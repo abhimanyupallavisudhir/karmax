@@ -70,7 +70,7 @@ const OPTIONS = {
   role: { type: 'string' }, ticket: { type: 'string' }, token: { type: 'string' }, fork: { type: 'boolean' }, print: { type: 'boolean' },
   data: { type: 'string', short: 'd', multiple: true }, list: { type: 'boolean' }, yes: { type: 'boolean', short: 'y' }, port: { type: 'string' },
   cwd: { type: 'string' }, 'git-via-tavya': { type: 'boolean' }, secret: { type: 'string', multiple: true },
-  skip: { type: 'string', multiple: true }, github: { type: 'string' }, 'dry-run': { type: 'boolean' },
+  skip: { type: 'string', multiple: true }, github: { type: 'string' }, 'dry-run': { type: 'boolean' }, repository: { type: 'string' },
 } as const;
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
@@ -130,7 +130,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     case 'secrets': case 'secret': {
       const client = await api();
       const projectId = flags.project?.[0] ? (await resolveTarget(client, flags.project[0])).project.id : Workspace.require().manifest.project.id;
-      await secrets(client, projectId, args, out, flags);
+      await secrets(client, projectId, args, out, flags, workspace);
       return 0;
     }
     case 'import': await importProject(await api(), args[0] ?? '.', out, flags); return 0;

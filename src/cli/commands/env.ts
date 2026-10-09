@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import path from 'node:path';
 import process from 'node:process';
 import type { Api } from '../api.js';
 import { environmentOf, secretValues, writeSecretFiles } from '../secrets.js';
@@ -59,29 +60,40 @@ export async function setup(workspace: Workspace, out: Output): Promise<number> 
   return 0;
 }
 
-export async function secrets(api: Api, projectId: string, args: string[], out: Output, flags: { file?: string; value?: string }) {
+export async function secrets(api: Api, projectId: string, args: string[], out: Output,
+  flags: { file?: string; value?: string; repository?: string }, workspace?: Workspace) {
   const [action = 'list', name] = args;
   const base = `/api/projects/${encodeURIComponent(projectId)}/secrets`;
+  const destination = { ...(flags.file ? { file: flags.file } : {}), ...(flags.repository ? { repository: flags.repository } : {}) };
   if (action === 'list' || action === 'ls') {
-    const { secrets: list, suggestions } = await api.get<{ secrets: Array<{ name: string; variable?: string; file?: string; credentialConfigured?: boolean }>;
-      suggestions: string[] }>(base);
-    return out.result({ secrets: list, suggestions }, table([
-      ...list.map((secret) => [secret.name, secret.file ? `file ${secret.file}` : `env ${secret.variable ?? secret.name}`,
+    const { secrets: list, suggested = [] } = await api.get<{ secrets: Array<{ name: string; variable?: string; file?: string;
+      repository?: string; dotenv?: { path: string; repository?: string }; credentialConfigured?: boolean }>;
+      suggested?: Array<{ name: string; repository: string }> }>(base);
+    const place = (location: { path: string; repository?: string }) => location.repository ? `${location.repository}/${location.path}` : location.path;
+    return out.result({ secrets: list, suggested }, table([
+      ...list.map((secret) => [secret.name, secret.dotenv ? `in ${place(secret.dotenv)}`
+        : secret.file ? `file ${place({ path: secret.file, repository: secret.repository })}` : `env ${secret.variable ?? secret.name}`,
         secret.credentialConfigured === false ? 'no value' : '']),
-      ...suggestions.map((suggestion) => [suggestion, 'suggested (in .env.example)', 'no value'])]) || 'No secrets.');
+      ...suggested.map((suggestion) => [suggestion.name, `suggested (${suggestion.repository}/.env.example)`, 'no value'])]) || 'No secrets.');
   }
   if (action === 'set') {
-    if (!name) throw new CliError('usage: tavya secrets set <NAME> [--file <path>] (value from stdin, or --value)', EXIT.usage);
+    if (!name) throw new CliError('usage: tavya secrets set <NAME> [--file <path>] [--repository <name>] (value from stdin, or --value)', EXIT.usage);
     const value = flags.value ?? (process.stdin.isTTY ? undefined : (await readStdin()).replace(/\n$/, ''));
     if (value === undefined) throw new CliError('pipe the value on stdin (e.g. `pbpaste | tavya secrets set NAME`) or pass --value', EXIT.usage);
-    await api.post(base, { name, value, ...(flags.file ? { file: flags.file } : {}) });
+    await api.post(base, { name, value, ...destination });
     return out.result({ set: name }, `Set ${name}.`);
   }
   if (action === 'import') {
     const source = name ?? '.env';
     const content = source === '-' ? await readStdin() : fs.readFileSync(source, 'utf8');
-    const result = await api.post<{ imported: Array<{ name: string }> }>(base, { env: content });
-    return out.result(result, `Imported ${result.imported.length} secret${result.imported.length === 1 ? '' : 's'}: ${result.imported.map((entry) => entry.name).join(', ')}`);
+    // A file keeps its place: its variables become lines of that repository's
+    // file, as on this machine. Standard input has no place; its variables
+    // reach every command.
+    const placed = source === '-' || destination.repository || workspace?.manifest.project.id !== projectId ? undefined
+      : workspacePlace(workspace, path.resolve(source));
+    const result = await api.post<{ imported: Array<{ name: string }> }>(base, { env: content, ...(placed ?? destination) });
+    const where = placed ? ` into ${placed.repository}/${placed.file}` : destination.repository ? ` into ${destination.repository}/${destination.file ?? '.env'}` : '';
+    return out.result(result, `Imported ${result.imported.length} secret${result.imported.length === 1 ? '' : 's'}${where}: ${result.imported.map((entry) => entry.name).join(', ')}`);
   }
   if (action === 'rm' || action === 'delete') {
     if (!name) throw new CliError('usage: tavya secrets rm <NAME>', EXIT.usage);
@@ -89,4 +101,11 @@ export async function secrets(api: Api, projectId: string, args: string[], out: 
     return out.result({ deleted: name }, `Deleted ${name}.`);
   }
   throw new CliError(`unknown secrets command "${action}" (list, set, import, rm)`, EXIT.usage);
+}
+
+/** The repository a workspace file is in, and its path there. */
+function workspacePlace(workspace: Workspace | undefined, absolute: string): { repository: string; file: string } | undefined {
+  const world = workspace?.worldPath(absolute);
+  const repository = world ? workspace!.repositoryOf(world) : undefined;
+  return repository && world!.startsWith(`${repository.name}/`) ? { repository: repository.name, file: world!.slice(repository.name.length + 1) } : undefined;
 }

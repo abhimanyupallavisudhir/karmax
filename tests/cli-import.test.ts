@@ -23,7 +23,7 @@ async function withGitHub() {
   const reconcile = vi.fn(async () => []);
   f = await cliFixture(cleanups, { githubApp: { configured: () => true, createRepository, reconcile,
     status: async () => ({ configured: true, userAuthorized: false, oauthConfigured: false }),
-    permissionStatus: async () => ({ ready: true }), fileContents: async () => undefined } as any });
+    permissionStatus: async () => ({ ready: true }), fileContents: async () => undefined, rootEntries: async () => undefined } as any });
   await f.store.upsertGitConnection({ organizationId: f.project.organizationId!, provider: 'github', installationId: '7',
     accountLogin: 'acme', accountType: 'Organization' });
   // acme/api is on GitHub and connected to the organization, but in no project yet.
@@ -78,8 +78,8 @@ it('imports a folder of repositories: creates the missing GitHub repository, pus
   expect(plan.repositories).toEqual([
     { folder: 'api', repository: 'acme/api', create: false, push: 'push 1 commit on main', uncommitted: 0 },
     { folder: 'web', repository: 'acme/web', create: true, push: 'push main', uncommitted: 0 }]);
-  // The two .env files disagree on PORT, so each is kept as a file where it is.
-  expect(plan.secrets).toEqual(expect.arrayContaining([{ path: 'api/.env', as: 'file' }, { path: 'web/.env', as: 'file' },
+  // Each repository keeps its own .env, so both may set PORT.
+  expect(plan.secrets).toEqual(expect.arrayContaining([{ path: 'api/.env', as: '.env' }, { path: 'web/.env', as: '.env' },
     { path: 'api/secrets/credentials.json', as: 'file' }, { path: 'web/credentials.json', as: 'file' }]));
   expect(plan.data.map((entry: { path: string; access: string }) => [entry.path, entry.access]).sort()).toEqual(
     [['api/app.sqlite', 'write'], ['datasets', 'read'], ['web/cache', 'read']]);
@@ -92,7 +92,10 @@ it('imports a folder of repositories: creates the missing GitHub repository, pus
   expect(createRepository.mock.calls[0]![2]).toMatchObject({ name: 'web', private: true, autoInit: false, defaultBranch: 'main' });
   expect(imported.repositories).toEqual({ api: 'pushed, linked', web: 'created, pushed, linked' });
   expect(imported.data.sort()).toEqual(['api/app.sqlite', 'datasets', 'web/cache']);
-  expect(imported.secrets.sort()).toEqual(['.env', 'credentials.json', 'web/.env', 'web/credentials.json']);
+  expect(imported.secrets.sort()).toEqual(['api/.env:PORT', 'api/.env:SHARED', 'api/secrets/credentials.json',
+    'web/.env:PORT', 'web/.env:SHARED', 'web/credentials.json']);
+  // Nothing is exported to every command: each value is a line of its repository's .env.
+  expect(json(await tavya(mono, ['env', '--json']))).toEqual({});
   // GitHub has both branches, and web's new origin is set.
   expect(await gitOrThrow(f.dir, ['--git-dir', path.join(f.remotes, 'acme', 'web.git'), 'log', '--format=%s', 'main'])).toBe('web');
   expect(await gitOrThrow(f.dir, ['--git-dir', path.join(f.remotes, 'acme', 'api.git'), 'log', '--format=%s', 'main'])).toBe('server\napi');
@@ -199,7 +202,7 @@ it('turns an imported checkout into its workspace, then adds and untracks ignore
   expect(Object.keys(after.resources)).toEqual(['raw_data']);
   expect(fs.existsSync(path.join(checkout, 'models', 'm.bin'))).toBe(true);
   const secrets = json(await f.tavya(checkout, ['secrets', 'list', '--json']));
-  expect(secrets.secrets.map((secret: { name: string }) => secret.name)).not.toContain('local.json');
+  expect(secrets.secrets.map((secret: { name: string }) => secret.name).filter((name: string) => name.includes('local.json'))).toEqual([]);
 
   // projects and open name the project the way clone takes it.
   const listed = json(await f.tavya(f.laptop, ['projects', '--json']));

@@ -62,9 +62,9 @@ import { SIG as WORKFLOW_SIG } from '../workflows/names.js';
 import { findFreePortFrom } from '../util/ports.js';
 import { expandPath } from '../util/expand.js';
 import { withTimeout } from '../util/timeout.js';
-import { AgentAuthority, AgentSpec, AuthorizationSelection, Avatar, Provider, Project, ProjectConfig, PrincipalRef, ProjectPrincipalRef, ResourceAttachment, ResourceRevision, ResourceTarget, normalizeUrgency } from '../domain/types.js';
+import { AgentAuthority, AgentSpec, AuthorizationSelection, Avatar, Provider, Project, ProjectConfig, PrincipalRef, ProjectPrincipalRef, ResourceAttachment, ResourceRevision, ResourceTarget, WorldLocation, normalizeUrgency } from '../domain/types.js';
+import { dotenvFile, dotenvSecretName, parseDotenv } from '../domain/dotenv.js';
 import { confirmLayersOf } from '../domain/confirm.js';
-import { parseEnvironmentValues } from '../domain/dotenv.js';
 import { ReviewActionRunner } from './review-actions.js';
 import { MIN_CLI_VERSION, WorkspaceService } from '../world/workspace.js';
 import { WorkspaceConflict } from '../world/resources.js';
@@ -4163,27 +4163,27 @@ export class Gateway {
           .filter((resource) => resource.driver === 'secret@1' && !stagedResourceCandidate(resource));
         const encodedName = projectSecrets[2] ? decodeURIComponent(projectSecrets[2]) : undefined;
         if (method === 'GET' && !encodedName) {
-          const names = await discoverEnvironmentNames(project, store, this.deps.githubApp);
-          const existing = new Set(resources.map((resource) => resource.target.kind === 'environment'
-            ? resource.target.name : resource.name));
+          const repositories = await projectRepositoryNames(project, store);
+          const declared = (name: string, repository: string) => resources.some((resource) => resource.target.kind === 'environment'
+            && resource.target.name === name && (!resource.target.dotenv
+              || anchorLocation(resource.target.dotenv, repositories).repository === repository));
+          const suggested = (await discoverEnvironmentNames(project, store, this.deps.githubApp))
+            .filter(({ name, repository }) => !declared(name, repository));
           return this.json(res, 200, { secrets: resources.map((resource) => ({
-            ...redactResource(resource),
-            file: resource.target.kind === 'path' ? resource.target.path : undefined,
-            variable: resource.target.kind === 'environment' ? resource.target.name : undefined,
-          })), suggestions: [...names].filter((name) => !existing.has(name)).sort() });
+            ...redactResource(resource), ...secretDestination(resource.target),
+          })), repositories, suggested, suggestions: [...new Set(suggested.map(({ name }) => name))].sort() });
         }
         if (method === 'POST' && !encodedName) {
           const body = await this.body(req);
-          const entries: Array<{ name: string; value: string; file?: string }> =
-            typeof body.env === 'string' ? parseEnvironmentValues(body.env)
-            : body.name ? [{ name: String(body.name), value: body.value == null ? '' : String(body.value),
-              file: body.file ? String(body.file) : undefined }] : [];
+          const repositories = await projectRepositoryNames(project, store);
+          let entries: SecretEntry[];
+          try { entries = secretEntries(body, repositories); }
+          catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
           if (!entries.length) return this.json(res, 400, { error: 'name/value or pasted env required' });
           const saved: ResourceAttachment[] = [];
           try {
             for (const entry of entries) {
-              const existing = resources.find((resource) =>
-                resource.name === entry.name || (resource.target.kind === 'environment' && resource.target.name === entry.name));
+              const existing = resources.find((resource) => sameSecretDestination(resource, entry, repositories));
               if (existing) {
                 // A new value becomes the resource's own secret; a stored
                 // handle may name someone else's (AU-40).
@@ -4191,8 +4191,7 @@ export class Gateway {
                   : existing.credentialHandles[0] ?? resourceSecretHandle(existing.id);
                 if (entry.value) (await this.deps.broker.registerHandle(handle, entry.value, organizationScope(project.organizationId)));
                 saved.push((await store.updateResourceAttachment(existing.id, {
-                  target: entry.file ? { kind: 'path', path: entry.file } : { kind: 'environment', name: entry.name },
-                  credentialHandles: [handle], enabled: true,
+                  target: entry.target, credentialHandles: [handle], enabled: true,
                   ...(entry.value ? { source: withoutVaultProjection(existing.source) } : {}),
                 })));
               } else {
@@ -4200,8 +4199,7 @@ export class Gateway {
                 const id = newId('resource'), handle = `resource:${id}:credential`;
                 (await this.deps.broker.registerHandle(handle, entry.value, organizationScope(project.organizationId)));
                 saved.push((await store.createResourceAttachment({ id, organizationId: project.organizationId,
-                  projectId: project.id, name: entry.name, driver: 'secret@1',
-                  target: entry.file ? { kind: 'path', path: entry.file } : { kind: 'environment', name: entry.name },
+                  projectId: project.id, name: entry.name, driver: 'secret@1', target: entry.target,
                   access: 'read', isolation: 'fork', source: { discovered: typeof body.env === 'string' },
                   credentialHandles: [handle], publish: 'discard' })));
               }
@@ -4235,9 +4233,7 @@ export class Gateway {
         try {
           if (method === 'GET' && !sub) {
             const spec = (await environments.spec(project.id));
-            const { remoteName } = await import('../world/provision-git.js');
-            const repositories = [...new Set([...(project.config.repos ?? []).map(remoteName),
-              ...(await store.listProjectRepositories(project.id)).map(({ repository }) => repository.name)])];
+            const repositories = await projectRepositoryNames(project, store);
             const { environmentBase } = await import('../world/project-runtime.js');
             const bases = new Map<string, string | undefined>();
             const builds = [];
@@ -10247,25 +10243,94 @@ async function projectRepositoryFiles(project: Project, store: Store,
   return repos;
 }
 
+/** Names each repository's `.env.example` (or `.sample`, `.template`) declares;
+ * values are never read from them. */
 async function discoverEnvironmentNames(project: Project, store: Store,
-  githubApp?: import('../integrations/github-app.js').GitHubAppService): Promise<Set<string>> {
-  const names = new Set<string>();
-  const add = (text: string) => {
-    for (const line of text.split('\n')) {
-      const match = line.trim().match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/);
-      if (match) names.add(match[1]!);
+  githubApp?: import('../integrations/github-app.js').GitHubAppService): Promise<Array<{ name: string; repository: string }>> {
+  const found: Array<{ name: string; repository: string }> = [];
+  for (const repository of await projectRepositoryFiles(project, store, githubApp)) {
+    const names = new Set<string>();
+    for (const file of ['.env.example', '.env.sample', '.env.template']) {
+      if (!repository.files.includes(file)) continue;
+      const text = await repository.read(file).catch(() => undefined);
+      for (const line of (text ?? '').split('\n')) {
+        const match = line.trim().match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/);
+        if (match) names.add(match[1]!);
+      }
     }
+    found.push(...[...names].sort().map((name) => ({ name, repository: repository.name })));
+  }
+  return found;
+}
+
+/** World checkout names of a project's repositories: what a resource's
+ * `repository` names (as `ProjectEnvironmentSpec.install` keys do). */
+async function projectRepositoryNames(project: Project, store: Store): Promise<string[]> {
+  const { remoteName } = await import('../world/provision-git.js');
+  return [...new Set([...(project.config.repos ?? []).map(remoteName),
+    ...(await store.listProjectRepositories(project.id)).map(({ repository }) => repository.name)])];
+}
+
+/** Pin a location to its repository: the one its first path segment names
+ * (`web/.env`, as the console shows places), else the only one. A pinned
+ * location stays put when a project gains a second repository (an unpinned
+ * one would move from that checkout to the workspace root). */
+function anchorLocation(location: WorldLocation, repositories: string[]): WorldLocation {
+  if (location.repository !== undefined) return location;
+  const normalized = location.path.replace(/\\/g, '/').replace(/^\.\//, '');
+  const [first, ...rest] = normalized.split('/');
+  if (rest.length && repositories.includes(first!)) return { path: rest.join('/'), repository: first! };
+  return repositories.length === 1 ? { path: normalized, repository: repositories[0]! } : { path: normalized };
+}
+
+interface SecretEntry { name: string; value: string; target: ResourceTarget }
+
+/** What a secrets POST asks for. A destination (`file`, optionally
+ * `repository`) that is a `.env` file makes each variable a line of it;
+ * another file takes a single value whole; none exports the variables to
+ * every command. */
+function secretEntries(body: Record<string, unknown>, repositories: string[]): SecretEntry[] {
+  const repository = typeof body.repository === 'string' && body.repository ? body.repository : undefined;
+  if (repository !== undefined && !repositories.includes(repository))
+    throw new Error(`this project has no repository named "${repository}"`);
+  const file = typeof body.file === 'string' && body.file.trim() ? body.file.trim()
+    : repository !== undefined ? '.env' : undefined;
+  const location = file === undefined ? undefined : anchorLocation({ path: file, ...(repository ? { repository } : {}) }, repositories);
+  const variable = (name: string, value: string): SecretEntry => location
+    ? { name: dotenvSecretName(location, name), value, target: { kind: 'environment', name, dotenv: location } }
+    : { name, value, target: { kind: 'environment', name } };
+  if (typeof body.env === 'string') {
+    if (location && !dotenvFile(location.path)) throw new Error('pasted variables go into a .env file');
+    return parseDotenv(body.env).map(({ name, value }) => variable(name, value));
+  }
+  if (!body.name) return [];
+  const name = String(body.name), value = body.value == null ? '' : String(body.value);
+  return [location && !dotenvFile(location.path) ? { name, value, target: { kind: 'path', ...location } } : variable(name, value)];
+}
+
+/** The stored secret a POST entry updates: the same variable in the same
+ * place, or the same file. A bare variable may still replace a file secret of
+ * its name, as before destinations existed. */
+function sameSecretDestination(resource: ResourceAttachment, entry: SecretEntry, repositories: string[]): boolean {
+  const same = (a: WorldLocation, b: WorldLocation) => {
+    const [x, y] = [anchorLocation(a, repositories), anchorLocation(b, repositories)];
+    return x.repository === y.repository && x.path.replace(/^\.\//, '') === y.path.replace(/^\.\//, '');
   };
-  for (const dir of projectRepositoryDirectories(project)) for (const file of
-    ['.env.example', '.env.sample', '.env.template']) {
-    try { add(fs.readFileSync(path.join(dir, file), 'utf8')); } catch {}
-  }
-  if (githubApp) for (const linked of (await store.listProjectRepositories(project.id))) for (const file of
-    ['.env.example', '.env.sample', '.env.template']) {
-    const text = await githubApp.fileContents(linked.repository, file);
-    if (text) add(text);
-  }
-  return names;
+  const { target } = resource;
+  if (entry.target.kind === 'path') return target.kind === 'path' && same(target, entry.target);
+  if (entry.target.kind !== 'environment') return false;
+  if (entry.target.dotenv) return target.kind === 'environment' && target.name === entry.target.name
+    && Boolean(target.dotenv) && same(target.dotenv!, entry.target.dotenv);
+  return (target.kind === 'environment' && !target.dotenv && target.name === entry.target.name)
+    || (target.kind === 'path' && resource.name === entry.name);
+}
+
+/** How the secrets API describes where a secret goes. */
+function secretDestination(target: ResourceTarget): { file?: string; variable?: string; repository?: string;
+  dotenv?: WorldLocation } {
+  if (target.kind === 'path') return { file: target.path, ...(target.repository !== undefined ? { repository: target.repository } : {}) };
+  if (target.kind === 'environment') return { variable: target.name, ...(target.dotenv ? { dotenv: target.dotenv } : {}) };
+  return {};
 }
 
 function redactResource(resource: ResourceAttachment): Omit<ResourceAttachment, 'credentialHandles'> & { credentialConfigured: boolean } {
@@ -10305,7 +10370,11 @@ function redactResourceRevision(revision: ResourceRevision | undefined): Omit<Re
 function normalizeResourceTarget(value: unknown, driver: string, name: string): ResourceTarget {
   if (value && typeof value === 'object') {
     const target = value as Record<string, unknown>;
-    if (target.kind === 'path') return { kind: 'path', path: String(target.path ?? '') };
+    const location = (value: Record<string, unknown>): WorldLocation => ({ path: String(value.path ?? ''),
+      ...(typeof value.repository === 'string' ? { repository: value.repository } : {}) });
+    if (target.kind === 'path') return { kind: 'path', ...location(target) };
+    if (target.kind === 'environment' && target.dotenv && typeof target.dotenv === 'object')
+      return { kind: 'environment', name: String(target.name ?? ''), dotenv: location(target.dotenv as Record<string, unknown>) };
     if (target.kind === 'environment' || target.kind === 'service') return { kind: target.kind, name: String(target.name ?? '') };
   }
   const variable = name.trim().toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^([^A-Z_])/, '_$1') || 'RESOURCE';

@@ -85,6 +85,8 @@ Inside a project's folder, a task is its number; anywhere else, `my-org/my-proje
 
 `tavya secrets list|set|import|rm` manages the project's secrets without ever printing a value. `tavya env` prints them for your own shell, if your role allows it.
 
+Each repository keeps its own `.env`. `tavya secrets import api/.env` stores that file's variables as lines of the `api` repository's `.env`, and every task and clone gets the file back in that place. Two repositories can each have their own `DATABASE_URL`. Variables from standard input (`tavya secrets import - < shared.env`) go to every command instead. `tavya secrets set NAME --file web/.env` adds one line to a file.
+
 ## Scripts and CI
 
 ```
