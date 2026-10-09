@@ -116,6 +116,8 @@ cleanup() {
   else
     say "Terminating every resource of $RUN_ID"
     sweep "$RUN_ID" || { sleep 30; sweep "$RUN_ID"; } || echo "run: CLEANUP INCOMPLETE — run: benchmarks/load/cloud.sh sweep $RUN_ID" >&2
+    # The proof, by describe calls: nothing tagged for the load test remains.
+    leftovers | tee "$OUT/logs/leftovers.txt" || echo "run: RESOURCES REMAIN — run: benchmarks/load/cloud.sh sweep" >&2
   fi
   if [ -s "$WORK/instances.jsonl" ]; then
     cost "$WORK/instances.jsonl" "$(date +%s)" > "$OUT/cost.json" && say "Cost: \$$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["totalUsd"])' "$OUT/cost.json")"

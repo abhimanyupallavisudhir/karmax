@@ -96,6 +96,18 @@ verify_scope() {
   return "$failed"
 }
 
+# What still exists with the load test's tag, by describe calls, across all
+# runs: live instances, volumes, security groups, key pairs. Fails if any.
+leftovers() {
+  local instances volumes groups keys
+  instances=$(instances_of)
+  volumes=$(aws_ ec2 describe-volumes --filters "$(run_filter)" --query 'Volumes[].VolumeId')
+  groups=$(aws_ ec2 describe-security-groups --filters "$(run_filter)" --query 'SecurityGroups[].GroupId')
+  keys=$(aws_ ec2 describe-key-pairs --filters "$(run_filter)" --query 'KeyPairs[].KeyPairId')
+  echo "Project=$PROJECT_TAG in $AWS_REGION at $(date -u +%FT%TZ): instances [${instances}] volumes [${volumes}] security groups [${groups}] key pairs [${keys}]"
+  [ -z "$instances$volumes$groups$keys" ]
+}
+
 list() {
   aws_ ec2 describe-instances --filters "$(run_filter)" \
     --query 'Reservations[].Instances[].[Tags[?Key==`RunId`]|[0].Value,InstanceId,InstanceType,State.Name,LaunchTime]'
@@ -130,8 +142,9 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   case "${1:-}" in
     sweep) sweep "${2:-}" ;;
     list) list ;;
+    leftovers) leftovers ;;
     verify-scope) verify_scope ;;
     cost) cost "$2" "${3:-$(date +%s)}" ;;
-    *) echo 'usage: cloud.sh sweep [RUN_ID] | list | verify-scope | cost INSTANCES_JSONL [ENDED_EPOCH]' >&2; exit 2 ;;
+    *) echo 'usage: cloud.sh sweep [RUN_ID] | list | leftovers | verify-scope | cost INSTANCES_JSONL [ENDED_EPOCH]' >&2; exit 2 ;;
   esac
 fi
