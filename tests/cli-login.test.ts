@@ -1,6 +1,8 @@
 import { afterAll, beforeAll, expect, it } from 'vitest';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { appGrantFixture, type AppGrantFixture } from './helpers/app-grants.js';
@@ -12,10 +14,10 @@ let config: string;
 beforeAll(async () => { f = await appGrantFixture(); config = fs.mkdtempSync(path.join(os.tmpdir(), 'tavya-cli-config-')); });
 afterAll(async () => { await f.g.close(); fs.rmSync(config, { recursive: true, force: true }); });
 
-function tavya(args: string[], options: { token?: string; onStderr?: (text: string) => void } = {}) {
+function tavya(args: string[], options: { token?: string; url?: string; onStderr?: (text: string) => void } = {}) {
   return new Promise<{ code: number; stdout: string; stderr: string }>((resolve, reject) => {
     const child = spawn(process.execPath, [path.resolve('bin/tavya.js'), ...args], {
-      env: { ...process.env, TAVYA_URL: f.g.url, TAVYA_TOKEN: options.token ?? '', KARMAX_TOKEN: '', KARMAX_GATEWAY_URL: '',
+      env: { ...process.env, TAVYA_URL: options.url ?? f.g.url, TAVYA_TOKEN: options.token ?? '', KARMAX_TOKEN: '', KARMAX_GATEWAY_URL: '',
         TAVYA_CONFIG_DIR: config, TAVYA_NO_KEYCHAIN: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = ''; let stderr = '';
     child.stdout.on('data', (chunk) => { stdout += chunk; });
@@ -76,4 +78,56 @@ it('signs in with the device flow, refreshes, makes a scoped token, and signs ou
   // The revoked refresh token no longer works on the server either.
   const reuse = await f.form('/oauth/token', { grant_type: 'refresh_token', refresh_token: refreshed.refreshToken, client_id: 'tavya-cli' });
   expect(reuse.status).toBe(400);
+});
+
+const hostsFile = () => path.join(config, 'hosts.json');
+const storedCredential = (server = f.g.url) => JSON.parse(fs.readFileSync(hostsFile(), 'utf8')).hosts[server]?.credential;
+
+/** A device sign-in stored as `tavya login` stores it, its access token already expired. */
+async function expiredSignIn(server = f.g.url, refreshToken?: string) {
+  const token = refreshToken ? { access_token: 'tva_stale', refresh_token: refreshToken } : await f.deviceLogin();
+  fs.writeFileSync(hostsFile(), JSON.stringify({ default: server, hosts: { [server]: { user: { name: 'Ada' }, keychain: false,
+    credential: { accessToken: token.access_token, refreshToken: token.refresh_token, expiresAt: Date.now() - 1, clientId: 'tavya-cli' } } } }));
+  return token.refresh_token;
+}
+
+it('refreshes once when one command sends several requests (an org/project reference)', async () => {
+  await expiredSignIn();
+  // `organization/project` lists organizations and projects at the same time.
+  const listed = await tavya(['task', 'list', '--project', 'acme/site', '--json']);
+  expect(listed.code, listed.stderr).toBe(0);
+  const later = await tavya(['whoami', '--json']);
+  expect(later.code, later.stderr).toBe(0);
+});
+
+it('refreshes once when several commands share one sign-in', async () => {
+  await expiredSignIn();
+  const runs = await Promise.all([1, 2, 3, 4].map(() => tavya(['api', 'GET', '/api/projects'])));
+  for (const run of runs) expect(run.code, run.stderr).toBe(0);
+  expect(storedCredential().expiresAt).toBeGreaterThan(Date.now());
+  const later = await tavya(['whoami', '--json']);
+  expect(later.code, later.stderr).toBe(0);
+});
+
+it('keeps the sign-in when the server cannot refresh it right now, and says why when it refuses', async () => {
+  let reply: { status: number; body: string; type: string } = { status: 502, body: '<html>Bad Gateway</html>', type: 'text/html' };
+  const server = http.createServer((_req, res) => { res.writeHead(reply.status, { 'content-type': reply.type }); res.end(reply.body); });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  try {
+    await expiredSignIn(url, 'tvr_grant_x.secret');
+    const outage = await tavya(['api', 'GET', '/api/projects'], { url });
+    expect(outage.code).not.toBe(0);
+    expect(outage.stderr).not.toContain('expired');
+    expect(outage.stderr).toContain('502');
+    expect(storedCredential(url)?.refreshToken).toBe('tvr_grant_x.secret');
+
+    reply = { status: 400, type: 'application/json',
+      body: JSON.stringify({ error: 'invalid_grant', error_description: 'Refresh token reuse detected; the grant was revoked. Sign in again.' }) };
+    const refused = await tavya(['api', 'GET', '/api/projects'], { url });
+    expect(refused.code).toBe(3);
+    expect(refused.stderr).toContain('Refresh token reuse detected');
+    expect(refused.stderr).toContain('tavya login');
+    expect(storedCredential(url)).toBeUndefined();
+  } finally { server.close(); }
 });

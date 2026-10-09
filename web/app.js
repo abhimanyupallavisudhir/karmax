@@ -1275,9 +1275,9 @@ function wireModelField(field, { fallbackProvider } = {}) {
 // ── Compare models: intelligence against cost or time ────────────────────────
 // Artificial Analysis benchmarks (bundled with tavya, or fetched daily by the
 // server when it has a key) of the models a harness here can run, one point per
-// harness:model:effort. The line is the efficient frontier: the upper convex hull
-// of the Pareto-optimal points, as plotted (log cost or time against
-// intelligence), so each step along it buys intelligence at a worsening rate.
+// harness:model:effort. The line is the Pareto frontier, drawn as Artificial
+// Analysis draws it: straight through every point no cheaper (or faster) point
+// beats. (A convex hull would skip models that are the best buy for some budget.)
 // Picking a point fills the field.
 const MODEL_CHART_METRICS = {
   cost: { label: 'Cost', axis: '$ per answer', ticks: [0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5], format: (v) => `$${Number(v.toPrecision(2))}` },
@@ -1295,24 +1295,12 @@ function loadModelBenchmarks() {
 }
 // "Claude Opus 5.5 (High, Default Fallback)" → "Claude Opus 5.5 · high"
 const benchmarkLabel = (model) => `${model.name.replace(/\s*\([^()]*\)\s*$/, '')}${model.ref.effort ? ` · ${model.ref.effort}` : ''}`;
-// Cheapest-or-fastest first: the Pareto-optimal points (each beats every point
-// to its left), then the upper convex hull of those in plotted coordinates.
+// Cheapest-or-fastest first, the Pareto-optimal points: each beats every point to its left.
 function paretoFrontier(points, metric) {
   const sorted = [...points].sort((a, b) => a[metric] - b[metric] || b.intelligence - a.intelligence);
   const pareto = [];
   for (const point of sorted) if (!pareto.length || point.intelligence > pareto[pareto.length - 1].intelligence) pareto.push(point);
-  const at = (point) => ({ x: Math.log10(point[metric]), y: point.intelligence });
-  const hull = [];
-  for (const point of pareto) {
-    // Drop the last point while it sits on or below the chord to this one.
-    while (hull.length >= 2) {
-      const o = at(hull[hull.length - 2]), a = at(hull[hull.length - 1]), b = at(point);
-      if ((a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x) < 0) break;
-      hull.pop();
-    }
-    hull.push(point);
-  }
-  return hull;
+  return pareto;
 }
 function modelChartSvg(models, metric, current, hidden) {
   const spec = MODEL_CHART_METRICS[metric];

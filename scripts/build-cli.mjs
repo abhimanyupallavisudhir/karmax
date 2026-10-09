@@ -20,8 +20,10 @@ const sea = process.argv.includes('--sea');
 fs.mkdirSync(out, { recursive: true });
 const common = { bundle: true, platform: 'node', target: 'node22', legalComments: 'none', logLevel: 'warning', minifySyntax: true };
 
-await build({ ...common, entryPoints: [path.join(root, 'src/cli/bin.ts')], format: 'esm', outfile: path.join(out, 'tavya.mjs'),
-  banner: { js: '#!/usr/bin/env node' } });
+const { metafile } = await build({ ...common, entryPoints: [path.join(root, 'src/cli/bin.ts')], format: 'esm', outfile: path.join(out, 'tavya.mjs'),
+  banner: { js: '#!/usr/bin/env node' }, metafile: true, absWorkingDir: root });
+// Its inputs, for scripts/check-cli-version.mjs.
+fs.writeFileSync(path.join(out, 'meta.json'), JSON.stringify(metafile));
 fs.chmodSync(path.join(out, 'tavya.mjs'), 0o755);
 
 if (sea) {
