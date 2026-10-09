@@ -11,14 +11,15 @@ import type { Client } from '@temporalio/client';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import { organizationScope } from '../autonomy/vault-keys.js';
 import type { IgnoredResourceInventory, Project, ResourceAttachment, ResourceAccess, ResourceCandidate,
-  ResourceChangeSummary, ResourcePublishPolicy, ResourceRevision, ResourceTarget } from '../domain/types.js';
+  ResourceChangeSummary, ResourcePublishPolicy, ResourceRevision, ResourceTarget, WorldLocation } from '../domain/types.js';
 import type { ObjectStore } from '../store/objects.js';
 import type { StorageLocationService } from '../store/storage-locations.js';
 import type { Store } from '../store/db.js';
 import { newId } from '../util/id.js';
 import type { ExecOptions, ExecResult, World, WorldHandle, WorldHttpRequest, WorldHttpResponse,
   WorldProcess, WorldProcessSpec, WorldPty, WorldPtySpec } from './types.js';
-import { worldRelativePath, worldRepos, worldWorkingDirectory, worldWorkingRelativePath } from './types.js';
+import { worldLocationPath, worldRelativePath, worldRepos, worldWorkingDirectory, worldWorkingRelativePath } from './types.js';
+import { dotenvSecretName, renderDotenv } from '../domain/dotenv.js';
 import type { WorldRegistry } from './registry.js';
 import { QRY_RESOURCE_PUBLISH, RESOURCE_PUBLISH_COORDINATOR_WORKFLOW, SIG_CANCEL_RESOURCE_PUBLISH,
   SIG_ENQUEUE_RESOURCE_PUBLISH, SIG_RELEASE_RESOURCE_PUBLISH,
@@ -477,6 +478,12 @@ export class ProjectResourceService {
     let compression: boolean | undefined;
     for (const attachment of (await this.store.listResourceAttachments(projectId))) {
       options.signal?.throwIfAborted();
+      const missing = absentRepository(world.handle, attachment);
+      if (missing) {
+        await this.store.appendEvent({ taskId, type: 'world.warning', ts: Date.now(), payload: { warning:
+          `resource "${attachment.name}" belongs in the ${missing} repository, which this world has no checkout of; skipped` } });
+        continue;
+      }
       const revisionId = Object.prototype.hasOwnProperty.call(revisions, attachment.id)
         ? revisions[attachment.id] : attachment.currentRevisionId;
       const lease = (await this.store.createResourceLease({ attachmentId: attachment.id, revisionId,
@@ -484,18 +491,17 @@ export class ProjectResourceService {
       try {
         if (isSecretLike(attachment)) {
           if (!attachment.credentialHandles[0]) throw new Error(`resource "${attachment.name}" has no configured credential`);
-          const value = await this.resolveSecret(attachment, taskId);
-          if (attachment.target.kind === 'path') {
-            const target = worldWorkingRelativePath(world.handle, attachment.target.path);
-            await world.writeFile(target, value);
-            await world.exec('chmod', ['600', target], { cwd: world.handle.root });
-            await ensureWorldExcluded(world, target);
+          // Resolved now so a missing value fails provisioning; files are
+          // written together below, since several variables may share a .env.
+          await this.resolveSecret(attachment, taskId);
+          const location = secretLocation(attachment);
+          if (location) {
+            const target = worldLocationPath(world.handle, location)!;
             ephemeralPaths.add(target);
             projections[attachment.id] = { target, revisionId, access: attachment.access };
           }
         } else if (isSnapshotDriver(attachment.driver)) {
-          const target = attachment.target.kind === 'path'
-            ? worldWorkingRelativePath(world.handle, attachment.target.path) : undefined;
+          const target = attachment.target.kind === 'path' ? worldLocationPath(world.handle, attachment.target) : undefined;
           if (!target) throw new Error(`resource "${attachment.name}" requires a path target`);
           if (target !== '.') await ensureWorldExcluded(world, target);
           if (revisionId) {
@@ -540,6 +546,7 @@ export class ProjectResourceService {
     world.handle = { ...world.handle, generation, meta: { ...world.handle.meta,
       ...(ephemeralPaths.size ? { ephemeralPaths: [...ephemeralPaths] } : {}),
       ...(Object.keys(projections).length ? { resourceProjections: projections } : {}) } };
+    await this.writeSecretFiles(world, false);
     return world.handle;
   }
 
@@ -566,7 +573,7 @@ export class ProjectResourceService {
       if (!attachment?.enabled || !isSecretLike(attachment)) continue;
       // Every world command carries these (EnvironmentWorld), so a value the OS
       // refuses would fail them all, the platform's own git included.
-      if (attachment.target.kind === 'environment' || attachment.target.kind === 'service')
+      if ((attachment.target.kind === 'environment' && !attachment.target.dotenv) || attachment.target.kind === 'service')
         Object.assign(env, screenEnvironment({ [attachment.target.name]: await this.resolveSecret(attachment, lease.taskId) },
           () => `project secret "${attachment.name}"`, skipped));
     }
@@ -610,12 +617,15 @@ export class ProjectResourceService {
     if (!project) return;
     const existing = new Set((await this.store.listResourceLeases(handle.id, generation)).map((lease) => lease.attachmentId));
     const late = (await this.store.listResourceAttachments(project.id)).filter((attachment) =>
-      attachment.organizationId === project.organizationId && isSecretLike(attachment) && !existing.has(attachment.id));
+      attachment.organizationId === project.organizationId && isSecretLike(attachment) && !existing.has(attachment.id)
+      && !absentRepository(handle, attachment));
     // Resolve before recording anything: a transient broker failure must fail
     // this open, but remain retryable on the next one.
     for (const attachment of late) await this.resolveSecret(attachment, task.id);
-    const projections = Object.fromEntries(late.flatMap((attachment) => attachment.target.kind === 'path'
-      ? [[attachment.id, { target: worldWorkingRelativePath(handle, attachment.target.path), access: attachment.access }]] : []));
+    const projections = Object.fromEntries(late.flatMap((attachment) => {
+      const location = secretLocation(attachment);
+      return location ? [[attachment.id, { target: worldLocationPath(handle, location)!, access: attachment.access }]] : [];
+    }));
     if (Object.keys(projections).length)
       world.handle = (await this.store.updateWorldMeta(handle, { resourceProjections: {
         ...(current.meta?.resourceProjections as Record<string, unknown> | undefined), ...projections } })) as WorldHandle;
@@ -629,20 +639,28 @@ export class ProjectResourceService {
     }
   }
 
-  /** Write every leased file secret (`changedOnly`: only those whose target or
-   * value differs from what this process last wrote, so a running agent's own
-   * edits survive until the project value actually changes). The cache is this
-   * process's alone: a file another process scrubbed, or the agent deleted, is
-   * written again (audit R-9). */
+  /** Write every leased file secret, and each `.env` from the variables that
+   * are lines of it (`changedOnly`: only files whose content differs from what
+   * this process last wrote, so a running agent's own edits survive until the
+   * project value actually changes). The cache is this process's alone: a file
+   * another process scrubbed, or the agent deleted, is written again (audit R-9). */
   private async writeSecretFiles(world: World, changedOnly: boolean): Promise<void> {
+    const files = new Map<string, { contents: string[]; variables: Array<{ name: string; value: string }> }>();
     for (const lease of (await this.store.listResourceLeases(world.handle.id, world.handle.generation ?? 1))) {
       if (lease.state !== 'active') continue;
       const attachment = (await this.store.getResourceAttachment(lease.attachmentId));
-      if (!attachment?.enabled || !isSecretLike(attachment) || attachment.target.kind !== 'path') continue;
+      if (!attachment?.enabled || !isSecretLike(attachment) || !secretLocation(attachment)) continue;
       const target = resourcePath(world.handle, attachment);
+      const file = files.get(target) ?? { contents: [], variables: [] };
+      files.set(target, file);
       const value = await this.resolveSecret(attachment, lease.taskId);
-      const key = `${writtenPrefix(world.handle)}${attachment.id}`;
-      const digest = sha256(Buffer.from(`${target}\0${value}`));
+      if (attachment.target.kind === 'environment') file.variables.push({ name: attachment.target.name, value });
+      else file.contents.push(value);
+    }
+    for (const [target, file] of files) {
+      const value = [...file.contents, renderDotenv(file.variables.sort((a, b) => a.name.localeCompare(b.name)))].join('');
+      const key = `${writtenPrefix(world.handle)}${target}`;
+      const digest = sha256(Buffer.from(value));
       if (changedOnly && this.writtenSecrets.get(key) === digest
         && (await world.exec('test', ['-e', target], { cwd: world.handle.root }).catch(() => undefined))?.code === 0) continue;
       await world.writeFile(target, value);
@@ -676,7 +694,7 @@ export class ProjectResourceService {
     for (const key of this.writtenSecrets.keys()) if (key.startsWith(writtenPrefix(handle))) this.writtenSecrets.delete(key);
     for (const lease of (await this.store.listResourceLeases(handle.id, handle.generation ?? 1))) {
       const attachment = (await this.store.getResourceAttachment(lease.attachmentId));
-      if (attachment?.target.kind === 'path' && isSecretLike(attachment))
+      if (attachment && isSecretLike(attachment) && secretLocation(attachment))
         await world.exec('rm', ['-f', resourcePath(handle, attachment)], { cwd: handle.root }).catch(() => undefined);
     }
   }
@@ -775,21 +793,23 @@ export class ProjectResourceService {
               throw new Error(`could not read copyGlobs match "${source}:${entry.name}": ${
                 error instanceof Error ? error.message : String(error)}`);
             }
-            const target = sources.length > 1 ? `${repoNames[index]}/${entry.name}` : entry.name;
+            // copyGlobs copied each match into its own checkout; keep it there.
+            const target = { path: entry.name, repository: repoNames[index]! };
+            const label = locationLabel(target);
             const sourceRecord = { migratedFrom: 'copyGlobs', repository: source, path: entry.name };
             const env = data && /^\.env(?:\.|$)/i.test(entry.name) ? parseCopyEnv(data.toString('utf8')) : [];
             if (env.length) {
               for (const value of env) {
                 const existing = (await this.store.listResourceAttachments(project.id, true)).find((attachment) =>
                   attachment.driver === 'secret@1' && attachment.target.kind === 'environment'
-                  && attachment.target.name === value.name);
+                  && attachment.target.name === value.name && sameLocation(attachment.target.dotenv, target));
                 if (existing) { result.reused.push(value.name); continue; }
                 const id = newId('resource'), handle = `resource:${id}:credential`;
                 (await this.broker.registerHandle(handle, value.value, organizationScope(project.organizationId!)));
                 try {
                   (await this.store.createResourceAttachment({ id, organizationId: project.organizationId!,
-                    projectId: project.id, name: value.name, driver: 'secret@1',
-                    target: { kind: 'environment', name: value.name }, access: 'read', isolation: 'fork',
+                    projectId: project.id, name: dotenvSecretName(target, value.name), driver: 'secret@1',
+                    target: { kind: 'environment', name: value.name, dotenv: target }, access: 'read', isolation: 'fork',
                     source: sourceRecord, credentialHandles: [handle], publish: 'discard' }));
                 } catch (error) { (await this.broker.deleteHandle(handle)); throw error; }
                 created.push(id); result.environmentSecrets.push(value.name);
@@ -797,29 +817,29 @@ export class ProjectResourceService {
               continue;
             }
             const existing = (await this.store.listResourceAttachments(project.id, true)).find((attachment) =>
-              attachment.target.kind === 'path' && attachment.target.path === target);
-            if (existing) { result.reused.push(target); continue; }
+              attachment.target.kind === 'path' && sameLocation(attachment.target, target));
+            if (existing) { result.reused.push(label); continue; }
             if (data && !data.includes(0)) {
               const id = newId('resource'), handle = `resource:${id}:credential`;
               (await this.broker.registerHandle(handle, data.toString('utf8'), organizationScope(project.organizationId!)));
               try {
                 (await this.store.createResourceAttachment({ id, organizationId: project.organizationId!,
                   projectId: project.id, name: copyGlobSecretName(entry.name), driver: 'secret@1',
-                  target: { kind: 'path', path: target }, access: 'read', isolation: 'fork',
+                  target: { kind: 'path', ...target }, access: 'read', isolation: 'fork',
                   source: sourceRecord, credentialHandles: [handle], publish: 'discard' }));
               } catch (error) { (await this.broker.deleteHandle(handle)); throw error; }
-              created.push(id); result.fileSecrets.push(target);
+              created.push(id); result.fileSecrets.push(label);
             } else {
               const attachment = (await this.store.createResourceAttachment({ organizationId: project.organizationId!,
                 projectId: project.id, name: `Imported ${entry.name}`, driver: 'volume@1',
-                target: { kind: 'path', path: target }, access: 'read', isolation: 'fork',
+                target: { kind: 'path', ...target }, access: 'read', isolation: 'fork',
                 source: { ...sourceRecord, shape: 'file' }, credentialHandles: [], publish: 'discard' }));
               created.push(attachment.id);
               const stat = await fs.promises.stat(absolute);
               await this.importFiles(attachment.id,
                 [{ path: entry.name, data: data ?? fs.createReadStream(absolute) as AsyncIterable<Buffer>,
                   bytes: stat.size }]);
-              result.data.push(target);
+              result.data.push(label);
             }
           }
         }
@@ -1401,7 +1421,7 @@ export class ProjectResourceService {
           }
         } else {
           const { lease, world, target } = await this.worldResource(taskId, attachment.id);
-          Object.assign(report, { path: attachment.target.kind === 'path' ? attachment.target.path : attachment.name, revisionId: delivery.revisionId });
+          Object.assign(report, { path: attachment.target.kind === 'path' ? locationLabel(attachment.target) : attachment.name, revisionId: delivery.revisionId });
           const repository = await this.restic.current(attachment);
           const restoredFrom = lease.revisionId ? await this.store.getResourceRevision(lease.revisionId) : undefined;
           const parent = this.parentIn(repository, restoredFrom);
@@ -1454,7 +1474,7 @@ export class ProjectResourceService {
     // Deduplicated against the version the world was restored from, so mostly a scan.
     const repository = await this.restic.current(attachment);
     const parent = this.parentIn(repository, restoredFrom);
-    const label = attachment.target.kind === 'path' ? attachment.target.path : attachment.name;
+    const label = attachment.target.kind === 'path' ? locationLabel(attachment.target) : attachment.name;
     const capture = await this.restic.backup({ world, path: target, file: fileShaped(attachment) }, repository, {
       key: `inspect:${lease.id}`, quota: true, ...(parent ? { parent } : {}),
       ...(work.checkContinue ? { checkContinue: work.checkContinue } : {}),
@@ -1650,6 +1670,14 @@ export class ProjectResourceService {
       payload: { attachmentId, snapshot } }));
   }
 
+  /** A location relative to a workspace's working directory, as CLIs before
+   * repository-pinned locations read `file` (wiki features/tavya-cli). */
+  private async workdirPath(projectId: string, location: WorldLocation): Promise<string> {
+    if (location.repository === undefined) return location.path;
+    const linked = await this.store.listProjectRepositories(projectId);
+    return linked.length === 1 ? location.path : path.posix.join(location.repository, location.path);
+  }
+
   /** The project's secret values, for a person's own machine (`tavya run`).
    * Every value read is audited by name. */
   async workspaceSecretValues(projectId: string, principal: string, names?: string[]):
@@ -1658,8 +1686,11 @@ export class ProjectResourceService {
     const values: Array<{ id: string; name: string; variable?: string; file?: string; value: string }> = [];
     for (const attachment of (await this.store.listResourceAttachments(projectId))) {
       if (!attachment.enabled || !isSecretLike(attachment) || !attachment.credentialHandles[0]) continue;
-      const variable = attachment.target.kind === 'environment' || attachment.target.kind === 'service' ? attachment.target.name : undefined;
-      const file = attachment.target.kind === 'path' ? attachment.target.path : undefined;
+      // A .env line has neither: older CLIs would export it, or write its bare
+      // value over the file. Newer ones place it from the workspace manifest.
+      const variable = (attachment.target.kind === 'environment' && !attachment.target.dotenv) || attachment.target.kind === 'service'
+        ? attachment.target.name : undefined;
+      const file = attachment.target.kind === 'path' ? await this.workdirPath(projectId, attachment.target) : undefined;
       if (wanted && !wanted.has(attachment.name) && !(variable && wanted.has(variable))) continue;
       const handle = await this.ownedCredentialHandle(attachment);
       const value = this.broker.resolve(handle, { taskId: `workspace:${principal}`, caps: [`use-credential:${handle}`] });
@@ -2007,11 +2038,32 @@ function resourcePath(handle: WorldHandle, attachment: ResourceAttachment): stri
   const projections = handle.meta?.resourceProjections as Record<string, { target?: string }> | undefined;
   const pinned = projections?.[attachment.id]?.target;
   if (pinned) return safePath(pinned);
-  if (attachment.target.kind !== 'path') throw new Error('resource has no filesystem target');
+  const location = attachment.target.kind === 'path' ? attachment.target : secretLocation(attachment);
+  if (!location) throw new Error('resource has no filesystem target');
   // Historical file secrets were root-relative and recorded only as ephemeral.
-  if (Array.isArray(handle.meta?.ephemeralPaths) && handle.meta.ephemeralPaths.includes(attachment.target.path))
-    return safePath(attachment.target.path);
-  return worldWorkingRelativePath(handle, attachment.target.path);
+  if (location.repository === undefined && Array.isArray(handle.meta?.ephemeralPaths)
+    && handle.meta.ephemeralPaths.includes(location.path)) return safePath(location.path);
+  const target = worldLocationPath(handle, location);
+  if (target === undefined) throw new Error(`this world has no checkout of the ${location.repository} repository`);
+  return target;
+}
+function sameLocation(a: WorldLocation | undefined, b: WorldLocation): boolean {
+  return a?.path === b.path && a.repository === b.repository;
+}
+function locationLabel(location: WorldLocation): string {
+  return location.repository === undefined ? location.path : `${location.repository}/${location.path}`;
+}
+/** Where a file-shaped secret is written: its own file, or the `.env` it is a line of. */
+function secretLocation(attachment: ResourceAttachment): WorldLocation | undefined {
+  if (!isSecretLike(attachment)) return undefined;
+  return attachment.target.kind === 'path' ? attachment.target
+    : attachment.target.kind === 'environment' ? attachment.target.dotenv : undefined;
+}
+/** The repository a resource is placed in, when this world has no checkout of it. */
+function absentRepository(handle: WorldHandle, attachment: ResourceAttachment): string | undefined {
+  const location = attachment.target.kind === 'path' ? attachment.target
+    : attachment.target.kind === 'environment' ? attachment.target.dotenv : undefined;
+  return location?.repository !== undefined && worldLocationPath(handle, location) === undefined ? location.repository : undefined;
 }
 function resourceAbsolutePath(handle: WorldHandle, attachment: ResourceAttachment): string {
   return path.posix.join(handle.root, resourcePath(handle, attachment));

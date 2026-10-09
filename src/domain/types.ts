@@ -607,11 +607,17 @@ export interface ProjectConfig {
 export type ResourceAccess = 'read' | 'write';
 export type ResourceIsolation = 'fork' | 'shared';
 export type ResourcePublishPolicy = 'discard' | 'review';
+/** A location inside a world. With `repository` (a world checkout name, like
+ * `ProjectEnvironmentSpec.install` keys) `path` is relative to that checkout;
+ * without, to the task working directory: the sole development checkout, or
+ * the encompassing workspace for multiple development repositories. */
+export interface WorldLocation { path: string; repository?: string }
+
 export type ResourceTarget =
-  /** Relative to the task working directory: the sole development checkout,
-   * or the encompassing workspace for multiple development repositories. */
-  | { kind: 'path'; path: string }
-  | { kind: 'environment'; name: string }
+  | ({ kind: 'path' } & WorldLocation)
+  /** With `dotenv`, a line of that `.env` file instead of an exported variable:
+   * repositories in one project may each need their own value for a name. */
+  | { kind: 'environment'; name: string; dotenv?: WorldLocation }
   | { kind: 'service'; name: string };
 
 /** Durable, secret-free project attachment. Driver configuration may contain

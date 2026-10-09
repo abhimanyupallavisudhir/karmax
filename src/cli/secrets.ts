@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { Api } from './api.js';
 import { HttpError } from './api.js';
+import { parseDotenv, renderDotenv } from '../domain/dotenv.js';
 import { excludeFromGit } from './git.js';
 import type { Output } from './util.js';
 import type { Workspace } from './workspace.js';
@@ -23,14 +24,15 @@ export const digest = (value: string): string => crypto.createHash('sha256').upd
 
 /**
  * Write file-shaped secrets where a world gets them (mode 0600, kept out of
- * Git). A file someone edited since tavya wrote it is left alone. Returns
- * false when the caller may not read secret values (it then pulls without them).
+ * Git): each whole-file secret, and each `.env` from its variables. A file
+ * someone edited since tavya wrote it is left alone. Returns false when the
+ * caller may not read secret values (it then pulls without them).
  */
 export async function writeSecretFiles(api: Api, workspace: Workspace, out: Output, force = false): Promise<boolean> {
-  const declared = workspace.manifest.secrets.filter((secret) => secret.file && secret.configured);
+  const declared = workspace.manifest.secrets.filter((secret) => (secret.file || secret.dotenv) && secret.configured);
   if (!declared.length) return true;
   let secrets: SecretValue[];
-  try { secrets = await secretValues(api, workspace.manifest.project.id, declared.map((secret) => secret.name)); }
+  try { secrets = await secretValues(api, workspace.manifest.project.id, [...new Set(declared.map((secret) => secret.name))]); }
   catch (error) {
     if (error instanceof HttpError && error.status === 403) {
       out.warn('secret files not written: reading project secrets needs Developer access (project:secret:use)');
@@ -38,23 +40,42 @@ export async function writeSecretFiles(api: Api, workspace: Workspace, out: Outp
     }
     throw error;
   }
-  const workdir = workspace.manifest.workdir;
-  for (const secret of secrets) {
-    if (!secret.file) continue;
-    const relative = path.posix.normalize(path.posix.join(workdir, secret.file)).replace(/^\.\//, '');
+  const values = new Map(secrets.map((secret) => [secret.id, secret.value]));
+  const files = new Map<string, { contents: string[]; variables: Array<{ name: string; value: string }> }>();
+  for (const secret of declared) {
+    const value = values.get(secret.id);
+    if (value === undefined) continue;
+    const relative = path.posix.normalize(secret.dotenv ?? secret.file!).replace(/^\.\//, '');
+    const file = files.get(relative) ?? { contents: [], variables: [] };
+    files.set(relative, file);
+    if (secret.dotenv) file.variables.push({ name: secret.variable ?? secret.name, value });
+    else file.contents.push(value);
+  }
+  for (const [relative, file] of files) {
+    const content = [...file.contents, renderDotenv(file.variables.sort((a, b) => a.name.localeCompare(b.name)))].join('');
     const target = workspace.path(relative);
     const written = workspace.secretFiles()[relative];
+    const repository = workspace.repositoryOf(relative);
+    const exclude = () => { if (repository) excludeFromGit(workspace.path(repository.name), path.posix.relative(repository.name, relative)); };
     if (fs.existsSync(target)) {
-      const current = digest(fs.readFileSync(target, 'utf8'));
-      if (current === digest(secret.value)) { workspace.setSecretFile(relative, current); continue; }
+      const text = fs.readFileSync(target, 'utf8');
+      const current = digest(text);
+      // A .env with these very variables is current however it is laid out (comments, order, quoting).
+      if (current === digest(content) || (!file.contents.length && sameVariables(parseDotenv(text), file.variables))) {
+        exclude(); workspace.setSecretFile(relative, current); continue;
+      }
       if (!force && current !== written) { out.warn(`${relative}: changed locally; not overwritten (pull --force replaces it)`); continue; }
     }
     fs.mkdirSync(path.dirname(target), { recursive: true });
-    fs.writeFileSync(target, secret.value, { mode: 0o600 });
+    fs.writeFileSync(target, content, { mode: 0o600 });
     fs.chmodSync(target, 0o600);
-    const repository = workspace.repositoryOf(relative);
-    if (repository) excludeFromGit(workspace.path(repository.name), path.posix.relative(repository.name, relative));
-    workspace.setSecretFile(relative, digest(secret.value));
+    exclude();
+    workspace.setSecretFile(relative, digest(content));
   }
   return true;
+}
+
+function sameVariables(a: Array<{ name: string; value: string }>, b: Array<{ name: string; value: string }>): boolean {
+  const map = new Map(a.map(({ name, value }) => [name, value]));
+  return map.size === b.length && b.every(({ name, value }) => map.get(name) === value);
 }

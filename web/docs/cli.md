@@ -49,7 +49,7 @@ tavya import
 `import` shows its plan and asks before changing anything:
 
 - Each checkout becomes a repository of the project. One with no GitHub remote gets a new private repository on your organization's GitHub account, and unpushed commits are pushed.
-- What Git ignores is sorted for you: `.env` files become secrets, files like `credentials.json` or `*.pem` become secret files, and databases and data folders (`data/`, `models/`, or anything over 50 MB) become data. Dependencies and build output are left out, and the rest is listed so you can choose.
+- What Git ignores is sorted for you: each `.env` stays in its own repository (its values stored as secrets), files like `credentials.json` or `*.pem` become secret files, and databases and data folders (`data/`, `models/`, or anything over 50 MB) become data. Dependencies and build output are left out, and the rest is listed so you can choose.
 - `--data <path>` and `--secret <path>` add something it left out; `--skip <path>` leaves something out. `--dry-run` only shows the plan.
 
 The folder then is the project's workspace: `tavya push`, `pull` and `status` work in it, and anyone can `tavya clone` the same layout. Importing again adds new checkouts and files, and never overwrites a secret the project already has.
@@ -84,6 +84,8 @@ Inside a project's folder, a task is its number; anywhere else, `my-org/my-proje
 ## Secrets
 
 `tavya secrets list|set|import|rm` manages the project's secrets without ever printing a value. `tavya env` prints them for your own shell, if your role allows it.
+
+Each repository keeps its own `.env`. `tavya secrets import api/.env` stores that file's variables as lines of the `api` repository's `.env`, and every task and clone gets the file back in that place. Two repositories can each have their own `DATABASE_URL`. Variables from standard input (`tavya secrets import - < shared.env`) go to every command instead. `tavya secrets set NAME --file web/.env` adds one line to a file.
 
 ## Scripts and CI
 

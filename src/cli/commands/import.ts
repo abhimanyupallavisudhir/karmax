@@ -1,10 +1,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Api } from '../api.js';
-import { parseEnvironmentValues } from '../../domain/dotenv.js';
+import { parseDotenv } from '../../domain/dotenv.js';
 import { dataFolder, DATA_FOLDER_BYTES, exampleEnvironmentFile, likelySecret, regenerated, sqliteDatabase } from '../../domain/ignored-files.js';
 import { aheadBehind, currentBranch, dirty, excludeFromGit, git, gitOk, isRepository } from '../git.js';
-import { accessOf, createDataResource, kindOf, projectSecrets, sizeOf, storeSecretFile, storeVariables, targetOf, type Kind } from '../onboard.js';
+import { accessOf, createDataResource, kindOf, placeOf, projectSecrets, sizeOf, storeEnvironmentFile, storeSecretFile, type Kind } from '../onboard.js';
 import { namesOrganization, slug, type Organization, type Project } from '../refs.js';
 import { pushProjectResource } from '../resources.js';
 import { bytes, CliError, confirm, EXIT, interactive, table, type Output } from '../util.js';
@@ -69,8 +69,9 @@ interface Checkout {
 }
 
 /** An ignored file or folder to keep. `inner` is relative to its checkout, or to the root when it has none. */
-interface Item { local: string; checkout?: Checkout; inner: string; kind: Kind; shape: 'file' | 'directory'; bytes: number; access: 'read' | 'write'; note?: string }
+interface Item { local: string; checkout?: Checkout; inner: string; kind: Kind; shape: 'file' | 'directory'; bytes: number; access: 'read' | 'write' }
 
+const count = (n: number, noun: string) => `${n} ${noun}${n === 1 ? '' : 's'}`;
 const posix = (value: string) => value.split(path.sep).join('/');
 const within = (child: string, parent: string) => parent === '.' || child === parent || child.startsWith(`${parent}/`);
 const joinLocal = (dir: string, inner: string) => dir === '.' ? inner : `${dir}/${inner}`;
@@ -201,7 +202,7 @@ export async function importProject(api: Api, dir: string, out: Output, flags: R
   // Importing a workspace again proposes only what the project does not keep yet.
   if (workspace) for (let index = items.length - 1; index >= 0; index--) {
     const world = workspace.worldPath(path.join(root, items[index]!.local));
-    if (workspace.manifest.resources.some((resource) => resource.path === world) || workspace.manifest.secrets.some((secret) => secret.file === world))
+    if (workspace.manifest.resources.some((resource) => resource.path === world) || workspace.manifest.secrets.some((secret) => secret.file === world || secret.dotenv === world))
       items.splice(index, 1);
   }
 
@@ -242,22 +243,14 @@ export async function importProject(api: Api, dir: string, out: Output, flags: R
       shape: stat.isDirectory() ? 'directory' : 'file', bytes: sizeOf(absolute), access: accessOf(relative) });
   }
 
-  // Project variables are one set: .env files that disagree on one are kept as files, each where it is.
-  const environments = new Map(items.filter((item) => item.kind === 'env')
-    .map((item) => [item, parseEnvironmentValues(fs.readFileSync(path.join(root, item.local), 'utf8'))]));
-  const values = new Map<string, Set<string>>();
-  for (const entries of environments.values()) for (const { name, value } of entries)
-    values.set(name, (values.get(name) ?? new Set()).add(value));
-  for (const [item, entries] of environments) if (entries.some((entry) => values.get(entry.name)!.size > 1))
-    Object.assign(item, { kind: 'secret', note: 'other .env files set its variables differently' });
-
   // The plan.
   const name: string = workspace?.manifest.project.name ?? flags.name ?? (toplevel
     ? checkouts[0]!.repository?.name ?? checkouts[0]!.createAs! : path.basename(root));
   let project: Project | undefined = workspace ? { id: workspace.manifest.project.id, name: workspace.manifest.project.name }
     : (await api.get<Project[]>(`${orgBase}/projects`)).find((entry) => slug(entry.name) === slug(name));
   const newProject = !project;
-  const describe = (item: Item) => item.kind === 'env' ? 'variables' : item.kind === 'secret' ? `secret file${item.note ? ` (${item.note})` : ''}`
+  const describe = (item: Item) => item.kind === 'env' ? `.env, ${count(parseDotenv(fs.readFileSync(path.join(root, item.local), 'utf8')).length, 'variable')}`
+    : item.kind === 'secret' ? 'secret file'
     : `data, ${bytes(item.bytes)}${item.access === 'write' ? ', tasks may change it through review' : ''}`;
   const rows = [
     ...checkouts.map((checkout) => [checkout.local === '.' ? path.basename(root) : checkout.local,
@@ -270,7 +263,7 @@ export async function importProject(api: Api, dir: string, out: Output, flags: R
     repositories: checkouts.map((checkout) => ({ folder: checkout.local, repository: checkout.repository
       ? `${checkout.repository.owner}/${checkout.repository.name}` : `${connection!.accountLogin}/${checkout.createAs}`,
     create: !checkout.repository, ...(checkout.push ? { push: checkout.push } : {}), uncommitted: checkout.uncommitted })),
-    secrets: items.filter((item) => item.kind !== 'data').map((item) => ({ path: item.local, as: item.kind === 'env' ? 'variables' : 'file' })),
+    secrets: items.filter((item) => item.kind !== 'data').map((item) => ({ path: item.local, as: item.kind === 'env' ? '.env' : 'file' })),
     data: items.filter((item) => item.kind === 'data').map((item) => ({ path: item.local, bytes: item.bytes, access: item.access })),
     leftOut };
   out.info(`Import ${path.relative(process.cwd(), root) || '.'} into ${newProject ? 'a new project ' : ''}${orgSlug}/${slug(name)}:`);
@@ -317,38 +310,40 @@ export async function importProject(api: Api, dir: string, out: Output, flags: R
     return entry.role === 'development' && github?.owner.toLowerCase() === checkout.repository!.owner.toLowerCase()
       && github.name.toLowerCase() === checkout.repository!.name.toLowerCase();
   })?.name ?? checkout.repository!.name;
-  const target = (item: Item) => targetOf(item.checkout ? `${item.checkout.world}/${item.inner}` : item.inner, manifest.workdir);
+  const worldOf = (item: Item) => item.checkout ? `${item.checkout.world}/${item.inner}` : item.inner;
+  const placed = (item: Item) => {
+    const place = placeOf(worldOf(item), manifest);
+    if (!place) out.warn(`${item.local}: outside the project's repositories; not kept`);
+    return place;
+  };
 
-  // 3. Secrets: variables and files the project does not have yet.
+  // 3. Secrets: each .env stays a file in its repository; secret files too. What the project has, it keeps.
   const secrets = await projectSecrets(api, project.id);
   const stored: string[] = []; const kept: string[] = []; const secretFiles: Array<{ world: string; file: string }> = [];
   for (const item of items.filter((candidate) => candidate.kind !== 'data')) {
     const file = path.join(root, item.local);
+    const place = placed(item);
+    if (!place) continue;
     if (item.kind === 'env') {
-      const result = await storeVariables(api, project.id, fs.readFileSync(file, 'utf8'), secrets, false);
-      stored.push(...result.stored); kept.push(...result.kept);
-      continue;
-    }
-    const where = target(item);
-    if (!where) { out.warn(`${item.local}: outside the project's working folder; not kept`); continue; }
-    const result = await storeSecretFile(api, project.id, file, where, secrets, false);
-    if (result === 'binary') out.warn(`${item.local}: binary; store it in the vault instead`);
-    else if (result === 'kept') kept.push(item.local);
-    else {
-      stored.push(result.name);
-      secretFiles.push({ world: path.posix.normalize(path.posix.join(manifest.workdir, where)).replace(/^\.\//, ''), file });
+      const result = await storeEnvironmentFile(api, project.id, fs.readFileSync(file, 'utf8'), place, secrets, false);
+      stored.push(...result.stored.map((variable) => `${worldOf(item)}:${variable}`));
+      kept.push(...result.kept.map((variable) => `${worldOf(item)}:${variable}`));
+    } else {
+      const result = await storeSecretFile(api, project.id, file, place, secrets, false);
+      if (result === 'binary') out.warn(`${item.local}: binary; store it in the vault instead`);
+      else if (result === 'kept') kept.push(worldOf(item));
+      else { stored.push(worldOf(item)); secretFiles.push({ world: worldOf(item), file }); }
     }
     if (item.checkout) excludeFromGit(item.checkout.dir, item.inner);
   }
 
   // 4. Data: a resource per path, then the folder becomes the workspace and pushes it.
-  const resources = await api.get<Array<{ id: string; target?: { path?: string } }>>(`${projectBase}/resources`);
   const data: Array<{ item: Item; id: string }> = [];
   for (const item of items.filter((candidate) => candidate.kind === 'data')) {
-    const where = target(item);
-    if (!where) { out.warn(`${item.local}: outside the project's working folder; not kept`); continue; }
-    const resource = resources.find((candidate) => candidate.target?.path === where);
-    data.push({ item, id: resource?.id ?? (await createDataResource(api, project.id, where, item.shape, item.access)).id });
+    const place = placed(item);
+    if (!place) continue;
+    const resource = manifest.resources.find((candidate) => candidate.path === worldOf(item));
+    data.push({ item, id: resource?.id ?? (await createDataResource(api, project.id, place, manifest.workdir, item.shape, item.access)).id });
     if (item.checkout) excludeFromGit(item.checkout.dir, item.inner);
   }
   manifest = await fetchManifest(api, { projectId: project.id });
