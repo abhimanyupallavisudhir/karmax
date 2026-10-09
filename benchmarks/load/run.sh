@@ -23,6 +23,8 @@
 # Needs: the AWS CLI with credentials for an EC2-only IAM user (README.md),
 # AWS_REGION (default eu-central-1), git, ssh, curl, python3 and Node ≥ 22.6.
 set -euo pipefail
+# A failed AWS call inside $(…) must stop the run, not hand back an empty id.
+shopt -s inherit_errexit
 
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 REPO=$(git -C "$HERE" rev-parse --show-toplevel)
@@ -169,6 +171,7 @@ launch() { # launch ROLE TYPE DISK_GB -> instance id
     --block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=$3,VolumeType=gp3,DeleteOnTermination=true}" \
     --tag-specifications "$(tag_spec instance "$RUN_ID" "$RUN_ID-$1")" "$(tag_spec volume "$RUN_ID" "$RUN_ID-$1")" \
     --query 'Instances[0].InstanceId')
+  [ -n "$id" ] && [ "$id" != None ] || die "could not launch the $1 VM ($2)"
   printf '{"id":"%s","role":"%s","type":"%s","diskGb":%d,"launched":%d}\n' "$id" "$1" "$2" "$3" "$(date +%s)" >> "$WORK/instances.jsonl"
   echo "$id"
 }
