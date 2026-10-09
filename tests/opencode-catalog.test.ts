@@ -28,6 +28,15 @@ describe('OpenCode models for an organization\'s API keys (task #515)', () => {
     expect(await openCodeKeyModels([], { fetch, now })).toEqual([]);
   });
 
+  it('never answers one fetcher from a catalog another fetcher cached (CI #1650)', async () => {
+    const now = Date.UTC(2026, 9, 9);
+    const other = { openrouter: { models: { 'x/other': { id: 'x/other', tool_call: true } } } };
+    await openCodeKeyModels(['openrouter'], { fetch: (async () => new Response(JSON.stringify(other))) as typeof globalThis.fetch, now });
+    const fetch = (async () => new Response(JSON.stringify(catalog))) as typeof globalThis.fetch;
+    expect((await openCodeKeyModels(['openrouter'], { fetch, now })).map((model) => model.id))
+      .toEqual(['openrouter/google/gemini-3.1-pro-preview', 'openrouter/anthropic/claude-sonnet-5']);
+  });
+
   it('lists nothing for a vendor when the catalog cannot be read', async () => {
     const fetch = (async () => { throw new Error('offline'); }) as typeof globalThis.fetch;
     // A fresh process-wide cache is not guaranteed here: a later "now" expires it.

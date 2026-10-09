@@ -19,7 +19,7 @@ function extractFn(name) {
 global.esc = (v) => String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 global.inhAttr = (v) => `data-inherit='${esc(JSON.stringify(v ?? null))}'`;
 global.wireMcpPicker = () => {};
-global.effortSelectHtml = (_cls, _provider, _model, effort) => `<select class="af-effort"><option selected>${effort || ''}</option></select>`;
+global.modelFieldHtml = (cls, spec) => `<input class="${cls}" value="${esc([spec.provider, spec.model, spec.effort].filter(Boolean).join(':'))}">`;
 global.AGENT_PROVIDERS = ['claude', 'codex', 'opencode', 'mock'];
 global.agentProviderChoice = (provider) => AGENT_PROVIDERS.includes(provider) ? provider : AGENT_PROVIDERS[0];
 global.S = { tasks: [], meta: { hostLocal: true }, projects: [{ id: 'p1', name: 'Website' }, { id: 'p2', name: 'Billing' }] };
@@ -115,7 +115,7 @@ const existing = renderAgentField(
 );
 ok(existing.includes('class="af-resume-enabled" checked'), 'an already-selected task fork checks the box');
 ok(existing.includes('class="af-resume-panel" >'), 'an already-selected task fork starts expanded');
-ok(existing.includes('value="gpt-source"'), 'existing fork parameters remain visible');
+ok(existing.includes('value="codex:gpt-source:high"'), 'existing fork parameters remain visible');
 
 // ── the chosen-source chip: a permalink to the source + the re-authorize option
 const source = {
@@ -151,9 +151,9 @@ const element = (extra = {}) => ({
   addEventListener(type, fn) { listeners.set(`${this.key}:${type}`, fn); },
   ...extra,
 });
-const provider = element({ key: 'provider', value: 'claude' });
-const model = element({ key: 'model', value: '' });
-const effort = element({ key: 'effort', value: '', options: [{ value: '' }, { value: 'high' }] });
+// The model field, as the one harness:model:effort value it holds.
+const ref = element({ key: 'ref', value: 'claude' });
+const controls = element({ key: 'controls', querySelector: () => null });
 const enabled = element({ key: 'enabled' });
 const panel = element({ key: 'panel' });
 // The chip container: its innerHTML is re-rendered by the box, so model the two
@@ -183,8 +183,7 @@ const box = {
   dataset: { agent: 'do' },
   querySelector(selector) {
     return {
-      '.af-model-combo': null, '.af-provider': provider, '.af-model': model,
-      '.af-effort': effort, '.af-resume-enabled': enabled, '.af-resume-panel': panel,
+      '.agent-controls': controls, '.af-resume-enabled': enabled, '.af-resume-panel': panel,
       '.af-resume-chosen': chosen, '.af-resume-pick': pick, '.af-resume-session': sessionInput,
       '.af-resume-upload input': uploadInput, '.af-resume-uploaded': uploaded,
     }[selector];
@@ -193,26 +192,25 @@ const box = {
   classList: { toggle(name, on) { on ? classes.add(name) : classes.delete(name); } },
   dispatchEvent(event) { dispatched.push(event.type); if (event.type === 'af-reauthorize') hostListeners.get('af-reauthorize')?.(event); },
 };
-global.wireCombo = () => {};
-global.modelOptions = () => [];
-global.refreshEffortSelect = () => {};
+global.wireModelField = () => {};
+global.setModelField = (_root, spec) => { ref.value = [spec.provider, spec.model, spec.effort].filter(Boolean).join(':'); };
+global.readModelField = () => { const [provider, model = '', effort = ''] = ref.value.split(':'); return { provider, model, effort }; };
 global.Event = class Event { constructor(type) { this.type = type; } };
 let picker;
 global.openTaskPicker = (config) => { picker = config; };
 eval(extractFn('wireAgentBox'));
 
 wireAgentBox(box);
-ok(panel.hidden && !provider.disabled, 'unchecked box is collapsed and provider is editable');
+ok(panel.hidden && !ref.disabled, 'unchecked box is collapsed and provider is editable');
 enabled.checked = true;
 listeners.get('enabled:change')();
-ok(!panel.hidden && !provider.disabled, 'checking expands before a source agent is selected');
+ok(!panel.hidden && !ref.disabled, 'checking expands before a source agent is selected');
 listeners.get('pick:click')();
 picker.onPick({
   task: { id: 'task_source', num: 42, title: 'Source', projectId: 'p1' }, role: 'do',
   session: { id: 'session-1', provider: 'codex', model: 'gpt-source', effort: 'high' },
 });
-ok(provider.value === 'claude' && !provider.disabled, 'source selection leaves the destination agent editable');
-ok(model.value === '' && effort.value === '', 'source selection does not overwrite destination model settings');
+ok(ref.value === 'claude' && !ref.disabled, 'source selection leaves the destination agent editable, without overwriting its model');
 ok(readResume(box)?.taskId === 'task_source', 'checked selection is collected as a task fork');
 ok(chosen.innerHTML.includes('href="/acme/p1/tasks/42"'), 'the picked source renders as a link even when the task list does not hold it');
 ok(!chosen.innerHTML.includes('af-resume-reauthorize'), 'a picked source without grants offers nothing to re-authorize');
@@ -225,11 +223,11 @@ uploaded.dataset.upload = JSON.stringify({ id: 'a'.repeat(64), name: 'session.js
 ok(readResume(box)?.upload?.format === 'codex', 'an uploaded conversation is collected as the sole source');
 enabled.checked = false;
 listeners.get('enabled:change')();
-ok(panel.hidden && !provider.disabled, 'unchecking collapses the panel and unlocks provider customization');
+ok(panel.hidden && !ref.disabled, 'unchecking collapses the panel and unlocks provider customization');
 ok(readResume(box) === undefined, 'unchecked fork is omitted from submitted parameters');
 enabled.checked = true;
 listeners.get('enabled:change')();
-ok(!provider.disabled && readResume(box) === undefined, 'rechecking does not revive a stale source');
+ok(!ref.disabled && readResume(box) === undefined, 'rechecking does not revive a stale source');
 
 // ── re-authorize: outside a grant-hosting form the option stays hidden
 picker.onPick({ task: source, role: 'do', session: { id: 'session-1', provider: 'codex' } });

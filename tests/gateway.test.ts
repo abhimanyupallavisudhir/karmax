@@ -77,6 +77,56 @@ describe('gateway HTTP API (real server end-to-end)', () => {
       .toEqual(expect.arrayContaining(['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna']));
   });
 
+  it('charts runnable models from Artificial Analysis: the bundled snapshot, or the live list with a key', async () => {
+    // No key: the snapshot that ships with tavya.
+    expect((await (await fetch(`${base}/api/meta`)).json() as any).modelBenchmarks).toBe(true);
+    const bundled: any = await (await fetch(`${base}/api/models/benchmarks`, { headers: auth() })).json();
+    expect(bundled.fetchedAt).toBe(Date.parse((await import('../src/agent/model-benchmarks.json', { with: { type: 'json' } })).default.fetchedAt));
+    expect(bundled.models.length).toBeGreaterThan(20);
+    expect(bundled.models).toContainEqual(expect.objectContaining({ ref: { provider: 'claude', model: 'claude-opus-5-5', effort: 'high' } }));
+
+    const requests: string[] = [];
+    const { ArtificialAnalysis } = await import('../src/agent/model-benchmarks.js');
+    const gw = await h.startGateway({ artificialAnalysis: new ArtificialAnalysis({
+      apiKey: 'aa-test-key',
+      fetch: async (_url, init) => {
+        requests.push(new Headers(init?.headers).get('x-api-key') ?? '');
+        return Response.json({ data: [
+          { id: 'aa-1', name: 'Claude Opus 5.5 (High)', slug: 'claude-opus-5-5-high', release_date: new Date().toISOString().slice(0, 10),
+            model_creator: { slug: 'anthropic', name: 'Anthropic' }, evaluations: { artificial_analysis_intelligence_index: 53.6 },
+            pricing: { price_1m_blended_3_to_1: 8, price_1m_input_tokens: 4, price_1m_output_tokens: 20 },
+            median_output_tokens_per_second: 50, median_time_to_first_answer_token: 2 },
+          { id: 'aa-2', name: 'Some Open Model', slug: 'some-open-model', model_creator: { slug: 'someone' },
+            evaluations: { artificial_analysis_intelligence_index: 20 } },
+        ] });
+      },
+    }) });
+    const session: any = await (await fetch(`${gw.url}/api/session`)).json();
+    const headers = { authorization: `Bearer ${session.token}` };
+    expect((await (await fetch(`${gw.url}/api/meta`)).json() as any).modelBenchmarks).toBe(true);
+    for (let i = 0; i < 2; i++) {
+      const response = await fetch(`${gw.url}/api/models/benchmarks`, { headers });
+      expect(response.status).toBe(200);
+      const body: any = await response.json();
+      expect(body.source.url).toBe('https://artificialanalysis.ai/');
+      expect(body.models).toEqual([expect.objectContaining({
+        id: 'aa-1', intelligence: 53.6, price: 8, seconds: 12, cost: 0.016,
+        ref: { provider: 'claude', model: 'claude-opus-5-5', effort: 'high' },
+      })]);
+      expect(JSON.stringify(body)).not.toContain('aa-test-key');
+    }
+    expect(requests).toEqual(['aa-test-key']);
+    expect((await fetch(`${gw.url}/api/models/benchmarks`)).status).toBe(401);
+
+    // Neither a snapshot nor a key: the chart is withdrawn.
+    const none = await h.startGateway({ artificialAnalysis: new ArtificialAnalysis({ snapshot: null }) });
+    const noneSession: any = await (await fetch(`${none.url}/api/session`)).json();
+    expect((await (await fetch(`${none.url}/api/meta`)).json() as any).modelBenchmarks).toBe(false);
+    expect((await fetch(`${none.url}/api/models/benchmarks`, { headers: { authorization: `Bearer ${noneSession.token}` } })).status).toBe(404);
+    await none.close();
+    await gw.close();
+  });
+
   it('accepts only recognized project-scoped conversation files', async () => {
     const project = (await h.store.createProject('Conversation imports'));
     const sessionId = '11111111-1111-4111-8111-111111111111';

@@ -225,6 +225,7 @@ export const PLATFORM_API_CATALOG = {
     'POST /api/projects/:projectId/propose-workflow-edit',
     'GET|PUT /api/profiles', 'DELETE /api/profiles/:id',
     'GET /api/models|schema|events/catalog|contributions', 'GET /api/defaults/:projectId/:workflow',
+    'GET /api/models/benchmarks (Artificial Analysis intelligence, cost per answer and time of each runnable provider:model:effort)',
     'GET|PUT /api/settings/global/:workflow (shared installation; settings:read/write; God authority)', 'GET|PUT /api/settings/project/:projectId/:workflow',
     ...(EXPLANATIONS_ENABLED ? ['GET|PUT /api/projects/:projectId/explanation-settings'] : []),
     'GET|PUT /api/settings/quick/global/:workflow', 'GET|PUT /api/settings/quick/project/:projectId/:workflow',
