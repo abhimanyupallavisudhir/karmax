@@ -1273,10 +1273,12 @@ function wireModelField(field, { fallbackProvider } = {}) {
 }
 
 // ── Compare models: intelligence against cost or time ────────────────────────
-// Artificial Analysis benchmarks (fetched and cached by the server, which holds
-// the key) of the models a harness here can run, one point per
-// harness:model:effort. The staircase is the Pareto frontier: nothing is both
-// cheaper (or faster) and smarter than a point on it. Picking a point fills the field.
+// Artificial Analysis benchmarks (bundled with tavya, or fetched daily by the
+// server when it has a key) of the models a harness here can run, one point per
+// harness:model:effort. The line is the efficient frontier: the upper convex hull
+// of the Pareto-optimal points, as plotted (log cost or time against
+// intelligence), so each step along it buys intelligence at a worsening rate.
+// Picking a point fills the field.
 const MODEL_CHART_METRICS = {
   cost: { label: 'Cost', axis: '$ per answer', ticks: [0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5], format: (v) => `$${Number(v.toPrecision(2))}` },
   seconds: { label: 'Time', axis: 'seconds per answer', ticks: [0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000], format: (v) => `${v < 10 ? Math.round(v * 10) / 10 : Math.round(v)} s` },
@@ -1293,12 +1295,24 @@ function loadModelBenchmarks() {
 }
 // "Claude Opus 5.5 (High, Default Fallback)" → "Claude Opus 5.5 · high"
 const benchmarkLabel = (model) => `${model.name.replace(/\s*\([^()]*\)\s*$/, '')}${model.ref.effort ? ` · ${model.ref.effort}` : ''}`;
-// Cheapest-or-fastest first; a point is on the frontier when it beats every point to its left.
+// Cheapest-or-fastest first: the Pareto-optimal points (each beats every point
+// to its left), then the upper convex hull of those in plotted coordinates.
 function paretoFrontier(points, metric) {
   const sorted = [...points].sort((a, b) => a[metric] - b[metric] || b.intelligence - a.intelligence);
-  const frontier = [];
-  for (const point of sorted) if (!frontier.length || point.intelligence > frontier[frontier.length - 1].intelligence) frontier.push(point);
-  return frontier;
+  const pareto = [];
+  for (const point of sorted) if (!pareto.length || point.intelligence > pareto[pareto.length - 1].intelligence) pareto.push(point);
+  const at = (point) => ({ x: Math.log10(point[metric]), y: point.intelligence });
+  const hull = [];
+  for (const point of pareto) {
+    // Drop the last point while it sits on or below the chord to this one.
+    while (hull.length >= 2) {
+      const o = at(hull[hull.length - 2]), a = at(hull[hull.length - 1]), b = at(point);
+      if ((a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x) < 0) break;
+      hull.pop();
+    }
+    hull.push(point);
+  }
+  return hull;
 }
 function modelChartSvg(models, metric, current, hidden) {
   const spec = MODEL_CHART_METRICS[metric];
@@ -1327,7 +1341,7 @@ function modelChartSvg(models, metric, current, hidden) {
     return `<polyline class="mc-ladder" data-harness="${esc(ordered[0].ref.provider)}" points="${ordered.map((point) => `${x(point[metric]).toFixed(1)},${y(point.intelligence).toFixed(1)}`).join(' ')}"/>`;
   });
   const frontier = paretoFrontier(points, metric);
-  const stairs = frontier.map((point, index) => `${index ? `H${x(point[metric]).toFixed(1)}V` : `M${x(point[metric]).toFixed(1)},`}${y(point.intelligence).toFixed(1)}`).join('');
+  const line = frontier.map((point, index) => `${index ? 'L' : 'M'}${x(point[metric]).toFixed(1)},${y(point.intelligence).toFixed(1)}`).join('');
   const onFrontier = new Set(frontier);
   const isCurrent = (point) => current && point.ref.provider === current.provider && point.ref.model === current.model && (point.ref.effort || '') === (current.effort || '');
   const dots = [...points].sort((a, b) => Number(onFrontier.has(a)) - Number(onFrontier.has(b))).map((point) => {
@@ -1344,7 +1358,7 @@ function modelChartSvg(models, metric, current, hidden) {
   const labels = frontier.flatMap((point) => {
     const text = benchmarkLabel(point);
     const width = text.length * 5.6;
-    // Above and to the left, clear of the staircase, which leaves each point rightwards.
+    // Above and to the left, clear of the frontier, which runs below-left to above-right.
     const px = x(point[metric]), py = y(point.intelligence);
     const left = px - 8 - width >= L;
     const box = { x: left ? px - 8 - width : px + 8, y: py - 17, w: width, h: 12 };
@@ -1357,7 +1371,7 @@ function modelChartSvg(models, metric, current, hidden) {
     <text class="mc-axis" x="${L}" y="${T - 4}" >Intelligence</text>
     <text class="mc-axis" x="${W - R}" y="${H - 4}" text-anchor="end">${esc(spec.label)} · ${esc(spec.axis)} →</text>
     ${ladderPaths.join('')}
-    <path class="mc-frontier" d="${stairs}"/>
+    <path class="mc-frontier" d="${line}"/>
     ${dots.join('')}
     ${labels.join('')}
   </svg>` };
@@ -1377,7 +1391,7 @@ function openModelChart(current, onPick, opener) {
     <div class="mc-plot"><div class="mc-empty">Loading…</div></div>
     <div class="mc-foot">
       <div class="mc-legend"></div>
-      <span class="mc-source">${policyTip('Intelligence is the Artificial Analysis Intelligence Index. Cost and time are for a 500-token answer to a short prompt, thinking included, as Artificial Analysis measures them. Lines join one model\'s effort levels; the staircase is the most intelligence you can get for the cost or time.')} Data: <a href="https://artificialanalysis.ai/" target="_blank" rel="noopener">Artificial Analysis</a></span>
+      <span class="mc-source">${policyTip('Intelligence is the Artificial Analysis Intelligence Index. Cost and time are for a 500-token answer to a short prompt, thinking included, as Artificial Analysis measures them. Thin lines join one model\'s effort levels; the dark line is the most intelligence you can get for the cost or time.')} Data: <a href="https://artificialanalysis.ai/" target="_blank" rel="noopener">Artificial Analysis</a></span>
     </div>
   </div>`;
   document.body.appendChild(overlay);

@@ -145,8 +145,11 @@ describe('model field', () => {
     expect(await points.count()).toBe(4);
     expect(await ui.page.locator('.mc-missing').innerText()).toContain('1 without cost data');
     expect(await ui.page.locator('.mc-point.current').getAttribute('aria-label')).toContain('Claude Opus 5.5 · high');
-    // Frontier by cost: Luna high ($0.004) → Opus low ($0.02) → Opus high ($0.10); Gemini is dominated.
-    expect(await ui.page.locator('.mc-label').allTextContents()).toEqual(['GPT-6 Luna · high', 'Claude Opus 5.5 · low', 'Claude Opus 5.5 · high']);
+    // Frontier by cost is the upper convex hull of the Pareto-optimal points, as plotted:
+    // Opus low ($0.02, 42.3) is Pareto-optimal but under the line from Luna high
+    // ($0.004, 32.9) to Opus high ($0.10, 53.6) on the log axis; Gemini is dominated.
+    expect(await ui.page.locator('.mc-label').allTextContents()).toEqual(['GPT-6 Luna · high', 'Claude Opus 5.5 · high']);
+    expect(await ui.page.locator('.mc-frontier').getAttribute('d')).toMatch(/^M[\d.]+,[\d.]+L[\d.]+,[\d.]+$/);
     expect(await ui.page.locator('.mc-source a').getAttribute('href')).toBe('https://artificialanalysis.ai/');
 
     await ui.page.getByRole('button', { name: 'Time', exact: true }).click();
