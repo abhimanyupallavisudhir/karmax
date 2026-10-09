@@ -62,13 +62,15 @@ describe('CI workflow', () => {
 // that pulls from Docker Hub logs in first, except on fork pull requests, which
 // get no secrets and must still run.
 describe('Docker Hub login', () => {
-  type Step = { name?: string; if?: string; uses?: string; run?: string; with?: Record<string, string> };
+  type Step = {
+    name?: string; if?: string; uses?: string; run?: string; with?: Record<string, string>; 'continue-on-error'?: boolean;
+  };
   const login = (steps: Step[]) => steps.findIndex((step) => step.uses?.startsWith('docker/login-action@'));
 
   it.each([
     ['test', 'npm test -- --shard='],
     ['deploy-artifacts', './deploy/karmax up '],
-  ])('%s logs in, pinned and skipped without the secret, before it pulls', (name, pull) => {
+  ])('%s logs in, pinned, skipped without the secret and best-effort, before it pulls', (name, pull) => {
     const job = ci.jobs[name];
     const steps: Step[] = job.steps;
     const index = login(steps);
@@ -79,15 +81,16 @@ describe('Docker Hub login', () => {
     expect(job.env.DOCKERHUB_USERNAME).toBe('${{ secrets.DOCKERHUB_USERNAME }}');
     expect(step.if).toContain("env.DOCKERHUB_USERNAME != ''");
     expect(step.with).toEqual({ username: '${{ env.DOCKERHUB_USERNAME }}', password: '${{ secrets.DOCKERHUB_TOKEN }}' });
+    // CI #1713: Docker Hub's authenticated path failed while anonymous pulls
+    // worked; a failed login must fall back to them, not fail the job.
+    expect(step['continue-on-error']).toBe(true);
   });
 
-  // Services are pulled before any step runs; the runner skips the login when
-  // the credentials are empty.
-  it('pulls the test shards\' services with the same credentials', () => {
+  // A service whose registry login fails fails the job before any step, with
+  // no anonymous fallback.
+  it('pulls the test shards\' services anonymously', () => {
     for (const service of Object.values<any>(ci.jobs.test.services))
-      expect(service.credentials).toEqual({
-        username: '${{ secrets.DOCKERHUB_USERNAME }}', password: '${{ secrets.DOCKERHUB_TOKEN }}',
-      });
+      expect(service.credentials).toBeUndefined();
   });
 });
 

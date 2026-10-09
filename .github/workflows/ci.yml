@@ -83,11 +83,6 @@ jobs:
     services:
       postgres:
         image: postgres:16
-        # The runner pulls services before any step, so they take credentials
-        # of their own; it pulls anonymously when they are empty (forks).
-        credentials:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
         env:
           POSTGRES_USER: karmax_test
           POSTGRES_PASSWORD: karmax_test
@@ -157,9 +152,12 @@ jobs:
 
       # Authenticated pulls (node:22, node:22-slim in the Docker suites) avoid
       # Docker Hub's anonymous rate limit. Fork pull requests get no secrets,
-      # so they skip this and pull anonymously.
+      # so they skip this, and a failed login (Docker Hub's authenticated path
+      # was down in CI #1713) falls back to pulling anonymously. The postgres
+      # service stays anonymous: a service whose login fails fails the job.
       - name: Log in to Docker Hub
         if: env.DOCKERHUB_USERNAME != ''
+        continue-on-error: true
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           username: ${{ env.DOCKERHUB_USERNAME }}
@@ -255,9 +253,11 @@ jobs:
           echo "deployment artifacts affected: $artifacts"
 
       # The builds and the stack pull node, caddy, postgres and temporalio
-      # images from Docker Hub; forks skip this and pull anonymously.
+      # images from Docker Hub; forks skip this, and a failed login falls back
+      # to pulling anonymously.
       - name: Log in to Docker Hub
         if: steps.scope.outputs.artifacts == 'true' && env.DOCKERHUB_USERNAME != ''
+        continue-on-error: true
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           username: ${{ env.DOCKERHUB_USERNAME }}
