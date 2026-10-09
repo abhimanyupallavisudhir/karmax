@@ -180,3 +180,10 @@ jobs:
         env:
           KARMAX_RUN_LIVE: '1'
           GH_TOKEN: ${{ secrets.LIVE_GITHUB_TOKEN }}
+      # A classic public_repo token of the fork's owner, who also owns the
+      # App-less upstream organization (wiki features/fork-contributions).
+      - run: npx vitest run tests/github-fork-live.test.ts
+        if: ${{ !cancelled() }}
+        env:
+          KARMAX_RUN_LIVE: '1'
+          LIVE_GITHUB_FORK_TOKEN: ${{ secrets.LIVE_GITHUB_FORK_TOKEN }}
