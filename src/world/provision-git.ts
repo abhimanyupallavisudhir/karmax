@@ -1,5 +1,8 @@
 import { concurrentMap } from '../util/concurrent-map.js';
 import { missingBaseAdjustment } from './branch-fallback.js';
+import { remoteName, worldCheckoutNames } from '../domain/world-location.js';
+
+export { remoteName };
 import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -111,7 +114,7 @@ export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec
     return { root, repos: [], warnings, ephemeralPaths, ...(spec.scratch ? { workdir: root } : {}) };
   }
   const multi = sources.length > 1 || spec.scratch || spec.layout === 'nested';
-  const allNames = uniqueNames([...(spec.scratch ? ['scratch'] : []), ...sources.map(remoteName)]);
+  const allNames = worldCheckoutNames([...(spec.scratch ? ['scratch'] : []), ...sources]);
   const scratchName = spec.scratch ? allNames[0]! : undefined;
   const names = (spec.scratch ? allNames.slice(1) : allNames)
     .map((name, index) => spec.checkouts?.[index]?.name ?? name);
@@ -291,22 +294,6 @@ async function configureRepo(target: ProvisionTarget, root: string, spec: WorldS
 
 function isSshRemote(value: string): boolean {
   return /^(?:ssh:\/\/|git@)[^\s]+/.test(value);
-}
-
-/** World checkout name for a repository source (its basename). */
-export function remoteName(remote: string): string {
-  const raw = remote.replace(/\/$/, '').split(/[/:]/).pop()?.replace(/\.git$/, '') || 'repo';
-  const safe = raw.replace(/[^a-zA-Z0-9._-]/g, '-');
-  return !safe || /^\.+$/.test(safe) ? 'repo' : safe;
-}
-
-function uniqueNames(names: string[]): string[] {
-  const seen = new Map<string, number>();
-  return names.map((name) => {
-    const count = seen.get(name) ?? 0;
-    seen.set(name, count + 1);
-    return count ? `${name}-${count + 1}` : name;
-  });
 }
 
 function quote(value: string): string {

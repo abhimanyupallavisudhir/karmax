@@ -13,7 +13,7 @@ export interface Manifest {
   repositories: Array<{ name: string; role: 'development' | 'project-wiki'; sshUrl: string; branch: string; base?: string; target?: string }>;
   resources: Array<{ id: string; name: string; driver: string; path: string; shape: 'file' | 'directory'; access: 'read' | 'write';
     revisionId?: string; bytes?: number; files?: number; transferable: boolean }>;
-  secrets: Array<{ id: string; name: string; variable?: string; file?: string; configured: boolean }>;
+  secrets: Array<{ id: string; name: string; variable?: string; file?: string; dotenv?: string; configured: boolean }>;
   install: Array<{ repository: string; commands: string[] }>;
 }
 

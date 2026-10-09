@@ -235,6 +235,15 @@ export function worldRepos(handle: WorldHandle): WorldRepo[] {
   return [];
 }
 
+/** A resource location as a root-relative path for the world file API: under
+ * the named checkout, else the working directory. Undefined when this world has
+ * no checkout of that name. */
+export function worldLocationPath(handle: WorldHandle, location: { path: string; repository?: string }): string | undefined {
+  if (location.repository === undefined) return worldWorkingRelativePath(handle, location.path);
+  const repo = worldRepos(handle).find((candidate) => candidate.name === location.repository);
+  return repo ? worldWorkingRelativePath({ ...handle, workdir: repo.root }, location.path) : undefined;
+}
+
 /** Stable configured identity for enrollment/checkpoint lookups. Local
  * worktrees created from URLs branch from a managed checkout, but must retain
  * the URL selected in project Settings. */
