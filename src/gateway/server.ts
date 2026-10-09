@@ -19,7 +19,7 @@ import { probeConnection } from '../mcp/connections/probe.js';
 import { McpConnections, validateMcpSelection } from '../mcp/connections/store.js';
 import { registrySearch } from '../mcp/connections/registry.js';
 import { beginOAuth, finishOAuth, mcpClientMetadata, MCP_CLIENT_METADATA_PATH } from '../mcp/connections/oauth.js';
-import { AppGrants, grantCapabilities, isAppBearer, type AppGrant } from '../auth/app-grants.js';
+import { AppGrants, isAppBearer, sessionCapabilities, type AppGrant } from '../auth/app-grants.js';
 import { OAuthServer } from '../auth/oauth-server.js';
 import { OAuthRoutes, appGrantRouteCapability } from './oauth-routes.js';
 import { publicModelFetch, publicUrl } from '../mcp/connections/http.js';
@@ -9668,11 +9668,8 @@ export class Gateway {
   private async personCaps(session: Pick<Session, 'userId' | 'appGrant'>, projectId?: string, organizationId?: string): Promise<Capability[]> {
     if (!session.userId || !this.deps.authorization) return [];
     const resolvedOrganizationId = organizationId ?? (projectId ? await this.deps.store.projectOrganizationAsync(projectId) : undefined);
-    const caps = await this.deps.authorization.capabilitiesAsync(`user:${session.userId}`, projectId, resolvedOrganizationId);
-    const ceiling = session.appGrant?.ceiling;
-    if (!ceiling) return caps;
-    const level = ceiling.level ? (await this.deps.authorization.profile(ceiling.level, projectId, resolvedOrganizationId))?.capabilities : undefined;
-    return grantCapabilities(ceiling, caps, { projectId, organizationId: resolvedOrganizationId }, level);
+    return sessionCapabilities(this.deps.authorization, session.userId, session.appGrant?.ceiling,
+      { projectId, organizationId: resolvedOrganizationId });
   }
 
   /** Mint (or reuse) the short-lived principal token for a browser session or
