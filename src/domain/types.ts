@@ -1397,7 +1397,11 @@ export interface ActionArg {
 
 // ─── Parameter schema (SPEC §10.4) — drives task forms + settings + defaults ──
 
-export type FieldType = 'text' | 'string' | 'number' | 'boolean' | 'select' | 'list' | 'repoPath' | 'branch' | 'agent' | 'confirmer' | 'responder' | 'computer';
+export type FieldType = 'text' | 'string' | 'number' | 'boolean' | 'select' | 'list' | 'repoPath' | 'branch' | 'repoBranches' | 'agent' | 'confirmer' | 'responder' | 'computer';
+/** Per-repository base/target branches, keyed by the repository source as the
+ * project lists it. A repository without an entry (or a blank name) uses the
+ * task's common base/target. */
+export type RepoBranches = Record<string, { base?: string; target?: string }>;
 /** Which surfaces a field appears on. */
 export type FieldScope = 'task' | 'project' | 'global';
 /** Where a resolved value lands in TaskInput (the generic assembler reads this). */
@@ -1790,6 +1794,9 @@ export interface TaskInput {
   files?: FileRef[];
   base?: string;
   target?: string;
+  /** Per-repository branches (the `repoBranches` field). Provisioning reads the
+   * copy persisted on the task record when it is queued. */
+  repoBranches?: RepoBranches;
   /** Existing branch to merge (merge-only workflow). */
   branch?: string;
   command?: string;

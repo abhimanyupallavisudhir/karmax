@@ -355,8 +355,10 @@ export class WorldLifecycleManager {
   }
 
   private async reconcileProviderUsage(now: number): Promise<void> {
+    const organizations = (await this.store.listOrganizations());
+    const organizationIds = new Set(organizations.map((organization) => organization.id));
     for (const provider of this.worlds.metered()) {
-      for (const organization of (await this.store.listOrganizations())) {
+      for (const organization of organizations) {
         // Each tenant key sees its own E2B project feed. Environment credentials
         // are imported into org_personal on boot, so an absent connection means
         // this organization must not be polled through another tenant's fallback.
@@ -380,18 +382,33 @@ export class WorldLifecycleManager {
           const attribution = new Map<string, Awaited<ReturnType<Store['taskAttribution']>>>();
           for (let offset = 0; offset < events.length; offset += 100) {
             const batch = events.slice(offset, offset + 100);
-            const recorded = (await this.store.recordedUsageEventIds(batch.map(event => `usage:${provider.kind}:${event.id}`)));
+            const recorded = (await this.store.recordedUsageEvents(batch.map(event => `usage:${provider.kind}:${event.id}`)));
             for (const event of batch) {
               const id = `usage:${provider.kind}:${event.id}`;
-              if (recorded.has(id)) continue;
+              const existing = recorded.get(id);
+              if (existing?.taskId) continue;
               if (event.taskId && !attribution.has(event.taskId))
                 attribution.set(event.taskId, (await this.store.taskAttribution(event.taskId)));
               const task = event.taskId ? attribution.get(event.taskId) : undefined;
-              const attributed = task?.organizationId === organization.id;
+              // One provider account may be connected to several organizations,
+              // and its feed then reports all of their executions to each. Book
+              // an execution to the organization that created the sandbox,
+              // whichever organization's key read it; skip one nobody can be
+              // shown to own (an unlabelled sandbox whose task was deleted).
+              const owner = event.organizationId ?? task?.organizationId;
+              if (!owner || !organizationIds.has(owner)) continue;
+              const attributed = task?.organizationId === owner
+                ? { projectId: task.projectId, taskId: event.taskId, worldId: event.taskId } : {};
+              if (existing) {
+                // Repairs rows an earlier sync booked to whoever read them first.
+                if (existing.organizationId !== owner || attributed.taskId)
+                  (await this.store.reattributeUsageEvent(id, { organizationId: owner, ...attributed }));
+                continue;
+              }
               const seconds = event.activeMs / 1000;
               (await this.store.recordUsage({ id,
-                organizationId: organization.id,
-                ...(attributed ? { projectId: task.projectId, taskId: event.taskId, worldId: event.taskId } : {}),
+                organizationId: owner,
+                ...attributed,
                 provider: provider.kind, kind: 'world.active', quantity: seconds, unit: 'second',
                 fundingSource: 'byok',
                 costMicros: Math.round(seconds * costMicrosPerSecond(provider.kind,
@@ -400,7 +417,7 @@ export class WorldLifecycleManager {
                 metadata: { source: 'provider-lifecycle', executionId: event.id,
                   sandboxId: event.sandboxId, cpu: event.cpu, memoryMb: event.memoryMb, gpu: event.gpu ?? 0 },
               }));
-              recorded.add(id);
+              recorded.set(id, { organizationId: owner, ...(attributed.taskId ? { taskId: attributed.taskId } : {}) });
             }
             // The PostgreSQL adapter is synchronous. Even a first-time catchup
             // must let HTTP requests and activity heartbeats make progress.

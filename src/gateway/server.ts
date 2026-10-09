@@ -8235,12 +8235,25 @@ export class Gateway {
           ? effectiveRepos(resolveParams(m, { project: projectVals, global: globalVals }), project.config)[0]
           : undefined;
         const branches = project ? await repositoryBranchDefaults(store, project, repo0) : undefined;
+        // Each repository's own branches, for the per-repository list to start
+        // from: what the common pair would mean in it (its real default branch,
+        // unless a default names one explicitly).
+        const repos = project && m.params.some((field) => field.type === 'repoBranches')
+          ? effectiveRepos(resolveParams(m, { project: projectVals, global: globalVals }), project.config) : [];
+        const repoDefaults = repos.length > 1
+          ? await Promise.all(repos.map((source) => repositoryBranchDefaults(store, project!, source).catch(() => undefined)))
+          : [];
         const enrich = async (vals: Record<string, unknown>, lower: Record<string, unknown>) => {
           const out = (await this.enrichAgentDefaults(m, vals, projectId, organizationId ?? undefined));
+          const detectBase = lower.base === undefined && globalVals.base === undefined && projectVals.base === undefined;
+          const detectTarget = lower.target === undefined && globalVals.target === undefined && projectVals.target === undefined;
           if (branches) {
-            if (lower.base === undefined && globalVals.base === undefined && projectVals.base === undefined) out.base = branches.base;
-            if (lower.target === undefined && globalVals.target === undefined && projectVals.target === undefined) out.target = branches.target;
+            if (detectBase) out.base = branches.base;
+            if (detectTarget) out.target = branches.target;
           }
+          if (repos.length > 1) out._repositoryBranches = repos.map((source, index) => ({ source,
+            base: (detectBase && repoDefaults[index]?.base) || out.base,
+            target: (detectTarget && repoDefaults[index]?.target) || out.target }));
           return out;
         };
         // Quick-task agent defaults (SPEC §10.4): an agent-only overlay for tasks

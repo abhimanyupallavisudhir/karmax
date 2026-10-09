@@ -161,3 +161,13 @@ export function assertInFlightComputerEdit(current: ComputerSpec, next: Computer
   if (next.network !== undefined && JSON.stringify(next.network) !== JSON.stringify(current.network ?? { unrestricted: true }))
     throw new Error('a running task\'s outbound network can\'t change — only its CPU, memory, disk and hibernation');
 }
+
+/** Whether a task's Computer may still be resized. The Computer is the
+ * platform's, not the workflow's: no workflow reads it, so every task may resize
+ * until it ends, whatever workflow version started it — including tasks started
+ * before the Computer existed, whose workflow input has no edit window for it
+ * (pramana#3 ran out of disk with the form greyed out). A task with no view yet
+ * hasn't started. */
+export function computerResizable(view: { status?: string; pointOfNoReturnPassed?: boolean } | undefined): boolean {
+  return !view || (!['done', 'cancelled', 'failed'].includes(view.status ?? '') && !view.pointOfNoReturnPassed);
+}

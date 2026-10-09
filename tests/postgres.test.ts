@@ -605,9 +605,13 @@ integration('PostgreSQL cutover', () => {
       expect((await store.taskAttribution('missing'))).toBeUndefined();
       (await store.recordUsage({ id: 'usage:e2b:known', organizationId: project.organizationId!, provider: 'e2b',
         kind: 'world.active', quantity: 1, unit: 'second', costMicros: 14, startedAt: 1, endedAt: 1001 }));
-      expect((await store.recordedUsageEventIds([])).size).toBe(0);
+      expect((await store.recordedUsageEvents([])).size).toBe(0);
       const ids = Array.from({ length: 501 }, (_, i) => `missing-${i}`);
-      expect((await store.recordedUsageEventIds([...ids, 'usage:e2b:known']))).toEqual(new Set(['usage:e2b:known']));
+      expect((await store.recordedUsageEvents([...ids, 'usage:e2b:known'])))
+        .toEqual(new Map([['usage:e2b:known', { organizationId: project.organizationId }]]));
+      (await store.reattributeUsageEvent('usage:e2b:known', { organizationId: 'org_owner', projectId: project.id, taskId: task.id, worldId: task.id }));
+      expect((await store.recordedUsageEvents(['usage:e2b:known'])))
+        .toEqual(new Map([['usage:e2b:known', { organizationId: 'org_owner', taskId: task.id }]]));
     } finally { (await store.close()); }
   });
 
