@@ -844,6 +844,48 @@ describe('resource publication by sub-tasks', () => {
     expect(views.at(-1).error).toBeUndefined();
   });
 
+  // pramana#3 (2026-10-09): 7,854 pages both sides had added differently; the
+  // escalation's only way forward was removing the task's copy.
+  it('offers to keep this task\'s version of conflicting files, and publishes with it', async () => {
+    const views = reviewAndConfirm();
+    const refused = Object.assign(new Error('Activity task failed'), { cause: Object.assign(new Error(conflict), { type: 'resource-conflict' }) });
+    wf.activities.settleResourceReview = vi.fn()
+      .mockRejectedValueOnce(refused)
+      .mockResolvedValue(undefined);
+    let escalated: any;
+    wf.wait = () => {
+      const view = wf.handlers.get('view')!();
+      if (view.stage !== 'escalated' || escalated) return;
+      escalated = view;
+      wf.handlers.get('keepOwnResources')!();
+    };
+    const result = await softwareDevV1_27(child);
+    expect(escalated.actions.map((a: any) => a.name)).toEqual(expect.arrayContaining(['retry', 'keepOwnResources']));
+    expect(escalated.actions.find((a: any) => a.name === 'keepOwnResources').label).toBe('Keep this task’s version');
+    expect(escalated.error).toMatch(/or keep this task’s version of those files\.$/);
+    expect(wf.activities.settleResourceReview.mock.calls).toEqual([['child'], ['child', { keepOwn: true }]]);
+    expect(result.stage).toBe('done');
+    expect(views.at(-1).actions.map((a: any) => a.name)).not.toContain('keepOwnResources');
+  });
+
+  it('offers no version choice when publishing failed for another reason', async () => {
+    reviewAndConfirm();
+    wf.activities.settleResourceReview = vi.fn()
+      .mockRejectedValueOnce(Object.assign(new Error('Activity task failed'), { cause: new Error('resource store unavailable') }))
+      .mockResolvedValue(undefined);
+    let escalated: any;
+    wf.wait = () => {
+      const view = wf.handlers.get('view')!();
+      if (view.stage !== 'escalated' || escalated) return;
+      escalated = view;
+      wf.handlers.get('keepOwnResources')!(); // ignored: there is nothing to choose
+      wf.handlers.get('parentResponse')!({ action: 'retry' });
+    };
+    await softwareDevV1_27(child);
+    expect(escalated.actions.map((a: any) => a.name)).not.toContain('keepOwnResources');
+    expect(wf.activities.settleResourceReview.mock.calls).toEqual([['child'], ['child']]);
+  });
+
   it('keeps histories recorded before the escalation failing the task', async () => {
     reviewAndConfirm();
     wf.absentPatches = new Set(['resource-publish-escalates-v1']);

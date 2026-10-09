@@ -180,6 +180,7 @@ export const cancelSignal = defineSignal('cancel');
  * releases execution-owned activity before the replacement starts. */
 export const lifecycleReplacementSignal = defineSignal('prepareLifecycleReplacement');
 export const retrySignal = defineSignal('retry');
+export const keepOwnResourcesSignal = defineSignal(SIG.keepOwnResources);
 export const mergeGrantedSignal = defineSignal(SIG_MERGE_GRANTED);
 type CredentialKind = 'login' | 'ambient' | 'key';
 export const accountGrantedSignal = defineSignal<[{
@@ -716,6 +717,9 @@ async function softwareDevImpl(
   let confirmed = carried?.confirmed ?? false;
   let manualPrConfirmer: string | undefined = continued?.manualPrConfirmer;
   let escalationAction: 'openPr' | 'confirm' | undefined = continued?.escalationAction;
+  /** A publication refused over files both sides changed: the person may keep this task's versions. */
+  let resourceConflict = false;
+  let keepOwnRequested = false;
   let manualEscalationRequested = carried?.manualEscalationRequested ?? false;
   let prRequested = carried?.prRequested ?? recoveryStage === 'pr';
   // checkout name -> head sha it was approved at (multi-PR Review).
@@ -1143,6 +1147,7 @@ async function softwareDevImpl(
       ];
     }
     const retry: DeclaredAction = { name: 'retry', kind: 'signal', label: 'Retry', enabled: true };
+    const keepOwnResources: DeclaredAction = { name: SIG.keepOwnResources, kind: 'signal', label: 'Keep this task’s version', enabled: true };
     switch (stage) {
       case 'setup':
         return [cancel];
@@ -1161,7 +1166,7 @@ async function softwareDevImpl(
       case 'resolve':
         return [cancel];
       case 'escalated':
-        return [retry, ...(escalationAction === 'openPr'
+        return [retry, ...(resourceConflict ? [keepOwnResources] : []), ...(escalationAction === 'openPr'
           ? [{ ...openPr, label: 'Commit changes, open & confirm PR' }]
           : escalationAction === 'confirm' ? [confirm] : []), followUp, cancel];
       default:
@@ -1401,18 +1406,23 @@ async function softwareDevImpl(
       await publish();
       let failure: string;
       try {
-        await runLandingActivity(() => resourceActivities.settleResourceReview(taskId));
+        await runLandingActivity(() => keepOwnRequested
+          ? resourceActivities.settleResourceReview(taskId, { keepOwn: true })
+          : resourceActivities.settleResourceReview(taskId));
         resourcesApplied = true;
         return 'applied';
       } catch (err) {
         if (isCancellation(err) || !patched('resource-publish-escalates-v1')) throw err;
         failure = innermostMessage(err);
-      } finally { applyingResources = false; }
+        resourceConflict = failureType(err) === 'resource-conflict';
+      } finally { applyingResources = false; keepOwnRequested = false; }
       const priorStage = stage;
       stage = 'escalated';
       status = 'blocked';
       retryRequested = false;
-      error = `Could not publish resources: ${failure} Nothing was lost; Retry publishes again.`;
+      error = resourceConflict
+        ? `Could not publish resources: ${failure} Nothing was lost: Retry publishes again, or keep this task’s version of those files.`
+        : `Could not publish resources: ${failure} Nothing was lost; Retry publishes again.`;
       if (input.parentTaskId) {
         waitingFor = { kind: 'parent' };
         await notifyParent('blocked', error);
@@ -1423,6 +1433,7 @@ async function softwareDevImpl(
         || (followUpReturnsToDo && followUpWakesEscalation && mainUnreadSince(seenAtEscalation)));
       waitingFor = undefined;
       error = undefined;
+      resourceConflict = false;
       stage = priorStage;
       status = 'active';
       if (cancelled) return 'cancelled';
@@ -1816,6 +1827,11 @@ async function softwareDevImpl(
       activeStaging?.cancel();
       if (!patched('software-dev-preserve-replacement-children-v1')) cancelChildren();
     }
+  });
+  setHandler(keepOwnResourcesSignal, () => {
+    if (!resourceConflict) return;
+    keepOwnRequested = true;
+    retryRequested = true;
   });
   setHandler(retrySignal, () => {
     retryRequested = true;
@@ -5272,6 +5288,13 @@ export function sameProposalIdentity(
 
 /** Extract a meaningful message, following Temporal's wrapped `.cause` chain. */
 /** The original failure's own words, without the activity wrapping. */
+/** The type of the innermost ApplicationFailure that names one. */
+function failureType(err: any): string | undefined {
+  let type: string | undefined;
+  for (let e: any = err, depth = 0; e && depth < 6; depth++, e = e.cause) if (typeof e.type === 'string') type = e.type;
+  return type;
+}
+
 function innermostMessage(err: any): string {
   let e: any = err;
   let message = '';
