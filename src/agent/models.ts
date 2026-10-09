@@ -259,7 +259,9 @@ export async function opencodeModels(configHome?: string, timeoutMs = 10_000): P
  * would list, for whichever providers it has a credential for. */
 const MODELS_DEV_URL = 'https://models.dev/api.json';
 const MODELS_DEV_TTL_MS = 6 * 60 * 60_000;
-let modelsDev: { at: number; catalog: Record<string, any> } | undefined;
+// Per fetcher, so a caller that brings its own (a test, a proxy) never reads a
+// catalog another one cached.
+let modelsDev: { at: number; catalog: Record<string, any>; fetcher: typeof fetch } | undefined;
 
 /** Karmax defines Kimi Code as its own OpenCode provider (acp.ts openCodeConfig). */
 const KIMI_CODE_MODELS: AvailableModel[] = [
@@ -281,13 +283,14 @@ export async function openCodeKeyModels(vendors: readonly string[], options: {
 } = {}): Promise<AvailableModel[]> {
   if (!vendors.length) return [];
   const now = options.now ?? Date.now();
-  let catalog = modelsDev && now - modelsDev.at < MODELS_DEV_TTL_MS ? modelsDev.catalog : undefined;
+  const fetcher = options.fetch ?? fetch;
+  let catalog = modelsDev?.fetcher === fetcher && now - modelsDev.at < MODELS_DEV_TTL_MS ? modelsDev.catalog : undefined;
   if (!catalog && vendors.some((vendor) => vendor !== 'kimi')) {
     try {
-      const response = await withTimeout((options.fetch ?? fetch)(process.env.KARMAX_MODELS_DEV_URL ?? MODELS_DEV_URL), options.timeoutMs ?? 10_000);
+      const response = await withTimeout(fetcher(process.env.KARMAX_MODELS_DEV_URL ?? MODELS_DEV_URL), options.timeoutMs ?? 10_000);
       if (response.ok) {
         catalog = await response.json() as Record<string, any>;
-        modelsDev = { at: now, catalog };
+        modelsDev = { at: now, catalog, fetcher };
       }
     } catch { /* offline: the vendors' models are simply not listed */ }
   }

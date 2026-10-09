@@ -207,7 +207,9 @@ describe('remote OpenCode (ACP in a cloud sandbox)', () => {
 
   afterEach(async () => {
     for (const world of worlds.splice(0)) await world.destroy();
-    process.env = { ...saved };
+    // Restore in place: replacing process.env detaches it from vi.stubEnv.
+    for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
+    Object.assign(process.env, saved);
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
