@@ -36,7 +36,7 @@ import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, FileRef, T
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable, awaitsSuccessOf } from '../domain/triggers.js';
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult, EvalContext, TaskGroup, forClauseValues, attentionCandidates } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
-import { assertInFlightComputerEdit, computerOf, machineShape, normalizeComputer, type ComputerSpec } from '../domain/computer.js';
+import { assertInFlightComputerEdit, computerOf, computerResizable, machineShape, normalizeComputer, type ComputerSpec } from '../domain/computer.js';
 import { resolveParamsLayers, assembleTaskInput, projectSettingsFor, globalSettingsFor, quickProjectSettingsFor, quickGlobalSettingsFor, effectiveRepos, ValueMap } from './params.js';
 import { REPOSITORY_BRANCHES_RESOLVED_PARAM, repositoryBranchDefaults } from './branch-defaults.js';
 import { withTimeout } from '../util/timeout.js';
@@ -2799,6 +2799,8 @@ export class KarmaxApi {
     const enrich = async (view: TaskView | undefined): Promise<TaskView | undefined> => {
       if (!view) return view;
       view = await this.deps.store.withPendingReviewInfoAsync(taskId, view);
+      if (computerResizable(view) && !(view.editableParams ?? []).includes('computer'))
+        view = { ...view, editableParams: [...(view.editableParams ?? []), 'computer'] };
       if (await this.deps.store.kvGet(`project-transfer-history:${taskId}`)) {
         const { world, worldPath, worldAvailable, worldDesktop, worldProvider, ...history } = view;
         view = history;
@@ -5835,6 +5837,7 @@ Act according to your Avatar instructions. When ready, call platform_request POS
     const computerBefore = project && Object.prototype.hasOwnProperty.call(patch, 'computer')
       ? (await this.deps.store.effectiveTaskConfig(project, taskId)) : undefined;
     if (project && computerBefore) {
+      if (!computerResizable(task.lastView)) throw new ValidationError('this task\'s computer can\'t be resized: the task has ended');
       try { assertInFlightComputerEdit(computerOf(computerBefore), normalizeComputer(patch.computer) ?? {}); }
       catch (error) { throw new ValidationError(error instanceof Error ? error.message : String(error)); }
       patch.computer = (await this.taskComputer(project, { computer: patch.computer })) ?? null;
@@ -5875,7 +5878,13 @@ Act according to your Avatar instructions. When ready, call platform_request POS
         { keys: routed.flatMap(keysOf), mayAttenuate: false, accept: options.acceptAttenuation }))
       : undefined;
     try {
-      const result = (await (await this.workflowHandle(taskId)).executeUpdate('updateParams', { args: [patch] })) as { applied: string[] };
+      // The workflow judges every other field's window; the Computer is the
+      // platform's (computerResizable), so it never reaches a workflow — an
+      // older one, started before the Computer existed, would refuse it.
+      const { computer: _computer, ...workflowPatch } = patch;
+      const result = Object.keys(workflowPatch).length
+        ? (await (await this.workflowHandle(taskId)).executeUpdate('updateParams', { args: [workflowPatch] })) as { applied: string[] }
+        : { applied: [] as string[] };
       const applied = routed.filter((name) => result.applied.includes(name));
       if (computed && applied.length) {
         const current = this.storedAgentAuthorizations((await this.deps.store.getTask(taskId)) ?? task);
