@@ -49,7 +49,7 @@ tavya import
 `import` shows its plan and asks before changing anything:
 
 - Each checkout becomes a repository of the project. One with no GitHub remote gets a new private repository on your organization's GitHub account, and unpushed commits are pushed.
-- What Git ignores is sorted for you: `.env` files become secrets, files like `credentials.json` or `*.pem` become secret files, and databases and data folders (`data/`, `models/`, or anything over 50 MB) become data. Dependencies and build output are left out, and the rest is listed so you can choose.
+- What Git ignores is sorted for you: each `.env` stays in its own repository (its values stored as secrets), files like `credentials.json` or `*.pem` become secret files, and databases and data folders (`data/`, `models/`, or anything over 50 MB) become data. Dependencies and build output are left out, and the rest is listed so you can choose.
 - `--data <path>` and `--secret <path>` add something it left out; `--skip <path>` leaves something out. `--dry-run` only shows the plan.
 
 The folder then is the project's workspace: `tavya push`, `pull` and `status` work in it, and anyone can `tavya clone` the same layout. Importing again adds new checkouts and files, and never overwrites a secret the project already has.
