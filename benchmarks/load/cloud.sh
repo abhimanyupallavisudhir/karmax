@@ -133,7 +133,7 @@ for i in instances:
     lines.append({'instance': i['id'], 'role': i.get('role'), 'type': i['type'], 'hours': round(hours, 3), 'diskGb': i['diskGb'],
                   'computeUsd': round(compute, 3), 'storageUsd': round(storage, 4), 'ipv4Usd': round(address, 4)})
     total += compute + storage + address
-print(json.dumps({'instances': lines, 'totalUsd': round(total, 2),
+print(json.dumps({'instances': lines, 'totalUsd': round(total, 3),
                   'prices': 'eu-central-1 on-demand list prices checked 2026-10-08; data transfer inside one AZ is free'}, indent=1))
 PY
 }
