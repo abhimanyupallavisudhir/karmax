@@ -1250,13 +1250,31 @@ export class Gateway {
           ? `\n\nDurable monitor evidence:\n${JSON.stringify(event.payload.evidence, null, 2)}` : '';
         const token = (await this.deps.tokens.mintPrincipal('system:github-recovery', ['*'],
           event.projectId, 10 * 60_000, project.organizationId)).token;
+        const title = `Repair ${missing ? 'missing' : 'failed'} GitHub workflow: ${event.payload.workflow}`;
+        const opening = missing
+          ? `A post-merge GitHub deployment workflow run was not created for ${event.payload.repository}.`
+          : `A post-merge GitHub workflow failed for ${event.payload.repository}.`;
+        // A workflow that is still red while its repair is open is that
+        // repair's business: tell it, rather than start a second one.
+        const open = missing ? undefined : (await this.deps.store.listTasks(event.projectId)).find((task) =>
+          task.title === title && String(task.params?.prompt ?? '').startsWith(opening)
+          && !task.params?.archived && !['done', 'cancelled', 'failed'].includes(task.lastView?.status ?? ''));
+        if (open) {
+          (await this.deps.store.kvSet(key, open.id));
+          (await this.emitTaskEvent({ taskId: open.id, type: event.type, ts: Date.now(), payload: event.payload }));
+          await this.deps.api.postTaskMessage(token, open.id, { text: [
+            `${event.payload.workflow} failed again on ${event.payload.branch} while this repair is open.`,
+            `Exact revision: ${event.payload.headSha || 'not reported'}`,
+            `Run: ${event.payload.url || `GitHub Actions run ${event.payload.runId}`} (attempt ${event.payload.attempt})`,
+            'If it is the failure you are repairing, nothing more is needed; otherwise repair it here too.',
+          ].join('\n') }).catch(() => undefined);
+          continue;
+        }
         const task = await this.deps.api.createTask(token, {
           projectId: event.projectId,
-          title: `Repair ${missing ? 'missing' : 'failed'} GitHub workflow: ${event.payload.workflow}`,
+          title,
           prompt: [
-            missing
-              ? `A post-merge GitHub deployment workflow run was not created for ${event.payload.repository}.`
-              : `A post-merge GitHub workflow failed for ${event.payload.repository}.`,
+            opening,
             `Workflow: ${event.payload.workflow}`,
             `Conclusion: ${event.payload.conclusion}`,
             `Exact revision: ${event.payload.headSha || 'not reported'}`,
@@ -1264,6 +1282,8 @@ export class Gateway {
               ? `Successful prerequisite run: ${event.payload.url || `GitHub Actions run ${event.payload.runId}`}${origin}`
               : `Run: ${event.payload.url || `GitHub Actions run ${event.payload.runId}`}${origin}`,
             incidentLine,
+            ...(!missing && Number(event.payload.attempt) > 1
+              ? [`This is attempt ${event.payload.attempt}: the run failed again after a rerun, so the failure reproduces.`] : []),
             evidence,
             '',
             'Inspect the complete GitHub evidence and classify it before changing code. For a missing run, check workflow schema/registration and triggers first; the evidence distinguishes direct API absence from webhook delay and records file/API permission failures. If a run exists, distinguish queued/waiting environment approval from a terminal failure. If it is a transient GitHub runner failure, rerun the exact revision once and verify it. If it is billing, permissions, protected-environment approval, secrets, or repository configuration, report the precise human action required and do not manufacture a code change. If it is a deterministic deployment or code defect, repair it through the normal reviewed pull-request workflow and verify recovery. The already-merged originating task is immutable and must remain complete.',
