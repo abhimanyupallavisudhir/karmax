@@ -38,7 +38,7 @@ import { evaluateQuery, fieldCatalogue, tagPath, EvalResult, EvalContext, TaskGr
 import { parseQuery } from '../domain/query-language.js';
 import { assertInFlightComputerEdit, computerOf, machineShape, normalizeComputer, type ComputerSpec } from '../domain/computer.js';
 import { resolveParamsLayers, assembleTaskInput, projectSettingsFor, globalSettingsFor, quickProjectSettingsFor, quickGlobalSettingsFor, effectiveRepos, ValueMap } from './params.js';
-import { REPOSITORY_BRANCHES_RESOLVED_PARAM, repositoryBranchDefaults } from './branch-defaults.js';
+import { REPOSITORY_BRANCHES_RESOLVED_PARAM, applyRepoBranches, normalizeRepoBranches, repositoryBranchDefaults } from './branch-defaults.js';
 import { withTimeout } from '../util/timeout.js';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -1335,6 +1335,7 @@ export class KarmaxApi {
           // different base from changed project settings.
           ...(!args.draft && typeof resolved.base === 'string' && resolved.base ? { base: resolved.base } : {}),
           ...(!args.draft && typeof resolved.target === 'string' && resolved.target ? { target: resolved.target } : {}),
+          ...(!args.draft && resolved.repoBranches ? { repoBranches: resolved.repoBranches } : {}),
           [REPOSITORY_BRANCHES_RESOLVED_PARAM]: true,
           profiles: args.profiles,
           draft: !!args.draft,
@@ -1628,6 +1629,7 @@ export class KarmaxApi {
         if (!explicitTarget) resolved.target = branches.target;
       }
     }
+    applyRepoBranches(resolved, layers, effectiveRepos(resolved, project.config));
     return resolved;
   }
 
@@ -1820,6 +1822,7 @@ export class KarmaxApi {
     (await this.deps.store.patchTaskParams(task.id, {
       ...(typeof resolved.base === 'string' && resolved.base ? { base: resolved.base } : {}),
       ...(typeof resolved.target === 'string' && resolved.target ? { target: resolved.target } : {}),
+      ...(resolved.repoBranches ? { repoBranches: resolved.repoBranches } : {}),
       [REPOSITORY_BRANCHES_RESOLVED_PARAM]: true,
     }));
     // The confirmer belongs to the logical task, not an attempt. Snapshotting it
@@ -5919,7 +5922,12 @@ Act according to your Avatar instructions. When ready, call platform_request POS
    * retargeting changes where work lands, not where its custody chain began. */
   private async persistAcceptedTarget(taskId: string, target: string): Promise<void> {
     const task = (await this.deps.store.getTask(taskId));
+    // Repositories that shared the common target follow it, as their checkouts
+    // do (unpinned); one with a target of its own keeps it.
+    const repoBranches = normalizeRepoBranches(task?.params.repoBranches);
     if (task) (await this.deps.store.updateTaskParams(taskId, { ...task.params, target,
+      ...(repoBranches ? { repoBranches: Object.fromEntries(Object.entries(repoBranches).map(([source, entry]) =>
+        [source, entry.target === task.params.target ? { ...entry, target } : entry])) } : {}),
       [REPOSITORY_BRANCHES_RESOLVED_PARAM]: true }));
     const world = (await this.deps.store.currentWorld(taskId));
     if (world) (await this.deps.store.updateCurrentWorldTarget(taskId, target));
