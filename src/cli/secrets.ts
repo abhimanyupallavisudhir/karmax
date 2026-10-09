@@ -20,7 +20,7 @@ export function environmentOf(secrets: SecretValue[]): Record<string, string> {
   return Object.fromEntries(secrets.filter((secret) => secret.variable).map((secret) => [secret.variable!, secret.value]));
 }
 
-const digest = (value: string) => crypto.createHash('sha256').update(value).digest('hex');
+export const digest = (value: string): string => crypto.createHash('sha256').update(value).digest('hex');
 
 /**
  * Write file-shaped secrets where a world gets them (mode 0600, kept out of

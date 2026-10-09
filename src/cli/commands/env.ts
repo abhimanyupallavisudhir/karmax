@@ -43,7 +43,7 @@ export async function setup(workspace: Workspace, out: Output): Promise<number> 
   if (!install.length) { out.result({ ran: [] }, 'This project has no install commands.'); return 0; }
   const ran: string[] = [];
   for (const { repository, commands } of install) {
-    const cwd = path.join(workspace.root, repository);
+    const cwd = workspace.checkout(repository);
     if (!fs.existsSync(cwd)) { out.warn(`${repository} is not cloned; skipping its install commands`); continue; }
     for (const command of commands) {
       out.info(`[${repository}] $ ${command}`);
@@ -103,10 +103,9 @@ export async function secrets(api: Api, projectId: string, args: string[], out: 
   throw new CliError(`unknown secrets command "${action}" (list, set, import, rm)`, EXIT.usage);
 }
 
-/** The repository a workspace file is in, and its path there. */
+/** The repository a workspace file is in (wherever it is checked out), and its path there. */
 function workspacePlace(workspace: Workspace | undefined, absolute: string): { repository: string; file: string } | undefined {
-  if (!workspace) return undefined;
-  const relative = path.relative(workspace.root, absolute).split(path.sep).join('/');
-  const repository = relative.startsWith('..') ? undefined : workspace.repositoryOf(relative);
-  return repository ? { repository: repository.name, file: path.posix.relative(repository.name, relative) } : undefined;
+  const world = workspace?.worldPath(absolute);
+  const repository = world ? workspace!.repositoryOf(world) : undefined;
+  return repository && world !== repository.name ? { repository: repository.name, file: world!.slice(repository.name.length + 1) } : undefined;
 }

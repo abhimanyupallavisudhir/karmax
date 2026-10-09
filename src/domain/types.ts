@@ -1972,10 +1972,15 @@ export interface ChildRaise {
   childTitle: string;
   type: RaiseType;
   detail?: string;
+  /** Answers beyond the usual ones that this raise accepts (`keep_own` for a
+   *  publication refused over files the child and a newer version changed). */
+  choices?: SubTaskAction[];
 }
 
-/** How a parent's Do agent answers a child raise (the `respond_to_sub_task` tool). */
-export type SubTaskAction = 'open_pr' | 'confirm' | 'comment' | 'retry' | 'cancel';
+/** How a parent's Do agent answers a child raise (the `respond_to_sub_task` tool).
+ *  `keep_own`: publish again, keeping the child's version of conflicting files. */
+export const SUB_TASK_ACTIONS = ['open_pr', 'confirm', 'comment', 'retry', 'cancel', 'keep_own'] as const;
+export type SubTaskAction = typeof SUB_TASK_ACTIONS[number];
 
 /** Signal a parent sends DOWN to a child in response to a raise. */
 export interface ParentResponse {
