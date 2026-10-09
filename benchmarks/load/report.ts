@@ -99,21 +99,6 @@ function load(resultsDir: string) {
 
 // ---------------------------------------------------------------- per step
 
-function findAll(value: Json, key: RegExp, out: number[] = []): number[] {
-  if (value && typeof value === 'object') {
-    for (const [k, v] of Object.entries(value)) {
-      if (key.test(k)) {
-        if (typeof v === 'number') out.push(v);
-        else if (typeof v === 'string' && /^\d+(\.\d+)?s$/.test(v)) out.push(Number(v.slice(0, -1)) * 1000);
-        else if (typeof v === 'string' && /^\d+$/.test(v)) out.push(Number(v));
-        else if (v && typeof v === 'object' && 'seconds' in (v as Json)) out.push(Number((v as Json).seconds) * 1000 + Number((v as Json).nanos ?? 0) / 1e6);
-      }
-      findAll(v, key, out);
-    }
-  }
-  return out;
-}
-
 function stepRow(step: Json, samples: Json[], probes: Json[]) {
   const from = Date.parse(step.steadyFrom), to = Date.parse(step.endedAt);
   const inWindow = (kind: string) => samples.filter((s) => s.kind === kind && s.t >= from && s.t <= to).map((s) => s.data);
@@ -147,15 +132,28 @@ function stepRow(step: Json, samples: Json[], probes: Json[]) {
   }
   const scrapeMs = finite(metrics.map((s) => s.data.scrapeMs));
 
-  let serverLatency: Record<string, Json> = {};
-  if (server.length >= 2) {
-    const first = parseProm(server[0].data.lines.join('\n')), last = parseProm(server.at(-1).data.lines.join('\n'));
+  // The server's matching histograms between the window's first and last
+  // scrape: every family summed, and schedule-to-start (the task-queue latency)
+  // per task type. Backlog age and count are gauges: the window's maximum.
+  const serverLatency: Record<string, Json> = {};
+  const scheduleToStart: Record<string, Json> = {};
+  const parsedServer = server.map((sample) => parseProm(sample.data.lines.join('\n')));
+  if (parsedServer.length >= 2) {
+    const first = parsedServer[0]!, last = parsedServer.at(-1)!;
+    const summary = (h: ReturnType<typeof histogramDelta>) => h && ({ count: h.count, meanMs: round(h.mean * 1000, 1), p50Ms: round(h.p50 * 1000, 1), p95Ms: round(h.p95 * 1000, 1) });
     const families = new Set(last.filter((s) => s.name.endsWith('_bucket')).map((s) => s.name.slice(0, -'_bucket'.length)));
     for (const family of families) {
-      const h = histogramDelta(first, last, family);
-      if (h) serverLatency[family] = { count: h.count, meanMs: round(h.mean * 1000, 1), p50Ms: round(h.p50 * 1000, 1), p95Ms: round(h.p95 * 1000, 1) };
+      const h = summary(histogramDelta(first, last, family));
+      if (h) serverLatency[family] = h;
+    }
+    for (const type of ['Workflow', 'Activity']) {
+      const only = (samples: Sample[]) => samples.filter((s) => s.labels.includes(`task_type="${type}"`) && s.labels.includes('taskqueue="karmax"'));
+      const h = summary(histogramDelta(only(first), only(last), 'task_schedule_to_start_latency'));
+      if (h) scheduleToStart[type.toLowerCase()] = h;
     }
   }
+  const karmaxQueue = (name: string) => finite(parsedServer.flatMap((samples) => samples
+    .filter((s) => s.name === name && s.labels.includes('taskqueue="karmax"') && s.labels.includes('namespace="karmax"')).map((s) => s.value)));
 
   const connections = pg.map((p) => Object.values(p.connections ?? {}).reduce((a: number, b) => a + Number(b), 0) as number);
   const karmaxConnections = pg.map((p) => Object.entries(p.connections ?? {}).filter(([k]) => k.startsWith('karmax:')).reduce((a, [, b]) => a + Number(b), 0));
@@ -203,8 +201,9 @@ function stepRow(step: Json, samples: Json[], probes: Json[]) {
     appGauges,
     metricsScrapeMaxMs: max(scrapeMs),
     temporal: {
-      backlogAgeMaxMs: round(max(findAll(temporal.map((t) => t.taskQueue), /approximateBacklogAge|backlogAge/i))),
-      backlogCountMax: max(findAll(temporal.map((t) => t.taskQueue), /approximateBacklogCount|backlogCountHint/i)),
+      backlogAgeMaxMs: round((max(karmaxQueue('approximate_backlog_age_seconds')) ?? NaN) * 1000),
+      backlogCountMax: max(karmaxQueue('approximate_backlog_count')),
+      scheduleToStart,
       serverLatency,
     },
     broken: step.broken ?? [],
@@ -220,10 +219,10 @@ const s = (ms: number | undefined) => ms === undefined ? '–' : (ms / 1000).toF
 
 function table(rows: Json[]) {
   const lines = [
-    '| step | tenants (people) | open tasks | running wf | req/s | API ms p50/p95/p99 | errors % | event lag ms p50/p95/p99 | turn overhead s p50/p95 | gateway heap / RSS MB | worker heap / RSS MB | worker loop p99 ms | app mem MB | host CPU % mean/max | PG conns | advisory waiters max | advisory wait max ms | Temporal backlog age ms |',
-    '|---:|---:|---:|---:|---:|---|---:|---|---|---|---|---:|---:|---|---:|---:|---:|---:|',
+    '| step | tenants (people) | open tasks | running wf | req/s | API ms p50/p95/p99 | errors % | event lag ms p50/p95/p99 | turn overhead s p50/p95 | gateway heap / RSS MB | worker heap / RSS MB | worker loop p99 ms | app mem MB | host CPU % mean/max | PG conns | advisory waiters max | advisory wait max ms | Temporal backlog age ms | schedule-to-start p95 ms wf / act |',
+    '|---:|---:|---:|---:|---:|---|---:|---|---|---|---|---:|---:|---|---:|---:|---:|---:|---|',
   ];
-  for (const r of rows) lines.push(`| ${r.step} | ${r.tenants} (${r.people}) | ${fmt(r.openTasks)} | ${fmt(r.runningWorkflows)} | ${fmt(r.requestsPerSecond)} | ${pct(r.api)} | ${fmt(r.errorRatePct)} | ${pct(r.eventLag)} | ${s(r.turnOverhead?.p50)} / ${s(r.turnOverhead?.p95)} | ${fmt(r.gateway.heapUsedMaxMb)} / ${fmt(r.gateway.rssMaxMb)} | ${fmt(r.worker.heapUsedMaxMb)} / ${fmt(r.worker.rssMaxMb)} | ${fmt(r.worker.eldP99MaxMs)} | ${fmt(r.containers.app.memMaxMb)} | ${fmt(r.hostCpuPct.mean)} / ${fmt(r.hostCpuPct.max)} | ${fmt(r.postgres.connectionsMax)} | ${fmt(r.postgres.advisoryWaitersMax)} | ${fmt(r.postgres.advisoryWaitMaxMs)} | ${fmt(r.temporal.backlogAgeMaxMs)} |`);
+  for (const r of rows) lines.push(`| ${r.step} | ${r.tenants} (${r.people}) | ${fmt(r.openTasks)} | ${fmt(r.runningWorkflows)} | ${fmt(r.requestsPerSecond)} | ${pct(r.api)} | ${fmt(r.errorRatePct)} | ${pct(r.eventLag)} | ${s(r.turnOverhead?.p50)} / ${s(r.turnOverhead?.p95)} | ${fmt(r.gateway.heapUsedMaxMb)} / ${fmt(r.gateway.rssMaxMb)} | ${fmt(r.worker.heapUsedMaxMb)} / ${fmt(r.worker.rssMaxMb)} | ${fmt(r.worker.eldP99MaxMs)} | ${fmt(r.containers.app.memMaxMb)} | ${fmt(r.hostCpuPct.mean)} / ${fmt(r.hostCpuPct.max)} | ${fmt(r.postgres.connectionsMax)} | ${fmt(r.postgres.advisoryWaitersMax)} | ${fmt(r.postgres.advisoryWaitMaxMs)} | ${fmt(r.temporal.backlogAgeMaxMs)} | ${fmt(r.temporal.scheduleToStart.workflow?.p95Ms)} / ${fmt(r.temporal.scheduleToStart.activity?.p95Ms)} |`);
   return lines.join('\n');
 }
 

@@ -8,10 +8,10 @@
  *              longest wait, commits/rollbacks/deadlocks               every --every s
  *    metrics   the app's /api/metrics (Prometheus text, as the
  *              installation administrator)                             every 2×--every s
- *    temporal  task-queue backlog (count and age) for workflow and
- *              activity tasks; running workflow count                  every 3×--every s
- *    temporal-server  the server's Prometheus metrics (matching and
- *              persistence latencies), filtered                        every 3×--every s
+ *    temporal  running workflow count                                  every 3×--every s
+ *    temporal-server  the server's Prometheus metrics: task-queue backlog
+ *              count and age, schedule-to-start, matching and
+ *              persistence latencies, filtered                           every 3×--every s
  *
  *  Process heap comes from probe.mjs inside the app container, not from here.
  *
@@ -32,7 +32,7 @@ const every = Number(option('every', '5')) * 1000;
 const origin = new URL(option('origin'));
 const app = option('app', 'http://127.0.0.1:4505');
 const adminEmail = option('admin-email');
-const adminPassword = option('admin-password');
+const adminPassword = process.env.LOADTEST_ADMIN_PASSWORD ?? option('admin-password');
 const project = option('compose-project', 'karmax');
 const temporalMetrics = option('temporal-metrics', 'http://127.0.0.1:8000/metrics');
 
@@ -151,13 +151,9 @@ async function temporalCli(args: string[]): Promise<string> {
   return run('docker', ['exec', TCTL, 'temporal', ...args, '--address', 'temporal:7233', '--namespace', 'karmax'], 30_000);
 }
 async function temporal() {
+  // Backlog count and age per task queue come from the server's own metrics
+  // (temporal-server samples); the CLI's describe has no backlog statistics here.
   const data: Record<string, unknown> = {};
-  try {
-    data.taskQueue = JSON.parse(await temporalCli(['task-queue', 'describe', '--task-queue', 'karmax', '--report-stats', '-o', 'json']));
-  } catch (error) {
-    // Older CLIs have no --report-stats; describe still lists pollers.
-    data.taskQueueError = error instanceof Error ? error.message : String(error);
-  }
   try {
     data.running = JSON.parse(await temporalCli(['workflow', 'count', '--query', 'ExecutionStatus="Running"', '-o', 'json']));
   } catch (error) { data.runningError = error instanceof Error ? error.message : String(error); }

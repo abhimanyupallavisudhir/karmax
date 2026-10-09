@@ -215,10 +215,10 @@ tail -n 3 "$OUT/logs/world-setup.log"
 # ---------------------------------------------------------------- drive
 say 'Driving synthetic tenants'
 driver=(/opt/node/bin/node --max-old-space-size=6144 --experimental-strip-types --no-warnings /opt/loadtest/driver.ts
-  --base "https://$DOMAIN" --admin-email "$ADMIN_EMAIL" --admin-password "$ADMIN_PASSWORD" --out /opt/loadtest/out
+  --base "https://$DOMAIN" --admin-email "$ADMIN_EMAIL" --out /opt/loadtest/out
   --hold "$HOLD" ${STEPS:+--steps "$STEPS"} "${DRIVER_ARGS[@]}")
 on "$WORLD" "sudo systemd-run --unit loadtest-driver --uid ubuntu --gid ubuntu --working-directory /opt/loadtest \
-  -p LimitNOFILE=1048576 -E NODE_EXTRA_CA_CERTS=/opt/loadtest/edge.crt $(printf '%q ' "${driver[@]}")"
+  -p LimitNOFILE=1048576 -E NODE_EXTRA_CA_CERTS=/opt/loadtest/edge.crt -E LOADTEST_ADMIN_PASSWORD=$ADMIN_PASSWORD $(printf '%q ' "${driver[@]}")"
 # Stop driving 25 minutes before the VMs power themselves off, to collect results.
 deadline=$(( $(python3 -c 'import json,sys; print(min(json.loads(l)["launched"] for l in open(sys.argv[1])))' "$WORK/instances.jsonl") + MAX_MINUTES * 60 - 1500 ))
 while :; do

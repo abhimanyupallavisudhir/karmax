@@ -13,7 +13,7 @@
  *  limit (see `broken()`) the driver stops: that step is the first wall.
  *
  *    node --experimental-strip-types benchmarks/load/driver.ts \
- *      --base https://loadtest.invalid --admin-email E --admin-password P --out DIR \
+ *      --base https://loadtest.invalid --admin-email E --out DIR \   (LOADTEST_ADMIN_PASSWORD=P)
  *      [--steps 4,8,16,...] [--hold 300] [--fake-e2b http://127.0.0.1:13000]
  *
  *  It needs NODE_EXTRA_CA_CERTS for the edge's self-signed certificate and the
@@ -37,7 +37,8 @@ const base = new URL(option('base'));
 const origin = option('origin', base.origin);
 const out = option('out');
 const adminEmail = option('admin-email');
-const adminPassword = option('admin-password');
+// From the environment, so it is not in the service's command line or journal.
+const adminPassword = process.env.LOADTEST_ADMIN_PASSWORD ?? option('admin-password');
 const steps = option('steps', '4,8,16,32,64,96,128,192,256,384,512').split(',').map(Number);
 const holdMs = Number(option('hold', '300')) * 1000;
 const thinkMs = Number(option('think', '20')) * 1000;

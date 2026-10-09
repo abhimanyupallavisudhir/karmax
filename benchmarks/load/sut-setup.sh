@@ -25,7 +25,7 @@ say 'Docker and Node'
 "$HARNESS/install-tools.sh"
 
 say 'Source'
-sudo rm -rf "$ROOT" && sudo mkdir -p "$ROOT" "$LOADTEST/probe" && sudo chown "$(id -u):$(id -g)" "$ROOT" "$LOADTEST"
+sudo rm -rf "$ROOT" "$LOADTEST" && sudo mkdir -p "$ROOT" "$LOADTEST/probe" && sudo chown -R "$(id -u):$(id -g)" "$ROOT" "$LOADTEST"
 tar -xzf "$SOURCE" -C "$ROOT"
 cp "$HARNESS/probe.mjs" "$HARNESS/collector.ts" "$LOADTEST/"
 # The app runs as uid 10001 and writes its probe files here.
@@ -93,8 +93,9 @@ status=$(curl -sS -o /tmp/setup.json -w '%{http_code}' http://127.0.0.1:4505/api
 say 'Collector'
 sudo systemctl stop loadtest-collector 2>/dev/null || true
 sudo systemd-run --unit loadtest-collector --uid "$(id -u)" --gid "$(id -g)" --working-directory "$LOADTEST" \
+  -E "LOADTEST_ADMIN_PASSWORD=$ADMIN_PASSWORD" \
   /opt/node/bin/node --experimental-strip-types --no-warnings "$LOADTEST/collector.ts" --out "$LOADTEST/samples.jsonl" \
-  --origin "https://$DOMAIN" --admin-email "$ADMIN_EMAIL" --admin-password "$ADMIN_PASSWORD" --every 5
+  --origin "https://$DOMAIN" --admin-email "$ADMIN_EMAIL" --every 5
 sleep 15
 grep -q '"kind":"postgres"' "$LOADTEST/samples.jsonl" || { echo 'sut-setup: the collector recorded no PostgreSQL sample' >&2; tail -5 "$LOADTEST/samples.jsonl" >&2; exit 1; }
 grep '"kind":"collector-error"' "$LOADTEST/samples.jsonl" | tail -5 || true
