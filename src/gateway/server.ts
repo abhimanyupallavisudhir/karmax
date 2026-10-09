@@ -33,7 +33,7 @@ import { fileURLToPath } from 'node:url';
 import { WebSocket as WebSocketClient, WebSocketServer } from 'ws';
 import type { Client } from '@temporalio/client';
 import { KarmaxApi, CapabilityError, ValidationError } from '../platform/api.js';
-import type { ChildTaskSummary, KarmaxEvent, TaskView } from '../domain/types.js';
+import type { ChildTaskSummary, KarmaxEvent, Organization, TaskView } from '../domain/types.js';
 import { BRAND_FILES, brandIconOf, isBrandIcon, siteNameError, siteNameOf, BRAND } from '../domain/brand.js';
 import { Store } from '../store/db.js';
 import { ProjectTransfers, ProjectTransferError } from '../platform/project-transfer.js';
@@ -2630,20 +2630,24 @@ export class Gateway {
           allows(authRecord.caps, 'authorization:read'))));
       }
       if (p === '/api/organizations' && method === 'GET') {
-        const canAuditAll = Boolean(authRecord && allows(authRecord.caps, 'authorization:read'));
-        if (canAuditAll) return this.json(res, 200, (await store.listOrganizations()));
-        if (authRecord.organizationId)
-          return this.json(res, 200, [(await store.getOrganization(authRecord.organizationId))].filter(Boolean));
-        const scopedOrganizationIds = new Set([
-          ...(authRecord.projectId ? [(await store.getProject(authRecord.projectId))?.organizationId] : []),
-          ...(await __asyncCollections.map((authRecord.projectIds ?? []), async (projectId) => (await store.getProject(projectId))?.organizationId)),
-        ].filter((value): value is string => Boolean(value)));
-        if (scopedOrganizationIds.size)
-          return this.json(res, 200, (await __asyncCollections.map([...scopedOrganizationIds], async (id) => (await store.getOrganization(id)))).filter(Boolean));
-        // A limited app grant lists only the organization it is limited to.
-        const grantOrganization = session.appGrant?.ceiling?.organizationId;
-        return this.json(res, 200, (await store.listOrganizations(callerIdentity.humanSubject?.userId))
-          .filter((organization) => !grantOrganization || organization.id === grantOrganization));
+        const listed = async (): Promise<Organization[]> => {
+          const canAuditAll = Boolean(authRecord && allows(authRecord.caps, 'authorization:read'));
+          if (canAuditAll) return store.listOrganizations();
+          if (authRecord.organizationId)
+            return [(await store.getOrganization(authRecord.organizationId))].filter((o): o is Organization => Boolean(o));
+          const scopedOrganizationIds = new Set([
+            ...(authRecord.projectId ? [(await store.getProject(authRecord.projectId))?.organizationId] : []),
+            ...(await __asyncCollections.map((authRecord.projectIds ?? []), async (projectId) => (await store.getProject(projectId))?.organizationId)),
+          ].filter((value): value is string => Boolean(value)));
+          if (scopedOrganizationIds.size)
+            return (await __asyncCollections.map([...scopedOrganizationIds], async (id) => (await store.getOrganization(id))))
+              .filter((o): o is Organization => Boolean(o));
+          // A limited app grant lists only the organization it is limited to.
+          const grantOrganization = session.appGrant?.ceiling?.organizationId;
+          return (await store.listOrganizations(callerIdentity.humanSubject?.userId))
+            .filter((organization) => !grantOrganization || organization.id === grantOrganization);
+        };
+        return this.json(res, 200, (await store.withPreviousSlugs((await listed()))));
       }
       if (p === '/api/organizations' && method === 'POST') {
         const subject = requireHumanSubject(callerIdentity);

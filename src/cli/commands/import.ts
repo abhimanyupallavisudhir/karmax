@@ -3,7 +3,7 @@ import path from 'node:path';
 import type { Api } from '../api.js';
 import { dataFolder, DATA_FOLDER_BYTES, exampleEnvironmentFile, likelySecret, regenerated, sqliteDatabase } from '../../domain/ignored-files.js';
 import { git, gitOk } from '../git.js';
-import { slug, type Organization, type Project } from '../refs.js';
+import { namesOrganization, slug, type Organization, type Project } from '../refs.js';
 import { backupArgs, restic, resticError, summaryOf } from '../restic.js';
 import { bytes, CliError, confirm, EXIT, interactive, table, type Output } from '../util.js';
 
@@ -61,7 +61,7 @@ export async function importProject(api: Api, dir: string, out: Output, flags: R
 
   const organizations = await api.get<Organization[]>('/api/organizations');
   const organization = flags.organization
-    ? organizations.find((entry) => entry.id === flags.organization || (entry.slug ?? slug(entry.name)) === flags.organization)
+    ? organizations.find((entry) => namesOrganization(entry, flags.organization!))
     : organizations.length === 1 ? organizations[0] : undefined;
   if (!organization) throw new CliError(flags.organization ? `no organization "${flags.organization}" that you can access`
     : `choose an organization with --organization (${organizations.map((entry) => entry.slug ?? slug(entry.name)).join(', ')})`, EXIT.usage);

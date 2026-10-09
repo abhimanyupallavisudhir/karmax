@@ -2,7 +2,8 @@ import { afterEach, expect, it } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { gitOrThrow } from '../src/world/git.js';
-import { parseRef } from '../src/cli/refs.js';
+import { parseRef, resolveTarget } from '../src/cli/refs.js';
+import type { Api } from '../src/cli/api.js';
 import { cliFixture, files } from './helpers/cli-fixture.js';
 
 const cleanups: Array<() => Promise<void> | void> = [];
@@ -97,6 +98,17 @@ it('pushes commits and data, pulls them into another workspace, and refuses a st
   expect((await f.tavya(one, ['pull', '--force'])).code).toBe(0);
   expect(fs.existsSync(path.join(one, 'site', 'data', 'pages', 'two.txt'))).toBe(true);
   expect(fs.existsSync(path.join(one, 'site', 'data', 'pages', 'one.txt'))).toBe(false);
+});
+
+it('resolves a renamed organization\'s old slug in references and console URLs', async () => {
+  const responses: Record<string, unknown> = {
+    '/api/organizations': [{ id: 'org_a', name: 'Acme Labs', slug: 'acme-labs', previousSlugs: ['acme'] }],
+    '/api/projects': [{ id: 'proj_s', name: 'Site', organizationId: 'org_a' }],
+  };
+  const api = { get: async (path: string) => responses[path] } as unknown as Api;
+  for (const ref of ['acme/site', 'acme-labs/site', 'https://tavya.io/acme/site'])
+    expect((await resolveTarget(api, ref)).organization?.id, ref).toBe('org_a');
+  await expect(resolveTarget(api, 'acmes/site')).rejects.toThrow(/no organization "acmes"/);
 });
 
 it('parses console URLs and short references', () => {

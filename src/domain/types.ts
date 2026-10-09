@@ -45,6 +45,8 @@ export interface Organization {
   id: string;
   name: string;
   slug: string;
+  /** Slugs from before a rename; their URLs still lead here. */
+  previousSlugs?: string[];
   kind: 'personal' | 'team';
   /** Hosted billing selection. Private installations ignore monetization plans. */
   plan: HostedPlanId;

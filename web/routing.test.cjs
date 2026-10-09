@@ -62,6 +62,8 @@ eval(extractFn('projectBySlug'));
 eval(extractFn('orgSlug'));
 eval(extractFn('organizationById'));
 eval(extractFn('organizationBySlug'));
+eval(extractFn('pathWithOrganization'));
+eval(extractFn('renamedOrganizationPath'));
 eval(extractFn('currentOrg'));
 eval(extractFn('syncOrganizationSwitcher'));
 eval(extractFn('orgBase'));
@@ -175,6 +177,18 @@ eq(projectBySlug(r.slug, organizationBySlug(r.org).id)?.id, 'P2', 'and back to t
 eq(projectBySlug('mobile-app', 'org_acme')?.id, 'P3', 'same slug resolves per-org (acme)');
 eq(projectBySlug('mobile-app', 'org_globex')?.id, 'P2', 'same slug resolves per-org (globex)');
 eq(projectBySlug('P2', 'org_acme'), undefined, 'a raw project id cannot escape the organization named in the URL');
+
+// ── A renamed organization's old slug resolves, and its URLs move to the new one ──
+S.organizations.push({ id: 'org_initech', name: 'Initech Labs', slug: 'initech-labs', previousSlugs: ['initech', 'initrode'] });
+global.location = { pathname: '/initech/payroll/tasks/7', search: '?q=', hash: '#x' };
+eq(organizationBySlug('initrode')?.id, 'org_initech', 'an older slug still names the organization');
+eq(renamedOrganizationPath(parseRoute('/initech/payroll/tasks/7?q=')), '/initech-labs/payroll/tasks/7?q=#x',
+  'an old URL moves to the current slug, keeping the rest of it');
+global.location = { pathname: '/initech-labs/payroll', search: '', hash: '' };
+eq(renamedOrganizationPath(parseRoute('/initech-labs/payroll')), '', 'a current URL stays put');
+eq(renamedOrganizationPath(parseRoute('/org_initech/payroll')), '', 'an organization id in the URL is left alone');
+eq(renamedOrganizationPath(parseRoute('/nowhere/payroll')), '', 'an unknown organization is not redirected');
+eq(organizationBySlug('acme')?.id, 'org_acme', 'a current slug wins');
 
 // ── Legacy URLs still parse and are flagged for canonicalisation ──────────────
 eq(parseRoute('/dashboard'), { name: 'global', tab: 'insights', legacy: true }, 'legacy /dashboard');
