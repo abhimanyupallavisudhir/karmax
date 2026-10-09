@@ -10637,7 +10637,7 @@ function conversationPane(v, t) {
   const fu = canFollowUp
     ? `<div class="ck-compose"><div class="followup-box" data-role="${esc(t.role)}">
         <div class="prompt-field">
-          <textarea class="followup-input" placeholder="${t.shared ? `Message the agent · @ to call an agent or person · [[ for wiki` : `Send a follow-up to ${agentName} (drop files here, type [[ for wiki context)`}" ${followUp.enabled ? '' : 'disabled'}>${esc(draft)}</textarea>
+          <textarea class="followup-input" placeholder="${t.shared ? `${defaultRecipientFor(v) === 'agent:do' ? 'Message the agent' : `Reply to ${participantLabelOf(defaultRecipientFor(v).slice(6), v)}`} · @ to call an agent or person · [[ for wiki` : `Send a follow-up to ${agentName} (drop files here, type [[ for wiki context)`}" ${followUp.enabled ? '' : 'disabled'}>${esc(draft)}</textarea>
           ${t.shared ? newAgentFormsHtml(v, `${v.taskId}/${t.role}`) : ''}
           <div class="img-chips attachment-chips followup-chips" style="display:none"></div>
           <div class="prompt-attach-row"><label class="attach-file-button" tabindex="0">Attach files<input class="followup-files" type="file" multiple hidden></label><span>25 MB each · 50 MB per prompt</span></div>
@@ -12893,14 +12893,29 @@ function wireStopAgents(v) {
   }));
 }
 
+// Whom unaddressed text goes to: you are replying to the agent that last spoke
+// to you (a helper answering or asking you, or the main agent), until you have
+// spoken since; else the main agent. A group (@creator, @maintainers…) may
+// include you, so a helper asking one is asking you.
+function defaultRecipientFor(v) {
+  const me = S.user?.id && `user:${S.user.id}`;
+  for (const m of [...(v?.messages || [])].reverse()) {
+    if (m.role === 'user' && (!m.author || m.author === me)) break;
+    if (m.role !== 'agent') continue;
+    const author = m.author || 'do';
+    // The main agent's own words (no recipients) are for the task's people.
+    const toMe = m.to ? m.to.some((s) => s === me || s.startsWith('@')) : author === 'do';
+    if (toMe) return `agent:${author}`;
+  }
+  return 'agent:do';
+}
 // Recipients of a composed message: text before the first mention also reaches
-// the main agent (first); a message starting with a mention reaches only those.
-// Helpers are reached only with @, so unaddressed text never wakes one.
-function composeRecipients(text, mentions) {
+// the default recipient (first); a message starting with a mention reaches only those.
+function composeRecipients(text, mentions, defaultRecipient = 'agent:do') {
   const ordered = [...mentions].sort((a, b) => a.index - b.index);
   const first = ordered.length ? ordered[0].index : text.length;
   const out = [];
-  if (!ordered.length || text.slice(0, first).trim()) out.push('agent:do');
+  if (!ordered.length || text.slice(0, first).trim()) out.push(defaultRecipient);
   for (const mention of ordered) if (!out.includes(mention.selector)) out.push(mention.selector);
   return out;
 }
@@ -13176,7 +13191,7 @@ function wireFollowups(v) {
         const mentions = shared ? [...picked, ...typedMentions(text).filter((t) => !picked.some((m) => m.index === t.index))] : [];
         const newAgents = shared ? Object.fromEntries(Object.entries(followupNewAgents(key))
           .filter(([agentKey]) => mentions.some((m) => m.selector === `agent:${agentKey}`))) : {};
-        const to = shared ? composeRecipients(text, mentions) : undefined;
+        const to = shared ? composeRecipients(text, mentions, defaultRecipientFor(v)) : undefined;
         const result = shared
           ? await api(`/api/tasks/${v.taskId}/messages`, { method: 'POST', body: JSON.stringify({ text, to,
               ...(Object.keys(newAgents).length ? { agents: newAgents } : {}),

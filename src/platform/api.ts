@@ -3723,7 +3723,7 @@ export class KarmaxApi {
     const task = (await this.deps.store.getTask(taskId));
     // Another of the task's agents (a helper called in with @, the Responder, a
     // Reviewer) asking people does not hold the task the main agent is driving:
-    // it asks them in the conversation, and a reply that @-mentions it calls it back.
+    // it asks them in the conversation, and their reply calls it back.
     if (task && caller.taskId === taskId && caller.participant && caller.participant !== MAIN_AGENT && this.sharedConversation(task)
       && task.lastView?.waitingFor?.kind !== 'responder') {
       if (!args.audience?.length) throw new ValidationError(unnamedAudienceError(await this.escalationTargets(task), !!task.parentTaskId));
@@ -3731,7 +3731,7 @@ export class KarmaxApi {
       const posted = await this.postTaskMessage(token, taskId, { text: args.message, to: audience,
         ...(args.urgency ? { urgency: args.urgency } : {}) });
       return { ...(task.lastView as TaskView), asked: posted.notified,
-        note: `Asked ${posted.notified.join(', ')} in the conversation. End your turn; a reply that @-mentions you calls you back.` } as TaskView;
+        note: `Asked ${posted.notified.join(', ')} in the conversation. End your turn; their reply calls you back.` } as TaskView;
     }
     // A task agent escalates its own task's requests, and those its sub-tasks
     // routed to it (it is their default audience).

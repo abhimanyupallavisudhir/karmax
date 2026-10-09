@@ -107,6 +107,17 @@ it('calls a new agent into a task from the follow-up box with @+', async () => {
   await page.locator('.followup-new-agent select').first().selectOption('mock').catch(() => {});
   await box.type('please double-check\n@heard');
   if (shots) await page.screenshot({ path: path.join(shots, 'mention-new-agent.png') });
+  // Agent 1's answer streams into the thread before the view that ends its turn
+  // reaches the page, and until then unaddressed text still goes to the main
+  // agent (master CI #1669 replied in that window). Holding that view makes
+  // the window certain instead of rare.
+  let holdTurnEnd = true;
+  await page.route(`${app.url}/api/tasks/${task.id}`, async (route) => {
+    const response = await route.fetch();
+    const json = await response.json();
+    if (holdTurnEnd && json.participants?.some((p: any) => p.key === 'agent-1' && p.state === 'idle')) await new Promise((resolve) => setTimeout(resolve, 3_000));
+    await route.fulfill({ response, json });
+  });
   await page.locator('.followup-box[data-role="do"] .followup-send').click();
   await step('Agent 1 answers in the same thread', () =>
     page.locator('.msg.agent.other-agent .role').filter({ hasText: 'Agent 1' }).waitFor({ timeout: 60_000 }));
@@ -117,16 +128,11 @@ it('calls a new agent into a task from the follow-up box with @+', async () => {
   if (shots) await page.screenshot({ path: path.join(shots, 'conversation.png'), fullPage: false });
 
   // Stop, like Ctrl+C: the working agent's turn ends and the task goes on.
-  // Unaddressed text still goes to the main agent after Agent 1 answered you;
-  // Agent 1 is reached with @.
-  await step('Agent 1 is done', () => expect.poll(async () => (await consoleRequest(context, app!.url, 'GET', `/api/tasks/${task.id}`))
-    ?.participants?.find((p: any) => p.key === 'agent-1')?.state, { timeout: 30_000 }).toBe('idle'));
-  expect(await box.getAttribute('placeholder')).toMatch(/^Message the agent /);
-  await box.fill('');
-  await box.type('@1');
-  await step('@1 picks Agent 1', () => expect.poll(() => box.inputValue()).toBe('@Agent 1 '));
-  await box.type('Take your time.\n@sleep 120000');
+  // (Unaddressed text replies to Agent 1, which just answered you; the box says so.)
+  await step('the box replies to Agent 1', () => expect.poll(() => box.getAttribute('placeholder'), { timeout: 15_000 }).toMatch(/^Reply to Agent 1 /));
+  await box.fill('Take your time.\n@sleep 120000');
   await page.locator('.followup-box[data-role="do"] .followup-send').click();
+  holdTurnEnd = false;
   const stop = page.locator('.followup-box[data-role="do"] .followup-stop');
   await step('Stop appears while the agent works', () => stop.waitFor({ timeout: 60_000 }));
   expect(await stop.getAttribute('title')).toBe('Stop Agent 1');

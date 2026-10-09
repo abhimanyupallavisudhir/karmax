@@ -42,7 +42,7 @@ global.S = {
 };
 global.ICON = { stop: '<svg></svg>' };
 global.waitingText = (w) => ({ account: 'Waiting for credential' }[w.kind] || w.kind);
-for (const fn of ['sharedConversation', 'participantLabelOf', 'messageSpeaker', 'recipientLabel', 'recipientsHtml', 'composeRecipients',
+for (const fn of ['defaultRecipientFor', 'sharedConversation', 'participantLabelOf', 'messageSpeaker', 'recipientLabel', 'recipientsHtml', 'composeRecipients',
   'nextAgentKeyFor', 'locateMentions', 'taskTranscripts', 'conversationTextKey', 'conversationEntries', 'renderConversationEntry',
   'participantListHtml', 'stoppableAgent', 'stopAgentButton', 'conversationPresence']) eval(extractFn(fn));
 
@@ -100,6 +100,27 @@ assert.strictEqual(participantLabelOf('agent-3', view), 'Agent 3');
 // Historical tasks keep their per-role transcripts.
 const legacy = { taskId: 't', messages: [], transcripts: [{ role: 'do', label: 'Do agent', messages: [] }, { role: 'confirm', label: 'Confirm agent', messages: [] }] };
 assert.deepStrictEqual(taskTranscripts(legacy).map((t) => t.role), ['do', 'confirm']);
+
+// Unaddressed text replies to the helper that asked you, until you have spoken.
+const asked = { participants: view.participants, messages: [
+  { id: 'q', role: 'agent', author: 'agent-3', to: ['user:user-1'], text: 'Which region?', ts: 1 }] };
+assert.strictEqual(defaultRecipientFor(asked), 'agent:agent-3');
+asked.messages.push({ id: 'r', role: 'user', author: 'user:user-1', text: 'EU', ts: 2 });
+assert.strictEqual(defaultRecipientFor(asked), 'agent:do');
+assert.deepStrictEqual(composeRecipients('EU', [], 'agent:agent-3'), ['agent:agent-3']);
+// A helper asking whoever created the task (escalate_to_human's default) or a
+// group asks you too.
+asked.messages.push({ id: 'q2', role: 'agent', author: 'agent-3', to: ['@creator'], text: 'Which zone?', ts: 3 });
+assert.strictEqual(defaultRecipientFor(asked), 'agent:agent-3');
+// The main agent speaking to you after it takes the reply back.
+asked.messages.push({ id: 'm', role: 'agent', text: 'Done; ready for review.', ts: 4 });
+assert.strictEqual(defaultRecipientFor(asked), 'agent:do');
+// A helper's answer to another agent is not for you.
+asked.messages.push({ id: 'h', role: 'agent', author: 'agent-3', to: ['agent:do'], text: 'Looks fine.', ts: 5 });
+assert.strictEqual(defaultRecipientFor(asked), 'agent:do');
+// Nor is a helper asking someone else.
+asked.messages.push({ id: 'b', role: 'agent', author: 'agent-3', to: ['user:user-2'], text: 'Bea, which zone?', ts: 6 });
+assert.strictEqual(defaultRecipientFor(asked), 'agent:do');
 
 // Stop (like Ctrl+C): every agent that is not idle can be stopped from the list;
 // the composer's Stop stops the one working now, else the one stuck waiting.
