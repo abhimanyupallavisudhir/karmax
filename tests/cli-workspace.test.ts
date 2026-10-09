@@ -4,6 +4,7 @@ import path from 'node:path';
 import { gitOrThrow } from '../src/world/git.js';
 import { parseRef, resolveTarget } from '../src/cli/refs.js';
 import type { Api } from '../src/cli/api.js';
+import { githubSshAliases } from '../src/cli/commands/sync.js';
 import { cliFixture, files } from './helpers/cli-fixture.js';
 
 const cleanups: Array<() => Promise<void> | void> = [];
@@ -119,4 +120,41 @@ it('parses console URLs and short references', () => {
   expect(parseRef('#3')).toEqual({ task: '3' });
   expect(parseRef('task_abc')).toEqual({ task: 'task_abc' });
   expect(parseRef('proj_x')).toEqual({ project: 'proj_x' });
+});
+
+it('suggests the SSH host alias of the account that can read the repository when GitHub refuses the default key', async () => {
+  const f = await fixture();
+  // A laptop whose github.com key belongs to another account; acme's key sits behind an alias.
+  const home = path.join(f.dir, 'home');
+  fs.mkdirSync(path.join(home, '.ssh'), { recursive: true });
+  fs.writeFileSync(path.join(home, '.ssh', 'config'), 'Host github.com\n  IdentityFile ~/.ssh/id_manyu\n\nHost acme.github.com\n  HostName github.com\n  IdentityFile ~/.ssh/id_acme\n');
+  // GitHub over SSH: only the alias's key can read acme's repositories.
+  const ssh = path.join(f.dir, 'github-ssh.sh');
+  fs.writeFileSync(ssh, `#!/bin/sh\nfor last; do :; done\ncase "$*" in *git@acme.github.com*) cd '${f.remotes}' && exec sh -c "$last";; esac\n`
+    + 'echo "ERROR: Repository not found." >&2\nexit 1\n', { mode: 0o755 });
+  const gitconfig = path.join(f.dir, 'gitconfig-ssh');
+  fs.writeFileSync(gitconfig, '[user]\n\tname = Laptop\n\temail = laptop@example.com\n');
+  const env = { HOME: home, GIT_CONFIG_GLOBAL: gitconfig, GIT_SSH_COMMAND: ssh };
+  const refused = await f.tavya(f.laptop, ['clone', f.project.id, 'ws'], { env });
+  expect(refused.code).not.toBe(0);
+  const suggestion = 'git config --global url."git@acme.github.com:acme/".insteadOf "git@github.com:acme/"';
+  expect(refused.stderr).toContain(suggestion);
+
+  // Running the suggestion is all it takes.
+  await gitOrThrow(f.laptop, ['config', '--file', gitconfig, 'url.git@acme.github.com:acme/.insteadOf', 'git@github.com:acme/']);
+  const cloned = await f.tavya(f.laptop, ['clone', f.project.id, 'ws2'], { env });
+  expect(cloned.code, cloned.stderr).toBe(0);
+  expect(fs.readFileSync(path.join(f.laptop, 'ws2', 'site', 'README.md'), 'utf8')).toBe('# site\n');
+});
+
+it('reads github.com host aliases from an OpenSSH config', () => {
+  expect(githubSshAliases([
+    '# personal', 'Host github.com', '  IdentityFile ~/.ssh/id_a',
+    'Host srajma.github.com gh-srajma', '  HostName github.com', '  User git',
+    'Host *.internal', '  HostName github.com',
+    'Host Work', '  hostname = "GitHub.com"',
+    'Host gitlab', '  HostName gitlab.com',
+    'Match host other', '  HostName github.com',
+  ].join('\n'))).toEqual(['srajma.github.com', 'gh-srajma', 'Work']);
+  expect(githubSshAliases('')).toEqual([]);
 });
