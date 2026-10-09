@@ -129,22 +129,17 @@ Override any of them with `-- --max-api-p95 3000` etc. (see `driver.ts`).
 
 ## AWS account
 
-A dedicated IAM user limited to EC2 in one region. Its inline policy:
-
-```json
-{"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Resource": "*",
-  "Action": ["ec2:RunInstances", "ec2:TerminateInstances", "ec2:StopInstances", "ec2:DescribeInstances",
-    "ec2:DescribeInstanceStatus", "ec2:DescribeImages", "ec2:DescribeVpcs", "ec2:DescribeSubnets",
-    "ec2:DescribeAvailabilityZones", "ec2:DescribeInstanceTypes", "ec2:DescribeVolumes", "ec2:DeleteVolume",
-    "ec2:CreateTags", "ec2:DescribeTags", "ec2:CreateSecurityGroup", "ec2:DeleteSecurityGroup",
-    "ec2:DescribeSecurityGroups", "ec2:AuthorizeSecurityGroupIngress", "ec2:RevokeSecurityGroupIngress",
-    "ec2:ImportKeyPair", "ec2:DeleteKeyPair", "ec2:DescribeKeyPairs"],
-  "Condition": {"StringEquals": {"aws:RequestedRegion": "eu-central-1"}}}]}
-```
+A dedicated IAM user (`tavya-loadtest`, no console access) whose only
+permission is the inline policy [`iam-policy.json`](iam-policy.json): EC2 in
+eu-central-1, where it may launch, change and delete **only resources tagged
+`Project=tavya-loadtest`**. It can read but not touch anything else in the
+account, so it is safe in an account that runs other things. Its access key
+lives in the vault as `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`.
 
 Safety: before creating anything `run.sh` probes the key (`cloud.sh
-verify-scope`: a dry-run launch in the region must be allowed; EC2 in another
-region, IAM, S3 and Lambda must be refused) and stops if it is broader. Every
+verify-scope`: a tagged dry-run launch in the region must be allowed; an
+untagged one, EC2 in another region, IAM, S3 and Lambda must be refused) and
+stops if it is broader. Every
 resource is tagged `Project=tavya-loadtest` and `RunId`; the EXIT trap
 terminates and deletes them even on failure or Ctrl-C (`--keep` skips that,
 for debugging); each VM runs `shutdown -h +180` at boot (`--max-minutes`) with

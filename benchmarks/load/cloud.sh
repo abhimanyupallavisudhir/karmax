@@ -8,7 +8,8 @@
 #
 # Every resource carries Project=tavya-loadtest and RunId=<run>; that tag is
 # the only thing cleanup trusts. Needs the AWS CLI and AWS_* credentials for an
-# IAM user limited to EC2 in AWS_REGION (README.md lists the policy).
+# IAM user limited to EC2 in AWS_REGION on resources tagged Project=tavya-loadtest
+# (iam-policy.json).
 set -euo pipefail
 : "${AWS_REGION:=eu-central-1}"
 export AWS_REGION AWS_DEFAULT_REGION=$AWS_REGION AWS_PAGER=''
@@ -64,9 +65,11 @@ sweep() { # sweep [RUN_ID]
   [ -z "$left" ] || { echo "cloud: ERROR: instances still alive: $left" >&2; return 1; }
 }
 
-# Probes what the key may do, since an EC2-only user may not read its own IAM
-# policy: EC2 in AWS_REGION must work (a dry-run launch is authorized), and EC2
-# in another region, IAM, S3 and STS role assumption must all be refused.
+# Probes what the key may do, since a scoped user may not read its own IAM
+# policy (iam-policy.json): a tagged dry-run launch in AWS_REGION must be
+# authorized, while an untagged one, EC2 in another region, IAM, S3 and Lambda
+# must all be refused. The untagged refusal is what shows the key cannot touch
+# anything in a shared account that the load test did not create.
 verify_scope() {
   local failed=0 out
   probe() { # probe EXPECT(allowed|denied) NAME COMMAND...
@@ -82,7 +85,9 @@ verify_scope() {
   local image
   image=$(aws_ ec2 describe-images --owners 099720109477 --filters 'Name=name,Values=ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*' \
     --query 'sort_by(Images,&CreationDate)[-1].ImageId' 2>/dev/null || echo ami-00000000)
-  probe allowed "dry-run launch in $AWS_REGION" aws_ ec2 run-instances --dry-run --image-id "$image" --instance-type c7i.large
+  probe allowed "tagged dry-run launch in $AWS_REGION" aws_ ec2 run-instances --dry-run --image-id "$image" --instance-type c7i.large \
+    --tag-specifications "$(tag_spec instance scope-check scope-check)" "$(tag_spec volume scope-check scope-check)"
+  probe denied "untagged dry-run launch in $AWS_REGION" aws_ ec2 run-instances --dry-run --image-id "$image" --instance-type c7i.large
   local other=eu-west-1; [ "$AWS_REGION" != eu-west-1 ] || other=eu-central-1
   probe denied "EC2 in $other" aws --region "$other" ec2 describe-instances --max-items 1
   probe denied 'IAM' aws iam list-users --max-items 1
