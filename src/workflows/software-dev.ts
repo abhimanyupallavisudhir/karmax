@@ -53,6 +53,7 @@ import {
   DeclaredAction,
   WorldHandleLike,
   ChildRaise,
+  SubTaskAction,
   ParentResponse,
   SubTaskRequest,
   SubTaskResponse,
@@ -1425,7 +1426,7 @@ async function softwareDevImpl(
         : `Could not publish resources: ${failure} Nothing was lost; Retry publishes again.`;
       if (input.parentTaskId) {
         waitingFor = { kind: 'parent' };
-        await notifyParent('blocked', error);
+        await notifyParent('blocked', error, resourceConflict ? ['keep_own'] : undefined);
       }
       const seenAtEscalation = msgs.length;
       await publish();
@@ -1878,7 +1879,9 @@ async function softwareDevImpl(
       confirmed = true;
       if (responsiveHumanHold && humanPauseActive)
         humanPauseWake = { kind: 'confirm' };
-    } else if (resp.action === 'retry') {
+    } else if (resp.action === 'retry' || resp.action === 'keep_own') {
+      // keep_own: as "Keep this task's version" on a refused publication; otherwise a retry.
+      if (resp.action === 'keep_own' && resourceConflict) keepOwnRequested = true;
       retryRequested = true;
       if (responsiveHumanHold && humanPauseActive)
         humanPauseWake = { kind: 'retry' };
@@ -3318,10 +3321,6 @@ Inspect the complete current diff and specifically compare its delta from the re
     }
   }
 
-  function subtaskRaiseText(r: ChildRaise): string {
-    return `Sub-task "${r.childTitle}" (${r.childTaskId}) needs you — ${r.type}${r.detail ? `: ${r.detail}` : ''}. Answer with respond_to_sub_task (confirm | comment | retry | cancel).`;
-  }
-
   /**
    * Fold any pending child events (raises + settlements) into the Do conversation so
    * the agent sees them at the top of its next turn (SPEC §5.3). This is what lets the
@@ -3467,7 +3466,7 @@ Inspect the complete current diff and specifically compare its delta from the re
   /** Tell our parent (if any) we need a decision (SPEC §5.3). Best effort — if the
    *  parent is gone the child stays human-resolvable via its own retry/confirm. */
   /** Raise to the parent; false when there is none (or it is gone). */
-  async function notifyParent(type: ChildRaise['type'], detail?: string): Promise<boolean> {
+  async function notifyParent(type: ChildRaise['type'], detail?: string, choices?: ChildRaise['choices']): Promise<boolean> {
     if (!input.parentTaskId) return false;
     try {
       await getExternalWorkflowHandle(input.parentTaskId).signal(raiseFromChildSignal, {
@@ -3475,6 +3474,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         childTitle: input.title,
         type,
         detail: detail ?? '',
+        ...(choices?.length ? { choices } : {}),
       });
       return true;
     } catch {
@@ -5288,6 +5288,16 @@ export function sameProposalIdentity(
 
 /** Extract a meaningful message, following Temporal's wrapped `.cause` chain. */
 /** The original failure's own words, without the activity wrapping. */
+const RAISE_CHOICES: Partial<Record<SubTaskAction, string>> = {
+  keep_own: 'publish again keeping its version of the conflicting files',
+};
+
+/** What a parent's Do agent reads when a sub-task raises to it. */
+export function subtaskRaiseText(r: ChildRaise): string {
+  const extra = (r.choices ?? []).filter((choice) => RAISE_CHOICES[choice]).map((choice) => ` | ${choice}: ${RAISE_CHOICES[choice]}`).join('');
+  return `Sub-task "${r.childTitle}" (${r.childTaskId}) needs you — ${r.type}${r.detail ? `: ${r.detail}` : ''}. Answer with respond_to_sub_task (confirm | comment | retry | cancel${extra}).`;
+}
+
 /** The type of the innermost ApplicationFailure that names one. */
 function failureType(err: any): string | undefined {
   let type: string | undefined;

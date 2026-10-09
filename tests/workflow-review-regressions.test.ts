@@ -51,7 +51,7 @@ vi.mock('@temporalio/workflow', async (importOriginal) => ({
 }));
 import { justDoV1_7 } from '../src/workflows/just-do.js';
 import { mergeOnlyV1_7 } from '../src/workflows/merge-only.js';
-import { softwareDevV1_20, softwareDevV1_26, softwareDevV1_27 } from '../src/workflows/software-dev.js';
+import { softwareDevV1_20, softwareDevV1_26, softwareDevV1_27, subtaskRaiseText } from '../src/workflows/software-dev.js';
 import { createAgentTurnLeaser } from '../src/workflows/agent-turn-lease.js';
 import { makeTurnPreparationActivities } from '../src/activities/turn-preparation.js';
 
@@ -866,6 +866,32 @@ describe('resource publication by sub-tasks', () => {
     expect(wf.activities.settleResourceReview.mock.calls).toEqual([['child'], ['child', { keepOwn: true }]]);
     expect(result.stage).toBe('done');
     expect(views.at(-1).actions.map((a: any) => a.name)).not.toContain('keepOwnResources');
+  });
+
+  // A sub-task's escalation goes to its parent, whose agent answers with
+  // respond_to_sub_task: it must have the same choice a person has.
+  it('offers its parent the version choice, and keeps its version when the parent says so', async () => {
+    reviewAndConfirm();
+    const refused = Object.assign(new Error('Activity task failed'), { cause: Object.assign(new Error(conflict), { type: 'resource-conflict' }) });
+    wf.activities.settleResourceReview = vi.fn()
+      .mockRejectedValueOnce(refused)
+      .mockResolvedValue(undefined);
+    let answered = false;
+    wf.wait = () => {
+      if (answered || wf.handlers.get('view')!().stage !== 'escalated') return;
+      answered = true;
+      wf.handlers.get('parentResponse')!({ action: 'keep_own' });
+    };
+    expect((await softwareDevV1_27(child)).stage).toBe('done');
+    expect(wf.childSignal).toHaveBeenCalledWith('raiseFromChild', expect.objectContaining({ type: 'blocked', choices: ['keep_own'] }));
+    expect(wf.activities.settleResourceReview.mock.calls).toEqual([['child'], ['child', { keepOwn: true }]]);
+  });
+
+  it('names the extra answers a raise accepts', () => {
+    const raise = { childTaskId: 'c', childTitle: 'OCR', type: 'blocked' as const, detail: 'Could not publish resources' };
+    expect(subtaskRaiseText(raise)).toMatch(/\(confirm \| comment \| retry \| cancel\)\.$/);
+    expect(subtaskRaiseText({ ...raise, choices: ['keep_own'] }))
+      .toMatch(/\(confirm \| comment \| retry \| cancel \| keep_own: publish again keeping its version of the conflicting files\)\.$/);
   });
 
   it('offers no version choice when publishing failed for another reason', async () => {
