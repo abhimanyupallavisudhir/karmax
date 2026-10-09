@@ -8245,7 +8245,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
 // stays visible on every tab.
 const TASK_TABS = [
   { key: 'overview', label: 'Overview' },
-  { key: 'checkin', label: 'Check-in' },
+  { key: 'checkin', label: 'Chat' },
   { key: 'approvals', label: 'Approval Requests' },
   { key: 'parameters', label: 'Parameters' },
   { key: 'timing', label: 'Timing' },
@@ -8269,7 +8269,7 @@ function renderTaskLoadingPage(rec, error) {
   if (!main) return;
   const title = rec?.title || 'Task';
   main.innerHTML = `<div class="task-page" aria-busy="${error ? 'false' : 'true'}">
-    <div class="tp-head"><div class="row1">
+    <div class="tp-head">${taskBreadcrumb({ taskId: rec?.id, parentTaskId: rec?.parentTaskId })}<div class="row1">
       <button class="icon-btn" id="tp-back" data-shortcut="nav.close" title="Back (Esc)">←</button>
       ${rec?.num != null ? `<span class="task-num">#${rec.num}</span>` : ''}
       <h2>${esc(title)}</h2>
@@ -8299,6 +8299,7 @@ async function renderSeriesPage(rec) {
   main.innerHTML = `
     <div class="task-page">
       <div class="tp-head">
+        ${taskBreadcrumb({ taskId: rec.id, parentTaskId: rec.parentTaskId })}
         <div class="row1">
           <button class="icon-btn" id="tp-back" data-shortcut="nav.close" title="Back (Esc)">←</button>
           ${rec.num != null ? `<span class="task-num">#${rec.num}</span>` : ''}
@@ -9247,7 +9248,7 @@ function renderTaskPage() {
   const retainedThread = patchTaskPage(main, `
     <div class="task-page">
       <div class="tp-head">
-        ${parentTaskContext(v)}
+        ${taskBreadcrumb(v)}
         <div class="row1">
           <button class="icon-btn" id="tp-back" data-shortcut="nav.close" title="Back to the list (Esc)">←</button>
           ${v.num != null ? `<span class="task-num" title="Task #${v.num} — permalink ${esc(base)}">#${v.num}</span>` : ''}
@@ -10228,6 +10229,23 @@ function setStopBtn(running, procId, taskId) {
 // page. Keep the relationship in the task-page masthead where it reads as
 // navigation; `taskRecord` normally supplies the human title/number from the
 // project task pool, with a compact id fallback for old or partially loaded data.
+// The task's place, above its title: its project (a link to the project's list)
+// and, for a sub-task, its parent — one breadcrumb, so where a task lives reads
+// the same whether it was opened from its project, the organization home or a link.
+function taskBreadcrumb(v) {
+  const project = projectById(taskRecord(v.taskId)?.projectId || S.projectId);
+  const org = project && organizationById(project.organizationId);
+  const crumbs = [];
+  if (project) {
+    const name = projectPath(project) || project.name;
+    crumbs.push(`<a class="tp-crumb tp-project" data-spa href="${esc(projectRoute(project.id))}" title="${esc(org?.name ? `${org.name} › ${name}` : name)}">${esc(name)}</a>`);
+  }
+  const parent = parentTaskContext(v);
+  if (parent) crumbs.push(parent);
+  if (!crumbs.length) return '';
+  return `<nav class="tp-crumbs" aria-label="Task location">${crumbs.join('<span class="tp-crumb-sep" aria-hidden="true">›</span>')}</nav>`;
+}
+
 function parentTaskContext(v) {
   const child = taskRecord(v.taskId);
   const parentId = v.parentTaskId || child?.parentTaskId;
@@ -10236,11 +10254,7 @@ function parentTaskContext(v) {
   const label = parent
     ? `${parent.num != null ? `#${parent.num} ` : ''}${parent.title}`
     : numLabel(parentId);
-  return `<button type="button" class="tp-parent" data-open="${esc(parentId)}" aria-label="Open parent task ${esc(label)}">
-    <span class="tp-parent-kicker">Sub-task of</span>
-    <span class="tp-parent-title">${esc(label)}</span>
-    <span class="tp-parent-arrow" aria-hidden="true">›</span>
-  </button>`;
+  return `<button type="button" class="tp-crumb tp-parent" data-open="${esc(parentId)}" title="Parent task" aria-label="Open parent task ${esc(label)}">${esc(label)}</button>`;
 }
 
 // A child reads exactly as it does in the task list and on its own page: the
@@ -21092,8 +21106,8 @@ function allCommands() {
   add({ id: 'task.attempt.new', title: 'New attempt', keybinding: 'a n', group: 'Task', help: false, available: !!(S.selected && S.view && $('#add-attempt:not(:disabled)')), run: () => $('#add-attempt:not(:disabled)')?.click() });
   add({ id: 'task.tab.prev', title: 'Previous tab', keybinding: '[', group: 'Task', help: false, available: !!(S.selected && S.view), run: () => cycleTaskTab(-1) });
   add({ id: 'task.tab.next', title: 'Next tab', keybinding: ']', group: 'Task', help: false, available: !!(S.selected && S.view), run: () => cycleTaskTab(1) });
-  add({ id: 'task.checkin.prev', title: 'Previous Check-in pane', keybinding: '{', group: 'Task', help: false, available: !!(S.selected && S.view && S.taskTab === 'checkin'), run: () => cycleCheckinPane(-1) });
-  add({ id: 'task.checkin.next', title: 'Next Check-in pane', keybinding: '}', group: 'Task', help: false, available: !!(S.selected && S.view && S.taskTab === 'checkin'), run: () => cycleCheckinPane(1) });
+  add({ id: 'task.checkin.prev', title: 'Previous Chat pane', keybinding: '{', group: 'Task', help: false, available: !!(S.selected && S.view && S.taskTab === 'checkin'), run: () => cycleCheckinPane(-1) });
+  add({ id: 'task.checkin.next', title: 'Next Chat pane', keybinding: '}', group: 'Task', help: false, available: !!(S.selected && S.view && S.taskTab === 'checkin'), run: () => cycleCheckinPane(1) });
   // { / } also walk the settings rail's panes (project or organization settings).
   const onSettings = ['settings', 'organization', 'global'].includes(S.tab) && !S.selected;
   add({ id: 'settings.pane.prev', title: 'Previous settings section', keybinding: '{', group: 'Navigation', help: false, available: onSettings, run: () => cycleSettingsPane(-1) });
@@ -21472,7 +21486,7 @@ function openHelp() {
       ${row('[ / ]', 'Previous / next tab')}
       ${row('a [ / a ]', 'Previous / next attempt')}
       ${row('a n', 'New attempt (open editable draft)')}
-      ${row('{ / }', 'Previous / next Check-in pane')}
+      ${row('{ / }', 'Previous / next Chat pane')}
       ${row('u', 'Back to the list')}
       ${row(esc(fmtKeys('meta+Enter')), 'Send follow-up (from inside the compose box)')}
       ${row('Esc', 'Close the topmost panel / leave a text field')}

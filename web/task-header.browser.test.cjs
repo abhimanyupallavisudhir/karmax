@@ -89,6 +89,16 @@ const attempt = (n, extra = {}) => ({
       };
     });
     assert.equal(layout.workflowInHead, false, 'workflow mode is not in the header');
+    // The project the task belongs to heads the page, as a link back to its list.
+    const crumb = page.locator('.tp-head .tp-crumbs a.tp-project');
+    assert.equal(await crumb.innerText(), 'Project');
+    assert.equal(await crumb.getAttribute('href'), '/test/project');
+    assert.equal(await page.locator('.tp-crumbs .tp-parent').count(), 0, 'a top-level task has no parent crumb');
+    const crumbAligned = await page.evaluate(() => {
+      const x = (sel) => Math.round(document.querySelector(sel).getBoundingClientRect().left);
+      return { crumb: x('.tp-crumbs .tp-project'), num: x('.tp-head .row1 .task-num') };
+    });
+    assert.ok(Math.abs(crumbAligned.crumb - crumbAligned.num) <= 2, `the project lines up with the task number (${JSON.stringify(crumbAligned)})`);
     assert.doesNotMatch(layout.headText, /Software dev|v1\.26\.0/, 'workflow name and version are not in the header');
     assert.doesNotMatch(layout.headText, /\d+ attempts/, 'no attempt-count heading');
     assert.doesNotMatch(layout.headText, /no tags|Shown in task list/, 'no filler text');
@@ -96,12 +106,12 @@ const attempt = (n, extra = {}) => ({
     assert.ok(layout.cardHeight <= 32, `attempt cards are single-line (${layout.cardHeight}px)`);
     assert.equal(layout.attemptChip, false, 'the selected card marks the current attempt; no duplicate title chip');
     assert.equal(layout.metaRows, 1, 'PR links, priority and tags share one line');
-    assert.ok(layout.headHeight <= 180, `header is compact (${layout.headHeight}px)`);
+    assert.ok(layout.headHeight <= 194, `header is compact (${layout.headHeight}px)`);
 
     // Without a pinned tab a task opens on Check-in, whose toolbar is one quiet row.
     await open(undefined);
     await page.waitForSelector('#fork-task-agent');
-    assert.equal(await page.locator('.tp-tabs .tab.active').innerText(), 'Check-in');
+    assert.equal(await page.locator('.tp-tabs .tab.active').innerText(), 'Chat');
     await shot('task-checkin-toolbar.png', '.task-page .ck-pane-head');
     const tools = await page.evaluate(() => [...document.querySelectorAll('.ck-tools .btn, #local-checkout')]
       .map((el) => Math.round(el.getBoundingClientRect().height)));
@@ -132,7 +142,9 @@ const attempt = (n, extra = {}) => ({
     await shot('task-header-single.png');
     assert.equal(await page.locator('.attempt-card').count(), 0, 'a single attempt shows no navigation strip');
     const single = await page.evaluate(() => document.querySelector('.tp-head').getBoundingClientRect().height);
-    assert.ok(single <= 140, `single-attempt header is compact (${single}px)`);
+    assert.ok(single <= 158, `single-attempt header is compact (${single}px)`);
+    await crumb.click();
+    await page.waitForFunction(() => location.pathname === '/test/project');
 
     assert.deepEqual(errors, []);
     console.log('task header browser regression passed');

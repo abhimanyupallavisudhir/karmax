@@ -78,7 +78,7 @@ const root = __dirname;
     await page.waitForSelector('.agent-forks');
     await shot('finished-task-overview.png');
     const overview = await page.locator('.task-page').innerText();
-    assert.match(overview, /Sub-task of\s*#10 Ship reporting/, 'the finished parent keeps its number and title');
+    assert.match(await page.locator('.tp-crumbs').innerText(), /^Shop\s*›\s*#10 Ship reporting$/, 'the breadcrumb names the project, then the finished parent by number and title');
     assert.match(overview, /work summary[\s\S]*3 file\(s\) changed\.[\s\S]*Merged into main as 1a2b3c4d\./i, 'the work summary keeps what the work was');
     assert.match(overview, /Screenshot/, 'review outputs stay openable');
     assert.match(overview, /2 task forks/, 'finished and live forks are both listed');

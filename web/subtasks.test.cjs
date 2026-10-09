@@ -45,7 +45,7 @@ const ok = (condition, message) => {
 };
 
 const parentLink = parentTaskContext({ taskId: 'child-a', parentTaskId: 'parent' });
-ok(parentLink.includes('Sub-task of') && parentLink.includes('#10 Ship the new workspace'), 'child names its parent in the masthead');
+ok(parentLink.includes('#10 Ship the new workspace') && parentLink.includes('aria-label="Open parent task #10 Ship the new workspace"'), 'child names its parent in the masthead');
 ok(parentLink.includes('data-open="parent"') && parentLink.startsWith('<button'), 'parent context is one keyboard-operable navigation target');
 ok(parentTaskContext({ taskId: 'parent' }) === '', 'top-level tasks do not render empty parent chrome');
 // A finished parent is archived out of the live list; the view still names it.
