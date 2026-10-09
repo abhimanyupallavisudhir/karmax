@@ -37,7 +37,13 @@ tavya pull               # bring repositories, data and secrets up to date
 tavya push               # push commits and changed data
 ```
 
-`tavya status` and `tavya diff` show what changed since the last pull or push. Git uses your own credentials. If your organization allows it, `clone --git-via-tavya` works without a GitHub account.
+`tavya status` and `tavya diff` show what changed since the last pull or push. If your organization allows it, `clone --git-via-tavya` works without a GitHub account.
+
+Git uses your own credentials. If you reach another GitHub account through an SSH alias in `~/.ssh/config` (say `Host work.github.com`), point that owner's repositories at it once:
+
+```
+git config --global url."git@work.github.com:owner/".insteadOf "git@github.com:owner/"
+```
 
 ## Bring a local project to tavya
 

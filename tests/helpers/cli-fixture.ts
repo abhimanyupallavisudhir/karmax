@@ -105,12 +105,12 @@ export async function cliFixture(cleanups: Array<() => Promise<void> | void>, op
   await post(`/api/projects/${project.id}/secrets`, { env: 'API_KEY=s3cret\n' });
   await post(`/api/projects/${project.id}/secrets`, { name: 'sa.json', value: '{"key":"x"}', file: 'config/sa.json' });
 
-  const tavya = (cwd: string, args: string[], run: { token?: string; input?: string } = {}) =>
+  const tavya = (cwd: string, args: string[], run: { token?: string; input?: string; env?: NodeJS.ProcessEnv } = {}) =>
     new Promise<{ code: number; stdout: string; stderr: string }>((resolve, reject) => {
       const child = spawn(process.execPath, [path.resolve('bin/tavya.js'), ...args], { cwd,
         env: { ...process.env, TAVYA_URL: server.url, TAVYA_TOKEN: run.token ?? maintainer, KARMAX_TOKEN: '', KARMAX_GATEWAY_URL: '',
           TAVYA_CONFIG_DIR: path.join(dir, 'config'), TAVYA_CACHE_DIR: path.join(dir, 'cache'), TAVYA_RESTIC: hostResticBinary(),
-          GIT_CONFIG_GLOBAL: gitconfig, GIT_CONFIG_NOSYSTEM: '1', TAVYA_NO_KEYCHAIN: '1' }, stdio: ['pipe', 'pipe', 'pipe'] });
+          GIT_CONFIG_GLOBAL: gitconfig, GIT_CONFIG_NOSYSTEM: '1', TAVYA_NO_KEYCHAIN: '1', ...run.env }, stdio: ['pipe', 'pipe', 'pipe'] });
       let stdout = ''; let stderr = '';
       child.stdout.on('data', (chunk) => { stdout += chunk; });
       child.stderr.on('data', (chunk) => { stderr += chunk; });
