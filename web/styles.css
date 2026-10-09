@@ -2369,6 +2369,16 @@ html[data-theme="dark"] .github-signin-btn:active,
 .branch-pair.cols-3 { grid-template-columns: 1fr 1fr 1fr; }
 .branch-pair .form-row { min-width: 0; }
 @media (max-width: 700px) { .branch-pair, .branch-pair.cols-3 { grid-template-columns: 1fr; } }
+/* Different branches per repo: the pair becomes one Base/Target row per repository. */
+.rb-list { display: grid; grid-template-columns: minmax(0, max-content) minmax(0, 1fr) minmax(0, 1fr); gap: 6px 12px; align-items: center; margin-bottom: 10px; }
+.rb-row { display: contents; }
+.rb-head label { font-size: 12px; font-weight: 600; color: var(--ink-2); }
+.rb-repo { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--font-mono); font-size: 12px; color: var(--ink-2); }
+.rb-list input { width: 100%; min-width: 0; padding: 9px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); outline: none; }
+.rb-list input:focus { border-color: var(--accent); }
+.branch-pair-slot .form-row { margin-bottom: 10px; }
+.rb-toggle-row { display: flex; align-items: center; gap: 6px; margin-bottom: 14px; font-size: 12px; font-weight: 600; color: var(--ink-2); }
+.rb-toggle-row .switch { gap: 8px; cursor: pointer; }
 
 /* ── 5-field cron grid (task form) ─────────────────────── */
 /* Cron field values are a few characters — compact cells, and minmax(0,1fr) +

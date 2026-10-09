@@ -164,7 +164,7 @@ describe('E2B cloud world provider', () => {
         return { events: [
           { id: 'pause-1', type: 'sandbox.lifecycle.paused', timestamp: '2026-07-31T10:05:00Z',
             sandbox_id: 'sandbox-1', sandbox_execution_id: 'execution-1', event_data: {
-              sandbox_metadata: { karmaxHome: serviceHomeLabel(), karmaxTaskId: 'task-1' },
+              sandbox_metadata: { karmaxHome: serviceHomeLabel(), karmaxTaskId: 'task-1', karmaxOrganizationId: 'org-1' },
               execution: { started_at: '2026-07-31T10:00:00Z', execution_time: 300_000,
                 vcpu_count: 2, memory_mb: 512 },
             } },
@@ -185,7 +185,7 @@ describe('E2B cloud world provider', () => {
       () => ({ organizationId: 'org-1', provider: 'e2b', apiKey: 'secret', config: {} }));
 
     expect((await provider.listUsageEvents!('org-1')).events).toEqual([{
-      id: 'execution-1', sandboxId: 'sandbox-1', taskId: 'task-1',
+      id: 'execution-1', sandboxId: 'sandbox-1', taskId: 'task-1', organizationId: 'org-1',
       startedAt: Date.UTC(2026, 6, 31, 10), endedAt: Date.UTC(2026, 6, 31, 10, 5),
       activeMs: 300_000, cpu: 2, memoryMb: 512,
     }]);
@@ -388,13 +388,15 @@ describe('E2B cloud world provider', () => {
         return sandbox;
       },
       async list(options) {
+        // Sandboxes created before the organization label are still adopted.
+        expect(options.metadata).not.toHaveProperty('karmaxOrganizationId');
         return options.metadata.karmaxTaskId === 'retry-create'
           ? [{ sandboxId: sandbox.sandboxId, metadata }]
           : [];
       },
     });
 
-    await provider.create({ taskId: 'retry-create', generation: 3, base: 'main' });
+    await provider.create({ taskId: 'retry-create', generation: 3, base: 'main', organizationId: 'org-1' });
 
     expect(creates).toBe(0);
     expect(connects).toBe(1);

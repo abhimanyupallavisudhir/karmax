@@ -231,13 +231,14 @@ export class WorktreeProvider implements WorldProvider {
       ...(baseSha ? { baseSha } : {}), ...(spec.sourceAuthority === 'origin' ? { sourceAuthority: 'origin' as const } : {}) };
   }
 
-  /** Apply a first-class repository attachment's per-repo branch policy. */
+  /** Apply a repository's own branch policy (a task's per-repository branches
+   * or a repository attachment's); a policy without a target keeps the task's. */
   private repoSpec(spec: WorldSpec, source: string): WorldSpec {
     const policy = spec.repositoryBranches?.[source];
     const sourceAuthority = spec.repositoryAuthorities?.[source] ?? spec.sourceAuthority;
     return {
       ...spec,
-      ...(policy ? { base: policy.base, target: policy.target } : {}),
+      ...(policy ? { base: policy.base, target: policy.target ?? spec.target } : {}),
       ...(sourceAuthority ? { sourceAuthority } : {}),
     };
   }

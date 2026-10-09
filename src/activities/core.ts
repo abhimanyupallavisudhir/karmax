@@ -121,7 +121,7 @@ import { SIG_AGENT_TURN_STATE } from '../workflows/names.js';
 import { destroyWorldServices } from '../world/services.js';
 import { sameRepository } from '../world/repository-identity.js';
 import { forkDevelopmentSources, forkRecordedAuthority, type ForkWorldSource } from '../world/fork.js';
-import { REPOSITORY_BRANCHES_RESOLVED_PARAM } from '../platform/branch-defaults.js';
+import { REPOSITORY_BRANCHES_RESOLVED_PARAM, normalizeRepoBranches, repoBranchesFor } from '../platform/branch-defaults.js';
 
 /** A sub-task's task param: the versions of its parent's writable resources it starts from. */
 const PARENT_RESOURCES_PARAM = '_parentResources';
@@ -1468,7 +1468,15 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // to merge back into. prepareChildTask publishes this parent ref before
       // provisioning, including repositories attached after the parent started.
       const childStack = Boolean(taskRecord?.parentTaskId && args.base);
-      const repositoryBranches = Object.fromEntries(worldSources.flatMap((source, index) => {
+      // The task's own per-repository branches (resolved and persisted when it
+      // was queued) outrank every project-level policy. A repository whose
+      // target is the common one stays unpinned, so a retarget still moves it.
+      const taskRepoBranches = normalizeRepoBranches(taskRecord?.params.repoBranches);
+      const repositoryBranches: Record<string, { base: string; target?: string }> = Object.fromEntries(worldSources.flatMap((source, index) => {
+        const own = childStack ? undefined : repoBranchesFor(taskRepoBranches, [requestedSources[index], transportSources[index], source]);
+        const ownBase = own?.base ?? args.base;
+        if (own && ownBase) return [[source, { base: ownBase,
+          ...(own.target && own.target !== (args.target ?? args.base) ? { target: own.target } : {}) }]];
         const candidate = linkedRepositories.find((entry) => sameRepository(entry.repository.sshUrl, transportSources[index]!));
         if (!candidate) return [];
         if (childStack) return [[source, { base: args.base, target: args.target ?? args.base }]];

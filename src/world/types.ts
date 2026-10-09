@@ -169,9 +169,10 @@ export interface WorldSpec {
     /** SSH-shaped GitHub URL -> short-lived, repository-scoped App token. */
     httpsTokens?: Record<string, string>;
   };
-  /** Per-repository branch policy supplied by first-class hosted repository
-   * attachments. Keys are the exact SSH URLs in `repos`. */
-  repositoryBranches?: Record<string, { base: string; target: string }>;
+  /** Per-repository branch policy: a task's per-repository branches, or a
+   * first-class repository attachment's. Keys are the exact sources in `repos`;
+   * without a target the repository follows the task's (unpinned). */
+  repositoryBranches?: Record<string, { base: string; target?: string }>;
   /** Per-source authority selected by the trusted create-world activity. A PR
    * checkout forks from and later publishes through origin; local-only and
    * none/push checkouts retain the configured project repository. */
@@ -391,6 +392,10 @@ export interface ProviderUsageEvent {
   id: string;
   sandboxId: string;
   taskId?: string;
+  /** The organization that created the sandbox (`karmaxOrganizationId`
+   * metadata). One provider account can serve several organizations, so this,
+   * not whose key read the feed, decides who the execution is booked to. */
+  organizationId?: string;
   startedAt: number;
   endedAt: number;
   activeMs: number;

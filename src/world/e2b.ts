@@ -196,7 +196,10 @@ export class E2BWorldProvider implements WorldProvider {
       // `karmaxHome` scopes orphan reaping to sandboxes THIS deployment
       // created: several karmax instances (dev, prod, a colleague's) can share
       // one E2B account, and reaping by task id alone would kill theirs.
-      metadata,
+      // The organization label books this sandbox's runtime to its owner when
+      // several organizations share one E2B account. It is left out of the
+      // lookup above so sandboxes created before it existed are still adopted.
+      metadata: { ...metadata, ...(spec.organizationId ? { karmaxOrganizationId: spec.organizationId } : {}) },
       // Git provisioning is trusted host work and may require protocols (most
       // notably GitHub SSH) that E2B's domain allowlist proxy resets even when
       // the host is explicitly allowed. No task code runs in this phase. The
@@ -420,6 +423,8 @@ export class E2BWorldProvider implements WorldProvider {
       normalized.push({ id, sandboxId,
         ...(typeof metadata?.karmaxTaskId === 'string' && metadata.karmaxTaskId
           ? { taskId: metadata.karmaxTaskId } : {}),
+        ...(typeof metadata?.karmaxOrganizationId === 'string' && metadata.karmaxOrganizationId
+          ? { organizationId: metadata.karmaxOrganizationId } : {}),
         startedAt, endedAt: startedAt + activeMs, activeMs, cpu, memoryMb });
     }
     return { events: normalized, ...(next !== undefined ? { resumeAt: next } : {}) };

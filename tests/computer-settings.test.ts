@@ -133,11 +133,39 @@ describe('Computer defaults', () => {
     expect(updates).toEqual([]);
     const result = await api.updateParams(editor, task.id, { computer: { provider: 'e2b', cpu: '4', diskGb: 50 } });
     expect(result.applied).toContain('computer');
-    // The workflow judges the edit window; the platform keeps the value.
-    expect(updates).toEqual([{ computer: { provider: 'e2b', cpu: 4, diskGb: 50 } }]);
+    // The Computer is the platform's: no workflow reads it, so none judges it.
+    expect(updates).toEqual([]);
     expect((await store.getTask(task.id))!.params.computer).toEqual({ provider: 'e2b', cpu: 4, diskGb: 50 });
     // A world made before machines were recorded learns the size it was made at.
     expect((await store.currentWorld(task.id))!.meta?.computer).toEqual({ cpu: 2, memoryMb: 2048 });
     expect((await store.effectiveTaskConfig(project.id, task.id)).resources).toMatchObject({ cpu: 4, memoryMb: 2048, diskGb: 50 });
+  });
+
+  // pramana#3: a task started before the Computer existed has no edit window for
+  // it in its workflow input, so the workflow refused every resize and the form
+  // stayed greyed out — exactly when it ran out of disk.
+  it('resizes a task started before the Computer existed, until it ends', async () => {
+    const project = await store.createProject('Older', { worldProvider: 'e2b' });
+    const task = await store.createTask({ projectId: project.id, title: 'Out of disk', workflow: 'software-dev',
+      workflowVersion: '1.20.0', params: { prompt: 'x' } });
+    await store.registerWorld({ version: 2, kind: 'e2b', provider: 'e2b', id: task.id, generation: 1, root: '/w',
+      workspaceRoot: '/w', branch: `tavya/${task.id}`, base: 'main', meta: { projectId: project.id } }, project.id);
+    const view = { taskId: task.id, workflow: 'software-dev', stage: 'do', status: 'waiting', actions: [], editableParams: ['target'] } as any;
+    await store.saveView(task.id, view);
+    const editor = (await tokens.mintPrincipal('user:editor', ['task:edit', 'task:read'], project.id)).token;
+    expect((await api.getTaskView(editor, task.id))?.editableParams).toEqual(['target', 'computer']);
+    updates.length = 0;
+    // The old workflow would refuse a patch naming `computer`; it never sees one.
+    expect((await api.updateParams(editor, task.id, { computer: { diskGb: 25 } })).applied).toEqual(['computer']);
+    expect(updates).toEqual([]);
+    expect((await store.getTask(task.id))!.params.computer).toEqual({ diskGb: 25 });
+    // Other fields still go to the workflow, which judges their windows.
+    await api.updateParams(editor, task.id, { computer: { diskGb: 30 }, target: 'next' });
+    expect(updates).toEqual([{ target: 'next' }]);
+    for (const ended of [{ status: 'done' }, { status: 'waiting', pointOfNoReturnPassed: true }]) {
+      await store.saveView(task.id, { ...view, ...ended });
+      expect((await api.getTaskView(editor, task.id))?.editableParams ?? []).not.toContain('computer');
+      await expect(api.updateParams(editor, task.id, { computer: { diskGb: 40 } })).rejects.toThrow(/can't be resized/);
+    }
   });
 });
