@@ -807,17 +807,18 @@ a.git-repo-name:hover { color:var(--accent); }
 .tp-head .row1 { display: flex; align-items: center; gap: 10px; }
 .tp-head h2 { font-size: 17px; margin: 0; flex: 1; letter-spacing: -0.01em; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tp-head .row1 .task-num { font-size: 13px; }
-.tp-parent {
-  width: 100%; display: flex; align-items: center; gap: 7px;
-  padding: 0 28px 8px 72px; border: 0; background: transparent;
-  color: var(--ink-3); text-align: left; cursor: pointer;
+/* Where the task lives: project › parent task, one quiet line above the title. */
+.tp-head:has(> .tp-crumbs) { padding-top: 10px; }
+.tp-head > .tp-crumbs { display: flex; align-items: center; gap: 6px; min-width: 0; padding-left: 72px; padding-bottom: 4px; font-size: 12px; line-height: 18px; color: var(--ink-3); }
+.tp-crumb {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  padding: 0; border: 0; background: transparent; font: inherit; color: var(--ink-2); font-weight: 500;
+  text-decoration: none; cursor: pointer; transition: color .12s;
 }
-.tp-parent:hover .tp-parent-title { color: var(--accent); }
-.tp-parent:focus-visible { outline: none; }
-.tp-parent:focus-visible .tp-parent-title { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 2px; }
-.tp-parent-kicker { font-size: 11px; letter-spacing: .02em; white-space: nowrap; }
-.tp-parent-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-2); font-size: 12px; font-weight: 600; transition: color .12s; }
-.tp-parent-arrow { font-size: 16px; line-height: 1; color: var(--ink-3); }
+.tp-crumb.tp-project { flex: none; max-width: 40%; }
+.tp-crumb:hover { color: var(--accent); }
+.tp-crumb:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+.tp-crumb-sep { flex: none; color: var(--ink-3); }
 .tp-head .meta { display: flex; gap: 10px; align-items: center; margin-top: 6px; font-size: 12px; color: var(--ink-3); font-family: var(--font-mono); flex-wrap: wrap; }
 /* margin-top/bottom longhands keep the parent rule's auto side margins (and kill
    the base .tabs 18px bottom margin — the head's border sits right under the tabs);
@@ -1042,7 +1043,7 @@ a.git-repo-name:hover { color:var(--accent); }
 .fork-row:hover .fork-arrow { color: var(--accent); transform: translateX(2px); }
 
 @media (max-width: 700px) {
-  .tp-parent { padding-left: 28px; }
+  .tp-head > .tp-crumbs { padding-left: 28px; }
   .subtask-pipeline { display: none; }
   .subtask-row { grid-template-columns: auto minmax(0, 1fr) auto; }
   .subtasks-head { align-items: center; }
