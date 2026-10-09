@@ -6546,8 +6546,9 @@ function openFilterPicker(fieldKey, onAdd) {
 // transparent -is:archived -is:run treatment, parameterized per caller — the
 // fork search deliberately keeps archived tasks in).
 // Forking may start from any project the organization can read: the agent
-// picker searches organization-wide, starting at `project:<this project>` so
-// deleting that one token widens it.
+// picker searches organization-wide, starting at `project:<this project> ` so
+// deleting that one token widens it (the trailing space lets typing go straight
+// on to the next clause).
 function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'run'], exclude, onPick }) {
   const organizationWide = mode === 'agent' && !!S.organizationId;
   const ownProject = organizationWide ? projectById(S.projectId) : undefined;
@@ -6573,7 +6574,7 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
   let closed = false;
   let selection = 0; // ignore agent lookups after closing, searching or choosing another task
   const close = () => { closed = true; selection++; host.remove(); };
-  let q = organizationWide && ownProject ? `project:${projectSlug(ownProject)}` : '';
+  let q = organizationWide && ownProject ? `project:${projectSlug(ownProject)} ` : '';
   let result = null; // last server evaluation
   let hi = 0; // roving highlight over pickable rows
   const sessions = new Map(); // taskId → [{ task: exact attempt, sessions: role→session }]
