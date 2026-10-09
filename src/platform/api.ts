@@ -3786,6 +3786,13 @@ export class KarmaxApi {
       await (await this.workflowHandle(taskId)).signal('reroute', { audience: audience.filter((selector) => !selector.startsWith('avatar:')).length
         ? audience : [...audience, '@creator'], detail });
       held = { ...view, waitingFor: { ...view.waitingFor!, kind: 'human', audience, detail } };
+      // A sub-task's question passed on to people no longer waits on its parent,
+      // which would otherwise keep being prompted to answer it (#454).
+      if (waitingOn === 'parent' && task.parentTaskId) {
+        try {
+          await (await this.workflowHandle(task.parentTaskId)).signal(SIG.subtaskRedirected, { childTaskId: task.id });
+        } catch { /* the parent is gone: nothing waits on it */ }
+      }
     } else {
       await this.stopTaskActivity(task, view, `Escalated to ${audience.join(', ')}`);
       held = await this.startTransitionReplacement(task, view, view.stage, true, { audience, detail });

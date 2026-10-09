@@ -149,7 +149,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'respond_to_sub_task',
     description:
-      'Answer a sub-task that raised to you. action: "open_pr" (its completed work should open a PR and enter Review), "confirm" (approve what it has: lands a PR at Review, or opens the PR of a child whose turn ended without one), "comment" (send guidance/answer its question so it keeps working), "retry" (retry a failed step), or "cancel" (abandon it). Omit child_task_id to answer all waiting children. The answer is delivered when your current turn ends.',
+      'Answer a sub-task that raised to you. action: "open_pr" (its completed work should open a PR and enter Review), "confirm" (approve what it has: lands a PR at Review, or opens the PR of a child whose turn ended without one), "comment" (send guidance/answer its question so it keeps working), "retry" (retry a failed step), or "cancel" (abandon it). Omit child_task_id to answer all waiting children. The answer is delivered when your current turn ends. A question only a person can answer: pass it to them with escalate(to, note, task_id) instead of relaying it.',
     parameters: {
       type: 'object',
       properties: {
@@ -1219,7 +1219,8 @@ export function platformToolHandlers(
       }
       catch (e: any) { return `error: ${e?.message ?? e}`; }
       if (needsInput) {
-        const who = needsInput.audience?.join(', ') ?? 'whoever answers this task\'s questions';
+        const who = needsInput.audience?.join(', ')
+          ?? 'whoever answers this task\'s questions (for a sub-task, its parent task, not a person: to ask a person, name them in audience)';
         return `Asking ${who}. End your turn now${needsInput.message ? '' : ' with the question as your final response'}; you will be resumed with their answer, ${jobs.length ? `when ${jobs.join(', ')} ${jobs.length > 1 ? 'finish' : 'finishes'}, ` : ''}or after ${Math.round(minutes)} min to carry on without it.`;
       }
       return jobs.length

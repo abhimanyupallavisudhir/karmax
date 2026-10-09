@@ -128,6 +128,8 @@ export function pinnedType(type: WorkflowName, version: string): string {
 
 export const SIG = {
   followUp: 'followUp',
+  /** A sub-task's request was passed on to people: it no longer waits on its parent. */
+  subtaskRedirected: 'subtaskRedirected',
   collaborationRequested: 'collaborationRequested',
   collaborationSettled: 'collaborationSettled',
   resourceResolved: 'resourceResolved',
