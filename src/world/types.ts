@@ -391,6 +391,10 @@ export interface ProviderUsageEvent {
   id: string;
   sandboxId: string;
   taskId?: string;
+  /** The organization that created the sandbox (`karmaxOrganizationId`
+   * metadata). One provider account can serve several organizations, so this,
+   * not whose key read the feed, decides who the execution is booked to. */
+  organizationId?: string;
   startedAt: number;
   endedAt: number;
   activeMs: number;

@@ -23,7 +23,20 @@ describe('a local task’s own browser', () => {
     children.push(child);
     return child;
   };
-  const browser = (port: number, custody?: string) => run([`--remote-debugging-port=${port}`], custody, port);
+  /** A browser stand-in, resolved once it owns its port: a busy runner can take
+   * longer than any fixed pause to start a process. */
+  const browser = async (port: number, custody?: string) => {
+    run([`--remote-debugging-port=${port}`], custody, port);
+    for (const deadline = Date.now() + 10_000; ;) {
+      const listening = await new Promise<boolean>((resolve) => {
+        const socket = net.connect(port, '127.0.0.1');
+        socket.once('connect', () => { socket.destroy(); resolve(true); }).once('error', () => resolve(false));
+      });
+      if (listening) return;
+      if (Date.now() > deadline) throw new Error(`stand-in browser never listened on ${port}`);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  };
   const agent = (taskId: string, custodyId: string) => {
     const child = run([], custodyId);
     registerAgent({ pid: child.pid!, cmd: 'node', taskId, owner: process.pid, custodyId, startedAt: Date.now() });
@@ -57,11 +70,11 @@ for arg in "$@"; do case "$arg" in -iTCP@127.0.0.1:*) port=\${arg#-iTCP@127.0.0.
       agent('task_a', 'custody-a');
       agent('task_b', 'custody-b');
       // Another task's browser, and one nobody's agent started.
-      browser(45101, 'outer,custody-b');
-      browser(45102);
+      await browser(45101, 'outer,custody-b');
+      await browser(45102);
       await settle();
       expect(() => localTaskBrowserUrl('task_a')).toThrow(/no browser of its own/);
-      browser(45103, 'outer,custody-a');
+      await browser(45103, 'outer,custody-a');
       await settle();
       expect(localTaskBrowserUrl('task_a')).toBe('http://127.0.0.1:45103');
       expect(localTaskBrowserUrl('task_b')).toBe('http://127.0.0.1:45101');
@@ -79,11 +92,11 @@ for arg in "$@"; do case "$arg" in -iTCP@127.0.0.1:*) port=\${arg#-iTCP@127.0.0.
     Object.defineProperty(process, 'platform', { value: platform });
     try {
       agent('task_a', 'custody-a');
-      browser(45111); // someone else's debug-enabled browser (or a fake CDP server)
+      await browser(45111); // someone else's debug-enabled browser (or a fake CDP server)
       run(['--remote-debugging-port=45111'], 'custody-a'); // names that port, owns nothing
       await settle();
       expect(() => localTaskBrowserUrl('task_a')).toThrow(/no browser of its own/);
-      browser(45112, 'custody-a');
+      await browser(45112, 'custody-a');
       await settle();
       expect(localTaskBrowserUrl('task_a')).toBe('http://127.0.0.1:45112');
     } finally { Object.defineProperty(process, 'platform', { value: real }); }
@@ -94,7 +107,7 @@ for arg in "$@"; do case "$arg" in -iTCP@127.0.0.1:*) port=\${arg#-iTCP@127.0.0.
   it('does not count an IPv6 listener when another process owns the IPv4 one', async () => {
     if (process.platform !== 'linux') return;
     agent('task_a', 'custody-a');
-    browser(45121); // someone else's, on 127.0.0.1
+    await browser(45121); // someone else's, on 127.0.0.1
     const v6 = spawn(process.execPath, ['-e', `require('node:net').createServer().listen({ port: 45121, host: '::', ipv6Only: true }); ${idle}`,
       '--', '--remote-debugging-port=45121'], { stdio: 'ignore', env: { PATH: process.env.PATH ?? '', [CUSTODY_ENV]: 'custody-a' } });
     children.push(v6);
