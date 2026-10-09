@@ -3,6 +3,7 @@ import { parseTransition } from '../resolve/transitions.js';
 import { providerErrorFromMessage } from './limits.js';
 import { worldRepoTarget, worldRepos, worldWorkingRelativePath } from '../world/types.js';
 import { platformToolHandlers } from './tools.js';
+import { SUB_TASK_ACTIONS, type SubTaskAction } from '../domain/types.js';
 
 /**
  * Deterministic mock agent for hermetic tests. It executes simple directives
@@ -184,8 +185,8 @@ export class MockAdapter implements AgentAdapter {
           // Without child_task_id it targets all children currently waiting.
           const [action, textRest = ''] = splitOn(rest, '::');
           const [act = '', childTaskId] = action.trim().split(/\s+/);
-          if (['open_pr', 'confirm', 'comment', 'retry', 'cancel'].includes(act)) {
-            await ctx.respondToSubTask({ action: act as 'open_pr' | 'confirm' | 'comment' | 'retry' | 'cancel', text: textRest.trim() || undefined,
+          if ((SUB_TASK_ACTIONS as readonly string[]).includes(act)) {
+            await ctx.respondToSubTask({ action: act as SubTaskAction, text: textRest.trim() || undefined,
               ...(childTaskId ? { childTaskId } : {}) });
             outputs.push(`respond: ${act}`);
           }

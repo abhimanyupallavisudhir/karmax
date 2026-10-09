@@ -45,7 +45,22 @@ Git uses your own credentials. If you reach another GitHub account through an SS
 git config --global url."git@work.github.com:owner/".insteadOf "git@github.com:owner/"
 ```
 
-`tavya import` turns a folder on your machine into a new tavya project.
+## Bring a local project to tavya
+
+```
+cd ~/code/my-project     # one Git checkout, or a folder of them
+tavya import
+```
+
+`import` shows its plan and asks before changing anything:
+
+- Each checkout becomes a repository of the project. One with no GitHub remote gets a new private repository on your organization's GitHub account, and unpushed commits are pushed.
+- What Git ignores is sorted for you: `.env` files become secrets, files like `credentials.json` or `*.pem` become secret files, and databases and data folders (`data/`, `models/`, or anything over 50 MB) become data. Dependencies and build output are left out, and the rest is listed so you can choose.
+- `--data <path>` and `--secret <path>` add something it left out; `--skip <path>` leaves something out. `--dry-run` only shows the plan.
+
+The folder then is the project's workspace: `tavya push`, `pull` and `status` work in it, and anyone can `tavya clone` the same layout. Importing again adds new checkouts and files, and never overwrites a secret the project already has.
+
+Later, keep more of what Git ignores with `tavya add <path>` (`--data` or `--secret` to say which), and stop with `tavya untrack <path>`; your files stay.
 
 ## Work on a task locally
 
@@ -82,6 +97,6 @@ Inside a project's folder, a task is its number; anywhere else, `my-org/my-proje
 tavya token create --name ci --expires 30
 ```
 
-Set the token as `TAVYA_TOKEN` in your CI. `--level` and `--project` limit what it can do. `tavya api <METHOD> <path>` calls any API endpoint; `tavya api --list` prints them all. Every command accepts `--json`.
+Set the token as `TAVYA_TOKEN` in your CI. `--level` and `--project` limit what it can do. `tavya api <METHOD> <path>` calls any API endpoint; `tavya api --list` prints them all. Every command accepts `--json`. `tavya projects` lists the projects you can open; `tavya open` opens the current one in your browser.
 
 Inside a task's world, `tavya` is already signed in as that task.

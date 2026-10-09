@@ -90,7 +90,8 @@ it('imports a local checkout: links the repository, its .env as secrets, secret 
   fs.mkdirSync(path.join(checkout, 'data', 'raw'), { recursive: true });
   fs.writeFileSync(path.join(checkout, 'data', 'raw', 'a.csv'), 'id\n1\n');
   expect(planImport(checkout, ['.env', 'secrets/credentials.json', 'data/raw/a.csv', 'node_modules/x/index.js', '.env.example'])).toEqual({
-    environmentFiles: ['.env'], secretFiles: ['secrets/credentials.json'], data: [{ path: 'data', shape: 'directory', bytes: 5, access: 'read' }] });
+    environmentFiles: ['.env'], secretFiles: ['secrets/credentials.json'], data: [{ path: 'data', shape: 'directory', bytes: 5, access: 'read' }],
+    leftOut: [{ path: '.env.example', bytes: 0 }] });
   expect(githubRepository('https://github.com/acme/site.git')).toEqual({ owner: 'acme', name: 'site' });
 
   const without = await f.tavya(checkout, ['import', '--name', 'Site Builder']);
