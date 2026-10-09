@@ -63,7 +63,7 @@ Layers around that core:
 - `src/gateway/` — HTTP/WebSocket gateway translating requests into Temporal signal/query/update calls; the **only** thing the UI talks to.
 - `src/store/` — metadata store (SQLite; PostgreSQL when hosted). `overlays.ts` is the SPEC §9 overlay-resolution library; nothing reads it yet.
 - `web/` — single-page console with **no build step**; edit `app.js`/`index.html`/`styles.css` directly.
-- `src/cli/` — the `tavya` command-line client (wiki `features/tavya-cli`): a laptop workspace assembled like a world, plus tasks, exec and the API. It must stay free of runtime dependencies and of server imports (only `src/domain/ignored-files.ts` and `src/world/restic-release.json`); `tests/cli-bundle.test.ts` enforces that the bundle imports only `node:` modules.
+- `src/cli/` — the `tavya` command-line client (wiki `features/tavya-cli`): a laptop workspace assembled like a world, plus tasks, exec and the API. It must stay free of runtime dependencies and of server imports (only `src/domain/ignored-files.ts`, `src/domain/dotenv.ts` and `src/world/restic-release.json`); `tests/cli-bundle.test.ts` enforces that the bundle imports only `node:` modules.
 
 ## Environment variables
 

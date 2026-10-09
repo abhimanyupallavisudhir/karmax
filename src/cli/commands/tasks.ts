@@ -33,6 +33,26 @@ export function taskUrl(server: string, target: Target, organization?: { name: s
   return org ? `${server}/${org.slug ?? slug(org.name)}/${slug(target.project.name)}/tasks/${key}` : `${server}/projects/${slug(target.project.name)}/tasks/${key}`;
 }
 
+export function projectUrl(server: string, project: { name: string }, organization?: { name: string; slug?: string }): string {
+  return organization ? `${server}/${organization.slug ?? slug(organization.name)}/${slug(project.name)}` : `${server}/projects/${slug(project.name)}`;
+}
+
+/** The projects you can open, as `<organization>/<project>` (what clone and --project take). */
+export async function projects(api: Api, args: string[], out: Output, flags: Record<string, any>): Promise<number> {
+  if (args[0] && !['list', 'ls'].includes(args[0])) throw new CliError('usage: tavya projects [--organization <org>]', EXIT.usage);
+  const [organizations, list] = await Promise.all([api.get<Array<{ id: string; name: string; slug?: string }>>('/api/organizations').catch(() => []),
+    api.get<Array<{ id: string; name: string; organizationId?: string }>>('/api/projects')]);
+  const orgOf = (id?: string) => organizations.find((entry) => entry.id === id);
+  const wanted = flags.organization ? organizations.find((entry) => entry.id === flags.organization || (entry.slug ?? slug(entry.name)) === flags.organization) : undefined;
+  if (flags.organization && !wanted) throw new CliError(`no organization "${flags.organization}" that you can access`, EXIT.notFound);
+  const shown = list.filter((project) => !wanted || project.organizationId === wanted.id).map((project) => {
+    const organization = orgOf(project.organizationId);
+    return { ...project, ref: `${organization ? organization.slug ?? slug(organization.name) : project.organizationId ?? ''}/${slug(project.name)}` };
+  });
+  out.result(shown, table(shown.map((project) => [project.ref, project.name])) || 'No projects.');
+  return 0;
+}
+
 interface TaskView { taskId?: string; id?: string; title: string; num?: number; status?: string; stage?: string;
   waitingFor?: { kind?: string; summary?: string }; branch?: string; lastView?: TaskView }
 
