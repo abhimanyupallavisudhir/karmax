@@ -155,6 +155,37 @@ describe('Project settings', () => {
     await ui.close();
   });
 
+  it('shows where each secret goes and puts a suggested name in the repository that asked for it', async () => {
+    const posts: any[] = [];
+    const ui = await settings({ api: ({ method, path: route, body }) => {
+      if (!route.split('?')[0]!.endsWith('/secrets')) return undefined;
+      if (method === 'POST') { posts.push(body); return { imported: [], secrets: [] }; }
+      return { repositories: ['api', 'web'], suggested: [{ name: 'DATABASE_URL', repository: 'web' }], secrets: [
+        { id: 's1', name: 'api/.env:DATABASE_URL', variable: 'DATABASE_URL', dotenv: { path: '.env', repository: 'api' } },
+        { id: 's2', name: 'SHARED', variable: 'SHARED' },
+        { id: 's3', name: 'sa.json', file: 'config/sa.json', repository: 'web' }] };
+    } });
+    const box = ui.page.locator('#project-secrets-box');
+    await box.locator('.project-resource-row').first().waitFor();
+    const rows = await box.locator('.project-resource-row').evaluateAll((elements) =>
+      elements.map((element) => [element.querySelector('b')!.textContent, element.querySelector('code')!.textContent, element.querySelector('.chip')!.textContent]));
+    expect(rows).toEqual([['SHARED', 'SHARED', 'environment variable'], ['DATABASE_URL', 'api/.env', '.env line'],
+      ['sa.json', 'web/config/sa.json', 'private file']]);
+    await box.locator('.project-secret-suggest', { hasText: 'DATABASE_URL' }).click();
+    expect(await box.locator('#project-secret-file').inputValue()).toBe('web/.env');
+    await box.locator('#project-secret-value').fill('postgres://web');
+    await box.locator('#project-secret-save').click();
+    await expect.poll(() => posts.length).toBe(1);
+    expect(posts[0]).toEqual({ name: 'DATABASE_URL', value: 'postgres://web', file: 'web/.env' });
+    // Each repository's .env is offered; a blank destination means every command.
+    await box.locator('#project-secret-paste summary').click();
+    await box.locator('#project-secret-env-file').focus();
+    expect(await box.locator('#project-secret-paste .combo-opt').evaluateAll((options) => options.map((option) => (option as any).dataset.v)))
+      .toEqual(['api/.env', 'web/.env']);
+    expect(await box.locator('#project-secret-env-file').getAttribute('placeholder')).toBe('Every command');
+    await ui.close();
+  });
+
   it('keeps organization repository and storage controls in one Projects pane', async () => {
     const ui = await settings({ path: '/org/settings' });
     const links = await ui.page.locator('.settings-layout a[href^="#settings-"]').evaluateAll((anchors) =>

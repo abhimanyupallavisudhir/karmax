@@ -95,14 +95,17 @@ export async function importProject(api: Api, dir: string, out: Output, flags: R
   const secretsBase = `/api/projects/${encodeURIComponent(project.id)}/secrets`;
   const secrets: string[] = [];
   for (const file of plan.environmentFiles) {
-    const result = await api.post<{ imported: Array<{ name: string }> }>(secretsBase, { env: fs.readFileSync(path.join(root, file), 'utf8') });
+    const result = await api.post<{ imported: Array<{ name: string }> }>(secretsBase,
+      { env: fs.readFileSync(path.join(root, file), 'utf8'), file, repository: repository.name });
     secrets.push(...result.imported.map((entry) => entry.name));
   }
   for (const file of plan.secretFiles) {
     const content = fs.readFileSync(path.join(root, file));
     if (content.includes(0) || content.toString('utf8').includes('�')) { out.warn(`${file}: binary; store it in the vault instead`); continue; }
-    await api.post(secretsBase, { name: path.posix.basename(file), value: content.toString('utf8'), file });
-    secrets.push(path.posix.basename(file));
+    // Named by place: two repositories may both have a credentials.json.
+    const name = `${repository.name}/${file}`;
+    await api.post(secretsBase, { name, value: content.toString('utf8'), file, repository: repository.name });
+    secrets.push(name);
   }
   const data: string[] = [];
   const existing = await api.get<Array<{ id: string; name: string; target?: { path?: string } }>>(`/api/projects/${encodeURIComponent(project.id)}/resources`);
@@ -110,7 +113,7 @@ export async function importProject(api: Api, dir: string, out: Output, flags: R
     const resourceName = slug(entry.path).replace(/-/g, '_');
     const resource = existing.find((candidate) => candidate.target?.path === entry.path)
       ?? await api.post<{ id: string }>(`/api/projects/${encodeURIComponent(project.id)}/resources`, { name: resourceName, driver: 'volume@1',
-        target: { kind: 'path', path: entry.path }, access: entry.access, publish: entry.access === 'write' ? 'review' : 'discard',
+        target: { kind: 'path', path: entry.path, repository: repository.name }, access: entry.access, publish: entry.access === 'write' ? 'review' : 'discard',
         source: { shape: entry.shape, imported: true } });
     const grant = await api.post<{ env: Record<string, string>; parent?: string }>(`/api/projects/${encodeURIComponent(project.id)}/resources/${encodeURIComponent(resource.id)}/append-grant`);
     const full = path.join(root, entry.path);

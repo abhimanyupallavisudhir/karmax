@@ -9010,12 +9010,20 @@ function validateResourceAttachment(value: ResourceAttachment): void {
   if (driver.credentialRequired && !value.credentialHandles.length) throw new Error('credential-backed resources require a credential handle');
   if (value.publish === 'review' && (!snapshot || value.access !== 'write' || value.isolation !== 'fork'))
     throw new Error('reviewed promotion requires a writable, forked snapshot resource');
-  if (value.target.kind === 'path') {
-    const normalized = value.target.path.replace(/\\/g, '/');
+  const location = (target: { path: string; repository?: string }, label: string) => {
+    const normalized = target.path.replace(/\\/g, '/');
     if (!normalized || normalized.startsWith('/') || normalized.split('/').includes('..'))
-      throw new Error('resource path target must be world-relative');
-  } else if (value.target.kind === 'environment' || value.target.kind === 'service') {
+      throw new Error(`${label} must be world-relative`);
+    if (target.repository !== undefined && !/^[A-Za-z0-9._-]+$/.test(target.repository) || /^\.+$/.test(target.repository ?? ''))
+      throw new Error(`${label} names an invalid repository`);
+  };
+  if (value.target.kind === 'path') location(value.target, 'resource path target');
+  else if (value.target.kind === 'environment' || value.target.kind === 'service') {
     if (!/^[A-Z_][A-Z0-9_]*$/.test(value.target.name)) throw new Error('resource environment target must be an uppercase variable name');
+    if (value.target.kind === 'environment' && value.target.dotenv) {
+      location(value.target.dotenv, 'resource .env file');
+      if (value.target.dotenv.path.endsWith('/')) throw new Error('resource .env file must name a file');
+    }
   } else throw new Error('unknown resource target');
   if (!Array.isArray(value.credentialHandles) || value.credentialHandles.some((handle) => typeof handle !== 'string' || !handle))
     throw new Error('resource credential handles must be non-empty strings');
