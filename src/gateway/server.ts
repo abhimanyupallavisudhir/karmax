@@ -4167,7 +4167,8 @@ export class Gateway {
           const declared = (name: string, repository: string) => resources.some((resource) => resource.target.kind === 'environment'
             && resource.target.name === name && (!resource.target.dotenv
               || anchorLocation(resource.target.dotenv, repositories).repository === repository));
-          const suggested = (await discoverEnvironmentNames(project, store, this.deps.githubApp))
+          // Suggestions are a convenience: GitHub being unreachable must not hide the secrets.
+          const suggested = (await discoverEnvironmentNames(project, store, this.deps.githubApp).catch(() => []))
             .filter(({ name, repository }) => !declared(name, repository));
           return this.json(res, 200, { secrets: resources.map((resource) => ({
             ...redactResource(resource), ...secretDestination(resource.target),
@@ -4181,9 +4182,12 @@ export class Gateway {
           catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
           if (!entries.length) return this.json(res, 400, { error: 'name/value or pasted env required' });
           const saved: ResourceAttachment[] = [];
+          const kept: string[] = [];
           try {
             for (const entry of entries) {
               const existing = resources.find((resource) => sameSecretDestination(resource, entry, repositories));
+              // `overwrite: false` keeps a stored value: it has no older version to go back to.
+              if (existing && body.overwrite === false && existing.credentialHandles[0]) { kept.push(existing.name); continue; }
               if (existing) {
                 // A new value becomes the resource's own secret; a stored
                 // handle may name someone else's (AU-40).
@@ -4204,7 +4208,7 @@ export class Gateway {
                   credentialHandles: [handle], publish: 'discard' })));
               }
             }
-            return this.json(res, 200, { imported: saved.map(redactResource), secrets: saved.map(redactResource) });
+            return this.json(res, 200, { imported: saved.map(redactResource), secrets: saved.map(redactResource), kept });
           } catch (error) {
             return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
           }

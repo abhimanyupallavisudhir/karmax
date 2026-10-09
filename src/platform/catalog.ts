@@ -96,7 +96,7 @@ export const PLATFORM_API_CATALOG = {
     'POST /api/projects/:projectId/resources/import-copyglobs',
     'POST /api/projects/:projectId/resources/:resourceId/uploads',
     'PUT|POST|DELETE /api/resource-uploads/:uploadId?projectId=',
-    'GET|POST /api/projects/:projectId/secrets (POST body {name, value} or {env: pasted .env}, optionally {file, repository}: a .env file makes each variable a line of it in that repository, another file takes the whole value; none exports to every command)',
+    'GET|POST /api/projects/:projectId/secrets (POST body {name, value} or {env: pasted .env}, optionally {file, repository}: a .env file makes each variable a line of it in that repository, another file takes the whole value; none exports to every command; overwrite:false keeps stored values, listed in `kept`)',
     'DELETE /api/projects/:projectId/secrets/:name',
     'POST /api/projects/:projectId/secrets/values (project:secret:use; body {names?}; plaintext values for your own machine, audited per name; what `tavya run` injects)',
     'GET|POST|DELETE /api/projects/:projectId/services', 'GET /api/projects/:projectId/services/compose-import',
