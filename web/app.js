@@ -15873,24 +15873,41 @@ async function hydrateAvatarAvailability(scope, id) {
   } catch (error) { paneError(box, error, () => hydrateAvatarAvailability(scope, id)); }
 }
 
+// Where a secret goes: blank exports it to every command; a .env file makes it
+// a line of that file (so each repository can have its own value for a name);
+// any other file takes the whole value.
+function secretPlace(location) { return location ? `${location.repository ? `${location.repository}/` : ''}${location.path}` : ''; }
+function secretDestinationComboHtml(id) {
+  return `<div class="combo secret-destination"><input id="${id}" placeholder="Every command" aria-label="Deliver to" autocomplete="off" spellcheck="false" /><button type="button" class="combo-caret" tabindex="-1" aria-label="Show .env files">▾</button><div class="combo-menu" hidden></div></div>`;
+}
+
 async function hydrateProjectSecrets(proj) {
   const box = $('#project-secrets-box'); if (!box || S.projectId !== proj.id) return;
   const renderIsCurrent = beginAsyncElementRender(box);
   try {
-    const { secrets, suggestions = [] } = await api(`/api/projects/${encodeURIComponent(proj.id)}/secrets`);
+    const { secrets, repositories = [], suggested = [] } = await api(`/api/projects/${encodeURIComponent(proj.id)}/secrets`);
     if (!renderIsCurrent()) return;
-    box.innerHTML = `${secrets.map((secret) => `<div class="project-resource-row"><div class="project-resource-main"><b>${esc(secret.name)}</b><div class="project-resource-meta"><span class="chip">${secret.file ? 'private file' : 'environment variable'}</span><span class="project-resource-location"><span>Delivered as</span><code>${esc(secret.file || secret.variable || secret.name)}</code></span><span class="chip" title="${secret.file ? 'Applies to running tasks too.' : 'Applies to running tasks too. Processes already running keep their old environment until restarted.'}">configured</span></div></div><button class="btn sm project-secret-delete" data-id="${esc(secret.id)}">Remove</button></div>`).join('')}
-      ${suggestions.length ? `<div class="proposal-card"><b>Found in this repository</b><p class="task-sub">These names came from .env.example; nothing has been imported.</p><div class="inline-form">${suggestions.map((name) => `<button class="btn sm project-secret-suggest" data-name="${esc(name)}">＋ ${esc(name)}</button>`).join('')}</div></div>` : ''}
-      <details class="settings-disclosure compact" id="project-secret-add"><summary><b>Add a secret</b><span>Environment variable or private file</span></summary>
+    const place = (secret) => secret.dotenv ? secretPlace(secret.dotenv) : secret.file ? secretPlace({ path: secret.file, repository: secret.repository }) : '';
+    const sorted = [...secrets].sort((a, b) => place(a).localeCompare(place(b)) || (a.variable || a.name).localeCompare(b.variable || b.name));
+    const destinationTip = 'Blank: an environment variable in every command. A .env file: a line of it, so each repository can have its own value. Any other file: the value is the whole file.';
+    const byRepository = repositories.map((repository) => [repository, suggested.filter((entry) => entry.repository === repository)]).filter(([, names]) => names.length);
+    box.innerHTML = `${sorted.map((secret) => `<div class="project-resource-row"><div class="project-resource-main"><b>${esc(secret.dotenv ? secret.variable : secret.name)}</b><div class="project-resource-meta"><span class="chip">${secret.dotenv ? '.env line' : secret.file ? 'private file' : 'environment variable'}</span><span class="project-resource-location"><span>${secret.dotenv ? 'In' : 'Delivered as'}</span><code>${esc(place(secret) || secret.variable || secret.name)}</code></span><span class="chip" title="${secret.file || secret.dotenv ? 'Applies to running tasks too.' : 'Applies to running tasks too. Processes already running keep their old environment until restarted.'}">configured</span></div></div><button class="btn sm project-secret-delete" data-id="${esc(secret.id)}">Remove</button></div>`).join('')}
+      ${byRepository.length ? `<div class="proposal-card"><b>Found in .env.example</b> ${policyTip('Names only; nothing has been imported.')}${byRepository.map(([repository, names]) => `<div class="inline-form">${repositories.length > 1 ? `<span class="task-sub">${esc(repository)}</span>` : ''}${names.map(({ name }) => `<button class="btn sm project-secret-suggest" data-name="${esc(name)}" data-repository="${esc(repository)}">＋ ${esc(name)}</button>`).join('')}</div>`).join('')}</div>` : ''}
+      <details class="settings-disclosure compact" id="project-secret-add"><summary><b>Add a secret</b><span>Environment variable, .env line or private file</span></summary>
         <div class="project-form-grid">
           <label class="form-row"><span>Name</span><input id="project-secret-name" placeholder="DATABASE_URL"><small class="field-help">How this secret is identified in ${siteNameMarkup()}.</small></label>
           <label class="form-row"><span>Value</span><input id="project-secret-value" type="password" autocomplete="new-password" placeholder="Write-only value"><small class="field-help">Encrypted immediately and never returned by the API.</small></label>
-          <label class="form-row wide"><span>Deliver as a private file <small>(optional)</small></span><input id="project-secret-file" placeholder=".secrets/service-account.json"><small class="field-help">Leave blank to inject it as an environment variable with the name above. File secrets are mode 0600 and privately Git-excluded.</small></label>
+          <div class="form-row wide"><span>Deliver to ${policyTip(destinationTip)}</span>${secretDestinationComboHtml('project-secret-file')}</div>
         </div><div class="project-form-actions"><button class="btn sm primary" id="project-secret-save">Save secret</button></div>
       </details>
-      <details class="settings-disclosure compact"><summary><b>Import a pasted .env</b><span>Review names, paste once</span></summary><textarea id="project-secret-env" rows="5" placeholder="KEY=value&#10;# blank values are ignored" style="width:100%"></textarea><button class="btn sm primary" id="project-secret-import">Import</button></details>`;
+      <details class="settings-disclosure compact" id="project-secret-paste"><summary><b>Import a pasted .env</b><span>Review names, paste once</span></summary><textarea id="project-secret-env" rows="5" placeholder="KEY=value&#10;# blank values are ignored" style="width:100%"></textarea><div class="form-row wide"><span>Into ${policyTip(destinationTip)}</span>${secretDestinationComboHtml('project-secret-env-file')}</div><button class="btn sm primary" id="project-secret-import">Import</button></details>`;
+    const dotenvOptions = () => repositories.map((repository) => `${repository}/.env`);
+    box.querySelectorAll('.secret-destination').forEach((combo) => wireCombo(combo, dotenvOptions, null));
     box.querySelectorAll('.project-secret-suggest').forEach((button) => button.addEventListener('click', () => {
-      box.querySelector('#project-secret-add').open = true; box.querySelector('#project-secret-name').value = button.dataset.name; box.querySelector('#project-secret-value').focus();
+      box.querySelector('#project-secret-add').open = true; box.querySelector('#project-secret-name').value = button.dataset.name;
+      // With several repositories, the name goes where its .env.example asked for it.
+      box.querySelector('#project-secret-file').value = repositories.length > 1 ? `${button.dataset.repository}/.env` : '';
+      box.querySelector('#project-secret-value').focus();
     }));
     box.querySelectorAll('.project-secret-delete').forEach((button) => button.addEventListener('click', async () => {
       if (!confirm('Remove this secret and its vault value?')) return;
@@ -15909,7 +15926,8 @@ async function hydrateProjectSecrets(proj) {
     box.querySelector('#project-secret-import')?.addEventListener('click', async () => {
       try {
         const result = await api(`/api/projects/${proj.id}/secrets`, { method: 'POST',
-          body: JSON.stringify({ env: box.querySelector('#project-secret-env').value }) });
+          body: JSON.stringify({ env: box.querySelector('#project-secret-env').value,
+            file: box.querySelector('#project-secret-env-file').value.trim() || undefined }) });
         toast(`Imported ${result.imported.length} secret${result.imported.length === 1 ? '' : 's'}`);
         await hydrateProjectSecrets(proj);
       } catch (error) { toast(error.message, true); }

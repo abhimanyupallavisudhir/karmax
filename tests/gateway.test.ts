@@ -1790,7 +1790,8 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     });
     expect(migrated.status).toBe(200);
     const result: any = await migrated.json();
-    expect(result).toMatchObject({ environmentSecrets: ['LEGACY_TOKEN'], data: ['model.bin'], skipped: [] });
+    // Each match stays in the checkout copyGlobs copied it into.
+    expect(result).toMatchObject({ environmentSecrets: ['LEGACY_TOKEN'], data: [`${path.basename(repo)}/model.bin`], skipped: [] });
     expect(JSON.stringify(result)).not.toContain('private-legacy-value');
     expect((await h.store.getProject(project.id))?.config.copyGlobs).toEqual([]);
     const attachments = await fetch(`${base}/api/projects/${project.id}/resources`, { headers: auth() })

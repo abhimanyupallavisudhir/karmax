@@ -1,74 +1,83 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Api } from './api.js';
-import { parseEnvironmentValues } from '../domain/dotenv.js';
+import { dotenvFile, parseDotenv } from '../domain/dotenv.js';
 import { exampleEnvironmentFile, likelySecret, sqliteDatabase } from '../domain/ignored-files.js';
 import { slug } from './refs.js';
 
 /** What `import` and `add` make of a local file or folder: a .env's variables, a secret file, or data. */
 export type Kind = 'env' | 'secret' | 'data';
 
-export interface ProjectSecret { name: string; variable?: string; file?: string }
+export interface Place { path: string; repository?: string }
 
-const isEnvironmentFile = (relative: string) => /^\.env(?:\.|$)/i.test(path.posix.basename(relative));
+export interface ProjectSecret { id?: string; name: string; variable?: string; file?: string; repository?: string; dotenv?: Place }
 
 /** The kind a path is kept as: `--secret`/`--data` decide, else its name (directories are always data). */
 export function kindOf(relative: string, directory: boolean, wanted?: 'secret' | 'data'): Kind {
   if (wanted === 'data' || directory) return 'data';
   const base = path.posix.basename(relative).toLowerCase();
-  if (wanted === 'secret' || (likelySecret(base) && !exampleEnvironmentFile(base))) return isEnvironmentFile(relative) ? 'env' : 'secret';
+  if (wanted === 'secret' || (likelySecret(base) && !exampleEnvironmentFile(base))) return dotenvFile(relative) ? 'env' : 'secret';
   return 'data';
 }
 
 /** Data tasks may change through review (databases), or only read (everything else). */
 export const accessOf = (relative: string): 'read' | 'write' => sqliteDatabase(relative) ? 'write' : 'read';
 
-/** A world path (`<repository>/…`) as the project stores it: relative to the
- * working folder (the only development repository), else to the root. */
-export function targetOf(worldPath: string, workdir: string): string | undefined {
-  if (workdir === '.') return worldPath;
-  const relative = path.posix.relative(workdir, worldPath);
-  return relative && !relative.startsWith('..') ? relative : undefined;
+/** Where the project keeps a world path (`<repository>/…`, or a root-level name):
+ * pinned to its repository, so it stays put when the project gains or loses one.
+ * Undefined for a root-level path in a one-repository project (it has no root folder). */
+export function placeOf(worldPath: string, manifest: { workdir: string; repositories: Array<{ name: string; role: string }> }): Place | undefined {
+  const repository = manifest.repositories.find((entry) => entry.role === 'development' && worldPath.startsWith(`${entry.name}/`));
+  if (repository) return { repository: repository.name, path: worldPath.slice(repository.name.length + 1) };
+  return manifest.workdir === '.' && !manifest.repositories.some((entry) => entry.name === worldPath) ? { path: worldPath } : undefined;
 }
+
+const samePlace = (a: Place | undefined, b: Place) => Boolean(a) && (a!.repository ?? '') === (b.repository ?? '')
+  && a!.path.replace(/^\.\//, '') === b.path.replace(/^\.\//, '');
 
 export async function projectSecrets(api: Api, projectId: string): Promise<ProjectSecret[]> {
   return (await api.get<{ secrets: ProjectSecret[] }>(`/api/projects/${encodeURIComponent(projectId)}/secrets`)).secrets;
 }
 
-/** Variables a .env file sets. Ones the project already has keep their value
- * unless `overwrite`: a stored secret has no older version to go back to. */
-export async function storeVariables(api: Api, projectId: string, text: string, existing: ProjectSecret[], overwrite: boolean):
-  Promise<{ stored: string[]; kept: string[] }> {
+/** A .env file's variables, as lines of that file in every world and workspace
+ * (each repository keeps its own). Ones it already has keep their value unless
+ * `overwrite`: a stored secret has no older version to go back to. */
+export async function storeEnvironmentFile(api: Api, projectId: string, text: string, place: Place, existing: ProjectSecret[],
+  overwrite: boolean): Promise<{ stored: string[]; kept: string[] }> {
   const stored: string[] = []; const kept: string[] = [];
-  for (const { name, value } of parseEnvironmentValues(text)) {
-    if (!overwrite && existing.some((secret) => secret.variable === name || secret.name === name)) { kept.push(name); continue; }
-    await api.post(`/api/projects/${encodeURIComponent(projectId)}/secrets`, { name, value });
-    existing.push({ name, variable: name });
+  for (const { name, value } of parseDotenv(text)) {
+    if (!overwrite && existing.some((secret) => secret.variable === name && samePlace(secret.dotenv, place))) { kept.push(name); continue; }
+    await api.post(`/api/projects/${encodeURIComponent(projectId)}/secrets`, { name, value, file: place.path,
+      ...(place.repository !== undefined ? { repository: place.repository } : {}) });
+    existing.push({ name, variable: name, dotenv: place });
     stored.push(name);
   }
   return { stored, kept };
 }
 
-/** A file kept as a secret and written at `target` in every world and workspace.
- * Named after the file, or after its path when another secret has that name. */
-export async function storeSecretFile(api: Api, projectId: string, file: string, target: string, existing: ProjectSecret[],
+/** A file kept as a secret and written at its place in every world and workspace,
+ * named by that place (two repositories may each have a credentials.json). */
+export async function storeSecretFile(api: Api, projectId: string, file: string, place: Place, existing: ProjectSecret[],
   overwrite: boolean): Promise<{ name: string } | 'kept' | 'binary'> {
   const content = fs.readFileSync(file);
-  if (content.includes(0) || content.toString('utf8').includes('�')) return 'binary';
-  const same = existing.find((secret) => secret.file === target);
+  if (content.includes(0) || content.toString('utf8').includes('\uFFFD')) return 'binary';
+  const same = existing.find((secret) => secret.file !== undefined && samePlace({ path: secret.file, repository: secret.repository }, place));
   if (same && !overwrite) return 'kept';
-  const base = path.posix.basename(target);
-  const name = same?.name ?? (existing.some((secret) => secret.name === base) ? target : base);
-  await api.post(`/api/projects/${encodeURIComponent(projectId)}/secrets`, { name, value: content.toString('utf8'), file: target });
-  if (!same) existing.push({ name, file: target });
+  const name = same?.name ?? (place.repository !== undefined ? `${place.repository}/${place.path}` : place.path);
+  await api.post(`/api/projects/${encodeURIComponent(projectId)}/secrets`, { name, value: content.toString('utf8'), file: place.path,
+    ...(place.repository !== undefined ? { repository: place.repository } : {}) });
+  if (!same) existing.push({ name, file: place.path, ...(place.repository !== undefined ? { repository: place.repository } : {}) });
   return { name };
 }
 
-/** A project resource for data at `target` (no version yet: pushing it makes one). */
-export async function createDataResource(api: Api, projectId: string, target: string, shape: 'file' | 'directory',
+/** A project resource for data at `place` (no version yet: pushing it makes one),
+ * named after its path in the working folder (`data`; `api_data` among several repositories). */
+export async function createDataResource(api: Api, projectId: string, place: Place, workdir: string, shape: 'file' | 'directory',
   access: 'read' | 'write'): Promise<{ id: string }> {
+  const label = place.repository !== undefined && place.repository !== workdir ? `${place.repository}/${place.path}` : place.path;
   return api.post<{ id: string }>(`/api/projects/${encodeURIComponent(projectId)}/resources`, {
-    name: slug(target).replace(/-/g, '_'), driver: 'volume@1', target: { kind: 'path', path: target }, access,
+    name: slug(label).replace(/-/g, '_'), driver: 'volume@1',
+    target: { kind: 'path', path: place.path, ...(place.repository !== undefined ? { repository: place.repository } : {}) }, access,
     publish: access === 'write' ? 'review' : 'discard', source: { shape, imported: true } });
 }
 

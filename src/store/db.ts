@@ -11,6 +11,7 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { isIP } from 'node:net';
 import { sameRepository } from '../world/repository-identity.js';
+import { pinTarget, workingFolder, worldCheckoutNames } from '../domain/world-location.js';
 import { isPostgresTarget, openSqlDatabase, type SqlDatabase } from './sql.js';
 import { watchAuthorityWrites } from './authorization-epoch.js';
 import { setImmediate as yieldTurn } from 'node:timers/promises';
@@ -1618,6 +1619,15 @@ export class Store {
     if (process.env.KARMAX_DEPLOYMENT === 'hosted' && ['worktree', 'container', 'memory'].includes(merged.worldProvider ?? 'e2b'))
       throw new Error('hosted projects require a remote world provider');
     (await this.db.prepare('UPDATE projects SET config = ? WHERE id = ?').run(JSON.stringify(merged), id));
+    // An unpinned resource or secret location is relative to the working folder,
+    // which moves when the project gains a second repository or keeps only one:
+    // pin each to the checkout it lies in now, so it stays where it is.
+    const before = worldCheckoutNames(existing.config.repos ?? []);
+    if (workingFolder(before) !== workingFolder(worldCheckoutNames(merged.repos ?? [])))
+      for (const attachment of (await this.listResourceAttachments(id, true))) {
+        const target = pinTarget(attachment.target, before);
+        if (target !== attachment.target) (await this.updateResourceAttachment(attachment.id, { target }));
+      }
     return { ...existing, config: merged };
   
     });
@@ -9010,12 +9020,20 @@ function validateResourceAttachment(value: ResourceAttachment): void {
   if (driver.credentialRequired && !value.credentialHandles.length) throw new Error('credential-backed resources require a credential handle');
   if (value.publish === 'review' && (!snapshot || value.access !== 'write' || value.isolation !== 'fork'))
     throw new Error('reviewed promotion requires a writable, forked snapshot resource');
-  if (value.target.kind === 'path') {
-    const normalized = value.target.path.replace(/\\/g, '/');
+  const location = (target: { path: string; repository?: string }, label: string) => {
+    const normalized = target.path.replace(/\\/g, '/');
     if (!normalized || normalized.startsWith('/') || normalized.split('/').includes('..'))
-      throw new Error('resource path target must be world-relative');
-  } else if (value.target.kind === 'environment' || value.target.kind === 'service') {
+      throw new Error(`${label} must be world-relative`);
+    if (target.repository !== undefined && !/^[A-Za-z0-9._-]+$/.test(target.repository) || /^\.+$/.test(target.repository ?? ''))
+      throw new Error(`${label} names an invalid repository`);
+  };
+  if (value.target.kind === 'path') location(value.target, 'resource path target');
+  else if (value.target.kind === 'environment' || value.target.kind === 'service') {
     if (!/^[A-Z_][A-Z0-9_]*$/.test(value.target.name)) throw new Error('resource environment target must be an uppercase variable name');
+    if (value.target.kind === 'environment' && value.target.dotenv) {
+      location(value.target.dotenv, 'resource .env file');
+      if (value.target.dotenv.path.endsWith('/')) throw new Error('resource .env file must name a file');
+    }
   } else throw new Error('unknown resource target');
   if (!Array.isArray(value.credentialHandles) || value.credentialHandles.some((handle) => typeof handle !== 'string' || !handle))
     throw new Error('resource credential handles must be non-empty strings');

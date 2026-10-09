@@ -2,6 +2,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { Project } from '../domain/types.js';
 import { git } from './git.js';
+import { remoteName } from './provision-git.js';
+import { dotenvFile } from '../domain/dotenv.js';
 import { dataFolder, DATA_FOLDER_BYTES, likelySecret, sqliteDatabase, variableName } from '../domain/ignored-files.js';
 
 export interface ResourceProposal {
@@ -13,7 +15,7 @@ export interface ResourceProposal {
   reason: string;
   suggested: {
     driver: 'secret@1' | 'volume@1';
-    target: { kind: 'environment'; name: string } | { kind: 'path'; path: string };
+    target: { kind: 'environment'; name: string } | { kind: 'path'; path: string; repository?: string };
     access: 'read' | 'write';
     isolation: 'fork';
     publish: 'discard' | 'review';
@@ -36,10 +38,13 @@ export async function scanProjectResources(project: Project): Promise<{ proposal
       const base = path.posix.basename(relative).toLowerCase();
       if (!likelySecret(base)) continue;
       claimed.add(relative);
+      // A .env holds many variables: they stay lines of this repository's file.
+      const dotenv = dotenvFile(base);
       proposals.push({ id: proposalId(source, relative), repository: source, path: relative, kind: 'secret',
-        reason: 'Ignored filename commonly contains credentials; contents were not read.',
-        suggested: { driver: 'secret@1', target: { kind: 'environment', name: variableName(base) },
-          access: 'read', isolation: 'fork', publish: 'discard' } });
+        reason: dotenv ? 'Ignored .env file; its variables belong in this repository\'s copy of it. Contents were not read.'
+          : 'Ignored filename commonly contains credentials; contents were not read.',
+        suggested: { driver: 'secret@1', target: dotenv ? { kind: 'path', path: relative, repository: remoteName(source) }
+          : { kind: 'environment', name: variableName(base) }, access: 'read', isolation: 'fork', publish: 'discard' } });
     }
     for (const relative of files) {
       if (claimed.has(relative) || !sqliteDatabase(relative)) continue;

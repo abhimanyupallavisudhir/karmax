@@ -101,12 +101,14 @@ it('imports a local checkout: links the repository, its .env as secrets, secret 
   expect(imported.code, imported.stderr).toBe(0);
   const result = JSON.parse(imported.stdout);
   expect(result.project.id).toBe(f.project.id);
-  expect(result.secrets).toEqual(expect.arrayContaining(['STRIPE_KEY', 'DEBUG', 'credentials.json']));
+  expect(result.secrets).toEqual(expect.arrayContaining(['site/.env:STRIPE_KEY', 'site/.env:DEBUG', 'site/secrets/credentials.json']));
   expect(result.data).toEqual(['data']);
   // The data is now the project's version: a fresh clone gets exactly it.
   expect((await f.tavya(f.laptop, ['clone', f.project.id, 'fresh'])).code).toBe(0);
   expect(files(path.join(f.laptop, 'fresh', 'site', 'data'))).toEqual(['raw/a.csv']);
   expect(fs.readFileSync(path.join(f.laptop, 'fresh', 'site', 'secrets', 'credentials.json'), 'utf8')).toBe('{"client":"x"}');
+  // The .env stays a file in its repository, as it was on the laptop.
+  expect(fs.readFileSync(path.join(f.laptop, 'fresh', 'site', '.env'), 'utf8')).toBe('DEBUG=1\nSTRIPE_KEY=sk_test_1\n');
   const env = await f.tavya(path.join(f.laptop, 'fresh'), ['env', '--json']);
-  expect(JSON.parse(env.stdout)).toMatchObject({ STRIPE_KEY: 'sk_test_1', DEBUG: '1', API_KEY: 's3cret' });
+  expect(JSON.parse(env.stdout)).toEqual({ API_KEY: 's3cret' });
 });
