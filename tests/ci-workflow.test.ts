@@ -12,10 +12,10 @@ const ci = parse(fs.readFileSync(path.join(repoRoot, '.github', 'workflows', 'ci
 describe('CI workflow', () => {
   // Branch protection and Karmax's merge gate both key on this check name, so
   // it has to stand for everything a landing needs, not just one job of it.
-  it('reports the required check after static checks, every test shard, and deploy artifacts', () => {
+  it('reports the required check after static checks, every test shard, deploy artifacts and the CLI version bump', () => {
     const required = ci.jobs.required;
     expect(required.name).toBe('typecheck + tests');
-    expect([...required.needs].sort()).toEqual(['checks', 'deploy-artifacts', 'test']);
+    expect([...required.needs].sort()).toEqual(['checks', 'cli-version', 'deploy-artifacts', 'test']);
     // It must still run, and fail, when a needed job failed or was cancelled.
     expect(required.if).toBe('always()');
   });
