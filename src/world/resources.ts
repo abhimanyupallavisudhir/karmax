@@ -1760,7 +1760,7 @@ export class ProjectResourceService {
     await options.checkContinue?.();
     if (place.file) await restic.restore(place, repository, currentSnapshot, options);
     else await restic.applyPaths(place, repository, currentSnapshot,
-      { paths, deletions, removedDirectories: theirs.removedDirectories }, options);
+      { paths, deletions, removedDirectories: theirs.removedDirectories, addedDirectories: theirs.addedDirectories, own: ours }, options);
     const merged = await restic.backup(place, repository, { ...options, key: `${options.key}:save`, parent: mine });
     // The merge is right only if it differs from the published version
     // exactly where this world's own changes are.

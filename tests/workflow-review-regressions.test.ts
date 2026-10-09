@@ -881,4 +881,82 @@ describe('resource publication by sub-tasks', () => {
     ]);
     expect(prompts).toHaveLength(3);
   });
+
+  // pramana#3: W2's 7.7 GB took hours to come in, while the task still read
+  // "Waiting 90 min" from the pause it had left, and a follow-up seemed ignored.
+  it('shows that it is bringing a sub-task\'s data in while it does', async () => {
+    wf.activities.accountPoolSize.mockResolvedValue(0);
+    wf.activities.prepareChildTask = vi.fn(async () => ({ ...input, taskId: 'child' }));
+    let finish!: (value: { stage: string }) => void;
+    wf.startChild = async () => ({ result: () => new Promise((resolve) => { finish = resolve; }) });
+    const views: any[] = [];
+    wf.activities.publishView.mockImplementation(async (_id: string, view: any) => { views.push(view); });
+    let during: any;
+    wf.activities.refreshResourceForks = vi.fn(async () => { during = views.at(-1); return []; });
+    let turns = 0;
+    wf.activities.runAgentTurn.mockImplementation(async () => {
+      turns++;
+      if (turns === 1) return { subTasks: [{ title: 'child', prompt: 'work' }] };
+      if (turns === 2) { finish({ stage: 'done' }); return { waitForSubtasks: true }; }
+      wf.handlers.get('cancel')!();
+      return {};
+    });
+    wf.wait = () => { if (turns >= 3) wf.handlers.get('cancel')!(); };
+    await softwareDevV1_27(input);
+    expect(during).toMatchObject({ stage: 'do', status: 'active', state: { refreshingResources: true } });
+    expect(during.waitingFor).toBeUndefined();
+    expect(views.at(-1).state.refreshingResources).toBeUndefined();
+  });
+
+  // pramana#3: a deploy restarted the worker during W2's delivery once per
+  // attempt until none were left; the delivery then waited for Confirm, and
+  // the parent never had W2's OCR to build on.
+  it('tries a failed delivery again before the next turn, once', async () => {
+    wf.activities.accountPoolSize.mockResolvedValue(0);
+    wf.activities.prepareChildTask = vi.fn(async () => ({ ...input, taskId: 'child' }));
+    let finish!: (value: { stage: string }) => void;
+    wf.startChild = async () => ({ result: () => new Promise((resolve) => { finish = resolve; }) });
+    const heartbeat = Object.assign(new Error('Activity task failed'), { cause: new Error('activity Heartbeat timeout') });
+    wf.activities.refreshResourceForks = vi.fn()
+      .mockRejectedValueOnce(heartbeat)
+      .mockResolvedValueOnce([{ attachmentId: 'r1', name: 'raw_data', path: 'raw_data', revisionId: 'rev', added: 706_916, modified: 0, deleted: 0 }]);
+    let turns = 0;
+    wf.activities.runAgentTurn.mockImplementation(async () => {
+      turns++;
+      if (turns === 1) return { subTasks: [{ title: 'child', prompt: 'work' }] };
+      if (turns === 2) { finish({ stage: 'done' }); return { waitForSubtasks: true }; }
+      if (turns === 4) wf.handlers.get('cancel')!();
+      return {};
+    });
+    // The user's follow-up after the turn the failure was reported in.
+    wf.wait = () => turns >= 4 ? wf.handlers.get('cancel')!()
+      : wf.handlers.get('followUp')!({ id: `u${turns}`, role: 'user', text: 'Would an R2 bucket help?', ts: turns });
+    await softwareDevV1_27(input);
+    expect(wf.activities.refreshResourceForks).toHaveBeenCalledTimes(2);
+    const texts = wf.handlers.get('view')!().messages.map((m: any) => m.text);
+    expect(texts).toContain('Could not bring sub-tasks\' saved data into your world: activity Heartbeat timeout It is kept, and is tried again before your next turn.');
+    expect(texts).toContain('raw_data now includes a sub-task\'s data: 706916 new, 0 changed, 0 removed files.');
+  });
+
+  it('keeps histories recorded before the retry waiting for the next sub-task or Confirm', async () => {
+    wf.absentPatches = new Set(['subtask-resource-refresh-retry-v1']);
+    wf.activities.accountPoolSize.mockResolvedValue(0);
+    wf.activities.prepareChildTask = vi.fn(async () => ({ ...input, taskId: 'child' }));
+    let finish!: (value: { stage: string }) => void;
+    wf.startChild = async () => ({ result: () => new Promise((resolve) => { finish = resolve; }) });
+    wf.activities.refreshResourceForks = vi.fn(async () => { throw new Error('restic exited 1'); });
+    let turns = 0;
+    wf.activities.runAgentTurn.mockImplementation(async () => {
+      turns++;
+      if (turns === 1) return { subTasks: [{ title: 'child', prompt: 'work' }] };
+      if (turns === 2) { finish({ stage: 'done' }); return { waitForSubtasks: true }; }
+      if (turns === 4) wf.handlers.get('cancel')!();
+      return {};
+    });
+    // The user's follow-up after the turn the failure was reported in.
+    wf.wait = () => turns >= 4 ? wf.handlers.get('cancel')!()
+      : wf.handlers.get('followUp')!({ id: `u${turns}`, role: 'user', text: 'Would an R2 bucket help?', ts: turns });
+    await softwareDevV1_27(input);
+    expect(wf.activities.refreshResourceForks).toHaveBeenCalledOnce();
+  });
 });
