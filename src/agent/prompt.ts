@@ -1,4 +1,4 @@
-import { describeMachine, type MachineShape } from '../domain/computer.js';
+import { describeMachine, sameMachine, type MachineShape } from '../domain/computer.js';
 import { AgentProfile, AgentRole, TaskInput } from '../domain/types.js';
 import { WorldHandle, worldRepos, worldWorkingDirectory } from '../world/types.js';
 import { agentRoleDef, manifest } from '../contrib/manifests.js';
@@ -84,6 +84,8 @@ export interface AssembleArgs {
   world: WorldHandle;
   globalInstructions?: string;
   projectInstructions?: string;
+  /** The machine the task's Computer asks for now (its world may still run on another). */
+  computer?: MachineShape;
   /** Extra bindings for non-do roles (error, stage, transcript, reviewInfo, skills). */
   bindings?: Record<string, string>;
 }
@@ -114,7 +116,7 @@ Git ancestry for recovered, forked, or retargeted work: "recorded base" is the i
     title: args.task.title,
     prompt: args.task.prompt,
     worldPath: worldWorkingDirectory(args.world),
-    worldRepos: [describeRepos(args.world), describeEnvironment(args.world), describeComputer(args.world, args.task.taskId)].filter(Boolean).join('\n'),
+    worldRepos: [describeRepos(args.world), describeEnvironment(args.world), describeComputer(args.world, args.task.taskId, args.computer)].filter(Boolean).join('\n'),
     branch: args.world.branch,
     base: args.world.base,
     target,
@@ -154,13 +156,17 @@ function describeEnvironment(world: WorldHandle): string {
 }
 
 /** A cloud world's machine, and how the agent can get a bigger one itself. */
-function describeComputer(world: WorldHandle, taskId: string): string {
+function describeComputer(world: WorldHandle, taskId: string, requested?: MachineShape): string {
   const shape = world.meta?.computer as MachineShape | undefined;
   if (!shape) return '';
-  return `Computer: ${describeMachine(shape)}. If it is too small (out of disk or memory), resize it yourself with `
-    + `platform_request(PATCH, "/api/tasks/${taskId}/params", {"params": {"computer": {"diskGb": 50}}}) (or cpu, memoryMb) and then pause(3): the move happens while the task is paused. `
+  // A world moves to a new size only once it parks; a pause on jobs keeps it awake.
+  const move = 'end your turn with pause(3) without jobs. A pause that waits on jobs keeps this machine, so first let them finish or stop them (stop_job). '
     + 'You resume on the new machine with every tracked file and uncommitted change, but Git-ignored files (dependencies, build output) '
     + 'and running processes do not carry over.';
+  if (requested && !sameMachine(shape, requested))
+    return `Computer: ${describeMachine(shape)}. This task's computer is now ${describeMachine(requested)}: you move to it when the task parks, so ${move}`;
+  return `Computer: ${describeMachine(shape)}. If it is too small (out of disk or memory), resize it yourself with `
+    + `platform_request(PATCH, "/api/tasks/${taskId}/params", {"params": {"computer": {"diskGb": 50}}}) (or cpu, memoryMb) and then ${move}`;
 }
 
 /**

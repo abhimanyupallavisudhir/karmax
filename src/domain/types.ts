@@ -1738,6 +1738,10 @@ export interface TaskView {
    * by the gateway from the manifest schema (the workflow needn't know its schema).
    */
   editableParams?: string[];
+  /** The machine this task's Computer now asks for, while its world still runs
+   * on the one it was made on: it moves when the world parks (wiki
+   * features/computers). Enriched by the API. */
+  computerChange?: { from: { cpu?: number; memoryMb?: number; diskGb?: number }; to: { cpu?: number; memoryMb?: number; diskGb?: number } };
   updatedAt: number;
 }
 

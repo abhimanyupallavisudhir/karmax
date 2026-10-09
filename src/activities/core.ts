@@ -2513,11 +2513,23 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const paymentPolicy = (await paymentService?.participantPolicy(args.task.projectId, args.taskId, paymentParticipant));
       const paymentContext = paymentPromptContext(paymentCards, paymentPolicy,
         paymentCards.length && paymentPolicy ? paymentPolicy.spent : 0, paymentPolicy?.own ? 'Your budget' : 'Task budget');
+      // The machine as recorded now (the workflow's copy of the handle predates a
+      // size learned later), and the one the task's Computer asks for.
+      let promptWorld = args.worldHandle;
+      let requestedComputer: ReturnType<typeof machineShape> | undefined;
+      try {
+        const stored = (await store.currentWorld(args.taskId)) as WorldHandle | undefined;
+        if (stored?.meta?.computer && (stored.generation ?? 1) === (args.worldHandle.generation ?? 1))
+          promptWorld = { ...args.worldHandle, meta: { ...args.worldHandle.meta, computer: stored.meta.computer } };
+        const project = (await store.getProject(args.task.projectId));
+        if (project) requestedComputer = machineShape(await store.effectiveTaskConfig(project, args.taskId));
+      } catch { /* the World section then names the machine as the workflow knows it */ }
       const systemPrompt = assemblePrompt({
         profile,
         role: args.role,
         task: promptTask,
-        world: args.worldHandle,
+        world: promptWorld,
+        ...(requestedComputer ? { computer: requestedComputer } : {}),
         globalInstructions: (globalInstructions ?? '') + forkContext + agentForkContext + attemptContext + paymentContext,
         projectInstructions,
         bindings,

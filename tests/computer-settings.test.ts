@@ -19,6 +19,7 @@ import { seedProfiles } from '../src/agent/profiles.js';
 describe('Computer defaults', () => {
   let dir: string, store: Store, gateway: Gateway, base: string, priorHome: string | undefined, api: KarmaxApi;
   const updates: unknown[] = [];
+  const signals: unknown[][] = [];
   let tokens: TokenAuthority;
   let close: () => Promise<void>;
   let token: string;
@@ -37,7 +38,7 @@ describe('Computer defaults', () => {
     await seedProfiles(store, 'mock');
     tokens = new TokenAuthority();
     const worlds = new WorldRegistry();
-    const client = { workflow: { getHandle: () => ({ query: async () => [],
+    const client = { workflow: { getHandle: () => ({ query: async () => [], signal: async (...args: unknown[]) => { signals.push(args); },
       executeUpdate: async (_name: string, options: { args: unknown[] }) => { updates.push(options.args[0]); return { applied: [] }; } }),
       start: async () => ({}) } } as any;
     const providerConnections = { available: async (_organizationId: string, provider: string) => connected.has(provider),
@@ -167,5 +168,45 @@ describe('Computer defaults', () => {
       expect((await api.getTaskView(editor, task.id))?.editableParams ?? []).not.toContain('computer');
       await expect(api.updateParams(editor, task.id, { computer: { diskGb: 40 } })).rejects.toThrow(/can't be resized/);
     }
+  });
+
+  // pramana#3 (2026-10-09): its owner set the disk to 30, then 50 GB while the
+  // agent waited on a rebuild job. A world waiting on a job never parks, so it
+  // never moved; nobody was told, and the agent, asked, found 22 GB and waited
+  // "for word that the disk size has changed".
+  it('tells a live task\'s agent how to reach its new size, and shows the size as pending', async () => {
+    const project = await store.createProject('Pending', { worldProvider: 'e2b', resources: { cpu: 2, memoryMb: 2048 } });
+    const task = await store.createTask({ projectId: project.id, title: 'Rebuild', workflow: 'software-dev',
+      workflowVersion: '1.27.0', params: { prompt: 'x' } });
+    const handle = { version: 2, kind: 'e2b', provider: 'e2b', id: task.id, generation: 1, root: '/w', workspaceRoot: '/w',
+      branch: `tavya/${task.id}`, base: 'main', meta: { projectId: project.id, computer: { cpu: 2, memoryMb: 2048 } } } as any;
+    await store.registerWorld(handle, project.id);
+    await store.saveView(task.id, { taskId: task.id, workflow: 'software-dev', stage: 'do', status: 'waiting',
+      waitingFor: { kind: 'job' }, actions: [], editableParams: [] } as any);
+    const editor = (await tokens.mintPrincipal('user:editor', ['task:edit', 'task:read'], project.id)).token;
+    expect((await api.getTaskView(editor, task.id))?.computerChange).toBeUndefined();
+    signals.length = 0;
+
+    await api.updateParams(editor, task.id, { computer: { diskGb: 50 } });
+    expect((await api.getTaskView(editor, task.id))?.computerChange)
+      .toEqual({ from: { cpu: 2, memoryMb: 2048 }, to: { cpu: 2, memoryMb: 2048, diskGb: 50 } });
+    expect(signals).toHaveLength(1);
+    const [name, message, role] = signals[0] as [string, { text: string }, string];
+    expect([name, role]).toEqual(['followUp', 'do']);
+    expect(message.text).toMatch(/computer change\]/);
+    expect(message.text).toContain('2 CPU · 2 GB · 50 GB disk');
+    expect(message.text).toMatch(/pause\(3\) without jobs/);
+    expect(message.text).toMatch(/stop_job/);
+
+    // The agent resizing itself already knows; a parked world simply moves.
+    const agent = (await tokens.mint({ taskId: task.id, profileId: 'mock', role: 'do', principal: 'user:editor', projectId: project.id,
+      ceiling: ['task:edit', 'task:read'], grantorCaps: ['task:edit', 'task:read'] })).token;
+    await api.updateParams(agent, task.id, { computer: { diskGb: 40 } });
+    await store.setWorldState(handle, 'parked');
+    await api.updateParams(editor, task.id, { computer: { diskGb: 30 } });
+    expect(signals).toHaveLength(1);
+    // Back to the size it has: nothing pending.
+    await api.updateParams(editor, task.id, { computer: { diskGb: null } });
+    expect((await api.getTaskView(editor, task.id))?.computerChange).toBeUndefined();
   });
 });

@@ -36,7 +36,8 @@ import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, FileRef, T
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable, awaitsSuccessOf } from '../domain/triggers.js';
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult, EvalContext, TaskGroup, forClauseValues, attentionCandidates } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
-import { assertInFlightComputerEdit, computerOf, computerResizable, machineShape, normalizeComputer, type ComputerSpec } from '../domain/computer.js';
+import { assertInFlightComputerEdit, computerOf, computerResizable, describeMachine, machineShape, normalizeComputer, sameMachine,
+  type ComputerSpec, type MachineShape } from '../domain/computer.js';
 import { resolveParamsLayers, assembleTaskInput, projectSettingsFor, globalSettingsFor, quickProjectSettingsFor, quickGlobalSettingsFor, effectiveRepos, ValueMap } from './params.js';
 import { REPOSITORY_BRANCHES_RESOLVED_PARAM, applyRepoBranches, normalizeRepoBranches, repositoryBranchDefaults } from './branch-defaults.js';
 import { withTimeout } from '../util/timeout.js';
@@ -2834,6 +2835,10 @@ export class KarmaxApi {
       view = await this.deps.store.withPendingReviewInfoAsync(taskId, view);
       if (computerResizable(view) && !(view.editableParams ?? []).includes('computer'))
         view = { ...view, editableParams: [...(view.editableParams ?? []), 'computer'] };
+      if (computerResizable(view)) {
+        const computerChange = await this.computerChange(taskId).catch(() => undefined);
+        if (computerChange) view = { ...view, computerChange };
+      }
       if (await this.deps.store.kvGet(`project-transfer-history:${taskId}`)) {
         const { world, worldPath, worldAvailable, worldDesktop, worldProvider, ...history } = view;
         view = history;
@@ -5964,6 +5969,11 @@ Act according to your Avatar instructions. When ready, call platform_request POS
         if (world && !world.meta?.computer && !['worktree', 'container', 'memory'].includes(world.kind))
           (await this.deps.store.updateWorldMeta(world, { computer: machineShape(computerBefore) }).catch(() => undefined));
         result.applied = [...new Set([...result.applied, 'computer'])];
+        // A running world moves only once it parks, which a turn or a job wait
+        // never does: tell the agent, unless it asked for the size itself.
+        const change = caller.taskId === taskId ? undefined : await this.computerChange(taskId).catch(() => undefined);
+        if (change && (await this.deps.store.worldState(taskId)) === 'ready')
+          (await this.deliverWorkflowMessage(taskId, computerChangeNotice(change)).catch(() => undefined));
       }
       (await this.updateAgentSnapshot(taskId, patch, result.applied));
       if (result.applied.includes('target') && typeof patch.target === 'string')
@@ -5981,6 +5991,17 @@ Act according to your Avatar instructions. When ready, call platform_request POS
     } catch (e) {
       throw new Error(unwrapCause(e));
     }
+  }
+
+  /** The machine a task's Computer asks for, when its world runs on another. */
+  private async computerChange(taskId: string): Promise<{ from: MachineShape; to: MachineShape } | undefined> {
+    const world = (await this.deps.store.currentWorld(taskId));
+    const from = world?.meta?.computer as MachineShape | undefined;
+    const task = from && (await this.deps.store.getTask(taskId));
+    const project = task && (await this.deps.store.getProject(task.projectId));
+    if (!from || !project) return undefined;
+    const to = machineShape(await this.deps.store.effectiveTaskConfig(project, taskId));
+    return sameMachine(from, to) ? undefined : { from, to };
   }
 
   /** Keep the workflow's accepted destination, stored task snapshot, and durable
@@ -6913,4 +6934,12 @@ function applyExecutionConfig(config: import('../domain/types.js').ProjectConfig
     else next[key] = patch[key];
   }
   return next as import('../domain/types.js').ProjectConfig;
+}
+
+/** What an agent is told when its task's Computer changes under it. */
+function computerChangeNotice(change: { from: MachineShape; to: MachineShape }): string {
+  return `[${BRAND} computer change]\n\nThis task's computer is now ${describeMachine(change.to)}; you are still on ${describeMachine(change.from)}. `
+    + 'You move to it when this task parks: end your turn with pause(3) without jobs. A pause that waits on jobs keeps this machine, '
+    + 'so first let them finish or stop them (stop_job); if one is running out of room, stopping it now is usually right. '
+    + 'You resume with every tracked file and uncommitted change; Git-ignored files (dependencies, build output) and running processes do not carry over.';
 }

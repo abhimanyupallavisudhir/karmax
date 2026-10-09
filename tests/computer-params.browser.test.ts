@@ -31,3 +31,26 @@ it('lets a running task resize its computer, and nothing else about it', async (
   expect(ui.errors).toEqual([]);
   await ui.close();
 });
+
+// pramana#3: 50 GB was saved while the task waited on a job, and nothing said
+// the computer would only move once the task paused with nothing running.
+it('marks a size the running computer has not reached yet', async () => {
+  const ui = await consolePage();
+  const render = (change: unknown) => ui.run(`
+    S.tasks = [{ id: 't', projectId: 'p', workflow: 'software-dev', params: { computer: { diskGb: 50 } } }];
+    S.schema = [{ name: 'software-dev', params: [{ name: 'computer', type: 'computer', label: 'Computer', scopes: ['task', 'project', 'global'], bind: 'computer', mutable: 'always' }] }];
+    S.paramDefaults = { computer: { provider: 'e2b', cpu: 2, memoryMb: 2048, flavor: 'headless', network: { unrestricted: true } } };
+    S.worldProviderConnections = [{ provider: 'e2b', enabled: true, credentialConfigured: true }];
+    document.getElementById('main').innerHTML = paramsSection({ taskId: 't', workflow: 'software-dev', stage: 'do', status: 'waiting',
+      editableParams: ['computer'], agents: {}, messages: [], participants: [], computerChange: ${JSON.stringify(change)} });
+  `);
+  await render({ from: { cpu: 2, memoryMb: 2048 }, to: { cpu: 2, memoryMb: 2048, diskGb: 50 } });
+  const chip = ui.page.locator('#tp-params .tp-computer .computer-pending');
+  expect(await chip.textContent()).toBe('Moves at next pause');
+  expect(await chip.getAttribute('title'))
+    .toBe('Still 2 CPU · 2 GB. Moves to 2 CPU · 2 GB · 50 GB disk when the task next pauses with nothing running.');
+  await render(null);
+  expect(await chip.count()).toBe(0);
+  expect(ui.errors).toEqual([]);
+  await ui.close();
+});
