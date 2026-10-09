@@ -20,7 +20,9 @@ data versions at their paths, secret files, and the project's install commands.
 | `tavya task new "Fix the login page"` | Start a task; `task list`, `show`, `logs -f`, `say`, `confirm` |
 | `tavya attach` / `tavya exec -- cmd` | A shell, or one command, in the task's cloud world |
 | `tavya resume --fork` | Continue the task's agent here (Claude Code, Codex) |
-| `tavya import` | Make a local checkout a tavya project, with its `.env` and data |
+| `tavya import` | Make a local checkout, or a folder of them, a tavya project: GitHub repositories, unpushed commits, `.env`, secret files and data. The folder becomes its workspace |
+| `tavya add <path>` / `tavya untrack <path>` | Keep more ignored files in the project as data or secrets, or stop |
+| `tavya projects` / `tavya open` | List your projects; open this one in the browser |
 | `tavya api GET /api/projects` | Any API call |
 
 `tavya login` signs in through your browser (it works over SSH too). Scripts and

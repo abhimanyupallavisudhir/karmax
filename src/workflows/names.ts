@@ -142,6 +142,8 @@ export const SIG = {
   approveCheckout: 'approveCheckout',
   cancel: 'cancel',
   retry: 'retry',
+  /** Publish again, keeping this task's version of the files a newer version changed differently. */
+  keepOwnResources: 'keepOwnResources',
 } as const;
 
 /** Activity → owning workflow transition after host agent-slot admission. */

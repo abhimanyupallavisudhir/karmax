@@ -42,8 +42,8 @@ export async function pullResource(api: Api, workspace: Workspace, resource: Res
   const target = workspace.path(resource.path);
   const state = workspace.resource(resource.id);
   const repository = workspace.repositoryOf(resource.path);
-  if (repository && fs.existsSync(path.join(workspace.root, repository.name, '.git')))
-    excludeFromGit(path.join(workspace.root, repository.name), path.posix.relative(repository.name, resource.path));
+  if (repository && fs.existsSync(path.join(workspace.checkout(repository.name), '.git')))
+    excludeFromGit(workspace.checkout(repository.name), path.posix.relative(repository.name, resource.path));
   if (!resource.revisionId) {
     if (resource.shape === 'directory') fs.mkdirSync(target, { recursive: true });
     workspace.setResource(resource.id, { fingerprint: fingerprint(target) });
