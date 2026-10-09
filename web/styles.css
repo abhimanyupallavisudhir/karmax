@@ -3442,7 +3442,7 @@ html[data-theme="dark"] .github-signin-btn:active,
 .mc-tick { fill: var(--ink-3); font-size: 10.5px; }
 .mc-axis { fill: var(--ink-2); font-size: 11px; font-weight: 600; }
 .mc-ladder { fill: none; stroke: var(--harness); stroke-opacity: .35; stroke-width: 1.5; stroke-linejoin: round; }
-.mc-frontier { fill: none; stroke: var(--ink-2); stroke-width: 1.5; stroke-dasharray: none; opacity: .7; }
+.mc-frontier { fill: none; stroke: var(--ink-2); stroke-width: 2; stroke-dasharray: 0 4.5; stroke-linecap: round; opacity: .8; }
 .mc-label { fill: var(--ink-2); font-size: 10.5px; paint-order: stroke; stroke: var(--surface); stroke-width: 3px; }
 .mc-point { cursor: pointer; outline: none; }
 .mc-hit { fill: transparent; }
@@ -3465,7 +3465,7 @@ html[data-theme="dark"] .github-signin-btn:active,
 .mc-key[aria-pressed="false"] { color: var(--ink-3); text-decoration: line-through; }
 .mc-key[aria-pressed="false"] i { background: none; box-shadow: inset 0 0 0 1.5px var(--harness); }
 .mc-key-frontier { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-2); }
-.mc-key-frontier i { width: 14px; height: 0; border-top: 1.5px solid var(--ink-2); opacity: .7; }
+.mc-key-frontier i { width: 14px; height: 0; border-top: 2px dotted var(--ink-2); opacity: .8; }
 .mc-source { display: inline-flex; align-items: center; gap: 4px; }
 .mc-source a { color: var(--ink-2); }
 

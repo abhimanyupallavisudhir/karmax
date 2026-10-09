@@ -1275,10 +1275,9 @@ function wireModelField(field, { fallbackProvider } = {}) {
 // ── Compare models: intelligence against cost or time ────────────────────────
 // Artificial Analysis benchmarks (bundled with tavya, or fetched daily by the
 // server when it has a key) of the models a harness here can run, one point per
-// harness:model:effort. The line is the efficient frontier: the most intelligence
-// any model gives within each cost or time, a staircase rising at each
-// Pareto-optimal point. (A convex hull would skip models that are the best buy for
-// some budget, and draw intelligence between points that no model offers.)
+// harness:model:effort. The line is the Pareto frontier, drawn as Artificial
+// Analysis draws it: straight through every point no cheaper (or faster) point
+// beats. (A convex hull would skip models that are the best buy for some budget.)
 // Picking a point fills the field.
 const MODEL_CHART_METRICS = {
   cost: { label: 'Cost', axis: '$ per answer', ticks: [0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5], format: (v) => `$${Number(v.toPrecision(2))}` },
@@ -1330,10 +1329,7 @@ function modelChartSvg(models, metric, current, hidden) {
     return `<polyline class="mc-ladder" data-harness="${esc(ordered[0].ref.provider)}" points="${ordered.map((point) => `${x(point[metric]).toFixed(1)},${y(point.intelligence).toFixed(1)}`).join(' ')}"/>`;
   });
   const frontier = paretoFrontier(points, metric);
-  // Flat until the next point's cost buys more intelligence, then up to it.
-  const line = frontier.map((point, index) => index
-    ? `H${x(point[metric]).toFixed(1)}V${y(point.intelligence).toFixed(1)}`
-    : `M${x(point[metric]).toFixed(1)},${y(point.intelligence).toFixed(1)}`).join('');
+  const line = frontier.map((point, index) => `${index ? 'L' : 'M'}${x(point[metric]).toFixed(1)},${y(point.intelligence).toFixed(1)}`).join('');
   const onFrontier = new Set(frontier);
   const isCurrent = (point) => current && point.ref.provider === current.provider && point.ref.model === current.model && (point.ref.effort || '') === (current.effort || '');
   const dots = [...points].sort((a, b) => Number(onFrontier.has(a)) - Number(onFrontier.has(b))).map((point) => {
