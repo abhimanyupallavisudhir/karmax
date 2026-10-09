@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import type { Api } from '../api.js';
 import { HttpError } from '../api.js';
@@ -38,9 +39,42 @@ async function cloneRepository(root: string, repository: Manifest['repositories'
     result = await git(root, ['clone', '--quiet', ...config, '--branch', repository.base, url, destination]);
   }
   if (result.code === 0) return true;
-  const reason = (result.stderr || result.stdout).trim().split('\n').slice(-2).join(' ');
+  const output = (result.stderr || result.stdout).trim();
+  const reason = output.split('\n').slice(-2).join(' ');
   if (repository.role === 'project-wiki') { out.warn(`project wiki not cloned: ${reason}`); return false; }
-  throw new CliError(`cloning ${repository.sshUrl} failed: ${reason}\nGit uses your own GitHub credentials: check that you can access this repository.`);
+  throw new CliError(`cloning ${repository.sshUrl} failed: ${reason}\n${!viaTavya && /access rights|Repository not found|Permission denied/i.test(output)
+    ? aliasHint(repository.sshUrl) ?? GENERIC_HINT : GENERIC_HINT}`);
+}
+
+const GENERIC_HINT = 'Git uses your own GitHub credentials: check that you can access this repository.';
+
+/** Host aliases in an OpenSSH config that reach github.com (`Host work` + `HostName github.com`). */
+export function githubSshAliases(config: string): string[] {
+  const aliases: string[] = [];
+  let hosts: string[] = [];
+  for (const line of config.split(/\r?\n/)) {
+    const match = /^\s*(\w+)(?:\s*=\s*|\s+)(.*?)\s*$/.exec(line);
+    if (!match) continue;
+    const keyword = match[1]!.toLowerCase();
+    const value = match[2]!.replace(/"/g, '');
+    if (keyword === 'host') hosts = value.split(/\s+/).filter((host) => !/[*?!]/.test(host) && host.toLowerCase() !== 'github.com');
+    else if (keyword === 'match') hosts = [];
+    else if (keyword === 'hostname' && value.toLowerCase() === 'github.com') aliases.push(...hosts);
+  }
+  return [...new Set(aliases)];
+}
+
+/** GitHub refused the default key: the user may reach the repository's account through an alias in ~/.ssh/config. */
+function aliasHint(sshUrl: string): string | undefined {
+  const owner = /^git@github\.com:([^/]+)\//.exec(sshUrl)?.[1];
+  let config = '';
+  try { config = fs.readFileSync(path.join(os.homedir(), '.ssh', 'config'), 'utf8'); } catch { return undefined; }
+  const aliases = githubSshAliases(config);
+  if (!owner || !aliases.length) return undefined;
+  const alias = aliases.find((entry) => entry.toLowerCase().includes(owner.toLowerCase())) ?? (aliases.length === 1 ? aliases[0] : '<alias>');
+  return `Your github.com SSH key may belong to another GitHub account. To reach ${owner}'s repositories through `
+    + `${alias === '<alias>' ? `one of your ~/.ssh/config aliases (${aliases.join(', ')})` : `${alias} from ~/.ssh/config`}, run once:\n`
+    + `  git config --global url."git@${alias}:${owner}/".insteadOf "git@github.com:${owner}/"`;
 }
 
 export async function clone(api: Api, ref: string, directory: string | undefined, out: Output,
