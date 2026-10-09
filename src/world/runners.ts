@@ -184,28 +184,50 @@ export class WorldLifecycleManager {
     return this.sweeping ??= this.sweepOnce(now).finally(() => { this.sweeping = undefined; });
   }
 
-  private async sweepOnce(now: number): Promise<number> {
-    (await this.runners?.reconcileWorldLeases(now));
-    await this.checkpoints.collectGarbage?.();
-    if (this.objects instanceof DeferredDeleteObjectStore) await this.objects.purgeDue(now).catch(() => undefined);
-    await this.reconcileProviderUsage(now);
-    for (const artifact of (await this.store.expiredPromotedArtifacts(now))) {
-      (await this.store.deletePromotedArtifact(artifact.id));
-      await this.objects?.delete(artifact.objectKey).catch(() => undefined);
+  /** One step of a sweep, or one world within it, failing on its own: the
+   * rest of the sweep still runs (pramana#3: one world whose operation lock
+   * stayed held made every sweep throw before hibernating anything, for hours,
+   * unseen). A failure is logged when it starts or changes, not every minute. */
+  private async step(name: string, work: () => Promise<unknown>): Promise<void> {
+    try {
+      await work();
+      this.failing.delete(name);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (this.failing.get(name) !== message) console.warn(`[world lifecycle] ${name}: ${message}`);
+      this.failing.set(name, message);
     }
-    if (this.objects) await expireConversationExports(this.store, this.objects, now);
+  }
+  private failing = new Map<string, string>();
+
+  private async sweepOnce(now: number): Promise<number> {
+    await this.step('runner leases', async () => this.runners?.reconcileWorldLeases(now));
+    await this.step('checkpoint garbage', async () => this.checkpoints.collectGarbage?.());
+    if (this.objects instanceof DeferredDeleteObjectStore) await this.objects.purgeDue(now).catch(() => undefined);
+    await this.step('provider usage', () => this.reconcileProviderUsage(now));
+    await this.step('promoted artifacts', async () => {
+      for (const artifact of (await this.store.expiredPromotedArtifacts(now))) {
+        (await this.store.deletePromotedArtifact(artifact.id));
+        await this.objects?.delete(artifact.objectKey).catch(() => undefined);
+      }
+    });
+    if (this.objects) await this.step('conversation exports', () => expireConversationExports(this.store, this.objects!, now));
     for (const preview of (await this.store.expiredPreviewLeases(now))) {
-      (await this.store.revokePreviewLease(preview.id));
-      const handle = (await this.store.currentWorld(preview.worldId)) as any;
-      if (handle && this.access) await this.access.releaseLeaseAndParkIfIdle(handle, preview.runnerLeaseId);
-      else if (preview.runnerLeaseId) (await this.runners?.release(preview.runnerLeaseId, preview.provider));
+      await this.step(`preview ${preview.id}`, async () => {
+        (await this.store.revokePreviewLease(preview.id));
+        const handle = (await this.store.currentWorld(preview.worldId)) as any;
+        if (handle && this.access) await this.access.releaseLeaseAndParkIfIdle(handle, preview.runnerLeaseId);
+        else if (preview.runnerLeaseId) (await this.runners?.release(preview.runnerLeaseId, preview.provider));
+      });
     }
     for (const id of (await this.store.markLostExecutions(now - 2 * 60_000))) {
-      const execution = (await this.store.execution(id));
-      if (!execution?.runnerLeaseId) continue;
-      const world = (await this.store.currentWorld(execution.worldId));
-      if (world && this.access) await this.access.releaseLeaseAndParkIfIdle(world as any, execution.runnerLeaseId);
-      else (await this.runners?.release(execution.runnerLeaseId, world?.provider ?? world?.kind ?? 'unknown'));
+      await this.step(`lost execution ${id}`, async () => {
+        const execution = (await this.store.execution(id));
+        if (!execution?.runnerLeaseId) return;
+        const world = (await this.store.currentWorld(execution.worldId));
+        if (world && this.access) await this.access.releaseLeaseAndParkIfIdle(world as any, execution.runnerLeaseId);
+        else (await this.runners?.release(execution.runnerLeaseId, world?.provider ?? world?.kind ?? 'unknown'));
+      });
     }
     // Reconciliation: an active remote world whose sandbox disappeared
     // out-of-band (manual deletion, provider eviction) should surface as
@@ -216,7 +238,7 @@ export class WorldLifecycleManager {
       for (const candidate of (await this.store.listWorldInstances('ready', now - reconcileAfter))) {
         const key = `${candidate.handle.id}:${candidate.handle.generation ?? 1}`;
         if ((this.probedAt.get(key) ?? 0) > now - reconcileAfter) continue;
-        await this.worlds.withOperation(candidate.handle.id, async () => {
+        await this.step(`probe ${candidate.handle.id}`, () => this.worlds.withOperation(candidate.handle.id, async () => {
           const unchanged = async () => {
             const current = await this.store.worldStateSnapshot(candidate.handle.id);
             return current?.state === 'ready'
@@ -229,12 +251,12 @@ export class WorldLifecycleManager {
           if (state !== 'missing' || !(await unchanged())) return;
           await this.store.setWorldState(candidate.handle, 'degraded');
           await this.recordLifecycle(candidate.handle, 'world.providerLost', {});
-        });
+        }));
       }
     }
     for (const candidate of await this.store.listWorldInstances('degraded')) {
       if (!candidate.handle.meta?.teardownPending) continue;
-      await this.worlds.withOperation(candidate.handle.id, () => this.worlds.withoutRecovery(async () => {
+      await this.step(`teardown ${candidate.handle.id}`, () => this.worlds.withOperation(candidate.handle.id, () => this.worlds.withoutRecovery(async () => {
         const eligible = async () => {
           const current = await this.store.worldStateSnapshot(candidate.handle.id);
           const task = await this.store.taskMetadata(candidate.handle.id);
@@ -258,11 +280,11 @@ export class WorldLifecycleManager {
         if (!(await eligible())) return;
         await this.store.setWorldState(candidate.handle, 'released');
         await this.recordLifecycle(candidate.handle, 'world.destroyed', { retried: true });
-      }));
+      })));
     }
     for (const [key, probedAt] of this.probedAt)
       if (probedAt < now - Math.max(2 * reconcileAfter, 60_000)) this.probedAt.delete(key);
-    await this.reapOrphanSandboxes();
+    await this.step('orphan sandboxes', () => this.reapOrphanSandboxes());
     let hibernated = 0;
     const parked = await this.store.listWorldInstances('parked');
     const parkedIds = new Set(parked.map(candidate => candidate.handle.id));
@@ -486,7 +508,7 @@ export class WorldLifecycleManager {
           // No task id means karmax cannot attribute it — never destroy blind.
           if (!sandbox.taskId) continue;
           const taskId = sandbox.taskId;
-          await this.worlds.withOperation(taskId, async () => {
+          await this.step(`orphan ${sandbox.sandboxId}`, () => this.worlds.withOperation(taskId, async () => {
             const task = (await this.store.taskMetadata(taskId));
             const current = task ? (await this.store.currentWorld(taskId)) : undefined;
             const duplicate = Boolean(task && current && sandbox.matches && sandbox.matches(current) === false);
@@ -499,7 +521,7 @@ export class WorldLifecycleManager {
             } catch {
               // Transient control-plane failure — the next sweep tries again.
             }
-          });
+          }));
         }
       }
     }

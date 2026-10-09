@@ -47,4 +47,18 @@ describe('the computer in the World section', () => {
     // A local world has no machine of its own to resize.
     expect(assemblePrompt({ profile, role: 'do', task: task({ kind: 'human', audience: ['@creator'] }), world })).not.toContain('Computer:');
   });
+
+  // pramana#3: the agent paused on its rebuild job after its owner chose 50 GB;
+  // a pause that waits on jobs never parks, so the machine never moved.
+  it('says a resize needs a pause without jobs, and names a size the task asks for but has not reached', () => {
+    const cloud = { ...world, meta: { computer: { cpu: 2, memoryMb: 2048 } } } as any;
+    const steady = assemblePrompt({ profile, role: 'do', task: task({ kind: 'human', audience: ['@creator'] }), world: cloud,
+      computer: { cpu: 2, memoryMb: 2048 } });
+    expect(steady).toContain('pause(3) without jobs');
+    expect(steady).toContain('A pause that waits on jobs keeps this machine');
+    expect(steady).not.toContain('This task\'s computer is now');
+    const pending = assemblePrompt({ profile, role: 'do', task: task({ kind: 'human', audience: ['@creator'] }), world: cloud,
+      computer: { cpu: 2, memoryMb: 2048, diskGb: 50 } });
+    expect(pending).toContain('Computer: 2 CPU · 2 GB. This task\'s computer is now 2 CPU · 2 GB · 50 GB disk: you move to it when the task parks');
+  });
 });

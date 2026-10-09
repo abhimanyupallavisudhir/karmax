@@ -1498,6 +1498,16 @@ function computerBlockHtml(name, value, inherited, opts = {}) {
   return `<div class="computer-field computer-block" data-computer="${esc(name)}" ${inhAttr(inh)}>
     ${opts.frozen ? `<fieldset class="ab-frozen" disabled>${body}</fieldset>` : body}</div>`;
 }
+// A size the task asks for but its running computer has not reached: it moves
+// when the task pauses with nothing running (wiki features/computers).
+function computerPendingChip(change) {
+  if (!change) return '';
+  const tip = `Still ${describeMachineShape(change.from)}. Moves to ${describeMachineShape(change.to)} when the task next pauses with nothing running.`;
+  return `<button type="button" class="chip computer-pending" title="${esc(tip)}" aria-label="${esc(tip)}">Moves at next pause</button>`;
+}
+function describeMachineShape(shape) {
+  return [`${shape.cpu ?? 2} CPU`, `${gbOf(shape.memoryMb ?? 2048)} GB`, ...(shape.diskGb != null ? [`${shape.diskGb} GB disk`] : [])].join(' · ');
+}
 function readComputerBlock(box) {
   const value = (selector) => box.querySelector(selector)?.value.trim() ?? '';
   const number = (selector) => { const raw = value(selector); return raw === '' || !Number.isFinite(Number(raw)) ? undefined : Number(raw); };
@@ -12339,7 +12349,8 @@ function paramsSection(v) {
     // hibernation change; the provider, experience and network stay.
     if (f.type === 'computer') {
       const block = computerBlockHtml(f.name, own || undefined, inherited, { inFlight: true, frozen: !isEditable });
-      return `<div class="${isEditable ? 'pf-edit-row' : 'pf-frozen'}" data-row="${esc(f.name)}"><div class="form-row">${isEditable ? fieldLabel(f) : frozenLabel(f)}${block}</div></div>`;
+      const label = (isEditable ? fieldLabel(f) : frozenLabel(f)).replace('</label>', `</label>${computerPendingChip(v.computerChange)}`);
+      return `<div class="${isEditable ? 'pf-edit-row' : 'pf-frozen'}" data-row="${esc(f.name)}"><div class="form-row">${label}${block}</div></div>`;
     }
     if (isEditable) return `<div class="pf-edit-row" data-row="${esc(f.name)}">${renderField(f, own, inherited)}</div>`;
     // A frozen route keeps its shape (who, in order, and each agent's block).
@@ -12385,7 +12396,7 @@ function paramsSection(v) {
   const renderKey = JSON.stringify([v.taskId, v.workflow, terminal, fields.map(({ participant: _p, ...f }) => f), [...editable], inheritedAll,
     fields.filter((f) => !editable.has(f.name)).map((f) => paramCurrentValue(f, v, rec)),
     TERMINAL_STAGES.includes(v.stage) || !!v.pointOfNoReturnPassed, (v.participants || []).map((p) => [p.key, p.state]),
-    authorizationLiveKey(v.taskId), paymentsLiveKey(v)]);
+    authorizationLiveKey(v.taskId), paymentsLiveKey(v), v.computerChange || null]);
   // A workflow without an agent field still shows the task's own authority.
   const authorityOnly = mainAgent ? '' : `<section class="tp-section"><div class="form-row" data-row="__authorization">
     ${agentAuthorityHtml('tp-main', null, { ...mainAuthorityParams(v), open: !!S.mainAuthorityOpen?.[v.taskId] })}</div></section>`;

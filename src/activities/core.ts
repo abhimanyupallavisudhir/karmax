@@ -1,4 +1,4 @@
-import { machineShape } from '../domain/computer.js';
+import { applyComputer, machineShape, normalizeComputer } from '../domain/computer.js';
 import { CheckpointRefusedError } from '../world/checkpoint-chunks.js';
 import { conversationFor, participantLabel, workDigest } from '../domain/participants.js';
 import { forkSourceRole } from '../domain/forks.js';
@@ -2513,11 +2513,25 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const paymentPolicy = (await paymentService?.participantPolicy(args.task.projectId, args.taskId, paymentParticipant));
       const paymentContext = paymentPromptContext(paymentCards, paymentPolicy,
         paymentCards.length && paymentPolicy ? paymentPolicy.spent : 0, paymentPolicy?.own ? 'Your budget' : 'Task budget');
+      // The machine as recorded now (the workflow's copy of the handle predates a
+      // size learned later), and the one the task's Computer asks for.
+      let promptWorld = args.worldHandle;
+      let requestedComputer: ReturnType<typeof machineShape> | undefined;
+      try {
+        const stored = (await store.currentWorld(args.taskId)) as WorldHandle | undefined;
+        if (stored?.meta?.computer && (stored.generation ?? 1) === (args.worldHandle.generation ?? 1))
+          promptWorld = { ...args.worldHandle, meta: { ...args.worldHandle.meta, computer: stored.meta.computer } };
+        // Only a cloud world has a machine to name; the task was read once above (RT-14).
+        const project = promptWorld.meta?.computer ? (await store.getProject(args.task.projectId)) : undefined;
+        if (project) requestedComputer = machineShape(applyComputer(await store.effectiveProjectConfig(project),
+          normalizeComputer(preparationTask?.params.computer)));
+      } catch { /* the World section then names the machine as the workflow knows it */ }
       const systemPrompt = assemblePrompt({
         profile,
         role: args.role,
         task: promptTask,
-        world: args.worldHandle,
+        world: promptWorld,
+        ...(requestedComputer ? { computer: requestedComputer } : {}),
         globalInstructions: (globalInstructions ?? '') + forkContext + agentForkContext + attemptContext + paymentContext,
         projectInstructions,
         bindings,
