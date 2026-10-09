@@ -1227,14 +1227,19 @@ export class KarmaxApi {
       ? (await this.deps.authorization.taskGrant(caller.principal, args.projectId, requestedAuthorization, grantorCaps))
       : { profileId: args.authorizationProfile ?? 'caller', capabilities: caller.caps, attenuated: false };
     const profileAttenuated = authorization.attenuated;
-    if (args.authorization && profileAttenuated
-      && !(args.draft && args.allowAttenuation) && !acceptsTaskAttenuation)
-      throw await this.authorizationGap(token, args.projectId, args.authorization, { kind: 'new-task' });
     const orgVault = (await this.deps.store.getSettings(`organization:${project.organizationId ?? 'org_personal'}`, 'vault')) ?? {};
     const projectVault = (await this.deps.store.getSettings(project.id, 'vault')) ?? {};
     const vaultDefaults = Object.hasOwn(projectVault, 'credentialGrants') ? projectVault : orgVault;
     const grants = args.credentialGrants ?? vaultDefaults.credentialGrants as string[] | undefined;
-    this.applyCredentialGrants(authorization, grants, caller.caps);
+    const ungranted = this.applyCredentialGrants(authorization, grants, caller.caps);
+    // Credentials named explicitly are a gap like an explicit level; inherited
+    // defaults are narrowed to the creator, as the default level is.
+    const missingCredentialGrants = args.credentialGrants === undefined ? [] : ungranted;
+    const limited = missingCredentialGrants.length > 0 || profileAttenuated;
+    if ((args.authorization && profileAttenuated || missingCredentialGrants.length)
+      && !(args.draft && args.allowAttenuation) && !acceptsTaskAttenuation)
+      throw await this.authorizationGap(token, args.projectId, args.authorization ?? selectionOf(authorization, args.projectId),
+        { kind: 'new-task' }, { credentialGrants: missingCredentialGrants });
     const credentialPolicies = await this.credentialPolicyOverrides(
       project.organizationId ?? 'org_personal', args.credentialPolicies ?? (args.credentialGrants === undefined ? vaultDefaults.credentialPolicies as VaultTaskPolicyOverrides | undefined : undefined), caller.caps, authorization,
     );
@@ -1340,7 +1345,8 @@ export class KarmaxApi {
           profiles: args.profiles,
           draft: !!args.draft,
           _authorization: { ...authorization, profileAttenuated, principal: caller.principal, credentialPolicies,
-            ...(profileAttenuated ? { attenuationAccepted: acceptsTaskAttenuation } : {}) },
+            ...(missingCredentialGrants.length ? { missingCredentialGrants } : {}),
+            ...(limited ? { attenuationAccepted: acceptsTaskAttenuation } : {}) },
           ...(githubAccountId ? { _githubAccountId: githubAccountId } : {}),
           ...(repeatable ? { repeatable: true } : {}),
         },
@@ -1954,11 +1960,13 @@ export class KarmaxApi {
     if (!task) throw new NotFoundError(`no task ${taskId}`);
     const caller = (await this.require(token, 'create_task', { projectId: task.projectId, taskId }));
     const storedAuthorization = task.params?._authorization as {
-      profileAttenuated?: boolean; attenuationAccepted?: boolean;
+      profileAttenuated?: boolean; attenuationAccepted?: boolean; missingCredentialGrants?: string[];
     } | undefined;
-    if (storedAuthorization?.profileAttenuated && !storedAuthorization.attenuationAccepted) {
+    if ((storedAuthorization?.profileAttenuated || storedAuthorization?.missingCredentialGrants?.length)
+      && !storedAuthorization.attenuationAccepted) {
       const selection = previousTaskGrants(task).authorization;
-      throw selection ? await this.authorizationGap(token, task.projectId, selection, { kind: 'task', taskId, queue: true })
+      throw selection ? await this.authorizationGap(token, task.projectId, selection, { kind: 'task', taskId, queue: true },
+        { credentialGrants: storedAuthorization.missingCredentialGrants })
         : new AuthorizationGrantError('you cannot grant the agent more authorization than you have');
     }
     (await this.assertStoredGrantQueueable(token, caller, task));
@@ -2040,23 +2048,27 @@ export class KarmaxApi {
    * Layer per-task vault item grants onto the attenuated profile package
    * (wiki plans/PLAN-passwords §6). A creator can attach only items its own grant
    * covers — or any item when it holds credential administration — so a
-   * confused deputy cannot mint credential access it does not have. Dropped
-   * grants mark the task attenuated rather than failing creation.
+   * confused deputy cannot mint credential access it does not have. Returns
+   * the grants it left out (marking the package attenuated); the caller
+   * decides whether that is a gap to refuse or a default to narrow.
    */
   private applyCredentialGrants(
     authorization: { capabilities: Capability[]; attenuated: boolean },
     requested: string[] | undefined,
     callerCaps: Capability[],
-  ): void {
+  ): Capability[] {
+    const ungranted: Capability[] = [];
     for (const raw of requested ?? []) {
       const cap = String(raw);
       if (!cap.startsWith('use-credential:')) throw new Error(`credentialGrants entries must be use-credential:… capabilities (got ${cap})`);
-      if (allows(callerCaps, cap) || allows(callerCaps, 'credential:write')) {
+      if (canGrantCredential(callerCaps, cap)) {
         if (!authorization.capabilities.includes(cap)) authorization.capabilities.push(cap);
       } else {
         authorization.attenuated = true;
+        if (!ungranted.includes(cap)) ungranted.push(cap);
       }
     }
+    return ungranted;
   }
 
   private async credentialPolicyOverrides(
@@ -2145,10 +2157,11 @@ export class KarmaxApi {
       ? (await this.deps.authorization.taskGrant(caller.principal, task.projectId, requested, grantorCaps))
       : { profileId: typeof requested === 'string' ? requested : requested.level, capabilities: caller.caps, attenuated: false };
     const profileAttenuated = authorization.attenuated;
-    this.applyCredentialGrants(authorization, credentialGrants, caller.caps);
+    const missingCredentialGrants = this.applyCredentialGrants(authorization, credentialGrants, caller.caps);
     const priorAuthorization = task.params?._authorization as {
       credentialPolicies?: VaultTaskPolicyOverrides; delegationId?: string; principal?: string;
       attenuationAccepted?: boolean; level?: string; scope?: string; projectIds?: string[]; capabilities?: string[];
+      missingCredentialGrants?: string[];
     } | undefined;
     if (options.preserveCredentialGrants) for (const capability of priorAuthorization?.capabilities ?? []) {
       if (capability.startsWith('use-credential:') && !authorization.capabilities.includes(capability))
@@ -2168,11 +2181,16 @@ export class KarmaxApi {
       : requested.level === priorAuthorization?.level
         && requested.scope === priorAuthorization?.scope
         && JSON.stringify(requested.projectIds ?? []) === JSON.stringify(priorAuthorization?.projectIds ?? []);
-    const attenuationAccepted = profileAttenuated
-      && (options.acceptAttenuation === true || sameSelection && priorAuthorization?.attenuationAccepted === true);
-    if (typeof requested !== 'string' && profileAttenuated
+    // A limit accepted before stays accepted only for what it covered.
+    const acceptedBefore = sameSelection && priorAuthorization?.attenuationAccepted === true
+      && missingCredentialGrants.every((grant) => priorAuthorization.missingCredentialGrants?.includes(grant));
+    const limited = profileAttenuated || missingCredentialGrants.length > 0;
+    const attenuationAccepted = limited && (options.acceptAttenuation === true || acceptedBefore);
+    if ((typeof requested !== 'string' && profileAttenuated || missingCredentialGrants.length)
       && !(editInPlace && options.allowAttenuation) && !attenuationAccepted)
-      throw await this.authorizationGap(token, task.projectId, requested, { kind: 'task', taskId });
+      throw await this.authorizationGap(token, task.projectId,
+        typeof requested === 'string' ? selectionOf(authorization, task.projectId) : requested,
+        { kind: 'task', taskId }, { credentialGrants: missingCredentialGrants });
     const authorizationScope = authorization as typeof authorization & {
       scope?: 'projects' | 'organization' | 'global'; projectIds?: string[]; organizationId?: string;
     };
@@ -2222,7 +2240,8 @@ export class KarmaxApi {
       _authorization: { ...priorAuthorizationWithoutDelegation, ...authorization, profileAttenuated,
         principal: caller.principal, credentialPolicies: policies,
         ...(delegation ? { delegationId: delegation.id } : {}),
-        ...(profileAttenuated ? { attenuationAccepted } : { attenuationAccepted: undefined }) },
+        missingCredentialGrants: missingCredentialGrants.length ? missingCredentialGrants : undefined,
+        attenuationAccepted: limited ? attenuationAccepted : undefined },
       ...(!pinnedGithubAccountId && delegation?.externalIdentities?.githubAccountId
         ? { _githubAccountId: delegation.externalIdentities.githubAccountId } : {}),
     }));
@@ -2267,14 +2286,18 @@ export class KarmaxApi {
     projectId: string,
     authorization: AuthorizationSelection,
     target: { kind: 'new-task' } | { kind: 'task'; taskId: string; queue?: boolean; participant?: string } | { kind: 'avatar'; avatarId?: string },
-    options: { canLimit?: boolean } = {},
+    options: { canLimit?: boolean; credentialGrants?: Capability[] } = {},
   ): Promise<AuthorizationGrantError> {
-    const targets = await this.authorizationEscalationTargets(token, { projectId, authorization }).catch(() => undefined);
-    const missingCapabilities = targets?.missingCapabilities ?? [];
+    const credentialGrants = options.credentialGrants?.length ? options.credentialGrants : undefined;
+    const targets = await this.authorizationEscalationTargets(token, { projectId, authorization, credentialGrants }).catch(() => undefined);
+    const missingCapabilities = targets?.missingCapabilities ?? credentialGrants ?? [];
     const summon = targets?.summon;
-    const summary = await this.authorizationSummary(projectId, authorization);
+    const credentialNames = (targets?.credentials ?? []).map((credential) => credential.label);
+    const summary = await this.authorizationSummary(projectId, authorization)
+      + (credentialNames.length ? ` with ${credentialNames.join(', ')}` : '');
     const request = (taskOrAvatar: string) => `POST /api/authorization-requests?projectId=${projectId} with `
-      + `{"target":${taskOrAvatar},"authorization":${JSON.stringify(authorization)},"audience":["${summon}"]}`;
+      + `{"target":${taskOrAvatar},"authorization":${JSON.stringify(authorization)},`
+      + `${credentialGrants ? `"credentialGrants":${JSON.stringify(credentialGrants)},` : ''}"audience":["${summon}"]}`;
     const limit = options.canLimit === false ? undefined
       : target.kind === 'avatar' ? 'save it with limitAuthorization: true'
         : target.kind === 'task' && target.participant ? `retry with acceptAttenuation: ["${target.participant}"]`
@@ -2293,7 +2316,7 @@ export class KarmaxApi {
     return new AuthorizationGrantError(
       `you cannot grant the ${target.kind === 'avatar' ? 'Avatar' : target.kind === 'task' && target.participant ? participantLabel(target.participant) : 'agent'} more authorization than you have: `
       + `${summary}${shown ? ` needs ${shown}` : ''}. ${next}`,
-      { summary, missingCapabilities, ...(summon ? { summon } : {}), next });
+      { summary, missingCapabilities, ...(summon ? { summon } : {}), next, ...(credentialGrants ? { credentialGrants } : {}) });
   }
 
   /** "Project maintainer · Site", "Developer · 3 projects", "Administrator · Acme". */
@@ -2390,7 +2413,8 @@ export class KarmaxApi {
       const kept = prior[key];
       const accepted = options.accept === true || (Array.isArray(options.accept) && options.accept.includes(key));
       if (!options.force && kept && kept.principal === caller.principal && authorityKey(kept.requested) === authorityKey(requested)) {
-        next[key] = kept.profileAttenuated && !kept.attenuationAccepted && accepted ? { ...kept, attenuationAccepted: true } : kept;
+        next[key] = (kept.profileAttenuated || kept.missingCredentialGrants?.length) && !kept.attenuationAccepted && accepted
+          ? { ...kept, attenuationAccepted: true } : kept;
         continue;
       }
       next[key] = await this.agentAuthorizationFor(token, caller, task, key, requested, {
@@ -2417,18 +2441,22 @@ export class KarmaxApi {
       ? (await this.deps.authorization.taskGrant(caller.principal, task.projectId, selection, grantorCaps))
       : { ...selection, profileId: selection.level, capabilities: [...caller.caps], attenuated: false };
     const profileAttenuated = authorization.attenuated;
-    this.applyCredentialGrants(authorization, requested.credentialGrants ?? inherited.credentialGrants, caller.caps);
+    const ungranted = this.applyCredentialGrants(authorization, requested.credentialGrants ?? inherited.credentialGrants, caller.caps);
+    const missingCredentialGrants = requested.credentialGrants === undefined ? [] : ungranted;
+    const limited = profileAttenuated || missingCredentialGrants.length > 0;
     const credentialPolicies = (await this.credentialPolicyOverrides(organizationId,
       requested.credentialPolicies ?? (requested.credentialGrants === undefined ? inherited.credentialPolicies : undefined),
       caller.caps, authorization));
     const sameRequest = !!options.prior && authorityKey(options.prior.requested) === authorityKey(requested);
-    const attenuationAccepted = profileAttenuated && (options.accepted || !!options.fromDefaults
+    const attenuationAccepted = limited && (options.accepted || !!options.fromDefaults
       || sameRequest && options.prior?.attenuationAccepted === true);
-    // Like the task's own selection: an explicit level the setter cannot grant
-    // is refused unless a draft keeps it for later or the setter accepts the
-    // limited package. Task defaults are snapshotted attenuated, never widened.
-    if (requested.authorization && profileAttenuated && !options.mayAttenuate && !attenuationAccepted)
-      throw Object.assign(await this.authorizationGap(token, task.projectId, selection, { kind: 'task', taskId: task.id, participant: key }),
+    // Like the task's own selection: an explicit level or credential the setter
+    // cannot grant is refused unless a draft keeps it for later or the setter
+    // accepts the limited package. Task defaults are snapshotted attenuated, never widened.
+    if ((requested.authorization && profileAttenuated || missingCredentialGrants.length)
+      && !options.mayAttenuate && !attenuationAccepted)
+      throw Object.assign(await this.authorizationGap(token, task.projectId, selection,
+        { kind: 'task', taskId: task.id, participant: key }, { credentialGrants: missingCredentialGrants }),
         { participant: key, authorization: selection });
     const scoped = authorization as typeof authorization & { scope?: AuthorizationSelection['scope']; projectIds?: string[]; organizationId?: string };
     const pinnedGithubAccountId = typeof task.params?._githubAccountId === 'string' ? task.params._githubAccountId : undefined;
@@ -2446,7 +2474,8 @@ export class KarmaxApi {
     }));
     return {
       ...authorization, profileAttenuated, principal: caller.principal, credentialPolicies,
-      ...(profileAttenuated ? { attenuationAccepted } : {}),
+      ...(missingCredentialGrants.length ? { missingCredentialGrants } : {}),
+      ...(limited ? { attenuationAccepted } : {}),
       ...(delegation ? { delegationId: delegation.id } : {}),
       ...(requested.paymentPolicy ? { paymentPolicy: requested.paymentPolicy } : {}),
       requested,
@@ -2457,9 +2486,10 @@ export class KarmaxApi {
    * setter's acceptance (the task-level gate in `queueTask`, per agent). */
   private assertAgentAuthorizationsAccepted(entries: Record<string, StoredAgentAuthorization>): void {
     for (const [key, entry] of Object.entries(entries)) {
-      if (entry.profileAttenuated && !entry.attenuationAccepted)
+      if ((entry.profileAttenuated || entry.missingCredentialGrants?.length) && !entry.attenuationAccepted)
         throw Object.assign(new AuthorizationGrantError(`you cannot grant the ${participantLabel(key)} more authorization than you have`),
-          { participant: key, authorization: entry.requested.authorization });
+          { participant: key, authorization: entry.requested.authorization,
+            ...(entry.missingCredentialGrants?.length ? { credentialGrants: entry.missingCredentialGrants } : {}) });
     }
   }
 
@@ -3973,12 +4003,14 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
 
   async authorizationEscalationTargets(
     token: string,
-    input: { projectId: string; authorization: AuthorizationSelection },
+    input: { projectId: string; authorization: AuthorizationSelection; credentialGrants?: Capability[] },
   ): Promise<{
     projectId: string;
     authorization: AuthorizationSelection;
     requestedCapabilities: Capability[];
     missingCapabilities: Capability[];
+    /** The missing vault credentials, named for people. */
+    credentials: Array<{ capability: Capability; label: string }>;
     users: Array<{ id: string; selector: string }>;
     teams: Array<{ id: string; name: string; slug: string; selector: string; eligibleUserIds: string[] }>;
     special: Array<{ selector: string; eligibleUserIds: string[] }>;
@@ -3991,14 +4023,22 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     if (!project?.organizationId) throw new NotFoundError('project organization not found');
     const authorization = this.deps.authorization;
     if (!authorization) throw new Error('authorization service is unavailable');
-    const requestedCapabilities = (await authorization.requestedCapabilities(input.projectId, input.authorization));
-    const missingCapabilities = caller.kind === 'human'
+    const credentialGrants = [...new Set((input.credentialGrants ?? []).map(String))];
+    const invalid = credentialGrants.find((grant) => !grant.startsWith('use-credential:'));
+    if (invalid) throw new ValidationError(`credentialGrants entries must be use-credential:… capabilities (got ${invalid})`);
+    const levelCapabilities = (await authorization.requestedCapabilities(input.projectId, input.authorization));
+    const requestedCapabilities = [...levelCapabilities, ...credentialGrants.filter((grant) => !levelCapabilities.includes(grant))];
+    const missingCredentials = credentialGrants.filter((grant) => !canGrantCredential(caller.caps, grant));
+    const missingCapabilities = [...(caller.kind === 'human'
       ? (await authorization.missingCapabilities(caller.principal, input.projectId, input.authorization))
-      : requestedCapabilities.filter((capability) => !allows(caller.caps, capability));
+      : levelCapabilities.filter((capability) => !allows(caller.caps, capability))), ...missingCredentials];
+    const canGrantAll = (caps: Capability[]) => credentialGrants.every((grant) => canGrantCredential(caps, grant));
     const memberIds = (await this.deps.store.listOrganizationMemberships(project.organizationId)).map((member) => member.userId);
-    const eligibleUserIds = (await __asyncCollections.filter(memberIds, async (userId) =>
-      allows((await authorization.capabilities(`user:${userId}`, input.projectId, project.organizationId)), 'task:create')
-      && (await authorization.canGrantSelection(`user:${userId}`, input.projectId, input.authorization))));
+    const eligibleUserIds = (await __asyncCollections.filter(memberIds, async (userId) => {
+      const held = (await authorization.capabilities(`user:${userId}`, input.projectId, project.organizationId));
+      return allows(held, 'task:create') && canGrantAll(held)
+        && (await authorization.canGrantSelection(`user:${userId}`, input.projectId, input.authorization));
+    }));
     const users = eligibleUserIds.map((id) => ({ id, selector: `user:${id}` }));
     const eligible = new Set(eligibleUserIds);
     const teams = (await __asyncCollections.map((await this.deps.store.listTeams(project.organizationId, input.projectId)), async (team) => ({ ...team, eligibleUserIds: (await this.deps.store.listTeamMemberships(team.id))
@@ -4014,15 +4054,23 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         && (!avatar.roles.length || avatar.roles.includes('authorize'))
         && (await avatarCallableBy(this.deps.store, avatar, initiatingUserId)))), async (avatar) => {
         const effective = (await avatarAuthorizationCapabilities(this.deps.store, authorization, avatar, input.projectId));
-        return allows(effective, 'task:create')
-          && requestedCapabilities.every((capability) => allows(effective, capability));
+        return allows(effective, 'task:create') && canGrantAll(effective)
+          && levelCapabilities.every((capability) => allows(effective, capability));
       }))
       .map((avatar) => ({ id: avatar.id, name: avatar.name,
         ...(avatar.purpose ? { purpose: avatar.purpose } : {}), selector: `avatar:${avatar.id}` }));
     const { special, summon } = await this.summonable(project.id, project.organizationId, eligibleUserIds);
+    // Names only for a caller who may see the vault's item list.
+    const vault = allows(caller.caps, 'credential:read') ? new VaultItems(this.deps.store, undefined, undefined, project.organizationId) : undefined;
+    const credentials = await __asyncCollections.map(missingCredentials, async (capability) => {
+      const [, kind, ...rest] = capability.split(':');
+      const target = rest.join(':');
+      const label = kind === 'item' ? (await vault?.get(target))?.label : undefined;
+      return { capability, label: label ?? (kind === 'tag' ? `#${target}` : target) };
+    });
     return {
       projectId: input.projectId, authorization: input.authorization,
-      requestedCapabilities, missingCapabilities, users, teams, special, avatars,
+      requestedCapabilities, missingCapabilities, credentials, users, teams, special, avatars,
       ...(summon ? { summon } : {}),
     };
   }
@@ -4061,6 +4109,8 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       target: { kind: 'task'; taskId: string; participant?: string; queueAfterApproval?: boolean }
         | { kind: 'avatar'; avatarId: string; enableAfterApproval?: boolean };
       authorization: AuthorizationSelection;
+      /** Vault credentials to add on approval (a task target only). */
+      credentialGrants?: Capability[];
       audience: string[];
       reason?: string;
     },
@@ -4091,8 +4141,11 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       if (!requesterId || avatar.ownerUserId !== requesterId)
         throw new CapabilityError('only the Avatar owner can route its authorization request');
     }
+    const credentialGrants = input.credentialGrants?.length ? [...new Set(input.credentialGrants.map(String))] : undefined;
+    if (credentialGrants && input.target.kind !== 'task')
+      throw new ValidationError('an Avatar’s credentials are chosen with the Avatar, not requested');
     const targets = (await this.authorizationEscalationTargets(token, {
-      projectId: input.projectId, authorization: input.authorization,
+      projectId: input.projectId, authorization: input.authorization, credentialGrants,
     }));
     if (!targets.missingCapabilities.length)
       throw new ValidationError('you already have the requested authorization');
@@ -4132,11 +4185,14 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     // A repeated click must not fan out duplicate Avatar decision tasks or route
     // a second audience that is not recorded on the durable request.
     if (existing) return existing;
+    const credentialNames = targets.credentials.map((credential) => credential.label);
     const request = (await service.request({
       projectId: input.projectId, target: input.target, authorization: input.authorization,
+      ...(credentialGrants ? { credentialGrants } : {}),
       capabilities: targets.requestedCapabilities, missingCapabilities: targets.missingCapabilities,
       audience, recipients: [...recipients], avatarRecipients: [...avatarRecipients],
-      reason: String(input.reason ?? '').trim() || `Grant ${input.authorization.level} authorization to this ${input.target.kind}.`,
+      reason: String(input.reason ?? '').trim() || `Grant ${input.authorization.level} authorization`
+        + `${credentialNames.length ? ` with ${credentialNames.join(', ')}` : ''} to this ${input.target.kind}.`,
       requestedBy: caller.principal,
     }));
     if (input.target.kind === 'task') {
@@ -4164,7 +4220,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         await this.createTask(token, {
           projectId: input.projectId, workflow: 'just-do',
           title: `${avatar.name}: decide authorization request`,
-          prompt: `Decide whether to approve or deny authorization request ${request.id}.\n\nTarget: ${input.target.kind} ${input.target.kind === 'task' ? input.target.taskId : input.target.avatarId}\nRequested authorization: ${input.authorization.level} (${input.authorization.scope})\nMissing capabilities: ${request.missingCapabilities.join(', ')}\n${untrustedBlock('reason from the requester', request.reason)}\n\nAct according to your Avatar instructions. Resolve the request exactly once by calling platform_request with POST /api/authorization-requests/${request.id}/resolve?organizationId=${project.organizationId} and body {"action":"approve"} or {"action":"deny"}. Then briefly report the decision.`,
+          prompt: `Decide whether to approve or deny authorization request ${request.id}.\n\nTarget: ${input.target.kind} ${input.target.kind === 'task' ? input.target.taskId : input.target.avatarId}\nRequested authorization: ${input.authorization.level} (${input.authorization.scope})${credentialNames.length ? ` with vault credentials ${credentialNames.join(', ')}` : ''}\nMissing capabilities: ${request.missingCapabilities.join(', ')}\n${untrustedBlock('reason from the requester', request.reason)}\n\nAct according to your Avatar instructions. Resolve the request exactly once by calling platform_request with POST /api/authorization-requests/${request.id}/resolve?organizationId=${project.organizationId} and body {"action":"approve"} or {"action":"deny"}. Then briefly report the decision.`,
           params: { 'agent:do': { avatarId: avatar.id, avatarPurpose: 'authorize', provider: avatar.runtime.provider,
             ...(avatar.runtime.model ? { model: avatar.runtime.model } : {}),
             ...(avatar.runtime.effort ? { effort: avatar.runtime.effort } : {}) } },
@@ -4222,7 +4278,8 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     if (input.action === 'approve') {
       const grantorCaps = (await this.authorizationGrantorCaps(token, caller, request.authorization, input.organizationId));
       const authorization = (await this.deps.authorization?.taskGrant(caller.principal, request.projectId, request.authorization, grantorCaps));
-      if (!authorization || authorization.attenuated)
+      if (!authorization || authorization.attenuated
+        || (request.credentialGrants ?? []).some((grant) => !canGrantCredential(caller.caps, grant)))
         throw new CapabilityError('you can no longer grant the complete requested authorization');
       claimId = await service.claim(request.id, input.action, caller.principal);
       if (request.target.kind === 'task') {
@@ -4231,7 +4288,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         const participant = request.target.participant;
         for (const attempt of attempts) {
           if (!participant) {
-            await this.setTaskAuthorization(token, attempt.id, request.authorization, undefined, undefined,
+            await this.setTaskAuthorization(token, attempt.id, request.authorization, request.credentialGrants, undefined,
               { acceptAttenuation: false, preserveCredentialGrants: true });
             continue;
           }
@@ -6798,6 +6855,20 @@ Act according to your Avatar instructions. When ready, call platform_request POS
  * a human approved a mid-task authorization request), its per-task vault
  * credential caps and the policies chosen for them. A legacy record that only
  * carries a `profileId` still maps to a level. */
+/** Can `caps` hand a vault credential grant to a task? Its own grant must
+ * cover it, or it administers credentials (wiki plans/PLAN-passwords §6). */
+function canGrantCredential(caps: Capability[], grant: Capability): boolean {
+  return allows(caps, grant) || allows(caps, 'credential:write');
+}
+
+/** The level and scope an effective package was minted from. */
+function selectionOf(authorization: { level?: string; profileId?: string; scope?: AuthorizationSelection['scope']; projectIds?: string[] },
+  projectId: string): AuthorizationSelection {
+  const scope = authorization.scope ?? 'projects';
+  return { level: authorization.level ?? authorization.profileId ?? 'developer', scope,
+    ...(scope === 'projects' ? { projectIds: authorization.projectIds?.length ? authorization.projectIds : [projectId] } : {}) };
+}
+
 export function previousTaskGrants(task: TaskRecord): {
   authorization?: AuthorizationSelection;
   credentialGrants: string[];

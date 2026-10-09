@@ -2719,12 +2719,20 @@ function authorizationShortSummary(value, projects) {
  * can grant the complete package, and are re-checked when the request is made
  * and when it is approved. Resolves to { action: 'ask', audience, reason } |
  * { action: 'limit' } | null. */
-async function chooseAuthorizationGrant(projectId, authorization, targetLabel = 'agent') {
+async function chooseAuthorizationGrant(projectId, authorization, targetLabel = 'agent', credentialGrants = []) {
   const targets = await api(`/api/authorization/escalation-targets?projectId=${encodeURIComponent(projectId)}`, {
-    method: 'POST', body: JSON.stringify({ projectId, authorization }),
+    method: 'POST', body: JSON.stringify({ projectId, authorization, ...(credentialGrants.length ? { credentialGrants } : {}) }),
   });
-  const summary = authorizationShortSummary(authorization,
+  // Missing vault credentials are named, not shown as capabilities; when they
+  // are all that is missing, the dialog is about them alone.
+  const credentials = targets.credentials || [];
+  const credentialLabel = new Map(credentials.map((credential) => [credential.capability, credential.label]));
+  const levelMissing = targets.missingCapabilities.filter((capability) => !credentialLabel.has(capability));
+  const credentialSummary = credentials.length === 1 ? credentials[0].label : `${credentials.length} credentials`;
+  const levelSummary = authorizationShortSummary(authorization,
     S.projects.filter((project) => project.organizationId === projectById(projectId)?.organizationId));
+  const summary = !credentials.length ? levelSummary
+    : levelMissing.length ? `${levelSummary} with ${credentialSummary}` : credentialSummary;
   const count = (ids) => `${ids.length} ${ids.length === 1 ? 'person' : 'people'}`;
   const summoned = targets.special.find((item) => item.selector === targets.summon);
   const recipients = [
@@ -2738,7 +2746,7 @@ async function chooseAuthorizationGrant(projectId, authorization, targetLabel = 
   const decision = await summonDialog({
     title: `You can't grant ${summary}`,
     tip: `Only someone who holds this authorization can grant it. Alert asks them to approve — the ${targetLabel} waits until one does. Use my authorization goes ahead with only what you have.`,
-    missing: targets.missingCapabilities,
+    missing: targets.missingCapabilities.map((capability) => credentialLabel.get(capability) || capability),
     summon: summoned ? { label: `Alert ${summoned.selector}`, audience: [summoned.selector],
       tip: `Ask the ${count(summoned.eligibleUserIds)} in ${SUMMON_GROUP_LABELS[summoned.selector] || summoned.selector} who can grant it` } : null,
     recipients,
@@ -2757,12 +2765,14 @@ async function saveTaskAuthorization(taskId, projectId, values) {
     return await api(`/api/tasks/${taskId}/authorization`, { method: 'PATCH', body: JSON.stringify(values) });
   } catch (error) {
     if (!isAuthorizationGrantGap(error)) throw error;
-    const decision = await chooseAuthorizationGrant(projectId, values.authorization, 'agent');
+    const credentialGrants = error.credentialGrants || [];
+    const decision = await chooseAuthorizationGrant(projectId, values.authorization, 'agent', credentialGrants);
     if (decision?.action === 'limit')
       return api(`/api/tasks/${taskId}/authorization`, { method: 'PATCH', body: JSON.stringify({ ...values, acceptAttenuation: true }) });
     if (decision?.action === 'ask') {
       await api(`/api/authorization-requests?projectId=${encodeURIComponent(projectId)}`, { method: 'POST', body: JSON.stringify({
-        projectId, target: { kind: 'task', taskId }, authorization: values.authorization, audience: decision.audience, reason: decision.reason,
+        projectId, target: { kind: 'task', taskId }, authorization: values.authorization,
+        ...(credentialGrants.length ? { credentialGrants } : {}), audience: decision.audience, reason: decision.reason,
       }) });
       toast('Authorization request sent');
     }
@@ -8138,8 +8148,9 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
           // The refusal names the agent whose authority exceeds the user's (`do`,
           // or absent, is the main agent): ask about exactly that one.
           const participant = e.participant && e.participant !== 'do' ? e.participant : null;
+          const credentialGrants = e.credentialGrants || [];
           const decision = await chooseAuthorizationGrant(projectId, participant ? e.authorization || st.authorization : st.authorization,
-            participant ? agentParticipantLabel(participant) : 'task agent');
+            participant ? agentParticipantLabel(participant) : 'task agent', credentialGrants);
           if (!decision) return false;
           if (decision.action === 'limit') {
             succeeded = await submit(false, [...new Set([...accepted, participant || 'do'])], activeFeedback);
@@ -8164,7 +8175,8 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
           }
           await api(`/api/authorization-requests?projectId=${encodeURIComponent(projectId)}`, { method: 'POST', body: JSON.stringify({
             projectId, target: { kind: 'task', taskId: targetId, queueAfterApproval: true, ...(participant ? { participant } : {}) },
-            authorization: participant ? e.authorization || st.authorization : st.authorization, audience: decision.audience, reason: decision.reason,
+            authorization: participant ? e.authorization || st.authorization : st.authorization,
+            ...(credentialGrants.length ? { credentialGrants } : {}), audience: decision.audience, reason: decision.reason,
           }) });
           releaseFormKeys();
           root.innerHTML = '';
