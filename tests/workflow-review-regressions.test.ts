@@ -889,9 +889,10 @@ describe('resource publication by sub-tasks', () => {
 
   it('names the extra answers a raise accepts', () => {
     const raise = { childTaskId: 'c', childTitle: 'OCR', type: 'blocked' as const, detail: 'Could not publish resources' };
-    expect(subtaskRaiseText(raise)).toMatch(/\(confirm \| comment \| retry \| cancel\)\.$/);
+    // The answers come first; then how to pass a question only a person can answer on (#533/#454).
+    expect(subtaskRaiseText(raise)).toMatch(/\(confirm \| comment \| retry \| cancel\)\. If only a person can answer, .*task_id: "c"/);
     expect(subtaskRaiseText({ ...raise, choices: ['keep_own'] }))
-      .toMatch(/\(confirm \| comment \| retry \| cancel \| keep_own: publish again keeping its version of the conflicting files\)\.$/);
+      .toMatch(/\(confirm \| comment \| retry \| cancel \| keep_own: publish again keeping its version of the conflicting files\)\. If only a person/);
   });
 
   it('offers no version choice when publishing failed for another reason', async () => {

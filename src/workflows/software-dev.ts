@@ -203,6 +203,7 @@ export const agentTurnStateSignal = defineSignal<[{
 /** A child raises UP to its parent when it reaches a decision point (SPEC §5.3). */
 const REPLY_TO_SPEAKERS = 'software-dev-reply-to-speakers-v1';
 export const raiseFromChildSignal = defineSignal<[ChildRaise]>('raiseFromChild');
+export const subtaskRedirectedSignal = defineSignal<[{ childTaskId: string }]>(SIG.subtaskRedirected);
 /** A parent answers a child that raised to it — maps onto the same confirm/retry/
  *  cancel/follow-up transitions a human would drive (SPEC §5.3). */
 export const parentResponseSignal = defineSignal<[ParentResponse]>('parentResponse');
@@ -1851,6 +1852,11 @@ async function softwareDevImpl(
     if (!awaitingResponse.has(r.childTaskId)) subtaskNags = 0;
     raises.push(r);
     awaitingResponse.add(r.childTaskId);
+  });
+  // A child's request passed on to people (escalate) waits for them, not us:
+  // stop prompting our agent to answer it. A later raise asks us again.
+  setHandler(subtaskRedirectedSignal, ({ childTaskId }) => {
+    if (awaitingResponse.delete(childTaskId)) subtaskNags = 0;
   });
   // Our parent answered a raise. Map its decision onto the SAME flags a human drives
   // (confirm/retry/cancel/follow-up) so the parent is literally our confirmer.
@@ -5295,7 +5301,10 @@ const RAISE_CHOICES: Partial<Record<SubTaskAction, string>> = {
 /** What a parent's Do agent reads when a sub-task raises to it. */
 export function subtaskRaiseText(r: ChildRaise): string {
   const extra = (r.choices ?? []).filter((choice) => RAISE_CHOICES[choice]).map((choice) => ` | ${choice}: ${RAISE_CHOICES[choice]}`).join('');
-  return `Sub-task "${r.childTitle}" (${r.childTaskId}) needs you — ${r.type}${r.detail ? `: ${r.detail}` : ''}. Answer with respond_to_sub_task (confirm | comment | retry | cancel${extra}).`;
+  return `Sub-task "${r.childTitle}" (${r.childTaskId}) needs you — ${r.type}${r.detail ? `: ${r.detail}` : ''}. Answer with respond_to_sub_task (confirm | comment | retry | cancel${extra}).`
+    // #533/#454: a parent "relayed" a question in its own reply, which no
+    // person reads while it waits for sub-tasks, and told the child to wait.
+    + ` If only a person can answer, pass it to them with escalate(to, note, task_id: "${r.childTaskId}"): it waits for them and their reply goes to the sub-task. While you wait for sub-tasks, your own reply reaches nobody.`;
 }
 
 /** The type of the innermost ApplicationFailure that names one. */
