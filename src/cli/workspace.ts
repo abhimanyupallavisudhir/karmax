@@ -32,6 +32,9 @@ interface State {
   secretFiles: Record<string, string>;
   /** Git reaches GitHub through `tavya git-credential` (clone --git-via-tavya). */
   gitViaTavya?: boolean;
+  /** Where a repository is checked out, relative to the root, when not at its
+   * world folder (`import` adopts folders as they are; `.` = the root itself). */
+  checkouts?: Record<string, string>;
 }
 
 const DIR = '.tavya';
@@ -60,18 +63,25 @@ export class Workspace {
     return found;
   }
 
-  static create(root: string, server: string, manifest: Manifest): Workspace {
+  static create(root: string, server: string, manifest: Manifest, checkouts?: Record<string, string>): Workspace {
     fs.mkdirSync(path.join(root, DIR), { recursive: true });
     fs.writeFileSync(path.join(root, DIR, '.gitignore'), '*\n');
     const workspace = new Workspace(root, { version: 1, server, manifest, resources: {}, secretFiles: {} });
-    workspace.save();
+    workspace.checkouts = checkouts ?? {};
     return workspace;
   }
 
   get server(): string { return this.state.server; }
   get manifest(): Manifest { return this.state.manifest; }
   set manifest(value: Manifest) { this.state.manifest = value; }
-  get workdir(): string { return path.join(this.root, this.state.manifest.workdir); }
+  get workdir(): string { return this.path(this.state.manifest.workdir); }
+
+  get checkouts(): Record<string, string> { return { ...this.state.checkouts }; }
+  set checkouts(value: Record<string, string>) {
+    const moved = Object.entries(value).filter(([name, dir]) => dir !== name);
+    if (moved.length) this.state.checkouts = Object.fromEntries(moved); else delete this.state.checkouts;
+    this.save();
+  }
 
   get gitViaTavya(): boolean { return Boolean(this.state.gitViaTavya); }
   set gitViaTavya(value: boolean) { this.state.gitViaTavya = value; this.save(); }
@@ -85,7 +95,37 @@ export class Workspace {
   }
 
   /** Where the manifest names a path (relative to the root, `/`-separated). */
-  path(relative: string): string { return path.join(this.root, ...relative.split('/')); }
+  path(relative: string): string {
+    const [first = '', ...rest] = relative.split('/');
+    const checkout = this.state.checkouts?.[first];
+    return checkout === undefined ? path.join(this.root, ...relative.split('/')) : path.join(this.checkout(first), ...rest);
+  }
+
+  /** The repository's checkout: its world folder, unless `import` adopted one elsewhere. */
+  checkout(name: string): string { return path.join(this.root, ...(this.state.checkouts?.[name] ?? name).split('/')); }
+
+  /** The world path (`<repository>/…`, or a root-level name) of a local file, if inside the workspace. */
+  worldPath(absolute: string): string | undefined {
+    const full = path.resolve(absolute);
+    const within = (dir: string) => full === dir || full.startsWith(dir.endsWith(path.sep) ? dir : `${dir}${path.sep}`);
+    // The deepest checkout wins: an adopted checkout may be the root itself.
+    const repositories = this.state.manifest.repositories.map((repository) => ({ name: repository.name, dir: this.checkout(repository.name) }))
+      .filter((entry) => within(entry.dir)).sort((a, b) => b.dir.length - a.dir.length);
+    const toPosix = (value: string) => value.split(path.sep).join('/');
+    if (repositories[0]) {
+      const inner = toPosix(path.relative(repositories[0].dir, full));
+      return inner ? `${repositories[0].name}/${inner}` : repositories[0].name;
+    }
+    if (!within(this.root)) return undefined;
+    return toPosix(path.relative(this.root, full)) || '.';
+  }
+
+  /** Repositories `pull` must not clone: their folder would land inside another checkout. */
+  nested(name: string): boolean {
+    const destination = this.checkout(name);
+    return this.state.manifest.repositories.some((other) => other.name !== name && this.state.checkouts?.[other.name] !== undefined
+      && (destination + path.sep).startsWith(this.checkout(other.name) + path.sep));
+  }
 
   /** The repository a path lies in, if any. */
   repositoryOf(relative: string): Manifest['repositories'][number] | undefined {

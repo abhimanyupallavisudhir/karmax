@@ -11,7 +11,7 @@ import {
   PLATFORM_REQUEST_BODY_SCHEMA, PRIORITY_NAMES, AGENT_ROLE_NAMES,
   compactSearch, compactOrganizationSearch, compactTags, normalizeRequestBody, platformRequestPathError,
 } from '../platform/platform-request.js';
-import { URGENCY_LEVELS, type AgentWait, type Urgency } from '../domain/types.js';
+import { SUB_TASK_ACTIONS, URGENCY_LEVELS, type AgentWait, type SubTaskAction, type Urgency } from '../domain/types.js';
 import { BRAND } from '../domain/brand.js';
 
 /** The longest a single wait may last: a week, after which a parked world may hibernate. */
@@ -149,12 +149,12 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'respond_to_sub_task',
     description:
-      'Answer a sub-task that raised to you. action: "open_pr" (its completed work should open a PR and enter Review), "confirm" (approve what it has: lands a PR at Review, or opens the PR of a child whose turn ended without one), "comment" (send guidance/answer its question so it keeps working), "retry" (retry a failed step), or "cancel" (abandon it). Omit child_task_id to answer all waiting children. The answer is delivered when your current turn ends.',
+      'Answer a sub-task that raised to you. action: "open_pr" (its completed work should open a PR and enter Review), "confirm" (approve what it has: lands a PR at Review, or opens the PR of a child whose turn ended without one), "comment" (send guidance/answer its question so it keeps working), "retry" (retry a failed step), "cancel" (abandon it), or "keep_own" (only when its raise offers it: its publication was refused over files it and a newer version changed differently; publish again keeping its version of them). Omit child_task_id to answer all waiting children. The answer is delivered when your current turn ends.',
     parameters: {
       type: 'object',
       properties: {
         child_task_id: { type: 'string', description: 'The raising child; omit to respond to all waiting children.' },
-        action: { type: 'string', enum: ['open_pr', 'confirm', 'comment', 'retry', 'cancel'] },
+        action: { type: 'string', enum: [...SUB_TASK_ACTIONS] },
         text: { type: 'string', description: 'For "comment": the message/answer/guidance to send down.' },
       },
       required: ['action'],
@@ -1127,11 +1127,11 @@ export function platformToolHandlers(
     },
     async respond_to_sub_task(args) {
       const action = String(args?.action ?? '');
-      if (!['open_pr', 'confirm', 'comment', 'retry', 'cancel'].includes(action))
-        return 'invalid action — use open_pr | confirm | comment | retry | cancel';
+      if (!(SUB_TASK_ACTIONS as readonly string[]).includes(action))
+        return `invalid action — use ${SUB_TASK_ACTIONS.join(' | ')}`;
       await ctx.respondToSubTask({
         childTaskId: args?.child_task_id ? String(args.child_task_id) : undefined,
-        action: action as 'open_pr' | 'confirm' | 'comment' | 'retry' | 'cancel',
+        action: action as SubTaskAction,
         text: args?.text ? String(args.text) : undefined,
       });
       return `${action} queued for sub-task${args?.child_task_id ? ` ${args.child_task_id}` : 's'}: delivered when this turn ends`;

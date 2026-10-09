@@ -3716,7 +3716,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       await deps.resources?.beginReview(taskId, reviewId);
     },
 
-    async settleResourceReview(taskId: string): Promise<void> {
+    /** `keepOwn`: files this task and a newer version changed differently keep
+     * this task's version (the person chose it on the conflict escalation). */
+    async settleResourceReview(taskId: string, choice: { keepOwn?: boolean } = {}): Promise<void> {
       let context: ReturnType<typeof activityContext.current> | undefined;
       try { context = activityContext.current(); } catch { /* direct tests */ }
       let progress: StagingProgress | undefined;
@@ -3727,6 +3729,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }, 5_000);
       try {
         await deps.resources?.settleReview(taskId, {
+          ...(choice.keepOwn ? { keepOwn: true } : {}),
           checkContinue: async () => { context?.cancellationSignal.throwIfAborted(); },
           // Publishing a changed resource is a save too: Review shows how far it has got.
           onProgress: (next) => {
