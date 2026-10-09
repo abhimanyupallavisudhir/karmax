@@ -35,3 +35,20 @@ describe('sub-task replies reach only the replying task’s children', () => {
     expect((await ownSubTaskResponses(store, parent.id, [{ childTaskId: victim.id, action: 'cancel' }])).kept).toBeUndefined();
   });
 });
+
+describe('respond_to_sub_task', () => {
+  // A parent agent answers a sub-task's refused publication the way a person
+  // can on the sub-task: keeping the sub-task's version of conflicting files.
+  it('offers and queues keep_own', async () => {
+    const { TOOL_SCHEMAS, platformToolHandlers } = await import('../src/agent/tools.js');
+    const schema = TOOL_SCHEMAS.find((tool) => tool.name === 'respond_to_sub_task')!;
+    expect((schema.parameters as any).properties.action.enum).toContain('keep_own');
+    expect(schema.description).toMatch(/"keep_own"/);
+    const responses: unknown[] = [];
+    const handlers = platformToolHandlers({ handle: { id: 'task', root: '/w', branch: 'b', base: 'main' } } as any,
+      { respondToSubTask: (r: unknown) => { responses.push(r); } } as any);
+    expect(await handlers.respond_to_sub_task!({ action: 'keep_own', child_task_id: 'child' })).toMatch(/keep_own queued/);
+    expect(responses).toEqual([{ childTaskId: 'child', action: 'keep_own', text: undefined }]);
+    expect(await handlers.respond_to_sub_task!({ action: 'merge' })).toMatch(/invalid action — use open_pr \| confirm \| comment \| retry \| cancel \| keep_own/);
+  });
+});

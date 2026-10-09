@@ -148,6 +148,28 @@ describe('combining publications of one resource', () => {
     expect(await f.published()).toEqual({ 'index.txt': 'one', 'keep.txt': 'edited', 'from-one.txt': '1', 'from-two.txt': '2' });
   }, 180_000);
 
+  // pramana#3 (2026-10-09): 7,854 OCR pages were added both by the published
+  // version and by the task, differently (two runs of the same LLM cleanup).
+  // The only way out was to remove the task's copy, though its copy was the
+  // one its database had been built from.
+  it('publishes this task\'s version of files both changed when asked, and everything else merged as usual', async () => {
+    const f = await fixture({ 'index.txt': 'v1', 'keep.txt': 'k' });
+    const one = await f.task('One');
+    const two = await f.task('Two');
+    await f.write(one.world, 'pages/p1.txt', 'run one');
+    await f.write(one.world, 'from-one.txt', '1');
+    await f.write(two.world, 'pages/p1.txt', 'run two');
+    await f.write(two.world, 'index.txt', 'v2');
+    await f.publish(one.task.id, 'one');
+    await expect(f.publish(two.task.id, 'two')).rejects.toBeInstanceOf(ResourceConflictError);
+
+    await f.resources.beginReview(two.task.id, 'two-keep');
+    await f.resources.settleReview(two.task.id, { keepOwn: true });
+    const expected = { 'index.txt': 'v2', 'keep.txt': 'k', 'from-one.txt': '1', 'pages/p1.txt': 'run two' };
+    expect(await f.published()).toEqual(expected);
+    expect(f.inWorld(two.world)).toEqual(expected);
+  }, 180_000);
+
   it('publishes a copy restored from a park, which starts from a checkpoint capture', async () => {
     const f = await fixture({ 'index.txt': 'v1' });
     const worker = await f.task('Worker');

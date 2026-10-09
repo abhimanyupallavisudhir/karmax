@@ -1,6 +1,5 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
-import path from 'node:path';
 import process from 'node:process';
 import type { Api } from '../api.js';
 import { environmentOf, secretValues, writeSecretFiles } from '../secrets.js';
@@ -43,7 +42,7 @@ export async function setup(workspace: Workspace, out: Output): Promise<number> 
   if (!install.length) { out.result({ ran: [] }, 'This project has no install commands.'); return 0; }
   const ran: string[] = [];
   for (const { repository, commands } of install) {
-    const cwd = path.join(workspace.root, repository);
+    const cwd = workspace.checkout(repository);
     if (!fs.existsSync(cwd)) { out.warn(`${repository} is not cloned; skipping its install commands`); continue; }
     for (const command of commands) {
       out.info(`[${repository}] $ ${command}`);

@@ -58,6 +58,42 @@ describe('CI workflow', () => {
   });
 });
 
+// CI #1709 failed only on Docker Hub's anonymous pull limit (429). Every job
+// that pulls from Docker Hub logs in first, except on fork pull requests, which
+// get no secrets and must still run.
+describe('Docker Hub login', () => {
+  type Step = {
+    name?: string; if?: string; uses?: string; run?: string; with?: Record<string, string>; 'continue-on-error'?: boolean;
+  };
+  const login = (steps: Step[]) => steps.findIndex((step) => step.uses?.startsWith('docker/login-action@'));
+
+  it.each([
+    ['test', 'npm test -- --shard='],
+    ['deploy-artifacts', './deploy/karmax up '],
+  ])('%s logs in, pinned, skipped without the secret and best-effort, before it pulls', (name, pull) => {
+    const job = ci.jobs[name];
+    const steps: Step[] = job.steps;
+    const index = login(steps);
+    expect(index).toBeGreaterThanOrEqual(0);
+    expect(index).toBeLessThan(steps.findIndex((step) => step.run?.startsWith(pull)));
+    const step = steps[index]!;
+    expect(step.uses).toMatch(/^docker\/login-action@[0-9a-f]{40}$/);
+    expect(job.env.DOCKERHUB_USERNAME).toBe('${{ secrets.DOCKERHUB_USERNAME }}');
+    expect(step.if).toContain("env.DOCKERHUB_USERNAME != ''");
+    expect(step.with).toEqual({ username: '${{ env.DOCKERHUB_USERNAME }}', password: '${{ secrets.DOCKERHUB_TOKEN }}' });
+    // CI #1713: Docker Hub's authenticated path failed while anonymous pulls
+    // worked; a failed login must fall back to them, not fail the job.
+    expect(step['continue-on-error']).toBe(true);
+  });
+
+  // A service whose registry login fails fails the job before any step, with
+  // no anonymous fallback.
+  it('pulls the test shards\' services anonymously', () => {
+    for (const service of Object.values<any>(ci.jobs.test.services))
+      expect(service.credentials).toBeUndefined();
+  });
+});
+
 describe('deploy artifacts', () => {
   type Step = { id?: string; name?: string; if?: string; run?: string; env?: Record<string, string> };
   const steps: Step[] = ci.jobs['deploy-artifacts'].steps;

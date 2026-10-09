@@ -967,6 +967,28 @@ describe('task stage transitions', () => {
     expect(f.signalled.filter((s) => s.signal === 'followUp')).toHaveLength(1);
   });
 
+  /** #533/#454: a sub-task's question passed on to people stops waiting on its
+   * parent, which must not keep being prompted to answer it. */
+  it("releases the parent when its sub-task's question is passed on to people", async () => {
+    const f = (await fixture());
+    const parent = (await f.store.createTask({ projectId: f.project.id, title: 'Parent', workflow: 'software-dev',
+      workflowVersion: '1.27.0', createdBy: { kind: 'user', userId: 'test' }, params: { prompt: 'parent', base: 'main', target: 'main' } }));
+    (await f.store.saveView(parent.id, { ...f.view, taskId: parent.id, title: 'Parent' }));
+    const child = (await f.store.createTask({ projectId: f.project.id, title: 'Child', workflow: 'software-dev',
+      workflowVersion: '1.27.0', parentTaskId: parent.id, createdBy: { kind: 'task-agent', taskId: parent.id, role: 'do' },
+      params: { prompt: 'child work', base: 'main', target: 'main' } }));
+    const waiting: TaskView = { ...f.view, taskId: child.id, title: 'Child', status: 'waiting',
+      waitingFor: { kind: 'parent', detail: 'Which region?' } };
+    (await f.store.saveView(child.id, waiting));
+    f.setLiveView(waiting);
+    const parentAgent = (await f.tokens.mint({ taskId: parent.id, profileId: 'do', role: 'do',
+      principal: `task-agent:${parent.id}:do`, projectId: f.project.id, ceiling: ['task:escalate'], grantorCaps: ['task:escalate'] })).token;
+    (await f.api.escalateToHuman(parentAgent, { taskId: child.id, audience: ['@creator'], message: 'Only you know the region.' }));
+    expect(f.signalled.filter((s) => s.id === child.id).map((s) => s.signal)).toEqual(['reroute']);
+    expect(f.signalled.filter((s) => s.id === parent.id)).toEqual([
+      expect.objectContaining({ signal: 'subtaskRedirected', args: [{ childTaskId: child.id }] })]);
+  });
+
   it('rejects an escalation to a missing audience and prevents an agent escalating another task', async () => {
     const f = (await fixture());
     const agentToken = (await f.tokens.mint({

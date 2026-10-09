@@ -51,7 +51,7 @@ vi.mock('@temporalio/workflow', async (importOriginal) => ({
 }));
 import { justDoV1_7 } from '../src/workflows/just-do.js';
 import { mergeOnlyV1_7 } from '../src/workflows/merge-only.js';
-import { softwareDevV1_20, softwareDevV1_26, softwareDevV1_27 } from '../src/workflows/software-dev.js';
+import { softwareDevV1_20, softwareDevV1_26, softwareDevV1_27, subtaskRaiseText } from '../src/workflows/software-dev.js';
 import { createAgentTurnLeaser } from '../src/workflows/agent-turn-lease.js';
 import { makeTurnPreparationActivities } from '../src/activities/turn-preparation.js';
 
@@ -842,6 +842,75 @@ describe('resource publication by sub-tasks', () => {
     expect(wf.activities.settleResourceReview).toHaveBeenCalledTimes(2);
     expect(result.stage).toBe('done');
     expect(views.at(-1).error).toBeUndefined();
+  });
+
+  // pramana#3 (2026-10-09): 7,854 pages both sides had added differently; the
+  // escalation's only way forward was removing the task's copy.
+  it('offers to keep this task\'s version of conflicting files, and publishes with it', async () => {
+    const views = reviewAndConfirm();
+    const refused = Object.assign(new Error('Activity task failed'), { cause: Object.assign(new Error(conflict), { type: 'resource-conflict' }) });
+    wf.activities.settleResourceReview = vi.fn()
+      .mockRejectedValueOnce(refused)
+      .mockResolvedValue(undefined);
+    let escalated: any;
+    wf.wait = () => {
+      const view = wf.handlers.get('view')!();
+      if (view.stage !== 'escalated' || escalated) return;
+      escalated = view;
+      wf.handlers.get('keepOwnResources')!();
+    };
+    const result = await softwareDevV1_27(child);
+    expect(escalated.actions.map((a: any) => a.name)).toEqual(expect.arrayContaining(['retry', 'keepOwnResources']));
+    expect(escalated.actions.find((a: any) => a.name === 'keepOwnResources').label).toBe('Keep this task’s version');
+    expect(escalated.error).toMatch(/or keep this task’s version of those files\.$/);
+    expect(wf.activities.settleResourceReview.mock.calls).toEqual([['child'], ['child', { keepOwn: true }]]);
+    expect(result.stage).toBe('done');
+    expect(views.at(-1).actions.map((a: any) => a.name)).not.toContain('keepOwnResources');
+  });
+
+  // A sub-task's escalation goes to its parent, whose agent answers with
+  // respond_to_sub_task: it must have the same choice a person has.
+  it('offers its parent the version choice, and keeps its version when the parent says so', async () => {
+    reviewAndConfirm();
+    const refused = Object.assign(new Error('Activity task failed'), { cause: Object.assign(new Error(conflict), { type: 'resource-conflict' }) });
+    wf.activities.settleResourceReview = vi.fn()
+      .mockRejectedValueOnce(refused)
+      .mockResolvedValue(undefined);
+    let answered = false;
+    wf.wait = () => {
+      if (answered || wf.handlers.get('view')!().stage !== 'escalated') return;
+      answered = true;
+      wf.handlers.get('parentResponse')!({ action: 'keep_own' });
+    };
+    expect((await softwareDevV1_27(child)).stage).toBe('done');
+    expect(wf.childSignal).toHaveBeenCalledWith('raiseFromChild', expect.objectContaining({ type: 'blocked', choices: ['keep_own'] }));
+    expect(wf.activities.settleResourceReview.mock.calls).toEqual([['child'], ['child', { keepOwn: true }]]);
+  });
+
+  it('names the extra answers a raise accepts', () => {
+    const raise = { childTaskId: 'c', childTitle: 'OCR', type: 'blocked' as const, detail: 'Could not publish resources' };
+    // The answers come first; then how to pass a question only a person can answer on (#533/#454).
+    expect(subtaskRaiseText(raise)).toMatch(/\(confirm \| comment \| retry \| cancel\)\. If only a person can answer, .*task_id: "c"/);
+    expect(subtaskRaiseText({ ...raise, choices: ['keep_own'] }))
+      .toMatch(/\(confirm \| comment \| retry \| cancel \| keep_own: publish again keeping its version of the conflicting files\)\. If only a person/);
+  });
+
+  it('offers no version choice when publishing failed for another reason', async () => {
+    reviewAndConfirm();
+    wf.activities.settleResourceReview = vi.fn()
+      .mockRejectedValueOnce(Object.assign(new Error('Activity task failed'), { cause: new Error('resource store unavailable') }))
+      .mockResolvedValue(undefined);
+    let escalated: any;
+    wf.wait = () => {
+      const view = wf.handlers.get('view')!();
+      if (view.stage !== 'escalated' || escalated) return;
+      escalated = view;
+      wf.handlers.get('keepOwnResources')!(); // ignored: there is nothing to choose
+      wf.handlers.get('parentResponse')!({ action: 'retry' });
+    };
+    await softwareDevV1_27(child);
+    expect(escalated.actions.map((a: any) => a.name)).not.toContain('keepOwnResources');
+    expect(wf.activities.settleResourceReview.mock.calls).toEqual([['child'], ['child']]);
   });
 
   it('keeps histories recorded before the escalation failing the task', async () => {

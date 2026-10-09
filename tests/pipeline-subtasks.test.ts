@@ -174,6 +174,37 @@ describe('software-dev pipeline: sub-tasks and in-harness sub-agents (real Tempo
     expect((await git(repo, ['show', 'main:helper.txt'])).stdout).toContain('from child');
   }, 90_000);
 
+  /** #533/#454: the parent "relayed" its sub-task's question to the owner in its
+   * own reply, which reached nobody, and told it to wait. The raise says how to
+   * pass a question on, and a passed-on question stops waiting on the parent. */
+  it('a raise the parent passes on to people no longer waits on the parent', async () => {
+    const repo = await h.makeRepo('app-sub-redirect');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev@1.27.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [input({ taskId, repo, title: 'Parent', prompt: '@subtask Ask :: Which region?\\n@incomplete', subtaskNagMs: 1500 })],
+    });
+    await expect.poll(async () => (await view(handle)).subTasks?.length, { timeout: 30_000 }).toBe(1);
+    const childId = (await view(handle)).subTasks![0];
+    await parentSawRaise(handle, 'needs_confirmation');
+    const raise = ((await view(handle)).messages as any[]).findLast((m) => m.role === 'user' && m.text.includes('needs you'));
+    expect(raise.text).toContain(`escalate(to, note, task_id: "${childId}")`);
+    expect(raise.text).toContain('your own reply reaches nobody');
+
+    await handle.signal('subtaskRedirected', { childTaskId: childId });
+    const agentTurns = async () => ((await view(handle)).messages as any[]).filter((m) => m.role === 'agent').length;
+    // Let a nag that was already due land, then expect no more: three nag
+    // intervals pass without the parent being prompted again.
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+    const settled = await agentTurns();
+    await new Promise((resolve) => setTimeout(resolve, 5_000));
+    expect(await agentTurns()).toBe(settled);
+    expect((await view(handle)).waitingFor?.kind).toBe('subtask');
+    await handle.signal('cancel');
+    await handle.result();
+  }, 90_000);
+
   it('a stuck child raises "blocked" to its parent instead of deadlocking on a hidden human', async () => {
     const repo = await h.makeRepo('app-sub-fail');
     const taskId = newId('task');

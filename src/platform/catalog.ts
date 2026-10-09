@@ -143,7 +143,7 @@ export const PLATFORM_API_CATALOG = {
     'DELETE /api/projects/:projectId/repositories/:repositoryId',
     'GET|POST /api/organizations/:organizationId/repositories',
     'GET|PUT /api/organizations/:organizationId/cli-git-credentials (PUT organization:edit; body {enabled}; lets members\' `tavya` Git use the organization\'s GitHub App, off by default)',
-    'POST /api/organizations/:organizationId/repositories/create (verified human subject; uses the explicitly scoped GitHub account or the represented user’s active account)',
+    'POST /api/organizations/:organizationId/repositories/create (verified human subject; body {gitConnectionId, name, private?, autoInit?, defaultBranch?, description?}; uses the explicitly scoped GitHub account or the represented user’s active account)',
     'GET /api/organizations/:organizationId/git-connections',
     'GET|PUT /api/organizations/:organizationId/github/app',
     'POST /api/organizations/:organizationId/github/app-manifest|install-url|authorize (verified user subject; delegation accepted for OAuth/install redirects); refresh is capability-only',

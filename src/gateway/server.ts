@@ -64,6 +64,7 @@ import { expandPath } from '../util/expand.js';
 import { withTimeout } from '../util/timeout.js';
 import { AgentAuthority, AgentSpec, AuthorizationSelection, Avatar, Provider, Project, ProjectConfig, PrincipalRef, ProjectPrincipalRef, ResourceAttachment, ResourceRevision, ResourceTarget, normalizeUrgency } from '../domain/types.js';
 import { confirmLayersOf } from '../domain/confirm.js';
+import { parseEnvironmentValues } from '../domain/dotenv.js';
 import { ReviewActionRunner } from './review-actions.js';
 import { MIN_CLI_VERSION, WorkspaceService } from '../world/workspace.js';
 import { WorkspaceConflict } from '../world/resources.js';
@@ -3278,7 +3279,8 @@ export class Gateway {
           const githubAccountId = subject.externalIdentities?.githubAccountId;
           return this.json(res, 200, await this.deps.githubApp.createRepository(connection.id, subject.userId,
             { name: String(b.name ?? ''), description: b.description ? String(b.description) : undefined,
-              private: b.private !== false, autoInit: b.autoInit !== false }, { accountId: githubAccountId }));
+              private: b.private !== false, autoInit: b.autoInit !== false,
+              ...(b.defaultBranch ? { defaultBranch: String(b.defaultBranch) } : {}) }, { accountId: githubAccountId }));
         } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
       }
       const organizationProjects = p.match(/^\/api\/organizations\/([^/]+)\/projects$/);
@@ -10268,22 +10270,6 @@ async function discoverEnvironmentNames(project: Project, store: Store,
     if (text) add(text);
   }
   return names;
-}
-
-function parseEnvironmentValues(text: string): Array<{ name: string; value: string }> {
-  const values: Array<{ name: string; value: string }> = [];
-  for (const raw of text.split('\n')) {
-    const line = raw.trim();
-    if (!line || line.startsWith('#')) continue;
-    const match = line.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
-    if (!match) continue;
-    let value = match[2]!.trim();
-    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))
-      value = value.slice(1, -1);
-    else value = value.replace(/\s+#.*$/, '');
-    if (value) values.push({ name: match[1]!, value });
-  }
-  return values;
 }
 
 function redactResource(resource: ResourceAttachment): Omit<ResourceAttachment, 'credentialHandles'> & { credentialConfigured: boolean } {
