@@ -81,8 +81,9 @@ describe('tag chips in the task picker', () => {
 });
 
 // Forking is not confined to the open project: the agent picker searches the
-// organization, starting at `project:<this project>`; clearing that token
-// reaches every project, whose rows say where they are.
+// organization, starting at `project:<this project> ` (a trailing space, so
+// typing adds a clause); clearing that token reaches every project, whose rows
+// say where they are.
 describe('fork picker across projects', () => {
   it('starts at this project and widens to the organization', async () => {
     const queries: string[] = [];
@@ -103,9 +104,12 @@ describe('fork picker across projects', () => {
     await ui.page.locator('#main').waitFor();
     await ui.run(`openTaskPicker({ title: 'Fork a previous agent', mode: 'agent', defaults: ['run'], onPick: () => {} })`);
     const search = ui.page.locator('#pk-search');
-    await expect.poll(() => search.inputValue()).toBe('project:workspace');
+    await expect.poll(() => search.inputValue()).toBe('project:workspace ');
     await ui.page.locator('#pk-list .pick-row').filter({ hasText: 'Here' }).waitFor();
     expect(queries[0]).toContain('project:workspace');
+    await ui.page.keyboard.type('fix');
+    expect(await search.inputValue()).toBe('project:workspace fix');
+    await expect.poll(() => queries.at(-1)).toContain('project:workspace fix');
     await search.fill('');
     const elsewhere = ui.page.locator('#pk-list .pick-row').filter({ hasText: 'Elsewhere' });
     await elsewhere.waitFor();
