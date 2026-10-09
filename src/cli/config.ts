@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -86,6 +87,27 @@ export class Credentials {
   }
 
   setDefault(server: string): void { const data = this.read(); data.default = server; this.write(data); }
+
+  /**
+   * Run `fn` while no other tavya process is renewing this server's sign-in.
+   * The server revokes a sign-in whose refresh token is presented twice, so two
+   * processes must never renew from the same token. A lock older than 30 s
+   * belongs to a process that died and is taken over.
+   */
+  async exclusive<T>(server: string, fn: () => Promise<T>): Promise<T> {
+    fs.mkdirSync(path.dirname(this.file), { recursive: true, mode: 0o700 });
+    const lock = path.join(path.dirname(this.file), `renew-${crypto.createHash('sha256').update(server).digest('hex').slice(0, 16)}.lock`);
+    for (;;) {
+      try { fs.writeFileSync(lock, String(process.pid), { flag: 'wx', mode: 0o600 }); break; } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        let age = 0;
+        try { age = Date.now() - fs.statSync(lock).mtimeMs; } catch { continue; }
+        if (age > 30_000) { fs.rmSync(lock, { force: true }); continue; }
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
+    try { return await fn(); } finally { fs.rmSync(lock, { force: true }); }
+  }
 
   remove(server: string): void {
     const data = this.read();
