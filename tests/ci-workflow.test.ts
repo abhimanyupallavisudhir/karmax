@@ -58,6 +58,39 @@ describe('CI workflow', () => {
   });
 });
 
+// CI #1709 failed only on Docker Hub's anonymous pull limit (429). Every job
+// that pulls from Docker Hub logs in first, except on fork pull requests, which
+// get no secrets and must still run.
+describe('Docker Hub login', () => {
+  type Step = { name?: string; if?: string; uses?: string; run?: string; with?: Record<string, string> };
+  const login = (steps: Step[]) => steps.findIndex((step) => step.uses?.startsWith('docker/login-action@'));
+
+  it.each([
+    ['test', 'npm test -- --shard='],
+    ['deploy-artifacts', './deploy/karmax up '],
+  ])('%s logs in, pinned and skipped without the secret, before it pulls', (name, pull) => {
+    const job = ci.jobs[name];
+    const steps: Step[] = job.steps;
+    const index = login(steps);
+    expect(index).toBeGreaterThanOrEqual(0);
+    expect(index).toBeLessThan(steps.findIndex((step) => step.run?.startsWith(pull)));
+    const step = steps[index]!;
+    expect(step.uses).toMatch(/^docker\/login-action@[0-9a-f]{40}$/);
+    expect(job.env.DOCKERHUB_USERNAME).toBe('${{ secrets.DOCKERHUB_USERNAME }}');
+    expect(step.if).toContain("env.DOCKERHUB_USERNAME != ''");
+    expect(step.with).toEqual({ username: '${{ env.DOCKERHUB_USERNAME }}', password: '${{ secrets.DOCKERHUB_TOKEN }}' });
+  });
+
+  // Services are pulled before any step runs; the runner skips the login when
+  // the credentials are empty.
+  it('pulls the test shards\' services with the same credentials', () => {
+    for (const service of Object.values<any>(ci.jobs.test.services))
+      expect(service.credentials).toEqual({
+        username: '${{ secrets.DOCKERHUB_USERNAME }}', password: '${{ secrets.DOCKERHUB_TOKEN }}',
+      });
+  });
+});
+
 describe('deploy artifacts', () => {
   type Step = { id?: string; name?: string; if?: string; run?: string; env?: Record<string, string> };
   const steps: Step[] = ci.jobs['deploy-artifacts'].steps;
