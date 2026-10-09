@@ -30,6 +30,7 @@ if (role !== 'other') {
     const loop = monitorEventLoopDelay({ resolution: 10 });
     loop.enable();
     let gcMs = 0, gcCount = 0, majorMs = 0;
+    let cpu = process.cpuUsage(), cpuAt = performance.now();
     try {
       new PerformanceObserver((list) => {
         for (const entry of list.getEntries()) {
@@ -49,7 +50,10 @@ if (role !== 'other') {
         heapLimit: heap.heap_size_limit, mallocked: heap.malloced_memory,
         eldP50: loop.percentile(50) / 1e6, eldP99: loop.percentile(99) / 1e6, eldMax: loop.max / 1e6,
         gcMs: Math.round(gcMs), gcCount, majorGcMs: Math.round(majorMs),
+        // CPU this process used over the interval, in percent of one core.
+        cpuPct: Math.round(((process.cpuUsage(cpu).user + process.cpuUsage(cpu).system) / 1000 / (performance.now() - cpuAt)) * 1000) / 10,
       };
+      cpu = process.cpuUsage(); cpuAt = performance.now();
       loop.reset(); gcMs = 0; gcCount = 0; majorMs = 0;
       try { fs.appendFileSync(file, `${JSON.stringify(line)}\n`); } catch { /* disk full: keep running */ }
     };

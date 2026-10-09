@@ -186,10 +186,10 @@ function stepRow(step: Json, samples: Json[], probes: Json[]) {
     appRestarts: max(finite(docker.map((d) => d.states?.app?.restarts))), appOomKilled: docker.some((d) => d.states?.app?.oomKilled),
     gateway: { heapUsedMaxMb: mb(max(finite(gateway.map((p) => p.heapUsed)))), heapLimitMb: mb(max(finite(gateway.map((p) => p.heapLimit)))),
       rssMaxMb: mb(max(finite(gateway.map((p) => p.rss)))), eldP99MaxMs: round(max(finite(gateway.map((p) => p.eldP99))), 1),
-      eldMaxMs: round(max(finite(gateway.map((p) => p.eldMax)))), gcPct: round(100 * (gcShare(gateway) ?? NaN), 1), pids: new Set(gateway.map((p) => p.pid)).size },
+      eldMaxMs: round(max(finite(gateway.map((p) => p.eldMax)))), cpuMeanPct: round(mean(finite(gateway.map((p) => p.cpuPct)))), gcPct: round(100 * (gcShare(gateway) ?? NaN), 1), pids: new Set(gateway.map((p) => p.pid)).size },
     worker: { heapUsedMaxMb: mb(max(finite(worker.map((p) => p.heapUsed)))), heapLimitMb: mb(max(finite(worker.map((p) => p.heapLimit)))),
       rssMaxMb: mb(max(finite(worker.map((p) => p.rss)))), eldP99MaxMs: round(max(finite(worker.map((p) => p.eldP99))), 1),
-      eldMaxMs: round(max(finite(worker.map((p) => p.eldMax)))), gcPct: round(100 * (gcShare(worker) ?? NaN), 1), pids: new Set(worker.map((p) => p.pid)).size },
+      eldMaxMs: round(max(finite(worker.map((p) => p.eldMax)))), cpuMeanPct: round(mean(finite(worker.map((p) => p.cpuPct)))), gcPct: round(100 * (gcShare(worker) ?? NaN), 1), pids: new Set(worker.map((p) => p.pid)).size },
     postgres: {
       connectionsMax: max(connections), karmaxConnectionsMax: max(karmaxConnections), maxConnections: pg[0]?.maxConnections,
       lockWaitersMax: max(finite(pg.map((p) => p.lockWaiting))), advisoryWaitersMax: max(finite(pg.map((p) => p.advisoryWaiting))),

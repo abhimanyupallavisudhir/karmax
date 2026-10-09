@@ -1,0 +1,1604 @@
+{
+ "run": {
+  "runId": "loadtest-20261009T225523Z-c5d9",
+  "ref": "45522f01",
+  "sha": "45522f01a941d235926bede16179d1ab6648351c",
+  "label": "baseline",
+  "region": "eu-central-1",
+  "sutType": "c7i.xlarge",
+  "worldType": "c7i.2xlarge",
+  "worldRttMs": 50,
+  "holdSeconds": 300,
+  "maxMinutes": 180,
+  "steps": "default",
+  "driverArgs": "",
+  "startedAt": "2026-10-09T22:55:23Z"
+ },
+ "cost": {
+  "instances": [
+   {
+    "instance": "i-0740d42ba32d81a05",
+    "role": "sut",
+    "type": "c7i.xlarge",
+    "hours": 0.585,
+    "diskGb": 40,
+    "computeUsd": 0.119,
+    "storageUsd": 0.0031,
+    "ipv4Usd": 0.0029
+   },
+   {
+    "instance": "i-0424e2a2110884246",
+    "role": "world",
+    "type": "c7i.2xlarge",
+    "hours": 0.584,
+    "diskGb": 80,
+    "computeUsd": 0.238,
+    "storageUsd": 0.0061,
+    "ipv4Usd": 0.0029
+   }
+  ],
+  "totalUsd": 0.372,
+  "prices": "eu-central-1 on-demand list prices checked 2026-10-08; data transfer inside one AZ is free"
+ },
+ "steps": [
+  {
+   "step": 1,
+   "tenants": 4,
+   "teams": 1,
+   "people": 6,
+   "sockets": 12,
+   "openTasks": 9,
+   "tasksInTurn": 5,
+   "tasksAtReview": 4,
+   "runningWorkflows": 13,
+   "sandboxes": {
+    "running": 5,
+    "paused": 7
+   },
+   "setupSeconds": 4,
+   "failedSetups": 0,
+   "requestsPerSecond": 1.1,
+   "requests": 319,
+   "errorRatePct": 0,
+   "rateLimited": 0,
+   "clientErrors": 0,
+   "api": {
+    "n": 319,
+    "p50": 16,
+    "p95": 63,
+    "p99": 595,
+    "max": 645
+   },
+   "eventLag": {
+    "n": 3884,
+    "p50": 6,
+    "p95": 18,
+    "p99": 25,
+    "max": 49
+   },
+   "turnOverhead": {
+    "n": 31,
+    "p50": 1576,
+    "p95": 1767,
+    "p99": 2146,
+    "max": 2146
+   },
+   "firstTurn": {
+    "n": 20,
+    "p50": 27646,
+    "p95": 41377,
+    "p99": 41377,
+    "max": 41377
+   },
+   "approveToDone": {
+    "n": 10,
+    "p50": 218,
+    "p95": 256,
+    "p99": 256,
+    "max": 256
+   },
+   "cancelToCancelled": {
+    "n": 3,
+    "p50": 80,
+    "p95": 80,
+    "p99": 80,
+    "max": 80
+   },
+   "wsConnect": {
+    "n": 2,
+    "p50": 13,
+    "p95": 13,
+    "p99": 13,
+    "max": 13
+   },
+   "tenantSetup": {
+    "n": 4,
+    "p50": 4129,
+    "p95": 4495,
+    "p99": 4495,
+    "max": 4495
+   },
+   "tasks": {
+    "created": 22,
+    "turns": 31,
+    "done": 10,
+    "cancelled": 3,
+    "failed": 0,
+    "stuck": 0,
+    "followUps": 14,
+    "resourceSaves": 6
+   },
+   "sockets_": {
+    "opens": 0,
+    "refused": 0,
+    "failures": 0,
+    "drops": 0,
+    "closes": {},
+    "events": 3886
+   },
+   "slowestRoutes": [
+    {
+     "route": "POST /api/projects/:id/resources/:id/import",
+     "n": 6,
+     "p50": 610,
+     "p95": 645,
+     "p99": 645,
+     "max": 645
+    },
+    {
+     "route": "POST /api/projects/:id/tasks",
+     "n": 22,
+     "p50": 63,
+     "p95": 70,
+     "p99": 75,
+     "max": 75
+    },
+    {
+     "route": "POST /api/tasks/:id/signal",
+     "n": 27,
+     "p50": 41,
+     "p95": 55,
+     "p99": 62,
+     "max": 62
+    },
+    {
+     "route": "GET /api/tasks/:id/conversation",
+     "n": 35,
+     "p50": 19,
+     "p95": 32,
+     "p99": 39,
+     "max": 39
+    },
+    {
+     "route": "GET /api/tasks/:id",
+     "n": 35,
+     "p50": 20,
+     "p95": 31,
+     "p99": 60,
+     "max": 60
+    },
+    {
+     "route": "GET /api/projects/:id/tasks",
+     "n": 43,
+     "p50": 18,
+     "p95": 24,
+     "p99": 40,
+     "max": 40
+    }
+   ],
+   "hostCpuPct": {
+    "mean": 8,
+    "max": 59,
+    "steal": 0.1,
+    "iowait": 2.5
+   },
+   "load1Max": 1.24,
+   "hostMemAvailableMinMb": 5811,
+   "containers": {
+    "app": {
+     "cpuMeanPct": 11,
+     "cpuMaxPct": 63,
+     "memMaxMb": 816,
+     "memLimitMb": 4096
+    },
+    "postgresql": {
+     "cpuMeanPct": 8,
+     "cpuMaxPct": 24,
+     "memMaxMb": 211,
+     "memLimitMb": 768
+    },
+    "temporal": {
+     "cpuMeanPct": 7,
+     "cpuMaxPct": 23,
+     "memMaxMb": 129,
+     "memLimitMb": 2048
+    },
+    "caddy": {
+     "cpuMeanPct": 0,
+     "cpuMaxPct": 1,
+     "memMaxMb": 21,
+     "memLimitMb": 512
+    }
+   },
+   "appRestarts": 0,
+   "appOomKilled": false,
+   "gateway": {
+    "heapUsedMaxMb": 128,
+    "heapLimitMb": 2096,
+    "rssMaxMb": 423,
+    "eldP99MaxMs": 13.1,
+    "eldMaxMs": 206,
+    "gcPct": 0.1,
+    "pids": 1
+   },
+   "worker": {
+    "heapUsedMaxMb": 112,
+    "heapLimitMb": 2096,
+    "rssMaxMb": 409,
+    "eldP99MaxMs": 15.6,
+    "eldMaxMs": 192,
+    "gcPct": 0.1,
+    "pids": 1
+   },
+   "postgres": {
+    "connectionsMax": 48,
+    "karmaxConnectionsMax": 9,
+    "maxConnections": 100,
+    "lockWaitersMax": 0,
+    "advisoryWaitersMax": 0,
+    "advisoryWaitersMean": 0,
+    "advisoryWaitMaxMs": 0,
+    "longestXactMs": 9,
+    "karmaxCommitsPerSecond": 168,
+    "karmaxDbMb": 14
+   },
+   "appGauges": {
+    "karmax_database_bytes": 14629911,
+    "karmax_http_inflight": 3,
+    "karmax_process_rss_bytes": 440279040,
+    "karmax_event_loop_delay_seconds{quantile=\"0.95\"}": 0.021299199,
+    "karmax_event_loop_delay_seconds{quantile=\"0.99\"}": 0.022167551,
+    "karmax_event_loop_delay_max_seconds": 0.200671231,
+    "karmax_database_pending": 1,
+    "karmax_database_connections": 4,
+    "karmax_database_waiting": 0
+   },
+   "metricsScrapeMaxMs": 76,
+   "temporal": {
+    "backlogAgeMaxMs": 0,
+    "backlogCountMax": 0,
+    "scheduleToStart": {
+     "workflow": {
+      "count": 671,
+      "meanMs": 5.2,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "activity": {
+      "count": 592,
+      "meanMs": 5.2,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     }
+    },
+    "serverLatency": {
+     "persistence_latency": {
+      "count": 7717,
+      "meanMs": 1.8,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "syncmatch_latency": {
+      "count": 1282,
+      "meanMs": 4.2,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_dispatch_latency": {
+      "count": 1302,
+      "meanMs": 4,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency": {
+      "count": 1541,
+      "meanMs": 4.2,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency_load": {
+      "count": 2944,
+      "meanMs": 2.4,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency_processing": {
+      "count": 2928,
+      "meanMs": 2.3,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency_queue": {
+      "count": 1541,
+      "meanMs": 8.7,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency_schedule": {
+      "count": 2928,
+      "meanMs": 0,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_schedule_to_start_latency": {
+      "count": 1263,
+      "meanMs": 5.2,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "workflow_task_attempt": {
+      "count": 671,
+      "meanMs": 1000,
+      "p50Ms": 500,
+      "p95Ms": 950
+     }
+    }
+   },
+   "broken": [],
+   "errorSamples": []
+  },
+  {
+   "step": 2,
+   "tenants": 8,
+   "teams": 2,
+   "people": 12,
+   "sockets": 24,
+   "openTasks": 20,
+   "tasksInTurn": 4,
+   "tasksAtReview": 16,
+   "runningWorkflows": 25,
+   "sandboxes": {
+    "running": 4,
+    "paused": 31
+   },
+   "setupSeconds": 5,
+   "failedSetups": 0,
+   "requestsPerSecond": 2.5,
+   "requests": 750,
+   "errorRatePct": 0,
+   "rateLimited": 0,
+   "clientErrors": 0,
+   "api": {
+    "n": 750,
+    "p50": 15,
+    "p95": 62,
+    "p99": 91,
+    "max": 672
+   },
+   "eventLag": {
+    "n": 9240,
+    "p50": 6,
+    "p95": 19,
+    "p99": 27,
+    "max": 68
+   },
+   "turnOverhead": {
+    "n": 75,
+    "p50": 1512,
+    "p95": 1701,
+    "p99": 1834,
+    "max": 1834
+   },
+   "firstTurn": {
+    "n": 44,
+    "p50": 27893,
+    "p95": 39042,
+    "p99": 41222,
+    "max": 41222
+   },
+   "approveToDone": {
+    "n": 22,
+    "p50": 209,
+    "p95": 256,
+    "p99": 359,
+    "max": 359
+   },
+   "cancelToCancelled": {
+    "n": 12,
+    "p50": 69,
+    "p95": 104,
+    "p99": 104,
+    "max": 104
+   },
+   "wsConnect": {
+    "n": 6,
+    "p50": 23,
+    "p95": 31,
+    "p99": 31,
+    "max": 31
+   },
+   "tenantSetup": {
+    "n": 4,
+    "p50": 4048,
+    "p95": 5490,
+    "p99": 5490,
+    "max": 5490
+   },
+   "tasks": {
+    "created": 45,
+    "turns": 75,
+    "done": 22,
+    "cancelled": 12,
+    "failed": 0,
+    "stuck": 0,
+    "followUps": 29,
+    "resourceSaves": 6
+   },
+   "sockets_": {
+    "opens": 0,
+    "refused": 0,
+    "failures": 0,
+    "drops": 0,
+    "closes": {},
+    "events": 9246
+   },
+   "slowestRoutes": [
+    {
+     "route": "POST /api/projects/:id/resources/:id/import",
+     "n": 6,
+     "p50": 616,
+     "p95": 672,
+     "p99": 672,
+     "max": 672
+    },
+    {
+     "route": "POST /api/projects/:id/tasks",
+     "n": 45,
+     "p50": 64,
+     "p95": 80,
+     "p99": 91,
+     "max": 91
+    },
+    {
+     "route": "POST /api/tasks/:id/signal",
+     "n": 63,
+     "p50": 38,
+     "p95": 54,
+     "p99": 94,
+     "max": 94
+    },
+    {
+     "route": "GET /api/tasks/:id",
+     "n": 98,
+     "p50": 17,
+     "p95": 33,
+     "p99": 51,
+     "max": 51
+    },
+    {
+     "route": "GET /api/projects/:id/tasks",
+     "n": 104,
+     "p50": 16,
+     "p95": 25,
+     "p99": 42,
+     "max": 61
+    },
+    {
+     "route": "GET /api/tasks/:id/conversation",
+     "n": 98,
+     "p50": 17,
+     "p95": 25,
+     "p99": 31,
+     "max": 31
+    }
+   ],
+   "hostCpuPct": {
+    "mean": 13,
+    "max": 51,
+    "steal": 0.1,
+    "iowait": 3.1
+   },
+   "load1Max": 1.15,
+   "hostMemAvailableMinMb": 5710,
+   "containers": {
+    "app": {
+     "cpuMeanPct": 21,
+     "cpuMaxPct": 68,
+     "memMaxMb": 839,
+     "memLimitMb": 4096
+    },
+    "postgresql": {
+     "cpuMeanPct": 13,
+     "cpuMaxPct": 38,
+     "memMaxMb": 228,
+     "memLimitMb": 768
+    },
+    "temporal": {
+     "cpuMeanPct": 10,
+     "cpuMaxPct": 35,
+     "memMaxMb": 153,
+     "memLimitMb": 2048
+    },
+    "caddy": {
+     "cpuMeanPct": 0,
+     "cpuMaxPct": 2,
+     "memMaxMb": 28,
+     "memLimitMb": 512
+    }
+   },
+   "appRestarts": 0,
+   "appOomKilled": false,
+   "gateway": {
+    "heapUsedMaxMb": 138,
+    "heapLimitMb": 2096,
+    "rssMaxMb": 432,
+    "eldP99MaxMs": 12.6,
+    "eldMaxMs": 28,
+    "gcPct": 0.1,
+    "pids": 1
+   },
+   "worker": {
+    "heapUsedMaxMb": 101,
+    "heapLimitMb": 2096,
+    "rssMaxMb": 432,
+    "eldP99MaxMs": 15.2,
+    "eldMaxMs": 32,
+    "gcPct": 0.2,
+    "pids": 1
+   },
+   "postgres": {
+    "connectionsMax": 50,
+    "karmaxConnectionsMax": 11,
+    "maxConnections": 100,
+    "lockWaitersMax": 0,
+    "advisoryWaitersMax": 0,
+    "advisoryWaitersMean": 0,
+    "advisoryWaitMaxMs": 0,
+    "longestXactMs": 3,
+    "karmaxCommitsPerSecond": 400.3,
+    "karmaxDbMb": 18
+   },
+   "appGauges": {
+    "karmax_database_bytes": 18734103,
+    "karmax_http_inflight": 1,
+    "karmax_process_rss_bytes": 453263360,
+    "karmax_event_loop_delay_seconds{quantile=\"0.95\"}": 0.021266431,
+    "karmax_event_loop_delay_seconds{quantile=\"0.99\"}": 0.021463039,
+    "karmax_event_loop_delay_max_seconds": 0.200671231,
+    "karmax_database_pending": 1,
+    "karmax_database_connections": 4,
+    "karmax_database_waiting": 0
+   },
+   "metricsScrapeMaxMs": 64,
+   "temporal": {
+    "backlogAgeMaxMs": 0,
+    "backlogCountMax": 0,
+    "scheduleToStart": {
+     "workflow": {
+      "count": 1429,
+      "meanMs": 5.1,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "activity": {
+      "count": 1256,
+      "meanMs": 5.2,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     }
+    },
+    "serverLatency": {
+     "persistence_latency": {
+      "count": 14562,
+      "meanMs": 1.9,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "syncmatch_latency": {
+      "count": 2716,
+      "meanMs": 4.2,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_dispatch_latency": {
+      "count": 2760,
+      "meanMs": 4,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency": {
+      "count": 3248,
+      "meanMs": 4.2,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency_load": {
+      "count": 6822,
+      "meanMs": 2.2,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency_processing": {
+      "count": 6822,
+      "meanMs": 2.1,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency_queue": {
+      "count": 3248,
+      "meanMs": 8.7,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency_schedule": {
+      "count": 6822,
+      "meanMs": 0,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_schedule_to_start_latency": {
+      "count": 2685,
+      "meanMs": 5.1,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "workflow_task_attempt": {
+      "count": 1432,
+      "meanMs": 1000,
+      "p50Ms": 500,
+      "p95Ms": 950
+     }
+    }
+   },
+   "broken": [],
+   "errorSamples": []
+  },
+  {
+   "step": 3,
+   "tenants": 16,
+   "teams": 4,
+   "people": 24,
+   "sockets": 48,
+   "openTasks": 51,
+   "tasksInTurn": 11,
+   "tasksAtReview": 40,
+   "runningWorkflows": 51,
+   "sandboxes": {
+    "running": 11,
+    "paused": 78
+   },
+   "setupSeconds": 8,
+   "failedSetups": 0,
+   "requestsPerSecond": 4.3,
+   "requests": 1289,
+   "errorRatePct": 0,
+   "rateLimited": 0,
+   "clientErrors": 0,
+   "api": {
+    "n": 1289,
+    "p50": 15,
+    "p95": 65,
+    "p99": 538,
+    "max": 883
+   },
+   "eventLag": {
+    "n": 14850,
+    "p50": 6,
+    "p95": 29,
+    "p99": 44,
+    "max": 152
+   },
+   "turnOverhead": {
+    "n": 116,
+    "p50": 1643,
+    "p95": 1956,
+    "p99": 2191,
+    "max": 2264
+   },
+   "firstTurn": {
+    "n": 75,
+    "p50": 26761,
+    "p95": 40839,
+    "p99": 41532,
+    "max": 41532
+   },
+   "approveToDone": {
+    "n": 25,
+    "p50": 213,
+    "p95": 291,
+    "p99": 307,
+    "max": 307
+   },
+   "cancelToCancelled": {
+    "n": 22,
+    "p50": 77,
+    "p95": 112,
+    "p99": 133,
+    "max": 133
+   },
+   "wsConnect": {
+    "n": 6,
+    "p50": 23,
+    "p95": 28,
+    "p99": 28,
+    "max": 28
+   },
+   "tenantSetup": {
+    "n": 8,
+    "p50": 4674,
+    "p95": 7687,
+    "p99": 7687,
+    "max": 7687
+   },
+   "tasks": {
+    "created": 80,
+    "turns": 116,
+    "done": 25,
+    "cancelled": 22,
+    "failed": 0,
+    "stuck": 0,
+    "followUps": 44,
+    "resourceSaves": 23
+   },
+   "sockets_": {
+    "opens": 0,
+    "refused": 0,
+    "failures": 0,
+    "drops": 0,
+    "closes": {},
+    "events": 14856
+   },
+   "slowestRoutes": [
+    {
+     "route": "POST /api/projects/:id/resources/:id/import",
+     "n": 23,
+     "p50": 565,
+     "p95": 761,
+     "p99": 883,
+     "max": 883
+    },
+    {
+     "route": "POST /api/projects/:id/tasks",
+     "n": 80,
+     "p50": 65,
+     "p95": 91,
+     "p99": 130,
+     "max": 130
+    },
+    {
+     "route": "POST /api/tasks/:id/signal",
+     "n": 91,
+     "p50": 36,
+     "p95": 65,
+     "p99": 101,
+     "max": 101
+    },
+    {
+     "route": "GET /api/tasks/:id/conversation",
+     "n": 170,
+     "p50": 17,
+     "p95": 40,
+     "p99": 71,
+     "max": 82
+    },
+    {
+     "route": "GET /api/tasks/:id",
+     "n": 170,
+     "p50": 17,
+     "p95": 36,
+     "p99": 45,
+     "max": 88
+    },
+    {
+     "route": "GET /api/tasks/:id/events",
+     "n": 170,
+     "p50": 13,
+     "p95": 29,
+     "p99": 63,
+     "max": 65
+    }
+   ],
+   "hostCpuPct": {
+    "mean": 19,
+    "max": 32,
+    "steal": 0.1,
+    "iowait": 3.8
+   },
+   "load1Max": 1.45,
+   "hostMemAvailableMinMb": 5480,
+   "containers": {
+    "app": {
+     "cpuMeanPct": 35,
+     "cpuMaxPct": 89,
+     "memMaxMb": 907,
+     "memLimitMb": 4096
+    },
+    "postgresql": {
+     "cpuMeanPct": 21,
+     "cpuMaxPct": 54,
+     "memMaxMb": 252,
+     "memLimitMb": 768
+    },
+    "temporal": {
+     "cpuMeanPct": 14,
+     "cpuMaxPct": 46,
+     "memMaxMb": 167,
+     "memLimitMb": 2048
+    },
+    "caddy": {
+     "cpuMeanPct": 1,
+     "cpuMaxPct": 1,
+     "memMaxMb": 36,
+     "memLimitMb": 512
+    }
+   },
+   "appRestarts": 0,
+   "appOomKilled": false,
+   "gateway": {
+    "heapUsedMaxMb": 142,
+    "heapLimitMb": 2096,
+    "rssMaxMb": 444,
+    "eldP99MaxMs": 13.5,
+    "eldMaxMs": 29,
+    "gcPct": 0.3,
+    "pids": 1
+   },
+   "worker": {
+    "heapUsedMaxMb": 109,
+    "heapLimitMb": 2096,
+    "rssMaxMb": 462,
+    "eldP99MaxMs": 21.7,
+    "eldMaxMs": 33,
+    "gcPct": 0.3,
+    "pids": 1
+   },
+   "postgres": {
+    "connectionsMax": 49,
+    "karmaxConnectionsMax": 10,
+    "maxConnections": 100,
+    "lockWaitersMax": 0,
+    "advisoryWaitersMax": 0,
+    "advisoryWaitersMean": 0,
+    "advisoryWaitMaxMs": 0,
+    "longestXactMs": 13,
+    "karmaxCommitsPerSecond": 774.8,
+    "karmaxDbMb": 24
+   },
+   "appGauges": {
+    "karmax_database_bytes": 25279511,
+    "karmax_http_inflight": 3,
+    "karmax_process_rss_bytes": 465846272,
+    "karmax_event_loop_delay_seconds{quantile=\"0.95\"}": 0.021250047,
+    "karmax_event_loop_delay_seconds{quantile=\"0.99\"}": 0.021512191,
+    "karmax_event_loop_delay_max_seconds": 0.200671231,
+    "karmax_database_pending": 1,
+    "karmax_database_connections": 4,
+    "karmax_database_waiting": 0
+   },
+   "metricsScrapeMaxMs": 151,
+   "temporal": {
+    "backlogAgeMaxMs": 0,
+    "backlogCountMax": 0,
+    "scheduleToStart": {
+     "workflow": {
+      "count": 2285,
+      "meanMs": 5.7,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "activity": {
+      "count": 2008,
+      "meanMs": 5.9,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     }
+    },
+    "serverLatency": {
+     "persistence_latency": {
+      "count": 22716,
+      "meanMs": 2.1,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "syncmatch_latency": {
+      "count": 4351,
+      "meanMs": 4.5,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_dispatch_latency": {
+      "count": 4428,
+      "meanMs": 4.3,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency": {
+      "count": 5271,
+      "meanMs": 4.5,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency_load": {
+      "count": 11083,
+      "meanMs": 2.4,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency_processing": {
+      "count": 11091,
+      "meanMs": 2.2,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency_queue": {
+      "count": 5271,
+      "meanMs": 9.6,
+      "p50Ms": 25,
+      "p95Ms": 47.6
+     },
+     "task_latency_schedule": {
+      "count": 11091,
+      "meanMs": 0,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_schedule_to_start_latency": {
+      "count": 4293,
+      "meanMs": 5.8,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "workflow_task_attempt": {
+      "count": 2283,
+      "meanMs": 1000,
+      "p50Ms": 500,
+      "p95Ms": 950
+     }
+    }
+   },
+   "broken": [],
+   "errorSamples": []
+  },
+  {
+   "step": 4,
+   "tenants": 32,
+   "teams": 8,
+   "people": 48,
+   "sockets": 96,
+   "openTasks": 112,
+   "tasksInTurn": 23,
+   "tasksAtReview": 89,
+   "runningWorkflows": 115,
+   "sandboxes": {
+    "running": 23,
+    "paused": 167
+   },
+   "setupSeconds": 13,
+   "failedSetups": 0,
+   "requestsPerSecond": 7.4,
+   "requests": 2219,
+   "errorRatePct": 0,
+   "rateLimited": 0,
+   "clientErrors": 0,
+   "api": {
+    "n": 2219,
+    "p50": 17,
+    "p95": 121,
+    "p99": 587,
+    "max": 1149
+   },
+   "eventLag": {
+    "n": 29724,
+    "p50": 9,
+    "p95": 69,
+    "p99": 120,
+    "max": 258
+   },
+   "turnOverhead": {
+    "n": 237,
+    "p50": 2144,
+    "p95": 3025,
+    "p99": 3308,
+    "max": 3656
+   },
+   "firstTurn": {
+    "n": 157,
+    "p50": 27545,
+    "p95": 40996,
+    "p99": 41953,
+    "max": 42400
+   },
+   "approveToDone": {
+    "n": 60,
+    "p50": 320,
+    "p95": 691,
+    "p99": 884,
+    "max": 884
+   },
+   "cancelToCancelled": {
+    "n": 40,
+    "p50": 97,
+    "p95": 482,
+    "p99": 495,
+    "max": 495
+   },
+   "wsConnect": {
+    "n": 6,
+    "p50": 109,
+    "p95": 122,
+    "p99": 122,
+    "max": 122
+   },
+   "tenantSetup": {
+    "n": 16,
+    "p50": 4691,
+    "p95": 9381,
+    "p99": 9381,
+    "max": 9381
+   },
+   "tasks": {
+    "created": 155,
+    "turns": 237,
+    "done": 60,
+    "cancelled": 40,
+    "failed": 0,
+    "stuck": 0,
+    "followUps": 87,
+    "resourceSaves": 47
+   },
+   "sockets_": {
+    "opens": 0,
+    "refused": 0,
+    "failures": 0,
+    "drops": 0,
+    "closes": {},
+    "events": 29732
+   },
+   "slowestRoutes": [
+    {
+     "route": "POST /api/projects/:id/resources/:id/import",
+     "n": 47,
+     "p50": 587,
+     "p95": 883,
+     "p99": 1149,
+     "max": 1149
+    },
+    {
+     "route": "POST /api/projects/:id/tasks",
+     "n": 155,
+     "p50": 86,
+     "p95": 206,
+     "p99": 340,
+     "max": 356
+    },
+    {
+     "route": "POST /api/tasks/:id/signal",
+     "n": 187,
+     "p50": 47,
+     "p95": 137,
+     "p99": 312,
+     "max": 344
+    },
+    {
+     "route": "GET /api/projects/:id/tasks",
+     "n": 318,
+     "p50": 18,
+     "p95": 74,
+     "p99": 134,
+     "max": 221
+    },
+    {
+     "route": "GET /api/tasks/:id",
+     "n": 282,
+     "p50": 19,
+     "p95": 71,
+     "p99": 156,
+     "max": 222
+    },
+    {
+     "route": "GET /api/tasks/:id/events",
+     "n": 282,
+     "p50": 15,
+     "p95": 53,
+     "p99": 112,
+     "max": 115
+    }
+   ],
+   "hostCpuPct": {
+    "mean": 39,
+    "max": 92,
+    "steal": 0.1,
+    "iowait": 4.6
+   },
+   "load1Max": 2.43,
+   "hostMemAvailableMinMb": 5358,
+   "containers": {
+    "app": {
+     "cpuMeanPct": 77,
+     "cpuMaxPct": 191,
+     "memMaxMb": 1046,
+     "memLimitMb": 4096
+    },
+    "postgresql": {
+     "cpuMeanPct": 46,
+     "cpuMaxPct": 84,
+     "memMaxMb": 305,
+     "memLimitMb": 768
+    },
+    "temporal": {
+     "cpuMeanPct": 28,
+     "cpuMaxPct": 57,
+     "memMaxMb": 175,
+     "memLimitMb": 2048
+    },
+    "caddy": {
+     "cpuMeanPct": 1,
+     "cpuMaxPct": 3,
+     "memMaxMb": 51,
+     "memLimitMb": 512
+    }
+   },
+   "appRestarts": 0,
+   "appOomKilled": false,
+   "gateway": {
+    "heapUsedMaxMb": 184,
+    "heapLimitMb": 2096,
+    "rssMaxMb": 492,
+    "eldP99MaxMs": 17.3,
+    "eldMaxMs": 50,
+    "gcPct": 0.9,
+    "pids": 1
+   },
+   "worker": {
+    "heapUsedMaxMb": 122,
+    "heapLimitMb": 2096,
+    "rssMaxMb": 540,
+    "eldP99MaxMs": 36,
+    "eldMaxMs": 51,
+    "gcPct": 0.7,
+    "pids": 1
+   },
+   "postgres": {
+    "connectionsMax": 58,
+    "karmaxConnectionsMax": 16,
+    "maxConnections": 100,
+    "lockWaitersMax": 0,
+    "advisoryWaitersMax": 0,
+    "advisoryWaitersMean": 0,
+    "advisoryWaitMaxMs": 0,
+    "longestXactMs": 10,
+    "karmaxCommitsPerSecond": 2007.6,
+    "karmaxDbMb": 37
+   },
+   "appGauges": {
+    "karmax_database_bytes": 38724111,
+    "karmax_http_inflight": 4,
+    "karmax_process_rss_bytes": 515321856,
+    "karmax_event_loop_delay_seconds{quantile=\"0.95\"}": 0.021233663,
+    "karmax_event_loop_delay_seconds{quantile=\"0.99\"}": 0.022298623,
+    "karmax_event_loop_delay_max_seconds": 0.200671231,
+    "karmax_database_pending": 5,
+    "karmax_database_connections": 4,
+    "karmax_database_waiting": 1
+   },
+   "metricsScrapeMaxMs": 191,
+   "temporal": {
+    "backlogAgeMaxMs": 0,
+    "backlogCountMax": 0,
+    "scheduleToStart": {
+     "workflow": {
+      "count": 4595,
+      "meanMs": 7.5,
+      "p50Ms": 25.1,
+      "p95Ms": 47.6
+     },
+     "activity": {
+      "count": 4039,
+      "meanMs": 8.1,
+      "p50Ms": 25,
+      "p95Ms": 47.6
+     }
+    },
+    "serverLatency": {
+     "asyncmatch_latency": {
+      "count": 2,
+      "meanMs": 8.4,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "persistence_latency": {
+      "count": 43825,
+      "meanMs": 2.4,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "syncmatch_latency": {
+      "count": 8789,
+      "meanMs": 5.4,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_dispatch_latency": {
+      "count": 8896,
+      "meanMs": 5.1,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency": {
+      "count": 10655,
+      "meanMs": 5.3,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency_load": {
+      "count": 21817,
+      "meanMs": 3.2,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency_processing": {
+      "count": 21820,
+      "meanMs": 2.7,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency_queue": {
+      "count": 10655,
+      "meanMs": 12,
+      "p50Ms": 25.1,
+      "p95Ms": 47.8
+     },
+     "task_latency_schedule": {
+      "count": 21820,
+      "meanMs": 0,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_schedule_to_start_latency": {
+      "count": 8634,
+      "meanMs": 7.8,
+      "p50Ms": 25.1,
+      "p95Ms": 47.6
+     },
+     "workflow_task_attempt": {
+      "count": 4610,
+      "meanMs": 1000,
+      "p50Ms": 500,
+      "p95Ms": 950
+     }
+    }
+   },
+   "broken": [],
+   "errorSamples": []
+  },
+  {
+   "step": 5,
+   "tenants": 64,
+   "teams": 16,
+   "people": 96,
+   "sockets": 192,
+   "openTasks": 252,
+   "tasksInTurn": 67,
+   "tasksAtReview": 179,
+   "runningWorkflows": 245,
+   "sandboxes": {
+    "running": 52,
+    "paused": 356
+   },
+   "setupSeconds": 101,
+   "failedSetups": 0,
+   "requestsPerSecond": 14,
+   "requests": 4209,
+   "errorRatePct": 0,
+   "rateLimited": 0,
+   "clientErrors": 2,
+   "api": {
+    "n": 4209,
+    "p50": 1083,
+    "p95": 3429,
+    "p99": 5377,
+    "max": 7108
+   },
+   "eventLag": {
+    "n": 41736,
+    "p50": 3339,
+    "p95": 17621,
+    "p99": 22956,
+    "max": 26991
+   },
+   "turnOverhead": {
+    "n": 383,
+    "p50": 16711,
+    "p95": 101961,
+    "p99": 125168,
+    "max": 139040
+   },
+   "firstTurn": {
+    "n": 252,
+    "p50": 45399,
+    "p95": 130976,
+    "p99": 141797,
+    "max": 143059
+   },
+   "approveToDone": {
+    "n": 84,
+    "p50": 5493,
+    "p95": 24859,
+    "p99": 111051,
+    "max": 111051
+   },
+   "cancelToCancelled": {
+    "n": 75,
+    "p50": 7496,
+    "p95": 74566,
+    "p99": 93193,
+    "max": 93193
+   },
+   "wsConnect": {
+    "n": 154,
+    "p50": 210,
+    "p95": 381,
+    "p99": 405,
+    "max": 416
+   },
+   "tenantSetup": {
+    "n": 32,
+    "p50": 17134,
+    "p95": 44823,
+    "p99": 44937,
+    "max": 44937
+   },
+   "tasks": {
+    "created": 251,
+    "turns": 383,
+    "done": 84,
+    "cancelled": 75,
+    "failed": 0,
+    "stuck": 0,
+    "followUps": 143,
+    "resourceSaves": 84
+   },
+   "sockets_": {
+    "opens": 148,
+    "refused": 0,
+    "failures": 0,
+    "drops": 148,
+    "closes": {
+     "socketClosed 1013": 148
+    },
+    "events": 41890
+   },
+   "slowestRoutes": [
+    {
+     "route": "POST /api/projects/:id/resources/:id/import",
+     "n": 85,
+     "p50": 5291,
+     "p95": 6427,
+     "p99": 7108,
+     "max": 7108
+    },
+    {
+     "route": "POST /api/projects/:id/tasks",
+     "n": 251,
+     "p50": 3462,
+     "p95": 4319,
+     "p99": 5210,
+     "max": 5824
+    },
+    {
+     "route": "POST /api/tasks/:id/signal",
+     "n": 303,
+     "p50": 2516,
+     "p95": 3296,
+     "p99": 3867,
+     "max": 5424
+    },
+    {
+     "route": "GET /api/tasks/:id/conversation",
+     "n": 567,
+     "p50": 1874,
+     "p95": 2498,
+     "p99": 3075,
+     "max": 3208
+    },
+    {
+     "route": "GET /api/tasks/:id",
+     "n": 616,
+     "p50": 1761,
+     "p95": 2376,
+     "p99": 2675,
+     "max": 3047
+    },
+    {
+     "route": "GET /api/projects/:id/tasks",
+     "n": 597,
+     "p50": 1351,
+     "p95": 1869,
+     "p99": 2268,
+     "max": 3755
+    }
+   ],
+   "hostCpuPct": {
+    "mean": 87,
+    "max": 90,
+    "steal": 0.1,
+    "iowait": 3.1
+   },
+   "load1Max": 9.82,
+   "hostMemAvailableMinMb": 4676,
+   "containers": {
+    "app": {
+     "cpuMeanPct": 188,
+     "cpuMaxPct": 227,
+     "memMaxMb": 1662,
+     "memLimitMb": 4096
+    },
+    "postgresql": {
+     "cpuMeanPct": 107,
+     "cpuMaxPct": 132,
+     "memMaxMb": 336,
+     "memLimitMb": 768
+    },
+    "temporal": {
+     "cpuMeanPct": 44,
+     "cpuMaxPct": 69,
+     "memMaxMb": 195,
+     "memLimitMb": 2048
+    },
+    "caddy": {
+     "cpuMeanPct": 2,
+     "cpuMaxPct": 3,
+     "memMaxMb": 83,
+     "memLimitMb": 512
+    }
+   },
+   "appRestarts": 0,
+   "appOomKilled": false,
+   "gateway": {
+    "heapUsedMaxMb": 581,
+    "heapLimitMb": 2096,
+    "rssMaxMb": 894,
+    "eldP99MaxMs": 20.9,
+    "eldMaxMs": 57,
+    "gcPct": 7.4,
+    "pids": 1
+   },
+   "worker": {
+    "heapUsedMaxMb": 175,
+    "heapLimitMb": 2096,
+    "rssMaxMb": 683,
+    "eldP99MaxMs": 46.7,
+    "eldMaxMs": 144,
+    "gcPct": 1.9,
+    "pids": 1
+   },
+   "postgres": {
+    "connectionsMax": 56,
+    "karmaxConnectionsMax": 13,
+    "maxConnections": 100,
+    "lockWaitersMax": 1,
+    "advisoryWaitersMax": 1,
+    "advisoryWaitersMean": 0.05,
+    "advisoryWaitMaxMs": 15,
+    "longestXactMs": 408,
+    "karmaxCommitsPerSecond": 6004.9,
+    "karmaxDbMb": 62
+   },
+   "appGauges": {
+    "karmax_database_bytes": 64371735,
+    "karmax_http_inflight": 40,
+    "karmax_process_rss_bytes": 927694848,
+    "karmax_event_loop_delay_seconds{quantile=\"0.95\"}": 0.021348351,
+    "karmax_event_loop_delay_seconds{quantile=\"0.99\"}": 0.024936447,
+    "karmax_event_loop_delay_max_seconds": 0.200671231,
+    "karmax_database_pending": 237,
+    "karmax_database_connections": 4,
+    "karmax_database_waiting": 233
+   },
+   "metricsScrapeMaxMs": 1561,
+   "temporal": {
+    "backlogAgeMaxMs": 0,
+    "backlogCountMax": 0,
+    "scheduleToStart": {
+     "workflow": {
+      "count": 7301,
+      "meanMs": 11.4,
+      "p50Ms": 25.3,
+      "p95Ms": 48
+     },
+     "activity": {
+      "count": 6418,
+      "meanMs": 11.8,
+      "p50Ms": 25.2,
+      "p95Ms": 47.9
+     }
+    },
+    "serverLatency": {
+     "asyncmatch_latency": {
+      "count": 18,
+      "meanMs": 35.8,
+      "p50Ms": 32.1,
+      "p95Ms": 88.7
+     },
+     "persistence_latency": {
+      "count": 70988,
+      "meanMs": 3.8,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "syncmatch_latency": {
+      "count": 14077,
+      "meanMs": 9.6,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_dispatch_latency": {
+      "count": 14152,
+      "meanMs": 9.2,
+      "p50Ms": 25,
+      "p95Ms": 47.6
+     },
+     "task_latency": {
+      "count": 16861,
+      "meanMs": 9.1,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency_load": {
+      "count": 35735,
+      "meanMs": 4.4,
+      "p50Ms": 25.1,
+      "p95Ms": 47.6
+     },
+     "task_latency_processing": {
+      "count": 35721,
+      "meanMs": 4.5,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency_queue": {
+      "count": 16861,
+      "meanMs": 18.6,
+      "p50Ms": 25.4,
+      "p95Ms": 48.2
+     },
+     "task_latency_schedule": {
+      "count": 35721,
+      "meanMs": 0,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_schedule_to_start_latency": {
+      "count": 13719,
+      "meanMs": 11.6,
+      "p50Ms": 25.3,
+      "p95Ms": 48
+     },
+     "workflow_task_attempt": {
+      "count": 7302,
+      "meanMs": 1000,
+      "p50Ms": 500,
+      "p95Ms": 950
+     }
+    }
+   },
+   "broken": [
+    "API p95 3429 ms",
+    "event lag p95 17621 ms",
+    "148 websocket failures or drops of 148 opens"
+   ],
+   "errorSamples": [
+    {
+     "route": "POST /api/projects/:id/resources/:id/import",
+     "status": 403,
+     "detail": "{\"error\":\"invalid or expired token\",\"code\":\"capability_denied\"}"
+    },
+    {
+     "route": "GET /api/projects/:id/tasks",
+     "status": 403,
+     "detail": "{\"error\":\"invalid or expired token\"}"
+    }
+   ]
+  }
+ ]
+}

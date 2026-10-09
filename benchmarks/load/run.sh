@@ -190,7 +190,8 @@ done
 
 # ---------------------------------------------------------------- install
 say 'Shipping the revision under test and the harness'
-git -C "$REPO" archive --format=tar.gz -o "$WORK/source.tar.gz" "$SHA"
+echo "$SHA" > "$WORK/REVISION"
+git -C "$REPO" archive --format=tar.gz --add-file="$WORK/REVISION" -o "$WORK/source.tar.gz" "$SHA"
 # The harness comes from this checkout, so an older revision is measured the same way.
 tar czf "$WORK/harness.tar.gz" -C "$REPO" benchmarks/load scripts/rehearsal
 put "$SUT" "$WORK/source.tar.gz" "$WORK/harness.tar.gz"
@@ -224,7 +225,9 @@ deadline=$(( $(python3 -c 'import json,sys; print(min(json.loads(l)["launched"] 
 while :; do
   sleep 60
   state=$(on "$WORLD" 'systemctl is-active loadtest-driver' 2>/dev/null || true)
-  on "$WORLD" 'sudo journalctl -u loadtest-driver --no-pager -o cat -n 400' 2>/dev/null | grep -E 'step [0-9]+ done|BROKEN|setup failed' | tail -n 1 || true
+  progress=$(on "$WORLD" 'sudo journalctl -u loadtest-driver --no-pager -o cat -n 400' 2>/dev/null | grep -E 'step [0-9]+ done|BROKEN|setup failed' | tail -n 1 || true)
+  [ -z "$progress" ] || [ "$progress" = "${last_progress:-}" ] || echo "$progress"
+  last_progress=$progress
   case "$state" in active|activating|reloading) ;; *) break ;; esac
   if [ "$(date +%s)" -gt "$deadline" ]; then
     echo 'run: the time limit is near; stopping the driver'
