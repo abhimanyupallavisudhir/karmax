@@ -215,6 +215,18 @@ export function githubSlug(remote: string): string | undefined {
   return match?.[1];
 }
 
+/** GitHub's prefilled "Open a pull request" page for a branch of a fork. A
+ * person can always open a pull request there, whatever tavya may do with the
+ * upstream repository. The body is cut to keep the address a usable length. */
+export function upstreamPullRequestUrl(slug: string, input: { base: string; headRepository: string; head: string; title: string; body: string }): string {
+  const [owner, name] = repositorySlug(input.headRepository).split('/');
+  const ref = (value: string) => encodeURIComponent(value).replace(/%2F/g, '/');
+  const range = `${ref(input.base)}...${owner}:${name}:${ref(input.head)}`;
+  const body = input.body.length > 3000 ? `${input.body.slice(0, 3000)}…` : input.body;
+  const query = new URLSearchParams({ quick_pull: '1', title: input.title, body });
+  return `https://github.com/${repositorySlug(slug)}/compare/${range}?${query}`;
+}
+
 /** The task a PR head belongs to (re-exported for existing importers). */
 export { taskIdOfBranch };
 
@@ -248,9 +260,10 @@ export class GithubPrApi {
     return normalize(await this.request(`/repos/${repositorySlug(slug)}/pulls/${number}`));
   }
 
-  /** The open-or-closed PR for a head branch in the same repository, if any. */
-  async findByHead(slug: string, branch: string): Promise<GithubPullRequest | undefined> {
-    const owner = slug.split('/')[0];
+  /** The open-or-closed PR for a head branch, if any: in the same repository,
+   * or in the fork `headOwner` owns. */
+  async findByHead(slug: string, branch: string, headOwner?: string): Promise<GithubPullRequest | undefined> {
+    const owner = headOwner ?? slug.split('/')[0];
     const found = await this.request<any[]>(
       `/repos/${repositorySlug(slug)}/pulls?state=all&per_page=1&head=${encodeURIComponent(`${owner}:${branch}`)}`);
     return found?.length ? normalize(found[0]) : undefined;
@@ -262,13 +275,14 @@ export class GithubPrApi {
    * Do) must update that PR, never fail on GitHub's "already exists" 422 and
    * never open a second one.
    */
-  async openOrUpdate(slug: string, input: { head: string; base: string; title: string; body: string }):
+  async openOrUpdate(slug: string, input: { head: string; base: string; title: string; body: string; headOwner?: string }):
   Promise<{ pr: GithubPullRequest; created: boolean }> {
-    const existing = await this.findByHead(slug, input.head);
+    const existing = await this.findByHead(slug, input.head, input.headOwner);
+    const head = input.headOwner ? `${input.headOwner}:${input.head}` : input.head;
     let reopenRefused = false;
     if (existing?.merged) {
       const comparison = await this.request<{ ahead_by: number }>(
-        `/repos/${repositorySlug(slug)}/compare/${encodeURIComponent(input.base)}...${encodeURIComponent(input.head)}`);
+        `/repos/${repositorySlug(slug)}/compare/${encodeURIComponent(input.base)}...${encodeURIComponent(head)}`);
       if (comparison.ahead_by === 0) return { pr: existing, created: false };
       if (!Number.isSafeInteger(comparison.ahead_by) || comparison.ahead_by < 0)
         throw new Error('GitHub did not report whether the branch contains new commits');
@@ -295,11 +309,11 @@ export class GithubPrApi {
     try {
       return { pr: normalize(await this.request(`/repos/${repositorySlug(slug)}/pulls`, {
         method: 'POST',
-        body: JSON.stringify({ title: input.title, body: input.body, head: input.head, base: input.base }),
+        body: JSON.stringify({ title: input.title, body: input.body, head, base: input.base }),
       })), created: true };
     } catch (error) {
       // Lost a race (or GitHub indexed the head late) — adopt the existing PR.
-      const raced = reopenRefused ? undefined : await this.findByHead(slug, input.head).catch(() => undefined);
+      const raced = reopenRefused ? undefined : await this.findByHead(slug, input.head, input.headOwner).catch(() => undefined);
       if (!raced || raced.state !== 'open' || raced.merged) throw error;
       return { pr: raced, created: false };
     }
