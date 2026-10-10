@@ -1,0 +1,379 @@
+import path from 'node:path';
+import type { Duplex } from 'node:stream';
+import type { WorldReferenceKeys } from '../reference-keys.js';
+import type { ResolvedWorldProviderConnection } from '../connections.js';
+import type { MachineShape } from '../../domain/computer.js';
+import type { ProviderSandboxRef, ProviderUsagePage, ProviderUsageEvent, World, WorldDiagnosis, WorldHandle,
+  WorldLifecycleState, WorldProvider, WorldSpec } from '../types.js';
+import { serviceHomeLabel } from '../services.js';
+import { provisionGitCredentials, provisionGitRepos, runOrThrow, provisionTimeoutMs, type ProvisionTarget } from '../provision-git.js';
+import { taskBranch } from '../../domain/brand.js';
+import { timed } from '../../timing/index.js';
+import { generateSshKeyPair, quote, SshTransport, type SshEndpoint } from './ssh.js';
+import { VmWorld } from './world.js';
+import { VM_HOME, VM_USER, vmProvisionScript, vmProvisionStamp } from './provision.js';
+
+/** What a VM world's machine is: CPU, memory, and the size of its volume. */
+export interface VmShape { cpu: number; memoryMb: number; diskGb: number }
+
+/** What karmax delivers to a machine at every boot (`vm/provision.ts`). */
+export interface VmBootKeys {
+  /** OpenSSH private key the machine presents as its host key. */
+  hostPrivateKey: string;
+  /** The world's client key, the only one sshd accepts. */
+  authorizedKey: string;
+}
+
+export interface VmAllocation {
+  /** Driver-owned identity of the machine and its volume, sealed into the handle. */
+  ref: Record<string, string>;
+  warnings?: string[];
+}
+
+export interface VmListing {
+  id: string;
+  taskId?: string;
+  generation?: string;
+  ref: Record<string, string>;
+  destroy(): Promise<void>;
+}
+
+/**
+ * A cloud's control plane for VM worlds: machines and their volumes. The
+ * generic `VmWorldProvider` owns keys, SSH, provisioning, Git, and the World;
+ * a driver only creates, starts, stops and deletes things, and reports them.
+ */
+export interface VmDriver {
+  readonly kind: string;
+  readonly name: string;
+  /** The machine for a Computer: the provider's nearest size that covers it.
+   * Throws (a message for people) when the account cannot provide it. */
+  shape(resources: MachineShape | undefined, connection: ResolvedWorldProviderConnection): VmShape;
+  /** Create the volume and the machine, booted with `keys`. Labels name the
+   * world (`karmaxHome`, `karmaxTaskId`, `karmaxGeneration`, …). */
+  allocate(connection: ResolvedWorldProviderConnection, request: {
+    labels: Record<string, string>; shape: VmShape; keys: VmBootKeys; signal?: AbortSignal;
+  }): Promise<VmAllocation>;
+  /** Where sshd answers for this machine now (an address can change on wake). */
+  endpoint(connection: ResolvedWorldProviderConnection, ref: Record<string, string>): Promise<Pick<SshEndpoint, 'host' | 'port' | 'tls'>>;
+  /** Wake a parked machine at `shape` (CPU and memory may have changed). */
+  start(connection: ResolvedWorldProviderConnection, ref: Record<string, string>, shape: VmShape, keys: VmBootKeys): Promise<void>;
+  /** Stop paying for compute; keep the volume. */
+  stop(connection: ResolvedWorldProviderConnection, ref: Record<string, string>): Promise<void>;
+  /** Delete the machine and its volume. A missing one is already gone. */
+  destroy(connection: ResolvedWorldProviderConnection, ref: Record<string, string>): Promise<void>;
+  /** Grow the volume to `diskGb`, in place; false when it is already that large. Never shrinks. */
+  growDisk(connection: ResolvedWorldProviderConnection, ref: Record<string, string>, diskGb: number): Promise<boolean>;
+  state(connection: ResolvedWorldProviderConnection, ref: Record<string, string>): Promise<WorldLifecycleState | undefined>;
+  /** Machines carrying this deployment's `karmaxHome` label. */
+  list(connection: ResolvedWorldProviderConnection, home: string): Promise<VmListing[]>;
+  /** Whether two references name the same world (its volume). */
+  same(a: Record<string, string>, b: Record<string, string>): boolean;
+  usage?(connection: ResolvedWorldProviderConnection, home: string, since?: number): Promise<ProviderUsageEvent[]>;
+  /** Periodic upkeep (deferred deletes, stale builders), once per sweep. */
+  housekeep?(connection: ResolvedWorldProviderConnection, home: string): Promise<void>;
+  diagnose?(connection: ResolvedWorldProviderConnection, ref: Record<string, string>, window: { since: number; now: number }): Promise<WorldDiagnosis | undefined>;
+  /** Check the credential without creating anything billable. */
+  test(connection: ResolvedWorldProviderConnection): Promise<void>;
+}
+
+type Resolver = (organizationId: string | undefined, provider: string) => ResolvedWorldProviderConnection | Promise<ResolvedWorldProviderConnection>;
+
+/** How long a new or woken machine may take to answer SSH (a stock image installs sshd first). */
+const REACHABLE_MS = 6 * 60_000;
+const PROVISION_MS = 25 * 60_000;
+
+/**
+ * A World provider over any cloud that rents Linux VMs with attachable
+ * volumes (SPEC §11.1). The world's files live on the volume, mounted as the
+ * VM user's home: parking stops the machine (no compute billing) and keeps
+ * the volume, so waking needs no checkpoint restore and keeps everything —
+ * Git-ignored files, caches, data — and the disk grows in place. Checkpoints
+ * remain for forks and recovery, as on every provider.
+ */
+export class VmWorldProvider implements WorldProvider {
+  readonly kind: string;
+  readonly parkable = true;
+  // No network policy: the VM user has root (as on E2B), so an in-VM firewall
+  // would be advisory. Restricted networks are refused up front instead.
+  readonly capabilities = { remote: true, pty: true, snapshots: true, ports: true, networkPolicy: false } as const;
+  private states = new Map<string, WorldLifecycleState>();
+  private transports = new Map<string, SshTransport>();
+  private destroyed = new WeakSet<WorldHandle>();
+
+  constructor(readonly driver: VmDriver, private resolveConnection: Resolver, private referenceKeys?: WorldReferenceKeys,
+    private options: {
+      reachableMs?: number;
+      /** Test seams: how SSH reaches a machine, and the machine's user, home and provisioning. */
+      socket?: (endpoint: SshEndpoint) => Promise<Duplex>;
+      user?: string;
+      home?: string;
+      provision?: { stamp: string; script: string; sudo: boolean };
+    } = {}) {
+    this.kind = driver.kind;
+  }
+
+  async create(spec: WorldSpec): Promise<World> {
+    spec.signal?.throwIfAborted();
+    if (spec.network && !spec.network.unrestricted)
+      throw new Error(`${this.driver.name} computers have unrestricted outbound network. Choose E2B or Daytona for an allowlist.`);
+    if (spec.environment?.flavor === 'desktop')
+      throw new Error(`${this.driver.name} computers are headless. Choose E2B or Daytona for a desktop.`);
+    const connection = await this.connection(spec.organizationId);
+    const shape = this.driver.shape(spec.resources, connection);
+    const labels = { karmaxHome: serviceHomeLabel(), karmaxTaskId: spec.taskId, karmaxGeneration: String(spec.generation ?? 1),
+      ...(spec.organizationId ? { karmaxOrganizationId: spec.organizationId } : {}) };
+    // An earlier attempt of this create (a retried activity) may have left a
+    // machine. Its keys died with that attempt and it never held user work:
+    // delete it rather than adopt it, so one task never bills for two.
+    for (const stale of await this.driver.list(connection, labels.karmaxHome))
+      if (stale.taskId === spec.taskId && stale.generation === labels.karmaxGeneration) await stale.destroy();
+    const host = generateSshKeyPair('karmax-host');
+    const client = generateSshKeyPair(`karmax-${spec.taskId}`);
+    const keys: VmBootKeys = { hostPrivateKey: host.privateKey, authorizedKey: client.publicKey };
+    const allocation = await timed(`${this.kind}.allocate`, () => this.driver.allocate(connection, { labels, shape, keys, signal: spec.signal }));
+    const sealed = { ...allocation.ref, generation: labels.karmaxGeneration, sshKey: client.privateKey, clientKey: client.publicKey, hostKey: host.publicKey,
+      hostPrivateKey: host.privateKey, ...(spec.organizationId ? { organizationId: spec.organizationId } : {}) };
+    try {
+      const transport = this.transportFor(spec.taskId, connection, sealed);
+      await timed(`${this.kind}.reachable`, () => waitReachable(transport, this.options.reachableMs ?? REACHABLE_MS, spec.signal));
+      await this.ensureProvisioned(transport, spec.signal);
+      const target = provisionTarget(transport, spec.signal);
+      const home = this.home();
+      const root = path.posix.join(home, 'karmax');
+      await runOrThrow(target, `mkdir -p ${quote(root)}`);
+      await provisionGitCredentials(target, spec, home);
+      const provisioned = await provisionGitRepos(target, spec, {
+        root, home,
+        sshUrlError: `${this.driver.name} worlds require repositories as SSH Git URLs, not local paths or HTTPS URLs`,
+        copyGlobsWarning: `copyGlobs are host-local and were not copied into the ${this.driver.name} world`,
+      });
+      await runOrThrow(target, `rm -f ${quote(home)}/.ssh/karmax-auth*`);
+      spec.signal?.throwIfAborted();
+      const handle: WorldHandle = {
+        version: 2, kind: this.kind, provider: this.kind, id: spec.taskId, root: provisioned.root ?? root, workspaceRoot: provisioned.root ?? root,
+        branch: spec.branch ?? taskBranch(spec.taskId), base: provisioned.repos[0]?.base ?? spec.base,
+        target: provisioned.repos[0]?.target ?? spec.target, repo: provisioned.repos[0]?.repo, repos: provisioned.repos,
+        ...(provisioned.workdir ? { workdir: provisioned.workdir } : {}),
+        sealedProviderRef: this.seal(sealed),
+        meta: { releaseOnCompletion: true, environmentFlavor: 'headless', machine: shape,
+          ...(provisioned.ephemeralPaths.length ? { ephemeralPaths: provisioned.ephemeralPaths } : {}) },
+        ...([...(allocation.warnings ?? []), ...provisioned.warnings].length
+          ? { warnings: [...(allocation.warnings ?? []), ...provisioned.warnings] } : {}),
+      };
+      this.states.set(spec.taskId, 'ready');
+      return this.world(handle, connection, sealed, transport);
+    } catch (error) {
+      this.dropTransport(spec.taskId);
+      await this.driver.destroy(connection, allocation.ref).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async open(handle: WorldHandle): Promise<World> {
+    const sealed = this.reference(handle);
+    const connection = await this.connection(sealed.organizationId);
+    let transport = this.transports.get(handle.id);
+    if (!transport || this.states.get(handle.id) === 'parked') {
+      const state = await this.driver.state(connection, sealed);
+      if (state === 'missing') throw Object.assign(new Error(`the ${this.driver.name} machine of this world no longer exists`), { status: 404 });
+      transport = this.transportFor(handle.id, connection, sealed);
+      if (state !== 'ready') {
+        await timed(`${this.kind}.start`, () => this.driver.start(connection, sealed, this.shapeOf(handle, connection), keysOf(sealed)));
+        transport.reset();
+        await timed(`${this.kind}.reachable`, () => waitReachable(transport!, this.options.reachableMs ?? REACHABLE_MS));
+        await this.ensureProvisioned(transport);
+      }
+    }
+    this.states.set(handle.id, 'ready');
+    return this.world(handle, connection, sealed, transport);
+  }
+
+  async park(handle: WorldHandle): Promise<WorldHandle> {
+    const sealed = this.reference(handle);
+    if (this.states.get(handle.id) === 'parked') return handle;
+    const connection = await this.connection(sealed.organizationId);
+    this.dropTransport(handle.id);
+    await timed(`${this.kind}.stop`, () => this.driver.stop(connection, sealed));
+    this.states.set(handle.id, 'parked');
+    return handle;
+  }
+
+  async destroy(handle: WorldHandle): Promise<void> {
+    const sealed = this.reference(handle);
+    const connection = await this.connection(sealed.organizationId);
+    this.dropTransport(handle.id);
+    await this.driver.destroy(connection, sealed);
+    this.states.delete(handle.id);
+    this.destroyed.add(handle);
+  }
+
+  async status(handle: WorldHandle): Promise<WorldLifecycleState> {
+    if (this.destroyed.has(handle)) return 'missing';
+    this.reference(handle); // an unreadable reference must fail here, as on E2B
+    return this.states.get(handle.id) ?? 'ready';
+  }
+
+  async probe(handle: WorldHandle): Promise<WorldLifecycleState | undefined> {
+    const sealed = this.reference(handle);
+    try { return await this.driver.state(await this.connection(sealed.organizationId), sealed); }
+    catch { return undefined; }
+  }
+
+  /**
+   * Resize in place. The volume grows now, even under a running agent, and
+   * its filesystem with it; CPU and memory take effect at the machine's next
+   * start (a park and wake), with nothing lost — everything is on the volume.
+   */
+  async resize(handle: WorldHandle, to: MachineShape): Promise<{ disk: 'grown' | 'unchanged'; restart: boolean; machine: VmShape }> {
+    const sealed = this.reference(handle);
+    const connection = await this.connection(sealed.organizationId);
+    const made = (handle.meta?.machine as VmShape | undefined) ?? this.driver.shape(handle.meta?.computer as MachineShape | undefined, connection);
+    const next = this.driver.shape({ cpu: to.cpu ?? made.cpu, memoryMb: to.memoryMb ?? made.memoryMb, diskGb: Math.max(to.diskGb ?? 0, made.diskGb) }, connection);
+    // The volume's own size decides: an earlier resize may already have grown it.
+    const grown = next.diskGb > made.diskGb && await this.driver.growDisk(connection, sealed, next.diskGb);
+    if (grown) {
+      // A running machine grows its filesystem now; a stopped one at boot.
+      const transport = this.transports.get(handle.id);
+      if (transport && this.states.get(handle.id) !== 'parked')
+        await growFilesystem(transport, this.home()).catch(() => undefined);
+    }
+    return { disk: grown ? 'grown' : 'unchanged', restart: next.cpu !== made.cpu || next.memoryMb !== made.memoryMb,
+      machine: { cpu: made.cpu, memoryMb: made.memoryMb, diskGb: next.diskGb } };
+  }
+
+  async listSandboxes(organizationId?: string): Promise<ProviderSandboxRef[]> {
+    const connection = await this.connection(organizationId);
+    return (await this.driver.list(connection, serviceHomeLabel())).map((listing) => ({
+      sandboxId: listing.id,
+      ...(listing.taskId ? { taskId: listing.taskId } : {}),
+      matches: (handle) => {
+        try { return handle.kind === this.kind && this.driver.same(this.reference(handle as WorldHandle), listing.ref); }
+        catch { return undefined; }
+      },
+      destroy: async () => { await listing.destroy(); if (listing.taskId) this.dropTransport(listing.taskId); },
+    }));
+  }
+
+  async listUsageEvents(organizationId: string, since?: number): Promise<ProviderUsagePage> {
+    if (!this.driver.usage) return { events: [] };
+    return { events: await this.driver.usage(await this.connection(organizationId), serviceHomeLabel(), since) };
+  }
+
+  async housekeep(organizationId?: string): Promise<void> {
+    await this.driver.housekeep?.(await this.connection(organizationId), serviceHomeLabel());
+  }
+
+  private world(handle: WorldHandle, connection: ResolvedWorldProviderConnection, sealed: Record<string, string>, transport: SshTransport): World {
+    return new VmWorld(handle, transport, this.home(), {
+      destroy: async () => {
+        this.dropTransport(handle.id);
+        await this.driver.destroy(connection, sealed);
+        this.states.delete(handle.id);
+        this.destroyed.add(handle);
+      },
+      ...(this.driver.diagnose ? { diagnose: (window) => this.driver.diagnose!(connection, sealed, window) } : {}),
+    });
+  }
+
+  /** Provision a machine that has not run this exact provisioning yet: a
+   * stock image does it once, an image or snapshot built with it never. */
+  private async ensureProvisioned(transport: SshTransport, signal?: AbortSignal): Promise<void> {
+    const provision = this.options.provision ?? { stamp: vmProvisionStamp(), script: vmProvisionScript(), sudo: true };
+    if ((await transport.exec(`test -f ${quote(provision.stamp)}`, { timeoutMs: 30_000 })).code === 0) return;
+    await timed(`${this.kind}.provision`, async () => {
+      const script = `/tmp/karmax-provision-${process.pid}.sh`;
+      await transport.writeFile(script, Buffer.from(provision.script), 0o700);
+      const run = await transport.exec(`${provision.sudo ? 'sudo -n ' : ''}bash ${script} > ${script}.log 2>&1; code=$?; `
+        + `[ $code = 0 ] || tail -n 40 ${script}.log; rm -f ${script}; exit $code`, { timeoutMs: PROVISION_MS, ...(signal ? { signal } : {}) });
+      if (run.code !== 0) throw new Error(`provisioning the ${this.driver.name} machine failed (status ${run.code}): ${run.stdout.toString().slice(-4000)}`);
+    });
+  }
+
+  private shapeOf(handle: WorldHandle, connection: ResolvedWorldProviderConnection): VmShape {
+    const made = handle.meta?.machine as VmShape | undefined;
+    const wanted = handle.meta?.computer as MachineShape | undefined;
+    // Never shrink the disk; CPU and memory follow the Computer.
+    const shape = this.driver.shape(wanted ?? made, connection);
+    return made ? { ...shape, diskGb: Math.max(shape.diskGb, made.diskGb) } : shape;
+  }
+
+  private transportFor(id: string, connection: ResolvedWorldProviderConnection, sealed: Record<string, string>): SshTransport {
+    let transport = this.transports.get(id);
+    if (!transport) {
+      transport = new SshTransport(async () => ({ ...(await this.driver.endpoint(connection, sealed)),
+        hostKey: sealed.hostKey!, username: this.options.user ?? VM_USER, privateKey: sealed.sshKey! }),
+      this.options.socket ? { socket: this.options.socket } : {});
+      this.transports.set(id, transport);
+    }
+    return transport;
+  }
+
+  private dropTransport(id: string): void {
+    this.transports.get(id)?.close();
+    this.transports.delete(id);
+  }
+
+  private home(): string { return this.options.home ?? VM_HOME; }
+
+  private async connection(organizationId: string | undefined): Promise<ResolvedWorldProviderConnection> {
+    return this.resolveConnection(organizationId, this.kind);
+  }
+
+  private seal(value: Record<string, string>): string {
+    if (!this.referenceKeys) {
+      // Tests only: production always boots with the vault's reference key.
+      if (process.env.NODE_ENV === 'production') throw new Error('VM world references need the world reference key');
+      return `KVMT.${Buffer.from(JSON.stringify(value)).toString('base64url')}`;
+    }
+    return this.referenceKeys.seal(value);
+  }
+
+  private reference(handle: WorldHandle): Record<string, string> {
+    const sealed = handle.sealedProviderRef;
+    if (!sealed) throw new Error(`invalid ${this.driver.name} world handle`);
+    const value = sealed.startsWith('KVMT.') && !this.referenceKeys
+      ? JSON.parse(Buffer.from(sealed.slice(5), 'base64url').toString('utf8')) as Record<string, string>
+      : this.referenceKeys?.open(sealed);
+    if (!value?.sshKey || !value.hostKey) throw new Error(`invalid ${this.driver.name} world handle`);
+    return value;
+  }
+}
+
+function keysOf(sealed: Record<string, string>): VmBootKeys {
+  return { hostPrivateKey: sealed.hostPrivateKey!, authorizedKey: sealed.clientKey! };
+}
+
+async function growFilesystem(transport: SshTransport, home: string): Promise<void> {
+  await transport.exec(`sudo -n resize2fs "$(findmnt -no SOURCE ${quote(home)})"`, { timeoutMs: 120_000 });
+}
+
+/** Wait for sshd: a booting machine refuses or resets connections for a while. */
+async function waitReachable(transport: SshTransport, ms: number, signal?: AbortSignal): Promise<void> {
+  const until = Date.now() + ms;
+  let last: unknown;
+  for (let attempt = 0; Date.now() < until; attempt++) {
+    signal?.throwIfAborted();
+    try {
+      const probe = await transport.exec('true', { timeoutMs: 20_000 });
+      if (probe.code === 0) return;
+    } catch (error) { last = error; transport.reset(); }
+    await new Promise((resolve) => setTimeout(resolve, Math.min(5_000, 500 * (attempt + 1))));
+  }
+  throw new Error(`the machine did not answer SSH within ${Math.round(ms / 60_000)} minutes: ${last instanceof Error ? last.message : String(last)}`);
+}
+
+/** Trusted provisioning over the world's own SSH connection. */
+function provisionTarget(transport: SshTransport, signal?: AbortSignal): ProvisionTarget {
+  return {
+    async run(command, timeoutMs) {
+      signal?.throwIfAborted();
+      const result = await transport.exec(`bash -c ${quote(command)}`, { timeoutMs: timeoutMs ?? provisionTimeoutMs(), ...(signal ? { signal } : {}) });
+      return { stdout: result.stdout.toString('utf8'), stderr: result.stderr.toString('utf8'), code: result.code };
+    },
+    async writeFile(remotePath, content) {
+      signal?.throwIfAborted();
+      await transport.writeFile(remotePath, Buffer.isBuffer(content) ? content : Buffer.from(content), 0o600);
+    },
+  };
+}

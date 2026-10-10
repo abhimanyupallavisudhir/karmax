@@ -345,6 +345,10 @@ export interface WorldProviderConnection {
     desktopImage?: string;
     apiUrl?: string;
     target?: string;
+    /** VM providers: where machines run (a Fly region, a Hetzner location). */
+    region?: string;
+    /** Fly.io: the organization slug machines are created in. */
+    organization?: string;
   };
   enabled: boolean;
   status: 'untested' | 'ready' | 'error';
