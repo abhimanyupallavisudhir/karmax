@@ -33,6 +33,27 @@ BEGIN
       CASE item.relkind WHEN 'S' THEN 'SEQUENCE' WHEN 'v' THEN 'VIEW' WHEN 'm' THEN 'MATERIALIZED VIEW' ELSE 'TABLE' END,
       item.name, app);
   END LOOP;
+  -- Functions too: the app replaces its own on every boot (CREATE OR REPLACE
+  -- FUNCTION karmax_seq), which only their owner may do, and a restored dump
+  -- creates them as the superuser. Members of extensions stay theirs.
+  FOR item IN SELECT p.oid::regprocedure AS name, p.prokind FROM pg_proc p
+      JOIN pg_namespace n ON n.oid = p.pronamespace
+      WHERE p.proowner <> app::regrole AND n.nspname NOT LIKE 'pg\_%' AND n.nspname <> 'information_schema'
+        AND NOT EXISTS (SELECT FROM pg_depend d
+          WHERE d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype = 'e') LOOP
+    EXECUTE format('ALTER %s %s OWNER TO %I',
+      CASE item.prokind WHEN 'p' THEN 'PROCEDURE' WHEN 'a' THEN 'AGGREGATE' ELSE 'FUNCTION' END, item.name, app);
+  END LOOP;
+  -- And domains and enums; a table's row type and an array type follow their
+  -- owner.
+  FOR item IN SELECT t.oid::regtype AS name FROM pg_type t
+      JOIN pg_namespace n ON n.oid = t.typnamespace
+      WHERE t.typtype IN ('d', 'e') AND t.typowner <> app::regrole
+        AND n.nspname NOT LIKE 'pg\_%' AND n.nspname <> 'information_schema'
+        AND NOT EXISTS (SELECT FROM pg_depend d
+          WHERE d.classid = 'pg_type'::regclass AND d.objid = t.oid AND d.deptype = 'e') LOOP
+    EXECUTE format('ALTER TYPE %s OWNER TO %I', item.name, app);
+  END LOOP;
   FOR item IN SELECT datname FROM pg_database
       WHERE datname = ANY (string_to_array(current_setting('karmax.private_databases', true), ',')) LOOP
     EXECUTE format('REVOKE CONNECT, TEMPORARY ON DATABASE %I FROM PUBLIC', item.datname);
