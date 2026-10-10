@@ -1882,14 +1882,21 @@ export class Gateway {
     // Incoming webhook delivery (wiki planned/external-connectors-and-automations):
     // one project event per delivery, recorded before the sender is answered.
     const hookMatch = p.match(/^\/api\/hooks\/([^/]+)$/);
-    if (hookMatch && method === 'POST') {
+    if (hookMatch && (method === 'POST' || method === 'GET')) {
       try {
-        const raw = await this.rawBody(req, 1024 * 1024);
+        const raw = method === 'POST' ? await this.rawBody(req, 1024 * 1024) : Buffer.alloc(0);
         const result = await this.deps.api.receiveIncomingWebhook(decodeURIComponent(hookMatch[1]!), {
-          raw, contentType: typeof req.headers['content-type'] === 'string' ? req.headers['content-type'] : undefined,
+          method, raw, contentType: typeof req.headers['content-type'] === 'string' ? req.headers['content-type'] : undefined,
           headers: req.headers, query: url.searchParams,
         });
-        return this.json(res, 202, { accepted: true, event: result.event.id, duplicate: result.duplicate });
+        if (result.answer?.text) {
+          res.writeHead(result.answer.status, { 'content-type': 'text/plain; charset=utf-8' });
+          return res.end(String(result.answer.body));
+        }
+        if (result.answer) return this.json(res, result.answer.status, result.answer.body);
+        const [first] = result.events;
+        return this.json(res, 202, { accepted: true, ...(first ? { event: first.event.id, duplicate: first.duplicate } : {}),
+          ...(result.events.length > 1 ? { events: result.events.map(({ event, duplicate }) => ({ id: event.id, duplicate })) } : {}) });
       } catch (error) {
         return this.fail(res, error);
       }
@@ -4993,8 +5000,10 @@ export class Gateway {
         if (method === 'GET') return this.json(res, 200, { webhooks: await api.listIncomingWebhooks(token, projectId), urlBase: `${this.publicUrl(req)}/api/hooks/` });
         if (method === 'POST') {
           const b = await this.body(req);
-          const created = await api.createIncomingWebhook(token, projectId, { name: b.name, type: b.type });
-          return this.json(res, 201, { ...created, url: `${this.publicUrl(req)}/api/hooks/${created.hook.id}` });
+          const hookUrl = (hookId: string) => `${this.publicUrl(req)}/api/hooks/${hookId}`;
+          const created = await api.createIncomingWebhook(token, projectId,
+            { name: b.name, type: b.type, kind: b.kind, credentials: b.credentials }, { hookUrl });
+          return this.json(res, 201, { ...created, url: hookUrl(created.hook.id) });
         }
       }
       const webhookMatch = p.match(/^\/api\/webhooks\/([^/]+)(\/rotate)?$/);

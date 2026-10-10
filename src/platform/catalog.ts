@@ -227,6 +227,7 @@ export const PLATFORM_API_CATALOG = {
     'POST /api/events (the same, in the calling task\'s project: what `tavya emit` sends from a task\'s world)',
     'GET /api/project-events/:eventId (one event with its claims; task:event:read)',
     'GET|POST /api/projects/:projectId/webhooks (incoming webhooks; POST body {name, type?} returns {hook, secret, url} once — a delivery is accepted when signed with the secret, HMAC-SHA256 of the body in any *-Signature header such as X-Hub-Signature-256, or when it presents the secret as Authorization: Bearer or ?token=; each delivery becomes one event of the hook\'s type from webhook:<hookId>; project:settings:read/write)',
+    'POST /api/projects/:projectId/webhooks with {name, kind: telegram|slack|discord|whatsapp, credentials} connects a chat bot instead (telegram {botToken}; slack {signingSecret, botToken}; discord {applicationId, publicKey, botToken}; whatsapp {phoneNumberId, appSecret, accessToken}, answering a verifyToken to enter in Meta\'s dashboard). Each message that mentions the bot becomes a chat.mention event {platform, text, author, channel, thread, url} from chat:<hookId>; the bot answers in the thread when a run starts, needs input, is ready for review, finishes or fails. Key a trigger\'s concurrency on {{channel.id}}/{{thread}} with mode tell to send a thread\'s follow-ups to its run.',
     'PATCH|DELETE /api/webhooks/:hookId (body {name?, type?})', 'POST /api/webhooks/:hookId/rotate (new secret, returned once)',
   ],
   automation: [

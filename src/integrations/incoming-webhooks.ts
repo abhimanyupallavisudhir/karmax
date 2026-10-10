@@ -4,6 +4,8 @@ import type { CredentialBroker } from '../autonomy/broker.js';
 import { organizationScope } from '../autonomy/vault-keys.js';
 import { validEventType } from '../domain/project-events.js';
 import { newId } from '../util/id.js';
+import { CHAT_ADAPTERS, CHAT_CREDENTIALS, ChatPlatformError, type ChatBotIdentity, type ChatCredentials, type ChatDelivery,
+  type ChatInbound, type ChatPlatform } from './chat-platforms.js';
 
 /**
  * Incoming webhooks: a project's URL that any outside service can POST to
@@ -18,6 +20,11 @@ import { newId } from '../util/id.js';
  * the secret itself (`Authorization: Bearer …` or `?token=…`, for senders that
  * can only be given a URL). Both prove possession of the same secret over TLS;
  * a signature additionally keeps the secret off the wire.
+ *
+ * A chat bot (`kind`: telegram, slack, discord, whatsapp) is the same kind of
+ * hook: its URL is where the platform delivers, the platform's own credentials
+ * are its vault secret, and each message that mentions the bot is one
+ * `chat.mention` event (src/integrations/chat-platforms.ts).
  */
 
 export interface IncomingWebhook {
@@ -33,6 +40,10 @@ export interface IncomingWebhook {
   lastDeliveryAt?: number;
   /** The last refused delivery's reason, cleared by the next accepted one. */
   lastError?: { at: number; message: string };
+  /** A chat bot's platform; absent for a plain webhook. */
+  kind?: ChatPlatform;
+  /** The bot's own name and id on its platform. */
+  bot?: ChatBotIdentity;
 }
 
 const KEY_PREFIX = 'incoming-webhook:';
@@ -103,21 +114,50 @@ export class IncomingWebhooks {
     return hooks.sort((a, b) => a.createdAt - b.createdAt);
   }
 
-  /** Create a hook; the secret is returned once and never again. */
-  async create(input: { organizationId: string; projectId: string; name: string; type?: string; createdBy?: string }):
-    Promise<{ hook: IncomingWebhook; secret: string }> {
+  /** Create a hook; its secret is returned once and never again. A chat bot is
+   *  connected to its platform here (`url` is where the platform will deliver):
+   *  a refused connection creates nothing. */
+  async create(input: { organizationId: string; projectId: string; name: string; type?: string; createdBy?: string;
+    kind?: ChatPlatform; credentials?: ChatCredentials; url?: (id: string) => string; fetcher?: typeof fetch }):
+    Promise<{ hook: IncomingWebhook; secret?: string; verifyToken?: string }> {
     const name = input.name.trim().slice(0, 100);
     if (!name) throw new WebhookConfigError('name the webhook');
-    const type = input.type?.trim() || defaultWebhookType(name);
+    const type = input.kind ? 'chat.mention' : input.type?.trim() || defaultWebhookType(name);
     if (!validEventType(type)) throw new WebhookConfigError('event type must be dotted words, e.g. "sentry.alert"');
     const hook: IncomingWebhook = {
       id: newId('hook'), organizationId: input.organizationId, projectId: input.projectId, name, type,
       createdAt: Date.now(), ...(input.createdBy ? { createdBy: input.createdBy } : {}), deliveries: 0,
+      ...(input.kind ? { kind: input.kind } : {}),
     };
-    const secret = newSecret();
-    await this.broker.registerHandle(secretHandle(hook), secret, organizationScope(hook.organizationId));
+    if (!input.kind) {
+      const secret = newSecret();
+      await this.broker.registerHandle(secretHandle(hook), secret, organizationScope(hook.organizationId));
+      await this.store.kvSet(`${KEY_PREFIX}${hook.id}`, JSON.stringify(hook));
+      return { hook, secret };
+    }
+    const credentials: ChatCredentials = {};
+    for (const field of CHAT_CREDENTIALS[input.kind]) {
+      const value = String(input.credentials?.[field.name] ?? '').trim();
+      if (!value) throw new WebhookConfigError(`${field.label} is required`);
+      credentials[field.name] = value;
+    }
+    if (!input.url) throw new WebhookConfigError('a public URL is needed to connect a chat bot');
+    let connected: Awaited<ReturnType<(typeof CHAT_ADAPTERS)[ChatPlatform]['connect']>>;
+    // The platform may check the URL at once (Discord sends a signed PING), so
+    // the hook answers before the platform is told about it.
     await this.store.kvSet(`${KEY_PREFIX}${hook.id}`, JSON.stringify(hook));
-    return { hook, secret };
+    await this.broker.registerHandle(secretHandle(hook), JSON.stringify(credentials), organizationScope(hook.organizationId));
+    try {
+      connected = await CHAT_ADAPTERS[input.kind].connect(credentials, input.url(hook.id), input.fetcher ?? fetch);
+    } catch (error) {
+      await this.delete(hook.id);
+      throw new WebhookConfigError(error instanceof ChatPlatformError ? error.message : `could not connect: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const stored = { ...credentials, ...connected.generated };
+    await this.broker.registerHandle(secretHandle(hook), JSON.stringify(stored), organizationScope(hook.organizationId));
+    const saved: IncomingWebhook = { ...hook, bot: connected.identity };
+    await this.store.kvSet(`${KEY_PREFIX}${hook.id}`, JSON.stringify(saved));
+    return { hook: saved, ...(connected.generated?.verifyToken ? { verifyToken: connected.generated.verifyToken } : {}) };
   }
 
   async update(id: string, patch: { name?: string; type?: string }): Promise<IncomingWebhook> {
@@ -137,6 +177,7 @@ export class IncomingWebhooks {
 
   async rotate(id: string): Promise<{ hook: IncomingWebhook; secret: string }> {
     const hook = await this.require(id);
+    if (hook.kind) throw new WebhookConfigError('a chat bot keeps its platform credentials; connect it again to change them');
     const secret = newSecret();
     await this.broker.registerHandle(secretHandle(hook), secret, organizationScope(hook.organizationId));
     return { hook, secret };
@@ -149,10 +190,29 @@ export class IncomingWebhooks {
     if (this.broker.hasHandle(secretHandle(hook))) await this.broker.deleteHandle(secretHandle(hook));
   }
 
+  /** A chat bot's delivery, read by its platform's adapter. */
+  receiveChat(hook: IncomingWebhook, delivery: ChatDelivery): ChatInbound | 'refused' {
+    const credentials = this.credentials(hook);
+    return hook.kind && credentials ? CHAT_ADAPTERS[hook.kind].receive(credentials, hook.bot ?? {}, delivery) : 'refused';
+  }
+
+  /** Post in a chat bot's channel (a thread's reply when `thread` is set). */
+  async reply(hook: IncomingWebhook, to: { channel: string; thread?: string }, text: string, fetcher: typeof fetch = fetch): Promise<{ messageId?: string }> {
+    const credentials = this.credentials(hook);
+    if (!hook.kind || !credentials) throw new WebhookConfigError('not a connected chat bot');
+    return CHAT_ADAPTERS[hook.kind].reply(credentials, to, text, fetcher);
+  }
+
+  private credentials(hook: IncomingWebhook): ChatCredentials | undefined {
+    const handle = secretHandle(hook);
+    if (!this.broker.hasHandle(handle)) return undefined;
+    try { return JSON.parse(this.broker.resolve(handle, { caps: [`use-credential:${handle}`] })) as ChatCredentials; } catch { return undefined; }
+  }
+
   /** Is this delivery from someone holding the hook's secret? */
   verify(hook: IncomingWebhook, raw: Buffer, headers: Record<string, string | string[] | undefined>, query: URLSearchParams): boolean {
     const handle = secretHandle(hook);
-    if (!this.broker.hasHandle(handle)) return false;
+    if (hook.kind || !this.broker.hasHandle(handle)) return false;
     const secret = this.broker.resolve(handle, { caps: [`use-credential:${handle}`] });
     const auth = Array.isArray(headers.authorization) ? headers.authorization[0] : headers.authorization;
     const bearer = auth?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();

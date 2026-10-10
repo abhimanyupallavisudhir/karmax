@@ -82,6 +82,8 @@ export interface TriggerSchedulerDeps {
   fire: (taskId: string, mode: 'self' | 'clone', trigger?: TriggerContext) => Promise<unknown>;
   /** Give an unfinished run a further event of its concurrency key (`tell`). */
   tell?: (runId: string, trigger: TriggerContext) => Promise<unknown>;
+  /** An event started a run or was told to one (a chat bot answers in its thread). */
+  announce?: (event: ProjectEvent, runId: string, how: 'started' | 'told') => Promise<unknown>;
   /** Injectable clock/timers (tests drive them; prod uses wall-clock). */
   now?: () => number;
   setTimer?: (fn: () => void, ms: number) => unknown;
@@ -597,11 +599,19 @@ export class TriggerScheduler {
       await this.deps.tell!(runId, triggerContext(event, concurrencyKey));
       await this.deps.store.updateProjectEventClaim(event.id, taskId, ['pending'],
         { state: 'told', runId, reason: null, updatedAt: this.now() });
+      this.announce(event, runId, 'told');
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       await this.deps.store.updateProjectEventClaim(event.id, taskId, ['pending'],
         { state: 'deferred', reason: `${FAILED_START}: ${message}`.slice(0, 300), updatedAt: this.now() });
     }
+  }
+
+  /** Best effort and off the dispatch path: an answer never holds up an event. */
+  private announce(event: ProjectEvent, runId: string, how: 'started' | 'told'): void {
+    if (!this.deps.announce) return;
+    this.track(Promise.resolve().then(() => this.deps.announce!(event, runId, how))
+      .catch((error) => this.log(`announcing event ${event.id} failed: ${error instanceof Error ? error.message : String(error)}`)));
   }
 
   private async startEventRun(entry: ArmedEntry, event: ProjectEvent, concurrencyKey: string | undefined): Promise<void> {
@@ -619,6 +629,7 @@ export class TriggerScheduler {
         { state: 'started', runId: runId ?? null, reason: null, updatedAt: this.now() });
       if (!repeatable && this.armed.get(taskId) === entry) this.disarm(taskId);
       this.log(`event ${event.type} started ${repeatable ? `a run of ${taskId}` : taskId}`);
+      if (runId) this.announce(event, runId, 'started');
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (!repeatable && this.armed.get(taskId) === entry) entry.fired = false;

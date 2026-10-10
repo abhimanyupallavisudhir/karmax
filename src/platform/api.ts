@@ -39,6 +39,8 @@ import { applyTriggerContext, normalizeEventInput, type ProjectEvent, type Proje
   type ProjectEventOrigin, type TriggerContext } from '../domain/project-events.js';
 import { newId } from '../util/id.js';
 import { IncomingWebhooks, WebhookConfigError, webhookDeliveryKey, type IncomingWebhook } from '../integrations/incoming-webhooks.js';
+import { isChatPlatform, type ChatPlatform } from '../integrations/chat-platforms.js';
+import { chatThreadKey } from '../integrations/chat-replies.js';
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult, EvalContext, TaskGroup, forClauseValues, attentionCandidates } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
 import { assertInFlightComputerEdit, computerOf, computerResizable, describeMachine, machineShape, normalizeComputer, sameMachine,
@@ -2802,13 +2804,19 @@ export class KarmaxApi {
     return this.incomingWebhooks().list(projectId);
   }
 
-  /** The secret is in the answer once; it is never shown again. */
-  async createIncomingWebhook(token: string, projectId: string, input: { name: string; type?: string }): Promise<{ hook: IncomingWebhook; secret: string }> {
+  /** The secret is in the answer once; it is never shown again. A chat bot
+   *  (`kind`) is connected to its platform with `credentials`, at `hookUrl`. */
+  async createIncomingWebhook(token: string, projectId: string,
+    input: { name: string; type?: string; kind?: string; credentials?: Record<string, string> },
+    options: { hookUrl?: (hookId: string) => string; fetcher?: typeof fetch } = {}): Promise<{ hook: IncomingWebhook; secret?: string; verifyToken?: string }> {
     const caller = (await this.require(token, 'project:settings:write', { projectId }));
     const project = (await this.deps.store.getProject(projectId));
     if (!project) throw new NotFoundError(`no project ${projectId}`);
+    if (input.kind !== undefined && !isChatPlatform(input.kind)) throw new ValidationError(`unknown chat platform "${input.kind}"`);
     return this.webhookCall(() => this.incomingWebhooks().create({ organizationId: project.organizationId ?? 'org_personal', projectId,
-      name: String(input.name ?? ''), ...(input.type ? { type: String(input.type) } : {}), createdBy: caller.principal }));
+      name: String(input.name ?? ''), ...(input.type ? { type: String(input.type) } : {}), createdBy: caller.principal,
+      ...(input.kind ? { kind: input.kind as ChatPlatform, credentials: input.credentials ?? {} } : {}),
+      ...(options.hookUrl ? { url: options.hookUrl } : {}), ...(options.fetcher ? { fetcher: options.fetcher } : {}) }));
   }
 
   private async ownedWebhook(token: string, hookId: string): Promise<IncomingWebhook> {
@@ -2836,22 +2844,38 @@ export class KarmaxApi {
 
   /**
    * A delivery to a hook's public URL. Unknown hooks and bad credentials are the
-   * same refusal, so the URL space cannot be probed for valid ids.
+   * same refusal, so the URL space cannot be probed for valid ids. A chat bot's
+   * delivery may be a protocol handshake to `answer` at once, and may carry
+   * several mentions; a plain webhook's delivery is one event.
    */
-  async receiveIncomingWebhook(hookId: string, delivery: { raw: Buffer; contentType?: string; headers: Record<string, string | string[] | undefined>; query: URLSearchParams }):
-    Promise<{ event: ProjectEvent; duplicate: boolean }> {
+  async receiveIncomingWebhook(hookId: string, delivery: { method?: string; raw: Buffer; contentType?: string; headers: Record<string, string | string[] | undefined>; query: URLSearchParams }):
+    Promise<{ answer?: { status: number; body: unknown; text?: boolean }; events: Array<{ event: ProjectEvent; duplicate: boolean }> }> {
     const hooks = this.incomingWebhooks();
     const hook = await hooks.get(hookId);
-    if (!hook || !(await this.deps.store.getProject(hook.projectId)) || !hooks.verify(hook, delivery.raw, delivery.headers, delivery.query)) {
+    const project = hook ? await this.deps.store.getProject(hook.projectId) : undefined;
+    const method = delivery.method ?? 'POST';
+    const inbound = hook && project && hook.kind ? hooks.receiveChat(hook, { method, raw: delivery.raw, headers: delivery.headers, query: delivery.query })
+      : hook && project && method === 'POST' && hooks.verify(hook, delivery.raw, delivery.headers, delivery.query) ? undefined : 'refused' as const;
+    if (!hook || inbound === 'refused') {
       if (hook) await hooks.noteDelivery(hook.id, 'refused a delivery without a valid signature or token');
       throw new WebhookAuthError();
     }
+    const from = { organizationId: hook.organizationId, projectId: hook.projectId, source: `${hook.kind ? 'chat' : 'webhook'}:${hook.id}`, origin: 'external' as const, hops: 0 };
     try {
-      const result = await this.ingestProjectEvent(
-        { organizationId: hook.organizationId, projectId: hook.projectId, source: `webhook:${hook.id}`, origin: 'external', hops: 0 },
-        { type: hook.type, key: webhookDeliveryKey(delivery.headers, delivery.raw), payload: parseWebhookBody(delivery.raw, delivery.contentType) });
-      await hooks.noteDelivery(hook.id);
-      return result;
+      const events: Array<{ event: ProjectEvent; duplicate: boolean }> = [];
+      if (!inbound) {
+        events.push(await this.ingestProjectEvent(from, { type: hook.type, key: webhookDeliveryKey(delivery.headers, delivery.raw),
+          payload: parseWebhookBody(delivery.raw, delivery.contentType) }));
+      } else {
+        for (const mention of inbound.mentions) {
+          // A reply to the bot's own message belongs to the thread that message answered.
+          const thread = mention.thread ? (await this.deps.store.kvGet(chatThreadKey(hook.id, mention.thread))) ?? mention.thread : undefined;
+          const { key, url, ...payload } = { ...mention, ...(thread ? { thread } : {}) };
+          events.push(await this.ingestProjectEvent(from, { type: 'chat.mention', key, ...(url ? { subject: url } : {}), payload: { ...payload, ...(url ? { url } : {}) } }));
+        }
+      }
+      if (events.length || !inbound?.answer) await hooks.noteDelivery(hook.id);
+      return { ...(inbound?.answer ? { answer: inbound.answer } : {}), events };
     } catch (error) {
       await hooks.noteDelivery(hook.id, error instanceof Error ? error.message : String(error));
       throw error;
