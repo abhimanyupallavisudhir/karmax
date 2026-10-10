@@ -336,6 +336,32 @@ jobs:
           docker run --rm --user postgres -e KEYS=/keys -v "$keys:/keys:ro" \
             -v "$PWD/tests/fixtures/pg-backup-pitr.sh:/pitr.sh:ro" --entrypoint bash "$image" /pitr.sh
 
+      # Memory caps (deploy/README.md, "Memory caps"): the stack runs with the
+      # defaults, PostgreSQL and the app size themselves to their own caps,
+      # and the operator's report shows both.
+      - name: Size the app and PostgreSQL to their containers' caps
+        if: steps.scope.outputs.artifacts == 'true'
+        env:
+          COMPOSE_FILE: deploy/compose.turnkey.yml
+          COMPOSE_ENV_FILES: deploy/.turnkey.env
+        run: |
+          setting() { docker compose exec -T postgresql psql -U temporal -d postgres -Atc "SHOW $1"; }
+          echo "shared_buffers $(setting shared_buffers), effective_cache_size $(setting effective_cache_size), max_connections $(setting max_connections)"
+          [ "$(setting shared_buffers)" = 192MB ]
+          [ "$(setting effective_cache_size)" = 576MB ]
+          [ "$(setting max_connections)" = 100 ]
+          [ "$(docker compose exec -T app node --import tsx src/runtime/memory-budget.ts gateway)" = 614 ]
+          # Another cap, in the same images: the budget and the settings follow it.
+          [ "$(docker run --rm --memory 2g -e KARMAX_WORKER_MODE=process karmax-app node --import tsx src/runtime/memory-budget.ts gateway)" = 307 ]
+          image=$(docker compose config --images | grep -m1 '^karmax-postgresql:')
+          sized=$(docker run --rm --memory 1g --entrypoint karmax-postgres "$image" --print)
+          echo "1g: $sized"
+          case "$sized" in *'shared_buffers=256MB effective_cache_size=768MB'*) ;; *) exit 1 ;; esac
+          ./deploy/karmax doctor | tee "$RUNNER_TEMP/doctor-memory.log"
+          grep -E 'karmax-app-1 +[0-9.]+[KMG]i?B / 4GiB' "$RUNNER_TEMP/doctor-memory.log"
+          grep -E 'karmax-postgresql-1 +[0-9.]+[KMG]i?B / 768MiB' "$RUNNER_TEMP/doctor-memory.log"
+          grep -F 'PostgreSQL: shared_buffers 192MB, effective_cache_size 576MB, work_mem 4MB, maintenance_work_mem 64MB;' "$RUNNER_TEMP/doctor-memory.log"
+
       - name: Load native runtime modules in the image
         if: steps.scope.outputs.artifacts == 'true'
         run: docker run --rm karmax-app node -e "require('node:sqlite'); require('node-pty')"
@@ -362,6 +388,16 @@ jobs:
           docker compose --env-file deploy/.env.example -f deploy/compose.hosted.yml config -q
           printf 'KARMAX_DOMAIN=karmax.example.com\nKARMAX_PREVIEW_DOMAIN=preview.karmax.example.com\nPOSTGRES_PASSWORD=ci\n' > "$RUNNER_TEMP/ci.env"
           docker compose --project-directory deploy --env-file "$RUNNER_TEMP/ci.env" -f deploy/compose.turnkey.yml config -q
+          # The memory caps: the defaults, then the 16 GB host's profile.
+          caps() { docker compose --project-directory deploy --env-file "$RUNNER_TEMP/ci.env" -f deploy/compose.turnkey.yml config --format json \
+            | jq -r '[.services | to_entries[] | "\(.key)=\(.value.mem_limit)"] | sort | join(" ")'; }
+          echo "default caps: $(caps)"
+          [ "$(caps)" = 'app=4294967296 caddy=536870912 karmax-database=268435456 pg-backup=536870912 postgresql=805306368 temporal-namespace=536870912 temporal-schema=536870912 temporal=2147483648' ]
+          printf 'KARMAX_APP_MEM_LIMIT=7g\nKARMAX_POSTGRES_MEM_LIMIT=3g\nKARMAX_POSTGRES_MAX_CONNECTIONS=150\nKARMAX_CADDY_MEM_LIMIT=256m\n' >> "$RUNNER_TEMP/ci.env"
+          echo "overridden caps: $(caps)"
+          [ "$(caps)" = 'app=7516192768 caddy=268435456 karmax-database=268435456 pg-backup=536870912 postgresql=3221225472 temporal-namespace=536870912 temporal-schema=536870912 temporal=2147483648' ]
+          { cat deploy/.env.example; echo KARMAX_APP_MEM_LIMIT=7g; } > "$RUNNER_TEMP/hosted.env"
+          [ "$(docker compose --env-file "$RUNNER_TEMP/hosted.env" -f deploy/compose.hosted.yml config --format json | jq -r .services.app.mem_limit)" = 7516192768 ]
 
       - name: Show the turnkey stack after a failure
         if: failure() && steps.scope.outputs.artifacts == 'true'

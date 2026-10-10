@@ -358,6 +358,35 @@ report_app_role() {
   done
 }
 
+# Each running container's memory use against its cap (KARMAX_*_MEM_LIMIT in
+# .turnkey.env), what the caps leave the host, and PostgreSQL's sizing to its
+# own cap (deploy/README.md, "Memory caps"). Never fails: it only reports.
+report_memory() {
+  containers=$(dc ps -q < /dev/null) || containers=''
+  [ -n "$containers" ] || { note 'No container is running, so there are no memory caps to report.'; return 0; }
+  note 'Memory in use / cap:'
+  # shellcheck disable=SC2086 # one argument per container
+  docker stats --no-stream --format '    {{.Name}}  {{.MemUsage}}' $containers < /dev/null || true
+  # shellcheck disable=SC2086
+  caps_mb=$(docker inspect --format '{{.HostConfig.Memory}}' $containers < /dev/null 2>/dev/null \
+    | awk '$1 == 0 { uncapped = 1 } { sum += $1 } END { if (!uncapped && NR) printf "%d", sum / 1048576 }') || caps_mb=''
+  host_mb=$(awk '/^MemTotal:/ { printf "%d", $2 / 1024 }' /proc/meminfo 2>/dev/null) || host_mb=''
+  if [ -n "$caps_mb" ] && [ -n "$host_mb" ]; then
+    if [ "$caps_mb" -gt "$host_mb" ]; then
+      echo "karmax: warning: the running containers' memory caps add up to $caps_mb MiB, more than the host's $host_mb MiB; lower a KARMAX_*_MEM_LIMIT in .turnkey.env" >&2
+    else
+      note "The caps add up to $caps_mb of the host's $host_mb MiB, leaving $((host_mb - caps_mb)) MiB for the host itself."
+    fi
+  fi
+  settings=$(dc exec -T postgresql psql -U temporal -d postgres -Atc "SELECT 'shared_buffers ' || current_setting('shared_buffers')
+    || ', effective_cache_size ' || current_setting('effective_cache_size') || ', work_mem ' || current_setting('work_mem')
+    || ', maintenance_work_mem ' || current_setting('maintenance_work_mem') || '; '
+    || (SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend') || ' of '
+    || current_setting('max_connections') || ' connections in use'" < /dev/null) \
+    && note "PostgreSQL: $settings" \
+    || echo 'karmax: warning: could not read PostgreSQL memory settings' >&2
+}
+
 cmd_doctor() {
   need_docker
   [ -f "$ENV_FILE" ] || die 'this instance is not configured; run `./deploy/karmax up your-domain`'
@@ -371,6 +400,7 @@ cmd_doctor() {
     echo 'karmax: warning: a vault key rotation is unfinished; run ./deploy/karmax rotate-vault-key to finish it' >&2
   fi
   dc ps
+  report_memory
   report_app_role
   # Names the store; an S3 one must accept a write, read-back and delete.
   objects_ok=1

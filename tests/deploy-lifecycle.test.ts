@@ -34,7 +34,13 @@ if (args.includes('cp')) {
 }
 if (args.includes('--sign-checksums')) { fs.readFileSync(0); process.stdout.write('signature-fixture'); }
 if (args.includes('pg_dump')) process.stdout.write('dump-' + args.at(-1));
-if (args.join(' ').includes('pg_stat_activity')) process.stdout.write(process.env.FAKE_SESSIONS ?? '');
+if (args.join(' ').includes('shared_buffers')) {
+  if (process.env.FAKE_PG_MEMORY === undefined) process.exit(1);
+  process.stdout.write(process.env.FAKE_PG_MEMORY);
+} else if (args.join(' ').includes('pg_stat_activity')) process.stdout.write(process.env.FAKE_SESSIONS ?? '');
+if (args.includes('ps') && args.includes('-q')) process.stdout.write(process.env.FAKE_CONTAINERS ?? '');
+if (args[0] === 'stats') process.stdout.write(process.env.FAKE_STATS ?? '');
+if (args[0] === 'inspect') process.stdout.write(process.env.FAKE_CAPS ?? '');
 if (args.join(' ').includes('object-store-check')) {
   process.stdout.write(process.env.FAKE_OBJECT_STORE ?? 'object store: local\\n');
   if (process.env.FAKE_OBJECT_STORE_FAIL) process.exit(1);
@@ -368,6 +374,33 @@ it('doctor reports the role the app connects to PostgreSQL as, and warns on the 
   expect(superuser.stderr).toContain('KARMAX_DATABASE_URL');
   const idle = h.run(['doctor'], '', '', { FAKE_SESSIONS: '' });
   expect(idle.stdout).toContain('The app has no connection to the karmax database');
+});
+
+it('doctor prints each container\'s memory cap, what the caps leave the host, and PostgreSQL\'s sizing', () => {
+  const h = deployment();
+  const GiB = 1024 ** 3;
+  const env = { FAKE_SESSIONS: 'karmax|f\n', FAKE_CONTAINERS: 'c-app\nc-pg\n',
+    FAKE_STATS: '    karmax-app-1  1.1GiB / 7GiB\n    karmax-postgresql-1  356MiB / 3GiB\n',
+    FAKE_PG_MEMORY: 'shared_buffers 768MB, effective_cache_size 2304MB, work_mem 7MB, maintenance_work_mem 192MB; 68 of 150 connections in use\n' };
+  const small = h.run(['doctor'], '', '', { ...env, FAKE_CAPS: `${GiB / 4}\n${GiB / 4}\n` });
+  expect(small.status, small.stderr).toBe(0);
+  expect(small.stdout).toContain('Memory in use / cap:');
+  expect(small.stdout).toContain('karmax-app-1  1.1GiB / 7GiB');
+  expect(small.stdout).toMatch(/The caps add up to 512 of the host's \d+ MiB, leaving \d+ MiB for the host itself\./);
+  expect(small.stdout).toContain('PostgreSQL: shared_buffers 768MB, effective_cache_size 2304MB, work_mem 7MB, maintenance_work_mem 192MB; 68 of 150 connections in use');
+  expect(h.calls().some(args => args[0] === 'stats' && args.includes('--no-stream') && args.includes('c-app') && args.includes('c-pg'))).toBe(true);
+  // Caps past the host's memory are a warning, not a failure; so is a
+  // PostgreSQL that does not answer, and an uncapped container is not summed.
+  const { FAKE_PG_MEMORY: _settings, ...postgresDown } = env;
+  const over = h.run(['doctor'], '', '', { ...postgresDown, FAKE_CAPS: `${1024 * GiB}\n${GiB}\n` });
+  expect(over.status, over.stderr).toBe(0);
+  expect(over.stderr).toMatch(/warning: the running containers' memory caps add up to 1049600 MiB, more than the host's \d+ MiB/);
+  expect(over.stderr).toContain('could not read PostgreSQL memory settings');
+  const uncapped = h.run(['doctor'], '', '', { ...env, FAKE_CAPS: `0\n${GiB}\n` });
+  expect(uncapped.stdout).not.toContain('The caps add up');
+  const none = h.run(['doctor'], '', '', { FAKE_SESSIONS: 'karmax|f\n' });
+  expect(none.status, none.stderr).toBe(0);
+  expect(none.stdout).toContain('No container is running');
 });
 
 it('doctor reports the active object store and fails when an S3 store does not answer its probe', () => {
