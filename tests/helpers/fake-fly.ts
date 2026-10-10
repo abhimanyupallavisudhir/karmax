@@ -22,6 +22,8 @@ export class FakeFly {
   machines = new Map<string, { id: string; app: string; region: string; state: string; config: any; events: any[]; sshd?: LocalSshd }>();
   requests: Array<{ method: string; path: string; body?: any }> = [];
   private ids = 0;
+  /** An organization with no payment method: Fly's free trial. */
+  trial = false;
   readonly root = fs.mkdtempSync(path.join(os.tmpdir(), 'fake-fly-'));
   /** The VM home every machine sees: a symlink to its volume while it runs. */
   readonly home = path.join(this.root, 'home');
@@ -34,6 +36,9 @@ export class FakeFly {
     if (new Headers(init.headers).get('authorization') !== this.token) return json(401, { error: 'unauthorized' });
     const body = init.body ? JSON.parse(String(init.body)) : undefined;
     this.requests.push({ method, path: url.pathname + url.search, body });
+    if (url.hostname === 'api.fly.io' && body.query.includes('billingStatus'))
+      return json(200, { data: { organization: this.trial ? { billingStatus: 'TRIAL_ACTIVE', isCreditCardSaved: false }
+        : { billingStatus: 'CURRENT', isCreditCardSaved: true } } });
     if (url.hostname === 'api.fly.io') {
       const app = this.apps.get(body.variables.input.appId);
       if (!app) return json(200, { errors: [{ message: 'Could not find App' }] });

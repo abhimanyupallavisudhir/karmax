@@ -77,6 +77,7 @@ export class FlyDriver implements VmDriver {
     const api = this.api(connection);
     const region = connection.config.region ?? FLY_DEFAULT_REGION;
     const app = appName(request.labels);
+    await this.assertNotTrial(connection);
     await api('POST', '/apps', { app_name: app, org_slug: organization(connection) });
     try {
       await this.allocateAddress(connection, app);
@@ -224,6 +225,22 @@ export class FlyDriver implements VmDriver {
 
   async test(connection: ResolvedWorldProviderConnection): Promise<void> {
     await this.api(connection)('GET', `/apps?org_slug=${encodeURIComponent(organization(connection))}`);
+    await this.assertNotTrial(connection);
+  }
+
+  /** On Fly's free trial flyd stops every machine 300 s after it starts, before
+   * a world has even provisioned: refuse up front, saying what fixes it. */
+  private async assertNotTrial(connection: ResolvedWorldProviderConnection): Promise<void> {
+    const slug = organization(connection);
+    const status = await this.fetchImpl(GRAPHQL, { method: 'POST', headers: { ...authorization(connection), 'content-type': 'application/json' },
+      body: JSON.stringify({ query: 'query($slug: String!) { organization(slug: $slug) { billingStatus isCreditCardSaved } }', variables: { slug } }),
+      signal: AbortSignal.timeout(30_000) }).then((response) => response.json(), () => undefined) as
+      { data?: { organization?: { billingStatus?: string; isCreditCardSaved?: boolean } } } | undefined;
+    const org = status?.data?.organization;
+    // Unknown (an older API, a network failure) is not proof of a trial.
+    if (org && org.isCreditCardSaved === false && /TRIAL/i.test(org.billingStatus ?? ''))
+      throw new FlyError(`This Fly.io organization is on its free trial, which stops every machine after 5 minutes. `
+        + `Add a payment method at https://fly.io/dashboard/${slug}/billing.`, 402);
   }
 
   private async allocateAddress(connection: ResolvedWorldProviderConnection, app: string): Promise<void> {

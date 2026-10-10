@@ -133,6 +133,16 @@ describe.skipIf(!sshdAvailable)('Fly.io worlds (fake Machines API, real sshd)', 
     expect(fly.apps.size).toBe(0);
   });
 
+  it('refuses an organization on Fly’s free trial, which stops every machine after 5 minutes', async () => {
+    fly.trial = true;
+    await expect(provider.create({ taskId: 'task_trial', base: 'main', generation: 1 }))
+      .rejects.toThrow(/free trial, which stops every machine after 5 minutes\. Add a payment method at https:\/\/fly.io\/dashboard\/personal\/billing/);
+    await expect(new FlyDriver(fly.fetch, 10).test(connection(fly.token))).rejects.toThrow(/free trial/);
+    expect(fly.apps.size).toBe(0);
+    fly.trial = false;
+    await new FlyDriver(fly.fetch, 10).test(connection(fly.token));
+  });
+
   it('refuses an outbound allowlist and a desktop, which a VM cannot enforce or offer', async () => {
     await expect(provider.create({ taskId: 'task_net', base: 'main', network: { allowDomains: ['example.com'] } }))
       .rejects.toThrow(/unrestricted outbound network/);
