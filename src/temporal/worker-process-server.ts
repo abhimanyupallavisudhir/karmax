@@ -2,7 +2,8 @@ import fs from 'node:fs';
 import { Worker as Guardian } from 'node:worker_threads';
 import type { WorkerManager } from './worker-pool.js';
 import type { ExternalWorkflowRef } from '../packages/bundle.js';
-import { heapNow, type WorkerHeap, type WorkerProcessRequest, type WorkerProcessReply, type WorkerProcessNotice } from './worker-process.js';
+import { heapNow, type WorkerHeap, type WorkerJournaledNotice, type WorkerProcessRequest, type WorkerProcessReply, type WorkerProcessNotice } from './worker-process.js';
+import { followUpJournaled } from '../activities/follow-up-wakes.js';
 import { storeMetricsSnapshot } from '../store/transaction-metrics.js';
 
 export interface WorkerProcessRuntime {
@@ -96,6 +97,12 @@ export function serveWorkerProcess(create: () => Promise<WorkerProcessRuntime>, 
   process.once('SIGINT', stop);
   process.on('message', (value: unknown) => {
     if (!value || typeof value !== 'object') return;
+    const journaled = value as Partial<WorkerJournaledNotice>;
+    if (journaled.type === 'worker.journaled') {
+      if (Array.isArray(journaled.taskIds))
+        for (const taskId of journaled.taskIds.slice(0, 1_000)) if (typeof taskId === 'string') followUpJournaled(taskId);
+      return;
+    }
     const request = value as Partial<WorkerProcessRequest>;
     if (request.type !== 'worker.request' || !Number.isSafeInteger(request.id)
       || !['start', 'refresh', 'stop', 'ping'].includes(String(request.action))) return;

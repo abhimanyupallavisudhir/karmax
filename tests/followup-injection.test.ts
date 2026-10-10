@@ -266,6 +266,48 @@ describe('gateFollowUps (LT-13)', () => {
     expect(queries).toBe(1 + FOLLOW_UP_SETTLE_MS / 1_000);
   });
 
+  // Load test 2026-10: every poll read the journal, a few commits a second per
+  // running turn. With wake marks it is read when its task's mark moves.
+  it('reads the journal only when its wake mark moves, and at the recheck bound', async () => {
+    const { gateFollowUps, FOLLOW_UP_JOURNAL_RECHECK_MS } = await import('../src/activities/follow-up-gate.js');
+    let clock = 0, queries = 0, reads = 0, mark = 0;
+    const journal: { seq: number; messageId?: string }[] = [];
+    const inbox: Message[] = [];
+    const pull = gateFollowUps({
+      query: async () => { queries++; return inbox.splice(0); },
+      cursor: async () => 5,
+      journaled: async (seq) => { reads++; return journal.filter((entry) => entry.seq > seq); },
+      mark: () => mark,
+      now: () => clock,
+    });
+    await pull(1);
+    for (clock = 100; clock < 4_000; clock += 100) await pull(1);
+    expect(reads).toBe(0);
+    journal.push({ seq: 6, messageId: 'm-1' });
+    inbox.push({ id: 'm-1', role: 'user', text: 'also add tests', ts: 1 });
+    mark++;
+    clock += 100;
+    expect((await pull(1)).map((m) => m.id)).toEqual(['m-1']);
+    // A second more of reads after a move, then quiet until the recheck bound.
+    for (const end = clock + 1_100; clock < end; clock += 100) await pull(2);
+    const settled = reads;
+    expect(settled).toBeGreaterThan(1);
+    for (const end = clock + FOLLOW_UP_JOURNAL_RECHECK_MS - 200; clock < end; clock += 100) await pull(2);
+    expect(reads).toBe(settled);
+    clock += 300; await pull(2);
+    expect(reads).toBe(settled + 1);
+    expect(queries).toBe(2);
+  });
+
+  it('reads every poll when wake marks are not wired', async () => {
+    const { gateFollowUps } = await import('../src/activities/follow-up-gate.js');
+    let reads = 0;
+    const pull = gateFollowUps({ query: async () => [], cursor: async () => 0, mark: () => undefined,
+      journaled: async () => { reads++; return []; } });
+    for (let i = 0; i < 4; i++) await pull(1);
+    expect(reads).toBe(3);
+  });
+
   it('asks the workflow when the journal cannot be read', async () => {
     const { gateFollowUps } = await import('../src/activities/follow-up-gate.js');
     let queries = 0;

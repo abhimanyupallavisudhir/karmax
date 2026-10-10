@@ -24,11 +24,16 @@ wiki (`ops/performance-history`, risks in `planned/managed-infrastructure`).
 
 ## Findings
 
-October 2026 ([report](../results/load-report-2026-10.md)): the first wall is at **64 concurrently
+October 2026 ([report](../results/load-report-2026-10.md)): the first wall was at **64 concurrently
 active tenants** (96 people, ~240 open tasks) on both master and the integrated branch. Every
-websocket re-derives its owner's permissions from the database whenever any agent turn ends,
-because the end of each turn revokes a token and moves the global authorization epoch. That saturates
-the store's 4-connection pool. Fix that first, then re-run this harness to find the next wall.
+websocket re-derived its owner's permissions from the database whenever any agent turn ended,
+because the end of each turn revoked a token and moved the global authorization epoch. That
+saturated the store's 4-connection pool.
+
+After the fix ([follow-up](../results/load-report-2026-10-after-fix.md)): authority changes are
+scoped, the fan-out routes by organization, and 64 tenants run at API p95 146 ms with events 46 ms
+behind. The wall is now **128 tenants** (192 people, 670 open tasks): workflow tasks back up in the
+activity worker, which still forks `flock` for world locks, on a host at 90 % CPU.
 
 ## What runs where
 

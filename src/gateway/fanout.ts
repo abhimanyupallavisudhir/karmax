@@ -9,19 +9,33 @@ import { setImmediate as yieldTurn } from 'node:timers/promises';
  * connected browsers still observe it. The local bus only wakes the poller to
  * reduce latency. Pages end at the event watermark, so the cursor never passes
  * an event whose transaction is still to commit.
+ *
+ * Subscribers name the organizations whose events they may read, and an event
+ * is offered only to its organization's subscribers and to installation-wide
+ * readers ('all'), each in event order. Offering every tenant's events to every
+ * socket made each decide, per event, about tenants it could never read: the
+ * 2026-10 load test's first wall (benchmarks/results/load-report-2026-10.md).
+ * An organization is a routing bound, not a decision: subscribers still decide
+ * each event they are offered. An event whose task has no project reaches only
+ * installation-wide readers.
  */
 type RoutedEvent = { event: KarmaxEvent & { seq?: number }; projectId?: string; siblingAttempt?: boolean; bytes: number };
+export type FanoutAudience = ReadonlySet<string> | 'all';
 interface Subscriber {
   listener: (event: KarmaxEvent & { seq?: number }, projectId?: string, siblingAttempt?: boolean) => unknown;
   overflow?: () => void;
+  audience: FanoutAudience;
   queue: RoutedEvent[];
   bytes: number;
   running: boolean;
   closed: boolean;
 }
+/** Unsubscribes when called; `audience` changes the organizations it is offered. */
+export type FanoutSubscription = (() => void) & { audience(organizations: FanoutAudience): void };
 
 export class DurableEventFanout {
-  private listeners = new Set<Subscriber>();
+  private everyone = new Set<Subscriber>();
+  private byOrganization = new Map<string, Set<Subscriber>>();
   private cursor!: number;
   private timer!: NodeJS.Timeout;
   private offBus?: () => void;
@@ -49,17 +63,46 @@ export class DurableEventFanout {
     this.offBus = bus?.onAny(() => this.schedule());
   }
 
-  on(listener: Subscriber['listener'], overflow?: () => void): () => void {
-    const subscriber: Subscriber = { listener, overflow, queue: [], bytes: 0, running: false, closed: false };
-    this.listeners.add(subscriber);
-    return () => this.remove(subscriber);
+  on(listener: Subscriber['listener'], overflow?: () => void, audience: FanoutAudience = 'all'): FanoutSubscription {
+    const subscriber: Subscriber = { listener, overflow, audience: 'all', queue: [], bytes: 0, running: false, closed: false };
+    this.index(subscriber, audience);
+    return Object.assign(() => this.remove(subscriber), {
+      audience: (organizations: FanoutAudience) => { if (!subscriber.closed) this.index(subscriber, organizations); },
+    });
+  }
+
+  /** Every subscriber once, whichever organizations it reads. */
+  *subscribers(): Iterable<Readonly<Subscriber>> {
+    const seen = new Set<Subscriber>();
+    for (const subscriber of [...this.everyone, ...[...this.byOrganization.values()].flatMap((set) => [...set])])
+      if (!seen.has(subscriber)) { seen.add(subscriber); yield subscriber; }
+  }
+
+  private index(subscriber: Subscriber, audience: FanoutAudience): void {
+    this.unindex(subscriber);
+    subscriber.audience = audience === 'all' ? 'all' : new Set(audience);
+    if (subscriber.audience === 'all') { this.everyone.add(subscriber); return; }
+    for (const organizationId of subscriber.audience) {
+      let subscribers = this.byOrganization.get(organizationId);
+      if (!subscribers) this.byOrganization.set(organizationId, subscribers = new Set());
+      subscribers.add(subscriber);
+    }
+  }
+
+  private unindex(subscriber: Subscriber): void {
+    if (subscriber.audience === 'all') { this.everyone.delete(subscriber); return; }
+    for (const organizationId of subscriber.audience) {
+      const subscribers = this.byOrganization.get(organizationId);
+      subscribers?.delete(subscriber);
+      if (subscribers && !subscribers.size) this.byOrganization.delete(organizationId);
+    }
   }
 
   private remove(subscriber: Subscriber): void {
     subscriber.closed = true;
     subscriber.queue = [];
     subscriber.bytes = 0;
-    this.listeners.delete(subscriber);
+    this.unindex(subscriber);
   }
 
   private deliver(subscriber: Subscriber, routed: RoutedEvent): void {
@@ -97,7 +140,7 @@ export class DurableEventFanout {
     if (this.scheduled) clearImmediate(this.scheduled);
     clearInterval(this.timer);
     this.offBus?.();
-    for (const subscriber of this.listeners) this.remove(subscriber);
+    for (const subscriber of this.subscribers()) this.remove(subscriber as Subscriber);
   }
 
   private schedule(): void {
@@ -116,7 +159,9 @@ export class DurableEventFanout {
       this.cursor = Math.max(this.cursor, event.seq);
       const route = routes.get(event.taskId);
       const routed = { event, projectId: route?.projectId, siblingAttempt: route?.siblingAttempt, bytes: Buffer.byteLength(JSON.stringify(event)) };
-      for (const subscriber of this.listeners) this.deliver(subscriber, routed);
+      for (const subscriber of this.everyone) this.deliver(subscriber, routed);
+      const organization = route ? this.byOrganization.get(route.organizationId) : undefined;
+      if (organization) for (const subscriber of organization) this.deliver(subscriber, routed);
     }
   }
 

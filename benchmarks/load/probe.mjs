@@ -6,7 +6,16 @@
 // delay and GC pause time over the interval. The timer is unref'd, so the probe
 // never keeps a process alive, and it writes synchronously so a process that is
 // about to die of heap exhaustion still leaves its last sample.
+//
+// Every LOADTEST_PROFILE_EVERY_MS (default 2 min; 0 disables) it also records
+// a LOADTEST_PROFILE_MS (default 20 s) CPU profile of its main thread with the
+// in-process inspector, keeps the profile (<role>-<pid>-<t>.cpuprofile) and
+// appends a summary to <role>-<pid>.profile.jsonl: self time by module (a
+// source file, or a package under node_modules) and the hottest functions, so
+// a report can say what a saturated process spends its core on. Only ever on
+// a load-test copy, never production (wiki ops/performance-history).
 import fs from 'node:fs';
+import inspector from 'node:inspector';
 import path from 'node:path';
 import v8 from 'node:v8';
 import { monitorEventLoopDelay, PerformanceObserver } from 'node:perf_hooks';
@@ -59,5 +68,55 @@ if (role !== 'other') {
     };
     setInterval(sample, every).unref();
     process.on('exit', sample);
+    const profileEvery = Number(process.env.LOADTEST_PROFILE_EVERY_MS ?? 120_000);
+    const profileFor = Number(process.env.LOADTEST_PROFILE_MS) || 20_000;
+    if (profileEvery > 0) setInterval(() => profile(dir, role, profileFor), profileEvery).unref();
   }
+}
+
+/** Where a call frame's code lives: a package, a source file, or the runtime. */
+function moduleOf(url) {
+  if (!url) return '(runtime)';
+  const modules = url.lastIndexOf('node_modules/');
+  if (modules >= 0) {
+    const rest = url.slice(modules + 'node_modules/'.length).split('/');
+    return rest[0].startsWith('@') ? `${rest[0]}/${rest[1]}` : rest[0];
+  }
+  if (url.startsWith('node:')) return url;
+  const source = url.indexOf('/src/');
+  return source >= 0 ? url.slice(source + 1) : url.replace(/^file:\/\//, '');
+}
+
+function profile(dir, role, ms) {
+  const session = new inspector.Session();
+  const post = (method, params) => new Promise((resolve, reject) => session.post(method, params, (error, result) => error ? reject(error) : resolve(result)));
+  const started = Date.now();
+  (async () => {
+    session.connect();
+    await post('Profiler.enable');
+    await post('Profiler.start');
+    await new Promise((resolve) => setTimeout(resolve, ms).unref());
+    const { profile } = await post('Profiler.stop');
+    const deltas = profile.timeDeltas ?? [];
+    const self = new Map();
+    for (let i = 0; i < profile.samples.length; i++) self.set(profile.samples[i], (self.get(profile.samples[i]) ?? 0) + (deltas[i] ?? 0));
+    const total = [...self.values()].reduce((a, b) => a + b, 0) || 1;
+    const byModule = new Map(), byFunction = new Map();
+    for (const node of profile.nodes) {
+      const us = self.get(node.id) ?? 0;
+      if (!us) continue;
+      const frame = node.callFrame;
+      const module = frame.functionName === '(idle)' || frame.functionName === '(program)' || frame.functionName === '(garbage collector)'
+        ? frame.functionName : moduleOf(frame.url);
+      byModule.set(module, (byModule.get(module) ?? 0) + us);
+      const fn = `${frame.functionName || '(anonymous)'} ${moduleOf(frame.url)}:${frame.lineNumber + 1}`;
+      byFunction.set(fn, (byFunction.get(fn) ?? 0) + us);
+    }
+    const top = (map, n) => [...map].sort((a, b) => b[1] - a[1]).slice(0, n)
+      .map(([name, us]) => ({ name, ms: Math.round(us / 1000), pct: Math.round((us / total) * 1000) / 10 }));
+    fs.writeFileSync(path.join(dir, `${role}-${process.pid}-${started}.cpuprofile`), JSON.stringify(profile));
+    fs.appendFileSync(path.join(dir, `${role}-${process.pid}.profile.jsonl`), `${JSON.stringify({
+      t: started, until: Date.now(), role, pid: process.pid, sampledMs: Math.round(total / 1000),
+      modules: top(byModule, 25), functions: top(byFunction, 40) })}\n`);
+  })().catch(() => { /* a profile is best effort */ }).finally(() => { try { session.disconnect(); } catch { /* closed */ } });
 }

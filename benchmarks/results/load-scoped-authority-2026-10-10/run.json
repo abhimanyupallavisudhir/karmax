@@ -1,0 +1,3 @@
+{"runId": "loadtest-20261010T080020Z-270d", "ref": "4fefbc31", "sha": "4fefbc31b5a69170cd8c5d781cefd4a13ab305d2", "label": "scoped-authority", "region": "eu-central-1",
+ "sutType": "c7i.xlarge", "worldType": "c7i.2xlarge", "worldRttMs": 50, "holdSeconds": 300,
+ "maxMinutes": 180, "steps": "default", "driverArgs": "", "startedAt": "2026-10-10T08:00:20Z"}

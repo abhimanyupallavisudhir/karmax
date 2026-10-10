@@ -46,6 +46,7 @@ import { AgentAdapter, type TurnResult, type AdapterTurn } from '../agent/types.
 import { KARMAX_RUNTIME_PROTOCOL, runRuntimeTurn } from '../agent/runtime.js';
 import { TaskSecrets, cardRef, handleRef, paymentCardDetails, recordSecretRefs, secretScope, taskRef } from '../autonomy/task-secrets.js';
 import { gateFollowUps } from './follow-up-gate.js';
+import { FOLLOW_UP_JOURNAL_TYPES, followUpMark } from './follow-up-wakes.js';
 import { acquireAgentSlot, awaitAgentResources, AgentResourcesUnavailableError } from './agent-slots.js';
 import { assemblePrompt } from '../agent/prompt.js';
 import { GLOBAL_INSTRUCTIONS } from '../agent/instructions.js';
@@ -106,7 +107,7 @@ import { paths } from '../config/paths.js';
 import { hostLocal as deploymentHostLocal } from '../config/deployment.js';
 import type { ObjectStore } from '../store/objects.js';
 import { conversationImportObjectKey } from '../store/conversation-imports.js';
-import { ensureProjectWikiRepository, PROJECT_WIKI_BRANCH, setProjectWikiRemote } from '../wiki/repository.js';
+import { ensureProjectWikiRepositoryAsync, PROJECT_WIKI_BRANCH, setProjectWikiRemote } from '../wiki/repository.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { manifest, roleCeiling } from '../contrib/manifests.js';
@@ -1416,7 +1417,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // platform API, so attaching the wiki there would secretly reintroduce a
       // branch, worktree, Git credential, and merge into an otherwise non-Git run.
       const wikiRoot = project
-        ? ensureProjectWikiRepository(deps.contentDir ?? paths().content, project.id)
+        ? await ensureProjectWikiRepositoryAsync(deps.contentDir ?? paths().content, project.id)
         : undefined;
       if (project && !(await store.projectWiki(project.id))) (await store.setProjectWikiRepository(project.id));
       const wikiRepository = project ? (await store.projectWiki(project.id))?.repository : undefined;
@@ -2527,7 +2528,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                 }
               },
               cursor: () => store.latestEventSeq(),
-              journaled: async (seq) => (await store.eventsOfType(args.taskId, ['conversation.message', 'view.updated', 'subtask.parent-response'], seq))
+              mark: () => followUpMark(args.taskId),
+              journaled: async (seq) => (await store.eventsOfType(args.taskId, FOLLOW_UP_JOURNAL_TYPES, seq))
                 .map(event => ({ seq: event.seq, pending: event.type === 'subtask.parent-response', messageId: event.type === 'conversation.message'
                   ? String((event.payload as { message?: { id?: string } }).message?.id ?? `seq:${event.seq}`) : undefined })),
             })

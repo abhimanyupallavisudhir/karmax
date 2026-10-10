@@ -1,4 +1,5 @@
 import { monitorEventLoopDelay, performance } from 'node:perf_hooks';
+import { authorityChangeCounts } from '../store/authorization-epoch.js';
 import { STORE_BOUNDS, storeMetricsSnapshot, type StoreMetricsSnapshot } from '../store/transaction-metrics.js';
 import { heapNow, type WorkerHeap } from '../temporal/worker-process.js';
 
@@ -68,6 +69,9 @@ export class GatewayMetrics {
         `karmax_http_errors_total{route="${route}"} ${sample.errors}`);
     }
     lines.push(...storeLines({ gateway: storeMetricsSnapshot(), ...(worker ? { worker } : {}) }));
+    const authority = authorityChangeCounts();
+    lines.push('# TYPE karmax_authority_changes_total counter',
+      `karmax_authority_changes_total{scope="all"} ${authority.all}`, `karmax_authority_changes_total{scope="scoped"} ${authority.scoped}`);
     return lines.join('\n') + '\n';
   }
 

@@ -5831,6 +5831,60 @@ export class Store {
     return rows.map(row => ({ ...row, principal: JSON.parse(row.principal) }));
   }
 
+  /**
+   * Everything a principal's capabilities in one scope are derived from
+   * (`capabilityPolicy`), in one round trip: the project's organization, the
+   * principal's grants, the project's memberships, the person's teams and
+   * organizations, and the profiles defined in the scope. A socket used to
+   * re-decide with three to six sequential reads, through a 4-connection pool
+   * (2026-10 load test). Rows are tagged with the read they answer.
+   */
+  async capabilityInputsAsync(principalId: string, projectId?: string, organizationId?: string): Promise<Array<{ kind: string; a: string | null; b: string | null; c: string | null }>> {
+    const userId = principalId.startsWith('user:') ? principalId.slice(5) : '';
+    const project = projectId ?? '';
+    return this.readRows(`SELECT 'organization' AS kind, CAST(id AS TEXT) AS a, CAST(COALESCE(organizationId, 'org_personal') AS TEXT) AS b, CAST(NULL AS TEXT) AS c FROM projects WHERE id = ?
+      UNION ALL SELECT 'grant', CAST(principalId AS TEXT), CAST(scopeKey AS TEXT), CAST(json AS TEXT) FROM principal_grants WHERE principalId = ?
+      UNION ALL SELECT 'profile', CAST(scopeKey AS TEXT), CAST(id AS TEXT), CAST(json AS TEXT) FROM authorization_profiles
+        WHERE scopeKey IN ('global', ?, ?, 'organization:' || COALESCE((SELECT organizationId FROM projects WHERE id = ?), 'org_personal'))
+      UNION ALL SELECT 'member', CAST(principal AS TEXT), CAST(role AS TEXT), CAST(joinedAt AS TEXT) FROM project_memberships WHERE projectId = ?
+      UNION ALL SELECT 'team', CAST(teamId AS TEXT), CAST(NULL AS TEXT), CAST(NULL AS TEXT) FROM team_memberships WHERE userId = ?
+      UNION ALL SELECT 'orgMember', CAST(organizationId AS TEXT), CAST(NULL AS TEXT), CAST(NULL AS TEXT) FROM organization_memberships WHERE userId = ?`,
+    [project, principalId, `project:${project}`, `organization:${organizationId ?? ''}`, project, project, userId, userId]);
+  }
+
+  /**
+   * Where a person's access can come from, in one round trip: whether a
+   * global grant reaches every organization, the organizations reached by
+   * their grants and memberships (and their teams'), and the teams and
+   * organizations they belong to. A superset of what they may read: the
+   * gateway offers a socket only these organizations' events and still
+   * decides each one.
+   */
+  async personReachAsync(userId: string): Promise<{ all: boolean; organizations: string[]; teams: string[]; memberOf: string[] }> {
+    const principal = `user:${userId}`;
+    const rows = await this.readRows<{ kind: string; a: string | null; b: string | null }>(
+      `SELECT 'grant' AS kind, CAST(g.scopeKey AS TEXT) AS a, CAST(p.organizationId AS TEXT) AS b FROM principal_grants g
+         LEFT JOIN projects p ON p.id = SUBSTR(g.scopeKey, 9) AND g.scopeKey LIKE 'project:%' WHERE g.principalId = ?
+       UNION ALL SELECT 'member', CAST(organizationId AS TEXT), CAST(NULL AS TEXT) FROM organization_memberships WHERE userId = ?
+       UNION ALL SELECT 'team', CAST(teamId AS TEXT), CAST(NULL AS TEXT) FROM team_memberships WHERE userId = ?
+       UNION ALL SELECT 'project', CAST(m.projectId AS TEXT), CAST(COALESCE(p.organizationId, 'org_personal') AS TEXT) FROM project_memberships m
+         JOIN projects p ON p.id = m.projectId
+         WHERE m.principalKey = ? OR m.principalKey IN (SELECT 'team:' || teamId FROM team_memberships WHERE userId = ?)`,
+      [principal, userId, userId, principal, userId]);
+    const organizations = new Set<string>(), teams: string[] = [], memberOf: string[] = [];
+    let all = false;
+    for (const row of rows) {
+      if (row.kind === 'grant') {
+        if (row.a === 'global') all = true;
+        else if (row.a?.startsWith('organization:')) organizations.add(row.a.slice(13));
+        else if (row.a?.startsWith('project:')) organizations.add(row.b ?? 'org_personal');
+      } else if (row.kind === 'member') { organizations.add(row.a!); memberOf.push(row.a!); }
+      else if (row.kind === 'team') teams.push(row.a!);
+      else if (row.kind === 'project') organizations.add(row.b!);
+    }
+    return { all, organizations: [...organizations], teams, memberOf };
+  }
+
   async hasTeamMembershipAsync(teamId: string, userId: string): Promise<boolean> {
     return (await this.readRows('SELECT 1 FROM team_memberships WHERE teamId=? AND userId=?', [teamId, userId])).length > 0;
   }
@@ -6412,15 +6466,18 @@ export class Store {
 
   /** Each task's project, and whether it is an attempt other than its intent's
    *  principal: task lists show only principals, so live events say so (RQ-3). */
-  async taskEventRoutes(taskIds: readonly string[]): Promise<Map<string, { projectId: string; siblingAttempt: boolean }>> {
-    const result = new Map<string, { projectId: string; siblingAttempt: boolean }>();
+  /** Each task's project and organization, for routing its events (gateway fan-out). */
+  async taskEventRoutes(taskIds: readonly string[]): Promise<Map<string, { projectId: string; organizationId: string; siblingAttempt: boolean }>> {
+    const result = new Map<string, { projectId: string; organizationId: string; siblingAttempt: boolean }>();
     const ids = [...new Set(taskIds)];
     for (let offset = 0; offset < ids.length; offset += 500) {
       const batch = ids.slice(offset, offset + 500);
-      const rows = await this.readRows<{ id: string; projectId: string; principalAttemptId: string | null }>(
-        `SELECT t.id, t.projectId, i.principalAttemptId FROM tasks t LEFT JOIN task_intents i ON i.id=t.intentId
+      const rows = await this.readRows<{ id: string; projectId: string; organizationId: string | null; principalAttemptId: string | null }>(
+        `SELECT t.id, t.projectId, COALESCE(p.organizationId, 'org_personal') AS organizationId, i.principalAttemptId
+         FROM tasks t LEFT JOIN task_intents i ON i.id=t.intentId LEFT JOIN projects p ON p.id=t.projectId
          WHERE t.id IN (${batch.map(() => '?').join(',')})`, batch);
-      for (const row of rows) result.set(row.id, { projectId: row.projectId, siblingAttempt: !!row.principalAttemptId && row.principalAttemptId !== row.id });
+      for (const row of rows) result.set(row.id, { projectId: row.projectId, organizationId: row.organizationId ?? 'org_personal',
+        siblingAttempt: !!row.principalAttemptId && row.principalAttemptId !== row.id });
     }
     return result;
   }
@@ -8835,6 +8892,12 @@ export class Store {
     const r = (await this.db.prepare('SELECT json FROM scoped_tokens WHERE tokenId=? AND revokedAt IS NULL AND expiresAt>?')
       .get(tokenId, Date.now())) as any;
     return r ? JSON.parse(r.json) : undefined;
+  }
+
+  /** A token by id with its digest, revoked or not: a connection's ancestry. */
+  async scopedTokenRowById(tokenId: string): Promise<{ tokenHash: string; record: Record<string, unknown> } | undefined> {
+    const [row] = await this.readRows<{ tokenHash: string; json: string }>('SELECT tokenHash, json FROM scoped_tokens WHERE tokenId=?', [tokenId]);
+    return row ? { tokenHash: row.tokenHash, record: JSON.parse(row.json) } : undefined;
   }
 
   async putHumanDelegation(id: string, record: Record<string, unknown>, expiresAt: number): Promise<void> {
