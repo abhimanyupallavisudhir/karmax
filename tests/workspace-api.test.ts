@@ -180,3 +180,45 @@ it('replaces a task world\'s private copy with a workspace snapshot exactly (fil
   await f.store.updateResourceAttachment(f.data.id, { access: 'read', publish: 'discard' });
   expect((await f.post(`/api/tasks/${task.id}/resources/${f.data.id}/append-grant`, maintainer)).status).toBe(403);
 });
+
+// An on-demand resource's version is one snapshot per top-level folder: a
+// laptop pulls every part, and its push of the whole folder is split into parts
+// on the server, keeping the snapshots of parts it did not change.
+it('serves an on-demand version as parts and splits a laptop\'s push into them', async () => {
+  const f = await fixture();
+  await f.store.updateResourceAttachment(f.data.id, { onDemand: true });
+  const maintainer = await f.tokenFor('maintainer');
+  const local = path.join(f.dir, 'laptop', 'data');
+  fs.mkdirSync(path.join(local, 'ocr'), { recursive: true });
+  fs.writeFileSync(path.join(local, 'ocr', 'page.txt'), 'ocr');
+  fs.mkdirSync(path.join(local, 'pages'), { recursive: true });
+  for (const file of f.corpus) fs.writeFileSync(path.join(local, file.path), file.data);
+  fs.writeFileSync(path.join(local, 'README.md'), 'top-level');
+  const save = async (baseRevisionId: string) => {
+    const append = await (await f.post(`/api/projects/${f.project.id}/resources/${f.data.id}/append-grant`, maintainer, { baseRevisionId })).json();
+    const backup = await runHostRestic(['backup', '--json', '--host', 'tavya', '--ignore-inode', '--no-cache', '.'], append.env, { cwd: local });
+    expect(backup.code).toBe(0);
+    return (await (await f.post(`/api/projects/${f.project.id}/resources/${f.data.id}/revisions`, maintainer,
+      { snapshot: JSON.parse(backup.stdout.trim().split('\n').pop()!).snapshot_id, baseRevisionId })).json());
+  };
+  const saved = await save(f.first.id);
+  expect(saved).toMatchObject({ unchanged: false, revision: { parentRevisionId: f.first.id, files: 22 } });
+  const revision = (await f.store.getResourceRevision(saved.revision.id))!;
+  const parts = JSON.parse(revision.sealedRef).parts;
+  expect(Object.keys(parts).sort()).toEqual(['.', 'ocr', 'pages']);
+  // `pages` did not change from the first version (split when it was read): it keeps that snapshot.
+  const first = JSON.parse((await f.store.getResourceRevision(f.first.id))!.sealedRef);
+  expect(parts.pages).toEqual(first.parts.pages);
+
+  const read = await (await f.post(`/api/projects/${f.project.id}/resources/${f.data.id}/read-grant`, await f.tokenFor('developer'))).json();
+  expect(read.snapshot).toBeUndefined();
+  expect(read.parts).toEqual(Object.fromEntries(Object.entries(parts).map(([name, part]) => [name, (part as { snapshot: string }).snapshot])));
+  const other = path.join(f.dir, 'other-laptop');
+  for (const [name, snapshot] of Object.entries(read.parts as Record<string, string>))
+    expect((await runHostRestic(['restore', snapshot, '--target', other, '--no-lock', '--no-cache'], read.env)).code).toBe(0);
+  expect(fs.readFileSync(path.join(other, 'README.md'), 'utf8')).toBe('top-level');
+  for (const file of f.corpus) expect(fs.readFileSync(path.join(other, file.path)).equals(file.data)).toBe(true);
+
+  // The same files again: no new version.
+  expect(await save(saved.revision.id)).toMatchObject({ unchanged: true, revision: { id: saved.revision.id } });
+});

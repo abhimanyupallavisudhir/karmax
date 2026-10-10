@@ -268,7 +268,7 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
   private async restoreKeeping(place: ResticPlace, attachment: Repository, snapshot: string, options: ResticRunOptions): Promise<void> {
     // Named by the job's key, so a retry restores into the same directory and resumes.
     const scratch = path.posix.join(place.world.handle.root, `.karmax-injection/restore-${crypto.createHash('sha256').update(options.key).digest('hex').slice(0, 12)}`);
-    await this.restore({ world: place.world, path: scratch }, attachment, snapshot, options);
+    await this.restore({ world: place.world, path: scratch }, attachment, snapshot, { ...options, keep: false });
     const merged = await place.world.exec('bash', ['-c', `${MERGE_TREE}\nmkdir -p -- "$2"; merge "$1" "$2"; rm -rf -- "$1"`, 'merge', scratch, place.path],
       { cwd: place.world.handle.root, timeoutMs: 10 * 60_000 });
     if (merged.code !== 0) throw new Error(`restoring the resource failed: ${(merged.stderr || merged.stdout).trim().slice(0, 300)}`);

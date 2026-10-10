@@ -15952,6 +15952,8 @@ async function hydrateProjectSecrets(proj) {
   } catch (error) { if (renderIsCurrent()) paneError(box, error, () => hydrateProjectSecrets(proj)); }
 }
 
+const ON_DEMAND_TIP = 'Tasks get a list of this folder instead of a full copy, and download only the top-level folders they need, so large data fits on their disk. Folders a task never downloads stay exactly as they are.';
+
 async function hydrateProjectData(proj) {
   const box = $('#project-data-box'); if (!box || S.projectId !== proj.id) return;
   const renderIsCurrent = beginAsyncElementRender(box);
@@ -15965,13 +15967,14 @@ async function hydrateProjectData(proj) {
     const storageName = (id) => storageLocations.find((location) => location.id === id)?.name
       || storageLocations.find((location) => location.isDefault)?.name || 'Managed storage';
     if (!renderIsCurrent()) return;
-    box.innerHTML = `      ${resources.map((resource) => `<div class="project-resource-row" data-data-resource="${esc(resource.id)}"><div class="project-resource-main"><b>${esc(resource.name)}</b><div class="project-resource-meta"><span class="project-resource-location"><span>Inside each task</span><code>${esc(resource.target.path)}</code></span><span class="chip">${esc(storageName(resource.storageLocationId))}</span><span class="chip">${resource.access === 'write' ? 'private writable copy' : 'read-only'}</span><span class="chip">${resource.publish === 'review' ? 'changes can be promoted' : 'task changes discarded'}</span>${resource.revision ? `<span>${formatBytes(resource.revision.bytes)} · revision ${esc(resource.revision.id)}</span>` : '<span>No initial data</span>'}</div></div><button class="btn sm resource-toggle">${resource.enabled ? 'Disable' : 'Enable'}</button><button class="btn sm danger resource-delete">Remove</button></div>`).join('')}
+    box.innerHTML = `      ${resources.map((resource) => `<div class="project-resource-row" data-data-resource="${esc(resource.id)}"><div class="project-resource-main"><b>${esc(resource.name)}</b><div class="project-resource-meta"><span class="project-resource-location"><span>Inside each task</span><code>${esc(resource.target.path)}</code></span><span class="chip">${esc(storageName(resource.storageLocationId))}</span><span class="chip">${resource.access === 'write' ? 'private writable copy' : 'read-only'}</span><span class="chip">${resource.publish === 'review' ? 'changes can be promoted' : 'task changes discarded'}</span>${resource.revision ? `<span>${formatBytes(resource.revision.bytes)} · revision ${esc(resource.revision.id)}</span>` : '<span>No initial data</span>'}</div></div>${resource.source?.shape === 'file' ? '' : `<label class="resource-on-demand">On demand ${policyTip(ON_DEMAND_TIP)}<input class="toggle resource-on-demand-toggle" type="checkbox" ${resource.onDemand ? 'checked' : ''} aria-label="Load ${esc(resource.name)} on demand"></label>`}<button class="btn sm resource-toggle">${resource.enabled ? 'Disable' : 'Enable'}</button><button class="btn sm danger resource-delete">Remove</button></div>`).join('')}
       <details class="settings-disclosure compact" id="data-add-panel"><summary><b>Add data</b></summary>
         <div class="project-form-grid">
           <label class="form-row"><span>Name</span><input id="data-name" placeholder="Training data"></label>
           <label class="form-row"><span>Mount at path <small>(repo-relative)</small></span><input id="data-path" placeholder="data/training-data"></label>
           <label class="form-row"><span>Task access</span><select id="data-access"><option value="read">Read-only</option><option value="write">Writable private copy per task</option></select></label>
           <label class="form-row"><span>If a task changes it</span><select id="data-publish"><option value="discard">Discard its changes</option><option value="review">Offer “Promote” during Review</option></select></label>
+          <label class="form-row form-row-toggle"><span>On demand ${policyTip(ON_DEMAND_TIP)}</span><input id="data-on-demand" class="toggle" type="checkbox"></label>
           <div class="form-row"><span>Storage</span>${readyStorage.length > 1
             ? `<select id="data-storage" aria-label="Storage">${readyStorage.map((location) => `<option value="${esc(location.id)}" ${location.isDefault ? 'selected' : ''}>${esc(location.name)}${location.kind === 's3' ? ' · customer bucket' : ''}</option>`).join('')}</select>`
             : `<input id="data-storage" type="hidden" value="${esc(readyStorage[0]?.id || '')}"><span>${esc(readyStorage[0]?.name || 'Organization default')}</span>`}
@@ -15989,6 +15992,12 @@ async function hydrateProjectData(proj) {
           await api(`/api/projects/${proj.id}/resources/${resource.id}`, { method: 'PATCH', body: JSON.stringify({ enabled: !resource.enabled }) });
           await hydrateProjectData(proj);
         } catch (error) { toast(error.message, true); }
+      });
+      row.querySelector('.resource-on-demand-toggle')?.addEventListener('change', async (event) => {
+        try {
+          await api(`/api/projects/${proj.id}/resources/${resource.id}`, { method: 'PATCH', body: JSON.stringify({ onDemand: event.target.checked }) });
+          resource.onDemand = event.target.checked;
+        } catch (error) { event.target.checked = !event.target.checked; toast(error.message, true); }
       });
       row.querySelector('.resource-delete').addEventListener('click', async () => {
         if (!confirm(`Remove ${resource.name}?`)) return;
@@ -16024,6 +16033,7 @@ async function hydrateProjectData(proj) {
         const created = await api(`/api/projects/${proj.id}/resources`, { method: 'POST', body: JSON.stringify({
           name, driver: 'volume@1', target: { kind: 'path', path: box.querySelector('#data-path').value.trim() || `data/${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` },
           access: box.querySelector('#data-access').value, isolation: 'fork', publish: box.querySelector('#data-publish').value,
+          onDemand: box.querySelector('#data-on-demand').checked || undefined,
           storageLocationId: box.querySelector('#data-storage')?.value || undefined,
           sourcePath: box.querySelector('#data-source')?.value.trim() || undefined,
         }) });

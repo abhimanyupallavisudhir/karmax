@@ -116,7 +116,8 @@ Git ancestry for recovered, forked, or retargeted work: "recorded base" is the i
     title: args.task.title,
     prompt: args.task.prompt,
     worldPath: worldWorkingDirectory(args.world),
-    worldRepos: [describeRepos(args.world), describeEnvironment(args.world), describeComputer(args.world, args.task.taskId, args.computer)].filter(Boolean).join('\n'),
+    worldRepos: [describeRepos(args.world), describeEnvironment(args.world), describeComputer(args.world, args.task.taskId, args.computer),
+      describeData(args.world)].filter(Boolean).join('\n'),
     branch: args.world.branch,
     base: args.world.base,
     target,
@@ -167,6 +168,24 @@ function describeComputer(world: WorldHandle, taskId: string, requested?: Machin
     return `Computer: ${describeMachine(shape)}. This task's computer is now ${describeMachine(requested)}: you move to it when the task parks, so ${move}`;
   return `Computer: ${describeMachine(shape)}. If it is too small (out of disk or memory), resize it yourself with `
     + `platform_request(PATCH, "/api/tasks/${taskId}/params", {"params": {"computer": {"diskGb": 50}}}) (or cpu, memoryMb) and then ${move}`;
+}
+
+/** On-demand project data: what there is, and the command that fetches and drops it. */
+function describeData(world: WorldHandle): string {
+  const projections = Object.values((world.meta?.resourceProjections ?? {}) as Record<string, { target?: string; onDemand?: boolean;
+    bytes?: number; files?: number; parts?: number; held?: number }>).filter((projection) => projection.onDemand && projection.target);
+  if (!projections.length) return '';
+  const tool = `${world.root.replace(/\/+$/, '')}/.karmax-injection/bin/tavya-data`;
+  const listed = projections.map((projection) => `${projection.target} (${gigabytes(projection.bytes ?? 0)}, `
+    + `${(projection.files ?? 0).toLocaleString('en-US')} files in ${projection.parts ?? 0} top-level parts; ${gigabytes(projection.held ?? 0)} on this disk)`);
+  return `Project data on demand: ${listed.join('; ')}. Only what you fetch is on this disk. `
+    + `\`${tool} ls [path]\` lists its parts (top-level folders) and files with sizes; \`${tool} get <folder>\` fetches a part; `
+    + `\`${tool} drop <folder>\` frees its space again. Fetch only what this task needs. A part you never fetch, or drop, stays in the `
+    + 'project unchanged; deleting files of a part you fetched deletes them from the project when your work is published, so free space with drop, never rm.';
+}
+
+function gigabytes(bytes: number): string {
+  return bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)} GB` : bytes >= 1e6 ? `${Math.round(bytes / 1e6)} MB` : `${Math.round(bytes / 1e3)} KB`;
 }
 
 /**

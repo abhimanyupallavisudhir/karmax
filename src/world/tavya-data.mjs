@@ -76,6 +76,8 @@ function resolve(argument, all) {
   return { resource, relative: folder ? relative : '.', part: folder ? first : ROOT_PART };
 }
 
+function files(count) { return `${count.toLocaleString('en-US')} file${count === 1 ? '' : 's'}`; }
+
 function size(bytes) {
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
   let value = bytes; let unit = 0;
@@ -143,7 +145,7 @@ async function list(argument) {
       const width = Math.max(4, ...names.map((name) => shown(name).length));
       for (const name of names) {
         const value = resource.parts[name];
-        console.log(`  ${shown(name).padEnd(width)}  ${size(value.bytes).padStart(8)}  ${value.files.toLocaleString('en-US').padStart(9)} files${held.has(name) ? '  here' : ''}`);
+        console.log(`  ${shown(name).padEnd(width)}  ${size(value.bytes).padStart(8)}  ${files(value.files).padStart(12)}${held.has(name) ? '  here' : ''}`);
       }
       const extra = [...held].filter((name) => !resource.parts[name]);
       if (extra.length) console.log(`  new here, not saved yet: ${extra.map(shown).join(', ')}`);
@@ -167,7 +169,7 @@ async function list(argument) {
     }
     console.log(`${resource.label}/${relative}${held.has(part) ? '  (here)' : '  (not on this disk: tavya-data get ' + path.posix.join(resource.label, part === ROOT_PART ? '.' : part) + ')'}`);
     for (const [name, child] of [...children].sort((a, b) => a[0].localeCompare(b[0])))
-      console.log(`  ${(child.dir ? `${name}/` : name).padEnd(30)}  ${size(child.bytes).padStart(8)}${child.dir ? `  ${child.files.toLocaleString('en-US')} files` : ''}`);
+      console.log(`  ${(child.dir ? `${name}/` : name).padEnd(30)}  ${size(child.bytes).padStart(8)}${child.dir ? `  ${files(child.files)}` : ''}`);
   }
 }
 

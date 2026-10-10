@@ -9,7 +9,8 @@ import { bytes, CliError, EXIT, type Output } from './util.js';
 import { compareFingerprints, fingerprint, type Manifest, type Workspace } from './workspace.js';
 
 type Resource = Manifest['resources'][number];
-interface Grant { env: Record<string, string>; snapshot?: string; revisionId?: string; parent?: string }
+/** `parts`: an on-demand resource's version, one snapshot per top-level folder (`.`: the files beside them). */
+interface Grant { env: Record<string, string>; snapshot?: string; parts?: Record<string, string>; revisionId?: string; parent?: string }
 
 export interface ResourceChanges { added: string[]; modified: string[]; deleted: string[] }
 
@@ -81,13 +82,45 @@ export async function pullResource(api: Api, workspace: Workspace, resource: Res
     fs.mkdirSync(target, { recursive: true });
     // --delete makes the folder exactly the version, but never inside a checkout's own .git.
     const mirror = !fs.existsSync(path.join(target, '.git'));
-    const run = await restic(['restore', grant.snapshot!, '--target', target, '--no-lock', '--json', ...(mirror ? ['--delete'] : [])],
-      grant.env, { progress: progress(out, label) });
+    if (grant.parts) await restoreParts(grant, target, mirror, resource.name, progress(out, label));
+    else {
+      const run = await restic(['restore', grant.snapshot!, '--target', target, '--no-lock', '--json', ...(mirror ? ['--delete'] : [])],
+        grant.env, { progress: progress(out, label) });
+      if (run.code !== 0) { done(out); throw resticError(run, `pulling ${resource.name}`); }
+    }
     done(out);
-    if (run.code !== 0) throw resticError(run, `pulling ${resource.name}`);
   }
   workspace.setResource(resource.id, { revisionId: grant.revisionId ?? resource.revisionId, snapshot: grant.snapshot, fingerprint: fingerprint(target) });
   return 'pulled';
+}
+
+/** Restore every part of an on-demand version into `target`. With `mirror`,
+ * what no part holds goes: each folder is restored with --delete inside it,
+ * and top-level entries of no part are removed. */
+async function restoreParts(grant: Grant, target: string, mirror: boolean, name: string,
+  onProgress?: (status: { percent: number; bytesDone: number; totalBytes: number }) => void): Promise<void> {
+  const parts = grant.parts!;
+  const run = async (args: string[]) => {
+    const result = await restic(args, grant.env, { progress: onProgress });
+    if (result.code !== 0) throw resticError(result, `pulling ${name}`);
+    return result;
+  };
+  let loose = new Set<string>();
+  if (parts['.']) {
+    const listed = await run(['ls', '--json', '--no-lock', parts['.'], '/']);
+    loose = new Set(listed.stdout.split('\n').filter((line) => line.startsWith('{')).map((line) => JSON.parse(line))
+      .filter((node) => node.struct_type === 'node').map((node) => String(node.name)));
+  }
+  if (mirror) for (const entry of fs.readdirSync(target, { withFileTypes: true })) {
+    if (entry.name === '.git' || (entry.isDirectory() ? parts[entry.name] : loose.has(entry.name))) continue;
+    fs.rmSync(path.join(target, entry.name), { recursive: true, force: true });
+  }
+  for (const [part, snapshot] of Object.entries(parts)) {
+    if (part === '.') continue;
+    fs.mkdirSync(path.join(target, part), { recursive: true });
+    await run(['restore', `${snapshot}:/${part}`, '--target', path.join(target, part), '--no-lock', '--json', ...(mirror ? ['--delete'] : [])]);
+  }
+  if (parts['.']) await run(['restore', parts['.'], '--target', target, '--no-lock', '--json']);
 }
 
 /** Save the resource's files as a snapshot in its repository (an append grant

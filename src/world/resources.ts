@@ -18,7 +18,7 @@ import type { Store } from '../store/db.js';
 import { newId } from '../util/id.js';
 import type { ExecOptions, ExecResult, World, WorldHandle, WorldHttpRequest, WorldHttpResponse,
   WorldProcess, WorldProcessSpec, WorldPty, WorldPtySpec } from './types.js';
-import { worldLocationPath, worldRelativePath, worldRepos, worldWorkingDirectory, worldWorkingRelativePath } from './types.js';
+import { isRemoteWorldKind, worldLocationPath, worldRelativePath, worldRepos, worldWorkingDirectory, worldWorkingRelativePath } from './types.js';
 import { dotenvSecretName, renderDotenv } from '../domain/dotenv.js';
 import type { WorldRegistry } from './registry.js';
 import { QRY_RESOURCE_PUBLISH, RESOURCE_PUBLISH_COORDINATOR_WORKFLOW, SIG_CANCEL_RESOURCE_PUBLISH,
@@ -471,7 +471,8 @@ export class ProjectResourceService {
     revisions: Record<string, string | undefined> = {}, options: { signal?: AbortSignal } = {}): Promise<WorldHandle> {
     const ephemeralPaths = new Set<string>(Array.isArray(world.handle.meta?.ephemeralPaths)
       ? world.handle.meta!.ephemeralPaths as string[] : []);
-    const projections: Record<string, { target: string; revisionId?: string; access: string; onDemand?: true }> = {};
+    const projections: Record<string, { target: string; revisionId?: string; access: string; onDemand?: true; name?: string;
+      bytes?: number; files?: number; parts?: number; held?: number }> = {};
     let compression: boolean | undefined;
     for (const attachment of (await this.store.listResourceAttachments(projectId))) {
       options.signal?.throwIfAborted();
@@ -503,8 +504,8 @@ export class ProjectResourceService {
           if (target !== '.') await ensureWorldExcluded(world, target);
           if (onDemand(attachment)) {
             // Its listing, not its bytes: only the parts this task had fetched before it parked come back.
-            await this.materializeOnDemand(world, taskId, attachment, target, lease.id, revisionId, options.signal);
-            projections[attachment.id] = { target, revisionId, access: attachment.access, onDemand: true };
+            const listing = await this.materializeOnDemand(world, taskId, attachment, target, lease.id, revisionId, options.signal);
+            projections[attachment.id] = { target, revisionId, access: attachment.access, onDemand: true, ...listing };
           } else if (revisionId) {
             const revision = (await this.store.getResourceRevision(revisionId));
             if (!revision) throw new Error(`resource "${attachment.name}" revision is missing`);
@@ -555,7 +556,7 @@ export class ProjectResourceService {
    * last parked are restored (none for anyone else: a sub-task fetches what it
    * needs), and `tavya-data` gets the listing and a grant to fetch the rest. */
   private async materializeOnDemand(world: World, taskId: string, attachment: ResourceAttachment, target: string, leaseId: string,
-    revisionId: string | undefined, signal?: AbortSignal): Promise<void> {
+    revisionId: string | undefined, signal?: AbortSignal): Promise<{ name: string; bytes: number; files: number; parts: number; held: number }> {
     const revision = revisionId ? await this.store.getResourceRevision(revisionId) : undefined;
     if (revisionId && !revision) throw new Error(`resource "${attachment.name}" revision is missing`);
     const parts = revision ? await this.partsOf(attachment, revision) : {};
@@ -574,6 +575,9 @@ export class ProjectResourceService {
         payload: { attachmentId: attachment.id, revisionId, durationMs: Date.now() - startedAt } });
     }
     await this.writeDataFiles(world, attachment, target, repository, parts, held);
+    // For the agent's prompt: what there is, and how much of it is here.
+    return { name: attachment.name, ...partsTotals(parts), parts: Object.keys(parts).length,
+      held: held.reduce((sum, name) => sum + parts[name]!.bytes, 0) };
   }
 
   /** What `tavya-data` works from: the version's parts, the parts here, the grant. */

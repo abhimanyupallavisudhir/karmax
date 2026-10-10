@@ -134,8 +134,9 @@ export interface PartsSave { capture: PartsCapture; fetched: Set<string> }
 export async function saveParts(restic: ResticResources, place: { world: World; path: string }, repository: Repository,
   base: Parts, fetched: Set<string>, options: ResticRunOptions & { quota: boolean }): Promise<PartsSave> {
   const held = new Set(fetched);
-  const disk = await topLevel(place.world, place.path);
-  const present = new Set([...disk.folders, ...(disk.loose.length ? [ROOT_PART] : [])]);
+  const before = await topLevel(place.world, place.path);
+  const present = new Set([...before.folders, ...(before.loose.length ? [ROOT_PART] : [])]);
+  let strays = false;
   for (const name of present) {
     if (!validPartName(name)) throw new Error(`cannot save a top-level entry named ${JSON.stringify(name)}`);
     if (held.has(name)) continue;
@@ -143,9 +144,12 @@ export async function saveParts(restic: ResticResources, place: { world: World; 
       await options.checkContinue?.();
       await restic.restore(place, repository, base[name]!.snapshot, { key: `${options.key}:fetch:${name}`, keep: true,
         ...(options.checkContinue ? { checkContinue: options.checkContinue } : {}) });
+      strays = true;
     }
     held.add(name);
   }
+  // What a part's fetch brought in is saved with it (the top-level files above all).
+  const disk = strays ? await topLevel(place.world, place.path) : before;
   const parts: Parts = { ...base };
   const fresh: string[] = [];
   let added = 0;
