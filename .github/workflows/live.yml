@@ -137,10 +137,16 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/install
       - uses: ./.github/actions/temporal-cli
+      # On-demand resources: the sandboxes reach this runner's repository server through a Cloudflare quick tunnel.
+      - run: |
+          curl -fsSL -o "$RUNNER_TEMP/cloudflared" https://github.com/cloudflare/cloudflared/releases/download/2026.10.0/cloudflared-linux-amd64
+          echo "d33ff2d14475178d2012c2c56beba87389ac5ded27649519f198a7d3134a99db  $RUNNER_TEMP/cloudflared" | sha256sum -c -
+          sudo install "$RUNNER_TEMP/cloudflared" /usr/local/bin/cloudflared
       # The smoke checks, then a whole task: pause at Review, resume, teardown.
-      - run: npx vitest run tests/cloud-live.test.ts tests/e2b-workflow-live.test.ts tests/e2b-computer-live.test.ts
+      - run: npx vitest run tests/cloud-live.test.ts tests/e2b-workflow-live.test.ts tests/e2b-computer-live.test.ts tests/resource-on-demand-live.test.ts
         env:
           KARMAX_RUN_LIVE: '1'
+          KARMAX_LIVE_DATA_GB: '1'
           E2B_API_KEY: ${{ secrets.LIVE_E2B_API_KEY }}
 
   daytona:
