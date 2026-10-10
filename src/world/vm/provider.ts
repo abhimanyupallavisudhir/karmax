@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import path from 'node:path';
 import type { Duplex } from 'node:stream';
 import type { WorldReferenceKeys } from '../reference-keys.js';
@@ -9,7 +10,7 @@ import { serviceHomeLabel } from '../services.js';
 import { provisionGitCredentials, provisionGitRepos, runOrThrow, provisionTimeoutMs, type ProvisionTarget } from '../provision-git.js';
 import { taskBranch } from '../../domain/brand.js';
 import { timed } from '../../timing/index.js';
-import { generateSshKeyPair, quote, SshTransport, type SshEndpoint } from './ssh.js';
+import { generateSshKeyPair, quote, SshTransport, VmTransportError, type SshEndpoint } from './ssh.js';
 import { VmWorld } from './world.js';
 import { VM_HOME, VM_USER, vmProvisionScript, vmProvisionStamp } from './provision.js';
 
@@ -275,17 +276,14 @@ export class VmWorldProvider implements WorldProvider {
   }
 
   /** Provision a machine that has not run this exact provisioning yet: a
-   * stock image does it once, an image or snapshot built with it never. */
+   * stock image does it once, an image or snapshot built with it never. The
+   * script runs detached and is polled: minutes of package installs must not
+   * hang on one SSH channel (on Fly a dropped connection killed it). */
   private async ensureProvisioned(transport: SshTransport, signal?: AbortSignal): Promise<void> {
     const provision = this.options.provision ?? { stamp: vmProvisionStamp(), script: vmProvisionScript(), sudo: true };
     if ((await transport.exec(`test -f ${quote(provision.stamp)}`, { timeoutMs: 30_000 })).code === 0) return;
-    await timed(`${this.kind}.provision`, async () => {
-      const script = `/tmp/karmax-provision-${process.pid}.sh`;
-      await transport.writeFile(script, Buffer.from(provision.script), 0o700);
-      const run = await transport.exec(`${provision.sudo ? 'sudo -n ' : ''}bash ${script} > ${script}.log 2>&1; code=$?; `
-        + `[ $code = 0 ] || tail -n 40 ${script}.log; rm -f ${script}; exit $code`, { timeoutMs: PROVISION_MS, ...(signal ? { signal } : {}) });
-      if (run.code !== 0) throw new Error(`provisioning the ${this.driver.name} machine failed (status ${run.code}): ${run.stdout.toString().slice(-4000)}`);
-    });
+    await timed(`${this.kind}.provision`, () => runDetached(transport, provision.script, provision.sudo, PROVISION_MS, signal)
+      .catch((error) => { throw new Error(`provisioning the ${this.driver.name} machine failed: ${error instanceof Error ? error.message : String(error)}`); }));
   }
 
   private async shapeOf(handle: WorldHandle, connection: ResolvedWorldProviderConnection): Promise<VmShape> {
@@ -340,6 +338,34 @@ export class VmWorldProvider implements WorldProvider {
 
 function keysOf(sealed: Record<string, string>): VmBootKeys {
   return { hostPrivateKey: sealed.hostPrivateKey!, authorizedKey: sealed.clientKey! };
+}
+
+/** Run a root script detached from the SSH connection and wait for its exit
+ * status, riding out dropped connections and an sshd restart. */
+export async function runDetached(transport: SshTransport, script: string, sudo: boolean, timeoutMs: number, signal?: AbortSignal): Promise<void> {
+  const file = `/tmp/karmax-run-${crypto.randomBytes(6).toString('hex')}.sh`;
+  await transport.writeFile(file, Buffer.from(script), 0o700);
+  const started = await transport.exec(`${sudo ? 'sudo -n ' : ''}setsid sh -c 'bash "$0" > "$0.log" 2>&1; echo $? > "$0.exit"' ${quote(file)} < /dev/null > /dev/null 2>&1 &`,
+    { timeoutMs: 60_000 });
+  if (started.code !== 0) throw new Error(`could not start (status ${started.code})`);
+  const until = Date.now() + timeoutMs;
+  for (;;) {
+    signal?.throwIfAborted();
+    await new Promise((resolve) => setTimeout(resolve, 3_000));
+    try {
+      const status = await transport.exec(`cat ${quote(`${file}.exit`)} 2>/dev/null`, { timeoutMs: 30_000 });
+      const code = status.stdout.toString().trim();
+      if (code !== '') {
+        if (code === '0') { await transport.exec(`${sudo ? 'sudo -n ' : ''}rm -f ${quote(file)} ${quote(`${file}.log`)} ${quote(`${file}.exit`)}`, { timeoutMs: 30_000 }).catch(() => undefined); return; }
+        const log = await transport.exec(`tail -n 40 ${quote(`${file}.log`)}`, { timeoutMs: 30_000 }).catch(() => undefined);
+        throw new Error(`status ${code}: ${log?.stdout.toString().slice(-4000) ?? ''}`);
+      }
+    } catch (error) {
+      if (!(error instanceof VmTransportError)) throw error;
+      transport.reset(); // the machine may be restarting sshd; ask again
+    }
+    if (Date.now() > until) throw new Error(`still running after ${Math.round(timeoutMs / 60_000)} minutes`);
+  }
 }
 
 async function growFilesystem(transport: SshTransport, home: string): Promise<void> {

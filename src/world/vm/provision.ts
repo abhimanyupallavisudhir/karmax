@@ -77,7 +77,8 @@ EOF
 grep -q '^Include /etc/ssh/sshd_config.d' /etc/ssh/sshd_config 2> /dev/null || sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' /etc/ssh/sshd_config
 touch "$K/booted"
 ${options.foreground
-    ? 'exec /usr/sbin/sshd -D -e'
+    // The machine's main process: sshd, restarted should anything stop it.
+    ? 'while :; do /usr/sbin/sshd -D -e; sleep 1; done'
     : '(systemctl restart ssh || systemctl restart sshd || /usr/sbin/sshd) > /dev/null 2>&1'}
 `;
 }
@@ -99,6 +100,9 @@ export function vmProvisionScript(): string {
 # karmax VM provisioning (src/world/vm/provision.ts), as root.
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
+# No package may restart a running service: on Fly, sshd is the machine's main process.
+printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d && chmod 755 /usr/sbin/policy-rc.d
+trap 'rm -f /usr/sbin/policy-rc.d' EXIT
 retry() { for attempt in 1 2 3; do "$@" && return 0; sleep $((attempt * 5)); done; return 1; }
 retry apt-get update -qq
 retry apt-get install -y -qq --no-install-recommends ca-certificates curl gnupg git openssh-server sudo xz-utils \\

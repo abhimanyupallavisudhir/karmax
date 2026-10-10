@@ -25,7 +25,7 @@ import { liveEnabled } from './helpers/live-gate.js';
  * Opt in with KARMAX_RUN_LIVE=1, FLY_API_TOKEN and/or HCLOUD_TOKEN, and a
  * metered model key (OPENAI_API_KEY for the default openai/gpt-5-mini).
  * Optional: KARMAX_FLY_REGION, KARMAX_FLY_ORG, KARMAX_FLY_IMAGE,
- * KARMAX_HETZNER_LOCATION. Everything the suite creates is deleted at the end
+ * KARMAX_HETZNER_LOCATION, KARMAX_LIVE_VM_REPORT (a file the report line is appended to). Everything the suite creates is deleted at the end
  * (Hetzner's provisioned snapshot, firewall and key too, unless they existed
  * before it ran). About $0.10 of compute and disk per provider.
  */
@@ -105,6 +105,7 @@ describe.each(providers)('a live $name VM world', ({ name, connection, driver: m
       if (driver instanceof HetznerDriver) await cleanHetzner(connection, before);
       report.leftovers = (await provider.listSandboxes().catch(() => [])).length;
       console.log(`VM-LIVE ${JSON.stringify(report)}`);
+      if (process.env.KARMAX_LIVE_VM_REPORT) fs.appendFileSync(process.env.KARMAX_LIVE_VM_REPORT, `${JSON.stringify({ at: new Date().toISOString(), ...report })}\n`);
     } finally {
       if (previousHome === undefined) delete process.env.KARMAX_HOME; else process.env.KARMAX_HOME = previousHome;
       delete process.env.KARMAX_HETZNER_SNAPSHOTS;
