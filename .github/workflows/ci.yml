@@ -370,17 +370,32 @@ jobs:
         if: steps.scope.outputs.artifacts == 'true'
         run: docker run --rm karmax-app sh -c 'test -z "$(find /app/web -name "*.test.cjs")"'
 
-      # rate_limit is a third-party module; Caddy refuses to start on a directive
-      # it does not recognise, so building the edge is what makes the Caddyfile
-      # below valid at all.
+      # rate_limit and dns cloudflare are third-party modules; Caddy refuses to
+      # start on a directive it does not recognise, so building the edge is what
+      # makes the Caddyfile below valid at all. Both preview certificate modes:
+      # on demand, and one wildcard by DNS-01 with the token read from its secret
+      # file (validating provisions the provider, which refuses an empty token).
       - name: Validate the Caddyfile against the edge image
         if: steps.scope.outputs.artifacts == 'true'
         run: |
-          docker run --rm \
-            -e KARMAX_DOMAIN=karmax.example.com \
-            -e KARMAX_PREVIEW_DOMAIN=preview.karmax.example.com \
-            -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" \
-            karmax-caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          validate() {
+            docker run --rm -e KARMAX_DOMAIN=karmax.example.com "$@" \
+              -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" \
+              karmax-caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          }
+          validate -e KARMAX_PREVIEW_DOMAIN=preview.karmax.example.com
+          token=$(mktemp)
+          printf 'ci-placeholder-token-0123456789abcdef\n' > "$token"
+          chmod 644 "$token"
+          wildcard="-e KARMAX_PREVIEW_DOMAIN=karmax-usercontent.example -e KARMAX_PREVIEW_TLS=cloudflare -e KARMAX_LEGACY_PREVIEW_DOMAIN=preview.karmax.example.com"
+          # shellcheck disable=SC2086
+          validate $wildcard -v "$token:/run/secrets/cloudflare_dns_api_token:ro"
+          : > "$token"
+          # shellcheck disable=SC2086
+          if validate $wildcard -v "$token:/run/secrets/cloudflare_dns_api_token:ro" 2> "$RUNNER_TEMP/caddy.err"; then
+            echo 'Caddy accepted a wildcard without its DNS token' >&2; exit 1
+          fi
+          grep -F "provision dns.providers.cloudflare" "$RUNNER_TEMP/caddy.err"
 
       - name: Validate both compose profiles
         if: steps.scope.outputs.artifacts == 'true'

@@ -84,6 +84,7 @@ import {
 } from '../domain/entitlements.js';
 import { newId } from '../util/id.js';
 import { paymentMerchantMatches } from '../util/payment-merchant.js';
+import { previewHostname } from '../gateway/previews.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
 import { withPullRequestStates } from '../integrations/github-pr.js';
 import { lifecycleEventPayload } from '../domain/view-publication.js';
@@ -8450,7 +8451,7 @@ export class Store {
   async createPreviewLease(lease: PreviewLease): Promise<PreviewLease> {
     return this.db.transaction(async () => {
 
-    const value = { ...lease, hostname: lease.hostname ?? previewHostnameForLease(lease.id) };
+    const value = { ...lease, hostname: lease.hostname ?? previewHostname(lease.id) };
     (await this.db.prepare(`INSERT INTO preview_leases (id, organizationId, projectId, taskId, worldId, generation,
       port, public, tokenHash, runnerLeaseId, provider, createdBy, createdAt, expiresAt, revokedAt, hostname)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(value.id, value.organizationId,
@@ -9759,12 +9760,6 @@ function rowToPreviewLease(row: any): PreviewLease {
   };
 }
 
-function previewHostnameForLease(id: string): string | undefined {
-  try {
-    const base = new URL(process.env.KARMAX_PREVIEW_ORIGIN ?? '');
-    return `p-${crypto.createHash('sha256').update(id).digest('hex').slice(0, 24)}.${base.hostname}`.toLowerCase();
-  } catch { return undefined; }
-}
 
 function rowToRunnerPool(r: any): RunnerPool {
   return { id: r.id, organizationId: r.organizationId, name: r.name, provider: r.provider,
