@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { Gateway, routeCapability } from '../src/gateway/server.js';
 import { Store } from '../src/store/db.js';
 import { AuthorizationService, projectScope } from '../src/platform/authorization.js';
@@ -90,6 +90,32 @@ describe('organization task list', () => {
       expect(titles((await f.call(f.ana, f.org.id, 'q=for:nobody')).body)).toEqual([]);
       expect(titles((await f.call(f.ana, f.org.id, 'q=-for:me')).body)).toEqual(['redesign header']);
     } finally { await f.store.close(); }
+  });
+
+  it('leads with the task that last changed status, and For you with the task that last came to you', async () => {
+    const f = await fixture();
+    const olu = { user: 'Olu', userId: 'owner', email: 'olu@example.com', apiToken: 'session' };
+    const at = (ms: number) => vi.spyOn(Date, 'now').mockReturnValue(ms);
+    const view = (task: { id: string; title: string }, stage: string, status: string, waitingFor?: object) =>
+      f.store.saveView(task.id, { taskId: task.id, title: task.title, workflow: 'software-dev', stage, status, waitingFor,
+        messages: [], actions: [], state: {}, updatedAt: 3 } as any);
+    const order = async (query: string) => (await f.call(olu, f.org.id, `q=${encodeURIComponent(query)}`)).body.tasks.map((t: any) => t.title);
+    try {
+      const base = Date.now() + 60_000;
+      at(base); await view(f.t3, 'do', 'active');
+      // The oldest task reaches Review: it rises above everything created since.
+      at(base + 1_000); await view(f.t1, 'review', 'waiting', { kind: 'human' });
+      expect((await order('')).slice(0, 2)).toEqual(['redesign header', 'secret work']);
+      expect(await order('for:me')).toEqual(['redesign header']);
+      // Someone mentions Olu on a task whose status has not moved: on For you it
+      // arrives on top, while the status-ordered list keeps it where it was.
+      at(base + 2_000);
+      await f.store.appendEvent({ taskId: f.t3.id, type: 'task.mentioned', ts: base + 2_000, payload: { principal: { kind: 'user', userId: 'owner' } } });
+      expect(await order('for:me')).toEqual(['secret work', 'redesign header']);
+      expect((await order('')).slice(0, 2)).toEqual(['redesign header', 'secret work']);
+      // Creation order is still a sort away.
+      expect((await order('sort:created-desc'))[0]).toBe('ana draft');
+    } finally { vi.restoreAllMocks(); await f.store.close(); }
   });
 
   it('filters by project id, slug or name and pages across projects', async () => {

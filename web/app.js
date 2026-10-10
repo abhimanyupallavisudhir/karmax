@@ -4332,6 +4332,12 @@ function markTaskCancelling(taskId) {
   if (S.view?.taskId === taskId) S.view = pendingCancellationView(S.view, taskId);
 }
 
+// The lists' default order (the server's `updated` sort): the task whose stage,
+// status or wait last changed first; one that never ran counts from its creation.
+function byLastUpdate(a, b) {
+  return (b.statusChangedAt || b.createdAt || 0) - (a.statusChangedAt || a.createdAt || 0);
+}
+
 // Evaluate the working query on the server and stash the result. The default list
 // (empty query) is just an evaluation too. We overlay each result's freshest live
 // `lastView` from S.tasks so status chips reflect the latest transition.
@@ -4541,6 +4547,8 @@ function patchLifecycleView(record, ev) {
     agentTurn,
   }, ev.taskId);
   record.lastView = next;
+  if (previous.stage !== next.stage || previous.status !== next.status || previous.waitingFor?.kind !== next.waitingFor?.kind)
+    record.statusChangedAt = ev.ts || Date.now();
   // A retrying or accidentally hot-looping workflow can publish an identical
   // compact view many times per second. Updating the in-memory record is cheap;
   // replacing the entire list DOM is not, and can remove a row between pointer
@@ -5913,7 +5921,7 @@ function tasksView() {
   const preview = !across && !/(^|\s)-?[\w.#-]+:/.test(S.search || '');
   const flat = (r
     ? r.tasks
-    : preview ? S.tasks.filter((t) => taskMatches(t, S.search) && !t.params?.archived).slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)) : []
+    : preview ? S.tasks.filter((t) => taskMatches(t, S.search) && !t.params?.archived).slice().sort(byLastUpdate) : []
   ).filter(topLevel);
   const row = (t, opts = {}) => taskRow(t, { ...opts, ...(across ? { showTags: false, project: true } : {}) });
   const groups = r && r.groups ? r.groups : null;
@@ -21263,14 +21271,14 @@ function openCursorRow() { openListRow(cursorRow()); }
 function archiveCursorRow() { cursorRow()?.querySelector('[data-archive],[data-unarchive]')?.click(); }
 // With a task page open, j/k walk the same task order the list shows — when the
 // open task is in that list; otherwise (a permalink, a task the query does not
-// match) they walk every task of the project, newest first.
+// match) they walk every task of the project in the lists' default order.
 function taskOrder() {
   const listed = S.searchScope === S.projectId ? (S.searchResult?.tasks || [])
     .filter((t) => !t.params?.draft && t.projectId === S.projectId).map((t) => t.id) : [];
   if (listed.includes(S.taskWalkTarget || S.selected)) return listed;
   return S.tasks
     .filter((t) => !t.params?.draft)
-    .slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
+    .slice().sort(byLastUpdate)
     .map((t) => t.id);
 }
 function openAdjacentTask(delta) {
