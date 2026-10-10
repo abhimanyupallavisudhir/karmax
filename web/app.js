@@ -3129,8 +3129,12 @@ function wireAgentBox(box) {
     const option = chosen?.querySelector('.af-resume-reuse-model');
     if (option) option.checked = false;
   };
-  box.addEventListener('input', releaseModel);
-  box.addEventListener('change', releaseModel);
+  // A re-wired box (kept around a retained section, its controls re-rendered)
+  // replaces its listeners.
+  box.agentWiring?.abort();
+  const { signal } = box.agentWiring = new AbortController();
+  box.addEventListener('input', releaseModel, { signal });
+  box.addEventListener('change', releaseModel, { signal });
   // Dropping the source also withdraws the grants and model it brought along.
   const withdrawReauthorize = () => {
     if (chosen?.querySelector('.af-resume-reauthorize')?.checked) announceReauthorize(false);
@@ -9163,12 +9167,15 @@ function patchTaskPage(main, html) {
   }
   if (sameThread) patchConversationRows(previous, next);
   for (const [fresh, old] of retained.ancestors) {
-    // A keyed container kept only for a retained section inside it (the
-    // parameter form around the main agent's authorization) takes its new key.
-    if (fresh.dataset?.renderKey !== undefined) old.dataset.renderKey = fresh.dataset.renderKey;
-    // A live section kept only for a retained section inside it has fresh
-    // content: it takes its new key and is hydrated again.
-    if (fresh.dataset?.liveKey !== undefined) { old.dataset.liveKey = fresh.dataset.liveKey; old.liveWired = false; }
+    // A container kept only for a retained section inside it (the parameter
+    // form and the main agent's block around its authorization) is the fresh
+    // node in all but identity: it takes the fresh attributes (keys, inherited
+    // values), and its fresh content is wired and hydrated again.
+    if (fresh.nodeType === Node.ELEMENT_NODE) {
+      syncAttributes(old, fresh);
+      old.liveWired = old.paramsWired = false;
+      delete old._agentCtx;
+    }
     patchChildren(old, fresh, retained.nodes);
   }
   return !!sameThread;
@@ -9198,6 +9205,11 @@ function retainedTaskNodes(main, fragment, pairs) {
   for (const [fresh, old] of ancestors) if (!nodes.has(fresh)) nodes.set(fresh, old);
   for (const [, fresh] of pairs) ancestors.delete(fresh); // a retained node keeps its own children
   return { nodes, ancestors };
+}
+
+function syncAttributes(old, fresh) {
+  for (const name of old.getAttributeNames()) if (!fresh.hasAttribute(name)) old.removeAttribute(name);
+  for (const name of fresh.getAttributeNames()) if (old.getAttribute(name) !== fresh.getAttribute(name)) old.setAttribute(name, fresh.getAttribute(name));
 }
 
 // Give `old` the children of `fresh`, substituting retained nodes. Stale nodes
@@ -9341,6 +9353,7 @@ function renderTaskPage() {
     wireTaskApprovalRequests(v);
   } else if (tab === 'parameters') {
     wireParams(v);
+    paintParticipantStates(v);
     const projectId = rec?.projectId || S.projectId;
     wireLiveSection($('#tp-auth'), () => wireTaskAuthorization(v));
     const payments = $('#tp-payments');
@@ -12377,7 +12390,7 @@ function paramsSection(v) {
       const opts = f === mainAgent
         ? { frozen: !isEditable, authority: { ...mainAuthorityParams(v), open: !!S.mainAuthorityOpen?.[v.taskId] } }
         : { frozen: !isEditable, ...(f.calledAgent ? { authority: { label: 'Agent' } } : {}) };
-      const state = f.participant?.state && f.participant.state !== 'idle' ? `<span class="chip pf-agent-state">${esc(f.participant.state)}</span>` : '';
+      const state = f.participant ? participantStateChip(f.participant) : '';
       const label = isEditable ? fieldLabel(f) : frozenLabel(f);
       const block = renderAgentField(f, own || undefined, inherited, opts);
       const row = `<div class="form-row">${label.replace('</label>', `</label>${state}`)}${block}</div>`;
@@ -12434,7 +12447,7 @@ function paramsSection(v) {
   // events retain the connected controls, preserving native editing state.
   const renderKey = JSON.stringify([v.taskId, v.workflow, terminal, fields.map(({ participant: _p, ...f }) => f), [...editable], inheritedAll,
     fields.filter((f) => !editable.has(f.name)).map((f) => paramCurrentValue(f, v, rec)),
-    TERMINAL_STAGES.includes(v.stage) || !!v.pointOfNoReturnPassed, (v.participants || []).map((p) => [p.key, p.state]),
+    TERMINAL_STAGES.includes(v.stage) || !!v.pointOfNoReturnPassed,
     authorizationLiveKey(v.taskId), paymentsLiveKey(v), v.computerChange || null]);
   // A workflow without an agent field still shows the task's own authority.
   const authorityOnly = mainAgent ? '' : `<section class="tp-section"><div class="form-row" data-row="__authorization">
@@ -12444,6 +12457,21 @@ function paramsSection(v) {
     ${agentFields.map((f) => `<section class="tp-section tp-${esc(f.type)}">${rowFor(f)}</section>`).join('')}
     ${where || triggers ? `<section class="tp-section tp-where">${where}${triggers}</section>` : ''}
     ${footer}</div>`;
+}
+
+// An agent's state changes often while a task runs; its chip is repainted in
+// place (paintParticipantStates) rather than rebuilding the form being edited.
+function participantStateChip(participant) {
+  const busy = participant.state && participant.state !== 'idle';
+  return `<span class="chip pf-agent-state" data-participant="${esc(participant.key)}" ${busy ? '' : 'hidden'}>${busy ? esc(participant.state) : ''}</span>`;
+}
+function paintParticipantStates(v) {
+  document.querySelectorAll('#tp-params .pf-agent-state[data-participant]').forEach((chip) => {
+    const state = (v.participants || []).find((p) => p.key === chip.dataset.participant)?.state;
+    const busy = !!state && state !== 'idle';
+    chip.hidden = !busy;
+    chip.textContent = busy ? state : '';
+  });
 }
 
 // A running task's branches per repository, read-only: "app  main → main".
@@ -12574,12 +12602,11 @@ function wireParams(v) {
     return;
   }
   const root = document.getElementById('tp-params');
-  // Retained controls already own their handlers. The form element itself can
-  // outlive its controls (it is kept around a retained authorization section),
-  // so the mark is on its content and its own listeners are replaced.
-  const marker = root?.firstElementChild;
-  if (marker?.paramsWired) return;
-  if (marker) marker.paramsWired = true;
+  // A retained form already owns its handlers. One kept only around a retained
+  // authorization section has fresh controls (patchTaskPage clears the mark),
+  // so it is wired again and its own listeners are replaced.
+  if (root?.paramsWired) return;
+  if (root) root.paramsWired = true;
   root?.paramsWiring?.abort();
   const wiring = root ? (root.paramsWiring = new AbortController()) : null;
   if (root) {
@@ -12590,7 +12617,7 @@ function wireParams(v) {
     const organizationId = S.projects.find((project) => project.id === projectId)?.organizationId;
     wireAgentFields(root, { projectId, organizationId, inheritedAuthority: () => taskAuthorityOf(taskRecord(v.taskId)) });
     const main = root.querySelector('#tp-auth, #tp-auth-frozen')?.closest('.agent-authority');
-    main?.addEventListener('toggle', () => { (S.mainAuthorityOpen ||= {})[v.taskId] = main.open; });
+    main?.addEventListener('toggle', () => { (S.mainAuthorityOpen ||= {})[v.taskId] = main.open; }, { signal: wiring.signal });
   }
   const saveBtn = document.getElementById('params-save');
   if (!saveBtn) return;
