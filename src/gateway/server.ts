@@ -7115,19 +7115,23 @@ export class Gateway {
             ...(propagated ? { propagated } : {}), ...(writeBack?.length ? { writeBack } : {}) });
         }
         // Plaintext reveal (§5C) — per-item grant + reveal policy, audited.
+        // A TOTP field yields only the current one-time code, never the seed,
+        // so it is blind use (§5B) like a browser fill, not a reveal.
         if (p === '/api/vault/resolve' && method === 'POST') {
           const b = await this.body(req);
           const item = (await findItem(b));
           if (!item) return this.json(res, 200, { status: 'not_in_vault', reason: 'no matching vault item — use request_credential to ask for it' });
-          const field = (b.field as any) ?? defaultField(item.type);
+          const seedOnly = item.type === 'login' && !item.fields.includes('password') && item.fields.includes('totp');
+          const field = (b.field as any) ?? (seedOnly ? 'totp' : defaultField(item.type));
           if (!ITEM_FIELDS[item.type].includes(field) || !item.fields.includes(field)) return this.json(res, 400, { error: `item type ${item.type} has no field ${field}` });
-          const decision = (await vault.access(caps, callerTaskId, item, 'reveal', { consume: true }));
+          const mode: AccessMode = field === 'totp' ? 'use' : 'reveal';
+          const decision = (await vault.access(caps, callerTaskId, item, mode, { consume: true }));
           if (decision.status !== 'granted')
-            return this.json(res, 200, (await this.autoRaiseCredential(vault, decision, { caps, taskId: callerTaskId, projectId: authRecord?.projectId, item, field: b.field, mode: 'reveal', why: b.why })));
+            return this.json(res, 200, (await this.autoRaiseCredential(vault, decision, { caps, taskId: callerTaskId, projectId: authRecord?.projectId, item, field, mode, why: b.why })));
           const value = field === 'totp'
             ? (await vault.totp(item, { taskId: callerTaskId, principal }))
             : (await vault.resolveField(item, field, { taskId: callerTaskId, principal, mode: 'reveal' }));
-          const notes = b.field == null && item.type === 'login' && item.fields.includes('note')
+          const notes = b.field == null && mode === 'reveal' && item.type === 'login' && item.fields.includes('note')
             ? (await vault.resolveField(item, 'note', { taskId: callerTaskId, principal, mode: 'reveal' })) : undefined;
           return this.json(res, 200, { status: 'granted', itemId: item.id, field, ...(item.username ? { username: item.username } : {}), value, ...(notes !== undefined ? { notes } : {}) });
         }
