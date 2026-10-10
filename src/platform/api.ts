@@ -2896,6 +2896,7 @@ export class KarmaxApi {
       const group = await this.deps.store.attemptCommitAsync(taskId);
       const subTaskSummaries = await this.deps.store.childTaskSummaries(taskId);
       const forkSummaries = await this.deps.store.forkTaskSummaries(taskId);
+      const forkSourceSummaries = await this.deps.store.forkSourceTaskSummaries(taskId);
       const parentTaskId = view.parentTaskId ?? task?.parentTaskId;
       let parent = parentTaskId ? await this.deps.store.taskMetadataAsync(parentTaskId) : undefined;
       // A parent elsewhere is named only to a caller who may read it.
@@ -2905,6 +2906,7 @@ export class KarmaxApi {
         ...view,
         ...(subTaskSummaries.length ? { subTaskSummaries } : {}),
         ...(forkSummaries.length ? { forkSummaries } : {}),
+        ...(forkSourceSummaries.length ? { forkSourceSummaries } : {}),
         ...(parent ? { parentTask: { id: parent.id, ...(parent.num != null ? { num: parent.num } : {}), title: parent.title } } : {}),
         notes: task?.notes,
         ...(agents ? { agents } : {}),

@@ -1100,14 +1100,16 @@ export class Gateway {
       counts = organizationId ? (await this.approvalCounts(organizationId)) : new Map();
     }
     const count = counts.get(taskId);
-    // Sub-task and fork panels flag a task's approval exactly as its list row does.
+    // Sub-task and fork lineage panels flag a task's approval exactly as its list row does.
     const flag = <T extends ChildTaskSummary>(summary: T): T => {
       const approvalRequests = counts.get(summary.id)?.notify;
       return approvalRequests && summary.lastView ? { ...summary, lastView: { ...summary.lastView, approvalRequests } } : summary;
     };
     const subTaskSummaries = view.subTaskSummaries?.map(flag);
     const forkSummaries = view.forkSummaries?.map(flag);
+    const forkSourceSummaries = view.forkSourceSummaries?.map(flag);
     return { ...view, ...(subTaskSummaries ? { subTaskSummaries } : {}), ...(forkSummaries ? { forkSummaries } : {}),
+      ...(forkSourceSummaries ? { forkSourceSummaries } : {}),
       approvalRequests: count?.notify || undefined, pendingDecisions: count?.pending || undefined };
   }
 

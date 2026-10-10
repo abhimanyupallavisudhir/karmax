@@ -62,6 +62,32 @@ describe.each(storeBackends)('Store ($name)', ({ name, open }) => {
     expect(await store.forkTaskSummaries(nested.id)).toEqual([]);
   });
 
+  // The mirror image: a fork's Forked from panel names every task it descends
+  // from, archived ones too, oldest first.
+  it('summarizes every task a fork descends from, archived and nested ones included', async () => {
+    const project = await store.createProject('Fork sources');
+    const other = await store.createProject('Elsewhere');
+    const make = (title: string, params: Record<string, unknown>, projectId = project.id) => store.createTask({ projectId, title,
+      workflow: 'software-dev', workflowVersion: '1.26.0', params: { prompt: title, ...params } });
+    const foreign = await make('Other project', {}, other.id);
+    const root = await make('Root', { 'agent:do': { resumeFrom: { taskId: foreign.id, role: 'do' } } });
+    const side = await make('Side', {});
+    const first = await make('First', { 'agent:do': { resumeFrom: { taskId: root.id, role: 'do' } } });
+    const nested = await make('Nested', { 'agent:do': { resumeFrom: { taskId: first.id, role: 'do' } },
+      confirm: { layers: [{ kind: 'agent', resumeFrom: { taskId: side.id, role: 'merge' } }] } });
+    const looped = await make('Looped', {});
+    await store.updateTaskParams(looped.id, { prompt: 'Looped', 'agent:do': { resumeFrom: { taskId: looped.id, role: 'do' } } } as any);
+    await store.saveView(root.id, { taskId: root.id, title: 'Root', workflow: 'software-dev', stage: 'done', status: 'done',
+      messages: [], actions: [], updatedAt: 1 } as any);
+    expect((await store.getTask(root.id))?.params.archived).toBe(true);
+    const sources = await store.forkSourceTaskSummaries(nested.id);
+    expect(sources.map((source) => [source.id, source.forkOf])).toEqual([
+      [root.id, []], [side.id, []], [first.id, [root.id]]]);
+    expect(sources[0]).toMatchObject({ num: root.num, title: 'Root', lastView: { stage: 'done', status: 'done' } });
+    expect(await store.forkSourceTaskSummaries(side.id)).toEqual([]);
+    expect(await store.forkSourceTaskSummaries(looped.id)).toEqual([]);
+  });
+
   // Ids only carry millisecond time plus random bytes, so children created in
   // the same millisecond must keep their insertion order rather than id order.
   it('lists children created in the same millisecond in creation order', async () => {
