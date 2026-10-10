@@ -149,6 +149,12 @@ const STAGING_PROGRESS_EVERY_MS = 5_000;
 /** A retried turn's processes did not survive it; agents otherwise assume they did. */
 const INTERRUPTED_COMMANDS = 'Commands that were running in it, including run_in_background shells, were stopped: '
   + 'check whether they finished before relying on their results. Jobs from start_job kept running.';
+// The interrupted attempt's session holds the agent's answer, but no one has
+// read it: told only to "restate the final result", an agent cut off by a deploy
+// replied "Nothing to recover" to a person still waiting for it (exten-epi#5).
+const INTERRUPTED_REPLY = 'Your final response from it was never posted: a reply is posted only when the turn ends. '
+  + 'Continue from where you left off, then give your full final response, even if you had already written it; '
+  + 'do not mention the interruption unless it changes the result.';
 
 // Old executions without a recorded grant retain the normal developer workflow
 // surface (but no administration). New tasks always carry a creator-attenuated
@@ -2011,9 +2017,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                 // Tell the agent what broke, or it reruns the command that froze the sandbox.
                 ? `(This turn was interrupted mid-run: ${interruption.summary}.${interruption.memoryExhausted
                   ? ' Keep memory-hungry commands (type checks, test suites, builds) within the memory `free -m` reports as available.' : ''}`
-                  + ` ${INTERRUPTED_COMMANDS} Continue from where you left off; if the work was already finished, restate the final result.)`
+                  + ` ${INTERRUPTED_COMMANDS} ${INTERRUPTED_REPLY})`
                 // The only undiagnosed cause left is a lost heartbeat: turns have no time limit.
-                : `(This turn was interrupted mid-run — the worker restarted, the connection dropped, or the host slept. ${INTERRUPTED_COMMANDS} Continue from where you left off; if the work was already finished, restate the final result.)`,
+                : `(This turn was interrupted mid-run — the worker restarted, the connection dropped, or the host slept. ${INTERRUPTED_COMMANDS} ${INTERRUPTED_REPLY})`,
               ts: 0,
             },
           ];
