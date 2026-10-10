@@ -71,6 +71,13 @@ export class DurableEventFanout {
     });
   }
 
+  /** Every subscriber once, whichever organizations it reads. */
+  *subscribers(): Iterable<Readonly<Subscriber>> {
+    const seen = new Set<Subscriber>();
+    for (const subscriber of [...this.everyone, ...[...this.byOrganization.values()].flatMap((set) => [...set])])
+      if (!seen.has(subscriber)) { seen.add(subscriber); yield subscriber; }
+  }
+
   private index(subscriber: Subscriber, audience: FanoutAudience): void {
     this.unindex(subscriber);
     subscriber.audience = audience === 'all' ? 'all' : new Set(audience);
@@ -133,7 +140,7 @@ export class DurableEventFanout {
     if (this.scheduled) clearImmediate(this.scheduled);
     clearInterval(this.timer);
     this.offBus?.();
-    for (const subscriber of [...this.everyone, ...[...this.byOrganization.values()].flatMap((set) => [...set])]) this.remove(subscriber);
+    for (const subscriber of this.subscribers()) this.remove(subscriber as Subscriber);
   }
 
   private schedule(): void {
