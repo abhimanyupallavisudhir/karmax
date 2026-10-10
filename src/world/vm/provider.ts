@@ -48,7 +48,7 @@ export interface VmDriver {
   readonly name: string;
   /** The machine for a Computer: the provider's nearest size that covers it.
    * Throws (a message for people) when the account cannot provide it. */
-  shape(resources: MachineShape | undefined, connection: ResolvedWorldProviderConnection): VmShape;
+  shape(resources: MachineShape | undefined, connection: ResolvedWorldProviderConnection): VmShape | Promise<VmShape>;
   /** Create the volume and the machine, booted with `keys`. Labels name the
    * world (`karmaxHome`, `karmaxTaskId`, `karmaxGeneration`, …). */
   allocate(connection: ResolvedWorldProviderConnection, request: {
@@ -120,7 +120,7 @@ export class VmWorldProvider implements WorldProvider {
     if (spec.environment?.flavor === 'desktop')
       throw new Error(`${this.driver.name} computers are headless. Choose E2B or Daytona for a desktop.`);
     const connection = await this.connection(spec.organizationId);
-    const shape = this.driver.shape(spec.resources, connection);
+    const shape = await this.driver.shape(spec.resources, connection);
     const labels = { karmaxHome: serviceHomeLabel(), karmaxTaskId: spec.taskId, karmaxGeneration: String(spec.generation ?? 1),
       ...(spec.organizationId ? { karmaxOrganizationId: spec.organizationId } : {}) };
     // An earlier attempt of this create (a retried activity) may have left a
@@ -179,7 +179,8 @@ export class VmWorldProvider implements WorldProvider {
       if (state === 'missing') throw Object.assign(new Error(`the ${this.driver.name} machine of this world no longer exists`), { status: 404 });
       transport = this.transportFor(handle.id, connection, sealed);
       if (state !== 'ready') {
-        await timed(`${this.kind}.start`, () => this.driver.start(connection, sealed, this.shapeOf(handle, connection), keysOf(sealed)));
+        const shape = await this.shapeOf(handle, connection);
+        await timed(`${this.kind}.start`, () => this.driver.start(connection, sealed, shape, keysOf(sealed)));
         transport.reset();
         await timed(`${this.kind}.reachable`, () => waitReachable(transport!, this.options.reachableMs ?? REACHABLE_MS));
         await this.ensureProvisioned(transport);
@@ -228,8 +229,8 @@ export class VmWorldProvider implements WorldProvider {
   async resize(handle: WorldHandle, to: MachineShape): Promise<{ disk: 'grown' | 'unchanged'; restart: boolean; machine: VmShape }> {
     const sealed = this.reference(handle);
     const connection = await this.connection(sealed.organizationId);
-    const made = (handle.meta?.machine as VmShape | undefined) ?? this.driver.shape(handle.meta?.computer as MachineShape | undefined, connection);
-    const next = this.driver.shape({ cpu: to.cpu ?? made.cpu, memoryMb: to.memoryMb ?? made.memoryMb, diskGb: Math.max(to.diskGb ?? 0, made.diskGb) }, connection);
+    const made = (handle.meta?.machine as VmShape | undefined) ?? await this.driver.shape(handle.meta?.computer as MachineShape | undefined, connection);
+    const next = await this.driver.shape({ cpu: to.cpu ?? made.cpu, memoryMb: to.memoryMb ?? made.memoryMb, diskGb: Math.max(to.diskGb ?? 0, made.diskGb) }, connection);
     // The volume's own size decides: an earlier resize may already have grown it.
     const grown = next.diskGb > made.diskGb && await this.driver.growDisk(connection, sealed, next.diskGb);
     if (grown) {
@@ -290,11 +291,11 @@ export class VmWorldProvider implements WorldProvider {
     });
   }
 
-  private shapeOf(handle: WorldHandle, connection: ResolvedWorldProviderConnection): VmShape {
+  private async shapeOf(handle: WorldHandle, connection: ResolvedWorldProviderConnection): Promise<VmShape> {
     const made = handle.meta?.machine as VmShape | undefined;
     const wanted = handle.meta?.computer as MachineShape | undefined;
     // Never shrink the disk; CPU and memory follow the Computer.
-    const shape = this.driver.shape(wanted ?? made, connection);
+    const shape = await this.driver.shape(wanted ?? made, connection);
     return made ? { ...shape, diskGb: Math.max(shape.diskGb, made.diskGb) } : shape;
   }
 
