@@ -27,6 +27,36 @@ function stubView(t: TaskRecord): TaskView {
   };
 }
 
+/** Temporal terminates a run whose history reaches 50 MB or 51,200 events,
+ * and termination runs nothing in the workflow (#367). Software Dev continues
+ * as new long before that; any run that still grows this large is recorded
+ * once, as a `workflow.history-large` event, while there is time to act. */
+const HISTORY_WARN_BYTES = 20 * 1024 * 1024;
+const HISTORY_WARN_EVENTS = 20_000;
+async function warnOnLargeHistory(
+  store: Store,
+  taskId: string,
+  desc: { runId: string; historySize?: number; historyLength?: number },
+): Promise<void> {
+  const bytes = desc.historySize ?? 0;
+  const events = desc.historyLength ?? 0;
+  if (bytes < HISTORY_WARN_BYTES && events < HISTORY_WARN_EVENTS) return;
+  const key = `history-warning:${taskId}:${desc.runId}`;
+  if (await store.kvGet(key)) return;
+  (await store.kvSet(key, String(Date.now())));
+  (await store.appendEvent({ taskId, type: 'workflow.history-large', ts: Date.now(),
+    payload: { runId: desc.runId, bytes, events, limitBytes: 50 * 1024 * 1024, limitEvents: 51_200 } }));
+  console.warn(`[karmax] ${taskId}: workflow history is ${Math.round(bytes / 1048576)} MB / ${events} events; Temporal terminates it at 50 MB / 51,200`);
+}
+
+/** A run that ended without settling its own view failed in the stage that
+ * view shows. Keep that stage: Retry needs it to resume the run faithfully
+ * (an interrupted Landing becomes an integration repair). */
+function failedView(base: TaskView): TaskView {
+  const failedFrom = TERMINAL.includes(base.stage) ? base.state?.failedFrom : base.stage;
+  return { ...base, status: 'failed', stage: 'failed', state: { ...base.state, ...(failedFrom ? { failedFrom } : {}) } };
+}
+
 /**
  * Reconcile the task index against live Temporal workflows on boot (SPEC §9
  * boundary: state survives a restart, but a workflow that was terminated or lost
@@ -68,6 +98,7 @@ export async function reconcileTasks(store: Store, client: Client): Promise<{ ch
         const desc = await withTimeout(handle.describe(), DESCRIBE_TIMEOUT_MS);
         const name = desc.status.name;
         if (name === 'RUNNING') {
+          await warnOnLargeHistory(store, t.id, desc).catch(() => undefined);
           // Older executions restarted their turn counter at zero, colliding
           // with reservations from the previous run. The run-scoped turn IDs
           // now make a fresh retry safe. Recover only that proven historical
@@ -131,7 +162,7 @@ export async function reconcileTasks(store: Store, client: Client): Promise<{ ch
         const next: TaskView =
           name === 'COMPLETED'
             ? { ...base, status: 'done', stage: 'done', updatedAt: base.updatedAt }
-            : { ...base, status: 'failed', stage: 'failed', error: terminationReason
+            : { ...failedView(base), error: terminationReason
               ? `workflow terminated: ${terminationReason}`
               : base.error ?? `workflow ${name.toLowerCase()}`, updatedAt: base.updatedAt };
         (await settle(t.id, next));
@@ -140,9 +171,7 @@ export async function reconcileTasks(store: Store, client: Client): Promise<{ ch
         if (e instanceof Error && e.message === 'operation timed out') return; // transient — don't fail a live task
         // workflow not found → lost (state reset) or never started (orphan row).
         (await settle(t.id, {
-          ...base,
-          status: 'failed',
-          stage: 'failed',
+          ...failedView(base),
           error: v ? 'workflow not found (lost on restart)' : 'workflow never started (engine was unavailable when queued)',
           updatedAt: base.updatedAt,
         }));

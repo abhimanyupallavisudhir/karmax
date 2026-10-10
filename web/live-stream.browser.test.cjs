@@ -27,7 +27,7 @@ const { fakeConsole, launch } = require('../tests/helpers/fake-console.cjs');
     page.on('pageerror', error => { errors.push(error.message); console.error('page:', error.message); });
     await page.goto('http://console.test/org/workspace');
     await page.locator('[data-id="t"] .row-link').click();
-    await page.getByRole('tab', { name: 'Check-in' }).or(page.getByText('Check-in', { exact: true })).first().click();
+    await page.getByRole('tab', { name: 'Chat' }).or(page.getByText('Chat', { exact: true })).first().click();
     await page.locator('#ck-thread').getByText('Reading the parser first.').waitFor();
     await page.waitForTimeout(300); // let the task page settle before measuring reads
 

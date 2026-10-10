@@ -89,6 +89,23 @@ describe('durable jobs (real worktree world)', () => {
     expect(statuses.map((s) => s.state)).toEqual(['missing', 'missing']);
   });
 
+  it('reports a job that finishes while its status is read as exited, never lost', async () => {
+    const job = await startJob(world, { command: 'sleep 30' });
+    // The job ends between the status script's look for its exit record and
+    // its look at the process: `cat <dir>/pid` (inside `alive`) records the exit
+    // first and names a process that is gone, as a job finishing then would.
+    const shim = path.join(home, 'shim');
+    fs.mkdirSync(shim);
+    fs.writeFileSync(path.join(shim, 'cat'), `#!/bin/bash
+case "$1" in */pid) d=$(dirname -- "$1"); echo 0 > "$d/exit"; echo 4194303; exit 0;; esac
+exec /bin/cat "$@"
+`, { mode: 0o755 });
+    const exec = world.exec.bind(world);
+    world.exec = (cmd, args, opts = {}) => exec(cmd, args, { ...opts, env: { ...opts.env, PATH: `${shim}:${process.env.PATH}` } });
+    const [status] = await jobStatuses(world, [job.id], { root: '.karmax-injection/jobs' });
+    expect(status).toMatchObject({ state: 'exited', exitCode: 0 });
+  });
+
   it('stops a job and its children', async () => {
     const job = await startJob(world, { command: 'sleep 60 & sleep 60; wait' });
     await stopJobs(world, [job.id]);
@@ -270,7 +287,7 @@ describe('durable jobs (real worktree world)', () => {
       } as any);
       // pause waits on jobs and events; it is not how an agent asks for input it needs.
       const pause = TOOL_SCHEMAS.find((tool) => tool.name === 'pause')!;
-      expect(pause.description).toContain('It is not for asking: if you need an answer to continue, call escalate_to_human or end your turn with the question.');
+      expect(pause.description).toContain('It is not for asking: if you need an answer to continue, end your turn with the question (or call escalate_to_human for what only a person can give).');
       const schema = pause.parameters as any;
       expect(Object.keys(schema.properties)).toEqual(['minutes', 'jobs', 'needs_input', 'message', 'audience', 'urgency']);
       expect(schema.properties.urgency.enum).toEqual(['low', 'normal', 'high', 'critical']);

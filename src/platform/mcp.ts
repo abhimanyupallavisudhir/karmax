@@ -50,8 +50,9 @@ export interface PlatformOps {
   setTaskPriority(taskId: string, priority: number): Promise<void>;
   signalTask(taskId: string, signal: string, text?: string, role?: string, otherAttempts?: 'keep' | 'cancel', saveOtherAttemptsDefault?: boolean): Promise<void>;
   messageAgent(taskId: string, text: string, role?: string): Promise<void>;
+  stopAgent(taskId: string, agent: string): Promise<unknown>;
   escalateToHuman(a: { taskId?: string; audience: string[]; message: string; urgency?: Urgency }): Promise<unknown>;
-  notify(a: { to: string[]; message: string; urgency?: Urgency }): Promise<unknown>;
+  notify(a: { to?: string[]; message: string; urgency?: Urgency; agents?: AgentSpec[] }): Promise<unknown>;
   requestPermission(a: { capabilities: string[]; projectIds?: string[]; audience?: string[]; reason: string; urgency?: Urgency }): Promise<unknown>;
   requestAgentAction(a: { taskId: string; role?: string; action: 'publish_branch'; message?: string }): Promise<unknown>;
   cancelAgentAction(requestId: string): Promise<unknown>;
@@ -125,6 +126,7 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
     setTaskPriority: (id, priority) => api.setTaskPriority(getToken(), id, priority),
     signalTask: async (id, sig, text, role, otherAttempts, saveOtherAttemptsDefault) => void (await api.signalTask(getToken(), id, sig as any, text, role, undefined, undefined, { otherAttempts, saveOtherAttemptsDefault })),
     messageAgent: async (id, text, role) => void (await api.messageAgent(getToken(), id, text, role)),
+    stopAgent: (id, agent) => api.stopAgent(getToken(), id, agent),
     escalateToHuman: (a) => api.escalateToHuman(getToken(), a),
     notify: (a) => api.notify(getToken(), a),
     requestPermission: (a) => api.requestPermission(getToken(), a),
@@ -172,7 +174,8 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
  * re-acquire one — the gateway holds sessions in memory, so a gateway restart
  * would otherwise 401 every subsequent call for the life of the agent.
  */
-export function httpOps(baseUrl: string, token: string | (() => Promise<string | undefined>)): PlatformOps {
+export function httpOps(baseUrl: string, token: string | (() => Promise<string | undefined>),
+  extraHeaders: Record<string, string> = {}): PlatformOps {
   const resolve = typeof token === 'string' ? async () => token : token;
   let cached: string | undefined = typeof token === 'string' ? token : undefined;
   const req = async (rawPath: string, init: RequestInit = {}, reauth = true): Promise<unknown> => {
@@ -184,7 +187,7 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
     if (cached === undefined) cached = await resolve();
     const res = await fetch(`${baseUrl}${path}`, {
       ...init,
-      headers: { 'content-type': 'application/json', ...(cached ? { authorization: `Bearer ${cached}` } : {}), ...(init.headers ?? {}) },
+      headers: { 'content-type': 'application/json', ...extraHeaders, ...(cached ? { authorization: `Bearer ${cached}` } : {}), ...(init.headers ?? {}) },
     });
     // Session expired or the gateway restarted since we last authed — drop the
     // stale token, re-acquire once, and retry before surfacing an error.
@@ -222,6 +225,7 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
     setTaskPriority: async (id, priority) => void (await req(`/api/tasks/${id}/priority`, { method: 'PUT', body: JSON.stringify({ priority }) })),
     signalTask: async (id, signal, text, role, otherAttempts, saveOtherAttemptsDefault) => void (await req(`/api/tasks/${id}/signal`, { method: 'POST', body: JSON.stringify({ signal, text, role, otherAttempts, saveOtherAttemptsDefault }) })),
     messageAgent: async (id, text, role) => void (await req(`/api/tasks/${id}/messages`, { method: 'POST', body: JSON.stringify({ text, role }) })),
+    stopAgent: (id, agent) => req(`/api/tasks/${id}/agents/${encodeURIComponent(agent)}/stop`, { method: 'POST' }),
     escalateToHuman: (a) => req('/api/agent/escalate', { method: 'POST', body: JSON.stringify(a) }),
     notify: (a) => req('/api/agent/notify', { method: 'POST', body: JSON.stringify(a) }),
     requestPermission: (a) => req('/api/agent/permission-requests', { method: 'POST', body: JSON.stringify(a) }),
@@ -291,8 +295,15 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
   };
 }
 
-export function createPlatformMcpServer(ops: PlatformOps): McpServer {
-  const server = new McpServer({ name: 'karmax-platform', version: '1.0.0' });
+/** `tools` registers only that subset of the definitions below (the remote
+ * `/mcp` server leaves out tools bound to a calling task). */
+export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: ReadonlySet<string>; name?: string } = {}): McpServer {
+  const server = new McpServer({ name: options.name ?? 'karmax-platform', version: '1.0.0' });
+  if (options.tools) {
+    const register = server.registerTool.bind(server), tools = options.tools;
+    server.registerTool = ((name: string, ...rest: unknown[]) => tools.has(name)
+      ? (register as (...args: unknown[]) => unknown)(name, ...rest) : undefined) as typeof server.registerTool;
+  }
   const ok = (text: string) => ({ content: [{ type: 'text' as const, text }] });
   const wrap = async (fn: () => Promise<any>) => {
     try {
@@ -375,7 +386,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
       organizationId: z.string(), projectId: z.string().optional(),
       worldProvider: z.string().nullish(), runnerPoolId: z.string().nullish(),
       environmentFlavor: z.enum(['headless', 'desktop']).optional(),
-      cpu: z.number().positive().optional(), memoryMb: z.number().int().min(128).optional(), gpu: z.number().nonnegative().optional(),
+      cpu: z.number().positive().optional(), memoryMb: z.number().int().min(128).optional(), diskGb: z.number().int().min(1).optional(), gpu: z.number().nonnegative().optional(),
       unrestrictedInternet: z.boolean().optional(), allowDomains: z.array(z.string()).optional(), allowCidrs: z.array(z.string()).optional(),
       monthlyBudgetUsd: z.number().nonnegative().nullish(), hibernateAfterDays: z.number().nonnegative().nullish(),
     } },
@@ -393,7 +404,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
       // the policy currently in force: otherwise `{allowDomains}` alone silently
       // set `unrestricted:false` and dropped `allowCidrs`, and `{memoryMb}` alone
       // erased `cpu`/`gpu`. Only keys the caller actually supplied are assigned.
-      const wantsResources = a.cpu !== undefined || a.memoryMb !== undefined || a.gpu !== undefined;
+      const wantsResources = a.cpu !== undefined || a.memoryMb !== undefined || a.diskGb !== undefined || a.gpu !== undefined;
       const wantsNetwork = a.unrestrictedInternet !== undefined || a.allowDomains !== undefined || a.allowCidrs !== undefined;
       if (wantsResources || wantsNetwork) {
         // Either `{organization, override?, effective?}` or a bare policy — see below.
@@ -414,6 +425,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
           const resources: Record<string, unknown> = { ...(base.resources ?? {}) };
           if (a.cpu !== undefined) resources.cpu = a.cpu;
           if (a.memoryMb !== undefined) resources.memoryMb = a.memoryMb;
+          if (a.diskGb !== undefined) resources.diskGb = a.diskGb;
           if (a.gpu !== undefined) resources.gpu = a.gpu;
           policy.resources = resources;
         }
@@ -461,14 +473,16 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
     'escalate_to_human',
     {
       description:
-        'Pause your current task at its exact stage and request input from selected people, teams, or Avatars. ' +
+        'Ask named people, teams, or Avatars for what only a person can give: an approval, a secret, an action in the real world, a personal decision. ' +
+        'For anything an agent could answer, end your turn with the question instead; it goes to your task\'s usual input route (a sub-task\'s parent, else its Responder). ' +
+        'This pauses your task at its exact stage and ends your turn. A reply resumes you, and the answer or question you end that turn with reaches them too. ' +
         'Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @maintainers, @admins, @superadmins, @owners, @project, or @all. ' +
         'Discover valid choices with platform_request GET /api/agent/escalation-targets. ' +
-        'Calling this stops the current turn; the task resumes when a selected principal responds. ' +
         'urgency orders the human\'s inbox and decides whether their device alerts them: use high only when the ' +
         'person is genuinely blocking progress, and critical only for something that goes wrong if it waits.',
       inputSchema: {
-        audience: z.array(z.string()).max(32).optional(),
+        // Required, but checked by the platform, whose refusal lists who can be asked.
+        audience: z.array(z.string()).max(32).optional().describe('Required. Who to ask: person/team/Avatar selectors; any of them may answer.'),
         message: z.string().trim().min(1).max(4_000),
         urgency: z.enum(URGENCY_LEVELS as [Urgency, ...Urgency[]]).optional(),
       },
@@ -482,14 +496,23 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
         'Tell or call people and agents of this task without ending your turn. People (user:<id>, @team:<slug>, ' +
         '@creator, @owners, @project, @maintainers, @admins, @all) and Avatars (avatar:<id>) are notified now and keep ' +
         'their own pace; agents of this task (agent:do for the main agent, agent:responder, agent:confirm, ' +
-        'agent:agent-<n>) are called when your turn ends, in order. The message is said in the task conversation.',
+        'agent:agent-<n>) are called when your turn ends, in order. The message is said in the task conversation. ' +
+        '`agents` calls new agents in, after `to`; each becomes the next agent:agent-<n> (the returned message\'s `to` names them).',
       inputSchema: {
-        to: z.array(z.string()).min(1).max(32),
+        to: z.array(z.string()).max(32).optional(),
         message: z.string().trim().min(1).max(4_000),
         urgency: z.enum(URGENCY_LEVELS as [Urgency, ...Urgency[]]).optional(),
+        agents: z.array(z.object({
+          provider: z.string().min(1),
+          model: z.string().optional(),
+          effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).optional(),
+          prompt: z.string().max(4_000).optional().describe('Its instructions.'),
+          resumeFrom: z.object({ taskId: z.string().min(1), role: z.string().optional() }).optional()
+            .describe('Fork that task agent (role default do).'),
+        })).max(8).optional(),
       },
     },
-    async (a) => wrap(async () => (await ops.notify(a))),
+    async (a) => wrap(async () => (await ops.notify(a as Parameters<typeof ops.notify>[0]))),
   );
   server.registerTool(
     'escalate',
@@ -846,6 +869,14 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
       },
     },
     async (a) => wrap(async () => { await ops.signalTask(a.taskId, a.signal, a.text, a.role, a.otherAttempts, a.saveOtherAttemptsDefault); return 'signalled'; }),
+  );
+  server.registerTool(
+    'stop_agent',
+    {
+      description: 'Stop one agent of a task, like Ctrl+C: its turn ends now — working, or waiting for a credential, capacity or people — or, if queued, it does not run. The task goes on. `agent` is its key: do, responder, confirm, confirm-<n> or agent-<n> (list_agents).',
+      inputSchema: { taskId: z.string(), agent: z.string() },
+    },
+    async (a) => wrap(async () => { await ops.stopAgent(a.taskId, a.agent); return `stopped ${a.agent}`; }),
   );
   server.registerTool('reorder_queue', { description: 'Prioritize a task in a merge queue domain.', inputSchema: { domain: z.string(), taskId: z.string() } }, async (a) => wrap(async () => { await ops.reorderQueue(a.domain, a.taskId); return 'reordered'; }));
   server.registerTool('save_skill', {

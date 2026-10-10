@@ -10,6 +10,7 @@ import { WorkflowIdReusePolicy } from '@temporalio/common';
 import { Store, slugify, type CollaborationRequest } from '../store/db.js';
 import { TokenAuthority, type HumanDelegationArgs, type ScopedToken } from './tokens.js';
 import { TOOL_CAPABILITY, Capability, ORGANIZATION_WIKI_WRITE_DENIED, allows } from './capabilities.js';
+import { AppGrants, sessionCapabilities } from '../auth/app-grants.js';
 import { WORKFLOW_TYPE, SIG, pinnedType } from '../workflows/names.js';
 import { bundledStart, StartResolution } from './resolve-start.js';
 import { MANIFESTS, WorkflowManifest, eventCatalog } from '../contrib/manifests.js';
@@ -36,8 +37,10 @@ import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, FileRef, T
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable, awaitsSuccessOf } from '../domain/triggers.js';
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult, EvalContext, TaskGroup, forClauseValues, attentionCandidates } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
+import { assertInFlightComputerEdit, computerOf, computerResizable, describeMachine, machineShape, normalizeComputer, sameMachine,
+  type ComputerSpec, type MachineShape } from '../domain/computer.js';
 import { resolveParamsLayers, assembleTaskInput, projectSettingsFor, globalSettingsFor, quickProjectSettingsFor, quickGlobalSettingsFor, effectiveRepos, ValueMap } from './params.js';
-import { REPOSITORY_BRANCHES_RESOLVED_PARAM, repositoryBranchDefaults } from './branch-defaults.js';
+import { REPOSITORY_BRANCHES_RESOLVED_PARAM, applyRepoBranches, normalizeRepoBranches, repositoryBranchDefaults } from './branch-defaults.js';
 import { withTimeout } from '../util/timeout.js';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -73,7 +76,7 @@ import { applyAvatarProfile, avatarAuthorizationCapabilities, avatarCallableBy, 
 import { CapabilityError, NotFoundError, ValidationError } from './errors.js';
 import { assertAgentSpec } from './agent-params.js';
 import { CALLED_AGENT_FIELD, agentSpecsByParticipant, authorityKey, normalizeAgentAuthority, type StoredAgentAuthorization } from './agent-authority.js';
-import { AGENT_SELECTOR, MAIN_AGENT, conversationFor, isParticipantKey, nextAgentKey, participantLabel, selectorAgent } from '../domain/participants.js';
+import { AGENT_SELECTOR, MAIN_AGENT, agentSelector, conversationFor, isParticipantKey, nextAgentKey, participantLabel, selectorAgent } from '../domain/participants.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import type { ProjectResourceService } from '../world/resources.js';
 import { lifecycleReplacementKey } from './lifecycle-replacement.js';
@@ -96,6 +99,30 @@ const PUBLIC_TASK_SIGNALS = new Set<string>([SIG.followUp, SIG.confirm, SIG.open
  * wired, triggered tasks are simply held as armed rows and picked up on the next
  * boot's re-arm (the store is the durable source of truth).
  */
+/** Who a task may ask for input (`GET /api/agent/escalation-targets`). */
+export interface EscalationTargets {
+  taskId: string;
+  users: Array<{ id: string; selector: string; name?: string }>;
+  teams: Array<{ id: string; name: string; slug: string; selector: string }>;
+  special: Array<{ selector: string; description: string }>;
+  avatars: Array<{ id: string; name: string; purpose?: string; selector: string; roles: string[] }>;
+}
+
+/** The refusal for an ask that names nobody: what the tool is for, the
+ * alternative, and every selector the agent may use. */
+export function unnamedAudienceError(targets: EscalationTargets, subTask: boolean): string {
+  const choices = [
+    ...targets.users.map((user) => `${user.selector}${user.name ? ` (${user.name})` : ''}`),
+    ...targets.teams.map((team) => `${team.selector} (${team.name})`),
+    ...targets.special.map((option) => `${option.selector} (${option.description.replace(/\.$/, '')})`),
+    ...targets.avatars.map((avatar) => `${avatar.selector} (Avatar ${avatar.name})`),
+  ];
+  return 'Name who to ask (audience). escalate_to_human is for input only a person can give — an approval, a secret, '
+    + 'an action in the real world, a personal decision. For anything else, end your turn with the question; '
+    + `it goes to ${subTask ? 'your parent task' : "whoever answers this task's questions"}.`
+    + `\nYou can ask: ${choices.join('; ') || 'nobody — this task has no people to ask'}`;
+}
+
 export interface TriggerArmer {
   arm(task: TaskRecord): unknown;
   disarm(taskId: string): void;
@@ -232,7 +259,9 @@ function assertInMergeDomain(task: TaskRecord, domain: string): void {
 const RETRY_ACTION = (): TaskView['actions'][number] =>
   ({ name: 'retry', kind: 'signal', label: 'Retry', enabled: true });
 
-const FAILED_RECOVERY_ACTIONS = (): TaskView['actions'] => [
+/** Past the point of no return a failed task keeps Retry and follow-ups, but
+ * not Cancel: part of its proposal already landed. */
+const FAILED_RECOVERY_ACTIONS = (pointOfNoReturnPassed?: boolean): TaskView['actions'] => [
   RETRY_ACTION(),
   {
     name: 'followUp',
@@ -241,7 +270,7 @@ const FAILED_RECOVERY_ACTIONS = (): TaskView['actions'] => [
     enabled: true,
     args: [{ name: 'text', type: 'text', label: 'Message', required: true }],
   },
-  { name: 'cancel', kind: 'signal', label: 'Cancel', enabled: true, danger: true },
+  ...(pointOfNoReturnPassed ? [] : [{ name: 'cancel', kind: 'signal' as const, label: 'Cancel', enabled: true, danger: true }]),
 ];
 
 const FOLLOW_UP_ACTION = (role?: AgentRole): TaskView['actions'][number] => ({
@@ -602,6 +631,21 @@ export class KarmaxApi {
     return (await this.deps.store.getCollaborationRequest(request.id)) ?? settled;
   }
 
+  /** A sub-task asking people tells its parent so, in the parent's conversation.
+   * Addressed to those people, it does not call the parent's agent, which reads
+   * it on its next turn. Before shared conversations any message called it, so
+   * such a parent is not told. */
+  private async noteInParent(task: TaskRecord, audience: string[], detail: string): Promise<void> {
+    const parent = (await this.deps.store.getTask(task.parentTaskId!));
+    if (!parent || !this.sharedConversation(parent)) return;
+    const message: Message = { id: `u${randomUUID()}`, role: 'user', author: `task:${task.id}`,
+      authorLabel: `Task #${task.num ?? task.id}`, to: audience, text: detail, ts: Date.now() };
+    try {
+      await (await this.workflowHandle(parent.id)).signal(SIG.followUp, message);
+      (await this.publishConversationMessage(parent.id, MAIN_AGENT, message));
+    } catch { /* the parent is gone: nobody is left to tell */ }
+  }
+
   private async deliverWorkflowMessage(taskId: string, text: string, role = 'do'): Promise<Message> {
     const now = Date.now();
     const message: Message = { id: `u${randomUUID()}`, role: 'user', text, ts: now };
@@ -934,8 +978,34 @@ export class KarmaxApi {
       if (typeof sourceId !== 'string' || !sourceId) continue;
       const source = (await this.deps.store.getTask(sourceId));
       if (!source) throw new NotFoundError(`no task ${sourceId} to resume from`);
-      (await this.require(token, 'get_conversation', { projectId: source.projectId, taskId: sourceId }));
+      (await this.requireAsPerson(token, 'get_conversation', { projectId: source.projectId, taskId: sourceId }));
     }
+  }
+
+  /**
+   * `require` for an object in another project of the organization than the
+   * one a person's token is narrowed to: the browser and app-grant tokens are
+   * minted for the route's project, so forking a conversation from project A
+   * into a task in B would otherwise be refused as "token is scoped to project
+   * B". A person is judged by their own current grants there, as their session
+   * may use them. Agents and other bearers stay limited to their token, and so
+   * does any request that leaves the token's organization.
+   */
+  private async requireAsPerson(token: string, tool: string, scope: { projectId: string; taskId?: string }) {
+    const caller = (await this.deps.tokens.verify(token));
+    const person = caller?.kind === 'human' && caller.humanSubject?.presence === 'interactive' ? caller.humanSubject.userId : undefined;
+    const organizationId = (await this.deps.store.projectOrganizationAsync(scope.projectId));
+    if (!caller || !person || !this.deps.authorization || !caller.projectId || caller.projectId === scope.projectId
+      || !organizationId || organizationId !== caller.organizationId)
+      return this.require(token, tool, scope);
+    const grant = caller.identitySessionId ? (await new AppGrants(this.deps.store).get(caller.identitySessionId)) : undefined;
+    if (grant && grant.userId !== person) return this.require(token, tool, scope);
+    const capability = TOOL_CAPABILITY[tool] ?? tool;
+    if (!allows((await sessionCapabilities(this.deps.authorization, person, grant?.ceiling, { projectId: scope.projectId, organizationId })), capability)) {
+      const project = (await this.deps.store.getProject(scope.projectId));
+      throw new CapabilityError(`missing capability ${capability} in project ${project ? `${JSON.stringify(project.name)} (${project.id})` : scope.projectId}`);
+    }
+    return caller;
   }
 
   /** Carry file handles across task-agent forks. A provider session remembers the
@@ -999,6 +1069,35 @@ export class KarmaxApi {
       if (value === undefined || value === null || value === '') continue;
       if (typeof value !== 'string' || !validGitBranch(value.trim())) throw new Error(`invalid ${key} branch name`);
     }
+  }
+
+  /** A task's own Computer, validated: sizes in range, and a provider this
+   * deployment can run and the organization has connected. */
+  private async taskComputer(project: Project, overrides: ValueMap): Promise<ComputerSpec | undefined> {
+    let computer: ComputerSpec | undefined;
+    try {
+      computer = normalizeComputer(overrides.computer);
+      if (!computer?.provider && typeof overrides.worldProvider === 'string' && overrides.worldProvider)
+        computer = normalizeComputer({ ...computer, provider: overrides.worldProvider });
+    } catch (error) { throw new ValidationError(error instanceof Error ? error.message : String(error)); }
+    const provider = computer?.provider;
+    if (provider) {
+      const local = ['worktree', 'container', 'memory'].includes(provider);
+      if (local && this.deps.hosted) throw new ValidationError('hosted tasks run on a cloud computer (E2B or Daytona)');
+      if (!local && this.deps.providerConnections
+        && !(await this.deps.providerConnections.available(project.organizationId ?? 'org_personal', provider)))
+        throw new ValidationError(`${provider} is not connected. Connect it under Settings → Computers first.`);
+    }
+    return computer;
+  }
+
+  /** Store a task's Computer in its one canonical, validated form. */
+  private async normalizeTaskComputer(project: Project, params: ValueMap): Promise<void> {
+    if (params.computer === undefined && params.worldProvider === undefined) return;
+    const computer = (await this.taskComputer(project, params));
+    delete params.worldProvider;
+    if (computer) params.computer = computer;
+    else delete params.computer;
   }
 
   private async assertRepositoriesValid(manifest: WorkflowManifest, project: Project, resolved: ValueMap) {
@@ -1156,14 +1255,19 @@ export class KarmaxApi {
       ? (await this.deps.authorization.taskGrant(caller.principal, args.projectId, requestedAuthorization, grantorCaps))
       : { profileId: args.authorizationProfile ?? 'caller', capabilities: caller.caps, attenuated: false };
     const profileAttenuated = authorization.attenuated;
-    if (args.authorization && profileAttenuated
-      && !(args.draft && args.allowAttenuation) && !acceptsTaskAttenuation)
-      throw await this.authorizationGap(token, args.projectId, args.authorization, { kind: 'new-task' });
     const orgVault = (await this.deps.store.getSettings(`organization:${project.organizationId ?? 'org_personal'}`, 'vault')) ?? {};
     const projectVault = (await this.deps.store.getSettings(project.id, 'vault')) ?? {};
     const vaultDefaults = Object.hasOwn(projectVault, 'credentialGrants') ? projectVault : orgVault;
     const grants = args.credentialGrants ?? vaultDefaults.credentialGrants as string[] | undefined;
-    this.applyCredentialGrants(authorization, grants, caller.caps);
+    const ungranted = this.applyCredentialGrants(authorization, grants, caller.caps);
+    // Credentials named explicitly are a gap like an explicit level; inherited
+    // defaults are narrowed to the creator, as the default level is.
+    const missingCredentialGrants = args.credentialGrants === undefined ? [] : ungranted;
+    const limited = missingCredentialGrants.length > 0 || profileAttenuated;
+    if ((args.authorization && profileAttenuated || missingCredentialGrants.length)
+      && !(args.draft && args.allowAttenuation) && !acceptsTaskAttenuation)
+      throw await this.authorizationGap(token, args.projectId, args.authorization ?? selectionOf(authorization, args.projectId),
+        { kind: 'new-task' }, { credentialGrants: missingCredentialGrants });
     const credentialPolicies = await this.credentialPolicyOverrides(
       project.organizationId ?? 'org_personal', args.credentialPolicies ?? (args.credentialGrants === undefined ? vaultDefaults.credentialPolicies as VaultTaskPolicyOverrides | undefined : undefined), caller.caps, authorization,
     );
@@ -1194,6 +1298,7 @@ export class KarmaxApi {
     }
     taskOverrides.paymentPolicy ??= paymentDefaults;
     this.assertBranchParams(taskOverrides);
+    (await this.normalizeTaskComputer(project, taskOverrides));
     // A `resumeFrom` pointer reads another task's conversation — authorize it
     // against that task's project before anything is created.
     (await this.validateAndAuthorizeResumeSources(token, taskOverrides));
@@ -1263,11 +1368,13 @@ export class KarmaxApi {
           // different base from changed project settings.
           ...(!args.draft && typeof resolved.base === 'string' && resolved.base ? { base: resolved.base } : {}),
           ...(!args.draft && typeof resolved.target === 'string' && resolved.target ? { target: resolved.target } : {}),
+          ...(!args.draft && resolved.repoBranches ? { repoBranches: resolved.repoBranches } : {}),
           [REPOSITORY_BRANCHES_RESOLVED_PARAM]: true,
           profiles: args.profiles,
           draft: !!args.draft,
           _authorization: { ...authorization, profileAttenuated, principal: caller.principal, credentialPolicies,
-            ...(profileAttenuated ? { attenuationAccepted: acceptsTaskAttenuation } : {}) },
+            ...(missingCredentialGrants.length ? { missingCredentialGrants } : {}),
+            ...(limited ? { attenuationAccepted: acceptsTaskAttenuation } : {}) },
           ...(githubAccountId ? { _githubAccountId: githubAccountId } : {}),
           ...(repeatable ? { repeatable: true } : {}),
         },
@@ -1527,6 +1634,12 @@ export class KarmaxApi {
       ? [taskOverrides, (await quickProjectSettingsFor(getSettings, project.id, manifest.name)), (await quickGlobalSettingsFor(getSettings, manifest.name, project.organizationId)), projectVals, globalVals]
       : [taskOverrides, projectVals, globalVals];
     const resolved = resolveParamsLayers(manifest, layers);
+    // The Computer's defaults are the execution policy (already in the project's
+    // effective config); only the task's own override is a param. A legacy
+    // `worldProvider` param (older drafts and API callers) is its provider.
+    const computer = (await this.taskComputer(project, taskOverrides));
+    if (computer) resolved.computer = computer;
+    else delete resolved.computer;
     // `none` means a completed merge may remain only in its local world. That is
     // a valid self-hosted choice, but never a valid outcome for a disposable
     // hosted GitHub world. Coerce legacy settings rows here so every newly
@@ -1550,6 +1663,7 @@ export class KarmaxApi {
         if (!explicitTarget) resolved.target = branches.target;
       }
     }
+    applyRepoBranches(resolved, layers, effectiveRepos(resolved, project.config));
     return resolved;
   }
 
@@ -1742,6 +1856,7 @@ export class KarmaxApi {
     (await this.deps.store.patchTaskParams(task.id, {
       ...(typeof resolved.base === 'string' && resolved.base ? { base: resolved.base } : {}),
       ...(typeof resolved.target === 'string' && resolved.target ? { target: resolved.target } : {}),
+      ...(resolved.repoBranches ? { repoBranches: resolved.repoBranches } : {}),
       [REPOSITORY_BRANCHES_RESOLVED_PARAM]: true,
     }));
     // The confirmer belongs to the logical task, not an attempt. Snapshotting it
@@ -1873,11 +1988,13 @@ export class KarmaxApi {
     if (!task) throw new NotFoundError(`no task ${taskId}`);
     const caller = (await this.require(token, 'create_task', { projectId: task.projectId, taskId }));
     const storedAuthorization = task.params?._authorization as {
-      profileAttenuated?: boolean; attenuationAccepted?: boolean;
+      profileAttenuated?: boolean; attenuationAccepted?: boolean; missingCredentialGrants?: string[];
     } | undefined;
-    if (storedAuthorization?.profileAttenuated && !storedAuthorization.attenuationAccepted) {
+    if ((storedAuthorization?.profileAttenuated || storedAuthorization?.missingCredentialGrants?.length)
+      && !storedAuthorization.attenuationAccepted) {
       const selection = previousTaskGrants(task).authorization;
-      throw selection ? await this.authorizationGap(token, task.projectId, selection, { kind: 'task', taskId, queue: true })
+      throw selection ? await this.authorizationGap(token, task.projectId, selection, { kind: 'task', taskId, queue: true },
+        { credentialGrants: storedAuthorization.missingCredentialGrants })
         : new AuthorizationGrantError('you cannot grant the agent more authorization than you have');
     }
     (await this.assertStoredGrantQueueable(token, caller, task));
@@ -1959,23 +2076,27 @@ export class KarmaxApi {
    * Layer per-task vault item grants onto the attenuated profile package
    * (wiki plans/PLAN-passwords §6). A creator can attach only items its own grant
    * covers — or any item when it holds credential administration — so a
-   * confused deputy cannot mint credential access it does not have. Dropped
-   * grants mark the task attenuated rather than failing creation.
+   * confused deputy cannot mint credential access it does not have. Returns
+   * the grants it left out (marking the package attenuated); the caller
+   * decides whether that is a gap to refuse or a default to narrow.
    */
   private applyCredentialGrants(
     authorization: { capabilities: Capability[]; attenuated: boolean },
     requested: string[] | undefined,
     callerCaps: Capability[],
-  ): void {
+  ): Capability[] {
+    const ungranted: Capability[] = [];
     for (const raw of requested ?? []) {
       const cap = String(raw);
       if (!cap.startsWith('use-credential:')) throw new Error(`credentialGrants entries must be use-credential:… capabilities (got ${cap})`);
-      if (allows(callerCaps, cap) || allows(callerCaps, 'credential:write')) {
+      if (canGrantCredential(callerCaps, cap)) {
         if (!authorization.capabilities.includes(cap)) authorization.capabilities.push(cap);
       } else {
         authorization.attenuated = true;
+        if (!ungranted.includes(cap)) ungranted.push(cap);
       }
     }
+    return ungranted;
   }
 
   private async credentialPolicyOverrides(
@@ -2064,10 +2185,11 @@ export class KarmaxApi {
       ? (await this.deps.authorization.taskGrant(caller.principal, task.projectId, requested, grantorCaps))
       : { profileId: typeof requested === 'string' ? requested : requested.level, capabilities: caller.caps, attenuated: false };
     const profileAttenuated = authorization.attenuated;
-    this.applyCredentialGrants(authorization, credentialGrants, caller.caps);
+    const missingCredentialGrants = this.applyCredentialGrants(authorization, credentialGrants, caller.caps);
     const priorAuthorization = task.params?._authorization as {
       credentialPolicies?: VaultTaskPolicyOverrides; delegationId?: string; principal?: string;
       attenuationAccepted?: boolean; level?: string; scope?: string; projectIds?: string[]; capabilities?: string[];
+      missingCredentialGrants?: string[];
     } | undefined;
     if (options.preserveCredentialGrants) for (const capability of priorAuthorization?.capabilities ?? []) {
       if (capability.startsWith('use-credential:') && !authorization.capabilities.includes(capability))
@@ -2087,11 +2209,16 @@ export class KarmaxApi {
       : requested.level === priorAuthorization?.level
         && requested.scope === priorAuthorization?.scope
         && JSON.stringify(requested.projectIds ?? []) === JSON.stringify(priorAuthorization?.projectIds ?? []);
-    const attenuationAccepted = profileAttenuated
-      && (options.acceptAttenuation === true || sameSelection && priorAuthorization?.attenuationAccepted === true);
-    if (typeof requested !== 'string' && profileAttenuated
+    // A limit accepted before stays accepted only for what it covered.
+    const acceptedBefore = sameSelection && priorAuthorization?.attenuationAccepted === true
+      && missingCredentialGrants.every((grant) => priorAuthorization.missingCredentialGrants?.includes(grant));
+    const limited = profileAttenuated || missingCredentialGrants.length > 0;
+    const attenuationAccepted = limited && (options.acceptAttenuation === true || acceptedBefore);
+    if ((typeof requested !== 'string' && profileAttenuated || missingCredentialGrants.length)
       && !(editInPlace && options.allowAttenuation) && !attenuationAccepted)
-      throw await this.authorizationGap(token, task.projectId, requested, { kind: 'task', taskId });
+      throw await this.authorizationGap(token, task.projectId,
+        typeof requested === 'string' ? selectionOf(authorization, task.projectId) : requested,
+        { kind: 'task', taskId }, { credentialGrants: missingCredentialGrants });
     const authorizationScope = authorization as typeof authorization & {
       scope?: 'projects' | 'organization' | 'global'; projectIds?: string[]; organizationId?: string;
     };
@@ -2141,7 +2268,8 @@ export class KarmaxApi {
       _authorization: { ...priorAuthorizationWithoutDelegation, ...authorization, profileAttenuated,
         principal: caller.principal, credentialPolicies: policies,
         ...(delegation ? { delegationId: delegation.id } : {}),
-        ...(profileAttenuated ? { attenuationAccepted } : { attenuationAccepted: undefined }) },
+        missingCredentialGrants: missingCredentialGrants.length ? missingCredentialGrants : undefined,
+        attenuationAccepted: limited ? attenuationAccepted : undefined },
       ...(!pinnedGithubAccountId && delegation?.externalIdentities?.githubAccountId
         ? { _githubAccountId: delegation.externalIdentities.githubAccountId } : {}),
     }));
@@ -2186,14 +2314,18 @@ export class KarmaxApi {
     projectId: string,
     authorization: AuthorizationSelection,
     target: { kind: 'new-task' } | { kind: 'task'; taskId: string; queue?: boolean; participant?: string } | { kind: 'avatar'; avatarId?: string },
-    options: { canLimit?: boolean } = {},
+    options: { canLimit?: boolean; credentialGrants?: Capability[] } = {},
   ): Promise<AuthorizationGrantError> {
-    const targets = await this.authorizationEscalationTargets(token, { projectId, authorization }).catch(() => undefined);
-    const missingCapabilities = targets?.missingCapabilities ?? [];
+    const credentialGrants = options.credentialGrants?.length ? options.credentialGrants : undefined;
+    const targets = await this.authorizationEscalationTargets(token, { projectId, authorization, credentialGrants }).catch(() => undefined);
+    const missingCapabilities = targets?.missingCapabilities ?? credentialGrants ?? [];
     const summon = targets?.summon;
-    const summary = await this.authorizationSummary(projectId, authorization);
+    const credentialNames = (targets?.credentials ?? []).map((credential) => credential.label);
+    const summary = await this.authorizationSummary(projectId, authorization)
+      + (credentialNames.length ? ` with ${credentialNames.join(', ')}` : '');
     const request = (taskOrAvatar: string) => `POST /api/authorization-requests?projectId=${projectId} with `
-      + `{"target":${taskOrAvatar},"authorization":${JSON.stringify(authorization)},"audience":["${summon}"]}`;
+      + `{"target":${taskOrAvatar},"authorization":${JSON.stringify(authorization)},`
+      + `${credentialGrants ? `"credentialGrants":${JSON.stringify(credentialGrants)},` : ''}"audience":["${summon}"]}`;
     const limit = options.canLimit === false ? undefined
       : target.kind === 'avatar' ? 'save it with limitAuthorization: true'
         : target.kind === 'task' && target.participant ? `retry with acceptAttenuation: ["${target.participant}"]`
@@ -2212,7 +2344,7 @@ export class KarmaxApi {
     return new AuthorizationGrantError(
       `you cannot grant the ${target.kind === 'avatar' ? 'Avatar' : target.kind === 'task' && target.participant ? participantLabel(target.participant) : 'agent'} more authorization than you have: `
       + `${summary}${shown ? ` needs ${shown}` : ''}. ${next}`,
-      { summary, missingCapabilities, ...(summon ? { summon } : {}), next });
+      { summary, missingCapabilities, ...(summon ? { summon } : {}), next, ...(credentialGrants ? { credentialGrants } : {}) });
   }
 
   /** "Project maintainer · Site", "Developer · 3 projects", "Administrator · Acme". */
@@ -2309,7 +2441,8 @@ export class KarmaxApi {
       const kept = prior[key];
       const accepted = options.accept === true || (Array.isArray(options.accept) && options.accept.includes(key));
       if (!options.force && kept && kept.principal === caller.principal && authorityKey(kept.requested) === authorityKey(requested)) {
-        next[key] = kept.profileAttenuated && !kept.attenuationAccepted && accepted ? { ...kept, attenuationAccepted: true } : kept;
+        next[key] = (kept.profileAttenuated || kept.missingCredentialGrants?.length) && !kept.attenuationAccepted && accepted
+          ? { ...kept, attenuationAccepted: true } : kept;
         continue;
       }
       next[key] = await this.agentAuthorizationFor(token, caller, task, key, requested, {
@@ -2336,18 +2469,22 @@ export class KarmaxApi {
       ? (await this.deps.authorization.taskGrant(caller.principal, task.projectId, selection, grantorCaps))
       : { ...selection, profileId: selection.level, capabilities: [...caller.caps], attenuated: false };
     const profileAttenuated = authorization.attenuated;
-    this.applyCredentialGrants(authorization, requested.credentialGrants ?? inherited.credentialGrants, caller.caps);
+    const ungranted = this.applyCredentialGrants(authorization, requested.credentialGrants ?? inherited.credentialGrants, caller.caps);
+    const missingCredentialGrants = requested.credentialGrants === undefined ? [] : ungranted;
+    const limited = profileAttenuated || missingCredentialGrants.length > 0;
     const credentialPolicies = (await this.credentialPolicyOverrides(organizationId,
       requested.credentialPolicies ?? (requested.credentialGrants === undefined ? inherited.credentialPolicies : undefined),
       caller.caps, authorization));
     const sameRequest = !!options.prior && authorityKey(options.prior.requested) === authorityKey(requested);
-    const attenuationAccepted = profileAttenuated && (options.accepted || !!options.fromDefaults
+    const attenuationAccepted = limited && (options.accepted || !!options.fromDefaults
       || sameRequest && options.prior?.attenuationAccepted === true);
-    // Like the task's own selection: an explicit level the setter cannot grant
-    // is refused unless a draft keeps it for later or the setter accepts the
-    // limited package. Task defaults are snapshotted attenuated, never widened.
-    if (requested.authorization && profileAttenuated && !options.mayAttenuate && !attenuationAccepted)
-      throw Object.assign(await this.authorizationGap(token, task.projectId, selection, { kind: 'task', taskId: task.id, participant: key }),
+    // Like the task's own selection: an explicit level or credential the setter
+    // cannot grant is refused unless a draft keeps it for later or the setter
+    // accepts the limited package. Task defaults are snapshotted attenuated, never widened.
+    if ((requested.authorization && profileAttenuated || missingCredentialGrants.length)
+      && !options.mayAttenuate && !attenuationAccepted)
+      throw Object.assign(await this.authorizationGap(token, task.projectId, selection,
+        { kind: 'task', taskId: task.id, participant: key }, { credentialGrants: missingCredentialGrants }),
         { participant: key, authorization: selection });
     const scoped = authorization as typeof authorization & { scope?: AuthorizationSelection['scope']; projectIds?: string[]; organizationId?: string };
     const pinnedGithubAccountId = typeof task.params?._githubAccountId === 'string' ? task.params._githubAccountId : undefined;
@@ -2365,7 +2502,8 @@ export class KarmaxApi {
     }));
     return {
       ...authorization, profileAttenuated, principal: caller.principal, credentialPolicies,
-      ...(profileAttenuated ? { attenuationAccepted } : {}),
+      ...(missingCredentialGrants.length ? { missingCredentialGrants } : {}),
+      ...(limited ? { attenuationAccepted } : {}),
       ...(delegation ? { delegationId: delegation.id } : {}),
       ...(requested.paymentPolicy ? { paymentPolicy: requested.paymentPolicy } : {}),
       requested,
@@ -2376,9 +2514,10 @@ export class KarmaxApi {
    * setter's acceptance (the task-level gate in `queueTask`, per agent). */
   private assertAgentAuthorizationsAccepted(entries: Record<string, StoredAgentAuthorization>): void {
     for (const [key, entry] of Object.entries(entries)) {
-      if (entry.profileAttenuated && !entry.attenuationAccepted)
+      if ((entry.profileAttenuated || entry.missingCredentialGrants?.length) && !entry.attenuationAccepted)
         throw Object.assign(new AuthorizationGrantError(`you cannot grant the ${participantLabel(key)} more authorization than you have`),
-          { participant: key, authorization: entry.requested.authorization });
+          { participant: key, authorization: entry.requested.authorization,
+            ...(entry.missingCredentialGrants?.length ? { credentialGrants: entry.missingCredentialGrants } : {}) });
     }
   }
 
@@ -2623,6 +2762,7 @@ export class KarmaxApi {
     params = stripPlatformMetadata({ ...params });
     const project = (await this.deps.store.getProject(task.projectId));
     if (project) this.assertProfilesVisible(params.profiles, project);
+    if (project) (await this.normalizeTaskComputer(project, params));
     // Editing params can introduce a `resumeFrom` pointer at another task, so
     // the same source-side conversation check as createTask applies here.
     (await this.validateAndAuthorizeResumeSources(token, params));
@@ -2720,6 +2860,12 @@ export class KarmaxApi {
     const enrich = async (view: TaskView | undefined): Promise<TaskView | undefined> => {
       if (!view) return view;
       view = await this.deps.store.withPendingReviewInfoAsync(taskId, view);
+      if (computerResizable(view) && !(view.editableParams ?? []).includes('computer'))
+        view = { ...view, editableParams: [...(view.editableParams ?? []), 'computer'] };
+      if (computerResizable(view)) {
+        const computerChange = await this.computerChange(taskId).catch(() => undefined);
+        if (computerChange) view = { ...view, computerChange };
+      }
       if (await this.deps.store.kvGet(`project-transfer-history:${taskId}`)) {
         const { world, worldPath, worldAvailable, worldDesktop, worldProvider, ...history } = view;
         view = history;
@@ -2761,8 +2907,8 @@ export class KarmaxApi {
         notes: task?.notes,
         ...(agents ? { agents } : {}),
         ...(task ? { stageTransitions: (await this.availableStageTransitions(task, view, group)) } : {}),
-        ...(view.status === 'failed' && RECOVERABLE_WORKFLOWS.has(view.workflow) && !view.pointOfNoReturnPassed
-          ? { actions: FAILED_RECOVERY_ACTIONS() }
+        ...(view.status === 'failed' && RECOVERABLE_WORKFLOWS.has(view.workflow)
+          ? { actions: FAILED_RECOVERY_ACTIONS(view.pointOfNoReturnPassed) }
           : { actions: this.lifecycleActions(view) }),
         ...((await this.deps.store.kvGet(`project-transfer-history:${taskId}`))
           ? { actions: [], stageTransitions: [] } : {}),
@@ -3093,7 +3239,9 @@ export class KarmaxApi {
       return result;
     }
     if (view.status === 'failed') {
-      if (resumable && !view.pointOfNoReturnPassed)
+      // Past the point of no return, Retry is how the rest of a partly landed
+      // proposal still lands; only discarding it is unsafe.
+      if (resumable)
         add({ target: 'do', label: 'Retry', description: 'Recover the preserved work and retry the task.' });
       if (!jayadratha && !view.pointOfNoReturnPassed)
         add({ target: 'draft', label: 'Draft', description: 'Discard failed progress and start over later.', danger: true });
@@ -3208,6 +3356,7 @@ export class KarmaxApi {
       // refs so a recovered Review/Merge can authorize the exact opened heads.
       prs: (view.prs ?? source.prs)?.map((pr) => ({ ...pr })),
       ...(view.landing ? { landing: { ...view.landing, authorizedHeads: { ...(view.landing.authorizedHeads ?? {}) } } } : {}),
+      ...(view.pointOfNoReturnPassed ? { pointOfNoReturnPassed: true } : {}),
       resumeStage,
       // A deliberate Landing → Do move is an integration repair, not a fresh
       // proposal. Keep intent authorization but require automated review of the
@@ -3303,7 +3452,16 @@ export class KarmaxApi {
       if (attempt === 3)
         throw new Error(`${task.title} kept continuing as new while it was being stopped; try again.`);
     }
+    await this.withdrawCoordinatorClaims(task, view);
+    return attempted;
+  }
 
+  /** Withdraw what a stopped run still holds in the coordinators: queued or
+   * granted agent turns, account leases and merge-queue places. A run that
+   * ended without running its own cleanup (terminated, failed) leaves them
+   * behind, and the merge queue's dead-holder check cannot tell that run from
+   * its replacement, which shares the task id. */
+  private async withdrawCoordinatorClaims(task: TaskRecord, view: TaskView): Promise<void> {
     // Do not trust only the projected turn: pre-1.7 account waits did not expose
     // their turnId, and a stale snapshot can lag a just-enqueued agent request.
     // Query both coordinators and withdraw every request owned by this task.
@@ -3329,13 +3487,18 @@ export class KarmaxApi {
     }
     const world = (view.world ?? view.state?.recoveryWorld) as WorldHandle | undefined;
     const rememberedDomain = typeof view.state?.mergeDomain === 'string' ? view.state.mergeDomain : undefined;
-    const domains = world
-      ? mergeQueueDomains(world, view.targetBranch ?? world.target ?? 'main', task.projectId)
+    // A GitHub landing leases one domain per participant repository, which the
+    // world alone does not name; the run publishes every domain it holds.
+    const publishedDomains = Array.isArray(view.state?.mergeDomains)
+      ? view.state.mergeDomains.filter((domain): domain is string => typeof domain === 'string')
+      : [];
+    const domains = [...publishedDomains, ...(world
+      ? [...mergeQueueDomains(world, view.targetBranch ?? world.target ?? 'main', task.projectId), ...(rememberedDomain ? [rememberedDomain] : [])]
       : view.stage === 'merge'
         ? [rememberedDomain ?? mergeQueueDomains(undefined, view.targetBranch ?? 'main', task.projectId)[0]!]
         : rememberedDomain
           ? [rememberedDomain]
-          : [];
+          : [])];
     for (const domain of [...new Set(domains)]) {
       signals.push(this.deps.client.workflow.signalWithStart(MERGE_QUEUE_WORKFLOW, {
         workflowId: mergeQueueId(domain),
@@ -3346,7 +3509,6 @@ export class KarmaxApi {
       }));
     }
     await Promise.all(signals.map((signal) => signal.catch(() => undefined)));
-    return attempted;
   }
 
   /** Setup can be terminated before a WorldHandle containing `worldLeaseId` is
@@ -3567,6 +3729,11 @@ export class KarmaxApi {
       return (await this.getTaskView(token, taskId, { live: true }))!;
     }
 
+    if (view.status === 'failed' && target === 'do') {
+      await this.recoverFailedTask(taskId);
+      return (await this.getTaskView(token, taskId))!;
+    }
+
     if (!['done', 'cancelled', 'failed'].includes(view.status))
       await this.stopTaskActivity(task, view, target === 'human' ? 'Task paused for human input' : `Task moved to ${target}`);
     const resumeStage = target === 'human' ? view.stage : target as Stage;
@@ -3591,7 +3758,8 @@ export class KarmaxApi {
     // it asks them in the conversation, and their reply calls it back.
     if (task && caller.taskId === taskId && caller.participant && caller.participant !== MAIN_AGENT && this.sharedConversation(task)
       && task.lastView?.waitingFor?.kind !== 'responder') {
-      const audience = args.audience?.length ? args.audience : ['@creator'];
+      if (!args.audience?.length) throw new ValidationError(unnamedAudienceError(await this.escalationTargets(task), !!task.parentTaskId));
+      const audience = args.audience;
       const posted = await this.postTaskMessage(token, taskId, { text: args.message, to: audience,
         ...(args.urgency ? { urgency: args.urgency } : {}) });
       return { ...(task.lastView as TaskView), asked: posted.notified,
@@ -3613,13 +3781,11 @@ export class KarmaxApi {
     if (!redirect && !(await this.availableStageTransitions(task, view)).some((move) => move.target === 'human'))
       throw new Error(`cannot request human input from ${stageName(view.stage)}`);
 
-    let audience = [...new Set((args.audience ?? []).map((selector) => String(selector).trim()).filter(Boolean))];
-    // Without an audience, ask whoever answers this task's questions: its human
-    // Responder route, else the person the task works for.
-    if (!audience.length) {
-      const route = task.params?.responder as { kind?: string; audience?: string[] } | undefined;
-      audience = route?.kind === 'human' && route.audience?.length ? [...route.audience] : ['@creator'];
-    }
+    const audience = [...new Set((args.audience ?? []).map((selector) => String(selector).trim()).filter(Boolean))];
+    // An ask a person must answer names them. A default here once sent a
+    // sub-task's question past its parent to the top of its creator chain (#533);
+    // what an agent can answer goes to the task's ordinary route instead.
+    if (!audience.length) throw new ValidationError(unnamedAudienceError(await this.escalationTargets(task), !!task.parentTaskId));
     if (audience.length > 32) throw new Error('at most 32 audience selectors may be used');
     const avatarRecipients: import('../domain/types.js').Avatar[] = [];
     const initiatingUserId = (await this.deps.store.taskCreatorUserId(task.id));
@@ -3647,6 +3813,13 @@ export class KarmaxApi {
       await (await this.workflowHandle(taskId)).signal('reroute', { audience: audience.filter((selector) => !selector.startsWith('avatar:')).length
         ? audience : [...audience, '@creator'], detail });
       held = { ...view, waitingFor: { ...view.waitingFor!, kind: 'human', audience, detail } };
+      // A sub-task's question passed on to people no longer waits on its parent,
+      // which would otherwise keep being prompted to answer it (#454).
+      if (waitingOn === 'parent' && task.parentTaskId) {
+        try {
+          await (await this.workflowHandle(task.parentTaskId)).signal(SIG.subtaskRedirected, { childTaskId: task.id });
+        } catch { /* the parent is gone: nothing waits on it */ }
+      }
     } else {
       await this.stopTaskActivity(task, view, `Escalated to ${audience.join(', ')}`);
       held = await this.startTransitionReplacement(task, view, view.stage, true, { audience, detail });
@@ -3663,6 +3836,7 @@ export class KarmaxApi {
     };
     const seq = (await this.deps.store.appendEvent(event));
     this.deps.bus?.emit({ ...event, seq });
+    if (task.parentTaskId && caller.taskId === taskId) await this.noteInParent(task, audience, detail);
     for (const avatar of avatarRecipients) {
       try {
         await this.createTask(token, {
@@ -3868,12 +4042,14 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
 
   async authorizationEscalationTargets(
     token: string,
-    input: { projectId: string; authorization: AuthorizationSelection },
+    input: { projectId: string; authorization: AuthorizationSelection; credentialGrants?: Capability[] },
   ): Promise<{
     projectId: string;
     authorization: AuthorizationSelection;
     requestedCapabilities: Capability[];
     missingCapabilities: Capability[];
+    /** The missing vault credentials, named for people. */
+    credentials: Array<{ capability: Capability; label: string }>;
     users: Array<{ id: string; selector: string }>;
     teams: Array<{ id: string; name: string; slug: string; selector: string; eligibleUserIds: string[] }>;
     special: Array<{ selector: string; eligibleUserIds: string[] }>;
@@ -3886,14 +4062,22 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     if (!project?.organizationId) throw new NotFoundError('project organization not found');
     const authorization = this.deps.authorization;
     if (!authorization) throw new Error('authorization service is unavailable');
-    const requestedCapabilities = (await authorization.requestedCapabilities(input.projectId, input.authorization));
-    const missingCapabilities = caller.kind === 'human'
+    const credentialGrants = [...new Set((input.credentialGrants ?? []).map(String))];
+    const invalid = credentialGrants.find((grant) => !grant.startsWith('use-credential:'));
+    if (invalid) throw new ValidationError(`credentialGrants entries must be use-credential:… capabilities (got ${invalid})`);
+    const levelCapabilities = (await authorization.requestedCapabilities(input.projectId, input.authorization));
+    const requestedCapabilities = [...levelCapabilities, ...credentialGrants.filter((grant) => !levelCapabilities.includes(grant))];
+    const missingCredentials = credentialGrants.filter((grant) => !canGrantCredential(caller.caps, grant));
+    const missingCapabilities = [...(caller.kind === 'human'
       ? (await authorization.missingCapabilities(caller.principal, input.projectId, input.authorization))
-      : requestedCapabilities.filter((capability) => !allows(caller.caps, capability));
+      : levelCapabilities.filter((capability) => !allows(caller.caps, capability))), ...missingCredentials];
+    const canGrantAll = (caps: Capability[]) => credentialGrants.every((grant) => canGrantCredential(caps, grant));
     const memberIds = (await this.deps.store.listOrganizationMemberships(project.organizationId)).map((member) => member.userId);
-    const eligibleUserIds = (await __asyncCollections.filter(memberIds, async (userId) =>
-      allows((await authorization.capabilities(`user:${userId}`, input.projectId, project.organizationId)), 'task:create')
-      && (await authorization.canGrantSelection(`user:${userId}`, input.projectId, input.authorization))));
+    const eligibleUserIds = (await __asyncCollections.filter(memberIds, async (userId) => {
+      const held = (await authorization.capabilities(`user:${userId}`, input.projectId, project.organizationId));
+      return allows(held, 'task:create') && canGrantAll(held)
+        && (await authorization.canGrantSelection(`user:${userId}`, input.projectId, input.authorization));
+    }));
     const users = eligibleUserIds.map((id) => ({ id, selector: `user:${id}` }));
     const eligible = new Set(eligibleUserIds);
     const teams = (await __asyncCollections.map((await this.deps.store.listTeams(project.organizationId, input.projectId)), async (team) => ({ ...team, eligibleUserIds: (await this.deps.store.listTeamMemberships(team.id))
@@ -3909,15 +4093,23 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         && (!avatar.roles.length || avatar.roles.includes('authorize'))
         && (await avatarCallableBy(this.deps.store, avatar, initiatingUserId)))), async (avatar) => {
         const effective = (await avatarAuthorizationCapabilities(this.deps.store, authorization, avatar, input.projectId));
-        return allows(effective, 'task:create')
-          && requestedCapabilities.every((capability) => allows(effective, capability));
+        return allows(effective, 'task:create') && canGrantAll(effective)
+          && levelCapabilities.every((capability) => allows(effective, capability));
       }))
       .map((avatar) => ({ id: avatar.id, name: avatar.name,
         ...(avatar.purpose ? { purpose: avatar.purpose } : {}), selector: `avatar:${avatar.id}` }));
     const { special, summon } = await this.summonable(project.id, project.organizationId, eligibleUserIds);
+    // Names only for a caller who may see the vault's item list.
+    const vault = allows(caller.caps, 'credential:read') ? new VaultItems(this.deps.store, undefined, undefined, project.organizationId) : undefined;
+    const credentials = await __asyncCollections.map(missingCredentials, async (capability) => {
+      const [, kind, ...rest] = capability.split(':');
+      const target = rest.join(':');
+      const label = kind === 'item' ? (await vault?.get(target))?.label : undefined;
+      return { capability, label: label ?? (kind === 'tag' ? `#${target}` : target) };
+    });
     return {
       projectId: input.projectId, authorization: input.authorization,
-      requestedCapabilities, missingCapabilities, users, teams, special, avatars,
+      requestedCapabilities, missingCapabilities, credentials, users, teams, special, avatars,
       ...(summon ? { summon } : {}),
     };
   }
@@ -3956,6 +4148,8 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       target: { kind: 'task'; taskId: string; participant?: string; queueAfterApproval?: boolean }
         | { kind: 'avatar'; avatarId: string; enableAfterApproval?: boolean };
       authorization: AuthorizationSelection;
+      /** Vault credentials to add on approval (a task target only). */
+      credentialGrants?: Capability[];
       audience: string[];
       reason?: string;
     },
@@ -3986,8 +4180,11 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       if (!requesterId || avatar.ownerUserId !== requesterId)
         throw new CapabilityError('only the Avatar owner can route its authorization request');
     }
+    const credentialGrants = input.credentialGrants?.length ? [...new Set(input.credentialGrants.map(String))] : undefined;
+    if (credentialGrants && input.target.kind !== 'task')
+      throw new ValidationError('an Avatar’s credentials are chosen with the Avatar, not requested');
     const targets = (await this.authorizationEscalationTargets(token, {
-      projectId: input.projectId, authorization: input.authorization,
+      projectId: input.projectId, authorization: input.authorization, credentialGrants,
     }));
     if (!targets.missingCapabilities.length)
       throw new ValidationError('you already have the requested authorization');
@@ -4027,11 +4224,14 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     // A repeated click must not fan out duplicate Avatar decision tasks or route
     // a second audience that is not recorded on the durable request.
     if (existing) return existing;
+    const credentialNames = targets.credentials.map((credential) => credential.label);
     const request = (await service.request({
       projectId: input.projectId, target: input.target, authorization: input.authorization,
+      ...(credentialGrants ? { credentialGrants } : {}),
       capabilities: targets.requestedCapabilities, missingCapabilities: targets.missingCapabilities,
       audience, recipients: [...recipients], avatarRecipients: [...avatarRecipients],
-      reason: String(input.reason ?? '').trim() || `Grant ${input.authorization.level} authorization to this ${input.target.kind}.`,
+      reason: String(input.reason ?? '').trim() || `Grant ${input.authorization.level} authorization`
+        + `${credentialNames.length ? ` with ${credentialNames.join(', ')}` : ''} to this ${input.target.kind}.`,
       requestedBy: caller.principal,
     }));
     if (input.target.kind === 'task') {
@@ -4059,7 +4259,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         await this.createTask(token, {
           projectId: input.projectId, workflow: 'just-do',
           title: `${avatar.name}: decide authorization request`,
-          prompt: `Decide whether to approve or deny authorization request ${request.id}.\n\nTarget: ${input.target.kind} ${input.target.kind === 'task' ? input.target.taskId : input.target.avatarId}\nRequested authorization: ${input.authorization.level} (${input.authorization.scope})\nMissing capabilities: ${request.missingCapabilities.join(', ')}\n${untrustedBlock('reason from the requester', request.reason)}\n\nAct according to your Avatar instructions. Resolve the request exactly once by calling platform_request with POST /api/authorization-requests/${request.id}/resolve?organizationId=${project.organizationId} and body {"action":"approve"} or {"action":"deny"}. Then briefly report the decision.`,
+          prompt: `Decide whether to approve or deny authorization request ${request.id}.\n\nTarget: ${input.target.kind} ${input.target.kind === 'task' ? input.target.taskId : input.target.avatarId}\nRequested authorization: ${input.authorization.level} (${input.authorization.scope})${credentialNames.length ? ` with vault credentials ${credentialNames.join(', ')}` : ''}\nMissing capabilities: ${request.missingCapabilities.join(', ')}\n${untrustedBlock('reason from the requester', request.reason)}\n\nAct according to your Avatar instructions. Resolve the request exactly once by calling platform_request with POST /api/authorization-requests/${request.id}/resolve?organizationId=${project.organizationId} and body {"action":"approve"} or {"action":"deny"}. Then briefly report the decision.`,
           params: { 'agent:do': { avatarId: avatar.id, avatarPurpose: 'authorize', provider: avatar.runtime.provider,
             ...(avatar.runtime.model ? { model: avatar.runtime.model } : {}),
             ...(avatar.runtime.effort ? { effort: avatar.runtime.effort } : {}) } },
@@ -4117,7 +4317,8 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     if (input.action === 'approve') {
       const grantorCaps = (await this.authorizationGrantorCaps(token, caller, request.authorization, input.organizationId));
       const authorization = (await this.deps.authorization?.taskGrant(caller.principal, request.projectId, request.authorization, grantorCaps));
-      if (!authorization || authorization.attenuated)
+      if (!authorization || authorization.attenuated
+        || (request.credentialGrants ?? []).some((grant) => !canGrantCredential(caller.caps, grant)))
         throw new CapabilityError('you can no longer grant the complete requested authorization');
       claimId = await service.claim(request.id, input.action, caller.principal);
       if (request.target.kind === 'task') {
@@ -4126,7 +4327,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         const participant = request.target.participant;
         for (const attempt of attempts) {
           if (!participant) {
-            await this.setTaskAuthorization(token, attempt.id, request.authorization, undefined, undefined,
+            await this.setTaskAuthorization(token, attempt.id, request.authorization, request.credentialGrants, undefined,
               { acceptAttenuation: false, preserveCredentialGrants: true });
             continue;
           }
@@ -4393,23 +4594,24 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   /** Discover only the people and teams that can receive an escalation for the
    * calling task. Kept behind the same narrow capability so Merge/Confirm and
    * custom roles do not need broad organization-directory access. */
-  async humanEscalationTargets(token: string): Promise<{
-    taskId: string;
-    users: Array<{ id: string; selector: string }>;
-    teams: Array<{ id: string; name: string; slug: string; selector: string }>;
-    special: Array<{ selector: string; description: string }>;
-    avatars: Array<{ id: string; name: string; purpose?: string; selector: string; roles: string[] }>;
-  }> {
+  async humanEscalationTargets(token: string): Promise<EscalationTargets> {
     const caller = (await this.require(token, 'escalate_to_human'));
     if (caller.taskId === '*') throw new Error('this endpoint requires a task-agent token');
     const task = (await this.deps.store.getTask(caller.taskId));
     (await this.require(token, 'escalate_to_human', { projectId: task?.projectId, taskId: caller.taskId }));
     if (!task) throw new Error(`no task ${caller.taskId}`);
+    return this.escalationTargets(task);
+  }
+
+  private async escalationTargets(task: TaskRecord): Promise<EscalationTargets> {
     const project = (await this.deps.store.getProject(task.projectId));
     if (!project?.organizationId) throw new Error('task project has no organization');
 
     const projectUsers = (await this.deps.store.humanAudience(task.id, ['@project']));
-    const users = projectUsers.map((id) => ({ id, selector: `user:${id}` }));
+    const users = (await __asyncCollections.map(projectUsers, async (id) => {
+      const name = (await this.deps.store.userDisplayName(id));
+      return { id, selector: `user:${id}`, ...(name ? { name } : {}) };
+    }));
     const teams = (await __asyncCollections.filter((await this.deps.store.listTeams(project.organizationId, project.id)), async (team) => (await this.deps.store.listTeamMemberships(team.id))
         .some((member) => projectUsers.includes(member.userId))))
       .map((team) => ({ id: team.id, name: team.name, slug: team.slug, selector: `@team:${team.slug}` }));
@@ -4678,8 +4880,9 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     return this.searchAuthorizedOrganization(readable, query, caller.principal, page, now);
   }
 
-  /** Evaluate one query across already-authorized projects of an organization:
-   *  one sort and grouping over all of them, then a page of the result. */
+  /** Evaluate one query across already-authorized projects — an organization's,
+   *  or every organization's: one sort and grouping over all of them, then a
+   *  page of the result. */
   async searchAuthorizedOrganization(projects: Project[], query: string | TaskQuery, principalId: string,
     page: { limit?: number; offset?: number } = {}, now = Date.now()) {
     const { result, tags } = await this.evaluateProjects(projects, query, principalId, now);
@@ -4696,7 +4899,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       ...result, tasks, total: result.total, offset, limit,
       ...(result.groups ? { groups: prune(result.groups) } : {}),
       ...(result.reasons ? { reasons: Object.fromEntries(Object.entries(result.reasons).filter(([id]) => ids.has(id))) } : {}),
-      projects: projects.map((project) => ({ id: project.id, name: project.name, slug: slugify(project.name) })),
+      projects: projects.map((project) => ({ id: project.id, name: project.name, slug: slugify(project.name), organizationId: project.organizationId ?? 'org_personal' })),
       tags,
     };
   }
@@ -4901,7 +5104,6 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     if (!task || !view) throw new Error(`no failed task ${taskId}`);
     if (!RECOVERABLE_WORKFLOWS.has(task.workflow) || view.status !== 'failed')
       throw new Error(`only a failed ${[...RECOVERABLE_WORKFLOWS].join(' or ')} task can be recovered`);
-    if (view.pointOfNoReturnPassed) throw new Error('cannot recover a task after its merge point of no return');
 
     // Recovery is an explicit migration boundary. Replaying a replacement with
     // the same obsolete implementation can reproduce the exact incompatibility
@@ -4937,33 +5139,22 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       };
     }
     if (world.kind === 'worktree' && !fs.existsSync(world.root)) throw new Error(`preserved worktree no longer exists: ${world.root}`);
+    await this.withdrawCoordinatorClaims(task, view);
 
-    const messages = view.messages.map((m) => ({ ...m }));
-    const seen = typeof view.state?.turnsSeen === 'number' ? view.state.turnsSeen : messages.length;
-    messages.push({
+    // Resume in Do whatever stage failed: a run that died mid-Landing may have
+    // been stopped inside a merge whose outcome only the provider knows, so the
+    // agent and the landing both re-read the live PRs rather than trusting the
+    // checkpoint. The PR set, landing and point of no return carry over, so an
+    // authorized landing that failed resumes as an integration repair.
+    const failedFrom = view.state?.failedFrom as Stage | undefined;
+    const checkpoint = (await this.transitionCheckpoint({ ...view, stage: failedFrom ?? view.stage }, 'do'));
+    const messages = [...checkpoint.messages, {
       id: `recovery-${Date.now()}`,
-      role: 'user',
+      role: 'user' as const,
       text: `${BRAND} recovered this task after its prior execution failed. Continue from the existing worktree and conversation; preserve and finish the work already present. Previous failure: ${view.error ?? 'unknown error'}`,
-      ts: messages.length,
-    });
-    const session = (await this.deps.store.kvGet(`session:${taskId}:do`)) || undefined;
-    let sessionHome: string | undefined;
-    try {
-      const meta = JSON.parse((await this.deps.store.kvGet(`sessionmeta:${taskId}:do`)) ?? '{}');
-      sessionHome = typeof meta.home === 'string' ? meta.home || '(profile)' : undefined;
-    } catch {
-      /* malformed legacy metadata: conversation still recovers without session resume */
-    }
-    input.recovery = {
-      world,
-      messages,
-      transcripts: view.transcripts?.map((t) => ({ ...t, messages: t.messages.map((m) => ({ ...m })) })),
-      reviewInfo: view.reviewInfo,
-      session,
-      sessionHome,
-      seen,
-      target: view.targetBranch,
-    };
+      ts: checkpoint.messages.length,
+    }];
+    input.recovery = { ...checkpoint, world, messages };
 
     const execution = await withTimeout(
       this.deps.client.workflow.start(startType, {
@@ -4996,6 +5187,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     if (started) (await this.saveAgentSnapshot(taskId, started.manifest, input));
     // Close the short acceptance→first-publish window so the UI cannot offer a
     // second recovery while the replacement run is already starting.
+    const { failedFrom: _failedFrom, ...recoveredState } = view.state;
     (await this.deps.store.saveView(taskId, {
       ...view,
       stage: 'do',
@@ -5003,8 +5195,8 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       messages,
       error: undefined,
       waitingFor: undefined,
-      actions: [{ name: 'cancel', kind: 'signal', label: 'Cancel', enabled: true, danger: true }],
-      state: { ...view.state, recoveryWorld: world },
+      actions: view.pointOfNoReturnPassed ? [] : [{ name: 'cancel', kind: 'signal', label: 'Cancel', enabled: true, danger: true }],
+      state: { ...recoveredState, recoveryWorld: world },
     }));
   }
 
@@ -5046,8 +5238,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       : [...new Set(input.to.map((selector) => String(selector).trim()).filter(Boolean))];
     if (to && to.length > 32) throw new ValidationError('at most 32 recipients');
     const newAgents = Object.entries(input.agents ?? {});
-    const listed = new Set((task.lastView?.participants ?? []).map((participant) => participant.key));
-    listed.add(MAIN_AGENT);
+    const listed = new Set(this.taskAgentKeys(task));
     if (!shared && (newAgents.length || (to ?? []).some((selector) => selector.startsWith(AGENT_SELECTOR) && selectorAgent(selector) !== MAIN_AGENT)))
       throw new ValidationError('this task predates conversations with several agents; send a follow-up to its agent');
     // New agents join the task as parameters first, so the workflow knows them
@@ -5123,12 +5314,31 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   }
 
   /** `notify`: a task's agent tells or calls people and agents without ending
-   * its turn — people are notified now, agents are called when it ends. */
-  async notify(token: string, args: { to: string[]; message: string; urgency?: Urgency }): Promise<{ message?: Message; notified: string[] }> {
+   * its turn — people are notified now, agents are called when it ends.
+   * `agents` calls new agents in (each the next `agent-N`, called after `to`);
+   * the returned message's `to` names the keys they were given. */
+  async notify(token: string, args: { to?: string[]; message: string; urgency?: Urgency; agents?: AgentSpec[] }): Promise<{ message?: Message; notified: string[] }> {
     const caller = (await this.require(token, 'notify'));
     if (!caller.taskId || caller.taskId === '*') throw new ValidationError('notify is for a task agent; use POST /api/tasks/:id/messages');
-    if (!args.to?.length) throw new ValidationError('notify needs at least one recipient');
-    return this.postTaskMessage(token, caller.taskId, { text: args.message, to: args.to, ...(args.urgency ? { urgency: args.urgency } : {}) });
+    if (!args.to?.length && !args.agents?.length) throw new ValidationError('notify needs at least one recipient');
+    const agents: Record<string, AgentSpec> = {};
+    if (args.agents?.length) {
+      const task = (await this.deps.store.getTask(caller.taskId));
+      const known = task ? this.taskAgentKeys(task) : [MAIN_AGENT];
+      for (const spec of args.agents) {
+        const key = nextAgentKey(known);
+        known.push(key);
+        agents[key] = spec;
+      }
+    }
+    const to = [...(args.to ?? []), ...Object.keys(agents).map(agentSelector)];
+    return this.postTaskMessage(token, caller.taskId, { text: args.message, to,
+      ...(args.agents?.length ? { agents } : {}), ...(args.urgency ? { urgency: args.urgency } : {}) });
+  }
+
+  /** The agents a task lists, its main agent first. */
+  private taskAgentKeys(task: TaskRecord): string[] {
+    return [...new Set([MAIN_AGENT, ...(task.lastView?.participants ?? []).map((participant) => participant.key)])];
   }
 
   /** Ask Avatars to respond to a task: each runs as its own small task that
@@ -5174,6 +5384,31 @@ Act according to your Avatar instructions. When ready, call platform_request POS
 
   async messageAgent(token: string, taskId: string, text: string, role?: string): Promise<Message | undefined> {
     return this.deliverSignal('message_agent', token, taskId, SIG.followUp, text, role);
+  }
+
+  /**
+   * Stop one of a task's agents, like Ctrl+C in a terminal (software-dev ≥1.27):
+   * its turn ends now — working, or still waiting for a credential, host
+   * capacity, a retry or people — and an agent only queued does not run. The
+   * task goes on: the next agent runs, the stage it interrupted resumes, and a
+   * stopped main agent waits for the next message.
+   */
+  async stopAgent(token: string, taskId: string, key: string): Promise<{ stopped: string }> {
+    const task = (await this.deps.store.getTask(taskId));
+    if (!task) throw new NotFoundError(`no task ${taskId}`);
+    const caller = (await this.require(token, 'stop_agent', { projectId: task.projectId, taskId }));
+    if (!this.sharedConversation(task)) throw new ValidationError('this task predates stopping one agent; cancel the task instead');
+    const participant = task.lastView?.participants?.find((candidate) => candidate.key === key);
+    if (!participant) throw new ValidationError(`${key} is not an agent on this task`);
+    if (participant.state === 'idle') throw new ValidationError(`${participantLabel(key)} is not working`);
+    const userId = caller.humanSubject?.userId;
+    const ownAgent = caller.kind === 'agent' && caller.taskId === taskId ? (caller.participant ?? MAIN_AGENT) : undefined;
+    const by = userId ? `user:${userId}` : ownAgent ? `agent:${ownAgent}` : caller.principal;
+    const byLabel = userId ? ((await this.deps.store.userDisplayName(userId)) ?? undefined)
+      : ownAgent ? participantLabel(ownAgent) : undefined;
+    await (await this.workflowHandle(taskId, task)).signal('stopAgent', { key, by, ...(byLabel ? { byLabel } : {}) });
+    (await this.deps.store.appendEvent({ taskId, type: 'task.agent-stopped', ts: Date.now(), payload: { participant: key, state: participant.state, by } }));
+    return { stopped: key };
   }
 
   private async deliverSignal(tool: 'signal_task' | 'message_agent', token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[], files?: FileRef[], attemptChoice?: { otherAttempts?: 'keep' | 'cancel'; saveOtherAttemptsDefault?: boolean }, receivedAt?: { monoMs: number; wallMs: number },
@@ -5306,7 +5541,7 @@ Act according to your Avatar instructions. When ready, call platform_request POS
     }
 
     const terminal = (await this.deps.store.getTask(taskId))?.lastView;
-    if (terminal?.status === 'failed' && RECOVERABLE_WORKFLOWS.has(terminal.workflow) && !terminal.pointOfNoReturnPassed) {
+    if (terminal?.status === 'failed' && RECOVERABLE_WORKFLOWS.has(terminal.workflow)) {
       if (signal === SIG.retry) {
         await this.recoverFailedTask(taskId);
         return;
@@ -5318,11 +5553,12 @@ Act according to your Avatar instructions. When ready, call platform_request POS
         const transcripts = terminal.transcripts?.map((t) => ({ ...t, messages: t.messages.map((m) => ({ ...m })) }));
         const target = role && role !== 'do' ? transcripts?.find((t) => t.role === role)?.messages : messages;
         (target ?? messages).push(msg);
-        (await this.deps.store.saveView(taskId, { ...terminal, messages, transcripts, actions: FAILED_RECOVERY_ACTIONS() }));
+        (await this.deps.store.saveView(taskId, { ...terminal, messages, transcripts, actions: FAILED_RECOVERY_ACTIONS(terminal.pointOfNoReturnPassed) }));
         (await this.publishConversationMessage(taskId, role, msg));
         return msg;
       }
       if (signal === SIG.cancel) {
+        if (terminal.pointOfNoReturnPassed) throw new Error('cannot cancel a task after its merge point of no return');
         (await this.saveSettledView(taskId, {
           ...terminal,
           stage: 'cancelled',
@@ -5695,6 +5931,16 @@ Act according to your Avatar instructions. When ready, call platform_request POS
     if ('paymentPolicy' in patch) throw new Error('Use the task payments endpoint to change cards or budget');
     patch = stripPlatformMetadata({ ...patch });
     this.assertBranchParams(patch);
+    // A running task may resize its computer, not swap it for another one.
+    const project = (await this.deps.store.getProject(task.projectId));
+    const computerBefore = project && Object.prototype.hasOwnProperty.call(patch, 'computer')
+      ? (await this.deps.store.effectiveTaskConfig(project, taskId)) : undefined;
+    if (project && computerBefore) {
+      if (!computerResizable(task.lastView)) throw new ValidationError('this task\'s computer can\'t be resized: the task has ended');
+      try { assertInFlightComputerEdit(computerOf(computerBefore), normalizeComputer(patch.computer) ?? {}); }
+      catch (error) { throw new ValidationError(error instanceof Error ? error.message : String(error)); }
+      patch.computer = (await this.taskComputer(project, { computer: patch.computer })) ?? null;
+    }
     // An in-flight edit can introduce a `resumeFrom` pointer at another task —
     // the same source-side conversation check as createTask/updateArmedParams.
     (await this.validateAndAuthorizeResumeSources(token, patch));
@@ -5731,7 +5977,13 @@ Act according to your Avatar instructions. When ready, call platform_request POS
         { keys: routed.flatMap(keysOf), mayAttenuate: false, accept: options.acceptAttenuation }))
       : undefined;
     try {
-      const result = (await (await this.workflowHandle(taskId)).executeUpdate('updateParams', { args: [patch] })) as { applied: string[] };
+      // The workflow judges every other field's window; the Computer is the
+      // platform's (computerResizable), so it never reaches a workflow — an
+      // older one, started before the Computer existed, would refuse it.
+      const { computer: _computer, ...workflowPatch } = patch;
+      const result = Object.keys(workflowPatch).length
+        ? (await (await this.workflowHandle(taskId)).executeUpdate('updateParams', { args: [workflowPatch] })) as { applied: string[] }
+        : { applied: [] as string[] };
       const applied = routed.filter((name) => result.applied.includes(name));
       if (computed && applied.length) {
         const current = this.storedAgentAuthorizations((await this.deps.store.getTask(taskId)) ?? task);
@@ -5740,6 +5992,22 @@ Act according to your Avatar instructions. When ready, call platform_request POS
           else delete current[key];
         }
         (await this.deps.store.patchTaskParams(taskId, { _agentAuthorization: current }));
+      }
+      // The workflow accepted the edit window; the Computer itself is read from
+      // the task's params by whatever makes its next machine (runners.ts sweep,
+      // checkpoint restore, a retry's world). A world made before machines were
+      // recorded learns the size it was made at, so the sweep can see the change.
+      if (computerBefore) {
+        (await this.deps.store.patchTaskParams(taskId, { computer: patch.computer }));
+        const world = (await this.deps.store.currentWorld(taskId));
+        if (world && !world.meta?.computer && !['worktree', 'container', 'memory'].includes(world.kind))
+          (await this.deps.store.updateWorldMeta(world, { computer: machineShape(computerBefore) }).catch(() => undefined));
+        result.applied = [...new Set([...result.applied, 'computer'])];
+        // A running world moves only once it parks, which a turn or a job wait
+        // never does: tell the agent, unless it asked for the size itself.
+        const change = caller.taskId === taskId ? undefined : await this.computerChange(taskId).catch(() => undefined);
+        if (change && (await this.deps.store.worldState(taskId)) === 'ready')
+          (await this.deliverWorkflowMessage(taskId, computerChangeNotice(change)).catch(() => undefined));
       }
       (await this.updateAgentSnapshot(taskId, patch, result.applied));
       if (result.applied.includes('target') && typeof patch.target === 'string')
@@ -5759,12 +6027,28 @@ Act according to your Avatar instructions. When ready, call platform_request POS
     }
   }
 
+  /** The machine a task's Computer asks for, when its world runs on another. */
+  private async computerChange(taskId: string): Promise<{ from: MachineShape; to: MachineShape } | undefined> {
+    const world = (await this.deps.store.currentWorld(taskId));
+    const from = world?.meta?.computer as MachineShape | undefined;
+    const task = from && (await this.deps.store.getTask(taskId));
+    const project = task && (await this.deps.store.getProject(task.projectId));
+    if (!from || !project) return undefined;
+    const to = machineShape(await this.deps.store.effectiveTaskConfig(project, taskId));
+    return sameMachine(from, to) ? undefined : { from, to };
+  }
+
   /** Keep the workflow's accepted destination, stored task snapshot, and durable
    * world handle coherent. The immutable base/baseSha deliberately do not move:
    * retargeting changes where work lands, not where its custody chain began. */
   private async persistAcceptedTarget(taskId: string, target: string): Promise<void> {
     const task = (await this.deps.store.getTask(taskId));
+    // Repositories that shared the common target follow it, as their checkouts
+    // do (unpinned); one with a target of its own keeps it.
+    const repoBranches = normalizeRepoBranches(task?.params.repoBranches);
     if (task) (await this.deps.store.updateTaskParams(taskId, { ...task.params, target,
+      ...(repoBranches ? { repoBranches: Object.fromEntries(Object.entries(repoBranches).map(([source, entry]) =>
+        [source, entry.target === task.params.target ? { ...entry, target } : entry])) } : {}),
       [REPOSITORY_BRANCHES_RESOLVED_PARAM]: true }));
     const world = (await this.deps.store.currentWorld(taskId));
     if (world) (await this.deps.store.updateCurrentWorldTarget(taskId, target));
@@ -6626,6 +6910,20 @@ Act according to your Avatar instructions. When ready, call platform_request POS
  * a human approved a mid-task authorization request), its per-task vault
  * credential caps and the policies chosen for them. A legacy record that only
  * carries a `profileId` still maps to a level. */
+/** Can `caps` hand a vault credential grant to a task? Its own grant must
+ * cover it, or it administers credentials (wiki plans/PLAN-passwords §6). */
+function canGrantCredential(caps: Capability[], grant: Capability): boolean {
+  return allows(caps, grant) || allows(caps, 'credential:write');
+}
+
+/** The level and scope an effective package was minted from. */
+function selectionOf(authorization: { level?: string; profileId?: string; scope?: AuthorizationSelection['scope']; projectIds?: string[] },
+  projectId: string): AuthorizationSelection {
+  const scope = authorization.scope ?? 'projects';
+  return { level: authorization.level ?? authorization.profileId ?? 'developer', scope,
+    ...(scope === 'projects' ? { projectIds: authorization.projectIds?.length ? authorization.projectIds : [projectId] } : {}) };
+}
+
 export function previousTaskGrants(task: TaskRecord): {
   authorization?: AuthorizationSelection;
   credentialGrants: string[];
@@ -6670,4 +6968,12 @@ function applyExecutionConfig(config: import('../domain/types.js').ProjectConfig
     else next[key] = patch[key];
   }
   return next as import('../domain/types.js').ProjectConfig;
+}
+
+/** What an agent is told when its task's Computer changes under it. */
+function computerChangeNotice(change: { from: MachineShape; to: MachineShape }): string {
+  return `[${BRAND} computer change]\n\nThis task's computer is now ${describeMachine(change.to)}; you are still on ${describeMachine(change.from)}. `
+    + 'You move to it when this task parks: end your turn with pause(3) without jobs. A pause that waits on jobs keeps this machine, '
+    + 'so first let them finish or stop them (stop_job); if one is running out of room, stopping it now is usually right. '
+    + 'You resume with every tracked file and uncommitted change; Git-ignored files (dependencies, build output) and running processes do not carry over.';
 }

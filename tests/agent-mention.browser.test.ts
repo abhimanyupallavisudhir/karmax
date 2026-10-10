@@ -64,14 +64,59 @@ it('calls a new agent into a task from the follow-up box with @+', async () => {
     expect(await menu.locator('.am-key').first().innerText()).toBe('[0]');
   });
   if (shots) await page.screenshot({ path: path.join(shots, 'mention-menu.png') });
+  // In a short window the expanded People list still fits on screen.
+  await page.setViewportSize({ width: 1280, height: 420 });
+  await box.fill('');
+  await box.type('@');
+  await menu.locator('.am-opt').filter({ hasText: 'People' }).dispatchEvent('mousedown');
+  await step('People stays inside the window', async () => {
+    await menu.getByText('@maintainers').waitFor();
+    const r = (await menu.boundingBox())!;
+    expect(r.y).toBeGreaterThanOrEqual(0);
+    expect(r.y + r.height).toBeLessThanOrEqual(420);
+  });
+  if (shots) await page.screenshot({ path: path.join(shots, 'mention-people.png') });
+  await step('the last person is reachable by keyboard', async () => {
+    for (let i = (await menu.locator('.am-opt').count()) - 1; i > 0; i--) await box.press('ArrowDown');
+    const active = (await menu.locator('.am-opt.active').boundingBox())!, r = (await menu.boundingBox())!;
+    expect(active.y + active.height).toBeLessThanOrEqual(r.y + r.height + 1);
+  });
+  // The box is a transparent textarea over a painted copy of its text: a pick
+  // must repaint that copy, or the picked name is invisible until the next key.
+  const painted = page.locator('.followup-box[data-role="do"] .wiki-ref-backdrop');
+  await box.fill('');
+  await box.type('@maint');
+  await box.press('Enter');
+  await step('a group is written as its identifier', () => expect.poll(() => box.inputValue()).toBe('@maintainers '));
+  await step('the picked group is visible at once', () => expect.poll(() => painted.textContent()).toBe('@maintainers '));
+  await box.fill('');
+  await box.type('@');
+  await menu.locator('.am-opt').first().dispatchEvent('mousedown');
+  await step('an agent picked with the mouse is visible at once', () => expect.poll(() => painted.textContent()).toBe('@Agent '));
+  await page.setViewportSize({ width: 1280, height: 860 });
+  await box.fill('');
+  await box.type('@');
+  await menu.getByText('New agent…').waitFor();
   await box.type('+');
   await step('+ adds Agent 1 with an inline form', async () => {
     await page.locator('.followup-new-agent').filter({ hasText: 'Agent 1' }).waitFor();
     expect(await box.inputValue()).toBe('@Agent 1 ');
+    expect(await painted.textContent()).toBe('@Agent 1 ');
   });
+  if (shots) await page.locator('.followup-box[data-role="do"]').screenshot({ path: path.join(shots, 'mention-picked.png') });
   await page.locator('.followup-new-agent select').first().selectOption('mock').catch(() => {});
   await box.type('please double-check\n@heard');
   if (shots) await page.screenshot({ path: path.join(shots, 'mention-new-agent.png') });
+  // Agent 1's answer streams into the thread before the view that ends its turn
+  // reaches the page, and until then unaddressed text still goes to the main
+  // agent (master CI #1669 replied in that window). Holding that view makes
+  // the window certain instead of rare.
+  await page.route(`${app.url}/api/tasks/${task.id}`, async (route) => {
+    const response = await route.fetch();
+    const json = await response.json();
+    if (json.participants?.some((p: any) => p.key === 'agent-1' && p.state === 'idle')) await new Promise((resolve) => setTimeout(resolve, 3_000));
+    await route.fulfill({ response, json });
+  });
   await page.locator('.followup-box[data-role="do"] .followup-send').click();
   await step('Agent 1 answers in the same thread', () =>
     page.locator('.msg.agent.other-agent .role').filter({ hasText: 'Agent 1' }).waitFor({ timeout: 60_000 }));
@@ -80,6 +125,34 @@ it('calls a new agent into a task from the follow-up box with @+', async () => {
   expect(v.stage).toBe('review');
   expect(v.participants.map((p: any) => p.key)).toEqual(['do', 'agent-1']);
   if (shots) await page.screenshot({ path: path.join(shots, 'conversation.png'), fullPage: false });
+
+  // Stop, like Ctrl+C: the working agent's turn ends and the task goes on.
+  // (Unaddressed text replies to Agent 1, which just answered you; the box says so.)
+  await step('the box replies to Agent 1', () => expect.poll(() => box.getAttribute('placeholder'), { timeout: 15_000 }).toMatch(/^Reply to Agent 1 /));
+  await box.fill('Take your time.\n@sleep 120000');
+  await page.locator('.followup-box[data-role="do"] .followup-send').click();
+  // Unrouted, not left passing through: a poll still in the route when the
+  // browser closes rejects unhandled ("Response has been disposed", CI #1729).
+  await page.unrouteAll({ behavior: 'ignoreErrors' });
+  const stop = page.locator('.followup-box[data-role="do"] .followup-stop');
+  await step('Stop appears while the agent works', () => stop.waitFor({ timeout: 60_000 }));
+  expect(await stop.getAttribute('title')).toBe('Stop Agent 1');
+  if (shots) await page.screenshot({ path: path.join(shots, 'stop-button.png'), fullPage: false });
+  await stop.click();
+  await step('the thread says who stopped it', () => page.locator('.msg.system').filter({ hasText: 'Ann Author stopped Agent 1.' }).waitFor({ timeout: 30_000 }));
+  await step('Stop is gone', () => stop.waitFor({ state: 'detached' }));
+  const after = await consoleRequest(context, app.url, 'GET', `/api/tasks/${task.id}`);
+  expect(after.stage).toBe('review');
+  expect(after.participants.map((p: any) => p.state)).toEqual(['idle', 'idle']);
+  if (shots) await page.screenshot({ path: path.join(shots, 'stopped.png'), fullPage: false });
+
+  // A group typed by hand addresses its people, as picking it does.
+  await box.fill('@maintainers have a look');
+  await page.locator('.followup-box[data-role="do"] .followup-send').click();
+  await step('a typed identifier addresses that group', () => expect.poll(async () => {
+    const events = await consoleRequest(context, app!.url, 'GET', `/api/tasks/${task.id}/events?since=0&limit=300`);
+    return (events.events ?? events).map((e: any) => e.payload?.message).find((m: any) => m?.text === '@maintainers have a look')?.to;
+  }, { timeout: 15_000 }).toEqual(['@maintainers']));
   expect(errors).toEqual([]);
   await context.close();
 }, 240_000);

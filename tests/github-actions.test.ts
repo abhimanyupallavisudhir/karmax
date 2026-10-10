@@ -182,11 +182,10 @@ describe('GitHub Actions API', () => {
     const identity = { repository: 'Acme/App', pullRequest: 118, headSha: 'c19ce3c', workflowId: 7, check: 'CI' };
     const cancelled = inspection('The operation was canceled.', {
       id: 365, workflowId: 7, runNumber: 365, attempt: 1, conclusion: 'cancelled',
-      headSha: 'synthetic-merge-1',
+      headSha: 'c19ce3c',
       pullRequests: [{ number: 118, headSha: 'c19ce3c' }],
     }).run;
-    const active = { ...cancelled, id: 366, runNumber: 366, status: 'in_progress', conclusion: undefined,
-      headSha: 'synthetic-merge-2' };
+    const active = { ...cancelled, id: 366, runNumber: 366, status: 'in_progress', conclusion: undefined };
     const key = githubRequiredCheckKey(identity);
     expect(key).toBe('acme/app#118:c19ce3c:workflow:7:check:ci');
     expect(reconcileGithubActionsRuns(identity, cancelled, [cancelled, active])).toMatchObject({
@@ -214,6 +213,27 @@ describe('GitHub Actions API', () => {
     const foreign = { ...active, id: 367, workflowId: 8,
       pullRequests: [{ number: 118, headSha: 'different-head' }] };
     expect(reconcileGithubActionsRuns(identity, cancelled, [foreign]).current.id).toBe(365);
+  });
+
+  // PR #540 (2026-10-08): its head's run was cancelled, and GitHub listed the
+  // previous head's green run with `pull_requests[].head.sha` set to the PR's
+  // *current* head. That field describes the PR now, not the commit the run
+  // tested, so the old run satisfied the new head and broken tests landed.
+  it('never lets a run of an earlier PR head satisfy the current head', () => {
+    const identity = { repository: 'acme/app', pullRequest: 540, headSha: 'b3897fd', workflowId: 7, check: 'tests 1/5' };
+    const cancelled = inspection('The operation was canceled.', {
+      id: 1622, runNumber: 1622, conclusion: 'cancelled', headSha: 'b3897fd',
+      updatedAt: '2026-10-08T22:06:38Z',
+      pullRequests: [{ number: 540, headSha: 'b3897fd' }],
+    }).run;
+    const earlierHead = { ...cancelled, id: 1613, runNumber: 1613, conclusion: 'success', headSha: 'f79e196',
+      updatedAt: '2026-10-08T21:11:58Z' };
+    const reconciliation = reconcileGithubActionsRuns(identity, cancelled, [cancelled, earlierHead]);
+    expect(reconciliation.successful).toBeUndefined();
+    expect(reconciliation.current.id).toBe(1622);
+    expect(reconciliation.runs.map((candidate) => candidate.id)).toEqual([1622]);
+    // Nor does the observed run itself count when it tested another commit.
+    expect(reconcileGithubActionsRuns(identity, earlierHead, [cancelled]).successful).toBeUndefined();
   });
 
   it('lists normalized runs with bounded provider filters', async () => {

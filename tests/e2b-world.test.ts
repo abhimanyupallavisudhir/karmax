@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { E2BWorldProvider, DEFAULT_E2B_TEMPLATE, type E2BFactory, type E2BSandboxLike } from '../src/world/e2b.js';
 import { serviceHomeLabel } from '../src/world/services.js';
+import { e2bDiskLimitGb, sizedBuildOptions, sizedTemplateName } from '../src/world/e2b-template.js';
 import { isMissingSandbox } from '../src/world/provider-errors.js';
 
 describe('E2B cloud world provider', () => {
@@ -15,6 +16,52 @@ describe('E2B cloud world provider', () => {
     await expect(provider.destroy(forged)).rejects.toThrow('invalid E2B world handle');
     expect(connect).not.toHaveBeenCalled();
     await expect(provider.open(world.handle)).resolves.toBeDefined();
+  });
+
+  it('runs a computer of another size on a template built once at that size', async () => {
+    const created: Array<string | undefined> = [];
+    const ensureTemplate = vi.fn(async () => undefined);
+    const factory = { create: async (options: { template?: string }) => { created.push(options.template); return fakeSandbox(() => undefined); },
+      connect: async () => fakeSandbox(() => undefined), ensureTemplate };
+    const provider = new E2BWorldProvider(factory as any);
+    // The default size needs nothing built.
+    await provider.create({ taskId: 'default', base: 'main', resources: { cpu: 2, memoryMb: 2048 } });
+    expect(created).toEqual([DEFAULT_E2B_TEMPLATE]);
+    expect(ensureTemplate).not.toHaveBeenCalled();
+    const shape = { cpu: 4, memoryMb: 8192, diskGb: 40 };
+    const world = await provider.create({ taskId: 'big', base: 'main', resources: { ...shape, gpu: 0 } });
+    await provider.create({ taskId: 'big-too', base: 'main', resources: shape });
+    expect(ensureTemplate).toHaveBeenCalledTimes(1);
+    expect(ensureTemplate).toHaveBeenCalledWith(DEFAULT_E2B_TEMPLATE, sizedTemplateName(DEFAULT_E2B_TEMPLATE, shape), shape, {});
+    expect(created.slice(1)).toEqual([sizedTemplateName(DEFAULT_E2B_TEMPLATE, shape), sizedTemplateName(DEFAULT_E2B_TEMPLATE, shape)]);
+    expect(world.handle.warnings ?? []).toEqual([]);
+    // A project environment snapshot was built at its project's size already.
+    await provider.create({ taskId: 'built', base: 'main', resources: shape, environment: { snapshot: 'env-snapshot' } });
+    expect(created.at(-1)).toBe('env-snapshot');
+    expect(sizedBuildOptions(shape)).toEqual({ cpuCount: 4, memoryMB: 8192, minFreeDiskMb: 40 * 1024 });
+    expect(sizedBuildOptions({ diskGb: 200 }).minFreeDiskMb).toBe(50 * 1024);
+  });
+
+  it('builds a disk above the account\'s ceiling at the ceiling, and says so', async () => {
+    expect(e2bDiskLimitGb(new Error("400: Minimum free disk can't be higher than 25600 MiB (if you need to increase this limit, please contact support)"))).toBe(25);
+    expect(e2bDiskLimitGb(new Error('quota exceeded'))).toBeUndefined();
+    const created: Array<string | undefined> = [];
+    const provider = new E2BWorldProvider({ create: async (options: { template?: string }) => { created.push(options.template); return fakeSandbox(() => undefined); },
+      connect: async () => fakeSandbox(() => undefined),
+      ensureTemplate: async () => ({ name: 'karmax-sized-capped', diskGb: 25 }) } as any);
+    const world = await provider.create({ taskId: 'capped', base: 'main', resources: { cpu: 4, memoryMb: 4096, diskGb: 30 } });
+    expect(created).toEqual(['karmax-sized-capped']);
+    expect(world.handle.warnings).toEqual(['This E2B account gives a computer at most 25 GB of free disk, so this one has 25 GB, not 30 GB.']);
+  });
+
+  it('never fails a task over its size: it runs at the default size and says why', async () => {
+    const created: Array<string | undefined> = [];
+    const provider = new E2BWorldProvider({ create: async (options: { template?: string }) => { created.push(options.template); return fakeSandbox(() => undefined); },
+      connect: async () => fakeSandbox(() => undefined),
+      ensureTemplate: async () => { throw new Error('template build quota exceeded'); } } as any);
+    const world = await provider.create({ taskId: 'refused', base: 'main', resources: { diskGb: 30 } });
+    expect(created).toEqual([DEFAULT_E2B_TEMPLATE]);
+    expect(world.handle.warnings?.join('\n')).toMatch(/could not be prepared as 2 CPU · 2 GB · 30 GB disk.*template build quota exceeded/);
   });
 
   it('uses one provider inventory request before a new allocation (LT-3)', async () => {
@@ -117,7 +164,7 @@ describe('E2B cloud world provider', () => {
         return { events: [
           { id: 'pause-1', type: 'sandbox.lifecycle.paused', timestamp: '2026-07-31T10:05:00Z',
             sandbox_id: 'sandbox-1', sandbox_execution_id: 'execution-1', event_data: {
-              sandbox_metadata: { karmaxHome: serviceHomeLabel(), karmaxTaskId: 'task-1' },
+              sandbox_metadata: { karmaxHome: serviceHomeLabel(), karmaxTaskId: 'task-1', karmaxOrganizationId: 'org-1' },
               execution: { started_at: '2026-07-31T10:00:00Z', execution_time: 300_000,
                 vcpu_count: 2, memory_mb: 512 },
             } },
@@ -138,7 +185,7 @@ describe('E2B cloud world provider', () => {
       () => ({ organizationId: 'org-1', provider: 'e2b', apiKey: 'secret', config: {} }));
 
     expect((await provider.listUsageEvents!('org-1')).events).toEqual([{
-      id: 'execution-1', sandboxId: 'sandbox-1', taskId: 'task-1',
+      id: 'execution-1', sandboxId: 'sandbox-1', taskId: 'task-1', organizationId: 'org-1',
       startedAt: Date.UTC(2026, 6, 31, 10), endedAt: Date.UTC(2026, 6, 31, 10, 5),
       activeMs: 300_000, cpu: 2, memoryMb: 512,
     }]);
@@ -341,13 +388,15 @@ describe('E2B cloud world provider', () => {
         return sandbox;
       },
       async list(options) {
+        // Sandboxes created before the organization label are still adopted.
+        expect(options.metadata).not.toHaveProperty('karmaxOrganizationId');
         return options.metadata.karmaxTaskId === 'retry-create'
           ? [{ sandboxId: sandbox.sandboxId, metadata }]
           : [];
       },
     });
 
-    await provider.create({ taskId: 'retry-create', generation: 3, base: 'main' });
+    await provider.create({ taskId: 'retry-create', generation: 3, base: 'main', organizationId: 'org-1' });
 
     expect(creates).toBe(0);
     expect(connects).toBe(1);

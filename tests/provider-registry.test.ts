@@ -81,3 +81,17 @@ describe('official ACP config homes', () => {
     expect(hasAcpHomeLogin('kimi', dir)).toBe(true);
   });
 });
+
+// Hosted deployments force cloud worlds, and the task form offers every
+// admitted agent in every project. So admission itself is the gate: an agent
+// that cannot run in an E2B/Daytona world is never offered (task #515's
+// OpenCode failed at its first turn on tavya.io before remote-acp.ts).
+describe('agent admission', () => {
+  it('admits only agents that also run in a cloud world', async () => {
+    const { AGENT_PROVIDERS, isAcpProvider } = await import('../src/agent/provider-registry.js');
+    const { remoteAcpSupported } = await import('../src/agent/remote-acp.js');
+    for (const provider of AGENT_PROVIDERS)
+      if (isAcpProvider(provider)) expect(remoteAcpSupported(provider), provider).toBe(true);
+    expect(remoteAcpSupported('kimi')).toBe(false);
+  });
+});

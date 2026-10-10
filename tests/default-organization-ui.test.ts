@@ -72,7 +72,7 @@ describe('default organization browser behavior', () => {
     };
     const went: string[] = [];
     const helpers = ['slugify', 'orgSlug', 'organizationById', 'projectById', 'currentOrg', 'orgBase', 'encodeQuery',
-      'listRoute', 'homeRoute', 'globalRoute', 'applyRoute'].map(extractFunction).join('\n');
+      'listRoute', 'homeRoute', 'globalRoute', 'organizationBySlug', 'pathWithOrganization', 'renamedOrganizationPath', 'applyRoute'].map(extractFunction).join('\n');
     const applyRoute = Function('S', 'go', 'parseRoute', 'currentPath', 'location', 'DEFAULT_LIST_QUERY',
       `${helpers}; return applyRoute;`)(state, (to: string) => { went.push(to); }, () => ({ name: 'home' }), () => '/',
       { pathname: '/' }, 'for:me');

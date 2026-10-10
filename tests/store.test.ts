@@ -659,13 +659,43 @@ describe.each(storeBackends)('Store ($name)', ({ name, open }) => {
       id: project.id, organizationId: organization.id, name: 'Storefront', folder: 'Commerce',
     });
     expect((await store.renameOrganization(organization.id, '  Acme Labs  '))).toMatchObject({
-      id: organization.id, name: 'Acme Labs', slug: organization.slug,
+      id: organization.id, name: 'Acme Labs', slug: 'acme-labs',
     });
     expect((await store.getProject(project.id))).toMatchObject({ name: 'Storefront', folder: 'Commerce' });
     expect((await store.getOrganization(organization.id))?.name).toBe('Acme Labs');
     await expect((async () => (await store.renameProject(project.id, 'settings')))()).rejects.toThrow(/reserved/i);
     await expect((async () => (await store.renameProject(project.id, '   ')))()).rejects.toThrow(/required/i);
     await expect((async () => (await store.renameOrganization(organization.id, '')))()).rejects.toThrow(/required/i);
+  });
+
+  it('moves an organization to its new name\'s URL and keeps its old URLs as its own', async () => {
+    const acme = (await store.createOrganization({ name: 'Acme' }));
+    const beta = (await store.createOrganization({ name: 'Beta' }));
+    const previous = async (id: string) => (await store.withPreviousSlugs([(await store.getOrganization(id))!]))[0]!.previousSlugs;
+
+    expect((await store.renameOrganization(acme.id, 'ACME'))).toMatchObject({ slug: 'acme' });
+    expect((await previous(acme.id))).toBeUndefined();
+    expect((await store.renameOrganization(acme.id, 'Acme Labs')).slug).toBe('acme-labs');
+    expect((await store.getOrganization(acme.id))?.slug).toBe('acme-labs');
+    expect((await previous(acme.id))).toEqual(['acme']);
+
+    // The old address still belongs to Acme: a newcomer with that name gets a suffix.
+    expect((await store.createOrganization({ name: 'acme' })).slug).toBe('acme-2');
+    expect((await store.renameOrganization(beta.id, 'Acme Labs!')).slug).toBe('acme-labs-2');
+    expect((await previous(beta.id))).toEqual(['beta']);
+
+    // Renaming back reclaims an organization's own old slug.
+    expect((await store.renameOrganization(acme.id, 'ACME Inc')).slug).toBe('acme-inc');
+    expect((await store.renameOrganization(acme.id, 'Acme Labs')).slug).toBe('acme-labs');
+    expect((await previous(acme.id))).toEqual(['acme-inc', 'acme']);
+
+    await expect(store.renameOrganization(acme.id, 'Settings')).rejects.toThrow(/reserved/i);
+    await expect(store.renameOrganization(acme.id, 'Docs')).rejects.toThrow(/reserved/i);
+    expect((await store.getOrganization(acme.id))).toMatchObject({ name: 'Acme Labs', slug: 'acme-labs' });
+
+    // Deleting the organization frees every address it held.
+    (await store.deleteOrganization(acme.id));
+    expect((await store.createOrganization({ name: 'Acme Inc' })).slug).toBe('acme-inc');
   });
 
   it('keeps organization names unique across organizations and users', async () => {

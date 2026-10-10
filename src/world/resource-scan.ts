@@ -2,6 +2,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { Project } from '../domain/types.js';
 import { git } from './git.js';
+import { remoteName } from './provision-git.js';
+import { dotenvFile } from '../domain/dotenv.js';
+import { dataFolder, DATA_FOLDER_BYTES, likelySecret, sqliteDatabase, variableName } from '../domain/ignored-files.js';
 
 export interface ResourceProposal {
   id: string;
@@ -12,7 +15,7 @@ export interface ResourceProposal {
   reason: string;
   suggested: {
     driver: 'secret@1' | 'volume@1';
-    target: { kind: 'environment'; name: string } | { kind: 'path'; path: string };
+    target: { kind: 'environment'; name: string } | { kind: 'path'; path: string; repository?: string };
     access: 'read' | 'write';
     isolation: 'fork';
     publish: 'discard' | 'review';
@@ -35,13 +38,16 @@ export async function scanProjectResources(project: Project): Promise<{ proposal
       const base = path.posix.basename(relative).toLowerCase();
       if (!likelySecret(base)) continue;
       claimed.add(relative);
+      // A .env holds many variables: they stay lines of this repository's file.
+      const dotenv = dotenvFile(base);
       proposals.push({ id: proposalId(source, relative), repository: source, path: relative, kind: 'secret',
-        reason: 'Ignored filename commonly contains credentials; contents were not read.',
-        suggested: { driver: 'secret@1', target: { kind: 'environment', name: variableName(base) },
-          access: 'read', isolation: 'fork', publish: 'discard' } });
+        reason: dotenv ? 'Ignored .env file; its variables belong in this repository\'s copy of it. Contents were not read.'
+          : 'Ignored filename commonly contains credentials; contents were not read.',
+        suggested: { driver: 'secret@1', target: dotenv ? { kind: 'path', path: relative, repository: remoteName(source) }
+          : { kind: 'environment', name: variableName(base) }, access: 'read', isolation: 'fork', publish: 'discard' } });
     }
     for (const relative of files) {
-      if (claimed.has(relative) || !/\.(sqlite3?|db)$/i.test(relative)) continue;
+      if (claimed.has(relative) || !sqliteDatabase(relative)) continue;
       claimed.add(relative);
       proposals.push({ id: proposalId(source, relative), repository: source, path: relative, kind: 'sqlite',
         bytes: safeSize(repo, relative), reason: 'Ignored SQLite database; fork it transactionally per task.',
@@ -57,7 +63,7 @@ export async function scanProjectResources(project: Project): Promise<{ proposal
     }
     for (const [top, grouped] of groups) {
       const bytes = grouped.reduce((sum, relative) => sum + safeSize(repo, relative), 0);
-      if (bytes < 50 * 1024 * 1024 && !/^(data|datasets?|models?|uploads?|artifacts?|assets?)$/i.test(top)) continue;
+      if (bytes < DATA_FOLDER_BYTES && !dataFolder(top)) continue;
       proposals.push({ id: proposalId(source, top), repository: source, path: top, kind: 'files', bytes,
         reason: `${grouped.length} ignored file${grouped.length === 1 ? '' : 's'} outside Git.`,
         suggested: { driver: 'volume@1', target: { kind: 'path', path: `resources/${safeSlug(top)}` },
@@ -71,14 +77,6 @@ export async function scanProjectResources(project: Project): Promise<{ proposal
   return { proposals: dedupe(proposals), unavailable };
 }
 
-function likelySecret(name: string): boolean {
-  return /^\.env(?:\.|$)/.test(name) || /(?:secret|credentials?|tokens?)(?:\.|$)/.test(name)
-    || /\.(?:pem|key|p12|pfx)$/i.test(name);
-}
-function variableName(name: string): string {
-  const clean = name.replace(/^\.+/, '').toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^([^A-Z_])/, '_$1');
-  return clean || 'SECRET';
-}
 function safeSlug(value: string): string { return value.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-|-$/g, '') || 'data'; }
 function safeRelative(value: string): boolean { return Boolean(value && !path.posix.isAbsolute(value) && !value.split('/').includes('..')); }
 function safeSize(root: string, relative: string): number {

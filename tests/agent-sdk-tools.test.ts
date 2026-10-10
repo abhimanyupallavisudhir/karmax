@@ -87,7 +87,10 @@ describe('Claude Agent-SDK tool exposure (no drift)', () => {
   it('advertises human escalation as a gateway-backed tool available to every agent', () => {
     const schema = TOOL_SCHEMAS.find((tool) => tool.name === 'escalate_to_human')!;
     expect(schema).toBeDefined();
-    // Without an audience it asks the task's Responder route.
+    // It is for what only a person can give, and names them: the platform
+    // refuses an ask without an audience by listing who can be asked (#533).
+    expect(schema.description).toMatch(/only a person can give/);
+    expect((schema.parameters.properties.audience as { description?: string }).description).toMatch(/^Required\./);
     expect(schema.parameters.required).toEqual(['message']);
     expect(SDK_CONTROL_TOOL_SCHEMAS.map((tool) => tool.name)).not.toContain('escalate_to_human');
     // notify and escalate (redirect a received request) are gateway-backed too.

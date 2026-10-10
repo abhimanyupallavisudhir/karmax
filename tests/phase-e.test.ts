@@ -81,6 +81,38 @@ describe('reconcileTasks (settle lost workflows on restart)', () => {
     } finally { (await store.close()); }
   });
 
+  // Temporal terminates a run at 50 MB of history and nothing in the run can
+  // react (#367). Record one warning per run while there is still time.
+  it('warns once per run when a running workflow history grows large', async () => {
+    const store = (await Store.create(':memory:'));
+    const p = (await store.createProject('P', {}));
+    const big = (await store.createTask({ projectId: p.id, title: 'Big', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'x' } }));
+    const small = (await store.createTask({ projectId: p.id, title: 'Small', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'x' } }));
+    for (const t of [big, small]) (await store.saveView(t.id, { taskId: t.id, title: t.title, workflow: 'just-do', stage: 'do',
+      status: 'active', messages: [], actions: [], state: {}, updatedAt: 0 }));
+    let run = 'run-1';
+    const sizes: Record<string, { historySize: number; historyLength: number }> = {
+      [big.id]: { historySize: 30 * 1024 * 1024, historyLength: 900 },
+      [small.id]: { historySize: 2 * 1024 * 1024, historyLength: 400 },
+    };
+    const client: any = { workflow: { getHandle: (id: string) => ({
+      describe: async () => ({ status: { name: 'RUNNING' }, runId: run, ...sizes[id] }),
+    }) } };
+    const warnings = async (taskId: string) => store.eventsOfType(taskId, 'workflow.history-large');
+    try {
+      (await reconcileTasks(store, client));
+      (await reconcileTasks(store, client));
+      expect((await warnings(big.id)).map((event) => event.payload)).toEqual([
+        expect.objectContaining({ runId: 'run-1', bytes: 30 * 1024 * 1024, events: 900 }),
+      ]);
+      expect(await warnings(small.id)).toEqual([]);
+      // A run that continued as new is a new history, and warns on its own.
+      run = 'run-2';
+      (await reconcileTasks(store, client));
+      expect((await warnings(big.id)).map((event) => event.payload.runId)).toEqual(['run-1', 'run-2']);
+    } finally { (await store.close()); }
+  });
+
   it('marks a non-terminal task whose workflow is gone as failed', async () => {
     const store = (await Store.create(':memory:'));
     const p = (await store.createProject('P', {}));

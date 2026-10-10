@@ -16,6 +16,8 @@ export interface AuthorizationRequest {
   projectId: string;
   target: AuthorizationRequestTarget;
   authorization: AuthorizationSelection;
+  /** Vault credentials to add to the target on approval. */
+  credentialGrants?: Capability[];
   /** Complete requested ceiling, snapshotted for recipient eligibility and the
    * approval check. The selection is still re-evaluated when approved. */
   capabilities: Capability[];

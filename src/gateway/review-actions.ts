@@ -91,6 +91,9 @@ export class ReviewActionRunner {
     command: string;
     server?: boolean;
     openUrls?: string[];
+    /** `command`: one command run with `tavya exec`, not a review action. */
+    kind?: 'review-action' | 'command';
+    cwd?: string;
   }): Promise<RunningAction> {
     const procId = newId('execution');
     const secrets = await this.secretsFor?.(opts.taskId);
@@ -112,7 +115,7 @@ export class ReviewActionRunner {
       const durableOpenUrls = openUrls.map(redactPreviewToken);
       (await this.store.createExecution({ id: procId, organizationId: project.organizationId, projectId: project.id,
         taskId: opts.taskId, worldId: opts.world.id, generation: opts.world.generation ?? 1,
-        kind: 'review-action', label: opts.label, command: opts.command, server: !!opts.server,
+        kind: opts.kind ?? 'review-action', label: opts.label, command: opts.command, server: !!opts.server,
         openUrls: durableOpenUrls, runnerLeaseId }));
     } catch (error) {
       if (runnerLeaseId && this.access) await this.access.releaseLeaseAndParkIfIdle(opts.world, runnerLeaseId);
@@ -134,7 +137,7 @@ export class ReviewActionRunner {
           notice += `Stopped an earlier process on port ${stopped.port}: ${stopped.command || `pid ${stopped.pid}`}\n`;
         if (notice) (await this.store.appendExecutionFrame(procId, (await scrub(notice)), 'system'));
       }
-      process = await world.startProcess({ command: opts.command });
+      process = await world.startProcess({ command: opts.command, ...(opts.cwd ? { cwd: opts.cwd } : {}) });
     } catch (error) {
       (await this.store.appendExecutionFrame(procId, (await scrub(`${error instanceof Error ? error.message : String(error)}\n`)), 'system'));
       (await this.store.finishExecution(procId, null, 'failed'));

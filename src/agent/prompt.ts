@@ -1,3 +1,4 @@
+import { describeMachine, sameMachine, type MachineShape } from '../domain/computer.js';
 import { AgentProfile, AgentRole, TaskInput } from '../domain/types.js';
 import { WorldHandle, worldRepos, worldWorkingDirectory } from '../world/types.js';
 import { agentRoleDef, manifest } from '../contrib/manifests.js';
@@ -44,7 +45,7 @@ const TOOLS_PREAMBLE = `You are running inside ${BRAND}, an agent-orchestration 
 - Prefer native MCP: use servers selected in the agent’s Tools, or request a remote MCP server by its MCP Registry name or official HTTPS URL. Use a Composio toolkit only as the fallback when no suitable remote MCP server exists.
 - list_connections(), request_connection({mcp | toolkit}, why), search_connection_tools(connectionId, search), execute_connection_tool(connectionId, tool, arguments): use connected apps through the gateway. Prefer managed sign-in to asking for passwords or API keys. The user allows an account they already connected or signs in from a Connect button in the task, which then resumes automatically.
 - start_job(command, cwd?, name?): run a long command (render, build, training run, large test suite) as a durable job that outlives this turn and any interruption; its output goes to a log file, and its name is what people see while you wait on it. Anything you run from your own shell stops when your turn ends.
-- pause(minutes, jobs?, needs_input?): end this turn and be resumed when the listed jobs finish, when a message arrives, or after \`minutes\` — whichever comes first. Without jobs it is a timed pause. pause is for waiting, not for asking: when you need an answer to continue, use escalate_to_human or end your turn with the question. Only when you are waiting anyway and someone may answer meanwhile, set needs_input (optionally with message, audience and urgency, as for escalate_to_human): the task shows Needs input and notifies them, and you carry on without the answer once \`minutes\` pass.
+- pause(minutes, jobs?, needs_input?): end this turn and be resumed when the listed jobs finish, when a message arrives, or after \`minutes\` — whichever comes first. Without jobs it is a timed pause. pause is for waiting, not for asking: when you need an answer to continue, end your turn with the question (or call escalate_to_human for what only a person can give). Only when you are waiting anyway and someone may answer meanwhile, set needs_input (optionally with message, audience and urgency, as for escalate_to_human): the task shows Needs input and notifies them, and you carry on without the answer once \`minutes\` pass.
 - stop_job(jobs): stop durable jobs you no longer need.
 - request_agent_action(taskId, "publish_branch", message?): ask a collaborator to publish in the background. It returns a durable request id immediately; continue other useful work and never poll. ${BRAND} injects completion or failure into this conversation and keeps the task in Do while a request remains outstanding.
 - cancel_agent_action(requestId): withdraw one of your pending collaboration requests when its target is blocked or its result is no longer needed. This releases your Do-stage wait without cancelling the target task.
@@ -56,11 +57,11 @@ const TOOLS_PREAMBLE = `You are running inside ${BRAND}, an agent-orchestration 
 - open_pr(): Do agents only. Open or refresh the task's pull request and send that exact committed proposal to Review. Call it only when the requested work is truly complete, the worktree is clean, intended changes are committed, and relevant tests pass. This is the final action of a completed Do turn.
 - confirm_decision(action, text?): use only when the workflow explicitly asks this turn to review or verify an already-open exact candidate. A final Do-agent integration verification uses this tool instead of open_pr and must not edit the proposal in that verification turn.
 - my_authorization(method?, path?): what your authorization covers, and whether one platform_request would be allowed without making it. Check it before attempting something you may lack or asking a person to do something for you: do what it covers yourself, and ask for what it lacks with request_permission(capabilities, projectIds?, reason).
-- notify(to, message, urgency?): tell or call people and this task's agents without ending your turn. People are notified now; agents (agent:do, agent:responder, agent:confirm, agent:agent-<n>) are called when your turn ends. Messages from other people and agents in this task reach you labelled with who said them.
+- notify(to, message, urgency?): tell or call people and this task's agents without ending your turn. People are notified now; agents (agent:do, agent:responder, agent:confirm, agent:agent-<n>) are called when your turn ends; its agents argument calls new ones in (e.g. a fork of another task's agent). Messages from other people and agents in this task reach you labelled with who said them. Your final response notifies nobody unless your task then waits on someone (a question, Review); to tell a person something while you work, wait for sub-tasks or pause, use notify.
 - escalate(to, note, task_id?): pass a request you received but cannot answer (as Responder, or from a sub-task) to people who can.
-- escalate_to_human(audience, message, urgency?): pause for input without opening a PR. Choose a specific user/team/Avatar when appropriate; discover valid routes with platform_request(GET, "/api/agent/escalation-targets"). A normal turn ending also waits for input from the default audience.
+- escalate_to_human(audience, message, urgency?): ask named people, teams or Avatars for what only a person can give (an approval, a secret, an action in the real world, a personal decision), pausing without opening a PR; discover who you can ask with platform_request(GET, "/api/agent/escalation-targets"). For anything an agent could answer, end your turn with the question instead: it goes to your task's usual input route (a sub-task's parent, else its Responder).
 - signal_completion(summary?): optional structured completion summary. Provider-reported successful turn completion is authoritative; this tool is not required.
-Do real work directly in the working directory (create/edit files, run commands), verify it, and report the result in your final response. If you are the Do agent and the work is ready for review, call open_pr as your final action. If you need a human decision first, use escalate_to_human instead; waiting for input and opening a PR are separate decisions.`;
+Do real work directly in the working directory (create/edit files, run commands), verify it, and report the result in your final response. If you are the Do agent and the work is ready for review, call open_pr as your final action. If you need input first, end your turn with the question (or call escalate_to_human for what only a person can give) instead; waiting for input and opening a PR are separate decisions.`;
 
 // Minimal fallback if a role is undeclared and there's no `do` role registered.
 const FALLBACK_TEMPLATE = `{{toolsPreamble}}
@@ -83,6 +84,8 @@ export interface AssembleArgs {
   world: WorldHandle;
   globalInstructions?: string;
   projectInstructions?: string;
+  /** The machine the task's Computer asks for now (its world may still run on another). */
+  computer?: MachineShape;
   /** Extra bindings for non-do roles (error, stage, transcript, reviewInfo, skills). */
   bindings?: Record<string, string>;
 }
@@ -100,7 +103,7 @@ export function assemblePrompt(args: AssembleArgs): string {
   if (args.role === 'do' && args.task.responder?.kind === 'agent') {
     preamble += `
 
-Input routing for this task: its ordinary Waiting-for-input Responder is an agent. When you need a decision or information that this Responder can supply, do not call escalate_to_human. End the turn without open_pr and make your final response the concrete question; ${BRAND} will send it to the Responder and return the answer to this same Do conversation. Use escalate_to_human only when the requested input is inherently human-only (for example an approval, secret, or irreversible personal decision).`;
+Input routing for this task: its ordinary Waiting-for-input Responder is an agent. When you need a decision or information that this Responder can supply, do not call escalate_to_human. End the turn without open_pr and make your final response the concrete question; ${BRAND} will send it to the Responder and return the answer to this same Do conversation. Use escalate_to_human only for what only a person can give (an approval, a secret, an action in the real world, a personal decision).`;
   }
   const target = args.task.target ?? args.world.target ?? args.world.base;
   if (args.role === 'do' && (target !== args.world.base || args.task.agents?.do?.resumeFrom)) {
@@ -113,7 +116,7 @@ Git ancestry for recovered, forked, or retargeted work: "recorded base" is the i
     title: args.task.title,
     prompt: args.task.prompt,
     worldPath: worldWorkingDirectory(args.world),
-    worldRepos: [describeRepos(args.world), describeEnvironment(args.world)].filter(Boolean).join('\n'),
+    worldRepos: [describeRepos(args.world), describeEnvironment(args.world), describeComputer(args.world, args.task.taskId, args.computer)].filter(Boolean).join('\n'),
     branch: args.world.branch,
     base: args.world.base,
     target,
@@ -150,6 +153,20 @@ function describeEnvironment(world: WorldHandle): string {
     + 'When something is missing (a dependency, browser or CLI), first check whether a command above covers it and you skipped or '
     + 'shortened it; if so, run it. Only a step that every task needs and these commands lack belongs in your final response, '
     + 'as the exact command to add to Project Settings → Environment.';
+}
+
+/** A cloud world's machine, and how the agent can get a bigger one itself. */
+function describeComputer(world: WorldHandle, taskId: string, requested?: MachineShape): string {
+  const shape = world.meta?.computer as MachineShape | undefined;
+  if (!shape) return '';
+  // A world moves to a new size only once it parks; a pause on jobs keeps it awake.
+  const move = 'end your turn with pause(3) without jobs. A pause that waits on jobs keeps this machine, so first let them finish or stop them (stop_job). '
+    + 'You resume on the new machine with every tracked file and uncommitted change, but Git-ignored files (dependencies, build output) '
+    + 'and running processes do not carry over.';
+  if (requested && !sameMachine(shape, requested))
+    return `Computer: ${describeMachine(shape)}. This task's computer is now ${describeMachine(requested)}: you move to it when the task parks, so ${move}`;
+  return `Computer: ${describeMachine(shape)}. If it is too small (out of disk or memory), resize it yourself with `
+    + `platform_request(PATCH, "/api/tasks/${taskId}/params", {"params": {"computer": {"diskGb": 50}}}) (or cpu, memoryMb) and then ${move}`;
 }
 
 /**

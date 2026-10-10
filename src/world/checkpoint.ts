@@ -1,3 +1,4 @@
+import { machineShape } from '../domain/computer.js';
 import * as __asyncCollections from '../util/async-collections.js';
 import crypto from 'node:crypto';
 import zlib from 'node:zlib';
@@ -236,6 +237,12 @@ export class WorldCheckpointService {
     }
   }
 
+  /** Tell the agent something about its world on its next turn, once. */
+  async addNotice(taskId: string, notice: string): Promise<void> {
+    const existing = await this.store.kvGet(noticeKey(taskId));
+    await this.store.kvSet(noticeKey(taskId), existing ? `${existing}\n\n${notice}` : notice);
+  }
+
   /** What the agent should know about its last checkpoint, once. */
   async takeNotice(taskId: string): Promise<string | undefined> {
     const notice = await this.store.kvGet(noticeKey(taskId));
@@ -250,7 +257,9 @@ export class WorldCheckpointService {
     return this.worlds.withOperation(checkpoint.worldId, async () => {
     const project = (await this.store.getProject(checkpoint.projectId));
     if (!project?.organizationId) throw new Error('checkpoint project no longer exists');
-    const executionConfig = (await this.store.effectiveProjectConfig(project));
+    // The task's Computer as it is now: a resize requested while the world was
+    // away (or the reason it went away) applies to the restored machine.
+    const executionConfig = (await this.store.effectiveTaskConfig(project, checkpoint.worldId));
     // Read (and verify) the manifest before provisioning a billable sandbox.
     const delta = await this.deltaFiles(checkpoint, project.organizationId);
     // A checkpoint must be restorable after its sandbox disappears even when a
@@ -273,7 +282,7 @@ export class WorldCheckpointService {
       ?? organizationRepositories.find((candidate) => sameRepository(candidate.sshUrl, sources[index]!))));
     const selected = provider ?? executionConfig.worldProvider ?? 'worktree';
     const environment = (await selectProjectEnvironment(this.store, checkpoint.projectId, selected,
-      executionConfig.environment, checkpoint.environment));
+      executionConfig.environment, checkpoint.environment, executionConfig.resources));
     const primary = checkpoint.repos[0];
     // An idle checkpoint may never have published its task refs, which a fresh
     // remote clone cannot fetch: provision it from base, then check out each
@@ -312,6 +321,10 @@ export class WorldCheckpointService {
     // `queued` lease row that nothing ever releases, permanently eating capacity.
     const remote = this.worlds.get(selected).capabilities?.remote === true;
     const hooks = options ?? ambientActivityHooks();
+    // After the generation it replaces, which may be newer than the checkpoint
+    // (task #552: a resize restored generation 1's checkpoint as generation 2,
+    // which vanished uncheckpointed; restoring it again as "2" was refused).
+    const generation = Math.max(checkpoint.generation, previousHandle?.generation ?? 0) + 1;
     const previousLeaseId = previousHandle?.meta?.worldLeaseId;
     if (remote && typeof previousLeaseId === 'string') {
       const previousLease = await this.store.worldLease(previousLeaseId);
@@ -321,6 +334,7 @@ export class WorldCheckpointService {
     const acquired = remote
       ? await this.runners.acquire({ project, taskId: checkpoint.worldId, worldId: checkpoint.worldId,
         provider: selected, priority: Number((await this.store.getTask(checkpoint.worldId))?.params.priority ?? 0),
+        resources: executionConfig.resources,
         signal: hooks.signal, heartbeat: hooks.heartbeat })
       : undefined;
     let world: World;
@@ -329,7 +343,7 @@ export class WorldCheckpointService {
       // identity selects the organization-owned credential, while generation
       // keeps the provider's idempotency lookup away from the vanished sandbox.
       world = await this.worlds.create(selected, { taskId: checkpoint.worldId,
-        generation: checkpoint.generation + 1, organizationId: project.organizationId,
+        generation, organizationId: project.organizationId,
         repos: sources as string[],
         ...(checkpoint.repos.some(repo => repo.checkoutPath !== '.') ? { layout: 'nested' } : {}),
         copySources: checkpoint.repos.map((repo, index) => repo.localPath ?? previousFor(repo, index)?.localPath),
@@ -370,7 +384,7 @@ export class WorldCheckpointService {
       if (this.resources) {
         const revisions = Object.fromEntries((checkpoint.resources ?? []).map((resource) => [resource.attachmentId, resource.revisionId]));
         world.handle = await this.resources.materialize(checkpoint.projectId, checkpoint.worldId, world,
-          checkpoint.generation + 1, revisions);
+          generation, revisions);
       }
       const writes: Array<[string, RestoredFile]> = [];
       for await (const file of delta) {
@@ -392,6 +406,7 @@ export class WorldCheckpointService {
       // Stamped exactly as createWorld does, so `destroyWorld` finds the lease to
       // release and the world's cost is attributed to the right pool.
       if (acquired) world.handle.meta = { ...world.handle.meta, worldLeaseId: acquired.leaseId };
+      if (remote) world.handle.meta = { ...world.handle.meta, computer: machineShape(executionConfig) };
       const registered = (await this.store.registerWorld({ ...world.handle, checkpointId }, checkpoint.projectId,
         { runnerPoolId: acquired?.runnerPoolId ?? checkpoint.runnerPoolId,
           environmentDigest: environment.digest ?? checkpoint.environmentDigest })) as WorldHandle;

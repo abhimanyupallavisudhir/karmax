@@ -93,7 +93,7 @@ install, where the operator's ambient login is the whole point.
 
 ### Diagnosing credential incidents
 
-Settings → Codex/Claude (Availability & quota) distinguishes a timed quota
+Settings → Agents (Availability & quota) distinguishes a timed quota
 exhaustion from a credential that needs attention. For the latest automatic quarantine it retains only a
 secret-safe provider diagnostic (kind, native code, HTTP status, request id,
 model, operation, retry disposition/count, and bounded message), plus the

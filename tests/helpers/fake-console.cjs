@@ -48,7 +48,7 @@ async function fakeConsole(context, { origin = 'http://console.test', project, t
     if (p.endsWith('/defaults')) return { effective: {}, inherited: {} };
     if (p === `/api/projects/${project.id}/tasks`) return tasks;
     if (p === `/api/projects/${project.id}/search`) return { tasks, total: tasks.length };
-    if (p === '/api/search') return [{ projectId: project.id, tasks, total: tasks.length }];
+    if (p === '/api/search') return { tasks, total: tasks.length, offset: 0, limit: 200, tags: [], projects: [{ id: project.id, name: project.name, organizationId: project.organizationId }] };
     if (byId(p)) return taskView(byId(p));
     if (p.endsWith('/sessions')) return {};
     const attempts = tasks.find((task) => p === `/api/tasks/${task.id}/attempts`);
@@ -59,8 +59,11 @@ async function fakeConsole(context, { origin = 'http://console.test', project, t
   await context.route(`${origin}/**`, async (route) => {
     const request = route.request(), url = new URL(request.url()), p = url.pathname;
     if (!p.startsWith('/api/')) {
-      const file = ASSETS.has(p) ? p.slice(1) : 'index.html';
-      return route.fulfill({ contentType: file.endsWith('.js') ? 'text/javascript' : file.endsWith('.css') ? 'text/css' : 'text/html',
+      // The public docs fetch their pages as Markdown files beside the console.
+      const doc = /^\/docs\/[a-z-]+\.md$/.test(p) && fs.existsSync(path.join(WEB, p)) ? p.slice(1) : null;
+      const file = doc || (ASSETS.has(p) ? p.slice(1) : 'index.html');
+      if (/^\/docs\/.*\.md$/.test(p) && !doc) return route.fulfill({ status: 404, body: 'not found' });
+      return route.fulfill({ contentType: file.endsWith('.js') ? 'text/javascript' : file.endsWith('.css') ? 'text/css' : file.endsWith('.md') ? 'text/markdown' : 'text/html',
         body: fs.readFileSync(path.join(WEB, file), 'utf8') });
     }
     requests.push(`${request.method()} ${p}`);

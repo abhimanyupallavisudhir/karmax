@@ -50,13 +50,14 @@ global.S = {
     { seq: 3, ts: 1710000003000, type: 'agent.activity', payload: { role: 'do', turnId: 'turn-1', id: 'cmd', kind: 'command', phase: 'completed', title: 'npm test', detail: '12 passed' } },
     { seq: 4, ts: 1710000004000, type: 'agent.activity', payload: { role: 'do', turnId: 'turn-1', attempt: 1, id: 'reply', kind: 'message', phase: 'completed', title: 'All done' } },
   ],
+  meta: { explanationsEnabled: true },
   explanationSettings: { model: 'google/gemini-3.6-flash' },
   explanationPending: {},
   explanationErrors: {},
 };
 
 global.DEFAULT_EXPLANATION_SETTINGS = { model: 'google/gemini-3.6-flash' };
-for (const fn of ['safeHref', 'attachmentUrl', 'formatAttachmentBytes', 'renderMessageFiles', 'conversationTextKey', 'conversationEntries', 'conversationTime', 'conversationTimeHtml', 'worldFileTarget', 'fileTargetQuery', 'worldFileHref', 'worldWikiHref', 'worldFileAnchor', 'wikiRoute', 'decodeMarkdownAttribute', 'renderConversationText', 'annotateWorldFileLinks', 'renderAgentMessageBody', 'renderWaitDetail', 'explanationModelLabel', 'texToggleHtml', 'explainMessageAffordance', 'sharedConversation', 'participantLabelOf', 'messageSpeaker', 'recipientLabel', 'recipientsHtml', 'renderConversationEntry']) eval(extractFn(fn));
+for (const fn of ['safeHref', 'attachmentUrl', 'formatAttachmentBytes', 'renderMessageFiles', 'conversationTextKey', 'conversationEntries', 'conversationTime', 'conversationTimeHtml', 'worldFileTarget', 'fileTargetQuery', 'worldFileHref', 'worldWikiHref', 'worldFileAnchor', 'wikiRoute', 'decodeMarkdownAttribute', 'renderConversationText', 'annotateWorldFileLinks', 'renderAgentMessageBody', 'renderWaitDetail', 'explanationModelLabel', 'explanationsEnabled', 'texToggleHtml', 'explainMessageAffordance', 'sharedConversation', 'participantLabelOf', 'messageSpeaker', 'recipientLabel', 'recipientsHtml', 'renderConversationEntry']) eval(extractFn(fn));
 
 let pass = 0;
 let fail = 0;
@@ -83,6 +84,11 @@ ok(html.includes('<time'), 'timestamps are rendered');
 ok((html.match(/All done/g) || []).length === 1, 'assistant final text is shown exactly once');
 ok(!html.includes('need not text-match'), 'the linked workflow transcript copy is suppressed by provider identity');
 ok(html.includes('Explain this with gemini-3.6-flash'), 'agent messages offer the effective explanation model');
+S.meta.explanationsEnabled = false;
+const unexplained = explainMessageAffordance({ sourceKey: 'activity:4', conversationRole: 'do' }, S.view);
+ok(!unexplained.includes('explain-run') && !unexplained.includes('explain-more') && unexplained.includes('tex-toggle'),
+  'with explanations off, messages keep the TeX toggle but offer no Explain button');
+S.meta.explanationsEnabled = true;
 const eventOrder = S.taskEvents;
 S.taskEvents = [...eventOrder].reverse();
 const shuffled = conversationEntries(transcript);
@@ -236,6 +242,7 @@ eval(extractFn('conversationPane'));
 eval(extractFn('liveOutputFor'));
 eval(extractFn('forkBranchDefaults'));
 eval(extractFn('wireCheckinSidebar'));
+eval(extractFn('wireStopAgents'));
 global.conversationApprovalRequests = () => '<div>Pending approvals</div>';
 global.liveRoleFor = () => 'do';
 global.localWorldPath = () => false;

@@ -39,6 +39,7 @@ for (const scope of ['organization', 'project']) {
         return scope === 'organization' ? { enabled: false } : { organization: false, project: 'inherit', effective: false };
       },
       loadAvatars: async () => {}, renderMain: () => { renders++; }, toast: () => {},
+      policyTip: (text) => `<button class="info-dot" title="${text}">ⓘ</button>`,
       paneError: (_, error) => { throw error; },
     });
     vm.runInContext(hydrateSource, context);

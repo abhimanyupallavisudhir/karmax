@@ -1,3 +1,4 @@
+import { applyComputer, normalizeComputer, type ComputerSpec } from '../domain/computer.js';
 import { AdmissionBackpressureError } from '../domain/admission-error.js';
 import { utf8Tail } from '../util/utf8-tail.js';
 import * as __asyncCollections from '../util/async-collections.js';
@@ -10,6 +11,7 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { isIP } from 'node:net';
 import { sameRepository } from '../world/repository-identity.js';
+import { pinTarget, workingFolder, worldCheckoutNames } from '../domain/world-location.js';
 import { isPostgresTarget, openSqlDatabase, type SqlDatabase } from './sql.js';
 import { watchAuthorityWrites } from './authorization-epoch.js';
 import { setImmediate as yieldTurn } from 'node:timers/promises';
@@ -462,6 +464,9 @@ export class Store {
       CREATE TABLE IF NOT EXISTS organizations (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
         kind TEXT NOT NULL, plan TEXT NOT NULL DEFAULT 'free', createdAt INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS organization_aliases (
+        slug TEXT PRIMARY KEY, organizationId TEXT NOT NULL, createdAt INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS organization_memberships (
         organizationId TEXT NOT NULL, userId TEXT NOT NULL, role TEXT NOT NULL,
@@ -1402,9 +1407,9 @@ export class Store {
   /** One organization-level execution policy. Provider-specific template/image
    * details stay with the provider connection; this is the provider-neutral
    * policy every project inherits. */
-  async getOrganizationExecutionPolicy(organizationId: string): Promise<OrganizationExecutionPolicy> {
-    if (!(await this.getOrganization(organizationId))) throw new Error(`no organization ${organizationId}`);
-    const fallback: OrganizationExecutionPolicy = {
+  /** The execution policy an organization has before it changes anything. */
+  defaultOrganizationExecutionPolicy(): OrganizationExecutionPolicy {
+    return {
       worldProvider: process.env.KARMAX_DEPLOYMENT === 'hosted'
         ? process.env.KARMAX_CLOUD_WORLD_PROVIDER ?? 'e2b'
         : 'worktree',
@@ -1415,6 +1420,11 @@ export class Store {
       environment: { flavor: 'headless' },
       hibernateAfterMs: 7 * 24 * 60 * 60 * 1000,
     };
+  }
+
+  async getOrganizationExecutionPolicy(organizationId: string): Promise<OrganizationExecutionPolicy> {
+    if (!(await this.getOrganization(organizationId))) throw new Error(`no organization ${organizationId}`);
+    const fallback = this.defaultOrganizationExecutionPolicy();
     const raw = (await this.kvGet(`organization-execution:${organizationId}`));
     if (!raw) return fallback;
     const saved = JSON.parse(raw) as OrganizationExecutionPolicy;
@@ -1566,6 +1576,18 @@ export class Store {
     return config;
   }
 
+  /** A task's effective execution config: its project's, with the task's own
+   * Computer (`params.computer`) layered on. Every world creation, restore and
+   * lifecycle decision for the task reads this. */
+  async effectiveTaskConfig(project: Project | string, taskId: string): Promise<ProjectConfig> {
+    const config = (await this.effectiveProjectConfig(project));
+    const params = (await this.getTask(taskId))?.params;
+    let computer: ComputerSpec | undefined;
+    // Validated when stored; a value that predates validation is ignored, never fatal.
+    try { computer = normalizeComputer(params?.computer); } catch { computer = undefined; }
+    return applyComputer(config, computer);
+  }
+
   async setProjectExecutionPolicy(id: string, override: Partial<Record<keyof OrganizationExecutionPolicy, unknown>>): Promise<Project> {
     return this.db.transaction(async () => {
 
@@ -1602,6 +1624,15 @@ export class Store {
     if (process.env.KARMAX_DEPLOYMENT === 'hosted' && ['worktree', 'container', 'memory'].includes(merged.worldProvider ?? 'e2b'))
       throw new Error('hosted projects require a remote world provider');
     (await this.db.prepare('UPDATE projects SET config = ? WHERE id = ?').run(JSON.stringify(merged), id));
+    // An unpinned resource or secret location is relative to the working folder,
+    // which moves when the project gains a second repository or keeps only one:
+    // pin each to the checkout it lies in now, so it stays where it is.
+    const before = worldCheckoutNames(existing.config.repos ?? []);
+    if (workingFolder(before) !== workingFolder(worldCheckoutNames(merged.repos ?? [])))
+      for (const attachment of (await this.listResourceAttachments(id, true))) {
+        const target = pinTarget(attachment.target, before);
+        if (target !== attachment.target) (await this.updateResourceAttachment(attachment.id, { target }));
+      }
     return { ...existing, config: merged };
   
     });
@@ -1843,7 +1874,9 @@ export class Store {
     assertRoutableName('organization', input.name, input.slug);
     const name = (await this.assertOrganizationNameAvailable(input.name,
       input.kind === 'personal' ? { allowUserId: input.ownerUserId } : undefined));
-    const slug = (await uniqueSlug(input.slug ?? input.name, async (candidate) => !!(await this.db.prepare('SELECT 1 FROM organizations WHERE slug = ?').get(candidate))));
+    const slug = (await uniqueSlug(input.slug ?? input.name, async (candidate) =>
+      !!(await this.db.prepare('SELECT 1 FROM organizations WHERE slug = ?').get(candidate))
+      || !!(await this.db.prepare('SELECT 1 FROM organization_aliases WHERE slug = ?').get(candidate))));
     const organization: Organization = {
       id: newId('org'), name, slug,
       kind: input.kind ?? 'team', plan: 'free', nameVisibility: 'members', createdAt: Date.now(),
@@ -1953,9 +1986,33 @@ export class Store {
       : undefined;
     const nextName = (await this.assertOrganizationNameAvailable(name,
       { excludeOrganizationId: id, allowUserId: personalOwner }));
-    (await this.db.prepare('UPDATE organizations SET name = ? WHERE id = ?').run(nextName, id));
-    return { ...existing, name: nextName };
+    assertRoutableName('organization', nextName);
+    // The URL follows the name. Every slug the organization has had stays its
+    // own and keeps leading to it, so a bookmark or a link in an old email
+    // still opens it, and no other organization can take over that address.
+    const slug = slugify(nextName) === existing.slug ? existing.slug : (await uniqueSlug(nextName, async (candidate) =>
+      !!(await this.db.prepare('SELECT 1 FROM organizations WHERE slug=? AND id<>?').get(candidate, id))
+      || !!(await this.db.prepare('SELECT 1 FROM organization_aliases WHERE slug=? AND organizationId<>?').get(candidate, id))));
+    if (slug !== existing.slug) {
+      (await this.db.prepare('INSERT OR IGNORE INTO organization_aliases (slug, organizationId, createdAt) VALUES (?, ?, ?)')
+        .run(existing.slug, id, Date.now()));
+      (await this.db.prepare('DELETE FROM organization_aliases WHERE slug=?').run(slug));
+    }
+    (await this.db.prepare('UPDATE organizations SET name = ?, slug = ? WHERE id = ?').run(nextName, slug, id));
+    return { ...existing, name: nextName, slug };
   
+    });
+  }
+
+  /** The slugs these organizations had before a rename, newest first, for the
+   * console to resolve an old URL to the organization it now names. */
+  async withPreviousSlugs(organizations: Organization[]): Promise<Organization[]> {
+    if (!organizations.length) return organizations;
+    const rows = (await rowsFor(this.db, 'organization_aliases', 'organizationId', organizations.map((o) => o.id)));
+    rows.sort((a, b) => Number(b.createdAt) - Number(a.createdAt));
+    return organizations.map((organization) => {
+      const previousSlugs = rows.filter((row) => row.organizationId === organization.id).map((row) => String(row.slug));
+      return previousSlugs.length ? { ...organization, previousSlugs } : organization;
     });
   }
 
@@ -2052,6 +2109,7 @@ export class Store {
       teams: (await selectRows(this.db, 'teams', 'organizationId=?', [organizationId])),
       team_memberships: (await rowsFor(this.db, 'team_memberships', 'teamId', teamIds)),
       team_aliases: (await rowsFor(this.db, 'team_aliases', 'teamId', teamIds)),
+      organization_aliases: (await selectRows(this.db, 'organization_aliases', 'organizationId=?', [organizationId])),
       projects: (await rowsFor(this.db, 'projects', 'id', projectIds)),
       avatars: (await rowsFor(this.db, 'avatars', 'projectId', projectIds)),
       resource_attachments: (await rowsFor(this.db, 'resource_attachments', 'projectId', projectIds))
@@ -2346,6 +2404,7 @@ export class Store {
       (await deleteRows(this.db, 'execution_frames', 'executionId', executionIds));
       (await deleteRows(this.db, 'team_memberships', 'teamId', teamIds));
       (await deleteRows(this.db, 'team_aliases', 'teamId', teamIds));
+      (await this.db.prepare('DELETE FROM organization_aliases WHERE organizationId=?').run(organizationId));
       (await deleteRows(this.db, 'repository_deploy_keys', 'repositoryId', repositoryIds));
       (await deleteRows(this.db, 'task_subscribers', 'taskId', taskIds));
       (await deleteRows(this.db, 'task_confirmation', 'taskId', taskIds));
@@ -6312,6 +6371,14 @@ export class Store {
     });
   }
 
+  /** A sub-task's pending output, handed to its parent: the parent's world
+   * holds it from now on, and the parent's Review adopts or excludes it. */
+  async reassignResourceCandidate(id: string, from: string, to: { taskId: string; worldId: string; worldGeneration: number }): Promise<void> {
+    const result = (await this.db.prepare(`UPDATE resource_candidates SET taskId=?, worldId=?, worldGeneration=?
+      WHERE id=? AND taskId=? AND state='pending'`).run(to.taskId, to.worldId, to.worldGeneration, id, from));
+    if (!Number(result.changes)) throw new Error('resource candidate is no longer pending for this task');
+  }
+
   async adoptResourceCandidate(id: string, taskId: string, resolvedBy: string): Promise<{ candidate: ResourceCandidate; attachment: ResourceAttachment }> {
     return this.db.transaction(async () => {
 
@@ -6850,6 +6917,13 @@ export class Store {
     for (const entry of (await this.kvEntries('resource-checkpoint:'))) {
       try { const revisionId = JSON.parse(entry.value)?.revisionId; if (revisionId) ids.add(String(revisionId)); } catch {}
     }
+    // A sub-task's output waiting for its parent's world, and the version it is relative to.
+    for (const entry of (await this.kvEntries('resource-delivery:'))) {
+      try {
+        const delivery = JSON.parse(entry.value);
+        for (const id of [delivery?.revisionId, delivery?.baseRevisionId]) if (id) ids.add(String(id));
+      } catch {}
+    }
     return ids;
   }
 
@@ -6885,7 +6959,8 @@ export class Store {
   private async resourceRevisionReferencedBesidesCurrent(id: string): Promise<boolean> {
     if ((await this.db.prepare("SELECT 1 FROM resource_leases WHERE state<>'released' AND revisionId=?").get(id))) return true;
     if ((await this.db.prepare('SELECT 1 FROM world_checkpoints WHERE manifest LIKE ?').get(`%"revisionId":"${id}"%`))) return true;
-    return (await this.kvEntries('resource-checkpoint:')).some((entry) => entry.value.includes(`"revisionId":"${id}"`));
+    if ((await this.kvEntries('resource-checkpoint:')).some((entry) => entry.value.includes(`"revisionId":"${id}"`))) return true;
+    return (await this.kvEntries('resource-delivery:')).some((entry) => entry.value.includes(`"${id}"`));
   }
 
   /** Everything an organization keeps in storage, for the storage page and the
@@ -7284,15 +7359,23 @@ export class Store {
       ORDER BY createdAt`).all()) as any[];
   }
 
-  async recordedUsageEventIds(ids: string[]): Promise<Set<string>> {
-    const recorded = new Set<string>();
+  /** Which of these usage ids are recorded, and whom each is booked to. */
+  async recordedUsageEvents(ids: string[]): Promise<Map<string, { organizationId: string; taskId?: string }>> {
+    const recorded = new Map<string, { organizationId: string; taskId?: string }>();
     for (let offset = 0; offset < ids.length; offset += 500) {
       const batch = ids.slice(offset, offset + 500);
-      const rows = (await this.db.prepare(`SELECT id FROM usage_events WHERE id IN (${batch.map(() => '?').join(',')})`)
-        .all(...batch)) as Array<{ id: string }>;
-      for (const row of rows) recorded.add(row.id);
+      const rows = (await this.db.prepare(`SELECT id, organizationId, taskId FROM usage_events WHERE id IN (${batch.map(() => '?').join(',')})`)
+        .all(...batch)) as Array<{ id: string; organizationId: string; taskId: string | null }>;
+      for (const row of rows) recorded.set(row.id, { organizationId: row.organizationId, ...(row.taskId ? { taskId: row.taskId } : {}) });
     }
     return recorded;
+  }
+
+  /** Move a usage row that no task claimed yet to the organization (and task)
+   * it turned out to belong to. Rows already attributed to a task are final. */
+  async reattributeUsageEvent(id: string, owner: { organizationId: string; projectId?: string; taskId?: string; worldId?: string }): Promise<void> {
+    (await this.db.prepare('UPDATE usage_events SET organizationId=?, projectId=?, taskId=?, worldId=? WHERE id=? AND taskId IS NULL')
+      .run(owner.organizationId, owner.projectId ?? null, owner.taskId ?? null, owner.worldId ?? null, id));
   }
 
   /** Ownership lookups do not need a task's potentially huge transcript. */
@@ -8890,7 +8973,9 @@ async function uniqueSlug(value: string, used: (candidate: string) => boolean | 
 const RESERVED_ROUTE_SLUGS = new Set([
   'mcp-callback',
   // gateway-owned top-level prefixes
-  'api', 'ws',
+  'api', 'ws', 'mcp', 'oauth',
+  // app sign-in approval (web/app.js renderDeviceApproval)
+  'device',
   // top-level routes / legacy org paths (an org slug is the first URL segment)
   'invite', 'projects', 'organization', 'organizations', 'installation',
   // `for:me` is the signed-in person in every search (and /me is kept free)
@@ -8901,12 +8986,17 @@ const RESERVED_ROUTE_SLUGS = new Set([
   'tasks', 'queue', 'activity',
 ]);
 
+/** Top-level public pages (web/app.js boot: renderDocsPage, renderPricing,
+ *  renderLegal*). Only an organization owns the first URL segment, so only an
+ *  organization can be shadowed by them; a project at /<org>/docs is fine. */
+const RESERVED_ORGANIZATION_SLUGS = new Set(['docs', 'pricing', 'legal']);
+
 /** Throw a user-facing error if `name` (or an explicit `slug`) resolves to a
  *  reserved routing word. Applied at the single creation choke points for
  *  projects and organizations. */
 function assertRoutableName(kind: 'project' | 'organization', name: string, slug?: string): void {
   const s = slugify(slug ?? name);
-  if (RESERVED_ROUTE_SLUGS.has(s))
+  if (RESERVED_ROUTE_SLUGS.has(s) || (kind === 'organization' && RESERVED_ORGANIZATION_SLUGS.has(s)))
     throw new Error(`"${s}" is a reserved name and can't be used for a ${kind}. Please choose a different name.`);
 }
 
@@ -8918,6 +9008,7 @@ function validateProjectExecutionConfig(config: ProjectConfig): void {
   };
   positive(raw.resources?.cpu, 'CPU', 1);
   positive(raw.resources?.memoryMb, 'memory', 128);
+  positive(raw.resources?.diskGb, 'disk', 1);
   positive(raw.resources?.gpu, 'GPU', 0);
   positive(raw.monthlyBudgetMicros, 'monthly budget', 0);
   if (raw.environment?.flavor != null && !['headless', 'desktop'].includes(raw.environment.flavor))
@@ -8962,12 +9053,20 @@ function validateResourceAttachment(value: ResourceAttachment): void {
   if (driver.credentialRequired && !value.credentialHandles.length) throw new Error('credential-backed resources require a credential handle');
   if (value.publish === 'review' && (!snapshot || value.access !== 'write' || value.isolation !== 'fork'))
     throw new Error('reviewed promotion requires a writable, forked snapshot resource');
-  if (value.target.kind === 'path') {
-    const normalized = value.target.path.replace(/\\/g, '/');
+  const location = (target: { path: string; repository?: string }, label: string) => {
+    const normalized = target.path.replace(/\\/g, '/');
     if (!normalized || normalized.startsWith('/') || normalized.split('/').includes('..'))
-      throw new Error('resource path target must be world-relative');
-  } else if (value.target.kind === 'environment' || value.target.kind === 'service') {
+      throw new Error(`${label} must be world-relative`);
+    if (target.repository !== undefined && !/^[A-Za-z0-9._-]+$/.test(target.repository) || /^\.+$/.test(target.repository ?? ''))
+      throw new Error(`${label} names an invalid repository`);
+  };
+  if (value.target.kind === 'path') location(value.target, 'resource path target');
+  else if (value.target.kind === 'environment' || value.target.kind === 'service') {
     if (!/^[A-Z_][A-Z0-9_]*$/.test(value.target.name)) throw new Error('resource environment target must be an uppercase variable name');
+    if (value.target.kind === 'environment' && value.target.dotenv) {
+      location(value.target.dotenv, 'resource .env file');
+      if (value.target.dotenv.path.endsWith('/')) throw new Error('resource .env file must name a file');
+    }
   } else throw new Error('unknown resource target');
   if (!Array.isArray(value.credentialHandles) || value.credentialHandles.some((handle) => typeof handle !== 'string' || !handle))
     throw new Error('resource credential handles must be non-empty strings');

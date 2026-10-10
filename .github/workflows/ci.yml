@@ -102,6 +102,8 @@ jobs:
       KARMAX_TEST_PASS_INTEROP: '1'
       KARMAX_TEST_PASS_BROWSER: '1'
       KARMAX_TEST_POSTGRES_URL: postgres://karmax_test:karmax_test@127.0.0.1:5432/karmax_test
+      # Owner of the read-only Docker Hub pull token; empty on fork pull requests.
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -148,16 +150,51 @@ jobs:
           tar -xzf "$archive" -C "$RUNNER_TEMP/gopass-1.16.1" gopass
           GOPASS_BIN="$RUNNER_TEMP/gopass-1.16.1/gopass" npx vitest run tests/git-pass-interop.test.ts
 
+      # Authenticated pulls (node:22, node:22-slim in the Docker suites) avoid
+      # Docker Hub's anonymous rate limit. Fork pull requests get no secrets,
+      # so they skip this, and a failed login (Docker Hub's authenticated path
+      # was down in CI #1713) falls back to pulling anonymously. The postgres
+      # service stays anonymous: a service whose login fails fails the job.
+      - name: Log in to Docker Hub
+        if: env.DOCKERHUB_USERNAME != ''
+        continue-on-error: true
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       # Includes the standalone UI and browser regressions: tests/web-regressions.test.ts
       # runs every web/*.test.cjs.
       - run: npm test -- --shard=${{ matrix.shard }}/${{ strategy.job-total }}
+
+  # Merging a new cli/package.json version publishes @tavya/cli (cli-release.yml),
+  # so a pull request that changes what the CLI ships must bump it.
+  cli-version:
+    name: CLI version bump
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'pull_request'
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: github.event_name == 'pull_request'
+        with: { node-version: '22.16.0' }
+      - if: github.event_name == 'pull_request'
+        run: npm ci --prefix cli --ignore-scripts --no-audit --no-fund
+      - if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: node scripts/check-cli-version.mjs "$BASE"
 
   # Branch protection requires this check. It stands for the jobs above, so it
   # runs even after one of them failed or was cancelled, in order to fail too.
   required:
     name: typecheck + tests
     if: always()
-    needs: [checks, test, deploy-artifacts]
+    needs: [checks, test, deploy-artifacts, cli-version]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -175,6 +212,9 @@ jobs:
     name: deploy artifacts
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    env:
+      # Owner of the read-only Docker Hub pull token; empty on fork pull requests.
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -211,6 +251,17 @@ jobs:
           fi
           echo "artifacts=$artifacts" >> "$GITHUB_OUTPUT"
           echo "deployment artifacts affected: $artifacts"
+
+      # The builds and the stack pull node, caddy, postgres and temporalio
+      # images from Docker Hub; forks skip this, and a failed login falls back
+      # to pulling anonymously.
+      - name: Log in to Docker Hub
+        if: steps.scope.outputs.artifacts == 'true' && env.DOCKERHUB_USERNAME != ''
+        continue-on-error: true
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       # Exactly what an operator runs: Compose builds the app and edge images
       # in parallel, then starts PostgreSQL, Temporal, the app's database role

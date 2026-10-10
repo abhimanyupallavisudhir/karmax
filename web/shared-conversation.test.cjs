@@ -40,8 +40,11 @@ global.S = {
     { seq: 3, ts: 1710000003000, type: 'agent.activity', payload: { role: 'confirm', participant: 'confirm', turnId: 't3', id: 'diff', kind: 'command', phase: 'completed', title: 'git diff' } },
   ],
 };
+global.ICON = { stop: '<svg></svg>' };
+global.waitingText = (w) => ({ account: 'Waiting for credential' }[w.kind] || w.kind);
 for (const fn of ['defaultRecipientFor', 'sharedConversation', 'participantLabelOf', 'messageSpeaker', 'recipientLabel', 'recipientsHtml', 'composeRecipients',
-  'nextAgentKeyFor', 'taskTranscripts', 'conversationTextKey', 'conversationEntries', 'renderConversationEntry']) eval(extractFn(fn));
+  'nextAgentKeyFor', 'locateMentions', 'taskTranscripts', 'conversationTextKey', 'conversationEntries', 'renderConversationEntry',
+  'participantListHtml', 'stoppableAgent', 'stopAgentButton', 'conversationPresence']) eval(extractFn(fn));
 
 const view = {
   taskId: 'task-1',
@@ -85,6 +88,12 @@ assert.deepStrictEqual(composeRecipients('Fix it, @Reviewer check', [{ selector:
 assert.deepStrictEqual(composeRecipients('@Reviewer then @Bea', [{ selector: 'user:user-2', index: 15 }, { selector: 'agent:confirm', index: 0 }]),
   ['agent:confirm', 'user:user-2']);
 assert.deepStrictEqual(composeRecipients('just text', []), ['agent:do']);
+// A picked mention counts where it still stands, whole: a deleted @Agent is not
+// found inside @Agent 1.
+assert.deepStrictEqual(locateMentions('@Agent 1 check', [{ token: '@Agent', selector: 'agent:do' }, { token: '@Agent 1', selector: 'agent:agent-1' }]),
+  [{ token: '@Agent 1', selector: 'agent:agent-1', index: 0 }]);
+assert.deepStrictEqual(locateMentions('@Agent 1 and @Agent', [{ token: '@Agent', selector: 'agent:do' }, { token: '@Agent 1', selector: 'agent:agent-1' }])
+  .map((m) => [m.selector, m.index]), [['agent:agent-1', 0], ['agent:do', 13]]);
 assert.strictEqual(nextAgentKeyFor(['do', 'responder', 'confirm']), 'agent-3');
 assert.strictEqual(participantLabelOf('agent-3', view), 'Agent 3');
 
@@ -99,5 +108,34 @@ assert.strictEqual(defaultRecipientFor(asked), 'agent:agent-3');
 asked.messages.push({ id: 'r', role: 'user', author: 'user:user-1', text: 'EU', ts: 2 });
 assert.strictEqual(defaultRecipientFor(asked), 'agent:do');
 assert.deepStrictEqual(composeRecipients('EU', [], 'agent:agent-3'), ['agent:agent-3']);
+// A helper asking whoever created the task (escalate_to_human's default) or a
+// group asks you too.
+asked.messages.push({ id: 'q2', role: 'agent', author: 'agent-3', to: ['@creator'], text: 'Which zone?', ts: 3 });
+assert.strictEqual(defaultRecipientFor(asked), 'agent:agent-3');
+// The main agent speaking to you after it takes the reply back.
+asked.messages.push({ id: 'm', role: 'agent', text: 'Done; ready for review.', ts: 4 });
+assert.strictEqual(defaultRecipientFor(asked), 'agent:do');
+// A helper's answer to another agent is not for you.
+asked.messages.push({ id: 'h', role: 'agent', author: 'agent-3', to: ['agent:do'], text: 'Looks fine.', ts: 5 });
+assert.strictEqual(defaultRecipientFor(asked), 'agent:do');
+// Nor is a helper asking someone else.
+asked.messages.push({ id: 'b', role: 'agent', author: 'agent-3', to: ['user:user-2'], text: 'Bea, which zone?', ts: 6 });
+assert.strictEqual(defaultRecipientFor(asked), 'agent:do');
+
+// Stop (like Ctrl+C): every agent that is not idle can be stopped from the list;
+// the composer's Stop stops the one working now, else the one stuck waiting.
+const busy = { taskId: 't', participants: [
+  { key: 'do', label: 'Agent', state: 'waiting' },
+  { key: 'agent-1', label: 'Agent 1', state: 'waiting' },
+  { key: 'agent-2', label: 'Agent 2', state: 'queued' },
+  { key: 'confirm', label: 'Reviewer', state: 'idle' }], waitingFor: { kind: 'account' }, messages: [] };
+const list = participantListHtml(busy);
+assert.deepStrictEqual([...list.matchAll(/data-stop-agent="([^"]+)" title="([^"]+)"/g)].map((m) => [m[1], m[2]]),
+  [['do', 'Stop Agent'], ['agent-1', 'Stop Agent 1'], ['agent-2', 'Stop Agent 2']]);
+assert.strictEqual(stoppableAgent(busy).key, 'agent-1', 'the innermost waiting agent');
+assert.deepStrictEqual(conversationPresence(busy, { shared: true, role: 'do' }), { label: 'Agent 1 · Waiting for credential', tone: 'waiting' });
+busy.participants[2].state = 'running';
+assert.strictEqual(stoppableAgent(busy).key, 'agent-2');
+assert.strictEqual(stoppableAgent({ participants: [{ key: 'do', state: 'idle' }, { key: 'agent-1', state: 'queued' }] }), undefined);
 
 console.log('shared-conversation: ok');

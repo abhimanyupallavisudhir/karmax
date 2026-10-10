@@ -63,6 +63,8 @@ export function resticRef(revision: Pick<ResourceRevision, 'sealedRef'>): Restic
 /** A resource's repository in one storage location ({@link repositoryName}). */
 export interface Repository { attachment: ResourceAttachment; storageLocationId?: string; name: string }
 
+export interface ChangeSet { files: Map<string, '+' | 'M' | '-'>; removedDirectories: string[]; addedDirectories: string[] }
+
 export interface ResticProgress { files: number; totalFiles: number; bytes: number; totalBytes: number }
 export interface ResticCapture { snapshot: string; files: number; bytes: number; added: number }
 
@@ -86,6 +88,9 @@ const BIN_DIR = '.karmax-injection/bin';
 const CACHE_DIR = '.karmax-injection/restic-cache';
 const TOKEN_HOURS = 24;
 const POLL_MS = 2_000;
+/** A job in a world is polled from this soon, backing off to POLL_MS: most
+ * saves and restores of a changed few files take well under a second. */
+const FIRST_POLL_MS = 100;
 const CONNECTIONS = 8;
 /** Each upload through the edge waits on two calls to this server, an ocean
  * away from many sandboxes: measured from E2B (Seattle) to R2 EU, 8, 16 and 32
@@ -96,6 +101,10 @@ const RESTORE_CONNECTIONS = 16;
 /** A save that finds files changed under it saves again, this many times. */
 const SETTLE_ROUNDS = 3;
 const VERIFY_MAX_BYTES = 256 * 1024 * 1024;
+/** restic tests every node of a snapshot against every restore pattern, so a
+ * merge's pattern count multiplies the resource's size. Past this many, a merge
+ * restores everything but this world's own changes when they are fewer. */
+const MERGE_PATTERNS = 1_000;
 /** A creator that has not finished by then has died. */
 const INIT_STALE_MS = 2 * 60_000;
 const HOST_CORES = Math.max(1, Math.min(2, Math.floor(os.cpus().length / 2)));
@@ -154,10 +163,13 @@ export class ResticResources {
     throw new Error(`${path.posix.basename(place.path)} kept changing while it was being saved; stop whatever is writing to it, then save it again`);
   }
 
-  async restore(place: ResticPlace, attachment: Repository, snapshot: string, options: ResticRunOptions): Promise<void> {
+  /** `mirror` also deletes what the snapshot does not have, so the place ends
+   * up exactly the snapshot (a laptop's push into a task world). */
+  async restore(place: ResticPlace, attachment: Repository, snapshot: string, options: ResticRunOptions & { mirror?: boolean }): Promise<void> {
     const remote = isRemoteWorldKind(place.world.handle.kind);
     const scratch = place.file ? path.posix.join(place.world.handle.root, `.karmax-injection/restore-${crypto.randomBytes(6).toString('hex')}`) : undefined;
-    const args = ['restore', snapshot, '--target', scratch ?? place.path, '--no-lock', '--json', '-o', `rest.connections=${RESTORE_CONNECTIONS}`];
+    const args = ['restore', snapshot, '--target', scratch ?? place.path, '--no-lock', '--json', '-o', `rest.connections=${RESTORE_CONNECTIONS}`,
+      ...(options.mirror && !scratch ? ['--delete'] : [])];
     if (remote) {
       // One job does the restore and puts a single file in place.
       const move = scratch ? `\nshopt -s dotglob nullglob; e=(${quote(scratch)}/*); [ \${#e[@]} -eq 1 ] || { echo "expected one file" >&2; exit 3; }
@@ -179,6 +191,21 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
       fs.renameSync(path.join(scratch, entries[0]!), place.path);
       fs.rmSync(scratch, { recursive: true, force: true });
     }
+  }
+
+  /** Create the repository if it does not exist yet: before a client outside
+   * any world (the tavya CLI) is given an append grant for it. */
+  async prepare(repository: Repository): Promise<void> { await this.ensureRepository(repository); }
+
+  /** Whether `snapshot` was saved in `repository` (its file is listed there). */
+  async hasSnapshot(repository: Repository, snapshot: string): Promise<boolean> {
+    return /^[0-9a-f]{64}$/.test(snapshot) && Boolean(await this.deps.store.repositoryFile(repository.name, 'snapshots', snapshot));
+  }
+
+  /** restic's environment for a client outside any world: the same grant a
+   * sandbox gets, for `base` (the edge, else the public URL). */
+  clientEnvironment(repository: Repository, base: string, access: 'read' | 'append'): Promise<Record<string, string>> {
+    return this.env(repository, base, access, access === 'append');
   }
 
   /** Save `entry` (`.`: all of it) of a directory on this host: an upload, an import. */
@@ -225,6 +252,102 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
       if (changedPaths.length < 100) changedPaths.push(String(entry.path).replace(/^\/+/, ''));
     }
     return { added, modified, deleted, bytes, changedPaths };
+  }
+
+  /** Every file `to` adds (`+`), changes (`M`) or removes (`-`) relative to
+   * `from` (none: an empty resource), and the directories it removes. As
+   * {@link diff}, metadata alone is not a change. */
+  async changeSet(attachment: Repository, from: string | undefined, to: string): Promise<ChangeSet> {
+    const files = new Map<string, '+' | 'M' | '-'>();
+    const removedDirectories: string[] = [];
+    const addedDirectories: string[] = [];
+    if (!from) {
+      const directories = new Set<string>();
+      for (const file of await this.files(attachment, to)) {
+        files.set(file.path, '+');
+        for (const directory of ancestors(file.path)) directories.add(directory);
+      }
+      return { files, removedDirectories, addedDirectories: [...directories] };
+    }
+    const run = await this.onHost(attachment, 'read', false, ['diff', '--json', '--no-lock', from, to], { key: 'host' });
+    if (run.code !== 0) throw resticFailure(run, 'comparing versions of the resource');
+    for (const line of run.stdout.split('\n')) {
+      if (!line.startsWith('{')) continue;
+      const entry = JSON.parse(line);
+      if (entry.message_type !== 'change') continue;
+      const modifier = String(entry.modifier ?? '');
+      const relative = String(entry.path).replace(/^\/+/, '');
+      if (relative.endsWith('/')) {
+        if (modifier.includes('-')) removedDirectories.push(relative.slice(0, -1));
+        else if (modifier.includes('+')) addedDirectories.push(relative.slice(0, -1));
+        continue;
+      }
+      if (modifier.includes('+')) files.set(relative, '+');
+      else if (modifier.includes('-')) files.set(relative, '-');
+      else if (/[MT]/.test(modifier)) files.set(relative, 'M');
+    }
+    return { files, removedDirectories, addedDirectories };
+  }
+
+  /** Make `paths` of a directory-shaped `place` what they are in `snapshot`,
+   * delete `deletions`, then the `removedDirectories` left empty. Nothing
+   * else in the place is touched: in particular not `own`, the place's own
+   * changes, which a merge keeps.
+   *
+   * restic tests every node of the snapshot against every pattern it is given
+   * (pramana#3: 706,916 patterns over 777,367 files made no progress in hours),
+   * so the patterns stay few: a file inside a directory the snapshot adds goes
+   * with that whole directory, and when even then there are more than
+   * {@link MERGE_PATTERNS} and the place's own changes are fewer, everything
+   * but those is restored instead. A file that both sides changed is the
+   * same on both (the caller refuses a conflict), so restoring it is a no-op. */
+  async applyPaths(place: ResticPlace, attachment: Repository, snapshot: string,
+    change: { paths: string[]; deletions: string[]; removedDirectories: string[]; addedDirectories?: string[]; own?: ChangeSet },
+    options: ResticRunOptions): Promise<void> {
+    const all = [...change.paths, ...change.deletions, ...change.removedDirectories];
+    const awkward = all.find((file) => /[\n\r]/.test(file) || file.split('/').includes('..'));
+    if (awkward !== undefined) throw new Error(`cannot merge a file named ${JSON.stringify(awkward)}`);
+    // Named by the job's key, so a retried merge issues the same command and
+    // finds the restore an earlier attempt left running.
+    const lists = `.karmax-injection/merge-${crypto.createHash('sha256').update(options.key).digest('hex').slice(0, 12)}`;
+    const root = place.world.handle.root;
+    const write = async (name: string, value: string) => {
+      await place.world.writeFile(`${lists}/${name}`, value);
+      return path.posix.join(root, lists, name);
+    };
+    try {
+      if (change.paths.length) {
+        const include = collapse(change.paths, new Set(change.addedDirectories ?? []));
+        let exclude: string[] | undefined;
+        if (include.length > MERGE_PATTERNS && change.own) {
+          // A directory of the place's own may go whole only if nothing in it changed in the snapshot.
+          const touched = new Set([...all, ...all.flatMap(ancestors)]);
+          const own = collapse(change.own.files.keys(), new Set([...change.own.addedDirectories, ...change.own.removedDirectories]
+            .filter((directory) => !touched.has(directory))));
+          if (own.length < include.length) exclude = own;
+        }
+        const selection = exclude
+          // Unchanged files are left alone: size and mtime say so, as they do for a save (backupArgs).
+          ? ['--exclude-file', await write('exclude', patternList(exclude)), '--overwrite', 'if-changed']
+          : ['--include-file', await write('include', patternList(include))];
+        const args = ['restore', snapshot, '--target', place.path, ...selection, '--no-lock', '--json',
+          '-o', `rest.connections=${RESTORE_CONNECTIONS}`];
+        const run = isRemoteWorldKind(place.world.handle.kind)
+          ? await this.inWorld(place.world, attachment, 'read', false, args, options)
+          : await this.onHost(attachment, 'read', false, args, options);
+        if (run.code !== 0) throw resticFailure(run, 'merging the resource');
+      }
+      if (change.deletions.length || change.removedDirectories.length) {
+        const deletions = await write('delete', change.deletions.map((file) => `${file}\0`).join(''));
+        // Deepest first, so a removed tree goes once it is empty; a directory still holding files stays.
+        const directories = await write('rmdir', [...change.removedDirectories].sort((a, b) => b.length - a.length).map((dir) => `${dir}\0`).join(''));
+        const removed = await place.world.exec('bash', ['-c', `set -e; cd -- "$1"; xargs -0 -r rm -f -- < "$2"; xargs -0 -r rmdir --ignore-fail-on-non-empty -- < "$3" 2>/dev/null || true`,
+          'merge', place.path, deletions, directories], { cwd: root, timeoutMs: 10 * 60_000 });
+        if (removed.code !== 0) throw new Error(`merging the resource failed: ${(removed.stderr || removed.stdout).trim().slice(0, 300)}`);
+      }
+    } finally {
+      await place.world.exec('rm', ['-rf', '--', lists], { cwd: root }).catch(() => undefined);
+    }
   }
 
   /** Read back files of a snapshot, decrypting and checking every byte, a page at a time. */
@@ -405,11 +528,17 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
     const digest = crypto.createHash('sha256').update(command).digest('hex');
     let recorded = await this.deps.store.kvGet(recordKey);
     let job: string | undefined;
+    let earlier: string | undefined;
     try {
       const value = JSON.parse(recorded ?? '{}') as { job?: string; generation?: number; digest?: string };
-      if (value.digest === digest && value.generation === (world.handle.generation ?? 1) && value.job
-        && (await jobStatuses(world, [value.job], { root: SYSTEM_JOB_ROOT }))[0]?.state === 'running') job = value.job;
+      if (value.generation === (world.handle.generation ?? 1) && value.job
+        && (await jobStatuses(world, [value.job], { root: SYSTEM_JOB_ROOT }))[0]?.state === 'running') {
+        if (value.digest === digest) job = value.job; else earlier = value.job;
+      }
     } catch { /* none */ }
+    // An attempt whose worker died left its restic running, with other
+    // arguments: two would compete for the sandbox and write the same files.
+    if (earlier) await stopJobs(world, [earlier], SYSTEM_JOB_ROOT);
     if (!job) {
       const env = { ...await this.env(attachment, base, access, quota),
         RESTIC_CACHE_DIR: path.posix.join(world.handle.root, CACHE_DIR) };
@@ -419,7 +548,7 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
     }
     const forget = () => this.deps.store.kvCompareAndSet(recordKey, recorded, undefined).catch(() => false);
     try {
-      for (;;) {
+      for (let wait = FIRST_POLL_MS; ; wait = Math.min(wait * 2, POLL_MS)) {
         await options.checkContinue?.();
         const [status] = await jobStatuses(world, [job], { root: SYSTEM_JOB_ROOT, tailLines: 4 });
         for (const line of (status?.tail ?? '').split('\n').reverse()) {
@@ -436,7 +565,7 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
           await forget();
           throw new Error('restic stopped without finishing (the sandbox was restarted); it resumes from what it stored when retried');
         }
-        await new Promise((resolve) => setTimeout(resolve, POLL_MS));
+        await new Promise((resolve) => setTimeout(resolve, wait));
       }
     } catch (error) {
       // Cancelled: the job stops with the activity that waited on it.
@@ -477,6 +606,32 @@ function backupArgs(parent?: string, connections = CONNECTIONS): string[] {
   // keeps both, by setting the old mtime back, would go unnoticed.)
   return ['backup', '--json', '--host', 'tavya', '--ignore-inode', '--exclude', '.git', '--exclude', '.karmax-injection',
     '-o', `rest.connections=${connections}`, ...(parent ? ['--parent', parent] : [])];
+}
+
+/** A restic pattern matching exactly `file`: glob characters escaped, `$`
+ * doubled (pattern files expand variables) and spaces in a class (lines are
+ * trimmed). */
+/** Every directory a relative path is inside, outermost first. */
+function ancestors(file: string): string[] {
+  const out: string[] = [];
+  for (let i = file.indexOf('/'); i > 0; i = file.indexOf('/', i + 1)) out.push(file.slice(0, i));
+  return out;
+}
+
+/** `files`, each given as the outermost of `directories` it is inside (if
+ * any): one restic pattern for a whole tree. Sorted, without repeats. */
+function collapse(files: Iterable<string>, directories: Set<string>): string[] {
+  const out = new Set<string>();
+  for (const file of files) out.add(ancestors(file).find((directory) => directories.has(directory)) ?? file);
+  return [...out].sort();
+}
+
+function patternList(files: string[]): string {
+  return files.map((file) => `/${includePattern(file)}\n`).join('');
+}
+
+function includePattern(file: string): string {
+  return file.replace(/[\\*?[]/g, (c) => `\\${c}`).replace(/\$/g, '$$$$').replace(/\s/g, (c) => `[${c}]`);
 }
 
 function summaryOf(stdout: string): Record<string, unknown> {

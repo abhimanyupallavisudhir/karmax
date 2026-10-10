@@ -51,9 +51,10 @@ export const CORE_COMMANDS: CommandDecl[] = [
   { id: 'nav.newTask', title: 'New task (quick add)', keybinding: 'n' },
   { id: 'nav.newTaskForm', title: 'New task (full form)', keybinding: 'N' },
   { id: 'nav.search', title: 'Search', keybinding: '/' },
+  { id: 'nav.home', title: 'Go home', keybinding: 'g H' },
   { id: 'nav.tasks', title: 'Go to tasks', keybinding: 'g t' },
   { id: 'nav.queue', title: 'Go to queues', keybinding: 'g q' },
-  { id: 'nav.insights', title: 'Go to insights', keybinding: 'g i' },
+  { id: 'nav.insights', title: 'Go to insights', keybinding: 'g I' },
   { id: 'nav.settings', title: 'Go to project settings', keybinding: 'g s' },
   { id: 'nav.wiki', title: 'Go to project wiki', keybinding: 'g w' },
   { id: 'nav.orgwiki', title: 'Go to organization wiki', keybinding: 'g W' },
@@ -63,6 +64,5 @@ export const CORE_COMMANDS: CommandDecl[] = [
   { id: 'nav.notifications', title: 'Go to inbox', keybinding: 'g N' },
   { id: 'nav.close', title: 'Close panel', keybinding: 'Escape' },
   { id: 'nav.commandPalette', title: 'Command palette', keybinding: 'meta+k' },
-  { id: 'nav.globalSearch', title: 'Search everything', keybinding: 'meta+shift+F' },
   { id: 'help.keyboard', title: 'Keyboard shortcuts', keybinding: '?' },
 ];

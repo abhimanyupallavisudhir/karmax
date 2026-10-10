@@ -5,7 +5,6 @@ afterAll(closeConsoleBrowser);
 
 type Console = Awaited<ReturnType<typeof consolePage>>;
 const month = Date.UTC(2026, 8, 1);
-const policy = { maxActiveWorlds: 4, effectiveMaxActiveAgentTurns: 4, maxAgentStartsPerMinute: 10, maxRemoteStartsPerMinute: 10 };
 
 /** Organization settings, open at the section holding `selector`. */
 async function organization(selector: string, api: ApiHandler, hostLocal = true) {
@@ -20,26 +19,71 @@ async function organization(selector: string, api: ApiHandler, hostLocal = true)
 const usageApi = (usage: Record<string, unknown>): ApiHandler => ({ path }) => path === '/api/organizations/o/usage'
   ? { costMicros: 1_750_000, incurredCostMicros: 1_000_000, estimatedCostMicros: 750_000, activeReservationsMicros: 250_000,
     events: 3, from: month, ...usage }
-  : path === '/api/organizations/o/usage-policy' ? policy
-  : path === '/api/organizations/o/runner-pools' ? [{ id: 'pool', name: 'Pool', provider: 'e2b', capacity: { activeWorlds: 20 } }]
   : undefined;
 const usageText = async (ui: Console) => (await ui.page.locator('#org-usage').textContent())!;
 
-describe('organization provider connection UI', () => {
-  it('shows the effective built-in E2B headless-template default', async () => {
-    const empty = await organization('#org-providers .provider-template', () => undefined);
-    const template = empty.page.locator('#org-providers .provider-template');
-    expect([await template.inputValue(), await template.getAttribute('placeholder')]).toEqual(['', 'codex']);
-    await empty.close();
-    const custom = await organization('#org-providers .provider-template', ({ path }) => path === '/api/organizations/o/world-providers'
-      ? [{ provider: 'e2b', status: 'connected', enabled: true, config: { template: 'my-template' } }] : undefined);
-    expect(await custom.page.locator('#org-providers .provider-template').inputValue()).toBe('my-template');
-    await custom.close();
+describe('organization Computers and usage UI', () => {
+  const connected = [{ provider: 'e2b', status: 'ready', enabled: true, credentialConfigured: true, config: { template: 'my-template' } },
+    { provider: 'daytona', status: 'error', enabled: true, credentialConfigured: true, lastError: 'Daytona connection failed: 401', config: {} }];
+
+  it('lists each cloud computer with its state, an edit dialog and a test', async () => {
+    const ui = await organization('#org-computers .computer-provider', ({ method, path }) => path === '/api/organizations/o/world-providers'
+      ? connected : method === 'POST' && path.endsWith('/test') ? {} : undefined);
+    const rows = ui.page.locator('#org-computers .computer-provider');
+    expect(await rows.evaluateAll((elements) => elements.map((row) => [row.querySelector('b')!.textContent, row.querySelector('.chip')!.textContent])))
+      .toEqual([['E2B', 'connected'], ['Daytona', 'failing']]);
+    expect(await rows.nth(1).locator('.chip').getAttribute('title')).toBe('Daytona connection failed: 401');
+    await rows.nth(0).getByRole('button', { name: 'Test' }).click();
+    await expect.poll(() => ui.calls.some((call) => call.method === 'POST' && call.path === '/api/organizations/o/world-providers/e2b/test')).toBe(true);
+    // The dialog: a key that stays unless replaced, and the provider templates under Advanced.
+    await rows.nth(0).getByRole('button', { name: 'Edit E2B' }).click();
+    const dialog = ui.page.locator('.computer-dialog');
+    expect(await dialog.locator('.computer-key').getAttribute('placeholder')).toBe('Blank to leave unchanged');
+    expect(await dialog.locator('.computer-advanced').evaluate((element) => (element as unknown as { open: boolean }).open)).toBe(false);
+    expect(await dialog.locator('[data-config="template"]').inputValue()).toBe('my-template');
+    // No guardrails, runner pools or execution policy remain on this page.
+    expect(await ui.page.locator('#usage-policy-save, #runner-create, #org-execution-save').count()).toBe(0);
+    await ui.close();
   });
 
-  it('distinguishes incurred, estimated, and reserved usage with monthly reconciliation coverage', async () => {
+  it('connects a provider: saves the key, then verifies it', async () => {
+    const ui = await organization('#org-computers .computer-provider', ({ method, path }) => method === 'PUT' || method === 'POST' ? {} : undefined);
+    const daytona = ui.page.locator('#org-computers [data-provider="daytona"]');
+    expect(await daytona.locator('.chip').textContent()).toBe('not connected');
+    await daytona.getByRole('button', { name: 'Connect' }).click();
+    const dialog = ui.page.locator('.computer-dialog');
+    expect(await dialog.locator('.computer-key').getAttribute('placeholder')).toBe('Required');
+    await dialog.locator('.computer-key').fill('dtn-key');
+    await dialog.locator('.computer-advanced > summary').click();
+    await dialog.locator('[data-config="snapshot"]').fill('big-snapshot');
+    await dialog.getByRole('button', { name: 'Connect' }).click();
+    await expect.poll(() => ui.calls.filter((call) => call.path.startsWith('/api/organizations/o/world-providers/daytona')).map((call) => call.method))
+      .toEqual(['PUT', 'POST']);
+    expect(ui.calls.find((call) => call.method === 'PUT')!.body).toMatchObject({ apiKey: 'dtn-key', config: { snapshot: 'big-snapshot', image: '' } });
+    await ui.close();
+  });
+
+  // UI-43: a rejected save changed nothing, so the dialog keeps what was typed.
+  it('keeps the typed key and settings when saving a provider fails', async () => {
+    for (const [provider, field, value] of [['e2b', 'template', 'my-template'], ['daytona', 'snapshot', 'my-snapshot']] as const) {
+      const ui = await organization('#org-computers .computer-provider', ({ method, path }) => method === 'PUT'
+        && path === `/api/organizations/o/world-providers/${provider}` ? { status: 400, json: { error: 'API key rejected by provider' } } : undefined);
+      await ui.page.locator(`#org-computers [data-provider="${provider}"] .computer-connect`).click();
+      const dialog = ui.page.locator('.computer-dialog');
+      await dialog.locator('.computer-key').fill('sk-typed-key');
+      await dialog.locator('.computer-advanced > summary').click();
+      await dialog.locator(`[data-config="${field}"]`).fill(value);
+      await dialog.locator('.computer-save').click();
+      await expect.poll(() => ui.toasts()).toContain('API key rejected by provider');
+      expect(await dialog.locator('.computer-key').inputValue()).toBe('sk-typed-key');
+      expect(await dialog.locator(`[data-config="${field}"]`).inputValue()).toBe(value);
+      await ui.close();
+    }
+  });
+
+  it('shows usage under Plan & billing, with reconciliation coverage', async () => {
     const ui = await organization('#org-usage .stat', usageApi({}));
-    await ui.page.locator('#org-usage .stat').waitFor();
+    expect(await ui.page.locator('#org-usage').evaluate((element) => element.closest('.settings-pane')!.getAttribute('data-pane'))).toBe('settings-plan');
     expect(await usageText(ui)).toContain('Metered + estimated usage · This month · 3 ledger events');
     expect(await usageText(ui)).toContain('Incurred $1.00 · estimated $0.75 · active managed reservations $0.25');
     await ui.close();
@@ -47,58 +91,10 @@ describe('organization provider connection UI', () => {
     // Provider reconciliation that only began mid-month narrows the period it vouches for.
     const late = await organization('#org-usage .stat', usageApi({ sync: [{ provider: 'e2b', status: 'ok', at: Date.now(),
       coverageFrom: Date.UTC(2026, 8, 15, 12) }] }));
-    await late.page.locator('#org-usage .stat').waitFor();
     expect(await usageText(late)).toMatch(/Metered \+ estimated usage · Since Sep 1[45] · 3 ledger events · synced /);
     await late.close();
     const gap = await organization('#org-usage .stat', usageApi({ sync: [{ provider: 'e2b', status: 'error', gap: true, at: Date.now() }] }));
-    await gap.page.locator('#org-usage .stat').waitFor();
     expect(await usageText(gap)).toContain('Metered + estimated usage · Incomplete history · 3 ledger events · sync unavailable');
     await gap.close();
-  });
-
-  it('derives hosted remote-world capacity from the plan instead of exposing a second limit', async () => {
-    const saved = (ui: Console) => ui.calls.filter((call) => call.method === 'PUT' && call.path === '/api/organizations/o/usage-policy')
-      .map((call) => call.body.policy);
-    const save = async (ui: Console) => {
-      await ui.page.locator('#org-usage summary').click();
-      await ui.page.locator('#usage-policy-save').click();
-      await expect.poll(() => saved(ui)).toHaveLength(1);
-    };
-    const withSave: ApiHandler = (call) => call.method === 'PUT' ? {} : usageApi({})(call);
-
-    const hosted = await organization('#org-usage .stat', withSave, false);
-    expect(await hosted.page.locator('#org-runners [data-runner="pool"] .chip').textContent()).toBe('e2b · concurrency capacity 4');
-    expect(await usageText(hosted)).toContain('Concurrent remote worlds');
-    expect(await usageText(hosted)).toContain('Same as agent concurrency: 4');
-    expect(await hosted.page.locator('#usage-world-active').count()).toBe(0);
-    await save(hosted);
-    expect(saved(hosted)[0]).not.toHaveProperty('maxActiveWorlds');
-    await hosted.close();
-
-    // A host-local installation owns its machine, so it sets the world limit itself.
-    const local = await organization('#org-usage .stat', withSave, true);
-    expect(await local.page.locator('#org-runners [data-runner="pool"] .chip').textContent()).toBe('e2b · 20 worlds');
-    await local.page.locator('#org-usage summary').click();
-    await local.page.locator('#usage-world-active').fill('6');
-    await local.page.locator('#usage-policy-save').click();
-    await expect.poll(() => saved(local)).toHaveLength(1);
-    expect(saved(local)[0]).toMatchObject({ maxActiveWorlds: 6 });
-    await local.close();
-  });
-  // UI-43: a rejected save changed nothing, so the form keeps what was typed.
-  it('keeps the typed key and settings when saving a provider fails', async () => {
-    for (const [provider, field, value] of [['e2b', '.provider-template', 'my-template'], ['daytona', '.provider-snapshot', 'my-snapshot']] as const) {
-      const ui = await organization('#org-providers .provider-key', ({ method, path }) => method === 'PUT'
-        && path === `/api/organizations/o/world-providers/${provider}` ? { status: 400, json: { error: 'API key rejected by provider' } } : undefined);
-      const row = ui.page.locator(`#org-providers [data-provider="${provider}"]`);
-      if (provider === 'daytona') await row.locator('summary').click(); // its settings sit under Advanced
-      await row.locator('.provider-key').fill('sk-typed-key');
-      await row.locator(field).fill(value);
-      await row.getByRole('button', { name: 'Connect & verify' }).click();
-      await expect.poll(() => ui.toasts()).toContain('API key rejected by provider');
-      expect(await row.locator('.provider-key').inputValue()).toBe('sk-typed-key');
-      expect(await row.locator(field).inputValue()).toBe(value);
-      await ui.close();
-    }
   });
 });

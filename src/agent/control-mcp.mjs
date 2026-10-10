@@ -16,10 +16,14 @@
  * verdict even though the prompt advertised the tools.
  *
  * Deliberate choices:
- *   · The low-level `Server` API is used, not `McpServer`, so the parent's JSON
- *     Schemas are forwarded verbatim — no lossy JSON-Schema→zod→JSON-Schema round
- *     trip (that round trip is exactly what once flattened `create_review_info`'s
- *     nested `actions` items to `{}`).
+ *   · No dependencies at all, only `node:` modules. The same file runs on the
+ *     host (local worlds) and inside a cloud sandbox (E2B/Daytona), where karmax
+ *     uploads it beside the ACP relay and no npm package can be assumed. It
+ *     speaks the small stdio-MCP subset a tool server needs (`initialize`,
+ *     `ping`, `tools/list`, `tools/call`), one JSON-RPC message per line.
+ *   · The parent's JSON Schemas are forwarded verbatim — no lossy
+ *     JSON-Schema→zod→JSON-Schema round trip (that round trip is exactly what
+ *     once flattened `create_review_info`'s nested `actions` items to `{}`).
  *   · We NEVER exit during startup. A bare `process.exit(1)` kills the stdio
  *     transport mid-handshake, which CLIs report as the opaque JSON-RPC
  *     `-32000 ConnectionClosed` (the same lesson as `src/mcp/stdio.ts`). If the
@@ -30,11 +34,12 @@
  *     socket is same-uid reachable by any other agent on this host, and these
  *     tools are not harmless (`request_spend`, `fill_payment_card`,
  *     `create_sub_task`) — see the security section of `control-bridge.ts`.
+ *     In a sandbox the socket belongs to the ACP relay (`acp-relay.mjs`), which
+ *     carries each frame over the agent's own PTY; the activity still checks
+ *     the token.
  */
 import net from 'node:net';
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import readline from 'node:readline';
 
 const SOCKET = process.env.KARMAX_CONTROL_SOCKET;
 const TOKEN = process.env.KARMAX_CONTROL_TOKEN;
@@ -107,45 +112,73 @@ const client = async () => {
   return connection;
 };
 
-async function main() {
-  const server = new Server(
-    { name: 'karmax_control', version: '1.0.0' },
-    { capabilities: { tools: {} } },
-  );
+/** MCP protocol revisions this server answers in; the newest is offered when
+ * a client asks for one it does not know (the client then decides). */
+const PROTOCOL_VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05', '2024-10-07'];
 
-  server.setRequestHandler(ListToolsRequestSchema, async () => {
-    try {
-      const reply = await (await client()).request({ op: 'list' });
-      const tools = reply?.ok && Array.isArray(reply.tools) ? reply.tools : [];
-      return {
-        tools: tools.map((tool) => ({
-          name: tool.name,
-          description: tool.description,
-          inputSchema: tool.parameters ?? { type: 'object', properties: {} },
-        })),
-      };
-    } catch {
-      // An unreachable activity means no turn-local tools this turn; an empty
-      // list keeps the connection healthy rather than failing the harness boot.
-      return { tools: [] };
-    }
-  });
-
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const name = request.params?.name ?? '';
-    try {
-      const reply = await (await client()).request({ op: 'call', name, args: request.params?.arguments ?? {} });
-      if (reply?.ok) return { content: [{ type: 'text', text: String(reply.text ?? '') }] };
-      return { content: [{ type: 'text', text: `error: ${String(reply?.error ?? 'tavya control call failed')}` }], isError: true };
-    } catch (error) {
-      return { content: [{ type: 'text', text: `error: ${String(error?.message ?? error)}` }], isError: true };
-    }
-  });
-
-  await server.connect(new StdioServerTransport());
+async function listTools() {
+  try {
+    const reply = await (await client()).request({ op: 'list' });
+    const tools = reply?.ok && Array.isArray(reply.tools) ? reply.tools : [];
+    return {
+      tools: tools.map((tool) => ({
+        name: tool.name,
+        description: tool.description,
+        inputSchema: tool.parameters ?? { type: 'object', properties: {} },
+      })),
+    };
+  } catch {
+    // An unreachable activity means no turn-local tools this turn; an empty
+    // list keeps the connection healthy rather than failing the harness boot.
+    return { tools: [] };
+  }
 }
 
-main().catch((error) => {
-  process.stderr.write(`karmax-control-mcp: ${String(error?.message ?? error)}\n`);
-  process.exit(1);
-});
+async function callTool(params) {
+  const name = params?.name ?? '';
+  try {
+    const reply = await (await client()).request({ op: 'call', name, args: params?.arguments ?? {} });
+    if (reply?.ok) return { content: [{ type: 'text', text: String(reply.text ?? '') }] };
+    return { content: [{ type: 'text', text: `error: ${String(reply?.error ?? 'tavya control call failed')}` }], isError: true };
+  } catch (error) {
+    return { content: [{ type: 'text', text: `error: ${String(error?.message ?? error)}` }], isError: true };
+  }
+}
+
+/** Answer one JSON-RPC request; notifications (no id) need no answer. */
+async function answer(message) {
+  const { id, method, params } = message ?? {};
+  if (id === undefined || id === null) return undefined;
+  const result = (value) => ({ jsonrpc: '2.0', id, result: value });
+  switch (method) {
+    case 'initialize': {
+      const requested = params?.protocolVersion;
+      return result({
+        protocolVersion: PROTOCOL_VERSIONS.includes(requested) ? requested : PROTOCOL_VERSIONS[0],
+        capabilities: { tools: { listChanged: false } },
+        serverInfo: { name: 'karmax_control', version: '1.0.0' },
+      });
+    }
+    case 'ping': return result({});
+    case 'tools/list': return result(await listTools());
+    case 'tools/call': return result(await callTool(params));
+    default: return { jsonrpc: '2.0', id, error: { code: -32601, message: `Method not found: ${String(method)}` } };
+  }
+}
+
+function main() {
+  const send = (message) => { if (message) process.stdout.write(`${JSON.stringify(message)}\n`); };
+  readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line', (line) => {
+    if (!line.trim()) return;
+    let message;
+    try { message = JSON.parse(line); }
+    catch { send({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }); return; }
+    // Calls run concurrently, as with the SDK transport: a slow tool must not
+    // hold up `ping` or another call.
+    answer(message).then(send, (error) => send({ jsonrpc: '2.0', id: message?.id ?? null,
+      error: { code: -32603, message: String(error?.message ?? error) } }));
+  });
+  process.stdin.on('end', () => process.exit(0));
+}
+
+main();

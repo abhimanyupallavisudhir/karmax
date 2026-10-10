@@ -1,0 +1,14 @@
+{
+  "name": "@tavya/cli",
+  "version": "1.2.2",
+  "description": "Work on tavya projects and tasks from your own machine: clone, pull and push code, data and secrets; start, follow and steer tasks.",
+  "license": "UNLICENSED",
+  "homepage": "https://tavya.io",
+  "repository": { "type": "git", "url": "git+https://github.com/abhimanyupallavisudhir/karmax.git", "directory": "cli" },
+  "type": "module",
+  "bin": { "tavya": "dist/tavya.mjs" },
+  "files": ["dist/tavya.mjs", "README.md"],
+  "engines": { "node": ">=22.16.0" },
+  "keywords": ["tavya", "cli", "agents", "restic", "git"],
+  "devDependencies": { "esbuild": "0.28.1", "postject": "1.0.0-alpha.6" }
+}

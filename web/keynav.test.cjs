@@ -73,12 +73,17 @@ for (const effective of [false, true]) {
   ok(tabs.includes('tasks') && tabs.includes('settings'), 'project navigation retains tasks and settings');
 }
 ok(!src.includes("id: 'nav.activity'"), 'Activity has no user-facing navigation command');
+// Home is a global destination, so it takes a shifted letter like g W / g S / g N.
+const registry = fs.readFileSync(path.join(__dirname, '..', 'src', 'contrib', 'registry.ts'), 'utf8');
+ok(src.includes("{ id: 'nav.home', title: 'Go home', key: 'g H',"), 'the console binds Go home to g H');
+ok(registry.includes("{ id: 'nav.home', title: 'Go home', keybinding: 'g H' }"), 'the server registry declares g H for Go home');
+ok(!/'g h'/.test(src + registry), 'g h is no longer bound');
 
 // ── parseKeybinding ──
 ok(JSON.stringify(parseKeybinding('n')) === JSON.stringify([{ key: 'n' }]), 'single key');
 ok(JSON.stringify(parseKeybinding('g t')) === JSON.stringify([{ key: 'g' }, { key: 't' }]), 'two-step chord');
 ok(JSON.stringify(parseKeybinding('meta+k')) === JSON.stringify([{ key: 'k', meta: true }]), 'meta modifier');
-ok(JSON.stringify(parseKeybinding('meta+shift+F')) === JSON.stringify([{ key: 'F', meta: true, shift: true }]), 'global-search modifier chord');
+ok(JSON.stringify(parseKeybinding('meta+shift+F')) === JSON.stringify([{ key: 'F', meta: true, shift: true }]), 'a three-key modifier chord');
 ok(JSON.stringify(parseKeybinding('cmd+K')) === JSON.stringify([{ key: 'K', meta: true }]), 'cmd alias + case preserved');
 ok(JSON.stringify(parseKeybinding('Escape')) === JSON.stringify([{ key: 'escape' }]), 'named key normalizes');
 ok(JSON.stringify(parseKeybinding('ArrowDown')) === JSON.stringify([{ key: 'arrowdown' }]), 'arrow key normalizes');
@@ -97,7 +102,7 @@ ok(!stepMatches({ key: 'c' }, ev('C')), 'case-sensitive: C (shift) is not c');
 ok(stepMatches({ key: 'J' }, ev('J', { shiftKey: true })), 'uppercase binding matches shifted key');
 ok(stepMatches({ key: 'k', meta: true }, ev('k', { metaKey: true })), 'meta+k matches Cmd');
 ok(stepMatches({ key: 'k', meta: true }, ev('k', { ctrlKey: true })), 'meta+k also matches Ctrl (Linux/Windows)');
-ok(stepMatches(parseKeybinding('meta+shift+F')[0], ev('F', { ctrlKey: true, shiftKey: true })), 'Ctrl+Shift+F opens global search');
+ok(stepMatches(parseKeybinding('meta+shift+F')[0], ev('F', { ctrlKey: true, shiftKey: true })), 'Ctrl+Shift+F matches meta+shift+F');
 ok(!stepMatches(parseKeybinding('meta+shift+F')[0], ev('f', { ctrlKey: true })), 'Ctrl+F remains the browser find shortcut');
 ok(!stepMatches({ key: 'k', meta: true }, ev('k')), 'meta+k needs the modifier');
 ok(stepMatches({ key: 'escape' }, ev('Escape')), 'named keys match case-insensitively');
@@ -185,7 +190,7 @@ ok(chordCandidates(shiftedCmds, [ev('g')], ev('S', { shiftKey: true })).map((c) 
 
 // ── fmtKeys ──
 ok(fmtKeys('meta+k') === 'Ctrl+k', 'meta renders as Ctrl+ on non-mac');
-ok(fmtKeys('meta+shift+F') === 'Ctrl+⇧F', 'global search renders its full shortcut');
+ok(fmtKeys('meta+shift+F') === 'Ctrl+⇧F', 'a three-key chord renders in full');
 ok(fmtKeys('g t') === 'g t', 'chords keep their spacing');
 ok(fmtKeys('Escape') === 'Esc' && fmtKeys('ArrowDown') === '↓', 'named keys get glyphs');
 setPlatform('MacIntel');
@@ -274,7 +279,7 @@ global.document = {
   addEventListener: (name, handler) => { attemptKeydown = handler; },
 };
 global.CHORD = { pending: [], timer: null };
-for (const name of ['cycleAttempt', 'allCommands', 'resetChord', 'dispatchKey', 'bindKeys']) eval(extractFn(name));
+for (const name of ['cycleAttempt', 'allCommands', 'echoKeys', 'clearPendingEcho', 'resetChord', 'dispatchKey', 'bindKeys']) eval(extractFn(name));
 bindKeys();
 const press = (key, typing = false) => attemptKeydown({
   ...ev(key), preventDefault() {},

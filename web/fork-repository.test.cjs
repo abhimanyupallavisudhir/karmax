@@ -6,13 +6,14 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const src = fs.readFileSync(`${__dirname}/app.js`, 'utf8');
-const helpers = src.slice(src.indexOf('function repositoryLabel('), src.indexOf('// Work on someone else'));
+const helpers = src.slice(src.indexOf('function githubRepositorySlug('), src.indexOf('// Work on someone else'));
 const context = vm.createContext({});
 vm.runInContext(helpers, context);
 
-test('a fork is labelled with the repository its pull requests go to', () => {
-  assert.equal(context.repositoryLabel({ owner: 'jane', name: 'widgets', upstream: { owner: 'acme', name: 'widgets' } }), 'jane/widgets → acme/widgets');
-  assert.equal(context.repositoryLabel({ owner: 'jane', name: 'own' }), 'jane/own');
+test('a fork in the repository list names the repository its pull requests go to', () => {
+  const panel = src.slice(src.indexOf('function renderProjectRepositories('), src.indexOf('async function hydrateProjectAccess('));
+  assert.match(panel, /git-repo-upstream" title="Pull requests go to \$\{esc\(upstream\.owner\)\}\/\$\{esc\(upstream\.name\)\} after Review">→ /);
+  assert.match(panel, /id="project-fork-open"/);
 });
 
 test('the fork dialog accepts a GitHub URL, SSH address or owner/name', () => {

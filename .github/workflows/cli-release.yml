@@ -1,0 +1,157 @@
+name: CLI release
+
+# Publishes the tavya CLI (src/cli): the bundled npm package `@tavya/cli`, and single
+# executables for each platform on the GitHub release `cli-v<version>`
+# (installed by https://tavya.io/cli/install.sh). Runs by itself when master's
+# cli/package.json changes to a version not released yet (CI's `cli-version`
+# job makes every pull request that changes the CLI bump it), when such a tag
+# is pushed, or by hand (workflow_dispatch) on a branch, which releases that
+# commit's cli/package.json version and creates its tag. npm publishes through
+# trusted publishing (no token; job `npm`).
+on:
+  push:
+    branches: [master]
+    paths: ['cli/package.json']
+    tags: ['cli-v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: An existing cli-v<version> tag to republish; empty releases this branch's version
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      sha: ${{ steps.version.outputs.sha }}
+      release: ${{ steps.version.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ inputs.tag || github.sha }}" }
+      - uses: actions/setup-node@v4
+        with: { node-version: '22.16.0' }
+      - name: Version
+        id: version
+        env:
+          REQUESTED: "${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || '' }}"
+          ON_MASTER: "${{ github.event_name == 'push' && github.ref_type == 'branch' }}"
+        run: |
+          tag="cli-v$(node -p "require('./cli/package.json').version")"
+          if [ -n "$REQUESTED" ] && [ "$REQUESTED" != "$tag" ]; then echo "::error::$REQUESTED does not match cli/package.json ($tag)"; exit 1; fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          # A master push releases only a version that has no tag yet (any other edit to cli/package.json is not a release).
+          if [ "$ON_MASTER" = true ] && [ -n "$(git ls-remote --tags origin "refs/tags/$tag")" ]; then
+            echo "$tag is already released"; echo "release=false" >> "$GITHUB_OUTPUT"
+          else echo "release=true" >> "$GITHUB_OUTPUT"; fi
+      # The CLI has no runtime dependencies; its build tools are locked in
+      # cli/package-lock.json. (`npm install <tool>` at the root would resolve
+      # the whole root project afresh.)
+      - if: steps.version.outputs.release == 'true'
+        run: npm ci --prefix cli --ignore-scripts --no-audit --no-fund
+      - if: steps.version.outputs.release == 'true'
+        run: node scripts/build-cli.mjs
+      - if: steps.version.outputs.release == 'true'
+        run: node cli/dist/tavya.mjs --version
+      - if: steps.version.outputs.release == 'true'
+        uses: actions/upload-artifact@v4
+        with: { name: tavya-mjs, path: cli/dist/tavya.mjs }
+
+  executable:
+    needs: bundle
+    if: needs.bundle.outputs.release == 'true'
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: linux-x64 }
+          - { os: ubuntu-24.04-arm, target: linux-arm64 }
+          - { os: macos-14, target: darwin-arm64 }
+          - { os: macos-15-intel, target: darwin-x64 }
+          - { os: windows-latest, target: windows-x64 }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: '${{ needs.bundle.outputs.sha }}' }
+      - uses: actions/setup-node@v4
+        with: { node-version: '22.16.0' }
+      - run: npm ci --prefix cli --ignore-scripts --no-audit --no-fund
+      - run: node scripts/build-cli.mjs --sea
+      - name: Inject into a copy of node (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cp "$(command -v node)" tavya-${{ matrix.target }}
+          cli/node_modules/.bin/postject tavya-${{ matrix.target }} NODE_SEA_BLOB cli/dist/sea-prep.blob --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2
+      - name: Inject into a copy of node (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cp "$(command -v node)" tavya-${{ matrix.target }}
+          codesign --remove-signature tavya-${{ matrix.target }}
+          cli/node_modules/.bin/postject tavya-${{ matrix.target }} NODE_SEA_BLOB cli/dist/sea-prep.blob --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2 --macho-segment-name NODE_SEA
+          codesign --sign - tavya-${{ matrix.target }}
+      - name: Inject into a copy of node (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cp "$(command -v node)" tavya-${{ matrix.target }}.exe
+          cli/node_modules/.bin/postject tavya-${{ matrix.target }}.exe NODE_SEA_BLOB cli/dist/sea-prep.blob --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2
+      - name: Smoke test
+        shell: bash
+        run: |
+          suffix=""
+          if [ "$RUNNER_OS" = Windows ]; then suffix=.exe; fi
+          "./tavya-${{ matrix.target }}${suffix}" --version
+      - uses: actions/upload-artifact@v4
+        with: { name: 'tavya-${{ matrix.target }}', path: 'tavya-${{ matrix.target }}*' }
+
+  release:
+    needs: [bundle, executable]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: assets, merge-multiple: true }
+      - name: Checksums
+        working-directory: assets
+        run: sha256sum tavya-* tavya.mjs > SHA256SUMS && cat SHA256SUMS
+      - name: GitHub release
+        env: { GH_TOKEN: '${{ github.token }}', TAG: '${{ needs.bundle.outputs.tag }}', SHA: '${{ needs.bundle.outputs.sha }}' }
+        run: |
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$SHA" --title "tavya CLI ${TAG#cli-v}" \
+                 --notes "Install: \`curl -fsSL https://tavya.io/cli/install.sh | sh\` or \`npm install -g @tavya/cli\`."
+          gh release upload "$TAG" assets/* --repo "$GITHUB_REPOSITORY" --clobber
+
+  # npm trusted publishing (configured 2026-10-07 for this repository and file):
+  # npm exchanges this job's GitHub OIDC token for a short-lived publish token,
+  # so no npm token is stored anywhere. Needs npm >= 11.5.1.
+  npm:
+    needs: bundle
+    if: needs.bundle.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: '${{ needs.bundle.outputs.sha }}' }
+      - uses: actions/setup-node@v4
+        with: { node-version: '22.16.0', registry-url: 'https://registry.npmjs.org' }
+      - run: npm install -g npm@11
+      - uses: actions/download-artifact@v4
+        with: { name: tavya-mjs, path: cli/dist }
+      - name: Publish
+        run: |
+          version="$(node -p "require('./cli/package.json').version")"
+          if npm view "@tavya/cli@${version}" version >/dev/null 2>&1; then echo "@tavya/cli@${version} is already on npm"; exit 0; fi
+          chmod +x cli/dist/tavya.mjs
+          cd cli && npm publish --access public --provenance

@@ -14,6 +14,8 @@ import { mergeQueueDomains } from '../src/domain/types.js';
 import { GithubActionsApi, githubRequiredCheckKey } from '../src/integrations/github-actions.js';
 import { brokerPublishBranch } from '../src/world/git-broker.js';
 import { expectedTaskRemoteHeads, recordTaskPublication } from '../src/world/publication.js';
+import { reconcileTasks } from '../src/platform/reconcile.js';
+import { TriggerScheduler } from '../src/platform/trigger-scheduler.js';
 
 /** The PR stage end to end under remote policy 'pr' (SPEC §5.2): the workflow
  *  opens the pull request, carries it on the view, and reconciles it with the
@@ -1556,6 +1558,60 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     expect(open.state).toBe('open');
     expect(comments.some((comment) => /was cancelled/.test(comment.body ?? ''))).toBe(false);
     expect((await h.store.getTask(task.id))?.lastView).toMatchObject({ stage: 'done', status: 'done' });
+  }, 120_000);
+
+  // Task #367: Temporal terminated a run for its history size while it waited
+  // to land the last of its PRs. One had merged, so past the point of no
+  // return Done was the only way out, and the rest never landed.
+  it('retries a run terminated mid-Landing after a partial merge and lands the rest', async () => {
+    const { task, project, handle, merged, open, slugB } = await reviewWithOneExternallyMergedPr('terminated-retry');
+    const token = (await h.tokens.mintPrincipal('user:a', ['*'], project.id)).token;
+    const dependent = (await h.store.createTask({ projectId: project.id, title: 'After the landing', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'next', triggers: [{ kind: 'dependency', tasks: [task.id], on: 'success' }] } }));
+    (await h.store.updateTaskParams(dependent.id, { ...dependent.params, triggerState: 'armed' }));
+    const fired: string[] = [];
+    const scheduler = new TriggerScheduler({ store: h.store, bus: h.bus, fire: async (id) => void fired.push(id) });
+    await scheduler.start();
+    try {
+      // B's CI stays pending, so the run waits in Landing with A already merged.
+      githubReadinessBySlug.set(slugB, { statusCheckRollup: { state: 'PENDING', contexts: { nodes: [] } } });
+      await handle.signal('confirm');
+      await expect.poll(async () => {
+        const current = await view(handle);
+        return `${current.stage}/${current.pointOfNoReturnPassed}`;
+      }, { timeout: 30_000 }).toBe('merge/true');
+      await handle.terminate('Workflow history size exceeds limit.');
+      (await reconcileTasks(h.store, h.client));
+
+      const failed = (await h.api.getTaskView(token, task.id))!;
+      expect(failed).toMatchObject({ stage: 'failed', pointOfNoReturnPassed: true, state: { failedFrom: 'merge' } });
+      expect(failed.stageTransitions?.map((move) => move.target)).toEqual(['do', 'done']);
+
+      githubReadinessBySlug.delete(slugB);
+      await h.api.moveTaskStage(token, task.id, 'do');
+      const retried = h.client.workflow.getHandle(task.id);
+      // The replacement starts past the point of no return: nothing offers to
+      // cancel or discard the half that already landed.
+      await expect.poll(async () => (await view(retried)).stage, { timeout: 30_000 }).toBe('do');
+      const resumed = await view(retried);
+      expect(resumed.pointOfNoReturnPassed).toBe(true);
+      expect(resumed.actions.find((action: any) => action.name === 'cancel')?.enabled ?? false).toBe(false);
+      await expect.poll(async () => (await view(retried)).status, { timeout: 30_000 }).toBe('waiting');
+      await h.api.signalTask(token, task.id, 'followUp', '@openpr');
+
+      await expect(retried.result()).resolves.toMatchObject({ stage: 'done' });
+      // The merged PR was left alone; the open one landed.
+      expect(merged.merged_at).toBeTruthy();
+      expect(open.merged_at).toBeTruthy();
+      expect((await git(remoteBySlug.get(slugB)!, ['show', 'main:b.md'])).stdout).toContain('B');
+      expect((await view(retried)).prs).toEqual([expect.objectContaining({ slug: slugB, merged: true })]);
+      // Failing did not satisfy the dependent; landing did, once.
+      await expect.poll(() => fired, { timeout: 30_000 }).toEqual([dependent.id]);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      expect(fired).toEqual([dependent.id]);
+    } finally {
+      await scheduler.stop();
+    }
   }, 120_000);
 
   it('v1.21 withdraws queued provider siblings before returning a failed participant to Do', async () => {

@@ -62,6 +62,10 @@ const baseField = (): FieldSpec => ({ name: 'base', type: 'branch', label: 'Base
 // opened against it or the merge enqueue). software-dev re-reads `target` at
 // PR/merge, so the edit genuinely takes effect (SPEC §4.5/§5.5, §2 setTarget).
 const targetField = (): FieldSpec => ({ name: 'target', type: 'branch', label: 'Target (merge-to) branch', default: 'main', scopes: ALL, bind: 'top', mutable: 'untilUsed' });
+// Multi-repository projects whose repositories do not share branch names (one
+// uses main, another master). Off, every repository uses the common base/target.
+// Task and project scopes only: an organization has no repository list.
+const repoBranchesField = (): FieldSpec => ({ name: 'repoBranches', type: 'repoBranches', label: 'Different branches per repo', help: 'Set the base and target branch for each repository separately.', scopes: ['task', 'project'], bind: 'top' });
 const reposField = (): FieldSpec => ({ name: 'repos', type: 'list', label: 'Repositories', help: 'One per line. Local worlds accept filesystem paths; E2B accepts SSH Git URLs (git@github.com:org/repo.git). Multiple repos are checked out in separate world subdirectories.', scopes: ['project'], bind: 'project' });
 // Wire compatibility for old settings and version-pinned tasks. The browser no
 // longer renders this retired host-file-copy control; typed project resources
@@ -79,6 +83,7 @@ const remoteField = (): FieldSpec => ({
   label: 'Remote policy',
   help: 'What leaves a local machine: none — merges stay local; push — push the target after merge; pr — open the exact GitHub proposal before Review, then merge it under a confirming human’s GitHub authorization. In E2B, the SSH repository is necessarily the durable source of truth, so confirmed merges are broker-pushed even when this is none.',
   options: ['none', 'push', 'pr'],
+  optionLabels: { none: 'Keep merges local', push: 'Push after merging', pr: 'Open a pull request' },
   default: 'none',
   scopes: ['project', 'global'],
   bind: 'project',
@@ -86,7 +91,8 @@ const remoteField = (): FieldSpec => ({
 const otherAttemptsField = (): FieldSpec => ({
   name: 'otherAttempts', type: 'select', label: 'Other task attempts',
   help: 'ask — the human or agent reviewer chooses Keep or Cancel; without a reviewer, keep. Keep allows other proposals to continue and merge. The first attempt entering Merge fixes the choice for its group.',
-  options: ['ask', 'keep', 'cancel'], default: 'ask', scopes: ['project'], bind: 'project',
+  options: ['ask', 'keep', 'cancel'], optionLabels: { ask: 'Reviewer decides', keep: 'Keep them', cancel: 'Cancel them' },
+  default: 'ask', scopes: ['project'], bind: 'project',
 });
 const landingAuthorityField = (): FieldSpec => ({
   name: 'landingAuthority',
@@ -95,7 +101,7 @@ const landingAuthorityField = (): FieldSpec => ({
   help: `auto — prefer the provider queue/auto-merge and use ${BRAND} admission only when strict freshness needs it; external — a repository-triggered third-party system owns landing and ${BRAND} only observes; ${BRAND} — always use ${BRAND} fair fallback admission.`,
   options: ['auto', 'external', 'karmax'],
   // The stored value predates the product name.
-  optionLabels: { karmax: BRAND },
+  optionLabels: { auto: 'Automatic', external: 'External system', karmax: BRAND },
   default: 'auto',
   scopes: ['project', 'global'],
   bind: 'project',
@@ -115,24 +121,24 @@ const multiPrField = (): FieldSpec => ({
   scopes: ALL,
   bind: 'project',
 });
-// "Agent environment" (SPEC §11) — the world backend a task's agent runs in: a
-// local git worktree/container or a remote sandbox (E2B/Daytona). Canonical
-// storage remains the execution policy (ProjectConfig.worldProvider / the
-// organization policy); this field exposes it as an ordinary task default AND a
-// per-task override, so a single task can pick a different environment without a
-// project-wide change. `bind:'project'` lands the resolved value on
-// `input.project.worldProvider`, which every world-creating workflow already
-// reads. Options are filled in by the client from the organization's connected
-// providers; an empty value ⇒ inherit the project / organization default. It is
-// frozen once the task starts (default `queue`): the world is provisioned at
-// setup and can't be swapped mid-flight.
-const agentEnvironmentField = (): FieldSpec => ({
-  name: 'worldProvider',
-  type: 'select',
-  label: 'Agent environment',
-  options: [''],
+// The Computer (SPEC §11) — where a task's agent runs and how big that machine
+// is: the provider (a remote sandbox on E2B/Daytona, or a local worktree or
+// container when self-hosted), CPU, memory, disk, the experience (headless or
+// desktop), how long it sleeps before hibernating, and outbound network. One
+// block, like the Agent. Organization and project defaults live in the
+// execution policy (the API's /defaults projects them into this field); a
+// task's own value is a sparse override that `assembleTaskInput` layers onto
+// `input.project`, which every world-creating workflow already reads. Its size
+// and hibernation stay editable while the task runs: the platform applies a
+// resize when the world next parks (src/world/runners.ts).
+const computerField = (): FieldSpec => ({
+  name: 'computer',
+  type: 'computer',
+  label: 'Computer',
+  help: 'Where the agent works, and how big that machine is. Disk is free space for the task\'s files; E2B allows 25 GB or more, depending on the plan. A running task can grow its computer, and moves to it when it next pauses.',
   scopes: ALL,
-  bind: 'project',
+  bind: 'computer',
+  mutable: 'always',
 });
 
 export interface EventSchemaDecl {
@@ -472,7 +478,8 @@ export const MANIFESTS: WorkflowManifest[] = [
       agentField('do', 'Agent', 'always'),
       baseField(),
       targetField(),
-      agentEnvironmentField(),
+      repoBranchesField(),
+      computerField(),
       reposField(),
       multiPrField(),
       copyGlobsField(),
@@ -512,7 +519,7 @@ export const MANIFESTS: WorkflowManifest[] = [
       { key: 'review', label: 'Review' },
       { key: 'done', label: 'End' },
     ],
-    params: [promptField(), agentField('do', 'Agent'), baseField(), agentEnvironmentField(), reposField(), confirmerField()],
+    params: [promptField(), agentField('do', 'Agent'), baseField(), computerField(), reposField(), confirmerField()],
   },
   {
     name: 'script-exec',
@@ -533,7 +540,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     ],
     params: [
       { name: 'command', type: 'text', label: 'Command', required: true, scopes: ['task'], bind: 'top', placeholder: 'npm test' },
-      agentEnvironmentField(),
+      computerField(),
       reposField(),
     ],
   },
@@ -549,7 +556,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     // goal delegates to softwareDev, so it shares the Do/Review machinery.
     roles: [DO_ROLE, ...(RESOLVE_AGENT_ENABLED ? [LEGACY_RESOLVE_ROLE] : []), RESPONDER_ROLE, CONFIRM_ROLE],
     stages: SOFTWARE_DEV_STAGES,
-    params: [promptField(), agentField('do', 'Agent'), baseField(), targetField(), agentEnvironmentField(), reposField(), copyGlobsField(), remoteField(), landingAuthorityField(), responderField(), confirmerField()],
+    params: [promptField(), agentField('do', 'Agent'), baseField(), targetField(), repoBranchesField(), computerField(), reposField(), copyGlobsField(), remoteField(), landingAuthorityField(), responderField(), confirmerField()],
   },
   {
     name: 'merge-only',
@@ -573,7 +580,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     params: [
       { name: 'branch', type: 'branch', label: 'Branch to merge', required: true, scopes: ['task'], bind: 'top' },
       targetField(),
-      agentEnvironmentField(),
+      computerField(),
       reposField(),
       agentField('do', 'Agent'),
       confirmerField(),

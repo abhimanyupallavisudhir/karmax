@@ -253,7 +253,7 @@ describe('runner capacity and world lifecycle', () => {
     });
   });
 
-  it('yields during usage catchup, coalesces sweeps, and imports late events without cross-tenant attribution', async () => {
+  it('yields during usage catchup, coalesces sweeps, imports late events, and books another tenant\'s execution to it', async () => {
     const store = (await Store.create(':memory:'));
     const organization = (await store.createOrganization({ name: 'Metered', ownerUserId: 'owner' }));
     const project = (await store.createProject('Cloud', {}, organization.id));
@@ -276,14 +276,66 @@ describe('runner capacity and world lifecycle', () => {
     expect(recordsAtYield).toBeGreaterThan(0);
     expect(recordsAtYield).toBeLessThan(events.length);
     expect(attribution).toHaveBeenCalledTimes(2);
-    expect(record.mock.calls[0]![0]).not.toHaveProperty('taskId');
+    expect(record.mock.calls[0]![0]).toMatchObject({ taskId: foreignTask.id, projectId: foreign.id, organizationId: foreign.organizationId });
     expect(record.mock.calls[1]![0]).toMatchObject({ taskId: task.id, projectId: project.id, organizationId: organization.id });
-    expect((await store.recordedUsageEventIds(events.map(event => `usage:e2b:${event.id}`))).size).toBe(550);
-    expect((await store.recordedUsageEventIds([])).size).toBe(0);
+    expect((await store.recordedUsageEvents(events.map(event => `usage:e2b:${event.id}`))).size).toBe(550);
+    expect((await store.recordedUsageEvents([])).size).toBe(0);
     events.push({ ...events[1]!, id: 'late-execution', startedAt: 0, endedAt: 1000 });
     await lifecycle.sweep();
     expect(record).toHaveBeenCalledTimes(551);
-    expect((await store.usageSummary(organization.id)).events).toBe(551);
+    expect((await store.usageSummary(organization.id)).events).toBe(550);
+    expect((await store.usageSummary(foreign.organizationId!)).events).toBe(1);
+    (await store.close());
+  });
+
+  // One E2B account connected to several organizations reports every
+  // organization's executions to each of them. Whichever organization's key
+  // read the feed first used to claim them all as its own, "unattributed".
+  it('books a shared provider account\'s executions to the organization that created each sandbox', async () => {
+    const store = (await Store.create(':memory:'));
+    const first = (await store.createOrganization({ name: 'First', ownerUserId: 'one' }));
+    const second = (await store.createOrganization({ name: 'Second', ownerUserId: 'two' }));
+    const firstProject = (await store.createProject('Mine', {}, first.id));
+    const secondProject = (await store.createProject('Theirs', {}, second.id));
+    const mine = (await createTask(store, firstProject.id, 'Mine'));
+    const theirs = (await createTask(store, secondProject.id, 'Theirs'));
+    for (const organization of [first, second])
+      (await store.upsertWorldProviderConnection({ organizationId: organization.id, provider: 'e2b',
+        credentialHandle: `test:e2b:${organization.id}`, enabled: true }));
+    const event = (id: string, labels: { taskId?: string; organizationId?: string }) => ({ id, sandboxId: `sandbox-${id}`,
+      ...labels, startedAt: 1000, endedAt: 2000, activeMs: 1000, cpu: 2, memoryMb: 2048 });
+    const events = [
+      event('mine', { taskId: mine.id, organizationId: first.id }),
+      // Sandboxes created before the organization label: the task decides.
+      event('theirs-legacy', { taskId: theirs.id }),
+      // A labelled sandbox outlives its deleted task; its organization is still known.
+      event('theirs-deleted', { taskId: 'task_deleted', organizationId: second.id }),
+      // Unlabelled and its task is gone: no organization can be shown to own it.
+      event('unknown', { taskId: 'task_gone' }),
+      event('misbooked', { taskId: theirs.id }),
+      event('no-such-organization', { taskId: 'task_other', organizationId: 'org_missing' }),
+    ];
+    // Booked to the wrong organization by the earlier first-come sync.
+    (await store.recordUsage({ id: 'usage:e2b:misbooked', organizationId: first.id, provider: 'e2b', kind: 'world.active',
+      quantity: 1, unit: 'second', costMicros: 37, startedAt: 1000, endedAt: 2000, fundingSource: 'byok',
+      metadata: { source: 'provider-lifecycle', executionId: 'misbooked', sandboxId: 'sandbox-misbooked' } }));
+    const worlds = new WorldRegistry();
+    worlds.register({ kind: 'e2b', parkable: true, listUsageEvents: vi.fn(async () => ({ events })) } as any);
+    const lifecycle = new WorldLifecycleManager(store, worlds, {} as any);
+
+    await lifecycle.sweep(Date.UTC(2026, 9, 8, 12));
+    await lifecycle.sweep(Date.UTC(2026, 9, 9, 13));
+
+    const row = async (id: string) => (await store.db.prepare(
+      'SELECT organizationId, projectId, taskId FROM usage_events WHERE id=?').get(`usage:e2b:${id}`)) as any;
+    expect(await row('mine')).toEqual({ organizationId: first.id, projectId: firstProject.id, taskId: mine.id });
+    expect(await row('theirs-legacy')).toEqual({ organizationId: second.id, projectId: secondProject.id, taskId: theirs.id });
+    expect(await row('theirs-deleted')).toEqual({ organizationId: second.id, projectId: null, taskId: null });
+    expect(await row('misbooked')).toEqual({ organizationId: second.id, projectId: secondProject.id, taskId: theirs.id });
+    expect(await row('unknown')).toBeUndefined();
+    expect(await row('no-such-organization')).toBeUndefined();
+    expect((await store.usageSummary(first.id)).events).toBe(1);
+    expect((await store.usageSummary(second.id)).events).toBe(3);
     (await store.close());
   });
 
@@ -293,7 +345,8 @@ describe('runner capacity and world lifecycle', () => {
     const store = (await Store.create(':memory:'));
     const organization = (await store.createOrganization({ name: 'Busy', ownerUserId: 'owner' }));
     (await store.upsertWorldProviderConnection({ organizationId: organization.id, provider: 'e2b', credentialHandle: 'test:e2b', enabled: true }));
-    const event = (id: string) => ({ id, sandboxId: id, startedAt: 1000, endedAt: 2000, activeMs: 1000, cpu: 1, memoryMb: 512 });
+    const event = (id: string) => ({ id, sandboxId: id, organizationId: organization.id,
+      startedAt: 1000, endedAt: 2000, activeMs: 1000, cpu: 1, memoryMb: 512 });
     const listUsageEvents = vi.fn(async (_organizationId: string, _since?: number, resumeAt?: number) =>
       resumeAt === undefined ? { events: [event('newest')], resumeAt: 100 }
         : resumeAt === 100 ? { events: [event('middle')], resumeAt: 200 } : { events: [event('oldest')] });
@@ -557,6 +610,32 @@ describe('runner capacity and world lifecycle', () => {
     const lifecycle = new WorldLifecycleManager(store, worlds, {} as any, 1_000);
     expect(await lifecycle.sweep(Date.now() + 1)).toBe(1);
     expect((await store.worldState(world.handle.id))).toBe('hibernated');
+  });
+
+  it('moves a parked world to a machine of its task\'s new size at once', async () => {
+    const store = (await Store.create(':memory:'));
+    // Hibernation is a week away: only the resize can explain an early one.
+    const project = (await store.createProject('Resize', { resources: { cpu: 2, memoryMb: 2048 } }));
+    const worlds = new WorldRegistry();
+    const task = await store.createTask({ projectId: project.id, title: 'Out of disk', workflow: 'software-dev',
+      workflowVersion: '1.27.0', params: { prompt: 'x' } });
+    const world = await worlds.create('memory', { taskId: task.id, base: 'main' });
+    world.handle.meta = { projectId: project.id, computer: { cpu: 2, memoryMb: 2048 } };
+    world.handle = (await store.registerWorld(world.handle, project.id)) as typeof world.handle;
+    (await store.saveWorldCheckpoint({ id: 'checkpoint-r', worldId: world.handle.id, generation: 1, projectId: project.id,
+      runnerPoolId: 'local', environmentDigest: 'test', repos: [], createdAt: Date.now() }));
+    (await store.setWorldState(world.handle, 'parked'));
+    const notices: string[] = [];
+    const lifecycle = new WorldLifecycleManager(store, worlds, { addNotice: async (_id: string, text: string) => { notices.push(text); } } as any, 1_000);
+    // Same size: nothing happens.
+    expect(await lifecycle.sweep(Date.now() + 1)).toBe(0);
+    expect((await store.worldState(world.handle.id))).toBe('parked');
+    await store.patchTaskParams(task.id, { computer: { diskGb: 50 } });
+    expect(await lifecycle.sweep(Date.now() + 1)).toBe(1);
+    expect((await store.worldState(world.handle.id))).toBe('hibernated');
+    expect(notices).toEqual([expect.stringContaining('resized to 2 CPU · 2 GB · 50 GB disk')]);
+    expect((await store.eventsOfType(task.id, 'world.hibernated')).at(-1)?.payload).toMatchObject({
+      resize: { from: { cpu: 2, memoryMb: 2048 }, to: { cpu: 2, memoryMb: 2048, diskGb: 50 } } });
   });
 
   it('never hibernates a world holding proposed output that is not saved yet', async () => {

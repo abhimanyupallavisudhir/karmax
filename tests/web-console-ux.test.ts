@@ -65,13 +65,13 @@ describe('websocket reconnect', () => {
 describe('profile account controls', () => {
   it('offers a plain-language export of all data linked to the signed-in user', () => {
     expect(app).toContain('id="export-user-data"');
-    expect(app).toContain('Export your data');
+    expect(app).toContain('Your data');
     expect(app).toContain('/api/user/export');
   });
 
   it('lets an unverified user resend their confirmation email from the email row', () => {
     expect(app).toContain('id="profile-resend-confirmation"');
-    expect(app).toContain('Resend confirmation email');
+    expect(app).toContain('>Resend confirmation<');
     expect(app).not.toContain('confirmation pending');
     const handler = handlerAfter("$('#profile-resend-confirmation')?.addEventListener");
     expect(handler).toContain('resendConfirmationEmail');
@@ -89,7 +89,7 @@ describe('profile account controls', () => {
   });
 
   it('offers a masked password row and a complete change-password panel', () => {
-    expect(app).toContain('********');
+    expect(app).toContain('aria-label="Password is set">••••••••<');
     expect(app).toContain('data-profile-edit="password"');
     expect(app).toContain('id="profile-password-panel"');
     expect(app).toContain('id="profile-current-password"');
@@ -113,9 +113,8 @@ describe('organization data controls', () => {
     const end = app.indexOf('function pendingInvitationRow', start);
     expect(start).toBeGreaterThan(-1);
     const advanced = app.slice(start, end);
-    expect(advanced).toContain('Export organization data');
     expect(advanced).toContain('readable JSON archive');
-    expect(advanced).toContain('Passwords, tokens, and stored credentials are never included.');
+    expect(advanced).toContain('Passwords, tokens and stored credentials are never included.');
     expect(advanced).toContain('id="export-organization"');
   });
 });
@@ -143,8 +142,6 @@ describe('forms report their failures', () => {
     "row.querySelector('.resource-delete').addEventListener",
     "box.querySelectorAll('.service-delete')",
     "box.querySelector('#environment-save')?.addEventListener",
-    "$('#main').querySelectorAll('[data-inbox-toggle]')",
-    "$('#inbox-read-all')?.addEventListener",
   ];
   for (const anchor of anchors) {
     it(`${anchor} surfaces the error`, () => {

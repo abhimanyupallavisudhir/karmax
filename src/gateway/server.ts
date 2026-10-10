@@ -1,3 +1,4 @@
+import { computerDefaults, saveOrganizationComputer, saveProjectComputer, splitComputerValues } from '../platform/computer-settings.js';
 import { REPOSITORY_ROUTE } from '../world/resource-repository.js';
 import { clientAddress, ClientRequestLimits } from './client-address.js';
 import { keepAuthorized, socketLifetime } from './socket-lifetime.js';
@@ -18,6 +19,9 @@ import { probeConnection } from '../mcp/connections/probe.js';
 import { McpConnections, validateMcpSelection } from '../mcp/connections/store.js';
 import { registrySearch } from '../mcp/connections/registry.js';
 import { beginOAuth, finishOAuth, mcpClientMetadata, MCP_CLIENT_METADATA_PATH } from '../mcp/connections/oauth.js';
+import { AppGrants, isAppBearer, sessionCapabilities, type AppGrant } from '../auth/app-grants.js';
+import { OAuthServer } from '../auth/oauth-server.js';
+import { OAuthRoutes, appGrantRouteCapability } from './oauth-routes.js';
 import { publicModelFetch, publicUrl } from '../mcp/connections/http.js';
 import { sharingPolicy, currentShare, createShare, revokeShare, publicShare, publicConversationHtml } from './conversation-sharing.js';
 import http from 'node:http';
@@ -29,8 +33,7 @@ import { fileURLToPath } from 'node:url';
 import { WebSocket as WebSocketClient, WebSocketServer } from 'ws';
 import type { Client } from '@temporalio/client';
 import { KarmaxApi, CapabilityError, ValidationError } from '../platform/api.js';
-import type { EvalResult } from '../domain/search.js';
-import type { ChildTaskSummary, KarmaxEvent, TaskView } from '../domain/types.js';
+import type { ChildTaskSummary, KarmaxEvent, Organization, TaskView } from '../domain/types.js';
 import { BRAND_FILES, brandIconOf, isBrandIcon, siteNameError, siteNameOf, BRAND } from '../domain/brand.js';
 import { Store } from '../store/db.js';
 import { ProjectTransfers, ProjectTransferError } from '../platform/project-transfer.js';
@@ -59,19 +62,23 @@ import { SIG as WORKFLOW_SIG } from '../workflows/names.js';
 import { findFreePortFrom } from '../util/ports.js';
 import { expandPath } from '../util/expand.js';
 import { withTimeout } from '../util/timeout.js';
-import { AgentAuthority, AgentSpec, AuthorizationSelection, Avatar, Provider, Project, ProjectConfig, PrincipalRef, ProjectPrincipalRef, ResourceAttachment, ResourceRevision, ResourceTarget, normalizeUrgency } from '../domain/types.js';
+import { AgentAuthority, AgentSpec, AuthorizationSelection, Avatar, Provider, Project, ProjectConfig, PrincipalRef, ProjectPrincipalRef, ResourceAttachment, ResourceRevision, ResourceTarget, WorldLocation, normalizeUrgency } from '../domain/types.js';
+import { dotenvFile, dotenvSecretName, parseDotenv } from '../domain/dotenv.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
-import { acpModels, claudeModelCatalog, claudeModels, codexModelCatalog, codexModels, opencodeModels, mergeModels,
+import { MIN_CLI_VERSION, WorkspaceService } from '../world/workspace.js';
+import { WorkspaceConflict } from '../world/resources.js';
+import { acpModels, claudeModelCatalog, claudeModels, codexModelCatalog, codexModels, opencodeModels, openCodeKeyModels, mergeModels,
   modelDiscoveryFailureReason, type ModelCatalog } from '../agent/models.js';
+import { ARTIFICIAL_ANALYSIS_KEY_ENV, ArtificialAnalysis, toBenchmarks, type ModelBenchmarks } from '../agent/model-benchmarks.js';
 import type { IdentityService } from '../auth/identity.js';
 import type { RepositoryFiles } from '../store/project-environment.js';
 import { AuthorizationGrantError, ORGANIZATION_GRANT_CEILING, type AuthorizationService } from '../platform/authorization.js';
 import { TOOL_CAPABILITY, CAPABILITY_GROUPS, OWN_TASK_CAPABILITIES, ORGANIZATION_WIKI_WRITE_DENIED, allows, type Capability } from '../platform/capabilities.js';
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
-import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
+import { EXPLANATIONS_ENABLED, RESOLVE_AGENT_ENABLED } from '../config/features.js';
 import { hostLocal } from '../config/deployment.js';
-import { apiKeyEnv, credentialAliases, isAgentProvider, isLoginProvider } from '../agent/provider-registry.js';
+import { apiKeyEnv, canonicalModelProvider, credentialAliases, isAgentProvider, isLoginProvider, MODEL_PROVIDERS } from '../agent/provider-registry.js';
 import { WorldRegistry } from '../world/registry.js';
 import { worldHandleForView } from '../world/resolve.js';
 import { LocalObjectStore, type ObjectStore } from '../store/objects.js';
@@ -91,7 +98,7 @@ import { credentialResource, resourceDriverCatalog, resourceSecretHandle, snapsh
 import { managedRepoPath } from '../world/worktree.js';
 import { paths } from '../config/paths.js';
 import { ensureProjectWikiRepositoryAsync, setProjectWikiRemote } from '../wiki/repository.js';
-import { worldRepos, worldWorkingRelativePath, type WorldHandle } from '../world/types.js';
+import { worldRepos, worldWorkingDirectory, worldWorkingRelativePath, type WorldHandle } from '../world/types.js';
 import { enumerateCredentials, resolveCredentials, resolveExplanationCredentials } from '../platform/credentials.js';
 import { credPolicyKey, gatherCredentialSources, parsePolicy, readPolicyLayers, remapCredentialPolicy } from '../platform/credential-sources.js';
 import { ITEM_FIELDS, VaultItems, itemHandle, weakensProtection } from '../autonomy/vault-items.js';
@@ -158,6 +165,11 @@ export interface GatewayDeps {
    *  rest rather than offering a switch that silently cannot deliver. */
   deliveryChannels?: string[];
   remoteAccess?: RemoteAccessController;
+  /** Fetches OAuth client ID metadata documents (default: the outbound SSRF guard). */
+  oauthMetadataFetch?: typeof fetch;
+  /** Model benchmarks for the model picker (default: the bundled snapshot,
+   *  refreshed daily when ARTIFICIAL_ANALYSIS_API_KEY is set). */
+  artificialAnalysis?: ArtificialAnalysis;
 }
 
 /** Coarse HTTP operation → capability binding. KarmaxApi performs the same check
@@ -174,6 +186,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/tasks\/[^/]+\/conversation-share$/.test(p)) return 'task:conversation:share';
   if (p === MCP_CLIENT_METADATA_PATH && read) return 'none';
   if (p === '/api/meta' || p === '/api/session' || p.startsWith('/api/health/')) return 'none';
+  const appGrantRoute = appGrantRouteCapability(p);
+  if (appGrantRoute) return appGrantRoute;
   if (p === '/api/settings/access') return url?.searchParams.get('projectId') ? 'project:read' : 'organization:read';
   if (p === '/api/platform') return 'workflow:read';
   if (p === '/api/resource-drivers') return 'workflow:read';
@@ -297,8 +311,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
     const scoped = Boolean(url?.searchParams.get('projectId') || url?.searchParams.get('organizationId'));
     return scoped ? (read ? 'profile:read' : 'profile:write') : (read ? 'settings:read' : 'settings:write');
   }
-  if (p === '/api/models' || p === '/api/schema' || p === '/api/events/catalog' || p === '/api/contributions') return 'workflow:read';
-  if (p === '/api/search' && read) return 'none'; // each project is authorized in searchProjects
+  if (p === '/api/models' || p === '/api/models/benchmarks' || p === '/api/schema' || p === '/api/events/catalog' || p === '/api/contributions') return 'workflow:read';
+  if (p === '/api/search' && read) return 'none'; // each project is authorized in searchEverywhere
   if (p === '/api/search/fields') return 'task:read';
   if (p === '/api/attachments' || p === '/api/files') return 'task:create';
   if (p === '/api/conversation-imports') return 'task:create';
@@ -322,6 +336,14 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/projects\/[^/]+\/(defaults|settings|quick-settings)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/explanation-settings$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/members/.test(p)) return read ? 'project:read' : 'project:edit';
+  // The tavya CLI (wiki planned/tavya-cli). Grants to read a resource are a
+  // read, whatever the method; saving one is a settings write (or a task edit).
+  if (/^\/api\/projects\/[^/]+\/workspace$/.test(p) || /^\/api\/projects\/[^/]+\/git-credential$/.test(p)) return 'repository:read';
+  if (/^\/api\/organizations\/[^/]+\/cli-git-credentials$/.test(p)) return read ? 'organization:read' : 'organization:edit';
+  if (/^\/api\/projects\/[^/]+\/secrets\/values$/.test(p)) return 'project:secret:use';
+  if (/^\/api\/projects\/[^/]+\/resources\/[^/]+\/read-grant$/.test(p)) return 'project:settings:read';
+  if (/^\/api\/tasks\/[^/]+\/workspace$/.test(p) || /^\/api\/tasks\/[^/]+\/resources\/[^/]+\/read-grant$/.test(p)) return 'task:read';
+  if (/^\/api\/tasks\/[^/]+\/resources\/[^/]+\/append-grant$/.test(p) || /^\/api\/tasks\/[^/]+\/(?:import-local|exec)$/.test(p)) return 'task:edit';
   if (/^\/api\/projects\/[^/]+\/(?:repositories|repository-sources|checkout)(?:\/|$)/.test(p))
     return read ? 'repository:read' : 'repository:write';
   if (/^\/api\/projects\/[^/]+\/github-merge-eligibility$/.test(p)) return 'project:read';
@@ -353,7 +375,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/\/review-action/.test(p) || /\/artifact$/.test(p) || /\/preview\//.test(p) || /\/desktop$/.test(p)) return 'task:review:execute';
   if (/\/artifacts(?:\/promote)?$/.test(p) || /^\/api\/artifacts\//.test(p)) return read ? 'task:read' : 'task:review:execute';
   if (/\/preview-leases$/.test(p) || /^\/api\/preview-leases\//.test(p)) return read ? 'task:read' : 'task:review:execute';
-  if (/\/signal$/.test(p)) return 'task:signal';
+  if (/\/signal$/.test(p) || /^\/api\/tasks\/[^/]+\/agents\/[^/]+\/stop$/.test(p)) return 'task:signal';
   if (/^\/api\/tasks\/[^/]+\/messages$/.test(p)) return 'task:conversation:message';
   if (/\/escalate$/.test(p)) return 'task:escalate';
   if (p.startsWith('/api/tasks/')) return read ? 'task:read' : method === 'DELETE' ? 'task:delete' : 'task:edit';
@@ -466,13 +488,19 @@ function projectPrincipalFromBody(value: unknown, organizationId: string): Proje
 
 /** What a refused grant tells the client: which agent, so the console can ask
  * about exactly that one (`chooseAuthorizationGrant`). */
-function grantRefusal(e: unknown): { code?: string; participant?: string; authorization?: AuthorizationSelection } {
-  const error = e as { code?: unknown; participant?: unknown; authorization?: AuthorizationSelection } | undefined;
+function grantRefusal(e: unknown): { code?: string; participant?: string; authorization?: AuthorizationSelection; credentialGrants?: string[] } {
+  const error = e as { code?: unknown; participant?: unknown; authorization?: AuthorizationSelection; credentialGrants?: unknown } | undefined;
   return {
     ...(error?.code ? { code: String(error.code) } : {}),
     ...(typeof error?.participant === 'string' ? { participant: error.participant,
       ...(error.authorization ? { authorization: error.authorization } : {}) } : {}),
+    ...(Array.isArray(error?.credentialGrants) ? { credentialGrants: error.credentialGrants.map(String) } : {}),
   };
+}
+
+/** `credentialGrants` of a gap or request body: vault grants, else absent. */
+function credentialGrantsFromBody(value: unknown): string[] | undefined {
+  return Array.isArray(value) && value.length ? value.map(String) : undefined;
 }
 
 /** `acceptAttenuation`: `true` for every agent, or the participant keys. */
@@ -603,6 +631,7 @@ const LIVE_OUTPUT_BUFFER_BYTES = 64 * 1024;
 const WATCHED_TASK_EVENTS = new Set(['agent.output', 'timing']);
 /** …and these only from its own project; lifecycle events still reach inbox and insights. */
 const TASK_DETAIL_EVENTS = new Set([...WATCHED_TASK_EVENTS, 'agent.activity', 'conversation.message', 'conversation.explanation']);
+const EXPLANATIONS_OFF = 'Explanations are turned off';
 
 const USER_CAPS = ['*'];
 const PREVIEW_METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']);
@@ -640,6 +669,8 @@ interface Session {
   identitySessionId?: string;
   email?: string;
   expiresAt?: number;
+  /** The app grant (CLI login, MCP client, personal token) this session stands for. */
+  appGrant?: AppGrant;
 }
 
 /** Enterprise SSO as the sign-in card shows it: configured, and whether its
@@ -676,6 +707,9 @@ export class Gateway {
   /** Discovery spawns provider CLIs (seconds): pages read the last catalog while
    *  one background load per organization refreshes it. */
   private modelCatalog = new SwrCache<string, ModelCatalog>((organizationId) => this.discoverModels(organizationId), 5 * 60_000);
+  private get artificialAnalysis(): ArtificialAnalysis {
+    return this.deps.artificialAnalysis ??= new ArtificialAnalysis({ apiKey: process.env[ARTIFICIAL_ANALYSIS_KEY_ENV] });
+  }
   private identityTokens = new Map<string, { apiToken: string; fingerprint: string; expiresAt: number; userId: string }>();
   private fanout!: DurableEventFanout;
   /** Remotes verified during this gateway process. Persisted links are retried
@@ -683,6 +717,12 @@ export class Gateway {
   private wikiWork = new Set<Promise<void>>();
   /** Projects whose local wiki repository this gateway process has ensured. */
   private wikiLocalReady = new Set<string>();
+  /** App grants and the OAuth server they come from (`oauth-routes.ts`). */
+  private appGrants!: AppGrants;
+  private oauthRoutes!: OAuthRoutes;
+  /** Marks the remote MCP server's loopback `/api` calls as this gateway's own. */
+  private loopbackSecret = crypto.randomBytes(24).toString('hex');
+  private loopbackUrl?: string;
   private wikiRemotesReady = new Set<string>();
   private wikiRemotesProvisioning = new Set<string>();
   private wikiRemoteRetryAfter = new Map<string, number>();
@@ -706,8 +746,17 @@ export class Gateway {
 
   private async initialize(deps: GatewayDeps) {
 
+    this.appGrants = new AppGrants(deps.store);
+    this.oauthRoutes = new OAuthRoutes({ store: deps.store, grants: this.appGrants, authorization: deps.authorization,
+      oauth: new OAuthServer(deps.store, this.appGrants, { fetchMetadata: deps.oauthMetadataFetch }),
+      hostLocal: () => this.hostLocal,
+      bearerValid: async (token) => isAppBearer(token) ? !!(await this.appGrantAuth(token)) : !!(await deps.tokens.verify(token)),
+      loopback: () => this.loopbackUrl ? { baseUrl: this.loopbackUrl, headers: { 'x-karmax-loopback': this.loopbackSecret } } : undefined,
+      userName: async (userId) => deps.identity?.userById(userId) });
     if (deps.identity) {
-      deps.tokens.connectIdentitySessions((sessionId, userId) => deps.identity!.sessionActive(sessionId, userId));
+      // A principal token minted for an app grant names the grant as its session.
+      deps.tokens.connectIdentitySessions((sessionId, userId) => sessionId.startsWith('grant_')
+        ? this.appGrants.live(sessionId, userId) : deps.identity!.sessionActive(sessionId, userId));
       deps.identity.connectSessionRevocation?.(async userId => {
         authorizationChanged(); // sessions live in the identity database, outside the Store's watch
         for (const [key, cached] of this.identityTokens) if (cached.userId === userId) {
@@ -845,7 +894,7 @@ export class Gateway {
         // token keeps the capabilities it was minted with for ten minutes, so
         // a narrowed grant would otherwise wait for it to rotate (GW-13).
         if (auth.userId && this.deps.authorization)
-          return !!projectId && allows((await this.deps.authorization.capabilitiesAsync(`user:${auth.userId}`, projectId)), 'task:event:read');
+          return !!projectId && allows((await this.personCaps(auth, projectId)), 'task:event:read');
         return (await this.deps.tokens.check(auth.apiToken, 'task:event:read', projectId ? { projectId, taskId } : undefined)).ok;
       })();
       // A failed lookup is not a decision: the next event asks again.
@@ -1208,13 +1257,31 @@ export class Gateway {
           ? `\n\nDurable monitor evidence:\n${JSON.stringify(event.payload.evidence, null, 2)}` : '';
         const token = (await this.deps.tokens.mintPrincipal('system:github-recovery', ['*'],
           event.projectId, 10 * 60_000, project.organizationId)).token;
+        const title = `Repair ${missing ? 'missing' : 'failed'} GitHub workflow: ${event.payload.workflow}`;
+        const opening = missing
+          ? `A post-merge GitHub deployment workflow run was not created for ${event.payload.repository}.`
+          : `A post-merge GitHub workflow failed for ${event.payload.repository}.`;
+        // A workflow that is still red while its repair is open is that
+        // repair's business: tell it, rather than start a second one.
+        const open = missing ? undefined : (await this.deps.store.listTasks(event.projectId)).find((task) =>
+          task.title === title && String(task.params?.prompt ?? '').startsWith(opening)
+          && !task.params?.archived && !['done', 'cancelled', 'failed'].includes(task.lastView?.status ?? ''));
+        if (open) {
+          (await this.deps.store.kvSet(key, open.id));
+          (await this.emitTaskEvent({ taskId: open.id, type: event.type, ts: Date.now(), payload: event.payload }));
+          await this.deps.api.postTaskMessage(token, open.id, { text: [
+            `${event.payload.workflow} failed again on ${event.payload.branch} while this repair is open.`,
+            `Exact revision: ${event.payload.headSha || 'not reported'}`,
+            `Run: ${event.payload.url || `GitHub Actions run ${event.payload.runId}`} (attempt ${event.payload.attempt})`,
+            'If it is the failure you are repairing, nothing more is needed; otherwise repair it here too.',
+          ].join('\n') }).catch(() => undefined);
+          continue;
+        }
         const task = await this.deps.api.createTask(token, {
           projectId: event.projectId,
-          title: `Repair ${missing ? 'missing' : 'failed'} GitHub workflow: ${event.payload.workflow}`,
+          title,
           prompt: [
-            missing
-              ? `A post-merge GitHub deployment workflow run was not created for ${event.payload.repository}.`
-              : `A post-merge GitHub workflow failed for ${event.payload.repository}.`,
+            opening,
             `Workflow: ${event.payload.workflow}`,
             `Conclusion: ${event.payload.conclusion}`,
             `Exact revision: ${event.payload.headSha || 'not reported'}`,
@@ -1222,6 +1289,8 @@ export class Gateway {
               ? `Successful prerequisite run: ${event.payload.url || `GitHub Actions run ${event.payload.runId}`}${origin}`
               : `Run: ${event.payload.url || `GitHub Actions run ${event.payload.runId}`}${origin}`,
             incidentLine,
+            ...(!missing && Number(event.payload.attempt) > 1
+              ? [`This is attempt ${event.payload.attempt}: the run failed again after a rerun, so the failure reproduces.`] : []),
             evidence,
             '',
             'Inspect the complete GitHub evidence and classify it before changing code. For a missing run, check workflow schema/registration and triggers first; the evidence distinguishes direct API absence from webhook delay and records file/API permission failures. If a run exists, distinguish queued/waiting environment approval from a terminal failure. If it is a transient GitHub runner failure, rerun the exact revision once and verify it. If it is billing, permissions, protected-environment approval, secrets, or repository configuration, report the precise human action required and do not manufacture a code change. If it is a deterministic deployment or code defect, repair it through the normal reviewed pull-request workflow and verify recovery. The already-merged originating task is immutable and must remain complete.',
@@ -1357,6 +1426,7 @@ export class Gateway {
     });
     const internalUrl = `http://127.0.0.1:${port}`;
     const directHost = bindHost === '0.0.0.0' || bindHost === '::' ? '127.0.0.1' : bindHost;
+    this.loopbackUrl = `http://${directHost.includes(':') ? `[${directHost}]` : directHost}:${port}`;
     const publicUrl = process.env.KARMAX_PUBLIC_URL?.trim().replace(/\/$/, '') || `http://${directHost}:${port}`;
     // Webhooks give GitHub-backed stores low latency; this durable-state scan is
     // the recovery rail for missed deliveries, restarts, and non-GitHub remotes.
@@ -1653,8 +1723,11 @@ export class Gateway {
         { 'cache-control': 'no-store', 'content-length': '0' });
       return void res.end();
     }
-    if (this.deps.hosted && !p.startsWith('/api/health/') && !this.requestLimits.allow(this.clientAddress(req), p))
+    // The remote MCP server's own `/api` calls were counted as its `/mcp` request.
+    const loopback = req.headers['x-karmax-loopback'] === this.loopbackSecret;
+    if (this.deps.hosted && !loopback && !p.startsWith('/api/health/') && !this.requestLimits.allow(this.clientAddress(req), p))
       return this.json(res, 429, { error: 'too many requests; try again later' });
+    if (await this.oauthRoutes.handlePublic(req, res, url)) return;
     if (p.startsWith('/share/conversations/')) {
       const share = req.method === 'GET' ? (await publicShare(this.deps.store, p.slice('/share/conversations/'.length))) : undefined;
       const signedIn = !!(await this.deps.identity?.session(requestHeaders(req.headers)).catch(() => null));
@@ -2125,9 +2198,11 @@ export class Gateway {
       return this.json(res, 200, {
         agent: this.deps.agentInfo,
         version: this.deps.version ?? '1.0.0',
+        cli: { minVersion: MIN_CLI_VERSION },
         ...(consoleRevision ? { consoleRevision } : {}),
         timingEnabled: (await this.cachedTimingEnabled()),
         resolveAgentEnabled: RESOLVE_AGENT_ENABLED,
+        explanationsEnabled: EXPLANATIONS_ENABLED,
         cellId: this.deps.cellId ?? 'local',
         hosted: this.deps.hosted ?? false,
         hostLocal: this.hostLocal,
@@ -2144,6 +2219,7 @@ export class Gateway {
         sso: ssoSession(this.deps.identity),
         google: this.deps.identity?.googleEnabled ?? false,
         github: this.deps.identity?.githubEnabled ?? false,
+        modelBenchmarks: this.artificialAnalysis.available,
       });
     }
     if (p === '/api/health/live' && method === 'GET') return this.json(res, 200, { ok: true, ts: Date.now() });
@@ -2248,6 +2324,7 @@ export class Gateway {
       });
     }
     try {
+      if (await this.oauthRoutes.handleApi(req, res, url, { session, record: authRecord, identity: callerIdentity })) return;
       const sharingSettings = p.match(/^\/api\/(organizations|projects)\/([^/]+)\/conversation-sharing$/);
       if (sharingSettings) {
         const [, scope, id] = sharingSettings;
@@ -2338,7 +2415,7 @@ export class Gateway {
           if (!organization) continue;
           const membership = await store.organizationMembership(organization.id, subject.userId);
           const paymentAllowed = this.deps.identity && session.userId === subject.userId && this.deps.authorization
-            ? allows(await this.deps.authorization.capabilities(`user:${subject.userId}`, undefined, organization.id), 'payment:write')
+            ? allows(await this.personCaps(session, undefined, organization.id), 'payment:write')
             : (await this.deps.tokens.check(token, 'payment:write', { organizationId: organization.id })).ok;
           const canManage = membership?.role === 'owner' && paymentAllowed;
           subscriptions.push({ ...subscription, organizationName: organization.name, canManage: Boolean(canManage),
@@ -2554,17 +2631,24 @@ export class Gateway {
           allows(authRecord.caps, 'authorization:read'))));
       }
       if (p === '/api/organizations' && method === 'GET') {
-        const canAuditAll = Boolean(authRecord && allows(authRecord.caps, 'authorization:read'));
-        if (canAuditAll) return this.json(res, 200, (await store.listOrganizations()));
-        if (authRecord.organizationId)
-          return this.json(res, 200, [(await store.getOrganization(authRecord.organizationId))].filter(Boolean));
-        const scopedOrganizationIds = new Set([
-          ...(authRecord.projectId ? [(await store.getProject(authRecord.projectId))?.organizationId] : []),
-          ...(await __asyncCollections.map((authRecord.projectIds ?? []), async (projectId) => (await store.getProject(projectId))?.organizationId)),
-        ].filter((value): value is string => Boolean(value)));
-        if (scopedOrganizationIds.size)
-          return this.json(res, 200, (await __asyncCollections.map([...scopedOrganizationIds], async (id) => (await store.getOrganization(id)))).filter(Boolean));
-        return this.json(res, 200, (await store.listOrganizations(callerIdentity.humanSubject?.userId)));
+        const listed = async (): Promise<Organization[]> => {
+          const canAuditAll = Boolean(authRecord && allows(authRecord.caps, 'authorization:read'));
+          if (canAuditAll) return store.listOrganizations();
+          if (authRecord.organizationId)
+            return [(await store.getOrganization(authRecord.organizationId))].filter((o): o is Organization => Boolean(o));
+          const scopedOrganizationIds = new Set([
+            ...(authRecord.projectId ? [(await store.getProject(authRecord.projectId))?.organizationId] : []),
+            ...(await __asyncCollections.map((authRecord.projectIds ?? []), async (projectId) => (await store.getProject(projectId))?.organizationId)),
+          ].filter((value): value is string => Boolean(value)));
+          if (scopedOrganizationIds.size)
+            return (await __asyncCollections.map([...scopedOrganizationIds], async (id) => (await store.getOrganization(id))))
+              .filter((o): o is Organization => Boolean(o));
+          // A limited app grant lists only the organization it is limited to.
+          const grantOrganization = session.appGrant?.ceiling?.organizationId;
+          return (await store.listOrganizations(callerIdentity.humanSubject?.userId))
+            .filter((organization) => !grantOrganization || organization.id === grantOrganization);
+        };
+        return this.json(res, 200, (await store.withPreviousSlugs((await listed()))));
       }
       if (p === '/api/organizations' && method === 'POST') {
         const subject = requireHumanSubject(callerIdentity);
@@ -3195,7 +3279,8 @@ export class Gateway {
           const githubAccountId = subject.externalIdentities?.githubAccountId;
           return this.json(res, 200, await this.deps.githubApp.createRepository(connection.id, subject.userId,
             { name: String(b.name ?? ''), description: b.description ? String(b.description) : undefined,
-              private: b.private !== false, autoInit: b.autoInit !== false }, { accountId: githubAccountId }));
+              private: b.private !== false, autoInit: b.autoInit !== false,
+              ...(b.defaultBranch ? { defaultBranch: String(b.defaultBranch) } : {}) }, { accountId: githubAccountId }));
         } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
       }
       const organizationProjects = p.match(/^\/api\/organizations\/([^/]+)\/projects$/);
@@ -3204,9 +3289,9 @@ export class Gateway {
         if (method === 'GET') {
           // Same per-project filter as GET /api/projects: an organization member
           // sees the projects they can read, not every project in the tenant.
-          const principal = session.userId && this.deps.authorization && !authRecord?.projectId ? `user:${session.userId}` : undefined;
+          const person = session.userId && this.deps.authorization && !authRecord?.projectId;
           return this.json(res, 200, (await __asyncCollections.filter((await store.listProjects()), async (project) => project.organizationId === organizationId
-            && (!principal || allows((await this.deps.authorization!.capabilities(principal, project.id)), 'project:read')))));
+            && (!person || allows((await this.personCaps(session, project.id, project.organizationId)), 'project:read')))));
         }
         if (method === 'POST') {
           const b = await this.body(req);
@@ -3871,10 +3956,8 @@ export class Gateway {
         // An organization-scoped token discovers its own tenant's projects only.
         if (authRecord?.organizationId) return this.json(res, 200,
           projects.filter((x) => (x.organizationId ?? 'org_personal') === authRecord!.organizationId));
-        if (session.userId && this.deps.authorization) {
-          const principal = `user:${session.userId}`;
-          return this.json(res, 200, (await __asyncCollections.filter(projects, async (x) => allows((await this.deps.authorization!.capabilities(principal, x.id)), 'project:read'))));
-        }
+        if (session.userId && this.deps.authorization)
+          return this.json(res, 200, (await __asyncCollections.filter(projects, async (x) => allows((await this.personCaps(session, x.id, x.organizationId)), 'project:read'))));
         // Identity-backed deployments never legitimately reach here: a session
         // that cannot be attributed to a user or a scoped token sees nothing.
         // The bare return is single-user legacy mode (no identity service).
@@ -3930,7 +4013,7 @@ export class Gateway {
           if (!checked?.ok || checked.record?.projectId || checked.record?.projectIds?.length)
             throw new CapabilityError(`Missing organization permission ${cap}.`);
           if (scoped?.userId && this.deps.identity && this.deps.authorization
-            && !allows(await this.deps.authorization.capabilities(`user:${scoped.userId}`, undefined, org), cap))
+            && !allows(await this.personCaps(scoped, undefined, org), cap))
             throw new CapabilityError(`Missing organization permission ${cap}.`);
         };
         if (!destination) {
@@ -4019,7 +4102,7 @@ export class Gateway {
           // (including delegated agents) must remain within their minted scope.
           const forbidden = (await __asyncCollections.find(projects, async (project) => {
             if (session.userId && this.deps.authorization)
-              return !allows((await this.deps.authorization.capabilities(`user:${session.userId}`, project.id, project.organizationId)), 'project:edit');
+              return !allows((await this.personCaps(session, project.id, project.organizationId)), 'project:edit');
             return !(await this.deps.tokens.check(token, 'project:edit', {
               projectId: project.id,
               organizationId: project.organizationId,
@@ -4084,27 +4167,31 @@ export class Gateway {
           .filter((resource) => resource.driver === 'secret@1' && !stagedResourceCandidate(resource));
         const encodedName = projectSecrets[2] ? decodeURIComponent(projectSecrets[2]) : undefined;
         if (method === 'GET' && !encodedName) {
-          const names = await discoverEnvironmentNames(project, store, this.deps.githubApp);
-          const existing = new Set(resources.map((resource) => resource.target.kind === 'environment'
-            ? resource.target.name : resource.name));
+          const repositories = await projectRepositoryNames(project, store);
+          const declared = (name: string, repository: string) => resources.some((resource) => resource.target.kind === 'environment'
+            && resource.target.name === name && (!resource.target.dotenv
+              || anchorLocation(resource.target.dotenv, repositories).repository === repository));
+          // Suggestions are a convenience: GitHub being unreachable must not hide the secrets.
+          const suggested = (await discoverEnvironmentNames(project, store, this.deps.githubApp).catch(() => []))
+            .filter(({ name, repository }) => !declared(name, repository));
           return this.json(res, 200, { secrets: resources.map((resource) => ({
-            ...redactResource(resource),
-            file: resource.target.kind === 'path' ? resource.target.path : undefined,
-            variable: resource.target.kind === 'environment' ? resource.target.name : undefined,
-          })), suggestions: [...names].filter((name) => !existing.has(name)).sort() });
+            ...redactResource(resource), ...secretDestination(resource.target),
+          })), repositories, suggested, suggestions: [...new Set(suggested.map(({ name }) => name))].sort() });
         }
         if (method === 'POST' && !encodedName) {
           const body = await this.body(req);
-          const entries: Array<{ name: string; value: string; file?: string }> =
-            typeof body.env === 'string' ? parseEnvironmentValues(body.env)
-            : body.name ? [{ name: String(body.name), value: body.value == null ? '' : String(body.value),
-              file: body.file ? String(body.file) : undefined }] : [];
+          const repositories = await projectRepositoryNames(project, store);
+          let entries: SecretEntry[];
+          try { entries = secretEntries(body, repositories); }
+          catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
           if (!entries.length) return this.json(res, 400, { error: 'name/value or pasted env required' });
           const saved: ResourceAttachment[] = [];
+          const kept: string[] = [];
           try {
             for (const entry of entries) {
-              const existing = resources.find((resource) =>
-                resource.name === entry.name || (resource.target.kind === 'environment' && resource.target.name === entry.name));
+              const existing = resources.find((resource) => sameSecretDestination(resource, entry, repositories));
+              // `overwrite: false` keeps a stored value: it has no older version to go back to.
+              if (existing && body.overwrite === false && existing.credentialHandles[0]) { kept.push(existing.name); continue; }
               if (existing) {
                 // A new value becomes the resource's own secret; a stored
                 // handle may name someone else's (AU-40).
@@ -4112,8 +4199,7 @@ export class Gateway {
                   : existing.credentialHandles[0] ?? resourceSecretHandle(existing.id);
                 if (entry.value) (await this.deps.broker.registerHandle(handle, entry.value, organizationScope(project.organizationId)));
                 saved.push((await store.updateResourceAttachment(existing.id, {
-                  target: entry.file ? { kind: 'path', path: entry.file } : { kind: 'environment', name: entry.name },
-                  credentialHandles: [handle], enabled: true,
+                  target: entry.target, credentialHandles: [handle], enabled: true,
                   ...(entry.value ? { source: withoutVaultProjection(existing.source) } : {}),
                 })));
               } else {
@@ -4121,13 +4207,12 @@ export class Gateway {
                 const id = newId('resource'), handle = `resource:${id}:credential`;
                 (await this.deps.broker.registerHandle(handle, entry.value, organizationScope(project.organizationId)));
                 saved.push((await store.createResourceAttachment({ id, organizationId: project.organizationId,
-                  projectId: project.id, name: entry.name, driver: 'secret@1',
-                  target: entry.file ? { kind: 'path', path: entry.file } : { kind: 'environment', name: entry.name },
+                  projectId: project.id, name: entry.name, driver: 'secret@1', target: entry.target,
                   access: 'read', isolation: 'fork', source: { discovered: typeof body.env === 'string' },
                   credentialHandles: [handle], publish: 'discard' })));
               }
             }
-            return this.json(res, 200, { imported: saved.map(redactResource), secrets: saved.map(redactResource) });
+            return this.json(res, 200, { imported: saved.map(redactResource), secrets: saved.map(redactResource), kept });
           } catch (error) {
             return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
           }
@@ -4156,9 +4241,7 @@ export class Gateway {
         try {
           if (method === 'GET' && !sub) {
             const spec = (await environments.spec(project.id));
-            const { remoteName } = await import('../world/provision-git.js');
-            const repositories = [...new Set([...(project.config.repos ?? []).map(remoteName),
-              ...(await store.listProjectRepositories(project.id)).map(({ repository }) => repository.name)])];
+            const repositories = await projectRepositoryNames(project, store);
             const { environmentBase } = await import('../world/project-runtime.js');
             const bases = new Map<string, string | undefined>();
             const builds = [];
@@ -4201,13 +4284,15 @@ export class Gateway {
             const spec = (await environments.spec(project.id));
             if (!spec) return this.json(res, 400, { error: 'accept or configure an environment proposal first' });
             const body = await this.body(req);
-            const provider = String(body.provider ?? (await store.effectiveProjectConfig(project)).worldProvider ?? 'worktree');
+            const executionConfig = (await store.effectiveProjectConfig(project));
+            const provider = String(body.provider ?? executionConfig.worldProvider ?? 'worktree');
             const digest = environments.digest(spec);
             const connection = ['e2b', 'daytona'].includes(provider)
               ? (await this.deps.providerConnections?.resolve(project.organizationId, provider)) : undefined;
             const { buildEnvironment } = await import('../world/environment-build.js');
             const attempt = await beginEnvironmentBuild(store, project.id, buildScope, provider, digest);
             void buildEnvironment({ provider, projectId: project.id, digest, spec, buildId: attempt.buildId,
+              resources: (await store.effectiveProjectConfig(project)).resources,
               onBuilderCreated: id => recordEnvironmentBuilder(store, attempt, id),
               assertActive: async () => { if (!await environmentBuildIsActive(store, attempt)) throw new Error('Environment build was invalidated.'); },
               ...(connection ? { connection: { apiKey: connection.apiKey,
@@ -4694,6 +4779,97 @@ export class Gateway {
           }
         }
       }
+      // `tavya git-credential`: the organization lends its GitHub App to members'
+      // Git (opt-in, off by default). One repository of the project, contents
+      // only, write when the caller may write to repositories, else read.
+      const gitCredential = p.match(/^\/api\/projects\/([^/]+)\/git-credential$/);
+      if (gitCredential && method === 'POST') {
+        const project = await store.getProject(gitCredential[1]!);
+        if (!project?.organizationId) return this.json(res, 404, { error: 'project not found' });
+        if ((await store.kvGet(cliGitCredentialsKey(project.organizationId))) !== 'enabled')
+          return this.json(res, 403, { error: `${(await store.getOrganization(project.organizationId))?.name ?? 'This organization'} does not lend its GitHub access to the CLI; `
+            + 'use your own GitHub credentials, or ask an administrator to allow it (Organization settings → GitHub)' });
+        if (!this.deps.githubApp) return this.json(res, 503, { error: 'GitHub is not connected' });
+        const body = await this.body(req);
+        const wanted = typeof body.repository === 'string' ? body.repository : '';
+        const wiki = (await store.projectWiki(project.id))?.repository;
+        const repository = [...(await store.listProjectRepositories(project.id)).map((entry) => entry.repository), ...(wiki ? [wiki] : [])]
+          .find((candidate) => { try { return sameRepository(candidate.sshUrl, wanted); } catch { return false; } });
+        if (!repository) return this.json(res, 404, { error: 'repository is not part of this project' });
+        const access = (await this.deps.tokens.check(token, 'repository:write', { projectId: project.id })).ok ? 'write' : 'read';
+        try {
+          const credential = await this.deps.githubApp.repositoryCredential(repository, access);
+          (await store.appendAudit({ principalId: actorPrincipal(callerIdentity.actor), action: 'github:cli-credential',
+            scopeKey: `project:${project.id}`, detail: { repositoryId: repository.id, access } }));
+          res.setHeader('cache-control', 'no-store');
+          return this.json(res, 200, { username: 'x-access-token', password: credential.token, expiresAt: credential.expiresAt, access });
+        } catch (error) { return this.json(res, 502, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      const cliGitCredentials = p.match(/^\/api\/organizations\/([^/]+)\/cli-git-credentials$/);
+      if (cliGitCredentials && ['GET', 'PUT'].includes(method)) {
+        const organizationId = cliGitCredentials[1]!;
+        if (!(await store.getOrganization(organizationId))) return this.json(res, 404, { error: 'organization not found' });
+        if (method === 'PUT') {
+          const body = await this.body(req);
+          if (typeof body.enabled !== 'boolean') return this.json(res, 400, { error: 'enabled must be true or false' });
+          if (body.enabled) (await store.kvSet(cliGitCredentialsKey(organizationId), 'enabled'));
+          else (await store.kvDelete(cliGitCredentialsKey(organizationId)));
+        }
+        return this.json(res, 200, { enabled: (await store.kvGet(cliGitCredentialsKey(organizationId))) === 'enabled' });
+      }
+      const projectWorkspace = p.match(/^\/api\/projects\/([^/]+)\/workspace$/);
+      if (projectWorkspace && method === 'GET') {
+        try { return this.json(res, 200, await this.workspaces().project(projectWorkspace[1]!)); }
+        catch (error) { return this.json(res, 404, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      const secretValues = p.match(/^\/api\/projects\/([^/]+)\/secrets\/values$/);
+      if (secretValues && method === 'POST') {
+        if (!this.deps.resources) return this.json(res, 503, { error: 'project resources are unavailable' });
+        const body = await this.body(req);
+        const names = Array.isArray(body.names) ? body.names.map(String) : undefined;
+        res.setHeader('cache-control', 'no-store');
+        try { return this.json(res, 200, { secrets: await this.deps.resources.workspaceSecretValues(secretValues[1]!, actorPrincipal(callerIdentity.actor), names) }); }
+        catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      const workspaceGrant = p.match(/^\/api\/(projects|tasks)\/([^/]+)\/resources\/([^/]+)\/(read|append)-grant$/);
+      if (workspaceGrant && method === 'POST') {
+        if (!this.deps.resources) return this.json(res, 503, { error: 'project resources are unavailable' });
+        const [, kind, scopeId, attachmentId, access] = workspaceGrant;
+        // A project's append grant is a settings write (routeCapability); a task's is
+        // only for the task's own world, so only resources a task may write.
+        const projectId = kind === 'projects' ? scopeId! : (await store.getTask(scopeId!))?.projectId;
+        const attachment = await store.getResourceAttachment(attachmentId!);
+        if (!attachment || !projectId || attachment.projectId !== projectId) return this.json(res, 404, { error: 'resource not found' });
+        if (kind === 'tasks' && access === 'append' && attachment.access !== 'write')
+          return this.json(res, 403, { error: `resource "${attachment.name}" is read-only in tasks` });
+        const body = await this.body(req);
+        try {
+          const revisionId = typeof body.revisionId === 'string' ? body.revisionId
+            : kind === 'tasks' && access === 'read' ? await this.deps.resources.workspaceRevision(attachment, scopeId) : undefined;
+          res.setHeader('cache-control', 'no-store');
+          return this.json(res, 200, await this.deps.resources.workspaceGrant(attachment.id, { access: access as 'read' | 'append',
+            ...(revisionId ? { revisionId } : {}), ...(typeof body.baseRevisionId === 'string' ? { baseRevisionId: body.baseRevisionId } : {}),
+            publicUrl: this.publicUrl(req) }));
+        } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      const workspaceRevision = p.match(/^\/api\/projects\/([^/]+)\/resources\/([^/]+)\/revisions$/);
+      if (workspaceRevision && method === 'POST') {
+        if (!this.deps.resources) return this.json(res, 503, { error: 'project resources are unavailable' });
+        const attachment = await store.getResourceAttachment(workspaceRevision[2]!);
+        if (!attachment || attachment.projectId !== workspaceRevision[1]) return this.json(res, 404, { error: 'resource not found' });
+        if (stagedResourceCandidate(attachment)) return this.json(res, 409, { error: 'staged resource candidates cannot be modified before Review' });
+        const body = await this.body(req);
+        if (typeof body.snapshot !== 'string') return this.json(res, 400, { error: 'snapshot is required' });
+        try {
+          const adopted = await this.deps.resources.adoptWorkspaceSnapshot(attachment.id, body.snapshot,
+            typeof body.baseRevisionId === 'string' ? body.baseRevisionId : null, actorPrincipal(callerIdentity.actor));
+          return this.json(res, 200, { unchanged: adopted.unchanged, revision: redactResourceRevision(adopted.revision) });
+        } catch (error) {
+          if (error instanceof WorkspaceConflict)
+            return this.json(res, 409, { error: error.message, code: 'resource_changed', currentRevisionId: error.currentRevisionId });
+          return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
       const projectCheckout = p.match(/^\/api\/projects\/([^/]+)\/checkout$/);
       if (projectCheckout && method === 'GET') {
         if (!this.deps.handoffs) return this.json(res, 503, { error: 'local checkout handoff is unavailable' });
@@ -4828,9 +5004,8 @@ export class Gateway {
       // ── search / organization (a view is a saved query) ──
       // The searchable-field registry the UI reads to build its filter/sort/group menus.
       if (p === '/api/search' && method === 'GET') {
-        const query = url.searchParams.get('q')?.trim() ?? '';
-        if (query.length > 2000) return this.json(res, 400, { error: 'Search is too long' });
-        return this.json(res, 200, await this.searchProjects(req, res, session, query));
+        if ((url.searchParams.get('q') ?? '').length > 2000) return this.json(res, 400, { error: 'Search is too long' });
+        return await this.searchEverywhere(res, session, url);
       }
       if (p === '/api/search/fields' && method === 'GET') return this.json(res, 200, (await api.searchFields(token)));
       const organizationSearch = p.match(/^\/api\/organizations\/([^/]+)\/search$/);
@@ -5177,6 +5352,9 @@ export class Gateway {
         const message = await api.signalTask(token, signalMatch[1]!, b.signal, b.text, b.role, b.images, b.files, { otherAttempts: b.otherAttempts, saveOtherAttemptsDefault: b.saveOtherAttemptsDefault }, receivedAt);
         return this.json(res, 200, { ok: true, ...(message ? { message, role: b.role ?? 'do' } : {}) });
       }
+      const stopAgentMatch = p.match(/^\/api\/tasks\/([^/]+)\/agents\/([^/]+)\/stop$/);
+      if (stopAgentMatch && method === 'POST')
+        return this.json(res, 200, { ok: true, ...(await api.stopAgent(token, stopAgentMatch[1]!, decodeURIComponent(stopAgentMatch[2]!))) });
       const messageMatch = p.match(/^\/api\/tasks\/([^/]+)\/messages$/);
       if (messageMatch && method === 'POST') {
         const b = await this.body(req);
@@ -5267,6 +5445,54 @@ export class Gateway {
         // A path into this install's checkout only means something to the machine it lives on.
         const attachArgv = this.hostLocal ? [process.execPath, fileURLToPath(new URL('../../bin/tavya.js', import.meta.url))] : [BRAND];
         return this.json(res, 200, { taskId, ticket, expiresAt, gatewayUrl: this.publicUrl(req), attachArgv });
+      }
+      // `tavya exec`: one command in the task's world, its output streamed as
+      // NDJSON ({type: output|exit}). It runs as a review action does (same lease,
+      // execution record and stored, scrubbed output), with the terminal's authority.
+      const execMatch = p.match(/^\/api\/tasks\/([^/]+)\/exec$/);
+      if (execMatch && method === 'POST') {
+        const taskId = execMatch[1]!;
+        const task = await store.getTask(taskId);
+        const body = await this.body(req);
+        const command = typeof body.command === 'string' ? body.command : '';
+        if (!command.trim()) return this.json(res, 400, { error: 'command is required' });
+        const handle = worldHandleForView(task?.lastView, taskId, task ? await store.effectiveProjectConfig(task.projectId) : undefined);
+        if (!task || !handle) return this.json(res, 404, { error: 'this task has no world yet' });
+        const workdir = worldWorkingDirectory(handle);
+        const cwd = typeof body.cwd === 'string' && body.cwd ? path.posix.resolve(workdir, body.cwd) : workdir;
+        if (cwd !== handle.root && !cwd.startsWith(`${handle.root.replace(/\/+$/, '')}/`)) return this.json(res, 400, { error: 'cwd is outside the task world' });
+        let rec;
+        try { rec = await this.reviewActions.start({ taskId, world: handle, label: 'tavya exec', command, kind: 'command', cwd }); }
+        catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
+        res.writeHead(200, { 'content-type': 'application/x-ndjson; charset=utf-8', 'cache-control': 'no-store' });
+        if (rec.output) res.write(`${JSON.stringify({ type: 'output', data: rec.output })}\n`);
+        let off: (() => void) | undefined;
+        const end = (code: number | null) => { if (!res.writableEnded) res.end(`${JSON.stringify({ type: 'exit', code })}\n`); off?.(); };
+        off = await this.reviewActions.attach(rec.procId, (chunk, done, code) => {
+          if (chunk && !res.writableEnded) res.write(`${JSON.stringify({ type: 'output', data: chunk })}\n`);
+          if (done) end(code);
+        });
+        if (!rec.running) end(rec.exitCode);
+        res.on('close', () => { if (!res.writableEnded) void this.reviewActions.stop(rec.procId); off?.(); });
+        return;
+      }
+      const taskWorkspace = p.match(/^\/api\/tasks\/([^/]+)\/workspace$/);
+      if (taskWorkspace && method === 'GET') {
+        try { return this.json(res, 200, await this.workspaces().task(taskWorkspace[1]!)); }
+        catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+      }
+      const importLocal = p.match(/^\/api\/tasks\/([^/]+)\/import-local$/);
+      if (importLocal && method === 'POST') {
+        if (!this.deps.handoffs) return this.json(res, 503, { error: 'local checkout handoff is unavailable' });
+        const taskId = importLocal[1]!;
+        const body = await this.body(req);
+        const resources = Array.isArray(body.resources) ? body.resources
+          .filter((entry: any) => typeof entry?.id === 'string' && typeof entry?.snapshot === 'string')
+          .map((entry: any) => ({ id: String(entry.id), snapshot: String(entry.snapshot) })) : [];
+        const view = (await api.getTaskView(token, taskId, { live: true }).catch(liveViewUnavailable)) ?? (await store.getTask(taskId))?.lastView;
+        if (!view) return this.json(res, 404, { error: 'task view is unavailable' });
+        try { return this.json(res, 200, await this.deps.handoffs.importLocal(taskId, view, { git: body.git !== false, resources })); }
+        catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
       }
       const checkoutMatch = p.match(/^\/api\/tasks\/([^/]+)\/checkout$/);
       if (checkoutMatch && method === 'GET') {
@@ -5420,6 +5646,7 @@ export class Gateway {
           to: Array.isArray(b.to) ? b.to.map(String) : [],
           message: String(b.message ?? ''),
           ...(b.urgency ? { urgency: normalizeUrgency(b.urgency) } : {}),
+          ...(Array.isArray(b.agents) ? { agents: b.agents } : {}),
         }));
       }
       if (p === '/api/agent/permission-requests' && method === 'POST') {
@@ -5449,7 +5676,7 @@ export class Gateway {
         if (!projectId) return this.json(res, 400, { error: unscopedProject });
         try {
           const result = (await api.authorizationEscalationTargets(token, {
-            projectId, authorization,
+            projectId, authorization, credentialGrants: credentialGrantsFromBody(b.credentialGrants),
           }));
           const names = new Map(((await this.deps.identity?.listUsers()) ?? []).map((user) =>
             [user.id, { name: user.name, email: user.email }]));
@@ -5472,6 +5699,7 @@ export class Gateway {
           try {
             return this.json(res, 200, await api.requestAuthorization(token, {
               projectId, target: b.target as any, authorization,
+              credentialGrants: credentialGrantsFromBody(b.credentialGrants),
               audience: Array.isArray(b.audience) ? b.audience.map(String) : [],
               reason: b.reason == null ? undefined : String(b.reason),
             }));
@@ -5901,6 +6129,7 @@ export class Gateway {
           return this.json(res, 200, explanations);
         }
         if (method !== 'POST') return this.json(res, 405, { error: 'method not allowed' });
+        if (!EXPLANATIONS_ENABLED) return this.json(res, 404, { error: EXPLANATIONS_OFF });
         const project = (await store.getProject(task.projectId));
         if (!project) return this.json(res, 404, { error: 'task project not found' });
         const body = await this.body(req);
@@ -6321,6 +6550,25 @@ export class Gateway {
           url.searchParams.get('refresh') === '1',
           requestedScope.organizationId ?? 'org_personal',
         ));
+      }
+      // Intelligence, price and speed of the runnable models, for the picker's chart.
+      if (p === '/api/models/benchmarks' && method === 'GET') {
+        if (!this.artificialAnalysis.available) return this.json(res, 404, { error: 'Model benchmarks are not configured' });
+        const organizationId = requestedScope.organizationId ?? 'org_personal';
+        try {
+          const [{ at, data }, catalog] = await Promise.all([
+            this.artificialAnalysis.models(),
+            this.modelCatalog.get(organizationId),
+          ]);
+          return this.json(res, 200, {
+            source: { name: 'Artificial Analysis', url: 'https://artificialanalysis.ai/' },
+            fetchedAt: at,
+            models: toBenchmarks(data, catalog.value, at),
+          } satisfies ModelBenchmarks);
+        } catch (error) {
+          console.warn(`[karmax] model benchmarks unavailable: ${error instanceof Error ? error.message : 'unknown error'}`);
+          return this.json(res, 502, { error: 'Model benchmarks are unavailable right now' });
+        }
       }
       if (p === '/api/profiles' && method === 'PUT') {
         const b = await this.body(req);
@@ -7891,7 +8139,7 @@ export class Gateway {
             enabled,
             modes: Object.fromEntries(creds.map((credential) => [credential.key,
               enabled.includes(credential.key) ? 'on'
-                : credential.kind === 'key' && explanationEnabled.has(credential.key) ? 'explainer-only'
+                : EXPLANATIONS_ENABLED && credential.kind === 'key' && explanationEnabled.has(credential.key) ? 'explainer-only'
                   : 'off',
             ])),
           };
@@ -7966,6 +8214,9 @@ export class Gateway {
       // annotations, so their defaults inherit organization → project without
       // becoming workflow params or agent-session input.
       const organizationExplanation = p.match(/^\/api\/organizations\/([^/]+)\/explanation-settings$/);
+      const projectExplanation = p.match(/^\/api\/projects\/([^/]+)\/explanation-settings$/);
+      if (!EXPLANATIONS_ENABLED && (organizationExplanation || projectExplanation))
+        return this.json(res, 404, { error: EXPLANATIONS_OFF });
       if (organizationExplanation) {
         const organizationId = organizationExplanation[1]!;
         const settings = (await this.explanationSettings(undefined, organizationId));
@@ -7981,7 +8232,6 @@ export class Gateway {
           return this.json(res, 200, { own, effective: normalizeExplanationSettings(own) });
         }
       }
-      const projectExplanation = p.match(/^\/api\/projects\/([^/]+)\/explanation-settings$/);
       if (projectExplanation) {
         const projectId = projectExplanation[1]!;
         const project = (await store.getProject(projectId));
@@ -8021,26 +8271,34 @@ export class Gateway {
             globalVals = { ...globalVals, remote: 'pr' };
           if (projectVals.remote === 'none') projectVals = { ...projectVals, remote: 'pr' };
         }
-        // "Agent environment" (worldProvider) is stored in the execution policy, not
-        // the settings rows — surface the real organization default + project override
-        // so the Task Defaults form shows and inherits the true selection (§11).
-        if (organizationId && globalVals.worldProvider === undefined) {
-          const orgProvider = (await store.getOrganizationExecutionPolicy(organizationId)).worldProvider;
-          if (orgProvider !== undefined) globalVals.worldProvider = orgProvider;
-        }
-        if (project?.config.worldProvider !== undefined) projectVals.worldProvider = project.config.worldProvider;
+        // The Computer is the execution policy, not a settings row: project the
+        // organization policy and the project override into each layer (§11).
+        const computer = (await computerDefaults(store, organizationId ?? undefined, project));
         // Detect the effective repository policy so placeholders agree with the
         // branch provisioning and pull requests will actually use.
         const repo0 = project
           ? effectiveRepos(resolveParams(m, { project: projectVals, global: globalVals }), project.config)[0]
           : undefined;
         const branches = project ? await repositoryBranchDefaults(store, project, repo0) : undefined;
+        // Each repository's own branches, for the per-repository list to start
+        // from: what the common pair would mean in it (its real default branch,
+        // unless a default names one explicitly).
+        const repos = project && m.params.some((field) => field.type === 'repoBranches')
+          ? effectiveRepos(resolveParams(m, { project: projectVals, global: globalVals }), project.config) : [];
+        const repoDefaults = repos.length > 1
+          ? await Promise.all(repos.map((source) => repositoryBranchDefaults(store, project!, source).catch(() => undefined)))
+          : [];
         const enrich = async (vals: Record<string, unknown>, lower: Record<string, unknown>) => {
           const out = (await this.enrichAgentDefaults(m, vals, projectId, organizationId ?? undefined));
+          const detectBase = lower.base === undefined && globalVals.base === undefined && projectVals.base === undefined;
+          const detectTarget = lower.target === undefined && globalVals.target === undefined && projectVals.target === undefined;
           if (branches) {
-            if (lower.base === undefined && globalVals.base === undefined && projectVals.base === undefined) out.base = branches.base;
-            if (lower.target === undefined && globalVals.target === undefined && projectVals.target === undefined) out.target = branches.target;
+            if (detectBase) out.base = branches.base;
+            if (detectTarget) out.target = branches.target;
           }
+          if (repos.length > 1) out._repositoryBranches = repos.map((source, index) => ({ source,
+            base: (detectBase && repoDefaults[index]?.base) || out.base,
+            target: (detectTarget && repoDefaults[index]?.target) || out.target }));
           return out;
         };
         // Quick-task agent defaults (SPEC §10.4): an agent-only overlay for tasks
@@ -8048,10 +8306,15 @@ export class Gateway {
         // organization Quick agents into the regular project/organization agents.
         const globalQuickVals = (await quickGlobalSettingsFor(gs, wf, organizationId ?? undefined));
         const projectQuickVals = project ? (await quickProjectSettingsFor(gs, project.id, wf)) : {};
+        const hasComputer = m.params.some((field) => field.type === 'computer');
+        const withComputer = (values: Record<string, unknown>, value: unknown) => {
+          const { worldProvider: _legacy, computer: _stale, ...rest } = values;
+          return hasComputer ? { ...rest, computer: value } : rest;
+        };
         return this.json(res, 200, {
-          task: { own: {}, inherited: (await enrich(resolveParams(m, { project: projectVals, global: globalVals }), {})) },
-          project: { own: projectVals, inherited: (await enrich(resolveParams(m, { global: globalVals }), projectVals)) },
-          global: { own: globalVals, inherited: (await enrich(resolveParams(m, {}), { ...projectVals, ...globalVals })) },
+          task: { own: {}, inherited: withComputer((await enrich(resolveParams(m, { project: projectVals, global: globalVals }), {})), computer.task.inherited) },
+          project: { own: withComputer(projectVals, computer.project.own), inherited: withComputer((await enrich(resolveParams(m, { global: globalVals }), projectVals)), computer.project.inherited) },
+          global: { own: withComputer(globalVals, computer.global.own), inherited: withComputer((await enrich(resolveParams(m, {}), { ...projectVals, ...globalVals })), computer.global.inherited) },
           globalQuick: { own: globalQuickVals, inherited: (await enrich(resolveParams(m, { global: globalVals }), globalQuickVals)) },
           projectQuick: {
             own: projectQuickVals,
@@ -8067,14 +8330,14 @@ export class Gateway {
         if (method === 'GET') return this.json(res, 200, (await globalSettingsFor(async (s, w) => (await store.getSettings(s, w)), wf!, organizationId)));
         if (method === 'PUT') {
           const b = await this.body(req);
-          const values = hostedSettingsValues(b.values ?? {}, this.deps.hosted === true);
+          const { rest: values, computer } = splitComputerValues(hostedSettingsValues(b.values ?? {}, this.deps.hosted === true));
+          // The Computer is the organization's execution policy (§11). Save it
+          // first: a refused provider must not leave half the form saved.
+          const options = { hosted: this.deps.hosted === true, providerConnections: this.deps.providerConnections };
+          try {
+            if (computer) (await saveOrganizationComputer(store, organizationId!, computer.value, options));
+          } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
           (await store.setSettings(`organization:${organizationId}`, wf!, values));
-          // The organization "Agent environment" default lives in the execution
-          // policy (so runner-pool compatibility and effectiveProjectConfig agree);
-          // mirror a non-empty selection there. Blank at organization scope means
-          // "unchanged" — the top-level default is always a concrete provider.
-          if (values.worldProvider)
-            (await store.setOrganizationExecutionPolicy(organizationId!, { worldProvider: values.worldProvider as string }));
           return this.json(res, 200, { ok: true });
         }
       }
@@ -8125,16 +8388,18 @@ export class Gateway {
         }
         if (method === 'PUT') {
           const b = await this.body(req);
-          const values = hostedSettingsValues(b.values ?? {}, this.deps.hosted === true);
+          const { rest: values, computer } = splitComputerValues(hostedSettingsValues(b.values ?? {}, this.deps.hosted === true));
+          const project = (await store.getProject(projectId));
+          if (!project) return this.json(res, 404, { error: 'no project' });
+          // The Computer is the project's execution-policy override (§11); empty inherits the organization's.
+          const options = { hosted: this.deps.hosted === true, providerConnections: this.deps.providerConnections };
+          try {
+            if (computer) (await saveProjectComputer(store, project, computer.value, options));
+          } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
           (await store.setSettings(projectId, wf, values));
           // Mirror bound-project fields into ProjectConfig for back-compat.
           const m = manifest(wf);
           if (m) (await store.updateProjectConfig(projectId, settingsToProjectConfig(m, values)));
-          // "Agent environment" is canonically an execution-policy value; mirror it so
-          // effectiveProjectConfig, runner-pool compatibility, and the Compute section
-          // stay coherent (empty ⇒ clear the override and inherit the organization).
-          if (Object.prototype.hasOwnProperty.call(values, 'worldProvider'))
-            (await store.setProjectExecutionPolicy(projectId, { worldProvider: (values.worldProvider as string) || null }));
           return this.json(res, 200, { ok: true });
         }
       }
@@ -8383,9 +8648,14 @@ export class Gateway {
       })));
       return mergeModels(results);
     };
-    const [claude, codex, opencode] = await Promise.all([
-      settled('claude'), settled('codex'), settled('opencode'),
+    // OpenCode runs on a model vendor's API key, so it lists that vendor's
+    // models whether or not an `opencode` binary exists here (hosted: none).
+    const keyVendors = [...new Set(creds.filter((c) => c.kind === 'key').map((c) => canonicalModelProvider(c.provider)))]
+      .filter((vendor) => (MODEL_PROVIDERS as readonly string[]).includes(vendor));
+    const [claude, codex, opencodeLogins, opencodeKeys] = await Promise.all([
+      settled('claude'), settled('codex'), settled('opencode'), openCodeKeyModels(keyVendors).catch(() => []),
     ]);
+    const opencode = mergeModels([opencodeLogins, opencodeKeys]);
     // Discovery is best-effort (offline/old CLI/expired login). Keep the existing
     // safe presets so forms never degrade to an empty, non-actionable picker.
     const value: ModelCatalog = {
@@ -8393,11 +8663,13 @@ export class Gateway {
       // metadata to add to the stable selections, not an exhaustive allowlist.
       claude: claudeModelCatalog(claude),
       codex: codexModelCatalog(codex),
+      // With no OpenCode credential at all, a few real models show what a key
+      // would unlock; a task on one waits for that key (Credentials).
       opencode: opencode.length ? opencode : [
         { id: 'kimi/kimi-for-coding' },
         { id: 'kimi/k3', effort: ['low', 'high', 'max'] },
-        { id: 'google/gemini-3.6-pro' },
-        { id: 'xai/grok-4.5' },
+        { id: 'anthropic/claude-sonnet-5' },
+        { id: 'openrouter/anthropic/claude-sonnet-5' },
       ],
       // Retained only for stored-profile/backward-compatible typing. The native
       // Kimi harness is disabled until its ACP server supports session/fork.
@@ -8880,7 +9152,7 @@ export class Gateway {
       return (await this.deps.tokens.check(session.apiToken, capability, { projectId, taskId })).ok;
     const userId = session.userId;
     // Shared: what the person may do in the project. Per call: the task.
-    const caps = await this.personCapabilities(userId, session.email, projectId);
+    const caps = await this.personCapabilities(session, projectId);
     if (!caps) return false;
     if (['task:edit', 'task:review:execute'].includes(capability) && await this.deps.store.kvGet(`project-transfer-history:${taskId}`))
       return false; // as tokens.check: history from before a project move
@@ -8899,8 +9171,9 @@ export class Gateway {
   /** A person's capabilities in a project, or undefined when their account is
    * closed or SSO no longer admits them; shared across their sockets for a
    * second within one authorization epoch. */
-  private personCapabilities(userId: string, email: string | undefined, projectId: string): Promise<Capability[] | undefined> {
-    const key = `${authorizationEpoch()}\0${userId}\0${projectId}`;
+  private personCapabilities(session: Session, projectId: string): Promise<Capability[] | undefined> {
+    const userId = session.userId!, email = session.email;
+    const key = `${authorizationEpoch()}\0${userId}\0${session.appGrant?.id ?? ''}\0${projectId}`;
     const now = Date.now();
     const cached = this.personDecisions.get(key);
     if (cached && cached.until > now) return cached.caps;
@@ -8909,7 +9182,8 @@ export class Gateway {
       if (await this.deps.store.kvGet(`account-closed:${userId}`)) return undefined;
       const organizationId = await this.deps.store.projectOrganizationAsync(projectId);
       if (organizationId && !(await this.ssoAdmits(userId, email, organizationId))) return undefined;
-      return this.deps.authorization!.capabilitiesAsync(`user:${userId}`, projectId, organizationId);
+      if (session.appGrant && !(await this.appGrants.live(session.appGrant.id, userId))) return undefined;
+      return this.personCaps(session, projectId, organizationId);
     })();
     caps.catch(() => this.personDecisions.delete(key));
     this.personDecisions.set(key, { caps, until: now + 1_000 });
@@ -9197,6 +9471,11 @@ export class Gateway {
     return handle.kind === 'container' || worldHandleIsRemote(handle) || !!this.deps.worlds.get(handle.kind)?.capabilities?.remote;
   }
 
+  private workspaceService?: WorkspaceService;
+  private workspaces(): WorkspaceService {
+    return this.workspaceService ??= new WorkspaceService(this.deps.store, this.deps.resources, this.deps.handoffs);
+  }
+
   private publicUrl(req: http.IncomingMessage, browserUrl?: unknown): string {
     // Behind a reverse proxy, the browser is the one component that always
     // knows the URL the human actually opened. An authenticated setup request
@@ -9278,22 +9557,19 @@ export class Gateway {
     return true;
   }
 
-  /** Global search visits only the projects the caller can read, resolved once:
-   *  a browser session's from its grants and memberships, authorized directly
-   *  (minting a token per project wrote tokens on every keystroke); a bearer's
-   *  from its own scope (UI-18/RQ-14). */
-  private async searchProjects(_req: http.IncomingMessage, res: http.ServerResponse, session: Session, query: string) {
-    const results: { projectId: string; tasks: EvalResult['tasks']; total: number }[] = [];
-    if (query.length < 2) return results;
-    const { api } = this.deps;
-    const member = this.searchMember(session);
-    for (const project of await this.searchableProjects(res, session)) {
-      if (res.destroyed) break;
-      const result = member ? await api.searchAuthorizedTasks(project.id, query, `user:${member}`)
-        : await api.searchTasks(session.apiToken, project.id, query);
-      results.push({ projectId: project.id, tasks: result.tasks.slice(0, 100), total: result.total });
-    }
-    return results;
+  /** One task list over every project the caller can read, in every
+   *  organization: a browser session's from its grants and memberships,
+   *  authorized directly (minting a token per project wrote tokens on every
+   *  keystroke); a bearer's from its own scope (UI-18/RQ-14). Sorted together
+   *  and paged like an organization's list. */
+  private async searchEverywhere(res: http.ServerResponse, session: Session, url: URL) {
+    const query = url.searchParams.get('q') ?? '';
+    const page = { limit: Number(url.searchParams.get('limit') ?? 200), offset: Number(url.searchParams.get('offset') ?? 0) };
+    const projects = await this.searchableProjects(res, session);
+    const principal = this.searchMember(session) ? `user:${this.searchMember(session)}`
+      : (await this.deps.tokens.verify(session.apiToken))?.principal;
+    if (!principal) return this.json(res, 401, { error: 'unauthorized' });
+    return this.json(res, 200, await this.deps.api.searchAuthorizedOrganization(projects, query, principal, page));
   }
 
   /** The organization task list: one query over every project of the
@@ -9320,7 +9596,7 @@ export class Gateway {
 
   /** The projects a search may visit, optionally within one organization. */
   private async searchableProjects(res: http.ServerResponse, session: Session, organizationId?: string): Promise<Project[]> {
-    const { authorization, store, tokens } = this.deps;
+    const { store, tokens } = this.deps;
     const member = this.searchMember(session);
     let projects: Project[];
     if (member) projects = await store.listProjectsReachableBy(member);
@@ -9338,7 +9614,7 @@ export class Gateway {
       const projectOrganization = project.organizationId ?? 'org_personal';
       if (organizationId && projectOrganization !== organizationId) continue;
       if (member) {
-        const caps = await authorization!.capabilitiesAsync(`user:${member}`, project.id, projectOrganization);
+        const caps = await this.personCaps(session, project.id, projectOrganization);
         if (!allows(caps, 'project:read') || !allows(caps, 'task:read')
           || !(await this.ssoAdmits(member, session.email, projectOrganization))) continue;
       } else {
@@ -9355,6 +9631,8 @@ export class Gateway {
     const h = req.headers['authorization'];
     const sid = h?.startsWith('Bearer ') ? h.slice(7)
       : req.headers.cookie?.split(';').map(value => value.trim()).find(value => value.startsWith('krmax_session='))?.slice('krmax_session='.length);
+    // An app grant's bearer (CLI login, MCP client, personal token) acts as its person.
+    if (h?.startsWith('Bearer ') && isAppBearer(sid)) return this.appGrantAuth(sid, projectId, organizationId);
     if (sid) {
       const legacy = this.sessions.get(sid);
       if (legacy) {
@@ -9375,8 +9653,46 @@ export class Gateway {
     if (resolvedOrganizationId && !(await this.ssoAdmits(identity.user.id, identity.user.email, resolvedOrganizationId)))
       return undefined;
     const caps = await this.deps.authorization?.capabilitiesAsync(principal, projectId, resolvedOrganizationId) ?? [];
+    const apiToken = await this.principalToken(identity.session.id, identity.user.id, caps, projectId, resolvedOrganizationId);
+    return { user: identity.user.name, userId: identity.user.id, email: identity.user.email, apiToken,
+      identitySessionId: identity.session.id };
+  }
+
+  /** A `tva_`/`tvp_` bearer: its grant, its person, and that person's current
+   * capabilities for the route attenuated by the grant's limit, as a cached
+   * short-lived principal token bound to the grant (revoking it revokes that). */
+  private async appGrantAuth(bearer: string, projectId?: string, organizationId?: string): Promise<Session | undefined> {
+    if (!this.deps.identity) return undefined;
+    const grant = await this.appGrants.authenticate(bearer);
+    const user = grant && await this.deps.identity.userById(grant.userId);
+    if (!grant || !user) return undefined;
+    if (((await this.deps.paidLaunchSettings?.publicLaunchInfo()) ?? publicLaunchInfo()).paidLaunch && !await this.deps.store.hasSignupAcceptanceAsync(user.id)) return undefined;
+    const resolvedOrganizationId = organizationId ?? (projectId ? await this.deps.store.projectOrganizationAsync(projectId) : undefined);
+    if (resolvedOrganizationId && !(await this.ssoAdmits(user.id, user.email, resolvedOrganizationId))) return undefined;
+    const session: Session = { user: user.name, userId: user.id, email: user.email, apiToken: '', identitySessionId: grant.id, appGrant: grant };
+    const caps = await this.personCaps(session, projectId, resolvedOrganizationId);
+    session.apiToken = await this.principalToken(grant.id, user.id, caps, projectId, resolvedOrganizationId);
+    return session;
+  }
+
+  /**
+   * A person's capabilities in a scope, as their session may use them: their
+   * current grants, attenuated by the app grant the session stands for. Every
+   * shortcut that authorizes a person directly (rather than through their
+   * route-scoped token) goes through here, so a limited token stays limited.
+   */
+  private async personCaps(session: Pick<Session, 'userId' | 'appGrant'>, projectId?: string, organizationId?: string): Promise<Capability[]> {
+    if (!session.userId || !this.deps.authorization) return [];
+    const resolvedOrganizationId = organizationId ?? (projectId ? await this.deps.store.projectOrganizationAsync(projectId) : undefined);
+    return sessionCapabilities(this.deps.authorization, session.userId, session.appGrant?.ceiling,
+      { projectId, organizationId: resolvedOrganizationId });
+  }
+
+  /** Mint (or reuse) the short-lived principal token for a browser session or
+   * app grant in one scope; a change in capabilities mints a fresh one. */
+  private async principalToken(sessionId: string, userId: string, caps: Capability[], projectId?: string, organizationId?: string): Promise<string> {
     const fingerprint = JSON.stringify(caps.slice().sort());
-    const cacheKey = `${identity.session.id}:${resolvedOrganizationId ?? 'global'}:${projectId ?? '*'}`;
+    const cacheKey = `${sessionId}:${organizationId ?? 'global'}:${projectId ?? '*'}`;
     let cached = this.identityTokens.get(cacheKey);
     if (!cached || cached.fingerprint !== fingerprint || !(await this.deps.tokens.verify(cached.apiToken))) {
       if (cached) (await this.deps.tokens.revoke(cached.apiToken));
@@ -9391,12 +9707,11 @@ export class Gateway {
         await this.deps.tokens.revoke(entry.apiToken);
       }
       const ttl = 10 * 60_000;
-      cached = { apiToken: (await this.deps.tokens.mintPrincipal(principal, caps, projectId, ttl,
-        resolvedOrganizationId, identity.session.id)).token, fingerprint, expiresAt: now + ttl, userId: identity.user.id };
+      cached = { apiToken: (await this.deps.tokens.mintPrincipal(`user:${userId}`, caps, projectId, ttl,
+        organizationId, sessionId)).token, fingerprint, expiresAt: now + ttl, userId };
       this.identityTokens.set(cacheKey, cached);
     }
-    return { user: identity.user.name, userId: identity.user.id, email: identity.user.email, apiToken: cached.apiToken,
-      identitySessionId: identity.session.id };
+    return cached.apiToken;
   }
   /** Browser sockets use HttpOnly cookies; API clients use Authorization. */
   private async socketAuth(req: http.IncomingMessage, _url: URL, projectId?: string): Promise<Session | undefined> {
@@ -9599,10 +9914,10 @@ export class Gateway {
       // yields an empty list and the app lands on that org's dashboard rather
       // than the "no access" waiting room.
       (await this.deps.store.listOrganizations(session.userId)).length > 0 ||
-      (await __asyncCollections.some((await this.deps.store.listProjects()), async (project) => allows((await this.deps.authorization?.capabilities(`user:${session.userId}`, project.id)) ?? [], required))));
+      (await __asyncCollections.some((await this.deps.store.listProjects()), async (project) => allows((await this.personCaps(session, project.id)), required))));
     const organizationCollectionAllowed = !checked.ok && p === '/api/organizations' && !!session.userId && (
       method === 'POST' || (await __asyncCollections.some((await this.deps.store.listOrganizations(session.userId)), async (organization) =>
-        allows((await this.deps.authorization?.capabilities(`user:${session.userId}`, undefined, organization.id)) ?? [], required)))
+        allows((await this.personCaps(session, undefined, organization.id)), required)))
     );
     return { required, scope, checked, allowed: checked.ok || collectionAllowed || organizationCollectionAllowed };
   }
@@ -9945,41 +10260,94 @@ async function projectRepositoryFiles(project: Project, store: Store,
   return repos;
 }
 
+/** Names each repository's `.env.example` (or `.sample`, `.template`) declares;
+ * values are never read from them. */
 async function discoverEnvironmentNames(project: Project, store: Store,
-  githubApp?: import('../integrations/github-app.js').GitHubAppService): Promise<Set<string>> {
-  const names = new Set<string>();
-  const add = (text: string) => {
-    for (const line of text.split('\n')) {
-      const match = line.trim().match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/);
-      if (match) names.add(match[1]!);
+  githubApp?: import('../integrations/github-app.js').GitHubAppService): Promise<Array<{ name: string; repository: string }>> {
+  const found: Array<{ name: string; repository: string }> = [];
+  for (const repository of await projectRepositoryFiles(project, store, githubApp)) {
+    const names = new Set<string>();
+    for (const file of ['.env.example', '.env.sample', '.env.template']) {
+      if (!repository.files.includes(file)) continue;
+      const text = await repository.read(file).catch(() => undefined);
+      for (const line of (text ?? '').split('\n')) {
+        const match = line.trim().match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/);
+        if (match) names.add(match[1]!);
+      }
     }
-  };
-  for (const dir of projectRepositoryDirectories(project)) for (const file of
-    ['.env.example', '.env.sample', '.env.template']) {
-    try { add(fs.readFileSync(path.join(dir, file), 'utf8')); } catch {}
+    found.push(...[...names].sort().map((name) => ({ name, repository: repository.name })));
   }
-  if (githubApp) for (const linked of (await store.listProjectRepositories(project.id))) for (const file of
-    ['.env.example', '.env.sample', '.env.template']) {
-    const text = await githubApp.fileContents(linked.repository, file);
-    if (text) add(text);
-  }
-  return names;
+  return found;
 }
 
-function parseEnvironmentValues(text: string): Array<{ name: string; value: string }> {
-  const values: Array<{ name: string; value: string }> = [];
-  for (const raw of text.split('\n')) {
-    const line = raw.trim();
-    if (!line || line.startsWith('#')) continue;
-    const match = line.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
-    if (!match) continue;
-    let value = match[2]!.trim();
-    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))
-      value = value.slice(1, -1);
-    else value = value.replace(/\s+#.*$/, '');
-    if (value) values.push({ name: match[1]!, value });
+/** World checkout names of a project's repositories: what a resource's
+ * `repository` names (as `ProjectEnvironmentSpec.install` keys do). */
+async function projectRepositoryNames(project: Project, store: Store): Promise<string[]> {
+  const { remoteName } = await import('../world/provision-git.js');
+  return [...new Set([...(project.config.repos ?? []).map(remoteName),
+    ...(await store.listProjectRepositories(project.id)).map(({ repository }) => repository.name)])];
+}
+
+/** Pin a location to its repository: the one its first path segment names
+ * (`web/.env`, as the console shows places), else the only one. A pinned
+ * location stays put when a project gains a second repository (an unpinned
+ * one would move from that checkout to the workspace root). */
+function anchorLocation(location: WorldLocation, repositories: string[]): WorldLocation {
+  if (location.repository !== undefined) return location;
+  const normalized = location.path.replace(/\\/g, '/').replace(/^\.\//, '');
+  const [first, ...rest] = normalized.split('/');
+  if (rest.length && repositories.includes(first!)) return { path: rest.join('/'), repository: first! };
+  return repositories.length === 1 ? { path: normalized, repository: repositories[0]! } : { path: normalized };
+}
+
+interface SecretEntry { name: string; value: string; target: ResourceTarget }
+
+/** What a secrets POST asks for. A destination (`file`, optionally
+ * `repository`) that is a `.env` file makes each variable a line of it;
+ * another file takes a single value whole; none exports the variables to
+ * every command. */
+function secretEntries(body: Record<string, unknown>, repositories: string[]): SecretEntry[] {
+  const repository = typeof body.repository === 'string' && body.repository ? body.repository : undefined;
+  if (repository !== undefined && !repositories.includes(repository))
+    throw new Error(`this project has no repository named "${repository}"`);
+  const file = typeof body.file === 'string' && body.file.trim() ? body.file.trim()
+    : repository !== undefined ? '.env' : undefined;
+  const location = file === undefined ? undefined : anchorLocation({ path: file, ...(repository ? { repository } : {}) }, repositories);
+  const variable = (name: string, value: string): SecretEntry => location
+    ? { name: dotenvSecretName(location, name), value, target: { kind: 'environment', name, dotenv: location } }
+    : { name, value, target: { kind: 'environment', name } };
+  if (typeof body.env === 'string') {
+    if (location && !dotenvFile(location.path)) throw new Error('pasted variables go into a .env file');
+    return parseDotenv(body.env).map(({ name, value }) => variable(name, value));
   }
-  return values;
+  if (!body.name) return [];
+  const name = String(body.name), value = body.value == null ? '' : String(body.value);
+  return [location && !dotenvFile(location.path) ? { name, value, target: { kind: 'path', ...location } } : variable(name, value)];
+}
+
+/** The stored secret a POST entry updates: the same variable in the same
+ * place, or the same file. A bare variable may still replace a file secret of
+ * its name, as before destinations existed. */
+function sameSecretDestination(resource: ResourceAttachment, entry: SecretEntry, repositories: string[]): boolean {
+  const same = (a: WorldLocation, b: WorldLocation) => {
+    const [x, y] = [anchorLocation(a, repositories), anchorLocation(b, repositories)];
+    return x.repository === y.repository && x.path.replace(/^\.\//, '') === y.path.replace(/^\.\//, '');
+  };
+  const { target } = resource;
+  if (entry.target.kind === 'path') return target.kind === 'path' && same(target, entry.target);
+  if (entry.target.kind !== 'environment') return false;
+  if (entry.target.dotenv) return target.kind === 'environment' && target.name === entry.target.name
+    && Boolean(target.dotenv) && same(target.dotenv!, entry.target.dotenv);
+  return (target.kind === 'environment' && !target.dotenv && target.name === entry.target.name)
+    || (target.kind === 'path' && resource.name === entry.name);
+}
+
+/** How the secrets API describes where a secret goes. */
+function secretDestination(target: ResourceTarget): { file?: string; variable?: string; repository?: string;
+  dotenv?: WorldLocation } {
+  if (target.kind === 'path') return { file: target.path, ...(target.repository !== undefined ? { repository: target.repository } : {}) };
+  if (target.kind === 'environment') return { variable: target.name, ...(target.dotenv ? { dotenv: target.dotenv } : {}) };
+  return {};
 }
 
 function redactResource(resource: ResourceAttachment): Omit<ResourceAttachment, 'credentialHandles'> & { credentialConfigured: boolean } {
@@ -10004,6 +10372,8 @@ function withoutVaultProjection(source: Record<string, unknown>): Record<string,
   return rest;
 }
 
+const cliGitCredentialsKey = (organizationId: string) => `cli-git-credentials:${organizationId}`;
+
 function stagedResourceCandidate(resource: ResourceAttachment): boolean {
   return resource.enabled === false && resource.source.candidate === true;
 }
@@ -10017,7 +10387,11 @@ function redactResourceRevision(revision: ResourceRevision | undefined): Omit<Re
 function normalizeResourceTarget(value: unknown, driver: string, name: string): ResourceTarget {
   if (value && typeof value === 'object') {
     const target = value as Record<string, unknown>;
-    if (target.kind === 'path') return { kind: 'path', path: String(target.path ?? '') };
+    const location = (value: Record<string, unknown>): WorldLocation => ({ path: String(value.path ?? ''),
+      ...(typeof value.repository === 'string' ? { repository: value.repository } : {}) });
+    if (target.kind === 'path') return { kind: 'path', ...location(target) };
+    if (target.kind === 'environment' && target.dotenv && typeof target.dotenv === 'object')
+      return { kind: 'environment', name: String(target.name ?? ''), dotenv: location(target.dotenv as Record<string, unknown>) };
     if (target.kind === 'environment' || target.kind === 'service') return { kind: target.kind, name: String(target.name ?? '') };
   }
   const variable = name.trim().toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^([^A-Z_])/, '_$1') || 'RESOURCE';

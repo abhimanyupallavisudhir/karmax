@@ -53,6 +53,7 @@ import {
   DeclaredAction,
   WorldHandleLike,
   ChildRaise,
+  SubTaskAction,
   ParentResponse,
   SubTaskRequest,
   SubTaskResponse,
@@ -157,6 +158,11 @@ export const followUpSignal = defineSignal<[Message, string?]>('followUp');
 /** Escalate: redirect the request this task is waiting on to other people
  * (v1.27). A Responder agent's own escalation takes effect when its turn ends. */
 export const rerouteSignal = defineSignal<[{ audience: string[]; detail?: string }]>('reroute');
+/** Stop one agent, like Ctrl+C (v1.27): its turn ends now — working, or still
+ * waiting for a credential, host capacity, a retry or people — or, if it is
+ * only queued, it does not run. The task goes on; a stopped main agent waits
+ * for the next message. `by` names who stopped it, for the conversation. */
+export const stopAgentSignal = defineSignal<[{ key: string; by?: string; byLabel?: string }]>('stopAgent');
 export const collaborationRequestedSignal = defineSignal<[string]>('collaborationRequested');
 export const collaborationSettledSignal = defineSignal<[string, Message]>('collaborationSettled');
 export const resourceResolvedSignal = defineSignal(SIG.resourceResolved);
@@ -175,6 +181,7 @@ export const cancelSignal = defineSignal('cancel');
  * releases execution-owned activity before the replacement starts. */
 export const lifecycleReplacementSignal = defineSignal('prepareLifecycleReplacement');
 export const retrySignal = defineSignal('retry');
+export const keepOwnResourcesSignal = defineSignal(SIG.keepOwnResources);
 export const mergeGrantedSignal = defineSignal(SIG_MERGE_GRANTED);
 type CredentialKind = 'login' | 'ambient' | 'key';
 export const accountGrantedSignal = defineSignal<[{
@@ -194,7 +201,9 @@ export const agentTurnStateSignal = defineSignal<[{
   detail?: string;
 }]>(SIG_AGENT_TURN_STATE);
 /** A child raises UP to its parent when it reaches a decision point (SPEC §5.3). */
+const REPLY_TO_SPEAKERS = 'software-dev-reply-to-speakers-v1';
 export const raiseFromChildSignal = defineSignal<[ChildRaise]>('raiseFromChild');
+export const subtaskRedirectedSignal = defineSignal<[{ childTaskId: string }]>(SIG.subtaskRedirected);
 /** A parent answers a child that raised to it — maps onto the same confirm/retry/
  *  cancel/follow-up transitions a human would drive (SPEC §5.3). */
 export const parentResponseSignal = defineSignal<[ParentResponse]>('parentResponse');
@@ -718,6 +727,9 @@ async function softwareDevImpl(
   let confirmed = carried?.confirmed ?? false;
   let manualPrConfirmer: string | undefined = continued?.manualPrConfirmer;
   let escalationAction: 'openPr' | 'confirm' | undefined = continued?.escalationAction;
+  /** A publication refused over files both sides changed: the person may keep this task's versions. */
+  let resourceConflict = false;
+  let keepOwnRequested = false;
   let manualEscalationRequested = carried?.manualEscalationRequested ?? false;
   let prRequested = carried?.prRequested ?? recoveryStage === 'pr';
   // checkout name -> head sha it was approved at (multi-PR Review).
@@ -734,6 +746,7 @@ async function softwareDevImpl(
   let resourceReviewSequence = carriedCount?.resourceReviewSequence ?? 0;
   let applyingResources = false;
   let stagingResources = false;
+  let refreshingResources = false;
   let resourcesApplied = carried?.resourcesApplied ?? false;
   let humanPauseActive = !!recovery?.pausedForHuman;
   let humanPauseWake: { kind: 'retry' | 'followUp' | 'confirm' | 'openPr' | 'workflowChange'; role?: string } | undefined;
@@ -821,7 +834,9 @@ async function softwareDevImpl(
   const settledCollaborations = new Set<string>(continued?.collaborations.settled);
   const pendingCollaborations = new Set<string>(continued?.collaborations.pending
     .filter((id) => !settledCollaborations.has(id)));
-  let pointOfNoReturnPassed = carried?.pointOfNoReturnPassed ?? false;
+  // A replacement of a partly landed run starts past the point of no return,
+  // so it never offers the cancellation or reset that would strand the rest.
+  let pointOfNoReturnPassed = carried?.pointOfNoReturnPassed ?? !!recovery?.pointOfNoReturnPassed;
   let lifecycleTransitionBlocked = false;
   // Flips true when `target` becomes load-bearing — a PR opened against it, or the
   // merge enqueue keyed by it — closing the in-flight target-edit window (SPEC §5.5).
@@ -863,6 +878,11 @@ async function softwareDevImpl(
   let responderEpoch = 0;
   let responderRounds = carriedCount?.responderRounds ?? 0;
   let subtaskNags = carriedCount?.subtaskNags ?? 0;
+  /** A sub-task landed since this world last took in what sub-tasks published. */
+  let childLandedSinceRefresh = false;
+  /** A failed refresh is tried once more before the next turn (a deploy that
+   * restarts the worker mid-transfer ends its last attempt). */
+  let refreshRetries = 1;
   // Account/token leasing (SPEC §6.2): per-turn lease of a connected login.
   type AccountGrant = {
     accountId: string;
@@ -881,6 +901,13 @@ async function softwareDevImpl(
   // Mid-turn cancel (SPEC §5.6): the running turn's cancellation scope, so a cancel
   // signal aborts the in-flight agent turn instead of waiting for it to finish.
   let activeTurn: CancellationScope | undefined;
+  // The agents in a turn right now, innermost last (v1.27): a called agent can
+  // run inside the main agent's wait. `stopping` is a stop not yet honoured.
+  const turnOwners: string[] = [];
+  let stopping: { key: string; by?: string; byLabel?: string } | undefined;
+  let lastStoppedBy: string | undefined;
+  /** Whether the innermost turn was asked to stop: its waits end and it throws. */
+  const halted = (): boolean => !!stopping && stopping.key === turnOwners[turnOwners.length - 1];
   let activeSetup: CancellationScope | undefined;
   let activeStaging: CancellationScope | undefined;
 
@@ -904,6 +931,9 @@ async function softwareDevImpl(
   // `agentQueue` and run, in call order, at the next turn boundary or at once
   // while the task is parked. The main agent keeps `session`/`sessionHome`/`seen`.
   const multiAgent = minor >= 27;
+  /** People (`user:<id>`) who spoke to the main agent in what its last turn
+   * answered (v1.27). */
+  let speakers: string[] = [];
   const participantSessions: Record<string, { session?: string; home?: string; seen: number }> =
     Object.fromEntries(Object.entries(continued?.participants?.sessions ?? {}).map(([key, value]) => [key, { ...value }]));
   let agentQueue: string[] = [...(continued?.participants?.queue ?? [])];
@@ -1127,6 +1157,7 @@ async function softwareDevImpl(
       ];
     }
     const retry: DeclaredAction = { name: 'retry', kind: 'signal', label: 'Retry', enabled: true };
+    const keepOwnResources: DeclaredAction = { name: SIG.keepOwnResources, kind: 'signal', label: 'Keep this task’s version', enabled: true };
     switch (stage) {
       case 'setup':
         return [cancel];
@@ -1145,7 +1176,7 @@ async function softwareDevImpl(
       case 'resolve':
         return [cancel];
       case 'escalated':
-        return [retry, ...(escalationAction === 'openPr'
+        return [retry, ...(resourceConflict ? [keepOwnResources] : []), ...(escalationAction === 'openPr'
           ? [{ ...openPr, label: 'Commit changes, open & confirm PR' }]
           : escalationAction === 'confirm' ? [confirm] : []), followUp, cancel];
       default:
@@ -1163,13 +1194,15 @@ async function softwareDevImpl(
     return participantKeys().map((key) => {
       const spec = key === MAIN_AGENT ? liveInput.agents?.do : participantSpec(key);
       const { kind: _kind, audience: _audience, prompt: _prompt, ...harness } = (spec ?? {}) as Partial<ConfirmLayer>;
-      const running = key === MAIN_AGENT
-        ? !runningParticipant && agentTurn?.role === 'do'
-        : runningParticipant === key;
+      // In a turn: working, or waiting in it (for a credential, capacity, a
+      // retry, people, its own pause, or an agent it is waiting on).
+      const innermost = turnOwners[turnOwners.length - 1] === key;
+      const state: TaskParticipant['state'] = !turnOwners.includes(key) ? (agentQueue.includes(key) ? 'queued' : 'idle')
+        : innermost && (agentTurn ? agentTurn.state === 'running' : status === 'active') ? 'running' : 'waiting';
       return {
         key, label: participantLabel(key), role: participantRole(key),
         ...(Object.keys(harness).length ? { spec: harness } : {}),
-        state: running ? 'running' : agentQueue.includes(key) ? 'queued' : 'idle',
+        state,
         messages: authored.get(key) ?? 0,
       };
     });
@@ -1229,6 +1262,7 @@ async function softwareDevImpl(
         confirmed,
         ...(applyingResources ? { applyingResources: true } : {}),
         ...(stagingResources ? { stagingResources: true } : {}),
+        ...(refreshingResources ? { refreshingResources: true } : {}),
         cancelled,
         ...(lifecycleReplacement ? { lifecycleReplacement: true } : {}),
         turnsSeen: seen,
@@ -1369,17 +1403,84 @@ async function softwareDevImpl(
     }
   }
 
-  /** False when a cancel stopped staging: nothing is adopted for a cancelled task. */
-  async function applyReviewedResources(stage = true): Promise<boolean> {
-    if (stage && await stageResources() && cancelled) return false;
-    applyingResources = true;
-    status = 'active';
-    await publish();
-    try {
-      await runLandingActivity(() => resourceActivities.settleResourceReview(taskId));
-      resourcesApplied = true;
-    } finally { applyingResources = false; }
-    return true;
+  /** `cancelled` when a cancel stopped it: nothing is adopted for a cancelled
+   * task. A publication that fails (a file another task changed differently,
+   * say) escalates with the reason instead of failing the task, whose world
+   * keeps the output: Retry publishes again, merging what was published
+   * meanwhile, and with `followUpReturnsToDo` a follow-up goes to the agent. */
+  async function applyReviewedResources(stageFirst = true, followUpReturnsToDo = false): Promise<'applied' | 'cancelled' | 'do'> {
+    if (stageFirst && await stageResources() && cancelled) return 'cancelled';
+    for (;;) {
+      applyingResources = true;
+      status = 'active';
+      await publish();
+      let failure: string;
+      try {
+        await runLandingActivity(() => keepOwnRequested
+          ? resourceActivities.settleResourceReview(taskId, { keepOwn: true })
+          : resourceActivities.settleResourceReview(taskId));
+        resourcesApplied = true;
+        return 'applied';
+      } catch (err) {
+        if (isCancellation(err) || !patched('resource-publish-escalates-v1')) throw err;
+        failure = innermostMessage(err);
+        resourceConflict = failureType(err) === 'resource-conflict';
+      } finally { applyingResources = false; keepOwnRequested = false; }
+      const priorStage = stage;
+      stage = 'escalated';
+      status = 'blocked';
+      retryRequested = false;
+      error = resourceConflict
+        ? `Could not publish resources: ${failure} Nothing was lost: Retry publishes again, or keep this task’s version of those files.`
+        : `Could not publish resources: ${failure} Nothing was lost; Retry publishes again.`;
+      if (input.parentTaskId) {
+        waitingFor = { kind: 'parent' };
+        await notifyParent('blocked', error, resourceConflict ? ['keep_own'] : undefined);
+      }
+      const seenAtEscalation = msgs.length;
+      await publish();
+      await waitServing(() => retryRequested || cancelled
+        || (followUpReturnsToDo && followUpWakesEscalation && mainUnreadSince(seenAtEscalation)));
+      waitingFor = undefined;
+      error = undefined;
+      resourceConflict = false;
+      stage = priorStage;
+      status = 'active';
+      if (cancelled) return 'cancelled';
+      if (!retryRequested) return 'do';
+      retryRequested = false;
+    }
+  }
+
+  /** Once a sub-task has landed, this world takes in what it handed over
+   * (SPEC §11.4) before the agent's next turn: its changes to the writable
+   * resources this world forked, and the output it proposed. */
+  async function refreshResourcesFromChildren(): Promise<void> {
+    let refreshed: Awaited<ReturnType<coreActivities['refreshResourceForks']>>;
+    // A multi-GB delivery takes minutes: the task says so rather than showing
+    // the wait it left (pramana#3 read "Waiting 90 min" for hours, and a
+    // follow-up sent meanwhile seemed ignored).
+    if (patched('subtask-resource-refresh-visible-v1')) {
+      refreshingResources = true;
+      await publish();
+    }
+    try { refreshed = await resourceStaging.refreshResourceForks(taskId); }
+    catch (err) {
+      if (isCancellation(err)) throw err;
+      const retry = patched('subtask-resource-refresh-retry-v1') && refreshRetries-- > 0;
+      if (retry) childLandedSinceRefresh = true;
+      msgs.push({ id: `st-${msgs.length}`, role: 'user', ts: msgs.length,
+        text: `Could not bring sub-tasks' saved data into your world: ${innermostMessage(err)} It is kept, and ${retry
+          ? 'is tried again before your next turn.' : 'comes in when the next sub-task finishes or when you are confirmed.'}` });
+      return;
+    } finally { refreshingResources = false; }
+    refreshRetries = 1;
+    for (const r of refreshed) {
+      const text = r.conflicts
+        ? `${r.path} was not updated with a sub-task's data: ${r.conflicts.length === 1 ? 'a file you changed differs' : `${r.conflicts.length} files you changed differ`} from the sub-task's (${r.conflicts.slice(0, 5).join(', ')}${r.conflicts.length > 5 ? ', …' : ''}). Keep one version (rename or remove yours); it comes in when the next sub-task finishes, and your publication fails until it does.`
+        : `${r.path} now includes a sub-task's data: ${r.added} new, ${r.modified} changed, ${r.deleted} removed file${r.deleted === 1 ? '' : 's'}.`;
+      msgs.push({ id: `st-${msgs.length}`, role: 'user', ts: msgs.length, text });
+    }
   }
 
   /** Play the one canonical Review route. Restored proposals call this after
@@ -1526,8 +1627,12 @@ async function softwareDevImpl(
       if (await stageResources() && cancelled) return 'cancelled';
       const saved = await ensureResourcesSaved();
       if (saved !== 'saved') return saved;
-      if (!(await applyReviewedResources(false))) return 'cancelled';
-    } else if (automaticResources && !(await applyReviewedResources())) return 'cancelled';
+      const applied = await applyReviewedResources(false, true);
+      if (applied !== 'applied') return applied;
+    } else if (automaticResources) {
+      const applied = await applyReviewedResources(true, true);
+      if (applied !== 'applied') return applied;
+    }
     confirmed = true;
     if (intentAuthorizedLanding) {
       landing = {
@@ -1644,6 +1749,18 @@ async function softwareDevImpl(
     waitingFor = { ...waitingFor, kind: 'human', audience: [...audience], ...(detail ? { detail } : {}) };
     await publish();
   });
+  setHandler(stopAgentSignal, async ({ key, by, byLabel }) => {
+    if (!multiAgent || cancelled || typeof key !== 'string') return;
+    if (turnOwners.includes(key)) {
+      stopping = { key, ...(by ? { by } : {}), ...(byLabel ? { byLabel } : {}) };
+      if (halted()) activeTurn?.cancel();
+    } else if (agentQueue.includes(key)) {
+      agentQueue = agentQueue.filter((queued) => queued !== key);
+      delete calledBy[key];
+      whenLoaded(() => noteStopped(key, { by, byLabel }));
+      await publish();
+    }
+  });
   // The "requested" and "settled" signals are sent by two independent code paths
   // over two concurrent RPCs, so they can arrive in either order: a target that
   // publishes while our request signal is still in flight settles it first. A
@@ -1721,6 +1838,11 @@ async function softwareDevImpl(
       if (!patched('software-dev-preserve-replacement-children-v1')) cancelChildren();
     }
   });
+  setHandler(keepOwnResourcesSignal, () => {
+    if (!resourceConflict) return;
+    keepOwnRequested = true;
+    retryRequested = true;
+  });
   setHandler(retrySignal, () => {
     retryRequested = true;
     if (responsiveHumanHold && humanPauseActive)
@@ -1738,6 +1860,11 @@ async function softwareDevImpl(
     if (!awaitingResponse.has(r.childTaskId)) subtaskNags = 0;
     raises.push(r);
     awaitingResponse.add(r.childTaskId);
+  });
+  // A child's request passed on to people (escalate) waits for them, not us:
+  // stop prompting our agent to answer it. A later raise asks us again.
+  setHandler(subtaskRedirectedSignal, ({ childTaskId }) => {
+    if (awaitingResponse.delete(childTaskId)) subtaskNags = 0;
   });
   // Our parent answered a raise. Map its decision onto the SAME flags a human drives
   // (confirm/retry/cancel/follow-up) so the parent is literally our confirmer.
@@ -1766,7 +1893,9 @@ async function softwareDevImpl(
       confirmed = true;
       if (responsiveHumanHold && humanPauseActive)
         humanPauseWake = { kind: 'confirm' };
-    } else if (resp.action === 'retry') {
+    } else if (resp.action === 'retry' || resp.action === 'keep_own') {
+      // keep_own: as "Keep this task's version" on a refused publication; otherwise a retry.
+      if (resp.action === 'keep_own' && resourceConflict) keepOwnRequested = true;
       retryRequested = true;
       if (responsiveHumanHold && humanPauseActive)
         humanPauseWake = { kind: 'retry' };
@@ -1892,7 +2021,7 @@ async function softwareDevImpl(
         try {
           return await fn();
         } catch (err) {
-          if (cancelled || isCancellation(err)) throw err; // mid-turn cancel: don't resolve/retry
+          if (cancelled || halted() || isCancellation(err)) throw err; // mid-turn cancel or stop: don't resolve/retry
           // This new failure type has no historical command sequence. A safety
           // decision is task-local: never rotate accounts or ask Resolve to retry.
           if (failureHasType(err, 'agent-policy')) {
@@ -1963,9 +2092,9 @@ async function softwareDevImpl(
                 waitingFor = { kind: 'retry', detail: `Retry ${infraRetries} of ${INFRA_BACKOFF_MS.length}`, until: Date.now() + wait };
               }
               await publish();
-              await condition(() => cancelled || retryRequested, wait);
+              await condition(() => cancelled || retryRequested || halted(), wait);
               if (visibleWait) { waitingFor = undefined; status = resumeStatus; }
-              if (cancelled) throw new Cancelled();
+              if (cancelled || halted()) throw new Cancelled();
               retryRequested = false;
               error = undefined;
               continue;
@@ -2009,8 +2138,9 @@ async function softwareDevImpl(
                 status = 'waiting';
                 waitingFor = { kind: 'account', ...(providerLimit.provider ? { provider: providerLimit.provider } : {}), earliestResetAt: until };
                 await publish();
-                await condition(() => cancelled || retryRequested, Math.max(1_000, until - Date.now()));
+                await condition(() => cancelled || retryRequested || halted(), Math.max(1_000, until - Date.now()));
                 if (cancelled) throw new Cancelled();
+                if (halted()) { waitingFor = undefined; status = resumeStatus; throw new Cancelled(); }
                 retryRequested = false;
                 waitingFor = undefined;
                 status = resumeStatus;
@@ -2140,7 +2270,7 @@ async function softwareDevImpl(
       await publish();
       for (;;) {
         await waitServing(() =>
-          retryRequested || cancelled || manualEscalationRequested
+          retryRequested || cancelled || manualEscalationRequested || halted()
           || (followUpWakesEscalation && mainUnreadSince(seenAtEscalation)));
         if (!manualEscalationRequested || cancelled || !manual) break;
         manualEscalationRequested = false;
@@ -2163,6 +2293,7 @@ async function softwareDevImpl(
       waitingFor = undefined;
       escalatedFrom = undefined;
       if (cancelled) throw new Cancelled();
+      if (halted()) { stage = resumeStage; status = 'active'; error = undefined; throw new Cancelled(); }
       // A human/parent retry resumes the stage that failed. Leaving this as
       // `escalated` made the live view claim the task was still escalated while
       // its replacement agent turn was already running (task #240). This is a
@@ -2257,8 +2388,8 @@ async function softwareDevImpl(
                 if (!admission.blocked) break;
                 waitingFor = { kind: 'agentSlot', provider, detail: admission.detail };
                 await publish();
-                await condition(() => cancelled, '30 seconds');
-                if (cancelled) throw new Cancelled();
+                await condition(() => cancelled || halted(), '30 seconds');
+                if (cancelled || halted()) throw new Cancelled();
               }
               slotHeld = admission.granted || agentSlotGrants.delete(turnId);
               if (!slotHeld) {
@@ -2268,21 +2399,21 @@ async function softwareDevImpl(
                   detail: admission.detail ?? 'Waiting for host capacity to start agent',
                 };
                 await publish();
-                await condition(() => agentSlotGrants.has(turnId) || cancelled);
+                await condition(() => agentSlotGrants.has(turnId) || cancelled || halted());
                 slotHeld = agentSlotGrants.delete(turnId);
               }
-              if (cancelled && !slotHeld) throw new Cancelled();
+              if ((cancelled || halted()) && !slotHeld) throw new Cancelled();
               waitingFor = { kind: 'agentSlot', provider, detail: 'Starting agent' };
               if (!compactStart) await publish();
             }
           }
-          if (patched('agent-turn-cancel-before-start-v1') && cancelled) throw new Cancelled();
+          if (patched('agent-turn-cancel-before-start-v1') && (cancelled || halted())) throw new Cancelled();
           if (compactStart && liveAgentStates) {
             waitingFor = { kind: 'agentSlot', provider, detail: 'Starting agent' };
             await publish();
             // A cancel delivered while that view was being published must still
             // stop the turn before it starts (WF-11).
-            if (cancelled) throw new Cancelled();
+            if (cancelled || halted()) throw new Cancelled();
           }
           return await fn(
             home,
@@ -2376,28 +2507,30 @@ async function softwareDevImpl(
         // The coordinator owns refresh timers and signals every grant. An arbitrary
         // workflow-side timeout used to fall through with no grant and accidentally
         // run on the profile credential, bypassing the exhausted account policy.
-        await condition(() => accountGrants.has(turnId) || cancelled);
+        await condition(() => accountGrants.has(turnId) || cancelled || halted());
       } else {
         // Immutable v1 command history: extant executions recorded this timer.
         await condition(() => accountGrants.has(turnId) || cancelled, '6 hours');
       }
       grant = accountGrants.get(turnId);
       accountGrants.delete(turnId);
-      if (grant?.accountId !== RELIST_ACCOUNT_GRANT || cancelled) break;
+      if (grant?.accountId !== RELIST_ACCOUNT_GRANT || cancelled || halted()) break;
     }
-    if (liveAgentStates && cancelled && !grant) await coordinator.cancelAccount(taskId, turnId).catch(() => undefined);
+    // A stopped agent gives up its place in the credential queue, as a cancel does.
+    const stopped = cancelled || halted();
+    if (liveAgentStates && stopped && !grant) await coordinator.cancelAccount(taskId, turnId).catch(() => undefined);
     if (!liveAgentStates) {
       // Preserve v1's in-memory transition. It intentionally did not publish here;
       // changing that command sequence would break every extant v1 history.
       waitingFor = undefined;
       if (status === 'waiting') status = priorStatus === 'waiting' ? 'active' : priorStatus;
-    } else if (cancelled || grant?.accountId === '(denied)') {
+    } else if (stopped || grant?.accountId === '(denied)') {
       // No model turn follows these paths, so explicitly clear the account wait.
       waitingFor = undefined;
       if (status === 'waiting') status = priorStatus === 'waiting' ? 'active' : priorStatus;
       await publish();
     }
-    if (liveAgentStates && cancelled) {
+    if (liveAgentStates && stopped) {
       if (grant && grant.accountId !== '(passthrough)' && grant.accountId !== '(denied)'
         && grant.accountId !== RELIST_ACCOUNT_GRANT && patched('software-dev-return-cancelled-grant-v1'))
         await coordinator.returnAccount(grant.accountId, { taskId, turnId }).catch(() => undefined);
@@ -2485,7 +2618,7 @@ async function softwareDevImpl(
     activeTurn = scope;
     try {
       return await scope.run(async () => {
-        if (patched('agent-turn-cancel-before-start-v1') && cancelled) throw new Cancelled();
+        if (patched('agent-turn-cancel-before-start-v1') && (cancelled || halted())) throw new Cancelled();
         return await fn();
       });
     } finally {
@@ -2505,7 +2638,8 @@ async function softwareDevImpl(
     // a mid-turn follow-up landed in `msgs` but got marked consumed, so it silently
     // never reached the agent (SPEC §5.6 — a queued follow-up must reach the agent).
     let deliveredNow = seen;
-    const turn = await withResolve('do', () =>
+    const answeredFrom = seen;
+    const ran = await stoppableTurn(MAIN_AGENT, () => withResolve('do', () =>
       leasedTurn('do', (
         accountConfigHome,
         accountApiKeyHandle,
@@ -2554,7 +2688,13 @@ async function softwareDevImpl(
           return { completed: true, providerCompleted: true, output: '', openPrRequested: true };
         },
       } : undefined,
-    );
+    ));
+    // Stopped: nothing it did this turn is folded in; it waits for a message.
+    if (!ran) {
+      speakers = [];
+      return { completed: false, providerCompleted: false, output: '', stopped: true } as AgentTurnResult & { stopped?: true };
+    }
+    const turn: AgentTurnResult & { stopped?: true } = ran.value;
     session = turn.session ?? session;
     sessionHome = doHome ?? sessionHome;
     // The turn reports how many `msgs` it actually delivered — the batch captured at
@@ -2567,11 +2707,20 @@ async function softwareDevImpl(
     // any follow-up that arrived after the last poll. This keeps the transcript honest
     // and leaves that follow-up AFTER `seen`, so the NEXT turn delivers it.
     if (turn.output?.trim()) {
-      msgs.splice(delivered, 0, { id: `a${delivered}`, role: 'agent', text: turn.output, ts: delivered,
-        ...(turn.finalActivity ? { sourceActivity: turn.finalActivity } : {}) });
+      const reply: Message = { id: `a${delivered}`, role: 'agent', text: turn.output, ts: delivered,
+        ...(turn.finalActivity ? { sourceActivity: turn.finalActivity } : {}) };
+      msgs.splice(delivered, 0, reply);
       seen = delivered + 1;
+      // The people who spoke to the agent hear its answer. A sub-task's turn
+      // ends with its parent, so it goes back to them now (#533); a top-level
+      // question also asks them (`askOf`).
+      speakers = multiAgent ? [...new Set(msgs.slice(answeredFrom, delivered)
+        .filter((m) => m.role === 'user' && m.author?.startsWith('user:') && addressedTo(m, MAIN_AGENT))
+        .map((m) => m.author!))] : [];
+      if (input.parentTaskId && speakers.length && patched(REPLY_TO_SPEAKERS)) await deliverReply(reply, speakers);
     } else {
       seen = delivered;
+      speakers = [];
     }
     if (turn.reviewInfo) {
       // A proposal-readiness/landing refusal resumes the SAME Do conversation.
@@ -2829,7 +2978,7 @@ async function softwareDevImpl(
     runningParticipant = key;
     let turn: AgentTurnResult | undefined;
     try {
-      turn = await withResolve(role, () => leasedTurn(role, (
+      const ran = await stoppableTurn(key, () => withResolve(role, () => leasedTurn(role, (
         accountConfigHome,
         accountApiKeyHandle,
         agentTurnId,
@@ -2862,7 +3011,9 @@ async function softwareDevImpl(
           ...(agentTurnId ? { agentTurnId } : {}),
           ...admission,
         });
-      }));
+      })));
+      if (!ran) return undefined;
+      turn = ran.value;
     } catch (e) {
       if (isCancellation(e)) throw e;
       log.warn('agent turn failed', { participant: key, e: String(e) });
@@ -2885,6 +3036,33 @@ async function softwareDevImpl(
     if (turn.subTasks?.length) await spawnSubTasks(turn.subTasks);
     if (turn.subTaskResponses?.length) await applySubTaskResponses(turn.subTaskResponses);
     return { ...turn, ...(reply ? { reply } : {}) };
+  }
+
+  /** Run agent `key`'s turn so `stopAgent` can end it (v1.27), including the
+   * waits before and around it. Undefined when it was stopped: the
+   * conversation says so and the stage it ran in is restored. */
+  async function stoppableTurn<T>(key: string, fn: () => Promise<T>): Promise<{ value: T } | undefined> {
+    const at = stage;
+    turnOwners.push(key);
+    try {
+      return { value: await fn() };
+    } catch (e) {
+      if (cancelled || !halted()) throw e;
+      stage = at;
+      noteStopped(key, stopping);
+      return undefined;
+    } finally {
+      turnOwners.pop();
+      if (stopping?.key === key && !turnOwners.includes(key)) stopping = undefined;
+    }
+  }
+
+  /** Say in the conversation that agent `key` was stopped. It is addressed to
+   * no one: it calls no agent. */
+  function noteStopped(key: string, stop?: { by?: string; byLabel?: string }): void {
+    lastStoppedBy = stop?.by;
+    msgs.push({ id: `stop-${msgs.length}`, role: 'system', to: [], ts: msgs.length,
+      text: `${stop?.byLabel ? `${stop.byLabel} stopped` : 'Stopped'} ${participantLabel(key)}.` });
   }
 
   /** Address `reply` and act on it: agents it names are called, people it names
@@ -2922,6 +3100,22 @@ async function softwareDevImpl(
       waitingFor = resume.waitingFor;
       await publish();
     }
+  }
+
+  /** After the main agent was stopped: it waits, like a terminal after Ctrl+C,
+   * for the next message to it (or Open PR). True when the task was cancelled. */
+  async function waitAfterStop(): Promise<boolean> {
+    const mark = msgs.length;
+    stage = 'do';
+    status = 'waiting';
+    // Whoever stopped it is at the keyboard; an agent's stop asks the creator.
+    const audience = lastStoppedBy?.startsWith('user:') ? [lastStoppedBy] : ['@creator'];
+    waitingFor = { kind: 'human', audience, detail: 'Stopped. Send a message to continue.' };
+    await publish();
+    await waitServing(() => cancelled || prRequested || mainUnreadSince(mark));
+    waitingFor = undefined;
+    status = 'active';
+    return cancelled;
   }
 
   /** Wait for `ready` while staying responsive to agents called meanwhile:
@@ -3141,10 +3335,6 @@ Inspect the complete current diff and specifically compare its delta from the re
     }
   }
 
-  function subtaskRaiseText(r: ChildRaise): string {
-    return `Sub-task "${r.childTitle}" (${r.childTaskId}) needs you — ${r.type}${r.detail ? `: ${r.detail}` : ''}. Answer with respond_to_sub_task (confirm | comment | retry | cancel).`;
-  }
-
   /**
    * Fold any pending child events (raises + settlements) into the Do conversation so
    * the agent sees them at the top of its next turn (SPEC §5.3). This is what lets the
@@ -3168,6 +3358,7 @@ Inspect the complete current diff and specifically compare its delta from the re
       if (((recovery && patched('software-dev-preserve-replacement-children-v1')) || durableChildSettlement)
         && !outstanding.has(s.childTaskId)) continue;
       subtaskNags = 0;
+      if (s.stage === 'done') childLandedSinceRefresh = true;
       outstanding.delete(s.childTaskId);
       awaitingResponse.delete(s.childTaskId);
       msgs.push({
@@ -3270,10 +3461,26 @@ Inspect the complete current diff and specifically compare its delta from the re
     runStart = { events: workflowInfo().historyLength, bytes: workflowInfo().historySize };
   }
 
+  /** A question ending the agent's turn asks the task's usual people and,
+   * since software-dev 1.27, whoever spoke to the agent in what it answered. */
+  function askOf(route: string[]): string[] {
+    return speakers.length && patched(REPLY_TO_SPEAKERS) ? [...new Set([...route, ...speakers])] : route;
+  }
+
+  /** ` (already sent to Bea, who spoke to it)` when the agent's last reply also
+   * went to people, so a parent does not relay it to them again. */
+  function alsoSentTo(): string {
+    const reply = msgs[seen - 1];
+    const people = reply?.role === 'agent' && messageAuthor(reply) === MAIN_AGENT ? reply.to ?? [] : [];
+    if (!people.length) return '';
+    const label = (selector: string) => msgs.find((m) => m.author === selector && m.authorLabel)?.authorLabel ?? selector;
+    return ` (already sent to ${people.map(label).join(', ')}, who spoke to it)`;
+  }
+
   /** Tell our parent (if any) we need a decision (SPEC §5.3). Best effort — if the
    *  parent is gone the child stays human-resolvable via its own retry/confirm. */
   /** Raise to the parent; false when there is none (or it is gone). */
-  async function notifyParent(type: ChildRaise['type'], detail?: string): Promise<boolean> {
+  async function notifyParent(type: ChildRaise['type'], detail?: string, choices?: ChildRaise['choices']): Promise<boolean> {
     if (!input.parentTaskId) return false;
     try {
       await getExternalWorkflowHandle(input.parentTaskId).signal(raiseFromChildSignal, {
@@ -3281,6 +3488,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         childTitle: input.title,
         type,
         detail: detail ?? '',
+        ...(choices?.length ? { choices } : {}),
       });
       return true;
     } catch {
@@ -3497,6 +3705,10 @@ Inspect the complete current diff and specifically compare its delta from the re
     // sees their raises/results at the top of this turn — this is what lets us keep
     // working while they run, rather than blocking on them.
     drainChildEvents();
+    if (childLandedSinceRefresh) {
+      childLandedSinceRefresh = false;
+      if (resourceCandidateReview && patched('subtask-resource-refresh-v1')) await refreshResourcesFromChildren();
+    }
     await publish();
     if (cancelled) return await abort();
     // An agent called while the task was elsewhere (an interrupted pause, a
@@ -3522,6 +3734,10 @@ Inspect the complete current diff and specifically compare its delta from the re
     )
       ? { completed: true, providerCompleted: true, output: '', openPrRequested: true }
       : await doTurn();
+    if ('stopped' in turn && turn.stopped) {
+      if (await waitAfterStop()) return await abort();
+      continue;
+    }
     // Sub-tasks run in the BACKGROUND: spawn is non-blocking, and answers go straight
     // down to the children they target (SPEC §5.3).
     if (turn.subTasks?.length) await spawnSubTasks(turn.subTasks);
@@ -3565,6 +3781,8 @@ Inspect the complete current diff and specifically compare its delta from the re
       }
       const rerouted = pendingReroute;
       pendingReroute = undefined;
+      // A paused agent can be stopped too: its pause ends without resuming it.
+      if (multiAgent) turnOwners.push(MAIN_AGENT);
       const note = await waitForAgent(turn.wait, {
         world,
         ...(input.waitMinuteMs ? { minuteMs: input.waitMinuteMs } : {}),
@@ -3580,12 +3798,18 @@ Inspect the complete current diff and specifically compare its delta from the re
         park: async (next) => { status = 'waiting'; waitingFor = next; await publish(); },
         // A Needs input hold offers Open PR, like any input hold in Do (and a parent may send it).
         interrupted: () => cancelled || mainUnread() || raises.length > 0 || settled.length > 0
-          || (!!needsInput && prRequested),
+          || (!!needsInput && prRequested) || halted(),
         // Agents called while the main agent is paused run now; its pause goes
         // on unless what they say is for it.
         ...(multiAgent ? { serveable: () => agentQueue.length > 0 && !cancelled, serve: runCalledAgents } : {}),
-      });
+      }).finally(() => { if (multiAgent) turnOwners.pop(); });
       if (cancelled) return await abort();
+      if (multiAgent && stopping?.key === MAIN_AGENT) {
+        noteStopped(MAIN_AGENT, stopping);
+        stopping = undefined;
+        if (await waitAfterStop()) return await abort();
+        continue;
+      }
       if (note) msgs.push({ id: `wait-${msgs.length}`, role: 'user', text: note, ts: msgs.length });
       continue;
     }
@@ -3865,7 +4089,7 @@ Inspect the complete current diff and specifically compare its delta from the re
             // own last words (its question, or what it says it finished).
             await notifyParent(turn.raise?.type ?? 'needs_confirmation', turn.raise?.detail
               ?? `Its Do turn ended without opening a PR. Confirm to open the PR if the work is truly complete; otherwise comment.${turn.output?.trim()
-                ? `\n\nIts last message:\n${clip(turn.output.trim(), PARENT_RAISE_OUTPUT_CHARS)}` : ''}`);
+                ? `\n\nIts last message${alsoSentTo()}:\n${clip(turn.output.trim(), PARENT_RAISE_OUTPUT_CHARS)}` : ''}`);
             await publish();
             await waitServing(() => prRequested || cancelled || mainUnread());
           } else {
@@ -3908,9 +4132,9 @@ Inspect the complete current diff and specifically compare its delta from the re
               } else {
                 waitingFor = {
                   kind: 'human',
-                  audience: routedInputResponder && route?.kind === 'human' && route.audience?.length
+                  audience: askOf(routedInputResponder && route?.kind === 'human' && route.audience?.length
                     ? route.audience
-                    : ['@creator'],
+                    : ['@creator']),
                   detail: boundedResponses && route?.kind === 'agent' && responderRounds >= 3
                     ? `Three automated responses have not resolved this pause. ${question}` : question,
                 };
@@ -4115,7 +4339,7 @@ Inspect the complete current diff and specifically compare its delta from the re
   // Recovery may carry an already-approved proposal across a replacement run
   // and bypass the review gate. Finish any interrupted resource publication too.
   if (restoredReviewApproved && resourceCandidateReview && !resourcesApplied
-    && patched('automatic-resource-review-restored-v1') && !(await applyReviewedResources())) return await abort();
+    && patched('automatic-resource-review-restored-v1') && (await applyReviewedResources()) !== 'applied') return await abort();
 
   if (repositoryless) {
     stage = 'done';
@@ -5125,6 +5349,34 @@ export function sameProposalIdentity(
 }
 
 /** Extract a meaningful message, following Temporal's wrapped `.cause` chain. */
+/** The original failure's own words, without the activity wrapping. */
+const RAISE_CHOICES: Partial<Record<SubTaskAction, string>> = {
+  keep_own: 'publish again keeping its version of the conflicting files',
+};
+
+/** What a parent's Do agent reads when a sub-task raises to it. */
+export function subtaskRaiseText(r: ChildRaise): string {
+  const extra = (r.choices ?? []).filter((choice) => RAISE_CHOICES[choice]).map((choice) => ` | ${choice}: ${RAISE_CHOICES[choice]}`).join('');
+  return `Sub-task "${r.childTitle}" (${r.childTaskId}) needs you — ${r.type}${r.detail ? `: ${r.detail}` : ''}. Answer with respond_to_sub_task (confirm | comment | retry | cancel${extra}).`
+    // #533/#454: a parent "relayed" a question in its own reply, which no
+    // person reads while it waits for sub-tasks, and told the child to wait.
+    + ` If only a person can answer, pass it to them with escalate(to, note, task_id: "${r.childTaskId}"): it waits for them and their reply goes to the sub-task. While you wait for sub-tasks, your own reply reaches nobody.`;
+}
+
+/** The type of the innermost ApplicationFailure that names one. */
+function failureType(err: any): string | undefined {
+  let type: string | undefined;
+  for (let e: any = err, depth = 0; e && depth < 6; depth++, e = e.cause) if (typeof e.type === 'string') type = e.type;
+  return type;
+}
+
+function innermostMessage(err: any): string {
+  let e: any = err;
+  let message = '';
+  for (let depth = 0; e && depth < 6; depth++) { if (e.message) message = e.message; e = e.cause; }
+  return message || String(err);
+}
+
 function describeError(err: any): string {
   const parts: string[] = [];
   let e: any = err;

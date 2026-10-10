@@ -56,6 +56,7 @@ global.DEFAULT_LIST_QUERY = 'for:me';
 global.api = async () => [];
 global.firstProjectForOrganization = () => null;
 global.syncOrganizationSwitcher = () => { calls.push(`syncOrganizationSwitcher:${S.organizationId}`); };
+global.renamedOrganizationPath = () => '';
 
 // Previous project 'A' with a live query, a stale search result and a roving
 // cursor — none of which belong to project 'B'.
@@ -77,6 +78,7 @@ global.S = {
 
 eval(extractFn('applyRoute'));
 eval(extractFn('applyHomeRoute'));
+eval(extractFn('applyListRoute'));
 
 let pass = 0, fail = 0;
 const ok = (cond, msg) => { if (cond) { pass++; } else { fail++; console.error('FAIL:', msg); } };

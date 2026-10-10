@@ -6,9 +6,26 @@ import { Store } from '../src/store/db.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 import { KarmaxApi } from '../src/platform/api.js';
 import { MANIFESTS } from '../src/contrib/manifests.js';
+import { reconcileTasks } from '../src/platform/reconcile.js';
+import { mergeQueueDomains } from '../src/domain/types.js';
+import { mergeQueueId, SIG_CANCEL_MERGE } from '../src/coordinators/names.js';
+import { WorkflowFailedError } from '@temporalio/client';
+import { TerminatedFailure } from '@temporalio/common';
 // Derived, not hard-coded: the pinned type moves every time a workflow ships a
 // new replay version, and a literal here just makes an unrelated PR red.
 const bundledVersion = (name: string) => MANIFESTS.find((m) => m.name === name)!.version;
+
+/** A Temporal client for a task whose run already closed: starts are
+ * recorded, the coordinators answer, and the closed run itself is never
+ * signalled. */
+const closedRunClient = (taskId: string, starts: any[], withdrawals: string[] = []) => ({ workflow: {
+  start: async (...args: any[]) => void starts.push(args),
+  signalWithStart: async (_type: string, options: any) => void withdrawals.push(`${options.signal}:${options.workflowId}`),
+  getHandle: (id: string) => {
+    if (id === taskId) throw new Error('a closed workflow must not be signalled');
+    return { query: async () => undefined, signal: async (name: string) => void withdrawals.push(`${name}:${id}`) };
+  },
+} }) as any;
 
 describe('failed software-dev recovery', () => {
   const dirs: string[] = [];
@@ -150,7 +167,7 @@ describe('failed software-dev recovery', () => {
     (await store.kvSet(`sessionmeta:${task.id}:do`, JSON.stringify({ home: '' })));
 
     const starts: any[] = [];
-    const client = { workflow: { start: async (...args: any[]) => void starts.push(args), getHandle: () => { throw new Error('closed workflow must not be signalled'); } } } as any;
+    const client = closedRunClient(task.id, starts);
     const api = new KarmaxApi({ store, client, taskQueue: 'test', tokens });
 
     const failed = await api.getTaskView(token, task.id);
@@ -175,6 +192,117 @@ describe('failed software-dev recovery', () => {
     expect(fs.readFileSync(path.join(world, 'dirty-work.txt'), 'utf8')).toBe('must survive');
     expect((await store.getTask(task.id))?.lastView).toMatchObject({ stage: 'do', status: 'active' });
     expect((await store.getTask(task.id))?.workflowVersion).toBe(bundledVersion('software-dev'));
+  });
+
+  // Task #367: Temporal terminated the run for its history size while Landing
+  // verified the last candidate. One PR of its set had already merged, so the
+  // point of no return had passed, and Done was the only way out even though
+  // its sandbox, branches and open PRs were intact.
+  it('retries a run terminated mid-Landing after one of its PRs merged', async () => {
+    const store = (await Store.create(':memory:'));
+    const tokens = new TokenAuthority();
+    const token = (await tokens.mint({
+      taskId: 'operator', profileId: 'do', principal: 'user:test',
+      ceiling: ['read-task', 'signal-task'], grantorCaps: ['read-task', 'signal-task'],
+    })).token;
+    const project = (await store.createProject('Partial landing', { defaultBase: 'main', defaultTarget: 'main' }));
+    const task = (await store.createTask({
+      projectId: project.id, title: 'Review everything', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'review', base: 'main', target: 'main' },
+    }));
+    const branch = `tavya/${task.id}`;
+    const world = {
+      kind: 'e2b', id: task.id, root: '/home/user/work', workdir: '/home/user/work/app', branch, base: 'main', target: 'main',
+      repos: ['app', 'wiki'].map((name) => ({ name, repo: `git@github.com:acme/${name}.git`, root: `/home/user/work/${name}`, branch, base: 'main' })),
+      meta: { sandboxId: 'sbx-367' },
+    };
+    const prs = [
+      { repo: 'wiki', slug: 'acme/wiki', number: 57, url: 'https://github.com/acme/wiki/pull/57', state: 'merged', merged: true, headSha: 'w1' },
+      { repo: 'app', slug: 'acme/app', number: 392, url: 'https://github.com/acme/app/pull/392', state: 'open', merged: false, headSha: 'a1' },
+    ] as any[];
+    (await store.saveView(task.id, {
+      taskId: task.id, title: task.title, workflow: 'software-dev', stage: 'merge', status: 'active',
+      messages: [{ id: 'm0', role: 'user', text: 'review', ts: 0 }, { id: 'a1', role: 'agent', text: 'proposal ready', ts: 1 }],
+      transcripts: [], actions: [], state: { recoveryWorld: world, turnsSeen: 2 },
+      world, branch, base: 'main', targetBranch: 'main', pr: prs[0], prs, pointOfNoReturnPassed: true,
+      landing: { authorization: 'authorized', validation: 'pending', provider: 'validating',
+        authorizedHeads: { 'acme/wiki#57': 'w1', 'acme/app#392': 'a1' } },
+      waitingFor: { kind: 'agentSlot', provider: 'claude', detail: 'Starting agent' }, updatedAt: 1,
+    } as any));
+
+    const terminated = { workflow: { getHandle: () => ({
+      describe: async () => ({ status: { name: 'TERMINATED' }, runId: 'run-367' }),
+      result: async () => { throw new WorkflowFailedError('Workflow execution failed',
+        new TerminatedFailure('Workflow history size exceeds limit.'), 'NON_RETRYABLE_FAILURE'); },
+    }) } } as any;
+    (await reconcileTasks(store, terminated));
+    // The failure keeps the stage it interrupted; nothing else in the view says so.
+    expect((await store.getTask(task.id))?.lastView).toMatchObject({
+      stage: 'failed', status: 'failed', pointOfNoReturnPassed: true, state: { failedFrom: 'merge' },
+    });
+
+    const starts: any[] = [];
+    const withdrawals: string[] = [];
+    const client = closedRunClient(task.id, starts, withdrawals);
+    const api = new KarmaxApi({ store, client, taskQueue: 'test', tokens });
+    const failed = await api.getTaskView(token, task.id);
+    // Retry and follow-up stay available; discarding or cancelling a partly
+    // landed task does not.
+    expect(failed?.stageTransitions?.map((move) => move.target)).toEqual(['do', 'done']);
+    expect(failed?.actions.map((action) => action.name)).toEqual(['retry', 'followUp']);
+    await expect(api.signalTask(token, task.id, 'cancel')).rejects.toThrow(/point of no return/);
+    await expect(api.moveTaskStage(token, task.id, 'draft')).rejects.toThrow(/cannot move/);
+
+    // The header's Retry and the action's retry are one recovery.
+    await api.moveTaskStage(token, task.id, 'do');
+    expect(starts).toHaveLength(1);
+    const options = starts[0]![1];
+    expect(options.workflowIdReusePolicy).toBe('ALLOW_DUPLICATE_FAILED_ONLY');
+    const recovery = options.args[0].recovery;
+    expect(recovery).toMatchObject({
+      world, prs, resumeStage: 'do', pointOfNoReturnPassed: true, seen: 2,
+      // An authorized landing that failed becomes an integration repair: the
+      // human's authorization holds, and the repaired head is reviewed again.
+      repairValidationPending: true,
+      landing: { authorization: 'authorized', provider: 'ejected', authorizedHeads: { 'acme/app#392': 'a1' } },
+    });
+    expect(recovery.messages.at(-1).text).toMatch(/recovered this task.*Workflow history size exceeds limit/s);
+    // The terminated run never released its merge-queue place, and the queue
+    // cannot tell it from the replacement, which shares its id.
+    expect(withdrawals).toEqual(mergeQueueDomains(world as any, 'main', project.id)
+      .map((domain) => `${SIG_CANCEL_MERGE}:${mergeQueueId(domain)}`));
+    const resumed = (await store.getTask(task.id))?.lastView;
+    expect(resumed).toMatchObject({ stage: 'do', status: 'active', pointOfNoReturnPassed: true });
+    expect(resumed?.state.failedFrom).toBeUndefined();
+  });
+
+  it('sends a retried failure through human Review when the stage it failed in is unknown', async () => {
+    const store = (await Store.create(':memory:'));
+    const tokens = new TokenAuthority();
+    const token = (await tokens.mint({
+      taskId: 'operator', profileId: 'do', principal: 'user:test',
+      ceiling: ['read-task', 'signal-task'], grantorCaps: ['read-task', 'signal-task'],
+    })).token;
+    const project = (await store.createProject('Legacy failure', { defaultBase: 'main', defaultTarget: 'main' }));
+    const task = (await store.createTask({
+      projectId: project.id, title: 'Failed before failedFrom', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'x', base: 'main', target: 'main' },
+    }));
+    const world = { kind: 'e2b', id: task.id, root: '/w', branch: `tavya/${task.id}`, base: 'main', target: 'main' };
+    (await store.saveView(task.id, {
+      taskId: task.id, title: task.title, workflow: 'software-dev', stage: 'failed', status: 'failed',
+      messages: [{ id: 'm0', role: 'user', text: 'x', ts: 0 }], transcripts: [], actions: [],
+      state: { recoveryWorld: world }, pointOfNoReturnPassed: true, error: 'workflow terminated: Workflow history size exceeds limit.',
+      landing: { authorization: 'authorized', validation: 'pending', provider: 'validating', authorizedHeads: {} },
+      updatedAt: 1,
+    } as any));
+    const starts: any[] = [];
+    const client = closedRunClient(task.id, starts);
+    const api = new KarmaxApi({ store, client, taskQueue: 'test', tokens });
+
+    await api.signalTask(token, task.id, 'retry');
+    expect(starts[0]![1].args[0].recovery.repairValidationPending).toBeUndefined();
+    expect(starts[0]![1].args[0].recovery).toMatchObject({ pointOfNoReturnPassed: true, landing: { authorization: 'authorized' } });
   });
 
   it('queries through a stale v1 account-wait snapshot but keeps current snapshots fast', async () => {

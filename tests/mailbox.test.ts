@@ -9,7 +9,11 @@ function memStore(): AgentMailStore {
 }
 
 const savedEnv = { ...process.env };
-afterEach(() => { process.env = { ...savedEnv }; });
+// Restore in place: replacing process.env detaches it from vi.stubEnv.
+afterEach(() => {
+  for (const key of Object.keys(process.env)) if (!(key in savedEnv)) delete process.env[key];
+  Object.assign(process.env, savedEnv);
+});
 
 describe('mailbox providers (§8: connect once, not an env var)', () => {
   it('self-managed: validates and stores a domain, forms the mint domain', () => {

@@ -21,7 +21,7 @@ const { fakeConsole, launch, reply } = require('../tests/helpers/fake-console.cj
         tags.push(tag);
         return tag;
       }
-      if (p === '/api/projects/p/search' || p === '/api/search') {
+      if (p === '/api/projects/p/search') {
         if (searchDelay) await new Promise(resolve => setTimeout(resolve, searchDelay));
         if (failSearch) return reply(503, { error: 'Search temporarily unavailable' });
       }
@@ -47,17 +47,7 @@ const { fakeConsole, launch, reply } = require('../tests/helpers/fake-console.cj
     await page.waitForFunction(() => document.querySelector('#tagm-name').value === '');
     assert.equal(await page.locator('#tagm-edit-name').inputValue(), 'Unsaved tag edit');
     await page.locator('#tagm-close').click();
-    await page.getByRole('button', { name: /Search everything/ }).click();
-    searchDelay = 150;
-    await page.locator('#gs-in').fill('Review');
-    await page.locator('.global-search-result').waitFor();
-    failSearch = true;
-    await page.locator('#gs-in').fill('offline');
-    await page.locator('#gs-list button').waitFor();
-    failSearch = false;
-    await page.locator('#gs-list button').click();
-    await page.locator('.global-search-result').waitFor();
-    await page.locator('#gs-close').click();
+    assert.equal(await page.locator('#topbar-search').count(), 0, 'lists are the search; the topbar has none');
     await page.locator('[data-id="t"] .row-link').click();
     await page.locator('#tp-body').waitFor();
     const before = requests.length;
@@ -77,7 +67,7 @@ const { fakeConsole, launch, reply } = require('../tests/helpers/fake-console.cj
     await page.getByRole('button', { name: 'Open full task form', exact: true }).click();
     const draft = '世界 <img src=x onerror=alert(1)> ' + 'long draft '.repeat(200);
     await page.locator('#tf-page textarea').first().fill(draft);
-    await page.locator('#topbar-palette').click();
+    await page.locator('#rail-palette').click();
     await page.locator('#pal-in').waitFor();
     assert.equal(await page.locator('#tf-page textarea').first().inputValue(), draft);
     await page.locator('#pal-in').press('Escape');

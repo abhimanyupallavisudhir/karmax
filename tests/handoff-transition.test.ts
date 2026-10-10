@@ -38,10 +38,11 @@ async function fixture() {
   const open = vi.fn(async () => ({ handle }));
   const park = vi.fn(async () => { parked = true; return handle; });
   const scrubSecrets = vi.fn(async () => {});
+  const importWorkspaceSnapshot = vi.fn(async () => {});
   worlds.register({ kind: 'e2b', capabilities: { remote: true }, open, park, status: async () => parked ? 'parked' : 'ready' } as any);
   const importBranch = vi.spyOn(gitBroker, 'brokerRefreshBranch').mockResolvedValue({ updated: [] });
-  const handoff = new WorldHandoffService(store, worlds, {} as any, runners as any, undefined, undefined, { scrubSecrets } as any);
-  return { store, task, view, handle, worlds, runners, open, park, scrubSecrets, handoff, importBranch };
+  const handoff = new WorldHandoffService(store, worlds, {} as any, runners as any, undefined, undefined, { scrubSecrets, importWorkspaceSnapshot } as any);
+  return { store, task, view, handle, worlds, runners, open, park, scrubSecrets, importWorkspaceSnapshot, handoff, importBranch };
 }
 
 it('imports, parks and releases its admission under one transition', async () => {
@@ -91,4 +92,19 @@ it('releases a newly acquired lease exactly once if opening fails', async () => 
   expect(f.runners.release).toHaveBeenCalledOnce();
   expect(await f.store.activeWorldLeaseCount(f.task.id)).toBe(0);
   expect((await f.store.currentWorld(f.task.id))?.meta?.worldLeaseId).toBeNull();
+});
+
+it('imports a workspace\'s resource snapshots into the same opened world, with or without its branch (tavya push)', async () => {
+  const f = await fixture();
+  const snapshot = 'a'.repeat(64);
+  expect(await f.handoff.importLocal(f.task.id, f.view, { git: false, resources: [{ id: 'resource_1', snapshot }] }))
+    .toEqual({ updated: [], resources: ['resource_1'], parked: true });
+  expect(f.importBranch).not.toHaveBeenCalled();
+  expect(f.importWorkspaceSnapshot).toHaveBeenCalledWith(f.task.id, expect.objectContaining({ handle: f.handle }), 'resource_1', snapshot);
+  expect(f.park).toHaveBeenCalledOnce();
+  const event = (await f.store.eventsSince(f.task.id, 0)).find((entry) => entry.type === 'world.local-handoff-imported');
+  expect(event?.payload).toMatchObject({ resources: ['resource_1'] });
+
+  await f.handoff.importLocal(f.task.id, f.view, { git: true, resources: [{ id: 'resource_1', snapshot }] });
+  expect(f.importBranch).toHaveBeenCalledOnce();
 });

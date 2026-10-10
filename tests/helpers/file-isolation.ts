@@ -18,8 +18,14 @@ if (testPath && /\bvi\.(?:mock|doMock)\(/.test(fs.readFileSync(testPath, 'utf8')
 
 // Environment variables and globals (assigned directly or stubbed) return to
 // what this file started with. The file's own afterAll hooks run first.
+// vi.stubEnv writes through a proxy whose deletes reach the process.env object
+// Vitest started with, so a file that replaces it (`process.env = {...}`) would
+// leave every later vi.unstubAllEnvs() unable to remove a stub (CI #1650:
+// git-transfer's size limit outlived its test). Put that object back first.
+const originalEnvironment: NodeJS.ProcessEnv = ((globalThis as Record<symbol, unknown>)[Symbol.for('karmax.test.processEnv')] ??= process.env) as NodeJS.ProcessEnv;
 const environment = { ...process.env };
 afterAll(() => {
+  if (process.env !== originalEnvironment) process.env = originalEnvironment;
   vi.unstubAllGlobals();
   vi.unstubAllEnvs();
   for (const key of Object.keys(process.env)) if (!(key in environment)) delete process.env[key];

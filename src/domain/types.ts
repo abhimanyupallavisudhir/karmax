@@ -45,6 +45,8 @@ export interface Organization {
   id: string;
   name: string;
   slug: string;
+  /** Slugs from before a rename; their URLs still lead here. */
+  previousSlugs?: string[];
   kind: 'personal' | 'team';
   /** Hosted billing selection. Private installations ignore monetization plans. */
   plan: HostedPlanId;
@@ -595,9 +597,10 @@ export interface ProjectConfig {
   worldProvider?: string;
   /** Resume provider-backed worlds after a parked wait (§11.3). */
   resumeWorlds?: boolean;
-  /** Hosted execution pool and declared resources. */
+  /** Hosted execution pool and declared resources. `diskGb` is the free space
+   * the task's files get (E2B: template `minFreeDiskMb`; Daytona: disk size). */
   runnerPoolId?: string;
-  resources?: { cpu?: number; memoryMb?: number; gpu?: number };
+  resources?: { cpu?: number; memoryMb?: number; diskGb?: number; gpu?: number };
   /** Remote-world egress policy. Normal coding uses unrestricted internet;
    * allowlists are an explicit organization-level hardening mode. */
   network?: { allowDomains?: string[]; allowCidrs?: string[]; unrestricted?: boolean };
@@ -615,11 +618,17 @@ export interface ProjectConfig {
 export type ResourceAccess = 'read' | 'write';
 export type ResourceIsolation = 'fork' | 'shared';
 export type ResourcePublishPolicy = 'discard' | 'review';
+/** A location inside a world. With `repository` (a world checkout name, like
+ * `ProjectEnvironmentSpec.install` keys) `path` is relative to that checkout;
+ * without, to the task working directory: the sole development checkout, or
+ * the encompassing workspace for multiple development repositories. */
+export interface WorldLocation { path: string; repository?: string }
+
 export type ResourceTarget =
-  /** Relative to the task working directory: the sole development checkout,
-   * or the encompassing workspace for multiple development repositories. */
-  | { kind: 'path'; path: string }
-  | { kind: 'environment'; name: string }
+  | ({ kind: 'path' } & WorldLocation)
+  /** With `dotenv`, a line of that `.env` file instead of an exported variable:
+   * repositories in one project may each need their own value for a name. */
+  | { kind: 'environment'; name: string; dotenv?: WorldLocation }
   | { kind: 'service'; name: string };
 
 /** Durable, secret-free project attachment. Driver configuration may contain
@@ -1335,7 +1344,8 @@ export interface AgentActivity {
   /** Provider item/tool id. Repeated updates with the same id replace in-place. */
   id: string;
   kind: 'message' | 'reasoning' | 'command' | 'file' | 'tool' | 'search' | 'subagent' | 'status' | 'turn' | 'error';
-  phase: 'started' | 'updated' | 'completed' | 'failed';
+  /** `stopped`: a turn someone stopped (or whose task was cancelled). */
+  phase: 'started' | 'updated' | 'completed' | 'failed' | 'stopped';
   /** Compact human-facing label, e.g. "Read package.json" or "npm test". */
   title: string;
   /** Optional bounded detail (command output, tool arguments/result, progress). */
@@ -1417,11 +1427,15 @@ export interface ActionArg {
 
 // ─── Parameter schema (SPEC §10.4) — drives task forms + settings + defaults ──
 
-export type FieldType = 'text' | 'string' | 'number' | 'boolean' | 'select' | 'list' | 'repoPath' | 'branch' | 'agent' | 'confirmer' | 'responder';
+export type FieldType = 'text' | 'string' | 'number' | 'boolean' | 'select' | 'list' | 'repoPath' | 'branch' | 'repoBranches' | 'agent' | 'confirmer' | 'responder' | 'computer';
+/** Per-repository base/target branches, keyed by the repository source as the
+ * project lists it. A repository without an entry (or a blank name) uses the
+ * task's common base/target. */
+export type RepoBranches = Record<string, { base?: string; target?: string }>;
 /** Which surfaces a field appears on. */
 export type FieldScope = 'task' | 'project' | 'global';
 /** Where a resolved value lands in TaskInput (the generic assembler reads this). */
-export type FieldBind = 'prompt' | 'top' | 'project' | 'profile' | 'confirm' | 'responder';
+export type FieldBind = 'prompt' | 'top' | 'project' | 'profile' | 'confirm' | 'responder' | 'computer';
 /**
  * When a param may be edited after the task is queued (SPEC §4.5/§5.5). This is
  * the single declaration that drives in-flight edits: the workflow validator
@@ -1483,8 +1497,11 @@ export interface TaskParticipant {
   role: AgentRole;
   /** Effective harness selection (authority is projected separately). */
   spec?: Partial<AgentSpec>;
-  /** queued: called and waiting for the running agent's turn to end. */
-  state: 'idle' | 'queued' | 'running';
+  /** running: working now. waiting: in its turn but waiting (for a
+   * credential, host capacity, a retry, people, its pause, or another agent).
+   * queued: called and waiting for the running agent's turn to end. Every
+   * state but idle can be stopped. */
+  state: 'idle' | 'queued' | 'running' | 'waiting';
   /** Messages this agent has authored. */
   messages: number;
 }
@@ -1751,6 +1768,10 @@ export interface TaskView {
    * by the gateway from the manifest schema (the workflow needn't know its schema).
    */
   editableParams?: string[];
+  /** The machine this task's Computer now asks for, while its world still runs
+   * on the one it was made on: it moves when the world parks (wiki
+   * features/computers). Enriched by the API. */
+  computerChange?: { from: { cpu?: number; memoryMb?: number; diskGb?: number }; to: { cpu?: number; memoryMb?: number; diskGb?: number } };
   updatedAt: number;
 }
 
@@ -1807,6 +1828,9 @@ export interface TaskInput {
   files?: FileRef[];
   base?: string;
   target?: string;
+  /** Per-repository branches (the `repoBranches` field). Provisioning reads the
+   * copy persisted on the task record when it is queued. */
+  repoBranches?: RepoBranches;
   /** Existing branch to merge (merge-only workflow). */
   branch?: string;
   command?: string;
@@ -1887,6 +1911,9 @@ export interface TaskRecoveryCheckpoint {
   /** The preserved intent-authorized proposal changed in Do and needs an
    * automatic integration review before provider re-admission. */
   repairValidationPending?: boolean;
+  /** Part of the proposal already landed: the replacement must never offer
+   * cancellation or a discarding reset, and must reconcile the rest. */
+  pointOfNoReturnPassed?: boolean;
   /** Set when the run continued as new to bound its history. */
   continued?: TaskContinuation;
 }
@@ -1969,10 +1996,15 @@ export interface ChildRaise {
   childTitle: string;
   type: RaiseType;
   detail?: string;
+  /** Answers beyond the usual ones that this raise accepts (`keep_own` for a
+   *  publication refused over files the child and a newer version changed). */
+  choices?: SubTaskAction[];
 }
 
-/** How a parent's Do agent answers a child raise (the `respond_to_sub_task` tool). */
-export type SubTaskAction = 'open_pr' | 'confirm' | 'comment' | 'retry' | 'cancel';
+/** How a parent's Do agent answers a child raise (the `respond_to_sub_task` tool).
+ *  `keep_own`: publish again, keeping the child's version of conflicting files. */
+export const SUB_TASK_ACTIONS = ['open_pr', 'confirm', 'comment', 'retry', 'cancel', 'keep_own'] as const;
+export type SubTaskAction = typeof SUB_TASK_ACTIONS[number];
 
 /** Signal a parent sends DOWN to a child in response to a raise. */
 export interface ParentResponse {
