@@ -25,6 +25,7 @@ import {
   TaskParams,
   AgentProfile,
   TaskView,
+  AttentionAsk,
   ChildTaskSummary,
   ForkTaskSummary,
   ReviewInfo,
@@ -575,7 +576,7 @@ export class Store {
         id TEXT PRIMARY KEY, projectId TEXT NOT NULL, listId TEXT NOT NULL,
         title TEXT NOT NULL, workflow TEXT NOT NULL, workflowVersion TEXT NOT NULL,
         params TEXT NOT NULL, createdAt INTEGER NOT NULL, ord INTEGER NOT NULL,
-        parentTaskId TEXT, lastView TEXT, completedAt INTEGER, createdBy TEXT, assignee TEXT,
+        parentTaskId TEXT, lastView TEXT, completedAt INTEGER, statusChangedAt INTEGER, createdBy TEXT, assignee TEXT,
         delegate TEXT, confirmationPolicy TEXT
       );
       CREATE TABLE IF NOT EXISTS organizations (
@@ -1184,6 +1185,19 @@ export class Store {
         WHERE completedAt IS NULL AND json_extract(lastView, '$.status')='done'`));
     }
     (await this.db.exec('CREATE INDEX IF NOT EXISTS idx_tasks_completed_at ON tasks(completedAt, projectId)'));
+    if (!cols.some((c) => c.name === 'statusChangedAt')) {
+      (await this.db.exec('ALTER TABLE tasks ADD COLUMN statusChangedAt INTEGER'));
+      // The last lifecycle event whose stage, status or wait kind differs from
+      // the one before it (an agent turn or a wait's detail re-ticks it too).
+      (await this.db.exec(`WITH lifecycle AS (
+          SELECT taskId, seq, ts, COALESCE(json_extract(payload, '$.stage'), '') || '|' || COALESCE(json_extract(payload, '$.status'), '')
+            || '|' || COALESCE(json_extract(payload, '$.waitingFor'), '') AS state FROM events WHERE type='view.updated'),
+        changes AS (
+          SELECT taskId, ts, state, LAG(state) OVER (PARTITION BY taskId ORDER BY seq) AS previous FROM lifecycle),
+        latest AS (
+          SELECT taskId, MAX(ts) AS ts FROM changes WHERE previous IS NULL OR previous<>state GROUP BY taskId)
+        UPDATE tasks SET statusChangedAt=latest.ts FROM latest WHERE latest.taskId=tasks.id`));
+    }
     const projectCols = (await this.db.prepare('PRAGMA table_info(projects)').all()) as any[];
     const cardCols = (await this.db.prepare('PRAGMA table_info(cards)').all()) as { name: string }[];
     if (!cardCols.some((c) => c.name === 'externalId')) (await this.db.exec('ALTER TABLE cards ADD COLUMN externalId TEXT'));
@@ -3826,7 +3840,7 @@ export class Store {
   async listTaskSummaries(projectId: string): Promise<TaskRecord[]> {
     const rows = (await this.db.prepare(`SELECT
         t.id, t.num, t.projectId, t.listId, t.title, t.workflow,
-        t.executionWorkflow, t.workflowVersion, t.params, t.createdAt, t.ord,
+        t.executionWorkflow, t.workflowVersion, t.params, t.createdAt, t.statusChangedAt, t.ord,
         t.parentTaskId, t.createdBy, t.assignee, t.delegate,
         t.confirmationPolicy, t.intentId, t.attemptNumber, t.notes,
         CASE WHEN t.lastView IS NULL THEN NULL ELSE json_remove(
@@ -3902,7 +3916,7 @@ export class Store {
       JOIN tasks root ON root.id=i.id WHERE t.projectId=?${this.taskArchivePredicate(options.includeArchived)}${selection}`;
     const params = [projectId, ...(intentIds ?? [])];
     const projection = includeConversation ? 't.*' : `t.id, t.num, t.projectId, t.listId, t.title, t.workflow,
-      t.executionWorkflow, t.workflowVersion, t.params, t.createdAt, t.ord, t.parentTaskId,
+      t.executionWorkflow, t.workflowVersion, t.params, t.createdAt, t.statusChangedAt, t.ord, t.parentTaskId,
       t.createdBy, t.assignee, t.delegate, t.confirmationPolicy, t.intentId, t.attemptNumber, t.notes,
       json_remove(t.lastView, '$.messages', '$.transcripts', '$.reviewInfo') AS lastView`;
     const rows = await this.readRows<any>(`SELECT ${projection},
@@ -4059,7 +4073,7 @@ export class Store {
 
   async taskMetadataAsync(id: string): Promise<TaskRecord | undefined> {
     const [row] = await this.readRows<any>(`SELECT t.id, t.num, t.projectId, t.listId, t.title, t.workflow,
-      t.executionWorkflow, t.workflowVersion, t.params, t.createdAt, t.ord, t.parentTaskId,
+      t.executionWorkflow, t.workflowVersion, t.params, t.createdAt, t.statusChangedAt, t.ord, t.parentTaskId,
       t.createdBy, t.assignee, t.delegate, t.confirmationPolicy, t.intentId, t.attemptNumber,
       t.notes, t.lastView, COALESCE(t.num, root.num) AS resolvedNum FROM tasks t
       LEFT JOIN tasks root ON root.id=t.intentId WHERE t.id=?`, [id]);
@@ -4438,6 +4452,8 @@ export class Store {
         .run(JSON.stringify(status), JSON.stringify({ messages, transcripts }), taskId));
       (await this.db.prepare('DELETE FROM kv WHERE k=?').run(`retention:view:${taskId}`));
     }
+    if (!prev?.lastView || statusOf(prev.lastView) !== statusOf(view))
+      (await this.db.prepare('UPDATE tasks SET statusChangedAt=? WHERE id=?').run(Date.now(), taskId));
     if (view.stage === 'review' && view.status === 'waiting'
       && (prev?.lastView?.stage !== 'review' || prev.lastView.status !== 'waiting') && prev?.confirmationPolicy) {
       (await this.beginConfirmationCycle(taskId, prev.confirmationPolicy));
@@ -4884,16 +4900,21 @@ export class Store {
 
   /**
    * What needs this person in this organization now: task id → the kinds of the
-   * live asks routed to them. An actionable row is a live ask by construction
-   * (it is deleted when discharged); a mention asks for attention until it is
-   * read. Routine `update` rows never do. Reads by the (userId, …) indexes.
+   * live asks routed to them, and when the newest arrived. An actionable row is
+   * a live ask by construction (it is deleted when discharged); a mention asks
+   * for attention until it is read. Routine `update` rows never do. Reads by
+   * the (userId, …) indexes.
    */
-  async attentionAsks(userId: string, organizationId: string): Promise<Map<string, string[]>> {
-    const rows = (await this.db.prepare(`SELECT taskId, kind FROM inbox WHERE userId=? AND organizationId=?
+  async attentionAsks(userId: string, organizationId: string): Promise<Map<string, AttentionAsk>> {
+    const rows = (await this.db.prepare(`SELECT taskId, kind, createdAt FROM inbox WHERE userId=? AND organizationId=?
       AND kind<>'update' AND (actionable=1 OR unread=1) AND subject IS NULL ORDER BY urgency DESC, createdAt DESC`)
-      .all(userId, organizationId)) as Array<{ taskId: string; kind: string }>;
-    const out = new Map<string, string[]>();
-    for (const row of rows) (out.get(String(row.taskId)) ?? out.set(String(row.taskId), []).get(String(row.taskId))!).push(String(row.kind));
+      .all(userId, organizationId)) as Array<{ taskId: string; kind: string; createdAt: number }>;
+    const out = new Map<string, AttentionAsk>();
+    for (const row of rows) {
+      const ask = out.get(String(row.taskId)) ?? out.set(String(row.taskId), { kinds: [], at: 0 }).get(String(row.taskId))!;
+      ask.kinds.push(String(row.kind));
+      ask.at = Math.max(ask.at, Number(row.createdAt));
+    }
     return out;
   }
 
@@ -9833,6 +9854,12 @@ function rowToTaskView(row: { lastView?: string; conversation?: string }): TaskV
   return row.lastView ? { ...(row.conversation ? JSON.parse(row.conversation) : {}), ...JSON.parse(row.lastView) } : undefined;
 }
 
+/** What a task list shows of where a task is: its stage, status and what it
+ *  waits for (not an agent turn coming and going, nor a wait's detail). */
+function statusOf(view: Pick<TaskView, 'stage' | 'status' | 'waitingFor'>): string {
+  return [view.stage, view.status, view.waitingFor?.kind ?? ''].join('|');
+}
+
 function rowToTask(r: any): TaskRecord {
   return {
     id: r.id,
@@ -9847,6 +9874,7 @@ function rowToTask(r: any): TaskRecord {
     workflowVersion: r.workflowVersion,
     params: JSON.parse(r.params),
     createdAt: r.createdAt,
+    ...(r.statusChangedAt != null ? { statusChangedAt: r.statusChangedAt } : {}),
     order: r.ord,
     parentTaskId: r.parentTaskId ?? undefined,
     createdBy: parseJsonOptional<PrincipalRef>(r.createdBy),
