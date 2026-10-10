@@ -47,6 +47,7 @@ import { platformRequestPathError } from '../platform/platform-request.js';
 import { ContributionRegistry } from '../contrib/registry.js';
 import { Overlays } from '../store/overlays.js';
 import { activationTaskPrompt, manifest } from '../contrib/manifests.js';
+import { machineShape } from '../domain/computer.js';
 import { projectSettingsFor, globalSettingsFor, quickProjectSettingsFor, quickGlobalSettingsFor, quickScopeKey, settingsToProjectConfig, resolveParams, resolveParamsLayers, effectiveRepos } from '../platform/params.js';
 import { defaultProvider } from '../agent/adapters.js';
 import { findProviderSession } from '../agent/fork.js';
@@ -2907,6 +2908,9 @@ export class Gateway {
             if (policy.worldProvider && !['worktree', 'container', 'memory'].includes(String(policy.worldProvider))
               && !(await this.deps.providerConnections?.available(organizationId, String(policy.worldProvider))))
               throw new Error(`${policy.worldProvider} is not connected and verified`);
+            if (policy.resources && typeof policy.resources === 'object')
+              (await this.deps.providerConnections?.assertFits?.(organizationId,
+                String(policy.worldProvider ?? (await store.getOrganizationExecutionPolicy(organizationId)).worldProvider ?? ''), machineShape({ resources: policy.resources })));
             if (policy.runnerPoolId) {
               const pool = (await store.getRunnerPool(String(policy.runnerPoolId)));
               if (!pool || pool.organizationId !== organizationId) throw new Error('runner pool does not belong to this organization');
@@ -4145,6 +4149,8 @@ export class Gateway {
             if (effective.worldProvider && !['worktree', 'container', 'memory'].includes(effective.worldProvider)
               && !(await this.deps.providerConnections?.available(project.organizationId!, effective.worldProvider)))
               throw new Error(`${effective.worldProvider} is not connected and verified in Organization settings`);
+            if (override.resources && typeof override.resources === 'object')
+              (await this.deps.providerConnections?.assertFits?.(project.organizationId!, effective.worldProvider, machineShape({ resources: override.resources })));
             if (effective.runnerPoolId) {
               const pool = (await store.getRunnerPool(effective.runnerPoolId));
               if (!pool || pool.organizationId !== project.organizationId) throw new Error('runner pool does not belong to this organization');

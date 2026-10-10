@@ -12,6 +12,7 @@ import { Overlays } from '../src/store/overlays.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { KarmaxApi } from '../src/platform/api.js';
 import { seedProfiles } from '../src/agent/profiles.js';
+import { assertComputerFits, computerLimits, type ComputerLimits } from '../src/domain/computer-limits.js';
 
 /** The Computer in Task defaults is the execution policy (wiki features/computers):
  * `/api/defaults` projects it into every layer, and saving Task defaults writes
@@ -24,6 +25,8 @@ describe('Computer defaults', () => {
   let close: () => Promise<void>;
   let token: string;
   const connected = new Set(['e2b']);
+  // What each provider account allows here (the real service learns it from the provider).
+  const ceilings: Record<string, ComputerLimits> = { e2b: { cpu: 64, memoryMb: 262_144, diskGb: 2048 } };
   const json = async (method: string, route: string, body?: unknown) => {
     const response = await fetch(`${base}${route}`, { method, headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
@@ -42,7 +45,11 @@ describe('Computer defaults', () => {
       executeUpdate: async (_name: string, options: { args: unknown[] }) => { updates.push(options.args[0]); return { applied: [] }; } }),
       start: async () => ({}) } } as any;
     const providerConnections = { available: async (_organizationId: string, provider: string) => connected.has(provider),
-      list: async () => [] } as any;
+      list: async () => [],
+      limits: async (_organizationId: string, provider: string) => computerLimits(provider, ceilings[provider]),
+      assertFits: async (_organizationId: string, provider: string | undefined, spec: any) => {
+        if (provider) assertComputerFits(spec, computerLimits(provider, ceilings[provider]), provider);
+      } } as any;
     api = new KarmaxApi({ store, tokens, worlds, client, taskQueue: 'test', contentDir: dir, providerConnections });
     gateway = await Gateway.create({ store, tokens, worlds, client, api, bus: new KarmaxBus(), providerConnections,
       contributions: new ContributionRegistry(), overlays: new Overlays(), taskQueue: 'test', staticDir: path.resolve('web'),
@@ -106,6 +113,33 @@ describe('Computer defaults', () => {
     expect((await json('PUT', `/api/settings/project/${project.id}/__common__`, { values: { computer: { cpu: 0 } } })).status).toBe(400);
     // Nothing was half-saved.
     expect(await store.getSettings(project.id, '__common__')).toBeUndefined();
+  });
+
+  // compute-disk item 1: ask only for what the account can give; never cap quietly.
+  it('refuses a computer bigger than the organization\'s account allows, wherever it is set', async () => {
+    const before = ceilings.e2b;
+    ceilings.e2b = { cpu: 8, memoryMb: 8192, diskGb: 29 };
+    try {
+      const project = await store.createProject('Ceilings', { worldProvider: 'e2b' });
+      const create = (computer: unknown) => json('POST', `/api/projects/${project.id}/tasks`, { workflow: 'software-dev', draft: true,
+        params: { prompt: 'big data', computer } });
+      expect(await create({ diskGb: 50 })).toMatchObject({ status: 400, body: { error: 'Disk can be at most 29 GB on this E2B account' } });
+      expect(await create({ memoryMb: 16_384 })).toMatchObject({ status: 400, body: { error: 'Memory can be at most 8 GB on this E2B account' } });
+      expect((await create({ diskGb: 29, cpu: 8 })).status).toBe(200);
+      // Task defaults: the project's and the organization's Computer.
+      expect(await json('PUT', `/api/settings/project/${project.id}/__common__`, { values: { computer: { diskGb: 40 } } }))
+        .toMatchObject({ status: 400, body: { error: 'Disk can be at most 29 GB on this E2B account' } });
+      expect(await json('PUT', `/api/organizations/${project.organizationId}/settings/__common__`, { values: {
+        computer: { provider: 'e2b', cpu: 16 } } })).toMatchObject({ status: 400, body: { error: 'CPU can be at most 8 on this E2B account' } });
+      // The execution policy API judges the same sizes.
+      expect((await json('PUT', `/api/projects/${project.id}/execution-policy`, { override: { resources: { diskGb: 64 } } })).status).toBe(400);
+      // A running task's Parameters.
+      const task = await store.createTask({ projectId: project.id, title: 'Rebuild', workflow: 'software-dev',
+        workflowVersion: '1.27.0', params: { prompt: 'x' } });
+      const editor = (await tokens.mintPrincipal('user:editor', ['task:edit', 'task:read'], project.id)).token;
+      await expect(api.updateParams(editor, task.id, { computer: { diskGb: 30 } })).rejects.toThrow('Disk can be at most 29 GB on this E2B account');
+      expect((await api.updateParams(editor, task.id, { computer: { diskGb: 29 } })).applied).toContain('computer');
+    } finally { ceilings.e2b = before; }
   });
 
   it('keeps a task\'s own computer sparse and validated', async () => {

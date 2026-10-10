@@ -345,7 +345,13 @@ export interface WorldProviderConnection {
     desktopImage?: string;
     apiUrl?: string;
     target?: string;
+    /** Per-machine limits entered in Advanced, for what the provider's API
+     * cannot tell (wiki features/computers). Disk is total GB. */
+    limits?: { cpu?: number; memoryMb?: number; diskGb?: number };
   };
+  /** What the provider account itself said it allows, from a probe or a
+   * refused build (src/world/provider-limits.ts). */
+  measuredLimits?: import('./computer-limits.js').ComputerLimits;
   enabled: boolean;
   status: 'untested' | 'ready' | 'error';
   lastCheckedAt?: number;

@@ -37,7 +37,7 @@ import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, FileRef, T
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable, awaitsSuccessOf } from '../domain/triggers.js';
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult, EvalContext, TaskGroup, forClauseValues, attentionCandidates } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
-import { assertInFlightComputerEdit, computerOf, computerResizable, describeMachine, machineShape, normalizeComputer, sameMachine,
+import { applyComputer, assertInFlightComputerEdit, computerOf, computerResizable, describeMachine, machineShape, normalizeComputer, sameMachine,
   type ComputerSpec, type MachineShape } from '../domain/computer.js';
 import { resolveParamsLayers, assembleTaskInput, projectSettingsFor, globalSettingsFor, quickProjectSettingsFor, quickGlobalSettingsFor, effectiveRepos, ValueMap } from './params.js';
 import { REPOSITORY_BRANCHES_RESOLVED_PARAM, applyRepoBranches, normalizeRepoBranches, repositoryBranchDefaults } from './branch-defaults.js';
@@ -899,6 +899,8 @@ export class KarmaxApi {
     if (provider && !['worktree', 'container', 'memory'].includes(provider)
       && !(await this.deps.providerConnections?.available(input.organizationId, provider)))
       throw new Error(`${provider} is not connected and verified`);
+    if (provider && policy.resources && typeof policy.resources === 'object')
+      (await this.deps.providerConnections?.assertFits?.(input.organizationId, provider, machineShape(candidate as Partial<import('../domain/types.js').ProjectConfig>)));
     const runnerPoolId = typeof candidate.runnerPoolId === 'string' ? candidate.runnerPoolId : undefined;
     if (runnerPoolId) {
       const pool = (await this.deps.store.getRunnerPool(runnerPoolId));
@@ -1087,6 +1089,15 @@ export class KarmaxApi {
       if (!local && this.deps.providerConnections
         && !(await this.deps.providerConnections.available(project.organizationId ?? 'org_personal', provider)))
         throw new ValidationError(`${provider} is not connected. Connect it under Settings → Computers first.`);
+    }
+    // Ask only for what the organization's provider account can give (wiki
+    // features/computers): the sizes this value names, or every effective size
+    // when it moves to another provider.
+    if (computer && (provider || computer.cpu != null || computer.memoryMb != null || computer.diskGb != null)) {
+      const effective = applyComputer(await this.deps.store.effectiveProjectConfig(project), computer);
+      const shape = provider ? machineShape(effective) : machineShape({ resources: computer });
+      try { await this.deps.providerConnections?.assertFits?.(project.organizationId ?? 'org_personal', effective.worldProvider, shape); }
+      catch (error) { throw new ValidationError(error instanceof Error ? error.message : String(error)); }
     }
     return computer;
   }
