@@ -1,7 +1,7 @@
 import type { Store } from '../store/db.js';
 import type { OrganizationExecutionPolicy, Project } from '../domain/types.js';
 import type { WorldProviderConnectionService } from '../world/connections.js';
-import { computerConfig, computerOf, normalizeComputer, type ComputerSpec } from '../domain/computer.js';
+import { computerConfig, computerOf, machineShape, normalizeComputer, type ComputerSpec } from '../domain/computer.js';
 
 /**
  * The Computer field in Task defaults (wiki features/computers). Its values are
@@ -43,6 +43,7 @@ export async function saveOrganizationComputer(store: Store, organizationId: str
   const spec = normalizeComputer(raw) ?? {};
   await assertProvider(options.providerConnections, organizationId, spec.provider, options.hosted);
   const fallback = store.defaultOrganizationExecutionPolicy();
+  await options.providerConnections?.assertFits?.(organizationId, spec.provider ?? fallback.worldProvider, machineShape({ resources: spec }));
   const current = (await store.getOrganizationExecutionPolicy(organizationId));
   const chosen = computerConfig(spec);
   return store.setOrganizationExecutionPolicy(organizationId, {
@@ -63,6 +64,8 @@ export async function saveProjectComputer(store: Store, project: Project, raw: u
   options: { hosted: boolean; providerConnections?: WorldProviderConnectionService }): Promise<Project> {
   const spec: ComputerSpec = normalizeComputer(raw) ?? {};
   await assertProvider(options.providerConnections, project.organizationId ?? 'org_personal', spec.provider, options.hosted);
+  const provider = spec.provider ?? (await store.getOrganizationExecutionPolicy(project.organizationId ?? 'org_personal')).worldProvider;
+  await options.providerConnections?.assertFits?.(project.organizationId ?? 'org_personal', provider, machineShape({ resources: spec }));
   const chosen = computerConfig(spec);
   const { cpu: _cpu, memoryMb: _memoryMb, diskGb: _diskGb, ...otherResources } = project.config.resources ?? {};
   const { flavor: _flavor, ...otherEnvironment } = project.config.environment ?? {};

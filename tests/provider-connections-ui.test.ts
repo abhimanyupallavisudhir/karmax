@@ -81,6 +81,30 @@ describe('organization Computers and usage UI', () => {
     }
   });
 
+  // compute-disk item 1: each connection's real limits, and Advanced for what its API cannot tell.
+  it('shows each connection\'s limits on its row, and lets Advanced set them', async () => {
+    const limited = [{ ...connected[0], limits: { cpu: 8, memoryMb: 8192, diskGb: 29, checkedAt: Date.UTC(2026, 9, 10),
+      source: { cpu: 'provider', memoryMb: 'provider', diskGb: 'provider' } } },
+    { ...connected[1], config: { limits: { diskGb: 50 } }, limits: { cpu: 4, memoryMb: 8192, diskGb: 30,
+      source: { cpu: 'default', memoryMb: 'default', diskGb: 'provider' } } }];
+    const ui = await organization('#org-computers .computer-provider', ({ method, path }) => path === '/api/organizations/o/world-providers'
+      ? limited : method === 'PUT' || method === 'POST' ? {} : undefined);
+    const rows = ui.page.locator('#org-computers .computer-provider');
+    expect(await rows.nth(0).locator('.computer-limits').textContent()).toBe('≤ 8 CPU · 8 GB · 29 GB disk');
+    expect(await rows.nth(1).locator('.computer-limits').textContent()).toBe('≤ 4 CPU · 8 GB · 30 GB disk');
+    await rows.nth(1).getByRole('button', { name: 'Edit Daytona' }).click();
+    const dialog = ui.page.locator('.computer-dialog');
+    await dialog.locator('.computer-advanced > summary').click();
+    // What a person entered shows as entered; what the provider said is the placeholder.
+    expect(await dialog.locator('[data-limit="diskGb"]').inputValue()).toBe('50');
+    expect(await dialog.locator('[data-limit="cpu"]').getAttribute('placeholder')).toBe('4');
+    await dialog.locator('[data-limit="cpu"]').fill('8');
+    await dialog.locator('[data-limit="memoryMb"]').fill('16');
+    await dialog.getByRole('button', { name: 'Save' }).click();
+    await expect.poll(() => ui.calls.find((call) => call.method === 'PUT')?.body?.config?.limits).toEqual({ cpu: 8, memoryMb: 16_384, diskGb: 50 });
+    await ui.close();
+  });
+
   it('shows usage under Plan & billing, with reconciliation coverage', async () => {
     const ui = await organization('#org-usage .stat', usageApi({}));
     expect(await ui.page.locator('#org-usage').evaluate((element) => element.closest('.settings-pane')!.getAttribute('data-pane'))).toBe('settings-plan');

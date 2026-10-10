@@ -16,7 +16,7 @@ export interface ComputerSpec {
   provider?: string;
   cpu?: number;
   memoryMb?: number;
-  /** Free space for the task's files, in GiB. Absent ⇒ the provider default. */
+  /** The machine's total disk, in GB. Absent ⇒ the provider default. */
   diskGb?: number;
   flavor?: 'headless' | 'desktop';
   /** How long a parked world keeps its sandbox before portable hibernation. */
@@ -32,9 +32,6 @@ export const IN_FLIGHT_COMPUTER_KEYS = ['cpu', 'memoryMb', 'diskGb', 'hibernateA
 /** The size karmax's default E2B template is built with. A shape equal to it
  * needs no sized template; anything else does (see `e2b-template.ts`). */
 export const DEFAULT_MACHINE = { cpu: 2, memoryMb: 2048 } as const;
-
-/** E2B grows a template's filesystem by at most this much free space. */
-export const E2B_MAX_DISK_GB = 50;
 
 const DAY_MS = 86_400_000;
 const LIMITS = {

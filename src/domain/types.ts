@@ -345,7 +345,13 @@ export interface WorldProviderConnection {
     desktopImage?: string;
     apiUrl?: string;
     target?: string;
+    /** Per-machine limits entered in Advanced, for what the provider's API
+     * cannot tell (wiki features/computers). Disk is total GB. */
+    limits?: { cpu?: number; memoryMb?: number; diskGb?: number };
   };
+  /** What the provider account itself said it allows, from a probe or a
+   * refused build (src/world/provider-limits.ts). */
+  measuredLimits?: import('./computer-limits.js').ComputerLimits;
   enabled: boolean;
   status: 'untested' | 'ready' | 'error';
   lastCheckedAt?: number;
@@ -1750,6 +1756,11 @@ export interface TaskView {
    * on the one it was made on: it moves when the world parks (wiki
    * features/computers). Enriched by the API. */
   computerChange?: { from: { cpu?: number; memoryMb?: number; diskGb?: number }; to: { cpu?: number; memoryMb?: number; diskGb?: number } };
+  /** The task stopped because its computer's disk was full (wiki features/computers). */
+  outOfDisk?: boolean;
+  /** The task computer's last measured usage, and the largest disk its provider
+   * account allows (`maxDiskGb`); added by the API from the world's readings. */
+  usage?: { at: number; provider?: string; disk?: { usedMb: number; totalMb: number }; memory?: { usedMb: number; totalMb: number }; maxDiskGb?: number };
   updatedAt: number;
 }
 
