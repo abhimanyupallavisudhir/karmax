@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, it } from 'vitest';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -28,16 +28,45 @@ import { liveEnabled } from './helpers/live-gate.js';
  * published version must hold every part the worlds never fetched byte for
  * byte.
  *
- * The repository server runs in this process, reached by the sandboxes at
- * KARMAX_LIVE_PUBLIC_URL (for a test run inside an E2B sandbox:
- * `https://<port>-$E2B_SANDBOX_ID.e2b.app`, with KARMAX_LIVE_PORT=<port>).
- * Needs KARMAX_RUN_LIVE=1 and E2B_API_KEY; it spends sandbox time and
- * deletes what it creates. KARMAX_LIVE_DATA_GB sizes the resource (default 3).
+ * The repository server runs in this process; the sandboxes reach it at
+ * KARMAX_LIVE_PUBLIC_URL, else (inside an E2B sandbox) at its public port URL
+ * `https://<port>-$E2B_SANDBOX_ID.e2b.app`, else through a Cloudflare quick
+ * tunnel (`cloudflared` on PATH or at KARMAX_LIVE_CLOUDFLARED: the CI runner).
+ * Needs KARMAX_RUN_LIVE=1 and E2B_API_KEY; it spends sandbox time and deletes
+ * what it creates. KARMAX_LIVE_DATA_GB sizes the resource (default 3).
  */
-const run = liveEnabled() && Boolean(process.env.E2B_API_KEY) && Boolean(process.env.KARMAX_LIVE_PUBLIC_URL);
+const PORT = Number(process.env.KARMAX_LIVE_PORT ?? 49_950);
+const cloudflared = process.env.KARMAX_LIVE_CLOUDFLARED
+  ?? (spawnSync('bash', ['-c', 'command -v cloudflared'], { encoding: 'utf8' }).stdout.trim() || undefined);
+const reachable = Boolean(process.env.KARMAX_LIVE_PUBLIC_URL || process.env.E2B_SANDBOX_ID || cloudflared);
+const run = liveEnabled() && Boolean(process.env.E2B_API_KEY) && reachable;
 const GB = Number(process.env.KARMAX_LIVE_DATA_GB ?? 3);
 const cleanups: Array<() => Promise<unknown> | unknown> = [];
 afterAll(async () => { for (const cleanup of cleanups.splice(0).reverse()) await Promise.resolve(cleanup()).catch(() => undefined); });
+
+/** The URL sandboxes reach this process's port at. */
+async function publicUrlFor(port: number): Promise<string> {
+  if (process.env.KARMAX_LIVE_PUBLIC_URL) return process.env.KARMAX_LIVE_PUBLIC_URL.replace(/\/+$/, '');
+  if (process.env.E2B_SANDBOX_ID) return `https://${port}-${process.env.E2B_SANDBOX_ID}.e2b.app`;
+  const tunnel = spawn(cloudflared!, ['tunnel', '--no-autoupdate', '--url', `http://127.0.0.1:${port}`], { stdio: ['ignore', 'pipe', 'pipe'] });
+  cleanups.push(() => tunnel.kill());
+  const url = await new Promise<string>((resolve, reject) => {
+    let seen = '';
+    const timer = setTimeout(() => reject(new Error(`cloudflared gave no URL: ${seen.slice(-500)}`)), 60_000);
+    const read = (chunk: Buffer) => {
+      seen += chunk;
+      const found = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/.exec(seen)?.[0];
+      if (found) { clearTimeout(timer); resolve(found); }
+    };
+    tunnel.stdout.on('data', read); tunnel.stderr.on('data', read);
+  });
+  // A new quick tunnel takes a few seconds to answer.
+  for (let attempt = 0; attempt < 30; attempt++) {
+    if ((await fetch(`${url}/resource-repositories/`).then((response) => response.status, () => 0)) > 0) break;
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+  }
+  return url;
+}
 
 const sha = (file: string) => execFileSync('sha256sum', [file], { encoding: 'utf8' }).split(' ')[0]!;
 const log = (message: string) => console.log(`[on-demand live ${new Date().toISOString().slice(11, 19)}] ${message}`);
@@ -70,7 +99,6 @@ describe.skipIf(!run)('on-demand resources in real E2B worlds', () => {
     const worlds = new WorldRegistry();
     const e2b = new E2BWorldProvider();
     worlds.register(e2b);
-    const publicUrl = process.env.KARMAX_LIVE_PUBLIC_URL!.replace(/\/+$/, '');
     const resources = new ProjectResourceService(store, worlds, new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker),
       broker, undefined, undefined, { world: () => publicUrl, objects: new LocalObjectStore(path.join(dir, 'objects')) });
     const tokens = new TokenAuthority();
@@ -80,7 +108,9 @@ describe.skipIf(!run)('on-demand resources in real E2B worlds', () => {
       bus: new KarmaxBus(), contributions: new ContributionRegistry(), overlays: new Overlays(), staticDir: 'web',
       agentInfo: { provider: 'mock', reason: 'on-demand live test' } });
     process.env.KARMAX_HOST = '0.0.0.0';
-    const server = await gateway.listen(Number(process.env.KARMAX_LIVE_PORT ?? 49_950));
+    const server = await gateway.listen(PORT);
+    expect(server.port).toBe(PORT);
+    const publicUrl = await publicUrlFor(PORT);
     cleanups.push(() => server.close());
     log(`repository server on ${server.url}, reached by worlds at ${publicUrl}`);
 
