@@ -22,6 +22,8 @@ import { liveEnabled } from './helpers/live-gate.js';
  * server deleted) and wakes again. Every step's latency and the provider's
  * own usage are printed as one `VM-LIVE` JSON line for the wiki.
  *
+ * A Fly organization needs a payment method: on Fly's free trial flyd stops
+ * every machine 300 s after it starts, before a stock world has provisioned.
  * Opt in with KARMAX_RUN_LIVE=1, FLY_API_TOKEN and/or HCLOUD_TOKEN, and a
  * metered model key (OPENAI_API_KEY for the default openai/gpt-5-mini).
  * Optional: KARMAX_FLY_REGION, KARMAX_FLY_ORG, KARMAX_FLY_IMAGE,
