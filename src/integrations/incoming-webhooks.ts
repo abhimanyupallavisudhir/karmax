@@ -187,33 +187,33 @@ export class IncomingWebhooks {
     const hook = await this.get(id);
     if (!hook) return;
     await this.store.kvDelete(`${KEY_PREFIX}${id}`);
-    if (this.broker.hasHandle(secretHandle(hook))) await this.broker.deleteHandle(secretHandle(hook));
+    if (await this.broker.hasHandle(secretHandle(hook))) await this.broker.deleteHandle(secretHandle(hook));
   }
 
   /** A chat bot's delivery, read by its platform's adapter. */
-  receiveChat(hook: IncomingWebhook, delivery: ChatDelivery): ChatInbound | 'refused' {
-    const credentials = this.credentials(hook);
+  async receiveChat(hook: IncomingWebhook, delivery: ChatDelivery): Promise<ChatInbound | 'refused'> {
+    const credentials = await this.credentials(hook);
     return hook.kind && credentials ? CHAT_ADAPTERS[hook.kind].receive(credentials, hook.bot ?? {}, delivery) : 'refused';
   }
 
   /** Post in a chat bot's channel (a thread's reply when `thread` is set). */
   async reply(hook: IncomingWebhook, to: { channel: string; thread?: string }, text: string, fetcher: typeof fetch = fetch): Promise<{ messageId?: string }> {
-    const credentials = this.credentials(hook);
+    const credentials = await this.credentials(hook);
     if (!hook.kind || !credentials) throw new WebhookConfigError('not a connected chat bot');
     return CHAT_ADAPTERS[hook.kind].reply(credentials, to, text, fetcher);
   }
 
-  private credentials(hook: IncomingWebhook): ChatCredentials | undefined {
+  private async credentials(hook: IncomingWebhook): Promise<ChatCredentials | undefined> {
     const handle = secretHandle(hook);
-    if (!this.broker.hasHandle(handle)) return undefined;
-    try { return JSON.parse(this.broker.resolve(handle, { caps: [`use-credential:${handle}`] })) as ChatCredentials; } catch { return undefined; }
+    if (!(await this.broker.hasHandle(handle))) return undefined;
+    try { return JSON.parse(await this.broker.resolve(handle, { caps: [`use-credential:${handle}`] })) as ChatCredentials; } catch { return undefined; }
   }
 
   /** Is this delivery from someone holding the hook's secret? */
-  verify(hook: IncomingWebhook, raw: Buffer, headers: Record<string, string | string[] | undefined>, query: URLSearchParams): boolean {
+  async verify(hook: IncomingWebhook, raw: Buffer, headers: Record<string, string | string[] | undefined>, query: URLSearchParams): Promise<boolean> {
     const handle = secretHandle(hook);
-    if (hook.kind || !this.broker.hasHandle(handle)) return false;
-    const secret = this.broker.resolve(handle, { caps: [`use-credential:${handle}`] });
+    if (hook.kind || !(await this.broker.hasHandle(handle))) return false;
+    const secret = await this.broker.resolve(handle, { caps: [`use-credential:${handle}`] });
     const auth = Array.isArray(headers.authorization) ? headers.authorization[0] : headers.authorization;
     const bearer = auth?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
     return signatureMatches(secret, raw, headers) || tokenMatches(secret, bearer) || tokenMatches(secret, query.get('token') ?? undefined);

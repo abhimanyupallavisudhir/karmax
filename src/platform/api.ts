@@ -2856,8 +2856,8 @@ export class KarmaxApi {
     const hook = await hooks.get(hookId);
     const project = hook ? await this.deps.store.getProject(hook.projectId) : undefined;
     const method = delivery.method ?? 'POST';
-    const inbound = hook && project && hook.kind ? hooks.receiveChat(hook, { method, raw: delivery.raw, headers: delivery.headers, query: delivery.query })
-      : hook && project && method === 'POST' && hooks.verify(hook, delivery.raw, delivery.headers, delivery.query) ? undefined : 'refused' as const;
+    const inbound = hook && project && hook.kind ? await hooks.receiveChat(hook, { method, raw: delivery.raw, headers: delivery.headers, query: delivery.query })
+      : hook && project && method === 'POST' && await hooks.verify(hook, delivery.raw, delivery.headers, delivery.query) ? undefined : 'refused' as const;
     if (!hook || inbound === 'refused') {
       if (hook) await hooks.noteDelivery(hook.id, 'refused a delivery without a valid signature or token');
       throw new WebhookAuthError();
