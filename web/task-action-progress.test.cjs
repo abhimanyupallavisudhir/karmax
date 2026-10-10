@@ -13,7 +13,8 @@ test('task buttons acknowledge immediately, prevent repeated requests, and recov
     const feedback = [], toasts = [];
     const context = vm.createContext({
       resourceChoiceWrites: new Map(),
-      $: selector => ({ querySelectorAll: () => selector === '#tp-foot' ? [btn] : [] }),
+      // No Bigger disk here: the task is not out of disk.
+      $: selector => selector === '#bigger-disk' ? null : ({ querySelectorAll: () => selector === '#tp-foot' ? [btn] : [] }),
       confirmTaskAction: () => true,
       beginActionFeedback: control => { assert.equal(control, btn); feedback.push('start'); return 'ticket'; },
       finishActionFeedback: (ticket, success) => { assert.equal(ticket, 'ticket'); feedback.push(success); },
@@ -54,7 +55,8 @@ test('pending attempt choice prevents repeated clicks and dismissing it never co
     const feedback = [], requests = [], toasts = [];
     const context = vm.createContext({
       resourceChoiceWrites: new Map(),
-      $: selector => ({ querySelectorAll: () => selector === '#tp-foot' ? [btn] : [] }),
+      // No Bigger disk here: the task is not out of disk.
+      $: selector => selector === '#bigger-disk' ? null : ({ querySelectorAll: () => selector === '#tp-foot' ? [btn] : [] }),
       confirmTaskAction: () => true,
       otherAttemptsConfirmation: () => { choices++; return new Promise(resolve => { choose = resolve; }); },
       beginActionFeedback: () => { feedback.push('start'); return 'ticket'; },
@@ -83,7 +85,7 @@ test('pending attempt choice prevents repeated clicks and dismissing it never co
 
 test('finalization feedback survives rendering a fresh task view', () => {
   const context = vm.createContext({});
-  vm.runInContext(fn('taskActions'), context);
+  vm.runInContext([fn('biggerDiskButton'), fn('taskActions')].join('\n'), context);
   const html = context.taskActions({ state: { finalizing: true }, actions: [] });
   assert.match(html, /Finishing…/);
   assert.match(html, /Saving task output/);
@@ -103,7 +105,8 @@ test('confirmation waits for resource saves and recovers without confirming a fa
     writes.set('task/resource', { promise });
     const context = vm.createContext({
       resourceChoiceWrites: writes,
-      $: selector => ({ querySelectorAll: () => selector === '#tp-foot' ? [btn] : [] }),
+      // No Bigger disk here: the task is not out of disk.
+      $: selector => selector === '#bigger-disk' ? null : ({ querySelectorAll: () => selector === '#tp-foot' ? [btn] : [] }),
       confirmTaskAction: () => true, otherAttemptsConfirmation: async () => ({}),
       beginActionFeedback() {}, finishActionFeedback() {}, reflectAcceptedTaskAction() {},
       api: async (_url, options) => requests.push(JSON.parse(options.body)),

@@ -2880,7 +2880,7 @@ export class KarmaxApi {
       }
       // The computer's last measured usage and the largest disk its account
       // allows: the usage meter and the Out of disk action (wiki features/computers).
-      const usage = await this.computerUsage(taskId).catch(() => undefined);
+      const usage = await this.computerUsage(taskId, view.outOfDisk).catch(() => undefined);
       if (usage) view = { ...view, usage };
       if (await this.deps.store.kvGet(`project-transfer-history:${taskId}`)) {
         const { world, worldPath, worldAvailable, worldDesktop, worldProvider, ...history } = view;
@@ -6045,14 +6045,17 @@ Act according to your Avatar instructions. When ready, call platform_request POS
 
   /** A cloud task's last measured disk and memory, and the largest disk its
    * provider account allows. Undefined for a task with no cloud computer. */
-  private async computerUsage(taskId: string): Promise<TaskView['usage']> {
+  private async computerUsage(taskId: string, outOfDisk?: boolean): Promise<TaskView['usage']> {
     const raw = await this.deps.store.kvGet(`world-usage:${taskId}`);
     let reading: TaskView['usage'] | undefined;
     try { reading = raw ? JSON.parse(raw) : undefined; } catch { reading = undefined; }
-    const task = await this.deps.store.getTask(taskId);
-    if (!reading && !task?.lastView?.outOfDisk) return undefined;
+    if (!reading && !outOfDisk) return undefined;
+    // The task's metadata, not its conversation: a task view is read often.
+    const task = await this.deps.store.taskMetadataAsync(taskId);
     const project = task && (await this.deps.store.getProject(task.projectId));
-    const provider = project ? (await this.deps.store.effectiveTaskConfig(project, taskId)).worldProvider : undefined;
+    let own: ComputerSpec | undefined;
+    try { own = normalizeComputer(task?.params?.computer); } catch { own = undefined; }
+    const provider = project ? own?.provider ?? (await this.deps.store.effectiveProjectConfig(project)).worldProvider : undefined;
     const maxDiskGb = provider ? (await this.deps.providerConnections?.limits?.(project!.organizationId ?? 'org_personal', provider))?.diskGb : undefined;
     return { at: reading?.at ?? 0, ...(provider ? { provider } : {}), ...(reading?.disk ? { disk: reading.disk } : {}),
       ...(reading?.memory ? { memory: reading.memory } : {}), ...(maxDiskGb != null ? { maxDiskGb } : {}) };
@@ -6074,7 +6077,7 @@ Act according to your Avatar instructions. When ready, call platform_request POS
     const provider = config.worldProvider ?? 'worktree';
     const maxDiskGb = (await this.deps.providerConnections?.limits?.(project.organizationId ?? 'org_personal', provider))?.diskGb;
     if (maxDiskGb == null) throw new ValidationError('this task\'s computer has no provider disk to grow');
-    const usage = await this.computerUsage(taskId).catch(() => undefined);
+    const usage = await this.computerUsage(taskId, true).catch(() => undefined);
     const current = usage?.disk ? Math.round(usage.disk.totalMb / 1024) : config.resources?.diskGb;
     const diskGb = requested ?? maxDiskGb;
     if (!Number.isInteger(diskGb) || diskGb < 1) throw new ValidationError('Disk must be a whole number of GB');
