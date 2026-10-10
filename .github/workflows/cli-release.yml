@@ -32,7 +32,7 @@ jobs:
       sha: ${{ steps.version.outputs.sha }}
       release: ${{ steps.version.outputs.release }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with: { ref: "${{ inputs.tag || github.sha }}" }
       - uses: actions/setup-node@v4
         with: { node-version: '22.16.0' }
@@ -77,7 +77,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with: { ref: '${{ needs.bundle.outputs.sha }}' }
       - uses: actions/setup-node@v4
         with: { node-version: '22.16.0' }
@@ -142,7 +142,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with: { ref: '${{ needs.bundle.outputs.sha }}' }
       - uses: actions/setup-node@v4
         with: { node-version: '22.16.0', registry-url: 'https://registry.npmjs.org' }
