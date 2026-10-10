@@ -255,7 +255,7 @@ afterEach(async () => {
 afterAll(async () => { await admin?.end(); });
 
 for (const backend of ['sqlite', ...(postgresUrl ? ['postgres'] : [])]) describe(`service limits on ${backend}`, () => {
-  async function fixture(options: { fetch?: typeof fetch; probeTimeoutMs?: number; heapAge?: number;
+  async function fixture(options: { fetch?: typeof fetch; probeTimeoutMs?: number; heapAge?: number; env?: NodeJS.ProcessEnv;
     notify?: (alerts: ServiceLimitAlert[]) => Promise<void> } = {}) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-service-limits-')); dirs.push(dir);
     if (backend === 'postgres') await admin!.query('DROP SCHEMA public CASCADE; CREATE SCHEMA public');
@@ -265,7 +265,7 @@ for (const backend of ['sqlite', ...(postgresUrl ? ['postgres'] : [])]) describe
     let now = NOW;
     const notices: ServiceLimitAlert[][] = [];
     /** A new instance on the same database and vault: what a restart sees. */
-    const make = () => new ServiceLimitsService({ store, broker, now: () => now, dataDir: dir, env: {},
+    const make = () => new ServiceLimitsService({ store, broker, now: () => now, dataDir: dir, env: options.env ?? {},
       fetch: options.fetch ?? stubFetch(() => reply({}, 500)).fetch, probeTimeoutMs: options.probeTimeoutMs,
       workerHeap: () => ({ usedBytes: 100e6, limitBytes: 2e9, at: now - (options.heapAge ?? 0) }),
       notify: options.notify ?? (async (alerts) => { notices.push(alerts); }) });
@@ -358,6 +358,23 @@ for (const backend of ['sqlite', ...(postgresUrl ? ['postgres'] : [])]) describe
     view = await service.run();
     expect(view.services.find((s) => s.id === 'resend')!.meters.map((m) => [m.used, m.usedSource, m.level]))
       .toEqual([[9, 'api', 0], [2_950, 'api', 95]]);
+  });
+
+  it('counts no per-preview certificates once previews share a wildcard, until the old domain\'s leases end', async () => {
+    const env = { KARMAX_PREVIEW_ORIGIN: 'https://usercontent.test', KARMAX_PREVIEW_TLS: 'cloudflare' };
+    const { store, service } = await fixture({ env });
+    let view = await service.run();
+    expect(view.services.find((s) => s.id === 'letsencrypt')).toMatchObject({ status: 'not-needed',
+      note: expect.stringContaining('wildcard') });
+    expect(view.services.find((s) => s.id === 'letsencrypt')!.connect).toBeUndefined();
+    // A host of the previous, on-demand domain still asked this week: counted.
+    await store.countServiceUsage('letsencrypt.certificates', NOW);
+    view = await service.run();
+    expect(view.services.find((s) => s.id === 'letsencrypt')).toMatchObject({ status: 'ok' });
+    expect(view.services.find((s) => s.id === 'letsencrypt')!.meters[0]).toMatchObject({ used: 1, limit: 50, level: 0 });
+    // On demand, the count is the meter, even at zero.
+    const onDemand = await fixture({ env: { KARMAX_PREVIEW_ORIGIN: 'https://preview.tavya.test' } });
+    expect((await onDemand.service.run()).services.find((s) => s.id === 'letsencrypt')!.meters[0]).toMatchObject({ used: 0, limit: 50 });
   });
 
   it('a probe failing twice in a row is an alert; its last readings stand', async () => {

@@ -18754,13 +18754,17 @@ let refreshVaultRequests = null;
 function agentMailCard() {
   return `<div class="card" id="agent-mail-card">
     <div class="section-h">Agent email</div>
-    <p class="task-sub">An inbox where agents receive confirmation codes. <a href="https://www.agentmail.to/" target="_blank" rel="noopener">Get an AgentMail account ↗</a></p>
+    <p class="task-sub" id="agentmail-hosted" hidden>Agents receive confirmation codes at <code id="agentmail-hosted-address"></code></p>
+    <details class="settings-disclosure compact" id="agentmail-own" open><summary class="task-sub">Use your own AgentMail inbox
+      ${policyTip('Optional: agents then read mail from an AgentMail inbox you own instead.')}</summary>
+    <p class="task-sub"><a href="https://www.agentmail.to/" target="_blank" rel="noopener">Get an AgentMail account ↗</a></p>
     <div class="inline-form">
       <input id="agentmail-address" type="email" placeholder="AgentMail address" />
       <input id="agentmail-key" type="password" placeholder="AgentMail API key" />
       <button class="btn sm" id="agentmail-connect">Set up</button>
     </div>
     <div id="agentmail-result" class="task-sub"></div>
+    </details>
   </div>`;
 }
 async function wireAgentMailCard(organizationId) {
@@ -18771,9 +18775,14 @@ async function wireAgentMailCard(organizationId) {
   const result = $('#agentmail-result');
   try {
     const data = await api(`/api/organizations/${org}/agent-mail`);
-    if (data.configured) {
+    if (data.configured && data.provider === 'agentmail') {
       address.value = data.address;
       result.textContent = 'Connected';
+    } else if (data.configured) {
+      // The installation's own mail domain: every organization has an address.
+      $('#agentmail-hosted-address').textContent = data.address;
+      $('#agentmail-hosted').hidden = false;
+      $('#agentmail-own').open = false;
     }
   } catch {}
   $('#agentmail-connect')?.addEventListener('click', async () => {
@@ -20141,11 +20150,12 @@ function serviceLimitActionsMarkup(service) {
 function serviceLimitsMarkup(view) {
   if (!view) return '';
   const rows = view.services.map((service) => {
-    if (service.status === 'not-connected' || service.status === 'unchecked' || !service.meters.length) {
-      const note = service.status === 'unchecked' ? 'Not checked yet' : 'Not connected';
+    if (['not-connected', 'not-needed', 'unchecked'].includes(service.status) || !service.meters.length) {
+      const note = service.status === 'unchecked' ? 'Not checked yet' : service.status === 'not-needed' ? 'Not needed' : 'Not connected';
+      const why = service.status === 'not-needed' ? service.note : service.connect;
       return `<div class="limits-row off" role="row" data-service="${esc(service.id)}">
         <span class="limits-service" role="rowheader">${serviceLimitNameMarkup(service)}</span>
-        <span class="limits-off" role="cell">${note}${service.connect ? ` ${policyTip(service.connect)}` : ''}</span>
+        <span class="limits-off" role="cell">${note}${why ? ` ${policyTip(why)}` : ''}</span>
         <span class="limits-actions" role="cell">${serviceLimitActionsMarkup(service)}</span>
       </div>`;
     }

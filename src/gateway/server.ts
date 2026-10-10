@@ -88,8 +88,9 @@ import { localTaskBrowserUrl, WORLD_CDP_URL } from '../autonomy/task-browser.js'
 import { newId } from '../util/id.js';
 import { DurableEventFanout, type FanoutAudience } from './fanout.js';
 import { affects, authorityChanged, authoritySeq, changedSince, onAuthorityChange, type AuthorityChange, type AuthoritySubject } from '../store/authorization-epoch.js';
+import { AGENT_MAIL_MAX_BYTES, MAIL_FROM_HEADER, MAIL_SIGNATURE_HEADER, MAIL_TO_HEADER, verifyMail } from '../edge/agent-mail-signature.js';
 import { configuredPreviewOrigin, hashPreviewToken, newPreviewToken, previewCookieHeader,
-  previewCookieValue, previewLeaseOrigin, previewLeaseUrl, previewTokenMatches } from './previews.js';
+  previewCookieValue, previewLeaseOrigin, previewLeaseUrl, previewOrigins, previewTokenMatches } from './previews.js';
 import type { RemoteAccessController } from '../remote/access.js';
 import { GITHUB_APP_PUBLIC_URL_KEY, type GithubProjectWebhookEvent,
   type GithubVaultPushEvent } from '../integrations/github-app.js';
@@ -1386,7 +1387,7 @@ export class Gateway {
       const id = url.pathname.match(/^\/preview\/([^/]+)/)?.[1];
       const lease = id ? await this.deps.store.previewLease(id) : undefined;
       if (!lease || lease.revokedAt || lease.expiresAt <= Date.now()) return;
-      if (configuredPreviewOrigin() && String(req.headers.host ?? '').toLowerCase() !== new URL(previewLeaseOrigin(lease.id)).host.toLowerCase()) return;
+      if (configuredPreviewOrigin() && String(req.headers.host ?? '').toLowerCase() !== new URL(previewLeaseOrigin(lease)).host.toLowerCase()) return;
       const current = await this.deps.store.currentWorld(lease.worldId);
       if (!current || (current.generation ?? 1) !== lease.generation) return;
       if (lease.tokenHash) {
@@ -1779,7 +1780,8 @@ export class Gateway {
     if (previewOrigin && !onPreviewOrigin && p.startsWith('/preview/')) {
       const leaseId = p.match(/^\/preview\/([^/]+)/)?.[1];
       if (!leaseId) return this.json(res, 404, { error: 'not found' });
-      res.writeHead(307, { location: `${previewLeaseOrigin(decodeURIComponent(leaseId))}${p}${url.search}`, 'referrer-policy': 'no-referrer' });
+      const id = decodeURIComponent(leaseId);
+      res.writeHead(307, { location: `${previewLeaseOrigin((await this.deps.store.previewLease(id)) ?? id)}${p}${url.search}`, 'referrer-policy': 'no-referrer' });
       return void res.end();
     }
     if (p.startsWith('/preview/')) return this.serveLeasedPreview(req, res, url);
@@ -2033,6 +2035,28 @@ export class Gateway {
     // unauthenticated endpoints, before the session gate.
     if (p === '/api/agent-mail/ingest' && method === 'POST') {
       const mailMod = await import('../autonomy/agent-mail.js');
+      // The installation's own mail domain (KARMAX_AGENT_MAIL_DOMAIN): the
+      // Cloudflare Email Worker posts each message as raw MIME, signed with the
+      // key it shares with this installation (src/edge/agent-mail-worker.ts).
+      const signature = req.headers[MAIL_SIGNATURE_HEADER];
+      if (typeof signature === 'string') {
+        if (Number(req.headers['content-length'] ?? 0) > AGENT_MAIL_MAX_BYTES)
+          return this.json(res, 413, { error: 'message too large' });
+        let raw: Buffer;
+        try { raw = await this.rawBody(req, AGENT_MAIL_MAX_BYTES); } catch { return this.json(res, 413, { error: 'message too large' }); }
+        const to = String(req.headers[MAIL_TO_HEADER] ?? '').trim().toLowerCase();
+        const from = String(req.headers[MAIL_FROM_HEADER] ?? '').trim().toLowerCase();
+        if (!(await verifyMail(mailMod.agentMailIngestKey(), signature, to, from, raw)))
+          return this.json(res, 401, { error: 'invalid mail signature' });
+        // Only the installation's mail domain arrives this way; every other
+        // address (an organization's own provider) has its own route.
+        const domain = process.env.KARMAX_AGENT_MAIL_DOMAIN?.trim().toLowerCase();
+        if (!domain || !to.endsWith(`@${domain}`)) return this.json(res, 200, { delivered: false });
+        const mail = mailMod.parseRawMail(raw.toString('utf8'));
+        const { delivered } = await new mailMod.AgentMail(this.deps.store).ingest({ to, from: mailMod.cleanAddress(from),
+          subject: mail.subject, text: mail.text, ...(mail.messageId ? { sourceId: `message-id:${mail.messageId}` } : {}) });
+        return this.json(res, 200, { delivered });
+      }
       // Auth: the minted secret (in the copy-pasted webhook URL or a Bearer
       // header) — forwarding services can rarely set custom headers, so the
       // query form is the primary one. Legacy env secret stays accepted.
@@ -6109,7 +6133,7 @@ export class Gateway {
           throw error;
         }
         return this.json(res, 200, { ...lease, tokenHash: undefined,
-          url: previewLeaseUrl(lease.id, '/', rawToken) });
+          url: previewLeaseUrl(lease, '/', rawToken) });
       }
       const previewLease = p.match(/^\/api\/preview-leases\/([^/]+)$/);
       if (previewLease && method === 'DELETE') {
@@ -9092,7 +9116,7 @@ export class Gateway {
     const match = url.pathname.match(/^\/preview\/([^/]+)(\/.*)?$/);
     const lease = match ? (await this.deps.store.previewLease(match[1]!)) : undefined;
     if (!lease || lease.revokedAt || lease.expiresAt <= Date.now()) return this.previewStopped(req, res, 404, 'preview not found or expired');
-    if (configuredPreviewOrigin() && String(req.headers.host ?? '').toLowerCase() !== new URL(previewLeaseOrigin(lease.id)).host.toLowerCase())
+    if (configuredPreviewOrigin() && String(req.headers.host ?? '').toLowerCase() !== new URL(previewLeaseOrigin(lease)).host.toLowerCase())
       return this.previewStopped(req, res, 404, 'preview not found or expired');
     const current = (await this.deps.store.currentWorld(lease.worldId));
     if (!current || (current.generation ?? 1) !== lease.generation) return this.previewStopped(req, res, 410, 'preview world generation is no longer current');
@@ -9168,7 +9192,7 @@ export class Gateway {
       };
       if (!lease || lease.revokedAt || lease.expiresAt <= Date.now()) { browser.close(4404, 'preview expired'); return; }
       previewProjectId = lease.projectId;
-      if (configuredPreviewOrigin() && String(req.headers.host ?? '').toLowerCase() !== new URL(previewLeaseOrigin(lease.id)).host.toLowerCase()) {
+      if (configuredPreviewOrigin() && String(req.headers.host ?? '').toLowerCase() !== new URL(previewLeaseOrigin(lease)).host.toLowerCase()) {
         browser.close(4404, 'preview expired'); return;
       }
       const current = (await this.deps.store.currentWorld(lease.worldId));
@@ -9485,14 +9509,15 @@ export class Gateway {
     return resources;
   }
 
+  /** On a preview origin: the current one or one previews moved away from. */
   private requestIsPreviewOrigin(req: http.IncomingMessage): boolean {
-    const origin = configuredPreviewOrigin();
-    if (!origin) return false;
     try {
       const requested = new URL(`http://${String(req.headers.host ?? '').trim()}`);
-      const base = new URL(origin);
-      return (requested.hostname === base.hostname || requested.hostname.endsWith(`.${base.hostname}`))
-        && requested.port === base.port;
+      return previewOrigins().some((origin) => {
+        const base = new URL(origin);
+        return (requested.hostname === base.hostname || requested.hostname.endsWith(`.${base.hostname}`))
+          && requested.port === base.port;
+      });
     } catch { return false; }
   }
 

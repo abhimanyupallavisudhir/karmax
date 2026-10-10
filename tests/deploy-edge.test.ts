@@ -106,7 +106,8 @@ describe('public edge (Caddy) rate limiting', () => {
   it('leaves preview origins unmetered so a user app is not throttled by the control plane', () => {
     // The preview block is lease-gated and serves someone's running app; a
     // shared control-plane budget there would throttle legitimate traffic.
-    const previewBlock = read('Caddyfile').split('handle @preview {')[1]?.split('\n\t\t}')[0] ?? '';
+    const previewBlock = read('Caddyfile').split('(karmax_preview) {')[1]?.split('\n}')[0] ?? '';
+    expect(previewBlock).toContain('reverse_proxy 127.0.0.1:4505');
     expect(previewBlock).not.toContain('rate_limit');
   });
 });
@@ -390,5 +391,166 @@ describe('deploy-repository-edge', () => {
     const odd = deployEdge('KARMAX_DOMAIN=tavya.io\n', 'deploy-repository-edge: CLOUDFLARE_API_TOKEN is not set');
     expect(odd).toMatchObject({ status: 1, env: 'KARMAX_DOMAIN=tavya.io\n' });
     expect(odd.output).toMatch(/unexpected edge URL/);
+  });
+});
+
+describe('previews on their own domain, under one wildcard certificate', () => {
+  const caddyfile = read('Caddyfile');
+  const block = (head: string) => caddyfile.split(`${head} {`)[1]?.split('\n}')[0] ?? '';
+
+  it('serves every preview host through one isolated, unmetered handler that sends no referrer', () => {
+    const preview = block('(karmax_preview)');
+    expect(preview).toContain('import karmax_security');
+    expect(preview).toMatch(/header Referrer-Policy no-referrer/);
+    expect(caddyfile.match(/import karmax_preview$/gm)).toHaveLength(2);
+  });
+
+  it('chooses how preview hosts get certificates from KARMAX_PREVIEW_TLS, on demand unless told otherwise', () => {
+    expect(block('*.{$KARMAX_PREVIEW_DOMAIN}')).toContain('import preview_certificate_{$KARMAX_PREVIEW_TLS:on-demand}');
+    expect(block('(preview_certificate_on-demand)')).toMatch(/tls \{\s+on_demand\s+\}/);
+    // The Caddyfile's own ask stays: on demand, Caddy asks before issuing.
+    expect(caddyfile).toContain('ask http://127.0.0.1:4505/api/tls/preview-allow');
+  });
+
+  it('proves the wildcard by DNS with a token read from a secret file, never the environment or the image', () => {
+    const cloudflare = block('(preview_certificate_cloudflare)');
+    expect(cloudflare).toContain('dns cloudflare {file./run/secrets/cloudflare_dns_api_token}');
+    expect(caddyfile).not.toMatch(/\{env\.|CLOUDFLARE_API_TOKEN/);
+    expect(read('Caddy.Dockerfile')).not.toMatch(/cloudflare_dns_api_token|API_TOKEN/);
+    expect(read('build-caddy.sh')).toContain('github.com/caddy-dns/cloudflare@v0.2.4');
+  });
+
+  it('keeps hosts of the previous preview domain on demand until their leases end, and refuses every other name', () => {
+    const catchAll = block('https://');
+    expect(catchAll).toMatch(/tls \{\s+on_demand\s+\}/);
+    expect(catchAll).toContain('@legacy_preview host *.{$KARMAX_LEGACY_PREVIEW_DOMAIN:invalid}');
+    expect(catchAll).toMatch(/handle \{\s+abort\s+\}/);
+    // No site answers for the bare preview domain.
+    expect(caddyfile).not.toMatch(/^\{\$KARMAX_PREVIEW_DOMAIN\}/m);
+  });
+
+  for (const file of ['compose.turnkey.yml', 'compose.hosted.yml']) {
+    it(`${file} gives Caddy and the app the preview settings, and Caddy alone the DNS token`, () => {
+      const compose = parse(read(file)) as { services: Record<string, any>; secrets: Record<string, { file: string }> };
+      const { caddy, app } = compose.services;
+      expect(caddy.environment).toMatchObject({ KARMAX_PREVIEW_TLS: '${KARMAX_PREVIEW_TLS:-on-demand}',
+        KARMAX_LEGACY_PREVIEW_DOMAIN: '${KARMAX_LEGACY_PREVIEW_DOMAIN:-invalid}' });
+      expect(caddy.secrets).toEqual(['cloudflare_dns_api_token']);
+      expect(compose.secrets.cloudflare_dns_api_token).toEqual({ file: './.secrets/cloudflare_dns_api_token' });
+      expect(app.secrets).not.toContain('cloudflare_dns_api_token');
+      expect(app.environment).toMatchObject({
+        KARMAX_LEGACY_PREVIEW_ORIGIN: '${KARMAX_LEGACY_PREVIEW_DOMAIN:+https://${KARMAX_LEGACY_PREVIEW_DOMAIN}}',
+        KARMAX_PREVIEW_TLS: '${KARMAX_PREVIEW_TLS:-on-demand}',
+        KARMAX_AGENT_MAIL_DOMAIN: '${KARMAX_AGENT_MAIL_DOMAIN:-}' });
+    });
+  }
+
+  /** Source deploy/karmax against a throwaway directory and run `script`. */
+  function operator(env: string, script: string, token?: string) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-deploy-'));
+    try {
+      fs.writeFileSync(path.join(dir, '.turnkey.env'), env);
+      if (token !== undefined) { fs.mkdirSync(path.join(dir, '.secrets')); fs.writeFileSync(path.join(dir, '.secrets', 'cloudflare_dns_api_token'), token); }
+      let status = 0; let stderr = '';
+      try {
+        execFileSync('sh', ['-c', `. "${path.join(deployDir, 'karmax')}" >/dev/null 2>&1 || true\n`
+          + `DEPLOY_DIR="${dir}"; ENV_FILE="${dir}/.turnkey.env"; SECRETS_DIR="${dir}/.secrets"\n${script}`],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+      } catch (error) { status = (error as { status: number }).status; stderr = String((error as { stderr: string }).stderr); }
+      return { status, stderr, env: fs.readFileSync(path.join(dir, '.turnkey.env'), 'utf8') };
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  }
+
+  it('refuses a wildcard without its DNS token, naming the token and the permissions it needs', () => {
+    const wildcard = 'KARMAX_PREVIEW_DOMAIN=usercontent.example\nKARMAX_PREVIEW_TLS=cloudflare\n';
+    const missing = operator(wildcard, 'preview_tls_ready', '');
+    expect(missing.status).toBe(1);
+    expect(missing.stderr).toContain('KARMAX_PREVIEW_TLS=cloudflare needs a Cloudflare API token with Zone DNS Edit and Zone Read on usercontent.example only, in deploy/.secrets/cloudflare_dns_api_token');
+    expect(operator(wildcard, 'preview_tls_ready', 'cf-dns-token\n').status).toBe(0);
+    expect(operator('KARMAX_PREVIEW_DOMAIN=preview.example\n', 'preview_tls_ready').status).toBe(0);
+    expect(operator('KARMAX_PREVIEW_TLS=on-demand\n', 'preview_tls_ready').status).toBe(0);
+    const typo = operator('KARMAX_PREVIEW_TLS=wildcard\n', 'preview_tls_ready');
+    expect(typo).toMatchObject({ status: 1 });
+    expect(typo.stderr).toContain('KARMAX_PREVIEW_TLS must be on-demand or cloudflare, not wildcard');
+    // `up` stops before starting anything.
+    const up = operator(`KARMAX_DOMAIN=tavya.example\n${wildcard}`, 'need_docker() { :; }; dc() { echo "dc $*" >&2; }; cmd_up', '');
+    expect(up.status).toBe(1);
+    expect(up.stderr).not.toContain('dc ');
+    expect(up.stderr).toContain('previews are not configured; nothing was started');
+  });
+
+  it('checks the token in every update and in doctor', () => {
+    const script = read('karmax');
+    const update = script.slice(script.indexOf('cmd_update() {'), script.indexOf('\n}\n', script.indexOf('cmd_update() {')));
+    expect(update.indexOf('preview_tls_ready')).toBeGreaterThan(update.indexOf('ensure_secrets'));
+    expect(update.indexOf('preview_tls_ready')).toBeLessThan(update.indexOf('build_images --pull'));
+    const doctor = script.slice(script.indexOf('cmd_doctor() {'), script.indexOf('\n}\n', script.indexOf('cmd_doctor() {')));
+    expect(doctor).toContain('preview_tls_ready');
+    // A changed Caddy image reaches the running edge only if updates build it.
+    expect(script).toMatch(/dc build --pull app && dc build postgresql caddy/);
+  });
+
+  it('moving previews to a new domain keeps the previous one for the leases issued under it', () => {
+    const seeded = 'KARMAX_DOMAIN=tavya.example\nKARMAX_PREVIEW_DOMAIN=preview.tavya.example\nPOSTGRES_PASSWORD=keep\n'
+      + 'KARMAX_PENDING_PREVIEW_DOMAIN=usercontent.example\nKARMAX_PREVIEW_TLS=cloudflare\n';
+    // What `update` does with a staged preview-only move.
+    const moved = operator(seeded, 'configure "" "$(env_value KARMAX_PENDING_PREVIEW_DOMAIN)"').env;
+    expect(moved).toContain('KARMAX_DOMAIN=tavya.example\n');
+    expect(moved).toContain('KARMAX_PREVIEW_DOMAIN=usercontent.example\n');
+    expect(moved).toContain('KARMAX_LEGACY_PREVIEW_DOMAIN=preview.tavya.example\n');
+    expect(moved).toContain('KARMAX_PREVIEW_TLS=cloudflare\n');
+    expect(moved).not.toContain('KARMAX_PENDING_PREVIEW_DOMAIN');
+    expect(moved).not.toContain('KARMAX_LEGACY_DOMAIN=');
+    // A later `up` keeps it; moving back drops it.
+    expect(operator(moved, 'configure').env.match(/^KARMAX_LEGACY_PREVIEW_DOMAIN=preview\.tavya\.example$/gm)).toHaveLength(1);
+    expect(operator(moved, 'configure tavya.example preview.tavya.example').env).toContain('KARMAX_LEGACY_PREVIEW_DOMAIN=usercontent.example\n');
+    // An update consumes a preview-only move as it does a domain move.
+    const script = read('karmax');
+    expect(script).toContain('if [ -n "$pending_domain" ] || [ -n "$pending_preview" ]; then');
+  });
+});
+
+describe('deploy-agent-mail-edge', () => {
+  function deployMail(seed: string, args: string, printed: string, token = 'cf-token') {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-deploy-'));
+    try {
+      fs.writeFileSync(path.join(dir, '.turnkey.env'), seed);
+      const log = path.join(dir, 'calls');
+      let status = 0; let output = '';
+      try {
+        output = execFileSync('sh', ['-c',
+          `. "${path.join(deployDir, 'karmax')}" >/dev/null 2>&1 || true\n`
+          + `DEPLOY_DIR="${dir}"; ENV_FILE="${dir}/.turnkey.env"; SECRETS_DIR="${dir}/.secrets"\n`
+          + `need_docker() { :; }; wait_ready() { echo ready >> "${log}"; }\n`
+          + `dc() { echo "$* token=$CLOUDFLARE_API_TOKEN" >> "${log}"; case "$1" in run) printf 'bundling\\n%s\\n' '${printed}';; esac; }\n`
+          + `cmd_deploy_agent_mail_edge ${args}`,
+        ], { encoding: 'utf8', env: { ...process.env, CLOUDFLARE_API_TOKEN: token }, stdio: ['ignore', 'pipe', 'pipe'] });
+      } catch (error) { status = (error as { status: number }).status; output = String((error as { stderr: string }).stderr); }
+      return { status, output, env: fs.readFileSync(path.join(dir, '.turnkey.env'), 'utf8'),
+        calls: fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n') : [] };
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  }
+  const seed = 'KARMAX_DOMAIN=tavya.io\nKARMAX_PREVIEW_DOMAIN=tavyausercontent.com\n';
+
+  it('deploys from a one-off app container, records the mail domain and restarts the app with it', () => {
+    const run = deployMail(seed, 'Mail.TavyaUserContent.com', 'tavya-agent-mail');
+    expect(run.status).toBe(0);
+    expect(run.env).toBe(`${seed}KARMAX_AGENT_MAIL_DOMAIN=mail.tavyausercontent.com\n`);
+    expect(run.calls).toEqual([
+      'run --rm --no-deps -T -e CLOUDFLARE_API_TOKEN -e CLOUDFLARE_ACCOUNT_ID -e KARMAX_AGENT_MAIL_DOMAIN=mail.tavyausercontent.com app npm run --silent deploy-agent-mail-edge token=cf-token',
+      'up -d --no-build app token=cf-token', 'ready']);
+    // Repeating it (a changed Worker) leaves the app running.
+    expect(deployMail(run.env, 'mail.tavyausercontent.com', 'tavya-agent-mail').calls).toHaveLength(1);
+  });
+
+  it('keeps mail off the console and preview domains, and changes nothing without a token or on an odd answer', () => {
+    for (const domain of ['tavya.io', 'tavyausercontent.com', 'not a domain', '']) {
+      const run = deployMail(seed, domain ? `'${domain}'` : '', 'tavya-agent-mail');
+      expect(run, domain).toMatchObject({ status: 1, env: seed, calls: [] });
+    }
+    expect(deployMail(seed, 'mail.tavyausercontent.com', 'tavya-agent-mail', '')).toMatchObject({ status: 1, env: seed, calls: [] });
+    const odd = deployMail(seed, 'mail.tavyausercontent.com', 'deploy-agent-mail-edge: KARMAX_PUBLIC_URL is not set');
+    expect(odd).toMatchObject({ status: 1, env: seed });
+    expect(odd.output).toMatch(/unexpected answer/);
   });
 });

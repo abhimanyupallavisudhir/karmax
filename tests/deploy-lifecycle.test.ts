@@ -463,8 +463,8 @@ it('refuses a release that cannot replay a running workflow, leaving production 
   const calls = h.calls().map(args => args.join(' '));
   const check = calls.findIndex(call => call.includes('replay-check'));
   expect(calls.some(call => call.includes('pg_dump') || call.includes('up -d'))).toBe(false);
-  // The Compose tags (app and PostgreSQL) point at the running code again for the next restart.
-  expect(calls.slice(check + 1).some(call => call.endsWith(' build app postgresql'))).toBe(true);
+  // The Compose tags (app, PostgreSQL and Caddy) point at the running code again for the next restart.
+  expect(calls.slice(check + 1).some(call => call.endsWith(' build app postgresql caddy'))).toBe(true);
 });
 
 // The two gates in the real updater: replay check before the backup, vault
