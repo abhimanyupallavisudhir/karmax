@@ -43,9 +43,28 @@ describe('the computer in the World section', () => {
     const prompt = assemblePrompt({ profile, role: 'do', task: task({ kind: 'human', audience: ['@creator'] }),
       world: { ...world, meta: { computer: { cpu: 2, memoryMb: 2048, diskGb: 20 } } } as any });
     expect(prompt).toContain('Computer: 2 CPU · 2 GB · 20 GB disk.');
-    expect(prompt).toMatch(/platform_request\(PATCH, "\/api\/tasks\/[^/]+\/params", \{"params": \{"computer": \{"diskGb": 50\}\}\}\)/);
+    expect(prompt).toMatch(/platform_request\(PATCH, "\/api\/tasks\/[^/]+\/params", \{"params": \{"computer": \{"diskGb": \d+\}\}\}\)/);
     // A local world has no machine of its own to resize.
     expect(assemblePrompt({ profile, role: 'do', task: task({ kind: 'human', audience: ['@creator'] }), world })).not.toContain('Computer:');
+  });
+
+  // compute-disk item 2: the real ceiling, not a generic "diskGb: 50".
+  it('names the disk in use and the largest the account allows, and offers exactly that', () => {
+    const e2b = { ...world, kind: 'e2b', meta: { computer: { cpu: 2, memoryMb: 2048 } } } as any;
+    const limits = { cpu: 8, memoryMb: 8192, diskGb: 29, source: { cpu: 'provider', memoryMb: 'provider', diskGb: 'provider' } as const };
+    const disk = { totalKb: 22 * 2 ** 20, usedKb: 17 * 2 ** 20, availKb: 5 * 2 ** 20 };
+    const prompt = assemblePrompt({ profile, role: 'do', task: task({ kind: 'human', audience: ['@creator'] }), world: e2b, limits, disk,
+      computer: { cpu: 2, memoryMb: 2048 } });
+    expect(prompt).toContain('Computer: 2 CPU · 2 GB · 22 GB disk (17 GB used). This E2B account allows up to 8 CPU, 8 GB memory and 29 GB disk.');
+    expect(prompt).toContain('{"params": {"computer": {"diskGb": 29}}}');
+    expect(prompt).not.toContain('"diskGb": 50');
+    // At the ceiling there is no bigger disk to offer: free space instead.
+    const full = assemblePrompt({ profile, role: 'do', task: task({ kind: 'human', audience: ['@creator'] }),
+      world: { ...e2b, meta: { computer: { cpu: 2, memoryMb: 2048, diskGb: 29 } } }, limits,
+      disk: { totalKb: 29 * 2 ** 20, usedKb: 28 * 2 ** 20, availKb: 2 ** 20 }, computer: { cpu: 2, memoryMb: 2048, diskGb: 29 } });
+    expect(full).toContain('Its disk is the largest this account allows');
+    expect(full).not.toContain('"diskGb"');
+    expect(full).toContain('{"params": {"computer": {"memoryMb": 8192}}}');
   });
 
   // pramana#3: the agent paused on its rebuild job after its owner chose 50 GB;

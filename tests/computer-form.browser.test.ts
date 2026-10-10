@@ -24,7 +24,8 @@ describe('the Computer block', () => {
   let dir: string, store: Store, project: Project, browser: Browser, base: string, close: () => Promise<void>;
   let priorHome: string | undefined;
   const connections = [{ id: 'c1', organizationId: 'org_personal', provider: 'e2b', name: 'E2B', config: {}, enabled: true,
-    status: 'ready', credentialConfigured: true }];
+    status: 'ready', credentialConfigured: true,
+    limits: { cpu: 8, memoryMb: 8192, diskGb: 64, source: { cpu: 'provider', memoryMb: 'provider', diskGb: 'provider' } } }];
 
   beforeAll(async () => {
     priorHome = process.env.KARMAX_HOME;
@@ -87,12 +88,12 @@ describe('the Computer block', () => {
     await block.locator('.cf-disk').dispatchEvent('change');
     await expect.poll(async () => (await store.listTasks(project.id)).find((task) => task.params?.prompt === 'Download the dataset')?.params?.computer,
       { timeout: 15_000 }).toEqual({ diskGb: 60 });
-    // Restricted network reveals its allowlist; E2B caps the disk.
+    // Restricted network reveals its allowlist; the account's limit caps the disk.
     await block.locator('.computer-more > summary').click();
     expect(await block.locator('.cf-allowlist').isHidden()).toBe(true);
     await block.locator('.cf-network').selectOption('restricted');
     expect(await block.locator('.cf-allowlist').isVisible()).toBe(true);
-    expect(await block.locator('.cf-disk').getAttribute('max')).toBe('50');
+    expect(await block.locator('.cf-disk').getAttribute('max')).toBe('64');
     expect(errors).toEqual([]);
   });
 

@@ -89,7 +89,7 @@ export async function waitForAgent(wait: AgentWait, hooks: AgentWaitHooks): Prom
   const world = hooks.world;
   if (!world) return '(Resumed: the task has no world to check the jobs in.)';
 
-  let outcome: { finished: boolean; summary: string } | undefined;
+  let outcome: { finished: boolean; summary: string; disk?: boolean } | undefined;
   let failure: unknown;
   let settled = false;
   const scope = new CancellationScope();
@@ -111,7 +111,10 @@ export async function waitForAgent(wait: AgentWait, hooks: AgentWaitHooks): Prom
     const reason = failure instanceof Error ? failure.message : String(failure);
     return `(Resumed: the task could not check on ${list}: ${reason.slice(0, 300)}. ${jobs.length > 1 ? 'They' : 'It'} may still be running; each log is in .karmax-injection/jobs/<id>/log.)`;
   }
-  const head = outcome.finished
+  // Text only: a disk alert changes what the resumed agent reads, no command.
+  const head = outcome.disk
+    ? `(Resumed: this computer's disk is nearly full while ${jobs.length > 1 ? 'your jobs run' : 'your job runs'}. Free space, grow the disk or stop ${jobs.length > 1 ? 'them' : 'it'} before ${jobs.length > 1 ? 'they fail' : 'it fails'}.)`
+    : outcome.finished
     ? `(Resumed: ${jobs.length > 1 ? 'your jobs have' : 'your job has'} finished.)`
     : `(Resumed: your ${wait.minutes}-minute limit passed before ${jobs.length > 1 ? 'every job finished' : 'the job finished'}${hooks.ask ? ' or anyone answered' : ''}. Call pause again to keep waiting.)`;
   return `${head}\n\n${outcome.summary}`;

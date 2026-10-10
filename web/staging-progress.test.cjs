@@ -9,7 +9,7 @@ const esc = source.match(/const esc = [^]*?\n\n/)[0];
 test('saving resources shows how far the save has got, and only while that is current', () => {
   const S = { taskEvents: [] };
   const context = vm.createContext({ S });
-  vm.runInContext([esc, fn('formatBytes'), fn('liveOnlyEvent'), fn('stagingProgress'), fn('taskActions')].join('\n'), context);
+  vm.runInContext([esc, fn('formatBytes'), fn('liveOnlyEvent'), fn('stagingProgress'), fn('biggerDiskButton'), fn('taskActions')].join('\n'), context);
   const view = { taskId: 'task', status: 'active', state: { stagingResources: true } };
   const label = () => context.taskActions(view).match(/<button[^>]*>([^<]*)<\/button>/)[1];
   assert.equal(label(), 'Saving resources…');
@@ -30,7 +30,7 @@ test('saving resources shows how far the save has got, and only while that is cu
 test('applying resources shows the same progress, so a long publication never looks stuck', () => {
   const S = { taskEvents: [] };
   const context = vm.createContext({ S });
-  vm.runInContext([esc, fn('formatBytes'), fn('liveOnlyEvent'), fn('stagingProgress'), fn('taskActions')].join('\n'), context);
+  vm.runInContext([esc, fn('formatBytes'), fn('liveOnlyEvent'), fn('stagingProgress'), fn('biggerDiskButton'), fn('taskActions')].join('\n'), context);
   const view = { taskId: 'task', status: 'active', state: { applyingResources: true } };
   const label = () => context.taskActions(view).match(/<button[^>]*>([^<]*)<\/button>/)[1];
   assert.equal(label(), 'Applying resources…');
@@ -43,7 +43,7 @@ test('applying resources shows the same progress, so a long publication never lo
 test('bringing in sub-tasks\' data says so beside the actions, so a follow-up sent meanwhile is not a mystery', () => {
   const S = { taskEvents: [] };
   const context = vm.createContext({ S });
-  vm.runInContext([esc, fn('formatBytes'), fn('liveOnlyEvent'), fn('stagingProgress'), fn('taskActionLabel'), fn('hasOpenPullRequest'), fn('taskActions')].join('\n'), context);
+  vm.runInContext([esc, fn('formatBytes'), fn('liveOnlyEvent'), fn('stagingProgress'), fn('taskActionLabel'), fn('hasOpenPullRequest'), fn('biggerDiskButton'), fn('taskActions')].join('\n'), context);
   const cancel = { name: 'cancel', label: 'Cancel', enabled: true, danger: true };
   const html = context.taskActions({ taskId: 'task', status: 'active', state: { refreshingResources: true }, actions: [cancel] });
   assert.match(html, /aria-busy="true"[^>]*>Bringing in sub-tasks’ data…<\/button>/);
