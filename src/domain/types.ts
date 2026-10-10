@@ -1756,6 +1756,11 @@ export interface TaskView {
    * on the one it was made on: it moves when the world parks (wiki
    * features/computers). Enriched by the API. */
   computerChange?: { from: { cpu?: number; memoryMb?: number; diskGb?: number }; to: { cpu?: number; memoryMb?: number; diskGb?: number } };
+  /** The task stopped because its computer's disk was full (wiki features/computers). */
+  outOfDisk?: boolean;
+  /** The task computer's last measured usage, and the largest disk its provider
+   * account allows (`maxDiskGb`); added by the API from the world's readings. */
+  usage?: { at: number; disk?: { usedMb: number; totalMb: number }; memory?: { usedMb: number; totalMb: number }; maxDiskGb?: number };
   updatedAt: number;
 }
 

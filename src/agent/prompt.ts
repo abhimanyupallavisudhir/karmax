@@ -1,4 +1,6 @@
 import { describeMachine, sameMachine, type MachineShape } from '../domain/computer.js';
+import { providerLabel, type ComputerLimits, type EffectiveComputerLimits } from '../domain/computer-limits.js';
+import type { DiskSpace } from '../world/disk.js';
 import { AgentProfile, AgentRole, TaskInput } from '../domain/types.js';
 import { WorldHandle, worldRepos, worldWorkingDirectory } from '../world/types.js';
 import { agentRoleDef, manifest } from '../contrib/manifests.js';
@@ -86,6 +88,10 @@ export interface AssembleArgs {
   projectInstructions?: string;
   /** The machine the task's Computer asks for now (its world may still run on another). */
   computer?: MachineShape;
+  /** The world's disk as measured before this turn. */
+  disk?: DiskSpace;
+  /** What a computer on the organization's provider account may be. */
+  limits?: EffectiveComputerLimits;
   /** Extra bindings for non-do roles (error, stage, transcript, reviewInfo, skills). */
   bindings?: Record<string, string>;
 }
@@ -116,7 +122,7 @@ Git ancestry for recovered, forked, or retargeted work: "recorded base" is the i
     title: args.task.title,
     prompt: args.task.prompt,
     worldPath: worldWorkingDirectory(args.world),
-    worldRepos: [describeRepos(args.world), describeEnvironment(args.world), describeComputer(args.world, args.task.taskId, args.computer)].filter(Boolean).join('\n'),
+    worldRepos: [describeRepos(args.world), describeEnvironment(args.world), describeComputer(args.world, args.task.taskId, args.computer, args.disk, args.limits)].filter(Boolean).join('\n'),
     branch: args.world.branch,
     base: args.world.base,
     target,
@@ -155,18 +161,41 @@ function describeEnvironment(world: WorldHandle): string {
     + 'as the exact command to add to Project Settings → Environment.';
 }
 
-/** A cloud world's machine, and how the agent can get a bigger one itself. */
-function describeComputer(world: WorldHandle, taskId: string, requested?: MachineShape): string {
+/** A cloud world's machine, what its provider account allows, and how the
+ * agent can get a bigger one itself (wiki features/computers). */
+function describeComputer(world: WorldHandle, taskId: string, requested?: MachineShape, disk?: DiskSpace, given?: EffectiveComputerLimits): string {
   const shape = world.meta?.computer as MachineShape | undefined;
   if (!shape) return '';
+  // Only what the account said, or a person entered: a documented default is
+  // not this account's ceiling, and an agent told "the largest" would stop asking.
+  const limits: ComputerLimits = Object.fromEntries((['cpu', 'memoryMb', 'diskGb'] as const)
+    .filter((key) => given?.[key] != null && given.source[key] && given.source[key] !== 'default').map((key) => [key, given![key]]));
+  const gb = (kb: number) => Math.round(kb / 2 ** 20);
+  // Disk as the machine really has it, measured; else as it was asked for.
+  const totalGb = disk ? gb(disk.totalKb) : shape.diskGb;
+  const current = `${describeMachine({ ...shape, ...(totalGb != null ? { diskGb: totalGb } : {}) })}${disk ? ` (${gb(disk.usedKb)} GB used)` : ''}`;
+  const allowed = [limits.cpu != null ? `${limits.cpu} CPU` : '', limits.memoryMb != null ? `${Math.round(limits.memoryMb / 1024)} GB memory` : '',
+    limits.diskGb != null ? `${limits.diskGb} GB disk` : ''].filter(Boolean);
+  const allows = allowed.length ? ` This ${providerLabel(world.kind)} account allows up to ${allowed.length > 1
+    ? `${allowed.slice(0, -1).join(', ')} and ${allowed.at(-1)}` : allowed[0]}.` : '';
   // A world moves to a new size only once it parks; a pause on jobs keeps it awake.
   const move = 'end your turn with pause(3) without jobs. A pause that waits on jobs keeps this machine, so first let them finish or stop them (stop_job). '
     + 'You resume on the new machine with every tracked file and uncommitted change, but Git-ignored files (dependencies, build output) '
     + 'and running processes do not carry over.';
   if (requested && !sameMachine(shape, requested))
-    return `Computer: ${describeMachine(shape)}. This task's computer is now ${describeMachine(requested)}: you move to it when the task parks, so ${move}`;
-  return `Computer: ${describeMachine(shape)}. If it is too small (out of disk or memory), resize it yourself with `
-    + `platform_request(PATCH, "/api/tasks/${taskId}/params", {"params": {"computer": {"diskGb": 50}}}) (or cpu, memoryMb) and then ${move}`;
+    return `Computer: ${current}.${allows} This task's computer is now ${describeMachine(requested)}: you move to it when the task parks, so ${move}`;
+  const resize = (key: string, value: number) => `platform_request(PATCH, "/api/tasks/${taskId}/params", {"params": {"computer": {"${key}": ${value}}}})`;
+  const atDiskCeiling = limits.diskGb != null && totalGb != null && totalGb >= limits.diskGb;
+  if (!atDiskCeiling) {
+    const diskGb = limits.diskGb ?? Math.max(2 * (totalGb ?? 20), 40);
+    return `Computer: ${current}.${allows} If it is too small (out of disk or memory), resize it yourself with ${resize('diskGb', diskGb)} `
+      + `(or cpu, memoryMb) and then ${move}`;
+  }
+  const memoryMb = shape.memoryMb ?? 2048;
+  const moreMemory = limits.memoryMb == null || limits.memoryMb > memoryMb
+    ? ` For more memory or CPU, resize it yourself with ${resize('memoryMb', limits.memoryMb ?? memoryMb * 2)} (or cpu) and then ${move}` : '';
+  return `Computer: ${current}.${allows} Its disk is the largest this account allows: when it fills, delete what you no longer need `
+    + `(build outputs, caches, old copies) or move large data out of the world.${moreMemory}`;
 }
 
 /**

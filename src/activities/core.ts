@@ -99,6 +99,9 @@ import { CodexHistoryError } from '../agent/codex-history.js';
 import { importWithPanagent, stableImportSessionId, looksLikeConversationUrl, publicConversationShare, type PanagentSource } from '../agent/panagent.js';
 import { publicShare, publicConversationHtml } from '../gateway/conversation-sharing.js';
 import { isRemoteAgentWorld, materializeRemoteSession, prewarmRemoteAgentHome } from '../agent/remote-process.js';
+import { checkWorldDisk, diskNotice, diskRatio, diskWasFull, DISK_REARM_RATIO, DISK_WARN_RATIO, isDiskFullMessage, largestWorldPaths,
+  outOfDiskMessage, worldUsage, type DiskCheck } from '../world/disk.js';
+import { computerLimits } from '../domain/computer-limits.js';
 import { materializeFileAttachments } from '../agent/files.js';
 import os from 'node:os';
 import fs from 'node:fs';
@@ -596,6 +599,81 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     const seq = (await store.appendEvent(ev));
     deps.bus?.emit({ ...ev, seq });
     return seq;
+  }
+
+  /** What a computer on this organization's provider account may be. */
+  async function accountLimits(organizationId: string, kind: string) {
+    const connection = await store.getWorldProviderConnection(organizationId, kind).catch(() => undefined);
+    return computerLimits(kind, connection?.measuredLimits, connection?.config.limits);
+  }
+
+  /** The largest disk the account is known to allow; a documented default is
+   * not known, and an agent told it has "the largest" would stop asking. */
+  async function knownMaxDiskGb(organizationId: string, kind: string): Promise<number | undefined> {
+    const limits = await accountLimits(organizationId, kind);
+    return limits.source.diskGb && limits.source.diskGb !== 'default' ? limits.diskGb : undefined;
+  }
+
+  /** Measure a cloud world's disk and memory (src/agent/disk-guard.sh), keep
+   * its ballast, and remember the reading for the task's usage meter. */
+  async function measureWorldDisk(world: World, taskId: string, timeoutMs?: number): Promise<DiskCheck | undefined> {
+    const check = await checkWorldDisk(world, timeoutMs).catch(() => undefined);
+    if (check) (await store.kvSet(`world-usage:${taskId}`, JSON.stringify(worldUsage(check))).catch(() => undefined));
+    return check;
+  }
+
+  /** Before an agent starts in a cloud world: make sure it can start (the
+   * ballast goes when the disk is critically full), and say what the agent
+   * should know about its disk — once per event, never every turn. */
+  async function prepareTurnDisk(world: World, taskId: string, organizationId: string, tell: boolean) {
+    const check = await measureWorldDisk(world, taskId, 20_000);
+    if (!check) return { notices: [] as string[] };
+    const limits = await accountLimits(organizationId, world.handle.kind);
+    const maxDiskGb = await knownMaxDiskGb(organizationId, world.handle.kind);
+    const notices: string[] = [];
+    if (!tell) return { check, limits, notices };
+    const ratio = diskRatio(check.disk);
+    const wasFull = await store.kvGet(`disk-full:${taskId}`);
+    const alerted = await store.kvGet(`disk-alert:${taskId}`);
+    if (wasFull) (await store.kvDelete(`disk-full:${taskId}`));
+    if (ratio < DISK_REARM_RATIO && alerted) (await store.kvDelete(`disk-alert:${taskId}`));
+    const nearlyFull = ratio >= DISK_WARN_RATIO && !alerted;
+    if (nearlyFull) (await store.kvSet(`disk-alert:${taskId}`, String(Date.now())));
+    if (wasFull || nearlyFull) {
+      const largest = ratio >= DISK_WARN_RATIO ? await largestWorldPaths(world).catch(() => undefined) : undefined;
+      notices.push(diskNotice({ kind: wasFull ? 'was-full' : 'nearly-full', disk: check.disk, largest, maxDiskGb, taskId }));
+    } else if (check.ballast === 'released') {
+      notices.push(diskNotice({ kind: 'ballast-released', disk: check.disk, maxDiskGb, taskId }));
+    }
+    return { check, limits, notices };
+  }
+
+  /** While a Do turn runs in a cloud world, look at its disk every minute and
+   * tell the agent, with the largest paths, when it passes 90% — through the
+   * conversation, so people see it too. */
+  function watchTurnDisk(world: World, taskId: string, organizationId: string, intervalMs = 60_000): () => void {
+    let stopped = false;
+    let running = false;
+    const timer = setInterval(() => {
+      if (stopped || running) return;
+      running = true;
+      void (async () => {
+        const check = await measureWorldDisk(world, taskId);
+        if (!check || stopped) return;
+        const ratio = diskRatio(check.disk);
+        if (ratio < DISK_REARM_RATIO) { (await store.kvDelete(`disk-alert:${taskId}`)); return; }
+        if (ratio < DISK_WARN_RATIO || (await store.kvGet(`disk-alert:${taskId}`))) return;
+        (await store.kvSet(`disk-alert:${taskId}`, String(Date.now())));
+        const largest = await largestWorldPaths(world).catch(() => undefined);
+        const maxDiskGb = await knownMaxDiskGb(organizationId, world.handle.kind);
+        const message: Message = { id: `disk-${Date.now()}`, role: 'user', ts: Date.now(),
+          text: diskNotice({ kind: 'nearly-full', disk: check.disk, largest, maxDiskGb, taskId }) };
+        await deps.client?.workflow.getHandle(taskId).signal('followUp', message, 'do');
+        (await record(taskId, 'conversation.message', { role: 'do', message }));
+      })().catch(() => undefined).finally(() => { running = false; });
+    }, intervalMs);
+    timer.unref?.();
+    return () => { stopped = true; clearInterval(timer); };
   }
 
   /** The task's pin when it names a run of the task that is no longer running
@@ -1688,6 +1766,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           // The machine this world was made as: the lifecycle sweep resizes it
           // when the task's Computer later asks for another (src/world/runners.ts).
           if (remote && executionConfig) world.handle.meta = { ...world.handle.meta, computer: machineShape(executionConfig) };
+          // The ballast a full disk gives up so the agent can still start, and the first reading.
+          if (remote) (await measureWorldDisk(world, args.taskId));
           activitySignal?.throwIfAborted();
           if (projectId) {
             world.handle = (await store.registerWorld(world.handle, projectId, {
@@ -1914,6 +1994,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // a PTY or filesystem request failing after the adapter starts.
         throw classifyTurnError(error, profile.provider);
       }
+      // A cloud world's disk, before its agent starts (wiki features/computers).
+      const remoteWorld = isRemote(args.worldHandle.kind);
+      const turnDisk = remoteWorld ? await prepareTurnDisk(world, args.taskId, organizationId, args.role === 'do') : undefined;
+      let stopDiskWatch: (() => void) | undefined;
 
       // Fork a prior agent (SPEC §10.5) — set up below, AFTER auth resolution, since
       // materializing the source session needs this turn's config home + world path.
@@ -2549,6 +2633,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         task: promptTask,
         world: promptWorld,
         ...(requestedComputer ? { computer: requestedComputer } : {}),
+        ...(turnDisk?.check ? { disk: turnDisk.check.disk } : {}),
+        ...(turnDisk?.limits ? { limits: turnDisk.limits } : {}),
         globalInstructions: (globalInstructions ?? '') + forkContext + agentForkContext + attemptContext + paymentContext,
         projectInstructions,
         bindings,
@@ -2618,6 +2704,16 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const notice = await deps.checkpoints?.takeNotice(args.taskId).catch(() => undefined);
         const last = messages.length - 1;
         if (notice) messages = messages.map((message, index) => index === last ? { ...message, text: `${message.text}\n\n(${notice})` } : message);
+      }
+      // What the agent should know about its disk rides on the newest message it
+      // has not read; with none, on its instructions for this turn.
+      let diskPromptNotice = '';
+      if (turnDisk?.notices.length && !resumedActivityAttempt) {
+        const text = turnDisk.notices.join('\n\n');
+        if (messages.length > (deliveredMessages ?? 0)) {
+          const last = messages.length - 1;
+          messages = messages.map((message, index) => index === last ? { ...message, text: `${message.text}\n\n${text}` } : message);
+        } else diskPromptNotice = `\n\n${text}`;
       }
       /** Compatibility publisher for immutable v1 histories. Those workflows
        * clear their in-memory account wait after a grant but cannot schedule a
@@ -2878,6 +2974,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           ...((args.agentTurnId ?? legacyAgentTurnId) ? { turnId: args.agentTurnId ?? legacyAgentTurnId } : {}),
         }));
         (await taskSecrets.refresh());
+        if (remoteWorld && args.role === 'do' && deps.client) stopDiskWatch = watchTurnDisk(world, args.taskId, organizationId);
         result = await runRuntimeTurn({ version: KARMAX_RUNTIME_PROTOCOL, input: {
           profile,
           world,
@@ -2885,7 +2982,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           session,
           deliveredMessages,
           fork,
-          systemPrompt: systemPrompt + skippedEnvNotice(skippedEnv) + (profile.mcpConnections?.some(id => id.startsWith('composio:')) ? '\nSelected app accounts (use list_connections and the connection tools; existing sharing permissions still apply): ' + profile.mcpConnections.filter(id => id.startsWith('composio:')).map(id => id.slice(9)).join(', ') : ''),
+          systemPrompt: systemPrompt + diskPromptNotice + skippedEnvNotice(skippedEnv) + (profile.mcpConnections?.some(id => id.startsWith('composio:')) ? '\nSelected app accounts (use list_connections and the connection tools; existing sharing permissions still apply): ' + profile.mcpConnections.filter(id => id.startsWith('composio:')).map(id => id.slice(9)).join(', ') : ''),
           role: args.role,
           maxTurns: profile.maxTurns,
           ...(resolvedAuth ? { resolvedAuth } : {}),
@@ -3123,12 +3220,27 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
         const failure = classifyTurnError(turnError, profile.provider);
         // Provider limits and policy rejections are authoritative; anything else
-        // in a remote world may be the sandbox's fault, which its metrics can show.
-        if (!world.diagnose || !(failure instanceof ApplicationFailure) || !['agent-error', 'agent-infra'].includes(failure.type ?? '')) throw failure;
+        // in a remote world may be the sandbox's fault: first a full disk (which
+        // also stops a harness from starting at all — pramana#3's exit 127), then
+        // what its metrics show.
+        const sandboxSuspect = failure instanceof ApplicationFailure && ['agent-error', 'agent-infra'].includes(failure.type ?? '');
+        if (sandboxSuspect && (remoteWorld || isDiskFullMessage(failure.message))) {
+          stopDiskWatch?.();
+          const check = remoteWorld ? await measureWorldDisk(world, args.taskId, 20_000) : undefined;
+          if (isDiskFullMessage(turnError instanceof Error ? turnError.message : String(turnError)) || diskWasFull(check)) {
+            (await store.kvSet(`disk-full:${args.taskId}`, String(Date.now())).catch(() => undefined));
+            const maxDiskGb = remoteWorld ? await knownMaxDiskGb(organizationId, args.worldHandle.kind) : undefined;
+            throw ApplicationFailure.create({ type: 'world-disk-full', nonRetryable: true, cause: turnError instanceof Error ? turnError : undefined,
+              message: outOfDiskMessage({ disk: check?.disk, maxDiskGb, taskId: args.taskId,
+                detail: turnError instanceof Error ? turnError.message : String(turnError) }) });
+          }
+        }
+        if (!world.diagnose || !sandboxSuspect) throw failure;
         const diagnosis = await world.diagnose({ since: attemptStarted }).catch(() => undefined);
         if (diagnosis && turnSessionKey) (await store.kvSet(`${turnSessionKey}:interruption`, JSON.stringify(diagnosis)));
         throw classifyTurnError(turnError, profile.provider, { diagnosis });
       } finally {
+        stopDiskWatch?.();
         try {
           if (usageAdmissionId && !usageAdmissionFinished) {
             if (providerInvoked || result) await finishUsage(false);
