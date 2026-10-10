@@ -25,6 +25,10 @@
  */
 
 import type { KarmaxEvent } from './types.js';
+import {
+  eventSourceMatches, eventTypeMatches, filterMatches, validateFilter, validEventType,
+  type EventFilter, type ProjectEvent,
+} from './project-events.js';
 
 // ─── Trigger shapes ──────────────────────────────────────────────────────────
 
@@ -57,14 +61,25 @@ export interface ScheduleTrigger {
 
 export interface EventTrigger {
   kind: 'event';
-  /** Event type to match, e.g. `software-dev.stage-changed` or `github.pr-merged`. */
+  /** Event type to match, e.g. `github.issues.labeled`; `github.issues.*` matches a family. */
   type: string;
-  /** Restrict to events from a specific source task (optional). */
+  /** Restrict to events from a specific source task (a task event, or one it emitted). */
   taskId?: string;
-  /** Shallow payload equality filter — every key must match the event payload. */
-  where?: Record<string, unknown>;
+  /** Restrict project events to a source: `github`, `webhook:<id>`, `webhook` (any webhook), … */
+  source?: string;
+  /** Payload filter: dotted path → value or operator (`in`, `contains`, `matches`, `exists`). */
+  where?: EventFilter;
   /** Re-arm after firing instead of disarming (default one-shot). */
   recurring?: boolean;
+  /**
+   * Project events only: at most one active run per rendered key (`{{issue.number}}`;
+   * empty = one per series). A further event is skipped, or queued until that run ends.
+   */
+  concurrency?: { key?: string; mode?: 'skip' | 'queue' };
+  /** Project events only: runs this trigger may start per hour (default 60); more wait. */
+  maxPerHour?: number;
+  /** Also fire on outside events that echo tavya's own actions (default: ignored). */
+  includeSelf?: boolean;
 }
 
 export type TaskTrigger = DependencyTrigger | ScheduleTrigger | EventTrigger;
@@ -144,6 +159,15 @@ export async function validateTriggers(triggers: TaskTrigger[], ctx: TriggerVali
         errs.push(`cron expression never occurs: "${t.cron}"`);
     } else if (t.kind === 'event') {
       if (!t.type) errs.push('event trigger needs an event `type`');
+      else if (t.type !== '*' && !validEventType(t.type.endsWith('.*') ? t.type.slice(0, -2) : t.type))
+        errs.push(`invalid event type: "${t.type}"`);
+      errs.push(...validateFilter(t.where));
+      if (t.concurrency !== undefined && (typeof t.concurrency !== 'object' || t.concurrency === null
+        || (t.concurrency.mode !== undefined && !['skip', 'queue'].includes(t.concurrency.mode))
+        || (t.concurrency.key !== undefined && typeof t.concurrency.key !== 'string')))
+        errs.push('event trigger `concurrency` takes an optional `key` and a `mode` of skip or queue');
+      if (t.maxPerHour !== undefined && !(Number.isInteger(t.maxPerHour) && t.maxPerHour > 0))
+        errs.push('event trigger `maxPerHour` must be a positive whole number');
     }
   }
   return errs;
@@ -187,16 +211,21 @@ async function validateDependencyGraph(deps: string[], ctx: TriggerValidationCon
 /** The lifecycle event dependency triggers listen on (the `view.updated` feed). */
 export const LIFECYCLE_EVENT = 'view.updated';
 
-/** Does a karmax event satisfy a single event/dependency trigger for one dep? */
+/** Does a task event (the bus) satisfy an event trigger? A trigger bound to a
+ *  project-event `source` never matches task events, nor does a bare `*`: the
+ *  bus carries every agent's live output, and each candidate costs store reads. */
 export function eventMatchesEventTrigger(t: EventTrigger, ev: KarmaxEvent): boolean {
-  if (ev.type !== t.type) return false;
+  if (!t.type || t.type === '*' || t.source || !eventTypeMatches(t.type, ev.type)) return false;
   if (t.taskId && ev.taskId !== t.taskId) return false;
-  if (t.where) {
-    for (const [k, v] of Object.entries(t.where)) {
-      if ((ev.payload as Record<string, unknown>)?.[k] !== v) return false;
-    }
-  }
-  return true;
+  return filterMatches(ev.payload, t.where);
+}
+
+/** Does a project event (the inbox) satisfy an event trigger? */
+export function projectEventMatchesTrigger(t: EventTrigger, ev: ProjectEvent): boolean {
+  if (!t.type || !eventTypeMatches(t.type, ev.type) || !eventSourceMatches(t.source, ev.source)) return false;
+  if (t.taskId && ev.source !== `task:${t.taskId}`) return false;
+  if (ev.origin === 'self' && !t.includeSelf) return false;
+  return filterMatches(ev.payload, t.where);
 }
 
 /** Does a status count as satisfying a dependency `on` condition? */
@@ -250,7 +279,7 @@ export function forcesRepeatable(triggers: TaskTrigger[]): boolean {
 
 /** Params for a run spawned from a series: the original minus trigger + series metadata. */
 export function cloneParamsWithoutTriggers<T extends Record<string, unknown>>(params: T): T {
-  const { triggers: _t, triggerState: _s, triggerLastFiredAt: _lf, triggerPending: _tp, draft: _d, repeatable: _r, runOf: _ro, ...rest } = params as Record<string, unknown>;
+  const { triggers: _t, triggerState: _s, triggerLastFiredAt: _lf, triggerPending: _tp, draft: _d, repeatable: _r, runOf: _ro, trigger: _tc, ...rest } = params as Record<string, unknown>;
   return rest as T;
 }
 

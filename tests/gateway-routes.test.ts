@@ -213,6 +213,8 @@ describe('platform catalog covers the gateway route table', () => {
     // Provider webhooks/ingest: authenticated by signature or a minted secret,
     // answered before the session gate, and excluded from platform_request.
     /\/(webhooks?|ingest)$/,
+    // Incoming webhook deliveries, authenticated by each hook's own secret.
+    /^\/api\/hooks\//,
     // OAuth/app-install redirect landings — the provider's browser redirect target,
     // authenticated by the flow's own state parameter, not a karmax token.
     /\/(oauth\/)?callback$/,

@@ -161,7 +161,8 @@ export async function bootHarness(
   let runPromise = worker.run();
   let serverStopped = false;
 
-  const api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, contentDir, defaultAgentProvider: provider, bus, worlds,
+  // The vault broker as src/main.ts passes it (incoming webhooks keep their secrets there).
+  const api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, contentDir, defaultAgentProvider: provider, bus, worlds, broker,
     refreshCredentialHealth: async (task, credentialProvider, options) => {
       if (credentialProvider) await retryCredentials({ store, client, taskQueue: TASK_QUEUE, broker, configHomes: overrides.configHomes }, task, credentialProvider, options);
     },

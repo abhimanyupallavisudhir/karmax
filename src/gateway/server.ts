@@ -294,6 +294,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   // The agent-mail inbound webhook authenticates with its own shared secret
   // (like the GitHub webhook), so it needs no capability.
   if (p === '/api/agent-mail/ingest') return 'none';
+  // Incoming webhooks authenticate each delivery with the hook's own secret.
+  if (/^\/api\/hooks\/[^/]+$/.test(p)) return 'none';
   if (p === '/api/payments/stripe/callback' || p === '/api/payments/stripe/webhook') return 'none';
   if (p === '/api/subscriptions/webhook' || p === '/api/subscriptions/paddle/webhook'
     || p === '/api/subscriptions/paddle/checkout-config') return 'none';
@@ -353,6 +355,11 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/tasks\/[^/]+\/resources/.test(p)) return read ? 'task:read' : 'task:review:execute';
   if (/^\/api\/tasks\/[^/]+\/resource-candidates/.test(p)) return read ? 'task:read' : 'task:review:execute';
   if (/^\/api\/projects\/[^/]+\/tasks/.test(p)) return read ? 'task:read' : 'task:create';
+  // Project events: reading needs the event stream; emitting can start runs.
+  if (/^\/api\/projects\/[^/]+\/events$/.test(p)) return read ? 'task:event:read' : 'task:create';
+  if (/^\/api\/project-events\/[^/]+$/.test(p)) return 'task:event:read';
+  if (/^\/api\/projects\/[^/]+\/webhooks$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
+  if (/^\/api\/webhooks\/[^/]+(?:\/rotate)?$/.test(p)) return 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/search$/.test(p)) return 'task:read';
   if (/^\/api\/projects\/[^/]+\/(tags|views)$/.test(p)) return read ? 'task:read' : 'task:edit';
   if (/^\/api\/(tags|views)\//.test(p)) return read ? 'task:read' : 'task:edit';
@@ -1955,6 +1962,21 @@ export class Gateway {
         // Verified failures remain in the durable inbox for local retry.
         const message = error instanceof Error ? error.message : String(error);
         return this.json(res, /webhook signature/i.test(message) ? 401 : 500, { error: message });
+      }
+    }
+    // Incoming webhook delivery (wiki planned/external-connectors-and-automations):
+    // one project event per delivery, recorded before the sender is answered.
+    const hookMatch = p.match(/^\/api\/hooks\/([^/]+)$/);
+    if (hookMatch && method === 'POST') {
+      try {
+        const raw = await this.rawBody(req, 1024 * 1024);
+        const result = await this.deps.api.receiveIncomingWebhook(decodeURIComponent(hookMatch[1]!), {
+          raw, contentType: typeof req.headers['content-type'] === 'string' ? req.headers['content-type'] : undefined,
+          headers: req.headers, query: url.searchParams,
+        });
+        return this.json(res, 202, { accepted: true, event: result.event.id, duplicate: result.duplicate });
+      } catch (error) {
+        return this.fail(res, error);
       }
     }
     // Agent mailbox inbound webhook (wiki plans/PLAN-passwords §8): authenticated by a
@@ -5022,6 +5044,48 @@ export class Gateway {
         const q = url.searchParams.get('q') ?? '';
         const r = await api.searchTasks(token, searchMatch[1]!, q);
         return this.json(res, 200, r);
+      }
+
+      // Project events (the inbox) and the incoming webhooks that feed it.
+      const projectEventsMatch = p.match(/^\/api\/projects\/([^/]+)\/events$/);
+      if (projectEventsMatch) {
+        const projectId = projectEventsMatch[1]!;
+        if (method === 'GET') {
+          const before = url.searchParams.get('before');
+          return this.json(res, 200, await api.listProjectEvents(token, projectId, {
+            ...(url.searchParams.get('limit') ? { limit: Number(url.searchParams.get('limit')) } : {}),
+            ...(before ? { before: Number(before) } : {}),
+            ...(url.searchParams.get('type') ? { type: url.searchParams.get('type')! } : {}),
+            ...(url.searchParams.get('source') ? { source: url.searchParams.get('source')! } : {}),
+          }));
+        }
+        if (method === 'POST') {
+          const b = await this.body(req);
+          const result = await api.emitProjectEvent(token, projectId, { type: b.type, key: b.key, subject: b.subject, occurredAt: b.occurredAt, payload: b.payload });
+          return this.json(res, result.duplicate ? 200 : 201, result);
+        }
+      }
+      const projectEventMatch = p.match(/^\/api\/project-events\/([^/]+)$/);
+      if (projectEventMatch && method === 'GET') return this.json(res, 200, await api.getProjectEvent(token, projectEventMatch[1]!));
+      const projectWebhooksMatch = p.match(/^\/api\/projects\/([^/]+)\/webhooks$/);
+      if (projectWebhooksMatch) {
+        const projectId = projectWebhooksMatch[1]!;
+        if (method === 'GET') return this.json(res, 200, { webhooks: await api.listIncomingWebhooks(token, projectId), urlBase: `${this.publicUrl(req)}/api/hooks/` });
+        if (method === 'POST') {
+          const b = await this.body(req);
+          const created = await api.createIncomingWebhook(token, projectId, { name: b.name, type: b.type });
+          return this.json(res, 201, { ...created, url: `${this.publicUrl(req)}/api/hooks/${created.hook.id}` });
+        }
+      }
+      const webhookMatch = p.match(/^\/api\/webhooks\/([^/]+)(\/rotate)?$/);
+      if (webhookMatch) {
+        const hookId = webhookMatch[1]!;
+        if (webhookMatch[2] && method === 'POST') return this.json(res, 200, await api.rotateIncomingWebhook(token, hookId));
+        if (!webhookMatch[2] && method === 'PATCH') {
+          const b = await this.body(req);
+          return this.json(res, 200, await api.updateIncomingWebhook(token, hookId, { ...(b.name !== undefined ? { name: String(b.name) } : {}), ...(b.type !== undefined ? { type: String(b.type) } : {}) }));
+        }
+        if (!webhookMatch[2] && method === 'DELETE') return this.json(res, 200, await api.deleteIncomingWebhook(token, hookId));
       }
 
       // Tags (labels + topics, hierarchical) — project-scoped catalogue.
