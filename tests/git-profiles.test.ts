@@ -146,7 +146,7 @@ describe('GitProfiles registry (PLAN-git-config §3)', () => {
     const removed = await user.saveGithubToken('7', undefined);
     expect(removed.githubToken).toBeUndefined();
     expect(removed).toMatchObject({ signingKey: true, userName: 'Jane D' });
-    expect(broker.hasHandle(gitHandle('github', 'token', userGitScope('user_jane')))).toBe(false);
+    expect(await broker.hasHandle(gitHandle('github', 'token', userGitScope('user_jane')))).toBe(false);
     await expect(user.saveGithubToken('99', 'ghp_x')).rejects.toThrow(/Connect GitHub/);
   });
 
