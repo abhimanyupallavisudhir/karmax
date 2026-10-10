@@ -5,7 +5,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import { INSTALLATION_SCOPE, userScope } from '../autonomy/vault-keys.js';
 import type { Store } from '../store/db.js';
-import type { GitConnection, Repository } from '../domain/types.js';
+import type { GitConnection, Repository, RepositoryUpstream } from '../domain/types.js';
 import { githubPrWebhookObservationKey, pullRequestWebhookEvent, reconcilePullRequestView,
   type GithubPrWebhookEvent } from './github-pr.js';
 import { GithubActionsApi } from './github-actions.js';
@@ -134,6 +134,7 @@ interface GitHubRepositoryPayload {
   ssh_url: string;
   default_branch: string;
   owner: { login: string };
+  fork?: boolean;
 }
 
 interface GitHubInstallationPayload {
@@ -945,10 +946,13 @@ export class GitHubAppService {
     const repositories: Repository[] = [];
     const existing = await this.store.listRepositories(connection.organizationId);
     for (const item of remote) {
-      if (item.archived && !existing.some((repo) => repo.providerId === String(item.id))) continue;
+      const prior = existing.find((repo) => repo.providerId === String(item.id));
+      if (item.archived && !prior) continue;
+      const upstream = item.fork ? prior?.upstream ?? await this.forkUpstream(item, token) : undefined;
       const repository = (await this.store.upsertRepository({ organizationId: connection.organizationId, provider: 'github',
         providerId: String(item.id), owner: item.owner.login, name: item.name, sshUrl: item.ssh_url,
-        defaultBranch: item.default_branch, private: item.private, gitConnectionId: connection.id }));
+        defaultBranch: item.default_branch, private: item.private, gitConnectionId: connection.id,
+        ...(upstream ? { upstream } : {}) }));
       active.add(repository.id);
       await this.removeLegacyDeployKeys(repository, token);
       repositories.push(repository);
@@ -1349,6 +1353,55 @@ export class GitHubAppService {
       }
       return this.installationToken(connection, [repository.providerId ?? '']);
     }, { apiBase: this.apiBase, fetch: this.fetcher });
+  }
+
+  /** The repository a fork was made from. The installation list says only
+   * that a repository is a fork; the repository itself names its parent. A
+   * failed lookup leaves the fork an ordinary repository until the next
+   * reconcile. */
+  private async forkUpstream(item: GitHubRepositoryPayload, token: string): Promise<RepositoryUpstream | undefined> {
+    try {
+      const detail = await this.request<{ parent?: GitHubRepositoryPayload }>(
+        `/repos/${encodeURIComponent(item.owner.login)}/${encodeURIComponent(item.name)}`, token);
+      const parent = detail?.parent;
+      if (!parent?.owner?.login || !parent.name || !parent.default_branch) return undefined;
+      return { owner: parent.owner.login, name: parent.name, defaultBranch: parent.default_branch, private: Boolean(parent.private) };
+    } catch { return undefined; }
+  }
+
+  /** Check that a personal token belongs to the connected GitHub account and
+   * can open pull requests on repositories the person does not own: a classic
+   * token with `public_repo` or `repo`. GitHub's fine-grained tokens cannot
+   * contribute to repositories whose owner the person is not a member of. */
+  async verifyPersonalToken(accountId: string, token: string): Promise<void> {
+    const response = await this.fetcher(`${this.apiBase}/user`, { signal: AbortSignal.timeout(30_000), headers: {
+      accept: 'application/vnd.github+json', authorization: `Bearer ${token}`, 'x-github-api-version': '2022-11-28',
+    } });
+    if (!response.ok) throw new Error(`GitHub did not accept this token (${response.status})`);
+    const user = await response.json() as { id?: number | string; login?: string };
+    if (String(user.id) !== accountId) throw new Error(`This token belongs to ${user.login ?? 'another account'}, not this GitHub account`);
+    const scopes = (response.headers.get('x-oauth-scopes') ?? '').split(',').map((scope) => scope.trim());
+    if (!scopes.includes('public_repo') && !scopes.includes('repo'))
+      throw new Error('Use a classic token with the public_repo scope');
+  }
+
+  /** Bring a fork's branch up to date with its upstream before a task branches
+   * off it, as GitHub's "Sync fork" does: a fast-forward when the fork has no
+   * commits of its own, else a merge. A conflict leaves the branch as it is. */
+  async syncFork(repository: Repository, branch: string): Promise<{ synced: boolean; detail: string }> {
+    if (!repository.upstream) return { synced: false, detail: 'not a fork' };
+    if (!repository.gitConnectionId) throw new Error('repository has no GitHub App connection');
+    const connection = (await this.store.getGitConnection(repository.gitConnectionId));
+    if (!connection || connection.organizationId !== repository.organizationId) throw new Error('repository GitHub App connection is missing');
+    const token = await this.installationToken(connection, [repository.providerId ?? '']);
+    try {
+      const result = await this.request<{ merge_type?: string; message?: string }>(
+        `/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.name)}/merge-upstream`, token,
+        { method: 'POST', body: JSON.stringify({ branch }) });
+      return { synced: true, detail: result?.message ?? result?.merge_type ?? 'synced' };
+    } catch (error) {
+      return { synced: false, detail: error instanceof Error ? error.message : String(error) };
+    }
   }
 
   /**
