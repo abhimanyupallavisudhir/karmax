@@ -693,13 +693,32 @@ export const PLATFORM_EVENTS: EventSchemaDecl[] = [
   { type: 'github.pr.synchronize', description: "New commits were pushed to a task's pull request.", fields: GITHUB_PR_ACTION_FIELDS },
   { type: 'github.pr.review', description: "A review was submitted on a task's pull request.", fields: { ...GITHUB_PR_FIELDS, review: 'approved | changes_requested | commented | dismissed', reviewer: 'GitHub login' } },
   { type: 'github.check.completed', description: "A check completed on a task's pull-request branch.", fields: { checkId: 'GitHub check-run id', name: 'check name', conclusion: 'success | failure | cancelled | …', status: 'completed', branch: 'task branch', headSha: 'exact checked revision', number: 'pull-request number when GitHub supplies it', url: 'details URL', repo: 'owner/name on GitHub' } },
-  { type: 'github.workflow.failed', description: 'A default-branch GitHub workflow failed and created this recovery task.', fields: { repository: 'owner/name on GitHub', workflow: 'workflow name', runId: 'GitHub Actions run id', attempt: 'run attempt', conclusion: 'failure | timed_out | startup_failure | …', headSha: 'exact failed revision', branch: 'default branch', url: 'run URL', source: 'workflow_run | check_run', originatingTaskId: 'task id when GitHub supplied one' } },
+
   { type: 'merge.result', description: "A task's work was merged (or the merge finished).", fields: { ok: 'boolean', sha: 'string' } },
   { type: 'work.committed', description: 'An agent committed work in its world.', fields: { sha: 'string' } },
   { type: 'world.created', description: "A task's local or cloud world was provisioned.", fields: {} },
   { type: 'world.parked', description: "A waiting task's metered world compute was paused while durable state was retained.", fields: {} },
   { type: 'world.destroyed', description: "A task's world was torn down.", fields: {} },
   { type: 'spend.requested', description: 'An agent requested a payment under its task budget.', fields: { status: 'string', reason: 'string' } },
+];
+
+/**
+ * Project events (wiki planned/external-connectors-and-automations): what the
+ * inbox receives from outside a task. GitHub sends `github.<event>.<action>`
+ * for every delivery of an attached repository (its payload as GitHub sent it,
+ * minus API links); these are the ones worth starting work on. An incoming
+ * webhook's events have the type its hook names, and a task's `emit_event`
+ * whatever type it chooses.
+ */
+export const PROJECT_EVENTS: EventSchemaDecl[] = [
+  { type: 'github.issues.opened', description: 'An issue was opened.', fields: { 'issue.number': 'number', 'issue.title': 'string', 'issue.body': 'string', 'issue.labels.name': 'label names', 'sender.login': 'who opened it' } },
+  { type: 'github.issues.labeled', description: 'A label was added to an issue.', fields: { 'label.name': 'the label added', 'issue.number': 'number', 'issue.title': 'string', 'issue.labels.name': 'every label' } },
+  { type: 'github.issue_comment.created', description: 'Someone commented on an issue or pull request.', fields: { 'comment.body': 'string', 'issue.number': 'number', 'sender.login': 'who commented' } },
+  { type: 'github.pull_request.opened', description: 'A pull request was opened.', fields: { 'pull_request.number': 'number', 'pull_request.title': 'string', 'pull_request.base.ref': 'target branch' } },
+  { type: 'github.push', description: 'Commits were pushed.', fields: { ref: 'refs/heads/<branch>', after: 'new head', 'pusher.name': 'string' } },
+  { type: 'github.release.published', description: 'A release was published.', fields: { 'release.tag_name': 'string', 'release.name': 'string' } },
+  { type: 'github.deployment_status.created', description: 'A deployment changed state.', fields: { 'deployment_status.state': 'success | failure | error | …', 'deployment.environment': 'string' } },
+  { type: 'github.workflow.failed', description: 'A default-branch workflow failed, or GitHub created no deployment run.', fields: { repository: 'owner/name on GitHub', workflow: 'workflow name', runId: 'GitHub Actions run id', attempt: 'run attempt', conclusion: 'failure | timed_out | startup_failure | missing | …', headSha: 'exact failed revision', branch: 'default branch', url: 'run URL', source: 'workflow_run | check_run | deployment_monitor', originatingTaskId: 'task id when GitHub supplied one', evidence: 'what the deployment monitor checked' } },
 ];
 
 /** The full event catalog: every workflow's declared events + the platform events,
@@ -710,6 +729,7 @@ export function eventCatalog(manifests: WorkflowManifest[] = MANIFESTS): (EventS
   const seen = new Set<string>();
   for (const m of manifests) for (const e of m.events) if (!seen.has(e.type)) { seen.add(e.type); out.push({ ...e, source: m.name }); }
   for (const e of PLATFORM_EVENTS) if (!seen.has(e.type)) { seen.add(e.type); out.push({ ...e, source: 'platform' }); }
+  for (const e of PROJECT_EVENTS) if (!seen.has(e.type)) { seen.add(e.type); out.push({ ...e, source: 'project' }); }
   return out;
 }
 

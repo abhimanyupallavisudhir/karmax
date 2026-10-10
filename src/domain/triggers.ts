@@ -72,10 +72,11 @@ export interface EventTrigger {
   /** Re-arm after firing instead of disarming (default one-shot). */
   recurring?: boolean;
   /**
-   * Project events only: at most one active run per rendered key (`{{issue.number}}`;
-   * empty = one per series). A further event is skipped, or queued until that run ends.
+   * Project events only: at most one unfinished run per rendered key (`{{issue.number}}`;
+   * empty = one per series). A further event is skipped, queued until that run
+   * ends, or told to that run as a message (`tell`, for an agent's run).
    */
-  concurrency?: { key?: string; mode?: 'skip' | 'queue' };
+  concurrency?: { key?: string; mode?: 'skip' | 'queue' | 'tell' };
   /** Project events only: runs this trigger may start per hour (default 60); more wait. */
   maxPerHour?: number;
   /** Also fire on outside events that echo tavya's own actions (default: ignored). */
@@ -163,9 +164,9 @@ export async function validateTriggers(triggers: TaskTrigger[], ctx: TriggerVali
         errs.push(`invalid event type: "${t.type}"`);
       errs.push(...validateFilter(t.where));
       if (t.concurrency !== undefined && (typeof t.concurrency !== 'object' || t.concurrency === null
-        || (t.concurrency.mode !== undefined && !['skip', 'queue'].includes(t.concurrency.mode))
+        || (t.concurrency.mode !== undefined && !['skip', 'queue', 'tell'].includes(t.concurrency.mode))
         || (t.concurrency.key !== undefined && typeof t.concurrency.key !== 'string')))
-        errs.push('event trigger `concurrency` takes an optional `key` and a `mode` of skip or queue');
+        errs.push('event trigger `concurrency` takes an optional `key` and a `mode` of skip, queue or tell');
       if (t.maxPerHour !== undefined && !(Number.isInteger(t.maxPerHour) && t.maxPerHour > 0))
         errs.push('event trigger `maxPerHour` must be a positive whole number');
     }

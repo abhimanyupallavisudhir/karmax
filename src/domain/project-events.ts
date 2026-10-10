@@ -36,10 +36,11 @@ export interface ProjectEvent {
   hops: number;
 }
 
-/** What one event did for one armed task. `pending`: a run is being started;
- *  `deferred`: waiting (dependencies, a queued concurrency slot, the hourly
- *  limit, or a failed start); `skipped`: never will. */
-export type ProjectEventClaimState = 'pending' | 'started' | 'deferred' | 'skipped';
+/** What one event did for one armed task. `pending`: a run is being started
+ *  (or told); `started`: it started `runId`; `told`: it went to the unfinished
+ *  run `runId` as a message; `deferred`: waiting (dependencies, a queued
+ *  concurrency slot, the hourly limit, or a failed start); `skipped`: never will. */
+export type ProjectEventClaimState = 'pending' | 'started' | 'told' | 'deferred' | 'skipped';
 
 export interface ProjectEventClaim {
   eventId: string;
@@ -271,6 +272,11 @@ export function triggerPromptSection(trigger: TriggerContext): string {
   ].join('\n');
 }
 
+/** The message an unfinished run receives for a further event of its key. */
+export function triggerMessage(trigger: TriggerContext): string {
+  return triggerPromptSection(trigger).replace(/^This run was started by the event/, 'While you work on this, another event arrived:');
+}
+
 /**
  * What a run started by an event looks like: the event on `params.trigger`
  * (commands read it from `$TAVYA_EVENT`), the prompt section appended, and a
@@ -282,4 +288,29 @@ export function applyTriggerContext<P extends Record<string, unknown>>(title: st
     title: hasTemplate(title) ? (renderTemplate(title, trigger.payload).trim() || title) : title,
     params: { ...params, trigger, prompt: [prompt, triggerPromptSection(trigger)].filter(Boolean).join('\n\n') },
   };
+}
+
+/**
+ * Fit an outside payload into the inbox's limit, keeping its shape: long text
+ * and long lists are shortened step by step, and `_truncated` says so. A sender
+ * that needs every byte can be fetched from by the run itself.
+ */
+export function boundEventPayload(payload: Record<string, unknown>, maxBytes = MAX_EVENT_PAYLOAD_BYTES): Record<string, unknown> {
+  const size = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).length;
+  if (size(payload) <= maxBytes) return payload;
+  for (const [textLimit, listLimit] of [[4000, 50], [1000, 20], [300, 5]] as const) {
+    const trimmed = trimValue(payload, textLimit, listLimit, 0) as Record<string, unknown>;
+    if (size(trimmed) <= maxBytes - 32) return { ...trimmed, _truncated: true };
+  }
+  const scalars = Object.entries(payload).filter(([, value]) => value === null || typeof value !== 'object')
+    .map(([key, value]) => [key, typeof value === 'string' ? value.slice(0, 300) : value]);
+  return { ...Object.fromEntries(scalars), _truncated: true };
+}
+
+function trimValue(value: unknown, textLimit: number, listLimit: number, depth: number): unknown {
+  if (typeof value === 'string') return value.length > textLimit ? `${value.slice(0, textLimit)}…` : value;
+  if (!value || typeof value !== 'object') return value;
+  if (depth > 8) return '…';
+  if (Array.isArray(value)) return value.slice(0, listLimit).map((item) => trimValue(item, textLimit, listLimit, depth + 1));
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, trimValue(item, textLimit, listLimit, depth + 1)]));
 }

@@ -170,7 +170,8 @@ describe('GitHub App integration', () => {
       ], default_permissions: { emails: 'read' } });
     expect(manifest.manifest).toHaveProperty('hook_attributes.url', 'https://karmax.example/api/github/webhook');
     // Installation events arrive automatically; the PR lifecycle must be asked for.
-    expect(manifest.manifest.default_events).toEqual(['push', 'pull_request', 'pull_request_review', 'check_run', 'merge_group', 'workflow_run']);
+    expect(manifest.manifest.default_events).toEqual(['push', 'pull_request', 'pull_request_review', 'check_run', 'merge_group', 'workflow_run',
+      'issues', 'issue_comment', 'release', 'deployment_status']);
     expect(manifest.manifest).toHaveProperty('default_permissions.checks', 'write');
     expect(manifest.manifest).toHaveProperty('default_permissions.actions', 'write');
     expect(manifest.manifest).toHaveProperty('default_permissions.workflows', 'write');
@@ -599,10 +600,12 @@ describe('GitHub App integration', () => {
     const otherTask = (await store.createTask({ projectId: (await store.createProject('Theirs', {}, other.id)).id,
       title: 'Theirs', workflow: 'software-dev', workflowVersion: '1.8.0', params: { prompt: 'x' } }));
     const service = (await GitHubAppService.create(store, broker, { appId: '123' }));
+    // Every delivery is also a project event; that is the next test's subject.
     const deliver = async (event: string, id: string, body: unknown) => {
       const raw = Buffer.from(JSON.stringify(body));
-      return service.handleWebhook(event, id, raw,
+      const { inbox: _inbox, ...result } = await service.handleWebhook(event, id, raw,
         `sha256=${crypto.createHmac('sha256', 'webhook-secret').update(raw).digest('hex')}`);
+      return result;
     };
     const pull = (branch: string, over: Record<string, unknown> = {}) => ({
       installation: { id: 42 }, action: 'closed', repository: { id: 99, full_name: 'acme/app' },
@@ -727,6 +730,56 @@ describe('GitHub App integration', () => {
     expect((await deliver('pull_request', 'pr-1', pull(`tavya/${task.id}`))).accepted).toBe(false);
     (await store.close());
     fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('turns every delivery for an attached repository into a project event', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-inbox-'));
+    const store = (await Store.create(':memory:'));
+    const broker = new CredentialBroker(new Vault(dir));
+    (await broker.registerHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE, 'webhook-secret', INSTALLATION_SCOPE));
+    const organization = (await store.createOrganization({ name: 'Hookworks', ownerUserId: 'owner' }));
+    (await store.upsertGitConnection({ organizationId: organization.id, provider: 'github',
+      installationId: '42', accountLogin: 'acme', accountType: 'Organization' }));
+    const project = (await store.createProject('App', {}, organization.id));
+    const second = (await store.createProject('Docs', {}, organization.id));
+    const repository = (await store.upsertRepository({ organizationId: organization.id, provider: 'github',
+      providerId: '99', owner: 'acme', name: 'app', sshUrl: 'git@github.com:acme/app.git', defaultBranch: 'main', private: true }));
+    (await store.attachProjectRepository({ projectId: project.id, repositoryId: repository.id }));
+    (await store.attachProjectRepository({ projectId: second.id, repositoryId: repository.id }));
+    const service = (await GitHubAppService.create(store, broker, { appId: '123', appSlug: 'tavya-test' }));
+    const deliver = async (event: string, id: string, body: unknown) => {
+      const raw = Buffer.from(JSON.stringify(body));
+      return service.handleWebhook(event, id, raw, `sha256=${crypto.createHmac('sha256', 'webhook-secret').update(raw).digest('hex')}`);
+    };
+    const labeled = (sender: Record<string, unknown>) => ({
+      installation: { id: 42 }, action: 'labeled', sender,
+      repository: { id: 99, full_name: 'acme/app', html_url: 'https://github.com/acme/app', hooks_url: 'https://api.github.com/x' },
+      label: { name: 'planned', url: 'https://api.github.com/labels/planned' },
+      issue: { number: 12, title: 'Dark mode', html_url: 'https://github.com/acme/app/issues/12', comments_url: 'https://api.github.com/c',
+        body: 'x'.repeat(100_000), labels: [{ name: 'planned' }] },
+    });
+
+    const result = await deliver('issues', 'delivery-issue-1', labeled({ login: 'octocat', type: 'User' }));
+    expect(result.inbox?.map((event) => event.projectId).sort()).toEqual([project.id, second.id].sort());
+    const [event] = result.inbox!;
+    expect(event).toMatchObject({ organizationId: organization.id, type: 'github.issues.labeled', key: 'delivery-issue-1',
+      subject: 'https://github.com/acme/app/issues/12', origin: 'external',
+      payload: { action: 'labeled', label: { name: 'planned' }, issue: { number: 12, labels: [{ name: 'planned' }] } } });
+    // API links go; the page link stays; an oversized body is shortened, never refused.
+    expect(JSON.stringify(event!.payload)).not.toMatch(/api\.github\.com|"installation"/);
+    expect((event!.payload as any).repository.html_url).toBe('https://github.com/acme/app');
+    expect((event!.payload as any)._truncated).toBe(true);
+    expect(new TextEncoder().encode(JSON.stringify(event!.payload)).length).toBeLessThanOrEqual(64 * 1024);
+
+    // What the App itself did on GitHub comes back marked as its own.
+    const echo = await deliver('issues', 'delivery-issue-2', labeled({ login: 'tavya-test[bot]', type: 'Bot' }));
+    expect(echo.inbox?.[0]?.origin).toBe('self');
+
+    // A repository no project has, or no repository at all, is not a project event.
+    expect((await deliver('issues', 'delivery-issue-3', { ...labeled({ login: 'x', type: 'User' }),
+      repository: { id: 7, full_name: 'acme/other' } })).inbox).toBeUndefined();
+    expect((await deliver('push', 'delivery-push', { installation: { id: 42 }, ref: 'refs/heads/feature',
+      repository: { id: 99, full_name: 'acme/app' } })).inbox).toMatchObject([{ type: 'github.push' }, { type: 'github.push' }]);
   });
 
   it('removes deploy keys left by an older karmax version during reconciliation', async () => {

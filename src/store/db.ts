@@ -8479,13 +8479,15 @@ export class Store {
     return Number(row?.n ?? 0);
   }
 
-  /** Is a run of this armed task for this concurrency key starting or still unfinished? */
-  async projectEventSlotBusy(taskId: string, concurrencyKey: string): Promise<boolean> {
-    const row = await this.db.prepare(`SELECT 1 hit FROM project_event_claims c LEFT JOIN tasks t ON t.id=c.runId
+  /** The run of this armed task for this concurrency key that is starting or
+   *  still unfinished: `{}` while one is starting, `{ runId }` once it runs. */
+  async projectEventSlot(taskId: string, concurrencyKey: string): Promise<{ runId?: string } | undefined> {
+    const row = await this.db.prepare(`SELECT c.state, c.runId FROM project_event_claims c LEFT JOIN tasks t ON t.id=c.runId
       WHERE c.taskId=? AND c.concurrencyKey=? AND (c.state='pending' OR (c.state='started' AND t.id IS NOT NULL
         AND IFNULL(json_extract(t.lastView, '$.status'), 'active') NOT IN ('done', 'failed', 'cancelled')))
-      LIMIT 1`).get(taskId, concurrencyKey);
-    return !!row;
+      ORDER BY CASE c.state WHEN 'started' THEN 0 ELSE 1 END LIMIT 1`).get(taskId, concurrencyKey) as { state?: string; runId?: string } | undefined;
+    if (!row) return undefined;
+    return row.state === 'started' && row.runId ? { runId: String(row.runId) } : {};
   }
 
   /** The run a pending claim may already have started before its process died. */

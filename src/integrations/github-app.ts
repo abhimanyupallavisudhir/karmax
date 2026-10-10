@@ -11,6 +11,7 @@ import { githubPrWebhookObservationKey, pullRequestWebhookEvent, reconcilePullRe
 import { GithubActionsApi } from './github-actions.js';
 import { githubActionsRunIdFromUrl } from './github-actions.js';
 import { observeDeploymentWorkflowRun } from './github-deployment-monitor.js';
+import { boundEventPayload } from '../domain/project-events.js';
 import { taskIdOfBranch, BRAND } from '../domain/brand.js';
 
 export const GITHUB_APP_PRIVATE_KEY_HANDLE = 'github-app:private-key';
@@ -45,6 +46,11 @@ export type GitHubAppPermissionLevel = 'write' | 'read';
  * provider 403. Installation owners still choose the repositories in scope and
  * explicitly approve every expansion of this envelope on GitHub.
  */
+/** The webhook events a new App subscribes to. An existing App's owner adds new
+ *  ones in its settings (GitHub has no API for an App's event subscriptions). */
+export const GITHUB_APP_EVENTS = ['push', 'pull_request', 'pull_request_review', 'check_run', 'merge_group', 'workflow_run',
+  'issues', 'issue_comment', 'release', 'deployment_status'] as const;
+
 export const GITHUB_APP_PERMISSIONS = {
   actions: 'write',
   administration: 'write',
@@ -241,11 +247,25 @@ export interface GithubVaultPushEvent {
   revision: string;
 }
 
+/** One GitHub delivery as a project event (wiki planned/external-connectors-and-
+ *  automations): `github.<event>.<action>`, keyed by the delivery id. */
+export interface GithubInboxEvent {
+  organizationId: string;
+  projectId: string;
+  type: string;
+  key: string;
+  subject?: string;
+  payload: Record<string, unknown>;
+  /** `self` when the sender is this installation's own App. */
+  origin: 'external' | 'self';
+}
+
 export interface GithubWebhookResult {
   accepted: boolean;
   reconciled?: number;
   events?: GithubPrWebhookEvent[];
   projectEvents?: GithubProjectWebhookEvent[];
+  inbox?: GithubInboxEvent[];
   vaultPushes?: GithubVaultPushEvent[];
 }
 
@@ -475,8 +495,10 @@ export class GitHubAppService {
     if (publicWebhookOrigin(parsed)) {
       manifest.hook_attributes = { url: `${origin}/api/github/webhook`, active: true };
       // PR/check/merge-group lifecycle turns provider progress for a Karmax task
-      // into durable events and wakes its reconciliation loop (SPEC §5.4).
-      manifest.default_events = ['push', 'pull_request', 'pull_request_review', 'check_run', 'merge_group', 'workflow_run'];
+      // into durable events and wakes its reconciliation loop (SPEC §5.4). Every
+      // delivery is also a project event an armed task can start runs on, which
+      // is what issues, comments, releases and deployments are here for.
+      manifest.default_events = [...GITHUB_APP_EVENTS];
     }
     return {
       action: 'https://github.com/settings/apps/new',
@@ -1015,14 +1037,14 @@ export class GitHubAppService {
       // Bounded retry budget: this call is inside GitHub's ~10 s delivery
       // timeout, so a long backoff must fail fast and let the inbox retry
       // rather than hold the response open (see WEBHOOK_RETRY_BUDGET_MS).
-      return await retryDeadline.run(Date.now() + WEBHOOK_RETRY_BUDGET_MS, () => this.dispatchWebhook(event, raw));
+      return await retryDeadline.run(Date.now() + WEBHOOK_RETRY_BUDGET_MS, () => this.dispatchWebhook(event, raw, deliveryId));
     } catch (error) {
       (await this.store.releaseGithubDelivery(deliveryId));
       throw error;
     }
   }
 
-  private async dispatchWebhook(event: string, raw: Buffer):
+  private async dispatchWebhook(event: string, raw: Buffer, deliveryId: string):
   Promise<GithubWebhookResult> {
     const payload = JSON.parse(raw.toString('utf8')) as any;
     const installationId = String(payload.installation?.id ?? '');
@@ -1033,8 +1055,11 @@ export class GitHubAppService {
     // tenants does not multiply webhook latency. allSettled is deliberate: if
     // one tenant fails, let the others finish before releasing the delivery for
     // retry, avoiding overlapping attempts against still-running work.
-    const settled = await Promise.allSettled(connections.map((connection) =>
-      this.dispatchConnectionWebhook(event, payload, connection)));
+    const settled = await Promise.allSettled(connections.map(async (connection) => {
+      const result = await this.dispatchConnectionWebhook(event, payload, connection);
+      const inbox = await this.inboxEvents(event, payload, connection.organizationId, deliveryId);
+      return inbox.length ? { ...result, inbox } : result;
+    }));
     const failed = settled.find((entry): entry is PromiseRejectedResult => entry.status === 'rejected');
     if (failed) throw failed.reason;
     const result: GithubWebhookResult = { accepted: true };
@@ -1043,6 +1068,7 @@ export class GitHubAppService {
       if (next.reconciled !== undefined) result.reconciled = (result.reconciled ?? 0) + next.reconciled;
       if (next.events?.length) (result.events ??= []).push(...next.events);
       if (next.projectEvents?.length) (result.projectEvents ??= []).push(...next.projectEvents);
+      if (next.inbox?.length) (result.inbox ??= []).push(...next.inbox);
       if (next.vaultPushes?.length) (result.vaultPushes ??= []).push(...next.vaultPushes);
     }
     return result;
@@ -1127,6 +1153,31 @@ export class GitHubAppService {
       return { accepted: true, reconciled: repositories.length };
     }
     return { accepted: true };
+  }
+
+  /**
+   * The delivery as a project event in every project the repository is attached
+   * to. GitHub's per-object `*_url` API links are dropped (`html_url` stays):
+   * they are most of a payload's bytes and a run can rebuild any of them.
+   */
+  private async inboxEvents(event: string, payload: any, organizationId: string, deliveryId: string): Promise<GithubInboxEvent[]> {
+    const repositoryPayload = payload?.repository;
+    if (!deliveryId || !repositoryPayload || ['installation', 'installation_repositories'].includes(event)) return [];
+    const repository = (await this.store.listRepositories(organizationId)).find((candidate) =>
+      (repositoryPayload.id && candidate.providerId === String(repositoryPayload.id))
+      || `${candidate.owner}/${candidate.name}`.toLowerCase() === String(repositoryPayload.full_name ?? '').toLowerCase());
+    if (!repository) return [];
+    const projectIds = await this.store.projectIdsForRepository(repository.id);
+    if (!projectIds.length) return [];
+    const action = typeof payload.action === 'string' && /^[a-z0-9_-]+$/i.test(payload.action) ? `.${payload.action}` : '';
+    const subject = [payload.comment, payload.issue, payload.pull_request, payload.release, payload.workflow_run, payload.check_run,
+      payload.deployment_status, repositoryPayload].map((object) => object?.html_url).find((url) => typeof url === 'string');
+    const slug = this.options.appSlug;
+    const origin = slug && payload.sender?.type === 'Bot' && payload.sender?.login === `${slug}[bot]` ? 'self' as const : 'external' as const;
+    const { installation: _installation, ...rest } = payload;
+    const compact = boundEventPayload(withoutApiLinks(rest) as Record<string, unknown>);
+    return projectIds.map((projectId) => ({ organizationId, projectId, type: `github.${event}${action}`, key: deliveryId,
+      ...(subject ? { subject } : {}), payload: compact, origin }));
   }
 
   /** Only same-repository pushes prove a failure on the merged default branch. */
@@ -1820,4 +1871,13 @@ export class GitHubAppService {
 
 function base64url(value: string): string {
   return Buffer.from(value).toString('base64url');
+}
+
+/** GitHub's REST links (`*_url` beside every object), minus `html_url`. */
+function withoutApiLinks(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(withoutApiLinks);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+    .filter(([key]) => key === 'html_url' || !(key === 'url' || key.endsWith('_url')))
+    .map(([key, item]) => [key, withoutApiLinks(item)]));
 }

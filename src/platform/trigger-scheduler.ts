@@ -17,7 +17,7 @@ import {
   type ScheduleTrigger,
 } from '../domain/triggers.js';
 import {
-  DEFAULT_MAX_RUNS_PER_HOUR, MAX_EVENT_HOPS, renderTemplate, triggerContext,
+  DEFAULT_MAX_RUNS_PER_HOUR, MAX_EVENT_HOPS, renderTemplate, triggerContext, triggerMessage,
   type ProjectEvent, type ProjectEventClaim, type ProjectEventClaimState, type TriggerContext,
 } from '../domain/project-events.js';
 
@@ -80,6 +80,8 @@ export interface TriggerSchedulerDeps {
    * armed template in place (recurring — cron, or a re-arming event trigger).
    */
   fire: (taskId: string, mode: 'self' | 'clone', trigger?: TriggerContext) => Promise<unknown>;
+  /** Give an unfinished run a further event of its concurrency key (`tell`). */
+  tell?: (runId: string, trigger: TriggerContext) => Promise<unknown>;
   /** Injectable clock/timers (tests drive them; prod uses wall-clock). */
   now?: () => number;
   setTimer?: (fn: () => void, ms: number) => unknown;
@@ -91,6 +93,19 @@ export interface TriggerSchedulerDeps {
   /** How often the project-event inbox is swept (default 15 s; `0` disables —
    *  tests call `sweepProjectEvents()` themselves). */
   inboxSweepMs?: number;
+}
+
+/** `tell`: the event reaches the run's agent as a message, with a bounded
+ *  credential like a start. */
+export function createTriggerTell(api: Pick<KarmaxApi, 'postTaskMessage'>, tokens: TokenAuthority): NonNullable<TriggerSchedulerDeps['tell']> {
+  return async (runId, trigger) => {
+    const { token } = (await tokens.mintPrincipal('system:triggers', ['*'], undefined, 10 * 60_000));
+    try {
+      return await api.postTaskMessage(token, runId, { text: triggerMessage(trigger) });
+    } finally {
+      (await tokens.revoke(token));
+    }
+  };
 }
 
 /** The dispatcher outlives principal-token TTLs. Give each start its own bounded
@@ -551,16 +566,22 @@ export class TriggerScheduler {
         concurrencyKey, receivedAt: event.receivedAt, updatedAt: now });
       return claimed ? decided : undefined;
     });
-    if (verdict?.state === 'pending') await this.startEventRun(entry, event, concurrencyKey);
+    if (verdict?.state === 'pending' && verdict.tell) await this.tellEventRun(entry, event, verdict.tell, concurrencyKey);
+    else if (verdict?.state === 'pending') await this.startEventRun(entry, event, concurrencyKey);
   }
 
   private async projectEventVerdict(entry: ArmedEntry, trigger: EventTrigger, event: ProjectEvent, concurrencyKey: string | undefined):
-    Promise<{ state: ProjectEventClaimState; reason?: string }> {
+    Promise<{ state: ProjectEventClaimState; reason?: string; tell?: string }> {
     if (event.hops > MAX_EVENT_HOPS) return { state: 'skipped', reason: `stopped a loop: more than ${MAX_EVENT_HOPS} event-to-run steps` };
     const dependencies = entry.triggers.filter((t): t is DependencyTrigger => t.kind === 'dependency');
     if (!dependencies.every((t) => dependencyMet(t, entry.satisfiedDeps))) return { state: 'deferred', reason: 'waiting for its dependencies' };
-    if (concurrencyKey !== undefined && await this.deps.store.projectEventSlotBusy(entry.task.id, concurrencyKey)) {
-      return trigger.concurrency?.mode === 'queue'
+    const slot = concurrencyKey !== undefined ? await this.deps.store.projectEventSlot(entry.task.id, concurrencyKey) : undefined;
+    if (slot) {
+      const mode = trigger.concurrency?.mode ?? 'skip';
+      if (mode === 'tell' && this.deps.tell) {
+        return slot.runId ? { state: 'pending', tell: slot.runId } : { state: 'deferred', reason: 'waiting for its run to start' };
+      }
+      return mode === 'queue' || mode === 'tell'
         ? { state: 'deferred', reason: 'queued behind an unfinished run' }
         : { state: 'skipped', reason: 'a run for it was already unfinished' };
     }
@@ -568,6 +589,19 @@ export class TriggerScheduler {
     if (await this.deps.store.projectEventRunsSince(entry.task.id, this.now() - 3600_000) >= limit)
       return { state: 'deferred', reason: `waiting for its limit of ${limit} runs an hour` };
     return { state: 'pending' };
+  }
+
+  private async tellEventRun(entry: ArmedEntry, event: ProjectEvent, runId: string, concurrencyKey: string | undefined): Promise<void> {
+    const taskId = entry.task.id;
+    try {
+      await this.deps.tell!(runId, triggerContext(event, concurrencyKey));
+      await this.deps.store.updateProjectEventClaim(event.id, taskId, ['pending'],
+        { state: 'told', runId, reason: null, updatedAt: this.now() });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await this.deps.store.updateProjectEventClaim(event.id, taskId, ['pending'],
+        { state: 'deferred', reason: `${FAILED_START}: ${message}`.slice(0, 300), updatedAt: this.now() });
+    }
   }
 
   private async startEventRun(entry: ArmedEntry, event: ProjectEvent, concurrencyKey: string | undefined): Promise<void> {

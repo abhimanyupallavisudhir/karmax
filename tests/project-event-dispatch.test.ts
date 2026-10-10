@@ -66,8 +66,10 @@ describe.each(storeBackends)('project event dispatch ($name)', ({ open }) => {
     return { startedTaskId: taskId };
   };
 
+  const told: Array<{ runId: string; trigger: TriggerContext }> = [];
+  const tell = async (runId: string, trigger: TriggerContext) => { told.push({ runId, trigger }); };
   const scheduler = async () => {
-    const s = new TriggerScheduler({ store, bus, fire, now: clock.now, setTimer: clock.set, clearTimer: clock.clear, reconcileMs: 0, inboxSweepMs: 0 });
+    const s = new TriggerScheduler({ store, bus, fire, tell, now: clock.now, setTimer: clock.set, clearTimer: clock.clear, reconcileMs: 0, inboxSweepMs: 0 });
     schedulers.push(s);
     await s.start();
     return s;
@@ -147,6 +149,25 @@ describe.each(storeBackends)('project event dispatch ($name)', ({ open }) => {
     await s.sweepProjectEvents();
     expect(fires.filter((f) => f.taskId === queue.id)).toHaveLength(2);
     expect(await store.getProjectEventClaim(second.id, queue.id)).toMatchObject({ state: 'started' });
+  });
+
+  it('tells the unfinished run of a key about a further event instead of starting another', async () => {
+    told.length = 0;
+    const series = await armedTask([{ ...planned, concurrency: { key: '{{label.name}}', mode: 'tell' } }]);
+    const s = await scheduler();
+    const first = await record();
+    await deliver(s, first);
+    const runId = (await store.getProjectEventClaim(first.id, series.id))!.runId!;
+    const second = await record();
+    await deliver(s, second);
+    expect(fires).toHaveLength(1);
+    expect(told).toMatchObject([{ runId, trigger: { eventId: second.id } }]);
+    expect(await store.getProjectEventClaim(second.id, series.id)).toMatchObject({ state: 'told', runId });
+    // Once that run has finished, the next event is new work.
+    await store.saveView(runId, { status: 'done' } as any);
+    await deliver(s, await record());
+    expect(fires).toHaveLength(2);
+    expect(told).toHaveLength(1);
   });
 
   it('holds runs past the hourly limit until the hour has passed', async () => {

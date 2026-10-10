@@ -1,7 +1,8 @@
 import crypto from 'node:crypto';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { bootHarness, type Harness } from './helpers/harness.js';
-import { TriggerScheduler, createTriggerFire } from '../src/platform/trigger-scheduler.js';
+import { TriggerScheduler, createTriggerFire, createTriggerTell } from '../src/platform/trigger-scheduler.js';
+import { GithubEvents, RECOVERY_PROMPT } from '../src/integrations/github-events.js';
 import type { TaskRecord } from '../src/domain/types.js';
 
 /**
@@ -20,7 +21,8 @@ describe('project events start runs (real gateway + Temporal)', () => {
 
   beforeAll(async () => {
     h = await bootHarness('mock');
-    scheduler = new TriggerScheduler({ store: h.store, bus: h.bus, fire: createTriggerFire(h.api, h.tokens), inboxSweepMs: 0, reconcileMs: 0 });
+    scheduler = new TriggerScheduler({ store: h.store, bus: h.bus, fire: createTriggerFire(h.api, h.tokens),
+      tell: createTriggerTell(h.api, h.tokens), inboxSweepMs: 0, reconcileMs: 0 });
     h.api.setTriggerArmer(scheduler);
     await scheduler.start();
     base = (await h.startGateway()).url;
@@ -33,6 +35,7 @@ describe('project events start runs (real gateway + Temporal)', () => {
     await h?.stop();
   });
 
+  const view = (taskId: string) => h.client.workflow.getHandle(taskId).query<{ status: string; messages: unknown[] }>('view').catch(() => undefined);
   const runsOf = async (seriesId: string): Promise<TaskRecord[]> =>
     (await h.store.listTasks(projectId)).filter((task) => task.params?.runOf === seriesId);
 
@@ -96,5 +99,31 @@ describe('project events start runs (real gateway + Temporal)', () => {
     expect((await runsOf(series.id))[0]!.params.trigger).toMatchObject({ key: 'order-7', subject: 'https://shop.example/orders/7' });
     const bad = await fetch(`${base}/api/projects/${projectId}/events`, { method: 'POST', headers: auth(), body: JSON.stringify({ type: 'not valid' }) });
     expect(bad.status).toBe(400);
+  }, 120_000);
+
+  it('repairs a failed deployment with the project\'s own repair task, telling its open run about a repeat', async () => {
+    const github = new GithubEvents({ api: h.api, store: h.store, tokens: h.tokens });
+    const failure = (runId: number) => ({ projectId, type: 'github.workflow.failed' as const, payload: {
+      repository: 'acme/app', repositoryId: 'repo-1', workflow: 'Deploy', runId, attempt: 1, conclusion: 'failure',
+      headSha: `sha-${runId}`, branch: 'main', url: `https://github.com/acme/app/actions/runs/${runId}`, source: 'workflow_run' as const } });
+    expect(await github.recordFailures([failure(900)])).toBe(1);
+    await scheduler.drain();
+    const series = (await h.store.listTasks(projectId)).find((task) => task.title === 'Repair GitHub workflow {{workflow}}')!;
+    expect(series.params.repeatable).toBe(true);
+    await expect.poll(async () => (await runsOf(series.id)).length, { timeout: 30_000 }).toBe(1);
+    const [run] = await runsOf(series.id);
+    expect(run!.title).toBe('Repair GitHub workflow Deploy');
+    expect(String(run!.params.prompt)).toContain(RECOVERY_PROMPT);
+    expect(run!.params.trigger).toMatchObject({ type: 'github.workflow.failed', payload: { runId: 900, headSha: 'sha-900' } });
+
+    // Still red on a later commit while the repair is open: the repair hears of it.
+    await expect.poll(async () => (await view(run!.id))?.status, { timeout: 30_000 }).not.toBe(undefined);
+    expect(await github.recordFailures([failure(901)])).toBe(1);
+    await scheduler.drain();
+    const repeat = (await h.store.listProjectEvents(projectId, { type: 'github.workflow.failed' }))[0]!;
+    expect(await h.store.getProjectEventClaim(repeat.id, series.id)).toMatchObject({ state: 'told', runId: run!.id });
+    expect(await runsOf(series.id)).toHaveLength(1);
+    await expect.poll(async () => JSON.stringify((await view(run!.id))?.messages ?? []), { timeout: 30_000 })
+      .toContain('another event arrived');
   }, 120_000);
 });
