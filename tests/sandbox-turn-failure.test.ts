@@ -126,8 +126,12 @@ describe('sandbox-caused turn failures', () => {
       expect(prompts[1]).toEqual([`(This turn was interrupted mid-run: ${exhausted.summary}. Keep memory-hungry commands `
         + '(type checks, test suites, builds) within the memory `free -m` reports as available. '
         + 'Commands that were running in it, including run_in_background shells, were stopped: check whether they finished '
-        + 'before relying on their results. Jobs from start_job kept running. Continue from where you left off; '
-        + 'if the work was already finished, restate the final result.)']);
+        + 'before relying on their results. Jobs from start_job kept running. '
+        // exten-epi#5: told only to "restate the final result", an agent cut off
+        // by a deploy assumed its answer had been read and sent "Nothing to recover".
+        + 'Your final response from it was never posted: a reply is posted only when the turn ends. '
+        + 'Continue from where you left off, then give your full final response, even if you had already written it; '
+        + 'do not mention the interruption unless it changes the result.)']);
     } finally {
       context.mockRestore();
       await new Promise((resolve) => setTimeout(resolve, 100));
