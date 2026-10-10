@@ -77,6 +77,8 @@ export async function preserveReviewArtifacts(store: Store, objects: ObjectStore
       try {
         await objects.put(objectKey, data, mediaType);
         await store.transaction(async () => {
+          // The task's row: its deletion, and another publish of this artifact, wait.
+          await store.lockTask(taskId);
           if (!(await store.getTask(taskId))) throw new Error('review artifact task was deleted during upload');
           if (!(await store.getPromotedArtifact(id))) {
             (await store.savePromotedArtifact({ id, organizationId, projectId: project.id,
@@ -97,6 +99,7 @@ export async function preserveReviewArtifacts(store: Store, objects: ObjectStore
   }
   // Publish pointers only after every attachment is durable.
   await store.transaction(async () => {
+    await store.lock(`kv:${indexKey(taskId)}`);
     await store.kvSet(indexKey(taskId), JSON.stringify({
       ...JSON.parse((await store.kvGet(indexKey(taskId))) ?? '{}'), ...index,
     }));

@@ -34,8 +34,9 @@ describe('public gateway payloads', () => {
     let publish: (event: unknown, projectId: string) => Promise<void>;
     gateway.socketAuth = async () => ({ apiToken: 'fixture' });
     gateway.watchTiming = async () => () => {};
-    gateway.deps = { tokens: { verify: async () => ({}), check: async () => ({ ok: true }) } };
-    gateway.fanout = { on: (listener: typeof publish) => { publish = listener; return () => {}; } };
+    gateway.deps = { tokens: { verify: async () => ({}), check: async () => ({ ok: true }),
+      dependencies: async () => ({ record: {}, tokens: new Set(), delegations: new Set(), principals: new Set(), projects: new Set(), organizations: new Set() }) } };
+    gateway.fanout = { on: (listener: typeof publish) => { publish = listener; return Object.assign(() => {}, { audience: () => {} }); } };
     const sent: any[] = [];
     const ws = { readyState: 1, bufferedAmount: 0, on: () => {}, once: () => {}, send: (value: string) => sent.push(JSON.parse(value)) };
     await gateway.eventStream(ws, { url: '/ws' });

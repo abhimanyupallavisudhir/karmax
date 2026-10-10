@@ -19,15 +19,15 @@ export class WorldProviderConnectionService {
   constructor(private store: Store, private broker: CredentialBroker) {}
 
   async list(organizationId: string): Promise<Array<WorldProviderConnection & { credentialConfigured: boolean }>> {
-    return (await this.store.listWorldProviderConnections(organizationId)).map((value) => ({
+    return Promise.all((await this.store.listWorldProviderConnections(organizationId)).map(async (value) => ({
       ...value,
-      credentialConfigured: this.broker.hasHandle(value.credentialHandle),
-    }));
+      credentialConfigured: await this.broker.hasHandle(value.credentialHandle),
+    })));
   }
 
   async get(organizationId: string, provider: string): Promise<(WorldProviderConnection & { credentialConfigured: boolean }) | undefined> {
     const value = (await this.store.getWorldProviderConnection(organizationId, provider));
-    return value ? { ...value, credentialConfigured: this.broker.hasHandle(value.credentialHandle) } : undefined;
+    return value ? { ...value, credentialConfigured: await this.broker.hasHandle(value.credentialHandle) } : undefined;
   }
 
   async save(input: {
@@ -46,7 +46,7 @@ export class WorldProviderConnectionService {
     const config = cleanConfig({ ...(existing?.config ?? {}), ...(input.config ?? {}) }, this.store.hosted);
     const key = input.apiKey?.trim();
     if (key) (await this.broker.registerHandle(handle, key, organizationScope(input.organizationId)));
-    if (!key && !this.broker.hasHandle(handle)) throw new Error(`${providerName(input.provider)} API key is required`);
+    if (!key && !await this.broker.hasHandle(handle)) throw new Error(`${providerName(input.provider)} API key is required`);
     const value = (await this.store.upsertWorldProviderConnection({
       organizationId: input.organizationId,
       provider: input.provider,
@@ -60,11 +60,11 @@ export class WorldProviderConnectionService {
 
   async resolve(organizationId: string | undefined, provider: string): Promise<ResolvedWorldProviderConnection> {
     const value = organizationId ? (await this.store.getWorldProviderConnection(organizationId, provider)) : undefined;
-    if (value?.enabled && this.broker.hasHandle(value.credentialHandle)) {
+    if (value?.enabled && await this.broker.hasHandle(value.credentialHandle)) {
       return {
         organizationId,
         provider,
-        apiKey: this.broker.resolve(value.credentialHandle, { caps: [`use-credential:${value.credentialHandle}`] }),
+        apiKey: await this.broker.resolve(value.credentialHandle, { caps: [`use-credential:${value.credentialHandle}`] }),
         config: cleanConfig(value.config, this.store.hosted),
       };
     }

@@ -427,7 +427,7 @@ export class ProjectResourceService {
       const server = http.createServer((req, res) => {
         const url = new URL(req.url ?? '/', 'http://localhost');
         if (!url.pathname.startsWith(REPOSITORY_ROUTE)) { res.writeHead(404).end(); return; }
-        void this.repositoryServer.handle(req, res, url.pathname.slice(REPOSITORY_ROUTE.length) + url.search);
+        void this.repositoryServer.handle(req, res, url.pathname.slice(REPOSITORY_ROUTE.length) + url.search, { unmetered: true });
       });
       server.on('error', reject);
       server.listen(0, '127.0.0.1', () => { server.unref(); resolve(`http://127.0.0.1:${(server.address() as AddressInfo).port}`); });
@@ -560,7 +560,7 @@ export class ProjectResourceService {
       for (const [name, secretHandle] of Object.entries(serviceHandles as Record<string, unknown>)) {
         if (typeof secretHandle !== 'string') continue;
         (await recordSecretRefs(this.store, handle.id, [handleRef(secretHandle)]));
-        services[name] = this.broker.resolve(secretHandle, {
+        services[name] = await this.broker.resolve(secretHandle, {
           taskId: handle.id,
           caps: [`use-credential:${secretHandle}`],
         });
@@ -1139,7 +1139,7 @@ export class ProjectResourceService {
     name: string; driver: 'secret@1' | 'service@1' | 'database@1'; target: ResourceTarget;
     access?: ResourceAccess; source?: Record<string, unknown> }): Promise<ProposedResourceCandidate> {
     const { task, project, handle } = await this.currentTaskWorld(taskId);
-    if (!this.broker.hasHandle(input.credentialHandle)) throw new Error('vault item field is not stored');
+    if (!await this.broker.hasHandle(input.credentialHandle)) throw new Error('vault item field is not stored');
     const shared = input.driver === 'service@1' || input.driver === 'database@1';
     const attachment = (await this.store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
       name: input.name, driver: input.driver, target: input.target, access: input.access ?? 'read',
@@ -1693,7 +1693,7 @@ export class ProjectResourceService {
       const file = attachment.target.kind === 'path' ? await this.workdirPath(projectId, attachment.target) : undefined;
       if (wanted && !wanted.has(attachment.name) && !(variable && wanted.has(variable))) continue;
       const handle = await this.ownedCredentialHandle(attachment);
-      const value = this.broker.resolve(handle, { taskId: `workspace:${principal}`, caps: [`use-credential:${handle}`] });
+      const value = await this.broker.resolve(handle, { taskId: `workspace:${principal}`, caps: [`use-credential:${handle}`] });
       (await this.store.appendAudit({ principalId: principal, action: 'resource:secret-read', scopeKey: `project:${projectId}`,
         detail: { attachmentId: attachment.id, name: attachment.name } }));
       values.push({ id: attachment.id, name: attachment.name, ...(variable ? { variable } : {}), ...(file ? { file } : {}), value });

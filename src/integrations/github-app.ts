@@ -12,6 +12,7 @@ import { GithubActionsApi } from './github-actions.js';
 import { githubActionsRunIdFromUrl } from './github-actions.js';
 import { observeDeploymentWorkflowRun } from './github-deployment-monitor.js';
 import { taskIdOfBranch, BRAND } from '../domain/brand.js';
+import { RefreshLeases } from '../autonomy/refresh-lease.js';
 
 export const GITHUB_APP_PRIVATE_KEY_HANDLE = 'github-app:private-key';
 export const GITHUB_APP_WEBHOOK_SECRET_HANDLE = 'github-app:webhook-secret';
@@ -353,7 +354,10 @@ export class GitHubAppService {
    * requested permission; without this, every landing poll would mint a token. */
   private tokenInvalidatedAt = new Map<string, number>();
 
+  /** User tokens refresh one at a time across processes (GitHub's refresh tokens are single-use). */
+  private leases: RefreshLeases;
   constructor(private store: Store, private broker: CredentialBroker, private options: GitHubAppOptions = {}) {
+    this.leases = new RefreshLeases(store.db);
   }
 
   static async create(store: Store, broker: CredentialBroker, options: GitHubAppOptions = {}) {
@@ -374,16 +378,16 @@ export class GitHubAppService {
     this.apiBase = (options.apiBase ?? 'https://api.github.com').replace(/\/$/, '');
   }
 
-  configured(): boolean {
-    return Boolean(this.options.appId?.trim() && this.broker.hasHandle(GITHUB_APP_PRIVATE_KEY_HANDLE));
+  async configured(): Promise<boolean> {
+    return Boolean(this.options.appId?.trim() && await this.broker.hasHandle(GITHUB_APP_PRIVATE_KEY_HANDLE));
   }
 
   /** OAuth client owned by this deployment's App. Kept behind the service so
    * callers do not need to know the vault handle or durable metadata keys. */
-  oauthCredentials(): { clientId: string; clientSecret: string } | undefined {
+  async oauthCredentials(): Promise<{ clientId: string; clientSecret: string } | undefined> {
     const clientId = this.options.clientId?.trim();
-    if (!clientId || !this.broker.hasHandle(GITHUB_APP_CLIENT_SECRET_HANDLE)) return undefined;
-    return { clientId, clientSecret: this.broker.resolve(GITHUB_APP_CLIENT_SECRET_HANDLE,
+    if (!clientId || !await this.broker.hasHandle(GITHUB_APP_CLIENT_SECRET_HANDLE)) return undefined;
+    return { clientId, clientSecret: await this.broker.resolve(GITHUB_APP_CLIENT_SECRET_HANDLE,
       { caps: [`use-credential:${GITHUB_APP_CLIENT_SECRET_HANDLE}`] }) };
   }
 
@@ -397,15 +401,14 @@ export class GitHubAppService {
     } catch {}
     const lastAuthorizationFailure = userId ? (await this.lastUserAuthorizationFailure(userId)) : undefined;
     return {
-      configured: this.configured(),
+      configured: await this.configured(),
       ...(this.options.appId ? { appId: this.options.appId } : {}),
       ...(this.options.appSlug ? { appSlug: this.options.appSlug } : {}),
-      oauthConfigured: Boolean(this.options.clientId && this.broker.hasHandle(GITHUB_APP_CLIENT_SECRET_HANDLE)),
-      webhookConfigured: this.broker.hasHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE),
+      oauthConfigured: Boolean(this.options.clientId && await this.broker.hasHandle(GITHUB_APP_CLIENT_SECRET_HANDLE)),
+      webhookConfigured: await this.broker.hasHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE),
       syncMode,
-      userAuthorized: Boolean(userId && ((await this.userAccounts(userId)).some((account) =>
-        this.broker.hasHandle(githubUserTokenHandle(userId, account.id)))
-        || this.broker.hasHandle(legacyGithubUserTokenHandle(userId)))),
+      userAuthorized: Boolean(userId && ((await this.authorizedAccounts(userId)).length
+        || await this.broker.hasHandle(legacyGithubUserTokenHandle(userId)))),
       ...(lastAuthorizationFailure ? { lastAuthorizationFailure } : {}),
     };
   }
@@ -496,8 +499,8 @@ export class GitHubAppService {
       webhookSecret: value.webhook_secret, clientId: value.client_id, clientSecret: value.client_secret }));
   }
 
-  userAuthorizationUrl(state: string, publicUrl: string, options: { login?: string; selectAccount?: boolean } = {}): string {
-    if (!this.options.clientId || !this.broker.hasHandle(GITHUB_APP_CLIENT_SECRET_HANDLE))
+  async userAuthorizationUrl(state: string, publicUrl: string, options: { login?: string; selectAccount?: boolean } = {}): Promise<string> {
+    if (!this.options.clientId || !await this.broker.hasHandle(GITHUB_APP_CLIENT_SECRET_HANDLE))
       throw new Error('GitHub user authorization is unavailable; configure the App client id and secret');
     const url = new URL('https://github.com/login/oauth/authorize');
     url.searchParams.set('client_id', this.options.clientId);
@@ -511,7 +514,7 @@ export class GitHubAppService {
   async authorizeUser(userId: string, code: string, publicUrl?: string,
     options: { expectedAccountId?: string; makeActive?: boolean } = {}): Promise<GitHubUserIdentity> {
     if (!this.options.clientId) throw new Error('GitHub App client id is missing');
-    const clientSecret = this.broker.resolve(GITHUB_APP_CLIENT_SECRET_HANDLE,
+    const clientSecret = await this.broker.resolve(GITHUB_APP_CLIENT_SECRET_HANDLE,
       { caps: [`use-credential:${GITHUB_APP_CLIENT_SECRET_HANDLE}`] });
     const value = await this.oauthToken({ client_id: this.options.clientId, client_secret: clientSecret, code,
       ...(publicUrl ? { redirect_uri: `${new URL(publicUrl).origin}/api/github/oauth/callback` } : {}) });
@@ -520,6 +523,8 @@ export class GitHubAppService {
     if (options.expectedAccountId && identity.id !== options.expectedAccountId)
       throw new Error(`GitHub connected @${identity.login}, but this reconnect belongs to another account`);
     await this.store.transaction(async () => {
+      // The user's linked accounts are rewritten, and closure is checked, under their account lock.
+      await this.store.lock(`account:${userId}`);
       await this.assertUserOpen(userId);
       await this.saveUserToken(userId, identity.id, value);
       (await this.clearUserAuthorizationFailure(userId, identity.id));
@@ -541,6 +546,7 @@ export class GitHubAppService {
     if (identity.id !== expectedAccountId)
       throw new Error(`GitHub signed in as @${identity.login}, but returned a mismatched account id`);
     await this.store.transaction(async () => {
+      await this.store.lock(`account:${userId}`);
       await this.assertUserOpen(userId);
       (await this.broker.registerHandle(githubUserTokenHandle(userId, identity.id), JSON.stringify({
         accessToken: authorization.accessToken,
@@ -643,9 +649,15 @@ export class GitHubAppService {
     }));
   }
 
+  /** The user's linked accounts that still hold a token. */
+  private async authorizedAccounts(userId: string) {
+    const accounts = await this.userAccounts(userId);
+    const present = await Promise.all(accounts.map((account) => this.broker.hasHandle(githubUserTokenHandle(userId, account.id))));
+    return accounts.filter((_, index) => present[index]);
+  }
+
   async activeUserAccountId(userId: string): Promise<string | undefined> {
-    const configured = (await this.userAccounts(userId)).filter((account) =>
-      this.broker.hasHandle(githubUserTokenHandle(userId, account.id)));
+    const configured = await this.authorizedAccounts(userId);
     const active = (await this.store.kvGet(githubUserActiveAccountKey(userId)));
     return configured.some((account) => account.id === active) ? active : configured[0]?.id;
   }
@@ -653,8 +665,7 @@ export class GitHubAppService {
   async listUserAccounts(userId: string): Promise<GitHubUserAccount[]> {
     await this.migrateLegacyUserAuthorization(userId);
     const active = (await this.activeUserAccountId(userId));
-    return (await this.userAccounts(userId))
-      .filter((account) => this.broker.hasHandle(githubUserTokenHandle(userId, account.id)))
+    return (await this.authorizedAccounts(userId))
       .map((account) => ({ ...account, active: account.id === active }));
   }
 
@@ -763,8 +774,8 @@ export class GitHubAppService {
       .find(installation => installation.accountType === 'User')?.id;
   }
 
-  installationUrl(state: string): string {
-    if (!this.configured()) throw new Error('GitHub App is not configured');
+  async installationUrl(state: string): Promise<string> {
+    if (!await this.configured()) throw new Error('GitHub App is not configured');
     const slug = this.options.appSlug?.trim();
     if (!slug || !/^[A-Za-z0-9-]+$/.test(slug)) throw new Error('GitHub App slug is not configured');
     const url = new URL(`https://github.com/apps/${slug}/installations/new`);
@@ -777,7 +788,7 @@ export class GitHubAppService {
    * account that already installed the App must then approve that expansion.
    * Keeping the two states separate makes the required human action explicit. */
   async workflowPermissionStatus(connection?: GitConnection): Promise<GitHubWorkflowPermissionStatus> {
-    if (!this.configured()) throw new Error('GitHub App is not configured');
+    if (!await this.configured()) throw new Error('GitHub App is not configured');
     const app = await this.appRequest<GitHubAppPayload>('/app');
     const slug = String(app.slug ?? this.options.appSlug ?? '').trim();
     if (!/^[A-Za-z0-9-]+$/.test(slug)) throw new Error('GitHub App slug is invalid');
@@ -810,7 +821,7 @@ export class GitHubAppService {
    * approval layers. The App owner changes the registration first; every
    * existing installation owner must then approve that expansion separately. */
   async permissionStatus(connection?: GitConnection, options: { forceRefresh?: boolean } = {}): Promise<GitHubAppPermissionStatus> {
-    if (!this.configured()) throw new Error('GitHub App is not configured');
+    if (!await this.configured()) throw new Error('GitHub App is not configured');
     const app = await this.permissionSnapshot<GitHubAppPayload>('/app', options.forceRefresh);
     const slug = String(app.slug ?? this.options.appSlug ?? '').trim();
     if (!/^[A-Za-z0-9-]+$/.test(slug)) throw new Error('GitHub App slug is invalid');
@@ -891,9 +902,9 @@ export class GitHubAppService {
     return 'GitHub reports Workflows: read and write as approved. Refresh the GitHub connection in organization settings and retry the task; if GitHub still rejects it, review the App installation on GitHub.';
   }
 
-  verifyWebhook(raw: Buffer, signature: string | undefined): boolean {
-    if (!signature?.startsWith('sha256=') || !this.broker.hasHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE)) return false;
-    const secret = this.broker.resolve(GITHUB_APP_WEBHOOK_SECRET_HANDLE, { caps: [`use-credential:${GITHUB_APP_WEBHOOK_SECRET_HANDLE}`] });
+  async verifyWebhook(raw: Buffer, signature: string | undefined): Promise<boolean> {
+    if (!signature?.startsWith('sha256=') || !await this.broker.hasHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE)) return false;
+    const secret = await this.broker.resolve(GITHUB_APP_WEBHOOK_SECRET_HANDLE, { caps: [`use-credential:${GITHUB_APP_WEBHOOK_SECRET_HANDLE}`] });
     const expected = Buffer.from(`sha256=${crypto.createHmac('sha256', secret).update(raw).digest('hex')}`);
     const actual = Buffer.from(signature);
     return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
@@ -950,7 +961,7 @@ export class GitHubAppService {
 
   async deliverWebhook(event: string, deliveryId: string, raw: Buffer, signature: string | undefined,
     dispatch: (result: GithubWebhookResult) => Promise<void>): Promise<GithubWebhookResult> {
-    if (!this.verifyWebhook(raw, signature)) throw new Error('invalid GitHub webhook signature');
+    if (!await this.verifyWebhook(raw, signature)) throw new Error('invalid GitHub webhook signature');
     if (!deliveryId) throw new Error('GitHub delivery id is required');
     const key = `github:webhook-pending:${crypto.createHash('sha256').update(deliveryId).digest('hex')}`;
     await this.store.kvClaim(key, JSON.stringify({ event, deliveryId, raw: raw.toString('base64'), signature,
@@ -974,6 +985,8 @@ export class GitHubAppService {
   private async processPendingWebhook(key: string, dispatch: (result: GithubWebhookResult) => Promise<void>, now: number):
   Promise<GithubWebhookResult | undefined> {
     const job = await this.store.transaction(async () => {
+      // One process leases a pending delivery.
+      await this.store.lock(`kv:${key}`);
       const saved = await this.store.kvGet(key);
       if (!saved) return undefined;
       const pending = JSON.parse(saved);
@@ -1003,7 +1016,7 @@ export class GitHubAppService {
 
   async handleWebhook(event: string, deliveryId: string, raw: Buffer, signature: string | undefined):
   Promise<GithubWebhookResult> {
-    if (!this.verifyWebhook(raw, signature)) throw new Error('invalid GitHub webhook signature');
+    if (!await this.verifyWebhook(raw, signature)) throw new Error('invalid GitHub webhook signature');
     // The delivery id is CLAIMED here (so two concurrent copies of one delivery
     // cannot both reconcile) but the claim is provisional: `dispatchWebhook` does
     // unbounded network I/O, and if that throws the claim must be released. It
@@ -1104,6 +1117,7 @@ export class GitHubAppService {
       if (!prEvent || !(await this.ownsTask(connection.organizationId, prEvent.taskId)))
         return { accepted: true, ...(projectEvents.length ? { projectEvents } : {}) };
       return this.store.transaction(async () => {
+        await this.store.lockTask(prEvent.taskId);
         const task = await this.store.getTask(prEvent.taskId);
         const attached = task ? await this.store.listProjectRepositories(task.projectId) : [];
         if (!attached.some(({ repository }) => repository.providerId === String(payload.repository?.id)))
@@ -1261,6 +1275,16 @@ export class GitHubAppService {
     }).finally(() => { if (this.tokenMints.get(cacheKey) === mint) this.tokenMints.delete(cacheKey); });
     this.tokenMints.set(cacheKey, mint);
     return mint;
+  }
+
+  /** An installation's REST rate limit. Reading it does not count against the
+   * limit, and the token comes from the same cache every other call uses. */
+  async rateLimit(connection: GitConnection, signal?: AbortSignal): Promise<{ limit: number; remaining: number; resetAt: number }> {
+    const body = await this.request<{ resources?: { core?: { limit?: number; remaining?: number; reset?: number } } }>(
+      '/rate_limit', await this.installationToken(connection), signal ? { signal } : {});
+    const core = body?.resources?.core;
+    if (!core || !Number.isFinite(core.limit) || !Number.isFinite(core.remaining)) throw new Error('GitHub returned no rate limit');
+    return { limit: Number(core.limit), remaining: Number(core.remaining), resetAt: Number(core.reset ?? 0) * 1000 };
   }
 
   private clearInstallationTokens(connectionId: string): void {
@@ -1558,18 +1582,18 @@ export class GitHubAppService {
     }
   }
 
-  private appJwt(): string {
-    if (!this.configured()) throw new Error('GitHub App is not configured');
+  private async appJwt(): Promise<string> {
+    if (!await this.configured()) throw new Error('GitHub App is not configured');
     const now = Math.floor(Date.now() / 1000);
     const header = base64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
     const payload = base64url(JSON.stringify({ iat: now - 60, exp: now + 9 * 60, iss: this.options.appId }));
-    const privateKey = this.broker.resolve(GITHUB_APP_PRIVATE_KEY_HANDLE, { caps: [`use-credential:${GITHUB_APP_PRIVATE_KEY_HANDLE}`] });
+    const privateKey = await this.broker.resolve(GITHUB_APP_PRIVATE_KEY_HANDLE, { caps: [`use-credential:${GITHUB_APP_PRIVATE_KEY_HANDLE}`] });
     const signature = crypto.sign('RSA-SHA256', Buffer.from(`${header}.${payload}`), privateKey).toString('base64url');
     return `${header}.${payload}.${signature}`;
   }
 
-  private appRequest<T>(pathname: string, init: RequestInit = {}): Promise<T> {
-    return this.request(pathname, this.appJwt(), init);
+  private async appRequest<T>(pathname: string, init: RequestInit = {}): Promise<T> {
+    return this.request(pathname, await this.appJwt(), init);
   }
 
   /** Injectable so tests do not actually wait out a rate-limit backoff. */
@@ -1620,20 +1644,24 @@ export class GitHubAppService {
   }
 
   private async saveTokenHandle(handle: string, value: any, userId: string): Promise<void> {
+    (await this.broker.registerHandle(handle, this.tokenRecord(value), userScope(userId)));
+  }
+
+  private tokenRecord(value: any): string {
     const now = Date.now();
-    (await this.broker.registerHandle(handle, JSON.stringify({
+    return JSON.stringify({
       accessToken: String(value.access_token),
       expiresAt: value.expires_in ? now + Number(value.expires_in) * 1000 : undefined,
       refreshToken: value.refresh_token ? String(value.refresh_token) : undefined,
       refreshExpiresAt: value.refresh_token_expires_in ? now + Number(value.refresh_token_expires_in) * 1000 : undefined,
-    }), userScope(userId)));
+    });
   }
 
-  private resolvedUserToken(handle: string): { raw: string; value: {
+  private async resolvedUserToken(handle: string): Promise<{ raw: string; value: {
     accessToken: string; expiresAt?: number; refreshToken?: string; refreshExpiresAt?: number;
-  } } | undefined {
-    if (!this.broker.hasHandle(handle)) return undefined;
-    const raw = this.broker.resolve(handle, { caps: [`use-credential:${handle}`] });
+  } } | undefined> {
+    if (!await this.broker.hasHandle(handle)) return undefined;
+    const raw = await this.broker.resolve(handle, { caps: [`use-credential:${handle}`] });
     return { raw, value: JSON.parse(raw) };
   }
 
@@ -1644,8 +1672,8 @@ export class GitHubAppService {
     return this.broker.deleteHandleIfUnchanged(handle, observed);
   }
 
-  private replacementUserToken(handle: string, observed: string): string | undefined {
-    const current = this.resolvedUserToken(handle);
+  private async replacementUserToken(handle: string, observed: string): Promise<string | undefined> {
+    const current = await this.resolvedUserToken(handle);
     return current && current.raw !== observed && current.value.accessToken
       ? current.value.accessToken
       : undefined;
@@ -1668,7 +1696,7 @@ export class GitHubAppService {
 
   private async refreshUserAccessToken(userId: string, accountId: string | undefined, handle: string,
     forceRefresh: boolean): Promise<string> {
-    const resolved = this.resolvedUserToken(handle);
+    const resolved = await this.resolvedUserToken(handle);
     if (!resolved) throw new Error('Connect GitHub on your profile, then try again.');
     const { raw: observed, value: stored } = resolved;
     if (!forceRefresh && (!stored.expiresAt || stored.expiresAt > Date.now() + 60_000)) return stored.accessToken;
@@ -1679,14 +1707,14 @@ export class GitHubAppService {
         ? 'refresh_token_expired' as const
         : undefined;
     if (unusable) {
-      const replacement = this.replacementUserToken(handle, observed);
+      const replacement = await this.replacementUserToken(handle, observed);
       if (replacement) {
         (await this.recordRefreshContentionRecovery(userId, accountId));
         return replacement;
       }
       const deleted = await this.deleteUserTokenIfUnchanged(handle, observed);
       if (!deleted) {
-        const raced = this.replacementUserToken(handle, observed);
+        const raced = await this.replacementUserToken(handle, observed);
         if (raced) {
           (await this.recordRefreshContentionRecovery(userId, accountId));
           return raced;
@@ -1695,13 +1723,13 @@ export class GitHubAppService {
       const failure = (await this.recordUserAuthorizationFailure(userId, accountId, {
         code: unusable,
         summary: this.refreshFailureSummary(unusable),
-        disconnected: deleted || !this.broker.hasHandle(handle),
+        disconnected: deleted || !await this.broker.hasHandle(handle),
       }));
       throw new Error(`${failure.summary} [${failure.code}]`);
     }
 
     if (!this.options.clientId) throw new Error('GitHub App client id is missing');
-    const clientSecret = this.broker.resolve(GITHUB_APP_CLIENT_SECRET_HANDLE,
+    const clientSecret = await this.broker.resolve(GITHUB_APP_CLIENT_SECRET_HANDLE,
       { caps: [`use-credential:${GITHUB_APP_CLIENT_SECRET_HANDLE}`] });
     let value: any;
     try {
@@ -1720,14 +1748,14 @@ export class GitHubAppService {
     }
     if (!value.access_token) {
       const providerError = this.safeOauthError(value.error);
-      const replacement = this.replacementUserToken(handle, observed);
+      const replacement = await this.replacementUserToken(handle, observed);
       if (replacement) {
         (await this.recordRefreshContentionRecovery(userId, accountId, providerError));
         return replacement;
       }
       const deleted = await this.deleteUserTokenIfUnchanged(handle, observed);
       if (!deleted) {
-        const raced = this.replacementUserToken(handle, observed);
+        const raced = await this.replacementUserToken(handle, observed);
         if (raced) {
           (await this.recordRefreshContentionRecovery(userId, accountId, providerError));
           return raced;
@@ -1736,15 +1764,22 @@ export class GitHubAppService {
       const failure = (await this.recordUserAuthorizationFailure(userId, accountId, {
         code: 'refresh_rejected',
         summary: this.refreshFailureSummary('refresh_rejected', providerError),
-        disconnected: deleted || !this.broker.hasHandle(handle),
+        disconnected: deleted || !await this.broker.hasHandle(handle),
         ...(providerError ? { providerError } : {}),
       }));
       throw new Error(`${failure.summary} [${failure.code}]`);
     }
-    await this.store.transaction(async () => {
+    // A compare-and-set: a sign-in that landed meanwhile is newer than this refresh.
+    const saved = await this.store.transaction(async () => {
+      await this.store.lock(`account:${userId}`);
       await this.assertUserOpen(userId);
-      await this.saveTokenHandle(handle, value, userId);
+      return this.broker.replaceHandleIfUnchanged(handle, observed, this.tokenRecord(value), userScope(userId));
     });
+    if (!saved) {
+      const replacement = await this.replacementUserToken(handle, observed);
+      if (replacement) return replacement;
+      throw new Error('The GitHub connection changed while its token was being refreshed. Retry.');
+    }
     (await this.clearUserAuthorizationFailure(userId, accountId));
     (await this.store.appendAudit({
       principalId: `user:${userId}`,
@@ -1764,13 +1799,21 @@ export class GitHubAppService {
     await this.assertUserOpen(userId);
     const accountId = opts.accountId ?? (await this.activeUserAccountId(userId));
     const handle = accountId ? githubUserTokenHandle(userId, accountId) : legacyGithubUserTokenHandle(userId);
-    const resolved = this.resolvedUserToken(handle);
+    const resolved = await this.resolvedUserToken(handle);
     if (!resolved) throw new Error('Connect GitHub on your profile, then try again.');
     if (!opts.forceRefresh && (!resolved.value.expiresAt || resolved.value.expiresAt > Date.now() + 60_000))
       return resolved.value.accessToken;
     const inFlight = this.userTokenRefreshes.get(handle);
     if (inFlight) return inFlight;
-    const refresh = this.refreshUserAccessToken(userId, accountId, handle, opts.forceRefresh === true)
+    // Across processes, one refresh at a time (refresh-lease.ts): a refresh
+    // another one completed while this waited is taken, not repeated.
+    const replaced = async () => {
+      const now = await this.resolvedUserToken(handle);
+      return now && now.raw !== resolved.raw && now.value.accessToken
+        && (!now.value.expiresAt || now.value.expiresAt > Date.now() + 60_000) ? { value: now.value.accessToken } : undefined;
+    };
+    const refresh = this.leases.hold(handle, async () => (await replaced())?.value
+      ?? this.refreshUserAccessToken(userId, accountId, handle, opts.forceRefresh === true), replaced)
       .finally(() => this.userTokenRefreshes.delete(handle));
     this.userTokenRefreshes.set(handle, refresh);
     return refresh;
@@ -1797,9 +1840,9 @@ export class GitHubAppService {
    * depends on GitHub being reachable. */
   private async migrateLegacyUserAuthorization(userId: string): Promise<void> {
     const legacy = legacyGithubUserTokenHandle(userId);
-    if (!this.broker.hasHandle(legacy)) return;
+    if (!await this.broker.hasHandle(legacy)) return;
     const identity = await this.userIdentity(userId);
-    const stored = this.broker.resolve(legacy, { caps: [`use-credential:${legacy}`] });
+    const stored = await this.broker.resolve(legacy, { caps: [`use-credential:${legacy}`] });
     (await this.broker.registerHandle(githubUserTokenHandle(userId, identity.id), stored, userScope(userId)));
     const accounts = (await this.userAccounts(userId));
     (await this.saveUserAccounts(userId, [...accounts.filter((account) => account.id !== identity.id), identity]));

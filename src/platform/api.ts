@@ -33,7 +33,7 @@ import {
   MERGE_QUEUE_WORKFLOW,
   AGENT_QUEUE_WORKFLOW,
 } from '../coordinators/names.js';
-import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, FileRef, Tag, SavedView, TaskQuery, AgentRole, AgentSpec, AgentAuthority, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency, remotePolicyOf, ResourceAccess, ResourceTarget } from '../domain/types.js';
+import { TaskRecord, TaskView, AttentionAsk, Message, Project, TaskInput, ImageRef, FileRef, Tag, SavedView, TaskQuery, AgentRole, AgentSpec, AgentAuthority, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency, remotePolicyOf, ResourceAccess, ResourceTarget } from '../domain/types.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable, awaitsSuccessOf } from '../domain/triggers.js';
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult, EvalContext, TaskGroup, forClauseValues, attentionCandidates } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
@@ -1352,6 +1352,8 @@ export class KarmaxApi {
     // against an organization that changed while we were awaiting it.
     let { task, delegation } = await this.deps.store.transaction(async () => {
       await this.require(token, 'create_task', { projectId: args.projectId });
+      // A transfer waits for this task, or this check sees it moved.
+      await this.deps.store.lockProjectRow(project.id, 'key share');
       if ((await this.deps.store.getProject(project.id))?.organizationId !== project.organizationId)
         throw new ValidationError('Project moved while preparing this task. Reload and retry.');
       let task = (await this.deps.store.createTask({
@@ -4940,9 +4942,9 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         : /^user:/i.test(value) ? value.slice(5) : ctx.people?.get(value.trim().toLowerCase())).filter((id): id is string => !!id));
       ctx.attention = new Map();
       for (const userId of users) {
-        const asks = new Map<string, string[]>();
+        const asks = new Map<string, AttentionAsk>();
         for (const organizationId of organizations)
-          for (const [taskId, kinds] of await this.deps.store.attentionAsks(userId, organizationId)) asks.set(taskId, kinds);
+          for (const [taskId, ask] of await this.deps.store.attentionAsks(userId, organizationId)) asks.set(taskId, ask);
         ctx.attention.set(userId, asks);
       }
     }

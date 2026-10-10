@@ -88,7 +88,7 @@ describe('streamed agent text on a socket', () => {
     const fanout = (h.gateway as any).fanout;
     const delivered = (seq: number) => vi.waitFor(() => {
       expect(fanout.cursor).toBeGreaterThanOrEqual(seq);
-      expect([...fanout.listeners].every((subscriber: any) => !subscriber.running && !subscriber.queue.length)).toBe(true);
+      expect([...fanout.subscribers()].every((subscriber: any) => !subscriber.running && !subscriber.queue.length)).toBe(true);
     });
     try {
       for (const text of windows()) {

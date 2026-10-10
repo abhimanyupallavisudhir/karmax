@@ -165,7 +165,7 @@ it.each(['live source', 'deleted source', 'disconnected login'])('forks and resu
         // credentials must not erase the only remaining native fork source.
         fs.rmSync(from.handle.root, { recursive: true, force: true });
         const config = fs.readFileSync(path.join(host, 'config.toml'));
-        homes.remove('codex', 'personal');
+        await homes.remove('codex', 'personal');
         expect(homes.list()).toEqual([]);
         expect(homes.prepareLogin('codex', 'personal')).toBe(host);
         fs.writeFileSync(path.join(host, 'config.toml'), config);

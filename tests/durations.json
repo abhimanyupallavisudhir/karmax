@@ -480,6 +480,7 @@
   "tests/task-read-model.test.ts": 0.4,
   "tests/task-secrets.test.ts": 0.2,
   "tests/task-start-critical-path.test.ts": 8.1,
+  "tests/task-status-changed.test.ts": 1.6,
   "tests/task-view-storage.test.ts": 0.2,
   "tests/temporal-server-identity.test.ts": 0.5,
   "tests/temporal.test.ts": 1.9,

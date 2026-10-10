@@ -34,7 +34,9 @@ describe.each(storeBackends)('attention asks ($name)', ({ open }) => {
     await view(elsewhere.id, { stage: 'review', status: 'waiting', waitingFor: { kind: 'human' } });
 
     const asks = await store.attentionAsks('owner', organization.id);
-    expect(Object.fromEntries(asks)).toEqual({ [review.id]: ['review-requested'], [mention.id]: ['mentioned'] });
+    expect(Object.fromEntries([...asks].map(([id, ask]) => [id, ask.kinds]))).toEqual({ [review.id]: ['review-requested'], [mention.id]: ['mentioned'] });
+    // When each ask arrived, so a list of what needs this person leads with the newest.
+    expect(asks.get(mention.id)!.at).toBeGreaterThanOrEqual(asks.get(review.id)!.at);
     expect([...(await store.attentionAsks('owner', other.id)).keys()]).toEqual([elsewhere.id]);
 
     // (A task with no reviewers routes its review to its creator.)

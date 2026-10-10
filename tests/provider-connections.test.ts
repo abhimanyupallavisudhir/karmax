@@ -43,7 +43,7 @@ describe('organization cloud provider connections', () => {
 
     const handle = saved.credentialHandle;
     (await service.delete(organization.id, 'e2b'));
-    expect(broker.hasHandle(handle)).toBe(false);
+    expect(await broker.hasHandle(handle)).toBe(false);
     expect((await service.list(organization.id))).toEqual([]);
     (await store.close());
     fs.rmSync(dir, { recursive: true, force: true });

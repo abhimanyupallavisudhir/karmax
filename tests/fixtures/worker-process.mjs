@@ -1,5 +1,6 @@
 // A real subprocess exercising the production protocol with controlled failures.
 import { announceEventsAppended, serveWorkerProcess } from '../../src/temporal/worker-process-server.ts';
+import { followUpMark, wireFollowUpWakes } from '../../src/activities/follow-up-wakes.ts';
 const mode = process.env.WORKER_FIXTURE_MODE;
 serveWorkerProcess(async () => ({
   worker: {
@@ -10,6 +11,16 @@ serveWorkerProcess(async () => ({
       }, 10);
       if (mode === 'frozen') while (true) { /* deliberate CPU stall */ }
       if (mode === 'frozen-idle') setTimeout(() => { while (true) { /* deliberate CPU stall */ } }, 50);
+      if (mode === 'journaled') {
+        wireFollowUpWakes();
+        const seen = new Map();
+        setInterval(() => {
+          for (const taskId of ['task-a', 'task-b']) {
+            const mark = followUpMark(taskId);
+            if (mark && mark !== seen.get(taskId)) { seen.set(taskId, mark); process.send({ type: 'fixture.journaled', taskId }); }
+          }
+        }, 5).unref();
+      }
       if (mode === 'announce') setTimeout(() => {
         for (let i = 0; i < 5; i++) announceEventsAppended(); // one burst of commits
         setTimeout(() => announceEventsAppended(), 50); // a later commit
@@ -22,6 +33,8 @@ serveWorkerProcess(async () => ({
       if (mode === 'reject-refresh') throw new Error('bundle rejected');
     },
     async stop() { if (mode === 'failed-stop') throw new Error('drain failed'); },
+    ...(mode === 'cache-status' ? { status: () => ({ workflowCache: { cached: 3, limit: 250, shrinks: 1 },
+      workflows: { usedBytes: 10, limitBytes: 20 } }) } : {}),
   },
   async close() {},
 }));

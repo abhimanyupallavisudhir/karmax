@@ -1,5 +1,8 @@
 import { fork, type ChildProcess } from 'node:child_process';
+import v8 from 'node:v8';
 import type { ExternalWorkflowRef } from '../packages/bundle.js';
+import type { StoreMetricsSnapshot } from '../store/transaction-metrics.js';
+import type { WorkflowCacheStatus } from '../runtime/memory-budget.js';
 
 export interface WorkerProcessRequest {
   type: 'worker.request'; id: number; action: 'start' | 'refresh' | 'stop' | 'ping';
@@ -7,9 +10,43 @@ export interface WorkerProcessRequest {
 }
 export interface WorkerProcessReply {
   type: 'worker.reply'; id: number; ok: boolean; error?: string;
+  /** A ping's reply carries the child's Store transaction timings. */
+  store?: StoreMetricsSnapshot;
+  /** On a ping: the worker's heaps, for metrics and the service-limits page. */
+  heap?: WorkerHeap;
+}
+/** V8 heap in use against its limit (`--max-old-space-size`, from the memory
+ * budget), and, where the worker runs, its workflow thread's separate heap and
+ * sticky cache (RT-35). */
+export interface WorkerHeap {
+  usedBytes: number; limitBytes: number; at: number;
+  rssBytes?: number;
+  workflows?: { usedBytes: number; limitBytes: number };
+  workflowCache?: WorkflowCacheStatus;
+}
+export function heapNow(worker: Pick<WorkerHeap, 'workflows' | 'workflowCache'> = {}): WorkerHeap {
+  const heap = v8.getHeapStatistics();
+  return { usedBytes: heap.used_heap_size, limitBytes: heap.heap_size_limit, at: Date.now(),
+    rssBytes: process.memoryUsage.rss(), ...worker };
+}
+/** A child's reported heap, numbers only, stamped on this clock. Fields an
+ * older child does not send stay absent. */
+function workerHeapFrom(heap: WorkerHeap): WorkerHeap {
+  const finite = (...values: unknown[]) => values.every((value) => typeof value === 'number' && Number.isFinite(value));
+  const { workflows, workflowCache, rssBytes } = heap;
+  return { usedBytes: heap.usedBytes, limitBytes: heap.limitBytes, at: Date.now(),
+    ...(finite(rssBytes) ? { rssBytes } : {}),
+    ...(workflows && finite(workflows.usedBytes, workflows.limitBytes)
+      ? { workflows: { usedBytes: workflows.usedBytes, limitBytes: workflows.limitBytes } } : {}),
+    ...(workflowCache && finite(workflowCache.cached, workflowCache.limit, workflowCache.shrinks)
+      ? { workflowCache: { cached: workflowCache.cached, limit: workflowCache.limit, shrinks: workflowCache.shrinks } } : {}) };
 }
 /** Unsolicited child → supervisor hint: events were committed to the shared store. */
 export interface WorkerProcessNotice { type: 'worker.events' }
+/** Supervisor → child: tasks whose follow-up journal the supervisor committed
+ * to, so their running turns read it now (`follow-up-wakes.ts`). A hint: a
+ * lost one is seen at the turn's next periodic read. */
+export interface WorkerJournaledNotice { type: 'worker.journaled'; taskIds: string[] }
 
 /** One supervised child, with bounded control requests and explicit readiness.
  * A control timeout kills the child: the caller cannot safely assume a timed-out
@@ -33,6 +70,10 @@ export class WorkerProcessManager {
   private externals: ExternalWorkflowRef[] = [];
   private pending = new Map<number, { resolve(): void; reject(error: Error): void; timer: NodeJS.Timeout }>();
   failure?: Error;
+  /** The child's Store timings as of its last answered liveness ping. */
+  storeMetrics?: StoreMetricsSnapshot;
+  /** The child's heap as of its last heartbeat. */
+  heap?: WorkerHeap;
 
   constructor(private options: {
     entrypoint: string;
@@ -72,6 +113,20 @@ export class WorkerProcessManager {
   private terminate(error: Error): void {
     this.fail(error);
     this.child?.kill('SIGKILL');
+  }
+
+  private journaledTasks = new Set<string>();
+  /** Tell the child that `taskId`'s follow-up journal changed; one message per burst. */
+  journaled(taskId: string): void {
+    if (!this.ready || !this.child?.connected) return;
+    if (!this.journaledTasks.size) setImmediate(() => {
+      const taskIds = [...this.journaledTasks].slice(0, 1_000);
+      this.journaledTasks.clear();
+      if (!this.child?.connected) return;
+      const notice: WorkerJournaledNotice = { type: 'worker.journaled', taskIds };
+      this.child.send(notice, () => { /* a hint: the turn's periodic read recovers it */ });
+    });
+    this.journaledTasks.add(taskId);
   }
 
   private request(action: WorkerProcessRequest['action'], packages?: ExternalWorkflowRef[], timeoutMs?: number): Promise<void> {
@@ -120,10 +175,13 @@ export class WorkerProcessManager {
         }
         const reply = value as Partial<WorkerProcessReply>;
         if (reply.type !== 'worker.reply' || typeof reply.id !== 'number' || typeof reply.ok !== 'boolean') return;
+        if (reply.heap && Number.isFinite(reply.heap.usedBytes) && Number.isFinite(reply.heap.limitBytes))
+          this.heap = workerHeapFrom(reply.heap);
         const request = this.pending.get(reply.id);
         if (!request) return;
         this.pending.delete(reply.id);
         clearTimeout(request.timer);
+        if (reply.store && typeof reply.store === 'object') this.storeMetrics = reply.store;
         if (reply.ok) request.resolve();
         else request.reject(new Error(typeof reply.error === 'string' ? reply.error.slice(0, 2_000) : 'worker request failed'));
       });

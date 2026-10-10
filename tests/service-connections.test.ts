@@ -148,7 +148,7 @@ describe('service connections', () => {
     await connected();
     vi.mocked(backend.active).mockRejectedValueOnce(new Error('account not found'));
     await expect(service.configure('wrong-project-key')).rejects.toThrow('provider could not complete');
-    expect(broker.resolve('service-connections:composio:api-key', { caps: ['use-credential:*'] })).toBe('project-key-private');
+    expect(await broker.resolve('service-connections:composio:api-key', { caps: ['use-credential:*'] })).toBe('project-key-private');
   });
   it('allows a later task to use an existing account without signing in again', async () => {
     const account = await connected('task_a');

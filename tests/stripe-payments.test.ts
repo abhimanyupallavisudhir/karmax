@@ -117,7 +117,7 @@ describe('Stripe Issuing organization rail', () => {
     const timestamp = Math.floor(Date.now() / 1000);
     const signature = crypto.createHmac('sha256', 'whsec_ui_managed')
       .update(`${timestamp}.${raw.toString('utf8')}`).digest('hex');
-    expect(managed.webhookSignatureValid(raw, `t=${timestamp},v1=${signature}`)).toBe(true);
+    expect(await managed.webhookSignatureValid(raw, `t=${timestamp},v1=${signature}`)).toBe(true);
   });
 
   it('validates UI-managed Stripe platform credentials without replacing retained secrets', async () => {

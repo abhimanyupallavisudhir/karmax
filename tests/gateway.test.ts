@@ -17,6 +17,7 @@ import { makeCoordinatorActivities } from '../src/activities/coordinator.js';
 import { TASK_QUEUE } from '../src/temporal/config.js';
 import { ConfigHomeManager } from '../src/autonomy/config-homes.js';
 import { INSTALLATION_SCOPE } from '../src/autonomy/vault-keys.js';
+import { totpCode } from '../src/autonomy/vault-items.js';
 import { EXPLANATIONS_ENABLED } from '../src/config/features.js';
 
 const webDir = fileURLToPath(new URL('../web', import.meta.url));
@@ -2064,6 +2065,46 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(after.map((i: any) => i.id)).not.toContain(created.id);
   });
 
+  it('hands out a one-time code under blind use, never the seed and never needing reveal', async () => {
+    const seed = 'JBSWY3DPEHPK3PXP';
+    const item: any = await (await fetch(`${base}/api/vault/items`, { method: 'POST', headers: auth(), body: JSON.stringify({
+      type: 'login', label: 'TOTP only', domains: 'totp.example.com',
+      policy: { use: 'auto', reveal: 'never' }, secrets: { totp: seed, note: 'recovery codes' },
+    }) })).json();
+    const project: any = await (await fetch(`${base}/api/projects`, { method: 'POST', headers: auth(), body: JSON.stringify({ name: 'TOTP project' }) })).json();
+    const task: any = await (await fetch(`${base}/api/projects/${project.id}/tasks`, { method: 'POST', headers: auth(), body: JSON.stringify({
+      workflow: 'just-do', command: 'later', draft: true, credentialGrants: [`use-credential:item:${item.id}`],
+    }) })).json();
+    const minted = (await h.tokens.mint({
+      taskId: task.id, profileId: 'do', principal: 'user:test',
+      ceiling: ['credential:read', 'use-credential:*'], grantorCaps: ['credential:read', `use-credential:item:${item.id}`],
+    }));
+    const resolve = async (body: object) => (await (await fetch(`${base}/api/vault/resolve`, {
+      method: 'POST', headers: { authorization: `Bearer ${minted.token}`, 'content-type': 'application/json' }, body: JSON.stringify(body),
+    })).json()) as any;
+
+    // reveal: never does not stop a code; a seed-only login defaults to it.
+    for (const body of [{ itemId: item.id, field: 'totp' }, { itemId: item.id }]) {
+      const code = await resolve(body);
+      expect(code).toMatchObject({ status: 'granted', field: 'totp' });
+      expect(code.value).toMatch(/^\d{6}$/);
+      expect([totpCode(seed), totpCode(seed, Date.now() - 30_000)]).toContain(code.value);
+      expect(JSON.stringify(code)).not.toContain(seed);
+      expect(JSON.stringify(code)).not.toContain('recovery codes');
+    }
+    expect((await resolve({ itemId: item.id, field: 'note' })).status).toBe('denied');
+    expect((await h.store.auditSince()).some((entry: any) => entry.action === 'vault.used'
+      && entry.detail.itemId === item.id && entry.detail.field === 'totp')).toBe(true);
+
+    // Blind use set to ask still gates the code.
+    await fetch(`${base}/api/vault/items`, { method: 'POST', headers: auth(), body: JSON.stringify({ id: item.id, type: 'login', label: item.label, domains: item.domains, policy: { use: 'ask' } }) });
+    const asked = await resolve({ itemId: item.id, field: 'totp' });
+    expect(asked.status).toBe('needs_approval');
+    expect(asked.value).toBeUndefined();
+    const pending: any = await (await fetch(`${base}/api/vault/requests?taskId=${task.id}&status=pending`, { headers: auth() })).json();
+    expect(pending.find((request: any) => request.itemId === item.id)?.mode).toBe('use');
+  });
+
   it('lists only non-secret credential metadata granted to the calling task', async () => {
     const granted: any = await (await fetch(`${base}/api/vault/items`, { method: 'POST', headers: auth(), body: JSON.stringify({
       type: 'login', label: 'Amazon UK', domains: 'www.amazon.co.uk', username: 'buyer@example.com',
@@ -2576,11 +2617,11 @@ esac
     expect(JSON.stringify(card)).not.toContain('4242424242424242');
     const listed = await (await fetch(`${base}/api/cards?organizationId=${orgId}`, { headers: auth() })).text();
     expect(listed).not.toContain('4242424242424242');
-    expect(h.broker.hasHandle(`payment:card:${card.id}`)).toBe(true);
+    expect(await h.broker.hasHandle(`payment:card:${card.id}`)).toBe(true);
 
     // Revoking destroys the secret rather than merely hiding the row.
     expect((await fetch(`${base}/api/cards/${card.id}?organizationId=${orgId}`,
       { method: 'DELETE', headers: auth() })).status).toBe(200);
-    expect(h.broker.hasHandle(`payment:card:${card.id}`)).toBe(false);
+    expect(await h.broker.hasHandle(`payment:card:${card.id}`)).toBe(false);
   });
 });

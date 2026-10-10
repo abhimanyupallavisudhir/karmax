@@ -4332,6 +4332,12 @@ function markTaskCancelling(taskId) {
   if (S.view?.taskId === taskId) S.view = pendingCancellationView(S.view, taskId);
 }
 
+// The lists' default order (the server's `updated` sort): the task whose stage,
+// status or wait last changed first; one that never ran counts from its creation.
+function byLastUpdate(a, b) {
+  return (b.statusChangedAt || b.createdAt || 0) - (a.statusChangedAt || a.createdAt || 0);
+}
+
 // Evaluate the working query on the server and stash the result. The default list
 // (empty query) is just an evaluation too. We overlay each result's freshest live
 // `lastView` from S.tasks so status chips reflect the latest transition.
@@ -4541,6 +4547,8 @@ function patchLifecycleView(record, ev) {
     agentTurn,
   }, ev.taskId);
   record.lastView = next;
+  if (previous.stage !== next.stage || previous.status !== next.status || previous.waitingFor?.kind !== next.waitingFor?.kind)
+    record.statusChangedAt = ev.ts || Date.now();
   // A retrying or accidentally hot-looping workflow can publish an identical
   // compact view many times per second. Updating the in-memory record is cheap;
   // replacing the entire list DOM is not, and can remove a row between pointer
@@ -5913,7 +5921,7 @@ function tasksView() {
   const preview = !across && !/(^|\s)-?[\w.#-]+:/.test(S.search || '');
   const flat = (r
     ? r.tasks
-    : preview ? S.tasks.filter((t) => taskMatches(t, S.search) && !t.params?.archived).slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)) : []
+    : preview ? S.tasks.filter((t) => taskMatches(t, S.search) && !t.params?.archived).slice().sort(byLastUpdate) : []
   ).filter(topLevel);
   const row = (t, opts = {}) => taskRow(t, { ...opts, ...(across ? { showTags: false, project: true } : {}) });
   const groups = r && r.groups ? r.groups : null;
@@ -17631,7 +17639,7 @@ const VAULT_SECRET_LABELS = {
   note: [['note', 'note']],
 };
 // Short label + click-to-expand explanation for the two per-item policies.
-const POL_USE_TIP = 'Use through a browser or environment without returning secret text to the model. The agent can still inspect its browser and environment, so a misbehaving agent can still leak it, e.g. by entering it on a malicious site. “ask” requires approval before each use.';
+const POL_USE_TIP = 'Use through a browser or environment without returning secret text to the model. Agents also get current 2FA codes, never the 2FA secret itself. The agent can still inspect its browser and environment, so a misbehaving agent can still leak it, e.g. by entering it on a malicious site. “ask” requires approval before each use.';
 const SESSION_EXCLUSIVE_TIP = 'For sites that sign other copies out when one is used. Other tasks wait until the task using it is done.';
 const POL_REVEAL_TIP = 'Agent sees = the plaintext secret is handed to the agent (needed e.g. to paste an API key into a dashboard). It then travels to the model provider and may end up in training data. “never” forbids that to everyone but Super-administrators, who can read the whole vault; “ask” requires your approval each time.';
 // `title` covers hover on desktop; the click handler is for touch, where there is
@@ -19130,6 +19138,8 @@ function urgencyRank(urgency) {
 // news is the outcome it is reporting, so it names the task's status instead.
 function inboxRowLabel(item) {
   if (item.subject?.kind === 'avatar-authorization') return 'Avatar authorization approval';
+  if (item.subject?.kind === 'service-limit') return item.subject.level === 'failed' ? `Can’t read ${item.subject.serviceName} usage`
+    : `${item.subject.serviceName} at ${Math.floor((item.subject.used / item.subject.limit) * 100)}% of its limit${item.subject.level === 95 ? ' — upgrade now' : ''}`;
   if (item.subject?.kind === 'storage') return item.subject.stage === 'deleted'
     ? 'Stored data deleted to fit the limit'
     : `Over the storage limit — free space by ${new Date(item.subject.deleteAt).toLocaleDateString()}`;
@@ -19144,6 +19154,8 @@ function inboxRowLabel(item) {
 function inboxTitle(item, fallback = item.kind) {
   if (item.subject?.kind === 'credential') return `${item.subject.provider}:${item.subject.account}`;
   if (item.subject?.kind === 'storage') return `Storage · ${formatBytes(item.subject.retainedBytes)} of ${formatBytes(item.subject.quotaBytes)}`;
+  if (item.subject?.kind === 'service-limit') return item.subject.level === 'failed' ? `${item.subject.serviceName} · ${item.subject.error}`
+    : `${item.subject.serviceName} · ${item.subject.label} ${limitAmount(item.subject.used, item.subject.unit)} of ${limitAmount(item.subject.limit, item.subject.unit, true)}`;
   return item.task?.title || item.resource?.name || fallback;
 }
 // Every priority is explicit; color and bars make the urgent levels scannable.
@@ -19340,6 +19352,7 @@ async function openInboxItem(item) {
   if (item.subject?.kind === 'storage') {
     return go(`${globalRoute('organization', organizationById(item.organizationId))}#settings-storage`);
   }
+  if (item.subject?.kind === 'service-limit') return go(`${installationRoute()}#installation-limits`);
   if (item.subject?.kind === 'avatar-authorization') {
     const project = projectById(item.subject.projectId); if (!project) return;
     return go(avatarRoute(project.id, item.subject.avatarId));
@@ -20074,6 +20087,141 @@ async function loadAccountErasure(userId) {
     confirmation: $('#erasure-reviewed').value }));
 }
 
+// ── Service limits (Installation) ─────────────────────────────────────────────
+// The operator's shared accounts and this server against their plans
+// (GET /api/settings/service-limits). One row per measure, the service's name,
+// plan and upgrade link on its first row; explanations live in tooltips.
+function limitSource(source) {
+  return { api: ['API', 'Read from the provider'], count: [siteName(), `Counted by ${siteName()}`],
+    host: ['server', 'Measured on this server'] }[source] || ['API', 'Read from the provider'];
+}
+function limitAmount(value, unit, compact = false) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '—';
+  if (unit === 'bytes') return formatBytes(n);
+  if (unit === 'hours') return `${n.toLocaleString('en-US', { maximumFractionDigits: 1 })} h`;
+  return compact && n >= 100_000
+    ? n.toLocaleString('en-US', { notation: 'compact', maximumFractionDigits: 1 })
+    : n.toLocaleString('en-US', { maximumFractionDigits: 1 });
+}
+function serviceLimitMeterMarkup(service, meter, first) {
+  const source = limitSource(meter.usedSource);
+  const has = meter.used !== undefined && meter.used !== null;
+  const ratio = has && meter.limit ? meter.used / meter.limit : undefined;
+  const percent = ratio === undefined ? '' : ratio > 0 && ratio < 0.01 ? '<1%' : `${Math.floor(ratio * 100)}%`;
+  const limitTitle = { entered: 'Entered by you', api: `Reported by ${service.name}`, published: service.plan ? `Published ${service.plan} limit` : 'Published limit' }[meter.limitSource] || '';
+  const peak = meter.peak && meter.limit && meter.peak.used > meter.used
+    ? `<b class="limits-peak" style="left:${Math.min(100, (meter.peak.used / meter.limit) * 100).toFixed(1)}%"></b>` : '';
+  const barTitle = [`Now ${limitAmount(meter.used, meter.unit)}${percent ? ` (${percent})` : ''}`,
+    meter.peak ? `7-day high ${limitAmount(meter.peak.used, meter.unit)}` : '', meter.detail || ''].filter(Boolean).join(' · ');
+  const usage = !has ? '<span class="limits-none">No reading yet</span>'
+    : `${meter.limit ? `<span class="limits-bar" title="${esc(barTitle)}"><i style="width:${Math.min(100, ratio * 100).toFixed(1)}%"></i>${peak}</span>` : ''}
+      <span class="limits-numbers" title="${esc(barTitle)}">${esc(limitAmount(meter.used, meter.unit))}${meter.limit
+        ? ` / <span class="limits-limit ${meter.limitSource === 'entered' ? 'entered' : ''}" title="${esc(limitTitle)}">${esc(limitAmount(meter.limit, meter.unit, true))}</span>` : ''}</span>
+      ${meter.limit ? `<span class="limits-level ${meter.level === 95 ? 'critical' : meter.level === 80 ? 'warn' : ''}">${meter.level ? '▲ ' : ''}${esc(percent)}</span>` : ''}`;
+  return `<div class="limits-row${first ? '' : ' cont'}" role="row" data-service="${esc(service.id)}" data-meter="${esc(meter.id)}" data-level="${meter.level || 0}">
+    <span class="limits-service" role="rowheader">${first ? serviceLimitNameMarkup(service, true) : ''}</span>
+    <span class="limits-measure" role="cell"><button type="button" class="info-dot limits-label" title="${esc(meter.tip)}">${esc(meter.label)}</button> <span class="limits-source" title="${esc(source[1])}">${esc(source[0])}</span></span>
+    <span class="limits-usage" role="cell">${usage}</span>
+    <span class="limits-actions" role="cell">${first ? serviceLimitActionsMarkup(service) : ''}</span>
+  </div>`;
+}
+function serviceLimitNameMarkup(service, withPlan = false) {
+  const plan = withPlan && service.plan ? `<span class="limits-plan" title="${esc(service.planSource === 'entered' ? 'Your plan, as you entered it'
+    : service.planSource === 'api' ? `Reported by ${service.name}` : 'Assumed until you enter yours')}">${esc(service.plan)}</span>` : '';
+  const failed = service.status === 'failed'
+    ? `<span class="limits-failed">Can’t read ${policyTip(`${service.error || 'No answer'}. The last reading is shown.`)}</span>` : '';
+  return `<button type="button" class="info-dot limits-label limits-name" title="${esc(service.tip)}">${esc(service.name)}</button>${plan}${failed}`;
+}
+function serviceLimitActionsMarkup(service) {
+  const link = service.link ? `<a href="${esc(service.link.url)}" target="_blank" rel="noopener noreferrer">${esc(service.link.label)} ↗</a>` : '';
+  const edit = S.serviceLimitsCanManage ? `<button type="button" class="limits-edit" data-limits-edit="${esc(service.id)}" aria-label="Edit ${esc(service.name)} plan and limits" title="Edit plan and limits">✎</button>` : '';
+  return link + edit;
+}
+function serviceLimitsMarkup(view) {
+  if (!view) return '';
+  const rows = view.services.map((service) => {
+    if (service.status === 'not-connected' || service.status === 'unchecked' || !service.meters.length) {
+      const note = service.status === 'unchecked' ? 'Not checked yet' : 'Not connected';
+      return `<div class="limits-row off" role="row" data-service="${esc(service.id)}">
+        <span class="limits-service" role="rowheader">${serviceLimitNameMarkup(service)}</span>
+        <span class="limits-off" role="cell">${note}${service.connect ? ` ${policyTip(service.connect)}` : ''}</span>
+        <span class="limits-actions" role="cell">${serviceLimitActionsMarkup(service)}</span>
+      </div>`;
+    }
+    return service.meters.map((meter, index) => serviceLimitMeterMarkup(service, meter, index === 0)).join('');
+  }).join('');
+  const alerts = view.services.flatMap((service) => service.meters.filter((meter) => meter.level)).length;
+  return `<div class="limits-head"><span class="task-sub">${view.checkedAt ? `Checked ${esc(fmtAgo(view.checkedAt))}` : 'Not checked yet'}${alerts ? ` · <b>${alerts} near ${alerts === 1 ? 'its limit' : 'their limits'}</b>` : ''}
+      ${policyTip('Checked every 15 minutes. At 80% and again at 95% of a limit, installation operators get an inbox alert and an email.')}</span>
+    ${S.serviceLimitsCanManage ? '<button type="button" class="btn sm" id="service-limits-check">Check now</button>' : ''}</div>
+  <div class="limits" role="table" aria-label="Service limits">${rows}</div>`;
+}
+function serviceLimitEditorMarkup(view, service) {
+  const spec = view.services.find((entry) => entry.id === service.id);
+  const field = (label, control, tip) => `<label><span>${esc(label)}${tip ? ` ${policyTip(tip)}` : ''}</span>${control}</label>`;
+  const limits = spec.meters.map((meter) => field(meter.label,
+    `<input type="number" min="0" step="any" data-limit="${esc(meter.id)}" value="${meter.limitSource === 'entered' ? esc(meter.limit) : ''}" placeholder="${meter.limitSource && meter.limitSource !== 'entered' && meter.limit ? esc(meter.limit) : 'No limit'}">`)).join('');
+  const cloudflare = service.id.startsWith('cloudflare-') ? field('Account ID',
+    `<input data-cloudflare-account value="${esc(view.cloudflare?.accountId || '')}" placeholder="32 hexadecimal characters" spellcheck="false">`)
+    + field('API token', `<input type="password" data-cloudflare-token autocomplete="off" placeholder="${view.cloudflare?.tokenConfigured ? 'Saved — paste to replace' : 'Needs Account Analytics: Read'}">`,
+      'Stored in the vault and never shown again. Create one in Cloudflare under My Profile → API Tokens.') : '';
+  const organization = ['e2b', 'daytona', 'agentmail'].includes(service.id) ? field('Account of',
+    `<select data-operator-organization>${(S.organizations || []).map((organization) => `<option value="${esc(organization.id)}" ${organization.id === view.operatorOrganizationId ? 'selected' : ''}>${esc(organization.name)}</option>`).join('')}</select>`,
+    'The organization whose E2B, Daytona and AgentMail connections are yours.') : '';
+  return `<div class="limits-editor" data-limits-editor="${esc(service.id)}">
+    ${field('Plan', `<input data-plan maxlength="60" value="${esc(service.planSource === 'entered' ? service.plan : '')}" placeholder="${esc(service.planSource !== 'entered' && service.plan ? service.plan : 'Plan name')}">`)}
+    ${limits}${cloudflare}${organization}
+    ${field('Upgrade link', `<input type="url" data-link value="" placeholder="${esc(service.link?.url || 'https://…')}">`)}
+    <div class="limits-editor-actions"><button type="button" class="btn sm primary" data-limits-save>Save</button>
+      <button type="button" class="btn sm" data-limits-reset title="Use the published plan, limits and link">Reset</button>
+      <button type="button" class="btn sm" data-limits-cancel>Cancel</button></div>
+  </div>`;
+}
+async function wireServiceLimitsCard(view) {
+  const card = $('#service-limits-card');
+  if (!card) return;
+  if (!view) {
+    try { view = await api('/api/settings/service-limits'); }
+    catch (error) { if (card.isConnected) paneError(card, error, () => wireServiceLimitsCard()); return; }
+  }
+  if (!card.isConnected) return;
+  S.serviceLimitsCanManage = view.canManage === true;
+  card.innerHTML = serviceLimitsMarkup(view);
+  const run = async (button, request) => {
+    button.disabled = true;
+    try { await wireServiceLimitsCard(await request()); }
+    catch (error) { button.disabled = false; toast(error.message, true); }
+  };
+  card.querySelector('#service-limits-check')?.addEventListener('click', (event) =>
+    run(event.currentTarget, () => api('/api/settings/service-limits/check', { method: 'POST' })));
+  card.querySelectorAll('[data-limits-edit]').forEach((button) => button.addEventListener('click', () => {
+    card.querySelector('.limits-editor')?.remove();
+    const service = view.services.find((entry) => entry.id === button.dataset.limitsEdit);
+    const rows = card.querySelectorAll(`.limits-row[data-service="${CSS.escape(service.id)}"]`);
+    rows[rows.length - 1].insertAdjacentHTML('afterend', serviceLimitEditorMarkup(view, service));
+    const editor = card.querySelector('.limits-editor');
+    editor.querySelector('input')?.focus();
+    const save = (reset) => {
+      const limits = {};
+      editor.querySelectorAll('[data-limit]').forEach((input) => {
+        limits[input.dataset.limit] = reset || input.value.trim() === '' ? null : Number(input.value);
+      });
+      const body = { services: { [service.id]: { plan: reset ? null : editor.querySelector('[data-plan]').value.trim() || null,
+        link: reset ? null : editor.querySelector('[data-link]').value.trim() || null, limits } } };
+      const account = editor.querySelector('[data-cloudflare-account]');
+      const token = editor.querySelector('[data-cloudflare-token]')?.value.trim();
+      if (account && !reset) body.cloudflare = { accountId: account.value.trim() || null, ...(token ? { apiToken: token } : {}) };
+      const organization = editor.querySelector('[data-operator-organization]');
+      if (organization && !reset) body.operatorOrganizationId = organization.value;
+      return api('/api/settings/service-limits', { method: 'PUT', body: JSON.stringify(body) });
+    };
+    editor.querySelector('[data-limits-save]').addEventListener('click', (event) => run(event.currentTarget, () => save(false)));
+    editor.querySelector('[data-limits-reset]').addEventListener('click', (event) => run(event.currentTarget, () => save(true)));
+    editor.querySelector('[data-limits-cancel]').addEventListener('click', () => editor.remove());
+  }));
+}
+
 function installationView() {
   const phone = hostLocal()
     ? `<div class="card phone-access-card" id="phone-access-card" hidden><div id="phone-access-status"><p class="task-sub">Checking this installation…</p></div></div>`
@@ -20083,7 +20231,7 @@ function installationView() {
   </div><span class="chip">operator only</span></div>
   <div class="settings-layout">
     <nav class="settings-nav" aria-label="Installation settings sections"><span>Installation</span>
-      <a href="#installation-appearance">Appearance</a><a href="#installation-health">Health</a><a href="#installation-capacity">Host capacity</a>
+      <a href="#installation-appearance">Appearance</a><a href="#installation-health">Health</a><a href="#installation-limits">Service limits</a><a href="#installation-capacity">Host capacity</a>
       <a href="#installation-github">GitHub</a><a href="#installation-composio">Composio</a><a href="#installation-paid-launch">Paid launch</a><a href="#installation-stripe">Agent cards</a><a href="#installation-email">Email</a>
       ${S.meta.hosted ? '<a href="#installation-users">Users</a>' : ''}<a href="#installation-access">Phone Access</a>
     </nav><div class="settings-content">
@@ -20091,6 +20239,8 @@ function installationView() {
       <div class="settings-section-title" id="installation-health"><div>Health<small>Load, memory, and every process ${siteNameMarkup()} runs</small></div></div>
       <div id="host-diag"><div class="card" style="color:var(--ink-3)">Loading…</div></div>
       <div id="proc-panel" style="margin-top:12px"><div class="card" style="color:var(--ink-3)">Loading…</div></div>
+      <div class="settings-section-title" id="installation-limits"><div>Service limits<small>Shared accounts and this server against their plans</small></div></div>
+      <div class="card service-limits" id="service-limits-card"><span class="task-sub">Loading…</span></div>
       <div class="settings-section-title" id="installation-capacity"><div>Host capacity<small>Admission limits shared by all agent work</small></div></div>${hostCapacityCard()}
       <div class="card"><label title="Record response measurements and show the Timing tab. Existing measurements are retained when off."><input type="checkbox" id="timing-enabled" ${S.meta?.timingEnabled ? 'checked' : ''}> Response timing</label></div>
       <div class="settings-section-title" id="installation-github"><div>GitHub<small>GitHub App for repository access</small></div></div>${installationGithubCard()}
@@ -20321,6 +20471,7 @@ function wireInstallationSettings() {
   wireAppearanceCard();
   refreshHostDiag();
   refreshProcPanel();
+  wireServiceLimitsCard();
   wireHostCapacityCard();
   $('#timing-enabled')?.addEventListener('change', async event => {
     const control = event.currentTarget; control.disabled = true;
@@ -21263,14 +21414,14 @@ function openCursorRow() { openListRow(cursorRow()); }
 function archiveCursorRow() { cursorRow()?.querySelector('[data-archive],[data-unarchive]')?.click(); }
 // With a task page open, j/k walk the same task order the list shows — when the
 // open task is in that list; otherwise (a permalink, a task the query does not
-// match) they walk every task of the project, newest first.
+// match) they walk every task of the project in the lists' default order.
 function taskOrder() {
   const listed = S.searchScope === S.projectId ? (S.searchResult?.tasks || [])
     .filter((t) => !t.params?.draft && t.projectId === S.projectId).map((t) => t.id) : [];
   if (listed.includes(S.taskWalkTarget || S.selected)) return listed;
   return S.tasks
     .filter((t) => !t.params?.draft)
-    .slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
+    .slice().sort(byLastUpdate)
     .map((t) => t.id);
 }
 function openAdjacentTask(delta) {
