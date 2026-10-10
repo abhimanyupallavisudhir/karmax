@@ -365,7 +365,7 @@ export interface UsageEvent {
   taskId?: string;
   worldId?: string;
   provider: string;
-  kind: 'world.active' | 'checkpoint.storage' | 'resource.storage' | 'preview.active' | 'agent.request' | 'agent.tokens' | 'agent.cost';
+  kind: 'world.active' | 'world.disk' | 'checkpoint.storage' | 'resource.storage' | 'preview.active' | 'agent.request' | 'agent.tokens' | 'agent.cost';
   /** Who pays the upstream bill. `managed` is installation-funded and is
    * disabled in hosted mode until an owner sets an explicit spend cap. */
   fundingSource?: 'managed' | 'byok' | 'customer';

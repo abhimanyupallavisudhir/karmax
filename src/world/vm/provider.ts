@@ -233,12 +233,9 @@ export class VmWorldProvider implements WorldProvider {
     const next = await this.driver.shape({ cpu: to.cpu ?? made.cpu, memoryMb: to.memoryMb ?? made.memoryMb, diskGb: Math.max(to.diskGb ?? 0, made.diskGb) }, connection);
     // The volume's own size decides: an earlier resize may already have grown it.
     const grown = next.diskGb > made.diskGb && await this.driver.growDisk(connection, sealed, next.diskGb);
-    if (grown) {
-      // A running machine grows its filesystem now; a stopped one at boot.
-      const transport = this.transports.get(handle.id);
-      if (transport && this.states.get(handle.id) !== 'parked')
-        await growFilesystem(transport, this.home()).catch(() => undefined);
-    }
+    // A running machine grows its filesystem now (the boot script does it on a stopped one).
+    if (grown && await this.driver.state(connection, sealed).catch(() => undefined) === 'ready')
+      await growFilesystem(this.transportFor(handle.id, connection, sealed), this.home()).catch(() => undefined);
     return { disk: grown ? 'grown' : 'unchanged', restart: next.cpu !== made.cpu || next.memoryMb !== made.memoryMb,
       machine: { cpu: made.cpu, memoryMb: made.memoryMb, diskGb: next.diskGb } };
   }

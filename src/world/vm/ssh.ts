@@ -1,7 +1,8 @@
+import crypto from 'node:crypto';
 import net from 'node:net';
 import tls from 'node:tls';
 import type { Duplex } from 'node:stream';
-import { Client, type ClientChannel, type SFTPWrapper, utils } from 'ssh2';
+import { Client, type ClientChannel, type SFTPWrapper } from 'ssh2';
 
 /**
  * Where a VM world's SSH server answers, and how to trust it. The host key is
@@ -32,10 +33,33 @@ export class VmTransportError extends Error {
 
 export interface SshKeyPair { privateKey: string; publicKey: string }
 
-/** A fresh ed25519 key pair in OpenSSH formats. */
+/**
+ * A fresh ed25519 key pair in OpenSSH formats, from node:crypto. (ssh2's own
+ * generator writes about one key in 400 that ssh2 itself then rejects as
+ * malformed: a world with such a key could never be reached.)
+ */
 export function generateSshKeyPair(comment = 'karmax'): SshKeyPair {
-  const pair = utils.generateKeyPairSync('ed25519', { comment });
-  return { privateKey: pair.private, publicKey: pair.public.trim() };
+  const jwk = crypto.generateKeyPairSync('ed25519').privateKey.export({ format: 'jwk' });
+  const seed = Buffer.from(jwk.d!, 'base64url');
+  const pub = Buffer.from(jwk.x!, 'base64url');
+  const string = (value: Buffer | string) => {
+    const bytes = Buffer.from(value);
+    const length = Buffer.alloc(4);
+    length.writeUInt32BE(bytes.length);
+    return Buffer.concat([length, bytes]);
+  };
+  const blob = Buffer.concat([string('ssh-ed25519'), string(pub)]);
+  const check = crypto.randomBytes(4);
+  let secret = Buffer.concat([check, check, string('ssh-ed25519'), string(pub), string(Buffer.concat([seed, pub])), string(comment)]);
+  // Pad to the cipher block size ("none": 8) with 1, 2, 3, …
+  const pad = (8 - (secret.length % 8)) % 8;
+  secret = Buffer.concat([secret, Buffer.from(Array.from({ length: pad }, (_, index) => index + 1))]);
+  const nkeys = Buffer.alloc(4);
+  nkeys.writeUInt32BE(1);
+  const body = Buffer.concat([Buffer.from('openssh-key-v1\0'), string('none'), string('none'), string(''), nkeys, string(blob), string(secret)]);
+  const lines = body.toString('base64').match(/.{1,70}/g)!.join('\n');
+  return { privateKey: `-----BEGIN OPENSSH PRIVATE KEY-----\n${lines}\n-----END OPENSSH PRIVATE KEY-----\n`,
+    publicKey: `ssh-ed25519 ${blob.toString('base64')} ${comment}` };
 }
 
 export interface SshChannel {

@@ -1083,7 +1083,7 @@ export class KarmaxApi {
     const provider = computer?.provider;
     if (provider) {
       const local = ['worktree', 'container', 'memory'].includes(provider);
-      if (local && this.deps.hosted) throw new ValidationError('hosted tasks run on a cloud computer (E2B or Daytona)');
+      if (local && this.deps.hosted) throw new ValidationError('hosted tasks run on a cloud computer (E2B, Daytona, Fly.io or Hetzner)');
       if (!local && this.deps.providerConnections
         && !(await this.deps.providerConnections.available(project.organizationId ?? 'org_personal', provider)))
         throw new ValidationError(`${provider} is not connected. Connect it under Settings → Computers first.`);
@@ -6003,11 +6003,17 @@ Act according to your Avatar instructions. When ready, call platform_request POS
         if (world && !world.meta?.computer && !['worktree', 'container', 'memory'].includes(world.kind))
           (await this.deps.store.updateWorldMeta(world, { computer: machineShape(computerBefore) }).catch(() => undefined));
         result.applied = [...new Set([...result.applied, 'computer'])];
+        // A VM world's disk grows now, under the running agent (vm/provider.ts).
+        const resized = await this.resizeInPlace(taskId).catch(() => ({ inPlace: true, grown: undefined }));
+        const grown = resized.grown;
         // A running world moves only once it parks, which a turn or a job wait
         // never does: tell the agent, unless it asked for the size itself.
         const change = caller.taskId === taskId ? undefined : await this.computerChange(taskId).catch(() => undefined);
-        if (change && (await this.deps.store.worldState(taskId)) === 'ready')
-          (await this.deliverWorkflowMessage(taskId, computerChangeNotice(change)).catch(() => undefined));
+        const live = (await this.deps.store.worldState(taskId)) === 'ready';
+        if (change && live)
+          (await this.deliverWorkflowMessage(taskId, computerChangeNotice(change, resized.inPlace)).catch(() => undefined));
+        else if (grown?.disk === 'grown' && live && caller.taskId !== taskId)
+          (await this.deliverWorkflowMessage(taskId, diskGrownNotice(grown.machine.diskGb)).catch(() => undefined));
       }
       (await this.updateAgentSnapshot(taskId, patch, result.applied));
       if (result.applied.includes('target') && typeof patch.target === 'string')
@@ -6025,6 +6031,23 @@ Act according to your Avatar instructions. When ready, call platform_request POS
     } catch (e) {
       throw new Error(unwrapCause(e));
     }
+  }
+
+  /** Grow a running VM world's disk now (its CPU and memory follow at the next
+   * start), recording what changed; undefined for providers that cannot. */
+  private async resizeInPlace(taskId: string): Promise<{ inPlace: boolean;
+    grown?: { disk: 'grown' | 'unchanged'; machine: { diskGb: number } } }> {
+    const world = (await this.deps.store.currentWorld(taskId));
+    const provider = world && this.deps.worlds ? (() => { try { return this.deps.worlds!.get(world.kind); } catch { return undefined; } })() : undefined;
+    if (!world || !provider?.resize) return { inPlace: false };
+    const change = await this.computerChange(taskId);
+    if ((await this.deps.store.worldState(taskId)) !== 'ready' || !change?.to.diskGb || change.to.diskGb <= (change.from.diskGb ?? 0))
+      return { inPlace: true };
+    return { inPlace: true, grown: await this.deps.worlds!.withOperation(taskId, async () => {
+      const result = await provider.resize!(world as import('../world/types.js').WorldHandle, { ...change.from, diskGb: change.to.diskGb });
+      (await this.deps.store.updateWorldMeta(world, { computer: { ...change.from, diskGb: change.to.diskGb }, machine: result.machine }));
+      return result;
+    }) };
   }
 
   /** The machine a task's Computer asks for, when its world runs on another. */
@@ -6971,9 +6994,16 @@ function applyExecutionConfig(config: import('../domain/types.js').ProjectConfig
 }
 
 /** What an agent is told when its task's Computer changes under it. */
-function computerChangeNotice(change: { from: MachineShape; to: MachineShape }): string {
+function computerChangeNotice(change: { from: MachineShape; to: MachineShape }, inPlace = false): string {
   return `[${BRAND} computer change]\n\nThis task's computer is now ${describeMachine(change.to)}; you are still on ${describeMachine(change.from)}. `
     + 'You move to it when this task parks: end your turn with pause(3) without jobs. A pause that waits on jobs keeps this machine, '
     + 'so first let them finish or stop them (stop_job); if one is running out of room, stopping it now is usually right. '
-    + 'You resume with every tracked file and uncommitted change; Git-ignored files (dependencies, build output) and running processes do not carry over.';
+    + (inPlace
+      ? 'Its disk keeps everything, Git-ignored files included; only running processes do not carry over.'
+      : 'You resume with every tracked file and uncommitted change; Git-ignored files (dependencies, build output) and running processes do not carry over.');
+}
+
+/** What an agent is told when its running computer's disk grew under it. */
+function diskGrownNotice(diskGb: number): string {
+  return `[${BRAND} computer change]\n\nThis task's disk is now ${diskGb} GB. It grew in place: nothing moved and nothing needs restarting.`;
 }

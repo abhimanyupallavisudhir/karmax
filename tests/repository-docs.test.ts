@@ -117,7 +117,7 @@ describe('repository guidance', () => {
   it('lists every world backend, remote ones included (WD-30a)', () => {
     for (const doc of ['CLAUDE.md', 'README.md']) {
       const line = read(doc).split('\n').find(entry => entry.startsWith('- `src/world/`'));
-      for (const backend of ['worktree', 'container', 'memory', 'E2B', 'Daytona']) expect(line, `${doc}: ${backend}`).toContain(backend);
+      for (const backend of ['worktree', 'container', 'memory', 'E2B', 'Daytona', 'Fly.io', 'Hetzner']) expect(line, `${doc}: ${backend}`).toContain(backend);
     }
   });
 

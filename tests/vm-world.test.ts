@@ -2,10 +2,32 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
-import { SshTransport } from '../src/world/vm/ssh.js';
+import { execFileSync } from 'node:child_process';
+import os from 'node:os';
+import ssh2 from 'ssh2';
+import { generateSshKeyPair, SshTransport } from '../src/world/vm/ssh.js';
 import { VmWorld } from '../src/world/vm/world.js';
 import type { WorldHandle, WorldPtyTermination } from '../src/world/types.js';
 import { sshdAvailable, startLocalSshd, type LocalSshd } from './helpers/local-sshd.js';
+
+describe('VM world keys', () => {
+  // ssh2's own generator writes about one ed25519 key in 400 that ssh2 then
+  // rejects as malformed; a world holding one could never be reached.
+  it('generates OpenSSH ed25519 keys that ssh2 and OpenSSH both read', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vm-keys-'));
+    for (let i = 0; i < 1500; i++) {
+      const pair = generateSshKeyPair(`karmax-task_${i}`);
+      const parsed = ssh2.utils.parseKey(pair.privateKey) as any;
+      expect(parsed).not.toBeInstanceOf(Error);
+      expect(`${parsed.type} ${parsed.getPublicSSH().toString('base64')} karmax-task_${i}`).toBe(pair.publicKey);
+      if (i < 5 && sshdAvailable) {
+        fs.writeFileSync(path.join(dir, 'key'), pair.privateKey, { mode: 0o600 });
+        expect(execFileSync('ssh-keygen', ['-y', '-f', path.join(dir, 'key')]).toString().trim().split(' ').slice(0, 2)).toEqual(pair.publicKey.split(' ').slice(0, 2));
+      }
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+});
 
 /**
  * The VM world core against a real sshd (tests/helpers/local-sshd.ts): every

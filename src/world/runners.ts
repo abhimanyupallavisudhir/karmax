@@ -16,6 +16,9 @@ import { taskEnded } from './task-ended.js';
 // pools ignore these totals and derive active worlds from plan concurrency.
 const DEFAULT_CAPACITY = { activeWorlds: 20, cpu: 40, memoryMb: 81_920, gpu: 0 };
 const STALE_PARKED_LEASE_MS = 2 * 60_000;
+/** Providers whose own control plane reports billable time (`listUsageEvents`):
+ * a runner lease there only reserves capacity, and billing it too would charge twice. */
+const PROVIDER_METERED = new Set(['e2b', 'fly', 'hetzner']);
 
 /** Durable admission and cost attribution for execution-plane capacity. The DB
  * queue is the source of truth, so a waiting activity can restart on any worker. */
@@ -112,8 +115,9 @@ export class RunnerPoolService {
     const seconds = Math.max(0, (endedAt - startedAt) / 1000);
     // E2B runner leases reserve concurrency; they are not billing intervals.
     // Its sandboxes auto-pause independently and report exact executions through
-    // lifecycle events, reconciled by WorldLifecycleManager below.
-    if (billedProvider === 'e2b') return;
+    // lifecycle events, reconciled by WorldLifecycleManager below; Fly and
+    // Hetzner report their machines' runs and volumes the same way.
+    if (PROVIDER_METERED.has(billedProvider)) return;
     (await this.store.recordUsage({ id: `usage:${leaseId}`, organizationId: lease.organizationId, projectId: lease.projectId,
       taskId: lease.taskId, worldId: lease.worldId, provider: billedProvider, kind: 'world.active', quantity: seconds,
       unit: 'second', costMicros: Math.round(seconds * costMicrosPerSecond(billedProvider, lease.cpu, lease.memoryMb, lease.gpu)),
@@ -288,6 +292,7 @@ export class WorldLifecycleManager {
     for (const [key, probedAt] of this.probedAt)
       if (probedAt < now - Math.max(2 * reconcileAfter, 60_000)) this.probedAt.delete(key);
     await this.step('orphan sandboxes', () => this.reapOrphanSandboxes());
+    await this.step('provider upkeep', () => this.housekeepProviders());
     let hibernated = 0;
     const parked = await this.store.listWorldInstances('parked');
     const parkedIds = new Set(parked.map(candidate => candidate.handle.id));
@@ -319,6 +324,20 @@ export class WorldLifecycleManager {
       const resize = recorded && config && !sameMachine(recorded, machineShape(config))
         ? { from: recorded, to: machineShape(config) } : undefined;
       if (!project || (!resize && candidate.updatedAt > now - after)) continue;
+      // A VM world keeps its disk across any size: grow it in place, never
+      // hibernate it for a new size (which would drop its ignored files).
+      const provider = this.worlds.get(candidate.handle.kind);
+      if (resize && provider.resize) {
+        await this.worlds.withOperation(candidate.handle.id, async () => {
+          const current = await this.store.worldStateSnapshot(candidate.handle.id);
+          if (current?.state !== 'parked' || current.generation !== (candidate.handle.generation ?? 1)) return;
+          const result = await provider.resize!(candidate.handle as any, resize.to);
+          await this.store.updateWorldMeta(candidate.handle, { computer: resize.to, machine: result.machine });
+          await this.recordLifecycle(candidate.handle, 'world.resized', { from: resize.from, to: resize.to, inPlace: true });
+          await this.checkpoints.addNotice?.(candidate.handle.id, inPlaceResizeNotice(resize.to));
+        });
+        continue;
+      }
       // Selection is only a hint: a gateway or activity can resume this world
       // while the sweep awaits another provider. Own the complete destructive
       // transition, and recheck after every potentially slow preparation step.
@@ -431,16 +450,19 @@ export class WorldLifecycleManager {
                 continue;
               }
               const seconds = event.activeMs / 1000;
+              const disk = event.kind === 'disk';
               (await this.store.recordUsage({ id,
                 organizationId: owner,
                 ...attributed,
-                provider: provider.kind, kind: 'world.active', quantity: seconds, unit: 'second',
+                provider: provider.kind, kind: disk ? 'world.disk' : 'world.active', quantity: seconds, unit: 'second',
                 fundingSource: 'byok',
-                costMicros: Math.round(seconds * costMicrosPerSecond(provider.kind,
+                // The provider's own price when it reports one (Fly, Hetzner); karmax's rates otherwise.
+                costMicros: event.costMicros ?? Math.round(seconds * costMicrosPerSecond(provider.kind,
                   event.cpu, event.memoryMb, event.gpu ?? 0)),
                 startedAt: event.startedAt, endedAt: event.endedAt,
                 metadata: { source: 'provider-lifecycle', executionId: event.id,
-                  sandboxId: event.sandboxId, cpu: event.cpu, memoryMb: event.memoryMb, gpu: event.gpu ?? 0 },
+                  sandboxId: event.sandboxId, cpu: event.cpu, memoryMb: event.memoryMb, gpu: event.gpu ?? 0,
+                  ...(event.diskGb !== undefined ? { diskGb: event.diskGb } : {}) },
               }));
               recorded.set(id, { organizationId: owner, ...(attributed.taskId ? { taskId: attributed.taskId } : {}) });
             }
@@ -530,6 +552,16 @@ export class WorldLifecycleManager {
     }
   }
 
+  /** Each provider's own periodic upkeep, once per connected organization. */
+  private async housekeepProviders(): Promise<void> {
+    for (const provider of this.worlds.housekept()) {
+      for (const organization of await this.store.listOrganizations()) {
+        if (!(await this.store.getWorldProviderConnection(organization.id, provider.kind))?.enabled) continue;
+        await this.step(`upkeep ${provider.kind} ${organization.id}`, () => provider.housekeep!(organization.id));
+      }
+    }
+  }
+
   private async recordLifecycle(handle: WorldHandleRef, type: string, payload: Record<string, unknown>): Promise<void> {
     if (!(await this.store.taskMetadata(handle.id))) return;
     (await this.store.appendEvent({ taskId: handle.id, type, ts: Date.now(), payload: {
@@ -544,6 +576,12 @@ function resizeNotice(shape: MachineShape): string {
   return `This task's computer was resized to ${describeMachine(shape)}. You are on a new machine with the same files your `
     + 'repositories track, and the same uncommitted changes. Git-ignored files (installed dependencies, build output, caches) and '
     + 'running processes did not carry over: reinstall or restart what you need.';
+}
+
+/** What the agent hears after its VM world was resized in place. */
+function inPlaceResizeNotice(shape: MachineShape): string {
+  return `This task's computer was resized to ${describeMachine(shape)}, in place: every file is where you left it, `
+    + 'including Git-ignored ones (dependencies, build output, caches). Only running processes did not carry over.';
 }
 
 const HIBERNATE_RETRY_MS = 5 * 60_000;

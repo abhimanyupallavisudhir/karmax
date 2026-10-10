@@ -1475,8 +1475,12 @@ const localWorldPath = (v) => (hostLocal() && v.worldPath) || '';
 // Parameters tab. The value is sparse ({provider, cpu, memoryMb, diskGb, flavor,
 // hibernateAfterDays, network}); the block shows the effective machine and a
 // form stores only what differs from what it inherits.
-const COMPUTER_PROVIDER_LABELS = { e2b: 'E2B', daytona: 'Daytona', worktree: 'This machine', container: 'Docker container' };
+const COMPUTER_PROVIDER_LABELS = { e2b: 'E2B', daytona: 'Daytona', fly: 'Fly.io', hetzner: 'Hetzner', worktree: 'This machine', container: 'Docker container' };
 const E2B_MAX_DISK_GB = 50;
+// The largest disk each provider can give one computer (Fly volumes 500 GB,
+// Hetzner volumes 10 TB); others are bounded only by the account.
+const COMPUTER_DISK_MAX_GB = { e2b: E2B_MAX_DISK_GB, fly: 500, hetzner: 10240 };
+const computerDiskMax = (provider) => COMPUTER_DISK_MAX_GB[provider] || 2048;
 // The providers a task can run on here: the organization's connected cloud
 // computers, plus this machine when self-hosted.
 function computerProviderOptions(current) {
@@ -1498,7 +1502,7 @@ function computerBlockHtml(name, value, inherited, opts = {}) {
       <select class="cf-provider" aria-label="Provider" ${fixed}>${computerProviderOptions(provider).map((p) => `<option value="${esc(p)}" ${p === provider ? 'selected' : ''}>${esc(COMPUTER_PROVIDER_LABELS[p] || p)}</option>`).join('')}</select>
       <label class="computer-size"><input class="cf-cpu" type="number" min="1" max="64" step="1" inputmode="numeric" value="${esc(v.cpu ?? '')}" placeholder="2" aria-label="CPU"><span>CPU</span></label>
       <label class="computer-size"><input class="cf-memory" type="number" min="0.5" max="256" step="0.5" inputmode="decimal" value="${esc(gbOf(v.memoryMb))}" placeholder="2" aria-label="Memory in GB"><span>GB RAM</span></label>
-      <label class="computer-size"><input class="cf-disk" type="number" min="1" ${provider === 'e2b' ? `max="${E2B_MAX_DISK_GB}"` : 'max="2048"'} step="1" inputmode="numeric" value="${esc(v.diskGb ?? '')}" placeholder="Default" aria-label="Disk in GB"><span>GB disk</span></label>
+      <label class="computer-size"><input class="cf-disk" type="number" min="1" max="${computerDiskMax(provider)}" step="1" inputmode="numeric" value="${esc(v.diskGb ?? '')}" placeholder="Default" aria-label="Disk in GB"><span>GB disk</span></label>
     </div>
     <details class="computer-more"${opts.open ? ' open' : ''}><summary>More</summary><div class="computer-more-grid">
       <label class="form-row"><span>Experience ${policyTip('Desktop adds a screen you can watch and take over.')}</span><select class="cf-flavor" ${fixed}>
@@ -1564,7 +1568,7 @@ function resetComputerBlock(box, attr = 'data-inherit') {
 function syncComputerBlock(box) {
   const provider = box.querySelector('.cf-provider')?.value;
   const disk = box.querySelector('.cf-disk');
-  if (disk) disk.max = provider === 'e2b' ? String(E2B_MAX_DISK_GB) : '2048';
+  if (disk) disk.max = String(computerDiskMax(provider));
   const allowlist = box.querySelector('.cf-allowlist');
   if (allowlist) allowlist.hidden = box.querySelector('.cf-network')?.value !== 'restricted';
 }
@@ -5016,7 +5020,7 @@ function renderOnboarding() {
     <ol class="onboarding-list">
       ${onboardingStep(1, 'github', 'Connect GitHub', `Import repositories and let ${siteNameMarkup()} work through reviewed pull requests.`, `<a class="btn sm" data-spa href="${settings}#settings-code">${state.steps.github.complete ? 'Manage GitHub' : 'Connect GitHub'}</a>`)}
       ${onboardingStep(2, 'agentLogin', 'Add agent logins', 'Connect at least one usable Codex, Claude, or API-key account.', `<a class="btn sm" data-spa href="${settings}#settings-agents">${state.steps.agentLogin.complete ? 'Manage agent logins' : 'Add agent login'}</a>`)}
-      ${onboardingStep(3, 'e2b', 'Add an E2B or Daytona API key', 'Enable secure cloud worlds where hosted agents do their work.', `<a class="btn sm" data-spa href="${settings}#settings-computers">${state.steps.e2b.complete ? 'Manage E2B/Daytona' : 'Set up E2B/Daytona'}</a>`)}
+      ${onboardingStep(3, 'e2b', 'Connect a cloud computer', 'Add an E2B, Daytona, Fly.io or Hetzner key: your agents work on its computers.', `<a class="btn sm" data-spa href="${settings}#settings-computers">${state.steps.e2b.complete ? 'Manage computers' : 'Connect a computer'}</a>`)}
       ${onboardingStep(4, 'optional', 'Connect apps and payment cards', 'Connect services and give agents approved access to passwords and purchases. This never blocks setup.', `<a class="btn sm" data-spa href="${settings}#settings-payments">${optional.vault || optional.card ? 'Manage apps &amp; cards' : 'Set up apps &amp; cards'}</a>`)}
       ${onboardingStep(5, 'paidPlan', 'Buy paid plan', 'Choose a paid subscription for this workspace, or keep using Free. This never blocks setup.', `<a class="btn sm" data-spa href="${settings}#settings-plan">${state.steps.paidPlan?.complete ? 'Manage paid plan' : 'View plans &amp; billing'}</a>`)}
       ${onboardingStep(6, 'project', 'Create your first project', 'Start a real task list and connect the code your agents will work on.', `<button class="btn sm ${state.steps.project.complete ? '' : 'primary'}" id="onboarding-new-project" type="button">${state.steps.project.complete ? 'Create another project' : 'Create project'}</button>`)}
@@ -20352,6 +20356,12 @@ const COMPUTER_PROVIDERS = {
     advanced: [['snapshot', 'Headless snapshot', 'Daytona default'], ['image', 'Headless image', 'used when no snapshot'],
       ['desktopSnapshot', 'Desktop snapshot', 'Daytona default'], ['desktopImage', 'Desktop image', 'used when no desktop snapshot'],
       ['apiUrl', 'API URL', 'https://app.daytona.io/api'], ['target', 'Target', 'provider default']] },
+  fly: { name: 'Fly.io', keys: 'https://fly.io/dashboard/personal/tokens',
+    tip: 'Disks up to 500 GB that grow in place and survive pauses. You pay per second while it works, and for the disk while it exists.',
+    advanced: [['region', 'Region', 'fra'], ['organization', 'Organization', 'personal'], ['image', 'Image', 'debian:bookworm']] },
+  hetzner: { name: 'Hetzner', keys: 'https://console.hetzner.cloud/projects',
+    tip: 'The cheapest: disks up to 10 TB that grow in place and survive pauses, in EU data centres. Use a Read & Write project token.',
+    advanced: [['region', 'Location', 'fsn1'], ['image', 'Image', 'karmax snapshot, else debian-12']] },
 };
 function computerConnectionState(connection) {
   if (!connection) return { label: 'not connected', tone: '' };
@@ -20860,7 +20870,7 @@ async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
       ]);
       if (!live('usage')) return;
       $('#org-plan').innerHTML = organizationPlanMarkup(entitlements);
-      const usageSync = (usage?.sync || []).filter((item) => item.provider === 'e2b');
+      const usageSync = (usage?.sync || []).filter((item) => ['e2b', 'fly', 'hetzner'].includes(item.provider));
       const usageSyncLabel = usageSync.some((item) => item.status === 'error') ? ' · sync unavailable'
         : usageSync.some((item) => item.status === 'pending') ? ' · first sync pending'
           : usageSync.length ? ` · synced ${fmtAgo(Math.max(...usageSync.map((item) => Number(item.at || 0))))}` : '';

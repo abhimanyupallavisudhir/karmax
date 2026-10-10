@@ -28,7 +28,7 @@ async function assertProvider(providerConnections: WorldProviderConnectionServic
   provider: string | undefined, hosted: boolean): Promise<void> {
   if (!provider) return;
   if (LOCAL.includes(provider)) {
-    if (hosted) throw new Error('hosted tasks run on a cloud computer (E2B or Daytona)');
+    if (hosted) throw new Error('hosted tasks run on a cloud computer (E2B, Daytona, Fly.io or Hetzner)');
     return;
   }
   if (providerConnections && !(await providerConnections.available(organizationId, provider)))

@@ -9191,6 +9191,8 @@ function rowToWorldProviderConnection(r: any): WorldProviderConnection {
 function providerDisplayName(provider: string): string {
   if (provider === 'e2b') return 'E2B';
   if (provider === 'daytona') return 'Daytona';
+  if (provider === 'fly') return 'Fly.io';
+  if (provider === 'hetzner') return 'Hetzner Cloud';
   return provider.charAt(0).toUpperCase() + provider.slice(1);
 }
 

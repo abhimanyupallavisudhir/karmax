@@ -2,6 +2,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { parseEnv } from 'node:util';
 import { launchConfig } from '../launch/legal.js';
+import { CLOUD_WORLD_PROVIDERS } from '../domain/computer.js';
 
 export interface DeploymentConfig {
   hosted: boolean;
@@ -55,7 +56,7 @@ const SECRET_FILE_ENV = [
   'STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET',
   'KARMAX_GITHUB_APP_PRIVATE_KEY', 'KARMAX_GITHUB_WEBHOOK_SECRET',
   'KARMAX_GITHUB_CLIENT_SECRET',
-  'E2B_API_KEY', 'DAYTONA_API_KEY', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY',
+  'E2B_API_KEY', 'DAYTONA_API_KEY', 'FLY_API_TOKEN', 'HCLOUD_TOKEN', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY',
   'ARTIFICIAL_ANALYSIS_API_KEY',
 ] as const;
 
@@ -137,7 +138,8 @@ export function validateDeployment(env: NodeJS.ProcessEnv = process.env): Deploy
     for (const name of ['KARMAX_S3_ENDPOINT', 'KARMAX_S3_BUCKET', 'KARMAX_S3_ACCESS_KEY_ID', 'KARMAX_S3_SECRET_ACCESS_KEY'])
       if (!env[name]) failures.push(`${name} is required when KARMAX_OBJECT_STORE=s3`);
   }
-  if (!['e2b', 'daytona'].includes(config.cloudWorldProvider!)) failures.push('KARMAX_CLOUD_WORLD_PROVIDER must be e2b or daytona');
+  if (!(CLOUD_WORLD_PROVIDERS as readonly string[]).includes(config.cloudWorldProvider!))
+    failures.push(`KARMAX_CLOUD_WORLD_PROVIDER must be ${CLOUD_WORLD_PROVIDERS.join(', ').replace(/, (?=[^,]*$)/, ' or ')}`);
   const launch = launchConfig(env);
   if (launch.paidLaunch && !launch.ready)
     failures.push(`KARMAX_PAID_LAUNCH=1 requires the explicit launch checklist: ${launch.missing.join(', ')}`);
