@@ -179,7 +179,7 @@ export class GitProfiles {
    */
   async save(args: { name: string; userName: string; userEmail: string; sshKey?: string; signingKey?: string;
     githubToken?: string; github?: { id: string; login: string; name?: string };
-    customIdentity?: { userName?: string; userEmail?: string }; clearSigningKey?: boolean }): Promise<GitProfile> {
+    customIdentity?: { userName?: string; userEmail?: string }; clearSigningKey?: boolean; clearGithubToken?: boolean }): Promise<GitProfile> {
     return this.store.transaction(async () => {
     await this.lockProfiles();
     const userId = userIdOfScope(this.organizationId);
@@ -200,7 +200,7 @@ export class GitProfiles {
       ...(args.customIdentity ? { customIdentity: args.customIdentity } : {}),
     };
     for (const [kind, value, flag] of secrets) {
-      if (kind === 'signing' && args.clearSigningKey) {
+      if ((kind === 'signing' && args.clearSigningKey) || (kind === 'token' && args.clearGithubToken)) {
         (await this.broker?.deleteHandle(gitHandle(name, kind, this.organizationId)));
       } else if (value?.trim()) {
         (await this.requireBroker().registerHandle(gitHandle(name, kind, this.organizationId), value.trim(), gitProfileVaultScope(this.organizationId)));
@@ -276,6 +276,22 @@ export class GitProfiles {
       ...(Object.keys(customIdentity).length ? { customIdentity } : {}),
       signingKey: args.signingKey,
       clearSigningKey: args.removeSigningKey,
+    }));
+
+    });
+  }
+
+  /** The person's own GitHub token for a connected account. The App acts only
+   * where it is installed; this token lets tavya open pull requests on
+   * repositories the person forked. `undefined` removes it. */
+  async saveGithubToken(accountId: string, token: string | undefined): Promise<GitProfile> {
+    return this.store.transaction(async () => {
+    const profile = (await this.githubProfile(accountId));
+    if (!profile?.github) throw new Error('Connect GitHub before adding a token');
+    return (await this.save({
+      name: profile.name, userName: profile.userName, userEmail: profile.userEmail,
+      github: profile.github, ...(profile.customIdentity ? { customIdentity: profile.customIdentity } : {}),
+      githubToken: token, clearGithubToken: !token,
     }));
 
     });

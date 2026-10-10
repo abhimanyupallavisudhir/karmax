@@ -53,6 +53,7 @@ jobs:
           LIVE_DAYTONA_API_KEY: ${{ secrets.LIVE_DAYTONA_API_KEY }}
           LIVE_OPENCODE_ANTHROPIC_API_KEY: ${{ secrets.LIVE_OPENCODE_ANTHROPIC_API_KEY }}
           LIVE_GITHUB_TOKEN: ${{ secrets.LIVE_GITHUB_TOKEN }}
+          LIVE_GITHUB_FORK_TOKEN: ${{ secrets.LIVE_GITHUB_FORK_TOKEN }}
         run: |
           # decide SUITE SECRET...: the suite runs when selected and any of its secrets is set.
           decide() {
@@ -68,7 +69,7 @@ jobs:
           decide claude LIVE_CLAUDE_CODE_OAUTH_TOKEN
           decide e2b LIVE_E2B_API_KEY
           decide daytona LIVE_DAYTONA_API_KEY
-          decide github LIVE_GITHUB_TOKEN
+          decide github LIVE_GITHUB_TOKEN LIVE_GITHUB_FORK_TOKEN
 
   models:
     name: model providers
@@ -184,3 +185,10 @@ jobs:
         env:
           KARMAX_RUN_LIVE: '1'
           GH_TOKEN: ${{ secrets.LIVE_GITHUB_TOKEN }}
+      # A classic public_repo token of the fork's owner, who also owns the
+      # App-less upstream organization (wiki features/fork-contributions).
+      - run: npx vitest run tests/github-fork-live.test.ts
+        if: ${{ !cancelled() }}
+        env:
+          KARMAX_RUN_LIVE: '1'
+          LIVE_GITHUB_FORK_TOKEN: ${{ secrets.LIVE_GITHUB_FORK_TOKEN }}

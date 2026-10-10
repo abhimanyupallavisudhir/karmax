@@ -608,6 +608,80 @@ describe('GitHub App integration', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  it('records the repository a fork was made from and syncs the fork through the installation', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-fork-'));
+    const store = (await Store.create(':memory:'));
+    const broker = new CredentialBroker(new Vault(dir));
+    const { privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048,
+      privateKeyEncoding: { format: 'pem', type: 'pkcs8' }, publicKeyEncoding: { format: 'pem', type: 'spki' } });
+    (await broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey, INSTALLATION_SCOPE));
+    const organization = (await store.createOrganization({ name: 'Jane', ownerUserId: 'jane' }));
+    const calls: Array<{ path: string; method: string; body?: any; auth?: string }> = [];
+    let syncStatus = 200;
+    const fakeFetch = async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      const body = typeof init.body === 'string' ? JSON.parse(init.body) : undefined;
+      calls.push({ path: url.pathname, method: init.method ?? 'GET', body, auth: new Headers(init.headers).get('authorization') ?? undefined });
+      if (url.pathname === '/app/installations/42') return Response.json({ id: 42, account: { login: 'jane', type: 'User' } });
+      if (url.pathname === '/app/installations/42/access_tokens') return Response.json({ token: 'installation-token', expires_at: new Date(Date.now() + 3600_000).toISOString() });
+      if (url.pathname === '/installation/repositories') return Response.json({ repositories: [
+        { id: 7, name: 'widgets', private: false, fork: true, ssh_url: 'git@github.com:jane/widgets.git', default_branch: 'main', owner: { login: 'jane' } },
+        { id: 8, name: 'own', private: true, ssh_url: 'git@github.com:jane/own.git', default_branch: 'main', owner: { login: 'jane' } },
+      ] });
+      if (url.pathname === '/repos/jane/widgets') return Response.json({ id: 7, name: 'widgets', fork: true,
+        parent: { id: 1, name: 'widgets', private: false, ssh_url: 'git@github.com:acme/widgets.git', default_branch: 'trunk', owner: { login: 'acme' } } });
+      if (url.pathname === '/repos/jane/widgets/merge-upstream') return syncStatus === 200
+        ? Response.json({ message: 'Successfully fetched and fast-forwarded from upstream acme:trunk.', merge_type: 'fast-forward', base_branch: 'acme:trunk' })
+        : Response.json({ message: 'There are merge conflicts' }, { status: syncStatus });
+      return new Response('not found', { status: 404 });
+    };
+    const service = (await GitHubAppService.create(store, broker, { appId: '123', appSlug: 'karmax-test', fetch: fakeFetch as typeof fetch }));
+    const connected = await service.connectInstallation(organization.id, '42');
+    const fork = connected.repositories.find((repository) => repository.name === 'widgets')!;
+    const own = connected.repositories.find((repository) => repository.name === 'own')!;
+    expect(fork.upstream).toEqual({ owner: 'acme', name: 'widgets', defaultBranch: 'trunk', private: false });
+    expect(own.upstream).toBeUndefined();
+    expect((await store.getRepository(fork.id))?.upstream).toEqual(fork.upstream);
+    // The parent is read once; later reconciles reuse it.
+    await service.reconcile(connected.connection);
+    expect(calls.filter((call) => call.path === '/repos/jane/widgets')).toHaveLength(1);
+
+    await expect(service.syncFork(fork, 'trunk')).resolves.toMatchObject({ synced: true });
+    const sync = calls.find((call) => call.path === '/repos/jane/widgets/merge-upstream')!;
+    expect(sync).toMatchObject({ method: 'POST', body: { branch: 'trunk' }, auth: 'Bearer installation-token' });
+    syncStatus = 409;
+    await expect(service.syncFork(fork, 'trunk')).resolves.toMatchObject({ synced: false, detail: expect.stringMatching(/409/) });
+    await expect(service.syncFork(own, 'main')).resolves.toMatchObject({ synced: false });
+    (await store.close());
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('accepts a personal token only for the same account, as a classic token that can contribute to forks', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-personal-token-'));
+    const store = (await Store.create(':memory:'));
+    const broker = new CredentialBroker(new Vault(dir));
+    const users: Record<string, { id: number; login: string; scopes?: string }> = {
+      'ghp_jane': { id: 7, login: 'jane', scopes: 'public_repo, read:org' },
+      'ghp_repo': { id: 7, login: 'jane', scopes: 'repo' },
+      'ghp_other': { id: 8, login: 'mallory', scopes: 'repo' },
+      'github_pat_fine': { id: 7, login: 'jane' },
+    };
+    const fakeFetch = async (input: string | URL | Request, init: RequestInit = {}) => {
+      const token = (new Headers(init.headers).get('authorization') ?? '').replace('Bearer ', '');
+      const user = users[token];
+      if (new URL(String(input)).pathname !== '/user' || !user) return new Response('Bad credentials', { status: 401 });
+      return Response.json({ id: user.id, login: user.login }, { headers: user.scopes ? { 'x-oauth-scopes': user.scopes } : {} });
+    };
+    const service = (await GitHubAppService.create(store, broker, { appId: '123', appSlug: 'karmax-test', fetch: fakeFetch as typeof fetch }));
+    await expect(service.verifyPersonalToken('7', 'ghp_jane')).resolves.toBeUndefined();
+    await expect(service.verifyPersonalToken('7', 'ghp_repo')).resolves.toBeUndefined();
+    await expect(service.verifyPersonalToken('7', 'ghp_other')).rejects.toThrow(/belongs to mallory/);
+    await expect(service.verifyPersonalToken('7', 'github_pat_fine')).rejects.toThrow(/classic token/);
+    await expect(service.verifyPersonalToken('7', 'nope')).rejects.toThrow(/401/);
+    (await store.close());
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   it('turns verified pull-request deliveries into karmax task events', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-pr-hook-'));
     const store = (await Store.create(':memory:'));

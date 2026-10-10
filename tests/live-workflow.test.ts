@@ -88,6 +88,7 @@ describe('live-test workflow', () => {
       expect(decide({ LIVE_E2B_API_KEY: 'e2b' })).toEqual({ ...none, e2b: 'true' });
       expect(decide({ LIVE_OPENAI_API_KEY: 'sk' })).toEqual({ ...none, models: 'true', agent: 'true' });
       expect(decide({ LIVE_ANTHROPIC_API_KEY: 'sk-ant' })).toEqual({ ...none, models: 'true' });
+      expect(decide({ LIVE_GITHUB_FORK_TOKEN: 'ghp' })).toEqual({ ...none, github: 'true' });
       const all = Object.fromEntries(Object.keys(plan.env!).filter((key) => key.startsWith('LIVE_')).map((key) => [key, 'set']));
       expect(decide(all)).toEqual(Object.fromEntries(suites.map(([name]) => [name, 'true'])));
     });

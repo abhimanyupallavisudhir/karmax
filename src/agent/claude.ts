@@ -898,8 +898,23 @@ export class ClaudeAdapter implements AgentAdapter {
               title: text,
             });
           }
-          for (const block of content) {
-            if (block?.type === 'tool_use') {
+          // Thinking blocks Claude Code lists here are the server's summaries of the
+          // prose the agent wrote between tool calls, not its reasoning: an answer
+          // to a person given before a pause arrives this way (indike.org#2).
+          const frame = message as { narration_block_indexes?: unknown; uuid?: unknown };
+          const narration = new Set<unknown>(Array.isArray(frame.narration_block_indexes) ? frame.narration_block_indexes : []);
+          for (const [index, block] of content.entries()) {
+            const narrated = block?.type === 'thinking' && narration.has(index)
+              ? String(block.thinking ?? '').trim() : '';
+            if (narrated) {
+              ctx.emitActivity({
+                id: String(block.signature ?? `${frame.uuid ?? 'narration'}-${index}`),
+                kind: 'message',
+                phase: 'completed',
+                title: narrated,
+              });
+            }
+            else if (block?.type === 'tool_use') {
               const activity = claudeToolActivity(block, 'started');
               toolActivities.set(activity.id, activity);
               toolNames.set(activity.id, String(block.name ?? ''));

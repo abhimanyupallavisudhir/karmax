@@ -1155,6 +1155,8 @@ export class Store {
     // installs pick it up without a re-create.
     const eventCols = await this.db.prepare('PRAGMA table_info(events)').all() as { name: string }[];
     if (!eventCols.some(column => column.name === 'origin')) await this.db.exec('ALTER TABLE events ADD COLUMN origin TEXT');
+    const repositoryCols = await this.db.prepare('PRAGMA table_info(repositories)').all() as { name: string }[];
+    if (!repositoryCols.some(column => column.name === 'upstream')) await this.db.exec('ALTER TABLE repositories ADD COLUMN upstream TEXT');
     const candidateCols = await this.db.prepare('PRAGMA table_info(resource_candidates)').all() as { name: string }[];
     if (!candidateCols.some(column => column.name === 'error')) await this.db.exec('ALTER TABLE resource_candidates ADD COLUMN error TEXT');
     const cols = (await this.db.prepare('PRAGMA table_info(tasks)').all()) as any[];
@@ -3280,13 +3282,13 @@ export class Store {
       .run(input.owner, input.name, byProvider.id);
     const now = Date.now();
     const repository: Repository = { ...input, id: existing?.id ?? input.id ?? newId('repo'), createdAt: existing?.createdAt ?? now, updatedAt: now };
-    (await this.db.prepare(`INSERT INTO repositories (id, organizationId, provider, providerId, owner, name, sshUrl, defaultBranch, private, gitConnectionId, createdAt, updatedAt)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(organizationId, provider, owner, name) DO UPDATE SET
+    (await this.db.prepare(`INSERT INTO repositories (id, organizationId, provider, providerId, owner, name, sshUrl, defaultBranch, private, gitConnectionId, upstream, createdAt, updatedAt)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(organizationId, provider, owner, name) DO UPDATE SET
       providerId=excluded.providerId, sshUrl=excluded.sshUrl, defaultBranch=excluded.defaultBranch,
-      private=excluded.private, gitConnectionId=excluded.gitConnectionId, updatedAt=excluded.updatedAt`)
+      private=excluded.private, gitConnectionId=excluded.gitConnectionId, upstream=excluded.upstream, updatedAt=excluded.updatedAt`)
       .run(repository.id, repository.organizationId, repository.provider, repository.providerId ?? null, repository.owner, repository.name,
         repository.sshUrl, repository.defaultBranch, repository.private ? 1 : 0, repository.gitConnectionId ?? null,
-        repository.createdAt, repository.updatedAt));
+        repository.upstream ? JSON.stringify(repository.upstream) : null, repository.createdAt, repository.updatedAt));
     return repository;
   
     });
@@ -3372,7 +3374,7 @@ export class Store {
    *  `purpose: 'manifest'` marks the App-creation flow, the only one whose
    *  callback may configure the installation-wide App (see the gateway). */
   async createGithubInstallState(organizationId: string, userId: string,
-    options: number | { ttlMs?: number; returnTo?: 'profile' | 'installation'; githubAccountId?: string;
+    options: number | { ttlMs?: number; returnTo?: 'profile' | 'installation' | 'connection'; githubAccountId?: string;
       githubLogin?: string; selectAccount?: boolean; purpose?: 'manifest' } = {}): Promise<string> {
     return this.db.transaction(async () => {
 
@@ -3380,7 +3382,7 @@ export class Store {
     const state = `kg_${crypto.randomBytes(32).toString('base64url')}`;
     const now = Date.now();
     const ttlMs = typeof options === 'number' ? options : options.ttlMs ?? 10 * 60_000;
-    const returnTo = typeof options === 'object' && ['profile', 'installation'].includes(options.returnTo ?? '') ? options.returnTo : undefined;
+    const returnTo = typeof options === 'object' && ['profile', 'installation', 'connection'].includes(options.returnTo ?? '') ? options.returnTo : undefined;
     const githubAccountId = typeof options === 'object' ? options.githubAccountId?.trim() : undefined;
     const githubLogin = typeof options === 'object' ? options.githubLogin?.trim() : undefined;
     const selectAccount = typeof options === 'object' && options.selectAccount;
@@ -3396,7 +3398,7 @@ export class Store {
     });
   }
 
-  async consumeGithubInstallState(state: string, userId: string): Promise<{ organizationId: string; returnTo?: 'profile' | 'installation';
+  async consumeGithubInstallState(state: string, userId: string): Promise<{ organizationId: string; returnTo?: 'profile' | 'installation' | 'connection';
     githubAccountId?: string; githubLogin?: string; selectAccount?: boolean; purpose?: 'manifest' } | undefined> {
     return this.db.transaction(async () => {
 
@@ -3417,6 +3419,7 @@ export class Store {
         organizationId: String(row.organizationId),
         ...(row.returnTo === 'profile' ? { returnTo: 'profile' as const } : {}),
         ...(row.returnTo === 'installation' ? { returnTo: 'installation' as const } : {}),
+        ...(row.returnTo === 'connection' ? { returnTo: 'connection' as const } : {}),
         ...(row.githubAccountId ? { githubAccountId: String(row.githubAccountId) } : {}),
         ...(row.githubLogin ? { githubLogin: String(row.githubLogin) } : {}),
         ...(row.selectAccount ? { selectAccount: true } : {}),
@@ -9718,6 +9721,7 @@ function rowToRepository(r: any): Repository {
   return { id: r.id, organizationId: r.organizationId, provider: r.provider, providerId: r.providerId ?? undefined,
     owner: r.owner, name: r.name, sshUrl: r.sshUrl, defaultBranch: r.defaultBranch,
     private: Boolean(r.private), gitConnectionId: r.gitConnectionId ?? undefined,
+    ...(r.upstream ? { upstream: JSON.parse(r.upstream) } : {}),
     createdAt: r.createdAt, updatedAt: r.updatedAt };
 }
 

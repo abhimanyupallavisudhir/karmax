@@ -8,7 +8,7 @@ import { INSTALLATION_SCOPE, organizationScope } from '../autonomy/vault-keys.js
 import { newId } from '../util/id.js';
 import { beginOAuth, finishOAuth, connectionHeaders, leasedOAuthRefresh, type OAuthVault, type OAuthTarget } from '../mcp/connections/oauth.js';
 import { RefreshLeases } from '../autonomy/refresh-lease.js';
-import { openRemoteMcp, remoteMcpAuth, type RemoteMcpTransport } from '../mcp/connections/remote.js';
+import { authorizesWithGitHub, openRemoteMcp, remoteMcpAuth, type RemoteMcpTransport } from '../mcp/connections/remote.js';
 import { registryServer } from '../mcp/connections/registry.js';
 import { validateTransport } from '../mcp/connections/store.js';
 
@@ -41,8 +41,18 @@ export interface ServiceConnection {
   revision?: string;
   notifiedAt?: number;
 }
-export interface McpServer extends RemoteMcpTransport { auth: 'oauth' | 'none'; registry?: { name: string; version: string } }
+/** `github`: the server authorizes through GitHub, so the owner signs in with
+ * the installation's GitHub App; `githubAccountId` pins the account used. */
+export interface McpServer extends RemoteMcpTransport { auth: 'oauth' | 'none' | 'github'; githubAccountId?: string; registry?: { name: string; version: string } }
 type OpenMcp = typeof openRemoteMcp;
+/** The installation's GitHub App, as a person's GitHub sign-in. */
+export interface GitHubSignIn {
+  /** The person's signed-in GitHub account (their active one), if any. */
+  account(userId: string): Promise<string | undefined>;
+  token(userId: string, accountId: string): Promise<string>;
+  /** Where the person signs in to GitHub; returning finishes their pending GitHub connections. */
+  authorizationUrl(organizationId: string, userId: string): Promise<string>;
+}
 export interface ServiceTool { slug: string; name: string; description?: string; inputParameters?: unknown }
 export interface ConnectionBackend {
   catalog(search: string): Promise<Array<{ slug: string; name: string }>>;
@@ -103,7 +113,7 @@ export class ServiceConnections {
   private locks = new Map<string, Promise<unknown>>();
   constructor(private store: Store, private broker: CredentialBroker,
     private factory: (key: string) => ConnectionBackend = key => new ComposioBackend(key),
-    private openMcp: OpenMcp = openRemoteMcp) {}
+    private openMcp: OpenMcp = openRemoteMcp, private github?: GitHubSignIn) {}
   private vault: OAuthVault = {
     secret: async (c) => {
       const handle = MCP_CREDENTIALS + c.id;
@@ -124,7 +134,7 @@ export class ServiceConnections {
     },
   };
   private target(c: ServiceConnection): OAuthTarget {
-    return { id: c.id, organizationId: c.organizationId, label: c.label, auth: c.mcp!.auth,
+    return { id: c.id, organizationId: c.organizationId, label: c.label, auth: c.mcp!.auth === 'github' ? 'oauth' : c.mcp!.auth,
       transport: { type: c.mcp!.type, url: c.mcp!.url }, revision: c.revision ?? '' };
   }
 
@@ -224,6 +234,7 @@ export class ServiceConnections {
     if (prior) return prior;
     let auth: McpServer['auth'];
     try { auth = await remoteMcpAuth(server.transport); } catch { throw new ConnectionError('Could not reach that MCP server. Check its URL.', 502); }
+    if (auth === 'oauth' && await authorizesWithGitHub(server.transport)) auth = 'github';
     return this.store.transaction(async () => (await this.store.lock(`service-connections:${org}:${taskId}`), await open()) ?? (await this.save({ id: newId('conn'), organizationId: org,
       toolkit: `mcp:${server.registry?.name ?? new URL(server.transport.url).hostname}`.slice(0, 120), label: server.label.slice(0, 120),
       mcp: { ...server.transport, auth, ...(server.registry ? { registry: server.registry } : {}) },
@@ -296,12 +307,30 @@ export class ServiceConnections {
     Object.assign(c, { ownerId, grantedConnectionId: undefined, revision: crypto.randomUUID(), notifiedAt: undefined });
     (await this.broker.deleteHandle(MCP_CREDENTIALS + c.id));
     if (c.mcp!.auth === 'none') { c.status = 'active'; (await this.save(c)); (await this.audit(c, ownerId, 'connected')); return { connection: this.view(c) }; }
+    // Requests recorded before GitHub sign-in existed say `oauth`, which GitHub cannot serve.
+    if (c.mcp!.auth === 'oauth' && await authorizesWithGitHub(c.mcp!)) c.mcp!.auth = 'github';
+    if (c.mcp!.auth === 'github') {
+      if (!this.github) throw new ConnectionError('GitHub sign-in is not set up on this installation. Ask its administrator to set up the GitHub App.', 503);
+      c.mcp!.githubAccountId = undefined;
+      if (await this.signedInWithGitHub(c)) return { connection: this.view(c) };
+      c.status = 'connecting'; (await this.save(c));
+      try { return { connection: this.view(c), url: await this.github.authorizationUrl(c.organizationId, ownerId), callback: 'github' as const }; }
+      catch (e) { throw new ConnectionError(e instanceof Error ? e.message : 'GitHub sign-in is unavailable', 503); }
+    }
     if (!redirect) throw new ConnectionError('Configure the public Tavya URL before signing in to MCP servers', 503);
     c.status = 'connecting'; (await this.save(c));
     try {
       const { authorizationUrl } = await beginOAuth(this.vault, this.target(c), `user:${ownerId}`, redirect);
       return { connection: this.view(c), url: authorizationUrl, callback: 'mcp' as const };
     } catch (e) { throw new ConnectionError(e instanceof Error ? e.message : 'MCP authorization failed', 502); }
+  }
+  /** Activates a GitHub-authorized connection once its owner is signed in to GitHub. */
+  private async signedInWithGitHub(c: ServiceConnection) {
+    const accountId = await this.github?.account(c.ownerId!);
+    if (!accountId) return false;
+    Object.assign(c, { status: 'active', notifiedAt: undefined, mcp: { ...c.mcp!, githubAccountId: accountId } });
+    (await this.save(c)); (await this.audit(c, c.ownerId!, 'connected'));
+    return true;
   }
   /** Completes the owner's MCP sign-in from the browser callback's state and code. */
   async finishMcp(org: string, id: string, ownerId: string, state: unknown, code: unknown) {
@@ -320,7 +349,9 @@ export class ServiceConnections {
     return this.locked(id, async () => {
       const c = (await this.get(org, id));
       if (c.mcp) {
-        // MCP sign-in completes only through its callback; abandoned sign-ins expire.
+        // MCP sign-in completes only through its callback (or, for GitHub, the
+        // owner's GitHub sign-in); abandoned sign-ins expire.
+        if (c.status === 'connecting' && c.mcp.auth === 'github' && c.ownerId && await this.signedInWithGitHub(c)) return c;
         if (c.status === 'connecting' && Date.now() - c.updatedAt > TTL) { c.status = 'expired'; c.notifiedAt = undefined; (await this.save(c)); }
         return c;
       }
@@ -416,7 +447,11 @@ export class ServiceConnections {
   /** One bounded MCP session with the account's current credentials. Never retried. */
   private async mcpCall<T>(c: ServiceConnection, taskId: string, run: (client: Awaited<ReturnType<OpenMcp>>) => Promise<T>): Promise<T> {
     let headers: Record<string, string>;
-    try { headers = await connectionHeaders(this.vault, this.target(c), taskId); }
+    try {
+      headers = c.mcp!.auth === 'github'
+        ? { Authorization: `Bearer ${await this.github!.token(c.ownerId!, c.mcp!.githubAccountId!)}` }
+        : await connectionHeaders(this.vault, this.target(c), taskId);
+    }
     catch { throw new ConnectionError('Account access expired; reconnect it in Connections', 409); }
     let client: Awaited<ReturnType<OpenMcp>> | undefined;
     try {

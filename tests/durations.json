@@ -230,6 +230,7 @@
   "tests/github-installation-discovery.test.ts": 0.1,
   "tests/github-landing-events.test.ts": 0,
   "tests/github-live.test.ts": 0,
+  "tests/github-mcp-connection.test.ts": 0.6,
   "tests/github-merge-eligibility.test.ts": 0.1,
   "tests/github-personal-installation.test.ts": 8.7,
   "tests/github-pr-client.test.ts": 0.1,
