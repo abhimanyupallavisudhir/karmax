@@ -20435,12 +20435,24 @@ function computerConnectionState(connection) {
   if (connection.status === 'ready') return { label: 'connected', tone: 'done' };
   return { label: connection.status === 'error' ? 'failing' : String(connection.status || 'unverified'), tone: 'failed' };
 }
+// "≤ 8 CPU · 8 GB · 29 GB disk": the most one computer on this account may be.
+function computerLimitsSummary(provider, limits) {
+  const parts = [limits.cpu != null ? `${limits.cpu} CPU` : '', limits.memoryMb != null ? `${gbOf(limits.memoryMb)} GB` : '',
+    limits.diskGb != null ? `${limits.diskGb} GB disk` : ''].filter(Boolean);
+  if (!parts.length) return '';
+  const name = COMPUTER_PROVIDERS[provider]?.name || provider;
+  const guessed = Object.values(limits.source || {}).includes('default');
+  const tip = `The most one computer may have on this ${name} account${limits.checkedAt ? `, as ${name} said on ${new Date(limits.checkedAt).toLocaleDateString()}` : ''}.`
+    + (guessed ? ` Some are ${name}'s documented defaults; set them under ✎ → Advanced if its support raised them.` : '');
+  return `<span class="setting-muted computer-limits" title="${esc(tip)}">≤ ${esc(parts.join(' · '))}</span>`;
+}
 function computersMarkup(connections) {
   return `<div class="computer-providers">${Object.entries(COMPUTER_PROVIDERS).map(([id, info]) => {
     const connection = connections.find((candidate) => candidate.provider === id);
     const state = computerConnectionState(connection);
     return `<div class="computer-provider" data-provider="${id}"><b>${esc(info.name)}</b>
       <span class="chip ${state.tone}"${connection?.lastError ? ` title="${esc(connection.lastError)}"` : ''}>${esc(state.label)}</span>
+      ${connection?.limits ? computerLimitsSummary(id, connection.limits) : ''}
       <span class="label-row-fill"></span>
       ${connection ? `<button class="icon-btn computer-edit" type="button" title="Edit ${esc(info.name)}" aria-label="Edit ${esc(info.name)}">✎</button>
         <button class="btn sm computer-test" type="button">Test</button>`
@@ -20481,6 +20493,12 @@ function openComputerDialog(provider, connection, organizationId, onSaved) {
       <input class="computer-key" type="password" autocomplete="new-password" placeholder="${connection ? 'Blank to leave unchanged' : 'Required'}"></label>
     <details class="computer-advanced"><summary>Advanced</summary><div class="settings-grid">
       ${info.advanced.map(([key, label, placeholder]) => `<label class="form-row">${esc(label)}<input data-config="${esc(key)}" value="${esc(config[key] || '')}" placeholder="${esc(placeholder)}"></label>`).join('')}
+      ${[['cpu', 'Max CPU'], ['memoryMb', 'Max memory (GB)'], ['diskGb', 'Max disk (GB)']].map(([key, label]) => {
+        const own = config.limits?.[key];
+        const known = connection?.limits?.[key];
+        const shown = (value) => (value == null ? '' : key === 'memoryMb' ? gbOf(value) : String(value));
+        return `<label class="form-row">${esc(label)}<input data-limit="${key}" type="number" min="1" step="1" inputmode="numeric" value="${esc(shown(own))}" placeholder="${esc(shown(known) || 'provider default')}"></label>`;
+      }).join('')}
     </div></details>
     <div class="modal-actions">${connection ? '<button class="btn danger computer-disconnect" type="button">Disconnect</button><span class="label-row-fill"></span>' : ''}
       <button class="btn computer-cancel" type="button">Cancel</button><button class="btn primary computer-save" type="button">${connection ? 'Save' : 'Connect'}</button></div>
@@ -20493,8 +20511,12 @@ function openComputerDialog(provider, connection, organizationId, onSaved) {
   overlay.querySelector('.computer-cancel').addEventListener('click', close);
   overlay.querySelector('.computer-save').addEventListener('click', async (event) => {
     const button = event.currentTarget; button.disabled = true;
+    // Limits a person entered, for what the provider's API cannot tell (disk is total GB).
+    const limits = Object.fromEntries([...overlay.querySelectorAll('[data-limit]')]
+      .filter((input) => input.value.trim() !== '' && Number(input.value) > 0)
+      .map((input) => [input.dataset.limit, input.dataset.limit === 'memoryMb' ? Math.round(Number(input.value) * 1024) : Math.round(Number(input.value))]));
     const body = { apiKey: overlay.querySelector('.computer-key').value.trim() || undefined,
-      config: Object.fromEntries([...overlay.querySelectorAll('[data-config]')].map((input) => [input.dataset.config, input.value.trim()])) };
+      config: { ...Object.fromEntries([...overlay.querySelectorAll('[data-config]')].map((input) => [input.dataset.config, input.value.trim()])), limits } };
     // A refused save changed nothing: keep what was typed. A saved one is
     // verified at once, and its state (or error) shows on the row.
     try { await api(base, { method: 'PUT', body: JSON.stringify(body) }); }
