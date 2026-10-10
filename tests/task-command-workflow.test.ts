@@ -17,6 +17,9 @@ describe('task commands (real Temporal + git)', () => {
   let token: string;
 
   beforeAll(async () => {
+    // Where a command's `tavya` reaches the platform; never the ambient value
+    // of whatever shell runs the tests (tests/helpers/file-isolation restores it).
+    process.env.KARMAX_PUBLIC_URL = 'https://tavya.test';
     h = await bootHarness('mock');
     repo = await h.makeRepo('command-repo');
     projectId = (await h.store.createProject('Commands', { repos: [repo], defaultBase: 'main', defaultTarget: 'main' })).id;
@@ -33,7 +36,7 @@ describe('task commands (real Temporal + git)', () => {
   const agentTurns = async (taskId: string) => (await h.store.eventsSince(taskId, 0)).filter((e) => e.type === 'turn.start' || e.type === 'agent.turn.started').length;
 
   it('finishes by itself when the command succeeds and changes nothing, without an agent', async () => {
-    const task = await create('Check', { command: 'test -n "$KARMAX_TOKEN" && test -n "$KARMAX_GATEWAY_URL" && command -v tavya && echo all-good' });
+    const task = await create('Check', { command: 'test -n "$KARMAX_TOKEN" && test "$KARMAX_GATEWAY_URL" = https://tavya.test && command -v tavya && echo all-good' });
     const done = await settle(task.id, (v) => v.status === 'done');
     expect(done.workflow).toBe('software-dev');
     const report = done.messages.find((m) => m.role === 'system' && m.text.includes('exited 0'));
