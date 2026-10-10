@@ -180,6 +180,7 @@
   "tests/followup-injection.test.ts": 3,
   "tests/followup-sizing.browser.test.ts": 3.6,
   "tests/foreign-event-relay.test.ts": 0.7,
+  "tests/fork-across-projects.test.ts": 0.4,
   "tests/fork-dependency-base.browser.test.ts": 3.4,
   "tests/fork-reauthorize.test.ts": 1.5,
   "tests/fork-world.test.ts": 5.4,
