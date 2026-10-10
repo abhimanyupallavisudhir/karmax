@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import type { Api } from '../api.js';
-import { resolveTarget, slug, type Target } from '../refs.js';
+import { namesOrganization, resolveTarget, slug, type Target } from '../refs.js';
 import { CliError, EXIT, readStdin, table, type Output } from '../util.js';
 import type { Workspace } from '../workspace.js';
 
@@ -43,7 +43,7 @@ export async function projects(api: Api, args: string[], out: Output, flags: Rec
   const [organizations, list] = await Promise.all([api.get<Array<{ id: string; name: string; slug?: string }>>('/api/organizations').catch(() => []),
     api.get<Array<{ id: string; name: string; organizationId?: string }>>('/api/projects')]);
   const orgOf = (id?: string) => organizations.find((entry) => entry.id === id);
-  const wanted = flags.organization ? organizations.find((entry) => entry.id === flags.organization || (entry.slug ?? slug(entry.name)) === flags.organization) : undefined;
+  const wanted = flags.organization ? organizations.find((entry) => namesOrganization(entry, flags.organization!)) : undefined;
   if (flags.organization && !wanted) throw new CliError(`no organization "${flags.organization}" that you can access`, EXIT.notFound);
   const shown = list.filter((project) => !wanted || project.organizationId === wanted.id).map((project) => {
     const organization = orgOf(project.organizationId);

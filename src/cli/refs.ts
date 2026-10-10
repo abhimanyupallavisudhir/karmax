@@ -2,12 +2,18 @@ import type { Api } from './api.js';
 import { CliError, EXIT } from './util.js';
 
 export interface Project { id: string; name: string; organizationId?: string }
-export interface Organization { id: string; name: string; slug?: string }
+export interface Organization { id: string; name: string; slug?: string; previousSlugs?: string[] }
 export interface Target { project: Project; organization?: Organization; taskId?: string; taskNumber?: number; server?: string }
 
 /** The same slug the console puts in URLs (web/app.js `slugify`). */
 export function slug(value: string): string {
   return String(value || '').normalize('NFC').toLowerCase().replace(/[^\p{L}\p{N}\p{M}]+/gu, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'item';
+}
+
+/** Whether `ref` names this organization: its id, its slug, or a slug it had
+ * before a rename (old console URLs and `org/project` refs keep working). */
+export function namesOrganization(organization: Organization, ref: string): boolean {
+  return organization.id === ref || orgSlug(organization) === ref || (organization.previousSlugs ?? []).includes(ref);
 }
 
 export interface ParsedRef { server?: string; organization?: string; project?: string; task?: string }
@@ -50,7 +56,7 @@ export async function resolveTarget(api: Api, ref: string, fallbackProjectId?: s
       // A login limited to projects cannot list organizations; its project list is then the whole scope.
       const [organizations, projects] = await Promise.all([api.get<Organization[]>('/api/organizations').catch(() => undefined), api.get<Project[]>('/api/projects')]);
       const orgMatches = parsed.organization && organizations
-        ? organizations.filter((entry) => (entry.slug ?? slug(entry.name)) === parsed.organization || entry.id === parsed.organization)
+        ? organizations.filter((entry) => namesOrganization(entry, parsed.organization!))
         : organizations ?? [];
       if (parsed.organization && organizations && !orgMatches.length) throw new CliError(`no organization "${parsed.organization}" that you can access`, EXIT.notFound);
       const allowed = new Set(orgMatches.map((entry) => entry.id));

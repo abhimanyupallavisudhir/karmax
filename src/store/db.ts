@@ -465,6 +465,9 @@ export class Store {
         id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
         kind TEXT NOT NULL, plan TEXT NOT NULL DEFAULT 'free', createdAt INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS organization_aliases (
+        slug TEXT PRIMARY KEY, organizationId TEXT NOT NULL, createdAt INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS organization_memberships (
         organizationId TEXT NOT NULL, userId TEXT NOT NULL, role TEXT NOT NULL,
         joinedAt INTEGER NOT NULL, PRIMARY KEY (organizationId, userId)
@@ -1869,7 +1872,9 @@ export class Store {
     assertRoutableName('organization', input.name, input.slug);
     const name = (await this.assertOrganizationNameAvailable(input.name,
       input.kind === 'personal' ? { allowUserId: input.ownerUserId } : undefined));
-    const slug = (await uniqueSlug(input.slug ?? input.name, async (candidate) => !!(await this.db.prepare('SELECT 1 FROM organizations WHERE slug = ?').get(candidate))));
+    const slug = (await uniqueSlug(input.slug ?? input.name, async (candidate) =>
+      !!(await this.db.prepare('SELECT 1 FROM organizations WHERE slug = ?').get(candidate))
+      || !!(await this.db.prepare('SELECT 1 FROM organization_aliases WHERE slug = ?').get(candidate))));
     const organization: Organization = {
       id: newId('org'), name, slug,
       kind: input.kind ?? 'team', plan: 'free', nameVisibility: 'members', createdAt: Date.now(),
@@ -1979,9 +1984,33 @@ export class Store {
       : undefined;
     const nextName = (await this.assertOrganizationNameAvailable(name,
       { excludeOrganizationId: id, allowUserId: personalOwner }));
-    (await this.db.prepare('UPDATE organizations SET name = ? WHERE id = ?').run(nextName, id));
-    return { ...existing, name: nextName };
+    assertRoutableName('organization', nextName);
+    // The URL follows the name. Every slug the organization has had stays its
+    // own and keeps leading to it, so a bookmark or a link in an old email
+    // still opens it, and no other organization can take over that address.
+    const slug = slugify(nextName) === existing.slug ? existing.slug : (await uniqueSlug(nextName, async (candidate) =>
+      !!(await this.db.prepare('SELECT 1 FROM organizations WHERE slug=? AND id<>?').get(candidate, id))
+      || !!(await this.db.prepare('SELECT 1 FROM organization_aliases WHERE slug=? AND organizationId<>?').get(candidate, id))));
+    if (slug !== existing.slug) {
+      (await this.db.prepare('INSERT OR IGNORE INTO organization_aliases (slug, organizationId, createdAt) VALUES (?, ?, ?)')
+        .run(existing.slug, id, Date.now()));
+      (await this.db.prepare('DELETE FROM organization_aliases WHERE slug=?').run(slug));
+    }
+    (await this.db.prepare('UPDATE organizations SET name = ?, slug = ? WHERE id = ?').run(nextName, slug, id));
+    return { ...existing, name: nextName, slug };
   
+    });
+  }
+
+  /** The slugs these organizations had before a rename, newest first, for the
+   * console to resolve an old URL to the organization it now names. */
+  async withPreviousSlugs(organizations: Organization[]): Promise<Organization[]> {
+    if (!organizations.length) return organizations;
+    const rows = (await rowsFor(this.db, 'organization_aliases', 'organizationId', organizations.map((o) => o.id)));
+    rows.sort((a, b) => Number(b.createdAt) - Number(a.createdAt));
+    return organizations.map((organization) => {
+      const previousSlugs = rows.filter((row) => row.organizationId === organization.id).map((row) => String(row.slug));
+      return previousSlugs.length ? { ...organization, previousSlugs } : organization;
     });
   }
 
@@ -2078,6 +2107,7 @@ export class Store {
       teams: (await selectRows(this.db, 'teams', 'organizationId=?', [organizationId])),
       team_memberships: (await rowsFor(this.db, 'team_memberships', 'teamId', teamIds)),
       team_aliases: (await rowsFor(this.db, 'team_aliases', 'teamId', teamIds)),
+      organization_aliases: (await selectRows(this.db, 'organization_aliases', 'organizationId=?', [organizationId])),
       projects: (await rowsFor(this.db, 'projects', 'id', projectIds)),
       avatars: (await rowsFor(this.db, 'avatars', 'projectId', projectIds)),
       resource_attachments: (await rowsFor(this.db, 'resource_attachments', 'projectId', projectIds))
@@ -2372,6 +2402,7 @@ export class Store {
       (await deleteRows(this.db, 'execution_frames', 'executionId', executionIds));
       (await deleteRows(this.db, 'team_memberships', 'teamId', teamIds));
       (await deleteRows(this.db, 'team_aliases', 'teamId', teamIds));
+      (await this.db.prepare('DELETE FROM organization_aliases WHERE organizationId=?').run(organizationId));
       (await deleteRows(this.db, 'repository_deploy_keys', 'repositoryId', repositoryIds));
       (await deleteRows(this.db, 'task_subscribers', 'taskId', taskIds));
       (await deleteRows(this.db, 'task_confirmation', 'taskId', taskIds));

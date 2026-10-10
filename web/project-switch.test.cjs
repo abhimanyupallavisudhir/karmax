@@ -56,6 +56,7 @@ global.DEFAULT_LIST_QUERY = 'for:me';
 global.api = async () => [];
 global.firstProjectForOrganization = () => null;
 global.syncOrganizationSwitcher = () => { calls.push(`syncOrganizationSwitcher:${S.organizationId}`); };
+global.renamedOrganizationPath = () => '';
 
 // Previous project 'A' with a live query, a stale search result and a roving
 // cursor — none of which belong to project 'B'.

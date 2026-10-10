@@ -237,8 +237,11 @@ describe('gateway request scope for bare-id routes', () => {
       body: JSON.stringify({ name: 'Acme Labs' }),
     });
     expect(renamedOrganization.status).toBe(200);
-    expect(await renamedOrganization.json()).toMatchObject({ id: acmeId, name: 'Acme Labs', slug });
-    expect((await store.getOrganization(acmeId))?.slug).toBe(slug);
+    expect(await renamedOrganization.json()).toMatchObject({ id: acmeId, name: 'Acme Labs', slug: 'acme-labs' });
+    expect((await store.getOrganization(acmeId))?.slug).toBe('acme-labs');
+    // The console resolves the old URL through the organization list.
+    const listed = await fetch(`${base}/api/organizations`, { headers: { authorization: `Bearer ${organizationEditor}` } });
+    expect(await listed.json()).toEqual([expect.objectContaining({ id: acmeId, slug: 'acme-labs', previousSlugs: [slug] })]);
   });
 
   it('accepts a scope-only request through HTTP and exposes the added projects for review', async () => {

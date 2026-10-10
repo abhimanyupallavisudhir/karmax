@@ -355,9 +355,24 @@ function githubAuthorizeButton(githubApp, id) {
   const [label, tip] = githubApp.userAuthorized ? ['Reconnect', 'Reconnect your GitHub account'] : ['Connect', 'Connect your GitHub account'];
   return `<button class="btn sm" id="${id}" title="${tip}">${label}</button>`;
 }
+// A renamed organization keeps answering to its old slugs (applyRoute then
+// rewrites the URL to the current one).
 function organizationBySlug(slug) {
   const s = slugify(slug);
-  return (S.organizations || []).find((o) => orgSlug(o) === s) || (S.organizations || []).find((o) => o.id === slug);
+  const organizations = S.organizations || [];
+  return organizations.find((o) => orgSlug(o) === s) || organizations.find((o) => o.id === slug)
+    || organizations.find((o) => (o.previousSlugs || []).includes(s));
+}
+// The current URL with its organization segment replaced by `org`'s slug.
+function pathWithOrganization(org) {
+  const [, , ...rest] = location.pathname.split('/');
+  return `/${[orgSlug(org), ...rest].join('/')}${location.search}${location.hash}`;
+}
+// Where a route that names an organization by a slug it had before a rename
+// now lives; '' when the route is already current.
+function renamedOrganizationPath(route) {
+  const org = route.org && organizationBySlug(route.org);
+  return org && slugify(route.org) !== orgSlug(org) && org.id !== route.org ? pathWithOrganization(org) : '';
 }
 // The organization whose slug prefixes every URL — the one selected in the
 // switcher, else the org owning the current project, else the first known org.
@@ -587,6 +602,8 @@ async function applyRoute() {
   const routePath = location.pathname;
   const routeIsCurrent = () => S.routeEpoch === routeEpoch && location.pathname === routePath;
   const r = parseRoute(currentPath());
+  const renamed = renamedOrganizationPath(r);
+  if (renamed) return go(renamed, { replace: true });
   if (r.name === 'home') {
     const org = currentOrg();
     return go(org ? homeRoute(org, DEFAULT_LIST_QUERY) : globalRoute('insights'), { replace: true });
@@ -20455,7 +20472,7 @@ function organizationView() {
 
     <div class="settings-section-title" id="settings-advanced" data-settings-advanced hidden><div>Advanced</div></div>
     <div class="card" data-settings-access="organization" hidden><div class="setting-rows">
-      <div class="setting-row"><span class="setting-label">Name</span>
+      <div class="setting-row"><span class="setting-label">Name ${policyTip('Also its web address. Links to the old one keep working.')}</span>
         <span class="setting-value"><input id="organization-name" class="setting-input" value="${esc(org?.name || '')}" aria-label="Organization name"></span>
         <span class="setting-actions"><button class="btn sm primary" id="rename-organization">Save</button></span></div>
       <div class="setting-row"><span class="setting-label">Data ${policyTip('A readable JSON archive of this organization, grouped into complete record collections. Passwords, tokens and stored credentials are never included.')}</span>
@@ -20609,10 +20626,12 @@ async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
       const name = $('#organization-name')?.value.trim();
       if (!name) return toast('Organization name is required', true);
       try {
-        await api(`/api/organizations/${S.organizationId}`, { method: 'PATCH', body: JSON.stringify({ name }) });
+        const organization = await api(`/api/organizations/${S.organizationId}`, { method: 'PATCH', body: JSON.stringify({ name }) });
         await loadOrganizations();
         toast('Organization renamed');
         renderShell();
+        if (organization?.slug && decodeRoutePart(location.pathname.split('/')[1] || '', true) !== organization.slug)
+          return go(pathWithOrganization(organization), { replace: true });
         renderMain();
       } catch (e) { toast(e.message, true); }
     };
