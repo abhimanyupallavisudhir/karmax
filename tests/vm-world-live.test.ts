@@ -35,6 +35,10 @@ const fly: ResolvedWorldProviderConnection = { provider: 'fly', apiKey: process.
   config: { region: process.env.KARMAX_FLY_REGION, organization: process.env.KARMAX_FLY_ORG, image: process.env.KARMAX_FLY_IMAGE } };
 const hetzner: ResolvedWorldProviderConnection = { provider: 'hetzner', apiKey: process.env.HCLOUD_TOKEN ?? '',
   config: { region: process.env.KARMAX_HETZNER_LOCATION } };
+// 100 GB growing to 150 GB by default. A Fly account with no payment method
+// refuses volumes over 20 GB in total: KARMAX_LIVE_VM_DISK_GB=10 KARMAX_LIVE_VM_GROW_GB=20.
+const diskGb = Number(process.env.KARMAX_LIVE_VM_DISK_GB ?? 100);
+const growGb = Number(process.env.KARMAX_LIVE_VM_GROW_GB ?? 150);
 const providers = [
   { name: 'Fly.io', connection: fly, driver: () => new FlyDriver() as VmDriver },
   { name: 'Hetzner', connection: hetzner, driver: () => new HetznerDriver() as VmDriver },
@@ -44,7 +48,7 @@ describe.each(providers)('a live $name VM world', ({ name, connection, driver: m
   const live = liveEnabled() && !!connection.apiKey && !!modelKey;
   const driver = makeDriver();
   const provider = new VmWorldProvider(driver, async () => connection);
-  const report: Record<string, unknown> = { provider: name, region: connection.config.region ?? 'default' };
+  const report: Record<string, unknown> = { provider: name, region: connection.config.region ?? 'default', diskGb, growGb };
   const marker = `VM-${name.replace(/\W/g, '').toUpperCase()}-${Date.now().toString(36)}`;
   let home: string;
   let previousHome: string | undefined;
@@ -87,7 +91,7 @@ describe.each(providers)('a live $name VM world', ({ name, connection, driver: m
     }
     handle = undefined as unknown as WorldHandle;
     world = await timed('createS', () => provider.create({ taskId: `live-vm-${Date.now().toString(36)}`, base: 'main', generation: 1,
-      organizationId: 'org_live', resources: { cpu: 2, memoryMb: 2048, diskGb: 100 } }));
+      organizationId: 'org_live', resources: { cpu: 2, memoryMb: 2048, diskGb } }));
     handle = world.handle as WorldHandle;
     report.machine = handle.meta?.machine;
   }, 60 * 60_000);
@@ -108,10 +112,10 @@ describe.each(providers)('a live $name VM world', ({ name, connection, driver: m
     }
   }, 30 * 60_000);
 
-  it.skipIf(!live)('is a 100 GB machine whose agent writes tracked and ignored files', async () => {
+  it.skipIf(!live)(`is a ${diskGb} GB machine whose agent writes tracked and ignored files`, async () => {
     const size = await disk();
     report.diskAtCreate = size;
-    expect(size.size).toBeGreaterThanOrEqual(95);
+    expect(size.size).toBeGreaterThanOrEqual(diskGb * 0.95 - 1);
     const { result, session } = await timed('turnS', () => turn('With your bash tool run exactly: '
       + `mkdir -p notes node_modules/.cache && echo ${marker} > notes/agent.txt && echo ignored-${marker} > node_modules/.cache/kept.txt `
       + '&& cat notes/agent.txt. Then reply with the single word DONE.'));
@@ -133,20 +137,20 @@ describe.each(providers)('a live $name VM world', ({ name, connection, driver: m
     expect(result.output).toContain(marker);
   }, 30 * 60_000);
 
-  it.skipIf(!live)('grows to 150 GB while running, losing nothing', async () => {
-    const grown = await timed('growS', () => provider.resize(handle, { cpu: 2, memoryMb: 2048, diskGb: 150 }));
+  it.skipIf(!live)(`grows to ${growGb} GB while running, losing nothing`, async () => {
+    const grown = await timed('growS', () => provider.resize(handle, { cpu: 2, memoryMb: 2048, diskGb: growGb }));
     expect(grown.disk).toBe('grown');
-    handle = { ...handle, meta: { ...handle.meta, computer: { cpu: 2, memoryMb: 2048, diskGb: 150 }, machine: grown.machine } };
+    handle = { ...handle, meta: { ...handle.meta, computer: { cpu: 2, memoryMb: 2048, diskGb: growGb }, machine: grown.machine } };
     let size = await disk();
     // Fly may only show the new size after a restart (`needs_restart`); the next wake grows the filesystem.
     report.diskAfterGrowLive = size;
-    if (size.size < 145) {
+    if (size.size < growGb * 0.95 - 1) {
       await provider.park(handle);
       world = await provider.open(handle);
       size = await disk();
     }
     report.diskAfterGrow = size;
-    expect(size.size).toBeGreaterThanOrEqual(145);
+    expect(size.size).toBeGreaterThanOrEqual(growGb * 0.95 - 1);
     expect((await world.readFile('notes/agent.txt')).trim()).toBe(marker);
     expect((await world.readFile('node_modules/.cache/kept.txt')).trim()).toBe(`ignored-${marker}`);
   }, 30 * 60_000);
@@ -158,7 +162,7 @@ describe.each(providers)('a live $name VM world', ({ name, connection, driver: m
       world = await timed('coldWakeS', () => provider.open(handle));
     } finally { delete process.env.KARMAX_HETZNER_PARK_GRACE; }
     expect((await world.readFile('notes/agent.txt')).trim()).toBe(marker);
-    expect((await disk()).size).toBeGreaterThanOrEqual(145);
+    expect((await disk()).size).toBeGreaterThanOrEqual(growGb * 0.95 - 1);
     report.usage = summarize((await provider.listUsageEvents('org_live')).events);
   }, 30 * 60_000);
 });

@@ -12,7 +12,7 @@ interface FakeServer { id: number; name: string; status: string; created: string
 interface FakeVolume { id: number; name: string; size: number; created: string; server: number | null; labels: Labels;
   location: { name: string }; linux_device: string; dir: string }
 
-const TYPES = [
+const TYPES: any[] = [
   { id: 1, name: 'cx11', cores: 1, memory: 2, cpu_type: 'shared', architecture: 'x86', deprecation: { announced: '2024-01-01' },
     prices: [{ location: 'fsn1', price_hourly: { net: '0.0050', gross: '0.0060' } }] },
   { id: 2, name: 'cx22', cores: 2, memory: 4, cpu_type: 'shared', architecture: 'x86', deprecation: null,
@@ -23,6 +23,10 @@ const TYPES = [
     prices: [{ location: 'fsn1', price_hourly: { net: '0.0208', gross: '0.0248' } }] },
   { id: 5, name: 'ccx13', cores: 2, memory: 8, cpu_type: 'dedicated', architecture: 'x86', deprecation: null,
     prices: [{ location: 'fsn1', price_hourly: { net: '0.0230', gross: '0.0274' } }] },
+  // Priced at fsn1 but no longer orderable there (as CPX11 was, 2026-10).
+  { id: 6, name: 'cpx11', cores: 2, memory: 2, cpu_type: 'shared', architecture: 'x86', deprecation: null,
+    prices: [{ location: 'fsn1', price_hourly: { net: '0.0040', gross: '0.0048' } }],
+    locations: [{ name: 'fsn1', available: false, deprecation: { announced: '2025-10-16T06:00:00Z' } }] },
 ];
 
 /**
@@ -102,6 +106,8 @@ export class FakeHetzner {
       case 'servers': {
         if (method === 'POST' && !idText) {
           if (!TYPES.some((type) => type.name === body.server_type)) return json(422, { error: { code: 'invalid_input', message: 'unknown server type' } });
+          const where = TYPES.find((type) => type.name === body.server_type).locations?.find((entry: any) => entry.name === body.location);
+          if (where && where.available === false) return json(422, { error: { code: 'invalid_input', message: 'unsupported location for server type' } });
           const server: FakeServer = { id: ++this.ids, name: body.name, status: 'initializing', created: new Date().toISOString(),
             labels: body.labels ?? {}, server_type: TYPES.find((type) => type.name === body.server_type), volumes: body.volumes ?? [],
             ip: `10.0.0.${this.ids % 250}`, userData: body.user_data, datacenter: { location: { name: body.location } } };

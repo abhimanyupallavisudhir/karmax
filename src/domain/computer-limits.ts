@@ -60,8 +60,8 @@ const PROVIDERS: Record<string, ProviderFacts> = {
   fly: { label: 'Fly.io', defaults: { cpu: 2, memoryMb: 2048, diskGb: 20 }, limits: { cpu: 16, memoryMb: 131_072, diskGb: 500 } },
   // Hetzner: volumes up to 10 TB; the largest machine is whatever server type
   // the location offers (the connection test asks), else the shared CPX51.
-  // A default computer gets the cheapest type, CX22 (2 CPU, 4 GB).
-  hetzner: { label: 'Hetzner', defaults: { cpu: 2, memoryMb: 4096, diskGb: 20 }, limits: { cpu: 16, memoryMb: 32_768, diskGb: 10_240 } },
+  // A default computer gets the cheapest type covering it (CPX11, 2 CPU / 2 GB, 2026-10-10).
+  hetzner: { label: 'Hetzner', defaults: { cpu: 2, memoryMb: 2048, diskGb: 20 }, limits: { cpu: 16, memoryMb: 32_768, diskGb: 10_240 } },
 };
 
 export function providerLabel(provider: string): string {

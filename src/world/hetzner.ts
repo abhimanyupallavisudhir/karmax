@@ -45,6 +45,18 @@ interface ServerType {
   id: number; name: string; cores: number; memory: number; cpu_type: string; architecture: string;
   deprecation?: unknown; deprecated?: boolean;
   prices: Array<{ location: string; price_hourly: { net: string; gross: string } }>;
+  /** Where the type can be ordered now (a price alone is not enough: CPX11
+   * kept its fsn1 price after it stopped being available there, 2026-10). */
+  locations?: Array<{ name: string; available?: boolean; deprecation?: unknown }>;
+}
+
+/** Whether a server of this type can be created at `location` now. */
+function orderable(type: ServerType, location: string): boolean {
+  if (type.architecture !== 'x86' || type.deprecation || type.deprecated) return false;
+  if (!type.prices.some((price) => price.location === location)) return false;
+  if (!type.locations) return true;
+  const here = type.locations.find((entry) => entry.name === location);
+  return !!here && here.available !== false && !here.deprecation;
 }
 interface Server {
   id: number; name: string; status: string; created: string; labels: Record<string, string>;
@@ -237,8 +249,7 @@ export class HetznerDriver implements VmDriver {
    * current x86 server type offered there, and a volume of 10 TB. */
   async limits(connection: ResolvedWorldProviderConnection): Promise<ComputerLimits> {
     const location = connection.config.region ?? HETZNER_DEFAULT_LOCATION;
-    const types = (await this.pages<ServerType>(connection, '/server_types', 'server_types')).filter((type) => type.architecture === 'x86'
-      && !type.deprecation && !type.deprecated && type.prices.some((price) => price.location === location));
+    const types = (await this.pages<ServerType>(connection, '/server_types', 'server_types')).filter((type) => orderable(type, location));
     return { ...(types.length ? { cpu: Math.max(...types.map((type) => type.cores)),
       memoryMb: Math.max(...types.map((type) => Math.round(type.memory * 1024))) } : {}), diskGb: HETZNER_MAX_DISK_GB, checkedAt: Date.now() };
   }
@@ -277,7 +288,7 @@ export class HetznerDriver implements VmDriver {
       cached.types.catch(() => this.types.delete(key));
     }
     const price = (type: ServerType) => Number(type.prices.find((entry) => entry.location === location)?.price_hourly.net ?? Infinity);
-    const fits = (await cached.types).filter((type) => type.architecture === 'x86' && !type.deprecation && !type.deprecated
+    const fits = (await cached.types).filter((type) => orderable(type, location)
       && Number.isFinite(price(type)) && type.cores >= want.cpu && type.memory * 1024 >= want.memoryMb)
       .sort((a, b) => price(a) - price(b) || a.cores - b.cores);
     if (!fits[0]) throw new Error(`Hetzner has no server at ${location} with ${want.cpu} CPU and ${Math.round(want.memoryMb / 1024)} GB of memory`);

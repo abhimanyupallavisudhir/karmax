@@ -1478,7 +1478,7 @@ const localWorldPath = (v) => (hostLocal() && v.worldPath) || '';
 const COMPUTER_PROVIDER_LABELS = { e2b: 'E2B', daytona: 'Daytona', fly: 'Fly.io', hetzner: 'Hetzner', worktree: 'This machine', container: 'Docker container' };
 // What a machine gets when the Computer asks for nothing more (disk is total GB).
 const COMPUTER_DEFAULTS = { e2b: { cpu: 2, memoryMb: 2048, diskGb: 22 }, daytona: { cpu: 2, memoryMb: 4096, diskGb: 8 },
-  fly: { cpu: 2, memoryMb: 2048, diskGb: 20 }, hetzner: { cpu: 2, memoryMb: 4096, diskGb: 20 } };
+  fly: { cpu: 2, memoryMb: 2048, diskGb: 20 }, hetzner: { cpu: 2, memoryMb: 2048, diskGb: 20 } };
 // What a computer on the organization's provider account may be: the
 // connection's limits, learned from the provider (src/domain/computer-limits.ts).
 const computerLimitsFor = (provider) => (S.worldProviderConnections || []).find((c) => c.provider === provider)?.limits || null;
