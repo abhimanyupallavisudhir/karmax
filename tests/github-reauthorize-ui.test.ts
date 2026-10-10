@@ -78,8 +78,8 @@ describe('GitHub re-authorization affordance', () => {
     const rows = ui.page.locator('#profile-github .github-account-row');
     expect(await rows.locator('.github-account-label').allInnerTexts()).toEqual(['octo\nActive', 'second']);
     // Only an inactive account offers Use; the old single-identity button is gone.
-    expect(await rows.nth(0).locator('button').allInnerTexts()).toEqual(['Reconnect', 'Custom identity', '']);
-    expect(await rows.nth(1).locator('button').allInnerTexts()).toEqual(['Use', 'Reconnect', 'Custom identity', '']);
+    expect(await rows.nth(0).locator('button').allInnerTexts()).toEqual(['Reconnect', 'Custom identity', 'Token', '']);
+    expect(await rows.nth(1).locator('button').allInnerTexts()).toEqual(['Use', 'Reconnect', 'Custom identity', 'Token', '']);
     expect(await ui.page.locator('#authorize-github, #user-authorize-github').count()).toBe(0);
     expect(await ui.page.locator('#profile-github .github-add').innerText()).toBe('Add new GitHub account');
 
