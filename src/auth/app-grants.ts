@@ -305,6 +305,26 @@ export function grantCapabilities(ceiling: AppGrantCeiling | undefined, userCaps
   return caps;
 }
 
+/**
+ * A person's capabilities in a scope as one of their sessions may use them:
+ * their current grants there, attenuated by the app grant the session stands
+ * for (none for a browser session). Every check that authorizes a person
+ * directly, rather than through their route-scoped token, goes through here,
+ * so a limited CLI, MCP or personal token stays limited.
+ */
+export async function sessionCapabilities(
+  authorization: {
+    capabilitiesAsync(principalId: string, projectId?: string, organizationId?: string): Promise<Capability[]>;
+    profile(id: string, projectId?: string, organizationId?: string): Promise<{ capabilities: Capability[] } | undefined>;
+  },
+  userId: string, ceiling: AppGrantCeiling | undefined, scope: { projectId?: string; organizationId?: string },
+): Promise<Capability[]> {
+  const caps = await authorization.capabilitiesAsync(`user:${userId}`, scope.projectId, scope.organizationId);
+  if (!ceiling) return caps;
+  const level = ceiling.level ? (await authorization.profile(ceiling.level, scope.projectId, scope.organizationId))?.capabilities : undefined;
+  return grantCapabilities(ceiling, caps, scope, level);
+}
+
 /** Is a project/organization inside the grant's scope? A route that names
  * neither is (it is filtered by the capabilities found there). */
 export function grantReaches(ceiling: AppGrantCeiling | undefined, scope: { projectId?: string; organizationId?: string }): boolean {
