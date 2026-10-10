@@ -198,6 +198,10 @@ describe.skipIf(!postgres)('karmax-role.sql against PostgreSQL', () => {
       await legacy.query('CREATE TABLE tasks (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL)');
       await legacy.query("INSERT INTO tasks (title) VALUES ('before the role existed')");
       await legacy.query('CREATE INDEX tasks_title ON tasks (title)');
+      // What a restored dump creates as the superuser besides tables.
+      await legacy.query("CREATE FUNCTION next_id(n int) RETURNS int LANGUAGE sql AS 'SELECT n + 1'");
+      await legacy.query("CREATE TYPE stage AS ENUM ('do', 'review')");
+      await legacy.query('CREATE DOMAIN positive AS int CHECK (VALUE > 0)');
     } finally { await legacy.end(); }
     // Every start re-applies it, so it must be idempotent.
     await apply();
@@ -219,12 +223,15 @@ describe.skipIf(!postgres)('karmax-role.sql against PostgreSQL', () => {
     expect(self).toEqual({ rolsuper: false, rolcreatedb: false, rolcreaterole: false, rolreplication: false, rolbypassrls: false });
   });
 
-  it('takes over the tables an older release created and keeps their data writable', async () => {
+  it('takes over the tables, functions and types an older release created and keeps their data writable', async () => {
     const { rows } = await app.query("SELECT tableowner FROM pg_tables WHERE schemaname = 'public'");
     expect(rows).toEqual([{ tableowner: role }]);
     await app.query("INSERT INTO tasks (title) VALUES ('after')");
     expect((await app.query('SELECT title FROM tasks ORDER BY id')).rows.map((row) => row.title))
       .toEqual(['before the role existed', 'after']);
+    await app.query("CREATE OR REPLACE FUNCTION next_id(n int) RETURNS int LANGUAGE sql AS 'SELECT n + 2'");
+    await app.query("ALTER TYPE stage ADD VALUE IF NOT EXISTS 'done'");
+    await app.query('ALTER DOMAIN positive SET NOT NULL');
     await app.query('CREATE TABLE later (id BIGSERIAL PRIMARY KEY)');
     await app.query('ALTER TABLE tasks ADD COLUMN done BOOLEAN');
     await app.query('DROP TABLE later');
@@ -238,5 +245,91 @@ describe.skipIf(!postgres)('karmax-role.sql against PostgreSQL', () => {
 
   it('rejects a wrong password', async () => {
     await expect(connect(database, { name: role, password: 'ff'.repeat(32) })).rejects.toMatchObject({ code: '28P01' });
+  });
+});
+
+// `deploy/karmax restore` loads each dump as the superuser without owners
+// (a fresh volume may have no karmax role yet), and the role job hands
+// everything to the app's role on the next start. Since #583 the app's own
+// boot replaces functions it owns (karmax_seq), so anything the handover
+// missed kept the restored app from starting (Rehearse upgrade step f).
+describe.skipIf(!postgres)('a restored karmax database starts as the app role', () => {
+  const suffix = crypto.randomBytes(6).toString('hex');
+  const role = `karmax_restore_${suffix}`;
+  const source = `karmax_restore_src_${suffix}`;
+  const restored = `karmax_restore_dst_${suffix}`;
+  const password = crypto.randomBytes(32).toString('hex');
+  const admin = new pg.Pool({ connectionString: postgres, max: 1 });
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-restore-'));
+  const vaultDir = path.join(home, 'vault');
+  const url = (db: string, user?: { name: string; password: string }) => {
+    const target = new URL(postgres!);
+    target.pathname = `/${db}`;
+    if (user) { target.username = user.name; target.password = user.password; }
+    return target.href;
+  };
+  const asApp = (db: string) => url(db, { name: role, password });
+  const roleJob = async (db: string) => {
+    const client = new pg.Client({ connectionString: url(db),
+      options: `-c karmax.app_role=${role} -c karmax.app_password=${password} -c karmax.private_databases=` });
+    await client.connect();
+    try { await client.query(roleSql); } finally { await client.end(); }
+  };
+  const run = (command: string, args: string[]) => {
+    const result = spawnSync(command, args, { encoding: 'utf8' });
+    if (result.error) throw new Error(`${command} is needed to rehearse a restore (PostgreSQL's client tools): ${result.error.message}`);
+    expect(result.status, result.stderr).toBe(0);
+  };
+  const boot = { resolveScopes: async () => new Map(), audit: async () => undefined };
+  const restoreFlags = '--no-owner --no-privileges';
+
+  afterAll(async () => {
+    for (const db of [source, restored]) await admin.query(`DROP DATABASE IF EXISTS ${db} WITH (FORCE)`);
+    await admin.query(`DROP ROLE IF EXISTS ${role}`);
+    await admin.end();
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  it('restores the dump the way deploy/karmax restore does', () => {
+    expect(read('karmax')).toContain(`pg_restore -U temporal ${restoreFlags} -d "$database"`);
+  });
+
+  it('boots the app, its vault and its sequences on the restored database', async () => {
+    const { Store } = await import('../src/store/db.js');
+    const { openSecretVault } = await import('../src/autonomy/vault-backend.js');
+    const { INSTALLATION_SCOPE } = await import('../src/autonomy/vault-keys.js');
+    // An install: the role job, then the app's first boot as its own role.
+    await admin.query(`CREATE DATABASE ${source}`);
+    await roleJob(source);
+    const before = await Store.create(asApp(source), { hosted: true });
+    try {
+      const vault = await openSecretVault(vaultDir, before.db, boot);
+      await vault.put('restore-check', 'sealed before the backup', INSTALLATION_SCOPE);
+      await before.appendAudit({ principalId: 'system:test', action: 'before.backup' });
+    } finally { await before.close(); }
+
+    const dump = path.join(home, 'karmax.dump');
+    run('pg_dump', ['-Fc', '-f', dump, `--dbname=${url(source)}`]);
+    await admin.query(`CREATE DATABASE ${restored}`);
+    run('pg_restore', [...restoreFlags.split(' '), `--dbname=${url(restored)}`, dump]);
+    await roleJob(restored);
+
+    const after = await Store.create(asApp(restored), { hosted: true });
+    try {
+      const vault = await openSecretVault(vaultDir, after.db, boot);
+      expect(await vault.reveal('restore-check')).toBe('sealed before the backup');
+      await after.appendAudit({ principalId: 'system:test', action: 'after.restore' });
+      const actions = (await after.db.prepare('SELECT action FROM audit_log ORDER BY seq').all() as Array<{ action: string }>)
+        .map((row) => row.action);
+      expect(actions.slice(-2)).toEqual(['before.backup', 'after.restore']);
+    } finally { await after.close(); }
+    // Nothing in the app's database is left to the superuser.
+    const client = new pg.Client({ connectionString: url(restored) });
+    await client.connect();
+    try {
+      const { rows } = await client.query(`SELECT p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = 'public' AND p.proowner <> $1::regrole`, [role]);
+      expect(rows).toEqual([]);
+    } finally { await client.end(); }
   });
 });

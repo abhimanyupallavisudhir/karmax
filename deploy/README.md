@@ -274,6 +274,96 @@ variables above, and start. Keep the local copy until the delay has passed: to
 go back, stop the app, copy what was written since with `--from-s3`, unset
 `KARMAX_OBJECT_STORE`, and start.
 
+### Memory caps
+
+Every container has a memory cap, a ceiling the kernel enforces on that
+container alone: one that reaches it is OOM-killed, not the host. Each is a
+line of `.turnkey.env`, and the defaults are the caps of the original 8 GB
+server:
+
+| Container | Setting | Default |
+| --- | --- | ---: |
+| app (gateway and worker) | `KARMAX_APP_MEM_LIMIT` | `4g` |
+| postgresql | `KARMAX_POSTGRES_MEM_LIMIT` | `768m` |
+| temporal | `KARMAX_TEMPORAL_MEM_LIMIT` | `2g` |
+| caddy | `KARMAX_CADDY_MEM_LIMIT` | `512m` |
+| pg-backup | `KARMAX_PG_BACKUP_MEM_LIMIT` | `512m` |
+| temporal-schema, temporal-namespace (exit after setup) | `KARMAX_TEMPORAL_SCHEMA_MEM_LIMIT`, `KARMAX_TEMPORAL_NAMESPACE_MEM_LIMIT` | `512m` |
+| karmax-database (exits after setup) | `KARMAX_DATABASE_ROLE_MEM_LIMIT` | `256m` |
+
+No container has a CPU limit.
+
+Two containers size themselves to their cap:
+
+- **The app.** Every V8 heap's limit comes from the cap
+  (`src/runtime/memory-budget.ts`): 15% for the gateway, 30% each for the
+  worker's process and its workflow thread, and the last quarter for native
+  memory. A hosted cell's sticky workflow cache follows the workflow heap at
+  4.9 MiB per workflow: 250 at `4g`, 438 at `7g`. `KARMAX_MAX_CACHED_WORKFLOWS`
+  overrides it.
+- **PostgreSQL** (`postgres/postgres-memory.sh`). `shared_buffers` is 1/4 of the
+  cap, at least 128 MB. `effective_cache_size` is 3/4, because the container's
+  page cache counts against the same cap. `work_mem` is what is left after the
+  buffers, split over every allowed connection running three sorts at once,
+  from 4 MB to 64 MB. `maintenance_work_mem` is 1/16 of the cap, from 64 MB to
+  1 GB. `max_connections` is `KARMAX_POSTGRES_MAX_CONNECTIONS`, default 100.
+  These are command-line settings, so they win over `ALTER SYSTEM`; change the
+  cap instead.
+
+After editing the file, run `./deploy/karmax up`. It recreates only the
+containers whose settings changed; PostgreSQL's restart takes Temporal and the
+app offline for under a minute. `./deploy/karmax doctor` prints each container's
+use against its cap, what the caps leave the host, and PostgreSQL's settings
+with its connections in use.
+
+**A 16 GB server** (8 vCPU; tavya.io since 2026-10-10):
+
+```bash
+KARMAX_APP_MEM_LIMIT=7g
+KARMAX_POSTGRES_MEM_LIMIT=3g
+KARMAX_POSTGRES_MAX_CONNECTIONS=150
+```
+
+Temporal, Caddy and pg-backup keep their defaults. The long-running caps then
+add up to 13 GiB of the 15.6 GiB the kernel reports, leaving 2.6 GiB for the
+host itself: the kernel, Docker and the image builds every update runs outside
+any container. The setup containers exit before the app starts. Why each number:
+
+- **app `7g`** (from 4g). The app is the container whose OOM kill stops every
+  tenant's work, and its heaps and workflow cache grow with its cap: the
+  gateway gets 1075 MiB and each worker isolate 2150 MiB, and the cache grows
+  from 250 to 438 workflows. On tavya.io the app held 1.1 GiB after a restart.
+  In the 2026-10 load test it peaked at 1.6 GiB at 128 tenants, with
+  684 running workflows against the cache of 250. Every evicted workflow costs a
+  full history replay, which kept workflow tasks queued. 8g would leave the host
+  under 2 GiB unless Temporal shrank, and nothing shows the app needs it.
+- **postgresql `3g`** (from 768m). The databases hold 1.85 GB (karmax 1.05 GB,
+  temporal 0.74 GB, on 2026-10-10). At 768m, with 128 MB of buffers, only a
+  fraction of that fit in memory. At 3g the buffers are 768 MB and the cache
+  2.3 GB, so the working set fits with room to grow. It used 362 MB of 768m at
+  128 tenants with stock settings.
+- **max_connections `150`** (from 100). Temporal keeps about 53 connections
+  open, idle or not. The app's pools can reach 34: 8 for each of the two
+  processes' stores, plus identity's 8-connection store and 10-connection pool.
+  Backups and operators add a few. That is about 90 of 100 at the peak, and the
+  load test reached 67. The extra 50 slots cost about a megabyte of shared
+  memory, and they leave room to raise `KARMAX_STORE_POOL_SIZE`. `work_mem`
+  falls from 7 to 5 MB, which matters little: the busiest statements take
+  under a millisecond and sort almost nothing.
+- **temporal `2g`** (unchanged). It used 129 MB after a restart and 260 MB at
+  128 tenants. Its caches are sized by its dynamic configuration, not by the
+  memory it is given, so a larger cap would go unused.
+- **caddy and pg-backup `512m`** (unchanged). Caddy peaked at 134 MB with
+  384 open sockets; a WAL-G base backup streams.
+
+The worker's workflow-task slots follow the cores, not memory. A hosted cell
+takes two per core, from 8 up to 16 (`KARMAX_MAX_WFT` overrides; 16 on 8 vCPUs).
+They all share the SDK's one workflow thread, so slots don't add workflow CPU.
+What they overlap is the wait for Temporal, history pages and completions, and
+Temporal and PostgreSQL can serve more of those at once on more cores. The cap
+of 16 keeps every accepted task inside Temporal's 10 s workflow-task timeout
+while it queues behind the others on that thread.
+
 ## Local development with a hosted control plane
 
 A hosted installation does not clone repositories onto its own filesystem.
@@ -291,7 +381,7 @@ release their execution lease when finished.
 ## Operations
 
 ```bash
-./deploy/karmax doctor              # Compose, secrets, containers, database role, DNS/HTTPS
+./deploy/karmax doctor              # Compose, secrets, containers, memory caps, database role, DNS/HTTPS
 ./deploy/karmax status
 ./deploy/karmax logs                # or: logs temporal
 ./deploy/karmax backup              # deploy/backups/manual-<UTC timestamp>
