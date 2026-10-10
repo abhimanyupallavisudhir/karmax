@@ -273,6 +273,15 @@ describe('Computer defaults', () => {
     signals.length = 0;
     await api.updateParams(editor, task.id, { computer: { diskGb: 150, cpu: 4 } });
     expect((signals[0] as [string, { text: string }])[1].text).toMatch(/Git-ignored files included/);
+
+    // Out of disk, Bigger disk grows it where it is, in one message.
+    await store.saveView(task.id, { taskId: task.id, workflow: 'software-dev', stage: 'do', status: 'blocked', outOfDisk: true,
+      waitingFor: { kind: 'human', reason: 'error' }, actions: [], editableParams: [] } as any);
+    signals.length = 0;
+    expect(await api.biggerDisk(editor, task.id, 300)).toMatchObject({ diskGb: 300, maxDiskGb: 500 });
+    expect(resized.at(-1)).toMatchObject({ diskGb: 300 });
+    expect(signals.map((signal) => (signal as [string, { text: string }])[1].text))
+      .toEqual([expect.stringMatching(/^\[tavya bigger disk\] The disk was full\. It now has 300 GB, grown in place/)]);
   });
 
   // compute-disk items 3 and 5: the task shows its disk, and a full one is a

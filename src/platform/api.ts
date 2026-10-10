@@ -6028,7 +6028,7 @@ Act according to your Avatar instructions. When ready, call platform_request POS
         const live = (await this.deps.store.worldState(taskId)) === 'ready';
         if (change && !task.lastView?.outOfDisk && live)
           (await this.deliverWorkflowMessage(taskId, computerChangeNotice(change, resized.inPlace)).catch(() => undefined));
-        else if (grown?.disk === 'grown' && live && caller.taskId !== taskId)
+        else if (grown?.disk === 'grown' && live && caller.taskId !== taskId && !task.lastView?.outOfDisk)
           (await this.deliverWorkflowMessage(taskId, diskGrownNotice(grown.machine.diskGb)).catch(() => undefined));
       }
       (await this.updateAgentSnapshot(taskId, patch, result.applied));
@@ -6113,8 +6113,11 @@ Act according to your Avatar instructions. When ready, call platform_request POS
     const { applied } = await this.updateParams(token, taskId, { computer: { ...own, diskGb } });
     // A stopped task waits for a message or a Retry; this message is both, and
     // says what changed. The agent asking for itself needs neither.
-    if (task.lastView?.outOfDisk && caller.taskId !== taskId)
-      (await this.deliverWorkflowMessage(taskId, biggerDiskNotice(diskGb, current)).catch(() => undefined));
+    if (task.lastView?.outOfDisk && caller.taskId !== taskId) {
+      const world = await this.deps.store.currentWorld(taskId);
+      const inPlace = Boolean(world && (() => { try { return this.deps.worlds?.get(world.kind).resize; } catch { return undefined; } })());
+      (await this.deliverWorkflowMessage(taskId, biggerDiskNotice(diskGb, current, inPlace)).catch(() => undefined));
+    }
     return { diskGb, maxDiskGb, applied };
   }
 
@@ -7062,7 +7065,9 @@ function applyExecutionConfig(config: import('../domain/types.js').ProjectConfig
 }
 
 /** What a task stopped by its full disk is told when it gets a bigger one. */
-function biggerDiskNotice(diskGb: number, fromGb: number | undefined): string {
+function biggerDiskNotice(diskGb: number, fromGb: number | undefined, inPlace = false): string {
+  // A VM world's disk grows where it is (vm/provider.ts): nothing moves.
+  if (inPlace) return `[${BRAND} bigger disk] The disk was full. It now has ${diskGb} GB, grown in place: every file is where you left it, so carry on.`;
   return `[${BRAND} bigger disk] The disk was full. This task's computer now has a ${diskGb} GB disk${fromGb != null ? `; you are still on ${fromGb} GB` : ''}. `
     + 'You move to it when this task parks: end your turn with pause(3) without jobs (stop any job first). '
     + 'You resume with every tracked file and uncommitted change; Git-ignored files (dependencies, build output) and running processes do not carry over.';
