@@ -12,7 +12,8 @@
 #    address gets, and the limiter still does all of its work.
 #  * compose.override.yml points the app's E2B SDK at the stand-in on the world
 #    VM, preloads probe.mjs into every Node process (heap, event-loop delay,
-#    GC), and turns on the Temporal server's Prometheus endpoint.
+#    GC, CPU), turns on the Temporal server's Prometheus endpoint, and loads
+#    pg_stat_statements into PostgreSQL (statement counts per query).
 #
 #   sut-setup.sh SOURCE_TARBALL HARNESS_DIR DOMAIN WORLD_IP ADMIN_EMAIL ADMIN_PASSWORD
 set -euo pipefail
@@ -60,6 +61,11 @@ say 'Load-test override (E2B stand-in, probes, Temporal metrics)'
 dc() { docker compose --project-directory deploy --env-file deploy/.turnkey.env -f deploy/compose.turnkey.yml "$@"; }
 # Keep whatever NODE_OPTIONS the release sets (a heap limit, say) and add the probe.
 base_options=$(dc config --format json | python3 -c 'import json,sys; print(json.load(sys.stdin)["services"]["app"].get("environment",{}).get("NODE_OPTIONS","") or "")')
+# PostgreSQL keeps the release's own command (WAL archiving, say) and adds
+# pg_stat_statements, so each run can name the queries behind its load.
+postgres_command=$(dc config --format json | python3 -c 'import json,sys
+command = json.load(sys.stdin)["services"]["postgresql"].get("command") or ["postgres"]
+print(json.dumps(command + ["-c", "shared_preload_libraries=pg_stat_statements", "-c", "pg_stat_statements.track=top", "-c", "pg_stat_statements.max=2000"]))')
 cat > "$LOADTEST/compose.override.yml" <<EOF
 services:
   app:
@@ -71,12 +77,19 @@ services:
     volumes:
       - $LOADTEST/probe.mjs:/loadtest/probe.mjs:ro
       - $LOADTEST/probe:/loadtest/probe
+  postgresql:
+    command: $postgres_command
   temporal:
     environment:
       PROMETHEUS_ENDPOINT: 0.0.0.0:8000
     ports: ["127.0.0.1:8000:8000"]
 EOF
-dc -f "$LOADTEST/compose.override.yml" up -d --no-build app temporal
+dc -f "$LOADTEST/compose.override.yml" up -d --no-build postgresql temporal app
+for attempt in $(seq 1 60); do
+  docker exec karmax-postgresql-1 psql -U temporal -d karmax -qc 'CREATE EXTENSION IF NOT EXISTS pg_stat_statements' 2>/dev/null && break
+  [ "$attempt" -lt 60 ] || { echo 'sut-setup: pg_stat_statements could not be enabled' >&2; exit 1; }
+  sleep 2
+done
 for attempt in $(seq 1 90); do
   curl -fsS -o /dev/null http://127.0.0.1:4505/api/health/ready && break
   [ "$attempt" -lt 90 ] || { docker logs --tail 80 karmax-app-1; exit 1; }

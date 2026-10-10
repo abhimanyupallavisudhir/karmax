@@ -8,6 +8,8 @@
  *              longest wait, commits/rollbacks/deadlocks               every --every s
  *    metrics   the app's /api/metrics (Prometheus text, as the
  *              installation administrator)                             every 2×--every s
+ *    statements  the karmax database's 80 busiest statements
+ *              (pg_stat_statements, cumulative)                         every 6×--every s
  *    temporal  running workflow count                                  every 3×--every s
  *    temporal-server  the server's Prometheus metrics: task-queue backlog
  *              count and age, schedule-to-start, matching and
@@ -122,6 +124,19 @@ async function postgres() {
   write('postgres', JSON.parse(text));
 }
 
+/** The karmax database's busiest statements so far (cumulative; report.ts takes
+ *  differences per step), from pg_stat_statements, which sut-setup.sh loads. */
+const STATEMENTS_QUERY = `
+select coalesce(json_agg(s), '[]'::json) from (
+  select queryid::text as id, calls, round(total_exec_time::numeric, 1) as ms, rows,
+         left(regexp_replace(query, '\\s+', ' ', 'g'), 240) as query
+  from pg_stat_statements where dbid = (select oid from pg_database where datname = 'karmax')
+  order by calls desc limit 80) s`;
+async function statements() {
+  const text = await run('docker', ['exec', `${project}-postgresql-1`, 'psql', '-U', 'temporal', '-d', 'karmax', '-Atqc', STATEMENTS_QUERY]);
+  write('statements', JSON.parse(text));
+}
+
 // ---------------------------------------------------------------- app metrics
 
 let cookie = '';
@@ -196,6 +211,7 @@ while (!stopping) {
   const work: Array<Promise<void>> = [guarded('docker', dockerStats), guarded('postgres', postgres)];
   if (tick % 2 === 0) work.push(guarded('metrics', appMetrics));
   if (tick % 3 === 0) work.push(guarded('temporal', temporal), guarded('temporal-server', temporalServer));
+  if (tick % 6 === 0) work.push(guarded('statements', statements));
   await Promise.all(work);
   tick++;
   await new Promise((resolve) => setTimeout(resolve, Math.max(0, every - (Date.now() - started))));

@@ -239,6 +239,7 @@ Steady window of each step (after its new tenants were set up). Latencies are as
   "karmax_database_connections": 4,
   "karmax_database_waiting": 0
  },
+ "topStatements": [],
  "metricsScrapeMaxMs": 76,
  "temporal": {
   "backlogAgeMaxMs": 0,
@@ -551,6 +552,7 @@ Steady window of each step (after its new tenants were set up). Latencies are as
   "karmax_database_connections": 4,
   "karmax_database_waiting": 0
  },
+ "topStatements": [],
  "metricsScrapeMaxMs": 64,
  "temporal": {
   "backlogAgeMaxMs": 0,
@@ -863,6 +865,7 @@ Steady window of each step (after its new tenants were set up). Latencies are as
   "karmax_database_connections": 4,
   "karmax_database_waiting": 0
  },
+ "topStatements": [],
  "metricsScrapeMaxMs": 151,
  "temporal": {
   "backlogAgeMaxMs": 0,
@@ -1175,6 +1178,7 @@ Steady window of each step (after its new tenants were set up). Latencies are as
   "karmax_database_connections": 4,
   "karmax_database_waiting": 1
  },
+ "topStatements": [],
  "metricsScrapeMaxMs": 191,
  "temporal": {
   "backlogAgeMaxMs": 0,
@@ -1495,6 +1499,7 @@ Steady window of each step (after its new tenants were set up). Latencies are as
   "karmax_database_connections": 4,
   "karmax_database_waiting": 233
  },
+ "topStatements": [],
  "metricsScrapeMaxMs": 1561,
  "temporal": {
   "backlogAgeMaxMs": 0,

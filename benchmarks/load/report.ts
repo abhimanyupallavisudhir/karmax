@@ -155,6 +155,22 @@ function stepRow(step: Json, samples: Json[], probes: Json[]) {
   const karmaxQueue = (name: string) => finite(parsedServer.flatMap((samples) => samples
     .filter((s) => s.name === name && s.labels.includes('taskqueue="karmax"') && s.labels.includes('namespace="karmax"')).map((s) => s.value)));
 
+  // Statement calls per second over the window (pg_stat_statements is cumulative).
+  const statementSamples = samples.filter((x) => x.kind === 'statements' && x.t >= from && x.t <= to);
+  let topStatements: Json[] = [];
+  if (statementSamples.length >= 2) {
+    const first = new Map<string, Json>(statementSamples[0].data.map((row: Json) => [row.id, row]));
+    const last: Json[] = statementSamples.at(-1).data;
+    const seconds = (statementSamples.at(-1).t - statementSamples[0].t) / 1000;
+    const rows = last.map((row) => {
+      const before = first.get(row.id) ?? { calls: 0, ms: 0 };
+      const calls = Number(row.calls) - Number(before.calls);
+      return { perSecond: round(calls / seconds, 1), meanMs: calls ? round((Number(row.ms) - Number(before.ms)) / calls, 2) : undefined, query: row.query };
+    }).filter((row) => (row.perSecond ?? 0) > 0).sort((a, b) => (b.perSecond ?? 0) - (a.perSecond ?? 0));
+    const total = rows.reduce((sum, row) => sum + (row.perSecond ?? 0), 0);
+    topStatements = rows.slice(0, 12).map((row) => ({ ...row, sharePct: round((100 * (row.perSecond ?? 0)) / (total || 1), 1) }));
+  }
+
   const connections = pg.map((p) => Object.values(p.connections ?? {}).reduce((a: number, b) => a + Number(b), 0) as number);
   const karmaxConnections = pg.map((p) => Object.entries(p.connections ?? {}).filter(([k]) => k.startsWith('karmax:')).reduce((a, [, b]) => a + Number(b), 0));
   const commits = pg.map((p) => Number(p.databases?.karmax?.commit ?? 0));
@@ -199,6 +215,7 @@ function stepRow(step: Json, samples: Json[], probes: Json[]) {
       karmaxDbMb: mb(max(finite(pg.map((p) => p.databases?.karmax?.sizeBytes)))),
     },
     appGauges,
+    topStatements,
     metricsScrapeMaxMs: max(scrapeMs),
     temporal: {
       backlogAgeMaxMs: round((max(karmaxQueue('approximate_backlog_age_seconds')) ?? NaN) * 1000),
@@ -242,6 +259,12 @@ md.push(wall
   : `No step broke a limit (the ramp ended at ${rows.at(-1)?.tenants ?? 0} tenants).`, '');
 md.push('Steady window of each step (after its new tenants were set up). Latencies are as the load generator saw them through the HTTPS edge.', '');
 md.push(table(rows), '');
+const attributed = wall ?? rows.at(-1);
+if (attributed?.topStatements?.length) {
+  md.push(`### Busiest statements at step ${attributed.step} (karmax database, pg_stat_statements)`, '',
+    '| calls/s | share | mean ms | statement |', '|---:|---:|---:|---|',
+    ...attributed.topStatements.map((row: Json) => `| ${fmt(row.perSecond)} | ${fmt(row.sharePct)} % | ${fmt(row.meanMs)} | \`${String(row.query).replaceAll('|', '\\|').slice(0, 160)}\` |`), '');
+}
 for (const r of rows) {
   md.push(`<details><summary>Step ${r.step}: ${r.tenants} tenants${r.broken.length ? ' — broke' : ''}</summary>`, '', '```json', JSON.stringify(r, null, 1), '```', '</details>', '');
 }
