@@ -438,6 +438,38 @@ it('updates an exact master revision', () => {
   expect(result.stdout).toContain(`Update complete at ${h.target}`);
 });
 
+// Compose mounts the previews' DNS token into Caddy, so an update to this
+// release must create it (empty: not configured) the way it creates the other
+// operator-written keys, and must keep one the operator wrote.
+it('creates the previews\' DNS token file on update, empty and readable, and keeps the operator\'s', () => {
+  const h = checkout();
+  const token = path.join(h.deploy, '.secrets', 'cloudflare_dns_api_token');
+  expect(fs.existsSync(token)).toBe(false);
+  expect(h.run(['update', h.target]).status).toBe(0);
+  expect(fs.readFileSync(token, 'utf8')).toBe('');
+  expect(fs.statSync(token).mode & 0o777).toBe(0o644);
+  expect(fs.readFileSync(path.join(h.deploy, '.secrets', 'vault_key'), 'utf8')).toBe('original-vault_key');
+
+  const again = checkout();
+  const operator = path.join(again.deploy, '.secrets', 'cloudflare_dns_api_token');
+  fs.writeFileSync(operator, 'cf-dns-token\n', { mode: 0o644 });
+  expect(again.run(['update', again.target]).status).toBe(0);
+  expect(fs.readFileSync(operator, 'utf8')).toBe('cf-dns-token\n');
+});
+
+it('refuses an update that turns on the wildcard without its DNS token, leaving production as it was', () => {
+  const h = checkout();
+  fs.appendFileSync(path.join(h.deploy, '.turnkey.env'), 'KARMAX_PENDING_PREVIEW_DOMAIN=usercontent.example.com\nKARMAX_PREVIEW_TLS=cloudflare\n');
+  const before = fs.readFileSync(path.join(h.deploy, '.turnkey.env'), 'utf8');
+  const result = h.run(['update', h.target]);
+  expect(result.status).not.toBe(0);
+  expect(result.stderr).toContain('KARMAX_PREVIEW_TLS=cloudflare needs a Cloudflare API token with Zone DNS Edit and Zone Read on usercontent.example.com only');
+  expect(result.stderr).toContain(`production remains at ${h.previous}`);
+  expect(h.git('rev-parse', 'HEAD')).toBe(h.previous);
+  expect(fs.readFileSync(path.join(h.deploy, '.turnkey.env'), 'utf8')).toBe(before);
+  expect(h.calls().map(args => args.join(' ')).some(call => call.includes('build') || call.includes('up -d'))).toBe(false);
+});
+
 // A running workflow replays its recorded history under whatever code is
 // loaded, so a release that cannot replay one wedges it at its next event
 // (WF-34 would have wedged every task on tavya.io). The candidate replays them
