@@ -84,8 +84,8 @@ import { ConversationExportExpired, createCodexConversationExport, readCodexConv
 import type { AccessMode, AccessStatus, VaultFieldName, VaultItem } from '../autonomy/vault-items.js';
 import { localTaskBrowserUrl, WORLD_CDP_URL } from '../autonomy/task-browser.js';
 import { newId } from '../util/id.js';
-import { DurableEventFanout } from './fanout.js';
-import { authorizationChanged, authorizationEpoch } from '../store/authorization-epoch.js';
+import { DurableEventFanout, type FanoutAudience } from './fanout.js';
+import { affects, authorityChanged, authoritySeq, changedSince, onAuthorityChange, type AuthorityChange, type AuthoritySubject } from '../store/authorization-epoch.js';
 import { configuredPreviewOrigin, hashPreviewToken, newPreviewToken, previewCookieHeader,
   previewCookieValue, previewLeaseOrigin, previewLeaseUrl, previewTokenMatches } from './previews.js';
 import type { RemoteAccessController } from '../remote/access.js';
@@ -617,6 +617,8 @@ const GIT_PASS_AUTO_SYNC_BACKSTOP_MS = 15 * 60_000;
  * when nothing in this process has changed authorization: the bound for
  * revocations made by another replica. */
 const SOCKET_DECISION_TTL_MS = 5_000;
+/** How often an event socket finds its organizations again without a local change (grants another process wrote). */
+const SOCKET_REACH_REFRESH_MS = 30_000;
 /** A browser's event socket can die without a close (sleep, network change,
  * NAT expiry). Each side checks the other this often: the gateway with protocol
  * pings, the console with an application `ping` it can see answered. */
@@ -686,7 +688,7 @@ export class Gateway {
   private terminalStops = new Set<() => Promise<void>>();
   private requestGuards = new WeakMap<http.IncomingMessage, () => Promise<void>>();
   private terminalTickets = new Map<string, { taskId: string; session: Session; expiresAt: number }>();
-  private personDecisions = new Map<string, { caps: Promise<Capability[] | undefined>; until: number }>();
+  private personDecisions = new Map<string, { caps: Promise<Capability[] | undefined>; until: number; seq: number; subject: AuthoritySubject }>();
   private requestLimits = new ClientRequestLimits();
   /** Failed sign-ins per client address and per account. Better Auth's own
    *  limiter only sees `auth.handler` traffic; `/api/login` calls the API
@@ -751,7 +753,9 @@ export class Gateway {
       deps.tokens.connectIdentitySessions((sessionId, userId) => sessionId.startsWith('grant_')
         ? this.appGrants.live(sessionId, userId) : deps.identity!.sessionActive(sessionId, userId));
       deps.identity.connectSessionRevocation?.(async userId => {
-        authorizationChanged(); // sessions live in the identity database, outside the Store's watch
+        // Sessions live in the identity database, outside the Store's watch:
+        // the person's connections check theirs again.
+        authorityChanged({ principals: [`user:${userId}`] });
         for (const [key, cached] of this.identityTokens) if (cached.userId === userId) {
           this.identityTokens.delete(key);
           await deps.tokens.revoke(cached.apiToken);
@@ -826,7 +830,17 @@ export class Gateway {
     const auth = await this.socketAuth(req, url);
     if (!auth) { ws.close(4401, 'unauthorized'); return; }
     if (ws.readyState !== WebSocketClient.OPEN) return;
-    const scoped = (await this.deps.tokens.verify(auth.apiToken));
+    // A person's socket stands on their session and their access, anything
+    // else on its token (and its ancestors and delegations). It decides again
+    // when a change touches what it stands on, never for another principal's
+    // token churn: every agent turn revokes its token, and re-deciding every
+    // socket each time was the 2026-10 load test's first wall.
+    const person = !!(auth.userId && this.deps.authorization);
+    const dependencies = person ? undefined : await this.deps.tokens.dependencies(auth.apiToken);
+    const scoped = person ? await this.deps.tokens.verify(auth.apiToken) : dependencies?.record;
+    if (!person && !scoped) { ws.close(4401, 'unauthorized'); return; }
+    const subject = { principals: new Set(dependencies?.principals ?? [`user:${auth.userId}`]), projects: new Set(dependencies?.projects),
+      organizations: new Set(dependencies?.organizations), tokens: dependencies?.tokens, delegations: dependencies?.delegations } satisfies AuthoritySubject;
     const delivery = new TimingDelivery(async row => (await this.deps.store.appendEvent({ taskId: row.taskId,
       type: 'timing', ts: row.wallMs, payload: { ...row } })), async () => (await this.cachedTimingEnabled()),
       async (context, sink) => (await installationTiming(this.deps.store, context, sink)));
@@ -868,34 +882,35 @@ export class Gateway {
     });
     const watched = (ev: KarmaxEvent, projectId?: string) => !watch || ev.taskId === watch.taskId
       || (projectId === watch.projectId ? !WATCHED_TASK_EVENTS.has(ev.type) : !TASK_DETAIL_EVENTS.has(ev.type));
-    // Decide each task's visibility once and reuse it (LT-15): re-verifying the
-    // token cost several store reads per event per socket, and a streaming agent
-    // publishes several events a second. A decision lasts until this process
-    // commits anything that can withdraw access (revocation, member removal,
-    // project transfer), until a token-based socket's token expires, and at
-    // most SOCKET_DECISION_TTL_MS, which bounds changes made by another replica.
-    const decisions = new Map<string, { allowed: Promise<boolean>; until: number; epoch: number }>();
+    // Decide visibility once and reuse it (LT-15): a streaming agent publishes
+    // several events a second. A person's decision depends on the project, a
+    // token's on the task too (task:manage-own). It lasts until a change
+    // touches what this socket stands on, until a token-based socket's token
+    // expires, and at most SOCKET_DECISION_TTL_MS, which bounds changes made
+    // by another process or replica.
+    let generation = 0;
+    const decisions = new Map<string, { allowed: Promise<boolean>; until: number; generation: number }>();
     const mayRead = (projectId: string | undefined, taskId: string): Promise<boolean> => {
-      const key = `${projectId ?? ''}\0${taskId}`;
+      const key = person ? projectId ?? '' : `${projectId ?? ''}\0${taskId}`;
       const cached = decisions.get(key);
-      if (cached && cached.until > Date.now() && cached.epoch === authorizationEpoch()) return cached.allowed;
+      if (cached && cached.until > Date.now() && cached.generation === generation) return cached.allowed;
       if (decisions.size >= 4096) decisions.clear();
+      if (projectId) subject.projects.add(projectId);
       // Read before deciding: a change committed while the check runs moves it again.
-      const epoch = authorizationEpoch();
+      const decidedIn = generation;
       const allowed = (async () => {
         // A person's socket decides from their grants as they stand now: its
         // token keeps the capabilities it was minted with for ten minutes, so
         // a narrowed grant would otherwise wait for it to rotate (GW-13).
-        if (auth.userId && this.deps.authorization)
-          return !!projectId && allows((await this.personCaps(auth, projectId)), 'task:event:read');
+        if (person) return !!projectId && allows((await this.personCaps(auth, projectId)), 'task:event:read');
         return (await this.deps.tokens.check(auth.apiToken, 'task:event:read', projectId ? { projectId, taskId } : undefined)).ok;
       })();
       // A failed lookup is not a decision: the next event asks again.
       allowed.catch(() => { if (decisions.get(key)?.allowed === allowed) decisions.delete(key); });
       // A person's decision does not depend on the socket token, so it does not
       // expire with it; a token's does.
-      decisions.set(key, { allowed, epoch, until: Math.min(Date.now() + SOCKET_DECISION_TTL_MS,
-        auth.userId && this.deps.authorization ? Infinity : scoped?.expiresAt ?? Infinity) });
+      decisions.set(key, { allowed, generation: decidedIn, until: Math.min(Date.now() + SOCKET_DECISION_TTL_MS,
+        person ? Infinity : scoped?.expiresAt ?? Infinity) });
       return allowed;
     };
     // Streamed text supersedes itself, so a client that has fallen behind gets
@@ -944,8 +959,54 @@ export class Gateway {
           ...(siblingAttempt ? { siblingAttempt } : {}), ...(timingDeliveryId ? { timingDeliveryId } : {}) }));
       } catch { /* ignore */ }
     };
-    const off = this.fanout.on(deliver, () => ws.close(1013, 'Client fell behind; reconnect to refresh'));
-    lifetime.add(off);
+    // The organizations whose events this socket is offered: its person's
+    // (their grants and memberships, and their teams'), or its token's. Every
+    // event is still decided above; this only keeps other tenants' away.
+    const audience = async (): Promise<FanoutAudience> => {
+      if (person) {
+        const reach = await this.deps.store.personReachAsync(auth.userId!);
+        subject.principals = new Set([`user:${auth.userId}`, ...reach.teams.map((id) => `team:${id}`), ...reach.memberOf.map((id) => `organization:${id}`)]);
+        subject.organizations = new Set(reach.organizations);
+        return reach.all ? 'all' : new Set(reach.organizations);
+      }
+      if (scoped!.organizationId) return new Set([scoped!.organizationId]);
+      const projects = [scoped!.projectId, ...(scoped!.projectIds ?? [])].filter((id): id is string => !!id);
+      if (!projects.length) return 'all';
+      const organizations = new Set<string>();
+      for (const projectId of projects) {
+        const organizationId = await this.deps.store.projectOrganizationAsync(projectId);
+        if (organizationId) { organizations.add(organizationId); subject.organizations.add(organizationId); }
+      }
+      return organizations;
+    };
+    let routed: FanoutAudience;
+    try { routed = await audience(); } catch { ws.close(1013, 'Try again later'); return; }
+    if (lifetime.closed) return;
+    const subscription = this.fanout.on(deliver, () => ws.close(1013, 'Client fell behind; reconnect to refresh'), routed);
+    lifetime.add(subscription);
+    // A change to what the socket stands on drops its decisions and finds its
+    // organizations again (a failed lookup keeps the previous ones); so does a
+    // slow timer, for grants another process wrote.
+    let reaching = false, reachAgain = false;
+    const reach = () => {
+      if (reaching) { reachAgain = true; return; }
+      reaching = true;
+      void (async () => {
+        do {
+          reachAgain = false;
+          try { const next = await audience(); if (!lifetime.closed) subscription.audience(next); } catch { /* the next change or tick retries */ }
+        } while (reachAgain && !lifetime.closed);
+      })().finally(() => { reaching = false; });
+    };
+    const relevant = (change: AuthorityChange) => affects(change, subject);
+    lifetime.add(onAuthorityChange((change) => { if (relevant(change)) { generation++; reach(); } }));
+    const reachTimer = setInterval(reach, SOCKET_REACH_REFRESH_MS);
+    reachTimer.unref?.();
+    lifetime.add(() => clearInterval(reachTimer));
+    // The credential the socket was opened with: a revoked token, a signed-out
+    // session, a closed account ends it.
+    keepAuthorized(ws, lifetime, async () => person ? this.sessionLive(auth) : !!(await this.deps.tokens.verify(auth.apiToken)),
+      { relevant, code: 4401, reason: 'credential no longer valid' });
   }
 
   /** Whether a review-action process id was started for `taskId`. Ids are
@@ -1598,7 +1659,7 @@ export class Gateway {
         ? (await this.sessionLive(auth) ? auth : undefined)
         : await this.socketAuth(req, url, task.projectId);
       return !!current && await this.sessionMay(current, 'task:edit', task.projectId, taskId);
-    });
+    }, { relevant: await this.socketRelevance(auth, task.projectId) });
     if (this.closing || ws.readyState !== 1) await stopTerminal();
   }
 
@@ -1636,7 +1697,7 @@ export class Gateway {
     keepAuthorized(ws, lifetime, async () => {
       const current = await this.socketAuth(req, url, task?.projectId);
       return !!current && await this.sessionMay(current, 'task:review:execute', task?.projectId, rec.taskId);
-    });
+    }, { relevant: await this.socketRelevance(auth, task?.projectId) });
   }
 
   // ─── request handling ────────────────────────────────────────────────────────
@@ -8991,12 +9052,14 @@ export class Gateway {
     let requestPath: string;
     /** The connect-time decision, made again while the socket stays open. */
     let stillAllowed: () => Promise<boolean>;
+    let previewProjectId: string | undefined;
     const taskMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/preview\/(\d+)(\/.*)?$/);
     if (taskMatch) {
       if (configuredPreviewOrigin()) { browser.close(4403, 'use isolated preview origin'); return; }
       taskId = decodeURIComponent(taskMatch[1]!);
       port = Number(taskMatch[2]);
       const task = (await this.deps.store.getTask(taskId));
+      previewProjectId = task?.projectId;
       const auth = await this.socketAuth(req, url, task?.projectId);
       stillAllowed = async () => {
         const current = task && await this.socketAuth(req, url, task.projectId);
@@ -9019,6 +9082,7 @@ export class Gateway {
         return !!session && await this.sessionMay(session, 'task:read', current.projectId, current.taskId);
       };
       if (!lease || lease.revokedAt || lease.expiresAt <= Date.now()) { browser.close(4404, 'preview expired'); return; }
+      previewProjectId = lease.projectId;
       if (configuredPreviewOrigin() && String(req.headers.host ?? '').toLowerCase() !== new URL(previewLeaseOrigin(lease.id)).host.toLowerCase()) {
         browser.close(4404, 'preview expired'); return;
       }
@@ -9075,7 +9139,32 @@ export class Gateway {
     upstream.on('close', (code, reason) => { release(); if (browser.readyState === browser.OPEN) browser.close(code || 1000, reason.toString()); });
     upstream.on('error', () => { release(); if (browser.readyState === browser.OPEN) browser.close(1011, 'preview upstream failed'); });
     lifetime.add(() => { if (upstream.readyState !== WebSocketClient.CLOSED) upstream.terminate(); });
-    keepAuthorized(browser, lifetime, stillAllowed);
+    keepAuthorized(browser, lifetime, stillAllowed, { relevant: await this.socketRelevance(await this.socketAuth(req, url, previewProjectId), previewProjectId) });
+  }
+
+  /**
+   * Which authority changes a long-lived socket must decide again for: those
+   * touching its principal (and their teams and organizations), its token
+   * (and the token's ancestors and delegations), or the project it acts in.
+   * A revoked preview lease, a profile edit or any write the Store does not
+   * recognise touches every socket. When what it stands on cannot be read,
+   * every change is relevant.
+   */
+  private async socketRelevance(session: Session | undefined, projectId?: string): Promise<(change: AuthorityChange) => boolean> {
+    try {
+      const organizationId = projectId ? await this.deps.store.projectOrganizationAsync(projectId) : undefined;
+      const dependencies = session ? await this.deps.tokens.dependencies(session.apiToken) : undefined;
+      const principals = new Set(dependencies?.principals);
+      if (session?.userId) {
+        const reach = await this.deps.store.personReachAsync(session.userId);
+        for (const principal of [`user:${session.userId}`, ...reach.teams.map((id) => `team:${id}`), ...reach.memberOf.map((id) => `organization:${id}`)])
+          principals.add(principal);
+      }
+      const subject: AuthoritySubject = { principals, tokens: dependencies?.tokens, delegations: dependencies?.delegations,
+        projects: new Set([...(projectId ? [projectId] : []), ...(dependencies?.projects ?? [])]),
+        organizations: new Set([...(organizationId ? [organizationId] : []), ...(dependencies?.organizations ?? [])]) };
+      return (change) => affects(change, subject);
+    } catch { return () => true; }
   }
 
   /**
@@ -9109,23 +9198,26 @@ export class Gateway {
 
   /** A person's capabilities in a project, or undefined when their account is
    * closed or SSO no longer admits them; shared across their sockets for a
-   * second within one authorization epoch. */
+   * second, until a change touches the person or the project. */
   private personCapabilities(session: Session, projectId: string): Promise<Capability[] | undefined> {
     const userId = session.userId!, email = session.email;
-    const key = `${authorizationEpoch()}\0${userId}\0${session.appGrant?.id ?? ''}\0${projectId}`;
+    const key = `${userId}\0${session.appGrant?.id ?? ''}\0${projectId}`;
     const now = Date.now();
     const cached = this.personDecisions.get(key);
-    if (cached && cached.until > now) return cached.caps;
+    if (cached && cached.until > now && !changedSince(cached.seq, cached.subject)) return cached.caps;
     if (this.personDecisions.size > 1024) this.personDecisions.clear();
+    const seq = authoritySeq();
+    const subject = { principals: new Set([`user:${userId}`]), projects: new Set([projectId]), organizations: new Set<string>() };
     const caps = (async () => {
       if (await this.deps.store.kvGet(`account-closed:${userId}`)) return undefined;
       const organizationId = await this.deps.store.projectOrganizationAsync(projectId);
+      if (organizationId) subject.organizations.add(organizationId);
       if (organizationId && !(await this.ssoAdmits(userId, email, organizationId))) return undefined;
       if (session.appGrant && !(await this.appGrants.live(session.appGrant.id, userId))) return undefined;
       return this.personCaps(session, projectId, organizationId);
     })();
     caps.catch(() => this.personDecisions.delete(key));
-    this.personDecisions.set(key, { caps, until: now + 1_000 });
+    this.personDecisions.set(key, { caps, until: now + 1_000, seq, subject });
     return caps;
   }
 
@@ -9624,10 +9716,11 @@ export class Gateway {
    */
   private async personCaps(session: Pick<Session, 'userId' | 'appGrant'>, projectId?: string, organizationId?: string): Promise<Capability[]> {
     if (!session.userId || !this.deps.authorization) return [];
+    const ceiling = session.appGrant?.ceiling;
+    // The policy finds the project's organization in the same read.
+    if (!ceiling) return this.deps.authorization.capabilitiesAsync(`user:${session.userId}`, projectId, organizationId);
     const resolvedOrganizationId = organizationId ?? (projectId ? await this.deps.store.projectOrganizationAsync(projectId) : undefined);
     const caps = await this.deps.authorization.capabilitiesAsync(`user:${session.userId}`, projectId, resolvedOrganizationId);
-    const ceiling = session.appGrant?.ceiling;
-    if (!ceiling) return caps;
     const level = ceiling.level ? (await this.deps.authorization.profile(ceiling.level, projectId, resolvedOrganizationId))?.capabilities : undefined;
     return grantCapabilities(ceiling, caps, { projectId, organizationId: resolvedOrganizationId }, level);
   }

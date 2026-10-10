@@ -512,8 +512,35 @@ export class AuthorizationService {
     return this.drive(capabilityPolicy(principalId, projectId, organizationId), (request) => this.readCapability(request));
   }
 
+  /** As `capabilities`, from one read of everything the policy can ask about
+   * the scope (`Store.capabilityInputsAsync`). A read outside it, such as
+   * another person's team, is made on its own. */
   async capabilitiesAsync(principalId: string, projectId?: string, organizationId?: string): Promise<Capability[]> {
-    return this.drive(capabilityPolicy(principalId, projectId, organizationId), (request) => this.readCapabilityAsync(request));
+    if (!principalId) return [];
+    const rows = await this.store.capabilityInputsAsync(principalId, projectId, organizationId);
+    const userId = principalId.startsWith('user:') ? principalId.slice(5) : undefined;
+    const projectOrganization = rows.find((row) => row.kind === 'organization')?.b ?? undefined;
+    const profileScopes = new Set(['global', ...(projectId ? [projectScope(projectId)] : []),
+      ...(organizationId ? [organizationScope(organizationId)] : []), ...(projectId ? [organizationScope(projectOrganization ?? 'org_personal')] : [])]);
+    const of = (kind: string) => rows.filter((row) => row.kind === kind);
+    const known = ({ kind, args: [a, b] }: CapabilityRead): { value: unknown } | undefined => {
+      switch (kind) {
+        case 'organization': return a === projectId ? { value: projectOrganization } : undefined;
+        case 'grants': return a === principalId ? { value: of('grant').map((row) => ({ ...JSON.parse(row.c!), principalId: row.a, scopeKey: row.b })) } : undefined;
+        case 'profile': {
+          if (!profileScopes.has(a!)) return undefined;
+          const row = of('profile').find((candidate) => candidate.a === a && candidate.b === b);
+          return { value: row ? { ...JSON.parse(row.c!), scopeKey: row.a } : undefined };
+        }
+        case 'projectMembers': return a === projectId ? { value: of('member').map((row) => ({ projectId, principal: JSON.parse(row.a!), role: row.b })) } : undefined;
+        case 'teamMember': return userId && b === userId ? { value: of('team').some((row) => row.a === a) } : undefined;
+        case 'orgMember': return userId && b === userId ? { value: of('orgMember').some((row) => row.a === a) } : undefined;
+      }
+    };
+    return this.drive(capabilityPolicy(principalId, projectId, organizationId), (request) => {
+      const answer = known(request);
+      return answer ? Promise.resolve(answer.value) : this.readCapabilityAsync(request);
+    });
   }
 
   private async drive<T>(policy: Generator<CapabilityRead, T, unknown>, read: (request: CapabilityRead) => Promise<unknown>): Promise<T> {
