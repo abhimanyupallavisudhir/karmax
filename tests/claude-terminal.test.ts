@@ -299,6 +299,38 @@ describe('Claude Agent SDK terminal outcome contract', () => {
     expect(turn.output).toBe('done');
   });
 
+  // indike.org#2, exten-epi#5: Claude Code hands prose the agent wrote between
+  // tool calls back as a thinking block the server summarized ("narration"), and
+  // lists it in `narration_block_indexes`. Shown as collapsed Reasoning, an
+  // answer to the person ("cancel Task 15") looked like no answer at all.
+  it('shows narration, the prose between tool calls, as a message rather than reasoning', async () => {
+    sdkState.messages = [
+      { type: 'assistant', session_id: 's1', narration_block_indexes: [1, 2], message: { content: [
+        { type: 'thinking', thinking: 'Check the download first.', signature: 'sig-thinking' },
+        { type: 'thinking', thinking: 'Task #15 is a leftover helper; cancel it rather than approving it.', signature: 'sig-narration' },
+        { type: 'thinking', thinking: '', signature: 'sig-empty-narration' },
+        { type: 'tool_use', id: 'toolu_1', name: 'mcp__karmax_control__pause', input: { minutes: 8 } },
+      ] } },
+      { type: 'assistant', session_id: 's1', message: { content: [
+        { type: 'thinking', thinking: 'Unlisted, so ordinary reasoning.', signature: 'sig-unlisted' },
+        { type: 'text', text: "I'll check the download again in about 8 minutes." },
+      ] } },
+      { type: 'result', subtype: 'success', is_error: false, session_id: 's1', stop_reason: 'end_turn' },
+    ];
+    const activities: any[] = [];
+    const turn = await new ClaudeAdapter().runTurn(input, { ...ctx, emitActivity(activity: any) { activities.push(activity); } });
+    const shown = activities.filter((a) => a.kind === 'message' || a.kind === 'reasoning')
+      .map((a) => ({ id: a.id, kind: a.kind, title: a.title, ...(a.detail ? { detail: a.detail } : {}) }));
+    expect(shown).toEqual([
+      { id: 'sig-thinking', kind: 'reasoning', title: 'Reasoning', detail: 'Check the download first.' },
+      { id: 'sig-narration', kind: 'message', title: 'Task #15 is a leftover helper; cancel it rather than approving it.' },
+      { id: 'sig-empty-narration', kind: 'reasoning', title: 'Reasoning' },
+      { id: expect.any(String), kind: 'message', title: "I'll check the download again in about 8 minutes." },
+      { id: 'sig-unlisted', kind: 'reasoning', title: 'Reasoning', detail: 'Unlisted, so ordinary reasoning.' },
+    ]);
+    expect(turn.output).toBe("I'll check the download again in about 8 minutes.");
+  });
+
   it.each(['rate_limit', 'authentication_failed'])('keeps sandbox %s signals task-local', async (code) => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-untrusted-claude-'));
     const world: any = {

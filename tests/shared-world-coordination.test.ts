@@ -113,3 +113,52 @@ linux('times out contention and closes the failed waiter before another acquisit
   expect(next).toBeTypeOf('function');
   next!();
 });
+
+// Load test 2026-10: each lock forked a `flock` helper, a third of the
+// activity worker's core at 96 tenants. One process now shares one access pin
+// per world, and the probe reads /proc/locks instead of trying the lock.
+linux('shares one access lock among a process\'s holders and drops it after the last', async () => {
+  const coordination = new SharedWorldCoordination(directory());
+  const filename = (coordination as any).filename('world', 'access');
+  const first = await coordination.holdAccess('world');
+  const second = await coordination.holdAccess('world');
+  expect(await coordination.hasAccess('world')).toBe(true);
+  // Another process sees the pin while either holder keeps it.
+  const probe = await acquireFileLock(filename, { waitMs: 0 });
+  expect(probe).toBeUndefined();
+  first(); first();
+  expect(await coordination.hasAccess('world')).toBe(true);
+  second();
+  expect(await coordination.hasAccess('world')).toBe(false);
+  const free = await acquireFileLock(filename, { waitMs: 0 });
+  expect(free).toBeDefined();
+  free!();
+});
+
+linux('finds another process\'s pin without forking a lock helper', async () => {
+  const dir = directory();
+  const coordination = new SharedWorldCoordination(dir);
+  expect(await coordination.hasAccess('world')).toBe(false); // no lock file yet
+  const owner = await childOwner(dir, 'access');
+  // With no `flock` to run, any attempt to fork the helper would fail.
+  const searchPath = process.env.PATH;
+  process.env.PATH = '';
+  try {
+    for (let i = 0; i < 20; i++) expect(await coordination.hasAccess('world')).toBe(true);
+    expect(await coordination.hasAccess('other-world')).toBe(false);
+  } finally { process.env.PATH = searchPath; }
+  const closed = once(owner, 'close');
+  owner.kill('SIGKILL');
+  await closed;
+  expect(await coordination.hasAccess('world')).toBe(false);
+});
+
+linux('falls back to trying the lock when /proc/locks cannot be read', async () => {
+  const dir = directory();
+  const coordination = new SharedWorldCoordination(dir, path.join(dir, 'no-such-proc-locks'));
+  const release = await coordination.holdAccess('world');
+  const other = new SharedWorldCoordination(dir, path.join(dir, 'no-such-proc-locks'));
+  expect(await other.hasAccess('world')).toBe(true);
+  release();
+  expect(await other.hasAccess('world')).toBe(false);
+});

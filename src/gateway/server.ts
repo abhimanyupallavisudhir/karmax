@@ -7,7 +7,7 @@ import { ExecutionOutput } from './execution-output.js';
 import { TaskSecrets, handleRef, paymentCardDetails, recordSecretRefs, secretScope } from '../autonomy/task-secrets.js';
 import { AsyncInterval } from '../util/async-interval.js';
 import * as __asyncCollections from '../util/async-collections.js';
-import { GatewayMetrics } from './metrics.js';
+import { GatewayMetrics, type MemorySource } from './metrics.js';
 import { MIME, ARTIFACT_MIME } from '../store/artifact-mime.js';
 import { assetExists, MATHJAX_SCRIPT_SOURCE, serveStaticAsset, staticAssetRevision, unpublishedAsset } from './static-assets.js';
 import { SwrCache } from '../util/swr-cache.js';
@@ -86,8 +86,8 @@ import { ConversationExportExpired, createCodexConversationExport, readCodexConv
 import type { AccessMode, AccessStatus, VaultFieldName, VaultItem } from '../autonomy/vault-items.js';
 import { localTaskBrowserUrl, WORLD_CDP_URL } from '../autonomy/task-browser.js';
 import { newId } from '../util/id.js';
-import { DurableEventFanout } from './fanout.js';
-import { authorizationChanged, authorizationEpoch } from '../store/authorization-epoch.js';
+import { DurableEventFanout, type FanoutAudience } from './fanout.js';
+import { affects, authorityChanged, authoritySeq, changedSince, onAuthorityChange, type AuthorityChange, type AuthoritySubject } from '../store/authorization-epoch.js';
 import { configuredPreviewOrigin, hashPreviewToken, newPreviewToken, previewCookieHeader,
   previewCookieValue, previewLeaseOrigin, previewLeaseUrl, previewTokenMatches } from './previews.js';
 import type { RemoteAccessController } from '../remote/access.js';
@@ -123,6 +123,11 @@ import { CHECKOUT_DISCLOSURES, assertPaidLaunchReady, assertPolicyAcceptance,
 export interface GatewayDeps {
   /** Primary startup/recovery and worker liveness, independent of DB health. */
   runtimeReady?: () => boolean;
+  /** The separate activity process's Store transaction timings, if any. */
+  workerStoreMetrics?: () => import('../store/transaction-metrics.js').StoreMetricsSnapshot | undefined;
+  /** The worker's memory for /api/metrics (RT-35): its child's last report,
+   * or the in-process worker's workflow heap and cache. */
+  memory?: MemorySource;
   serviceConnections?: ServiceConnections;
   api: KarmaxApi;
   store: Store;
@@ -158,6 +163,8 @@ export interface GatewayDeps {
   checkpoints?: import('../world/checkpoint.js').WorldCheckpointService;
   subscriptions?: import('../billing/subscriptions.js').SubscriptionBillingService;
   paidLaunchSettings?: import('../launch/settings.js').PaidLaunchSettingsService;
+  /** Installation → Service limits (operator accounts and this host against their plans). */
+  serviceLimits?: import('../ops/service-limits.js').ServiceLimitsService;
   cellId?: string;
   hosted?: boolean;
   /** Whether the browser and the host are the same machine (see `hostLocal`).
@@ -631,6 +638,8 @@ const GIT_PASS_AUTO_SYNC_BACKSTOP_MS = 15 * 60_000;
  * when nothing in this process has changed authorization: the bound for
  * revocations made by another replica. */
 const SOCKET_DECISION_TTL_MS = 5_000;
+/** How often an event socket finds its organizations again without a local change (grants another process wrote). */
+const SOCKET_REACH_REFRESH_MS = 30_000;
 /** A browser's event socket can die without a close (sleep, network change,
  * NAT expiry). Each side checks the other this often: the gateway with protocol
  * pings, the console with an application `ping` it can see answered. */
@@ -700,7 +709,7 @@ export class Gateway {
   private terminalStops = new Set<() => Promise<void>>();
   private requestGuards = new WeakMap<http.IncomingMessage, () => Promise<void>>();
   private terminalTickets = new Map<string, { taskId: string; session: Session; expiresAt: number }>();
-  private personDecisions = new Map<string, { caps: Promise<Capability[] | undefined>; until: number }>();
+  private personDecisions = new Map<string, { caps: Promise<Capability[] | undefined>; until: number; seq: number; subject: AuthoritySubject }>();
   private requestLimits = new ClientRequestLimits();
   /** Failed sign-ins per client address and per account. Better Auth's own
    *  limiter only sees `auth.handler` traffic; `/api/login` calls the API
@@ -768,7 +777,9 @@ export class Gateway {
       deps.tokens.connectIdentitySessions((sessionId, userId) => sessionId.startsWith('grant_')
         ? this.appGrants.live(sessionId, userId) : deps.identity!.sessionActive(sessionId, userId));
       deps.identity.connectSessionRevocation?.(async userId => {
-        authorizationChanged(); // sessions live in the identity database, outside the Store's watch
+        // Sessions live in the identity database, outside the Store's watch:
+        // the person's connections check theirs again.
+        authorityChanged({ principals: [`user:${userId}`] });
         for (const [key, cached] of this.identityTokens) if (cached.userId === userId) {
           this.identityTokens.delete(key);
           await deps.tokens.revoke(cached.apiToken);
@@ -791,7 +802,7 @@ export class Gateway {
       await notifyCredentialAttention({ store: this.deps.store, configHomes: this.deps.configHomes }, Date.now(), [state.organizationId])
         .catch(() => undefined);
       if (!state.loggedIn) return;
-      const credential = enumerateCredentials(gatherCredentialSources({
+      const credential = enumerateCredentials(await gatherCredentialSources({
         configHomes: this.deps.configHomes,
         broker: this.deps.broker,
         organizationId: state.organizationId,
@@ -843,7 +854,17 @@ export class Gateway {
     const auth = await this.socketAuth(req, url);
     if (!auth) { ws.close(4401, 'unauthorized'); return; }
     if (ws.readyState !== WebSocketClient.OPEN) return;
-    const scoped = (await this.deps.tokens.verify(auth.apiToken));
+    // A person's socket stands on their session and their access, anything
+    // else on its token (and its ancestors and delegations). It decides again
+    // when a change touches what it stands on, never for another principal's
+    // token churn: every agent turn revokes its token, and re-deciding every
+    // socket each time was the 2026-10 load test's first wall.
+    const person = !!(auth.userId && this.deps.authorization);
+    const dependencies = person ? undefined : await this.deps.tokens.dependencies(auth.apiToken);
+    const scoped = person ? await this.deps.tokens.verify(auth.apiToken) : dependencies?.record;
+    if (!person && !scoped) { ws.close(4401, 'unauthorized'); return; }
+    const subject = { principals: new Set(dependencies?.principals ?? [`user:${auth.userId}`]), projects: new Set(dependencies?.projects),
+      organizations: new Set(dependencies?.organizations), tokens: dependencies?.tokens, delegations: dependencies?.delegations } satisfies AuthoritySubject;
     const delivery = new TimingDelivery(async row => (await this.deps.store.appendEvent({ taskId: row.taskId,
       type: 'timing', ts: row.wallMs, payload: { ...row } })), async () => (await this.cachedTimingEnabled()),
       async (context, sink) => (await installationTiming(this.deps.store, context, sink)));
@@ -885,34 +906,35 @@ export class Gateway {
     });
     const watched = (ev: KarmaxEvent, projectId?: string) => !watch || ev.taskId === watch.taskId
       || (projectId === watch.projectId ? !WATCHED_TASK_EVENTS.has(ev.type) : !TASK_DETAIL_EVENTS.has(ev.type));
-    // Decide each task's visibility once and reuse it (LT-15): re-verifying the
-    // token cost several store reads per event per socket, and a streaming agent
-    // publishes several events a second. A decision lasts until this process
-    // commits anything that can withdraw access (revocation, member removal,
-    // project transfer), until a token-based socket's token expires, and at
-    // most SOCKET_DECISION_TTL_MS, which bounds changes made by another replica.
-    const decisions = new Map<string, { allowed: Promise<boolean>; until: number; epoch: number }>();
+    // Decide visibility once and reuse it (LT-15): a streaming agent publishes
+    // several events a second. A person's decision depends on the project, a
+    // token's on the task too (task:manage-own). It lasts until a change
+    // touches what this socket stands on, until a token-based socket's token
+    // expires, and at most SOCKET_DECISION_TTL_MS, which bounds changes made
+    // by another process or replica.
+    let generation = 0;
+    const decisions = new Map<string, { allowed: Promise<boolean>; until: number; generation: number }>();
     const mayRead = (projectId: string | undefined, taskId: string): Promise<boolean> => {
-      const key = `${projectId ?? ''}\0${taskId}`;
+      const key = person ? projectId ?? '' : `${projectId ?? ''}\0${taskId}`;
       const cached = decisions.get(key);
-      if (cached && cached.until > Date.now() && cached.epoch === authorizationEpoch()) return cached.allowed;
+      if (cached && cached.until > Date.now() && cached.generation === generation) return cached.allowed;
       if (decisions.size >= 4096) decisions.clear();
+      if (projectId) subject.projects.add(projectId);
       // Read before deciding: a change committed while the check runs moves it again.
-      const epoch = authorizationEpoch();
+      const decidedIn = generation;
       const allowed = (async () => {
         // A person's socket decides from their grants as they stand now: its
         // token keeps the capabilities it was minted with for ten minutes, so
         // a narrowed grant would otherwise wait for it to rotate (GW-13).
-        if (auth.userId && this.deps.authorization)
-          return !!projectId && allows((await this.personCaps(auth, projectId)), 'task:event:read');
+        if (person) return !!projectId && allows((await this.personCaps(auth, projectId)), 'task:event:read');
         return (await this.deps.tokens.check(auth.apiToken, 'task:event:read', projectId ? { projectId, taskId } : undefined)).ok;
       })();
       // A failed lookup is not a decision: the next event asks again.
       allowed.catch(() => { if (decisions.get(key)?.allowed === allowed) decisions.delete(key); });
       // A person's decision does not depend on the socket token, so it does not
       // expire with it; a token's does.
-      decisions.set(key, { allowed, epoch, until: Math.min(Date.now() + SOCKET_DECISION_TTL_MS,
-        auth.userId && this.deps.authorization ? Infinity : scoped?.expiresAt ?? Infinity) });
+      decisions.set(key, { allowed, generation: decidedIn, until: Math.min(Date.now() + SOCKET_DECISION_TTL_MS,
+        person ? Infinity : scoped?.expiresAt ?? Infinity) });
       return allowed;
     };
     // Streamed text supersedes itself, so a client that has fallen behind gets
@@ -961,8 +983,54 @@ export class Gateway {
           ...(siblingAttempt ? { siblingAttempt } : {}), ...(timingDeliveryId ? { timingDeliveryId } : {}) }));
       } catch { /* ignore */ }
     };
-    const off = this.fanout.on(deliver, () => ws.close(1013, 'Client fell behind; reconnect to refresh'));
-    lifetime.add(off);
+    // The organizations whose events this socket is offered: its person's
+    // (their grants and memberships, and their teams'), or its token's. Every
+    // event is still decided above; this only keeps other tenants' away.
+    const audience = async (): Promise<FanoutAudience> => {
+      if (person) {
+        const reach = await this.deps.store.personReachAsync(auth.userId!);
+        subject.principals = new Set([`user:${auth.userId}`, ...reach.teams.map((id) => `team:${id}`), ...reach.memberOf.map((id) => `organization:${id}`)]);
+        subject.organizations = new Set(reach.organizations);
+        return reach.all ? 'all' : new Set(reach.organizations);
+      }
+      if (scoped!.organizationId) return new Set([scoped!.organizationId]);
+      const projects = [scoped!.projectId, ...(scoped!.projectIds ?? [])].filter((id): id is string => !!id);
+      if (!projects.length) return 'all';
+      const organizations = new Set<string>();
+      for (const projectId of projects) {
+        const organizationId = await this.deps.store.projectOrganizationAsync(projectId);
+        if (organizationId) { organizations.add(organizationId); subject.organizations.add(organizationId); }
+      }
+      return organizations;
+    };
+    let routed: FanoutAudience;
+    try { routed = await audience(); } catch { ws.close(1013, 'Try again later'); return; }
+    if (lifetime.closed) return;
+    const subscription = this.fanout.on(deliver, () => ws.close(1013, 'Client fell behind; reconnect to refresh'), routed);
+    lifetime.add(subscription);
+    // A change to what the socket stands on drops its decisions and finds its
+    // organizations again (a failed lookup keeps the previous ones); so does a
+    // slow timer, for grants another process wrote.
+    let reaching = false, reachAgain = false;
+    const reach = () => {
+      if (reaching) { reachAgain = true; return; }
+      reaching = true;
+      void (async () => {
+        do {
+          reachAgain = false;
+          try { const next = await audience(); if (!lifetime.closed) subscription.audience(next); } catch { /* the next change or tick retries */ }
+        } while (reachAgain && !lifetime.closed);
+      })().finally(() => { reaching = false; });
+    };
+    const relevant = (change: AuthorityChange) => affects(change, subject);
+    lifetime.add(onAuthorityChange((change) => { if (relevant(change)) { generation++; reach(); } }));
+    const reachTimer = setInterval(reach, SOCKET_REACH_REFRESH_MS);
+    reachTimer.unref?.();
+    lifetime.add(() => clearInterval(reachTimer));
+    // The credential the socket was opened with: a revoked token, a signed-out
+    // session, a closed account ends it.
+    keepAuthorized(ws, lifetime, async () => person ? this.sessionLive(auth) : !!(await this.deps.tokens.verify(auth.apiToken)),
+      { relevant, code: 4401, reason: 'credential no longer valid' });
   }
 
   /** Whether a review-action process id was started for `taskId`. Ids are
@@ -1098,7 +1166,7 @@ export class Gateway {
 
   private async explanationApiKey(provider: string, organizationId: string, projectId: string, taskId: string): Promise<string | undefined> {
     const aliases = credentialAliases(provider);
-    const credentials = enumerateCredentials(gatherCredentialSources({
+    const credentials = enumerateCredentials(await gatherCredentialSources({
       configHomes: this.deps.configHomes,
       broker: this.deps.broker,
       organizationId,
@@ -1110,7 +1178,7 @@ export class Gateway {
     if (!credential) return undefined;
     if (credential.apiKeyHandle) {
       if (!this.deps.broker) return undefined;
-      return this.deps.broker.resolve(credential.apiKeyHandle, { taskId, caps: ['use-credential:*'] });
+      return await this.deps.broker.resolve(credential.apiKeyHandle, { taskId, caps: ['use-credential:*'] });
     }
     return process.env[apiKeyEnv(credential.provider)];
   }
@@ -1268,7 +1336,7 @@ export class Gateway {
   async listen(preferredPort = DEFAULT_GATEWAY_PORT): Promise<{ url: string; internalUrl: string; port: number; close: () => Promise<void> }> {
     const port = await findFreePortFrom(preferredPort);
     const bindHost = process.env.KARMAX_HOST?.trim() || '127.0.0.1';
-    this.operationalMetrics = new GatewayMetrics();
+    this.operationalMetrics = new GatewayMetrics(this.deps.memory);
     const server = http.createServer((req, res) => {
       const finish = this.operationalMetrics!.begin(req.url ?? '/');
       res.once('finish', () => finish(res.statusCode));
@@ -1548,7 +1616,7 @@ export class Gateway {
         ? (await this.sessionLive(auth) ? auth : undefined)
         : await this.socketAuth(req, url, task.projectId);
       return !!current && await this.sessionMay(current, 'task:edit', task.projectId, taskId);
-    });
+    }, { relevant: await this.socketRelevance(auth, task.projectId) });
     if (this.closing || ws.readyState !== 1) await stopTerminal();
   }
 
@@ -1586,7 +1654,7 @@ export class Gateway {
     keepAuthorized(ws, lifetime, async () => {
       const current = await this.socketAuth(req, url, task?.projectId);
       return !!current && await this.sessionMay(current, 'task:review:execute', task?.projectId, rec.taskId);
-    });
+    }, { relevant: await this.socketRelevance(auth, task?.projectId) });
   }
 
   // ─── request handling ────────────────────────────────────────────────────────
@@ -1616,7 +1684,8 @@ export class Gateway {
     const url = new URL(req.url ?? '/', 'http://localhost');
     const p = url.pathname;
     // Resource repositories: restic in task worlds (and the worker), with
-    // grants of their own, never a session; not the browser API's limits.
+    // grants of their own, never a session; each grant is metered on its own
+    // (GrantLimits), not by the address it came from.
     if (p.startsWith(REPOSITORY_ROUTE) && this.deps.resources?.repositoryServer)
       return this.deps.resources.repositoryServer.handle(req, res, p.slice(REPOSITORY_ROUTE.length) + url.search);
     const sensitiveNavigation = /^\/api\/tasks\/[^/]+\/(desktop|preview\/)/.test(p);
@@ -1642,8 +1711,10 @@ export class Gateway {
     // preventing arbitrary public certificate issuance through the catch-all.
     if (p === '/api/tls/preview-allow' && req.method === 'GET') {
       const domain = (url.searchParams.get('domain') ?? '').trim().toLowerCase();
-      res.writeHead((await this.deps.store.previewHostnameAllowed(domain)) ? 204 : 403,
-        { 'cache-control': 'no-store', 'content-length': '0' });
+      const allowed = (await this.deps.store.previewHostnameAllowed(domain));
+      // Counted toward Let's Encrypt's weekly limit (Installation → Service limits).
+      if (allowed) await this.deps.store.recordPreviewCertificateRequest(domain).catch(() => {});
+      res.writeHead(allowed ? 204 : 403, { 'cache-control': 'no-store', 'content-length': '0' });
       return void res.end();
     }
     // The remote MCP server's own `/api` calls were counted as its `/mcp` request.
@@ -1954,14 +2025,14 @@ export class Gateway {
       // App serves every tenant.
       if (!pending || pending.purpose !== 'manifest')
         return (await this.githubCallbackPage(res, 400, 'This GitHub App setup link is invalid, expired, or belongs to another user.'));
-      if (this.deps.githubApp.configured())
+      if (await this.deps.githubApp.configured())
         return (await this.githubCallbackPage(res, 409, 'A GitHub App is already configured.'));
       try {
         await this.deps.githubApp.convertManifest(code);
         const installState = (await this.deps.store.createGithubInstallState(pending.organizationId, identity.user.id,
           pending.returnTo === 'profile' ? { returnTo: 'profile', selectAccount: pending.selectAccount,
             githubAccountId: pending.githubAccountId, githubLogin: pending.githubLogin } : {}));
-        res.writeHead(303, { location: this.deps.githubApp.installationUrl(installState) });
+        res.writeHead(303, { location: await this.deps.githubApp.installationUrl(installState) });
         return void res.end();
       } catch (error) {
         return (await this.githubCallbackPage(res, 502, `GitHub App setup failed: ${error instanceof Error ? error.message : String(error)}`));
@@ -2022,7 +2093,7 @@ export class Gateway {
           // Verify through GitHub first; they then pick the installation they just made.
           const oauthState = (await this.deps.store.createGithubInstallState(pending.organizationId, identity.user.id,
             { returnTo: 'installation' }));
-          res.writeHead(303, { location: this.deps.githubApp.userAuthorizationUrl(oauthState, (await this.githubPublicUrl(req))) });
+          res.writeHead(303, { location: await this.deps.githubApp.userAuthorizationUrl(oauthState, (await this.githubPublicUrl(req))) });
           return void res.end();
         } else if (this.deps.hosted) {
           return (await this.githubCallbackPage(res, 403, 'Connect your GitHub account first, then install the App.'));
@@ -2040,7 +2111,7 @@ export class Gateway {
             { returnTo: 'profile', selectAccount: pending.selectAccount,
               githubAccountId: pending.githubAccountId, githubLogin: pending.githubLogin }));
           const publicUrl = (await this.githubPublicUrl(req));
-          res.writeHead(303, { location: this.deps.githubApp.userAuthorizationUrl(oauthState, publicUrl, {
+          res.writeHead(303, { location: await this.deps.githubApp.userAuthorizationUrl(oauthState, publicUrl, {
             login: pending.githubLogin, selectAccount: pending.selectAccount,
           }) });
           return void res.end();
@@ -2402,7 +2473,7 @@ export class Gateway {
           finishReplay = b.finishReplay === true;
           (await store.kvSet(key, JSON.stringify(record)));
         }
-        const credentials = enumerateCredentials(gatherCredentialSources({
+        const credentials = enumerateCredentials(await gatherCredentialSources({
           configHomes: this.deps.configHomes,
           broker: this.deps.broker,
           organizationId,
@@ -2418,8 +2489,8 @@ export class Gateway {
             || (await this.deps.githubApp?.status(subject.userId))?.userAuthorized
             || (await store.listGitConnections(organizationId)).some((connection) => !connection.suspendedAt)),
           agentLogin: enabledCredentials.length > 0,
-          e2b: [e2b, daytona].some(connection => connection?.enabled
-            && this.deps.broker?.hasHandle(connection.credentialHandle)),
+          e2b: (await Promise.all([e2b, daytona].map(async (connection) => !!connection?.enabled
+            && !!await this.deps.broker?.hasHandle(connection.credentialHandle)))).some(Boolean),
           paidPlan: await this.deps.subscriptions?.hasPaidSubscription(organizationId) ?? false,
           vault: (await new VaultItems(store, this.deps.broker, undefined, organizationId).list())
             .some((item) => item.type === 'login' && item.fields.includes('password')),
@@ -2520,6 +2591,27 @@ export class Gateway {
         const siteName = String(b.siteName).trim();
         (await store.setSettings('global', 'appearance', { ...appearance, siteName }));
         return this.json(res, 200, { ok: true, siteName });
+      }
+      // Installation-wide: operator accounts' usage is never an organization's
+      // business, so the checks carry no organization or project scope.
+      if (p === '/api/settings/service-limits' || p === '/api/settings/service-limits/check') {
+        const service = this.deps.serviceLimits;
+        if (!service) return this.json(res, 503, { error: 'service limits are unavailable' });
+        const write = method !== 'GET';
+        if (!['GET', 'PUT', 'POST'].includes(method) || (p.endsWith('/check') ? method !== 'POST' : method === 'POST'))
+          return this.json(res, 405, { error: 'method not allowed' });
+        if (!(await this.deps.tokens.check(token, write ? 'settings:write' : 'settings:read')).ok)
+          return this.json(res, 403, { error: `Only a ${(await this.siteName)} installation operator can ${write ? 'change' : 'see'} service limits` });
+        if (method === 'PUT') {
+          const { ServiceLimitsInputError } = await import('../ops/service-limits.js');
+          try { (await service.configure(await this.body(req))); }
+          catch (error) {
+            if (error instanceof ServiceLimitsInputError) return this.json(res, 400, { error: error.message });
+            throw error;
+          }
+        }
+        const view = method === 'GET' ? (await service.view()) : (await service.run());
+        return this.json(res, 200, { ...view, canManage: write || (await this.deps.tokens.check(token, 'settings:write')).ok });
       }
       if (p === '/api/settings/paid-launch/paddle/provision' && method === 'POST') {
         if (!(await this.deps.tokens.check(token, 'settings:write')).ok)
@@ -2905,9 +2997,9 @@ export class Gateway {
         const gitProfiles = new GitProfiles(store, this.deps.broker, undefined, organizationId);
         for (const profile of (await gitProfiles.list())) (await gitProfiles.delete(profile.name));
         const { agentAccountHandles } = await import('../platform/credential-sources.js');
-        for (const handle of agentAccountHandles(this.deps.broker?.listHandles() ?? [], organizationId))
+        for (const handle of agentAccountHandles(await this.deps.broker?.listHandles() ?? [], organizationId))
           (await this.deps.broker?.deleteHandle(handle));
-        this.deps.configHomes?.removeOrganization(organizationId);
+        await this.deps.configHomes?.removeOrganization(organizationId);
         await this.deps.workflows?.removeOrganization(organizationId);
         const { deleteOrganizationAutonomy } = await import('../autonomy/cleanup.js');
         await deleteOrganizationAutonomy(store, this.deps.broker, organizationId);
@@ -3119,7 +3211,7 @@ export class Gateway {
         if (!this.deps.githubApp) return this.json(res, 503, { error: 'GitHub integration is unavailable' });
         if (!(await this.deps.tokens.check(token, 'settings:write')).ok)
           return this.json(res, 403, { error: `Only a ${(await this.siteName)} installation administrator can create the shared GitHub App` });
-        if (this.deps.githubApp.configured()) return this.json(res, 409, { error: 'a GitHub App is already configured' });
+        if (await this.deps.githubApp.configured()) return this.json(res, 409, { error: 'a GitHub App is already configured' });
         const b = await this.body(req);
         const state = (await store.createGithubInstallState(githubManifest[1]!, subject.userId,
           { purpose: 'manifest', ...(b.returnTo === 'profile' ? { returnTo: 'profile' as const, selectAccount: true } : {}) }));
@@ -3145,7 +3237,7 @@ export class Gateway {
         const state = (await store.createGithubInstallState(githubAuthorize[1]!, subject.userId,
           b.returnTo === 'profile' || b.returnTo === 'installation' ? { returnTo: b.returnTo, githubAccountId: reconnectAccountId,
             githubLogin: reconnectLogin, selectAccount: b.mode === 'add' } : {}));
-        try { return this.json(res, 200, { url: this.deps.githubApp.userAuthorizationUrl(state, (await this.githubPublicUrl(req)), {
+        try { return this.json(res, 200, { url: await this.deps.githubApp.userAuthorizationUrl(state, (await this.githubPublicUrl(req)), {
           login: reconnectLogin, selectAccount: b.mode === 'add',
         }) }); }
         catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
@@ -3154,17 +3246,17 @@ export class Gateway {
       if (githubInstallUrl && method === 'POST') {
         const subject = requireHumanSubject(callerIdentity);
         const githubApp = this.deps.githubApp;
-        if (!githubApp?.configured()) return this.json(res, 503, { error: 'Set up the GitHub App first' });
+        if (!githubApp || !await githubApp.configured()) return this.json(res, 503, { error: 'Set up the GitHub App first' });
         const state = (await store.createGithubInstallState(githubInstallUrl[1]!, subject.userId));
         const status = await githubApp.status(subject.userId);
         const authorize = async () => {
           const oauthState = await store.createGithubInstallState(githubInstallUrl[1]!, subject.userId, { returnTo: 'installation' });
-          return this.json(res, 200, { url: githubApp.userAuthorizationUrl(oauthState, await this.githubPublicUrl(req)) });
+          return this.json(res, 200, { url: await githubApp.userAuthorizationUrl(oauthState, await this.githubPublicUrl(req)) });
         };
         if (!status.userAuthorized && status.oauthConfigured) return authorize();
         try {
           const installations = status.userAuthorized ? await githubApp.connectableInstallations(subject.userId) : [];
-          return this.json(res, 200, { url: githubApp.installationUrl(state), installations, canAuthorize: status.oauthConfigured });
+          return this.json(res, 200, { url: await githubApp.installationUrl(state), installations, canAuthorize: status.oauthConfigured });
         } catch (error) {
           // A revoked/expired user token may be removed during discovery. Resume
           // authorization instead of sending an existing installation to GitHub's dead end.
@@ -3175,7 +3267,7 @@ export class Gateway {
       const githubConnectExisting = p.match(/^\/api\/organizations\/([^/]+)\/github\/connect-existing$/);
       if (githubConnectExisting && method === 'POST') {
         const subject = requireHumanSubject(callerIdentity);
-        if (!this.deps.githubApp?.configured()) return this.json(res, 503, { error: 'Set up the GitHub App first' });
+        if (!this.deps.githubApp || !await this.deps.githubApp.configured()) return this.json(res, 503, { error: 'Set up the GitHub App first' });
         if (!(await store.organizationMembership(githubConnectExisting[1]!, subject.userId)))
           return this.json(res, 403, { error: 'user is not an organization member' });
         const body = await this.body(req);
@@ -3186,7 +3278,7 @@ export class Gateway {
       }
       const githubRefresh = p.match(/^\/api\/organizations\/([^/]+)\/github\/refresh$/);
       if (githubRefresh && method === 'POST') {
-        if (!this.deps.githubApp?.configured()) return this.json(res, 503, { error: 'Set up and install the GitHub App first' });
+        if (!this.deps.githubApp || !await this.deps.githubApp.configured()) return this.json(res, 503, { error: 'Set up and install the GitHub App first' });
         try {
           const repositories: import('../domain/types.js').Repository[] = [];
           for (const connection of (await store.listGitConnections(githubRefresh[1]!)))
@@ -3213,7 +3305,7 @@ export class Gateway {
       const createOrganizationRepository = p.match(/^\/api\/organizations\/([^/]+)\/repositories\/create$/);
       if (createOrganizationRepository && method === 'POST') {
         const subject = requireHumanSubject(callerIdentity);
-        if (!this.deps.githubApp?.configured()) return this.json(res, 503, { error: 'Set up and install the GitHub App first' });
+        if (!this.deps.githubApp || !await this.deps.githubApp.configured()) return this.json(res, 503, { error: 'Set up and install the GitHub App first' });
         const b = await this.body(req);
         const connection = (await store.getGitConnection(String(b.gitConnectionId ?? '')));
         if (!connection || connection.organizationId !== createOrganizationRepository[1])
@@ -3561,7 +3653,7 @@ export class Gateway {
       }
       if (p === '/api/metrics' && method === 'GET') {
         const pool = store.asyncReadStats;
-        const value = prometheusMetrics((await store.operationalSnapshot())) + (this.operationalMetrics?.prometheus() ?? '')
+        const value = prometheusMetrics((await store.operationalSnapshot())) + (this.operationalMetrics?.prometheus(this.deps.workerStoreMetrics?.()) ?? '')
           + `# TYPE karmax_database_pending gauge\nkarmax_database_pending ${pool.pending}\n`
           + `# TYPE karmax_database_connections gauge\nkarmax_database_connections ${pool.connections}\n`
           + `# TYPE karmax_database_waiting gauge\nkarmax_database_waiting ${pool.waiting}\n`;
@@ -6450,8 +6542,8 @@ export class Gateway {
           }
           if (p === '/api/mcp/registry' && method === 'GET')
             return this.json(res, 200, await registrySearch(url.searchParams.get('search') ?? '', url.searchParams.get('cursor') ?? ''));
-          if (p === '/api/mcp' && method === 'GET') return this.json(res, 200, (await connections.list(projectId)).map((c) => ({ ...c,
-            connected: c.auth === 'none' || (c.auth === 'secrets' ? c.secretNames.length > 0 : !!connections.secret(c).tokens?.access_token) })));
+          if (p === '/api/mcp' && method === 'GET') return this.json(res, 200, await Promise.all((await connections.list(projectId)).map(async (c) => ({ ...c,
+            connected: c.auth === 'none' || (c.auth === 'secrets' ? c.secretNames.length > 0 : !!(await connections.secret(c)).tokens?.access_token) }))));
           if (p === '/api/mcp' && method === 'POST') {
             const saved = (await connections.save(await this.body(req), projectId));
             (await store.appendAudit({ principalId: actor, action: 'mcp.connection.saved', scopeKey: auditScope, detail: { id: saved.id, revision: saved.revision } }));
@@ -6781,7 +6873,7 @@ export class Gateway {
         try {
           if (p === '/api/connections/config') {
             if (method === 'PUT') await service.configure(String(b.apiKey ?? ''));
-            if (method === 'GET' || method === 'PUT') return this.json(res, 200, { configured: service.configured(), canConfigure: (await this.deps.tokens.check(token, 'settings:write')).ok });
+            if (method === 'GET' || method === 'PUT') return this.json(res, 200, { configured: await service.configured(), canConfigure: (await this.deps.tokens.check(token, 'settings:write')).ok });
           }
           if (p === '/api/connections/catalog' && method === 'GET')
             return this.json(res, 200, await service.catalog(url.searchParams.get('search') ?? ''));
@@ -7277,7 +7369,7 @@ export class Gateway {
               }
               if (connName[1] === 'pass-git') {
                 if (action === 'check') {
-                  const secret = connectors.secretFor('pass-git');
+                  const secret = await connectors.secretFor('pass-git');
                   if (!secret) throw new Error('Connect a password store first');
                   return this.json(res, 200, await connectors.get('pass-git')!.validateSecret!(secret));
                 }
@@ -7382,7 +7474,7 @@ export class Gateway {
               : `sign in again (or ask a person to, through this task's desktop), then call save_session with itemId ${item.id}`;
             const checked = (await vault.access(caps, callerTaskId, item, 'use'));
             if (checked.status !== 'granted') return this.json(res, 200, await raise(checked, item));
-            const stored = vault.readSecret(item, 'session');
+            const stored = await vault.readSecret(item, 'session');
             if (!stored || !sessionState(parseSavedSession(stored), domains).usable)
               return this.json(res, 200, { status: 'expired', itemId: item.id, ...(fallback.length ? { fallback } : {}), next: `the saved session has expired: ${signInAgain}` });
             const opener = await this.taskPageOpener(callerTaskId, 'saved sessions');
@@ -7470,6 +7562,8 @@ export class Gateway {
                   const started = await this.passkeys.begin(async () => page, { expectDomains: domains, mode: 'login', credential: creds[0], owner: passkeyOwner, reserved: true,
                     onCredentials: async updated => {
                       await store.transaction(async () => {
+                        // The sign counter only grows: rewrite it under the vault lock.
+                        await store.lock(`vault:${organizationId}`);
                         const current = await vault.get(item.id);
                         if (!current || current.type !== 'passkey') return;
                         const secret = await vault.readSecret(current, 'passkey');
@@ -7727,7 +7821,7 @@ export class Gateway {
       if (resourcePath === '/api/accounts' && method === 'GET') {
         const { agentAccountHandles } = await import('../platform/credential-sources.js');
         return this.json(res, 200, {
-          handles: agentAccountHandles(this.deps.broker?.listHandles() ?? [], resourceOrganizationId),
+          handles: agentAccountHandles(await this.deps.broker?.listHandles() ?? [], resourceOrganizationId),
           // never expose the home's absolute path to the browser
           logins: (this.deps.configHomes?.list(resourceOrganizationId) ?? []).map((a) => ({
             provider: a.provider,
@@ -7772,7 +7866,7 @@ export class Gateway {
           ? `${provider}:${name}`
           : `${provider}:${resourceOrganizationId}:${name}`;
         const handle = handleFor(account);
-        if (!this.deps.broker.hasHandle(handle)) return this.json(res, 404, { error: 'API key not found' });
+        if (!await this.deps.broker.hasHandle(handle)) return this.json(res, 404, { error: 'API key not found' });
         const credentialKey = `key:handle:${handle}`;
         if (method === 'DELETE') {
           (await this.deps.broker.deleteHandle(handle));
@@ -7784,7 +7878,7 @@ export class Gateway {
         const nextAccount = b.account === undefined ? account : String(b.account);
         if (!simpleId.test(nextAccount)) return this.json(res, 400, { error: 'account must be a simple id' });
         const nextHandle = handleFor(nextAccount);
-        if (nextHandle !== handle && this.deps.broker.hasHandle(nextHandle))
+        if (nextHandle !== handle && await this.deps.broker.hasHandle(nextHandle))
           return this.json(res, 409, { error: `API key ${provider}:${nextAccount} already exists` });
         const replacement = b.apiKey === undefined || b.apiKey === '' ? undefined : String(b.apiKey);
         (await this.deps.broker.updateHandle(handle, nextHandle, organizationScope(resourceOrganizationId), replacement));
@@ -7844,7 +7938,7 @@ export class Gateway {
         }
         await this.refreshLoginPool();
         if (result.status === 'logged_in') {
-          const credential = enumerateCredentials(gatherCredentialSources({
+          const credential = enumerateCredentials(await gatherCredentialSources({
             configHomes: this.deps.configHomes,
             broker: this.deps.broker,
             organizationId: resourceOrganizationId,
@@ -7864,11 +7958,11 @@ export class Gateway {
         const provider = rawProvider;
         const account = decodeURIComponent(loginMatch[2]!);
         if (method === 'DELETE') {
-          this.deps.configHomes.remove(provider, account, resourceOrganizationId);
+          await this.deps.configHomes.remove(provider, account, resourceOrganizationId);
         } else {
           const b = await this.body(req);
           if (!b.account) return this.json(res, 400, { error: 'new account name required' });
-          this.deps.configHomes.rename(provider, account, String(b.account), resourceOrganizationId);
+          await this.deps.configHomes.rename(provider, account, String(b.account), resourceOrganizationId);
         }
         await this.refreshLoginPool();
         return this.json(res, 200, { ok: true });
@@ -8020,7 +8114,7 @@ export class Gateway {
         if (!this.deps.client) return this.json(res, 400, { error: 'no temporal client' });
         const b = await this.body(req);
         if (!b.accountId || !b.status) return this.json(res, 400, { error: 'accountId and status required' });
-        if (!this.organizationCredentialKeys(resourceOrganizationId).includes(String(b.accountId)))
+        if (!(await this.organizationCredentialKeys(resourceOrganizationId)).includes(String(b.accountId)))
           return this.json(res, 404, { error: 'credential not found in this organization' });
         const status = ['available', 'manual-off', 'needs-attention', 'exhausted'].includes(b.status) ? b.status : 'exhausted';
         const { makeCoordinatorActivities } = await import('../activities/coordinator.js');
@@ -8038,7 +8132,7 @@ export class Gateway {
       if (resourcePath === '/api/accounts/concurrency' && method === 'POST') {
         const b = await this.body(req);
         if (!b.accountId) return this.json(res, 400, { error: 'accountId required' });
-        if (!this.organizationCredentialKeys(resourceOrganizationId).includes(String(b.accountId)))
+        if (!(await this.organizationCredentialKeys(resourceOrganizationId)).includes(String(b.accountId)))
           return this.json(res, 404, { error: 'credential not found in this organization' });
         const { concurrencyKey } = await import('../platform/credential-sources.js');
         const { UNLIMITED_CONCURRENCY } = await import('../coordinators/names.js');
@@ -8056,7 +8150,7 @@ export class Gateway {
         const { enumerateCredentials } = await import('../platform/credentials.js');
         const { gatherCredentialSources } = await import('../platform/credential-sources.js');
         const { isUsagePollable, isUsageStale } = await import('../agent/usage.js');
-        const creds = enumerateCredentials(gatherCredentialSources({
+        const creds = enumerateCredentials(await gatherCredentialSources({
           configHomes: this.deps.configHomes,
           broker: this.deps.broker,
           organizationId: resourceOrganizationId,
@@ -8108,7 +8202,7 @@ export class Gateway {
           : resourceOrganizationId;
         if (scopedOrganizationId !== resourceOrganizationId)
           return this.json(res, 400, { error: 'credential scope does not belong to this organization' });
-        const creds = enumerateCredentials(gatherCredentialSources({
+        const creds = enumerateCredentials(await gatherCredentialSources({
           configHomes: this.deps.configHomes,
           broker: this.deps.broker,
           organizationId: scopedOrganizationId,
@@ -8605,7 +8699,7 @@ export class Gateway {
   private async discoverModels(organizationId: string): Promise<ModelCatalog> {
     const { gatherCredentialSources } = await import('../platform/credential-sources.js');
     const { enumerateCredentials } = await import('../platform/credentials.js');
-    const creds = enumerateCredentials(gatherCredentialSources({
+    const creds = enumerateCredentials(await gatherCredentialSources({
       configHomes: this.deps.configHomes,
       broker: this.deps.broker,
       organizationId,
@@ -8676,13 +8770,12 @@ export class Gateway {
     this.modelCatalog.invalidate();
     if (!this.deps.configHomes || !this.deps.client) return;
     const { concurrencyFor } = await import('../platform/credential-sources.js');
-    const creds = (await this.deps.store.listOrganizations()).flatMap((organization) =>
-      enumerateCredentials(gatherCredentialSources({
+    const creds = (await Promise.all((await this.deps.store.listOrganizations()).map(async (organization) =>
+      enumerateCredentials(await gatherCredentialSources({
         configHomes: this.deps.configHomes,
         broker: this.deps.broker,
         organizationId: organization.id,
-      })),
-    );
+      }))))).flat();
     const pool = (await __asyncCollections.map(creds, async (c) => {
       const maxConcurrent = (await concurrencyFor(async (k) => (await this.deps.store.kvGet(k)), c.key));
       const credentialProvider = c.kind === 'key' ? c.provider : c.modelProvider;
@@ -8716,7 +8809,7 @@ export class Gateway {
   }
 
   private async organizationAccountStatus(organizationId: string): Promise<Array<Record<string, any>>> {
-    const keys = new Set(this.organizationCredentialKeys(organizationId));
+    const keys = new Set(await this.organizationCredentialKeys(organizationId));
     let view: { accounts?: Array<Record<string, any>> } = {};
     try {
       view = await withTimeout(this.deps.client.workflow.getHandle(accountCoordinatorId()).query('accounts'), 3000) as typeof view;
@@ -8738,8 +8831,8 @@ export class Gateway {
     });
   }
 
-  private organizationCredentialKeys(organizationId: string): string[] {
-    return enumerateCredentials(gatherCredentialSources({
+  private async organizationCredentialKeys(organizationId: string): Promise<string[]> {
+    return enumerateCredentials(await gatherCredentialSources({
       configHomes: this.deps.configHomes,
       broker: this.deps.broker,
       organizationId,
@@ -9039,12 +9132,14 @@ export class Gateway {
     let requestPath: string;
     /** The connect-time decision, made again while the socket stays open. */
     let stillAllowed: () => Promise<boolean>;
+    let previewProjectId: string | undefined;
     const taskMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/preview\/(\d+)(\/.*)?$/);
     if (taskMatch) {
       if (configuredPreviewOrigin()) { browser.close(4403, 'use isolated preview origin'); return; }
       taskId = decodeURIComponent(taskMatch[1]!);
       port = Number(taskMatch[2]);
       const task = (await this.deps.store.getTask(taskId));
+      previewProjectId = task?.projectId;
       const auth = await this.socketAuth(req, url, task?.projectId);
       stillAllowed = async () => {
         const current = task && await this.socketAuth(req, url, task.projectId);
@@ -9067,6 +9162,7 @@ export class Gateway {
         return !!session && await this.sessionMay(session, 'task:read', current.projectId, current.taskId);
       };
       if (!lease || lease.revokedAt || lease.expiresAt <= Date.now()) { browser.close(4404, 'preview expired'); return; }
+      previewProjectId = lease.projectId;
       if (configuredPreviewOrigin() && String(req.headers.host ?? '').toLowerCase() !== new URL(previewLeaseOrigin(lease.id)).host.toLowerCase()) {
         browser.close(4404, 'preview expired'); return;
       }
@@ -9123,7 +9219,32 @@ export class Gateway {
     upstream.on('close', (code, reason) => { release(); if (browser.readyState === browser.OPEN) browser.close(code || 1000, reason.toString()); });
     upstream.on('error', () => { release(); if (browser.readyState === browser.OPEN) browser.close(1011, 'preview upstream failed'); });
     lifetime.add(() => { if (upstream.readyState !== WebSocketClient.CLOSED) upstream.terminate(); });
-    keepAuthorized(browser, lifetime, stillAllowed);
+    keepAuthorized(browser, lifetime, stillAllowed, { relevant: await this.socketRelevance(await this.socketAuth(req, url, previewProjectId), previewProjectId) });
+  }
+
+  /**
+   * Which authority changes a long-lived socket must decide again for: those
+   * touching its principal (and their teams and organizations), its token
+   * (and the token's ancestors and delegations), or the project it acts in.
+   * A revoked preview lease, a profile edit or any write the Store does not
+   * recognise touches every socket. When what it stands on cannot be read,
+   * every change is relevant.
+   */
+  private async socketRelevance(session: Session | undefined, projectId?: string): Promise<(change: AuthorityChange) => boolean> {
+    try {
+      const organizationId = projectId ? await this.deps.store.projectOrganizationAsync(projectId) : undefined;
+      const dependencies = session ? await this.deps.tokens.dependencies(session.apiToken) : undefined;
+      const principals = new Set(dependencies?.principals);
+      if (session?.userId) {
+        const reach = await this.deps.store.personReachAsync(session.userId);
+        for (const principal of [`user:${session.userId}`, ...reach.teams.map((id) => `team:${id}`), ...reach.memberOf.map((id) => `organization:${id}`)])
+          principals.add(principal);
+      }
+      const subject: AuthoritySubject = { principals, tokens: dependencies?.tokens, delegations: dependencies?.delegations,
+        projects: new Set([...(projectId ? [projectId] : []), ...(dependencies?.projects ?? [])]),
+        organizations: new Set([...(organizationId ? [organizationId] : []), ...(dependencies?.organizations ?? [])]) };
+      return (change) => affects(change, subject);
+    } catch { return () => true; }
   }
 
   /**
@@ -9157,23 +9278,26 @@ export class Gateway {
 
   /** A person's capabilities in a project, or undefined when their account is
    * closed or SSO no longer admits them; shared across their sockets for a
-   * second within one authorization epoch. */
+   * second, until a change touches the person or the project. */
   private personCapabilities(session: Session, projectId: string): Promise<Capability[] | undefined> {
     const userId = session.userId!, email = session.email;
-    const key = `${authorizationEpoch()}\0${userId}\0${session.appGrant?.id ?? ''}\0${projectId}`;
+    const key = `${userId}\0${session.appGrant?.id ?? ''}\0${projectId}`;
     const now = Date.now();
     const cached = this.personDecisions.get(key);
-    if (cached && cached.until > now) return cached.caps;
+    if (cached && cached.until > now && !changedSince(cached.seq, cached.subject)) return cached.caps;
     if (this.personDecisions.size > 1024) this.personDecisions.clear();
+    const seq = authoritySeq();
+    const subject = { principals: new Set([`user:${userId}`]), projects: new Set([projectId]), organizations: new Set<string>() };
     const caps = (async () => {
       if (await this.deps.store.kvGet(`account-closed:${userId}`)) return undefined;
       const organizationId = await this.deps.store.projectOrganizationAsync(projectId);
+      if (organizationId) subject.organizations.add(organizationId);
       if (organizationId && !(await this.ssoAdmits(userId, email, organizationId))) return undefined;
       if (session.appGrant && !(await this.appGrants.live(session.appGrant.id, userId))) return undefined;
       return this.personCaps(session, projectId, organizationId);
     })();
     caps.catch(() => this.personDecisions.delete(key));
-    this.personDecisions.set(key, { caps, until: now + 1_000 });
+    this.personDecisions.set(key, { caps, until: now + 1_000, seq, subject });
     return caps;
   }
 
@@ -9294,8 +9418,9 @@ export class Gateway {
   private async withDeletionFence<T>(projectIds: string[], organizationId: string | undefined, work: (projectIds: string[]) => Promise<T>): Promise<T> {
     const store = this.deps.store;
     const value = JSON.stringify({ id: crypto.randomUUID(), kind: 'delete', expiresAt: Number.MAX_SAFE_INTEGER });
-    const keys: string[] = [];
-    await store.transaction(async () => {
+    const keys = await store.transaction(async () => {
+      // Built per attempt: a re-run transaction starts over.
+      const keys: string[] = [];
       if (organizationId) {
         if (store.db.dialect === 'postgres') await store.db.prepare('SELECT id FROM organizations WHERE id=? FOR UPDATE').get(organizationId);
         projectIds = (await store.listProjects()).filter(p => p.organizationId === organizationId).map(p => p.id);
@@ -9309,6 +9434,7 @@ export class Gateway {
           throw new ProjectTransferError('A project move is in progress. Retry deletion when it finishes.');
       }
       for (const key of keys) await store.kvSet(key, value);
+      return keys;
     });
     try { return await work(projectIds); }
     finally { for (const key of keys) await store.db.prepare('DELETE FROM kv WHERE k=? AND v=?').run(key, value); }
@@ -9510,7 +9636,7 @@ export class Gateway {
     try {
       const installationId = (await githubApp.ownInstallation(userId, account.id));
       if (!installationId) {
-        return install ? githubApp.installationUrl((await this.deps.store.createGithubInstallState(personal.id, userId,
+        return install ? await githubApp.installationUrl((await this.deps.store.createGithubInstallState(personal.id, userId,
           { returnTo: 'profile', githubAccountId: account.id, githubLogin: account.login }))) : undefined;
       }
       await githubApp.connectInstallation(personal.id, installationId);
@@ -9670,8 +9796,11 @@ export class Gateway {
    */
   private async personCaps(session: Pick<Session, 'userId' | 'appGrant'>, projectId?: string, organizationId?: string): Promise<Capability[]> {
     if (!session.userId || !this.deps.authorization) return [];
+    const ceiling = session.appGrant?.ceiling;
+    // The policy finds the project's organization in the same read.
+    if (!ceiling) return this.deps.authorization.capabilitiesAsync(`user:${session.userId}`, projectId, organizationId);
     const resolvedOrganizationId = organizationId ?? (projectId ? await this.deps.store.projectOrganizationAsync(projectId) : undefined);
-    return sessionCapabilities(this.deps.authorization, session.userId, session.appGrant?.ceiling,
+    return sessionCapabilities(this.deps.authorization, session.userId, ceiling,
       { projectId, organizationId: resolvedOrganizationId });
   }
 

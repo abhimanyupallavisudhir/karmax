@@ -1001,6 +1001,9 @@ export interface TaskList {
   order: number;
 }
 
+/** The live asks a person has on one task: their inbox kinds, and when the newest arrived. */
+export interface AttentionAsk { kinds: string[]; at: number }
+
 /** The persisted index record for a task. The live view comes from the workflow query. */
 export interface TaskRecord {
   id: string;
@@ -1030,6 +1033,9 @@ export interface TaskRecord {
   workflowVersion: string; // pinned at creation (SPEC §4.4)
   params: TaskParams;
   createdAt: number;
+  /** When the task last changed stage, status or what it waits for — what
+   *  task lists are ordered by. Absent until its first view. */
+  statusChangedAt?: number;
   order: number;
   parentTaskId?: string;
   /** Immutable creator provenance. */

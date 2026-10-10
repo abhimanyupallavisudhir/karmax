@@ -84,6 +84,15 @@ describe.skipIf(!url)('native asynchronous PostgreSQL', () => {
     expect(await db.query('SELECT 1 AS ok')).toEqual([{ ok: 1 }]);
   });
 
+  it('sizes the pool from KARMAX_STORE_POOL_SIZE, and transactions use all but one connection', async () => {
+    const { storePoolSize } = await import('../src/store/async-sql.js');
+    expect(storePoolSize({})).toBe(8);
+    expect(storePoolSize({ KARMAX_STORE_POOL_SIZE: '12' })).toBe(12);
+    for (const bad of ['0', '65', '2.5', 'many']) expect(() => storePoolSize({ KARMAX_STORE_POOL_SIZE: bad })).toThrow('KARMAX_STORE_POOL_SIZE');
+    db = new AsyncPostgres(url!);
+    expect(db.maxConnections).toBe(8);
+  });
+
   it('bounds admission and releases capacity after failures', async () => {
     db = new AsyncPostgres(url!, { max: 1, maxPending: 1 });
     const slow = db.query('SELECT pg_sleep(0.1)');

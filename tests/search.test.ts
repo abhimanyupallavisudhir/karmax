@@ -374,6 +374,28 @@ describe('evaluateQuery — dates', () => {
   });
 });
 
+describe('evaluateQuery — default order', () => {
+  // A list leads with what last changed: a task that has just moved (to Review,
+  // Needs input, Done…) rises above newer tasks that have sat still since.
+  const tasks: SearchTask[] = [
+    task({ title: 'new idle', num: 1, createdAt: NOW - DAY }),
+    task({ title: 'old moved', num: 2, createdAt: NOW - 9 * DAY, statusChangedAt: NOW - 1000, lastView: view('waiting', 'review') }),
+    task({ title: 'old still', num: 3, createdAt: NOW - 8 * DAY, statusChangedAt: NOW - 8 * DAY }),
+  ];
+  const ctx = { now: NOW, tags: [] as Tag[] };
+
+  it('is by last status change, newest first; a task never changed counts from its creation', () => {
+    expect(evaluateQuery(tasks, parseQuery(''), ctx).tasks.map((t) => t.num)).toEqual([2, 1, 3]);
+    expect(evaluateQuery(tasks, parseQuery('sort:updated'), ctx).tasks.map((t) => t.num)).toEqual([2, 1, 3]);
+    expect(evaluateQuery(tasks, parseQuery('sort:created'), ctx).tasks.map((t) => t.num)).toEqual([1, 3, 2]);
+  });
+
+  it('filters `updated:` on that same time, not on the workflow history counter', () => {
+    const counted = [...tasks, task({ title: 'counter', num: 4, createdAt: NOW - 30 * DAY, lastView: view('active', 'do', { updatedAt: 412 }) })];
+    expect(evaluateQuery(counted, parseQuery('updated:<2d'), ctx).tasks.map((t) => t.num)).toEqual([2, 1]);
+  });
+});
+
 describe('evaluateQuery — sort and group', () => {
   const tasks: SearchTask[] = [
     task({ title: 'B', num: 1, lastView: view('active'), params: { priority: 1 }, createdAt: NOW - DAY }),

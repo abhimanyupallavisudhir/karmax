@@ -664,6 +664,7 @@ export class TriggerScheduler {
   private async setActivationPending(entry: ArmedEntry, pending: boolean): Promise<void> {
     try {
       await this.deps.store.transaction(async () => {
+        await this.deps.store.lockTask(entry.task.id);
         const current = await this.deps.store.taskMetadata(entry.task.id);
         if (!current || this.armed.get(entry.task.id) !== entry) return;
         const persisted = current.params?.triggerPending === true;

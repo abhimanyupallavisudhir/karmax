@@ -48,6 +48,7 @@ import { AgentAdapter, type TurnResult, type AdapterTurn } from '../agent/types.
 import { KARMAX_RUNTIME_PROTOCOL, runRuntimeTurn } from '../agent/runtime.js';
 import { TaskSecrets, cardRef, handleRef, paymentCardDetails, recordSecretRefs, secretScope, taskRef } from '../autonomy/task-secrets.js';
 import { gateFollowUps } from './follow-up-gate.js';
+import { FOLLOW_UP_JOURNAL_TYPES, followUpMark } from './follow-up-wakes.js';
 import { acquireAgentSlot, awaitAgentResources, AgentResourcesUnavailableError } from './agent-slots.js';
 import { assemblePrompt } from '../agent/prompt.js';
 import { GLOBAL_INSTRUCTIONS } from '../agent/instructions.js';
@@ -108,7 +109,7 @@ import { paths } from '../config/paths.js';
 import { hostLocal as deploymentHostLocal } from '../config/deployment.js';
 import type { ObjectStore } from '../store/objects.js';
 import { conversationImportObjectKey } from '../store/conversation-imports.js';
-import { ensureProjectWikiRepository, PROJECT_WIKI_BRANCH, setProjectWikiRemote } from '../wiki/repository.js';
+import { ensureProjectWikiRepositoryAsync, PROJECT_WIKI_BRANCH, setProjectWikiRemote } from '../wiki/repository.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { manifest, roleCeiling } from '../contrib/manifests.js';
@@ -148,6 +149,12 @@ const STAGING_PROGRESS_EVERY_MS = 5_000;
 /** A retried turn's processes did not survive it; agents otherwise assume they did. */
 const INTERRUPTED_COMMANDS = 'Commands that were running in it, including run_in_background shells, were stopped: '
   + 'check whether they finished before relying on their results. Jobs from start_job kept running.';
+// The interrupted attempt's session holds the agent's answer, but no one has
+// read it: told only to "restate the final result", an agent cut off by a deploy
+// replied "Nothing to recover" to a person still waiting for it (exten-epi#5).
+const INTERRUPTED_REPLY = 'Your final response from it was never posted: a reply is posted only when the turn ends. '
+  + 'Continue from where you left off, then give your full final response, even if you had already written it; '
+  + 'do not mention the interruption unless it changes the result.';
 
 // Old executions without a recorded grant retain the normal developer workflow
 // surface (but no administration). New tasks always carry a creator-attenuated
@@ -1503,7 +1510,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // platform API, so attaching the wiki there would secretly reintroduce a
       // branch, worktree, Git credential, and merge into an otherwise non-Git run.
       const wikiRoot = project
-        ? ensureProjectWikiRepository(deps.contentDir ?? paths().content, project.id)
+        ? await ensureProjectWikiRepositoryAsync(deps.contentDir ?? paths().content, project.id)
         : undefined;
       if (project && !(await store.projectWiki(project.id))) (await store.setProjectWikiRepository(project.id));
       const wikiRepository = project ? (await store.projectWiki(project.id))?.repository : undefined;
@@ -1851,7 +1858,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const { gatherCredentialSources, readPolicyLayers } = await import('../platform/credential-sources.js');
       const { enumerateCredentials, resolveCredentials } = await import('../platform/credentials.js');
       const organizationId = (await store.getProject(args.projectId))?.organizationId ?? 'org_personal';
-      const sources = gatherCredentialSources({ configHomes: deps.configHomes, broker: deps.broker, organizationId });
+      const sources = await gatherCredentialSources({ configHomes: deps.configHomes, broker: deps.broker, organizationId });
       const all = enumerateCredentials(sources);
       const layers = (await readPolicyLayers(async (k) => (await store.kvGet(k)), { organizationId, projectId: args.projectId, taskId: args.taskId }));
       const profile = args.role && args.task
@@ -2087,9 +2094,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                 // Tell the agent what broke, or it reruns the command that froze the sandbox.
                 ? `(This turn was interrupted mid-run: ${interruption.summary}.${interruption.memoryExhausted
                   ? ' Keep memory-hungry commands (type checks, test suites, builds) within the memory `free -m` reports as available.' : ''}`
-                  + ` ${INTERRUPTED_COMMANDS} Continue from where you left off; if the work was already finished, restate the final result.)`
+                  + ` ${INTERRUPTED_COMMANDS} ${INTERRUPTED_REPLY})`
                 // The only undiagnosed cause left is a lost heartbeat: turns have no time limit.
-                : `(This turn was interrupted mid-run — the worker restarted, the connection dropped, or the host slept. ${INTERRUPTED_COMMANDS} Continue from where you left off; if the work was already finished, restate the final result.)`,
+                : `(This turn was interrupted mid-run — the worker restarted, the connection dropped, or the host slept. ${INTERRUPTED_COMMANDS} ${INTERRUPTED_REPLY})`,
               ts: 0,
             },
           ];
@@ -2140,7 +2147,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       if ((args.accountConfigHome || args.accountApiKeyHandle) && profile.provider !== 'mock') {
         const { gatherCredentialSources } = await import('../platform/credential-sources.js');
         const { enumerateCredentials } = await import('../platform/credentials.js');
-        const own = enumerateCredentials(gatherCredentialSources({ configHomes: deps.configHomes, broker: deps.broker, organizationId }));
+        const own = enumerateCredentials(await gatherCredentialSources({ configHomes: deps.configHomes, broker: deps.broker, organizationId }));
         if ((args.accountConfigHome && !own.some((c) => c.configHome && path.resolve(c.configHome) === path.resolve(args.accountConfigHome!)))
           || (args.accountApiKeyHandle && !own.some((c) => c.apiKeyHandle === args.accountApiKeyHandle)))
           throw ApplicationFailure.create({
@@ -2152,6 +2159,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // A coordinator-leased account home wins over the profile default so turns
       // rotate across connected logins (SPEC §6.2 token/account leasing).
       if (args.accountConfigHome) {
+        // The login's credential is in the vault; the home caches it (data epoch 6).
+        await deps.configHomes?.sync(args.accountConfigHome);
         const tok = tokenToInject(args.accountConfigHome);
         resolvedAuth = { ...resolvedAuth, configHome: args.accountConfigHome, ...(tok ? { oauthToken: tok } : {}) };
       }
@@ -2159,7 +2168,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // resolve JIT; reserved environment-key references carry only the provider
       // identity and let the adapter read that provider's process environment.
       if (args.accountApiKeyHandle && deps.broker) {
-        const apiKey = deps.broker.resolve(args.accountApiKeyHandle, { taskId: args.taskId, profileId: profile.id, caps: [`use-credential:${args.accountApiKeyHandle}`] });
+        const apiKey = await deps.broker.resolve(args.accountApiKeyHandle, { taskId: args.taskId, profileId: profile.id, caps: [`use-credential:${args.accountApiKeyHandle}`] });
         (await recordSecretRefs(store, args.taskId, [handleRef(args.accountApiKeyHandle)]));
         resolvedAuth = { apiKey };
       }
@@ -2593,7 +2602,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                 }
               },
               cursor: () => store.latestEventSeq(),
-              journaled: async (seq) => (await store.eventsOfType(args.taskId, ['conversation.message', 'view.updated', 'subtask.parent-response'], seq))
+              mark: () => followUpMark(args.taskId),
+              journaled: async (seq) => (await store.eventsOfType(args.taskId, FOLLOW_UP_JOURNAL_TYPES, seq))
                 .map(event => ({ seq: event.seq, pending: event.type === 'subtask.parent-response', messageId: event.type === 'conversation.message'
                   ? String((event.payload as { message?: { id?: string } }).message?.id ?? `seq:${event.seq}`) : undefined })),
             })

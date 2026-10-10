@@ -12,6 +12,8 @@ import { startDevServer, watchDevServer } from './temporal/dev-server.js';
 import { makeClient } from './temporal/client.js';
 import { WorkerManager, terminateOnWorkerFailure } from './temporal/worker-pool.js';
 import { WorkerProcessManager } from './temporal/worker-process.js';
+import { noteFollowUpEvent, wireFollowUpWakes } from './activities/follow-up-wakes.js';
+import { memoryBudget } from './runtime/memory-budget.js';
 import { ForeignEventRelay } from './contrib/foreign-event-relay.js';
 import { TASK_QUEUE } from './temporal/config.js';
 import { WorkflowManager } from './packages/manager.js';
@@ -20,7 +22,7 @@ import { openStore } from './store/db.js';
 import { defaultProvider } from './agent/adapters.js';
 import { KarmaxBus } from './contrib/bus.js';
 import { CredentialBroker } from './autonomy/broker.js';
-import { Vault, recordQuarantine, recordScopeMigration } from './autonomy/vault.js';
+import { openSecretVault } from './autonomy/vault-backend.js';
 import { resolveVaultScopes } from './autonomy/vault-scopes.js';
 import { INSTALLATION_SCOPE } from './autonomy/vault-keys.js';
 import { EmailService, type OutboundEmailConfig } from './autonomy/email.js';
@@ -155,6 +157,8 @@ async function main() {
   const openedStore = (await openStore(path.join(p.state, 'karmax.db'), process.env.KARMAX_DATABASE_URL,
     { hosted: deployment.hosted }));
   const store = openedStore.store;
+  // A release older than the data this database holds refuses to start (data epoch 6 on).
+  await (await import('./config/data-epoch.js')).assertDataEpoch(store.db);
   await (await import('./ops/backup.js')).recordRestores(store, p.home); // DB-10
   if (process.env.KARMAX_DATABASE_URL) {
     const migrated = openedStore.migration?.imported
@@ -175,27 +179,25 @@ async function main() {
         .map((value) => value?.trim()).find(Boolean)! }
       : {}),
   }));
-  const vault = new Vault(p.vault);
-  // Data epoch 4 (SS-1): every secret moves under its owner's data key; the database knows the owners.
-  const scoped = await recordScopeMigration(vault, (handles) => resolveVaultScopes(store, handles), (report) => store.appendAudit({
-    principalId: 'system:vault', action: 'vault.scopes.migrated', detail: { migrated: report.migrated, byScope: report.byScope,
-      unresolved: report.unresolved.length, unresolvedHandles: report.unresolved.slice(0, 500) } }));
-  if (scoped?.migrated) console.log(`  • Vault: ${scoped.migrated} secrets moved under per-owner data keys`
-    + (scoped.unresolved.length ? `; ${scoped.unresolved.length} with no owner found stay under the installation key (audit log: vault.scopes.migrated)` : ''));
-  // Binds ciphertext written before AU-27 to its handle; what will not open is quarantined, loudly.
-  // Reported until audited, so a crash between quarantine and audit still reaches the log.
-  await recordQuarantine(vault, (entry) => store.appendAudit({ principalId: 'system:vault', action: 'vault.entry.quarantined', detail: { ...entry } }));
+  // The vault's one-way migrations run here, each audited before it is acknowledged: binding
+  // (AU-27), per-owner data keys (data epoch 4; the database knows the owners) and, on
+  // PostgreSQL, the move into the database (data epoch 5; wiki planned/host-local-state).
+  const vault = await openSecretVault(p.vault, store.db, {
+    resolveScopes: (handles) => resolveVaultScopes(store, handles),
+    audit: (action, detail) => store.appendAudit({ principalId: 'system:vault', action, detail }),
+    log: (line) => console.log(`  • ${line}`),
+  });
   const broker = new CredentialBroker(vault);
   await (await import('./autonomy/payments.js')).separateStoredCardCvcs(broker); // AU-31
   (await import('./autonomy/vault-items.js')).removeLegacyKeyCopies(p.state); // AU-33
   (await import('./autonomy/vault-items.js')).sweepTurnKeys(); // key files a crashed turn left behind
   const { PaidLaunchSettingsService } = await import('./launch/settings.js');
   const paidLaunchSettings = new PaidLaunchSettingsService(store, broker, process.env);
-  if (process.env.KARMAX_GITHUB_APP_PRIVATE_KEY && !broker.hasHandle(GITHUB_APP_PRIVATE_KEY_HANDLE))
+  if (process.env.KARMAX_GITHUB_APP_PRIVATE_KEY && !await broker.hasHandle(GITHUB_APP_PRIVATE_KEY_HANDLE))
     (await broker.ensureHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, process.env.KARMAX_GITHUB_APP_PRIVATE_KEY.replace(/\\n/g, '\n'), INSTALLATION_SCOPE));
-  if (process.env.KARMAX_GITHUB_WEBHOOK_SECRET && !broker.hasHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE))
+  if (process.env.KARMAX_GITHUB_WEBHOOK_SECRET && !await broker.hasHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE))
     (await broker.ensureHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE, process.env.KARMAX_GITHUB_WEBHOOK_SECRET, INSTALLATION_SCOPE));
-  if (process.env.KARMAX_GITHUB_CLIENT_SECRET && !broker.hasHandle(GITHUB_APP_CLIENT_SECRET_HANDLE))
+  if (process.env.KARMAX_GITHUB_CLIENT_SECRET && !await broker.hasHandle(GITHUB_APP_CLIENT_SECRET_HANDLE))
     (await broker.ensureHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, process.env.KARMAX_GITHUB_CLIENT_SECRET, INSTALLATION_SCOPE));
   // One deployment App owns repository installations and user OAuth. Environment
   // values remain an upgrade/enterprise bootstrap path; the normal path is the
@@ -203,7 +205,7 @@ async function main() {
   const githubApp = (await GitHubAppService.create(store, broker, { appId: process.env.KARMAX_GITHUB_APP_ID,
     appSlug: process.env.KARMAX_GITHUB_APP_SLUG, clientId: process.env.KARMAX_GITHUB_CLIENT_ID,
     publicApp: deployment.hosted }));
-  const sharedGithubOauth = githubApp.oauthCredentials();
+  const sharedGithubOauth = await githubApp.oauthCredentials();
   // A separately managed OAuth App remains a compatibility fallback only. Once
   // the deployment GitHub App exists, it is the single OAuth client.
   const legacyGithubOauth = process.env.KARMAX_GITHUB_OAUTH_CLIENT_ID?.trim()
@@ -263,8 +265,22 @@ async function main() {
     try { return JSON.parse((await store.kvGet('email:outbound')) ?? '{}'); } catch { return {}; }
   };
   const emailService = new EmailService(emailConfig,
-    (handle) => (broker.hasHandle(handle) ? broker.resolve(handle, { caps: ['use-credential:*'] }) : undefined));
+    async (handle) => (await broker.hasHandle(handle) ? broker.resolve(handle, { caps: ['use-credential:*'] }) : undefined),
+    async (sent) => {
+      (await store.countServiceUsage(`email.sent:${sent.provider}`));
+      if (sent.provider === 'resend') (await serviceLimits.recordResendQuota({ daily: sent.dailyQuota, monthly: sent.monthlyQuota }));
+    });
   identity.mailer = emailService;
+  // Installation → Service limits: the operator's shared accounts and this
+  // host against their plans, with alerts to the operators (sampled below).
+  const { ServiceLimitsService } = await import('./ops/service-limits.js');
+  const { serviceLimitNotifier } = await import('./ops/service-limit-notices.js');
+  const serviceLimits = new ServiceLimitsService({ store, broker, providerConnections, githubApp, dataDir: p.home,
+    workerHeap: () => workerManager.heap,
+    notify: serviceLimitNotifier({ store, email: emailService, publicUrl: process.env.KARMAX_PUBLIC_URL,
+      capabilities: (principalId) => authorization.capabilities(principalId),
+      userEmail: async (userId) => (await identity.userById(userId))?.email ?? undefined,
+      siteName: async () => siteNameOf((await store.getSettings('global', 'appearance'))) }) });
   // Managed storage lifecycle: retention, the over-quota policy and the
   // storage page (scheduled hourly below).
   const { ManagedStorageService } = await import('./world/managed-storage.js');
@@ -300,9 +316,15 @@ async function main() {
   // rolling the worker without a restart (§21d/§21e).
   const workerEnvironment: NodeJS.ProcessEnv = { ...process.env, KARMAX_TEMPORAL_ADDRESS: conn.address,
     KARMAX_TEMPORAL_NAMESPACE: conn.namespace };
+  // One budget for the container (RT-35): the worker child's heap flag also
+  // sizes its workflow thread, a second isolate with the same limit.
+  const budget = memoryBudget({ separateWorker });
+  console.log(`  • Memory budget: ${budget.limitMb} MiB; gateway heap ${budget.gatewayHeapMb} MiB`
+    + (separateWorker ? `, worker heaps ${budget.workerHeapMb} MiB each` : ''));
   const workerManager = separateWorker ? new WorkerProcessManager({
     entrypoint: fileURLToPath(new URL('./temporal/activity-worker-main.ts', import.meta.url)),
     env: workerEnvironment,
+    execArgv: ['--import', 'tsx', `--max-old-space-size=${budget.workerHeapMb}`],
     onFailure: terminateOnWorkerFailure,
     // Deliver the child's events to browsers now, not on the relay's next poll (LT-15).
     onEvents: () => { void eventRelay?.wake(); },
@@ -338,6 +360,10 @@ async function main() {
       await retryCredentials({ store, client, taskQueue: TASK_QUEUE, configHomes, broker }, task, credentialProvider, options);
     },
   });
+  // Running turns read their follow-up journal when it changes, not on every
+  // poll (load test 2026-10). A separate worker hears of this process's entries.
+  store.onEventRecorded((event) => { if (noteFollowUpEvent(event) && workerManager instanceof WorkerProcessManager) workerManager.journaled(event.taskId); });
+  if (!separateWorker) wireFollowUpWakes();
 
   // Workflow code activation is an explicit install operation with current
   // authorization. A completed edit must never activate a moving branch tip.
@@ -349,6 +375,8 @@ async function main() {
   const remoteAccess = new RemoteAccessController({ port: () => gatewayPort });
   const gateway = (await Gateway.create({
     runtimeReady: () => startupReady && !workerManager.failure,
+    workerStoreMetrics: () => workerManager instanceof WorkerProcessManager ? workerManager.storeMetrics : undefined,
+    memory: () => ({ heap: workerManager.heap, separate: workerManager instanceof WorkerProcessManager }),
     api,
     store,
     bus,
@@ -382,6 +410,7 @@ async function main() {
     checkpoints,
     subscriptions: subscriptionBilling,
     paidLaunchSettings,
+    serviceLimits,
     cellId: deployment.cellId,
     hosted: deployment.hosted,
     hostLocal: deployment.hostLocal,
@@ -467,6 +496,11 @@ async function main() {
   }, 3600_000);
   managedStorageTimer.unref();
   startupJobs.push(() => managedStorageTimer.run());
+  // Service limits: sample the operator's accounts every 15 minutes, so a
+  // daily allowance is caught well before it runs out.
+  const serviceLimitsTimer = new AsyncInterval(() => serviceLimits.run(), 15 * 60_000);
+  serviceLimitsTimer.unref();
+  startupJobs.push(() => serviceLimitsTimer.run());
   // Reconcile missed notification close events without delaying the first API response.
   const inboxCleanup = new AsyncInterval(() => store.pruneStaleInbox().then(() => undefined), 3600_000);
   inboxCleanup.unref();
@@ -562,9 +596,8 @@ async function main() {
   // so the coordinator can lease/track any of them (SPEC §6.2/§7).
   const { gatherCredentialSources, concurrencyFor } = await import('./platform/credential-sources.js');
   const { enumerateCredentials } = await import('./platform/credentials.js');
-  const creds = (await store.listOrganizations()).flatMap((organization) =>
-    enumerateCredentials(gatherCredentialSources({ configHomes, broker, organizationId: organization.id })),
-  );
+  const creds = (await Promise.all((await store.listOrganizations()).map(async (organization) =>
+    enumerateCredentials(await gatherCredentialSources({ configHomes, broker, organizationId: organization.id }))))).flat();
   const pool = (await __asyncCollections.map(creds, async (c) => {
     const maxConcurrent = (await concurrencyFor(async (k) => (await store.kvGet(k)), c.key));
     const credentialProvider = c.kind === 'key' ? c.provider : c.modelProvider;
@@ -625,7 +658,7 @@ async function main() {
       organizationId,
       config: (await readMailboxConfig(organizationId)),
     }))),
-    resolveSecret: (handle) => (broker.hasHandle(handle) ? broker.resolve(handle, { caps: ['use-credential:*'] }) : undefined),
+    resolveSecret: async (handle) => (await broker.hasHandle(handle) ? broker.resolve(handle, { caps: ['use-credential:*'] }) : undefined),
     makeIngest: (organizationId, config) => {
       const domain = config.domain || config.hostedDomain || config.agentmailDomain || config.fixedAddress?.split('@')[1];
       const fixedLocal = config.fixedAddress?.split('@')[0];
@@ -720,7 +753,7 @@ async function main() {
     // process-exit backstop bounds shutdown; do not close Store under these jobs.
     const maintenanceDrain = Promise.allSettled([
       startupMaintenance,
-      retentionTimer.stop(), inboxCleanup.stop(), credentialAttentionTimer.stop(), subscriptionEntitlementTimer.stop(),
+      retentionTimer.stop(), serviceLimitsTimer.stop(), inboxCleanup.stop(), credentialAttentionTimer.stop(), subscriptionEntitlementTimer.stop(),
       subscriptionSeatTimer.stop(),
       reconcileSweep.stop(), deploymentSweep.stop(),
       triggerScheduler.stop(), mailPoller.stop(), worldLifecycle.stop(), delivery.stop(),

@@ -1,0 +1,2 @@
+{"id":"i-0ad93540ac09ced0e","role":"sut","type":"c7i.xlarge","diskGb":40,"launched":1791588803}
+{"id":"i-0870f146e2cabd515","role":"world","type":"c7i.2xlarge","diskGb":80,"launched":1791588805}

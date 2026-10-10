@@ -63,6 +63,8 @@ export interface Harness {
   broker: CredentialBroker;
   checkpoints?: WorldCheckpointService;
   restartWorker(): Promise<void>;
+  /** The live worker, for diagnostics (cache and workflow-thread heap). */
+  worker(): WorkerHandle;
   stop(): Promise<void>;
   makeRepo(name: string): Promise<string>;
   startGateway(opts?: { password?: string; hosted?: boolean; port?: number; identity?: import('../../src/auth/identity.js').IdentityService;
@@ -181,6 +183,7 @@ export async function bootHarness(
     resources,
     broker,
     checkpoints,
+    worker: () => worker,
     async restartWorker() {
       worker.shutdown();
       await runPromise.catch(() => {});

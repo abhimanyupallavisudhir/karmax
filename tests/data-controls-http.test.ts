@@ -123,7 +123,7 @@ it('retries scoped organization offboarding after external cleanup fails without
     };
     const removed = await addResource(organization.id, project.id);
     const preserved = await addResource(other.id, retained.id);
-    const keysBefore = broker.listHandles();
+    const keysBefore = await broker.listHandles();
     const deletion = (confirmSlug: string) => fetch(`${server.url}/api/organizations/${organization.id}`, {
       method: 'DELETE', headers, body: JSON.stringify({ confirmSlug }),
     });
@@ -144,7 +144,7 @@ it('retries scoped organization offboarding after external cleanup fails without
     expect(await store.getTask(task.id)).toBeUndefined();
     expect(await store.getResourceAttachment(removed.attachment.id)).toBeUndefined();
     expect([...data.keys()].some(key => key.includes(organization.id))).toBe(false);
-    expect(broker.listHandles().length).toBe(keysBefore.length - 1);
+    expect((await broker.listHandles()).length).toBe(keysBefore.length - 1);
     expect(await store.getOrganization(other.id)).toBeDefined();
     expect((await resources.verifyRevision(retained.id, preserved.attachment.id, preserved.revision.id)).status).toBe('complete');
     expect((await deletion(organization.slug!)).status).toBe(404);

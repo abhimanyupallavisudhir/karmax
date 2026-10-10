@@ -9,6 +9,7 @@ import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { GitHubAppService } from '../src/integrations/github-app.js';
 import { createExecutionServices } from '../src/runtime/execution-services.js';
+import { MODEL_LOGINS_MOVED_MARKER } from '../src/autonomy/model-logins.js';
 
 afterEach(() => vi.unstubAllEnvs());
 
@@ -25,11 +26,14 @@ it('attaches a secondary process without seeding profiles, importing credentials
     const githubApp = await GitHubAppService.create(store, broker);
     const input = { store, broker, githubApp, p, client: {} as Client,
       deployment: { hosted: false, hostLocal: true }, provider: 'mock' as const };
+    // A secondary attaches only once the primary has moved the model logins into the vault (data epoch 6).
+    await expect(createExecutionServices(input)).rejects.toThrow(/model logins have not moved into the vault/);
+    await store.kvSet(MODEL_LOGINS_MOVED_MARKER, '{}');
     const secondary = await createExecutionServices(input);
     expect(await store.listProfiles()).toEqual([]);
     expect(await secondary.providerConnections.list('org_personal')).toEqual([]);
     expect(await store.listStorageLocations('org_personal')).toEqual([]);
-    expect(broker.listHandles()).toEqual([]);
+    expect(await broker.listHandles()).toEqual([]);
     const primary = await createExecutionServices({ ...input, bootstrap: true });
     expect((await store.listProfiles()).length).toBeGreaterThan(0);
     expect(await primary.providerConnections.get('org_personal', 'e2b')).toMatchObject({ credentialConfigured: true });
@@ -63,6 +67,7 @@ it('delays deleting managed objects in an S3 store and deletes local ones at onc
       deployment: { hosted: false, hostLocal: true }, provider: 'mock' as const };
 
     vi.stubEnv('KARMAX_OBJECT_STORE', 'local');
+    await store.kvSet(MODEL_LOGINS_MOVED_MARKER, '{}'); // as the primary's boot leaves it
     const local = await createExecutionServices(input);
     expect(local.objectStore).toBeInstanceOf(DeferredDeleteObjectStore);
     await local.objectStore.put('artifacts/o/p/t/a', Buffer.from('x'));

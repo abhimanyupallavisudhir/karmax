@@ -95,15 +95,15 @@ export async function cardOwnerScope(store: Pick<Store, 'getProject'>, card: Pic
  * cards it separated. */
 export async function separateStoredCardCvcs(broker: CredentialBroker): Promise<number> {
   let separated = 0;
-  for (const handle of broker.listHandles()) {
+  for (const handle of await broker.listHandles()) {
     if (!/^payment:card:[^:]+$/.test(handle)) continue;
     let details: Partial<CardDetails>;
-    try { details = JSON.parse(broker.resolve(handle, { caps: [`use-credential:${handle}`] })); }
+    try { details = JSON.parse(await broker.resolve(handle, { caps: [`use-credential:${handle}`] })); }
     catch { continue; } // not card details; never block boot on one entry
     if (details?.cvc === undefined) continue;
     const { cvc, ...rest } = details;
     // The card's owner, as the data epoch 4 migration recorded it (it runs first).
-    const scope = broker.scopeOf(handle);
+    const scope = await broker.scopeOf(handle);
     if (!scope) continue;
     // One card must not stop the rest, nor the boot that runs this.
     try {
@@ -233,7 +233,8 @@ export class MockPaymentProvider implements PaymentProvider {
     return (await this.store.getCard(cardId));
   }
   async fund(cardId: string, amount: number): Promise<void> {
-    return this.store.transaction(async () => {
+    // Balances change under the payment table lock (paymentTransaction).
+    return this.store.paymentTransaction(async () => {
     if (!Number.isSafeInteger(amount) || amount <= 0) throw new Error('funding amount must be a positive number of cents');
     const c = (await this.store.getCard(cardId));
     if (!c) throw new Error('no such card');
@@ -242,7 +243,7 @@ export class MockPaymentProvider implements PaymentProvider {
     });
   }
   async authorize(cardId: string, amount: number, merchant?: string): Promise<AuthorizeResult> {
-    return this.store.transaction(async () => {
+    return this.store.paymentTransaction(async () => {
     const c = (await this.store.getCard(cardId));
     if (!c) return { ok: false, reason: 'no such card' };
     if (!Number.isSafeInteger(amount) || amount <= 0) return { ok: false, reason: 'amount must be a positive number of cents' };
@@ -266,7 +267,7 @@ export class MockPaymentProvider implements PaymentProvider {
       .filter((card) => card.provider === this.name).reduce((sum, card) => sum + card.available, 0), currency: 'usd' };
   }
   async revoke(cardId: string): Promise<void> {
-    return this.store.transaction(async () => {
+    return this.store.paymentTransaction(async () => {
     if (!(await this.store.getCard(cardId))) throw new Error('no such card');
     (await this.store.updateCard(cardId, { status: 'canceled', available: 0 }));
 
@@ -346,10 +347,12 @@ export class VaultCardProvider implements PaymentProvider {
   async fund(cardId: string, amount: number): Promise<void> {
     if (!Number.isSafeInteger(amount) || amount <= 0)
       throw new Error('top-up amount must be a positive number of cents');
-    const card = await this.getCard(cardId);
-    if (!card) throw new Error('no such card');
-    if (card.status === 'canceled') throw new Error('card is not active');
-    (await this.store.updateCard(cardId, { available: card.available + amount, cap: card.cap + amount }));
+    await this.store.paymentTransaction(async () => {
+      const card = await this.getCard(cardId);
+      if (!card) throw new Error('no such card');
+      if (card.status === 'canceled') throw new Error('card is not active');
+      (await this.store.updateCard(cardId, { available: card.available + amount, cap: card.cap + amount }));
+    });
   }
   async authorize(cardId: string, amount: number, merchant?: string): Promise<AuthorizeResult> {
     const card = await this.getCard(cardId);
@@ -366,9 +369,9 @@ export class VaultCardProvider implements PaymentProvider {
     const card = await this.getCard(cardId);
     if (!card || card.status === 'canceled') throw new Error('card is not active');
     const handle = cardSecretHandle(cardId);
-    const details = JSON.parse(this.broker.resolve(handle, { caps: [`use-credential:${handle}`] })) as CardDetails;
+    const details = JSON.parse(await this.broker.resolve(handle, { caps: [`use-credential:${handle}`] })) as CardDetails;
     // A card stored before AU-31 still carries its CVC until boot separates it.
-    const cvc = details.cvc ?? this.broker.resolve(cardCvcHandle(cardId), { caps: [`use-credential:${cardCvcHandle(cardId)}`] });
+    const cvc = details.cvc ?? await this.broker.resolve(cardCvcHandle(cardId), { caps: [`use-credential:${cardCvcHandle(cardId)}`] });
     return { ...details, cvc };
   }
   describe(): ProviderInfo {
@@ -430,30 +433,30 @@ export class StripeIssuingProvider implements PaymentProvider {
     private env: NodeJS.ProcessEnv = process.env, private broker?: CredentialBroker) {}
 
   private async configured(): Promise<boolean> {
-    return Boolean(this.store && (await this.clientId()) && this.hasSecret(STRIPE_SECRET_KEY_HANDLE, 'STRIPE_SECRET_KEY'));
+    return Boolean(this.store && (await this.clientId()) && await this.hasSecret(STRIPE_SECRET_KEY_HANDLE, 'STRIPE_SECRET_KEY'));
   }
   private async clientId(): Promise<string | undefined> {
     return (await this.store?.kvGet(STRIPE_CLIENT_ID_KEY))?.trim() || this.env.STRIPE_CLIENT_ID?.trim() || undefined;
   }
-  private hasSecret(handle: string, environmentName: 'STRIPE_SECRET_KEY' | 'STRIPE_WEBHOOK_SECRET'): boolean {
-    return Boolean(this.broker?.hasHandle(handle) || this.env[environmentName]);
+  private async hasSecret(handle: string, environmentName: 'STRIPE_SECRET_KEY' | 'STRIPE_WEBHOOK_SECRET'): Promise<boolean> {
+    return Boolean(await this.broker?.hasHandle(handle) || this.env[environmentName]);
   }
-  private secret(handle: string, environmentName: 'STRIPE_SECRET_KEY' | 'STRIPE_WEBHOOK_SECRET'): string | undefined {
-    if (this.broker?.hasHandle(handle))
-      return this.broker.resolve(handle, { caps: [`use-credential:${handle}`] });
+  private async secret(handle: string, environmentName: 'STRIPE_SECRET_KEY' | 'STRIPE_WEBHOOK_SECRET'): Promise<string | undefined> {
+    if (await this.broker?.hasHandle(handle))
+      return this.broker!.resolve(handle, { caps: [`use-credential:${handle}`] });
     return this.env[environmentName];
   }
   async platformStatus(): Promise<StripePlatformStatus> {
     const clientId = (await this.clientId());
     const uiManaged = Boolean((await this.store?.kvGet(STRIPE_CLIENT_ID_KEY))
-      || this.broker?.hasHandle(STRIPE_SECRET_KEY_HANDLE)
-      || this.broker?.hasHandle(STRIPE_WEBHOOK_SECRET_HANDLE));
-    const secretKeyConfigured = this.hasSecret(STRIPE_SECRET_KEY_HANDLE, 'STRIPE_SECRET_KEY');
+      || await this.broker?.hasHandle(STRIPE_SECRET_KEY_HANDLE)
+      || await this.broker?.hasHandle(STRIPE_WEBHOOK_SECRET_HANDLE));
+    const secretKeyConfigured = await this.hasSecret(STRIPE_SECRET_KEY_HANDLE, 'STRIPE_SECRET_KEY');
     return {
       configured: Boolean(this.store && clientId && secretKeyConfigured),
       ...(clientId ? { clientId } : {}),
       secretKeyConfigured,
-      webhookConfigured: this.hasSecret(STRIPE_WEBHOOK_SECRET_HANDLE, 'STRIPE_WEBHOOK_SECRET'),
+      webhookConfigured: await this.hasSecret(STRIPE_WEBHOOK_SECRET_HANDLE, 'STRIPE_WEBHOOK_SECRET'),
       source: uiManaged ? 'ui' : clientId || secretKeyConfigured || this.env.STRIPE_WEBHOOK_SECRET ? 'environment' : 'none',
     };
   }
@@ -468,7 +471,7 @@ export class StripeIssuingProvider implements PaymentProvider {
       throw new Error('Stripe secret key must be an sk_test_… or sk_live_… key');
     if (webhookSecret && !/^whsec_\S+$/.test(webhookSecret))
       throw new Error('Stripe webhook signing secret must start with whsec_');
-    if (!secretKey && !this.hasSecret(STRIPE_SECRET_KEY_HANDLE, 'STRIPE_SECRET_KEY'))
+    if (!secretKey && !await this.hasSecret(STRIPE_SECRET_KEY_HANDLE, 'STRIPE_SECRET_KEY'))
       throw new Error('Stripe secret key is required');
     (await store.kvSet(STRIPE_CLIENT_ID_KEY, clientId));
     if (secretKey) (await this.broker.registerHandle(STRIPE_SECRET_KEY_HANDLE, secretKey, INSTALLATION_SCOPE));
@@ -492,7 +495,7 @@ export class StripeIssuingProvider implements PaymentProvider {
   }
   private async request(method: string, path: string, accountId?: string,
     params?: Record<string, unknown>, idempotencyKey?: string): Promise<any> {
-    const key = this.secret(STRIPE_SECRET_KEY_HANDLE, 'STRIPE_SECRET_KEY');
+    const key = await this.secret(STRIPE_SECRET_KEY_HANDLE, 'STRIPE_SECRET_KEY');
     if (!key) throw new Error('Stripe platform secret is not configured');
     const headers: Record<string, string> = {
       authorization: `Bearer ${key}`,
@@ -525,7 +528,7 @@ export class StripeIssuingProvider implements PaymentProvider {
       connected: Boolean(connection?.status === 'ready'),
       connectionStatus: connection?.status,
       help: connection?.status === 'ready'
-        ? `Connected to ${connection.accountId}${connection.livemode ? ' (live)' : ' (test)'}. Funds come from this organization's Stripe Issuing balance.${this.hasSecret(STRIPE_WEBHOOK_SECRET_HANDLE, 'STRIPE_WEBHOOK_SECRET') ? '' : ' Add the webhook signing secret in Stripe platform setup before issuing active cards.'}`
+        ? `Connected to ${connection.accountId}${connection.livemode ? ' (live)' : ' (test)'}. Funds come from this organization's Stripe Issuing balance.${await this.hasSecret(STRIPE_WEBHOOK_SECRET_HANDLE, 'STRIPE_WEBHOOK_SECRET') ? '' : ' Add the webhook signing secret in Stripe platform setup before issuing active cards.'}`
         : connection?.status === 'attention'
           ? `Connected account ${connection.accountId} needs Stripe card_issuing capability activation before ${BRAND} can issue cards.`
         : available
@@ -555,7 +558,7 @@ export class StripeIssuingProvider implements PaymentProvider {
     const pending = (await this.store!.consumePaymentOAuthState(state, userId));
     if (!pending) throw new Error('Stripe connection state is invalid, expired, or already used');
     const form = new URLSearchParams({
-      client_secret: this.secret(STRIPE_SECRET_KEY_HANDLE, 'STRIPE_SECRET_KEY')!,
+      client_secret: (await this.secret(STRIPE_SECRET_KEY_HANDLE, 'STRIPE_SECRET_KEY'))!,
       code,
       grant_type: 'authorization_code',
     });
@@ -596,7 +599,7 @@ export class StripeIssuingProvider implements PaymentProvider {
     });
     const response = await this.fetcher('https://connect.stripe.com/oauth/deauthorize', {
       method: 'POST',
-      headers: { authorization: `Bearer ${this.secret(STRIPE_SECRET_KEY_HANDLE, 'STRIPE_SECRET_KEY')!}`,
+      headers: { authorization: `Bearer ${(await this.secret(STRIPE_SECRET_KEY_HANDLE, 'STRIPE_SECRET_KEY'))!}`,
         'content-type': 'application/x-www-form-urlencoded' },
       body: form.toString(),
     });
@@ -607,7 +610,7 @@ export class StripeIssuingProvider implements PaymentProvider {
   async provisionCard(spec: CardSpec): Promise<Card> {
     if (!spec.cardholderId) throw new Error('Stripe Issuing cardholder is required');
     if (!Number.isSafeInteger(spec.cap) || spec.cap <= 0) throw new Error('card cap must be a positive number of cents');
-    if (!this.hasSecret(STRIPE_WEBHOOK_SECRET_HANDLE, 'STRIPE_WEBHOOK_SECRET'))
+    if (!await this.hasSecret(STRIPE_WEBHOOK_SECRET_HANDLE, 'STRIPE_WEBHOOK_SECRET'))
       throw new Error('A Stripe webhook signing secret is required before issuing active cards');
     const organizationId = spec.organizationId
       ?? (spec.scope === 'organization' ? spec.scopeId : spec.scope === 'project'
@@ -731,8 +734,8 @@ export class StripeIssuingProvider implements PaymentProvider {
     if (!remote.number || !remote.cvc) throw new Error('Stripe did not return virtual card details');
     return { number: remote.number, cvc: remote.cvc, expMonth: remote.exp_month, expYear: remote.exp_year };
   }
-  webhookSignatureValid(raw: Buffer, signature: string | undefined, now = Date.now()): boolean {
-    const secret = this.secret(STRIPE_WEBHOOK_SECRET_HANDLE, 'STRIPE_WEBHOOK_SECRET');
+  async webhookSignatureValid(raw: Buffer, signature: string | undefined, now = Date.now()): Promise<boolean> {
+    const secret = await this.secret(STRIPE_WEBHOOK_SECRET_HANDLE, 'STRIPE_WEBHOOK_SECRET');
     if (!secret || !signature) return false;
     const parts = signature.split(',').map((part) => part.split('=', 2));
     const timestamp = Number(parts.find(([key]) => key === 't')?.[1]);
@@ -743,7 +746,7 @@ export class StripeIssuingProvider implements PaymentProvider {
       && crypto.timingSafeEqual(Buffer.from(value), Buffer.from(expected)));
   }
   async handleWebhook(raw: Buffer, signature?: string): Promise<{ status: number; body: any; stripeVersion?: string }> {
-    if (!this.webhookSignatureValid(raw, signature)) return { status: 400, body: { error: 'invalid Stripe signature' } };
+    if (!await this.webhookSignatureValid(raw, signature)) return { status: 400, body: { error: 'invalid Stripe signature' } };
     const event = JSON.parse(raw.toString('utf8')) as any;
     const previous = (await this.store!.getPaymentEvent(this.name, event.id));
     if (previous?.decision) return { status: 200, body: previous.decision, stripeVersion: STRIPE_API_VERSION };
@@ -1292,6 +1295,7 @@ export class BudgetService {
     const refreshed = await provider.getCard(card.id) ?? card;
     let wonClaim = false;
     const claimed = (await this.store.paymentTransaction(async () => {
+      wonClaim = false; // per attempt: a deadlocked transaction re-runs this callback
       const current = (await this.store.getPaymentSpendRequest(requestId))!;
       if (!['pending_approval', 'needs_funding'].includes(current.status)) return current;
       if (await ended())

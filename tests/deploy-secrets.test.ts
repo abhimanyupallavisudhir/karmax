@@ -75,7 +75,7 @@ describe('turnkey update deploys an exact validated revision', () => {
   // older backup's secrets directory.
   it('creates any missing secret before building an update or starting a restore', () => {
     expect(update.indexOf('ensure_secrets')).toBeGreaterThan(update.indexOf('checkout --detach "$target"'));
-    expect(update.indexOf('ensure_secrets')).toBeLessThan(update.indexOf('dc build --pull app'));
+    expect(update.indexOf('ensure_secrets')).toBeLessThan(update.indexOf('build_images --pull'));
     const restore = script.split('cmd_restore() {')[1]?.split('\n}')[0] ?? '';
     expect(restore.indexOf('ensure_secrets')).toBeGreaterThan(restore.indexOf('mv "$staged_secrets" "$SECRETS_DIR"'));
     expect(restore.indexOf('ensure_secrets')).toBeLessThan(restore.lastIndexOf('dc up -d postgresql'));
@@ -292,7 +292,8 @@ describe('turnkey deployment secrets', () => {
   const secretsDir = generateSecrets();
   const secrets = ['auth_secret', 'vault_key', 'world_ref_key'];
   // Operator-supplied, empty until an S3 object store is configured.
-  const optional = ['s3_access_key_id', 's3_secret_access_key'];
+  const optional = ['s3_access_key_id', 's3_secret_access_key',
+    'pg_backup_access_key_id', 'pg_backup_secret_access_key', 'pg_backup_public_key'];
 
   // An update runs the installed release's script, which cannot generate a
   // host secret a newer release adds; Compose would refuse to mount it. So
@@ -306,9 +307,10 @@ describe('turnkey deployment secrets', () => {
     }
   });
 
-  // Compose refuses to start without every mounted file, but an S3 key is the
-  // operator's to write: an empty file means "not configured", never a random key.
-  it('creates the S3 key files empty and keeps the operator\'s', () => {
+  // Compose refuses to start without every mounted file, but an S3 key (the
+  // object store's, or the backup bucket's) is the operator's to write: an
+  // empty file means "not configured", never a random key.
+  it('creates the S3 and backup key files empty and keeps the operator\'s', () => {
     for (const name of optional) expect(fs.readFileSync(path.join(secretsDir, name), 'utf8')).toBe('');
     fs.writeFileSync(path.join(secretsDir, 's3_secret_access_key'), 'operator-key\n');
     rerunUp(path.dirname(secretsDir));
@@ -330,7 +332,18 @@ describe('turnkey deployment secrets', () => {
       KARMAX_S3_SECRET_ACCESS_KEY_FILE: '/run/secrets/s3_secret_access_key',
     });
     expect(app.environment).not.toHaveProperty('KARMAX_S3_SECRET_ACCESS_KEY');
-    expect(app.secrets).toEqual(expect.arrayContaining(optional));
+    expect(app.secrets).toEqual(expect.arrayContaining(['s3_access_key_id', 's3_secret_access_key']));
+  });
+
+  // The backup bucket's key reaches only what writes backups: never the app,
+  // which tenants' agents drive, and never anything that could read them back
+  // decrypted (only the public encryption key is on the host).
+  it('mounts the backup bucket key only into PostgreSQL and its backup service', () => {
+    const compose = parse(fs.readFileSync(path.join(deployDir, 'compose.turnkey.yml'), 'utf8'));
+    const holders = Object.entries(compose.services as Record<string, { secrets?: string[] }>)
+      .filter(([, service]) => service.secrets?.some((name) => name.startsWith('pg_backup_'))).map(([name]) => name);
+    expect(holders.sort()).toEqual(['pg-backup', 'postgresql']);
+    expect(compose.services['pg-backup'].volumes).toEqual(['temporal_postgres:/var/lib/postgresql/data:ro']);
   });
 
   // The app container runs as its own uid and compose bind-mounts these files

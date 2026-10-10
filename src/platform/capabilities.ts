@@ -249,15 +249,24 @@ export function allows(set: Capability[], requested: Capability): boolean {
   return set.some((p) => capMatches(p, requested));
 }
 
+const attenuated = new Map<string, Capability[]>();
 /**
  * Effective capabilities = intersection(ceiling, grantor). A concrete cap on
  * either side is kept only if the other side also allows it (so wildcards
  * narrow to the concrete grants they cover).
  */
 export function attenuate(ceiling: Capability[], grantor: Capability[]): Capability[] {
+  // Pure and quadratic in the two lists, and every capability decision makes
+  // several from the same few profiles: a tenth of the gateway's CPU at 96
+  // tenants (2026-10 load test). Remembered by value; callers get a copy.
+  const key = `${ceiling.join(',')}|${grantor.join(',')}`;
+  const known = attenuated.get(key);
+  if (known) return [...known];
   const out = new Set<Capability>();
   for (const c of grantor) if (allows(ceiling, c)) out.add(c);
   for (const c of ceiling) if (allows(grantor, c)) out.add(c);
+  if (attenuated.size >= 2_048) attenuated.clear();
+  attenuated.set(key, [...out]);
   return [...out];
 }
 
