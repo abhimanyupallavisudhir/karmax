@@ -8,6 +8,9 @@ export const FOLLOW_UP_SETTLE_MS = 10_000;
 /** A writer that journals nothing (an operator's raw Temporal signal) is still
  * delivered in-turn, within this bound. */
 export const FOLLOW_UP_BACKSTOP_MS = 30_000;
+/** With wake marks, the journal is read again at least this often anyway:
+ * a writer this process does not hear from (another replica) is seen within it. */
+export const FOLLOW_UP_JOURNAL_RECHECK_MS = 5_000;
 
 /**
  * Gate a running turn's follow-up pulls (SPEC §5.6, LT-13). Streaming adapters
@@ -29,10 +32,17 @@ export function gateFollowUps(options: {
    *  the journal cannot know (a parent's answer, #396 review item 8): the gate
    *  keeps asking until the settle window lapses. */
   journaled: (seq: number) => Promise<{ seq: number; messageId?: string; pending?: boolean }[]>;
+  /** The task's follow-up wake mark (`followUpMark`): the journal is read only
+   * once it moves, or after FOLLOW_UP_JOURNAL_RECHECK_MS. Undefined: read on
+   * every pull. */
+  mark?: () => number | undefined;
   now?: () => number;
 }): (fromIndex: number) => Promise<Message[]> {
   const now = options.now ?? Date.now;
   let seen: number | undefined;
+  let readMark: number | undefined;
+  let readAt = -Infinity;
+  let movedAt = -Infinity;
   let askedAt = 0;
   let publication = false;
   let pendingUntil = 0;
@@ -41,8 +51,17 @@ export function gateFollowUps(options: {
   // A query can return a message before its journal entry is written.
   const returned = new Set<string>();
   const worthAsking = async (): Promise<boolean> => {
-    if (seen === undefined) { seen = await options.cursor(); return true; }
-    for (const entry of await options.journaled(seen)) {
+    const mark = options.mark?.();
+    if (seen === undefined) { seen = await options.cursor(); readMark = mark; readAt = now(); return true; }
+    if (mark !== readMark) movedAt = now();
+    // After a move, read for a second more: on PostgreSQL the read stops at the
+    // commit watermark, which a lower seq still in flight can briefly hold back.
+    const unchanged = mark !== undefined && mark === readMark && now() - movedAt >= 1_000
+      && now() - readAt < FOLLOW_UP_JOURNAL_RECHECK_MS;
+    const entries = unchanged ? [] : await options.journaled(seen);
+    // `mark` was taken before reading: an entry committed during the read moves it again.
+    if (!unchanged) { readMark = mark; readAt = now(); }
+    for (const entry of entries) {
       seen = Math.max(seen, entry.seq);
       if (entry.pending) pendingUntil = now() + FOLLOW_UP_SETTLE_MS;
       else if (!entry.messageId) publication = true;

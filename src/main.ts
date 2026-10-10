@@ -12,6 +12,7 @@ import { startDevServer, watchDevServer } from './temporal/dev-server.js';
 import { makeClient } from './temporal/client.js';
 import { WorkerManager, terminateOnWorkerFailure } from './temporal/worker-pool.js';
 import { WorkerProcessManager } from './temporal/worker-process.js';
+import { noteFollowUpEvent, wireFollowUpWakes } from './activities/follow-up-wakes.js';
 import { memoryBudget } from './runtime/memory-budget.js';
 import { ForeignEventRelay } from './contrib/foreign-event-relay.js';
 import { TASK_QUEUE } from './temporal/config.js';
@@ -359,6 +360,10 @@ async function main() {
       await retryCredentials({ store, client, taskQueue: TASK_QUEUE, configHomes, broker }, task, credentialProvider, options);
     },
   });
+  // Running turns read their follow-up journal when it changes, not on every
+  // poll (load test 2026-10). A separate worker hears of this process's entries.
+  store.onEventRecorded((event) => { if (noteFollowUpEvent(event) && workerManager instanceof WorkerProcessManager) workerManager.journaled(event.taskId); });
+  if (!separateWorker) wireFollowUpWakes();
 
   // Workflow code activation is an explicit install operation with current
   // authorization. A completed edit must never activate a moving branch tip.

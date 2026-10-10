@@ -43,6 +43,10 @@ function workerHeapFrom(heap: WorkerHeap): WorkerHeap {
 }
 /** Unsolicited child → supervisor hint: events were committed to the shared store. */
 export interface WorkerProcessNotice { type: 'worker.events' }
+/** Supervisor → child: tasks whose follow-up journal the supervisor committed
+ * to, so their running turns read it now (`follow-up-wakes.ts`). A hint: a
+ * lost one is seen at the turn's next periodic read. */
+export interface WorkerJournaledNotice { type: 'worker.journaled'; taskIds: string[] }
 
 /** One supervised child, with bounded control requests and explicit readiness.
  * A control timeout kills the child: the caller cannot safely assume a timed-out
@@ -109,6 +113,20 @@ export class WorkerProcessManager {
   private terminate(error: Error): void {
     this.fail(error);
     this.child?.kill('SIGKILL');
+  }
+
+  private journaledTasks = new Set<string>();
+  /** Tell the child that `taskId`'s follow-up journal changed; one message per burst. */
+  journaled(taskId: string): void {
+    if (!this.ready || !this.child?.connected) return;
+    if (!this.journaledTasks.size) setImmediate(() => {
+      const taskIds = [...this.journaledTasks].slice(0, 1_000);
+      this.journaledTasks.clear();
+      if (!this.child?.connected) return;
+      const notice: WorkerJournaledNotice = { type: 'worker.journaled', taskIds };
+      this.child.send(notice, () => { /* a hint: the turn's periodic read recovers it */ });
+    });
+    this.journaledTasks.add(taskId);
   }
 
   private request(action: WorkerProcessRequest['action'], packages?: ExternalWorkflowRef[], timeoutMs?: number): Promise<void> {

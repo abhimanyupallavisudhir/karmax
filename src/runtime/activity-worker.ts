@@ -3,6 +3,7 @@ import { paths } from '../config/paths.js';
 import { validateDeployment } from '../config/deployment.js';
 import { admitWorkerProcess } from '../util/instance.js';
 import { Store } from '../store/db.js';
+import { noteFollowUpEvent, wireFollowUpWakes } from '../activities/follow-up-wakes.js';
 import { makeClient } from '../temporal/client.js';
 import { temporalConnectionFromEnv } from '../temporal/connection-env.js';
 import { WorkerManager } from '../temporal/worker-pool.js';
@@ -57,6 +58,10 @@ export async function createActivityWorkerRuntime(): Promise<WorkerProcessRuntim
     // commit rather than leaving delivery to its poll (LT-15).
     const append = store.appendEvent.bind(store);
     store.appendEvent = async (event) => { const seq = await append(event); announceEventsAppended(); return seq; };
+    // Running turns read their follow-up journal when it changes: on this
+    // process's commits, and on the primary's (`worker.journaled`).
+    store.onEventRecorded((event) => { noteFollowUpEvent(event); });
+    wireFollowUpWakes();
     const connection = await makeClient(conn);
     closeClient = connection.close;
     const client = connection.client;

@@ -47,6 +47,17 @@ test('wakes the supervisor when the child commits events, coalescing a burst (LT
   expect(onEvents).toHaveBeenCalledTimes(2);
 });
 
+test('tells the child which tasks\' follow-up journals changed, so their turns read them now', async () => {
+  const worker = manager('journaled');
+  await worker.start();
+  const journaled: string[] = [];
+  (worker as any).child.on('message', (value: any) => { if (value?.type === 'fixture.journaled') journaled.push(value.taskId); });
+  worker.journaled('task-a');
+  await vi.waitFor(() => expect(journaled).toEqual(['task-a']), { timeout: 2_000 });
+  worker.journaled('task-b'); worker.journaled('task-a');
+  await vi.waitFor(() => expect(journaled.slice(1).sort()).toEqual(['task-a', 'task-b']), { timeout: 2_000 });
+});
+
 test('keeps the previous package set when a refresh is rejected', async () => {
   const worker = manager('reject-refresh');
   const original = [{ type: 'fixture@1', entryFile: '/fixture/one.ts' }];

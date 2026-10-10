@@ -46,6 +46,7 @@ import { AgentAdapter, type TurnResult, type AdapterTurn } from '../agent/types.
 import { KARMAX_RUNTIME_PROTOCOL, runRuntimeTurn } from '../agent/runtime.js';
 import { TaskSecrets, cardRef, handleRef, paymentCardDetails, recordSecretRefs, secretScope, taskRef } from '../autonomy/task-secrets.js';
 import { gateFollowUps } from './follow-up-gate.js';
+import { FOLLOW_UP_JOURNAL_TYPES, followUpMark } from './follow-up-wakes.js';
 import { acquireAgentSlot, awaitAgentResources, AgentResourcesUnavailableError } from './agent-slots.js';
 import { assemblePrompt } from '../agent/prompt.js';
 import { GLOBAL_INSTRUCTIONS } from '../agent/instructions.js';
@@ -2527,7 +2528,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                 }
               },
               cursor: () => store.latestEventSeq(),
-              journaled: async (seq) => (await store.eventsOfType(args.taskId, ['conversation.message', 'view.updated', 'subtask.parent-response'], seq))
+              mark: () => followUpMark(args.taskId),
+              journaled: async (seq) => (await store.eventsOfType(args.taskId, FOLLOW_UP_JOURNAL_TYPES, seq))
                 .map(event => ({ seq: event.seq, pending: event.type === 'subtask.parent-response', messageId: event.type === 'conversation.message'
                   ? String((event.payload as { message?: { id?: string } }).message?.id ?? `seq:${event.seq}`) : undefined })),
             })
