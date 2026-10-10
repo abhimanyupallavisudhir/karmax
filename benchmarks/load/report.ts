@@ -83,18 +83,21 @@ function load(resultsDir: string) {
   const steps = jsonl(readMaybe(path.join(resultsDir, 'steps.jsonl')));
   const samplesFile = path.join(resultsDir, 'raw', 'samples.jsonl.gz');
   const samples = fs.existsSync(samplesFile) ? jsonl(zlib.gunzipSync(fs.readFileSync(samplesFile)).toString('utf8')) : [];
-  const probes: Json[] = [];
+  const probes: Json[] = [], profiles: Json[] = [];
   const probeArchive = path.join(resultsDir, 'raw', 'probe.tgz');
   if (fs.existsSync(probeArchive)) {
     const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'probe-'));
     execFileSync('tar', ['xzf', probeArchive, '-C', scratch]);
     const probeDir = path.join(scratch, 'probe');
-    for (const file of fs.existsSync(probeDir) ? fs.readdirSync(probeDir) : []) probes.push(...jsonl(fs.readFileSync(path.join(probeDir, file), 'utf8')));
+    for (const file of fs.existsSync(probeDir) ? fs.readdirSync(probeDir) : []) {
+      if (file.endsWith('.profile.jsonl')) profiles.push(...jsonl(fs.readFileSync(path.join(probeDir, file), 'utf8')));
+      else if (file.endsWith('.jsonl')) probes.push(...jsonl(fs.readFileSync(path.join(probeDir, file), 'utf8')));
+    }
     fs.rmSync(scratch, { recursive: true, force: true });
   }
   const run = JSON.parse(readMaybe(path.join(resultsDir, 'run.json')) || '{}');
   const cost = JSON.parse(readMaybe(path.join(resultsDir, 'cost.json')) || '{}');
-  return { steps, samples, probes, run, cost };
+  return { steps, samples, probes, profiles, run, cost };
 }
 
 // ---------------------------------------------------------------- per step
@@ -131,6 +134,15 @@ function stepRow(step: Json, samples: Json[], probes: Json[]) {
     appGauges[key] = Math.max(appGauges[key] ?? -Infinity, s.value);
   }
   const scrapeMs = finite(metrics.map((s) => s.data.scrapeMs));
+  // Authority changes per second (counters, so first to last scrape): broad
+  // ones re-decide every socket; scoped ones only those they touch.
+  const authority = (scrape: Json | undefined, scope: string) => scrape
+    ? parseProm(scrape.data.text).find((s) => s.name === 'karmax_authority_changes_total' && s.labels.includes(`scope="${scope}"`))?.value : undefined;
+  const authorityRate = (scope: string) => {
+    const first = authority(metrics[0], scope), last = authority(metrics.at(-1), scope);
+    const seconds = metrics.length >= 2 ? (metrics.at(-1)!.t - metrics[0]!.t) / 1000 : 0;
+    return first === undefined || last === undefined || !seconds ? undefined : round((last - first) / seconds, 2);
+  };
 
   // The server's matching histograms between the window's first and last
   // scrape: every family summed, and schedule-to-start (the task-queue latency)
@@ -215,6 +227,7 @@ function stepRow(step: Json, samples: Json[], probes: Json[]) {
       karmaxDbMb: mb(max(finite(pg.map((p) => p.databases?.karmax?.sizeBytes)))),
     },
     appGauges,
+    authorityChangesPerSecond: { all: authorityRate('all'), scoped: authorityRate('scoped') },
     topStatements,
     metricsScrapeMaxMs: max(scrapeMs),
     temporal: {
@@ -243,7 +256,7 @@ function table(rows: Json[]) {
   return lines.join('\n');
 }
 
-const { steps, samples, probes, run, cost } = load(dir);
+const { steps, samples, probes, profiles, run, cost } = load(dir);
 const rows = steps.map((step) => stepRow(step, samples, probes));
 const wall = rows.find((r) => r.broken.length);
 const restarts = (roleName: string) => new Set(probes.filter((p) => p.role === roleName).map((p) => p.pid)).size;
@@ -264,6 +277,22 @@ if (attributed?.topStatements?.length) {
   md.push(`### Busiest statements at step ${attributed.step} (karmax database, pg_stat_statements)`, '',
     '| calls/s | share | mean ms | statement |', '|---:|---:|---:|---|',
     ...attributed.topStatements.map((row: Json) => `| ${fmt(row.perSecond)} | ${fmt(row.sharePct)} % | ${fmt(row.meanMs)} | \`${String(row.query).replaceAll('|', '\\|').slice(0, 160)}\` |`), '');
+}
+// Where the gateway's and worker's main threads spent their CPU at that step
+// (probe.mjs profiles that started in its steady window).
+if (attributed && profiles.length) {
+  const step = steps.find((candidate) => candidate.step === attributed.step);
+  const from = Date.parse(step?.steadyFrom), to = Date.parse(step?.endedAt);
+  for (const role of ['gateway', 'worker']) {
+    const inWindow = profiles.filter((p) => p.role === role && p.t >= from && p.until <= to);
+    if (!inWindow.length) continue;
+    const totals = new Map<string, number>();
+    let sampled = 0;
+    for (const p of inWindow) { sampled += p.sampledMs; for (const m of p.modules) totals.set(m.name, (totals.get(m.name) ?? 0) + m.ms); }
+    md.push(`### ${role} CPU by module at step ${attributed.step} (${inWindow.length} profile(s), ${Math.round(sampled / 1000)} s sampled)`, '',
+      '| module | share |', '|---|---:|',
+      ...[...totals].sort((a, b) => b[1] - a[1]).slice(0, 15).map(([name, ms]) => `| \`${name}\` | ${round((100 * ms) / sampled, 1)} % |`), '');
+  }
 }
 for (const r of rows) {
   md.push(`<details><summary>Step ${r.step}: ${r.tenants} tenants${r.broken.length ? ' — broke' : ''}</summary>`, '', '```json', JSON.stringify(r, null, 1), '```', '</details>', '');

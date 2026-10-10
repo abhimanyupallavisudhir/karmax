@@ -21,6 +21,21 @@ function admissionTimeout(error: unknown): unknown {
 
 interface TransactionScope { client: PoolClient; active: boolean; pending: number; failure?: unknown }
 
+/** Connections per process (`KARMAX_STORE_POOL_SIZE`, default 8). Transactions
+ * use all but one (`sql.ts`). It was 4 until the 2026-10 load test: once the
+ * per-socket permission reads were gone, the activity worker queued past its
+ * 256-request admission bound behind 4 connections at 96 tenants while
+ * PostgreSQL had 43 of 100 connections spare. Each app process (gateway,
+ * worker) holds up to this many; keep the sum, Temporal's and identity's well
+ * under PostgreSQL's max_connections. */
+export function storePoolSize(env: NodeJS.ProcessEnv = process.env): number {
+  const configured = env.KARMAX_STORE_POOL_SIZE?.trim();
+  if (!configured) return 8;
+  const size = Number(configured);
+  if (!Number.isSafeInteger(size) || size < 1 || size > 64) throw new Error('KARMAX_STORE_POOL_SIZE must be an integer from 1 to 64');
+  return size;
+}
+
 /** Bounded native asynchronous PostgreSQL access. Each transaction has its own
  * checked-out connection; unrelated requests never inherit its transaction. */
 export class AsyncPostgres {
@@ -33,11 +48,11 @@ export class AsyncPostgres {
 
   constructor(url: string, options: { max?: number; maxPending?: number; statementTimeoutMs?: number } = {}) {
     this.maxPending = options.maxPending ?? 256;
-    this.maxConnections = options.max ?? 4;
+    this.maxConnections = options.max ?? storePoolSize();
     if (!Number.isSafeInteger(this.maxPending) || this.maxPending < 1
-      || !Number.isSafeInteger(options.max ?? 4) || (options.max ?? 4) < 1)
+      || !Number.isSafeInteger(this.maxConnections) || this.maxConnections < 1)
       throw new Error('database pool and admission limits must be positive integers');
-    this.pool = new Pool({ connectionString: url, max: options.max ?? 4, application_name: 'karmax',
+    this.pool = new Pool({ connectionString: url, max: this.maxConnections, application_name: 'karmax',
       connectionTimeoutMillis: 5000, idleTimeoutMillis: 30_000,
       statement_timeout: options.statementTimeoutMs ?? 15_000,
       types: { getTypeParser: (oid, format) => oid === 20 || oid === 1700 ? Number : types.getTypeParser(oid, format) } });
