@@ -157,7 +157,7 @@ jobs:
       - uses: ./.github/actions/install
       - uses: ./.github/actions/temporal-cli
       # The snapshot build stays behind its own KARMAX_DAYTONA_LIVE_BUILD switch.
-      - run: npx vitest run tests/daytona-live.test.ts tests/daytona-environment-live.test.ts tests/daytona-workflow-live.test.ts tests/remote-acp-live.test.ts tests/remote-acp-workflow-live.test.ts
+      - run: npx vitest run tests/daytona-live.test.ts tests/daytona-limits-live.test.ts tests/daytona-environment-live.test.ts tests/daytona-workflow-live.test.ts tests/remote-acp-live.test.ts tests/remote-acp-workflow-live.test.ts
         env:
           KARMAX_RUN_LIVE: '1'
           DAYTONA_API_KEY: ${{ secrets.LIVE_DAYTONA_API_KEY }}

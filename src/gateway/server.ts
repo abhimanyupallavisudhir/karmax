@@ -47,6 +47,7 @@ import { platformRequestPathError } from '../platform/platform-request.js';
 import { ContributionRegistry } from '../contrib/registry.js';
 import { Overlays } from '../store/overlays.js';
 import { activationTaskPrompt, manifest } from '../contrib/manifests.js';
+import { machineShape } from '../domain/computer.js';
 import { projectSettingsFor, globalSettingsFor, quickProjectSettingsFor, quickGlobalSettingsFor, quickScopeKey, settingsToProjectConfig, resolveParams, resolveParamsLayers, effectiveRepos } from '../platform/params.js';
 import { defaultProvider } from '../agent/adapters.js';
 import { findProviderSession } from '../agent/fork.js';
@@ -2907,6 +2908,9 @@ export class Gateway {
             if (policy.worldProvider && !['worktree', 'container', 'memory'].includes(String(policy.worldProvider))
               && !(await this.deps.providerConnections?.available(organizationId, String(policy.worldProvider))))
               throw new Error(`${policy.worldProvider} is not connected and verified`);
+            if (policy.resources && typeof policy.resources === 'object')
+              (await this.deps.providerConnections?.assertFits?.(organizationId,
+                String(policy.worldProvider ?? (await store.getOrganizationExecutionPolicy(organizationId)).worldProvider ?? ''), machineShape({ resources: policy.resources })));
             if (policy.runnerPoolId) {
               const pool = (await store.getRunnerPool(String(policy.runnerPoolId)));
               if (!pool || pool.organizationId !== organizationId) throw new Error('runner pool does not belong to this organization');
@@ -4145,6 +4149,8 @@ export class Gateway {
             if (effective.worldProvider && !['worktree', 'container', 'memory'].includes(effective.worldProvider)
               && !(await this.deps.providerConnections?.available(project.organizationId!, effective.worldProvider)))
               throw new Error(`${effective.worldProvider} is not connected and verified in Organization settings`);
+            if (override.resources && typeof override.resources === 'object')
+              (await this.deps.providerConnections?.assertFits?.(project.organizationId!, effective.worldProvider, machineShape({ resources: override.resources })));
             if (effective.runnerPoolId) {
               const pool = (await store.getRunnerPool(effective.runnerPoolId));
               if (!pool || pool.organizationId !== project.organizationId) throw new Error('runner pool does not belong to this organization');
@@ -5232,6 +5238,16 @@ export class Gateway {
           canEdit: !['done', 'cancelled', 'failed'].includes(task.lastView?.status ?? '')
             && (await this.deps.tokens.check(token, 'payment:write', { projectId: task.projectId })).ok,
           spent: (await store.paymentSpent(task.id, false, policy.currency)), released });
+      }
+      const biggerDisk = p.match(/^\/api\/tasks\/([^/]+)\/bigger-disk$/);
+      if (biggerDisk && method === 'POST') {
+        const b = await this.body(req);
+        try {
+          return this.json(res, 200, await api.biggerDisk(token, biggerDisk[1]!, b.diskGb == null ? undefined : Number(b.diskGb)));
+        } catch (e) {
+          const status = (e as { status?: number })?.status;
+          return this.json(res, status === 403 || status === 404 ? status : 400, { error: e instanceof Error ? e.message : String(e) });
+        }
       }
       const editMatch = p.match(/^\/api\/tasks\/([^/]+)\/params$/);
       if (editMatch && method === 'PATCH') {

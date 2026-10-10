@@ -744,6 +744,9 @@ async function softwareDevImpl(
   let humanPauseWake: { kind: 'retry' | 'followUp' | 'confirm' | 'openPr' | 'workflowChange'; role?: string } | undefined;
   /** v1.27: the stage a failure holds in (the view shows it instead of `escalated`). */
   let escalatedFrom: Stage | undefined;
+  // The last failure was a full disk (wiki features/computers): the view says
+  // "Out of disk" and offers a bigger one instead of a code fix or a retry loop.
+  let outOfDisk = false;
   let world: WorldHandleLike | undefined = recovery?.world;
   // A released sandbox is no longer addressable, but the branch and checkouts it
   // carried stay part of the finished task's record.
@@ -1288,6 +1291,7 @@ async function softwareDevImpl(
       subTasks: subTaskIds.length ? subTaskIds : undefined,
       parentTaskId: input.parentTaskId,
       error,
+      ...(outOfDisk && status === 'blocked' ? { outOfDisk: true } : {}),
       waitingFor,
       agentTurn,
       pointOfNoReturnPassed,
@@ -2022,6 +2026,16 @@ async function softwareDevImpl(
             error = lastError;
             break;
           }
+          // A full disk is the computer's, not the code's: no Resolve turn and no
+          // blind retry, which would only fail again. Like a policy rejection this
+          // type has no historical command sequence, so no patch marker is needed.
+          if (failureHasType(err, 'world-disk-full')) {
+            cause = 'task';
+            lastError = describeError(err);
+            error = lastError;
+            outOfDisk = true;
+            break;
+          }
           // A Do session the provider rejects as larger than the model's context
           // fails the same way on every retry and follow-up (legibench3#18). Run
           // the stage once more on a fresh session, which rebuilds its context from
@@ -2284,6 +2298,7 @@ async function softwareDevImpl(
       escalationAction = undefined;
       waitingFor = undefined;
       escalatedFrom = undefined;
+      outOfDisk = false;
       if (cancelled) throw new Cancelled();
       if (halted()) { stage = resumeStage; status = 'active'; error = undefined; throw new Cancelled(); }
       // A human/parent retry resumes the stage that failed. Leaving this as

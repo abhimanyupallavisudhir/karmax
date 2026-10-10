@@ -1029,3 +1029,37 @@ describe('resource publication by sub-tasks', () => {
     expect(wf.activities.refreshResourceForks).toHaveBeenCalledOnce();
   });
 });
+
+// compute-disk item 5: a full disk is the computer's problem, not the code's —
+// no Resolve turn, no blind retry; the task says "Out of disk" until it is fixed.
+describe('out of disk', () => {
+  it('stops as Out of disk without a Resolve turn, and a retry clears it', async () => {
+    const { ActivityFailure, ApplicationFailure } = await import('@temporalio/workflow');
+    const child = { ...input, taskId: 'child', parentTaskId: 'parent' };
+    wf.activities.accountPoolSize.mockResolvedValue(0);
+    wf.activities.pendingResourceCandidates = vi.fn(async () => 0);
+    const message = 'Out of disk: this task\'s computer filled its 22 GB disk, so its agent stopped. Bigger disk (up to 29 GB) fixes it (POST /api/tasks/child/bigger-disk).';
+    wf.activities.runAgentTurn = vi.fn()
+      .mockRejectedValueOnce(new ActivityFailure('activity failed', 'runAgentTurn', '1', 'NON_RETRYABLE_FAILURE' as any, 'worker',
+        ApplicationFailure.nonRetryable(message, 'world-disk-full')))
+      .mockResolvedValue({ openPrRequested: true, completed: true });
+    wf.activities.autoResolve = vi.fn(async () => ({ resolved: false }));
+    wf.activities.publishView.mockImplementation(async (_id: string, view: any) => {
+      if (view.stage === 'review' && view.waitingFor?.kind === 'parent') wf.handlers.get('parentResponse')!({ action: 'confirm' });
+    });
+    let stopped: any;
+    wf.wait = () => {
+      const view = wf.handlers.get('view')!();
+      if (!view.outOfDisk || stopped) return;
+      stopped = view;
+      wf.handlers.get('parentResponse')!({ action: 'retry' });
+    };
+    const result = await softwareDevV1_27(child);
+    expect(stopped).toMatchObject({ status: 'blocked', outOfDisk: true, waitingFor: { kind: 'parent' } });
+    expect(stopped.error).toContain(message);
+    expect(wf.activities.autoResolve).not.toHaveBeenCalled();
+    expect(wf.childSignal).toHaveBeenCalledWith('raiseFromChild', expect.objectContaining({ type: 'blocked' }));
+    expect(result.stage).toBe('done');
+    expect(wf.handlers.get('view')!().outOfDisk).toBeUndefined();
+  });
+});

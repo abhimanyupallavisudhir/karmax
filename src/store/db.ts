@@ -633,7 +633,7 @@ export class Store {
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, provider TEXT NOT NULL,
         name TEXT NOT NULL, credentialHandle TEXT NOT NULL, config TEXT NOT NULL,
         enabled INTEGER NOT NULL, status TEXT NOT NULL, lastCheckedAt INTEGER,
-        lastError TEXT, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL,
+        lastError TEXT, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL, limits TEXT,
         UNIQUE(organizationId, provider)
       );
       CREATE TABLE IF NOT EXISTS world_leases (
@@ -970,6 +970,8 @@ export class Store {
     // installs pick it up without a re-create.
     const eventCols = await this.db.prepare('PRAGMA table_info(events)').all() as { name: string }[];
     if (!eventCols.some(column => column.name === 'origin')) await this.db.exec('ALTER TABLE events ADD COLUMN origin TEXT');
+    const providerCols = await this.db.prepare('PRAGMA table_info(world_provider_connections)').all() as { name: string }[];
+    if (!providerCols.some(column => column.name === 'limits')) await this.db.exec('ALTER TABLE world_provider_connections ADD COLUMN limits TEXT');
     const candidateCols = await this.db.prepare('PRAGMA table_info(resource_candidates)').all() as { name: string }[];
     if (!candidateCols.some(column => column.name === 'error')) await this.db.exec('ALTER TABLE resource_candidates ADD COLUMN error TEXT');
     const cols = (await this.db.prepare('PRAGMA table_info(tasks)').all()) as any[];
@@ -7109,6 +7111,13 @@ export class Store {
     });
   }
 
+  /** What the provider account said it allows; null forgets it (a new key). */
+  async setWorldProviderConnectionLimits(organizationId: string, provider: string,
+    limits: import('../domain/computer-limits.js').ComputerLimits | null): Promise<void> {
+    (await this.db.prepare('UPDATE world_provider_connections SET limits=? WHERE organizationId=? AND provider=?')
+      .run(limits ? JSON.stringify(limits) : null, organizationId, provider));
+  }
+
   async deleteWorldProviderConnection(organizationId: string, provider: string): Promise<WorldProviderConnection | undefined> {
     return this.db.transaction(async () => {
 
@@ -9179,6 +9188,7 @@ function rowToWorldProviderConnection(r: any): WorldProviderConnection {
     name: r.name,
     credentialHandle: r.credentialHandle,
     config: JSON.parse(r.config || '{}'),
+    ...(r.limits ? { measuredLimits: JSON.parse(r.limits) } : {}),
     enabled: Boolean(r.enabled),
     status: r.status,
     lastCheckedAt: r.lastCheckedAt == null ? undefined : Number(r.lastCheckedAt),

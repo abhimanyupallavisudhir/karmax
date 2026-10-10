@@ -28,6 +28,16 @@ describe('Hetzner sizes, hours and cloud-init', () => {
     await expect(driver.shape({ diskGb: 20_000 }, connection(hetzner.token))).rejects.toThrow(/at most 10240 GB/);
   });
 
+  it('tells the limits record the largest machine its location offers, and a 10 TB volume', async () => {
+    const { computerLimits } = await import('../src/domain/computer-limits.js');
+    const measured = await new HetznerDriver(hetzner.fetch, 1).limits(connection(hetzner.token));
+    expect(measured).toMatchObject({ cpu: 4, memoryMb: 8192, diskGb: 10_240 });
+    expect(computerLimits('hetzner', measured)).toMatchObject({ cpu: 4, memoryMb: 8192, diskGb: 10_240,
+      source: { cpu: 'provider', memoryMb: 'provider', diskGb: 'provider' } });
+    // Fly's limits are fixed by Fly, not by the account.
+    expect(computerLimits('fly')).toMatchObject({ cpu: 16, memoryMb: 131_072, diskGb: 500, source: { diskGb: 'default' } });
+  });
+
   it('counts a server’s paid hour from its creation', () => {
     const created = Date.parse('2026-10-10T10:00:00Z');
     expect(paidMsLeft({ created: '2026-10-10T10:00:00Z' }, created + 10 * 60_000)).toBe(50 * 60_000);

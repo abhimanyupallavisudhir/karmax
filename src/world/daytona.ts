@@ -13,7 +13,8 @@ import { serviceHomeLabel } from './services.js';
 import type { ResolvedWorldProviderConnection } from './connections.js';
 import { provisionGitCredentials, provisionGitRepos, runOrThrow as provisionRun, type ProvisionTarget } from './provision-git.js';
 import { taskBranch } from '../domain/brand.js';
-import { DEFAULT_MACHINE } from '../domain/computer.js';
+import { DEFAULT_MACHINE, machineShape } from '../domain/computer.js';
+import { fitComputer, limitWarning } from '../domain/computer-limits.js';
 
 const DEFAULT_IDLE_MS = 10 * 60_000;
 /** Daytona's toolbox closes a PTY socket that receives an input frame over
@@ -132,6 +133,12 @@ export class DaytonaWorldProvider implements WorldProvider {
     spec.signal?.throwIfAborted();
     const connection = (await this.connection(spec.organizationId));
     const factory = this.factoryFor(connection);
+    // A size above the account's limit (stored before its limits were known)
+    // would be refused outright: fit it, and say so.
+    const requested = machineShape({ resources: spec.resources });
+    const fitted = connection?.limits ? fitComputer(requested, connection.limits) : undefined;
+    const limitWarnings = fitted?.reduced.length ? [limitWarning('daytona', fitted.reduced, fitted.shape, requested)] : [];
+    if (fitted?.reduced.length) spec = { ...spec, resources: { ...spec.resources, ...fitted.shape } };
     const environment = spec.environment ?? {};
     const flavor = environment.flavor ?? 'headless';
     const selectedSnapshot = environment.snapshot ?? (environment.image ? undefined : flavor === 'desktop'
@@ -183,7 +190,7 @@ export class DaytonaWorldProvider implements WorldProvider {
       if (adopted) { await sandbox.refreshData?.(); await startSandbox(sandbox); }
       // An image is created at the requested size; a snapshot boots at its own
       // and is resized to the Computer before anything is provisioned on it.
-      const resourceWarnings = selectedImage ? [] : await sizeSnapshotSandbox(sandbox, spec);
+      const resourceWarnings = [...limitWarnings, ...(selectedImage ? [] : await sizeSnapshotSandbox(sandbox, spec))];
       if (flavor === 'desktop') {
         if (!sandbox.computerUse) throw new Error('the selected Daytona environment does not support Computer Use');
         await sandbox.computerUse.start();

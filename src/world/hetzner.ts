@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import type { MachineShape } from '../domain/computer.js';
+import type { ComputerLimits } from '../domain/computer-limits.js';
 import type { ResolvedWorldProviderConnection } from './connections.js';
 import type { ProviderUsageEvent, WorldLifecycleState } from './types.js';
 import type { VmAllocation, VmBootKeys, VmDriver, VmListing, VmShape } from './vm/provider.js';
@@ -230,6 +231,16 @@ export class HetznerDriver implements VmDriver {
     for (const builder of await this.servers(connection, 'karmaxImageBuilder'))
       if (now - Date.parse(builder.created) > BUILDER_STALE_MS && !this.building.has(builder.labels.karmaxImageBuilder ?? ''))
         await this.deleteServer(connection, builder);
+  }
+
+  /** The largest machine the project can have at its location: the biggest
+   * current x86 server type offered there, and a volume of 10 TB. */
+  async limits(connection: ResolvedWorldProviderConnection): Promise<ComputerLimits> {
+    const location = connection.config.region ?? HETZNER_DEFAULT_LOCATION;
+    const types = (await this.pages<ServerType>(connection, '/server_types', 'server_types')).filter((type) => type.architecture === 'x86'
+      && !type.deprecation && !type.deprecated && type.prices.some((price) => price.location === location));
+    return { ...(types.length ? { cpu: Math.max(...types.map((type) => type.cores)),
+      memoryMb: Math.max(...types.map((type) => Math.round(type.memory * 1024))) } : {}), diskGb: HETZNER_MAX_DISK_GB, checkedAt: Date.now() };
   }
 
   async test(connection: ResolvedWorldProviderConnection): Promise<void> {

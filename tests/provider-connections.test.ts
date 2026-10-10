@@ -97,4 +97,57 @@ describe('organization cloud provider connections', () => {
     expect((await service.list(organization.id))).toEqual([]);
     (await store.close()); fs.rmSync(dir, { recursive: true, force: true });
   });
+
+  // compute-disk item 1: a connection's real limits are known before a machine is made.
+  it('learns each connection\'s limits, exposes them, and lets Advanced set what the API cannot tell', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-provider-limits-'));
+    const store = (await Store.create(':memory:'));
+    const probed: string[] = [];
+    const measured: Record<string, any> = {
+      e2b: { cpu: 8, memoryMb: 8192, diskGb: 29, checkedAt: 11 },
+      daytona: { cpu: 4, memoryMb: 8192, diskGb: 10, pool: { cpu: 10, memoryMb: 10_240, diskGb: 30 }, checkedAt: 12 },
+    };
+    const service = new WorldProviderConnectionService(store, new CredentialBroker(new Vault(dir)), {
+      check: async () => undefined,
+      limits: async (provider) => { probed.push(provider); return measured[provider]; },
+    });
+    const organization = (await store.createOrganization({ name: 'Acme', ownerUserId: 'owner' }));
+    try {
+      const saved = await service.save({ organizationId: organization.id, provider: 'e2b', apiKey: 'key-one' });
+      // Until the account is asked, the form offers only what every E2B account has.
+      expect(saved.limits).toMatchObject({ diskGb: 22, source: { diskGb: 'default' } });
+      const tested = await service.test(organization.id, 'e2b');
+      expect(tested.limits).toEqual({ cpu: 8, memoryMb: 8192, diskGb: 29, checkedAt: 11,
+        source: { cpu: 'provider', memoryMb: 'provider', diskGb: 'provider' } });
+      expect(JSON.stringify(await service.list(organization.id))).not.toContain('key-one');
+      expect((await service.list(organization.id))[0]!.limits.diskGb).toBe(29);
+      await expect(service.assertFits(organization.id, 'e2b', { diskGb: 30 })).rejects.toThrow('Disk can be at most 29 GB on this E2B account');
+      await expect(service.assertFits(organization.id, 'e2b', { diskGb: 29, cpu: 8 })).resolves.toBeUndefined();
+      await expect(service.assertFits(organization.id, 'worktree', { diskGb: 900 })).resolves.toBeUndefined();
+
+      // A refusal while building teaches the same thing, through the resolved connection.
+      const resolved = await service.resolve(organization.id, 'e2b');
+      expect(resolved.limits?.diskGb).toBe(29);
+      await resolved.recordLimits!({ diskGb: 27 });
+      expect((await service.limits(organization.id, 'e2b')).diskGb).toBe(27);
+
+      // Another key may be another account: what was learned about the old one goes.
+      await service.save({ organizationId: organization.id, provider: 'e2b', apiKey: 'key-two' });
+      expect((await service.get(organization.id, 'e2b'))!.limits).toMatchObject({ diskGb: 22, source: { diskGb: 'default' } });
+
+      // Daytona: the per-sandbox maximum can be entered in Advanced (support raises
+      // it); the organization's tier pool still bounds one machine.
+      await service.save({ organizationId: organization.id, provider: 'daytona', apiKey: 'dtn', config: { limits: { diskGb: 50, cpu: 'x' } as any } });
+      expect((await service.get(organization.id, 'daytona'))!.config.limits).toEqual({ diskGb: 50 });
+      probed.length = 0;
+      // A connection never asked is asked when it is listed.
+      const listed = await service.list(organization.id);
+      expect(probed.sort()).toEqual(['daytona', 'e2b']);
+      expect(listed.find((connection) => connection.provider === 'daytona')!.limits).toMatchObject({
+        cpu: 4, memoryMb: 8192, diskGb: 30, pool: { diskGb: 30 }, source: { diskGb: 'provider' } });
+      probed.length = 0;
+      await service.list(organization.id);
+      expect(probed).toEqual([]);
+    } finally { await store.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+  });
 });
