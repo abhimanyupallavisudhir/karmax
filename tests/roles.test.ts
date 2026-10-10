@@ -286,6 +286,14 @@ describe('prompt preamble (SPEC §5.4)', () => {
     expect(manifest('software-dev')!.promptPreamble).toBeUndefined();
   });
 
+  // indike.org#2: told its final response "notifies nobody", an agent asked a
+  // question mid-pause answered only in its reasoning, then posted a status line.
+  it('says the final response is posted in the conversation, so answers go there even before a pause', () => {
+    const out = assemblePrompt({ profile: profile(), role: 'do', task: { ...task, workflow: 'software-dev' } as any, world });
+    expect(out).not.toContain('Your final response notifies nobody');
+    expect(out).toContain('Your final response is posted in the conversation: answer there whatever you were just asked, even when you then pause.');
+  });
+
   it('repeats the optional, verification-only review guidance in global instructions', () => {
     expect(GLOBAL_INSTRUCTIONS).toMatch(/Review info is optional/i);
     expect(GLOBAL_INSTRUCTIONS).toContain('at most 280 characters');
