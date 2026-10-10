@@ -2465,3 +2465,13 @@ Steady window of each step (after its new tenants were set up). Latencies are as
 ```
 </details>
 
+## Compared with integrated (`1460e39c6d`)
+
+| step | tenants (people) | open tasks | running wf | req/s | API ms p50/p95/p99 | errors % | event lag ms p50/p95/p99 | turn overhead s p50/p95 | gateway heap / RSS MB | worker heap / RSS MB | worker loop p99 ms | app mem MB | host CPU % mean/max | PG conns | advisory waiters max | advisory wait max ms | Temporal backlog age ms | schedule-to-start p95 ms wf / act |
+|---:|---:|---:|---:|---:|---|---:|---|---|---|---|---:|---:|---|---:|---:|---:|---:|---|
+| 1 | 4 (6) | 10 | 12 | 1.1 | 18 / 67 / 543 | 0 | 8 / 19 / 28 | 1.6 / 2.1 | 142 / 440 | 102 / 402 | 16.5 | 756 | 10 / 61 | 38 | 0 | 0 | 0 | 47.5 / 47.5 |
+| 2 | 8 (12) | 25 | 24 | 1.9 | 16 / 67 / 564 | 0 | 7 / 22 / 28 | 1.7 / 2.0 | 140 / 444 | 103 / 418 | 15.3 | 810 | 13 / 49 | 41 | 0 | 0 | 0 | 47.5 / 47.5 |
+| 3 | 16 (24) | 52 | 54 | 4.2 | 17 / 68 / 466 | 0 | 7 / 33 / 53 | 1.8 / 2.4 | 150 / 455 | 109 / 477 | 19 | 867 | 22 / 61 | 46 | 0 | 0 | 0 | 47.6 / 47.5 |
+| 4 | 32 (48) | 115 | 115 | 7.2 | 18 / 104 / 585 | 0 | 10 / 72 / 115 | 2.3 / 3.2 | 184 / 499 | 129 / 551 | 32.1 | 1014 | 40 / 68 | 40 | 0 | 0 | 0 | 47.7 / 47.5 |
+| 5 | 64 (96) | 231 | 235 | 13.6 | 1042 / 3623 / 5329 | 0 | 1396 / 21639 / 28167 | 13.4 / 38.9 | 226 / 565 | 180 / 685 | 41.9 | 1265 | 88 / 93 | 63 | 0 | 0 | 0 | 48.2 / 48.3 |
+
