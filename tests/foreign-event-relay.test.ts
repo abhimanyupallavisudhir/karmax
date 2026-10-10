@@ -79,7 +79,7 @@ it('coalesces wake-ups and drains the accepted page before stopping', async () =
   const read = vi.fn().mockResolvedValue({ cursor: 2, scanned: 2, seqs: [1, 2], events: [1, 2].map(seq => ({
     seq, taskId: 'fixture', type: 'fixture', ts: 1, payload: {},
   })) });
-  const relay = await ForeignEventRelay.create({ nextForeignEventPage: read, foreignEventsAt: vi.fn(), latestEventSeq: async () => 0 }, bus,
+  const relay = await ForeignEventRelay.create({ nextForeignEventPage: read, latestEventSeq: async () => 0 }, bus,
     { intervalMs: 60_000 });
   cleanup.push(() => relay.stop());
   const first = relay.wake();
@@ -101,7 +101,7 @@ it('retries a failed database read without advancing the cursor', async () => {
   const failed = vi.fn();
   const read = vi.fn().mockRejectedValueOnce(new Error('database unavailable'))
     .mockResolvedValueOnce({ cursor: 4, scanned: 0, seqs: [], events: [] });
-  const relay = await ForeignEventRelay.create({ nextForeignEventPage: read, foreignEventsAt: vi.fn(), latestEventSeq: async () => 4 },
+  const relay = await ForeignEventRelay.create({ nextForeignEventPage: read, latestEventSeq: async () => 4 },
     new KarmaxBus(), { intervalMs: 60_000, onError: failed });
   cleanup.push(() => relay.stop());
   await relay.wake();
@@ -119,7 +119,6 @@ it('drains again at once for a wake-up that arrives during a drain', async () =>
       if (store.nextForeignEventPage.mock.calls.length === 1) await gate;
       return { cursor, scanned: 0, seqs: [], events: [] };
     }),
-    foreignEventsAt: vi.fn(),
   };
   const relay = await ForeignEventRelay.create(store as any, new KarmaxBus(), { intervalMs: 60_000 });
   cleanup.push(() => relay.stop());
@@ -165,34 +164,12 @@ const postgresUrl = process.env.KARMAX_TEST_POSTGRES_URL;
   await insert(slow, 'late');           // lower seq, still uncommitted
   await insert(fast, 'early');          // higher seq, committed at once
   await relay.wake();
-  expect(seen).toEqual(['early']);
+  // The watermark holds the higher seq back until the lower one is final.
+  expect(seen).toEqual([]);
   await slow.query('COMMIT');
   await relay.wake();
-  expect(seen).toEqual(['early', 'late']);
+  expect(seen).toEqual(['late', 'early']);
   await relay.wake();
-  expect(seen).toEqual(['early', 'late']);
+  expect(seen).toEqual(['late', 'early']);
 });
 
-it('stops looking for a skipped seq that never commits', async () => {
-  vi.useFakeTimers({ toFake: ['Date'] });
-  cleanup.push(() => vi.useRealTimers());
-  const missing = vi.fn(async () => ({ seqs: [], events: [] }));
-  const store = {
-    latestEventSeq: async () => 0,
-    // seq 1 rolled back (or was deleted); 2 committed.
-    nextForeignEventPage: vi.fn(async (cursor: number) => cursor < 2
-      ? { cursor: 2, scanned: 1, seqs: [2], events: [{ seq: 2, taskId: 't', type: 'fixture', ts: 1, payload: {} }] }
-      : { cursor, scanned: 0, seqs: [], events: [] }),
-    foreignEventsAt: missing,
-  };
-  const relay = await ForeignEventRelay.create(store, new KarmaxBus(), { intervalMs: 60_000 });
-  cleanup.push(() => relay.stop());
-  await relay.wake();
-  await relay.wake();
-  expect(missing).toHaveBeenLastCalledWith([1]);
-  vi.setSystemTime(Date.now() + 10 * 60_000);
-  missing.mockClear();
-  await relay.wake();
-  await relay.wake();
-  expect(missing).not.toHaveBeenCalled();
-});

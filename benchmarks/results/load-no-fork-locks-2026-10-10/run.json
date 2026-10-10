@@ -1,0 +1,3 @@
+{"runId": "loadtest-20261010T093424Z-ee74", "ref": "237f4bf2", "sha": "237f4bf2f3bf35616054796cc6898c17bc4c6163", "label": "no-fork-locks", "region": "eu-central-1",
+ "sutType": "c7i.xlarge", "worldType": "c7i.2xlarge", "worldRttMs": 50, "holdSeconds": 300,
+ "maxMinutes": 180, "steps": "default", "driverArgs": "", "startedAt": "2026-10-10T09:34:24Z"}

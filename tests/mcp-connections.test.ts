@@ -28,14 +28,14 @@ describe('MCP connections', () => {
   it('keeps credentials out of metadata, merges rotations, and revokes them on endpoint change', async () => {
     const c = (await service.save(definition, project));
     expect(JSON.stringify((await service.list(project)))).not.toContain('Bearer private');
-    expect(service.secret(c)).toEqual({ Authorization: 'Bearer private' });
+    expect((await service.secret(c))).toEqual({ Authorization: 'Bearer private' });
     const rotated = (await service.save({ ...c, secrets: { 'X-API-Key': 'second' }, mergeSecrets: true }, project));
-    expect(service.secret(rotated)).toEqual({ Authorization: 'Bearer private', 'X-API-Key': 'second' });
+    expect((await service.secret(rotated))).toEqual({ Authorization: 'Bearer private', 'X-API-Key': 'second' });
     const changed = (await service.save({ ...rotated, transport: { type: 'http', url: 'https://other.example/mcp' } }, project));
-    expect(service.secret(changed)).toEqual({});
+    expect((await service.secret(changed))).toEqual({});
     await expect((async () => (await service.setSecret(c, { token: 'stale' })))()).rejects.toThrow(/changed/);
     (await service.remove(c.id, project));
-    expect(broker.listHandles()).toEqual([]);
+    expect(await broker.listHandles()).toEqual([]);
   });
   it('preserves simultaneous connection saves from separate service instances', async () => {
     const peer = new McpConnections(store, broker, 'org_personal');

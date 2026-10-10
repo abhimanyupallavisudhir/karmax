@@ -24,6 +24,9 @@ import { RunnerPoolService } from '../world/runners.js';
 import { WorldAccessService } from '../world/access.js';
 import { ObjectSnapshotEngine, ProjectResourceService } from '../world/resources.js';
 import { ConfigHomeManager } from '../autonomy/config-homes.js';
+import { ModelLogins, useModelLogins } from '../autonomy/model-logins.js';
+import { Vault } from '../autonomy/vault.js';
+import { recordDataEpoch } from '../config/data-epoch.js';
 import { TASK_QUEUE } from '../temporal/config.js';
 import { taskEnded } from '../world/task-ended.js';
 
@@ -116,7 +119,21 @@ export async function createExecutionServices(input: {
   // own issuer. Registered before Stripe Issuing, which needs a business account.
   paymentRegistry.register(new VaultCardProvider(store, broker));
   paymentRegistry.register(new StripeIssuingProvider(store, fetch, process.env, broker));
-  const configHomes = new ConfigHomeManager(p.configHomes);
+  // Model logins live in the vault and config homes cache them (data epoch 6):
+  // the primary moves them there on its first boot; another process only attaches.
+  const logins = new ModelLogins(p.configHomes, broker, store.db);
+  if (bootstrap) {
+    await logins.moveIntoVault(store.db, {
+      audit: (action, detail) => store.appendAudit({ principalId: 'system:vault', action, detail }),
+      log: (line) => console.log(`  • ${line}`),
+    });
+    Vault.sealForEpoch6(p.vault, store.db.dialect === 'postgres');
+    await recordDataEpoch(store.db);
+  } else if (!await ModelLogins.moved(store.db)) {
+    throw new Error('model logins have not moved into the vault yet: the primary process moves them on its first boot of data epoch 6');
+  }
+  useModelLogins(logins);
+  const configHomes = new ConfigHomeManager(p.configHomes, logins);
   return { worlds, adapters, profiles, tokens, providerConnections, objectStore, storageLocations,
     resources, checkpoints, runners, worldAccess, payments, paymentRegistry, configHomes };
 }

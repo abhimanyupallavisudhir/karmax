@@ -164,7 +164,7 @@ describe('post-push deployment to the public instance', () => {
 
   it('builds first and snapshots with the validated candidate instead of the old live image', () => {
     const update = operator.split('cmd_update() {')[1]?.split('\n}')[0] ?? '';
-    expect(update.indexOf('dc build --pull app')).toBeLessThan(update.indexOf('cmd_backup_candidate'));
+    expect(update.indexOf('build_images --pull')).toBeLessThan(update.indexOf('cmd_backup_candidate'));
     expect(operator).toContain('dc run --rm --no-deps app npm run backup');
   });
 });

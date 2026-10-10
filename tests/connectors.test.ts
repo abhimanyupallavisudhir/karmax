@@ -73,10 +73,10 @@ describe('Bitwarden connector', () => {
     connectors.register(new BitwardenConnector(() => connectors.secretFor('bitwarden'), exec));
 
     await expect(connectors.connect('bitwarden', '')).rejects.toThrow(/session key/i);
-    expect(connectors.secretFor('bitwarden')).toBeUndefined();
+    expect(await connectors.secretFor('bitwarden')).toBeUndefined();
 
     await expect(connectors.connect('bitwarden', 'sess')).resolves.toMatchObject({ connector: { available: true }, newStore: true });
-    expect(connectors.secretFor('bitwarden')).toBe('sess');
+    expect(await connectors.secretFor('bitwarden')).toBe('sess');
   });
 
   it('does not replace a working connection when validation fails', async () => {
@@ -90,7 +90,7 @@ describe('Bitwarden connector', () => {
 
     await connectors.connect('bitwarden', 'working');
     await expect(connectors.connect('bitwarden', 'wrong')).rejects.toThrow(/invalid|expired/i);
-    expect(connectors.secretFor('bitwarden')).toBe('working');
+    expect(await connectors.secretFor('bitwarden')).toBe('working');
   });
 
   it('does not connect when the bw CLI is unavailable', async () => {
@@ -100,7 +100,7 @@ describe('Bitwarden connector', () => {
       throw new Error('ENOENT');
     }));
     await expect(connectors.connect('bitwarden', 'sess')).rejects.toThrow(/bw.*CLI/i);
-    expect(connectors.secretFor('bitwarden')).toBeUndefined();
+    expect(await connectors.secretFor('bitwarden')).toBeUndefined();
   });
 });
 
@@ -200,7 +200,7 @@ describe('1Password connector', () => {
     const connectors = new Connectors(store, items, broker);
     connectors.register(new OnePasswordConnector(() => connectors.secretFor('1password'), exec));
     await expect(connectors.connect('1password', '   ')).rejects.toThrow(/service-account token/i);
-    expect(connectors.secretFor('1password')).toBeUndefined();
+    expect(await connectors.secretFor('1password')).toBeUndefined();
   });
 
   it('does not connect when the op CLI is unavailable', async () => {
@@ -210,7 +210,7 @@ describe('1Password connector', () => {
       throw new Error('ENOENT');
     }));
     await expect(connectors.connect('1password', 'ops_token')).rejects.toThrow(/op.*CLI/i);
-    expect(connectors.secretFor('1password')).toBeUndefined();
+    expect(await connectors.secretFor('1password')).toBeUndefined();
   });
 });
 
@@ -1066,7 +1066,7 @@ describe('pass notes preservation and migration', () => {
     });
     await connectors.sync('pass-git', ['vps']);
     expect((await items.list())).toHaveLength(1);
-    expect(items.readSecret((await items.get(item.id))!, 'note')).toBe(note);
+    expect(await items.readSecret((await items.get(item.id))!, 'note')).toBe(note);
     expect((await items.get(item.id))!.policy.reveal).toBe('never');
     expect((await items.get(item.id))!.provenance.source).toBe(item.provenance.source);
     await connectors.sync('pass-git', ['vps']);
@@ -1074,7 +1074,7 @@ describe('pass notes preservation and migration', () => {
     note = '';
     changedAt = Date.now() + 10000;
     await connectors.sync('pass-git', ['vps']);
-    expect(items.readSecret((await items.get(item.id))!, 'note')).toBe('');
+    expect(await items.readSecret((await items.get(item.id))!, 'note')).toBe('');
   });
 });
 
@@ -1093,7 +1093,7 @@ describe('pass TOTP import migration', () => {
     expect((await connectors.sync('pass-git', ['otp'])).count).toBe(1);
     const updated = (await items.get(old.id))!;
     expect(updated.fields).toEqual(['totp', 'note']);
-    expect(items.readSecret(updated, 'password')).toBeUndefined();
+    expect(await items.readSecret(updated, 'password')).toBeUndefined();
     expect((await items.totp(updated, {}))).toMatch(/^\d{6}$/);
     expect((await connectors.sync('pass-git', ['otp'])).skipped).toBe(1);
   });
@@ -1113,7 +1113,7 @@ describe('Git password-store reconfiguration', () => {
     let online = false;
     connector.push = async (item) => {
       if (!online) throw new Error('offline');
-      pushedTo.push(JSON.parse(connectors.secretFor('pass-git')!).mounts[0].repositoryUrl);
+      pushedTo.push(JSON.parse((await connectors.secretFor('pass-git'))!).mounts[0].repositoryUrl);
       return { externalId: item.externalId };
     };
     connectors.register(connector);
@@ -1155,7 +1155,7 @@ describe('Git password-store reconfiguration', () => {
     expect(await connectors.retryWrites()).toEqual([{ connector: 'pass-git', itemId: created.id }]);
     expect(s.pushedTo).toEqual(['https://github.com/example/other.git']);
     expect(await connectors.pendingWrites()).toEqual([]);
-    expect(broker.hasHandle(queued!.snapshotHandle!)).toBe(false);
+    expect(await broker.hasHandle(queued!.snapshotHandle!)).toBe(false);
     expect((await items.get(created.id))!.provenance.externalIds).toEqual({ 'pass-git': queued!.externalId });
   });
 
@@ -1195,10 +1195,10 @@ it('keeps the active connector secret unchanged while a replacement is being val
   const replacement = service.connect('candidate', 'unverified');
   const rejected = expect(replacement).rejects.toThrow('invalid candidate');
   await started;
-  expect(service.secretFor('candidate')).toBe('working');
+  expect(await service.secretFor('candidate')).toBe('working');
   rejectCandidate(new Error('invalid candidate'));
   await rejected;
-  expect(service.secretFor('candidate')).toBe('working');
+  expect(await service.secretFor('candidate')).toBe('working');
 });
 
 
@@ -1312,7 +1312,7 @@ describe('durable connector outbox', () => {
     expect((await service.propagate(id, ['password']))?.error).toBeTruthy();
     expect(JSON.stringify((await service.pendingWrites()))).not.toContain('new-secret');
     expect((await service.sync('source', ['id'])).count).toBe(0);
-    expect(items.readSecret((await items.get(id))!, 'password')).toBe('new-secret');
+    expect(await items.readSecret((await items.get(id))!, 'password')).toBe('new-secret');
     (await service.setConfig('source', { writeBack: false }));
     fail = false;
     await service.retryWrites();
@@ -1458,7 +1458,7 @@ it('does not let an in-flight stale import undo a completed rotation', async () 
   expect((await service.pendingWrites())).toEqual([]);
   release();
   expect((await syncing).skipped).toBe(1);
-  expect(items.readSecret((await items.get(id))!, 'password')).toBe('new');
+  expect(await items.readSecret((await items.get(id))!, 'password')).toBe('new');
 });
 
 it('does not resurrect a dismissed write when an in-flight attempt fails', async () => {
@@ -1488,8 +1488,8 @@ it('does not resurrect a dismissed write when an in-flight attempt fails', async
   release();
   await attempt;
   expect((await service.pendingWrites())).toEqual([]);
-  expect(broker.hasHandle(handle)).toBe(false);
-  expect(items.readSecret((await items.get(item.id))!, 'note')).toBe('secret');
+  expect(await broker.hasHandle(handle)).toBe(false);
+  expect(await items.readSecret((await items.get(item.id))!, 'note')).toBe('secret');
 });
 
 it('deletes pending export snapshots with the vault item even while retries are disabled', async () => {
@@ -1499,14 +1499,14 @@ it('deletes pending export snapshots with the vault item even while retries are 
   const item=(await items.save({type:'note',label:'note',secrets:{note:'secret'}}));
   await service.writeBackCreated(item.id);
   const handle=(await service.pendingWrites())[0]!.snapshotHandle!;
-  expect(broker.hasHandle(handle)).toBe(true);
+  expect(await broker.hasHandle(handle)).toBe(true);
   const status=(await service.describe())[0]!.pendingWrites[0]!;
   expect(status).not.toHaveProperty('snapshotHandle');
   expect(status).not.toHaveProperty('target');
   (await service.setConfig('source',{writeBack:false}));
   (await items.delete(item.id));
   expect((await service.pendingWrites())).toEqual([]);
-  expect(broker.hasHandle(handle)).toBe(false);
+  expect(await broker.hasHandle(handle)).toBe(false);
 });
 
 it('queues Git rotations before remote revision lookup and respects dismissal during lookup', async () => {
@@ -1576,15 +1576,15 @@ describe.each(['LOGIN', 'SECURE_NOTE'])('1Password CLI %s notes', (category) => 
       const result = await service.sync('1password', ['entry']);
       expect(result).toMatchObject({ count: 1, itemIds: [item.id], failures: [] });
       const saved = (await items.get(item.id))!;
-      expect(items.readSecret(saved, 'note')).toBe(next);
+      expect(await items.readSecret(saved, 'note')).toBe(next);
       expect(saved.fields.includes('note')).toBe(next !== undefined);
-      if (type === 'login') expect(items.readSecret(saved, 'password')).toBe(password.password);
+      if (type === 'login') expect(await items.readSecret(saved, 'password')).toBe(password.password);
     }
     // Removing the source field entirely must also remove an existing mirror value.
     (await items.save({ id: item.id, type, secrets: { note: 'local old note' } }));
     present = false;
     expect((await service.sync('1password', ['entry'])).count).toBe(1);
     expect((await items.get(item.id))!.fields).not.toContain('note');
-    expect(items.readSecret((await items.get(item.id))!, 'note')).toBeUndefined();
+    expect(await items.readSecret((await items.get(item.id))!, 'note')).toBeUndefined();
   });
 });

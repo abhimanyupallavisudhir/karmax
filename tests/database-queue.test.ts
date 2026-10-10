@@ -84,3 +84,19 @@ it('stops admission and drains accepted work when closing', async () => {
   expect(closed).toBe(true);
   expect(queue.pending).toBe(0);
 });
+
+it('admits up to its concurrency at once and the rest in order as they finish', async () => {
+  const queue = new DatabaseQueue({ concurrency: 2 });
+  const gates = [gate(), gate(), gate()];
+  const started: number[] = [];
+  const runs = gates.map((g, i) => queue.enqueue(async () => { started.push(i); await g.promise; return i; }));
+  await vi.waitFor(() => expect(started).toEqual([0, 1]));
+  expect(queue.pending).toBe(3);
+  expect(queue.waiting).toBe(1);
+  gates[1]!.release();
+  await vi.waitFor(() => expect(started).toEqual([0, 1, 2]));
+  gates[0]!.release(); gates[2]!.release();
+  expect(await Promise.all(runs)).toEqual([0, 1, 2]);
+  await queue.close();
+  expect(queue.pending).toBe(0);
+});

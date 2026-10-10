@@ -1352,6 +1352,8 @@ export class KarmaxApi {
     // against an organization that changed while we were awaiting it.
     let { task, delegation } = await this.deps.store.transaction(async () => {
       await this.require(token, 'create_task', { projectId: args.projectId });
+      // A transfer waits for this task, or this check sees it moved.
+      await this.deps.store.lockProjectRow(project.id, 'key share');
       if ((await this.deps.store.getProject(project.id))?.organizationId !== project.organizationId)
         throw new ValidationError('Project moved while preparing this task. Reload and retry.');
       let task = (await this.deps.store.createTask({

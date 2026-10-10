@@ -39,4 +39,6 @@ VOLUME ["/var/lib/karmax"]
 HEALTHCHECK --interval=20s --timeout=5s --start-period=30s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:4505/api/health/ready').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
 ENTRYPOINT ["/usr/bin/dumb-init", "--"]
-CMD ["npm", "start"]
+# The gateway's heap comes from the container's memory budget (RT-35;
+# src/runtime/memory-budget.ts), which also sizes the worker child's heaps.
+CMD ["sh", "-c", "heap=$(node --import tsx src/runtime/memory-budget.ts gateway) || exit 1; exec node --max-old-space-size=\"$heap\" --import tsx src/main.ts"]

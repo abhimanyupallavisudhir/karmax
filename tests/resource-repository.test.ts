@@ -10,9 +10,9 @@ import { LocalObjectStore, type ObjectStore } from '../src/store/objects.js';
 import { StorageLocationService } from '../src/store/storage-locations.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
-import { REPOSITORY_ROUTE, RepositoryTokens, ResourceRepositoryServer, repositoryName, repositoryPassword,
-  type RepositoryAccess } from '../src/world/resource-repository.js';
-import { runHostRestic } from '../src/world/restic.js';
+import { GRANT_REQUESTS_PER_MINUTE, GrantLimits, REPOSITORY_ROUTE, RepositoryTokens, ResourceRepositoryServer, repositoryName,
+  repositoryPassword, type RepositoryAccess } from '../src/world/resource-repository.js';
+import { RESTIC_VERSION, runHostRestic, worldResticBinary } from '../src/world/restic.js';
 
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
@@ -46,7 +46,7 @@ async function presigning(objects: LocalObjectStore): Promise<ObjectStore & { ge
   return wrapped;
 }
 
-async function fixture(options: { presign?: boolean; quotaBytes?: number } = {}) {
+async function fixture(options: { presign?: boolean; quotaBytes?: number; grantRequestsPerMinute?: number } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-repository-'));
   cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
   const store = await Store.create(':memory:');
@@ -61,7 +61,8 @@ async function fixture(options: { presign?: boolean; quotaBytes?: number } = {})
     name: 'raw', driver: 'volume@1', target: { kind: 'path', path: 'raw' }, access: 'write', isolation: 'fork', source: {},
     credentialHandles: [], storageLocationId: managed.id, publish: 'review' });
   const tokens = new RepositoryTokens(broker);
-  const repositories = new ResourceRepositoryServer({ store, tokens, objects: async () => objects });
+  const repositories = new ResourceRepositoryServer({ store, tokens, objects: async () => objects,
+    ...(options.grantRequestsPerMinute ? { grantRequestsPerMinute: options.grantRequestsPerMinute } : {}) });
   const repository = repositoryName(attachment.id, managed.id);
   const server = http.createServer((req, res) => {
     const url = new URL(req.url!, 'http://x');
@@ -187,5 +188,78 @@ describe('resource repository server (restic REST protocol)', () => {
     expect(over.stdout + over.stderr).toMatch(/507/);
     // Work in progress (a parked task's private copy) is counted, never refused.
     expect((await f.restic('append', ['backup', '--host', 'tavya', '.'], f.source)).code).toBe(0);
+  });
+});
+
+/** `count` calls of `call`, `width` at a time; their statuses. */
+async function burst(count: number, width: number, call: () => Promise<Response>): Promise<number[]> {
+  const statuses: number[] = [];
+  for (let i = 0; i < count; i += width)
+    statuses.push(...await Promise.all(Array.from({ length: Math.min(width, count - i) }, async () => {
+      const response = await call(); await response.arrayBuffer(); return response.status;
+    })));
+  return statuses;
+}
+
+describe('resource repository request budgets', () => {
+  // Every remote world reaches the server through the Cloudflare edge, so all
+  // of them arrive from a few shared addresses: the budget follows the grant.
+  const as = (base: string, repository: string, token: string, headers: Record<string, string> = {}) => () =>
+    fetch(`${base}${repository}/locks/`, { headers: { authorization: `Basic ${Buffer.from(`tavya:${token}`).toString('base64')}`, ...headers } });
+
+  it('serves many worlds saving at once from one address, and refuses only the grant that floods', async () => {
+    // A budget of 100 stands in for 3,000 so the burst stays cheap; the next
+    // test holds the real budget against measured saves.
+    const budget = 100;
+    const f = await fixture({ grantRequestsPerMinute: budget });
+    const worlds = await Promise.all(Array.from({ length: 10 }, () => f.grant('append')));
+    const served = (await Promise.all(worlds.map((token) => burst(budget - 1, 25, as(f.base, f.repository, token))))).flat();
+    expect(served.filter((status) => status !== 200)).toEqual([]);
+
+    const flood = await f.grant('append');
+    expect(new Set(await burst(budget, 25, as(f.base, f.repository, flood)))).toEqual(new Set([200]));
+    const refused = await as(f.base, f.repository, flood)();
+    expect(refused.status).toBe(429);
+    expect(Number(refused.headers.get('retry-after'))).toBeGreaterThan(0);
+    expect(Number(refused.headers.get('retry-after'))).toBeLessThanOrEqual(60);
+    // Looking like the edge, or like another peer, earns the flood nothing.
+    for (const headers of [{ 'x-tavya-edge': 'intent' }, { 'x-forwarded-for': '172.71.146.192' }, { 'cf-connecting-ip': '198.51.100.7' }] as Record<string, string>[])
+      expect((await as(f.base, f.repository, flood, headers)()).status).toBe(429);
+    // Everyone else is untouched, from the same address at the same moment.
+    expect((await as(f.base, f.repository, worlds[0]!)()).status).toBe(200);
+    expect((await as(f.base, f.repository, await f.grant('read'))()).status).toBe(200);
+  });
+
+  it('gives every world room for the fastest measured save, and stops a flood', () => {
+    // The 1.27 GB probe made 228 edge subrequests in a minute, 152 of them to
+    // tavya; the fastest save measured (~85 MiB/s, 2 requests per 16 MiB pack)
+    // is ~650 requests a minute. Each world has a budget of its own.
+    const limits = new GrantLimits();
+    let refused = 0;
+    for (let world = 0; world < 50; world++)
+      for (let i = 0; i < 4 * 650; i++) if (limits.take(`world-${world}`, 1_000 + i)) refused++;
+    for (let i = 0; i < GRANT_REQUESTS_PER_MINUTE; i++) if (limits.take('flood', 1_000)) refused++;
+    expect(refused).toBe(0);
+    expect(limits.take('flood', 1_000)).toBeGreaterThan(0);
+  });
+
+  it('serves the restic binary only to a grant', async () => {
+    const f = await fixture();
+    const arch = process.arch === 'arm64' ? 'arm64' : 'amd64';
+    const url = `${f.base}restic/${RESTIC_VERSION}/linux-${arch}`;
+    expect((await fetch(url)).status).toBe(401);
+    const granted = await fetch(url, { headers: { authorization: `Basic ${Buffer.from(`tavya:${await f.grant('read')}`).toString('base64')}` } });
+    expect(granted.status).toBe(worldResticBinary(arch) ? 200 : 404);
+    await granted.arrayBuffer();
+  });
+
+  it("starts a grant's budget again each minute and forgets idle grants", () => {
+    const limits = new GrantLimits(3);
+    expect([0, 1, 2].map((i) => limits.take('a', 1_000 + i))).toEqual([0, 0, 0]);
+    expect(limits.take('a', 31_000)).toBe(30_000);
+    expect(limits.take('b', 31_000)).toBe(0);
+    expect(limits.take('a', 61_000)).toBe(0);
+    limits.take('c', 200_000);
+    expect(limits.size).toBe(1);
   });
 });
