@@ -10,6 +10,7 @@ import { WorkflowIdReusePolicy } from '@temporalio/common';
 import { Store, slugify, type CollaborationRequest } from '../store/db.js';
 import { TokenAuthority, type HumanDelegationArgs, type ScopedToken } from './tokens.js';
 import { TOOL_CAPABILITY, Capability, ORGANIZATION_WIKI_WRITE_DENIED, allows } from './capabilities.js';
+import { AppGrants, sessionCapabilities } from '../auth/app-grants.js';
 import { WORKFLOW_TYPE, SIG, pinnedType } from '../workflows/names.js';
 import { bundledStart, StartResolution } from './resolve-start.js';
 import { MANIFESTS, WorkflowManifest, eventCatalog } from '../contrib/manifests.js';
@@ -977,8 +978,34 @@ export class KarmaxApi {
       if (typeof sourceId !== 'string' || !sourceId) continue;
       const source = (await this.deps.store.getTask(sourceId));
       if (!source) throw new NotFoundError(`no task ${sourceId} to resume from`);
-      (await this.require(token, 'get_conversation', { projectId: source.projectId, taskId: sourceId }));
+      (await this.requireAsPerson(token, 'get_conversation', { projectId: source.projectId, taskId: sourceId }));
     }
+  }
+
+  /**
+   * `require` for an object in another project of the organization than the
+   * one a person's token is narrowed to: the browser and app-grant tokens are
+   * minted for the route's project, so forking a conversation from project A
+   * into a task in B would otherwise be refused as "token is scoped to project
+   * B". A person is judged by their own current grants there, as their session
+   * may use them. Agents and other bearers stay limited to their token, and so
+   * does any request that leaves the token's organization.
+   */
+  private async requireAsPerson(token: string, tool: string, scope: { projectId: string; taskId?: string }) {
+    const caller = (await this.deps.tokens.verify(token));
+    const person = caller?.kind === 'human' && caller.humanSubject?.presence === 'interactive' ? caller.humanSubject.userId : undefined;
+    const organizationId = (await this.deps.store.projectOrganizationAsync(scope.projectId));
+    if (!caller || !person || !this.deps.authorization || !caller.projectId || caller.projectId === scope.projectId
+      || !organizationId || organizationId !== caller.organizationId)
+      return this.require(token, tool, scope);
+    const grant = caller.identitySessionId ? (await new AppGrants(this.deps.store).get(caller.identitySessionId)) : undefined;
+    if (grant && grant.userId !== person) return this.require(token, tool, scope);
+    const capability = TOOL_CAPABILITY[tool] ?? tool;
+    if (!allows((await sessionCapabilities(this.deps.authorization, person, grant?.ceiling, { projectId: scope.projectId, organizationId })), capability)) {
+      const project = (await this.deps.store.getProject(scope.projectId));
+      throw new CapabilityError(`missing capability ${capability} in project ${project ? `${JSON.stringify(project.name)} (${project.id})` : scope.projectId}`);
+    }
+    return caller;
   }
 
   /** Carry file handles across task-agent forks. A provider session remembers the

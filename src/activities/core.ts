@@ -2211,8 +2211,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               || (await deps.tokens.check(token, 'task:conversation:read', { taskId: source.id })).ok);
           if (!readable) {
             (await record(args.taskId, 'session.fork-failed', { from: spec.resumeFrom, reason: 'source-not-authorized' }));
+            const sourceProject = source && sourceOrganization === organizationId ? (await store.getProject(source.projectId)) : undefined;
             throw ApplicationFailure.create({
-              message: `This agent cannot resume from task ${spec.resumeFrom.taskId}: it is not in this task's organization or its conversation is outside this task's authority.`,
+              message: sourceProject
+                ? `This agent cannot resume from task ${spec.resumeFrom.taskId}: its conversation is in project ${JSON.stringify(sourceProject.name)}, outside this task's authorization. Add that project to the task's Authorization, then retry.`
+                : `This agent cannot resume from task ${spec.resumeFrom.taskId}: it is not in this task's organization or its conversation is outside this task's authority.`,
               type: 'agent-error',
               nonRetryable: true,
             });
