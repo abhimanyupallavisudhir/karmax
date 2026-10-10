@@ -77,8 +77,9 @@ EOF
 grep -q '^Include /etc/ssh/sshd_config.d' /etc/ssh/sshd_config 2> /dev/null || sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' /etc/ssh/sshd_config
 touch "$K/booted"
 ${options.foreground
-    // The machine's main process: sshd, restarted should anything stop it.
-    ? 'while :; do /usr/sbin/sshd -D -e; sleep 1; done'
+    // The machine's main process: sshd, restarted should anything stop it,
+    // and stopped at once when the machine is (Fly kills it 15 s after a stop).
+    ? "trap 'kill $sshd 2> /dev/null; exit 0' TERM INT\nwhile :; do /usr/sbin/sshd -D -e & sshd=$!; wait $sshd; sleep 1; done"
     : '(systemctl restart ssh || systemctl restart sshd || /usr/sbin/sshd) > /dev/null 2>&1'}
 `;
 }
