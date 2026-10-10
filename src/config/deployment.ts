@@ -121,6 +121,13 @@ export function validateDeployment(env: NodeJS.ProcessEnv = process.env): Deploy
   if (!previewUrl || previewUrl.protocol !== 'https:') failures.push('KARMAX_PREVIEW_ORIGIN must be an https URL');
   if (publicUrl && previewUrl && publicUrl.origin === previewUrl.origin)
     failures.push('KARMAX_PREVIEW_ORIGIN must use a different origin from KARMAX_PUBLIC_URL');
+  if (env.KARMAX_LEGACY_PREVIEW_ORIGIN?.trim()) {
+    let legacyUrl: URL | undefined;
+    try { legacyUrl = new URL(env.KARMAX_LEGACY_PREVIEW_ORIGIN); } catch {}
+    if (!legacyUrl || legacyUrl.protocol !== 'https:') failures.push('KARMAX_LEGACY_PREVIEW_ORIGIN must be an https URL');
+    else if (publicUrl && publicUrl.origin === legacyUrl.origin)
+      failures.push('KARMAX_LEGACY_PREVIEW_ORIGIN must use a different origin from KARMAX_PUBLIC_URL');
+  }
   if (!env.KARMAX_AUTH_SECRET || env.KARMAX_AUTH_SECRET.length < 32) failures.push('KARMAX_AUTH_SECRET must contain at least 32 characters');
   if (!env.KARMAX_VAULT_KEY || env.KARMAX_VAULT_KEY.length < 32) failures.push('KARMAX_VAULT_KEY must contain at least 32 characters');
   if (!env.KARMAX_WORLD_REF_KEY || env.KARMAX_WORLD_REF_KEY.length < 32) failures.push('KARMAX_WORLD_REF_KEY must contain at least 32 characters');

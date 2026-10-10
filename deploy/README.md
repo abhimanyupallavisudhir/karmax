@@ -87,6 +87,50 @@ manage. You can choose another preview base as the second argument:
 ./deploy/karmax up karmax.example.com previews.example.net
 ```
 
+Previews run other people's apps, so a separately registered domain is safer
+than a subdomain of yours: tenants' pages then share no cookies with the
+console and cannot get your domain blocklisted. A busy installation should also
+use **one wildcard certificate** instead of one per preview (Let's Encrypt
+issues 50 a week per registered domain). With the preview domain's DNS on
+Cloudflare:
+
+```bash
+KARMAX_PREVIEW_TLS=cloudflare        # in .turnkey.env; default on-demand
+```
+
+and a Cloudflare API token with **Zone DNS Edit and Zone Read on that zone
+only** in `deploy/.secrets/cloudflare_dns_api_token` (empty until then; only
+Caddy mounts it). Caddy proves the domain by DNS-01 and renews the certificate
+itself. `up`, `update` and `doctor` refuse a wildcard without the token. Point
+`*.<preview domain>` at the VPS; the bare preview domain serves nothing.
+
+Moving previews to another domain (`up` with a new second argument, or
+`KARMAX_PENDING_PREVIEW_DOMAIN` below) records the old one as
+`KARMAX_LEGACY_PREVIEW_DOMAIN`: leases issued under it keep their hostnames,
+served on demand as before, until they expire (at most a day, plus a day in
+which a stopped preview still explains itself). Delete that line once they have.
+
+### Agent email
+
+Agents receive sign-up codes and links at a per-organization address. With no
+mail server: point a mail subdomain's MX at Cloudflare Email Routing, send its
+catch-all rule to the Email Worker this deploys, and the Worker posts each
+message, signed, to the app:
+
+```bash
+CLOUDFLARE_API_TOKEN=… ./deploy/karmax deploy-agent-mail-edge mail.example.net
+```
+
+It needs a token with Workers Scripts: Edit, records `KARMAX_AGENT_MAIL_DOMAIN`
+and restarts the app. Organizations without their own mail provider then get
+`agent-<token>@mail.example.net` (placeholder `@agent.local` addresses move
+over, keeping their token); an organization that connected its own AgentMail
+inbox keeps it. The Worker stores nothing, rejects mail for any other domain
+and anything over 4 MiB, and signs with a key derived from `auth_secret`, so
+rotating that secret means running this again. Enabling Email Routing for the
+subdomain (MX and SPF records) and the catch-all rule (action: Worker
+`tavya-agent-mail`) is done on the zone, in Cloudflare.
+
 Running `up` with a different application domain records the previous domain as
 `KARMAX_LEGACY_DOMAIN`. Caddy keeps the old apex and `www` host on HTTPS and
 permanently redirects them to the new canonical origin. Keep both domains'
@@ -97,7 +141,7 @@ Users must sign in again because browser cookies do not cross domains. The old
 continue while the GitHub App's webhook URL is being updated.
 
 To activate a domain change with the next reviewed, CI-validated release, set
-`KARMAX_PENDING_DOMAIN` and `KARMAX_PENDING_PREVIEW_DOMAIN` in `.turnkey.env`.
+`KARMAX_PENDING_DOMAIN` and/or `KARMAX_PENDING_PREVIEW_DOMAIN` in `.turnkey.env`.
 `update` consumes them and records the old domain; existing running containers
 are unchanged until the release starts. Failed deployments restore the old
 environment. An interrupted update retains `.turnkey.env.migration.*` for

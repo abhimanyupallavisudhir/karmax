@@ -8,8 +8,8 @@
 import { HOSTED_PLANS } from '../domain/entitlements.js';
 import { DEFAULT_SITE_NAME } from '../domain/brand.js';
 
-export const POLICY_VERSION = '2026-10-05.1';
-export const POLICY_EFFECTIVE_DATE = 'October 5, 2026';
+export const POLICY_VERSION = '2026-10-10.1';
+export const POLICY_EFFECTIVE_DATE = 'October 10, 2026';
 export const POLICY_DRAFT_NOTICE = 'Launch draft pending final operator approval — not legal advice or a statement of completed legal review.';
 
 export type PolicySlug = 'terms' | 'acceptable-use' | 'privacy' | 'billing' | 'subprocessors' | 'security' | 'data' | 'dpa';
@@ -135,7 +135,7 @@ const docs: Record<PolicySlug, Omit<PolicyDocument, 'version' | 'effectiveDate'>
         'OpenAI and Anthropic — prompts, selected repository/workspace context, attachments, and outputs when their model or connected subscription is selected. BYOK uses the customer’s provider account; managed usage uses the operator’s account.',
         'E2B or Daytona — isolated compute, repository checkout, workspace files, environment variables made available to the world, command traffic, and resulting artifacts when that cloud world provider is selected.',
         'one.com — VPS hosting and server backups where used by the operator. This can include application databases and encrypted vault material, plus, until it is removed in November 2026, the copy of stored objects made before they moved to Cloudflare R2. A core-hosting location is not a location guarantee for model calls, sandboxes or integrations.',
-        'Cloudflare (R2) — managed object storage in R2’s EU jurisdiction, which keeps stored objects in EU data centres: world checkpoints and project resource data (encrypted by tavya before upload), review attachments and conversation exports. Deleted objects are kept up to 30 days so backups stay restorable. Data an organization places in a storage bucket it connects itself goes to that bucket instead.',
+        'Cloudflare (R2, Email Routing) — managed object storage in R2’s EU jurisdiction, which keeps stored objects in EU data centres: world checkpoints and project resource data (encrypted by tavya before upload), review attachments and conversation exports; and, in a separate bucket, encrypted backups of tavya’s databases (encrypted before upload; kept 31 days); and, for agent mailboxes, inbound email routing that delivers messages to tavya without storing them. Deleted objects are kept up to 30 days so backups stay restorable. Data an organization places in a storage bucket it connects itself goes to that bucket instead.',
         'Cloudflare (Workers) — carries resource saves and reads between task sandboxes and the organization’s storage (managed R2, or a bucket it connects), so they need not pass through tavya’s servers. The data is encrypted before it leaves the sandbox, passes through the Cloudflare location nearest the sandbox (which may be outside the EU), and is not stored there.',
         'Resend — transactional account, verification, security and support-notification email where configured; receives recipient addresses and message contents, not unrestricted repository access.',
         'Composio — managed connection brokerage where configured; may handle connection credentials and tool requests/results. A broker engaged by the operator is distinct from the customer-selected destination service.',

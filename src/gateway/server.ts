@@ -88,8 +88,9 @@ import { localTaskBrowserUrl, WORLD_CDP_URL } from '../autonomy/task-browser.js'
 import { newId } from '../util/id.js';
 import { DurableEventFanout, type FanoutAudience } from './fanout.js';
 import { affects, authorityChanged, authoritySeq, changedSince, onAuthorityChange, type AuthorityChange, type AuthoritySubject } from '../store/authorization-epoch.js';
+import { AGENT_MAIL_MAX_BYTES, MAIL_FROM_HEADER, MAIL_SIGNATURE_HEADER, MAIL_TO_HEADER, verifyMail } from '../edge/agent-mail-signature.js';
 import { configuredPreviewOrigin, hashPreviewToken, newPreviewToken, previewCookieHeader,
-  previewCookieValue, previewLeaseOrigin, previewLeaseUrl, previewTokenMatches } from './previews.js';
+  previewCookieValue, previewLeaseOrigin, previewLeaseUrl, previewOrigins, previewTokenMatches } from './previews.js';
 import type { RemoteAccessController } from '../remote/access.js';
 import { GITHUB_APP_PUBLIC_URL_KEY, type GithubProjectWebhookEvent,
   type GithubVaultPushEvent } from '../integrations/github-app.js';
@@ -1036,8 +1037,16 @@ export class Gateway {
   private connectionTimer?: ReturnType<typeof setInterval>;
   private connectionSweep?: Promise<void>;
   private connections(): ServiceConnections | undefined {
-    if (!this.deps.serviceConnections && this.deps.broker)
-      this.deps.serviceConnections = new ServiceConnections(this.deps.store, this.deps.broker);
+    if (!this.deps.serviceConnections && this.deps.broker) {
+      const githubApp = this.deps.githubApp;
+      // MCP servers that authorize through GitHub sign in with the deployment's GitHub App.
+      this.deps.serviceConnections = new ServiceConnections(this.deps.store, this.deps.broker, undefined, undefined, githubApp && {
+        account: (userId) => githubApp.activeUserAccountId(userId),
+        token: (userId, accountId) => githubApp.userAccessToken(userId, { accountId }),
+        authorizationUrl: async (organizationId, userId) => githubApp.userAuthorizationUrl(
+          (await this.deps.store.createGithubInstallState(organizationId, userId, { returnTo: 'connection' })), (await this.githubPublicUrl())),
+      });
+    }
     return this.deps.serviceConnections;
   }
   private sweepConnections(): void {
@@ -1386,7 +1395,7 @@ export class Gateway {
       const id = url.pathname.match(/^\/preview\/([^/]+)/)?.[1];
       const lease = id ? await this.deps.store.previewLease(id) : undefined;
       if (!lease || lease.revokedAt || lease.expiresAt <= Date.now()) return;
-      if (configuredPreviewOrigin() && String(req.headers.host ?? '').toLowerCase() !== new URL(previewLeaseOrigin(lease.id)).host.toLowerCase()) return;
+      if (configuredPreviewOrigin() && String(req.headers.host ?? '').toLowerCase() !== new URL(previewLeaseOrigin(lease)).host.toLowerCase()) return;
       const current = await this.deps.store.currentWorld(lease.worldId);
       if (!current || (current.generation ?? 1) !== lease.generation) return;
       if (lease.tokenHash) {
@@ -1779,7 +1788,8 @@ export class Gateway {
     if (previewOrigin && !onPreviewOrigin && p.startsWith('/preview/')) {
       const leaseId = p.match(/^\/preview\/([^/]+)/)?.[1];
       if (!leaseId) return this.json(res, 404, { error: 'not found' });
-      res.writeHead(307, { location: `${previewLeaseOrigin(decodeURIComponent(leaseId))}${p}${url.search}`, 'referrer-policy': 'no-referrer' });
+      const id = decodeURIComponent(leaseId);
+      res.writeHead(307, { location: `${previewLeaseOrigin((await this.deps.store.previewLease(id)) ?? id)}${p}${url.search}`, 'referrer-policy': 'no-referrer' });
       return void res.end();
     }
     if (p.startsWith('/preview/')) return this.serveLeasedPreview(req, res, url);
@@ -2033,6 +2043,28 @@ export class Gateway {
     // unauthenticated endpoints, before the session gate.
     if (p === '/api/agent-mail/ingest' && method === 'POST') {
       const mailMod = await import('../autonomy/agent-mail.js');
+      // The installation's own mail domain (KARMAX_AGENT_MAIL_DOMAIN): the
+      // Cloudflare Email Worker posts each message as raw MIME, signed with the
+      // key it shares with this installation (src/edge/agent-mail-worker.ts).
+      const signature = req.headers[MAIL_SIGNATURE_HEADER];
+      if (typeof signature === 'string') {
+        if (Number(req.headers['content-length'] ?? 0) > AGENT_MAIL_MAX_BYTES)
+          return this.json(res, 413, { error: 'message too large' });
+        let raw: Buffer;
+        try { raw = await this.rawBody(req, AGENT_MAIL_MAX_BYTES); } catch { return this.json(res, 413, { error: 'message too large' }); }
+        const to = String(req.headers[MAIL_TO_HEADER] ?? '').trim().toLowerCase();
+        const from = String(req.headers[MAIL_FROM_HEADER] ?? '').trim().toLowerCase();
+        if (!(await verifyMail(mailMod.agentMailIngestKey(), signature, to, from, raw)))
+          return this.json(res, 401, { error: 'invalid mail signature' });
+        // Only the installation's mail domain arrives this way; every other
+        // address (an organization's own provider) has its own route.
+        const domain = process.env.KARMAX_AGENT_MAIL_DOMAIN?.trim().toLowerCase();
+        if (!domain || !to.endsWith(`@${domain}`)) return this.json(res, 200, { delivered: false });
+        const mail = mailMod.parseRawMail(raw.toString('utf8'));
+        const { delivered } = await new mailMod.AgentMail(this.deps.store).ingest({ to, from: mailMod.cleanAddress(from),
+          subject: mail.subject, text: mail.text, ...(mail.messageId ? { sourceId: `message-id:${mail.messageId}` } : {}) });
+        return this.json(res, 200, { delivered });
+      }
       // Auth: the minted secret (in the copy-pasted webhook URL or a Bearer
       // header) — forwarding services can rarely set custom headers, so the
       // query form is the primary one. Legacy env secret stays accepted.
@@ -2111,6 +2143,12 @@ export class Gateway {
           const { GitProfiles, userGitScope } = await import('../autonomy/git-profiles.js');
           (await new GitProfiles(this.deps.store, this.deps.broker, undefined, userGitScope(identity.user.id))
             .setActiveGithub(activeAccountId));
+        }
+        if (pending.returnTo === 'connection') {
+          // Started from a task's Connect button: its pending GitHub connections finish now.
+          await this.linkPersonalGithubInstallation(identity.user.id, githubIdentity, false);
+          this.sweepConnections();
+          return (await this.githubCallbackPage(res, 200, 'GitHub is connected. You can close this tab and return to your task.'));
         }
         if (pending.returnTo !== 'installation') {
           const installUrl = (await this.linkPersonalGithubInstallation(identity.user.id, githubIdentity, pending.returnTo === 'profile'));
@@ -6109,7 +6147,7 @@ export class Gateway {
           throw error;
         }
         return this.json(res, 200, { ...lease, tokenHash: undefined,
-          url: previewLeaseUrl(lease.id, '/', rawToken) });
+          url: previewLeaseUrl(lease, '/', rawToken) });
       }
       const previewLease = p.match(/^\/api\/preview-leases\/([^/]+)$/);
       if (previewLease && method === 'DELETE') {
@@ -7973,7 +8011,7 @@ export class Gateway {
         return this.json(res, 200, { ok: true });
       }
 
-      const githubAccountsResource = p.match(/^\/api\/user\/github-accounts(?:\/([^/]+)(?:\/(active|identity))?)?$/);
+      const githubAccountsResource = p.match(/^\/api\/user\/github-accounts(?:\/([^/]+)(?:\/(active|identity|token))?)?$/);
       if (githubAccountsResource) {
         const subject = requireHumanSubject(callerIdentity);
         if (!this.deps.githubApp || !this.deps.broker)
@@ -8006,6 +8044,18 @@ export class Gateway {
               signingKey: b.signingKey ? String(b.signingKey) : undefined,
               removeSigningKey: b.removeSigningKey === true,
             })) });
+          }
+          if (method === 'PUT' && accountId && action === 'token') {
+            const b = await this.body(req);
+            const personal = String(b.token ?? '').trim();
+            if (!personal) return this.json(res, 400, { error: 'token required' });
+            await this.deps.githubApp.assertUserAccount(subject.userId, accountId);
+            await this.deps.githubApp.verifyPersonalToken(accountId, personal);
+            return this.json(res, 200, { profile: (await gp.saveGithubToken(accountId, personal)) });
+          }
+          if (method === 'DELETE' && accountId && action === 'token') {
+            await this.deps.githubApp.assertUserAccount(subject.userId, accountId);
+            return this.json(res, 200, { profile: (await gp.saveGithubToken(accountId, undefined)) });
           }
           if (method === 'DELETE' && accountId && !action) {
             const active = await this.deps.githubApp.removeUserAccount(subject.userId, accountId);
@@ -9092,7 +9142,7 @@ export class Gateway {
     const match = url.pathname.match(/^\/preview\/([^/]+)(\/.*)?$/);
     const lease = match ? (await this.deps.store.previewLease(match[1]!)) : undefined;
     if (!lease || lease.revokedAt || lease.expiresAt <= Date.now()) return this.previewStopped(req, res, 404, 'preview not found or expired');
-    if (configuredPreviewOrigin() && String(req.headers.host ?? '').toLowerCase() !== new URL(previewLeaseOrigin(lease.id)).host.toLowerCase())
+    if (configuredPreviewOrigin() && String(req.headers.host ?? '').toLowerCase() !== new URL(previewLeaseOrigin(lease)).host.toLowerCase())
       return this.previewStopped(req, res, 404, 'preview not found or expired');
     const current = (await this.deps.store.currentWorld(lease.worldId));
     if (!current || (current.generation ?? 1) !== lease.generation) return this.previewStopped(req, res, 410, 'preview world generation is no longer current');
@@ -9168,7 +9218,7 @@ export class Gateway {
       };
       if (!lease || lease.revokedAt || lease.expiresAt <= Date.now()) { browser.close(4404, 'preview expired'); return; }
       previewProjectId = lease.projectId;
-      if (configuredPreviewOrigin() && String(req.headers.host ?? '').toLowerCase() !== new URL(previewLeaseOrigin(lease.id)).host.toLowerCase()) {
+      if (configuredPreviewOrigin() && String(req.headers.host ?? '').toLowerCase() !== new URL(previewLeaseOrigin(lease)).host.toLowerCase()) {
         browser.close(4404, 'preview expired'); return;
       }
       const current = (await this.deps.store.currentWorld(lease.worldId));
@@ -9485,14 +9535,15 @@ export class Gateway {
     return resources;
   }
 
+  /** On a preview origin: the current one or one previews moved away from. */
   private requestIsPreviewOrigin(req: http.IncomingMessage): boolean {
-    const origin = configuredPreviewOrigin();
-    if (!origin) return false;
     try {
       const requested = new URL(`http://${String(req.headers.host ?? '').trim()}`);
-      const base = new URL(origin);
-      return (requested.hostname === base.hostname || requested.hostname.endsWith(`.${base.hostname}`))
-        && requested.port === base.port;
+      return previewOrigins().some((origin) => {
+        const base = new URL(origin);
+        return (requested.hostname === base.hostname || requested.hostname.endsWith(`.${base.hostname}`))
+          && requested.port === base.port;
+      });
     } catch { return false; }
   }
 
@@ -9615,8 +9666,8 @@ export class Gateway {
   /** GitHub must see exactly the same origin throughout manifest, install, and
    * OAuth callbacks. Persist the admin's browser origin during setup so a stale
    * reverse-proxy/environment value cannot reappear midway through the flow. */
-  private async githubPublicUrl(req: http.IncomingMessage, browserUrl?: unknown): Promise<string> {
-    if (browserUrl != null) {
+  private async githubPublicUrl(req?: http.IncomingMessage, browserUrl?: unknown): Promise<string> {
+    if (req && browserUrl != null) {
       const value = this.publicUrl(req, browserUrl);
       (await this.deps.store.kvSet(GITHUB_APP_PUBLIC_URL_KEY, value));
       return value;
@@ -9626,7 +9677,10 @@ export class Gateway {
     // callbacks pinned to the retired host forever after a move.
     const configured = process.env.KARMAX_PUBLIC_URL?.trim();
     if (configured) return new URL(configured).origin;
-    return (await this.deps.store.kvGet(GITHUB_APP_PUBLIC_URL_KEY)) ?? this.publicUrl(req);
+    const stored = (await this.deps.store.kvGet(GITHUB_APP_PUBLIC_URL_KEY));
+    if (stored) return stored;
+    if (!req) throw new Error('Configure the public Tavya URL before signing in to GitHub');
+    return this.publicUrl(req);
   }
 
   /** Connecting GitHub must give the personal organization repository access,

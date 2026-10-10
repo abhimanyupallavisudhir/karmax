@@ -120,22 +120,54 @@ www.{$KARMAX_DOMAIN} {
 	redir https://{$KARMAX_DOMAIN}{uri} permanent
 }
 
-# Each live preview gets an opaque, isolated origin. Caddy asks Karmax whether
-# it issued the name (to a lease that is live or recently ended) before
-# obtaining a certificate, so this catch-all cannot be abused to mint
-# certificates for arbitrary names. A stopped preview therefore still answers
-# over HTTPS with a page saying so, instead of failing the TLS handshake.
+# Live previews. Each lease gets its own opaque origin, p-<hash>.<preview
+# domain>, on a separately registered domain, so a tenant's app shares no
+# cookies, storage or reputation with the console. The app sets no cookie
+# scoped to the domain, and says no-referrer so a lease's URL never leaks.
+(karmax_preview) {
+	import karmax_security
+	header Referrer-Policy no-referrer
+	reverse_proxy 127.0.0.1:4505 {
+		header_up X-Forwarded-For {http.request.remote.host}
+	}
+}
+
+# How preview hosts get certificates (KARMAX_PREVIEW_TLS):
+# - on-demand: one per host at its first handshake, once Caddy has asked the
+#   app whether it issued the name (to a lease live or recently ended), so the
+#   name cannot be used to mint certificates for arbitrary hosts. Let's Encrypt
+#   issues 50 a week per registered domain.
+# - cloudflare: one wildcard certificate for the whole domain, proved by a DNS
+#   record (DNS-01) that Caddy writes with the Cloudflare API token in
+#   .secrets/cloudflare_dns_api_token (Zone DNS Edit + Zone Read on that zone
+#   only). No per-preview certificate, so no weekly limit.
+(preview_certificate_on-demand) {
+	tls {
+		on_demand
+	}
+}
+(preview_certificate_cloudflare) {
+	tls {
+		dns cloudflare {file./run/secrets/cloudflare_dns_api_token}
+	}
+}
+
+# A stopped preview still answers over HTTPS with a page saying so, instead
+# of failing the TLS handshake. The bare domain serves nothing.
+*.{$KARMAX_PREVIEW_DOMAIN} {
+	import preview_certificate_{$KARMAX_PREVIEW_TLS:on-demand}
+	import karmax_preview
+}
+
+# Leases issued under an earlier preview domain keep their hostnames until
+# they expire, on demand as before. Any other name is refused.
 https:// {
 	tls {
 		on_demand
 	}
-	@preview host *.{$KARMAX_PREVIEW_DOMAIN}
-	handle @preview {
-		import karmax_security
-		header Referrer-Policy no-referrer
-		reverse_proxy 127.0.0.1:4505 {
-			header_up X-Forwarded-For {http.request.remote.host}
-		}
+	@legacy_preview host *.{$KARMAX_LEGACY_PREVIEW_DOMAIN:invalid}
+	handle @legacy_preview {
+		import karmax_preview
 	}
 	handle {
 		abort
