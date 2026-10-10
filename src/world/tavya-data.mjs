@@ -231,8 +231,10 @@ async function get(argumentsList) {
       merge(scratch, resource.path);
       fs.rmSync(scratch, { recursive: true, force: true });
       if (resource.access === 'read') {
-        const target = name === ROOT_PART ? undefined : path.join(resource.path, name);
-        if (target) makeReadOnly(target);
+        const targets = name === ROOT_PART
+          ? fs.readdirSync(resource.path).filter((entry) => !fs.lstatSync(path.join(resource.path, entry)).isDirectory())
+          : [name];
+        for (const target of targets) makeReadOnly(path.join(resource.path, target));
       }
       const now = fetched(resource); now.add(name); writeFetched(resource, now);
       console.log(`${label(resource, name)} is here`);
