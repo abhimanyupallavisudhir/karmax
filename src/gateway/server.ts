@@ -357,6 +357,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/projects\/[^/]+\/tasks/.test(p)) return read ? 'task:read' : 'task:create';
   // Project events: reading needs the event stream; emitting can start runs.
   if (/^\/api\/projects\/[^/]+\/events$/.test(p)) return read ? 'task:event:read' : 'task:create';
+  if (p === '/api/events' && !read) return 'task:create';
   if (/^\/api\/project-events\/[^/]+$/.test(p)) return 'task:event:read';
   if (/^\/api\/projects\/[^/]+\/webhooks$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/webhooks\/[^/]+(?:\/rotate)?$/.test(p)) return 'project:settings:write';
@@ -5064,6 +5065,11 @@ export class Gateway {
           const result = await api.emitProjectEvent(token, projectId, { type: b.type, key: b.key, subject: b.subject, occurredAt: b.occurredAt, payload: b.payload });
           return this.json(res, result.duplicate ? 200 : 201, result);
         }
+      }
+      if (p === '/api/events' && method === 'POST') {
+        const b = await this.body(req);
+        const result = await api.emitProjectEvent(token, undefined, { type: b.type, key: b.key, subject: b.subject, occurredAt: b.occurredAt, payload: b.payload });
+        return this.json(res, result.duplicate ? 200 : 201, result);
       }
       const projectEventMatch = p.match(/^\/api\/project-events\/([^/]+)$/);
       if (projectEventMatch && method === 'GET') return this.json(res, 200, await api.getProjectEvent(token, projectEventMatch[1]!));

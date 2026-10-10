@@ -224,6 +224,7 @@ export const PLATFORM_API_CATALOG = {
   events: [
     'GET /api/projects/:projectId/events?limit=&before=&type=&source= (the project event inbox, newest first; each event lists its claims: what it did for every armed task it reached — started a run, deferred, skipped — and why; task:event:read)',
     'POST /api/projects/:projectId/events (emit a project event; body {type: dotted words, key?: delivery key — repeats of one key collapse, so a poller may re-emit what it sees, subject?: link or label, payload?: JSON object ≤ 64 KB}; armed tasks whose event trigger matches start runs that receive it; a task\'s events come from task:<series id>; task:create)',
+    'POST /api/events (the same, in the calling task\'s project: what `tavya emit` sends from a task\'s world)',
     'GET /api/project-events/:eventId (one event with its claims; task:event:read)',
     'GET|POST /api/projects/:projectId/webhooks (incoming webhooks; POST body {name, type?} returns {hook, secret, url} once — a delivery is accepted when signed with the secret, HMAC-SHA256 of the body in any *-Signature header such as X-Hub-Signature-256, or when it presents the secret as Authorization: Bearer or ?token=; each delivery becomes one event of the hook\'s type from webhook:<hookId>; project:settings:read/write)',
     'PATCH|DELETE /api/webhooks/:hookId (body {name?, type?})', 'POST /api/webhooks/:hookId/rotate (new secret, returned once)',

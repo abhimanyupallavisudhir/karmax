@@ -2739,11 +2739,15 @@ export class KarmaxApi {
   /** Emit a project event as the caller: a task (its runs share one source, so a
    *  poller's re-emits collapse), a person, or a token. Emitting can start runs,
    *  so it needs the same authority as creating a task. */
-  async emitProjectEvent(token: string, projectId: string, input: ProjectEventInput): Promise<{ event: ProjectEvent; duplicate: boolean }> {
+  async emitProjectEvent(token: string, projectId: string | undefined, input: ProjectEventInput): Promise<{ event: ProjectEvent; duplicate: boolean }> {
+    const verified = (await this.deps.tokens.verify(token));
+    const callerTask = verified?.taskId && verified.taskId !== '*' ? (await this.deps.store.taskMetadata(verified.taskId)) : undefined;
+    // A task's own command (`tavya emit` in its world) need not name its project.
+    projectId ??= callerTask?.projectId;
+    if (!projectId) throw new ValidationError('name the project to emit the event in');
     const caller = (await this.require(token, 'emit_event', { projectId }));
     const project = (await this.deps.store.getProject(projectId));
     if (!project) throw new NotFoundError(`no project ${projectId}`);
-    const callerTask = caller.taskId && caller.taskId !== '*' ? (await this.deps.store.taskMetadata(caller.taskId)) : undefined;
     const trigger = callerTask?.params?.trigger as { hops?: number } | undefined;
     return this.ingestProjectEvent({
       organizationId: project.organizationId ?? 'org_personal', projectId,

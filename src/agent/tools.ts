@@ -550,6 +550,22 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     },
   },
   {
+    name: 'emit_event',
+    description: 'Record a project event. Tasks waiting on a matching event trigger start runs that receive it. '
+      + 'Re-emitting the same `key` does nothing, so a poller can report everything it sees each run.',
+    parameters: {
+      type: 'object',
+      properties: {
+        project_id: { type: 'string' },
+        type: { type: 'string', description: 'Dotted words, e.g. "orders.created".' },
+        key: { type: 'string', description: 'Delivery key; repeats of one key collapse. Omit for a one-off.' },
+        subject: { type: 'string', description: 'A link or label for what the event is about.' },
+        payload: { type: 'object', description: 'JSON object, at most 64 KB.' },
+      },
+      required: ['project_id', 'type'],
+    },
+  },
+  {
     name: 'get_task',
     description: "Get a task's current view-model.",
     parameters: { type: 'object', properties: { task_id: { type: 'string' } }, required: ['task_id'] },
@@ -1397,6 +1413,11 @@ export function platformToolHandlers(
         ...(priority !== undefined ? { priority } : {}), ...(tags ? { tags } : {}),
       });
       return JSON.stringify(created);
+    },
+    async emit_event(args) {
+      return JSON.stringify(await platformRequest('POST', `/api/projects/${encodeURIComponent(String(args?.project_id ?? ''))}/events`, {
+        type: args?.type, key: args?.key, subject: args?.subject, payload: args?.payload,
+      }));
     },
     async get_task(args) {
       return JSON.stringify(await platformRequest('GET', `/api/tasks/${encodeURIComponent(String(args?.task_id ?? ''))}`));
