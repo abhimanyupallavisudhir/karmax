@@ -25,9 +25,10 @@ const tasks = [
   task('agent-busy'),
   task('child-asks-me', { parentTaskId: 'agent-busy', projectId: 'p2' }),
 ];
+const ask = (...kinds: string[]) => ({ kinds, at: NOW });
 const attention = new Map([
-  [alice, new Map([['review-me', ['review-requested']], ['child-asks-me', ['escalated']]])],
-  [bob, new Map([['input-bob', ['escalated']], ['review-me', ['mentioned']]])],
+  [alice, new Map([['review-me', ask('review-requested')], ['child-asks-me', ask('escalated')]])],
+  [bob, new Map([['input-bob', ask('escalated')], ['review-me', ask('mentioned')]])],
 ]);
 const people = new Map([['bob', bob], ['bob@example.com', bob], ['alice', alice]]);
 const ctx = { now: NOW, userId: alice, attention, people };
@@ -72,7 +73,7 @@ describe('for: — what needs a person', () => {
   it('matches an ask raised on the attempt behind a logical task', () => {
     const attempt = task('logical', { intentId: 'logical', id: 'attempt-2' });
     const result = evaluateQuery([attempt], parseQuery('for:me'),
-      { ...ctx, attention: new Map([[alice, new Map([['attempt-2', ['review-requested']]])]]) });
+      { ...ctx, attention: new Map([[alice, new Map([['attempt-2', ask('review-requested')]])]]) });
     expect(result.tasks).toHaveLength(1);
   });
 
@@ -83,6 +84,33 @@ describe('for: — what needs a person', () => {
     expect(attentionCandidates(parseQuery('-for:me'), ctx)).toBeUndefined();
     expect(attentionCandidates(parseQuery('for:me blocks:#3'), ctx)).toBeUndefined();
     expect(attentionCandidates(parseQuery('status:active'), ctx)).toBeUndefined();
+  });
+});
+
+describe('for: — order', () => {
+  const HOUR = 3600e3;
+  // Each task last changed status an hour apart; the asks arrived later.
+  const listed = [
+    task('reviewed-long-ago', { createdAt: NOW - 9 * HOUR, statusChangedAt: NOW - 5 * HOUR }),
+    task('mentioned-just-now', { createdAt: NOW - 8 * HOUR, statusChangedAt: NOW - 6 * HOUR }),
+    task('input-recently', { createdAt: NOW - 7 * HOUR, statusChangedAt: NOW - HOUR }),
+    task('my-draft', { params: { draft: true }, createdBy: { kind: 'user', userId: alice }, createdAt: NOW - 2 * HOUR }),
+    task('unrelated-newer', { createdAt: NOW }),
+  ];
+  const asks = new Map([[alice, new Map([
+    ['reviewed-long-ago', { kinds: ['review-requested'], at: NOW - 5 * HOUR }],
+    ['mentioned-just-now', { kinds: ['mentioned'], at: NOW - 60e3 }],
+    ['input-recently', { kinds: ['escalated'], at: NOW - HOUR }],
+  ])]]);
+  const order = (q: string) => evaluateQuery(listed, parseQuery(q), { ...ctx, attention: asks }).tasks.map((t) => t.id);
+
+  it('puts the task that most recently came to the person first', () => {
+    // A mention on a task whose status has not moved still brings it to the top.
+    expect(order('for:me')).toEqual(['mentioned-just-now', 'input-recently', 'my-draft', 'reviewed-long-ago']);
+  });
+
+  it('leaves other lists ordered by status change alone', () => {
+    expect(order('')).toEqual(['unrelated-newer', 'input-recently', 'my-draft', 'reviewed-long-ago', 'mentioned-just-now']);
   });
 });
 
