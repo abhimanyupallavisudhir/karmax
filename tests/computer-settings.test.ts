@@ -243,4 +243,44 @@ describe('Computer defaults', () => {
     await api.updateParams(editor, task.id, { computer: { diskGb: null } });
     expect((await api.getTaskView(editor, task.id))?.computerChange).toBeUndefined();
   });
+
+  // compute-disk items 3 and 5: the task shows its disk, and a full one is a
+  // state with a one-click fix up to the account's ceiling.
+  it('shows the computer\'s usage, and Bigger disk grows a full one to the account\'s ceiling', async () => {
+    const before = ceilings.e2b;
+    ceilings.e2b = { cpu: 8, memoryMb: 8192, diskGb: 29 };
+    try {
+      const project = await store.createProject('Full disk', { worldProvider: 'e2b', resources: { cpu: 2, memoryMb: 2048 } });
+      const task = await store.createTask({ projectId: project.id, title: 'Rebuild', workflow: 'software-dev',
+        workflowVersion: '1.27.0', params: { prompt: 'x', computer: { cpu: 4 } } });
+      await store.registerWorld({ version: 2, kind: 'e2b', provider: 'e2b', id: task.id, generation: 1, root: '/w', workspaceRoot: '/w',
+        branch: `tavya/${task.id}`, base: 'main', meta: { projectId: project.id, computer: { cpu: 4, memoryMb: 2048 } } } as any, project.id);
+      await store.saveView(task.id, { taskId: task.id, workflow: 'software-dev', stage: 'do', status: 'blocked', outOfDisk: true,
+        error: 'Out of disk: …', waitingFor: { kind: 'human', reason: 'error' }, actions: [], editableParams: [] } as any);
+      await store.kvSet(`world-usage:${task.id}`, JSON.stringify({ at: 5, disk: { usedMb: 22_528, totalMb: 22_528 }, memory: { usedMb: 900, totalMb: 2048 } }));
+      const editor = (await tokens.mintPrincipal('user:editor', ['task:edit', 'task:read'], project.id)).token;
+      expect((await api.getTaskView(editor, task.id))).toMatchObject({ outOfDisk: true,
+        usage: { at: 5, disk: { usedMb: 22_528, totalMb: 22_528 }, memory: { usedMb: 900, totalMb: 2048 }, maxDiskGb: 29 } });
+
+      signals.length = 0;
+      await expect(api.biggerDisk(editor, task.id, 40)).rejects.toThrow('Disk can be at most 29 GB on this E2B account');
+      const grown = await api.biggerDisk(editor, task.id);
+      expect(grown).toMatchObject({ diskGb: 29, maxDiskGb: 29 });
+      // Only the disk changes; the task's other sizes stay as they were.
+      expect((await store.getTask(task.id))!.params.computer).toEqual({ cpu: 4, diskGb: 29 });
+      // One message wakes the stopped task and tells its agent how to reach the new disk.
+      expect(signals).toHaveLength(1);
+      const [name, message] = signals[0] as [string, { text: string }];
+      expect(name).toBe('followUp');
+      expect(message.text).toMatch(/^\[tavya bigger disk\] The disk was full\. This task's computer now has a 29 GB disk/);
+      expect(message.text).toMatch(/pause\(3\) without jobs/);
+
+      // At the ceiling there is nothing bigger to give.
+      await store.kvSet(`world-usage:${task.id}`, JSON.stringify({ at: 6, disk: { usedMb: 29_000, totalMb: 29_696 } }));
+      await expect(api.biggerDisk(editor, task.id)).rejects.toThrow('This computer already has the largest disk this E2B account allows (29 GB)');
+      // Over the gateway too (UI/API parity).
+      const viaHttp = await json('POST', `/api/tasks/${task.id}/bigger-disk`, {});
+      expect(viaHttp).toMatchObject({ status: 400, body: { error: expect.stringMatching(/largest disk this E2B account allows/) } });
+    } finally { ceilings.e2b = before; }
+  });
 });

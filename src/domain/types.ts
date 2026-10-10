@@ -1760,7 +1760,7 @@ export interface TaskView {
   outOfDisk?: boolean;
   /** The task computer's last measured usage, and the largest disk its provider
    * account allows (`maxDiskGb`); added by the API from the world's readings. */
-  usage?: { at: number; disk?: { usedMb: number; totalMb: number }; memory?: { usedMb: number; totalMb: number }; maxDiskGb?: number };
+  usage?: { at: number; provider?: string; disk?: { usedMb: number; totalMb: number }; memory?: { usedMb: number; totalMb: number }; maxDiskGb?: number };
   updatedAt: number;
 }
 

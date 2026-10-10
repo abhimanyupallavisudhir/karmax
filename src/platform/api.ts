@@ -37,6 +37,7 @@ import { TaskRecord, TaskView, Message, Project, TaskInput, ImageRef, FileRef, T
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable, awaitsSuccessOf } from '../domain/triggers.js';
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult, EvalContext, TaskGroup, forClauseValues, attentionCandidates } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
+import { providerLabel } from '../domain/computer-limits.js';
 import { applyComputer, assertInFlightComputerEdit, computerOf, computerResizable, describeMachine, machineShape, normalizeComputer, sameMachine,
   type ComputerSpec, type MachineShape } from '../domain/computer.js';
 import { resolveParamsLayers, assembleTaskInput, projectSettingsFor, globalSettingsFor, quickProjectSettingsFor, quickGlobalSettingsFor, effectiveRepos, ValueMap } from './params.js';
@@ -2877,6 +2878,10 @@ export class KarmaxApi {
         const computerChange = await this.computerChange(taskId).catch(() => undefined);
         if (computerChange) view = { ...view, computerChange };
       }
+      // The computer's last measured usage and the largest disk its account
+      // allows: the usage meter and the Out of disk action (wiki features/computers).
+      const usage = await this.computerUsage(taskId).catch(() => undefined);
+      if (usage) view = { ...view, usage };
       if (await this.deps.store.kvGet(`project-transfer-history:${taskId}`)) {
         const { world, worldPath, worldAvailable, worldDesktop, worldProvider, ...history } = view;
         view = history;
@@ -6017,7 +6022,7 @@ Act according to your Avatar instructions. When ready, call platform_request POS
         // A running world moves only once it parks, which a turn or a job wait
         // never does: tell the agent, unless it asked for the size itself.
         const change = caller.taskId === taskId ? undefined : await this.computerChange(taskId).catch(() => undefined);
-        if (change && (await this.deps.store.worldState(taskId)) === 'ready')
+        if (change && !task.lastView?.outOfDisk && (await this.deps.store.worldState(taskId)) === 'ready')
           (await this.deliverWorkflowMessage(taskId, computerChangeNotice(change)).catch(() => undefined));
       }
       (await this.updateAgentSnapshot(taskId, patch, result.applied));
@@ -6036,6 +6041,55 @@ Act according to your Avatar instructions. When ready, call platform_request POS
     } catch (e) {
       throw new Error(unwrapCause(e));
     }
+  }
+
+  /** A cloud task's last measured disk and memory, and the largest disk its
+   * provider account allows. Undefined for a task with no cloud computer. */
+  private async computerUsage(taskId: string): Promise<TaskView['usage']> {
+    const raw = await this.deps.store.kvGet(`world-usage:${taskId}`);
+    let reading: TaskView['usage'] | undefined;
+    try { reading = raw ? JSON.parse(raw) : undefined; } catch { reading = undefined; }
+    const task = await this.deps.store.getTask(taskId);
+    if (!reading && !task?.lastView?.outOfDisk) return undefined;
+    const project = task && (await this.deps.store.getProject(task.projectId));
+    const provider = project ? (await this.deps.store.effectiveTaskConfig(project, taskId)).worldProvider : undefined;
+    const maxDiskGb = provider ? (await this.deps.providerConnections?.limits?.(project!.organizationId ?? 'org_personal', provider))?.diskGb : undefined;
+    return { at: reading?.at ?? 0, ...(provider ? { provider } : {}), ...(reading?.disk ? { disk: reading.disk } : {}),
+      ...(reading?.memory ? { memory: reading.memory } : {}), ...(maxDiskGb != null ? { maxDiskGb } : {}) };
+  }
+
+  /**
+   * Bigger disk (wiki features/computers): give a task's computer more disk, up
+   * to its provider account's ceiling (the default). Only the disk changes. A
+   * task stopped by its full disk is woken, and its agent told how to reach the
+   * new size; at the ceiling there is nothing bigger to give.
+   */
+  async biggerDisk(token: string, taskId: string, requested?: number): Promise<{ diskGb: number; maxDiskGb: number; applied: string[] }> {
+    const task = (await this.deps.store.getTask(taskId));
+    if (!task) throw new NotFoundError(`no task ${taskId}`);
+    const caller = (await this.require(token, 'edit_task', { projectId: task.projectId, taskId }));
+    const project = (await this.deps.store.getProject(task.projectId));
+    if (!project) throw new NotFoundError(`no project ${task.projectId}`);
+    const config = await this.deps.store.effectiveTaskConfig(project, taskId);
+    const provider = config.worldProvider ?? 'worktree';
+    const maxDiskGb = (await this.deps.providerConnections?.limits?.(project.organizationId ?? 'org_personal', provider))?.diskGb;
+    if (maxDiskGb == null) throw new ValidationError('this task\'s computer has no provider disk to grow');
+    const usage = await this.computerUsage(taskId).catch(() => undefined);
+    const current = usage?.disk ? Math.round(usage.disk.totalMb / 1024) : config.resources?.diskGb;
+    const diskGb = requested ?? maxDiskGb;
+    if (!Number.isInteger(diskGb) || diskGb < 1) throw new ValidationError('Disk must be a whole number of GB');
+    if (diskGb > maxDiskGb) throw new ValidationError(`Disk can be at most ${maxDiskGb} GB on this ${providerLabel(provider)} account`);
+    if (current != null && diskGb <= current)
+      throw new ValidationError(current >= maxDiskGb
+        ? `This computer already has the largest disk this ${providerLabel(provider)} account allows (${maxDiskGb} GB)`
+        : `This computer already has ${current} GB of disk`);
+    const own = normalizeComputer(task.params.computer) ?? {};
+    const { applied } = await this.updateParams(token, taskId, { computer: { ...own, diskGb } });
+    // A stopped task waits for a message or a Retry; this message is both, and
+    // says what changed. The agent asking for itself needs neither.
+    if (task.lastView?.outOfDisk && caller.taskId !== taskId)
+      (await this.deliverWorkflowMessage(taskId, biggerDiskNotice(diskGb, current)).catch(() => undefined));
+    return { diskGb, maxDiskGb, applied };
   }
 
   /** The machine a task's Computer asks for, when its world runs on another. */
@@ -6979,6 +7033,13 @@ function applyExecutionConfig(config: import('../domain/types.js').ProjectConfig
     else next[key] = patch[key];
   }
   return next as import('../domain/types.js').ProjectConfig;
+}
+
+/** What a task stopped by its full disk is told when it gets a bigger one. */
+function biggerDiskNotice(diskGb: number, fromGb: number | undefined): string {
+  return `[${BRAND} bigger disk] The disk was full. This task's computer now has a ${diskGb} GB disk${fromGb != null ? `; you are still on ${fromGb} GB` : ''}. `
+    + 'You move to it when this task parks: end your turn with pause(3) without jobs (stop any job first). '
+    + 'You resume with every tracked file and uncommitted change; Git-ignored files (dependencies, build output) and running processes do not carry over.';
 }
 
 /** What an agent is told when its task's Computer changes under it. */

@@ -898,7 +898,7 @@ function installLinkRouter() {
 // a module (an inline handler cannot see `toast`).
 function installInfoDotTips() {
   document.addEventListener('click', (ev) => {
-    const dot = ev.target.closest('.info-dot');
+    const dot = ev.target.closest('.info-dot, .disk-meter');
     if (!dot) return;
     ev.preventDefault();
     ev.stopPropagation();
@@ -1476,7 +1476,30 @@ const localWorldPath = (v) => (hostLocal() && v.worldPath) || '';
 // hibernateAfterDays, network}); the block shows the effective machine and a
 // form stores only what differs from what it inherits.
 const COMPUTER_PROVIDER_LABELS = { e2b: 'E2B', daytona: 'Daytona', worktree: 'This machine', container: 'Docker container' };
-const E2B_MAX_DISK_GB = 50;
+// What a machine gets when the Computer asks for nothing more (disk is total GB).
+const COMPUTER_DEFAULTS = { e2b: { cpu: 2, memoryMb: 2048, diskGb: 22 }, daytona: { cpu: 2, memoryMb: 4096, diskGb: 8 } };
+// What a computer on the organization's provider account may be: the
+// connection's limits, learned from the provider (src/domain/computer-limits.ts).
+const computerLimitsFor = (provider) => (S.worldProviderConnections || []).find((c) => c.provider === provider)?.limits || null;
+// "This E2B account allows up to 29 GB" — the hover text of each size.
+function computerLimitTip(provider, limits, key) {
+  const value = limits?.[key];
+  if (value == null) return '';
+  const label = COMPUTER_PROVIDER_LABELS[provider] || provider;
+  const amount = key === 'cpu' ? `${value} CPU` : `${key === 'memoryMb' ? gbOf(value) : value} GB`;
+  return limits.source?.[key] === 'default' ? `${label} allows up to ${amount} unless its support raised the limit`
+    : `This ${label} account allows up to ${amount}`;
+}
+// Max, placeholder and hover text of the size fields, for the chosen provider.
+function computerSizeAttrs(provider) {
+  const limits = computerLimitsFor(provider);
+  const defaults = COMPUTER_DEFAULTS[provider] || {};
+  return {
+    cpu: { max: limits?.cpu ?? 64, placeholder: defaults.cpu ?? 2, title: computerLimitTip(provider, limits, 'cpu') },
+    memory: { max: limits?.memoryMb != null ? gbOf(limits.memoryMb) : 256, placeholder: gbOf(defaults.memoryMb ?? 2048), title: computerLimitTip(provider, limits, 'memoryMb') },
+    disk: { max: limits?.diskGb ?? 2048, placeholder: defaults.diskGb ?? 'Default', title: computerLimitTip(provider, limits, 'diskGb') },
+  };
+}
 // The providers a task can run on here: the organization's connected cloud
 // computers, plus this machine when self-hosted.
 function computerProviderOptions(current) {
@@ -1494,11 +1517,14 @@ function computerBlockHtml(name, value, inherited, opts = {}) {
   const restricted = v.network?.unrestricted === false;
   // In flight, a task may only resize: another provider, experience or network is another computer.
   const fixed = opts.inFlight ? 'disabled' : '';
+  const size = computerSizeAttrs(provider);
+  const sizeAttrs = (key) => `max="${esc(size[key].max)}" placeholder="${esc(size[key].placeholder)}"`;
+  const tip = (key) => (size[key].title ? ` title="${esc(size[key].title)}"` : '');
   const body = `<div class="computer-controls">
       <select class="cf-provider" aria-label="Provider" ${fixed}>${computerProviderOptions(provider).map((p) => `<option value="${esc(p)}" ${p === provider ? 'selected' : ''}>${esc(COMPUTER_PROVIDER_LABELS[p] || p)}</option>`).join('')}</select>
-      <label class="computer-size"><input class="cf-cpu" type="number" min="1" max="64" step="1" inputmode="numeric" value="${esc(v.cpu ?? '')}" placeholder="2" aria-label="CPU"><span>CPU</span></label>
-      <label class="computer-size"><input class="cf-memory" type="number" min="0.5" max="256" step="0.5" inputmode="decimal" value="${esc(gbOf(v.memoryMb))}" placeholder="2" aria-label="Memory in GB"><span>GB RAM</span></label>
-      <label class="computer-size"><input class="cf-disk" type="number" min="1" ${provider === 'e2b' ? `max="${E2B_MAX_DISK_GB}"` : 'max="2048"'} step="1" inputmode="numeric" value="${esc(v.diskGb ?? '')}" placeholder="Default" aria-label="Disk in GB"><span>GB disk</span></label>
+      <label class="computer-size"${tip('cpu')}><input class="cf-cpu" type="number" min="1" ${sizeAttrs('cpu')} step="1" inputmode="numeric" value="${esc(v.cpu ?? '')}" aria-label="CPU"><span>CPU</span></label>
+      <label class="computer-size"${tip('memory')}><input class="cf-memory" type="number" min="0.5" ${sizeAttrs('memory')} step="0.5" inputmode="decimal" value="${esc(gbOf(v.memoryMb))}" aria-label="Memory in GB"><span>GB RAM</span></label>
+      <label class="computer-size"${tip('disk')}><input class="cf-disk" type="number" min="1" ${sizeAttrs('disk')} step="1" inputmode="numeric" value="${esc(v.diskGb ?? '')}" aria-label="Disk in GB"><span>GB disk</span></label>
     </div>
     <details class="computer-more"${opts.open ? ' open' : ''}><summary>More</summary><div class="computer-more-grid">
       <label class="form-row"><span>Experience ${policyTip('Desktop adds a screen you can watch and take over.')}</span><select class="cf-flavor" ${fixed}>
@@ -1521,6 +1547,34 @@ function computerPendingChip(change) {
   if (!change) return '';
   const tip = `Still ${describeMachineShape(change.from)}. Moves to ${describeMachineShape(change.to)} when the task next pauses with nothing running.`;
   return `<button type="button" class="chip computer-pending" title="${esc(tip)}" aria-label="${esc(tip)}">Moves at next pause</button>`;
+}
+// "Disk 17/22 GB" — the task computer's last measured disk; memory, when it
+// was measured and the account's ceiling on hover (wiki features/computers).
+function diskMeter(v) {
+  const usage = v?.usage;
+  const disk = usage?.disk;
+  if (!disk?.totalMb) return '';
+  const gb = (mb) => { const value = mb / 1024; return value >= 10 ? String(Math.round(value * 10) / 10).replace(/\.0$/, '') : value.toFixed(1).replace(/\.0$/, ''); };
+  const label = COMPUTER_PROVIDER_LABELS[usage.provider] || usage.provider;
+  const ago = usage.at ? Math.max(0, Math.round((Date.now() - usage.at) / 60000)) : null;
+  const tip = [`${gb(disk.usedMb)} of ${gb(disk.totalMb)} GB disk used`,
+    ...(usage.memory?.totalMb ? [`memory ${gb(usage.memory.usedMb)} of ${gb(usage.memory.totalMb)} GB`] : []),
+    ...(ago != null ? [ago < 1 ? 'measured just now' : `measured ${ago} min ago`] : []),
+  ].join(' · ') + (usage.maxDiskGb != null && label ? `. This ${label} account allows up to ${usage.maxDiskGb} GB of disk.` : '.');
+  const ratio = disk.usedMb / disk.totalMb;
+  return `<button type="button" class="disk-meter${ratio >= 0.9 ? ' warn' : ''}" title="${esc(tip)}" aria-label="${esc(tip)}" style="--used:${Math.min(100, Math.round(ratio * 100))}%">Disk ${Math.round(disk.usedMb / 1024)}/${Math.round(disk.totalMb / 1024)} GB</button>`;
+}
+// Bigger disk: the Out of disk fix, up to the account's ceiling.
+function biggerDiskButton(v) {
+  if (!v?.outOfDisk) return '';
+  const usage = v.usage || {};
+  const current = usage.disk?.totalMb ? Math.round(usage.disk.totalMb / 1024) : null;
+  const label = COMPUTER_PROVIDER_LABELS[usage.provider] || usage.provider || 'provider';
+  const atCeiling = usage.maxDiskGb == null || (current != null && current >= usage.maxDiskGb);
+  const title = usage.maxDiskGb == null ? 'This computer has no bigger disk to give'
+    : atCeiling ? `Already the largest disk this ${label} account allows (${usage.maxDiskGb} GB). Free space in the terminal.`
+    : `Grow the disk ${current != null ? `from ${current} ` : ''}to ${usage.maxDiskGb} GB`;
+  return `<button class="btn primary" id="bigger-disk" title="${esc(title)}" ${atCeiling ? 'disabled' : ''}>Bigger disk</button>`;
 }
 function describeMachineShape(shape) {
   return [`${shape.cpu ?? 2} CPU`, `${gbOf(shape.memoryMb ?? 2048)} GB`, ...(shape.diskGb != null ? [`${shape.diskGb} GB disk`] : [])].join(' · ');
@@ -1563,8 +1617,14 @@ function resetComputerBlock(box, attr = 'data-inherit') {
 }
 function syncComputerBlock(box) {
   const provider = box.querySelector('.cf-provider')?.value;
-  const disk = box.querySelector('.cf-disk');
-  if (disk) disk.max = provider === 'e2b' ? String(E2B_MAX_DISK_GB) : '2048';
+  const size = computerSizeAttrs(provider);
+  for (const key of ['cpu', 'memory', 'disk']) {
+    const input = box.querySelector(`.cf-${key}`);
+    if (!input) continue;
+    input.max = String(size[key].max);
+    input.placeholder = String(size[key].placeholder);
+    input.closest('label').title = size[key].title;
+  }
   const allowlist = box.querySelector('.cf-allowlist');
   if (allowlist) allowlist.hidden = box.querySelector('.cf-network')?.value !== 'restricted';
 }
@@ -6334,6 +6394,8 @@ const PARKED_WAITS = new Set(['timer', 'job', 'subtask', 'collaboration', 'paren
 // the task ever leaving Landing. The short wait reason is rendered separately.
 function stageLabel(v) {
   if (v.state?.draft) return 'draft';
+  // A full disk stopped the task: say so, not "blocked" (wiki features/computers).
+  if (v.outOfDisk) return 'Out of disk';
   // A human hold is a public software-dev stage, even though the workflow keeps
   // its replay-safe Do/Review/Landing checkpoint internally so a follow-up knows
   // where to resume. Direct provider blockers may supply a concise specific
@@ -9281,6 +9343,7 @@ function renderTaskPage() {
             ? `<span title="${esc(v.landing.detail || 'Provider landing state')}">landing: ${esc(v.landing.provider)}</span>`
             : ''}
           ${pullRequestLinks(v)}
+          ${diskMeter(v)}
           ${rec ? orgEditorHtml(rec) : ''}
         </div>
         ${taskAttempts(v)}
@@ -12682,7 +12745,7 @@ function taskActions(v) {
   // Sub-tasks' files arriving before the agent's next turn: a message sent now waits for them.
   const refreshing = v.state?.refreshingResources && v.status === 'active'
     ? `<button class="btn primary action-pending" disabled aria-busy="true" title="Sub-tasks’ files arrive before the agent’s next turn. Messages sent now are read then.">Bringing in sub-tasks’ data…</button>` : '';
-  let html = `<div class="actions"${refreshing ? ' role="status" aria-live="polite"' : ''}>${refreshing}`;
+  let html = `<div class="actions"${refreshing ? ' role="status" aria-live="polite"' : ''}>${refreshing}${biggerDiskButton(v)}`;
   let slot = 0; // digits 1–9 press the Nth ENABLED button (see the command registry)
   for (const a of simple) {
     const cls = a.name === 'confirm' || a.name === 'openPr' ? 'primary' : a.danger ? 'danger' : '';
@@ -12783,6 +12846,19 @@ function reflectAcceptedTaskAction(taskId, action) {
 }
 
 function wireActions(v) {
+  $('#bigger-disk')?.addEventListener('click', async (event) => {
+    const btn = event.currentTarget;
+    if (btn.disabled) return;
+    btn.disabled = true;
+    try {
+      const grown = await api(`/api/tasks/${v.taskId}/bigger-disk`, { method: 'POST', body: JSON.stringify({}) });
+      toast(`Disk → ${grown.diskGb} GB`);
+      setTimeout(refreshTask, 250);
+    } catch (e) {
+      toast(e.message, true);
+      btn.disabled = false;
+    }
+  });
   $('#tp-foot').querySelectorAll('[data-act]').forEach((btn) =>
     btn.addEventListener('click', async () => {
       const act = btn.dataset.act;

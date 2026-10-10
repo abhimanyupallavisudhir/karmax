@@ -3384,6 +3384,12 @@ html[data-theme="dark"] .github-signin-btn:active,
 .computer-dialog .modal-actions { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
 .computer-dialog .modal-actions .label-row-fill { flex: 1; }
 .computer-size input { -moz-appearance: textfield; appearance: textfield; }
+/* A size above what the provider account allows (its hover text says how much). */
+.computer-size input:invalid { border-color: var(--danger); }
+/* Task header: the computer's disk in use, filled to its share (wiki features/computers). */
+.disk-meter { font: inherit; color: var(--ink-3); cursor: help; padding: 1px 8px; border: 1px solid var(--line); border-radius: 999px;
+  background: linear-gradient(90deg, var(--surface-2) var(--used, 0%), transparent var(--used, 0%)); font-variant-numeric: tabular-nums; }
+.disk-meter.warn { color: var(--danger); border-color: var(--danger); background: linear-gradient(90deg, var(--danger-weak) var(--used, 0%), transparent var(--used, 0%)); }
 .computer-size input::-webkit-inner-spin-button, .computer-size input::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
 
 /* ── Model field: one harness:model:effort input (web/app.js modelFieldHtml) ──
