@@ -968,8 +968,16 @@ export class Gateway {
   private connectionTimer?: ReturnType<typeof setInterval>;
   private connectionSweep?: Promise<void>;
   private connections(): ServiceConnections | undefined {
-    if (!this.deps.serviceConnections && this.deps.broker)
-      this.deps.serviceConnections = new ServiceConnections(this.deps.store, this.deps.broker);
+    if (!this.deps.serviceConnections && this.deps.broker) {
+      const githubApp = this.deps.githubApp;
+      // MCP servers that authorize through GitHub sign in with the deployment's GitHub App.
+      this.deps.serviceConnections = new ServiceConnections(this.deps.store, this.deps.broker, undefined, undefined, githubApp && {
+        account: (userId) => githubApp.activeUserAccountId(userId),
+        token: (userId, accountId) => githubApp.userAccessToken(userId, { accountId }),
+        authorizationUrl: async (organizationId, userId) => githubApp.userAuthorizationUrl(
+          (await this.deps.store.createGithubInstallState(organizationId, userId, { returnTo: 'connection' })), (await this.githubPublicUrl())),
+      });
+    }
     return this.deps.serviceConnections;
   }
   private sweepConnections(): void {
@@ -2040,6 +2048,12 @@ export class Gateway {
           const { GitProfiles, userGitScope } = await import('../autonomy/git-profiles.js');
           (await new GitProfiles(this.deps.store, this.deps.broker, undefined, userGitScope(identity.user.id))
             .setActiveGithub(activeAccountId));
+        }
+        if (pending.returnTo === 'connection') {
+          // Started from a task's Connect button: its pending GitHub connections finish now.
+          await this.linkPersonalGithubInstallation(identity.user.id, githubIdentity, false);
+          this.sweepConnections();
+          return (await this.githubCallbackPage(res, 200, 'GitHub is connected. You can close this tab and return to your task.'));
         }
         if (pending.returnTo !== 'installation') {
           const installUrl = (await this.linkPersonalGithubInstallation(identity.user.id, githubIdentity, pending.returnTo === 'profile'));
@@ -9485,8 +9499,8 @@ export class Gateway {
   /** GitHub must see exactly the same origin throughout manifest, install, and
    * OAuth callbacks. Persist the admin's browser origin during setup so a stale
    * reverse-proxy/environment value cannot reappear midway through the flow. */
-  private async githubPublicUrl(req: http.IncomingMessage, browserUrl?: unknown): Promise<string> {
-    if (browserUrl != null) {
+  private async githubPublicUrl(req?: http.IncomingMessage, browserUrl?: unknown): Promise<string> {
+    if (req && browserUrl != null) {
       const value = this.publicUrl(req, browserUrl);
       (await this.deps.store.kvSet(GITHUB_APP_PUBLIC_URL_KEY, value));
       return value;
@@ -9496,7 +9510,10 @@ export class Gateway {
     // callbacks pinned to the retired host forever after a move.
     const configured = process.env.KARMAX_PUBLIC_URL?.trim();
     if (configured) return new URL(configured).origin;
-    return (await this.deps.store.kvGet(GITHUB_APP_PUBLIC_URL_KEY)) ?? this.publicUrl(req);
+    const stored = (await this.deps.store.kvGet(GITHUB_APP_PUBLIC_URL_KEY));
+    if (stored) return stored;
+    if (!req) throw new Error('Configure the public Tavya URL before signing in to GitHub');
+    return this.publicUrl(req);
   }
 
   /** Connecting GitHub must give the personal organization repository access,

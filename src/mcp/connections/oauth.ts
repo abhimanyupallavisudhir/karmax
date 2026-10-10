@@ -21,7 +21,12 @@ export function mcpClientMetadata(publicOrigin = process.env.KARMAX_PUBLIC_URL) 
 
 async function authorize(...args: Parameters<typeof auth>) {
   try { return await auth(...args); }
-  catch { throw new Error('MCP authorization failed. Retry sign-in, or check the server’s required OAuth client details and installation callback URL.'); }
+  catch (error) {
+    // Without registration or client metadata documents, the server accepts only clients registered with it in advance.
+    if (error instanceof Error && error.message.includes('does not support dynamic client registration'))
+      throw new Error('This MCP server needs an OAuth app registered with it. Add it in Tools settings with that app’s client details.');
+    throw new Error('MCP authorization failed. Retry sign-in, or check the server’s required OAuth client details and installation callback URL.');
+  }
 }
 
 const locks = new Map<string, Promise<unknown>>();
