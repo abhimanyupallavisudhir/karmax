@@ -12,6 +12,7 @@ import { startDevServer, watchDevServer } from './temporal/dev-server.js';
 import { makeClient } from './temporal/client.js';
 import { WorkerManager, terminateOnWorkerFailure } from './temporal/worker-pool.js';
 import { WorkerProcessManager } from './temporal/worker-process.js';
+import { workflowCacheSize, workflowTaskConcurrency } from './temporal/worker.js';
 import { noteFollowUpEvent, wireFollowUpWakes } from './activities/follow-up-wakes.js';
 import { memoryBudget } from './runtime/memory-budget.js';
 import { ForeignEventRelay } from './contrib/foreign-event-relay.js';
@@ -322,7 +323,8 @@ async function main() {
   // sizes its workflow thread, a second isolate with the same limit.
   const budget = memoryBudget({ separateWorker });
   console.log(`  • Memory budget: ${budget.limitMb} MiB; gateway heap ${budget.gatewayHeapMb} MiB`
-    + (separateWorker ? `, worker heaps ${budget.workerHeapMb} MiB each` : ''));
+    + (separateWorker ? `, worker heaps ${budget.workerHeapMb} MiB each` : '')
+    + `; workflow cache ${workflowCacheSize()}, ${workflowTaskConcurrency()} workflow-task slots`);
   const workerManager = separateWorker ? new WorkerProcessManager({
     entrypoint: fileURLToPath(new URL('./temporal/activity-worker-main.ts', import.meta.url)),
     env: workerEnvironment,

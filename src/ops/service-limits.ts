@@ -20,7 +20,7 @@ import type { WorkerHeap } from '../temporal/worker-process.js';
 import { readReconciliation } from '../store/object-reconciliation.js';
 import {
   agentMailUsage, cloudflareR2Usage, cloudflareWorkersUsage, composioUsage, daytonaUsage, e2bUsage, githubUsage,
-  hostUsage, managedStorageUsage, NotConnected, type ProbeReading, type ProbeResult,
+  hostUsage, managedStorageUsage, NotConnected, NotNeeded, type ProbeReading, type ProbeResult,
 } from './service-limit-probes.js';
 
 export type MeterUnit = 'count' | 'bytes' | 'hours';
@@ -118,7 +118,7 @@ export const SERVICE_CATALOG: ServiceSpec[] = [
     ] },
   { id: 'letsencrypt', name: 'Let’s Encrypt',
     link: { url: 'https://letsencrypt.org/docs/rate-limits/', label: 'Limits' },
-    tip: 'Every live preview gets its own certificate. Let’s Encrypt issues 50 new certificates a week per domain; after that new previews fail to load. A wildcard certificate removes the limit.',
+    tip: 'With a certificate per preview, Let’s Encrypt issues 50 new ones a week per domain; after that new previews fail to load. One wildcard certificate for the preview domain removes the limit.',
     connect: 'Previews here aren’t served on their own domain.',
     meters: [{ id: 'letsencrypt.certificates', label: 'Certificates, 7 days', unit: 'count', window: 'week', source: 'count', limit: 50,
       tip: 'New preview certificates requested in the last 7 days, counted by tavya.' }] },
@@ -290,7 +290,7 @@ export function evaluateAlerts(memory: AlertMemory, inputs: AlertInput[], now: n
 // ─── The service ─────────────────────────────────────────────────────────────
 
 interface StoredReading { used: number; limit?: number; label?: string; unit?: MeterUnit; source?: UsedSource; detail?: string; at: number }
-interface StoredService { status: 'ok' | 'not-connected' | 'failed'; checkedAt: number; error?: string; failures?: number; plan?: string }
+interface StoredService { status: 'ok' | 'not-connected' | 'not-needed' | 'failed'; checkedAt: number; error?: string; failures?: number; plan?: string; note?: string }
 export interface ServiceLimitState {
   checkedAt?: number;
   services: Record<string, StoredService>;
@@ -312,8 +312,11 @@ export interface ServiceLimitServiceView {
   id: string; name: string; tip: string;
   plan?: string; planSource?: LimitSource;
   link?: { url: string; label: string };
-  status: 'ok' | 'not-connected' | 'failed' | 'unchecked';
-  error?: string; connect?: string; checkedAt?: number;
+  status: 'ok' | 'not-connected' | 'not-needed' | 'failed' | 'unchecked';
+  error?: string; connect?: string;
+  /** Why the limit doesn't apply here (`not-needed`). */
+  note?: string;
+  checkedAt?: number;
   meters: ServiceLimitMeterView[];
 }
 export interface ServiceLimitsView {
@@ -485,6 +488,10 @@ export class ServiceLimitsService {
         if (!this.env.KARMAX_PREVIEW_ORIGIN) throw new NotConnected();
         // Daily buckets: the 7-day window is read a little wide, never short.
         const certificates = await store.serviceUsageSince('letsencrypt.certificates', isoDay(now - 7 * DAY));
+        // Under one wildcard certificate new previews need none; only hosts of
+        // an earlier, on-demand preview domain still count until they expire.
+        if (this.env.KARMAX_PREVIEW_TLS === 'cloudflare' && !certificates)
+          throw new NotNeeded('Previews share one wildcard certificate, so there is no per-preview limit.');
         return { readings: { 'letsencrypt.certificates': { used: certificates } } };
       },
       github: async (_fetcher, signal) => {
@@ -543,8 +550,9 @@ export class ServiceLimitsService {
     }));
     for (const { spec, result, error } of results) {
       const previous = state.services[spec.id];
-      if (error instanceof NotConnected) {
-        state.services[spec.id] = { status: 'not-connected', checkedAt: now };
+      if (error instanceof NotConnected || error instanceof NotNeeded) {
+        state.services[spec.id] = error instanceof NotNeeded
+          ? { status: 'not-needed', checkedAt: now, note: error.reason } : { status: 'not-connected', checkedAt: now };
         for (const meter of spec.meters) delete state.readings[meter.id];
         continue;
       }
@@ -619,6 +627,7 @@ export class ServiceLimitsService {
           status: stored?.status ?? 'unchecked',
           ...(stored?.status === 'failed' ? { error: stored.error } : {}),
           ...(stored?.status === 'not-connected' && spec.connect ? { connect: spec.connect } : {}),
+          ...(stored?.status === 'not-needed' && stored.note ? { note: stored.note } : {}),
           checkedAt: stored?.checkedAt,
           meters,
         };

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { containerMemoryLimit, memoryBudget } from '../src/runtime/memory-budget.js';
+import { workflowCacheSize } from '../src/temporal/worker.js';
 
 const MiB = 1024 * 1024;
 
@@ -10,6 +11,20 @@ describe('memory budget (RT-35)', () => {
     // The worker's flag sizes both its isolates (main and workflow thread); all
     // three heaps at their limits still leave a quarter for native memory.
     expect(2 * budget.workerHeapMb + budget.gatewayHeapMb).toBeLessThanOrEqual(4096 * 0.75);
+  });
+
+  // The app container's cap (KARMAX_APP_MEM_LIMIT) is the only input: a bigger
+  // host raises every heap with it, and the workflow cache with the workflow heap.
+  it('follows the app container cap', () => {
+    expect(memoryBudget({ limitBytes: 7 * 1024 * MiB, separateWorker: true }))
+      .toMatchObject({ limitMb: 7168, gatewayHeapMb: 1075, workerHeapMb: 2150 });
+    expect(memoryBudget({ limitBytes: 8 * 1024 * MiB, separateWorker: true }))
+      .toMatchObject({ limitMb: 8192, gatewayHeapMb: 1228, workerHeapMb: 2457 });
+    const hosted = { KARMAX_DEPLOYMENT: 'hosted', KARMAX_WORKER_MODE: 'process' } as NodeJS.ProcessEnv;
+    const cache = (gib: number) => workflowCacheSize(hosted, () => memoryBudget({ limitBytes: gib * 1024 * MiB, separateWorker: true }));
+    expect([cache(2), cache(4), cache(7), cache(8)]).toEqual([125, 250, 438, 501]);
+    // The same through the environment the worker child sees.
+    expect(workflowCacheSize({ ...hosted, KARMAX_MEMORY_LIMIT_MB: '7168' })).toBe(438);
   });
 
   it('gives one combined process two equal isolates', () => {

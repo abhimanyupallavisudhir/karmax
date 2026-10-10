@@ -37,7 +37,8 @@
     "replay-check": "tsx src/scripts/replay-check.ts",
     "benchmark:latency": "tsx benchmarks/latency.ts",
     "timing:report": "tsx src/scripts/timing-report.ts",
-    "deploy-repository-edge": "tsx src/scripts/deploy-repository-edge.ts"
+    "deploy-repository-edge": "tsx src/scripts/deploy-repository-edge.ts",
+    "deploy-agent-mail-edge": "tsx src/scripts/deploy-agent-mail-edge.ts"
   },
   "dependencies": {
     "@1password/sdk": "^0.4.1",

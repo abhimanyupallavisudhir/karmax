@@ -142,7 +142,17 @@ describe('paid-launch policies', () => {
     expect(workers).toMatch(/encrypted before it leaves the sandbox/);
     expect(workers).toMatch(/outside the EU/);
     expect(workers).toMatch(/not stored there/);
-    expect(policyDocument('subprocessors')!.version).toBe('2026-10-05.1');
+  });
+
+  it('names the database backups and agent mail routing in the Cloudflare bullet, in the owner-approved words (2026-10-10.1)', () => {
+    const bullets = policyDocument('subprocessors')!.sections.flatMap((section) => section.bullets ?? []);
+    const cloudflare = bullets.find((bullet) => bullet.startsWith('Cloudflare (R2'));
+    expect(cloudflare).toContain('; and, in a separate bucket, encrypted backups of tavya’s databases (encrypted before upload; kept 31 days); '
+      + 'and, for agent mailboxes, inbound email routing that delivers messages to tavya without storing them.');
+    expect(cloudflare).toMatch(/^Cloudflare \(R2, Email Routing\) — /);
+    // A changed disclosure is a new version: acceptance evidence names the text a person saw.
+    expect(policyDocument('subprocessors')!.version).toBe('2026-10-10.1');
+    expect(policyDocument('subprocessors')!.effectiveDate).toBe('October 10, 2026');
   });
 
   it('incorporates a scoped processing addendum without claiming execution or launch approval', () => {

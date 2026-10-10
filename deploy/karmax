@@ -155,21 +155,25 @@ ensure_secrets() (
   done
   # The S3 object store's keys are the operator's to write (see
   # KARMAX_OBJECT_STORE in .turnkey.env); empty means not configured.
-  # So are the off-host PostgreSQL backups' (configure-backups writes them).
+  # So are the off-host PostgreSQL backups' (configure-backups writes them),
+  # and the previews' DNS token (KARMAX_PREVIEW_TLS=cloudflare).
   for secret in s3_access_key_id s3_secret_access_key \
-      pg_backup_access_key_id pg_backup_secret_access_key pg_backup_public_key; do
+      pg_backup_access_key_id pg_backup_secret_access_key pg_backup_public_key \
+      cloudflare_dns_api_token; do
     { [ -e "$SECRETS_DIR/$secret" ] || (umask 022 && : > "$SECRETS_DIR/$secret"); } \
       && secret_mode "$SECRETS_DIR/$secret" || exit 1
   done
 )
 
-# The images this checkout builds for an update: the app and, since the
-# off-host backups, PostgreSQL with WAL-G. A rollback to a release whose
-# postgresql service is a stock image builds nothing for it. PostgreSQL's base
-# is not re-pulled, so an unchanged image is never recreated (and restarted).
+# The images this checkout builds for an update: the app, PostgreSQL with
+# WAL-G (since the off-host backups) and Caddy with its modules (Compose builds
+# an image only when it is missing, so a changed Caddy.Dockerfile would never
+# reach a running edge otherwise). A rollback to a release whose postgresql
+# service is a stock image builds nothing for it. PostgreSQL's and Caddy's bases
+# are pinned and not re-pulled, so an unchanged image is never recreated.
 build_images() {
-  if [ "${1:-}" = --pull ]; then dc build --pull app && dc build postgresql
-  else dc build app postgresql
+  if [ "${1:-}" = --pull ]; then dc build --pull app && dc build postgresql caddy
+  else dc build app postgresql caddy
   fi
 }
 
@@ -188,6 +192,13 @@ configure() {
   preview=$(printf '%s' "$preview" | tr '[:upper:]' '[:lower:]')
   valid_domain "$preview" || die "invalid preview domain: $preview"
   [ "$domain" != "$preview" ] || die 'the preview domain must be different from the application domain'
+
+  # Moving previews to another domain keeps the previous one serving the leases
+  # already issued under it, until they expire (the app and Caddyfile read it).
+  existing_preview=$(env_value KARMAX_PREVIEW_DOMAIN)
+  legacy_preview=$(env_value KARMAX_LEGACY_PREVIEW_DOMAIN)
+  if [ -n "$existing_preview" ] && [ "$existing_preview" != "$preview" ]; then legacy_preview=$existing_preview; fi
+  [ "$legacy_preview" != "$preview" ] || legacy_preview=''
 
   legacy=$(env_value KARMAX_LEGACY_DOMAIN)
   if [ -z "$legacy" ] && [ -n "$existing_domain" ] && [ "$domain" != "$existing_domain" ]; then
@@ -216,7 +227,7 @@ configure() {
   carried=''
   if [ -f "$ENV_FILE" ]; then
     carried=$(awk '
-      BEGIN { split("KARMAX_DOMAIN KARMAX_PREVIEW_DOMAIN KARMAX_LEGACY_DOMAIN KARMAX_LEGACY_WWW_DOMAIN KARMAX_PENDING_DOMAIN KARMAX_PENDING_PREVIEW_DOMAIN KARMAX_CLOUD_WORLD_PROVIDER \
+      BEGIN { split("KARMAX_DOMAIN KARMAX_PREVIEW_DOMAIN KARMAX_LEGACY_DOMAIN KARMAX_LEGACY_WWW_DOMAIN KARMAX_LEGACY_PREVIEW_DOMAIN KARMAX_PENDING_DOMAIN KARMAX_PENDING_PREVIEW_DOMAIN KARMAX_CLOUD_WORLD_PROVIDER \
         POSTGRES_PASSWORD TEMPORAL_VERSION POSTGRES_VERSION", m, " ")
         for (i in m) managed[m[i]] = 1 }
       /^[A-Za-z_][A-Za-z0-9_]*=/ {
@@ -232,6 +243,7 @@ configure() {
   {
     printf 'KARMAX_DOMAIN=%s\n' "$domain"
     printf 'KARMAX_PREVIEW_DOMAIN=%s\n' "$preview"
+    [ -z "$legacy_preview" ] || printf 'KARMAX_LEGACY_PREVIEW_DOMAIN=%s\n' "$legacy_preview"
     if [ -n "$legacy" ]; then
       printf 'KARMAX_LEGACY_DOMAIN=%s\n' "$legacy"
       printf 'KARMAX_LEGACY_WWW_DOMAIN=www.%s\n' "$legacy"
@@ -243,6 +255,21 @@ configure() {
     [ -z "$carried" ] || printf '%s\n' "$carried"
   } > "$ENV_FILE" )
   chmod 600 "$ENV_FILE"
+}
+
+# KARMAX_PREVIEW_TLS=cloudflare serves previews under one wildcard certificate,
+# which Caddy proves by writing a DNS record with this token. Without it Caddy
+# would start and fail every preview handshake, so refuse here instead.
+preview_tls_ready() {
+  case "$(env_value KARMAX_PREVIEW_TLS)" in
+    ''|on-demand) return 0 ;;
+    cloudflare)
+      [ -s "$SECRETS_DIR/cloudflare_dns_api_token" ] && return 0
+      echo "karmax: KARMAX_PREVIEW_TLS=cloudflare needs a Cloudflare API token with Zone DNS Edit and Zone Read on $(env_value KARMAX_PREVIEW_DOMAIN) only, in deploy/.secrets/cloudflare_dns_api_token" >&2
+      return 1 ;;
+    *) echo "karmax: KARMAX_PREVIEW_TLS must be on-demand or cloudflare, not $(env_value KARMAX_PREVIEW_TLS)" >&2
+      return 1 ;;
+  esac
 }
 
 wait_ready() {
@@ -328,6 +355,7 @@ EOF
 cmd_up() {
   need_docker
   configure "${1:-}" "${2:-}"
+  preview_tls_ready || die 'previews are not configured; nothing was started'
   dc config --quiet
   note 'Building and starting PostgreSQL, Temporal, Karmax, and Caddy…'
   dc up -d --build --remove-orphans
@@ -358,6 +386,35 @@ report_app_role() {
   done
 }
 
+# Each running container's memory use against its cap (KARMAX_*_MEM_LIMIT in
+# .turnkey.env), what the caps leave the host, and PostgreSQL's sizing to its
+# own cap (deploy/README.md, "Memory caps"). Never fails: it only reports.
+report_memory() {
+  containers=$(dc ps -q < /dev/null) || containers=''
+  [ -n "$containers" ] || { note 'No container is running, so there are no memory caps to report.'; return 0; }
+  note 'Memory in use / cap:'
+  # shellcheck disable=SC2086 # one argument per container
+  docker stats --no-stream --format '    {{.Name}}  {{.MemUsage}}' $containers < /dev/null || true
+  # shellcheck disable=SC2086
+  caps_mb=$(docker inspect --format '{{.HostConfig.Memory}}' $containers < /dev/null 2>/dev/null \
+    | awk '$1 == 0 { uncapped = 1 } { sum += $1 } END { if (!uncapped && NR) printf "%d", sum / 1048576 }') || caps_mb=''
+  host_mb=$(awk '/^MemTotal:/ { printf "%d", $2 / 1024 }' /proc/meminfo 2>/dev/null) || host_mb=''
+  if [ -n "$caps_mb" ] && [ -n "$host_mb" ]; then
+    if [ "$caps_mb" -gt "$host_mb" ]; then
+      echo "karmax: warning: the running containers' memory caps add up to $caps_mb MiB, more than the host's $host_mb MiB; lower a KARMAX_*_MEM_LIMIT in .turnkey.env" >&2
+    else
+      note "The caps add up to $caps_mb of the host's $host_mb MiB, leaving $((host_mb - caps_mb)) MiB for the host itself."
+    fi
+  fi
+  settings=$(dc exec -T postgresql psql -U temporal -d postgres -Atc "SELECT 'shared_buffers ' || current_setting('shared_buffers')
+    || ', effective_cache_size ' || current_setting('effective_cache_size') || ', work_mem ' || current_setting('work_mem')
+    || ', maintenance_work_mem ' || current_setting('maintenance_work_mem') || '; '
+    || (SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend') || ' of '
+    || current_setting('max_connections') || ' connections in use'" < /dev/null) \
+    && note "PostgreSQL: $settings" \
+    || echo 'karmax: warning: could not read PostgreSQL memory settings' >&2
+}
+
 cmd_doctor() {
   need_docker
   [ -f "$ENV_FILE" ] || die 'this instance is not configured; run `./deploy/karmax up your-domain`'
@@ -367,10 +424,12 @@ cmd_doctor() {
     [ -s "$SECRETS_DIR/$secret" ] || die "missing secret: $secret"
   done
   note 'Durable secrets are present.'
+  preview_tls_ready || die 'previews cannot get certificates'
   if [ -e "$SECRETS_DIR/vault_key.next" ] || [ -e "$SECRETS_DIR/vault_key.previous" ]; then
     echo 'karmax: warning: a vault key rotation is unfinished; run ./deploy/karmax rotate-vault-key to finish it' >&2
   fi
   dc ps
+  report_memory
   report_app_role
   # Names the store; an S3 one must accept a write, read-back and delete.
   objects_ok=1
@@ -516,6 +575,40 @@ cmd_deploy_repository_edge() {
   note 'Restarting the app with it…'
   dc up -d --no-build app && wait_ready || die 'Karmax failed its readiness check after enabling the edge'
   note 'Sandboxes now save resources through the edge.'
+}
+
+# Agent mail's inbound edge: a Cloudflare Email Worker that Email Routing's
+# catch-all rule for DOMAIN (e.g. mail.example.com) hands every message to; it
+# posts each one to the app, signed with a key derived from auth_secret, which
+# goes up as a Worker secret (wiki features/agent-mail). Takes
+# CLOUDFLARE_API_TOKEN (Workers Scripts: Edit) from the environment and stores
+# it nowhere. Records DOMAIN as KARMAX_AGENT_MAIL_DOMAIN, so every organization
+# without its own mail provider gets agent-<token>@DOMAIN, and restarts the app
+# when it changed. Repeatable. Email Routing itself (MX records, the catch-all
+# rule naming the Worker) is configured on the zone, not here.
+cmd_deploy_agent_mail_edge() {
+  need_docker
+  [ -f "$ENV_FILE" ] || die 'this instance is not configured'
+  [ "$#" -eq 1 ] || die 'usage: ./deploy/karmax deploy-agent-mail-edge mail.example.com'
+  domain=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  valid_domain "$domain" || die "invalid mail domain: $domain"
+  [ "$domain" != "$(env_value KARMAX_DOMAIN)" ] || die 'agent mail needs a domain of its own, not the application domain'
+  [ "$domain" != "$(env_value KARMAX_PREVIEW_DOMAIN)" ] || die 'agent mail needs a domain of its own, not the preview domain'
+  [ -n "${CLOUDFLARE_API_TOKEN:-}" ] || die 'set CLOUDFLARE_API_TOKEN (Workers Scripts: Edit)'
+  output=$(dc run --rm --no-deps -T -e CLOUDFLARE_API_TOKEN -e CLOUDFLARE_ACCOUNT_ID -e "KARMAX_AGENT_MAIL_DOMAIN=$domain" \
+    app npm run --silent deploy-agent-mail-edge < /dev/null) || die 'the mail edge was not deployed; see above'
+  script=$(printf '%s\n' "$output" | tail -n 1)
+  case "$script" in tavya-agent-mail*) ;; *) die "unexpected answer: $script" ;; esac
+  note "Deployed the agent mail Worker $script for @$domain. Email Routing's catch-all rule must send to it."
+  [ "$(env_value KARMAX_AGENT_MAIL_DOMAIN)" != "$domain" ] || return 0
+  staged="$ENV_FILE.mail.$$"
+  if ! (umask 077 && { sed '/^KARMAX_AGENT_MAIL_DOMAIN=/d' "$ENV_FILE" && printf 'KARMAX_AGENT_MAIL_DOMAIN=%s\n' "$domain"; } > "$staged"); then
+    rm -f "$staged"; die 'could not record the mail domain; nothing was changed'
+  fi
+  mv "$staged" "$ENV_FILE"
+  note 'Restarting the app with it…'
+  dc up -d --no-build app && wait_ready || die 'Karmax failed its readiness check after enabling agent mail'
+  note "Organizations without their own mail provider now get addresses on $domain."
 }
 
 cmd_backup() {
@@ -850,11 +943,11 @@ cmd_update() {
   trap 'exit 143' TERM
   pending_domain=$(env_value KARMAX_PENDING_DOMAIN)
   pending_preview=$(env_value KARMAX_PENDING_PREVIEW_DOMAIN)
-  if [ -n "$pending_domain" ]; then
+  if [ -n "$pending_domain" ] || [ -n "$pending_preview" ]; then
     migration_backup="$ENV_FILE.migration.$$"
     cp -p "$ENV_FILE" "$migration_backup"
     configure "$pending_domain" "$pending_preview"
-    note "Staged domain migration to $pending_domain for this deployment."
+    note "Staged domain migration to ${pending_domain:-$(env_value KARMAX_DOMAIN)} (previews on $(env_value KARMAX_PREVIEW_DOMAIN)) for this deployment."
   fi
 
   note "Checking out validated revision $target…"
@@ -866,6 +959,13 @@ cmd_update() {
     cleanup_migration
     migration_backup=''
     die "deployment $target could not write its secrets; production remains at $previous"
+  fi
+  if ! preview_tls_ready; then
+    git -C "$ROOT_DIR" checkout --detach "$previous"
+    restore_migration
+    cleanup_migration
+    migration_backup=''
+    die "deployment $target stopped: previews could not get certificates (see above); production remains at $previous"
   fi
 
   # Building does not replace the running container. It gives the one-off
@@ -1061,6 +1161,8 @@ Usage: ./deploy/karmax COMMAND
                                Compare the object store with the database (read-only)
   deploy-repository-edge       Deploy the Cloudflare Worker sandboxes save resources through
                                (needs CLOUDFLARE_API_TOKEN), and use it
+  deploy-agent-mail-edge MAIL-DOMAIN
+                               Deploy the Cloudflare Email Worker agent mail arrives through
   configure-backups s3://BUCKET/PREFIX https://ENDPOINT PUBLIC_KEY
                                Stream PostgreSQL WAL and base backups off-host (key in
                                KARMAX_PG_BACKUP_ACCESS_KEY_ID / _SECRET_ACCESS_KEY)
@@ -1086,6 +1188,7 @@ case "$command" in
   migrate-objects) cmd_migrate_objects "$@" ;;
   reconcile-storage) cmd_reconcile_storage "$@" ;;
   deploy-repository-edge) cmd_deploy_repository_edge "$@" ;;
+  deploy-agent-mail-edge) cmd_deploy_agent_mail_edge "$@" ;;
   configure-backups) cmd_configure_backups "$@" ;;
   pg-restore) cmd_pg_restore "$@" ;;
   down) need_docker; [ -f "$ENV_FILE" ] || die 'not configured'; dc down ;;

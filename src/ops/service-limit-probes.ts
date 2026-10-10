@@ -23,6 +23,12 @@ export class NotConnected extends Error {
   constructor() { super('not connected'); }
 }
 
+/** The limit doesn't apply to how this installation is set up (`reason`
+ * says why): shown as such, never an alert. */
+export class NotNeeded extends Error {
+  constructor(readonly reason: string) { super(reason); }
+}
+
 const TIMEOUT_MS = 20_000;
 const GIB = 1024 ** 3;
 
