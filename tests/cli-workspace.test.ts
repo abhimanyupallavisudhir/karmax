@@ -101,6 +101,36 @@ it('pushes commits and data, pulls them into another workspace, and refuses a st
   expect(fs.existsSync(path.join(one, 'site', 'data', 'pages', 'one.txt'))).toBe(false);
 });
 
+// An on-demand resource's versions are one snapshot per top-level folder
+// (wiki features/resource-storage). A laptop holds all of it: clone restores
+// every part, pull makes the folder exactly the version, push is split into
+// parts on the server.
+it('clones, pulls and pushes an on-demand resource whole, part by part', async () => {
+  const f = await fixture();
+  await f.store.updateResourceAttachment(f.data.id, { onDemand: true });
+  expect((await f.tavya(f.laptop, ['clone', f.project.id, 'one'])).code).toBe(0);
+  expect((await f.tavya(f.laptop, ['clone', f.project.id, 'two'])).code).toBe(0);
+  const one = path.join(f.laptop, 'one', 'site', 'data'); const two = path.join(f.laptop, 'two', 'site', 'data');
+  for (const file of f.corpus) expect(fs.readFileSync(path.join(one, file.path)).equals(file.data)).toBe(true);
+  expect(fs.existsSync(path.join(one, 'big.bin'))).toBe(true);
+
+  fs.mkdirSync(path.join(one, 'ocr'));
+  fs.writeFileSync(path.join(one, 'ocr', 'page.txt'), 'ocr');
+  fs.rmSync(path.join(one, 'big.bin'));
+  fs.rmSync(path.join(one, 'pages', '0.txt'));
+  const pushed = await f.tavya(path.join(f.laptop, 'one'), ['push', '--json']);
+  expect(pushed.code, pushed.stderr).toBe(0);
+  const revision = (await f.store.getResourceRevision((await f.store.getResourceAttachment(f.data.id))!.currentRevisionId!))!;
+  expect(Object.keys(JSON.parse(revision.sealedRef).parts).sort()).toEqual(['ocr', 'pages']);
+
+  fs.writeFileSync(path.join(two, 'stray.txt'), 'not in any part');
+  const pulled = await f.tavya(path.join(f.laptop, 'two'), ['pull', '--force', '--json']);
+  expect(pulled.code, pulled.stderr).toBe(0);
+  expect(files(two)).toEqual(files(one));
+  expect(fs.existsSync(path.join(two, 'big.bin'))).toBe(false);
+  expect(fs.existsSync(path.join(two, 'pages', '0.txt'))).toBe(false);
+});
+
 it('resolves a renamed organization\'s old slug in references and console URLs', async () => {
   const responses: Record<string, unknown> = {
     '/api/organizations': [{ id: 'org_a', name: 'Acme Labs', slug: 'acme-labs', previousSlugs: ['acme'] }],

@@ -62,3 +62,19 @@ describe('the computer in the World section', () => {
     expect(pending).toContain('Computer: 2 CPU · 2 GB. This task\'s computer is now 2 CPU · 2 GB · 50 GB disk: you move to it when the task parks');
   });
 });
+
+// pramana#3: every sub-task copied all 10.5 GB of raw_data. An on-demand
+// resource arrives as a listing, and the prompt says how big it is and how to
+// fetch, and free, only what the task needs.
+describe('on-demand data in the World section', () => {
+  it('names each on-demand resource with its size and the tavya-data command', () => {
+    const prompt = assemblePrompt({ profile, role: 'do', task: task({ kind: 'human', audience: ['@creator'] }),
+      world: { ...world, meta: { resourceProjections: {
+        r1: { target: 'raw_data', access: 'write', onDemand: true, bytes: 10_500_000_000, files: 777_367, parts: 12, held: 0 },
+        r2: { target: 'secrets.env', access: 'read' } } } } as any });
+    expect(prompt).toContain('Project data on demand: raw_data (10.5 GB, 777,367 files in 12 top-level parts; 0 B on this disk).');
+    expect(prompt).toContain('`/world/.karmax-injection/bin/tavya-data get <folder>` fetches a part');
+    expect(prompt).toContain('free space with drop, never rm');
+    expect(assemblePrompt({ profile, role: 'do', task: task({ kind: 'human', audience: ['@creator'] }), world })).not.toContain('on demand');
+  });
+});

@@ -38,7 +38,7 @@ import { REPOSITORY_ROUTE, RepositoryTokens, ResourceRepositoryServer, parseRepo
 import { RESTIC_ENGINE, ROOT_PART, ResticResources, isParted, isPartsCapture, partsTotals, resticRef, storedRef, type Parts, type PartsCapture,
   type Repository, type ResticCapture, type ResticPlace } from './restic-engine.js';
 import { ResourceConflictError } from './resource-conflict.js';
-import { DATA_TOOL, installTool, mergeParts, partChanges, readFetched, readGrant, readManifest, removeGrants, saveParts, topLevel,
+import { installTool, mergeParts, partChanges, readFetched, readGrant, readManifest, removeGrants, saveParts, topLevel,
   writeFetched, writeGrant, writeManifest } from './resource-on-demand.js';
 
 const COPY_GLOB_SECRET_BYTES = 64 * 1024;

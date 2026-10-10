@@ -128,7 +128,7 @@ describe('on-demand resources', () => {
 
     const { task, world } = await f.task('Reader');
     expect(f.inWorld(world)).toEqual({});
-    expect((world.handle.meta?.resourceProjections as Record<string, unknown>)[f.data.id]).toMatchObject({ onDemand: true });
+    expect((world.handle.meta!.resourceProjections as Record<string, unknown>)[f.data.id]).toMatchObject({ onDemand: true });
     const listed = await f.tool(world, 'ls');
     expect(listed.code).toBe(0);
     expect(listed.stdout).toMatch(/resources\/raw_data {2}46 B in 4 parts, 0 B on this disk/);

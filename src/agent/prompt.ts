@@ -185,7 +185,8 @@ function describeData(world: WorldHandle): string {
 }
 
 function gigabytes(bytes: number): string {
-  return bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)} GB` : bytes >= 1e6 ? `${Math.round(bytes / 1e6)} MB` : `${Math.round(bytes / 1e3)} KB`;
+  return bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)} GB` : bytes >= 1e6 ? `${Math.round(bytes / 1e6)} MB`
+    : bytes >= 1e3 ? `${Math.round(bytes / 1e3)} KB` : `${bytes} B`;
 }
 
 /**

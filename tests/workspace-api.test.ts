@@ -214,7 +214,7 @@ it('serves an on-demand version as parts and splits a laptop\'s push into them',
   expect(read.snapshot).toBeUndefined();
   expect(read.parts).toEqual(Object.fromEntries(Object.entries(parts).map(([name, part]) => [name, (part as { snapshot: string }).snapshot])));
   const other = path.join(f.dir, 'other-laptop');
-  for (const [name, snapshot] of Object.entries(read.parts as Record<string, string>))
+  for (const snapshot of Object.values(read.parts as Record<string, string>))
     expect((await runHostRestic(['restore', snapshot, '--target', other, '--no-lock', '--no-cache'], read.env)).code).toBe(0);
   expect(fs.readFileSync(path.join(other, 'README.md'), 'utf8')).toBe('top-level');
   for (const file of f.corpus) expect(fs.readFileSync(path.join(other, file.path)).equals(file.data)).toBe(true);
