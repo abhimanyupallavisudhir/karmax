@@ -645,6 +645,11 @@ export interface ResourceAttachment {
   currentRevisionId?: string;
   publish: ResourcePublishPolicy;
   enabled: boolean;
+  /** A folder of data whose worlds get its listing but not its bytes: the
+   * agent fetches the top-level folders it needs (`tavya-data get`). Its
+   * versions are saved one top-level folder at a time, so what a world never
+   * fetched is never touched (wiki features/resource-storage). */
+  onDemand?: boolean;
   createdAt: number;
   updatedAt: number;
 }

@@ -4402,7 +4402,7 @@ export class Gateway {
               storageLocationId: isSnapshotResourceDriver(driver)
                 ? (await this.deps.resources.storageLocationFor(project.organizationId, b.storageLocationId == null ? undefined : String(b.storageLocationId)))
                 : undefined,
-              publish: b.publish === 'review' ? 'review' : 'discard' }));
+              publish: b.publish === 'review' ? 'review' : 'discard', ...(b.onDemand ? { onDemand: true } : {}) }));
             let revision;
             if (isSnapshotResourceDriver(driver)) {
               if (typeof b.sourcePath === 'string') {
@@ -4507,6 +4507,7 @@ export class Gateway {
               ...(b.target !== undefined ? { target: normalizeResourceTarget(b.target, resource.driver, resource.name) } : {}),
               ...(b.access !== undefined ? { access: b.access } : {}), ...(b.isolation !== undefined ? { isolation: b.isolation } : {}),
               ...(b.publish !== undefined ? { publish: b.publish } : {}), ...(b.enabled !== undefined ? { enabled: Boolean(b.enabled) } : {}),
+              ...(b.onDemand !== undefined ? { onDemand: Boolean(b.onDemand) } : {}),
               ...(source ? { source } : {}),
               ...(b.storageLocationId !== undefined && isSnapshotResourceDriver(resource.driver)
                 ? { storageLocationId: (await this.deps.resources?.storageLocationFor(resource.organizationId, String(b.storageLocationId))) }
