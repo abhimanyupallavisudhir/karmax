@@ -7,6 +7,25 @@ runs found, what shipped and what remains is summarised in the project wiki page
 `ops/performance-history`. They are small diagnostic samples on tavya.io, not
 statistical benchmarks.
 
+## Control-plane load tests (benchmarks/load)
+
+[load-report-2026-10.md](load-report-2026-10.md) is the summary: the first wall (64 concurrently
+active tenants) and its cause. Each run has a directory `load-<label>-<date>/`:
+[baseline](load-baseline-2026-10-09/report.md) (master `45522f01`),
+[integrated](load-integrated-2026-10-09/report.md) (`1460e39c`) and
+[integrated + statements](load-integrated-statements-2026-10-10/report.md) (`1460e39c` with
+`pg_stat_statements`). In each directory:
+
+- `report.md` and `summary.json`: the per-step table that `report.ts` builds.
+- `steps.jsonl`: the driver's step summaries. `tenants.json`: what it created. `run.json`: the run's parameters.
+- `instances.jsonl` and `cost.json`: the VMs launched and what they cost.
+- `raw/samples.jsonl.gz`: the collector's samples (host, containers, PostgreSQL, app metrics, Temporal, statements).
+- `raw/probe.tgz`: each Node process's heap, event-loop delay, GC and CPU.
+- `raw/app.log.gz`, `raw/temporal.log.gz`, `raw/caddy.log.gz`, `raw/fake-e2b.log.gz`: container logs.
+- `logs/`: `key-scope.log` (the key's proven limits), `leftovers.txt` (nothing tagged remained),
+  `sut-setup.log`, `world-prepare.log`, `world-setup.log`, `driver.log`, `containers-at-end.txt`,
+  `sandboxes-at-end.txt` and `kernel-oom.txt`.
+
 ## Generated reports
 
 - [latency-fixture-results.md](latency-fixture-results.md) — offline fixture run (`latency-fixture-2026-09-17.json.gz`).

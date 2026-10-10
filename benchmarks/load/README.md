@@ -22,6 +22,14 @@ Run it as a durable job (`start_job`) from a task: it outlives a turn. Results
 heap), `raw/app.log.gz`, `logs/`, `cost.json`. Findings are summarised in the
 wiki (`ops/performance-history`, risks in `planned/managed-infrastructure`).
 
+## Findings
+
+October 2026 ([report](../results/load-report-2026-10.md)): the first wall is at **64 concurrently
+active tenants** (96 people, ~240 open tasks) on both master and the integrated branch. Every
+websocket re-derives its owner's permissions from the database whenever any agent turn ends,
+because the end of each turn revokes a token and moves the global authorization epoch. That saturates
+the store's 4-connection pool. Fix that first, then re-run this harness to find the next wall.
+
 ## What runs where
 
 | VM | Size | Runs |
