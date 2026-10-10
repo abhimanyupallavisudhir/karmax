@@ -19,3 +19,10 @@ export function taskForkSourceIds(params: unknown): string[] {
   visit(params);
   return [...sources];
 }
+
+/** The source agent a fork reads: the one it names, else the agent of the same
+ * role — and for an agent called in with `@` (role `agent`, which keys no
+ * session), the source task's main agent. */
+export function forkSourceRole(resumeFrom: { role?: string }, role: string): string {
+  return resumeFrom.role ?? (role === 'agent' ? 'do' : role);
+}

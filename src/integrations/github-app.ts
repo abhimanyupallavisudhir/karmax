@@ -1167,12 +1167,16 @@ export class GitHubAppService {
     // A head label is `owner:branch`; a ref is the bare branch.
     const originatingTaskId = headRefs.map((ref) => taskIdOfBranch(ref.slice(ref.indexOf(':') + 1)))
       .find((id) => id && /^task_[A-Za-z0-9_-]+$/.test(id));
+    const attempt = Math.max(1, Number(workflowRun?.run_attempt ?? 1) || 1);
+    if (await this.workflowFailureSettlesItself(repository, { runId, attempt, conclusion, headSha, branch,
+      workflowId: Number(workflowRun.workflow_id ?? 0) || 0, runNumber: Number(workflowRun.run_number ?? 0) || 0 }))
+      return [];
     const base = {
       repository: `${repository.owner}/${repository.name}`,
       repositoryId: repository.id,
       workflow: String(workflowRun.name ?? 'GitHub workflow'),
       runId,
-      attempt: Math.max(1, Number(workflowRun?.run_attempt ?? 1) || 1),
+      attempt,
       conclusion,
       headSha,
       branch,
@@ -1183,6 +1187,49 @@ export class GitHubAppService {
     return (await this.store.projectIdsForRepository(repository.id)).map((projectId) => ({
       projectId, type: 'github.workflow.failed' as const, payload: base,
     }));
+  }
+
+  /**
+   * Whether GitHub will settle this default-branch failure without a recovery
+   * task. A branch's state is what needs repair, not each commit's: a newer
+   * run of the same workflow on a later commit decides instead (its own
+   * failure arrives here in turn). A first attempt that failed in its jobs gets
+   * one rerun of the failed jobs; a flaky test passes it, and a real failure
+   * comes back as attempt 2. Unknowns (no Actions access, an API error, a
+   * refused rerun) answer false, so an unclassifiable failure still gets a task.
+   */
+  private async workflowFailureSettlesItself(repository: Repository, run: {
+    runId: number; attempt: number; conclusion: string; headSha: string; branch: string;
+    workflowId: number; runNumber: number;
+  }): Promise<boolean> {
+    let actions: GithubActionsApi;
+    try { actions = await this.actions(repository); } catch { return false; }
+    const slug = `${repository.owner}/${repository.name}`;
+    if (run.workflowId > 0 && run.runNumber > 0) {
+      try {
+        const listed = await actions.listRuns(slug, { workflow: run.workflowId, branch: run.branch,
+          event: 'push', perPage: 20 });
+        if (listed.runs.some((other) => other.workflowId === run.workflowId
+          && other.runNumber > run.runNumber && other.headSha !== run.headSha)) return true;
+      } catch { /* cannot tell; judge this run on its own */ }
+    }
+    if (run.attempt !== 1 || !['failure', 'timed_out'].includes(run.conclusion)) return false;
+    // One rerun per run, however many deliveries describe it.
+    const key = `github:workflow-rerun:${repository.id}:${run.runId}`;
+    if (!(await this.store.kvClaim(key, `pending:${Date.now()}`))) {
+      const state = (await this.store.kvGet(key)) ?? '';
+      if (state === 'requested') return true;
+      // A claim abandoned by a crash before the request stops holding the run.
+      return state.startsWith('pending:') && Date.now() - Number(state.slice('pending:'.length)) < 10 * 60_000;
+    }
+    try {
+      await actions.rerun(slug, run.runId, true);
+      (await this.store.kvSet(key, 'requested'));
+      return true;
+    } catch {
+      (await this.store.kvSet(key, 'refused'));
+      return false;
+    }
   }
 
   /** Is `taskId` a live task of the organization that installed the App? */

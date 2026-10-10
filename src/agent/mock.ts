@@ -3,6 +3,7 @@ import { parseTransition } from '../resolve/transitions.js';
 import { providerErrorFromMessage } from './limits.js';
 import { worldRepoTarget, worldRepos, worldWorkingRelativePath } from '../world/types.js';
 import { platformToolHandlers } from './tools.js';
+import { SUB_TASK_ACTIONS, type SubTaskAction } from '../domain/types.js';
 
 /**
  * Deterministic mock agent for hermetic tests. It executes simple directives
@@ -51,6 +52,7 @@ import { platformToolHandlers } from './tools.js';
  *   @sleep <ms>                     await, but abort promptly if cancelled (tests mid-turn cancel)
  *   @heard                          report the conversation this turn was handed, one
  *                                   `role: first line` entry per message (shared conversations)
+ *   @instructed <text>              report whether this turn's system prompt contains <text>
  *
  * A Responder, Reviewer or called-in agent in a shared conversation (software-dev
  * ≥1.27) reads other agents' messages, not directive-bearing prompts, so it also
@@ -183,8 +185,8 @@ export class MockAdapter implements AgentAdapter {
           // Without child_task_id it targets all children currently waiting.
           const [action, textRest = ''] = splitOn(rest, '::');
           const [act = '', childTaskId] = action.trim().split(/\s+/);
-          if (['open_pr', 'confirm', 'comment', 'retry', 'cancel'].includes(act)) {
-            await ctx.respondToSubTask({ action: act as 'open_pr' | 'confirm' | 'comment' | 'retry' | 'cancel', text: textRest.trim() || undefined,
+          if ((SUB_TASK_ACTIONS as readonly string[]).includes(act)) {
+            await ctx.respondToSubTask({ action: act as SubTaskAction, text: textRest.trim() || undefined,
               ...(childTaskId ? { childTaskId } : {}) });
             outputs.push(`respond: ${act}`);
           }
@@ -365,6 +367,9 @@ export class MockAdapter implements AgentAdapter {
           outputs.push(`shells: ${rest.trim()}`);
           break;
         }
+        case 'instructed':
+          outputs.push(`${input.systemPrompt.includes(rest) ? 'instructed' : 'not instructed'}: ${rest}`);
+          break;
         case 'heard':
           outputs.push(`heard: ${input.messages.map((m) => `${m.role}: ${m.text.split('\n')[0]}`).join(' | ')}`);
           break;

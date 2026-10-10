@@ -127,6 +127,38 @@ describe('the authorization summon dialog', () => {
     expect(request!.body).toMatchObject({ audience: ['@maintainers'], target: { kind: 'task', taskId: 'task_draft', queueAfterApproval: true } });
     await ui.close();
   });
+
+  it('names a vault credential you cannot grant and asks for it with the task', async () => {
+    const cap = 'use-credential:item:vi_stripe';
+    const credentialTargets = { ...targets, authorization: { level: 'developer', scope: 'projects', projectIds: ['p'] },
+      requestedCapabilities: [cap], missingCapabilities: [cap], credentials: [{ capability: cap, label: 'Stripe dashboard' }],
+      special: [{ selector: '@admins', eligibleUserIds: ['owner'] }], summon: '@admins' };
+    const credentialGap = { status: 403, json: { ...gap.json, summon: '@admins', missingCapabilities: [cap], credentialGrants: [cap] } };
+    const schema = [{ name: 'software-dev', params: [{ name: 'prompt', type: 'text', label: 'Prompt', scopes: ['task'], bind: 'prompt' }],
+      stages: [{ key: 'do', label: 'Working' }] }];
+    const ui = await open(({ method, path, body }) => {
+      if (path === '/api/schema') return schema;
+      if (path.startsWith('/api/authorization/escalation-targets')) return credentialTargets;
+      if (method === 'POST' && path === '/api/projects/p/tasks') return body.draft ? { id: 'task_draft', projectId: 'p', params: {} } : credentialGap;
+      if (method === 'POST' && path.startsWith('/api/authorization-requests')) return { id: 'areq', status: 'pending' };
+      return undefined;
+    });
+    await ui.run(`openTaskForm('software-dev')`);
+    await ui.page.locator('#tf-page').waitFor();
+    await ui.page.locator('#tf-page textarea').first().fill('Refund the duplicate charge');
+    await ui.page.locator('#tf-queue').click();
+    await expect.poll(() => dialog(ui).getByRole('heading').innerText()).toBe("You can't grant Stripe dashboard");
+    await dialog(ui).getByText('1 missing').click();
+    expect(await dialog(ui).locator('.summon-missing .chip').allInnerTexts()).toEqual(['Stripe dashboard']);
+    const lookup = ui.calls.find((call: ApiCall) => call.path.startsWith('/api/authorization/escalation-targets'));
+    expect(lookup!.body).toMatchObject({ credentialGrants: [cap] });
+    await dialog(ui).getByRole('button', { name: 'Alert @admins', exact: true }).click();
+    await expect.poll(() => writes(ui).map((call) => `${call.method} ${call.path.split('?')[0]}`)).toEqual([
+      'POST /api/projects/p/tasks', 'POST /api/projects/p/tasks', 'POST /api/authorization-requests']);
+    expect(writes(ui)[2]!.body).toMatchObject({ credentialGrants: [cap], audience: ['@admins'],
+      reason: 'Please grant Stripe dashboard to this task agent.' });
+    await ui.close();
+  });
 });
 
 describe('confirming a merge you cannot make', () => {

@@ -52,7 +52,7 @@ export interface PlatformOps {
   messageAgent(taskId: string, text: string, role?: string): Promise<void>;
   stopAgent(taskId: string, agent: string): Promise<unknown>;
   escalateToHuman(a: { taskId?: string; audience: string[]; message: string; urgency?: Urgency }): Promise<unknown>;
-  notify(a: { to: string[]; message: string; urgency?: Urgency }): Promise<unknown>;
+  notify(a: { to?: string[]; message: string; urgency?: Urgency; agents?: AgentSpec[] }): Promise<unknown>;
   requestPermission(a: { capabilities: string[]; projectIds?: string[]; audience?: string[]; reason: string; urgency?: Urgency }): Promise<unknown>;
   requestAgentAction(a: { taskId: string; role?: string; action: 'publish_branch'; message?: string }): Promise<unknown>;
   cancelAgentAction(requestId: string): Promise<unknown>;
@@ -473,14 +473,16 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
     'escalate_to_human',
     {
       description:
-        'Pause your current task at its exact stage and request input from selected people, teams, or Avatars. ' +
+        'Ask named people, teams, or Avatars for what only a person can give: an approval, a secret, an action in the real world, a personal decision. ' +
+        'For anything an agent could answer, end your turn with the question instead; it goes to your task\'s usual input route (a sub-task\'s parent, else its Responder). ' +
+        'This pauses your task at its exact stage and ends your turn. A reply resumes you, and the answer or question you end that turn with reaches them too. ' +
         'Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @maintainers, @admins, @superadmins, @owners, @project, or @all. ' +
         'Discover valid choices with platform_request GET /api/agent/escalation-targets. ' +
-        'Calling this stops the current turn; the task resumes when a selected principal responds. ' +
         'urgency orders the human\'s inbox and decides whether their device alerts them: use high only when the ' +
         'person is genuinely blocking progress, and critical only for something that goes wrong if it waits.',
       inputSchema: {
-        audience: z.array(z.string()).max(32).optional(),
+        // Required, but checked by the platform, whose refusal lists who can be asked.
+        audience: z.array(z.string()).max(32).optional().describe('Required. Who to ask: person/team/Avatar selectors; any of them may answer.'),
         message: z.string().trim().min(1).max(4_000),
         urgency: z.enum(URGENCY_LEVELS as [Urgency, ...Urgency[]]).optional(),
       },
@@ -494,14 +496,23 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
         'Tell or call people and agents of this task without ending your turn. People (user:<id>, @team:<slug>, ' +
         '@creator, @owners, @project, @maintainers, @admins, @all) and Avatars (avatar:<id>) are notified now and keep ' +
         'their own pace; agents of this task (agent:do for the main agent, agent:responder, agent:confirm, ' +
-        'agent:agent-<n>) are called when your turn ends, in order. The message is said in the task conversation.',
+        'agent:agent-<n>) are called when your turn ends, in order. The message is said in the task conversation. ' +
+        '`agents` calls new agents in, after `to`; each becomes the next agent:agent-<n> (the returned message\'s `to` names them).',
       inputSchema: {
-        to: z.array(z.string()).min(1).max(32),
+        to: z.array(z.string()).max(32).optional(),
         message: z.string().trim().min(1).max(4_000),
         urgency: z.enum(URGENCY_LEVELS as [Urgency, ...Urgency[]]).optional(),
+        agents: z.array(z.object({
+          provider: z.string().min(1),
+          model: z.string().optional(),
+          effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).optional(),
+          prompt: z.string().max(4_000).optional().describe('Its instructions.'),
+          resumeFrom: z.object({ taskId: z.string().min(1), role: z.string().optional() }).optional()
+            .describe('Fork that task agent (role default do).'),
+        })).max(8).optional(),
       },
     },
-    async (a) => wrap(async () => (await ops.notify(a))),
+    async (a) => wrap(async () => (await ops.notify(a as Parameters<typeof ops.notify>[0]))),
   );
   server.registerTool(
     'escalate',
@@ -694,7 +705,7 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
     'get_credential',
     {
       description:
-        'Reveal a vault secret in plaintext (API key, password, SSH key, .env contents). Default login reveal includes notes; field note retrieves notes alone — the audited last resort; prefer fill_credential for logins. Returns granted with the value, or needs_approval/denied per the item\'s reveal policy, or not_in_vault. A needs_approval response already parks the approval request for the human (its requestId is returned) — do NOT also call request_credential; just wait for the decision, which resumes the task.',
+        'Reveal a vault secret in plaintext (API key, password, SSH key, .env contents). Default login reveal includes notes; field note retrieves notes alone — the audited last resort; prefer fill_credential for logins. Field totp returns only the current one-time code (never the seed) under the item\'s blind-use policy, no reveal approval needed; it is the default for a login that holds only a TOTP seed. Returns granted with the value, or needs_approval/denied per the item\'s policy, or not_in_vault. A needs_approval response already parks the approval request for the human (its requestId is returned) — do NOT also call request_credential; just wait for the decision, which resumes the task.',
       inputSchema: { itemId: z.string().optional(), domain: z.string().optional(), field: z.string().optional() },
     },
     async (a) => wrap(async () => (await ops.platformRequest('POST', '/api/vault/resolve', a))),

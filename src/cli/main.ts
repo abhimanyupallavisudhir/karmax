@@ -3,14 +3,15 @@ import pkg from '../../cli/package.json' with { type: 'json' };
 import { parseArgs } from 'node:util';
 import { Api, resolveServer } from './api.js';
 import { Credentials } from './config.js';
-import { parseRef } from './refs.js';
+import { parseRef, type Target } from './refs.js';
 import { CliError, EXIT, interactive, output, readStdin, type Output } from './util.js';
 import { Workspace } from './workspace.js';
 import { login, logout, token, whoami } from './commands/auth.js';
 import { clone, diff, pull, push, status } from './commands/sync.js';
 import { env, run, secrets, setup } from './commands/env.js';
-import { attach, resolveTask, resume, task } from './commands/tasks.js';
+import { attach, openUrl, projects, projectUrl, resolveTask, resume, task, taskUrl } from './commands/tasks.js';
 import { importProject } from './commands/import.js';
+import { add, untrack } from './commands/track.js';
 import { exec, preview } from './commands/world.js';
 import { gitCredential } from './commands/git-credential.js';
 
@@ -31,7 +32,12 @@ Workspaces (a project or task, assembled as its cloud world is)
   env [--format dotenv|shell|json]       Print the environment secrets
   setup                                  Run the project's install commands
   secrets list|set|import|rm             Manage project secrets (values are write-only)
-  import [dir]                           Make a local folder a tavya project (repositories, secrets, data)
+  import [dir]                           Make a local checkout, or a folder of them, a tavya project:
+                                         GitHub repositories (created if missing), unpushed commits,
+                                         and what Git ignores as secrets and data. The folder becomes
+                                         the workspace. --data/--secret/--skip <path> adjust; --dry-run
+  add <path>… [--data|--secret <path>]   Keep more ignored files in the project (data is pushed now)
+  untrack <path>…                        Stop keeping data or a secret file in the project (files stay)
 
 Tasks
   task new <title> [--prompt <text>]     Start a task (in the workspace's project, or --project)
@@ -43,6 +49,8 @@ Tasks
   resume [<task>] [--fork]               Continue the task's agent conversation here (Claude Code, Codex)
 
 Account
+  projects [--organization <org>]        Projects you can open
+  open [<org>/<project>[#<task>]]        Open the workspace's project or task in the browser
   login [--url <server>] | logout | whoami
   token create|list|revoke               Tokens for CI and scripts (--level, --project, --expires <days>)
   api <METHOD> <path> [-d <json>|@file]  Any API call (--list prints the catalog)
@@ -60,8 +68,9 @@ const OPTIONS = {
   organization: { type: 'string' }, expires: { type: 'string' }, prompt: { type: 'string' }, 'prompt-file': { type: 'string' },
   workflow: { type: 'string' }, draft: { type: 'boolean' }, all: { type: 'boolean' }, follow: { type: 'boolean', short: 'f' },
   role: { type: 'string' }, ticket: { type: 'string' }, token: { type: 'string' }, fork: { type: 'boolean' }, print: { type: 'boolean' },
-  data: { type: 'string', short: 'd' }, list: { type: 'boolean' }, yes: { type: 'boolean', short: 'y' }, port: { type: 'string' },
-  cwd: { type: 'string' }, 'git-via-tavya': { type: 'boolean' },
+  data: { type: 'string', short: 'd', multiple: true }, list: { type: 'boolean' }, yes: { type: 'boolean', short: 'y' }, port: { type: 'string' },
+  cwd: { type: 'string' }, 'git-via-tavya': { type: 'boolean' }, secret: { type: 'string', multiple: true },
+  skip: { type: 'string', multiple: true }, github: { type: 'string' }, 'dry-run': { type: 'boolean' }, repository: { type: 'string' },
 } as const;
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
@@ -121,10 +130,28 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     case 'secrets': case 'secret': {
       const client = await api();
       const projectId = flags.project?.[0] ? (await resolveTarget(client, flags.project[0])).project.id : Workspace.require().manifest.project.id;
-      await secrets(client, projectId, args, out, flags);
+      await secrets(client, projectId, args, out, flags, workspace);
       return 0;
     }
     case 'import': await importProject(await api(), args[0] ?? '.', out, flags); return 0;
+    case 'add': await add(await api(), Workspace.require(), [...args.map((value) => ({ value })),
+      ...[flags.data ?? []].flat().map((value: string) => ({ value, as: 'data' as const })),
+      ...[flags.secret ?? []].flat().map((value: string) => ({ value, as: 'secret' as const }))], out); return 0;
+    case 'untrack': await untrack(await api(), Workspace.require(), args, out, { yes: Boolean(flags.yes) }); return 0;
+    case 'projects': case 'project': return projects(await api(), args, out, flags);
+    case 'open': {
+      const client = await api();
+      const target: Target | undefined = args[0] ? await resolveTarget(client, args[0]) : workspace
+        ? { project: workspace.manifest.project, ...(workspace.manifest.task ? { taskId: workspace.manifest.task.id,
+          ...(workspace.manifest.task.number != null ? { taskNumber: workspace.manifest.task.number } : {}) } : {}) }
+        : undefined;
+      if (!target) throw new CliError('usage: tavya open [<organization>/<project>[#<task>]] (or run it in a workspace)', EXIT.usage);
+      const url = target.taskId ? taskUrl(server, target, workspace?.manifest.organization)
+        : projectUrl(server, target.project, target.organization ?? workspace?.manifest.organization);
+      openUrl(url);
+      out.result({ url }, url);
+      return 0;
+    }
     case 'task': case 'tasks': return task(await api(), args, out, { ...flags, project: flags.project?.[0] }, workspace);
     case 'attach': {
       const client = await api();
@@ -173,8 +200,9 @@ async function apiCommand(api: Api, args: string[], flags: Record<string, any>, 
   if (!path.startsWith('/api/') && !path.startsWith('/oauth/')) path = `/api${path}`;
   let body: unknown;
   if (flags.data !== undefined) {
-    const raw = flags.data === '@-' ? await readStdin() : String(flags.data).startsWith('@')
-      ? (await import('node:fs')).readFileSync(String(flags.data).slice(1), 'utf8') : String(flags.data);
+    const data = String([flags.data].flat().at(-1));
+    const raw = data === '@-' ? await readStdin() : data.startsWith('@')
+      ? (await import('node:fs')).readFileSync(data.slice(1), 'utf8') : data;
     try { body = JSON.parse(raw); } catch { throw new CliError('-d must be JSON', EXIT.usage); }
   }
   const result = await api.request(method.toUpperCase(), path, body);

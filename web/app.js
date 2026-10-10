@@ -67,6 +67,16 @@ const ICON = {
   // Window controls: a matched pair, drawn on the same grid and stroke.
   minimize: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" aria-hidden="true"><path d="M6 12h12"/></svg>',
   close: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" aria-hidden="true"><path d="m7 7 10 10"/><path d="M17 7 7 17"/></svg>',
+  // Sidebar navigation, icon-only (the name is the aria-label and tooltip):
+  // organization views at the top, installation-wide entries at the foot.
+  home: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 10.2a2 2 0 0 1 .7-1.5l7-6a2 2 0 0 1 2.6 0l7 6a2 2 0 0 1 .7 1.5V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/><path d="M9.5 21v-6.5a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1V21"/></svg>',
+  insights: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3v16a2 2 0 0 0 2 2h16"/><path d="m7 15 4-5 3.5 3L20 6.5"/></svg>',
+  wiki: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 7v14"/><path d="M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3Z"/></svg>',
+  settings: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2Z"/><circle cx="12" cy="12" r="3"/></svg>',
+  docs: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9.5"/><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3"/><path d="M12 17h.01"/></svg>',
+  palette: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3V6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3"/></svg>',
+  keyboard: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="5" width="20" height="14" rx="2"/><path d="M6 9h.01M10 9h.01M14 9h.01M18 9h.01M8 13h.01M12 13h.01M16 13h.01M7.5 16h9"/></svg>',
+  installation: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2.5" y="3" width="19" height="7.5" rx="2"/><rect x="2.5" y="13.5" width="19" height="7.5" rx="2"/><path d="M6.5 6.75h.01M6.5 17.25h.01M10.5 6.75h4M10.5 17.25h4"/></svg>',
 };
 const TAG_SECTION_QUERY = 'group:tag';
 const DEFAULT_EXPLANATION_SETTINGS = {
@@ -342,12 +352,27 @@ function organizationById(id) { return (S.organizations || []).find((o) => o.id 
 // grant is idempotent, so there is no cost to keeping the affordance visible.
 function githubAuthorizeButton(githubApp, id) {
   if (!githubApp?.oauthConfigured) return '';
-  const label = githubApp.userAuthorized ? 'Reconnect my GitHub identity' : 'Connect my GitHub identity';
-  return `<button class="btn sm" id="${id}">${label}</button>`;
+  const [label, tip] = githubApp.userAuthorized ? ['Reconnect', 'Reconnect your GitHub account'] : ['Connect', 'Connect your GitHub account'];
+  return `<button class="btn sm" id="${id}" title="${tip}">${label}</button>`;
 }
+// A renamed organization keeps answering to its old slugs (applyRoute then
+// rewrites the URL to the current one).
 function organizationBySlug(slug) {
   const s = slugify(slug);
-  return (S.organizations || []).find((o) => orgSlug(o) === s) || (S.organizations || []).find((o) => o.id === slug);
+  const organizations = S.organizations || [];
+  return organizations.find((o) => orgSlug(o) === s) || organizations.find((o) => o.id === slug)
+    || organizations.find((o) => (o.previousSlugs || []).includes(s));
+}
+// The current URL with its organization segment replaced by `org`'s slug.
+function pathWithOrganization(org) {
+  const [, , ...rest] = location.pathname.split('/');
+  return `/${[orgSlug(org), ...rest].join('/')}${location.search}${location.hash}`;
+}
+// Where a route that names an organization by a slug it had before a rename
+// now lives; '' when the route is already current.
+function renamedOrganizationPath(route) {
+  const org = route.org && organizationBySlug(route.org);
+  return org && slugify(route.org) !== orgSlug(org) && org.id !== route.org ? pathWithOrganization(org) : '';
 }
 // The organization whose slug prefixes every URL — the one selected in the
 // switcher, else the org owning the current project, else the first known org.
@@ -374,6 +399,7 @@ function orgBase(org = currentOrg()) { return org ? `/${orgSlug(org)}` : ''; }
  *  the rail highlights the project, the main pane shows its tab bar). One list
  *  so they never drift apart again. */
 const PROJECT_SCOPED_TABS = ['tasks', 'queue', 'activity', 'wiki', 'avatars', 'settings'];
+const PROJECT_TAB_COMMANDS = { tasks: 'nav.tasks', queue: 'nav.queue', wiki: 'nav.wiki', settings: 'nav.settings' };
 // The query a task list opens with: what needs the signed-in person.
 const DEFAULT_LIST_QUERY = 'for:me';
 // Second-segment words that name an organization-level view rather than a project.
@@ -576,6 +602,8 @@ async function applyRoute() {
   const routePath = location.pathname;
   const routeIsCurrent = () => S.routeEpoch === routeEpoch && location.pathname === routePath;
   const r = parseRoute(currentPath());
+  const renamed = renamedOrganizationPath(r);
+  if (renamed) return go(renamed, { replace: true });
   if (r.name === 'home') {
     const org = currentOrg();
     return go(org ? homeRoute(org, DEFAULT_LIST_QUERY) : globalRoute('insights'), { replace: true });
@@ -972,15 +1000,14 @@ const NODES = [
   { key: 'done', label: 'End' },
 ];
 
-// Provider → model choices for the agent field (free-text also allowed).
-// `mock` is a hermetic test adapter, not a user-selectable agent.
-const AGENT_PROVIDERS = ['claude', 'codex', 'opencode', 'kimi', 'grok'];
+// Harness → model choices for the model field (free text also allowed).
+// `mock` is a hermetic test adapter, not a user-selectable agent; Kimi Code and
+// Grok Build are not admitted by the server, so their models run through OpenCode.
+const AGENT_PROVIDERS = ['claude', 'codex', 'opencode'];
 const MODELS = {
   claude: ['default', 'opus[1m]', { id: 'claude-opus-5-5', displayName: 'Opus 5.5' }, { id: 'claude-fable-5-1', displayName: 'Fable 5.1' }, 'sonnet', 'haiku'],
   codex: ['gpt-5.6-sol', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'],
   opencode: ['kimi/k3', 'kimi/kimi-for-coding', 'openai/gpt-5.5', 'anthropic/claude-sonnet-5', 'google/gemini-3-pro', 'xai/grok-code-fast-1'],
-  kimi: ['kimi/k3', 'kimi/kimi-for-coding'],
-  grok: ['grok-build', 'grok-code-fast-1'],
 };
 const agentProviderChoice = (provider) => AGENT_PROVIDERS.includes(provider) ? provider : AGENT_PROVIDERS[0];
 const agentProviderLabel = (provider) => AGENT_PROVIDERS.includes(provider) ? provider : '';
@@ -1008,14 +1035,14 @@ function effortLevelsFor(provider, model) {
   // task schema. Do not offer a choice that the runtime would silently drop.
   if (advertised) return provider === 'codex' ? advertised.filter((level) => EFFORT_ORDER.includes(level)) : advertised;
   if (provider === 'claude') {
-    if (!/opus-(?:4-(5|6|7|8)|5)|sonnet-5|sonnet-4-6|fable-5|mythos-5/.test(m)) return [];
+    if (!/opus-(?:4-(5|6|7|8)|5)|sonnet-5|sonnet-4-6|fable-5|mythos-5|haiku-5/.test(m)) return [];
     const ok = new Set(['low', 'medium', 'high']);
-    if (/opus-(?:4-(7|8)|5)|sonnet-5|fable-5|mythos-5/.test(m)) ok.add('xhigh');
-    if (/opus-(?:4-(6|7|8)|5)|sonnet-5|sonnet-4-6|fable-5|mythos-5/.test(m)) ok.add('max');
+    if (/opus-(?:4-(7|8)|5)|sonnet-5|fable-5|mythos-5|haiku-5/.test(m)) ok.add('xhigh');
+    if (/opus-(?:4-(6|7|8)|5)|sonnet-5|sonnet-4-6|fable-5|mythos-5|haiku-5/.test(m)) ok.add('max');
     return EFFORT_ORDER.filter((l) => ok.has(l));
   }
   if (provider === 'codex') {
-    if (/^gpt-6(?:-|$)/.test(m)) return EFFORT_ORDER;
+    if (/^gpt-(?:[6-9]|\d{2,})(?:[.-]|$)/.test(m)) return EFFORT_ORDER;
     // gpt-5.x (5.5, 5.4-mini) accept up to xhigh; older reasoning models top out at high.
     if (/^gpt-5/.test(m)) return ['low', 'medium', 'high', 'xhigh'];
     if (/^(o1|o3|o4|codex)/.test(m) || m.includes('reasoning')) return ['low', 'medium', 'high'];
@@ -1023,23 +1050,413 @@ function effortLevelsFor(provider, model) {
   }
   return [];
 }
-// A <select> listing only the levels this model supports; disabled (greyed) when none.
-function effortSelectHtml(cls, provider, model, current) {
-  const levels = effortLevelsFor(provider, model);
-  if (!levels.length) {
-    return `<select class="${esc(cls)}" disabled title="This model has no reasoning-effort control"><option value="">no effort control</option></select>`;
-  }
-  const cur = levels.includes(current) ? current : '';
-  const opts = ['', ...levels].map((e) => `<option value="${e}" ${e === cur ? 'selected' : ''}>${e || 'provider default'}</option>`).join('');
-  return `<select class="${esc(cls)}">${opts}</select>`;
+
+// ── The model field ──────────────────────────────────────────────────────────
+// One field for what an agent runs on: harness, model and reasoning effort,
+// written `harness:model:effort` (claude:claude-opus-5-5:high). It is typed or
+// picked; every part but the harness is optional (claude:high, codex:gpt-6-sol)
+// and the harness follows from a bare model id (gpt-6-sol:high → codex). The
+// stored AgentSpec stays {provider, model, effort}: this is only how it is shown.
+const modelIdOf = (option) => typeof option === 'string' ? option : option.id;
+function inferHarness(model) {
+  const m = (model || '').toLowerCase();
+  if (!m) return '';
+  if (m.includes('/')) return 'opencode';
+  if (/^(?:claude-|opus|sonnet|haiku|fable|mythos|default$)/.test(m)) return 'claude';
+  if (/^(?:gpt-|o\d|codex)/.test(m)) return 'codex';
+  return AGENT_PROVIDERS.find((provider) => modelOptions(provider).some((option) => modelIdOf(option) === model)) || '';
 }
-// Re-render an effort <select> in place after its provider/model changes.
-function refreshEffortSelect(box, providerCls, modelCls, effortCls) {
-  const el = box.querySelector('.' + effortCls);
-  if (!el) return;
-  const provider = box.querySelector('.' + providerCls)?.value;
-  const model = box.querySelector('.' + modelCls)?.value.trim();
-  el.outerHTML = effortSelectHtml(effortCls, provider, model, el.value || '');
+function parseModelRef(text, fallbackProvider) {
+  const parts = String(text || '').trim().split(':').map((part) => part.trim());
+  let provider = '';
+  if (AGENT_PROVIDERS.includes(parts[0].toLowerCase())) provider = parts.shift().toLowerCase();
+  let effort = '';
+  const last = (parts[parts.length - 1] || '').toLowerCase();
+  if (EFFORT_ORDER.includes(last) && (parts.length > 1 || provider)) { effort = last; parts.pop(); }
+  const model = parts.join(':');
+  return { provider: provider || inferHarness(model) || agentProviderChoice(fallbackProvider), model, effort };
+}
+const formatModelRef = (spec) => [spec?.provider, spec?.model, spec?.effort].filter(Boolean).join(':');
+const modelRefKey = (spec) => `${spec.provider}:${spec.model || ''}:${spec.effort || ''}`;
+function modelLabel(provider, model) {
+  if (!model) return 'default model';
+  const option = modelOptions(provider).find((candidate) => modelIdOf(candidate) === model);
+  return (option && typeof option !== 'string' && option.displayName) || model;
+}
+function modelFaceHtml(spec) {
+  if (!spec?.provider) return '';
+  return `<span class="mf-harness" data-harness="${esc(spec.provider)}">${esc(spec.provider)}</span>`
+    + `<span class="mf-name">${esc(modelLabel(spec.provider, spec.model))}</span>`
+    + (spec.effort ? `<span class="mf-effort">${esc(spec.effort)}</span>` : '');
+}
+
+// Models someone picks, most frequent and recent first (per browser, like the
+// @-mention order): each pick's weight halves every two weeks.
+const MODEL_FRECENCY_KEY = 'tavya.models';
+const FRECENCY_HALF_LIFE_MS = 14 * 24 * 60 * 60_000;
+function modelUses() {
+  try { return JSON.parse(localStorage.getItem(MODEL_FRECENCY_KEY) || '{}') || {}; } catch { return {}; }
+}
+function recordModelUse(spec, now = Date.now()) {
+  if (!spec?.provider) return;
+  const uses = modelUses();
+  const key = modelRefKey(spec);
+  uses[key] = [now, ...(uses[key] || [])].slice(0, 10);
+  try { localStorage.setItem(MODEL_FRECENCY_KEY, JSON.stringify(uses)); } catch { /* private mode */ }
+}
+function modelFrecency(now = Date.now()) {
+  const scores = new Map();
+  for (const [key, times] of Object.entries(modelUses())) {
+    if (!Array.isArray(times)) continue;
+    scores.set(key, times.reduce((sum, at) => sum + 0.5 ** (Math.max(0, now - at) / FRECENCY_HALF_LIFE_MS), 0));
+  }
+  return scores;
+}
+// The picker's rows: one per (harness, model), most used first, each with its
+// effort levels and the effort it is usually picked with.
+function modelPickerRows(now = Date.now()) {
+  const scores = modelFrecency(now);
+  const rows = [];
+  for (const provider of AGENT_PROVIDERS) {
+    for (const option of modelOptions(provider)) {
+      const model = modelIdOf(option);
+      if (!model || rows.some((row) => row.provider === provider && row.model === model)) continue;
+      const efforts = effortLevelsFor(provider, model);
+      let score = 0;
+      let usual = '';
+      let usualScore = 0;
+      for (const effort of ['', ...efforts]) {
+        const value = scores.get(`${provider}:${model}:${effort}`) || 0;
+        score += value;
+        if (value > usualScore) { usual = effort; usualScore = value; }
+      }
+      const normalized = normalizeComboOption(option);
+      rows.push({ provider, model, label: normalized.label, description: normalized.description, efforts, usual, score, order: rows.length });
+    }
+  }
+  // A model typed by hand that the catalog does not list is still offered once picked.
+  for (const [key, score] of scores) {
+    const provider = key.slice(0, key.indexOf(':'));
+    const model = key.slice(key.indexOf(':') + 1, key.lastIndexOf(':'));
+    const effort = key.slice(key.lastIndexOf(':') + 1);
+    if (!AGENT_PROVIDERS.includes(provider) || !model) continue;
+    const row = rows.find((candidate) => candidate.provider === provider && candidate.model === model);
+    if (row?.typed) {
+      row.score += score;
+      if (score > row.usualScore) Object.assign(row, { usual: effort, usualScore: score });
+    } else if (!row) {
+      const efforts = effortLevelsFor(provider, model);
+      rows.push({ provider, model, label: model, description: '', efforts, usual: efforts.includes(effort) ? effort : '', usualScore: score, score, order: rows.length, typed: true });
+    }
+  }
+  return rows.sort((a, b) => b.score - a.score || a.order - b.order);
+}
+// Rows matching a typed query: every word is part of the harness, id or name,
+// or names (a prefix of) an effort the model takes, which it then selects.
+function filterModelRows(rows, query) {
+  const words = String(query || '').toLowerCase().split(/[\s:]+/).filter(Boolean);
+  if (!words.length) return rows.map((row) => ({ ...row, effort: row.usual }));
+  return rows.flatMap((row) => {
+    const haystack = `${row.provider} ${row.model} ${row.label}`.toLowerCase();
+    let effort = row.usual;
+    for (const word of words) {
+      if (haystack.includes(word)) continue;
+      const level = row.efforts.find((candidate) => candidate === word) || row.efforts.find((candidate) => candidate.startsWith(word));
+      if (!level) return [];
+      effort = level;
+    }
+    return [{ ...row, effort }];
+  });
+}
+
+const CHART_ICON = '<svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><path d="M2 2v12h12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><circle cx="6" cy="10" r="1.3" fill="currentColor"/><circle cx="9" cy="6.5" r="1.3" fill="currentColor"/><circle cx="12.5" cy="4.5" r="1.3" fill="currentColor"/><circle cx="11" cy="10.5" r="1.3" fill="currentColor"/></svg>';
+function modelFieldHtml(cls, spec, { placeholder = 'harness:model:effort' } = {}) {
+  return `<div class="combo model-field">
+    <input class="${esc(cls)}" value="${esc(formatModelRef(spec))}" aria-label="Model" placeholder="${esc(placeholder)}" autocomplete="off" spellcheck="false" />
+    <div class="mf-face" aria-hidden="true">${spec?.provider ? modelFaceHtml(spec) : ''}</div>
+    ${S.meta?.modelBenchmarks ? `<button type="button" class="mf-chart" title="Compare models by intelligence, cost and time" aria-label="Compare models">${CHART_ICON}</button>` : ''}
+    <button type="button" class="combo-caret" tabindex="-1" aria-label="Show models">▾</button>
+    <div class="combo-menu mf-menu" role="listbox" hidden></div>
+  </div>`;
+}
+const modelFieldInput = (root) => root?.querySelector('.model-field > input');
+function readModelField(root, fallbackProvider) {
+  return parseModelRef(modelFieldInput(root)?.value, fallbackProvider);
+}
+// Set the field without counting it as a pick (an Avatar's runtime, a reset).
+function setModelField(root, spec) {
+  const input = modelFieldInput(root);
+  if (!input) return;
+  input.value = formatModelRef(spec);
+  const face = root.querySelector('.mf-face');
+  if (face) face.innerHTML = spec?.provider ? modelFaceHtml(spec) : '';
+}
+function wireModelField(field, { fallbackProvider } = {}) {
+  const input = field?.querySelector('input');
+  const menu = field?.querySelector('.mf-menu');
+  if (!input || !menu || field._modelFieldWired) return;
+  field._modelFieldWired = true;
+  let rows = [];
+  let active = -1;
+  let typed = false; // the menu shows every model until the user types
+  const current = () => parseModelRef(input.value, fallbackProvider);
+  const draw = () => {
+    const value = current();
+    rows = filterModelRows(modelPickerRows(), typed ? input.value : '').map((row) =>
+      !typed && row.provider === value.provider && row.model === value.model ? { ...row, effort: value.effort, isCurrent: true } : row);
+    menu.innerHTML = rows.length ? rows.map((row, index) => `<div class="combo-opt mf-row${index === active ? ' active' : ''}" role="option" data-index="${index}">
+        <span class="mf-harness" data-harness="${esc(row.provider)}">${esc(row.provider)}</span>
+        <span class="mf-row-name" title="${esc(row.description || row.model)}">${esc(row.label)}${row.label !== row.model ? ` <code>${esc(row.model)}</code>` : ''}</span>
+        <span class="mf-efforts">${row.efforts.length ? ['', ...EFFORT_ORDER].map((effort) => effort && !row.efforts.includes(effort)
+          ? `<span class="mf-effort-chip mf-effort-gap" aria-hidden="true">${esc(effort)}</span>`
+          : `<button type="button" tabindex="-1" class="mf-effort-chip${effort === (row.effort || '') && (effort || row.isCurrent) ? ' on' : ''}" data-effort="${esc(effort)}"${effort ? '' : ' title="Provider default"'}>${esc(effort || 'auto')}</button>`).join('') : ''}</span>
+      </div>`).join('')
+      : '<div class="combo-empty">No matching models — any harness:model:effort works</div>';
+    menu.querySelector('.mf-row.active')?.scrollIntoView({ block: 'nearest' });
+  };
+  const open = () => { draw(); menu.hidden = false; };
+  const close = () => { menu.hidden = true; active = -1; typed = false; };
+  const commit = (spec) => {
+    setModelField(field, spec);
+    recordModelUse(spec);
+    close();
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  };
+  const commitRow = (row, effort = row.effort) => commit({ provider: row.provider, model: row.model, effort: effort || '' });
+  field._pickModel = commit;
+  input.addEventListener('focus', () => { active = -1; typed = false; open(); input.select(); });
+  input.addEventListener('input', () => { typed = true; active = -1; open(); });
+  input.addEventListener('mousedown', () => { if (menu.hidden && document.activeElement === input) { typed = false; open(); } });
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') { if (!menu.hidden) { event.stopPropagation(); close(); } input.blur(); return; }
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      if (menu.hidden) open();
+      if (!rows.length) return;
+      const step = event.key === 'ArrowDown' ? 1 : -1;
+      active = active === -1 ? (step === 1 ? 0 : rows.length - 1) : (active + step + rows.length) % rows.length;
+      draw();
+    } else if ((event.key === 'ArrowLeft' || event.key === 'ArrowRight') && active >= 0 && rows[active]?.efforts.length) {
+      // Within the list, left/right step the highlighted model's effort.
+      event.preventDefault();
+      const row = rows[active];
+      const levels = ['', ...row.efforts];
+      const at = levels.indexOf(row.effort || '');
+      row.effort = levels[Math.max(0, Math.min(levels.length - 1, at + (event.key === 'ArrowRight' ? 1 : -1)))];
+      rows[active] = row;
+      menu.querySelectorAll('.mf-row.active button.mf-effort-chip').forEach((chip) => chip.classList.toggle('on', chip.dataset.effort === (row.effort || '')));
+    } else if (event.key === 'Enter') {
+      event.preventDefault();
+      if (active >= 0 && rows[active]) return commitRow(rows[active]);
+      // A complete harness:model:effort is taken as typed; a partial one picks the best match.
+      const value = current();
+      const known = modelOptions(value.provider).some((option) => modelIdOf(option) === value.model);
+      if (typed && !known && rows.length) return commitRow(rows[0]);
+      commit(value);
+    }
+  });
+  // Menu clicks never take focus (mousedown is cancelled), so a blur is the user leaving.
+  input.addEventListener('blur', (event) => {
+    if (field.contains(event.relatedTarget)) return;
+    const wasTyped = typed;
+    close();
+    if (wasTyped) commit(current());
+    else setModelField(field, current());
+  });
+  menu.addEventListener('mousedown', (event) => {
+    event.preventDefault(); // keep focus in the input
+    const element = event.target.closest('.mf-row');
+    const row = element && rows[Number(element.dataset.index)];
+    if (!row) return;
+    const chip = event.target.closest('.mf-effort-chip');
+    commitRow(row, chip ? chip.dataset.effort : row.effort);
+  });
+  menu.addEventListener('mousemove', (event) => {
+    const element = event.target.closest('.mf-row');
+    if (!element || Number(element.dataset.index) === active) return;
+    menu.querySelector('.mf-row.active')?.classList.remove('active');
+    element.classList.add('active');
+    active = Number(element.dataset.index);
+  });
+  field.querySelector('.combo-caret')?.addEventListener('mousedown', (event) => {
+    event.preventDefault();
+    if (!menu.hidden) close();
+    else { input.focus(); open(); }
+  });
+  field.querySelector('.mf-chart')?.addEventListener('click', () => {
+    close();
+    openModelChart(current(), commit, field.querySelector('.mf-chart'));
+  });
+}
+
+// ── Compare models: intelligence against cost or time ────────────────────────
+// Artificial Analysis benchmarks (bundled with tavya, or fetched daily by the
+// server when it has a key) of the models a harness here can run, one point per
+// harness:model:effort. The line is the Pareto frontier, drawn as Artificial
+// Analysis draws it: straight through every point no cheaper (or faster) point
+// beats. (A convex hull would skip models that are the best buy for some budget.)
+// Picking a point fills the field.
+const MODEL_CHART_METRICS = {
+  cost: { label: 'Cost', axis: '$ per answer', ticks: [0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5], format: (v) => `$${Number(v.toPrecision(2))}` },
+  seconds: { label: 'Time', axis: 'seconds per answer', ticks: [0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000], format: (v) => `${v < 10 ? Math.round(v * 10) / 10 : Math.round(v)} s` },
+};
+function loadModelBenchmarks() {
+  const organizationId = S.organizationId || '';
+  if (S.modelBenchmarks?.organizationId !== organizationId) {
+    const query = organizationId ? `?organizationId=${encodeURIComponent(organizationId)}` : '';
+    const promise = api(`/api/models/benchmarks${query}`);
+    S.modelBenchmarks = { organizationId, promise };
+    promise.catch(() => { if (S.modelBenchmarks?.promise === promise) S.modelBenchmarks = null; });
+  }
+  return S.modelBenchmarks.promise;
+}
+// "Claude Opus 5.5 (High, Default Fallback)" → "Claude Opus 5.5 · high"
+const benchmarkLabel = (model) => `${model.name.replace(/\s*\([^()]*\)\s*$/, '')}${model.ref.effort ? ` · ${model.ref.effort}` : ''}`;
+// Cheapest-or-fastest first, the Pareto-optimal points: each beats every point to its left.
+function paretoFrontier(points, metric) {
+  const sorted = [...points].sort((a, b) => a[metric] - b[metric] || b.intelligence - a.intelligence);
+  const pareto = [];
+  for (const point of sorted) if (!pareto.length || point.intelligence > pareto[pareto.length - 1].intelligence) pareto.push(point);
+  return pareto;
+}
+function modelChartSvg(models, metric, current, hidden) {
+  const spec = MODEL_CHART_METRICS[metric];
+  const W = 680, H = 400, L = 46, R = 18, T = 16, B = 34;
+  const points = models.filter((model) => model[metric] && !hidden.has(model.ref.provider));
+  if (!points.length) return { svg: `<div class="mc-empty">No ${spec.label.toLowerCase()} data for these models</div>`, points };
+  const xs = points.map((point) => point[metric]);
+  const ys = points.map((point) => point.intelligence);
+  const x0 = Math.log10(Math.min(...xs) / 1.25), x1 = Math.log10(Math.max(...xs) * 1.25);
+  const y0 = Math.floor((Math.min(...ys) - 2) / 10) * 10, y1 = Math.ceil((Math.max(...ys) + 2) / 10) * 10;
+  const x = (v) => L + ((Math.log10(v) - x0) / (x1 - x0 || 1)) * (W - L - R);
+  const y = (v) => T + (1 - (v - y0) / (y1 - y0 || 1)) * (H - T - B);
+  const grid = [];
+  for (let v = y0; v <= y1; v += 10) grid.push(`<line class="mc-grid" x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}"/><text class="mc-tick" x="${L - 8}" y="${y(v) + 4}" text-anchor="end">${v}</text>`);
+  for (const v of spec.ticks.filter((tick) => Math.log10(tick) >= x0 && Math.log10(tick) <= x1)) {
+    grid.push(`<line class="mc-grid" x1="${x(v)}" x2="${x(v)}" y1="${T}" y2="${H - B}"/><text class="mc-tick" x="${x(v)}" y="${H - B + 16}" text-anchor="middle">${esc(spec.format(v))}</text>`);
+  }
+  // Each model's effort levels, joined: how much intelligence more effort buys.
+  const ladders = new Map();
+  for (const point of points) {
+    const key = `${point.ref.provider}:${point.ref.model}`;
+    ladders.set(key, [...(ladders.get(key) || []), point]);
+  }
+  const ladderPaths = [...ladders.values()].filter((ladder) => ladder.length > 1).map((ladder) => {
+    const ordered = ladder.sort((a, b) => EFFORT_ORDER.indexOf(a.ref.effort) - EFFORT_ORDER.indexOf(b.ref.effort));
+    return `<polyline class="mc-ladder" data-harness="${esc(ordered[0].ref.provider)}" points="${ordered.map((point) => `${x(point[metric]).toFixed(1)},${y(point.intelligence).toFixed(1)}`).join(' ')}"/>`;
+  });
+  const frontier = paretoFrontier(points, metric);
+  const line = frontier.map((point, index) => `${index ? 'L' : 'M'}${x(point[metric]).toFixed(1)},${y(point.intelligence).toFixed(1)}`).join('');
+  const onFrontier = new Set(frontier);
+  const isCurrent = (point) => current && point.ref.provider === current.provider && point.ref.model === current.model && (point.ref.effort || '') === (current.effort || '');
+  const dots = [...points].sort((a, b) => Number(onFrontier.has(a)) - Number(onFrontier.has(b))).map((point) => {
+    const index = models.indexOf(point);
+    return `<g class="mc-point${isCurrent(point) ? ' current' : ''}" data-index="${index}" tabindex="0" role="button" aria-label="${esc(`${benchmarkLabel(point)}, intelligence ${point.intelligence}, ${spec.format(point[metric])}`)}">
+      <circle class="mc-hit" cx="${x(point[metric])}" cy="${y(point.intelligence)}" r="11"/>
+      ${isCurrent(point) ? `<circle class="mc-current" cx="${x(point[metric])}" cy="${y(point.intelligence)}" r="9"/>` : ''}
+      <circle class="mc-dot" data-harness="${esc(point.ref.provider)}" cx="${x(point[metric])}" cy="${y(point.intelligence)}" r="5"/></g>`;
+  });
+  // Name only the frontier, skipping any label that would cover another label or a point.
+  const overlaps = (a, b) => a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+  const dotBoxes = points.map((point) => ({ point, x: x(point[metric]) - 5, y: y(point.intelligence) - 5, w: 10, h: 10 }));
+  const placed = [];
+  const labels = frontier.flatMap((point) => {
+    const text = benchmarkLabel(point);
+    const width = text.length * 5.6;
+    // Above and to the left, clear of the frontier, which runs below-left to above-right.
+    const px = x(point[metric]), py = y(point.intelligence);
+    const left = px - 8 - width >= L;
+    const box = { x: left ? px - 8 - width : px + 8, y: py - 17, w: width, h: 12 };
+    if (placed.some((other) => overlaps(box, other)) || dotBoxes.some((dot) => dot.point !== point && overlaps(box, dot))) return [];
+    placed.push(box);
+    return [`<text class="mc-label" x="${left ? px - 8 : px + 8}" y="${py - 8}" text-anchor="${left ? 'end' : 'start'}">${esc(text)}</text>`];
+  });
+  return { points, svg: `<svg class="mc-svg" viewBox="0 0 ${W} ${H}" role="img" aria-label="Intelligence against ${esc(spec.label.toLowerCase())}">
+    ${grid.join('')}
+    <text class="mc-axis" x="${L}" y="${T - 4}" >Intelligence</text>
+    <text class="mc-axis" x="${W - R}" y="${H - 4}" text-anchor="end">${esc(spec.label)} · ${esc(spec.axis)} →</text>
+    ${ladderPaths.join('')}
+    <path class="mc-frontier" d="${line}"/>
+    ${dots.join('')}
+    ${labels.join('')}
+  </svg>` };
+}
+function openModelChart(current, onPick, opener) {
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  let metric = localStorage.getItem('tavya.modelChart') === 'seconds' ? 'seconds' : 'cost';
+  const hidden = new Set();
+  let data = null;
+  overlay.innerHTML = `<div class="modal-card model-chart" role="dialog" aria-modal="true" aria-labelledby="mc-title">
+    <div class="mc-head">
+      <div class="section-h" id="mc-title">Compare models</div>
+      <div class="mc-metric" role="group" aria-label="Horizontal axis">${Object.entries(MODEL_CHART_METRICS).map(([key, value]) => `<button type="button" data-metric="${key}">${value.label}</button>`).join('')}</div>
+      <button type="button" class="icon-btn mc-close" aria-label="Close">✕</button>
+    </div>
+    <div class="mc-plot"><div class="mc-empty">Loading…</div></div>
+    <div class="mc-foot">
+      <div class="mc-legend"></div>
+      <span class="mc-source">${policyTip('Intelligence is the Artificial Analysis Intelligence Index. Cost and time are for a 500-token answer to a short prompt, thinking included, as Artificial Analysis measures them. Thin lines join one model\'s effort levels; the dark line is the most intelligence you can get for the cost or time.')} Data: <a href="https://artificialanalysis.ai/" target="_blank" rel="noopener">Artificial Analysis</a></span>
+    </div>
+  </div>`;
+  document.body.appendChild(overlay);
+  const close = () => { overlay.remove(); opener?.focus?.(); };
+  const plot = overlay.querySelector('.mc-plot');
+  const tip = document.createElement('div');
+  tip.className = 'mc-tip';
+  tip.hidden = true;
+  const showTip = (group) => {
+    const model = data?.models[Number(group.dataset.index)];
+    if (!model) return;
+    const ref = formatModelRef(model.ref);
+    tip.innerHTML = `<b>${esc(benchmarkLabel(model))}</b><code>${esc(ref)}</code>
+      <span>Intelligence ${esc(String(model.intelligence))}${model.cost ? ` · ${esc(MODEL_CHART_METRICS.cost.format(model.cost))} per answer` : ''}${model.seconds ? ` · ${esc(MODEL_CHART_METRICS.seconds.format(model.seconds))}` : ''}</span>`;
+    tip.hidden = false;
+    const dot = group.querySelector('.mc-dot').getBoundingClientRect();
+    const box = plot.getBoundingClientRect();
+    const left = Math.min(dot.left - box.left + 12, box.width - tip.offsetWidth - 4);
+    tip.style.left = `${Math.max(4, left)}px`;
+    tip.style.top = `${Math.max(4, dot.top - box.top - tip.offsetHeight - 6)}px`;
+  };
+  const draw = () => {
+    overlay.querySelectorAll('[data-metric]').forEach((button) => button.setAttribute('aria-pressed', String(button.dataset.metric === metric)));
+    if (!data) return;
+    const { svg, points } = modelChartSvg(data.models, metric, current, hidden);
+    plot.innerHTML = svg;
+    plot.appendChild(tip);
+    tip.hidden = true;
+    const harnesses = AGENT_PROVIDERS.filter((provider) => data.models.some((model) => model.ref.provider === provider));
+    const missing = data.models.filter((model) => !hidden.has(model.ref.provider) && !model[metric]).length;
+    overlay.querySelector('.mc-legend').innerHTML = harnesses.map((provider) => `<button type="button" class="mc-key" data-harness="${esc(provider)}" aria-pressed="${!hidden.has(provider)}"><i></i>${esc(provider)}</button>`).join('')
+      + '<span class="mc-key-frontier"><i></i>Pareto frontier</span>'
+      + (missing && points.length ? `<span class="mc-missing" title="Artificial Analysis has not measured these yet">${missing} without ${MODEL_CHART_METRICS[metric].label.toLowerCase()} data</span>` : '');
+  };
+  overlay.addEventListener('click', (event) => {
+    if (event.target === overlay || event.target.closest('.mc-close')) return close();
+    const metricButton = event.target.closest('[data-metric]');
+    if (metricButton) { metric = metricButton.dataset.metric; try { localStorage.setItem('tavya.modelChart', metric); } catch {} return draw(); }
+    const key = event.target.closest('.mc-key');
+    if (key) { hidden.has(key.dataset.harness) ? hidden.delete(key.dataset.harness) : hidden.add(key.dataset.harness); return draw(); }
+    const point = event.target.closest('.mc-point');
+    if (point && data) { const model = data.models[Number(point.dataset.index)]; close(); onPick({ provider: model.ref.provider, model: model.ref.model, effort: model.ref.effort || '' }); }
+  });
+  overlay.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); close(); }
+    else if ((event.key === 'Enter' || event.key === ' ') && event.target.closest?.('.mc-point')) { event.preventDefault(); event.target.closest('.mc-point').dispatchEvent(new MouseEvent('click', { bubbles: true })); }
+  });
+  plot.addEventListener('mouseover', (event) => { const point = event.target.closest('.mc-point'); if (point) showTip(point); });
+  plot.addEventListener('mouseout', (event) => { if (event.target.closest('.mc-point') && !event.relatedTarget?.closest?.('.mc-point')) tip.hidden = true; });
+  plot.addEventListener('focusin', (event) => { const point = event.target.closest('.mc-point'); if (point) showTip(point); });
+  draw();
+  overlay.querySelector(`[data-metric="${metric}"]`).focus();
+  loadModelBenchmarks().then((loaded) => {
+    if (!overlay.isConnected) return;
+    data = loaded;
+    if (!data.models?.length) { plot.innerHTML = '<div class="mc-empty">No benchmarked models to compare</div>'; return; }
+    draw();
+  }).catch((error) => {
+    if (overlay.isConnected) plot.innerHTML = `<div class="mc-empty">${esc(error.message || 'Model benchmarks are unavailable right now')}</div>`;
+  });
 }
 
 // Whether the browser and the karmax host are the same computer. Host-machine
@@ -1097,6 +1514,16 @@ function computerBlockHtml(name, value, inherited, opts = {}) {
     </div></details>`;
   return `<div class="computer-field computer-block" data-computer="${esc(name)}" ${inhAttr(inh)}>
     ${opts.frozen ? `<fieldset class="ab-frozen" disabled>${body}</fieldset>` : body}</div>`;
+}
+// A size the task asks for but its running computer has not reached: it moves
+// when the task pauses with nothing running (wiki features/computers).
+function computerPendingChip(change) {
+  if (!change) return '';
+  const tip = `Still ${describeMachineShape(change.from)}. Moves to ${describeMachineShape(change.to)} when the task next pauses with nothing running.`;
+  return `<button type="button" class="chip computer-pending" title="${esc(tip)}" aria-label="${esc(tip)}">Moves at next pause</button>`;
+}
+function describeMachineShape(shape) {
+  return [`${shape.cpu ?? 2} CPU`, `${gbOf(shape.memoryMb ?? 2048)} GB`, ...(shape.diskGb != null ? [`${shape.diskGb} GB disk`] : [])].join(' · ');
 }
 function readComputerBlock(box) {
   const value = (selector) => box.querySelector(selector)?.value.trim() ?? '';
@@ -1224,16 +1651,20 @@ function renderField(f, own, inherited, withChips, alt, agentOpts) {
 
 function renderFields(fields, own = {}, inherited = {}, withPromptChips = false, altFor) {
   // Base and target share one row (rendered at the first of them present, in
-  // this order); the rest are skipped where they'd fall.
+  // this order), with the per-repository switch under it; the rest are skipped
+  // where they'd fall.
   const inlineRow = ['base', 'target'].map((n) => fields.find((x) => x.name === n)).filter(Boolean);
   const inlineNames = new Set(inlineRow.map((f) => f.name));
+  const perRepo = fields.find((f) => f.type === 'repoBranches');
   let inlineDrawn = false;
   const html = [];
   for (const f of fields) {
+    if (f === perRepo) continue;
     if (inlineNames.has(f.name) && inlineRow.length > 1) {
       if (!inlineDrawn) {
         inlineDrawn = true;
-        html.push(`<div class="branch-pair">${inlineRow.map((g) => renderField(g, own[g.name], inherited[g.name], false, altFor?.(g))).join('')}</div>`);
+        const pair = `<div class="branch-pair">${inlineRow.map((g) => renderField(g, own[g.name], inherited[g.name], false, altFor?.(g))).join('')}</div>`;
+        html.push(perRepo ? repoBranchesHtml(perRepo, own[perRepo.name], inherited[perRepo.name], inherited._repositoryBranches, pair, inlineRow) : pair);
       }
       continue;
     }
@@ -1241,6 +1672,98 @@ function renderFields(fields, own = {}, inherited = {}, withPromptChips = false,
   }
   return html.join('');
 }
+
+// A repository as a short label: owner/name on GitHub, else its last path segment.
+function repositoryShortName(source) {
+  const view = repositorySourceView(source);
+  return view.kind === 'github' ? `${view.owner}/${view.name}` : source.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || source;
+}
+
+// ── Different branches per repo ──────────────────────────────────────────────
+// Under the common Base/Target pair of a multi-repository project, a switch
+// swaps the pair for one Base/Target row per repository. `repos` lists each
+// repository with the branches it starts from (`_repositoryBranches` in the
+// resolved defaults: its own default branch unless a default names one). The
+// stored value maps each repository to its branches; `{}` turns an inherited
+// list off.
+function repoBranchesHtml(f, own, inherited, repos, pair, pairFields) {
+  if (!Array.isArray(repos) || repos.length < 2) return pair;
+  const value = own ?? inherited ?? {};
+  const on = Object.keys(value).length > 0;
+  const rows = repos.map(({ source, base, target }) => {
+    const entry = value[source];
+    const name = repositoryShortName(source);
+    const input = (kind, suggested) => `<input class="rb-${kind}" value="${esc(entry?.[kind] ?? suggested ?? '')}" data-suggest="${esc(suggested ?? '')}"
+      ${entry ? 'data-edited="1"' : ''} aria-label="${kind === 'base' ? 'Base' : 'Target'} branch in ${esc(name)}" autocomplete="off" spellcheck="false">`;
+    return `<div class="rb-row" data-source="${esc(source)}"><span class="rb-repo" title="${esc(source)}">${esc(name)}</span>${input('base', base)}${input('target', target)}</div>`;
+  }).join('');
+  return `<div class="branch-block repo-branches-field" data-repo-branches="${esc(f.name)}" ${inhAttr(inherited ?? {})}>
+    <div class="branch-pair-slot" ${on ? 'hidden' : ''}>${pair}</div>
+    <div class="rb-list" ${on ? '' : 'hidden'}>
+      <div class="rb-row rb-head"><span></span>${pairFields.map((g) => `<label>${esc(g.label)}</label>`).join('')}</div>
+      ${rows}
+    </div>
+    <div class="rb-toggle-row"><label class="switch"><input type="checkbox" class="rb-toggle" ${on ? 'checked' : ''}> ${esc(f.label)}?</label>${f.help ? policyTip(f.help) : ''}<span class="label-row-fill"></span>${resetBtn(f.name)}</div>
+  </div>`;
+}
+// The per-repository branches a block holds: `{}` while it is off.
+function readRepoBranches(box) {
+  if (!box.querySelector('.rb-toggle')?.checked) return {};
+  return Object.fromEntries([...box.querySelectorAll('.rb-row[data-source]')].map((row) => {
+    const base = row.querySelector('.rb-base').value.trim();
+    const target = row.querySelector('.rb-target').value.trim();
+    return [row.dataset.source, { ...(base ? { base } : {}), ...(target ? { target } : {}) }];
+  }).filter(([, entry]) => Object.keys(entry).length));
+}
+// A stored map as this block compares it: only its own repositories, in order.
+function normRepoBranches(box, value) {
+  const map = value && typeof value === 'object' ? value : {};
+  return Object.fromEntries([...box.querySelectorAll('.rb-row[data-source]')].flatMap((row) => {
+    const entry = map[row.dataset.source];
+    const base = entry?.base?.trim?.(), target = entry?.target?.trim?.();
+    return base || target ? [[row.dataset.source, { ...(base ? { base } : {}), ...(target ? { target } : {}) }]] : [];
+  }));
+}
+function syncRepoBranches(box) {
+  const on = box.querySelector('.rb-toggle').checked;
+  box.querySelector('.branch-pair-slot').hidden = on;
+  box.querySelector('.rb-list').hidden = !on;
+}
+// Turning the list on starts each untouched row from the common pair when it
+// was changed here, else from that repository's own branches.
+function fillRepoBranches(box) {
+  for (const kind of ['base', 'target']) {
+    const common = box.querySelector(`.branch-pair-slot [data-field="${kind}"]`);
+    const changed = common && common.value.trim() && !sameJson(common.value.trim(), JSON.parse(common.dataset.inherit || 'null'));
+    box.querySelectorAll(`.rb-row .rb-${kind}:not([data-edited])`).forEach((input) => {
+      input.value = changed ? common.value.trim() : input.dataset.suggest;
+    });
+  }
+}
+function resetRepoBranches(box, attr = 'data-inherit') {
+  const inherited = normRepoBranches(box, JSON.parse(box.getAttribute(attr) || 'null'));
+  box.querySelector('.rb-toggle').checked = Object.keys(inherited).length > 0;
+  box.querySelectorAll('.rb-row[data-source]').forEach((row) => {
+    const entry = inherited[row.dataset.source];
+    for (const kind of ['base', 'target']) {
+      const input = row.querySelector(`.rb-${kind}`);
+      input.value = entry?.[kind] ?? input.dataset.suggest;
+      if (entry) input.dataset.edited = '1'; else delete input.dataset.edited;
+    }
+  });
+  syncRepoBranches(box);
+  box.dispatchEvent(new Event('change', { bubbles: true }));
+}
+document.addEventListener('change', (event) => {
+  const toggle = event.target?.closest?.('.rb-toggle');
+  const box = toggle?.closest('.repo-branches-field');
+  if (!box) return;
+  if (toggle.checked) fillRepoBranches(box);
+  syncRepoBranches(box);
+});
+document.addEventListener('input', (event) => {
+  if (event.target?.matches?.('.rb-row input')) event.target.dataset.edited = '1';
+});
 
 function renderAgentField(f, spec, inherited, opts) {
   return agentBlockHtml(opts?.prefix, spec, { role: f.role || f.name, inherited, ...opts });
@@ -1303,13 +1826,7 @@ function agentBlockHtml(prefix, spec, opts) {
     </select>` : ''}
     <div class="af-avatar-note" ${selectedAvatar ? '' : 'hidden'}>${selectedAvatar ? `${esc(selectedAvatar.purpose || 'Owner-controlled prompt and delegated authority')} · owned by ${esc(avatarOwnerName(selectedAvatar))}` : ''}</div>
     <div class="agent-controls" ${selectedAvatar ? 'hidden' : ''}>
-      <select class="af-provider" aria-label="Agent harness">${AGENT_PROVIDERS.map((p) => `<option ${p === provider ? 'selected' : ''}>${p}</option>`).join('')}</select>
-      <div class="combo af-model-combo" style="flex:1;min-width:140px">
-        <input class="af-model" placeholder="model" aria-label="Model" value="${esc(model || '')}" autocomplete="off" />
-        <button type="button" class="combo-caret" tabindex="-1" aria-label="Show model choices">▾</button>
-        <div class="combo-menu" hidden></div>
-      </div>
-      ${effortSelectHtml('af-effort', provider, model, effort || '')}
+      ${modelFieldHtml('af-ref', { provider, model, effort })}
       ${opts.extraControls || ''}
     </div>
     ${mcpPickerHtml(spec?.mcpConnections, inh.mcpConnections)}
@@ -1658,10 +2175,11 @@ function readResume(box) {
 function readAgentSpec(box) {
   const avatarId = box.querySelector('.af-avatar')?.value || '';
   const avatar = (S.avatars || []).find((candidate) => candidate.id === avatarId);
-  const spec = { provider: avatar?.runtime?.provider || box.querySelector('.af-provider').value };
+  const chosen = readModelField(box.querySelector('.agent-controls'));
+  const spec = { provider: avatar?.runtime?.provider || chosen.provider };
   if (avatarId) spec.avatarId = avatarId;
-  const model = avatar?.runtime?.model || box.querySelector('.af-model').value.trim();
-  const effort = avatar?.runtime?.effort || box.querySelector('.af-effort').value;
+  const model = avatar?.runtime?.model || chosen.model;
+  const effort = avatar?.runtime?.effort || chosen.effort;
   if (model) spec.model = model;
   if (effort) spec.effort = effort;
   const mcpConnections = readMcpPicker(box);
@@ -1850,6 +2368,14 @@ function collectForm(root, fields) {
       const inh = JSON.parse(box.getAttribute('data-inherit') || 'null');
       const route = readResponder(box);
       if (f.required || !sameJson(normResponder(route), normResponder(responderOf(inh)))) out[f.name] = route;
+      continue;
+    }
+    if (f.type === 'repoBranches') {
+      const box = root.querySelector(`.repo-branches-field[data-repo-branches="${CSS.escape(f.name)}"]`);
+      if (!box) continue;
+      // The whole list is one value; `{}` turns an inherited list off.
+      const value = readRepoBranches(box);
+      if (!sameJson(value, normRepoBranches(box, JSON.parse(box.getAttribute('data-inherit') || 'null')))) out[f.name] = value;
       continue;
     }
     const el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
@@ -2208,12 +2734,20 @@ function authorizationShortSummary(value, projects) {
  * can grant the complete package, and are re-checked when the request is made
  * and when it is approved. Resolves to { action: 'ask', audience, reason } |
  * { action: 'limit' } | null. */
-async function chooseAuthorizationGrant(projectId, authorization, targetLabel = 'agent') {
+async function chooseAuthorizationGrant(projectId, authorization, targetLabel = 'agent', credentialGrants = []) {
   const targets = await api(`/api/authorization/escalation-targets?projectId=${encodeURIComponent(projectId)}`, {
-    method: 'POST', body: JSON.stringify({ projectId, authorization }),
+    method: 'POST', body: JSON.stringify({ projectId, authorization, ...(credentialGrants.length ? { credentialGrants } : {}) }),
   });
-  const summary = authorizationShortSummary(authorization,
+  // Missing vault credentials are named, not shown as capabilities; when they
+  // are all that is missing, the dialog is about them alone.
+  const credentials = targets.credentials || [];
+  const credentialLabel = new Map(credentials.map((credential) => [credential.capability, credential.label]));
+  const levelMissing = targets.missingCapabilities.filter((capability) => !credentialLabel.has(capability));
+  const credentialSummary = credentials.length === 1 ? credentials[0].label : `${credentials.length} credentials`;
+  const levelSummary = authorizationShortSummary(authorization,
     S.projects.filter((project) => project.organizationId === projectById(projectId)?.organizationId));
+  const summary = !credentials.length ? levelSummary
+    : levelMissing.length ? `${levelSummary} with ${credentialSummary}` : credentialSummary;
   const count = (ids) => `${ids.length} ${ids.length === 1 ? 'person' : 'people'}`;
   const summoned = targets.special.find((item) => item.selector === targets.summon);
   const recipients = [
@@ -2227,7 +2761,7 @@ async function chooseAuthorizationGrant(projectId, authorization, targetLabel = 
   const decision = await summonDialog({
     title: `You can't grant ${summary}`,
     tip: `Only someone who holds this authorization can grant it. Alert asks them to approve — the ${targetLabel} waits until one does. Use my authorization goes ahead with only what you have.`,
-    missing: targets.missingCapabilities,
+    missing: targets.missingCapabilities.map((capability) => credentialLabel.get(capability) || capability),
     summon: summoned ? { label: `Alert ${summoned.selector}`, audience: [summoned.selector],
       tip: `Ask the ${count(summoned.eligibleUserIds)} in ${SUMMON_GROUP_LABELS[summoned.selector] || summoned.selector} who can grant it` } : null,
     recipients,
@@ -2246,12 +2780,14 @@ async function saveTaskAuthorization(taskId, projectId, values) {
     return await api(`/api/tasks/${taskId}/authorization`, { method: 'PATCH', body: JSON.stringify(values) });
   } catch (error) {
     if (!isAuthorizationGrantGap(error)) throw error;
-    const decision = await chooseAuthorizationGrant(projectId, values.authorization, 'agent');
+    const credentialGrants = error.credentialGrants || [];
+    const decision = await chooseAuthorizationGrant(projectId, values.authorization, 'agent', credentialGrants);
     if (decision?.action === 'limit')
       return api(`/api/tasks/${taskId}/authorization`, { method: 'PATCH', body: JSON.stringify({ ...values, acceptAttenuation: true }) });
     if (decision?.action === 'ask') {
       await api(`/api/authorization-requests?projectId=${encodeURIComponent(projectId)}`, { method: 'POST', body: JSON.stringify({
-        projectId, target: { kind: 'task', taskId }, authorization: values.authorization, audience: decision.audience, reason: decision.reason,
+        projectId, target: { kind: 'task', taskId }, authorization: values.authorization,
+        ...(credentialGrants.length ? { credentialGrants } : {}), audience: decision.audience, reason: decision.reason,
       }) });
       toast('Authorization request sent');
     }
@@ -2497,20 +3033,14 @@ function wireCombo(combo, getOptions, onChange, { multiple = false } = {}) {
   });
 }
 
-// Wire one agent box's controls: provider→model combobox + one fork source.
+// Wire one agent box's controls: the model field + one fork source.
 function wireAgentBox(box) {
   wireMcpPicker(box.querySelector('.mcp-picker'), box.closest?.('[data-mcp-scope]')?.dataset.mcpScope);
-  const combo = box.querySelector('.af-model-combo');
-  const providerOf = () => box.querySelector('.af-provider')?.value || 'claude';
-  if (combo) wireCombo(combo, () => modelOptions(providerOf()), () => refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort'));
-  box.querySelector('.af-provider')?.addEventListener('change', () => {
-    box.querySelector('.af-model').value = ''; // model choices are provider-specific
-    refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort');
-  });
+  const controls = box.querySelector('.agent-controls');
+  wireModelField(controls?.querySelector('.model-field'));
   const avatarSelect = box.querySelector('.af-avatar');
   const syncAvatar = () => {
     const avatar = (S.avatars || []).find((candidate) => candidate.id === avatarSelect?.value);
-    const controls = box.querySelector('.agent-controls');
     const note = box.querySelector('.af-avatar-note');
     if (controls) controls.hidden = !!avatar;
     // An Avatar acts with the authority its owner delegated to it.
@@ -2520,13 +3050,7 @@ function wireAgentBox(box) {
       note.hidden = !avatar;
       note.textContent = avatar ? `${avatar.purpose || 'Owner-controlled prompt and delegated authority'} · owned by ${avatarOwnerName(avatar)}` : '';
     }
-    if (avatar) {
-      box.querySelector('.af-provider').value = avatar.runtime.provider;
-      box.querySelector('.af-model').value = avatar.runtime.model || '';
-      refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort');
-      const effort = box.querySelector('.af-effort');
-      if (effort && avatar.runtime.effort && [...effort.options].some((option) => option.value === avatar.runtime.effort)) effort.value = avatar.runtime.effort;
-    }
+    if (avatar) setModelField(controls, avatar.runtime);
   };
   avatarSelect?.addEventListener('change', () => {
     syncAvatar();
@@ -2570,18 +3094,10 @@ function wireAgentBox(box) {
   // only until the source is withdrawn or the user customizes these controls.
   let modelStash = null;
   let modelRequest = 0;
-  const modelSelection = () => ({
-    avatarId: avatarSelect?.value || '',
-    provider: providerOf(),
-    model: box.querySelector('.af-model').value,
-    effort: box.querySelector('.af-effort').value,
-  });
+  const modelSelection = () => ({ avatarId: avatarSelect?.value || '', ...readModelField(controls) });
   const applyModelSelection = (spec) => {
     if (avatarSelect) avatarSelect.value = spec.avatarId || '';
-    box.querySelector('.af-provider').value = spec.provider;
-    box.querySelector('.af-model').value = spec.model || '';
-    refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort');
-    box.querySelector('.af-effort').value = spec.effort || '';
+    setModelField(controls, { provider: spec.provider, model: spec.model || '', effort: spec.effort || '' });
     syncAvatar();
   };
   const withdrawModel = () => {
@@ -2607,7 +3123,7 @@ function wireAgentBox(box) {
     }
   };
   const releaseModel = (event) => {
-    if (!event.target.matches('.af-provider, .af-model, .af-effort, .af-avatar')) return;
+    if (!event.target.matches('.af-ref, .af-avatar')) return;
     modelRequest++;
     modelStash = null;
     const option = chosen?.querySelector('.af-resume-reuse-model');
@@ -2808,6 +3324,7 @@ function wireFieldResets(root, fields) {
     else if (f.type === 'computer') box = root.querySelector(`.computer-field[data-computer="${CSS.escape(f.name)}"]`);
     else if (f.type === 'confirmer') box = root.querySelector(`.confirmer-field[data-confirmer="${CSS.escape(f.role || f.name)}"]`);
     else if (f.type === 'responder') box = root.querySelector(`.responder-field[data-responder="${CSS.escape(f.role || f.name)}"]`);
+    else if (f.type === 'repoBranches') box = root.querySelector(`.repo-branches-field[data-repo-branches="${CSS.escape(f.name)}"]`);
     else el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
     const target = box || el;
     if (!target) continue;
@@ -2822,6 +3339,7 @@ function wireFieldResets(root, fields) {
         else if (f.type === 'computer') resetComputerBlock(box, attr);
         else if (f.type === 'confirmer') resetConfirmerField(box, attr);
         else if (f.type === 'responder') resetResponderField(box, attr);
+        else if (f.type === 'repoBranches') resetRepoBranches(box, attr);
         else resetPlainField(el, f, attr);
         sync();
       });
@@ -2856,6 +3374,10 @@ function fieldDiffers(root, f, attr = 'data-inherit') {
     const inh = JSON.parse(box.getAttribute(attr) || 'null');
     return !sameJson(normResponder(readResponder(box)), normResponder(responderOf(inh)));
   }
+  if (f.type === 'repoBranches') {
+    const box = root.querySelector(`.repo-branches-field[data-repo-branches="${CSS.escape(f.name)}"]`);
+    return !!box && !sameJson(readRepoBranches(box), normRepoBranches(box, JSON.parse(box.getAttribute(attr) || 'null')));
+  }
   const el = root.querySelector(`[data-field="${CSS.escape(f.name)}"]`);
   if (!el) return false;
   const inh = JSON.parse(el.getAttribute(attr) || 'null');
@@ -2881,12 +3403,7 @@ function resetAgentField(box, attr = 'data-inherit') {
   const inh = JSON.parse(box.getAttribute(attr) || 'null') || {};
   const avatar = box.querySelector('.af-avatar');
   if (avatar) avatar.value = inh.avatarId || '';
-  const prov = box.querySelector('.af-provider');
-  prov.value = inh.provider || 'claude';
-  box.querySelector('.af-model').value = inh.model || '';
-  refreshEffortSelect(box, 'af-provider', 'af-model', 'af-effort');
-  const eff = box.querySelector('.af-effort');
-  if (eff && inh.effort) eff.value = inh.effort;
+  setModelField(box.querySelector('.agent-controls'), { provider: agentProviderChoice(inh.provider), model: inh.model || '', effort: inh.effort || '' });
   const picker = box.querySelector('.mcp-picker');
   if (picker) {
     picker.dataset.value = 'null';
@@ -3392,7 +3909,9 @@ async function boot() {
   // personal workspace and consumes the one-time git-onboarding flag. The
   // emailed password-reset link lands signed out, so it is one of them.
   const legalSlug = location.pathname.match(/^\/legal\/([^/]+)$/)?.[1];
+  const docSlug = location.pathname.match(/^\/docs(?:\/([^/]+))?\/?$/);
   const publicPage = legalSlug ? () => renderLegalPage(legalSlug)
+    : docSlug ? () => renderDocsPage(docSlug[1])
     : { '/legal': renderLegalIndex, '/pricing': renderPricing,
       '/reset-password': () => renderResetPassword(new URLSearchParams(location.search).get('token') || '') }[location.pathname];
   // Independent first reads go together; each used to wait for the one before (RQ-9).
@@ -3531,6 +4050,7 @@ function installShellListeners() {
   if (installShellListeners.installed) return;
   installShellListeners.installed = true;
   bindKeys();
+  document.addEventListener('click', echoClickedShortcut, true);
   installLinkRouter();
   installTagRouter();
   installInfoDotTips();
@@ -4527,24 +5047,35 @@ function renderShell() {
   app.innerHTML = `
     <div class="topbar">
       <button class="icon-btn mobile-menu" id="mobile-menu" aria-controls="rail" aria-label="Sidebar" aria-expanded="true">☰</button>
-      <a class="brand" id="brand-home" data-spa href="${esc(homeRoute())}" title="Home" aria-label="Home">${brandMark()} ${siteNameMarkup()}</a>
-      ${organizationComboHtml('org-switcher', S.organizationId, 'Organization')}
+      <a class="brand" id="brand-home" data-spa data-shortcut="nav.home" href="${esc(homeRoute())}" title="Home" aria-label="Home">${brandMark()} ${siteNameMarkup()}</a>
       <div class="spacer"></div>
       <span class="ws-offline hidden" id="ws-offline" role="status">Reconnecting — live updates paused</span>
-      <button class="icon-btn" id="topbar-palette" title="Command palette (${esc(fmtKeys('meta+k'))})" aria-haspopup="dialog">⌘</button>
-      <button class="icon-btn" id="topbar-help" title="${esc(commandHint('Keyboard shortcuts', 'help.keyboard'))}" aria-haspopup="dialog">?</button>
-      <a class="topbar-user" id="topbar-user" data-spa href="${profileRoute()}" title="Your profile">${esc(userDisplayName())}</a>
-      <a class="icon-btn has-badge" id="bell" data-spa href="${esc(inboxRoute(DEFAULT_LIST_QUERY))}" title="What needs you, in every organization" role="button" aria-label="Inbox">🔔<span class="badge hidden" id="bell-badge">0</span></a>
+      <kbd class="key-echo" id="key-echo" aria-hidden="true"></kbd>
+      <a class="topbar-user" id="topbar-user" data-spa data-shortcut="nav.profile" href="${profileRoute()}" title="Your profile">${esc(userDisplayName())}</a>
+      <a class="icon-btn has-badge" id="bell" data-shortcut="nav.notifications" data-spa href="${esc(inboxRoute(DEFAULT_LIST_QUERY))}" title="What needs you, in every organization" role="button" aria-label="Inbox">🔔<span class="badge hidden" id="bell-badge">0</span></a>
     </div>
     ${verificationBanner()}
     <div class="body">
-      <div class="rail" id="rail"></div>
+      <div class="rail" id="rail">
+        <div class="rail-top">
+          ${organizationComboHtml('org-switcher', S.organizationId, 'Organization')}
+          <nav class="rail-icons rail-org-nav" aria-label="Organization">${RAIL_ORG_NAV.map(([id, label, icon, , , , command]) =>
+            `<a class="rail-icon" id="${id}" data-spa data-shortcut="${command}" href="#" aria-label="${label}">${ICON[icon]}</a>`).join('')}</nav>
+        </div>
+        <div class="rail-list" id="rail-list"></div>
+        <div class="rail-icons rail-foot">
+          <a class="rail-icon" id="rail-docs" href="/docs" target="_blank" rel="noopener" aria-label="Docs" title="Docs">${ICON.docs}</a>
+          <button class="rail-icon" id="rail-palette" type="button" data-shortcut="nav.commandPalette" aria-label="Command palette" title="Command palette (${esc(fmtKeys('meta+k'))})" aria-haspopup="dialog">${ICON.palette}</button>
+          <button class="rail-icon" id="rail-help" type="button" data-shortcut="help.keyboard" aria-label="Keyboard shortcuts" title="${esc(commandHint('Keyboard shortcuts', 'help.keyboard'))}" aria-haspopup="dialog">${ICON.keyboard}</button>
+        </div>
+      </div>
       <button class="rail-scrim" id="rail-scrim" aria-label="Close navigation"></button>
       <div class="main"><div class="main-inner" id="main"></div></div>
     </div>
     <aside class="hosted-onboarding" id="hosted-onboarding" aria-live="polite" hidden></aside>`;
-  $('#topbar-palette').addEventListener('click', openPalette);
-  $('#topbar-help').addEventListener('click', openHelp);
+  $('#rail-palette').addEventListener('click', openPalette);
+  $('#rail-help').addEventListener('click', openHelp);
+  $('#key-echo').addEventListener('animationend', () => echoKeys('')); // faded out
   wireVerificationBanner();
   const closeMobileNav = () => {
     $('#rail')?.classList.remove('mobile-open');
@@ -4564,7 +5095,7 @@ function renderShell() {
   syncRailToggle();
   $('#rail-scrim')?.addEventListener('click', closeMobileNav);
   $('#rail')?.addEventListener('click', (event) => {
-    if (event.target.closest('.folder-toggle, .rail-edit-action, .rail-inline-edit')) return;
+    if (event.target.closest('.folder-toggle, .rail-edit-action, .rail-inline-edit, .organization-combo')) return;
     if (event.target.closest('a, button, [data-project], [data-nav]')) closeMobileNav();
   });
   // #topbar-user and #bell are real <a> links (open profile / inbox, incl. in a new tab); installLinkRouter() handles them.
@@ -4576,6 +5107,7 @@ function renderShell() {
     if (route) await go(route);
     else toast('Organization access is no longer available', true);
   }, true);
+  syncRailNav();
   renderOnboarding();
   // The rail/main are painted by applyRoute() (boot calls it right after), so the
   // shell reflects the initial URL instead of a default view.
@@ -4824,9 +5356,43 @@ function railProjectRows(projectScoped) {
   return walk(root, 0) || (query ? '<div class="rail-search-empty" role="status">No matching projects</div>' : '');
 }
 
+// The organization's views, icon-only at the top of the sidebar:
+// [id, name (aria-label), icon, tab(s) it marks current, route, tooltip, command].
+const RAIL_ORG_NAV = [
+  ['rail-home', 'Home', 'home', ['home'], () => homeRoute(), 'Home — every project, what needs you first', 'nav.home'],
+  ['rail-insights', 'Insights', 'insights', ['insights'], () => globalRoute('insights'), 'Insights', 'nav.insights'],
+  ['rail-wiki', 'Wiki', 'wiki', ['orgwiki'], () => globalRoute('orgwiki'), 'Wiki — organization-wide skills, memories, and the general agent prompt', 'nav.orgwiki'],
+  ['rail-organization', 'Settings', 'settings', ['organization', 'global'], () => globalRoute('organization'), 'Organization settings', 'nav.global'],
+];
+
+// The sidebar's top and foot outlive every repaint of the project list (an open
+// organization menu must survive a background refresh), so a route change only
+// re-points their links and moves the current-page mark.
+function syncRailNav() {
+  for (const [id, , , tabs, route, hint, command] of RAIL_ORG_NAV) {
+    const link = document.getElementById(id);
+    if (!link) continue;
+    link.setAttribute('href', route());
+    link.title = commandHint(hint, command);
+    if (tabs.includes(S.tab)) link.setAttribute('aria-current', 'page');
+    else link.removeAttribute('aria-current');
+  }
+  const foot = $('#rail .rail-foot');
+  let installation = $('#rail-installation');
+  if (foot && S.installationAccess && !installation) {
+    foot.insertAdjacentHTML('beforeend', `<a class="rail-icon" id="rail-installation" data-spa href="${installationRoute()}" aria-label="Installation settings" title="Installation settings">${ICON.installation}</a>`);
+    installation = $('#rail-installation');
+  } else if (installation && !S.installationAccess) { installation.remove(); installation = null; }
+  if (installation) {
+    if (S.tab === 'installation') installation.setAttribute('aria-current', 'page');
+    else installation.removeAttribute('aria-current');
+  }
+}
+
 function renderRail() {
-  const rail = $('#rail');
+  const rail = $('#rail-list');
   if (!rail) return;
+  syncRailNav();
   if (draggingProject || editingRailItem) return; // never repaint out from under an interaction in flight
   const projectScoped = PROJECT_SCOPED_TABS.includes(S.tab);
   // A background refresh (WS-driven refreshTasks) repaints the rail on every agent
@@ -4847,22 +5413,16 @@ function renderRail() {
     rail.querySelectorAll('.proj, .rail-search-empty').forEach((row) => row.remove());
     $('#rail-projects-end').insertAdjacentHTML('beforebegin', railProjectRows(projectScoped));
   } else rail.innerHTML = `
-    <a class="nav-item rail-home ${S.tab === 'home' ? 'active' : ''}" data-spa href="${esc(homeRoute())}" id="rail-home" tabindex="0" title="${esc(commandHint('Home — every project, what needs you first', 'nav.home'))}">⌂ Home</a>
-    <div class="label rail-heading"><span title="${esc(commandHint('Focus projects', 'nav.projects'))}">Projects</span><button class="rail-add" id="new-project" type="button" title="${esc(commandHint('New project', 'nav.projects', 'n'))}" aria-label="New project">${ICON.plus}</button></div>
+    <div class="label rail-heading"><span title="${esc(commandHint('Focus projects', 'nav.projects'))}">Projects</span><button class="rail-add" id="new-project" type="button" data-shortcut="nav.projects rail.newProject" title="${esc(commandHint('New project', 'nav.projects', 'n'))}" aria-label="New project">${ICON.plus}</button></div>
     <label class="rail-search-box">
       <svg class="rail-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4.5 4.5"/></svg>
-    <input id="project-search" class="rail-search" type="search" aria-label="Search projects" placeholder="Search projects…" title="${esc(commandHint('Search projects', 'nav.projects', '/'))}" value="${esc(S.projectSearch || '')}" autocomplete="off" spellcheck="false">
+    <input id="project-search" class="rail-search" type="search" data-shortcut="nav.projects rail.search" aria-label="Search projects" placeholder="Search projects…" title="${esc(commandHint('Search projects', 'nav.projects', '/'))}" value="${esc(S.projectSearch || '')}" autocomplete="off" spellcheck="false">
     </label>
     ${railProjectRows(projectScoped)}
-    <div class="grow" id="rail-projects-end"></div>
-    <div class="label">Organization</div>
-    <a class="nav-item ${S.tab === 'insights' ? 'active' : ''}" data-spa href="${globalRoute('insights')}" data-tab="insights" tabindex="0" title="${esc(commandHint('Insights', 'nav.insights'))}">▦ Insights</a>
-    <a class="nav-item ${S.tab === 'orgwiki' ? 'active' : ''}" data-spa href="${globalRoute('orgwiki')}" id="rail-wiki" tabindex="0" title="${esc(commandHint('Organization-wide skills, memories, and the general agent prompt', 'nav.orgwiki'))}">🕮 Wiki</a>
-    <a class="nav-item ${S.tab === 'organization' || S.tab === 'global' ? 'active' : ''}" data-spa href="${globalRoute('organization')}" id="rail-organization" tabindex="0" title="${esc(commandHint('Organization settings', 'nav.global'))}">⚙ Settings</a>
-    ${S.installationAccess ? `<div class="label">Installation</div><a class="nav-item ${S.tab === 'installation' ? 'active' : ''}" data-spa href="${installationRoute()}" id="rail-installation" tabindex="0">⌘ Installation</a>` : ''}`;
-  // Your profile lives in the top bar (#topbar-user), not the rail. Project +
-  // Insights/Wiki/Settings entries are real <a> links — installLinkRouter()
-  // routes their plain click in place and the browser handles new-tab gestures.
+    <div class="grow" id="rail-projects-end"></div>`;
+  // Your profile lives in the top bar (#topbar-user), not the rail. Project and
+  // organization entries are real <a> links — installLinkRouter() routes their
+  // plain click in place and the browser handles new-tab gestures.
   if (!searching) {
     $('#new-project')?.addEventListener('click', () => newProject());
     const search = $('#project-search');
@@ -5113,7 +5673,7 @@ function renderMain() {
   const projectScoped = PROJECT_SCOPED_TABS.includes(S.tab);
   const tabbar = projectScoped
     ? `<div class="tabs">${tabs
-        .map((t) => `<a class="tab ${S.tab === t ? 'active' : ''}" data-spa href="${projectRoute(proj?.id, t)}" data-tab="${t}">${labels[t]}${t === 'tasks' && S.tasks.length ? `<span class="pill">${S.tasks.length}</span>` : ''}</a>`)
+        .map((t) => `<a class="tab ${S.tab === t ? 'active' : ''}" data-spa href="${projectRoute(proj?.id, t)}" data-tab="${t}"${PROJECT_TAB_COMMANDS[t] ? ` data-shortcut="${PROJECT_TAB_COMMANDS[t]}"` : ''}>${labels[t]}${t === 'tasks' && S.tasks.length ? `<span class="pill">${S.tasks.length}</span>` : ''}</a>`)
         .join('')}${S.meta?.hosted ? `<span class="tabs-spacer"></span><button class="btn tool tabs-action" id="project-local-checkout" title="Check out this project on your computer">${ICON.laptop}Work locally</button>` : ''}</div>`
     : '';
 
@@ -5388,12 +5948,12 @@ function tasksView() {
     <div class="composer">
       <div class="quick-task-field">
         ${home ? projectPickerHtml('new-task-project', newTaskProjectId()) : ''}
-        <input class="title-in" id="new-task" placeholder="New Task · ↵ for full task form · Ctrl+↵ to send" />
+        <input class="title-in" id="new-task" data-shortcut="nav.newTask" placeholder="New Task · ↵ for full task form · Ctrl+↵ to send" />
         <label class="btn soft icon-only attach-composer quick-task-attach" tabindex="0" title="Attach files (25 MB each)" aria-label="Attach files">${ICON.attach}<input id="new-task-files" type="file" multiple hidden></label>
       </div>
       <button class="btn icon-only" id="draft-task" title="Save as draft ( Alt+Enter )" aria-label="Save as draft (Alt+Enter)">${ICON.save}</button>
-      <button class="btn icon-only" id="expand-task" title="Open full task form ( N or ↵ )" aria-label="Open full task form">${ICON.form}</button>
-      <button class="btn primary icon-only" id="add-task" title="Add directly ( ${esc(fmtKeys('meta+Enter'))} )" aria-label="Add task">${ICON.send}</button>
+      <button class="btn icon-only" id="expand-task" data-shortcut="nav.newTaskForm" title="Open full task form ( N or ↵ )" aria-label="Open full task form">${ICON.form}</button>
+      <button class="btn primary icon-only" id="add-task" data-shortcut="list.quickAdd" title="Add directly ( ${esc(fmtKeys('meta+Enter'))} )" aria-label="Add task">${ICON.send}</button>
     </div>
     <div class="img-chips attachment-chips" id="new-task-chips" style="display:none"></div>`;
   const trailing = everywhere ? '' : home ? projectFilterHtml()
@@ -5402,7 +5962,7 @@ function tasksView() {
     <div class="organizer">
       <div class="search-box${S.searchPending ? ' searching' : ''}">
         <span class="search-ic">⌕</span>
-        <input id="task-search" class="task-search" spellcheck="false" autocomplete="off" value="${esc(S.search)}"
+        <input id="task-search" class="task-search" data-shortcut="nav.search" spellcheck="false" autocomplete="off" value="${esc(S.search)}"
           placeholder="Search &amp; filter…  e.g.  status:active -tag:bug priority:>=2  ( / )" />
         ${S.search ? `<button class="search-x" id="q-clear" title="Clear (Esc)">✕</button>` : ''}
         ${S.searchPending ? '<span class="search-pending" role="status">Searching…</span>' : ''}
@@ -5724,8 +6284,8 @@ function taskRow(t, { showTags = true, project = false } = {}) {
   // Any task can be archived/un-archived — archiving only hides it from the list,
   // it never affects a running task's execution.
   const archiveBtn = archived
-    ? `<button class="icon-btn" data-unarchive="${t.id}" title="Unarchive — restore to the list"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 14 4 9 9 4"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/></svg></button>`
-    : `<button class="icon-btn" data-archive="${t.id}" title="Archive — hide from the list"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8"/><path d="M10 12h4"/></svg></button>`;
+    ? `<button class="icon-btn" data-unarchive="${t.id}" data-shortcut="list.archive" title="Unarchive — restore to the list"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 14 4 9 9 4"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/></svg></button>`
+    : `<button class="icon-btn" data-archive="${t.id}" data-shortcut="list.archive" title="Archive — hide from the list"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8"/><path d="M10 12h4"/></svg></button>`;
   return `
     <div class="task-row ${archived ? 'archived' : ''}${taskHasUnreadAsk(t.id) ? ' unread' : ''}" data-id="${t.id}" tabindex="0" role="group" aria-label="${esc(t.title)}">
       <span class="status-dot ${status}" title="${esc(status)}"></span>
@@ -6011,8 +6571,9 @@ function openFilterPicker(fieldKey, onAdd) {
 // transparent -is:archived -is:run treatment, parameterized per caller — the
 // fork search deliberately keeps archived tasks in).
 // Forking may start from any project the organization can read: the agent
-// picker searches organization-wide, starting at `project:<this project>` so
-// deleting that one token widens it.
+// picker searches organization-wide, starting at `project:<this project> ` so
+// deleting that one token widens it (the trailing space lets typing go straight
+// on to the next clause).
 function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'run'], exclude, onPick }) {
   const organizationWide = mode === 'agent' && !!S.organizationId;
   const ownProject = organizationWide ? projectById(S.projectId) : undefined;
@@ -6038,7 +6599,7 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
   let closed = false;
   let selection = 0; // ignore agent lookups after closing, searching or choosing another task
   const close = () => { closed = true; selection++; host.remove(); };
-  let q = organizationWide && ownProject ? `project:${projectSlug(ownProject)}` : '';
+  let q = organizationWide && ownProject ? `project:${projectSlug(ownProject)} ` : '';
   let result = null; // last server evaluation
   let hi = 0; // roving highlight over pickable rows
   const sessions = new Map(); // taskId → [{ task: exact attempt, sessions: role→session }]
@@ -6605,7 +7166,7 @@ function triggersSection(values, selfId) {
         </div>
         <span class="tb-label">Schedule ${policyTip('Cron, in UTC. Each field: * = every, */5 = every 5, 1-5 = range, 1,3 = list.')}</span>
         <div class="cron-grid">${gridCells}</div>
-        <label class="tb-label" for="trig-at">Once at</label>
+        <label class="tb-label" for="trig-at">Or once at</label>
         <input id="trig-at" type="datetime-local" value="${atVal}">
         <label class="tb-repeat"><input type="checkbox" id="trig-repeatable" ${values.repeatable ? 'checked' : ''}>
           Repeatable ${policyTip('Each run is kept: a trigger (or “Run again”) spawns a fresh run instead of running this task once.')}</label>
@@ -6915,7 +7476,7 @@ function taskFormTitle(draft) {
 function taskFormLoadingPage(project, draft) {
   return `<div class="task-form-page" id="tf-page" tabindex="-1" aria-busy="true">
     <div class="tf-head"><div class="tf-head-inner">
-      <button class="icon-btn" id="tf-close" title="Back (Esc)">←</button>
+      <button class="icon-btn" id="tf-close" data-shortcut="nav.close" title="Back (Esc)">←</button>
       <h2>${taskFormTitle(draft)}</h2>
       ${project ? `<span class="tf-crumb">in</span>${projectPickerHtml('tf-project', project.id, false)}` : ''}
     </div></div>
@@ -7027,7 +7588,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     <div class="task-form-page" id="tf-page" tabindex="-1">
       <div class="tf-head">
         <div class="tf-head-inner">
-          <button class="icon-btn" id="tf-close" title="Back (Esc)">←</button>
+          <button class="icon-btn" id="tf-close" data-shortcut="nav.close" title="Back (Esc)">←</button>
           <h2>${taskFormTitle(draft)}</h2>
           ${proj ? `<span class="tf-crumb">in</span>${projectPickerHtml('tf-project', projectId, !draft)}` : ''}
           ${formAttemptGroup?.attempts?.length > 1 ? `<nav class="attempts-list tf-attempts" aria-label="Choose an attempt">
@@ -7602,8 +8163,9 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
           // The refusal names the agent whose authority exceeds the user's (`do`,
           // or absent, is the main agent): ask about exactly that one.
           const participant = e.participant && e.participant !== 'do' ? e.participant : null;
+          const credentialGrants = e.credentialGrants || [];
           const decision = await chooseAuthorizationGrant(projectId, participant ? e.authorization || st.authorization : st.authorization,
-            participant ? agentParticipantLabel(participant) : 'task agent');
+            participant ? agentParticipantLabel(participant) : 'task agent', credentialGrants);
           if (!decision) return false;
           if (decision.action === 'limit') {
             succeeded = await submit(false, [...new Set([...accepted, participant || 'do'])], activeFeedback);
@@ -7628,7 +8190,8 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
           }
           await api(`/api/authorization-requests?projectId=${encodeURIComponent(projectId)}`, { method: 'POST', body: JSON.stringify({
             projectId, target: { kind: 'task', taskId: targetId, queueAfterApproval: true, ...(participant ? { participant } : {}) },
-            authorization: participant ? e.authorization || st.authorization : st.authorization, audience: decision.audience, reason: decision.reason,
+            authorization: participant ? e.authorization || st.authorization : st.authorization,
+            ...(credentialGrants.length ? { credentialGrants } : {}), audience: decision.audience, reason: decision.reason,
           }) });
           releaseFormKeys();
           root.innerHTML = '';
@@ -7677,6 +8240,8 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       return;
     }
     if (e.key === 'Escape' && e.target.closest?.('.task-payments')?.querySelector('[aria-expanded="true"]')) return;
+    // Escape in an open dropdown (the model field, people pickers) closes just the dropdown.
+    if (e.key === 'Escape' && e.target.closest?.('.combo')?.querySelector(':scope > .combo-menu:not([hidden])')) return;
     const action = taskFormKeyAction(e, secondaryModalOpen);
     if (!action) return;
     e.preventDefault();
@@ -7697,7 +8262,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
 // stays visible on every tab.
 const TASK_TABS = [
   { key: 'overview', label: 'Overview' },
-  { key: 'checkin', label: 'Check-in' },
+  { key: 'checkin', label: 'Chat' },
   { key: 'approvals', label: 'Approval Requests' },
   { key: 'parameters', label: 'Parameters' },
   { key: 'timing', label: 'Timing' },
@@ -7721,8 +8286,8 @@ function renderTaskLoadingPage(rec, error) {
   if (!main) return;
   const title = rec?.title || 'Task';
   main.innerHTML = `<div class="task-page" aria-busy="${error ? 'false' : 'true'}">
-    <div class="tp-head"><div class="row1">
-      <button class="icon-btn" id="tp-back" title="Back (Esc)">←</button>
+    <div class="tp-head">${taskBreadcrumb({ taskId: rec?.id, parentTaskId: rec?.parentTaskId })}<div class="row1">
+      <button class="icon-btn" id="tp-back" data-shortcut="nav.close" title="Back (Esc)">←</button>
       ${rec?.num != null ? `<span class="task-num">#${rec.num}</span>` : ''}
       <h2>${esc(title)}</h2>
     </div></div>
@@ -7751,8 +8316,9 @@ async function renderSeriesPage(rec) {
   main.innerHTML = `
     <div class="task-page">
       <div class="tp-head">
+        ${taskBreadcrumb({ taskId: rec.id, parentTaskId: rec.parentTaskId })}
         <div class="row1">
-          <button class="icon-btn" id="tp-back" title="Back (Esc)">←</button>
+          <button class="icon-btn" id="tp-back" data-shortcut="nav.close" title="Back (Esc)">←</button>
           ${rec.num != null ? `<span class="task-num">#${rec.num}</span>` : ''}
           <h2>${esc(rec.title)}</h2>
           <span class="chip">repeatable</span>
@@ -7856,7 +8422,7 @@ function attemptCard(a, g, v, { tab = '', form = false } = {}) {
 
 function addAttemptButton(cls = '') {
   const g = S.attemptGroup;
-  return `<button type="button" class="btn tool attempt-add ${cls}" id="add-attempt" ${g?.committedAttemptId || S.addingAttempt ? 'disabled' : ''} title="${g?.committedAttemptId ? 'An attempt has been selected to merge' : 'Create an editable draft from this attempt'}">${S.addingAttempt ? 'Creating…' : '＋ New attempt'}</button>`;
+  return `<button type="button" class="btn tool attempt-add ${cls}" id="add-attempt" data-shortcut="task.attempt.new" ${g?.committedAttemptId || S.addingAttempt ? 'disabled' : ''} title="${g?.committedAttemptId ? 'An attempt has been selected to merge' : 'Create an editable draft from this attempt'}">${S.addingAttempt ? 'Creating…' : '＋ New attempt'}</button>`;
 }
 
 // Follow the rendered links so keyboard navigation uses the same pinned routes
@@ -8699,9 +9265,9 @@ function renderTaskPage() {
   const retainedThread = patchTaskPage(main, `
     <div class="task-page">
       <div class="tp-head">
-        ${parentTaskContext(v)}
+        ${taskBreadcrumb(v)}
         <div class="row1">
-          <button class="icon-btn" id="tp-back" title="Back to the list (Esc)">←</button>
+          <button class="icon-btn" id="tp-back" data-shortcut="nav.close" title="Back to the list (Esc)">←</button>
           ${v.num != null ? `<span class="task-num" title="Task #${v.num} — permalink ${esc(base)}">#${v.num}</span>` : ''}
           <h2>${esc(v.title)}</h2>
           ${stageIndicator(v, v.taskId)}
@@ -9680,6 +10246,23 @@ function setStopBtn(running, procId, taskId) {
 // page. Keep the relationship in the task-page masthead where it reads as
 // navigation; `taskRecord` normally supplies the human title/number from the
 // project task pool, with a compact id fallback for old or partially loaded data.
+// The task's place, above its title: its project (a link to the project's list)
+// and, for a sub-task, its parent — one breadcrumb, so where a task lives reads
+// the same whether it was opened from its project, the organization home or a link.
+function taskBreadcrumb(v) {
+  const project = projectById(taskRecord(v.taskId)?.projectId || S.projectId);
+  const org = project && organizationById(project.organizationId);
+  const crumbs = [];
+  if (project) {
+    const name = projectPath(project) || project.name;
+    crumbs.push(`<a class="tp-crumb tp-project" data-spa href="${esc(projectRoute(project.id))}" title="${esc(org?.name ? `${org.name} › ${name}` : name)}">${esc(name)}</a>`);
+  }
+  const parent = parentTaskContext(v);
+  if (parent) crumbs.push(parent);
+  if (!crumbs.length) return '';
+  return `<nav class="tp-crumbs" aria-label="Task location">${crumbs.join('<span class="tp-crumb-sep" aria-hidden="true">›</span>')}</nav>`;
+}
+
 function parentTaskContext(v) {
   const child = taskRecord(v.taskId);
   const parentId = v.parentTaskId || child?.parentTaskId;
@@ -9688,11 +10271,7 @@ function parentTaskContext(v) {
   const label = parent
     ? `${parent.num != null ? `#${parent.num} ` : ''}${parent.title}`
     : numLabel(parentId);
-  return `<button type="button" class="tp-parent" data-open="${esc(parentId)}" aria-label="Open parent task ${esc(label)}">
-    <span class="tp-parent-kicker">Sub-task of</span>
-    <span class="tp-parent-title">${esc(label)}</span>
-    <span class="tp-parent-arrow" aria-hidden="true">›</span>
-  </button>`;
+  return `<button type="button" class="tp-crumb tp-parent" data-open="${esc(parentId)}" title="Parent task" aria-label="Open parent task ${esc(label)}">${esc(label)}</button>`;
 }
 
 // A child reads exactly as it does in the task list and on its own page: the
@@ -10093,7 +10672,7 @@ function conversationPane(v, t) {
           <div class="prompt-attach-row"><label class="attach-file-button" tabindex="0">Attach files<input class="followup-files" type="file" multiple hidden></label><span>25 MB each · 50 MB per prompt</span></div>
         </div>
         ${t.shared && stoppableAgent(v) ? stopAgentButton(stoppableAgent(v), 'btn followup-stop') : ''}
-        <button class="btn primary followup-send" ${followUp.enabled ? '' : 'disabled'}>Send</button>
+        <button class="btn primary followup-send" data-keys="meta+Enter" ${followUp.enabled ? '' : 'disabled'}>Send</button>
       </div></div>`
     : '';
   return `
@@ -10727,10 +11306,10 @@ function wireCheckinSidebar(v) {
     if (!ta.value.includes(token)) {
       ta.value = `${token} ${ta.value}`;
       followupMentions(key).push({ token, selector: `agent:${el.dataset.callAgent}` });
-      S.followupDrafts[key] = ta.value;
     }
     ta.focus();
     ta.setSelectionRange(ta.value.length, ta.value.length);
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
   }));
   $('#main').querySelectorAll('.escalate-request').forEach((el) => el.addEventListener('click', () => openEscalateDialog(v)));
   $('#conversation-fullscreen')?.addEventListener('click', () => setConversationFullscreen(!S.conversationFullscreen));
@@ -11801,7 +12380,8 @@ function paramsSection(v) {
     // hibernation change; the provider, experience and network stay.
     if (f.type === 'computer') {
       const block = computerBlockHtml(f.name, own || undefined, inherited, { inFlight: true, frozen: !isEditable });
-      return `<div class="${isEditable ? 'pf-edit-row' : 'pf-frozen'}" data-row="${esc(f.name)}"><div class="form-row">${isEditable ? fieldLabel(f) : frozenLabel(f)}${block}</div></div>`;
+      const label = (isEditable ? fieldLabel(f) : frozenLabel(f)).replace('</label>', `</label>${computerPendingChip(v.computerChange)}`);
+      return `<div class="${isEditable ? 'pf-edit-row' : 'pf-frozen'}" data-row="${esc(f.name)}"><div class="form-row">${label}${block}</div></div>`;
     }
     if (isEditable) return `<div class="pf-edit-row" data-row="${esc(f.name)}">${renderField(f, own, inherited)}</div>`;
     // A frozen route keeps its shape (who, in order, and each agent's block).
@@ -11819,11 +12399,14 @@ function paramsSection(v) {
     : f.type === 'confirmer' ? 2 : f.calledAgent ? 3 : f.type === 'computer' ? 3.5 : 4);
   const agentFields = fields.filter((f) => rank(f) < 4).sort((a, b) => rank(a) - rank(b));
   const whereFields = fields.filter((f) => rank(f) === 4);
-  // Base and target share one row, as in the task form.
+  // Base and target share one row, as in the task form; a task with branches
+  // per repository lists them under it.
   const pair = ['base', 'target'].map((name) => whereFields.find((f) => f.name === name)).filter(Boolean);
+  const perRepo = whereFields.find((f) => f.type === 'repoBranches');
   const where = [
     pair.length > 1 ? `<div class="branch-pair">${pair.map(rowFor).join('')}</div>` : '',
-    ...whereFields.filter((f) => pair.length < 2 || !pair.includes(f)).map(rowFor),
+    perRepo ? repoBranchesFrozenRow(perRepo, paramCurrentValue(perRepo, v, rec), lock) : '',
+    ...whereFields.filter((f) => f !== perRepo && (pair.length < 2 || !pair.includes(f))).map(rowFor),
   ].join('');
   const triggers = Array.isArray(rec?.params?.triggers) && rec.params.triggers.length
     ? `<div class="form-row pf-frozen" data-row="__triggers"><div class="label-row"><label>Triggers</label>${lock}<span class="label-row-fill"></span></div>
@@ -11844,7 +12427,7 @@ function paramsSection(v) {
   const renderKey = JSON.stringify([v.taskId, v.workflow, terminal, fields.map(({ participant: _p, ...f }) => f), [...editable], inheritedAll,
     fields.filter((f) => !editable.has(f.name)).map((f) => paramCurrentValue(f, v, rec)),
     TERMINAL_STAGES.includes(v.stage) || !!v.pointOfNoReturnPassed, (v.participants || []).map((p) => [p.key, p.state]),
-    authorizationLiveKey(v.taskId), paymentsLiveKey(v)]);
+    authorizationLiveKey(v.taskId), paymentsLiveKey(v), v.computerChange || null]);
   // A workflow without an agent field still shows the task's own authority.
   const authorityOnly = mainAgent ? '' : `<section class="tp-section"><div class="form-row" data-row="__authorization">
     ${agentAuthorityHtml('tp-main', null, { ...mainAuthorityParams(v), open: !!S.mainAuthorityOpen?.[v.taskId] })}</div></section>`;
@@ -11853,6 +12436,16 @@ function paramsSection(v) {
     ${agentFields.map((f) => `<section class="tp-section tp-${esc(f.type)}">${rowFor(f)}</section>`).join('')}
     ${where || triggers ? `<section class="tp-section tp-where">${where}${triggers}</section>` : ''}
     ${footer}</div>`;
+}
+
+// A running task's branches per repository, read-only: "app  main → main".
+function repoBranchesFrozenRow(f, value, lock) {
+  const entries = Object.entries(value && typeof value === 'object' ? value : {});
+  if (!entries.length) return '';
+  return `<div class="form-row pf-frozen" data-row="${esc(f.name)}"><div class="label-row"><label>Branches per repo</label>${lock}<span class="label-row-fill"></span></div>
+    <div class="pf-ro rb-frozen">${entries.map(([source, entry]) => {
+      return `<div><span class="rb-repo" title="${esc(source)}">${esc(repositoryShortName(source))}</span> ${esc(entry?.base || '(default)')} → ${esc(entry?.target || '(default)')}</div>`;
+    }).join('')}</div></div>`;
 }
 
 function isParamDraftField(draft, name) {
@@ -12086,7 +12679,10 @@ function taskActions(v) {
   if (v.state?.finalizing) return `<div class="actions" role="status" aria-live="polite"><button class="btn primary action-pending" disabled aria-busy="true">Finishing…</button><span>Saving task output</span></div>`;
   const acts = v.actions || [];
   const simple = acts.filter((a) => !a.args || a.args.length === 0);
-  let html = `<div class="actions">`;
+  // Sub-tasks' files arriving before the agent's next turn: a message sent now waits for them.
+  const refreshing = v.state?.refreshingResources && v.status === 'active'
+    ? `<button class="btn primary action-pending" disabled aria-busy="true" title="Sub-tasks’ files arrive before the agent’s next turn. Messages sent now are read then.">Bringing in sub-tasks’ data…</button>` : '';
+  let html = `<div class="actions"${refreshing ? ' role="status" aria-live="polite"' : ''}>${refreshing}`;
   let slot = 0; // digits 1–9 press the Nth ENABLED button (see the command registry)
   for (const a of simple) {
     const cls = a.name === 'confirm' || a.name === 'openPr' ? 'primary' : a.danger ? 'danger' : '';
@@ -12103,7 +12699,7 @@ function taskActions(v) {
   // The follow-up box lives inside each agent's conversation on the Check-in tab,
   // so a human can address any agent (SPEC §5.6).
   html += `</div>`;
-  if (!acts.length) html = `<div style="color:var(--ink-3)">Nothing to do here right now.</div>`;
+  if (!acts.length && !refreshing) html = `<div style="color:var(--ink-3)">Nothing to do here right now.</div>`;
   return html;
 }
 
@@ -12327,14 +12923,19 @@ function wireStopAgents(v) {
   }));
 }
 
-// Whom unaddressed text goes to: the agent that last asked you something (a
-// helper that asked you, say) until you have spoken since — you are replying —
-// else the main agent.
+// Whom unaddressed text goes to: you are replying to the agent that last spoke
+// to you (a helper answering or asking you, or the main agent), until you have
+// spoken since; else the main agent. A group (@creator, @maintainers…) may
+// include you, so a helper asking one is asking you.
 function defaultRecipientFor(v) {
   const me = S.user?.id && `user:${S.user.id}`;
   for (const m of [...(v?.messages || [])].reverse()) {
     if (m.role === 'user' && (!m.author || m.author === me)) break;
-    if (m.role === 'agent' && m.author && m.author !== 'do' && me && (m.to || []).includes(me)) return `agent:${m.author}`;
+    if (m.role !== 'agent') continue;
+    const author = m.author || 'do';
+    // The main agent's own words (no recipients) are for the task's people.
+    const toMe = m.to ? m.to.some((s) => s === me || s.startsWith('@')) : author === 'do';
+    if (toMe) return `agent:${author}`;
   }
   return 'agent:do';
 }
@@ -12362,14 +12963,43 @@ function countMentions(selectors) {
   for (const selector of selectors) if (!selector.startsWith('agent:')) counts[selector] = (counts[selector] || 0) + 1;
   try { localStorage.setItem(`tavya.mentions.${S.organizationId}`, JSON.stringify(counts)); } catch { /* private mode */ }
 }
+// Groups and teams are written as their selectors (@maintainers, @team:leaders),
+// the identifiers agents use too; a person or Avatar has no handle, so by name.
 function mentionPeople() {
   return [
-    ...humanAudienceOptions().map((o) => ({ selector: o.value, label: o.label.replace(/^(Person|Team) · /, ''),
-      kind: o.value.startsWith('user:') ? 'person' : o.value.startsWith('@team:') ? 'team' : 'group' })),
-    ...(S.avatars || []).filter((a) => a.enabled !== false).map((a) => ({ selector: `avatar:${a.id}`, label: a.name, kind: 'avatar' })),
+    ...humanAudienceOptions().map((o) => {
+      const label = o.label.replace(/^(Person|Team) · /, '');
+      const kind = o.value.startsWith('user:') ? 'person' : o.value.startsWith('@team:') ? 'team' : 'group';
+      return { selector: o.value, label, kind, token: kind === 'person' ? `@${label}` : o.value };
+    }),
+    ...(S.avatars || []).filter((a) => a.enabled !== false).map((a) => ({ selector: `avatar:${a.id}`, label: a.name, kind: 'avatar', token: `@${a.name}` })),
   ];
 }
+// Group and team selectors typed by hand address their people just as picking
+// them from the @ menu does: [{ token, selector, index }].
+function typedMentions(text) {
+  const known = new Set(mentionPeople().filter((p) => p.kind === 'group' || p.kind === 'team').map((p) => p.selector));
+  return [...text.matchAll(/(^|[\s(])(@[\w:-]*\w)/g)].filter((m) => known.has(m[2]))
+    .map((m) => ({ token: m[2], selector: m[2], index: m.index + m[1].length }));
+}
 
+// Where each picked mention still stands in the text: [{ ...mention, index }].
+// Longest first, each on its own span, so a deleted @Agent is not found inside
+// @Agent 1; one no longer in the text is dropped.
+function locateMentions(text, mentions) {
+  const taken = [];
+  const out = [];
+  for (const m of [...mentions].sort((a, b) => b.token.length - a.token.length)) {
+    for (let index = text.indexOf(m.token); index >= 0; index = text.indexOf(m.token, index + 1)) {
+      const end = index + m.token.length;
+      if (taken.some(([a, b]) => index < b && end > a)) continue;
+      taken.push([index, end]);
+      out.push({ ...m, index });
+      break;
+    }
+  }
+  return out;
+}
 // Mentions typed into a box, by box key: [{ token, selector, newAgent? }].
 function followupMentions(key) { return ((S.followupMentions ||= {})[key] ||= []); }
 // Agents added for a message being written, by box key: { 'agent-3': spec }.
@@ -12449,10 +13079,11 @@ function wireAgentMention(ta, box, v, key) {
     ta.value = ta.value.slice(0, token.start) + value + ta.value.slice(token.end);
     const caret = token.start + value.length;
     followupMentions(key).push({ token: text, selector, ...extra });
-    S.followupDrafts[key] = ta.value;
     close();
     ta.setSelectionRange(caret, caret);
     ta.focus();
+    // As typing would: the painted text, the draft and the box's height follow.
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
   };
   const choose = (item) => {
     if (!item || !token) return close();
@@ -12464,27 +13095,30 @@ function wireAgentMention(ta, box, v, key) {
       insert(`@${participantLabelOf(agentKey, v)}`, `agent:${agentKey}`, { newAgent: true });
       return renderTaskPage();
     }
-    insert(`@${item.label}`, item.selector);
+    insert(item.token || `@${item.label}`, item.selector);
   };
   const render = () => {
     if (!menu) { menu = document.createElement('div'); menu.className = 'wiki-mention-menu agent-mention-menu'; menu.setAttribute('role', 'listbox'); document.body.appendChild(menu); }
+    const scrolled = menu.scrollTop;
     let sawAgent = false;
     menu.innerHTML = items.length ? items.map((item, i) => {
       const sep = (item.kind !== 'agent' && item.kind !== 'new' && sawAgent) ? (sawAgent = false, '<div class="am-sep" role="separator"></div>') : '';
       if (item.kind === 'agent' || item.kind === 'new') sawAgent = true;
       const key = item.kind === 'agent' ? `[${item.index}]` : item.kind === 'new' ? '[+]' : '';
       const hint = item.kind === 'agent' ? (item.state === 'running' ? 'working' : item.state === 'queued' ? 'queued' : item.state === 'new' ? 'new' : '')
-        : item.kind === 'people' ? '›' : item.kind === 'avatar' ? 'Avatar' : item.kind === 'team' ? 'Team' : item.kind === 'group' ? '' : '';
+        : item.kind === 'people' ? '›' : item.kind === 'avatar' ? 'Avatar' : '';
+      const named = item.kind === 'group' || item.kind === 'team';
       return `${sep}<div class="wm-opt am-opt ${i === active ? 'active' : ''}" data-i="${i}" role="option">
-        <span class="am-key">${key}</span><span class="wm-main"><span class="wm-ref">${esc(item.label)}</span></span><span class="wm-scope">${esc(hint)}</span></div>`;
+        <span class="am-key">${key}</span><span class="wm-main"><span class="wm-ref">${esc(named ? item.token : item.label)}</span>${
+          named ? `<span class="wm-desc">${esc(item.label)}</span>` : ''}</span><span class="wm-scope">${esc(hint)}</span></div>`;
     }).join('') : '<div class="wm-empty">No one matches</div>';
     menu.querySelectorAll('.am-opt').forEach((el) => {
       el.addEventListener('mousedown', (ev) => { ev.preventDefault(); choose(items[+el.dataset.i]); });
       el.addEventListener('mouseenter', () => { active = +el.dataset.i; menu.querySelectorAll('.am-opt').forEach((o, j) => o.classList.toggle('active', j === active)); });
     });
-    const xy = textareaCaretXY(ta, token.start);
-    menu.style.left = `${Math.min(xy.left, window.innerWidth - 300)}px`;
-    menu.style.top = `${xy.top}px`;
+    placeCaretMenu(menu, ta, token.start);
+    menu.scrollTop = scrolled;
+    revealActiveOption(menu);
   };
   const update = () => {
     token = tokenAt();
@@ -12583,7 +13217,8 @@ function wireFollowups(v) {
       try {
         // A shared conversation addresses whoever was mentioned, in order;
         // new agents travel with the message that calls them.
-        const mentions = shared ? followupMentions(key).map((m) => ({ ...m, index: text.indexOf(m.token) })).filter((m) => m.index >= 0) : [];
+        const picked = shared ? locateMentions(text, followupMentions(key)) : [];
+        const mentions = shared ? [...picked, ...typedMentions(text).filter((t) => !picked.some((m) => m.index === t.index))] : [];
         const newAgents = shared ? Object.fromEntries(Object.entries(followupNewAgents(key))
           .filter(([agentKey]) => mentions.some((m) => m.selector === `agent:${agentKey}`))) : {};
         const to = shared ? composeRecipients(text, mentions, defaultRecipientFor(v)) : undefined;
@@ -13172,36 +13807,36 @@ async function renderAccountStatus(organizationId = S.organizationId || 'org_per
   const pollable = new Set(u.pollable || []);
   if (!accounts.length) { box.innerHTML = ''; return; }
   box.innerHTML = `
-    <div class="section-h" style="display:flex;align-items:center;justify-content:space-between">
-      <span>Availability &amp; quota</span>
-      ${pollable.size ? `<button class="btn sm usage-recheck-all" title="Check usage with each provider now">↻ Re-check</button>` : ''}
+    <div class="section-h section-h-action">
+      <span>Availability</span>
+      ${pollable.size ? `<button class="btn sm ghost usage-recheck-all" title="Check usage with each provider now">↻ Re-check all</button>` : ''}
     </div>
     ${accounts.map((a) => {
       const status = a.status || 'available';
-      const badge = status === 'available'
-        ? '🟢 available'
+      const [tone, badge] = status === 'available'
+        ? ['ok', 'available']
         : status === 'manual-off'
-          ? '⏸ off (manual)'
+          ? ['off', 'off (manual)']
           : status === 'needs-attention'
-            ? '🔴 needs attention (funding or re-authentication)'
-            : `🟠 ${esc(a.window || 'quota exhausted')}${a.note ? ` (${esc(a.note)})` : ''}${a.resetAt ? ` · resets ${fmtReset(a.resetAt)}` : ''}`;
-      const weekly = a.weeklyResetAt ? `<span style="color:var(--ink-3)"> · weekly resets ${fmtReset(a.weeklyResetAt)}</span>` : '';
+            ? ['bad', 'needs attention (funding or re-authentication)']
+            : ['warn', `${esc(a.window || 'quota exhausted')}${a.note ? ` (${esc(a.note)})` : ''}${a.resetAt ? ` · resets ${fmtReset(a.resetAt)}` : ''}`];
+      const weekly = a.weeklyResetAt ? `<span class="setting-muted">weekly resets ${fmtReset(a.weeklyResetAt)}</span>` : '';
       return `<div class="account-status">
-        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <div class="account-status-head">
           <b class="mono">${esc(a.id)}</b>
-          <span>${badge}</span>${weekly}
-          <span style="color:var(--ink-3)">in use ${a.inUse}/${a.maxConcurrent >= 1000000 ? '∞' : a.maxConcurrent}</span>
+          <span class="status-dot ${tone}" aria-hidden="true"></span><span>${badge}</span>${weekly}
+          <span class="setting-muted" title="Agent turns running on this account now">${a.inUse}/${a.maxConcurrent >= 1000000 ? '∞' : a.maxConcurrent} in use</span>
+          <span class="account-status-actions">
+          <label class="account-conc" title="How many agent turns may run on this account at once; empty means unlimited">Max <input class="acct-conc" data-id="${esc(a.id)}" value="${a.maxConcurrent >= 1000000 ? '' : a.maxConcurrent}" placeholder="∞" aria-label="Max concurrent turns" /></label>
+          ${pollable.has(a.id) ? `<button class="icon-btn usage-recheck" data-id="${esc(a.id)}" title="Re-check usage" aria-label="Re-check usage">↻</button>` : ''}
+          <button class="btn sm ghost acct-reset" data-id="${esc(a.id)}" title="Set when this account’s quota resets">Reset time…</button>
+          ${status === 'available'
+            ? `<button class="btn sm acct-avail" data-id="${esc(a.id)}" data-status="manual-off" title="Stop using this account until you turn it back on">Pause</button>`
+            : `<button class="btn sm acct-avail" data-id="${esc(a.id)}" data-status="available">Mark available</button>`}
+          </span>
         </div>
         ${usageBlock(a.id, usage[a.id], pollable.has(a.id))}
         ${accountIncidentHtml(a)}
-        <div class="task-sub" style="gap:6px;margin-top:6px;align-items:center">
-          ${status === 'available'
-            ? `<button class="btn sm acct-avail" data-id="${esc(a.id)}" data-status="manual-off">Mark unavailable</button>`
-            : `<button class="btn sm acct-avail" data-id="${esc(a.id)}" data-status="available">Mark available now</button>`}
-          <button class="btn sm acct-reset" data-id="${esc(a.id)}">Set reset time…</button>
-          ${pollable.has(a.id) ? `<button class="btn sm usage-recheck" data-id="${esc(a.id)}">↻ Re-check usage</button>` : ''}
-          <label style="display:inline-flex;align-items:center;gap:4px;color:var(--ink-3);font-size:12px">max concurrent <input class="acct-conc" data-id="${esc(a.id)}" value="${a.maxConcurrent >= 1000000 ? '' : a.maxConcurrent}" placeholder="∞" title="How many agent turns may run on this login at once; leave empty = unlimited" style="width:52px;padding:2px 6px" /></label>
-        </div>
       </div>`;
     }).join('')}`;
   const recheck = async (btn, body) => {
@@ -13845,7 +14480,7 @@ function flashSaved(button) {
 // One renderer for both scopes; `scope` decides which fields show + where they save.
 const settingsFields = (workflow, scope) => schemaFor(workflow)
   .filter((field) => field.scopes.includes(scope) && !['repos', 'gitProfile', 'copyGlobs'].includes(field.name));
-const COMMON_DEFAULT_NAMES = new Set(['otherAttempts', 'base', 'target', 'computer', 'multiPr', 'copyGlobs', 'remote', 'landingAuthority', 'agent:do', 'agent:merge', 'agent:resolve', 'responder', 'confirm']);
+const COMMON_DEFAULT_NAMES = new Set(['otherAttempts', 'base', 'target', 'repoBranches', 'computer', 'multiPr', 'copyGlobs', 'remote', 'landingAuthority', 'agent:do', 'agent:merge', 'agent:resolve', 'responder', 'confirm']);
 // Review route and Responder stay shared/common values on the wire, but their
 // controls live in the Agent card.
 const agentRouteSettingsFields = (scope) => ['responder', 'confirm']
@@ -13883,7 +14518,7 @@ function settingsForms(scope, projectId) {
       <section class="td-section td-agent"><div id="profiles-list-${scope}">Loading…</div></section>
       <section class="td-section td-routes"><div id="review-route-${scope}">Loading…</div></section>
       <section class="td-section td-computer" data-wf="__common__" data-schema-wf="software-dev" data-part="computer">
-        <div class="wf-form parameter-fields">${renderFields(computerSettingsFields(scope))}</div>
+        <div class="wf-form parameter-fields">Loading…</div>
       </section>
       <section class="td-section td-where" data-wf="__common__" data-schema-wf="software-dev">
         <div class="wf-form parameter-fields">${renderFields(commonSettingsFields(scope))}</div>
@@ -14231,15 +14866,16 @@ async function fillAvatarEditor(overlay, close, proj, avatar) {
   const runtime = avatar?.runtime || { provider: agentProviderChoice(), model: '', effort: '' };
   overlay.querySelector('.avatar-editor').innerHTML = `<div class="avatar-editor-head"><div><h2>${avatar ? 'Edit Avatar' : 'New Avatar'}</h2><p>Create a named autonomous principal. Only you can edit its instructions.</p></div><button class="icon-btn avatar-editor-close" type="button" aria-label="Close">✕</button></div><div class="avatar-editor-scroll">
     <label class="form-row"><span>Name</span><input id="avatar-name" maxlength="80" value="${esc(avatar?.name || '')}" placeholder="Atlas"></label><label class="form-row"><span>Purpose</span><input id="avatar-purpose" maxlength="240" value="${esc(avatar?.purpose || '')}" placeholder="Handles implementation and routine approvals"></label><label class="form-row"><span>Instructions</span><textarea id="avatar-prompt" rows="12" placeholder="You are my trusted engineering delegate…">${esc(avatar?.prompt || '')}</textarea></label>
-    <div class="avatar-defaults"><div><span>Authority</span><b id="avatar-authority-summary">${avatar?.authorityMode === 'restricted' ? esc(avatar.authorization.level) : 'Full delegation from you'}</b></div><div><span>Callable by</span><b>${callMode === 'me' ? 'Only you' : callMode === 'project' ? 'Everyone in this project' : 'Specific people and teams'}</b></div><div><span>Roles</span><b>${avatar ? esc(avatarRoleSummary(avatar)) : 'Any role'}</b></div><div><span>Runtime</span><b>${esc(`${runtime.provider}${runtime.model ? ` · ${runtime.model}` : ''}`)}</b></div></div>
+    <div class="avatar-defaults"><div><span>Authority</span><b id="avatar-authority-summary">${avatar?.authorityMode === 'restricted' ? esc(avatar.authorization.level) : 'Full delegation from you'}</b></div><div><span>Callable by</span><b>${callMode === 'me' ? 'Only you' : callMode === 'project' ? 'Everyone in this project' : 'Specific people and teams'}</b></div><div><span>Roles</span><b>${avatar ? esc(avatarRoleSummary(avatar)) : 'Any role'}</b></div><div><span>Runtime</span><b>${esc(formatModelRef(runtime))}</b></div></div>
     <details class="settings-disclosure avatar-customize" ${avatar && (avatar.authorityMode === 'restricted' || callMode !== 'me' || roles.size) ? 'open' : ''}><summary><b>Customize…</b></summary><div class="avatar-custom-section"><div class="section-h">Authority</div>
       <label class="choice-row"><input type="radio" name="avatar-authority" value="full" ${avatar?.authorityMode !== 'restricted' ? 'checked' : ''}><span><b>Full delegation</b><small>All ${siteNameMarkup()}, GitHub, and Vault authority you can delegate.</small></span></label><label class="choice-row"><input type="radio" name="avatar-authority" value="restricted" ${avatar?.authorityMode === 'restricted' ? 'checked' : ''}><span><b>Restricted delegation</b><small>Choose an authorization level and credentials.</small></span></label>
       <div id="avatar-restricted" ${avatar?.authorityMode === 'restricted' ? '' : 'hidden'}>${authorizationEditorHtml('avatar-authorization', selectedAuth, S.projects.filter((item) => item.organizationId === proj.organizationId), proj.id)}<button class="btn tf-vault-button" id="avatar-vault" type="button"><span>Vault credentials</span><span id="avatar-vault-count">${selectedCredentialIds.size} selected</span></button></div>${activeGithub ? `<label class="choice-row compact"><input id="avatar-github" type="checkbox" ${avatar?.githubAccountId ? 'checked' : ''}><span><b>Use GitHub account ${esc(activeGithub.login)}</b><small>Delegate this connected account to the Avatar.</small></span></label>` : ''}</div>
       <div class="avatar-custom-section"><div class="section-h">Callable by</div><select id="avatar-call-mode"><option value="me" ${callMode === 'me' ? 'selected' : ''}>Only me</option><option value="project" ${callMode === 'project' ? 'selected' : ''}>Everyone in this project</option><option value="specific" ${callMode === 'specific' ? 'selected' : ''}>Specific people and teams</option></select><input id="avatar-callers" value="${esc(callMode === 'specific' ? avatar.callableBy.join(', ') : '')}" placeholder="user:id, @team:engineering" ${callMode === 'specific' ? '' : 'hidden'}></div>
       <div class="avatar-custom-section"><div class="section-h">Roles</div><label class="choice-row compact"><input id="avatar-any-role" type="checkbox" ${roles.size ? '' : 'checked'}><span><b>Any role</b></span></label><div class="avatar-role-grid" ${roles.size ? '' : 'hidden'}>${[['do','Working'],['confirm','Review'],['respond','Response'],['resolve','Resolve'],['merge','Merge'],['authorize','Authorize']].map(([id,label]) => `<label><input type="checkbox" value="${id}" ${roles.has(id) ? 'checked' : ''}> ${label}</label>`).join('')}</div></div>
-      <div class="avatar-custom-section"><div class="section-h">Runtime</div><div class="agent-controls"><select id="avatar-provider">${AGENT_PROVIDERS.map((provider) => `<option value="${provider}" ${provider === runtime.provider ? 'selected' : ''}>${provider}</option>`).join('')}</select><input id="avatar-model" value="${esc(runtime.model || '')}" placeholder="Project default model"><select id="avatar-effort"><option value="">Default effort</option>${['low','medium','high','xhigh','max'].map((effort) => `<option ${runtime.effort === effort ? 'selected' : ''}>${effort}</option>`).join('')}</select></div></div></details></div>
+      <div class="avatar-custom-section"><div class="section-h">Runtime</div><div class="agent-controls" id="avatar-runtime">${modelFieldHtml('avatar-ref', runtime)}</div></div></details></div>
     <div class="avatar-editor-actions"><button class="btn avatar-editor-cancel" type="button">Cancel</button><button class="btn primary avatar-editor-save" type="button">${avatar ? 'Save Avatar' : 'Create Avatar'}</button></div>`;
   overlay.querySelector('.avatar-editor-close').addEventListener('click', close); overlay.querySelector('.avatar-editor-cancel').addEventListener('click', close);
+  wireModelField(overlay.querySelector('#avatar-runtime .model-field'));
   const authorityInputs = [...overlay.querySelectorAll('[name="avatar-authority"]')];
   const syncAuthority = () => { const mode = authorityInputs.find((input) => input.checked)?.value || 'full'; overlay.querySelector('#avatar-restricted').hidden = mode !== 'restricted'; overlay.querySelector('#avatar-authority-summary').textContent = mode === 'full' ? 'Full delegation from you' : 'Restricted delegation'; };
   authorityInputs.forEach((input) => input.addEventListener('change', syncAuthority)); wireAuthorizationEditor(overlay.querySelector('#avatar-authorization'), S.projects.filter((item) => item.organizationId === proj.organizationId));
@@ -14256,9 +14892,7 @@ async function fillAvatarEditor(overlay, close, proj, avatar) {
       ...(requestedAuthorization ? { authorization: requestedAuthorization, credentialIds: [...selectedCredentialIds], credentialPolicies } : {}),
       githubAccountId: overlay.querySelector('#avatar-github')?.checked ? activeGithub?.id : null, callableBy,
       roles: anyRole.checked ? [] : [...roleGrid.querySelectorAll('input:checked')].map((input) => input.value),
-      runtime: { provider: overlay.querySelector('#avatar-provider').value,
-        model: overlay.querySelector('#avatar-model').value.trim() || undefined,
-        effort: overlay.querySelector('#avatar-effort').value || undefined } };
+      runtime: (({ provider, model, effort }) => ({ provider, model: model || undefined, effort: effort || undefined }))(readModelField(overlay.querySelector('#avatar-runtime'))) };
     const save = (body, current = avatar) => api(`/api/projects/${proj.id}/avatars${current ? `/${current.id}` : ''}`, {
       method: current ? 'PUT' : 'POST', body: JSON.stringify(body),
     });
@@ -14753,12 +15387,31 @@ function textareaCaretXY(ta, pos) {
   mirror.appendChild(marker);
   document.body.appendChild(mirror);
   const lineH = parseFloat(style.lineHeight) || parseFloat(style.fontSize) * 1.4;
-  const xy = {
-    top: rect.top + marker.offsetTop - ta.scrollTop + lineH,
-    left: rect.left + marker.offsetLeft - ta.scrollLeft,
-  };
+  const lineTop = rect.top + marker.offsetTop - ta.scrollTop;
+  const xy = { lineTop, top: lineTop + lineH, left: rect.left + marker.offsetLeft - ta.scrollLeft };
   mirror.remove();
   return xy;
+}
+// A caret menu opens below the caret's line, or above it when there is more room
+// there, and stays inside the viewport — scrolling rather than running off it.
+function placeCaretMenu(menu, ta, pos) {
+  const edge = 8, xy = textareaCaretXY(ta, pos);
+  const below = window.innerHeight - xy.top - edge, above = xy.lineTop - edge;
+  menu.style.maxHeight = '';
+  const natural = menu.offsetHeight;
+  const up = natural > below && above > below;
+  const room = Math.max(0, up ? above : below);
+  if (natural > room) menu.style.maxHeight = `${room}px`;
+  menu.style.top = up ? 'auto' : `${xy.top}px`;
+  menu.style.bottom = up ? `${window.innerHeight - xy.lineTop}px` : 'auto';
+  menu.style.left = `${Math.max(edge, Math.min(xy.left, window.innerWidth - menu.offsetWidth - edge))}px`;
+}
+// Keeps a scrolling menu's highlighted option in view.
+function revealActiveOption(menu) {
+  const opt = menu.querySelector('.active');
+  if (!opt) return;
+  if (opt.offsetTop < menu.scrollTop) menu.scrollTop = opt.offsetTop;
+  else if (opt.offsetTop + opt.offsetHeight > menu.scrollTop + menu.clientHeight) menu.scrollTop = opt.offsetTop + opt.offsetHeight - menu.clientHeight;
 }
 
 // Every wiring holds a window-level `resize` listener, and renders replace
@@ -14847,9 +15500,7 @@ function wireWikiMention(ta, projectId) {
       el.addEventListener('mousedown', (ev) => { ev.preventDefault(); choose(items[+el.dataset.i]); });
       el.addEventListener('mouseenter', () => { active = +el.dataset.i; highlight(); });
     });
-    const xy = textareaCaretXY(ta, token.start);
-    menu.style.left = `${Math.min(xy.left, window.innerWidth - 380)}px`;
-    menu.style.top = `${xy.top}px`;
+    placeCaretMenu(menu, ta, token.start);
   };
   const update = async () => {
     token = tokenAt();
@@ -14872,8 +15523,8 @@ function wireWikiMention(ta, projectId) {
     if (!menu) return;
     if (ev.key === 'Escape') { ev.preventDefault(); ev.stopImmediatePropagation(); close(); }
     else if (!items.length) return;
-    else if (ev.key === 'ArrowDown') { ev.preventDefault(); ev.stopImmediatePropagation(); active = (active + 1) % items.length; highlight(); }
-    else if (ev.key === 'ArrowUp') { ev.preventDefault(); ev.stopImmediatePropagation(); active = (active - 1 + items.length) % items.length; highlight(); }
+    else if (ev.key === 'ArrowDown') { ev.preventDefault(); ev.stopImmediatePropagation(); active = (active + 1) % items.length; highlight(); revealActiveOption(menu); }
+    else if (ev.key === 'ArrowUp') { ev.preventDefault(); ev.stopImmediatePropagation(); active = (active - 1 + items.length) % items.length; highlight(); revealActiveOption(menu); }
     else if (ev.key === 'Enter' || ev.key === 'Tab') { ev.preventDefault(); ev.stopImmediatePropagation(); choose(items[active]); }
   }, { signal });
   ta.addEventListener('blur', () => setTimeout(close, 150), { signal });
@@ -15127,27 +15778,27 @@ function settingsView(proj) {
     <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project">Project</a><a href="#project-agents">Agents</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced" data-settings-advanced hidden>Advanced</a></nav><div class="settings-content">
     <div class="settings-section-title" id="project"><div>Project</div></div>
     <div class="project-kind-guide" aria-label="Project dependency guide">
-      <button type="button" data-project-jump="project-git"><b>Code</b><span>Git repositories</span></button>
-      <button type="button" data-project-jump="project-secrets"><b>Secret</b><span>A sensitive value</span></button>
-      <button type="button" data-project-jump="project-data"><b>Data</b><span>Files ${siteNameMarkup()} versions</span></button>
-      <button type="button" data-project-jump="project-services"><b>Service</b><span>A live system tasks call</span></button>
-      <button type="button" data-project-jump="project-environment"><b>Environment</b><span>Tools tasks run with</span></button>
+      <button type="button" data-project-jump="project-git"><b>Git &amp; GitHub</b><span>Repositories</span></button>
+      <button type="button" data-project-jump="project-secrets"><b>Secrets</b><span>Keys and tokens</span></button>
+      <button type="button" data-project-jump="project-data"><b>Data</b><span>Versioned files</span></button>
+      <button type="button" data-project-jump="project-services"><b>Services</b><span>Live systems</span></button>
+      <button type="button" data-project-jump="project-environment"><b>Environment</b><span>Tools and setup</span></button>
       <button type="button" data-project-jump="project-computers"><b>Computers</b><span>Where tasks run</span></button>
     </div>
     <div class="project-config-section" id="project-git"><div class="project-config-number">01</div><div><h2>Git &amp; GitHub</h2></div></div>
-    <div class="card"><div id="project-repositories">Loading…</div><div class="settings-divider"></div><p class="task-sub">Development commits and pull requests use the task creator’s <a data-spa href="${profileRoute()}">personal Git identity</a>. Repository access and organization-owned automation stay separate.</p><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-code">Organization GitHub connection</a></div>
+    <div class="card"><div id="project-repositories">Loading…</div></div>
     <div class="project-config-section" id="project-secrets"><div class="project-config-number">02</div><div><h2>Secrets</h2></div></div>
     <div class="card"><div id="project-secrets-box">Loading…</div></div>
-    <div class="project-config-section" id="project-data"><div class="project-config-number">03</div><div><h2>Data ${policyTip(`Choose Data when ${siteName()} should capture and version the files; Storage only decides where the encrypted revisions live. A live S3 bucket, database or API that tasks call directly belongs under Services, with its access key under Secrets.`)}</h2><p>Files ${siteNameMarkup()} snapshots and versions: datasets, model weights, fixtures, and development databases.</p></div></div>
+    <div class="project-config-section" id="project-data"><div class="project-config-number">03</div><div><h2>Data ${policyTip(`Files ${siteName()} snapshots and versions: datasets, model weights, fixtures, development databases. Choose Data when ${siteName()} should capture and version the files; Storage only decides where the encrypted revisions live. A live S3 bucket, database or API that tasks call directly belongs under Services, with its access key under Secrets.`)}</h2></div></div>
     <div class="card"><div id="project-data-box">Loading…</div></div>
-    <div class="project-config-section" id="project-services"><div class="project-config-number">04</div><div><h2>Services ${policyTip('Use an external service for an API, hosted database or S3 bucket that tasks call directly, and a per-task container for an isolated dependency such as Postgres or Redis. Credentials belong in Secrets.')}</h2><p>Live systems tasks connect to, either shared externally or started privately for each task.</p></div></div>
+    <div class="project-config-section" id="project-services"><div class="project-config-number">04</div><div><h2>Services ${policyTip('Live systems tasks connect to. Use an external service for an API, hosted database or S3 bucket that tasks call directly, and a per-task container for an isolated dependency such as Postgres or Redis. Credentials belong in Secrets.')}</h2></div></div>
     <div class="card"><div id="project-services-box">Loading…</div></div>
-    <div class="project-config-section" id="project-environment"><div class="project-config-number">05</div><div><h2>Environment</h2><p>The base image, tools, setup, and boot commands available in every task world.</p></div></div>
+    <div class="project-config-section" id="project-environment"><div class="project-config-number">05</div><div><h2>Environment ${policyTip('The base image, tools, setup and boot commands every task starts with.')}</h2></div></div>
     <div class="card"><div id="project-environment-box">Loading…</div></div>
     <div class="project-config-section" id="project-computers"><div class="project-config-number">06</div><div><h2>Computers ${policyTip('The cloud computers this organization’s tasks run on. A task’s own computer—its size, experience and network—is set in Task defaults and the task form.')}</h2></div></div>
     <div class="card"><div id="project-computers-box">Loading…</div></div>
     <div class="settings-section-title" id="project-agents"><div>Agents</div></div>
-    <div class="card"><a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-agents">Organization agent accounts</a><div class="settings-divider"></div><div class="section-h">Account order for this project</div><div id="cred-editor-project">Loading…</div></div>
+    <div class="card"><div class="section-h section-h-action"><span>Account order ${policyTip('Tasks in this project use the first available account. Drag to reorder; switch one off to skip it here.')}</span><a class="btn sm ghost organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-agents">Manage accounts</a></div><div id="cred-editor-project">Loading…</div></div>
     <div class="settings-section-title" id="project-defaults"><div>Task defaults<small>How new tasks begin, unless a task says otherwise</small></div></div>
     ${settingsForms('project', proj.id)}
     <div class="settings-section-title" id="project-payments"><div>Payments<small>What this project's tasks may spend</small></div></div>${paymentsCard('project')}
@@ -15156,13 +15807,20 @@ function settingsView(proj) {
     <div class="card"><div id="project-conversation-sharing">Loading…</div></div>
     <div class="settings-section-title" id="project-workflows"><div>Workflows<small>The recipes this project's tasks run on</small></div></div>
     <div class="card" id="wf-pins-card">
-      <div class="section-h">Workflow versions</div>
-      <div id="wf-pins-list">Loading…</div></div>
+      <div class="section-h">Versions ${policyTip('New tasks start on the version chosen here; running tasks keep the version they started on. Latest follows platform releases.')}</div>
+      <div class="setting-rows" id="wf-pins-list">Loading…</div></div>
     <div class="settings-section-title" id="project-advanced" data-settings-advanced hidden><div>Advanced</div></div>
-    <div class="card" data-settings-advanced hidden>
-      <div class="section-h" data-settings-access="project" hidden>Project name</div>
-      <div class="inline-form"><input id="project-name" value="${esc(projectPath(proj))}" placeholder="Folder/Project" aria-label="Project name, including folders" data-settings-access="project" hidden><button class="btn sm primary" id="rename-project" data-settings-access="project" hidden>Save</button><button class="btn sm" id="move-project" data-settings-access="projectTransfer" hidden>Move to organization…</button><button class="btn sm danger" id="delete-project" data-settings-access="projectDelete" hidden>Delete project</button></div>
-    </div>
+    <div class="card" data-settings-advanced hidden><div class="setting-rows">
+      <div class="setting-row" data-settings-access="project" hidden><span class="setting-label">Name ${policyTip('Use / to put the project in folders, e.g. Clients/Website.')}</span>
+        <span class="setting-value"><input id="project-name" class="setting-input" value="${esc(projectPath(proj))}" placeholder="Folder/Project" aria-label="Project name, including folders"></span>
+        <span class="setting-actions"><button class="btn sm primary" id="rename-project">Save</button></span></div>
+      <div class="setting-row" data-settings-access="projectTransfer" hidden><span class="setting-label">Organization</span>
+        <span class="setting-value">${esc(organizationById(proj.organizationId)?.name || '')}</span>
+        <span class="setting-actions"><button class="btn sm" id="move-project">Move…</button></span></div>
+      <div class="setting-row danger" data-settings-access="projectDelete" hidden><span class="setting-label">Delete project</span>
+        <span class="setting-value setting-muted">Removes the project and all its tasks</span>
+        <span class="setting-actions"><button class="btn sm danger" id="delete-project">Delete…</button></span></div>
+    </div></div>
     <div class="settings-section-title" id="project-experimental"><div>Experimental<small>Optional features for this project</small></div></div>
     <div class="card"><div id="project-avatar-settings">Loading…</div></div>
     </div></div></div>`;
@@ -15181,22 +15839,24 @@ async function hydrateConversationSharing(scope, id) {
   const url = `/api/${scope === 'project' ? 'projects' : 'organizations'}/${encodeURIComponent(id)}/conversation-sharing`;
   try {
     const policy = await api(url);
-    box.innerHTML = `<div class="section-h">Public conversation links</div><p class="task-sub">Allow developers to create public snapshots of agent conversations. Anyone with a link can read its message text. Disabling sharing makes existing links unavailable until re-enabled.</p>
-      <label class="form-row"><span>${scope === 'organization' ? 'Organization policy' : `Project policy · organization ${policy.organization ? 'allows' : 'disallows'} sharing`}</span><select ${policy.canManage ? '' : 'disabled'}>
-        ${scope === 'organization' ? `<option value="disabled" ${!policy.enabled ? 'selected' : ''}>Disabled</option><option value="enabled" ${policy.enabled ? 'selected' : ''}>Allow developers to share</option>` : `<option value="inherit" ${policy.value === 'inherit' ? 'selected' : ''}>Use organization policy</option><option value="disabled" ${policy.value === 'disabled' ? 'selected' : ''}>Disable for this project</option>`}
-      </select></label><button class="btn sm" data-save ${policy.canManage ? '' : 'disabled'}>Save</button>`;
+    const options = scope === 'organization'
+      ? [['disabled', 'Off'], ['enabled', 'Allowed']]
+      : [['inherit', `Organization default (${policy.organization ? 'allowed' : 'off'})`], ['disabled', 'Off for this project']];
+    const current = scope === 'organization' ? (policy.enabled ? 'enabled' : 'disabled') : policy.value;
+    box.innerHTML = `<div class="setting-row"><span class="setting-label">Public links ${policyTip('Lets developers publish a read-only snapshot of an agent conversation; anyone with the link can read it. Turning this off hides existing links until it is back on.')}</span>
+      <span class="setting-value"><select aria-label="Public conversation links" ${policy.canManage ? '' : 'disabled'}>${options.map(([value, label]) =>
+        `<option value="${value}" ${current === value ? 'selected' : ''}>${esc(label)}</option>`).join('')}</select></span></div>`;
     const select = box.querySelector('select');
     let saved = select.value;
-    box.querySelector('[data-save]').onclick = async (event) => {
-      const button = event.currentTarget;
-      button.disabled = select.disabled = true;
+    select.onchange = async () => {
+      select.disabled = true;
       try {
         const value = select.value;
         await api(url, { method: 'PUT', body: JSON.stringify(scope === 'organization' ? { enabled: value === 'enabled' } : { value }) });
         saved = value;
         toast('Public sharing policy saved');
       } catch (error) { select.value = saved; toast(error.message, true); }
-      finally { button.disabled = select.disabled = false; }
+      finally { select.disabled = false; }
     };
   } catch (error) { paneError(box, error, () => hydrateConversationSharing(scope, id)); }
 }
@@ -15210,8 +15870,11 @@ async function hydrateAvatarAvailability(scope, id) {
   try {
     const policy = await api(url);
     const enabled = scope === 'organization' ? policy.enabled : policy.effective;
-    box.innerHTML = `<div class="section-h">Avatars</div><p class="task-sub">Trusted agents with delegated authority. Disabled by default. ${scope === 'organization' ? 'Projects can override this default in either direction.' : `Organization default: ${policy.organization ? 'enabled' : 'disabled'}. This project ${policy.project === 'inherit' ? 'inherits the default' : 'overrides the default'}.`} Existing Avatars and their history are retained when disabled.</p>
-      <div class="inline-form"><button type="button" class="btn sm avatar-availability-toggle" aria-pressed="${enabled}">${enabled ? 'Disable' : 'Enable'} Avatars</button>${scope === 'project' ? `<button type="button" class="btn sm avatar-availability-inherit" ${policy.project === 'inherit' ? 'disabled' : ''}>Use organization default</button>` : ''}</div>`;
+    const state = scope === 'organization' ? (enabled ? 'On' : 'Off')
+      : `${enabled ? 'On' : 'Off'} · ${policy.project === 'inherit' ? 'organization default' : 'set for this project'}`;
+    box.innerHTML = `<div class="setting-row"><span class="setting-label">Avatars ${policyTip(`Trusted agents with delegated authority. Disabled by default. ${scope === 'organization' ? 'Projects can override this.' : ''} Turning them off keeps existing Avatars and their history.`)}</span>
+      <span class="setting-value setting-muted">${state}</span>
+      <span class="setting-actions">${scope === 'project' && policy.project !== 'inherit' ? '<button type="button" class="btn sm ghost avatar-availability-inherit">Use organization default</button>' : ''}<button type="button" class="btn sm avatar-availability-toggle" aria-pressed="${enabled}">${enabled ? 'Disable' : 'Enable'} Avatars</button></span></div>`;
     const save = async (button, body) => {
       button.disabled = true;
       try {
@@ -15227,24 +15890,41 @@ async function hydrateAvatarAvailability(scope, id) {
   } catch (error) { paneError(box, error, () => hydrateAvatarAvailability(scope, id)); }
 }
 
+// Where a secret goes: blank exports it to every command; a .env file makes it
+// a line of that file (so each repository can have its own value for a name);
+// any other file takes the whole value.
+function secretPlace(location) { return location ? `${location.repository ? `${location.repository}/` : ''}${location.path}` : ''; }
+function secretDestinationComboHtml(id) {
+  return `<div class="combo secret-destination"><input id="${id}" placeholder="Every command" aria-label="Deliver to" autocomplete="off" spellcheck="false" /><button type="button" class="combo-caret" tabindex="-1" aria-label="Show .env files">▾</button><div class="combo-menu" hidden></div></div>`;
+}
+
 async function hydrateProjectSecrets(proj) {
   const box = $('#project-secrets-box'); if (!box || S.projectId !== proj.id) return;
   const renderIsCurrent = beginAsyncElementRender(box);
   try {
-    const { secrets, suggestions = [] } = await api(`/api/projects/${encodeURIComponent(proj.id)}/secrets`);
+    const { secrets, repositories = [], suggested = [] } = await api(`/api/projects/${encodeURIComponent(proj.id)}/secrets`);
     if (!renderIsCurrent()) return;
-    box.innerHTML = `${secrets.map((secret) => `<div class="project-resource-row"><div class="project-resource-main"><b>${esc(secret.name)}</b><div class="project-resource-meta"><span class="chip">${secret.file ? 'private file' : 'environment variable'}</span><span class="project-resource-location"><span>Delivered as</span><code>${esc(secret.file || secret.variable || secret.name)}</code></span><span class="chip" title="${secret.file ? 'Applies to running tasks too.' : 'Applies to running tasks too. Processes already running keep their old environment until restarted.'}">configured</span></div></div><button class="btn sm project-secret-delete" data-id="${esc(secret.id)}">Remove</button></div>`).join('')}
-      ${suggestions.length ? `<div class="proposal-card"><b>Found in this repository</b><p class="task-sub">These names came from .env.example; nothing has been imported.</p><div class="inline-form">${suggestions.map((name) => `<button class="btn sm project-secret-suggest" data-name="${esc(name)}">＋ ${esc(name)}</button>`).join('')}</div></div>` : ''}
-      <details class="settings-disclosure compact" id="project-secret-add"><summary><b>Add a secret</b><span>Environment variable or private file</span></summary>
+    const place = (secret) => secret.dotenv ? secretPlace(secret.dotenv) : secret.file ? secretPlace({ path: secret.file, repository: secret.repository }) : '';
+    const sorted = [...secrets].sort((a, b) => place(a).localeCompare(place(b)) || (a.variable || a.name).localeCompare(b.variable || b.name));
+    const destinationTip = 'Blank: an environment variable in every command. A .env file: a line of it, so each repository can have its own value. Any other file: the value is the whole file.';
+    const byRepository = repositories.map((repository) => [repository, suggested.filter((entry) => entry.repository === repository)]).filter(([, names]) => names.length);
+    box.innerHTML = `${sorted.map((secret) => `<div class="project-resource-row"><div class="project-resource-main"><b>${esc(secret.dotenv ? secret.variable : secret.name)}</b><div class="project-resource-meta"><span class="chip">${secret.dotenv ? '.env line' : secret.file ? 'private file' : 'environment variable'}</span><span class="project-resource-location"><span>${secret.dotenv ? 'In' : 'Delivered as'}</span><code>${esc(place(secret) || secret.variable || secret.name)}</code></span><span class="chip" title="${secret.file || secret.dotenv ? 'Applies to running tasks too.' : 'Applies to running tasks too. Processes already running keep their old environment until restarted.'}">configured</span></div></div><button class="btn sm project-secret-delete" data-id="${esc(secret.id)}">Remove</button></div>`).join('')}
+      ${byRepository.length ? `<div class="proposal-card"><b>Found in .env.example</b> ${policyTip('Names only; nothing has been imported.')}${byRepository.map(([repository, names]) => `<div class="inline-form">${repositories.length > 1 ? `<span class="task-sub">${esc(repository)}</span>` : ''}${names.map(({ name }) => `<button class="btn sm project-secret-suggest" data-name="${esc(name)}" data-repository="${esc(repository)}">＋ ${esc(name)}</button>`).join('')}</div>`).join('')}</div>` : ''}
+      <details class="settings-disclosure compact" id="project-secret-add"><summary><b>Add a secret</b><span>Environment variable, .env line or private file</span></summary>
         <div class="project-form-grid">
           <label class="form-row"><span>Name</span><input id="project-secret-name" placeholder="DATABASE_URL"><small class="field-help">How this secret is identified in ${siteNameMarkup()}.</small></label>
           <label class="form-row"><span>Value</span><input id="project-secret-value" type="password" autocomplete="new-password" placeholder="Write-only value"><small class="field-help">Encrypted immediately and never returned by the API.</small></label>
-          <label class="form-row wide"><span>Deliver as a private file <small>(optional)</small></span><input id="project-secret-file" placeholder=".secrets/service-account.json"><small class="field-help">Leave blank to inject it as an environment variable with the name above. File secrets are mode 0600 and privately Git-excluded.</small></label>
+          <div class="form-row wide"><span>Deliver to ${policyTip(destinationTip)}</span>${secretDestinationComboHtml('project-secret-file')}</div>
         </div><div class="project-form-actions"><button class="btn sm primary" id="project-secret-save">Save secret</button></div>
       </details>
-      <details class="settings-disclosure compact"><summary><b>Import a pasted .env</b><span>Review names, paste once</span></summary><textarea id="project-secret-env" rows="5" placeholder="KEY=value&#10;# blank values are ignored" style="width:100%"></textarea><button class="btn sm primary" id="project-secret-import">Import</button></details>`;
+      <details class="settings-disclosure compact" id="project-secret-paste"><summary><b>Import a pasted .env</b><span>Review names, paste once</span></summary><textarea id="project-secret-env" rows="5" placeholder="KEY=value&#10;# blank values are ignored" style="width:100%"></textarea><div class="form-row wide"><span>Into ${policyTip(destinationTip)}</span>${secretDestinationComboHtml('project-secret-env-file')}</div><button class="btn sm primary" id="project-secret-import">Import</button></details>`;
+    const dotenvOptions = () => repositories.map((repository) => `${repository}/.env`);
+    box.querySelectorAll('.secret-destination').forEach((combo) => wireCombo(combo, dotenvOptions, null));
     box.querySelectorAll('.project-secret-suggest').forEach((button) => button.addEventListener('click', () => {
-      box.querySelector('#project-secret-add').open = true; box.querySelector('#project-secret-name').value = button.dataset.name; box.querySelector('#project-secret-value').focus();
+      box.querySelector('#project-secret-add').open = true; box.querySelector('#project-secret-name').value = button.dataset.name;
+      // With several repositories, the name goes where its .env.example asked for it.
+      box.querySelector('#project-secret-file').value = repositories.length > 1 ? `${button.dataset.repository}/.env` : '';
+      box.querySelector('#project-secret-value').focus();
     }));
     box.querySelectorAll('.project-secret-delete').forEach((button) => button.addEventListener('click', async () => {
       if (!confirm('Remove this secret and its vault value?')) return;
@@ -15263,7 +15943,8 @@ async function hydrateProjectSecrets(proj) {
     box.querySelector('#project-secret-import')?.addEventListener('click', async () => {
       try {
         const result = await api(`/api/projects/${proj.id}/secrets`, { method: 'POST',
-          body: JSON.stringify({ env: box.querySelector('#project-secret-env').value }) });
+          body: JSON.stringify({ env: box.querySelector('#project-secret-env').value,
+            file: box.querySelector('#project-secret-env-file').value.trim() || undefined }) });
         toast(`Imported ${result.imported.length} secret${result.imported.length === 1 ? '' : 's'}`);
         await hydrateProjectSecrets(proj);
       } catch (error) { toast(error.message, true); }
@@ -15285,7 +15966,6 @@ async function hydrateProjectData(proj) {
       || storageLocations.find((location) => location.isDefault)?.name || 'Managed storage';
     if (!renderIsCurrent()) return;
     box.innerHTML = `      ${resources.map((resource) => `<div class="project-resource-row" data-data-resource="${esc(resource.id)}"><div class="project-resource-main"><b>${esc(resource.name)}</b><div class="project-resource-meta"><span class="project-resource-location"><span>Inside each task</span><code>${esc(resource.target.path)}</code></span><span class="chip">${esc(storageName(resource.storageLocationId))}</span><span class="chip">${resource.access === 'write' ? 'private writable copy' : 'read-only'}</span><span class="chip">${resource.publish === 'review' ? 'changes can be promoted' : 'task changes discarded'}</span>${resource.revision ? `<span>${formatBytes(resource.revision.bytes)} · revision ${esc(resource.revision.id)}</span>` : '<span>No initial data</span>'}</div></div><button class="btn sm resource-toggle">${resource.enabled ? 'Disable' : 'Enable'}</button><button class="btn sm danger resource-delete">Remove</button></div>`).join('')}
-      ${hostLocal() ? '<div class="inline-form"><button class="btn sm" id="data-discover">Discover from repo</button></div><div id="data-proposals"></div>' : ''}
       <details class="settings-disclosure compact" id="data-add-panel"><summary><b>Add data</b></summary>
         <div class="project-form-grid">
           <label class="form-row"><span>Name</span><input id="data-name" placeholder="Training data"></label>
@@ -15300,7 +15980,8 @@ async function hydrateProjectData(proj) {
           <label class="form-row wide"><span>Upload files <small>(optional)</small></span><input id="data-files" type="file" multiple></label>
           <label class="form-row wide"><span>${hostLocal() ? 'Or upload' : 'Upload'} a folder <small>(optional)</small></span><input id="data-folder" type="file" multiple webkitdirectory><small class="field-help">Leave the initial files blank to define the resource without importing data. No files are supplied to tasks until data is added. For task-generated output, choose writable access; choose “Promote” during Review to offer those files for future tasks.</small></label>
         </div><div class="project-form-actions"><button class="btn sm primary" id="data-add">Add data</button></div>
-      </details>`;
+      </details>
+      ${hostLocal() ? '<button class="action-row" type="button" id="data-discover"><b>Discover from repo</b><span>Finds ignored data files</span></button><div id="data-proposals"></div>' : ''}`;
     box.querySelectorAll('[data-data-resource]').forEach((row) => {
       const resource = resources.find((item) => item.id === row.dataset.dataResource);
       row.querySelector('.resource-toggle').addEventListener('click', async () => {
@@ -15365,8 +16046,7 @@ async function hydrateProjectServices(proj) {
     const data = resources.filter((resource) => ['volume@1', 'object-tree@1'].includes(resource.driver) && resource.target.kind === 'path');
     if (!renderIsCurrent()) return;
     box.innerHTML = `      ${services.map((service) => `<div class="project-resource-row"><div class="project-resource-main"><b>${esc(service.name)}</b><div class="project-resource-meta"><span class="chip">${service.kind === 'per-world' ? 'private per task' : 'shared external'}</span>${service.image ? `<span class="project-resource-location"><span>Image</span><code>${esc(service.image)}</code></span>` : ''}${service.urlEnv ? `<span class="project-resource-location"><span>Connection variable</span><code>${esc(service.urlEnv)}</code></span>` : ''}</div></div><button class="btn sm service-delete" data-name="${esc(service.name)}">Remove</button></div>`).join('')}
-      <div class="inline-form"><button class="btn sm" id="service-discover">Discover from Compose/devcontainer</button></div><div id="service-proposals"></div>
-      <details class="settings-disclosure compact"><summary><b>Add a service manually</b></summary>
+      <details class="settings-disclosure compact" id="service-add-panel"><summary><b>Add a service</b></summary>
         <div class="project-form-grid">
           <label class="form-row"><span>Name</span><input id="service-name" placeholder="Postgres development database"></label>
           <label class="form-row"><span>How tasks reach it</span><select id="service-kind"><option value="per-world">Start a private container for every task</option><option value="external">Connect to an existing external service</option></select></label>
@@ -15383,7 +16063,8 @@ async function hydrateProjectServices(proj) {
           <label class="form-row wide"><span>Connection secret</span><select id="service-connection"><option value="">Choose a configured secret…</option>${secrets.map((resource) => `<option value="${esc(resource.id)}">${esc(resource.name)}</option>`).join('')}</select><small class="field-help">Create the bucket URL, database URL, API key, or connection JSON under Secrets first. ${siteNameMarkup()} passes only an opaque credential handle to the task world.</small></label>
         </div></div>
         <div class="project-form-actions"><button class="btn sm primary" id="service-save">Save service</button></div>
-      </details>`;
+      </details>
+      <button class="action-row" type="button" id="service-discover"><b>Discover from repo</b><span>Reads Compose and devcontainer files</span></button><div id="service-proposals"></div>`;
     const syncServiceFields = () => box.querySelectorAll('[data-service-kind]').forEach((fields) => {
       fields.hidden = fields.dataset.serviceKind !== box.querySelector('#service-kind').value;
     });
@@ -15436,7 +16117,7 @@ async function hydrateProjectEnvironment(proj) {
     const installRepos = [...new Set([...repositories, ...Object.keys(spec?.install || {})])];
     const build = (record) => `<div class="queue-item"><div style="flex:1"><b>${esc(record.provider)}</b> <span class="chip">${record.status === 'ready' ? '🟢 ready' : record.status === 'building' ? '⏳ building' : '🔴 failed'}</span> <span class="chip"${record.stale ? ' title="Built on an older base image. Rebuild to use it."' : ''}>${esc(record.digest.slice(0, 8))}${(digest && record.digest !== digest) || record.stale ? ' · stale' : ''}</span>${record.ref && record.ref !== 'host' ? ` <span class="chip">${esc(record.ref)}</span>` : ''}<div class="task-sub">${record.error ? esc(record.error) : ''}</div></div>${record.status === 'building' ? `<button class="btn sm" data-environment-recover="${esc(record.recoveryRevision)}">Recover abandoned build…</button>` : ''}</div>`;
     if (!renderIsCurrent()) return;
-    box.innerHTML = `<div class="inline-form"><button class="btn sm" id="environment-propose">Discover from repo</button><div id="environment-evidence"></div></div>
+    box.innerHTML = `<button class="action-row" type="button" id="environment-propose"><b>Discover from repo</b><span>Suggests a recipe from your repository</span></button><div id="environment-evidence"></div>
       <datalist id="environment-image-options">
         <option value="node:22-bookworm">Node.js 22 · Debian</option>
         <option value="node:22-slim">Node.js 22 · slim</option>
@@ -15609,6 +16290,98 @@ function openNewGithubRepositoryDialog(proj, gitConnections, opener) {
   $('#modal-root').appendChild(host); document.addEventListener('keydown', keydown);
   host.querySelector('#project-new-repo-name').focus();
 }
+// A repository source as people name it: owner/name for GitHub, the path or URL
+// otherwise. The exact source stays on hover.
+function repositorySourceView(source) {
+  const github = /^(?:git@github\.com:|(?:ssh:\/\/git@|https?:\/\/)(?:ssh\.)?github\.com(?::\d+)?\/)([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/i.exec(source);
+  if (github) return { kind: 'github', owner: github[1], name: github[2], key: `${github[1]}/${github[2]}`.toLowerCase() };
+  return { kind: /^(?:\/|~|\.{1,2}\/)/.test(source) ? 'local' : 'git', name: source, key: source };
+}
+const folderIcon = () => '<svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M1.5 3.5A1.5 1.5 0 0 1 3 2h3.2l1.5 1.5H13A1.5 1.5 0 0 1 14.5 5v7.5A1.5 1.5 0 0 1 13 14H3a1.5 1.5 0 0 1-1.5-1.5v-9ZM3 3.5v9h10V5H7.1L5.6 3.5H3Z"/></svg>';
+const gitIcon = () => '<svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M5 2.5a1.5 1.5 0 0 0-.75 2.8v5.4a1.5 1.5 0 1 0 1.5 0V8.6c.4.25.9.4 1.5.4h2.1a1.5 1.5 0 1 0 0-1.5H7.25c-.83 0-1.5-.67-1.5-1.5v-.7A1.5 1.5 0 0 0 5 2.5Z"/></svg>';
+
+// Settings → Project → Git & GitHub: the project's repositories (each add or
+// remove saves at once), then who gives access and who commits.
+function renderProjectRepositories(box, proj, { repositories, gitConnections, githubApp, githubLoadError, githubLogin }) {
+  const sources = proj.config.repos || [];
+  const attached = new Set(sources.map((source) => repositorySourceView(source).key));
+  const choices = repositories.filter((repository) => !attached.has(`${repository.owner}/${repository.name}`.toLowerCase()));
+  // Hosted projects may only use repositories the organization's GitHub reaches.
+  const pickOnly = !!S.meta?.hosted;
+  const canAdd = !pickOnly || repositories.length > 0;
+  const placeholder = !canAdd ? 'Connect GitHub to add repositories'
+    : [repositories.length ? 'owner/repository' : '', pickOnly ? '' : 'Git URL', hostLocal() ? 'local path' : '']
+      .filter(Boolean).join(', ').replace(/, ([^,]*)$/, ' or $1');
+  const canCreate = githubApp.configured && gitConnections.length && githubApp.userAuthorized;
+  const row = (source) => {
+    const view = repositorySourceView(source);
+    const name = view.kind === 'github'
+      ? `<a class="git-repo-name" href="https://github.com/${esc(view.owner)}/${esc(view.name)}" target="_blank" rel="noopener noreferrer" title="${esc(source)}"><span>${esc(view.owner)}/</span>${esc(view.name)}</a>`
+      : `<span class="git-repo-name mono" title="${esc(source)}">${esc(source)}</span>`;
+    return `<div class="git-repo" data-source="${esc(source)}"><span class="git-repo-icon">${view.kind === 'github' ? githubMark() : view.kind === 'local' ? folderIcon() : gitIcon()}</span>${name}<button class="icon-btn git-repo-remove" type="button" title="Remove" aria-label="Remove ${esc(view.kind === 'github' ? `${view.owner}/${view.name}` : source)}">×</button></div>`;
+  };
+  const organizationLink = `${globalRoute('organization', organizationById(proj.organizationId))}#settings-code`;
+  const needsUpdate = gitConnections.some((connection) => connection.permissionStatus && !connection.permissionStatus.ready);
+  const access = githubLoadError ? { value: '<span id="project-github-error"></span>', actions: '' }
+    : !githubApp.configured ? { value: `<span class="setting-muted">Not set up</span>${S.installationAccess ? '' : policyTip('Your administrator needs to set up GitHub first.')}`,
+      actions: S.installationAccess ? `<a class="btn sm primary" data-spa href="${installationRoute()}#installation-github">Set up</a>` : '' }
+    : !gitConnections.length ? { value: '<span class="setting-muted">Not connected</span>', actions: '<button class="btn sm primary" id="project-connect-github" type="button">Connect GitHub</button>' }
+    : { value: `${gitConnections.map((connection) => `<b>${esc(connection.accountLogin)}</b>`).join('<span class="setting-sep">·</span>')}${needsUpdate ? '<span class="chip setting-warn" title="Approve GitHub’s updated access in organization settings">needs update</span>' : ''}`,
+      actions: `<button class="icon-btn" id="project-refresh-github" type="button" title="Refresh repository list" aria-label="Refresh repository list">↻</button><a class="btn sm" data-spa href="${organizationLink}">Manage</a>` };
+  const identity = `<b>You</b>${githubLogin && githubApp.userAuthorized ? `<span class="setting-sep">·</span><span class="setting-muted">${esc(githubLogin)}</span>` : ''}`;
+  box.innerHTML = `<div class="section-h">Repositories</div>
+    <div class="git-repos">
+      <div id="project-repository-fields">${sources.map(row).join('')}</div>
+      <form class="git-repo-add" id="project-repository-add-form">
+        <input id="project-repository-input" list="project-repository-options" autocomplete="off" spellcheck="false" aria-label="Add a repository" placeholder="${esc(placeholder)}" ${canAdd ? '' : 'disabled'}>
+        <button class="btn sm" type="submit" id="project-repository-add" ${canAdd ? '' : 'disabled'}>Add</button>
+        ${canCreate ? '<button class="btn sm" id="project-new-repo-open" type="button" aria-haspopup="dialog">New repository</button>' : ''}
+      </form>
+    </div>
+    <datalist id="project-repository-options">${choices.map((repository) => `<option value="${esc(repository.owner)}/${esc(repository.name)}"></option>`).join('')}</datalist>
+    <div class="setting-rows ruled git-facts">
+      <div class="setting-row" id="project-github-access"><span class="setting-label">GitHub ${policyTip('The GitHub accounts this organization connected. Their repositories can be added above.')}</span><span class="setting-value">${access.value}</span><span class="setting-actions">${access.actions}</span></div>
+      <div class="setting-row" id="project-github-identity"><span class="setting-label">Commits as ${policyTip('Each task commits and opens pull requests as the person who created it.')}</span><span class="setting-value">${identity}</span><span class="setting-actions">${githubAuthorizeButton(githubApp, 'project-authorize-github')}<a class="btn sm" data-spa href="${profileRoute()}">Manage</a></span></div>
+    </div>`;
+  const rerender = () => hydrateProjectAccess(projectById(proj.id) || proj);
+  if (githubLoadError) paneError($('#project-github-error'), githubLoadError, rerender);
+  const controls = () => box.querySelectorAll('#project-repository-add-form input, #project-repository-add-form button, .git-repo-remove');
+  const save = async (repos) => {
+    controls().forEach((control) => { control.disabled = true; });
+    try {
+      await api(`/api/projects/${proj.id}/repository-sources`, { method: 'PUT', body: JSON.stringify({ repos }) });
+      await loadProjects();
+      await rerender();
+      return true;
+    } catch (error) {
+      toast(error.message, true);
+      controls().forEach((control) => { control.disabled = false; });
+      return false;
+    }
+  };
+  box.querySelectorAll('.git-repo').forEach((item) => item.querySelector('.git-repo-remove').addEventListener('click', () =>
+    save(sources.filter((source) => source !== item.dataset.source))));
+  $('#project-repository-add-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const input = $('#project-repository-input');
+    const typed = input.value.trim();
+    if (!typed) return input.focus();
+    const known = repositories.find((repository) => `${repository.owner}/${repository.name}`.toLowerCase() === typed.toLowerCase()
+      || repository.sshUrl === typed) || repositories.find((repository) => repositorySourceView(repository.sshUrl).key === repositorySourceView(typed).key);
+    if (pickOnly && !known) return toast('Choose one of the organization’s GitHub repositories', true);
+    const source = known?.sshUrl || typed;
+    if (attached.has(repositorySourceView(source).key)) { input.value = ''; return toast('Already added'); }
+    if (await save([...sources, source])) $('#project-repository-input')?.focus();
+  });
+  $('#project-new-repo-open')?.addEventListener('click', (event) => openNewGithubRepositoryDialog(proj, gitConnections, event.currentTarget));
+  $('#project-connect-github')?.addEventListener('click', async () => { try { await connectOrganizationGithub(proj.organizationId, rerender); } catch (error) { toast(error.message, true); } });
+  $('#project-authorize-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/authorize`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (error) { toast(error.message, true); } });
+  $('#project-refresh-github')?.addEventListener('click', async (event) => {
+    const button = event.currentTarget; button.disabled = true;
+    try { const result = await api(`/api/organizations/${proj.organizationId}/github/refresh`, { method: 'POST', body: '{}' }); toast(`Found ${result.count} ${result.count === 1 ? 'repository' : 'repositories'}`); await rerender(); }
+    catch (error) { toast(error.message, true); button.disabled = false; }
+  });
+}
 async function hydrateProjectAccess(proj) {
   const accessBox = $('#project-access');
   const repositoryBox = $('#project-repositories');
@@ -15620,11 +16393,12 @@ async function hydrateProjectAccess(proj) {
     // Unreadable GitHub state offers Retry; read as "not connected" it would send
     // an organization that is connected into setup.
     let githubLoadError = null;
-    const [repositories, members, gitConnections, githubApp] = await Promise.all([
+    const [repositories, members, gitConnections, githubApp, userGithub] = await Promise.all([
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/repositories`),
       api(`/api/projects/${encodeURIComponent(proj.id)}/members`),
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/git-connections`).catch((error) => { githubLoadError = error; return []; }),
       api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/github/app`).catch((error) => { githubLoadError = error; return { configured: false }; }),
+      api('/api/user/github-accounts').catch(() => null),
     ]);
     if (!renderIsCurrent()) return;
     const userRecord = (id) => S.organizationMembers.find((member) => member.userId === id)?.user || S.users.find((user) => user.id === id);
@@ -15632,32 +16406,15 @@ async function hydrateProjectAccess(proj) {
     const principalName = (principal) => principal.kind === 'user' ? userName(principal.userId)
       : principal.kind === 'organization' ? '@all'
       : `@team:${S.teams.find((team) => team.id === principal.teamId)?.slug || principal.teamId}`;
-    accessBox.innerHTML = `<div class="section-h">Project access</div>
-      ${members.map((member) => { const id = member.principal.userId || member.principal.teamId || member.principal.organizationId; return `<div class="member-row" data-project-member data-kind="${esc(member.principal.kind)}" data-id="${esc(id)}"><span>${esc(principalName(member.principal))}</span>${member.protectedOwner ? '<span class="chip">project creator</span>' : ''}<span class="chip">${esc(member.profileId || 'developer')}</span><button class="btn sm project-member-remove">Remove</button></div>`; }).join('') || '<p class="task-sub">No project access overrides.</p>'}
-      <a class="btn sm organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-people">Manage people and authorization</a>`;
-    repositoryBox.innerHTML = `<div class="section-h">Repositories</div><p class="task-sub">Local repo, GitHub, or Git URL</p>
-      <datalist id="project-repository-options">${repositories.map((repository) => `<option value="${esc(repository.sshUrl)}">${esc(repository.owner)}/${esc(repository.name)}</option>`).join('')}</datalist>
-      <div id="project-repository-fields">${((proj.config.repos || []).length ? proj.config.repos : ['']).map((source) => `<div class="inline-form project-repository-field"><label class="form-row"><span>Repository source</span><input list="project-repository-options" value="${esc(source)}" placeholder="git@github.com:org/repo.git${hostLocal() ? ' or /srv/code/repo' : ''}"></label><button class="btn sm project-repository-remove" aria-label="Remove repository">Remove</button></div>`).join('')}</div>
-      <div class="inline-form"><button class="btn sm" id="project-repository-add">＋ Repository</button><button class="btn sm primary" id="project-repositories-save">Save repositories</button>${githubApp.configured && gitConnections.length && githubApp.userAuthorized ? '<button class="btn sm" id="project-new-repo-open" type="button" aria-haspopup="dialog">New repository...</button>' : ''}</div>
-      ${githubLoadError ? '<div id="project-github-error"></div>' : !githubApp.configured ? `<div class="inline-form">${S.installationAccess
-        ? `<a class="btn sm primary" data-spa href="${installationRoute()}#installation-github">Set up GitHub for this installation</a>`
-        : '<span class="task-sub">The installation operator must set up the shared GitHub App before repositories can be connected.</span>'}</div>`
-        : !gitConnections.length ? '<div class="inline-form"><button class="btn sm primary" id="project-connect-github">Choose GitHub repositories</button></div>'
-        : `<div class="inline-form"><button class="btn sm" id="project-refresh-github">Refresh from GitHub</button>${githubAuthorizeButton(githubApp, 'project-authorize-github')}</div>`}`;
+    accessBox.innerHTML = `<div class="section-h section-h-action"><span>Project access ${policyTip('People and teams with a role in this project beyond their organization role.')}</span><a class="btn sm ghost" data-spa href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-people">Manage people</a></div>
+      <div class="setting-rows">${members.map((member) => { const id = member.principal.userId || member.principal.teamId || member.principal.organizationId; return `<div class="setting-row member-line" data-project-member data-kind="${esc(member.principal.kind)}" data-id="${esc(id)}"><span class="setting-value"><b>${esc(principalName(member.principal))}</b>${member.protectedOwner ? '<span class="setting-muted">project creator</span>' : ''}</span><span class="chip">${esc(authorizationLevels().find((level) => level.id === (member.profileId || 'developer'))?.name || member.profileId || 'Developer')}</span><span class="setting-actions"><button class="icon-btn project-member-remove" type="button" title="Remove" aria-label="Remove ${esc(principalName(member.principal))}">×</button></span></div>`; }).join('') || '<p class="task-sub">Nobody has a project-specific role.</p>'}</div>`;
+    renderProjectRepositories(repositoryBox, proj, { repositories, gitConnections, githubApp, githubLoadError,
+      githubLogin: (userGithub?.accounts || []).find((account) => account.active)?.login });
     accessBox.querySelectorAll('[data-project-member]').forEach((row) => row.querySelector('.project-member-remove')?.addEventListener('click', async () => {
       if (!confirm('Remove this member’s access to the project?')) return;
       try { await api(`/api/projects/${proj.id}/members/${row.dataset.kind}/${encodeURIComponent(row.dataset.id)}`, { method: 'DELETE' }); await hydrateProjectAccess(proj); }
       catch (error) { toast(error.message, true); }
     }));
-    if (githubLoadError) paneError($('#project-github-error'), githubLoadError, () => hydrateProjectAccess(projectById(proj.id) || proj));
-    const wireRepositoryRemoves = () => repositoryBox.querySelectorAll('.project-repository-remove').forEach((button) => button.onclick = () => { button.closest('.project-repository-field').remove(); if (!$('#project-repository-fields').children.length) $('#project-repository-add').click(); });
-    wireRepositoryRemoves();
-    $('#project-repository-add')?.addEventListener('click', () => { $('#project-repository-fields').insertAdjacentHTML('beforeend', `<div class="inline-form project-repository-field"><label class="form-row"><span>Repository source</span><input list="project-repository-options" placeholder="git@github.com:org/repo.git${hostLocal() ? ' or /srv/code/repo' : ''}"></label><button class="btn sm project-repository-remove" aria-label="Remove repository">Remove</button></div>`); wireRepositoryRemoves(); });
-    $('#project-repositories-save')?.addEventListener('click', async () => { const repos = [...repositoryBox.querySelectorAll('.project-repository-field input')].map((input) => input.value.trim()).filter(Boolean); try { await api(`/api/projects/${proj.id}/repository-sources`, { method: 'PUT', body: JSON.stringify({ repos }) }); await loadProjects(); toast('Repositories saved'); await hydrateProjectAccess(projectById(proj.id)); } catch (error) { toast(error.message, true); } });
-    $('#project-new-repo-open')?.addEventListener('click', (event) => openNewGithubRepositoryDialog(proj, gitConnections, event.currentTarget));
-    $('#project-connect-github')?.addEventListener('click', async () => { try { await connectOrganizationGithub(proj.organizationId, () => hydrateProjectAccess(proj)); } catch (error) { toast(error.message, true); } });
-    $('#project-authorize-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/authorize`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (error) { toast(error.message, true); } });
-    $('#project-refresh-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/refresh`, { method: 'POST', body: '{}' }); toast(`Found ${result.count} ${result.count === 1 ? 'repository' : 'repositories'}`); await hydrateProjectAccess(proj); } catch (error) { toast(error.message, true); } });
   } catch (error) {
     if (renderIsCurrent()) accessBox.innerHTML = repositoryBox.innerHTML = `<span class="task-sub">${esc(error.message)}</span>`;
   }
@@ -15674,20 +16431,22 @@ async function hydrateWorkflowPins(projectId) {
     api(`/api/projects/${projectId}/workflow-pins`),
   ]); }
   catch {
-    if (renderIsCurrent()) box.innerHTML = '<span style="color:var(--ink-3)">Could not load workflow versions.</span>';
+    if (renderIsCurrent()) paneError(box, new Error('Could not load workflow versions'), () => hydrateWorkflowPins(projectId));
     return;
   }
   if (!renderIsCurrent()) return;
+  // Only a workflow with more than one version has anything to pin.
+  list = list.filter((w) => w.versions.length > 1 || (pins[w.name] && pins[w.name] !== 'latest'));
   box.innerHTML = list.map((w) => {
     const pinned = pins[w.name] ?? 'latest';
     const opts = [`<option value="latest" ${pinned === 'latest' ? 'selected' : ''}>latest (v${esc(w.latest)})</option>`]
       .concat(w.versions.slice().reverse().map((v) => `<option value="${esc(v)}" ${pinned === v ? 'selected' : ''}>v${esc(v)}</option>`))
       .join('');
-    return `<div class="queue-item">
-      <div style="flex:1"><b>${esc(w.name)}</b> <span class="chip">${w.source === 'bundled' ? 'built-in' : 'installed'}</span></div>
-      <select class="wf-pin" data-wf="${esc(w.name)}" data-saved="${esc(pinned)}" ${w.versions.length <= 1 ? 'disabled title="only one version"' : ''}>${opts}</select>
+    return `<div class="setting-row">
+      <span class="setting-value"><b title="${esc(w.description || '')}">${esc(w.name)}</b>${w.source === 'bundled' ? '' : '<span class="chip">installed</span>'}</span>
+      <span class="setting-actions"><select class="wf-pin" aria-label="${esc(w.name)} version" data-wf="${esc(w.name)}" data-saved="${esc(pinned)}">${opts}</select></span>
     </div>`;
-  }).join('');
+  }).join('') || '<p class="task-sub">No workflow has more than one version yet.</p>';
   box.querySelectorAll('.wf-pin').forEach((sel) => sel.addEventListener('change', async () => {
     try {
       await api(`/api/projects/${projectId}/workflow-pins`, { method: 'POST', body: JSON.stringify({ workflow: sel.dataset.wf, version: sel.value }) });
@@ -15979,8 +16738,7 @@ function globalSettingsView(embedded = false) {
     ${embedded ? '<div class="settings-section-title" id="settings-defaults"><div>Task defaults<small>How new tasks begin, unless a project or task says otherwise</small></div></div>' : '<div class="page-title">Organization settings</div><p style="color:var(--ink-2);margin-top:-8px">How new tasks behave unless a project or task deliberately changes something.</p>'}
     ${settingsForms('global')}
     <div class="settings-section-title" id="settings-payments"><div>Passwords &amp; payments<small>Credentials agents may use on your behalf, and what tasks may spend</small></div></div>
-    <div class="card" id="settings-connections"><div class="section-h">Connected apps</div>
-      <p class="task-sub">List of connected apps. To set defaults, go to <a href="#settings-defaults">Task defaults</a>.</p>
+    <div class="card" id="settings-connections"><div class="section-h">Connected apps ${policyTip('Apps agents can use through MCP or Composio. Choose which ones new tasks get in Task defaults.')}</div>
       <div id="native-connections">Loading connections…</div></div>
     ${passwordsCard()}
     ${vaultRequestsCard()}
@@ -15988,53 +16746,50 @@ function globalSettingsView(embedded = false) {
     ${paymentsCard('global')}
     <div class="settings-section-title" id="settings-agents"><div>Agents</div></div>
     <div class="card" id="accounts-card">
-      <div class="section-h">Agent accounts <span class="chip">organization resource</span></div>
-      <div id="cred-editor-global" style="margin-bottom:14px">Loading…</div>
-      <div id="account-status" style="margin-bottom:14px"></div>
-
-      <div style="font-weight:600;margin-bottom:4px">Connect a login (subscription)</div>
-      <div class="form-row"><label>Connect a login</label>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-          <select id="login-provider"><option value="claude">Claude Code</option><option value="codex">Codex</option><option value="opencode">OpenCode</option></select>
+      <div class="section-h">Accounts ${policyTip('Tasks use the first available account, in this order. Drag to reorder; switch one off to skip it. Projects can reorder them for themselves.')}</div>
+      <div id="cred-editor-global">Loading…</div>
+      <div id="account-status"></div>
+      <div class="section-h">Add an account</div>
+      <div class="setting-rows ruled account-add">
+      <div class="setting-row"><span class="setting-label">Subscription ${policyTip('Sign in with a Claude, ChatGPT/Codex or Grok subscription.')}</span>
+        <div class="setting-value">
+          <select id="login-provider" aria-label="Subscription"><option value="claude">Claude Code</option><option value="codex">Codex</option><option value="opencode">OpenCode</option></select>
           <select id="login-opencode-target" hidden title="Subscription routed through OpenCode">
             <option value="xai|xAI Grok OAuth (Headless / Remote / VPS)">SuperGrok / Grok or X Premium (device code)</option>
             <option value="xai|xAI Grok OAuth (SuperGrok Subscription)">SuperGrok / Grok or X Premium (local browser)</option>
           </select>
-          <input id="login-name" placeholder="account name (e.g. personal)" style="flex:1;min-width:120px" />
-          <button class="btn primary" id="login-connect">Connect</button>
+          <input id="login-name" placeholder="Name, e.g. personal" aria-label="Account name" class="grow" />
         </div>
-        <div id="login-result" style="font-size:12px;margin-top:6px"></div>
-        <div id="login-opencode-note" hidden style="font-size:11px;color:var(--ink-3);margin-top:4px">OpenCode stores this subscription in its isolated home. Kimi and Google consumer subscriptions are not claimed here; use a Kimi/Google API key (or Google Vertex credentials) instead.</div>
+        <span class="setting-actions"><button class="btn sm primary" id="login-connect">Connect</button></span>
       </div>
-
-      <div style="font-weight:600;margin:14px 0 4px">Register an API key</div>
-      <div class="form-row"><label>Register a key</label>
-        <div style="display:flex;gap:8px;flex-wrap:wrap">
-          <input id="acct-provider" list="model-provider-options" value="kimi" placeholder="model provider" style="width:150px" />
+      <div id="login-result" class="account-add-note"></div>
+      <div id="login-opencode-note" hidden class="account-add-note">Kimi and Google consumer subscriptions can’t be used here; add a Kimi or Google API key instead.</div>
+      <div class="setting-row"><span class="setting-label">API key</span>
+        <div class="setting-value">
+          <input id="acct-provider" list="model-provider-options" value="kimi" placeholder="Provider" aria-label="Model provider" class="account-provider" />
           <datalist id="model-provider-options">
             <option value="kimi"><option value="xai"><option value="google"><option value="openai"><option value="anthropic">
             <option value="moonshotai"><option value="openrouter"><option value="groq"><option value="mistral"><option value="deepseek">
           </datalist>
-          <input id="acct-name" placeholder="account name (e.g. work)" style="flex:1;min-width:120px" />
-          <input id="acct-key" type="password" placeholder="API key" style="flex:1;min-width:160px" />
-          <button class="btn" id="acct-add">Register</button>
+          <input id="acct-name" placeholder="Name, e.g. work" aria-label="Account name" class="grow" />
+          <input id="acct-key" type="password" placeholder="Key" aria-label="API key" class="grow" />
         </div>
+        <span class="setting-actions"><button class="btn sm" id="acct-add">Add</button></span>
+      </div>
       </div>
     </div>
     <div class="settings-section-title" id="settings-installation"><div>Workflows<small>The orchestration recipes tasks run on</small></div></div>
     <div class="card" id="workflows-card">
-      <div class="section-h">Workflows <span class="chip">organization resource</span></div>
-      <p style="color:var(--ink-2);margin-top:0;font-size:12px">Built-ins ship with ${siteNameMarkup()} and change only with platform releases. Each task pins its workflow version.</p>
-      <div id="workflows-list" style="margin-bottom:12px">Loading…</div>
-      ${S.meta?.hosted ? `<p>Custom workflow code is unavailable on hosted ${siteNameMarkup()}.</p>` : `<div class="form-row"><label>Install from a git repo</label>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-          <input id="wf-url" placeholder="git URL or path (e.g. https://github.com/you/my-workflow.git)" style="flex:1;min-width:220px" />
-          <input id="wf-ref" placeholder="ref (tag/branch/sha, optional)" style="width:180px" />
-          <button class="btn primary" id="wf-install">Install</button>
+      <div class="section-h">Workflows ${policyTip(`Built-ins ship with ${siteName()} and change only with platform releases. Each task keeps the workflow version it started on.`)}</div>
+      <div id="workflows-list" class="setting-rows" style="margin-bottom:12px">Loading…</div>
+      ${S.meta?.hosted ? `<p class="task-sub">Custom workflow code is unavailable on hosted ${siteNameMarkup()}.</p>` : `<div class="section-h">Install</div>
+        <div class="inline-form">
+          <input id="wf-url" placeholder="Git URL or path" aria-label="Workflow repository" style="flex:2;min-width:200px" />
+          <input id="wf-ref" placeholder="Tag, branch or commit" aria-label="Version (optional)" style="flex:1;min-width:140px" />
+          <button class="btn sm primary" id="wf-install">Install</button>
         </div>
         <div id="wf-install-result" style="font-size:12px;margin-top:6px"></div>
-        <div style="font-size:11px;color:var(--ink-3);margin-top:4px">Install only code you trust with this server. External workflows share the platform worker; manifest validation and version pins do not isolate them. Packages must supply manifest.json. Merging an edit does not activate it; install the reviewed commit explicitly.</div>
-      </div>`}
+        <p class="field-help" style="margin:6px 0 0">Only install code you trust: it runs inside this server. ${policyTip('External workflows share the platform worker; manifest validation and version pins do not isolate them. Packages must supply manifest.json. Merging an edit does not activate it; install the reviewed commit explicitly.')}</p>`}
     </div>`;
 }
 
@@ -16293,13 +17048,9 @@ async function hydrateWorkflows(organizationId = S.organizationId) {
   }
   if (!renderIsCurrent()) return;
   if (!list.length) { box.innerHTML = '<span style="color:var(--ink-3)">No workflows registered.</span>'; return; }
-  box.innerHTML = list.map((w) => `<div class="queue-item">
-      <div style="flex:1"><b>${esc(w.name)}</b>
-        <span class="chip">${w.source === 'bundled' ? 'built-in' : 'installed'}</span>
-        <span class="chip">v${esc(w.latest)}</span>
-        ${w.versions.length > 1 ? `<span class="task-sub" style="color:var(--ink-3)">versions: ${w.versions.map(esc).join(', ')}</span>` : ''}
-        <div class="task-sub" style="color:var(--ink-3)">${esc(w.description || '')}</div>
-      </div></div>`).join('');
+  box.innerHTML = list.map((w) => `<div class="setting-row workflow-line">
+      <span class="setting-value"><b>${esc(w.name)}</b>${w.source === 'bundled' ? '' : '<span class="chip">installed</span>'}<span class="workflow-description" title="${esc(w.description || '')}">${esc(w.description || '')}</span></span>
+      <span class="setting-actions"><span class="chip" title="${esc(`${w.versions.length} version${w.versions.length === 1 ? '' : 's'}: ${w.versions.join(', ')}`)}">v${esc(w.latest)}</span></span></div>`).join('');
 }
 // ── payments: budget policy + cards (SPEC §7.6) ──────────────────────────────
 function paymentsCard(scope) {
@@ -16323,12 +17074,12 @@ function paymentsCard(scope) {
     </div>
     <button class="btn primary" data-addcard="${scope}">Add card</button>
     </details>
-    <details class="pay-stripe" style="margin-top:16px">
-      <summary style="cursor:pointer;font-weight:600">Stripe Issuing</summary>
+    <details class="pay-stripe">
+      <summary>Stripe Issuing</summary>
       <p class="task-sub">For registered businesses. Lets ${siteNameMarkup()} issue a separate capped card per agent or task, instead of registering one you already hold. Requires a Stripe Connect application, a public webhook URL, and a Stripe compliance cardholder record.</p>
       ${scope === 'global' ? `<div class="pay-providers-list"></div>
       <div class="pay-balance" style="margin:8px 0"></div>
-      <details class="pay-cardholder hidden"><summary style="cursor:pointer;font-weight:600">Cardholder</summary>
+      <details class="pay-cardholder hidden"><summary>Cardholder</summary>
         <p class="task-sub">Stripe’s compliance record for the person or company legally authorized to use the card. Stripe may require verification.</p>
         <div class="settings-grid">
           <label class="form-row">Type<select class="holder-type"><option value="individual">Individual</option><option value="company">Company</option></select></label>
@@ -16880,7 +17631,7 @@ const VAULT_SECRET_LABELS = {
   note: [['note', 'note']],
 };
 // Short label + click-to-expand explanation for the two per-item policies.
-const POL_USE_TIP = 'Use through a browser or environment without returning secret text to the model. The agent can still inspect its browser and environment, so a misbehaving agent can still leak it, e.g. by entering it on a malicious site. “ask” requires approval before each use.';
+const POL_USE_TIP = 'Use through a browser or environment without returning secret text to the model. Agents also get current 2FA codes, never the 2FA secret itself. The agent can still inspect its browser and environment, so a misbehaving agent can still leak it, e.g. by entering it on a malicious site. “ask” requires approval before each use.';
 const SESSION_EXCLUSIVE_TIP = 'For sites that sign other copies out when one is used. Other tasks wait until the task using it is done.';
 const POL_REVEAL_TIP = 'Agent sees = the plaintext secret is handed to the agent (needed e.g. to paste an API key into a dashboard). It then travels to the model provider and may end up in training data. “never” forbids that to everyone but Super-administrators, who can read the whole vault; “ask” requires your approval each time.';
 // `title` covers hover on desktop; the click handler is for touch, where there is
@@ -17377,7 +18128,7 @@ async function openConnectorEditor(query, changed, app, existing) {
 
 function passwordsCard() {
   return `<div class="card" id="vault-card">
-    <div class="section-h">Passwords <span class="chip">organization resource</span></div>
+    <div class="section-h">Passwords</div>
     <div class="vault-risk" role="note">
       <span class="vault-risk-mark" aria-hidden="true">!</span>
       <div><b>Connect your passwords and secrets at your own risk.</b>
@@ -17403,7 +18154,7 @@ function passwordsCard() {
     </div>
     <div class="connectors-list" style="margin-bottom:14px">Loading…</div>
 
-    <details class="vault-custom" open><summary style="cursor:pointer;font-weight:600">Add one by hand</summary>
+    <details class="vault-custom" open><summary>Add one by hand</summary>
       <div style="margin-top:8px">
       <div class="form-row"><div style="display:flex;gap:8px;flex-wrap:wrap">
         <select class="vi-type">${Object.keys(VAULT_SECRET_LABELS).map((t) => `<option>${t}</option>`).join('')}</select>
@@ -17995,7 +18746,7 @@ let refreshVaultRequests = null;
 function agentMailCard() {
   return `<div class="card" id="agent-mail-card">
     <div class="section-h">Agent email</div>
-    <p style="color:var(--ink-2);margin-top:0;font-size:12px">Email for agents to receive confirmation codes. <a href="https://www.agentmail.to/" target="_blank" rel="noopener">Create an AgentMail account here.</a></p>
+    <p class="task-sub">An inbox where agents receive confirmation codes. <a href="https://www.agentmail.to/" target="_blank" rel="noopener">Get an AgentMail account ↗</a></p>
     <div class="inline-form">
       <input id="agentmail-address" type="email" placeholder="AgentMail address" />
       <input id="agentmail-key" type="password" placeholder="AgentMail API key" />
@@ -18683,11 +19434,11 @@ async function hydrateProfileGithub() {
     <div class="task-sub" style="margin-top:4px">${esc(failure.summary)} <span class="chip">${esc(failure.code)}</span></div>
     <div class="task-sub" style="margin-top:3px">Recorded ${esc(new Date(failure.occurredAt).toLocaleString())}. The diagnostic is secret-free and is also preserved in the audit log.</div>
   </div>` : '';
-  box.innerHTML = `${failureDetail}<div class="github-account-list">${accounts.map((account) => `<div class="github-account-row" data-account="${esc(account.id)}">
+  box.innerHTML = `${failureDetail}${accounts.length ? '' : '<span class="setting-muted">Not connected</span>'}<div class="github-account-list">${accounts.map((account) => `<div class="github-account-row" data-account="${esc(account.id)}">
     <span class="github-account-label">${githubMark()}<b>${esc(account.login)}</b>${account.active ? '<span class="chip">Active</span>' : ''}</span>
     <span class="github-account-actions">${account.active ? '' : '<button class="btn sm github-use" type="button">Use</button>'}<button class="btn sm github-reconnect" type="button">Reconnect</button><button class="btn sm github-custom" type="button">Custom identity</button><button class="icon-btn github-remove" type="button" aria-label="Remove GitHub account">${trashIcon()}</button></span>
   </div>`).join('')}</div>
-  <button class="btn ${accounts.length ? '' : 'primary'} github-add" type="button">${githubMark()}${accounts.length ? 'Add new GitHub account' : 'Connect GitHub'}</button>`;
+  <button class="btn sm ${accounts.length ? 'ghost' : 'primary'} github-add" type="button">${githubMark()}${accounts.length ? 'Add new GitHub account' : 'Connect GitHub'}</button>`;
   box.querySelector('.github-add')?.addEventListener('click', () => startUserGithubConnection(data.githubApp, 'add').catch((error) => toast(error.message, true)));
   box.querySelectorAll('.github-account-row').forEach((row) => {
     const account = accounts.find((candidate) => candidate.id === row.dataset.account);
@@ -18704,9 +19455,8 @@ async function hydrateProfileGithub() {
 // one place to end the session. Sign out lives here rather than in the top bar.
 function profileWalkthroughCard(userId) {
   if (!S.meta?.hosted || !userId || (!S.installationAccess && userId !== S.user?.id)) return '';
-  return `<div class="card"><div class="section-h">Walkthrough</div>
-    <p class="task-sub">Restart the setup walkthrough in each organization. Existing work and connections are preserved.</p>
-    <button class="btn sm" type="button" id="profile-reset-onboarding" data-user-id="${esc(userId)}">Restart walkthrough</button></div>`;
+  return `<div class="card"><div class="setting-row"><span class="setting-label">Walkthrough</span><span class="setting-value setting-muted">Setup guide in each organization</span>
+    <span class="setting-actions"><button class="btn sm" type="button" id="profile-reset-onboarding" data-user-id="${esc(userId)}" title="Existing work and connections are kept">Restart walkthrough</button></span></div></div>`;
 }
 
 function profileView() {
@@ -18727,77 +19477,53 @@ function profileView() {
   const orgList = orgs.length
     ? organizationComboHtml('default-organization', S.defaultOrganizationId, 'Default organization')
     : '<p class="task-sub">You are not a member of any organization yet.</p>';
+  const theme = document.documentElement.getAttribute('data-theme') || '';
+  const incident = S.launch?.contacts?.incident;
   return `<div class="profile-page">
-    <h1 class="page-title">Profile</h1>
+    <div class="profile-identity">
+      <div class="profile-avatar">${u?.image ? `<img src="${esc(u.image)}" alt="">` : esc(initial)}</div>
+      <div class="profile-meta"><h1 class="page-title">${esc(name)}</h1><div class="profile-email">${email ? esc(email) : 'Profile'}</div></div>
+    </div>
     ${profileWalkthroughCard(u?.id)}
-    <div class="card profile-card">
-      <div class="profile-identity">
-        <div class="profile-avatar">${u?.image ? `<img src="${esc(u.image)}" alt="">` : esc(initial)}</div>
-        <div class="profile-meta">
-          <div class="profile-name">${esc(name)}</div>
-          <div class="profile-email">Your ${siteNameMarkup()} profile</div>
-        </div>
-      </div>
-      <div class="profile-rows">
-        ${u?.name ? `<div class="profile-row">
-          <span class="profile-row-label">Name</span>
-          <span class="profile-row-value">${esc(u.name)}</span>
-        </div>` : ''}
-        ${u ? `<div class="profile-row profile-row-action">
-          <span class="profile-row-label">Email</span>
-          <div class="profile-row-control">
-            <span class="profile-row-value">${esc(email)}</span>
-            ${u.emailVerified
-              ? '<span class="chip success">verified</span>'
-              : S.emailDelivery ? '<button class="btn sm" id="profile-resend-confirmation" type="button">Resend confirmation email</button>' : ''}
-            <button class="btn sm profile-edit-toggle" type="button" data-profile-edit="email"
-              aria-expanded="false" aria-controls="profile-email-panel">Edit</button>
-          </div>
+    ${u ? `<div class="card profile-card">
+      <div class="section-h">Account</div>
+      <div class="setting-rows">
+        <div class="setting-row">
+          <span class="setting-label">Email</span>
+          <span class="setting-value"><span>${esc(email)}</span>${u.emailVerified ? '<span class="chip success">verified</span>' : ''}</span>
+          <span class="setting-actions">${!u.emailVerified && S.emailDelivery ? '<button class="btn sm" id="profile-resend-confirmation" type="button">Resend confirmation</button>' : ''}<button class="btn sm profile-edit-toggle" type="button" data-profile-edit="email"
+              aria-expanded="false" aria-controls="profile-email-panel">Change</button></span>
         </div>
         <div class="profile-edit-panel" id="profile-email-panel" hidden>
           <form id="profile-email-form">
-            <div class="profile-edit-heading">
-              <div>
-                <div class="section-h">Change email</div>
-                <p class="task-sub">Used to sign in and receive account emails.</p>
-              </div>
-            </div>
             <label class="form-row" for="profile-email">
               <span>New email address</span>
               <input id="profile-email" type="email" autocomplete="email" value="${esc(email)}" required />
             </label>
             <p class="profile-edit-help">${u.emailVerified
-              ? 'Your current address stays active until you confirm the link sent to the new one.'
-              : 'Because this address is not confirmed yet, changing it takes effect immediately and sends a fresh confirmation link.'}</p>
+              ? 'Your current address stays active until you confirm the new one.'
+              : 'This takes effect at once and sends a new confirmation link.'}</p>
             <div class="profile-edit-actions">
               <button class="btn primary" id="profile-email-save" type="submit">Save email</button>
               <button class="btn" type="button" data-profile-cancel>Cancel</button>
             </div>
           </form>
         </div>
-        <div class="profile-row profile-row-action">
-          <span class="profile-row-label">Password</span>
-          <div class="profile-row-control">
-            <span class="profile-row-value profile-password-mask" aria-label="Password is set">********</span>
-            <button class="btn sm profile-edit-toggle" type="button" data-profile-edit="password"
-              aria-expanded="false" aria-controls="profile-password-panel">Edit</button>
-          </div>
+        <div class="setting-row">
+          <span class="setting-label">Password</span>
+          <span class="setting-value"><span class="profile-password-mask" aria-label="Password is set">••••••••</span></span>
+          <span class="setting-actions"><button class="btn sm profile-edit-toggle" type="button" data-profile-edit="password"
+              aria-expanded="false" aria-controls="profile-password-panel">Change</button></span>
         </div>
         <div class="profile-edit-panel" id="profile-password-panel" hidden>
           <form id="profile-password-form">
-            <div class="profile-edit-heading">
-              <div>
-                <div class="section-h">Change password</div>
-                <p class="task-sub">Use at least 10 characters. Other signed-in sessions will be closed.</p>
-              </div>
-            </div>
             <div class="profile-password-fields">
               <label class="form-row" for="profile-current-password">
                 <span>Current password</span>
                 <input id="profile-current-password" type="password" autocomplete="current-password" required />
               </label>
               <label class="form-row" for="profile-new-password">
-                <span>New password</span>
+                <span>New password <span class="field-help">at least 10 characters</span></span>
                 <input id="profile-new-password" type="password" autocomplete="new-password" minlength="10" required />
               </label>
               <label class="form-row" for="profile-confirm-password">
@@ -18809,46 +19535,62 @@ function profileView() {
             <div class="profile-edit-actions">
               <button class="btn primary" id="profile-password-save" type="submit">Update password</button>
               <button class="btn" type="button" data-profile-cancel>Cancel</button>
+              <span class="field-help">Signs out your other sessions.</span>
             </div>
           </form>
-        </div>` : ''}
+        </div>
+        <div class="setting-row profile-github-row">
+          <span class="setting-label">GitHub ${policyTip('Tasks you create commit and open pull requests as your active GitHub account.')}</span>
+          ${profileGithubFields()}
+        </div>
       </div>
-      <div class="settings-divider"></div>
-      ${profileGithubFields()}
-    </div>
-    <div class="card">
-      <div class="section-h">Default organization</div>
-      <p class="task-sub">Select your default organization. It opens when you sign in.</p><div class="profile-orgs">${orgList}</div>
+    </div>` : ''}
+    <div class="card" id="profile-preferences">
+      <div class="section-h">Preferences</div>
+      <div class="setting-rows">
+        <div class="setting-row">
+          <span class="setting-label">Default organization ${policyTip('Opens when you sign in.')}</span>
+          <span class="setting-value">${orgs.length ? orgList : '<span class="setting-muted">No organizations yet</span>'}</span>
+        </div>
+        <div class="setting-row">
+          <span class="setting-label">Theme</span>
+          <span class="setting-value"><span class="segmented" id="profile-theme" role="group" aria-label="Theme">${[['', 'System'], ['light', 'Light'], ['dark', 'Dark']].map(([value, label]) =>
+            `<button type="button" data-theme-choice="${value}" aria-pressed="${theme === value}">${label}</button>`).join('')}</span></span>
+        </div>
+        <label class="setting-row" for="profile-md-render">
+          <span class="setting-label">Markdown</span>
+          <span class="setting-value setting-muted">Format agent messages</span>
+          <span class="setting-actions"><input class="toggle" type="checkbox" id="profile-md-render" ${markdownEnabled() ? 'checked' : ''} /></span>
+        </label>
+        <label class="setting-row" for="profile-mathjax">
+          <span class="setting-label">Math ${policyTip('Typesets LaTeX with MathJax, loaded from a CDN. Needs Markdown.')}</span>
+          <span class="setting-value setting-muted">Typeset LaTeX</span>
+          <span class="setting-actions"><input class="toggle" type="checkbox" id="profile-mathjax" ${mathjaxEnabled() ? 'checked' : ''} /></span>
+        </label>
+      </div>
     </div>
     ${notificationsCard()}
-    <div class="card">
-      <div class="section-h">Appearance</div>
-      <div class="switch"><button class="btn sm" id="profile-theme">Toggle theme ◐</button></div>
-      <div class="switch"><input type="checkbox" id="profile-md-render" ${markdownEnabled() ? 'checked' : ''} /><label for="profile-md-render">Render conversation messages as Markdown</label></div>
-      <div class="switch"><input type="checkbox" id="profile-mathjax" ${mathjaxEnabled() ? 'checked' : ''} /><label for="profile-mathjax">Typeset math with MathJax (needs Markdown; loads MathJax from a CDN)</label></div>
-      <p style="color:var(--ink-3);margin:2px 0 0;font-size:11px">Per-browser display choices.</p>
-    </div>
-    ${S.meta?.hosted ? '<div class="card"><div class="section-h">Paid subscriptions</div><p class="task-sub">Paid-plan subscriptions started through your account. Organization owners can change or cancel them in Plans &amp; billing.</p><div id="profile-paid-subscriptions" aria-live="polite">Loading subscriptions…</div></div>' : ''}
+    ${S.meta?.hosted ? '<div class="card"><div class="section-h">Paid subscriptions</div><div id="profile-paid-subscriptions" aria-live="polite">Loading subscriptions…</div></div>' : ''}
     ${u ? appGrantsCard() : ''}
-    <div class="card data-export-card">
-      <div class="data-export-mark" aria-hidden="true"><span>{ }</span><i></i></div>
-      <div class="data-export-copy">
-        <div class="section-h">Your data</div>
-        <p class="task-sub">Download a readable JSON archive of your profile and the ${siteNameMarkup()} records directly linked to you across organizations.</p>
-        <p class="data-export-note">Passwords, session tokens, OAuth tokens, and stored credentials are never included.</p>
-      </div>
-      <button class="btn" id="export-user-data" type="button">Export your data</button>
-    </div>
     <div class="card" id="data-account">
       <div class="section-h">Data &amp; account</div>
-      <p class="task-sub">Request account deletion online. We’ll verify ownership and any organization or resource transfer, then confirm what will be removed or retained and why.</p>
-      <p class="data-export-note">Cancel an active subscription first. Urgent compromise: ${S.launch?.contacts?.incident ? `<a href="mailto:${esc(S.launch.contacts.incident)}">${esc(S.launch.contacts.incident)}</a>` : '<a href="/legal/security">security contact</a>'}.</p>
-      <button class="btn danger" id="request-account-deletion" type="button">Request account deletion</button>
-    </div>
-    <div class="card">
-      <div class="section-h">Session</div>
-      <p class="task-sub">End this browser session${email ? ` for ${esc(email)}` : ''}.</p>
-      <button class="btn danger" id="profile-logout">Sign out</button>
+      <div class="setting-rows">
+        <div class="setting-row">
+          <span class="setting-label">Your data ${policyTip(`A readable JSON archive of your profile and the ${siteName()} records linked to you. Passwords, tokens and stored credentials are never included.`)}</span>
+          <span class="setting-value setting-muted">JSON archive</span>
+          <span class="setting-actions"><button class="btn sm" id="export-user-data" type="button">Export</button></span>
+        </div>
+        ${u ? `<div class="setting-row">
+          <span class="setting-label">Session</span>
+          <span class="setting-value setting-muted">This browser</span>
+          <span class="setting-actions"><button class="btn sm" id="profile-logout">Sign out</button></span>
+        </div>` : ''}
+        <div class="setting-row danger">
+          <span class="setting-label">Delete account ${policyTip(`We verify ownership and any organization or resource transfer, then confirm what is removed or kept. Cancel active subscriptions first. Account compromised? Contact ${incident || 'security'}.`)}</span>
+          <span class="setting-value setting-muted">Permanent</span>
+          <span class="setting-actions"><button class="btn sm danger" id="request-account-deletion" type="button">Request deletion</button></span>
+        </div>
+      </div>
     </div>
   </div>`;
 }
@@ -18861,31 +19603,38 @@ function notificationsCard() {
   const emailReady = S.meta?.deliveryChannels?.includes('email');
   const permission = typeof Notification === 'undefined' ? 'unsupported' : Notification.permission;
   const permissionNote = {
-    granted: '<p class="task-sub">This browser may show system notifications.</p>',
-    denied: '<p class="task-sub">This browser is blocking system notifications. Allow them in its site settings; in-app alerts and sounds still work.</p>',
-    unsupported: '<p class="task-sub">This browser cannot show system notifications; in-app alerts and sounds still work.</p>',
+    denied: '<p class="notify-note">System notifications are blocked in this browser’s site settings.</p>',
     default: '<button class="btn sm" id="notify-permission" type="button">Allow system notifications</button>',
   }[permission] ?? '';
+  const headTip = {
+    notify: 'Shown by your device, even when this tab is in the background. Do Not Disturb still applies.',
+    sound: 'Plays in this browser while the app is open.',
+    visual: 'A banner inside the app.',
+    email: emailReady ? 'Sent to your account email for this organization, even when the app is closed.' : 'Your administrator hasn’t set up email.',
+  };
   // Loudest first, the same order the inbox itself is in.
   const levels = [...URGENCY_LEVELS].reverse();
   return `<div class="card" id="notifications">
-    <div class="section-h">Notifications ${policyTip('Agents set an urgency when they need you; approvals arrive high by default. Higher urgency always sorts first in your inbox; here you choose what else each level does.')}</div>
+    <div class="section-h">Notifications ${policyTip('Agents set an urgency when they need you; approvals arrive as high. Choose what each level does. Everything except email applies to this browser only.')}</div>
     <div class="notify-grid">
       <div class="notify-row notify-head"><span>Urgency</span>${NOTIFY_BEHAVIOURS.map((behaviour) =>
-    `<span>${behaviour.label}</span>`).join('')}<span></span></div>
+    `<span title="${esc(headTip[behaviour.key])}">${behaviour.label}</span>`).join('')}<span></span></div>
       ${levels.map((level) => `<div class="notify-row" data-notify-level="${level}">
         <span class="urgency-chip ${level}">${level}</span>
         ${NOTIFY_BEHAVIOURS.map((behaviour) => `<span><input type="checkbox" data-notify="${level}:${behaviour.key}"
           aria-label="${behaviour.label} for ${level} urgency" ${(behaviour.key === 'email' ? S.deliveryPreferences?.emailUrgencies?.[level] ?? S.deliveryPreferences?.email : prefs[level][behaviour.key]) ? 'checked' : ''} ${behaviour.key === 'email' && (!emailReady || S.deliveryPreferences?.organizationId !== S.organizationId) ? 'disabled' : ''}/></span>`).join('')}
-        <span><button class="btn sm" type="button" data-notify-test="${level}" title="Test browser alerts">Test</button></span>
+        <span><button class="btn sm ghost" type="button" data-notify-test="${level}" title="Send a test ${level} notification">Test</button></span>
       </div>`).join('')}
     </div>
-    <div class="notify-sound-options"><label>Sound <select id="notify-tone">${['bell', 'chime', 'soft'].map((tone) => `<option value="${tone}" ${sound.tone === tone ? 'selected' : ''}>${tone[0].toUpperCase() + tone.slice(1)}</option>`).join('')}</select></label>
-      <label>Duration <select id="notify-duration">${[0.35, 1, 3, 5].map((duration) => `<option value="${duration}" ${sound.duration === duration ? 'selected' : ''}>${duration === 0.35 ? 'Brief' : `${duration} second${duration === 1 ? '' : 's'}`}</option>`).join('')}</select></label>
-      <button class="btn sm" id="notify-preview">Preview sound</button></div>
-    <p class="task-sub">Email choices apply to your account in this organization, even when the app is closed.${emailReady ? '' : ' Email delivery has not been configured by your administrator.'}</p>
+    <div class="setting-rows ruled">
+      <div class="setting-row">
+        <span class="setting-label">Sound</span>
+        <span class="setting-value notify-sound-options"><select id="notify-tone" aria-label="Sound">${['bell', 'chime', 'soft'].map((tone) => `<option value="${tone}" ${sound.tone === tone ? 'selected' : ''}>${tone[0].toUpperCase() + tone.slice(1)}</option>`).join('')}</select>
+          <select id="notify-duration" aria-label="Duration">${[0.35, 1, 3, 5].map((duration) => `<option value="${duration}" ${sound.duration === duration ? 'selected' : ''}>${duration === 0.35 ? 'Brief' : `${duration} second${duration === 1 ? '' : 's'}`}</option>`).join('')}</select></span>
+        <span class="setting-actions"><button class="btn sm" id="notify-preview" type="button" title="Play the sound">▶ Preview</button></span>
+      </div>
+    </div>
     ${permissionNote}
-    <p class="task-sub">System notifications, in-app alerts, and sounds apply to this browser while the app is open. Interact with the page once to enable sounds. Device notification and Do Not Disturb settings still apply.</p>
   </div>`;
 }
 
@@ -19111,7 +19860,10 @@ function wireProfileView() {
       finishActionFeedback(feedback, actionSucceeded);
     }
   });
-  $('#profile-theme')?.addEventListener('click', toggleTheme);
+  $('#profile-theme')?.querySelectorAll('[data-theme-choice]').forEach((button) => button.addEventListener('click', () => {
+    setTheme(button.dataset.themeChoice);
+    $('#profile-theme').querySelectorAll('[data-theme-choice]').forEach((other) => other.setAttribute('aria-pressed', String(other === button)));
+  }));
   $('#profile-md-render')?.addEventListener('change', (e) => {
     try { localStorage.setItem('karmax-md-render', e.target.checked ? '1' : '0'); } catch {}
     if (S.taskTab === 'checkin') renderTaskPage();
@@ -19505,11 +20257,15 @@ async function hydrateOrganizationSubscription(organizationId) {
   try { state = await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/status`); }
   catch (error) { box.innerHTML = `<p class="task-sub" style="color:var(--danger)">${esc(error.message)}</p>`; return; }
   if (!$('#org-subscription') || S.organizationId !== organizationId) return;
+  // A private installation has no hosted subscription to show.
   if (!state.managed) {
-    box.innerHTML = `<div class="section-h">Self-hosted <span class="chip">unmetered</span></div>
-      <p class="task-sub">Hosted subscription billing does not apply to this private installation. Your organization plans and agent payment cards remain locally managed.</p>`;
+    box.hidden = true;
+    const heading = $('#settings-billing');
+    if (heading) heading.hidden = true;
     return;
   }
+  box.hidden = false;
+  if ($('#settings-billing')) $('#settings-billing').hidden = false;
   const catalog = Object.fromEntries((state.catalog || []).map((plan) => [plan.id, plan]));
   const names = Object.fromEntries(Object.values(catalog).map((plan) => [plan.id, plan.name]));
   const price = (cents) => `$${(Number(cents || 0) / 100).toLocaleString(undefined,
@@ -19841,13 +20597,13 @@ function organizationView() {
 
     <div class="settings-section-title" id="settings-people"><div>People &amp; authorization<small>Who is in this organization, and what each person may do</small></div></div>
     <div class="card"><div class="section-h">People</div><div id="org-members">Loading…</div>
-      <div class="authz-invite-row"><input id="invite-email" placeholder="teammate@company.com">${authorizationEditorHtml('invite-authorization', { level: 'developer', scope: 'organization' }, authorizationProjects)}<button class="btn sm" id="invite-member">Invite</button></div><div id="invite-result" class="task-sub"></div>
-      <div class="settings-divider"></div><div class="section-h">Teams</div><p class="task-sub">Teams are reusable review routes. A team named Leaders is available to workflows as <span class="mono">@team:leaders</span>.</p><div id="org-teams">Loading…</div><datalist id="org-people-options"></datalist><div class="inline-form"><input id="team-name" placeholder="Leaders"><button class="btn sm" id="create-team">Create team</button></div></div>
-    <div class="card"><label class="form-row">Organization name visibility
-      <select id="organization-name-visibility" disabled>
-        <option value="members" ${org?.nameVisibility !== 'public' ? 'selected' : ''}>Only people added to this organization</option>
-        <option value="public" ${org?.nameVisibility === 'public' ? 'selected' : ''}>All users</option>
-      </select></label><p class="task-sub">Controls whether your organization’s name appears in organization search. Access to projects and settings still requires authorization. The operator can always find every organization.</p></div>
+      <div class="authz-invite-row"><input id="invite-email" type="email" placeholder="teammate@company.com" aria-label="Email to invite">${authorizationEditorHtml('invite-authorization', { level: 'developer', scope: 'organization' }, authorizationProjects)}<button class="btn sm primary" id="invite-member">Invite</button></div><div id="invite-result" class="task-sub"></div></div>
+    <div class="card"><div class="section-h">Teams ${policyTip('Teams are reusable review routes: a team named Leaders is available to workflows as @team:leaders.')}</div><div id="org-teams">Loading…</div><datalist id="org-people-options"></datalist><div class="inline-form team-create"><input id="team-name" placeholder="New team name" aria-label="New team name"><button class="btn sm" id="create-team">Create team</button></div></div>
+    <div class="card"><div class="setting-row"><span class="setting-label">Name visibility ${policyTip('Whether this organization’s name appears in organization search. Joining still needs an invitation, and the operator can always find every organization.')}</span>
+      <span class="setting-value"><select id="organization-name-visibility" aria-label="Organization name visibility" disabled>
+        <option value="members" ${org?.nameVisibility !== 'public' ? 'selected' : ''}>Members only</option>
+        <option value="public" ${org?.nameVisibility === 'public' ? 'selected' : ''}>Everyone signed in</option>
+      </select></span></div></div>
     <div class="card" id="organization-roles">Loading roles…</div>
     <div class="card"><div id="organization-conversation-sharing">Loading…</div></div>
     <div class="settings-section-title" id="settings-code"><div>Projects<small>Repositories, computers and storage shared by this organization’s projects</small></div></div>
@@ -19858,22 +20614,22 @@ function organizationView() {
     ${globalSettingsView(true)}
 
     <div class="settings-section-title" id="settings-advanced" data-settings-advanced hidden><div>Advanced</div></div>
+    <div class="card" data-settings-access="organization" hidden><div class="setting-rows">
+      <div class="setting-row"><span class="setting-label">Name ${policyTip('Also its web address. Links to the old one keep working.')}</span>
+        <span class="setting-value"><input id="organization-name" class="setting-input" value="${esc(org?.name || '')}" aria-label="Organization name"></span>
+        <span class="setting-actions"><button class="btn sm primary" id="rename-organization">Save</button></span></div>
+      <div class="setting-row"><span class="setting-label">Data ${policyTip('A readable JSON archive of this organization, grouped into complete record collections. Passwords, tokens and stored credentials are never included.')}</span>
+        <span class="setting-value setting-muted">JSON archive</span>
+        <span class="setting-actions"><button class="btn sm" id="export-organization" type="button">Export</button></span></div>
+      ${org?.kind === 'team' ? `<div class="setting-row danger"><span class="setting-label">Delete organization</span>
+        <span class="setting-value setting-muted">Permanent</span>
+        <span class="setting-actions"><button class="btn sm danger" id="delete-organization">Delete…</button></span></div>` : ''}
+    </div></div>
+    <details class="card settings-disclosure" data-settings-access="organization" hidden><summary><b>Single sign-on &amp; directory sync</b><span>For companies with an identity provider</span></summary><p class="task-sub">OIDC signs employees in through your company; SCIM adds, removes and groups them. Use the values your identity administrator gives you.</p><div id="org-identity">Loading…</div></details>
     <div class="settings-section-title" id="settings-experimental"><div>Experimental<small>Optional features for this organization</small></div></div>
     ${AVATAR_RISK_NOTE}
     <div class="card"><div id="organization-avatar-settings">Loading…</div></div>
     <div id="org-misc-slot"></div>
-    <details class="card settings-disclosure" data-settings-access="organization" hidden><summary><b>Single sign-on &amp; directory sync</b><span>For organizations that already use an identity provider</span></summary><p class="task-sub">OIDC makes employees sign in through your company. SCIM automatically adds, removes, and groups them. Leave this untouched unless your identity administrator gives you these values.</p><div id="org-identity">Loading…</div></details>
-    <div class="card data-export-card" data-settings-access="organization" hidden>
-      <div class="data-export-mark" aria-hidden="true"><span>{ }</span><i></i></div>
-      <div class="data-export-copy"><div class="section-h">Export organization data</div>
-        <p class="task-sub">Download a readable JSON archive of this organization, grouped into complete record collections.</p>
-        <p class="data-export-note">Passwords, tokens, and stored credentials are never included.</p></div>
-      <button class="btn sm" id="export-organization" type="button">Export organization data</button>
-    </div>
-    <div class="card" data-settings-access="organization" hidden>
-      <div class="section-h">Organization name</div>
-      <div class="inline-form"><input id="organization-name" value="${esc(org?.name || '')}" aria-label="Organization name"><button class="btn sm primary" id="rename-organization">Save name</button>${org?.kind === 'team' ? '<button class="btn sm danger" id="delete-organization">Delete organization</button>' : ''}</div>
-    </div>
     </div></div></div>`;
 }
 
@@ -19884,8 +20640,9 @@ function pendingInvitationRow(invitation, projects) {
 
 function organizationPlanMarkup(entitlements) {
   if (!entitlements) return '<span class="task-sub">Plan information is temporarily unavailable.</span>';
-  if (entitlements.deployment === 'private') return `<div class="section-h">Private installation</div>
-    <p class="task-sub">Hosted plan restrictions are not applied. Users, projects, and active agent runs are limited only by this installation’s own capacity settings.</p>`;
+  if (entitlements.deployment === 'private') return `<div class="setting-row"><span class="setting-label">Plan</span>
+    <span class="setting-value"><b>Private installation</b> ${policyTip('Hosted plan restrictions are not applied. Users, projects and agent runs are limited only by this installation’s own capacity settings.')}</span>
+    <span class="setting-actions"><span class="chip">unmetered</span></span></div>`;
   const memberCount = Number(entitlements.currentMemberCount ?? entitlements.activeUsers ?? 0);
   const users = entitlements.maxMembers == null
     ? `${memberCount} active user${memberCount === 1 ? '' : 's'} · unlimited`
@@ -19943,8 +20700,7 @@ function renderOrganizationRoles() {
   const catalog = S.authorizationCatalog;
   if (!catalog) { root.textContent = 'Could not load roles. Reload this page to try again.'; return; }
   const levels = authorizationLevels();
-  root.innerHTML = `<div class="section-h">Roles &amp; capabilities</div>
-    <p class="task-sub">Expand a role, then a category to inspect its exact capabilities. Access is limited by the selected projects or organization and by the person granting it. Task actions also depend on workflow state.</p>
+  root.innerHTML = `<div class="section-h">Roles &amp; capabilities ${policyTip('Expand a role, then a category, to see its exact capabilities. Access is limited by the selected projects or organization and by the person granting it; task actions also depend on workflow state.')}</div>
     ${catalog.profiles.slice().sort((a, b) => levels.findIndex((level) => level.id === a.id) - levels.findIndex((level) => level.id === b.id)).map((role) => `<details class="authorization-role">
       <summary><b>${esc(role.name)}</b><span class="chip">${role.builtin ? 'Built-in' : 'Custom'}</span></summary>
       <p class="task-sub">${esc(role.description)}</p>
@@ -20013,10 +20769,12 @@ async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
       const name = $('#organization-name')?.value.trim();
       if (!name) return toast('Organization name is required', true);
       try {
-        await api(`/api/organizations/${S.organizationId}`, { method: 'PATCH', body: JSON.stringify({ name }) });
+        const organization = await api(`/api/organizations/${S.organizationId}`, { method: 'PATCH', body: JSON.stringify({ name }) });
         await loadOrganizations();
         toast('Organization renamed');
         renderShell();
+        if (organization?.slug && decodeRoutePart(location.pathname.split('/')[1] || '', true) !== organization.slug)
+          return go(pathWithOrganization(organization), { replace: true });
         renderMain();
       } catch (e) { toast(e.message, true); }
     };
@@ -20078,7 +20836,7 @@ async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
       renderOrganizationRoles();
       $('#org-members').innerHTML = S.organizationMembers.length ? S.organizationMembers.map((m) => {
         const current = m.authorization || { level: m.profileId || 'viewer', scope: 'organization' };
-        return `<div class="member-row authz-member-row" data-org-member="${esc(m.userId)}">${personMarkup(m.userId, m.user)}${m.protectedOwner ? '<span class="chip" title="Recovery ownership is protected; authorization remains editable">protected owner</span>' : ''}${authorizationEditorHtml(`org-authorization-${m.userId}`, current, authorizationProjects)}<button class="btn sm org-member-remove">Remove</button></div>`;
+        return `<div class="member-row authz-member-row" data-org-member="${esc(m.userId)}">${personMarkup(m.userId, m.user)}${m.protectedOwner ? '<span class="chip" title="Recovery ownership is protected; authorization remains editable">owner</span>' : ''}${authorizationEditorHtml(`org-authorization-${m.userId}`, current, authorizationProjects)}<button class="icon-btn org-member-remove" type="button" title="Remove from organization" aria-label="Remove ${esc(userName(m.userId, m.user))}">×</button></div>`;
       }).join('') : '<span class="task-sub">No members.</span>';
       const [teamMembers, invitationList] = await Promise.all([
         Promise.all(S.teams.map((team) => read(`teams/${team.id}/members`).catch(() => []).then((members) => ({ team, members })))),
@@ -20088,7 +20846,7 @@ async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
       const pendingInvitations = invitationList.filter((invitation) => !invitation.acceptedAt);
       $('#org-members').insertAdjacentHTML('beforeend', `<div id="pending-invitations" ${pendingInvitations.length ? '' : 'hidden'}><div class="section-h" style="margin-top:12px">Pending invitations</div>${pendingInvitations.map((invitation) => pendingInvitationRow(invitation, authorizationProjects)).join('')}</div>`);
       $('#org-people-options').innerHTML = S.organizationMembers.map((member) => `<option value="${esc(personChoice(member))}"></option>`).join('');
-      $('#org-teams').innerHTML = teamMembers.length ? teamMembers.map(({ team, members }) => `<div class="team-block" data-team="${esc(team.id)}"><div class="team-heading"><span><b>${esc(team.name)}</b><span class="task-sub mono">@team:${esc(team.slug)}</span></span><span class="team-actions"><span class="chip">${members.length} member${members.length === 1 ? '' : 's'}</span><button class="btn sm team-rename">Rename</button><button class="btn sm danger team-delete">Delete</button></span></div><div class="inline-form team-rename-form" hidden><input class="team-name-edit" value="${esc(team.name)}" aria-label="Team name"><button class="btn sm primary team-rename-save">Save name</button><button class="btn sm team-rename-cancel">Cancel</button></div>${members.map((m) => `<div class="member-row">${personMarkup(m.userId, m.user)}<button class="btn sm team-member-remove" data-user="${esc(m.userId)}">Remove</button></div>`).join('')}<div class="inline-form"><input class="team-user" list="org-people-options" autocomplete="off" placeholder="Type a name or email"><button class="btn sm team-member-add">Add person</button></div></div>`).join('') : '<span class="task-sub">No teams yet.</span>';
+      $('#org-teams').innerHTML = teamMembers.length ? teamMembers.map(({ team, members }) => `<div class="team-block" data-team="${esc(team.id)}"><div class="team-heading"><span><b>${esc(team.name)}</b><span class="task-sub mono">@team:${esc(team.slug)}</span></span><span class="team-actions"><span class="chip">${members.length} member${members.length === 1 ? '' : 's'}</span><button class="btn sm team-rename">Rename</button><button class="btn sm danger team-delete">Delete</button></span></div><div class="inline-form team-rename-form" hidden><input class="team-name-edit" value="${esc(team.name)}" aria-label="Team name"><button class="btn sm primary team-rename-save">Save name</button><button class="btn sm team-rename-cancel">Cancel</button></div>${members.map((m) => `<div class="member-row">${personMarkup(m.userId, m.user)}<button class="btn sm team-member-remove" data-user="${esc(m.userId)}">Remove</button></div>`).join('')}<div class="inline-form"><input class="team-user" list="org-people-options" autocomplete="off" placeholder="Type a name or email"><button class="btn sm team-member-add">Add person</button></div></div>`).join('') : '';
       $('#org-members')?.querySelectorAll('[data-org-member]').forEach((row) => {
         const editor = row.querySelector('.authz-editor');
         wireAuthorizationEditor(editor, authorizationProjects, async (authorization) => {
@@ -20286,9 +21044,8 @@ async function createOrganization() {
 }
 
 // ── theme ────────────────────────────────────────────────────────────────────
-function toggleTheme() {
-  const cur = document.documentElement.getAttribute('data-theme');
-  const next = cur === 'dark' ? 'light' : cur === 'light' ? '' : 'dark';
+/** 'light', 'dark', or '' to follow the system. */
+function setTheme(next) {
   if (next) document.documentElement.setAttribute('data-theme', next);
   else document.documentElement.removeAttribute('data-theme');
   localStorage.setItem('karmax-theme', next);
@@ -20455,10 +21212,10 @@ const HOST_COMMANDS = [
     openTaskForm(QUICK_TASK_WORKFLOW);
   } },
   { id: 'nav.search', title: 'Search tasks', key: '/', run: () => { if (!isTaskListTab()) switchTab('tasks'); setTimeout(() => $('#task-search')?.focus(), 0); } },
-  { id: 'nav.home', title: 'Go home', key: 'g h', run: () => go(homeRoute(currentOrg(), DEFAULT_LIST_QUERY)) },
+  { id: 'nav.home', title: 'Go home', key: 'g H', run: () => go(homeRoute(currentOrg(), DEFAULT_LIST_QUERY)) },
   { id: 'nav.tasks', title: 'Go to tasks', key: 'g t', run: () => switchTab('tasks') },
   { id: 'nav.queue', title: 'Go to queues', key: 'g q', run: () => switchTab('queue') },
-  { id: 'nav.insights', title: 'Go to insights', key: 'g i', run: () => switchTab('insights') },
+  { id: 'nav.insights', title: 'Go to insights', key: 'g I', run: () => switchTab('insights') },
   { id: 'nav.settings', title: 'Go to project settings', key: 'g s', run: () => switchTab('settings') },
   { id: 'nav.wiki', title: 'Go to project wiki', key: 'g w', run: () => switchTab('wiki') },
   { id: 'nav.orgwiki', title: 'Go to organization wiki', key: 'g W', run: () => go(globalRoute('orgwiki')) },
@@ -20511,8 +21268,8 @@ function allCommands() {
   add({ id: 'task.attempt.new', title: 'New attempt', keybinding: 'a n', group: 'Task', help: false, available: !!(S.selected && S.view && $('#add-attempt:not(:disabled)')), run: () => $('#add-attempt:not(:disabled)')?.click() });
   add({ id: 'task.tab.prev', title: 'Previous tab', keybinding: '[', group: 'Task', help: false, available: !!(S.selected && S.view), run: () => cycleTaskTab(-1) });
   add({ id: 'task.tab.next', title: 'Next tab', keybinding: ']', group: 'Task', help: false, available: !!(S.selected && S.view), run: () => cycleTaskTab(1) });
-  add({ id: 'task.checkin.prev', title: 'Previous Check-in pane', keybinding: '{', group: 'Task', help: false, available: !!(S.selected && S.view && S.taskTab === 'checkin'), run: () => cycleCheckinPane(-1) });
-  add({ id: 'task.checkin.next', title: 'Next Check-in pane', keybinding: '}', group: 'Task', help: false, available: !!(S.selected && S.view && S.taskTab === 'checkin'), run: () => cycleCheckinPane(1) });
+  add({ id: 'task.checkin.prev', title: 'Previous Chat pane', keybinding: '{', group: 'Task', help: false, available: !!(S.selected && S.view && S.taskTab === 'checkin'), run: () => cycleCheckinPane(-1) });
+  add({ id: 'task.checkin.next', title: 'Next Chat pane', keybinding: '}', group: 'Task', help: false, available: !!(S.selected && S.view && S.taskTab === 'checkin'), run: () => cycleCheckinPane(1) });
   // { / } also walk the settings rail's panes (project or organization settings).
   const onSettings = ['settings', 'organization', 'global'].includes(S.tab) && !S.selected;
   add({ id: 'settings.pane.prev', title: 'Previous settings section', keybinding: '{', group: 'Navigation', help: false, available: onSettings, run: () => cycleSettingsPane(-1) });
@@ -20673,7 +21430,7 @@ function openAdjacentTask(delta) {
 function railRows() {
   // Search results are projects; skip their folder headings during a filtered walk.
   const folders = (S.projectSearch || '').trim() ? '' : ', #rail .folder-toggle';
-  return [...document.querySelectorAll('#rail .rail-add, #project-search, #rail .project-link, #rail .nav-item' + folders)];
+  return [...document.querySelectorAll('#rail .rail-icon, #rail .rail-add, #project-search, #rail .project-link' + folders)];
 }
 function inRail() { return !!(document.activeElement && document.activeElement.closest && document.activeElement.closest('#rail')); }
 function focusRail() {
@@ -20703,9 +21460,47 @@ function closeTopOverlay() {
   if (S.selected) return closeTask();
 }
 
+// -- the shortcut echo: what you just did, as keys ---------------------------
+// Every action with a shortcut — clicked, run from the palette or typed — shows
+// its keys in the topbar for a moment, so the console teaches its own keyboard.
+// A chord prefix ('g') shows until the chord completes or lapses. The keys come
+// from the same registry as dispatch: clickable controls name their command in
+// `data-shortcut` (space-separated ids form a sequence: 'nav.projects
+// rail.newProject' is g P then n), or a raw binding in `data-keys`.
+function echoKeys(keys, title = '', pending = false) {
+  const el = $('#key-echo');
+  if (!el) return;
+  el.textContent = keys || '';
+  el.title = title;
+  el.classList.toggle('pending', pending);
+  el.style.animation = 'none'; void el.offsetWidth; el.style.animation = ''; // restart the fade
+}
+function clearPendingEcho() { if ($('#key-echo.pending')) echoKeys(''); }
+function controlShortcut(control) {
+  if (control.disabled) return null;
+  if (control.dataset.keys) return { keys: fmtKeys(control.dataset.keys), title: control.getAttribute('aria-label') || control.textContent.trim() };
+  const cmds = allCommands();
+  if (control.dataset.act) { // a task action: its workflow's binding, else the digit it shows
+    const bound = cmds.find((c) => c.id === `task.${control.dataset.act}` && c.available && c.keybinding);
+    const keys = bound ? fmtKeys(bound.keybinding) : control.querySelector('.kbd')?.textContent;
+    return keys ? { keys, title: control.dataset.label } : null;
+  }
+  const steps = control.dataset.shortcut.split(' ').map((id) => cmds.find((c) => c.id === id));
+  if (!steps.every((c) => c?.keybinding)) return null;
+  return { keys: steps.map((c) => fmtKeys(c.keybinding)).join(' '), title: steps.at(-1).title };
+}
+function echoClickedShortcut(e) {
+  // Clicks a command fires itself (digits press action buttons) are untrusted;
+  // the keys that fired it are already showing.
+  if (!e.isTrusted || !e.target?.closest) return;
+  const control = e.target.closest('[data-shortcut], [data-keys], #tp-foot [data-act]');
+  const hint = control && controlShortcut(control);
+  if (hint) echoKeys(hint.keys, hint.title);
+}
+
 // -- the dispatcher ------------------------------------------------------------
 const CHORD = { pending: [], timer: 0 };
-function resetChord() { CHORD.pending = []; clearTimeout(CHORD.timer); }
+function resetChord() { CHORD.pending = []; clearTimeout(CHORD.timer); clearPendingEcho(); }
 // A bare modifier keydown (Shift/Ctrl/Alt/Meta) fires on its own before the key
 // it modifies. It must be transparent to the chord buffer — otherwise pressing
 // Shift for the second step of a shifted chord (`g P`, `g W`, `g D`, `g S`, …)
@@ -20731,8 +21526,9 @@ function dispatchKey(e) {
   e.preventDefault();
   const exact = candidates.find((c) => c.keys.length === CHORD.pending.length + 1);
   const longer = candidates.some((c) => c.keys.length > CHORD.pending.length + 1);
-  if (exact && !longer) { resetChord(); exact.run(); return true; }
+  if (exact && !longer) { resetChord(); echoKeys(fmtKeys(exact.keybinding), exact.title); exact.run(); return true; }
   CHORD.pending.push(snap); // a chord prefix ('g' …) — wait briefly for the rest
+  echoKeys(fmtKeys(candidates[0].keybinding).split(' ').slice(0, CHORD.pending.length).join(' '), '', true);
   clearTimeout(CHORD.timer);
   CHORD.timer = setTimeout(resetChord, 900);
   return true;
@@ -20822,7 +21618,7 @@ function openPalette() {
     }).join('') || `<div class="pal-empty">No matches</div>`;
     list.querySelector('.opt.active')?.scrollIntoView({ block: 'nearest' });
   };
-  const run = (i) => { const it = items[i]; if (!it) return; close(); it.run(); };
+  const run = (i) => { const it = items[i]; if (!it) return; close(); if (it.kbd) echoKeys(fmtKeys(it.kbd), it.title); it.run(); };
   input.addEventListener('input', build);
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') { e.stopPropagation(); close(); }
@@ -20852,7 +21648,7 @@ function openHelp() {
       ${row('[ / ]', 'Previous / next tab')}
       ${row('a [ / a ]', 'Previous / next attempt')}
       ${row('a n', 'New attempt (open editable draft)')}
-      ${row('{ / }', 'Previous / next Check-in pane')}
+      ${row('{ / }', 'Previous / next Chat pane')}
       ${row('u', 'Back to the list')}
       ${row(esc(fmtKeys('meta+Enter')), 'Send follow-up (from inside the compose box)')}
       ${row('Esc', 'Close the topmost panel / leave a text field')}
@@ -20968,8 +21764,102 @@ function readPolicyAcceptance(context) {
 }
 
 function legalFooter() {
-  return `<footer class="legal-footer"><a href="/">${siteNameMarkup()}</a><a href="/pricing">Pricing</a><a href="/legal">Policies</a>
+  return `<footer class="legal-footer"><a href="/">${siteNameMarkup()}</a><a href="/docs">Docs</a><a href="/pricing">Pricing</a><a href="/legal">Policies</a>
     <a href="/legal/security">Security</a><a href="/legal/dpa">DPA requests</a></footer>`;
+}
+
+// ── public docs ──────────────────────────────────────────────────────────────
+// A few pages of Markdown served beside the console (web/docs/<slug>.md), with
+// Pricing and the policies, under one sidebar. `{{origin}}` in a page is this
+// server, so the commands it shows work on a self-hosted installation too.
+const DOC_PAGES = [
+  { slug: 'getting-started', path: '/docs', title: 'Getting started' },
+  { slug: 'how-it-works', path: '/docs/how-it-works', title: 'How it works' },
+  { slug: 'cli', path: '/docs/cli', title: 'tavya CLI' },
+];
+
+function docsAnchor(text) { return text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, ''); }
+
+// Links between public pages swap the page in place instead of reloading it.
+let publicLinksInstalled = false;
+function installPublicLinks() {
+  if (publicLinksInstalled) return;
+  publicLinksInstalled = true;
+  document.addEventListener('click', (event) => {
+    if (isNewTabClick(event) || event.defaultPrevented) return;
+    const link = event.target.closest('a[data-public]');
+    if (!link) return;
+    const url = new URL(link.href, location.href);
+    if (url.origin !== location.origin) return;
+    event.preventDefault();
+    if (url.pathname === location.pathname && url.hash) {
+      history.pushState({}, '', url.hash);
+      return document.getElementById(url.hash.slice(1))?.scrollIntoView();
+    }
+    history.pushState({}, '', `${url.pathname}${url.search}${url.hash}`);
+    boot();
+  });
+}
+
+/** `current` is the path whose sidebar entry is marked as this page. */
+function renderPublicShell(current, content) {
+  document.body.classList.remove('landing-active');
+  installPublicLinks();
+  const link = (href, label) => `<a href="${href}" data-public${href === current ? ' aria-current="page"' : ''}>${esc(label)}</a>`;
+  $('#app').innerHTML = `<div class="legal-shell docs-shell"><header class="legal-nav"><a href="/" class="landing-brand">${brandMark()}<span>${siteNameMarkup()}</span></a><a href="/">Open ${siteNameMarkup()}</a></header>
+    <div class="docs-layout"><nav class="docs-nav" aria-label="Documentation">
+      <div class="docs-nav-group"><span>Docs</span>${DOC_PAGES.map((page) => link(page.path, page.title)).join('')}</div>
+      <div class="docs-nav-group">${link('/pricing', 'Pricing')}</div>
+      <div class="docs-nav-group">${link('/legal', 'Policies')}<div class="docs-nav-sub">${(S.launch?.policies || [])
+        .map((policy) => link(`/legal/${policy.slug}`, policy.title)).join('')}</div></div>
+    </nav><div class="docs-content">${content}</div></div>${legalFooter()}</div>`;
+  if (location.hash) document.getElementById(decodeURIComponent(location.hash.slice(1)))?.scrollIntoView();
+  else window.scrollTo(0, 0);
+  window.onpopstate = () => boot();
+}
+
+async function renderDocsPage(slug = 'getting-started') {
+  const page = DOC_PAGES.find((candidate) => candidate.slug === slug);
+  if (!page) { history.replaceState({}, '', '/docs'); return renderDocsPage(); }
+  document.title = `${page.title} · ${siteName()}`;
+  const response = await feedbackFetch(`/docs/${page.slug}.md`).catch(() => null);
+  if (location.pathname.replace(/\/$/, '') !== page.path) return; // navigated on meanwhile
+  const source = response?.ok ? await response.text() : `# ${page.title}\n\nThis page could not be loaded. Reload to try again.`;
+  const template = document.createElement('template');
+  template.innerHTML = renderMarkdown(source.replaceAll('{{origin}}', location.origin));
+  // Every section is linkable (the console points at them), links between
+  // public pages stay in this tab, wide tables scroll on their own, and a
+  // command copies with one click.
+  for (const heading of template.content.querySelectorAll('h2, h3')) heading.id = docsAnchor(heading.textContent);
+  for (const anchor of template.content.querySelectorAll('a[href^="/"], a[href^="#"]')) {
+    anchor.removeAttribute('target');
+    anchor.removeAttribute('rel');
+    if (/^\/(docs|pricing|legal)\b/.test(anchor.getAttribute('href'))) anchor.dataset.public = '';
+  }
+  for (const table of template.content.querySelectorAll('table')) {
+    const wrap = document.createElement('div');
+    wrap.className = 'docs-table';
+    table.replaceWith(wrap);
+    wrap.append(table);
+  }
+  for (const block of template.content.querySelectorAll('pre')) {
+    const wrap = document.createElement('div');
+    wrap.className = 'docs-code';
+    block.replaceWith(wrap);
+    wrap.append(block);
+    wrap.insertAdjacentHTML('beforeend', `<button class="docs-copy" type="button" aria-label="Copy" title="Copy">${ICON.copy}</button>`);
+  }
+  const article = document.createElement('article');
+  article.className = 'docs-page';
+  article.append(template.content);
+  renderPublicShell(page.path, `<main>${article.outerHTML}</main>`);
+  for (const button of document.querySelectorAll('.docs-copy')) button.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(button.previousElementSibling.textContent);
+      button.classList.add('copied');
+      setTimeout(() => button.classList.remove('copied'), 1200);
+    } catch { /* the text stays selectable */ }
+  });
 }
 
 async function renderLegalPage(slug) {
@@ -20980,28 +21870,24 @@ async function renderLegalPage(slug) {
   document.title = `${policy.title} · ${siteName()}`;
   const contactRows = Object.entries(policy.contacts || {}).filter(([, email]) => email)
     .map(([kind, email]) => `<a href="mailto:${esc(email)}">${esc(kind)}: ${esc(email)}</a>`).join('');
-  $('#app').innerHTML = `<div class="legal-shell"><header class="legal-nav"><a href="/" class="landing-brand">${brandMark()}<span>${siteNameMarkup()}</span></a><a href="/legal">All policies</a></header>
-    <main class="legal-document"><div class="legal-kicker">Version ${esc(policy.version)} · Effective ${esc(policy.effectiveDate)}</div>
+  renderPublicShell(`/legal/${policy.slug}`, `<main class="legal-document"><div class="legal-kicker">Version ${esc(policy.version)} · Effective ${esc(policy.effectiveDate)}</div>
     <h1>${esc(policy.title)}</h1><p class="legal-summary">${esc(policy.summary)}</p>
     <div class="legal-draft" role="note"><b>Launch draft</b><span>${esc(policy.draftNotice)}</span></div>
     ${policy.operator ? `<p class="legal-operator"><b>Configured operator:</b> ${esc(policy.operator.name)}${policy.operator.country ? ` · ${esc(policy.operator.country)}` : ''}${policy.operator.governingLaw ? `<br><b>Governing law:</b> ${esc(policy.operator.governingLaw)}` : ''}${policy.operator.legalNoticeAddress ? `<br><b>Legal notices:</b> ${esc(policy.operator.legalNoticeAddress)}` : ''}</p>`
       : '<p class="legal-unresolved"><b>Launch configuration incomplete:</b> the contracting entity and jurisdiction fields are intentionally not represented.</p>'}
     ${policy.sections.map((section) => `<section><h2>${esc(section.heading)}</h2>${section.paragraphs.map((text) => `<p>${esc(text)}</p>`).join('')}
       ${section.bullets?.length ? `<ul>${section.bullets.map((text) => `<li>${esc(text)}</li>`).join('')}</ul>` : ''}</section>`).join('')}
-    ${contactRows ? `<div class="legal-contacts">${contactRows}</div>` : ''}</main>${legalFooter()}</div>`;
-  window.onpopstate = () => boot();
+    ${contactRows ? `<div class="legal-contacts">${contactRows}</div>` : ''}</main>`);
 }
 
 function renderLegalIndex() {
   document.body.classList.remove('landing-active');
   document.title = `Policies · ${siteName()}`;
-  $('#app').innerHTML = `<div class="legal-shell"><header class="legal-nav"><a href="/" class="landing-brand">${brandMark()}<span>${siteNameMarkup()}</span></a><a href="/pricing">Pricing</a></header>
-    <main class="legal-index"><div class="legal-kicker">Launch policy set · v${esc(S.launch?.policyVersion)}</div><h1>Policies &amp; trust</h1>
+  renderPublicShell('/legal', `<main class="legal-index"><div class="legal-kicker">Launch policy set · v${esc(S.launch?.policyVersion)}</div><h1>Policies &amp; trust</h1>
     <p class="legal-summary">Versioned product, billing, privacy, and operational disclosures for the initial paid launch.</p>
     <div class="legal-draft" role="note"><b>Launch draft</b><span>${esc(S.launch?.draftNotice)}</span></div>
-    <div class="legal-grid">${(S.launch?.policies || []).map((policy) => `<a href="/legal/${policy.slug}"><span>${esc(policy.title)}</span><small>${esc(policy.summary)}</small><i>v${esc(policy.version)} →</i></a>`).join('')}</div>
-    </main>${legalFooter()}</div>`;
-  window.onpopstate = () => boot();
+    <div class="legal-grid">${(S.launch?.policies || []).map((policy) => `<a href="/legal/${policy.slug}" data-public><span>${esc(policy.title)}</span><small>${esc(policy.summary)}</small><i>v${esc(policy.version)} →</i></a>`).join('')}</div>
+    </main>`);
 }
 
 function formatCatalogPrice(cents, currency = 'usd') {
@@ -21027,14 +21913,12 @@ function renderPricing() {
       <li>${esc(formatBytes(plan.storageBytes))} storage${plan.id === 'team' ? ` + ${esc(formatBytes(plan.additionalActiveUserStorageBytes))} per additional active user` : ''}</li></ul>
       ${plan.id === 'free' || checkoutReady ? '<a class="btn primary" href="/signup">Create account</a>' : '<span class="price-unavailable">Paid checkout is not yet enabled.</span>'}</article>`;
   }).join('');
-  $('#app').innerHTML = `<div class="legal-shell"><header class="legal-nav"><a href="/" class="landing-brand">${brandMark()}<span>${siteNameMarkup()}</span></a><a href="/login">Sign in</a></header>
-    <main class="pricing-page"><div class="legal-kicker">Hosted plans</div><h1>Free, Individual, and Team</h1>
+  renderPublicShell('/pricing', `<main class="pricing-page"><div class="legal-kicker">Hosted plans</div><h1>Free, Individual, and Team</h1>
       <p class="legal-summary">All plans include unlimited projects. Concurrency is a maximum number of active agent runs, not reserved capacity.</p>
       <div class="pricing-grid">${cards}</div>
       <div class="pricing-terms"><p>Individual and Team renew monthly until canceled. Team is ${esc(formatCatalogPrice(team?.monthlyBasePriceCents, team?.currency))} per month including the first active user, plus ${esc(formatCatalogPrice(team?.monthlyAdditionalActiveUserPriceCents, team?.currency))} per additional active user per month. Cancel online from Organization settings; cancellation normally stops the next renewal and access continues through the paid period. Refunds are subject to applicable law and the payment provider’s buyer terms. Request refunds through billing support or the payment provider.</p>
       ${!checkoutReady ? '<p class="legal-unresolved"><b>Paid checkout disabled:</b> the operator must complete the founder-reviewed entity, jurisdiction, and contact launch configuration before accepting charges.</p>' : ''}
-      <p class="price-policy">${policyLinks(['terms', 'privacy', 'billing'])}</p></div></main>${legalFooter()}</div>`;
-  window.onpopstate = () => boot();
+      <p class="price-policy">${policyLinks(['terms', 'privacy', 'billing'])}</p></div></main>`);
 }
 
 function openPublicAuth(path, render) {
@@ -21083,21 +21967,19 @@ function renderLanding() {
     <header class="landing-nav" aria-label="Primary navigation"><div class="landing-nav-inner">
       <div class="landing-identity"><a class="landing-brand" href="/" aria-label="${siteNameMarkup()} home">${brandMark()}<span>${siteNameMarkup()}</span></a><p class="landing-tagline">Just do things.</p></div>
       <div class="landing-nav-actions">
+        <a href="/docs" class="landing-text-link">Docs</a>
         <a href="/pricing" class="landing-text-link">Pricing</a>
         <a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues" class="landing-text-link">GitHub</a>
         <button class="landing-theme" id="landing-theme" type="button" aria-label="Switch theme"><svg class="sun" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="3.4"/><path d="M10 1.8v2M10 16.2v2M1.8 10h2M16.2 10h2M4.2 4.2l1.4 1.4M14.4 14.4l1.4 1.4M4.2 15.8l1.4-1.4M14.4 5.6l1.4-1.4"/></svg><svg class="moon" viewBox="0 0 20 20" aria-hidden="true"><path d="M16.4 12.6A6.8 6.8 0 0 1 7.4 3.6a6.8 6.8 0 1 0 9 9z"/></svg></button>
         <button class="landing-sign-in" id="landing-sign-in" type="button">Sign in</button>
-        <button class="landing-start" id="landing-start" type="button">Get started <span aria-hidden="true">↗</span></button>
+        <button class="landing-start" id="landing-start" type="button">Get started</button>
       </div>
     </div></header>
 
     <main id="landing-main">
       <section class="landing-hero" aria-labelledby="landing-title">
         <div class="landing-hero-copy">
-          <h1 id="landing-title" class="landing-analogy">
-            <span><strong>vscode</strong><span>was a fancy <b>text editor.</b></span></span>
-            <span><strong>${siteNameMarkup()}</strong><span>is a fancy <b>to-do list.</b></span></span>
-          </h1>
+          <h1 id="landing-title" class="landing-analogy"><span>vscode was a fancy <b>text editor.</b></span> <span>${siteNameMarkup()} is a fancy <b>to-do list.</b></span></h1>
           <p class="landing-intro">The interface for the era of <strong>managing agents</strong> rather than <s>manually coding/working</s>.</p>
           <div class="landing-hero-actions">
             <button class="landing-start landing-start-large" id="landing-hero-start" type="button">Start managing agents <span aria-hidden="true">→</span></button>
@@ -21165,7 +22047,7 @@ function renderLanding() {
       </section>
     </main>
 
-    <footer class="landing-footer"><a class="landing-brand" href="/">${brandMark()}<span>${siteNameMarkup()}</span></a><p>Just do things.</p><a href="/pricing">Pricing</a><a href="/legal">Policies</a><a href="/legal/security">Security</a><a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues">GitHub ↗</a></footer>
+    <footer class="landing-footer"><a class="landing-brand" href="/">${brandMark()}<span>${siteNameMarkup()}</span></a><p>Just do things.</p><a href="/docs">Docs</a><a href="/pricing">Pricing</a><a href="/legal">Policies</a><a href="/legal/security">Security</a><a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues">GitHub ↗</a></footer>
   </div>`;
 
   const signIn = () => openPublicAuth('/login', renderLogin);
@@ -22146,10 +23028,9 @@ async function renderOAuthConsent() {
 
 function appGrantsCard() {
   return `<div class="card" id="app-grants-card">
-    <div class="section-h">Apps and tokens ${policyTip('Devices, apps and tokens that act as you. Revoking one signs it out everywhere at once.')}</div>
-    <div id="profile-app-grants" aria-live="polite"><p class="task-sub">Loading…</p></div>
+    <div class="section-h section-h-action"><span>Apps and tokens ${policyTip('Devices, apps and tokens that act as you. Revoking one signs it out everywhere at once.')}</span><button class="btn sm" type="button" id="app-token-open">New token</button></div>
     <div class="app-token-new" id="app-token-new"></div>
-    <button class="btn sm" type="button" id="app-token-open">New token</button>
+    <div id="profile-app-grants" aria-live="polite"><p class="task-sub">Loading…</p></div>
   </div>`;
 }
 
@@ -22168,7 +23049,7 @@ async function hydrateAppGrants() {
           · ${grant.lastUsedAt ? `used ${esc(fmtAgo(grant.lastUsedAt))}` : 'never used'}
           · <span title="${esc(`Created ${new Date(grant.createdAt).toLocaleString()}`)}">${grant.kind === 'token' ? 'expires' : 'expires if unused by'} ${esc(day(grant.expiresAt))}</span></p></div>
       <button class="btn sm danger" type="button" data-revoke-grant="${esc(grant.id)}">Revoke</button></div>`).join('')
-    : '<p class="task-sub">Nothing signed in. <code>npx @tavya/cli login</code> signs in a terminal.</p>';
+    : '<p class="task-sub app-grants-empty">Nothing signed in yet. Sign in a terminal with <code>npx @tavya/cli login</code>.</p>';
   box.querySelectorAll('[data-revoke-grant]').forEach((button) => button.addEventListener('click', async () => {
     const name = button.closest('.app-grant-row')?.querySelector('b')?.textContent || 'this';
     if (!confirm(`Revoke ${name}? It is signed out at once.`)) return;

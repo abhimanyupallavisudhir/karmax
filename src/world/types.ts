@@ -169,9 +169,10 @@ export interface WorldSpec {
     /** SSH-shaped GitHub URL -> short-lived, repository-scoped App token. */
     httpsTokens?: Record<string, string>;
   };
-  /** Per-repository branch policy supplied by first-class hosted repository
-   * attachments. Keys are the exact SSH URLs in `repos`. */
-  repositoryBranches?: Record<string, { base: string; target: string }>;
+  /** Per-repository branch policy: a task's per-repository branches, or a
+   * first-class repository attachment's. Keys are the exact sources in `repos`;
+   * without a target the repository follows the task's (unpinned). */
+  repositoryBranches?: Record<string, { base: string; target?: string }>;
   /** Per-source authority selected by the trusted create-world activity. A PR
    * checkout forks from and later publishes through origin; local-only and
    * none/push checkouts retain the configured project repository. */
@@ -232,6 +233,15 @@ export function worldRepos(handle: WorldHandle): WorldRepo[] {
       branch: handle.branch, base: handle.base, target: handle.target, targetPinned: false }];
   }
   return [];
+}
+
+/** A resource location as a root-relative path for the world file API: under
+ * the named checkout, else the working directory. Undefined when this world has
+ * no checkout of that name. */
+export function worldLocationPath(handle: WorldHandle, location: { path: string; repository?: string }): string | undefined {
+  if (location.repository === undefined) return worldWorkingRelativePath(handle, location.path);
+  const repo = worldRepos(handle).find((candidate) => candidate.name === location.repository);
+  return repo ? worldWorkingRelativePath({ ...handle, workdir: repo.root }, location.path) : undefined;
 }
 
 /** Stable configured identity for enrollment/checkpoint lookups. Local
@@ -391,6 +401,10 @@ export interface ProviderUsageEvent {
   id: string;
   sandboxId: string;
   taskId?: string;
+  /** The organization that created the sandbox (`karmaxOrganizationId`
+   * metadata). One provider account can serve several organizations, so this,
+   * not whose key read the feed, decides who the execution is booked to. */
+  organizationId?: string;
   startedAt: number;
   endedAt: number;
   activeMs: number;

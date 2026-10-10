@@ -3,6 +3,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { ProjectService, ResourceAttachment } from '../domain/types.js';
 import type { ExecResult, World } from './types.js';
+import { worldLocationPath } from './types.js';
 import { paths } from '../config/paths.js';
 
 const pexec = promisify(execFile);
@@ -30,8 +31,8 @@ export async function launchWorldServices(world: World, taskId: string, services
     if (service.containerPort) args.push('-p', `127.0.0.1:0:${service.containerPort}`);
     if (service.seedResourceId && service.seedContainerPath) {
       const resource = resources.get(service.seedResourceId);
-      if (resource?.target.kind === 'path') args.push('-v',
-        `${join(world.handle.root, resource.target.path)}:${service.seedContainerPath}:ro`);
+      const seed = resource?.target.kind === 'path' ? worldLocationPath(world.handle, resource.target) : undefined;
+      if (seed !== undefined) args.push('-v', `${join(world.handle.root, seed)}:${service.seedContainerPath}:ro`);
       else result.warnings.push(`service ${service.name}: seed resource is unavailable or not path-shaped`);
     }
     args.push(service.image!);

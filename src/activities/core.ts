@@ -1,6 +1,8 @@
-import { machineShape } from '../domain/computer.js';
+import { applyComputer, machineShape, normalizeComputer } from '../domain/computer.js';
+import { taskEnded } from '../world/task-ended.js';
 import { CheckpointRefusedError } from '../world/checkpoint-chunks.js';
-import { conversationFor, workDigest } from '../domain/participants.js';
+import { conversationFor, participantLabel, workDigest } from '../domain/participants.js';
+import { forkSourceRole } from '../domain/forks.js';
 import { createHash } from 'node:crypto';
 import { buildVersionedBundle } from '../packages/bundle.js';
 import type { WorkflowBundle } from '@temporalio/worker';
@@ -121,7 +123,7 @@ import { SIG_AGENT_TURN_STATE } from '../workflows/names.js';
 import { destroyWorldServices } from '../world/services.js';
 import { sameRepository } from '../world/repository-identity.js';
 import { forkDevelopmentSources, forkRecordedAuthority, type ForkWorldSource } from '../world/fork.js';
-import { REPOSITORY_BRANCHES_RESOLVED_PARAM } from '../platform/branch-defaults.js';
+import { REPOSITORY_BRANCHES_RESOLVED_PARAM, normalizeRepoBranches, repoBranchesFor } from '../platform/branch-defaults.js';
 
 /** A sub-task's task param: the versions of its parent's writable resources it starts from. */
 const PARENT_RESOURCES_PARAM = '_parentResources';
@@ -1041,6 +1043,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
   async function ensureRunnerLease(handleInput: WorldHandle, taskId: string): Promise<WorldHandle> {
     const handle = ((await store.currentWorld(handleInput.id)) ?? handleInput) as WorldHandle;
     if (!isRemote(handle.kind) || !deps.runners) return handle;
+    // A finished task's world was torn down on purpose. Leasing it would mark it
+    // ready again and let recovery rebuild it (task #552: about 230 leases an
+    // hour for eleven hours, for another task forking its agent).
+    if ((await store.worldState(handle.id)) === 'released') throw new Error(`task ${handle.id}'s world was released when the task ended`);
     const existing = typeof handle.meta?.worldLeaseId === 'string' ? (await store.worldLease(handle.meta.worldLeaseId)) : undefined;
     if (existing?.state === 'active') return handle;
     const projectId = String(handle.meta?.projectId ?? (await store.taskProjectIdAsync(taskId)) ?? '');
@@ -1056,7 +1062,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     return next as WorldHandle;
   }
 
-  async function openWorld(handle: WorldHandle, taskId = handle.id): Promise<World> {
+  /** `recover: false` opens only a sandbox that is still there: a reader such
+   * as a fork copying a session out never rebuilds another task's world. */
+  async function openWorld(handle: WorldHandle, taskId = handle.id, options: { recover?: boolean } = {}): Promise<World> {
+    const recover = options.recover !== false;
     // Pin access before admission, but never wait for capacity while holding a
     // transition lock: the previous owner needs that lock to release its lease.
     const releaseAccess = await worlds.holdAccess?.(handle.id);
@@ -1067,8 +1076,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (typeof leaseId !== 'string' || (await store.worldLease(leaseId))?.state !== 'active') return undefined;
       }
       let world: World;
-      try { world = await worlds.open(current); }
+      try { world = await (recover ? worlds.open(current) : worlds.withoutRecovery(() => worlds.open(current))); }
       catch (e) {
+        if (!recover) throw e;
         const recovered = await recoverVanishedWorld(current, taskId, e);
         if (!recovered) throw e;
         world = recovered;
@@ -1115,7 +1125,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     // open on a released handle (a retried activity, a late artifact fetch, an
     // MCP call holding the old handle) would probe 'missing' — correctly, it was
     // destroyed — and re-provision a fresh billable sandbox for a done task.
-    if ((await store.worldState(handle.id)) === 'released') return undefined;
+    if ((await store.worldState(handle.id)) === 'released' || await taskEnded(store, handle.id)) return undefined;
     const checkpointId = handle.checkpointId ?? ((await store.currentWorld(handle.id)) as WorldHandle | undefined)?.checkpointId;
     if (!checkpointId) return undefined;
     const state = await worlds.probe(handle).catch(() => undefined);
@@ -1468,7 +1478,15 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // to merge back into. prepareChildTask publishes this parent ref before
       // provisioning, including repositories attached after the parent started.
       const childStack = Boolean(taskRecord?.parentTaskId && args.base);
-      const repositoryBranches = Object.fromEntries(worldSources.flatMap((source, index) => {
+      // The task's own per-repository branches (resolved and persisted when it
+      // was queued) outrank every project-level policy. A repository whose
+      // target is the common one stays unpinned, so a retarget still moves it.
+      const taskRepoBranches = normalizeRepoBranches(taskRecord?.params.repoBranches);
+      const repositoryBranches: Record<string, { base: string; target?: string }> = Object.fromEntries(worldSources.flatMap((source, index) => {
+        const own = childStack ? undefined : repoBranchesFor(taskRepoBranches, [requestedSources[index], transportSources[index], source]);
+        const ownBase = own?.base ?? args.base;
+        if (own && ownBase) return [[source, { base: ownBase,
+          ...(own.target && own.target !== (args.target ?? args.base) ? { target: own.target } : {}) }]];
         const candidate = linkedRepositories.find((entry) => sameRepository(entry.repository.sshUrl, transportSources[index]!));
         if (!candidate) return [];
         if (childStack) return [[source, { base: args.base, target: args.target ?? args.base }]];
@@ -1801,7 +1819,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // another. Ambient/API-key sessions have no stored source home.
       const resume = args.role ? args.task?.agents?.[args.role]?.resumeFrom : undefined;
       if (profile?.provider === 'opencode' && resume?.taskId) {
-        const srcRole = resume.role ?? args.role!;
+        const srcRole = forkSourceRole(resume, args.role!);
         const raw = (await store.kvGet(`sessionmeta:${resume.taskId}:${srcRole}`));
         if (raw) {
           try {
@@ -2182,7 +2200,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // provider histories, uploads, and public shares go through panagent; API rails
       // and unsupported native targets receive a guarded context message instead.
       if (!session && spec?.resumeFrom) {
-        const srcRole = spec.resumeFrom.role ?? args.role; // a task has many agents; pick the source's role
+        const srcRole = forkSourceRole(spec.resumeFrom, args.role); // a task has many agents; pick the source's
         // A task fork reads the source's conversation, native session and world.
         // The API authorizes the pointer when it is set, but a pointer can
         // outlive that check (an old template's spawned run, a task created
@@ -2196,8 +2214,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               || (await deps.tokens.check(token, 'task:conversation:read', { taskId: source.id })).ok);
           if (!readable) {
             (await record(args.taskId, 'session.fork-failed', { from: spec.resumeFrom, reason: 'source-not-authorized' }));
+            const sourceProject = source && sourceOrganization === organizationId ? (await store.getProject(source.projectId)) : undefined;
             throw ApplicationFailure.create({
-              message: `This agent cannot resume from task ${spec.resumeFrom.taskId}: it is not in this task's organization or its conversation is outside this task's authority.`,
+              message: sourceProject
+                ? `This agent cannot resume from task ${spec.resumeFrom.taskId}: its conversation is in project ${JSON.stringify(sourceProject.name)}, outside this task's authorization. Add that project to the task's Authorization, then retry.`
+                : `This agent cannot resume from task ${spec.resumeFrom.taskId}: it is not in this task's organization or its conversation is outside this task's authority.`,
               type: 'agent-error',
               nonRetryable: true,
             });
@@ -2343,9 +2364,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             } else if (profile.provider !== 'kimi' && profile.provider !== 'grok') {
               if (remoteSubscriptionRail) {
                 const sourceHandle = (await store.currentWorld(spec.resumeFrom.taskId)) as WorldHandle | undefined;
-                if (sourceHandle && isRemote(sourceHandle.kind)) {
+                // Only a sandbox still running or parked is read; a finished,
+                // hibernated or vanished source is never rebuilt for this
+                // (task #557 rebuilt #552's for eleven hours). Its session was
+                // saved when it stopped: the durable home below has it.
+                const sourceState = sourceHandle ? await store.worldState(sourceHandle.id) : undefined;
+                if (sourceHandle && isRemote(sourceHandle.kind) && (sourceState === 'ready' || sourceState === 'parked')) {
                   try {
-                    const sourceWorld = await openWorld(sourceHandle, spec.resumeFrom.taskId);
+                    const sourceWorld = await openWorld(sourceHandle, spec.resumeFrom.taskId, { recover: false });
                     prepared = await materializeRemoteSession(sourceWorld, world, profile.provider, srcSession, forkHome);
                   } catch (error) {
                     if (error instanceof CodexHistoryError) throw error;
@@ -2408,8 +2434,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
       // The sandbox bootstrap, and a native agent's home and browser tools, are
       // prepared while the prompt is (LT-1, LT-22).
-      prewarmRemoteAgentHome(world, profile.provider, remoteSubscriptionRail && (profile.provider === 'codex' || profile.provider === 'claude')
-        ? resolvedAuth?.configHome : undefined, session, profile.mcpConnections);
+      // OpenCode prepares its sandbox home on every rail, its login's or the
+      // shared API-key one, exactly as its adapter will ask for it (remote-acp.ts).
+      prewarmRemoteAgentHome(world, profile.provider, profile.provider === 'opencode'
+        ? (resolvedAuth?.apiKey ? undefined : resolvedAuth?.configHome)
+        : remoteSubscriptionRail && (profile.provider === 'codex' || profile.provider === 'claude')
+          ? resolvedAuth?.configHome : undefined, session, profile.mcpConnections);
 
       // Self-healing loop (SPEC §3.4): show the Resolve agent the INDEX of prior saved
       // resolutions (`{{skills}}`) so it reuses a known fix rather than rediscovering
@@ -2479,6 +2509,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           : forkOrigin.unpublished
             ? 'This independent world includes the source checkpoint’s unpublished work. Shared external services retain their configured sharing behavior.'
             : 'The source task landed. This world starts from its merge destination with the normal promoted project resources, rather than its old unpublished state.') : '';
+      // Any other forked agent — one called into this conversation, or a main
+      // agent whose world was not forked — remembers work done somewhere else.
+      const agentFork = spec?.resumeFrom && !(forkOrigin && speaker === 'do') ? spec.resumeFrom : undefined;
+      const agentForkSource = agentFork?.taskId ? (await store.getTask(agentFork.taskId)) : undefined;
+      const agentForkContext = !agentFork ? ''
+        : agentFork.taskId
+          ? `\n\nYour earlier conversation is forked from task #${agentForkSource?.num ?? agentFork.taskId}'s ${participantLabel(forkSourceRole(agentFork, args.role))}, which worked in its own world. You now work in this task's world: check the files, branches and processes you remember before relying on them.`
+          : '\n\nYour earlier conversation was imported from outside this task; that work did not happen in this world. Check the files, branches and processes it mentions before relying on them.';
       const attemptGroup = (await store.attemptSummary(args.taskId));
       const attemptContext = attemptGroup && attemptGroup.attempts > 1
         ? `\n\nThis task has ${attemptGroup.attempts} attempts. Other attempts: ${attemptGroup.otherAttempts ?? (await store.otherAttemptsDefault(args.taskId))}. `
@@ -2495,12 +2533,26 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const paymentPolicy = (await paymentService?.participantPolicy(args.task.projectId, args.taskId, paymentParticipant));
       const paymentContext = paymentPromptContext(paymentCards, paymentPolicy,
         paymentCards.length && paymentPolicy ? paymentPolicy.spent : 0, paymentPolicy?.own ? 'Your budget' : 'Task budget');
+      // The machine as recorded now (the workflow's copy of the handle predates a
+      // size learned later), and the one the task's Computer asks for.
+      let promptWorld = args.worldHandle;
+      let requestedComputer: ReturnType<typeof machineShape> | undefined;
+      try {
+        const stored = (await store.currentWorld(args.taskId)) as WorldHandle | undefined;
+        if (stored?.meta?.computer && (stored.generation ?? 1) === (args.worldHandle.generation ?? 1))
+          promptWorld = { ...args.worldHandle, meta: { ...args.worldHandle.meta, computer: stored.meta.computer } };
+        // Only a cloud world has a machine to name; the task was read once above (RT-14).
+        const project = promptWorld.meta?.computer ? (await store.getProject(args.task.projectId)) : undefined;
+        if (project) requestedComputer = machineShape(applyComputer(await store.effectiveProjectConfig(project),
+          normalizeComputer(preparationTask?.params.computer)));
+      } catch { /* the World section then names the machine as the workflow knows it */ }
       const systemPrompt = assemblePrompt({
         profile,
         role: args.role,
         task: promptTask,
-        world: args.worldHandle,
-        globalInstructions: (globalInstructions ?? '') + forkContext + attemptContext + paymentContext,
+        world: promptWorld,
+        ...(requestedComputer ? { computer: requestedComputer } : {}),
+        globalInstructions: (globalInstructions ?? '') + forkContext + agentForkContext + attemptContext + paymentContext,
         projectInstructions,
         bindings,
       });
@@ -3671,7 +3723,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       await deps.resources?.beginReview(taskId, reviewId);
     },
 
-    async settleResourceReview(taskId: string): Promise<void> {
+    /** `keepOwn`: files this task and a newer version changed differently keep
+     * this task's version (the person chose it on the conflict escalation). */
+    async settleResourceReview(taskId: string, choice: { keepOwn?: boolean } = {}): Promise<void> {
       let context: ReturnType<typeof activityContext.current> | undefined;
       try { context = activityContext.current(); } catch { /* direct tests */ }
       let progress: StagingProgress | undefined;
@@ -3682,6 +3736,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }, 5_000);
       try {
         await deps.resources?.settleReview(taskId, {
+          ...(choice.keepOwn ? { keepOwn: true } : {}),
           checkContinue: async () => { context?.cancellationSignal.throwIfAborted(); },
           // Publishing a changed resource is a save too: Review shows how far it has got.
           onProgress: (next) => {
@@ -4156,12 +4211,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               let inspected = await inspection.actions.inspectFailure(ref.slug, runId);
               // A stale check URL must never cause a rerun or repair of a
               // different revision than the proposal whose landing is held.
-              // pull_request Actions run against refs/pull/N/merge, however,
-              // legitimately carries the synthetic merge SHA rather than the
-              // PR head. The URL came from this current PR's readiness packet,
-              // so that event remains safely correlated to this candidate.
-              if (inspected.run.headSha && ref.headSha && inspected.run.headSha !== ref.headSha
-                && inspected.run.event !== 'pull_request') continue;
+              // A pull_request run's head_sha is the PR head it tested.
+              if (inspected.run.headSha && ref.headSha && inspected.run.headSha !== ref.headSha) continue;
               const check = (readiness.failedChecks ?? [])
                 .find((candidate) => githubActionsRunIdFromUrl(candidate.url) === runId);
               const identity = {

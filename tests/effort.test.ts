@@ -150,7 +150,7 @@ describe('reasoning-effort → provider parameter mapping (SPEC §10.5)', () => 
   });
 });
 
-it.each(['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna'])('preserves explicit reasoning effort for %s', (model) => {
+it.each(['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-6.1-sol'])('preserves explicit reasoning effort for %s', (model) => {
   for (const effort of ['low', 'medium', 'high', 'xhigh', 'max']) {
     expect(codexReasoningEffort(model, effort)).toBe(effort);
   }

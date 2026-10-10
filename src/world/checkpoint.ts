@@ -321,6 +321,10 @@ export class WorldCheckpointService {
     // `queued` lease row that nothing ever releases, permanently eating capacity.
     const remote = this.worlds.get(selected).capabilities?.remote === true;
     const hooks = options ?? ambientActivityHooks();
+    // After the generation it replaces, which may be newer than the checkpoint
+    // (task #552: a resize restored generation 1's checkpoint as generation 2,
+    // which vanished uncheckpointed; restoring it again as "2" was refused).
+    const generation = Math.max(checkpoint.generation, previousHandle?.generation ?? 0) + 1;
     const previousLeaseId = previousHandle?.meta?.worldLeaseId;
     if (remote && typeof previousLeaseId === 'string') {
       const previousLease = await this.store.worldLease(previousLeaseId);
@@ -339,7 +343,7 @@ export class WorldCheckpointService {
       // identity selects the organization-owned credential, while generation
       // keeps the provider's idempotency lookup away from the vanished sandbox.
       world = await this.worlds.create(selected, { taskId: checkpoint.worldId,
-        generation: checkpoint.generation + 1, organizationId: project.organizationId,
+        generation, organizationId: project.organizationId,
         repos: sources as string[],
         ...(checkpoint.repos.some(repo => repo.checkoutPath !== '.') ? { layout: 'nested' } : {}),
         copySources: checkpoint.repos.map((repo, index) => repo.localPath ?? previousFor(repo, index)?.localPath),
@@ -380,7 +384,7 @@ export class WorldCheckpointService {
       if (this.resources) {
         const revisions = Object.fromEntries((checkpoint.resources ?? []).map((resource) => [resource.attachmentId, resource.revisionId]));
         world.handle = await this.resources.materialize(checkpoint.projectId, checkpoint.worldId, world,
-          checkpoint.generation + 1, revisions);
+          generation, revisions);
       }
       const writes: Array<[string, RestoredFile]> = [];
       for await (const file of delta) {

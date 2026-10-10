@@ -155,6 +155,37 @@ describe('Project settings', () => {
     await ui.close();
   });
 
+  it('shows where each secret goes and puts a suggested name in the repository that asked for it', async () => {
+    const posts: any[] = [];
+    const ui = await settings({ api: ({ method, path: route, body }) => {
+      if (!route.split('?')[0]!.endsWith('/secrets')) return undefined;
+      if (method === 'POST') { posts.push(body); return { imported: [], secrets: [] }; }
+      return { repositories: ['api', 'web'], suggested: [{ name: 'DATABASE_URL', repository: 'web' }], secrets: [
+        { id: 's1', name: 'api/.env:DATABASE_URL', variable: 'DATABASE_URL', dotenv: { path: '.env', repository: 'api' } },
+        { id: 's2', name: 'SHARED', variable: 'SHARED' },
+        { id: 's3', name: 'sa.json', file: 'config/sa.json', repository: 'web' }] };
+    } });
+    const box = ui.page.locator('#project-secrets-box');
+    await box.locator('.project-resource-row').first().waitFor();
+    const rows = await box.locator('.project-resource-row').evaluateAll((elements) =>
+      elements.map((element) => [element.querySelector('b')!.textContent, element.querySelector('code')!.textContent, element.querySelector('.chip')!.textContent]));
+    expect(rows).toEqual([['SHARED', 'SHARED', 'environment variable'], ['DATABASE_URL', 'api/.env', '.env line'],
+      ['sa.json', 'web/config/sa.json', 'private file']]);
+    await box.locator('.project-secret-suggest', { hasText: 'DATABASE_URL' }).click();
+    expect(await box.locator('#project-secret-file').inputValue()).toBe('web/.env');
+    await box.locator('#project-secret-value').fill('postgres://web');
+    await box.locator('#project-secret-save').click();
+    await expect.poll(() => posts.length).toBe(1);
+    expect(posts[0]).toEqual({ name: 'DATABASE_URL', value: 'postgres://web', file: 'web/.env' });
+    // Each repository's .env is offered; a blank destination means every command.
+    await box.locator('#project-secret-paste summary').click();
+    await box.locator('#project-secret-env-file').focus();
+    expect(await box.locator('#project-secret-paste .combo-opt').evaluateAll((options) => options.map((option) => (option as any).dataset.v)))
+      .toEqual(['api/.env', 'web/.env']);
+    expect(await box.locator('#project-secret-env-file').getAttribute('placeholder')).toBe('Every command');
+    await ui.close();
+  });
+
   it('keeps organization repository and storage controls in one Projects pane', async () => {
     const ui = await settings({ path: '/org/settings' });
     const links = await ui.page.locator('.settings-layout a[href^="#settings-"]').evaluateAll((anchors) =>
@@ -194,9 +225,9 @@ describe('Project settings', () => {
       'Sensitive values injected only when a task needs them. Values are never shown again.',
       'No versioned data yet.', 'A human-readable name in Project settings.',
       'The destination path inside every task world', 'Expensive installation commands baked into a reusable build',
-      'No build yet.',
+      'No build yet.', 'Local repo, GitHub, or Git URL', 'Repository source', 'Save repositories',
     ]) expect(text).not.toContain(removed);
-    expect(text).toContain('Local repo, GitHub, or Git URL');
+    expect(await ui.page.locator('#project-repository-input').getAttribute('placeholder')).toBe('Git URL or local path');
     expect(text).toContain('Base image (optional)');
     expect(await ui.page.locator('#environment-image').getAttribute('list')).toBe('environment-image-options');
     expect(await ui.page.locator('#environment-image-options option').evaluateAll((options) =>
@@ -221,14 +252,14 @@ describe('Project settings', () => {
     await ui.close();
   });
 
-  it('opens GitHub repository creation from a button beside Save repositories', async () => {
+  it('opens GitHub repository creation from a button beside Add', async () => {
     const ui = await settings({ api: ({ method, path: route }) => method !== 'GET' ? undefined
       : route.endsWith('/github/app') ? { configured: true, userAuthorized: true }
         : route.endsWith('/git-connections') ? [{ id: 'gc', provider: 'github', accountLogin: 'octo' }] : undefined });
-    const save = ui.page.getByRole('button', { name: 'Save repositories' });
-    const create = ui.page.getByRole('button', { name: 'New repository...' });
+    const add = ui.page.getByRole('button', { name: 'Add', exact: true });
+    const create = ui.page.getByRole('button', { name: 'New repository' });
     await create.waitFor();
-    expect(await save.evaluate((element, other) => element.parentElement === other!.parentElement
+    expect(await add.evaluate((element, other) => element.parentElement === other!.parentElement
       && !!(element.compareDocumentPosition(other!) & (globalThis as any).Node.DOCUMENT_POSITION_FOLLOWING), await create.elementHandle())).toBe(true);
     await create.click();
     const dialog = ui.page.getByRole('dialog');
@@ -238,6 +269,85 @@ describe('Project settings', () => {
     await ui.page.keyboard.press('Escape');
     await dialog.waitFor({ state: 'detached' });
     expect(await create.evaluate((element) => element === (globalThis as any).document.activeElement)).toBe(true);
+    await ui.close();
+  });
+
+  it('names repositories the way people do, keeping the exact source on hover', async () => {
+    const ui = await consolePage();
+    expect(await ui.run(`[
+      'git@github.com:acme/web.git', 'https://github.com/Acme/API', 'ssh://git@ssh.github.com:443/acme/infra.git',
+      '/srv/code/tools', 'https://gitlab.com/acme/legacy.git',
+    ].map((source) => { const { kind, owner, name, key } = repositorySourceView(source); return [kind, owner, name, key]; })`)).toEqual([
+      ['github', 'acme', 'web', 'acme/web'], ['github', 'Acme', 'API', 'acme/api'], ['github', 'acme', 'infra', 'acme/infra'],
+      ['local', undefined, '/srv/code/tools', '/srv/code/tools'], ['git', undefined, 'https://gitlab.com/acme/legacy.git', 'https://gitlab.com/acme/legacy.git'],
+    ]);
+    await ui.close();
+  });
+
+  it('saves each repository as it is added or removed, picking organization repositories by owner/name', async () => {
+    const repositories = [{ id: 'r1', owner: 'acme', name: 'web', sshUrl: 'git@github.com:acme/web.git' },
+      { id: 'r2', owner: 'acme', name: 'api', sshUrl: 'git@github.com:acme/api.git' }];
+    let repos = ['git@github.com:acme/web.git', '/srv/code/tools'];
+    const project = () => ({ id: 'p', organizationId: 'o', name: 'Workspace', config: { repos } });
+    const ui = await consolePage({ path: '/org/workspace/settings', api: signedIn(async (call: ApiCall) => {
+      const route = call.path.split('?')[0]!;
+      if (call.method === 'PUT' && route === '/api/projects/p/repository-sources') { repos = call.body.repos; return project(); }
+      if (call.method !== 'GET') return undefined;
+      if (route === '/api/projects') return [project()];
+      if (route === '/api/projects/p') return project();
+      if (route === '/api/organizations/o/repositories') return repositories;
+      if (route.endsWith('/github/app')) return { configured: true, oauthConfigured: true, userAuthorized: true };
+      if (route.endsWith('/git-connections')) return [{ id: 'gc', provider: 'github', accountLogin: 'acme', permissionStatus: { ready: true } }];
+      if (route === '/api/user/github-accounts') return { accounts: [{ id: 'a', login: 'octo', active: true }] };
+      return emptySettings(call);
+    }, { projects: [project()] }) });
+    await ui.run('window.confirm = () => true; boot()');
+    const rows = ui.page.locator('#project-repository-fields .git-repo');
+    await expect.poll(() => rows.count()).toBe(2);
+    expect(await rows.locator('.git-repo-name').allInnerTexts()).toEqual(['acme/web', '/srv/code/tools']);
+    expect(await rows.first().locator('a').getAttribute('href')).toBe('https://github.com/acme/web');
+    expect(await rows.first().locator('a').getAttribute('title')).toBe('git@github.com:acme/web.git');
+    // Only repositories not yet in the project are offered.
+    expect(await ui.page.locator('#project-repository-options option').evaluateAll((options) =>
+      options.map((option) => (option as any).value))).toEqual(['acme/api']);
+    expect(await ui.page.locator('#project-github-access').innerText()).toContain('acme');
+    expect(await ui.page.locator('#project-github-identity').innerText()).toMatch(/You\s*·\s*octo/);
+
+    await ui.page.locator('#project-repository-input').fill('Acme/API');
+    await ui.page.keyboard.press('Enter');
+    await expect.poll(() => rows.count()).toBe(3);
+    await rows.filter({ hasText: '/srv/code/tools' }).getByRole('button', { name: 'Remove /srv/code/tools' }).click();
+    await expect.poll(() => rows.count()).toBe(2);
+    expect(ui.calls.filter((call) => call.method === 'PUT').map((call) => call.body.repos)).toEqual([
+      ['git@github.com:acme/web.git', '/srv/code/tools', 'git@github.com:acme/api.git'],
+      ['git@github.com:acme/web.git', 'git@github.com:acme/api.git'],
+    ]);
+    // A repository already in the project is not added twice.
+    await ui.page.locator('#project-repository-input').fill('git@github.com:acme/web.git');
+    await ui.page.getByRole('button', { name: 'Add', exact: true }).click();
+    await expect.poll(() => ui.toasts()).toContain('Already added');
+    expect(ui.calls.filter((call) => call.method === 'PUT')).toHaveLength(2);
+    await ui.close();
+  });
+
+  it('offers only the organization’s GitHub repositories on hosted', async () => {
+    const hosted = (repositories: unknown[]) => settings({ api: ({ method, path: route }) => method !== 'GET' ? undefined
+      : route === '/api/meta' ? { siteName: 'Fixture', hosted: true, hostLocal: false, consoleRevision: 'one', agent: { provider: 'mock' }, worldProviders: [] }
+        : route.endsWith('/organizations/o/repositories') ? repositories
+          : route.endsWith('/github/app') ? { configured: true } : undefined });
+    const empty = await hosted([]);
+    const input = empty.page.locator('#project-repository-input');
+    await input.waitFor();
+    expect(await input.isDisabled()).toBe(true);
+    expect(await input.getAttribute('placeholder')).toBe('Connect GitHub to add repositories');
+    expect(await empty.page.locator('#project-github-access').getByRole('button', { name: 'Connect GitHub' }).count()).toBe(1);
+    await empty.close();
+
+    const ui = await hosted([{ id: 'r', owner: 'acme', name: 'web', sshUrl: 'git@github.com:acme/web.git' }]);
+    await ui.page.locator('#project-repository-input').fill('git@gitlab.com:acme/web.git');
+    await ui.page.keyboard.press('Enter');
+    await expect.poll(() => ui.toasts()).toContain('Choose one of the organization’s GitHub repositories');
+    expect(ui.calls.some((call) => call.method === 'PUT')).toBe(false);
     await ui.close();
   });
 

@@ -17,6 +17,7 @@ import { makeCoordinatorActivities } from '../src/activities/coordinator.js';
 import { TASK_QUEUE } from '../src/temporal/config.js';
 import { ConfigHomeManager } from '../src/autonomy/config-homes.js';
 import { INSTALLATION_SCOPE } from '../src/autonomy/vault-keys.js';
+import { totpCode } from '../src/autonomy/vault-items.js';
 import { EXPLANATIONS_ENABLED } from '../src/config/features.js';
 
 const webDir = fileURLToPath(new URL('../web', import.meta.url));
@@ -75,6 +76,56 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(catalog.providers.claude.map((m: any) => m.id)).toContain('claude-opus-5-5');
     expect(catalog.providers.codex.map((m: any) => m.id))
       .toEqual(expect.arrayContaining(['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna']));
+  });
+
+  it('charts runnable models from Artificial Analysis: the bundled snapshot, or the live list with a key', async () => {
+    // No key: the snapshot that ships with tavya.
+    expect((await (await fetch(`${base}/api/meta`)).json() as any).modelBenchmarks).toBe(true);
+    const bundled: any = await (await fetch(`${base}/api/models/benchmarks`, { headers: auth() })).json();
+    expect(bundled.fetchedAt).toBe(Date.parse((await import('../src/agent/model-benchmarks.json', { with: { type: 'json' } })).default.fetchedAt));
+    expect(bundled.models.length).toBeGreaterThan(20);
+    expect(bundled.models).toContainEqual(expect.objectContaining({ ref: { provider: 'claude', model: 'claude-opus-5-5', effort: 'high' } }));
+
+    const requests: string[] = [];
+    const { ArtificialAnalysis } = await import('../src/agent/model-benchmarks.js');
+    const gw = await h.startGateway({ artificialAnalysis: new ArtificialAnalysis({
+      apiKey: 'aa-test-key',
+      fetch: async (_url, init) => {
+        requests.push(new Headers(init?.headers).get('x-api-key') ?? '');
+        return Response.json({ data: [
+          { id: 'aa-1', name: 'Claude Opus 5.5 (High)', slug: 'claude-opus-5-5-high', release_date: new Date().toISOString().slice(0, 10),
+            model_creator: { slug: 'anthropic', name: 'Anthropic' }, evaluations: { artificial_analysis_intelligence_index: 53.6 },
+            pricing: { price_1m_blended_3_to_1: 8, price_1m_input_tokens: 4, price_1m_output_tokens: 20 },
+            median_output_tokens_per_second: 50, median_time_to_first_answer_token: 2 },
+          { id: 'aa-2', name: 'Some Open Model', slug: 'some-open-model', model_creator: { slug: 'someone' },
+            evaluations: { artificial_analysis_intelligence_index: 20 } },
+        ] });
+      },
+    }) });
+    const session: any = await (await fetch(`${gw.url}/api/session`)).json();
+    const headers = { authorization: `Bearer ${session.token}` };
+    expect((await (await fetch(`${gw.url}/api/meta`)).json() as any).modelBenchmarks).toBe(true);
+    for (let i = 0; i < 2; i++) {
+      const response = await fetch(`${gw.url}/api/models/benchmarks`, { headers });
+      expect(response.status).toBe(200);
+      const body: any = await response.json();
+      expect(body.source.url).toBe('https://artificialanalysis.ai/');
+      expect(body.models).toEqual([expect.objectContaining({
+        id: 'aa-1', intelligence: 53.6, price: 8, seconds: 12, cost: 0.016,
+        ref: { provider: 'claude', model: 'claude-opus-5-5', effort: 'high' },
+      })]);
+      expect(JSON.stringify(body)).not.toContain('aa-test-key');
+    }
+    expect(requests).toEqual(['aa-test-key']);
+    expect((await fetch(`${gw.url}/api/models/benchmarks`)).status).toBe(401);
+
+    // Neither a snapshot nor a key: the chart is withdrawn.
+    const none = await h.startGateway({ artificialAnalysis: new ArtificialAnalysis({ snapshot: null }) });
+    const noneSession: any = await (await fetch(`${none.url}/api/session`)).json();
+    expect((await (await fetch(`${none.url}/api/meta`)).json() as any).modelBenchmarks).toBe(false);
+    expect((await fetch(`${none.url}/api/models/benchmarks`, { headers: { authorization: `Bearer ${noneSession.token}` } })).status).toBe(404);
+    await none.close();
+    await gw.close();
   });
 
   it('accepts only recognized project-scoped conversation files', async () => {
@@ -332,6 +383,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     const c: any = await (await fetch(`${base}/api/contributions`, { headers: auth() })).json();
     expect(c.commands.find((x: any) => x.id === 'nav.newTask')).toBeTruthy();
     expect(c.commands.find((x: any) => x.id === 'nav.notifications')?.keybinding).toBe('g N');
+    expect(c.commands.find((x: any) => x.id === 'nav.home')?.keybinding).toBe('g H');
     expect(c.commands.find((x: any) => x.id === 'nav.activity')).toBeUndefined();
     expect(c.slots.some((s: any) => s.contribution.slot === 'task-detail')).toBe(true);
     expect(c.events.some((e: any) => e.type === 'software-dev.merged')).toBe(true);
@@ -1739,7 +1791,8 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     });
     expect(migrated.status).toBe(200);
     const result: any = await migrated.json();
-    expect(result).toMatchObject({ environmentSecrets: ['LEGACY_TOKEN'], data: ['model.bin'], skipped: [] });
+    // Each match stays in the checkout copyGlobs copied it into.
+    expect(result).toMatchObject({ environmentSecrets: ['LEGACY_TOKEN'], data: [`${path.basename(repo)}/model.bin`], skipped: [] });
     expect(JSON.stringify(result)).not.toContain('private-legacy-value');
     expect((await h.store.getProject(project.id))?.config.copyGlobs).toEqual([]);
     const attachments = await fetch(`${base}/api/projects/${project.id}/resources`, { headers: auth() })
@@ -2010,6 +2063,46 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     await fetch(`${base}/api/vault/items/${created.id}`, { method: 'DELETE', headers: auth() });
     const after: any = await (await fetch(`${base}/api/vault/items`, { headers: auth() })).json();
     expect(after.map((i: any) => i.id)).not.toContain(created.id);
+  });
+
+  it('hands out a one-time code under blind use, never the seed and never needing reveal', async () => {
+    const seed = 'JBSWY3DPEHPK3PXP';
+    const item: any = await (await fetch(`${base}/api/vault/items`, { method: 'POST', headers: auth(), body: JSON.stringify({
+      type: 'login', label: 'TOTP only', domains: 'totp.example.com',
+      policy: { use: 'auto', reveal: 'never' }, secrets: { totp: seed, note: 'recovery codes' },
+    }) })).json();
+    const project: any = await (await fetch(`${base}/api/projects`, { method: 'POST', headers: auth(), body: JSON.stringify({ name: 'TOTP project' }) })).json();
+    const task: any = await (await fetch(`${base}/api/projects/${project.id}/tasks`, { method: 'POST', headers: auth(), body: JSON.stringify({
+      workflow: 'just-do', command: 'later', draft: true, credentialGrants: [`use-credential:item:${item.id}`],
+    }) })).json();
+    const minted = (await h.tokens.mint({
+      taskId: task.id, profileId: 'do', principal: 'user:test',
+      ceiling: ['credential:read', 'use-credential:*'], grantorCaps: ['credential:read', `use-credential:item:${item.id}`],
+    }));
+    const resolve = async (body: object) => (await (await fetch(`${base}/api/vault/resolve`, {
+      method: 'POST', headers: { authorization: `Bearer ${minted.token}`, 'content-type': 'application/json' }, body: JSON.stringify(body),
+    })).json()) as any;
+
+    // reveal: never does not stop a code; a seed-only login defaults to it.
+    for (const body of [{ itemId: item.id, field: 'totp' }, { itemId: item.id }]) {
+      const code = await resolve(body);
+      expect(code).toMatchObject({ status: 'granted', field: 'totp' });
+      expect(code.value).toMatch(/^\d{6}$/);
+      expect([totpCode(seed), totpCode(seed, Date.now() - 30_000)]).toContain(code.value);
+      expect(JSON.stringify(code)).not.toContain(seed);
+      expect(JSON.stringify(code)).not.toContain('recovery codes');
+    }
+    expect((await resolve({ itemId: item.id, field: 'note' })).status).toBe('denied');
+    expect((await h.store.auditSince()).some((entry: any) => entry.action === 'vault.used'
+      && entry.detail.itemId === item.id && entry.detail.field === 'totp')).toBe(true);
+
+    // Blind use set to ask still gates the code.
+    await fetch(`${base}/api/vault/items`, { method: 'POST', headers: auth(), body: JSON.stringify({ id: item.id, type: 'login', label: item.label, domains: item.domains, policy: { use: 'ask' } }) });
+    const asked = await resolve({ itemId: item.id, field: 'totp' });
+    expect(asked.status).toBe('needs_approval');
+    expect(asked.value).toBeUndefined();
+    const pending: any = await (await fetch(`${base}/api/vault/requests?taskId=${task.id}&status=pending`, { headers: auth() })).json();
+    expect(pending.find((request: any) => request.itemId === item.id)?.mode).toBe('use');
   });
 
   it('lists only non-secret credential metadata granted to the calling task', async () => {

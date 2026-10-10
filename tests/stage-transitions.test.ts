@@ -913,6 +913,82 @@ describe('task stage transitions', () => {
     expect((await f.store.listInbox('developer', 'org_personal'))).toEqual([]);
   });
 
+  /** #533: a sub-task's escalate_to_human named nobody, and the default sent it
+   * past its parent to the person at the top of the creator chain. An ask a
+   * person must answer names them; the error lists who can be asked. */
+  it('refuses an escalation that names nobody, listing who can be asked', async () => {
+    const f = (await fixture());
+    (await f.store.setOrganizationMembership('org_personal', 'developer', 'member'));
+    (await f.store.setProjectMembership(f.project.id, { kind: 'user', userId: 'developer' }, 'member'));
+    const agentToken = (await f.tokens.mint({ taskId: f.task.id, profileId: 'do', role: 'do',
+      principal: `task-agent:${f.task.id}:do`, projectId: f.project.id, ceiling: ['task:escalate'], grantorCaps: ['task:escalate'] })).token;
+    const refused = f.api.escalateToHuman(agentToken, { audience: [], message: 'Which colour?' });
+    await expect(refused).rejects.toThrow(/Name who to ask/);
+    await expect(refused).rejects.toThrow(/only a person can give/);
+    await expect(refused).rejects.toThrow(/end your turn with the question/);
+    await expect(refused).rejects.toThrow(/user:developer/);
+    await expect(refused).rejects.toThrow(/@creator/);
+    expect(f.terminated).toEqual([]);
+    expect(f.starts).toEqual([]);
+    expect((await f.store.eventsSince(f.task.id, 0)).map((e) => e.type)).not.toContain('task.escalated');
+  });
+
+  /** #533: the parent never learnt its sub-task had asked its owner. */
+  it("notes a sub-task's escalation in its parent's conversation without calling the parent", async () => {
+    const f = (await fixture());
+    const parent = (await f.store.createTask({ projectId: f.project.id, title: 'Parent', workflow: 'software-dev',
+      workflowVersion: '1.27.0', createdBy: { kind: 'user', userId: 'test' }, params: { prompt: 'parent', base: 'main', target: 'main' } }));
+    (await f.store.saveView(parent.id, { ...f.view, taskId: parent.id, title: 'Parent' }));
+    const child = (await f.store.createTask({ projectId: f.project.id, title: 'Child', workflow: 'software-dev',
+      workflowVersion: '1.4.0', parentTaskId: parent.id, createdBy: { kind: 'task-agent', taskId: parent.id, role: 'do' },
+      params: { prompt: 'child work', base: 'main', target: 'main' } }));
+    (await f.store.saveView(child.id, { ...f.view, taskId: child.id, title: 'Child' }));
+    const childAgent = (await f.tokens.mint({ taskId: child.id, profileId: 'do', role: 'do',
+      principal: `task-agent:${child.id}:do`, projectId: f.project.id, ceiling: ['task:escalate'], grantorCaps: ['task:escalate'] })).token;
+    (await f.api.escalateToHuman(childAgent, { audience: ['@creator'], message: 'Finish the AWS sign-up, then tell me.' }));
+    const notes = f.signalled.filter((s) => s.id === parent.id && s.signal === 'followUp');
+    expect(notes).toHaveLength(1);
+    expect(notes[0]!.args[0]).toMatchObject({ role: 'user', author: `task:${child.id}`, authorLabel: `Task #${child.num}`,
+      to: ['@creator'], text: 'Finish the AWS sign-up, then tell me.' });
+
+    // The parent passing on its sub-task's request knows already; a parent from
+    // before shared conversations would read a note as a follow-up for its agent.
+    const parentAgent = (await f.tokens.mint({ taskId: parent.id, profileId: 'do', role: 'do',
+      principal: `task-agent:${parent.id}:do`, projectId: f.project.id, ceiling: ['task:escalate'], grantorCaps: ['task:escalate'] })).token;
+    (await f.store.saveView(child.id, { ...f.view, taskId: child.id, title: 'Child' }));
+    (await f.api.escalateToHuman(parentAgent, { taskId: child.id, audience: ['user:test'], message: 'Over to you.' }));
+    const legacy = (await f.store.createTask({ projectId: f.project.id, title: 'Legacy child', workflow: 'software-dev',
+      workflowVersion: '1.4.0', parentTaskId: f.task.id, createdBy: { kind: 'task-agent', taskId: f.task.id, role: 'do' },
+      params: { prompt: 'child work', base: 'main', target: 'main' } }));
+    (await f.store.saveView(legacy.id, { ...f.view, taskId: legacy.id, title: 'Legacy child' }));
+    const legacyAgent = (await f.tokens.mint({ taskId: legacy.id, profileId: 'do', role: 'do',
+      principal: `task-agent:${legacy.id}:do`, projectId: f.project.id, ceiling: ['task:escalate'], grantorCaps: ['task:escalate'] })).token;
+    (await f.api.escalateToHuman(legacyAgent, { audience: ['@creator'], message: 'Approve?' }));
+    expect(f.signalled.filter((s) => s.signal === 'followUp')).toHaveLength(1);
+  });
+
+  /** #533/#454: a sub-task's question passed on to people stops waiting on its
+   * parent, which must not keep being prompted to answer it. */
+  it("releases the parent when its sub-task's question is passed on to people", async () => {
+    const f = (await fixture());
+    const parent = (await f.store.createTask({ projectId: f.project.id, title: 'Parent', workflow: 'software-dev',
+      workflowVersion: '1.27.0', createdBy: { kind: 'user', userId: 'test' }, params: { prompt: 'parent', base: 'main', target: 'main' } }));
+    (await f.store.saveView(parent.id, { ...f.view, taskId: parent.id, title: 'Parent' }));
+    const child = (await f.store.createTask({ projectId: f.project.id, title: 'Child', workflow: 'software-dev',
+      workflowVersion: '1.27.0', parentTaskId: parent.id, createdBy: { kind: 'task-agent', taskId: parent.id, role: 'do' },
+      params: { prompt: 'child work', base: 'main', target: 'main' } }));
+    const waiting: TaskView = { ...f.view, taskId: child.id, title: 'Child', status: 'waiting',
+      waitingFor: { kind: 'parent', detail: 'Which region?' } };
+    (await f.store.saveView(child.id, waiting));
+    f.setLiveView(waiting);
+    const parentAgent = (await f.tokens.mint({ taskId: parent.id, profileId: 'do', role: 'do',
+      principal: `task-agent:${parent.id}:do`, projectId: f.project.id, ceiling: ['task:escalate'], grantorCaps: ['task:escalate'] })).token;
+    (await f.api.escalateToHuman(parentAgent, { taskId: child.id, audience: ['@creator'], message: 'Only you know the region.' }));
+    expect(f.signalled.filter((s) => s.id === child.id).map((s) => s.signal)).toEqual(['reroute']);
+    expect(f.signalled.filter((s) => s.id === parent.id)).toEqual([
+      expect.objectContaining({ signal: 'subtaskRedirected', args: [{ childTaskId: child.id }] })]);
+  });
+
   it('rejects an escalation to a missing audience and prevents an agent escalating another task', async () => {
     const f = (await fixture());
     const agentToken = (await f.tokens.mint({

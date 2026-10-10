@@ -67,7 +67,7 @@ describe('platform MCP server (capability-checked tool calls)', () => {
     expect(catalog.cloud).toContain('GET|PUT /api/organizations/:organizationId/execution-policy');
     expect(catalog.sourceControl).toContain('GET|PUT /api/projects/:projectId/repository-sources');
     expect(catalog.sourceControl).toContain('GET|POST /api/projects/:projectId/repositories');
-    expect(catalog.projects).toContain('GET|POST /api/projects/:projectId/secrets');
+    expect(catalog.projects.some((route: string) => route.startsWith('GET|POST /api/projects/:projectId/secrets ('))).toBe(true);
     expect(catalog.projects).toContain('GET|POST|DELETE /api/projects/:projectId/services');
     expect(catalog.projects).toContain('GET|PUT /api/projects/:projectId/environment');
     const fork = tools.find((tool) => tool.name === 'fork_agent') as any;

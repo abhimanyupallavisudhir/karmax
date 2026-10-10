@@ -1,6 +1,6 @@
 import path from 'node:path';
 import type { Store } from '../store/db.js';
-import type { ResourceAttachment } from '../domain/types.js';
+import type { ResourceAttachment, WorldLocation } from '../domain/types.js';
 import { credentialResource, snapshotResource } from '../domain/resource-drivers.js';
 import { ProjectEnvironment } from '../store/project-environment.js';
 import type { ProjectResourceService } from './resources.js';
@@ -33,7 +33,9 @@ export interface WorkspaceManifest {
     base?: string; target?: string }>;
   resources: Array<{ id: string; name: string; driver: string; path: string; shape: 'file' | 'directory';
     access: 'read' | 'write'; revisionId?: string; bytes?: number; files?: number; transferable: boolean }>;
-  secrets: Array<{ id: string; name: string; variable?: string; file?: string; configured: boolean }>;
+  /** `variable` alone: exported to every command; `file`: the value is that
+   * whole file; `variable` with `dotenv`: a line of that `.env` file. */
+  secrets: Array<{ id: string; name: string; variable?: string; file?: string; dotenv?: string; configured: boolean }>;
   install: Array<{ repository: string; commands: string[] }>;
 }
 
@@ -81,21 +83,23 @@ export class WorkspaceService {
     const organization = await this.store.getOrganization(project.organizationId!);
     const development = repositories.filter((repository) => repository.role === 'development');
     const workdir = development.length === 1 ? development[0]!.name : '.';
+    const place = (location: WorldLocation) => join(location.repository ?? workdir, location.path);
     const resources: WorkspaceManifest['resources'] = [];
     const secrets: WorkspaceManifest['secrets'] = [];
     for (const attachment of await this.store.listResourceAttachments(projectId)) {
       if (attachment.source.candidate === true && attachment.enabled === false) continue;
       if (credentialResource(attachment)) {
         secrets.push({ id: attachment.id, name: attachment.name, configured: Boolean(attachment.credentialHandles[0]),
-          ...(attachment.target.kind === 'path' ? { file: join(workdir, attachment.target.path) }
-            : { variable: attachment.target.name }) });
+          ...(attachment.target.kind === 'path' ? { file: place(attachment.target) }
+            : { variable: attachment.target.name,
+              ...(attachment.target.kind === 'environment' && attachment.target.dotenv ? { dotenv: place(attachment.target.dotenv) } : {}) }) });
         continue;
       }
       if (!snapshotResource(attachment) || attachment.target.kind !== 'path') continue;
       const revisionId = await this.revisionFor(attachment, task?.id);
       const revision = revisionId ? await this.store.getResourceRevision(revisionId) : undefined;
       resources.push({ id: attachment.id, name: attachment.name, driver: attachment.driver,
-        path: join(workdir, attachment.target.path), shape: attachment.source.shape === 'file' ? 'file' : 'directory',
+        path: place(attachment.target), shape: attachment.source.shape === 'file' ? 'file' : 'directory',
         access: attachment.access === 'write' ? 'write' : 'read',
         ...(revision ? { revisionId: revision.id, bytes: revision.bytes, files: revision.files } : {}),
         transferable: !revision || revision.engine === RESTIC_ENGINE });
