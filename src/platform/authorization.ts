@@ -526,13 +526,16 @@ export class AuthorizationService {
     const known = ({ kind, args: [a, b] }: CapabilityRead): { value: unknown } | undefined => {
       switch (kind) {
         case 'organization': return a === projectId ? { value: projectOrganization } : undefined;
-        case 'grants': return a === principalId ? { value: of('grant').map((row) => ({ ...JSON.parse(row.c!), principalId: row.a, scopeKey: row.b })) } : undefined;
+        // In the separate reads' order (scope key; join time), which the capability list follows.
+        case 'grants': return a === principalId ? { value: of('grant').sort((x, y) => (x.b! < y.b! ? -1 : x.b! > y.b! ? 1 : 0))
+          .map((row) => ({ ...JSON.parse(row.c!), principalId: row.a, scopeKey: row.b })) } : undefined;
         case 'profile': {
           if (!profileScopes.has(a!)) return undefined;
           const row = of('profile').find((candidate) => candidate.a === a && candidate.b === b);
           return { value: row ? { ...JSON.parse(row.c!), scopeKey: row.a } : undefined };
         }
-        case 'projectMembers': return a === projectId ? { value: of('member').map((row) => ({ projectId, principal: JSON.parse(row.a!), role: row.b })) } : undefined;
+        case 'projectMembers': return a === projectId ? { value: of('member').sort((x, y) => Number(x.c) - Number(y.c))
+          .map((row) => ({ projectId, principal: JSON.parse(row.a!), role: row.b, joinedAt: Number(row.c) })) } : undefined;
         case 'teamMember': return userId && b === userId ? { value: of('team').some((row) => row.a === a) } : undefined;
         case 'orgMember': return userId && b === userId ? { value: of('orgMember').some((row) => row.a === a) } : undefined;
       }

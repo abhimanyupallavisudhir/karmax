@@ -5846,7 +5846,7 @@ export class Store {
       UNION ALL SELECT 'grant', CAST(principalId AS TEXT), CAST(scopeKey AS TEXT), CAST(json AS TEXT) FROM principal_grants WHERE principalId = ?
       UNION ALL SELECT 'profile', CAST(scopeKey AS TEXT), CAST(id AS TEXT), CAST(json AS TEXT) FROM authorization_profiles
         WHERE scopeKey IN ('global', ?, ?, 'organization:' || COALESCE((SELECT organizationId FROM projects WHERE id = ?), 'org_personal'))
-      UNION ALL SELECT 'member', CAST(principal AS TEXT), CAST(role AS TEXT), CAST(NULL AS TEXT) FROM project_memberships WHERE projectId = ?
+      UNION ALL SELECT 'member', CAST(principal AS TEXT), CAST(role AS TEXT), CAST(joinedAt AS TEXT) FROM project_memberships WHERE projectId = ?
       UNION ALL SELECT 'team', CAST(teamId AS TEXT), CAST(NULL AS TEXT), CAST(NULL AS TEXT) FROM team_memberships WHERE userId = ?
       UNION ALL SELECT 'orgMember', CAST(organizationId AS TEXT), CAST(NULL AS TEXT), CAST(NULL AS TEXT) FROM organization_memberships WHERE userId = ?`,
     [project, principalId, `project:${project}`, `organization:${organizationId ?? ''}`, project, project, userId, userId]);
