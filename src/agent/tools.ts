@@ -377,13 +377,13 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'get_credential',
     description:
-      'Reveal a vault secret in plaintext (API key, password, SSH key, .env contents). Default login reveal includes notes; field note retrieves notes alone. This is the audited last resort — prefer fill_credential for browser logins and rely on spawn-time env injection for keys. Returns granted with the value, or needs_approval/denied per the item\'s reveal policy, or not_in_vault. A needs_approval response already parks the approval request for the human (its requestId is returned) — do NOT also call request_credential; just wait for the decision, which resumes the task.',
+      'Reveal a vault secret in plaintext (API key, password, SSH key, .env contents). Default login reveal includes notes; field note retrieves notes alone. Field totp returns only the current one-time code (never the seed) under the item\'s blind-use policy, no reveal approval needed; it is the default for a login that holds only a TOTP seed. Plaintext reveal is the audited last resort — prefer fill_credential for browser logins and rely on spawn-time env injection for keys. Returns granted with the value, or needs_approval/denied per the item\'s reveal policy, or not_in_vault. A needs_approval response already parks the approval request for the human (its requestId is returned) — do NOT also call request_credential; just wait for the decision, which resumes the task.',
     parameters: {
       type: 'object',
       properties: {
         item_id: { type: 'string' },
         domain: { type: 'string' },
-        field: { type: 'string', description: 'password | totp | secret | privateKey | env | note (defaults to the item type\'s main field).' },
+        field: { type: 'string', description: 'password | totp | secret | privateKey | env | note (defaults to the item type\'s main field). totp returns the current one-time code.' },
       },
     },
   },
@@ -1240,8 +1240,8 @@ export function platformToolHandlers(
         return `Asking ${who}. End your turn now${needsInput.message ? '' : ' with the question as your final response'}; you will be resumed with their answer, ${jobs.length ? `when ${jobs.join(', ')} ${jobs.length > 1 ? 'finish' : 'finishes'}, ` : ''}or after ${Math.round(minutes)} min to carry on without it.`;
       }
       return jobs.length
-        ? `Waiting for ${jobNames.length === jobs.length ? jobNames.join(', ') : jobs.join(', ')} (at most ${Math.round(minutes)} min). End your turn now; you will be resumed when ${jobs.length > 1 ? 'they finish' : 'it finishes'}, a message arrives, or the time is up.`
-        : `Pausing for ${Math.round(minutes)} min. End your turn now; you will be resumed then, or sooner if a message arrives.`;
+        ? `Waiting for ${jobNames.length === jobs.length ? jobNames.join(', ') : jobs.join(', ')} (at most ${Math.round(minutes)} min). End your turn now, answering in your final response anything you were just asked; you will be resumed when ${jobs.length > 1 ? 'they finish' : 'it finishes'}, a message arrives, or the time is up.`
+        : `Pausing for ${Math.round(minutes)} min. End your turn now, answering in your final response anything you were just asked; you will be resumed then, or sooner if a message arrives.`;
     },
     async create_branch(args) {
       try {
