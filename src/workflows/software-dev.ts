@@ -26,6 +26,7 @@ import {
 import { ActivityCancellationType, msToNumber, type Duration } from '@temporalio/common';
 import type { childActivities } from '../activities/children.js';
 import type { coreActivities } from '../activities/core.js';
+import type { WorldHandle } from '../world/types.js';
 import type { coordinatorActivities } from '../activities/coordinator.js';
 import { SIG_MERGE_GRANTED, SIG_ACCOUNT_GRANTED, SIG_AGENT_SLOT_GRANTED, RELIST_ACCOUNT_GRANT } from '../coordinators/names.js';
 import { editableInFlight } from '../platform/mutability.js';
@@ -130,6 +131,13 @@ const cancellationAwareTurns = proxyActivities<coreActivities>({
   heartbeatTimeout: '2 minutes',
   retry: { maximumAttempts: 3, initialInterval: '10s', backoffCoefficient: 2 },
   cancellationType: ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
+});
+// The task's own command (v1.28) runs as a durable job that may take as long
+// as any job; the watch heartbeats and returns at its own deadline.
+const commandWatch = proxyActivities<coreActivities>({
+  startToCloseTimeout: '8 days',
+  heartbeatTimeout: '2 minutes',
+  retry: { maximumAttempts: 10, initialInterval: '10s', backoffCoefficient: 2, maximumInterval: '5 minutes' },
 });
 const coord = proxyActivities<coordinatorActivities>({ startToCloseTimeout: '30s' });
 // Coordinator calls with a BOUNDED retry budget. With Temporal's default
@@ -504,13 +512,18 @@ export async function softwareDevV1_27(input: SoftwareDevInput): Promise<{ stage
   return softwareDevImpl(input, '1.27.0');
 }
 
+/** v1.28: Do can run the task's own command instead of the agent. */
+export async function softwareDevV1_28(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevImpl(input, '1.28.0');
+}
+
 /** Replay-compatible entry for executions already recorded as
  * `softwareDev@1.0.0`. v1 published Resolve before invoking autoResolve. */
 export async function softwareDevV1(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevImpl(input, '1.0.0');
 }
 
-type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0' | '1.14.0' | '1.15.0' | '1.16.0' | '1.17.0' | '1.18.0' | '1.19.0' | '1.20.0' | '1.21.0' | '1.22.0' | '1.23.0' | '1.24.0' | '1.25.0' | '1.26.0' | '1.27.0';
+type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0' | '1.14.0' | '1.15.0' | '1.16.0' | '1.17.0' | '1.18.0' | '1.19.0' | '1.20.0' | '1.21.0' | '1.22.0' | '1.23.0' | '1.24.0' | '1.25.0' | '1.26.0' | '1.27.0' | '1.28.0';
 
 
 /** The minor of a behavior version. Every feature gate below is a `>=` test on
@@ -724,6 +737,12 @@ async function softwareDevImpl(
   let keepOwnRequested = false;
   let manualEscalationRequested = carried?.manualEscalationRequested ?? false;
   let prRequested = carried?.prRequested ?? recoveryStage === 'pr';
+  // v1.28: Do runs the task's own command instead of the agent — once per run
+  // of the task; a revise, or a failure handed to the agent, continues with it.
+  const taskCommand = minor >= 28 ? input.command?.trim() || undefined : undefined;
+  let commandRan = carried?.commandRan ?? false;
+  /** The command finished cleanly and changed no repository: nothing to review. */
+  let commandUnchanged = carried?.commandUnchanged ?? false;
   // checkout name -> head sha it was approved at (multi-PR Review).
   let checkoutApprovals: CheckoutApprovals = recovery?.checkoutApprovals ?? {};
   let checkoutHeads: Record<string, string> = { ...continued?.checkoutHeads };
@@ -1538,6 +1557,7 @@ async function softwareDevImpl(
         checkoutApprovals = approveAll(worldRepos(world as any), checkoutHeads, checkoutApprovals);
     } else {
       const gatesNow = (): ConfirmLayer[] => {
+        if (commandUnchanged && !forceHumanRepairReview) return [];
         if (forceHumanRepairReview) {
           const humanLayers = softwareDevConfirmLayers.filter((layer) => layer.kind === 'human');
           return humanLayers.length ? humanLayers : [{ kind: 'human', audience: ['@creator'] }];
@@ -2618,6 +2638,76 @@ async function softwareDevImpl(
     }
   }
 
+  // ── The task's own command (v1.28) ──
+  /**
+   * Do runs code instead of the agent (wiki features/events-and-automations):
+   * the command runs as a durable job in the world with the
+   * agent's authority (`startTaskCommand`). Exit 0 continues exactly like an
+   * agent that called open_pr — its changes are committed and reviewed, and with
+   * none its Review confirms itself. A failure ends the task, or hands it to
+   * the agent with the output when the task says so.
+   */
+  async function commandTurn(): Promise<AgentTurnResult & { stopped?: true; commandFailed?: string }> {
+    commandRan = true;
+    const handle = world as unknown as WorldHandle;
+    const command = taskCommand!;
+    const runKey = workflowInfo().runId;
+    const { jobId } = await core.startTaskCommand({ taskId, worldHandle: handle, task: liveInput, command, runKey });
+    status = 'active';
+    waitingFor = { kind: 'job', detail: 'Running the task command', summary: 'Task command', jobs: [jobId] };
+    await publish();
+    let result: { state: 'running' | 'exited' | 'lost'; exitCode?: number; tail: string } = { state: 'running', tail: '' };
+    while (result.state === 'running' && !cancelled) {
+      const scope = new CancellationScope();
+      let settled = false;
+      let failure: unknown;
+      const watching = scope.run(() => commandWatch.awaitJobs(handle, [jobId], Date.now() + 24 * 3600_000))
+        .catch((error) => { if (!isCancellation(error)) failure = error; })
+        .finally(() => { settled = true; });
+      await condition(() => settled || cancelled);
+      if (!settled) { scope.cancel(); await watching; break; }
+      if (failure) throw failure;
+      result = await core.taskCommandResult({ taskId, worldHandle: handle, runKey });
+    }
+    waitingFor = undefined;
+    if (cancelled) return { completed: false, providerCompleted: false, output: '' };
+    const outcome = result.state === 'exited' ? `exited ${result.exitCode}` : 'stopped without an exit code';
+    msgs.push({ id: `command-${msgs.length}`, role: 'system', text: `\`${command}\` ${outcome}${result.tail ? `\n\n${result.tail}` : ''}`, ts: msgs.length });
+    if (result.state === 'exited' && result.exitCode === 0) {
+      // The output is a record for people; an agent called in later reads it there.
+      seen = msgs.length;
+      await core.commitWork(handle, `${input.title}: ran the task command`.slice(0, 200));
+      const review = await core.buildReview(handle, base);
+      commandUnchanged = !review.changedFiles.length;
+      if (explicitPrCycle) prRequested = true;
+      return { completed: true, providerCompleted: true, output: '', openPrRequested: true };
+    }
+    if (liveInput.onCommandFailure === 'agent') {
+      msgs.push({ id: `command-fix-${msgs.length}`, role: 'user', ts: msgs.length,
+        text: `The task's command \`${command}\` ${outcome} (output above). Find and fix the cause, run the command again to check, then finish the task.` });
+      return await doTurn();
+    }
+    return { completed: false, providerCompleted: false, output: '', commandFailed: `The command ${outcome}.` };
+  }
+
+  /** A failed command ends the task: there is no agent to repair it. */
+  async function commandFailed(detail: string) {
+    stage = 'done';
+    status = 'failed';
+    reviewInfo = { ...reviewInfo, summary: detail };
+    await publish();
+    if (world) {
+      const remoteWorld = releaseWorldOnCompletion(world);
+      await core.destroyWorld(world as unknown as WorldHandle);
+      if (remoteWorld) {
+        releasedWorld = world;
+        world = undefined;
+        await publish();
+      }
+    }
+    return { stage };
+  }
+
   // ── Do turn + sub-task hierarchy (SPEC §5.2/§5.3) ──
   /** Run one Do-agent turn (leased login, resolve-wrapped) and fold its result into
    *  the running conversation. Shared by the main loop and sub-task management. */
@@ -3396,7 +3486,8 @@ Inspect the complete current diff and specifically compare its delta from the re
         checkoutHeads,
         accountPool,
         flags: { targetLocked, pointOfNoReturnPassed, branchPreparedForPr, forceHumanRepairReview, providerQueueAccepted,
-          prRequested, confirmed, retryRequested, manualEscalationRequested, resourcesApplied },
+          prRequested, confirmed, retryRequested, manualEscalationRequested, resourcesApplied,
+          ...(taskCommand ? { commandRan, commandUnchanged } : {}) },
         ...(manualPrConfirmer ? { manualPrConfirmer } : {}),
         ...(escalationAction ? { escalationAction } : {}),
         ...(error ? { error } : {}),
@@ -3725,7 +3816,12 @@ Inspect the complete current diff and specifically compare its delta from the re
       preventsUnreadOpenPrSpin,
     )
       ? { completed: true, providerCompleted: true, output: '', openPrRequested: true }
-      : await doTurn();
+      : taskCommand && !commandRan ? await commandTurn() : await doTurn();
+    if (taskCommand) {
+      if (cancelled) return await abort();
+      const failed = (turn as { commandFailed?: string }).commandFailed;
+      if (failed) return await commandFailed(failed);
+    }
     if ('stopped' in turn && turn.stopped) {
       if (await waitAfterStop()) return await abort();
       continue;

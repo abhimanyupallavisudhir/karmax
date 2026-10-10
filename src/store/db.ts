@@ -83,6 +83,8 @@ import {
   type OrganizationEntitlements,
 } from '../domain/entitlements.js';
 import { newId } from '../util/id.js';
+import { EVENT_RETENTION_MS as PROJECT_EVENT_RETENTION_MS, type ProjectEvent, type ProjectEventClaim,
+  type ProjectEventClaimState } from '../domain/project-events.js';
 import { paymentMerchantMatches } from '../util/payment-merchant.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
 import { withPullRequestStates } from '../integrations/github-pr.js';
@@ -918,6 +920,24 @@ export class Store {
         type TEXT NOT NULL, decision TEXT, createdAt INTEGER NOT NULL,
         PRIMARY KEY (provider, eventId)
       );
+      -- Project event inbox (wiki features/events-and-automations):
+      -- one row per outside occurrence, written before its sender is answered.
+      -- (projectId, source, eventKey) collapses redeliveries; dispatchedAt marks
+      -- rows the trigger dispatcher has offered to every armed task.
+      CREATE TABLE IF NOT EXISTS project_events (
+        id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, projectId TEXT NOT NULL,
+        source TEXT NOT NULL, type TEXT NOT NULL, eventKey TEXT NOT NULL, subject TEXT,
+        occurredAt INTEGER NOT NULL, receivedAt INTEGER NOT NULL, payload TEXT NOT NULL,
+        origin TEXT NOT NULL, hops INTEGER NOT NULL, dispatchedAt INTEGER,
+        UNIQUE (projectId, source, eventKey)
+      );
+      -- What one event did for one armed task: at most one run per pair.
+      -- state: pending (a run is starting) | started | deferred | skipped.
+      CREATE TABLE IF NOT EXISTS project_event_claims (
+        eventId TEXT NOT NULL, taskId TEXT NOT NULL, state TEXT NOT NULL, reason TEXT,
+        runId TEXT, concurrencyKey TEXT, receivedAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL,
+        PRIMARY KEY (eventId, taskId)
+      );
       -- Hosted SaaS subscriptions are a separate ledger from agent spending
       -- cards/payment_connections above. Only verified provider events update
       -- plan, status, and seat quantities in this table.
@@ -1048,6 +1068,11 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_execution_frames ON execution_frames(executionId, seq);
       CREATE INDEX IF NOT EXISTS idx_preview_expiry ON preview_leases(expiresAt, revokedAt);
       CREATE INDEX IF NOT EXISTS idx_delivery_pending ON delivery_outbox(state, nextAt);
+      CREATE INDEX IF NOT EXISTS idx_project_events_dispatch ON project_events(dispatchedAt, receivedAt);
+      CREATE INDEX IF NOT EXISTS idx_project_events_project ON project_events(projectId, receivedAt);
+      CREATE INDEX IF NOT EXISTS idx_project_events_received ON project_events(receivedAt);
+      CREATE INDEX IF NOT EXISTS idx_project_event_claims_state ON project_event_claims(state, receivedAt);
+      CREATE INDEX IF NOT EXISTS idx_project_event_claims_task ON project_event_claims(taskId, state, updatedAt);
       CREATE INDEX IF NOT EXISTS idx_events_task ON events(taskId, seq);
       CREATE INDEX IF NOT EXISTS idx_events_type ON events(type, taskId);
       CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts, seq);
@@ -1879,6 +1904,12 @@ export class Store {
       (await deleteRows(this.db, 'task_intents', 'id', intentIds));
       (await this.db.prepare('DELETE FROM inbox WHERE taskId IN (SELECT id FROM tasks WHERE projectId=?)').run(id));
       (await deleteRows(this.db, 'inbox', 'id', authorizationInboxIds));
+      (await this.db.prepare('DELETE FROM project_event_claims WHERE eventId IN (SELECT id FROM project_events WHERE projectId=?)').run(id));
+      (await this.db.prepare('DELETE FROM project_events WHERE projectId=?').run(id));
+      // Incoming webhooks (src/integrations/incoming-webhooks.ts). CASE keeps
+      // PostgreSQL from parsing every other kv value as JSON.
+      (await this.db.prepare(`DELETE FROM kv WHERE k LIKE 'incoming-webhook:%'
+        AND (CASE WHEN k LIKE 'incoming-webhook:%' THEN json_extract(v, '$.projectId') END)=?`).run(id));
       (await this.db.prepare('DELETE FROM preview_leases WHERE projectId=?').run(id));
       (await this.db.prepare('DELETE FROM executions WHERE projectId=?').run(id));
       (await this.db.prepare('DELETE FROM promoted_artifacts WHERE projectId=?').run(id));
@@ -2383,6 +2414,9 @@ export class Store {
       payment_spend_requests: (await selectRows(this.db, 'payment_spend_requests', 'organizationId=?', [organizationId])),
       payment_transactions: (await selectRows(this.db, 'payment_transactions', 'organizationId=?', [organizationId])),
       payment_events: (await selectRows(this.db, 'payment_events', 'organizationId=?', [organizationId])),
+      project_events: (await selectRows(this.db, 'project_events', 'organizationId=?', [organizationId])),
+      project_event_claims: (await rowsFor(this.db, 'project_event_claims', 'eventId',
+        ((await this.db.prepare('SELECT id FROM project_events WHERE organizationId=?').all(organizationId)) as Array<{ id: unknown }>).map((r) => String(r.id)))),
       subscription_gifts: (await selectRows(this.db, 'subscription_gifts', 'organizationId=?', [organizationId])),
       storage_pack_gifts: (await selectRows(this.db, 'storage_pack_gifts', 'organizationId=?', [organizationId])),
       subscription_billing_accounts: (await selectRows(this.db, 'subscription_billing_accounts', 'organizationId=?', [organizationId])),
@@ -2631,6 +2665,10 @@ export class Store {
       (await deleteRows(this.db, 'task_intents', 'id', intentIds));
       (await deleteRows(this.db, 'settings', 'scopeKey', projectSettingKeys));
       (await deleteRows(this.db, 'cards', 'scopeId', [organizationId, ...projectIds]));
+      (await this.db.prepare('DELETE FROM project_event_claims WHERE eventId IN (SELECT id FROM project_events WHERE organizationId=?)').run(organizationId));
+      (await this.db.prepare('DELETE FROM project_events WHERE organizationId=?').run(organizationId));
+      (await this.db.prepare(`DELETE FROM kv WHERE k LIKE 'incoming-webhook:%'
+        AND (CASE WHEN k LIKE 'incoming-webhook:%' THEN json_extract(v, '$.organizationId') END)=?`).run(organizationId));
       (await this.db.prepare('DELETE FROM payment_events WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM payment_transactions WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM payment_spend_requests WHERE organizationId=?').run(organizationId));
@@ -8921,6 +8959,134 @@ export class Store {
     });
   }
 
+  // ─── Project event inbox (wiki features/events-and-automations) ──
+
+  /** Insert an outside occurrence once; a repeat of (project, source, key)
+   *  returns the stored row with `created: false`. */
+  async recordProjectEvent(input: Omit<ProjectEvent, 'id' | 'receivedAt'> & { receivedAt?: number }):
+    Promise<{ event: ProjectEvent; created: boolean }> {
+    return this.db.transaction(async () => {
+      const id = newId('pev');
+      const receivedAt = input.receivedAt ?? Date.now();
+      const created = Number((await this.db.prepare(`INSERT OR IGNORE INTO project_events
+        (id, organizationId, projectId, source, type, eventKey, subject, occurredAt, receivedAt, payload, origin, hops)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, input.organizationId, input.projectId, input.source, input.type,
+        input.key, input.subject ?? null, input.occurredAt, receivedAt, JSON.stringify(input.payload), input.origin, input.hops)).changes) === 1;
+      const row = await this.db.prepare('SELECT * FROM project_events WHERE projectId=? AND source=? AND eventKey=?')
+        .get(input.projectId, input.source, input.key);
+      return { event: projectEventFromRow(row), created };
+    });
+  }
+
+  async getProjectEvent(id: string): Promise<ProjectEvent | undefined> {
+    const row = await this.db.prepare('SELECT * FROM project_events WHERE id=?').get(id);
+    return row ? projectEventFromRow(row) : undefined;
+  }
+
+  /** Newest first, for the project's event list and the trigger form's samples. */
+  async listProjectEvents(projectId: string, options: { limit?: number; before?: number; type?: string; source?: string } = {}): Promise<ProjectEvent[]> {
+    const where = ['projectId=?'];
+    const args: unknown[] = [projectId];
+    if (options.before !== undefined) { where.push('receivedAt<?'); args.push(options.before); }
+    if (options.type) {
+      if (options.type.endsWith('.*')) { where.push('type LIKE ?'); args.push(`${options.type.slice(0, -1).replace(/[%_]/g, '')}%`); }
+      else if (options.type !== '*') { where.push('type=?'); args.push(options.type); }
+    }
+    if (options.source) { where.push('(source=? OR source LIKE ?)'); args.push(options.source, `${options.source.replace(/[%_]/g, '')}:%`); }
+    const limit = Math.min(Math.max(Math.trunc(options.limit ?? 50), 1), 500);
+    const rows = await this.db.prepare(`SELECT * FROM project_events WHERE ${where.join(' AND ')}
+      ORDER BY receivedAt DESC, id DESC LIMIT ${limit}`).all(...args);
+    return rows.map(projectEventFromRow);
+  }
+
+  /** Oldest first: events not yet offered to the armed tasks of their project. */
+  async undispatchedProjectEvents(limit = 100): Promise<ProjectEvent[]> {
+    const rows = await this.db.prepare(`SELECT * FROM project_events WHERE dispatchedAt IS NULL
+      ORDER BY receivedAt, id LIMIT ${Math.min(Math.max(Math.trunc(limit), 1), 500)}`).all();
+    return rows.map(projectEventFromRow);
+  }
+
+  async markProjectEventDispatched(id: string, at = Date.now()): Promise<void> {
+    await this.db.transaction(async () => {
+      await this.db.prepare('UPDATE project_events SET dispatchedAt=? WHERE id=? AND dispatchedAt IS NULL').run(at, id);
+    });
+  }
+
+  /** First writer wins: false when this (event, task) pair already has a claim. */
+  async claimProjectEvent(claim: ProjectEventClaim): Promise<boolean> {
+    return this.db.transaction(async () => Number((await this.db.prepare(`INSERT OR IGNORE INTO project_event_claims
+      (eventId, taskId, state, reason, runId, concurrencyKey, receivedAt, updatedAt) VALUES (?,?,?,?,?,?,?,?)`)
+      .run(claim.eventId, claim.taskId, claim.state, claim.reason ?? null, claim.runId ?? null,
+        claim.concurrencyKey ?? null, claim.receivedAt, claim.updatedAt)).changes) === 1);
+  }
+
+  async getProjectEventClaim(eventId: string, taskId: string): Promise<ProjectEventClaim | undefined> {
+    const row = await this.db.prepare('SELECT * FROM project_event_claims WHERE eventId=? AND taskId=?').get(eventId, taskId);
+    return row ? projectEventClaimFromRow(row) : undefined;
+  }
+
+  /** Compare-and-set on the claim's state, so two dispatchers never both act. */
+  async updateProjectEventClaim(eventId: string, taskId: string, from: ProjectEventClaimState[],
+    next: { state: ProjectEventClaimState; reason?: string | null; runId?: string | null; concurrencyKey?: string | null; updatedAt?: number }): Promise<boolean> {
+    return this.db.transaction(async () => {
+      const sets = ['state=?', 'updatedAt=?'];
+      const args: unknown[] = [next.state, next.updatedAt ?? Date.now()];
+      for (const field of ['reason', 'runId', 'concurrencyKey'] as const) {
+        if (next[field] !== undefined) { sets.push(`${field}=?`); args.push(next[field]); }
+      }
+      return Number((await this.db.prepare(`UPDATE project_event_claims SET ${sets.join(', ')}
+        WHERE eventId=? AND taskId=? AND state IN (${from.map(() => '?').join(',')})`)
+        .run(...args, eventId, taskId, ...from)).changes) === 1;
+    });
+  }
+
+  /** Claims in one state, oldest event first (`updatedBefore` finds stale ones). */
+  async projectEventClaimsInState(state: ProjectEventClaimState, options: { updatedBefore?: number; limit?: number } = {}): Promise<ProjectEventClaim[]> {
+    const rows = await this.db.prepare(`SELECT * FROM project_event_claims WHERE state=?
+      ${options.updatedBefore !== undefined ? 'AND updatedAt<?' : ''} ORDER BY receivedAt, eventId
+      LIMIT ${Math.min(Math.max(Math.trunc(options.limit ?? 200), 1), 1000)}`)
+      .all(state, ...(options.updatedBefore !== undefined ? [options.updatedBefore] : []));
+    return rows.map(projectEventClaimFromRow);
+  }
+
+  async listProjectEventClaims(eventId: string): Promise<ProjectEventClaim[]> {
+    const rows = await this.db.prepare('SELECT * FROM project_event_claims WHERE eventId=? ORDER BY taskId').all(eventId);
+    return rows.map(projectEventClaimFromRow);
+  }
+
+  /** Runs one armed task started from events since `since` (its hourly limit). */
+  async projectEventRunsSince(taskId: string, since: number): Promise<number> {
+    const row = await this.db.prepare(`SELECT COUNT(*) n FROM project_event_claims
+      WHERE taskId=? AND state IN ('pending', 'started') AND updatedAt>?`).get(taskId, since) as { n: number };
+    return Number(row?.n ?? 0);
+  }
+
+  /** The run of this armed task for this concurrency key that is starting or
+   *  still unfinished: `{}` while one is starting, `{ runId }` once it runs. */
+  async projectEventSlot(taskId: string, concurrencyKey: string): Promise<{ runId?: string } | undefined> {
+    const row = await this.db.prepare(`SELECT c.state, c.runId FROM project_event_claims c LEFT JOIN tasks t ON t.id=c.runId
+      WHERE c.taskId=? AND c.concurrencyKey=? AND (c.state='pending' OR (c.state='started' AND t.id IS NOT NULL
+        AND IFNULL(json_extract(t.lastView, '$.status'), 'active') NOT IN ('done', 'failed', 'cancelled')))
+      ORDER BY CASE c.state WHEN 'started' THEN 0 ELSE 1 END LIMIT 1`).get(taskId, concurrencyKey) as { state?: string; runId?: string } | undefined;
+    if (!row) return undefined;
+    return row.state === 'started' && row.runId ? { runId: String(row.runId) } : {};
+  }
+
+  /** The run a pending claim may already have started before its process died. */
+  async projectEventRun(seriesId: string, eventId: string): Promise<string | undefined> {
+    const row = await this.db.prepare(`SELECT id FROM tasks WHERE (id=? OR json_extract(params, '$.runOf')=?)
+      AND json_extract(params, '$.trigger.eventId')=? ORDER BY createdAt LIMIT 1`).get(seriesId, seriesId, eventId) as { id?: string } | undefined;
+    return row?.id ? String(row.id) : undefined;
+  }
+
+  async pruneProjectEvents(before: number): Promise<number> {
+    return this.db.transaction(async () => {
+      await this.db.prepare(`DELETE FROM project_event_claims WHERE receivedAt<?`).run(before);
+      return Number((await this.db.prepare(`DELETE FROM project_events WHERE id IN
+        (SELECT id FROM project_events WHERE receivedAt<? ORDER BY receivedAt LIMIT 10000)`).run(before)).changes);
+    });
+  }
+
   // ─── KV (misc small state) ───────────────────────────────────────────────────
 
   private async scopedTokenProjectIds(record: Record<string, unknown>): Promise<string[]> {
@@ -9114,7 +9280,7 @@ export class Store {
    */
   async retentionSweep(now = Date.now()): Promise<{ scopedTokens: number; humanDelegations: number; githubDeliveries: number;
     githubPrObservations: number; subscriptionRequests: number; viewSnapshots: number; publicationFences: number; turnSessions: number;
-    permissionRequests: number; events: number; auditEntries: number }> {
+    permissionRequests: number; events: number; auditEntries: number; projectEvents: number }> {
     return this.db.transaction(async () => {
 
     // Keep immutable snapshots through a retry window. A late activity retry can
@@ -9212,6 +9378,7 @@ export class Store {
       auditEntries: Number((await this.db.prepare(`DELETE FROM audit_log WHERE seq IN
         (SELECT seq FROM audit_log WHERE ts<? ORDER BY ts, seq LIMIT 10000)`)
         .run(now - 365 * 86400_000)).changes),
+      projectEvents: (await this.pruneProjectEvents(now - PROJECT_EVENT_RETENTION_MS)),
     };
   
     });
@@ -9905,4 +10072,24 @@ function rowToOrganizationIdentityPolicy(organizationId: string, row: any): Orga
     verifiedDomains: JSON.parse(row.verifiedDomains), enforceSso: Boolean(row.enforceSso),
     scimTokenId: row.scimTokenId ?? undefined, updatedAt: Number(row.updatedAt) }
     : { organizationId, verifiedDomains: [], enforceSso: false, updatedAt: 0 };
+}
+
+function projectEventFromRow(row: any): ProjectEvent {
+  return {
+    id: String(row.id), organizationId: String(row.organizationId), projectId: String(row.projectId),
+    source: String(row.source), type: String(row.type), key: String(row.eventKey),
+    ...(row.subject ? { subject: String(row.subject) } : {}),
+    occurredAt: Number(row.occurredAt), receivedAt: Number(row.receivedAt),
+    payload: JSON.parse(String(row.payload)) as Record<string, unknown>,
+    origin: String(row.origin) as ProjectEvent['origin'], hops: Number(row.hops),
+  };
+}
+
+function projectEventClaimFromRow(row: any): ProjectEventClaim {
+  return {
+    eventId: String(row.eventId), taskId: String(row.taskId), state: String(row.state) as ProjectEventClaimState,
+    ...(row.reason ? { reason: String(row.reason) } : {}), ...(row.runId ? { runId: String(row.runId) } : {}),
+    ...(row.concurrencyKey !== null && row.concurrencyKey !== undefined ? { concurrencyKey: String(row.concurrencyKey) } : {}),
+    receivedAt: Number(row.receivedAt), updatedAt: Number(row.updatedAt),
+  };
 }

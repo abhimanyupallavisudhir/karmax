@@ -14,6 +14,7 @@ import { importProject } from './commands/import.js';
 import { add, untrack } from './commands/track.js';
 import { exec, preview } from './commands/world.js';
 import { gitCredential } from './commands/git-credential.js';
+import { emit } from './commands/events.js';
 
 export const VERSION: string = pkg.version;
 
@@ -43,6 +44,8 @@ Tasks
   task new <title> [--prompt <text>]     Start a task (in the workspace's project, or --project)
   task list|show|open|logs [-f]|say      Follow and steer tasks
   task confirm|cancel|retry [<task>]
+  emit <type> [-d <json>|@file|@-]       Record a project event; tasks waiting on it start runs
+                                         (--key collapses repeats, --subject links what it is about)
   attach [<task>]                        A terminal in the task's cloud world
   exec [<task>] -- <command>             Run one command in the task's cloud world
   preview [<task>] [--port <n>]          Open a port of the task's world in the browser
@@ -71,6 +74,7 @@ const OPTIONS = {
   data: { type: 'string', short: 'd', multiple: true }, list: { type: 'boolean' }, yes: { type: 'boolean', short: 'y' }, port: { type: 'string' },
   cwd: { type: 'string' }, 'git-via-tavya': { type: 'boolean' }, secret: { type: 'string', multiple: true },
   skip: { type: 'string', multiple: true }, github: { type: 'string' }, 'dry-run': { type: 'boolean' }, repository: { type: 'string' },
+  key: { type: 'string' }, subject: { type: 'string' },
 } as const;
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
@@ -153,6 +157,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       return 0;
     }
     case 'task': case 'tasks': return task(await api(), args, out, { ...flags, project: flags.project?.[0] }, workspace);
+    case 'emit': return emit(await api(), args, out, { ...flags, project: flags.project?.[0] }, workspace);
     case 'attach': {
       const client = await api();
       if (flags.ticket) {

@@ -622,11 +622,18 @@ async function main() {
   // dependency prerequisites are met and a schedule/event activates it. Runs
   // in-process off the same bus as the self-heal loop; the store is the durable
   // source of truth, so it re-arms every armed task on boot.
-  const { TriggerScheduler, createTriggerFire } = await import('./platform/trigger-scheduler.js');
+  const { TriggerScheduler, createTriggerFire, createTriggerTell } = await import('./platform/trigger-scheduler.js');
+  // A chat bot answers in the thread that asked (src/integrations/chat-replies.ts).
+  const { ChatReplies } = await import('./integrations/chat-replies.js');
+  const chatReplies = new ChatReplies({ store, broker, publicUrl: () => process.env.KARMAX_PUBLIC_URL ?? process.env.KARMAX_GATEWAY_URL,
+    log: (m) => console.warn('  • ' + m) });
+  bus.onAny((event) => { if (event.type === 'view.updated') void chatReplies.observe(event).catch((e) => console.warn('  • chat reply failed:', String(e))); });
   const triggerScheduler = new TriggerScheduler({
     store,
     bus,
     fire: createTriggerFire(api, tokens),
+    tell: createTriggerTell(api, tokens),
+    announce: (event, runId, how) => chatReplies.announce(event, runId, how),
     log: (m) => console.log('  • ' + m),
   });
   api.setTriggerArmer(triggerScheduler);
@@ -687,7 +694,7 @@ async function main() {
     deploymentSweepRunning = true;
     try {
       for (const finding of await deploymentMonitor.reconcile()) {
-        await gateway.dispatchGithubRecoveryEvents(finding.events);
+        await gateway.githubEvents.recordFailures(finding.events);
         (await deploymentMonitor.markReported(finding));
       }
     } catch (error) {

@@ -52,6 +52,7 @@ const TOOLS_PREAMBLE = `You are running inside ${BRAND}, an agent-orchestration 
 - publish_task_branch(): publish your clean committed branch for collaborators.
 - import_task_branch(sourceTaskId): fetch a collaborator's published branch into a namespaced local ref, then inspect/test/cherry-pick or merge it normally.
 - refresh_upstream(branch?): fetch the latest upstream branch into refs/remotes/origin before merging or rebasing.
+- emit_event(projectId, type, key?, subject?, payload?): record a project event; tasks waiting on a matching event trigger start runs that receive it. Re-emitting a key does nothing, so a poller can report everything it sees.
 - list_events(taskId?, since?) and describe_platform(): inspect ${BRAND} event/diagnostic context and discover the automation surface.
 - platform_request(method, path, body?): call any authenticated /api operation not covered by a dedicated tool. Your task-scoped KARMAX_TOKEN is enforced by ${BRAND} for every request; this is the complete escape hatch for projects, users, authorization, credentials, payments, settings, review actions, and future UI operations.
 - open_pr(): Do agents only. Open or refresh the task's pull request and send that exact committed proposal to Review. Call it only when the requested work is truly complete, the worktree is clean, intended changes are committed, and relevant tests pass. This is the final action of a completed Do turn.

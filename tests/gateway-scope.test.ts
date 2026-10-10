@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -568,124 +568,71 @@ describe('gateway request scope for bare-id routes', () => {
     expect((await deliver()).status).toBe(200);
   });
 
-  it('creates one durable recovery task for a post-merge workflow failure', async () => {
-    webhookProjectEvents = [{
-      projectId: mine,
-      type: 'github.workflow.failed',
-      payload: {
-        repository: 'acme/app', repositoryId: 'repo-1', workflow: 'Deploy', runId: 700,
-        attempt: 1, conclusion: 'failure', headSha: 'abc123', branch: 'main',
-        url: 'https://github.com/acme/app/actions/runs/700', source: 'workflow_run',
-      },
-    }];
-    const deliver = async (delivery: string) => fetch(`${base}/api/github/webhook`, {
-      method: 'POST', headers: { 'content-type': 'application/json',
-        'x-github-event': 'workflow_run', 'x-github-delivery': delivery },
-      body: JSON.stringify({ action: 'completed' }),
-    });
-    const first = await deliver('workflow-recovery-1');
-    expect(first.status).toBe(200);
-    expect(await first.json()).toMatchObject({ accepted: true, recoveries: 1 });
-    const recovery = (await store.listTasks(mine)).find((task) => task.title === 'Repair failed GitHub workflow: Deploy');
-    expect(recovery?.params.prompt).toContain('Exact revision: abc123');
-    expect((await store.eventsSince(recovery!.id, 0))).toEqual(expect.arrayContaining([
-      expect.objectContaining({ type: 'github.workflow.failed' }),
-    ]));
-
-    // check_run and workflow_run can both describe the same Actions run; the
-    // repository/run key prevents duplicate recovery work across deliveries.
-    const duplicate = await deliver('workflow-recovery-2');
-    expect(duplicate.status).toBe(200);
-    expect((await store.listTasks(mine)).filter((task) => task.title === recovery!.title)).toHaveLength(1);
-    webhookProjectEvents = [];
+  // The repair of a failed default-branch workflow is an ordinary repeatable
+  // task fed by the project event inbox (src/integrations/github-events.ts);
+  // what its runs do is covered in tests/project-events-workflow.test.ts.
+  const failure = (runId: number, extra: Record<string, unknown> = {}) => ({
+    projectId: mine,
+    type: 'github.workflow.failed',
+    payload: {
+      repository: 'acme/app', repositoryId: 'repo-1', workflow: 'Deploy', runId,
+      attempt: 1, conclusion: 'failure', headSha: `sha-${runId}`, branch: 'main',
+      url: `https://github.com/acme/app/actions/runs/${runId}`, source: 'workflow_run', ...extra,
+    },
   });
+  const deliverWorkflowRun = async (delivery: string) => fetch(`${base}/api/github/webhook`, {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-github-event': 'workflow_run', 'x-github-delivery': delivery },
+    body: JSON.stringify({ action: 'completed' }),
+  });
+  const repairTasks = async () => (await store.listTasks(mine)).filter((task) => task.title === 'Repair GitHub workflow {{workflow}}');
 
-  // #554 and #555 (2026-10-08) were two tasks for one broken test: each red
-  // merge opened its own repair while the first was still at work.
-  it('tells the open repair task about a workflow that fails again, instead of opening another', async () => {
-    const failure = (runId: number, headSha: string) => ({
-      projectId: mine,
-      type: 'github.workflow.failed',
-      payload: {
-        repository: 'acme/app', repositoryId: 'repo-1', workflow: 'Lint', runId, attempt: 2,
-        conclusion: 'failure', headSha, branch: 'main',
-        url: `https://github.com/acme/app/actions/runs/${runId}`, source: 'workflow_run',
-      },
-    });
-    const deliver = async (delivery: string) => (await (await fetch(`${base}/api/github/webhook`, {
-      method: 'POST', headers: { 'content-type': 'application/json',
-        'x-github-event': 'workflow_run', 'x-github-delivery': delivery },
-      body: JSON.stringify({ action: 'completed' }),
-    })).json()) as { recoveries?: number };
-    const title = 'Repair failed GitHub workflow: Lint';
-    const repairs = async () => (await store.listTasks(mine)).filter((task) => task.title === title);
-    const told = vi.spyOn(KarmaxApi.prototype, 'postTaskMessage');
+  it('records a post-merge workflow failure once and gives the project its repair task', async () => {
     try {
-      webhookProjectEvents = [failure(710, 'first')];
-      expect(await deliver('lint-1')).toMatchObject({ recoveries: 1 });
-      const [open] = await repairs();
-      expect(open?.params.prompt).toContain('This is attempt 2');
+      webhookProjectEvents = [failure(700)];
+      const first = await deliverWorkflowRun('workflow-recovery-1');
+      expect(first.status).toBe(200);
+      expect(await first.json()).toMatchObject({ accepted: true, recorded: 1 });
+      const [repair] = await repairTasks();
+      expect(repair?.params).toMatchObject({ repeatable: true, triggers: [{ kind: 'event', type: 'github.workflow.failed',
+        concurrency: { key: '{{repository}}/{{workflow}}', mode: 'tell' } }] });
+      expect(repair?.params.prompt).toContain('workflow schema/registration');
+      const events = await store.listProjectEvents(mine, { type: 'github.workflow.failed' });
+      expect(events).toMatchObject([{ source: 'github', key: 'workflow:repo-1:700', subject: 'https://github.com/acme/app/actions/runs/700',
+        payload: { workflow: 'Deploy', headSha: 'sha-700' } }]);
 
-      webhookProjectEvents = [failure(711, 'second')];
-      expect((await deliver('lint-2')).recoveries ?? 0).toBe(0);
-      expect(await repairs()).toHaveLength(1);
-      expect(told).toHaveBeenCalledWith(expect.any(String), open!.id, { text: expect.stringMatching(
-        /Lint failed again on main[\s\S]*Exact revision: second[\s\S]*runs\/711 \(attempt 2\)/) });
-      expect((await store.eventsSince(open!.id, 0)).filter((event) => event.type === 'github.workflow.failed')
-        .map((event) => event.payload.runId)).toEqual([710, 711]);
-      expect(await store.kvGet(`github:workflow-recovery:${mine}:repo-1:711`)).toBe(open!.id);
+      // check_run and workflow_run can both describe the same Actions run.
+      expect(await (await deliverWorkflowRun('workflow-recovery-2')).json()).not.toHaveProperty('recorded');
+      expect(await repairTasks()).toHaveLength(1);
+      expect(await store.listProjectEvents(mine, { type: 'github.workflow.failed' })).toHaveLength(1);
 
-      // Once that repair has finished, a new failure is new work.
-      (await store.saveView(open!.id, { ...(await store.getTask(open!.id))!.lastView!, status: 'done', stage: 'done' } as any));
-      webhookProjectEvents = [failure(712, 'third')];
-      expect(await deliver('lint-3')).toMatchObject({ recoveries: 1 });
-      expect(await repairs()).toHaveLength(2);
-      expect(told).toHaveBeenCalledTimes(1);
+      // A deleted repair task stays deleted: later failures are only recorded.
+      await store.deleteTask(repair!.id);
+      webhookProjectEvents = [failure(701)];
+      expect(await (await deliverWorkflowRun('workflow-recovery-3')).json()).toMatchObject({ recorded: 1 });
+      expect(await repairTasks()).toHaveLength(0);
     } finally {
-      told.mockRestore();
       webhookProjectEvents = [];
     }
   });
 
-  it('routes a missing deployment run through the same idempotent recovery rail', async () => {
-    webhookProjectEvents = [{
-      projectId: mine,
-      type: 'github.workflow.failed',
-      payload: {
-        repository: 'acme/app', repositoryId: 'repo-1', workflow: 'Deploy', runId: 701,
-        attempt: 1, conclusion: 'missing', headSha: 'def456', branch: 'main',
-        url: 'https://github.com/acme/app/actions/runs/701', source: 'deployment_monitor',
+  it('keys a missing deployment run by its incident and skips incidents the former rail handled', async () => {
+    try {
+      webhookProjectEvents = [failure(702, { conclusion: 'missing', source: 'deployment_monitor',
         incidentKey: 'missing:def456:.github/workflows/deploy.yml',
-        evidence: {
-          kind: 'missing_deployment_run',
-          workflowFile: { status: 'present', bytes: 100 },
-          actionsQuery: { status: 'ok', runsChecked: 0 },
-        },
-      },
-    }];
-    const deliver = (delivery: string) => fetch(`${base}/api/github/webhook`, {
-      method: 'POST', headers: { 'content-type': 'application/json',
-        'x-github-event': 'workflow_run', 'x-github-delivery': delivery },
-      body: JSON.stringify({ action: 'completed' }),
-    });
+        evidence: { kind: 'missing_deployment_run', workflowFile: { status: 'present', bytes: 100 } } })];
+      expect(await (await deliverWorkflowRun('missing-recovery-1')).json()).toMatchObject({ recorded: 1 });
+      expect((await store.listProjectEvents(mine, { type: 'github.workflow.failed' }))[0]).toMatchObject({
+        key: 'workflow:repo-1:missing:def456:.github/workflows/deploy.yml', payload: { evidence: { kind: 'missing_deployment_run' } } });
+      await deliverWorkflowRun('missing-recovery-2');
+      expect((await store.listProjectEvents(mine, { type: 'github.workflow.failed' }))
+        .filter((event) => event.key.startsWith('workflow:repo-1:missing:'))).toHaveLength(1);
 
-    expect(await (await deliver('missing-recovery-1')).json()).toMatchObject({ recoveries: 1 });
-    const recovery = (await store.listTasks(mine))
-      .find((task) => task.title === 'Repair missing GitHub workflow: Deploy');
-    expect(recovery?.params.prompt).toContain('was not created');
-    expect(recovery?.params.prompt).toContain('Durable monitor evidence');
-    expect(recovery?.params.prompt).toContain('workflow schema/registration');
-
-    await deliver('missing-recovery-2');
-    expect((await store.listTasks(mine)).filter((task) => task.title === recovery!.title)).toHaveLength(1);
-    // Simulate a restart after createTask persisted but before the pending claim
-    // was acknowledged with the task id. The stale claim adopts that task.
-    const recoveryKey = 'github:workflow-recovery:' + mine
-      + ':repo-1:missing:def456:.github/workflows/deploy.yml';
-    (await store.kvSet(recoveryKey, `pending:${Date.now() - 11 * 60_000}`));
-    await deliver('missing-recovery-after-restart');
-    expect((await store.listTasks(mine)).filter((task) => task.title === recovery!.title)).toHaveLength(1);
-    expect((await store.kvGet(recoveryKey))).toBe(recovery!.id);
-    webhookProjectEvents = [];
+      await store.kvSet(`github:workflow-recovery:${mine}:repo-1:703`, 'task_handled_before_upgrade');
+      webhookProjectEvents = [failure(703)];
+      expect(await (await deliverWorkflowRun('legacy-1')).json()).not.toHaveProperty('recorded');
+      expect((await store.listProjectEvents(mine)).some((event) => event.key === 'workflow:repo-1:703')).toBe(false);
+    } finally {
+      webhookProjectEvents = [];
+    }
   });
 });

@@ -35,6 +35,12 @@ import {
 } from '../coordinators/names.js';
 import { TaskRecord, TaskView, AttentionAsk, Message, Project, TaskInput, ImageRef, FileRef, Tag, SavedView, TaskQuery, AgentRole, AgentSpec, AgentAuthority, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency, remotePolicyOf, ResourceAccess, ResourceTarget } from '../domain/types.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable, awaitsSuccessOf } from '../domain/triggers.js';
+import { applyTriggerContext, normalizeEventInput, type ProjectEvent, type ProjectEventClaim, type ProjectEventInput,
+  type ProjectEventOrigin, type TriggerContext } from '../domain/project-events.js';
+import { newId } from '../util/id.js';
+import { IncomingWebhooks, WebhookConfigError, webhookDeliveryKey, type IncomingWebhook } from '../integrations/incoming-webhooks.js';
+import { isChatPlatform, type ChatPlatform } from '../integrations/chat-platforms.js';
+import { chatThreadKey } from '../integrations/chat-replies.js';
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult, EvalContext, TaskGroup, forClauseValues, attentionCandidates } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
 import { assertInFlightComputerEdit, computerOf, computerResizable, describeMachine, machineShape, normalizeComputer, sameMachine,
@@ -130,6 +136,8 @@ export interface TriggerArmer {
    *  Only the armer can do this half — it needs the store to resolve dependency
    *  ids — so `armStoredTask` asks for it before mutating anything. */
   validationErrors?(task: TaskRecord): string[] | Promise<string[]>;
+  /** A project event was recorded in this process (the inbox; see triggers). */
+  projectEventRecorded?(event: ProjectEvent): void;
 }
 
 const firstLine = (s: string) => (s.split('\n')[0] ?? 'Task').slice(0, 80) || 'Task';
@@ -2625,20 +2633,24 @@ export class KarmaxApi {
    * stripped so it's a plain one-off execution with its own history. Used on
    * each trigger fire of a repeatable series, and by "Run again".
    */
-  async spawnRun(token: string, seriesId: string): Promise<TaskRecord> {
+  async spawnRun(token: string, seriesId: string, trigger?: TriggerContext): Promise<TaskRecord> {
     const series = (await this.deps.store.getTask(seriesId));
     // Scope the check to the series' own project (the run inherits it), so a
     // project-scoped token cannot spawn a run from another project's series.
     const caller = (await this.require(token, 'create_task', { projectId: series?.projectId, taskId: seriesId }));
     if (!series) throw new NotFoundError(`no task ${seriesId}`);
     (await this.assertStoredGrantQueueable(token, caller, series));
+    // A run an event started carries that event (wiki features/events-and-automations).
+    const shaped = trigger
+      ? applyTriggerContext(series.title, { ...cloneParamsWithoutTriggers(series.params), runOf: seriesId }, trigger)
+      : { title: series.title, params: { ...cloneParamsWithoutTriggers(series.params), runOf: seriesId } };
     let run = (await this.deps.store.createTask({
       projectId: series.projectId,
       listId: series.listId,
-      title: series.title,
+      title: shaped.title,
       workflow: series.workflow,
       workflowVersion: series.workflowVersion,
-      params: { ...cloneParamsWithoutTriggers(series.params), runOf: seriesId },
+      params: shaped.params,
       parentTaskId: series.parentTaskId,
       createdBy: (await this.taskCreator(caller, series.projectId)) ?? series.createdBy,
       assignee: series.assignee,
@@ -2675,18 +2687,20 @@ export class KarmaxApi {
    * (a repeatable series — cron, or any recurring trigger). Re-arms the task on a
    * start failure so a fire is never silently lost.
    */
-  async fireTriggeredTask(token: string, taskId: string, mode: 'self' | 'clone'): Promise<{ startedTaskId: string }> {
+  async fireTriggeredTask(token: string, taskId: string, mode: 'self' | 'clone', trigger?: TriggerContext): Promise<{ startedTaskId: string }> {
     const task = (await this.deps.store.getTask(taskId));
     const caller = (await this.require(token, 'create_task', { projectId: task?.projectId, taskId }));
     if (!task) throw new NotFoundError(`no task ${taskId}`);
 
-    if (mode === 'clone') return { startedTaskId: (await this.spawnRun(token, taskId)).id };
+    if (mode === 'clone') return { startedTaskId: (await this.spawnRun(token, taskId, trigger)).id };
 
-    const fired: Record<string, unknown> = { ...(task.params as Record<string, unknown>), triggerState: 'fired' };
+    const shaped = trigger ? applyTriggerContext(task.title, task.params as Record<string, unknown>, trigger) : undefined;
+    const fired: Record<string, unknown> = { ...(shaped?.params ?? task.params as Record<string, unknown>), triggerState: 'fired' };
     delete fired.triggerPending;
     (await this.deps.store.updateTaskParams(taskId, fired as any));
+    if (shaped && shaped.title !== task.title) (await this.deps.store.setTaskTitle(taskId, shaped.title));
     try {
-      const { startType, input } = await this.buildStart({ ...task, params: fired as any }, false, caller);
+      const { startType, input } = await this.buildStart({ ...task, ...(shaped ? { title: shaped.title } : {}), params: fired as TaskRecord['params'] }, false, caller);
       await withTimeout(
         this.deps.client.workflow.start(startType, { taskQueue: this.deps.taskQueue, workflowId: task.id, args: [input] }),
         START_TIMEOUT_MS,
@@ -2703,6 +2717,7 @@ export class KarmaxApi {
       // reconciliation forever — the task is permanently invisible to recovery.
       if (e instanceof WorkflowExecutionAlreadyStartedError) return { startedTaskId: taskId };
       (await this.deps.store.updateTaskParams(taskId, { ...(task.params as Record<string, unknown>), triggerState: 'armed' } as any));
+      if (shaped && shaped.title !== task.title) (await this.deps.store.setTaskTitle(taskId, task.title));
       throw e;
     }
     return { startedTaskId: taskId };
@@ -2718,6 +2733,155 @@ export class KarmaxApi {
     if (task?.params?.repeatable) return this.runAgain(token, taskId);
     this.armer?.disarm(taskId); // take it off the dispatcher so no later event double-fires
     return this.fireTriggeredTask(token, taskId, 'self');
+  }
+
+  // ─── Project events and incoming webhooks ─────────────────────────────────
+  // wiki features/events-and-automations: an outside occurrence is
+  // one row in the project's inbox; armed tasks whose event triggers match it
+  // start runs that receive it.
+
+  /** Emit a project event as the caller: a task (its runs share one source, so a
+   *  poller's re-emits collapse), a person, or a token. Emitting can start runs,
+   *  so it needs the same authority as creating a task. */
+  async emitProjectEvent(token: string, projectId: string | undefined, input: ProjectEventInput): Promise<{ event: ProjectEvent; duplicate: boolean }> {
+    const verified = (await this.deps.tokens.verify(token));
+    const callerTask = verified?.taskId && verified.taskId !== '*' ? (await this.deps.store.taskMetadata(verified.taskId)) : undefined;
+    // A task's own command (`tavya emit` in its world) need not name its project.
+    projectId ??= callerTask?.projectId;
+    if (!projectId) throw new ValidationError('name the project to emit the event in');
+    const caller = (await this.require(token, 'emit_event', { projectId }));
+    const project = (await this.deps.store.getProject(projectId));
+    if (!project) throw new NotFoundError(`no project ${projectId}`);
+    const trigger = callerTask?.params?.trigger as { hops?: number } | undefined;
+    return this.ingestProjectEvent({
+      organizationId: project.organizationId ?? 'org_personal', projectId,
+      source: callerTask ? `task:${String(callerTask.params?.runOf ?? callerTask.id)}` : caller.principal,
+      origin: callerTask ? 'task' : 'external',
+      hops: callerTask ? Number(trigger?.hops ?? -1) + 1 : 0,
+    }, input);
+  }
+
+  /** Record an occurrence whose sender the caller has already authenticated
+   *  (a verified webhook, a GitHub delivery, a chat platform). */
+  async ingestProjectEvent(from: { organizationId: string; projectId: string; source: string; origin: ProjectEventOrigin; hops: number },
+    input: ProjectEventInput): Promise<{ event: ProjectEvent; duplicate: boolean }> {
+    const normalized = normalizeEventInput(input, () => newId('key'));
+    if ('error' in normalized) throw new ValidationError(normalized.error);
+    const { event, created } = (await this.deps.store.recordProjectEvent({
+      ...from, ...normalized, occurredAt: normalized.occurredAt ?? Date.now(),
+    }));
+    if (created) this.armer?.projectEventRecorded?.(event);
+    return { event, duplicate: !created };
+  }
+
+  /** Newest first, each with what it did for every armed task it reached. */
+  async listProjectEvents(token: string, projectId: string, options: { limit?: number; before?: number; type?: string; source?: string } = {}):
+    Promise<Array<ProjectEvent & { claims: ProjectEventClaim[] }>> {
+    (await this.require(token, 'list_events', { projectId }));
+    const events = (await this.deps.store.listProjectEvents(projectId, options));
+    return Promise.all(events.map(async (event) => ({ ...event, claims: (await this.deps.store.listProjectEventClaims(event.id)) })));
+  }
+
+  async getProjectEvent(token: string, eventId: string): Promise<ProjectEvent & { claims: ProjectEventClaim[] }> {
+    const event = (await this.deps.store.getProjectEvent(eventId));
+    (await this.require(token, 'list_events', { projectId: event?.projectId ?? '__missing__' }));
+    if (!event) throw new NotFoundError(`no event ${eventId}`);
+    return { ...event, claims: (await this.deps.store.listProjectEventClaims(eventId)) };
+  }
+
+  private incomingWebhooks(): IncomingWebhooks {
+    if (!this.deps.broker) throw new ValidationError('incoming webhooks need the vault');
+    return new IncomingWebhooks(this.deps.store, this.deps.broker);
+  }
+
+  private async webhookCall<T>(work: () => Promise<T>): Promise<T> {
+    try { return await work(); } catch (error) {
+      if (error instanceof WebhookConfigError) throw error.status === 404 ? new NotFoundError(error.message) : new ValidationError(error.message);
+      throw error;
+    }
+  }
+
+  async listIncomingWebhooks(token: string, projectId: string): Promise<IncomingWebhook[]> {
+    (await this.require(token, 'project:settings:read', { projectId }));
+    return this.incomingWebhooks().list(projectId);
+  }
+
+  /** The secret is in the answer once; it is never shown again. A chat bot
+   *  (`kind`) is connected to its platform with `credentials`, at `hookUrl`. */
+  async createIncomingWebhook(token: string, projectId: string,
+    input: { name: string; type?: string; kind?: string; credentials?: Record<string, string> },
+    options: { hookUrl?: (hookId: string) => string; fetcher?: typeof fetch } = {}): Promise<{ hook: IncomingWebhook; secret?: string; verifyToken?: string }> {
+    const caller = (await this.require(token, 'project:settings:write', { projectId }));
+    const project = (await this.deps.store.getProject(projectId));
+    if (!project) throw new NotFoundError(`no project ${projectId}`);
+    if (input.kind !== undefined && !isChatPlatform(input.kind)) throw new ValidationError(`unknown chat platform "${input.kind}"`);
+    return this.webhookCall(() => this.incomingWebhooks().create({ organizationId: project.organizationId ?? 'org_personal', projectId,
+      name: String(input.name ?? ''), ...(input.type ? { type: String(input.type) } : {}), createdBy: caller.principal,
+      ...(input.kind ? { kind: input.kind as ChatPlatform, credentials: input.credentials ?? {} } : {}),
+      ...(options.hookUrl ? { url: options.hookUrl } : {}), ...(options.fetcher ? { fetcher: options.fetcher } : {}) }));
+  }
+
+  private async ownedWebhook(token: string, hookId: string): Promise<IncomingWebhook> {
+    const hook = await this.incomingWebhooks().get(hookId);
+    (await this.require(token, 'project:settings:write', { projectId: hook?.projectId ?? '__missing__' }));
+    if (!hook) throw new NotFoundError(`no webhook ${hookId}`);
+    return hook;
+  }
+
+  async updateIncomingWebhook(token: string, hookId: string, patch: { name?: string; type?: string }): Promise<IncomingWebhook> {
+    (await this.ownedWebhook(token, hookId));
+    return this.webhookCall(() => this.incomingWebhooks().update(hookId, patch));
+  }
+
+  async rotateIncomingWebhook(token: string, hookId: string): Promise<{ hook: IncomingWebhook; secret: string }> {
+    (await this.ownedWebhook(token, hookId));
+    return this.webhookCall(() => this.incomingWebhooks().rotate(hookId));
+  }
+
+  async deleteIncomingWebhook(token: string, hookId: string): Promise<{ deleted: true }> {
+    (await this.ownedWebhook(token, hookId));
+    await this.incomingWebhooks().delete(hookId);
+    return { deleted: true };
+  }
+
+  /**
+   * A delivery to a hook's public URL. Unknown hooks and bad credentials are the
+   * same refusal, so the URL space cannot be probed for valid ids. A chat bot's
+   * delivery may be a protocol handshake to `answer` at once, and may carry
+   * several mentions; a plain webhook's delivery is one event.
+   */
+  async receiveIncomingWebhook(hookId: string, delivery: { method?: string; raw: Buffer; contentType?: string; headers: Record<string, string | string[] | undefined>; query: URLSearchParams }):
+    Promise<{ answer?: { status: number; body: unknown; text?: boolean }; events: Array<{ event: ProjectEvent; duplicate: boolean }> }> {
+    const hooks = this.incomingWebhooks();
+    const hook = await hooks.get(hookId);
+    const project = hook ? await this.deps.store.getProject(hook.projectId) : undefined;
+    const method = delivery.method ?? 'POST';
+    const inbound = hook && project && hook.kind ? await hooks.receiveChat(hook, { method, raw: delivery.raw, headers: delivery.headers, query: delivery.query })
+      : hook && project && method === 'POST' && await hooks.verify(hook, delivery.raw, delivery.headers, delivery.query) ? undefined : 'refused' as const;
+    if (!hook || inbound === 'refused') {
+      if (hook) await hooks.noteDelivery(hook.id, 'refused a delivery without a valid signature or token');
+      throw new WebhookAuthError();
+    }
+    const from = { organizationId: hook.organizationId, projectId: hook.projectId, source: `${hook.kind ? 'chat' : 'webhook'}:${hook.id}`, origin: 'external' as const, hops: 0 };
+    try {
+      const events: Array<{ event: ProjectEvent; duplicate: boolean }> = [];
+      if (!inbound) {
+        events.push(await this.ingestProjectEvent(from, { type: hook.type, key: webhookDeliveryKey(delivery.headers, delivery.raw),
+          payload: parseWebhookBody(delivery.raw, delivery.contentType) }));
+      } else {
+        for (const mention of inbound.mentions) {
+          // A reply to the bot's own message belongs to the thread that message answered.
+          const thread = mention.thread ? (await this.deps.store.kvGet(chatThreadKey(hook.id, mention.thread))) ?? mention.thread : undefined;
+          const { key, url, ...payload } = { ...mention, ...(thread ? { thread } : {}) };
+          events.push(await this.ingestProjectEvent(from, { type: 'chat.mention', key, ...(url ? { subject: url } : {}), payload: { ...payload, ...(url ? { url } : {}) } }));
+        }
+      }
+      if (events.length || !inbound?.answer) await hooks.noteDelivery(hook.id);
+      return { ...(inbound?.answer ? { answer: inbound.answer } : {}), events };
+    } catch (error) {
+      await hooks.noteDelivery(hook.id, error instanceof Error ? error.message : String(error));
+      throw error;
+    }
   }
 
   /** Cancel a task's triggers: disarm it and keep it as an editable draft. */
@@ -6978,4 +7142,25 @@ function computerChangeNotice(change: { from: MachineShape; to: MachineShape }):
     + 'You move to it when this task parks: end your turn with pause(3) without jobs. A pause that waits on jobs keeps this machine, '
     + 'so first let them finish or stop them (stop_job); if one is running out of room, stopping it now is usually right. '
     + 'You resume with every tracked file and uncommitted change; Git-ignored files (dependencies, build output) and running processes do not carry over.';
+}
+
+/** A webhook delivery the hook could not authenticate. */
+export class WebhookAuthError extends Error {
+  code = 'unauthorized';
+  status = 401;
+  constructor() { super('webhook delivery needs a valid signature or token'); }
+}
+
+/** A JSON object stays as sent; a form becomes its fields; anything else is
+ *  kept as `body` so a filter can still match it. */
+function parseWebhookBody(raw: Buffer, contentType: string | undefined): Record<string, unknown> {
+  const text = raw.toString('utf8');
+  if (!text.trim()) return {};
+  if (/application\/x-www-form-urlencoded/i.test(contentType ?? '')) return Object.fromEntries(new URLSearchParams(text));
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : { body: parsed };
+  } catch {
+    return { body: text };
+  }
 }

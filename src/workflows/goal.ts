@@ -27,6 +27,7 @@ import {
   softwareDevV1_25,
   softwareDevV1_26,
   softwareDevV1_27,
+  softwareDevV1_28,
   SoftwareDevInput,
 } from './software-dev.js';
 import { TaskInput, Stage } from './contract.js';
@@ -173,6 +174,10 @@ export async function goalV1_26(input: TaskInput): Promise<{ stage: Stage; sha?:
 /** One conversation with several agents; errors hold in their stage. */
 export async function goalV1_27(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevV1_27({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
+}
+
+export async function goalV1_28(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevV1_28({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
 }
 
 /** Immutable replay entry for executions pinned to goal@1.0.0. */

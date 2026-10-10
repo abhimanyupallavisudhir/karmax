@@ -2416,6 +2416,15 @@ html[data-theme="dark"] .github-signin-btn:active,
   font-size: 12px; font-weight: 600; color: var(--ink-2); cursor: pointer;
 }
 .triggers-block .tb-repeat input { width: auto; margin: 0; padding: 0; }
+/* On event: the type, then its conditions and what a repeat does. */
+.ev-trigger { display:flex; flex-direction:column; gap:6px; min-width:0; }
+.ev-trigger #ev-type, .ev-cond input, .ev-more #ev-key { padding:6px 9px; background:var(--surface); font-family:var(--mono, ui-monospace, monospace); font-size:12.5px; }
+.ev-trigger #ev-type { max-width:320px; }
+.ev-cond { display:grid; grid-template-columns:minmax(0, 1.2fr) auto minmax(0, 1fr) auto; gap:6px; align-items:center; max-width:560px; }
+.ev-cond select, .ev-more select { padding:5px 8px; background:var(--surface); font-size:12.5px; }
+.ev-more { display:flex; flex-wrap:wrap; gap:6px; align-items:center; }
+.ev-more[hidden], .ev-more [hidden] { display:none; }
+.ev-more #ev-key { width:180px; }
 @media (max-width: 700px) {
   .triggers-block { grid-template-columns: minmax(0, 1fr); gap: 4px; }
   .triggers-block > :not(:first-child):is(.tb-label, .tb-repeat) { margin-top: 8px; }
@@ -3640,3 +3649,25 @@ input.toggle:disabled { opacity:.45; cursor:not-allowed; }
 :is(.payment-add-card, .pay-stripe, .pay-cardholder, .payment-restrictions, .vault-custom, .authorization-role) > summary::-webkit-details-marker { display:none; }
 :is(.payment-add-card, .pay-stripe, .pay-cardholder, .payment-restrictions, .vault-custom, .authorization-role) > summary::before { content:'›'; display:inline-block; width:10px; color:var(--ink-3); font-size:17px; line-height:1; transition:transform .15s; }
 :is(.payment-add-card, .pay-stripe, .pay-cardholder, .payment-restrictions, .vault-custom, .authorization-role)[open] > summary::before { transform:rotate(90deg); }
+
+/* A task's own command: one folded row under the task's settings. */
+.tf-command > summary { cursor:pointer; color:var(--ink-2); font-size:13px; padding:4px 0; list-style:none; }
+.tf-command > summary::-webkit-details-marker { display:none; }
+.tf-command > summary::before { content:'›'; display:inline-block; width:14px; color:var(--ink-3); transition:transform .15s; }
+.tf-command[open] > summary::before { transform:rotate(90deg); }
+.tf-command[open] > .form-row textarea { min-height:0; font-family:var(--mono, ui-monospace, monospace); font-size:12.5px; }
+
+/* Project settings → Events: sources, then what recent events did. */
+.pe-add { display:inline-flex; gap:4px; }
+.pe-new, .pe-reveal { display:flex; flex-direction:column; gap:8px; padding:10px; margin:6px 0 10px; border:1px solid var(--line); border-radius:10px; background:var(--surface-2); }
+.pe-new.inline-form { flex-direction:row; flex-wrap:wrap; }
+.pe-new input { min-width:0; flex:1 1 160px; }
+.pe-starts { display:flex; align-items:center; gap:8px; font-size:13px; }
+.pe-reveal code { word-break:break-all; font-size:12px; }
+.pe-event > summary { list-style:none; cursor:pointer; }
+.pe-event > summary::-webkit-details-marker { display:none; }
+.pe-event code { font-size:12px; }
+.pe-payload { max-height:280px; overflow:auto; margin:0 0 8px; padding:8px 10px; font-size:11.5px; background:var(--surface-2); border-radius:8px; }
+.setting-value .warn { color:var(--warn); }
+.pe-new input.toggle { flex:none; min-width:0; }
+.triggers-block label[for="ev-type"] { align-self:start; padding-top:8px; }

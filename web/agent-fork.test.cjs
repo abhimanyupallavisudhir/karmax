@@ -281,6 +281,8 @@ ok(!resumeChosenInner({ taskId: source.id }, { ...source, lastView: { status: 'd
 ok(!resumeChosenInner({ taskId: 'unknown' }).includes('Also add as dependency?'), 'unknown source does not guess its completion state');
 eval(extractFn('dependencyChipHtml'));
 eval(extractFn('wireDepPicker'));
+eval(extractFn('eventValue'));
+eval(extractFn('collectEventTrigger'));
 eval(extractFn('collectTriggers'));
 global.numberedTaskTitle = (task) => task.title;
 let depIds = [], depChange, depPickerClick;

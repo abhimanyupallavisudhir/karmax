@@ -40,6 +40,8 @@ export interface PlatformOps {
     tags?: string[];
     /** Full task-form field values, including trigger definitions. */
     params?: Record<string, unknown> }): Promise<{ id: string }>;
+  /** Record a project event; armed tasks whose event trigger matches start runs. */
+  emitEvent(a: { projectId: string; type: string; key?: string; subject?: string; payload?: Record<string, unknown> }): Promise<unknown>;
   getTask(taskId: string): Promise<unknown>;
   listTasks(projectId: string): Promise<{ id: string; title: string; workflow: string }[]>;
   searchTasks(projectId: string, query: string): Promise<{ total: number; tasks: CompactTask[] }>;
@@ -112,6 +114,7 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
     // not hold, so a tagged create half-succeeded and then reported a permission
     // error for a task that already existed.
     createTask: (a) => api.createTask(getToken(), a),
+    emitEvent: ({ projectId, ...event }) => api.emitProjectEvent(getToken(), projectId, event),
     getTask: (id) => api.getTaskView(getToken(), id) as Promise<unknown>,
     listTasks: async (pid) => (await api.listTaskSummaries(getToken(), pid)).map((t) => ({ id: t.id, title: t.title, workflow: t.workflow })),
     searchTasks: async (pid, query) => {
@@ -211,6 +214,7 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
       if (tags?.length) await req(`/api/tasks/${task.id}/tag`, { method: 'POST', body: JSON.stringify({ add: tags }) });
       return task;
     },
+    emitEvent: ({ projectId, ...event }) => req(`/api/projects/${encodeURIComponent(projectId)}/events`, { method: 'POST', body: JSON.stringify(event) }),
     getTask: (id) => req(`/api/tasks/${id}`),
     listTasks: (pid) => req(`/api/projects/${pid}/tasks`) as Promise<{ id: string; title: string; workflow: string }[]>,
     searchTasks: async (pid, query) => {
@@ -581,6 +585,16 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
     },
     async (a) => wrap(async () => (await ops.cancelAgentAction(a.requestId))),
   );
+  server.registerTool('emit_event', {
+    description: `Record a project event (wiki features/events-and-automations). Tasks waiting on a matching event trigger start runs that receive it. Re-emitting the same \`key\` does nothing, so a poller can report everything it sees each run.`,
+    inputSchema: {
+      projectId: z.string(),
+      type: z.string().describe('Dotted words, e.g. "orders.created".'),
+      key: z.string().optional().describe('Delivery key; repeats of one key collapse. Omit for a one-off.'),
+      subject: z.string().optional().describe('A link or label for what the event is about.'),
+      payload: z.record(z.string(), z.unknown()).optional().describe('JSON object, at most 64 KB.'),
+    },
+  }, async (a) => wrap(async () => (await ops.emitEvent(a))));
   server.registerTool('list_events', { description: `Read durable ${BRAND} events for a task after an optional sequence number.`, inputSchema: { taskId: z.string(), since: z.number().int().nonnegative().default(0) } }, async (a) => wrap(async () => (await ops.listEvents(a.taskId, a.since))));
   server.registerTool('list_github_actions_runs', {
     description: 'List GitHub Actions workflow runs for a repository attached to the calling task’s project. The GitHub credential remains in the control plane.',

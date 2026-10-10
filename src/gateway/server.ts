@@ -91,7 +91,9 @@ import { affects, authorityChanged, authoritySeq, changedSince, onAuthorityChang
 import { configuredPreviewOrigin, hashPreviewToken, newPreviewToken, previewCookieHeader,
   previewCookieValue, previewLeaseOrigin, previewLeaseUrl, previewTokenMatches } from './previews.js';
 import type { RemoteAccessController } from '../remote/access.js';
-import { GITHUB_APP_PUBLIC_URL_KEY, type GithubProjectWebhookEvent,
+import { GithubEvents } from '../integrations/github-events.js';
+import { CHAT_CREDENTIALS } from '../integrations/chat-platforms.js';
+import { GITHUB_APP_PUBLIC_URL_KEY,
   type GithubVaultPushEvent } from '../integrations/github-app.js';
 import { scanProjectResources } from '../world/resource-scan.js';
 import { credentialResource, resourceDriverCatalog, resourceSecretHandle, snapshotResource } from '../domain/resource-drivers.js';
@@ -301,6 +303,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   // The agent-mail inbound webhook authenticates with its own shared secret
   // (like the GitHub webhook), so it needs no capability.
   if (p === '/api/agent-mail/ingest') return 'none';
+  // Incoming webhooks authenticate each delivery with the hook's own secret.
+  if (/^\/api\/hooks\/[^/]+$/.test(p)) return 'none';
   if (p === '/api/payments/stripe/callback' || p === '/api/payments/stripe/webhook') return 'none';
   if (p === '/api/subscriptions/webhook' || p === '/api/subscriptions/paddle/webhook'
     || p === '/api/subscriptions/paddle/checkout-config') return 'none';
@@ -360,6 +364,12 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/tasks\/[^/]+\/resources/.test(p)) return read ? 'task:read' : 'task:review:execute';
   if (/^\/api\/tasks\/[^/]+\/resource-candidates/.test(p)) return read ? 'task:read' : 'task:review:execute';
   if (/^\/api\/projects\/[^/]+\/tasks/.test(p)) return read ? 'task:read' : 'task:create';
+  // Project events: reading needs the event stream; emitting can start runs.
+  if (/^\/api\/projects\/[^/]+\/events$/.test(p)) return read ? 'task:event:read' : 'task:create';
+  if (p === '/api/events' && !read) return 'task:create';
+  if (/^\/api\/project-events\/[^/]+$/.test(p)) return 'task:event:read';
+  if (/^\/api\/projects\/[^/]+\/webhooks$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
+  if (/^\/api\/webhooks\/[^/]+(?:\/rotate)?$/.test(p)) return 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/search$/.test(p)) return 'task:read';
   if (/^\/api\/projects\/[^/]+\/(tags|views)$/.test(p)) return read ? 'task:read' : 'task:edit';
   if (/^\/api\/(tags|views)\//.test(p)) return read ? 'task:read' : 'task:edit';
@@ -1033,6 +1043,7 @@ export class Gateway {
   }
 
   private githubWebhookSweep?: Promise<void>;
+  private githubEventsIngest?: GithubEvents;
   private connectionTimer?: ReturnType<typeof setInterval>;
   private connectionSweep?: Promise<void>;
   private connections(): ServiceConnections | undefined {
@@ -1290,103 +1301,15 @@ export class Gateway {
         && Number(String(task.workflowVersion).split('.')[1] ?? 0) >= 20)
         await this.deps.client.workflow.getHandle(event.taskId).signal(WORKFLOW_SIG.providerChanged).catch(() => undefined);
     }
-    const recoveries = await this.dispatchGithubRecoveryEvents(result.projectEvents ?? []);
+    const recorded = await this.githubEvents.ingest(result);
     for (const event of result.vaultPushes ?? []) await this.enqueueGitPassPush(event);
-    return recoveries;
+    return recorded;
   }
 
-  /** Route both terminal GitHub runs and "no run was created" incidents through
-   * the same post-merge recovery-task rail. The durable incident claim is what
-   * makes webhook duplicates, monitor polls, and crash retries converge. */
-  async dispatchGithubRecoveryEvents(events: GithubProjectWebhookEvent[]): Promise<number> {
-    let recoveries = 0;
-    for (const event of events) {
-      // Preserve the historical run-id key exactly so an upgrade cannot turn a
-      // GitHub redelivery for an already-recovered run into a second task.
-      const incident = event.payload.incidentKey ?? String(event.payload.runId);
-      const key = `github:workflow-recovery:${event.projectId}:${event.payload.repositoryId}:${incident}`;
-      const incidentLine = `Recovery incident: ${key}`;
-      const previous = (await this.deps.store.kvGet(key));
-      if (previous?.startsWith('task_')) continue;
-      // A process may have died after the claim but before task creation.
-      // Reclaim an abandoned marker; fresh markers serialize concurrent
-      // workflow_run/check_run deliveries and monitor sweeps.
-      if (previous?.startsWith('pending:')) {
-        const claimedAt = Number(previous.slice('pending:'.length));
-        if (Number.isFinite(claimedAt) && Date.now() - claimedAt < 10 * 60_000) continue;
-        // createTask persists before starting the workflow. If the process died
-        // after that insert but before replacing `pending`, adopt the task by its
-        // durable incident line instead of creating a second recovery on restart.
-        const existing = (await this.deps.store.listTasks(event.projectId)).find((task) =>
-          String(task.params?.prompt ?? '').includes(incidentLine));
-        if (existing) { (await this.deps.store.kvSet(key, existing.id)); continue; }
-        (await this.deps.store.kvDelete(key));
-      }
-      if (!(await this.deps.store.kvClaim(key, `pending:${Date.now()}`))) continue;
-      try {
-        const project = (await this.deps.store.getProject(event.projectId));
-        if (!project) { (await this.deps.store.kvDelete(key)); continue; }
-        const origin = event.payload.originatingTaskId
-          ? `\nOriginating task: ${event.payload.originatingTaskId}` : '';
-        const missing = event.payload.source === 'deployment_monitor';
-        const evidence = event.payload.evidence
-          ? `\n\nDurable monitor evidence:\n${JSON.stringify(event.payload.evidence, null, 2)}` : '';
-        const token = (await this.deps.tokens.mintPrincipal('system:github-recovery', ['*'],
-          event.projectId, 10 * 60_000, project.organizationId)).token;
-        const title = `Repair ${missing ? 'missing' : 'failed'} GitHub workflow: ${event.payload.workflow}`;
-        const opening = missing
-          ? `A post-merge GitHub deployment workflow run was not created for ${event.payload.repository}.`
-          : `A post-merge GitHub workflow failed for ${event.payload.repository}.`;
-        // A workflow that is still red while its repair is open is that
-        // repair's business: tell it, rather than start a second one.
-        const open = missing ? undefined : (await this.deps.store.listTasks(event.projectId)).find((task) =>
-          task.title === title && String(task.params?.prompt ?? '').startsWith(opening)
-          && !task.params?.archived && !['done', 'cancelled', 'failed'].includes(task.lastView?.status ?? ''));
-        if (open) {
-          (await this.deps.store.kvSet(key, open.id));
-          (await this.emitTaskEvent({ taskId: open.id, type: event.type, ts: Date.now(), payload: event.payload }));
-          await this.deps.api.postTaskMessage(token, open.id, { text: [
-            `${event.payload.workflow} failed again on ${event.payload.branch} while this repair is open.`,
-            `Exact revision: ${event.payload.headSha || 'not reported'}`,
-            `Run: ${event.payload.url || `GitHub Actions run ${event.payload.runId}`} (attempt ${event.payload.attempt})`,
-            'If it is the failure you are repairing, nothing more is needed; otherwise repair it here too.',
-          ].join('\n') }).catch(() => undefined);
-          continue;
-        }
-        const task = await this.deps.api.createTask(token, {
-          projectId: event.projectId,
-          title,
-          prompt: [
-            opening,
-            `Workflow: ${event.payload.workflow}`,
-            `Conclusion: ${event.payload.conclusion}`,
-            `Exact revision: ${event.payload.headSha || 'not reported'}`,
-            missing
-              ? `Successful prerequisite run: ${event.payload.url || `GitHub Actions run ${event.payload.runId}`}${origin}`
-              : `Run: ${event.payload.url || `GitHub Actions run ${event.payload.runId}`}${origin}`,
-            incidentLine,
-            ...(!missing && Number(event.payload.attempt) > 1
-              ? [`This is attempt ${event.payload.attempt}: the run failed again after a rerun, so the failure reproduces.`] : []),
-            evidence,
-            '',
-            'Inspect the complete GitHub evidence and classify it before changing code. For a missing run, check workflow schema/registration and triggers first; the evidence distinguishes direct API absence from webhook delay and records file/API permission failures. If a run exists, distinguish queued/waiting environment approval from a terminal failure. If it is a transient GitHub runner failure, rerun the exact revision once and verify it. If it is billing, permissions, protected-environment approval, secrets, or repository configuration, report the precise human action required and do not manufacture a code change. If it is a deterministic deployment or code defect, repair it through the normal reviewed pull-request workflow and verify recovery. The already-merged originating task is immutable and must remain complete.',
-          ].join('\n'),
-        });
-        (await this.deps.store.kvSet(key, task.id));
-        (await this.emitTaskEvent({ taskId: task.id, type: event.type, ts: Date.now(), payload: event.payload }));
-        recoveries++;
-      } catch (error) {
-        // The API compensates ordinary start failures, but if it threw after the
-        // durable task insert survived, retain/adopt that task just like the
-        // restart path above instead of deleting the only idempotency record.
-        const existing = (await this.deps.store.listTasks(event.projectId)).find((task) =>
-          String(task.params?.prompt ?? '').includes(incidentLine));
-        if (existing) { (await this.deps.store.kvSet(key, existing.id)); continue; }
-        (await this.deps.store.kvDelete(key));
-        throw error;
-      }
-    }
-    return recoveries;
+  /** GitHub deliveries and workflow failures into the project event inbox
+   *  (src/integrations/github-events.ts); the deployment monitor uses it too. */
+  get githubEvents(): GithubEvents {
+    return this.githubEventsIngest ??= new GithubEvents({ api: this.deps.api, store: this.deps.store, tokens: this.deps.tokens });
   }
 
   private async upgradePrincipal(req: http.IncomingMessage, url: URL): Promise<string | undefined> {
@@ -2018,22 +1941,44 @@ export class Gateway {
       try {
         const raw = await this.rawBody(req, 2 * 1024 * 1024);
         const deliveryId = String(req.headers['x-github-delivery'] ?? '');
-        let recoveries = 0;
+        let recorded = 0;
         const result = await this.deps.githubApp.deliverWebhook(
           String(req.headers['x-github-event'] ?? ''), deliveryId, raw,
           typeof req.headers['x-hub-signature-256'] === 'string' ? req.headers['x-hub-signature-256'] : undefined,
-          async (result) => { recoveries = await this.dispatchGithubWebhook(result); },
+          async (result) => { recorded = await this.dispatchGithubWebhook(result); },
         );
         return this.json(res, 200, { accepted: result.accepted,
           ...(result.reconciled !== undefined ? { reconciled: result.reconciled } : {}),
           ...(result.events?.length ? { dispatched: result.events.length } : {}),
-          ...(recoveries ? { recoveries } : {}),
+          ...(recorded ? { recorded } : {}),
           ...(result.vaultPushes?.length ? { vaultSyncsQueued: result.vaultPushes.length } : {}),
         });
       } catch (error) {
         // Verified failures remain in the durable inbox for local retry.
         const message = error instanceof Error ? error.message : String(error);
         return this.json(res, /webhook signature/i.test(message) ? 401 : 500, { error: message });
+      }
+    }
+    // Incoming webhook delivery (wiki features/events-and-automations):
+    // one project event per delivery, recorded before the sender is answered.
+    const hookMatch = p.match(/^\/api\/hooks\/([^/]+)$/);
+    if (hookMatch && (method === 'POST' || method === 'GET')) {
+      try {
+        const raw = method === 'POST' ? await this.rawBody(req, 1024 * 1024) : Buffer.alloc(0);
+        const result = await this.deps.api.receiveIncomingWebhook(decodeURIComponent(hookMatch[1]!), {
+          method, raw, contentType: typeof req.headers['content-type'] === 'string' ? req.headers['content-type'] : undefined,
+          headers: req.headers, query: url.searchParams,
+        });
+        if (result.answer?.text) {
+          res.writeHead(result.answer.status, { 'content-type': 'text/plain; charset=utf-8' });
+          return res.end(String(result.answer.body));
+        }
+        if (result.answer) return this.json(res, result.answer.status, result.answer.body);
+        const [first] = result.events;
+        return this.json(res, 202, { accepted: true, ...(first ? { event: first.event.id, duplicate: first.duplicate } : {}),
+          ...(result.events.length > 1 ? { events: result.events.map(({ event, duplicate }) => ({ id: event.id, duplicate })) } : {}) });
+      } catch (error) {
+        return this.fail(res, error);
       }
     }
     // Agent mailbox inbound webhook (wiki plans/PLAN-passwords §8): authenticated by a
@@ -5128,6 +5073,56 @@ export class Gateway {
         const q = url.searchParams.get('q') ?? '';
         const r = await api.searchTasks(token, searchMatch[1]!, q);
         return this.json(res, 200, r);
+      }
+
+      // Project events (the inbox) and the incoming webhooks that feed it.
+      const projectEventsMatch = p.match(/^\/api\/projects\/([^/]+)\/events$/);
+      if (projectEventsMatch) {
+        const projectId = projectEventsMatch[1]!;
+        if (method === 'GET') {
+          const before = url.searchParams.get('before');
+          return this.json(res, 200, await api.listProjectEvents(token, projectId, {
+            ...(url.searchParams.get('limit') ? { limit: Number(url.searchParams.get('limit')) } : {}),
+            ...(before ? { before: Number(before) } : {}),
+            ...(url.searchParams.get('type') ? { type: url.searchParams.get('type')! } : {}),
+            ...(url.searchParams.get('source') ? { source: url.searchParams.get('source')! } : {}),
+          }));
+        }
+        if (method === 'POST') {
+          const b = await this.body(req);
+          const result = await api.emitProjectEvent(token, projectId, { type: b.type, key: b.key, subject: b.subject, occurredAt: b.occurredAt, payload: b.payload });
+          return this.json(res, result.duplicate ? 200 : 201, result);
+        }
+      }
+      if (p === '/api/events' && method === 'POST') {
+        const b = await this.body(req);
+        const result = await api.emitProjectEvent(token, undefined, { type: b.type, key: b.key, subject: b.subject, occurredAt: b.occurredAt, payload: b.payload });
+        return this.json(res, result.duplicate ? 200 : 201, result);
+      }
+      const projectEventMatch = p.match(/^\/api\/project-events\/([^/]+)$/);
+      if (projectEventMatch && method === 'GET') return this.json(res, 200, await api.getProjectEvent(token, projectEventMatch[1]!));
+      const projectWebhooksMatch = p.match(/^\/api\/projects\/([^/]+)\/webhooks$/);
+      if (projectWebhooksMatch) {
+        const projectId = projectWebhooksMatch[1]!;
+        if (method === 'GET') return this.json(res, 200, { webhooks: await api.listIncomingWebhooks(token, projectId),
+          urlBase: `${this.publicUrl(req)}/api/hooks/`, platforms: CHAT_CREDENTIALS });
+        if (method === 'POST') {
+          const b = await this.body(req);
+          const hookUrl = (hookId: string) => `${this.publicUrl(req)}/api/hooks/${hookId}`;
+          const created = await api.createIncomingWebhook(token, projectId,
+            { name: b.name, type: b.type, kind: b.kind, credentials: b.credentials }, { hookUrl });
+          return this.json(res, 201, { ...created, url: hookUrl(created.hook.id) });
+        }
+      }
+      const webhookMatch = p.match(/^\/api\/webhooks\/([^/]+)(\/rotate)?$/);
+      if (webhookMatch) {
+        const hookId = webhookMatch[1]!;
+        if (webhookMatch[2] && method === 'POST') return this.json(res, 200, await api.rotateIncomingWebhook(token, hookId));
+        if (!webhookMatch[2] && method === 'PATCH') {
+          const b = await this.body(req);
+          return this.json(res, 200, await api.updateIncomingWebhook(token, hookId, { ...(b.name !== undefined ? { name: String(b.name) } : {}), ...(b.type !== undefined ? { type: String(b.type) } : {}) }));
+        }
+        if (!webhookMatch[2] && method === 'DELETE') return this.json(res, 200, await api.deleteIncomingWebhook(token, hookId));
       }
 
       // Tags (labels + topics, hierarchical) — project-scoped catalogue.

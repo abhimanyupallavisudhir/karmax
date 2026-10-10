@@ -22,7 +22,7 @@ const INSTALLATION_HANDLES = new Set(['github-app:private-key', 'github-app:webh
 const INSTALLATION_PREFIXES = ['platform:'];
 /** Handles whose second segment (or third, for mailboxes) is the organization id. */
 const ORGANIZATION_IN_HANDLE = [
-  /^(?:world-provider|mcp|connector|connector-export):([^:]+):/,
+  /^(?:world-provider|mcp|connector|connector-export|incoming-webhook):([^:]+):/,
   /^resource-store:key:([^:]+)$/,
   /^mailbox:[^:]+:([^:]+):auth$/,
 ];
