@@ -159,6 +159,7 @@ function describeEnvironment(world: WorldHandle): string {
 function describeComputer(world: WorldHandle, taskId: string, requested?: MachineShape): string {
   const shape = world.meta?.computer as MachineShape | undefined;
   if (!shape) return '';
+  if (world.kind === 'fly' || world.kind === 'hetzner') return describeVmComputer(world, taskId, shape, requested);
   // A world moves to a new size only once it parks; a pause on jobs keeps it awake.
   const move = 'end your turn with pause(3) without jobs. A pause that waits on jobs keeps this machine, so first let them finish or stop them (stop_job). '
     + 'You resume on the new machine with every tracked file and uncommitted change, but Git-ignored files (dependencies, build output) '
@@ -167,6 +168,20 @@ function describeComputer(world: WorldHandle, taskId: string, requested?: Machin
     return `Computer: ${describeMachine(shape)}. This task's computer is now ${describeMachine(requested)}: you move to it when the task parks, so ${move}`;
   return `Computer: ${describeMachine(shape)}. If it is too small (out of disk or memory), resize it yourself with `
     + `platform_request(PATCH, "/api/tasks/${taskId}/params", {"params": {"computer": {"diskGb": 50}}}) (or cpu, memoryMb) and then ${move}`;
+}
+
+/** A VM world (Fly.io, Hetzner): its disk is a volume that keeps everything and grows in place. */
+function describeVmComputer(world: WorldHandle, taskId: string, shape: MachineShape, requested?: MachineShape): string {
+  const machine = (world.meta?.machine as MachineShape | undefined) ?? shape;
+  const max = world.kind === 'fly' ? 500 : 10_240;
+  const home = world.kind === 'hetzner'
+    ? ' Only your home directory (/home/user) lasts through a long pause: install tools there or in the project, not with apt.' : '';
+  const pending = requested && (requested.cpu !== undefined && requested.cpu !== machine.cpu
+    || requested.memoryMb !== undefined && requested.memoryMb !== machine.memoryMb)
+    ? ` Its CPU and memory become ${describeMachine(requested)} at your next pause(3) without jobs (a pause on jobs keeps this machine).` : '';
+  return `Computer: ${describeMachine(machine)} (up to ${max} GB of disk). Everything on its disk, Git-ignored files included, survives pauses.${home}${pending} `
+    + `If it runs out of disk, grow it yourself with platform_request(PATCH, "/api/tasks/${taskId}/params", {"params": {"computer": {"diskGb": ${Math.min(max, Math.max(50, (machine.diskGb ?? 20) * 2))}}}}): `
+    + 'it grows at once, nothing moves and nothing needs restarting. More CPU or memory (cpu, memoryMb) applies after your next pause(3) without jobs.';
 }
 
 /**
