@@ -51,7 +51,7 @@ import { gateFollowUps } from './follow-up-gate.js';
 import { acquireAgentSlot, awaitAgentResources, AgentResourcesUnavailableError } from './agent-slots.js';
 import { assemblePrompt } from '../agent/prompt.js';
 import { GLOBAL_INSTRUCTIONS } from '../agent/instructions.js';
-import { jobStatuses, startJobWaiter, stopJobs, describeJobs } from '../world/jobs.js';
+import { jobStatuses, startJob, startJobWaiter, stopJobs, describeJobs } from '../world/jobs.js';
 import { autoResolve as runAutoResolve } from '../resolve/cases.js';
 import { KarmaxBus } from '../contrib/bus.js';
 import { TokenAuthority } from '../platform/tokens.js';
@@ -1061,6 +1061,83 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     return next as WorldHandle;
   }
 
+  /** The authority one task turn acts with: the stored task authorization (or
+   *  the Avatar's), approved extensions, and the scope its platform token is
+   *  minted for. Shared by the agent's turn and the task's own command
+   *  (`runTaskCommand`), so a command never acts with more or less than its agent. */
+  async function turnAuthority(args: { taskId: string; task: TaskInput; role: string; participant?: string; organizationId: string;
+    avatar?: Awaited<ReturnType<typeof avatarForRole>> }) {
+    const organizationId = args.organizationId;
+    const participant = args.participant ?? defaultParticipant(args.role);
+    const avatar = args.avatar;
+    const orgVaultItems = new VaultItems(store, deps.broker, undefined, organizationId, participant);
+    const approvedPermissions = (await new PermissionRequests(store, organizationId).extensionCaps(args.taskId, args.role));
+    // Requesting human input is a non-removable safety valve for every task
+    // agent. The API restricts task-scoped callers to their own task, so this
+    // cannot be used to interrupt peer work or widen the agent's authority.
+    const preparationTask = await store.getTask(args.taskId);
+    // An agent other than the main one acts with its own authority when it has
+    // one (wiki features/collaboration-model); otherwise with the task's.
+    const agentAuthorization = participantAuthorization(preparationTask?.params, participant);
+    const storedAuthorization = (agentAuthorization ?? preparationTask?.params?._authorization) as {
+      capabilities?: string[];
+      principal?: string;
+      scope?: 'projects' | 'organization' | 'global';
+      projectIds?: string[];
+      organizationId?: string;
+      delegationId?: string;
+    } | undefined;
+    const delegatedAuthorization = avatar?.authorization;
+    // A task may have been authorized by a routed Avatar without itself using
+    // that Avatar as its role profile. Re-evaluate that delegation on every
+    // turn so disabling the authorizer, narrowing its authority, or revoking
+    // its backing principal immediately attenuates the task as well.
+    const authorizingAvatarId = !avatar && storedAuthorization?.principal?.startsWith('avatar:')
+      ? storedAuthorization.principal.slice(7) : undefined;
+    const authorizingAvatar = authorizingAvatarId ? (await store.getAvatar(authorizingAvatarId)) : undefined;
+    const authorizingAvatarBackingCaps = authorizingAvatar
+      ? (await avatarAuthorizationCapabilities(store, deps.authorization, authorizingAvatar, args.task.projectId))
+      : [];
+    const principalGrant = avatar
+      ? (await avatarAuthorizationCapabilities(store, deps.authorization, avatar, args.task.projectId))
+      : authorizingAvatarId
+        ? attenuate(storedAuthorization?.capabilities ?? [], authorizingAvatarBackingCaps)
+        : storedAuthorization?.capabilities ?? args.task.grant ?? DEFAULT_GRANT;
+    const grant = [...new Set([
+      ...principalGrant,
+      ...(avatar ? [] : (await orgVaultItems.extensionCaps(args.taskId))),
+      ...approvedPermissions,
+      'task:escalate',
+    ])];
+    // Approved permission extensions join the task grant. The role ceiling
+    // admits that grant for declared agent roles; it does not raise the
+    // selected level or bypass the task's scope and durable approval checks.
+    const ceiling = avatar
+      ? [...new Set(grant)]
+      : [...new Set([...roleCeiling(args.role), ...approvedPermissions])];
+    const effective = attenuate(ceiling, grant);
+    const authorizationScope = storedAuthorization?.scope;
+    const delegatedScope = delegatedAuthorization?.scope;
+    const mintScope = {
+      principal: avatar ? avatarPrincipal(avatar.id)
+        : args.task.parentTaskId ? `task:${args.task.parentTaskId}`
+          : (agentAuthorization?.principal ?? args.task.grantPrincipal ?? 'system:legacy-task'),
+      projectId: avatar ? (delegatedScope ? undefined : args.task.projectId)
+        : authorizationScope ? undefined : args.task.projectId,
+      projectIds: avatar
+        ? delegatedScope === 'projects' ? delegatedAuthorization?.projectIds : undefined
+        : authorizationScope === 'projects' ? storedAuthorization?.projectIds : undefined,
+      organizationId: avatar
+        ? delegatedScope === 'global' ? undefined : (delegatedAuthorization?.organizationId ?? avatar.organizationId)
+        : authorizationScope === 'global' ? undefined
+          : (storedAuthorization?.organizationId ?? (await store.getProject(args.task.projectId))?.organizationId),
+      delegationId: avatar ? undefined : agentAuthorization ? agentAuthorization.delegationId
+        : (storedAuthorization?.delegationId ?? args.task.delegationId),
+      externalIdentities: avatar?.githubAccountId ? { githubAccountId: avatar.githubAccountId } : undefined,
+    };
+    return { participant, preparationTask, orgVaultItems, grant, ceiling, effective, mintScope };
+  }
+
   /** `recover: false` opens only a sandbox that is still there: a reader such
    * as a fork copying a session out never rebuilds another task's world. */
   async function openWorld(handle: WorldHandle, taskId = handle.id, options: { recover?: boolean } = {}): Promise<World> {
@@ -2029,82 +2106,21 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // Approved credential escalations recorded after creation
       // (wiki plans/PLAN-passwords §7 approve-for-task) extend the stored grant here,
       // so the next minted token carries them without touching workflow input.
-      const participant = args.participant ?? defaultParticipant(args.role);
-      const orgVaultItems = new VaultItems(store, deps.broker, undefined, organizationId, participant);
-      const approvedPermissions = (await new PermissionRequests(store, organizationId).extensionCaps(args.taskId, args.role));
-      // Requesting human input is a non-removable safety valve for every task
-      // agent. The API restricts task-scoped callers to their own task, so this
-      // cannot be used to interrupt peer work or widen the agent's authority.
-      const preparationTask = await store.getTask(args.taskId);
-      // An agent other than the main one acts with its own authority when it has
-      // one (wiki features/collaboration-model); otherwise with the task's.
-      const agentAuthorization = participantAuthorization(preparationTask?.params, participant);
-      const storedAuthorization = (agentAuthorization ?? preparationTask?.params?._authorization) as {
-        capabilities?: string[];
-        principal?: string;
-        scope?: 'projects' | 'organization' | 'global';
-        projectIds?: string[];
-        organizationId?: string;
-        delegationId?: string;
-      } | undefined;
-      const delegatedAuthorization = avatar?.authorization;
-      // A task may have been authorized by a routed Avatar without itself using
-      // that Avatar as its role profile. Re-evaluate that delegation on every
-      // turn so disabling the authorizer, narrowing its authority, or revoking
-      // its backing principal immediately attenuates the task as well.
-      const authorizingAvatarId = !avatar && storedAuthorization?.principal?.startsWith('avatar:')
-        ? storedAuthorization.principal.slice(7) : undefined;
-      const authorizingAvatar = authorizingAvatarId ? (await store.getAvatar(authorizingAvatarId)) : undefined;
-      const authorizingAvatarBackingCaps = authorizingAvatar
-        ? (await avatarAuthorizationCapabilities(store, deps.authorization, authorizingAvatar, args.task.projectId))
-        : [];
-      const principalGrant = avatar
-        ? (await avatarAuthorizationCapabilities(store, deps.authorization, avatar, args.task.projectId))
-        : authorizingAvatarId
-          ? attenuate(storedAuthorization?.capabilities ?? [], authorizingAvatarBackingCaps)
-          : storedAuthorization?.capabilities ?? args.task.grant ?? DEFAULT_GRANT;
-      const grant = [...new Set([
-        ...principalGrant,
-        ...(avatar ? [] : (await orgVaultItems.extensionCaps(args.taskId))),
-        ...approvedPermissions,
-        'task:escalate',
-      ])];
-      // Approved permission extensions join the task grant. The role ceiling
-      // admits that grant for declared agent roles; it does not raise the
-      // selected level or bypass the task's scope and durable approval checks.
-      const ceiling = avatar
-        ? [...new Set(grant)]
-        : [...new Set([...roleCeiling(args.role), ...approvedPermissions])];
-      const effective = attenuate(ceiling, grant);
+      const { participant, preparationTask, orgVaultItems, grant, ceiling, effective, mintScope } = await turnAuthority({
+        taskId: args.taskId, task: args.task, role: args.role, participant: args.participant, organizationId, avatar });
       let token: string | undefined;
       if (deps.tokens) {
-        const authorizationScope = storedAuthorization?.scope;
-        const delegatedScope = delegatedAuthorization?.scope;
         const minted = (await deps.tokens.mint({
+          ...mintScope,
           taskId: args.taskId,
           profileId: profile.id,
           role: args.role,
           participant,
-          principal: avatar ? avatarPrincipal(avatar.id)
-            : args.task.parentTaskId ? `task:${args.task.parentTaskId}`
-              : (agentAuthorization?.principal ?? args.task.grantPrincipal ?? 'system:legacy-task'),
-          projectId: avatar ? (delegatedScope ? undefined : args.task.projectId)
-            : authorizationScope ? undefined : args.task.projectId,
-          projectIds: avatar
-            ? delegatedScope === 'projects' ? delegatedAuthorization?.projectIds : undefined
-            : authorizationScope === 'projects' ? storedAuthorization?.projectIds : undefined,
-          organizationId: avatar
-            ? delegatedScope === 'global' ? undefined : (delegatedAuthorization?.organizationId ?? avatar.organizationId)
-            : authorizationScope === 'global' ? undefined
-              : (storedAuthorization?.organizationId ?? (await store.getProject(args.task.projectId))?.organizationId),
           audience: 'karmax-platform',
           executionId: args.agentTurnId ?? legacyAgentTurnId,
           executionAttempt: activityAttempt,
           executionRunId: workflowRunId,
           worldGeneration: args.worldHandle.generation,
-          delegationId: avatar ? undefined : agentAuthorization ? agentAuthorization.delegationId
-            : (storedAuthorization?.delegationId ?? args.task.delegationId),
-          externalIdentities: avatar?.githubAccountId ? { githubAccountId: avatar.githubAccountId } : undefined,
           ceiling,
           grantorCaps: grant,
         }));
@@ -3706,6 +3722,70 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           if (signal.aborted) await Promise.resolve(waiter.kill()).catch(() => undefined);
         }
       } finally { clearInterval(beat); }
+    },
+
+    /**
+     * Start the task's own command — Do runs code instead of an agent (wiki
+     * planned/external-connectors-and-automations) — as a durable job in its
+     * world. A retried activity re-attaches to the job it already started. The
+     * command acts with exactly the Do agent's authority (`turnAuthority`): its
+     * platform token, granted vault items, Git profile and project secrets, with
+     * `tavya` on its PATH; a run an event started finds it at $TAVYA_EVENT.
+     */
+    async startTaskCommand(args: { taskId: string; worldHandle: WorldHandle; task: TaskInput; command: string; runKey: string }): Promise<{ jobId: string }> {
+      const key = `task-command:${args.taskId}:${args.runKey}`;
+      const started = await store.kvGet(key);
+      if (started) return { jobId: (JSON.parse(started) as { jobId: string }).jobId };
+      const world = await openWorld(args.worldHandle, args.taskId);
+      const organizationId = (await store.getProject(args.task.projectId))?.organizationId ?? 'org_personal';
+      const { participant, preparationTask, orgVaultItems, grant, ceiling, effective, mintScope } = await turnAuthority({
+        taskId: args.taskId, task: args.task, role: 'do', organizationId });
+      const minted = deps.tokens ? (await deps.tokens.mint({ ...mintScope, taskId: args.taskId, profileId: 'command', role: 'do',
+        participant, audience: 'karmax-platform', worldGeneration: args.worldHandle.generation, ceiling, grantorCaps: grant })) : undefined;
+      if (minted) (await record(args.taskId, 'token.minted', { tokenId: minted.record.id, profile: 'command', caps: effective,
+        audience: minted.record.audience, expiresAt: minted.record.expiresAt, participant }));
+      const skippedEnv: SkippedEnv[] = [];
+      const gitEnv = isRemote(args.worldHandle.kind) && organizationId === 'org_personal' ? {} : (await gitEnvFor(args.worldHandle, args.taskId));
+      const vaultEnv = screenEnvironment((await orgVaultItems.envFor(args.taskId, effective, world, skippedEnv)), () => 'a credential', skippedEnv);
+      // Paths as the world sees them (a container maps its root elsewhere).
+      const shim = '#!/bin/sh\n# The tavya CLI, signed in by KARMAX_GATEWAY_URL and KARMAX_TOKEN.\nexec npx -y @tavya/cli@latest "$@"\n';
+      const installed = await world.exec('bash', ['-c', 'mkdir -p .karmax-injection/bin && printf "%s" "$1" > .karmax-injection/bin/tavya'
+        + ' && chmod 755 .karmax-injection/bin/tavya && cd .karmax-injection && pwd', 'karmax-command', shim], { cwd: args.worldHandle.root, timeoutMs: 30_000 });
+      const injection = installed.stdout.trim().split('\n').at(-1) ?? '';
+      if (installed.code !== 0 || !injection.startsWith('/'))
+        throw new Error(`could not prepare the command: ${(installed.stderr || installed.stdout).trim().slice(0, 300)}`);
+      const trigger = preparationTask?.params?.trigger;
+      if (trigger) await world.writeFile('.karmax-injection/event.json', JSON.stringify(trigger, null, 2));
+      const gateway = process.env.KARMAX_PUBLIC_URL ?? process.env.KARMAX_GATEWAY_URL;
+      const job = await startJob(world, {
+        command: `export PATH="${injection}/bin:$PATH"\n${args.command}`,
+        name: 'Task command',
+        env: { ...gitEnv, ...vaultEnv, ...(minted ? { KARMAX_TOKEN: minted.token } : {}), ...(gateway ? { KARMAX_GATEWAY_URL: gateway } : {}),
+          ...(trigger ? { TAVYA_EVENT: `${injection}/event.json` } : {}) },
+      });
+      (await store.kvSet(key, JSON.stringify({ jobId: job.id, ...(minted ? { tokenId: minted.record.id } : {}) })));
+      (await record(args.taskId, 'command.started', { jobId: job.id, command: args.command.slice(0, 2000),
+        ...(skippedEnv.length ? { skipped: skippedEnv.map(({ source, reason }) => `${source}: ${reason}`) } : {}) }));
+      return { jobId: job.id };
+    },
+
+    /** The outcome of `startTaskCommand`'s job once it has ended: its exit code
+     *  and output tail with every secret the task received scrubbed. Its token
+     *  is revoked, so one the output printed is already dead. */
+    async taskCommandResult(args: { taskId: string; worldHandle: WorldHandle; runKey: string }):
+      Promise<{ state: 'running' | 'exited' | 'lost'; exitCode?: number; tail: string }> {
+      const saved = JSON.parse((await store.kvGet(`task-command:${args.taskId}:${args.runKey}`)) ?? 'null') as { jobId: string; tokenId?: string } | null;
+      if (!saved) return { state: 'lost', tail: 'The command was never started.' };
+      const world = await openWorld(args.worldHandle, args.taskId);
+      const [job] = await jobStatuses(world, [saved.jobId], { tailLines: 80 });
+      if (job?.state === 'running') return { state: 'running', tail: '' };
+      if (saved.tokenId) await deps.tokens?.revokeById(saved.tokenId);
+      const scrubber = await new TaskSecrets({ store, broker: deps.broker, cardDetails: paymentCardDetails(store, deps.paymentRegistry) },
+        (await secretScope(store, args.taskId, (await store.getTask(args.taskId)) ?? null))).refresh();
+      const tail = scrubber.scrub(job?.tail ?? '').slice(-8000);
+      const exited = job?.state === 'exited' && job.exitCode !== undefined;
+      (await record(args.taskId, 'command.done', { jobId: saved.jobId, ...(exited ? { exitCode: job!.exitCode } : { state: job?.state ?? 'missing' }) }));
+      return exited ? { state: 'exited', exitCode: job!.exitCode!, tail } : { state: 'lost', tail: tail || 'The command stopped without an exit code.' };
     },
 
     async pendingServiceConnections(taskId: string): Promise<number> {

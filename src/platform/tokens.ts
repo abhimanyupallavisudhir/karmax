@@ -458,6 +458,12 @@ export class TokenAuthority {
     return false;
   }
 
+  /** Revoke a token known only by id (its value is never stored). */
+  async revokeById(tokenId: string) {
+    for (const [digest, record] of this.tokens) if (record.id === tokenId) this.tokens.delete(digest);
+    (await this.store?.revokeScopedToken({ tokenId }));
+  }
+
   async revoke(token: string) {
     const digest = this.digest(token);
     const record = this.tokens.get(digest);

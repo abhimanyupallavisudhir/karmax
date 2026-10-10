@@ -88,6 +88,17 @@ const remoteField = (): FieldSpec => ({
   scopes: ['project', 'global'],
   bind: 'project',
 });
+// software-dev ≥1.28: Do runs the task's own code instead of the agent
+// (wiki planned/external-connectors-and-automations).
+const commandField = (): FieldSpec => ({
+  name: 'command', type: 'text', label: 'Command', scopes: ['task'], bind: 'top', placeholder: 'python scripts/triage.py',
+  help: 'Runs in the task’s world instead of the agent, with the same access. Changes it makes go to Review; with none, the task finishes by itself.',
+});
+const onCommandFailureField = (): FieldSpec => ({
+  name: 'onCommandFailure', type: 'select', label: 'If the command fails',
+  options: ['fail', 'agent'], optionLabels: { fail: 'Stop', agent: 'Hand it to the agent' },
+  default: 'fail', scopes: ['task', 'project'], bind: 'top',
+});
 const otherAttemptsField = (): FieldSpec => ({
   name: 'otherAttempts', type: 'select', label: 'Other task attempts',
   help: 'ask — the human or agent reviewer chooses Keep or Cancel; without a reviewer, keep. Keep allows other proposals to continue and merge. The first attempt entering Merge fixes the choice for its group.',
@@ -437,7 +448,7 @@ export interface WorkflowManifest {
 export const MANIFESTS: WorkflowManifest[] = [
   {
     name: 'software-dev',
-    version: '1.27.0',
+    version: '1.28.0',
     description: `World → do/wait → review → optional per-PR provider/external landing or canonical ${BRAND} fallback admission; lifecycle restoration rebuilds proposal prerequisites, and task views track GitHub’s actual PR state.`,
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
@@ -476,6 +487,8 @@ export const MANIFESTS: WorkflowManifest[] = [
       // in-flight up to the point of no return (SPEC §5.5); software-dev's update
       // validator still gates the IDENTITY swap (provider/session) per role.
       agentField('do', 'Agent', 'always'),
+      commandField(),
+      onCommandFailureField(),
       baseField(),
       targetField(),
       repoBranchesField(),
@@ -546,7 +559,7 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'goal',
-    version: '1.27.0',
+    version: '1.28.0',
     description: 'Software Dev in autonomous completion mode with prerequisite-aware lifecycle restoration, GitHub-authoritative PR state, per-PR multi-repository landing ownership, canonical fallback admission, and reviewed adoption of task-created resources.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
@@ -556,7 +569,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     // goal delegates to softwareDev, so it shares the Do/Review machinery.
     roles: [DO_ROLE, ...(RESOLVE_AGENT_ENABLED ? [LEGACY_RESOLVE_ROLE] : []), RESPONDER_ROLE, CONFIRM_ROLE],
     stages: SOFTWARE_DEV_STAGES,
-    params: [promptField(), agentField('do', 'Agent'), baseField(), targetField(), repoBranchesField(), computerField(), reposField(), copyGlobsField(), remoteField(), landingAuthorityField(), responderField(), confirmerField()],
+    params: [promptField(), agentField('do', 'Agent'), commandField(), onCommandFailureField(), baseField(), targetField(), repoBranchesField(), computerField(), reposField(), copyGlobsField(), remoteField(), landingAuthorityField(), responderField(), confirmerField()],
   },
   {
     name: 'merge-only',
