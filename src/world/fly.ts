@@ -65,7 +65,7 @@ export class FlyDriver implements VmDriver {
 
   constructor(private fetchImpl: Fetch = fetch, private pollMs = 1_000) {}
 
-  shape(resources: MachineShape | undefined, _connection: ResolvedWorldProviderConnection): VmShape {
+  shape(resources: MachineShape | undefined): VmShape {
     const diskGb = resources?.diskGb ?? FLY_DEFAULT_DISK_GB;
     if (diskGb > FLY_MAX_DISK_GB) throw new Error(`A Fly.io volume holds at most ${FLY_MAX_DISK_GB} GB, not ${diskGb} GB`);
     const guest = flyGuest({ cpu: resources?.cpu ?? 2, memoryMb: resources?.memoryMb ?? 2048 });

@@ -3,7 +3,7 @@ import * as __asyncCollections from '../util/async-collections.js';
 import { setImmediate as yieldToEventLoop } from 'node:timers/promises';
 import type { Store } from '../store/db.js';
 import type { Project, RunnerPool, WorldHandleRef } from '../domain/types.js';
-import type { ProviderSandboxRef } from './types.js';
+import type { ProviderSandboxRef, WorldHandle } from './types.js';
 import { describeMachine, machineShape, sameMachine, type MachineShape } from '../domain/computer.js';
 import type { WorldRegistry } from './registry.js';
 import type { WorldCheckpointService } from './checkpoint.js';
@@ -331,7 +331,7 @@ export class WorldLifecycleManager {
         await this.worlds.withOperation(candidate.handle.id, async () => {
           const current = await this.store.worldStateSnapshot(candidate.handle.id);
           if (current?.state !== 'parked' || current.generation !== (candidate.handle.generation ?? 1)) return;
-          const result = await provider.resize!(candidate.handle as any, resize.to);
+          const result = await provider.resize!(candidate.handle as WorldHandle, resize.to);
           await this.store.updateWorldMeta(candidate.handle, { computer: resize.to, machine: result.machine });
           await this.recordLifecycle(candidate.handle, 'world.resized', { from: resize.from, to: resize.to, inPlace: true });
           await this.checkpoints.addNotice?.(candidate.handle.id, inPlaceResizeNotice(resize.to));

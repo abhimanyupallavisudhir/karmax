@@ -67,7 +67,7 @@ describe('the computer in the World section', () => {
     const vm = (kind: string) => ({ ...world, kind, meta: { computer: { diskGb: 100 }, machine: { cpu: 2, memoryMb: 2048, diskGb: 100 } } }) as any;
     const fly = assemblePrompt({ profile, role: 'do', task: task({ kind: 'human', audience: ['@creator'] }), world: vm('fly') });
     expect(fly).toContain('Computer: 2 CPU · 2 GB · 100 GB disk (up to 500 GB of disk). Everything on its disk, Git-ignored files included, survives pauses.');
-    expect(fly).toMatch(/\{"computer": \{"diskGb": 200\}\}\}\)\: it grows at once/);
+    expect(fly).toMatch(/\{"computer": \{"diskGb": 200\}\}\}\): it grows at once/);
     expect(fly).not.toContain('do not carry over');
     const hetzner = assemblePrompt({ profile, role: 'do', task: task({ kind: 'human', audience: ['@creator'] }), world: vm('hetzner'),
       computer: { cpu: 4, memoryMb: 8192, diskGb: 100 } });

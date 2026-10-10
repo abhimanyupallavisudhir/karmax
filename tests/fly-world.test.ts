@@ -37,8 +37,8 @@ describe('Fly.io sizes and prices', () => {
   });
 
   it('refuses a disk larger than a Fly volume can be', () => {
-    expect(() => new FlyDriver().shape({ diskGb: 600 }, connection('x'))).toThrow(/at most 500 GB/);
-    expect(new FlyDriver().shape(undefined, connection('x'))).toEqual({ cpu: 2, memoryMb: 2048, diskGb: 20 });
+    expect(() => new FlyDriver().shape({ diskGb: 600 })).toThrow(/at most 500 GB/);
+    expect(new FlyDriver().shape(undefined)).toEqual({ cpu: 2, memoryMb: 2048, diskGb: 20 });
   });
 });
 

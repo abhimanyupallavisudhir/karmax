@@ -377,7 +377,7 @@ class VmSession {
 }
 
 function exports(env: Record<string, string> | undefined): string {
-  const value = { ...(env ?? {}) };
+  const value = { ...env };
   // Host credential paths mean nothing in the VM, and credentials must not cross into it.
   delete value.GIT_SSH_COMMAND; delete value.GIT_ASKPASS; delete value.GH_TOKEN;
   return Object.entries(value).filter(([key]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(key))
