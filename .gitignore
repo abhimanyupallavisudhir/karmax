@@ -34,3 +34,4 @@ __pycache__/
 .idea/
 .vscode/
 *.swp
+environments/vm/out/
