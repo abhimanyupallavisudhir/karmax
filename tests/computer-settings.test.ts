@@ -139,7 +139,7 @@ describe('Computer defaults', () => {
       const editor = (await tokens.mintPrincipal('user:editor', ['task:edit', 'task:read'], project.id)).token;
       await expect(api.updateParams(editor, task.id, { computer: { diskGb: 30 } })).rejects.toThrow('Disk can be at most 29 GB on this E2B account');
       expect((await api.updateParams(editor, task.id, { computer: { diskGb: 29 } })).applied).toContain('computer');
-    } finally { ceilings.e2b = before; }
+    } finally { ceilings.e2b = before!; }
   });
 
   it('keeps a task\'s own computer sparse and validated', async () => {
@@ -281,6 +281,6 @@ describe('Computer defaults', () => {
       // Over the gateway too (UI/API parity).
       const viaHttp = await json('POST', `/api/tasks/${task.id}/bigger-disk`, {});
       expect(viaHttp).toMatchObject({ status: 400, body: { error: expect.stringMatching(/largest disk this E2B account allows/) } });
-    } finally { ceilings.e2b = before; }
+    } finally { ceilings.e2b = before!; }
   });
 });

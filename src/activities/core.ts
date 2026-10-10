@@ -3793,16 +3793,45 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
      * awake meanwhile; if its stream drops (a provider pause, a worker restart)
      * the loop re-reads the job files and starts another. Cancelled when the
      * task gets a message or is cancelled. */
-    async awaitJobs(handle: WorldHandleRef, jobs: string[], untilMs: number): Promise<{ finished: boolean; summary: string }> {
+    async awaitJobs(handle: WorldHandleRef, jobs: string[], untilMs: number): Promise<{ finished: boolean; summary: string; disk?: boolean }> {
       const ctx = activityContext.current();
       const signal = ctx.cancellationSignal;
       const beat = setInterval(() => ctx.heartbeat(), 5_000);
+      let diskWatch: ReturnType<typeof setInterval> | undefined;
       try {
         const world = await openWorld(handle as WorldHandle);
+        // A job can fill the disk while its agent waits (pramana#3's rebuild):
+        // measure it every minute, and past 90% wake the agent to act.
+        let diskAlert: string | undefined;
+        let wake = () => {};
+        if (isRemote(handle.kind)) {
+          const projectId = String((handle as WorldHandle).meta?.projectId ?? '');
+          const organizationId = (projectId ? (await store.getProject(projectId))?.organizationId : undefined) ?? 'org_personal';
+          let measuring = false;
+          diskWatch = setInterval(() => {
+            if (measuring || diskAlert) return;
+            measuring = true;
+            void (async () => {
+              const check = await measureWorldDisk(world, handle.id);
+              if (!check) return;
+              const ratio = diskRatio(check.disk);
+              if (ratio < DISK_REARM_RATIO) { (await store.kvDelete(`disk-alert:${handle.id}`)); return; }
+              if (ratio < DISK_WARN_RATIO || (await store.kvGet(`disk-alert:${handle.id}`))) return;
+              (await store.kvSet(`disk-alert:${handle.id}`, String(Date.now())));
+              const largest = await largestWorldPaths(world).catch(() => undefined);
+              diskAlert = diskNotice({ kind: 'nearly-full', disk: check.disk, largest, taskId: handle.id,
+                maxDiskGb: await knownMaxDiskGb(organizationId, handle.kind) });
+              wake();
+            })().catch(() => undefined).finally(() => { measuring = false; });
+          }, Number(process.env.KARMAX_DISK_WATCH_MS) || 60_000);
+          diskWatch.unref?.();
+        }
         for (;;) {
           signal.throwIfAborted();
           ctx.heartbeat();
           const running = (await jobStatuses(world, jobs)).filter((job) => job.state === 'running').map((job) => job.id);
+          if (diskAlert && running.length)
+            return { finished: false, disk: true, summary: `${diskAlert}\n\n${describeJobs(await jobStatuses(world, jobs, { tailLines: 30 }))}` };
           if (!running.length || Date.now() >= untilMs) {
             return { finished: !running.length, summary: describeJobs(await jobStatuses(world, jobs, { tailLines: 30 })) };
           }
@@ -3811,13 +3840,15 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           let abort = () => {};
           await new Promise<void>((resolve) => {
             abort = resolve;
+            wake = resolve;
             waiter.onExit(() => resolve());
             signal.addEventListener('abort', abort, { once: true });
           });
+          wake = () => {};
           signal.removeEventListener('abort', abort);
-          if (signal.aborted) await Promise.resolve(waiter.kill()).catch(() => undefined);
+          if (signal.aborted || diskAlert) await Promise.resolve(waiter.kill()).catch(() => undefined);
         }
-      } finally { clearInterval(beat); }
+      } finally { clearInterval(beat); if (diskWatch) clearInterval(diskWatch); }
     },
 
     async pendingServiceConnections(taskId: string): Promise<number> {
