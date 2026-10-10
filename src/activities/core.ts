@@ -107,7 +107,7 @@ import { paths } from '../config/paths.js';
 import { hostLocal as deploymentHostLocal } from '../config/deployment.js';
 import type { ObjectStore } from '../store/objects.js';
 import { conversationImportObjectKey } from '../store/conversation-imports.js';
-import { ensureProjectWikiRepository, PROJECT_WIKI_BRANCH, setProjectWikiRemote } from '../wiki/repository.js';
+import { ensureProjectWikiRepositoryAsync, PROJECT_WIKI_BRANCH, setProjectWikiRemote } from '../wiki/repository.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { manifest, roleCeiling } from '../contrib/manifests.js';
@@ -1417,7 +1417,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // platform API, so attaching the wiki there would secretly reintroduce a
       // branch, worktree, Git credential, and merge into an otherwise non-Git run.
       const wikiRoot = project
-        ? ensureProjectWikiRepository(deps.contentDir ?? paths().content, project.id)
+        ? await ensureProjectWikiRepositoryAsync(deps.contentDir ?? paths().content, project.id)
         : undefined;
       if (project && !(await store.projectWiki(project.id))) (await store.setProjectWikiRepository(project.id));
       const wikiRepository = project ? (await store.projectWiki(project.id))?.repository : undefined;
