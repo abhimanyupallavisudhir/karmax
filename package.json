@@ -72,7 +72,7 @@
     "@types/pg": "^8.15.5",
     "@types/ws": "^8.5.13",
     "@vitest/coverage-v8": "^4.1.11",
-    "dotenv": "^17.4.2",
+    "dotenv": "^18.0.5",
     "oxlint": "1.85.0",
     "playwright": "1.63.0",
     "typescript": "^5.7.2",
