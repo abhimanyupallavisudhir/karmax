@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { bootHarness, Harness } from './helpers/harness.js';
 import { ProfileResolver } from '../src/agent/profiles.js';
+import { EXPLANATIONS_ENABLED } from '../src/config/features.js';
 
 describe('profile + account management settings backend', () => {
   let h: Harness;
@@ -65,7 +66,7 @@ describe('profile + account management settings backend', () => {
     const edited = await fetch(`${base}/api/accounts`, { headers: auth() }).then(J);
     expect(edited.handles).toContain('openrouter:explain-new');
     expect(edited.handles).not.toContain('openrouter:explain-old');
-    expect(h.broker.resolve('openrouter:explain-new', { caps: ['use-credential:*'] })).toBe('new-secret');
+    expect(await h.broker.resolve('openrouter:explain-new', { caps: ['use-credential:*'] })).toBe('new-secret');
     expect(JSON.parse((await h.store.kvGet('credpolicy:organization:org_personal'))!)).toMatchObject({
       order: [nextKey], explainerOnly: [nextKey],
     });
@@ -73,12 +74,13 @@ describe('profile + account management settings backend', () => {
     expect(credentials.credentials.find((credential: any) => credential.key === nextKey)).toMatchObject({
       provider: 'openrouter', account: 'explain-new', kind: 'key',
     });
-    expect(credentials.global.modes[nextKey]).toBe('explainer-only');
+    // The policy keeps the key's mode; while explanations are off it reads as Off.
+    expect(credentials.global.modes[nextKey]).toBe(EXPLANATIONS_ENABLED ? 'explainer-only' : 'off');
     expect(credentials.global.enabled).not.toContain(nextKey);
 
     const deleted = await fetch(`${base}/api/accounts/keys/openrouter/explain-new`, { method: 'DELETE', headers: auth() });
     expect(deleted.status).toBe(200);
-    expect(h.broker.hasHandle('openrouter:explain-new')).toBe(false);
+    expect(await h.broker.hasHandle('openrouter:explain-new')).toBe(false);
     expect(JSON.parse((await h.store.kvGet('credpolicy:organization:org_personal'))!)).toMatchObject({
       order: [], explainerOnly: [],
     });

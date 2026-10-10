@@ -26,7 +26,7 @@ describe('config homes + scrubbed env (SPEC §7.3)', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it('keeps same-named organization logins in disjoint homes and preserves legacy personal homes', () => {
+  it('keeps same-named organization logins in disjoint homes and preserves legacy personal homes', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-ch-org-'));
     const mgr = new ConfigHomeManager(dir);
     const personal = mgr.ensure('claude', 'work');
@@ -39,7 +39,7 @@ describe('config homes + scrubbed env (SPEC §7.3)', () => {
     expect(mgr.list('org_beta').map((home) => home.path)).toEqual([beta]);
     expect(mgr.list().map((home) => home.path)).toEqual([personal]);
 
-    mgr.removeOrganization('org_acme');
+    await mgr.removeOrganization('org_acme');
     expect(fs.existsSync(acme)).toBe(false);
     expect(fs.existsSync(beta)).toBe(true);
     fs.rmSync(dir, { recursive: true, force: true });
@@ -443,17 +443,17 @@ describe('account login (SPEC §7.3 / §6.2)', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it('deletes and renames a login config home (1b)', () => {
+  it('deletes and renames a login config home (1b)', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-mgmt-'));
     const homes = new ConfigHomeManager(dir);
     const home = homes.ensure('claude', 'old');
     fs.writeFileSync(path.join(home, '.credentials.json'), JSON.stringify({
       claudeAiOauth: { accessToken: 'access', refreshToken: 'refresh' },
     }));
-    const moved = homes.rename('claude', 'old', 'new');
+    const moved = await homes.rename('claude', 'old', 'new');
     expect(fs.existsSync(path.join(moved, '.credentials.json'))).toBe(true); // creds carried over
     expect(homes.list().map((h) => h.account)).toContain('new');
-    homes.remove('claude', 'new');
+    await homes.remove('claude', 'new');
     expect(homes.list().map((h) => h.account)).not.toContain('new');
     fs.rmSync(dir, { recursive: true, force: true });
   });

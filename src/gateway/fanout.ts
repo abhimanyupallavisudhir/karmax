@@ -7,7 +7,8 @@ import { setImmediate as yieldTurn } from 'node:timers/promises';
  * Durable gateway fan-out. The event table, not an in-process emitter, is the
  * cursor source, so another worker/gateway replica can append an event and all
  * connected browsers still observe it. The local bus only wakes the poller to
- * reduce latency; correctness comes from monotonically increasing event.seq.
+ * reduce latency. Pages end at the event watermark, so the cursor never passes
+ * an event whose transaction is still to commit.
  */
 type RoutedEvent = { event: KarmaxEvent & { seq?: number }; projectId?: string; siblingAttempt?: boolean; bytes: number };
 interface Subscriber {
@@ -107,6 +108,18 @@ export class DurableEventFanout {
     });
   }
 
+  private async route(rows: Array<KarmaxEvent & { seq: number }>): Promise<void> {
+    if (!rows.length) return;
+    const routes = await this.store.taskEventRoutes(rows.map(row => row.taskId));
+    for (const event of rows) {
+      if (this.closed) break;
+      this.cursor = Math.max(this.cursor, event.seq);
+      const route = routes.get(event.taskId);
+      const routed = { event, projectId: route?.projectId, siblingAttempt: route?.siblingAttempt, bytes: Buffer.byteLength(JSON.stringify(event)) };
+      for (const subscriber of this.listeners) this.deliver(subscriber, routed);
+    }
+  }
+
   private async drain(): Promise<void> {
     if (this.draining || this.closed) return;
     this.draining = true;
@@ -117,14 +130,7 @@ export class DurableEventFanout {
         // it here would skip the middle of bursts larger than one page.
         const rows = await this.store.nextEventsSince(this.cursor, 500);
         if (!rows.length) break;
-        const routes = await this.store.taskEventRoutes(rows.map(row => row.taskId));
-        for (const event of rows) {
-          if (this.closed) break;
-          this.cursor = Math.max(this.cursor, event.seq ?? 0);
-          const route = routes.get(event.taskId);
-          const routed = { event, projectId: route?.projectId, siblingAttempt: route?.siblingAttempt, bytes: Buffer.byteLength(JSON.stringify(event)) };
-          for (const subscriber of this.listeners) this.deliver(subscriber, routed);
-        }
+        await this.route(rows);
         if (rows.length < 500) break;
         await yieldTurn();
       }

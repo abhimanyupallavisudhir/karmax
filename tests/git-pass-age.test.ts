@@ -173,7 +173,7 @@ describe('age and mounted Git password stores', () => {
     await expect(
       service.connect('pass-git', JSON.stringify({ ...f.config, ageIdentity: 'AGE-SECRET-KEY-1' + 'A'.repeat(58) })),
     ).rejects.toThrow();
-    expect(service.secretFor('pass-git')).toBe(JSON.stringify(f.config));
+    expect(await service.secretFor('pass-git')).toBe(JSON.stringify(f.config));
     await expect(
       service.connect('pass-git', JSON.stringify({ ...f.config, repositoryUrl: path.join(f.root, 'missing.git') })),
     ).rejects.toThrow();
@@ -248,7 +248,7 @@ describe('age and mounted Git password stores', () => {
     fresh.register(connector(f.config, f.root));
     expect((await fresh.retryWrites())[0]?.error).toBeUndefined();
     expect((await fresh.pendingWrites())).toEqual([]);
-    expect(freshBroker.hasHandle(snapshot)).toBe(false);
+    expect(await freshBroker.hasHandle(snapshot)).toBe(false);
     const externalId = (await items.get(item.id))!.provenance.externalIds!['pass-git']!;
     expect((await c.pull([externalId])).items[0]?.secrets.secret).toBe('rotated-secret');
     expect(await c.list()).toHaveLength(2);
@@ -320,9 +320,9 @@ it('persists failed write-back, blocks remote conflicts and imports an explicitl
   expect((await service.retryWrites())[0]?.error).toContain('review the remote value');
   const blocked = await service.sync('pass-git', ['example']);
   expect(blocked.failures).toHaveLength(1);
-  expect(items.readSecret((await items.get(id))!, 'password')).toBe('local-new');
+  expect(await items.readSecret((await items.get(id))!, 'password')).toBe('local-new');
   await service.acceptRemote(id);
-  expect(items.readSecret((await items.get(id))!, 'password')).toBe('remote-new');
+  expect(await items.readSecret((await items.get(id))!, 'password')).toBe('remote-new');
   expect((await service.describe())[0]?.pendingWrites).toEqual([]);
   (await items.save({ id, type: 'login', secrets: { password: 'retry-new', totp: 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ' } }));
   fs.writeFileSync(hook, '#!/bin/sh\nexit 1\n', { mode: 0o700 });
@@ -347,7 +347,7 @@ it('persists failed write-back, blocks remote conflicts and imports an explicitl
   };
   const raced = await service.sync('pass-git', ['example']);
   expect(raced.failures[0]?.error).toContain('changed during import');
-  expect(items.readSecret((await items.get(id))!, 'password')).toBe('concurrent-local');
+  expect(await items.readSecret((await items.get(id))!, 'password')).toBe('concurrent-local');
 
   expect((await service.describe())[0]?.pendingWrites).toEqual([]);
   active.pull = originalPull;
@@ -356,7 +356,7 @@ it('persists failed write-back, blocks remote conflicts and imports an explicitl
   expect((await service.propagate(id, ['password']))?.error).toBeTruthy();
   expect((await service.discardWrites('pass-git'))).toBe(1);
   expect((await service.describe())[0]?.pendingWrites).toEqual([]);
-  expect(items.readSecret((await items.get(id))!, 'password')).toBe('dismiss-local');
+  expect(await items.readSecret((await items.get(id))!, 'password')).toBe('dismiss-local');
   expect((await service.propagate(id, ['password']))?.error).toBeTruthy();
   (await service.setConfig('pass-git', { writeBack: false }));
   (await items.delete(id));

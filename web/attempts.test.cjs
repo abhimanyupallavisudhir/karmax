@@ -47,7 +47,9 @@ global.tagChips = () => '';
 global.pipeline = () => '';
 eval(extractFn('customBranch'));
 global.attentionChip = () => '';
-global.projectChip = () => '';
+global.projectLabel = () => '';
+global.taskHasUnreadAsk = () => false;
+global.markTaskAsksRead = () => {};
 eval(extractFn('taskRow'));
 
 let pass = 0, fail = 0;
@@ -181,6 +183,7 @@ eval(extractFn('wireAttempts'));
   };
   global.scheduleTaskPageRender = () => {};
   global.syncLiveWatch = () => {};
+  eval(extractFn('explanationsEnabled'));
   eval(extractFn('mergeTaskHistory'));
   eval(extractFn('refreshTaskHistory'));
   eval(extractFn('showDraftPage'));

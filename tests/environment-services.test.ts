@@ -7,6 +7,7 @@ import { ProjectEnvironment, localRepositoryFiles, parseDevcontainer, proposeEnv
   type RepositoryFiles } from '../src/store/project-environment.js';
 import { activateProjectRuntime } from '../src/world/project-runtime.js';
 import type { World } from '../src/world/types.js';
+import { sizedTemplateName } from '../src/world/e2b-template.js';
 import { buildEnvironment, bootCommands, environmentDockerfile, environmentArtifactName, setupCommands, type BuilderSandbox } from '../src/world/environment-build.js';
 import { ProjectServices, composeServiceProposals } from '../src/store/project-services.js';
 import { DEFAULT_E2B_TEMPLATE } from '../src/world/e2b-template.js';
@@ -128,6 +129,26 @@ describe('project environment proposals and builds', () => {
     expect(calls).toContain('npm ci');
     expect(calls).toContain(environmentArtifactName('p', 'd', 'attempt-1'));
     expect(killed).toBe(true);
+  });
+
+  // Snapshots keep the size of the sandbox they were taken from, so a project
+  // whose Computer is larger builds its environment at that size.
+  it('builds an E2B environment at the project\'s computer size', async () => {
+    const shape = { cpu: 4, memoryMb: 8192, diskGb: 40 };
+    const ensured: unknown[] = [];
+    let builderBase: string | undefined;
+    const builder: BuilderSandbox = {
+      async run() { return { exitCode: 0, stderr: '', stdout: '' }; },
+      async createSnapshot() { return { snapshotId: 'snapshot-sized' }; },
+      async kill() {},
+    };
+    const sized = sizedTemplateName('compute-template', shape);
+    expect(await buildEnvironment({ provider: 'e2b', projectId: 'p', digest: 'd', spec: { setup: ['true'] },
+      connection: { template: 'compute-template', apiKey: 'k' }, resources: { ...shape },
+      ensureTemplate: async (...args) => { ensured.push(args); },
+      createBuilderSandbox: async (base) => { builderBase = base; return builder; } })).toEqual({ ref: 'snapshot-sized', base: sized });
+    expect(ensured).toEqual([['compute-template', sized, shape, { apiKey: 'k' }]]);
+    expect(builderBase).toBe(sized);
   });
 
   // With no template under Compute, E2B would start the builder from its stock

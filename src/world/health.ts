@@ -17,7 +17,8 @@ const RECENT_MS = 5 * 60_000;
  * Returns undefined unless the metrics show the sandbox was the problem, so a
  * healthy sandbox never masks a real agent error.
  */
-export function diagnoseMetrics(samples: MemorySample[], { since, now }: { since: number; now: number }): WorldDiagnosis | undefined {
+export function diagnoseMetrics(samples: MemorySample[], { since, now, silentMs = SILENT_MS }:
+  { since: number; now: number; /** Longer than the provider's sampling interval plus its lag. */ silentMs?: number }): WorldDiagnosis | undefined {
   const ordered = samples.filter(s => s.memTotal > 0).sort((a, b) => a.at - b.at);
   const last = ordered.at(-1);
   if (!last) return undefined;
@@ -25,7 +26,7 @@ export function diagnoseMetrics(samples: MemorySample[], { since, now }: { since
     .reduce((top, s) => (s.memUsed / s.memTotal > top.memUsed / top.memTotal ? s : top));
   const memoryExhausted = peak.memUsed / peak.memTotal >= EXHAUSTED;
   // A resumed sandbox has no samples from its pause, and metrics lag a little.
-  const silent = now - Math.max(last.at, since) > SILENT_MS;
+  const silent = now - Math.max(last.at, since) > silentMs;
   if (!memoryExhausted && !silent) return undefined;
   const memory = `memory reached ${Math.round(peak.memUsed / 2 ** 20)} of ${Math.round(peak.memTotal / 2 ** 20)} MB `
     + `(${Math.round((peak.memUsed / peak.memTotal) * 100)}%) at ${clock(peak.at)}`;

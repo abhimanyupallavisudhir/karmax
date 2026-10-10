@@ -6,9 +6,11 @@ import crypto from 'node:crypto';
 import {
   claudeAccessToken,
   claudeAccessTokenExpiresAt,
+  claudeSignIn,
   hasClaudeNativeCredential,
   scrubbedEnv,
 } from '../autonomy/config-homes.js';
+import { modelLoginsFor, type ModelLogins } from '../autonomy/model-logins.js';
 import { trackProcess } from '../util/processes.js';
 import { withTimeout } from '../util/timeout.js';
 import { CodexAppServerClient } from './codex-app-server-client.js';
@@ -73,8 +75,9 @@ export type UsageResult = UsageSnapshot | UsageUnavailable;
 /** Injectable runner (tests): given the probe args, return combined stdout+stderr. */
 export type UsageRunner = (configDir: string) => Promise<string>;
 
-/** Injectable Codex app-server request (tests); returns account/rateLimits/read. */
-export type CodexUsageRunner = () => Promise<unknown>;
+/** Injectable Codex app-server request (tests), given the home it runs in;
+ * returns account/rateLimits/read. */
+export type CodexUsageRunner = (configHome?: string) => Promise<unknown>;
 const codexRefreshes = new Map<string, { promise: Promise<unknown>; force: boolean }>();
 const claudeRefreshes = new Map<string, Promise<string>>();
 /** Codex authenticates with its access token (about ten days) and refreshes it
@@ -303,6 +306,7 @@ export async function probeClaudeUsage(
   opts: { configHome?: string; now?: number; timeoutMs?: number; run?: UsageRunner } = {},
 ): Promise<UsageResult> {
   const now = opts.now ?? Date.now();
+  if (opts.configHome) await modelLoginsFor(opts.configHome)?.sync(opts.configHome);
   const cred = claudeCredentialPath(opts.configHome);
   // Only a full-login `.credentials.json` yields usage. setup-token homes (only
   // karmax-oauth.json) or logged-out homes are reported unavailable, not probed.
@@ -396,7 +400,10 @@ function runUsageCli(configDir: string, timeoutMs: number): Promise<string> {
 /** Refresh the ONE canonical Claude login and return its current access token.
  * Remote turns call this before projection and after terminal OAuth expiry;
  * their sandboxes never receive the rotating refresh token. Concurrent calls
- * share one provider process so a refresh-token family has one writer.
+ * share one provider process so a refresh-token family has one writer; a
+ * managed login (in the vault, data epoch 6) refreshes under its database
+ * lease on a private copy, so that holds across processes and hosts too, and
+ * a caller that waited takes the refresh another one completed.
  *
  * Claude Code refreshes only inside the last five minutes of an access token,
  * so a still-valid token may come back unchanged; callers must accept it. A
@@ -404,17 +411,29 @@ function runUsageCli(configDir: string, timeoutMs: number): Promise<string> {
  * refresh token expired about a month after sign-in, or was revoked): that is
  * a hard credential failure a person resolves by signing in again. */
 export async function refreshClaudeAccessToken(
-  opts: { configHome: string; timeoutMs?: number; run?: UsageRunner },
+  opts: { configHome: string; timeoutMs?: number; run?: UsageRunner; logins?: ModelLogins },
 ): Promise<string> {
   const key = path.resolve(opts.configHome);
   const existing = claudeRefreshes.get(key);
   if (existing) return existing;
-  const created = (async () => {
-    if (opts.run) await opts.run(key);
-    else await runUsageCli(key, opts.timeoutMs ?? 30_000).catch((error) => {
+  const logins = modelLoginsFor(key, opts.logins);
+  const cli = async (home: string) => {
+    if (opts.run) await opts.run(home);
+    else await runUsageCli(home, opts.timeoutMs ?? 30_000).catch((error) => {
       // A signed-out login makes the CLI exit non-zero; judge the credential file.
-      if (claudeAccessToken(key)) throw error;
+      if (claudeAccessToken(home)) throw error;
     });
+  };
+  const created = (async () => {
+    await logins?.sync(key);
+    // The sign-in's own deadline is the real one: past it a refresh only gets
+    // the login signed out (Claude Code blanks its tokens), so none is
+    // attempted, and an access token that is still valid stays usable.
+    const signIn = claudeSignIn(key);
+    if (!signIn || signIn.signedOut || signIn.expiresAt > Date.now()) {
+      if (logins) await logins.refresh(key, cli, { skipIfChanged: true });
+      else await cli(key);
+    }
     const token = claudeAccessToken(key);
     const expiresAt = claudeAccessTokenExpiresAt(key);
     if (!token || (expiresAt !== undefined && expiresAt <= Date.now())) throw claudeSignedOut(key);
@@ -455,6 +474,7 @@ export async function ensureClaudeAccessTokenFresh(
 ): Promise<boolean> {
   const now = opts.now ?? Date.now();
   const minValidityMs = opts.minValidityMs ?? CLAUDE_REMOTE_ACCESS_TOKEN_SAFETY_MS;
+  await modelLoginsFor(opts.configHome)?.sync(opts.configHome);
   const accessToken = claudeAccessToken(opts.configHome);
   const expiresAt = claudeAccessTokenExpiresAt(opts.configHome);
   if (accessToken && expiresAt !== undefined && expiresAt - now >= minValidityMs) return false;
@@ -470,9 +490,12 @@ export async function ensureClaudeAccessTokenFresh(
 
 /** Refresh the ONE canonical Codex login and return current limits. Concurrent
  * callers share a process because OAuth refresh-token rotation is single-writer:
- * two app-servers refreshing the same token family can revoke each other's result. */
+ * two app-servers refreshing the same token family can revoke each other's result.
+ * A managed login (data epoch 6) runs its app-server on a private copy under the
+ * login's database lease, so that holds across processes; a forced refresh
+ * someone else completed meanwhile is taken instead (then no limits are read). */
 export async function refreshCodexLogin(
-  opts: { configHome?: string; timeoutMs?: number; run?: CodexUsageRunner; force?: boolean } = {},
+  opts: { configHome?: string; timeoutMs?: number; run?: CodexUsageRunner; force?: boolean; logins?: ModelLogins } = {},
 ): Promise<unknown> {
   const key = path.resolve(opts.configHome ?? process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex'));
   const existing = codexRefreshes.get(key);
@@ -484,7 +507,10 @@ export async function refreshCodexLogin(
     await existing.promise.catch(() => undefined);
     return refreshCodexLogin(opts);
   }
-  const created = (opts.run ? opts.run() : runCodexUsageCli(opts.configHome, opts.timeoutMs ?? 30_000, !!opts.force))
+  const logins = modelLoginsFor(key, opts.logins);
+  const call = (home: string | undefined) => opts.run ? opts.run(home)
+    : runCodexUsageCli(home, opts.timeoutMs ?? 30_000, !!opts.force, opts.configHome);
+  const created = (logins ? logins.refresh(key, call, { skipIfChanged: !!opts.force }).then(({ result }) => result) : call(opts.configHome))
     .finally(() => {
       if (codexRefreshes.get(key)?.promise === created) codexRefreshes.delete(key);
     });
@@ -511,6 +537,7 @@ export async function ensureCodexLoginFresh(
   const refreshAheadMs = opts.refreshAheadMs ?? CODEX_REMOTE_ACCESS_TOKEN_REFRESH_AHEAD_MS;
   const minValidityMs = opts.minValidityMs ?? CODEX_REMOTE_ACCESS_TOKEN_SAFETY_MS;
   const usable = (expiresAt: number | undefined) => expiresAt !== undefined && expiresAt - now >= minValidityMs;
+  if (opts.configHome) await modelLoginsFor(opts.configHome)?.sync(opts.configHome);
   const expiresAt = codexAccessTokenExpiresAt(opts.configHome);
   if (expiresAt !== undefined && expiresAt - now >= refreshAheadMs) return false;
   opts.onRefresh?.();
@@ -565,7 +592,8 @@ function codexSignedOut(configHome?: string) {
   });
 }
 
-async function runCodexUsageCli(configHome: string | undefined, timeoutMs: number, force: boolean): Promise<unknown> {
+/** `login`: the login's own home, for messages, when `configHome` is a private copy of it. */
+async function runCodexUsageCli(configHome: string | undefined, timeoutMs: number, force: boolean, login = configHome): Promise<unknown> {
   const cmd = process.env.KARMAX_CODEX_USAGE_CMD ?? process.env.KARMAX_CODEX_EXEC_CMD ?? localProviderCli('codex');
   const env = scrubbedEnv({ provider: 'codex', configHome });
   const custody = createCustodyEnv(env);
@@ -607,7 +635,7 @@ async function runCodexUsageCli(configHome: string | undefined, timeoutMs: numbe
     // app-server reports no refresh error; a permanent one leaves no account.
     const account = await withTimeout(client.request('account/read', { refreshToken: true }), timeoutMs) as
       { account?: unknown } | undefined;
-    if (account?.account === null) throw codexSignedOut(configHome);
+    if (account?.account === null) throw codexSignedOut(login);
     return await withTimeout(client.request('account/rateLimits/read'), timeoutMs);
   } finally {
     client.close();

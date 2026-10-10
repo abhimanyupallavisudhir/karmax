@@ -23,6 +23,7 @@ export async function currentShare(store: Store, taskId: string, role: string): 
 }
 export async function revokeShare(store: Store, taskId: string, role: string) {
   return store.transaction(async () => {
+  (await store.lock(`kv:${indexKey(taskId, role)}`));
   const old = (await currentShare(store, taskId, role));
   if (old) (await store.kvDelete(`conversation-share:${old.id}`));
   (await store.kvDelete(indexKey(taskId, role)));
@@ -31,6 +32,8 @@ export async function revokeShare(store: Store, taskId: string, role: string) {
 }
 export async function createShare(store: Store, taskId: string, role: string, messages: Message[]) {
   return store.transaction(async () => {
+  // One public share per conversation: the index is rewritten under its lock.
+  (await store.lock(`kv:${indexKey(taskId, role)}`));
   const task = (await store.getTask(taskId));
   if (!task || !(await sharingPolicy(store, task.projectId)).effective) throw new Error('Public conversation sharing is disabled');
   const existing = (await currentShare(store, taskId, role));

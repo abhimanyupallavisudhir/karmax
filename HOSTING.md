@@ -93,7 +93,7 @@ install, where the operator's ambient login is the whole point.
 
 ### Diagnosing credential incidents
 
-Settings → Codex/Claude (Availability & quota) distinguishes a timed quota
+Settings → Agents (Availability & quota) distinguishes a timed quota
 exhaustion from a credential that needs attention. For the latest automatic quarantine it retains only a
 secret-safe provider diagnostic (kind, native code, HTTP status, request id,
 model, operation, retry disposition/count, and bounded message), plus the
@@ -163,7 +163,12 @@ runs only inside its HTTP router, which those routes never enter. Without the
 edge they are unmetered.
 
 Zones are independent: exhausting the signup budget does not affect the rest of
-the site. Preview origins are deliberately unmetered — they serve someone's
+the site. Resource repositories (`/resource-repositories/*`, restic in task
+worlds) are in none of them: remote worlds reach them through a Cloudflare
+Worker, so every customer's sandboxes share a few Cloudflare addresses. The app
+gives each verified repository grant its own budget instead (3,000 requests a
+minute, `GrantLimits` in `src/world/resource-repository.ts`); a request without
+a valid grant is refused after one signature check. Preview origins are deliberately unmetered — they serve someone's
 running app behind a lease, and a shared control-plane budget would throttle
 legitimate traffic.
 
@@ -366,6 +371,26 @@ or task for a workflow outside the cache replays its whole history, and the
 console and every running turn query their task's workflow. Raise
 `KARMAX_MAX_CACHED_WORKFLOWS` when a cell keeps more tasks open, as long as the
 worker's heap has room for their conversations.
+
+**Memory budget.** Cached workflows live in the worker's workflow thread, a V8
+isolate with its own heap limit, and exhausting any heap aborts the whole
+process. The container image therefore derives every heap limit from its
+cgroup memory limit, or from `KARMAX_MEMORY_LIMIT_MB` if set
+(`src/runtime/memory-budget.ts`):
+- **Process worker mode:** the gateway gets 15%, and the worker child's main
+  heap and its workflow thread get 30% each.
+- **One combined process:** each of its two isolates gets 37.5%.
+- **Native memory** keeps a quarter in both modes.
+
+Under sustained pressure on the workflow heap (used/limit at
+`KARMAX_HEAP_HIGH_WATERMARK`, default 0.8, on two checks
+`KARMAX_HEAP_CHECK_MS` apart, default 15 s), the worker rolls to a workflow
+cache half the size of what it holds. Evicted workflows replay on their next
+task, so they slow down but keep running. After a long calm it grows the cache
+back toward the configured size. `/api/metrics` reports
+`karmax_heap_used_bytes` and `karmax_heap_limit_bytes` for each heap
+(`heap="gateway|worker|workflows"`), `karmax_process_rss_bytes`, and
+`karmax_workflow_cache_{workflows,limit,shrinks_total}`.
 
 ## Payment rails
 

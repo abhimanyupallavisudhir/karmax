@@ -4,6 +4,8 @@ import type { Store } from '../../store/db.js';
 import type { CredentialBroker } from '../../autonomy/broker.js';
 import { organizationScope } from '../../autonomy/vault-keys.js';
 import { publicUrl } from './http.js';
+import { leasedOAuthRefresh } from './oauth.js';
+import { RefreshLeases } from '../../autonomy/refresh-lease.js';
 import { handleRef, recordSecretRefs } from '../../autonomy/task-secrets.js';
 
 export type McpTransport = { type: 'http' | 'sse'; url: string }
@@ -60,6 +62,8 @@ export class McpConnections {
   private handle(id: string) { return `mcp:${this.organizationId}:${id}`; }
   async save(input: any, projectId?: string): Promise<McpConnection> {
     return this.store.transaction(async () => {
+      // The organization's connection list (and its cap) is rewritten under its vault lock.
+      (await this.store.lock(`vault:${this.organizationId}`));
       if (projectId && (await this.store.getProject(projectId))?.organizationId !== this.organizationId) throw new Error('Project does not belong to this organization');
       const prior = input.id ? (await this.get(input.id, projectId)) : undefined;
       if (prior && prior.projectId !== projectId) throw new Error('Edit this connection in its owning settings');
@@ -80,7 +84,7 @@ export class McpConnections {
           const clientId = bounded(v.clientId, 2048, 'OAuth client ID').trim();
           const method = v.tokenEndpointAuthMethod ?? 'none';
           if (!['none', 'client_secret_basic', 'client_secret_post'].includes(method)) throw new Error('Unsupported OAuth client authentication method');
-          const previous = prior && !changed ? this.secret(prior).manualClient : undefined;
+          const previous = prior && !changed ? (await this.secret(prior)).manualClient : undefined;
           const secret = v.clientSecret === undefined && previous?.client_id === clientId && previous?.token_endpoint_auth_method === method
             ? previous.client_secret : v.clientSecret;
           if (method !== 'none' && (typeof secret !== 'string' || !secret || secret.length > 16384 || /[\r\n\0]/.test(secret)))
@@ -103,7 +107,7 @@ export class McpConnections {
       if (input.secrets !== undefined && auth === 'secrets') {
         secrets = validateSecrets(input.secrets, transport.type === 'stdio');
         if (input.mergeSecrets && prior && !changed && prior.auth === 'secrets') {
-          const old = this.secret(prior);
+          const old = await this.secret(prior);
           const keep = Array.isArray(input.retainSecretNames) ? input.retainSecretNames : Object.keys(old);
           secrets = validateSecrets({ ...Object.fromEntries(Object.entries(old).filter(([key]) => keep.includes(key))), ...secrets }, transport.type === 'stdio');
         }
@@ -123,6 +127,7 @@ export class McpConnections {
 
   async remove(id: string, projectId?: string) {
     return this.store.transaction(async () => {
+      (await this.store.lock(`vault:${this.organizationId}`));
       const c = (await this.get(id, projectId));
       if (c.projectId !== projectId) throw new Error('Remove this connection in its owning settings');
       (await this.store.setSettings(this.key(), 'mcp', { connections: (await this.all()).filter((v) => v.id !== id) }));
@@ -135,13 +140,25 @@ export class McpConnections {
   async delivered(taskId: string, connections: McpConnection[]): Promise<void> {
     (await recordSecretRefs(this.store, taskId, connections.map((c) => handleRef(this.handle(c.id)))));
   }
-  secret(c: McpConnection, taskId?: string): any {
+  async secret(c: McpConnection, taskId?: string): Promise<any> {
     const handle = this.handle(c.id);
-    if (!this.broker.hasHandle(handle)) return {};
-    return JSON.parse(this.broker.resolve(handle, { taskId, caps: [`use-credential:${handle}`] }));
+    if (!await this.broker.hasHandle(handle)) return {};
+    return JSON.parse(await this.broker.resolve(handle, { taskId, caps: [`use-credential:${handle}`] }));
+  }
+  /** An OAuth refresh, one at a time across processes (`OAuthVault.refresh`). */
+  async refresh(c: McpConnection, taskId: string | undefined, observed: any, run: (data: any) => Promise<any>): Promise<any> {
+    const handle = this.handle(c.id);
+    return leasedOAuthRefresh(new RefreshLeases(this.store.db), handle, observed,
+      async () => await this.broker.hasHandle(handle) ? this.broker.resolve(handle, { taskId, caps: [`use-credential:${handle}`] }) : undefined,
+      // As setSecret: the organization's vault lock, then the lease row, then the vault's rows.
+      async (current, next, held) => (await this.store.lock(`vault:${this.organizationId}`), await held())
+        && (await this.get(c.id, c.projectId)).revision === c.revision
+        && this.broker.replaceHandleIfUnchanged(handle, current, next, organizationScope(this.organizationId)),
+      run);
   }
   async setSecret(c: McpConnection, value: unknown) {
     await this.store.transaction(async () => {
+      (await this.store.lock(`vault:${this.organizationId}`));
       if ((await this.get(c.id, c.projectId)).revision !== c.revision) throw new Error('Connection changed during authorization. Connect again.');
       (await this.broker.registerHandle(this.handle(c.id), JSON.stringify(value), organizationScope(this.organizationId)));
     });

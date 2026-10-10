@@ -41,15 +41,15 @@ it('deletes organization secrets, inbox routes and key files without touching pe
     expect(fs.existsSync(keyring(org.id))).toBe(true);
     await deleteOrganizationAutonomy(store, broker, org.id, home);
     await deleteOrganizationAutonomy(store, broker, org.id, home);
-    expect(broker.hasHandle(itemHandle(item.id, 'privateKey'))).toBe(false);
-    expect(broker.hasHandle('payment:card:cleanup-card')).toBe(false);
-    expect(broker.hasHandle(handles[0]!)).toBe(false);
-    expect(broker.hasHandle(handles[1]!)).toBe(false);
-    expect(broker.hasHandle('other:secret')).toBe(true);
+    expect(await broker.hasHandle(itemHandle(item.id, 'privateKey'))).toBe(false);
+    expect(await broker.hasHandle('payment:card:cleanup-card')).toBe(false);
+    expect(await broker.hasHandle(handles[0]!)).toBe(false);
+    expect(await broker.hasHandle(handles[1]!)).toBe(false);
+    expect(await broker.hasHandle('other:secret')).toBe(true);
     // SS-1: crypto-shredded: the organization's data key is gone with everything under it.
-    expect(broker.hasHandle(`world-provider:${org.id}:e2b:api-key`)).toBe(false);
+    expect(await broker.hasHandle(`world-provider:${org.id}:e2b:api-key`)).toBe(false);
     expect(fs.existsSync(keyring(org.id))).toBe(false);
-    expect(broker.resolve(`world-provider:${peer.id}:e2b:api-key`, { caps: ['use-credential:*'] })).toBe('peer');
+    expect(await broker.resolve(`world-provider:${peer.id}:e2b:api-key`, { caps: ['use-credential:*'] })).toBe('peer');
     expect(fs.existsSync(legacyKey)).toBe(false);
     expect(await mail.ownerOf(address)).toBeUndefined();
     expect(await ingestScope(store, secret)).toBeUndefined();
@@ -69,6 +69,6 @@ it('allows an empty organization without a broker but retains metadata if secret
     const item = await vault.save({ type: 'login', label: 'Retained', secrets: { password: 'retained-secret' } });
     await expect(deleteOrganizationAutonomy(store, undefined, org.id, home)).rejects.toThrow(/broker/);
     expect(await vault.get(item.id)).toBeDefined();
-    expect(broker.hasHandle(itemHandle(item.id, 'password'))).toBe(true);
+    expect(await broker.hasHandle(itemHandle(item.id, 'password'))).toBe(true);
   } finally { await store.close(); fs.rmSync(home, { recursive: true, force: true }); }
 });

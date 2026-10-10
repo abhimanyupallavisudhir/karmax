@@ -273,7 +273,7 @@ describe('portable world checkpoints', () => {
     const ledger = (await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
       name: 'Ledger', driver: 'object-tree@1', target: { kind: 'path', path: 'runs/spend.sqlite' },
       access: 'write', isolation: 'fork', source: { shape: 'file' }, credentialHandles: [], publish: 'review' }));
-    await resources.importFiles(ledger.id, [{ path: 'spend.sqlite', data: Buffer.from('original') }]);
+    const published = await resources.importFiles(ledger.id, [{ path: 'spend.sqlite', data: Buffer.from('original') }]);
 
     const world = await worlds.create('worktree', { taskId: task.id, repos: [development, wiki], base: 'main',
       repositoryBranches: { [wiki]: { base: 'project-wiki', target: 'project-wiki' } } });
@@ -311,7 +311,9 @@ describe('portable world checkpoints', () => {
     expect(await restored.readFile('wiki/unpublished.md')).toBe('portable wiki edit\n');
     expect(await restored.readFile('development/runs/spend.sqlite')).toBe('historical ledger');
     expect(fs.existsSync(path.join(restoredHandle.root, 'runs/spend.sqlite'))).toBe(false);
-    expect(await resources.summarize(task.id, ledger.id)).toMatchObject({ added: 0, modified: 0, deleted: 0 });
+    // The edit made before the park is still this task's change to publish:
+    // measured from the published version, not from the park's capture.
+    expect(await resources.summarize(task.id, ledger.id)).toMatchObject({ baseRevisionId: published.id, added: 0, modified: 1, deleted: 0 });
 
     await restored.destroy();
     (await store.close());
@@ -551,9 +553,9 @@ esac
       expect((await wrapped.exec('bash', ['-lc', 'printf %s "$DATABASE_URL"'])).stdout)
         .toBe('postgres://app@172.17.0.8:5432/app');
       const serviceHandle = Object.values(restoredHandle.meta?.serviceEnvironmentHandles as Record<string, string>)[0]!;
-      expect(broker.hasHandle(serviceHandle)).toBe(true);
+      expect(await broker.hasHandle(serviceHandle)).toBe(true);
       await resources.release(restoredHandle);
-      expect(broker.hasHandle(serviceHandle)).toBe(false);
+      expect(await broker.hasHandle(serviceHandle)).toBe(false);
       await restored.destroy();
       (await store.close());
     } finally {

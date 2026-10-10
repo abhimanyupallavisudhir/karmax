@@ -17,6 +17,7 @@ import { makeCoordinatorActivities } from '../src/activities/coordinator.js';
 import { TASK_QUEUE } from '../src/temporal/config.js';
 import { ConfigHomeManager } from '../src/autonomy/config-homes.js';
 import { INSTALLATION_SCOPE } from '../src/autonomy/vault-keys.js';
+import { EXPLANATIONS_ENABLED } from '../src/config/features.js';
 
 const webDir = fileURLToPath(new URL('../web', import.meta.url));
 
@@ -357,7 +358,24 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(invalid.status).toBe(400);
   });
 
-  it('inherits explanation defaults from organization to project', async () => {
+  it.skipIf(EXPLANATIONS_ENABLED)('turns explanations off but keeps saved ones readable', async () => {
+    const project = (await h.store.createProject('Explanations off'));
+    const organizationId = project.organizationId ?? 'org_personal';
+    const meta: any = await (await fetch(`${base}/api/meta`, { headers: auth() })).json();
+    expect(meta.explanationsEnabled).toBe(false);
+    for (const url of [`/api/projects/${project.id}/explanation-settings`, `/api/organizations/${organizationId}/explanation-settings`]) {
+      expect((await fetch(`${base}${url}`, { headers: auth() })).status).toBe(404);
+      expect((await fetch(`${base}${url}`, { method: 'PUT', headers: auth(), body: JSON.stringify({ values: { model: 'm' } }) })).status).toBe(404);
+    }
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Explain off', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'p', draft: true } }));
+    const explain = await fetch(`${base}/api/tasks/${task.id}/explanations`, {
+      method: 'POST', headers: auth(), body: JSON.stringify({ role: 'do', sourceKey: 'message:1' }) });
+    expect(explain.status).toBe(404);
+    expect((await fetch(`${base}/api/tasks/${task.id}/explanations`, { headers: auth() })).status).toBe(200);
+  });
+
+  it.skipIf(!EXPLANATIONS_ENABLED)('inherits explanation defaults from organization to project', async () => {
     const project = (await h.store.createProject('Explanation defaults'));
     const organizationId = project.organizationId ?? 'org_personal';
     const initial: any = await (await fetch(`${base}/api/projects/${project.id}/explanation-settings`, { headers: auth() })).json();
@@ -2506,11 +2524,11 @@ esac
     expect(JSON.stringify(card)).not.toContain('4242424242424242');
     const listed = await (await fetch(`${base}/api/cards?organizationId=${orgId}`, { headers: auth() })).text();
     expect(listed).not.toContain('4242424242424242');
-    expect(h.broker.hasHandle(`payment:card:${card.id}`)).toBe(true);
+    expect(await h.broker.hasHandle(`payment:card:${card.id}`)).toBe(true);
 
     // Revoking destroys the secret rather than merely hiding the row.
     expect((await fetch(`${base}/api/cards/${card.id}?organizationId=${orgId}`,
       { method: 'DELETE', headers: auth() })).status).toBe(200);
-    expect(h.broker.hasHandle(`payment:card:${card.id}`)).toBe(false);
+    expect(await h.broker.hasHandle(`payment:card:${card.id}`)).toBe(false);
   });
 });

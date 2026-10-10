@@ -5,7 +5,9 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { ProjectEnvironmentSpec } from '../domain/types.js';
 import { environmentArtifactName } from '../util/environment-artifact.js';
-import { e2bTemplate } from './e2b-template.js';
+import { buildSizedTemplate, e2bTemplate, e2bWorldTemplate } from './e2b-template.js';
+import { machineShape, type MachineShape } from '../domain/computer.js';
+import { daytonaSize } from './daytona.js';
 export { environmentArtifactName } from '../util/environment-artifact.js';
 
 const pexec = promisify(execFile);
@@ -25,7 +27,12 @@ export interface EnvironmentBuildInput {
   assertActive?: () => void | Promise<void>;
   spec: ProjectEnvironmentSpec;
   connection?: { apiKey?: string; apiUrl?: string; target?: string; template?: string };
+  /** The project's machine size. E2B snapshots keep the size of the sandbox
+   * they were taken from, so the builder starts at it; Daytona bakes the
+   * covering general size into the setup snapshot. */
+  resources?: { cpu?: number; memoryMb?: number; diskGb?: number };
   createBuilderSandbox?: (base: string, options: { apiKey?: string }) => Promise<BuilderSandbox>;
+  ensureTemplate?: (base: string, name: string, shape: MachineShape, options: { apiKey?: string }) => Promise<{ name?: string } | void>;
 }
 export interface BuilderSandbox {
   id?: string;
@@ -86,8 +93,15 @@ async function buildE2b(input: EnvironmentBuildInput): Promise<EnvironmentBuildR
   // E2B builds on the template task worlds start from. With none named under
   // Compute that is karmax's own; E2B's stock image has neither the browser
   // tools nor the memory those worlds need.
-  const base = e2bTemplate(input.connection?.template);
-  const builder = await create(base, { ...(input.connection?.apiKey ? { apiKey: input.connection.apiKey } : {}) });
+  const template = e2bTemplate(input.connection?.template);
+  const shape = machineShape({ resources: input.resources });
+  const base = e2bWorldTemplate(template, shape);
+  const apiKey = input.connection?.apiKey ? { apiKey: input.connection.apiKey } : {};
+  // `base` stays the shape's key for matching builds to worlds; the builder
+  // starts from whatever template E2B could make at that size.
+  const start = base === template ? base
+    : ((await (input.ensureTemplate ?? buildSizedTemplate)(template, base, shape, apiKey)) || {}).name ?? base;
+  const builder = await create(start, apiKey);
   try {
     if (builder.id) await input.onBuilderCreated?.(builder.id);
     for (const command of setupCommands(input.spec)) {
@@ -113,7 +127,8 @@ async function buildDaytona(input: EnvironmentBuildInput): Promise<EnvironmentBu
     if (commands.length) image = image.runCommands(...commands);
     const name = environmentArtifactName(input.projectId, input.digest, input.buildId);
     await input.assertActive?.();
-    await daytona.snapshot.create({ name, image }, { timeout: 45 * 60 });
+    const { cpu, memory, disk } = daytonaSize(input.resources);
+    await daytona.snapshot.create({ name, image, resources: { cpu, memory, disk } }, { timeout: 45 * 60 });
     return { ref: name };
   } catch (error) {
     if (error instanceof DaytonaAuthorizationError)

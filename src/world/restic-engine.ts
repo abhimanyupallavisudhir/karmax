@@ -63,6 +63,8 @@ export function resticRef(revision: Pick<ResourceRevision, 'sealedRef'>): Restic
 /** A resource's repository in one storage location ({@link repositoryName}). */
 export interface Repository { attachment: ResourceAttachment; storageLocationId?: string; name: string }
 
+export interface ChangeSet { files: Map<string, '+' | 'M' | '-'>; removedDirectories: string[] }
+
 export interface ResticProgress { files: number; totalFiles: number; bytes: number; totalBytes: number }
 export interface ResticCapture { snapshot: string; files: number; bytes: number; added: number }
 
@@ -154,10 +156,13 @@ export class ResticResources {
     throw new Error(`${path.posix.basename(place.path)} kept changing while it was being saved; stop whatever is writing to it, then save it again`);
   }
 
-  async restore(place: ResticPlace, attachment: Repository, snapshot: string, options: ResticRunOptions): Promise<void> {
+  /** `mirror` also deletes what the snapshot does not have, so the place ends
+   * up exactly the snapshot (a laptop's push into a task world). */
+  async restore(place: ResticPlace, attachment: Repository, snapshot: string, options: ResticRunOptions & { mirror?: boolean }): Promise<void> {
     const remote = isRemoteWorldKind(place.world.handle.kind);
     const scratch = place.file ? path.posix.join(place.world.handle.root, `.karmax-injection/restore-${crypto.randomBytes(6).toString('hex')}`) : undefined;
-    const args = ['restore', snapshot, '--target', scratch ?? place.path, '--no-lock', '--json', '-o', `rest.connections=${RESTORE_CONNECTIONS}`];
+    const args = ['restore', snapshot, '--target', scratch ?? place.path, '--no-lock', '--json', '-o', `rest.connections=${RESTORE_CONNECTIONS}`,
+      ...(options.mirror && !scratch ? ['--delete'] : [])];
     if (remote) {
       // One job does the restore and puts a single file in place.
       const move = scratch ? `\nshopt -s dotglob nullglob; e=(${quote(scratch)}/*); [ \${#e[@]} -eq 1 ] || { echo "expected one file" >&2; exit 3; }
@@ -179,6 +184,21 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
       fs.renameSync(path.join(scratch, entries[0]!), place.path);
       fs.rmSync(scratch, { recursive: true, force: true });
     }
+  }
+
+  /** Create the repository if it does not exist yet: before a client outside
+   * any world (the tavya CLI) is given an append grant for it. */
+  async prepare(repository: Repository): Promise<void> { await this.ensureRepository(repository); }
+
+  /** Whether `snapshot` was saved in `repository` (its file is listed there). */
+  async hasSnapshot(repository: Repository, snapshot: string): Promise<boolean> {
+    return /^[0-9a-f]{64}$/.test(snapshot) && Boolean(await this.deps.store.repositoryFile(repository.name, 'snapshots', snapshot));
+  }
+
+  /** restic's environment for a client outside any world: the same grant a
+   * sandbox gets, for `base` (the edge, else the public URL). */
+  clientEnvironment(repository: Repository, base: string, access: 'read' | 'append'): Promise<Record<string, string>> {
+    return this.env(repository, base, access, access === 'append');
   }
 
   /** Save `entry` (`.`: all of it) of a directory on this host: an upload, an import. */
@@ -225,6 +245,69 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
       if (changedPaths.length < 100) changedPaths.push(String(entry.path).replace(/^\/+/, ''));
     }
     return { added, modified, deleted, bytes, changedPaths };
+  }
+
+  /** Every file `to` adds (`+`), changes (`M`) or removes (`-`) relative to
+   * `from` (none: an empty resource), and the directories it removes. As
+   * {@link diff}, metadata alone is not a change. */
+  async changeSet(attachment: Repository, from: string | undefined, to: string): Promise<ChangeSet> {
+    const files = new Map<string, '+' | 'M' | '-'>();
+    const removedDirectories: string[] = [];
+    if (!from) {
+      for (const file of await this.files(attachment, to)) files.set(file.path, '+');
+      return { files, removedDirectories };
+    }
+    const run = await this.onHost(attachment, 'read', false, ['diff', '--json', '--no-lock', from, to], { key: 'host' });
+    if (run.code !== 0) throw resticFailure(run, 'comparing versions of the resource');
+    for (const line of run.stdout.split('\n')) {
+      if (!line.startsWith('{')) continue;
+      const entry = JSON.parse(line);
+      if (entry.message_type !== 'change') continue;
+      const modifier = String(entry.modifier ?? '');
+      const relative = String(entry.path).replace(/^\/+/, '');
+      if (relative.endsWith('/')) { if (modifier.includes('-')) removedDirectories.push(relative.slice(0, -1)); continue; }
+      if (modifier.includes('+')) files.set(relative, '+');
+      else if (modifier.includes('-')) files.set(relative, '-');
+      else if (/[MT]/.test(modifier)) files.set(relative, 'M');
+    }
+    return { files, removedDirectories };
+  }
+
+  /** Make `paths` of a directory-shaped `place` what they are in `snapshot`,
+   * delete `deletions`, then the `removedDirectories` left empty. Nothing
+   * else in the place is touched. */
+  async applyPaths(place: ResticPlace, attachment: Repository, snapshot: string,
+    change: { paths: string[]; deletions: string[]; removedDirectories: string[] }, options: ResticRunOptions): Promise<void> {
+    const all = [...change.paths, ...change.deletions, ...change.removedDirectories];
+    const awkward = all.find((file) => /[\n\r]/.test(file) || file.split('/').includes('..'));
+    if (awkward !== undefined) throw new Error(`cannot merge a file named ${JSON.stringify(awkward)}`);
+    const lists = `.karmax-injection/merge-${crypto.randomBytes(6).toString('hex')}`;
+    const root = place.world.handle.root;
+    const write = async (name: string, value: string) => {
+      await place.world.writeFile(`${lists}/${name}`, value);
+      return path.posix.join(root, lists, name);
+    };
+    try {
+      if (change.paths.length) {
+        const include = await write('include', change.paths.map((file) => `/${includePattern(file)}\n`).join(''));
+        const args = ['restore', snapshot, '--target', place.path, '--include-file', include, '--no-lock', '--json',
+          '-o', `rest.connections=${RESTORE_CONNECTIONS}`];
+        const run = isRemoteWorldKind(place.world.handle.kind)
+          ? await this.inWorld(place.world, attachment, 'read', false, args, options)
+          : await this.onHost(attachment, 'read', false, args, options);
+        if (run.code !== 0) throw resticFailure(run, 'merging the resource');
+      }
+      if (change.deletions.length || change.removedDirectories.length) {
+        const deletions = await write('delete', change.deletions.map((file) => `${file}\0`).join(''));
+        // Deepest first, so a removed tree goes once it is empty; a directory still holding files stays.
+        const directories = await write('rmdir', [...change.removedDirectories].sort((a, b) => b.length - a.length).map((dir) => `${dir}\0`).join(''));
+        const removed = await place.world.exec('bash', ['-c', `set -e; cd -- "$1"; xargs -0 -r rm -f -- < "$2"; xargs -0 -r rmdir --ignore-fail-on-non-empty -- < "$3" 2>/dev/null || true`,
+          'merge', place.path, deletions, directories], { cwd: root, timeoutMs: 10 * 60_000 });
+        if (removed.code !== 0) throw new Error(`merging the resource failed: ${(removed.stderr || removed.stdout).trim().slice(0, 300)}`);
+      }
+    } finally {
+      await place.world.exec('rm', ['-rf', '--', lists], { cwd: root }).catch(() => undefined);
+    }
   }
 
   /** Read back files of a snapshot, decrypting and checking every byte, a page at a time. */
@@ -398,7 +481,7 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
     options: ResticRunOptions & { cwd?: string; prefix?: string; suffix?: string }): Promise<ResticRun> {
     const base = this.deps.endpoints.world(world.handle);
     if (!base) throw new Error('this world cannot reach the resource store (no public URL is configured)');
-    const binary = await this.worldBinary(world, base);
+    const binary = await this.worldBinary(world, base, attachment);
     const command = `set -e\n${options.prefix ? `${options.prefix}\n` : ''}${options.cwd ? `cd -- ${quote(options.cwd)}\n` : ''}`
       + `${quote(binary)} ${args.map(quote).join(' ')}${options.suffix ?? ''}`;
     const recordKey = `restic-job:${world.handle.id}:${options.key}`;
@@ -445,8 +528,9 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
     }
   }
 
-  /** restic in a remote world: fetched once from this server and checked against its pinned digest. */
-  private async worldBinary(world: World, base: string): Promise<string> {
+  /** restic in a remote world: fetched once from this server, with a grant for
+   * the repository it is fetched to use, and checked against its pinned digest. */
+  private async worldBinary(world: World, base: string, repository: Repository): Promise<string> {
     const relative = `${BIN_DIR}/restic-${RESTIC_VERSION}`;
     const absolute = path.posix.join(world.handle.root, relative);
     // Finished platform jobs are kept a day (another waiter may still read one).
@@ -458,13 +542,15 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
     if (!binary) throw new Error(`restic is not available for this world (${probe.stdout.trim() || probe.stderr.trim() || 'unknown architecture'})`);
     await ensureWorldExcluded(world, '.karmax-injection').catch(() => undefined);
     const url = `${base.replace(/\/+$/, '')}${REPOSITORY_ROUTE}restic/${RESTIC_VERSION}/linux-${arch}`;
+    const token = await this.deps.tokens.mint({ repository: repository.name, access: 'read', quota: false, expiresAt: Date.now() + 10 * 60_000 });
+    const authorization = `authorization: Basic ${Buffer.from(`tavya:${token}`).toString('base64')}`;
     const fetched = await world.exec('bash', ['-c', `set -e; mkdir -p ${BIN_DIR}; t=${BIN_DIR}/.restic-$$
-if command -v curl >/dev/null; then curl -fsSL --retry 3 "$1" -o "$t"
-elif command -v wget >/dev/null; then wget -q -O "$t" "$1"
-else node -e 'fetch(process.argv[1]).then(async r=>{if(!r.ok)throw new Error(r.status);require("fs").writeFileSync(process.argv[2],Buffer.from(await r.arrayBuffer()))})' "$1" "$t"; fi
+if command -v curl >/dev/null; then curl -fsSL --retry 3 -H "$3" "$1" -o "$t"
+elif command -v wget >/dev/null; then wget -q --header="$3" -O "$t" "$1"
+else node -e 'const [u,f,h]=process.argv.slice(1);fetch(u,{headers:{authorization:h.slice(h.indexOf(":")+1).trim()}}).then(async r=>{if(!r.ok)throw new Error(r.status);require("fs").writeFileSync(f,Buffer.from(await r.arrayBuffer()))})' "$1" "$t" "$3"; fi
 got=$(sha256sum "$t" 2>/dev/null | cut -d' ' -f1 || node -e 'process.stdout.write(require("crypto").createHash("sha256").update(require("fs").readFileSync(process.argv[1])).digest("hex"))' "$t")
 [ "$got" = "$2" ] || { rm -f "$t"; echo "restic download does not match its digest" >&2; exit 1; }
-chmod +x "$t"; mv -f "$t" ${quote(relative)}`, 'restic-fetch', url, binary.sha256], { cwd: world.handle.root, timeoutMs: 5 * 60_000 });
+chmod +x "$t"; mv -f "$t" ${quote(relative)}`, 'restic-fetch', url, binary.sha256, authorization], { cwd: world.handle.root, timeoutMs: 5 * 60_000 });
     if (fetched.code !== 0) throw new Error(`could not install restic in the world: ${(fetched.stderr || fetched.stdout).trim().slice(0, 300)}`);
     return absolute;
   }
@@ -477,6 +563,13 @@ function backupArgs(parent?: string, connections = CONNECTIONS): string[] {
   // keeps both, by setting the old mtime back, would go unnoticed.)
   return ['backup', '--json', '--host', 'tavya', '--ignore-inode', '--exclude', '.git', '--exclude', '.karmax-injection',
     '-o', `rest.connections=${connections}`, ...(parent ? ['--parent', parent] : [])];
+}
+
+/** A restic pattern matching exactly `file`: glob characters escaped, `$`
+ * doubled (pattern files expand variables) and spaces in a class (lines are
+ * trimmed). */
+function includePattern(file: string): string {
+  return file.replace(/[\\*?[]/g, (c) => `\\${c}`).replace(/\$/g, '$$$$').replace(/\s/g, (c) => `[${c}]`);
 }
 
 function summaryOf(stdout: string): Record<string, unknown> {

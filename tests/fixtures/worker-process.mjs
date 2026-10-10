@@ -22,6 +22,8 @@ serveWorkerProcess(async () => ({
       if (mode === 'reject-refresh') throw new Error('bundle rejected');
     },
     async stop() { if (mode === 'failed-stop') throw new Error('drain failed'); },
+    ...(mode === 'cache-status' ? { status: () => ({ workflowCache: { cached: 3, limit: 250, shrinks: 1 },
+      workflows: { usedBytes: 10, limitBytes: 20 } }) } : {}),
   },
   async close() {},
 }));

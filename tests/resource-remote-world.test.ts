@@ -128,3 +128,34 @@ it('reattaches to its save still running in the world instead of starting anothe
   // One save ran, not two: a single snapshot in the repository besides the seed's.
   expect(await f.store.listRepositoryFiles(repository.name, 'snapshots')).toHaveLength(2);
 });
+
+it('merges a newer publication into a remote world, restoring only what changed there', async () => {
+  const f = await fixture();
+  await f.resources.importFiles(f.attachment.id, [{ path: 'seed.txt', data: Buffer.from('seed') },
+    { path: 'old/gone.txt', data: Buffer.from('x') }]);
+  const ocr = await f.sandbox('W2 OCR');
+  const translations = await f.sandbox('W7 translations');
+  const byId = new Map([[ocr.world.handle.id, ocr.world], [translations.world.handle.id, translations.world]]);
+  vi.spyOn(f.worlds, 'open').mockImplementation(async (handle) => byId.get(handle.id)!);
+  for (const { task, world } of [ocr, translations]) {
+    world.handle = await f.resources.materialize(f.project.id, task.id, world, 1);
+    world.handle = (await f.store.registerWorld(world.handle, f.project.id)) as typeof world.handle;
+  }
+  fs.mkdirSync(path.join(ocr.world.handle.root, 'data/ocr'));
+  fs.writeFileSync(path.join(ocr.world.handle.root, 'data/ocr/page 1*.txt'), 'ocr');
+  fs.rmSync(path.join(ocr.world.handle.root, 'data/old'), { recursive: true });
+  fs.writeFileSync(path.join(translations.world.handle.root, 'data/translated.txt'), 'translated');
+  const first = await f.resources.promote(ocr.task.id, f.attachment.id);
+  const combined = await f.resources.promote(translations.task.id, f.attachment.id);
+
+  expect(combined.revision.parentRevisionId).toBe(first.revision.id);
+  const verified = await f.resources.verifyRevision(f.project.id, f.attachment.id, combined.revision.id, 0, 100);
+  expect(verified.files.map((file) => file.path).sort()).toEqual(['ocr/page 1*.txt', 'seed.txt', 'translated.txt']);
+  const root = translations.world.handle.root;
+  expect(fs.readFileSync(path.join(root, 'data/ocr/page 1*.txt'), 'utf8')).toBe('ocr');
+  expect(fs.existsSync(path.join(root, 'data/old'))).toBe(false);
+  // restic fetched only the other task's file, as a job in that world.
+  const restores = fs.readdirSync(path.join(root, SYSTEM_JOB_ROOT))
+    .map((id) => fs.readFileSync(path.join(root, SYSTEM_JOB_ROOT, id, 'command'), 'utf8')).filter((command) => /\brestore\b/.test(command));
+  expect(restores.filter((command) => command.includes('--include-file'))).toHaveLength(1);
+});

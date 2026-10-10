@@ -8,6 +8,7 @@ import { DEFAULT_CDP_PORT } from './cdp-endpoint.js';
 import { CUSTODY_ENV } from '../agent/custody.js';
 import { Provider } from '../domain/types.js';
 import { acpHomeEnv, apiKeyEnv, hasAcpHomeLogin, isAcpProvider, MODEL_PROVIDERS } from '../agent/provider-registry.js';
+import type { ModelLogins } from './model-logins.js';
 
 const DISCONNECTED_HOME = '.karmax-disconnected';
 
@@ -22,7 +23,9 @@ const DISCONNECTED_HOME = '.karmax-disconnected';
  * unset inherited API keys so they don't leak across profiles.
  */
 export class ConfigHomeManager {
-  constructor(private root = paths().configHomes) {}
+  /** `logins`: the credentials live in the vault and these homes cache them
+   * (data epoch 6, `model-logins.ts`). Without it (tests, tools) the files are the login. */
+  constructor(private root = paths().configHomes, readonly logins?: ModelLogins) {}
 
   /** Ensure (and return) the config home dir for an organization × account × provider.
    * Historical flat homes belong only to the personal organization. */
@@ -46,8 +49,10 @@ export class ConfigHomeManager {
   /** Disconnect credentials, not the task histories sharing this home. Tasks keep
    * absolute sessionmeta.home references, so retained history must stay in place.
    * Account discovery hides this history-only home until an explicit reconnect. */
-  remove(provider: Provider, account: string, organizationId = 'org_personal'): void {
+  async remove(provider: Provider, account: string, organizationId = 'org_personal'): Promise<void> {
     const dir = path.join(this.organizationRoot(organizationId), `${provider}-${sanitize(account)}`);
+    // The credential first: a cache pruned while the vault still held it would come back.
+    await this.logins?.forget(dir);
     if (!fs.existsSync(dir)) return;
     if (!fs.lstatSync(dir).isDirectory()) {
       fs.rmSync(dir, { force: true });
@@ -82,12 +87,14 @@ export class ConfigHomeManager {
   }
 
   /** Rename a login (move its config home so credentials carry over). */
-  rename(provider: Provider, from: string, to: string, organizationId = 'org_personal'): string {
+  async rename(provider: Provider, from: string, to: string, organizationId = 'org_personal'): Promise<string> {
     const root = this.organizationRoot(organizationId);
     const src = path.join(root, `${provider}-${sanitize(from)}`);
     const dst = path.join(root, `${provider}-${sanitize(to)}`);
-    if (fs.existsSync(src) && !fs.existsSync(dst)) fs.renameSync(src, dst);
-    else fs.mkdirSync(dst, { recursive: true });
+    if (fs.existsSync(src) && !fs.existsSync(dst)) {
+      await this.logins?.rename(src, dst);
+      fs.renameSync(src, dst);
+    } else fs.mkdirSync(dst, { recursive: true });
     return dst;
   }
 
@@ -135,9 +142,16 @@ export class ConfigHomeManager {
     );
   }
 
-  removeOrganization(organizationId: string): void {
+  async removeOrganization(organizationId: string): Promise<void> {
     if (organizationId === 'org_personal') throw new Error('cannot remove the personal organization config-home namespace');
+    await this.logins?.forgetOrganization(organizationId);
     fs.rmSync(this.organizationRoot(organizationId), { recursive: true, force: true });
+  }
+
+  /** Bring a home's cached credential up to date with the vault before it is
+   * used, and a change a CLI made here into the vault (data epoch 6). */
+  async sync(home: string): Promise<void> {
+    await this.logins?.sync(home);
   }
 
   /**

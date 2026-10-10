@@ -18,6 +18,7 @@ import { AuthorizationService } from '../src/platform/authorization.js';
 import { findFreePortFrom } from '../src/util/ports.js';
 import { GitHubAppService, GITHUB_APP_CLIENT_SECRET_HANDLE } from '../src/integrations/github-app.js';
 import { INSTALLATION_SCOPE, userScope } from '../src/autonomy/vault-keys.js';
+import { AppGrants } from '../src/auth/app-grants.js';
 
 const cleanup: Array<() => Promise<void>> = [];
 afterEach(async () => { vi.restoreAllMocks(); for (const close of cleanup.splice(0).reverse()) await close(); });
@@ -98,6 +99,11 @@ it('cleans only personal access/settings and preserves shared work, history and 
   const other = await tokens.mintPrincipal('user:uX1', ['*']);
   const delegation = await tokens.delegateHuman(human.token, { taskId: task.id, projectId: project.id });
   const agent = await tokens.mint({ taskId: task.id, profileId: 'test', principal: 'user:u_1', ceiling: ['*'], grantorCaps: ['*'], delegationId: delegation!.id, projectId: project.id });
+  // App grants (CLI login, personal token) go with the account; another person's stay.
+  const appGrants = new AppGrants(store);
+  const cliLogin = await appGrants.issue(await appGrants.create({ userId: 'u_1', kind: 'cli', clientId: 'tavya-cli', name: 'laptop' }));
+  const otherLogin = await appGrants.issue(await appGrants.create({ userId: 'uX1', kind: 'cli', clientId: 'tavya-cli', name: 'laptop' }));
+  await appGrants.create({ userId: 'u_1', kind: 'token', clientId: 'personal-token', name: 'CI', expiresAt: Date.now() + 60_000 });
   await store.kvSet('account-deletion:u_1', JSON.stringify({ userId: 'u_1', email: 'person@example.test' }));
   await broker.registerHandle('user-owned:unlisted', 'no cleanup step names this handle', userScope('u_1'));
   const record = await close();
@@ -112,10 +118,10 @@ it('cleans only personal access/settings and preserves shared work, history and 
   expect(await store.organizationMembership(org.id, 'uX1')).toBeDefined();
   expect(await store.listPrincipalGrants('user:u_1')).toEqual([]);
   expect(await store.listPrincipalGrants('user:uX1')).toHaveLength(1);
-  expect(broker.listHandles().some(h => h.includes(':u_1:'))).toBe(false);
-  expect(broker.hasHandle('github-app:user:uX1:account:9:authorization')).toBe(true);
+  expect((await broker.listHandles()).some(h => h.includes(':u_1:'))).toBe(false);
+  expect(await broker.hasHandle('github-app:user:uX1:account:9:authorization')).toBe(true);
   // SS-1: the user's data key is destroyed too, and with it anything left under it.
-  expect(broker.hasHandle('user-owned:unlisted')).toBe(false);
+  expect(await broker.hasHandle('user-owned:unlisted')).toBe(false);
   expect(fs.existsSync(path.join(dir, 'vault', 'keys', `${crypto.createHash('sha256').update('user:u_1').digest('hex')}.json`))).toBe(false);
   expect(fs.existsSync(path.join(dir, 'vault', 'keys', `${crypto.createHash('sha256').update('user:uX1').digest('hex')}.json`))).toBe(true);
   expect(await store.kvGet('github-app:user:u_1:accounts')).toBeUndefined();
@@ -125,6 +131,10 @@ it('cleans only personal access/settings and preserves shared work, history and 
   expect(await tokens.verify(human.token)).toBeUndefined();
   expect(await tokens.verify(agent.token)).toBeUndefined();
   expect(await tokens.verify(other.token)).toBeDefined();
+  expect(await appGrants.list('u_1')).toEqual([]);
+  expect(await store.kvEntries('app-grant-user:u_1:')).toEqual([]);
+  expect(await appGrants.authenticate(cliLogin.accessToken)).toBeUndefined();
+  expect(await appGrants.authenticate(otherLogin.accessToken)).toBeDefined();
   expect((await service.list()).requests).toEqual([]);
   expect(JSON.stringify(record)).not.toContain('person@example.test');
   expect(identity.removeUser).toHaveBeenCalledWith('u_1');
@@ -146,7 +156,7 @@ it('keeps access fenced during failure and resumes idempotently with persisted p
   // A new service has no in-memory progress. Recovery reads the durable manifest.
   const restarted = new AccountErasureService(store, identity, broker, dir);
   expect((await restarted.close('u_1', { confirmation: 'CLOSE u_1', exportHandled: true }, 'user:admin')).state).toBe('closed');
-  expect(broker.hasHandle('github-app:user:u_1:authorization')).toBe(false);
+  expect(await broker.hasHandle('github-app:user:u_1:authorization')).toBe(false);
   expect((await restarted.get('u_1'))?.steps).toEqual(['access-and-preferences', 'personal-credentials', 'identity']);
 });
 
@@ -179,8 +189,8 @@ it('rejects delayed GitHub grants and refreshes after closure without affecting 
   await close();
   release();
   await rejection;
-  expect(broker.hasHandle('github-app:user:u_1:account:42:authorization')).toBe(false);
-  expect(broker.hasHandle(GITHUB_APP_CLIENT_SECRET_HANDLE)).toBe(true);
+  expect(await broker.hasHandle('github-app:user:u_1:account:42:authorization')).toBe(false);
+  expect(await broker.hasHandle(GITHUB_APP_CLIENT_SECRET_HANDLE)).toBe(true);
   await expect(github.userAccessToken('u_1')).rejects.toThrow('closed');
 });
 

@@ -50,6 +50,7 @@ export interface PlatformOps {
   setTaskPriority(taskId: string, priority: number): Promise<void>;
   signalTask(taskId: string, signal: string, text?: string, role?: string, otherAttempts?: 'keep' | 'cancel', saveOtherAttemptsDefault?: boolean): Promise<void>;
   messageAgent(taskId: string, text: string, role?: string): Promise<void>;
+  stopAgent(taskId: string, agent: string): Promise<unknown>;
   escalateToHuman(a: { taskId?: string; audience: string[]; message: string; urgency?: Urgency }): Promise<unknown>;
   notify(a: { to: string[]; message: string; urgency?: Urgency }): Promise<unknown>;
   requestPermission(a: { capabilities: string[]; projectIds?: string[]; audience?: string[]; reason: string; urgency?: Urgency }): Promise<unknown>;
@@ -125,6 +126,7 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
     setTaskPriority: (id, priority) => api.setTaskPriority(getToken(), id, priority),
     signalTask: async (id, sig, text, role, otherAttempts, saveOtherAttemptsDefault) => void (await api.signalTask(getToken(), id, sig as any, text, role, undefined, undefined, { otherAttempts, saveOtherAttemptsDefault })),
     messageAgent: async (id, text, role) => void (await api.messageAgent(getToken(), id, text, role)),
+    stopAgent: (id, agent) => api.stopAgent(getToken(), id, agent),
     escalateToHuman: (a) => api.escalateToHuman(getToken(), a),
     notify: (a) => api.notify(getToken(), a),
     requestPermission: (a) => api.requestPermission(getToken(), a),
@@ -172,7 +174,8 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
  * re-acquire one — the gateway holds sessions in memory, so a gateway restart
  * would otherwise 401 every subsequent call for the life of the agent.
  */
-export function httpOps(baseUrl: string, token: string | (() => Promise<string | undefined>)): PlatformOps {
+export function httpOps(baseUrl: string, token: string | (() => Promise<string | undefined>),
+  extraHeaders: Record<string, string> = {}): PlatformOps {
   const resolve = typeof token === 'string' ? async () => token : token;
   let cached: string | undefined = typeof token === 'string' ? token : undefined;
   const req = async (rawPath: string, init: RequestInit = {}, reauth = true): Promise<unknown> => {
@@ -184,7 +187,7 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
     if (cached === undefined) cached = await resolve();
     const res = await fetch(`${baseUrl}${path}`, {
       ...init,
-      headers: { 'content-type': 'application/json', ...(cached ? { authorization: `Bearer ${cached}` } : {}), ...(init.headers ?? {}) },
+      headers: { 'content-type': 'application/json', ...extraHeaders, ...(cached ? { authorization: `Bearer ${cached}` } : {}), ...(init.headers ?? {}) },
     });
     // Session expired or the gateway restarted since we last authed — drop the
     // stale token, re-acquire once, and retry before surfacing an error.
@@ -222,6 +225,7 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
     setTaskPriority: async (id, priority) => void (await req(`/api/tasks/${id}/priority`, { method: 'PUT', body: JSON.stringify({ priority }) })),
     signalTask: async (id, signal, text, role, otherAttempts, saveOtherAttemptsDefault) => void (await req(`/api/tasks/${id}/signal`, { method: 'POST', body: JSON.stringify({ signal, text, role, otherAttempts, saveOtherAttemptsDefault }) })),
     messageAgent: async (id, text, role) => void (await req(`/api/tasks/${id}/messages`, { method: 'POST', body: JSON.stringify({ text, role }) })),
+    stopAgent: (id, agent) => req(`/api/tasks/${id}/agents/${encodeURIComponent(agent)}/stop`, { method: 'POST' }),
     escalateToHuman: (a) => req('/api/agent/escalate', { method: 'POST', body: JSON.stringify(a) }),
     notify: (a) => req('/api/agent/notify', { method: 'POST', body: JSON.stringify(a) }),
     requestPermission: (a) => req('/api/agent/permission-requests', { method: 'POST', body: JSON.stringify(a) }),
@@ -291,8 +295,15 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
   };
 }
 
-export function createPlatformMcpServer(ops: PlatformOps): McpServer {
-  const server = new McpServer({ name: 'karmax-platform', version: '1.0.0' });
+/** `tools` registers only that subset of the definitions below (the remote
+ * `/mcp` server leaves out tools bound to a calling task). */
+export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: ReadonlySet<string>; name?: string } = {}): McpServer {
+  const server = new McpServer({ name: options.name ?? 'karmax-platform', version: '1.0.0' });
+  if (options.tools) {
+    const register = server.registerTool.bind(server), tools = options.tools;
+    server.registerTool = ((name: string, ...rest: unknown[]) => tools.has(name)
+      ? (register as (...args: unknown[]) => unknown)(name, ...rest) : undefined) as typeof server.registerTool;
+  }
   const ok = (text: string) => ({ content: [{ type: 'text' as const, text }] });
   const wrap = async (fn: () => Promise<any>) => {
     try {
@@ -375,7 +386,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
       organizationId: z.string(), projectId: z.string().optional(),
       worldProvider: z.string().nullish(), runnerPoolId: z.string().nullish(),
       environmentFlavor: z.enum(['headless', 'desktop']).optional(),
-      cpu: z.number().positive().optional(), memoryMb: z.number().int().min(128).optional(), gpu: z.number().nonnegative().optional(),
+      cpu: z.number().positive().optional(), memoryMb: z.number().int().min(128).optional(), diskGb: z.number().int().min(1).optional(), gpu: z.number().nonnegative().optional(),
       unrestrictedInternet: z.boolean().optional(), allowDomains: z.array(z.string()).optional(), allowCidrs: z.array(z.string()).optional(),
       monthlyBudgetUsd: z.number().nonnegative().nullish(), hibernateAfterDays: z.number().nonnegative().nullish(),
     } },
@@ -393,7 +404,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
       // the policy currently in force: otherwise `{allowDomains}` alone silently
       // set `unrestricted:false` and dropped `allowCidrs`, and `{memoryMb}` alone
       // erased `cpu`/`gpu`. Only keys the caller actually supplied are assigned.
-      const wantsResources = a.cpu !== undefined || a.memoryMb !== undefined || a.gpu !== undefined;
+      const wantsResources = a.cpu !== undefined || a.memoryMb !== undefined || a.diskGb !== undefined || a.gpu !== undefined;
       const wantsNetwork = a.unrestrictedInternet !== undefined || a.allowDomains !== undefined || a.allowCidrs !== undefined;
       if (wantsResources || wantsNetwork) {
         // Either `{organization, override?, effective?}` or a bare policy — see below.
@@ -414,6 +425,7 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
           const resources: Record<string, unknown> = { ...(base.resources ?? {}) };
           if (a.cpu !== undefined) resources.cpu = a.cpu;
           if (a.memoryMb !== undefined) resources.memoryMb = a.memoryMb;
+          if (a.diskGb !== undefined) resources.diskGb = a.diskGb;
           if (a.gpu !== undefined) resources.gpu = a.gpu;
           policy.resources = resources;
         }
@@ -846,6 +858,14 @@ export function createPlatformMcpServer(ops: PlatformOps): McpServer {
       },
     },
     async (a) => wrap(async () => { await ops.signalTask(a.taskId, a.signal, a.text, a.role, a.otherAttempts, a.saveOtherAttemptsDefault); return 'signalled'; }),
+  );
+  server.registerTool(
+    'stop_agent',
+    {
+      description: 'Stop one agent of a task, like Ctrl+C: its turn ends now — working, or waiting for a credential, capacity or people — or, if queued, it does not run. The task goes on. `agent` is its key: do, responder, confirm, confirm-<n> or agent-<n> (list_agents).',
+      inputSchema: { taskId: z.string(), agent: z.string() },
+    },
+    async (a) => wrap(async () => { await ops.stopAgent(a.taskId, a.agent); return `stopped ${a.agent}`; }),
   );
   server.registerTool('reorder_queue', { description: 'Prioritize a task in a merge queue domain.', inputSchema: { domain: z.string(), taskId: z.string() } }, async (a) => wrap(async () => { await ops.reorderQueue(a.domain, a.taskId); return 'reordered'; }));
   server.registerTool('save_skill', {
