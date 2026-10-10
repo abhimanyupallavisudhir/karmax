@@ -23,7 +23,7 @@ describe('chat bots', () => {
   let calls: Array<{ url: string; body?: any; headers?: any }>;
   const answers: Record<string, unknown> = {};
 
-  const fetcher = (async (input: RequestInfo | URL, init?: RequestInit) => {
+  const fetcher = (async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input);
     calls.push({ url, body: init?.body ? JSON.parse(String(init.body)) : undefined, headers: init?.headers });
     const match = Object.entries(answers).find(([fragment]) => url.includes(fragment));

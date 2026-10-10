@@ -92,6 +92,7 @@ import { configuredPreviewOrigin, hashPreviewToken, newPreviewToken, previewCook
   previewCookieValue, previewLeaseOrigin, previewLeaseUrl, previewTokenMatches } from './previews.js';
 import type { RemoteAccessController } from '../remote/access.js';
 import { GithubEvents } from '../integrations/github-events.js';
+import { CHAT_CREDENTIALS } from '../integrations/chat-platforms.js';
 import { GITHUB_APP_PUBLIC_URL_KEY,
   type GithubVaultPushEvent } from '../integrations/github-app.js';
 import { scanProjectResources } from '../world/resource-scan.js';
@@ -4997,7 +4998,8 @@ export class Gateway {
       const projectWebhooksMatch = p.match(/^\/api\/projects\/([^/]+)\/webhooks$/);
       if (projectWebhooksMatch) {
         const projectId = projectWebhooksMatch[1]!;
-        if (method === 'GET') return this.json(res, 200, { webhooks: await api.listIncomingWebhooks(token, projectId), urlBase: `${this.publicUrl(req)}/api/hooks/` });
+        if (method === 'GET') return this.json(res, 200, { webhooks: await api.listIncomingWebhooks(token, projectId),
+          urlBase: `${this.publicUrl(req)}/api/hooks/`, platforms: CHAT_CREDENTIALS });
         if (method === 'POST') {
           const b = await this.body(req);
           const hookUrl = (hookId: string) => `${this.publicUrl(req)}/api/hooks/${hookId}`;

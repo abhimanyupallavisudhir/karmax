@@ -126,7 +126,7 @@ function isOperator(value: FilterValue): value is Exclude<FilterValue, FilterLit
 export function filterEntryMatches(payload: unknown, path: string, expected: FilterValue): boolean {
   const values = valuesAtPath(payload, path);
   if (!isOperator(expected)) return values.some((value) => value === expected);
-  if ('exists' in expected) return (values.length > 0 && values.some((v) => v !== null && v !== undefined)) === expected.exists;
+  if ('exists' in expected) return values.some((v) => v !== null && v !== undefined) === expected.exists;
   if ('in' in expected) return values.some((value) => expected.in.includes(value as FilterLiteral));
   if ('contains' in expected) {
     const needle = expected.contains.toLowerCase();

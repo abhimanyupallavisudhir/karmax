@@ -2698,7 +2698,7 @@ export class KarmaxApi {
     (await this.deps.store.updateTaskParams(taskId, fired as any));
     if (shaped && shaped.title !== task.title) (await this.deps.store.setTaskTitle(taskId, shaped.title));
     try {
-      const { startType, input } = await this.buildStart({ ...task, ...(shaped ? { title: shaped.title } : {}), params: fired as any }, false, caller);
+      const { startType, input } = await this.buildStart({ ...task, ...(shaped ? { title: shaped.title } : {}), params: fired as TaskRecord['params'] }, false, caller);
       await withTimeout(
         this.deps.client.workflow.start(startType, { taskQueue: this.deps.taskQueue, workflowId: task.id, args: [input] }),
         START_TIMEOUT_MS,

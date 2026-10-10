@@ -1658,8 +1658,18 @@ function renderFields(fields, own = {}, inherited = {}, withPromptChips = false,
   const perRepo = fields.find((f) => f.type === 'repoBranches');
   let inlineDrawn = false;
   const html = [];
+  // A task's own command (software-dev ≥1.28) is an alternative to its agent,
+  // rarely wanted: one folded row, open when the task has a command.
+  const onCommandFailure = fields.find((x) => x.name === 'onCommandFailure');
   for (const f of fields) {
     if (f === perRepo) continue;
+    if (f === onCommandFailure) continue;
+    if (f.name === 'command' && onCommandFailure) {
+      const set = !!String(eff(own[f.name], inherited[f.name]) ?? '').trim();
+      html.push(`<details class="tf-command" ${set ? 'open' : ''}><summary>Run a command instead of the agent</summary>
+        ${renderField(f, own[f.name], inherited[f.name])}${renderField(onCommandFailure, own[onCommandFailure.name], inherited[onCommandFailure.name])}</details>`);
+      continue;
+    }
     if (inlineNames.has(f.name) && inlineRow.length > 1) {
       if (!inlineDrawn) {
         inlineDrawn = true;
@@ -7168,10 +7178,141 @@ function triggersSection(values, selfId) {
         <div class="cron-grid">${gridCells}</div>
         <label class="tb-label" for="trig-at">Or once at</label>
         <input id="trig-at" type="datetime-local" value="${atVal}">
+        <label class="tb-label" for="ev-type">On event ${policyTip('Start when something happens: a GitHub issue is labelled, a webhook or chat message arrives, another task emits an event. Each event starts its own run and the run receives the event.')}</label>
+        ${eventTriggerHtml(existing.find((t) => t.kind === 'event'))}
         <label class="tb-repeat"><input type="checkbox" id="trig-repeatable" ${values.repeatable ? 'checked' : ''}>
           Repeatable ${policyTip('Each run is kept: a trigger (or “Run again”) spawns a fresh run instead of running this task once.')}</label>
       </div>
     </div>`;
+}
+
+// ── event trigger: type, conditions, and what a repeat does ─────────────────
+const EVENT_OPS = [['eq', 'is'], ['contains', 'contains'], ['matches', 'matches'], ['in', 'is one of']];
+
+function eventConditionHtml(path = '', op = 'eq', value = '') {
+  return `<div class="ev-cond"><input class="ev-path" list="ev-paths" placeholder="label.name" value="${esc(path)}" aria-label="Field" autocomplete="off" spellcheck="false">
+    <select class="ev-op" aria-label="Comparison">${EVENT_OPS.map(([v, l]) => `<option value="${v}" ${v === op ? 'selected' : ''}>${l}</option>`).join('')}</select>
+    <input class="ev-val" placeholder="planned" value="${esc(value)}" aria-label="Value" autocomplete="off" spellcheck="false">
+    <button type="button" class="dep-x ev-x" title="Remove">✕</button></div>`;
+}
+
+// A `where` value back into the form's comparison and text.
+function eventConditionParts(expected) {
+  if (expected && typeof expected === 'object') {
+    if ('contains' in expected) return ['contains', expected.contains];
+    if ('matches' in expected) return ['matches', expected.matches];
+    if ('in' in expected) return ['in', (expected.in || []).join(', ')];
+  }
+  return ['eq', expected === null ? 'null' : String(expected ?? '')];
+}
+
+function eventTriggerHtml(trigger) {
+  const conditions = Object.entries(trigger?.where || {}).filter(([, v]) => !(v && typeof v === 'object' && 'exists' in v))
+    .map(([path, expected]) => eventConditionHtml(path, ...eventConditionParts(expected))).join('');
+  const mode = trigger?.concurrency ? trigger.concurrency.mode || 'skip' : '';
+  return `<div class="ev-trigger" id="ev-trigger">
+    <input id="ev-type" list="ev-types" placeholder="github.issues.labeled" value="${esc(trigger?.type || '')}" autocomplete="off" spellcheck="false">
+    <datalist id="ev-types"></datalist><datalist id="ev-paths"></datalist>
+    <div id="ev-conds">${conditions}</div>
+    <div class="ev-more" ${trigger ? '' : 'hidden'}>
+      <button type="button" class="btn sm" id="ev-add-cond">＋ Only when…</button>
+      <select id="ev-mode" aria-label="If its run is still going" title="If an earlier run is still going">
+        <option value="" ${mode === '' ? 'selected' : ''}>Always start a run</option>
+        <option value="skip" ${mode === 'skip' ? 'selected' : ''}>Skip while one runs</option>
+        <option value="queue" ${mode === 'queue' ? 'selected' : ''}>Wait for it</option>
+        <option value="tell" ${mode === 'tell' ? 'selected' : ''}>Tell the running one</option>
+      </select>
+      <input id="ev-key" placeholder="per {{issue.number}}" value="${esc(trigger?.concurrency?.key || '')}" ${mode ? '' : 'hidden'}
+        title="One run per value, e.g. {{issue.number}}; empty means one at a time" autocomplete="off" spellcheck="false">
+    </div>
+  </div>`;
+}
+
+// Typed like the payload: 42 matches the number 42, true the boolean.
+function eventValue(text) {
+  const t = String(text).trim();
+  if (/^-?\d+(\.\d+)?$/.test(t)) return Number(t);
+  if (t === 'true' || t === 'false') return t === 'true';
+  if (t === 'null') return null;
+  return t;
+}
+
+// The form's event trigger, keeping what it does not show (source, limits).
+function collectEventTrigger(existing) {
+  const type = ($('#ev-type')?.value || '').trim();
+  if (!type) return undefined;
+  const where = {};
+  document.querySelectorAll('#ev-conds .ev-cond').forEach((row) => {
+    const path = row.querySelector('.ev-path').value.trim();
+    const op = row.querySelector('.ev-op').value;
+    const value = row.querySelector('.ev-val').value;
+    if (!path) return;
+    where[path] = op === 'eq' ? eventValue(value) : op === 'in' ? { in: value.split(',').map(eventValue).filter((v) => v !== '') }
+      : { [op]: value.trim() };
+  });
+  const { where: _w, concurrency: _c, type: _t, kind: _k, recurring: _r, ...kept } = existing || {};
+  const mode = $('#ev-mode')?.value || '';
+  const key = ($('#ev-key')?.value || '').trim();
+  return { kind: 'event', type, ...kept, ...(Object.keys(where).length ? { where } : {}),
+    ...(mode ? { concurrency: { ...(key ? { key } : {}), mode } } : {}),
+    ...($('#trig-repeatable')?.checked ? { recurring: true } : {}) };
+}
+
+// Every dotted path in a real payload (lists reached through their items), with an example value.
+function eventPaths(payload, prefix = '', out = new Map(), depth = 0) {
+  if (!payload || typeof payload !== 'object' || depth > 4) return out;
+  const items = Array.isArray(payload) ? payload.slice(0, 3) : [payload];
+  for (const item of items) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    for (const [key, value] of Object.entries(item)) {
+      const path = prefix ? `${prefix}.${key}` : key;
+      if (value && typeof value === 'object') eventPaths(value, path, out, depth + 1);
+      else if (!out.has(path)) out.set(path, String(value ?? '').slice(0, 60));
+    }
+  }
+  return out;
+}
+
+// Suggestions from the catalog and from what this project actually received.
+function wireEventTrigger(projectId) {
+  const type = $('#ev-type');
+  if (!type) return;
+  const more = document.querySelector('#ev-trigger .ev-more');
+  let recent = null;
+  const loadRecent = () => (recent ??= Promise.all([
+    api('/api/events/catalog').catch(() => []),
+    projectId ? api(`/api/projects/${encodeURIComponent(projectId)}/events?limit=100`).catch(() => []) : [],
+  ]));
+  const fillTypes = async () => {
+    const [catalog, events] = await loadRecent();
+    const seen = [...new Set([...events.map((e) => e.type), ...catalog.filter((e) => e.source === 'project').map((e) => e.type)])];
+    $('#ev-types').innerHTML = seen.map((t) => `<option value="${esc(t)}"></option>`).join('');
+  };
+  const fillPaths = async () => {
+    const [catalog, events] = await loadRecent();
+    const chosen = type.value.trim();
+    const paths = new Map(Object.entries(catalog.find((e) => e.type === chosen)?.fields || {}));
+    const sample = events.find((e) => e.type === chosen);
+    if (sample) for (const [path, example] of eventPaths(sample.payload)) paths.set(path, example);
+    $('#ev-paths').innerHTML = [...paths].map(([p, example]) => `<option value="${esc(p)}" label="${esc(example)}"></option>`).join('');
+  };
+  type.addEventListener('focus', fillTypes, { once: true });
+  type.addEventListener('change', () => {
+    const repeatable = $('#trig-repeatable');
+    if (type.value.trim() && more.hidden && repeatable && !repeatable.disabled) repeatable.checked = true;
+    more.hidden = !type.value.trim();
+    fillPaths();
+  });
+  if (type.value.trim()) fillPaths();
+  const conds = $('#ev-conds');
+  $('#ev-add-cond').addEventListener('click', () => { conds.insertAdjacentHTML('beforeend', eventConditionHtml()); conds.lastElementChild.querySelector('.ev-path').focus(); });
+  conds.addEventListener('click', (event) => {
+    const x = event.target.closest('.ev-x');
+    if (!x) return;
+    x.closest('.ev-cond').remove();
+    conds.dispatchEvent(new Event('change', { bubbles: true }));
+  });
+  $('#ev-mode').addEventListener('change', () => { $('#ev-key').hidden = !$('#ev-mode').value; });
 }
 
 // ── schedule: the 5 labelled cron cells ──────────────────────────────────────
@@ -7198,9 +7339,7 @@ function selectedDepIds() {
 
 // Read the triggers section back into a TaskTrigger[] (empty ⇒ starts immediately).
 // Dependencies default to mode:'all' (AND) and on:'success' server-side, so we
-// only carry the task ids. `existing` is the task's stored triggers: event triggers
-// have no form UI (only agents create them, via the API), so any there are passed
-// through untouched — editing a task in the form must not silently drop them.
+// only carry the task ids. `existing` is the task's stored triggers.
 function collectTriggers(existing) {
   const trigs = [];
   const deps = selectedDepIds();
@@ -7212,7 +7351,11 @@ function collectTriggers(existing) {
     const ms = Date.parse(at);
     if (!isNaN(ms)) trigs.push({ kind: 'schedule', at: ms });
   }
-  for (const t of Array.isArray(existing) ? existing : []) if (t.kind === 'event') trigs.push(t);
+  // The form edits the first event trigger; any others (set through the API) are kept as they are.
+  const events = (Array.isArray(existing) ? existing : []).filter((t) => t.kind === 'event');
+  const edited = collectEventTrigger(events[0]);
+  if (edited) trigs.push(edited);
+  trigs.push(...events.slice(1));
   return trigs;
 }
 
@@ -7870,6 +8013,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   })();
   wireDepPicker(values, draft?.id);
   wireScheduleBuilder(values);
+  wireEventTrigger(projectId);
 
   // The priority+tags editor is wired further down, once `draftId`/`ensureDraft` exist
   // (a brand-new task needs a draft persisted before tags/priority can attach).
@@ -8359,6 +8503,7 @@ async function renderSeriesPage(rec) {
   renderCredentialEditor($('#cred-editor-newtask'), 'task', { projectId: rec.projectId, taskId: rec.id });
   wireDepPicker(values, rec.id);
   wireScheduleBuilder(values);
+  wireEventTrigger(rec.projectId);
   $('#tp-body').querySelectorAll('[data-runopen]').forEach((el) => wireTaskNav(el, () => el.dataset.runopen));
   $('#sd-runagain').addEventListener('click', async () => {
     try { await api(`/api/tasks/${rec.id}/run-again`, { method: 'POST', body: '{}' }); toast('New run started'); closeTask(); refreshTasks(); }
@@ -15784,6 +15929,7 @@ function settingsView(proj) {
       <button type="button" data-project-jump="project-services"><b>Services</b><span>Live systems</span></button>
       <button type="button" data-project-jump="project-environment"><b>Environment</b><span>Tools and setup</span></button>
       <button type="button" data-project-jump="project-computers"><b>Computers</b><span>Where tasks run</span></button>
+      <button type="button" data-project-jump="project-events"><b>Events</b><span>What starts tasks</span></button>
     </div>
     <div class="project-config-section" id="project-git"><div class="project-config-number">01</div><div><h2>Git &amp; GitHub</h2></div></div>
     <div class="card"><div id="project-repositories">Loading…</div></div>
@@ -15797,6 +15943,8 @@ function settingsView(proj) {
     <div class="card"><div id="project-environment-box">Loading…</div></div>
     <div class="project-config-section" id="project-computers"><div class="project-config-number">06</div><div><h2>Computers ${policyTip('The cloud computers this organization’s tasks run on. A task’s own computer—its size, experience and network—is set in Task defaults and the task form.')}</h2></div></div>
     <div class="card"><div id="project-computers-box">Loading…</div></div>
+    <div class="project-config-section" id="project-events"><div class="project-config-number">07</div><div><h2>Events ${policyTip('What happens outside a task: GitHub activity, webhook deliveries, chat messages to your bot, events tasks emit. A task with an “On event” trigger starts a run for each one it matches.')}</h2></div></div>
+    <div class="card"><div id="project-events-box">Loading…</div></div>
     <div class="settings-section-title" id="project-agents"><div>Agents</div></div>
     <div class="card"><div class="section-h section-h-action"><span>Account order ${policyTip('Tasks in this project use the first available account. Drag to reorder; switch one off to skip it here.')}</span><a class="btn sm ghost organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-agents">Manage accounts</a></div><div id="cred-editor-project">Loading…</div></div>
     <div class="settings-section-title" id="project-defaults"><div>Task defaults<small>How new tasks begin, unless a task says otherwise</small></div></div>
@@ -15825,6 +15973,147 @@ function settingsView(proj) {
     <div class="card"><div id="project-avatar-settings">Loading…</div></div>
     </div></div></div>`;
 }
+// ── Events: where outside happenings come from, and what each one did ───────
+const CHAT_PLATFORM_LABELS = { telegram: 'Telegram', slack: 'Slack', discord: 'Discord', whatsapp: 'WhatsApp' };
+
+// What one event did, said in a few words.
+function eventOutcome(event) {
+  const claims = event.claims || [];
+  if (!claims.length) return '<span class="setting-muted">No task waits for this</span>';
+  return claims.map((c) => {
+    const run = c.runId ? `<a href="#" data-pe-task="${esc(c.runId)}">a run</a>` : 'a run';
+    if (c.state === 'started') return `Started ${run}`;
+    if (c.state === 'told') return `Told ${run}`;
+    if (c.state === 'pending') return 'Starting a run…';
+    return `<span class="setting-muted" title="${esc(c.reason || '')}">${c.state === 'deferred' ? 'Waiting' : 'Skipped'}: ${esc(c.reason || '')}</span>`;
+  }).join(' · ');
+}
+
+function eventSourceLabel(source, hooks) {
+  const id = source.split(':')[1];
+  const hook = hooks.find((h) => h.id === id);
+  if (hook) return esc(hook.name);
+  if (source === 'github') return 'GitHub';
+  if (source.startsWith('task:')) return `<a href="#" data-pe-task="${esc(id)}">a task</a>`;
+  if (source.startsWith('user:')) return 'a person';
+  return esc(source);
+}
+
+function projectEventsHtml(projectId, list, events) {
+  const hooks = list.webhooks || [];
+  const health = (h) => h.lastError && (!h.lastDeliveryAt || h.lastError.at > h.lastDeliveryAt)
+    ? `<span class="warn" title="${esc(h.lastError.message)}">Refused one ${fmtAgo(h.lastError.at)}</span>`
+    : h.deliveries ? `${h.deliveries} received · last ${fmtAgo(h.lastDeliveryAt)}` : 'Nothing received yet';
+  const sourceRow = (h) => `<div class="setting-row" data-hook="${esc(h.id)}">
+    <span class="setting-label">${esc(h.name)}</span>
+    <span class="setting-value"><span class="setting-muted">${h.kind ? `${CHAT_PLATFORM_LABELS[h.kind]}${h.bot?.username ? ` · ${esc(h.bot.username.startsWith('+') ? h.bot.username : '@' + h.bot.username)}` : ''}` : `<code>${esc(h.type)}</code>`}</span><span class="setting-sep">·</span><span class="setting-muted">${health(h)}</span></span>
+    <span class="setting-actions">${h.kind ? '' : `<button class="btn sm ghost" data-hook-copy="${esc(list.urlBase + h.id)}">Copy URL</button><button class="btn sm ghost" data-hook-rotate title="Replace the secret; the old one stops working">New secret</button>`}<button class="btn sm ghost" data-hook-delete title="Delete">✕</button></span></div>`;
+  const eventRow = (e) => `<details class="pe-event"><summary class="setting-row">
+    <span class="setting-label"><code>${esc(e.type)}</code></span>
+    <span class="setting-value">${eventSourceLabel(e.source, hooks)}${e.subject ? ` · ${/^https?:/.test(e.subject) ? `<a href="${esc(e.subject)}" target="_blank" rel="noopener">${esc(e.subject.replace(/^https?:\/\/(www\.)?/, '').slice(0, 60))}</a>` : esc(e.subject.slice(0, 60))}` : ''}<span class="setting-sep">·</span>${eventOutcome(e)}</span>
+    <span class="setting-actions setting-muted">${fmtAgo(e.receivedAt)}</span></summary>
+    <pre class="pe-payload">${esc(JSON.stringify(e.payload, null, 2))}</pre></details>`;
+  return `<div class="section-h section-h-action"><span>Sources</span><span class="pe-add">
+      <button class="btn sm ghost" data-pe-new="webhook">＋ Webhook</button><button class="btn sm ghost" data-pe-new="chat">＋ Chat bot</button></span></div>
+    <div id="pe-form"></div>
+    <div class="setting-rows">${hooks.map(sourceRow).join('')}
+      <div class="setting-row"><span class="setting-label">GitHub</span><span class="setting-value setting-muted">Issues, pull requests, pushes, releases and failed workflows of this project’s repositories</span></div></div>
+    <div class="section-h">Recent</div>
+    <div class="setting-rows pe-events">${events.length ? events.map(eventRow).join('') : '<div class="setting-row setting-muted">Nothing yet</div>'}</div>`;
+}
+
+function webhookFormHtml() {
+  return `<div class="inline-form pe-new"><input id="pe-name" placeholder="Name, e.g. Sentry" autocomplete="off">
+    <input id="pe-type" placeholder="Event type (optional)" title="What its events are called, e.g. sentry.alert" autocomplete="off" spellcheck="false">
+    <button class="btn sm primary" id="pe-create">Create</button><button class="btn sm ghost" data-pe-cancel>Cancel</button></div>`;
+}
+
+function chatFormHtml(platforms, kind) {
+  const fields = platforms[kind] || [];
+  return `<div class="pe-new pe-chat">
+    <div class="segmented" role="group" aria-label="Platform">${Object.keys(platforms).map((k) => `<button type="button" data-pe-platform="${k}" aria-pressed="${k === kind}">${CHAT_PLATFORM_LABELS[k] || k}</button>`).join('')}</div>
+    <div class="inline-form">${fields.map((f) => `<input data-pe-cred="${esc(f.name)}" placeholder="${esc(f.label)}" ${f.secret ? 'type="password"' : ''} autocomplete="off" spellcheck="false">`).join('')}</div>
+    <label class="pe-starts"><input type="checkbox" class="toggle" id="pe-starts" checked> Start a task for each message ${policyTip('Adds a task that runs once per message to the bot. Replies in the same thread go to the run already working on it.')}</label>
+    <div class="inline-form"><button class="btn sm primary" id="pe-connect">Connect</button><button class="btn sm ghost" data-pe-cancel>Cancel</button></div></div>`;
+}
+
+// Shown once: what to paste where.
+function revealHtml(rows) {
+  return `<div class="pe-reveal"><div class="setting-muted">Copy these now; they won’t be shown again.</div>
+    ${rows.map(([label, value]) => `<div class="setting-row"><span class="setting-label">${esc(label)}</span><span class="setting-value"><code>${esc(value)}</code></span><span class="setting-actions"><button class="btn sm ghost" data-copy-value="${esc(value)}">Copy</button></span></div>`).join('')}
+    <div class="inline-form"><button class="btn sm" data-pe-done>Done</button></div></div>`;
+}
+
+async function hydrateProjectEvents(proj) {
+  const box = $('#project-events-box');
+  if (!box) return;
+  const base = `/api/projects/${encodeURIComponent(proj.id)}`;
+  const load = async () => {
+    let list, events;
+    try {
+      [list, events] = await Promise.all([api(`${base}/webhooks`), api(`${base}/events?limit=25`)]);
+    } catch (e) { return paneError(box, e, load); }
+    box.innerHTML = projectEventsHtml(proj.id, list, events);
+    const form = $('#pe-form');
+    const copy = async (value) => { await copyToClipboard(value); toast('Copied'); };
+    box.querySelectorAll('[data-hook-copy]').forEach((b) => b.addEventListener('click', () => copy(b.dataset.hookCopy)));
+    box.querySelectorAll('[data-pe-task]').forEach((a) => a.addEventListener('click', (e) => { e.preventDefault(); openTask(a.dataset.peTask); }));
+    box.querySelectorAll('[data-hook-delete]').forEach((b) => b.addEventListener('click', async () => {
+      const row = b.closest('[data-hook]');
+      if (!confirm(`Delete “${row.querySelector('.setting-label').textContent}”? It stops receiving events.`)) return;
+      try { await api(`/api/webhooks/${row.dataset.hook}`, { method: 'DELETE' }); load(); } catch (e) { toast(e.message, true); }
+    }));
+    box.querySelectorAll('[data-hook-rotate]').forEach((b) => b.addEventListener('click', async () => {
+      const row = b.closest('[data-hook]');
+      if (!confirm('Replace the secret? Senders using the old one are refused until they get the new one.')) return;
+      try {
+        const { secret } = await api(`/api/webhooks/${row.dataset.hook}/rotate`, { method: 'POST' });
+        form.innerHTML = revealHtml([['URL', list.urlBase + row.dataset.hook], ['Secret', secret]]);
+        wireForm();
+      } catch (e) { toast(e.message, true); }
+    }));
+    const wireForm = () => {
+      form.querySelectorAll('[data-pe-cancel], [data-pe-done]').forEach((b) => b.addEventListener('click', () => (b.dataset.peDone !== undefined ? load() : (form.innerHTML = ''))));
+      form.querySelectorAll('[data-copy-value]').forEach((b) => b.addEventListener('click', () => copy(b.dataset.copyValue)));
+    };
+    const showChat = (kind) => {
+      form.innerHTML = chatFormHtml(list.platforms || {}, kind);
+      wireForm();
+      form.querySelectorAll('[data-pe-platform]').forEach((b) => b.addEventListener('click', () => showChat(b.dataset.pePlatform)));
+      $('#pe-connect').addEventListener('click', async (e) => {
+        const button = e.currentTarget;
+        const credentials = Object.fromEntries([...form.querySelectorAll('[data-pe-cred]')].map((i) => [i.dataset.peCred, i.value.trim()]));
+        button.disabled = true;
+        try {
+          const created = await api(`${base}/webhooks`, { method: 'POST', body: JSON.stringify({ name: `${CHAT_PLATFORM_LABELS[kind]} bot`, kind, credentials }) });
+          if ($('#pe-starts')?.checked) await api(`${base}/tasks`, { method: 'POST', body: JSON.stringify({
+            title: '{{text}}', prompt: 'Do what this chat message asks. Your final message is posted back to the chat.',
+            params: { repeatable: true, triggers: [{ kind: 'event', type: 'chat.mention', source: `chat:${created.hook.id}`, recurring: true,
+              concurrency: { key: '{{channel.id}}/{{thread}}', mode: 'tell' } }] } }) });
+          if (created.verifyToken) { form.innerHTML = revealHtml([['Callback URL', created.url], ['Verify token', created.verifyToken]]); wireForm(); }
+          else { toast(`${CHAT_PLATFORM_LABELS[kind]} bot connected`); load(); }
+        } catch (err) { toast(err.message, true); button.disabled = false; }
+      });
+    };
+    box.querySelector('[data-pe-new="chat"]').addEventListener('click', () => showChat(Object.keys(list.platforms || {})[0] || 'telegram'));
+    box.querySelector('[data-pe-new="webhook"]').addEventListener('click', () => {
+      form.innerHTML = webhookFormHtml();
+      wireForm();
+      $('#pe-name').focus();
+      $('#pe-create').addEventListener('click', async (e) => {
+        const button = e.currentTarget;
+        button.disabled = true;
+        try {
+          const created = await api(`${base}/webhooks`, { method: 'POST', body: JSON.stringify({ name: $('#pe-name').value, type: $('#pe-type').value.trim() || undefined }) });
+          form.innerHTML = revealHtml([['URL', created.url], ['Secret', created.secret], ['Event type', created.hook.type]]);
+          wireForm();
+        } catch (err) { toast(err.message, true); button.disabled = false; }
+      });
+    });
+  };
+  load();
+}
+
 // A settings pane that fails to load used to dead-end on bare server text. Say
 // plainly what happened, keep the raw detail on hover, and offer the one useful
 // next step.
@@ -16464,6 +16753,7 @@ function wireSettingsView(proj) {
   }));
   hydrateProjectAccess(proj);
   hydrateComputers($('#project-computers-box'), proj.organizationId);
+  hydrateProjectEvents(proj);
   hydrateConversationSharing('project', proj.id);
   hydrateAvatarAvailability('project', proj.id);
   hydrateProjectSecrets(proj);

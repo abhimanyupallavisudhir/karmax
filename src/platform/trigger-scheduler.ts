@@ -506,7 +506,7 @@ export class TriggerScheduler {
   }
 
   private async dispatchProjectEvent(event: ProjectEvent): Promise<void> {
-    for (const entry of [...this.armed.values()]) {
+    for (const entry of this.armed.values()) {
       if (entry.fired || entry.task.projectId !== event.projectId || this.armed.get(entry.task.id) !== entry) continue;
       const trigger = this.projectEventTrigger(entry, event);
       if (trigger) await this.offerProjectEvent(entry, trigger, event);

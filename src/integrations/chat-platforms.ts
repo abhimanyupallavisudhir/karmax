@@ -72,7 +72,7 @@ export class ChatPlatformError extends Error {}
 
 async function call(fetcher: typeof fetch, url: string, init: RequestInit, platform: string): Promise<any> {
   const response = await fetcher(url, { ...init, signal: AbortSignal.timeout(15_000) });
-  const body = await response.json().catch(() => undefined) as any;
+  const body: any = await response.json().catch(() => undefined);
   // Telegram and Slack answer 200 with ok:false; Discord and Meta use the status.
   if (!response.ok || body?.ok === false) {
     const reason = body?.description ?? body?.error ?? body?.message ?? body?.error?.message ?? `HTTP ${response.status}`;

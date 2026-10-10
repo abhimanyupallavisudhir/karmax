@@ -26,6 +26,7 @@ import {
 import { ActivityCancellationType, msToNumber, type Duration } from '@temporalio/common';
 import type { childActivities } from '../activities/children.js';
 import type { coreActivities } from '../activities/core.js';
+import type { WorldHandle } from '../world/types.js';
 import type { coordinatorActivities } from '../activities/coordinator.js';
 import { SIG_MERGE_GRANTED, SIG_ACCOUNT_GRANTED, SIG_AGENT_SLOT_GRANTED, RELIST_ACCOUNT_GRANT } from '../coordinators/names.js';
 import { editableInFlight } from '../platform/mutability.js';
@@ -2648,9 +2649,10 @@ async function softwareDevImpl(
    */
   async function commandTurn(): Promise<AgentTurnResult & { stopped?: true; commandFailed?: string }> {
     commandRan = true;
+    const handle = world as unknown as WorldHandle;
     const command = taskCommand!;
     const runKey = workflowInfo().runId;
-    const { jobId } = await core.startTaskCommand({ taskId, worldHandle: world as any, task: liveInput, command, runKey });
+    const { jobId } = await core.startTaskCommand({ taskId, worldHandle: handle, task: liveInput, command, runKey });
     status = 'active';
     waitingFor = { kind: 'job', detail: 'Running the task command', summary: 'Task command', jobs: [jobId] };
     await publish();
@@ -2659,13 +2661,13 @@ async function softwareDevImpl(
       const scope = new CancellationScope();
       let settled = false;
       let failure: unknown;
-      const watching = scope.run(() => commandWatch.awaitJobs(world as any, [jobId], Date.now() + 24 * 3600_000))
+      const watching = scope.run(() => commandWatch.awaitJobs(handle, [jobId], Date.now() + 24 * 3600_000))
         .catch((error) => { if (!isCancellation(error)) failure = error; })
         .finally(() => { settled = true; });
       await condition(() => settled || cancelled);
       if (!settled) { scope.cancel(); await watching; break; }
       if (failure) throw failure;
-      result = await core.taskCommandResult({ taskId, worldHandle: world as any, runKey });
+      result = await core.taskCommandResult({ taskId, worldHandle: handle, runKey });
     }
     waitingFor = undefined;
     if (cancelled) return { completed: false, providerCompleted: false, output: '' };
@@ -2674,8 +2676,8 @@ async function softwareDevImpl(
     if (result.state === 'exited' && result.exitCode === 0) {
       // The output is a record for people; an agent called in later reads it there.
       seen = msgs.length;
-      await core.commitWork(world as any, `${input.title}: ran the task command`.slice(0, 200));
-      const review = await core.buildReview(world as any, base);
+      await core.commitWork(handle, `${input.title}: ran the task command`.slice(0, 200));
+      const review = await core.buildReview(handle, base);
       commandUnchanged = !review.changedFiles.length;
       if (explicitPrCycle) prRequested = true;
       return { completed: true, providerCompleted: true, output: '', openPrRequested: true };
@@ -2696,7 +2698,7 @@ async function softwareDevImpl(
     await publish();
     if (world) {
       const remoteWorld = releaseWorldOnCompletion(world);
-      await core.destroyWorld(world as any);
+      await core.destroyWorld(world as unknown as WorldHandle);
       if (remoteWorld) {
         releasedWorld = world;
         world = undefined;

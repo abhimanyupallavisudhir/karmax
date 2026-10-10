@@ -2206,7 +2206,7 @@ export class Store {
       payment_events: (await selectRows(this.db, 'payment_events', 'organizationId=?', [organizationId])),
       project_events: (await selectRows(this.db, 'project_events', 'organizationId=?', [organizationId])),
       project_event_claims: (await rowsFor(this.db, 'project_event_claims', 'eventId',
-        ((await this.db.prepare('SELECT id FROM project_events WHERE organizationId=?').all(organizationId)) as any[]).map((r) => String(r.id)))),
+        ((await this.db.prepare('SELECT id FROM project_events WHERE organizationId=?').all(organizationId)) as Array<{ id: unknown }>).map((r) => String(r.id)))),
       subscription_gifts: (await selectRows(this.db, 'subscription_gifts', 'organizationId=?', [organizationId])),
       storage_pack_gifts: (await selectRows(this.db, 'storage_pack_gifts', 'organizationId=?', [organizationId])),
       subscription_billing_accounts: (await selectRows(this.db, 'subscription_billing_accounts', 'organizationId=?', [organizationId])),
@@ -8463,7 +8463,7 @@ export class Store {
     const rows = await this.db.prepare(`SELECT * FROM project_event_claims WHERE state=?
       ${options.updatedBefore !== undefined ? 'AND updatedAt<?' : ''} ORDER BY receivedAt, eventId
       LIMIT ${Math.min(Math.max(Math.trunc(options.limit ?? 200), 1), 1000)}`)
-      .all(...[state, ...(options.updatedBefore !== undefined ? [options.updatedBefore] : [])]);
+      .all(state, ...(options.updatedBefore !== undefined ? [options.updatedBefore] : []));
     return rows.map(projectEventClaimFromRow);
   }
 
