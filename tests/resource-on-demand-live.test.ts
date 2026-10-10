@@ -82,6 +82,7 @@ describe.skipIf(!run)('on-demand resources in real E2B worlds', () => {
     process.env.KARMAX_HOST = '0.0.0.0';
     const server = await gateway.listen(Number(process.env.KARMAX_LIVE_PORT ?? 49_950));
     cleanups.push(() => server.close());
+    log(`repository server on ${server.url}, reached by worlds at ${publicUrl}`);
 
     const data = await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
       name: 'raw_data', driver: 'volume@1', target: { kind: 'path', path: 'raw_data' }, access: 'write', isolation: 'fork',
@@ -94,7 +95,8 @@ describe.skipIf(!run)('on-demand resources in real E2B worlds', () => {
     const task = await store.createTask({ projectId: project.id, title: 'OCR cleanup', workflow: 'software-dev', workflowVersion: '1.26.0',
       params: { prompt: 'clean the OCR' } });
     const open = async (generation: number, revisions: Record<string, string> = {}) => {
-      const world = await e2b.create({ taskId: task.id, base: 'main' });
+      // Allowed to reach the repository server, as worlds reach the public gateway (publicGatewayDomains).
+      const world = await e2b.create({ taskId: task.id, base: 'main', network: { allowDomains: [new URL(publicUrl).hostname] } });
       cleanups.push(() => world.destroy());
       world.handle = await resources.materialize(project.id, task.id, world, generation, revisions);
       world.handle = (await store.registerWorld(world.handle, project.id)) as typeof world.handle;
