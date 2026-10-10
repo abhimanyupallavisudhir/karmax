@@ -321,6 +321,20 @@ describe('native MCP connections', () => {
     await expect(service.execute(org, request.id, 'task_a', project, 'search_emails', {})).rejects.toThrow('Reconnect');
   });
 
+  it('explains servers whose sign-in needs a registered OAuth app', async () => {
+    const fetchFixture = vi.mocked(network.publicFetch).getMockImplementation()!;
+    vi.mocked(network.publicFetch).mockImplementation(async (input, init) => {
+      const req = new Request(input, init);
+      if (req.url.includes('.well-known/oauth-authorization-server')) return new Response(JSON.stringify({ issuer: 'https://auth.example',
+        authorization_endpoint: 'https://auth.example/authorize', token_endpoint: 'https://auth.example/token', response_types_supported: ['code'],
+        code_challenge_methods_supported: ['S256'] }), { headers: { 'content-type': 'application/json' } });
+      return fetchFixture(input, init);
+    });
+    const request = (await service.requestMcp(org, await service.resolveMcp('https://mail.example/mcp'), 'task_a', 'do', 'Mail'));
+    await expect(service.connect(org, 'alice', { id: request.id, redirect: 'https://tavya.example/mcp-callback' }))
+      .rejects.toThrow('needs an OAuth app registered with it');
+  });
+
   it('connects servers without authentication immediately and expires abandoned sign-ins', async () => {
     vi.mocked(network.publicStreamFetch).mockResolvedValueOnce(new Response('{}', { status: 200 }));
     const open = (await service.requestMcp(org, await service.resolveMcp('https://open.example/mcp'), 'task_a', 'do', 'Public data'));
@@ -330,5 +344,87 @@ describe('native MCP connections', () => {
     await service.connect(org, 'alice', { id: oauth.id, redirect: 'https://tavya.example/mcp-callback' });
     vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 31 * 60_000);
     expect((await service.refresh(org, oauth.id)).status).toBe('expired');
+  });
+});
+
+describe('GitHub MCP connections', () => {
+  // GitHub's MCP server authorizes through github.com/login/oauth, which offers
+  // neither dynamic registration nor client metadata documents. Tavya signs in
+  // with its own GitHub App instead.
+  const GITHUB_MCP = 'https://api.githubcopilot.com/mcp/';
+  let home: string, store: Store, service: ServiceConnections, org: string, project: string;
+  let accounts: Record<string, string | undefined>;
+  const github = {
+    account: vi.fn(async (userId: string) => accounts[userId]),
+    token: vi.fn(async (userId: string, accountId?: string) => {
+      if (!accountId || accounts[userId] !== accountId) throw new Error('Connect GitHub on your profile, then try again.');
+      return `ghu_${userId}_${accountId}`;
+    }),
+    authorizationUrl: vi.fn(async () => 'https://github.com/login/oauth/authorize?client_id=Iv1.tavya&state=kg_state'),
+  };
+  const callTool = vi.fn(async () => ({ content: [{ type: 'text', text: 'octocat' }] }));
+  const open = vi.fn(async () => ({ listTools: async () => ({ tools: [] }), callTool, close: async () => {} }) as any);
+  beforeEach(async () => {
+    home = fs.mkdtempSync(path.join(os.tmpdir(), 'github-mcp-connections-'));
+    store = (await Store.create(':memory:'));
+    org = (await store.createOrganization({ name: 'Team', ownerUserId: 'alice' })).id;
+    project = (await store.createProject('Project', {}, org)).id;
+    accounts = {};
+    service = new ServiceConnections(store, new CredentialBroker(new Vault(path.join(home, 'vault'))), () => { throw new Error('Composio used'); }, open, github);
+    vi.spyOn(network, 'publicStreamFetch').mockResolvedValue(new Response('', { status: 401 }));
+    vi.spyOn(network, 'publicFetch').mockImplementation(async (input, init) => {
+      const req = new Request(input, init);
+      const json = (value: unknown) => new Response(JSON.stringify(value), { headers: { 'content-type': 'application/json' } });
+      if (req.url.startsWith('https://api.githubcopilot.com/.well-known/oauth-protected-resource'))
+        return json({ resource: GITHUB_MCP, authorization_servers: ['https://github.com/login/oauth'], scopes_supported: ['repo'] });
+      if (req.url.startsWith('https://github.com/.well-known/oauth-authorization-server')) return json({ issuer: 'https://github.com/login/oauth',
+        authorization_endpoint: 'https://github.com/login/oauth/authorize', token_endpoint: 'https://github.com/login/oauth/access_token',
+        response_types_supported: ['code'], code_challenge_methods_supported: ['S256'] });
+      throw new Error(`Unexpected request ${req.url}`);
+    });
+  });
+  afterEach(async () => { (await store.close()); fs.rmSync(home, { recursive: true, force: true }); vi.restoreAllMocks(); open.mockClear(); callTool.mockClear(); });
+
+  it('uses the person’s GitHub sign-in at once when they have one', async () => {
+    accounts.alice = '583231';
+    const request = (await service.requestMcp(org, await service.resolveMcp(GITHUB_MCP), 'task_a', 'do', 'Read issues'));
+    expect(request.mcp).toMatchObject({ url: GITHUB_MCP, auth: 'github' });
+    const result = await service.connect(org, 'alice', { id: request.id, redirect: 'https://tavya.example/mcp-callback' });
+    expect(result).toEqual({ connection: expect.objectContaining({ status: 'active' }) });
+    expect(await service.execute(org, request.id, 'task_a', project, 'get_me', {})).toEqual({ content: [{ type: 'text', text: 'octocat' }] });
+    expect(open).toHaveBeenLastCalledWith({ type: 'http', url: GITHUB_MCP }, { Authorization: 'Bearer ghu_alice_583231' });
+    expect(JSON.stringify(await service.list(org, { taskId: 'task_a', projectId: project }))).not.toContain('ghu_');
+    // The account stays pinned: removing that GitHub sign-in ends access instead of switching accounts.
+    accounts.alice = '999';
+    await expect(service.execute(org, request.id, 'task_a', project, 'get_me', {})).rejects.toThrow('reconnect');
+  });
+
+  it('sends a person without a GitHub sign-in through GitHub, then finishes once they return', async () => {
+    const request = (await service.requestMcp(org, await service.resolveMcp(GITHUB_MCP), 'task_a', 'do', 'Read issues'));
+    const started = await service.connect(org, 'alice', { id: request.id, redirect: 'https://tavya.example/mcp-callback' });
+    expect(started).toMatchObject({ callback: 'github', url: expect.stringMatching(/^https:\/\/github\.com\/login\/oauth\/authorize/),
+      connection: { status: 'connecting' } });
+    expect(github.authorizationUrl).toHaveBeenCalledWith(org, 'alice');
+    expect((await service.refresh(org, request.id)).status).toBe('connecting');
+    accounts.alice = '583231';
+    expect((await service.refresh(org, request.id)).status).toBe('active');
+    expect(await service.execute(org, request.id, 'task_a', project, 'get_me', {})).toMatchObject({ content: expect.any(Array) });
+    expect(open).toHaveBeenLastCalledWith({ type: 'http', url: GITHUB_MCP }, { Authorization: 'Bearer ghu_alice_583231' });
+  });
+
+  it('heals a GitHub request recorded before GitHub sign-in was supported', async () => {
+    accounts.alice = '583231';
+    const request = (await service.requestMcp(org, await service.resolveMcp(GITHUB_MCP), 'task_a', 'do', 'Read issues'));
+    const legacy = { ...request, mcp: { ...request.mcp!, auth: 'oauth' as const } };
+    (await store.kvSet(`service-connection:${request.id}`, JSON.stringify(legacy)));
+    expect(await service.connect(org, 'alice', { id: request.id, redirect: 'https://tavya.example/mcp-callback' }))
+      .toEqual({ connection: expect.objectContaining({ status: 'active', mcp: expect.objectContaining({ auth: 'github' }) }) });
+  });
+
+  it('says plainly when the installation has no GitHub App', async () => {
+    const bare = new ServiceConnections(store, new CredentialBroker(new Vault(path.join(home, 'vault2'))), () => { throw new Error('Composio used'); }, open);
+    const request = (await bare.requestMcp(org, await bare.resolveMcp(GITHUB_MCP), 'task_a', 'do', 'Read issues'));
+    await expect(bare.connect(org, 'alice', { id: request.id, redirect: 'https://tavya.example/mcp-callback' }))
+      .rejects.toThrow('GitHub sign-in is not set up');
   });
 });

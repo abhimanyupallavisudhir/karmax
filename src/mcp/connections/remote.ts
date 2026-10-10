@@ -1,7 +1,8 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
-import { publicStreamFetch } from './http.js';
+import { discoverOAuthProtectedResourceMetadata } from '@modelcontextprotocol/sdk/client/auth.js';
+import { publicFetch, publicStreamFetch } from './http.js';
 
 export type RemoteMcpTransport = { type: 'http' | 'sse'; url: string };
 
@@ -37,4 +38,14 @@ export async function remoteMcpAuth(transport: RemoteMcpTransport): Promise<'oau
   if (response.status === 401) return 'oauth';
   if (response.ok) return 'none';
   throw new Error(`The MCP server answered HTTP ${response.status}`);
+}
+
+/** Whether a server authorizes through GitHub (as GitHub's own MCP server does).
+ * GitHub registers no clients on demand, so such servers sign in with the
+ * installation's GitHub App instead of the generic MCP OAuth flow. */
+export async function authorizesWithGitHub(transport: RemoteMcpTransport): Promise<boolean> {
+  try {
+    const metadata = await discoverOAuthProtectedResourceMetadata(transport.url, undefined, publicFetch);
+    return metadata.authorization_servers?.some((server) => server.replace(/\/$/, '') === 'https://github.com/login/oauth') ?? false;
+  } catch { return false; }
 }
