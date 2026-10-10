@@ -21,6 +21,7 @@ describe('Computer defaults', () => {
   const updates: unknown[] = [];
   const signals: unknown[][] = [];
   let tokens: TokenAuthority;
+  let worlds: WorldRegistry;
   let close: () => Promise<void>;
   let token: string;
   const connected = new Set(['e2b']);
@@ -37,7 +38,7 @@ describe('Computer defaults', () => {
     store = await Store.create(':memory:');
     await seedProfiles(store, 'mock');
     tokens = new TokenAuthority();
-    const worlds = new WorldRegistry();
+    worlds = new WorldRegistry();
     const client = { workflow: { getHandle: () => ({ query: async () => [], signal: async (...args: unknown[]) => { signals.push(args); },
       executeUpdate: async (_name: string, options: { args: unknown[] }) => { updates.push(options.args[0]); return { applied: [] }; } }),
       start: async () => ({}) } } as any;
@@ -208,5 +209,35 @@ describe('Computer defaults', () => {
     // Back to the size it has: nothing pending.
     await api.updateParams(editor, task.id, { computer: { diskGb: null } });
     expect((await api.getTaskView(editor, task.id))?.computerChange).toBeUndefined();
+  });
+
+  // A VM world (Fly.io, Hetzner) keeps its disk: the disk grows now, under the
+  // running agent, which is told; nothing waits for a park.
+  it('grows a running VM world\'s disk at once and tells its agent', async () => {
+    const resized: unknown[] = [];
+    worlds.register({ kind: 'fly', parkable: true, async create() { throw new Error('unused'); }, async open() { throw new Error('unused'); },
+      async resize(_handle: unknown, to: { diskGb?: number }) { resized.push(to); return { disk: 'grown', restart: false, machine: { cpu: 2, memoryMb: 2048, diskGb: to.diskGb! } }; } } as any);
+    const project = await store.createProject('VM', { worldProvider: 'fly', resources: { cpu: 2, memoryMb: 2048, diskGb: 100 } });
+    const task = await store.createTask({ projectId: project.id, title: 'Bigger data', workflow: 'software-dev',
+      workflowVersion: '1.27.0', params: { prompt: 'x' } });
+    const handle = { version: 2, kind: 'fly', provider: 'fly', id: task.id, generation: 1, root: '/home/user/karmax', workspaceRoot: '/home/user/karmax',
+      branch: `tavya/${task.id}`, base: 'main', meta: { projectId: project.id, computer: { cpu: 2, memoryMb: 2048, diskGb: 100 } } } as any;
+    await store.registerWorld(handle, project.id);
+    await store.saveView(task.id, { taskId: task.id, workflow: 'software-dev', stage: 'do', status: 'active', actions: [], editableParams: [] } as any);
+    const editor = (await tokens.mintPrincipal('user:editor', ['task:edit', 'task:read'], project.id)).token;
+    signals.length = 0;
+
+    await api.updateParams(editor, task.id, { computer: { diskGb: 150 } });
+    expect(resized).toEqual([{ cpu: 2, memoryMb: 2048, diskGb: 150 }]);
+    expect((await store.currentWorld(task.id))!.meta).toMatchObject({ computer: { diskGb: 150 }, machine: { diskGb: 150 } });
+    // Nothing is pending: the world already has its new disk.
+    expect((await api.getTaskView(editor, task.id))?.computerChange).toBeUndefined();
+    expect(signals).toHaveLength(1);
+    expect((signals[0] as [string, { text: string }])[1].text).toMatch(/disk is now 150 GB\. It grew in place/);
+
+    // More CPU waits for the next start, and the agent hears that nothing on disk is lost.
+    signals.length = 0;
+    await api.updateParams(editor, task.id, { computer: { diskGb: 150, cpu: 4 } });
+    expect((signals[0] as [string, { text: string }])[1].text).toMatch(/Git-ignored files included/);
   });
 });
