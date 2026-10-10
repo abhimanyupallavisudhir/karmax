@@ -4166,6 +4166,28 @@ export class Store {
       .map(({ row, forkOf }) => ({ ...taskSummary(row), forkOf: forkOf.filter((id) => reached.has(id)) }));
   }
 
+  /** Every task this one was forked from, their sources included, archived ones
+   * too, oldest first, for its Forked from panel (`TaskView.forkSourceSummaries`).
+   * Sources are found within the fork's project, like its forks. */
+  async forkSourceTaskSummaries(taskId: string): Promise<ForkTaskSummary[]> {
+    const [task] = await this.readRows<{ projectId: string; params: string }>('SELECT projectId, params FROM tasks WHERE id = ?', [taskId]);
+    if (!task) return [];
+    const forkOf = new Map<string, string[]>();
+    const seen = new Set([taskId]);
+    let next = taskForkSourceIds(JSON.parse(task.params));
+    while ((next = next.filter((id) => !seen.has(id))).length) {
+      for (const id of next) seen.add(id);
+      const rows = await this.readRows<{ id: string; params: string }>(`SELECT id, params FROM tasks
+        WHERE projectId = ? AND id IN (${next.map(() => '?').join(',')})`, [task.projectId, ...next]);
+      next = [];
+      for (const row of rows) { const sources = taskForkSourceIds(JSON.parse(row.params)); forkOf.set(row.id, sources); next.push(...sources); }
+    }
+    if (!forkOf.size) return [];
+    const rows = await this.readRows<TaskSummaryRow>(`SELECT id, num, title, workflow, lastView FROM tasks
+      WHERE id IN (${[...forkOf.keys()].map(() => '?').join(',')}) ORDER BY createdAt, ord, rowid`, [...forkOf.keys()]);
+    return rows.map((row) => ({ ...taskSummary(row), forkOf: forkOf.get(row.id)!.filter((id) => forkOf.has(id)) }));
+  }
+
   /** Resolve a task by its per-project sequential number (SPEC §10.6). */
   async taskPointerByNumAsync(projectId: string, num: number): Promise<Pick<TaskRecord, 'id' | 'num' | 'projectId'> | undefined> {
     const [row] = await this.readRows<{ id: string; num: number; projectId: string }>(`SELECT t.id,

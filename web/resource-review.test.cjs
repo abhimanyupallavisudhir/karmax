@@ -36,7 +36,7 @@ function setup(api) {
     document: { getElementById: (id) => id === 'review-resource-inventory' ? inventory : wrap }, esc: String, formatBytes: String, confirm: () => true, toast: () => {},
     S: {}, ICON: {}, siteNameMarkup: () => 'Karmax', markdownEnabled: () => false, mathjaxEnabled: () => true, renderAgentMessageBody: String, renderWaitDetail: String, explainMessageAffordance: () => '',
     waitingText: () => 'Waiting', liveRoleFor: () => 'do', conversationPresence: () => ({ tone: 'waiting', label: 'Waiting' }),
-    conversationEntries: () => [], subTasksSection: () => '', agentForksSection: () => '', pipelineLarge: () => '',
+    conversationEntries: () => [], subTasksSection: () => '', forkSourcesSection: () => '', agentForksSection: () => '', pipelineLarge: () => '',
     checkoutsSection: () => '', renderWidgetGroups: () => '', notesSection: () => '',
     conversationApprovalRequests: () => '',
     approvalRequestsTab: () => 'approvals', parametersTab: () => 'parameters',

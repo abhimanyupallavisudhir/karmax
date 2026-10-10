@@ -1647,8 +1647,8 @@ export interface ChildTaskSummary {
   lastView?: Pick<TaskView, 'stage' | 'status' | 'waitingFor' | 'pointOfNoReturnPassed' | 'approvalRequests'> & { state?: { draft?: boolean } };
 }
 
-/** A task forked from another task's agent, as the source's Agent forks panel
- *  shows it; `forkOf` names the task(s) in that tree it resumed from. */
+/** A task in a fork lineage, as the Agent forks and Forked from panels show it;
+ *  `forkOf` names the task(s) in that lineage it resumed from. */
 export interface ForkTaskSummary extends ChildTaskSummary {
   forkOf: string[];
 }
@@ -1736,6 +1736,9 @@ export interface TaskView {
   /** Every task forked from this one's agents, nested forks included: a finished
    *  fork is archived out of the live task list. */
   forkSummaries?: ForkTaskSummary[];
+  /** Every task this one was forked from, their sources included, oldest first:
+   *  the Forked from panel, the mirror image of `forkSummaries`. */
+  forkSourceSummaries?: ForkTaskSummary[];
   parentTaskId?: string;
   /** The parent's list identity, which outlives the parent in the live task list. */
   parentTask?: { id: string; num?: number; title: string };

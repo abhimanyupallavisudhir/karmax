@@ -30,6 +30,11 @@ const root = __dirname;
       reviewInfo: { caption: undefined, summary: '3 file(s) changed.\n\nMerged into main as 1a2b3c4d.', completion: 'signalled',
         actions: [{ kind: 'open', label: 'Screenshot', target: 'shot.png' }] },
       prs: [{ repo: 'app', number: 7, url: 'https://github.com/o/app/pull/7', state: 'closed', merged: true }],
+      // It was itself forked from an archived task, which was forked from another.
+      forkSourceSummaries: [
+        { id: 'origin', num: 8, title: 'Sketch the export', workflow: 'software-dev', lastView: { stage: 'done', status: 'done' }, forkOf: [] },
+        { id: 'attempt', num: 9, title: 'Export as CSV', workflow: 'software-dev', lastView: { stage: 'done', status: 'done' }, forkOf: ['origin'] },
+      ],
       forkSummaries: [
         { id: 'fork-done', num: 13, title: 'Try a toolbar icon', workflow: 'software-dev', lastView: { stage: 'done', status: 'done' }, forkOf: ['child'] },
         { id: 'fork-live', num: 14, title: 'Try a menu instead', workflow: 'software-dev', lastView: { stage: 'setup', status: 'active' }, forkOf: ['child'] },
@@ -82,6 +87,10 @@ const root = __dirname;
     assert.match(overview, /work summary[\s\S]*3 file\(s\) changed\.[\s\S]*Merged into main as 1a2b3c4d\./i, 'the work summary keeps what the work was');
     assert.match(overview, /Screenshot/, 'review outputs stay openable');
     assert.match(overview, /2 task forks/, 'finished and live forks are both listed');
+    assert.match(overview, /Forked from\s*2 source tasks\s*#8\s*Sketch the export[\s\S]*#9\s*Export as CSV[\s\S]*Agent forks/,
+      'the tasks it was forked from are listed, oldest first, above its own forks');
+    assert.equal(await page.locator('#fork-sources-title').locator('xpath=ancestor::section').locator('a[href$="/tasks/origin"] + .fork-tree a[href$="/tasks/attempt"]').count(), 1,
+      'its direct source nests under the task that one was forked from');
     assert.equal(await page.locator('a[href$="/tasks/fork-done"] .subtask-state.done').count(), 1, 'the finished fork shows as done');
     assert.match(overview, /PR #7\s*merged/i, 'the merged pull request stays linked');
 
