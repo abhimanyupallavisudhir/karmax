@@ -3371,7 +3371,7 @@ export class Store {
    *  `purpose: 'manifest'` marks the App-creation flow, the only one whose
    *  callback may configure the installation-wide App (see the gateway). */
   async createGithubInstallState(organizationId: string, userId: string,
-    options: number | { ttlMs?: number; returnTo?: 'profile' | 'installation'; githubAccountId?: string;
+    options: number | { ttlMs?: number; returnTo?: 'profile' | 'installation' | 'connection'; githubAccountId?: string;
       githubLogin?: string; selectAccount?: boolean; purpose?: 'manifest' } = {}): Promise<string> {
     return this.db.transaction(async () => {
 
@@ -3379,7 +3379,7 @@ export class Store {
     const state = `kg_${crypto.randomBytes(32).toString('base64url')}`;
     const now = Date.now();
     const ttlMs = typeof options === 'number' ? options : options.ttlMs ?? 10 * 60_000;
-    const returnTo = typeof options === 'object' && ['profile', 'installation'].includes(options.returnTo ?? '') ? options.returnTo : undefined;
+    const returnTo = typeof options === 'object' && ['profile', 'installation', 'connection'].includes(options.returnTo ?? '') ? options.returnTo : undefined;
     const githubAccountId = typeof options === 'object' ? options.githubAccountId?.trim() : undefined;
     const githubLogin = typeof options === 'object' ? options.githubLogin?.trim() : undefined;
     const selectAccount = typeof options === 'object' && options.selectAccount;
@@ -3395,7 +3395,7 @@ export class Store {
     });
   }
 
-  async consumeGithubInstallState(state: string, userId: string): Promise<{ organizationId: string; returnTo?: 'profile' | 'installation';
+  async consumeGithubInstallState(state: string, userId: string): Promise<{ organizationId: string; returnTo?: 'profile' | 'installation' | 'connection';
     githubAccountId?: string; githubLogin?: string; selectAccount?: boolean; purpose?: 'manifest' } | undefined> {
     return this.db.transaction(async () => {
 
@@ -3416,6 +3416,7 @@ export class Store {
         organizationId: String(row.organizationId),
         ...(row.returnTo === 'profile' ? { returnTo: 'profile' as const } : {}),
         ...(row.returnTo === 'installation' ? { returnTo: 'installation' as const } : {}),
+        ...(row.returnTo === 'connection' ? { returnTo: 'connection' as const } : {}),
         ...(row.githubAccountId ? { githubAccountId: String(row.githubAccountId) } : {}),
         ...(row.githubLogin ? { githubLogin: String(row.githubLogin) } : {}),
         ...(row.selectAccount ? { selectAccount: true } : {}),

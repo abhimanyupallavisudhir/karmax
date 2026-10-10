@@ -18008,7 +18008,7 @@ function wireConnectionActions(root, organizationId, refresh) {
           button.hidden = !!popup;
         } else if (result.url) {
           if (popup) popup.location.href = result.url;
-          row.querySelector('[data-connection-result]').innerHTML = `<a class="btn sm primary" href="${esc(result.url)}" target="_blank" rel="noopener noreferrer">Sign in with Composio ↗</a><p class="task-sub">This task continues automatically after you finish signing in.</p>`;
+          row.querySelector('[data-connection-result]').innerHTML = `<a class="btn sm primary" href="${esc(result.url)}" target="_blank" rel="noopener noreferrer">Sign in with ${result.callback === 'github' ? 'GitHub' : 'Composio'} ↗</a><p class="task-sub">This task continues automatically after you finish signing in.</p>`;
           button.hidden = true;
         } else { popup?.close(); await refresh(); }
       } else {
