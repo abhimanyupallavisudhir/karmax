@@ -577,6 +577,7 @@ export class Store {
         access TEXT NOT NULL, isolation TEXT NOT NULL, source TEXT NOT NULL,
         credentialHandles TEXT NOT NULL, currentRevisionId TEXT, publish TEXT NOT NULL,
         storageLocationId TEXT, enabled INTEGER NOT NULL, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL,
+        onDemand INTEGER NOT NULL DEFAULT 0,
         UNIQUE(projectId, name)
       );
       CREATE TABLE IF NOT EXISTS resource_revisions (
@@ -1134,6 +1135,8 @@ export class Store {
     const attachmentCols = (await this.db.prepare('PRAGMA table_info(resource_attachments)').all()) as { name: string }[];
     if (!attachmentCols.some((c) => c.name === 'storageLocationId'))
       (await this.db.exec('ALTER TABLE resource_attachments ADD COLUMN storageLocationId TEXT'));
+    if (!attachmentCols.some((c) => c.name === 'onDemand'))
+      (await this.db.exec('ALTER TABLE resource_attachments ADD COLUMN onDemand INTEGER NOT NULL DEFAULT 0'));
     const revisionCols = (await this.db.prepare('PRAGMA table_info(resource_revisions)').all()) as { name: string }[];
     if (!revisionCols.some((c) => c.name === 'storageLocationId'))
       (await this.db.exec('ALTER TABLE resource_revisions ADD COLUMN storageLocationId TEXT'));
@@ -6213,11 +6216,11 @@ export class Store {
       createdAt: now, updatedAt: input.updatedAt ?? now };
     validateResourceAttachment(value);
     (await this.db.prepare(`INSERT INTO resource_attachments (id, organizationId, projectId, name, driver, target,
-      access, isolation, source, credentialHandles, currentRevisionId, publish, storageLocationId, enabled, createdAt, updatedAt)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(value.id, value.organizationId, value.projectId,
+      access, isolation, source, credentialHandles, currentRevisionId, publish, storageLocationId, enabled, onDemand, createdAt, updatedAt)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(value.id, value.organizationId, value.projectId,
         value.name, value.driver, JSON.stringify(value.target), value.access, value.isolation, JSON.stringify(value.source),
         JSON.stringify(value.credentialHandles), value.currentRevisionId ?? null, value.publish, value.storageLocationId ?? null, value.enabled ? 1 : 0,
-        value.createdAt, value.updatedAt));
+        value.onDemand ? 1 : 0, value.createdAt, value.updatedAt));
     return value;
   
     });
@@ -6236,7 +6239,7 @@ export class Store {
   }
 
   async updateResourceAttachment(id: string, patch: Partial<Pick<ResourceAttachment,
-    'name' | 'target' | 'access' | 'isolation' | 'source' | 'credentialHandles' | 'storageLocationId' | 'publish' | 'enabled'>>): Promise<ResourceAttachment> {
+    'name' | 'target' | 'access' | 'isolation' | 'source' | 'credentialHandles' | 'storageLocationId' | 'publish' | 'enabled' | 'onDemand'>>): Promise<ResourceAttachment> {
     return this.db.transaction(async () => {
 
     const current = (await this.getResourceAttachment(id));
@@ -6244,9 +6247,9 @@ export class Store {
     const next = { ...current, ...patch, updatedAt: Date.now() };
     validateResourceAttachment(next);
     (await this.db.prepare(`UPDATE resource_attachments SET name=?, target=?, access=?, isolation=?, source=?,
-      credentialHandles=?, storageLocationId=?, publish=?, enabled=?, updatedAt=? WHERE id=?`).run(next.name, JSON.stringify(next.target),
+      credentialHandles=?, storageLocationId=?, publish=?, enabled=?, onDemand=?, updatedAt=? WHERE id=?`).run(next.name, JSON.stringify(next.target),
         next.access, next.isolation, JSON.stringify(next.source), JSON.stringify(next.credentialHandles),
-        next.storageLocationId ?? null, next.publish, next.enabled ? 1 : 0, next.updatedAt, id));
+        next.storageLocationId ?? null, next.publish, next.enabled ? 1 : 0, next.onDemand ? 1 : 0, next.updatedAt, id));
     return next;
   
     });
@@ -6664,12 +6667,39 @@ export class Store {
         file.content ?? null, Date.now()));
   }
 
+  /** Which of `snapshots` some restic revision of the attachment names (as its
+   * whole snapshot or as one of its parts): an on-demand resource's versions
+   * share the snapshots of the parts they did not change. */
+  async referencedRepositorySnapshots(attachmentId: string, snapshots: string[]): Promise<Set<string>> {
+    const wanted = new Set(snapshots);
+    const found = new Set<string>();
+    if (!wanted.size) return found;
+    for (const row of (await this.db.prepare(`SELECT sealedRef FROM resource_revisions WHERE attachmentId=? AND engine='restic@1'`)
+      .all(attachmentId)) as Array<{ sealedRef: string }>) {
+      let ref: { snapshot?: string; parts?: Record<string, { snapshot?: string }> } | undefined;
+      try { ref = JSON.parse(row.sealedRef); } catch { continue; }
+      for (const id of [ref?.snapshot, ...Object.values(ref?.parts ?? {}).map((part) => part?.snapshot)])
+        if (id && wanted.has(id)) found.add(id);
+    }
+    return found;
+  }
+
+  /** Give a whole-snapshot restic revision its parts (same content, so the
+   * same revision: leases, checkpoints and children keep naming it). False when
+   * it changed or went meanwhile. */
+  async partResourceRevision(id: string, fromSealedRef: string, to: Pick<ResourceRevision, 'sealedRef' | 'rootDigest'>): Promise<boolean> {
+    const result = (await this.db.prepare(`UPDATE resource_revisions SET sealedRef=?, rootDigest=? WHERE id=? AND engine='restic@1' AND sealedRef=?`)
+      .run(to.sealedRef, to.rootDigest, id, fromSealedRef)) as { changes?: number };
+    return Number(result?.changes ?? 0) > 0;
+  }
+
   /** Snapshots written before `before` that no revision names: an interrupted
    * or superseded save, a Review inspection, an unchanged capture. */
   async unreferencedRepositorySnapshots(before: number, limit = 1000): Promise<Array<{ repository: string; attachmentId: string; name: string }>> {
     return ((await this.db.prepare(`SELECT f.repository, f.attachmentId, f.name FROM resource_repository_files f
       WHERE f.kind='snapshots' AND f.createdAt < ? AND NOT EXISTS (SELECT 1 FROM resource_revisions r
-        WHERE r.attachmentId=f.attachmentId AND r.engine='restic@1' AND r.rootDigest=f.name)
+        WHERE r.attachmentId=f.attachmentId AND r.engine='restic@1'
+          AND (r.rootDigest=f.name OR r.sealedRef LIKE ('%' || f.name || '%')))
       ORDER BY f.repository LIMIT ?`).all(before, limit)) as Array<{ repository: string; attachmentId: string; name: string }>);
   }
 
@@ -8865,6 +8895,7 @@ function resourceAttachmentRow(row: any): ResourceAttachment {
     source: JSON.parse(row.source), credentialHandles: JSON.parse(row.credentialHandles),
     storageLocationId: row.storageLocationId ?? undefined,
     currentRevisionId: row.currentRevisionId ?? undefined, publish: row.publish, enabled: Boolean(row.enabled),
+    ...(Number(row.onDemand ?? 0) ? { onDemand: true } : {}),
     createdAt: Number(row.createdAt), updatedAt: Number(row.updatedAt) };
 }
 
@@ -9049,6 +9080,8 @@ function validateResourceAttachment(value: ResourceAttachment): void {
   if (!driver.isolations.includes(value.isolation)) throw new Error(`${value.driver} does not support ${value.isolation} isolation`);
   if (!driver.targets.includes(value.target.kind)) throw new Error(`${value.driver} does not support ${value.target.kind} targets`);
   if (driver.credentialRequired && !value.credentialHandles.length) throw new Error('credential-backed resources require a credential handle');
+  if (value.onDemand && (!snapshot || value.target.kind !== 'path' || value.source.shape === 'file'))
+    throw new Error('only a folder of data can be loaded on demand');
   if (value.publish === 'review' && (!snapshot || value.access !== 'write' || value.isolation !== 'fork'))
     throw new Error('reviewed promotion requires a writable, forked snapshot resource');
   const location = (target: { path: string; repository?: string }, label: string) => {

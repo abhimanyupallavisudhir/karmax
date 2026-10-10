@@ -9,7 +9,7 @@ import type { ObjectStore } from '../store/objects.js';
 import { SYSTEM_JOB_ROOT, jobStatuses, startJob, stopJobs } from './jobs.js';
 import { REPOSITORY_ROUTE, RepositoryTokens, parseRepositoryName, repositoryName, repositoryObjectKey, repositoryPassword,
   type RepositoryAccess } from './resource-repository.js';
-import { RESTIC_VERSION, resticFailure, runHostRestic, worldResticBinary, type ResticRun } from './restic.js';
+import { RESTIC_VERSION, hostResticBinary, resticFailure, runHostRestic, worldResticBinary, type ResticRun } from './restic.js';
 import { ensureWorldExcluded } from './secret-exclude.js';
 import type { SnapshotVerification } from './resources.js';
 import type { World, WorldHandle } from './types.js';
@@ -52,12 +52,71 @@ export interface ResticDeps {
   cacheDir?: string;
 }
 
-/** What a revision's `sealedRef` holds for this engine. */
+/** One top-level entry of an on-demand resource, saved as its own snapshot
+ * whose root holds just that entry (`.`: the files beside the folders). */
+export interface PartRef { snapshot: string; files: number; bytes: number }
+/** An on-demand resource's version: part name → snapshot. Versions share the
+ * snapshots of the parts they did not change. */
+export type Parts = Record<string, PartRef>;
+/** The part holding a resource's top-level files (everything but folders). */
+export const ROOT_PART = '.';
+
+/** What a revision's `sealedRef` holds for this engine: one snapshot of the
+ * whole resource, or (on demand) one per part. */
+export interface StoredRef { snapshot?: string; parts?: Parts; storageLocationId?: string }
 export interface ResticRef { snapshot: string; storageLocationId?: string }
-export function resticRef(revision: Pick<ResourceRevision, 'sealedRef'>): ResticRef {
-  const ref = JSON.parse(revision.sealedRef) as ResticRef;
-  if (!/^[0-9a-f]{64}$/.test(ref?.snapshot ?? '')) throw new Error('resource revision has no restic snapshot');
+const SNAPSHOT_ID = /^[0-9a-f]{64}$/;
+
+/** A revision's reference, either form. */
+export function storedRef(revision: Pick<ResourceRevision, 'sealedRef'>): StoredRef {
+  const ref = JSON.parse(revision.sealedRef) as StoredRef;
+  if (ref?.parts && typeof ref.parts === 'object' && !ref.snapshot) {
+    for (const [name, part] of Object.entries(ref.parts))
+      if (!validPartName(name) || !SNAPSHOT_ID.test(part?.snapshot ?? '')) throw new Error('resource revision has an invalid part');
+    return ref;
+  }
+  if (!SNAPSHOT_ID.test(ref?.snapshot ?? '')) throw new Error('resource revision has no restic snapshot');
   return ref;
+}
+
+/** A whole-snapshot revision's reference; a version saved in parts has none. */
+export function resticRef(revision: Pick<ResourceRevision, 'sealedRef'>): ResticRef {
+  const ref = storedRef(revision);
+  if (!ref.snapshot) throw new Error('this resource version is saved in parts (on demand), not as one snapshot');
+  return ref as ResticRef;
+}
+
+export function isParted(revision: Pick<ResourceRevision, 'engine' | 'sealedRef'> | undefined): boolean {
+  if (revision?.engine !== RESTIC_ENGINE) return false;
+  try { return Boolean(storedRef(revision).parts); } catch { return false; }
+}
+
+/** A top-level entry's name, or ROOT_PART. */
+export function validPartName(name: string): boolean {
+  return name === ROOT_PART || (name.length > 0 && name.length <= 255 && name !== '..' && !/[/\0\n\r]/.test(name));
+}
+
+/** The part a resource-relative path belongs to. */
+export function partOf(relative: string): string {
+  const slash = relative.indexOf('/');
+  return slash < 0 ? ROOT_PART : relative.slice(0, slash);
+}
+
+/** Identifies a version's content: its parts' snapshots. */
+export function partsDigest(parts: Parts): string {
+  return crypto.createHash('sha256').update(Object.keys(parts).sort().map((name) => `${name}\0${parts[name]!.snapshot}\n`).join('')).digest('hex');
+}
+
+export function partsTotals(parts: Parts): { files: number; bytes: number } {
+  let files = 0; let bytes = 0;
+  for (const part of Object.values(parts)) { files += part.files; bytes += part.bytes; }
+  return { files, bytes };
+}
+
+/** A save of an on-demand resource: its parts, and the snapshots it made. */
+export interface PartsCapture { parts: Parts; files: number; bytes: number; added: number; fresh: string[] }
+export function isPartsCapture(capture: ResticCapture | PartsCapture): capture is PartsCapture {
+  return 'parts' in capture;
 }
 
 /** A resource's repository in one storage location ({@link repositoryName}). */
@@ -75,6 +134,9 @@ export interface ResticPlace {
   /** Absolute path of the resource in the world. */
   path: string;
   file?: boolean;
+  /** Save only these entries of the directory (an on-demand resource's part),
+   * so the snapshot's root holds just them. */
+  entries?: string[];
 }
 
 export interface ResticRunOptions {
@@ -119,20 +181,26 @@ export class ResticResources {
     return this.repository(attachment, await this.deps.locationOf(attachment));
   }
 
-  /** The repository holding a revision's snapshot. */
+  /** The repository holding a revision's snapshot (or parts). */
   of(attachment: ResourceAttachment, revision: Pick<ResourceRevision, 'sealedRef'>): Repository {
-    return this.repository(attachment, resticRef(revision).storageLocationId);
+    return this.repository(attachment, storedRef(revision).storageLocationId);
   }
 
   repository(attachment: ResourceAttachment, storageLocationId: string | undefined): Repository {
     return { attachment, ...(storageLocationId ? { storageLocationId } : {}), name: repositoryName(attachment.id, storageLocationId) };
   }
 
-  /** A revision's fields for a snapshot saved in `repository`. */
-  revisionFields(capture: ResticCapture, repository: Repository) {
+  /** A revision's fields for a snapshot (or parts) saved in `repository`. */
+  revisionFields(capture: ResticCapture | PartsCapture, repository: Repository) {
     const { storageLocationId } = repository;
-    return { engine: RESTIC_ENGINE, sealedRef: JSON.stringify({ snapshot: capture.snapshot, ...(storageLocationId ? { storageLocationId } : {}) }),
-      rootDigest: capture.snapshot, bytes: capture.bytes, files: capture.files, ...(storageLocationId ? { storageLocationId } : {}) };
+    const location = storageLocationId ? { storageLocationId } : {};
+    if (isPartsCapture(capture)) {
+      const parts = Object.fromEntries(Object.keys(capture.parts).sort().map((name) => [name, capture.parts[name]!]));
+      return { engine: RESTIC_ENGINE, sealedRef: JSON.stringify({ parts, ...location }), rootDigest: partsDigest(parts),
+        ...partsTotals(parts), ...location };
+    }
+    return { engine: RESTIC_ENGINE, sealedRef: JSON.stringify({ snapshot: capture.snapshot, ...location }),
+      rootDigest: capture.snapshot, bytes: capture.bytes, files: capture.files, ...location };
   }
 
   /** Save `place` as a new snapshot. A file that changes while it is read
@@ -164,8 +232,12 @@ export class ResticResources {
   }
 
   /** `mirror` also deletes what the snapshot does not have, so the place ends
-   * up exactly the snapshot (a laptop's push into a task world). */
-  async restore(place: ResticPlace, attachment: Repository, snapshot: string, options: ResticRunOptions & { mirror?: boolean }): Promise<void> {
+   * up exactly the snapshot (a laptop's push into a task world). `keep`
+   * restores beside the place first and moves in only what the place lacks:
+   * files already there (an agent's own) win, and an interrupted restore never
+   * leaves a half-written file where one is expected. */
+  async restore(place: ResticPlace, attachment: Repository, snapshot: string, options: ResticRunOptions & { mirror?: boolean; keep?: boolean }): Promise<void> {
+    if (options.keep && !place.file) return this.restoreKeeping(place, attachment, snapshot, options);
     const remote = isRemoteWorldKind(place.world.handle.kind);
     const scratch = place.file ? path.posix.join(place.world.handle.root, `.karmax-injection/restore-${crypto.randomBytes(6).toString('hex')}`) : undefined;
     const args = ['restore', snapshot, '--target', scratch ?? place.path, '--no-lock', '--json', '-o', `rest.connections=${RESTORE_CONNECTIONS}`,
@@ -191,6 +263,15 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
       fs.renameSync(path.join(scratch, entries[0]!), place.path);
       fs.rmSync(scratch, { recursive: true, force: true });
     }
+  }
+
+  private async restoreKeeping(place: ResticPlace, attachment: Repository, snapshot: string, options: ResticRunOptions): Promise<void> {
+    // Named by the job's key, so a retry restores into the same directory and resumes.
+    const scratch = path.posix.join(place.world.handle.root, `.karmax-injection/restore-${crypto.createHash('sha256').update(options.key).digest('hex').slice(0, 12)}`);
+    await this.restore({ world: place.world, path: scratch }, attachment, snapshot, options);
+    const merged = await place.world.exec('bash', ['-c', `${MERGE_TREE}\nmkdir -p -- "$2"; merge "$1" "$2"; rm -rf -- "$1"`, 'merge', scratch, place.path],
+      { cwd: place.world.handle.root, timeoutMs: 10 * 60_000 });
+    if (merged.code !== 0) throw new Error(`restoring the resource failed: ${(merged.stderr || merged.stdout).trim().slice(0, 300)}`);
   }
 
   /** Create the repository if it does not exist yet: before a client outside
@@ -230,6 +311,79 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
       if (node.struct_type === 'node' && node.type === 'file') files.push({ path: String(node.path).replace(/^\/+/, ''), bytes: Number(node.size ?? 0) });
     }
     return files.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+  }
+
+  /** Files of a stored version: its snapshot's, or every part's. */
+  async filesOf(attachment: Repository, ref: StoredRef): Promise<Array<{ path: string; bytes: number }>> {
+    if (ref.snapshot) return this.files(attachment, ref.snapshot);
+    const files: Array<{ path: string; bytes: number }> = [];
+    for (const name of Object.keys(ref.parts ?? {}).sort()) files.push(...await this.files(attachment, ref.parts![name]!.snapshot));
+    return files.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+  }
+
+  /** Split a snapshot of a whole resource into parts, one per top-level
+   * entry (ROOT_PART: the files beside the folders), each a snapshot holding
+   * just that entry. `restic rewrite` only writes new trees: no data moves. */
+  async split(repository: Repository, snapshot: string): Promise<{ parts: Parts; fresh: string[] }> {
+    const listed = await this.onHost(repository, 'read', false, ['ls', '--json', '--no-lock', snapshot, '/'], { key: 'host' });
+    if (listed.code !== 0) throw resticFailure(listed, 'listing the resource');
+    const folders: string[] = []; let loose = false;
+    for (const line of listed.stdout.split('\n')) {
+      if (!line.startsWith('{')) continue;
+      const node = JSON.parse(line);
+      if (node.struct_type !== 'node') continue;
+      const name = String(node.name ?? '');
+      if (node.type === 'dir' && validPartName(name) && name !== ROOT_PART) folders.push(name);
+      else loose = true;
+    }
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-split-'));
+    const made: Array<{ name: string; snapshot: string }> = [];
+    const fresh: string[] = [];
+    try {
+      const rewrite = async (name: string, filter: string[]) => {
+        // A part that is already the whole snapshot is not rewritten: restic says so.
+        if ((name === ROOT_PART ? !folders.length : !loose && folders.length === 1)) { made.push({ name, snapshot }); return; }
+        const run = await this.onHost(repository, 'append', false, ['rewrite', snapshot, ...filter, '-v'], { key: 'host' });
+        if (run.code !== 0) throw resticFailure(run, 'splitting the resource into parts');
+        const short = /saved new snapshot ([0-9a-f]{8,64})/.exec(`${run.stdout}\n${run.stderr}`)?.[1];
+        if (!short) { made.push({ name, snapshot }); return; }
+        const full = (await this.deps.store.listRepositoryFiles(repository.name, 'snapshots')).map((file) => file.name).filter((id) => id.startsWith(short));
+        if (full.length !== 1) throw new Error('splitting the resource into parts failed: restic\'s new snapshot is not listed');
+        made.push({ name, snapshot: full[0]! }); fresh.push(full[0]!);
+      };
+      for (const [index, folder] of folders.entries()) {
+        const include = path.join(scratch, `include-${index}`);
+        fs.writeFileSync(include, patternList([folder]));
+        await rewrite(folder, ['--include-file', include]);
+      }
+      if (loose) {
+        const exclude = path.join(scratch, 'exclude');
+        fs.writeFileSync(exclude, patternList(folders));
+        await rewrite(ROOT_PART, folders.length ? ['--exclude-file', exclude] : []);
+      }
+      const totals = await this.snapshotTotals(repository, [...new Set(made.map((part) => part.snapshot))]);
+      return { parts: Object.fromEntries(made.map((part) => [part.name, { snapshot: part.snapshot, ...totals.get(part.snapshot)! }])), fresh };
+    } catch (error) {
+      await this.forget(repository, fresh).catch(() => undefined);
+      throw error;
+    } finally { fs.rmSync(scratch, { recursive: true, force: true }); }
+  }
+
+  /** Files and bytes of snapshots, from restic's summary of each. */
+  private async snapshotTotals(repository: Repository, snapshots: string[]): Promise<Map<string, { files: number; bytes: number }>> {
+    const totals = new Map<string, { files: number; bytes: number }>();
+    if (!snapshots.length) return totals;
+    const run = await this.onHost(repository, 'read', false, ['snapshots', '--json', '--no-lock', ...snapshots], { key: 'host' });
+    if (run.code !== 0) throw resticFailure(run, 'reading resource versions');
+    for (const entry of JSON.parse(run.stdout.slice(run.stdout.indexOf('['))) as Array<{ id: string; summary?: Record<string, unknown> }>)
+      totals.set(entry.id, { files: Number(entry.summary?.total_files_processed ?? 0), bytes: Number(entry.summary?.total_bytes_processed ?? 0) });
+    for (const snapshot of snapshots) {
+      if (totals.has(snapshot)) continue;
+      // A snapshot without a summary (rewritten before restic recorded one): count its files.
+      const files = await this.files(repository, snapshot);
+      totals.set(snapshot, { files: files.length, bytes: files.reduce((sum, file) => sum + file.bytes, 0) });
+    }
+    return totals;
   }
 
   /** What changed between two snapshots of the same repository. Metadata
@@ -350,14 +504,14 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
     }
   }
 
-  /** Read back files of a snapshot, decrypting and checking every byte, a page at a time. */
-  async verify(attachment: Repository, snapshot: string, offset: number, limit: number): Promise<SnapshotVerification> {
+  /** Read back files of a version, decrypting and checking every byte, a page at a time. */
+  async verify(attachment: Repository, ref: StoredRef, offset: number, limit: number): Promise<SnapshotVerification> {
     let files: Array<{ path: string; bytes: number }>;
     // restic's errors may name URLs and paths: report only that it failed.
-    try { files = await this.files(attachment, snapshot); }
+    try { files = await this.filesOf(attachment, ref); }
     catch { return { status: 'failed' as const, manifestVerified: false, offset, verifiedFiles: 0, verifiedBytes: 0, files: [], issue: 'unreadable-or-corrupt' as const }; }
     const totalBytes = files.reduce((sum, file) => sum + file.bytes, 0);
-    const base = { manifestVerified: true, rootDigest: snapshot, totalFiles: files.length, totalBytes, offset,
+    const base = { manifestVerified: true, rootDigest: ref.snapshot ?? partsDigest(ref.parts ?? {}), totalFiles: files.length, totalBytes, offset,
       verifiedFiles: 0, verifiedBytes: 0, files: [] as Array<{ path: string; bytes: number; sha256: string }> };
     if (offset > files.length) return { ...base, status: 'failed' as const, issue: 'invalid-offset' as const };
     // Nothing counts as verified unless every file of the page read back.
@@ -371,9 +525,16 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
     }
     const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-verify-'));
     try {
-      if (page.length) {
-        const includes = path.join(scratch, 'include');
-        fs.writeFileSync(includes, page.map((file) => `/${file.path.replace(/[\\*?[]/g, '\\$&')}`).join('\n'));
+      // Each part's files come from its own snapshot.
+      const bySnapshot = new Map<string, typeof page>();
+      for (const file of page) {
+        const snapshot = ref.snapshot ?? ref.parts?.[partOf(file.path)]?.snapshot;
+        if (!snapshot) return failed();
+        bySnapshot.set(snapshot, [...bySnapshot.get(snapshot) ?? [], file]);
+      }
+      for (const [index, [snapshot, chosen]] of [...bySnapshot].entries()) {
+        const includes = path.join(scratch, `include-${index}`);
+        fs.writeFileSync(includes, chosen.map((file) => `/${file.path.replace(/[\\*?[]/g, '\\$&')}`).join('\n'));
         const run = await this.onHost(attachment, 'read', false, ['restore', snapshot, '--target', path.join(scratch, 'files'),
           '--include-file', includes, '--no-lock', '--json'], { key: 'host' });
         if (run.code !== 0) return failed();
@@ -409,6 +570,24 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
     const run = await this.onHost(attachment, 'admin', false, ['forget', '--json', ...gone], { key: 'host' });
     if (run.code !== 0) throw resticFailure(run, 'forgetting resource versions');
     await this.deps.store.kvSet(`restic-prune:${attachment.name}`, String(Date.now()));
+  }
+
+  /** Drop those of `snapshots` that no version of the resource names (an
+   * on-demand version shares its unchanged parts with others). */
+  async forgetUnreferenced(attachment: Repository, snapshots: string[]): Promise<void> {
+    const referenced = await this.deps.store.referencedRepositorySnapshots(attachment.attachment.id, snapshots);
+    await this.forget(attachment, [...new Set(snapshots)].filter((snapshot) => !referenced.has(snapshot)));
+  }
+
+  /** What an agent's own restic needs to fetch parts in a world (`tavya-data`):
+   * the binary there and a read grant for the repository. */
+  async worldReader(world: World, repository: Repository): Promise<{ binary: string; env: Record<string, string>; expiresAt: number }> {
+    const remote = isRemoteWorldKind(world.handle.kind);
+    const base = remote ? this.deps.endpoints.world(world.handle) : await this.deps.endpoints.host();
+    if (!base) throw new Error('this world cannot reach the resource store (no public URL is configured)');
+    const binary = remote ? await this.worldBinary(world, base) : hostResticBinary();
+    const expiresAt = Date.now() + TOKEN_HOURS * 3_600_000;
+    return { binary, env: await this.env(repository, base, 'read', false), expiresAt };
   }
 
   /** Delete the data no snapshot uses. Waits out a save in progress, which
@@ -470,11 +649,21 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
     const directory = file ? path.posix.dirname(file) : place.path;
     const remote = isRemoteWorldKind(place.world.handle.kind);
     const connections = remote && await this.deps.endpoints.direct?.(attachment) ? EDGE_CONNECTIONS : CONNECTIONS;
-    const args = [...backupArgs(options.parent, connections), ...(options.dryRun ? ['--dry-run'] : []), file ? path.posix.basename(file) : '.'];
+    // Named entries go in a list (names may start with a dash), written once per key.
+    let list: string | undefined;
+    if (place.entries) {
+      if (!place.entries.length || place.entries.some((entry) => !entry || /[\n\r]/.test(entry) || entry.includes('/')))
+        throw new Error('cannot save these entries of the resource');
+      list = `.karmax-injection/restic-entries/${crypto.createHash('sha256').update(options.key).digest('hex').slice(0, 16)}`;
+      await place.world.writeFile(list, place.entries.map((entry) => `${entry}\n`).join(''));
+    }
+    const args = [...backupArgs(options.parent, connections), ...(options.dryRun ? ['--dry-run'] : []),
+      ...(list ? ['--files-from-verbatim', path.posix.join(place.world.handle.root, list)] : [file ? path.posix.basename(file) : '.'])];
     const progress = options.dryRun ? {} : { onProgress: options.onProgress };
-    const run = remote
-      ? await this.inWorld(place.world, attachment, 'append', options.quota, args, { ...options, ...progress, cwd: directory })
-      : await this.onHost(attachment, 'append', options.quota, args, { ...options, ...progress, cwd: directory });
+    const run = await (remote
+      ? this.inWorld(place.world, attachment, 'append', options.quota, args, { ...options, ...progress, cwd: directory })
+      : this.onHost(attachment, 'append', options.quota, args, { ...options, ...progress, cwd: directory }))
+      .finally(() => list && place.world.exec('rm', ['-f', '--', list], { cwd: place.world.handle.root }).catch(() => undefined));
     if (run.code !== 0) throw resticFailure(run, 'saving the resource');
     const summary = summaryOf(run.stdout);
     return { ...captureOf(run.stdout, options.dryRun), changed: Number(summary.files_new ?? 0) + Number(summary.files_changed ?? 0) > 0 };
@@ -598,6 +787,15 @@ chmod +x "$t"; mv -f "$t" ${quote(relative)}`, 'restic-fetch', url, binary.sha25
     return absolute;
   }
 }
+
+/** Move every entry of `$1` that `$2` lacks into it, descending into folders
+ * both have: what is already in `$2` stays as it is. */
+const MERGE_TREE = `merge() { local s="$1" d="$2" e n; shopt -s dotglob nullglob
+  for e in "$s"/*; do n="\${e##*/}"
+    if [ ! -e "$d/$n" ] && [ ! -L "$d/$n" ]; then mv -- "$e" "$d/$n" || return 1
+    elif [ -d "$e" ] && [ ! -L "$e" ] && [ -d "$d/$n" ] && [ ! -L "$d/$n" ]; then merge "$e" "$d/$n" || return 1
+    fi
+  done; }`;
 
 function backupArgs(parent?: string, connections = CONNECTIONS): string[] {
   // Inode and ctime differ in every world a resource is restored into; the
