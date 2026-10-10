@@ -6,8 +6,8 @@ import type { ProjectEvent } from '../domain/project-events.js';
 import { IncomingWebhooks } from './incoming-webhooks.js';
 
 /**
- * A chat bot answers where it was asked (wiki planned/external-connectors-and-
- * automations): when a mention starts a run (or reaches one already working on
+ * A chat bot answers where it was asked (wiki features/events-and-automations):
+ * when a mention starts a run (or reaches one already working on
  * its thread), and when that run needs someone, is ready for review, finishes or
  * fails. Each answer is posted once: a claim in the store keys it by run and
  * moment, so a restart or a second process never repeats one.

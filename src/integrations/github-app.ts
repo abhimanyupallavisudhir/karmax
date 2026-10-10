@@ -247,8 +247,8 @@ export interface GithubVaultPushEvent {
   revision: string;
 }
 
-/** One GitHub delivery as a project event (wiki planned/external-connectors-and-
- *  automations): `github.<event>.<action>`, keyed by the delivery id. */
+/** One GitHub delivery as a project event (wiki features/events-and-automations):
+ * `github.<event>.<action>`, keyed by the delivery id. */
 export interface GithubInboxEvent {
   organizationId: string;
   projectId: string;

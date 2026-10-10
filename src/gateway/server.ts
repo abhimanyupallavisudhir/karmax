@@ -1880,7 +1880,7 @@ export class Gateway {
         return this.json(res, /webhook signature/i.test(message) ? 401 : 500, { error: message });
       }
     }
-    // Incoming webhook delivery (wiki planned/external-connectors-and-automations):
+    // Incoming webhook delivery (wiki features/events-and-automations):
     // one project event per delivery, recorded before the sender is answered.
     const hookMatch = p.match(/^\/api\/hooks\/([^/]+)$/);
     if (hookMatch && (method === 'POST' || method === 'GET')) {

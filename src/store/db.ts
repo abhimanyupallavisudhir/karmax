@@ -798,7 +798,7 @@ export class Store {
         type TEXT NOT NULL, decision TEXT, createdAt INTEGER NOT NULL,
         PRIMARY KEY (provider, eventId)
       );
-      -- Project event inbox (wiki planned/external-connectors-and-automations):
+      -- Project event inbox (wiki features/events-and-automations):
       -- one row per outside occurrence, written before its sender is answered.
       -- (projectId, source, eventKey) collapses redeliveries; dispatchedAt marks
       -- rows the trigger dispatcher has offered to every armed task.
@@ -8377,7 +8377,7 @@ export class Store {
     });
   }
 
-  // ─── Project event inbox (wiki planned/external-connectors-and-automations) ──
+  // ─── Project event inbox (wiki features/events-and-automations) ──
 
   /** Insert an outside occurrence once; a repeat of (project, source, key)
    *  returns the stored row with `created: false`. */

@@ -1,8 +1,8 @@
 import crypto from 'node:crypto';
 
 /**
- * Chat platforms as project event sources (wiki planned/external-connectors-and-
- * automations): a message that mentions the project's bot becomes one
+ * Chat platforms as project event sources (wiki features/events-and-automations):
+ * a message that mentions the project's bot becomes one
  * `chat.mention` event — the same shape from every platform, so one trigger
  * serves them all — and the bot answers in the thread when a run starts and
  * when it settles.

@@ -1,6 +1,6 @@
 /**
  * Project events — the durable inbox of things that happened outside a task
- * (wiki planned/external-connectors-and-automations). A GitHub delivery, an
+ * (wiki features/events-and-automations). A GitHub delivery, an
  * incoming webhook, a chat mention or an event a task emitted all become one
  * `ProjectEvent`; an armed task whose `event` trigger matches it starts a run
  * that receives the event.

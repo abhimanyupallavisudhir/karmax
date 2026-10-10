@@ -3726,7 +3726,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
     /**
      * Start the task's own command — Do runs code instead of an agent (wiki
-     * planned/external-connectors-and-automations) — as a durable job in its
+     * features/events-and-automations) — as a durable job in its
      * world. A retried activity re-attaches to the job it already started. The
      * command acts with exactly the Do agent's authority (`turnAuthority`): its
      * platform token, granted vault items, Git profile and project secrets, with

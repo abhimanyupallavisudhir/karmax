@@ -18,7 +18,7 @@ import { seedProfiles } from '../src/agent/profiles.js';
 import type { Project } from '../src/domain/types.js';
 
 /**
- * The console's side of events (wiki planned/external-connectors-and-automations):
+ * The console's side of events (wiki features/events-and-automations):
  * the task form's "On event" trigger and command, and Project settings → Events.
  */
 describe('events in the console', () => {

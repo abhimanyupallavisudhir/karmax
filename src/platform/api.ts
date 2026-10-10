@@ -2638,7 +2638,7 @@ export class KarmaxApi {
     const caller = (await this.require(token, 'create_task', { projectId: series?.projectId, taskId: seriesId }));
     if (!series) throw new NotFoundError(`no task ${seriesId}`);
     (await this.assertStoredGrantQueueable(token, caller, series));
-    // A run an event started carries that event (wiki planned/external-connectors-and-automations).
+    // A run an event started carries that event (wiki features/events-and-automations).
     const shaped = trigger
       ? applyTriggerContext(series.title, { ...cloneParamsWithoutTriggers(series.params), runOf: seriesId }, trigger)
       : { title: series.title, params: { ...cloneParamsWithoutTriggers(series.params), runOf: seriesId } };
@@ -2734,7 +2734,7 @@ export class KarmaxApi {
   }
 
   // ─── Project events and incoming webhooks ─────────────────────────────────
-  // wiki planned/external-connectors-and-automations: an outside occurrence is
+  // wiki features/events-and-automations: an outside occurrence is
   // one row in the project's inbox; armed tasks whose event triggers match it
   // start runs that receive it.
 

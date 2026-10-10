@@ -2640,8 +2640,8 @@ async function softwareDevImpl(
 
   // ── The task's own command (v1.28) ──
   /**
-   * Do runs code instead of the agent (wiki planned/external-connectors-and-
-   * automations): the command runs as a durable job in the world with the
+   * Do runs code instead of the agent (wiki features/events-and-automations):
+   * the command runs as a durable job in the world with the
    * agent's authority (`startTaskCommand`). Exit 0 continues exactly like an
    * agent that called open_pr — its changes are committed and reviewed, and with
    * none its Review confirms itself. A failure ends the task, or hands it to

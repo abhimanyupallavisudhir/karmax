@@ -586,7 +586,7 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
     async (a) => wrap(async () => (await ops.cancelAgentAction(a.requestId))),
   );
   server.registerTool('emit_event', {
-    description: `Record a project event (wiki planned/external-connectors-and-automations). Tasks waiting on a matching event trigger start runs that receive it. Re-emitting the same \`key\` does nothing, so a poller can report everything it sees each run.`,
+    description: `Record a project event (wiki features/events-and-automations). Tasks waiting on a matching event trigger start runs that receive it. Re-emitting the same \`key\` does nothing, so a poller can report everything it sees each run.`,
     inputSchema: {
       projectId: z.string(),
       type: z.string().describe('Dotted words, e.g. "orders.created".'),

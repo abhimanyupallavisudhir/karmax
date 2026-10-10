@@ -6,7 +6,7 @@ import { GithubEvents, RECOVERY_PROMPT } from '../src/integrations/github-events
 import type { TaskRecord } from '../src/domain/types.js';
 
 /**
- * External events end to end (wiki planned/external-connectors-and-automations):
+ * External events end to end (wiki features/events-and-automations):
  * a real gateway, a real Temporal worker and the trigger dispatcher. A webhook
  * delivery and an emitted event each become a project event; the armed series
  * whose trigger matches starts a run that carries the event.

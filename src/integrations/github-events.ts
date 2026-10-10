@@ -7,8 +7,8 @@ import { eventTypeMatches } from '../domain/project-events.js';
 import type { GithubProjectWebhookEvent, GithubWebhookResult } from './github-app.js';
 
 /**
- * GitHub into the project event inbox (wiki planned/external-connectors-and-
- * automations). Every delivery for an attached repository is a project event;
+ * GitHub into the project event inbox (wiki features/events-and-automations).
+ * Every delivery for an attached repository is a project event;
  * a default-branch workflow failure — or a deployment run GitHub never created
  * (the deployment monitor) — is `github.workflow.failed`.
  *

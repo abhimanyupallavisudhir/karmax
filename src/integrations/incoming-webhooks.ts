@@ -9,7 +9,7 @@ import { CHAT_ADAPTERS, CHAT_CREDENTIALS, ChatPlatformError, type ChatBotIdentit
 
 /**
  * Incoming webhooks: a project's URL that any outside service can POST to
- * (wiki planned/external-connectors-and-automations). Each delivery becomes one
+ * (wiki features/events-and-automations). Each delivery becomes one
  * project event of the hook's `type`; an armed task's event trigger reacts.
  *
  * A hook is project configuration, so it lives in the store (kv, one row per

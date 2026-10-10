@@ -7,7 +7,7 @@ import type { TaskView } from '../src/domain/types.js';
 
 /**
  * Tasks whose Do runs the task's own command instead of an agent (software-dev
- * 1.28; wiki planned/external-connectors-and-automations), on real Temporal and
+ * 1.28; wiki features/events-and-automations), on real Temporal and
  * git with the mock agent standing by for a hand-off.
  */
 describe('task commands (real Temporal + git)', () => {

@@ -89,7 +89,7 @@ const remoteField = (): FieldSpec => ({
   bind: 'project',
 });
 // software-dev ≥1.28: Do runs the task's own code instead of the agent
-// (wiki planned/external-connectors-and-automations).
+// (wiki features/events-and-automations).
 const commandField = (): FieldSpec => ({
   name: 'command', type: 'text', label: 'Command', scopes: ['task'], bind: 'top', placeholder: 'python scripts/triage.py',
   help: 'Runs in the task’s world instead of the agent, with the same access. Changes it makes go to Review; with none, the task finishes by itself.',
@@ -703,7 +703,7 @@ export const PLATFORM_EVENTS: EventSchemaDecl[] = [
 ];
 
 /**
- * Project events (wiki planned/external-connectors-and-automations): what the
+ * Project events (wiki features/events-and-automations): what the
  * inbox receives from outside a task. GitHub sends `github.<event>.<action>`
  * for every delivery of an attached repository (its payload as GitHub sent it,
  * minus API links); these are the ones worth starting work on. An incoming
