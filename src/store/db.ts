@@ -792,6 +792,10 @@ export class Store {
         objectKey TEXT PRIMARY KEY, deletedAt INTEGER NOT NULL, purgeAfter INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_object_tombstones_due ON object_tombstones(purgeAfter);
+      CREATE TABLE IF NOT EXISTS pending_object_writes (
+        objectKey TEXT PRIMARY KEY, startedAt INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_pending_object_writes_started ON pending_object_writes(startedAt);
       CREATE TABLE IF NOT EXISTS executions (
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, projectId TEXT NOT NULL,
         taskId TEXT NOT NULL, worldId TEXT NOT NULL, generation INTEGER NOT NULL,
@@ -8307,6 +8311,67 @@ export class Store {
 
   async deleteObjectTombstone(key: string): Promise<void> {
     (await this.db.prepare('DELETE FROM object_tombstones WHERE objectKey=?').run(key));
+  }
+
+  /** A managed object about to be written (store/object-reconciliation.ts):
+   * recorded before its bytes reach the store, so an upload whose record never
+   * follows is found and deleted, not left behind unaccounted. */
+  async recordPendingObjectWrite(key: string, startedAt: number): Promise<void> {
+    (await this.db.prepare(`INSERT INTO pending_object_writes (objectKey, startedAt) VALUES (?, ?)
+      ON CONFLICT(objectKey) DO UPDATE SET startedAt=excluded.startedAt`).run(key, startedAt));
+  }
+
+  /** With `startedAt`, only if no write of the same key began since. */
+  async deletePendingObjectWrite(key: string, startedAt?: number): Promise<void> {
+    if (startedAt === undefined) (await this.db.prepare('DELETE FROM pending_object_writes WHERE objectKey=?').run(key));
+    else (await this.db.prepare('DELETE FROM pending_object_writes WHERE objectKey=? AND startedAt=?').run(key, startedAt));
+  }
+
+  async pendingObjectWrite(key: string): Promise<number | undefined> {
+    const row = (await this.db.prepare('SELECT startedAt FROM pending_object_writes WHERE objectKey=?').get(key)) as
+      { startedAt: number | bigint } | undefined;
+    return row ? Number(row.startedAt) : undefined;
+  }
+
+  /** Writes started before `before`, oldest first. */
+  async pendingObjectWrites(before: number, limit: number): Promise<Array<{ key: string; startedAt: number }>> {
+    return ((await this.db.prepare('SELECT objectKey, startedAt FROM pending_object_writes WHERE startedAt<? ORDER BY startedAt, objectKey LIMIT ?')
+      .all(before, limit)) as Array<{ objectKey: string; startedAt: number | bigint }>)
+      .map((row) => ({ key: String(row.objectKey), startedAt: Number(row.startedAt) }));
+  }
+
+  /**
+   * Whether a record still names this managed object, so it must not be
+   * deleted: a resource repository file (every pack a revision, lease,
+   * checkpoint or candidate needs is one), a pre-restic chunk or manifest, a
+   * world checkpoint, a review artifact,
+   * a conversation export, an upload in progress. Keys of families no table
+   * records answer false: whether such an object may go is not the database's
+   * to say (`objectFamily` in store/object-reconciliation.ts). `_` in a key is
+   * a LIKE wildcard below: it can only match more, never less.
+   */
+  async objectKeyReferenced(key: string): Promise<boolean> {
+    const parts = key.split('/');
+    const exists = async (sql: string, ...params: unknown[]) => !!(await this.db.prepare(sql).get(...params));
+    switch (parts[0]) {
+      case 'resource-repositories': {
+        const [, attachment, place, kind, name] = parts;
+        if (!attachment || !place || !kind || parts.length > 5) return false;
+        return exists('SELECT 1 FROM resource_repository_files WHERE repository=? AND kind=? AND name=?',
+          `${attachment}@${place}`, kind, kind === 'config' ? 'config' : name ?? '');
+      }
+      case 'resources': {
+        const chunk = /^([^/]+)\/chunks\/([^/]+)\.bin$/.exec(parts.slice(1).join('/'));
+        if (chunk) return this.hasResourceChunk(chunk[1]!, chunk[2]!);
+        if (parts[2] === 'manifests') return exists("SELECT 1 FROM resource_revisions WHERE json_extract(sealedRef, '$.objectKey')=?", key);
+        return false;
+      }
+      case 'checkpoints': return exists("SELECT 1 FROM world_checkpoints WHERE json_extract(manifest, '$.filesystemDelta.objectKey')=?", key);
+      case 'artifacts': return exists('SELECT 1 FROM promoted_artifacts WHERE objectKey=?', key);
+      case 'conversation-exports': return exists('SELECT 1 FROM conversation_exports WHERE objectKey=?', key);
+      case 'resource-uploads': return exists("SELECT 1 FROM kv WHERE k LIKE 'resource-upload:%' AND v LIKE ?", `%${key}%`);
+      default: return false;
+    }
   }
 
   async hasResourceChunk(organizationId: string, chunkId: string): Promise<boolean> {

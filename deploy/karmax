@@ -481,6 +481,15 @@ cmd_migrate_objects() {
   dc run --rm --no-deps -T app npm run --silent migrate-objects -- "$@"
 }
 
+# A dry run of the daily reconciliation of the managed store with the
+# database: what it holds per organization (live, awaiting deletion, untracked)
+# and which orphans it would delete. Read-only (wiki features/managed-storage).
+cmd_reconcile_storage() {
+  need_docker
+  [ -f "$ENV_FILE" ] || die 'this instance is not configured'
+  dc run --rm --no-deps -T app npm run --silent reconcile-storage -- "$@"
+}
+
 # The resource repositories' edge: a Cloudflare Worker that sandboxes save
 # resources through, so the bytes go into storage without passing through this
 # host (wiki features/resource-storage). Takes CLOUDFLARE_API_TOKEN (Workers
@@ -1048,6 +1057,8 @@ Usage: ./deploy/karmax COMMAND
   rotate-vault-key              Replace the vault's key encryption key (resumable)
   migrate-objects [--verify-only] [--concurrency N]
                                Copy local objects to the configured S3 store
+  reconcile-storage [--orphans N]
+                               Compare the object store with the database (read-only)
   deploy-repository-edge       Deploy the Cloudflare Worker sandboxes save resources through
                                (needs CLOUDFLARE_API_TOKEN), and use it
   configure-backups s3://BUCKET/PREFIX https://ENDPOINT PUBLIC_KEY
@@ -1073,6 +1084,7 @@ case "$command" in
   rotate-postgres-password) cmd_rotate_postgres_password "$@" ;;
   rotate-vault-key) cmd_rotate_vault_key "$@" ;;
   migrate-objects) cmd_migrate_objects "$@" ;;
+  reconcile-storage) cmd_reconcile_storage "$@" ;;
   deploy-repository-edge) cmd_deploy_repository_edge "$@" ;;
   configure-backups) cmd_configure_backups "$@" ;;
   pg-restore) cmd_pg_restore "$@" ;;

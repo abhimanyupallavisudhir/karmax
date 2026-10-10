@@ -30,6 +30,7 @@ const MB = 1024 ** 2;
 const CONTENTS = {
   retainedBytes: 6.2 * GB, quotaBytes: 5 * GB,
   overQuota: { since: NOW - 10 * 86_400_000, deleteAt: Date.parse('2027-09-21T12:00:00Z') },
+  pendingDeletion: { bytes: 25.7 * GB, until: Date.parse('2026-11-09T00:00:00Z'), measuredAt: NOW },
   policy: { finishedTaskCheckpointDays: 30, overQuotaDeletionDays: 365 },
   projects: [
     { projectId: 'p-ml', name: 'Model training', bytes: 5.1 * GB,
@@ -57,14 +58,15 @@ const CONTENTS = {
     await page.evaluate(() => {
       window.esc = v => String(v ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
     });
-    await page.addScriptTag({ content: ['formatBytes', 'policyTip', 'storageOverQuotaMarkup', 'storageContentsMarkup', 'inboxRowLabel', 'inboxTitle'].map(fn).join('\n') });
+    await page.addScriptTag({ content: ['formatBytes', 'policyTip', 'storageOverQuotaMarkup', 'storagePendingDeletionMarkup', 'storageContentsMarkup', 'inboxRowLabel', 'inboxTitle'].map(fn).join('\n') });
 
     // Nothing to show without contents (a member without organization:edit).
     assert.equal(await page.evaluate(() => storageContentsMarkup(null) + storageOverQuotaMarkup(null)), '');
     assert.equal(await page.evaluate(() => storageOverQuotaMarkup({ projects: [] })), '');
+    assert.equal(await page.evaluate(() => storagePendingDeletionMarkup(null) + storagePendingDeletionMarkup({ projects: [] })), '');
 
     await page.evaluate((contents) => {
-      const usage = `<div class="team-block storage-location"><div class="member-row"><span><b>Managed storage</b> <span class="chip">managed</span> <span class="chip">default</span></span><span>${formatBytes(contents.retainedBytes)} / ${formatBytes(contents.quotaBytes)}</span></div><div class="progress over"><i style="width:100%"></i></div>${storageOverQuotaMarkup(contents)}</div>`;
+      const usage = `<div class="team-block storage-location"><div class="member-row"><span><b>Managed storage</b> <span class="chip">managed</span> <span class="chip">default</span></span><span>${formatBytes(contents.retainedBytes)} / ${formatBytes(contents.quotaBytes)}</span></div><div class="progress over"><i style="width:100%"></i></div>${storageOverQuotaMarkup(contents)}${storagePendingDeletionMarkup(contents)}</div>`;
       document.querySelector('#org-storage').innerHTML = usage + storageContentsMarkup(contents);
       document.querySelector('details').open = true;
     }, CONTENTS);
@@ -72,6 +74,9 @@ const CONTENTS = {
     const over = await page.locator('.storage-over').textContent();
     assert.match(over, /Over the limit: adding data is paused/);
     assert.match(await page.locator('.storage-over .info-dot').getAttribute('title'), /by 9\/21\/2027.*older versions first/);
+    // Deleted data still in the bucket: shown, explained in a tooltip, not part of the usage figure.
+    assert.equal((await page.locator('.storage-pending').textContent()).replace('ⓘ', '').trim(), '+ 25.7 GB being deleted');
+    assert.match(await page.locator('.storage-pending .info-dot').getAttribute('title'), /until 11\/9\/2026.*doesn’t count toward your limit/);
     const projects = await page.locator('.storage-project > .member-row b').allTextContents();
     assert.deepEqual(projects, ['Model training', 'Storefront'], 'largest first; empty projects hidden');
     assert.equal(await page.locator('[data-older-versions]').count(), 1);

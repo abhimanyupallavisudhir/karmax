@@ -17,9 +17,10 @@ import { INSTALLATION_SCOPE } from '../autonomy/vault-keys.js';
 import type { GitConnection } from '../domain/types.js';
 import type { Store } from '../store/db.js';
 import type { WorkerHeap } from '../temporal/worker-process.js';
+import { readReconciliation } from '../store/object-reconciliation.js';
 import {
   agentMailUsage, cloudflareR2Usage, cloudflareWorkersUsage, composioUsage, daytonaUsage, e2bUsage, githubUsage,
-  hostUsage, NotConnected, type ProbeReading, type ProbeResult,
+  hostUsage, managedStorageUsage, NotConnected, type ProbeReading, type ProbeResult,
 } from './service-limit-probes.js';
 
 export type MeterUnit = 'count' | 'bytes' | 'hours';
@@ -59,6 +60,15 @@ export const SERVICE_CATALOG: ServiceSpec[] = [
         tip: 'Downloads this month (Class B operations). 10 million a month are free.' },
       { id: 'cloudflare-r2.storage', label: 'Stored', unit: 'bytes', window: 'now', source: 'api', limit: 10 * GB,
         tip: 'Data stored in every bucket now. 10 GB is free.' },
+    ] },
+  { id: 'managed-storage', name: 'Managed storage',
+    tip: 'The bucket that holds every organization’s data, checked against tavya’s records once a day.',
+    connect: 'Measured after the first daily check of the bucket.',
+    meters: [
+      { id: 'managed-storage.untracked', label: 'Untracked', unit: 'bytes', window: 'now', source: 'count', limit: GB,
+        tip: 'Data in the bucket that no record accounts for, such as an upload that never finished. Counted toward no organization.' },
+      { id: 'managed-storage.pending-delete', label: 'Awaiting deletion', unit: 'bytes', window: 'now', source: 'count',
+        tip: 'Deleted data, kept 30 days so a restored backup still finds it. Counted toward no organization.' },
     ] },
   { id: 'composio', name: 'Composio', plan: 'Hobby',
     link: { url: 'https://dashboard.composio.dev/~/org/settings/billing', label: 'Upgrade' },
@@ -424,6 +434,14 @@ export class ServiceLimitsService {
     return {
       'cloudflare-workers': async (fetcher) => cloudflareWorkersUsage({ fetch: fetcher, now, ...await cloudflare() }),
       'cloudflare-r2': async (fetcher) => cloudflareR2Usage({ fetch: fetcher, now, ...await cloudflare() }),
+      'managed-storage': async () => {
+        const report = await readReconciliation(store);
+        if (!report) throw new NotConnected();
+        const names = new Map<string, string>();
+        for (const id of Object.keys(report.organizations))
+          if (id) names.set(id, (await store.getOrganization(id))?.name ?? id);
+        return managedStorageUsage(report, names);
+      },
       composio: async (fetcher) => {
         const apiKey = await secret(COMPOSIO_KEY_HANDLE);
         if (!apiKey) throw new NotConnected();

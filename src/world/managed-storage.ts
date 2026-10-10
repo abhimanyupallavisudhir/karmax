@@ -1,5 +1,6 @@
 import type { Store } from '../store/db.js';
 import type { ObjectStore } from '../store/objects.js';
+import type { StorageReconciliation } from '../store/object-reconciliation.js';
 import type { ProjectResourceService } from './resources.js';
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -37,6 +38,9 @@ export interface StorageOverQuotaView { since: number; deleteAt: number }
 export interface StorageContentsView {
   retainedBytes: number;
   quotaBytes?: number;
+  /** Deleted data the store still holds until its delayed delete (counted
+   * nowhere): from the last reconciliation of the bucket. */
+  pendingDeletion?: { bytes: number; until?: number; measuredAt: number };
   overQuota?: StorageOverQuotaView;
   policy: { finishedTaskCheckpointDays: number; overQuotaDeletionDays: number };
   projects: Array<{
@@ -62,6 +66,9 @@ export class ManagedStorageService {
     /** The managed object store, for artifact objects. */
     objects?: ObjectStore;
     notify?: (notice: StorageNotice) => Promise<void>;
+    /** Settles unrecorded uploads and compares the bucket with the database
+     * (store/object-reconciliation.ts). */
+    reconciler?: { run(now?: number): Promise<unknown>; report(): Promise<StorageReconciliation | undefined> };
   }) {}
 
   async run(now = Date.now()): Promise<{ expiredCheckpoints: number; deletedRevisions: number; notices: number }> {
@@ -74,6 +81,9 @@ export class ManagedStorageService {
     // Forget unused restic snapshots, prune, and convert pre-restic versions,
     // before usage is measured against quotas.
     await this.deps.resources.maintainRepositories(now);
+    // A failure to list the bucket must not hold up the quota policy.
+    await this.deps.reconciler?.run(now)
+      .catch((error) => console.warn(`[storage] reconciliation failed: ${error instanceof Error ? error.message : String(error)}`));
     let notices = 0;
     if (store.hosted) for (const organization of (await store.listOrganizations()))
       notices += (await this.enforceQuota(organization.id, now));
@@ -186,9 +196,13 @@ export class ManagedStorageService {
         entry.checkpoints.finishedCount++; entry.checkpoints.finishedBytes += checkpoint.bytes;
       }
     }
+    const reconciled = await this.deps.reconciler?.report().catch(() => undefined);
+    const held = reconciled?.organizations[organizationId];
     return {
       retainedBytes: usage?.retainedBytes ?? 0,
       ...(usage?.quotaBytes != null ? { quotaBytes: usage.quotaBytes } : {}),
+      ...(held?.pendingDelete ? { pendingDeletion: { bytes: held.pendingDelete,
+        ...(held.pendingDeleteUntil ? { until: held.pendingDeleteUntil } : {}), measuredAt: reconciled!.at } } : {}),
       ...(state ? { overQuota: { since: state.since, deleteAt: state.since + STORAGE_POLICY.overQuotaDeletionMs } } : {}),
       policy: { finishedTaskCheckpointDays: STORAGE_POLICY.finishedTaskCheckpointMs / DAY,
         overQuotaDeletionDays: STORAGE_POLICY.overQuotaDeletionMs / DAY },
