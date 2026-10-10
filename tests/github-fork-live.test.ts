@@ -38,7 +38,7 @@ const API = 'https://api.github.com';
 async function github<T = any>(pathname: string, init: RequestInit = {}): Promise<{ status: number; body: T }> {
   const response = await fetch(`${API}${pathname}`, { ...init, headers: {
     accept: 'application/vnd.github+json', authorization: `Bearer ${token}`, 'x-github-api-version': '2022-11-28',
-    'content-type': 'application/json', ...(init.headers ?? {}),
+    'content-type': 'application/json', ...init.headers,
   } });
   const text = await response.text();
   return { status: response.status, body: (text ? JSON.parse(text) : undefined) as T };
