@@ -1996,7 +1996,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
       // A cloud world's disk, before its agent starts (wiki features/computers).
       const remoteWorld = isRemote(args.worldHandle.kind);
-      const turnDisk = remoteWorld ? await prepareTurnDisk(world, args.taskId, organizationId, args.role === 'do') : undefined;
+      // Runs beside the rest of the preparation; awaited before the prompt, and so
+      // before the harness writes anything.
+      const turnDiskReady = remoteWorld
+        ? prepareTurnDisk(world, args.taskId, organizationId, args.role === 'do').catch(() => undefined) : Promise.resolve(undefined);
       let stopDiskWatch: (() => void) | undefined;
 
       // Fork a prior agent (SPEC §10.5) — set up below, AFTER auth resolution, since
@@ -2627,6 +2630,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (project) requestedComputer = machineShape(applyComputer(await store.effectiveProjectConfig(project),
           normalizeComputer(preparationTask?.params.computer)));
       } catch { /* the World section then names the machine as the workflow knows it */ }
+      const turnDisk = await turnDiskReady;
       const systemPrompt = assemblePrompt({
         profile,
         role: args.role,
@@ -3224,6 +3228,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // also stops a harness from starting at all — pramana#3's exit 127), then
         // what its metrics show.
         const sandboxSuspect = failure instanceof ApplicationFailure && ['agent-error', 'agent-infra'].includes(failure.type ?? '');
+        // Both read the sandbox; a frozen one answers neither quickly, so ask at once.
+        const diagnosing = sandboxSuspect && world.diagnose ? world.diagnose({ since: attemptStarted }).catch(() => undefined) : undefined;
         if (sandboxSuspect && (remoteWorld || isDiskFullMessage(failure.message))) {
           stopDiskWatch?.();
           const check = remoteWorld ? await measureWorldDisk(world, args.taskId, 20_000) : undefined;
@@ -3235,8 +3241,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                 detail: turnError instanceof Error ? turnError.message : String(turnError) }) });
           }
         }
-        if (!world.diagnose || !sandboxSuspect) throw failure;
-        const diagnosis = await world.diagnose({ since: attemptStarted }).catch(() => undefined);
+        if (!diagnosing) throw failure;
+        const diagnosis = await diagnosing;
         if (diagnosis && turnSessionKey) (await store.kvSet(`${turnSessionKey}:interruption`, JSON.stringify(diagnosis)));
         throw classifyTurnError(turnError, profile.provider, { diagnosis });
       } finally {
