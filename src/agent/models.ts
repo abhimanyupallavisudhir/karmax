@@ -255,6 +255,60 @@ export async function opencodeModels(configHome?: string, timeoutMs = 10_000): P
     .map((id) => ({ id }));
 }
 
+/** OpenCode's own catalog source: every provider and model `opencode models`
+ * would list, for whichever providers it has a credential for. */
+const MODELS_DEV_URL = 'https://models.dev/api.json';
+const MODELS_DEV_TTL_MS = 6 * 60 * 60_000;
+// Per fetcher, so a caller that brings its own (a test, a proxy) never reads a
+// catalog another one cached.
+let modelsDev: { at: number; catalog: Record<string, any>; fetcher: typeof fetch } | undefined;
+
+/** Karmax defines Kimi Code as its own OpenCode provider (acp.ts openCodeConfig). */
+const KIMI_CODE_MODELS: AvailableModel[] = [
+  { id: 'kimi/kimi-for-coding' },
+  { id: 'kimi/k3', effort: ['low', 'high', 'max'] },
+];
+
+/**
+ * The OpenCode models an organization's API keys can run, by vendor (task
+ * #515: the picker offered `google/gemini-3.6-pro` to an organization with
+ * only an OpenRouter key — a model that does not exist, for a key it did not
+ * have — and the task waited for a credential forever). Read from models.dev,
+ * the catalog OpenCode itself uses, so this needs no `opencode` binary on the
+ * control plane: a hosted one runs OpenCode only in sandboxes. Tool-calling
+ * text models only, newest first. Empty when the catalog cannot be read.
+ */
+export async function openCodeKeyModels(vendors: readonly string[], options: {
+  fetch?: typeof fetch; timeoutMs?: number; perVendor?: number; now?: number;
+} = {}): Promise<AvailableModel[]> {
+  if (!vendors.length) return [];
+  const now = options.now ?? Date.now();
+  const fetcher = options.fetch ?? fetch;
+  let catalog = modelsDev?.fetcher === fetcher && now - modelsDev.at < MODELS_DEV_TTL_MS ? modelsDev.catalog : undefined;
+  if (!catalog && vendors.some((vendor) => vendor !== 'kimi')) {
+    try {
+      const response = await withTimeout(fetcher(process.env.KARMAX_MODELS_DEV_URL ?? MODELS_DEV_URL), options.timeoutMs ?? 10_000);
+      if (response.ok) {
+        catalog = await response.json() as Record<string, any>;
+        modelsDev = { at: now, catalog, fetcher };
+      }
+    } catch { /* offline: the vendors' models are simply not listed */ }
+  }
+  const out: AvailableModel[] = [];
+  for (const vendor of vendors) {
+    if (vendor === 'kimi') { out.push(...KIMI_CODE_MODELS); continue; }
+    const models = catalog?.[vendor]?.models;
+    if (!models || typeof models !== 'object') continue;
+    out.push(...Object.values(models as Record<string, any>)
+      .filter((model) => model && typeof model.id === 'string' && model.tool_call === true && model.status !== 'deprecated'
+        && (!Array.isArray(model.modalities?.output) || model.modalities.output.includes('text')))
+      .sort((a, b) => String(b.release_date ?? '').localeCompare(String(a.release_date ?? '')))
+      .slice(0, options.perVendor ?? 25)
+      .map((model) => ({ id: `${vendor}/${model.id}`, ...(typeof model.name === 'string' ? { displayName: model.name } : {}) })));
+  }
+  return out;
+}
+
 /** Ask an ACP harness for its negotiated model picker, scoped to one login home. */
 export async function acpModels(
   provider: Extract<AcpProvider, 'kimi' | 'grok'>,

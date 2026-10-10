@@ -62,6 +62,10 @@ const baseField = (): FieldSpec => ({ name: 'base', type: 'branch', label: 'Base
 // opened against it or the merge enqueue). software-dev re-reads `target` at
 // PR/merge, so the edit genuinely takes effect (SPEC §4.5/§5.5, §2 setTarget).
 const targetField = (): FieldSpec => ({ name: 'target', type: 'branch', label: 'Target (merge-to) branch', default: 'main', scopes: ALL, bind: 'top', mutable: 'untilUsed' });
+// Multi-repository projects whose repositories do not share branch names (one
+// uses main, another master). Off, every repository uses the common base/target.
+// Task and project scopes only: an organization has no repository list.
+const repoBranchesField = (): FieldSpec => ({ name: 'repoBranches', type: 'repoBranches', label: 'Different branches per repo', help: 'Set the base and target branch for each repository separately.', scopes: ['task', 'project'], bind: 'top' });
 const reposField = (): FieldSpec => ({ name: 'repos', type: 'list', label: 'Repositories', help: 'One per line. Local worlds accept filesystem paths; E2B accepts SSH Git URLs (git@github.com:org/repo.git). Multiple repos are checked out in separate world subdirectories.', scopes: ['project'], bind: 'project' });
 // Wire compatibility for old settings and version-pinned tasks. The browser no
 // longer renders this retired host-file-copy control; typed project resources
@@ -79,6 +83,7 @@ const remoteField = (): FieldSpec => ({
   label: 'Remote policy',
   help: 'What leaves a local machine: none — merges stay local; push — push the target after merge; pr — open the exact GitHub proposal before Review, then merge it under a confirming human’s GitHub authorization. In E2B, the SSH repository is necessarily the durable source of truth, so confirmed merges are broker-pushed even when this is none.',
   options: ['none', 'push', 'pr'],
+  optionLabels: { none: 'Keep merges local', push: 'Push after merging', pr: 'Open a pull request' },
   default: 'none',
   scopes: ['project', 'global'],
   bind: 'project',
@@ -86,7 +91,8 @@ const remoteField = (): FieldSpec => ({
 const otherAttemptsField = (): FieldSpec => ({
   name: 'otherAttempts', type: 'select', label: 'Other task attempts',
   help: 'ask — the human or agent reviewer chooses Keep or Cancel; without a reviewer, keep. Keep allows other proposals to continue and merge. The first attempt entering Merge fixes the choice for its group.',
-  options: ['ask', 'keep', 'cancel'], default: 'ask', scopes: ['project'], bind: 'project',
+  options: ['ask', 'keep', 'cancel'], optionLabels: { ask: 'Reviewer decides', keep: 'Keep them', cancel: 'Cancel them' },
+  default: 'ask', scopes: ['project'], bind: 'project',
 });
 const landingAuthorityField = (): FieldSpec => ({
   name: 'landingAuthority',
@@ -95,7 +101,7 @@ const landingAuthorityField = (): FieldSpec => ({
   help: `auto — prefer the provider queue/auto-merge and use ${BRAND} admission only when strict freshness needs it; external — a repository-triggered third-party system owns landing and ${BRAND} only observes; ${BRAND} — always use ${BRAND} fair fallback admission.`,
   options: ['auto', 'external', 'karmax'],
   // The stored value predates the product name.
-  optionLabels: { karmax: BRAND },
+  optionLabels: { auto: 'Automatic', external: 'External system', karmax: BRAND },
   default: 'auto',
   scopes: ['project', 'global'],
   bind: 'project',
@@ -472,6 +478,7 @@ export const MANIFESTS: WorkflowManifest[] = [
       agentField('do', 'Agent', 'always'),
       baseField(),
       targetField(),
+      repoBranchesField(),
       computerField(),
       reposField(),
       multiPrField(),
@@ -549,7 +556,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     // goal delegates to softwareDev, so it shares the Do/Review machinery.
     roles: [DO_ROLE, ...(RESOLVE_AGENT_ENABLED ? [LEGACY_RESOLVE_ROLE] : []), RESPONDER_ROLE, CONFIRM_ROLE],
     stages: SOFTWARE_DEV_STAGES,
-    params: [promptField(), agentField('do', 'Agent'), baseField(), targetField(), computerField(), reposField(), copyGlobsField(), remoteField(), landingAuthorityField(), responderField(), confirmerField()],
+    params: [promptField(), agentField('do', 'Agent'), baseField(), targetField(), repoBranchesField(), computerField(), reposField(), copyGlobsField(), remoteField(), landingAuthorityField(), responderField(), confirmerField()],
   },
   {
     name: 'merge-only',

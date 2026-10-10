@@ -11,7 +11,7 @@ import {
   PLATFORM_REQUEST_BODY_SCHEMA, PRIORITY_NAMES, AGENT_ROLE_NAMES,
   compactSearch, compactOrganizationSearch, compactTags, normalizeRequestBody, platformRequestPathError,
 } from '../platform/platform-request.js';
-import { URGENCY_LEVELS, type AgentWait, type Urgency } from '../domain/types.js';
+import { SUB_TASK_ACTIONS, URGENCY_LEVELS, type AgentWait, type SubTaskAction, type Urgency } from '../domain/types.js';
 import { BRAND } from '../domain/brand.js';
 
 /** The longest a single wait may last: a week, after which a parked world may hibernate. */
@@ -37,6 +37,29 @@ export { MAX_REVIEW_TEXT_LENGTH };
 
 /** How loudly an ask asks. One shared parameter across every human-facing tool,
  * so an agent learns the vocabulary once. See `Urgency` in domain/types.ts. */
+/** New agents for notify, in the task form's agent shape. */
+const NEW_AGENTS_PARAMETER = {
+  type: 'array',
+  maxItems: 8,
+  description: 'Agents to call in: {provider, model?, effort?, prompt? (its instructions), resumeFrom? ({taskId, role?}: ' +
+    'fork that task agent, role default do)}.',
+  items: {
+    type: 'object',
+    properties: {
+      provider: { type: 'string' },
+      model: { type: 'string' },
+      effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh', 'max'] },
+      prompt: { type: 'string', maxLength: 4_000 },
+      resumeFrom: {
+        type: 'object',
+        properties: { taskId: { type: 'string' }, role: { type: 'string' } },
+        required: ['taskId'],
+      },
+    },
+    required: ['provider'],
+  },
+};
+
 const URGENCY_PARAMETER = {
   type: 'string',
   enum: URGENCY_LEVELS,
@@ -126,12 +149,12 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'respond_to_sub_task',
     description:
-      'Answer a sub-task that raised to you. action: "open_pr" (its completed work should open a PR and enter Review), "confirm" (approve what it has: lands a PR at Review, or opens the PR of a child whose turn ended without one), "comment" (send guidance/answer its question so it keeps working), "retry" (retry a failed step), or "cancel" (abandon it). Omit child_task_id to answer all waiting children. The answer is delivered when your current turn ends.',
+      'Answer a sub-task that raised to you. action: "open_pr" (its completed work should open a PR and enter Review), "confirm" (approve what it has: lands a PR at Review, or opens the PR of a child whose turn ended without one), "comment" (send guidance/answer its question so it keeps working), "retry" (retry a failed step), "cancel" (abandon it), or "keep_own" (only when its raise offers it: its publication was refused over files it and a newer version changed differently; publish again keeping its version of them). Omit child_task_id to answer all waiting children. The answer is delivered when your current turn ends. A question only a person can answer: pass it to them with escalate(to, note, task_id) instead of relaying it.',
     parameters: {
       type: 'object',
       properties: {
         child_task_id: { type: 'string', description: 'The raising child; omit to respond to all waiting children.' },
-        action: { type: 'string', enum: ['open_pr', 'confirm', 'comment', 'retry', 'cancel'] },
+        action: { type: 'string', enum: [...SUB_TASK_ACTIONS] },
         text: { type: 'string', description: 'For "comment": the message/answer/guidance to send down.' },
       },
       required: ['action'],
@@ -174,7 +197,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     name: 'pause',
     description:
       'End your turn to wait for durable jobs or a real-world event (CI, a deploy, a set time), and be resumed when every listed job has finished, when a message arrives, or after `minutes`, whichever comes first. Without jobs it is a timed pause; list every job that is still running, or the paused world could freeze it. You are resumed with each job\'s exit code and last output. ' +
-      'It is not for asking: if you need an answer to continue, call escalate_to_human or end your turn with the question. Set needs_input only when you are waiting anyway and someone may answer meanwhile, and you will carry on without the answer once `minutes` pass: the task then shows Needs input and notifies them. After calling it, end your turn.',
+      'It is not for asking: if you need an answer to continue, end your turn with the question (or call escalate_to_human for what only a person can give). Set needs_input only when you are waiting anyway and someone may answer meanwhile, and you will carry on without the answer once `minutes` pass: the task then shows Needs input and notifies them. After calling it, end your turn.',
     parameters: {
       type: 'object',
       properties: {
@@ -354,13 +377,13 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'get_credential',
     description:
-      'Reveal a vault secret in plaintext (API key, password, SSH key, .env contents). Default login reveal includes notes; field note retrieves notes alone. This is the audited last resort — prefer fill_credential for browser logins and rely on spawn-time env injection for keys. Returns granted with the value, or needs_approval/denied per the item\'s reveal policy, or not_in_vault. A needs_approval response already parks the approval request for the human (its requestId is returned) — do NOT also call request_credential; just wait for the decision, which resumes the task.',
+      'Reveal a vault secret in plaintext (API key, password, SSH key, .env contents). Default login reveal includes notes; field note retrieves notes alone. Field totp returns only the current one-time code (never the seed) under the item\'s blind-use policy, no reveal approval needed; it is the default for a login that holds only a TOTP seed. Plaintext reveal is the audited last resort — prefer fill_credential for browser logins and rely on spawn-time env injection for keys. Returns granted with the value, or needs_approval/denied per the item\'s reveal policy, or not_in_vault. A needs_approval response already parks the approval request for the human (its requestId is returned) — do NOT also call request_credential; just wait for the decision, which resumes the task.',
     parameters: {
       type: 'object',
       properties: {
         item_id: { type: 'string' },
         domain: { type: 'string' },
-        field: { type: 'string', description: 'password | totp | secret | privateKey | env | note (defaults to the item type\'s main field).' },
+        field: { type: 'string', description: 'password | totp | secret | privateKey | env | note (defaults to the item type\'s main field). totp returns the current one-time code.' },
       },
     },
   },
@@ -734,19 +757,20 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'escalate_to_human',
     description:
-      'Pause your current task at its exact stage and ask selected people, teams, or Avatars for input. ' +
+      'Ask named people, teams, or Avatars for what only a person can give: an approval, a secret, an action in the real world, a personal decision. ' +
+      'For anything an agent could answer, end your turn with the question instead; it goes to your task\'s usual input route (a sub-task\'s parent, else its Responder). ' +
+      'This pauses your task at its exact stage and ends your turn. A reply resumes you, and the answer or question you end that turn with reaches them too. ' +
       'Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @maintainers, @admins, @superadmins, @owners, @project, or @all. ' +
-      'Discover valid choices with platform_request(GET, "/api/agent/escalation-targets"). ' +
-      'Calling this stops your current turn; the task resumes when a selected principal responds.',
+      'Discover valid choices with platform_request(GET, "/api/agent/escalation-targets").',
     parameters: {
       type: 'object',
       properties: {
         audience: {
           type: 'array',
           items: { type: 'string' },
-          minItems: 1,
           maxItems: 32,
-          description: 'One or more person/team/Avatar routing selectors; any selected principal may respond. Default: the task\'s Responder (people), else its creator.',
+          // Required, but checked by the platform, whose refusal lists who can be asked.
+          description: 'Required. Who to ask: person/team/Avatar selectors; any of them may answer.',
         },
         message: {
           type: 'string',
@@ -765,15 +789,17 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
       'Tell or call people and agents of this task without ending your turn. People (user:<id>, @team:<slug>, @creator, ' +
       '@owners, @project, @maintainers, @admins, @all) and Avatars (avatar:<id>) are notified now; agents of this task ' +
       '(agent:do for the main agent, agent:responder, agent:confirm, agent:agent-<n>) are called when your turn ends, in order. ' +
-      'The message is said in the task conversation.',
+      'The message is said in the task conversation. `agents` calls new agents in, after `to`; each becomes the next ' +
+      'agent:agent-<n> (the returned message\'s `to` names them).',
     parameters: {
       type: 'object',
       properties: {
-        to: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 32 },
+        to: { type: 'array', items: { type: 'string' }, maxItems: 32 },
         message: { type: 'string', minLength: 1, maxLength: 4_000 },
         urgency: URGENCY_PARAMETER,
+        agents: NEW_AGENTS_PARAMETER,
       },
-      required: ['to', 'message'],
+      required: ['message'],
     },
   },
   {
@@ -1101,11 +1127,11 @@ export function platformToolHandlers(
     },
     async respond_to_sub_task(args) {
       const action = String(args?.action ?? '');
-      if (!['open_pr', 'confirm', 'comment', 'retry', 'cancel'].includes(action))
-        return 'invalid action — use open_pr | confirm | comment | retry | cancel';
+      if (!(SUB_TASK_ACTIONS as readonly string[]).includes(action))
+        return `invalid action — use ${SUB_TASK_ACTIONS.join(' | ')}`;
       await ctx.respondToSubTask({
         childTaskId: args?.child_task_id ? String(args.child_task_id) : undefined,
-        action: action as 'open_pr' | 'confirm' | 'comment' | 'retry' | 'cancel',
+        action: action as SubTaskAction,
         text: args?.text ? String(args.text) : undefined,
       });
       return `${action} queued for sub-task${args?.child_task_id ? ` ${args.child_task_id}` : 's'}: delivered when this turn ends`;
@@ -1193,12 +1219,13 @@ export function platformToolHandlers(
       }
       catch (e: any) { return `error: ${e?.message ?? e}`; }
       if (needsInput) {
-        const who = needsInput.audience?.join(', ') ?? 'whoever answers this task\'s questions';
+        const who = needsInput.audience?.join(', ')
+          ?? 'whoever answers this task\'s questions (for a sub-task, its parent task, not a person: to ask a person, name them in audience)';
         return `Asking ${who}. End your turn now${needsInput.message ? '' : ' with the question as your final response'}; you will be resumed with their answer, ${jobs.length ? `when ${jobs.join(', ')} ${jobs.length > 1 ? 'finish' : 'finishes'}, ` : ''}or after ${Math.round(minutes)} min to carry on without it.`;
       }
       return jobs.length
-        ? `Waiting for ${jobNames.length === jobs.length ? jobNames.join(', ') : jobs.join(', ')} (at most ${Math.round(minutes)} min). End your turn now; you will be resumed when ${jobs.length > 1 ? 'they finish' : 'it finishes'}, a message arrives, or the time is up.`
-        : `Pausing for ${Math.round(minutes)} min. End your turn now; you will be resumed then, or sooner if a message arrives.`;
+        ? `Waiting for ${jobNames.length === jobs.length ? jobNames.join(', ') : jobs.join(', ')} (at most ${Math.round(minutes)} min). End your turn now, answering in your final response anything you were just asked; you will be resumed when ${jobs.length > 1 ? 'they finish' : 'it finishes'}, a message arrives, or the time is up.`
+        : `Pausing for ${Math.round(minutes)} min. End your turn now, answering in your final response anything you were just asked; you will be resumed then, or sooner if a message arrives.`;
     },
     async create_branch(args) {
       try {
@@ -1543,6 +1570,7 @@ export function platformToolHandlers(
         to: Array.isArray(args?.to) ? args.to.map(String) : [],
         message: String(args?.message ?? ''),
         ...(args?.urgency ? { urgency: String(args.urgency) } : {}),
+        ...(Array.isArray(args?.agents) && args.agents.length ? { agents: args.agents } : {}),
       }));
     },
     async escalate(args) {

@@ -68,6 +68,74 @@ describe('public landing page', () => {
     await ui.close();
   });
 
+  it('sets the analogy as two plain sentences, a single word space after each name', async () => {
+    const ui = await landing();
+    const lines = ui.page.locator('#landing-title > span');
+    expect(await lines.allInnerTexts()).toEqual(['vscode was a fancy text editor.', 'tavya is a fancy to-do list.']);
+    // The gap between the name and the next word is the font's own space,
+    // not a column padded to the longer name.
+    const gaps = await lines.evaluateAll((spans) => spans.map((span) => {
+      const text = span.firstChild, space = text.data.indexOf(' ');
+      const range = (start: number, end: number) => {
+        const r = document.createRange();
+        r.setStart(text, start); r.setEnd(text, end);
+        return r.getBoundingClientRect();
+      };
+      return (range(space + 1, space + 2).left - range(0, space).right) / parseFloat(getComputedStyle(span).fontSize);
+    }));
+    for (const gap of gaps) expect(gap).toBeLessThan(.35);
+    await ui.close();
+  });
+
+  it('separates the two analogy sentences by more than their line spacing, at any width', async () => {
+    for (const width of [1440, 1100, 961, 800, 390, 320]) {
+      const ui = await landing({ viewport: { width, height: 900 } });
+      const [first, second] = await ui.page.locator('#landing-title > span').evaluateAll((spans) => spans.map((span) => {
+        const box = span.getBoundingClientRect();
+        return { top: box.top, bottom: box.bottom, lineHeight: parseFloat(getComputedStyle(span).lineHeight) };
+      }));
+      // Wrapped lines of one sentence sit lineHeight apart; the sentences sit further.
+      expect(second!.top - first!.bottom, `${width}px`).toBeGreaterThan(first!.lineHeight * .4);
+      expect(await ui.page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+      await ui.close();
+    }
+  });
+
+  it('colours each analogy object in the accent, the past one muted', async () => {
+    const ui = await landing();
+    const colours = await ui.page.locator('#landing-title > span').evaluateAll((spans) => spans.map((span) =>
+      [getComputedStyle(span).color, getComputedStyle(span.querySelector('b')).color]));
+    expect(await ui.page.locator('#landing-title b').allInnerTexts()).toEqual(['text editor.', 'to-do list.']);
+    for (const [sentence, object] of colours) expect(object).not.toBe(sentence);
+    expect(colours[0]![1]).not.toBe(colours[1]![1]); // the past is a muted accent
+    await ui.close();
+  });
+
+  it('closes on the brand mark', async () => {
+    const ui = await landing();
+    const mark = ui.page.locator('.landing-final-mark .mark');
+    expect(await mark.count()).toBe(1);
+    expect((await mark.boundingBox())!.width).toBeGreaterThanOrEqual(60);
+    await ui.close();
+  });
+
+  it('sets type like the console: Inter with its default glyphs and natural tracking', async () => {
+    const ui = await landing();
+    const type = await ui.page.evaluate(() => [...document.querySelectorAll('.landing-page, .landing-page h1, .landing-page h2, .landing-page h3, .landing-intro')]
+      .map((element) => {
+        const style = getComputedStyle(element);
+        const tracking = style.letterSpacing === 'normal' ? 0 : parseFloat(style.letterSpacing) / parseFloat(style.fontSize);
+        return { family: style.fontFamily, features: style.fontFeatureSettings, tracking };
+      }));
+    const consoleFamily = await ui.page.evaluate(() => getComputedStyle(document.body).fontFamily);
+    for (const { family, features, tracking } of type) {
+      expect(family).toBe(consoleFamily);
+      expect(features).toBe('normal'); // no single-storey a or other alternates
+      expect(tracking).toBeGreaterThanOrEqual(-.025);
+    }
+    await ui.close();
+  });
+
   it('uses a faithful, installation-branded task list to advertise implemented features', async () => {
     const ui = await landing();
     const { page } = ui;

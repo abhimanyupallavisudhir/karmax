@@ -12,10 +12,10 @@ const ci = parse(fs.readFileSync(path.join(repoRoot, '.github', 'workflows', 'ci
 describe('CI workflow', () => {
   // Branch protection and Karmax's merge gate both key on this check name, so
   // it has to stand for everything a landing needs, not just one job of it.
-  it('reports the required check after static checks, every test shard, and deploy artifacts', () => {
+  it('reports the required check after static checks, every test shard, deploy artifacts and the CLI version bump', () => {
     const required = ci.jobs.required;
     expect(required.name).toBe('typecheck + tests');
-    expect([...required.needs].sort()).toEqual(['checks', 'deploy-artifacts', 'test']);
+    expect([...required.needs].sort()).toEqual(['checks', 'cli-version', 'deploy-artifacts', 'test']);
     // It must still run, and fail, when a needed job failed or was cancelled.
     expect(required.if).toBe('always()');
   });
@@ -55,6 +55,42 @@ describe('CI workflow', () => {
   it('covers the standalone UI and browser regressions through the sharded suite', () => {
     expect(fs.readdirSync(path.join(repoRoot, 'web')).some((name) => name.endsWith('.test.cjs'))).toBe(true);
     expect(fs.existsSync(path.join(repoRoot, 'tests', 'web-regressions.test.ts'))).toBe(true);
+  });
+});
+
+// CI #1709 failed only on Docker Hub's anonymous pull limit (429). Every job
+// that pulls from Docker Hub logs in first, except on fork pull requests, which
+// get no secrets and must still run.
+describe('Docker Hub login', () => {
+  type Step = {
+    name?: string; if?: string; uses?: string; run?: string; with?: Record<string, string>; 'continue-on-error'?: boolean;
+  };
+  const login = (steps: Step[]) => steps.findIndex((step) => step.uses?.startsWith('docker/login-action@'));
+
+  it.each([
+    ['test', 'npm test -- --shard='],
+    ['deploy-artifacts', './deploy/karmax up '],
+  ])('%s logs in, pinned, skipped without the secret and best-effort, before it pulls', (name, pull) => {
+    const job = ci.jobs[name];
+    const steps: Step[] = job.steps;
+    const index = login(steps);
+    expect(index).toBeGreaterThanOrEqual(0);
+    expect(index).toBeLessThan(steps.findIndex((step) => step.run?.startsWith(pull)));
+    const step = steps[index]!;
+    expect(step.uses).toMatch(/^docker\/login-action@[0-9a-f]{40}$/);
+    expect(job.env.DOCKERHUB_USERNAME).toBe('${{ secrets.DOCKERHUB_USERNAME }}');
+    expect(step.if).toContain("env.DOCKERHUB_USERNAME != ''");
+    expect(step.with).toEqual({ username: '${{ env.DOCKERHUB_USERNAME }}', password: '${{ secrets.DOCKERHUB_TOKEN }}' });
+    // CI #1713: Docker Hub's authenticated path failed while anonymous pulls
+    // worked; a failed login must fall back to them, not fail the job.
+    expect(step['continue-on-error']).toBe(true);
+  });
+
+  // A service whose registry login fails fails the job before any step, with
+  // no anonymous fallback.
+  it('pulls the test shards\' services anonymously', () => {
+    for (const service of Object.values<any>(ci.jobs.test.services))
+      expect(service.credentials).toBeUndefined();
   });
 });
 

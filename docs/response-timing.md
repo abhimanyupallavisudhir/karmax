@@ -67,7 +67,7 @@ to worker-wall-clock estimate, not an exact queue duration.
 | `tool.provider-observed` | Provider item start/terminal notifications for CLI-owned tools, commands and searches. Internal discovery or missing lifecycle notifications cannot be reconstructed. |
 | `service.*` | Gateway-side managed discovery/execution, per-connection lock wait, account validation and remote action. Correlation comes from the verified task token’s execution ID/attempt, never a caller-supplied trace header. |
 | `provider.usage`, `provider.completed` | Provider-reported per-request counters where exposed and complete aggregate counters. Missing usage/cache fields stay absent. Cache inclusion semantics are explicit. |
-| `delivery.socket-roundtrip`, `delivery.browser-frame` | First assistant output per turn/attempt per socket: send-to-ack on the server clock, and client-reported receipt-to-two-animation-frames. Only a foreground Check-in tab acknowledges. This is a frame opportunity, not proof of paint or exact one-way network delay. |
+| `delivery.socket-roundtrip`, `delivery.browser-frame` | First assistant output per turn/attempt per socket: send-to-ack on the server clock, and client-reported receipt-to-two-animation-frames. Only a foreground Chat tab acknowledges. This is a frame opportunity, not proof of paint or exact one-way network delay. |
 
 Live follow-ups offered to an adapter have separate receipt and offer observations.
 An offer is not proof of consumption, nor proof that the next text answers that
@@ -124,7 +124,7 @@ also accepts `.json.gz` exports.
 ## Production collection and fair comparisons
 
 1. Deploy through the normal release process and explicitly opt in to timing. Prefer an isolated installation for benchmarks. Open the
-   foreground Check-in tab before submitting a test if browser evidence matters.
+   foreground Chat tab before submitting a test if browser evidence matters.
 2. Collect separate sets for conversation, one authorized **read-only** service
    action, sequential actions, and parallel actions. Use equivalent prompts,
    accounts/data sizes, tools, reasoning settings, models and response criteria.

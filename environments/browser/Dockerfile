@@ -8,6 +8,8 @@ ARG PLAYWRIGHT_VERSION=1.61.1
 # when a user has not rebuilt an older template yet.
 ARG CLAUDE_CODE_VERSION=2.1.281
 ARG CODEX_VERSION=0.156.1
+# src/agent/acp-packages.ts OPENCODE_VERSION.
+ARG OPENCODE_VERSION=1.18.35
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PLAYWRIGHT_BROWSERS_PATH=/opt/karmax/browsers \
@@ -35,8 +37,10 @@ RUN mkdir -p /opt/karmax/browser /opt/karmax/bin "$PLAYWRIGHT_BROWSERS_PATH" \
 RUN npm install --prefix /opt/karmax/agents --no-audit --no-fund --omit=dev \
       "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
       "@openai/codex@${CODEX_VERSION}" \
+      "opencode-ai@${OPENCODE_VERSION}" \
  && ln -s /opt/karmax/agents/node_modules/.bin/claude /opt/karmax/bin/claude \
- && ln -s /opt/karmax/agents/node_modules/.bin/codex /opt/karmax/bin/codex
+ && ln -s /opt/karmax/agents/node_modules/.bin/codex /opt/karmax/bin/codex \
+ && ln -s /opt/karmax/agents/node_modules/.bin/opencode /opt/karmax/bin/opencode
 
 COPY smoke.mjs /opt/karmax/smoke.mjs
 RUN node /opt/karmax/smoke.mjs

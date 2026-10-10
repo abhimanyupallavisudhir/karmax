@@ -51,6 +51,7 @@ jobs:
           LIVE_CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.LIVE_CLAUDE_CODE_OAUTH_TOKEN }}
           LIVE_E2B_API_KEY: ${{ secrets.LIVE_E2B_API_KEY }}
           LIVE_DAYTONA_API_KEY: ${{ secrets.LIVE_DAYTONA_API_KEY }}
+          LIVE_OPENCODE_ANTHROPIC_API_KEY: ${{ secrets.LIVE_OPENCODE_ANTHROPIC_API_KEY }}
           LIVE_GITHUB_TOKEN: ${{ secrets.LIVE_GITHUB_TOKEN }}
         run: |
           # decide SUITE SECRET...: the suite runs when selected and any of its secrets is set.
@@ -156,10 +157,13 @@ jobs:
       - uses: ./.github/actions/install
       - uses: ./.github/actions/temporal-cli
       # The snapshot build stays behind its own KARMAX_DAYTONA_LIVE_BUILD switch.
-      - run: npx vitest run tests/daytona-live.test.ts tests/daytona-environment-live.test.ts tests/daytona-workflow-live.test.ts
+      - run: npx vitest run tests/daytona-live.test.ts tests/daytona-environment-live.test.ts tests/daytona-workflow-live.test.ts tests/remote-acp-live.test.ts tests/remote-acp-workflow-live.test.ts
         env:
           KARMAX_RUN_LIVE: '1'
           DAYTONA_API_KEY: ${{ secrets.LIVE_DAYTONA_API_KEY }}
+          # OpenCode's model key, its own secret like every suite's; without it
+          # the OpenCode suites skip (their E2B half runs only by hand).
+          ANTHROPIC_API_KEY: ${{ secrets.LIVE_OPENCODE_ANTHROPIC_API_KEY }}
 
   github:
     name: GitHub pull requests

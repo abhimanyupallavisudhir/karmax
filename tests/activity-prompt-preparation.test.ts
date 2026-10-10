@@ -102,6 +102,33 @@ it('RT-14 queues a remote turn for its world lease without another task read', a
 });
 
 
+// pramana#3: the workflow's copy of the handle predated the machine the API
+// recorded, so the World section named none, and nothing said 50 GB was pending.
+it('names the recorded machine and the size the task now asks for, with one task read', async () => {
+  home = fs.mkdtempSync(path.join(os.tmpdir(), 'prompt-review-'));
+  store = await Store.create(':memory:');
+  const project = await store.createProject('Remote', { worldProvider: 'e2b', resources: { cpu: 2, memoryMb: 2048 } });
+  const task = await store.createTask({ projectId: project.id, title: 'Work', workflow: 'just-do', workflowVersion: '1.0.0',
+    params: { prompt: 'fixture', computer: { diskGb: 50 } } });
+  const stale = await store.registerWorld({ id: task.id, kind: 'e2b', root: '/workspace', branch: 'task', base: 'main' }, project.id) as any;
+  await store.updateWorldMeta(stale, { computer: { cpu: 2, memoryMb: 2048 } });
+  const worlds = new WorldRegistry();
+  world = await worlds.create('memory', { taskId: task.id, base: 'main' });
+  world.handle = stale;
+  worlds.register({ kind: 'e2b', open: async () => world, status: async () => 'ready' } as any);
+  let prompt = '';
+  const core = makeCoreActivities({ store, worlds, contentDir: home, profiles: new ProfileResolver(store, 'mock'),
+    adapters: new Map([['mock', { provider: 'mock', runTurn: async (input: any) => {
+      prompt = input.systemPrompt;
+      return { output: 'done', termination: { kind: 'success', status: 'fixture' } };
+    } }]]) as any });
+  const get = vi.spyOn(store, 'getTask');
+  await core.runAgentTurn({ taskId: task.id, role: 'do', agentSlotGranted: true, worldHandle: stale, messages: [],
+    task: { taskId: task.id, projectId: project.id, title: 'Work', prompt: 'work', project: {}, agents: { do: { provider: 'mock' } } } } as any);
+  expect(prompt).toContain("Computer: 2 CPU · 2 GB. This task's computer is now 2 CPU · 2 GB · 50 GB disk");
+  expect(get.mock.calls.filter(([id]) => id === task.id)).toHaveLength(1);
+});
+
 it('RT-14 polls execution state without parsing stored conversation', async () => {
   const { task } = await fixture();
   await store.db.prepare('UPDATE tasks SET lastView=?, conversation=? WHERE id=?').run(

@@ -241,3 +241,43 @@ it('trusts the latest checkpoint when no failure was recorded for this generatio
   expect(f.checkpointWorld).not.toHaveBeenCalled();
   expect(f.destroy).toHaveBeenCalledTimes(1);
 });
+
+// pramana#3 (2026-10-09): a finished task's world (#552) was held by a stuck
+// operation in the worker. Every sweep reached that task's sandbox in the
+// orphan reaper, waited 30 s for its operation lock, threw "file lock admission
+// timed out", and stopped there, silently: no parked world was hibernated or
+// resized for anyone, and a 50 GB resize waited for hours.
+it('hibernates parked worlds although another world is busy in every earlier step', async () => {
+  const f = await fixture();
+  const busy = 'task_busy';
+  const operate = f.worlds.withOperation.bind(f.worlds);
+  vi.spyOn(f.worlds, 'withOperation').mockImplementation(((id: string, work: () => Promise<unknown>) =>
+    id === busy ? Promise.reject(new Error('file lock admission timed out')) : operate(id, work)) as any);
+  f.worlds.register({ kind: 'memory', open: f.open, probe: f.probe, listSandboxes: async () => [{
+    sandboxId: 'held', taskId: busy, matches: () => false, destroy: vi.fn(async () => {}),
+  }] } as any);
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  expect(await f.lifecycle.sweep(Date.now() + 1)).toBe(1);
+  expect(await f.store.worldState(f.handle.id)).toBe('hibernated');
+  // Said, not swallowed — once while it keeps failing the same way.
+  await f.store.setWorldState(f.handle, 'parked');
+  await f.lifecycle.sweep(Date.now() + 2);
+  expect(warn.mock.calls.filter(([text]) => String(text).includes('file lock admission timed out'))).toHaveLength(1);
+});
+
+// Task #552 (2026-10-09): released when it finished, then revived by another
+// task's open and left degraded, holding a runner lease. Nothing tore it down
+// again: only worlds marked teardownPending were retried.
+it('tears down a degraded world whose task has finished, marked or not', async () => {
+  const f = await fixture();
+  await f.store.saveView(f.handle.id, { taskId: f.handle.id, title: 'Done', workflow: 'software-dev',
+    stage: 'done', status: 'done', messages: [], actions: [], state: {}, updatedAt: Date.now() } as any);
+  await f.store.setWorldState(f.handle, 'degraded');
+  await f.lifecycle.sweep();
+  expect(await f.store.worldState(f.handle.id)).toBe('released');
+  // A running task's degraded world is left to its own recovery.
+  const f2 = await fixture();
+  await f2.store.setWorldState(f2.handle, 'degraded');
+  await f2.lifecycle.sweep();
+  expect(await f2.store.worldState(f2.handle.id)).toBe('degraded');
+});

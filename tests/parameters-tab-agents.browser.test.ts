@@ -103,9 +103,9 @@ it('lists called agents from params for a view without participants, and freezes
     await params.waitFor();
     const called = params.locator('[data-row="agent:agent-2"]');
     expect(await called.count()).toBe(1);
-    expect(await called.locator('.af-provider').isDisabled()).toBe(true);
+    expect(await called.locator('.af-ref').isDisabled()).toBe(true);
     expect(await params.locator('[data-row="responder"] .rf-kind').isDisabled()).toBe(true);
-    expect(await params.locator('[data-row="agent:do"] .af-provider').isDisabled()).toBe(true);
+    expect(await params.locator('[data-row="agent:do"] .af-ref').isDisabled()).toBe(true);
     // The task's authority stays editable while its agent's harness is frozen.
     await params.locator('[data-row="agent:do"] .agent-authority > summary').click();
     expect(await params.locator('#tp-authorization .authz-level-select').isDisabled()).toBe(false);

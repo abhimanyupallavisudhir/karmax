@@ -11,6 +11,7 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { isIP } from 'node:net';
 import { sameRepository } from '../world/repository-identity.js';
+import { pinTarget, workingFolder, worldCheckoutNames } from '../domain/world-location.js';
 import { isPostgresTarget, openSqlDatabase, type SqlDatabase } from './sql.js';
 import { watchAuthorityWrites } from './authorization-epoch.js';
 import { setImmediate as yieldTurn } from 'node:timers/promises';
@@ -580,6 +581,9 @@ export class Store {
       CREATE TABLE IF NOT EXISTS organizations (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
         kind TEXT NOT NULL, plan TEXT NOT NULL DEFAULT 'free', createdAt INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS organization_aliases (
+        slug TEXT PRIMARY KEY, organizationId TEXT NOT NULL, createdAt INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS organization_memberships (
         organizationId TEXT NOT NULL, userId TEXT NOT NULL, role TEXT NOT NULL,
@@ -1803,6 +1807,15 @@ export class Store {
     if (process.env.KARMAX_DEPLOYMENT === 'hosted' && ['worktree', 'container', 'memory'].includes(merged.worldProvider ?? 'e2b'))
       throw new Error('hosted projects require a remote world provider');
     (await this.db.prepare('UPDATE projects SET config = ? WHERE id = ?').run(JSON.stringify(merged), id));
+    // An unpinned resource or secret location is relative to the working folder,
+    // which moves when the project gains a second repository or keeps only one:
+    // pin each to the checkout it lies in now, so it stays where it is.
+    const before = worldCheckoutNames(existing.config.repos ?? []);
+    if (workingFolder(before) !== workingFolder(worldCheckoutNames(merged.repos ?? [])))
+      for (const attachment of (await this.listResourceAttachments(id, true))) {
+        const target = pinTarget(attachment.target, before);
+        if (target !== attachment.target) (await this.updateResourceAttachment(attachment.id, { target }));
+      }
     return { ...existing, config: merged };
   
     });
@@ -2051,7 +2064,9 @@ export class Store {
     assertRoutableName('organization', input.name, input.slug);
     const name = (await this.assertOrganizationNameAvailable(input.name,
       input.kind === 'personal' ? { allowUserId: input.ownerUserId } : undefined));
-    const slug = (await uniqueSlug(input.slug ?? input.name, async (candidate) => !!(await this.db.prepare('SELECT 1 FROM organizations WHERE slug = ?').get(candidate))));
+    const slug = (await uniqueSlug(input.slug ?? input.name, async (candidate) =>
+      !!(await this.db.prepare('SELECT 1 FROM organizations WHERE slug = ?').get(candidate))
+      || !!(await this.db.prepare('SELECT 1 FROM organization_aliases WHERE slug = ?').get(candidate))));
     const organization: Organization = {
       id: newId('org'), name, slug,
       kind: input.kind ?? 'team', plan: 'free', nameVisibility: 'members', createdAt: Date.now(),
@@ -2163,9 +2178,33 @@ export class Store {
       : undefined;
     const nextName = (await this.assertOrganizationNameAvailable(name,
       { excludeOrganizationId: id, allowUserId: personalOwner }));
-    (await this.db.prepare('UPDATE organizations SET name = ? WHERE id = ?').run(nextName, id));
-    return { ...existing, name: nextName };
+    assertRoutableName('organization', nextName);
+    // The URL follows the name. Every slug the organization has had stays its
+    // own and keeps leading to it, so a bookmark or a link in an old email
+    // still opens it, and no other organization can take over that address.
+    const slug = slugify(nextName) === existing.slug ? existing.slug : (await uniqueSlug(nextName, async (candidate) =>
+      !!(await this.db.prepare('SELECT 1 FROM organizations WHERE slug=? AND id<>?').get(candidate, id))
+      || !!(await this.db.prepare('SELECT 1 FROM organization_aliases WHERE slug=? AND organizationId<>?').get(candidate, id))));
+    if (slug !== existing.slug) {
+      (await this.db.prepare('INSERT OR IGNORE INTO organization_aliases (slug, organizationId, createdAt) VALUES (?, ?, ?)')
+        .run(existing.slug, id, Date.now()));
+      (await this.db.prepare('DELETE FROM organization_aliases WHERE slug=?').run(slug));
+    }
+    (await this.db.prepare('UPDATE organizations SET name = ?, slug = ? WHERE id = ?').run(nextName, slug, id));
+    return { ...existing, name: nextName, slug };
   
+    });
+  }
+
+  /** The slugs these organizations had before a rename, newest first, for the
+   * console to resolve an old URL to the organization it now names. */
+  async withPreviousSlugs(organizations: Organization[]): Promise<Organization[]> {
+    if (!organizations.length) return organizations;
+    const rows = (await rowsFor(this.db, 'organization_aliases', 'organizationId', organizations.map((o) => o.id)));
+    rows.sort((a, b) => Number(b.createdAt) - Number(a.createdAt));
+    return organizations.map((organization) => {
+      const previousSlugs = rows.filter((row) => row.organizationId === organization.id).map((row) => String(row.slug));
+      return previousSlugs.length ? { ...organization, previousSlugs } : organization;
     });
   }
 
@@ -2264,6 +2303,7 @@ export class Store {
       teams: (await selectRows(this.db, 'teams', 'organizationId=?', [organizationId])),
       team_memberships: (await rowsFor(this.db, 'team_memberships', 'teamId', teamIds)),
       team_aliases: (await rowsFor(this.db, 'team_aliases', 'teamId', teamIds)),
+      organization_aliases: (await selectRows(this.db, 'organization_aliases', 'organizationId=?', [organizationId])),
       projects: (await rowsFor(this.db, 'projects', 'id', projectIds)),
       avatars: (await rowsFor(this.db, 'avatars', 'projectId', projectIds)),
       resource_attachments: (await rowsFor(this.db, 'resource_attachments', 'projectId', projectIds))
@@ -2563,6 +2603,7 @@ export class Store {
       (await deleteRows(this.db, 'execution_frames', 'executionId', executionIds));
       (await deleteRows(this.db, 'team_memberships', 'teamId', teamIds));
       (await deleteRows(this.db, 'team_aliases', 'teamId', teamIds));
+      (await this.db.prepare('DELETE FROM organization_aliases WHERE organizationId=?').run(organizationId));
       (await deleteRows(this.db, 'repository_deploy_keys', 'repositoryId', repositoryIds));
       (await deleteRows(this.db, 'task_subscribers', 'taskId', taskIds));
       (await deleteRows(this.db, 'task_confirmation', 'taskId', taskIds));
@@ -7842,15 +7883,23 @@ export class Store {
     return { used: Number(row.used), max: Number(row.allowed) };
   }
 
-  async recordedUsageEventIds(ids: string[]): Promise<Set<string>> {
-    const recorded = new Set<string>();
+  /** Which of these usage ids are recorded, and whom each is booked to. */
+  async recordedUsageEvents(ids: string[]): Promise<Map<string, { organizationId: string; taskId?: string }>> {
+    const recorded = new Map<string, { organizationId: string; taskId?: string }>();
     for (let offset = 0; offset < ids.length; offset += 500) {
       const batch = ids.slice(offset, offset + 500);
-      const rows = (await this.db.prepare(`SELECT id FROM usage_events WHERE id IN (${batch.map(() => '?').join(',')})`)
-        .all(...batch)) as Array<{ id: string }>;
-      for (const row of rows) recorded.add(row.id);
+      const rows = (await this.db.prepare(`SELECT id, organizationId, taskId FROM usage_events WHERE id IN (${batch.map(() => '?').join(',')})`)
+        .all(...batch)) as Array<{ id: string; organizationId: string; taskId: string | null }>;
+      for (const row of rows) recorded.set(row.id, { organizationId: row.organizationId, ...(row.taskId ? { taskId: row.taskId } : {}) });
     }
     return recorded;
+  }
+
+  /** Move a usage row that no task claimed yet to the organization (and task)
+   * it turned out to belong to. Rows already attributed to a task are final. */
+  async reattributeUsageEvent(id: string, owner: { organizationId: string; projectId?: string; taskId?: string; worldId?: string }): Promise<void> {
+    (await this.db.prepare('UPDATE usage_events SET organizationId=?, projectId=?, taskId=?, worldId=? WHERE id=? AND taskId IS NULL')
+      .run(owner.organizationId, owner.projectId ?? null, owner.taskId ?? null, owner.worldId ?? null, id));
   }
 
   /** Ownership lookups do not need a task's potentially huge transcript. */
@@ -9511,12 +9560,17 @@ const RESERVED_ROUTE_SLUGS = new Set([
   'tasks', 'queue', 'activity',
 ]);
 
+/** Top-level public pages (web/app.js boot: renderDocsPage, renderPricing,
+ *  renderLegal*). Only an organization owns the first URL segment, so only an
+ *  organization can be shadowed by them; a project at /<org>/docs is fine. */
+const RESERVED_ORGANIZATION_SLUGS = new Set(['docs', 'pricing', 'legal']);
+
 /** Throw a user-facing error if `name` (or an explicit `slug`) resolves to a
  *  reserved routing word. Applied at the single creation choke points for
  *  projects and organizations. */
 function assertRoutableName(kind: 'project' | 'organization', name: string, slug?: string): void {
   const s = slugify(slug ?? name);
-  if (RESERVED_ROUTE_SLUGS.has(s))
+  if (RESERVED_ROUTE_SLUGS.has(s) || (kind === 'organization' && RESERVED_ORGANIZATION_SLUGS.has(s)))
     throw new Error(`"${s}" is a reserved name and can't be used for a ${kind}. Please choose a different name.`);
 }
 
@@ -9573,12 +9627,20 @@ function validateResourceAttachment(value: ResourceAttachment): void {
   if (driver.credentialRequired && !value.credentialHandles.length) throw new Error('credential-backed resources require a credential handle');
   if (value.publish === 'review' && (!snapshot || value.access !== 'write' || value.isolation !== 'fork'))
     throw new Error('reviewed promotion requires a writable, forked snapshot resource');
-  if (value.target.kind === 'path') {
-    const normalized = value.target.path.replace(/\\/g, '/');
+  const location = (target: { path: string; repository?: string }, label: string) => {
+    const normalized = target.path.replace(/\\/g, '/');
     if (!normalized || normalized.startsWith('/') || normalized.split('/').includes('..'))
-      throw new Error('resource path target must be world-relative');
-  } else if (value.target.kind === 'environment' || value.target.kind === 'service') {
+      throw new Error(`${label} must be world-relative`);
+    if (target.repository !== undefined && !/^[A-Za-z0-9._-]+$/.test(target.repository) || /^\.+$/.test(target.repository ?? ''))
+      throw new Error(`${label} names an invalid repository`);
+  };
+  if (value.target.kind === 'path') location(value.target, 'resource path target');
+  else if (value.target.kind === 'environment' || value.target.kind === 'service') {
     if (!/^[A-Z_][A-Z0-9_]*$/.test(value.target.name)) throw new Error('resource environment target must be an uppercase variable name');
+    if (value.target.kind === 'environment' && value.target.dotenv) {
+      location(value.target.dotenv, 'resource .env file');
+      if (value.target.dotenv.path.endsWith('/')) throw new Error('resource .env file must name a file');
+    }
   } else throw new Error('unknown resource target');
   if (!Array.isArray(value.credentialHandles) || value.credentialHandles.some((handle) => typeof handle !== 'string' || !handle))
     throw new Error('resource credential handles must be non-empty strings');

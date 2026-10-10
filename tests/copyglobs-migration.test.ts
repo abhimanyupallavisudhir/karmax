@@ -35,8 +35,8 @@ describe('typed copyGlobs migration', () => {
     const result = await resources.migrateCopyGlobs(project);
     expect(result).toMatchObject({
       environmentSecrets: ['DATABASE_URL', 'MODEL_TOKEN'],
-      fileSecrets: ['service-account.json'],
-      data: ['weights.bin'],
+      fileSecrets: ['repo/service-account.json'],
+      data: ['repo/weights.bin'],
       skipped: [],
     });
     expect((await store.getProject(project.id))?.config.copyGlobs).toEqual([]);
@@ -54,9 +54,9 @@ describe('typed copyGlobs migration', () => {
     world.handle = (await store.registerWorld(world.handle, project.id)) as typeof world.handle;
     expect(await world.readFile('service-account.json')).toContain('secret-json');
     expect([...await world.readFileBuffer('weights.bin')]).toEqual([0, 1, 2, 3, 255]);
-    const runtime = (await resources.withEnvironment(world));
-    expect((await runtime.exec('bash', ['-lc', 'printf "%s|%s" "$DATABASE_URL" "$MODEL_TOKEN"'])).stdout)
-      .toBe('postgres://private|token-value');
+    // copyGlobs copied the .env into its checkout; its variables stay lines of it there.
+    expect(await world.readFile('.env')).toBe('DATABASE_URL=postgres://private\nMODEL_TOKEN=token-value\n');
+    expect(await resources.environmentFor(world.handle)).toEqual({});
     expect(JSON.stringify(world.handle)).not.toContain('private');
     expect(JSON.stringify(world.handle)).not.toContain('token-value');
     expect((await world.exec('git', ['status', '--porcelain'])).stdout.trim()).toBe('');
@@ -92,7 +92,7 @@ describe('typed copyGlobs migration', () => {
     }) as typeof fs.readFileSync);
     try {
       const result = await resources.migrateCopyGlobs(project);
-      expect(result.data).toEqual(['.env.large']);
+      expect(result.data).toEqual(['repo/.env.large']);
       expect(result.environmentSecrets).toEqual([]);
       const attachment = (await store.listResourceAttachments(project.id))
         .find((candidate) => candidate.target.kind === 'path' && candidate.target.path === '.env.large')!;

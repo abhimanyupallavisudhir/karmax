@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import type { Api } from '../api.js';
 import { HttpError } from '../api.js';
@@ -8,6 +9,9 @@ import { changed, localChanges, pullResource, pushProjectResource, saveResource 
 import { writeSecretFiles } from '../secrets.js';
 import { CliError, EXIT, shellQuote, table, type Output } from '../util.js';
 import { fingerprint, Workspace, type Manifest } from '../workspace.js';
+
+/** A repository an adopted checkout leaves no folder for (its place would be inside that checkout). */
+const NOT_HERE = 'not in this folder (tavya clone has the full layout)';
 
 export async function fetchManifest(api: Api, target: { projectId: string; taskId?: string }): Promise<Manifest> {
   return api.get<Manifest>(target.taskId ? `/api/tasks/${encodeURIComponent(target.taskId)}/workspace`
@@ -26,8 +30,9 @@ function httpsUrl(sshUrl: string): string {
   return match ? `https://github.com/${match[1]}` : sshUrl;
 }
 
-async function cloneRepository(root: string, repository: Manifest['repositories'][number], out: Output, viaTavya = false): Promise<boolean> {
-  const destination = path.join(root, repository.name);
+async function cloneRepository(destination: string, repository: Manifest['repositories'][number], out: Output, viaTavya = false): Promise<boolean> {
+  const root = path.dirname(destination);
+  fs.mkdirSync(root, { recursive: true });
   out.info(`Cloning ${repository.name} (${repository.branch})…`);
   // `--config` is written into the new repository before it fetches, so the clone itself uses it.
   const config = viaTavya ? tavyaCredentialConfig().flatMap((entry) => ['--config', entry]) : [];
@@ -38,9 +43,42 @@ async function cloneRepository(root: string, repository: Manifest['repositories'
     result = await git(root, ['clone', '--quiet', ...config, '--branch', repository.base, url, destination]);
   }
   if (result.code === 0) return true;
-  const reason = (result.stderr || result.stdout).trim().split('\n').slice(-2).join(' ');
+  const output = (result.stderr || result.stdout).trim();
+  const reason = output.split('\n').slice(-2).join(' ');
   if (repository.role === 'project-wiki') { out.warn(`project wiki not cloned: ${reason}`); return false; }
-  throw new CliError(`cloning ${repository.sshUrl} failed: ${reason}\nGit uses your own GitHub credentials: check that you can access this repository.`);
+  throw new CliError(`cloning ${repository.sshUrl} failed: ${reason}\n${!viaTavya && /access rights|Repository not found|Permission denied/i.test(output)
+    ? aliasHint(repository.sshUrl) ?? GENERIC_HINT : GENERIC_HINT}`);
+}
+
+const GENERIC_HINT = 'Git uses your own GitHub credentials: check that you can access this repository.';
+
+/** Host aliases in an OpenSSH config that reach github.com (`Host work` + `HostName github.com`). */
+export function githubSshAliases(config: string): string[] {
+  const aliases: string[] = [];
+  let hosts: string[] = [];
+  for (const line of config.split(/\r?\n/)) {
+    const match = /^\s*(\w+)(?:\s*=\s*|\s+)(.*?)\s*$/.exec(line);
+    if (!match) continue;
+    const keyword = match[1]!.toLowerCase();
+    const value = match[2]!.replace(/"/g, '');
+    if (keyword === 'host') hosts = value.split(/\s+/).filter((host) => !/[*?!]/.test(host) && host.toLowerCase() !== 'github.com');
+    else if (keyword === 'match') hosts = [];
+    else if (keyword === 'hostname' && value.toLowerCase() === 'github.com') aliases.push(...hosts);
+  }
+  return [...new Set(aliases)];
+}
+
+/** GitHub refused the default key: the user may reach the repository's account through an alias in ~/.ssh/config. */
+function aliasHint(sshUrl: string): string | undefined {
+  const owner = /^git@github\.com:([^/]+)\//.exec(sshUrl)?.[1];
+  let config = '';
+  try { config = fs.readFileSync(path.join(os.homedir(), '.ssh', 'config'), 'utf8'); } catch { return undefined; }
+  const aliases = githubSshAliases(config);
+  if (!owner || !aliases.length) return undefined;
+  const alias = aliases.find((entry) => entry.toLowerCase().includes(owner.toLowerCase())) ?? (aliases.length === 1 ? aliases[0] : '<alias>');
+  return `Your github.com SSH key may belong to another GitHub account. To reach ${owner}'s repositories through `
+    + `${alias === '<alias>' ? `one of your ~/.ssh/config aliases (${aliases.join(', ')})` : `${alias} from ~/.ssh/config`}, run once:\n`
+    + `  git config --global url."git@${alias}:${owner}/".insteadOf "git@github.com:${owner}/"`;
 }
 
 export async function clone(api: Api, ref: string, directory: string | undefined, out: Output,
@@ -52,7 +90,7 @@ export async function clone(api: Api, ref: string, directory: string | undefined
   fs.mkdirSync(root, { recursive: true });
   const workspace = Workspace.create(root, api.server, manifest);
   if (options.gitViaTavya) workspace.gitViaTavya = true;
-  for (const repository of manifest.repositories) await cloneRepository(root, repository, out, options.gitViaTavya);
+  for (const repository of manifest.repositories) await cloneRepository(workspace.checkout(repository.name), repository, out, options.gitViaTavya);
   const report = await syncData(api, workspace, out, { resources: options.resources, secrets: options.secrets, force: false });
   const where = path.relative(process.cwd(), workspace.workdir) || '.';
   out.result({ root, workdir: workspace.workdir, manifest, ...report },
@@ -75,8 +113,12 @@ export async function pull(api: Api, workspace: Workspace, out: Output, options:
   workspace.save();
   const repositories: Record<string, string> = {};
   for (const repository of manifest.repositories) {
-    const dir = path.join(workspace.root, repository.name);
-    if (!isRepository(dir)) { repositories[repository.name] = await cloneRepository(workspace.root, repository, out, workspace.gitViaTavya) ? 'cloned' : 'skipped'; continue; }
+    const dir = workspace.checkout(repository.name);
+    if (!isRepository(dir)) {
+      repositories[repository.name] = workspace.nested(repository.name) ? NOT_HERE
+        : await cloneRepository(dir, repository, out, workspace.gitViaTavya) ? 'cloned' : 'skipped';
+      continue;
+    }
     let fetched = await git(dir, ['fetch', '--quiet', 'origin', repository.branch]);
     let branch = repository.branch;
     if (fetched.code !== 0 && repository.base) { branch = repository.base; fetched = await git(dir, ['fetch', '--quiet', 'origin', branch]); }
@@ -107,7 +149,7 @@ export async function push(api: Api, workspace: Workspace, out: Output, options:
   const repositories: Record<string, string> = {};
   let pushedGit = false;
   if (options.git) for (const repository of manifest.repositories) {
-    const dir = path.join(workspace.root, repository.name);
+    const dir = workspace.checkout(repository.name);
     if (!isRepository(dir)) continue;
     const uncommitted = (await dirty(dir)).length;
     if (uncommitted) out.warn(`${repository.name}: ${uncommitted} uncommitted change${uncommitted === 1 ? '' : 's'} not pushed; commit them first`);
@@ -163,8 +205,8 @@ export async function status(api: Api | undefined, workspace: Workspace, out: Ou
   const rows: string[][] = [];
   const result: Record<string, unknown> = { project: manifest.project, ...(manifest.task ? { task: manifest.task } : {}), repositories: {}, resources: {} };
   for (const repository of manifest.repositories) {
-    const dir = path.join(workspace.root, repository.name);
-    if (!isRepository(dir)) { rows.push([repository.name, 'not cloned (tavya pull)']); continue; }
+    const dir = workspace.checkout(repository.name);
+    if (!isRepository(dir)) { rows.push([repository.name, workspace.nested(repository.name) ? NOT_HERE : 'not cloned (tavya pull)']); continue; }
     const branch = await currentBranch(dir);
     const counts = branch ? await aheadBehind(dir, `origin/${branch}`) : undefined;
     const uncommitted = (await dirty(dir)).length;

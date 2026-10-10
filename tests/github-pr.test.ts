@@ -884,6 +884,7 @@ describe('GitHub-authoritative merge activity', () => {
     let cancelledAttempt = 1;
     let newerSucceeded = false;
     let newerActive = false;
+    let earlierHeadSucceeded = false;
     let actionsAvailable = true;
     let actionsForbidden = false;
     let readiness: any = { mergeable: 'MERGEABLE', mergeStateStatus: 'UNSTABLE',
@@ -915,20 +916,28 @@ describe('GitHub-authoritative merge activity', () => {
         return {
           run: { id: 31737743200, name: 'CI', workflowId: 9, runNumber: 100, attempt: cancelledAttempt,
             event: 'pull_request', status: 'completed', conclusion: 'cancelled', branch: 'tavya/task_preempted',
-            // GitHub's pull_request run is attached to refs/pull/113/merge, not the PR head.
-            headSha: 'synthetic-merge-ref-sha', url: 'https://github.test/run/31737743200',
+            // A pull_request run's head_sha is the PR head it tested.
+            headSha: 'pr-head', url: 'https://github.test/run/31737743200',
             createdAt: '2026-08-14T00:00:00Z', updatedAt: '2026-08-14T00:01:00Z' },
           jobs: [], failedJobs: [{ id: 501, name: 'CI', status: 'completed', conclusion: 'cancelled', url: '',
             steps: [], log: { excerpt: inspectionLog, downloadedBytes: inspectionLog.length, truncated: false } }],
           artifacts: [], notices: [],
         };
       },
-      listRuns: async () => ({ total: newerSucceeded || newerActive ? 2 : 1, page: 1, perPage: 100,
+      listRuns: async () => earlierHeadSucceeded ? { total: 2, page: 1, perPage: 100, runs: [{
+        // The previous head's green run. GitHub reports the PR's current head
+        // in pull_requests[], but the run tested `earlier-head` (PR #540).
+        id: 31737743100, name: 'CI', workflowId: 9, runNumber: 99, attempt: 1,
+        event: 'pull_request', status: 'completed', conclusion: 'success', branch: 'tavya/task_preempted',
+        headSha: 'earlier-head', url: 'https://github.test/run/31737743100',
+        createdAt: '2026-08-13T23:00:00Z', updatedAt: '2026-08-13T23:20:00Z',
+        pullRequests: [{ number: 113, headSha: 'pr-head' }],
+      }] } : ({ total: newerSucceeded || newerActive ? 2 : 1, page: 1, perPage: 100,
         runs: newerSucceeded || newerActive ? [{
         id: 31737743300, name: 'CI', workflowId: 9, runNumber: 101, attempt: 1,
         event: 'pull_request', status: newerSucceeded ? 'completed' : 'in_progress',
         ...(newerSucceeded ? { conclusion: 'success' } : {}), branch: 'tavya/task_preempted',
-        headSha: 'newer-synthetic-merge-ref-sha', url: 'https://github.test/run/31737743300',
+        headSha: 'pr-head', url: 'https://github.test/run/31737743300',
         createdAt: '2026-08-14T00:02:00Z', updatedAt: '2026-08-14T00:03:00Z',
         pullRequests: [{ number: 113, headSha: 'pr-head' }],
       }] : [] }),
@@ -973,6 +982,12 @@ describe('GitHub-authoritative merge activity', () => {
     expect((await core.store.eventsSince(task.id, 0))
       .filter((event) => event.type === 'github.ci.terminal-observed')).toHaveLength(1);
     expect(reruns).toBe(1);
+
+    earlierHeadSucceeded = true;
+    await expect(core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' })).resolves
+      .not.toMatchObject({ status: 'planned' });
+    expect((await core.store.eventsSince(task.id, 0)).filter((event) => event.type === 'github.ci.superseded')).toEqual([]);
+    earlierHeadSucceeded = false;
 
     newerActive = true;
     await expect(core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' })).resolves.toMatchObject({

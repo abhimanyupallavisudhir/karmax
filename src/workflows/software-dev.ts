@@ -53,6 +53,7 @@ import {
   DeclaredAction,
   WorldHandleLike,
   ChildRaise,
+  SubTaskAction,
   ParentResponse,
   SubTaskRequest,
   SubTaskResponse,
@@ -180,6 +181,7 @@ export const cancelSignal = defineSignal('cancel');
  * releases execution-owned activity before the replacement starts. */
 export const lifecycleReplacementSignal = defineSignal('prepareLifecycleReplacement');
 export const retrySignal = defineSignal('retry');
+export const keepOwnResourcesSignal = defineSignal(SIG.keepOwnResources);
 export const mergeGrantedSignal = defineSignal(SIG_MERGE_GRANTED);
 type CredentialKind = 'login' | 'ambient' | 'key';
 export const accountGrantedSignal = defineSignal<[{
@@ -199,7 +201,9 @@ export const agentTurnStateSignal = defineSignal<[{
   detail?: string;
 }]>(SIG_AGENT_TURN_STATE);
 /** A child raises UP to its parent when it reaches a decision point (SPEC §5.3). */
+const REPLY_TO_SPEAKERS = 'software-dev-reply-to-speakers-v1';
 export const raiseFromChildSignal = defineSignal<[ChildRaise]>('raiseFromChild');
+export const subtaskRedirectedSignal = defineSignal<[{ childTaskId: string }]>(SIG.subtaskRedirected);
 /** A parent answers a child that raised to it — maps onto the same confirm/retry/
  *  cancel/follow-up transitions a human would drive (SPEC §5.3). */
 export const parentResponseSignal = defineSignal<[ParentResponse]>('parentResponse');
@@ -715,6 +719,9 @@ async function softwareDevImpl(
   let confirmed = carried?.confirmed ?? false;
   let manualPrConfirmer: string | undefined = continued?.manualPrConfirmer;
   let escalationAction: 'openPr' | 'confirm' | undefined = continued?.escalationAction;
+  /** A publication refused over files both sides changed: the person may keep this task's versions. */
+  let resourceConflict = false;
+  let keepOwnRequested = false;
   let manualEscalationRequested = carried?.manualEscalationRequested ?? false;
   let prRequested = carried?.prRequested ?? recoveryStage === 'pr';
   // checkout name -> head sha it was approved at (multi-PR Review).
@@ -731,6 +738,7 @@ async function softwareDevImpl(
   let resourceReviewSequence = carriedCount?.resourceReviewSequence ?? 0;
   let applyingResources = false;
   let stagingResources = false;
+  let refreshingResources = false;
   let resourcesApplied = carried?.resourcesApplied ?? false;
   let humanPauseActive = !!recovery?.pausedForHuman;
   let humanPauseWake: { kind: 'retry' | 'followUp' | 'confirm' | 'openPr' | 'workflowChange'; role?: string } | undefined;
@@ -864,6 +872,9 @@ async function softwareDevImpl(
   let subtaskNags = carriedCount?.subtaskNags ?? 0;
   /** A sub-task landed since this world last took in what sub-tasks published. */
   let childLandedSinceRefresh = false;
+  /** A failed refresh is tried once more before the next turn (a deploy that
+   * restarts the worker mid-transfer ends its last attempt). */
+  let refreshRetries = 1;
   // Account/token leasing (SPEC §6.2): per-turn lease of a connected login.
   type AccountGrant = {
     accountId: string;
@@ -912,6 +923,9 @@ async function softwareDevImpl(
   // `agentQueue` and run, in call order, at the next turn boundary or at once
   // while the task is parked. The main agent keeps `session`/`sessionHome`/`seen`.
   const multiAgent = minor >= 27;
+  /** People (`user:<id>`) who spoke to the main agent in what its last turn
+   * answered (v1.27). */
+  let speakers: string[] = [];
   const participantSessions: Record<string, { session?: string; home?: string; seen: number }> =
     Object.fromEntries(Object.entries(continued?.participants?.sessions ?? {}).map(([key, value]) => [key, { ...value }]));
   let agentQueue: string[] = [...(continued?.participants?.queue ?? [])];
@@ -1135,6 +1149,7 @@ async function softwareDevImpl(
       ];
     }
     const retry: DeclaredAction = { name: 'retry', kind: 'signal', label: 'Retry', enabled: true };
+    const keepOwnResources: DeclaredAction = { name: SIG.keepOwnResources, kind: 'signal', label: 'Keep this task’s version', enabled: true };
     switch (stage) {
       case 'setup':
         return [cancel];
@@ -1153,7 +1168,7 @@ async function softwareDevImpl(
       case 'resolve':
         return [cancel];
       case 'escalated':
-        return [retry, ...(escalationAction === 'openPr'
+        return [retry, ...(resourceConflict ? [keepOwnResources] : []), ...(escalationAction === 'openPr'
           ? [{ ...openPr, label: 'Commit changes, open & confirm PR' }]
           : escalationAction === 'confirm' ? [confirm] : []), followUp, cancel];
       default:
@@ -1239,6 +1254,7 @@ async function softwareDevImpl(
         confirmed,
         ...(applyingResources ? { applyingResources: true } : {}),
         ...(stagingResources ? { stagingResources: true } : {}),
+        ...(refreshingResources ? { refreshingResources: true } : {}),
         cancelled,
         ...(lifecycleReplacement ? { lifecycleReplacement: true } : {}),
         turnsSeen: seen,
@@ -1392,21 +1408,26 @@ async function softwareDevImpl(
       await publish();
       let failure: string;
       try {
-        await runLandingActivity(() => resourceActivities.settleResourceReview(taskId));
+        await runLandingActivity(() => keepOwnRequested
+          ? resourceActivities.settleResourceReview(taskId, { keepOwn: true })
+          : resourceActivities.settleResourceReview(taskId));
         resourcesApplied = true;
         return 'applied';
       } catch (err) {
         if (isCancellation(err) || !patched('resource-publish-escalates-v1')) throw err;
         failure = innermostMessage(err);
-      } finally { applyingResources = false; }
+        resourceConflict = failureType(err) === 'resource-conflict';
+      } finally { applyingResources = false; keepOwnRequested = false; }
       const priorStage = stage;
       stage = 'escalated';
       status = 'blocked';
       retryRequested = false;
-      error = `Could not publish resources: ${failure} Nothing was lost; Retry publishes again.`;
+      error = resourceConflict
+        ? `Could not publish resources: ${failure} Nothing was lost: Retry publishes again, or keep this task’s version of those files.`
+        : `Could not publish resources: ${failure} Nothing was lost; Retry publishes again.`;
       if (input.parentTaskId) {
         waitingFor = { kind: 'parent' };
-        await notifyParent('blocked', error);
+        await notifyParent('blocked', error, resourceConflict ? ['keep_own'] : undefined);
       }
       const seenAtEscalation = msgs.length;
       await publish();
@@ -1414,6 +1435,7 @@ async function softwareDevImpl(
         || (followUpReturnsToDo && followUpWakesEscalation && mainUnreadSince(seenAtEscalation)));
       waitingFor = undefined;
       error = undefined;
+      resourceConflict = false;
       stage = priorStage;
       status = 'active';
       if (cancelled) return 'cancelled';
@@ -1427,13 +1449,24 @@ async function softwareDevImpl(
    * resources this world forked, and the output it proposed. */
   async function refreshResourcesFromChildren(): Promise<void> {
     let refreshed: Awaited<ReturnType<coreActivities['refreshResourceForks']>>;
+    // A multi-GB delivery takes minutes: the task says so rather than showing
+    // the wait it left (pramana#3 read "Waiting 90 min" for hours, and a
+    // follow-up sent meanwhile seemed ignored).
+    if (patched('subtask-resource-refresh-visible-v1')) {
+      refreshingResources = true;
+      await publish();
+    }
     try { refreshed = await resourceStaging.refreshResourceForks(taskId); }
     catch (err) {
       if (isCancellation(err)) throw err;
+      const retry = patched('subtask-resource-refresh-retry-v1') && refreshRetries-- > 0;
+      if (retry) childLandedSinceRefresh = true;
       msgs.push({ id: `st-${msgs.length}`, role: 'user', ts: msgs.length,
-        text: `Could not bring sub-tasks' saved data into your world: ${innermostMessage(err)} It is kept, and comes in when the next sub-task finishes or when you are confirmed.` });
+        text: `Could not bring sub-tasks' saved data into your world: ${innermostMessage(err)} It is kept, and ${retry
+          ? 'is tried again before your next turn.' : 'comes in when the next sub-task finishes or when you are confirmed.'}` });
       return;
-    }
+    } finally { refreshingResources = false; }
+    refreshRetries = 1;
     for (const r of refreshed) {
       const text = r.conflicts
         ? `${r.path} was not updated with a sub-task's data: ${r.conflicts.length === 1 ? 'a file you changed differs' : `${r.conflicts.length} files you changed differ`} from the sub-task's (${r.conflicts.slice(0, 5).join(', ')}${r.conflicts.length > 5 ? ', …' : ''}). Keep one version (rename or remove yours); it comes in when the next sub-task finishes, and your publication fails until it does.`
@@ -1797,6 +1830,11 @@ async function softwareDevImpl(
       if (!patched('software-dev-preserve-replacement-children-v1')) cancelChildren();
     }
   });
+  setHandler(keepOwnResourcesSignal, () => {
+    if (!resourceConflict) return;
+    keepOwnRequested = true;
+    retryRequested = true;
+  });
   setHandler(retrySignal, () => {
     retryRequested = true;
     if (responsiveHumanHold && humanPauseActive)
@@ -1814,6 +1852,11 @@ async function softwareDevImpl(
     if (!awaitingResponse.has(r.childTaskId)) subtaskNags = 0;
     raises.push(r);
     awaitingResponse.add(r.childTaskId);
+  });
+  // A child's request passed on to people (escalate) waits for them, not us:
+  // stop prompting our agent to answer it. A later raise asks us again.
+  setHandler(subtaskRedirectedSignal, ({ childTaskId }) => {
+    if (awaitingResponse.delete(childTaskId)) subtaskNags = 0;
   });
   // Our parent answered a raise. Map its decision onto the SAME flags a human drives
   // (confirm/retry/cancel/follow-up) so the parent is literally our confirmer.
@@ -1842,7 +1885,9 @@ async function softwareDevImpl(
       confirmed = true;
       if (responsiveHumanHold && humanPauseActive)
         humanPauseWake = { kind: 'confirm' };
-    } else if (resp.action === 'retry') {
+    } else if (resp.action === 'retry' || resp.action === 'keep_own') {
+      // keep_own: as "Keep this task's version" on a refused publication; otherwise a retry.
+      if (resp.action === 'keep_own' && resourceConflict) keepOwnRequested = true;
       retryRequested = true;
       if (responsiveHumanHold && humanPauseActive)
         humanPauseWake = { kind: 'retry' };
@@ -2585,6 +2630,7 @@ async function softwareDevImpl(
     // a mid-turn follow-up landed in `msgs` but got marked consumed, so it silently
     // never reached the agent (SPEC §5.6 — a queued follow-up must reach the agent).
     let deliveredNow = seen;
+    const answeredFrom = seen;
     const ran = await stoppableTurn(MAIN_AGENT, () => withResolve('do', () =>
       leasedTurn('do', (
         accountConfigHome,
@@ -2636,7 +2682,10 @@ async function softwareDevImpl(
       } : undefined,
     ));
     // Stopped: nothing it did this turn is folded in; it waits for a message.
-    if (!ran) return { completed: false, providerCompleted: false, output: '', stopped: true } as AgentTurnResult & { stopped?: true };
+    if (!ran) {
+      speakers = [];
+      return { completed: false, providerCompleted: false, output: '', stopped: true } as AgentTurnResult & { stopped?: true };
+    }
     const turn: AgentTurnResult & { stopped?: true } = ran.value;
     session = turn.session ?? session;
     sessionHome = doHome ?? sessionHome;
@@ -2650,11 +2699,20 @@ async function softwareDevImpl(
     // any follow-up that arrived after the last poll. This keeps the transcript honest
     // and leaves that follow-up AFTER `seen`, so the NEXT turn delivers it.
     if (turn.output?.trim()) {
-      msgs.splice(delivered, 0, { id: `a${delivered}`, role: 'agent', text: turn.output, ts: delivered,
-        ...(turn.finalActivity ? { sourceActivity: turn.finalActivity } : {}) });
+      const reply: Message = { id: `a${delivered}`, role: 'agent', text: turn.output, ts: delivered,
+        ...(turn.finalActivity ? { sourceActivity: turn.finalActivity } : {}) };
+      msgs.splice(delivered, 0, reply);
       seen = delivered + 1;
+      // The people who spoke to the agent hear its answer. A sub-task's turn
+      // ends with its parent, so it goes back to them now (#533); a top-level
+      // question also asks them (`askOf`).
+      speakers = multiAgent ? [...new Set(msgs.slice(answeredFrom, delivered)
+        .filter((m) => m.role === 'user' && m.author?.startsWith('user:') && addressedTo(m, MAIN_AGENT))
+        .map((m) => m.author!))] : [];
+      if (input.parentTaskId && speakers.length && patched(REPLY_TO_SPEAKERS)) await deliverReply(reply, speakers);
     } else {
       seen = delivered;
+      speakers = [];
     }
     if (turn.reviewInfo) {
       // A proposal-readiness/landing refusal resumes the SAME Do conversation.
@@ -3269,10 +3327,6 @@ Inspect the complete current diff and specifically compare its delta from the re
     }
   }
 
-  function subtaskRaiseText(r: ChildRaise): string {
-    return `Sub-task "${r.childTitle}" (${r.childTaskId}) needs you — ${r.type}${r.detail ? `: ${r.detail}` : ''}. Answer with respond_to_sub_task (confirm | comment | retry | cancel).`;
-  }
-
   /**
    * Fold any pending child events (raises + settlements) into the Do conversation so
    * the agent sees them at the top of its next turn (SPEC §5.3). This is what lets the
@@ -3399,10 +3453,26 @@ Inspect the complete current diff and specifically compare its delta from the re
     runStart = { events: workflowInfo().historyLength, bytes: workflowInfo().historySize };
   }
 
+  /** A question ending the agent's turn asks the task's usual people and,
+   * since software-dev 1.27, whoever spoke to the agent in what it answered. */
+  function askOf(route: string[]): string[] {
+    return speakers.length && patched(REPLY_TO_SPEAKERS) ? [...new Set([...route, ...speakers])] : route;
+  }
+
+  /** ` (already sent to Bea, who spoke to it)` when the agent's last reply also
+   * went to people, so a parent does not relay it to them again. */
+  function alsoSentTo(): string {
+    const reply = msgs[seen - 1];
+    const people = reply?.role === 'agent' && messageAuthor(reply) === MAIN_AGENT ? reply.to ?? [] : [];
+    if (!people.length) return '';
+    const label = (selector: string) => msgs.find((m) => m.author === selector && m.authorLabel)?.authorLabel ?? selector;
+    return ` (already sent to ${people.map(label).join(', ')}, who spoke to it)`;
+  }
+
   /** Tell our parent (if any) we need a decision (SPEC §5.3). Best effort — if the
    *  parent is gone the child stays human-resolvable via its own retry/confirm. */
   /** Raise to the parent; false when there is none (or it is gone). */
-  async function notifyParent(type: ChildRaise['type'], detail?: string): Promise<boolean> {
+  async function notifyParent(type: ChildRaise['type'], detail?: string, choices?: ChildRaise['choices']): Promise<boolean> {
     if (!input.parentTaskId) return false;
     try {
       await getExternalWorkflowHandle(input.parentTaskId).signal(raiseFromChildSignal, {
@@ -3410,6 +3480,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         childTitle: input.title,
         type,
         detail: detail ?? '',
+        ...(choices?.length ? { choices } : {}),
       });
       return true;
     } catch {
@@ -4010,7 +4081,7 @@ Inspect the complete current diff and specifically compare its delta from the re
             // own last words (its question, or what it says it finished).
             await notifyParent(turn.raise?.type ?? 'needs_confirmation', turn.raise?.detail
               ?? `Its Do turn ended without opening a PR. Confirm to open the PR if the work is truly complete; otherwise comment.${turn.output?.trim()
-                ? `\n\nIts last message:\n${clip(turn.output.trim(), PARENT_RAISE_OUTPUT_CHARS)}` : ''}`);
+                ? `\n\nIts last message${alsoSentTo()}:\n${clip(turn.output.trim(), PARENT_RAISE_OUTPUT_CHARS)}` : ''}`);
             await publish();
             await waitServing(() => prRequested || cancelled || mainUnread());
           } else {
@@ -4053,9 +4124,9 @@ Inspect the complete current diff and specifically compare its delta from the re
               } else {
                 waitingFor = {
                   kind: 'human',
-                  audience: routedInputResponder && route?.kind === 'human' && route.audience?.length
+                  audience: askOf(routedInputResponder && route?.kind === 'human' && route.audience?.length
                     ? route.audience
-                    : ['@creator'],
+                    : ['@creator']),
                   detail: boundedResponses && route?.kind === 'agent' && responderRounds >= 3
                     ? `Three automated responses have not resolved this pause. ${question}` : question,
                 };
@@ -5223,6 +5294,26 @@ export function sameProposalIdentity(
 
 /** Extract a meaningful message, following Temporal's wrapped `.cause` chain. */
 /** The original failure's own words, without the activity wrapping. */
+const RAISE_CHOICES: Partial<Record<SubTaskAction, string>> = {
+  keep_own: 'publish again keeping its version of the conflicting files',
+};
+
+/** What a parent's Do agent reads when a sub-task raises to it. */
+export function subtaskRaiseText(r: ChildRaise): string {
+  const extra = (r.choices ?? []).filter((choice) => RAISE_CHOICES[choice]).map((choice) => ` | ${choice}: ${RAISE_CHOICES[choice]}`).join('');
+  return `Sub-task "${r.childTitle}" (${r.childTaskId}) needs you — ${r.type}${r.detail ? `: ${r.detail}` : ''}. Answer with respond_to_sub_task (confirm | comment | retry | cancel${extra}).`
+    // #533/#454: a parent "relayed" a question in its own reply, which no
+    // person reads while it waits for sub-tasks, and told the child to wait.
+    + ` If only a person can answer, pass it to them with escalate(to, note, task_id: "${r.childTaskId}"): it waits for them and their reply goes to the sub-task. While you wait for sub-tasks, your own reply reaches nobody.`;
+}
+
+/** The type of the innermost ApplicationFailure that names one. */
+function failureType(err: any): string | undefined {
+  let type: string | undefined;
+  for (let e: any = err, depth = 0; e && depth < 6; depth++, e = e.cause) if (typeof e.type === 'string') type = e.type;
+  return type;
+}
+
 function innermostMessage(err: any): string {
   let e: any = err;
   let message = '';

@@ -1056,6 +1056,105 @@ describe('GitHub App failure and suspension handling', () => {
     await expect(service.installationToken((await store.getGitConnection(connection.id))!)).rejects.toThrow(/suspended/);
     (await store.close()); fs.rmSync(dir, { recursive: true, force: true });
   });
+
+  // Master CI went red on ~1 in 6 merges (2026-10-01..09), and every red run
+  // became a "Repair failed GitHub workflow" task: flaky tests that pass on a
+  // rerun, and runs a newer merge had already superseded. GitHub settles both.
+  it('opens a recovery task only for a failure that is current and survives one rerun', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-recovery-gate-'));
+    const store = (await Store.create(':memory:'));
+    const broker = new CredentialBroker(new Vault(dir));
+    try {
+      (await broker.registerHandle(GITHUB_APP_WEBHOOK_SECRET_HANDLE, 'webhook-secret', INSTALLATION_SCOPE));
+      const { privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048,
+        privateKeyEncoding: { format: 'pem', type: 'pkcs8' }, publicKeyEncoding: { format: 'pem', type: 'spki' } });
+      (await broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey, INSTALLATION_SCOPE));
+      let listed: Array<Record<string, unknown>> = [];
+      let rerunStatus = 201;
+      let listStatus = 200;
+      const reruns: string[] = [];
+      const fakeFetch = async (input: string | URL | Request, init: RequestInit = {}) => {
+        const url = new URL(String(input));
+        if (url.pathname === '/app/installations/42/access_tokens')
+          return Response.json({ token: 'installation-token', expires_at: new Date(Date.now() + 3600_000).toISOString() });
+        if (url.pathname === '/repos/acme/app/actions/workflows/5/runs') {
+          expect(Object.fromEntries(url.searchParams)).toMatchObject({ branch: 'main', event: 'push' });
+          return listStatus === 200 ? Response.json({ total_count: listed.length, workflow_runs: listed })
+            : Response.json({ message: 'Server Error' }, { status: listStatus });
+        }
+        const rerun = url.pathname.match(/^\/repos\/acme\/app\/actions\/runs\/(\d+)\/rerun-failed-jobs$/);
+        if (rerun && init.method === 'POST') {
+          reruns.push(rerun[1]!);
+          return rerunStatus === 201 ? new Response(null, { status: 201 })
+            : Response.json({ message: 'Resource not accessible by integration' }, { status: rerunStatus });
+        }
+        return Response.json({ message: `unexpected ${url.pathname}` }, { status: 404 });
+      };
+      const service = (await GitHubAppService.create(store, broker, { appId: '123', fetch: fakeFetch as typeof fetch,
+        sleep: async () => {} }));
+      const organization = (await store.createOrganization({ name: 'Acme', ownerUserId: 'owner' }));
+      const connection = (await store.upsertGitConnection({ organizationId: organization.id, provider: 'github',
+        installationId: '42', accountLogin: 'acme', accountType: 'Organization' }));
+      const repository = (await store.upsertRepository({ organizationId: organization.id, provider: 'github',
+        providerId: '99', owner: 'acme', name: 'app', sshUrl: 'git@github.com:acme/app.git', defaultBranch: 'main',
+        private: true, gitConnectionId: connection.id }));
+      const project = (await store.createProject('App', {}, organization.id));
+      (await store.attachProjectRepository({ projectId: project.id, repositoryId: repository.id }));
+      let delivery = 0;
+      const failed = async (run: { id: number; number: number; attempt?: number; sha: string; conclusion?: string }) => {
+        const raw = Buffer.from(JSON.stringify({ installation: { id: 42 }, action: 'completed',
+          repository: { id: 99, full_name: 'acme/app' },
+          workflow_run: { event: 'push', head_repository: { id: 99 }, id: run.id, name: 'CI', workflow_id: 5,
+            run_number: run.number, run_attempt: run.attempt ?? 1, status: 'completed',
+            conclusion: run.conclusion ?? 'failure', head_branch: 'main', head_sha: run.sha,
+            html_url: `https://github.com/acme/app/actions/runs/${run.id}` } }));
+        const result = await service.handleWebhook('workflow_run', `delivery-${++delivery}`, raw,
+          `sha256=${crypto.createHmac('sha256', 'webhook-secret').update(raw).digest('hex')}`);
+        return result.projectEvents ?? [];
+      };
+      const listedRun = (id: number, number: number, sha: string, status = 'in_progress') => ({
+        id, workflow_id: 5, run_number: number, run_attempt: 1, event: 'push', status, head_branch: 'main', head_sha: sha,
+      });
+
+      // The tip's first failure: rerun its failed jobs once, no task yet.
+      listed = [listedRun(1669, 1669, 'tip')];
+      expect(await failed({ id: 1669, number: 1669, sha: 'tip' })).toEqual([]);
+      expect(reruns).toEqual(['1669']);
+      // Redelivered: still one rerun, still no task.
+      expect(await failed({ id: 1669, number: 1669, sha: 'tip' })).toEqual([]);
+      expect(reruns).toEqual(['1669']);
+      // The rerun failed too: a real failure, so a recovery task.
+      expect(await failed({ id: 1669, number: 1669, attempt: 2, sha: 'tip' })).toEqual([
+        expect.objectContaining({ projectId: project.id, type: 'github.workflow.failed',
+          payload: expect.objectContaining({ runId: 1669, attempt: 2, headSha: 'tip' }) }),
+      ]);
+      expect(reruns).toEqual(['1669']);
+
+      // A failure a newer merge's run already covers is left to that run,
+      // whichever attempt it is and whether or not that run has finished.
+      listed = [listedRun(1636, 1636, 'newer'), listedRun(1633, 1633, 'older', 'completed')];
+      expect(await failed({ id: 1633, number: 1633, sha: 'older' })).toEqual([]);
+      expect(await failed({ id: 1633, number: 1633, attempt: 2, sha: 'older' })).toEqual([]);
+      expect(reruns).toEqual(['1669']);
+
+      // Failures a rerun cannot fix go straight to a task.
+      listed = [];
+      expect(await failed({ id: 1700, number: 1700, sha: 'config', conclusion: 'startup_failure' })).toHaveLength(1);
+      expect(reruns).toEqual(['1669']);
+
+      // When GitHub refuses the rerun (an installation without Actions write)
+      // or the runs cannot be listed, the failure still gets a task.
+      rerunStatus = 403;
+      expect(await failed({ id: 1701, number: 1701, sha: 'refused' })).toHaveLength(1);
+      expect(await failed({ id: 1701, number: 1701, sha: 'refused' })).toHaveLength(1);
+      expect(reruns).toEqual(['1669', '1701']);
+      rerunStatus = 201;
+      listStatus = 500;
+      expect(await failed({ id: 1702, number: 1702, sha: 'unlisted' })).toEqual([]);
+      expect(reruns).toEqual(['1669', '1701', '1702']);
+      expect(await failed({ id: 1702, number: 1702, attempt: 2, sha: 'unlisted' })).toHaveLength(1);
+    } finally { await store.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+  });
 });
 
 it('bounds GitHub provisioning requests with an abort signal (PS-7)', async () => {

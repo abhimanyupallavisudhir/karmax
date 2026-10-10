@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { OPENCODE_VERSION } from '../src/agent/acp-packages.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -27,6 +28,8 @@ describe('deployment profiles', () => {
     const browserImage = fs.readFileSync(path.join(repoRoot, 'environments/browser/Dockerfile'), 'utf8');
     expect(browserImage).toContain('ARG CODEX_VERSION=0.156.1');
     expect(browserImage).toContain('ARG CLAUDE_CODE_VERSION=2.1.281');
+    // Remote OpenCode runs the pinned package; the template bakes that version.
+    expect(browserImage).toContain(`ARG OPENCODE_VERSION=${OPENCODE_VERSION}`);
     expect(pkg.dependencies['@openai/codex']).toBe('0.156.1');
     expect(pkg.dependencies.pg).toBeTruthy();
     expect(dockerfile).toContain('npm ci --omit=dev');

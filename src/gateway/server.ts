@@ -19,7 +19,7 @@ import { probeConnection } from '../mcp/connections/probe.js';
 import { McpConnections, validateMcpSelection } from '../mcp/connections/store.js';
 import { registrySearch } from '../mcp/connections/registry.js';
 import { beginOAuth, finishOAuth, mcpClientMetadata, MCP_CLIENT_METADATA_PATH } from '../mcp/connections/oauth.js';
-import { AppGrants, grantCapabilities, isAppBearer, type AppGrant } from '../auth/app-grants.js';
+import { AppGrants, isAppBearer, sessionCapabilities, type AppGrant } from '../auth/app-grants.js';
 import { OAuthServer } from '../auth/oauth-server.js';
 import { OAuthRoutes, appGrantRouteCapability } from './oauth-routes.js';
 import { publicModelFetch, publicUrl } from '../mcp/connections/http.js';
@@ -33,7 +33,7 @@ import { fileURLToPath } from 'node:url';
 import { WebSocket as WebSocketClient, WebSocketServer } from 'ws';
 import type { Client } from '@temporalio/client';
 import { KarmaxApi, CapabilityError, ValidationError } from '../platform/api.js';
-import type { ChildTaskSummary, KarmaxEvent, TaskView } from '../domain/types.js';
+import type { ChildTaskSummary, KarmaxEvent, Organization, TaskView } from '../domain/types.js';
 import { BRAND_FILES, brandIconOf, isBrandIcon, siteNameError, siteNameOf, BRAND } from '../domain/brand.js';
 import { Store } from '../store/db.js';
 import { ProjectTransfers, ProjectTransferError } from '../platform/project-transfer.js';
@@ -62,13 +62,15 @@ import { SIG as WORKFLOW_SIG } from '../workflows/names.js';
 import { findFreePortFrom } from '../util/ports.js';
 import { expandPath } from '../util/expand.js';
 import { withTimeout } from '../util/timeout.js';
-import { AgentAuthority, AgentSpec, AuthorizationSelection, Avatar, Provider, Project, ProjectConfig, PrincipalRef, ProjectPrincipalRef, ResourceAttachment, ResourceRevision, ResourceTarget, normalizeUrgency } from '../domain/types.js';
+import { AgentAuthority, AgentSpec, AuthorizationSelection, Avatar, Provider, Project, ProjectConfig, PrincipalRef, ProjectPrincipalRef, ResourceAttachment, ResourceRevision, ResourceTarget, WorldLocation, normalizeUrgency } from '../domain/types.js';
+import { dotenvFile, dotenvSecretName, parseDotenv } from '../domain/dotenv.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
 import { MIN_CLI_VERSION, WorkspaceService } from '../world/workspace.js';
 import { WorkspaceConflict } from '../world/resources.js';
-import { acpModels, claudeModelCatalog, claudeModels, codexModelCatalog, codexModels, opencodeModels, mergeModels,
+import { acpModels, claudeModelCatalog, claudeModels, codexModelCatalog, codexModels, opencodeModels, openCodeKeyModels, mergeModels,
   modelDiscoveryFailureReason, type ModelCatalog } from '../agent/models.js';
+import { ARTIFICIAL_ANALYSIS_KEY_ENV, ArtificialAnalysis, toBenchmarks, type ModelBenchmarks } from '../agent/model-benchmarks.js';
 import type { IdentityService } from '../auth/identity.js';
 import type { RepositoryFiles } from '../store/project-environment.js';
 import { AuthorizationGrantError, ORGANIZATION_GRANT_CEILING, type AuthorizationService } from '../platform/authorization.js';
@@ -76,7 +78,7 @@ import { TOOL_CAPABILITY, CAPABILITY_GROUPS, OWN_TASK_CAPABILITIES, ORGANIZATION
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
 import { EXPLANATIONS_ENABLED, RESOLVE_AGENT_ENABLED } from '../config/features.js';
 import { hostLocal } from '../config/deployment.js';
-import { apiKeyEnv, credentialAliases, isAgentProvider, isLoginProvider } from '../agent/provider-registry.js';
+import { apiKeyEnv, canonicalModelProvider, credentialAliases, isAgentProvider, isLoginProvider, MODEL_PROVIDERS } from '../agent/provider-registry.js';
 import { WorldRegistry } from '../world/registry.js';
 import { worldHandleForView } from '../world/resolve.js';
 import { LocalObjectStore, type ObjectStore } from '../store/objects.js';
@@ -172,6 +174,9 @@ export interface GatewayDeps {
   remoteAccess?: RemoteAccessController;
   /** Fetches OAuth client ID metadata documents (default: the outbound SSRF guard). */
   oauthMetadataFetch?: typeof fetch;
+  /** Model benchmarks for the model picker (default: the bundled snapshot,
+   *  refreshed daily when ARTIFICIAL_ANALYSIS_API_KEY is set). */
+  artificialAnalysis?: ArtificialAnalysis;
 }
 
 /** Coarse HTTP operation → capability binding. KarmaxApi performs the same check
@@ -313,7 +318,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
     const scoped = Boolean(url?.searchParams.get('projectId') || url?.searchParams.get('organizationId'));
     return scoped ? (read ? 'profile:read' : 'profile:write') : (read ? 'settings:read' : 'settings:write');
   }
-  if (p === '/api/models' || p === '/api/schema' || p === '/api/events/catalog' || p === '/api/contributions') return 'workflow:read';
+  if (p === '/api/models' || p === '/api/models/benchmarks' || p === '/api/schema' || p === '/api/events/catalog' || p === '/api/contributions') return 'workflow:read';
   if (p === '/api/search' && read) return 'none'; // each project is authorized in searchEverywhere
   if (p === '/api/search/fields') return 'task:read';
   if (p === '/api/attachments' || p === '/api/files') return 'task:create';
@@ -490,13 +495,19 @@ function projectPrincipalFromBody(value: unknown, organizationId: string): Proje
 
 /** What a refused grant tells the client: which agent, so the console can ask
  * about exactly that one (`chooseAuthorizationGrant`). */
-function grantRefusal(e: unknown): { code?: string; participant?: string; authorization?: AuthorizationSelection } {
-  const error = e as { code?: unknown; participant?: unknown; authorization?: AuthorizationSelection } | undefined;
+function grantRefusal(e: unknown): { code?: string; participant?: string; authorization?: AuthorizationSelection; credentialGrants?: string[] } {
+  const error = e as { code?: unknown; participant?: unknown; authorization?: AuthorizationSelection; credentialGrants?: unknown } | undefined;
   return {
     ...(error?.code ? { code: String(error.code) } : {}),
     ...(typeof error?.participant === 'string' ? { participant: error.participant,
       ...(error.authorization ? { authorization: error.authorization } : {}) } : {}),
+    ...(Array.isArray(error?.credentialGrants) ? { credentialGrants: error.credentialGrants.map(String) } : {}),
   };
+}
+
+/** `credentialGrants` of a gap or request body: vault grants, else absent. */
+function credentialGrantsFromBody(value: unknown): string[] | undefined {
+  return Array.isArray(value) && value.length ? value.map(String) : undefined;
 }
 
 /** `acceptAttenuation`: `true` for every agent, or the participant keys. */
@@ -705,6 +716,9 @@ export class Gateway {
   /** Discovery spawns provider CLIs (seconds): pages read the last catalog while
    *  one background load per organization refreshes it. */
   private modelCatalog = new SwrCache<string, ModelCatalog>((organizationId) => this.discoverModels(organizationId), 5 * 60_000);
+  private get artificialAnalysis(): ArtificialAnalysis {
+    return this.deps.artificialAnalysis ??= new ArtificialAnalysis({ apiKey: process.env[ARTIFICIAL_ANALYSIS_KEY_ENV] });
+  }
   private identityTokens = new Map<string, { apiToken: string; fingerprint: string; expiresAt: number; userId: string }>();
   private fanout!: DurableEventFanout;
   /** Remotes verified during this gateway process. Persisted links are retried
@@ -1311,13 +1325,31 @@ export class Gateway {
           ? `\n\nDurable monitor evidence:\n${JSON.stringify(event.payload.evidence, null, 2)}` : '';
         const token = (await this.deps.tokens.mintPrincipal('system:github-recovery', ['*'],
           event.projectId, 10 * 60_000, project.organizationId)).token;
+        const title = `Repair ${missing ? 'missing' : 'failed'} GitHub workflow: ${event.payload.workflow}`;
+        const opening = missing
+          ? `A post-merge GitHub deployment workflow run was not created for ${event.payload.repository}.`
+          : `A post-merge GitHub workflow failed for ${event.payload.repository}.`;
+        // A workflow that is still red while its repair is open is that
+        // repair's business: tell it, rather than start a second one.
+        const open = missing ? undefined : (await this.deps.store.listTasks(event.projectId)).find((task) =>
+          task.title === title && String(task.params?.prompt ?? '').startsWith(opening)
+          && !task.params?.archived && !['done', 'cancelled', 'failed'].includes(task.lastView?.status ?? ''));
+        if (open) {
+          (await this.deps.store.kvSet(key, open.id));
+          (await this.emitTaskEvent({ taskId: open.id, type: event.type, ts: Date.now(), payload: event.payload }));
+          await this.deps.api.postTaskMessage(token, open.id, { text: [
+            `${event.payload.workflow} failed again on ${event.payload.branch} while this repair is open.`,
+            `Exact revision: ${event.payload.headSha || 'not reported'}`,
+            `Run: ${event.payload.url || `GitHub Actions run ${event.payload.runId}`} (attempt ${event.payload.attempt})`,
+            'If it is the failure you are repairing, nothing more is needed; otherwise repair it here too.',
+          ].join('\n') }).catch(() => undefined);
+          continue;
+        }
         const task = await this.deps.api.createTask(token, {
           projectId: event.projectId,
-          title: `Repair ${missing ? 'missing' : 'failed'} GitHub workflow: ${event.payload.workflow}`,
+          title,
           prompt: [
-            missing
-              ? `A post-merge GitHub deployment workflow run was not created for ${event.payload.repository}.`
-              : `A post-merge GitHub workflow failed for ${event.payload.repository}.`,
+            opening,
             `Workflow: ${event.payload.workflow}`,
             `Conclusion: ${event.payload.conclusion}`,
             `Exact revision: ${event.payload.headSha || 'not reported'}`,
@@ -1325,6 +1357,8 @@ export class Gateway {
               ? `Successful prerequisite run: ${event.payload.url || `GitHub Actions run ${event.payload.runId}`}${origin}`
               : `Run: ${event.payload.url || `GitHub Actions run ${event.payload.runId}`}${origin}`,
             incidentLine,
+            ...(!missing && Number(event.payload.attempt) > 1
+              ? [`This is attempt ${event.payload.attempt}: the run failed again after a rerun, so the failure reproduces.`] : []),
             evidence,
             '',
             'Inspect the complete GitHub evidence and classify it before changing code. For a missing run, check workflow schema/registration and triggers first; the evidence distinguishes direct API absence from webhook delay and records file/API permission failures. If a run exists, distinguish queued/waiting environment approval from a terminal failure. If it is a transient GitHub runner failure, rerun the exact revision once and verify it. If it is billing, permissions, protected-environment approval, secrets, or repository configuration, report the precise human action required and do not manufacture a code change. If it is a deterministic deployment or code defect, repair it through the normal reviewed pull-request workflow and verify recovery. The already-merged originating task is immutable and must remain complete.',
@@ -2256,6 +2290,7 @@ export class Gateway {
         sso: ssoSession(this.deps.identity),
         google: this.deps.identity?.googleEnabled ?? false,
         github: this.deps.identity?.githubEnabled ?? false,
+        modelBenchmarks: this.artificialAnalysis.available,
       });
     }
     if (p === '/api/health/live' && method === 'GET') return this.json(res, 200, { ok: true, ts: Date.now() });
@@ -2688,20 +2723,24 @@ export class Gateway {
           allows(authRecord.caps, 'authorization:read'))));
       }
       if (p === '/api/organizations' && method === 'GET') {
-        const canAuditAll = Boolean(authRecord && allows(authRecord.caps, 'authorization:read'));
-        if (canAuditAll) return this.json(res, 200, (await store.listOrganizations()));
-        if (authRecord.organizationId)
-          return this.json(res, 200, [(await store.getOrganization(authRecord.organizationId))].filter(Boolean));
-        const scopedOrganizationIds = new Set([
-          ...(authRecord.projectId ? [(await store.getProject(authRecord.projectId))?.organizationId] : []),
-          ...(await __asyncCollections.map((authRecord.projectIds ?? []), async (projectId) => (await store.getProject(projectId))?.organizationId)),
-        ].filter((value): value is string => Boolean(value)));
-        if (scopedOrganizationIds.size)
-          return this.json(res, 200, (await __asyncCollections.map([...scopedOrganizationIds], async (id) => (await store.getOrganization(id)))).filter(Boolean));
-        // A limited app grant lists only the organization it is limited to.
-        const grantOrganization = session.appGrant?.ceiling?.organizationId;
-        return this.json(res, 200, (await store.listOrganizations(callerIdentity.humanSubject?.userId))
-          .filter((organization) => !grantOrganization || organization.id === grantOrganization));
+        const listed = async (): Promise<Organization[]> => {
+          const canAuditAll = Boolean(authRecord && allows(authRecord.caps, 'authorization:read'));
+          if (canAuditAll) return store.listOrganizations();
+          if (authRecord.organizationId)
+            return [(await store.getOrganization(authRecord.organizationId))].filter((o): o is Organization => Boolean(o));
+          const scopedOrganizationIds = new Set([
+            ...(authRecord.projectId ? [(await store.getProject(authRecord.projectId))?.organizationId] : []),
+            ...(await __asyncCollections.map((authRecord.projectIds ?? []), async (projectId) => (await store.getProject(projectId))?.organizationId)),
+          ].filter((value): value is string => Boolean(value)));
+          if (scopedOrganizationIds.size)
+            return (await __asyncCollections.map([...scopedOrganizationIds], async (id) => (await store.getOrganization(id))))
+              .filter((o): o is Organization => Boolean(o));
+          // A limited app grant lists only the organization it is limited to.
+          const grantOrganization = session.appGrant?.ceiling?.organizationId;
+          return (await store.listOrganizations(callerIdentity.humanSubject?.userId))
+            .filter((organization) => !grantOrganization || organization.id === grantOrganization);
+        };
+        return this.json(res, 200, (await store.withPreviousSlugs((await listed()))));
       }
       if (p === '/api/organizations' && method === 'POST') {
         const subject = requireHumanSubject(callerIdentity);
@@ -3332,7 +3371,8 @@ export class Gateway {
           const githubAccountId = subject.externalIdentities?.githubAccountId;
           return this.json(res, 200, await this.deps.githubApp.createRepository(connection.id, subject.userId,
             { name: String(b.name ?? ''), description: b.description ? String(b.description) : undefined,
-              private: b.private !== false, autoInit: b.autoInit !== false }, { accountId: githubAccountId }));
+              private: b.private !== false, autoInit: b.autoInit !== false,
+              ...(b.defaultBranch ? { defaultBranch: String(b.defaultBranch) } : {}) }, { accountId: githubAccountId }));
         } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
       }
       const organizationProjects = p.match(/^\/api\/organizations\/([^/]+)\/projects$/);
@@ -4219,27 +4259,31 @@ export class Gateway {
           .filter((resource) => resource.driver === 'secret@1' && !stagedResourceCandidate(resource));
         const encodedName = projectSecrets[2] ? decodeURIComponent(projectSecrets[2]) : undefined;
         if (method === 'GET' && !encodedName) {
-          const names = await discoverEnvironmentNames(project, store, this.deps.githubApp);
-          const existing = new Set(resources.map((resource) => resource.target.kind === 'environment'
-            ? resource.target.name : resource.name));
+          const repositories = await projectRepositoryNames(project, store);
+          const declared = (name: string, repository: string) => resources.some((resource) => resource.target.kind === 'environment'
+            && resource.target.name === name && (!resource.target.dotenv
+              || anchorLocation(resource.target.dotenv, repositories).repository === repository));
+          // Suggestions are a convenience: GitHub being unreachable must not hide the secrets.
+          const suggested = (await discoverEnvironmentNames(project, store, this.deps.githubApp).catch(() => []))
+            .filter(({ name, repository }) => !declared(name, repository));
           return this.json(res, 200, { secrets: resources.map((resource) => ({
-            ...redactResource(resource),
-            file: resource.target.kind === 'path' ? resource.target.path : undefined,
-            variable: resource.target.kind === 'environment' ? resource.target.name : undefined,
-          })), suggestions: [...names].filter((name) => !existing.has(name)).sort() });
+            ...redactResource(resource), ...secretDestination(resource.target),
+          })), repositories, suggested, suggestions: [...new Set(suggested.map(({ name }) => name))].sort() });
         }
         if (method === 'POST' && !encodedName) {
           const body = await this.body(req);
-          const entries: Array<{ name: string; value: string; file?: string }> =
-            typeof body.env === 'string' ? parseEnvironmentValues(body.env)
-            : body.name ? [{ name: String(body.name), value: body.value == null ? '' : String(body.value),
-              file: body.file ? String(body.file) : undefined }] : [];
+          const repositories = await projectRepositoryNames(project, store);
+          let entries: SecretEntry[];
+          try { entries = secretEntries(body, repositories); }
+          catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
           if (!entries.length) return this.json(res, 400, { error: 'name/value or pasted env required' });
           const saved: ResourceAttachment[] = [];
+          const kept: string[] = [];
           try {
             for (const entry of entries) {
-              const existing = resources.find((resource) =>
-                resource.name === entry.name || (resource.target.kind === 'environment' && resource.target.name === entry.name));
+              const existing = resources.find((resource) => sameSecretDestination(resource, entry, repositories));
+              // `overwrite: false` keeps a stored value: it has no older version to go back to.
+              if (existing && body.overwrite === false && existing.credentialHandles[0]) { kept.push(existing.name); continue; }
               if (existing) {
                 // A new value becomes the resource's own secret; a stored
                 // handle may name someone else's (AU-40).
@@ -4247,8 +4291,7 @@ export class Gateway {
                   : existing.credentialHandles[0] ?? resourceSecretHandle(existing.id);
                 if (entry.value) (await this.deps.broker.registerHandle(handle, entry.value, organizationScope(project.organizationId)));
                 saved.push((await store.updateResourceAttachment(existing.id, {
-                  target: entry.file ? { kind: 'path', path: entry.file } : { kind: 'environment', name: entry.name },
-                  credentialHandles: [handle], enabled: true,
+                  target: entry.target, credentialHandles: [handle], enabled: true,
                   ...(entry.value ? { source: withoutVaultProjection(existing.source) } : {}),
                 })));
               } else {
@@ -4256,13 +4299,12 @@ export class Gateway {
                 const id = newId('resource'), handle = `resource:${id}:credential`;
                 (await this.deps.broker.registerHandle(handle, entry.value, organizationScope(project.organizationId)));
                 saved.push((await store.createResourceAttachment({ id, organizationId: project.organizationId,
-                  projectId: project.id, name: entry.name, driver: 'secret@1',
-                  target: entry.file ? { kind: 'path', path: entry.file } : { kind: 'environment', name: entry.name },
+                  projectId: project.id, name: entry.name, driver: 'secret@1', target: entry.target,
                   access: 'read', isolation: 'fork', source: { discovered: typeof body.env === 'string' },
                   credentialHandles: [handle], publish: 'discard' })));
               }
             }
-            return this.json(res, 200, { imported: saved.map(redactResource), secrets: saved.map(redactResource) });
+            return this.json(res, 200, { imported: saved.map(redactResource), secrets: saved.map(redactResource), kept });
           } catch (error) {
             return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
           }
@@ -4291,9 +4333,7 @@ export class Gateway {
         try {
           if (method === 'GET' && !sub) {
             const spec = (await environments.spec(project.id));
-            const { remoteName } = await import('../world/provision-git.js');
-            const repositories = [...new Set([...(project.config.repos ?? []).map(remoteName),
-              ...(await store.listProjectRepositories(project.id)).map(({ repository }) => repository.name)])];
+            const repositories = await projectRepositoryNames(project, store);
             const { environmentBase } = await import('../world/project-runtime.js');
             const bases = new Map<string, string | undefined>();
             const builds = [];
@@ -5698,6 +5738,7 @@ export class Gateway {
           to: Array.isArray(b.to) ? b.to.map(String) : [],
           message: String(b.message ?? ''),
           ...(b.urgency ? { urgency: normalizeUrgency(b.urgency) } : {}),
+          ...(Array.isArray(b.agents) ? { agents: b.agents } : {}),
         }));
       }
       if (p === '/api/agent/permission-requests' && method === 'POST') {
@@ -5727,7 +5768,7 @@ export class Gateway {
         if (!projectId) return this.json(res, 400, { error: unscopedProject });
         try {
           const result = (await api.authorizationEscalationTargets(token, {
-            projectId, authorization,
+            projectId, authorization, credentialGrants: credentialGrantsFromBody(b.credentialGrants),
           }));
           const names = new Map(((await this.deps.identity?.listUsers()) ?? []).map((user) =>
             [user.id, { name: user.name, email: user.email }]));
@@ -5750,6 +5791,7 @@ export class Gateway {
           try {
             return this.json(res, 200, await api.requestAuthorization(token, {
               projectId, target: b.target as any, authorization,
+              credentialGrants: credentialGrantsFromBody(b.credentialGrants),
               audience: Array.isArray(b.audience) ? b.audience.map(String) : [],
               reason: b.reason == null ? undefined : String(b.reason),
             }));
@@ -6601,6 +6643,25 @@ export class Gateway {
           requestedScope.organizationId ?? 'org_personal',
         ));
       }
+      // Intelligence, price and speed of the runnable models, for the picker's chart.
+      if (p === '/api/models/benchmarks' && method === 'GET') {
+        if (!this.artificialAnalysis.available) return this.json(res, 404, { error: 'Model benchmarks are not configured' });
+        const organizationId = requestedScope.organizationId ?? 'org_personal';
+        try {
+          const [{ at, data }, catalog] = await Promise.all([
+            this.artificialAnalysis.models(),
+            this.modelCatalog.get(organizationId),
+          ]);
+          return this.json(res, 200, {
+            source: { name: 'Artificial Analysis', url: 'https://artificialanalysis.ai/' },
+            fetchedAt: at,
+            models: toBenchmarks(data, catalog.value, at),
+          } satisfies ModelBenchmarks);
+        } catch (error) {
+          console.warn(`[karmax] model benchmarks unavailable: ${error instanceof Error ? error.message : 'unknown error'}`);
+          return this.json(res, 502, { error: 'Model benchmarks are unavailable right now' });
+        }
+      }
       if (p === '/api/profiles' && method === 'PUT') {
         const b = await this.body(req);
         if (!b.role) return this.json(res, 400, { error: 'profile needs a role' });
@@ -7146,19 +7207,23 @@ export class Gateway {
             ...(propagated ? { propagated } : {}), ...(writeBack?.length ? { writeBack } : {}) });
         }
         // Plaintext reveal (§5C) — per-item grant + reveal policy, audited.
+        // A TOTP field yields only the current one-time code, never the seed,
+        // so it is blind use (§5B) like a browser fill, not a reveal.
         if (p === '/api/vault/resolve' && method === 'POST') {
           const b = await this.body(req);
           const item = (await findItem(b));
           if (!item) return this.json(res, 200, { status: 'not_in_vault', reason: 'no matching vault item — use request_credential to ask for it' });
-          const field = (b.field as any) ?? defaultField(item.type);
+          const seedOnly = item.type === 'login' && !item.fields.includes('password') && item.fields.includes('totp');
+          const field = (b.field as any) ?? (seedOnly ? 'totp' : defaultField(item.type));
           if (!ITEM_FIELDS[item.type].includes(field) || !item.fields.includes(field)) return this.json(res, 400, { error: `item type ${item.type} has no field ${field}` });
-          const decision = (await vault.access(caps, callerTaskId, item, 'reveal', { consume: true }));
+          const mode: AccessMode = field === 'totp' ? 'use' : 'reveal';
+          const decision = (await vault.access(caps, callerTaskId, item, mode, { consume: true }));
           if (decision.status !== 'granted')
-            return this.json(res, 200, (await this.autoRaiseCredential(vault, decision, { caps, taskId: callerTaskId, projectId: authRecord?.projectId, item, field: b.field, mode: 'reveal', why: b.why })));
+            return this.json(res, 200, (await this.autoRaiseCredential(vault, decision, { caps, taskId: callerTaskId, projectId: authRecord?.projectId, item, field, mode, why: b.why })));
           const value = field === 'totp'
             ? (await vault.totp(item, { taskId: callerTaskId, principal }))
             : (await vault.resolveField(item, field, { taskId: callerTaskId, principal, mode: 'reveal' }));
-          const notes = b.field == null && item.type === 'login' && item.fields.includes('note')
+          const notes = b.field == null && mode === 'reveal' && item.type === 'login' && item.fields.includes('note')
             ? (await vault.resolveField(item, 'note', { taskId: callerTaskId, principal, mode: 'reveal' })) : undefined;
           return this.json(res, 200, { status: 'granted', itemId: item.id, field, ...(item.username ? { username: item.username } : {}), value, ...(notes !== undefined ? { notes } : {}) });
         }
@@ -8301,12 +8366,25 @@ export class Gateway {
           ? effectiveRepos(resolveParams(m, { project: projectVals, global: globalVals }), project.config)[0]
           : undefined;
         const branches = project ? await repositoryBranchDefaults(store, project, repo0) : undefined;
+        // Each repository's own branches, for the per-repository list to start
+        // from: what the common pair would mean in it (its real default branch,
+        // unless a default names one explicitly).
+        const repos = project && m.params.some((field) => field.type === 'repoBranches')
+          ? effectiveRepos(resolveParams(m, { project: projectVals, global: globalVals }), project.config) : [];
+        const repoDefaults = repos.length > 1
+          ? await Promise.all(repos.map((source) => repositoryBranchDefaults(store, project!, source).catch(() => undefined)))
+          : [];
         const enrich = async (vals: Record<string, unknown>, lower: Record<string, unknown>) => {
           const out = (await this.enrichAgentDefaults(m, vals, projectId, organizationId ?? undefined));
+          const detectBase = lower.base === undefined && globalVals.base === undefined && projectVals.base === undefined;
+          const detectTarget = lower.target === undefined && globalVals.target === undefined && projectVals.target === undefined;
           if (branches) {
-            if (lower.base === undefined && globalVals.base === undefined && projectVals.base === undefined) out.base = branches.base;
-            if (lower.target === undefined && globalVals.target === undefined && projectVals.target === undefined) out.target = branches.target;
+            if (detectBase) out.base = branches.base;
+            if (detectTarget) out.target = branches.target;
           }
+          if (repos.length > 1) out._repositoryBranches = repos.map((source, index) => ({ source,
+            base: (detectBase && repoDefaults[index]?.base) || out.base,
+            target: (detectTarget && repoDefaults[index]?.target) || out.target }));
           return out;
         };
         // Quick-task agent defaults (SPEC §10.4): an agent-only overlay for tasks
@@ -8656,9 +8734,14 @@ export class Gateway {
       })));
       return mergeModels(results);
     };
-    const [claude, codex, opencode] = await Promise.all([
-      settled('claude'), settled('codex'), settled('opencode'),
+    // OpenCode runs on a model vendor's API key, so it lists that vendor's
+    // models whether or not an `opencode` binary exists here (hosted: none).
+    const keyVendors = [...new Set(creds.filter((c) => c.kind === 'key').map((c) => canonicalModelProvider(c.provider)))]
+      .filter((vendor) => (MODEL_PROVIDERS as readonly string[]).includes(vendor));
+    const [claude, codex, opencodeLogins, opencodeKeys] = await Promise.all([
+      settled('claude'), settled('codex'), settled('opencode'), openCodeKeyModels(keyVendors).catch(() => []),
     ]);
+    const opencode = mergeModels([opencodeLogins, opencodeKeys]);
     // Discovery is best-effort (offline/old CLI/expired login). Keep the existing
     // safe presets so forms never degrade to an empty, non-actionable picker.
     const value: ModelCatalog = {
@@ -8666,11 +8749,13 @@ export class Gateway {
       // metadata to add to the stable selections, not an exhaustive allowlist.
       claude: claudeModelCatalog(claude),
       codex: codexModelCatalog(codex),
+      // With no OpenCode credential at all, a few real models show what a key
+      // would unlock; a task on one waits for that key (Credentials).
       opencode: opencode.length ? opencode : [
         { id: 'kimi/kimi-for-coding' },
         { id: 'kimi/k3', effort: ['low', 'high', 'max'] },
-        { id: 'google/gemini-3.6-pro' },
-        { id: 'xai/grok-4.5' },
+        { id: 'anthropic/claude-sonnet-5' },
+        { id: 'openrouter/anthropic/claude-sonnet-5' },
       ],
       // Retained only for stored-profile/backward-compatible typing. The native
       // Kimi harness is disabled until its ACP server supports session/fork.
@@ -9720,9 +9805,8 @@ export class Gateway {
     // The policy finds the project's organization in the same read.
     if (!ceiling) return this.deps.authorization.capabilitiesAsync(`user:${session.userId}`, projectId, organizationId);
     const resolvedOrganizationId = organizationId ?? (projectId ? await this.deps.store.projectOrganizationAsync(projectId) : undefined);
-    const caps = await this.deps.authorization.capabilitiesAsync(`user:${session.userId}`, projectId, resolvedOrganizationId);
-    const level = ceiling.level ? (await this.deps.authorization.profile(ceiling.level, projectId, resolvedOrganizationId))?.capabilities : undefined;
-    return grantCapabilities(ceiling, caps, { projectId, organizationId: resolvedOrganizationId }, level);
+    return sessionCapabilities(this.deps.authorization, session.userId, ceiling,
+      { projectId, organizationId: resolvedOrganizationId });
   }
 
   /** Mint (or reuse) the short-lived principal token for a browser session or
@@ -10297,41 +10381,94 @@ async function projectRepositoryFiles(project: Project, store: Store,
   return repos;
 }
 
+/** Names each repository's `.env.example` (or `.sample`, `.template`) declares;
+ * values are never read from them. */
 async function discoverEnvironmentNames(project: Project, store: Store,
-  githubApp?: import('../integrations/github-app.js').GitHubAppService): Promise<Set<string>> {
-  const names = new Set<string>();
-  const add = (text: string) => {
-    for (const line of text.split('\n')) {
-      const match = line.trim().match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/);
-      if (match) names.add(match[1]!);
+  githubApp?: import('../integrations/github-app.js').GitHubAppService): Promise<Array<{ name: string; repository: string }>> {
+  const found: Array<{ name: string; repository: string }> = [];
+  for (const repository of await projectRepositoryFiles(project, store, githubApp)) {
+    const names = new Set<string>();
+    for (const file of ['.env.example', '.env.sample', '.env.template']) {
+      if (!repository.files.includes(file)) continue;
+      const text = await repository.read(file).catch(() => undefined);
+      for (const line of (text ?? '').split('\n')) {
+        const match = line.trim().match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/);
+        if (match) names.add(match[1]!);
+      }
     }
-  };
-  for (const dir of projectRepositoryDirectories(project)) for (const file of
-    ['.env.example', '.env.sample', '.env.template']) {
-    try { add(fs.readFileSync(path.join(dir, file), 'utf8')); } catch {}
+    found.push(...[...names].sort().map((name) => ({ name, repository: repository.name })));
   }
-  if (githubApp) for (const linked of (await store.listProjectRepositories(project.id))) for (const file of
-    ['.env.example', '.env.sample', '.env.template']) {
-    const text = await githubApp.fileContents(linked.repository, file);
-    if (text) add(text);
-  }
-  return names;
+  return found;
 }
 
-function parseEnvironmentValues(text: string): Array<{ name: string; value: string }> {
-  const values: Array<{ name: string; value: string }> = [];
-  for (const raw of text.split('\n')) {
-    const line = raw.trim();
-    if (!line || line.startsWith('#')) continue;
-    const match = line.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
-    if (!match) continue;
-    let value = match[2]!.trim();
-    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))
-      value = value.slice(1, -1);
-    else value = value.replace(/\s+#.*$/, '');
-    if (value) values.push({ name: match[1]!, value });
+/** World checkout names of a project's repositories: what a resource's
+ * `repository` names (as `ProjectEnvironmentSpec.install` keys do). */
+async function projectRepositoryNames(project: Project, store: Store): Promise<string[]> {
+  const { remoteName } = await import('../world/provision-git.js');
+  return [...new Set([...(project.config.repos ?? []).map(remoteName),
+    ...(await store.listProjectRepositories(project.id)).map(({ repository }) => repository.name)])];
+}
+
+/** Pin a location to its repository: the one its first path segment names
+ * (`web/.env`, as the console shows places), else the only one. A pinned
+ * location stays put when a project gains a second repository (an unpinned
+ * one would move from that checkout to the workspace root). */
+function anchorLocation(location: WorldLocation, repositories: string[]): WorldLocation {
+  if (location.repository !== undefined) return location;
+  const normalized = location.path.replace(/\\/g, '/').replace(/^\.\//, '');
+  const [first, ...rest] = normalized.split('/');
+  if (rest.length && repositories.includes(first!)) return { path: rest.join('/'), repository: first! };
+  return repositories.length === 1 ? { path: normalized, repository: repositories[0]! } : { path: normalized };
+}
+
+interface SecretEntry { name: string; value: string; target: ResourceTarget }
+
+/** What a secrets POST asks for. A destination (`file`, optionally
+ * `repository`) that is a `.env` file makes each variable a line of it;
+ * another file takes a single value whole; none exports the variables to
+ * every command. */
+function secretEntries(body: Record<string, unknown>, repositories: string[]): SecretEntry[] {
+  const repository = typeof body.repository === 'string' && body.repository ? body.repository : undefined;
+  if (repository !== undefined && !repositories.includes(repository))
+    throw new Error(`this project has no repository named "${repository}"`);
+  const file = typeof body.file === 'string' && body.file.trim() ? body.file.trim()
+    : repository !== undefined ? '.env' : undefined;
+  const location = file === undefined ? undefined : anchorLocation({ path: file, ...(repository ? { repository } : {}) }, repositories);
+  const variable = (name: string, value: string): SecretEntry => location
+    ? { name: dotenvSecretName(location, name), value, target: { kind: 'environment', name, dotenv: location } }
+    : { name, value, target: { kind: 'environment', name } };
+  if (typeof body.env === 'string') {
+    if (location && !dotenvFile(location.path)) throw new Error('pasted variables go into a .env file');
+    return parseDotenv(body.env).map(({ name, value }) => variable(name, value));
   }
-  return values;
+  if (!body.name) return [];
+  const name = String(body.name), value = body.value == null ? '' : String(body.value);
+  return [location && !dotenvFile(location.path) ? { name, value, target: { kind: 'path', ...location } } : variable(name, value)];
+}
+
+/** The stored secret a POST entry updates: the same variable in the same
+ * place, or the same file. A bare variable may still replace a file secret of
+ * its name, as before destinations existed. */
+function sameSecretDestination(resource: ResourceAttachment, entry: SecretEntry, repositories: string[]): boolean {
+  const same = (a: WorldLocation, b: WorldLocation) => {
+    const [x, y] = [anchorLocation(a, repositories), anchorLocation(b, repositories)];
+    return x.repository === y.repository && x.path.replace(/^\.\//, '') === y.path.replace(/^\.\//, '');
+  };
+  const { target } = resource;
+  if (entry.target.kind === 'path') return target.kind === 'path' && same(target, entry.target);
+  if (entry.target.kind !== 'environment') return false;
+  if (entry.target.dotenv) return target.kind === 'environment' && target.name === entry.target.name
+    && Boolean(target.dotenv) && same(target.dotenv!, entry.target.dotenv);
+  return (target.kind === 'environment' && !target.dotenv && target.name === entry.target.name)
+    || (target.kind === 'path' && resource.name === entry.name);
+}
+
+/** How the secrets API describes where a secret goes. */
+function secretDestination(target: ResourceTarget): { file?: string; variable?: string; repository?: string;
+  dotenv?: WorldLocation } {
+  if (target.kind === 'path') return { file: target.path, ...(target.repository !== undefined ? { repository: target.repository } : {}) };
+  if (target.kind === 'environment') return { variable: target.name, ...(target.dotenv ? { dotenv: target.dotenv } : {}) };
+  return {};
 }
 
 function redactResource(resource: ResourceAttachment): Omit<ResourceAttachment, 'credentialHandles'> & { credentialConfigured: boolean } {
@@ -10371,7 +10508,11 @@ function redactResourceRevision(revision: ResourceRevision | undefined): Omit<Re
 function normalizeResourceTarget(value: unknown, driver: string, name: string): ResourceTarget {
   if (value && typeof value === 'object') {
     const target = value as Record<string, unknown>;
-    if (target.kind === 'path') return { kind: 'path', path: String(target.path ?? '') };
+    const location = (value: Record<string, unknown>): WorldLocation => ({ path: String(value.path ?? ''),
+      ...(typeof value.repository === 'string' ? { repository: value.repository } : {}) });
+    if (target.kind === 'path') return { kind: 'path', ...location(target) };
+    if (target.kind === 'environment' && target.dotenv && typeof target.dotenv === 'object')
+      return { kind: 'environment', name: String(target.name ?? ''), dotenv: location(target.dotenv as Record<string, unknown>) };
     if (target.kind === 'environment' || target.kind === 'service') return { kind: target.kind, name: String(target.name ?? '') };
   }
   const variable = name.trim().toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^([^A-Z_])/, '_$1') || 'RESOURCE';

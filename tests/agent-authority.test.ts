@@ -226,8 +226,14 @@ describe('per-agent authorization', () => {
     const f = await fixture();
     try {
       const token = await f.tokenFor('dev', ['use-credential:item:mine']);
-      const task = await f.api.createTask(token, { projectId: f.project.id, draft: true, params: { prompt: 'Vault',
-        'agent:agent-2': { provider: 'mock', authority: { credentialGrants: ['use-credential:item:mine', 'use-credential:item:theirs'] } } } });
+      const params = { prompt: 'Vault',
+        'agent:agent-2': { provider: 'mock', authority: { credentialGrants: ['use-credential:item:mine', 'use-credential:item:theirs'] } } };
+      // A credential the creator cannot grant is refused, never silently dropped…
+      await expect(f.api.createTask(token, { projectId: f.project.id, draft: true, params }))
+        .rejects.toMatchObject({ code: 'authorization_grant_denied', participant: 'agent-2' });
+      // …unless the creator runs that agent without it.
+      const task = await f.api.createTask(token, { projectId: f.project.id, draft: true, acceptAttenuation: ['agent-2'], params });
+      expect(entries(task)['agent-2']).toMatchObject({ missingCredentialGrants: ['use-credential:item:theirs'], attenuationAccepted: true });
       const caps = entries(task)['agent-2'].capabilities;
       expect(caps).toContain('use-credential:item:mine');
       expect(caps).not.toContain('use-credential:item:theirs');

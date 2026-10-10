@@ -32,6 +32,8 @@ export interface StoredAgentAuthorization {
   attenuated?: boolean;
   /** The requested level/scope exceeded the grantor. */
   profileAttenuated?: boolean;
+  /** Vault credentials it was explicitly given that the grantor cannot grant. */
+  missingCredentialGrants?: string[];
   /** The grantor chose to run with the limited package. */
   attenuationAccepted?: boolean;
   principal?: string;

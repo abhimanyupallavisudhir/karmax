@@ -18,10 +18,10 @@ function fn(name) {
   const browser = await chromium.launch({ args: ['--no-sandbox'] });
   try {
     const page = await browser.newPage();
-    await page.route('http://rail.test/**', route => route.fulfill({ contentType: 'text/html', body: '<div id="rail"></div>' }));
+    await page.route('http://rail.test/**', route => route.fulfill({ contentType: 'text/html', body: '<div id="rail"><div id="rail-list"></div></div>' }));
     const boot = async () => {
       await page.goto('http://rail.test/');
-      await page.addStyleTag({ content: '#rail { height: 220px; overflow: auto; } .proj { height: 40px; }' });
+      await page.addStyleTag({ content: '#rail-list { height: 220px; overflow: auto; } .proj { height: 40px; }' });
       await page.evaluate(() => {
         window.$ = s => document.querySelector(s);
         window.S = { organizationId: 'o1', projectId: 'loose', tab: 'tasks', projects: [
@@ -41,6 +41,7 @@ function fn(name) {
         window.DEFAULT_LIST_QUERY = 'for:me';
         window.commandHint = s => s;
         window.wireProjectDrag = () => {};
+        window.syncRailNav = () => {};
       });
       await page.addScriptTag({ content: ['railCollapsedFolders', 'saveRailCollapsedFolders', 'toggleRailFolder', 'renameCollapsedRailFolder', 'railProjectRows', 'renderRail'].map(fn).join('\n') });
       await page.evaluate(() => renderRail());
@@ -65,8 +66,8 @@ function fn(name) {
     await page.locator('#project-search').fill('');
     assert.equal(await folder('work').getAttribute('aria-expanded'), 'false');
     await folder('work').click();
-    await page.evaluate(() => { $('#rail').scrollTop = 500; renderRail(); });
-    assert.equal(await page.evaluate(() => $('#rail').scrollTop), 500, 'refresh retains sidebar scroll');
+    await page.evaluate(() => { $('#rail-list').scrollTop = 500; renderRail(); });
+    assert.equal(await page.evaluate(() => $('#rail-list').scrollTop), 500, 'refresh retains sidebar scroll');
     await page.evaluate(() => {
       localStorage.setItem('karmax-rail-folders:o1', '[null,4,"work/clients"]');
       renameCollapsedRailFolder('work', 'renamed');

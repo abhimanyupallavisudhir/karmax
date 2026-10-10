@@ -2,12 +2,16 @@ name: CLI release
 
 # Publishes the tavya CLI (src/cli): the bundled npm package `@tavya/cli`, and single
 # executables for each platform on the GitHub release `cli-v<version>`
-# (installed by https://tavya.io/cli/install.sh). Runs when such a tag is
-# pushed, or by hand (workflow_dispatch) on a branch, which releases that
+# (installed by https://tavya.io/cli/install.sh). Runs by itself when master's
+# cli/package.json changes to a version not released yet (CI's `cli-version`
+# job makes every pull request that changes the CLI bump it), when such a tag
+# is pushed, or by hand (workflow_dispatch) on a branch, which releases that
 # commit's cli/package.json version and creates its tag. npm publishes through
 # trusted publishing (no token; job `npm`).
 on:
   push:
+    branches: [master]
+    paths: ['cli/package.json']
     tags: ['cli-v*']
   workflow_dispatch:
     inputs:
@@ -26,6 +30,7 @@ jobs:
     outputs:
       tag: ${{ steps.version.outputs.tag }}
       sha: ${{ steps.version.outputs.sha }}
+      release: ${{ steps.version.outputs.release }}
     steps:
       - uses: actions/checkout@v4
         with: { ref: "${{ inputs.tag || github.sha }}" }
@@ -34,23 +39,33 @@ jobs:
       - name: Version
         id: version
         env:
-          REQUESTED: "${{ inputs.tag || (github.event_name == 'push' && github.ref_name) || '' }}"
+          REQUESTED: "${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || '' }}"
+          ON_MASTER: "${{ github.event_name == 'push' && github.ref_type == 'branch' }}"
         run: |
           tag="cli-v$(node -p "require('./cli/package.json').version")"
           if [ -n "$REQUESTED" ] && [ "$REQUESTED" != "$tag" ]; then echo "::error::$REQUESTED does not match cli/package.json ($tag)"; exit 1; fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          # A master push releases only a version that has no tag yet (any other edit to cli/package.json is not a release).
+          if [ "$ON_MASTER" = true ] && [ -n "$(git ls-remote --tags origin "refs/tags/$tag")" ]; then
+            echo "$tag is already released"; echo "release=false" >> "$GITHUB_OUTPUT"
+          else echo "release=true" >> "$GITHUB_OUTPUT"; fi
       # The CLI has no runtime dependencies; its build tools are locked in
       # cli/package-lock.json. (`npm install <tool>` at the root would resolve
       # the whole root project afresh.)
-      - run: npm ci --prefix cli --ignore-scripts --no-audit --no-fund
-      - run: node scripts/build-cli.mjs
-      - run: node cli/dist/tavya.mjs --version
-      - uses: actions/upload-artifact@v4
+      - if: steps.version.outputs.release == 'true'
+        run: npm ci --prefix cli --ignore-scripts --no-audit --no-fund
+      - if: steps.version.outputs.release == 'true'
+        run: node scripts/build-cli.mjs
+      - if: steps.version.outputs.release == 'true'
+        run: node cli/dist/tavya.mjs --version
+      - if: steps.version.outputs.release == 'true'
+        uses: actions/upload-artifact@v4
         with: { name: tavya-mjs, path: cli/dist/tavya.mjs }
 
   executable:
     needs: bundle
+    if: needs.bundle.outputs.release == 'true'
     strategy:
       matrix:
         include:
@@ -120,6 +135,7 @@ jobs:
   # so no npm token is stored anywhere. Needs npm >= 11.5.1.
   npm:
     needs: bundle
+    if: needs.bundle.outputs.release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
