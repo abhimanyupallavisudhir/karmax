@@ -304,6 +304,22 @@ export class HetznerDriver implements VmDriver {
     return ready ? String(ready.id) : undefined;
   }
 
+  /** The provisioned snapshot, built now if there is none (several minutes). */
+  async ensureSnapshot(connection: ResolvedWorldProviderConnection): Promise<string> {
+    const until = Date.now() + 45 * 60_000;
+    for (;;) {
+      const ready = await this.snapshot(connection);
+      if (ready) return ready;
+      const key = `${crypto.createHash('sha256').update(connection.apiKey).digest('hex')}:${vmProvisionVersion()}`;
+      const building = this.building.get(key);
+      if (building) await building;
+      else if (!(await this.servers(connection, `karmaxImageBuilder=${vmProvisionVersion()}`)).length)
+        await this.runBuild(connection, vmProvisionVersion());
+      else await new Promise((resolve) => setTimeout(resolve, 15 * this.pollMs));
+      if (Date.now() > until) throw new Error('the karmax VM snapshot was not ready within 45 minutes');
+    }
+  }
+
   /** Build the provisioned snapshot in the background, once per project and version. */
   private buildSnapshot(connection: ResolvedWorldProviderConnection): void {
     const version = vmProvisionVersion();
