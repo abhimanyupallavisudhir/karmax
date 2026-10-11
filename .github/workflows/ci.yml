@@ -315,6 +315,27 @@ jobs:
             exit 1
           fi
 
+      # Off-host PostgreSQL backups (deploy/postgres/pg-backup.sh): with none
+      # configured the stack's PostgreSQL archives through the script without a
+      # failure and the backup service idles; and a point-in-time restore works
+      # inside the image the stack just built (PostgreSQL 16, WAL-G, the script).
+      - name: Restore PostgreSQL to a point in time with the shipped image
+        if: steps.scope.outputs.artifacts == 'true'
+        env:
+          COMPOSE_FILE: deploy/compose.turnkey.yml
+          COMPOSE_ENV_FILES: deploy/.turnkey.env
+        run: |
+          archiver=$(docker compose exec -T postgresql psql -U temporal -d postgres -Atc \
+            "SELECT current_setting('archive_mode') || ' ' || failed_count FROM pg_stat_archiver")
+          echo "archiver: $archiver"
+          [ "$archiver" = 'on 0' ]
+          [ "$(docker compose ps --status running --services | grep -cx pg-backup)" = 1 ]
+          keys=$(mktemp -d)
+          tests/fixtures/pg-backup-keys.sh "$keys"
+          image=$(docker compose config --images | grep -m1 '^karmax-postgresql:')
+          docker run --rm --user postgres -e KEYS=/keys -v "$keys:/keys:ro" \
+            -v "$PWD/tests/fixtures/pg-backup-pitr.sh:/pitr.sh:ro" --entrypoint bash "$image" /pitr.sh
+
       - name: Load native runtime modules in the image
         if: steps.scope.outputs.artifacts == 'true'
         run: docker run --rm karmax-app node -e "require('node:sqlite'); require('node-pty')"

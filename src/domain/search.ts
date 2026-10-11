@@ -13,7 +13,7 @@
  * it usable from the deterministic-ish gateway path AND unit-testable with a fixed clock
  * (tests/search.test.ts) without booting Temporal.
  */
-import { TaskRecord, TaskQuery, FilterClause, Tag, SortClause, PRIORITIES } from './types.js';
+import { TaskRecord, TaskQuery, FilterClause, Tag, SortClause, PRIORITIES, AttentionAsk } from './types.js';
 import { normalizeTriggers, isRecurring, nextCronFire, TaskTrigger } from './triggers.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
 
@@ -34,12 +34,13 @@ export interface EvalContext {
    *  and for resolving `for:me`. */
   userId?: string;
   /**
-   * userId → task id → what each live ask routed to that person is (inbox kinds:
-   * `review-requested`, `escalated`, `approval-requested`, `assigned`, `mentioned`).
-   * The API precomputes it from the inbox for the people a query's `for:` clauses
-   * name, so this module stays pure. Absent ⇒ nobody has an ask (drafts still count).
+   * userId → task id → the live asks routed to that person: their inbox kinds
+   * (`review-requested`, `escalated`, `approval-requested`, `assigned`,
+   * `mentioned`) and when the newest arrived. The API precomputes it from the
+   * inbox for the people a query's `for:` clauses name, so this module stays
+   * pure. Absent ⇒ nobody has an ask (drafts still count).
    */
-  attention?: Map<string, Map<string, string[]>>;
+  attention?: Map<string, Map<string, AttentionAsk>>;
   /** Lower-cased person name or email → userId, for `for:<name|email>` (the
    *  organization's members; anything else matches nobody). */
   people?: Map<string, string>;
@@ -59,6 +60,8 @@ export interface FieldContext extends EvalContext {
    * "Scheduled" view. Absent ⇒ fall back to computing on demand.
    */
   nextRun?: Map<string, number | undefined>;
+  /** The asks of each person the query's positive `for:` clauses name. */
+  askedOf?: Map<string, AttentionAsk>[];
 }
 
 export type FieldType = 'text' | 'enum' | 'number' | 'date' | 'tag' | 'facet';
@@ -264,11 +267,17 @@ const ownDraft = (t: SearchTask, userId: string): boolean =>
  *  the attempt or its logical task), plus `draft` for their own draft. */
 function attentionReasons(t: SearchTask, userId: string, ctx?: EvalContext): string[] {
   const asks = ctx?.attention?.get(userId);
-  const out = [...(asks?.get(t.id) ?? []), ...(t.intentId && t.intentId !== t.id ? asks?.get(t.intentId) ?? [] : [])];
+  const out = [...(asks?.get(t.id)?.kinds ?? []), ...(t.intentId && t.intentId !== t.id ? asks?.get(t.intentId)?.kinds ?? [] : [])];
   if (ownDraft(t, userId)) out.push('draft');
   return [...new Set(out)];
 }
 const projectOf = (t: SearchTask, ctx?: EvalContext) => ctx?.projects?.get(t.projectId);
+/** When the task last changed stage, status or what it waits for. */
+const statusChangedAt = (t: SearchTask) => t.statusChangedAt ?? t.createdAt;
+/** When `t` last changed for the people the query is for: a status change, or
+ *  an ask reaching them — so a task that has just come to them leads the list. */
+const updatedFor = (t: SearchTask, ctx?: FieldContext) => Math.max(statusChangedAt(t) ?? 0,
+  ...(ctx?.askedOf ?? []).map((asks) => Math.max(asks.get(t.id)?.at ?? 0, (t.intentId && asks.get(t.intentId)?.at) || 0)));
 
 // ─── the searchable-field registry ───────────────────────────────────────────
 export const FIELDS: FieldDef[] = [
@@ -284,7 +293,7 @@ export const FIELDS: FieldDef[] = [
   { key: 'tag-type', label: 'Tag (type)', type: 'tag', tagKind: 'type', get: (t) => t.tags ?? [], groupable: true, groupOnly: true },
   { key: 'tag-topic', label: 'Tag (topic)', type: 'tag', tagKind: 'topic', get: (t) => t.tags ?? [], groupable: true, groupOnly: true },
   { key: 'created', label: 'Created', type: 'date', get: (t) => t.createdAt, sortable: true, sortKey: (t) => t.createdAt ?? 0 },
-  { key: 'updated', label: 'Updated', type: 'date', get: (t) => t.lastView?.updatedAt, sortable: true, sortKey: (t) => t.lastView?.updatedAt ?? t.createdAt ?? 0 },
+  { key: 'updated', label: 'Updated', type: 'date', get: statusChangedAt, sortable: true, sortKey: updatedFor },
   { key: 'notes', label: 'Notes', type: 'text', get: (t) => t.notes },
   { key: 'prompt', label: 'Prompt', type: 'text', get: (t) => (t.params?.prompt == null ? undefined : String(t.params.prompt)) },
   { key: 'conversation', label: 'Conversation', type: 'text', aliases: ['says'], get: conversationText },
@@ -610,7 +619,7 @@ export interface EvalResult {
   total: number;
 }
 
-const DEFAULT_SORT: SortClause[] = [{ field: 'created', dir: 'desc' }];
+const DEFAULT_SORT: SortClause[] = [{ field: 'updated', dir: 'desc' }];
 
 /**
  * Enrich the caller's `{ now, tags }` with cross-task indices so relational/time fields
@@ -634,7 +643,8 @@ function enrichContext(tasks: SearchTask[], ctx: EvalContext, query: TaskQuery):
     if (needsNextRun && normalizeTriggers(t.params).some((x) => x.kind === 'schedule'))
       nextRun.set(t.id, nextRunOf(t, ctx.now));
   }
-  return { ...ctx, idToNum, blockedBy, nextRun };
+  const askedOf = positiveForUsers(query, ctx).map((user) => ctx.attention?.get(user)).filter((asks): asks is Map<string, AttentionAsk> => !!asks);
+  return { ...ctx, idToNum, blockedBy, nextRun, askedOf };
 }
 
 export function evaluateQuery(tasks: SearchTask[], query: TaskQuery, ctx: EvalContext): EvalResult {

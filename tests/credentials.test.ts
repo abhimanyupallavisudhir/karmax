@@ -188,27 +188,27 @@ describe('credential policy references', () => {
 });
 
 describe('host ambient credentials on a managed cell', () => {
-  const gather = (env: NodeJS.ProcessEnv) => {
+  const gather = async (env: NodeJS.ProcessEnv) => {
     const previous = { ...process.env };
     Object.assign(process.env, { ANTHROPIC_API_KEY: 'sk-host', OPENAI_API_KEY: 'sk-host', ...env });
-    try { return gatherCredentialSources({ organizationId: 'org_personal' }); }
+    try { return await gatherCredentialSources({ organizationId: 'org_personal' }); }
     finally { for (const k of Object.keys(process.env)) delete process.env[k]; Object.assign(process.env, previous); }
   };
 
-  it('never offers the operator machine credentials to a hosted tenant', () => {
+  it('never offers the operator machine credentials to a hosted tenant', async () => {
     // `org_personal` is bootstrapped into EVERY install (store/db.ts), and it is
     // the fallback organization id all over the store — so membership alone must
     // not be what stands between a SaaS tenant and the control plane's own
     // `claude login` / ANTHROPIC_API_KEY.
-    const hosted = gather({ KARMAX_DEPLOYMENT: 'hosted' });
+    const hosted = await gather({ KARMAX_DEPLOYMENT: 'hosted' });
     expect(hosted.ambient).toEqual({ claude: false, codex: false, opencode: false });
     expect(Object.values(hosted.envKeys).every((present) => present === false)).toBe(true);
   });
 
-  it('still offers them to a self-host, where the operator is the user', () => {
+  it('still offers them to a self-host, where the operator is the user', async () => {
     // A solo VPS install on a public URL is hosted:false — the person browsing
     // owns the box, and running on its own `claude login` is the point.
-    const selfHost = gather({ KARMAX_HOST: '0.0.0.0' });
+    const selfHost = await gather({ KARMAX_HOST: '0.0.0.0' });
     expect(selfHost.envKeys.claude).toBe(true);
     expect(selfHost.envKeys.codex).toBe(true);
   });

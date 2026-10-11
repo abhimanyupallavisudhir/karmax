@@ -3190,8 +3190,12 @@ function wireAgentBox(box) {
     const option = chosen?.querySelector('.af-resume-reuse-model');
     if (option) option.checked = false;
   };
-  box.addEventListener('input', releaseModel);
-  box.addEventListener('change', releaseModel);
+  // A re-wired box (kept around a retained section, its controls re-rendered)
+  // replaces its listeners.
+  box.agentWiring?.abort();
+  const { signal } = box.agentWiring = new AbortController();
+  box.addEventListener('input', releaseModel, { signal });
+  box.addEventListener('change', releaseModel, { signal });
   // Dropping the source also withdraws the grants and model it brought along.
   const withdrawReauthorize = () => {
     if (chosen?.querySelector('.af-resume-reauthorize')?.checked) announceReauthorize(false);
@@ -4393,6 +4397,12 @@ function markTaskCancelling(taskId) {
   if (S.view?.taskId === taskId) S.view = pendingCancellationView(S.view, taskId);
 }
 
+// The lists' default order (the server's `updated` sort): the task whose stage,
+// status or wait last changed first; one that never ran counts from its creation.
+function byLastUpdate(a, b) {
+  return (b.statusChangedAt || b.createdAt || 0) - (a.statusChangedAt || a.createdAt || 0);
+}
+
 // Evaluate the working query on the server and stash the result. The default list
 // (empty query) is just an evaluation too. We overlay each result's freshest live
 // `lastView` from S.tasks so status chips reflect the latest transition.
@@ -4602,6 +4612,8 @@ function patchLifecycleView(record, ev) {
     agentTurn,
   }, ev.taskId);
   record.lastView = next;
+  if (previous.stage !== next.stage || previous.status !== next.status || previous.waitingFor?.kind !== next.waitingFor?.kind)
+    record.statusChangedAt = ev.ts || Date.now();
   // A retrying or accidentally hot-looping workflow can publish an identical
   // compact view many times per second. Updating the in-memory record is cheap;
   // replacing the entire list DOM is not, and can remove a row between pointer
@@ -5974,7 +5986,7 @@ function tasksView() {
   const preview = !across && !/(^|\s)-?[\w.#-]+:/.test(S.search || '');
   const flat = (r
     ? r.tasks
-    : preview ? S.tasks.filter((t) => taskMatches(t, S.search) && !t.params?.archived).slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)) : []
+    : preview ? S.tasks.filter((t) => taskMatches(t, S.search) && !t.params?.archived).slice().sort(byLastUpdate) : []
   ).filter(topLevel);
   const row = (t, opts = {}) => taskRow(t, { ...opts, ...(across ? { showTags: false, project: true } : {}) });
   const groups = r && r.groups ? r.groups : null;
@@ -9218,12 +9230,15 @@ function patchTaskPage(main, html) {
   }
   if (sameThread) patchConversationRows(previous, next);
   for (const [fresh, old] of retained.ancestors) {
-    // A keyed container kept only for a retained section inside it (the
-    // parameter form around the main agent's authorization) takes its new key.
-    if (fresh.dataset?.renderKey !== undefined) old.dataset.renderKey = fresh.dataset.renderKey;
-    // A live section kept only for a retained section inside it has fresh
-    // content: it takes its new key and is hydrated again.
-    if (fresh.dataset?.liveKey !== undefined) { old.dataset.liveKey = fresh.dataset.liveKey; old.liveWired = false; }
+    // A container kept only for a retained section inside it (the parameter
+    // form and the main agent's block around its authorization) is the fresh
+    // node in all but identity: it takes the fresh attributes (keys, inherited
+    // values), and its fresh content is wired and hydrated again.
+    if (fresh.nodeType === Node.ELEMENT_NODE) {
+      syncAttributes(old, fresh);
+      old.liveWired = old.paramsWired = false;
+      delete old._agentCtx;
+    }
     patchChildren(old, fresh, retained.nodes);
   }
   return !!sameThread;
@@ -9253,6 +9268,11 @@ function retainedTaskNodes(main, fragment, pairs) {
   for (const [fresh, old] of ancestors) if (!nodes.has(fresh)) nodes.set(fresh, old);
   for (const [, fresh] of pairs) ancestors.delete(fresh); // a retained node keeps its own children
   return { nodes, ancestors };
+}
+
+function syncAttributes(old, fresh) {
+  for (const name of old.getAttributeNames()) if (!fresh.hasAttribute(name)) old.removeAttribute(name);
+  for (const name of fresh.getAttributeNames()) if (old.getAttribute(name) !== fresh.getAttribute(name)) old.setAttribute(name, fresh.getAttribute(name));
 }
 
 // Give `old` the children of `fresh`, substituting retained nodes. Stale nodes
@@ -9397,6 +9417,7 @@ function renderTaskPage() {
     wireTaskApprovalRequests(v);
   } else if (tab === 'parameters') {
     wireParams(v);
+    paintParticipantStates(v);
     const projectId = rec?.projectId || S.projectId;
     wireLiveSection($('#tp-auth'), () => wireTaskAuthorization(v));
     const payments = $('#tp-payments');
@@ -10541,7 +10562,7 @@ function overviewTab(v) {
   const error = v.error ? `<div class="section-h">Error</div><div class="diff del">${esc(v.error)}</div>` : '';
   const requestedInput = humanWaitDetail(v);
   const waiting = v.waitingFor
-    ? `<div class="section-h">Waiting</div><div class="card" style="color:var(--ink-2)">⏳ ${esc(waitingText(v.waitingFor))}${v.waitingFor.earliestResetAt ? ` · earliest ${esc(fmtReset(v.waitingFor.earliestResetAt))}` : ''}${v.waitingFor.kind === 'account' && v.waitingFor.detail ? `<div style="margin-top:8px">${esc(v.waitingFor.detail)}</div>` : ''}${requestedInput ? `<div style="margin-top:8px;white-space:pre-wrap;color:var(--ink-1)">${esc(requestedInput)}</div>` : ''}</div>`
+    ? `<div class="section-h">Waiting</div><div class="card" style="color:var(--ink-2)">⏳ ${esc(waitingText(v.waitingFor))}${v.waitingFor.earliestResetAt ? ` · earliest ${esc(fmtReset(v.waitingFor.earliestResetAt))}` : ''}${v.waitingFor.kind === 'account' && v.waitingFor.detail ? `<div style="margin-top:8px">${esc(v.waitingFor.detail)}</div>` : ''}${requestedInput ? `<div class="msg-text${markdownEnabled() ? ' md' : ''}" style="margin-top:8px;color:var(--ink-1)">${renderWaitDetail(requestedInput, v)}</div>` : ''}</div>`
     : '';
   const agentTurn = v.agentTurn
     ? `<div class="section-h">Agent turn</div><div class="card" style="color:var(--ink-2)">${v.agentTurn.state === 'running' ? '▶' : '⏳'} ${esc(agentRoleLabel(v.agentTurn.role))} · ${esc(agentTurnStateText(v))}${agentProviderLabel(v.agentTurn.provider) ? ` · ${esc(agentProviderLabel(v.agentTurn.provider))}` : ''}</div>`
@@ -11113,6 +11134,22 @@ function annotateWorldFileLinks(html, v = S.view) {
 
 // Agent message bodies: Markdown (with world-file annotation) when enabled,
 // else the plain path that renders only the file-citation link subset.
+// What a person is asked to do. A landing ask (open the upstream pull request)
+// is tavya's own text: its links are app routes and GitHub pages, never
+// citations of files in the task's world.
+function renderWaitDetail(text, v = S.view, math = mathjaxEnabled()) {
+  if (v?.waitingFor?.reason !== 'merge') return renderAgentMessageBody(text, v, math);
+  if (markdownEnabled()) return renderMessageBody(text, math);
+  const link = /\[([^\]\n]+)\]\(([^\s)]+)\)/g;
+  let html = '';
+  let at = 0;
+  for (const match of String(text).matchAll(link)) {
+    html += esc(text.slice(at, match.index)) + `<a href="${esc(safeHref(match[2]))}" target="_blank" rel="noopener">${esc(match[1])}</a>`;
+    at = match.index + match[0].length;
+  }
+  return html + esc(String(text).slice(at));
+}
+
 function renderAgentMessageBody(text, v = S.view, math = mathjaxEnabled()) {
   return markdownEnabled() ? annotateWorldFileLinks(renderMessageBody(text, math), v) : renderConversationText(text, 'agent', v);
 }
@@ -11150,7 +11187,7 @@ function renderConversationEntry(entry, v = S.view) {
   if (entry.type === 'input-request') {
     const escalate = v.waitingFor?.kind === 'human' || v.waitingFor?.kind === 'parent'
       ? `<button class="btn sm ghost escalate-request" title="Pass this to someone who can answer">Escalate…</button>` : '';
-    return `<div class="msg agent input-request"><div class="msg-meta"><span class="role">${v.waitingFor?.reason === 'error' ? 'Needs attention' : 'Input requested'}</span><span class="msg-meta-gap"></span>${escalate}</div><div class="msg-text${md}">${renderAgentMessageBody(entry.request.text, v, math)}</div>${entry.resourceReview ? resourceReviewPlaceholder() : ''}${explainMessageAffordance(entry, v)}</div>`;
+    return `<div class="msg agent input-request"><div class="msg-meta"><span class="role">${v.waitingFor?.reason === 'error' ? 'Needs attention' : 'Input requested'}</span><span class="msg-meta-gap"></span>${escalate}</div><div class="msg-text${md}">${renderWaitDetail(entry.request.text, v, math)}</div>${entry.resourceReview ? resourceReviewPlaceholder() : ''}${explainMessageAffordance(entry, v)}</div>`;
   }
   if (entry.type === 'message') {
     const m = entry.message;
@@ -12433,7 +12470,7 @@ function paramsSection(v) {
       const opts = f === mainAgent
         ? { frozen: !isEditable, authority: { ...mainAuthorityParams(v), open: !!S.mainAuthorityOpen?.[v.taskId] } }
         : { frozen: !isEditable, ...(f.calledAgent ? { authority: { label: 'Agent' } } : {}) };
-      const state = f.participant?.state && f.participant.state !== 'idle' ? `<span class="chip pf-agent-state">${esc(f.participant.state)}</span>` : '';
+      const state = f.participant ? participantStateChip(f.participant) : '';
       const label = isEditable ? fieldLabel(f) : frozenLabel(f);
       const block = renderAgentField(f, own || undefined, inherited, opts);
       const row = `<div class="form-row">${label.replace('</label>', `</label>${state}`)}${block}</div>`;
@@ -12490,7 +12527,7 @@ function paramsSection(v) {
   // events retain the connected controls, preserving native editing state.
   const renderKey = JSON.stringify([v.taskId, v.workflow, terminal, fields.map(({ participant: _p, ...f }) => f), [...editable], inheritedAll,
     fields.filter((f) => !editable.has(f.name)).map((f) => paramCurrentValue(f, v, rec)),
-    TERMINAL_STAGES.includes(v.stage) || !!v.pointOfNoReturnPassed, (v.participants || []).map((p) => [p.key, p.state]),
+    TERMINAL_STAGES.includes(v.stage) || !!v.pointOfNoReturnPassed,
     authorizationLiveKey(v.taskId), paymentsLiveKey(v), v.computerChange || null]);
   // A workflow without an agent field still shows the task's own authority.
   const authorityOnly = mainAgent ? '' : `<section class="tp-section"><div class="form-row" data-row="__authorization">
@@ -12500,6 +12537,21 @@ function paramsSection(v) {
     ${agentFields.map((f) => `<section class="tp-section tp-${esc(f.type)}">${rowFor(f)}</section>`).join('')}
     ${where || triggers ? `<section class="tp-section tp-where">${where}${triggers}</section>` : ''}
     ${footer}</div>`;
+}
+
+// An agent's state changes often while a task runs; its chip is repainted in
+// place (paintParticipantStates) rather than rebuilding the form being edited.
+function participantStateChip(participant) {
+  const busy = participant.state && participant.state !== 'idle';
+  return `<span class="chip pf-agent-state" data-participant="${esc(participant.key)}" ${busy ? '' : 'hidden'}>${busy ? esc(participant.state) : ''}</span>`;
+}
+function paintParticipantStates(v) {
+  document.querySelectorAll('#tp-params .pf-agent-state[data-participant]').forEach((chip) => {
+    const state = (v.participants || []).find((p) => p.key === chip.dataset.participant)?.state;
+    const busy = !!state && state !== 'idle';
+    chip.hidden = !busy;
+    chip.textContent = busy ? state : '';
+  });
 }
 
 // A running task's branches per repository, read-only: "app  main → main".
@@ -12630,12 +12682,11 @@ function wireParams(v) {
     return;
   }
   const root = document.getElementById('tp-params');
-  // Retained controls already own their handlers. The form element itself can
-  // outlive its controls (it is kept around a retained authorization section),
-  // so the mark is on its content and its own listeners are replaced.
-  const marker = root?.firstElementChild;
-  if (marker?.paramsWired) return;
-  if (marker) marker.paramsWired = true;
+  // A retained form already owns its handlers. One kept only around a retained
+  // authorization section has fresh controls (patchTaskPage clears the mark),
+  // so it is wired again and its own listeners are replaced.
+  if (root?.paramsWired) return;
+  if (root) root.paramsWired = true;
   root?.paramsWiring?.abort();
   const wiring = root ? (root.paramsWiring = new AbortController()) : null;
   if (root) {
@@ -12646,7 +12697,7 @@ function wireParams(v) {
     const organizationId = S.projects.find((project) => project.id === projectId)?.organizationId;
     wireAgentFields(root, { projectId, organizationId, inheritedAuthority: () => taskAuthorityOf(taskRecord(v.taskId)) });
     const main = root.querySelector('#tp-auth, #tp-auth-frozen')?.closest('.agent-authority');
-    main?.addEventListener('toggle', () => { (S.mainAuthorityOpen ||= {})[v.taskId] = main.open; });
+    main?.addEventListener('toggle', () => { (S.mainAuthorityOpen ||= {})[v.taskId] = main.open; }, { signal: wiring.signal });
   }
   const saveBtn = document.getElementById('params-save');
   if (!saveBtn) return;
@@ -12726,6 +12777,9 @@ function taskActionLabel(v, action) {
   if (action.name === 'openPr' && v?.stage === 'escalated') return action.label || 'Manually Open & Confirm PR';
   if (action.name === 'openPr')
     return hasOpenPullRequest(v) ? 'Return to Review & Confirm' : 'Manually Open & Confirm PR';
+  // Waiting for the person to open the upstream pull request: Confirm checks now.
+  if (action.name === 'confirm' && v?.stage === 'merge' && v.waitingFor?.kind === 'human' && v.waitingFor.reason === 'merge')
+    return 'I opened it';
   if (action.name === 'confirm' && v?.stage === 'merge' && v.waitingFor?.kind === 'human')
     return 'Authorize GitHub merge';
   return action.label || action.name;
@@ -16336,6 +16390,78 @@ async function connectOrganizationGithub(organizationId, onConnected) {
   document.body.append(dialog);
   dialog.showModal();
 }
+// `owner/name` from a GitHub URL or slug.
+function githubRepositorySlug(text) {
+  const match = String(text || '').trim().match(/^(?:(?:https?:\/\/)?(?:www\.)?github\.com[/:]|git@github\.com:)?([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/?$/);
+  return match ? `${match[1]}/${match[2]}` : '';
+}
+
+// Work on someone else's repository: fork it on GitHub (where the App can reach
+// it), then attach the fork. Its pull requests open on the original.
+function openForkRepositoryDialog(proj, opener, githubApp = {}) {
+  const host = document.createElement('div');
+  host.innerHTML = `<div class="modal-overlay"><form class="modal-card new-repository-dialog" role="dialog" aria-modal="true" aria-labelledby="fork-repository-title">
+    <div class="new-repository-head"><b id="fork-repository-title">Fork a repository</b><button class="icon-btn new-repository-close" type="button" aria-label="Close">×</button></div>
+    <label class="form-row"><span>Repository</span><input id="project-fork-source" placeholder="https://github.com/owner/repo" required autocomplete="off"></label>
+    <p class="task-sub fork-private-note" hidden></p>
+    <div class="new-repository-actions"><button class="btn new-repository-cancel" type="button">Cancel</button><a class="btn" id="project-fork-github" target="_blank" rel="noopener" aria-disabled="true">Fork on GitHub ↗</a><button class="btn primary" type="submit" title="After forking">Attach fork</button></div>
+  </form></div>`;
+  const close = () => { document.removeEventListener('keydown', keydown); host.remove(); opener?.focus?.(); };
+  const keydown = (event) => { if (event.key === 'Escape') close(); };
+  const source = host.querySelector('#project-fork-source');
+  const forkLink = host.querySelector('#project-fork-github');
+  const sync = () => {
+    const slug = githubRepositorySlug(source.value);
+    if (slug) { forkLink.href = `https://github.com/${slug}/fork`; forkLink.removeAttribute('aria-disabled'); }
+    else { forkLink.removeAttribute('href'); forkLink.setAttribute('aria-disabled', 'true'); }
+  };
+  const note = host.querySelector('.fork-private-note');
+  let privateAcknowledged = '';
+  source.addEventListener('input', () => { sync(); note.hidden = true; privateAcknowledged = ''; });
+  host.querySelector('.modal-overlay').addEventListener('mousedown', (event) => { if (event.target === event.currentTarget) close(); });
+  host.querySelector('.new-repository-close').addEventListener('click', close);
+  host.querySelector('.new-repository-cancel').addEventListener('click', close);
+  host.querySelector('form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const slug = githubRepositorySlug(source.value).toLowerCase();
+    if (!slug) return toast('Enter a GitHub repository', true);
+    const button = event.submitter;
+    if (button) button.disabled = true;
+    try {
+      const { repositories } = await api(`/api/organizations/${proj.organizationId}/github/refresh`, { method: 'POST', body: '{}' });
+      const fork = (repositories || []).find((repository) => repository.upstream
+        && `${repository.upstream.owner}/${repository.upstream.name}`.toLowerCase() === slug);
+      if (!fork) {
+        toast('No fork found yet. Fork it on GitHub and give the GitHub App access to the fork.', true);
+        return;
+      }
+      // A private original is visible to the App only where it is installed;
+      // without a token of the person's own, tasks on its fork cannot propose.
+      if (fork.upstream.private && privateAcknowledged !== fork.id) {
+        const { accounts = [] } = await api('/api/user/github-accounts').catch(() => ({}));
+        if (!accounts.some((account) => account.profile?.githubToken)) {
+          const install = githubApp.appSlug ? `https://github.com/apps/${encodeURIComponent(githubApp.appSlug)}/installations/new` : '';
+          note.innerHTML = `<b>${esc(slug)} is private.</b> tavya can only open pull requests there if ${install
+            ? `<a href="${esc(install)}" target="_blank" rel="noopener">an owner installs the GitHub App on it ↗</a>` : 'an owner installs the GitHub App on it'}
+            or you <a href="/profile#github-token" target="_blank" rel="noopener">save a GitHub token</a> with the repo scope.`;
+          note.hidden = false;
+          privateAcknowledged = fork.id;
+          if (button) button.textContent = 'Attach anyway';
+          return;
+        }
+      }
+      await api(`/api/projects/${proj.id}/repositories`, { method: 'POST', body: JSON.stringify({ repositoryId: fork.id }) });
+      close(); toast('Fork attached'); await loadProjects(); await hydrateProjectAccess(projectById(proj.id) || proj);
+    } catch (error) {
+      toast(error.message, true);
+    } finally {
+      if (button?.isConnected) button.disabled = false;
+    }
+  });
+  $('#modal-root').appendChild(host); document.addEventListener('keydown', keydown);
+  source.focus();
+}
+
 function openNewGithubRepositoryDialog(proj, gitConnections, opener) {
   const host = document.createElement('div');
   host.innerHTML = `<div class="modal-overlay"><form class="modal-card new-repository-dialog" role="dialog" aria-modal="true" aria-labelledby="new-repository-title">
@@ -16405,7 +16531,11 @@ function renderProjectRepositories(box, proj, { repositories, gitConnections, gi
     const name = view.kind === 'github'
       ? `<a class="git-repo-name" href="https://github.com/${esc(view.owner)}/${esc(view.name)}" target="_blank" rel="noopener noreferrer" title="${esc(source)}"><span>${esc(view.owner)}/</span>${esc(view.name)}</a>`
       : `<span class="git-repo-name mono" title="${esc(source)}">${esc(source)}</span>`;
-    return `<div class="git-repo" data-source="${esc(source)}"><span class="git-repo-icon">${view.kind === 'github' ? githubMark() : view.kind === 'local' ? folderIcon() : gitIcon()}</span>${name}<button class="icon-btn git-repo-remove" type="button" title="Remove" aria-label="Remove ${esc(view.kind === 'github' ? `${view.owner}/${view.name}` : source)}">×</button></div>`;
+    // A fork's pull requests go to the repository it was forked from.
+    const upstream = view.kind === 'github'
+      && repositories.find((repository) => `${repository.owner}/${repository.name}`.toLowerCase() === view.key)?.upstream;
+    const proposes = upstream ? `<span class="setting-muted git-repo-upstream" title="Pull requests go to ${esc(upstream.owner)}/${esc(upstream.name)} after Review">→ ${esc(upstream.owner)}/${esc(upstream.name)}</span>` : '';
+    return `<div class="git-repo" data-source="${esc(source)}"><span class="git-repo-icon">${view.kind === 'github' ? githubMark() : view.kind === 'local' ? folderIcon() : gitIcon()}</span>${name}${proposes}<button class="icon-btn git-repo-remove" type="button" title="Remove" aria-label="Remove ${esc(view.kind === 'github' ? `${view.owner}/${view.name}` : source)}">×</button></div>`;
   };
   const organizationLink = `${globalRoute('organization', organizationById(proj.organizationId))}#settings-code`;
   const needsUpdate = gitConnections.some((connection) => connection.permissionStatus && !connection.permissionStatus.ready);
@@ -16423,9 +16553,10 @@ function renderProjectRepositories(box, proj, { repositories, gitConnections, gi
         <input id="project-repository-input" list="project-repository-options" autocomplete="off" spellcheck="false" aria-label="Add a repository" placeholder="${esc(placeholder)}" ${canAdd ? '' : 'disabled'}>
         <button class="btn sm" type="submit" id="project-repository-add" ${canAdd ? '' : 'disabled'}>Add</button>
         ${canCreate ? '<button class="btn sm" id="project-new-repo-open" type="button" aria-haspopup="dialog">New repository</button>' : ''}
+        ${githubApp.configured && gitConnections.length ? '<button class="btn sm" id="project-fork-open" type="button" aria-haspopup="dialog" title="Work on a repository you don\'t own. Pull requests go to it after Review.">Fork a repository</button>' : ''}
       </form>
     </div>
-    <datalist id="project-repository-options">${choices.map((repository) => `<option value="${esc(repository.owner)}/${esc(repository.name)}"></option>`).join('')}</datalist>
+    <datalist id="project-repository-options">${choices.map((repository) => `<option value="${esc(repository.owner)}/${esc(repository.name)}">${repository.upstream ? `→ ${esc(repository.upstream.owner)}/${esc(repository.upstream.name)}` : ''}</option>`).join('')}</datalist>
     <div class="setting-rows ruled git-facts">
       <div class="setting-row" id="project-github-access"><span class="setting-label">GitHub ${policyTip('The GitHub accounts this organization connected. Their repositories can be added above.')}</span><span class="setting-value">${access.value}</span><span class="setting-actions">${access.actions}</span></div>
       <div class="setting-row" id="project-github-identity"><span class="setting-label">Commits as ${policyTip('Each task commits and opens pull requests as the person who created it.')}</span><span class="setting-value">${identity}</span><span class="setting-actions">${githubAuthorizeButton(githubApp, 'project-authorize-github')}<a class="btn sm" data-spa href="${profileRoute()}">Manage</a></span></div>
@@ -16461,6 +16592,7 @@ function renderProjectRepositories(box, proj, { repositories, gitConnections, gi
     if (await save([...sources, source])) $('#project-repository-input')?.focus();
   });
   $('#project-new-repo-open')?.addEventListener('click', (event) => openNewGithubRepositoryDialog(proj, gitConnections, event.currentTarget));
+  $('#project-fork-open')?.addEventListener('click', (event) => openForkRepositoryDialog(proj, event.currentTarget, githubApp));
   $('#project-connect-github')?.addEventListener('click', async () => { try { await connectOrganizationGithub(proj.organizationId, rerender); } catch (error) { toast(error.message, true); } });
   $('#project-authorize-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/authorize`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (error) { toast(error.message, true); } });
   $('#project-refresh-github')?.addEventListener('click', async (event) => {
@@ -17718,7 +17850,7 @@ const VAULT_SECRET_LABELS = {
   note: [['note', 'note']],
 };
 // Short label + click-to-expand explanation for the two per-item policies.
-const POL_USE_TIP = 'Use through a browser or environment without returning secret text to the model. The agent can still inspect its browser and environment, so a misbehaving agent can still leak it, e.g. by entering it on a malicious site. “ask” requires approval before each use.';
+const POL_USE_TIP = 'Use through a browser or environment without returning secret text to the model. Agents also get current 2FA codes, never the 2FA secret itself. The agent can still inspect its browser and environment, so a misbehaving agent can still leak it, e.g. by entering it on a malicious site. “ask” requires approval before each use.';
 const SESSION_EXCLUSIVE_TIP = 'For sites that sign other copies out when one is used. Other tasks wait until the task using it is done.';
 const POL_REVEAL_TIP = 'Agent sees = the plaintext secret is handed to the agent (needed e.g. to paste an API key into a dashboard). It then travels to the model provider and may end up in training data. “never” forbids that to everyone but Super-administrators, who can read the whole vault; “ask” requires your approval each time.';
 // `title` covers hover on desktop; the click handler is for touch, where there is
@@ -18087,7 +18219,7 @@ function wireConnectionActions(root, organizationId, refresh) {
           button.hidden = !!popup;
         } else if (result.url) {
           if (popup) popup.location.href = result.url;
-          row.querySelector('[data-connection-result]').innerHTML = `<a class="btn sm primary" href="${esc(result.url)}" target="_blank" rel="noopener noreferrer">Sign in with Composio ↗</a><p class="task-sub">This task continues automatically after you finish signing in.</p>`;
+          row.querySelector('[data-connection-result]').innerHTML = `<a class="btn sm primary" href="${esc(result.url)}" target="_blank" rel="noopener noreferrer">Sign in with ${result.callback === 'github' ? 'GitHub' : 'Composio'} ↗</a><p class="task-sub">This task continues automatically after you finish signing in.</p>`;
           button.hidden = true;
         } else { popup?.close(); await refresh(); }
       } else {
@@ -19217,6 +19349,8 @@ function urgencyRank(urgency) {
 // news is the outcome it is reporting, so it names the task's status instead.
 function inboxRowLabel(item) {
   if (item.subject?.kind === 'avatar-authorization') return 'Avatar authorization approval';
+  if (item.subject?.kind === 'service-limit') return item.subject.level === 'failed' ? `Can’t read ${item.subject.serviceName} usage`
+    : `${item.subject.serviceName} at ${Math.floor((item.subject.used / item.subject.limit) * 100)}% of its limit${item.subject.level === 95 ? ' — upgrade now' : ''}`;
   if (item.subject?.kind === 'storage') return item.subject.stage === 'deleted'
     ? 'Stored data deleted to fit the limit'
     : `Over the storage limit — free space by ${new Date(item.subject.deleteAt).toLocaleDateString()}`;
@@ -19231,6 +19365,8 @@ function inboxRowLabel(item) {
 function inboxTitle(item, fallback = item.kind) {
   if (item.subject?.kind === 'credential') return `${item.subject.provider}:${item.subject.account}`;
   if (item.subject?.kind === 'storage') return `Storage · ${formatBytes(item.subject.retainedBytes)} of ${formatBytes(item.subject.quotaBytes)}`;
+  if (item.subject?.kind === 'service-limit') return item.subject.level === 'failed' ? `${item.subject.serviceName} · ${item.subject.error}`
+    : `${item.subject.serviceName} · ${item.subject.label} ${limitAmount(item.subject.used, item.subject.unit)} of ${limitAmount(item.subject.limit, item.subject.unit, true)}`;
   return item.task?.title || item.resource?.name || fallback;
 }
 // Every priority is explicit; color and bars make the urgent levels scannable.
@@ -19427,6 +19563,7 @@ async function openInboxItem(item) {
   if (item.subject?.kind === 'storage') {
     return go(`${globalRoute('organization', organizationById(item.organizationId))}#settings-storage`);
   }
+  if (item.subject?.kind === 'service-limit') return go(`${installationRoute()}#installation-limits`);
   if (item.subject?.kind === 'avatar-authorization') {
     const project = projectById(item.subject.projectId); if (!project) return;
     return go(avatarRoute(project.id, item.subject.avatarId));
@@ -19502,6 +19639,38 @@ function openGitIdentityDialog({ title, profile, endpoint, onSaved }) {
   overlay.querySelector('.git-identity-name').focus();
 }
 
+// The person's own GitHub token: the App acts only where it is installed, so
+// opening pull requests on repositories they forked needs a token of theirs.
+function openGithubTokenDialog(account, onSaved) {
+  const overlay = document.createElement('div'); overlay.className = 'modal-overlay';
+  const saved = Boolean(account.profile?.githubToken);
+  overlay.innerHTML = `<form class="modal-card new-repository-dialog" role="dialog" aria-modal="true" aria-label="GitHub token">
+    <div class="new-repository-head"><b>GitHub token</b><button class="icon-btn git-identity-close" type="button" aria-label="Close">×</button></div>
+    <label class="form-row"><span>Classic token · <a href="https://github.com/settings/tokens/new?scopes=public_repo&description=tavya" target="_blank" rel="noopener" title="Scope: public_repo">create ↗</a></span><input class="github-token-value" type="password" autocomplete="off" spellcheck="false" placeholder="${saved ? 'Saved — paste a new token to replace it' : 'ghp_…'}" /></label>
+    <div class="new-repository-actions">${saved ? '<button class="btn github-token-remove" type="button">Remove</button>' : ''}<button class="btn git-identity-cancel" type="button">Cancel</button><button class="btn primary github-token-save" type="submit">Save</button></div>
+  </form>`;
+  const endpoint = `/api/user/github-accounts/${encodeURIComponent(account.id)}/token`;
+  const close = () => { document.removeEventListener('keydown', keydown); overlay.remove(); };
+  const keydown = (event) => { if (event.key === 'Escape') close(); };
+  const run = async (button, request, message) => {
+    button.disabled = true;
+    try { await api(endpoint, request); close(); toast(message); await onSaved?.(); }
+    catch (error) { toast(error.message, true); button.disabled = false; }
+  };
+  overlay.addEventListener('click', (event) => { if (event.target === overlay) close(); });
+  overlay.querySelector('.git-identity-close').addEventListener('click', close);
+  overlay.querySelector('.git-identity-cancel').addEventListener('click', close);
+  overlay.querySelector('.github-token-remove')?.addEventListener('click', (event) => run(event.currentTarget, { method: 'DELETE' }, 'Token removed'));
+  overlay.querySelector('form').addEventListener('submit', (event) => {
+    event.preventDefault();
+    const token = overlay.querySelector('.github-token-value').value.trim();
+    if (!token) return toast('Paste a token', true);
+    run(overlay.querySelector('.github-token-save'), { method: 'PUT', body: JSON.stringify({ token }) }, 'Token saved');
+  });
+  document.body.appendChild(overlay); document.addEventListener('keydown', keydown);
+  overlay.querySelector('.github-token-value').focus();
+}
+
 async function hydrateProfileGithub() {
   const box = $('#profile-github'); if (!box) return;
   const renderIsCurrent = beginAsyncElementRender(box);
@@ -19518,7 +19687,7 @@ async function hydrateProfileGithub() {
   </div>` : '';
   box.innerHTML = `${failureDetail}${accounts.length ? '' : '<span class="setting-muted">Not connected</span>'}<div class="github-account-list">${accounts.map((account) => `<div class="github-account-row" data-account="${esc(account.id)}">
     <span class="github-account-label">${githubMark()}<b>${esc(account.login)}</b>${account.active ? '<span class="chip">Active</span>' : ''}</span>
-    <span class="github-account-actions">${account.active ? '' : '<button class="btn sm github-use" type="button">Use</button>'}<button class="btn sm github-reconnect" type="button">Reconnect</button><button class="btn sm github-custom" type="button">Custom identity</button><button class="icon-btn github-remove" type="button" aria-label="Remove GitHub account">${trashIcon()}</button></span>
+    <span class="github-account-actions">${account.active ? '' : '<button class="btn sm github-use" type="button">Use</button>'}<button class="btn sm github-reconnect" type="button">Reconnect</button><button class="btn sm github-custom" type="button">Custom identity</button><button class="btn sm github-token" type="button" title="Lets tavya open pull requests on repositories you forked">${account.profile?.githubToken ? 'Token ✓' : 'Token'}</button><button class="icon-btn github-remove" type="button" aria-label="Remove GitHub account">${trashIcon()}</button></span>
   </div>`).join('')}</div>
   <button class="btn sm ${accounts.length ? 'ghost' : 'primary'} github-add" type="button">${githubMark()}${accounts.length ? 'Add new GitHub account' : 'Connect GitHub'}</button>`;
   box.querySelector('.github-add')?.addEventListener('click', () => startUserGithubConnection(data.githubApp, 'add').catch((error) => toast(error.message, true)));
@@ -19528,9 +19697,16 @@ async function hydrateProfileGithub() {
     row.querySelector('.github-use')?.addEventListener('click', async () => { try { await api(`/api/user/github-accounts/${account.id}/active`, { method: 'POST', body: '{}' }); await hydrateProfileGithub(); } catch (error) { toast(error.message, true); } });
     row.querySelector('.github-custom')?.addEventListener('click', () => openGitIdentityDialog({ title: 'Custom identity', profile: account.profile,
       endpoint: `/api/user/github-accounts/${account.id}/identity`, onSaved: hydrateProfileGithub }));
+    row.querySelector('.github-token')?.addEventListener('click', () => openGithubTokenDialog(account, hydrateProfileGithub));
     row.querySelector('.github-remove')?.addEventListener('click', async () => {
       if (!confirm('Disconnect this GitHub account? Tasks using it may lose repository access.')) return; try { await api(`/api/user/github-accounts/${account.id}`, { method: 'DELETE' }); await hydrateProfileGithub(); } catch (error) { toast(error.message, true); } });
   });
+  // Linked from a task waiting for its upstream pull request.
+  if (location.hash === '#github-token') {
+    history.replaceState(history.state, '', `${location.pathname}${location.search}`);
+    const account = accounts.find((candidate) => candidate.active) || accounts[0];
+    if (account) openGithubTokenDialog(account, hydrateProfileGithub);
+  }
 }
 
 // A clean profile page: identity, the browser display preference (theme), and the
@@ -20161,6 +20337,141 @@ async function loadAccountErasure(userId) {
     confirmation: $('#erasure-reviewed').value }));
 }
 
+// ── Service limits (Installation) ─────────────────────────────────────────────
+// The operator's shared accounts and this server against their plans
+// (GET /api/settings/service-limits). One row per measure, the service's name,
+// plan and upgrade link on its first row; explanations live in tooltips.
+function limitSource(source) {
+  return { api: ['API', 'Read from the provider'], count: [siteName(), `Counted by ${siteName()}`],
+    host: ['server', 'Measured on this server'] }[source] || ['API', 'Read from the provider'];
+}
+function limitAmount(value, unit, compact = false) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '—';
+  if (unit === 'bytes') return formatBytes(n);
+  if (unit === 'hours') return `${n.toLocaleString('en-US', { maximumFractionDigits: 1 })} h`;
+  return compact && n >= 100_000
+    ? n.toLocaleString('en-US', { notation: 'compact', maximumFractionDigits: 1 })
+    : n.toLocaleString('en-US', { maximumFractionDigits: 1 });
+}
+function serviceLimitMeterMarkup(service, meter, first) {
+  const source = limitSource(meter.usedSource);
+  const has = meter.used !== undefined && meter.used !== null;
+  const ratio = has && meter.limit ? meter.used / meter.limit : undefined;
+  const percent = ratio === undefined ? '' : ratio > 0 && ratio < 0.01 ? '<1%' : `${Math.floor(ratio * 100)}%`;
+  const limitTitle = { entered: 'Entered by you', api: `Reported by ${service.name}`, published: service.plan ? `Published ${service.plan} limit` : 'Published limit' }[meter.limitSource] || '';
+  const peak = meter.peak && meter.limit && meter.peak.used > meter.used
+    ? `<b class="limits-peak" style="left:${Math.min(100, (meter.peak.used / meter.limit) * 100).toFixed(1)}%"></b>` : '';
+  const barTitle = [`Now ${limitAmount(meter.used, meter.unit)}${percent ? ` (${percent})` : ''}`,
+    meter.peak ? `7-day high ${limitAmount(meter.peak.used, meter.unit)}` : '', meter.detail || ''].filter(Boolean).join(' · ');
+  const usage = !has ? '<span class="limits-none">No reading yet</span>'
+    : `${meter.limit ? `<span class="limits-bar" title="${esc(barTitle)}"><i style="width:${Math.min(100, ratio * 100).toFixed(1)}%"></i>${peak}</span>` : ''}
+      <span class="limits-numbers" title="${esc(barTitle)}">${esc(limitAmount(meter.used, meter.unit))}${meter.limit
+        ? ` / <span class="limits-limit ${meter.limitSource === 'entered' ? 'entered' : ''}" title="${esc(limitTitle)}">${esc(limitAmount(meter.limit, meter.unit, true))}</span>` : ''}</span>
+      ${meter.limit ? `<span class="limits-level ${meter.level === 95 ? 'critical' : meter.level === 80 ? 'warn' : ''}">${meter.level ? '▲ ' : ''}${esc(percent)}</span>` : ''}`;
+  return `<div class="limits-row${first ? '' : ' cont'}" role="row" data-service="${esc(service.id)}" data-meter="${esc(meter.id)}" data-level="${meter.level || 0}">
+    <span class="limits-service" role="rowheader">${first ? serviceLimitNameMarkup(service, true) : ''}</span>
+    <span class="limits-measure" role="cell"><button type="button" class="info-dot limits-label" title="${esc(meter.tip)}">${esc(meter.label)}</button> <span class="limits-source" title="${esc(source[1])}">${esc(source[0])}</span></span>
+    <span class="limits-usage" role="cell">${usage}</span>
+    <span class="limits-actions" role="cell">${first ? serviceLimitActionsMarkup(service) : ''}</span>
+  </div>`;
+}
+function serviceLimitNameMarkup(service, withPlan = false) {
+  const plan = withPlan && service.plan ? `<span class="limits-plan" title="${esc(service.planSource === 'entered' ? 'Your plan, as you entered it'
+    : service.planSource === 'api' ? `Reported by ${service.name}` : 'Assumed until you enter yours')}">${esc(service.plan)}</span>` : '';
+  const failed = service.status === 'failed'
+    ? `<span class="limits-failed">Can’t read ${policyTip(`${service.error || 'No answer'}. The last reading is shown.`)}</span>` : '';
+  return `<button type="button" class="info-dot limits-label limits-name" title="${esc(service.tip)}">${esc(service.name)}</button>${plan}${failed}`;
+}
+function serviceLimitActionsMarkup(service) {
+  const link = service.link ? `<a href="${esc(service.link.url)}" target="_blank" rel="noopener noreferrer">${esc(service.link.label)} ↗</a>` : '';
+  const edit = S.serviceLimitsCanManage ? `<button type="button" class="limits-edit" data-limits-edit="${esc(service.id)}" aria-label="Edit ${esc(service.name)} plan and limits" title="Edit plan and limits">✎</button>` : '';
+  return link + edit;
+}
+function serviceLimitsMarkup(view) {
+  if (!view) return '';
+  const rows = view.services.map((service) => {
+    if (service.status === 'not-connected' || service.status === 'unchecked' || !service.meters.length) {
+      const note = service.status === 'unchecked' ? 'Not checked yet' : 'Not connected';
+      return `<div class="limits-row off" role="row" data-service="${esc(service.id)}">
+        <span class="limits-service" role="rowheader">${serviceLimitNameMarkup(service)}</span>
+        <span class="limits-off" role="cell">${note}${service.connect ? ` ${policyTip(service.connect)}` : ''}</span>
+        <span class="limits-actions" role="cell">${serviceLimitActionsMarkup(service)}</span>
+      </div>`;
+    }
+    return service.meters.map((meter, index) => serviceLimitMeterMarkup(service, meter, index === 0)).join('');
+  }).join('');
+  const alerts = view.services.flatMap((service) => service.meters.filter((meter) => meter.level)).length;
+  return `<div class="limits-head"><span class="task-sub">${view.checkedAt ? `Checked ${esc(fmtAgo(view.checkedAt))}` : 'Not checked yet'}${alerts ? ` · <b>${alerts} near ${alerts === 1 ? 'its limit' : 'their limits'}</b>` : ''}
+      ${policyTip('Checked every 15 minutes. At 80% and again at 95% of a limit, installation operators get an inbox alert and an email.')}</span>
+    ${S.serviceLimitsCanManage ? '<button type="button" class="btn sm" id="service-limits-check">Check now</button>' : ''}</div>
+  <div class="limits" role="table" aria-label="Service limits">${rows}</div>`;
+}
+function serviceLimitEditorMarkup(view, service) {
+  const spec = view.services.find((entry) => entry.id === service.id);
+  const field = (label, control, tip) => `<label><span>${esc(label)}${tip ? ` ${policyTip(tip)}` : ''}</span>${control}</label>`;
+  const limits = spec.meters.map((meter) => field(meter.label,
+    `<input type="number" min="0" step="any" data-limit="${esc(meter.id)}" value="${meter.limitSource === 'entered' ? esc(meter.limit) : ''}" placeholder="${meter.limitSource && meter.limitSource !== 'entered' && meter.limit ? esc(meter.limit) : 'No limit'}">`)).join('');
+  const cloudflare = service.id.startsWith('cloudflare-') ? field('Account ID',
+    `<input data-cloudflare-account value="${esc(view.cloudflare?.accountId || '')}" placeholder="32 hexadecimal characters" spellcheck="false">`)
+    + field('API token', `<input type="password" data-cloudflare-token autocomplete="off" placeholder="${view.cloudflare?.tokenConfigured ? 'Saved — paste to replace' : 'Needs Account Analytics: Read'}">`,
+      'Stored in the vault and never shown again. Create one in Cloudflare under My Profile → API Tokens.') : '';
+  const organization = ['e2b', 'daytona', 'agentmail'].includes(service.id) ? field('Account of',
+    `<select data-operator-organization>${(S.organizations || []).map((organization) => `<option value="${esc(organization.id)}" ${organization.id === view.operatorOrganizationId ? 'selected' : ''}>${esc(organization.name)}</option>`).join('')}</select>`,
+    'The organization whose E2B, Daytona and AgentMail connections are yours.') : '';
+  return `<div class="limits-editor" data-limits-editor="${esc(service.id)}">
+    ${field('Plan', `<input data-plan maxlength="60" value="${esc(service.planSource === 'entered' ? service.plan : '')}" placeholder="${esc(service.planSource !== 'entered' && service.plan ? service.plan : 'Plan name')}">`)}
+    ${limits}${cloudflare}${organization}
+    ${field('Upgrade link', `<input type="url" data-link value="" placeholder="${esc(service.link?.url || 'https://…')}">`)}
+    <div class="limits-editor-actions"><button type="button" class="btn sm primary" data-limits-save>Save</button>
+      <button type="button" class="btn sm" data-limits-reset title="Use the published plan, limits and link">Reset</button>
+      <button type="button" class="btn sm" data-limits-cancel>Cancel</button></div>
+  </div>`;
+}
+async function wireServiceLimitsCard(view) {
+  const card = $('#service-limits-card');
+  if (!card) return;
+  if (!view) {
+    try { view = await api('/api/settings/service-limits'); }
+    catch (error) { if (card.isConnected) paneError(card, error, () => wireServiceLimitsCard()); return; }
+  }
+  if (!card.isConnected) return;
+  S.serviceLimitsCanManage = view.canManage === true;
+  card.innerHTML = serviceLimitsMarkup(view);
+  const run = async (button, request) => {
+    button.disabled = true;
+    try { await wireServiceLimitsCard(await request()); }
+    catch (error) { button.disabled = false; toast(error.message, true); }
+  };
+  card.querySelector('#service-limits-check')?.addEventListener('click', (event) =>
+    run(event.currentTarget, () => api('/api/settings/service-limits/check', { method: 'POST' })));
+  card.querySelectorAll('[data-limits-edit]').forEach((button) => button.addEventListener('click', () => {
+    card.querySelector('.limits-editor')?.remove();
+    const service = view.services.find((entry) => entry.id === button.dataset.limitsEdit);
+    const rows = card.querySelectorAll(`.limits-row[data-service="${CSS.escape(service.id)}"]`);
+    rows[rows.length - 1].insertAdjacentHTML('afterend', serviceLimitEditorMarkup(view, service));
+    const editor = card.querySelector('.limits-editor');
+    editor.querySelector('input')?.focus();
+    const save = (reset) => {
+      const limits = {};
+      editor.querySelectorAll('[data-limit]').forEach((input) => {
+        limits[input.dataset.limit] = reset || input.value.trim() === '' ? null : Number(input.value);
+      });
+      const body = { services: { [service.id]: { plan: reset ? null : editor.querySelector('[data-plan]').value.trim() || null,
+        link: reset ? null : editor.querySelector('[data-link]').value.trim() || null, limits } } };
+      const account = editor.querySelector('[data-cloudflare-account]');
+      const token = editor.querySelector('[data-cloudflare-token]')?.value.trim();
+      if (account && !reset) body.cloudflare = { accountId: account.value.trim() || null, ...(token ? { apiToken: token } : {}) };
+      const organization = editor.querySelector('[data-operator-organization]');
+      if (organization && !reset) body.operatorOrganizationId = organization.value;
+      return api('/api/settings/service-limits', { method: 'PUT', body: JSON.stringify(body) });
+    };
+    editor.querySelector('[data-limits-save]').addEventListener('click', (event) => run(event.currentTarget, () => save(false)));
+    editor.querySelector('[data-limits-reset]').addEventListener('click', (event) => run(event.currentTarget, () => save(true)));
+    editor.querySelector('[data-limits-cancel]').addEventListener('click', () => editor.remove());
+  }));
+}
+
 function installationView() {
   const phone = hostLocal()
     ? `<div class="card phone-access-card" id="phone-access-card" hidden><div id="phone-access-status"><p class="task-sub">Checking this installation…</p></div></div>`
@@ -20170,7 +20481,7 @@ function installationView() {
   </div><span class="chip">operator only</span></div>
   <div class="settings-layout">
     <nav class="settings-nav" aria-label="Installation settings sections"><span>Installation</span>
-      <a href="#installation-appearance">Appearance</a><a href="#installation-health">Health</a><a href="#installation-capacity">Host capacity</a>
+      <a href="#installation-appearance">Appearance</a><a href="#installation-health">Health</a><a href="#installation-limits">Service limits</a><a href="#installation-capacity">Host capacity</a>
       <a href="#installation-github">GitHub</a><a href="#installation-composio">Composio</a><a href="#installation-paid-launch">Paid launch</a><a href="#installation-stripe">Agent cards</a><a href="#installation-email">Email</a>
       ${S.meta.hosted ? '<a href="#installation-users">Users</a>' : ''}<a href="#installation-access">Phone Access</a>
     </nav><div class="settings-content">
@@ -20178,6 +20489,8 @@ function installationView() {
       <div class="settings-section-title" id="installation-health"><div>Health<small>Load, memory, and every process ${siteNameMarkup()} runs</small></div></div>
       <div id="host-diag"><div class="card" style="color:var(--ink-3)">Loading…</div></div>
       <div id="proc-panel" style="margin-top:12px"><div class="card" style="color:var(--ink-3)">Loading…</div></div>
+      <div class="settings-section-title" id="installation-limits"><div>Service limits<small>Shared accounts and this server against their plans</small></div></div>
+      <div class="card service-limits" id="service-limits-card"><span class="task-sub">Loading…</span></div>
       <div class="settings-section-title" id="installation-capacity"><div>Host capacity<small>Admission limits shared by all agent work</small></div></div>${hostCapacityCard()}
       <div class="card"><label title="Record response measurements and show the Timing tab. Existing measurements are retained when off."><input type="checkbox" id="timing-enabled" ${S.meta?.timingEnabled ? 'checked' : ''}> Response timing</label></div>
       <div class="settings-section-title" id="installation-github"><div>GitHub<small>GitHub App for repository access</small></div></div>${installationGithubCard()}
@@ -20408,6 +20721,7 @@ function wireInstallationSettings() {
   wireAppearanceCard();
   refreshHostDiag();
   refreshProcPanel();
+  wireServiceLimitsCard();
   wireHostCapacityCard();
   $('#timing-enabled')?.addEventListener('change', async event => {
     const control = event.currentTarget; control.disabled = true;
@@ -21378,14 +21692,14 @@ function openCursorRow() { openListRow(cursorRow()); }
 function archiveCursorRow() { cursorRow()?.querySelector('[data-archive],[data-unarchive]')?.click(); }
 // With a task page open, j/k walk the same task order the list shows — when the
 // open task is in that list; otherwise (a permalink, a task the query does not
-// match) they walk every task of the project, newest first.
+// match) they walk every task of the project in the lists' default order.
 function taskOrder() {
   const listed = S.searchScope === S.projectId ? (S.searchResult?.tasks || [])
     .filter((t) => !t.params?.draft && t.projectId === S.projectId).map((t) => t.id) : [];
   if (listed.includes(S.taskWalkTarget || S.selected)) return listed;
   return S.tasks
     .filter((t) => !t.params?.draft)
-    .slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
+    .slice().sort(byLastUpdate)
     .map((t) => t.id);
 }
 function openAdjacentTask(delta) {

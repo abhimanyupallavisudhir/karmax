@@ -1,0 +1,62 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadEc2InFrankfurt",
+      "Effect": "Allow",
+      "Action": "ec2:Describe*",
+      "Resource": "*",
+      "Condition": { "StringEquals": { "aws:RequestedRegion": "eu-central-1" } }
+    },
+    {
+      "Sid": "LaunchOnlyTaggedInstancesAndDisks",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": ["arn:aws:ec2:eu-central-1:*:instance/*", "arn:aws:ec2:eu-central-1:*:volume/*"],
+      "Condition": { "StringEquals": { "aws:RequestTag/Project": "tavya-loadtest" } }
+    },
+    {
+      "Sid": "LaunchUsingExistingImagesNetworksAndKeys",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": [
+        "arn:aws:ec2:eu-central-1::image/*",
+        "arn:aws:ec2:eu-central-1:*:subnet/*",
+        "arn:aws:ec2:eu-central-1:*:network-interface/*",
+        "arn:aws:ec2:eu-central-1:*:security-group/*",
+        "arn:aws:ec2:eu-central-1:*:key-pair/*"
+      ]
+    },
+    {
+      "Sid": "CreateOnlyTaggedGroupsAndKeys",
+      "Effect": "Allow",
+      "Action": ["ec2:CreateSecurityGroup", "ec2:ImportKeyPair"],
+      "Resource": ["arn:aws:ec2:eu-central-1:*:security-group/*", "arn:aws:ec2:eu-central-1:*:key-pair/*"],
+      "Condition": { "StringEquals": { "aws:RequestTag/Project": "tavya-loadtest" } }
+    },
+    {
+      "Sid": "CreateGroupsInAnyVpc",
+      "Effect": "Allow",
+      "Action": "ec2:CreateSecurityGroup",
+      "Resource": "arn:aws:ec2:eu-central-1:*:vpc/*"
+    },
+    {
+      "Sid": "TagOnlyWhileCreating",
+      "Effect": "Allow",
+      "Action": "ec2:CreateTags",
+      "Resource": "arn:aws:ec2:eu-central-1:*:*/*",
+      "Condition": { "StringEquals": { "ec2:CreateAction": ["RunInstances", "CreateSecurityGroup", "ImportKeyPair"] } }
+    },
+    {
+      "Sid": "ChangeOrDeleteOnlyItsOwnResources",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:TerminateInstances", "ec2:StopInstances", "ec2:DeleteVolume",
+        "ec2:DeleteSecurityGroup", "ec2:AuthorizeSecurityGroupIngress", "ec2:RevokeSecurityGroupIngress",
+        "ec2:DeleteKeyPair"
+      ],
+      "Resource": "arn:aws:ec2:eu-central-1:*:*/*",
+      "Condition": { "StringEquals": { "aws:ResourceTag/Project": "tavya-loadtest" } }
+    }
+  ]
+}

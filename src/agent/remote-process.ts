@@ -1190,7 +1190,7 @@ function configFiles(root: string): Array<{ relative: string; content: Buffer }>
       // real E2B filesystem request time out. Durable config, skills, rules,
       // commands, hooks, and plugin manifests continue through this walk; the one
       // requested session is materialized separately below.
-      if (top === KARMAX_TOKEN_FILE || /^karmax-work-.*\.config\.toml$/.test(top) || top.startsWith('.karmax-history') || ['projects', 'sessions', 'archived_sessions', 'logs', 'log', 'debug', 'tmp', '.tmp', 'cache', 'telemetry', 'shell_snapshots'].includes(top)
+      if (top === KARMAX_TOKEN_FILE || /^karmax-work-.*\.config\.toml$/.test(top) || top.startsWith('.karmax-history') || top.startsWith('.karmax-login') || ['projects', 'sessions', 'archived_sessions', 'logs', 'log', 'debug', 'tmp', '.tmp', 'cache', 'telemetry', 'shell_snapshots'].includes(top)
         || segments.some((segment) => ['cache', '.remote-plugin-install-staging'].includes(segment))
         || /^(?:logs?|state|goals|memories)(?:[_-].*)?\.sqlite(?:-(?:wal|shm))?$/.test(entry.name.toLowerCase())
         || ['history.jsonl', 'models_cache.json'].includes(entry.name.toLowerCase())) continue;

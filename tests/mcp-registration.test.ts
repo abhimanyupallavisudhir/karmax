@@ -52,7 +52,7 @@ describe('MCP client registration interoperability', () => {
       expect(url.searchParams.get('client_id')).toBe(manual ? 'registered-client' : mode === 'cimd' ? 'https://tavya.example/api/mcp-client-metadata' : 'dynamic-client');
       expect(url.searchParams.get('code_challenge_method')).toBe('S256');
       await finishOAuth(f.service, c, 'user:alice', url.searchParams.get('state')!, 'code');
-      (await f.service.setSecret(c, { ...f.service.secret(c), expiresAt: 0 }));
+      (await f.service.setSecret(c, { ...(await f.service.secret(c)), expiresAt: 0 }));
       expect(await connectionHeaders(f.service, c)).toEqual({ Authorization: 'Bearer access' });
       expect(calls.filter(r => r.url.endsWith('/register'))).toHaveLength(mode === 'dcr' ? 1 : 0);
       expect(JSON.stringify((await f.service.list()))).not.toContain('private-client-secret');
@@ -63,17 +63,17 @@ describe('MCP client registration interoperability', () => {
     const f = (await fixture());
     try {
       let c = (await f.service.save({ ...f.input, oauthClient: { clientId: 'id', clientSecret: 'secret', tokenEndpointAuthMethod: 'client_secret_basic' } }));
-      (await f.service.setSecret(c, { ...f.service.secret(c), tokens: { access_token: 'old' } }));
+      (await f.service.setSecret(c, { ...(await f.service.secret(c)), tokens: { access_token: 'old' } }));
       c = (await f.service.save({ ...c, label: 'Renamed' }));
-      expect(f.service.secret(c).tokens.access_token).toBe('old');
+      expect((await f.service.secret(c)).tokens.access_token).toBe('old');
       c = (await f.service.save({ ...c, oauthClient: { clientId: 'id', tokenEndpointAuthMethod: 'client_secret_basic' } }));
-      expect(f.service.secret(c).manualClient.client_secret).toBe('secret');
-      expect(f.service.secret(c).tokens.access_token).toBe('old');
+      expect((await f.service.secret(c)).manualClient.client_secret).toBe('secret');
+      expect((await f.service.secret(c)).tokens.access_token).toBe('old');
       c = (await f.service.save({ ...c, oauthClient: { clientId: 'id', clientSecret: 'replacement', tokenEndpointAuthMethod: 'client_secret_basic' } }));
-      expect(f.service.secret(c).tokens).toBeUndefined();
+      expect((await f.service.secret(c)).tokens).toBeUndefined();
       await expect(f.service.save({ ...c, transport: { type: 'http', url: 'https://other.example/mcp' } })).rejects.toThrow(/secret/);
       c = (await f.service.save({ ...c, oauthClient: null }));
-      expect(f.service.secret(c)).toEqual({});
+      expect((await f.service.secret(c))).toEqual({});
       expect(c.oauthClient).toBeUndefined();
     } finally { (await f.close()); }
   });

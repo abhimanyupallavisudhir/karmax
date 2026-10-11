@@ -63,18 +63,13 @@
 {$KARMAX_DOMAIN} {
 	import karmax_security
 	# Project resources are restic repositories that task sandboxes save to and
-	# restore from: a save is hundreds of requests a minute, and sandboxes may
-	# share an address, so they have their own budget, not the console's. Every
-	# request carries a signed grant for one repository, and the app enforces
-	# storage quotas.
+	# restore from, through a Cloudflare Worker: every customer's sandboxes
+	# arrive from the same few Cloudflare addresses, so no budget here can be
+	# per address. Every request must carry a signed grant for one repository,
+	# and the app gives each grant its own budget once it has checked the
+	# signature (GrantLimits in src/world/resource-repository.ts), which no
+	# header can imitate.
 	handle /resource-repositories/* {
-		rate_limit {
-			zone repositories {
-				key {http.request.remote.host}
-				events 30000
-				window 1m
-			}
-		}
 		reverse_proxy 127.0.0.1:4505 {
 			header_up X-Forwarded-For {http.request.remote.host}
 		}

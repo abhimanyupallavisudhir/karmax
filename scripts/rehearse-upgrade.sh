@@ -331,6 +331,17 @@ observe '   Edge on FROM: each client keeps its address' edge-from-addresses.log
 # ---------------------------------------------------------------- b. seed
 step 'b. Seed through the FROM API' seed.log client seed || abort
 step '   Verify the seed on FROM (baseline)' verify-from.log client verify --phase from || abort
+# A model login is a CLI's credential file in a config home, which no API
+# writes; seed one on the volume as `claude auth login` would. Its access
+# token never expires, so nothing tries to refresh it.
+LOGIN_HOME=/var/lib/karmax/config-homes/claude-rehearsal
+LOGIN_CREDENTIAL='{"claudeAiOauth":{"accessToken":"rehearsal-access","refreshToken":"rehearsal-refresh","expiresAt":4102444800000,"refreshTokenExpiresAt":4102444800000,"scopes":["user:inference"]}}'
+seed_login() {
+  local id; id=$(app_container); [ -n "$id" ] || { echo 'rehearse: no running app container'; return 1; }
+  printf '%s' "$LOGIN_CREDENTIAL" | docker exec -i "$id" sh -c "umask 077 && mkdir -p $LOGIN_HOME && cat > $LOGIN_HOME/.credentials.json" || return 1
+  echo "Seeded $LOGIN_HOME/.credentials.json"
+}
+step '   Seed a Claude login on the FROM volume' seed-login.log seed_login || abort
 
 # ---------------------------------------------------------------- c. backup
 BACKUP=$WORK/backup
@@ -416,6 +427,40 @@ background_jobs() {
   fi
   echo "No background job failed in app container ${id:0:12}."
 }
+# From data epoch 5 the vault is rows of PostgreSQL: the volume keeps only the
+# marker the previous release refuses and the retired copy of the files, and
+# vault-key reads the keyrings from the database.
+vault_in_database() {
+  local id status entries; id=$(app_container)
+  docker exec "$id" grep -q karmax-vault-moved-to-database /var/lib/karmax/vault/secrets.json \
+    || { echo 'rehearse: vault/secrets.json is not the moved-to-database marker'; return 1; }
+  # From data epoch 6 `entries` is a file: the note that stops an epoch 5 release.
+  entries=$(docker exec "$id" sh -c 'if [ -f /var/lib/karmax/vault/entries ]; then echo sealed; else ls -A /var/lib/karmax/vault/entries; fi')
+  [ "$entries" = .migrated ] || [ "$entries" = sealed ] \
+    || { echo 'rehearse: vault/entries/ still holds secrets'; return 1; }
+  echo "vault/entries: $entries"
+  echo "Retired copy: $(docker exec "$id" sh -c 'ls /var/lib/karmax/vault/retired-epoch5/entries | grep -c json') entry files"
+  status=$(docker exec "$id" npm run --silent vault-key -- status) || { echo "$status"; return 1; }
+  echo "$status"
+  echo "$status" | grep -Eq '^[1-9][0-9]* keyrings' || { echo 'rehearse: the database vault holds no keyrings'; return 1; }
+}
+moves_vault() { [ "$(git -C "$WORK/origin.git" show "$DEPLOY_SHA:deploy/data-epoch" 2>/dev/null || echo 1)" -ge 5 ]; }
+# From data epoch 6 model logins are vault entries and config homes cache
+# them: the seeded login is in the vault, its cache is byte for byte the
+# credential seeded on FROM, and the import kept the file it found.
+login_in_vault() {
+  local id status; id=$(app_container)
+  status=$(docker exec "$id" npm run --silent model-logins -- status 2>/dev/null) || { echo "$status"; return 1; }
+  echo "$status"
+  echo "$status" | grep -q '^model-login:org_personal:claude:rehearsal cache in sync' \
+    || { echo 'rehearse: the seeded login is not in the vault, or its cache differs from it'; return 1; }
+  [ "$(docker exec "$id" cat "$LOGIN_HOME/.credentials.json")" = "$LOGIN_CREDENTIAL" ] \
+    || { echo 'rehearse: the cached credential is not the one seeded on FROM'; return 1; }
+  docker exec "$id" cmp -s "$LOGIN_HOME/.credentials.json" /var/lib/karmax/retired-epoch6/config-homes/claude-rehearsal/.credentials.json \
+    || { echo 'rehearse: the import did not keep the seeded credential file'; return 1; }
+  echo 'The seeded login is in the vault; the cache and the retired copy are the seeded credential.'
+}
+moves_logins() { [ "$(git -C "$WORK/origin.git" show "$DEPLOY_SHA:deploy/data-epoch" 2>/dev/null || echo 1)" -ge 6 ]; }
 if [ "$updated" -eq 0 ]; then
   record FAIL 'e. skipped: the update did not complete, so there is no TO to verify'
 elif [ -z "$(app_container)" ]; then
@@ -424,6 +469,8 @@ else
   step 'e. Verify every record through the TO API' verify-to.log client verify --phase upgraded --resume || true
   step '   doctor: the app connects as its own role' doctor.log doctor_role || true
   step "   The app's background jobs run cleanly" jobs-to.log background_jobs || true
+  ! moves_vault || step '   The vault moved into PostgreSQL (data epoch 5)' vault-to.log vault_in_database || true
+  ! moves_logins || step '   The seeded login moved into the vault (data epoch 6)' login-to.log login_in_vault || true
   judge_edge 'e. Edge: HTTPS through Caddy reaches the app' edge-to-reach.log edge_probe reach to
   if promises_client_addresses; then
     judge_edge 'e. Edge: each client keeps its address' edge-to-addresses.log edge_probe addresses to
@@ -469,6 +516,8 @@ if step 'f. Install a fresh TO stack (deploy/karmax up)' up-fresh.log ./deploy/k
   step 'f. Verify every record after the restore' verify-restore.log client verify --phase restored --resume || true
   step '   doctor after the restore' doctor-restore.log doctor_role || true
   step "   The restored app's background jobs run cleanly" jobs-restore.log background_jobs || true
+  ! moves_vault || step '   The restored vault moved into PostgreSQL again' vault-restore.log vault_in_database || true
+  ! moves_logins || step '   The restored login moved into the vault again' login-restore.log login_in_vault || true
 fi
 
 summary

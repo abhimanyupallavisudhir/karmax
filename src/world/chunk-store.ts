@@ -17,11 +17,11 @@ export function organizationKeyHandle(organizationId: string): string { return `
 
 export async function organizationKey(broker: CredentialBroker, organizationId: string, create = true): Promise<Buffer> {
   const handle = organizationKeyHandle(organizationId);
-  if (!broker.hasHandle(handle)) {
+  if (!await broker.hasHandle(handle)) {
     if (!create) throw new Error('resource key unavailable');
     await broker.ensureHandle(handle, crypto.randomBytes(32).toString('base64'), organizationScope(organizationId));
   }
-  return Buffer.from(broker.resolve(handle, { caps: [`use-credential:${handle}`] }), 'base64');
+  return Buffer.from(await broker.resolve(handle, { caps: [`use-credential:${handle}`] }), 'base64');
 }
 
 export function chunkObjectKey(organizationId: string, chunkId: string): string {

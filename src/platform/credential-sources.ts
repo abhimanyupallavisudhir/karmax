@@ -14,11 +14,11 @@ import path from 'node:path';
  * lives outside the pure credentials module; used by both the gateway (listing) and
  * the core activity (resolution).
  */
-export function gatherCredentialSources(deps: {
+export async function gatherCredentialSources(deps: {
   configHomes?: ConfigHomeManager;
   broker?: CredentialBroker;
   organizationId?: string;
-}): CredentialSources {
+}): Promise<CredentialSources> {
   const organizationId = deps.organizationId ?? 'org_personal';
   // The operator's own machine credentials — the `claude login` in karmax's config
   // home, the API keys in its environment. `org_personal` is bootstrapped into every
@@ -54,7 +54,7 @@ export function gatherCredentialSources(deps: {
           .map((provider) => [provider, hostCredentials && !!process.env[apiKeyEnv(provider)]]),
       ),
     },
-    handles: agentAccountHandles(deps.broker?.listHandles() ?? [], organizationId),
+    handles: agentAccountHandles(await deps.broker?.listHandles() ?? [], organizationId),
   };
 }
 

@@ -42,7 +42,7 @@ describe('GitHub App integration', () => {
       appSettingsUrl: 'https://github.com/organizations/acme/settings/apps/krmax-hosted/permissions',
     });
     expect((await store.kvGet('github-app:slug'))).toBe('krmax-hosted');
-    expect(service.installationUrl('state')).toContain('/apps/krmax-hosted/installations/new');
+    expect(await service.installationUrl('state')).toContain('/apps/krmax-hosted/installations/new');
     await expect(service.workflowPermissionGuidance(repository)).resolves.toMatch(/installation operator must grant/i);
     appPermissions.workflows = 'write';
     await expect(service.workflowPermissionGuidance(repository)).resolves.toMatch(/has not approved/i);
@@ -119,7 +119,7 @@ describe('GitHub App integration', () => {
       return new Response('not found', { status: 404 });
     };
     const service = (await GitHubAppService.create(store, broker, { clientId: 'Iv1.client', fetch: fakeFetch as typeof fetch }));
-    const picker = new URL(service.userAuthorizationUrl('state', 'https://karmax.example', { selectAccount: true }));
+    const picker = new URL(await service.userAuthorizationUrl('state', 'https://karmax.example', { selectAccount: true }));
     expect(picker.searchParams.get('prompt')).toBe('select_account');
     await service.authorizeUser('owner', 'first', undefined, { makeActive: true });
     await service.authorizeUser('owner', 'second', undefined, { makeActive: true });
@@ -183,13 +183,13 @@ describe('GitHub App integration', () => {
     expect(manifest.manifest).toHaveProperty('default_permissions.security_events', 'read');
     expect(manifest.manifest).not.toHaveProperty('redirect_on_update');
     await service.convertManifest('setup-code');
-    expect(service.oauthCredentials()).toEqual({ clientId: 'Iv1.client', clientSecret: 'client-secret' });
+    expect(await service.oauthCredentials()).toEqual({ clientId: 'Iv1.client', clientSecret: 'client-secret' });
     expect((await service.status('owner'))).toMatchObject({ configured: true, appSlug: 'karmax-acme', oauthConfigured: true,
       webhookConfigured: true, userAuthorized: false });
     expect(JSON.stringify((await service.status('owner')))).not.toContain('secret');
 
     const connected = await service.connectInstallation(organization.id, '42');
-    const authorize = new URL(service.userAuthorizationUrl('oauth-state', 'https://karmax.example'));
+    const authorize = new URL(await service.userAuthorizationUrl('oauth-state', 'https://karmax.example'));
     expect(authorize.searchParams.get('client_id')).toBe('Iv1.client');
     await expect(service.authorizeUser('owner', 'oauth-code', 'https://karmax.example')).resolves.toEqual({
       id: '42', login: 'octocat', name: 'The Octocat',
@@ -354,7 +354,7 @@ describe('GitHub App integration', () => {
     expect(repository).toMatchObject({ providerId: '77', name: 'project-wiki', private: true });
     expect(refreshes).toBe(1);
     // The refreshed access + refresh tokens are persisted so the next call reuses them.
-    const stored = JSON.parse(broker.resolve(handle, { caps: [`use-credential:${handle}`] }));
+    const stored = JSON.parse(await broker.resolve(handle, { caps: [`use-credential:${handle}`] }));
     expect(stored).toMatchObject({ accessToken: 'fresh-token', refreshToken: 'refresh-2' });
     (await store.close());
     fs.rmSync(dir, { recursive: true, force: true });
@@ -430,9 +430,42 @@ describe('GitHub App integration', () => {
       service.userAccessToken('owner'),
     ])).resolves.toEqual(['fresh-token', 'fresh-token', 'fresh-token']);
     expect(refreshes).toBe(1);
-    expect(JSON.parse(broker.resolve(handle, { caps: [`use-credential:${handle}`] })))
+    expect(JSON.parse(await broker.resolve(handle, { caps: [`use-credential:${handle}`] })))
       .toMatchObject({ accessToken: 'fresh-token', refreshToken: 'refresh-2' });
     expect((await store.auditSince()).filter((entry) => entry.action === 'github.user-authorization.refreshed')).toHaveLength(1);
+    (await store.close()); fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('refreshes once across processes, and the waiting process takes the new token', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-refresh-lease-'));
+    const store = (await Store.create(':memory:'));
+    const broker = new CredentialBroker(new Vault(dir));
+    (await broker.registerHandle(GITHUB_APP_CLIENT_SECRET_HANDLE, 'client-secret', INSTALLATION_SCOPE));
+    const handle = 'github-app:user:owner:authorization';
+    (await broker.registerHandle(handle, JSON.stringify({ accessToken: 'expired-token', expiresAt: Date.now() - 1,
+      refreshToken: 'refresh-1', refreshExpiresAt: Date.now() + 180 * 86_400_000 }), userScope('owner')));
+    // GitHub's refresh tokens are single-use.
+    let live = 'refresh-1';
+    const spent: string[] = [];
+    const fakeFetch = async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/login/oauth/access_token') {
+        const token = new URLSearchParams(String(init?.body ?? '')).get('refresh_token') ?? JSON.parse(String(init?.body ?? '{}')).refresh_token;
+        spent.push(token);
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        if (token !== live) return Response.json({ error: 'bad_refresh_token' });
+        live = 'refresh-2';
+        return Response.json({ access_token: 'fresh-token', expires_in: 28_800, refresh_token: live, refresh_token_expires_in: 15_552_000 });
+      }
+      return new Response('not found', { status: 404 });
+    };
+    // Two processes: their own services (and in-process single-flight maps) on one database and vault.
+    const first = (await GitHubAppService.create(store, broker, { clientId: 'Iv1.client', fetch: fakeFetch as typeof fetch }));
+    const second = (await GitHubAppService.create(store, broker, { clientId: 'Iv1.client', fetch: fakeFetch as typeof fetch }));
+    await expect(Promise.all([first.userAccessToken('owner'), second.userAccessToken('owner')])).resolves.toEqual(['fresh-token', 'fresh-token']);
+    expect(spent).toEqual(['refresh-1']);
+    expect(JSON.parse(await broker.resolve(handle, { caps: [`use-credential:${handle}`] }))).toMatchObject({ refreshToken: 'refresh-2' });
+    expect((await first.status('owner')).lastAuthorizationFailure).toBeUndefined();
     (await store.close()); fs.rmSync(dir, { recursive: true, force: true });
   });
 
@@ -458,7 +491,7 @@ describe('GitHub App integration', () => {
     const service = (await GitHubAppService.create(store, broker, { clientId: 'Iv1.client', fetch: fakeFetch as typeof fetch }));
 
     await expect(service.userAccessToken('owner')).resolves.toBe('other-instance-token');
-    expect(broker.resolve(handle, { caps: [`use-credential:${handle}`] })).toBe(replacement);
+    expect(await broker.resolve(handle, { caps: [`use-credential:${handle}`] })).toBe(replacement);
     expect((await service.status('owner'))).toMatchObject({ userAuthorized: true });
     expect((await service.status('owner')).lastAuthorizationFailure).toBeUndefined();
     expect((await store.auditSince()).at(-1)).toMatchObject({
@@ -517,7 +550,7 @@ describe('GitHub App integration', () => {
     const service = (await GitHubAppService.create(store, broker, { appId: '123', appSlug: 'karmax-test',
       fetch: fakeFetch as typeof fetch }));
 
-    const install = new URL(service.installationUrl('one-time-state'));
+    const install = new URL(await service.installationUrl('one-time-state'));
     expect(install.pathname).toBe('/apps/karmax-test/installations/new');
     expect(install.searchParams.get('state')).toBe('one-time-state');
 
@@ -571,6 +604,80 @@ describe('GitHub App integration', () => {
     await service.reconcile(connected.connection);
     expect((await store.getRepository(repository.id))).toBeUndefined();
     expect(calls.filter((call) => call.method === 'DELETE')).toHaveLength(0);
+    (await store.close());
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('records the repository a fork was made from and syncs the fork through the installation', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-fork-'));
+    const store = (await Store.create(':memory:'));
+    const broker = new CredentialBroker(new Vault(dir));
+    const { privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048,
+      privateKeyEncoding: { format: 'pem', type: 'pkcs8' }, publicKeyEncoding: { format: 'pem', type: 'spki' } });
+    (await broker.registerHandle(GITHUB_APP_PRIVATE_KEY_HANDLE, privateKey, INSTALLATION_SCOPE));
+    const organization = (await store.createOrganization({ name: 'Jane', ownerUserId: 'jane' }));
+    const calls: Array<{ path: string; method: string; body?: any; auth?: string }> = [];
+    let syncStatus = 200;
+    const fakeFetch = async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      const body = typeof init.body === 'string' ? JSON.parse(init.body) : undefined;
+      calls.push({ path: url.pathname, method: init.method ?? 'GET', body, auth: new Headers(init.headers).get('authorization') ?? undefined });
+      if (url.pathname === '/app/installations/42') return Response.json({ id: 42, account: { login: 'jane', type: 'User' } });
+      if (url.pathname === '/app/installations/42/access_tokens') return Response.json({ token: 'installation-token', expires_at: new Date(Date.now() + 3600_000).toISOString() });
+      if (url.pathname === '/installation/repositories') return Response.json({ repositories: [
+        { id: 7, name: 'widgets', private: false, fork: true, ssh_url: 'git@github.com:jane/widgets.git', default_branch: 'main', owner: { login: 'jane' } },
+        { id: 8, name: 'own', private: true, ssh_url: 'git@github.com:jane/own.git', default_branch: 'main', owner: { login: 'jane' } },
+      ] });
+      if (url.pathname === '/repos/jane/widgets') return Response.json({ id: 7, name: 'widgets', fork: true,
+        parent: { id: 1, name: 'widgets', private: false, ssh_url: 'git@github.com:acme/widgets.git', default_branch: 'trunk', owner: { login: 'acme' } } });
+      if (url.pathname === '/repos/jane/widgets/merge-upstream') return syncStatus === 200
+        ? Response.json({ message: 'Successfully fetched and fast-forwarded from upstream acme:trunk.', merge_type: 'fast-forward', base_branch: 'acme:trunk' })
+        : Response.json({ message: 'There are merge conflicts' }, { status: syncStatus });
+      return new Response('not found', { status: 404 });
+    };
+    const service = (await GitHubAppService.create(store, broker, { appId: '123', appSlug: 'karmax-test', fetch: fakeFetch as typeof fetch }));
+    const connected = await service.connectInstallation(organization.id, '42');
+    const fork = connected.repositories.find((repository) => repository.name === 'widgets')!;
+    const own = connected.repositories.find((repository) => repository.name === 'own')!;
+    expect(fork.upstream).toEqual({ owner: 'acme', name: 'widgets', defaultBranch: 'trunk', private: false });
+    expect(own.upstream).toBeUndefined();
+    expect((await store.getRepository(fork.id))?.upstream).toEqual(fork.upstream);
+    // The parent is read once; later reconciles reuse it.
+    await service.reconcile(connected.connection);
+    expect(calls.filter((call) => call.path === '/repos/jane/widgets')).toHaveLength(1);
+
+    await expect(service.syncFork(fork, 'trunk')).resolves.toMatchObject({ synced: true });
+    const sync = calls.find((call) => call.path === '/repos/jane/widgets/merge-upstream')!;
+    expect(sync).toMatchObject({ method: 'POST', body: { branch: 'trunk' }, auth: 'Bearer installation-token' });
+    syncStatus = 409;
+    await expect(service.syncFork(fork, 'trunk')).resolves.toMatchObject({ synced: false, detail: expect.stringMatching(/409/) });
+    await expect(service.syncFork(own, 'main')).resolves.toMatchObject({ synced: false });
+    (await store.close());
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('accepts a personal token only for the same account, as a classic token that can contribute to forks', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-github-personal-token-'));
+    const store = (await Store.create(':memory:'));
+    const broker = new CredentialBroker(new Vault(dir));
+    const users: Record<string, { id: number; login: string; scopes?: string }> = {
+      'ghp_jane': { id: 7, login: 'jane', scopes: 'public_repo, read:org' },
+      'ghp_repo': { id: 7, login: 'jane', scopes: 'repo' },
+      'ghp_other': { id: 8, login: 'mallory', scopes: 'repo' },
+      'github_pat_fine': { id: 7, login: 'jane' },
+    };
+    const fakeFetch = async (input: string | URL | Request, init: RequestInit = {}) => {
+      const token = (new Headers(init.headers).get('authorization') ?? '').replace('Bearer ', '');
+      const user = users[token];
+      if (new URL(String(input)).pathname !== '/user' || !user) return new Response('Bad credentials', { status: 401 });
+      return Response.json({ id: user.id, login: user.login }, { headers: user.scopes ? { 'x-oauth-scopes': user.scopes } : {} });
+    };
+    const service = (await GitHubAppService.create(store, broker, { appId: '123', appSlug: 'karmax-test', fetch: fakeFetch as typeof fetch }));
+    await expect(service.verifyPersonalToken('7', 'ghp_jane')).resolves.toBeUndefined();
+    await expect(service.verifyPersonalToken('7', 'ghp_repo')).resolves.toBeUndefined();
+    await expect(service.verifyPersonalToken('7', 'ghp_other')).rejects.toThrow(/belongs to mallory/);
+    await expect(service.verifyPersonalToken('7', 'github_pat_fine')).rejects.toThrow(/classic token/);
+    await expect(service.verifyPersonalToken('7', 'nope')).rejects.toThrow(/401/);
     (await store.close());
     fs.rmSync(dir, { recursive: true, force: true });
   });
@@ -765,8 +872,8 @@ describe('GitHub App integration', () => {
     await expect(service.connectInstallation(organization.id, '9')).resolves.toBeTruthy();
     expect(deleted).toEqual(['/repos/acme/app/keys/201', '/repos/acme/app/keys/202']);
     expect((await store.repositoryDeployKeys(repository.id))).toBeUndefined();
-    expect(broker.hasHandle(cloneHandle)).toBe(false);
-    expect(broker.hasHandle(writeHandle)).toBe(false);
+    expect(await broker.hasHandle(cloneHandle)).toBe(false);
+    expect(await broker.hasHandle(writeHandle)).toBe(false);
     (await store.close());
     fs.rmSync(dir, { recursive: true, force: true });
   });
@@ -878,8 +985,8 @@ describe('GitHub App failure and suspension handling', () => {
     // installationToken() refuses to mint for a suspended installation, so minting
     // unconditionally made every retry of the org delete fail identically.
     await expect(h.service.disconnectOrganization(h.organization.id)).resolves.toBeUndefined();
-    expect(h.broker.hasHandle(`repokey:${repository.id}:clone`)).toBe(false);
-    expect(h.broker.hasHandle(`repokey:${repository.id}:write`)).toBe(false);
+    expect(await h.broker.hasHandle(`repokey:${repository.id}:clone`)).toBe(false);
+    expect(await h.broker.hasHandle(`repokey:${repository.id}:write`)).toBe(false);
     (await h.store.close()); fs.rmSync(h.dir, { recursive: true, force: true });
   });
 

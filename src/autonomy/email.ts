@@ -163,31 +163,36 @@ export function connectOutboundEmail(input: ConnectOutboundInput): ConnectOutbou
  * Sends installation-wide user email. Reads the live config and secret on each
  * send so a provider swap in Settings takes effect immediately.
  */
+export interface EmailSent { provider: 'resend' | 'smtp'; dailyQuota?: number; monthlyQuota?: number }
+
 export class EmailService {
   constructor(
     private readConfig: () => OutboundEmailConfig | Promise<OutboundEmailConfig>,
-    private readSecret: (handle: string) => string | undefined,
+    private readSecret: (handle: string) => string | undefined | Promise<string | undefined>,
+    /** Each accepted message, with the plan quota Resend reports when it does
+     * (the operator's service-limits page counts sends from this). */
+    private onSent?: (sent: EmailSent) => unknown,
   ) {}
 
   /** True when a provider is fully connected (config + resolvable secret). */
   async configured(): Promise<boolean> {
     const c = (await this.readConfig());
     if (!c.from || !fromAddress(c.from)) return false;
-    if (c.provider === 'smtp') return !!(c.host && c.secretHandle && this.readSecret(c.secretHandle));
-    if (c.provider === 'resend') return !!(c.secretHandle && this.readSecret(c.secretHandle));
+    if (c.provider === 'smtp') return !!(c.host && c.secretHandle && await this.readSecret(c.secretHandle));
+    if (c.provider === 'resend') return !!(c.secretHandle && await this.readSecret(c.secretHandle));
     return false;
   }
 
   async send(msg: EmailMessage): Promise<void> {
     const c = (await this.readConfig());
     if (!(await this.configured())) throw new Error('outbound email is not configured');
-    const secret = c.secretHandle ? this.readSecret(c.secretHandle) : undefined;
+    const secret = c.secretHandle ? await this.readSecret(c.secretHandle) : undefined;
     if (!secret) throw new Error('outbound email secret is missing');
-    if (c.provider === 'resend') return this.sendResend(c, secret, msg);
-    return this.sendSmtp(c, secret, msg);
+    const sent: EmailSent = c.provider === 'resend' ? (await this.sendResend(c, secret, msg)) : (await this.sendSmtp(c, secret, msg));
+    try { await this.onSent?.(sent); } catch { /* counting must never fail a sent message */ }
   }
 
-  private async sendResend(c: OutboundEmailConfig, apiKey: string, msg: EmailMessage): Promise<void> {
+  private async sendResend(c: OutboundEmailConfig, apiKey: string, msg: EmailMessage): Promise<EmailSent> {
     const res = await fetch('https://api.resend.com/emails', {
       method: 'POST',
       headers: { authorization: `Bearer ${apiKey}`, 'content-type': 'application/json' },
@@ -197,12 +202,19 @@ export class EmailService {
       const detail = await res.text().catch(() => '');
       throw new Error(`Resend rejected the message (${res.status})${detail ? `: ${detail.slice(0, 200)}` : ''}`);
     }
+    // Resend reports the plan quota already used (the daily one on Free only).
+    const quota = (name: string) => {
+      const value = Number(res.headers.get(name) ?? Number.NaN);
+      return Number.isFinite(value) && value >= 0 ? value : undefined;
+    };
+    return { provider: 'resend', dailyQuota: quota('x-resend-daily-quota'), monthlyQuota: quota('x-resend-monthly-quota') };
   }
 
-  private async sendSmtp(c: OutboundEmailConfig, password: string, msg: EmailMessage): Promise<void> {
+  private async sendSmtp(c: OutboundEmailConfig, password: string, msg: EmailMessage): Promise<EmailSent> {
     // Imported lazily so installs that never send email don't load nodemailer.
     const nodemailer = (await import('nodemailer')).default;
     const transport = nodemailer.createTransport(smtpTransportOptions(c, password));
     await transport.sendMail({ from: c.from, to: msg.to, subject: msg.subject, text: msg.text, ...(msg.html ? { html: msg.html } : {}) });
+    return { provider: 'smtp' };
   }
 }

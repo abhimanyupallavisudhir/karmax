@@ -34,6 +34,14 @@ describe.each(storeBackends)('authorization readers ($name)', ({ open }) => {
       for (const projectId of [undefined, project.id, other.id])
         expect(await auth.capabilitiesAsync(`user:${principal}`, projectId)).toEqual((await auth.capabilities(`user:${principal}`, projectId)));
     }
+    // One round trip per decision (2026-10 load test): sockets re-decide through a 4-connection pool.
+    const reads = vi.spyOn(store.db, 'prepare');
+    for (const principal of ['member', 'team', 'all', 'maintainer']) {
+      reads.mockClear();
+      await auth.capabilitiesAsync(`user:${principal}`, project.id);
+      expect(reads).toHaveBeenCalledTimes(1);
+    }
+    reads.mockRestore();
     expect(allows(await auth.capabilitiesAsync('user:root', project.id), 'workflow:install')).toBe(true);
     expect(allows(await auth.capabilitiesAsync('user:admin', project.id), 'workflow:install')).toBe(false);
     expect(allows(await auth.capabilitiesAsync('user:maintainer', project.id), 'organization:delete')).toBe(false);

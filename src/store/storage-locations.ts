@@ -44,7 +44,7 @@ export class StorageLocationService {
     return (await __asyncCollections.map((await this.store.listStorageLocations(organizationId)), async ({ credentialHandle, ...location }) => {
       const usage = (await this.store.storageLocationUsage(location.id));
       return { ...location, quotaBytes: usage.quotaBytes,
-        credentialConfigured: Boolean(credentialHandle && this.broker.hasHandle(credentialHandle)), usage };
+        credentialConfigured: Boolean(credentialHandle && await this.broker.hasHandle(credentialHandle)), usage };
     }));
   }
 
@@ -53,7 +53,7 @@ export class StorageLocationService {
     const { credentialHandle, ...location } = (await this.ownedLocation(organizationId, id));
     const usage = (await this.store.storageLocationUsage(id));
     return { ...location, quotaBytes: usage.quotaBytes,
-      credentialConfigured: Boolean(credentialHandle && this.broker.hasHandle(credentialHandle)), usage };
+      credentialConfigured: Boolean(credentialHandle && await this.broker.hasHandle(credentialHandle)), usage };
   }
 
   async defaultLocation(organizationId: string): Promise<StorageLocation> {
@@ -89,7 +89,7 @@ export class StorageLocationService {
       if (!input.accessKeyId || !input.secretAccessKey) throw new Error('both S3 access key fields are required');
       (await this.broker.registerHandle(handle, JSON.stringify({ accessKeyId: input.accessKeyId,
         secretAccessKey: input.secretAccessKey, sessionToken: input.sessionToken }), organizationScope(organizationId)));
-    } else if (!this.broker.hasHandle(handle)) throw new Error('S3 access key is required');
+    } else if (!await this.broker.hasHandle(handle)) throw new Error('S3 access key is required');
     const value = (await this.store.saveStorageLocation({ id, organizationId, name: input.name.trim() || 'Customer S3', kind: 's3',
       config: { endpoint, bucket, region: input.region?.trim() || 'us-east-1', prefix }, credentialHandle: handle,
       // A customer bucket cannot become a data-plane default until the explicit
@@ -150,7 +150,7 @@ export class StorageLocationService {
     const cached = this.stores.get(id);
     if (cached) return cached;
     if (!location.credentialHandle) throw new Error('customer storage credential is missing');
-    const secret = JSON.parse(this.broker.resolve(location.credentialHandle, { caps: [`use-credential:${location.credentialHandle}`] }));
+    const secret = JSON.parse(await this.broker.resolve(location.credentialHandle, { caps: [`use-credential:${location.credentialHandle}`] }));
     const objects = new PrefixedObjectStore(new S3ObjectStore({ endpoint: location.config.endpoint!, bucket: location.config.bucket!,
       region: location.config.region ?? 'us-east-1', accessKeyId: String(secret.accessKeyId),
       secretAccessKey: String(secret.secretAccessKey), sessionToken: secret.sessionToken ? String(secret.sessionToken) : undefined }),

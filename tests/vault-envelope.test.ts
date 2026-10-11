@@ -76,8 +76,8 @@ describe('entries under scope data keys', () => {
     expect(keyring.scope).toBe(A);
     const kid = entry.blob.split('.')[1];
     expect(Object.keys(keyring.keys[kid].wraps)).toEqual([kekId(KEY_A)]);
-    expect(vault.reveal('item:1:password')).toBe('tenant-secret');
-    expect(vault.scopeOf('item:1:password')).toBe(A);
+    expect(await vault.reveal('item:1:password')).toBe('tenant-secret');
+    expect(await vault.scopeOf('item:1:password')).toBe(A);
     // Never the raw secret, nor the raw data key, on disk.
     expect(fs.readFileSync(keyringFile(dir, A), 'utf8')).not.toContain('tenant-secret');
   });
@@ -87,11 +87,11 @@ describe('entries under scope data keys', () => {
     await vault.put('h', 'one', A);
     await vault.put('h', 'two', A);
     await vault.move('h', 'h2', A);
-    expect(vault.reveal('h2')).toBe('two');
-    expect(vault.reveal('h2', 1)).toBe('one');
+    expect(await vault.reveal('h2')).toBe('two');
+    expect(await vault.reveal('h2', 1)).toBe('one');
     await vault.putIfAbsent('k', 'first', INSTALLATION_SCOPE);
     await vault.putIfAbsent('k', 'second', INSTALLATION_SCOPE);
-    expect(vault.reveal('k')).toBe('first');
+    expect(await vault.reveal('k')).toBe('first');
     await expect(vault.put('big', 'x'.repeat(70_000), A)).rejects.toThrow(/size limit/);
   });
 
@@ -113,10 +113,10 @@ describe('a cross-scope swap is refused', () => {
     const stolen = readJson(entryFile(dir, 'item:a'));
     // Same handle, relabelled as B's: the AAD binds the scope.
     fs.writeFileSync(entryFile(dir, 'item:a'), JSON.stringify({ ...stolen, scope: B }));
-    expect(() => vault.reveal('item:a')).toThrow(/item:a/);
+    await expect((async () => vault.reveal('item:a'))()).rejects.toThrow(/item:a/);
     // A's ciphertext on B's handle.
     fs.writeFileSync(entryFile(dir, 'item:b'), JSON.stringify({ ...stolen, handle: 'item:b' }));
-    expect(() => vault.reveal('item:b')).toThrow(/item:b.*failed authentication/);
+    await expect((async () => vault.reveal('item:b'))()).rejects.toThrow(/item:b.*failed authentication/);
   });
 
   it('refuses a keyring or a wrapped data key copied to another scope', async () => {
@@ -126,9 +126,9 @@ describe('a cross-scope swap is refused', () => {
     await vault.put('item:b', 'org-b-secret', B);
     const ringA = readJson(keyringFile(dir, A));
     fs.writeFileSync(keyringFile(dir, B), JSON.stringify(ringA));
-    expect(() => new Vault(dir).reveal('item:b')).toThrow(/keyring/);
+    await expect((async () => new Vault(dir).reveal('item:b'))()).rejects.toThrow(/keyring/);
     fs.writeFileSync(keyringFile(dir, B), JSON.stringify({ ...ringA, scope: B }));
-    expect(() => new Vault(dir).reveal('item:b')).toThrow(/data key/);
+    await expect((async () => new Vault(dir).reveal('item:b'))()).rejects.toThrow(/data key/);
   });
 
   it('refuses to write a secret into another owner’s scope', async () => {
@@ -138,8 +138,8 @@ describe('a cross-scope swap is refused', () => {
     await expect(vault.move('resource:r1:credential', 'resource:r1:credential', B, 'x')).rejects.toThrow(/belongs to/);
     await vault.put('other', 'b', B);
     await expect(vault.move('resource:r1:credential', 'other', A)).rejects.toThrow(/belongs to/);
-    expect(vault.reveal('resource:r1:credential')).toBe('org-a-secret');
-    expect(vault.reveal('other')).toBe('b');
+    expect(await vault.reveal('resource:r1:credential')).toBe('org-a-secret');
+    expect(await vault.reveal('other')).toBe('b');
   });
 });
 
@@ -210,14 +210,14 @@ describe('the epoch 4 migration of a realistic mixed v2 vault', () => {
       expect(report.migrated).toBe(Object.keys(secrets).length);
       expect(report.unresolved.sort()).toEqual(['mystery:thing', 'world-provider:org_gone:e2b:api-key']);
       for (const [handle, scope] of Object.entries(expected(orgA, orgB))) {
-        expect(vault.scopeOf(handle), handle).toBe(scope);
+        expect(await vault.scopeOf(handle), handle).toBe(scope);
         const entry = readJson(entryFile(dir, handle));
         expect(entry.blob, handle).toMatch(/^v3\./);
         for (const blob of entry.previous ?? []) expect(blob).toMatch(/^v3\./);
       }
       for (const [handle, { current, previous = [] }] of Object.entries(secrets)) {
-        expect(vault.reveal(handle)).toBe(current);
-        previous.forEach((plain, i) => expect(vault.reveal(handle, i + 1)).toBe(plain));
+        expect(await vault.reveal(handle)).toBe(current);
+        for (const [i, plain] of previous.entries()) expect(await vault.reveal(handle, i + 1)).toBe(plain);
       }
       // The epoch-3 canary is retired, so that release refuses this vault.
       expect(fs.readFileSync(path.join(dir, 'vault.canary'), 'utf8')).toMatch(/epoch 4/);
@@ -225,11 +225,11 @@ describe('the epoch 4 migration of a realistic mixed v2 vault', () => {
       expect((await new Vault(dir).migrateToScopes((handles) => resolveVaultScopes(store, handles))).migrated).toBe(0);
       // v2 is readable only until the migration: a planted one is refused.
       fs.writeFileSync(entryFile(dir, 'mystery:thing'), JSON.stringify({ handle: 'mystery:thing', blob: v2('planted', 'mystery:thing') }));
-      expect(() => new Vault(dir).reveal('mystery:thing')).toThrow(/not under a data key/);
+      await expect((async () => new Vault(dir).reveal('mystery:thing'))()).rejects.toThrow(/not under a data key/);
       // A guessed owner yields to the first write that names the real one.
       const fresh = new Vault(dir);
       await fresh.put('world-provider:org_gone:e2b:api-key', 'moved', B);
-      expect(fresh.scopeOf('world-provider:org_gone:e2b:api-key')).toBe(B);
+      expect(await fresh.scopeOf('world-provider:org_gone:e2b:api-key')).toBe(B);
     } finally { await store.close(); }
   });
 
@@ -246,14 +246,14 @@ describe('the epoch 4 migration of a realistic mixed v2 vault', () => {
       spy.mockRestore();
       // Half-migrated: everything still opens, old and new formats alike.
       const reopened = new Vault(dir);
-      for (const [handle, { current }] of Object.entries(secrets)) expect(reopened.reveal(handle)).toBe(current);
+      for (const [handle, { current }] of Object.entries(secrets)) expect(await reopened.reveal(handle)).toBe(current);
       expect(inspectVault(dir).toScopes).toBe(Object.keys(secrets).length - 5);
       const report = await reopened.migrateToScopes((handles) => resolveVaultScopes(store, handles));
       expect(report.migrated).toBe(Object.keys(secrets).length - 5);
-      for (const [handle, scope] of Object.entries(expected(orgA, orgB))) expect(reopened.scopeOf(handle), handle).toBe(scope);
+      for (const [handle, scope] of Object.entries(expected(orgA, orgB))) expect(await reopened.scopeOf(handle), handle).toBe(scope);
       for (const [handle, { current, previous = [] }] of Object.entries(secrets)) {
-        expect(reopened.reveal(handle)).toBe(current);
-        previous.forEach((plain, i) => expect(reopened.reveal(handle, i + 1)).toBe(plain));
+        expect(await reopened.reveal(handle)).toBe(current);
+        for (const [i, plain] of previous.entries()) expect(await reopened.reveal(handle, i + 1)).toBe(plain);
       }
     } finally { await store.close(); }
   });
@@ -263,7 +263,7 @@ describe('the epoch 4 migration of a realistic mixed v2 vault', () => {
     const vault = new Vault(dir);
     await vault.put('new', 'n', A);
     expect(readJson(entryFile(dir, 'new')).blob).toMatch(/^v3\./);
-    expect(vault.reveal('old')).toBe('v');
+    expect(await vault.reveal('old')).toBe('v');
     expect(readJson(entryFile(dir, 'old')).blob).toMatch(/^v2\./);
     const report = await vault.migrateToScopes(async () => new Map());
     expect(report).toMatchObject({ migrated: 1, unresolved: ['old'] });
@@ -281,9 +281,9 @@ describe('key encryption key rotation', () => {
     await vault.put('i', 'installation', INSTALLATION_SCOPE);
     return dir;
   }
-  const opensAll = (dir: string, kek: { current: LocalKek; others?: LocalKek[] }) => {
+  const opensAll = async (dir: string, kek: { current: LocalKek; others?: LocalKek[] }) => {
     const vault = new Vault(dir, { kek: { current: kek.current, others: kek.others ?? [] } });
-    return ['a', 'b', 'u', 'i'].map((handle) => vault.reveal(handle));
+    return Promise.all(['a', 'b', 'u', 'i'].map((handle) => vault.reveal(handle)));
   };
   const old = () => LocalKek.fromText(KEY_A), next = () => LocalKek.fromText(KEY_B);
   const values = ['alpha', 'beta', 'user', 'installation'];
@@ -300,14 +300,14 @@ describe('key encryption key rotation', () => {
   it('adds wraps, switches, then prunes, with the old key working until the switch', async () => {
     const dir = await populated();
     await new Vault(dir, { kek: { current: next(), others: [old()] } }).wrapUnderCurrentKek();
-    expect(opensAll(dir, { current: old() })).toEqual(values);
-    expect(opensAll(dir, { current: next() })).toEqual(values);
-    const status = new Vault(dir, { kek: { current: next(), others: [] } }).keyStatus();
+    expect(await opensAll(dir, { current: old() })).toEqual(values);
+    expect(await opensAll(dir, { current: next() })).toEqual(values);
+    const status = await new Vault(dir, { kek: { current: next(), others: [] } }).keyStatus();
     expect(status.wraps).toEqual({ [next().id]: 4, [old().id]: 4 });
     await new Vault(dir, { kek: { current: next(), others: [] } }).pruneKeks();
-    expect(opensAll(dir, { current: next() })).toEqual(values);
-    expect(() => opensAll(dir, { current: old() })).toThrow(/vault key does not open this vault.*wrapped under vk-/);
-    expect(new Vault(dir, { kek: { current: next(), others: [] } }).keyStatus().wraps).toEqual({ [next().id]: 4 });
+    expect(await opensAll(dir, { current: next() })).toEqual(values);
+    await expect((async () => opensAll(dir, { current: old() }))()).rejects.toThrow(/vault key does not open this vault.*wrapped under vk-/);
+    expect((await new Vault(dir, { kek: { current: next(), others: [] } }).keyStatus()).wraps).toEqual({ [next().id]: 4 });
   });
 
   it('crash-safe: interrupted while adding the new wraps', async () => {
@@ -315,12 +315,12 @@ describe('key encryption key rotation', () => {
     const spy = crashOnKeyWrite(3);
     await expect(new Vault(dir, { kek: { current: next(), others: [old()] } }).wrapUnderCurrentKek()).rejects.toThrow('crash');
     spy.mockRestore();
-    expect(opensAll(dir, { current: old() })).toEqual(values);
+    expect(await opensAll(dir, { current: old() })).toEqual(values);
     // The new key's canary is written last: alone, it is not yet the vault's key.
-    expect(() => opensAll(dir, { current: next() })).toThrow(/vault key does not open this vault/);
+    await expect((async () => opensAll(dir, { current: next() }))()).rejects.toThrow(/vault key does not open this vault/);
     await new Vault(dir, { kek: { current: next(), others: [old()] } }).wrapUnderCurrentKek();
-    expect(opensAll(dir, { current: next() })).toEqual(values);
-    expect(opensAll(dir, { current: old() })).toEqual(values);
+    expect(await opensAll(dir, { current: next() })).toEqual(values);
+    expect(await opensAll(dir, { current: old() })).toEqual(values);
   });
 
   it('crash-safe: a data key created by the live app between add and switch', async () => {
@@ -332,7 +332,7 @@ describe('key encryption key rotation', () => {
     expect(() => new Vault(dir, { kek: { current: next(), others: [] } }).pruneKeks()).toThrow();
     // The catch-up add (deploy/karmax runs it with the app stopped) closes the gap.
     await new Vault(dir, { kek: { current: next(), others: [old()] } }).wrapUnderCurrentKek();
-    expect(new Vault(dir, { kek: { current: next(), others: [] } }).reveal('c')).toBe('gamma');
+    expect(await new Vault(dir, { kek: { current: next(), others: [] } }).reveal('c')).toBe('gamma');
   });
 
   it('crash-safe: interrupted while pruning the old wraps', async () => {
@@ -341,11 +341,11 @@ describe('key encryption key rotation', () => {
     const spy = crashOnKeyWrite(2);
     await expect(new Vault(dir, { kek: { current: next(), others: [] } }).pruneKeks()).rejects.toThrow('crash');
     spy.mockRestore();
-    expect(opensAll(dir, { current: next() })).toEqual(values);
+    expect(await opensAll(dir, { current: next() })).toEqual(values);
     // The old key's canary goes first, so a half-pruned vault refuses it cleanly.
-    expect(() => opensAll(dir, { current: old() })).toThrow(/vault key does not open this vault/);
+    await expect((async () => opensAll(dir, { current: old() }))()).rejects.toThrow(/vault key does not open this vault/);
     await new Vault(dir, { kek: { current: next(), others: [] } }).pruneKeks();
-    expect(new Vault(dir, { kek: { current: next(), others: [] } }).keyStatus().wraps).toEqual({ [next().id]: 4 });
+    expect((await new Vault(dir, { kek: { current: next(), others: [] } }).keyStatus()).wraps).toEqual({ [next().id]: 4 });
   });
 
   it('refuses to rotate the key of a vault the migration has not finished', async () => {
@@ -368,7 +368,7 @@ describe('key encryption key rotation', () => {
     const pruned = spawnSync(process.execPath, ['--import', 'tsx', 'src/scripts/vault-key.ts', '--vault', dir, 'prune'],
       { encoding: 'utf8', env: { ...process.env, KARMAX_VAULT_KEY: KEY_B, KARMAX_HOME: directory() } });
     expect(pruned.status, pruned.stderr).toBe(0);
-    expect(opensAll(dir, { current: next() })).toEqual(values);
+    expect(await opensAll(dir, { current: next() })).toEqual(values);
   });
 });
 
@@ -392,9 +392,9 @@ describe('data key rotation', () => {
       const entry = readJson(entryFile(dir, handle));
       for (const blob of [entry.blob, ...(entry.previous ?? [])]) expect(blob.split('.')[1]).toBe(after.current);
     }
-    expect(vault.reveal('a1')).toBe('two');
-    expect(vault.reveal('a1', 1)).toBe('one');
-    expect(new Vault(dir).reveal('a2')).toBe('other');
+    expect(await vault.reveal('a1')).toBe('two');
+    expect(await vault.reveal('a1', 1)).toBe('one');
+    expect(await new Vault(dir).reveal('a2')).toBe('other');
     expect(fs.readFileSync(keyringFile(dir, B), 'utf8')).toBe(ringB);
   });
 
@@ -412,7 +412,7 @@ describe('data key rotation', () => {
     spy.mockRestore();
     const mid = readJson(keyringFile(dir, A));
     expect(Object.keys(mid.keys)).toHaveLength(2);
-    for (let i = 0; i < 4; i++) expect(new Vault(dir).reveal(`a${i}`)).toBe(`v${i}`);
+    for (let i = 0; i < 4; i++) expect(await new Vault(dir).reveal(`a${i}`)).toBe(`v${i}`);
     const result = await new Vault(dir).rotateDataKey(A);
     expect(result.reencrypted).toBe(2);
     const after = readJson(keyringFile(dir, A));
@@ -437,13 +437,13 @@ describe('crypto-shredding a scope', () => {
     const result = await broker.destroyScope(A);
     expect(result).toMatchObject({ entries: 1, quarantined: 1 });
     expect(fs.existsSync(keyringFile(dir, A))).toBe(false);
-    expect(broker.hasHandle('a1')).toBe(false);
+    expect(await broker.hasHandle('a1')).toBe(false);
     expect(fs.existsSync(quarantined)).toBe(false);
-    expect(broker.resolve('b1', { caps: ['use-credential:*'] })).toBe('bee');
+    expect(await broker.resolve('b1', { caps: ['use-credential:*'] })).toBe('bee');
     // A copy that survived elsewhere (an old snapshot of the entry) no longer opens.
     fs.writeFileSync(entryFile(dir, 'a1'), leftover);
-    expect(() => new Vault(dir).reveal('a1')).toThrow(/data key .* organization:org_a .*(destroyed|missing)/);
-    expect(() => new Vault(dir).reveal('a1', 1)).toThrow(/data key/);
+    await expect((async () => new Vault(dir).reveal('a1'))()).rejects.toThrow(/data key .* organization:org_a .*(destroyed|missing)/);
+    await expect((async () => new Vault(dir).reveal('a1', 1))()).rejects.toThrow(/data key/);
     await expect(broker.destroyScope(INSTALLATION_SCOPE)).rejects.toThrow(/installation/);
   });
 });

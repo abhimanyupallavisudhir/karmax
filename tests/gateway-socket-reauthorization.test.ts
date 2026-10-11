@@ -3,7 +3,7 @@ import { EventEmitter } from 'node:events';
 import { WebSocketServer } from 'ws';
 import { stubGateway } from './helpers/stub-gateway.js';
 import { AuthorizationService } from '../src/platform/authorization.js';
-import { authorizationChanged, authorizationEpoch } from '../src/store/authorization-epoch.js';
+import { authorizationChanged, onAuthorityChange, type AuthorityChange } from '../src/store/authorization-epoch.js';
 
 /**
  * #367 review item 12: the terminal, review-action and preview sockets checked
@@ -111,7 +111,9 @@ it('keeps a person’s event decisions for the TTL after the socket token expire
     await h.store.setOrganizationMembership(project.organizationId!, 'member', 'member');
     await gateway.deps.authorization.grant('user:owner', { principalId: 'user:member', scopeKey: `organization:${project.organizationId}`, profileId: 'viewer' });
     const minted = await h.tokens.mintPrincipal('user:member', ['task:event:read'], undefined, 300, project.organizationId);
-    vi.spyOn(gateway, 'socketAuth').mockResolvedValue({ apiToken: minted.token, userId: 'member' });
+    // A browser session: its socket token expires while the session lives.
+    h.tokens.connectIdentitySessions(async () => true);
+    vi.spyOn(gateway, 'socketAuth').mockResolvedValue({ apiToken: minted.token, userId: 'member', identitySessionId: 'browser' });
     const ws = socket();
     await gateway.eventStream(ws, { headers: {}, url: '/ws' });
     await new Promise((resolve) => setTimeout(resolve, 350));
@@ -185,16 +187,19 @@ it('decides a ticket terminal from the person’s current grants', async () => {
 // Item 10: re-checking costs store reads per open socket, so only changes
 // that can withdraw access count, and a burst of them is one pass.
 describe('the cost of re-deciding', () => {
-  it('moves the epoch for a revocation, not for a minted token', async () => {
+  it('announces a revocation, scoped to its token, and not a minted token', async () => {
     const h = await stubGateway();
+    const changes: AuthorityChange[] = [];
+    const off = onAuthorityChange((change) => { changes.push(change); });
     try {
-      const before = authorizationEpoch();
       const minted = await h.tokens.mintPrincipal('user:x', ['task:read']);
       await h.tokens.mintPrincipal('user:y', ['task:read']);
-      expect(authorizationEpoch()).toBe(before);
+      expect(changes).toEqual([]);
       await h.tokens.revoke(minted.token);
-      expect(authorizationEpoch()).toBeGreaterThan(before);
-    } finally { await h.close(); }
+      expect(changes).toHaveLength(1);
+      expect(changes[0]!.all).toBeFalsy();
+      expect(changes[0]!.tokens).toHaveLength(1);
+    } finally { off(); await h.close(); }
   });
 
   it('re-decides a burst of changes about once a second', async () => {
@@ -328,7 +333,7 @@ it('keeps re-checking after a lookup that hangs', async () => {
   const { keepAuthorized, socketLifetime } = await import('../src/gateway/socket-lifetime.js');
   const ws = socket();
   let calls = 0;
-  keepAuthorized(ws, socketLifetime(ws), () => { calls++; return calls === 1 ? new Promise<boolean>(() => {}) : Promise.resolve(false); }, 50, 100);
+  keepAuthorized(ws, socketLifetime(ws), () => { calls++; return calls === 1 ? new Promise<boolean>(() => {}) : Promise.resolve(false); }, { intervalMs: 50, timeoutMs: 100 });
   await vi.waitFor(() => expect(closedWith(ws)).toBe(4403), { timeout: 2_000 });
   expect(calls).toBeGreaterThanOrEqual(2);
 });

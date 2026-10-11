@@ -12,7 +12,17 @@ COMPOSE_FILE="$DEPLOY_DIR/compose.turnkey.yml"
 
 die() { echo "karmax: $*" >&2; exit 1; }
 note() { echo "• $*"; }
-dc() { docker compose --project-directory "$DEPLOY_DIR" --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"; }
+# Compose recreates a container when its configuration changes, not when a file
+# it mounts does, and Caddy's admin API is off, so it cannot reload. Worse, the
+# Caddyfile is a single-file bind mount: git checkout replaces the file by
+# rename, so a running container keeps the old inode and never even sees the
+# new content (tavya.io served its 2026-10-02 Caddyfile until task #529). The
+# Caddyfile's digest is therefore a label on Caddy: every `up` recreates it,
+# binding the new file, whenever the Caddyfile changed.
+dc() {
+  KARMAX_CADDYFILE_SHA256=$(sha256sum "$DEPLOY_DIR/Caddyfile" 2>/dev/null | cut -d' ' -f1) \
+    docker compose --project-directory "$DEPLOY_DIR" --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"
+}
 
 # The checksums cover the dumps and secrets outside the signed control-plane
 # manifest, and the manifest itself, so the two signatures vouch for one backup.
@@ -145,11 +155,23 @@ ensure_secrets() (
   done
   # The S3 object store's keys are the operator's to write (see
   # KARMAX_OBJECT_STORE in .turnkey.env); empty means not configured.
-  for secret in s3_access_key_id s3_secret_access_key; do
+  # So are the off-host PostgreSQL backups' (configure-backups writes them).
+  for secret in s3_access_key_id s3_secret_access_key \
+      pg_backup_access_key_id pg_backup_secret_access_key pg_backup_public_key; do
     { [ -e "$SECRETS_DIR/$secret" ] || (umask 022 && : > "$SECRETS_DIR/$secret"); } \
       && secret_mode "$SECRETS_DIR/$secret" || exit 1
   done
 )
+
+# The images this checkout builds for an update: the app and, since the
+# off-host backups, PostgreSQL with WAL-G. A rollback to a release whose
+# postgresql service is a stock image builds nothing for it. PostgreSQL's base
+# is not re-pulled, so an unchanged image is never recreated (and restarted).
+build_images() {
+  if [ "${1:-}" = --pull ]; then dc build --pull app && dc build postgresql
+  else dc build app postgresql
+  fi
+}
 
 configure() {
   requested_domain=${1:-}
@@ -353,6 +375,14 @@ cmd_doctor() {
   # Names the store; an S3 one must accept a write, read-back and delete.
   objects_ok=1
   dc exec -T app npm run --silent object-store-check < /dev/null || objects_ok=''
+  # Off-host PostgreSQL backups: no WAL waiting longer than 10 minutes, and a
+  # base backup within the interval (deploy/postgres/pg-backup.sh status).
+  backups_ok=1
+  if [ -n "$(env_value KARMAX_PG_BACKUP_PREFIX)" ]; then
+    dc exec -T pg-backup karmax-pg-backup status < /dev/null || backups_ok=''
+  else
+    note 'Off-host PostgreSQL backups are off: a lost host loses everything since its last disk image (./deploy/karmax configure-backups).'
+  fi
   domain=$(env_value KARMAX_DOMAIN)
   if command -v curl >/dev/null 2>&1 && curl -fsS --max-time 10 "https://$domain/api/health/ready" >/dev/null 2>&1; then
     note "Public HTTPS health check passed for $domain."
@@ -360,6 +390,86 @@ cmd_doctor() {
     note "Public HTTPS is not reachable yet. Check DNS for $domain and ports 80/443."
   fi
   [ -n "$objects_ok" ] || die 'object store check failed; see its output above'
+  [ -n "$backups_ok" ] || die 'off-host PostgreSQL backups are not current; see above and ./deploy/karmax logs pg-backup'
+}
+
+# Turn on continuous off-host PostgreSQL backups (WAL-G, wiki
+# ops/production-tavya): every WAL segment within a minute, and a base backup
+# each KARMAX_PG_BACKUP_INTERVAL_HOURS (24). The bucket must be the backups'
+# own, with a lock rule so its key cannot delete or overwrite them and a
+# lifecycle rule for retention; nothing here ever deletes from it. The key
+# comes from KARMAX_PG_BACKUP_ACCESS_KEY_ID and KARMAX_PG_BACKUP_SECRET_ACCESS_KEY,
+# so it never appears in a process list. PUBLIC_KEY is the armored OpenPGP
+# public key backups are encrypted to; its private half restores them and
+# must stay off this host.
+cmd_configure_backups() {
+  need_docker
+  [ -f "$ENV_FILE" ] || die 'this instance is not configured'
+  [ "$#" -eq 3 ] || die 'usage: ./deploy/karmax configure-backups s3://BUCKET/PREFIX https://ENDPOINT PUBLIC_KEY'
+  prefix=$1; endpoint=$2; public_key=$3
+  printf '%s' "$prefix" | grep -Eq '^s3://[a-z0-9][a-z0-9.-]{1,61}[a-z0-9](/[A-Za-z0-9._-]+)+$' \
+    || die "the prefix must look like s3://bucket/installation, not $prefix"
+  case "$endpoint" in https://*) ;; *) die "the endpoint must be an https:// URL, not $endpoint" ;; esac
+  grep -q 'BEGIN PGP PUBLIC KEY BLOCK' "$public_key" 2>/dev/null || die "$public_key is not an armored OpenPGP public key"
+  ! grep -q 'PRIVATE KEY' "$public_key" || die "$public_key holds a private key: give this host only the public key"
+  [ -n "${KARMAX_PG_BACKUP_ACCESS_KEY_ID:-}" ] && [ -n "${KARMAX_PG_BACKUP_SECRET_ACCESS_KEY:-}" ] \
+    || die 'set KARMAX_PG_BACKUP_ACCESS_KEY_ID and KARMAX_PG_BACKUP_SECRET_ACCESS_KEY to the backup bucket key'
+  ensure_secrets || die 'could not prepare the secrets directory'
+  ( umask 077
+    printf '%s\n' "$KARMAX_PG_BACKUP_ACCESS_KEY_ID" > "$SECRETS_DIR/pg_backup_access_key_id"
+    printf '%s\n' "$KARMAX_PG_BACKUP_SECRET_ACCESS_KEY" > "$SECRETS_DIR/pg_backup_secret_access_key"
+    cp "$public_key" "$SECRETS_DIR/pg_backup_public_key" ) || die 'could not write the backup secrets'
+  secret_mode "$SECRETS_DIR/pg_backup_access_key_id" "$SECRETS_DIR/pg_backup_secret_access_key" "$SECRETS_DIR/pg_backup_public_key"
+  staged="$ENV_FILE.backups.$$"
+  if ! (umask 077 && { sed -e '/^KARMAX_PG_BACKUP_PREFIX=/d' -e '/^KARMAX_PG_BACKUP_ENDPOINT=/d' "$ENV_FILE" \
+      && printf 'KARMAX_PG_BACKUP_PREFIX=%s\nKARMAX_PG_BACKUP_ENDPOINT=%s\n' "$prefix" "$endpoint"; } > "$staged"); then
+    rm -f "$staged"; die 'could not stage the backup settings; nothing was changed'
+  fi
+  mv "$staged" "$ENV_FILE"
+  note 'Restarting PostgreSQL with WAL archiving to the bucket, and starting base backups…'
+  dc up -d --remove-orphans
+  wait_ready || die 'Karmax failed its readiness check after enabling backups'
+  note 'The first base backup is starting now (./deploy/karmax logs pg-backup); doctor passes once it is in the bucket.'
+}
+
+# Point-in-time restore of the off-host backups into a scratch volume, never
+# into production: the copy cannot archive, has no network listener, and is
+# deleted afterwards unless --keep. It prints what it recovered. TIME is
+# PostgreSQL's timestamptz syntax (e.g. "2026-10-08 12:00:00+00"); without it,
+# everything archived is replayed. The private key is the off-host one.
+cmd_pg_restore() {
+  need_docker
+  [ -f "$ENV_FILE" ] || die 'this instance is not configured'
+  [ -n "$(env_value KARMAX_PG_BACKUP_PREFIX)" ] || die 'off-host backups are not configured here'
+  target='' private_key='' keep=''
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --to) target=${2:?--to needs a time}; shift 2 ;;
+      --private-key) private_key=${2:?--private-key needs a file}; shift 2 ;;
+      --keep) keep=1; shift ;;
+      *) die "unknown pg-restore option: $1" ;;
+    esac
+  done
+  [ -n "$private_key" ] || die 'usage: ./deploy/karmax pg-restore --private-key FILE [--to TIME] [--keep]'
+  grep -q 'BEGIN PGP PRIVATE KEY BLOCK' "$private_key" 2>/dev/null || die "$private_key is not an armored OpenPGP private key"
+  volume="karmax-pitr-$(date -u +%Y%m%dT%H%M%SZ)"
+  keydir=$(mktemp -d)
+  chmod 700 "$keydir"
+  # Readable by the container's postgres user; the 0700 directory keeps
+  # everyone else on the host out, and it is removed on every exit.
+  cp "$private_key" "$keydir/private.asc" && chmod 644 "$keydir/private.asc" || die 'could not stage the private key'
+  trap 'rm -rf "$keydir"; [ -n "$keep" ] || docker volume rm -f "$volume" >/dev/null 2>&1 || true' EXIT
+  docker volume create "$volume" >/dev/null
+  note "Restoring ${target:+to $target }into the scratch volume $volume…"
+  # shellcheck disable=SC2016 # expanded by the container's shell
+  dc run --rm --no-deps -T --user root -v "$volume:/restore" -v "$keydir/private.asc:/run/pitr/private.asc:ro" \
+    -e KARMAX_PG_BACKUP_PRIVATE_KEY=/run/pitr/private.asc -e PGDATA=/restore/data -e TARGET="$target" \
+    --entrypoint sh pg-backup -c 'install -d -o postgres -g postgres -m 700 /restore/data \
+      && exec gosu postgres karmax-pg-backup restore ${TARGET:+--to "$TARGET"}' < /dev/null \
+    || die 'the point-in-time restore failed; see above'
+  if [ -n "$keep" ]; then note "Kept the restored data directory in volume $volume (data/); remove it with docker volume rm $volume."
+  else note 'Restore verified; the scratch volume is removed.'
+  fi
 }
 
 # Copy the local object store to the S3 store configured in .turnkey.env, from
@@ -550,7 +660,7 @@ cmd_restore() {
   # Check both signatures, every checksum, the control-plane manifest, every
   # payload file and the vault key using the candidate app, while the live
   # containers and all three databases are still untouched.
-  dc build app
+  build_images
   # The backup is private to the operator who took it (0600) and the app image
   # runs as its own uid, so the one-offs that read it run as root. Their stdin
   # is closed so they cannot swallow the confirmation meant for the prompt.
@@ -752,7 +862,7 @@ cmd_update() {
   # Building does not replace the running container. It gives the one-off
   # snapshot process the candidate's backup implementation while production
   # continues serving the previous image.
-  if ! dc build --pull app; then
+  if ! build_images --pull; then
     git -C "$ROOT_DIR" checkout --detach "$previous"
     restore_migration
     cleanup_migration
@@ -769,7 +879,7 @@ cmd_update() {
     if ! dc run --rm --no-deps -T app npm run --silent replay-check; then
       git -C "$ROOT_DIR" checkout --detach "$previous"
       restore_migration
-      dc build app || true
+      build_images || true
       cleanup_migration
       migration_backup=''
       die "deployment $target stopped by the replay check, which lists above the running workflows it cannot replay or why it could not run; production remains at $previous. Fix the release, or rerun with KARMAX_SKIP_REPLAY_CHECK=1 only if those workflows may break"
@@ -778,7 +888,7 @@ cmd_update() {
   if ! cmd_backup_candidate; then
     git -C "$ROOT_DIR" checkout --detach "$previous"
     restore_migration
-    dc build app || true
+    build_images || true
     cleanup_migration
     migration_backup=''
     die "deployment $target could not be backed up; production remains at $previous"
@@ -795,7 +905,7 @@ cmd_update() {
   elif [ "$preflight" -ne 0 ]; then
     git -C "$ROOT_DIR" checkout --detach "$previous"
     restore_migration
-    dc build app || true
+    build_images || true
     cleanup_migration
     migration_backup=''
     [ "$preflight" -eq 3 ] \
@@ -838,7 +948,7 @@ cmd_update() {
   note "Deployment $target failed; rolling back to $previous…"
   git -C "$ROOT_DIR" checkout --detach "$previous"
   restore_migration
-  if dc build app && dc up -d --remove-orphans && wait_ready && { [ "$edge_before" = 0 ] || wait_edge; }; then
+  if build_images && dc up -d --remove-orphans && wait_ready && { [ "$edge_before" = 0 ] || wait_edge; }; then
     cleanup_migration
     migration_backup=''
     die "deployment $target failed; production was restored to $previous"
@@ -940,6 +1050,11 @@ Usage: ./deploy/karmax COMMAND
                                Copy local objects to the configured S3 store
   deploy-repository-edge       Deploy the Cloudflare Worker sandboxes save resources through
                                (needs CLOUDFLARE_API_TOKEN), and use it
+  configure-backups s3://BUCKET/PREFIX https://ENDPOINT PUBLIC_KEY
+                               Stream PostgreSQL WAL and base backups off-host (key in
+                               KARMAX_PG_BACKUP_ACCESS_KEY_ID / _SECRET_ACCESS_KEY)
+  pg-restore --private-key FILE [--to TIME] [--keep]
+                               Point-in-time restore of those backups into a scratch volume
   down                          Stop everything without deleting durable data
 EOF
 }
@@ -959,6 +1074,8 @@ case "$command" in
   rotate-vault-key) cmd_rotate_vault_key "$@" ;;
   migrate-objects) cmd_migrate_objects "$@" ;;
   deploy-repository-edge) cmd_deploy_repository_edge "$@" ;;
+  configure-backups) cmd_configure_backups "$@" ;;
+  pg-restore) cmd_pg_restore "$@" ;;
   down) need_docker; [ -f "$ENV_FILE" ] || die 'not configured'; dc down ;;
   help|-h|--help) usage ;;
   *) usage >&2; die "unknown command: $command" ;;

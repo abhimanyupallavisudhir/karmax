@@ -214,6 +214,21 @@ integration('PostgreSQL cutover', () => {
     } finally { await store.close(); }
   });
 
+  it('backfills when each task last changed status from its lifecycle events', async () => {
+    const legacy = await Store.create(url!);
+    const project = await legacy.createProject('Ordered');
+    const task = await legacy.createTask({ projectId: project.id, title: 'Moved', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt: 't' } });
+    for (const [ts, payload] of [[100, { status: 'active' }], [200, { status: 'active', agentTurn: 'running' }],
+      [300, { status: 'waiting', waitingFor: 'human' }], [400, { status: 'waiting', waitingFor: 'human', waitingDetail: 'again' }]] as const)
+      await legacy.appendEvent({ taskId: task.id, type: 'view.updated', ts, payload: { stage: 'do', ...payload } });
+    await legacy.close();
+    await admin!.query('ALTER TABLE tasks DROP COLUMN "statusChangedAt"'); // as deployed before the column
+    const store = await Store.create(url!);
+    try {
+      expect((await store.getTask(task.id))!.statusChangedAt).toBe(300);
+    } finally { await store.close(); }
+  });
+
   it('adds the candidate failure reason to an existing database and round-trips it', async () => {
     (await Store.create(url!).then((store) => store.close()));
     await admin!.query('ALTER TABLE resource_candidates DROP COLUMN error'); // as deployed before the column

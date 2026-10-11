@@ -62,7 +62,7 @@ describe('GitProfiles registry (PLAN-git-config §3)', () => {
     const p = (await profiles.get('personal'))!;
     expect(p.githubToken).toBe(true); // a flag — never the secret
     expect(p.sshKey).toBeUndefined();
-    expect(broker.hasHandle(gitHandle('personal', 'token'))).toBe(true);
+    expect(await broker.hasHandle(gitHandle('personal', 'token'))).toBe(true);
     expect(JSON.stringify([...kv.entries()])).not.toContain('ghp_secret'); // registry carries no secret
 
     // default: none → set → cleared on delete
@@ -72,7 +72,7 @@ describe('GitProfiles registry (PLAN-git-config §3)', () => {
     expect((await profiles.resolve({ gitProfile: 'work' }))?.name).toBe('work'); // project selection wins
     (await profiles.delete('personal'));
     expect((await profiles.get('personal'))).toBeUndefined();
-    expect(broker.hasHandle(gitHandle('personal', 'token'))).toBe(false);
+    expect(await broker.hasHandle(gitHandle('personal', 'token'))).toBe(false);
     expect((await profiles.resolve({}))).toBeUndefined();
   });
 
@@ -101,7 +101,7 @@ describe('GitProfiles registry (PLAN-git-config §3)', () => {
 
     (await acme.delete('work'));
     expect((await beta.get('work'))?.userEmail).toBe('bot@beta.test');
-    expect(broker.hasHandle(gitHandle('work', 'token', 'org_beta'))).toBe(true);
+    expect(await broker.hasHandle(gitHandle('work', 'token', 'org_beta'))).toBe(true);
     expect((await acme.preflight({})).tier).toBe('unconfigured');
   });
 
@@ -128,11 +128,26 @@ describe('GitProfiles registry (PLAN-git-config §3)', () => {
     });
     expect((await user.defaultProfile())).toBe('github');
     expect((await user.saveGithubSigningKey('PRIVATE SIGNING KEY'))).toMatchObject({ signingKey: true });
-    expect(broker.hasHandle(gitHandle('github', 'signing', userGitScope('user_jane')))).toBe(true);
+    expect(await broker.hasHandle(gitHandle('github', 'signing', userGitScope('user_jane')))).toBe(true);
     // Reconnecting refreshes public identity without dropping the signing key.
     expect((await user.saveGithubIdentity({ id: '12345', login: 'jane-renamed' }))).toMatchObject({
       userName: 'jane-renamed', userEmail: '12345+jane-renamed@users.noreply.github.com', signingKey: true,
     });
+  });
+
+  it('keeps a connected account\'s own GitHub token with its identity, and removes it on request', async () => {
+    const user = new GitProfiles(store, broker, path.join(tmp, 'state'), userGitScope('user_jane'));
+    (await user.saveGithubIdentity({ id: '7', login: 'jane' }));
+    (await user.saveGithubCustomIdentity('7', { userName: 'Jane D', signingKey: 'SIGN' }));
+    expect((await user.saveGithubToken('7', 'ghp_personal'))).toMatchObject({
+      name: 'github', github: { id: '7', login: 'jane' }, userName: 'Jane D', githubToken: true, signingKey: true,
+      customIdentity: { userName: 'Jane D' } });
+    expect((await user.env((await user.githubProfile('7'))!, {})).GH_TOKEN).toBe('ghp_personal');
+    const removed = await user.saveGithubToken('7', undefined);
+    expect(removed.githubToken).toBeUndefined();
+    expect(removed).toMatchObject({ signingKey: true, userName: 'Jane D' });
+    expect(await broker.hasHandle(gitHandle('github', 'token', userGitScope('user_jane')))).toBe(false);
+    await expect(user.saveGithubToken('99', 'ghp_x')).rejects.toThrow(/Connect GitHub/);
   });
 
   it('keeps per-account custom identities separate and supports an organization automation identity', async () => {
@@ -165,7 +180,7 @@ describe('GitProfiles registry (PLAN-git-config §3)', () => {
     (await user.save({ name: 'main', userName: 'Jane Updated', userEmail: 'new@example.test', githubToken: 'rotated-token' }));
     expect((await organization.get('main'))).toMatchObject({ userName: 'Jane Updated', userEmail: 'new@example.test' });
     expect((await organization.env((await organization.get('main'))!, {})).GH_TOKEN).toBe('rotated-token');
-    expect(broker.hasHandle(gitHandle('main', 'token', 'org_acme'))).toBe(false);
+    expect(await broker.hasHandle(gitHandle('main', 'token', 'org_acme'))).toBe(false);
     await expect((async () => (await organization.reuseUserProfile(user)))()).rejects.toThrow(/already configured/i);
   });
 

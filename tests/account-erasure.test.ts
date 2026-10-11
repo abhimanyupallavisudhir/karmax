@@ -118,10 +118,10 @@ it('cleans only personal access/settings and preserves shared work, history and 
   expect(await store.organizationMembership(org.id, 'uX1')).toBeDefined();
   expect(await store.listPrincipalGrants('user:u_1')).toEqual([]);
   expect(await store.listPrincipalGrants('user:uX1')).toHaveLength(1);
-  expect(broker.listHandles().some(h => h.includes(':u_1:'))).toBe(false);
-  expect(broker.hasHandle('github-app:user:uX1:account:9:authorization')).toBe(true);
+  expect((await broker.listHandles()).some(h => h.includes(':u_1:'))).toBe(false);
+  expect(await broker.hasHandle('github-app:user:uX1:account:9:authorization')).toBe(true);
   // SS-1: the user's data key is destroyed too, and with it anything left under it.
-  expect(broker.hasHandle('user-owned:unlisted')).toBe(false);
+  expect(await broker.hasHandle('user-owned:unlisted')).toBe(false);
   expect(fs.existsSync(path.join(dir, 'vault', 'keys', `${crypto.createHash('sha256').update('user:u_1').digest('hex')}.json`))).toBe(false);
   expect(fs.existsSync(path.join(dir, 'vault', 'keys', `${crypto.createHash('sha256').update('user:uX1').digest('hex')}.json`))).toBe(true);
   expect(await store.kvGet('github-app:user:u_1:accounts')).toBeUndefined();
@@ -156,7 +156,7 @@ it('keeps access fenced during failure and resumes idempotently with persisted p
   // A new service has no in-memory progress. Recovery reads the durable manifest.
   const restarted = new AccountErasureService(store, identity, broker, dir);
   expect((await restarted.close('u_1', { confirmation: 'CLOSE u_1', exportHandled: true }, 'user:admin')).state).toBe('closed');
-  expect(broker.hasHandle('github-app:user:u_1:authorization')).toBe(false);
+  expect(await broker.hasHandle('github-app:user:u_1:authorization')).toBe(false);
   expect((await restarted.get('u_1'))?.steps).toEqual(['access-and-preferences', 'personal-credentials', 'identity']);
 });
 
@@ -189,8 +189,8 @@ it('rejects delayed GitHub grants and refreshes after closure without affecting 
   await close();
   release();
   await rejection;
-  expect(broker.hasHandle('github-app:user:u_1:account:42:authorization')).toBe(false);
-  expect(broker.hasHandle(GITHUB_APP_CLIENT_SECRET_HANDLE)).toBe(true);
+  expect(await broker.hasHandle('github-app:user:u_1:account:42:authorization')).toBe(false);
+  expect(await broker.hasHandle(GITHUB_APP_CLIENT_SECRET_HANDLE)).toBe(true);
   await expect(github.userAccessToken('u_1')).rejects.toThrow('closed');
 });
 

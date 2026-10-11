@@ -1,3 +1,4 @@
+import { noteExternalEffect } from '../store/transaction-effects.js';
 import { identitySqliteDatabase } from '../store/identity-sqlite.js';
 import { betterAuth } from 'better-auth';
 import { admin, genericOAuth } from 'better-auth/plugins';
@@ -192,6 +193,10 @@ export class IdentityService {
 
     this.db = openSqlDatabase(opts.databaseUrl ?? dbFile);
     this.pool = opts.databaseUrl ? new Pool({ connectionString: opts.databaseUrl, application_name: 'karmax' }) : undefined;
+    // A PostgreSQL restart or idle kill ends pooled connections; without a
+    // listener that 'error' event crashes the process (DB-18). The pool
+    // replaces the connection on the next query.
+    this.pool?.on('error', error => console.error('[identity] idle PostgreSQL connection failed:', error.message));
     this.sqlite = this.pool ? undefined : identitySqliteDatabase(this.db);
     // Same durability pragmas the metadata store uses (src/store/db.ts): karmax
     // runs the gateway, the worker and every activity in one process, so a
@@ -503,25 +508,30 @@ export class IdentityService {
   }
 
   async revokeUserSessions(userId: string): Promise<void> {
-    return this.db.transaction(async () => {
-
-    (await this.db.prepare('DELETE FROM session WHERE userId=?').run(userId));
+    (await this.db.transaction(async () => {
+      (await this.db.prepare('DELETE FROM session WHERE userId=?').run(userId));
+    }));
+    // After the commit: the listener clears in-memory tokens, which a re-run
+    // (deadlock retry) of the transaction would not see again.
     await this.sessionsRevoked?.(userId);
-  
-    });
   }
 
   /** First-account setup. The route calling this is available only while empty. */
   async bootstrap(input: { name: string; email: string; password: string }, headers?: Headers): Promise<{ response: Response; user: IdentityUser }> {
     return this.db.transaction(async () => {
 
+    // Concurrent bootstraps take turns: the second sees the first's account.
+    (await this.db.lock('account-names'));
     if ((await this.hasUsers())) throw new Error(`${BRAND} has already been set up`);
+    // Better Auth commits the account on its own pool and may send mail: a
+    // rollback cannot undo that, so this attempt is never re-run.
+    noteExternalEffect();
     const response = await this.auth.api.signUpEmail({
       body: { ...input, name: (await this.assertUserNameAvailable(input.name)) }, headers, asResponse: true });
     if (!response.ok) throw new Error((await response.clone().json().catch(() => ({})) as any)?.message ?? 'could not create account');
     // Promote the account this call actually created, resolved by its own email —
-    // NOT `listUsers()[0]`. The surrounding transaction serializes the empty-
-    // installation check, so only one concurrent bootstrap may create an admin.
+    // NOT `listUsers()[0]`. The lock above serializes the empty-installation
+    // check, so only one concurrent bootstrap may create an admin.
     const created = (await response.clone().json().catch(() => ({})) as any)?.user as { id?: string } | undefined;
     const email = input.email.trim().toLowerCase();
     const user = (await this.listUsers()).find((candidate) => (created?.id ? candidate.id === created.id

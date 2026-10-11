@@ -1,0 +1,26 @@
+{
+ "instances": [
+  {
+   "instance": "i-00a82ab82a30fc682",
+   "role": "sut",
+   "type": "c7i.xlarge",
+   "hours": 0.672,
+   "diskGb": 40,
+   "computeUsd": 0.137,
+   "storageUsd": 0.0035,
+   "ipv4Usd": 0.0034
+  },
+  {
+   "instance": "i-00d2bc43d947415ab",
+   "role": "world",
+   "type": "c7i.2xlarge",
+   "hours": 0.672,
+   "diskGb": 80,
+   "computeUsd": 0.274,
+   "storageUsd": 0.007,
+   "ipv4Usd": 0.0034
+  }
+ ],
+ "totalUsd": 0.428,
+ "prices": "eu-central-1 on-demand list prices checked 2026-10-08; data transfer inside one AZ is free"
+}

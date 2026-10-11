@@ -53,7 +53,7 @@ describe('VaultCardProvider — the universal rail', () => {
     expect(Object.values(row)).not.toContain('123');
     expect(row).not.toHaveProperty('cvc');
     expect(row).not.toHaveProperty('number');
-    expect(broker.hasHandle(cardSecretHandle(card.id))).toBe(true);
+    expect(await broker.hasHandle(cardSecretHandle(card.id))).toBe(true);
   });
 
   it('retrieves the full details back out of the vault for secure fill', async () => {
@@ -66,26 +66,26 @@ describe('VaultCardProvider — the universal rail', () => {
   // never a complete card-not-present credential.
   it('keeps the CVC out of the stored card secret', async () => {
     const card = await provision();
-    const stored = JSON.parse(broker.resolve(cardSecretHandle(card.id), { caps: ['use-credential:*'] }));
+    const stored = JSON.parse(await broker.resolve(cardSecretHandle(card.id), { caps: ['use-credential:*'] }));
     expect(stored).toMatchObject({ number: '4242424242424242', expMonth: 12, expYear: 2031 });
     expect(stored).not.toHaveProperty('cvc');
-    expect(broker.resolve(cardCvcHandle(card.id), { caps: ['use-credential:*'] })).toBe('123');
+    expect(await broker.resolve(cardCvcHandle(card.id), { caps: ['use-credential:*'] })).toBe('123');
   });
 
   it('separates the CVC of a card stored before AU-31, once', async () => {
     const card = await provision();
-    (await broker.registerHandle(cardSecretHandle(card.id), JSON.stringify(details), broker.scopeOf(cardSecretHandle(card.id))!));
+    (await broker.registerHandle(cardSecretHandle(card.id), JSON.stringify(details), (await broker.scopeOf(cardSecretHandle(card.id)))!));
     (await broker.deleteHandle(cardCvcHandle(card.id)));
     expect(await separateStoredCardCvcs(broker)).toBe(1);
     expect(await separateStoredCardCvcs(broker)).toBe(0);
     // Every boot checks again: a vault put back from before the split (a
     // manual rollback) is split too, which a marker outside it would miss.
     const combined = JSON.stringify(details);
-    (await broker.registerHandle(cardSecretHandle(card.id), combined, broker.scopeOf(cardSecretHandle(card.id))!, { history: false }));
+    (await broker.registerHandle(cardSecretHandle(card.id), combined, (await broker.scopeOf(cardSecretHandle(card.id)))!, { history: false }));
     expect(await separateStoredCardCvcs(broker)).toBe(1);
-    expect(JSON.parse(broker.resolve(cardSecretHandle(card.id), { caps: ['use-credential:*'] }))).not.toHaveProperty('cvc');
+    expect(JSON.parse(await broker.resolve(cardSecretHandle(card.id), { caps: ['use-credential:*'] }))).not.toHaveProperty('cvc');
     // …nor in the card secret's history, where `put` keeps earlier revisions.
-    expect(new Vault(dir).reveal(cardSecretHandle(card.id), 1)).toBeUndefined();
+    expect(await new Vault(dir).reveal(cardSecretHandle(card.id), 1)).toBeUndefined();
     expect(await provider.retrieveCardDetails(card.id)).toMatchObject({ number: '4242424242424242', cvc: '123' });
   });
 
@@ -122,8 +122,8 @@ describe('VaultCardProvider — the universal rail', () => {
   it('revoking destroys the stored secret, not just the row', async () => {
     const card = await provision();
     await provider.revoke(card.id);
-    expect(broker.hasHandle(cardSecretHandle(card.id))).toBe(false);
-    expect(broker.hasHandle(cardCvcHandle(card.id))).toBe(false);
+    expect(await broker.hasHandle(cardSecretHandle(card.id))).toBe(false);
+    expect(await broker.hasHandle(cardCvcHandle(card.id))).toBe(false);
     expect((await store.getCard(card.id)).status).toBe('canceled');
     await expect(provider.retrieveCardDetails(card.id)).rejects.toThrow(/not active/i);
   });

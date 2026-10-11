@@ -3,6 +3,7 @@ import { paths } from '../config/paths.js';
 import { validateDeployment } from '../config/deployment.js';
 import { admitWorkerProcess } from '../util/instance.js';
 import { Store } from '../store/db.js';
+import { noteFollowUpEvent, wireFollowUpWakes } from '../activities/follow-up-wakes.js';
 import { makeClient } from '../temporal/client.js';
 import { temporalConnectionFromEnv } from '../temporal/connection-env.js';
 import { WorkerManager } from '../temporal/worker-pool.js';
@@ -10,12 +11,13 @@ import { announceEventsAppended, type WorkerProcessRuntime } from '../temporal/w
 import { TASK_QUEUE } from '../temporal/config.js';
 import { defaultProvider } from '../agent/adapters.js';
 import { KarmaxBus } from '../contrib/bus.js';
-import { Vault } from '../autonomy/vault.js';
+import { openSecretVault } from '../autonomy/vault-backend.js';
 import { sweepTurnKeys } from '../autonomy/vault-items.js';
 import { CredentialBroker } from '../autonomy/broker.js';
 import { AuthorizationService } from '../platform/authorization.js';
 import { GitHubAppService } from '../integrations/github-app.js';
 import { createExecutionServices } from './execution-services.js';
+import { assertDataEpoch } from '../config/data-epoch.js';
 import type { ExternalWorkflowRef } from '../packages/bundle.js';
 
 /** Attach to the primary's already-initialized installation. The parent passes
@@ -51,14 +53,20 @@ export async function createActivityWorkerRuntime(): Promise<WorkerProcessRuntim
   };
   try {
     store = await Store.create(database);
+    await assertDataEpoch(store.db);
     // The primary relays this process's events to browsers; wake it on every
     // commit rather than leaving delivery to its poll (LT-15).
     const append = store.appendEvent.bind(store);
     store.appendEvent = async (event) => { const seq = await append(event); announceEventsAppended(); return seq; };
+    // Running turns read their follow-up journal when it changes: on this
+    // process's commits, and on the primary's (`worker.journaled`).
+    store.onEventRecorded((event) => { noteFollowUpEvent(event); });
+    wireFollowUpWakes();
     const connection = await makeClient(conn);
     closeClient = connection.close;
     const client = connection.client;
-    const broker = new CredentialBroker(new Vault(p.vault));
+    // Attaches only: the primary process ran the vault's migrations on its boot.
+    const broker = new CredentialBroker(await openSecretVault(p.vault, store.db));
     sweepTurnKeys(); // key files a crashed turn of an earlier worker left behind
     const authorization = await AuthorizationService.create(store);
     const githubApp = await GitHubAppService.create(store, broker, {

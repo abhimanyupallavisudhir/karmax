@@ -117,7 +117,7 @@ it('saves a site\'s session from one task and signs another task in after approv
     expect(JSON.stringify(saved.body)).not.toContain('SECRET');
     const item = (await vault.get(saved.body.itemId))!;
     expect(item).toMatchObject({ type: 'session', label: 'notes.test (signed in)', username: 'alice', policy: { use: 'auto', reveal: 'never' } });
-    const stored = vault.readSecret(item, 'session')!;
+    const stored = await vault.readSecret(item, 'session')!;
     expect(stored).toContain('NOTES-SECRET');
     expect(stored).not.toContain('IDP-SECRET');
 
@@ -166,7 +166,7 @@ it('saves a site\'s session from one task and signs another task in after approv
     expect((await call(userToken, 'use', { domain: 'missing.test' })).body).toMatchObject({ status: 'not_in_vault' });
 
     // An expired session says so, names the site's own sign-in, and spends no approval.
-    const working = vault.readSecret(item, 'session')!;
+    const working = (await vault.readSecret(item, 'session'))!;
     const expiredSession = JSON.parse(working);
     for (const cookie of expiredSession.cookies) cookie.expires = Math.floor(Date.now() / 1000) - 60;
     await vault.save({ id: item.id, type: 'session', secrets: { session: JSON.stringify(expiredSession) } });

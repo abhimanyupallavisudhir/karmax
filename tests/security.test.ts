@@ -110,9 +110,9 @@ describe('CredentialBroker (vault-backed, JIT, scoped, audited)', () => {
 
     const broker = new CredentialBroker(vault);
     // permitted requester
-    expect(broker.resolve('openai', { caps: ['use-credential:openai'], taskId: 't1' })).toBe('sk-secret-123');
+    expect(await broker.resolve('openai', { caps: ['use-credential:openai'], taskId: 't1' })).toBe('sk-secret-123');
     // denied requester
-    expect(() => broker.resolve('openai', { caps: ['use-credential:other'] })).toThrow(/not permitted/);
+    await expect((async () => broker.resolve('openai', { caps: ['use-credential:other'] }))()).rejects.toThrow(/not permitted/);
     // audit captures both attempts
     const log = broker.audit_log();
     expect(log).toHaveLength(2);
@@ -123,14 +123,14 @@ describe('CredentialBroker (vault-backed, JIT, scoped, audited)', () => {
   it('write-back of a newly created account is resolvable later', async () => {
     const broker = new CredentialBroker(new Vault(dir));
     (await broker.registerHandle('new-acct', 'pw-xyz', INSTALLATION_SCOPE));
-    expect(broker.resolve('new-acct', { caps: ['use-credential:*'] })).toBe('pw-xyz');
+    expect(await broker.resolve('new-acct', { caps: ['use-credential:*'] })).toBe('pw-xyz');
   });
 
   it('renames and rotates a handle without leaving the old credential behind', async () => {
     const broker = new CredentialBroker(new Vault(dir));
     (await broker.registerHandle('openrouter:old', 'old-secret', INSTALLATION_SCOPE));
     (await broker.updateHandle('openrouter:old', 'openrouter:new', INSTALLATION_SCOPE, 'new-secret'));
-    expect(broker.hasHandle('openrouter:old')).toBe(false);
-    expect(broker.resolve('openrouter:new', { caps: ['use-credential:*'] })).toBe('new-secret');
+    expect(await broker.hasHandle('openrouter:old')).toBe(false);
+    expect(await broker.resolve('openrouter:new', { caps: ['use-credential:*'] })).toBe('new-secret');
   });
 });

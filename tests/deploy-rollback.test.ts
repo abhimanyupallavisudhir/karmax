@@ -152,6 +152,16 @@ it('puts the one-way vault migration behind its own data epoch', () => {
   expect(readme).not.toContain('entries.pre-v2');
 });
 
+// Moving the vault into the application database (wiki planned/host-local-state)
+// retires the vault directory the epoch 4 release reads: rolling back to it
+// would start on no secrets, or on a copy that missed every later write.
+it('puts the vault\'s move into the database behind data epoch 5', () => {
+  const epoch = Number(fs.readFileSync(new URL('../deploy/data-epoch', import.meta.url), 'utf8').trim());
+  expect(epoch).toBeGreaterThanOrEqual(5);
+  const readme = fs.readFileSync(new URL('../deploy/README.md', import.meta.url), 'utf8');
+  expect(readme).toMatch(/Epoch 5[^]*application database[^]*pre-update backup/);
+});
+
 // #367 review item 4: automatic rollback cannot cross epoch 3, so a first
 // boot that would refuse the vault key, stop on an unreadable entry or
 // quarantine one is caught with the new image before the switch.

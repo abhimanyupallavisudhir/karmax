@@ -108,7 +108,7 @@ describe('historical snapshot byte verification', () => {
       const revision = await f.legacy([{ path: 'file', data: Buffer.from('original') }]);
       const manifest = await f.engine.manifest(revision);
       const handle = `resource-store:key:${f.project.organizationId}`;
-      const key = Buffer.from(f.broker.resolve(handle, { caps: [`use-credential:${handle}`] }), 'base64');
+      const key = Buffer.from(await f.broker.resolve(handle, { caps: [`use-credential:${handle}`] }), 'base64');
       // A valid envelope with a stale root digest must fail manifest validation.
       manifest.files[0]!.sha256 = sha(Buffer.from('modified'));
       const ref = JSON.parse(revision.sealedRef);
@@ -139,7 +139,7 @@ describe('historical snapshot byte verification', () => {
         (await f.broker.deleteHandle(handle));
         expect(await f.service.verifyRevision(f.project.id, f.resource.id, revision.id))
           .toMatchObject({ status: 'failed', manifestVerified: false, verifiedFiles: 0 });
-        expect(f.broker.hasHandle(handle)).toBe(false);
+        expect(await f.broker.hasHandle(handle)).toBe(false);
       } finally { (await f.close()); }
     }
   });

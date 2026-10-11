@@ -1,0 +1,2442 @@
+{
+ "run": {
+  "runId": "loadtest-20261010T084544Z-5140",
+  "ref": "d6e4102e",
+  "sha": "d6e4102e752e988ceafcf8daf89fa0865f13da05",
+  "label": "pool8",
+  "region": "eu-central-1",
+  "sutType": "c7i.xlarge",
+  "worldType": "c7i.2xlarge",
+  "worldRttMs": 50,
+  "holdSeconds": 300,
+  "maxMinutes": 180,
+  "steps": "default",
+  "driverArgs": "",
+  "startedAt": "2026-10-10T08:45:44Z"
+ },
+ "cost": {
+  "instances": [
+   {
+    "instance": "i-09a82456e83aadee5",
+    "role": "sut",
+    "type": "c7i.xlarge",
+    "hours": 0.673,
+    "diskGb": 40,
+    "computeUsd": 0.137,
+    "storageUsd": 0.0035,
+    "ipv4Usd": 0.0034
+   },
+   {
+    "instance": "i-0088ba62b8018e5b1",
+    "role": "world",
+    "type": "c7i.2xlarge",
+    "hours": 0.673,
+    "diskGb": 80,
+    "computeUsd": 0.274,
+    "storageUsd": 0.007,
+    "ipv4Usd": 0.0034
+   }
+  ],
+  "totalUsd": 0.429,
+  "prices": "eu-central-1 on-demand list prices checked 2026-10-08; data transfer inside one AZ is free"
+ },
+ "steps": [
+  {
+   "step": 1,
+   "tenants": 4,
+   "teams": 1,
+   "people": 6,
+   "sockets": 12,
+   "openTasks": 14,
+   "tasksInTurn": 2,
+   "tasksAtReview": 12,
+   "runningWorkflows": 15,
+   "sandboxes": {
+    "running": 2,
+    "paused": 13
+   },
+   "setupSeconds": 4,
+   "failedSetups": 0,
+   "requestsPerSecond": 1.3,
+   "requests": 394,
+   "errorRatePct": 0,
+   "rateLimited": 0,
+   "clientErrors": 0,
+   "api": {
+    "n": 394,
+    "p50": 16,
+    "p95": 72,
+    "p99": 561,
+    "max": 593
+   },
+   "eventLag": {
+    "n": 4112,
+    "p50": 7,
+    "p95": 16,
+    "p99": 29,
+    "max": 93
+   },
+   "turnOverhead": {
+    "n": 31,
+    "p50": 1542,
+    "p95": 2428,
+    "p99": 2539,
+    "max": 2539
+   },
+   "firstTurn": {
+    "n": 19,
+    "p50": 25302,
+    "p95": 39587,
+    "p99": 39587,
+    "max": 39587
+   },
+   "approveToDone": {
+    "n": 5,
+    "p50": 202,
+    "p95": 233,
+    "p99": 233,
+    "max": 233
+   },
+   "cancelToCancelled": {
+    "n": 1,
+    "p50": 69,
+    "p95": 69,
+    "p99": 69,
+    "max": 69
+   },
+   "wsConnect": {
+    "n": 6,
+    "p50": 30,
+    "p95": 34,
+    "p99": 34,
+    "max": 34
+   },
+   "tenantSetup": {
+    "n": 4,
+    "p50": 4306,
+    "p95": 4407,
+    "p99": 4407,
+    "max": 4407
+   },
+   "tasks": {
+    "created": 20,
+    "turns": 31,
+    "done": 5,
+    "cancelled": 1,
+    "failed": 0,
+    "stuck": 0,
+    "followUps": 13,
+    "resourceSaves": 4
+   },
+   "sockets_": {
+    "opens": 0,
+    "refused": 0,
+    "failures": 0,
+    "drops": 0,
+    "closes": {},
+    "events": 4118
+   },
+   "slowestRoutes": [
+    {
+     "route": "POST /api/projects/:id/resources/:id/import",
+     "n": 4,
+     "p50": 568,
+     "p95": 593,
+     "p99": 593,
+     "max": 593
+    },
+    {
+     "route": "POST /api/projects/:id/tasks",
+     "n": 20,
+     "p50": 74,
+     "p95": 202,
+     "p99": 202,
+     "max": 202
+    },
+    {
+     "route": "POST /api/tasks/:id/signal",
+     "n": 19,
+     "p50": 39,
+     "p95": 51,
+     "p99": 51,
+     "max": 51
+    },
+    {
+     "route": "GET /api/tasks/:id",
+     "n": 53,
+     "p50": 18,
+     "p95": 35,
+     "p99": 83,
+     "max": 83
+    },
+    {
+     "route": "GET /api/tasks/:id/conversation",
+     "n": 53,
+     "p50": 18,
+     "p95": 33,
+     "p99": 110,
+     "max": 110
+    },
+    {
+     "route": "GET /api/projects/:id/tasks",
+     "n": 54,
+     "p50": 17,
+     "p95": 23,
+     "p99": 72,
+     "max": 72
+    }
+   ],
+   "hostCpuPct": {
+    "mean": 9,
+    "max": 63,
+    "steal": 0.1,
+    "iowait": 2
+   },
+   "load1Max": 1.67,
+   "hostMemAvailableMinMb": 5854,
+   "containers": {
+    "app": {
+     "cpuMeanPct": 14,
+     "cpuMaxPct": 67,
+     "memMaxMb": 824,
+     "memLimitMb": 4096
+    },
+    "postgresql": {
+     "cpuMeanPct": 6,
+     "cpuMaxPct": 21,
+     "memMaxMb": 142,
+     "memLimitMb": 768
+    },
+    "temporal": {
+     "cpuMeanPct": 5,
+     "cpuMaxPct": 20,
+     "memMaxMb": 129,
+     "memLimitMb": 2048
+    },
+    "caddy": {
+     "cpuMeanPct": 0,
+     "cpuMaxPct": 1,
+     "memMaxMb": 23,
+     "memLimitMb": 512
+    }
+   },
+   "appRestarts": 0,
+   "appOomKilled": false,
+   "gateway": {
+    "heapUsedMaxMb": 140,
+    "heapLimitMb": 662,
+    "rssMaxMb": 433,
+    "eldP99MaxMs": 14.6,
+    "eldMaxMs": 209,
+    "cpuMeanPct": 5,
+    "gcPct": 0.1,
+    "pids": 1
+   },
+   "worker": {
+    "heapUsedMaxMb": 104,
+    "heapLimitMb": 1276,
+    "rssMaxMb": 398,
+    "eldP99MaxMs": 14.4,
+    "eldMaxMs": 120,
+    "cpuMeanPct": 7,
+    "gcPct": 0.1,
+    "pids": 1
+   },
+   "postgres": {
+    "connectionsMax": 40,
+    "karmaxConnectionsMax": 13,
+    "maxConnections": 100,
+    "lockWaitersMax": 1,
+    "advisoryWaitersMax": 0,
+    "advisoryWaitersMean": 0,
+    "advisoryWaitMaxMs": 0,
+    "longestXactMs": 14,
+    "karmaxCommitsPerSecond": 135.3,
+    "karmaxDbMb": 14
+   },
+   "appGauges": {
+    "karmax_database_bytes": 14769175,
+    "karmax_http_inflight": 3,
+    "karmax_heap_used_bytes{heap=\"gateway\"}": 147003712,
+    "karmax_heap_used_bytes{heap=\"worker\"}": 107649544,
+    "karmax_heap_limit_bytes{heap=\"gateway\"}": 694157312,
+    "karmax_heap_limit_bytes{heap=\"worker\"}": 1337982976,
+    "karmax_process_rss_bytes{process=\"gateway\"}": 453173248,
+    "karmax_process_rss_bytes{process=\"worker\"}": 417431552,
+    "karmax_event_loop_delay_seconds{quantile=\"0.95\"}": 0.021266431,
+    "karmax_event_loop_delay_seconds{quantile=\"0.99\"}": 0.021954559,
+    "karmax_event_loop_delay_max_seconds": 0.221249535,
+    "karmax_store_global_lock_wait_seconds_sum{process=\"gateway\"}": 0,
+    "karmax_store_global_lock_wait_seconds_sum{process=\"worker\"}": 0,
+    "karmax_store_entity_lock_wait_seconds_sum{process=\"gateway\"}": 0.18154685399989057,
+    "karmax_store_entity_lock_wait_seconds_sum{process=\"worker\"}": 0.0664955500001559,
+    "karmax_database_pending": 1,
+    "karmax_database_connections": 7,
+    "karmax_database_waiting": 0
+   },
+   "authorityChangesPerSecond": {
+    "all": 0,
+    "scoped": 0
+   },
+   "topStatements": [
+    {
+     "perSecond": 23.8,
+     "meanMs": 0.01,
+     "query": "SELECT v FROM kv WHERE k = $1",
+     "sharePct": 13.8
+    },
+    {
+     "perSecond": 12,
+     "meanMs": 0.16,
+     "query": "SELECT karmax_seq_watermark($1, $2) AS w",
+     "sharePct": 7
+    },
+    {
+     "perSecond": 10.6,
+     "meanMs": 0,
+     "query": "BEGIN",
+     "sharePct": 6.2
+    },
+    {
+     "perSecond": 10.6,
+     "meanMs": 0,
+     "query": "COMMIT",
+     "sharePct": 6.2
+    },
+    {
+     "perSecond": 10,
+     "meanMs": 0.01,
+     "query": "SELECT * FROM events WHERE seq > $1 AND seq <= $2 ORDER BY seq LIMIT $3",
+     "sharePct": 5.8
+    },
+    {
+     "perSecond": 7.2,
+     "meanMs": 0.01,
+     "query": "SELECT \"expiresAt\" FROM session WHERE id=$1 AND \"userId\"=$2",
+     "sharePct": 4.2
+    },
+    {
+     "perSecond": 6.7,
+     "meanMs": 0.01,
+     "query": "SELECT * FROM projects WHERE id = $1",
+     "sharePct": 3.9
+    },
+    {
+     "perSecond": 6,
+     "meanMs": 0.03,
+     "query": "SELECT id, num, \"projectId\", \"listId\", title, workflow, \"executionWorkflow\", \"workflowVersion\", params, \"createdAt\", ord, \"parentTaskId\", \"createdBy\", assignee, delegate, \"confirmationPolicy\", \"intentId\", \"attemptNumber\", notes, \"lastView\" ",
+     "sharePct": 3.5
+    },
+    {
+     "perSecond": 5.6,
+     "meanMs": 0.01,
+     "query": "SELECT handle FROM world_instances WHERE \"worldId\"=$1 AND state!=$2 ORDER BY generation DESC LIMIT $3",
+     "sharePct": 3.3
+    },
+    {
+     "perSecond": 4.8,
+     "meanMs": 0.01,
+     "query": "SELECT json FROM scoped_tokens WHERE \"tokenHash\"=$1 AND \"revokedAt\" IS NULL AND \"expiresAt\">$2",
+     "sharePct": 2.8
+    },
+    {
+     "perSecond": 3.9,
+     "meanMs": 0.51,
+     "query": "SELECT $2 FROM tasks WHERE id = $1 FOR UPDATE",
+     "sharePct": 2.3
+    },
+    {
+     "perSecond": 3.4,
+     "meanMs": 0.01,
+     "query": "SELECT json FROM settings WHERE \"scopeKey\" = $1 AND workflow = $2",
+     "sharePct": 2
+    }
+   ],
+   "metricsScrapeMaxMs": 100,
+   "temporal": {
+    "backlogAgeMaxMs": 0,
+    "backlogCountMax": 0,
+    "scheduleToStart": {
+     "workflow": {
+      "count": 586,
+      "meanMs": 5.3,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "activity": {
+      "count": 517,
+      "meanMs": 5.2,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     }
+    },
+    "serverLatency": {
+     "persistence_latency": {
+      "count": 6834,
+      "meanMs": 1.8,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "syncmatch_latency": {
+      "count": 1119,
+      "meanMs": 4.3,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_dispatch_latency": {
+      "count": 1136,
+      "meanMs": 4.1,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency": {
+      "count": 1343,
+      "meanMs": 4.3,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency_load": {
+      "count": 2576,
+      "meanMs": 2.4,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency_processing": {
+      "count": 2576,
+      "meanMs": 2.3,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency_queue": {
+      "count": 1343,
+      "meanMs": 9,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency_schedule": {
+      "count": 2576,
+      "meanMs": 0,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_schedule_to_start_latency": {
+      "count": 1103,
+      "meanMs": 5.3,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "workflow_task_attempt": {
+      "count": 589,
+      "meanMs": 1000,
+      "p50Ms": 500,
+      "p95Ms": 950
+     }
+    }
+   },
+   "broken": [],
+   "errorSamples": []
+  },
+  {
+   "step": 2,
+   "tenants": 8,
+   "teams": 2,
+   "people": 12,
+   "sockets": 24,
+   "openTasks": 29,
+   "tasksInTurn": 8,
+   "tasksAtReview": 21,
+   "runningWorkflows": 29,
+   "sandboxes": {
+    "running": 9,
+    "paused": 28
+   },
+   "setupSeconds": 6,
+   "failedSetups": 0,
+   "requestsPerSecond": 1.7,
+   "requests": 507,
+   "errorRatePct": 0,
+   "rateLimited": 0,
+   "clientErrors": 0,
+   "api": {
+    "n": 507,
+    "p50": 16,
+    "p95": 70,
+    "p99": 555,
+    "max": 748
+   },
+   "eventLag": {
+    "n": 7500,
+    "p50": 7,
+    "p95": 15,
+    "p99": 30,
+    "max": 163
+   },
+   "turnOverhead": {
+    "n": 54,
+    "p50": 1522,
+    "p95": 1759,
+    "p99": 1827,
+    "max": 1827
+   },
+   "firstTurn": {
+    "n": 33,
+    "p50": 31152,
+    "p95": 39999,
+    "p99": 40761,
+    "max": 40761
+   },
+   "approveToDone": {
+    "n": 16,
+    "p50": 229,
+    "p95": 359,
+    "p99": 359,
+    "max": 359
+   },
+   "cancelToCancelled": {
+    "n": 7,
+    "p50": 76,
+    "p95": 96,
+    "p99": 96,
+    "max": 96
+   },
+   "wsConnect": {
+    "n": 6,
+    "p50": 25,
+    "p95": 33,
+    "p99": 33,
+    "max": 33
+   },
+   "tenantSetup": {
+    "n": 4,
+    "p50": 3485,
+    "p95": 5572,
+    "p99": 5572,
+    "max": 5572
+   },
+   "tasks": {
+    "created": 38,
+    "turns": 54,
+    "done": 16,
+    "cancelled": 7,
+    "failed": 0,
+    "stuck": 0,
+    "followUps": 23,
+    "resourceSaves": 9
+   },
+   "sockets_": {
+    "opens": 0,
+    "refused": 0,
+    "failures": 0,
+    "drops": 0,
+    "closes": {},
+    "events": 7506
+   },
+   "slowestRoutes": [
+    {
+     "route": "POST /api/projects/:id/resources/:id/import",
+     "n": 9,
+     "p50": 557,
+     "p95": 748,
+     "p99": 748,
+     "max": 748
+    },
+    {
+     "route": "POST /api/projects/:id/tasks",
+     "n": 38,
+     "p50": 67,
+     "p95": 97,
+     "p99": 116,
+     "max": 116
+    },
+    {
+     "route": "POST /api/tasks/:id/signal",
+     "n": 46,
+     "p50": 37,
+     "p95": 52,
+     "p99": 78,
+     "max": 78
+    },
+    {
+     "route": "GET /api/tasks/:id/conversation",
+     "n": 59,
+     "p50": 17,
+     "p95": 26,
+     "p99": 28,
+     "max": 28
+    },
+    {
+     "route": "GET /api/projects/:id/tasks",
+     "n": 69,
+     "p50": 16,
+     "p95": 24,
+     "p99": 31,
+     "max": 31
+    },
+    {
+     "route": "GET /api/tasks/:id/events",
+     "n": 59,
+     "p50": 15,
+     "p95": 23,
+     "p99": 31,
+     "max": 31
+    }
+   ],
+   "hostCpuPct": {
+    "mean": 12,
+    "max": 45,
+    "steal": 0.1,
+    "iowait": 1.9
+   },
+   "load1Max": 0.81,
+   "hostMemAvailableMinMb": 5764,
+   "containers": {
+    "app": {
+     "cpuMeanPct": 17,
+     "cpuMaxPct": 83,
+     "memMaxMb": 809,
+     "memLimitMb": 4096
+    },
+    "postgresql": {
+     "cpuMeanPct": 9,
+     "cpuMaxPct": 31,
+     "memMaxMb": 162,
+     "memLimitMb": 768
+    },
+    "temporal": {
+     "cpuMeanPct": 10,
+     "cpuMaxPct": 30,
+     "memMaxMb": 151,
+     "memLimitMb": 2048
+    },
+    "caddy": {
+     "cpuMeanPct": 0,
+     "cpuMaxPct": 1,
+     "memMaxMb": 26,
+     "memLimitMb": 512
+    }
+   },
+   "appRestarts": 0,
+   "appOomKilled": false,
+   "gateway": {
+    "heapUsedMaxMb": 141,
+    "heapLimitMb": 662,
+    "rssMaxMb": 440,
+    "eldP99MaxMs": 12.3,
+    "eldMaxMs": 197,
+    "cpuMeanPct": 5,
+    "gcPct": 0.1,
+    "pids": 1
+   },
+   "worker": {
+    "heapUsedMaxMb": 103,
+    "heapLimitMb": 1276,
+    "rssMaxMb": 416,
+    "eldP99MaxMs": 15.7,
+    "eldMaxMs": 153,
+    "cpuMeanPct": 10,
+    "gcPct": 0.2,
+    "pids": 1
+   },
+   "postgres": {
+    "connectionsMax": 42,
+    "karmaxConnectionsMax": 15,
+    "maxConnections": 100,
+    "lockWaitersMax": 0,
+    "advisoryWaitersMax": 0,
+    "advisoryWaitersMean": 0,
+    "advisoryWaitMaxMs": 0,
+    "longestXactMs": 9,
+    "karmaxCommitsPerSecond": 220.3,
+    "karmaxDbMb": 17
+   },
+   "appGauges": {
+    "karmax_database_bytes": 18168855,
+    "karmax_http_inflight": 2,
+    "karmax_heap_used_bytes{heap=\"gateway\"}": 148918408,
+    "karmax_heap_used_bytes{heap=\"worker\"}": 108929592,
+    "karmax_heap_limit_bytes{heap=\"gateway\"}": 694157312,
+    "karmax_heap_limit_bytes{heap=\"worker\"}": 1337982976,
+    "karmax_process_rss_bytes{process=\"gateway\"}": 460349440,
+    "karmax_process_rss_bytes{process=\"worker\"}": 438636544,
+    "karmax_event_loop_delay_seconds{quantile=\"0.95\"}": 0.021266431,
+    "karmax_event_loop_delay_seconds{quantile=\"0.99\"}": 0.021463039,
+    "karmax_event_loop_delay_max_seconds": 0.221249535,
+    "karmax_store_global_lock_wait_seconds_sum{process=\"gateway\"}": 0,
+    "karmax_store_global_lock_wait_seconds_sum{process=\"worker\"}": 0,
+    "karmax_store_entity_lock_wait_seconds_sum{process=\"gateway\"}": 0.2822081979997377,
+    "karmax_store_entity_lock_wait_seconds_sum{process=\"worker\"}": 0.18059999899949225,
+    "karmax_database_pending": 1,
+    "karmax_database_connections": 8,
+    "karmax_database_waiting": 0
+   },
+   "authorityChangesPerSecond": {
+    "all": 0,
+    "scoped": 0.03
+   },
+   "topStatements": [
+    {
+     "perSecond": 37.2,
+     "meanMs": 0.01,
+     "query": "SELECT v FROM kv WHERE k = $1",
+     "sharePct": 12.7
+    },
+    {
+     "perSecond": 19.4,
+     "meanMs": 0,
+     "query": "BEGIN",
+     "sharePct": 6.6
+    },
+    {
+     "perSecond": 19.4,
+     "meanMs": 0,
+     "query": "COMMIT",
+     "sharePct": 6.6
+    },
+    {
+     "perSecond": 18.6,
+     "meanMs": 0.17,
+     "query": "SELECT karmax_seq_watermark($1, $2) AS w",
+     "sharePct": 6.4
+    },
+    {
+     "perSecond": 15,
+     "meanMs": 0.01,
+     "query": "SELECT * FROM events WHERE seq > $1 AND seq <= $2 ORDER BY seq LIMIT $3",
+     "sharePct": 5.1
+    },
+    {
+     "perSecond": 12.8,
+     "meanMs": 0.01,
+     "query": "SELECT * FROM projects WHERE id = $1",
+     "sharePct": 4.4
+    },
+    {
+     "perSecond": 11.5,
+     "meanMs": 0.03,
+     "query": "SELECT id, num, \"projectId\", \"listId\", title, workflow, \"executionWorkflow\", \"workflowVersion\", params, \"createdAt\", ord, \"parentTaskId\", \"createdBy\", assignee, delegate, \"confirmationPolicy\", \"intentId\", \"attemptNumber\", notes, \"lastView\" ",
+     "sharePct": 3.9
+    },
+    {
+     "perSecond": 11.1,
+     "meanMs": 0.01,
+     "query": "SELECT \"expiresAt\" FROM session WHERE id=$1 AND \"userId\"=$2",
+     "sharePct": 3.8
+    },
+    {
+     "perSecond": 10.7,
+     "meanMs": 0.01,
+     "query": "SELECT handle FROM world_instances WHERE \"worldId\"=$1 AND state!=$2 ORDER BY generation DESC LIMIT $3",
+     "sharePct": 3.7
+    },
+    {
+     "perSecond": 7.4,
+     "meanMs": 0.45,
+     "query": "SELECT $2 FROM tasks WHERE id = $1 FOR UPDATE",
+     "sharePct": 2.5
+    },
+    {
+     "perSecond": 6.3,
+     "meanMs": 0.01,
+     "query": "SELECT json FROM scoped_tokens WHERE \"tokenHash\"=$1 AND \"revokedAt\" IS NULL AND \"expiresAt\">$2",
+     "sharePct": 2.2
+    },
+    {
+     "perSecond": 5.8,
+     "meanMs": 0.09,
+     "query": "INSERT INTO events (\"taskId\", type, ts, payload, origin) VALUES ($1, $2, $3, $4, $5) RETURNING seq",
+     "sharePct": 2
+    }
+   ],
+   "metricsScrapeMaxMs": 80,
+   "temporal": {
+    "backlogAgeMaxMs": 0,
+    "backlogCountMax": 0,
+    "scheduleToStart": {
+     "workflow": {
+      "count": 1090,
+      "meanMs": 5.5,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "activity": {
+      "count": 960,
+      "meanMs": 5.5,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     }
+    },
+    "serverLatency": {
+     "persistence_latency": {
+      "count": 11633,
+      "meanMs": 1.9,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "syncmatch_latency": {
+      "count": 2076,
+      "meanMs": 4.3,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_dispatch_latency": {
+      "count": 2114,
+      "meanMs": 4.1,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency": {
+      "count": 2496,
+      "meanMs": 4.4,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency_load": {
+      "count": 5224,
+      "meanMs": 2.3,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency_processing": {
+      "count": 5224,
+      "meanMs": 2.2,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency_queue": {
+      "count": 2496,
+      "meanMs": 9.2,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency_schedule": {
+      "count": 5224,
+      "meanMs": 0,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_schedule_to_start_latency": {
+      "count": 2050,
+      "meanMs": 5.5,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "workflow_task_attempt": {
+      "count": 1099,
+      "meanMs": 1000,
+      "p50Ms": 500,
+      "p95Ms": 950
+     }
+    }
+   },
+   "broken": [],
+   "errorSamples": []
+  },
+  {
+   "step": 3,
+   "tenants": 16,
+   "teams": 4,
+   "people": 24,
+   "sockets": 48,
+   "openTasks": 71,
+   "tasksInTurn": 15,
+   "tasksAtReview": 56,
+   "runningWorkflows": 70,
+   "sandboxes": {
+    "running": 15,
+    "paused": 89
+   },
+   "setupSeconds": 8,
+   "failedSetups": 0,
+   "requestsPerSecond": 4,
+   "requests": 1202,
+   "errorRatePct": 0,
+   "rateLimited": 0,
+   "clientErrors": 0,
+   "api": {
+    "n": 1202,
+    "p50": 16,
+    "p95": 73,
+    "p99": 521,
+    "max": 814
+   },
+   "eventLag": {
+    "n": 16322,
+    "p50": 7,
+    "p95": 16,
+    "p99": 27,
+    "max": 159
+   },
+   "turnOverhead": {
+    "n": 130,
+    "p50": 1652,
+    "p95": 2019,
+    "p99": 2150,
+    "max": 2151
+   },
+   "firstTurn": {
+    "n": 89,
+    "p50": 28404,
+    "p95": 40413,
+    "p99": 41348,
+    "max": 41348
+   },
+   "approveToDone": {
+    "n": 30,
+    "p50": 238,
+    "p95": 386,
+    "p99": 522,
+    "max": 522
+   },
+   "cancelToCancelled": {
+    "n": 25,
+    "p50": 74,
+    "p95": 137,
+    "p99": 261,
+    "max": 261
+   },
+   "wsConnect": {
+    "n": 6,
+    "p50": 38,
+    "p95": 41,
+    "p99": 41,
+    "max": 41
+   },
+   "tenantSetup": {
+    "n": 8,
+    "p50": 5037,
+    "p95": 7532,
+    "p99": 7532,
+    "max": 7532
+   },
+   "tasks": {
+    "created": 97,
+    "turns": 130,
+    "done": 30,
+    "cancelled": 25,
+    "failed": 0,
+    "stuck": 0,
+    "followUps": 43,
+    "resourceSaves": 23
+   },
+   "sockets_": {
+    "opens": 0,
+    "refused": 0,
+    "failures": 0,
+    "drops": 0,
+    "closes": {},
+    "events": 16328
+   },
+   "slowestRoutes": [
+    {
+     "route": "POST /api/projects/:id/resources/:id/import",
+     "n": 23,
+     "p50": 523,
+     "p95": 770,
+     "p99": 814,
+     "max": 814
+    },
+    {
+     "route": "POST /api/projects/:id/tasks",
+     "n": 97,
+     "p50": 67,
+     "p95": 100,
+     "p99": 226,
+     "max": 226
+    },
+    {
+     "route": "POST /api/tasks/:id/signal",
+     "n": 98,
+     "p50": 38,
+     "p95": 65,
+     "p99": 235,
+     "max": 235
+    },
+    {
+     "route": "GET /api/tasks/:id",
+     "n": 154,
+     "p50": 18,
+     "p95": 43,
+     "p99": 88,
+     "max": 93
+    },
+    {
+     "route": "GET /api/tasks/:id/conversation",
+     "n": 154,
+     "p50": 18,
+     "p95": 38,
+     "p99": 58,
+     "max": 131
+    },
+    {
+     "route": "GET /api/projects/:id/tasks",
+     "n": 164,
+     "p50": 17,
+     "p95": 33,
+     "p99": 52,
+     "max": 82
+    }
+   ],
+   "hostCpuPct": {
+    "mean": 21,
+    "max": 34,
+    "steal": 0.1,
+    "iowait": 3.9
+   },
+   "load1Max": 2.53,
+   "hostMemAvailableMinMb": 5594,
+   "containers": {
+    "app": {
+     "cpuMeanPct": 45,
+     "cpuMaxPct": 113,
+     "memMaxMb": 886,
+     "memLimitMb": 4096
+    },
+    "postgresql": {
+     "cpuMeanPct": 22,
+     "cpuMaxPct": 59,
+     "memMaxMb": 195,
+     "memLimitMb": 768
+    },
+    "temporal": {
+     "cpuMeanPct": 18,
+     "cpuMaxPct": 42,
+     "memMaxMb": 166,
+     "memLimitMb": 2048
+    },
+    "caddy": {
+     "cpuMeanPct": 1,
+     "cpuMaxPct": 1,
+     "memMaxMb": 35,
+     "memLimitMb": 512
+    }
+   },
+   "appRestarts": 0,
+   "appOomKilled": false,
+   "gateway": {
+    "heapUsedMaxMb": 146,
+    "heapLimitMb": 662,
+    "rssMaxMb": 449,
+    "eldP99MaxMs": 16.2,
+    "eldMaxMs": 207,
+    "cpuMeanPct": 10,
+    "gcPct": 0.2,
+    "pids": 1
+   },
+   "worker": {
+    "heapUsedMaxMb": 115,
+    "heapLimitMb": 1276,
+    "rssMaxMb": 495,
+    "eldP99MaxMs": 18,
+    "eldMaxMs": 195,
+    "cpuMeanPct": 22,
+    "gcPct": 0.3,
+    "pids": 1
+   },
+   "postgres": {
+    "connectionsMax": 46,
+    "karmaxConnectionsMax": 18,
+    "maxConnections": 100,
+    "lockWaitersMax": 0,
+    "advisoryWaitersMax": 0,
+    "advisoryWaitersMean": 0,
+    "advisoryWaitMaxMs": 0,
+    "longestXactMs": 13,
+    "karmaxCommitsPerSecond": 507,
+    "karmaxDbMb": 25
+   },
+   "appGauges": {
+    "karmax_database_bytes": 25852951,
+    "karmax_http_inflight": 3,
+    "karmax_heap_used_bytes{heap=\"gateway\"}": 151392024,
+    "karmax_heap_used_bytes{heap=\"worker\"}": 122715648,
+    "karmax_heap_limit_bytes{heap=\"gateway\"}": 694157312,
+    "karmax_heap_limit_bytes{heap=\"worker\"}": 1337982976,
+    "karmax_process_rss_bytes{process=\"gateway\"}": 470016000,
+    "karmax_process_rss_bytes{process=\"worker\"}": 516632576,
+    "karmax_event_loop_delay_seconds{quantile=\"0.95\"}": 0.021217279,
+    "karmax_event_loop_delay_seconds{quantile=\"0.99\"}": 0.021561343,
+    "karmax_event_loop_delay_max_seconds": 0.224526335,
+    "karmax_store_global_lock_wait_seconds_sum{process=\"gateway\"}": 0,
+    "karmax_store_global_lock_wait_seconds_sum{process=\"worker\"}": 0,
+    "karmax_store_entity_lock_wait_seconds_sum{process=\"gateway\"}": 0.9957921090013039,
+    "karmax_store_entity_lock_wait_seconds_sum{process=\"worker\"}": 0.5658541489998934,
+    "karmax_database_pending": 3,
+    "karmax_database_connections": 8,
+    "karmax_database_waiting": 0
+   },
+   "authorityChangesPerSecond": {
+    "all": 0,
+    "scoped": 0
+   },
+   "topStatements": [
+    {
+     "perSecond": 89.1,
+     "meanMs": 0.01,
+     "query": "SELECT v FROM kv WHERE k = $1",
+     "sharePct": 13.1
+    },
+    {
+     "perSecond": 45,
+     "meanMs": 0,
+     "query": "BEGIN",
+     "sharePct": 6.6
+    },
+    {
+     "perSecond": 45,
+     "meanMs": 0,
+     "query": "COMMIT",
+     "sharePct": 6.6
+    },
+    {
+     "perSecond": 38.7,
+     "meanMs": 0.17,
+     "query": "SELECT karmax_seq_watermark($1, $2) AS w",
+     "sharePct": 5.7
+    },
+    {
+     "perSecond": 31.5,
+     "meanMs": 0.01,
+     "query": "SELECT * FROM projects WHERE id = $1",
+     "sharePct": 4.6
+    },
+    {
+     "perSecond": 30.3,
+     "meanMs": 0.01,
+     "query": "SELECT * FROM events WHERE seq > $1 AND seq <= $2 ORDER BY seq LIMIT $3",
+     "sharePct": 4.5
+    },
+    {
+     "perSecond": 27.5,
+     "meanMs": 0.03,
+     "query": "SELECT id, num, \"projectId\", \"listId\", title, workflow, \"executionWorkflow\", \"workflowVersion\", params, \"createdAt\", ord, \"parentTaskId\", \"createdBy\", assignee, delegate, \"confirmationPolicy\", \"intentId\", \"attemptNumber\", notes, \"lastView\" ",
+     "sharePct": 4.1
+    },
+    {
+     "perSecond": 26.1,
+     "meanMs": 0.01,
+     "query": "SELECT handle FROM world_instances WHERE \"worldId\"=$1 AND state!=$2 ORDER BY generation DESC LIMIT $3",
+     "sharePct": 3.8
+    },
+    {
+     "perSecond": 24.2,
+     "meanMs": 0.01,
+     "query": "SELECT \"expiresAt\" FROM session WHERE id=$1 AND \"userId\"=$2",
+     "sharePct": 3.6
+    },
+    {
+     "perSecond": 17.6,
+     "meanMs": 0.49,
+     "query": "SELECT $2 FROM tasks WHERE id = $1 FOR UPDATE",
+     "sharePct": 2.6
+    },
+    {
+     "perSecond": 14.6,
+     "meanMs": 0.01,
+     "query": "SELECT json FROM scoped_tokens WHERE \"tokenHash\"=$1 AND \"revokedAt\" IS NULL AND \"expiresAt\">$2",
+     "sharePct": 2.2
+    },
+    {
+     "perSecond": 13.8,
+     "meanMs": 0.09,
+     "query": "INSERT INTO events (\"taskId\", type, ts, payload, origin) VALUES ($1, $2, $3, $4, $5) RETURNING seq",
+     "sharePct": 2
+    }
+   ],
+   "metricsScrapeMaxMs": 123,
+   "temporal": {
+    "backlogAgeMaxMs": 0,
+    "backlogCountMax": 0,
+    "scheduleToStart": {
+     "workflow": {
+      "count": 2553,
+      "meanMs": 5.9,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "activity": {
+      "count": 2245,
+      "meanMs": 6.2,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     }
+    },
+    "serverLatency": {
+     "asyncmatch_latency": {
+      "count": 1,
+      "meanMs": 7.1,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "persistence_latency": {
+      "count": 25226,
+      "meanMs": 2.2,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "syncmatch_latency": {
+      "count": 4861,
+      "meanMs": 4.8,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_dispatch_latency": {
+      "count": 4944,
+      "meanMs": 4.6,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency": {
+      "count": 5961,
+      "meanMs": 4.7,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency_load": {
+      "count": 12165,
+      "meanMs": 2.6,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency_processing": {
+      "count": 12154,
+      "meanMs": 2.4,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency_queue": {
+      "count": 5961,
+      "meanMs": 10,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency_schedule": {
+      "count": 12154,
+      "meanMs": 0,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_schedule_to_start_latency": {
+      "count": 4798,
+      "meanMs": 6,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "workflow_task_attempt": {
+      "count": 2565,
+      "meanMs": 1000,
+      "p50Ms": 500,
+      "p95Ms": 950
+     }
+    }
+   },
+   "broken": [],
+   "errorSamples": []
+  },
+  {
+   "step": 4,
+   "tenants": 32,
+   "teams": 8,
+   "people": 48,
+   "sockets": 96,
+   "openTasks": 138,
+   "tasksInTurn": 26,
+   "tasksAtReview": 112,
+   "runningWorkflows": 138,
+   "sandboxes": {
+    "running": 25,
+    "paused": 189
+   },
+   "setupSeconds": 15,
+   "failedSetups": 0,
+   "requestsPerSecond": 7.8,
+   "requests": 2327,
+   "errorRatePct": 0,
+   "rateLimited": 0,
+   "clientErrors": 0,
+   "api": {
+    "n": 2327,
+    "p50": 17,
+    "p95": 89,
+    "p99": 544,
+    "max": 936
+   },
+   "eventLag": {
+    "n": 30452,
+    "p50": 8,
+    "p95": 23,
+    "p99": 41,
+    "max": 151
+   },
+   "turnOverhead": {
+    "n": 241,
+    "p50": 2017,
+    "p95": 2772,
+    "p99": 4263,
+    "max": 4414
+   },
+   "firstTurn": {
+    "n": 152,
+    "p50": 26969,
+    "p95": 41083,
+    "p99": 42170,
+    "max": 42239
+   },
+   "approveToDone": {
+    "n": 54,
+    "p50": 291,
+    "p95": 621,
+    "p99": 893,
+    "max": 893
+   },
+   "cancelToCancelled": {
+    "n": 43,
+    "p50": 99,
+    "p95": 198,
+    "p99": 204,
+    "max": 204
+   },
+   "wsConnect": {
+    "n": 6,
+    "p50": 34,
+    "p95": 38,
+    "p99": 38,
+    "max": 38
+   },
+   "tenantSetup": {
+    "n": 16,
+    "p50": 5949,
+    "p95": 8802,
+    "p99": 8802,
+    "max": 8802
+   },
+   "tasks": {
+    "created": 157,
+    "turns": 241,
+    "done": 54,
+    "cancelled": 43,
+    "failed": 0,
+    "stuck": 0,
+    "followUps": 93,
+    "resourceSaves": 39
+   },
+   "sockets_": {
+    "opens": 0,
+    "refused": 0,
+    "failures": 0,
+    "drops": 0,
+    "closes": {},
+    "events": 30458
+   },
+   "slowestRoutes": [
+    {
+     "route": "POST /api/projects/:id/resources/:id/import",
+     "n": 39,
+     "p50": 598,
+     "p95": 917,
+     "p99": 936,
+     "max": 936
+    },
+    {
+     "route": "POST /api/projects/:id/tasks",
+     "n": 157,
+     "p50": 80,
+     "p95": 208,
+     "p99": 293,
+     "max": 294
+    },
+    {
+     "route": "POST /api/tasks/:id/signal",
+     "n": 190,
+     "p50": 41,
+     "p95": 89,
+     "p99": 159,
+     "max": 300
+    },
+    {
+     "route": "GET /api/tasks/:id",
+     "n": 305,
+     "p50": 19,
+     "p95": 42,
+     "p99": 72,
+     "max": 101
+    },
+    {
+     "route": "GET /api/tasks/:id/conversation",
+     "n": 305,
+     "p50": 20,
+     "p95": 40,
+     "p99": 96,
+     "max": 125
+    },
+    {
+     "route": "GET /api/projects/:id/tasks",
+     "n": 332,
+     "p50": 18,
+     "p95": 35,
+     "p99": 74,
+     "max": 173
+    }
+   ],
+   "hostCpuPct": {
+    "mean": 37,
+    "max": 62,
+    "steal": 0.1,
+    "iowait": 4.6
+   },
+   "load1Max": 2.74,
+   "hostMemAvailableMinMb": 5399,
+   "containers": {
+    "app": {
+     "cpuMeanPct": 68,
+     "cpuMaxPct": 158,
+     "memMaxMb": 1018,
+     "memLimitMb": 4096
+    },
+    "postgresql": {
+     "cpuMeanPct": 37,
+     "cpuMaxPct": 76,
+     "memMaxMb": 267,
+     "memLimitMb": 768
+    },
+    "temporal": {
+     "cpuMeanPct": 30,
+     "cpuMaxPct": 57,
+     "memMaxMb": 177,
+     "memLimitMb": 2048
+    },
+    "caddy": {
+     "cpuMeanPct": 1,
+     "cpuMaxPct": 2,
+     "memMaxMb": 49,
+     "memLimitMb": 512
+    }
+   },
+   "appRestarts": 0,
+   "appOomKilled": false,
+   "gateway": {
+    "heapUsedMaxMb": 167,
+    "heapLimitMb": 662,
+    "rssMaxMb": 476,
+    "eldP99MaxMs": 16.4,
+    "eldMaxMs": 243,
+    "cpuMeanPct": 19,
+    "gcPct": 0.4,
+    "pids": 1
+   },
+   "worker": {
+    "heapUsedMaxMb": 138,
+    "heapLimitMb": 1276,
+    "rssMaxMb": 558,
+    "eldP99MaxMs": 28.3,
+    "eldMaxMs": 210,
+    "cpuMeanPct": 40,
+    "gcPct": 0.6,
+    "pids": 1
+   },
+   "postgres": {
+    "connectionsMax": 51,
+    "karmaxConnectionsMax": 21,
+    "maxConnections": 100,
+    "lockWaitersMax": 1,
+    "advisoryWaitersMax": 0,
+    "advisoryWaitersMean": 0,
+    "advisoryWaitMaxMs": 0,
+    "longestXactMs": 24,
+    "karmaxCommitsPerSecond": 918.5,
+    "karmaxDbMb": 39
+   },
+   "appGauges": {
+    "karmax_database_bytes": 40909847,
+    "karmax_http_inflight": 4,
+    "karmax_heap_used_bytes{heap=\"gateway\"}": 153787656,
+    "karmax_heap_used_bytes{heap=\"worker\"}": 143613912,
+    "karmax_heap_limit_bytes{heap=\"gateway\"}": 694157312,
+    "karmax_heap_limit_bytes{heap=\"worker\"}": 1337982976,
+    "karmax_process_rss_bytes{process=\"gateway\"}": 498073600,
+    "karmax_process_rss_bytes{process=\"worker\"}": 585170944,
+    "karmax_event_loop_delay_seconds{quantile=\"0.95\"}": 0.021217279,
+    "karmax_event_loop_delay_seconds{quantile=\"0.99\"}": 0.022773759,
+    "karmax_event_loop_delay_max_seconds": 0.481034239,
+    "karmax_store_global_lock_wait_seconds_sum{process=\"gateway\"}": 0,
+    "karmax_store_global_lock_wait_seconds_sum{process=\"worker\"}": 0,
+    "karmax_store_entity_lock_wait_seconds_sum{process=\"gateway\"}": 2.7742901440003087,
+    "karmax_store_entity_lock_wait_seconds_sum{process=\"worker\"}": 1.7293765939929175,
+    "karmax_database_pending": 3,
+    "karmax_database_connections": 8,
+    "karmax_database_waiting": 0
+   },
+   "authorityChangesPerSecond": {
+    "all": 0,
+    "scoped": 0.17
+   },
+   "topStatements": [
+    {
+     "perSecond": 165.6,
+     "meanMs": 0.01,
+     "query": "SELECT v FROM kv WHERE k = $1",
+     "sharePct": 13.4
+    },
+    {
+     "perSecond": 80.5,
+     "meanMs": 0,
+     "query": "COMMIT",
+     "sharePct": 6.5
+    },
+    {
+     "perSecond": 80.5,
+     "meanMs": 0,
+     "query": "BEGIN",
+     "sharePct": 6.5
+    },
+    {
+     "perSecond": 65.7,
+     "meanMs": 0.18,
+     "query": "SELECT karmax_seq_watermark($1, $2) AS w",
+     "sharePct": 5.3
+    },
+    {
+     "perSecond": 56.3,
+     "meanMs": 0.01,
+     "query": "SELECT * FROM projects WHERE id = $1",
+     "sharePct": 4.6
+    },
+    {
+     "perSecond": 50.5,
+     "meanMs": 0.01,
+     "query": "SELECT * FROM events WHERE seq > $1 AND seq <= $2 ORDER BY seq LIMIT $3",
+     "sharePct": 4.1
+    },
+    {
+     "perSecond": 49.8,
+     "meanMs": 0.03,
+     "query": "SELECT id, num, \"projectId\", \"listId\", title, workflow, \"executionWorkflow\", \"workflowVersion\", params, \"createdAt\", ord, \"parentTaskId\", \"createdBy\", assignee, delegate, \"confirmationPolicy\", \"intentId\", \"attemptNumber\", notes, \"lastView\" ",
+     "sharePct": 4
+    },
+    {
+     "perSecond": 47.7,
+     "meanMs": 0.02,
+     "query": "SELECT \"expiresAt\" FROM session WHERE id=$1 AND \"userId\"=$2",
+     "sharePct": 3.9
+    },
+    {
+     "perSecond": 47.6,
+     "meanMs": 0.01,
+     "query": "SELECT handle FROM world_instances WHERE \"worldId\"=$1 AND state!=$2 ORDER BY generation DESC LIMIT $3",
+     "sharePct": 3.9
+    },
+    {
+     "perSecond": 31.5,
+     "meanMs": 0.59,
+     "query": "SELECT $2 FROM tasks WHERE id = $1 FOR UPDATE",
+     "sharePct": 2.6
+    },
+    {
+     "perSecond": 28.5,
+     "meanMs": 0.01,
+     "query": "SELECT json FROM scoped_tokens WHERE \"tokenHash\"=$1 AND \"revokedAt\" IS NULL AND \"expiresAt\">$2",
+     "sharePct": 2.3
+    },
+    {
+     "perSecond": 24.8,
+     "meanMs": 0.1,
+     "query": "INSERT INTO events (\"taskId\", type, ts, payload, origin) VALUES ($1, $2, $3, $4, $5) RETURNING seq",
+     "sharePct": 2
+    }
+   ],
+   "metricsScrapeMaxMs": 155,
+   "temporal": {
+    "backlogAgeMaxMs": 0,
+    "backlogCountMax": 0,
+    "scheduleToStart": {
+     "workflow": {
+      "count": 4588,
+      "meanMs": 7.6,
+      "p50Ms": 25.1,
+      "p95Ms": 47.7
+     },
+     "activity": {
+      "count": 4030,
+      "meanMs": 8,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     }
+    },
+    "serverLatency": {
+     "persistence_latency": {
+      "count": 44267,
+      "meanMs": 2.5,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "syncmatch_latency": {
+      "count": 8758,
+      "meanMs": 5.5,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_dispatch_latency": {
+      "count": 8880,
+      "meanMs": 5.2,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency": {
+      "count": 10503,
+      "meanMs": 5.4,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency_load": {
+      "count": 22031,
+      "meanMs": 3.2,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency_processing": {
+      "count": 22023,
+      "meanMs": 2.7,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_latency_queue": {
+      "count": 10503,
+      "meanMs": 12.1,
+      "p50Ms": 25.1,
+      "p95Ms": 47.8
+     },
+     "task_latency_schedule": {
+      "count": 22023,
+      "meanMs": 0,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_schedule_to_start_latency": {
+      "count": 8618,
+      "meanMs": 7.8,
+      "p50Ms": 25.1,
+      "p95Ms": 47.6
+     },
+     "workflow_task_attempt": {
+      "count": 4594,
+      "meanMs": 1000,
+      "p50Ms": 500,
+      "p95Ms": 950
+     }
+    }
+   },
+   "broken": [],
+   "errorSamples": []
+  },
+  {
+   "step": 5,
+   "tenants": 64,
+   "teams": 16,
+   "people": 96,
+   "sockets": 192,
+   "openTasks": 279,
+   "tasksInTurn": 45,
+   "tasksAtReview": 233,
+   "runningWorkflows": 276,
+   "sandboxes": {
+    "running": 45,
+    "paused": 384
+   },
+   "setupSeconds": 39,
+   "failedSetups": 0,
+   "requestsPerSecond": 15.6,
+   "requests": 4677,
+   "errorRatePct": 0,
+   "rateLimited": 0,
+   "clientErrors": 0,
+   "api": {
+    "n": 4677,
+    "p50": 33,
+    "p95": 181,
+    "p99": 743,
+    "max": 1481
+   },
+   "eventLag": {
+    "n": 59558,
+    "p50": 26,
+    "p95": 87,
+    "p99": 136,
+    "max": 380
+   },
+   "turnOverhead": {
+    "n": 494,
+    "p50": 5358,
+    "p95": 8966,
+    "p99": 9666,
+    "max": 11316
+   },
+   "firstTurn": {
+    "n": 304,
+    "p50": 30356,
+    "p95": 45780,
+    "p99": 47873,
+    "max": 48648
+   },
+   "approveToDone": {
+    "n": 111,
+    "p50": 825,
+    "p95": 1875,
+    "p99": 2105,
+    "max": 2328
+   },
+   "cancelToCancelled": {
+    "n": 69,
+    "p50": 290,
+    "p95": 654,
+    "p99": 917,
+    "max": 917
+   },
+   "wsConnect": {
+    "n": 6,
+    "p50": 67,
+    "p95": 78,
+    "p99": 78,
+    "max": 78
+   },
+   "tenantSetup": {
+    "n": 32,
+    "p50": 8596,
+    "p95": 12962,
+    "p99": 13832,
+    "max": 13832
+   },
+   "tasks": {
+    "created": 291,
+    "turns": 494,
+    "done": 111,
+    "cancelled": 69,
+    "failed": 0,
+    "stuck": 0,
+    "followUps": 200,
+    "resourceSaves": 90
+   },
+   "sockets_": {
+    "opens": 0,
+    "refused": 0,
+    "failures": 0,
+    "drops": 0,
+    "closes": {},
+    "events": 59564
+   },
+   "slowestRoutes": [
+    {
+     "route": "POST /api/projects/:id/resources/:id/import",
+     "n": 90,
+     "p50": 747,
+     "p95": 1319,
+     "p99": 1481,
+     "max": 1481
+    },
+    {
+     "route": "POST /api/projects/:id/tasks",
+     "n": 291,
+     "p50": 145,
+     "p95": 423,
+     "p99": 586,
+     "max": 594
+    },
+    {
+     "route": "POST /api/tasks/:id/signal",
+     "n": 381,
+     "p50": 75,
+     "p95": 210,
+     "p99": 386,
+     "max": 433
+    },
+    {
+     "route": "GET /api/tasks/:id/conversation",
+     "n": 632,
+     "p50": 38,
+     "p95": 129,
+     "p99": 194,
+     "max": 366
+    },
+    {
+     "route": "GET /api/tasks/:id",
+     "n": 632,
+     "p50": 39,
+     "p95": 126,
+     "p99": 218,
+     "max": 404
+    },
+    {
+     "route": "GET /api/projects/:id/tasks",
+     "n": 663,
+     "p50": 36,
+     "p95": 107,
+     "p99": 174,
+     "max": 395
+    }
+   ],
+   "hostCpuPct": {
+    "mean": 76,
+    "max": 90,
+    "steal": 0.1,
+    "iowait": 4.3
+   },
+   "load1Max": 8.65,
+   "hostMemAvailableMinMb": 5018,
+   "containers": {
+    "app": {
+     "cpuMeanPct": 156,
+     "cpuMaxPct": 226,
+     "memMaxMb": 1270,
+     "memLimitMb": 4096
+    },
+    "postgresql": {
+     "cpuMeanPct": 86,
+     "cpuMaxPct": 118,
+     "memMaxMb": 312,
+     "memLimitMb": 768
+    },
+    "temporal": {
+     "cpuMeanPct": 59,
+     "cpuMaxPct": 82,
+     "memMaxMb": 200,
+     "memLimitMb": 2048
+    },
+    "caddy": {
+     "cpuMeanPct": 2,
+     "cpuMaxPct": 5,
+     "memMaxMb": 76,
+     "memLimitMb": 512
+    }
+   },
+   "appRestarts": 0,
+   "appOomKilled": false,
+   "gateway": {
+    "heapUsedMaxMb": 197,
+    "heapLimitMb": 662,
+    "rssMaxMb": 512,
+    "eldP99MaxMs": 33.2,
+    "eldMaxMs": 338,
+    "cpuMeanPct": 37,
+    "gcPct": 1.1,
+    "pids": 1
+   },
+   "worker": {
+    "heapUsedMaxMb": 204,
+    "heapLimitMb": 1276,
+    "rssMaxMb": 746,
+    "eldP99MaxMs": 53.5,
+    "eldMaxMs": 336,
+    "cpuMeanPct": 86,
+    "gcPct": 1.8,
+    "pids": 1
+   },
+   "postgres": {
+    "connectionsMax": 55,
+    "karmaxConnectionsMax": 23,
+    "maxConnections": 100,
+    "lockWaitersMax": 3,
+    "advisoryWaitersMax": 0,
+    "advisoryWaitersMean": 0,
+    "advisoryWaitMaxMs": 0,
+    "longestXactMs": 190,
+    "karmaxCommitsPerSecond": 1767.1,
+    "karmaxDbMb": 67
+   },
+   "appGauges": {
+    "karmax_database_bytes": 70073367,
+    "karmax_http_inflight": 5,
+    "karmax_heap_used_bytes{heap=\"gateway\"}": 199146016,
+    "karmax_heap_used_bytes{heap=\"worker\"}": 215358744,
+    "karmax_heap_limit_bytes{heap=\"gateway\"}": 694157312,
+    "karmax_heap_limit_bytes{heap=\"worker\"}": 1337982976,
+    "karmax_process_rss_bytes{process=\"gateway\"}": 537321472,
+    "karmax_process_rss_bytes{process=\"worker\"}": 782262272,
+    "karmax_event_loop_delay_seconds{quantile=\"0.95\"}": 0.021397503,
+    "karmax_event_loop_delay_seconds{quantile=\"0.99\"}": 0.026673151,
+    "karmax_event_loop_delay_max_seconds": 0.481034239,
+    "karmax_store_global_lock_wait_seconds_sum{process=\"gateway\"}": 0,
+    "karmax_store_global_lock_wait_seconds_sum{process=\"worker\"}": 0,
+    "karmax_store_entity_lock_wait_seconds_sum{process=\"gateway\"}": 8.076001946004219,
+    "karmax_store_entity_lock_wait_seconds_sum{process=\"worker\"}": 13.78085944298364,
+    "karmax_database_pending": 5,
+    "karmax_database_connections": 8,
+    "karmax_database_waiting": 0
+   },
+   "authorityChangesPerSecond": {
+    "all": 0,
+    "scoped": 0.35
+   },
+   "topStatements": [
+    {
+     "perSecond": 334.1,
+     "meanMs": 0.02,
+     "query": "SELECT v FROM kv WHERE k = $1",
+     "sharePct": 13.9
+    },
+    {
+     "perSecond": 159.7,
+     "meanMs": 0,
+     "query": "COMMIT",
+     "sharePct": 6.6
+    },
+    {
+     "perSecond": 159.6,
+     "meanMs": 0,
+     "query": "BEGIN",
+     "sharePct": 6.6
+    },
+    {
+     "perSecond": 114.1,
+     "meanMs": 0.3,
+     "query": "SELECT karmax_seq_watermark($1, $2) AS w",
+     "sharePct": 4.7
+    },
+    {
+     "perSecond": 110.6,
+     "meanMs": 0.03,
+     "query": "SELECT * FROM projects WHERE id = $1",
+     "sharePct": 4.6
+    },
+    {
+     "perSecond": 98.7,
+     "meanMs": 0.05,
+     "query": "SELECT id, num, \"projectId\", \"listId\", title, workflow, \"executionWorkflow\", \"workflowVersion\", params, \"createdAt\", ord, \"parentTaskId\", \"createdBy\", assignee, delegate, \"confirmationPolicy\", \"intentId\", \"attemptNumber\", notes, \"lastView\" ",
+     "sharePct": 4.1
+    },
+    {
+     "perSecond": 96.8,
+     "meanMs": 0.02,
+     "query": "SELECT \"expiresAt\" FROM session WHERE id=$1 AND \"userId\"=$2",
+     "sharePct": 4
+    },
+    {
+     "perSecond": 93.6,
+     "meanMs": 0.02,
+     "query": "SELECT handle FROM world_instances WHERE \"worldId\"=$1 AND state!=$2 ORDER BY generation DESC LIMIT $3",
+     "sharePct": 3.9
+    },
+    {
+     "perSecond": 82.7,
+     "meanMs": 0.01,
+     "query": "SELECT * FROM events WHERE seq > $1 AND seq <= $2 ORDER BY seq LIMIT $3",
+     "sharePct": 3.4
+    },
+    {
+     "perSecond": 63.4,
+     "meanMs": 1.91,
+     "query": "SELECT $2 FROM tasks WHERE id = $1 FOR UPDATE",
+     "sharePct": 2.6
+    },
+    {
+     "perSecond": 58.4,
+     "meanMs": 0.02,
+     "query": "SELECT json FROM scoped_tokens WHERE \"tokenHash\"=$1 AND \"revokedAt\" IS NULL AND \"expiresAt\">$2",
+     "sharePct": 2.4
+    },
+    {
+     "perSecond": 49.9,
+     "meanMs": 0.13,
+     "query": "INSERT INTO events (\"taskId\", type, ts, payload, origin) VALUES ($1, $2, $3, $4, $5) RETURNING seq",
+     "sharePct": 2.1
+    }
+   ],
+   "metricsScrapeMaxMs": 286,
+   "temporal": {
+    "backlogAgeMaxMs": 0,
+    "backlogCountMax": 0,
+    "scheduleToStart": {
+     "workflow": {
+      "count": 9167,
+      "meanMs": 16.9,
+      "p50Ms": 26.4,
+      "p95Ms": 53.7
+     },
+     "activity": {
+      "count": 8058,
+      "meanMs": 17.1,
+      "p50Ms": 26.5,
+      "p95Ms": 55.1
+     }
+    },
+    "serverLatency": {
+     "asyncmatch_latency": {
+      "count": 188,
+      "meanMs": 41.4,
+      "p50Ms": 34.8,
+      "p95Ms": 124
+     },
+     "persistence_latency": {
+      "count": 85891,
+      "meanMs": 3.9,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "syncmatch_latency": {
+      "count": 17436,
+      "meanMs": 10.6,
+      "p50Ms": 25.1,
+      "p95Ms": 47.6
+     },
+     "task_dispatch_latency": {
+      "count": 17766,
+      "meanMs": 10.5,
+      "p50Ms": 25.1,
+      "p95Ms": 47.8
+     },
+     "task_latency": {
+      "count": 20944,
+      "meanMs": 10,
+      "p50Ms": 25.1,
+      "p95Ms": 47.6
+     },
+     "task_latency_load": {
+      "count": 43780,
+      "meanMs": 6.1,
+      "p50Ms": 25.3,
+      "p95Ms": 48.1
+     },
+     "task_latency_processing": {
+      "count": 43732,
+      "meanMs": 5,
+      "p50Ms": 25,
+      "p95Ms": 47.6
+     },
+     "task_latency_queue": {
+      "count": 20944,
+      "meanMs": 22.8,
+      "p50Ms": 26.9,
+      "p95Ms": 64.3
+     },
+     "task_latency_schedule": {
+      "count": 43732,
+      "meanMs": 0,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_schedule_to_start_latency": {
+      "count": 17225,
+      "meanMs": 17,
+      "p50Ms": 26.4,
+      "p95Ms": 54.3
+     },
+     "workflow_task_attempt": {
+      "count": 9171,
+      "meanMs": 1000,
+      "p50Ms": 500,
+      "p95Ms": 950
+     }
+    }
+   },
+   "broken": [],
+   "errorSamples": []
+  },
+  {
+   "step": 6,
+   "tenants": 96,
+   "teams": 24,
+   "people": 144,
+   "sockets": 288,
+   "openTasks": 479,
+   "tasksInTurn": 264,
+   "tasksAtReview": 211,
+   "runningWorkflows": 489,
+   "sandboxes": {
+    "running": 287,
+    "paused": 419
+   },
+   "setupSeconds": 51,
+   "failedSetups": 0,
+   "requestsPerSecond": 32.9,
+   "requests": 9856,
+   "errorRatePct": 0,
+   "rateLimited": 0,
+   "clientErrors": 1,
+   "api": {
+    "n": 9856,
+    "p50": 65,
+    "p95": 409,
+    "p99": 1099,
+    "max": 3161
+   },
+   "eventLag": {
+    "n": 50612,
+    "p50": 2015,
+    "p95": 3155,
+    "p99": 3875,
+    "max": 4211
+   },
+   "turnOverhead": {
+    "n": 265,
+    "p50": 88459,
+    "p95": 173368,
+    "p99": 188268,
+    "max": 192869
+   },
+   "firstTurn": {
+    "n": 191,
+    "p50": 110970,
+    "p95": 200582,
+    "p99": 225646,
+    "max": 227748
+   },
+   "approveToDone": {
+    "n": 76,
+    "p50": 34705,
+    "p95": 44760,
+    "p99": 51316,
+    "max": 51316
+   },
+   "cancelToCancelled": {
+    "n": 69,
+    "p50": 8788,
+    "p95": 20896,
+    "p99": 24149,
+    "max": 24149
+   },
+   "wsConnect": {
+    "n": 6,
+    "p50": 49,
+    "p95": 51,
+    "p99": 51,
+    "max": 51
+   },
+   "tenantSetup": {
+    "n": 32,
+    "p50": 10944,
+    "p95": 17092,
+    "p99": 17861,
+    "max": 17861
+   },
+   "tasks": {
+    "created": 292,
+    "turns": 265,
+    "done": 76,
+    "cancelled": 69,
+    "failed": 8,
+    "stuck": 0,
+    "followUps": 128,
+    "resourceSaves": 130
+   },
+   "sockets_": {
+    "opens": 0,
+    "refused": 0,
+    "failures": 0,
+    "drops": 0,
+    "closes": {},
+    "events": 50618
+   },
+   "slowestRoutes": [
+    {
+     "route": "POST /api/projects/:id/resources/:id/import",
+     "n": 130,
+     "p50": 1193,
+     "p95": 2371,
+     "p99": 3153,
+     "max": 3161
+    },
+    {
+     "route": "POST /api/projects/:id/tasks",
+     "n": 292,
+     "p50": 305,
+     "p95": 953,
+     "p99": 1587,
+     "max": 1975
+    },
+    {
+     "route": "POST /api/tasks/:id/signal",
+     "n": 272,
+     "p50": 158,
+     "p95": 540,
+     "p99": 1307,
+     "max": 1394
+    },
+    {
+     "route": "GET /api/tasks/:id",
+     "n": 1528,
+     "p50": 88,
+     "p95": 409,
+     "p99": 735,
+     "max": 993
+    },
+    {
+     "route": "GET /api/tasks/:id/conversation",
+     "n": 1507,
+     "p50": 88,
+     "p95": 395,
+     "p99": 776,
+     "max": 996
+    },
+    {
+     "route": "GET /api/projects/:id/tasks",
+     "n": 1530,
+     "p50": 74,
+     "p95": 321,
+     "p99": 576,
+     "max": 793
+    }
+   ],
+   "hostCpuPct": {
+    "mean": 93,
+    "max": 98,
+    "steal": 0.1,
+    "iowait": 1.9
+   },
+   "load1Max": 11.53,
+   "hostMemAvailableMinMb": 4770,
+   "containers": {
+    "app": {
+     "cpuMeanPct": 193,
+     "cpuMaxPct": 238,
+     "memMaxMb": 1448,
+     "memLimitMb": 4096
+    },
+    "postgresql": {
+     "cpuMeanPct": 104,
+     "cpuMaxPct": 132,
+     "memMaxMb": 326,
+     "memLimitMb": 768
+    },
+    "temporal": {
+     "cpuMeanPct": 67,
+     "cpuMaxPct": 91,
+     "memMaxMb": 232,
+     "memLimitMb": 2048
+    },
+    "caddy": {
+     "cpuMeanPct": 3,
+     "cpuMaxPct": 5,
+     "memMaxMb": 106,
+     "memLimitMb": 512
+    }
+   },
+   "appRestarts": 0,
+   "appOomKilled": false,
+   "gateway": {
+    "heapUsedMaxMb": 201,
+    "heapLimitMb": 662,
+    "rssMaxMb": 523,
+    "eldP99MaxMs": 36,
+    "eldMaxMs": 438,
+    "cpuMeanPct": 55,
+    "gcPct": 2.4,
+    "pids": 1
+   },
+   "worker": {
+    "heapUsedMaxMb": 245,
+    "heapLimitMb": 1276,
+    "rssMaxMb": 878,
+    "eldP99MaxMs": 72.7,
+    "eldMaxMs": 469,
+    "cpuMeanPct": 102,
+    "gcPct": 3.3,
+    "pids": 1
+   },
+   "postgres": {
+    "connectionsMax": 60,
+    "karmaxConnectionsMax": 24,
+    "maxConnections": 100,
+    "lockWaitersMax": 1,
+    "advisoryWaitersMax": 0,
+    "advisoryWaitersMean": 0,
+    "advisoryWaitMaxMs": 0,
+    "longestXactMs": 440,
+    "karmaxCommitsPerSecond": 2176.9,
+    "karmaxDbMb": 89
+   },
+   "appGauges": {
+    "karmax_database_bytes": 93395991,
+    "karmax_http_inflight": 19,
+    "karmax_heap_used_bytes{heap=\"gateway\"}": 201072416,
+    "karmax_heap_used_bytes{heap=\"worker\"}": 249183408,
+    "karmax_heap_limit_bytes{heap=\"gateway\"}": 694157312,
+    "karmax_heap_limit_bytes{heap=\"worker\"}": 1337982976,
+    "karmax_process_rss_bytes{process=\"gateway\"}": 548876288,
+    "karmax_process_rss_bytes{process=\"worker\"}": 919609344,
+    "karmax_event_loop_delay_seconds{quantile=\"0.95\"}": 0.023117823,
+    "karmax_event_loop_delay_seconds{quantile=\"0.99\"}": 0.030310399,
+    "karmax_event_loop_delay_max_seconds": 0.481034239,
+    "karmax_store_global_lock_wait_seconds_sum{process=\"gateway\"}": 0,
+    "karmax_store_global_lock_wait_seconds_sum{process=\"worker\"}": 0,
+    "karmax_store_entity_lock_wait_seconds_sum{process=\"gateway\"}": 15.407863438999186,
+    "karmax_store_entity_lock_wait_seconds_sum{process=\"worker\"}": 33.218204722981056,
+    "karmax_database_pending": 20,
+    "karmax_database_connections": 8,
+    "karmax_database_waiting": 12
+   },
+   "authorityChangesPerSecond": {
+    "all": 0,
+    "scoped": 0.74
+   },
+   "topStatements": [
+    {
+     "perSecond": 498.4,
+     "meanMs": 0.02,
+     "query": "SELECT v FROM kv WHERE k = $1",
+     "sharePct": 18.6
+    },
+    {
+     "perSecond": 173.9,
+     "meanMs": 0.02,
+     "query": "SELECT \"expiresAt\" FROM session WHERE id=$1 AND \"userId\"=$2",
+     "sharePct": 6.5
+    },
+    {
+     "perSecond": 125.9,
+     "meanMs": 0,
+     "query": "BEGIN",
+     "sharePct": 4.7
+    },
+    {
+     "perSecond": 125.9,
+     "meanMs": 0,
+     "query": "COMMIT",
+     "sharePct": 4.7
+    },
+    {
+     "perSecond": 116.3,
+     "meanMs": 0.02,
+     "query": "SELECT json FROM scoped_tokens WHERE \"tokenHash\"=$1 AND \"revokedAt\" IS NULL AND \"expiresAt\">$2",
+     "sharePct": 4.3
+    },
+    {
+     "perSecond": 109.8,
+     "meanMs": 0.05,
+     "query": "SELECT * FROM projects WHERE id = $1",
+     "sharePct": 4.1
+    },
+    {
+     "perSecond": 86.7,
+     "meanMs": 0.04,
+     "query": "SELECT \"organizationId\" FROM projects WHERE id=$1",
+     "sharePct": 3.2
+    },
+    {
+     "perSecond": 84.4,
+     "meanMs": 0.41,
+     "query": "SELECT karmax_seq_watermark($1, $2) AS w",
+     "sharePct": 3.1
+    },
+    {
+     "perSecond": 74.9,
+     "meanMs": 0.06,
+     "query": "SELECT id, num, \"projectId\", \"listId\", title, workflow, \"executionWorkflow\", \"workflowVersion\", params, \"createdAt\", ord, \"parentTaskId\", \"createdBy\", assignee, delegate, \"confirmationPolicy\", \"intentId\", \"attemptNumber\", notes, \"lastView\" ",
+     "sharePct": 2.8
+    },
+    {
+     "perSecond": 71.5,
+     "meanMs": 0.15,
+     "query": "SELECT $9 AS kind, CAST(id AS TEXT) AS a, CAST(COALESCE(\"organizationId\", $10) AS TEXT) AS b, CAST($11 AS TEXT) AS c FROM projects WHERE id = $1 UNION ALL SELECT $12, CAST(\"principalId\" AS TEXT), CAST(\"scopeKey\" AS TEXT), CAST(json AS TEXT)",
+     "sharePct": 2.7
+    },
+    {
+     "perSecond": 69.6,
+     "meanMs": 0.02,
+     "query": "SELECT \"projectId\" FROM tasks WHERE id=$1",
+     "sharePct": 2.6
+    },
+    {
+     "perSecond": 66.5,
+     "meanMs": 0.03,
+     "query": "SELECT handle FROM world_instances WHERE \"worldId\"=$1 AND state!=$2 ORDER BY generation DESC LIMIT $3",
+     "sharePct": 2.5
+    }
+   ],
+   "metricsScrapeMaxMs": 646,
+   "temporal": {
+    "backlogAgeMaxMs": 0,
+    "backlogCountMax": 0,
+    "scheduleToStart": {
+     "workflow": {
+      "count": 7167,
+      "meanMs": 194.6,
+      "p50Ms": 40.9,
+      "p95Ms": 1252.1
+     },
+     "activity": {
+      "count": 7183,
+      "meanMs": 18.3,
+      "p50Ms": 26.2,
+      "p95Ms": 49.7
+     }
+    },
+    "serverLatency": {
+     "asyncmatch_latency": {
+      "count": 3089,
+      "meanMs": 424.4,
+      "p50Ms": 287.9,
+      "p95Ms": 1729
+     },
+     "persistence_latency": {
+      "count": 103807,
+      "meanMs": 5.7,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "syncmatch_latency": {
+      "count": 11723,
+      "meanMs": 17.9,
+      "p50Ms": 25.9,
+      "p95Ms": 49.2
+     },
+     "task_dispatch_latency": {
+      "count": 14927,
+      "meanMs": 101.9,
+      "p50Ms": 31.5,
+      "p95Ms": 645.7
+     },
+     "task_latency": {
+      "count": 17723,
+      "meanMs": 13.9,
+      "p50Ms": 25.6,
+      "p95Ms": 48.6
+     },
+     "task_latency_load": {
+      "count": 39277,
+      "meanMs": 5.2,
+      "p50Ms": 25.1,
+      "p95Ms": 47.6
+     },
+     "task_latency_processing": {
+      "count": 39312,
+      "meanMs": 6.7,
+      "p50Ms": 25.3,
+      "p95Ms": 48.1
+     },
+     "task_latency_queue": {
+      "count": 17723,
+      "meanMs": 26,
+      "p50Ms": 27.1,
+      "p95Ms": 68.8
+     },
+     "task_latency_schedule": {
+      "count": 39312,
+      "meanMs": 0,
+      "p50Ms": 25,
+      "p95Ms": 47.5
+     },
+     "task_schedule_to_start_latency": {
+      "count": 14350,
+      "meanMs": 106.3,
+      "p50Ms": 31.9,
+      "p95Ms": 685.9
+     },
+     "workflow_task_attempt": {
+      "count": 7178,
+      "meanMs": 1000,
+      "p50Ms": 500,
+      "p95Ms": 950
+     }
+    }
+   },
+   "broken": [
+    "turn overhead p50 88459 ms",
+    "8 failed and 0 stuck tasks of 273"
+   ],
+   "errorSamples": [
+    {
+     "route": "GET /api/tasks/:id/events",
+     "status": 403,
+     "detail": "{\"error\":\"invalid or expired token\",\"code\":\"capability_denied\"}"
+    }
+   ]
+  }
+ ]
+}

@@ -6,6 +6,7 @@ export async function rememberSubscriptionCatalog(store: Pick<Store, 'db' | 'kvG
   input: Partial<SubscriptionCatalogConfig>): Promise<SubscriptionCatalogConfig[]> {
   const key = `billing:catalog-history:${provider}`;
   return store.db.transaction(async () => {
+    await store.db.lock(`kv:${key}`);
     const history = JSON.parse(await store.kvGet(key) ?? '[]') as SubscriptionCatalogConfig[];
     if (!input.individualPriceId || !input.teamBasePriceId || !input.teamSeatPriceId) return history;
     const catalog: SubscriptionCatalogConfig = {

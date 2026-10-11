@@ -225,9 +225,12 @@ exec /bin/cat "$@"
       expect(immediate).toContain('finished-already');
       expect(ctx.waits).toEqual([]);
 
-      expect(await t.pause!({ minutes: 10 })).toContain('Pausing for 10 min');
+      // indike.org#2: "End your turn now" alone made agents drop a question they were just asked.
+      expect(await t.pause!({ minutes: 10 })).toBe('Pausing for 10 min. End your turn now, answering in your final response anything you were just asked; you will be resumed then, or sooner if a message arrives.');
       const running = await startJob(world, { command: 'sleep 30' });
-      expect(await t.pause!({ minutes: 90, jobs: [running.id, done.id] })).toContain(`Waiting for ${running.id} (at most 90 min)`);
+      const waiting = await t.pause!({ minutes: 90, jobs: [running.id, done.id] });
+      expect(waiting).toContain(`Waiting for ${running.id} (at most 90 min)`);
+      expect(waiting).toContain('End your turn now, answering in your final response anything you were just asked;');
       // A plain pause lets a cloud world be suspended, which would freeze the job.
       expect(await t.pause!({ minutes: 10 })).toBe(`error: ${running.id} is still running. Pass it in jobs: a pause without it lets the world be suspended, which freezes it. You are still resumed after minutes at the latest.`);
       expect(ctx.waits).toEqual([{ minutes: 10 }, { minutes: 90, jobs: [running.id] }]);

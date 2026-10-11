@@ -58,10 +58,10 @@ linux('initializes one complete key and retains independent writes from two proc
     for (const { child } of workers) child.send('start');
     for (const worker of workers) expect((await worker.closed)[0]).toBe(0);
     const vault = new Vault(dir);
-    expect(vault.list()).toHaveLength(25);
+    expect(await vault.list()).toHaveLength(25);
     for (const prefix of ['first', 'second'])
-      for (let i = 0; i < 12; i++) expect(vault.reveal(prefix + i)).toBe('fixture-' + i);
-    expect(['first', 'second']).toContain(vault.reveal('shared-encryption-key'));
+      for (let i = 0; i < 12; i++) expect(await vault.reveal(prefix + i)).toBe('fixture-' + i);
+    expect(['first', 'second']).toContain(await vault.reveal('shared-encryption-key'));
     expect(fs.readFileSync(path.join(dir, 'vault.key'))).toHaveLength(32);
   } finally {
     clearTimeout(timeout);
@@ -82,7 +82,7 @@ linux('waits asynchronously for another writer before reading the secret map', a
     await lockContended(path.join(dir, 'secrets.json.lock'));
     expect(written).toBe(false);
   } finally { release(); await writing; }
-  expect(vault.reveal('later')).toBe('fixture');
+  expect(await vault.reveal('later')).toBe('fixture');
 });
 
 it('preserves a replacement credential when cleanup carries an older value', async () => {
@@ -91,10 +91,10 @@ it('preserves a replacement credential when cleanup carries an older value', asy
   await broker.registerHandle('token', 'old', INSTALLATION_SCOPE);
   await broker.registerHandle('token', 'replacement', INSTALLATION_SCOPE);
   expect(await broker.deleteHandleIfUnchanged('token', 'old')).toBe(false);
-  expect(vault.reveal('token')).toBe('replacement');
+  expect(await vault.reveal('token')).toBe('replacement');
   await broker.updateHandle('token', 'renamed', INSTALLATION_SCOPE);
-  expect(vault.has('token')).toBe(false);
-  expect(vault.reveal('renamed')).toBe('replacement');
+  expect(await vault.has('token')).toBe(false);
+  expect(await vault.reveal('renamed')).toBe('replacement');
   expect(await broker.deleteHandleIfUnchanged('renamed', 'replacement')).toBe(true);
 });
 
@@ -119,7 +119,7 @@ it('keeps the existing ciphertext intact when a mutation fails and releases admi
   await expect(vault.move('missing', 'new', INSTALLATION_SCOPE)).rejects.toThrow('no secret');
   expect(stored()).toEqual(before);
   await vault.put('next', 'fixture-2', INSTALLATION_SCOPE);
-  expect(vault.reveal('retained')).toBe('fixture');
+  expect(await vault.reveal('retained')).toBe('fixture');
 });
 
 it('bounds secret writes and reads only the requested entry (AU-5)', async () => {
@@ -130,7 +130,7 @@ it('bounds secret writes and reads only the requested entry (AU-5)', async () =>
   await vault.put('two', 'second', INSTALLATION_SCOPE);
   const read = vi.spyOn(fs, 'readFileSync');
   try {
-    expect(vault.reveal('one')).toBe('first');
+    expect(await vault.reveal('one')).toBe('first');
     expect(read.mock.calls.some(([file]) => String(file).endsWith('secrets.json'))).toBe(false);
   } finally { read.mockRestore(); }
 });
@@ -146,10 +146,10 @@ it('migrates legacy ciphertext without losing readable secrets (AU-5)', async ()
   fs.writeFileSync(path.join(dir, 'secrets.json'), JSON.stringify({
     legacy: `${iv.toString('base64')}.${cipher.getAuthTag().toString('base64')}.${body.toString('base64')}` }));
   const reopened = new Vault(dir);
-  expect(reopened.reveal('legacy')).toBe('retained');
+  expect(await reopened.reveal('legacy')).toBe('retained');
   await reopened.put('next', 'new', INSTALLATION_SCOPE);
-  expect(new Vault(dir).reveal('legacy')).toBe('retained');
-  expect(reopened.list().sort()).toEqual(['legacy', 'next']);
+  expect(await new Vault(dir).reveal('legacy')).toBe('retained');
+  expect((await reopened.list()).sort()).toEqual(['legacy', 'next']);
 });
 
 
@@ -158,13 +158,13 @@ it('retains five encrypted prior values on rotation and deletes them with the ha
   const vault = new Vault(dir);
   for (let i = 0; i < 8; i++) await vault.put('rotated', `rotation-secret-${i}`, INSTALLATION_SCOPE);
   const reopened = new Vault(dir);
-  expect(reopened.reveal('rotated')).toBe('rotation-secret-7');
-  expect(reopened.reveal('rotated', 1)).toBe('rotation-secret-6');
-  expect(reopened.reveal('rotated', 5)).toBe('rotation-secret-2');
-  expect(reopened.reveal('rotated', 6)).toBeUndefined();
+  expect(await reopened.reveal('rotated')).toBe('rotation-secret-7');
+  expect(await reopened.reveal('rotated', 1)).toBe('rotation-secret-6');
+  expect(await reopened.reveal('rotated', 5)).toBe('rotation-secret-2');
+  expect(await reopened.reveal('rotated', 6)).toBeUndefined();
   const files = fs.readdirSync(path.join(dir, 'entries')).filter(file => file.endsWith('.json'));
   expect(files).toHaveLength(1);
   expect(fs.readFileSync(path.join(dir, 'entries', files[0]!), 'utf8')).not.toContain('rotation-secret');
   await reopened.delete('rotated');
-  expect(reopened.reveal('rotated', 1)).toBeUndefined();
+  expect(await reopened.reveal('rotated', 1)).toBeUndefined();
 });

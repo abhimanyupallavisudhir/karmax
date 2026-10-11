@@ -13,7 +13,7 @@ import { ProjectTransfers } from '../src/platform/project-transfer.js';
  */
 
 function socket() {
-  const ws = Object.assign(new EventEmitter(), { readyState: 1, send: vi.fn(), close: vi.fn(), bufferedAmount: 0 });
+  const ws = Object.assign(new EventEmitter(), { readyState: 1, send: vi.fn(), close: vi.fn(), terminate: vi.fn(), bufferedAmount: 0 });
   return { ws, disconnect() { ws.readyState = 3; ws.emit('close'); } };
 }
 
@@ -59,7 +59,9 @@ it('keeps refusing events the socket may not read, without re-deciding each one'
     await f.publish(f.hidden.id, 10);
     await f.publish(f.visible.id, 3);
     expect(f.received().map((ev) => ev.taskId)).toEqual([f.visible.id, f.visible.id, f.visible.id]);
-    expect(f.check).toHaveBeenCalledTimes(2);
+    // The hidden task is another organization's: the socket is never offered
+    // its events (load test 2026-10), so only the visible task is decided.
+    expect(f.check).toHaveBeenCalledTimes(1);
   } finally { f.disconnect(); await f.h.close(); }
 });
 

@@ -2,10 +2,12 @@ import fs from 'node:fs';
 import { Worker as Guardian } from 'node:worker_threads';
 import type { WorkerManager } from './worker-pool.js';
 import type { ExternalWorkflowRef } from '../packages/bundle.js';
-import type { WorkerProcessRequest, WorkerProcessReply, WorkerProcessNotice } from './worker-process.js';
+import { heapNow, type WorkerHeap, type WorkerJournaledNotice, type WorkerProcessRequest, type WorkerProcessReply, type WorkerProcessNotice } from './worker-process.js';
+import { followUpJournaled } from '../activities/follow-up-wakes.js';
+import { storeMetricsSnapshot } from '../store/transaction-metrics.js';
 
 export interface WorkerProcessRuntime {
-  worker: Pick<WorkerManager, 'start' | 'refresh' | 'stop'>;
+  worker: Pick<WorkerManager, 'start' | 'refresh' | 'stop'> & { status?(): Pick<WorkerHeap, 'workflows' | 'workflowCache'> };
   close(): Promise<void>;
 }
 
@@ -69,9 +71,9 @@ export function serveWorkerProcess(create: () => Promise<WorkerProcessRuntime>, 
   let pending = 0;
   let queue = Promise.resolve();
   let shutdown: Promise<void> | undefined;
-  const reply = (id: number, ok: boolean, error?: string): Promise<void> => new Promise(resolve => {
+  const reply = (id: number, ok: boolean, error?: string, extra: Partial<WorkerProcessReply> = {}): Promise<void> => new Promise(resolve => {
     if (!process.connected) return resolve();
-    const response: WorkerProcessReply = { type: 'worker.reply', id, ok, ...(error ? { error } : {}) };
+    const response: WorkerProcessReply = { ...extra, type: 'worker.reply', id, ok, ...(error ? { error } : {}) };
     process.send!(response, () => resolve());
   });
   const drain = () => shutdown ??= (async () => {
@@ -95,13 +97,20 @@ export function serveWorkerProcess(create: () => Promise<WorkerProcessRuntime>, 
   process.once('SIGINT', stop);
   process.on('message', (value: unknown) => {
     if (!value || typeof value !== 'object') return;
+    const journaled = value as Partial<WorkerJournaledNotice>;
+    if (journaled.type === 'worker.journaled') {
+      if (Array.isArray(journaled.taskIds))
+        for (const taskId of journaled.taskIds.slice(0, 1_000)) if (typeof taskId === 'string') followUpJournaled(taskId);
+      return;
+    }
     const request = value as Partial<WorkerProcessRequest>;
     if (request.type !== 'worker.request' || !Number.isSafeInteger(request.id)
       || !['start', 'refresh', 'stop', 'ping'].includes(String(request.action))) return;
     const id = request.id!;
     if (closing || (pending >= 16 && request.action !== 'stop')) { void reply(id, false, 'worker is not accepting commands'); return; }
     if (request.action === 'ping') {
-      void reply(id, !!runtime, runtime ? undefined : 'worker is not started');
+      void reply(id, !!runtime, runtime ? undefined : 'worker is not started',
+        { heap: heapNow(runtime?.worker.status?.()), store: storeMetricsSnapshot() });
       return;
     }
     if (request.action !== 'stop' && (!Array.isArray(request.packages) || request.packages.some(ref =>

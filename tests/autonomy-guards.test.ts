@@ -50,10 +50,10 @@ describe('deleting a vault item', () => {
         write('c', 'other', 'outbox:shared'), write('d', 'other', 'outbox:kept')]));
       await deleteItemConnectorWrites(store, broker, 'org', 'gone');
       expect((await readConnectorWrites(store, 'org')).map((w) => w.id)).toEqual(['c', 'd']);
-      expect(broker.hasHandle('outbox:gone')).toBe(false);
+      expect(await broker.hasHandle('outbox:gone')).toBe(false);
       // A copy another pending write still needs is kept.
-      expect(broker.hasHandle('outbox:shared')).toBe(true);
-      expect(broker.hasHandle('outbox:kept')).toBe(true);
+      expect(await broker.hasHandle('outbox:shared')).toBe(true);
+      expect(await broker.hasHandle('outbox:kept')).toBe(true);
       // A pass write-back already in flight for the item is superseded.
       expect(JSON.parse(kv.get('pass-writeback:org:gone')!).fields).toEqual({});
     } finally { fs.rmSync(home, { recursive: true, force: true }); }

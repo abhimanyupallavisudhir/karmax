@@ -367,6 +367,7 @@ export class SubscriptionBillingService {
     this.requireKey(key);
     if (plan !== null && !isPaidHostedPlanId(plan)) throw new Error('choose Individual or Team, or null to remove the gift');
     return this.store.transaction(async () => {
+      await this.store.lock(`org:${organizationId}`);
       if (!(await this.store.getOrganization(organizationId))) throw new Error('organization not found');
       return this.idempotent(organizationId, `gift:${plan}`, key, async () => {
         if (plan === null) {
@@ -377,8 +378,7 @@ export class SubscriptionBillingService {
             plan=excluded.plan, grantedBy=excluded.grantedBy, grantedAt=excluded.grantedAt`)
             .run(organizationId, plan, grantedBy, Date.now());
         }
-        const account = await this.account(organizationId);
-        await this.reconcileOrganization(organizationId, account);
+        await this.reconcileOrganization(organizationId);
         return this.current(organizationId);
       });
     });
@@ -677,6 +677,9 @@ export class SubscriptionBillingService {
       }
     }
     if (!account) return; // Never adopt a tenant association from provider metadata.
+    // One organization's events apply one at a time, each to its latest account.
+    await this.store.lock(`org:${account.organizationId}`);
+    account = (await this.account(account.organizationId)) ?? account;
     if (provider.customerMode === 'checkout' && event.checkoutId && subscriptionId)
       await this.store.db.prepare("UPDATE subscription_billing_checkouts SET subscriptionId=?, state='associated' WHERE provider=? AND checkoutId=? AND organizationId=?")
         .run(subscriptionId, provider.name, event.checkoutId, account.organizationId);
@@ -754,11 +757,15 @@ export class SubscriptionBillingService {
   }
 
   private async reconcileAccount(account: BillingAccount, now = Date.now()): Promise<void> {
-    await this.reconcileOrganization(account.organizationId, account, now);
+    await this.reconcileOrganization(account.organizationId, now);
   }
 
-  private async reconcileOrganization(organizationId: string, account?: BillingAccount, now = Date.now()): Promise<void> {
+  private async reconcileOrganization(organizationId: string, now = Date.now()): Promise<void> {
     await this.store.transaction(async () => {
+      // The plan follows the gift and account as they are under the lock, not
+      // as the caller read them.
+      await this.store.lock(`org:${organizationId}`);
+      const account = await this.account(organizationId);
       const gift = await this.currentGift(organizationId);
       const paidPlan = account ? this.effectivePlan(account, now) : 'free';
       const plan = paidPlan === 'team' || gift?.plan === 'team' ? 'team'
@@ -865,6 +872,8 @@ export class SubscriptionBillingService {
     const hash = crypto.createHash('sha256').update(`${organizationId}:${operation}`).digest('hex');
     const reference = crypto.randomUUID();
     const cached = await this.store.transaction(async () => {
+    // One billing request reserves the organization at a time.
+    await this.store.lock(`org:${organizationId}`);
     const prior = (await this.store.db.prepare('SELECT * FROM subscription_billing_requests WHERE requestKey=?').get(key)) as any;
     if (prior) {
       if (prior.organizationId !== organizationId || prior.requestHash !== hash) throw new Error('idempotency key was already used for another billing request');

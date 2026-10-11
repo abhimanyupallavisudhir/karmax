@@ -52,9 +52,9 @@ export class WorldProviderConnectionService {
 
   constructor(private store: Store, private broker: CredentialBroker, private probes: ProviderProbes = defaultProbes) {}
 
-  private view(value: WorldProviderConnection): WorldProviderConnectionView {
+  private async view(value: WorldProviderConnection): Promise<WorldProviderConnectionView> {
     const { measuredLimits, ...rest } = value;
-    return { ...rest, credentialConfigured: this.broker.hasHandle(value.credentialHandle),
+    return { ...rest, credentialConfigured: await this.broker.hasHandle(value.credentialHandle),
       limits: computerLimits(value.provider, measuredLimits, value.config.limits) };
   }
 
@@ -62,18 +62,19 @@ export class WorldProviderConnectionService {
    * waited for), so the Computer form's maximum is the account's own. */
   async list(organizationId: string): Promise<WorldProviderConnectionView[]> {
     const values = await this.store.listWorldProviderConnections(organizationId);
-    const unknown = values.filter((value) => !value.measuredLimits && value.enabled && this.broker.hasHandle(value.credentialHandle));
+    const configured = await Promise.all(values.map((value) => this.broker.hasHandle(value.credentialHandle)));
+    const unknown = values.filter((value, index) => !value.measuredLimits && value.enabled && configured[index]);
     if (unknown.length) {
       const probes = unknown.map((value) => this.probeOnce(organizationId, value.provider));
       await Promise.race([Promise.allSettled(probes), new Promise((resolve) => setTimeout(resolve, LIST_PROBE_WAIT_MS).unref())]);
-      return (await this.store.listWorldProviderConnections(organizationId)).map((value) => this.view(value));
+      return Promise.all((await this.store.listWorldProviderConnections(organizationId)).map((value) => this.view(value)));
     }
-    return values.map((value) => this.view(value));
+    return Promise.all(values.map((value) => this.view(value)));
   }
 
   async get(organizationId: string, provider: string): Promise<WorldProviderConnectionView | undefined> {
     const value = (await this.store.getWorldProviderConnection(organizationId, provider));
-    return value ? this.view(value) : undefined;
+    return value ? await this.view(value) : undefined;
   }
 
   /** What a computer on `provider` may be for this organization. Self-hosted
@@ -129,7 +130,7 @@ export class WorldProviderConnectionService {
     const config = cleanConfig({ ...(existing?.config ?? {}), ...(input.config ?? {}) }, this.store.hosted);
     const key = input.apiKey?.trim();
     if (key) (await this.broker.registerHandle(handle, key, organizationScope(input.organizationId)));
-    if (!key && !this.broker.hasHandle(handle)) throw new Error(`${providerName(input.provider)} API key is required`);
+    if (!key && !await this.broker.hasHandle(handle)) throw new Error(`${providerName(input.provider)} API key is required`);
     (await this.store.upsertWorldProviderConnection({
       organizationId: input.organizationId,
       provider: input.provider,
@@ -148,11 +149,11 @@ export class WorldProviderConnectionService {
 
   async resolve(organizationId: string | undefined, provider: string): Promise<ResolvedWorldProviderConnection> {
     const value = organizationId ? (await this.store.getWorldProviderConnection(organizationId, provider)) : undefined;
-    if (value?.enabled && this.broker.hasHandle(value.credentialHandle)) {
+    if (value?.enabled && await this.broker.hasHandle(value.credentialHandle)) {
       return {
         organizationId,
         provider,
-        apiKey: this.broker.resolve(value.credentialHandle, { caps: [`use-credential:${value.credentialHandle}`] }),
+        apiKey: await this.broker.resolve(value.credentialHandle, { caps: [`use-credential:${value.credentialHandle}`] }),
         config: cleanConfig(value.config, this.store.hosted),
         limits: computerLimits(provider, value.measuredLimits, value.config.limits),
         recordLimits: (limits) => this.recordLimits(organizationId!, provider, limits),

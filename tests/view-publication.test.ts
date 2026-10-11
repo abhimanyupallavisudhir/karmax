@@ -1,4 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
+import v8 from 'node:v8';
+import { runInNewContext } from 'node:vm';
 import { Context } from '@temporalio/activity';
 import { Store } from '../src/store/db.js';
 import { WorldRegistry } from '../src/world/registry.js';
@@ -553,6 +555,39 @@ describe('durable conversation publication', () => {
         expect(await f.stored()).toMatchObject({ status: 'waiting', messages: [{ text: 'fourth' }] });
       } finally { await f.close(); }
     });
+  });
+
+  // RT-35: a cached workflow kept its conversation about five times over (the
+  // live messages, a JSON string and a parsed copy, the Do transcript twice in
+  // each), in UTF-16, and 127 of them exhausted the workflow thread's heap.
+  it('remembers what it published as fingerprints, not as copies of the conversation', async () => {
+    v8.setFlagsFromString('--expose-gc');
+    const gc = runInNewContext('gc') as () => void;
+    const heap = () => { gc(); gc(); return v8.getHeapStatistics().used_heap_size; };
+    const writes: PublishedView[] = [];
+    const publish = conversationPublisher('run', async (view) => { writes.push({ ...view, messages: undefined,
+      transcripts: undefined, conversationPatch: view.conversationPatch && { ...view.conversationPatch,
+        messages: { ...view.conversationPatch.messages, append: [] }, transcripts: undefined } } as PublishedView); },
+    { patches: () => true });
+    // 50 messages of 100k UTF-16 characters: 10 MB of text.
+    const conversation = () => {
+      const messages = Array.from({ length: 50 }, (_, i) => ({ id: `m${i}`, role: 'agent' as const, ts: i,
+        text: `‹${i}› ` + 'conversation '.repeat(7_700) }));
+      return { messages, transcripts: [{ role: 'do', label: 'Do', messages }] } as unknown as TaskView;
+    };
+    const before = heap();
+    await publish(conversation());
+    expect(heap() - before).toBeLessThan(1_000_000);
+    // Still recognizes the same conversation, and a grown one as a delta of it.
+    const same = conversation();
+    expect(publish.acknowledges(same)).toBe('run:0');
+    await publish(same);
+    expect(writes.at(-1)!.conversationPatch).toBeUndefined();
+    same.messages.push({ id: 'new', role: 'user', text: 'and one more', ts: 99 });
+    expect(publish.turnBase(same.messages, 'do')).toMatchObject({ base: { reference: 'run:0', role: 'do', count: 50 } });
+    await publish(same);
+    expect(writes.at(-1)!.conversationPatch?.messages.keep).toBe(50);
+    expect(writes.at(-1)!.conversationPatch?.base).toBe('run:0');
   });
 
   it('does not reference an unacknowledged write', async () => {

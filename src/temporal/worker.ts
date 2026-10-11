@@ -2,10 +2,48 @@ import { Worker, NativeConnection, Runtime, DefaultLogger, WorkflowBundle } from
 import { fileURLToPath } from 'node:url';
 import { TASK_QUEUE, TemporalConn } from './config.js';
 import { buildActivities, ActivityDeps } from '../activities/index.js';
+import type { HeapUsage } from '../runtime/memory-budget.js';
 
 export interface WorkerHandle {
   run(): Promise<void>;
   shutdown(): void;
+  /** Cached workflows, and the heap of the thread they run in (RT-35). */
+  status(): Promise<WorkerStatus>;
+  /** Heap snapshots of the workflow threads (each forces a full GC first).
+   * Diagnostics and benchmarks only: a snapshot needs about the heap again. */
+  workflowHeapSnapshots(): Promise<NodeJS.ReadableStream[]>;
+}
+
+export interface WorkerStatus {
+  cachedWorkflows: number;
+  cacheLimit: number;
+  /** The workflow thread's own V8 isolate, separate from the process's main
+   * heap: the SDK runs every workflow (and so the sticky cache) in a worker
+   * thread. Absent if the SDK stops exposing it. */
+  workflowHeap?: HeapUsage;
+}
+
+type HeapThread = {
+  getHeapStatistics(): Promise<{ used_heap_size: number; heap_size_limit: number }>;
+  getHeapSnapshot(): Promise<NodeJS.ReadableStream>;
+};
+
+/** The SDK's workflow threads (@temporalio/worker 1.24: `workflowCreator.
+ * workerThreadClients[].workerThread`). Internal, so feature-detected; the
+ * worker-process Temporal test fails if an upgrade moves it. */
+function workflowThreads(worker: Worker): HeapThread[] {
+  const clients = (worker as unknown as { workflowCreator?: { workerThreadClients?: { workerThread?: unknown }[] } })
+    .workflowCreator?.workerThreadClients ?? [];
+  return clients.map(client => client.workerThread as HeapThread)
+    .filter(thread => typeof thread?.getHeapStatistics === 'function');
+}
+
+async function workflowHeap(worker: Worker): Promise<HeapUsage | undefined> {
+  const threads = workflowThreads(worker);
+  if (!threads.length) return undefined;
+  const stats = await Promise.all(threads.map(thread => thread.getHeapStatistics()));
+  return { heapUsed: stats.reduce((sum, s) => sum + s.used_heap_size, 0),
+    heapLimit: stats.reduce((sum, s) => sum + s.heap_size_limit, 0) };
 }
 
 export interface WorkerOpts {
@@ -16,6 +54,8 @@ export interface WorkerOpts {
    */
   workflowBundle?: WorkflowBundle;
   shutdownGraceTime?: string;
+  /** Overrides `workflowCacheSize()`; the heap governor rolls the worker with less. */
+  maxCachedWorkflows?: number;
 }
 
 let runtimeInstalled = false;
@@ -47,6 +87,7 @@ export function workflowCacheSize(env: NodeJS.ProcessEnv = process.env): number 
 }
 
 export async function makeWorker(conn: TemporalConn, deps: ActivityDeps = {}, opts: WorkerOpts = {}): Promise<WorkerHandle> {
+  const cacheLimit = opts.maxCachedWorkflows ?? workflowCacheSize();
   ensureQuietRuntime();
   const connection = await NativeConnection.connect({ address: conn.address, apiKey: conn.apiKey, tls: conn.tls });
   // Resource caps. The Worker's reusable-VM cache and task-execution pools
@@ -65,7 +106,7 @@ export async function makeWorker(conn: TemporalConn, deps: ActivityDeps = {}, op
     taskQueue: TASK_QUEUE,
     ...source,
     activities: buildActivities(deps),
-    maxCachedWorkflows: workflowCacheSize(),
+    maxCachedWorkflows: cacheLimit,
     maxConcurrentWorkflowTaskExecutions: num(process.env.KARMAX_MAX_WFT, 8),
     maxConcurrentActivityTaskExecutions: activityTaskConcurrency(),
     // Agent activities heartbeat once a second so Temporal can deliver a pending
@@ -102,5 +143,10 @@ export async function makeWorker(conn: TemporalConn, deps: ActivityDeps = {}, op
     shutdown() {
       worker.shutdown();
     },
+    async status() {
+      return { cachedWorkflows: worker.getStatus().numCachedWorkflows, cacheLimit,
+        ...await workflowHeap(worker).then(heap => heap ? { workflowHeap: heap } : {}, () => ({})) };
+    },
+    workflowHeapSnapshots: () => Promise.all(workflowThreads(worker).map(thread => thread.getHeapSnapshot())),
   };
 }

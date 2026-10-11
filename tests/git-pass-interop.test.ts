@@ -141,7 +141,7 @@ it.runIf(process.env.KARMAX_TEST_PASS_INTEROP === '1')('round-trips pass-otp and
     for (const name of names) {
       const item = (await items.list()).find(i => i.provenance.externalId === name)!;
       if (name === 'standalone') expect(item.fields).not.toContain('password');
-      const token = items.readSecret(item, 'totp')!;
+      const token = (await items.readSecret(item, 'totp'))!;
       expect((await items.totp(item, {}))).toHaveLength(token.startsWith('otpauth://') ? Number(new URL(token).searchParams.get('digits') || 6) : 6);
       compareCodes(name, token);
     }
@@ -186,14 +186,14 @@ it.runIf(process.env.KARMAX_TEST_PASS_INTEROP === '1')('round-trips pass-otp and
     connectors.register(mounted);
     expect((await connectors.sync('pass-git', ['work/otp'])).count).toBe(1);
     const mountedItem = (await items.list()).find(item => item.provenance.externalId === 'work/otp')!;
-    expect(items.readSecret(mountedItem, 'totp')).toBe(uri);
+    expect(await items.readSecret(mountedItem, 'totp')).toBe(uri);
     await mounted.updateSecret('work/otp', 'totp', newSeed);
     run('git', ['pull', '--ff-only'], undefined, ageStore);
     const beforeAge = Date.now();
     const ageCode = run('gopass', ['otp', '-o', 'work/otp']).trim();
     expect([totpCode(newSeed, beforeAge), totpCode(newSeed, Date.now())]).toContain(ageCode);
     expect((await connectors.sync('pass-git', ['work/otp'])).count).toBe(1);
-    expect(items.readSecret((await items.get(mountedItem.id))!, 'totp')).toContain(newSeed);
+    expect(await items.readSecret((await items.get(mountedItem.id))!, 'totp')).toContain(newSeed);
   } finally {
     run('gpgconf', ['--kill', 'gpg-agent']);
     fs.rmSync(root, { recursive: true, force: true });

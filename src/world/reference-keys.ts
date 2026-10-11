@@ -7,19 +7,21 @@ import { INSTALLATION_SCOPE } from '../autonomy/vault-keys.js';
 export class WorldReferenceKeys {
   private cached?: { key: Buffer; id: string };
   private constructor(private broker: CredentialBroker) {}
+  /** The key, loaded once by `create` (references are sealed and opened synchronously). */
   private material(): { key: Buffer; id: string } {
-    if (!this.cached) {
-      const handle = 'world-reference:key:v2';
-      const key = Buffer.from(this.broker.resolve(handle, { caps: [`use-credential:${handle}`] }), 'base64');
-      if (key.length !== 32) throw new Error('invalid world reference key');
-      this.cached = { key, id: crypto.createHash('sha256').update(key).digest('hex').slice(0, 16) };
-    }
+    if (!this.cached) throw new Error('world reference key unavailable');
     return this.cached;
+  }
+  private async load(): Promise<void> {
+    const handle = 'world-reference:key:v2';
+    const key = Buffer.from(await this.broker.resolve(handle, { caps: [`use-credential:${handle}`] }), 'base64');
+    if (key.length !== 32) throw new Error('invalid world reference key');
+    this.cached = { key, id: crypto.createHash('sha256').update(key).digest('hex').slice(0, 16) };
   }
   static async create(broker: CredentialBroker, initialize = true): Promise<WorldReferenceKeys> {
     if (initialize) await broker.ensureHandle('world-reference:key:v2', crypto.randomBytes(32).toString('base64'), INSTALLATION_SCOPE);
     const keys = new WorldReferenceKeys(broker);
-    if (initialize || broker.hasHandle('world-reference:key:v2')) keys.material();
+    if (initialize || await broker.hasHandle('world-reference:key:v2')) await keys.load();
     return keys;
   }
   seal(value: Record<string, string>): string {

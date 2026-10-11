@@ -108,13 +108,13 @@ export class PaidLaunchSettingsService {
     const bootstrapEnvironment = this.env.KARMAX_SUBSCRIPTION_PADDLE_ENVIRONMENT === 'sandbox' ? 'sandbox' : 'live';
     const environment = c.environment ?? bootstrapEnvironment;
     const bootstrap = (name: string) => environment === bootstrapEnvironment ? this.env[name] : undefined;
-    const secret = (field: string, fallback?: string) => {
+    const secret = async (field: string, fallback?: string) => {
       const handle = `platform:paddle-subscriptions:${environment}:${field}`;
-      return this.broker.hasHandle(handle) ? this.broker.resolve(handle, { caps: [`use-credential:${handle}`] }) : clean(fallback);
+      return await this.broker.hasHandle(handle) ? this.broker.resolve(handle, { caps: [`use-credential:${handle}`] }) : clean(fallback);
     };
     return { ...c, environment,
-      apiKey: secret('api-key', bootstrap('KARMAX_SUBSCRIPTION_PADDLE_API_KEY')),
-      webhookSecret: secret('webhook-secret', bootstrap('KARMAX_SUBSCRIPTION_PADDLE_WEBHOOK_SECRET')),
+      apiKey: await secret('api-key', bootstrap('KARMAX_SUBSCRIPTION_PADDLE_API_KEY')),
+      webhookSecret: await secret('webhook-secret', bootstrap('KARMAX_SUBSCRIPTION_PADDLE_WEBHOOK_SECRET')),
       clientToken: c.clientToken ?? clean(bootstrap('KARMAX_SUBSCRIPTION_PADDLE_CLIENT_TOKEN')),
       individualPriceId: c.individualPriceId ?? clean(bootstrap('KARMAX_SUBSCRIPTION_PADDLE_INDIVIDUAL_PRICE_ID')),
       teamBasePriceId: c.teamBasePriceId ?? clean(bootstrap('KARMAX_SUBSCRIPTION_PADDLE_TEAM_BASE_PRICE_ID')),
@@ -143,12 +143,12 @@ export class PaidLaunchSettingsService {
 
   async subscriptionConfig(): Promise<SubscriptionRuntimeConfig> {
     const stripe = (await this.stored()).stripe ?? {};
-    const secret = (handle: string, fallback: string | undefined) => this.broker.hasHandle(handle)
+    const secret = async (handle: string, fallback: string | undefined) => await this.broker.hasHandle(handle)
       ? this.broker.resolve(handle, { caps: [`use-credential:${handle}`] }) : clean(fallback);
     return {
       ...stripe,
-      secretKey: secret(SUBSCRIPTION_STRIPE_SECRET_HANDLE, this.env.KARMAX_SUBSCRIPTION_STRIPE_SECRET_KEY),
-      webhookSecret: secret(SUBSCRIPTION_STRIPE_WEBHOOK_HANDLE, this.env.KARMAX_SUBSCRIPTION_STRIPE_WEBHOOK_SECRET),
+      secretKey: await secret(SUBSCRIPTION_STRIPE_SECRET_HANDLE, this.env.KARMAX_SUBSCRIPTION_STRIPE_SECRET_KEY),
+      webhookSecret: await secret(SUBSCRIPTION_STRIPE_WEBHOOK_HANDLE, this.env.KARMAX_SUBSCRIPTION_STRIPE_WEBHOOK_SECRET),
       individualPriceId: stripe.individualPriceId ?? clean(this.env.KARMAX_SUBSCRIPTION_STRIPE_INDIVIDUAL_PRICE_ID),
       teamBasePriceId: stripe.teamBasePriceId ?? clean(this.env.KARMAX_SUBSCRIPTION_STRIPE_TEAM_BASE_PRICE_ID),
       teamSeatPriceId: stripe.teamSeatPriceId ?? clean(this.env.KARMAX_SUBSCRIPTION_STRIPE_TEAM_SEAT_PRICE_ID),

@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { Store } from '../src/store/db.js';
-import { Vault } from '../src/autonomy/vault.js';
+import { openSecretVault } from '../src/autonomy/vault-backend.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { WorldProviderConnectionService } from '../src/world/connections.js';
 import { E2BWorldProvider } from '../src/world/e2b.js';
@@ -51,7 +51,8 @@ async function main() {
     fs.writeFileSync(configFile, JSON.stringify(config));
   }
 
-  const broker = new CredentialBroker(new Vault(path.join(home, 'vault')));
+  // Attaches only: a probe never runs the vault's boot migrations against production.
+  const broker = new CredentialBroker(await openSecretVault(path.join(home, 'vault'), store.db));
   const connections = new WorldProviderConnectionService(store, broker);
   const connection = await connections.get(project.organizationId, worldKind);
   if (!connection?.enabled || !connection.credentialConfigured) throw new Error(`${worldKind} is not enabled and credentialed for this organization`);

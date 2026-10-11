@@ -8,7 +8,7 @@ import { paths } from '../config/paths.js';
 
 export async function deleteAgentMail(store: Store, broker: CredentialBroker | undefined, organizationId: string): Promise<void> {
   const address = await store.kvGet(`agent-mail:address:${organizationId}`);
-  for (const handle of broker?.listHandles() ?? []) {
+  for (const handle of await broker?.listHandles() ?? []) {
     if (handle.startsWith('mailbox:') && handle.endsWith(`:${organizationId}:auth`)) await broker!.deleteHandle(handle);
   }
   await store.transaction(async () => {
@@ -33,7 +33,7 @@ export async function deleteOrganizationAutonomy(store: Store, broker: Credentia
     throw new Error('credential broker is required for organization secret cleanup');
   for (const item of items) await vault.delete(item.id);
   for (const card of cards) for (const handle of [`payment:card:${card.id}`, `payment:card:${card.id}:cvc`]) await broker!.deleteHandle(handle);
-  for (const handle of broker?.listHandles() ?? []) {
+  for (const handle of await broker?.listHandles() ?? []) {
     if (handle.startsWith(`connector:${organizationId}:`) || handle.startsWith(`connector-export:${organizationId}:`)) await broker!.deleteHandle(handle);
   }
   await deleteAgentMail(store, broker, organizationId);

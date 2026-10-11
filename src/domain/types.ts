@@ -160,8 +160,19 @@ export interface Repository {
   defaultBranch: string;
   private: boolean;
   gitConnectionId?: string;
+  /** The repository this one is a GitHub fork of. Work on a fork is proposed
+   * to its upstream: the task branch is pushed to the fork and the pull request
+   * opens on the upstream, which needs no tavya App installation. */
+  upstream?: RepositoryUpstream;
   createdAt: number;
   updatedAt: number;
+}
+
+export interface RepositoryUpstream {
+  owner: string;
+  name: string;
+  defaultBranch: string;
+  private: boolean;
 }
 
 export interface ProjectRepository {
@@ -899,6 +910,17 @@ export interface TaskPullRequest {
   headSha?: string;
   /** GraphQL node id, used only to enter a repository merge queue. */
   nodeId?: string;
+  /** `owner/name` of the fork holding the head branch, when it is not `slug`:
+   * a proposal to a repository someone else owns. Its maintainers land it. */
+  headRepository?: string;
+}
+
+/** What proposing reviewed fork branches to their upstreams produced: pull
+ * requests that exist, and those only a person can open (GitHub's prefilled
+ * page at `url`) because no credential of theirs may write upstream. */
+export interface UpstreamProposal {
+  prs: TaskPullRequest[];
+  pending: Array<{ repo: string; slug: string; url: string }>;
 }
 
 export type GithubLandingOwner = 'provider' | 'external' | 'karmax' | 'unowned' | 'merged';
@@ -1016,6 +1038,9 @@ export interface TaskList {
   order: number;
 }
 
+/** The live asks a person has on one task: their inbox kinds, and when the newest arrived. */
+export interface AttentionAsk { kinds: string[]; at: number }
+
 /** The persisted index record for a task. The live view comes from the workflow query. */
 export interface TaskRecord {
   id: string;
@@ -1045,6 +1070,9 @@ export interface TaskRecord {
   workflowVersion: string; // pinned at creation (SPEC §4.4)
   params: TaskParams;
   createdAt: number;
+  /** When the task last changed stage, status or what it waits for — what
+   *  task lists are ordered by. Absent until its first view. */
+  statusChangedAt?: number;
   order: number;
   parentTaskId?: string;
   /** Immutable creator provenance. */

@@ -74,7 +74,7 @@ describe('vault items: CRUD + write-only secrets', () => {
     }));
     expect(saved.fields.sort()).toEqual(['password', 'totp']);
     expect(JSON.stringify(saved)).not.toContain('hunter2');
-    expect(broker.hasHandle(itemHandle(saved.id, 'password'))).toBe(true);
+    expect(await broker.hasHandle(itemHandle(saved.id, 'password'))).toBe(true);
     // update without secrets keeps the stored ones
     const updated = (await items.save({ id: saved.id, type: 'login', label: 'GitHub — alice' }));
     expect(updated.fields.sort()).toEqual(['password', 'totp']);
@@ -82,7 +82,7 @@ describe('vault items: CRUD + write-only secrets', () => {
     // delete removes the vault handles too
     (await items.delete(saved.id));
     expect((await items.get(saved.id))).toBeUndefined();
-    expect(broker.hasHandle(itemHandle(saved.id, 'password'))).toBe(false);
+    expect(await broker.hasHandle(itemHandle(saved.id, 'password'))).toBe(false);
   });
 
   it('computes a live TOTP code from the stored seed (never returning the seed)', async () => {
@@ -129,7 +129,7 @@ describe('vault usage frequency', () => {
     (await store.kvSet('vault:items:org_personal', JSON.stringify([item])));
     (await items.list());
     (await items.get(item.id));
-    items.readSecret(item, 'password');
+    await items.readSecret(item, 'password');
     await expect((async () => (await items.resolveField(item, 'totp', { mode: 'use' })))()).rejects.toThrow();
     expect((await items.get(item.id))?.useCount).toBe(0);
     (await items.resolveField(item, 'password', { mode: 'use' }));

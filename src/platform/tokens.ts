@@ -368,6 +368,51 @@ export class TokenAuthority {
     return undefined;
   }
 
+  /**
+   * What a connection authenticated with `token` stands on, for deciding when
+   * it must check the token again (`AuthoritySubject`): the token and every
+   * ancestor (revoking a parent invalidates its children), by digest and id;
+   * its delegations; its principal and human subject; its projects and
+   * organization. Undefined when the token is not valid now.
+   */
+  async dependencies(token: string): Promise<{ record: ScopedToken; tokens: Set<string>; delegations: Set<string>;
+    principals: Set<string>; projects: Set<string>; organizations: Set<string> } | undefined> {
+    const record = await this.verify(token);
+    if (!record) return undefined;
+    const tokens = new Set([this.digest(token), record.id]);
+    const delegations = new Set<string>(), principals = new Set<string>(), projects = new Set<string>(), organizations = new Set<string>();
+    for (let current: ScopedToken | undefined = record; current;) {
+      principals.add(current.principal);
+      if (current.humanSubject?.userId) principals.add(`user:${current.humanSubject.userId}`);
+      for (const projectId of [current.projectId, ...(current.projectIds ?? [])]) if (projectId) projects.add(projectId);
+      if (current.organizationId) organizations.add(current.organizationId);
+      if (current.delegationId) delegations.add(current.delegationId);
+      const parentId: string | undefined = current.parentTokenId;
+      if (!parentId || tokens.has(parentId)) break;
+      tokens.add(parentId);
+      const parent = await this.tokenRow(parentId);
+      if (parent) tokens.add(parent.tokenHash);
+      current = parent?.record;
+    }
+    for (const id of delegations) {
+      for (let next = (await this.delegation(id))?.parentDelegationId; next && !delegations.has(next);) {
+        delegations.add(next);
+        next = (await this.delegation(next))?.parentDelegationId;
+      }
+    }
+    if (record.taskId && record.taskId !== '*') {
+      const projectId = await this.store?.taskProjectIdAsync(record.taskId);
+      if (projectId) projects.add(projectId);
+    }
+    return { record, tokens, delegations, principals, projects, organizations };
+  }
+
+  private async tokenRow(id: string): Promise<{ tokenHash: string; record: ScopedToken } | undefined> {
+    if (this.store) return (await this.store.scopedTokenRowById(id)) as { tokenHash: string; record: ScopedToken } | undefined;
+    for (const [tokenHash, record] of this.tokens) if (record.id === id) return { tokenHash, record };
+    return undefined;
+  }
+
   /** Where a refused capability was looked for, in words a person and an
    * agent can both act on: the project and organization, by name and id. */
   private async describeScope(record: ScopedToken, scope?: { projectId?: string; taskId?: string; organizationId?: string }): Promise<string> {

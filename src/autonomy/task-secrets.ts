@@ -175,7 +175,7 @@ export class TaskSecrets {
     if (ref.startsWith('handle:')) {
       const handle = ref.slice(7);
       if (!this.sources.broker) throw new Error('no credential broker');
-      return [this.sources.broker.resolve(handle, { caps: [`use-credential:${handle}`] })];
+      return [await this.sources.broker.resolve(handle, { caps: [`use-credential:${handle}`] })];
     }
     if (ref.startsWith('card:')) {
       if (!this.sources.cardDetails) throw new Error('no payment rail');

@@ -105,6 +105,7 @@ export class LoginManager {
   /** Start (or report) a login for an account. Returns the device URL to open. */
   async connect(provider: Provider, account: string, opts: LoginOptions = {}, organizationId = 'org_personal'): Promise<LoginResult> {
     const configHome = this.homes.prepareLogin(provider, account, organizationId);
+    await this.homes.sync(configHome);
     if (provider === 'opencode' && opts.modelProvider) {
       this.homes.setModelProvider(configHome, opts.modelProvider);
     }
@@ -116,7 +117,14 @@ export class LoginManager {
     if (existing && existing.child.exitCode === null && existing.prompt?.loginUrl) {
       return { provider, account, configHome, ...existing.prompt, status: 'awaiting_oauth' };
     }
-    const spec = this.loginCommand(provider, configHome, opts);
+    // A login in the vault (data epoch 6) signs in beside its cache, which is
+    // adopted when the CLI finishes; otherwise the CLI writes the home itself.
+    const target = this.signInHome(configHome);
+    if (target !== configHome) {
+      fs.rmSync(target, { recursive: true, force: true });
+      fs.mkdirSync(target, { recursive: true, mode: 0o700 });
+    }
+    const spec = this.loginCommand(provider, target, opts);
     if (!spec) {
       const detail = provider === 'opencode'
         ? 'OpenCode login requires a model provider and auth method'
@@ -140,7 +148,7 @@ export class LoginManager {
       if (finished) return;
       finished = true;
       if (this.pending.get(pendingKey)?.child === child) this.pending.delete(pendingKey);
-      this.emitStateChange(provider, account, organizationId, configHome);
+      void this.adopt(configHome).finally(() => this.emitStateChange(provider, account, organizationId, configHome));
     };
     child.once('exit', finish);
     child.once('error', finish);
@@ -153,7 +161,7 @@ export class LoginManager {
       // unsupervised until the user finishes OAuth — visible there, killable if stuck.
       child.once('exit', trackProcess({ pid: child.pid, kind: 'login', label: `${provider} login (${account})`, startedAt: Date.now() }));
     }
-    persistTokenWhenPrinted(child, configHome);
+    persistTokenWhenPrinted(child, target);
     const prompt = await captureLoginPrompt(child, opts.urlTimeoutMs ?? 8000);
     pending.prompt = parseLoginPrompt(prompt.output);
     child.unref(); // let it keep running while the user completes OAuth
@@ -175,7 +183,8 @@ export class LoginManager {
         status: 'awaiting_oauth',
       };
     }
-    if (!opts.force && isFullyAuthed(provider, configHome)) {
+    if (!opts.force && isFullyAuthed(provider, target)) {
+      await this.adopt(configHome);
       this.emitStateChange(provider, account, organizationId, configHome);
       return { provider, account, configHome, status: 'logged_in' };
     }
@@ -190,6 +199,7 @@ export class LoginManager {
     organizationId = 'org_personal',
   ): Promise<LoginResult> {
     const configHome = this.homes.ensure(provider, account, organizationId);
+    const target = this.signInHome(configHome);
     const value = code.trim();
     if (!value || value.length > 4096 || /[\r\n\0]/.test(value))
       return { provider, account, configHome, status: 'failed', detail: 'invalid authorization code' };
@@ -203,13 +213,14 @@ export class LoginManager {
     // not mistake that predecessor for proof that the newly-submitted code was
     // accepted; wait for the provider login process to finish.
     while (Date.now() < deadline && pending.child.exitCode == null
-      && (pending.forced || !isFullyAuthed(provider, configHome))) {
+      && (pending.forced || !isFullyAuthed(provider, target))) {
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
     if (pending.forced && pending.child.exitCode == null)
       return { provider, account, configHome, status: 'awaiting_oauth', detail: 'authorization code submitted; waiting for the provider' };
     if (pending.forced && pending.child.exitCode !== 0)
       return { provider, account, configHome, status: 'failed', detail: 'the provider rejected the authorization code' };
+    if (isFullyAuthed(provider, target)) await this.adopt(configHome);
     if (isFullyAuthed(provider, configHome)) return { provider, account, configHome, status: 'logged_in' };
     if (pending.child.exitCode != null)
       return { provider, account, configHome, status: 'failed', detail: 'the provider rejected the authorization code' };
@@ -219,6 +230,16 @@ export class LoginManager {
   status(provider: Provider, account: string, organizationId = 'org_personal'): { provider: Provider; account: string; configHome: string; loggedIn: boolean } {
     const configHome = this.homes.ensure(provider, account, organizationId);
     return { provider, account, configHome, loggedIn: isLoggedIn(provider, configHome) };
+  }
+
+  private signInHome(configHome: string): string {
+    return this.homes.logins?.pendingHome(configHome) ?? configHome;
+  }
+
+  /** A finished sign-in into the vault; a failure is logged, and the next sign-in repeats it. */
+  private async adopt(configHome: string): Promise<void> {
+    try { await this.homes.logins?.adopt(configHome); }
+    catch (error) { console.error(`[login] could not store the sign-in for ${configHome} in the vault:`, error); }
   }
 
   private pendingKey(provider: Provider, account: string, organizationId: string): string {
