@@ -345,6 +345,10 @@ export interface WorldProviderConnection {
     desktopImage?: string;
     apiUrl?: string;
     target?: string;
+    /** VM providers: where machines run (a Fly region, a Hetzner location). */
+    region?: string;
+    /** Fly.io: the organization slug machines are created in. */
+    organization?: string;
     /** Per-machine limits entered in Advanced, for what the provider's API
      * cannot tell (wiki features/computers). Disk is total GB. */
     limits?: { cpu?: number; memoryMb?: number; diskGb?: number };
@@ -367,7 +371,7 @@ export interface UsageEvent {
   taskId?: string;
   worldId?: string;
   provider: string;
-  kind: 'world.active' | 'checkpoint.storage' | 'resource.storage' | 'preview.active' | 'agent.request' | 'agent.tokens' | 'agent.cost';
+  kind: 'world.active' | 'world.disk' | 'checkpoint.storage' | 'resource.storage' | 'preview.active' | 'agent.request' | 'agent.tokens' | 'agent.cost';
   /** Who pays the upstream bill. `managed` is installation-funded and is
    * disabled in hosted mode until an owner sets an explicit spend cap. */
   fundingSource?: 'managed' | 'byok' | 'customer';

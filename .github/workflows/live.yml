@@ -13,7 +13,7 @@ on:
         description: Live suite to run
         type: choice
         default: all
-        options: [all, models, agent, claude, e2b, daytona, github]
+        options: [all, models, agent, claude, e2b, daytona, vm, github]
   schedule:
     - cron: '17 6 * * 1'
 
@@ -39,6 +39,7 @@ jobs:
       claude: ${{ steps.plan.outputs.claude }}
       e2b: ${{ steps.plan.outputs.e2b }}
       daytona: ${{ steps.plan.outputs.daytona }}
+      vm: ${{ steps.plan.outputs.vm }}
       github: ${{ steps.plan.outputs.github }}
     steps:
       # Job conditions cannot read secrets, so their presence is decided here.
@@ -52,6 +53,9 @@ jobs:
           LIVE_E2B_API_KEY: ${{ secrets.LIVE_E2B_API_KEY }}
           LIVE_DAYTONA_API_KEY: ${{ secrets.LIVE_DAYTONA_API_KEY }}
           LIVE_OPENCODE_ANTHROPIC_API_KEY: ${{ secrets.LIVE_OPENCODE_ANTHROPIC_API_KEY }}
+          LIVE_FLY_API_TOKEN: ${{ secrets.LIVE_FLY_API_TOKEN }}
+          LIVE_HETZNER_API_TOKEN: ${{ secrets.LIVE_HETZNER_API_TOKEN }}
+          LIVE_VM_OPENAI_API_KEY: ${{ secrets.LIVE_VM_OPENAI_API_KEY }}
           LIVE_GITHUB_TOKEN: ${{ secrets.LIVE_GITHUB_TOKEN }}
         run: |
           # decide SUITE SECRET...: the suite runs when selected and any of its secrets is set.
@@ -68,6 +72,7 @@ jobs:
           decide claude LIVE_CLAUDE_CODE_OAUTH_TOKEN
           decide e2b LIVE_E2B_API_KEY
           decide daytona LIVE_DAYTONA_API_KEY
+          decide vm LIVE_FLY_API_TOKEN LIVE_HETZNER_API_TOKEN
           decide github LIVE_GITHUB_TOKEN
 
   models:
@@ -170,6 +175,28 @@ jobs:
           # OpenCode's model key, its own secret like every suite's; without it
           # the OpenCode suites skip (their E2B half runs only by hand).
           ANTHROPIC_API_KEY: ${{ secrets.LIVE_OPENCODE_ANTHROPIC_API_KEY }}
+
+  vm:
+    name: Fly.io and Hetzner VM worlds
+    needs: plan
+    if: github.ref == 'refs/heads/master' && needs.plan.outputs.vm == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: live
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/install
+      # Per provider whose token is set: a 100 GB world, a real agent turn, park
+      # and wake, growth to 150 GB; everything it creates is deleted. A Fly
+      # organization needs a payment method (its free trial stops machines at 5 min).
+      - run: npx vitest run tests/vm-world-live.test.ts
+        env:
+          KARMAX_RUN_LIVE: '1'
+          FLY_API_TOKEN: ${{ secrets.LIVE_FLY_API_TOKEN }}
+          HCLOUD_TOKEN: ${{ secrets.LIVE_HETZNER_API_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.LIVE_VM_OPENAI_API_KEY }}
 
   github:
     name: GitHub pull requests

@@ -65,6 +65,7 @@ import { expandPath } from '../util/expand.js';
 import { withTimeout } from '../util/timeout.js';
 import { AgentAuthority, AgentSpec, AuthorizationSelection, Avatar, Provider, Project, ProjectConfig, PrincipalRef, ProjectPrincipalRef, ResourceAttachment, ResourceRevision, ResourceTarget, WorldLocation, normalizeUrgency } from '../domain/types.js';
 import { dotenvFile, dotenvSecretName, parseDotenv } from '../domain/dotenv.js';
+import { CLOUD_WORLD_PROVIDERS } from '../domain/computer.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
 import { MIN_CLI_VERSION, WorkspaceService } from '../world/workspace.js';
@@ -2467,14 +2468,13 @@ export class Gateway {
         const enabledCredentials = resolveCredentials(credentials, {
           global: parsePolicy((await store.kvGet(credPolicyKey.organization(organizationId)))),
         });
-        const e2b = (await store.getWorldProviderConnection(organizationId, 'e2b'));
-        const daytona = await store.getWorldProviderConnection(organizationId, 'daytona');
+        const clouds = await Promise.all(CLOUD_WORLD_PROVIDERS.map((provider) => store.getWorldProviderConnection(organizationId, provider)));
         const facts = {
           github: Boolean((await this.deps.identity?.providersForUser(subject.userId))?.includes('github')
             || (await this.deps.githubApp?.status(subject.userId))?.userAuthorized
             || (await store.listGitConnections(organizationId)).some((connection) => !connection.suspendedAt)),
           agentLogin: enabledCredentials.length > 0,
-          e2b: [e2b, daytona].some(connection => connection?.enabled
+          e2b: clouds.some(connection => connection?.enabled
             && this.deps.broker?.hasHandle(connection.credentialHandle)),
           paidPlan: await this.deps.subscriptions?.hasPaidSubscription(organizationId) ?? false,
           vault: (await new VaultItems(store, this.deps.broker, undefined, organizationId).list())

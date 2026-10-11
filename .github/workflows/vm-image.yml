@@ -1,0 +1,34 @@
+name: VM image
+
+# Publishes karmax's VM image (environments/vm) to GHCR, tagged with the
+# provisioning version (src/world/vm/provision.ts). Fly.io worlds boot it
+# ready instead of provisioning stock Debian. By hand only; selecting the image
+# (Fly connection → Advanced → Image, or KARMAX_FLY_IMAGE) is a separate step.
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22.16.0' }
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - id: context
+        run: echo "tag=$(npx tsx environments/vm/context.ts environments/vm/out)" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        with: { registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}" }
+      - name: Build and push
+        env:
+          IMAGE: "ghcr.io/${{ github.repository_owner }}/karmax-vm:${{ steps.context.outputs.tag }}"
+        run: |
+          image=$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')
+          docker build -t "$image" environments/vm/out
+          docker push "$image"
+          echo "Published $image — make the package public once, then select it as the Fly image." >> "$GITHUB_STEP_SUMMARY"

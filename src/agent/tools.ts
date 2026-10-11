@@ -645,11 +645,13 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     parameters: {
       type: 'object',
       properties: {
-        organization_id: { type: 'string' }, provider: { type: 'string', enum: ['e2b', 'daytona'] },
+        organization_id: { type: 'string' }, provider: { type: 'string', enum: ['e2b', 'daytona', 'fly', 'hetzner'] },
         api_key: { type: 'string' }, name: { type: 'string' },
         template: { type: 'string' }, snapshot: { type: 'string' }, image: { type: 'string' },
         desktop_template: { type: 'string' }, desktop_snapshot: { type: 'string' }, desktop_image: { type: 'string' },
         api_url: { type: 'string' }, target: { type: 'string' },
+        region: { type: 'string', description: 'Fly.io region (fra) or Hetzner location (fsn1).' },
+        organization: { type: 'string', description: 'Fly.io organization slug (default personal).' },
       },
       required: ['organization_id', 'provider'],
     },
@@ -659,7 +661,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     description: 'Verify an organization cloud provider credential without creating a billable task world.',
     parameters: {
       type: 'object',
-      properties: { organization_id: { type: 'string' }, provider: { type: 'string', enum: ['e2b', 'daytona'] } },
+      properties: { organization_id: { type: 'string' }, provider: { type: 'string', enum: ['e2b', 'daytona', 'fly', 'hetzner'] } },
       required: ['organization_id', 'provider'],
     },
   },
@@ -668,7 +670,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     description: 'Remove an organization cloud provider credential after all worlds using it are gone.',
     parameters: {
       type: 'object',
-      properties: { organization_id: { type: 'string' }, provider: { type: 'string', enum: ['e2b', 'daytona'] } },
+      properties: { organization_id: { type: 'string' }, provider: { type: 'string', enum: ['e2b', 'daytona', 'fly', 'hetzner'] } },
       required: ['organization_id', 'provider'],
     },
   },
@@ -1460,7 +1462,7 @@ export function platformToolHandlers(
         apiKey: args?.api_key, name: args?.name,
         config: { template: args?.template, snapshot: args?.snapshot, image: args?.image,
           desktopTemplate: args?.desktop_template, desktopSnapshot: args?.desktop_snapshot, desktopImage: args?.desktop_image,
-          apiUrl: args?.api_url, target: args?.target },
+          apiUrl: args?.api_url, target: args?.target, region: args?.region, organization: args?.organization },
       }));
     },
     async test_world_provider(args) {

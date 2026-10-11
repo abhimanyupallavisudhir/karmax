@@ -24,6 +24,10 @@ export interface ComputerSpec {
   network?: NonNullable<ProjectConfig['network']>;
 }
 
+/** Cloud providers an organization can connect for task worlds (BYOK). */
+export const CLOUD_WORLD_PROVIDERS = ['e2b', 'daytona', 'fly', 'hetzner'] as const;
+export type CloudWorldProvider = (typeof CLOUD_WORLD_PROVIDERS)[number];
+
 /** What a task may still change once its world exists: the machine's size and
  * how long it sleeps. A different provider, experience or network policy is a
  * different computer, not a resize. */
@@ -37,7 +41,7 @@ const DAY_MS = 86_400_000;
 const LIMITS = {
   cpu: { min: 1, max: 64, integer: true, label: 'CPU' },
   memoryMb: { min: 512, max: 262_144, integer: true, label: 'Memory' },
-  diskGb: { min: 1, max: 2_048, integer: true, label: 'Disk' },
+  diskGb: { min: 1, max: 10_240, integer: true, label: 'Disk' },
   hibernateAfterDays: { min: 0, max: 365, integer: false, label: 'Hibernate after' },
 } as const;
 

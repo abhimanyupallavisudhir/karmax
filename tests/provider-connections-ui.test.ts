@@ -31,7 +31,7 @@ describe('organization Computers and usage UI', () => {
       ? connected : method === 'POST' && path.endsWith('/test') ? {} : undefined);
     const rows = ui.page.locator('#org-computers .computer-provider');
     expect(await rows.evaluateAll((elements) => elements.map((row) => [row.querySelector('b')!.textContent, row.querySelector('.chip')!.textContent])))
-      .toEqual([['E2B', 'connected'], ['Daytona', 'failing']]);
+      .toEqual([['E2B', 'connected'], ['Daytona', 'failing'], ['Fly.io', 'not connected'], ['Hetzner', 'not connected']]);
     expect(await rows.nth(1).locator('.chip').getAttribute('title')).toBe('Daytona connection failed: 401');
     await rows.nth(0).getByRole('button', { name: 'Test' }).click();
     await expect.poll(() => ui.calls.some((call) => call.method === 'POST' && call.path === '/api/organizations/o/world-providers/e2b/test')).toBe(true);
@@ -60,6 +60,22 @@ describe('organization Computers and usage UI', () => {
     await expect.poll(() => ui.calls.filter((call) => call.path.startsWith('/api/organizations/o/world-providers/daytona')).map((call) => call.method))
       .toEqual(['PUT', 'POST']);
     expect(ui.calls.find((call) => call.method === 'PUT')!.body).toMatchObject({ apiKey: 'dtn-key', config: { snapshot: 'big-snapshot', image: '' } });
+    await ui.close();
+  });
+
+  it('connects a VM provider with its region', async () => {
+    const ui = await organization('#org-computers .computer-provider', ({ method }) => method === 'PUT' || method === 'POST' ? {} : undefined);
+    await ui.page.locator('#org-computers [data-provider="fly"] .computer-connect').click();
+    const dialog = ui.page.locator('.computer-dialog');
+    await dialog.locator('.computer-key').fill('FlyV1 fm2_key');
+    await dialog.locator('.computer-advanced > summary').click();
+    expect(await dialog.locator('[data-config]').evaluateAll((inputs) => inputs.map((input) => input.getAttribute('data-config'))))
+      .toEqual(['region', 'organization', 'image']);
+    await dialog.locator('[data-config="region"]').fill('ams');
+    await dialog.getByRole('button', { name: 'Connect' }).click();
+    await expect.poll(() => ui.calls.filter((call) => call.path.startsWith('/api/organizations/o/world-providers/fly')).map((call) => call.method))
+      .toEqual(['PUT', 'POST']);
+    expect(ui.calls.find((call) => call.method === 'PUT')!.body).toMatchObject({ apiKey: 'FlyV1 fm2_key', config: { region: 'ams' } });
     await ui.close();
   });
 

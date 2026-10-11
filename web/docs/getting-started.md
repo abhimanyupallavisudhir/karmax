@@ -12,7 +12,7 @@ In the organization's **Settings**:
 
 - **Projects**: connect GitHub, so agents can work on your repositories and open pull requests.
 - **Agents**: sign in with a Claude or ChatGPT subscription, or add an API key.
-- **Computers**: add an E2B or Daytona API key. Every task runs on a computer from that account.
+- **Computers**: add an E2B, Daytona, Fly.io or Hetzner API key. Every task runs on a computer from that account.
 
 ## 3. Create a project
 

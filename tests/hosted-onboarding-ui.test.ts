@@ -33,7 +33,7 @@ describe('hosted onboarding UI', () => {
     const steps = guide(ui).locator('.onboarding-step');
     await steps.first().waitFor();
     expect(await steps.locator('.onboarding-step-title').allInnerTexts()).toEqual([
-      'Connect GitHub', 'Add agent logins', 'Add an E2B or Daytona API key',
+      'Connect GitHub', 'Add agent logins', 'Connect a cloud computer',
       'Connect apps and payment cards\nOPTIONAL', 'Buy paid plan\nOPTIONAL', 'Create your first project', // chip is upper-cased by CSS
     ]);
     expect(await steps.nth(3).innerText()).toContain('This never blocks setup.');
@@ -50,7 +50,7 @@ describe('hosted onboarding UI', () => {
       links.map((link) => [link.textContent?.trim(), link.getAttribute('href')]));
     expect(actions.map(([, href]) => href)).toEqual(['/org/settings#settings-code', '/org/settings#settings-agents',
       '/org/settings#settings-computers', '/org/settings#settings-payments', '/org/settings#settings-plan']);
-    expect(actions[2]![0]).toBe('Manage E2B/Daytona'); // a completed step offers management, not setup
+    expect(actions[2]![0]).toBe('Manage computers'); // a completed step offers management, not setup
     await guide(ui).locator('.onboarding-step a[href$="#settings-agents"]').click();
     await expect.poll(() => ui.run<string>('location.pathname + location.hash')).toBe('/org/settings#settings-agents');
     await guide(ui).locator('#onboarding-new-project').click();

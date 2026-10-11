@@ -6,6 +6,12 @@ import type { WorldProviderConnection } from '../domain/types.js';
 import type { Store } from '../store/db.js';
 import { probeDaytonaLimits, probeE2BLimits } from './provider-limits.js';
 
+import { CLOUD_WORLD_PROVIDERS } from '../domain/computer.js';
+
+export { CLOUD_WORLD_PROVIDERS };
+/** Self-hosted fallback keys, imported into the installation owner's connection at boot. */
+const ENVIRONMENT_KEYS: Record<string, string> = { e2b: 'E2B_API_KEY', daytona: 'DAYTONA_API_KEY', fly: 'FLY_API_TOKEN', hetzner: 'HCLOUD_TOKEN' };
+
 export interface ResolvedWorldProviderConnection {
   organizationId?: string;
   provider: string;
@@ -115,7 +121,7 @@ export class WorldProviderConnectionService {
     config?: WorldProviderConnection['config'];
     enabled?: boolean;
   }): Promise<WorldProviderConnectionView> {
-    if (!['e2b', 'daytona'].includes(input.provider)) throw new Error(`unsupported world provider: ${input.provider}`);
+    if (!(CLOUD_WORLD_PROVIDERS as readonly string[]).includes(input.provider)) throw new Error(`unsupported world provider: ${input.provider}`);
     const existing = (await this.store.getWorldProviderConnection(input.organizationId, input.provider));
     const handle = existing?.credentialHandle ?? worldProviderCredentialHandle(input.organizationId, input.provider);
     // Validate every non-secret field before rotating the vault handle. A bad
@@ -160,7 +166,7 @@ export class WorldProviderConnectionService {
     if (this.store.hosted)
       throw new Error(`${providerName(provider)} is not connected for this organization`);
     // Environment credentials remain a self-hosted compatibility fallback.
-    const apiKey = provider === 'e2b' ? process.env.E2B_API_KEY : provider === 'daytona' ? process.env.DAYTONA_API_KEY : undefined;
+    const apiKey = ENVIRONMENT_KEYS[provider] ? process.env[ENVIRONMENT_KEYS[provider]!] : undefined;
     if (!apiKey) throw new Error(`${providerName(provider)} is not connected for this organization`);
     return { organizationId, provider, apiKey, config: environmentConfig(provider) };
   }
@@ -174,7 +180,7 @@ export class WorldProviderConnectionService {
   async test(organizationId: string, provider: string): Promise<WorldProviderConnectionView> {
     const connection = (await this.resolve(organizationId, provider));
     try {
-      if (provider !== 'e2b' && provider !== 'daytona') throw new Error(`unsupported world provider: ${provider}`);
+      if (!(CLOUD_WORLD_PROVIDERS as readonly string[]).includes(provider)) throw new Error(`unsupported world provider: ${provider}`);
       await this.probes.check(provider, connection);
       (await this.store.setWorldProviderConnectionStatus(organizationId, provider, 'ready'));
     } catch (error) {
@@ -198,7 +204,8 @@ export class WorldProviderConnectionService {
    * connection exactly once. It keeps upgraded installs working while making
    * subsequent rotation possible from the UI. */
   async importEnvironment(organizationId = 'org_personal'): Promise<void> {
-    for (const [provider, apiKey] of [['e2b', process.env.E2B_API_KEY], ['daytona', process.env.DAYTONA_API_KEY]] as const) {
+    for (const [provider, variable] of Object.entries(ENVIRONMENT_KEYS)) {
+      const apiKey = process.env[variable];
       if (!apiKey || (await this.store.getWorldProviderConnection(organizationId, provider))) continue;
       (await this.save({ organizationId, provider, apiKey, config: environmentConfig(provider) }));
     }
@@ -211,6 +218,12 @@ const defaultProbes: ProviderProbes = {
       const { Sandbox } = await import('e2b');
       const page = Sandbox.list({ apiKey: connection.apiKey, limit: 1 });
       await page.nextItems();
+    } else if (provider === 'fly') {
+      const { FlyDriver } = await import('./fly.js');
+      await new FlyDriver().test(connection);
+    } else if (provider === 'hetzner') {
+      const { HetznerDriver } = await import('./hetzner.js');
+      await new HetznerDriver().test(connection);
     } else {
       const { Daytona } = await import('@daytona/sdk');
       const client = new Daytona({ apiKey: connection.apiKey, apiUrl: connection.config.apiUrl, target: connection.config.target });
@@ -221,6 +234,12 @@ const defaultProbes: ProviderProbes = {
   async limits(provider, connection) {
     if (provider === 'e2b') return probeE2BLimits(connection.apiKey);
     if (provider === 'daytona') return probeDaytonaLimits(connection.apiKey, { apiUrl: connection.config.apiUrl, target: connection.config.target });
+    // Fly's limits are fixed and documented (computer-limits.ts); Hetzner's
+    // largest machine depends on the server types offered at the location.
+    if (provider === 'hetzner') {
+      const { HetznerDriver } = await import('./hetzner.js');
+      return new HetznerDriver().limits(connection);
+    }
     return {};
   },
 };
@@ -255,11 +274,24 @@ function cleanConfig(value: WorldProviderConnection['config'], hosted = false): 
     ...(one(value.desktopImage) ? { desktopImage: one(value.desktopImage) } : {}),
     ...(apiUrl ? { apiUrl } : {}),
     ...(one(value.target, 100) ? { target: one(value.target, 100) } : {}),
+    ...(slug(value.region, 'region') ? { region: slug(value.region, 'region') } : {}),
+    ...(slug(value.organization, 'organization') ? { organization: slug(value.organization, 'organization') } : {}),
     ...(limits ? { limits } : {}),
   };
 }
 
+/** A Fly region or Hetzner location (`fra`, `fsn1`), a Fly organization slug. */
+function slug(input: unknown, label: string): string | undefined {
+  if (typeof input !== 'string' || !input.trim()) return undefined;
+  const value = input.trim().toLowerCase();
+  if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(value)) throw new Error(`${label} must be a short lowercase name like ${label === 'region' ? 'fra' : 'personal'}`);
+  return value;
+}
+
 function environmentConfig(provider: string): WorldProviderConnection['config'] {
+  if (provider === 'fly') return { region: process.env.KARMAX_FLY_REGION, organization: process.env.KARMAX_FLY_ORG,
+    image: process.env.KARMAX_FLY_IMAGE };
+  if (provider === 'hetzner') return { region: process.env.KARMAX_HETZNER_LOCATION, image: process.env.KARMAX_HETZNER_IMAGE };
   return provider === 'e2b'
     ? { template: process.env.KARMAX_E2B_TEMPLATE,
         desktopTemplate: process.env.KARMAX_E2B_DESKTOP_TEMPLATE }
@@ -269,6 +301,6 @@ function environmentConfig(provider: string): WorldProviderConnection['config'] 
         apiUrl: process.env.DAYTONA_API_URL, target: process.env.DAYTONA_TARGET };
 }
 
-function providerName(provider: string): string {
-  return provider === 'e2b' ? 'E2B' : provider === 'daytona' ? 'Daytona' : provider;
+export function providerName(provider: string): string {
+  return ({ e2b: 'E2B', daytona: 'Daytona', fly: 'Fly.io', hetzner: 'Hetzner Cloud' } as Record<string, string>)[provider] ?? provider;
 }

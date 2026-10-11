@@ -1,5 +1,5 @@
 import { describeMachine, sameMachine, type MachineShape } from '../domain/computer.js';
-import { providerLabel, type ComputerLimits, type EffectiveComputerLimits } from '../domain/computer-limits.js';
+import { computerLimits, providerLabel, type ComputerLimits, type EffectiveComputerLimits } from '../domain/computer-limits.js';
 import type { DiskSpace } from '../world/disk.js';
 import { AgentProfile, AgentRole, TaskInput } from '../domain/types.js';
 import { WorldHandle, worldRepos, worldWorkingDirectory } from '../world/types.js';
@@ -179,6 +179,7 @@ function describeComputer(world: WorldHandle, taskId: string, requested?: Machin
     limits.diskGb != null ? `${limits.diskGb} GB disk` : ''].filter(Boolean);
   const allows = allowed.length ? ` This ${providerLabel(world.kind)} account allows up to ${allowed.length > 1
     ? `${allowed.slice(0, -1).join(', ')} and ${allowed.at(-1)}` : allowed[0]}.` : '';
+  if (world.kind === 'fly' || world.kind === 'hetzner') return describeVmComputer(world, taskId, shape, requested, { current, allows, totalGb, limits });
   // A world moves to a new size only once it parks; a pause on jobs keeps it awake.
   const move = 'end your turn with pause(3) without jobs. A pause that waits on jobs keeps this machine, so first let them finish or stop them (stop_job). '
     + 'You resume on the new machine with every tracked file and uncommitted change, but Git-ignored files (dependencies, build output) '
@@ -197,6 +198,29 @@ function describeComputer(world: WorldHandle, taskId: string, requested?: Machin
     ? ` For more memory or CPU, resize it yourself with ${resize('memoryMb', limits.memoryMb ?? memoryMb * 2)} (or cpu) and then ${move}` : '';
   return `Computer: ${current}.${allows} Its disk is the largest this account allows: when it fills, delete what you no longer need `
     + `(build outputs, caches, old copies) or move large data out of the world.${moreMemory}`;
+}
+
+/** A VM world (Fly.io, Hetzner): its disk is a volume that keeps everything and grows in place. */
+function describeVmComputer(world: WorldHandle, taskId: string, shape: MachineShape, requested: MachineShape | undefined,
+  known: { current: string; allows: string; totalGb?: number; limits: ComputerLimits }): string {
+  const machine = (world.meta?.machine as MachineShape | undefined) ?? shape;
+  const home = world.kind === 'hetzner'
+    ? ' Only your home directory (/home/user) lasts through a long pause: install tools there or in the project, not with apt.' : '';
+  const pending = requested && (requested.cpu !== undefined && requested.cpu !== machine.cpu
+    || requested.memoryMb !== undefined && requested.memoryMb !== machine.memoryMb)
+    ? ` Its CPU and memory become ${describeMachine(requested)} at your next pause(3) without jobs (a pause on jobs keeps this machine).` : '';
+  const total = known.totalGb ?? machine.diskGb ?? 20;
+  const max = known.limits.diskGb ?? providerDefaultLimit(world.kind);
+  const grow = max === undefined || total < max
+    ? `If it runs out of disk, grow it yourself with platform_request(PATCH, "/api/tasks/${taskId}/params", {"params": {"computer": {"diskGb": ${
+      max === undefined ? Math.max(50, total * 2) : Math.min(max, Math.max(50, total * 2))}}}}): it grows at once, nothing moves and nothing needs restarting. `
+    : 'Its disk is the largest this account allows: when it fills, delete what you no longer need or move large data out of the world. ';
+  return `Computer: ${known.current}.${known.allows} Everything on its disk, Git-ignored files included, survives pauses.${home}${pending} `
+    + `${grow}More CPU or memory (cpu, memoryMb) applies after your next pause(3) without jobs.`;
+}
+
+function providerDefaultLimit(kind: string): number | undefined {
+  return computerLimits(kind).diskGb;
 }
 
 /** On-demand project data: what there is, and the command that fetches and drops it. */

@@ -80,6 +80,19 @@ describe('the computer in the World section', () => {
       computer: { cpu: 2, memoryMb: 2048, diskGb: 50 } });
     expect(pending).toContain('Computer: 2 CPU · 2 GB. This task\'s computer is now 2 CPU · 2 GB · 50 GB disk: you move to it when the task parks');
   });
+
+  // A VM world's disk is a volume: it keeps everything and grows in place.
+  it('tells an agent on a VM world that its disk keeps everything and grows at once', () => {
+    const vm = (kind: string) => ({ ...world, kind, meta: { computer: { diskGb: 100 }, machine: { cpu: 2, memoryMb: 2048, diskGb: 100 } } }) as any;
+    const fly = assemblePrompt({ profile, role: 'do', task: task({ kind: 'human', audience: ['@creator'] }), world: vm('fly') });
+    expect(fly).toContain('Computer: 2 CPU · 2 GB · 100 GB disk. Everything on its disk, Git-ignored files included, survives pauses.');
+    expect(fly).toMatch(/\{"computer": \{"diskGb": 200\}\}\}\): it grows at once/);
+    expect(fly).not.toContain('do not carry over');
+    const hetzner = assemblePrompt({ profile, role: 'do', task: task({ kind: 'human', audience: ['@creator'] }), world: vm('hetzner'),
+      computer: { cpu: 4, memoryMb: 8192, diskGb: 100 } });
+    expect(hetzner).toContain('Only your home directory (/home/user) lasts through a long pause');
+    expect(hetzner).toContain('Its CPU and memory become 4 CPU · 8 GB · 100 GB disk at your next pause(3) without jobs');
+  });
 });
 
 // pramana#3: every sub-task copied all 10.5 GB of raw_data. An on-demand
