@@ -85,14 +85,17 @@ describe.skipIf(!sshdAvailable)('VM world over SSH', () => {
   });
 
   it('carries a protocol line far over 64 KiB through a raw PTY, both ways', async () => {
-    const pty = await world.openPty({ command: 'stty raw -echo; head -n 1' });
+    // Like a real agent launch, write only once the terminal is raw: before
+    // `stty` runs, a canonical line holds ~4 KiB and input is echoed.
+    const pty = await world.openPty({ command: "stty raw -echo; printf 'R\\n'; head -n 1" });
     let output = '';
     pty.onData((chunk) => { output += chunk; });
     const exit = new Promise<number | null>((resolve) => pty.onExit((code) => resolve(code)));
+    await waitFor(() => output.includes('R\n'));
     const line = 'y'.repeat(300 * 1024);
     await pty.write(`${line}\n`);
     expect(await exit).toBe(0);
-    expect(output).toBe(`${line}\n`);
+    expect(output).toBe(`R\n${line}\n`);
   });
 
   it('reattaches a dropped connection to the same process without losing or repeating output', async () => {

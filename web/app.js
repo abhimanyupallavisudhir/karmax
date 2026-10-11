@@ -1485,7 +1485,7 @@ const computerLimitsFor = (provider) => (S.worldProviderConnections || []).find(
 // What else the chosen provider offers (desktop, outbound allowlist); a
 // provider the page knows nothing about (this machine) offers everything.
 const computerFeaturesFor = (provider) => ({ desktop: true, allowlist: true,
-  ...((S.worldProviderConnections || []).find((c) => c.provider === provider)?.features || {}) });
+  ...((S.worldProviderConnections || []).find((c) => c.provider === provider)?.features) });
 // "This E2B account allows up to 29 GB" — the hover text of each size.
 function computerLimitTip(provider, limits, key) {
   const value = limits?.[key];

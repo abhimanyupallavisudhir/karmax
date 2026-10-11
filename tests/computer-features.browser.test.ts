@@ -19,11 +19,14 @@ it('shows desktop and allowlist only for providers that have them', async () => 
   `);
   const block = ui.page.locator('.computer-field');
   await block.locator('summary').click();
-  const shown = () => block.evaluate((box) => ({
-    flavor: !box.querySelector('.cf-flavor')!.closest('label')!.hidden,
-    network: !box.querySelector('.cf-network')!.closest('label')!.hidden,
-    allowlist: !(box.querySelector('.cf-allowlist') as HTMLElement).hidden,
-  }));
+  const shown = () => block.evaluate((box) => {
+    const hidden = (element: unknown) => (element as { hidden: boolean }).hidden;
+    return {
+      flavor: !hidden(box.querySelector('.cf-flavor')!.closest('label')),
+      network: !hidden(box.querySelector('.cf-network')!.closest('label')),
+      allowlist: !hidden(box.querySelector('.cf-allowlist')),
+    };
+  });
   expect(await shown()).toEqual({ flavor: true, network: true, allowlist: true });
 
   await block.locator('.cf-provider').selectOption('hetzner');

@@ -4,6 +4,7 @@ import type { ResolvedWorldProviderConnection } from './connections.js';
 import type { ProviderUsageEvent, WorldDiagnosis, WorldLifecycleState } from './types.js';
 import type { VmAllocation, VmBootKeys, VmDriver, VmListing, VmShape } from './vm/provider.js';
 import { VM_ETC, VM_HOME, VM_SSH_PORT, vmBootScript } from './vm/provision.js';
+import { PublishedVmImage } from './vm/image.js';
 
 /**
  * Fly.io Machines as VM worlds (`vm/provider.ts`). One Fly app per world: the
@@ -22,9 +23,10 @@ const GRAPHQL = 'https://api.fly.io/graphql';
 export const FLY_MAX_DISK_GB = 500;
 export const FLY_DEFAULT_DISK_GB = 20;
 export const FLY_DEFAULT_REGION = 'fra';
-/** Until a karmax VM image is published, worlds boot a stock Debian image and
- * provision themselves once (minutes); its root filesystem persists. */
-export const DEFAULT_FLY_IMAGE = 'debian:bookworm';
+/** A world boots karmax's published VM image (src/world/vm/image.ts) when it
+ * exists for this provisioning version; until then stock Debian, which
+ * provisions itself once (minutes) and keeps its root filesystem. */
+const publishedImage = new PublishedVmImage();
 
 /** docs.fly.io/about/pricing (checked 2026-10-10): per second, before the region's multiplier. */
 const PRICE_PER_VCPU_SECOND = { shared: 0.0000008465, performance: 0.000012732 } as const;
@@ -63,7 +65,8 @@ export class FlyDriver implements VmDriver {
   readonly kind = 'fly';
   readonly name = 'Fly.io';
 
-  constructor(private fetchImpl: Fetch = fetch, private pollMs = 1_000) {}
+  constructor(private fetchImpl: Fetch = fetch, private pollMs = 1_000,
+    private images: { image(): Promise<string> } = publishedImage) {}
 
   shape(resources: MachineShape | undefined): VmShape {
     const diskGb = resources?.diskGb ?? FLY_DEFAULT_DISK_GB;
@@ -85,8 +88,9 @@ export class FlyDriver implements VmDriver {
       const volume = await api('POST', `/apps/${app}/volumes`, { name: 'home', region, size_gb: request.shape.diskGb,
         encrypted: true, require_unique_zone: false, snapshot_retention: 1 }) as { id: string };
       request.signal?.throwIfAborted();
+      const image = connection.config.image ?? await this.images.image();
       const machine = await api('POST', `/apps/${app}/machines`, { name: 'world', region,
-        config: machineConfig(connection, request.labels, request.shape, request.keys, volume.id) }) as { id: string };
+        config: machineConfig(image, request.labels, request.shape, request.keys, volume.id) }) as { id: string };
       await this.waitFor(connection, app, machine.id, 'started');
       return { ref: { app, machine: machine.id, volume: volume.id, region } };
     } catch (error) {
@@ -322,10 +326,10 @@ export function machineRuns(events: FlyEvent[]): Array<{ startedAt: number; ende
   return runs;
 }
 
-function machineConfig(connection: ResolvedWorldProviderConnection, labels: Record<string, string>, shape: VmShape, keys: VmBootKeys, volume: string) {
+function machineConfig(image: string, labels: Record<string, string>, shape: VmShape, keys: VmBootKeys, volume: string) {
   const file = (guest_path: string, value: string) => ({ guest_path, raw_value: Buffer.from(value).toString('base64') });
   return {
-    image: connection.config.image ?? DEFAULT_FLY_IMAGE,
+    image,
     guest: { ...flyGuest(shape), persist_rootfs: 'always' },
     init: { exec: ['/bin/sh', `${VM_ETC}/boot.sh`] },
     files: [

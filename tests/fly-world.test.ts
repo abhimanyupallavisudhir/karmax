@@ -50,7 +50,7 @@ describe.skipIf(!sshdAvailable)('Fly.io worlds (fake Machines API, real sshd)', 
   beforeEach(() => {
     fly = new FakeFly();
     stamp = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'vm-stamp-')), 'provisioned');
-    provider = new VmWorldProvider(new FlyDriver(fly.fetch, 10), async () => connection(fly.token), undefined, {
+    provider = new VmWorldProvider(new FlyDriver(fly.fetch, 10, { image: async () => 'ghcr.io/owner/karmax-vm:v1' }), async () => connection(fly.token), undefined, {
       socket: fly.socket, user: os.userInfo().username, home: fly.home,
       provision: { stamp, script: `echo provisioned > ${stamp}`, sudo: false },
     });
@@ -65,6 +65,8 @@ describe.skipIf(!sshdAvailable)('Fly.io worlds (fake Machines API, real sshd)', 
     expect([...fly.volumes.values()].map((volume) => [volume.size_gb, volume.region])).toEqual([[100, 'fra']]);
     const machine = [...fly.machines.values()][0]!;
     expect(machine.config.guest).toEqual({ cpu_kind: 'shared', cpus: 2, memory_mb: 4096, persist_rootfs: 'always' });
+    // The published image when there is one (a connection's own Advanced → Image wins).
+    expect(machine.config.image).toBe('ghcr.io/owner/karmax-vm:v1');
     expect(machine.config.metadata).toMatchObject({ karmaxTaskId: 'task_fly', karmaxGeneration: '1', karmaxOrganizationId: 'org_a',
       karmaxHome: serviceHomeLabel() });
     expect(machine.config.services).toEqual([expect.objectContaining({ internal_port: 2222, ports: [{ port: 443, handlers: ['tls'] }] })]);

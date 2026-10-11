@@ -13,18 +13,23 @@ That takes minutes, so:
   itself from `debian:bookworm` (its root filesystem then persists across
   parks). With this image it boots ready.
 
-Build and publish the image (tag = provisioning version, so a world booted from
-it finds its provisioning stamp and skips provisioning):
+The **VM image** workflow (`.github/workflows/vm-image.yml`) runs on every
+merge to master. It computes the tag (the provisioning version, so a world booted
+from the image finds its provisioning stamp and skips provisioning) and builds
+and pushes the image only when that tag is not yet published. A running tavya
+selects it by itself (`src/world/vm/image.ts`): each new Fly world boots the
+published image for its provisioning version once anyone can pull it, and stock
+Debian until then. A Fly connection's **Advanced → Image** still overrides it;
+`KARMAX_VM_IMAGE_REPOSITORY` points at another repository.
+
+**Once, by hand:** GitHub has no API for package visibility, so after the first
+publish make the `karmax-vm` package public (package settings → visibility).
+Later tags stay public. Until then tavya keeps booting stock Debian.
+
+To build by hand:
 
 ```sh
 tag=$(npx tsx environments/vm/context.ts environments/vm/out)
 docker build -t ghcr.io/<owner>/karmax-vm:$tag environments/vm/out
 docker push ghcr.io/<owner>/karmax-vm:$tag
 ```
-
-or run the **VM image** workflow (`.github/workflows/vm-image.yml`). A new GHCR
-package is private: make it public once (package settings → visibility) so any
-organization's Fly account can pull it. Then select it: the Fly connection's
-**Advanced → Image**, or `KARMAX_FLY_IMAGE` for the installation. Publishing does
-not activate it. Every change to the pinned tool versions changes the tag:
-publish again, then select the new tag.
