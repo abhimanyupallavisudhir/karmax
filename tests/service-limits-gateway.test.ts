@@ -12,6 +12,9 @@ import { ORGANIZATION_GRANT_CEILING } from '../src/platform/authorization.js';
 import { PLATFORM_API_CATALOG } from '../src/platform/catalog.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 import { Store } from '../src/store/db.js';
+import { DeferredDeleteObjectStore } from '../src/store/deferred-delete.js';
+import { LocalObjectStore } from '../src/store/objects.js';
+import { ObjectReconciler } from '../src/store/object-reconciliation.js';
 import { Overlays } from '../src/store/overlays.js';
 import { findFreePortFrom } from '../src/util/ports.js';
 import { WorldRegistry } from '../src/world/registry.js';
@@ -45,6 +48,8 @@ describe('service limits API authorization', () => {
     const gateway = await Gateway.create({
       store, bus: new KarmaxBus(), tokens, contributions: new ContributionRegistry(), overlays: new Overlays(),
       client: {} as any, api: {} as any, taskQueue: 'test', staticDir: home, broker, serviceLimits,
+      storageReconciler: new ObjectReconciler({ store, mode: 'delete',
+        objects: new DeferredDeleteObjectStore(new LocalObjectStore(path.join(home, 'objects')), store, { delayMs: 0 }) }),
       agentInfo: { provider: 'mock', reason: 'service limits test' }, worlds: new WorldRegistry(),
     } as any);
     const running = await gateway.listen(await findFreePortFrom(48_500));
@@ -73,6 +78,27 @@ describe('service limits API authorization', () => {
     expect(routeCapability('POST', '/api/settings/service-limits/check')).toBe('settings:write');
     expect(PLATFORM_API_CATALOG.installation.some((entry: string) => entry.startsWith('GET|PUT /api/settings/service-limits '))).toBe(true);
     expect(PLATFORM_API_CATALOG.installation.some((entry: string) => entry.startsWith('POST /api/settings/service-limits/check '))).toBe(true);
+  });
+
+  it('reconciles the managed bucket for installation operators only, and a dry run deletes nothing', async () => {
+    expect(routeCapability('GET', '/api/settings/storage-reconciliation')).toBe('settings:read');
+    expect(routeCapability('POST', '/api/settings/storage-reconciliation')).toBe('settings:write');
+    expect(PLATFORM_API_CATALOG.installation.some((entry: string) => entry.startsWith('GET|POST /api/settings/storage-reconciliation '))).toBe(true);
+    const orphan = path.join(home, 'objects', 'checkpoints', 'org_x', 'p', 't', 'lost.bin');
+    fs.mkdirSync(path.dirname(orphan), { recursive: true });
+    fs.writeFileSync(orphan, 'lost');
+    const old = new Date(Date.now() - 3 * 86_400_000);
+    fs.utimesSync(orphan, old, old);
+    for (const who of ['tenantOwner', 'projectAgent', 'reader'])
+      expect((await call(tokenFor[who]!, 'POST', '/api/settings/storage-reconciliation', { dryRun: true })).status).toBe(403);
+    expect(await (await call(tokenFor.reader!, 'GET', '/api/settings/storage-reconciliation')).json()).toEqual({ report: null });
+    const dry = await call(tokenFor.agent!, 'POST', '/api/settings/storage-reconciliation', { dryRun: true });
+    expect(dry.status).toBe(200);
+    expect(((await dry.json()) as { report: unknown }).report).toMatchObject({ mode: 'report', orphans: { count: 1, bytes: 4 }, deleted: { count: 0 },
+      sample: [{ key: 'checkpoints/org_x/p/t/lost.bin', bytes: 4 }] });
+    expect(fs.existsSync(orphan)).toBe(true);
+    const last = (await (await call(tokenFor.reader!, 'GET', '/api/settings/storage-reconciliation')).json()) as { report: { orphans: { count: number } } };
+    expect(last.report.orphans.count).toBe(1);
   });
 
   it('shows the page to installation readers and operators only', async () => {

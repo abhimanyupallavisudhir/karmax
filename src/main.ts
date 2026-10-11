@@ -286,7 +286,9 @@ async function main() {
   // storage page (scheduled hourly below).
   const { ManagedStorageService } = await import('./world/managed-storage.js');
   const { storageNotifier } = await import('./world/storage-notices.js');
-  const managedStorage = new ManagedStorageService({ store, resources, checkpoints, objects: objectStore,
+  const { ObjectReconciler, reconcileMode } = await import('./store/object-reconciliation.js');
+  const reconciler = new ObjectReconciler({ store, objects: objectStore, mode: reconcileMode(), log: (line) => console.log(`  • ${line}`) });
+  const managedStorage = new ManagedStorageService({ store, resources, checkpoints, objects: objectStore, reconciler,
     notify: storageNotifier({ store, email: emailService, publicUrl: process.env.KARMAX_PUBLIC_URL,
       userEmail: async (userId) => (await identity.userById(userId))?.email ?? undefined,
       siteName: async () => siteNameOf((await store.getSettings('global', 'appearance'))) }) });
@@ -413,6 +415,7 @@ async function main() {
     subscriptions: subscriptionBilling,
     paidLaunchSettings,
     serviceLimits,
+    storageReconciler: reconciler,
     cellId: deployment.cellId,
     hosted: deployment.hosted,
     hostLocal: deployment.hostLocal,

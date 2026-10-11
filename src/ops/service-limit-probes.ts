@@ -5,6 +5,7 @@
  */
 import type { GitConnection } from '../domain/types.js';
 import type { WorkerHeap } from '../temporal/worker-process.js';
+import { formatBytes, type StorageReconciliation } from '../store/object-reconciliation.js';
 
 export interface ProbeReading {
   used: number;
@@ -162,15 +163,24 @@ export async function e2bUsage(input: { fetch: typeof fetch; apiKey: string; hou
 // ─── Daytona: the organization's usage against its tier's quotas ─────────────
 
 const DAYTONA_TIERS: Record<number, string> = { 10: 'Tier 1', 100: 'Tier 2', 250: 'Tier 3', 500: 'Tier 4' };
+/** Sandbox states that no longer hold vCPUs and memory, and those that hold no disk either. */
+const DAYTONA_IDLE = new Set(['stopped', 'stopping', 'archived', 'archiving', 'destroyed', 'destroying', 'error', 'build_failed']);
+const DAYTONA_GONE = new Set(['archived', 'destroyed', 'destroying']);
+const DAYTONA_PAGES = 50;
 
 export async function daytonaUsage(input: { fetch: typeof fetch; apiKey: string; apiUrl?: string }): Promise<ProbeResult> {
   const base = (input.apiUrl || 'https://app.daytona.io/api').replace(/\/+$/, '');
   const headers = { authorization: `Bearer ${input.apiKey}` };
-  const key = await json(await input.fetch(`${base}/api-keys/current`, { headers, signal: AbortSignal.timeout(TIMEOUT_MS) }), 'Daytona');
+  const get = (path: string) => input.fetch(`${base}${path}`, { headers, signal: AbortSignal.timeout(TIMEOUT_MS) });
+  const key = await json(await get('/api-keys/current'), 'Daytona');
   const organizationId = typeof key?.organizationId === 'string' ? key.organizationId : undefined;
   if (!organizationId) throw new Error('Daytona did not say which organization the key belongs to');
-  const usage = await json(await input.fetch(`${base}/organizations/${encodeURIComponent(organizationId)}/usage`,
-    { headers, signal: AbortSignal.timeout(TIMEOUT_MS) }), 'Daytona');
+  const answer = await get(`/organizations/${encodeURIComponent(organizationId)}/usage`);
+  // A key made for sandboxes only (write:sandboxes, delete:sandboxes: what
+  // tavya needs) may not read the organization's usage. It still works, so
+  // count what its sandboxes hold instead; the tier's limits stay unknown.
+  if (answer.status === 403) return daytonaSandboxUsage(get);
+  const usage = await json(answer, 'Daytona');
   const total = { cpu: [0, 0], memory: [0, 0], disk: [0, 0] } as Record<'cpu' | 'memory' | 'disk', [number, number]>;
   for (const region of usage?.regionUsage ?? []) {
     total.cpu[0] += Number(region?.currentCpuUsage ?? 0); total.cpu[1] += Number(region?.totalCpuQuota ?? 0);
@@ -189,6 +199,38 @@ export async function daytonaUsage(input: { fetch: typeof fetch; apiKey: string;
       detail: `${total.cpu[0]} of ${total.cpu[1]} vCPUs · ${total.memory[0]} of ${total.memory[1]} GiB memory · ${total.disk[0]} of ${total.disk[1]} GiB disk` } },
     ...(DAYTONA_TIERS[total.cpu[1]] ? { plan: DAYTONA_TIERS[total.cpu[1]] } : {}),
   };
+}
+
+/** What the key's sandboxes hold, from the sandbox list a sandbox-scoped key can read. */
+async function daytonaSandboxUsage(get: (path: string) => Promise<Response>): Promise<ProbeResult> {
+  const total = { cpu: 0, memory: 0, disk: 0 };
+  let cursor: string | undefined;
+  for (let page = 0; page < DAYTONA_PAGES; page++) {
+    const body = await json(await get(`/sandbox?limit=200${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`), 'Daytona');
+    for (const sandbox of Array.isArray(body?.items) ? body.items : []) {
+      const state = String(sandbox?.state ?? '');
+      if (!DAYTONA_IDLE.has(state)) { total.cpu += Number(sandbox?.cpu ?? 0); total.memory += Number(sandbox?.memory ?? 0); }
+      if (!DAYTONA_GONE.has(state)) total.disk += Number(sandbox?.disk ?? 0);
+    }
+    cursor = typeof body?.nextCursor === 'string' && body.nextCursor ? body.nextCursor : undefined;
+    if (!cursor) break;
+  }
+  return { plan: 'Limited key', readings: { 'daytona.capacity': { used: total.cpu, label: 'vCPUs in use', unit: 'count',
+    detail: `${total.cpu} vCPUs · ${total.memory} GiB memory · ${total.disk} GiB disk` } } };
+}
+
+// ─── Managed storage: the last reconciliation of the bucket with the database ──
+
+export function managedStorageUsage(report: StorageReconciliation, names: Map<string, string>): ProbeResult {
+  const organizations = Object.entries(report.organizations);
+  const top = organizations.filter(([, entry]) => entry.untracked > 0).sort(([, a], [, b]) => b.untracked - a.untracked).slice(0, 3)
+    .map(([id, entry]) => `${id ? names.get(id) ?? id : 'unattributed'} ${formatBytes(entry.untracked)}`);
+  const until = Math.max(0, ...organizations.map(([, entry]) => entry.pendingDeleteUntil ?? 0));
+  return { readings: {
+    'managed-storage.untracked': { used: report.untracked.bytes, ...(top.length ? { detail: top.join(' · ') } : {}) },
+    'managed-storage.pending-delete': { used: report.pendingDelete.bytes,
+      ...(until ? { detail: `all purged by ${new Date(until).toISOString().slice(0, 10)}` } : {}) },
+  } };
 }
 
 // ─── AgentMail: inboxes on the account; emails are counted as they arrive ────

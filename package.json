@@ -32,6 +32,7 @@
     "vault-key": "tsx src/scripts/vault-key.ts",
     "model-logins": "tsx src/scripts/model-logins.ts",
     "migrate-objects": "tsx src/scripts/object-store-migrate.ts",
+    "reconcile-storage": "tsx src/scripts/reconcile-storage.ts",
     "object-store-check": "tsx src/scripts/object-store-check.ts",
     "replay-check": "tsx src/scripts/replay-check.ts",
     "benchmark:latency": "tsx benchmarks/latency.ts",

@@ -16,6 +16,14 @@ function storageOverQuotaMarkup(contents) {
   const date = new Date(contents.overQuota.deleteAt).toLocaleDateString();
   return `<p class="task-sub storage-over">Over the limit: adding data is paused. ${policyTip(`Free space or upgrade by ${date}. After that, stored data is deleted, older versions first, until it fits.`)}</p>`;
 }
+// Deleted data the bucket keeps for its 30-day recovery window: real bytes,
+// but not the organization's to count against its limit.
+function storagePendingDeletionMarkup(contents) {
+  const pending = contents?.pendingDeletion;
+  if (!pending?.bytes) return '';
+  const until = pending.until ? ` until ${new Date(pending.until).toLocaleDateString()}` : '';
+  return `<p class="task-sub storage-pending">+ ${formatBytes(pending.bytes)} being deleted ${policyTip(`Deleted data is kept${until} so it can be recovered, then removed. It doesn’t count toward your limit.`)}</p>`;
+}
 function storageContentsMarkup(contents) {
   const projects = (contents?.projects || []).filter((project) => project.bytes > 0);
   if (!projects.length) return '';
@@ -21129,7 +21137,7 @@ async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
       const [storageLocations, contents] = await Promise.all([read('storage').catch(() => []), read('storage-contents').catch(() => null)]);
       if (!live('storage')) return;
       $('#org-storage').innerHTML = `
-        ${storageLocations.map((location) => { const usage = location.usage || {}; const pct = usage.quotaBytes ? Math.min(100, usage.retainedBytes / usage.quotaBytes * 100) : 0; return `<div class="team-block storage-location" data-storage="${esc(location.id)}"><div class="member-row"><span><b>${esc(location.name)}</b> <span class="chip">${location.kind === 'managed' ? 'managed' : 'customer S3'}</span> ${location.isDefault ? '<span class="chip">default</span>' : ''}</span><span>${formatBytes(usage.retainedBytes || 0)}${usage.quotaBytes ? ` / ${formatBytes(usage.quotaBytes)}` : ''}</span>${!location.isDefault && location.status === 'ready' ? '<button class="btn sm storage-default">Make default</button>' : ''}${location.kind === 's3' ? '<button class="btn sm storage-test">Test</button><button class="btn sm danger storage-delete">Remove</button>' : ''}</div>${usage.quotaBytes ? `<div class="progress${pct >= 100 ? ' over' : ''}"><i style="width:${pct}%"></i></div>` : ''}${location.kind === 'managed' ? storageOverQuotaMarkup(contents) : ''}${location.config?.bucket ? `<p class="task-sub mono">${esc(location.config.endpoint)}/${esc(location.config.bucket)}/${esc(location.config.prefix || '')}</p>` : ''}${location.lastError ? `<p class="task-sub" style="color:var(--danger)">${esc(location.lastError)}</p>` : ''}</div>`; }).join('')}
+        ${storageLocations.map((location) => { const usage = location.usage || {}; const pct = usage.quotaBytes ? Math.min(100, usage.retainedBytes / usage.quotaBytes * 100) : 0; return `<div class="team-block storage-location" data-storage="${esc(location.id)}"><div class="member-row"><span><b>${esc(location.name)}</b> <span class="chip">${location.kind === 'managed' ? 'managed' : 'customer S3'}</span> ${location.isDefault ? '<span class="chip">default</span>' : ''}</span><span>${formatBytes(usage.retainedBytes || 0)}${usage.quotaBytes ? ` / ${formatBytes(usage.quotaBytes)}` : ''}</span>${!location.isDefault && location.status === 'ready' ? '<button class="btn sm storage-default">Make default</button>' : ''}${location.kind === 's3' ? '<button class="btn sm storage-test">Test</button><button class="btn sm danger storage-delete">Remove</button>' : ''}</div>${usage.quotaBytes ? `<div class="progress${pct >= 100 ? ' over' : ''}"><i style="width:${pct}%"></i></div>` : ''}${location.kind === 'managed' ? storageOverQuotaMarkup(contents) + storagePendingDeletionMarkup(contents) : ''}${location.config?.bucket ? `<p class="task-sub mono">${esc(location.config.endpoint)}/${esc(location.config.bucket)}/${esc(location.config.prefix || '')}</p>` : ''}${location.lastError ? `<p class="task-sub" style="color:var(--danger)">${esc(location.lastError)}</p>` : ''}</div>`; }).join('')}
         ${storageContentsMarkup(contents)}
         <details class="settings-disclosure compact"><summary><b>Connect customer-owned S3 storage</b></summary><div class="settings-grid">
           <label class="form-row">Name<input id="storage-name" placeholder="Production data"></label><label class="form-row">Endpoint<input id="storage-endpoint" placeholder="https://s3.amazonaws.com"></label>

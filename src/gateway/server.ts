@@ -164,6 +164,8 @@ export interface GatewayDeps {
   paidLaunchSettings?: import('../launch/settings.js').PaidLaunchSettingsService;
   /** Installation → Service limits (operator accounts and this host against their plans). */
   serviceLimits?: import('../ops/service-limits.js').ServiceLimitsService;
+  /** Compares the managed bucket with the database (store/object-reconciliation.ts). */
+  storageReconciler?: import('../store/object-reconciliation.js').ObjectReconciler;
   cellId?: string;
   hosted?: boolean;
   /** Whether the browser and the host are the same machine (see `hostLocal`).
@@ -2705,6 +2707,19 @@ export class Gateway {
         }
         const view = method === 'GET' ? (await service.view()) : (await service.run());
         return this.json(res, 200, { ...view, canManage: write || (await this.deps.tokens.check(token, 'settings:write')).ok });
+      }
+      // The last comparison of the managed bucket with the database, per
+      // organization; POST lists the bucket now. `dryRun` never deletes, even
+      // when KARMAX_STORAGE_RECONCILE=delete.
+      if (p === '/api/settings/storage-reconciliation') {
+        const reconciler = this.deps.storageReconciler;
+        if (!reconciler) return this.json(res, 503, { error: 'storage reconciliation is unavailable' });
+        if (method !== 'GET' && method !== 'POST') return this.json(res, 405, { error: 'method not allowed' });
+        if (!(await this.deps.tokens.check(token, method === 'GET' ? 'settings:read' : 'settings:write')).ok)
+          return this.json(res, 403, { error: `Only a ${(await this.siteName)} installation operator can reconcile storage` });
+        if (method === 'GET') return this.json(res, 200, { report: (await reconciler.report()) ?? null });
+        const body = (await this.body(req).catch(() => ({}))) as { dryRun?: unknown } | undefined;
+        return this.json(res, 200, { report: await reconciler.reconcile({ dryRun: body?.dryRun === true }) });
       }
       if (p === '/api/settings/paid-launch/paddle/provision' && method === 'POST') {
         if (!(await this.deps.tokens.check(token, 'settings:write')).ok)
