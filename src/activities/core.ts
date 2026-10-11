@@ -344,9 +344,24 @@ export function privateUpstreamGuidance(fork: Repository): string {
 
 /** A proposal to someone else's repository carries only what its maintainers
  * need: the change's description, without this deployment's task references. */
-function upstreamPrBody(details: OpenPrDetails, title: string): string {
-  const summary = details.summary?.trim() || title;
+function upstreamPrBody(details: OpenPrDetails, title: string, commits: string[] = []): string {
+  const written = details.summary?.trim();
+  // The git-derived review summary ("1 file(s) changed.") tells a maintainer
+  // nothing; the commits describe the change, as GitHub's own fork PRs do.
+  const fromCommits = commits.length === 1 ? commits[0]
+    : commits.length > 1 ? commits.map((message) => `- ${message.split('\n')[0]}`).join('\n') : '';
+  const summary = (written && !isGitDerivedReviewSummary(written) ? written : fromCommits || written) || title;
   return summary.length > 60_000 ? `${summary.slice(0, 60_000)}\n… (summary truncated)` : summary;
+}
+
+/** The review summary buildReview writes when the agent wrote none. */
+export function gitDerivedReviewSummary(changed: number, shown?: number): string {
+  if (!changed) return 'No file changes detected.';
+  return `${changed} file(s) changed.${shown != null ? ` Showing ${shown}; inspect the checkouts for the full list.` : ''}`;
+}
+
+export function isGitDerivedReviewSummary(summary: string): boolean {
+  return /^(?:\d+ file\(s\) changed\.(?: Showing \d+; inspect the checkouts for the full list\.)?|No file changes detected\.)$/.test(summary.trim());
 }
 
 function upstreamRef(repo: string, slug: string, headRepository: string, pr: GithubPullRequest): TaskPullRequest {
@@ -1044,23 +1059,29 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
    * commit in `baseSha`. Keep the configured name for the GitHub PR; these refs
    * are only for local Git comparison. */
   async function commitsAheadOfPrBase(world: World, repo: ReturnType<typeof worldRepos>[number], base: string) {
-    const dwim = () => world.exec('git', ['rev-list', '--count', `${base}..${repo.branch}`], { cwd: repo.root });
-    if (base.startsWith('refs/') || /^[0-9a-f]{40,64}$/i.test(base)) return dwim();
+    return world.exec('git', ['rev-list', '--count', ...(await prBaseRange(world, repo, base))], { cwd: repo.root });
+  }
+
+  /** The revisions selecting the branch's own commits (see commitsAheadOfPrBase). */
+  async function prBaseRange(world: World, repo: ReturnType<typeof worldRepos>[number], base: string): Promise<string[]> {
+    const dwim = [`${base}..${repo.branch}`];
+    if (base.startsWith('refs/') || /^[0-9a-f]{40,64}$/i.test(base)) return dwim;
     const candidates = [`refs/heads/${base}`, `refs/remotes/origin/${base}`];
     const listed = await world.exec('git', ['for-each-ref', '--format=%(refname)', ...candidates], { cwd: repo.root });
     const lines = listed.code === 0 ? listed.stdout.split('\n').map((line) => line.trim()) : [];
     const present = candidates.filter((ref) => lines.includes(ref));
-    if (present.length) {
-      return world.exec('git', ['rev-list', '--count', repo.branch, ...present.map((ref) => `^${ref}`)], { cwd: repo.root });
-    }
+    if (present.length) return [repo.branch, ...present.map((ref) => `^${ref}`)];
     if (repo.baseSha) {
       const ancestor = await world.exec('git', ['merge-base', '--is-ancestor', repo.baseSha, repo.branch], { cwd: repo.root });
-      if (ancestor.code === 0) {
-        const recorded = await world.exec('git', ['rev-list', '--count', `${repo.baseSha}..${repo.branch}`], { cwd: repo.root });
-        if (recorded.code === 0) return recorded;
-      }
+      if (ancestor.code === 0) return [`${repo.baseSha}..${repo.branch}`];
     }
-    return dwim();
+    return dwim;
+  }
+
+  /** The commit messages of the branch's own commits, oldest first. */
+  async function branchCommitMessages(world: World, repo: ReturnType<typeof worldRepos>[number], base: string): Promise<string[]> {
+    const log = await world.exec('git', ['log', '--reverse', '--format=%B%x00', ...(await prBaseRange(world, repo, base))], { cwd: repo.root });
+    return log.code === 0 ? log.stdout.split('\0').map((message) => message.trim()).filter(Boolean) : [];
   }
 
   async function brokerAuthFor(handle: WorldHandle, taskId?: string): Promise<GitBrokerAuth> {
@@ -3359,7 +3380,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         );
       }
       const bounded = reviewFiles(changedFiles);
-      const summary = changedFiles.length ? `${changedFiles.length} file(s) changed.${bounded.truncated ? ` Showing ${bounded.changedFiles.length}; inspect the checkouts for the full list.` : ''}` : 'No file changes detected.';
+      const summary = gitDerivedReviewSummary(changedFiles.length, bounded.truncated ? bounded.changedFiles.length : undefined);
       (await record(handle.id, 'review.built', { files: changedFiles.length }));
       return { summary, changedFiles: bounded.changedFiles };
     },
@@ -4078,7 +4099,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const title = changed.length > 1
           ? `${details.title?.trim() || BRAND} (${repo.name})`
           : details.title?.trim() || `${BRAND}: ${repo.branch}`;
-        const body = upstreamPrBody(details, title);
+        const body = upstreamPrBody(details, title, await branchCommitMessages(world, repo, base));
         const headOwner = headRepository!.split('/')[0]!;
         let pr = await api.findByHead(slug, repo.branch, headOwner);
         if (pr?.merged) pr = undefined;
