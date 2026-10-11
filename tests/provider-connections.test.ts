@@ -121,6 +121,7 @@ describe('organization cloud provider connections', () => {
         source: { cpu: 'provider', memoryMb: 'provider', diskGb: 'provider' } });
       expect(JSON.stringify(await service.list(organization.id))).not.toContain('key-one');
       expect((await service.list(organization.id))[0]!.limits.diskGb).toBe(29);
+      expect((await service.list(organization.id))[0]!.features).toEqual({ desktop: true, allowlist: true });
       await expect(service.assertFits(organization.id, 'e2b', { diskGb: 30 })).rejects.toThrow('Disk can be at most 29 GB on this E2B account');
       await expect(service.assertFits(organization.id, 'e2b', { diskGb: 29, cpu: 8 })).resolves.toBeUndefined();
       await expect(service.assertFits(organization.id, 'worktree', { diskGb: 900 })).resolves.toBeUndefined();

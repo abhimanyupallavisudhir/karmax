@@ -4,6 +4,7 @@ import type { Duplex } from 'node:stream';
 import type { WorldReferenceKeys } from '../reference-keys.js';
 import type { ResolvedWorldProviderConnection } from '../connections.js';
 import type { MachineShape } from '../../domain/computer.js';
+import { providerFeatures } from '../../domain/computer-limits.js';
 import type { ProviderSandboxRef, ProviderUsagePage, ProviderUsageEvent, World, WorldDiagnosis, WorldHandle,
   WorldLifecycleState, WorldProvider, WorldSpec } from '../types.js';
 import { serviceHomeLabel } from '../services.js';
@@ -116,9 +117,10 @@ export class VmWorldProvider implements WorldProvider {
 
   async create(spec: WorldSpec): Promise<World> {
     spec.signal?.throwIfAborted();
-    if (spec.network && !spec.network.unrestricted)
+    const features = providerFeatures(this.kind);
+    if (!features.allowlist && spec.network && !spec.network.unrestricted)
       throw new Error(`${this.driver.name} computers have unrestricted outbound network. Choose E2B or Daytona for an allowlist.`);
-    if (spec.environment?.flavor === 'desktop')
+    if (!features.desktop && spec.environment?.flavor === 'desktop')
       throw new Error(`${this.driver.name} computers are headless. Choose E2B or Daytona for a desktop.`);
     const connection = await this.connection(spec.organizationId);
     const shape = await this.driver.shape(spec.resources, connection);

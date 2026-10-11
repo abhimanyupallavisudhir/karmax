@@ -1,7 +1,7 @@
 import type { CredentialBroker } from '../autonomy/broker.js';
 import { organizationScope } from '../autonomy/vault-keys.js';
 import type { MachineShape } from '../domain/computer.js';
-import { assertComputerFits, computerLimits, type ComputerLimits, type EffectiveComputerLimits } from '../domain/computer-limits.js';
+import { assertComputerFits, computerLimits, providerFeatures, type ComputerFeatures, type ComputerLimits, type EffectiveComputerLimits } from '../domain/computer-limits.js';
 import type { WorldProviderConnection } from '../domain/types.js';
 import type { Store } from '../store/db.js';
 import { probeDaytonaLimits, probeE2BLimits } from './provider-limits.js';
@@ -26,7 +26,7 @@ export interface ResolvedWorldProviderConnection {
 /** A connection as the API shows it: the key stays write-only, and `limits`
  * is what a computer on this account may be. */
 export type WorldProviderConnectionView = Omit<WorldProviderConnection, 'measuredLimits'>
-  & { credentialConfigured: boolean; limits: EffectiveComputerLimits };
+  & { credentialConfigured: boolean; limits: EffectiveComputerLimits; features: ComputerFeatures };
 
 /** How a connection reaches its provider; tests replace these. */
 export interface ProviderProbes {
@@ -55,7 +55,7 @@ export class WorldProviderConnectionService {
   private async view(value: WorldProviderConnection): Promise<WorldProviderConnectionView> {
     const { measuredLimits, ...rest } = value;
     return { ...rest, credentialConfigured: await this.broker.hasHandle(value.credentialHandle),
-      limits: computerLimits(value.provider, measuredLimits, value.config.limits) };
+      limits: computerLimits(value.provider, measuredLimits, value.config.limits), features: providerFeatures(value.provider) };
   }
 
   /** Every connection, with its limits. One never asked is asked now (briefly

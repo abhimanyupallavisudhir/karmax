@@ -1482,6 +1482,10 @@ const COMPUTER_DEFAULTS = { e2b: { cpu: 2, memoryMb: 2048, diskGb: 22 }, daytona
 // What a computer on the organization's provider account may be: the
 // connection's limits, learned from the provider (src/domain/computer-limits.ts).
 const computerLimitsFor = (provider) => (S.worldProviderConnections || []).find((c) => c.provider === provider)?.limits || null;
+// What else the chosen provider offers (desktop, outbound allowlist); a
+// provider the page knows nothing about (this machine) offers everything.
+const computerFeaturesFor = (provider) => ({ desktop: true, allowlist: true,
+  ...((S.worldProviderConnections || []).find((c) => c.provider === provider)?.features || {}) });
 // "This E2B account allows up to 29 GB" — the hover text of each size.
 function computerLimitTip(provider, limits, key) {
   const value = limits?.[key];
@@ -1519,6 +1523,7 @@ function computerBlockHtml(name, value, inherited, opts = {}) {
   // In flight, a task may only resize: another provider, experience or network is another computer.
   const fixed = opts.inFlight ? 'disabled' : '';
   const size = computerSizeAttrs(provider);
+  const features = computerFeaturesFor(provider);
   const sizeAttrs = (key) => `max="${esc(size[key].max)}" placeholder="${esc(size[key].placeholder)}"`;
   const tip = (key) => (size[key].title ? ` title="${esc(size[key].title)}"` : '');
   const body = `<div class="computer-controls">
@@ -1528,13 +1533,13 @@ function computerBlockHtml(name, value, inherited, opts = {}) {
       <label class="computer-size"${tip('disk')}><input class="cf-disk" type="number" min="1" ${sizeAttrs('disk')} step="1" inputmode="numeric" value="${esc(v.diskGb ?? '')}" aria-label="Disk in GB"><span>GB disk</span></label>
     </div>
     <details class="computer-more"${opts.open ? ' open' : ''}><summary>More</summary><div class="computer-more-grid">
-      <label class="form-row"><span>Experience ${policyTip('Desktop adds a screen you can watch and take over.')}</span><select class="cf-flavor" ${fixed}>
+      <label class="form-row"${features.desktop ? '' : ' hidden'}><span>Experience ${policyTip('Desktop adds a screen you can watch and take over.')}</span><select class="cf-flavor" ${fixed}>
         <option value="headless" ${v.flavor !== 'desktop' ? 'selected' : ''}>Headless</option><option value="desktop" ${v.flavor === 'desktop' ? 'selected' : ''}>Desktop</option></select></label>
       <label class="form-row"><span>Hibernate after (days) ${policyTip('How long a paused task keeps its computer before packing it away. Waking it afterwards takes a little longer.')}</span>
         <input class="cf-hibernate" type="number" min="0" max="365" step="1" value="${esc(v.hibernateAfterDays ?? '')}" placeholder="7"></label>
-      <label class="form-row"><span>Outbound network ${policyTip('Agents normally need package registries, documentation, search and APIs. Allowlist only is for organizations that maintain an egress policy.')}</span><select class="cf-network" ${fixed}>
+      <label class="form-row"${features.allowlist ? '' : ' hidden'}><span>Outbound network ${policyTip('Agents normally need package registries, documentation, search and APIs. Allowlist only is for organizations that maintain an egress policy.')}</span><select class="cf-network" ${fixed}>
         <option value="unrestricted" ${restricted ? '' : 'selected'}>Normal internet</option><option value="restricted" ${restricted ? 'selected' : ''}>Allowlist only</option></select></label>
-      <div class="cf-allowlist" ${restricted ? '' : 'hidden'}>
+      <div class="cf-allowlist" ${restricted && features.allowlist ? '' : 'hidden'}>
         <input class="cf-domains" ${fixed} value="${esc((v.network?.allowDomains || []).join(', '))}" placeholder="Allowed domains: registry.npmjs.org, pypi.org" aria-label="Allowed domains">
         <input class="cf-cidrs" ${fixed} value="${esc((v.network?.allowCidrs || []).join(', '))}" placeholder="Allowed CIDRs: 10.20.0.0/16" aria-label="Allowed CIDRs">
       </div>
@@ -1585,14 +1590,17 @@ function readComputerBlock(box) {
   const number = (selector) => { const raw = value(selector); return raw === '' || !Number.isFinite(Number(raw)) ? undefined : Number(raw); };
   const list = (selector) => value(selector).split(',').map((item) => item.trim()).filter(Boolean);
   const memory = number('.cf-memory');
+  // A provider without a desktop or an allowlist gets headless and normal
+  // internet, even if the defaults it inherits ask for more.
+  const features = computerFeaturesFor(value('.cf-provider'));
   const out = {
     provider: value('.cf-provider') || undefined,
     cpu: number('.cf-cpu'),
     memoryMb: memory === undefined ? undefined : Math.round(memory * 1024),
     diskGb: number('.cf-disk'),
-    flavor: value('.cf-flavor') || undefined,
+    flavor: features.desktop ? value('.cf-flavor') || undefined : 'headless',
     hibernateAfterDays: number('.cf-hibernate'),
-    network: value('.cf-network') === 'restricted'
+    network: features.allowlist && value('.cf-network') === 'restricted'
       ? { unrestricted: false, allowDomains: list('.cf-domains'), allowCidrs: list('.cf-cidrs') } : { unrestricted: true },
   };
   return Object.fromEntries(Object.entries(out).filter(([, item]) => item !== undefined));
@@ -1601,7 +1609,9 @@ function readComputerBlock(box) {
 function computerOverride(box, attr = 'data-inherit') {
   const inh = JSON.parse(box.getAttribute(attr) || 'null') || {};
   const read = readComputerBlock(box);
-  const network = (n) => JSON.stringify(n?.unrestricted === false ? n : { unrestricted: true });
+  // Missing domain or CIDR lists are empty ones, so an unchanged allowlist is no override.
+  const network = (n) => JSON.stringify(n?.unrestricted === false
+    ? { unrestricted: false, allowDomains: n.allowDomains || [], allowCidrs: n.allowCidrs || [] } : { unrestricted: true });
   return Object.fromEntries(Object.entries(read).filter(([key, item]) => key === 'network'
     ? network(item) !== network(inh.network) : !sameJson(item, inh[key])));
 }
@@ -1626,8 +1636,12 @@ function syncComputerBlock(box) {
     input.placeholder = String(size[key].placeholder);
     input.closest('label').title = size[key].title;
   }
+  const features = computerFeaturesFor(provider);
+  const row = (selector) => box.querySelector(selector)?.closest('label');
+  if (row('.cf-flavor')) row('.cf-flavor').hidden = !features.desktop;
+  if (row('.cf-network')) row('.cf-network').hidden = !features.allowlist;
   const allowlist = box.querySelector('.cf-allowlist');
-  if (allowlist) allowlist.hidden = box.querySelector('.cf-network')?.value !== 'restricted';
+  if (allowlist) allowlist.hidden = !features.allowlist || box.querySelector('.cf-network')?.value !== 'restricted';
 }
 // One delegated listener keeps every Computer block's dependent controls in step.
 document.addEventListener('change', (event) => {

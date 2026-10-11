@@ -43,29 +43,48 @@ interface ProviderFacts {
   defaults: Required<MachineShape>;
   /** Documented per-machine maxima, used until the account itself is asked. */
   limits: ComputerLimits;
+  /** What else a Computer may ask of it; the form shows only these. */
+  features: ComputerFeatures;
 }
+
+/** Options beyond size that a provider may or may not offer. */
+export interface ComputerFeatures {
+  /** A screen people can watch and take over (`flavor: 'desktop'`). */
+  desktop: boolean;
+  /** Outbound network limited to an allowlist (`network.unrestricted: false`). */
+  allowlist: boolean;
+}
+
+const ALL_FEATURES: ComputerFeatures = { desktop: true, allowlist: true };
+const VM_FEATURES: ComputerFeatures = { desktop: false, allowlist: false };
 
 /** One entry per cloud provider. A new provider (Fly.io, Hetzner…) adds its
  * documented facts here and, if its API can tell, a probe in provider-limits.ts. */
 const PROVIDERS: Record<string, ProviderFacts> = {
   // Measured 2026-10-10: the default template has 22 GB of disk. Until the
   // account is asked, offer only what every account has.
-  e2b: { label: 'E2B', defaults: { cpu: 2, memoryMb: 2048, diskGb: 22 }, limits: { cpu: 8, memoryMb: 8192, diskGb: 22 } },
+  e2b: { label: 'E2B', defaults: { cpu: 2, memoryMb: 2048, diskGb: 22 }, limits: { cpu: 8, memoryMb: 8192, diskGb: 22 }, features: ALL_FEATURES },
   // Daytona's documented per-sandbox maximum (raised by its support); karmax
   // starts a default computer on `daytona-medium` (2 vCPU / 4 GiB / 8 GB).
-  daytona: { label: 'Daytona', defaults: { cpu: 2, memoryMb: 4096, diskGb: 8 }, limits: { cpu: 4, memoryMb: 8192, diskGb: 10 } },
+  daytona: { label: 'Daytona', defaults: { cpu: 2, memoryMb: 4096, diskGb: 8 }, limits: { cpu: 4, memoryMb: 8192, diskGb: 10 }, features: ALL_FEATURES },
   // VM worlds (wiki features/vm-worlds): disk is the volume mounted as the
   // home, the size `df ~` shows. Fly: a volume holds at most 500 GB, the
   // largest machine is performance-16x with 128 GB; no account API says more.
-  fly: { label: 'Fly.io', defaults: { cpu: 2, memoryMb: 2048, diskGb: 20 }, limits: { cpu: 16, memoryMb: 131_072, diskGb: 500 } },
+  fly: { label: 'Fly.io', defaults: { cpu: 2, memoryMb: 2048, diskGb: 20 }, limits: { cpu: 16, memoryMb: 131_072, diskGb: 500 }, features: VM_FEATURES },
   // Hetzner: volumes up to 10 TB; the largest machine is whatever server type
   // the location offers (the connection test asks), else the shared CPX51.
   // A default computer gets the cheapest type covering it (CPX11, 2 CPU / 2 GB, 2026-10-10).
-  hetzner: { label: 'Hetzner', defaults: { cpu: 2, memoryMb: 2048, diskGb: 20 }, limits: { cpu: 16, memoryMb: 32_768, diskGb: 10_240 } },
+  hetzner: { label: 'Hetzner', defaults: { cpu: 2, memoryMb: 2048, diskGb: 20 }, limits: { cpu: 16, memoryMb: 32_768, diskGb: 10_240 }, features: VM_FEATURES },
 };
 
 export function providerLabel(provider: string): string {
   return PROVIDERS[provider]?.label ?? provider;
+}
+
+/** What else a Computer on `provider` may ask for. A provider without a
+ * record (this machine, Docker) offers everything. */
+export function providerFeatures(provider: string): ComputerFeatures {
+  return { ...(PROVIDERS[provider]?.features ?? ALL_FEATURES) };
 }
 
 /** The machine a provider gives when the Computer asks for nothing more. */
