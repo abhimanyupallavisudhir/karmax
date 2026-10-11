@@ -1,4 +1,6 @@
-import { machineShape } from '../domain/computer.js';
+import { machineShape, normalizeComputer } from '../domain/computer.js';
+import { providerLabel } from '../domain/computer-limits.js';
+import { taskProvider } from './task-provider.js';
 import * as __asyncCollections from '../util/async-collections.js';
 import crypto from 'node:crypto';
 import zlib from 'node:zlib';
@@ -234,6 +236,39 @@ export class WorldCheckpointService {
     for (const checkpoint of await this.store.listProjectCheckpoints(projectId)) {
       if (checkpoint.filesystemDelta?.format !== 2) continue;
       await this.chunks.release(checkpoint, organizationId, () => this.store.completeCheckpointDeletion(checkpoint.id));
+    }
+  }
+
+  /**
+   * Restore a world that is gone (hibernated or lost) where its task now runs:
+   * on the provider its own Computer names when that differs (a move, wiki
+   * features/computers), else where it ran. If the new provider cannot take it
+   * (an account limit, an outage), the world comes back where it was, the task's
+   * Computer goes back to that provider so the next park does not try again,
+   * and the agent and the task's events say why.
+   */
+  async restoreWhereTaskRuns(checkpointId: string, handle: WorldHandle): Promise<WorldHandle> {
+    const target = await taskProvider(this.store, handle.id);
+    if (!target || target === handle.kind) return this.restore(checkpointId, handle.kind);
+    const event = (type: string, payload: Record<string, unknown>) => this.store.appendEvent({ taskId: handle.id, type, ts: Date.now(),
+      payload: { from: handle.kind, to: target, checkpointId, ...payload } });
+    try {
+      const restored = await this.restore(checkpointId, target as WorldKind);
+      await event('world.moved', { generation: restored.generation });
+      await this.addNotice(handle.id, `This task moved to ${providerLabel(target)}. You are on a new machine with the same files your `
+        + 'repositories track, the same uncommitted changes and the same project data. Git-ignored files (installed dependencies, '
+        + 'build output, caches) and running processes did not carry over: reinstall or restart what you need.');
+      return restored;
+    } catch (error) {
+      const reason = (error instanceof Error ? error.message : String(error)).slice(0, 300);
+      const task = await this.store.taskMetadataAsync(handle.id);
+      let own: Record<string, unknown> = {};
+      try { own = { ...normalizeComputer(task?.params?.computer) }; } catch { own = {}; }
+      await this.store.patchTaskParams(handle.id, { computer: { ...own, provider: handle.kind } });
+      await event('world.move_failed', { error: reason });
+      await this.addNotice(handle.id, `This task could not move to ${providerLabel(target)} (${reason}), so it stays on `
+        + `${providerLabel(handle.kind)}, restored from its last checkpoint. Its Computer is set back to ${providerLabel(handle.kind)}.`);
+      return this.restore(checkpointId, handle.kind);
     }
   }
 

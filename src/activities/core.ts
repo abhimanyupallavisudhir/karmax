@@ -1300,7 +1300,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     if (state !== 'missing') return undefined; // transient/parked → keep the original error
     (await record(taskId, 'world.recovering', { checkpointId, reason: (cause instanceof Error ? cause.message : String(cause)).slice(0, 200) }));
     try {
-      const restored = await deps.checkpoints.restore(checkpointId, handle.kind);
+      const restored = await deps.checkpoints.restoreWhereTaskRuns(checkpointId, handle);
       const opened = await worlds.open(await ensureRunnerLease(restored, taskId));
       (await store.setWorldState(((await store.currentWorld(restored.id)) ?? restored) as WorldHandle, 'ready'));
       (await record(taskId, 'world.recovered', { checkpointId, generation: restored.generation }));

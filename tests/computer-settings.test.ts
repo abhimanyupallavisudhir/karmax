@@ -156,15 +156,18 @@ describe('Computer defaults', () => {
       params: { prompt: 'too big', computer: { diskGb: 100_000 } } })).status).toBe(400);
   });
 
-  it('resizes a running task\'s computer but never swaps it for another', async () => {
+  it('resizes a running task\'s computer, moving it only to a connected cloud provider', async () => {
     const project = await store.createProject('Running', { worldProvider: 'e2b', resources: { cpu: 2, memoryMb: 2048 } });
     const task = await store.createTask({ projectId: project.id, title: 'Disk full', workflow: 'software-dev',
       workflowVersion: '1.27.0', params: { prompt: 'x' } });
     await store.registerWorld({ version: 2, kind: 'e2b', provider: 'e2b', id: task.id, generation: 1, root: '/w',
       workspaceRoot: '/w', branch: `tavya/${task.id}`, base: 'main', meta: { projectId: project.id } }, project.id);
     const editor = (await tokens.mintPrincipal('user:editor', ['task:edit', 'task:read'], project.id)).token;
+    // Another provider must be connected (daytona is not here); this machine never.
     await expect(api.updateParams(editor, task.id, { computer: { provider: 'daytona', diskGb: 50 } }))
-      .rejects.toThrow(/provider can't change/);
+      .rejects.toThrow(/not connected/);
+    await expect(api.updateParams(editor, task.id, { computer: { provider: 'worktree' } }))
+      .rejects.toThrow(/between cloud providers/);
     await expect(api.updateParams(editor, task.id, { computer: { flavor: 'desktop' } })).rejects.toThrow(/experience/);
     expect(updates).toEqual([]);
     const result = await api.updateParams(editor, task.id, { computer: { provider: 'e2b', cpu: '4', diskGb: 50 } });

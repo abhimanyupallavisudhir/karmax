@@ -112,7 +112,7 @@ export async function createExecutionServices(input: {
     const state = await worlds.probe(handle).catch(() => undefined);
     if (state !== 'missing') return undefined; // transient/parked → keep the original error
     (await store.setWorldState(((await store.currentWorld(handle.id)) ?? handle) as import('../world/types.js').WorldHandle, 'degraded'));
-    return checkpoints.restore(checkpoint.id, handle.kind);
+    return checkpoints.restoreWhereTaskRuns(checkpoint.id, handle);
   });
   const { MockPaymentProvider, VaultCardProvider, StripeIssuingProvider, PaymentRegistry } = await import('../autonomy/payments.js');
   const payments = new MockPaymentProvider(store);

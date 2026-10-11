@@ -20,7 +20,8 @@ it('lets a running task resize its computer, and nothing else about it', async (
   const block = ui.page.locator('#tp-params .tp-computer .computer-field');
   const disabled = () => block.evaluate((box) => Object.fromEntries(['provider', 'cpu', 'memory', 'disk', 'flavor', 'hibernate', 'network']
     .map((key) => [key, box.querySelector(`.cf-${key}`)!.matches(':disabled')])));
-  expect(await disabled()).toEqual({ provider: true, cpu: false, memory: false, disk: false, flavor: true, hibernate: false, network: true });
+  // It can also move to another connected cloud provider (at its next pause).
+  expect(await disabled()).toEqual({ provider: false, cpu: false, memory: false, disk: false, flavor: true, hibernate: false, network: true });
   await block.locator('.cf-disk').fill('50');
   expect(await ui.run(`collectParamEdits(document.getElementById('tp-params'), paramFields({ workflow: 'software-dev', taskId: 't' }))`))
     .toEqual({ computer: { provider: 'e2b', cpu: 2, memoryMb: 2048, diskGb: 50, flavor: 'headless', network: { unrestricted: true } } });

@@ -1792,7 +1792,9 @@ export interface TaskView {
   /** The machine this task's Computer now asks for, while its world still runs
    * on the one it was made on: it moves when the world parks (wiki
    * features/computers). Enriched by the API. */
-  computerChange?: { from: { cpu?: number; memoryMb?: number; diskGb?: number }; to: { cpu?: number; memoryMb?: number; diskGb?: number } };
+  computerChange?: { from: { cpu?: number; memoryMb?: number; diskGb?: number }; to: { cpu?: number; memoryMb?: number; diskGb?: number };
+    /** The task chose another provider; it moves there at its next idle park. */
+    provider?: { from: string; to: string } };
   /** The task stopped because its computer's disk was full (wiki features/computers). */
   outOfDisk?: boolean;
   /** The task computer's last measured usage, and the largest disk its provider
