@@ -34,7 +34,13 @@ if (args.includes('cp')) {
 }
 if (args.includes('--sign-checksums')) { fs.readFileSync(0); process.stdout.write('signature-fixture'); }
 if (args.includes('pg_dump')) process.stdout.write('dump-' + args.at(-1));
-if (args.join(' ').includes('pg_stat_activity')) process.stdout.write(process.env.FAKE_SESSIONS ?? '');
+if (args.join(' ').includes('shared_buffers')) {
+  if (process.env.FAKE_PG_MEMORY === undefined) process.exit(1);
+  process.stdout.write(process.env.FAKE_PG_MEMORY);
+} else if (args.join(' ').includes('pg_stat_activity')) process.stdout.write(process.env.FAKE_SESSIONS ?? '');
+if (args.includes('ps') && args.includes('-q')) process.stdout.write(process.env.FAKE_CONTAINERS ?? '');
+if (args[0] === 'stats') process.stdout.write(process.env.FAKE_STATS ?? '');
+if (args[0] === 'inspect') process.stdout.write(process.env.FAKE_CAPS ?? '');
 if (args.join(' ').includes('object-store-check')) {
   process.stdout.write(process.env.FAKE_OBJECT_STORE ?? 'object store: local\\n');
   if (process.env.FAKE_OBJECT_STORE_FAIL) process.exit(1);
@@ -370,6 +376,33 @@ it('doctor reports the role the app connects to PostgreSQL as, and warns on the 
   expect(idle.stdout).toContain('The app has no connection to the karmax database');
 });
 
+it('doctor prints each container\'s memory cap, what the caps leave the host, and PostgreSQL\'s sizing', () => {
+  const h = deployment();
+  const GiB = 1024 ** 3;
+  const env = { FAKE_SESSIONS: 'karmax|f\n', FAKE_CONTAINERS: 'c-app\nc-pg\n',
+    FAKE_STATS: '    karmax-app-1  1.1GiB / 7GiB\n    karmax-postgresql-1  356MiB / 3GiB\n',
+    FAKE_PG_MEMORY: 'shared_buffers 768MB, effective_cache_size 2304MB, work_mem 7MB, maintenance_work_mem 192MB; 68 of 150 connections in use\n' };
+  const small = h.run(['doctor'], '', '', { ...env, FAKE_CAPS: `${GiB / 4}\n${GiB / 4}\n` });
+  expect(small.status, small.stderr).toBe(0);
+  expect(small.stdout).toContain('Memory in use / cap:');
+  expect(small.stdout).toContain('karmax-app-1  1.1GiB / 7GiB');
+  expect(small.stdout).toMatch(/The caps add up to 512 of the host's \d+ MiB, leaving \d+ MiB for the host itself\./);
+  expect(small.stdout).toContain('PostgreSQL: shared_buffers 768MB, effective_cache_size 2304MB, work_mem 7MB, maintenance_work_mem 192MB; 68 of 150 connections in use');
+  expect(h.calls().some(args => args[0] === 'stats' && args.includes('--no-stream') && args.includes('c-app') && args.includes('c-pg'))).toBe(true);
+  // Caps past the host's memory are a warning, not a failure; so is a
+  // PostgreSQL that does not answer, and an uncapped container is not summed.
+  const { FAKE_PG_MEMORY: _settings, ...postgresDown } = env;
+  const over = h.run(['doctor'], '', '', { ...postgresDown, FAKE_CAPS: `${1024 * GiB}\n${GiB}\n` });
+  expect(over.status, over.stderr).toBe(0);
+  expect(over.stderr).toMatch(/warning: the running containers' memory caps add up to 1049600 MiB, more than the host's \d+ MiB/);
+  expect(over.stderr).toContain('could not read PostgreSQL memory settings');
+  const uncapped = h.run(['doctor'], '', '', { ...env, FAKE_CAPS: `0\n${GiB}\n` });
+  expect(uncapped.stdout).not.toContain('The caps add up');
+  const none = h.run(['doctor'], '', '', { FAKE_SESSIONS: 'karmax|f\n' });
+  expect(none.status, none.stderr).toBe(0);
+  expect(none.stdout).toContain('No container is running');
+});
+
 it('doctor reports the active object store and fails when an S3 store does not answer its probe', () => {
   const h = deployment();
   const local = h.run(['doctor'], '', '', { FAKE_SESSIONS: 'karmax|f\n' });
@@ -438,6 +471,38 @@ it('updates an exact master revision', () => {
   expect(result.stdout).toContain(`Update complete at ${h.target}`);
 });
 
+// Compose mounts the previews' DNS token into Caddy, so an update to this
+// release must create it (empty: not configured) the way it creates the other
+// operator-written keys, and must keep one the operator wrote.
+it('creates the previews\' DNS token file on update, empty and readable, and keeps the operator\'s', () => {
+  const h = checkout();
+  const token = path.join(h.deploy, '.secrets', 'cloudflare_dns_api_token');
+  expect(fs.existsSync(token)).toBe(false);
+  expect(h.run(['update', h.target]).status).toBe(0);
+  expect(fs.readFileSync(token, 'utf8')).toBe('');
+  expect(fs.statSync(token).mode & 0o777).toBe(0o644);
+  expect(fs.readFileSync(path.join(h.deploy, '.secrets', 'vault_key'), 'utf8')).toBe('original-vault_key');
+
+  const again = checkout();
+  const operator = path.join(again.deploy, '.secrets', 'cloudflare_dns_api_token');
+  fs.writeFileSync(operator, 'cf-dns-token\n', { mode: 0o644 });
+  expect(again.run(['update', again.target]).status).toBe(0);
+  expect(fs.readFileSync(operator, 'utf8')).toBe('cf-dns-token\n');
+});
+
+it('refuses an update that turns on the wildcard without its DNS token, leaving production as it was', () => {
+  const h = checkout();
+  fs.appendFileSync(path.join(h.deploy, '.turnkey.env'), 'KARMAX_PENDING_PREVIEW_DOMAIN=usercontent.example.com\nKARMAX_PREVIEW_TLS=cloudflare\n');
+  const before = fs.readFileSync(path.join(h.deploy, '.turnkey.env'), 'utf8');
+  const result = h.run(['update', h.target]);
+  expect(result.status).not.toBe(0);
+  expect(result.stderr).toContain('KARMAX_PREVIEW_TLS=cloudflare needs a Cloudflare API token with Zone DNS Edit and Zone Read on usercontent.example.com only');
+  expect(result.stderr).toContain(`production remains at ${h.previous}`);
+  expect(h.git('rev-parse', 'HEAD')).toBe(h.previous);
+  expect(fs.readFileSync(path.join(h.deploy, '.turnkey.env'), 'utf8')).toBe(before);
+  expect(h.calls().map(args => args.join(' ')).some(call => call.includes('build') || call.includes('up -d'))).toBe(false);
+});
+
 // A running workflow replays its recorded history under whatever code is
 // loaded, so a release that cannot replay one wedges it at its next event
 // (WF-34 would have wedged every task on tavya.io). The candidate replays them
@@ -463,8 +528,8 @@ it('refuses a release that cannot replay a running workflow, leaving production 
   const calls = h.calls().map(args => args.join(' '));
   const check = calls.findIndex(call => call.includes('replay-check'));
   expect(calls.some(call => call.includes('pg_dump') || call.includes('up -d'))).toBe(false);
-  // The Compose tags (app and PostgreSQL) point at the running code again for the next restart.
-  expect(calls.slice(check + 1).some(call => call.endsWith(' build app postgresql'))).toBe(true);
+  // The Compose tags (app, PostgreSQL and Caddy) point at the running code again for the next restart.
+  expect(calls.slice(check + 1).some(call => call.endsWith(' build app postgresql caddy'))).toBe(true);
 });
 
 // The two gates in the real updater: replay check before the backup, vault

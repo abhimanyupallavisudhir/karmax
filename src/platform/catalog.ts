@@ -237,6 +237,7 @@ export const PLATFORM_API_CATALOG = {
     'POST /api/settings/paid-launch/paddle/provision (settings:write; discover/create monthly prices, client token, and signed webhook; does not enable live checkout)',
     'GET|PUT /api/settings/service-limits (installation operator: shared provider accounts and this host against plan limits — services[].meters[] with used, usedSource api|count|host, limit, limitSource published|api|entered, level 0|80|95, 7-day hourly history; GET needs settings:read, PUT settings:write with {services: {<id>: {plan, link, limits: {<meterId>: number|null}}}, operatorOrganizationId, cloudflare: {accountId, apiToken}}; null restores a default; the token is write-only)',
     'POST /api/settings/service-limits/check (settings:write; sample every account now and raise or clear alerts)',
+    'GET|POST /api/settings/storage-reconciliation (installation operator: the managed bucket against the database — {report: {at, mode, listed, live, pendingDelete, pendingWrite, untracked, orphans, deleted, organizations: {<id>: {live, pendingDelete, pendingDeleteUntil, untracked}}, families, sample}}; GET the last daily run (settings:read), POST lists the bucket now (settings:write; body {dryRun: true} never deletes, otherwise orphans are queued for the delayed delete only when KARMAX_STORAGE_RECONCILE=delete))',
     'GET|PUT /api/organizations/:organizationId/payments/stripe/platform',
     'GET /api/email', 'POST /api/email/connect|test',
     'GET|POST /api/remote-access',

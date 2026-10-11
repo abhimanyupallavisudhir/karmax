@@ -6,7 +6,8 @@ set -eu
 # checksum verification or let a failed final build pass.
 attempt=1
 while :; do
-  if xcaddy build --with github.com/mholt/caddy-ratelimit@v0.1.0; then
+  if xcaddy build --with github.com/mholt/caddy-ratelimit@v0.1.0 \
+      --with github.com/caddy-dns/cloudflare@v0.2.4; then
     exit 0
   else
     status=$?
