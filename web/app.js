@@ -898,7 +898,7 @@ function installLinkRouter() {
 // a module (an inline handler cannot see `toast`).
 function installInfoDotTips() {
   document.addEventListener('click', (ev) => {
-    const dot = ev.target.closest('.info-dot');
+    const dot = ev.target.closest('.info-dot, .disk-meter');
     if (!dot) return;
     ev.preventDefault();
     ev.stopPropagation();
@@ -1475,8 +1475,36 @@ const localWorldPath = (v) => (hostLocal() && v.worldPath) || '';
 // Parameters tab. The value is sparse ({provider, cpu, memoryMb, diskGb, flavor,
 // hibernateAfterDays, network}); the block shows the effective machine and a
 // form stores only what differs from what it inherits.
-const COMPUTER_PROVIDER_LABELS = { e2b: 'E2B', daytona: 'Daytona', worktree: 'This machine', container: 'Docker container' };
-const E2B_MAX_DISK_GB = 50;
+const COMPUTER_PROVIDER_LABELS = { e2b: 'E2B', daytona: 'Daytona', fly: 'Fly.io', hetzner: 'Hetzner', worktree: 'This machine', container: 'Docker container' };
+// What a machine gets when the Computer asks for nothing more (disk is total GB).
+const COMPUTER_DEFAULTS = { e2b: { cpu: 2, memoryMb: 2048, diskGb: 22 }, daytona: { cpu: 2, memoryMb: 4096, diskGb: 8 },
+  fly: { cpu: 2, memoryMb: 2048, diskGb: 20 }, hetzner: { cpu: 2, memoryMb: 2048, diskGb: 20 } };
+// What a computer on the organization's provider account may be: the
+// connection's limits, learned from the provider (src/domain/computer-limits.ts).
+const computerLimitsFor = (provider) => (S.worldProviderConnections || []).find((c) => c.provider === provider)?.limits || null;
+// What else the chosen provider offers (desktop, outbound allowlist); a
+// provider the page knows nothing about (this machine) offers everything.
+const computerFeaturesFor = (provider) => ({ desktop: true, allowlist: true,
+  ...((S.worldProviderConnections || []).find((c) => c.provider === provider)?.features) });
+// "This E2B account allows up to 29 GB" — the hover text of each size.
+function computerLimitTip(provider, limits, key) {
+  const value = limits?.[key];
+  if (value == null) return '';
+  const label = COMPUTER_PROVIDER_LABELS[provider] || provider;
+  const amount = key === 'cpu' ? `${value} CPU` : `${key === 'memoryMb' ? gbOf(value) : value} GB`;
+  return limits.source?.[key] === 'default' ? `${label} allows up to ${amount} unless its support raised the limit`
+    : `This ${label} account allows up to ${amount}`;
+}
+// Max, placeholder and hover text of the size fields, for the chosen provider.
+function computerSizeAttrs(provider) {
+  const limits = computerLimitsFor(provider);
+  const defaults = COMPUTER_DEFAULTS[provider] || {};
+  return {
+    cpu: { max: limits?.cpu ?? 64, placeholder: defaults.cpu ?? 2, title: computerLimitTip(provider, limits, 'cpu') },
+    memory: { max: limits?.memoryMb != null ? gbOf(limits.memoryMb) : 256, placeholder: gbOf(defaults.memoryMb ?? 2048), title: computerLimitTip(provider, limits, 'memoryMb') },
+    disk: { max: limits?.diskGb ?? 2048, placeholder: defaults.diskGb ?? 'Default', title: computerLimitTip(provider, limits, 'diskGb') },
+  };
+}
 // The providers a task can run on here: the organization's connected cloud
 // computers, plus this machine when self-hosted.
 function computerProviderOptions(current) {
@@ -1494,20 +1522,24 @@ function computerBlockHtml(name, value, inherited, opts = {}) {
   const restricted = v.network?.unrestricted === false;
   // In flight, a task may only resize: another provider, experience or network is another computer.
   const fixed = opts.inFlight ? 'disabled' : '';
+  const size = computerSizeAttrs(provider);
+  const features = computerFeaturesFor(provider);
+  const sizeAttrs = (key) => `max="${esc(size[key].max)}" placeholder="${esc(size[key].placeholder)}"`;
+  const tip = (key) => (size[key].title ? ` title="${esc(size[key].title)}"` : '');
   const body = `<div class="computer-controls">
       <select class="cf-provider" aria-label="Provider" ${fixed}>${computerProviderOptions(provider).map((p) => `<option value="${esc(p)}" ${p === provider ? 'selected' : ''}>${esc(COMPUTER_PROVIDER_LABELS[p] || p)}</option>`).join('')}</select>
-      <label class="computer-size"><input class="cf-cpu" type="number" min="1" max="64" step="1" inputmode="numeric" value="${esc(v.cpu ?? '')}" placeholder="2" aria-label="CPU"><span>CPU</span></label>
-      <label class="computer-size"><input class="cf-memory" type="number" min="0.5" max="256" step="0.5" inputmode="decimal" value="${esc(gbOf(v.memoryMb))}" placeholder="2" aria-label="Memory in GB"><span>GB RAM</span></label>
-      <label class="computer-size"><input class="cf-disk" type="number" min="1" ${provider === 'e2b' ? `max="${E2B_MAX_DISK_GB}"` : 'max="2048"'} step="1" inputmode="numeric" value="${esc(v.diskGb ?? '')}" placeholder="Default" aria-label="Disk in GB"><span>GB disk</span></label>
+      <label class="computer-size"${tip('cpu')}><input class="cf-cpu" type="number" min="1" ${sizeAttrs('cpu')} step="1" inputmode="numeric" value="${esc(v.cpu ?? '')}" aria-label="CPU"><span>CPU</span></label>
+      <label class="computer-size"${tip('memory')}><input class="cf-memory" type="number" min="0.5" ${sizeAttrs('memory')} step="0.5" inputmode="decimal" value="${esc(gbOf(v.memoryMb))}" aria-label="Memory in GB"><span>GB RAM</span></label>
+      <label class="computer-size"${tip('disk')}><input class="cf-disk" type="number" min="1" ${sizeAttrs('disk')} step="1" inputmode="numeric" value="${esc(v.diskGb ?? '')}" aria-label="Disk in GB"><span>GB disk</span></label>
     </div>
     <details class="computer-more"${opts.open ? ' open' : ''}><summary>More</summary><div class="computer-more-grid">
-      <label class="form-row"><span>Experience ${policyTip('Desktop adds a screen you can watch and take over.')}</span><select class="cf-flavor" ${fixed}>
+      <label class="form-row"${features.desktop ? '' : ' hidden'}><span>Experience ${policyTip('Desktop adds a screen you can watch and take over.')}</span><select class="cf-flavor" ${fixed}>
         <option value="headless" ${v.flavor !== 'desktop' ? 'selected' : ''}>Headless</option><option value="desktop" ${v.flavor === 'desktop' ? 'selected' : ''}>Desktop</option></select></label>
       <label class="form-row"><span>Hibernate after (days) ${policyTip('How long a paused task keeps its computer before packing it away. Waking it afterwards takes a little longer.')}</span>
         <input class="cf-hibernate" type="number" min="0" max="365" step="1" value="${esc(v.hibernateAfterDays ?? '')}" placeholder="7"></label>
-      <label class="form-row"><span>Outbound network ${policyTip('Agents normally need package registries, documentation, search and APIs. Allowlist only is for organizations that maintain an egress policy.')}</span><select class="cf-network" ${fixed}>
+      <label class="form-row"${features.allowlist ? '' : ' hidden'}><span>Outbound network ${policyTip('Agents normally need package registries, documentation, search and APIs. Allowlist only is for organizations that maintain an egress policy.')}</span><select class="cf-network" ${fixed}>
         <option value="unrestricted" ${restricted ? '' : 'selected'}>Normal internet</option><option value="restricted" ${restricted ? 'selected' : ''}>Allowlist only</option></select></label>
-      <div class="cf-allowlist" ${restricted ? '' : 'hidden'}>
+      <div class="cf-allowlist" ${restricted && features.allowlist ? '' : 'hidden'}>
         <input class="cf-domains" ${fixed} value="${esc((v.network?.allowDomains || []).join(', '))}" placeholder="Allowed domains: registry.npmjs.org, pypi.org" aria-label="Allowed domains">
         <input class="cf-cidrs" ${fixed} value="${esc((v.network?.allowCidrs || []).join(', '))}" placeholder="Allowed CIDRs: 10.20.0.0/16" aria-label="Allowed CIDRs">
       </div>
@@ -1522,6 +1554,34 @@ function computerPendingChip(change) {
   const tip = `Still ${describeMachineShape(change.from)}. Moves to ${describeMachineShape(change.to)} when the task next pauses with nothing running.`;
   return `<button type="button" class="chip computer-pending" title="${esc(tip)}" aria-label="${esc(tip)}">Moves at next pause</button>`;
 }
+// "Disk 17/22 GB" — the task computer's last measured disk; memory, when it
+// was measured and the account's ceiling on hover (wiki features/computers).
+function diskMeter(v) {
+  const usage = v?.usage;
+  const disk = usage?.disk;
+  if (!disk?.totalMb) return '';
+  const gb = (mb) => { const value = mb / 1024; return value >= 10 ? String(Math.round(value * 10) / 10).replace(/\.0$/, '') : value.toFixed(1).replace(/\.0$/, ''); };
+  const label = COMPUTER_PROVIDER_LABELS[usage.provider] || usage.provider;
+  const ago = usage.at ? Math.max(0, Math.round((Date.now() - usage.at) / 60000)) : null;
+  const tip = [`${gb(disk.usedMb)} of ${gb(disk.totalMb)} GB disk used`,
+    ...(usage.memory?.totalMb ? [`memory ${gb(usage.memory.usedMb)} of ${gb(usage.memory.totalMb)} GB`] : []),
+    ...(ago != null ? [ago < 1 ? 'measured just now' : `measured ${ago} min ago`] : []),
+  ].join(' · ') + (usage.maxDiskGb != null && label ? `. This ${label} account allows up to ${usage.maxDiskGb} GB of disk.` : '.');
+  const ratio = disk.usedMb / disk.totalMb;
+  return `<button type="button" class="disk-meter${ratio >= 0.9 ? ' warn' : ''}" title="${esc(tip)}" aria-label="${esc(tip)}" style="--used:${Math.min(100, Math.round(ratio * 100))}%">Disk ${Math.round(disk.usedMb / 1024)}/${Math.round(disk.totalMb / 1024)} GB</button>`;
+}
+// Bigger disk: the Out of disk fix, up to the account's ceiling.
+function biggerDiskButton(v) {
+  if (!v?.outOfDisk) return '';
+  const usage = v.usage || {};
+  const current = usage.disk?.totalMb ? Math.round(usage.disk.totalMb / 1024) : null;
+  const label = COMPUTER_PROVIDER_LABELS[usage.provider] || usage.provider || 'provider';
+  const atCeiling = usage.maxDiskGb == null || (current != null && current >= usage.maxDiskGb);
+  const title = usage.maxDiskGb == null ? 'This computer has no bigger disk to give'
+    : atCeiling ? `Already the largest disk this ${label} account allows (${usage.maxDiskGb} GB). Free space in the terminal.`
+    : `Grow the disk ${current != null ? `from ${current} ` : ''}to ${usage.maxDiskGb} GB`;
+  return `<button class="btn primary" id="bigger-disk" title="${esc(title)}" ${atCeiling ? 'disabled' : ''}>Bigger disk</button>`;
+}
 function describeMachineShape(shape) {
   return [`${shape.cpu ?? 2} CPU`, `${gbOf(shape.memoryMb ?? 2048)} GB`, ...(shape.diskGb != null ? [`${shape.diskGb} GB disk`] : [])].join(' · ');
 }
@@ -1530,14 +1590,17 @@ function readComputerBlock(box) {
   const number = (selector) => { const raw = value(selector); return raw === '' || !Number.isFinite(Number(raw)) ? undefined : Number(raw); };
   const list = (selector) => value(selector).split(',').map((item) => item.trim()).filter(Boolean);
   const memory = number('.cf-memory');
+  // A provider without a desktop or an allowlist gets headless and normal
+  // internet, even if the defaults it inherits ask for more.
+  const features = computerFeaturesFor(value('.cf-provider'));
   const out = {
     provider: value('.cf-provider') || undefined,
     cpu: number('.cf-cpu'),
     memoryMb: memory === undefined ? undefined : Math.round(memory * 1024),
     diskGb: number('.cf-disk'),
-    flavor: value('.cf-flavor') || undefined,
+    flavor: features.desktop ? value('.cf-flavor') || undefined : 'headless',
     hibernateAfterDays: number('.cf-hibernate'),
-    network: value('.cf-network') === 'restricted'
+    network: features.allowlist && value('.cf-network') === 'restricted'
       ? { unrestricted: false, allowDomains: list('.cf-domains'), allowCidrs: list('.cf-cidrs') } : { unrestricted: true },
   };
   return Object.fromEntries(Object.entries(out).filter(([, item]) => item !== undefined));
@@ -1546,7 +1609,9 @@ function readComputerBlock(box) {
 function computerOverride(box, attr = 'data-inherit') {
   const inh = JSON.parse(box.getAttribute(attr) || 'null') || {};
   const read = readComputerBlock(box);
-  const network = (n) => JSON.stringify(n?.unrestricted === false ? n : { unrestricted: true });
+  // Missing domain or CIDR lists are empty ones, so an unchanged allowlist is no override.
+  const network = (n) => JSON.stringify(n?.unrestricted === false
+    ? { unrestricted: false, allowDomains: n.allowDomains || [], allowCidrs: n.allowCidrs || [] } : { unrestricted: true });
   return Object.fromEntries(Object.entries(read).filter(([key, item]) => key === 'network'
     ? network(item) !== network(inh.network) : !sameJson(item, inh[key])));
 }
@@ -1563,10 +1628,20 @@ function resetComputerBlock(box, attr = 'data-inherit') {
 }
 function syncComputerBlock(box) {
   const provider = box.querySelector('.cf-provider')?.value;
-  const disk = box.querySelector('.cf-disk');
-  if (disk) disk.max = provider === 'e2b' ? String(E2B_MAX_DISK_GB) : '2048';
+  const size = computerSizeAttrs(provider);
+  for (const key of ['cpu', 'memory', 'disk']) {
+    const input = box.querySelector(`.cf-${key}`);
+    if (!input) continue;
+    input.max = String(size[key].max);
+    input.placeholder = String(size[key].placeholder);
+    input.closest('label').title = size[key].title;
+  }
+  const features = computerFeaturesFor(provider);
+  const row = (selector) => box.querySelector(selector)?.closest('label');
+  if (row('.cf-flavor')) row('.cf-flavor').hidden = !features.desktop;
+  if (row('.cf-network')) row('.cf-network').hidden = !features.allowlist;
   const allowlist = box.querySelector('.cf-allowlist');
-  if (allowlist) allowlist.hidden = box.querySelector('.cf-network')?.value !== 'restricted';
+  if (allowlist) allowlist.hidden = !features.allowlist || box.querySelector('.cf-network')?.value !== 'restricted';
 }
 // One delegated listener keeps every Computer block's dependent controls in step.
 document.addEventListener('change', (event) => {
@@ -5075,7 +5150,7 @@ function renderOnboarding() {
     <ol class="onboarding-list">
       ${onboardingStep(1, 'github', 'Connect GitHub', `Import repositories and let ${siteNameMarkup()} work through reviewed pull requests.`, `<a class="btn sm" data-spa href="${settings}#settings-code">${state.steps.github.complete ? 'Manage GitHub' : 'Connect GitHub'}</a>`)}
       ${onboardingStep(2, 'agentLogin', 'Add agent logins', 'Connect at least one usable Codex, Claude, or API-key account.', `<a class="btn sm" data-spa href="${settings}#settings-agents">${state.steps.agentLogin.complete ? 'Manage agent logins' : 'Add agent login'}</a>`)}
-      ${onboardingStep(3, 'e2b', 'Add an E2B or Daytona API key', 'Enable secure cloud worlds where hosted agents do their work.', `<a class="btn sm" data-spa href="${settings}#settings-computers">${state.steps.e2b.complete ? 'Manage E2B/Daytona' : 'Set up E2B/Daytona'}</a>`)}
+      ${onboardingStep(3, 'e2b', 'Connect a cloud computer', 'Add an E2B, Daytona, Fly.io or Hetzner key: your agents work on its computers.', `<a class="btn sm" data-spa href="${settings}#settings-computers">${state.steps.e2b.complete ? 'Manage computers' : 'Connect a computer'}</a>`)}
       ${onboardingStep(4, 'optional', 'Connect apps and payment cards', 'Connect services and give agents approved access to passwords and purchases. This never blocks setup.', `<a class="btn sm" data-spa href="${settings}#settings-payments">${optional.vault || optional.card ? 'Manage apps &amp; cards' : 'Set up apps &amp; cards'}</a>`)}
       ${onboardingStep(5, 'paidPlan', 'Buy paid plan', 'Choose a paid subscription for this workspace, or keep using Free. This never blocks setup.', `<a class="btn sm" data-spa href="${settings}#settings-plan">${state.steps.paidPlan?.complete ? 'Manage paid plan' : 'View plans &amp; billing'}</a>`)}
       ${onboardingStep(6, 'project', 'Create your first project', 'Start a real task list and connect the code your agents will work on.', `<button class="btn sm ${state.steps.project.complete ? '' : 'primary'}" id="onboarding-new-project" type="button">${state.steps.project.complete ? 'Create another project' : 'Create project'}</button>`)}
@@ -6393,6 +6468,8 @@ const PARKED_WAITS = new Set(['timer', 'job', 'subtask', 'collaboration', 'paren
 // the task ever leaving Landing. The short wait reason is rendered separately.
 function stageLabel(v) {
   if (v.state?.draft) return 'draft';
+  // A full disk stopped the task: say so, not "blocked" (wiki features/computers).
+  if (v.outOfDisk) return 'Out of disk';
   // A human hold is a public software-dev stage, even though the workflow keeps
   // its replay-safe Do/Review/Landing checkpoint internally so a follow-up knows
   // where to resume. Direct provider blockers may supply a concise specific
@@ -9349,6 +9426,7 @@ function renderTaskPage() {
             ? `<span title="${esc(v.landing.detail || 'Provider landing state')}">landing: ${esc(v.landing.provider)}</span>`
             : ''}
           ${pullRequestLinks(v)}
+          ${diskMeter(v)}
           ${rec ? orgEditorHtml(rec) : ''}
         </div>
         ${taskAttempts(v)}
@@ -12784,7 +12862,7 @@ function taskActions(v) {
   // Sub-tasks' files arriving before the agent's next turn: a message sent now waits for them.
   const refreshing = v.state?.refreshingResources && v.status === 'active'
     ? `<button class="btn primary action-pending" disabled aria-busy="true" title="Sub-tasks’ files arrive before the agent’s next turn. Messages sent now are read then.">Bringing in sub-tasks’ data…</button>` : '';
-  let html = `<div class="actions"${refreshing ? ' role="status" aria-live="polite"' : ''}>${refreshing}`;
+  let html = `<div class="actions"${refreshing ? ' role="status" aria-live="polite"' : ''}>${refreshing}${biggerDiskButton(v)}`;
   let slot = 0; // digits 1–9 press the Nth ENABLED button (see the command registry)
   for (const a of simple) {
     const cls = a.name === 'confirm' || a.name === 'openPr' ? 'primary' : a.danger ? 'danger' : '';
@@ -12885,6 +12963,19 @@ function reflectAcceptedTaskAction(taskId, action) {
 }
 
 function wireActions(v) {
+  $('#bigger-disk')?.addEventListener('click', async (event) => {
+    const btn = event.currentTarget;
+    if (btn.disabled) return;
+    btn.disabled = true;
+    try {
+      const grown = await api(`/api/tasks/${v.taskId}/bigger-disk`, { method: 'POST', body: JSON.stringify({}) });
+      toast(`Disk → ${grown.diskGb} GB`);
+      setTimeout(refreshTask, 250);
+    } catch (e) {
+      toast(e.message, true);
+      btn.disabled = false;
+    }
+  });
   $('#tp-foot').querySelectorAll('[data-act]').forEach((btn) =>
     btn.addEventListener('click', async () => {
       const act = btn.dataset.act;
@@ -16054,6 +16145,8 @@ async function hydrateProjectSecrets(proj) {
   } catch (error) { if (renderIsCurrent()) paneError(box, error, () => hydrateProjectSecrets(proj)); }
 }
 
+const ON_DEMAND_TIP = 'Tasks get a list of this folder instead of a full copy, and download only the top-level folders they need, so large data fits on their disk. Folders a task never downloads stay exactly as they are.';
+
 async function hydrateProjectData(proj) {
   const box = $('#project-data-box'); if (!box || S.projectId !== proj.id) return;
   const renderIsCurrent = beginAsyncElementRender(box);
@@ -16067,13 +16160,14 @@ async function hydrateProjectData(proj) {
     const storageName = (id) => storageLocations.find((location) => location.id === id)?.name
       || storageLocations.find((location) => location.isDefault)?.name || 'Managed storage';
     if (!renderIsCurrent()) return;
-    box.innerHTML = `      ${resources.map((resource) => `<div class="project-resource-row" data-data-resource="${esc(resource.id)}"><div class="project-resource-main"><b>${esc(resource.name)}</b><div class="project-resource-meta"><span class="project-resource-location"><span>Inside each task</span><code>${esc(resource.target.path)}</code></span><span class="chip">${esc(storageName(resource.storageLocationId))}</span><span class="chip">${resource.access === 'write' ? 'private writable copy' : 'read-only'}</span><span class="chip">${resource.publish === 'review' ? 'changes can be promoted' : 'task changes discarded'}</span>${resource.revision ? `<span>${formatBytes(resource.revision.bytes)} · revision ${esc(resource.revision.id)}</span>` : '<span>No initial data</span>'}</div></div><button class="btn sm resource-toggle">${resource.enabled ? 'Disable' : 'Enable'}</button><button class="btn sm danger resource-delete">Remove</button></div>`).join('')}
+    box.innerHTML = `      ${resources.map((resource) => `<div class="project-resource-row" data-data-resource="${esc(resource.id)}"><div class="project-resource-main"><b>${esc(resource.name)}</b><div class="project-resource-meta"><span class="project-resource-location"><span>Inside each task</span><code>${esc(resource.target.path)}</code></span><span class="chip">${esc(storageName(resource.storageLocationId))}</span><span class="chip">${resource.access === 'write' ? 'private writable copy' : 'read-only'}</span><span class="chip">${resource.publish === 'review' ? 'changes can be promoted' : 'task changes discarded'}</span>${resource.revision ? `<span>${formatBytes(resource.revision.bytes)} · revision ${esc(resource.revision.id)}</span>` : '<span>No initial data</span>'}</div></div>${resource.source?.shape === 'file' ? '' : `<label class="resource-on-demand">On demand ${policyTip(ON_DEMAND_TIP)}<input class="toggle resource-on-demand-toggle" type="checkbox" ${resource.onDemand ? 'checked' : ''} aria-label="Load ${esc(resource.name)} on demand"></label>`}<button class="btn sm resource-toggle">${resource.enabled ? 'Disable' : 'Enable'}</button><button class="btn sm danger resource-delete">Remove</button></div>`).join('')}
       <details class="settings-disclosure compact" id="data-add-panel"><summary><b>Add data</b></summary>
         <div class="project-form-grid">
           <label class="form-row"><span>Name</span><input id="data-name" placeholder="Training data"></label>
           <label class="form-row"><span>Mount at path <small>(repo-relative)</small></span><input id="data-path" placeholder="data/training-data"></label>
           <label class="form-row"><span>Task access</span><select id="data-access"><option value="read">Read-only</option><option value="write">Writable private copy per task</option></select></label>
           <label class="form-row"><span>If a task changes it</span><select id="data-publish"><option value="discard">Discard its changes</option><option value="review">Offer “Promote” during Review</option></select></label>
+          <label class="form-row form-row-toggle"><span>On demand ${policyTip(ON_DEMAND_TIP)}</span><input id="data-on-demand" class="toggle" type="checkbox"></label>
           <div class="form-row"><span>Storage</span>${readyStorage.length > 1
             ? `<select id="data-storage" aria-label="Storage">${readyStorage.map((location) => `<option value="${esc(location.id)}" ${location.isDefault ? 'selected' : ''}>${esc(location.name)}${location.kind === 's3' ? ' · customer bucket' : ''}</option>`).join('')}</select>`
             : `<input id="data-storage" type="hidden" value="${esc(readyStorage[0]?.id || '')}"><span>${esc(readyStorage[0]?.name || 'Organization default')}</span>`}
@@ -16091,6 +16185,12 @@ async function hydrateProjectData(proj) {
           await api(`/api/projects/${proj.id}/resources/${resource.id}`, { method: 'PATCH', body: JSON.stringify({ enabled: !resource.enabled }) });
           await hydrateProjectData(proj);
         } catch (error) { toast(error.message, true); }
+      });
+      row.querySelector('.resource-on-demand-toggle')?.addEventListener('change', async (event) => {
+        try {
+          await api(`/api/projects/${proj.id}/resources/${resource.id}`, { method: 'PATCH', body: JSON.stringify({ onDemand: event.target.checked }) });
+          resource.onDemand = event.target.checked;
+        } catch (error) { event.target.checked = !event.target.checked; toast(error.message, true); }
       });
       row.querySelector('.resource-delete').addEventListener('click', async () => {
         if (!confirm(`Remove ${resource.name}?`)) return;
@@ -16126,6 +16226,7 @@ async function hydrateProjectData(proj) {
         const created = await api(`/api/projects/${proj.id}/resources`, { method: 'POST', body: JSON.stringify({
           name, driver: 'volume@1', target: { kind: 'path', path: box.querySelector('#data-path').value.trim() || `data/${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` },
           access: box.querySelector('#data-access').value, isolation: 'fork', publish: box.querySelector('#data-publish').value,
+          onDemand: box.querySelector('#data-on-demand').checked || undefined,
           storageLocationId: box.querySelector('#data-storage')?.value || undefined,
           sourcePath: box.querySelector('#data-source')?.value.trim() || undefined,
         }) });
@@ -20714,6 +20815,12 @@ const COMPUTER_PROVIDERS = {
     advanced: [['snapshot', 'Headless snapshot', 'Daytona default'], ['image', 'Headless image', 'used when no snapshot'],
       ['desktopSnapshot', 'Desktop snapshot', 'Daytona default'], ['desktopImage', 'Desktop image', 'used when no desktop snapshot'],
       ['apiUrl', 'API URL', 'https://app.daytona.io/api'], ['target', 'Target', 'provider default']] },
+  fly: { name: 'Fly.io', keys: 'https://fly.io/dashboard/personal/tokens',
+    tip: 'Disks up to 500 GB that grow in place and survive pauses. You pay per second while it works, and for the disk while it exists.',
+    advanced: [['region', 'Region', 'fra'], ['organization', 'Organization', 'personal'], ['image', 'Image', 'debian:bookworm']] },
+  hetzner: { name: 'Hetzner', keys: 'https://console.hetzner.cloud/projects',
+    tip: 'The cheapest: disks up to 10 TB that grow in place and survive pauses, in EU data centres. Use a Read & Write project token.',
+    advanced: [['region', 'Location', 'fsn1'], ['image', 'Image', 'karmax snapshot, else debian-12']] },
 };
 function computerConnectionState(connection) {
   if (!connection) return { label: 'not connected', tone: '' };
@@ -20721,12 +20828,24 @@ function computerConnectionState(connection) {
   if (connection.status === 'ready') return { label: 'connected', tone: 'done' };
   return { label: connection.status === 'error' ? 'failing' : String(connection.status || 'unverified'), tone: 'failed' };
 }
+// "≤ 8 CPU · 8 GB · 29 GB disk": the most one computer on this account may be.
+function computerLimitsSummary(provider, limits) {
+  const parts = [limits.cpu != null ? `${limits.cpu} CPU` : '', limits.memoryMb != null ? `${gbOf(limits.memoryMb)} GB` : '',
+    limits.diskGb != null ? `${limits.diskGb} GB disk` : ''].filter(Boolean);
+  if (!parts.length) return '';
+  const name = COMPUTER_PROVIDERS[provider]?.name || provider;
+  const guessed = Object.values(limits.source || {}).includes('default');
+  const tip = `The most one computer may have on this ${name} account${limits.checkedAt ? `, as ${name} said on ${new Date(limits.checkedAt).toLocaleDateString()}` : ''}.`
+    + (guessed ? ` Some are ${name}'s documented defaults; set them under ✎ → Advanced if its support raised them.` : '');
+  return `<span class="setting-muted computer-limits" title="${esc(tip)}">≤ ${esc(parts.join(' · '))}</span>`;
+}
 function computersMarkup(connections) {
   return `<div class="computer-providers">${Object.entries(COMPUTER_PROVIDERS).map(([id, info]) => {
     const connection = connections.find((candidate) => candidate.provider === id);
     const state = computerConnectionState(connection);
     return `<div class="computer-provider" data-provider="${id}"><b>${esc(info.name)}</b>
       <span class="chip ${state.tone}"${connection?.lastError ? ` title="${esc(connection.lastError)}"` : ''}>${esc(state.label)}</span>
+      ${connection?.limits ? computerLimitsSummary(id, connection.limits) : ''}
       <span class="label-row-fill"></span>
       ${connection ? `<button class="icon-btn computer-edit" type="button" title="Edit ${esc(info.name)}" aria-label="Edit ${esc(info.name)}">✎</button>
         <button class="btn sm computer-test" type="button">Test</button>`
@@ -20767,6 +20886,12 @@ function openComputerDialog(provider, connection, organizationId, onSaved) {
       <input class="computer-key" type="password" autocomplete="new-password" placeholder="${connection ? 'Blank to leave unchanged' : 'Required'}"></label>
     <details class="computer-advanced"><summary>Advanced</summary><div class="settings-grid">
       ${info.advanced.map(([key, label, placeholder]) => `<label class="form-row">${esc(label)}<input data-config="${esc(key)}" value="${esc(config[key] || '')}" placeholder="${esc(placeholder)}"></label>`).join('')}
+      ${[['cpu', 'Max CPU'], ['memoryMb', 'Max memory (GB)'], ['diskGb', 'Max disk (GB)']].map(([key, label]) => {
+        const own = config.limits?.[key];
+        const known = connection?.limits?.[key];
+        const shown = (value) => (value == null ? '' : key === 'memoryMb' ? gbOf(value) : String(value));
+        return `<label class="form-row">${esc(label)}<input data-limit="${key}" type="number" min="1" step="1" inputmode="numeric" value="${esc(shown(own))}" placeholder="${esc(shown(known) || 'provider default')}"></label>`;
+      }).join('')}
     </div></details>
     <div class="modal-actions">${connection ? '<button class="btn danger computer-disconnect" type="button">Disconnect</button><span class="label-row-fill"></span>' : ''}
       <button class="btn computer-cancel" type="button">Cancel</button><button class="btn primary computer-save" type="button">${connection ? 'Save' : 'Connect'}</button></div>
@@ -20779,8 +20904,12 @@ function openComputerDialog(provider, connection, organizationId, onSaved) {
   overlay.querySelector('.computer-cancel').addEventListener('click', close);
   overlay.querySelector('.computer-save').addEventListener('click', async (event) => {
     const button = event.currentTarget; button.disabled = true;
+    // Limits a person entered, for what the provider's API cannot tell (disk is total GB).
+    const limits = Object.fromEntries([...overlay.querySelectorAll('[data-limit]')]
+      .filter((input) => input.value.trim() !== '' && Number(input.value) > 0)
+      .map((input) => [input.dataset.limit, input.dataset.limit === 'memoryMb' ? Math.round(Number(input.value) * 1024) : Math.round(Number(input.value))]));
     const body = { apiKey: overlay.querySelector('.computer-key').value.trim() || undefined,
-      config: Object.fromEntries([...overlay.querySelectorAll('[data-config]')].map((input) => [input.dataset.config, input.value.trim()])) };
+      config: { ...Object.fromEntries([...overlay.querySelectorAll('[data-config]')].map((input) => [input.dataset.config, input.value.trim()])), limits } };
     // A refused save changed nothing: keep what was typed. A saved one is
     // verified at once, and its state (or error) shows on the row.
     try { await api(base, { method: 'PUT', body: JSON.stringify(body) }); }
@@ -21222,7 +21351,7 @@ async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
       ]);
       if (!live('usage')) return;
       $('#org-plan').innerHTML = organizationPlanMarkup(entitlements);
-      const usageSync = (usage?.sync || []).filter((item) => item.provider === 'e2b');
+      const usageSync = (usage?.sync || []).filter((item) => ['e2b', 'fly', 'hetzner'].includes(item.provider));
       const usageSyncLabel = usageSync.some((item) => item.status === 'error') ? ' · sync unavailable'
         : usageSync.some((item) => item.status === 'pending') ? ' · first sync pending'
           : usageSync.length ? ` · synced ${fmtAgo(Math.max(...usageSync.map((item) => Number(item.at || 0))))}` : '';

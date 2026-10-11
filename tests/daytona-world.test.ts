@@ -224,6 +224,16 @@ describe('Daytona cloud world provider', () => {
     expect(created[0]).toMatchObject({ resources: { cpu: 2, memory: 2, disk: 40 } });
   });
 
+  it('fits a size above the account\'s limit to it, instead of failing the create', async () => {
+    const created: Array<Record<string, unknown>> = [];
+    const create = async (options: Record<string, unknown>) => { created.push(options); return fakeSandbox(); };
+    const world = await new DaytonaWorldProvider({ create, get: async () => fakeSandbox() }, undefined, undefined, undefined,
+      () => ({ provider: 'daytona', apiKey: 'k', config: {}, limits: { cpu: 4, memoryMb: 8192, diskGb: 10, source: {} } }))
+      .create({ taskId: 'too-big', base: 'main', environment: { image: 'ubuntu:24.04' }, resources: { cpu: 2, memoryMb: 2048, diskGb: 50 } });
+    expect(created[0]).toMatchObject({ resources: { cpu: 2, memory: 2, disk: 10 } });
+    expect(world.handle.warnings).toEqual(['This Daytona account allows at most 10 GB of disk, so this computer has 2 CPU · 2 GB · 10 GB disk, not 2 CPU · 2 GB · 50 GB disk.']);
+  });
+
   it('keeps the snapshot size and says so when this Daytona cannot resize', async () => {
     const sandbox = fakeSandbox();
     const resized: object[] = [];

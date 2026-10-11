@@ -7,6 +7,7 @@ import { MemoryWorldProvider } from './memory.js';
 import { ContainerWorldProvider } from './container.js';
 import { E2BWorldProvider } from './e2b.js';
 import { DaytonaWorldProvider } from './daytona.js';
+import { flyWorldProvider, hetznerWorldProvider } from './vm/providers.js';
 
 /**
  * Selects a world provider by kind. `createWorld` dispatches to the configured
@@ -30,6 +31,8 @@ export class WorldRegistry {
     this.register(new ContainerWorldProvider());
     this.register(new E2BWorldProvider());
     this.register(new DaytonaWorldProvider());
+    this.register(flyWorldProvider());
+    this.register(hetznerWorldProvider());
   }
 
   register(p: WorldProvider) {
@@ -59,6 +62,11 @@ export class WorldRegistry {
    *  lifecycle sweep's orphan reaper (`WorldLifecycleManager.sweep`). */
   enumerable(): WorldProvider[] {
     return [...this.providers.values()].filter((provider) => typeof provider.listSandboxes === 'function');
+  }
+
+  /** Providers with periodic upkeep of their own (`WorldProvider.housekeep`). */
+  housekept(): WorldProvider[] {
+    return [...this.providers.values()].filter((provider) => typeof provider.housekeep === 'function');
   }
 
   /** Providers whose control plane exposes completed billable executions. */
