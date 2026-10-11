@@ -84,7 +84,12 @@ ${options.foreground
 `;
 }
 
-const SMOKE = fs.readFileSync(fileURLToPath(new URL('../../../environments/browser/smoke.mjs', import.meta.url)), 'utf8');
+/** The render smoke test of `environments/browser`, read when a script is made:
+ * an install without it (an old image) fails provisioning, not boot. */
+let smoke: string | undefined;
+function smokeTest(): string {
+  return smoke ??= fs.readFileSync(fileURLToPath(new URL('../../../environments/browser/smoke.mjs', import.meta.url)), 'utf8');
+}
 
 /**
  * Everything the E2B template `environments/browser` bakes, for a stock
@@ -135,7 +140,7 @@ retry npm install --prefix /opt/karmax/agents --no-audit --no-fund --omit=dev ${
   ].map(quote).join(' ')}
 for name in claude codex opencode; do ln -sfn "/opt/karmax/agents/node_modules/.bin/$name" "/opt/karmax/bin/$name"; done
 cat > /opt/karmax/smoke.mjs << 'KARMAX_SMOKE'
-${SMOKE.trim()}
+${smokeTest().trim()}
 KARMAX_SMOKE
 chmod -R a+rX /opt/karmax
 PLAYWRIGHT_BROWSERS_PATH=/opt/karmax/browsers node /opt/karmax/smoke.mjs
@@ -159,7 +164,7 @@ export function vmProvisionVersion(): string {
   if (!version) {
     const script = vmProvisionScript.toString() + JSON.stringify([PINNED_REMOTE_NODE_VERSION, PINNED_REMOTE_NPM_VERSION,
       PLAYWRIGHT_VERSION, PLAYWRIGHT_MCP_VERSION, CHROME_DEVTOOLS_MCP_VERSION, installedClaudeCodeVersion(), CODEX_VERSION,
-      OPENCODE_PACKAGE, SMOKE]);
+      OPENCODE_PACKAGE, smokeTest()]);
     version = crypto.createHash('sha256').update(script).digest('hex').slice(0, 12);
   }
   return version;
