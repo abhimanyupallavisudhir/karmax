@@ -40,6 +40,7 @@ export type {
   TaskPullRequest,
   GithubLandingParticipant,
   GitHubMergeAuthorization,
+  UpstreamProposal,
   TaskLandingState,
   TaskCheckout,
   WorldHandleRef,

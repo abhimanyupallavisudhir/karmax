@@ -6,10 +6,11 @@ import { WorktreeProvider } from '../src/world/worktree.js';
 import { git, gitOrThrow, ensureIdentity } from '../src/world/git.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
-import { GithubPrApi, githubSlug, taskIdOfBranch, pullRequestWebhookEvent, reconcilePullRequestView } from '../src/integrations/github-pr.js';
+import { GithubPrApi, githubSlug, taskIdOfBranch, pullRequestWebhookEvent, reconcilePullRequestView, upstreamPullRequestUrl } from '../src/integrations/github-pr.js';
 import { GithubActionsApiError } from '../src/integrations/github-actions.js';
 import type { TaskPullRequest } from '../src/domain/types.js';
 import { ensureProjectWikiRepository } from '../src/wiki/repository.js';
+import { GitProfiles, userGitScope } from '../src/autonomy/git-profiles.js';
 
 /** The GitHub pull-request integration (SPEC §5.2, wiki plans/PLAN-git-config §5):
  *  the REST client, the PR stage activity, merge/cancel reconciliation, and the
@@ -197,6 +198,44 @@ describe('GitHub PR client', () => {
     expect(gh.prs).toHaveLength(1);
     expect(gh.prs[0].title).toBe('Two');
     expect(gh.prs[0].body).toBe('second');
+  });
+
+  it('proposes a fork branch to its upstream and links GitHub\'s prefilled pull-request page', async () => {
+    const calls: Array<{ method: string; path: string; body?: any }> = [];
+    const opened: any[] = [];
+    const fetcher = (async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      const method = init.method ?? 'GET';
+      const body = init.body ? JSON.parse(String(init.body)) : undefined;
+      calls.push({ method, path: `${url.pathname}${url.search}`, body });
+      if (url.pathname === '/repos/acme/widgets/pulls' && method === 'GET')
+        return Response.json(opened.filter((pr) => `${pr.owner}:${pr.head.ref}` === url.searchParams.get('head')));
+      if (url.pathname === '/repos/acme/widgets/pulls' && method === 'POST') {
+        const [owner, ref] = String(body.head).split(':');
+        const pr = { owner, number: 3, html_url: 'https://github.com/acme/widgets/pull/3', state: 'open', head: { ref }, base: { ref: body.base } };
+        opened.push(pr);
+        return Response.json(pr, { status: 201 });
+      }
+      return Response.json({ message: 'not found' }, { status: 404 });
+    }) as typeof fetch;
+    const api = new GithubPrApi('personal-token', { apiBase: 'https://api.github.test', fetch: fetcher });
+    const first = await api.openOrUpdate('acme/widgets', { head: 'tavya/t1', base: 'main', title: 'Fix', body: 'Why', headOwner: 'jane' });
+    expect(first).toMatchObject({ created: true, pr: { number: 3 } });
+    expect(calls.find((call) => call.method === 'POST')?.body).toMatchObject({ head: 'jane:tavya/t1', base: 'main' });
+    expect(calls[0]?.path).toBe('/repos/acme/widgets/pulls?state=all&per_page=1&head=jane%3Atavya%2Ft1');
+    await expect(api.findByHead('acme/widgets', 'tavya/t1', 'jane')).resolves.toMatchObject({ number: 3 });
+    // A same-named branch in the upstream itself is a different proposal.
+    await expect(api.findByHead('acme/widgets', 'tavya/t1')).resolves.toBeUndefined();
+
+    const link = new URL(upstreamPullRequestUrl('acme/widgets', {
+      base: 'main', headRepository: 'jane/widgets', head: 'tavya/t1', title: 'Fix the widget', body: 'x'.repeat(5000),
+    }));
+    expect(`${link.origin}${link.pathname}`).toBe('https://github.com/acme/widgets/compare/main...jane:widgets:tavya/t1');
+    expect(link.searchParams.get('quick_pull')).toBe('1');
+    expect(link.searchParams.get('title')).toBe('Fix the widget');
+    expect(link.searchParams.get('body')!.length).toBeLessThan(3100);
+    expect(() => upstreamPullRequestUrl('acme/widgets', { base: 'main', headRepository: '../x', head: 'b', title: '', body: '' }))
+      .toThrow(/repository slug/);
   });
 
   it('binds a merge to the reviewed head and can enter a GitHub merge queue', async () => {
@@ -2255,6 +2294,91 @@ describe('PR stage (remote policy "pr")', () => {
     } finally {
       for (const key of Object.keys(process.env).filter((key) => key.startsWith('GIT_CONFIG_'))) delete process.env[key];
       Object.assign(process.env, prior);
+      await core.destroyWorld(handle);
+    }
+  });
+
+  it('syncs a fork with its upstream before a world branches off it', async () => {
+    const gh = fakeGithub();
+    const app = await repoWithGithubOrigin('fork-sync', 'jane/widgets');
+    await gitOrThrow(app, ['config', '--unset-all', `url.${path.join(tmp, 'fork-sync-origin.git')}.insteadOf`]);
+    const syncs: Array<{ repository: string; branch: string }> = [];
+    const core = await remoteCoreFor(gh, {
+      async repositoryCloneToken() { return 'clone-token'; },
+      async brokerCredentials() { return { env: {} }; },
+      async syncFork(repository: { owner: string; name: string }, branch: string) {
+        syncs.push({ repository: `${repository.owner}/${repository.name}`, branch });
+        return { synced: false, detail: 'GitHub API 409: There are merge conflicts' };
+      },
+    }, path.join(tmp, 'content'));
+    (await core.store.claimPersonalOrganization('jane'));
+    const project = (await core.store.createProject('Fork', { repos: [app], worldProvider: 'fake-remote' }));
+    const wikiRoot = ensureProjectWikiRepository(path.join(tmp, 'content'), project.id);
+    const wikiRemote = 'git@github.com:jane/project-wiki.git';
+    await gitOrThrow(wikiRoot, ['remote', 'add', 'origin', wikiRemote]);
+    const wiki = (await core.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+      owner: 'jane', name: 'project-wiki', sshUrl: wikiRemote, defaultBranch: 'main', private: true }));
+    (await core.store.setProjectWikiRepository(project.id, wiki.id));
+    const fork = (await core.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '7',
+      owner: 'jane', name: 'widgets', sshUrl: 'git@github.com:jane/widgets.git', defaultBranch: 'main', private: false,
+      upstream: { owner: 'acme', name: 'widgets', defaultBranch: 'main', private: false } }));
+    (await core.store.attachProjectRepository({ projectId: project.id, repositoryId: fork.id }));
+    const task = (await core.store.createTask({ projectId: project.id, title: 'Fork work', workflow: 'software-dev',
+      workflowVersion: '1.28.0', params: { prompt: 'work' } }));
+    const handle = await core.createWorld({ taskId: task.id, projectId: project.id, repo: app, base: 'main', target: 'main', kind: 'fake-remote' });
+    try {
+      expect(syncs).toEqual([{ repository: 'jane/widgets', branch: 'main' }]);
+      // A fork that cannot be synced keeps its branch; the world still starts.
+      expect((await core.store.eventsOfTypes(task.id, ['repository.fork-synced']))[0]?.payload)
+        .toMatchObject({ repository: 'jane/widgets', upstream: 'acme/widgets', branch: 'main', synced: false });
+    } finally {
+      await core.destroyWorld(handle);
+    }
+  });
+
+  it('stops a fork of a private repository at Setup with how to fix it, unless the person saved a token', async () => {
+    const gh = fakeGithub();
+    const app = await repoWithGithubOrigin('private-fork', 'jane/secret');
+    await gitOrThrow(app, ['config', '--unset-all', `url.${path.join(tmp, 'private-fork-origin.git')}.insteadOf`]);
+    const syncs: string[] = [];
+    const content = path.join(tmp, 'private-content');
+    const core = await remoteCoreFor(gh, {
+      async repositoryCloneToken() { return 'clone-token'; },
+      async brokerCredentials() { return { env: {} }; },
+      async activeUserAccountId() { return '7'; },
+      async syncFork(repository: { name: string }) { syncs.push(repository.name); return { synced: true, detail: 'ok' }; },
+    }, content);
+    (await core.store.claimPersonalOrganization('jane'));
+    const project = (await core.store.createProject('Private fork', { repos: [app], worldProvider: 'fake-remote' }));
+    const wikiRoot = ensureProjectWikiRepository(content, project.id);
+    const wikiRemote = 'git@github.com:jane/private-wiki.git';
+    await gitOrThrow(wikiRoot, ['remote', 'add', 'origin', wikiRemote]);
+    const wiki = (await core.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+      owner: 'jane', name: 'private-wiki', sshUrl: wikiRemote, defaultBranch: 'main', private: true }));
+    (await core.store.setProjectWikiRepository(project.id, wiki.id));
+    const fork = (await core.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '9',
+      owner: 'jane', name: 'secret', sshUrl: 'git@github.com:jane/secret.git', defaultBranch: 'main', private: true,
+      upstream: { owner: 'acme', name: 'secret', defaultBranch: 'main', private: true } }));
+    (await core.store.attachProjectRepository({ projectId: project.id, repositoryId: fork.id }));
+    const start = async () => {
+      const task = (await core.store.createTask({ projectId: project.id, title: 'Private fork work', workflow: 'software-dev',
+        workflowVersion: '1.28.0', params: { prompt: 'work' }, createdBy: { kind: 'user', userId: 'jane' } }));
+      return core.createWorld({ taskId: task.id, projectId: project.id, repo: app, base: 'main', target: 'main', kind: 'fake-remote' });
+    };
+    const refused = await start().then(() => undefined, (error) => error);
+    expect(refused).toMatchObject({ type: 'repository-access', nonRetryable: true });
+    expect(refused.message).toMatch(/acme\/secret is private/);
+    expect(refused.message).toMatch(/install the tavya GitHub App on acme\/secret/);
+    expect(refused.message).toMatch(/token with the repo scope under Profile → GitHub → Token/);
+    expect(syncs).toEqual([]);
+
+    const profiles = new GitProfiles(core.store, broker, path.join(tmp, 'state'), userGitScope('jane'));
+    (await profiles.saveGithubIdentity({ id: '7', login: 'jane' }));
+    (await profiles.saveGithubToken('7', 'ghp_personal'));
+    const handle = await start();
+    try {
+      expect(syncs).toEqual(['secret']);
+    } finally {
       await core.destroyWorld(handle);
     }
   });

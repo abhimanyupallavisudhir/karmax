@@ -272,6 +272,56 @@ describe('Project settings', () => {
     await ui.close();
   });
 
+  it('forks someone else\'s repository on GitHub, then attaches the fork whose upstream it is', async () => {
+    const fork = { id: 'repo_fork', owner: 'octo', name: 'widgets', sshUrl: 'git@github.com:octo/widgets.git',
+      upstream: { owner: 'acme', name: 'widgets', defaultBranch: 'main', private: false } };
+    const ui = await settings({ api: ({ method, path: route }) => route.endsWith('/github/app') ? { configured: true, userAuthorized: true }
+      : route.endsWith('/git-connections') ? [{ id: 'gc', provider: 'github', accountLogin: 'octo' }]
+        : method === 'GET' && route.endsWith('/repositories') ? [fork]
+          : method === 'POST' && route.endsWith('/github/refresh') ? { repositories: [fork], count: 1 }
+            : method === 'POST' && route.endsWith('/repositories') ? { ok: true } : undefined });
+    const open = ui.page.getByRole('button', { name: 'Fork a repository' });
+    await open.waitFor();
+    expect(await open.getAttribute('title')).toMatch(/repository you don't own/);
+    const option = ui.page.locator('#project-repository-options option').first();
+    expect([await option.getAttribute('value'), await option.textContent()]).toEqual(['octo/widgets', '→ acme/widgets']);
+    await open.click();
+    const dialog = ui.page.getByRole('dialog', { name: 'Fork a repository' });
+    await dialog.getByLabel('Repository').fill('https://github.com/Acme/widgets');
+    expect(await dialog.getByRole('link', { name: /Fork on GitHub/ }).getAttribute('href')).toBe('https://github.com/Acme/widgets/fork');
+    await dialog.getByRole('button', { name: 'Attach fork' }).click();
+    await expect.poll(() => ui.calls.filter((call) => call.method === 'POST').map((call) => [call.path, call.body ?? null]))
+      .toContainEqual([expect.stringMatching(/\/api\/projects\/[^/]+\/repositories$/), { repositoryId: 'repo_fork' }]);
+    await dialog.waitFor({ state: 'detached' });
+    await ui.close();
+  });
+
+  it('explains, before attaching, why a fork of a private repository needs the App or a token', async () => {
+    const fork = { id: 'repo_secret', owner: 'octo', name: 'secret', sshUrl: 'git@github.com:octo/secret.git',
+      upstream: { owner: 'acme', name: 'secret', defaultBranch: 'main', private: true } };
+    const ui = await settings({ api: ({ method, path: route }) => route.endsWith('/github/app') ? { configured: true, userAuthorized: true, appSlug: 'tavya-app' }
+      : route.endsWith('/git-connections') ? [{ id: 'gc', provider: 'github', accountLogin: 'octo' }]
+        : route === '/api/user/github-accounts' ? { accounts: [{ id: 'a1', login: 'octo', active: true, profile: {} }] }
+          : method === 'GET' && route.endsWith('/repositories') ? [fork]
+            : method === 'POST' && route.endsWith('/github/refresh') ? { repositories: [fork], count: 1 }
+              : method === 'POST' && route.endsWith('/repositories') ? { ok: true } : undefined });
+    await ui.page.getByRole('button', { name: 'Fork a repository' }).click();
+    const dialog = ui.page.getByRole('dialog', { name: 'Fork a repository' });
+    await dialog.locator('#project-fork-source').fill('acme/secret');
+    await dialog.getByRole('button', { name: 'Attach fork' }).click();
+    const note = dialog.locator('.fork-private-note');
+    await note.waitFor();
+    expect(await note.innerText()).toMatch(/acme\/secret is private/);
+    expect(await note.locator('a', { hasText: 'installs the GitHub App' }).getAttribute('href')).toBe('https://github.com/apps/tavya-app/installations/new');
+    expect(await note.locator('a', { hasText: 'save a GitHub token' }).getAttribute('href')).toBe('/profile#github-token');
+    const attachments = () => ui.calls.filter((call) => call.method === 'POST' && /\/api\/projects\/[^/]+\/repositories$/.test(call.path));
+    expect(attachments()).toEqual([]);
+    // The person may still attach it, knowing what it needs.
+    await dialog.getByRole('button', { name: 'Attach anyway' }).click();
+    await expect.poll(() => attachments().map((call) => call.body)).toEqual([{ repositoryId: 'repo_secret' }]);
+    await ui.close();
+  });
+
   it('names repositories the way people do, keeping the exact source on hover', async () => {
     const ui = await consolePage();
     expect(await ui.run(`[

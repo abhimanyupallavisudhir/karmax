@@ -88,7 +88,7 @@ const remoteField = (): FieldSpec => ({
   scopes: ['project', 'global'],
   bind: 'project',
 });
-// software-dev ≥1.28: Do runs the task's own code instead of the agent
+// software-dev ≥1.29: Do runs the task's own code instead of the agent
 // (wiki features/events-and-automations).
 const commandField = (): FieldSpec => ({
   name: 'command', type: 'text', label: 'Command', scopes: ['task'], bind: 'top', placeholder: 'python scripts/triage.py',
@@ -448,8 +448,8 @@ export interface WorkflowManifest {
 export const MANIFESTS: WorkflowManifest[] = [
   {
     name: 'software-dev',
-    version: '1.28.0',
-    description: `World → do/wait → review → optional per-PR provider/external landing or canonical ${BRAND} fallback admission; lifecycle restoration rebuilds proposal prerequisites, and task views track GitHub’s actual PR state.`,
+    version: '1.29.0',
+    description: `World → do/wait → review → proposal to a fork's upstream → optional per-PR provider/external landing or canonical ${BRAND} fallback admission; lifecycle restoration rebuilds proposal prerequisites, and task views track GitHub’s actual PR state.`,
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
     events: [
@@ -559,7 +559,7 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'goal',
-    version: '1.28.0',
+    version: '1.29.0',
     description: 'Software Dev in autonomous completion mode with prerequisite-aware lifecycle restoration, GitHub-authoritative PR state, per-PR multi-repository landing ownership, canonical fallback admission, and reviewed adoption of task-created resources.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],

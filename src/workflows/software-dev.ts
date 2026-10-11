@@ -132,7 +132,7 @@ const cancellationAwareTurns = proxyActivities<coreActivities>({
   retry: { maximumAttempts: 3, initialInterval: '10s', backoffCoefficient: 2 },
   cancellationType: ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
 });
-// The task's own command (v1.28) runs as a durable job that may take as long
+// The task's own command (v1.29) runs as a durable job that may take as long
 // as any job; the watch heartbeats and returns at its own deadline.
 const commandWatch = proxyActivities<coreActivities>({
   startToCloseTimeout: '8 days',
@@ -512,9 +512,14 @@ export async function softwareDevV1_27(input: SoftwareDevInput): Promise<{ stage
   return softwareDevImpl(input, '1.27.0');
 }
 
-/** v1.28: Do can run the task's own command instead of the agent. */
+/** Work on a fork is proposed to its upstream after Review. */
 export async function softwareDevV1_28(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevImpl(input, '1.28.0');
+}
+
+/** v1.29: Do can run the task's own command instead of the agent. */
+export async function softwareDevV1_29(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevImpl(input, '1.29.0');
 }
 
 /** Replay-compatible entry for executions already recorded as
@@ -523,7 +528,7 @@ export async function softwareDevV1(input: SoftwareDevInput): Promise<{ stage: S
   return softwareDevImpl(input, '1.0.0');
 }
 
-type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0' | '1.14.0' | '1.15.0' | '1.16.0' | '1.17.0' | '1.18.0' | '1.19.0' | '1.20.0' | '1.21.0' | '1.22.0' | '1.23.0' | '1.24.0' | '1.25.0' | '1.26.0' | '1.27.0' | '1.28.0';
+type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0' | '1.14.0' | '1.15.0' | '1.16.0' | '1.17.0' | '1.18.0' | '1.19.0' | '1.20.0' | '1.21.0' | '1.22.0' | '1.23.0' | '1.24.0' | '1.25.0' | '1.26.0' | '1.27.0' | '1.28.0' | '1.29.0';
 
 
 /** The minor of a behavior version. Every feature gate below is a `>=` test on
@@ -662,6 +667,9 @@ async function softwareDevImpl(
   // task-wide scalar owner cannot represent a native queue in one repository
   // and guarded fallback in another.
   const participantLanding = !repositoryless && minor >= 21;
+  // v1.28 proposes a reviewed fork branch to the repository it was forked from:
+  // a pull request there opens only after Review, and its maintainers land it.
+  const upstreamProposals = !repositoryless && minor >= 28;
   const restoresStagePrerequisites = minor >= 22;
   const preservesHumanHoldContext = minor >= 22;
   const interlocksLandingTransitions = minor >= 22;
@@ -737,9 +745,9 @@ async function softwareDevImpl(
   let keepOwnRequested = false;
   let manualEscalationRequested = carried?.manualEscalationRequested ?? false;
   let prRequested = carried?.prRequested ?? recoveryStage === 'pr';
-  // v1.28: Do runs the task's own command instead of the agent — once per run
+  // v1.29: Do runs the task's own command instead of the agent — once per run
   // of the task; a revise, or a failure handed to the agent, continues with it.
-  const taskCommand = minor >= 28 ? input.command?.trim() || undefined : undefined;
+  const taskCommand = minor >= 29 ? input.command?.trim() || undefined : undefined;
   let commandRan = carried?.commandRan ?? false;
   /** The command finished cleanly and changed no repository: nothing to review. */
   let commandUnchanged = carried?.commandUnchanged ?? false;
@@ -2638,7 +2646,7 @@ async function softwareDevImpl(
     }
   }
 
-  // ── The task's own command (v1.28) ──
+  // ── The task's own command (v1.29) ──
   /**
    * Do runs code instead of the agent (wiki features/events-and-automations):
    * the command runs as a durable job in the world with the
@@ -4574,6 +4582,51 @@ Inspect the complete current diff and specifically compare its delta from the re
     await condition(() => mergeGranted || cancelled || changed);
     if (!changed) scope.cancel();
   }
+  // ── Proposal to upstream ──
+  // The fork branch was pushed before Review; the pull request on someone
+  // else's repository opens now. Without a GitHub token of the person's own,
+  // only they can open it there: ask them, and check GitHub until it exists.
+  if (upstreamProposals && githubAuthoritativeMerge) {
+    for (let checks = 0; ; checks++) {
+      if (cancelled) return await abort();
+      const proposal = await withResolve('pr', () => core.proposeUpstream(world!, target, {
+        title: input.title,
+        summary: pullRequestSummary(reviewInfo?.summary, msgs, false),
+      }));
+      const known = new Set(prs.map(prKey));
+      const added = proposal.prs.filter((candidate) => !known.has(prKey(candidate)));
+      prs = [...mergePrSnapshots(prs, proposal.prs), ...added];
+      pr = prs[0];
+      if (intentAuthorizedLanding && added.length)
+        landing = { ...landing, authorizedHeads: { ...landing.authorizedHeads, ...prHeadMap(added) } };
+      if (!proposal.pending.length) break;
+      stage = 'merge';
+      status = 'waiting';
+      const waitSeen = msgs.length;
+      waitingFor = {
+        kind: 'human', audience: ['@creator'], reason: 'merge',
+        summary: 'Open the pull request on GitHub',
+        detail: `${proposal.pending.map((candidate) => `[Open the pull request on ${candidate.slug}](${candidate.url})`).join('\n')}`
+          + '\n\nTo skip this step next time, [save a GitHub token](/profile#github-token).',
+      };
+      // Cleared before the wait is shown, so a Confirm sent the moment it
+      // appears ("I opened it") wakes the check instead of being dropped.
+      confirmed = false;
+      await publish();
+      await condition(() => confirmed || cancelled || msgs.length > waitSeen, Math.min(60_000 * 2 ** checks, 600_000));
+      waitingFor = undefined;
+      confirmed = false;
+      if (cancelled) return await abort();
+      if (msgs.length > waitSeen) {
+        if (recoveryStage === 'pr' || recoveryStage === 'merge') recoveredLandingNeedsDo = true;
+        prRequested = false;
+        branchPreparedForPr = false;
+        stage = 'do';
+        status = 'active';
+        continue proposalCycle;
+      }
+    }
+  }
   for (;;) {
     stage = 'merge';
     status = 'active';
@@ -4665,9 +4718,12 @@ Inspect the complete current diff and specifically compare its delta from the re
               detail: 'Every multi-repository landing participant has merged.',
             };
           } else if (!fallbackPrs.length) {
+            const upstream = prs.filter((candidate) => !candidate.merged && candidate.headRepository);
             githubResult = {
               status: 'queued', prs, participants: plannedParticipants,
-              detail: 'Repository landing authorities own every outstanding pull request.',
+              detail: upstreamProposals && upstream.length === prs.filter((candidate) => !candidate.merged).length
+                ? `Proposed to ${[...new Set(upstream.map((candidate) => candidate.slug))].join(', ')}: waiting for its maintainers to review and merge it.`
+                : 'Repository landing authorities own every outstanding pull request.',
               providerQueue: { state: 'queued' },
             };
           }

@@ -160,8 +160,19 @@ export interface Repository {
   defaultBranch: string;
   private: boolean;
   gitConnectionId?: string;
+  /** The repository this one is a GitHub fork of. Work on a fork is proposed
+   * to its upstream: the task branch is pushed to the fork and the pull request
+   * opens on the upstream, which needs no tavya App installation. */
+  upstream?: RepositoryUpstream;
   createdAt: number;
   updatedAt: number;
+}
+
+export interface RepositoryUpstream {
+  owner: string;
+  name: string;
+  defaultBranch: string;
+  private: boolean;
 }
 
 export interface ProjectRepository {
@@ -884,6 +895,17 @@ export interface TaskPullRequest {
   headSha?: string;
   /** GraphQL node id, used only to enter a repository merge queue. */
   nodeId?: string;
+  /** `owner/name` of the fork holding the head branch, when it is not `slug`:
+   * a proposal to a repository someone else owns. Its maintainers land it. */
+  headRepository?: string;
+}
+
+/** What proposing reviewed fork branches to their upstreams produced: pull
+ * requests that exist, and those only a person can open (GitHub's prefilled
+ * page at `url`) because no credential of theirs may write upstream. */
+export interface UpstreamProposal {
+  prs: TaskPullRequest[];
+  pending: Array<{ repo: string; slug: string; url: string }>;
 }
 
 export type GithubLandingOwner = 'provider' | 'external' | 'karmax' | 'unowned' | 'merged';
@@ -1818,7 +1840,7 @@ export interface TaskInput {
   /** Existing branch to merge (merge-only workflow). */
   branch?: string;
   command?: string;
-  /** software-dev ≥1.28: when `command` (the task's own code) fails, `fail` ends the task;
+  /** software-dev ≥1.29: when `command` (the task's own code) fails, `fail` ends the task;
    *  `agent` hands it to the Do agent with the output. */
   onCommandFailure?: 'fail' | 'agent';
   parentTaskId?: string;
@@ -1941,9 +1963,9 @@ export interface TaskContinuation {
     confirmed: boolean;
     retryRequested: boolean;
     manualEscalationRequested: boolean;
-    /** v1.28: the task's command already ran in this run of the task. */
+    /** v1.29: the task's command already ran in this run of the task. */
     commandRan?: boolean;
-    /** v1.28: it finished cleanly with nothing to review. */
+    /** v1.29: it finished cleanly with nothing to review. */
     commandUnchanged?: boolean;
     resourcesApplied: boolean;
   };
