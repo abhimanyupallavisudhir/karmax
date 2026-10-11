@@ -16,13 +16,17 @@ export interface ComputerSpec {
   provider?: string;
   cpu?: number;
   memoryMb?: number;
-  /** Free space for the task's files, in GiB. Absent ⇒ the provider default. */
+  /** The machine's total disk, in GB. Absent ⇒ the provider default. */
   diskGb?: number;
   flavor?: 'headless' | 'desktop';
   /** How long a parked world keeps its sandbox before portable hibernation. */
   hibernateAfterDays?: number;
   network?: NonNullable<ProjectConfig['network']>;
 }
+
+/** Cloud providers an organization can connect for task worlds (BYOK). */
+export const CLOUD_WORLD_PROVIDERS = ['e2b', 'daytona', 'fly', 'hetzner'] as const;
+export type CloudWorldProvider = (typeof CLOUD_WORLD_PROVIDERS)[number];
 
 /** What a task may still change once its world exists: the machine's size and
  * how long it sleeps. A different provider, experience or network policy is a
@@ -33,14 +37,11 @@ export const IN_FLIGHT_COMPUTER_KEYS = ['cpu', 'memoryMb', 'diskGb', 'hibernateA
  * needs no sized template; anything else does (see `e2b-template.ts`). */
 export const DEFAULT_MACHINE = { cpu: 2, memoryMb: 2048 } as const;
 
-/** E2B grows a template's filesystem by at most this much free space. */
-export const E2B_MAX_DISK_GB = 50;
-
 const DAY_MS = 86_400_000;
 const LIMITS = {
   cpu: { min: 1, max: 64, integer: true, label: 'CPU' },
   memoryMb: { min: 512, max: 262_144, integer: true, label: 'Memory' },
-  diskGb: { min: 1, max: 2_048, integer: true, label: 'Disk' },
+  diskGb: { min: 1, max: 10_240, integer: true, label: 'Disk' },
   hibernateAfterDays: { min: 0, max: 365, integer: false, label: 'Hibernate after' },
 } as const;
 

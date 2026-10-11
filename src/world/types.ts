@@ -411,6 +411,13 @@ export interface ProviderUsageEvent {
   cpu: number;
   memoryMb: number;
   gpu?: number;
+  /** `disk`: storage held for `activeMs` (a VM world's volume), whatever the
+   * machine did. Absent: compute. */
+  kind?: 'compute' | 'disk';
+  diskGb?: number;
+  /** The provider's own price for this execution, when it publishes one
+   * (Fly's per-second formula, Hetzner's hourly price). Absent: karmax's rates. */
+  costMicros?: number;
 }
 
 /**
@@ -473,6 +480,15 @@ export interface WorldProvider {
    * provider cannot enumerate and nothing is reaped.
    */
   listSandboxes?(organizationId?: string): Promise<ProviderSandboxRef[]>;
+  /** Change the machine size in place, keeping everything on its disk: the
+   * disk grows now, CPU and memory at the next start. Providers without it
+   * move a resized world through hibernation and a checkpoint restore. */
+  resize?(handle: WorldHandle, to: import('../domain/computer.js').MachineShape): Promise<{ disk: 'grown' | 'unchanged'; restart: boolean;
+    /** The machine as it now is: record it as the handle's `meta.machine`. */
+    machine: { cpu: number; memoryMb: number; diskGb: number } }>;
+  /** Periodic provider upkeep (deferred deletes, stale image builders), once
+   * per lifecycle sweep for each organization connected to it. */
+  housekeep?(organizationId?: string): Promise<void>;
   /** Completed provider-authoritative billable executions. Lease wall time is
    * not usage: providers can auto-pause while a local capacity lease is stale. */
   listUsageEvents?(organizationId: string, since?: number, resumeAt?: number): Promise<ProviderUsagePage>;

@@ -11,6 +11,7 @@ import {
   type CompactTask,
 } from './platform-request.js';
 import { BRAND } from '../domain/brand.js';
+import { CLOUD_WORLD_PROVIDERS, type CloudWorldProvider } from '../domain/computer.js';
 
 // Re-exported so the platform MCP module stays the one place a reader looks for
 // the agent-facing contract; `src/agent/tools.ts` imports the same definitions
@@ -82,11 +83,11 @@ export interface PlatformOps {
     target: { kind: 'path'; path: string } | { kind: 'environment' | 'service'; name: string };
     access?: 'read' | 'write'; publish?: 'discard' | 'review' }): Promise<unknown>;
   listWorldProviders(organizationId: string): Promise<unknown>;
-  connectWorldProvider(a: { organizationId: string; provider: 'e2b' | 'daytona'; apiKey?: string;
+  connectWorldProvider(a: { organizationId: string; provider: CloudWorldProvider; apiKey?: string;
     name?: string; template?: string; snapshot?: string; image?: string; desktopTemplate?: string;
-    desktopSnapshot?: string; desktopImage?: string; apiUrl?: string; target?: string }): Promise<unknown>;
-  testWorldProvider(organizationId: string, provider: 'e2b' | 'daytona'): Promise<unknown>;
-  disconnectWorldProvider(organizationId: string, provider: 'e2b' | 'daytona'): Promise<unknown>;
+    desktopSnapshot?: string; desktopImage?: string; apiUrl?: string; target?: string; region?: string; organization?: string }): Promise<unknown>;
+  testWorldProvider(organizationId: string, provider: CloudWorldProvider): Promise<unknown>;
+  disconnectWorldProvider(organizationId: string, provider: CloudWorldProvider): Promise<unknown>;
   getExecutionPolicy(organizationId: string, projectId?: string): Promise<unknown>;
   setExecutionPolicy(a: { organizationId: string; projectId?: string; policy: Record<string, unknown> }): Promise<unknown>;
   /** Complete escape hatch for the documented gateway API; still authz checked. */
@@ -156,7 +157,7 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
       organizationId: a.organizationId, provider: a.provider, apiKey: a.apiKey, name: a.name,
       config: { template: a.template, snapshot: a.snapshot, image: a.image,
         desktopTemplate: a.desktopTemplate, desktopSnapshot: a.desktopSnapshot, desktopImage: a.desktopImage,
-        apiUrl: a.apiUrl, target: a.target },
+        apiUrl: a.apiUrl, target: a.target, region: a.region, organization: a.organization },
     }))),
     testWorldProvider: (organizationId, provider) => api.testWorldProviderConnection(getToken(), organizationId, provider),
     disconnectWorldProvider: async (organizationId, provider) => Promise.resolve((await api.deleteWorldProviderConnection(getToken(), organizationId, provider))),
@@ -355,22 +356,24 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
     {
       description: `Connect or rotate an organization cloud sandbox provider. Requires organization:edit. The API key is stored in the encrypted ${BRAND} vault and never returned.`,
       inputSchema: {
-        organizationId: z.string(), provider: z.enum(['e2b', 'daytona']), apiKey: z.string().optional(), name: z.string().optional(),
+        organizationId: z.string(), provider: z.enum(CLOUD_WORLD_PROVIDERS), apiKey: z.string().optional(), name: z.string().optional(),
         template: z.string().optional(), snapshot: z.string().optional(), image: z.string().optional(),
         desktopTemplate: z.string().optional(), desktopSnapshot: z.string().optional(), desktopImage: z.string().optional(),
         apiUrl: z.string().url().optional(), target: z.string().optional(),
+        region: z.string().optional().describe('Fly.io region (fra) or Hetzner location (fsn1).'),
+        organization: z.string().optional().describe('Fly.io organization slug (default personal).'),
       },
     },
     async (a) => wrap(async () => (await ops.connectWorldProvider(a))),
   );
   server.registerTool(
     'test_world_provider',
-    { description: 'Verify an organization cloud provider credential without creating a billable task world.', inputSchema: { organizationId: z.string(), provider: z.enum(['e2b', 'daytona']) } },
+    { description: 'Verify an organization cloud provider credential without creating a billable task world.', inputSchema: { organizationId: z.string(), provider: z.enum(CLOUD_WORLD_PROVIDERS) } },
     async (a) => wrap(async () => (await ops.testWorldProvider(a.organizationId, a.provider))),
   );
   server.registerTool(
     'disconnect_world_provider',
-    { description: 'Remove an organization cloud provider credential after all worlds using it are gone.', inputSchema: { organizationId: z.string(), provider: z.enum(['e2b', 'daytona']) } },
+    { description: 'Remove an organization cloud provider credential after all worlds using it are gone.', inputSchema: { organizationId: z.string(), provider: z.enum(CLOUD_WORLD_PROVIDERS) } },
     async (a) => wrap(async () => (await ops.disconnectWorldProvider(a.organizationId, a.provider))),
   );
   server.registerTool(

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { E2BWorldProvider, DEFAULT_E2B_TEMPLATE, type E2BFactory, type E2BSandboxLike } from '../src/world/e2b.js';
 import { serviceHomeLabel } from '../src/world/services.js';
-import { e2bDiskLimitGb, sizedBuildOptions, sizedTemplateName } from '../src/world/e2b-template.js';
+import { E2B_USED_DISK_MB, e2bDiskLimitGb, sizedBuildOptions, sizedTemplateName } from '../src/world/e2b-template.js';
 import { isMissingSandbox } from '../src/world/provider-errors.js';
 
 describe('E2B cloud world provider', () => {
@@ -38,20 +38,38 @@ describe('E2B cloud world provider', () => {
     // A project environment snapshot was built at its project's size already.
     await provider.create({ taskId: 'built', base: 'main', resources: shape, environment: { snapshot: 'env-snapshot' } });
     expect(created.at(-1)).toBe('env-snapshot');
-    expect(sizedBuildOptions(shape)).toEqual({ cpuCount: 4, memoryMB: 8192, minFreeDiskMb: 40 * 1024 });
-    expect(sizedBuildOptions({ diskGb: 200 }).minFreeDiskMb).toBe(50 * 1024);
+    // Disk is the machine's total: E2B is asked for that total less what the template uses.
+    expect(sizedBuildOptions(shape)).toEqual({ cpuCount: 4, memoryMB: 8192, minFreeDiskMb: 40 * 1024 - E2B_USED_DISK_MB });
+    // The default template already has 22 GB: asking for less grows nothing.
+    expect(sizedBuildOptions({ cpu: 4, diskGb: 20 })).toEqual({ cpuCount: 4, memoryMB: 2048 });
+    expect(sizedTemplateName(DEFAULT_E2B_TEMPLATE, { cpu: 4, diskGb: 20 })).toBe(sizedTemplateName(DEFAULT_E2B_TEMPLATE, { cpu: 4 }));
   });
 
-  it('builds a disk above the account\'s ceiling at the ceiling, and says so', async () => {
-    expect(e2bDiskLimitGb(new Error("400: Minimum free disk can't be higher than 25600 MiB (if you need to increase this limit, please contact support)"))).toBe(25);
+  it('builds a disk above the account\'s ceiling at the ceiling, says so, and remembers the ceiling', async () => {
+    // E2B counts free disk; people see the machine's total (29 GB at 25600 MiB free).
+    expect(e2bDiskLimitGb(new Error("400: Minimum free disk can't be higher than 25600 MiB (if you need to increase this limit, please contact support)"))).toBe(29);
     expect(e2bDiskLimitGb(new Error('quota exceeded'))).toBeUndefined();
     const created: Array<string | undefined> = [];
+    const learned: unknown[] = [];
     const provider = new E2BWorldProvider({ create: async (options: { template?: string }) => { created.push(options.template); return fakeSandbox(() => undefined); },
       connect: async () => fakeSandbox(() => undefined),
-      ensureTemplate: async () => ({ name: 'karmax-sized-capped', diskGb: 25 }) } as any);
-    const world = await provider.create({ taskId: 'capped', base: 'main', resources: { cpu: 4, memoryMb: 4096, diskGb: 30 } });
+      ensureTemplate: async () => ({ name: 'karmax-sized-capped', diskGb: 29 }) } as any, undefined, undefined,
+      () => ({ provider: 'e2b', apiKey: 'k', config: {}, recordLimits: async (limits: unknown) => { learned.push(limits); } }));
+    const world = await provider.create({ taskId: 'capped', base: 'main', organizationId: 'org_a', resources: { cpu: 4, memoryMb: 4096, diskGb: 50 } });
     expect(created).toEqual(['karmax-sized-capped']);
-    expect(world.handle.warnings).toEqual(['This E2B account gives a computer at most 25 GB of free disk, so this one has 25 GB, not 30 GB.']);
+    expect(world.handle.warnings).toEqual(['This E2B account allows at most 29 GB of disk, so this computer has 4 CPU · 4 GB · 29 GB disk, not 4 CPU · 4 GB · 50 GB disk.']);
+    expect(learned).toEqual([{ diskGb: 29 }]);
+  });
+
+  it('fits a stored size to the account\'s known limits before building anything', async () => {
+    const ensureTemplate = vi.fn(async (_base: string, name: string) => ({ name }));
+    const provider = new E2BWorldProvider({ create: async () => fakeSandbox(() => undefined), connect: async () => fakeSandbox(() => undefined),
+      ensureTemplate } as any, undefined, undefined,
+      () => ({ provider: 'e2b', apiKey: 'k', config: {}, limits: { cpu: 8, memoryMb: 8192, diskGb: 29, source: {} } }));
+    const world = await provider.create({ taskId: 'legacy', base: 'main', resources: { cpu: 16, memoryMb: 4096, diskGb: 50 } });
+    expect(ensureTemplate).toHaveBeenCalledWith(DEFAULT_E2B_TEMPLATE, sizedTemplateName(DEFAULT_E2B_TEMPLATE, { cpu: 8, memoryMb: 4096, diskGb: 29 }),
+      { cpu: 8, memoryMb: 4096, diskGb: 29 }, { apiKey: 'k' });
+    expect(world.handle.warnings).toEqual(['This E2B account allows at most 8 CPU and 29 GB of disk, so this computer has 8 CPU · 4 GB · 29 GB disk, not 16 CPU · 4 GB · 50 GB disk.']);
   });
 
   it('never fails a task over its size: it runs at the default size and says why', async () => {

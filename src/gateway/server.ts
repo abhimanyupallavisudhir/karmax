@@ -47,6 +47,7 @@ import { platformRequestPathError } from '../platform/platform-request.js';
 import { ContributionRegistry } from '../contrib/registry.js';
 import { Overlays } from '../store/overlays.js';
 import { activationTaskPrompt, manifest } from '../contrib/manifests.js';
+import { machineShape } from '../domain/computer.js';
 import { projectSettingsFor, globalSettingsFor, quickProjectSettingsFor, quickGlobalSettingsFor, quickScopeKey, settingsToProjectConfig, resolveParams, resolveParamsLayers, effectiveRepos } from '../platform/params.js';
 import { defaultProvider } from '../agent/adapters.js';
 import { findProviderSession } from '../agent/fork.js';
@@ -64,6 +65,7 @@ import { expandPath } from '../util/expand.js';
 import { withTimeout } from '../util/timeout.js';
 import { AgentAuthority, AgentSpec, AuthorizationSelection, Avatar, Provider, Project, ProjectConfig, PrincipalRef, ProjectPrincipalRef, ResourceAttachment, ResourceRevision, ResourceTarget, WorldLocation, normalizeUrgency } from '../domain/types.js';
 import { dotenvFile, dotenvSecretName, parseDotenv } from '../domain/dotenv.js';
+import { CLOUD_WORLD_PROVIDERS } from '../domain/computer.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
 import { MIN_CLI_VERSION, WorkspaceService } from '../world/workspace.js';
@@ -2551,14 +2553,13 @@ export class Gateway {
         const enabledCredentials = resolveCredentials(credentials, {
           global: parsePolicy((await store.kvGet(credPolicyKey.organization(organizationId)))),
         });
-        const e2b = (await store.getWorldProviderConnection(organizationId, 'e2b'));
-        const daytona = await store.getWorldProviderConnection(organizationId, 'daytona');
+        const clouds = await Promise.all(CLOUD_WORLD_PROVIDERS.map((provider) => store.getWorldProviderConnection(organizationId, provider)));
         const facts = {
           github: Boolean((await this.deps.identity?.providersForUser(subject.userId))?.includes('github')
             || (await this.deps.githubApp?.status(subject.userId))?.userAuthorized
             || (await store.listGitConnections(organizationId)).some((connection) => !connection.suspendedAt)),
           agentLogin: enabledCredentials.length > 0,
-          e2b: (await Promise.all([e2b, daytona].map(async (connection) => !!connection?.enabled
+          e2b: (await Promise.all(clouds.map(async (connection) => !!connection?.enabled
             && !!await this.deps.broker?.hasHandle(connection.credentialHandle)))).some(Boolean),
           paidPlan: await this.deps.subscriptions?.hasPaidSubscription(organizationId) ?? false,
           vault: (await new VaultItems(store, this.deps.broker, undefined, organizationId).list())
@@ -3013,6 +3014,9 @@ export class Gateway {
             if (policy.worldProvider && !['worktree', 'container', 'memory'].includes(String(policy.worldProvider))
               && !(await this.deps.providerConnections?.available(organizationId, String(policy.worldProvider))))
               throw new Error(`${policy.worldProvider} is not connected and verified`);
+            if (policy.resources && typeof policy.resources === 'object')
+              (await this.deps.providerConnections?.assertFits?.(organizationId,
+                String(policy.worldProvider ?? (await store.getOrganizationExecutionPolicy(organizationId)).worldProvider ?? ''), machineShape({ resources: policy.resources })));
             if (policy.runnerPoolId) {
               const pool = (await store.getRunnerPool(String(policy.runnerPoolId)));
               if (!pool || pool.organizationId !== organizationId) throw new Error('runner pool does not belong to this organization');
@@ -4251,6 +4255,8 @@ export class Gateway {
             if (effective.worldProvider && !['worktree', 'container', 'memory'].includes(effective.worldProvider)
               && !(await this.deps.providerConnections?.available(project.organizationId!, effective.worldProvider)))
               throw new Error(`${effective.worldProvider} is not connected and verified in Organization settings`);
+            if (override.resources && typeof override.resources === 'object')
+              (await this.deps.providerConnections?.assertFits?.(project.organizationId!, effective.worldProvider, machineShape({ resources: override.resources })));
             if (effective.runnerPoolId) {
               const pool = (await store.getRunnerPool(effective.runnerPoolId));
               if (!pool || pool.organizationId !== project.organizationId) throw new Error('runner pool does not belong to this organization');
@@ -4502,7 +4508,7 @@ export class Gateway {
               storageLocationId: isSnapshotResourceDriver(driver)
                 ? (await this.deps.resources.storageLocationFor(project.organizationId, b.storageLocationId == null ? undefined : String(b.storageLocationId)))
                 : undefined,
-              publish: b.publish === 'review' ? 'review' : 'discard' }));
+              publish: b.publish === 'review' ? 'review' : 'discard', ...(b.onDemand ? { onDemand: true } : {}) }));
             let revision;
             if (isSnapshotResourceDriver(driver)) {
               if (typeof b.sourcePath === 'string') {
@@ -4607,6 +4613,7 @@ export class Gateway {
               ...(b.target !== undefined ? { target: normalizeResourceTarget(b.target, resource.driver, resource.name) } : {}),
               ...(b.access !== undefined ? { access: b.access } : {}), ...(b.isolation !== undefined ? { isolation: b.isolation } : {}),
               ...(b.publish !== undefined ? { publish: b.publish } : {}), ...(b.enabled !== undefined ? { enabled: Boolean(b.enabled) } : {}),
+              ...(b.onDemand !== undefined ? { onDemand: Boolean(b.onDemand) } : {}),
               ...(source ? { source } : {}),
               ...(b.storageLocationId !== undefined && isSnapshotResourceDriver(resource.driver)
                 ? { storageLocationId: (await this.deps.resources?.storageLocationFor(resource.organizationId, String(b.storageLocationId))) }
@@ -5338,6 +5345,16 @@ export class Gateway {
           canEdit: !['done', 'cancelled', 'failed'].includes(task.lastView?.status ?? '')
             && (await this.deps.tokens.check(token, 'payment:write', { projectId: task.projectId })).ok,
           spent: (await store.paymentSpent(task.id, false, policy.currency)), released });
+      }
+      const biggerDisk = p.match(/^\/api\/tasks\/([^/]+)\/bigger-disk$/);
+      if (biggerDisk && method === 'POST') {
+        const b = await this.body(req);
+        try {
+          return this.json(res, 200, await api.biggerDisk(token, biggerDisk[1]!, b.diskGb == null ? undefined : Number(b.diskGb)));
+        } catch (e) {
+          const status = (e as { status?: number })?.status;
+          return this.json(res, status === 403 || status === 404 ? status : 400, { error: e instanceof Error ? e.message : String(e) });
+        }
       }
       const editMatch = p.match(/^\/api\/tasks\/([^/]+)\/params$/);
       if (editMatch && method === 'PATCH') {
