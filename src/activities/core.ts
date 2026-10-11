@@ -4444,6 +4444,39 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           detail: `GitHub could not be inspected or updated: ${detail}`,
         };
       };
+      // Brings the target into one PR branch with GitHub's expected-head
+      // guarded update. A conflict is the only outcome that returns to Do; the
+      // new head is accepted as this landing's own (fair landing, above).
+      const updateFromTarget = async (ref: TaskPullRequest, current: TaskPullRequest[],
+        conflictFingerprint: (message: string) => string | undefined): Promise<GitHubMergeAuthorization> => {
+        (await record(handle.id, 'github.pr.branch-update-requested', {
+          ...ref, actorUserId, expectedHeadSha: ref.headSha,
+        }));
+        let update;
+        try { update = await api.updateBranch(ref.slug, ref.number, ref.headSha!); }
+        catch (error) { return errorDecision(error, current); }
+        if (!update.requested) {
+          const fingerprint = conflictFingerprint(update.message);
+          return {
+            status: 'needs-revision', prs: current, actorUserId,
+            detail: `GitHub could not mechanically update ${ref.slug}#${ref.number} from its target: ${update.message}. Resolve the actual conflict in Do; this task has already released fallback admission.`,
+            repair: { kind: 'conflict', preserveAuthorization: true, ...(fingerprint ? { fingerprint } : {}) },
+          };
+        }
+        if (update.headSha) (await record(handle.id, 'github.pr.branch-updated', {
+          ...ref, actorUserId, previousHeadSha: ref.headSha, headSha: update.headSha,
+        }));
+        return {
+          status: 'waiting',
+          prs: current.map((pr) => update.headSha && pr.slug === ref.slug && pr.number === ref.number
+            ? { ...pr, headSha: update.headSha } : pr),
+          actorUserId,
+          detail: update.headSha
+            ? `GitHub mechanically updated ${ref.slug}#${ref.number} to ${update.headSha.slice(0, 8)}; fallback admission is waiting for repository checks.`
+            : `GitHub accepted the mechanical update for ${ref.slug}#${ref.number}; fallback admission is waiting for the new head and its checks.`,
+          landingOwner: 'karmax',
+        };
+      };
       // `brief` is for people: a line of each check's output, not its log.
       const ciFailureDetail = (ref: TaskPullRequest, readiness: GithubPullRequestReadiness, brief = false) => {
         const failures = (readiness.failedChecks ?? []).slice(0, 12).map((check) => {
@@ -4738,6 +4771,16 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             if (reruns.some((event) => Number(event.payload?.runId) === run.id
               && Number(event.payload?.observedAttempt) === run.attempt))
               return { status: 'waiting', prs: current, actorUserId, detail: 'Rerunning CI' };
+            // A target that moved on since this head may already carry the
+            // fix (task 597: a restore fix landed while a PR without it kept
+            // failing the rehearsal, and Confirm only re-read that failure).
+            // Test the proposal as it would land instead of rerunning it or
+            // asking a person.
+            if (fairLanding && ref.headSha && readiness.baseSha
+              && (await inspection.api.compare(ref.slug, readiness.baseSha, ref.headSha)
+                .then((comparison) => comparison.behindBy > 0, () => false)))
+              return updateFromTarget(ref, current, (message) =>
+                `${ref.slug.toLowerCase()}#${ref.number}:${ref.headSha}:${readiness.baseSha}:conflict:${message}`);
             if (reruns.length) return {
               status: 'needs-human', prs: current, actorUserId,
               waitReason: 'CI failed again after a rerun',
@@ -5335,35 +5378,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           // owns fallback admission is updated, using GitHub's expected-head
           // guarded mechanical operation. A conflict is the only branch-update
           // outcome that returns to Do.
-          if (readiness?.mergeStateStatus === 'BEHIND') {
-            (await record(handle.id, 'github.pr.branch-update-requested', {
-              ...ref, actorUserId, expectedHeadSha: ref.headSha,
-            }));
-            let update;
-            try { update = await api.updateBranch(ref.slug, ref.number, ref.headSha); }
-            catch (error) { return errorDecision(error, current); }
-            if (!update.requested) {
-              return {
-                status: 'needs-revision', prs: current, actorUserId,
-                detail: `GitHub could not mechanically update ${ref.slug}#${ref.number} from its target: ${update.message}. Resolve the actual conflict in Do; this task has already released fallback admission.`,
-                repair: { kind: 'conflict', preserveAuthorization: true,
-                  ...(repairFingerprint('conflict', update.message) ? { fingerprint: repairFingerprint('conflict', update.message) } : {}) },
-              };
-            }
-            const refreshed = update.headSha ? { ...next, headSha: update.headSha } : next;
-            if (update.headSha) (await record(handle.id, 'github.pr.branch-updated', {
-              ...ref, actorUserId, previousHeadSha: ref.headSha, headSha: update.headSha,
-            }));
-            return {
-              status: 'waiting',
-              prs: [...settled, refreshed, ...prs.slice(settled.length + 1)],
-              actorUserId,
-              detail: update.headSha
-                ? `GitHub mechanically updated ${ref.slug}#${ref.number} to ${update.headSha.slice(0, 8)}; fallback admission is waiting for repository checks.`
-                : `GitHub accepted the mechanical update for ${ref.slug}#${ref.number}; fallback admission is waiting for the new head and its checks.`,
-              landingOwner: 'karmax',
-            };
-          }
+          if (readiness?.mergeStateStatus === 'BEHIND')
+            return updateFromTarget(ref, current, (message) => repairFingerprint('conflict', message));
 
           // Auto-merge is provider-owned completion. It is safe to release
           // Karmax admission while current; if strict freshness later reports
