@@ -167,7 +167,8 @@ Object.defineProperty(chosen, 'innerHTML', {
   set: (html) => { chosenHtml = html; chosen.option.hidden = html.includes('class="af-resume-reauth" hidden'); chosen.checkbox.checked = false; },
 });
 chosen.querySelector = (sel) => !chosenHtml.includes(sel.slice(1)) ? null
-  : sel === '.af-resume-reauth' ? chosen.option : sel === '.af-resume-reauthorize' ? chosen.checkbox : null;
+  : sel === '.af-resume-reauth' ? chosen.option : sel === '.af-resume-reauthorize' ? chosen.checkbox
+    : sel === '.af-resume-add-dependency' ? chosen.dependency : null;
 const pick = element({ key: 'pick' });
 const sessionInput = element({ key: 'session', value: '' });
 const uploadInput = element({ key: 'upload-input', files: [] });
@@ -176,6 +177,10 @@ const classes = new Set();
 // The hosting form (task form / task page): claims the option and applies grants.
 const hostListeners = new Map();
 const hostRoot = { dataset: {}, querySelectorAll: () => [], addEventListener(type, fn) { hostListeners.set(type, fn); } };
+// The dependency checkbox the hosting form shows for an unfinished source.
+chosen.dependency = { checked: false, dataset: { taskId: 'task_source' }, closest: () => chosen.dependencyLabel,
+  dispatchEvent(event) { dispatched.push(`dependency:${event.type}`); } };
+chosen.dependencyLabel = { hidden: true };
 let hostAttached = false;
 const dispatched = [];
 const box = {
@@ -190,7 +195,12 @@ const box = {
   },
   closest: (sel) => sel === '[data-reauthorize-host]' && hostAttached ? hostRoot : null,
   classList: { toggle(name, on) { on ? classes.add(name) : classes.delete(name); } },
-  dispatchEvent(event) { dispatched.push(event.type); if (event.type === 'af-reauthorize') hostListeners.get('af-reauthorize')?.(event); },
+  dispatchEvent(event) {
+    dispatched.push(event.type);
+    if (!event.type.startsWith('af-')) return;
+    Object.defineProperty(event, 'target', { value: box });
+    hostListeners.get(event.type)?.(event);
+  },
 };
 global.wireModelField = () => {};
 global.setModelField = (_root, spec) => { ref.value = [spec.provider, spec.model, spec.effort].filter(Boolean).join(':'); };
@@ -241,6 +251,7 @@ const editor = { _authorizationValue: { level: 'developer', scope: 'projects', p
 let formGrants = { ids: [], policies: {} };
 let changed = 0;
 wireResumeReauthorization(hostRoot, {
+  projectId: 'p1',
   editor: () => editor,
   grants: () => ({ ids: [...formGrants.ids], policies: formGrants.policies }),
   setGrants: (ids, policies) => { formGrants = { ids, policies }; },
@@ -250,8 +261,7 @@ ok('reauthorizeHost' in hostRoot.dataset, 'a hosting form claims the option');
 hostAttached = true;
 picker.onPick({ task: source, role: 'do', session: { id: 'session-1', provider: 'codex' } });
 ok(!chosen.option.hidden, 'inside a hosting form the option is shown');
-chosen.checkbox.checked = true;
-listeners.get('chosen:change')({ target: chosen.checkbox });
+ok(chosen.checkbox.checked, 'a fresh pick re-authorizes the source grants by default');
 ok(editorCalls.length === 1 && editorCalls[0].level === 'maintainer' && editorCalls[0].projectIds.join() === 'p1,p2', 'checking applies the source level + scope to the Authorization editor');
 ok(formGrants.ids.join() === 'cred_a,cred_b' && formGrants.policies.cred_a.use === 'ask', 'checking applies the source vault grants + policies');
 ok(changed === 1, 'the host is told to persist the change');
@@ -272,6 +282,48 @@ listeners.get('chosen:change')({ target: chosen.checkbox });
 enabled.checked = false;
 listeners.get('enabled:change')();
 ok(formGrants.ids.length === 0 && editorCalls.at(-1).level === 'developer', 'turning the fork off withdraws re-authorized grants too');
+
+// ── a source in another project brings that project into the Authorization
+const otherProject = { id: 'task_other', num: 9, title: 'Billing work', projectId: 'p2', params: {} };
+enabled.checked = true;
+listeners.get('enabled:change')();
+const before = editorCalls.length;
+picker.onPick({ task: otherProject, role: 'do', session: { id: 'session-2', provider: 'codex' } });
+ok(editor._authorizationValue.projectIds.join() === 'p1,p2' && editorCalls.length === before + 1, 'forking another project’s task adds that project to the Authorization');
+listeners.get('chosen:click')({ target: { closest: (sel) => sel === '.af-resume-clear' ? {} : null } });
+ok(editor._authorizationValue.projectIds.join() === 'p1', 'clearing that source removes the project it added');
+editor._authorizationValue = { level: 'developer', scope: 'projects', projectIds: ['p1', 'p2'] };
+picker.onPick({ task: otherProject, role: 'do', session: { id: 'session-2', provider: 'codex' } });
+listeners.get('chosen:click')({ target: { closest: (sel) => sel === '.af-resume-clear' ? {} : null } });
+ok(editor._authorizationValue.projectIds.join() === 'p1,p2', 'a project the user had chosen stays when the source is cleared');
+editor._authorizationValue = { level: 'developer', scope: 'organization' };
+const orgCalls = editorCalls.length;
+picker.onPick({ task: otherProject, role: 'do', session: { id: 'session-2', provider: 'codex' } });
+ok(editorCalls.length === orgCalls, 'an organization-wide Authorization already reaches the source');
+listeners.get('chosen:click')({ target: { closest: (sel) => sel === '.af-resume-clear' ? {} : null } });
+editor._authorizationValue = { level: 'developer', scope: 'projects', projectIds: ['p1'] };
+picker.onPick({ task: { ...otherProject, params: { _authorization: { level: 'maintainer', scope: 'projects', projectIds: ['p2'], capabilities: [] } } },
+  role: 'do', session: { id: 'session-2', provider: 'codex' } });
+ok(chosen.checkbox.checked && editor._authorizationValue.level === 'maintainer' && editor._authorizationValue.projectIds.join() === 'p2,p1',
+  'the source’s grants keep this task’s project and the source’s');
+listeners.get('chosen:click')({ target: { closest: (sel) => sel === '.af-resume-clear' ? {} : null } });
+ok(editor._authorizationValue.level === 'developer' && editor._authorizationValue.projectIds.join() === 'p1', 'clearing it restores the Authorization exactly');
+
+// ── an unfinished source becomes a dependency by default, a dead one does not
+chosen.dependencyLabel.hidden = false;
+dispatched.length = 0;
+picker.onPick({ task: { ...source, lastView: { status: 'waiting' } }, role: 'do', session: { id: 'session-1', provider: 'codex' } });
+ok(chosen.dependency.checked && dispatched.includes('dependency:change'), 'a fresh pick of an unfinished source adds it as a dependency');
+for (const status of ['failed', 'cancelled']) {
+  chosen.dependency.checked = false;
+  dispatched.length = 0;
+  picker.onPick({ task: { ...source, lastView: { status } }, role: 'do', session: { id: 'session-1', provider: 'codex' } });
+  ok(!chosen.dependency.checked && !dispatched.includes('dependency:change'), `a ${status} source is not waited on by default`);
+}
+chosen.dependencyLabel.hidden = true;
+chosen.dependency.checked = false;
+picker.onPick({ task: { ...source, lastView: { status: 'waiting' } }, role: 'do', session: { id: 'session-1', provider: 'codex' } });
+ok(!chosen.dependency.checked, 'outside a dependency-hosting form nothing is added');
 
 // The fork checkbox shares the normal dependency state and serialized triggers.
 for (const status of ['running', 'waiting', 'failed', 'cancelled']) {
