@@ -152,7 +152,14 @@ export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec
     const remoteRefExists = refCheck.code === 0;
     if (repoSpec.branch && !remoteRefExists) throw new Error(`repository "${source}" has no remote branch "${repoSpec.branch}" to review`);
     let branchAdjustment;
-    if (!repoSpec.branch && !remoteRefExists) {
+    const empty = !repoSpec.branch && !remoteRefExists
+      && !(await runOrThrow(target, `git -C ${quote(repoRoot)} for-each-ref --count=1 refs/remotes/origin`)).stdout.trim();
+    if (empty) {
+      if (targetBranch && targetBranch !== base)
+        throw new Error(`repository "${source}": target branch "${targetBranch}" does not exist; choose an existing target before starting the task`);
+      await initializeEmptyRepository(target, repoRoot, base, auth, repoSpec);
+      warnings.push(`repo "${names[index]}": the repository was empty, so it was started with an empty first commit on "${base}"`);
+    } else if (!repoSpec.branch && !remoteRefExists) {
       const fallback = await runOrThrow(target, `git -C ${quote(repoRoot)} symbolic-ref refs/remotes/origin/HEAD`);
       const prefix = 'refs/remotes/origin/';
       const ref = fallback.stdout.trim();
@@ -275,6 +282,21 @@ async function cloneWithRetry(target: ProvisionTarget, command: string, repoRoot
       await new Promise((resolve) => setTimeout(resolve, envInt('KARMAX_WORLD_CLONE_RETRY_MS', 2_000, 0) * attempt));
     }
   }
+}
+
+/** Give an empty repository its base branch, as dynamic enrollment does
+ * (git-broker.ts): a task branch and its pull request need a base commit on
+ * the remote. A push refused because another world initialized the base after
+ * our clone is harmless; the fetch adopts that base instead. */
+async function initializeEmptyRepository(target: ProvisionTarget, repoRoot: string, base: string, auth: string,
+  spec: WorldSpec): Promise<void> {
+  const repo = `git -C ${quote(repoRoot)}`;
+  const identity = `-c user.name=${quote(spec.gitIdentity?.name ?? BRAND)} -c user.email=${quote(spec.gitIdentity?.email ?? `${BRAND}@localhost`)}`;
+  await runOrThrow(target, `${repo} checkout -q --orphan ${quote(base)} && ${repo} ${identity} commit -q --allow-empty -m ${quote(`${BRAND}: initialize repository`)}`);
+  const pushed = await target.run(`${auth}${repo} push -q origin ${quote(`refs/heads/${base}:refs/heads/${base}`)}`, provisionTimeoutMs());
+  const fetched = await target.run(`${auth}${repo} fetch -q origin ${quote(`+refs/heads/${base}:refs/remotes/origin/${base}`)}`, provisionTimeoutMs());
+  if (fetched.code !== 0)
+    throw new Error(`could not initialize empty repository base "${base}": ${pushed.stderr || pushed.stdout || fetched.stderr || fetched.stdout}`);
 }
 
 async function configureRepo(target: ProvisionTarget, root: string, spec: WorldSpec, branch: string,
