@@ -585,7 +585,7 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
     const remote = isRemoteWorldKind(world.handle.kind);
     const base = remote ? this.deps.endpoints.world(world.handle) : await this.deps.endpoints.host();
     if (!base) throw new Error('this world cannot reach the resource store (no public URL is configured)');
-    const binary = remote ? await this.worldBinary(world, base) : hostResticBinary();
+    const binary = remote ? await this.worldBinary(world, base, repository) : hostResticBinary();
     const expiresAt = Date.now() + TOKEN_HOURS * 3_600_000;
     return { binary, env: await this.env(repository, base, 'read', false), expiresAt };
   }
