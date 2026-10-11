@@ -2205,20 +2205,47 @@ function previousGrantsSummary(task) {
 // hidden: the grants land in the same controls the user would otherwise fill by
 // hand, so what will be granted stays visible and editable, and it is persisted
 // exactly like a manual selection.
+// A fork of another project's task also needs that project (`af-fork-source`):
+// its agent reads the source conversation with the task's own grants, and the
+// task is refused at Run without it. It is added while that source is chosen
+// (removed again with it, unless the user had it already), and kept, with the
+// task's own project, when the source's grants are applied.
 function wireResumeReauthorization(root, host) {
   if (!root) return;
   root.dataset.reauthorizeHost = '';
   root.querySelectorAll('.af-resume-reauth[hidden]').forEach((option) => { option.hidden = false; });
   let stash = null;
+  const sources = new Map(); // agent box → its fork source's project, when another
+  const added = new Map(); // agent box → the project added for it
+  const withProjects = (value, ids) => value.scope !== 'projects' ? value
+    : { ...value, projectIds: [...new Set([...(value.projectIds || []), ...ids])] };
   // A re-wired host (its controls were re-rendered) replaces the listener.
   root.reauthorizeWiring?.abort();
   const wiring = root.reauthorizeWiring = new AbortController();
+  root.addEventListener('af-fork-source', (event) => {
+    const editor = host.editor();
+    const value = readAuthorizationEditor(editor);
+    const { enabled, projectId } = event.detail;
+    const box = event.target;
+    if (enabled && projectId && projectId !== host.projectId) {
+      sources.set(box, projectId);
+      if (value.scope !== 'projects' || value.projectIds?.includes(projectId)) return;
+      added.set(box, projectId);
+      editor?._setAuthorization?.(withProjects(value, [projectId]));
+    } else if (!enabled && sources.delete(box) && added.has(box)) {
+      const projectId = added.get(box);
+      added.delete(box);
+      if (value.scope !== 'projects' || [...sources.values()].includes(projectId)) return;
+      editor?._setAuthorization?.({ ...value, projectIds: value.projectIds.filter((id) => id !== projectId) });
+    } else return;
+    host.changed?.();
+  }, { signal: wiring.signal });
   root.addEventListener('af-reauthorize', (event) => {
     const { enabled, authorization, credentialGrantIds, credentialPolicies } = event.detail;
     const editor = host.editor();
     if (enabled) {
       stash = stash || { authorization: readAuthorizationEditor(editor), ...host.grants() };
-      editor?._setAuthorization?.(authorization);
+      editor?._setAuthorization?.(withProjects(normalizedAuthorization(authorization), [host.projectId, ...sources.values()].filter(Boolean)));
       host.setGrants(credentialGrantIds, credentialPolicies);
     } else if (stash) {
       editor?._setAuthorization?.(stash.authorization);
@@ -3210,9 +3237,28 @@ function wireAgentBox(box) {
   const { signal } = box.agentWiring = new AbortController();
   box.addEventListener('input', releaseModel, { signal });
   box.addEventListener('change', releaseModel, { signal });
-  // Dropping the source also withdraws the grants and model it brought along.
+  // Dropping the source also withdraws the grants, project and model it brought along.
   const withdrawReauthorize = () => {
     if (chosen?.querySelector('.af-resume-reauthorize')?.checked) announceReauthorize(false);
+    box.dispatchEvent(new CustomEvent('af-fork-source', { bubbles: true, detail: { enabled: false } }));
+  };
+  // A freshly picked source brings its project into the Authorization (the
+  // agent reads the conversation it forks with its own grants), and starts with
+  // the source's grants and waiting for it — both still optional. A source that
+  // failed or was cancelled may never succeed, so the fork does not wait on it.
+  const applyForkDefaults = (task) => {
+    box.dispatchEvent(new CustomEvent('af-fork-source', { bubbles: true, detail: { enabled: true, projectId: task.projectId } }));
+    const reauthorize = chosen.querySelector('.af-resume-reauthorize');
+    if (reauthorize && !chosen.querySelector('.af-resume-reauth')?.hidden) {
+      reauthorize.checked = true;
+      announceReauthorize(true);
+    }
+    const dependency = chosen.querySelector('.af-resume-add-dependency');
+    if (dependency && !dependency.closest('.af-resume-dependency')?.hidden && !dependency.checked
+      && !['failed', 'cancelled'].includes(task.lastView?.status || task.status)) {
+      dependency.checked = true;
+      dependency.dispatchEvent(new Event('change', { bubbles: true }));
+    }
   };
   const clearTask = () => {
     if (!chosen) return;
@@ -3241,6 +3287,7 @@ function wireAgentBox(box) {
     chosen.innerHTML = rf ? resumeChosenInner(rf, task) : '';
     if (rf && task) prefillForkBranch(box, task);
     syncForkState();
+    if (rf && task) applyForkDefaults(task);
     box.dispatchEvent(new Event('change', { bubbles: true })); // the form's auto-save listens for change
   };
   chosen?.addEventListener('click', (e) => { if (e.target.closest('.af-resume-clear')) setResume(null); });
@@ -7919,6 +7966,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   let refreshVaultCount = () => {};
   // A fork's "Re-authorize previous grants?" writes into these same controls.
   wireResumeReauthorization($('#tf-body'), {
+    projectId,
     editor: () => $('#tf-authorization'),
     grants: () => ({ ids: [...vaultGrantIds], policies: vaultCredentialPolicies }),
     setGrants: (ids, policies) => {

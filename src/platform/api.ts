@@ -1189,6 +1189,38 @@ export class KarmaxApi {
     } else params.base = start.base;
   }
 
+  /**
+   * A task fork reads its source's conversation with the forking agent's own
+   * turn token (`src/activities/core.ts`), so an agent whose authorization does
+   * not reach the source's project fails on its first turn — after the task was
+   * queued. Refuse to start (or arm) such a task instead, naming the project to
+   * add. Mirrors the token's scope: the participant's stored authorization (an
+   * Avatar's own), whose project list must include the source's project.
+   */
+  private async assertForkSourcesReadable(task: TaskRecord, specs?: Map<string, Partial<AgentSpec>>): Promise<void> {
+    specs ??= (await this.taskAgentSpecs(task)).specs;
+    const main = (task.params['agent:do'] ?? task.params['agent:unified']) as Partial<AgentSpec> | undefined;
+    const organizationId = (await this.deps.store.projectOrganizationAsync(task.projectId)) ?? 'org_personal';
+    for (const [participant, spec] of [[MAIN_AGENT, main], ...specs] as [string, Partial<AgentSpec> | undefined][]) {
+      const sourceId = spec?.resumeFrom?.taskId;
+      const source = sourceId ? (await this.deps.store.getTask(sourceId)) : undefined;
+      if (!source) continue;
+      const sourceProject = (await this.deps.store.getProject(source.projectId));
+      const reference = source.num != null ? `#${source.num}` : JSON.stringify(source.title);
+      if ((sourceProject?.organizationId ?? 'org_personal') !== organizationId)
+        throw new ValidationError(`${reference} is in another organization; an agent can only fork from this organization`);
+      const avatar = spec?.avatarId ? (await this.deps.store.getAvatar(spec.avatarId)) : undefined;
+      const own = participant === MAIN_AGENT ? undefined : this.storedAgentAuthorizations(task)[participant];
+      const held: Partial<AuthorizationSelection> | undefined = avatar ? avatar.authorization
+        : own ?? task.params._authorization as Partial<AuthorizationSelection> | undefined;
+      const reaches = held?.scope === 'global' || held?.scope === 'organization'
+        || (held?.scope === 'projects' ? !!held.projectIds?.includes(source.projectId) : source.projectId === task.projectId);
+      if (reaches) continue;
+      const whose = avatar ? `${JSON.stringify(avatar.name)}’s` : own ? `the ${participantLabel(participant)}’s` : 'this task’s';
+      throw new ValidationError(`Add project ${JSON.stringify(sourceProject?.name ?? source.projectId)} to ${whose} Authorization to fork ${reference}`);
+    }
+  }
+
   async createTask(
     token: string,
     args: {
@@ -1430,6 +1462,7 @@ export class KarmaxApi {
         (await this.deps.store.patchTaskParams(task.id, { _agentAuthorization: agents }));
         task = (await this.deps.store.getTask(task.id))!;
       }
+      if (!args.draft) (await this.assertForkSourcesReadable(task, specs));
 
       return { task, delegation };
     });
@@ -2543,19 +2576,27 @@ export class KarmaxApi {
    * limited package nobody accepted refuses the start.
    */
   private async refreshAgentAuthorizationsForQueue(token: string, caller: ScopedToken, task: TaskRecord): Promise<void> {
+    const { specs, fromDefaults, resolvable } = (await this.taskAgentSpecs(task));
+    if (!resolvable) return;
+    const next = (await this.nextAgentAuthorizations(token, caller, task, specs, { mayAttenuate: false, fromDefaults }));
+    this.assertAgentAuthorizationsAccepted(next);
+    if (Object.keys(next).length || task.params?._agentAuthorization !== undefined)
+      (await this.deps.store.patchTaskParams(task.id, { _agentAuthorization: next }));
+    (await this.assertForkSourcesReadable((await this.deps.store.getTask(task.id))!, specs));
+  }
+
+  /** Every agent other than the main one a stored task configures, resolved
+   * against the live defaults as queueing it would. */
+  private async taskAgentSpecs(task: TaskRecord) {
     const project = (await this.deps.store.getProject(task.projectId));
     const start = project && this.resolveStart(task.workflow, task.workflowVersion, project.organizationId);
-    if (!project || !start) return;
+    if (!project || !start) return { specs: new Map<string, Partial<AgentSpec>>(), fromDefaults: new Set<string>(), resolvable: false };
     const overrides = stripPlatformMetadata({ ...task.params }) as ValueMap;
     const resolved = await this.resolveTaskParams(start.manifest, project, overrides);
     const confirmer = start.manifest.params.find((f) => f.type === 'confirmer');
     const group = (await this.deps.store.attemptGroup(task.id));
     if (confirmer && group?.confirmer !== undefined) resolved[confirmer.name] = group.confirmer;
-    const { specs, fromDefaults } = this.agentSpecsOf(start.manifest, { ...resolved, ...calledAgentFields(overrides) }, overrides);
-    const next = (await this.nextAgentAuthorizations(token, caller, task, specs, { mayAttenuate: false, fromDefaults }));
-    this.assertAgentAuthorizationsAccepted(next);
-    if (Object.keys(next).length || task.params?._agentAuthorization !== undefined)
-      (await this.deps.store.patchTaskParams(task.id, { _agentAuthorization: next }));
+    return { ...this.agentSpecsOf(start.manifest, { ...resolved, ...calledAgentFields(overrides) }, overrides), resolvable: true };
   }
 
   /** A copy of a task (an attempt, a series run) gets its own delegated

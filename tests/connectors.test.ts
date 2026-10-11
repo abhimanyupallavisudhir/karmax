@@ -654,7 +654,11 @@ describe('Connectors sync into the vault (§9)', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it('checks ciphertext across timestamp resets, restarts and a 500-entry re-import', async () => {
+  // Every vault write takes its file lock by spawning `flock` (src/util/file-lock.ts),
+  // and a spawn costs more the larger this process is: after a heavy file in the
+  // same Vitest process (github-pr-pipeline) these ~1000 writes take over 30 s on
+  // CI, against ~5 s alone. The budget covers that, not a hang.
+  it('checks ciphertext across timestamp resets, restarts and a 500-entry re-import', { timeout: 120_000 }, async () => {
     const { shown, write, connector, dir } = passStore();
     const ids = Array.from({ length: 500 }, (_, i) => `sites/${i}.com`);
     for (const id of ids) write(id, `password-${id}`);
