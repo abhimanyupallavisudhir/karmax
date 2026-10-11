@@ -43,6 +43,10 @@ const VIEW = {
       meter('cloudflare-r2.class-b', 'Reads this month', 'count', 241_000, 10_000_000),
       meter('cloudflare-r2.storage', 'Stored', 'bytes', 4.3 * GIB, 10 * GIB),
     ], { link: { url: 'https://dash.cloudflare.com/?to=/:account/r2/overview', label: 'Billing' } }),
+    service('managed-storage', 'Managed storage', undefined, [
+      meter('managed-storage.untracked', 'Untracked', 'bytes', 375e6, GIB, { usedSource: 'count', detail: 'nisada-personal 358 MB' }),
+      meter('managed-storage.pending-delete', 'Awaiting deletion', 'bytes', 29.3e9, undefined, { usedSource: 'count', detail: 'all purged by 2026-11-09' }),
+    ], { link: undefined }),
     service('composio', 'Composio', 'Pro', [
       meter('composio.tool-calls', 'Tool calls this month', 'count', 1_840, 400_000, { usedSource: 'count', limitSource: 'entered' }),
       meter('composio.accounts', 'Connected accounts', 'count', 8, undefined),
@@ -115,8 +119,8 @@ const PAGE = `<!doctype html><html data-theme="light"><body><main class="main"><
 
     // One row per measure; the service, plan and link only on its first row.
     const rows = page.locator('.limits-row');
-    assert.equal(await rows.count(), 19);
-    assert.equal(await page.locator('.limits-row:not(.cont) .limits-service .limits-name').count(), 10);
+    assert.equal(await rows.count(), 21);
+    assert.equal(await page.locator('.limits-row:not(.cont) .limits-service .limits-name').count(), 11);
     const r2 = page.locator('.limits-row[data-service="cloudflare-r2"]');
     assert.equal(await r2.count(), 3);
     assert.equal(await r2.nth(0).locator('.limits-plan').textContent(), 'Free allowance');
@@ -140,6 +144,11 @@ const PAGE = `<!doctype html><html data-theme="light"><body><main class="main"><
     assert.equal((await page.locator('.limits-row[data-meter="host.disk"] .limits-numbers').textContent()).trim(), '85 GB / 193 GB');
     assert.equal((await page.locator('.limits-row[data-meter="e2b.hours"] .limits-numbers').textContent()).trim(), '61.4 h');
     assert.equal(await page.locator('.limits-row[data-meter="e2b.hours"] .limits-bar').count(), 0, 'no limit, no bar');
+    // The bucket against tavya's records: untracked bytes as a meter, deleted bytes shown alongside.
+    const untracked = page.locator('.limits-row[data-meter="managed-storage.untracked"]');
+    assert.equal((await untracked.locator('.limits-numbers').textContent()).trim(), '358 MB / 1 GB');
+    assert.match(await untracked.locator('.limits-bar').getAttribute('title'), /nisada-personal 358 MB$/);
+    assert.equal((await page.locator('.limits-row[data-meter="managed-storage.pending-delete"] .limits-numbers').textContent()).trim(), '27.3 GB');
 
     // 80% and 95%: colour plus a marked percentage, never colour alone.
     const level = (id) => page.locator(`.limits-row[data-meter="${id}"] .limits-level`);
@@ -164,7 +173,7 @@ const PAGE = `<!doctype html><html data-theme="light"><body><main class="main"><
     assert.match(await daytona.textContent(), /Not connected/);
     assert.match(await daytona.locator('.limits-off .info-dot').getAttribute('title'), /Compute settings/);
     assert.equal(await page.locator('.limits-row[data-meter="e2b.hours"] .limits-label').getAttribute('title'), 'Hours this month: what it counts.');
-    assert.equal(await page.locator('.limits-row .limits-label.info-dot').count(), 18 + 10, 'every service and measure explains itself on hover or tap');
+    assert.equal(await page.locator('.limits-row .limits-label.info-dot').count(), 20 + 11, 'every service and measure explains itself on hover or tap');
     if (process.env.SERVICE_LIMITS_SCREENSHOT) await page.locator('.settings-content').screenshot({ path: process.env.SERVICE_LIMITS_SCREENSHOT });
     for (const text of await page.locator('.limits-row .limits-measure, .limits-row .limits-numbers').all()) {
       const box = await text.boundingBox();

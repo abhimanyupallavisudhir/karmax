@@ -1,8 +1,9 @@
 import { Worker, NativeConnection, Runtime, DefaultLogger, WorkflowBundle } from '@temporalio/worker';
+import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { TASK_QUEUE, TemporalConn } from './config.js';
 import { buildActivities, ActivityDeps } from '../activities/index.js';
-import type { HeapUsage } from '../runtime/memory-budget.js';
+import { memoryBudget, separateWorkerMode, type HeapUsage, type MemoryBudget } from '../runtime/memory-budget.js';
 
 export interface WorkerHandle {
   run(): Promise<void>;
@@ -75,15 +76,41 @@ export function activityTaskConcurrency(env: NodeJS.ProcessEnv = process.env): n
     : env.KARMAX_DEPLOYMENT === 'hosted' ? 1_000 : 8;
 }
 
+/** Workflow heap (MiB of the workflow thread's limit) set aside per cached
+ * workflow. A software-dev workflow holding a 1 MB conversation takes about
+ * 3.5 MB (0.43 MB plus 3.1 bytes per conversation byte, measured 2026-10-08);
+ * the heap governor shrinks the cache at 80% of the limit, so each needs about
+ * 4.4 MiB of limit, and 4.9 leaves room for longer conversations. It is also
+ * what keeps a 4 GiB container (1228 MiB workflow heap) at 250. */
+const WORKFLOW_HEAP_MB_PER_CACHED = 4.9;
+
 /** Sticky workflow cache. Every open task's workflow is queried by the console
  * and by its own running turn, and a query or task for an evicted workflow
  * replays its whole history. The private default suits one person's handful
- * of tasks; a hosted cell keeps hundreds open. karmax workflows hold their
- * conversation, so this stays well under the SDK's heap-derived default
- * (about 600 per GiB of heap), which assumes much smaller workflow state. */
-export function workflowCacheSize(env: NodeJS.ProcessEnv = process.env): number {
-  return env.KARMAX_MAX_CACHED_WORKFLOWS ? Number(env.KARMAX_MAX_CACHED_WORKFLOWS)
-    : env.KARMAX_DEPLOYMENT === 'hosted' ? 250 : 20;
+ * of tasks; a hosted cell keeps hundreds open, so its cache grows with the
+ * workflow thread's heap, which grows with the container (RT-35). karmax
+ * workflows hold their conversation, so this stays well under the SDK's
+ * heap-derived default (about 600 per GiB of heap), which assumes much smaller
+ * workflow state. */
+export function workflowCacheSize(env: NodeJS.ProcessEnv = process.env,
+  budget: () => MemoryBudget = () => memoryBudget({ separateWorker: separateWorkerMode(env), env })): number {
+  if (env.KARMAX_MAX_CACHED_WORKFLOWS) return Number(env.KARMAX_MAX_CACHED_WORKFLOWS);
+  if (env.KARMAX_DEPLOYMENT !== 'hosted') return 20;
+  return Math.max(10, Math.floor(budget().workerHeapMb / WORKFLOW_HEAP_MB_PER_CACHED));
+}
+
+/** Workflow tasks in flight at once. All of them run on the SDK's single
+ * workflow thread (`reuseV8Context`), so slots add no workflow CPU; what they
+ * overlap is the wait for Temporal: history pages for a replay, completions.
+ * The 2026-10 load test's wall was that: at 128 tenants workflow tasks waited
+ * 8 s for one of 8 slots while the worker process used 113 % CPU, 79 % of it
+ * its main thread, so at most a third of a core went to workflows. Hosted therefore takes two per core, which the host's Temporal and
+ * PostgreSQL can serve concurrently, from today's 8 (4 cores) up to 16: every
+ * accepted task must finish inside Temporal's 10 s workflow-task timeout while
+ * queued behind the others on that one thread. Private keeps 8. */
+export function workflowTaskConcurrency(env: NodeJS.ProcessEnv = process.env, cores = os.availableParallelism()): number {
+  if (env.KARMAX_MAX_WFT) return Number(env.KARMAX_MAX_WFT);
+  return env.KARMAX_DEPLOYMENT === 'hosted' ? Math.min(16, Math.max(8, 2 * cores)) : 8;
 }
 
 export async function makeWorker(conn: TemporalConn, deps: ActivityDeps = {}, opts: WorkerOpts = {}): Promise<WorkerHandle> {
@@ -94,7 +121,6 @@ export async function makeWorker(conn: TemporalConn, deps: ActivityDeps = {}, op
   // default to sizes that scale with CPU cores; on a multi-core box several of
   // these (one per test file, plus the dev server) can exhaust RAM. These caps
   // keep one worker small without affecting correctness. Tune via env for prod.
-  const num = (v: string | undefined, d: number) => (v ? Number(v) : d);
   // Run a prebuilt bundle (built-ins + external packages) when provided, else
   // bundle the built-in workflows from their source path.
   const source = opts.workflowBundle
@@ -107,7 +133,7 @@ export async function makeWorker(conn: TemporalConn, deps: ActivityDeps = {}, op
     ...source,
     activities: buildActivities(deps),
     maxCachedWorkflows: cacheLimit,
-    maxConcurrentWorkflowTaskExecutions: num(process.env.KARMAX_MAX_WFT, 8),
+    maxConcurrentWorkflowTaskExecutions: workflowTaskConcurrency(),
     maxConcurrentActivityTaskExecutions: activityTaskConcurrency(),
     // Agent activities heartbeat once a second so Temporal can deliver a pending
     // cancellation to their AbortSignal promptly. The SDK otherwise throttles

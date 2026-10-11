@@ -3,6 +3,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { isPostgresTarget, openSqlDatabase, type SqlDatabase } from '../store/sql.js';
 import { LocalObjectStore, type ObjectInfo } from '../store/objects.js';
+import { formatBytes } from '../store/object-reconciliation.js';
+
+// The inventory (which objects the database references) is shared with the
+// in-app reconciliation.
+export {
+  formatBytes, formatInventory, inventoryObjects, loadObjectReferences, type FamilyReport, type InventoryReport, type ObjectReferences,
+} from '../store/object-reconciliation.js';
 
 /** What the migration needs from the bucket: an `S3ObjectStore`. */
 export interface MigrationTarget {
@@ -202,22 +209,7 @@ export function formatMigration(report: MigrationReport): string[] {
 }
 
 // ---------------------------------------------------------------------------
-// Inventory: which local objects does the database still reference?
-
-export interface ObjectReferences {
-  /** `<organization>/<chunk id>` of managed chunks with references. */
-  chunks: Set<string>;
-  manifests: Set<string>;
-  attachments: Set<string>;
-  checkpoints: Set<string>;
-  /** Checkpoint objects queued for deletion (`checkpoint-gc:` entries). */
-  pendingCheckpointGc: Set<string>;
-  artifacts: Set<string>;
-  uploadParts: Set<string>;
-  conversationExports: Set<string>;
-  /** Object keys of resource repository files (restic) in the managed store. */
-  repositoryFiles: Set<string>;
-}
+// Inventory: which objects does the database still reference?
 
 export interface ReferenceDatabase { query(sql: string): Promise<Array<Record<string, unknown>>>; close(): Promise<void> }
 
@@ -238,137 +230,6 @@ export function openReferenceDatabase(target: string): ReferenceDatabase {
   return { query: async (sql) => (await db.prepare(sql).all()) as Array<Record<string, unknown>>, close: () => db.close() };
 }
 
-export async function loadObjectReferences(db: Pick<ReferenceDatabase, 'query'>): Promise<ObjectReferences> {
-  const json = (value: unknown): any => { try { return JSON.parse(String(value)); } catch { return undefined; } };
-  const references: ObjectReferences = { chunks: new Set(), manifests: new Set(), attachments: new Set(), checkpoints: new Set(),
-    pendingCheckpointGc: new Set(), artifacts: new Set(), uploadParts: new Set(), conversationExports: new Set(), repositoryFiles: new Set() };
-  for (const row of await db.query('SELECT organizationId, chunkId, storageLocationId FROM resource_snapshot_chunks WHERE refs > 0')) {
-    const location = row.storageLocationId == null ? '' : String(row.storageLocationId);
-    if (!location || location.startsWith('storage-managed-')) references.chunks.add(`${row.organizationId}/${row.chunkId}`);
-  }
-  for (const row of await db.query('SELECT sealedRef FROM resource_revisions')) {
-    const key = json(row.sealedRef)?.objectKey;
-    if (typeof key === 'string') references.manifests.add(key);
-  }
-  for (const row of await db.query('SELECT id FROM resource_attachments')) references.attachments.add(String(row.id));
-  for (const row of await db.query("SELECT repository, kind, name, storageLocationId FROM resource_repository_files WHERE kind<>'locks'")) {
-    const location = row.storageLocationId == null ? '' : String(row.storageLocationId);
-    if (location && !location.startsWith('storage-managed-')) continue;
-    const [attachment, place] = String(row.repository).split('@');
-    references.repositoryFiles.add(`resource-repositories/${attachment}/${place}/${row.kind === 'config' ? 'config' : `${row.kind}/${row.name}`}`);
-  }
-  for (const row of await db.query('SELECT manifest FROM world_checkpoints')) {
-    const key = json(row.manifest)?.filesystemDelta?.objectKey;
-    if (typeof key === 'string') references.checkpoints.add(key);
-  }
-  for (const row of await db.query("SELECT v FROM kv WHERE k LIKE 'checkpoint-gc:%'")) {
-    const key = json(row.v)?.objectKey;
-    if (typeof key === 'string') references.pendingCheckpointGc.add(key);
-  }
-  for (const row of await db.query('SELECT objectKey FROM promoted_artifacts')) references.artifacts.add(String(row.objectKey));
-  for (const row of await db.query('SELECT objectKey FROM conversation_exports')) references.conversationExports.add(String(row.objectKey));
-  for (const row of await db.query("SELECT v FROM kv WHERE k LIKE 'resource-upload:%'")) {
-    for (const file of Object.values(json(row.v)?.files ?? {}) as Array<{ parts?: Array<{ objectKey?: unknown }> } | undefined>)
-      for (const part of file?.parts ?? []) if (typeof part?.objectKey === 'string') references.uploadParts.add(part.objectKey);
-  }
-  return references;
-}
-
-export interface FamilyReport {
-  family: string;
-  referenced: Tally;
-  unreferenced: Tally;
-  /** Families no table indexes (conversation imports, unknown keys). */
-  untracked: Tally;
-  reasons: Record<string, Tally>;
-  /** Unreferenced bytes per organization, for the families keyed by one. */
-  organizations: Record<string, Tally>;
-  /** Modification times of the oldest and newest unreferenced object. */
-  unreferencedSpan?: { oldest: number; newest: number };
-}
-
-export interface InventoryReport { families: FamilyReport[]; total: Tally; unreferenced: Tally; untracked: Tally }
-
-/** Classify objects by key family and whether the database references them. */
-export function inventoryObjects(objects: Iterable<{ key: string; bytes: number; modifiedAt?: number }>,
-  references: ObjectReferences): InventoryReport {
-  const families = new Map<string, FamilyReport>();
-  const report: InventoryReport = { families: [], total: { count: 0, bytes: 0 }, unreferenced: { count: 0, bytes: 0 },
-    untracked: { count: 0, bytes: 0 } };
-  const add = (into: Tally, bytes: number) => { into.count++; into.bytes += bytes; };
-  for (const object of objects) {
-    if (TEMPORARY.test(object.key)) continue;
-    const { family, organization, state } = classify(object.key, references);
-    let entry = families.get(family);
-    if (!entry) families.set(family, entry = { family, referenced: { count: 0, bytes: 0 }, unreferenced: { count: 0, bytes: 0 },
-      untracked: { count: 0, bytes: 0 }, reasons: {}, organizations: {} });
-    add(report.total, object.bytes);
-    if (state === 'referenced') add(entry.referenced, object.bytes);
-    else if (state === 'untracked') { add(entry.untracked, object.bytes); add(report.untracked, object.bytes); }
-    else {
-      add(entry.unreferenced, object.bytes);
-      add(report.unreferenced, object.bytes);
-      add(entry.reasons[state] ??= { count: 0, bytes: 0 }, object.bytes);
-      if (organization) add(entry.organizations[organization] ??= { count: 0, bytes: 0 }, object.bytes);
-      if (object.modifiedAt !== undefined) {
-        const span = entry.unreferencedSpan ??= { oldest: object.modifiedAt, newest: object.modifiedAt };
-        span.oldest = Math.min(span.oldest, object.modifiedAt);
-        span.newest = Math.max(span.newest, object.modifiedAt);
-      }
-    }
-  }
-  report.families = [...families.values()].sort((a, b) => b.unreferenced.bytes - a.unreferenced.bytes || a.family.localeCompare(b.family));
-  return report;
-}
-
-function classify(key: string, references: ObjectReferences): { family: string; organization?: string; state: string } {
-  const parts = key.split('/');
-  const organization = parts[1];
-  if (parts[0] === 'resources' && parts[2] === 'chunks') {
-    const chunk = parts[3]?.replace(/\.bin$/, '');
-    return { family: 'resource chunk', organization,
-      state: references.chunks.has(`${organization}/${chunk}`) ? 'referenced' : 'no live chunk row' };
-  }
-  if (parts[0] === 'resources' && parts[2] === 'manifests') {
-    return { family: 'resource manifest', organization, state: references.manifests.has(key) ? 'referenced'
-      : references.attachments.has(parts[3] ?? '') ? 'attachment exists, no revision' : 'attachment deleted' };
-  }
-  if (parts[0] === 'resource-repositories') {
-    return { family: 'resource repository', state: references.repositoryFiles.has(key) ? 'referenced'
-      : references.attachments.has(parts[1] ?? '') ? 'no repository file row' : 'attachment deleted' };
-  }
-  if (parts[0] === 'checkpoints') {
-    return { family: 'checkpoint', organization, state: references.checkpoints.has(key) ? 'referenced'
-      : references.pendingCheckpointGc.has(key) ? 'pending checkpoint GC' : 'no checkpoint row' };
-  }
-  if (parts[0] === 'artifacts')
-    return { family: 'artifact', organization, state: references.artifacts.has(key) ? 'referenced' : 'no artifact row' };
-  if (parts[0] === 'resource-uploads')
-    return { family: 'resource upload part', organization, state: references.uploadParts.has(key) ? 'referenced' : 'no upload session' };
-  if (parts[0] === 'conversation-exports')
-    return { family: 'conversation export', state: references.conversationExports.has(key) ? 'referenced' : 'no export row' };
-  if (parts[0] === 'conversation-imports') return { family: 'conversation import', state: 'untracked' };
-  return { family: 'unknown', state: 'untracked' };
-}
-
-export function formatInventory(report: InventoryReport): string {
-  const day = (ms: number) => new Date(ms).toISOString().slice(0, 10);
-  const lines = [`Unreferenced local objects: ${count(report.unreferenced)} of ${count(report.total)} are not referenced by the database`];
-  for (const family of report.families) {
-    const parts = [`referenced ${count(family.referenced)}`, `unreferenced ${count(family.unreferenced)}`];
-    if (family.untracked.count) parts.push(`not indexed by any table ${count(family.untracked)}`);
-    lines.push(`  ${family.family}: ${parts.join(', ')}`);
-    for (const [reason, tally] of Object.entries(family.reasons).sort(([, a], [, b]) => b.bytes - a.bytes))
-      lines.push(`    ${reason}: ${count(tally)}`);
-    const organizations = Object.entries(family.organizations).sort(([, a], [, b]) => b.bytes - a.bytes);
-    if (organizations.length)
-      lines.push(`    by organization: ${organizations.slice(0, 5).map(([id, tally]) => `${id} ${formatBytes(tally.bytes)}`).join(', ')}`
-        + (organizations.length > 5 ? `, … ${organizations.length - 5} more` : ''));
-    if (family.unreferencedSpan) lines.push(`    written ${day(family.unreferencedSpan.oldest)} … ${day(family.unreferencedSpan.newest)}`);
-  }
-  return lines.join('\n');
-}
-
 // ---------------------------------------------------------------------------
 
 function count(tally: Tally): string {
@@ -378,13 +239,6 @@ function count(tally: Tally): string {
 function keyList(tally: KeyedTally): string {
   if (!tally.count) return '';
   return `:\n${tally.keys.map((key) => `  ${key}`).join('\n')}${tally.count > tally.keys.length ? `\n  … ${tally.count - tally.keys.length} more` : ''}`;
-}
-
-export function formatBytes(bytes: number): string {
-  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
-  let value = bytes, unit = 0;
-  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++; }
-  return `${unit ? value.toFixed(1) : value} ${units[unit]}`;
 }
 
 function md5(data: Buffer): string { return crypto.createHash('md5').update(data).digest('hex'); }

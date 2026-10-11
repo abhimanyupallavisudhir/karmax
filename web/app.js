@@ -16,6 +16,14 @@ function storageOverQuotaMarkup(contents) {
   const date = new Date(contents.overQuota.deleteAt).toLocaleDateString();
   return `<p class="task-sub storage-over">Over the limit: adding data is paused. ${policyTip(`Free space or upgrade by ${date}. After that, stored data is deleted, older versions first, until it fits.`)}</p>`;
 }
+// Deleted data the bucket keeps for its 30-day recovery window: real bytes,
+// but not the organization's to count against its limit.
+function storagePendingDeletionMarkup(contents) {
+  const pending = contents?.pendingDeletion;
+  if (!pending?.bytes) return '';
+  const until = pending.until ? ` until ${new Date(pending.until).toLocaleDateString()}` : '';
+  return `<p class="task-sub storage-pending">+ ${formatBytes(pending.bytes)} being deleted ${policyTip(`Deleted data is kept${until} so it can be recovered, then removed. It doesn’t count toward your limit.`)}</p>`;
+}
 function storageContentsMarkup(contents) {
   const projects = (contents?.projects || []).filter((project) => project.bytes > 0);
   if (!projects.length) return '';
@@ -18878,13 +18886,17 @@ let refreshVaultRequests = null;
 function agentMailCard() {
   return `<div class="card" id="agent-mail-card">
     <div class="section-h">Agent email</div>
-    <p class="task-sub">An inbox where agents receive confirmation codes. <a href="https://www.agentmail.to/" target="_blank" rel="noopener">Get an AgentMail account ↗</a></p>
+    <p class="task-sub" id="agentmail-hosted" hidden>Agents receive confirmation codes at <code id="agentmail-hosted-address"></code></p>
+    <details class="settings-disclosure compact" id="agentmail-own" open><summary class="task-sub">Use your own AgentMail inbox
+      ${policyTip('Optional: agents then read mail from an AgentMail inbox you own instead.')}</summary>
+    <p class="task-sub"><a href="https://www.agentmail.to/" target="_blank" rel="noopener">Get an AgentMail account ↗</a></p>
     <div class="inline-form">
       <input id="agentmail-address" type="email" placeholder="AgentMail address" />
       <input id="agentmail-key" type="password" placeholder="AgentMail API key" />
       <button class="btn sm" id="agentmail-connect">Set up</button>
     </div>
     <div id="agentmail-result" class="task-sub"></div>
+    </details>
   </div>`;
 }
 async function wireAgentMailCard(organizationId) {
@@ -18895,9 +18907,14 @@ async function wireAgentMailCard(organizationId) {
   const result = $('#agentmail-result');
   try {
     const data = await api(`/api/organizations/${org}/agent-mail`);
-    if (data.configured) {
+    if (data.configured && data.provider === 'agentmail') {
       address.value = data.address;
       result.textContent = 'Connected';
+    } else if (data.configured) {
+      // The installation's own mail domain: every organization has an address.
+      $('#agentmail-hosted-address').textContent = data.address;
+      $('#agentmail-hosted').hidden = false;
+      $('#agentmail-own').open = false;
     }
   } catch {}
   $('#agentmail-connect')?.addEventListener('click', async () => {
@@ -20304,11 +20321,12 @@ function serviceLimitActionsMarkup(service) {
 function serviceLimitsMarkup(view) {
   if (!view) return '';
   const rows = view.services.map((service) => {
-    if (service.status === 'not-connected' || service.status === 'unchecked' || !service.meters.length) {
-      const note = service.status === 'unchecked' ? 'Not checked yet' : 'Not connected';
+    if (['not-connected', 'not-needed', 'unchecked'].includes(service.status) || !service.meters.length) {
+      const note = service.status === 'unchecked' ? 'Not checked yet' : service.status === 'not-needed' ? 'Not needed' : 'Not connected';
+      const why = service.status === 'not-needed' ? service.note : service.connect;
       return `<div class="limits-row off" role="row" data-service="${esc(service.id)}">
         <span class="limits-service" role="rowheader">${serviceLimitNameMarkup(service)}</span>
-        <span class="limits-off" role="cell">${note}${service.connect ? ` ${policyTip(service.connect)}` : ''}</span>
+        <span class="limits-off" role="cell">${note}${why ? ` ${policyTip(why)}` : ''}</span>
         <span class="limits-actions" role="cell">${serviceLimitActionsMarkup(service)}</span>
       </div>`;
     }
@@ -21119,7 +21137,7 @@ async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
       const [storageLocations, contents] = await Promise.all([read('storage').catch(() => []), read('storage-contents').catch(() => null)]);
       if (!live('storage')) return;
       $('#org-storage').innerHTML = `
-        ${storageLocations.map((location) => { const usage = location.usage || {}; const pct = usage.quotaBytes ? Math.min(100, usage.retainedBytes / usage.quotaBytes * 100) : 0; return `<div class="team-block storage-location" data-storage="${esc(location.id)}"><div class="member-row"><span><b>${esc(location.name)}</b> <span class="chip">${location.kind === 'managed' ? 'managed' : 'customer S3'}</span> ${location.isDefault ? '<span class="chip">default</span>' : ''}</span><span>${formatBytes(usage.retainedBytes || 0)}${usage.quotaBytes ? ` / ${formatBytes(usage.quotaBytes)}` : ''}</span>${!location.isDefault && location.status === 'ready' ? '<button class="btn sm storage-default">Make default</button>' : ''}${location.kind === 's3' ? '<button class="btn sm storage-test">Test</button><button class="btn sm danger storage-delete">Remove</button>' : ''}</div>${usage.quotaBytes ? `<div class="progress${pct >= 100 ? ' over' : ''}"><i style="width:${pct}%"></i></div>` : ''}${location.kind === 'managed' ? storageOverQuotaMarkup(contents) : ''}${location.config?.bucket ? `<p class="task-sub mono">${esc(location.config.endpoint)}/${esc(location.config.bucket)}/${esc(location.config.prefix || '')}</p>` : ''}${location.lastError ? `<p class="task-sub" style="color:var(--danger)">${esc(location.lastError)}</p>` : ''}</div>`; }).join('')}
+        ${storageLocations.map((location) => { const usage = location.usage || {}; const pct = usage.quotaBytes ? Math.min(100, usage.retainedBytes / usage.quotaBytes * 100) : 0; return `<div class="team-block storage-location" data-storage="${esc(location.id)}"><div class="member-row"><span><b>${esc(location.name)}</b> <span class="chip">${location.kind === 'managed' ? 'managed' : 'customer S3'}</span> ${location.isDefault ? '<span class="chip">default</span>' : ''}</span><span>${formatBytes(usage.retainedBytes || 0)}${usage.quotaBytes ? ` / ${formatBytes(usage.quotaBytes)}` : ''}</span>${!location.isDefault && location.status === 'ready' ? '<button class="btn sm storage-default">Make default</button>' : ''}${location.kind === 's3' ? '<button class="btn sm storage-test">Test</button><button class="btn sm danger storage-delete">Remove</button>' : ''}</div>${usage.quotaBytes ? `<div class="progress${pct >= 100 ? ' over' : ''}"><i style="width:${pct}%"></i></div>` : ''}${location.kind === 'managed' ? storageOverQuotaMarkup(contents) + storagePendingDeletionMarkup(contents) : ''}${location.config?.bucket ? `<p class="task-sub mono">${esc(location.config.endpoint)}/${esc(location.config.bucket)}/${esc(location.config.prefix || '')}</p>` : ''}${location.lastError ? `<p class="task-sub" style="color:var(--danger)">${esc(location.lastError)}</p>` : ''}</div>`; }).join('')}
         ${storageContentsMarkup(contents)}
         <details class="settings-disclosure compact"><summary><b>Connect customer-owned S3 storage</b></summary><div class="settings-grid">
           <label class="form-row">Name<input id="storage-name" placeholder="Production data"></label><label class="form-row">Endpoint<input id="storage-endpoint" placeholder="https://s3.amazonaws.com"></label>
