@@ -44,7 +44,7 @@ global.ICON = { stop: '<svg></svg>' };
 global.waitingText = (w) => ({ account: 'Waiting for credential' }[w.kind] || w.kind);
 for (const fn of ['defaultRecipientFor', 'sharedConversation', 'participantLabelOf', 'messageSpeaker', 'recipientLabel', 'recipientsHtml', 'composeRecipients',
   'nextAgentKeyFor', 'locateMentions', 'taskTranscripts', 'conversationTextKey', 'conversationEntries', 'renderConversationEntry',
-  'participantListHtml', 'stoppableAgent', 'stopAgentButton', 'conversationPresence']) eval(extractFn(fn));
+  'activeAgentsHtml', 'waitingText', 'waitingLabel', 'stoppableAgent', 'stopAgentButton', 'conversationPresence']) eval(extractFn(fn));
 
 const view = {
   taskId: 'task-1',
@@ -122,14 +122,14 @@ assert.strictEqual(defaultRecipientFor(asked), 'agent:do');
 asked.messages.push({ id: 'b', role: 'agent', author: 'agent-3', to: ['user:user-2'], text: 'Bea, which zone?', ts: 6 });
 assert.strictEqual(defaultRecipientFor(asked), 'agent:do');
 
-// Stop (like Ctrl+C): every agent that is not idle can be stopped from the list;
-// the composer's Stop stops the one working now, else the one stuck waiting.
+// Stop (like Ctrl+C): every agent that is not idle shows, with its Stop, over the
+// conversation; the composer's Stop stops the one working now, else the one stuck waiting.
 const busy = { taskId: 't', participants: [
   { key: 'do', label: 'Agent', state: 'waiting' },
   { key: 'agent-1', label: 'Agent 1', state: 'waiting' },
   { key: 'agent-2', label: 'Agent 2', state: 'queued' },
   { key: 'confirm', label: 'Reviewer', state: 'idle' }], waitingFor: { kind: 'account' }, messages: [] };
-const list = participantListHtml(busy);
+const list = activeAgentsHtml(busy);
 assert.deepStrictEqual([...list.matchAll(/data-stop-agent="([^"]+)" title="([^"]+)"/g)].map((m) => [m[1], m[2]]),
   [['do', 'Stop Agent'], ['agent-1', 'Stop Agent 1'], ['agent-2', 'Stop Agent 2']]);
 assert.strictEqual(stoppableAgent(busy).key, 'agent-1', 'the innermost waiting agent');
@@ -137,5 +137,7 @@ assert.deepStrictEqual(conversationPresence(busy, { shared: true, role: 'do' }),
 busy.participants[2].state = 'running';
 assert.strictEqual(stoppableAgent(busy).key, 'agent-2');
 assert.strictEqual(stoppableAgent({ participants: [{ key: 'do', state: 'idle' }, { key: 'agent-1', state: 'queued' }] }), undefined);
+assert.ok(!list.includes('Reviewer'), 'an idle agent is not listed');
+assert.strictEqual(activeAgentsHtml({ participants: [{ key: 'do', label: 'Agent', state: 'running' }] }), '', 'a lone agent’s state is the header’s');
 
 console.log('shared-conversation: ok');

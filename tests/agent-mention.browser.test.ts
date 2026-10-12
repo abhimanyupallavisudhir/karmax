@@ -55,7 +55,6 @@ it('calls a new agent into a task from the follow-up box with @+', async () => {
   await step('open the conversation', () => page.goto(`${app!.url}/personal/mentions/tasks/${task.num}/checkin`));
   const box = page.locator('.followup-box[data-role="do"] .followup-input');
   await box.waitFor();
-  await step('the agents are listed beside the thread', () => page.locator('.ck-participant').filter({ hasText: 'Agent' }).first().waitFor());
   await box.click();
   await box.type('@');
   const menu = page.locator('.agent-mention-menu');

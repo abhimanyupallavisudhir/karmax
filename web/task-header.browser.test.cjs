@@ -1,6 +1,6 @@
 // Real browser regression: the task page header stays compact. The title, its
 // pull requests, its stage and the Chat/Parameters switch share one line;
-// attempts sit on one line with the New attempt action; priority and tags live
+// attempts head the details rail with the New attempt action; priority and tags live
 // in the details rail; the workflow name/version live on Parameters only. Tasks
 // open on Chat, its toolbar actions share one size, and a draft attempt opens its form.
 // SCREENSHOT_DIR=<dir> also writes screenshots. APP_SOURCE can test the baseline.
@@ -81,9 +81,9 @@ const attempt = (n, extra = {}) => ({
       return {
         headText: head.innerText,
         workflowInHead: !!head.querySelector('#tp-workflow-mode'),
-        cardRows: new Set([...head.querySelectorAll('.attempt-card, #add-attempt')].map(top)).size,
-        cardHeight: Math.max(...[...head.querySelectorAll('.attempt-card')].map((el) => el.getBoundingClientRect().height)),
-        attemptChip: !!head.querySelector('.row1 .attempt-current'),
+        attemptsInHead: head.querySelectorAll('.attempt-card, #add-attempt').length,
+        attemptsFirstInRail: document.querySelector('#tp-rail .rail-inner > :first-child')?.querySelectorAll('.attempt-card').length,
+        cardHeight: Math.max(...[...document.querySelectorAll('#tp-rail .attempt-card')].map((el) => el.getBoundingClientRect().height)),
         titleRows: new Set([...head.querySelectorAll('.row1 h2, .row1 .pr-link, .tp-stage, .tp-views, #tp-rail-toggle')].map(top)).size,
         orgInRail: !!document.querySelector('#tp-rail .org-priority') && !head.querySelector('.org-priority'),
         headHeight: head.getBoundingClientRect().height,
@@ -103,9 +103,9 @@ const attempt = (n, extra = {}) => ({
     assert.doesNotMatch(layout.headText, /Software dev|v1\.26\.0/, 'workflow name and version are not in the header');
     assert.doesNotMatch(layout.headText, /\d+ attempts/, 'no attempt-count heading');
     assert.doesNotMatch(layout.headText, /no tags|Shown in task list/, 'no filler text');
-    assert.equal(layout.cardRows, 1, 'attempts and New attempt share one line');
+    assert.equal(layout.attemptsInHead, 0, 'attempts are not in the header');
+    assert.equal(layout.attemptsFirstInRail, 3, 'attempts head the details rail');
     assert.ok(layout.cardHeight <= 32, `attempt cards are single-line (${layout.cardHeight}px)`);
-    assert.equal(layout.attemptChip, false, 'the selected card marks the current attempt; no duplicate title chip');
     assert.equal(layout.titleRows, 1, 'the title, its pull requests, its stage and the view switch share one line');
     assert.equal(layout.orgInRail, true, 'priority and tags live in the details rail');
     assert.ok(layout.headHeight <= 120, `header is compact (${layout.headHeight}px)`);
@@ -118,8 +118,8 @@ const attempt = (n, extra = {}) => ({
     await shot('task-checkin-toolbar.png', '.task-page .ck-pane-head');
     const tools = await page.evaluate(() => [...document.querySelectorAll('.ck-tools .btn')]
       .map((el) => Math.round(el.getBoundingClientRect().height)));
-    assert.ok(tools.length === 3 && tools.every((h) => h === 28), `toolbar actions share one size (${tools})`);
-    assert.equal(await page.locator('#tp-rail #local-checkout').count(), 1, 'Work locally is in the details rail');
+    assert.ok(tools.length === 4 && tools.every((h) => h === 28), `toolbar actions share one size (${tools})`);
+    assert.deepEqual(await page.locator('.ck-tools .btn').allInnerTexts().then((t) => t.slice(0, 3).map((x) => x.trim())), ['Share', 'Fork', 'Work locally'], 'Work locally sits beside Share and Fork');
 
     // The crown still selects the principal attempt and the note is a tooltip.
     const crownTitle = await page.locator('.attempt-crown.principal').getAttribute('title');

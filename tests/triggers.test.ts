@@ -773,6 +773,32 @@ describe('TriggerScheduler (dispatcher)', () => {
     expect(after.params.draft).toBe(true);
   });
 
+  it('a rejected edit of a waiting task leaves it exactly as it was, still armed', async () => {
+    (await store.updateProjectConfig(projectId, { repos: ['/tmp/karmax-test-repo'] }));
+    const client = { workflow: { start: async () => {}, getHandle: () => ({}) } } as any;
+    const tokens = new TokenAuthority();
+    const token = (await tokens.mintPrincipal('u', ['*'])).token;
+    const api = new KarmaxApi({ store, client, taskQueue: 'q', tokens });
+    let cyclic = false;
+    api.setTriggerArmer({
+      arm: () => {}, disarm: () => {},
+      validationErrors: (t) => cyclic && (t.params.triggers as any)?.[0]?.type === 'loop' ? ['dependency would create a cycle'] : [],
+    });
+    const t = await api.createTask(token, { projectId, workflow: 'just-do', params: { prompt: 'Release notes', triggers: [{ kind: 'event', type: 'a.b' }] } });
+    expect(t.params.triggerState).toBe('armed');
+    cyclic = true;
+    await expect(api.updateArmedParams(token, t.id, { prompt: 'Renamed', triggers: [{ kind: 'event', type: 'loop' }] }, { replace: true, keepArmed: true }))
+      .rejects.toThrow(/cycle/);
+    // Saving first and validating after left the task un-armed with the bad
+    // triggers stored, and the reconcile sweep then failed it as "never started".
+    const after = (await store.getTask(t.id))!;
+    expect(after.params.triggerState).toBe('armed');
+    expect((after.params.triggers as any)[0].type).toBe('a.b');
+    expect(after.params.prompt).toBe('Release notes');
+    expect(after.title).toBe('Release notes');
+    expect(await store.listReconciliationCandidates(projectId)).not.toContainEqual(expect.objectContaining({ id: t.id }));
+  });
+
   it('edits a waiting (armed) task in place, re-arming with new triggers', async () => {
     (await store.updateProjectConfig(projectId, { repos: ['/tmp/karmax-test-repo'] }));
     const started: string[] = [];

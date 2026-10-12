@@ -50,7 +50,7 @@ const root = __dirname;
       const file = path.join(root, p === '/' ? 'index.html' : p);
       if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) return route.abort();
       let body = fs.readFileSync(file, 'utf8');
-      if (p === '/app.js') body = body.replace(/^boot\(\)\.catch\(.*$/m, 'window.layoutTest = { S, openTask, renderTaskPage }; installLinkRouter();');
+      if (p === '/app.js') body = body.replace(/^boot\(\)\.catch\(.*$/m, 'window.layoutTest = { S, openTask, renderTaskPage }; installLinkRouter(); bindKeys();');
       return route.fulfill({ body, contentType: file.endsWith('.js') ? 'text/javascript' : file.endsWith('.css') ? 'text/css' : 'text/html' });
     });
     await page.goto('http://layout.test/');
@@ -82,8 +82,12 @@ const root = __dirname;
     assert.equal(await page.locator('.review-info').evaluate((el) => !el.nextElementSibling), true, 'nothing follows the review in the thread');
     assert.equal(await page.locator('.pipeline-lg').count(), 0, 'no second, larger pipeline');
     assert.equal(await page.locator('.tp-stage .pipeline').count(), 1, 'the stage carries its pipeline');
-    for (const selector of ['.subtask-row[data-open="t2"]', '#task-notes', '.org-priority', '#ck-term-item', '#local-checkout', '#approval-history-open'])
+    for (const selector of ['.subtask-row[data-open="t2"]', '#task-notes', '.org-priority', '#ck-term-item', '#approval-history-open'])
       assert.equal(await page.locator(`#tp-rail ${selector}`).count(), 1, `${selector} is in the details rail`);
+    assert.equal(await page.locator('#tp-rail .rail-inner > :first-child #add-attempt').count(), 1, 'attempts head the rail');
+    assert.equal(await page.locator('#tp-rail .rail-inner > :last-child > :last-child').getAttribute('id'), 'ck-term-item', 'the terminal comes last');
+    assert.doesNotMatch(await page.locator('#tp-rail').innerText(), /Agents/, 'no agent list: the conversation already shows who speaks');
+    assert.equal(await page.locator('.ck-tools #local-checkout').count(), 1, 'Work locally sits beside Share and Fork');
     assert.match(await page.locator('#tp-rail').innerText(), /src\/theme\.js/, 'workflow widgets are in the rail');
     assert.equal(await page.locator('.task-page').evaluate((el) => !el.textContent.includes('Nothing to do here')), true);
 
@@ -108,6 +112,21 @@ const root = __dirname;
     await page.locator('#tp-rail [data-checkin="terminal"]').click();
     await page.waitForSelector('.tp-views .tab.active[data-tasktab="checkin"]');
     await page.waitForSelector('#term-open');
+
+    // t: the terminal in place of the conversation, and back; i: the rail.
+    await page.locator('.tp-head h2').click();
+    await page.keyboard.press('t');
+    await page.waitForSelector('#ck-thread');
+    assert.equal(await page.locator('#term-open').count(), 0, 't returns to the conversation');
+    await page.keyboard.press('t');
+    await page.waitForSelector('#term-open');
+    await page.locator('.tp-views [data-tasktab="checkin"]').click();
+    await page.waitForSelector('#ck-thread');
+    assert.equal(await page.locator('#term-open').count(), 0, 'Chat brings the conversation back');
+    await page.keyboard.press('i');
+    assert.equal(await page.locator('#tp-rail').isVisible(), false, 'i hides the rail');
+    await page.keyboard.press('i');
+    assert.equal(await page.locator('#tp-rail').isVisible(), true, 'i shows it again');
 
     // A former tab's link opens the conversation.
     await open('overview');

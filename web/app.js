@@ -6404,7 +6404,7 @@ function taskRow(t, { showTags = true, project = false } = {}) {
     <div class="task-row" data-armed="${t.id}">
       <span class="status-dot waiting" title="waiting for trigger"></span>
       <div class="task-main">
-        <div class="task-title">${esc(t.title)}</div>
+        <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</div>
         <div class="task-sub"><span class="chip">waiting for trigger</span><span style="color:var(--ink-3)">${esc(triggerSummary(t.params.triggers))}</span></div>
       </div>
       <div class="task-right">
@@ -7743,8 +7743,12 @@ async function consumeTaskFormDefaults(projectId, workflow) {
   finally { if (taskFormDefaultRequests.get(key) === request) taskFormDefaultRequests.delete(key); }
 }
 
+// A waiting task is a real, numbered task already: its page names it and what
+// it waits for. (HTML: escaped here.)
 function taskFormTitle(draft) {
   const p = draft?.params || {};
+  if (p.triggerState === 'armed' && !p.repeatable && draft.num != null)
+    return `<span class="task-num">#${draft.num}</span> ${esc(draft.title)} <span class="chip waiting" title="Starts by itself when its trigger fires">${esc(triggerSummary(p.triggers) || 'waiting')}</span>`;
   return !draft ? 'New task' : p.triggerState === 'armed' || p.repeatable ? 'Edit task' : 'Edit draft';
 }
 
@@ -7910,7 +7914,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       </div>
       <div class="tf-foot">
         <div class="tf-foot-inner">
-          <span class="tf-hint">Closing keeps your work as a draft</span>
+          <span class="tf-hint">${editInPlace ? 'Closing keeps your changes' : 'Closing keeps your work as a draft'}</span>
           <button class="btn" id="tf-draft">Save draft</button>
           <button class="btn primary" id="tf-queue">${editInPlace ? 'Save' : 'Run task'}<span class="kbd">${esc(fmtKeys('meta+Enter'))}</span></button>
         </div>
@@ -8228,7 +8232,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       if (sig === lastSaved) return; // no change since the last write landed
       if (activeFormToken === formToken) {
         const ss = $('#tf-savestate');
-        if (ss) ss.textContent = 'Saving draft…';
+        if (ss) ss.textContent = editInPlace ? 'Saving…' : 'Saving draft…';
       }
       try {
         if (!draftId) {
@@ -8247,7 +8251,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
         lastSaved = sig;
         // Quiet auto-save indicator in the page head. Guard on the form token: this
         // chain link can land after a NEWER form instance has mounted its own head.
-        if (activeFormToken === formToken) { const ss = $('#tf-savestate'); if (ss) ss.textContent = 'Draft saved'; }
+        if (activeFormToken === formToken) { const ss = $('#tf-savestate'); if (ss) ss.textContent = editInPlace ? 'Saved' : 'Draft saved'; }
         refreshTasks();
       } catch {
         // Auto-save used to fail silently, leaving the form looking saved while
@@ -8255,7 +8259,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
         // dirty signature retryable, but tell the user the durable write missed.
         if (activeFormToken === formToken) {
           const ss = $('#tf-savestate');
-          if (ss) ss.textContent = 'Draft not saved — keep editing to retry';
+          if (ss) ss.textContent = `${editInPlace ? 'Not saved' : 'Draft not saved'} — keep editing to retry`;
         }
       }
     });
@@ -8556,23 +8560,25 @@ function visibleTaskTabs() { return TASK_TABS.filter(t => t.key !== 'timing' || 
 // parameters (it has no conversation yet), else the conversation — what people
 // come to a task for, and where its pending approvals wait.
 function defaultTaskTab(v) {
-  return v.state?.draft ? 'parameters' : 'checkin';
+  return v?.state?.draft ? 'parameters' : 'checkin';
 }
 
 // Task navigation owns the main cell immediately. The compact view normally
 // arrives quickly, but under host load the old list/task used to remain visible
 // with no acknowledgement that the click had landed.
-function renderTaskLoadingPage(rec, error) {
+function renderTaskLoadingPage(rec, error, notStarted = false) {
   const main = $('#main');
   if (!main) return;
   const title = rec?.title || 'Task';
-  main.innerHTML = `<div class="task-page" aria-busy="${error ? 'false' : 'true'}">
+  main.innerHTML = `<div class="task-page" aria-busy="${error || notStarted ? 'false' : 'true'}">
     <div class="tp-head wide">${taskBreadcrumb({ taskId: rec?.id, parentTaskId: rec?.parentTaskId })}<div class="row1">
       <button class="icon-btn" id="tp-back" data-shortcut="nav.close" title="Back (Esc)">←</button>
       ${rec?.num != null ? `<span class="task-num">#${rec.num}</span>` : ''}
       <h2>${esc(title)}</h2>
     </div></div>
-    <div class="tf-loading" role="status">${error
+    <div class="tf-loading" role="status">${notStarted
+      ? '<div class="task-load-error"><b>Not started yet</b><button class="btn sm" id="task-load-retry">Refresh</button></div>'
+      : error
       ? `<div class="task-load-error"><b>Couldn’t load this task</b><span>${esc(error)}</span><button class="btn sm" id="task-load-retry">Try again</button></div>`
       : '<span class="global-search-loading">Loading task…</span>'}</div>
   </div>`;
@@ -8881,7 +8887,7 @@ const TASK_WALK_SETTLE_MS = 150;
 // still waits), or the open approval history (UI-6). Vault item names only label
 // credential requests, so they load only when there are some.
 function showsTaskApprovals(view) {
-  return !!(view.approvalRequests || view.pendingDecisions || S.approvalHistoryOpen);
+  return !!(view?.approvalRequests || view?.pendingDecisions || S.approvalHistoryOpen);
 }
 function ensureTaskApprovals(taskId) {
   if (S.taskApprovalsFor === taskId) return Promise.resolve();
@@ -8911,9 +8917,12 @@ function ensureTaskApprovals(taskId) {
 // A draft has nothing to show but its parameters, so its page is its form —
 // however it is reached (attempt card, keyboard, permalink, New attempt). An
 // archived draft keeps its task page, which owns Unarchive.
+// A task with no execution yet — a draft, or one waiting for its trigger —
+// opens as its editable form.
 function showDraftPage(taskId) {
   const rec = taskRecord(taskId);
-  if (S.selected !== taskId || !rec?.params?.draft || rec.params.archived || $('#tf-page')) return false;
+  const unstarted = rec?.params?.draft || rec?.params?.triggerState === 'armed';
+  if (S.selected !== taskId || !unstarted || rec.params.archived || $('#tf-page')) return false;
   // The URL leads: a late load must not reopen a draft the user just left.
   const key = parseRoute(currentPath())?.taskKey;
   if (key !== taskId && key !== String(rec.num)) return false;
@@ -9009,6 +9018,8 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     ]);
     const view = await api(`/api/tasks/${taskId}`);
     if (S.selected !== taskId || S.taskOpenEpoch !== openEpoch) return;
+    // No execution yet (waiting for a trigger opens as its form, above).
+    if (!view) { if (!$('#tf-page')) renderTaskLoadingPage(rec, null, true); return; }
     S.view = pendingCancellationView(view, taskId);
     // The auto tab is resolved ONCE, now that the view is in hand — in the Confirm/
     // Review gate that's Check-in (the conversation that led here is the thing to
@@ -9089,6 +9100,7 @@ async function refreshTask(reason = 'all') {
     // The user may have opened another task while this websocket-driven refresh
     // was in flight. Never pair task A's response with task B's selected page.
     if (S.selected !== id || S.taskViewRefreshEpoch !== epoch) return;
+    if (!view) return; // not started: nothing to paint over its form or notice
     if (attempts?.principalAttemptId && attempts.principalAttemptId !== id && S.viewingAttempt !== id) {
       await openTask(attempts.principalAttemptId, S.taskTab);
       return;
@@ -9566,9 +9578,6 @@ function renderTaskPage() {
   // the swap and carry over any half-typed follow-up.
   const fuState = captureFollowupFocus(main);
   const rec = taskRecord(v.taskId);
-  const previousAttempts = main.querySelector('.attempts-list');
-  const attemptScroll = previousAttempts?.querySelector('[aria-current="true"]')?.dataset.attemptSelect === v.taskId
-    ? previousAttempts.scrollLeft : null;
   const base = taskUrl(v.taskId);
   const retainedThread = patchTaskPage(main, `
     <div class="task-page${taskRailOpen() ? '' : ' rail-closed'}">
@@ -9584,9 +9593,8 @@ function renderTaskPage() {
           <nav class="tp-views segmented" aria-label="Task view">
             ${visibleTaskTabs().map((t) => `<a class="tab${t.key === tab ? ' active' : ''}" data-tasktab="${t.key}" href="${esc(base)}/${t.key}" aria-pressed="${t.key === tab}"${t.key === tab ? ' aria-current="page"' : ''}>${t.label}</a>`).join('')}
           </nav>
-          <button type="button" class="icon-btn tp-rail-toggle" id="tp-rail-toggle" aria-controls="tp-rail" aria-expanded="${taskRailOpen()}" title="Details">${ICON.sidebar}</button>
+          <button type="button" class="icon-btn tp-rail-toggle" id="tp-rail-toggle" data-shortcut="task.rail" aria-controls="tp-rail" aria-expanded="${taskRailOpen()}" title="Details (i)">${ICON.sidebar}</button>
         </div>
-        ${taskAttempts(v)}
       </div>
       <div class="tp-main">
         <div class="tp-col">
@@ -9596,14 +9604,6 @@ function renderTaskPage() {
         <aside class="tp-rail" id="tp-rail" aria-label="Task details">${taskRail(v, rec)}</aside>
       </div>
     </div>`);
-  const attemptList = main.querySelector('.attempts-list');
-  if (attemptList) {
-    if (attemptScroll !== null) attemptList.scrollLeft = attemptScroll;
-    else {
-      const selected = attemptList.querySelector('[aria-current="true"]');
-      if (selected) attemptList.scrollLeft = selected.getBoundingClientRect().left - attemptList.getBoundingClientRect().left;
-    }
-  }
   $('#tp-back').addEventListener('click', closeTask);
   // The tabs are real links (Ctrl/⌘-click or middle-click opens the pinned tab in
   // a new browser tab); a plain click switches in place without a refetch.
@@ -9611,7 +9611,8 @@ function renderTaskPage() {
     a.addEventListener('click', (e) => {
       if (e.ctrlKey || e.metaKey || e.shiftKey) return; // the browser handles new-tab/new-window opens
       e.preventDefault();
-      setTaskTab(a.dataset.tasktab);
+      if (a.dataset.tasktab === 'checkin' && S.taskTab === 'checkin' && checkinSelection(v) === 'terminal') selectCheckinPane(v, liveRoleFor(v));
+      else setTaskTab(a.dataset.tasktab);
     }),
   );
   wireAttempts(v);
@@ -10810,13 +10811,9 @@ function taskRail(v, rec = taskRecord(v.taskId)) {
       ? `<span title="${esc(v.landing.detail || 'Provider landing state')}">landing: ${esc(v.landing.provider)}</span>` : '',
     diskMeter(v),
   ].filter(Boolean).join('');
-  const links = [
-    S.attemptGroup?.attempts?.length === 1 ? addAttemptButton('rail-link') : '',
-    S.meta?.hosted ? `<button type="button" class="btn tool rail-link" id="local-checkout" title="Check out this task on your computer">${ICON.laptop}Work locally</button>` : '',
-    rec?.params?.draft ? '' : '<button type="button" class="btn tool rail-link" id="approval-history-open" title="Every app, credential and permission request this task raised">Approval requests</button>',
-  ].join('');
+  const attempts = S.attemptGroup?.attempts?.length || 0;
   return `<div class="rail-inner">
-    ${section('Agents', railAgents(v))}
+    ${attempts > 1 ? section('Attempts', taskAttempts(v)) : attempts === 1 ? `<div class="rail-sec rail-new-attempt">${addAttemptButton('rail-link')}</div>` : ''}
     ${subTasksSection(v)}
     ${checkoutsSection(v)}
     ${forkSourcesSection(v)}
@@ -10824,27 +10821,20 @@ function taskRail(v, rec = taskRecord(v.taskId)) {
     ${section('', `${meta ? `<div class="rail-meta">${meta}</div>` : ''}${rec ? orgEditorHtml(rec) : ''}`)}
     ${renderWidgetGroups(S.widgets)}
     ${notesSection(v)}
-    ${links ? `<div class="rail-links">${links}</div>` : ''}
+    <div class="rail-links">
+      ${rec?.params?.draft ? '' : '<button type="button" class="btn tool rail-link" id="approval-history-open" title="Every app, credential and permission request this task raised">Approval requests</button>'}
+      ${railTerminal(v)}
+    </div>
   </div>`;
 }
 
-// The task's conversations (or, in one shared conversation, its agents) and
-// the shell, as rail rows. Picking one shows it in the main column.
-function railAgents(v) {
-  const transcripts = taskTranscripts(v);
-  const sel = S.taskTab === 'checkin' ? checkinSelection(v) : null;
-  const liveRole = liveRoleFor(v);
-  const items = sharedConversation(v)
-    ? participantListHtml(v)
-    : transcripts.map((t) => `<button type="button" class="ck-item ${sel === t.role ? 'sel' : ''}" data-checkin="${esc(t.role)}">
-        <span class="ck-name">${esc(t.label || t.role)}</span>
-        ${t.role === liveRole && v.status === 'active' ? '<span class="ck-live" title="agent working"></span>' : ''}
-        <span class="ck-count">${conversationEntries(t).length}</span>
-      </button>`).join('');
+// The shell, last in the rail: rarely needed. It shows in place of the
+// conversation; picked again (or t), the conversation comes back.
+function railTerminal(v) {
+  const sel = S.taskTab === 'checkin' && checkinSelection(v) === 'terminal';
   const hasWorld = !!(v.worldAvailable || v.worldPath);
-  return `${items}
-    <div class="ck-item ck-terminal-item ${sel === 'terminal' ? 'sel' : ''}" id="ck-term-item">
-      <button type="button" class="ck-terminal-open" data-checkin="terminal" data-open-terminal="1" ${hasWorld ? '' : 'disabled'} title="${hasWorld ? "Open a terminal in this task's workspace" : noWorkspaceLabel(v)}">
+  return `<div class="ck-item ck-terminal-item ${sel ? 'sel' : ''}" id="ck-term-item">
+      <button type="button" class="ck-terminal-open" data-checkin="terminal" data-open-terminal="1" data-shortcut="task.terminal" aria-pressed="${sel}" ${hasWorld ? '' : 'disabled'} title="${hasWorld ? "A shell in this task's workspace (t)" : noWorkspaceLabel(v)}">
         ${ICON.terminal}<span class="ck-name">${hasWorld ? 'Terminal' : noWorkspaceLabel(v)}</span>
         <span class="ck-live ${termIsOpenFor(v.taskId) ? '' : 'hidden'}" title="shell running"></span>
       </button>
@@ -10874,34 +10864,26 @@ function wireTaskRail(v) {
   page.querySelector('.tp-col')?.addEventListener('pointerdown', () => {
     if (!page.classList.contains('rail-closed') && taskRailNarrow()) setRail(false);
   });
-  $('#local-checkout')?.addEventListener('click', () => openLocalCheckout(v));
   $('#approval-history-open')?.addEventListener('click', () => openApprovalHistory(v));
   wireTaskOrg(v);
   wireNotes(v);
   wireCheckoutApprovals(v);
-  wireStopAgents(v);
-  $('#tp-rail').querySelectorAll('[data-checkin]').forEach((el) => el.addEventListener('click', () => {
-    S.taskRailOverlay = false; // what was picked shows in place of the floating rail
-    if (S.taskTab !== 'checkin') { S.checkinSel = el.dataset.checkin; setTaskTab('checkin'); }
-    selectCheckinPane(v, el.dataset.checkin, el.dataset.openTerminal === '1');
-  }));
-  // An agent in the list starts a message to it.
-  $('#tp-rail').querySelectorAll('[data-call-agent]').forEach((el) => el.addEventListener('click', () => {
-    if (S.taskTab !== 'checkin') setTaskTab('checkin');
-    if (checkinSelection(v) === 'terminal') selectCheckinPane(v, 'do');
-    const ta = $('#main').querySelector('.followup-box[data-role="do"] .followup-input');
-    if (!ta || ta.disabled) return;
-    const key = `${v.taskId}/do`;
-    const label = participantLabelOf(el.dataset.callAgent, v);
-    const token = `@${label}`;
-    if (!ta.value.includes(token)) {
-      ta.value = `${token} ${ta.value}`;
-      followupMentions(key).push({ token, selector: `agent:${el.dataset.callAgent}` });
-    }
-    ta.focus();
-    ta.setSelectionRange(ta.value.length, ta.value.length);
-    ta.dispatchEvent(new Event('input', { bubbles: true }));
-  }));
+  $('#tp-rail [data-open-terminal]')?.addEventListener('click', () => {
+    S.taskRailOverlay = false; // the shell shows in place of the floating rail
+    toggleTaskTerminal(v);
+  });
+}
+
+// The page's details rail, open or closed (the header toggle, i).
+function toggleTaskRail() { $('#tp-rail-toggle')?.click(); }
+
+// The terminal in place of the conversation, or the conversation back (t).
+function toggleTaskTerminal(v = S.view) {
+  if (!v) return;
+  const showing = S.taskTab === 'checkin' && checkinSelection(v) === 'terminal';
+  if (showing) { selectCheckinPane(v, liveRoleFor(v)); return; }
+  if (S.taskTab !== 'checkin') { S.checkinSel = 'terminal'; setTaskTab('checkin'); }
+  selectCheckinPane(v, 'terminal', true);
 }
 
 // Check-in: talking to the task — every agent's conversation (Do / Merge /
@@ -10933,15 +10915,6 @@ function checkinSelection(v) {
   return liveRoleFor(v);
 }
 
-// Return the adjacent sidebar key with wraparound. Kept pure so the keyboard
-// navigation behavior is easy to verify independently of rendering.
-function adjacentCheckinPane(panes, current, delta) {
-  if (!panes.length) return null;
-  const i = panes.indexOf(current);
-  const at = i < 0 ? (delta > 0 ? -1 : 0) : i;
-  return panes[(at + delta + panes.length) % panes.length];
-}
-
 function selectCheckinPane(v, key, openShell = false) {
   if (!key) return;
   const changed = key !== checkinSelection(v);
@@ -10954,14 +10927,6 @@ function selectCheckinPane(v, key, openShell = false) {
     document.getElementById('ck-term-hint')?.remove();
     openTerminal(v.taskId);
   }
-}
-
-function cycleCheckinPane(delta) {
-  const v = S.view;
-  if (!v || S.taskTab !== 'checkin') return;
-  const panes = [...taskTranscripts(v).map((t) => t.role), 'terminal'];
-  const key = adjacentCheckinPane(panes, checkinSelection(v), delta);
-  selectCheckinPane(v, key, key === 'terminal');
 }
 
 function checkinTab(v) {
@@ -11046,6 +11011,7 @@ function conversationPane(v, t) {
   const agentName = esc(t.label || t.role);
   // The page header already states a lone agent's state; with several, say whose.
   const presence = conversationPresence(v, t);
+  const transcripts = taskTranscripts(v);
   const followUp = (v.actions || []).find((a) => a.name === 'followUp');
   const canFollowUp = followUp && (!followUp.roles?.length || followUp.roles.includes(t.role));
   const requestedInput = canFollowUp ? conversationInputRequest(v, entries) : '';
@@ -11074,12 +11040,14 @@ function conversationPane(v, t) {
     : '';
   return `
     <div class="ck-pane-head">
-      ${t.shared || taskTranscripts(v).length < 2 ? '' : `<b>${agentName}</b>`}
-      ${presence.tone === 'idle' || presence.tone === 'done' || (t.shared && v.participants.length < 2) ? '' : `<span class="conversation-presence ${presence.tone}"><span class="presence-dot"></span>${esc(presence.label)}</span>`}
+      ${transcripts.length > 1 ? `<select class="sel sm ck-switch" id="ck-transcript" aria-label="Conversation">${transcripts.map((x) => `<option value="${esc(x.role)}"${x.role === t.role ? ' selected' : ''}>${esc(x.label || x.role)}</option>`).join('')}</select>` : ''}
+      ${t.shared ? activeAgentsHtml(v)
+        : presence.tone === 'idle' || presence.tone === 'done' ? '' : `<span class="conversation-presence ${presence.tone}"><span class="presence-dot"></span>${esc(presence.label)}</span>`}
       <span style="flex:1"></span>
       <div class="ck-tools">
         <button class="btn tool" id="share-task-conversation" data-role="${esc(t.role)}" title="Share this conversation">${ICON.share}Share</button>
         <button class="btn tool" id="fork-task-agent" data-role="${esc(t.role)}" title="Create a new task from this agent’s conversation">${ICON.fork}Fork</button>
+        ${S.meta?.hosted ? `<button type="button" class="btn tool" id="local-checkout" title="Check out this task on your computer">${ICON.laptop}Work locally</button>` : ''}
         ${copy}
         <span class="tool-sep" aria-hidden="true"></span>
         ${conversationFullscreenButton()}
@@ -11710,6 +11678,8 @@ async function openConversationShare(v, role) {
 
 function wireCheckinSidebar(v) {
   wireStopAgents(v);
+  $('#ck-transcript')?.addEventListener('change', (event) => selectCheckinPane(v, event.target.value));
+  $('#local-checkout')?.addEventListener('click', () => openLocalCheckout(v));
   $('#main').querySelector('[data-reload-history]')?.addEventListener('click', () => refreshTaskHistory(v.taskId));
   $('#main').querySelectorAll('.escalate-request').forEach((el) => el.addEventListener('click', () => openEscalateDialog(v)));
   $('#conversation-fullscreen')?.addEventListener('click', () => setConversationFullscreen(!S.conversationFullscreen));
@@ -13311,16 +13281,14 @@ function recipientsHtml(m, v) {
   return `<span class="msg-to" title="Addressed to">→ ${to.map((selector) => esc(recipientLabel(selector, v))).join(', ')}</span>`;
 }
 // The task's agents beside the conversation. Clicking one starts a message to it.
-function participantListHtml(v) {
-  const hint = { running: 'Working now', waiting: 'Waiting', queued: 'Called — runs when the current turn ends' };
-  return `${v.participants.map((p, index) => `
-    <div class="ck-participant-row">
-      <button type="button" class="ck-item ck-participant" data-call-agent="${esc(p.key)}" title="${hint[p.state] || 'Message this agent'}">
-        ${v.participants.length > 1 ? `<span class="ck-num">${index}</span>` : ''}<span class="ck-name">${esc(p.label)}</span>
-        ${p.state === 'running' ? '<span class="ck-live"></span>' : p.state === 'waiting' ? '<span class="ck-waiting" aria-label="waiting"></span>' : p.state === 'queued' ? '<span class="ck-queued" aria-label="queued">⋯</span>' : ''}
-      </button>
-      ${p.state && p.state !== 'idle' ? stopAgentButton(p, 'ck-stop') : ''}
-    </div>`).join('')}`;
+// In a conversation several agents share: the ones not idle (working, waiting
+// or called), each with its Stop. A lone agent's state is the header's.
+function activeAgentsHtml(v) {
+  if (!(v.participants?.length > 1)) return '';
+  const tone = { running: 'working', waiting: 'waiting', queued: 'queued' };
+  const hint = { running: 'Working now', waiting: v.waitingFor ? waitingText(v.waitingFor) : 'Waiting', queued: 'Called — runs when the current turn ends' };
+  return v.participants.filter((p) => tone[p.state]).map((p) => `<span class="conversation-presence ck-agent ${tone[p.state]}" title="${esc(hint[p.state])}">
+      <span class="presence-dot"></span>${esc(p.label)}${stopAgentButton(p, 'ck-stop')}</span>`).join('');
 }
 // The agent the composer's Stop button stops: the one working now, else the
 // innermost one waiting in its turn (for a credential, capacity, a retry or people).
@@ -22020,18 +21988,18 @@ function allCommands() {
   add({ id: 'rail.open', title: 'Switch to project / open entry', keybinding: 'Enter', group: 'Projects', palette: false, available: rail, run: () => document.activeElement?.click() });
   add({ id: 'rail.open.o', title: 'Switch to project / open entry', keybinding: 'o', group: 'Projects', palette: false, help: false, available: rail, run: () => document.activeElement?.click() });
   // Task-page navigation (host grammar, like j/k): u goes back to the list
-  // (Gmail-style — Esc does too, once overlays are popped), [ / ] cycle the
-  // page's tabs. Documented in the help panel's static "On a task page" section
+  // (Gmail-style — Esc does too, once overlays are popped), [ / ] switch the
+  // page's views, { / } its attempts, i the details rail, t the terminal. Documented in the help panel's static "On a task page" section
   // (help: false here) so they're discoverable before a page is open.
   add({ id: 'task.back', title: 'Back to the list', keybinding: 'u', group: 'Task', help: false, available: !!S.selected, run: () => closeTask() });
   const attemptsAvailable = !!(S.selected && S.view && document.querySelectorAll('[data-attempt-select]').length > 1);
-  add({ id: 'task.attempt.next', title: 'Next attempt', keybinding: 'a ]', group: 'Task', help: false, available: attemptsAvailable, run: () => cycleAttempt(1) });
-  add({ id: 'task.attempt.prev', title: 'Previous attempt', keybinding: 'a [', group: 'Task', help: false, available: attemptsAvailable, run: () => cycleAttempt(-1) });
+  add({ id: 'task.attempt.prev', title: 'Previous attempt', keybinding: '{', group: 'Task', help: false, available: attemptsAvailable, run: () => cycleAttempt(-1) });
+  add({ id: 'task.attempt.next', title: 'Next attempt', keybinding: '}', group: 'Task', help: false, available: attemptsAvailable, run: () => cycleAttempt(1) });
   add({ id: 'task.attempt.new', title: 'New attempt', keybinding: 'a n', group: 'Task', help: false, available: !!(S.selected && S.view && $('#add-attempt:not(:disabled)')), run: () => $('#add-attempt:not(:disabled)')?.click() });
-  add({ id: 'task.tab.prev', title: 'Previous tab', keybinding: '[', group: 'Task', help: false, available: !!(S.selected && S.view), run: () => cycleTaskTab(-1) });
-  add({ id: 'task.tab.next', title: 'Next tab', keybinding: ']', group: 'Task', help: false, available: !!(S.selected && S.view), run: () => cycleTaskTab(1) });
-  add({ id: 'task.checkin.prev', title: 'Previous Chat pane', keybinding: '{', group: 'Task', help: false, available: !!(S.selected && S.view && S.taskTab === 'checkin'), run: () => cycleCheckinPane(-1) });
-  add({ id: 'task.checkin.next', title: 'Next Chat pane', keybinding: '}', group: 'Task', help: false, available: !!(S.selected && S.view && S.taskTab === 'checkin'), run: () => cycleCheckinPane(1) });
+  add({ id: 'task.tab.prev', title: 'Chat / Parameters', keybinding: '[', group: 'Task', help: false, available: !!(S.selected && S.view), run: () => cycleTaskTab(-1) });
+  add({ id: 'task.tab.next', title: 'Chat / Parameters', keybinding: ']', group: 'Task', help: false, available: !!(S.selected && S.view), run: () => cycleTaskTab(1) });
+  add({ id: 'task.rail', title: 'Show / hide details', keybinding: 'i', group: 'Task', help: false, available: !!(S.selected && S.view && $('#tp-rail-toggle')), run: toggleTaskRail });
+  add({ id: 'task.terminal', title: 'Terminal / conversation', keybinding: 't', group: 'Task', help: false, available: !!(S.selected && S.view && $('#tp-rail [data-open-terminal]:not(:disabled)')), run: () => toggleTaskTerminal() });
   // { / } also walk the settings rail's panes (project or organization settings).
   const onSettings = ['settings', 'organization', 'global'].includes(S.tab) && !S.selected;
   add({ id: 'settings.pane.prev', title: 'Previous settings section', keybinding: '{', group: 'Navigation', help: false, available: onSettings, run: () => cycleSettingsPane(-1) });
@@ -22407,10 +22375,11 @@ function openHelp() {
       ${groups.map((g) => `<div class="section-h">${esc(g)}</div>${cmds.filter((c) => c.group === g).map((c) => row(esc(fmtKeys(c.keybinding)), esc(c.title), c.workflow)).join('')}`).join('')}
       <div class="section-h">On a task page</div>
       ${row('1–9', 'Press the Nth action button (whatever the workflow declares)')}
-      ${row('[ / ]', 'Previous / next tab')}
-      ${row('a [ / a ]', 'Previous / next attempt')}
+      ${row('[ / ]', 'Chat / Parameters')}
+      ${row('{ / }', 'Previous / next attempt')}
       ${row('a n', 'New attempt (open editable draft)')}
-      ${row('{ / }', 'Previous / next Chat pane')}
+      ${row('i', 'Show / hide details')}
+      ${row('t', 'Terminal / conversation')}
       ${row('u', 'Back to the list')}
       ${row(esc(fmtKeys('meta+Enter')), 'Send follow-up (from inside the compose box)')}
       ${row('Esc', 'Close the topmost panel / leave a text field')}

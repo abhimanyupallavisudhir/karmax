@@ -849,11 +849,6 @@ a.git-repo-name:hover { color:var(--accent); }
 .rail-sec { padding: 12px 16px; border-top: 1px solid var(--line); }
 .rail-inner > :first-child { border-top: 0; }
 .rail-h, .tp-rail .section-h { display: flex; align-items: center; gap: 6px; margin: 0 0 6px; color: var(--ink-3); font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; }
-.rail-sec .ck-item { margin: 0 -8px; padding: 6px 8px; }
-.rail-sec .ck-item svg { flex: none; color: var(--ink-3); }
-.rail-sec button.ck-item { width: calc(100% + 16px); border: 0; background: none; font: inherit; text-align: left; }
-.rail-sec .ck-participant-row { margin: 0 -8px; }
-.rail-sec .ck-participant-row .ck-item { margin: 0; }
 .rail-meta { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; margin-bottom: 8px; color: var(--ink-3); font-size: 12px; }
 .rail-meta .mono { font-family: var(--font-mono); }
 .tp-rail .org-editor { margin-top: 0; }
@@ -861,6 +856,21 @@ a.git-repo-name:hover { color:var(--accent); }
 #task-notes:focus { background: var(--surface); }
 .rail-links { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: 10px 12px 0; border-top: 1px solid var(--line); }
 .rail-link { justify-content: flex-start; }
+/* The shell, last: a quiet row like the links above it. */
+.rail-links .ck-terminal-item { align-self: stretch; margin: 0; border-radius: var(--r-sm); font-size: 12.5px; }
+.rail-links .ck-terminal-open { padding: 5px 6px 5px 4px; }
+.rail-links .ck-terminal-open svg { color: var(--ink-3); }
+/* Attempts head the rail, one per row. */
+.tp-rail .attempts { flex-direction: column; align-items: stretch; gap: 6px; margin: 0; }
+.tp-rail .attempts-list { flex-direction: column; gap: 4px; padding: 0; overflow: visible; }
+.tp-rail .attempt-card { display: flex; width: 100%; box-sizing: border-box; }
+.tp-rail .attempt-add { align-self: flex-start; }
+.rail-new-attempt { padding-top: 8px; padding-bottom: 8px; }
+/* The agents working in a shared conversation, each with its Stop. */
+.ck-agent { gap: 5px; padding-right: 3px; }
+.ck-agent .ck-stop { width: 18px; height: 18px; border-radius: 999px; }
+.conversation-presence.queued .presence-dot { background: transparent; box-shadow: inset 0 0 0 1.5px var(--ink-3); }
+.ck-switch { width: auto; max-width: 220px; }
 /* Delegated and forked work, branches and widgets: the same objects as
    elsewhere, flattened into rail sections. */
 .tp-rail .subtasks, .tp-rail .agent-forks { margin: 0; border: 0; border-top: 1px solid var(--line); border-radius: 0; box-shadow: none; background: transparent; }
@@ -3353,13 +3363,6 @@ html[data-theme="dark"] .github-signin-btn:active,
 .msg.agent.other-agent { background: color-mix(in srgb, var(--accent) 6%, var(--surface-2)); border-color: color-mix(in srgb, var(--accent) 22%, var(--line)); }
 .msg-to { font-size: 11px; color: currentColor; opacity: .72; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 40ch; }
 .activity-speaker { flex: none; font: 10px/1.6 var(--font-mono); text-transform: uppercase; letter-spacing: .04em; color: var(--accent); margin-right: 6px; }
-.ck-participant { width: 100%; border: 0; background: none; text-align: left; font: inherit; }
-.ck-participant .ck-num { flex: none; width: 16px; font: 11px var(--font-mono); color: var(--ink-3); }
-.ck-participant .ck-queued { margin-left: auto; color: var(--ink-3); font-weight: 700; letter-spacing: .1em; }
-.ck-participant .ck-live { margin-left: auto; }
-.ck-participant .ck-waiting { margin-left: auto; width: 8px; height: 8px; border-radius: 50%; background: var(--working); flex: none; }
-.ck-participant-row { display: flex; align-items: center; }
-.ck-participant-row .ck-participant { flex: 1; min-width: 0; }
 .ck-stop { flex: none; width: 24px; height: 24px; display: grid; place-items: center; border: 0; border-radius: 6px; background: transparent; color: var(--ink-3); cursor: pointer; }
 .ck-stop:hover { background: var(--surface); color: var(--danger); }
 .followup-stop { flex: none; display: grid; place-items: center; padding: 0 10px; min-height: 38px; color: var(--ink-2); }

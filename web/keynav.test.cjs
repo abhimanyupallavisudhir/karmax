@@ -38,7 +38,6 @@ eval(extractFn('isBareModifier'));
 eval(extractFn('focusedEnterAction'));
 eval(extractFn('fmtKeys'));
 eval(extractFn('fuzzyScore'));
-eval(extractFn('adjacentCheckinPane'));
 eval(extractConst('firstLine').replace('const firstLine =', 'global.firstLine ='));
 eval(extractConst('QUICK_TASK_WORKFLOW').replace('const QUICK_TASK_WORKFLOW =', 'global.QUICK_TASK_WORKFLOW ='));
 eval(extractFn('quickTaskSubmitMode'));
@@ -204,11 +203,6 @@ ok(fuzzyScore('conf', 'Confirm task') > fuzzyScore('cnf', 'Confirm task'), 'cons
 ok(fuzzyScore('task', 'Confirm task') > 0, 'word-boundary bonus applies');
 ok(fuzzyScore('gq', 'Go to queues') >= 0, 'initials-style query matches');
 
-// ── Check-in sidebar cycling ──
-const panes = ['do', 'merge', 'terminal'];
-ok(adjacentCheckinPane(panes, 'do', 1) === 'merge', 'Check-in moves to the next pane');
-ok(adjacentCheckinPane(panes, 'terminal', 1) === 'do', 'Check-in next wraps to the first pane');
-ok(adjacentCheckinPane(panes, 'do', -1) === 'terminal', 'Check-in previous wraps to the terminal');
 
 // ── Quick-add submission modes ──
 ok(quickTaskSubmitMode(ev('Enter')) === 'form', 'Enter opens the full task form');
@@ -256,7 +250,7 @@ ok(openTaskFormSource.includes('activeTaskFormKeyController?.abort()') && openTa
 ok(openTaskFormSource.includes("activeFormToken !== formToken || !root.querySelector('#tf-page')"),
   'a detached form cannot retain a live document-level submit shortcut');
 
-// Exercise attempt chords through the real command registry and key dispatcher.
+// Exercise the task page's keys through the real command registry and key dispatcher.
 global.S = { selected: 'one', view: {}, tab: 'tasks' };
 global.HOST_COMMANDS = [];
 global.inRail = () => false;
@@ -268,9 +262,13 @@ let links = ['one', 'two', 'three'].map((id) => ({
   dataset: { attemptSelect: id },
   click: () => { S.selected = id; },
 }));
-let overlayCount = 0;
+let overlayCount = 0, railToggles = 0, terminalToggles = 0, hasWorld = true;
+global.toggleTaskRail = () => railToggles++;
+global.toggleTaskTerminal = () => terminalToggles++;
 global.$ = (selector) => {
   if (selector === '#overlay-root' || selector === '#modal-root') return { childElementCount: overlayCount };
+  if (selector === '#tp-rail-toggle') return {};
+  if (selector === '#tp-rail [data-open-terminal]:not(:disabled)') return hasWorld ? {} : null;
   if (selector === '#add-attempt:not(:disabled)') return addAttempt.disabled ? null : addAttempt;
   return null;
 };
@@ -286,14 +284,24 @@ const press = (key, typing = false) => attemptKeydown({
   target: { matches: () => typing },
 });
 const chord = (key) => { press('a'); press(key); };
-chord(']');
-ok(S.selected === 'two' && taskMoves === 0, 'a ] selects the next attempt without switching tasks');
-chord('[');
-ok(S.selected === 'one', 'a [ selects the previous attempt');
-chord('[');
+press('}');
+ok(S.selected === 'two' && taskMoves === 0, '} selects the next attempt without switching tasks');
+press('{');
+ok(S.selected === 'one', '{ selects the previous attempt');
+press('{');
 ok(S.selected === 'three', 'previous attempt wraps to the last');
-chord(']');
+press('}');
 ok(S.selected === 'one', 'next attempt wraps to the first');
+press('i');
+ok(railToggles === 1, 'i shows or hides the details rail');
+press('t');
+ok(terminalToggles === 1, 't switches between the terminal and the conversation');
+hasWorld = false;
+press('t');
+ok(terminalToggles === 1, 't does nothing without a workspace');
+hasWorld = true;
+press('i', true); press('t', true);
+ok(railToggles === 1 && terminalToggles === 1, 'typing i or t in a field is just text');
 chord('n');
 ok(newAttempts === 1, 'a n invokes the existing draft creation control');
 addAttempt.disabled = true;
