@@ -14,7 +14,9 @@ import { CredentialBroker } from '../src/autonomy/broker.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { WorktreeProvider } from '../src/world/worktree.js';
 import { ObjectSnapshotEngine, ProjectResourceService } from '../src/world/resources.js';
-import { REPOSITORY_ROUTE } from '../src/world/resource-repository.js';
+import { REPOSITORY_ROUTE, repositoryObjectKey } from '../src/world/resource-repository.js';
+import { ObjectReconciler } from '../src/store/object-reconciliation.js';
+import { checksumHeader } from '../src/store/objects.js';
 import { SYSTEM_JOB_ROOT } from '../src/world/jobs.js';
 import edge, { type EdgeEnv } from '../src/edge/resource-repository-worker.js';
 import { fakeS3 } from './helpers/fake-s3.js';
@@ -51,7 +53,8 @@ async function fixture(options: { verifiesChecksums?: boolean } = {}) {
   // The managed store: an S3 bucket that verifies checksums, as R2 does, unless told not to.
   const s3 = await fakeS3(options);
   cleanups.push(() => s3.close());
-  const objects = s3.client;
+  // Wrapped as in production: writes are recorded as pending, deletes go through it (immediately here).
+  const objects = new DeferredDeleteObjectStore(s3.client, store, { delayMs: 0 });
   const locations = new StorageLocationService(store, objects, broker);
   const managed = await locations.ensureManaged(project.organizationId!);
   const worlds = new WorldRegistry();
@@ -183,7 +186,7 @@ it('keeps a file written again through the edge while its earlier delete was pen
     body: new Uint8Array(body) });
   expect(response.status).toBe(200);
   expect(await new DeferredDeleteObjectStore(f.objects, f.store, { delayMs: 1 }).purgeDue()).toEqual({ purged: 0, failed: 0 });
-  expect(await f.objects.head(key)).toMatchObject({ bytes: 1000 });
+  expect(await f.objects.head!(key)).toMatchObject({ bytes: 1000 });
 });
 
 it('sends uploads through tavya for a store that does not verify checksums', async () => {
@@ -207,4 +210,43 @@ it('sends uploads through tavya for a store that does not verify checksums', asy
     headers: { authorization: `Basic ${Buffer.from(`tavya:${token}`).toString('base64')}`, 'x-tavya-edge': 'intent', 'x-tavya-length': '1' } });
   expect(intent.status).toBe(409);
   expect(intent.headers.get('x-tavya-upload-url')).toBeNull();
+});
+
+it('records an edge upload as pending until it is stored, and deletes one never stored after its grace period', async () => {
+  const f = await fixture();
+  await f.resources.importFiles(f.attachment.id, [{ path: 'a.txt', data: Buffer.from('a') }]);
+  // Every file of that save was recorded, and its pending write settled with it.
+  expect((await f.store.pendingObjectWrites(Number.MAX_SAFE_INTEGER, 100)).filter((write) => write.key.startsWith('resource-repositories/')))
+    .toEqual([]);
+  const repository = await f.resources.restic.current(f.attachment);
+  const token = await (f.resources.restic as any).deps.tokens.mint({ repository: repository.name, access: 'append', quota: false,
+    expiresAt: Date.now() + 60_000 });
+  const authorization = `Basic ${Buffer.from(`tavya:${token}`).toString('base64')}`;
+  // The Worker asks, gets a URL and stores the pack, then its `stored` call is lost (the sandbox died).
+  const lost = crypto.randomBytes(1000);
+  const intent = await fetch(`${f.originUrl}${REPOSITORY_ROUTE}${repository.name}/data/${sha256(lost)}`, { method: 'POST',
+    headers: { authorization, 'x-tavya-edge': 'intent', 'x-tavya-length': '1000' } });
+  expect(intent.status).toBe(202);
+  const key = repositoryObjectKey(repository.name, 'data', sha256(lost));
+  expect(await f.store.pendingObjectWrite(key)).toBeDefined();
+  const put = await fetch(intent.headers.get('x-tavya-upload-url')!, { method: 'PUT', headers: checksumHeader(sha256(lost)),
+    body: new Uint8Array(lost) });
+  expect(put.status).toBe(200);
+  expect(await f.objects.head!(key)).toMatchObject({ bytes: 1000 });
+  // A complete upload through the edge leaves nothing pending.
+  const kept = crypto.randomBytes(1000);
+  const stored = await fetch(`${f.edgeUrl}${REPOSITORY_ROUTE}${repository.name}/data/${sha256(kept)}`,
+    { method: 'POST', headers: { authorization, 'content-length': '1000' }, body: new Uint8Array(kept) });
+  expect(stored.status).toBe(200);
+  const keptKey = repositoryObjectKey(repository.name, 'data', sha256(kept));
+  expect(await f.store.pendingObjectWrite(keptKey)).toBeUndefined();
+
+  const reconciler = new ObjectReconciler({ store: f.store, objects: f.objects, now: () => Date.now() + 24 * 3_600_000 + 1 });
+  // Pending: the lost pack, and the probe that checked the store verifies checksums (its wrong body was refused).
+  expect((await f.store.pendingObjectWrites(Number.MAX_SAFE_INTEGER, 100)).map((write) => write.key.replace(/^(\.karmax-connection-test\/).*/, '$1…')).sort())
+    .toEqual(['.karmax-connection-test/…', key]);
+  expect(await reconciler.resolvePendingWrites()).toMatchObject({ abandoned: 2 });
+  expect(await f.objects.head!(key)).toBeUndefined();
+  expect(await f.objects.head!(keptKey)).toMatchObject({ bytes: 1000 });
+  expect(await f.store.repositoryFile(repository.name, 'data', sha256(kept))).toEqual({ bytes: 1000 });
 });

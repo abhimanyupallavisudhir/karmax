@@ -264,6 +264,25 @@ describe.each(BACKENDS)('%s', (name) => {
     });
 
   describe('storage page', () => {
+    it('shows deleted data the bucket still holds, without counting it toward the quota', async () => {
+      const f = (await fixture());
+      const data = (await f.attachment('data'));
+      (await f.resources.importFiles(data.id, [{ path: 'a.bin', data: Buffer.alloc(300, 1) }]));
+      const runs: number[] = [];
+      const until = Date.parse('2026-11-09T00:00:00Z');
+      const reconciler = { run: async (now?: number) => { runs.push(now!); },
+        report: async () => ({ at: 1, organizations: { [f.organizationId]: { live: 1, pendingDelete: 25e9, pendingDeleteUntil: until, untracked: 0 } } }) as any };
+      const service = new ManagedStorageService({ store: f.store, resources: f.resources, reconciler });
+      const before = (await f.service.contents(f.organizationId));
+      const view = (await service.contents(f.organizationId));
+      expect(view.pendingDeletion).toEqual({ bytes: 25e9, until, measuredAt: 1 });
+      expect(view.retainedBytes).toBe(before.retainedBytes);
+      expect(before.pendingDeletion).toBeUndefined();
+      // The hourly run settles unrecorded uploads and reconciles.
+      (await service.run(5));
+      expect(runs).toEqual([5]);
+    });
+
     it('groups what an organization stores by project and lets an owner clear history', async () => {
       const f = (await fixture());
       const data = (await f.attachment('data'));

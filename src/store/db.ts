@@ -84,6 +84,7 @@ import {
 } from '../domain/entitlements.js';
 import { newId } from '../util/id.js';
 import { paymentMerchantMatches } from '../util/payment-merchant.js';
+import { previewHostname } from '../gateway/previews.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
 import { withPullRequestStates } from '../integrations/github-pr.js';
 import { lifecycleEventPayload } from '../domain/view-publication.js';
@@ -695,6 +696,7 @@ export class Store {
         access TEXT NOT NULL, isolation TEXT NOT NULL, source TEXT NOT NULL,
         credentialHandles TEXT NOT NULL, currentRevisionId TEXT, publish TEXT NOT NULL,
         storageLocationId TEXT, enabled INTEGER NOT NULL, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL,
+        onDemand INTEGER NOT NULL DEFAULT 0,
         UNIQUE(projectId, name)
       );
       CREATE TABLE IF NOT EXISTS resource_revisions (
@@ -751,7 +753,7 @@ export class Store {
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, provider TEXT NOT NULL,
         name TEXT NOT NULL, credentialHandle TEXT NOT NULL, config TEXT NOT NULL,
         enabled INTEGER NOT NULL, status TEXT NOT NULL, lastCheckedAt INTEGER,
-        lastError TEXT, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL,
+        lastError TEXT, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL, limits TEXT,
         UNIQUE(organizationId, provider)
       );
       CREATE TABLE IF NOT EXISTS world_leases (
@@ -792,6 +794,10 @@ export class Store {
         objectKey TEXT PRIMARY KEY, deletedAt INTEGER NOT NULL, purgeAfter INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_object_tombstones_due ON object_tombstones(purgeAfter);
+      CREATE TABLE IF NOT EXISTS pending_object_writes (
+        objectKey TEXT PRIMARY KEY, startedAt INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_pending_object_writes_started ON pending_object_writes(startedAt);
       CREATE TABLE IF NOT EXISTS executions (
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, projectId TEXT NOT NULL,
         taskId TEXT NOT NULL, worldId TEXT NOT NULL, generation INTEGER NOT NULL,
@@ -1154,6 +1160,8 @@ export class Store {
     // installs pick it up without a re-create.
     const eventCols = await this.db.prepare('PRAGMA table_info(events)').all() as { name: string }[];
     if (!eventCols.some(column => column.name === 'origin')) await this.db.exec('ALTER TABLE events ADD COLUMN origin TEXT');
+    const providerCols = await this.db.prepare('PRAGMA table_info(world_provider_connections)').all() as { name: string }[];
+    if (!providerCols.some(column => column.name === 'limits')) await this.db.exec('ALTER TABLE world_provider_connections ADD COLUMN limits TEXT');
     const repositoryCols = await this.db.prepare('PRAGMA table_info(repositories)').all() as { name: string }[];
     if (!repositoryCols.some(column => column.name === 'upstream')) await this.db.exec('ALTER TABLE repositories ADD COLUMN upstream TEXT');
     const candidateCols = await this.db.prepare('PRAGMA table_info(resource_candidates)').all() as { name: string }[];
@@ -1334,6 +1342,8 @@ export class Store {
     const attachmentCols = (await this.db.prepare('PRAGMA table_info(resource_attachments)').all()) as { name: string }[];
     if (!attachmentCols.some((c) => c.name === 'storageLocationId'))
       (await this.db.exec('ALTER TABLE resource_attachments ADD COLUMN storageLocationId TEXT'));
+    if (!attachmentCols.some((c) => c.name === 'onDemand'))
+      (await this.db.exec('ALTER TABLE resource_attachments ADD COLUMN onDemand INTEGER NOT NULL DEFAULT 0'));
     const revisionCols = (await this.db.prepare('PRAGMA table_info(resource_revisions)').all()) as { name: string }[];
     if (!revisionCols.some((c) => c.name === 'storageLocationId'))
       (await this.db.exec('ALTER TABLE resource_revisions ADD COLUMN storageLocationId TEXT'));
@@ -6671,11 +6681,11 @@ export class Store {
       createdAt: now, updatedAt: input.updatedAt ?? now };
     validateResourceAttachment(value);
     (await this.db.prepare(`INSERT INTO resource_attachments (id, organizationId, projectId, name, driver, target,
-      access, isolation, source, credentialHandles, currentRevisionId, publish, storageLocationId, enabled, createdAt, updatedAt)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(value.id, value.organizationId, value.projectId,
+      access, isolation, source, credentialHandles, currentRevisionId, publish, storageLocationId, enabled, onDemand, createdAt, updatedAt)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(value.id, value.organizationId, value.projectId,
         value.name, value.driver, JSON.stringify(value.target), value.access, value.isolation, JSON.stringify(value.source),
         JSON.stringify(value.credentialHandles), value.currentRevisionId ?? null, value.publish, value.storageLocationId ?? null, value.enabled ? 1 : 0,
-        value.createdAt, value.updatedAt));
+        value.onDemand ? 1 : 0, value.createdAt, value.updatedAt));
     return value;
   
     });
@@ -6694,7 +6704,7 @@ export class Store {
   }
 
   async updateResourceAttachment(id: string, patch: Partial<Pick<ResourceAttachment,
-    'name' | 'target' | 'access' | 'isolation' | 'source' | 'credentialHandles' | 'storageLocationId' | 'publish' | 'enabled'>>): Promise<ResourceAttachment> {
+    'name' | 'target' | 'access' | 'isolation' | 'source' | 'credentialHandles' | 'storageLocationId' | 'publish' | 'enabled' | 'onDemand'>>): Promise<ResourceAttachment> {
     return this.db.transaction(async () => {
 
     (await this.lockAttachment(id, 'update'));
@@ -6703,9 +6713,9 @@ export class Store {
     const next = { ...current, ...patch, updatedAt: Date.now() };
     validateResourceAttachment(next);
     (await this.db.prepare(`UPDATE resource_attachments SET name=?, target=?, access=?, isolation=?, source=?,
-      credentialHandles=?, storageLocationId=?, publish=?, enabled=?, updatedAt=? WHERE id=?`).run(next.name, JSON.stringify(next.target),
+      credentialHandles=?, storageLocationId=?, publish=?, enabled=?, onDemand=?, updatedAt=? WHERE id=?`).run(next.name, JSON.stringify(next.target),
         next.access, next.isolation, JSON.stringify(next.source), JSON.stringify(next.credentialHandles),
-        next.storageLocationId ?? null, next.publish, next.enabled ? 1 : 0, next.updatedAt, id));
+        next.storageLocationId ?? null, next.publish, next.enabled ? 1 : 0, next.onDemand ? 1 : 0, next.updatedAt, id));
     return next;
   
     });
@@ -7154,12 +7164,39 @@ export class Store {
         file.content ?? null, Date.now()));
   }
 
+  /** Which of `snapshots` some restic revision of the attachment names (as its
+   * whole snapshot or as one of its parts): an on-demand resource's versions
+   * share the snapshots of the parts they did not change. */
+  async referencedRepositorySnapshots(attachmentId: string, snapshots: string[]): Promise<Set<string>> {
+    const wanted = new Set(snapshots);
+    const found = new Set<string>();
+    if (!wanted.size) return found;
+    for (const row of (await this.db.prepare(`SELECT sealedRef FROM resource_revisions WHERE attachmentId=? AND engine='restic@1'`)
+      .all(attachmentId)) as Array<{ sealedRef: string }>) {
+      let ref: { snapshot?: string; parts?: Record<string, { snapshot?: string }> } | undefined;
+      try { ref = JSON.parse(row.sealedRef); } catch { continue; }
+      for (const id of [ref?.snapshot, ...Object.values(ref?.parts ?? {}).map((part) => part?.snapshot)])
+        if (id && wanted.has(id)) found.add(id);
+    }
+    return found;
+  }
+
+  /** Give a whole-snapshot restic revision its parts (same content, so the
+   * same revision: leases, checkpoints and children keep naming it). False when
+   * it changed or went meanwhile. */
+  async partResourceRevision(id: string, fromSealedRef: string, to: Pick<ResourceRevision, 'sealedRef' | 'rootDigest'>): Promise<boolean> {
+    const result = (await this.db.prepare(`UPDATE resource_revisions SET sealedRef=?, rootDigest=? WHERE id=? AND engine='restic@1' AND sealedRef=?`)
+      .run(to.sealedRef, to.rootDigest, id, fromSealedRef)) as { changes?: number };
+    return Number(result?.changes ?? 0) > 0;
+  }
+
   /** Snapshots written before `before` that no revision names: an interrupted
    * or superseded save, a Review inspection, an unchanged capture. */
   async unreferencedRepositorySnapshots(before: number, limit = 1000): Promise<Array<{ repository: string; attachmentId: string; name: string }>> {
     return ((await this.db.prepare(`SELECT f.repository, f.attachmentId, f.name FROM resource_repository_files f
       WHERE f.kind='snapshots' AND f.createdAt < ? AND NOT EXISTS (SELECT 1 FROM resource_revisions r
-        WHERE r.attachmentId=f.attachmentId AND r.engine='restic@1' AND r.rootDigest=f.name)
+        WHERE r.attachmentId=f.attachmentId AND r.engine='restic@1'
+          AND (r.rootDigest=f.name OR r.sealedRef LIKE ('%' || f.name || '%')))
       ORDER BY f.repository LIMIT ?`).all(before, limit)) as Array<{ repository: string; attachmentId: string; name: string }>);
   }
 
@@ -7622,6 +7659,13 @@ export class Store {
     return value;
   
     });
+  }
+
+  /** What the provider account said it allows; null forgets it (a new key). */
+  async setWorldProviderConnectionLimits(organizationId: string, provider: string,
+    limits: import('../domain/computer-limits.js').ComputerLimits | null): Promise<void> {
+    (await this.db.prepare('UPDATE world_provider_connections SET limits=? WHERE organizationId=? AND provider=?')
+      .run(limits ? JSON.stringify(limits) : null, organizationId, provider));
   }
 
   async deleteWorldProviderConnection(organizationId: string, provider: string): Promise<WorldProviderConnection | undefined> {
@@ -8334,6 +8378,67 @@ export class Store {
     (await this.db.prepare('DELETE FROM object_tombstones WHERE objectKey=?').run(key));
   }
 
+  /** A managed object about to be written (store/object-reconciliation.ts):
+   * recorded before its bytes reach the store, so an upload whose record never
+   * follows is found and deleted, not left behind unaccounted. */
+  async recordPendingObjectWrite(key: string, startedAt: number): Promise<void> {
+    (await this.db.prepare(`INSERT INTO pending_object_writes (objectKey, startedAt) VALUES (?, ?)
+      ON CONFLICT(objectKey) DO UPDATE SET startedAt=excluded.startedAt`).run(key, startedAt));
+  }
+
+  /** With `startedAt`, only if no write of the same key began since. */
+  async deletePendingObjectWrite(key: string, startedAt?: number): Promise<void> {
+    if (startedAt === undefined) (await this.db.prepare('DELETE FROM pending_object_writes WHERE objectKey=?').run(key));
+    else (await this.db.prepare('DELETE FROM pending_object_writes WHERE objectKey=? AND startedAt=?').run(key, startedAt));
+  }
+
+  async pendingObjectWrite(key: string): Promise<number | undefined> {
+    const row = (await this.db.prepare('SELECT startedAt FROM pending_object_writes WHERE objectKey=?').get(key)) as
+      { startedAt: number | bigint } | undefined;
+    return row ? Number(row.startedAt) : undefined;
+  }
+
+  /** Writes started before `before`, oldest first. */
+  async pendingObjectWrites(before: number, limit: number): Promise<Array<{ key: string; startedAt: number }>> {
+    return ((await this.db.prepare('SELECT objectKey, startedAt FROM pending_object_writes WHERE startedAt<? ORDER BY startedAt, objectKey LIMIT ?')
+      .all(before, limit)) as Array<{ objectKey: string; startedAt: number | bigint }>)
+      .map((row) => ({ key: String(row.objectKey), startedAt: Number(row.startedAt) }));
+  }
+
+  /**
+   * Whether a record still names this managed object, so it must not be
+   * deleted: a resource repository file (every pack a revision, lease,
+   * checkpoint or candidate needs is one), a pre-restic chunk or manifest, a
+   * world checkpoint, a review artifact,
+   * a conversation export, an upload in progress. Keys of families no table
+   * records answer false: whether such an object may go is not the database's
+   * to say (`objectFamily` in store/object-reconciliation.ts). `_` in a key is
+   * a LIKE wildcard below: it can only match more, never less.
+   */
+  async objectKeyReferenced(key: string): Promise<boolean> {
+    const parts = key.split('/');
+    const exists = async (sql: string, ...params: unknown[]) => !!(await this.db.prepare(sql).get(...params));
+    switch (parts[0]) {
+      case 'resource-repositories': {
+        const [, attachment, place, kind, name] = parts;
+        if (!attachment || !place || !kind || parts.length > 5) return false;
+        return exists('SELECT 1 FROM resource_repository_files WHERE repository=? AND kind=? AND name=?',
+          `${attachment}@${place}`, kind, kind === 'config' ? 'config' : name ?? '');
+      }
+      case 'resources': {
+        const chunk = /^([^/]+)\/chunks\/([^/]+)\.bin$/.exec(parts.slice(1).join('/'));
+        if (chunk) return this.hasResourceChunk(chunk[1]!, chunk[2]!);
+        if (parts[2] === 'manifests') return exists("SELECT 1 FROM resource_revisions WHERE json_extract(sealedRef, '$.objectKey')=?", key);
+        return false;
+      }
+      case 'checkpoints': return exists("SELECT 1 FROM world_checkpoints WHERE json_extract(manifest, '$.filesystemDelta.objectKey')=?", key);
+      case 'artifacts': return exists('SELECT 1 FROM promoted_artifacts WHERE objectKey=?', key);
+      case 'conversation-exports': return exists('SELECT 1 FROM conversation_exports WHERE objectKey=?', key);
+      case 'resource-uploads': return exists("SELECT 1 FROM kv WHERE k LIKE 'resource-upload:%' AND v LIKE ?", `%${key}%`);
+      default: return false;
+    }
+  }
+
   async hasResourceChunk(organizationId: string, chunkId: string): Promise<boolean> {
     return !!(await this.db.prepare('SELECT 1 FROM resource_snapshot_chunks WHERE organizationId=? AND chunkId=?').get(organizationId, chunkId));
   }
@@ -8472,7 +8577,7 @@ export class Store {
   async createPreviewLease(lease: PreviewLease): Promise<PreviewLease> {
     return this.db.transaction(async () => {
 
-    const value = { ...lease, hostname: lease.hostname ?? previewHostnameForLease(lease.id) };
+    const value = { ...lease, hostname: lease.hostname ?? previewHostname(lease.id) };
     (await this.db.prepare(`INSERT INTO preview_leases (id, organizationId, projectId, taskId, worldId, generation,
       port, public, tokenHash, runnerLeaseId, provider, createdBy, createdAt, expiresAt, revokedAt, hostname)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(value.id, value.organizationId,
@@ -9487,6 +9592,7 @@ function resourceAttachmentRow(row: any): ResourceAttachment {
     source: JSON.parse(row.source), credentialHandles: JSON.parse(row.credentialHandles),
     storageLocationId: row.storageLocationId ?? undefined,
     currentRevisionId: row.currentRevisionId ?? undefined, publish: row.publish, enabled: Boolean(row.enabled),
+    ...(Number(row.onDemand ?? 0) ? { onDemand: true } : {}),
     createdAt: Number(row.createdAt), updatedAt: Number(row.updatedAt) };
 }
 
@@ -9671,6 +9777,8 @@ function validateResourceAttachment(value: ResourceAttachment): void {
   if (!driver.isolations.includes(value.isolation)) throw new Error(`${value.driver} does not support ${value.isolation} isolation`);
   if (!driver.targets.includes(value.target.kind)) throw new Error(`${value.driver} does not support ${value.target.kind} targets`);
   if (driver.credentialRequired && !value.credentialHandles.length) throw new Error('credential-backed resources require a credential handle');
+  if (value.onDemand && (!snapshot || value.target.kind !== 'path' || value.source.shape === 'file'))
+    throw new Error('only a folder of data can be loaded on demand');
   if (value.publish === 'review' && (!snapshot || value.access !== 'write' || value.isolation !== 'fork'))
     throw new Error('reviewed promotion requires a writable, forked snapshot resource');
   const location = (target: { path: string; repository?: string }, label: string) => {
@@ -9781,12 +9889,6 @@ function rowToPreviewLease(row: any): PreviewLease {
   };
 }
 
-function previewHostnameForLease(id: string): string | undefined {
-  try {
-    const base = new URL(process.env.KARMAX_PREVIEW_ORIGIN ?? '');
-    return `p-${crypto.createHash('sha256').update(id).digest('hex').slice(0, 24)}.${base.hostname}`.toLowerCase();
-  } catch { return undefined; }
-}
 
 function rowToRunnerPool(r: any): RunnerPool {
   return { id: r.id, organizationId: r.organizationId, name: r.name, provider: r.provider,
@@ -9802,6 +9904,7 @@ function rowToWorldProviderConnection(r: any): WorldProviderConnection {
     name: r.name,
     credentialHandle: r.credentialHandle,
     config: JSON.parse(r.config || '{}'),
+    ...(r.limits ? { measuredLimits: JSON.parse(r.limits) } : {}),
     enabled: Boolean(r.enabled),
     status: r.status,
     lastCheckedAt: r.lastCheckedAt == null ? undefined : Number(r.lastCheckedAt),
@@ -9814,6 +9917,8 @@ function rowToWorldProviderConnection(r: any): WorldProviderConnection {
 function providerDisplayName(provider: string): string {
   if (provider === 'e2b') return 'E2B';
   if (provider === 'daytona') return 'Daytona';
+  if (provider === 'fly') return 'Fly.io';
+  if (provider === 'hetzner') return 'Hetzner Cloud';
   return provider.charAt(0).toUpperCase() + provider.slice(1);
 }
 

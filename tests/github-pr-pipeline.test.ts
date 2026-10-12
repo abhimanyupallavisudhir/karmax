@@ -58,6 +58,8 @@ let actionsReplacementSuccess = false;
 let actionsInspectionForbidden = false;
 let checkAnnotations: unknown[] = [];
 let annotationReads = 0;
+let branchUpdates = 0;
+let afterBranchUpdate: (() => void) | undefined;
 
 async function remoteForBranch(branch: string, slug?: string): Promise<string | undefined> {
   if (slug && remoteBySlug.has(slug)) return remoteBySlug.get(slug);
@@ -212,6 +214,32 @@ const fetcher = (async (url: string, init: RequestInit = {}) => {
     pr.state = 'closed'; pr.merged_at = new Date().toISOString();
     const landed = await landProviderTarget(pr, decodeURIComponent(targetRef[2]!));
     return json(200, { ref: `refs/heads/${decodeURIComponent(targetRef[2]!)}`, object: { sha: landed } });
+  }
+  const compare = u.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/compare\/(.+)\.\.\.(.+)$/);
+  if (compare && method === 'GET') {
+    const remote = await remoteForBranch(prs[0]?.head?.ref, compare[1]);
+    if (!remote) return json(404, {});
+    const [base, head] = [decodeURIComponent(compare[2]!), decodeURIComponent(compare[3]!)];
+    const count = async (range: string) => Number((await gitOrThrow(remote, ['rev-list', '--count', range])).trim());
+    return json(200, { ahead_by: await count(`${base}..${head}`), behind_by: await count(`${head}..${base}`),
+      base_commit: { sha: (await gitOrThrow(remote, ['rev-parse', base])).trim() } });
+  }
+  // GitHub merges the PR's target into its head branch, guarded by the head.
+  const updateBranch = u.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/pulls\/(\d+)\/update-branch$/);
+  if (updateBranch && method === 'PUT') {
+    const pr = prs.find((candidate) => candidate.repo === updateBranch[1] && candidate.number === Number(updateBranch[2]));
+    if (!pr) return json(404, {});
+    await refreshPrHead(pr);
+    if (body.expected_head_sha !== pr.head.sha) return json(422, { message: 'expected head sha didn’t match current head ref.' });
+    const remote = (await remoteForBranch(pr.head.ref, pr.repo))!;
+    const target = (await targetTip(pr))!;
+    const tree = (await gitOrThrow(remote, ['merge-tree', '--write-tree', pr.head.sha, target])).trim();
+    const merged = (await gitOrThrow(remote, ['-c', 'user.name=GitHub', '-c', 'user.email=noreply@github.com',
+      'commit-tree', tree, '-p', pr.head.sha, '-p', target, '-m', `Merge branch '${pr.base.ref}' into ${pr.head.ref}`])).trim();
+    await gitOrThrow(remote, ['update-ref', `refs/heads/${pr.head.ref}`, merged, pr.head.sha]);
+    branchUpdates++;
+    afterBranchUpdate?.();
+    return json(202, { message: 'Updating pull request branch.' });
   }
   const merge = u.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/pulls\/(\d+)\/merge$/);
   if (merge && method === 'PUT') {
@@ -389,6 +417,8 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     actionsInspectionForbidden = false;
     checkAnnotations = [];
     annotationReads = 0;
+    branchUpdates = 0;
+    afterBranchUpdate = undefined;
   });
 
   /** origin reads as GitHub (so the PR is keyed on the slug) and pushes to a
@@ -969,6 +999,119 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     expect(actionsReruns).toBe(1);
     await handle.signal('cancel');
     await expect(handle.result()).resolves.toMatchObject({ stage: 'cancelled' });
+  }, 120_000);
+
+  // Task 597: the failure was master's, and its fix landed on master while the
+  // PR kept failing a rerun of a head without it. Asking a person to Confirm
+  // only re-read that failure, so the task never landed.
+  it('brings a moved target into the PR instead of asking a person when CI fails again', async () => {
+    const repo = await repoWithOrigin('github-refail-target-moved');
+    const project = (await h.store.createProject('CI fixed on the target', { repos: [repo], remote: 'pr' }));
+    const connection = (await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: 'refail-target-moved', accountLogin: 'acme', accountType: 'Organization' }));
+    const enrolled = (await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+      providerId: 'refail-target-moved-repo', owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main',
+      private: true, gitConnectionId: connection.id }));
+    (await h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Fixed on the target', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+      createdBy: { kind: 'user', userId: 'a' } }));
+    const handle = await h.client.workflow.start('softwareDev@1.26.0', {
+      taskQueue: TASK_QUEUE, workflowId: task.id, args: [{
+        taskId: task.id, projectId: project.id, title: task.title,
+        prompt: '@write moved.md :: proposal\n@review Ready', base: 'main', target: 'main',
+        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' }, githubPollMs: 10,
+      }],
+    });
+    ciStaysRedThroughIntegration = true;
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    actionsJobConclusion = 'failure';
+    actionsJobLog = 'FAIL rehearse > restore leaves the app unhealthy\n';
+    githubReadiness = {
+      mergeStateStatus: 'UNSTABLE',
+      statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
+        __typename: 'CheckRun', name: 'rehearse', status: 'COMPLETED', conclusion: 'FAILURE',
+        detailsUrl: `https://github.com/${SLUG}/actions/runs/42/job/99`,
+      }] } },
+    };
+    const reviewed = prs[0].head.sha;
+    await handle.signal('confirm');
+    // The target has not moved yet: the unchanged head is rerun, as before.
+    await expect.poll(() => actionsReruns, { timeout: 30_000 }).toBe(1);
+    expect(branchUpdates).toBe(0);
+
+    // The fix lands on the target, and the rerun of the old head fails again.
+    const origin = remoteBySlug.get(SLUG) ?? await remoteForBranch(prs[0].head.ref, SLUG);
+    const fixed = (await gitOrThrow(origin!, ['-c', 'user.name=Neighbour', '-c', 'user.email=neighbour@example.test',
+      'commit-tree', 'main^{tree}', '-p', 'main', '-m', 'Fix the restore'])).trim();
+    await gitOrThrow(origin!, ['update-ref', 'refs/heads/main', fixed]);
+    afterBranchUpdate = () => { githubReadiness = {}; };
+    actionsRunAttempt = 2;
+
+    expect(await handle.result()).toMatchObject({ stage: 'done' });
+    expect(branchUpdates).toBe(1);
+    expect(actionsReruns).toBe(1);
+    expect(prs[0].head.sha).not.toBe(reviewed);
+    expect((await gitOrThrow(origin!, ['merge-base', '--is-ancestor', fixed, prs[0].head.sha])).trim()).toBe('');
+    const events = await h.store.eventsSince(task.id, 0);
+    expect(events.filter((event) => event.type === 'github.pr.branch-updated')).toEqual([
+      expect.objectContaining({ payload: expect.objectContaining({ previousHeadSha: reviewed, headSha: prs[0].head.sha }) }),
+    ]);
+    // Nobody was asked to weigh a failure the target had already fixed.
+    expect(events.filter((event) => event.type === 'view.updated'
+      && event.payload?.waitingFor === 'human' && event.payload?.stage !== 'review')).toHaveLength(0);
+  }, 120_000);
+
+  // Task 603: a test shard ran past its timeout on every rerun of the same
+  // head while the fix (rebalanced shards) landed on the target.
+  it('brings a moved target in instead of asking a person when reruns stay transiently broken', async () => {
+    const repo = await repoWithOrigin('github-transient-target-moved');
+    const project = (await h.store.createProject('Transient CI fixed on the target', { repos: [repo], remote: 'pr' }));
+    const connection = (await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: 'transient-target-moved', accountLogin: 'acme', accountType: 'Organization' }));
+    const enrolled = (await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+      providerId: 'transient-target-moved-repo', owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main',
+      private: true, gitConnectionId: connection.id }));
+    (await h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Shard timeout', workflow: 'software-dev',
+      workflowVersion: '1.26.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+      createdBy: { kind: 'user', userId: 'a' } }));
+    const handle = await h.client.workflow.start('softwareDev@1.26.0', {
+      taskQueue: TASK_QUEUE, workflowId: task.id, args: [{
+        taskId: task.id, projectId: project.id, title: task.title,
+        prompt: '@write shard.md :: proposal\n@review Ready', base: 'main', target: 'main',
+        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' }, githubPollMs: 10,
+      }],
+    });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    githubReadiness = {
+      mergeStateStatus: 'UNSTABLE',
+      statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
+        __typename: 'CheckRun', name: 'tests 4/5', status: 'COMPLETED', conclusion: 'TIMED_OUT',
+        detailsUrl: `https://github.com/${SLUG}/actions/runs/42/job/99`,
+      }] } },
+    };
+    const reviewed = prs[0].head.sha;
+    await handle.signal('confirm');
+    await expect.poll(() => actionsReruns, { timeout: 30_000 }).toBe(1);
+    actionsRunAttempt = 2;
+    await expect.poll(() => actionsReruns, { timeout: 30_000 }).toBe(2);
+    expect(branchUpdates).toBe(0);
+
+    // The fix lands on the target, and the second rerun times out again.
+    const origin = remoteBySlug.get(SLUG) ?? await remoteForBranch(prs[0].head.ref, SLUG);
+    const fixed = (await gitOrThrow(origin!, ['-c', 'user.name=Neighbour', '-c', 'user.email=neighbour@example.test',
+      'commit-tree', 'main^{tree}', '-p', 'main', '-m', 'Rebalance the shards'])).trim();
+    await gitOrThrow(origin!, ['update-ref', 'refs/heads/main', fixed]);
+    afterBranchUpdate = () => { githubReadiness = {}; };
+    actionsRunAttempt = 3;
+
+    expect(await handle.result()).toMatchObject({ stage: 'done' });
+    expect(branchUpdates).toBe(1);
+    expect(actionsReruns).toBe(2);
+    expect(prs[0].head.sha).not.toBe(reviewed);
+    expect((await h.store.eventsSince(task.id, 0)).filter((event) => event.type === 'view.updated'
+      && event.payload?.waitingFor === 'human' && event.payload?.stage !== 'review')).toHaveLength(0);
   }, 120_000);
 
   it.each([

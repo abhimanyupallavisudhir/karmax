@@ -32,6 +32,8 @@ COPY package.json package-lock.json tsconfig.json ./
 COPY src ./src
 COPY web ./web
 COPY vendor ./vendor
+# VM-world provisioning runs the browser environment's render smoke test (src/world/vm/provision.ts).
+COPY environments/browser/smoke.mjs ./environments/browser/smoke.mjs
 USER karmax
 
 EXPOSE 4505

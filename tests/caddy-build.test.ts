@@ -24,7 +24,7 @@ if [ "$count" -le "$FAILURES" ]; then exit 42; fi
       const attempts = Math.min(failures + 1, 3);
       expect(Number(fs.readFileSync(path.join(root, 'count'), 'utf8'))).toBe(attempts);
       expect(fs.readFileSync(path.join(root, 'args'), 'utf8').trim().split('\n'))
-        .toEqual(Array(attempts).fill('build --with github.com/mholt/caddy-ratelimit@v0.1.0'));
+        .toEqual(Array(attempts).fill('build --with github.com/mholt/caddy-ratelimit@v0.1.0 --with github.com/caddy-dns/cloudflare@v0.2.4'));
       expect(result.stdout).toContain(`build attempt ${attempts}`);
       expect(fs.existsSync(path.join(root, 'delays')) ? fs.readFileSync(path.join(root, 'delays'), 'utf8') : '')
         .toBe(attempts === 1 ? '' : '5\n10\n');

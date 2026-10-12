@@ -27,10 +27,46 @@ export function cloudflareAccount(env: NodeJS.ProcessEnv): string {
   return match[1]!;
 }
 
-export async function bundleRepositoryEdge(): Promise<string> {
-  const result = await build({ entryPoints: [SOURCE], bundle: true, format: 'esm', platform: 'neutral', target: 'es2022',
+/** One web-standard ES module, as Cloudflare runs it. */
+export async function bundleWorker(source: string): Promise<string> {
+  const result = await build({ entryPoints: [source], bundle: true, format: 'esm', platform: 'neutral', target: 'es2022',
     write: false, minify: false, logLevel: 'silent' });
   return result.outputFiles[0]!.text;
+}
+
+export function bundleRepositoryEdge(): Promise<string> {
+  return bundleWorker(SOURCE);
+}
+
+export type WorkerBinding = { type: 'plain_text' | 'secret_text'; name: string; text: string };
+
+/** Cloudflare's Workers API for one account, with errors that say which
+ * permission a refused token lacks. */
+export function workersApi(apiToken: string, accountId: string, fetcher: typeof fetch = fetch) {
+  const account = `${API}/accounts/${accountId}/workers`;
+  const call = async <T>(method: string, url: string, body?: FormData | object): Promise<T> => {
+    const json = body !== undefined && !(body instanceof FormData);
+    const response = await fetcher(url, { method, headers: { authorization: `Bearer ${apiToken}`,
+      ...(json ? { 'content-type': 'application/json' } : {}) }, ...(body === undefined ? {} : { body: json ? JSON.stringify(body) : body as FormData }) });
+    const reply = await response.json().catch(() => ({})) as { success?: boolean; result?: T; errors?: Array<{ code?: number; message?: string }> };
+    if (!response.ok || reply.success === false) {
+      const reason = reply.errors?.map((error) => `${error.message ?? 'error'}${error.code ? ` (${error.code})` : ''}`).join('; ') || `HTTP ${response.status}`;
+      throw new Error(`Cloudflare refused ${method} ${url.slice(API.length)}: ${reason}${response.status === 403
+        ? '. The API token needs Workers Scripts: Edit on this account' : ''}`);
+    }
+    return reply.result as T;
+  };
+  return {
+    account, call,
+    /** Replace the script `name` with this module and these bindings (secrets included). */
+    upload: async (name: string, module: string, bindings: WorkerBinding[]) => {
+      const form = new FormData();
+      form.set('metadata', new Blob([JSON.stringify({ main_module: 'worker.js', compatibility_date: COMPATIBILITY_DATE, bindings })],
+        { type: 'application/json' }));
+      form.set('worker.js', new Blob([module], { type: 'application/javascript+module' }), 'worker.js');
+      await call('PUT', `${account}/scripts/${name}`, form);
+    },
+  };
 }
 
 export interface EdgeDeployment {
@@ -50,28 +86,9 @@ export interface EdgeDeployment {
 export async function deployRepositoryEdge(options: EdgeDeployment): Promise<string> {
   const fetcher = options.fetch ?? fetch;
   const script = options.script ?? EDGE_SCRIPT;
-  const account = `${API}/accounts/${options.accountId}/workers`;
-  const call = async <T>(method: string, url: string, body?: FormData | object): Promise<T> => {
-    const json = body !== undefined && !(body instanceof FormData);
-    const response = await fetcher(url, { method, headers: { authorization: `Bearer ${options.apiToken}`,
-      ...(json ? { 'content-type': 'application/json' } : {}) }, ...(body === undefined ? {} : { body: json ? JSON.stringify(body) : body as FormData }) });
-    const reply = await response.json().catch(() => ({})) as { success?: boolean; result?: T; errors?: Array<{ code?: number; message?: string }> };
-    if (!response.ok || reply.success === false) {
-      const reason = reply.errors?.map((error) => `${error.message ?? 'error'}${error.code ? ` (${error.code})` : ''}`).join('; ') || `HTTP ${response.status}`;
-      throw new Error(`Cloudflare refused ${method} ${url.slice(API.length)}: ${reason}${response.status === 403
-        ? '. The API token needs Workers Scripts: Edit on this account' : ''}`);
-    }
-    return reply.result as T;
-  };
-
-  const form = new FormData();
-  form.set('metadata', new Blob([JSON.stringify({
-    main_module: 'worker.js',
-    compatibility_date: COMPATIBILITY_DATE,
-    bindings: [{ type: 'plain_text', name: 'ORIGIN', text: options.origin.replace(/\/+$/, '') }],
-  })], { type: 'application/json' }));
-  form.set('worker.js', new Blob([await bundleRepositoryEdge()], { type: 'application/javascript+module' }), 'worker.js');
-  await call('PUT', `${account}/scripts/${script}`, form);
+  const { account, call, upload } = workersApi(options.apiToken, options.accountId, fetcher);
+  await upload(script, await bundleRepositoryEdge(),
+    [{ type: 'plain_text', name: 'ORIGIN', text: options.origin.replace(/\/+$/, '') }]);
 
   const subdomain = (await call<{ subdomain?: string } | null>('GET', `${account}/subdomain`).catch((error: Error) => {
     if (/subdomain|10007/i.test(error.message)) return null;

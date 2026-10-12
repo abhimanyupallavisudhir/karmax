@@ -54,9 +54,8 @@ it('resets a fork’s base branch when its source becomes a dependency', async (
     const base = page.locator('#tf-body [data-field="base"]');
     const dependency = page.locator('#tf-body .af-resume-add-dependency');
     const chips = page.locator('#dep-chips [data-depid]');
-    await expect.poll(() => base.inputValue()).toBe('tavya/source');
-
-    await dependency.check();
+    // An unfinished source is a dependency by default, so the fork starts where it lands.
+    await expect.poll(() => dependency.isChecked()).toBe(true);
     expect(await chips.count()).toBe(1);
     expect(await base.inputValue()).toBe('main');
     // Dropping the dependency (here from its chip) restores the fork's branch.

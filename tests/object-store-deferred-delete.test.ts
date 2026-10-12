@@ -15,7 +15,8 @@ class MemoryObjects implements ObjectStore {
   attempts: Array<{ key: string; timeoutMs?: number }> = [];
   holdDelete?: Promise<void>;
   onDelete?: () => void;
-  async put(key: string, data: Buffer) { this.objects.set(key, data); }
+  onPut?: (key: string) => Promise<void>;
+  async put(key: string, data: Buffer) { await this.onPut?.(key); this.objects.set(key, data); }
   async get(key: string) {
     const data = this.objects.get(key);
     if (!data) throw new Error(`missing ${key}`);
@@ -38,7 +39,8 @@ describe('delayed deletion wrapper', () => {
     const inner = Object.assign(new MemoryObjects(), {
       presign: vi.fn(async (method: string, key: string, seconds: number) => `https://s/${method}/${key}/${seconds}`),
       head: vi.fn(async () => ({ bytes: 3, etag: 'e' })) });
-    const wrapped = new DeferredDeleteObjectStore(inner, {} as Store, { delayMs: DAY });
+    const pending = { recordPendingObjectWrite: vi.fn(async () => undefined) } as unknown as Store;
+    const wrapped = new DeferredDeleteObjectStore(inner, pending, { delayMs: DAY });
     expect(await wrapped.presign!('PUT', 'k', 60)).toBe('https://s/PUT/k/60');
     expect(await wrapped.head!('k')).toEqual({ bytes: 3, etag: 'e' });
   });
@@ -92,6 +94,50 @@ describe.each(targets)('delayed deletion of managed objects (%s)', (target) => {
     expect(await objects.purgeDue()).toEqual({ purged: 1, failed: 0 });
     expect(inner.deletes).toEqual(['checkpoints/o/p/w/c1.bin']);
     expect(await store.objectTombstone('checkpoints/o/p/w/c1.bin')).toBeUndefined();
+  });
+
+  // Every write is recorded before its bytes reach the store: an upload whose
+  // record never follows (a crash, an edge upload whose `stored` never came)
+  // is then found and deleted (store/object-reconciliation.ts), not left behind.
+  it('records every write as pending before its bytes reach the store, a presigned upload too', async () => {
+    const store = await openStore();
+    const inner = Object.assign(new MemoryObjects(), {
+      presign: vi.fn(async (method: string, key: string) => `https://s/${method}/${key}`) });
+    let now = 5_000;
+    const objects = new DeferredDeleteObjectStore(inner, store, { delayMs: 30 * DAY, now: () => now });
+    const seen: Array<number | undefined> = [];
+    inner.onPut = async (key) => { seen.push(await store.pendingObjectWrite(key)); };
+    await objects.put('checkpoints/o/p/w/c1.bin', Buffer.from('state'));
+    expect(seen).toEqual([5_000]);
+    now = 6_000;
+    await objects.presign!('PUT', 'resource-repositories/a/storage-managed-o/data/ab', 60);
+    expect(await store.pendingObjectWrite('resource-repositories/a/storage-managed-o/data/ab')).toBe(6_000);
+    // Reads are not writes.
+    await objects.presign!('GET', 'artifacts/o/p/t/x', 60);
+    expect(await store.pendingObjectWrite('artifacts/o/p/t/x')).toBeUndefined();
+    expect((await store.pendingObjectWrites(Number.MAX_SAFE_INTEGER, 10)).map((write) => write.key))
+      .toEqual(['checkpoints/o/p/w/c1.bin', 'resource-repositories/a/storage-managed-o/data/ab']);
+  });
+
+  it('never purges an object a record still names, of any family', async () => {
+    const { store, inner, objects, advance } = await setup();
+    const repository = 'resource-repositories/att/storage-managed-org/data/' + 'a'.repeat(64);
+    await store.recordRepositoryFile({ repository: 'att@storage-managed-org', attachmentId: 'att', organizationId: 'org',
+      storageLocationId: 'storage-managed-org', kind: 'data', name: 'a'.repeat(64), bytes: 5 });
+    const config = 'resource-repositories/att/storage-managed-org/config';
+    await store.recordRepositoryFile({ repository: 'att@storage-managed-org', attachmentId: 'att', organizationId: 'org',
+      storageLocationId: 'storage-managed-org', kind: 'config', name: 'config', bytes: 5 });
+    const pruned = 'resource-repositories/att/storage-managed-org/data/' + 'b'.repeat(64);
+    const probe = '.karmax-connection-test/0123';
+    const imported = 'conversation-imports/proj/one.json';
+    for (const key of [repository, config, pruned, probe, imported]) { await objects.put(key, Buffer.from('bytes')); await objects.delete(key); }
+    advance(31 * DAY);
+    expect(await objects.purgeDue()).toEqual({ purged: 3, failed: 0 });
+    // The database names these, so their objects stay and their tombstones go.
+    expect([...inner.objects.keys()].sort()).toEqual([config, repository].sort());
+    expect(await store.objectTombstone(repository)).toBeUndefined();
+    expect(await store.objectKeyReferenced(pruned)).toBe(false);
+    expect(await store.objectKeyReferenced(repository)).toBe(true);
   });
 
   // Resource chunks are content-addressed: a chunk released to zero references

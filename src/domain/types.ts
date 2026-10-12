@@ -356,7 +356,17 @@ export interface WorldProviderConnection {
     desktopImage?: string;
     apiUrl?: string;
     target?: string;
+    /** VM providers: where machines run (a Fly region, a Hetzner location). */
+    region?: string;
+    /** Fly.io: the organization slug machines are created in. */
+    organization?: string;
+    /** Per-machine limits entered in Advanced, for what the provider's API
+     * cannot tell (wiki features/computers). Disk is total GB. */
+    limits?: { cpu?: number; memoryMb?: number; diskGb?: number };
   };
+  /** What the provider account itself said it allows, from a probe or a
+   * refused build (src/world/provider-limits.ts). */
+  measuredLimits?: import('./computer-limits.js').ComputerLimits;
   enabled: boolean;
   status: 'untested' | 'ready' | 'error';
   lastCheckedAt?: number;
@@ -372,7 +382,7 @@ export interface UsageEvent {
   taskId?: string;
   worldId?: string;
   provider: string;
-  kind: 'world.active' | 'checkpoint.storage' | 'resource.storage' | 'preview.active' | 'agent.request' | 'agent.tokens' | 'agent.cost';
+  kind: 'world.active' | 'world.disk' | 'checkpoint.storage' | 'resource.storage' | 'preview.active' | 'agent.request' | 'agent.tokens' | 'agent.cost';
   /** Who pays the upstream bill. `managed` is installation-funded and is
    * disabled in hosted mode until an owner sets an explicit spend cap. */
   fundingSource?: 'managed' | 'byok' | 'customer';
@@ -650,6 +660,11 @@ export interface ResourceAttachment {
   currentRevisionId?: string;
   publish: ResourcePublishPolicy;
   enabled: boolean;
+  /** A folder of data whose worlds get its listing but not its bytes: the
+   * agent fetches the top-level folders it needs (`tavya-data get`). Its
+   * versions are saved one top-level folder at a time, so what a world never
+   * fetched is never touched (wiki features/resource-storage). */
+  onDemand?: boolean;
   createdAt: number;
   updatedAt: number;
 }
@@ -1781,6 +1796,11 @@ export interface TaskView {
    * on the one it was made on: it moves when the world parks (wiki
    * features/computers). Enriched by the API. */
   computerChange?: { from: { cpu?: number; memoryMb?: number; diskGb?: number }; to: { cpu?: number; memoryMb?: number; diskGb?: number } };
+  /** The task stopped because its computer's disk was full (wiki features/computers). */
+  outOfDisk?: boolean;
+  /** The task computer's last measured usage, and the largest disk its provider
+   * account allows (`maxDiskGb`); added by the API from the world's readings. */
+  usage?: { at: number; provider?: string; disk?: { usedMb: number; totalMb: number }; memory?: { usedMb: number; totalMb: number }; maxDiskGb?: number };
   updatedAt: number;
 }
 

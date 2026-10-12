@@ -11,6 +11,8 @@ export interface ObjectStore {
    * Karmax. Absent when the store has no URL of its own (local disk). */
   presign?(method: 'PUT' | 'GET', key: string, seconds: number, options?: PresignOptions): Promise<string>;
   head?(key: string, options?: ObjectRequestOptions): Promise<ObjectInfo | undefined>;
+  /** Every object under `prefix`. */
+  list?(prefix?: string): AsyncIterable<ListedObject>;
 }
 
 export interface ObjectRequestOptions {
@@ -50,6 +52,8 @@ export async function verifiesChecksums(objects: ObjectStore, fetcher: typeof fe
 
 /** What `head` and `list` report: the stored size and the ETag without quotes. */
 export interface ObjectInfo { bytes: number; etag: string }
+/** A listed object; `modifiedAt` (ms) is when it was last written. */
+export interface ListedObject extends ObjectInfo { key: string; modifiedAt?: number }
 
 export class LocalObjectStore implements ObjectStore {
   constructor(private root: string) { fs.mkdirSync(root, { recursive: true }); }
@@ -64,6 +68,24 @@ export class LocalObjectStore implements ObjectStore {
 
   async get(key: string): Promise<Buffer> { return fs.promises.readFile(this.file(key)); }
   async delete(key: string): Promise<void> { await fs.promises.rm(this.file(key), { force: true }); }
+
+  /** Every file under the root, keyed by its path; an unfinished write
+   * (`<key>.<12 hex>.tmp`) is not an object yet. No ETag is computed. */
+  async *list(prefix = ''): AsyncGenerator<ListedObject> {
+    const walk = async function* (root: string, directory: string): AsyncGenerator<ListedObject> {
+      const entries = await fs.promises.readdir(directory, { withFileTypes: true }).catch(() => []);
+      entries.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+      for (const entry of entries) {
+        const file = path.join(directory, entry.name);
+        if (entry.isDirectory()) yield* walk(root, file);
+        else if (entry.isFile() && !/\.[0-9a-f]{12}\.tmp$/.test(entry.name)) {
+          const stat = await fs.promises.stat(file).catch(() => undefined);
+          if (stat) yield { key: path.relative(root, file).split(path.sep).join('/'), bytes: stat.size, etag: '', modifiedAt: stat.mtimeMs };
+        }
+      }
+    };
+    for await (const object of walk(this.root, this.root)) if (object.key.startsWith(prefix)) yield object;
+  }
 
   private file(key: string): string {
     if (!/^[a-zA-Z0-9][a-zA-Z0-9/_.-]*$/.test(key) || key.includes('..')) throw new Error('invalid object key');
@@ -141,13 +163,15 @@ export class S3ObjectStore implements ObjectStore {
   }
 
   /** Every object under `prefix`, a ListObjectsV2 page at a time. */
-  async *list(prefix = ''): AsyncGenerator<ObjectInfo & { key: string }> {
+  async *list(prefix = ''): AsyncGenerator<ListedObject> {
     let token: string | undefined;
     do {
       const query: Record<string, string> = { 'list-type': '2', prefix, ...(token ? { 'continuation-token': token } : {}) };
       const xml = await (await this.request('GET', '', { query })).text();
       for (const [, entry] of xml.matchAll(/<Contents>([\s\S]*?)<\/Contents>/g)) {
-        yield { key: xmlText(entry!, 'Key'), bytes: Number(xmlText(entry!, 'Size')), etag: unquote(xmlText(entry!, 'ETag')) };
+        const modifiedAt = Date.parse(xmlText(entry!, 'LastModified'));
+        yield { key: xmlText(entry!, 'Key'), bytes: Number(xmlText(entry!, 'Size')), etag: unquote(xmlText(entry!, 'ETag')),
+          ...(Number.isFinite(modifiedAt) ? { modifiedAt } : {}) };
       }
       token = xmlText(xml, 'IsTruncated') === 'true' ? xmlText(xml, 'NextContinuationToken') : undefined;
     } while (token);
