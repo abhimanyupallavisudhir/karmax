@@ -369,6 +369,7 @@ export class Store {
     (await this.migrate());
     (await this.migrateData());
     (await this.migrateConversations());
+    (await this.migrateSavedViews());
     (await this.paymentTransaction(async () => {
       if ((await this.kvGet('migration:unique-card-names'))) return;
       const rows = (await this.db.prepare(`SELECT c.id, c.label, c.scope, c.scopeId, p.organizationId
@@ -409,6 +410,29 @@ export class Store {
       }
     }
   
+    });
+  }
+
+  /** The task list used to hide archived tasks unless a query mentioned them;
+   * now a query means what it says (the Active view is `-is:archived`). Views
+   * saved under the old rule get the clause they relied on, once. */
+  private async migrateSavedViews(force = false): Promise<void> {
+    return this.db.transaction(async () => {
+    (await this.db.lock('store-migration'));
+    const marker = 'migration:saved-views-explicit-archived';
+    if (!force && await this.kvGet(marker)) return;
+    const rows = (await this.db.prepare('SELECT id, query FROM saved_views').all()) as Array<{ id: string; query: string }>;
+    for (const row of rows) {
+      let query: TaskQuery;
+      try { query = JSON.parse(row.query) as TaskQuery; } catch { continue; }
+      if (!query || typeof query !== 'object') continue;
+      const filters = Array.isArray(query.filters) ? query.filters : [];
+      if (filters.some((c) => (c?.field === 'is' || c?.field === 'has')
+        && Array.isArray(c.values) && c.values.some((v) => String(v).includes('archived')))) continue;
+      const next = { ...query, filters: [...filters, { field: 'is', op: 'is', values: ['archived'], negate: true }] };
+      (await this.db.prepare('UPDATE saved_views SET query=? WHERE id=? AND query=?').run(JSON.stringify(next), row.id, row.query));
+    }
+    (await this.kvSet(marker, '1'));
     });
   }
 
@@ -9842,6 +9866,7 @@ export class Store {
     (await this.migrate());
     (await this.migrateData(true));
     (await this.migrateConversations());
+    (await this.migrateSavedViews(true));
   
     });
   }

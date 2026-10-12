@@ -109,7 +109,7 @@ eq(homeRoute(), '/acme', 'the organization home is the bare organization path (i
 eq(homeRoute(organizationById('org_globex'), ''), '/globex?q=', '"All" on the home is spelled out as an empty query');
 eq(homeRoute(organizationById('org_globex'), 'project:mobile-app'), '/globex?q=project:mobile-app', 'a home query rides in ?q=');
 eq(projectRoute('P1', 'tasks', ''), '/acme/website-redesign?q=', '"All" on a project list is bookmarkable');
-eq(projectRoute('P1', 'tasks', 'for:me'), '/acme/website-redesign', 'the default for:me list is the bare path');
+eq(projectRoute('P1', 'tasks', 'for:me -is:archived'), '/acme/website-redesign', 'the default for:me list is the bare path');
 S.organizationId = 'org_globex';
 eq(profileRoute(), '/profile', 'profile route is stable when a different organization is selected');
 const organizationSwitcher = { value: 'org_acme', _sync() { this.value = currentOrg().id; } };
@@ -122,34 +122,34 @@ S.organizationId = 'org_acme';
 eq(parseRoute('/acme/insights'), { name: 'global', org: 'acme', tab: 'insights' }, 'parse /<org>/insights');
 eq(parseRoute('/acme/dashboard'), { name: 'global', org: 'acme', tab: 'insights', legacy: true }, 'old /<org>/dashboard bookmarks land on insights');
 eq(parseRoute('/acme/settings'), { name: 'global', org: 'acme', tab: 'organization' }, 'parse /<org>/settings');
-eq(parseRoute('/acme/inbox'), { name: 'global', tab: 'inbox', q: 'for:me', legacy: true }, 'an organization\'s inbox is now the bell\'s page');
-eq(parseRoute('/acme/inbox/review-requested'), { name: 'global', tab: 'inbox', q: 'for:me', legacy: true },
+eq(parseRoute('/acme/inbox'), { name: 'global', tab: 'inbox', q: 'for:me -is:archived', legacy: true }, 'an organization\'s inbox is now the bell\'s page');
+eq(parseRoute('/acme/inbox/review-requested'), { name: 'global', tab: 'inbox', q: 'for:me -is:archived', legacy: true },
   'so are its old per-kind tabs');
 eq(parseRoute('/profile'), { name: 'profile' }, 'parse the global user profile');
 eq(parseRoute('/installation'), { name: 'installation' }, 'parse the operator-owned installation page');
 eq(parseRoute('/globex/profile'), { name: 'profile', legacy: true },
   'an old org-prefixed profile URL canonicalises without selecting that organization');
-eq(parseRoute('/acme'), { name: 'global', org: 'acme', tab: 'home', q: 'for:me' }, 'parse bare /<org> as the organization home, for:me by default');
+eq(parseRoute('/acme'), { name: 'global', org: 'acme', tab: 'home', q: 'for:me -is:archived' }, 'parse bare /<org> as the organization home, for:me by default');
 eq(parseRoute('/acme?q='), { name: 'global', org: 'acme', tab: 'home', q: '' }, 'an empty ?q= is the home\'s "All" view');
 eq(parseRoute('/acme?q=project:app+status:waiting').q, 'project:app status:waiting', 'the home carries its query');
 eq(parseRoute('/acme/website-redesign'),
-  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'tasks', taskKey: null, taskTab: null, q: 'for:me' },
+  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'tasks', taskKey: null, taskTab: null, q: 'for:me -is:archived' },
   'parse /<org>/<project> as the tasks tab');
 eq(parseRoute('/acme/website-redesign/queue'),
-  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'queue', taskKey: null, taskTab: null, q: 'for:me' },
+  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'queue', taskKey: null, taskTab: null, q: 'for:me -is:archived' },
   'parse a project tab');
 eq(parseRoute('/acme/website-redesign/activity'),
-  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'activity', taskKey: null, taskTab: null, q: 'for:me' },
+  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'activity', taskKey: null, taskTab: null, q: 'for:me -is:archived' },
   'the hidden Activity debugger remains reachable by direct URL');
 eq(parseRoute('/acme/website-redesign/tasks/42'),
-  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'tasks', taskKey: '42', taskTab: null, q: 'for:me' },
+  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'tasks', taskKey: '42', taskTab: null, q: 'for:me -is:archived' },
   'parse a task permalink');
 eq(parseRoute('/acme/website-redesign/tasks/42/file?path=%2Fworkspace%2Fapp%2Fmain.ts&line=17'),
-  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'tasks', taskKey: '42', taskTab: null, q: 'for:me',
+  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'tasks', taskKey: '42', taskTab: null, q: 'for:me -is:archived',
     taskFile: { path: '/workspace/app/main.ts', line: 17 } },
   'parse a task-scoped file handoff permalink');
 eq(parseRoute('/acme/website-redesign/tasks/42/checkin'),
-  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'tasks', taskKey: '42', taskTab: 'checkin', q: 'for:me' },
+  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'tasks', taskKey: '42', taskTab: 'checkin', q: 'for:me -is:archived' },
   'parse a task permalink pinned to a tab');
 
 // ── Wiki routes (org-level bottom-left link + project tab) ────────────────────
@@ -165,7 +165,7 @@ eq(parseRoute('/acme/website-redesign/wiki?branch=feature%2Fx').wikiView, 'branc
 eq(parseRoute('/acme/website-redesign/wiki').wikiView, undefined, 'the default view carries no selector');
 eq(parseRoute('/acme/website-redesign/queue?task=367').wikiView, undefined, 'only the wiki reads a view');
 eq(parseRoute('/acme/website-redesign/wiki'),
-  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'wiki', taskKey: null, taskTab: null, q: 'for:me' },
+  { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'wiki', taskKey: null, taskTab: null, q: 'for:me -is:archived' },
   'parse a project wiki tab');
 
 // ── Round-trip: build → parse → resolve ───────────────────────────────────────
@@ -194,11 +194,11 @@ eq(organizationBySlug('acme')?.id, 'org_acme', 'a current slug wins');
 eq(parseRoute('/dashboard'), { name: 'global', tab: 'insights', legacy: true }, 'legacy /dashboard');
 eq(parseRoute('/organization'), { name: 'global', tab: 'organization', legacy: true }, 'legacy /organization');
 eq(parseRoute('/settings'), { name: 'global', tab: 'organization', legacy: true }, 'legacy /settings alias');
-eq(parseRoute('/inbox'), { name: 'global', tab: 'inbox', q: 'for:me' }, 'the bell\'s page, above every organization, opens on for:me');
+eq(parseRoute('/inbox'), { name: 'global', tab: 'inbox', q: 'for:me -is:archived' }, 'the bell\'s page, above every organization, opens on for:me');
 eq(parseRoute('/inbox?q='), { name: 'global', tab: 'inbox', q: '' }, 'its query rides in ?q= like any list');
-eq(parseRoute('/inbox/mentioned'), { name: 'global', tab: 'inbox', q: 'for:me', legacy: true }, 'old per-kind tabs land on it');
+eq(parseRoute('/inbox/mentioned'), { name: 'global', tab: 'inbox', q: 'for:me -is:archived', legacy: true }, 'old per-kind tabs land on it');
 eq(parseRoute('/projects/website-redesign/tasks/42'),
-  { name: 'project', slug: 'website-redesign', tab: 'tasks', taskKey: '42', taskTab: null, q: 'for:me', legacy: true },
+  { name: 'project', slug: 'website-redesign', tab: 'tasks', taskKey: '42', taskTab: null, q: 'for:me -is:archived', legacy: true },
   'legacy /projects/:name/tasks/:num');
 eq(parseRoute('/invite'), { name: 'invite' }, 'invite stays a top-level route');
 eq(parseRoute('/'), { name: 'home' }, 'root is home');

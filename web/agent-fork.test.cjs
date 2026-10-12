@@ -208,6 +208,7 @@ global.readModelField = () => { const [provider, model = '', effort = ''] = ref.
 global.Event = class Event { constructor(type) { this.type = type; } };
 let picker;
 global.openTaskPicker = (config) => { picker = config; };
+global.ACTIVE_VIEW_QUERY = '-is:archived';
 eval(extractFn('wireAgentBox'));
 
 wireAgentBox(box);

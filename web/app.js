@@ -332,8 +332,8 @@ function taskRecord(id) {
 //   /<org>/<project>                     → task list (also /queue, /activity, /wiki, /settings)
 //   /<org>/<project>/tasks/:num          → the task's own page (permalink)
 //   /<org>/<project>/tasks/:num/:tab     → the task page pinned to one of its tabs
-// A task list's query rides in ?q=; no ?q means the default `for:me`, and an
-// empty ?q= is "All".
+// A task list's query rides in ?q=; no ?q means the default `for:me -is:archived`,
+// and an empty ?q= is every task.
 // Pre-organization URLs (/dashboard, /organization, /projects/:name/…) are still
 // parsed and then canonicalised to the org form.
 function slugify(s) {
@@ -416,7 +416,7 @@ function orgBase(org = currentOrg()) { return org ? `/${orgSlug(org)}` : ''; }
 const PROJECT_SCOPED_TABS = ['tasks', 'queue', 'activity', 'wiki', 'avatars', 'settings'];
 const PROJECT_TAB_COMMANDS = { tasks: 'nav.tasks', queue: 'nav.queue', wiki: 'nav.wiki', settings: 'nav.settings' };
 // The query a task list opens with: what needs the signed-in person.
-const DEFAULT_LIST_QUERY = 'for:me';
+const DEFAULT_LIST_QUERY = 'for:me -is:archived';
 // Second-segment words that name an organization-level view rather than a project.
 const ORG_VIEWS = { insights: 'insights', settings: 'organization', inbox: 'inbox', wiki: 'orgwiki' };
 
@@ -519,8 +519,8 @@ function projectRoute(pid, tab = 'tasks', q = pid === S.searchScope ? S.search :
   return listRoute(base, q);
 }
 
-// A task list's URL: the default query (`for:me`) is the bare path, anything
-// else — "All" (the empty query) included — is spelled out in ?q=.
+// A task list's URL: the default query (`for:me -is:archived`) is the bare path,
+// anything else — the empty query (every task) included — is spelled out in ?q=.
 function listRoute(base, q) {
   return q === DEFAULT_LIST_QUERY ? base : `${base}?q=${encodeQuery(q || '')}`;
 }
@@ -4506,7 +4506,7 @@ async function runSearch() {
   const scope = scopeOf();
   if (S.tab === 'home' ? !organizationId : S.tab !== 'inbox' && !projectId) return false;
   const isCurrent = () => scopeOf() === scope;
-  const q = effectiveQuery(S.search); // adds the default -is:archived unless overridden
+  const q = effectiveQuery(S.search); // adds the default -is:run -is:subtask unless overridden
   const epoch = S.searchEpoch = (S.searchEpoch || 0) + 1;
   S.searchPending = true;
   try {
@@ -5888,24 +5888,25 @@ function taskMatches(t, q) {
   return s.split(/\s+/).every((term) => !term || hay.includes(term));
 }
 
-// The default list transparently hides three kinds of noise unless the query opts in:
-// archived tasks (`-is:archived`), the auto-spawned *runs* of a repeatable series
-// (`-is:run`), and delegated *sub-tasks* (`-is:subtask`) — a sub-task lives under its
-// parent's detail page, not as a sibling at the top level, so a fan-out of children
-// doesn't flood the list. Its parent still shows, and you drill into children with
-// `is:subtask` (or the Sub-tasks/Repeatable/Archived views). These are therefore just
-// facets, not toggles. The clean `S.search` stays in the box; only the evaluated query
-// carries the defaults. If the query already mentions a facet, we leave it.
-// The task-picker overlay passes its own facet list (e.g. the fork search keeps archived).
+// The default list transparently hides two kinds of nesting unless the query opts in:
+// the auto-spawned *runs* of a repeatable series (`-is:run`), and delegated *sub-tasks*
+// (`-is:subtask`) — a sub-task lives under its parent's detail page, not as a sibling
+// at the top level, so a fan-out of children doesn't flood the list. Its parent still
+// shows, and you drill into children with `is:subtask` (or the Repeatable view). These
+// are therefore just facets, not toggles. The clean `S.search` stays in the box; only
+// the evaluated query carries the defaults. If the query already mentions a facet, we
+// leave it. Archived tasks are not hidden implicitly: the views that leave them out say
+// `-is:archived`, so an empty query is every task. The task-picker overlay passes its
+// own facet list.
 function queryMentionsFacet(q, facet) { return new RegExp(`(^|\\s)-?(is|has):[^\\s]*${facet}`, 'i').test(q || ''); }
 // A `for:` query asks what waits on a person, wherever it sits: a sub-task or a
 // run that needs a human routes to them, so those facets are not hidden.
 function queryNamesPerson(q) { return /(^|\s)for:\S/i.test(q || ''); }
 function listShowsNested(q, facet) { return queryMentionsFacet(q, facet) || queryNamesPerson(q); }
-function effectiveQuery(q, facets = ['archived', 'run', 'subtask']) {
+function effectiveQuery(q, facets = ['run', 'subtask']) {
   let s = (q || '').trim();
   for (const facet of facets)
-    if (!queryMentionsFacet(s, facet) && !(facet !== 'archived' && queryNamesPerson(s))) s = `${s} -is:${facet}`.trim();
+    if (!queryMentionsFacet(s, facet) && !queryNamesPerson(s)) s = `${s} -is:${facet}`.trim();
   return s;
 }
 
@@ -5913,10 +5914,10 @@ function effectiveQuery(q, facets = ['archived', 'run', 'subtask']) {
 // first-class instead of buried. Each is just a query string; they
 // can't be deleted (no ✕). Keep the queries in step with the facets in src/domain/search.ts.
 const BUILTIN_VIEWS = [
-  { id: 'builtin:sectioned-type', name: 'Sectioned (type)', icon: '§', query: 'group:tag-type' },
-  { id: 'builtin:sectioned-topic', name: 'Sectioned (topic)', icon: '§', query: 'group:tag-topic' },
-  { id: 'builtin:scheduled', name: 'Scheduled', icon: '⏰', query: 'is:scheduled sort:nextRun-asc' },
-  { id: 'builtin:series', name: 'Repeatable', icon: '🔁', query: 'is:series' },
+  { id: 'builtin:sectioned-type', name: 'Sectioned (type)', icon: '§', query: '-is:archived group:tag-type' },
+  { id: 'builtin:sectioned-topic', name: 'Sectioned (topic)', icon: '§', query: '-is:archived group:tag-topic' },
+  { id: 'builtin:scheduled', name: 'Scheduled', icon: '⏰', query: 'is:scheduled -is:archived sort:nextRun-asc' },
+  { id: 'builtin:series', name: 'Repeatable', icon: '🔁', query: 'is:series -is:archived' },
   { id: 'builtin:archived', name: 'Archived', icon: '🗄', query: 'is:archived' },
 ];
 
@@ -5924,14 +5925,15 @@ const BUILTIN_VIEWS = [
 // there is no separate "selected view" to keep in sync, and a pasted or reloaded
 // ?q= URL lights the right chip for free. Comparison is on the canonical form, so
 // a view still matches when its query was re-spelled by the toolbar or round-tripped
-// through the saved (structured) form. The empty query is the "All" chip; a query
-// that matches no view lights nothing — "no filter" and "a filter I haven't saved"
-// are different states, and only the first of them is All.
-const ALL_VIEW = '__all__'; // the chip standing for the empty (unfiltered) query
+// through the saved (structured) form. A query that matches no view lights nothing —
+// including the empty one, which is every task, archived ones too.
+const ACTIVE_VIEW_QUERY = '-is:archived';
+const ACTIVE_VIEW = '__active__'; // the chip for every task that isn't archived
 const FOR_ME_VIEW = '__for_me__'; // the default chip: what waits on you
 function viewIdForQuery(q) {
   const s = normalizeQuery(q);
-  if (!s) return ALL_VIEW;
+  if (!s) return null;
+  if (s === normalizeQuery(ACTIVE_VIEW_QUERY)) return ACTIVE_VIEW;
   if (s === normalizeQuery(DEFAULT_LIST_QUERY)) return FOR_ME_VIEW;
   return BUILTIN_VIEWS.find((v) => normalizeQuery(v.query) === s)?.id
     || (S.views || []).find((v) => normalizeQuery(stringifyQuery(v.query || {})) === s)?.id
@@ -5939,7 +5941,7 @@ function viewIdForQuery(q) {
 }
 
 // The saved-views switcher — every chip is a query. "For me" is the default, then
-// "All", the built-in starter views, and the project's saved views (each with a ✕
+// "Active", the built-in starter views, and the project's saved views (each with a ✕
 // to delete). Saved views belong to a project, so the organization home has none.
 function viewsBar() {
   const active = viewIdForQuery(S.search);
@@ -5954,7 +5956,7 @@ function viewsBar() {
     .join('');
   return `<div class="views-bar">
     <div class="view-chip ${active === FOR_ME_VIEW ? 'active' : ''}" data-view="${FOR_ME_VIEW}" role="button" tabindex="0" title="Waiting on you: reviews, questions, approvals, mentions — and your drafts">◉ For me</div>
-    <div class="view-chip ${active === ALL_VIEW ? 'active' : ''}" data-view="${ALL_VIEW}" role="button" tabindex="0">≡ All</div>
+    <div class="view-chip ${active === ACTIVE_VIEW ? 'active' : ''}" data-view="${ACTIVE_VIEW}" role="button" tabindex="0" title="${esc(ACTIVE_VIEW_QUERY)}">≡ Active</div>
     ${builtins}
     ${saved}
     ${home ? '' : '<div class="view-chip add" id="save-view" role="button" tabindex="0" title="Save the current query as a view">＋ Save view</div>'}
@@ -6075,8 +6077,8 @@ function tasksView() {
   const keepRun = listShowsNested(S.search, 'run');
   const keepSub = listShowsNested(S.search, 'subtask');
   const topLevel = (t) => (keepRun || !nestedRun(t)) && (keepSub || !t.parentTaskId);
-  // The server already applied the query (incl. the default -is:archived from effectiveQuery).
-  // Fallback (before the first result lands) filters client-side and drops archived to match.
+  // The server already applied the query. The fallback (before the first result lands)
+  // filters the open project's rows, which never include archived ones.
   // Before the first result the open project's rows are a fair preview of a text
   // search, but not of a structured one (for:, status:…) nor of the home's.
   const preview = !across && !/(^|\s)-?[\w.#-]+:/.test(S.search || '');
@@ -6594,12 +6596,12 @@ function pipelineLarge(v) {
 // ── task-organization control wiring (views bar + query toolbar + modals) ─────
 function wireOrgControls() {
   const main = $('#main');
-  // Saved-view chips: each selects a query; "All" is the default (empty) view.
+  // Saved-view chips: each selects a query.
   main.querySelectorAll('.view-chip[data-view]').forEach((el) =>
     el.addEventListener('click', (ev) => {
       if (ev.target.closest('[data-delview]')) return; // the ✕ handles itself
       const id = el.dataset.view;
-      if (id === ALL_VIEW) { setQuery(''); return; }
+      if (id === ACTIVE_VIEW) { setQuery(ACTIVE_VIEW_QUERY); return; }
       if (id === FOR_ME_VIEW) { setQuery(DEFAULT_LIST_QUERY); return; }
       const builtin = BUILTIN_VIEWS.find((x) => x.id === id);
       if (builtin) { setQuery(builtin.query); return; }
@@ -6739,13 +6741,13 @@ function openFilterPicker(fieldKey, onAdd) {
 // picks a task row; mode 'agent' picks an unambiguous session directly or shows
 // attempts with compact agent choices → onPick({ task, role, session }).
 // `defaults` are the facets hidden unless the query mentions them (the list's
-// transparent -is:archived -is:run treatment, parameterized per caller — the
-// fork search deliberately keeps archived tasks in).
+// transparent -is:run treatment, parameterized per caller); `query` is where the
+// search starts — the fork search deliberately keeps archived tasks in.
 // Forking may start from any project the organization can read: the agent
 // picker searches organization-wide, starting at `project:<this project> ` so
 // deleting that one token widens it (the trailing space lets typing go straight
 // on to the next clause).
-function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'run'], exclude, onPick }) {
+function openTaskPicker({ title, hint, mode = 'task', defaults = ['run'], query = '', exclude, onPick }) {
   const organizationWide = mode === 'agent' && !!S.organizationId;
   const ownProject = organizationWide ? projectById(S.projectId) : undefined;
   const root = $('#modal-root');
@@ -6770,19 +6772,19 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
   let closed = false;
   let selection = 0; // ignore agent lookups after closing, searching or choosing another task
   const close = () => { closed = true; selection++; host.remove(); };
-  let q = organizationWide && ownProject ? `project:${projectSlug(ownProject)} ` : '';
+  let q = organizationWide && ownProject ? `project:${projectSlug(ownProject)} ${query}` : query;
   let result = null; // last server evaluation
   let hi = 0; // roving highlight over pickable rows
   const sessions = new Map(); // taskId → [{ task: exact attempt, sessions: role→session }]
   const pending = new Map(); // share in-flight lookups on repeated clicks
   const expanded = new Set(); // taskIds whose attempts are shown
 
-  // View chips (All + built-ins + saved) and the toolbar re-render on every query
+  // View chips (Active + built-ins + saved) and the toolbar re-render on every query
   // change so their selected state tracks the picker's own query, not the list's.
   const paintControls = () => {
     const activeView = viewIdForQuery(q);
     $('#pk-views', host).innerHTML = [
-      `<div class="view-chip ${activeView === ALL_VIEW ? 'active' : ''}" data-pkview="${ALL_VIEW}">≡ All</div>`,
+      `<div class="view-chip ${activeView === ACTIVE_VIEW ? 'active' : ''}" data-pkview="${ACTIVE_VIEW}" title="${esc(ACTIVE_VIEW_QUERY)}">≡ Active</div>`,
       ...BUILTIN_VIEWS.map((v) => `<div class="view-chip builtin ${activeView === v.id ? 'active' : ''}" data-pkview="${v.id}" title="${esc(v.query)}">${esc(v.icon)} ${esc(v.name)}</div>`),
       ...S.views.map((v) => `<div class="view-chip ${activeView === v.id ? 'active' : ''}" data-pkview="${v.id}">${v.icon ? esc(v.icon) + ' ' : ''}${esc(v.name)}</div>`),
     ].join('');
@@ -6791,7 +6793,7 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
         const id = el.dataset.pkview;
         const bv = BUILTIN_VIEWS.find((x) => x.id === id);
         const sv = S.views.find((x) => x.id === id);
-        setQ(id === ALL_VIEW ? '' : bv ? bv.query : sv ? stringifyQuery(sv.query || {}) : '');
+        setQ(id === ACTIVE_VIEW ? ACTIVE_VIEW_QUERY : bv ? bv.query : sv ? stringifyQuery(sv.query || {}) : '');
       }),
     );
     $('#pk-toolbar', host).innerHTML = queryToolbarHtml(q, 'pk');
@@ -7567,7 +7569,8 @@ function wireDepPicker(values, selfId) {
   btn.addEventListener('click', () =>
     openTaskPicker({
       title: 'Add a dependency',
-      defaults: ['archived', 'run', 'series', 'draft'],
+      defaults: ['run', 'series', 'draft'],
+      query: `${ACTIVE_VIEW_QUERY} `,
       exclude: (t) => t.id === selfId || selectedDepIds().includes(t.id),
       onPick: (t) => { known.set(t.id, t); paint([...selectedDepIds(), t.id], true); },
     }),
