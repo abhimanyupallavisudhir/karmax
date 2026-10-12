@@ -11,6 +11,9 @@ export const STORAGE_POLICY = Object.freeze({
   /** Saved workspaces of done or cancelled tasks: their committed work is on
    * the task branch, so the uncommitted leftovers expire after this. */
   finishedTaskCheckpointMs: 30 * DAY,
+  /** Older versions of data in managed storage are deleted this long after a
+   * newer version replaced them, unless a task still uses them. */
+  olderVersionMs: 30 * DAY,
   /** A park's capture of a task's private data copy that nothing references
    * any more is deleted once it is this old (in-flight parks are younger). */
   unreferencedCheckpointRevisionMs: DAY,
@@ -42,7 +45,9 @@ export interface StorageContentsView {
    * nowhere): from the last reconciliation of the bucket. */
   pendingDeletion?: { bytes: number; until?: number; measuredAt: number };
   overQuota?: StorageOverQuotaView;
-  policy: { finishedTaskCheckpointDays: number; overQuotaDeletionDays: number };
+  policy: { finishedTaskCheckpointDays: number; overQuotaDeletionDays: number;
+    /** Hosted only: a private installation keeps every version. */
+    olderVersionDays?: number };
   projects: Array<{
     projectId: string;
     name: string;
@@ -71,13 +76,17 @@ export class ManagedStorageService {
     reconciler?: { run(now?: number): Promise<unknown>; report(): Promise<StorageReconciliation | undefined> };
   }) {}
 
-  async run(now = Date.now()): Promise<{ expiredCheckpoints: number; deletedRevisions: number; notices: number }> {
+  async run(now = Date.now()): Promise<{ expiredCheckpoints: number; deletedRevisions: number; expiredVersions: number; notices: number }> {
     const { store } = this.deps;
     const expiredCheckpoints = (await store.expireFinishedWorldCheckpoints(now - STORAGE_POLICY.finishedTaskCheckpointMs));
     if (expiredCheckpoints) await this.deps.checkpoints?.collectGarbage();
     let deletedRevisions = 0;
     for (const revision of (await store.unreferencedCheckpointRevisions(now - STORAGE_POLICY.unreferencedCheckpointRevisionMs)))
       if ((await this.deps.resources.deleteRevision(revision.id))) deletedRevisions++;
+    // Hosted policy: a private installation keeps every version.
+    let expiredVersions = 0;
+    if (store.hosted) for (const revision of (await store.expiredResourceVersions(now - STORAGE_POLICY.olderVersionMs)))
+      if ((await this.deps.resources.deleteRevision(revision.id))) expiredVersions++;
     // Forget unused restic snapshots, prune, and convert pre-restic versions,
     // before usage is measured against quotas.
     await this.deps.resources.maintainRepositories(now);
@@ -87,7 +96,7 @@ export class ManagedStorageService {
     let notices = 0;
     if (store.hosted) for (const organization of (await store.listOrganizations()))
       notices += (await this.enforceQuota(organization.id, now));
-    return { expiredCheckpoints, deletedRevisions, notices };
+    return { expiredCheckpoints, deletedRevisions, expiredVersions, notices };
   }
 
   /** The over-quota policy for one organization: record when it went over,
@@ -205,7 +214,8 @@ export class ManagedStorageService {
         ...(held.pendingDeleteUntil ? { until: held.pendingDeleteUntil } : {}), measuredAt: reconciled!.at } } : {}),
       ...(state ? { overQuota: { since: state.since, deleteAt: state.since + STORAGE_POLICY.overQuotaDeletionMs } } : {}),
       policy: { finishedTaskCheckpointDays: STORAGE_POLICY.finishedTaskCheckpointMs / DAY,
-        overQuotaDeletionDays: STORAGE_POLICY.overQuotaDeletionMs / DAY },
+        overQuotaDeletionDays: STORAGE_POLICY.overQuotaDeletionMs / DAY,
+        ...(store.hosted ? { olderVersionDays: STORAGE_POLICY.olderVersionMs / DAY } : {}) },
       projects: [...projects.values()].sort((a, b) => b.bytes - a.bytes),
     };
   }
