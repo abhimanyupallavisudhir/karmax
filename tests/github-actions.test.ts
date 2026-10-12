@@ -153,6 +153,41 @@ describe('GitHub Actions API', () => {
     expect(classifyGithubActionsFailure(value).disposition).toBe('revision');
   });
 
+  // CI #1711/#1716/#1720 (2026-10-09): Docker Hub refused the shards' postgres
+  // service image, so every shard failed at GitHub's own "Initialize
+  // containers" before a test ran, and the aggregate gate failed after them.
+  // Each sent Do to look for a code defect that did not exist.
+  it('reruns a failure confined to the runner setting the job up, and the gate that ran after it', () => {
+    const value = inspection('results: failure failure');
+    value.failedJobs[0]!.startedAt = '2026-10-09T21:10:00Z';
+    value.jobs = [
+      { id: 103, name: 'tests 1/8', status: 'completed', conclusion: 'failure', url: '',
+        steps: [{ number: 1, name: 'Set up job', status: 'completed', conclusion: 'success' },
+          { number: 2, name: 'Initialize containers', status: 'completed', conclusion: 'failure' }],
+        startedAt: '2026-10-09T21:00:00Z', completedAt: '2026-10-09T21:04:00Z' },
+      { id: 104, name: 'tests 2/8', status: 'completed', conclusion: 'failure', url: '',
+        steps: [{ number: 1, name: 'Set up job', status: 'completed', conclusion: 'failure' }],
+        startedAt: '2026-10-09T21:00:00Z', completedAt: '2026-10-09T21:01:00Z' },
+    ];
+    expect(classifyGithubActionsFailure(value)).toMatchObject({ disposition: 'retry' });
+  });
+
+  it('still repairs a test failure beside a job that failed while being set up', () => {
+    const value = inspection('FAIL tests/x.test.ts');
+    value.jobs = [
+      { id: 104, name: 'tests 2/8', status: 'completed', conclusion: 'failure', url: '',
+        steps: [{ number: 2, name: 'Initialize containers', status: 'completed', conclusion: 'failure' }],
+        startedAt: '2026-10-09T21:00:00Z', completedAt: '2026-10-09T21:01:00Z' },
+    ];
+    expect(classifyGithubActionsFailure(value).disposition).toBe('revision');
+  });
+
+  it('does not take a repository step named like a runner step for setup', () => {
+    const value = inspection('error');
+    value.failedJobs[0]!.steps = [{ number: 4, name: 'Set up job', status: 'completed', conclusion: 'failure' }];
+    expect(classifyGithubActionsFailure(value).disposition).toBe('revision');
+  });
+
   it('does not invent a cause when all jobs are skipped or metadata is partial', () => {
     const value = inspection('');
     value.failedJobs = [];

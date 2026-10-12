@@ -1573,13 +1573,37 @@ async function softwareDevImpl(
       if (msgs.length > messagesAtWait) return 'do';
     }
 
+    // While the proposal waits for its reviewer, a GitHub change (a check
+    // finished, the target moved) is checked the way landing would check it: a
+    // failure or conflict the agent must repair goes back to Do now rather than
+    // after someone approved a red proposal (#612: CI red at 19:50, approved at
+    // 20:33, repaired only then). Returns the repair request, if any.
+    async function awaitReview(ready: () => boolean): Promise<string | undefined> {
+      const watchesCi = fairLanding && githubAuthoritativeMerge && prs.length > 0 && !!world
+        && patched('software-dev-review-ci-repair-v1');
+      for (;;) {
+        const providerSeen = providerChangeEpoch;
+        await waitServing(() => ready() || (watchesCi && providerChangeEpoch !== providerSeen));
+        if (!watchesCi || ready()) return undefined;
+        const ci = await core.mergeGithubPrs(world!, prs, { mode: 'review-ci' }).catch(() => undefined);
+        if (ready()) return undefined;
+        if (ci?.status === 'needs-revision')
+          return `${ci.detail ?? 'The pull request needs a repair.'}\nThis came up while the proposal waited for Review, so it goes back to you before anyone approves it. Repair it, verify it, then call open_pr again; Review will show the repaired head.`;
+      }
+    }
+    const repairBeforeReview = (text: string): 'do' => {
+      msgs.push({ id: `review-ci-${msgs.length}`, role: 'user', text, ts: msgs.length });
+      return 'do';
+    };
+
     if (input.parentTaskId) {
       waitingFor = { kind: 'parent' };
       await notifyParent(options.raise?.type ?? 'needs_confirmation', reviewInfo?.summary);
       await publish();
-      await waitServing(() => confirmed || cancelled || mainUnreadSince(options.messagesSeen));
+      const repair = await awaitReview(() => confirmed || cancelled || mainUnreadSince(options.messagesSeen));
       waitingFor = undefined;
       if (cancelled) return 'cancelled';
+      if (repair) return repairBeforeReview(repair);
       if (!confirmed) return 'do';
       if (multiPrEnabled && world)
         checkoutApprovals = approveAll(worldRepos(world as any), checkoutHeads, checkoutApprovals);
@@ -1649,9 +1673,10 @@ async function softwareDevImpl(
           if (approved && confirmEpoch === epoch && !mainUnreadSince(options.messagesSeen) && !cancelled)
             confirmed = true;
         }
-        await waitServing(() => confirmed || cancelled || mainUnreadSince(options.messagesSeen) || confirmEpoch !== epoch);
+        const repair = await awaitReview(() => confirmed || cancelled || mainUnreadSince(options.messagesSeen) || confirmEpoch !== epoch);
         waitingFor = undefined;
         if (cancelled) return 'cancelled';
+        if (repair) return repairBeforeReview(repair);
         if (confirmEpoch !== epoch) { layerIndex = 0; confirmed = false; continue; }
         if (!confirmed) return 'do';
         if (multiPrEnabled && world)

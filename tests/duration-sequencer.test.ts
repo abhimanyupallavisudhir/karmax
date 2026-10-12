@@ -32,11 +32,16 @@ describe('duration-balanced test shards', () => {
     expect(load(plan, weights)).toEqual([9, 9]);
   });
 
-  it('charges a file without a measurement the median measured duration', () => {
-    // Weighing the new file 6 (not 0) is what pairs it with b rather than c.
-    const weights = { 'a.test.ts': 1, 'b.test.ts': 6, 'c.test.ts': 6 };
+  // An unmeasured file may be the longest in the suite (#597: a ~4-minute file
+  // weighed as a typical one overloaded its shard), so it is charged as the
+  // longest, which also spreads unmeasured files one to a shard.
+  it('charges a file without a measurement the longest measured duration, one to a shard', () => {
+    const weights = { 'a.test.ts': 1, 'b.test.ts': 2, 'c.test.ts': 6 };
     const plan = planShards([...Object.keys(weights), 'new.test.ts'], weights, 2);
-    expect(plan.map((shard) => [...shard].sort())).toEqual([['b.test.ts', 'new.test.ts'], ['a.test.ts', 'c.test.ts']]);
+    expect(plan.map((shard) => [...shard].sort())).toEqual([['b.test.ts', 'c.test.ts'], ['a.test.ts', 'new.test.ts']]);
+    const fresh = ['n1.test.ts', 'n2.test.ts', 'n3.test.ts'];
+    const spread = planShards([...Object.keys(weights), ...fresh], weights, 3);
+    expect(spread.map((shard) => shard.filter((file) => fresh.includes(file)).length)).toEqual([1, 1, 1]);
   });
 
   it('divides the files evenly by count when nothing has been measured', () => {
@@ -64,19 +69,25 @@ describe('duration-balanced test shards', () => {
     expect(Math.max(...loads)).toBeLessThan(floor * 1.05);
   });
 
-  // An unmeasured file weighs the median, under a second, however long it
-  // runs. Twice an unmeasured multi-minute file overloaded a shard past its
-  // timeout and cancelled CI for every PR whose plan put it there (CI #1750;
-  // #597: tests/resource-on-demand.test.ts, ~4 min).
-  it('has a measured duration for every test file', () => {
+  // Measuring each new file in its own pull request made every two of them
+  // conflict in tests/durations.json and failed CI for each that forgot (GL-5).
+  // Charged as the longest file and spread one to a shard, a few unmeasured
+  // files cannot push a shard past its timeout: half of it for the measured
+  // files below, plus one longest file. Past one per shard, measure them.
+  it('leaves at most one unmeasured test file per shard', () => {
     const durations = readDurations(repoRoot);
+    const ci = parse(fs.readFileSync(path.join(repoRoot, '.github', 'workflows', 'ci.yml'), 'utf8'));
+    const count: number = ci.jobs.test.strategy.matrix.shard.length;
     const unmeasured = ['tests', 'src'].flatMap((dir) =>
       fs.readdirSync(path.join(repoRoot, dir), { recursive: true, encoding: 'utf8' })
         .filter((file) => file.endsWith('.test.ts'))
         .map((file) => `${dir}/${file.split(path.sep).join('/')}`))
       .filter((file) => !(file in durations));
-    expect(unmeasured, `Measure them: npx vitest run --reporter=default ${unmeasured.join(' ')} | npm run test:durations`)
-      .toEqual([]);
+    expect(unmeasured.length, `Measure them: npx vitest run --reporter=default ${unmeasured.join(' ')} | npm run test:durations`)
+      .toBeLessThanOrEqual(count);
+    const longest = Math.max(...Object.values(durations));
+    const loads = load(planShards(Object.keys(durations), durations, count), durations);
+    expect(Math.max(...loads) + longest).toBeLessThan(ci.jobs.test['timeout-minutes'] * 60);
   });
 
   // Runners vary up to twice in speed, so a shard must fit its timeout twice
