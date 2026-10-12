@@ -496,8 +496,8 @@ async function main() {
   // park-time data captures, and apply the over-quota policy (hosted).
   const managedStorageTimer = new AsyncInterval(async () => {
     const result = (await managedStorage.run());
-    if (result.expiredCheckpoints || result.deletedRevisions)
-      console.log(`  • Storage retention: ${result.expiredCheckpoints} finished-task checkpoint(s), ${result.deletedRevisions} unreferenced data capture(s)`);
+    if (result.expiredCheckpoints || result.deletedRevisions || result.expiredVersions)
+      console.log(`  • Storage retention: ${result.expiredCheckpoints} finished-task checkpoint(s), ${result.deletedRevisions} unreferenced data capture(s), ${result.expiredVersions} older data version(s)`);
   }, 3600_000);
   managedStorageTimer.unref();
   startupJobs.push(() => managedStorageTimer.run());

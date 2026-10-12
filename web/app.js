@@ -28,7 +28,7 @@ function storageContentsMarkup(contents) {
   const projects = (contents?.projects || []).filter((project) => project.bytes > 0);
   if (!projects.length) return '';
   const rows = projects.map((project) => {
-    const resources = project.resources.map((resource) => `<div class="member-row storage-item"><span>${esc(resource.name)}</span><span>${formatBytes(resource.currentBytes)}${resource.olderVersions ? ` · ${resource.olderVersions} older version${resource.olderVersions === 1 ? '' : 's'} ${formatBytes(resource.olderBytes)}` : ''}${resource.taskCopies ? ` · task copies ${formatBytes(resource.taskCopyBytes)}` : ''}</span>${resource.olderVersions ? `<button class="btn sm" data-older-versions="${esc(resource.id)}">Delete older versions</button>` : ''}</div>`).join('');
+    const resources = project.resources.map((resource) => `<div class="member-row storage-item"><span>${esc(resource.name)}</span><span>${formatBytes(resource.currentBytes)}${resource.olderVersions ? ` · ${resource.olderVersions} older version${resource.olderVersions === 1 ? '' : 's'} ${formatBytes(resource.olderBytes)}${contents.policy?.olderVersionDays ? ` ${policyTip(`Deleted ${contents.policy.olderVersionDays} days after a newer version replaces them, unless a task still uses them.`)}` : ''}` : ''}${resource.taskCopies ? ` · task copies ${formatBytes(resource.taskCopyBytes)}` : ''}</span>${resource.olderVersions ? `<button class="btn sm" data-older-versions="${esc(resource.id)}">Delete older versions</button>` : ''}</div>`).join('');
     const workspaces = project.checkpoints.count ? `<div class="member-row storage-item"><span>Saved task workspaces ${policyTip(`Uncommitted files of parked tasks. A finished task's are deleted ${contents.policy.finishedTaskCheckpointDays} days after it ends.`)}</span><span>${formatBytes(project.checkpoints.bytes)}</span>${project.checkpoints.finishedCount ? `<button class="btn sm" data-finished-workspaces="${esc(project.projectId)}">Delete finished (${formatBytes(project.checkpoints.finishedBytes)})</button>` : ''}</div>` : '';
     const artifacts = project.artifacts.count ? `<div class="member-row storage-item"><span>Review files ${policyTip('Files attached to reviews. They are deleted automatically when they expire.')}</span><span>${formatBytes(project.artifacts.bytes)}</span></div>` : '';
     return `<div class="storage-project"><div class="member-row"><b>${esc(project.name)}</b><span>${formatBytes(project.bytes)}</span></div>${resources}${workspaces}${artifacts}</div>`;
@@ -300,6 +300,13 @@ function feedbackFetch(input, opts = {}) {
 
 // Non-principal attempts are intentionally absent from S.tasks because the list
 // has one row per logical task. Page lookups must also consult the loaded group.
+// A live repeatable series: the row its runs nest under. A draft is not one,
+// even with Repeatable ticked: it shows (and runs) as a draft. Mirrors isSeries
+// in src/domain/triggers.ts.
+function isSeries(params) {
+  return !!params?.repeatable && !params?.draft;
+}
+
 function taskRecord(id) {
   return (S.attemptGroup?.attempts || []).find((t) => t.id === id)
     || (S.tasks || []).find((t) => t.id === id)
@@ -6055,7 +6062,14 @@ function tasksView() {
   // not shown at the top level. Build the lookup once for taskRow/seriesRow, and
   // hide runs from every list surface (flat + grouped) below.
   S._runsBySeries = {};
-  for (const t of S.tasks) if (t.params?.runOf) (S._runsBySeries[t.params.runOf] ||= []).push(t);
+  const loaded = new Map();
+  for (const t of S.tasks) {
+    loaded.set(t.id, t);
+    if (t.params?.runOf) (S._runsBySeries[t.params.runOf] ||= []).push(t);
+  }
+  // Only while its series is live: a run whose task was un-ticked, moved to
+  // drafts or deleted is an ordinary task (the server's `is:run` agrees).
+  const nestedRun = (t) => !!t.params?.runOf && isSeries(loaded.get(t.params.runOf)?.params);
   // Runs nest under their series row and sub-tasks nest under their parent's detail page,
   // so by default neither belongs in the flat top-level list. The server already drops both
   // (the -is:run/-is:subtask defaults from effectiveQuery); this is the client-side fallback,
@@ -6063,7 +6077,7 @@ function tasksView() {
   // `is:subtask`, or a hand-typed `is:run`) so those views aren't stripped to empty.
   const keepRun = listShowsNested(S.search, 'run');
   const keepSub = listShowsNested(S.search, 'subtask');
-  const topLevel = (t) => (keepRun || !t.params?.runOf) && (keepSub || !t.parentTaskId);
+  const topLevel = (t) => (keepRun || !nestedRun(t)) && (keepSub || !t.parentTaskId);
   // The server already applied the query (incl. the default -is:archived from effectiveQuery).
   // Fallback (before the first result lands) filters client-side and drops archived to match.
   // Before the first result the open project's rows are a fair preview of a text
@@ -6400,7 +6414,7 @@ function taskRow(t, { showTags = true, project = false } = {}) {
   const isDraft = t.params?.draft;
   const archived = t.params?.archived;
   const where = project ? projectLabel(t) : '';
-  if (t.params?.repeatable && !archived) return seriesRow(t);
+  if (isSeries(t.params) && !archived) return seriesRow(t);
   if (t.params?.triggerState === 'armed' && !archived) {
     return `
     <div class="task-row" data-armed="${t.id}">
@@ -7360,7 +7374,7 @@ function eventTriggerHtml(trigger) {
   const conditions = Object.entries(trigger?.where || {}).filter(([, v]) => !(v && typeof v === 'object' && 'exists' in v))
     .map(([path, expected]) => eventConditionHtml(path, ...eventConditionParts(expected))).join('');
   const mode = trigger?.concurrency ? trigger.concurrency.mode || 'skip' : '';
-  return `<div class="ev-trigger" id="ev-trigger">
+  return `<div class="ev-trigger" id="ev-trigger"${trigger ? '' : ' data-fresh="1"'}>
     <input id="ev-type" list="ev-types" placeholder="github.issues.labeled" value="${esc(trigger?.type || '')}" autocomplete="off" spellcheck="false">
     <datalist id="ev-types"></datalist><datalist id="ev-paths"></datalist>
     <div id="ev-conds">${conditions}</div>
@@ -7448,8 +7462,7 @@ function wireEventTrigger(projectId) {
   };
   type.addEventListener('focus', fillTypes, { once: true });
   type.addEventListener('change', () => {
-    const repeatable = $('#trig-repeatable');
-    if (type.value.trim() && more.hidden && repeatable && !repeatable.disabled) repeatable.checked = true;
+    syncAutoRepeatable();
     more.hidden = !type.value.trim();
     fillPaths();
   });
@@ -7470,16 +7483,31 @@ function readCronCells() {
   return CRON_FIELDS.map((f) => ($('#' + f.id)?.value || '').trim() || '*');
 }
 
-// A schedule forces "repeatable" on (a cron fires forever) and locks the box.
+// A schedule forces Repeatable on (a cron fires forever) and locks the box; a new
+// event trigger ticks it. Whatever the form ticks it unticks again once that is
+// cleared, unless the person has set the box themselves (#616: a cleared
+// schedule left it ticked, and Run task then made a repeatable task).
+function syncAutoRepeatable() {
+  const cb = $('#trig-repeatable');
+  if (!cb) return;
+  const cronSet = readCronCells().join(' ') !== '* * * * *';
+  const newEvent = !!$('#ev-type')?.value.trim() && $('#ev-trigger')?.dataset.fresh === '1';
+  if (cronSet || (newEvent && !cb.dataset.owned)) {
+    if (!cb.checked) { cb.checked = true; cb.dataset.auto = '1'; }
+  } else if (cb.dataset.auto) {
+    cb.checked = false;
+    delete cb.dataset.auto;
+  }
+  cb.disabled = cronSet;
+}
+
 function wireScheduleBuilder() {
-  const syncRepeatable = () => {
-    const cb = $('#trig-repeatable');
-    if (!cb) return;
-    const cronSet = readCronCells().join(' ') !== '* * * * *';
-    if (cronSet) { cb.checked = true; cb.disabled = true; } else { cb.disabled = false; }
-  };
-  CRON_FIELDS.forEach((f) => $('#' + f.id)?.addEventListener('input', syncRepeatable));
-  syncRepeatable();
+  $('#trig-repeatable')?.addEventListener('change', (event) => {
+    event.target.dataset.owned = '1';
+    delete event.target.dataset.auto;
+  });
+  CRON_FIELDS.forEach((f) => $('#' + f.id)?.addEventListener('input', syncAutoRepeatable));
+  syncAutoRepeatable();
 }
 
 // The dependency task ids currently chipped into the picker (state lives in the DOM).
@@ -7763,7 +7791,7 @@ async function consumeTaskFormDefaults(projectId, workflow) {
 
 function taskFormTitle(draft) {
   const p = draft?.params || {};
-  return !draft ? 'New task' : p.triggerState === 'armed' || p.repeatable ? 'Edit task' : 'Edit draft';
+  return !draft ? 'New task' : p.triggerState === 'armed' || isSeries(p) ? 'Edit task' : 'Edit draft';
 }
 
 function taskFormLoadingPage(project, draft) {
@@ -7804,7 +7832,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   const promptField = cf && cf.type === 'text' ? cf : null;
   const values = draft ? { ...draft.params } : { ...seedParams };
   const armed = draft?.params?.triggerState === 'armed'; // a "waiting for trigger" task
-  const series = !!draft?.params?.repeatable; // a repeatable template
+  const series = isSeries(draft?.params); // a repeatable template
   const editInPlace = armed || series; // neither has a running workflow — edit its stored params
   const workflowEditable = !draft || !!draft.params?.draft;
   // Carry over the quick-add text (or whatever was typed before switching
@@ -8427,8 +8455,19 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
         }
       }
       succeeded = true;
+      // Running a repeatable task starts a new task, its run: name it and go
+      // there, so it is never mistaken for this one (#616/#617).
+      const run = !editInPlace && !draftMode && st.body.repeatable && !st.body.triggers?.length && primaryId
+        ? await api(`/api/tasks/${primaryId}/runs`).then((runs) => runs.reduce((a, b) => (b.createdAt > (a?.createdAt ?? 0) ? b : a), null)).catch(() => null)
+        : null;
       releaseFormKeys();
       root.innerHTML = '';
+      if (run) {
+        toast(run.num != null ? `Started run #${run.num}` : 'Run started');
+        await refreshTasks();
+        goToTask(run.id);
+        return true;
+      }
       if (page && S.selected === draft.id) {
         // A saved draft leaves its page like Back; a started one shows its live page.
         if (draftMode) closeTask();
@@ -8965,7 +9004,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     if (S.selected !== taskId || S.taskOpenEpoch !== openEpoch) return;
   }
   markTaskAsksRead(taskId);
-  if (rec?.params?.repeatable) {
+  if (isSeries(rec?.params)) {
     await renderSeriesPage(rec);
     return;
   }
@@ -9062,7 +9101,7 @@ async function refreshTask(reason = 'all') {
   if (!S.selected) return;
   // The series config page holds an editable form — don't live-refresh it (that
   // would clobber in-progress edits); it re-renders only on open / explicit save.
-  if (taskRecord(S.selected)?.params?.repeatable) return;
+  if (isSeries(taskRecord(S.selected)?.params)) return;
   const id = S.selected;
   const pending = refreshTask.pending ||= new Map();
   const existing = pending.get(id);

@@ -152,6 +152,73 @@ describe.each(BACKENDS)('%s', (name) => {
       for (const checkpoint of kept) expect((await f.store.getWorldCheckpoint(checkpoint.id))).toBeDefined();
     });
 
+    it('deletes older data versions 30 days after they were replaced, keeping any a task still uses', async () => {
+      const f = (await fixture({ hosted: true }));
+      const now = Date.now();
+      const data = (await f.attachment('data'));
+      const version = async (fill: number, daysAgo: number) => {
+        const revision = (await f.resources.importFiles(data.id, [{ path: 'file.bin', data: Buffer.alloc(64, fill) }]));
+        (await f.store.db.prepare('UPDATE resource_revisions SET createdAt=? WHERE id=?').run(now - daysAgo * DAY, revision.id));
+        return revision;
+      };
+      const replacedLongAgo = (await version(1, 90));
+      const forkedByParkedTask = (await version(2, 80));
+      const leased = (await version(3, 70));
+      const replacedRecently = (await version(4, 20));
+      const current = (await version(5, 5));
+      // A task's world forked `forkedByParkedTask` and was restored from a park: its
+      // copy now starts from the park capture, which names the published version as its parent.
+      const capture = (await f.checkpointRevision(data.id, Buffer.alloc(64, 6), now - 60 * DAY));
+      (await f.store.db.prepare('UPDATE resource_revisions SET parentRevisionId=? WHERE id=?').run(forkedByParkedTask.id, capture.id));
+      const parked = (await f.task('waiting'));
+      (await f.worldCheckpoint(parked.id, now, { resources: [{ attachmentId: data.id, revisionId: capture.id }] }));
+      (await f.store.createResourceLease({ attachmentId: data.id, revisionId: leased.id, taskId: 'working', worldId: 'working-world',
+        worldGeneration: 1, access: 'write', state: 'active' } as any));
+      // A sub-task's delivered version, superseded long ago, and one a later delivery builds on.
+      const delivered = (await f.store.saveResourceRevision({ attachmentId: data.id, ...JSON.parse(JSON.stringify({
+        engine: replacedLongAgo.engine, sealedRef: replacedLongAgo.sealedRef, rootDigest: replacedLongAgo.rootDigest,
+        bytes: 64, files: 1, storageLocationId: f.managed.id })), metadata: { deliveredTo: 'parent' }, createdAt: now - 85 * DAY }));
+      const deliveredLast = (await f.store.saveResourceRevision({ attachmentId: data.id, ...JSON.parse(JSON.stringify({
+        engine: replacedLongAgo.engine, sealedRef: replacedLongAgo.sealedRef, rootDigest: replacedLongAgo.rootDigest,
+        bytes: 64, files: 1, storageLocationId: f.managed.id })), metadata: { deliveredTo: 'parent' }, createdAt: now - 75 * DAY }));
+      (await f.store.kvSet(`resource-delivered:parent:${data.id}:child`, deliveredLast.id));
+      // Versions in a bucket the organization connected itself are its own to keep.
+      const own = (await f.store.saveStorageLocation({ id: 'own-bucket', organizationId: f.organizationId, name: 'Own', kind: 's3',
+        config: { bucket: 'own' }, isDefault: false, status: 'ready' }));
+      const inOwnBucket = (await f.store.saveResourceRevision({ attachmentId: data.id, engine: 'restic@1',
+        sealedRef: JSON.stringify({ snapshot: 'f'.repeat(64), storageLocationId: own.id }), rootDigest: 'f'.repeat(64), bytes: 64, files: 1,
+        storageLocationId: own.id, metadata: { summary: {} }, createdAt: now - 95 * DAY }));
+
+      const result = (await f.service.run(now));
+
+      expect(result.expiredVersions).toBe(2);
+      for (const gone of [replacedLongAgo, delivered]) expect((await f.store.getResourceRevision(gone.id))).toBeUndefined();
+      for (const kept of [forkedByParkedTask, leased, replacedRecently, current, capture, deliveredLast, inOwnBucket])
+        expect((await f.store.getResourceRevision(kept.id))).toBeDefined();
+      expect((await f.service.contents(f.organizationId)).policy.olderVersionDays).toBe(30);
+
+      // Its replacement (the current version) is 5 days old: 30 days after that, it goes too.
+      expect((await f.service.run(now + 24 * DAY)).expiredVersions).toBe(0);
+      expect((await f.service.run(now + 26 * DAY)).expiredVersions).toBe(1);
+      expect((await f.store.getResourceRevision(replacedRecently.id))).toBeUndefined();
+      // Its snapshot is forgotten and its data pruned.
+      expect(await f.snapshots(data.id)).not.toContain(replacedRecently.rootDigest);
+      expect(await f.store.kvEntries('restic-prune:')).toEqual([]);
+    });
+
+    it('keeps every data version on a private installation', async () => {
+      const f = (await fixture());
+      const now = Date.now();
+      const data = (await f.attachment('data'));
+      const old = (await f.resources.importFiles(data.id, [{ path: 'file.bin', data: Buffer.alloc(64, 1) }]));
+      (await f.store.db.prepare('UPDATE resource_revisions SET createdAt=? WHERE id=?').run(now - 90 * DAY, old.id));
+      const newer = (await f.resources.importFiles(data.id, [{ path: 'file.bin', data: Buffer.alloc(64, 2) }]));
+      (await f.store.db.prepare('UPDATE resource_revisions SET createdAt=? WHERE id=?').run(now - 60 * DAY, newer.id));
+      (await f.resources.importFiles(data.id, [{ path: 'file.bin', data: Buffer.alloc(64, 3) }]));
+      expect((await f.service.run(now)).expiredVersions).toBe(0);
+      expect((await f.store.getResourceRevision(old.id))).toBeDefined();
+    });
+
     it('stops counting a checkpoint once it is queued for deletion', async () => {
       const f = (await fixture());
       const done = (await f.task('done', 1));
