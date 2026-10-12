@@ -6808,6 +6808,10 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
     </div>${open ? `<div class="pk-sessions">${sessionsHtml(t)}</div>` : ''}`;
   };
 
+  // A task waiting for its trigger, or started but not yet at its first turn,
+  // will have an agent: the fork waits for it (the form adds the dependency)
+  // and picks the conversation up when it starts.
+  const willRun = (t) => t.params?.triggerState === 'armed' || ['active', 'waiting'].includes(t.lastView?.status);
   const sessionsHtml = (t) => {
     const attempts = sessions.get(t.id) || [];
     return attempts.map(({ task, sessions: agents }) => `<div class="pk-attempt">
@@ -6815,7 +6819,10 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
       <div class="pk-agents">${Object.entries(agents).map(([role, session]) => `<button type="button" class="pick-row pk-agent" data-nav data-task="${esc(t.id)}" data-attempt="${esc(task.id)}" data-role="${esc(role)}"
         title="${esc([agentRoleLabel(role), session.provider, session.model].filter(Boolean).join(' · '))}">
         <span class="pk-fork">⑂</span><span>${esc(agentRoleLabel(role))}</span>${session.provider ? `<span class="wf">${esc(session.provider)}</span>` : ''}
-      </button>`).join('') || '<span class="pk-empty">No agent to fork yet. Choose another attempt or task.</span>'}</div>
+      </button>`).join('') || (willRun(task)
+        ? `<button type="button" class="pick-row pk-agent" data-nav data-task="${esc(t.id)}" data-attempt="${esc(task.id)}" data-role="do" data-later="1"
+            title="It hasn’t run yet: this task waits for it and forks its agent once it finishes"><span class="pk-fork">⑂</span><span>${esc(agentRoleLabel('do'))}</span><span class="wf">when it finishes</span></button>`
+        : '<span class="pk-empty">No agent to fork yet. Choose another attempt or task.</span>')}</div>
     </div>`).join('');
   };
 
@@ -6850,7 +6857,7 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
     if (el.dataset.role !== undefined) {
       const attempt = sessions.get(tid)?.find((a) => a.task.id === el.dataset.attempt);
       const session = attempt?.sessions[el.dataset.role];
-      if (!session) return;
+      if (!session && !el.dataset.later) return;
       close();
       onPick({ task: attempt.task, role: el.dataset.role, session });
       return;
