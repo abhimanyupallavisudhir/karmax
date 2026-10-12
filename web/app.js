@@ -13049,7 +13049,10 @@ function taskActions(v) {
   const simple = acts.filter((a) => !a.args || a.args.length === 0);
   // Sub-tasks' files arriving before the agent's next turn: a message sent now waits for them.
   const refreshing = v.state?.refreshingResources && v.status === 'active'
-    ? `<button class="btn primary action-pending" disabled aria-busy="true" title="Sub-tasks’ files arrive before the agent’s next turn. Messages sent now are read then.">Bringing in sub-tasks’ data…</button>` : '';
+    ? `<button class="btn primary action-pending" disabled aria-busy="true" title="Sub-tasks’ files arrive before the agent’s next turn. Messages sent now are read then.">Bringing in sub-tasks’ data…</button>`
+    // A sub-task starts from this task's data, saved first: gigabytes take minutes.
+    : v.state?.preparingSubTask && v.status === 'active'
+      ? `<button class="btn primary action-pending" disabled aria-busy="true" title="A sub-task starts from this task’s data, so it is saved first.">${esc(stagingProgress()?.text || 'Saving data for a sub-task…')}</button>` : '';
   let html = `<div class="actions"${refreshing ? ' role="status" aria-live="polite"' : ''}>${refreshing}${biggerDiskButton(v)}`;
   let slot = 0; // digits 1–9 press the Nth ENABLED button (see the command registry)
   for (const a of simple) {

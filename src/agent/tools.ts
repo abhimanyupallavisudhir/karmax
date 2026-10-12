@@ -134,7 +134,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'create_sub_task',
     description:
-      'Delegate to a child task. It branches off your current work and merges back into YOUR branch (not main), and YOU are its confirmer: when it reaches Review or gets stuck it will raise to you (surfaced as a message) and you answer with respond_to_sub_task. It starts when your current turn ends. You manage your children to completion before you finish. '
+      'Delegate to a child task. It branches off your current work and merges back into YOUR branch (not main), and YOU are its confirmer: when it reaches Review or gets stuck it will raise to you (surfaced as a message) and you answer with respond_to_sub_task. It starts when your current turn ends, and first saves this task\'s writable project data for it to start from: stop anything writing into it (a server, a job, an open SQLite database) before you call it, or the save fails and no sub-task is created. You manage your children to completion before you finish. '
       + 'It runs your agent unless `params` choose another: create_task\'s task-form fields, e.g. {"agent:do": {"provider": "codex", "model": "gpt-5.5", "effort": "high"}} or {"agent:do": {"avatarId": "…"}}. Only the agent fields can be set; the branch, project and authorization stay yours. An invalid or unavailable choice is refused and nothing is created.',
     parameters: {
       type: 'object',
