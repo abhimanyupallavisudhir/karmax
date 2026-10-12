@@ -178,7 +178,7 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.LIVE_OPENCODE_ANTHROPIC_API_KEY }}
 
   vm:
-    name: Fly.io and Hetzner VM worlds
+    name: Fly.io and Hetzner VM worlds, moving to them
     needs: plan
     if: github.ref == 'refs/heads/master' && needs.plan.outputs.vm == 'true'
     runs-on: ubuntu-latest
@@ -198,6 +198,14 @@ jobs:
           FLY_API_TOKEN: ${{ secrets.LIVE_FLY_API_TOKEN }}
           HCLOUD_TOKEN: ${{ secrets.LIVE_HETZNER_API_TOKEN }}
           OPENAI_API_KEY: ${{ secrets.LIVE_VM_OPENAI_API_KEY }}
+      # A running task moving from E2B to Hetzner through its checkpoint, and
+      # its fallback to E2B when Hetzner refuses; skips without an E2B key.
+      - run: npx vitest run tests/computer-move-live.test.ts
+        if: ${{ !cancelled() }}
+        env:
+          KARMAX_RUN_LIVE: '1'
+          E2B_API_KEY: ${{ secrets.LIVE_E2B_API_KEY }}
+          HCLOUD_TOKEN: ${{ secrets.LIVE_HETZNER_API_TOKEN }}
 
   github:
     name: GitHub pull requests
