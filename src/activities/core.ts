@@ -1300,7 +1300,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     if (state !== 'missing') return undefined; // transient/parked → keep the original error
     (await record(taskId, 'world.recovering', { checkpointId, reason: (cause instanceof Error ? cause.message : String(cause)).slice(0, 200) }));
     try {
-      const restored = await deps.checkpoints.restore(checkpointId, handle.kind);
+      const restored = await deps.checkpoints.restoreWhereTaskRuns(checkpointId, handle);
       const opened = await worlds.open(await ensureRunnerLease(restored, taskId));
       (await store.setWorldState(((await store.currentWorld(restored.id)) ?? restored) as WorldHandle, 'ready'));
       (await record(taskId, 'world.recovered', { checkpointId, generation: restored.generation }));
@@ -2731,6 +2731,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // size learned later), and the one the task's Computer asks for.
       let promptWorld = args.worldHandle;
       let requestedComputer: ReturnType<typeof machineShape> | undefined;
+      // Where else this task could run (wiki features/computers: moving a running
+      // task): the organization's other connected cloud providers, and the one
+      // the task's own Computer now names if its world still runs elsewhere.
+      let otherProviders: Array<{ provider: string; diskGb?: number }> = [];
+      let moveTo: string | undefined;
       try {
         const stored = (await store.currentWorld(args.taskId)) as WorldHandle | undefined;
         if (stored?.meta?.computer && (stored.generation ?? 1) === (args.worldHandle.generation ?? 1))
@@ -2739,6 +2744,16 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const project = promptWorld.meta?.computer ? (await store.getProject(args.task.projectId)) : undefined;
         if (project) requestedComputer = machineShape(applyComputer(await store.effectiveProjectConfig(project),
           normalizeComputer(preparationTask?.params.computer)));
+        if (project?.organizationId) {
+          const own = normalizeComputer(preparationTask?.params.computer)?.provider;
+          if (own && own !== promptWorld.kind) moveTo = own;
+          const connections = await store.listWorldProviderConnections(project.organizationId);
+          otherProviders = await Promise.all(connections
+            .filter((connection) => connection.enabled && connection.provider !== promptWorld.kind
+              && (() => { try { return isRemote(connection.provider as WorldKind); } catch { return false; } })())
+            .map(async (connection) => ({ provider: connection.provider,
+              diskGb: (await accountLimits(project.organizationId!, connection.provider)).diskGb })));
+        }
       } catch { /* the World section then names the machine as the workflow knows it */ }
       const turnDisk = await turnDiskReady;
       const systemPrompt = assemblePrompt({
@@ -2748,6 +2763,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         world: promptWorld,
         ...(requestedComputer ? { computer: requestedComputer } : {}),
         ...(turnDisk?.check ? { disk: turnDisk.check.disk } : {}),
+        ...(otherProviders.length ? { providers: otherProviders } : {}),
+        ...(moveTo ? { moveTo } : {}),
         ...(turnDisk?.limits ? { limits: turnDisk.limits } : {}),
         globalInstructions: (globalInstructions ?? '') + forkContext + agentForkContext + attemptContext + paymentContext,
         projectInstructions,

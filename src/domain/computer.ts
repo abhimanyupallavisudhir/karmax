@@ -1,4 +1,5 @@
 import type { ProjectConfig } from './types.js';
+import { providerFeatures, providerLabel } from './computer-limits.js';
 
 /**
  * The computer a task runs on — one value, edited as one block wherever an
@@ -153,14 +154,25 @@ export function describeMachine(shape: MachineShape): string {
   ].join(' · ');
 }
 
-/** Reject an in-flight edit that would change more than the machine's size. */
+const LOCAL_PROVIDERS = new Set(['worktree', 'container', 'memory']);
+
+/** Reject an in-flight edit that would change more than the machine's size and
+ * where it runs. A running task may move to another cloud provider (it moves at
+ * its next idle park, through its checkpoint), unless that provider lacks
+ * something the task relies on; its experience and network never change. */
 export function assertInFlightComputerEdit(current: ComputerSpec, next: ComputerSpec): void {
-  for (const key of ['provider', 'flavor'] as const) {
-    if (next[key] !== undefined && next[key] !== current[key])
-      throw new Error(`a running task's ${key === 'provider' ? 'computer provider' : 'experience'} can't change — only its CPU, memory, disk and hibernation`);
-  }
+  if (next.flavor !== undefined && next.flavor !== current.flavor)
+    throw new Error('a running task\'s experience can\'t change — only its provider, CPU, memory, disk and hibernation');
   if (next.network !== undefined && JSON.stringify(next.network) !== JSON.stringify(current.network ?? { unrestricted: true }))
-    throw new Error('a running task\'s outbound network can\'t change — only its CPU, memory, disk and hibernation');
+    throw new Error('a running task\'s outbound network can\'t change — only its provider, CPU, memory, disk and hibernation');
+  if (next.provider === undefined || next.provider === current.provider) return;
+  if (LOCAL_PROVIDERS.has(next.provider) || (current.provider && LOCAL_PROVIDERS.has(current.provider)))
+    throw new Error('a running task moves only between cloud providers');
+  const features = providerFeatures(next.provider);
+  if (current.flavor === 'desktop' && !features.desktop)
+    throw new Error(`${providerLabel(next.provider)} has no desktop, which this task uses`);
+  if (current.network?.unrestricted === false && !features.allowlist)
+    throw new Error(`${providerLabel(next.provider)} has no outbound allowlist, which this task uses`);
 }
 
 /** Whether a task's Computer may still be resized. The Computer is the

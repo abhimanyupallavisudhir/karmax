@@ -11,6 +11,7 @@ import type { ObjectStore } from '../store/objects.js';
 import { expireConversationExports } from '../store/conversation-exports.js';
 import { DeferredDeleteObjectStore } from '../store/deferred-delete.js';
 import { taskEnded } from './task-ended.js';
+import { taskProvider } from './task-provider.js';
 
 // Private/explicit pools retain physical resource totals. Hosted customer-owned
 // pools ignore these totals and derive active worlds from plan concurrency.
@@ -323,11 +324,17 @@ export class WorldLifecycleManager {
       const recorded = candidate.handle.meta?.computer as MachineShape | undefined;
       const resize = recorded && config && !sameMachine(recorded, machineShape(config))
         ? { from: recorded, to: machineShape(config) } : undefined;
-      if (!project || (!resize && candidate.updatedAt > now - after)) continue;
+      // A task whose own Computer names another provider moves there the same
+      // way: hibernate now, and the wake restores the checkpoint on that provider
+      // (checkpoint.ts restoreWhereTaskRuns). An organization default never moves
+      // a running task; only the task's own choice does.
+      const target = await taskProvider(this.store, candidate.handle.id);
+      const move = target && target !== candidate.handle.kind ? { from: candidate.handle.kind, to: target } : undefined;
+      if (!project || (!resize && !move && candidate.updatedAt > now - after)) continue;
       // A VM world keeps its disk across any size: grow it in place, never
       // hibernate it for a new size (which would drop its ignored files).
       const provider = this.worlds.get(candidate.handle.kind);
-      if (resize && provider.resize) {
+      if (resize && !move && provider.resize) {
         await this.worlds.withOperation(candidate.handle.id, async () => {
           const current = await this.store.worldStateSnapshot(candidate.handle.id);
           if (current?.state !== 'parked' || current.generation !== (candidate.handle.generation ?? 1)) return;
@@ -381,14 +388,16 @@ export class WorldLifecycleManager {
           }
           await this.store.setWorldState(candidate.handle, 'hibernated');
           await this.recordLifecycle(candidate.handle, 'world.hibernated', { checkpointId: checkpoint.id, providerEvicted: true,
-            ...(resize ? { resize } : {}) });
-          if (resize) await this.checkpoints.addNotice?.(candidate.handle.id, resizeNotice(resize.to));
+            ...(resize ? { resize } : {}), ...(move ? { move } : {}) });
+          if (resize && !move) await this.checkpoints.addNotice?.(candidate.handle.id, resizeNotice(resize.to));
           hibernated++;
           return;
         }
         await this.store.setWorldState(candidate.handle, 'hibernated');
-        await this.recordLifecycle(candidate.handle, 'world.hibernated', { checkpointId: checkpoint.id, ...(resize ? { resize } : {}) });
-        if (resize) await this.checkpoints.addNotice?.(candidate.handle.id, resizeNotice(resize.to));
+        await this.recordLifecycle(candidate.handle, 'world.hibernated', { checkpointId: checkpoint.id,
+          ...(resize ? { resize } : {}), ...(move ? { move } : {}) });
+        // A move is told when it lands (or fails), by the restore.
+        if (resize && !move) await this.checkpoints.addNotice?.(candidate.handle.id, resizeNotice(resize.to));
         hibernated++;
       }));
       } catch (error) {

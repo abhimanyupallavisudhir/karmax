@@ -38,6 +38,7 @@ import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, valid
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult, EvalContext, TaskGroup, forClauseValues, attentionCandidates } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
 import { providerLabel } from '../domain/computer-limits.js';
+import { taskProvider } from '../world/task-provider.js';
 import { applyComputer, assertInFlightComputerEdit, computerOf, computerResizable, describeMachine, machineShape, normalizeComputer, sameMachine,
   type ComputerSpec, type MachineShape } from '../domain/computer.js';
 import { resolveParamsLayers, assembleTaskInput, projectSettingsFor, globalSettingsFor, quickProjectSettingsFor, quickGlobalSettingsFor, effectiveRepos, ValueMap } from './params.js';
@@ -6219,15 +6220,18 @@ Act according to your Avatar instructions. When ready, call platform_request POS
     return { diskGb, maxDiskGb, applied };
   }
 
-  /** The machine a task's Computer asks for, when its world runs on another. */
-  private async computerChange(taskId: string): Promise<{ from: MachineShape; to: MachineShape } | undefined> {
+  /** The machine a task's Computer asks for, when its world runs on another
+   * (another size, or another provider the task itself chose). */
+  private async computerChange(taskId: string): Promise<ComputerChange | undefined> {
     const world = (await this.deps.store.currentWorld(taskId));
-    const from = world?.meta?.computer as MachineShape | undefined;
-    const task = from && (await this.deps.store.getTask(taskId));
+    const task = world && (await this.deps.store.getTask(taskId));
     const project = task && (await this.deps.store.getProject(task.projectId));
-    if (!from || !project) return undefined;
+    if (!world || !project) return undefined;
     const to = machineShape(await this.deps.store.effectiveTaskConfig(project, taskId));
-    return sameMachine(from, to) ? undefined : { from, to };
+    const from = (world.meta?.computer as MachineShape | undefined) ?? to;
+    const target = await taskProvider(this.deps.store, taskId);
+    const provider = target && target !== world.kind ? { from: world.kind, to: target } : undefined;
+    return sameMachine(from, to) && !provider ? undefined : { from, to, ...(provider ? { provider } : {}) };
   }
 
   /** Keep the workflow's accepted destination, stored task snapshot, and durable
@@ -7171,9 +7175,15 @@ function biggerDiskNotice(diskGb: number, fromGb: number | undefined, inPlace = 
     + 'You resume with every tracked file and uncommitted change; Git-ignored files (dependencies, build output) and running processes do not carry over.';
 }
 
+/** A size or provider a task asks for while its world is still on the old one. */
+type ComputerChange = { from: MachineShape; to: MachineShape; provider?: { from: string; to: string } };
+
 /** What an agent is told when its task's Computer changes under it. */
-function computerChangeNotice(change: { from: MachineShape; to: MachineShape }, inPlace = false): string {
-  return `[${BRAND} computer change]\n\nThis task's computer is now ${describeMachine(change.to)}; you are still on ${describeMachine(change.from)}. `
+function computerChangeNotice(change: ComputerChange, inPlace = false): string {
+  if (change.provider) inPlace = false; // a move always goes through the checkpoint
+  const where = (provider: string | undefined) => (provider ? ` on ${providerLabel(provider)}` : '');
+  return `[${BRAND} computer change]\n\nThis task's computer is now ${describeMachine(change.to)}${where(change.provider?.to)}; `
+    + `you are still on ${describeMachine(change.from)}${where(change.provider?.from)}. `
     + 'You move to it when this task parks: end your turn with pause(3) without jobs. A pause that waits on jobs keeps this machine, '
     + 'so first let them finish or stop them (stop_job); if one is running out of room, stopping it now is usually right. '
     + (inPlace

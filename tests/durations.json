@@ -109,6 +109,7 @@
   "tests/computer-features.browser.test.ts": 0.8,
   "tests/computer-form.browser.test.ts": 7.1,
   "tests/computer-limits.test.ts": 0.1,
+  "tests/computer-move.test.ts": 0.6,
   "tests/computer-params.browser.test.ts": 1.2,
   "tests/computer-settings.test.ts": 1.7,
   "tests/computer.test.ts": 0,

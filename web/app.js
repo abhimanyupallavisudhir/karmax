@@ -1515,8 +1515,9 @@ function computerSizeAttrs(provider) {
 }
 // The providers a task can run on here: the organization's connected cloud
 // computers, plus this machine when self-hosted.
-function computerProviderOptions(current) {
-  const local = S.meta?.hosted ? [] : ['worktree', 'container'];
+function computerProviderOptions(current, inFlight = false) {
+  // A running task moves only between cloud providers.
+  const local = S.meta?.hosted || inFlight ? [] : ['worktree', 'container'];
   const connected = (S.worldProviderConnections || [])
     .filter((c) => c.enabled && c.credentialConfigured)
     .map((c) => c.provider);
@@ -1528,14 +1529,15 @@ function computerBlockHtml(name, value, inherited, opts = {}) {
   const v = { ...inh, ...value };
   const provider = v.provider || '';
   const restricted = v.network?.unrestricted === false;
-  // In flight, a task may only resize: another provider, experience or network is another computer.
+  // In flight, a task may resize or move to another cloud provider (at its next
+  // pause); another experience or network would be another computer.
   const fixed = opts.inFlight ? 'disabled' : '';
   const size = computerSizeAttrs(provider);
   const features = computerFeaturesFor(provider);
   const sizeAttrs = (key) => `max="${esc(size[key].max)}" placeholder="${esc(size[key].placeholder)}"`;
   const tip = (key) => (size[key].title ? ` title="${esc(size[key].title)}"` : '');
   const body = `<div class="computer-controls">
-      <select class="cf-provider" aria-label="Provider" ${fixed}>${computerProviderOptions(provider).map((p) => `<option value="${esc(p)}" ${p === provider ? 'selected' : ''}>${esc(COMPUTER_PROVIDER_LABELS[p] || p)}</option>`).join('')}</select>
+      <select class="cf-provider" aria-label="Provider">${computerProviderOptions(provider, opts.inFlight).map((p) => `<option value="${esc(p)}" ${p === provider ? 'selected' : ''}>${esc(COMPUTER_PROVIDER_LABELS[p] || p)}</option>`).join('')}</select>
       <label class="computer-size"${tip('cpu')}><input class="cf-cpu" type="number" min="1" ${sizeAttrs('cpu')} step="1" inputmode="numeric" value="${esc(v.cpu ?? '')}" aria-label="CPU"><span>CPU</span></label>
       <label class="computer-size"${tip('memory')}><input class="cf-memory" type="number" min="0.5" ${sizeAttrs('memory')} step="0.5" inputmode="decimal" value="${esc(gbOf(v.memoryMb))}" aria-label="Memory in GB"><span>GB RAM</span></label>
       <label class="computer-size"${tip('disk')}><input class="cf-disk" type="number" min="1" ${sizeAttrs('disk')} step="1" inputmode="numeric" value="${esc(v.diskGb ?? '')}" aria-label="Disk in GB"><span>GB disk</span></label>
@@ -1559,7 +1561,8 @@ function computerBlockHtml(name, value, inherited, opts = {}) {
 // when the task pauses with nothing running (wiki features/computers).
 function computerPendingChip(change) {
   if (!change) return '';
-  const tip = `Still ${describeMachineShape(change.from)}. Moves to ${describeMachineShape(change.to)} when the task next pauses with nothing running.`;
+  const on = (provider) => (provider ? ` on ${COMPUTER_PROVIDER_LABELS[provider] || provider}` : '');
+  const tip = `Still ${describeMachineShape(change.from)}${on(change.provider?.from)}. Moves to ${describeMachineShape(change.to)}${on(change.provider?.to)} when the task next pauses with nothing running.`;
   return `<button type="button" class="chip computer-pending" title="${esc(tip)}" aria-label="${esc(tip)}">Moves at next pause</button>`;
 }
 // "Disk 17/22 GB" — the task computer's last measured disk; memory, when it

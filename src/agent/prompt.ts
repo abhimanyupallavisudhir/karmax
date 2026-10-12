@@ -1,5 +1,5 @@
 import { describeMachine, sameMachine, type MachineShape } from '../domain/computer.js';
-import { computerLimits, providerLabel, type ComputerLimits, type EffectiveComputerLimits } from '../domain/computer-limits.js';
+import { computerLimits, providerFeatures as computerFeatures, providerLabel, type ComputerLimits, type EffectiveComputerLimits } from '../domain/computer-limits.js';
 import type { DiskSpace } from '../world/disk.js';
 import { AgentProfile, AgentRole, TaskInput } from '../domain/types.js';
 import { WorldHandle, worldRepos, worldWorkingDirectory } from '../world/types.js';
@@ -92,6 +92,10 @@ export interface AssembleArgs {
   disk?: DiskSpace;
   /** What a computer on the organization's provider account may be. */
   limits?: EffectiveComputerLimits;
+  /** The organization's other connected cloud providers, with the largest disk each allows. */
+  providers?: Array<{ provider: string; diskGb?: number }>;
+  /** The provider the task's own Computer now names, when its world still runs elsewhere. */
+  moveTo?: string;
   /** Extra bindings for non-do roles (error, stage, transcript, reviewInfo, skills). */
   bindings?: Record<string, string>;
 }
@@ -122,7 +126,7 @@ Git ancestry for recovered, forked, or retargeted work: "recorded base" is the i
     title: args.task.title,
     prompt: args.task.prompt,
     worldPath: worldWorkingDirectory(args.world),
-    worldRepos: [describeRepos(args.world), describeEnvironment(args.world), describeComputer(args.world, args.task.taskId, args.computer, args.disk, args.limits),
+    worldRepos: [describeRepos(args.world), describeEnvironment(args.world), describeComputer(args.world, args.task.taskId, args.computer, args.disk, args.limits, args.providers, args.moveTo),
       describeData(args.world)].filter(Boolean).join('\n'),
     branch: args.world.branch,
     base: args.world.base,
@@ -164,7 +168,42 @@ function describeEnvironment(world: WorldHandle): string {
 
 /** A cloud world's machine, what its provider account allows, and how the
  * agent can get a bigger one itself (wiki features/computers). */
-function describeComputer(world: WorldHandle, taskId: string, requested?: MachineShape, disk?: DiskSpace, given?: EffectiveComputerLimits): string {
+function describeComputer(world: WorldHandle, taskId: string, requested?: MachineShape, disk?: DiskSpace, given?: EffectiveComputerLimits,
+  providers: Array<{ provider: string; diskGb?: number }> = [], moveTo?: string): string {
+  const base = describeMachineAndRoom(world, taskId, requested, disk, given, moveTo);
+  if (!base) return '';
+  return base + describeOtherProviders(world, taskId, disk, given, providers, moveTo);
+}
+
+/** How a move to another provider works, said wherever one is offered or pending. */
+function moveFacts(world: WorldHandle, target: string): string {
+  return 'The move goes through this world\'s checkpoint: tracked files, uncommitted changes and project data come across; '
+    + 'Git-ignored files (dependencies, build output) and running processes do not, so run the install commands again. '
+    + `If ${providerLabel(target)} cannot take the task, it stays on ${providerLabel(world.kind)} and you are told why.`;
+}
+
+/** The organization's other providers that give more disk than this one can
+ * (wiki features/computers: moving a running task), and how to move there. */
+function describeOtherProviders(world: WorldHandle, taskId: string, disk: DiskSpace | undefined, given: EffectiveComputerLimits | undefined,
+  providers: Array<{ provider: string; diskGb?: number }>, moveTo?: string): string {
+  if (moveTo && moveTo !== world.kind) return '';
+  const here = given?.diskGb ?? (disk ? Math.round(disk.totalKb / 2 ** 20) : (world.meta?.computer as MachineShape | undefined)?.diskGb ?? 0);
+  // A desktop world needs a provider with a desktop; VM providers have none.
+  const desktop = world.meta?.environmentFlavor === 'desktop';
+  const better = providers.filter((candidate) => candidate.provider !== world.kind && (candidate.diskGb ?? 0) > here
+    && (!desktop || computerFeatures(candidate.provider).desktop));
+  if (!better.length) return '';
+  const best = better.reduce((a, b) => ((b.diskGb ?? 0) > (a.diskGb ?? 0) ? b : a));
+  const used = disk ? Math.round(disk.usedKb / 2 ** 20) : here;
+  const want = Math.min(best.diskGb!, Math.max(100, Math.ceil((used * 2) / 10) * 10));
+  const list = better.map((candidate) => `${providerLabel(candidate.provider)} (up to ${candidate.diskGb} GB disk)`).join(', ');
+  return ` This organization also has ${list}. To move there, platform_request(PATCH, "/api/tasks/${taskId}/params", `
+    + `{"params": {"computer": {"provider": "${best.provider}", "diskGb": ${want}}}}); the move happens at your next pause(3) without jobs. `
+    + moveFacts(world, best.provider);
+}
+
+function describeMachineAndRoom(world: WorldHandle, taskId: string, requested?: MachineShape, disk?: DiskSpace, given?: EffectiveComputerLimits,
+  moveTo?: string): string {
   const shape = world.meta?.computer as MachineShape | undefined;
   if (!shape) return '';
   // Only what the account said, or a person entered: a documented default is
@@ -179,6 +218,10 @@ function describeComputer(world: WorldHandle, taskId: string, requested?: Machin
     limits.diskGb != null ? `${limits.diskGb} GB disk` : ''].filter(Boolean);
   const allows = allowed.length ? ` This ${providerLabel(world.kind)} account allows up to ${allowed.length > 1
     ? `${allowed.slice(0, -1).join(', ')} and ${allowed.at(-1)}` : allowed[0]}.` : '';
+  if (moveTo && moveTo !== world.kind)
+    return `Computer: ${current}.${allows} This task is moving to ${providerLabel(moveTo)}: you move when the task parks, so end your turn `
+      + 'with pause(3) without jobs. A pause that waits on jobs keeps this machine, so first let them finish or stop them (stop_job). '
+      + moveFacts(world, moveTo);
   if (world.kind === 'fly' || world.kind === 'hetzner') return describeVmComputer(world, taskId, shape, requested, { current, allows, totalGb, limits });
   // A world moves to a new size only once it parks; a pause on jobs keeps it awake.
   const move = 'end your turn with pause(3) without jobs. A pause that waits on jobs keeps this machine, so first let them finish or stop them (stop_job). '

@@ -40,10 +40,11 @@ describe('computer value', () => {
     expect(describeMachine({ memoryMb: 1536 })).toBe('2 CPU · 1.5 GB');
   });
 
-  it('lets a running task resize but not become a different computer', () => {
+  it('lets a running task resize or move clouds, but not become a different computer', () => {
     const current = { provider: 'e2b', cpu: 2, flavor: 'headless' as const };
     expect(() => assertInFlightComputerEdit(current, { provider: 'e2b', cpu: 8, diskGb: 40, hibernateAfterDays: 1 })).not.toThrow();
-    expect(() => assertInFlightComputerEdit(current, { provider: 'daytona' })).toThrow(/provider/);
+    expect(() => assertInFlightComputerEdit(current, { provider: 'daytona' })).not.toThrow();
+    expect(() => assertInFlightComputerEdit(current, { provider: 'container' })).toThrow(/between cloud providers/);
     expect(() => assertInFlightComputerEdit(current, { flavor: 'desktop' })).toThrow(/experience/);
     expect(() => assertInFlightComputerEdit(current, { network: { unrestricted: false, allowDomains: [], allowCidrs: [] } })).toThrow(/network/);
     expect(() => assertInFlightComputerEdit(current, { network: { unrestricted: true } })).not.toThrow();
