@@ -270,7 +270,7 @@ describe('agent turn admission', () => {
       agentSlotGranted: true, agentAdmissionManaged: true, worldHandle: world.handle,
       messages: [{ id: 'm0', role: 'user', text: 'work', ts: 0 }],
       task: { taskId: task.id, projectId: project.id, title: task.title, prompt: 'work', project: {}, workflow: 'just-do',
-        agents: { do: { provider: 'claude' } } },
+        agents: { do: { provider: 'claude', model: 'claude-opus-5-5', effort: 'xhigh' } } },
     } as any);
 
     expect((await store.usageSummary('org_personal'))).toMatchObject({
@@ -279,7 +279,11 @@ describe('agent turn admission', () => {
     });
     const event = (await store.db.prepare("SELECT projectId, taskId, worldId, fundingSource, metadata FROM usage_events WHERE kind='agent.tokens'").get()) as any;
     expect(event).toMatchObject({ projectId: project.id, taskId: task.id, worldId: task.id, fundingSource: 'customer' });
-    expect(JSON.parse(event.metadata)).toMatchObject({ inputTokens: 20, outputTokens: 5, cacheReadTokens: 3 });
+    // The effort is part of what was run: cost per task differs several-fold between efforts of one model.
+    expect(JSON.parse(event.metadata)).toMatchObject({ inputTokens: 20, outputTokens: 5, cacheReadTokens: 3,
+      model: 'claude-opus-5-5', effort: 'xhigh' });
+    const request = (await store.db.prepare("SELECT metadata FROM usage_events WHERE kind='agent.request'").get()) as any;
+    expect(JSON.parse(request.metadata)).toMatchObject({ model: 'claude-opus-5-5', effort: 'xhigh' });
     await world.destroy();
   });
 

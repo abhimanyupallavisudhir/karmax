@@ -1307,13 +1307,15 @@ function wireModelField(field, { fallbackProvider } = {}) {
 // ── Compare models: intelligence against cost or time ────────────────────────
 // Artificial Analysis benchmarks (bundled with tavya, or fetched daily by the
 // server when it has a key) of the models a harness here can run, one point per
-// harness:model:effort. The line is the Pareto frontier, drawn as Artificial
-// Analysis draws it: straight through every point no cheaper (or faster) point
-// beats. (A convex hull would skip models that are the best buy for some budget.)
+// harness:model:effort. Cost and time are per task: the tokens LiveBench
+// measured that model and effort spending on a question, or an estimate (≈).
+// The line is the Pareto frontier, drawn as Artificial Analysis draws it:
+// straight through every point no cheaper (or faster) point beats. (A convex
+// hull would skip models that are the best buy for some budget.)
 // Picking a point fills the field.
 const MODEL_CHART_METRICS = {
-  cost: { label: 'Cost', axis: '$ per answer', ticks: [0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5], format: (v) => `$${Number(v.toPrecision(2))}` },
-  seconds: { label: 'Time', axis: 'seconds per answer', ticks: [0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000], format: (v) => `${v < 10 ? Math.round(v * 10) / 10 : Math.round(v)} s` },
+  cost: { label: 'Cost', axis: '$ per task', ticks: [0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5], format: (v) => `$${Number(v.toPrecision(2))}` },
+  seconds: { label: 'Time', axis: 'seconds per task', ticks: [0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000], format: (v) => `${v < 10 ? Math.round(v * 10) / 10 : Math.round(v)} s` },
 };
 function loadModelBenchmarks() {
   const organizationId = S.organizationId || '';
@@ -1411,7 +1413,7 @@ function openModelChart(current, onPick, opener) {
     <div class="mc-plot"><div class="mc-empty">Loading…</div></div>
     <div class="mc-foot">
       <div class="mc-legend"></div>
-      <span class="mc-source">${policyTip('Intelligence is the Artificial Analysis Intelligence Index. Cost and time are for a 500-token answer to a short prompt, thinking included, as Artificial Analysis measures them. Thin lines join one model\'s effort levels; the dark line is the most intelligence you can get for the cost or time.')} Data: <a href="https://artificialanalysis.ai/" target="_blank" rel="noopener">Artificial Analysis</a></span>
+      <span class="mc-source">${policyTip('Intelligence is the Artificial Analysis Intelligence Index. Cost and time are per task: what a model spends answering a LiveBench question, thinking included. LiveBench measured some models and effort levels; the rest (≈) are estimated from them. Thin lines join one model\'s effort levels; the dark line is the most intelligence you can get for the cost or time.')} <span>Data: <a href="https://artificialanalysis.ai/" target="_blank" rel="noopener">Artificial Analysis</a>, <a href="https://livebench.ai/" target="_blank" rel="noopener">LiveBench</a></span></span>
     </div>
   </div>`;
   document.body.appendChild(overlay);
@@ -1424,8 +1426,9 @@ function openModelChart(current, onPick, opener) {
     const model = data?.models[Number(group.dataset.index)];
     if (!model) return;
     const ref = formatModelRef(model.ref);
+    const approx = model.measured ? '' : '≈';
     tip.innerHTML = `<b>${esc(benchmarkLabel(model))}</b><code>${esc(ref)}</code>
-      <span>Intelligence ${esc(String(model.intelligence))}${model.cost ? ` · ${esc(MODEL_CHART_METRICS.cost.format(model.cost))} per answer` : ''}${model.seconds ? ` · ${esc(MODEL_CHART_METRICS.seconds.format(model.seconds))}` : ''}</span>`;
+      <span>Intelligence ${esc(String(model.intelligence))}${model.cost ? ` · ${approx}${esc(MODEL_CHART_METRICS.cost.format(model.cost))} per task` : ''}${model.seconds ? ` · ${approx}${esc(MODEL_CHART_METRICS.seconds.format(model.seconds))}` : ''}</span>`;
     tip.hidden = false;
     const dot = group.querySelector('.mc-dot').getBoundingClientRect();
     const box = plot.getBoundingClientRect();
@@ -1444,7 +1447,7 @@ function openModelChart(current, onPick, opener) {
     const missing = data.models.filter((model) => !hidden.has(model.ref.provider) && !model[metric]).length;
     overlay.querySelector('.mc-legend').innerHTML = harnesses.map((provider) => `<button type="button" class="mc-key" data-harness="${esc(provider)}" aria-pressed="${!hidden.has(provider)}"><i></i>${esc(provider)}</button>`).join('')
       + '<span class="mc-key-frontier"><i></i>Pareto frontier</span>'
-      + (missing && points.length ? `<span class="mc-missing" title="Artificial Analysis has not measured these yet">${missing} without ${MODEL_CHART_METRICS[metric].label.toLowerCase()} data</span>` : '');
+      + (missing && points.length ? `<span class="mc-missing" title="Not measured yet">${missing} without ${MODEL_CHART_METRICS[metric].label.toLowerCase()} data</span>` : '');
   };
   overlay.addEventListener('click', (event) => {
     if (event.target === overlay || event.target.closest('.mc-close')) return close();
