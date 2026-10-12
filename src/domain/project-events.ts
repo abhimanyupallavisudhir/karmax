@@ -277,6 +277,12 @@ export function triggerMessage(trigger: TriggerContext): string {
   return triggerPromptSection(trigger).replace(/^This run was started by the event/, 'While you work on this, another event arrived:');
 }
 
+/** The message a following task receives for a matching event. */
+export function followMessage(trigger: TriggerContext, follow: Pick<EventFollow, 'id' | 'once'>): string {
+  const how = follow.once ? 'the event you were waiting for arrived' : `an event you follow arrived (${follow.id})`;
+  return triggerPromptSection(trigger).replace(/^This run was started by the event/, `${how[0]!.toUpperCase()}${how.slice(1)}:`);
+}
+
 /**
  * What a run started by an event looks like: the event on `params.trigger`
  * (commands read it from `$TAVYA_EVENT`), the prompt section appended, and a
@@ -340,12 +346,14 @@ export interface EventFollow {
   createdAt: number;
 }
 
-export function followMatches(follow: Pick<EventFollow, 'taskId' | 'type' | 'source' | 'subject' | 'where' | 'includeSelf'>, event: ProjectEvent): boolean {
+/** `emitter` is the task id the follower's own emits carry (a run emits as its series). */
+export function followMatches(follow: Pick<EventFollow, 'taskId' | 'type' | 'source' | 'subject' | 'where' | 'includeSelf'>, event: ProjectEvent,
+  emitter = follow.taskId): boolean {
   if (!eventTypeMatches(follow.type || '*', event.type) || !eventSourceMatches(follow.source, event.source)) return false;
   if (follow.subject && event.subject !== follow.subject) return false;
   if (event.origin === 'self' && !follow.includeSelf) return false;
   // A task never hears its own emits.
-  if (event.source === `task:${follow.taskId}`) return false;
+  if (event.source === `task:${follow.taskId}` || event.source === `task:${emitter}`) return false;
   return filterMatches(event.payload, follow.where);
 }
 

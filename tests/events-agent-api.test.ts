@@ -99,4 +99,24 @@ describe('events through an agent\'s task token', () => {
       expect(String(refused)).toMatch(/project:settings:write/);
     } finally { a.restore(); }
   });
+
+  it('an agent follows events for its own task, waits on one, and unfollows', async () => {
+    const a = await agent('developer');
+    try {
+      const follow = json(await a.call('follow_events', { task_id: a.task.id, type: 'deploy.*', where: { env: 'prod' }, once: true }));
+      expect(follow).toMatchObject({ taskId: a.task.id, type: 'deploy.*', where: { env: 'prod' }, once: true, id: expect.stringMatching(/^fol_/) });
+      const bad = await a.call('follow_events', { task_id: a.task.id }).catch((error: Error) => error.message);
+      expect(String(bad)).toMatch(/at least/);
+      await a.call('follow_events', { task_id: a.task.id, subject: 'https://github.com/o/r/issues/1' });
+      expect(json(await a.request('GET', `/api/tasks/${a.task.id}/follows`)).follows).toHaveLength(2);
+      expect(json(await a.call('unfollow_events', { task_id: a.task.id, follow_id: follow.id }))).toEqual({ unfollowed: [follow.id] });
+      expect(json(await a.call('unfollow_events', { task_id: a.task.id })).unfollowed).toHaveLength(1);
+      expect(await store.taskFollows(a.task.id)).toEqual([]);
+      // Another project's task is out of this token's reach.
+      const elsewhere = await store.createTask({ projectId: (await store.createProject('Other')).id, title: 'X', workflow: 'software-dev',
+        workflowVersion: '1.28.0', params: { prompt: 'p' } });
+      const refused = await a.call('follow_events', { task_id: elsewhere.id, type: 'x.y' }).catch((error: Error) => error.message);
+      expect(String(refused)).toMatch(/403|not allowed|missing|forbidden|scope/i);
+    } finally { a.restore(); }
+  });
 });

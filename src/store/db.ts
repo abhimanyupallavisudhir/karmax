@@ -4821,6 +4821,7 @@ export class Store {
       (await this.db.prepare('DELETE FROM events WHERE taskId = ?').run(taskId));
       (await this.db.prepare('DELETE FROM task_tags WHERE taskId = ?').run(taskId));
       (await this.db.prepare('DELETE FROM task_subscribers WHERE taskId = ?').run(taskId));
+      (await this.db.prepare('DELETE FROM task_follows WHERE taskId = ?').run(taskId));
       (await this.db.prepare('DELETE FROM task_confirmation WHERE taskId = ?').run(taskId));
       (await this.db.prepare('DELETE FROM confirmation_votes WHERE taskId = ?').run(taskId));
       (await this.db.prepare('DELETE FROM collaboration_requests WHERE requesterTaskId = ? OR targetTaskId = ?').run(taskId, taskId));
@@ -9195,6 +9196,13 @@ export class Store {
   }
 
   /** Runs one armed task started from events since `since` (its hourly limit). */
+  /** Events delivered (or being delivered) to a following task since `since`. */
+  async projectEventsToldSince(taskId: string, since: number): Promise<number> {
+    const row = await this.db.prepare(`SELECT COUNT(*) n FROM project_event_claims
+      WHERE taskId=? AND state IN ('pending', 'told') AND updatedAt>?`).get(taskId, since) as { n: number };
+    return Number(row?.n ?? 0);
+  }
+
   async projectEventRunsSince(taskId: string, since: number): Promise<number> {
     const row = await this.db.prepare(`SELECT COUNT(*) n FROM project_event_claims
       WHERE taskId=? AND state IN ('pending', 'started') AND updatedAt>?`).get(taskId, since) as { n: number };
@@ -9206,7 +9214,7 @@ export class Store {
   async projectEventSlot(taskId: string, concurrencyKey: string): Promise<{ runId?: string } | undefined> {
     const row = await this.db.prepare(`SELECT c.state, c.runId FROM project_event_claims c LEFT JOIN tasks t ON t.id=c.runId
       WHERE c.taskId=? AND c.concurrencyKey=? AND (c.state='pending' OR (c.state='started' AND t.id IS NOT NULL
-        AND IFNULL(json_extract(t.lastView, '$.status'), 'active') NOT IN ('done', 'failed', 'cancelled')))
+        AND COALESCE(json_extract(t.lastView, '$.status'), 'active') NOT IN ('done', 'failed', 'cancelled')))
       ORDER BY CASE c.state WHEN 'started' THEN 0 ELSE 1 END LIMIT 1`).get(taskId, concurrencyKey) as { state?: string; runId?: string } | undefined;
     if (!row) return undefined;
     return row.state === 'started' && row.runId ? { runId: String(row.runId) } : {};
@@ -9229,11 +9237,12 @@ export class Store {
   }
 
   /** Follows of tasks in a project that is not finished (the dispatcher's candidates). */
-  async liveTaskFollows(projectId: string): Promise<EventFollow[]> {
-    const rows = await this.db.prepare(`SELECT f.* FROM task_follows f JOIN tasks t ON t.id=f.taskId
-      WHERE f.projectId=? AND IFNULL(json_extract(t.lastView, '$.status'), 'active') NOT IN ('done', 'failed', 'cancelled')
+  async liveTaskFollows(projectId: string): Promise<Array<EventFollow & { emitter: string }>> {
+    const rows = await this.db.prepare(`SELECT f.*, COALESCE(json_extract(t.params, '$.runOf'), t.id) emitter
+      FROM task_follows f JOIN tasks t ON t.id=f.taskId
+      WHERE f.projectId=? AND COALESCE(json_extract(t.lastView, '$.status'), 'active') NOT IN ('done', 'failed', 'cancelled')
       ORDER BY f.createdAt`).all(projectId);
-    return rows.map(taskFollowFromRow);
+    return rows.map((row: any) => ({ ...taskFollowFromRow(row), emitter: String(row.emitter) }));
   }
 
   async taskFollows(taskId: string): Promise<EventFollow[]> {
@@ -9262,7 +9271,7 @@ export class Store {
       await this.db.prepare(`DELETE FROM project_event_claims WHERE receivedAt<?`).run(before);
       // A finished task hears nothing more; one deleted is gone.
       await this.db.prepare(`DELETE FROM task_follows WHERE taskId NOT IN (SELECT id FROM tasks WHERE
-        IFNULL(json_extract(lastView, '$.status'), 'active') NOT IN ('done', 'failed', 'cancelled'))`).run();
+        COALESCE(json_extract(lastView, '$.status'), 'active') NOT IN ('done', 'failed', 'cancelled'))`).run();
       return Number((await this.db.prepare(`DELETE FROM project_events WHERE id IN
         (SELECT id FROM project_events WHERE receivedAt<? ORDER BY receivedAt LIMIT 10000)`).run(before)).changes);
     });

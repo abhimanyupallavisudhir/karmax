@@ -1188,8 +1188,10 @@ export class GitHubAppService {
     const projectIds = await this.store.projectIdsForRepository(repository.id);
     if (!projectIds.length) return [];
     const action = typeof payload.action === 'string' && /^[a-z0-9_-]+$/i.test(payload.action) ? `.${payload.action}` : '';
-    const subject = [payload.comment, payload.issue, payload.pull_request, payload.release, payload.workflow_run, payload.check_run,
-      payload.deployment_status, repositoryPayload].map((object) => object?.html_url).find((url) => typeof url === 'string');
+    // The thread a comment or review belongs to, so whoever follows an issue or
+    // pull request hears what is said on it.
+    const subject = [payload.issue, payload.pull_request, payload.discussion, payload.release, payload.workflow_run, payload.check_run,
+      payload.deployment_status, payload.comment, repositoryPayload].map((object) => object?.html_url).find((url) => typeof url === 'string');
     const slug = this.options.appSlug;
     const origin = slug && payload.sender?.type === 'Bot' && payload.sender?.login === `${slug}[bot]` ? 'self' as const : 'external' as const;
     const { installation: _installation, ...rest } = payload;

@@ -882,6 +882,13 @@ describe('GitHub App integration', () => {
     const echo = await deliver('issues', 'delivery-issue-2', labeled({ login: 'tavya-test[bot]', type: 'Bot' }));
     expect(echo.inbox?.[0]?.origin).toBe('self');
 
+    // A comment is about its issue (or pull request), so the issue's followers hear it.
+    const comment = await deliver('issue_comment', 'delivery-comment-1', { installation: { id: 42 }, action: 'created',
+      sender: { login: 'octocat', type: 'User' }, repository: { id: 99, full_name: 'acme/app' },
+      issue: { number: 12, html_url: 'https://github.com/acme/app/issues/12' },
+      comment: { body: 'also the footer', html_url: 'https://github.com/acme/app/issues/12#issuecomment-1' } });
+    expect(comment.inbox?.[0]).toMatchObject({ type: 'github.issue_comment.created', subject: 'https://github.com/acme/app/issues/12' });
+
     // A repository no project has, or no repository at all, is not a project event.
     expect((await deliver('issues', 'delivery-issue-3', { ...labeled({ login: 'x', type: 'User' }),
       repository: { id: 7, full_name: 'acme/other' } })).inbox).toBeUndefined();

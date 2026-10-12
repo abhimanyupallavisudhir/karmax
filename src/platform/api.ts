@@ -35,8 +35,8 @@ import {
 } from '../coordinators/names.js';
 import { TaskRecord, TaskView, AttentionAsk, Message, Project, TaskInput, ImageRef, FileRef, Tag, SavedView, TaskQuery, AgentRole, AgentSpec, AgentAuthority, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency, remotePolicyOf, ResourceAccess, ResourceTarget } from '../domain/types.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable, awaitsSuccessOf } from '../domain/triggers.js';
-import { applyTriggerContext, normalizeEventInput, type ProjectEvent, type ProjectEventClaim, type ProjectEventInput,
-  type ProjectEventOrigin, type TriggerContext } from '../domain/project-events.js';
+import { applyTriggerContext, normalizeEventInput, validateFollow, type EventFilter, type EventFollow, type ProjectEvent, type ProjectEventClaim,
+  type ProjectEventInput, type ProjectEventOrigin, type TriggerContext } from '../domain/project-events.js';
 import { newId } from '../util/id.js';
 import { IncomingWebhooks, WebhookConfigError, webhookDeliveryKey, type IncomingWebhook } from '../integrations/incoming-webhooks.js';
 import { isChatPlatform, type ChatPlatform } from '../integrations/chat-platforms.js';
@@ -204,6 +204,8 @@ const QUERY_TIMEOUT_MS = 3000;
  * "clicked queue, nothing happened, pile of tasks stuck at setup" failure mode).
  */
 const START_TIMEOUT_MS = 12_000;
+/** Follows one task may hold (wiki features/events-and-automations). */
+const MAX_FOLLOWS_PER_TASK = 50;
 /** How long a create waits for the advisory GitHub merge preflight's warning. */
 const PREFLIGHT_WAIT_MS = 2_000;
 const TERMINAL_CLEANUP_TIMEOUT_MS = 10_000;
@@ -2735,6 +2737,7 @@ export class KarmaxApi {
     }));
     run = (await this.inheritTaskDelegation(series, run));
     (await this.persistTaskCredentialPolicies(run));
+    (await this.followTriggerSubject(run, trigger));
     const { startType, input } = await this.buildStart(run, false, caller);
     try {
       await withTimeout(
@@ -2775,6 +2778,7 @@ export class KarmaxApi {
     delete fired.triggerPending;
     (await this.deps.store.updateTaskParams(taskId, fired as any));
     if (shaped && shaped.title !== task.title) (await this.deps.store.setTaskTitle(taskId, shaped.title));
+    (await this.followTriggerSubject(task, trigger));
     try {
       const { startType, input } = await this.buildStart({ ...task, ...(shaped ? { title: shaped.title } : {}), params: fired as TaskRecord['params'] }, false, caller);
       await withTimeout(
@@ -2851,6 +2855,49 @@ export class KarmaxApi {
   }
 
   /** Newest first, each with what it did for every armed task it reached. */
+  /** A run started by an event follows what the event is about: the issue's
+   *  comments, the chat thread's replies reach it as messages. */
+  private async followTriggerSubject(task: TaskRecord, trigger: TriggerContext | undefined): Promise<void> {
+    if (!trigger?.subject || (await this.deps.store.taskFollows(task.id)).some((follow) => follow.subject === trigger.subject && !follow.type && !follow.source && !follow.where)) return;
+    (await this.deps.store.addTaskFollow({ id: newId('fol'), taskId: task.id, projectId: task.projectId, subject: trigger.subject, createdAt: Date.now() }));
+  }
+
+  /**
+   * Follow project events (wiki features/events-and-automations): each match
+   * reaches the task's conversation as a message. A message ends a pause, so an
+   * agent waits for an event by following it `once` and pausing. Following reads
+   * the project's events and messages the task, so it needs both rights.
+   */
+  async followProjectEvents(token: string, taskId: string, input: { type?: string; source?: string; subject?: string; where?: EventFilter;
+    includeSelf?: boolean; once?: boolean }): Promise<EventFollow> {
+    const task = (await this.deps.store.getTask(taskId));
+    (await this.require(token, 'list_events', { projectId: task?.projectId ?? '__missing__', taskId }));
+    (await this.require(token, 'message_agent', { projectId: task?.projectId ?? '__missing__', taskId }));
+    if (!task) throw new NotFoundError(`no task ${taskId}`);
+    const errors = validateFollow(input);
+    if (errors.length) throw new ValidationError(errors.join('; '));
+    if ((await this.deps.store.taskFollows(taskId)).length >= MAX_FOLLOWS_PER_TASK)
+      throw new ValidationError(`a task follows at most ${MAX_FOLLOWS_PER_TASK} kinds of event; unfollow one first`);
+    const pick = <K extends keyof typeof input>(key: K) => (input[key] === undefined || input[key] === false ? {} : { [key]: input[key] });
+    return this.deps.store.addTaskFollow({ id: newId('fol'), taskId, projectId: task.projectId,
+      ...pick('type'), ...pick('source'), ...pick('subject'), ...pick('where'), ...pick('includeSelf'), ...pick('once'), createdAt: Date.now() });
+  }
+
+  async listTaskFollows(token: string, taskId: string): Promise<EventFollow[]> {
+    const task = (await this.deps.store.getTask(taskId));
+    (await this.require(token, 'list_events', { projectId: task?.projectId ?? '__missing__', taskId }));
+    if (!task) throw new NotFoundError(`no task ${taskId}`);
+    return this.deps.store.taskFollows(taskId);
+  }
+
+  async unfollowProjectEvents(token: string, taskId: string, followId: string): Promise<void> {
+    const task = (await this.deps.store.getTask(taskId));
+    (await this.require(token, 'message_agent', { projectId: task?.projectId ?? '__missing__', taskId }));
+    const follow = (await this.deps.store.getTaskFollow(followId));
+    if (!task || follow?.taskId !== taskId) throw new NotFoundError(`no follow ${followId} on task ${taskId}`);
+    (await this.deps.store.deleteTaskFollow(followId));
+  }
+
   async listProjectEvents(token: string, projectId: string, options: { limit?: number; before?: number; type?: string; source?: string } = {}):
     Promise<Array<ProjectEvent & { claims: ProjectEventClaim[] }>> {
     (await this.require(token, 'list_events', { projectId }));
@@ -2949,7 +2996,9 @@ export class KarmaxApi {
           // A reply to the bot's own message belongs to the thread that message answered.
           const thread = mention.thread ? (await this.deps.store.kvGet(chatThreadKey(hook.id, mention.thread))) ?? mention.thread : undefined;
           const { key, url, ...payload } = { ...mention, ...(thread ? { thread } : {}) };
-          events.push(await this.ingestProjectEvent(from, { type: 'chat.mention', key, ...(url ? { subject: url } : {}), payload: { ...payload, ...(url ? { url } : {}) } }));
+          // The subject is the conversation, so a run started by a mention hears the replies in its thread.
+          const subject = `${from.source}/${mention.channel.id}/${thread ?? key}`;
+          events.push(await this.ingestProjectEvent(from, { type: 'chat.mention', key, subject, payload: { ...payload, ...(url ? { url } : {}) } }));
         }
       }
       if (events.length || !inbound?.answer) await hooks.noteDelivery(hook.id);

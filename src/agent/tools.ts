@@ -577,6 +577,29 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     },
   },
   {
+    name: 'follow_events',
+    description: 'Follow project events: each matching event reaches the task\'s conversation as a message. To wait for an event, '
+      + 'follow it with once: true, then pause; the message ends the pause. A run started by an event already follows its subject.',
+    parameters: {
+      type: 'object',
+      properties: {
+        task_id: { type: 'string', description: 'Usually your own task.' },
+        type: { type: 'string', description: 'A type or family, e.g. "github.issue_comment.*".' },
+        source: { type: 'string', description: 'e.g. "github", "webhook:<hookId>", "task:<taskId>".' },
+        subject: { type: 'string', description: 'An exact subject, e.g. an issue or pull request URL.' },
+        where: { type: 'object', description: 'Payload filter, as in an event trigger.' },
+        include_self: { type: 'boolean', description: 'Also hear what the tavya GitHub App itself did.' },
+        once: { type: 'boolean', description: 'Stop following after the first match (a wait).' },
+      },
+      required: ['task_id'],
+    },
+  },
+  {
+    name: 'unfollow_events',
+    description: 'Stop following project events: one follow by id, or all of the task\'s follows.',
+    parameters: { type: 'object', properties: { task_id: { type: 'string' }, follow_id: { type: 'string' } }, required: ['task_id'] },
+  },
+  {
     name: 'get_task',
     description: "Get a task's current view-model.",
     parameters: { type: 'object', properties: { task_id: { type: 'string' } }, required: ['task_id'] },
@@ -1436,6 +1459,18 @@ export function platformToolHandlers(
       return JSON.stringify(await platformRequest('POST', `/api/projects/${encodeURIComponent(String(args?.project_id ?? ''))}/events`, {
         type: args?.type, key: args?.key, subject: args?.subject, payload: args?.payload,
       }));
+    },
+    async follow_events(args) {
+      return JSON.stringify(await platformRequest('POST', `/api/tasks/${encodeURIComponent(String(args?.task_id ?? ''))}/follows`, {
+        type: args?.type, source: args?.source, subject: args?.subject, where: args?.where, includeSelf: args?.include_self, once: args?.once,
+      }));
+    },
+    async unfollow_events(args) {
+      const taskId = encodeURIComponent(String(args?.task_id ?? ''));
+      const follows = args?.follow_id ? [{ id: String(args.follow_id) }]
+        : ((await platformRequest('GET', `/api/tasks/${taskId}/follows`)) as { follows: Array<{ id: string }> }).follows;
+      for (const follow of follows) await platformRequest('DELETE', `/api/tasks/${taskId}/follows/${encodeURIComponent(follow.id)}`);
+      return JSON.stringify({ unfollowed: follows.map((follow) => follow.id) });
     },
     async get_task(args) {
       return JSON.stringify(await platformRequest('GET', `/api/tasks/${encodeURIComponent(String(args?.task_id ?? ''))}`));
