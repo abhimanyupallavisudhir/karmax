@@ -230,7 +230,9 @@ describe('software-dev 1.27: one conversation, several agents (real Temporal + g
       text: 'Why is pigeon missing?\n@pause 30' });
     await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 20_000 }).toBe('timer');
     expect((await view(handle)).messages.at(-1)).toMatchObject({ role: 'agent', to: ['user:bea'] });
-    expect((await h.store.eventsOfType(taskId, ['task.mentioned'])).map((e: any) => e.payload.recipients)).toEqual([['user:bea']]);
+    // A reply, not an ask (#613): the task waits on its timer, not on Bea.
+    expect((await h.store.eventsOfType(taskId, ['task.mentioned'])).map((e: any) => e.payload))
+      .toEqual([expect.objectContaining({ recipients: ['user:bea'], ask: false })]);
     await handle.signal('cancel');
     await handle.result();
   });
@@ -244,7 +246,8 @@ describe('software-dev 1.27: one conversation, several agents (real Temporal + g
       text: 'Split it up.\n@subtask Child :: Work.\\n@sleep 60000\n@wait' });
     await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 30_000 }).toBe('subtask');
     expect((await view(handle)).messages.findLast((m: any) => m.role === 'agent')).toMatchObject({ to: ['user:bea'] });
-    expect((await h.store.eventsOfType(taskId, ['task.mentioned'])).map((e: any) => e.payload.recipients)).toEqual([['user:bea']]);
+    expect((await h.store.eventsOfType(taskId, ['task.mentioned'])).map((e: any) => e.payload))
+      .toEqual([expect.objectContaining({ recipients: ['user:bea'], ask: false })]);
     await handle.signal('cancel');
     await handle.result();
   }, 60_000);

@@ -17,8 +17,8 @@ import {
   type ScheduleTrigger,
 } from '../domain/triggers.js';
 import {
-  DEFAULT_MAX_RUNS_PER_HOUR, MAX_EVENT_HOPS, renderTemplate, triggerContext, triggerMessage,
-  type ProjectEvent, type ProjectEventClaim, type ProjectEventClaimState, type TriggerContext,
+  DEFAULT_MAX_RUNS_PER_HOUR, MAX_EVENT_HOPS, followMatches, followMessage, renderTemplate, triggerContext, triggerMessage,
+  type EventFollow, type ProjectEvent, type ProjectEventClaim, type ProjectEventClaimState, type TriggerContext,
 } from '../domain/project-events.js';
 
 /**
@@ -81,7 +81,7 @@ export interface TriggerSchedulerDeps {
    */
   fire: (taskId: string, mode: 'self' | 'clone', trigger?: TriggerContext) => Promise<unknown>;
   /** Give an unfinished run a further event of its concurrency key (`tell`). */
-  tell?: (runId: string, trigger: TriggerContext) => Promise<unknown>;
+  tell?: (runId: string, trigger: TriggerContext, text?: string) => Promise<unknown>;
   /** An event started a run or was told to one (a chat bot answers in its thread). */
   announce?: (event: ProjectEvent, runId: string, how: 'started' | 'told') => Promise<unknown>;
   /** Injectable clock/timers (tests drive them; prod uses wall-clock). */
@@ -100,10 +100,10 @@ export interface TriggerSchedulerDeps {
 /** `tell`: the event reaches the run's agent as a message, with a bounded
  *  credential like a start. */
 export function createTriggerTell(api: Pick<KarmaxApi, 'postTaskMessage'>, tokens: TokenAuthority): NonNullable<TriggerSchedulerDeps['tell']> {
-  return async (runId, trigger) => {
+  return async (runId, trigger, text) => {
     const { token } = (await tokens.mintPrincipal('system:triggers', ['*'], undefined, 10 * 60_000));
     try {
-      return await api.postTaskMessage(token, runId, { text: triggerMessage(trigger) });
+      return await api.postTaskMessage(token, runId, { text: text ?? triggerMessage(trigger) });
     } finally {
       (await tokens.revoke(token));
     }
@@ -163,6 +163,8 @@ const STALE_PENDING_MS = 10 * 60_000;
 /** A failed start is retried no sooner than this. */
 const FAILED_START_RETRY_MS = 60_000;
 const FAILED_START = 'could not start';
+/** A follower hears at most this many events an hour; the rest are skipped. */
+const MAX_FOLLOW_MESSAGES_PER_HOUR = 60;
 
 export class TriggerScheduler {
   private armed = new Map<string, ArmedEntry>();
@@ -511,7 +513,67 @@ export class TriggerScheduler {
       const trigger = this.projectEventTrigger(entry, event);
       if (trigger) await this.offerProjectEvent(entry, trigger, event);
     }
+    // After the starts: a run this event just started already has it.
+    await this.offerToFollowers(event);
     await this.deps.store.markProjectEventDispatched(event.id, this.now());
+  }
+
+  // ─── Follows: events delivered into a task's conversation ──────────────────
+
+  /** Each unfinished task following a matching event hears of it once, as a
+   *  message; the `(event, task)` claim makes a redelivery or a second process
+   *  a no-op. A message ends a pause, so this is also how a task waits. */
+  private async offerToFollowers(event: ProjectEvent): Promise<void> {
+    if (!this.deps.tell) return;
+    const offered = new Set<string>();
+    for (const follow of await this.deps.store.liveTaskFollows(event.projectId)) {
+      if (offered.has(follow.taskId) || !followMatches(follow, event, follow.emitter)) continue;
+      offered.add(follow.taskId);
+      if (await this.deps.store.projectEventReached(event.id, follow.taskId)) continue;
+      const verdict = await this.deps.store.transaction(async () => {
+        const decided = await this.followVerdict(follow.taskId, event);
+        const claimed = await this.deps.store.claimProjectEvent({ eventId: event.id, taskId: follow.taskId, state: decided.state,
+          reason: decided.reason, receivedAt: event.receivedAt, updatedAt: this.now() });
+        return claimed ? decided : undefined;
+      });
+      if (verdict?.state === 'pending') await this.deliverToFollower(follow, event);
+    }
+  }
+
+  private async followVerdict(taskId: string, event: ProjectEvent): Promise<{ state: ProjectEventClaimState; reason?: string }> {
+    if (event.hops > MAX_EVENT_HOPS) return { state: 'skipped', reason: `stopped a loop: more than ${MAX_EVENT_HOPS} event-to-run steps` };
+    if (await this.deps.store.projectEventsToldSince(taskId, this.now() - 3600_000) >= MAX_FOLLOW_MESSAGES_PER_HOUR)
+      return { state: 'skipped', reason: `the task already heard ${MAX_FOLLOW_MESSAGES_PER_HOUR} events this hour` };
+    return { state: 'pending' };
+  }
+
+  private async deliverToFollower(follow: EventFollow, event: ProjectEvent): Promise<void> {
+    try {
+      await this.deps.tell!(follow.taskId, triggerContext(event), followMessage(triggerContext(event), follow));
+      await this.deps.store.updateProjectEventClaim(event.id, follow.taskId, ['pending'],
+        { state: 'told', runId: follow.taskId, reason: null, updatedAt: this.now() });
+      if (follow.once) await this.deps.store.deleteTaskFollow(follow.id);
+      this.announce(event, follow.taskId, 'told');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await this.deps.store.updateProjectEventClaim(event.id, follow.taskId, ['pending'],
+        { state: 'deferred', reason: `${FAILED_START}: ${message}`.slice(0, 300), updatedAt: this.now() });
+    }
+  }
+
+  /** A deferred delivery to a follower: retry it while the task still follows a match. */
+  private async retryFollowerClaim(claim: ProjectEventClaim): Promise<void> {
+    const task = await this.deps.store.taskMetadata(claim.taskId);
+    const event = await this.deps.store.getProjectEvent(claim.eventId);
+    const emitter = String(task?.params?.runOf ?? claim.taskId);
+    const follow = event && (await this.deps.store.taskFollows(claim.taskId)).find((candidate) => followMatches(candidate, event, emitter));
+    const status = (task as { lastView?: { status?: string } } | undefined)?.lastView?.status;
+    if (!event || !follow || !task || ['done', 'failed', 'cancelled'].includes(status ?? '')) {
+      await this.settleClaim(claim, 'skipped', 'the task no longer follows this event');
+      return;
+    }
+    if (await this.deps.store.updateProjectEventClaim(claim.eventId, claim.taskId, ['deferred'], { state: 'pending', updatedAt: this.now() }))
+      await this.deliverToFollower(follow, event);
   }
 
   private projectEventTrigger(entry: ArmedEntry, event: ProjectEvent): EventTrigger | undefined {
@@ -530,6 +592,7 @@ export class TriggerScheduler {
     for (const claim of await this.deps.store.projectEventClaimsInState('deferred')) {
       if (claim.reason?.startsWith(FAILED_START) && now - claim.updatedAt < FAILED_START_RETRY_MS) continue;
       const entry = this.armed.get(claim.taskId);
+      if (!entry && (await this.deps.store.taskFollows(claim.taskId)).length) { await this.retryFollowerClaim(claim); continue; }
       if (!entry || entry.fired) {
         const task = await this.deps.store.taskMetadata(claim.taskId);
         if (task?.params?.triggerState !== 'armed')
@@ -575,6 +638,11 @@ export class TriggerScheduler {
   private async projectEventVerdict(entry: ArmedEntry, trigger: EventTrigger, event: ProjectEvent, concurrencyKey: string | undefined):
     Promise<{ state: ProjectEventClaimState; reason?: string; tell?: string }> {
     if (event.hops > MAX_EVENT_HOPS) return { state: 'skipped', reason: `stopped a loop: more than ${MAX_EVENT_HOPS} event-to-run steps` };
+    // A reply in a thread, a comment on an issue: the run already working on it
+    // follows it and hears it there, so a second run would duplicate it.
+    const following = event.subject ? (await this.deps.store.liveTaskFollows(event.projectId))
+      .find((follow) => follow.emitter === entry.task.id && follow.taskId !== entry.task.id && followMatches(follow, event, follow.emitter)) : undefined;
+    if (following) return { state: 'skipped', reason: `its run ${following.taskId} follows this` };
     const dependencies = entry.triggers.filter((t): t is DependencyTrigger => t.kind === 'dependency');
     if (!dependencies.every((t) => dependencyMet(t, entry.satisfiedDeps))) return { state: 'deferred', reason: 'waiting for its dependencies' };
     const slot = concurrencyKey !== undefined ? await this.deps.store.projectEventSlot(entry.task.id, concurrencyKey) : undefined;

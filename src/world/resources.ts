@@ -116,6 +116,8 @@ export interface ResourceWork { checkContinue?: () => Promise<void>; onProgress?
 
 /** How far staging is through one candidate (`index` of `count`). */
 export interface StagingProgress { path: string; index: number; count: number; files: number; totalFiles: number; bytes: number; totalBytes: number }
+/** How far a save of one resource has got. */
+export type ResourceSaveProgress = Omit<StagingProgress, 'index' | 'count'>;
 
 export interface StagedResourceCandidates {
   staged: string[];
@@ -1606,9 +1608,10 @@ export class ProjectResourceService {
 
   /** Save the writable resources a world forked, for its sub-tasks to start
    * from, as its branch is committed for them: attachment → version. */
-  async snapshotForks(handle: WorldHandle): Promise<Record<string, string>> {
+  async snapshotForks(handle: WorldHandle, work: { checkContinue?: () => Promise<void>; onProgress?: (progress: ResourceSaveProgress) => void } = {})
+    : Promise<Record<string, string>> {
     const forks: Record<string, string> = {};
-    for (const ref of await this.checkpoint(handle)) {
+    for (const ref of await this.checkpoint(handle, work.checkContinue, work.onProgress)) {
       const attachment = await this.store.getResourceAttachment(ref.attachmentId);
       if (attachment?.access === 'write' && attachment.isolation === 'fork') forks[ref.attachmentId] = ref.revisionId;
     }
@@ -1711,7 +1714,8 @@ export class ProjectResourceService {
 
   /** Capture writable task forks for portable hibernation without promoting
    * them to the project's current baseline. */
-  async checkpoint(handle: WorldHandle, checkContinue?: () => Promise<void>): Promise<Array<{ attachmentId: string; revisionId: string }>> {
+  async checkpoint(handle: WorldHandle, checkContinue?: () => Promise<void>, onProgress?: (progress: ResourceSaveProgress) => void)
+    : Promise<Array<{ attachmentId: string; revisionId: string }>> {
     const world = await this.worlds.open(handle);
     const refs: Array<{ attachmentId: string; revisionId: string }> = [];
     for (const lease of (await this.store.listResourceLeases(handle.id, handle.generation ?? 1))) {
@@ -1732,15 +1736,17 @@ export class ProjectResourceService {
       const baselineId = recorded.leaseId === lease.id ? recorded.revisionId : lease.revisionId;
       const found = baselineId ? (await this.store.getResourceRevision(baselineId)) : undefined;
       const baseline = found?.attachmentId === attachment.id ? found : undefined;
+      const label = locationLabel(attachment.target);
+      const progress = onProgress ? { onProgress: (p: Omit<ResourceSaveProgress, 'path'>) => onProgress({ path: label, ...p }) } : {};
       if (await this.partedWorld(handle, attachment, baseline)) {
-        const saved = await this.saveWorldParts(world, handle, lease, attachment, baseline, { key: `checkpoint:${lease.id}`, quota: false, checkContinue });
+        const saved = await this.saveWorldParts(world, handle, lease, attachment, baseline, { key: `checkpoint:${lease.id}`, quota: false, checkContinue, ...progress });
         refs.push({ attachmentId: attachment.id, revisionId: await this.recordWorld(world, handle, lease, attachment, saved) });
         continue;
       }
       // A park's capture of the task's private copy is work in progress:
       // counted, never refused (see WorldCheckpointService).
       const captured = await this.capture({ world, path: resourceAbsolutePath(handle, attachment), file: fileShaped(attachment) },
-        attachment, baseline, { key: `checkpoint:${lease.id}`, quota: false, checkContinue });
+        attachment, baseline, { key: `checkpoint:${lease.id}`, quota: false, checkContinue, ...progress });
       const revisionId = !captured && baseline ? baseline.id : (await this.store.saveResourceRevision({ attachmentId: attachment.id,
         parentRevisionId: lease.revisionId, ...captured!.fields, metadata: { checkpoint: true }, createdByTaskId: lease.taskId })).id;
       (await this.store.kvSet(baselineKey, JSON.stringify({ leaseId: lease.id, revisionId })));
