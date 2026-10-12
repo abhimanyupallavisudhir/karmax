@@ -291,6 +291,10 @@ exec /bin/cat "$@"
       // pause waits on jobs and events; it is not how an agent asks for input it needs.
       const pause = TOOL_SCHEMAS.find((tool) => tool.name === 'pause')!;
       expect(pause.description).toContain('It is not for asking: if you need an answer to continue, end your turn with the question (or call escalate_to_human for what only a person can give).');
+      // An ask interrupts a person: never for a progress report.
+      expect((pause.parameters as any).properties.needs_input.description).toContain('Never to report progress');
+      expect(TOOL_SCHEMAS.find((tool) => tool.name === 'notify')!.description)
+        .toContain('Notify a person only when you need them to do something; never for updates on your work.');
       const schema = pause.parameters as any;
       expect(Object.keys(schema.properties)).toEqual(['minutes', 'jobs', 'needs_input', 'message', 'audience', 'urgency']);
       expect(schema.properties.urgency.enum).toEqual(['low', 'normal', 'high', 'critical']);

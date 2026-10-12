@@ -32,6 +32,12 @@ describe('Do-agent input routing instructions', () => {
     expect(GLOBAL_INSTRUCTIONS).toContain('Use escalate_to_human, naming who to ask, only for what only a person can give');
   });
 
+  it('tells agents to notify a person only when they need them to do something', () => {
+    const prompt = assemblePrompt({ profile, role: 'do', task: task({ kind: 'human', audience: ['@creator'] }), world });
+    expect(prompt).toContain('Notify a person only when you need them to do something; never for updates on your work.');
+    expect(prompt).not.toContain('to alert a person while you work');
+  });
+
   it('does not add agent-routing instructions for a human Responder', () => {
     const prompt = assemblePrompt({ profile, role: 'do', task: task({ kind: 'human', audience: ['@creator'] }), world });
     expect(prompt).not.toContain('ordinary Waiting-for-input Responder is an agent');
