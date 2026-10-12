@@ -228,7 +228,7 @@ async function get(argumentsList) {
       // Restored beside the resource and moved in once complete: an interrupted
       // fetch never leaves half a part where the resource is.
       await restic(resource, ['restore', resource.parts[name].snapshot, '--target', scratch, '--no-lock']);
-      merge(scratch, resource.path);
+      writing(resource.path, () => merge(scratch, resource.path));
       fs.rmSync(scratch, { recursive: true, force: true });
       if (resource.access === 'read') {
         const targets = name === ROOT_PART
@@ -240,6 +240,15 @@ async function get(argumentsList) {
       console.log(`${label(resource, name)} is here`);
     }
   }
+}
+
+/** Run `work` with `dir` writable by its owner, then give it back its mode: a
+ * read-only resource's folder (chmod a-w) still takes and gives up its parts. */
+function writing(dir, work) {
+  const mode = fs.statSync(dir).mode & 0o7777;
+  if (mode & 0o200) return work();
+  fs.chmodSync(dir, mode | 0o200);
+  try { return work(); } finally { fs.chmodSync(dir, mode); }
 }
 
 function makeReadOnly(target) {
@@ -308,7 +317,7 @@ async function drop(argumentsList) {
       for (const entry of entries) {
         const target = path.join(resource.path, entry);
         makeWritable(target);
-        fs.rmSync(target, { recursive: true, force: true });
+        writing(resource.path, () => fs.rmSync(target, { recursive: true, force: true }));
       }
       held.delete(name); writeFetched(resource, held);
       console.log(`dropped ${label(resource, name)}: ${size(freed)} freed; it is still in the project`);

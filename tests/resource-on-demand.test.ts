@@ -29,7 +29,7 @@ afterEach(async () => { while (cleanups.length) await cleanups.pop()!(); });
 const sha = (text: string) => crypto.createHash('sha256').update(text).digest('hex');
 const RESOURCE = 'resources/raw_data';
 
-async function fixture(initial: Record<string, string>, options: { onDemand?: boolean } = {}) {
+async function fixture(initial: Record<string, string>, options: { onDemand?: boolean; access?: 'read' | 'write' } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-on-demand-'));
   const repo = path.join(dir, 'repo'); fs.mkdirSync(repo);
   await gitOrThrow(repo, ['init', '-q', '-b', 'main']); await ensureIdentity(repo);
@@ -43,8 +43,9 @@ async function fixture(initial: Record<string, string>, options: { onDemand?: bo
   const resources = new ProjectResourceService(store, worlds,
     new ObjectSnapshotEngine(new LocalObjectStore(path.join(dir, 'objects')), broker), broker);
   const data = await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
-    name: 'raw_data', driver: 'volume@1', target: { kind: 'path', path: RESOURCE }, access: 'write',
-    isolation: 'fork', source: {}, credentialHandles: [], publish: 'review', onDemand: options.onDemand ?? true });
+    name: 'raw_data', driver: 'volume@1', target: { kind: 'path', path: RESOURCE }, access: options.access ?? 'write',
+    isolation: 'fork', source: {}, credentialHandles: [], publish: options.access === 'read' ? 'discard' : 'review',
+    onDemand: options.onDemand ?? true });
   const first = await resources.importFiles(data.id, Object.entries(initial).map(([file, text]) => ({ path: file, data: Buffer.from(text) })));
   const opened: World[] = [];
   cleanups.push(async () => {
@@ -186,6 +187,21 @@ describe('on-demand resources', () => {
     expect(f.inWorld(world)).toEqual({});
     await f.publish(task.id, 'worker');
     expect(await f.version(await f.current())).toEqual(f.hashed({ ...CORPUS, 'ocr/page-3.txt': 'ocr 3' }));
+  }, 180_000);
+
+  it('fetches and drops parts of a read-only resource, whose folder the world may not write', async () => {
+    // Canary of task #610: `get` failed with EACCES moving a fetched part into the read-only folder.
+    const f = await fixture(CORPUS, { access: 'read' });
+    const { world } = await f.task('Reader');
+    const fetched = await f.tool(world, 'get', `${RESOURCE}/ocr`);
+    expect(fetched.stderr).toBe('');
+    expect(fetched.code).toBe(0);
+    expect(f.inWorld(world)).toEqual({ 'ocr/page-1.txt': 'paid ocr 1', 'ocr/page-2.txt': 'paid ocr 2' });
+    // Still read-only: the folder, the part and its files.
+    for (const file of ['', 'ocr', 'ocr/page-1.txt']) expect(fs.statSync(f.at(world, file)).mode & 0o222).toBe(0);
+    expect((await f.tool(world, 'drop', `${RESOURCE}/ocr`)).code).toBe(0);
+    expect(f.inWorld(world)).toEqual({});
+    expect(fs.statSync(f.at(world)).mode & 0o222).toBe(0);
   }, 180_000);
 
   it('keeps what a park saved and what the world held through a restore from it', async () => {
