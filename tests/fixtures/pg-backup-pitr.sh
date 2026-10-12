@@ -42,7 +42,10 @@ archive_timeout = 60
 listen_addresses = ''
 unix_socket_directories = '$PGHOST'
 EOF
-pg_ctl -D "$PGDATA" -w -l "$work/server.log" start >/dev/null
+# Limits above the defaults, given on the command line as Compose does with
+# production's (KARMAX_POSTGRES_MAX_CONNECTIONS): the base backup doesn't carry
+# them, and recovery refuses to run below the primary's.
+pg_ctl -D "$PGDATA" -w -l "$work/server.log" -o '-c max_connections=150 -c max_worker_processes=12' start >/dev/null
 psql -XqA -d postgres -c 'CREATE DATABASE karmax'
 psql -XqA -d karmax -c 'CREATE TABLE tasks (id TEXT PRIMARY KEY); CREATE TABLE events (seq SERIAL, ts BIGINT NOT NULL, payload TEXT)'
 

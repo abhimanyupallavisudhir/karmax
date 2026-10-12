@@ -9,6 +9,7 @@ import {
   extractMimeText,
   decodeQuotedPrintable,
   parseMultipart,
+  parseRawMail,
   parseUrlEncoded,
   ingestSecret,
   ingestScope,
@@ -150,6 +151,19 @@ describe('raw MIME extraction (the Cloudflare Email Worker path)', () => {
     const body = Buffer.from('secret code 778899').toString('base64');
     const raw = `Content-Type: text/plain\r\nContent-Transfer-Encoding: base64\r\n\r\n${body}`;
     expect(extractMimeText(raw)).toContain('778899');
+  });
+  it('reads the headers themselves, not the header names a relay signature lists', () => {
+    // Cloudflare Email Routing adds ARC/DKIM signatures whose h= list names the
+    // signed headers; production mail went undecoded (2026-10-12) and a wrapped
+    // link arrived cut at its soft break.
+    const raw = [
+      'ARC-Message-Signature: i=1; a=rsa-sha256; c=relaxed/relaxed; d=email.cloudflare.net;',
+      '\th=from:to:subject:content-transfer-encoding:mime-version:content-type;', '\tbh=abc; b=def',
+      'Subject: Verify', 'Content-Transfer-Encoding: quoted-printable', 'MIME-Version: 1.0',
+      'Content-Type: text/plain; charset=utf-8', '',
+      'Your code is 482913. Open https://example.com/verify?t=3D=', 'abc123 to finish.', '',
+    ].join('\r\n');
+    expect(parseRawMail(raw).text).toBe('Your code is 482913. Open https://example.com/verify?t=abc123 to finish.\r\n');
   });
   it('quoted-printable soft breaks and =XX escapes', () => {
     expect(decodeQuotedPrintable('one=\r\ntwo =3D three')).toBe('onetwo = three');
