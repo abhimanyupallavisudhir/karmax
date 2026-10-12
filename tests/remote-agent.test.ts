@@ -442,7 +442,7 @@ describe('remote subscription agents', () => {
     expect(remoteAgentCommand('claude', '/usr/bin/node', ['/host/sdk/cli.js', '--resume', 's']).args)
       .toEqual(expect.arrayContaining([`@anthropic-ai/claude-code@${pinned}`, '--print', '--resume', 's']));
     expect(remoteAgentCommand('codex', 'codex', ['app-server']).args)
-      .toEqual(expect.arrayContaining(['@openai/codex@0.156.1', 'app-server']));
+      .toEqual(expect.arrayContaining(['@openai/codex@0.162.1', 'app-server']));
   });
 
   it('exports only the current Claude session and never replaces newer or divergent history', async () => {
@@ -697,7 +697,7 @@ describe('remote subscription agents', () => {
     const launcher = world.openedPty?.command?.match(/^exec sh '\/workspace\/([^']+)'$/)?.[1];
     expect(launcher).toMatch(/^\.karmax-injection\/agent\/codex\/[0-9a-f]+\/launch-[0-9a-f-]+\.sh$/);
     const script = world.files.get(launcher!)?.toString() ?? '';
-    expect(script).toContain('@openai/codex@0.156.1');
+    expect(script).toContain('@openai/codex@0.162.1');
     expect(script).toContain('/opt/karmax/bin/codex');
     expect(script).toContain('app-server');
     expect(script).toContain('stty raw -echo');

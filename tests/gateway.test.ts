@@ -187,7 +187,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
         expect(read.mock.calls.some(([file]) => String(file).includes(sessionId))).toBe(false);
       } finally { read.mockRestore(); }
       const sessions: any = await (await fetch(`${base}/api/tasks/${task.id}/sessions`, { headers: auth() })).json();
-      expect(sessions.do).toMatchObject({ id: sessionId, provider: 'codex', downloadable: true, requiredCodexVersion: '0.156.1' });
+      expect(sessions.do).toMatchObject({ id: sessionId, provider: 'codex', downloadable: true, requiredCodexVersion: '0.162.1' });
       const response = await fetch(`${base}${sessions.do.downloadUrl}`, { headers: auth() });
       expect(response.status).toBe(200);
       expect(response.headers.get('content-type')).toContain('application/x-ndjson');

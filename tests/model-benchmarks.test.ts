@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { codexModelCatalog } from '../src/agent/models.js';
 import { ArtificialAnalysis, BUNDLED_MODELS, baseSlug, benchmarkRef, toBenchmarks, trimModels, variantEffort } from '../src/agent/model-benchmarks.js';
 
 const NOW = Date.parse('2026-10-08T00:00:00Z');
@@ -12,7 +13,8 @@ const row = (creator: string, slug: string, name: string, extra: Record<string, 
   ...extra,
 });
 const catalog = {
-  claude: [{ id: 'opus[1m]' }], codex: [], kimi: [], grok: [],
+  claude: [{ id: 'opus[1m]' }], kimi: [], grok: [],
+  codex: ['gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.5', 'gpt-5.4-mini'].map((id) => ({ id })),
   opencode: [{ id: 'google/gemini-3.1-pro-preview' }, { id: 'kimi/k3', effort: ['low', 'high', 'max'] }],
 };
 const ref = (creator: string, slug: string, name: string) => benchmarkRef({ creator, slug, name }, catalog);
@@ -48,6 +50,15 @@ describe('Artificial Analysis rows as harness choices', () => {
     expect(ref('openai', 'gpt-5-5-pro', 'GPT-5.5 Pro (Xhigh)')).toBeUndefined();
     expect(ref('openai', 'gpt-oss-120b', 'gpt-oss-120b (High)')).toBeUndefined();
     expect(ref('deepseek', 'deepseek-v4-pro', 'DeepSeek V4 Pro 0813 (Max)')).toBeUndefined();
+  });
+
+  it('offers an OpenAI model only when the Codex catalog lists it', () => {
+    // OpenAI refuses a model the pinned Codex or the login does not offer:
+    // "The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account."
+    expect(benchmarkRef({ creator: 'openai', slug: 'gpt-6-1-sol-low', name: 'GPT-6.1 Sol (Low)' },
+      { ...catalog, codex: [{ id: 'gpt-6-sol' }] })).toBeUndefined();
+    expect(benchmarkRef({ creator: 'openai', slug: 'gpt-6-1-sol-low', name: 'GPT-6.1 Sol (Low)' },
+      { ...catalog, codex: undefined })).toBeUndefined();
   });
 
   it('matches other vendors against the organization catalog', () => {
@@ -127,10 +138,12 @@ describe('bundled snapshot', () => {
     const { at, data } = await source.models();
     expect(at).toBe(BUNDLED_MODELS.at);
     // Charted as of the snapshot's own date, so an old snapshot keeps its newest models.
-    const models = toBenchmarks(data, {}, at);
+    const models = toBenchmarks(data, { codex: codexModelCatalog([]) }, at);
     expect(models.length).toBeGreaterThan(20);
     expect(new Set(models.map((model) => model.ref.provider))).toEqual(new Set(['claude', 'codex']));
     expect(models.some((model) => model.cost && model.seconds)).toBe(true);
+    // The Codex offline catalog covers the newest benchmarked OpenAI model.
+    expect(models.some((model) => model.ref.model === 'gpt-6.1-sol')).toBe(true);
   });
 
   it('falls back to the snapshot when the live list cannot be fetched', async () => {
