@@ -76,10 +76,15 @@ describe.skipIf(!live)('moving a live task from E2B to Hetzner', () => {
     return result.stdout.trimEnd();
   };
 
+  const destroy = async (world: WorldHandle) => {
+    const provider = worlds.get(world.kind);
+    await (provider.destroy ? provider.destroy(world) : (await provider.open(world)).destroy());
+  };
+
   /** What the sweep does to a parked world whose task asks for another provider. */
   async function hibernate(label: string): Promise<string> {
     const checkpoint = await timed(`${label}CheckpointS`, () => service.checkpoint(handle));
-    await timed(`${label}DestroyS`, () => worlds.get(handle.kind).destroy(handle));
+    await timed(`${label}DestroyS`, () => destroy(handle));
     await store.setWorldState(handle, 'hibernated');
     return checkpoint.id;
   }
@@ -134,7 +139,7 @@ describe.skipIf(!live)('moving a live task from E2B to Hetzner', () => {
 
   afterAll(async () => {
     try {
-      for (const world of created) await worlds?.get(world.kind).destroy(world).catch(() => undefined);
+      if (worlds) for (const world of created) await destroy(world).catch(() => undefined);
       for (const provider of [worlds?.get('e2b'), worlds?.get('hetzner')])
         for (const leftover of await provider?.listSandboxes?.().catch(() => []) ?? []) await leftover.destroy().catch(() => undefined);
       await cleanHetzner(hetzner, before).catch((error) => { report.cleanupError = String(error); });
