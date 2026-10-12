@@ -51,7 +51,7 @@ vi.mock('@temporalio/workflow', async (importOriginal) => ({
 }));
 import { justDoV1_7 } from '../src/workflows/just-do.js';
 import { mergeOnlyV1_7 } from '../src/workflows/merge-only.js';
-import { softwareDevV1_20, softwareDevV1_26, softwareDevV1_27, subtaskRaiseText } from '../src/workflows/software-dev.js';
+import { softwareDevV1_20, softwareDevV1_26, softwareDevV1_27, softwareDevV1_28, subtaskRaiseText } from '../src/workflows/software-dev.js';
 import { createAgentTurnLeaser } from '../src/workflows/agent-turn-lease.js';
 import { makeTurnPreparationActivities } from '../src/activities/turn-preparation.js';
 
@@ -1061,5 +1061,97 @@ describe('out of disk', () => {
     expect(wf.childSignal).toHaveBeenCalledWith('raiseFromChild', expect.objectContaining({ type: 'blocked' }));
     expect(result.stage).toBe('done');
     expect(wf.handlers.get('view')!().outOfDisk).toBeUndefined();
+  });
+});
+
+// pramana#22: preparing a sub-task saves the parent's writable data first. A
+// process writing into it made that save fail every attempt, and the failed
+// activity failed the parent's whole workflow ("workflow failed").
+describe('a sub-task that cannot be prepared', () => {
+  const keptChanging = () => Object.assign(new Error('Activity task failed'), { cause: Object.assign(
+    new Error('raw_data kept changing while it was being saved: 1 file changed between saves (server.log). Something is still writing into it, usually a server or job: stop it, then try again.'),
+    { type: 'resource-kept-changing' }) });
+  const withRepo = { ...input, project: { repos: ['/tmp/repo'] } };
+
+  it('comes back to the agent as a failed create_sub_task, and the parent goes on', async () => {
+    wf.activities.accountPoolSize.mockResolvedValue(0);
+    let during: any;
+    wf.activities.prepareChildTask = vi.fn().mockImplementationOnce(async () => {
+      during = structuredClone(wf.handlers.get('view')!().state);
+      throw keptChanging();
+    }).mockResolvedValue({ ...input, taskId: 'child' });
+    let heard: any[] = [];
+    wf.activities.runAgentTurn.mockImplementation(async () => {
+      if (wf.activities.runAgentTurn.mock.calls.length === 1)
+        return { output: 'Delegating', providerCompleted: true, subTasks: [{ title: 'OCR', prompt: 'p' }, { title: 'Index', prompt: 'q' }] };
+      heard = [...wf.handlers.get('view')!().messages];
+      return { output: 'Stopped the server; trying again', providerCompleted: true, subTasks: [{ title: 'OCR', prompt: 'p' }] };
+    });
+    wf.wait = () => wf.handlers.get('cancel')!();
+    expect(await softwareDevV1_28(withRepo)).toEqual({ stage: 'cancelled' });
+    const note = heard.at(-1);
+    expect(note.role).toBe('user');
+    expect(note.text).toMatch(/^create_sub_task "OCR" failed: no sub-task was created\. This task's project data could not be saved for it to start from: raw_data kept changing .*\(server\.log\)/);
+    // The rest of that turn's requests wait for the agent too, rather than each saving again.
+    expect(note.text).toMatch(/"Index" was not created either/);
+    expect(note.text).toMatch(/call create_sub_task again/);
+    // The second attempt, with the writer stopped, starts the child.
+    expect(wf.activities.prepareChildTask).toHaveBeenCalledTimes(2);
+    expect(wf.handlers.get('view')!().subTasks).toEqual(['child']);
+    // The task said what it was doing meanwhile.
+    expect(during.preparingSubTask).toBe(true);
+    expect(wf.handlers.get('view')!().state.preparingSubTask).toBeUndefined();
+  });
+
+  it('comes back to the agent after any other failure too', async () => {
+    wf.activities.accountPoolSize.mockResolvedValue(0);
+    wf.activities.prepareChildTask = vi.fn().mockRejectedValue(Object.assign(new Error('Activity task failed'),
+      { cause: Object.assign(new Error('activity Heartbeat timeout'), { type: undefined }) }));
+    let heard: any[] = [];
+    wf.activities.runAgentTurn.mockImplementation(async () => {
+      if (wf.activities.runAgentTurn.mock.calls.length === 1) return { output: 'Delegating', providerCompleted: true, subTasks: [{ title: 'OCR', prompt: 'p' }] };
+      heard = [...wf.handlers.get('view')!().messages];
+      wf.handlers.get('cancel')!();
+      return { output: 'Doing it myself', providerCompleted: true };
+    });
+    expect(await softwareDevV1_28(withRepo)).toEqual({ stage: 'cancelled' });
+    expect(heard.at(-1).text).toMatch(/^create_sub_task "OCR" failed: no sub-task was created\. activity Heartbeat timeout/);
+  });
+
+  it('escalates with Retry when no turn of the agent that asked follows (a Reviewer at Review)', async () => {
+    wf.activities.accountPoolSize.mockResolvedValue(0);
+    wf.activities.prepareChildTask = vi.fn().mockRejectedValueOnce(keptChanging()).mockResolvedValue({ ...input, taskId: 'child' });
+    wf.activities.checkProposal = vi.fn(async () => ({ ready: true }));
+    wf.activities.runAgentTurn.mockImplementation(async (args: any) => args.role === 'confirm'
+      ? { output: 'Splitting the evaluation off', providerCompleted: true, subTasks: [{ title: 'Evaluate', prompt: 'p' }],
+        confirmDecision: { action: 'confirm' } }
+      : { output: 'Done', providerCompleted: true, completed: true, openPrRequested: true });
+    let escalated: any;
+    wf.wait = () => {
+      const view = wf.handlers.get('view')!();
+      if (view.stage === 'escalated' && !escalated) {
+        escalated = structuredClone(view);
+        wf.handlers.get('retry')!();
+        return;
+      }
+      wf.handlers.get('cancel')!();
+    };
+    await softwareDevV1_28({ ...withRepo, confirm: { layers: [{ kind: 'agent' }] } });
+    expect(escalated.status).toBe('blocked');
+    expect(escalated.error).toMatch(/^create_sub_task "Evaluate" failed: no sub-task was created\..*server\.log.* Retry creates it again\.$/);
+    expect(escalated.actions.map((a: any) => a.name)).toContain('retry');
+    // Retry prepared it again, and the child started.
+    expect(wf.activities.prepareChildTask).toHaveBeenCalledTimes(2);
+    expect(wf.handlers.get('view')!().subTasks).toEqual(['child']);
+  });
+
+  it('keeps histories recorded before it failing the task', async () => {
+    wf.absentPatches = new Set(['subtask-prepare-failure-to-agent-v1']);
+    wf.activities.accountPoolSize.mockResolvedValue(0);
+    wf.activities.prepareChildTask = vi.fn().mockRejectedValue(keptChanging());
+    wf.activities.runAgentTurn.mockResolvedValue({ output: 'Delegating', providerCompleted: true, subTasks: [{ title: 'OCR', prompt: 'p' }] });
+    wf.wait = () => wf.handlers.get('cancel')!();
+    await expect(softwareDevV1_28(withRepo)).rejects.toThrow('Activity task failed');
+    expect(wf.activities.runAgentTurn).toHaveBeenCalledOnce();
   });
 });
