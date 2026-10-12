@@ -1014,7 +1014,7 @@ const NODES = [
 const AGENT_PROVIDERS = ['claude', 'codex', 'opencode'];
 const MODELS = {
   claude: ['default', 'opus[1m]', { id: 'claude-opus-5-5', displayName: 'Opus 5.5' }, { id: 'claude-fable-5-1', displayName: 'Fable 5.1' }, 'sonnet', 'haiku'],
-  codex: ['gpt-5.6-sol', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'],
+  codex: ['gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'],
   opencode: ['kimi/k3', 'kimi/kimi-for-coding', 'openai/gpt-5.5', 'anthropic/claude-sonnet-5', 'google/gemini-3-pro', 'xai/grok-code-fast-1'],
 };
 const agentProviderChoice = (provider) => AGENT_PROVIDERS.includes(provider) ? provider : AGENT_PROVIDERS[0];
@@ -10531,11 +10531,8 @@ function agentForkTree(pool, sourceTaskId, lineage = []) {
     .map(({ task }) => ({ task, children: agentForkTree(pool, task.id, [...ancestors]) }));
 }
 
-function agentForksSection(v) {
-  const tree = agentForkTree(agentForkPool(v), v.taskId);
-  if (!tree.length) return '';
-  const countNodes = (nodes) => nodes.reduce((total, node) => total + 1 + countNodes(node.children), 0);
-  const renderNodes = (nodes) => `<ul class="fork-tree">${nodes.map(({ task, children }) => {
+function forkTreeHtml(nodes) {
+  return `<ul class="fork-tree">${nodes.map(({ task, children }) => {
     const state = subTaskState(task);
     return `<li class="fork-tree-item">
       <a class="fork-row" data-spa href="${esc(taskUrl(task.id))}" aria-label="Open ${esc(task.title)} — ${esc(state.label)}">
@@ -10546,9 +10543,15 @@ function agentForksSection(v) {
         </span>
         <span class="fork-arrow" aria-hidden="true">›</span>
       </a>
-      ${children.length ? renderNodes(children) : ''}
+      ${children.length ? forkTreeHtml(children) : ''}
     </li>`;
   }).join('')}</ul>`;
+}
+
+function agentForksSection(v) {
+  const tree = agentForkTree(agentForkPool(v), v.taskId);
+  if (!tree.length) return '';
+  const countNodes = (nodes) => nodes.reduce((total, node) => total + 1 + countNodes(node.children), 0);
   const count = countNodes(tree);
   return `<section class="agent-forks" aria-labelledby="agent-forks-title">
     <div class="agent-forks-head">
@@ -10558,7 +10561,34 @@ function agentForksSection(v) {
       </div>
       <div class="agent-forks-count">${count} task fork${count === 1 ? '' : 's'}</div>
     </div>
-    ${renderNodes(tree)}
+    ${forkTreeHtml(tree)}
+  </section>`;
+}
+
+// The mirror image for a fork: every task it descends from
+// (`forkSourceSummaries`, oldest first), drawn like the forks tree — each
+// source nested under the task it was itself forked from — so the direct
+// source sits deepest, just above this task. A live record is fresher.
+function forkSourceTree(v) {
+  const live = new Map((S.tasks || []).map((task) => [task.id, task]));
+  const pool = (v.forkSourceSummaries || []).map((source) => ({ task: live.get(source.id) || source, sources: source.forkOf || [] }));
+  return pool.filter(({ sources }) => !sources.length)
+    .map(({ task }) => ({ task, children: agentForkTree(pool, task.id, [v.taskId]) }));
+}
+
+function forkSourcesSection(v) {
+  const tree = forkSourceTree(v);
+  if (!tree.length) return '';
+  const count = v.forkSourceSummaries.length;
+  return `<section class="agent-forks" aria-labelledby="fork-sources-title">
+    <div class="agent-forks-head">
+      <div>
+        <div class="agent-forks-kicker">Branched conversation</div>
+        <h3 id="fork-sources-title">Forked from</h3>
+      </div>
+      <div class="agent-forks-count">${count} source task${count === 1 ? '' : 's'}</div>
+    </div>
+    ${forkTreeHtml(tree)}
   </section>`;
 }
 
@@ -10638,6 +10668,7 @@ function overviewTab(v) {
     ? `<div class="section-h">Agent turn</div><div class="card" style="color:var(--ink-2)">${v.agentTurn.state === 'running' ? '▶' : '⏳'} ${esc(agentRoleLabel(v.agentTurn.role))} · ${esc(agentTurnStateText(v))}${agentProviderLabel(v.agentTurn.provider) ? ` · ${esc(agentProviderLabel(v.agentTurn.provider))}` : ''}</div>`
     : '';
   const subtasks = subTasksSection(v);
+  const forkSources = forkSourcesSection(v);
   const agentForks = agentForksSection(v);
   return `
     <div class="section-h">Pipeline</div>
@@ -10646,6 +10677,7 @@ function overviewTab(v) {
     ${waiting}
     ${agentTurn}
     ${subtasks}
+    ${forkSources}
     ${agentForks}
     ${checkoutsSection(v)}
     ${review}
@@ -11516,7 +11548,7 @@ function portableForkCommandFor(session, cwd) {
     'mkdir -p "$HOME/.codex/sessions/tavya"',
     `cp -n "${source}" "$HOME/.codex/sessions/tavya/${filename}"`,
     `cd ${shellQuote(cwd)}`,
-    `CODEX_HOME="$HOME/.codex" npx --yes @openai/codex@${session.requiredCodexVersion || "0.156.1"} fork ${shellQuote(sessionId)}`,
+    `CODEX_HOME="$HOME/.codex" npx --yes @openai/codex@${session.requiredCodexVersion || "0.162.1"} fork ${shellQuote(sessionId)}`,
   ].join('\n');
   if (session.provider === 'claude') return [
     `tavya_cwd="$(cd ${shellQuote(cwd)} && pwd -P)"`,

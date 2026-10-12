@@ -106,17 +106,19 @@ describe('provider model discovery', () => {
 });
 
 it('offers current Codex models during discovery failures without replacing account metadata', () => {
-  expect(codexModelCatalog([]).map(m => m.id)).toEqual(expect.arrayContaining(['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-terra']));
-  expect(codexModelCatalog([]).find(m => m.isDefault)?.id).toBe('gpt-5.6-sol');
+  expect(codexModelCatalog([]).map(m => m.id)).toEqual(expect.arrayContaining(['gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-terra']));
+  expect(codexModelCatalog([]).find(m => m.isDefault)?.id).toBe('gpt-6.1-sol');
   const discovered = [{ id: 'account-model', isDefault: true, effort: ['high'] }];
   expect(codexModelCatalog(discovered)).toEqual(discovered);
 });
 
-it('discovers GPT-6 Sol and Luna through the shipped Codex app-server without credentials', async () => {
+it('discovers GPT-6.1 Sol, Sol and Luna through the shipped Codex app-server without credentials', async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-codex-catalog-'));
   try {
     const models = await codexModels(home);
-    for (const id of ['gpt-6-sol', 'gpt-6-luna']) {
+    // Codex before 0.161 lacks GPT-6.1 Sol, and OpenAI then refuses it for a
+    // ChatGPT login ("not supported when using Codex with a ChatGPT account").
+    for (const id of ['gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna']) {
       expect(models.find(m => m.id === id)?.effort).toEqual(expect.arrayContaining(['low', 'medium', 'high', 'xhigh', 'max']));
     }
   } finally { fs.rmSync(home, { recursive: true, force: true }); }

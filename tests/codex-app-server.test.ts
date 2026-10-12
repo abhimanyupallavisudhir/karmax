@@ -31,7 +31,7 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     setTimeout(() => send({ id: msg.id, result: {} }), 100);
   }
   else if (msg.method === 'turn/start') {
-    // Codes from the pinned Codex protocol (0.156.1 has no usageLimitReached; audit R-10).
+    // Codes from the pinned Codex protocol (0.162.1 has no usageLimitReached; audit R-10).
     if (process.env.STUB_MODE?.startsWith('rpc-limit')) { send({ id: msg.id, error: { code: -32000, message: 'try again in 20s', data: { codexErrorInfo: process.env.STUB_MODE === 'rpc-limit-rate' ? 'rateLimitExceeded' : 'usageLimitExceeded' } } }); return; }
     if (process.env.STUB_MODE?.startsWith('rpc-local-')) { send({ id: msg.id, error: { code: -32603, message: process.env.STUB_MODE === 'rpc-local-disk' ? 'Disk quota exceeded' : 'npm registry HTTP 401 unauthorized' } }); return; }
     send({ id: msg.id, result: { turn: { id: 'turn-1' } } });
@@ -109,6 +109,11 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
       send({ method: 'turn/completed', params: { turn: { id: 'turn-1', status: 'completed' } } });
     }
     else if (mode === 'interrupted') send({ method: 'turn/completed', params: { turn: { id: 'turn-1', status: 'interrupted', reason: 'server restart' } } });
+    else if (mode === 'unsupported-model') {
+      // Production 2026-10-12: Codex logs in colour even to a pipe.
+      process.stderr.write('\\x1b[2m2026-10-12T00:00:00Z\\x1b[0m \\x1b[31mERROR\\x1b[0m \\x1b[2mcodex_app_server\\x1b[0m\\x1b[2m:\\x1b[0m Codex could not find bubblewrap on PATH.\\n');
+      send({ method: 'error', params: { error: { message: '{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The \\'gpt-6.1-sol\\' model is not supported when using Codex with a ChatGPT account."}}' }, willRetry: false } });
+    }
     else if (mode === 'failed') send({ method: 'turn/completed', params: { turn: { id: 'turn-1', status: 'failed', error: { message: 'model execution failed' } } } });
     else send({ method: 'turn/completed', params: { turn: { id: 'turn-1', status: 'completed' } } });
   }
@@ -295,6 +300,13 @@ describe('CodexAdapter app-server security policy', () => {
 
   it('rejects a failed terminal status even when partial assistant text exists', async () => {
     await expect(run(undefined, 'failed')).rejects.toThrow(/model execution failed/i);
+  });
+
+  it('reports a provider refusal as readable text, without terminal colour codes', async () => {
+    const failure = await run(undefined, 'unsupported-model').then(() => undefined, (error: Error) => error);
+    expect(failure?.message).toContain("The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account.");
+    expect(failure?.message).toContain('ERROR codex_app_server: Codex could not find bubblewrap on PATH.');
+    expect(failure?.message).not.toMatch(/\x1b/);
   });
 
   it('does not quarantine the Codex login when the optional Apps MCP token expires', async () => {

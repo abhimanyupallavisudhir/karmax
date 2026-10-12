@@ -399,6 +399,15 @@ describe('gateway request scope for bare-id routes', () => {
     for (const summaries of [parentView.subTaskSummaries, parentView.forkSummaries])
       expect(summaries).toEqual([expect.objectContaining({ id: child.id,
         lastView: expect.objectContaining({ status: 'waiting', approvalRequests: 1 }) })]);
+    // And the fork's Forked from row for that waiting task flags it the same way.
+    const grandchild = (await store.createTask({ projectId: mine, title: 'Storage packs, again', workflow: 'software-dev',
+      workflowVersion: '1.9.0', params: { prompt: 'again', 'agent:do': { resumeFrom: { taskId: child.id, role: 'do' } } },
+      createdBy: { kind: 'user', userId: 'a' } }));
+    (await store.saveView(grandchild.id, view(grandchild.id, grandchild.title)));
+    liveView = (await store.getTask(grandchild.id))!.lastView;
+    const forkView = (await (await fetch(`${base}/api/tasks/${grandchild.id}`, { headers: auth() })).json()) as any;
+    expect(forkView.forkSourceSummaries).toEqual([expect.objectContaining({ id: parent.id }), expect.objectContaining({ id: child.id,
+      forkOf: [parent.id], lastView: expect.objectContaining({ status: 'waiting', approvalRequests: 1 }) })]);
   });
 
   it('refuses PATCH/DELETE/reorder /api/views/:id across a project and tenant boundary', async () => {

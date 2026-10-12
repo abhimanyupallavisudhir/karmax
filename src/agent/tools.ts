@@ -8,7 +8,7 @@ import { readWorldFilePrefix } from '../world/file-prefix.js';
 import { startJob, jobStatuses, describeJobs, listJobs, stopJobs, MAX_JOB_NAME } from '../world/jobs.js';
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
 import {
-  PLATFORM_REQUEST_BODY_SCHEMA, PRIORITY_NAMES, AGENT_ROLE_NAMES,
+  PLATFORM_REQUEST_BODY_SCHEMA, PRIORITY_NAMES, AGENT_ROLE_NAMES, CREATE_TASK_GRANTS, REQUEST_FOR_TASK,
   compactSearch, compactOrganizationSearch, compactTags, normalizeRequestBody, platformRequestPathError,
 } from '../platform/platform-request.js';
 import { SUB_TASK_ACTIONS, URGENCY_LEVELS, type AgentWait, type SubTaskAction, type Urgency } from '../domain/types.js';
@@ -532,7 +532,8 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
       'Create a new task on a project task list. It is queued and started immediately unless `draft` is true. '
       + '`params` carries the full task-form field values for the chosen workflow (including `triggers`, so a draft can be armed on a schedule/dependency/event); '
       + '`tags` accepts names or `a/b` paths and creates missing ones. '
-      + '`wiki_context` inlines wiki pages as `[[proj:…]]`/`[[org:…]]` references; omit to inherit the default-labelled pages, pass [] for none.',
+      + '`wiki_context` inlines wiki pages as `[[proj:…]]`/`[[org:…]]` references; omit to inherit the default-labelled pages, pass [] for none. '
+      + CREATE_TASK_GRANTS,
     parameters: {
       type: 'object',
       properties: {
@@ -545,6 +546,16 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
         priority: { type: 'string', enum: [...PRIORITY_NAMES] },
         tags: { type: 'array', items: { type: 'string' } },
         params: { type: 'object', description: 'Full task-form field values for the workflow.' },
+        authorization: {
+          type: 'object',
+          properties: {
+            level: { type: 'string', description: 'viewer, developer, maintainer, administrator, …' },
+            scope: { type: 'string', enum: ['projects', 'organization', 'global'] },
+            projectIds: { type: 'array', items: { type: 'string' } },
+          },
+          required: ['level', 'scope'],
+        },
+        credential_grants: { type: 'array', items: { type: 'string' } },
       },
       required: ['project_id', 'title', 'prompt'],
     },
@@ -837,7 +848,8 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
       `Request exact ${BRAND} capabilities and/or additional projectIds for this task. Project expansion retains existing projects and applies the task authorization in added projects. The request appears in Approval Requests and is routed ` +
       'to selected people, teams, or Avatars. Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @maintainers, @admins, @superadmins, @owners, @project, or @all; ' +
       'omit audience to summon the lowest level that can grant it. Discover choices with platform_request(GET, "/api/agent/escalation-targets"). Only a selected principal that already ' +
-      'holds the requested capabilities and can grant the full task authorization across the expanded scope can approve. Do not request wildcards. An approval or denial resumes the task.',
+      'holds the requested capabilities and can grant the full task authorization across the expanded scope can approve. Do not request wildcards. An approval or denial resumes the task. '
+      + REQUEST_FOR_TASK,
     parameters: {
       type: 'object',
       properties: {
@@ -850,6 +862,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
         },
         projectIds: { type: 'array', items: { type: 'string' }, maxItems: 32,
           description: 'Additional project IDs in this organization. Existing projects are retained. Supply capabilities: [] for scope only.' },
+        task_id: { type: 'string', description: 'A task you created that is held for authorization you could not grant.' },
         audience: {
           type: 'array',
           items: { type: 'string' },
@@ -865,7 +878,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
         },
         urgency: URGENCY_PARAMETER,
       },
-      required: ['capabilities', 'reason'],
+      required: ['reason'],
     },
   },
   {
@@ -1398,6 +1411,7 @@ export function platformToolHandlers(
       const created: any = await platformRequest('POST', `/api/projects/${projectId}/tasks`, {
         title: args?.title, prompt: args?.prompt, workflow: args?.workflow,
         wikiContext: args?.wiki_context, draft: args?.draft, params: args?.params,
+        authorization: args?.authorization, credentialGrants: args?.credential_grants, holdForAuthorization: true,
         ...(priority !== undefined ? { priority } : {}), ...(tags ? { tags } : {}),
       });
       return JSON.stringify(created);
@@ -1588,6 +1602,7 @@ export function platformToolHandlers(
       return JSON.stringify(await platformRequest('POST', '/api/agent/permission-requests', {
         capabilities: Array.isArray(args?.capabilities) ? args.capabilities.map(String) : [],
         ...(args?.projectIds !== undefined ? { projectIds: args.projectIds } : {}),
+        ...(args?.task_id ? { taskId: String(args.task_id) } : {}),
         audience: Array.isArray(args?.audience) ? args.audience.map(String) : [],
         reason: String(args?.reason ?? ''),
         ...(args?.urgency ? { urgency: String(args.urgency) } : {}),

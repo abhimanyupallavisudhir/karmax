@@ -112,7 +112,7 @@ trap 'rm -f /usr/sbin/policy-rc.d' EXIT
 retry() { for attempt in 1 2 3; do "$@" && return 0; sleep $((attempt * 5)); done; return 1; }
 retry apt-get update -qq
 retry apt-get install -y -qq --no-install-recommends ca-certificates curl gnupg git openssh-server sudo xz-utils \\
-  python3 build-essential procps unzip jq less util-linux e2fsprogs
+  python3 build-essential procps unzip jq less util-linux e2fsprogs bubblewrap
 if [ "$(dpkg --print-architecture)" = amd64 ] && ! command -v google-chrome > /dev/null; then
   install -d -m 0755 /etc/apt/keyrings
   curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | gpg --batch --yes --dearmor -o /etc/apt/keyrings/google-chrome.gpg

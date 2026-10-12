@@ -53,7 +53,8 @@ export class DurationSequencer extends BaseSequencer {
 export function parseReporterDurations(log: string): Durations {
   const fileResult = /\s[✓↓×❯]\s+(\S+\.test\.ts)\s+\(\d+ tests?[^)]*\)(?:\s+(\d+(?:\.\d+)?)(ms|s)\b)?/u;
   const durations: Durations = {};
-  for (const line of log.split('\n')) {
+  // A terminal's colour codes sit inside each line.
+  for (const line of log.replace(/\u001b\[[0-9;]*m/g, '').split('\n')) {
     const match = fileResult.exec(line);
     if (!match) continue;
     const [, file, value, unit] = match as unknown as [string, string, string | undefined, string | undefined];

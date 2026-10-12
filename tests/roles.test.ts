@@ -6,6 +6,7 @@ import { assemblePrompt } from '../src/agent/prompt.js';
 import { GLOBAL_INSTRUCTIONS } from '../src/agent/instructions.js';
 import { autoResolve } from '../src/resolve/cases.js';
 import { allows } from '../src/platform/capabilities.js';
+import { normalizeTriggers } from '../src/domain/triggers.js';
 
 const world = { id: 'w', root: '/tmp/w', branch: 'tavya/t', base: 'main', target: 'main' } as any;
 const task = { taskId: 't', projectId: 'p', title: 'Add factorial', prompt: 'implement it' } as any;
@@ -306,6 +307,20 @@ describe('prompt preamble (SPEC §5.4)', () => {
     expect(GLOBAL_INSTRUCTIONS).toContain('(and ask for their credential or ask to connect via MCP)');
     expect(GLOBAL_INSTRUCTIONS).toContain('You are much more capable than you think you are.');
     expect(GLOBAL_INSTRUCTIONS).toContain('Always use the wiki rather than any local memory files.');
+  });
+
+  it('tells agents to hand post-landing work to a task that depends on theirs', () => {
+    expect(GLOBAL_INSTRUCTIONS).toContain('If something must still be done after your changes land');
+    expect(GLOBAL_INSTRUCTIONS).toContain('create a task that depends on yours');
+    expect(GLOBAL_INSTRUCTIONS).toContain('params["agent:do"].resumeFrom {taskId: <your task id>, role: "do"}');
+    // The trigger shape the instructions spell out is one tasks actually arm on.
+    expect(GLOBAL_INSTRUCTIONS).toContain('params.triggers [{kind: "dependency", tasks: [<your task id>]}]');
+    expect(normalizeTriggers({ triggers: [{ kind: 'dependency', tasks: ['task_a'] }] })).toEqual([{ kind: 'dependency', tasks: ['task_a'] }]);
+  });
+
+  it('tells agents to grant tasks they create what they need, and to ask for what they cannot grant', () => {
+    expect(GLOBAL_INSTRUCTIONS).toContain("If you create a task yourself, don't forget to grant it any authorizations or credentials it needs");
+    expect(GLOBAL_INSTRUCTIONS).toContain('request_permission with its task_id');
   });
 });
 
