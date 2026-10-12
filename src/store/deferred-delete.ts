@@ -80,13 +80,23 @@ export class DeferredDeleteObjectStore implements ObjectStore {
     this.deleteTimeoutMs = options.deleteTimeoutMs ?? 5_000;
     this.immediatePrefixes = options.immediatePrefixes ?? ['resource-uploads/'];
     this.now = options.now ?? Date.now;
-    // A direct upload goes around put(): its object is retained first, and
-    // retaining cancels a pending delete, so no tombstone can purge it.
-    if (inner.presign) this.presign = (method, key, seconds, options) => inner.presign!(method, key, seconds, options);
+    // A direct upload goes around put(): whoever records it cancels a pending
+    // delete of its key then (the edge's `stored`, `retainResourceChunks`).
+    // Its URL is a write all the same, so it is recorded as pending first.
+    if (inner.presign) this.presign = async (method, key, seconds, options) => {
+      if (method === 'PUT') await this.store.recordPendingObjectWrite(key, this.now());
+      return inner.presign!(method, key, seconds, options);
+    };
     if (inner.head) this.head = (key, request) => inner.head!(key, request);
+    if (inner.list) this.list = (prefix) => inner.list!(prefix);
   }
 
+  /** Every write is recorded as pending before its bytes reach the store, so
+   * one whose own record never follows (the process died in between, or a
+   * caller failed after writing) is found and deleted once its grace period
+   * has passed (`ObjectReconciler.resolvePendingWrites`). */
   async put(key: string, data: Buffer, contentType?: string): Promise<void> {
+    await this.store.recordPendingObjectWrite(key, this.now());
     // Tombstones are rare, so look before taking the transaction. A purge in
     // progress has not dropped its row yet, so this still sees it and waits.
     if (await this.store.objectTombstone(key))
@@ -97,6 +107,7 @@ export class DeferredDeleteObjectStore implements ObjectStore {
   get(key: string): Promise<Buffer> { return this.inner.get(key); }
   readonly presign?: ObjectStore['presign'];
   readonly head?: ObjectStore['head'];
+  readonly list?: ObjectStore['list'];
 
   async delete(key: string, options?: ObjectRequestOptions): Promise<void> {
     if (this.options.delayMs <= 0 || this.immediatePrefixes.some((prefix) => key.startsWith(prefix)))
@@ -105,9 +116,10 @@ export class DeferredDeleteObjectStore implements ObjectStore {
     await this.store.recordObjectTombstone(key, now, now + this.options.delayMs);
   }
 
-  /** Purge up to one batch of due tombstones, oldest first. A chunk the
-   * database references again (a capture retained it after its release) is
-   * kept and its tombstone dropped. The batch stops at the first failed or
+  /** Purge up to one batch of due tombstones, oldest first. An object the
+   * database names again (a capture retained a chunk after its release, a
+   * world stored a pruned pack again) or still (`Store.objectKeyReferenced`)
+   * is kept and its tombstone dropped. The batch stops at the first failed or
    * timed-out delete: while the store is degraded, each sweep holds the lock
    * for one bounded attempt, and the rest wait for a later sweep. */
   async purgeDue(now = this.now()): Promise<{ purged: number; failed: number }> {
@@ -121,7 +133,7 @@ export class DeferredDeleteObjectStore implements ObjectStore {
           if (chunk) await this.store.lock(`storage:${chunk[1]}`);
           const tombstone = await this.store.objectTombstone(key, { lock: true });
           if (!tombstone || tombstone.purgeAfter > now) return false; // resurrected or deleted again since
-          const referenced = !!chunk && await this.store.hasResourceChunk(chunk[1]!, chunk[2]!);
+          const referenced = await this.store.objectKeyReferenced(key);
           if (!referenced) {
             noteExternalEffect(); // a deleted object is not rolled back: never re-run this attempt
             await withTimeout(this.inner.delete(key, { timeoutMs: this.deleteTimeoutMs }), this.deleteTimeoutMs);

@@ -547,7 +547,11 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .field-help { color:var(--ink-3); font-size:10.5px; font-weight:400; line-height:1.4; }
 .project-resource-row { display:flex; align-items:flex-start; gap:10px; padding:11px 0; border-bottom:1px solid var(--line); }
 .project-resource-row:last-child { border-bottom:0; }
+.resource-on-demand { display:inline-flex; align-items:center; gap:6px; flex:none; min-height:30px; margin-right:6px; font-size:13px; color:var(--ink-2); white-space:nowrap; }
+.form-row.form-row-toggle { flex-direction:row; align-items:center; gap:10px; }
 .project-resource-main { flex:1; min-width:0; }
+/* A phone: the resource's details take the row, its controls go below them. */
+@media (max-width: 640px) { .project-resource-row { flex-wrap:wrap; } .project-resource-main { flex-basis:100%; } .resource-on-demand { margin-right:auto; } }
 .project-resource-meta { display:flex; align-items:center; flex-wrap:wrap; gap:5px; margin-top:5px; color:var(--ink-3); font-size:11px; }
 .project-resource-location { display:inline-flex; gap:5px; align-items:center; padding:3px 7px; border-radius:6px; background:var(--surface-2); }
 .project-resource-location span { color:var(--ink-3); }
@@ -3455,6 +3459,12 @@ html[data-theme="dark"] .github-signin-btn:active,
 .computer-dialog .modal-actions { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
 .computer-dialog .modal-actions .label-row-fill { flex: 1; }
 .computer-size input { -moz-appearance: textfield; appearance: textfield; }
+/* A size above what the provider account allows (its hover text says how much). */
+.computer-size input:invalid { border-color: var(--danger); }
+/* Task header: the computer's disk in use, filled to its share (wiki features/computers). */
+.disk-meter { font: inherit; color: var(--ink-3); cursor: help; padding: 1px 8px; border: 1px solid var(--line); border-radius: 999px;
+  background: linear-gradient(90deg, var(--surface-2) var(--used, 0%), transparent var(--used, 0%)); font-variant-numeric: tabular-nums; }
+.disk-meter.warn { color: var(--danger); border-color: var(--danger); background: linear-gradient(90deg, var(--danger-weak) var(--used, 0%), transparent var(--used, 0%)); }
 .computer-size input::-webkit-inner-spin-button, .computer-size input::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
 
 /* ── Model field: one harness:model:effort input (web/app.js modelFieldHtml) ──

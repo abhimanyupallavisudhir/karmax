@@ -6,8 +6,9 @@
  * Artificial Analysis benchmarks each reasoning effort as its own row —
  * "Claude Opus 5.5 (High)" is `claude-opus-5-5-high` — so a row maps onto one
  * `harness:model:effort` choice. A row is offered only when some harness can
- * run exactly that: Claude and Codex take any exact Anthropic/OpenAI id, and
- * every other model must be in the organization's catalog. Rows a harness
+ * run exactly that: Claude takes any exact Anthropic id, and every other model
+ * — OpenAI's included — must be in the organization's catalog (OpenAI refuses a
+ * model the pinned Codex or the login does not offer). Rows a harness
  * cannot reproduce (non-reasoning modes, ChatGPT-only and Pro models, efforts
  * the model does not accept) are dropped rather than mislabelled.
  *
@@ -127,7 +128,9 @@ export function benchmarkRef(row: { creator: string; slug: string; name: string 
   }
   if (row.creator === 'openai' && /^gpt-\d/.test(base) && !/(?:oss|pro|instant|chatgpt|daybreak|search|audio|realtime|image)/.test(base)) {
     const model = base.replace(/^gpt-(\d+)-(\d+)(?=-|$)/, 'gpt-$1.$2');
-    return !effort || codexReasoningEffort(model, effort) === effort ? withEffort('codex', model) : undefined;
+    if (catalog.codex?.some((m) => m.id === model)) {
+      return !effort || codexReasoningEffort(model, effort) === effort ? withEffort('codex', model) : undefined;
+    }
   }
 
   for (const provider of ['opencode', 'claude', 'codex', 'kimi', 'grok'] as const) {

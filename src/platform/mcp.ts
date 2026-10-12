@@ -3,14 +3,15 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { KarmaxApi, CapabilityError } from './api.js';
 import { PLATFORM_API_CATALOG } from './catalog.js';
-import { URGENCY_LEVELS, type AgentSpec, type Provider, type Urgency } from '../domain/types.js';
+import { URGENCY_LEVELS, type AgentSpec, type AuthorizationSelection, type Provider, type Urgency } from '../domain/types.js';
 import {
   AGENT_ROLE_NAMES, PLATFORM_REQUEST_BODY_SCHEMA, PLATFORM_REQUEST_EXCLUDED_PATHS,
   PRIORITY_NAMES, compactSearch, compactOrganizationSearch, compactTags, normalizePlatformPath, normalizeRequestBody,
-  platformRequestPathError,
+  platformRequestPathError, CREATE_TASK_GRANTS, REQUEST_FOR_TASK,
   type CompactTask,
 } from './platform-request.js';
 import { BRAND } from '../domain/brand.js';
+import { CLOUD_WORLD_PROVIDERS, type CloudWorldProvider } from '../domain/computer.js';
 
 // Re-exported so the platform MCP module stays the one place a reader looks for
 // the agent-facing contract; `src/agent/tools.ts` imports the same definitions
@@ -39,7 +40,12 @@ export interface PlatformOps {
     /** Tag names or `a/b` paths, created on demand (same rules as tag_task). */
     tags?: string[];
     /** Full task-form field values, including trigger definitions. */
-    params?: Record<string, unknown> }): Promise<{ id: string }>;
+    params?: Record<string, unknown>;
+    /** Level and scope its agent gets, and vault credentials (`use-credential:…`) it may use. */
+    authorization?: AuthorizationSelection;
+    credentialGrants?: string[];
+    /** Keep what the caller cannot grant as a held draft rather than refusing it. */
+    holdForAuthorization?: boolean }): Promise<{ id: string; authorizationGap?: { next: string } }>;
   /** Record a project event; armed tasks whose event trigger matches start runs. */
   emitEvent(a: { projectId: string; type: string; key?: string; subject?: string; payload?: Record<string, unknown> }): Promise<unknown>;
   getTask(taskId: string): Promise<unknown>;
@@ -55,7 +61,7 @@ export interface PlatformOps {
   stopAgent(taskId: string, agent: string): Promise<unknown>;
   escalateToHuman(a: { taskId?: string; audience: string[]; message: string; urgency?: Urgency }): Promise<unknown>;
   notify(a: { to?: string[]; message: string; urgency?: Urgency; agents?: AgentSpec[] }): Promise<unknown>;
-  requestPermission(a: { capabilities: string[]; projectIds?: string[]; audience?: string[]; reason: string; urgency?: Urgency }): Promise<unknown>;
+  requestPermission(a: { capabilities?: string[]; projectIds?: string[]; taskId?: string; audience?: string[]; reason: string; urgency?: Urgency }): Promise<unknown>;
   requestAgentAction(a: { taskId: string; role?: string; action: 'publish_branch'; message?: string }): Promise<unknown>;
   cancelAgentAction(requestId: string): Promise<unknown>;
   reorderQueue(domain: string, taskId: string): Promise<void>;
@@ -84,11 +90,11 @@ export interface PlatformOps {
     target: { kind: 'path'; path: string } | { kind: 'environment' | 'service'; name: string };
     access?: 'read' | 'write'; publish?: 'discard' | 'review' }): Promise<unknown>;
   listWorldProviders(organizationId: string): Promise<unknown>;
-  connectWorldProvider(a: { organizationId: string; provider: 'e2b' | 'daytona'; apiKey?: string;
+  connectWorldProvider(a: { organizationId: string; provider: CloudWorldProvider; apiKey?: string;
     name?: string; template?: string; snapshot?: string; image?: string; desktopTemplate?: string;
-    desktopSnapshot?: string; desktopImage?: string; apiUrl?: string; target?: string }): Promise<unknown>;
-  testWorldProvider(organizationId: string, provider: 'e2b' | 'daytona'): Promise<unknown>;
-  disconnectWorldProvider(organizationId: string, provider: 'e2b' | 'daytona'): Promise<unknown>;
+    desktopSnapshot?: string; desktopImage?: string; apiUrl?: string; target?: string; region?: string; organization?: string }): Promise<unknown>;
+  testWorldProvider(organizationId: string, provider: CloudWorldProvider): Promise<unknown>;
+  disconnectWorldProvider(organizationId: string, provider: CloudWorldProvider): Promise<unknown>;
   getExecutionPolicy(organizationId: string, projectId?: string): Promise<unknown>;
   setExecutionPolicy(a: { organizationId: string; projectId?: string; policy: Record<string, unknown> }): Promise<unknown>;
   /** Complete escape hatch for the documented gateway API; still authz checked. */
@@ -159,7 +165,7 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
       organizationId: a.organizationId, provider: a.provider, apiKey: a.apiKey, name: a.name,
       config: { template: a.template, snapshot: a.snapshot, image: a.image,
         desktopTemplate: a.desktopTemplate, desktopSnapshot: a.desktopSnapshot, desktopImage: a.desktopImage,
-        apiUrl: a.apiUrl, target: a.target },
+        apiUrl: a.apiUrl, target: a.target, region: a.region, organization: a.organization },
     }))),
     testWorldProvider: (organizationId, provider) => api.testWorldProviderConnection(getToken(), organizationId, provider),
     disconnectWorldProvider: async (organizationId, provider) => Promise.resolve((await api.deleteWorldProviderConnection(getToken(), organizationId, provider))),
@@ -335,7 +341,8 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
         'Create a new task on a project task list. It is queued and started immediately unless `draft` is true. '
         + '`params` carries the full task-form field values for the chosen workflow (including `triggers`, so a draft can be armed on a schedule/dependency/event); '
         + '`tags` accepts names or `a/b` paths and creates missing ones. '
-        + 'To inline wiki context into the new task, pass wikiContext: an array of `[[proj:…]]`/`[[org:…]]` references — a page ([[proj:guides/deploy]]), a whole label ([[proj:tag:security]]), or a folder ([[proj:runbooks/*]]). Omit it to inherit the default `default`-labelled pages; pass [] to inline none.',
+        + 'To inline wiki context into the new task, pass wikiContext: an array of `[[proj:…]]`/`[[org:…]]` references — a page ([[proj:guides/deploy]]), a whole label ([[proj:tag:security]]), or a folder ([[proj:runbooks/*]]). Omit it to inherit the default `default`-labelled pages; pass [] to inline none. '
+        + CREATE_TASK_GRANTS,
       inputSchema: {
         projectId: z.string(), title: z.string(), prompt: z.string(), workflow: z.string().optional(),
         wikiContext: z.array(z.string()).optional(),
@@ -343,11 +350,16 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
         priority: z.enum(PRIORITY_NAMES).optional(),
         tags: z.array(z.string()).optional(),
         params: z.record(z.string(), z.unknown()).optional(),
+        authorization: z.object({ level: z.string(), scope: z.enum(['projects', 'organization', 'global']),
+          projectIds: z.array(z.string()).optional() }).optional(),
+        credentialGrants: z.array(z.string()).optional(),
       },
     },
-    async (a) => wrap(async () => (await ops.createTask({
-      ...a, priority: a.priority ? PRIORITY_NAMES.indexOf(a.priority) : undefined,
-    })).id),
+    async (a) => wrap(async () => {
+      const task = await ops.createTask({ ...a, priority: a.priority ? PRIORITY_NAMES.indexOf(a.priority) : undefined,
+        holdForAuthorization: true });
+      return task.authorizationGap ? { id: task.id, draft: true, authorizationGap: task.authorizationGap } : task.id;
+    }),
   );
   server.registerTool(
     'list_world_providers',
@@ -359,22 +371,24 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
     {
       description: `Connect or rotate an organization cloud sandbox provider. Requires organization:edit. The API key is stored in the encrypted ${BRAND} vault and never returned.`,
       inputSchema: {
-        organizationId: z.string(), provider: z.enum(['e2b', 'daytona']), apiKey: z.string().optional(), name: z.string().optional(),
+        organizationId: z.string(), provider: z.enum(CLOUD_WORLD_PROVIDERS), apiKey: z.string().optional(), name: z.string().optional(),
         template: z.string().optional(), snapshot: z.string().optional(), image: z.string().optional(),
         desktopTemplate: z.string().optional(), desktopSnapshot: z.string().optional(), desktopImage: z.string().optional(),
         apiUrl: z.string().url().optional(), target: z.string().optional(),
+        region: z.string().optional().describe('Fly.io region (fra) or Hetzner location (fsn1).'),
+        organization: z.string().optional().describe('Fly.io organization slug (default personal).'),
       },
     },
     async (a) => wrap(async () => (await ops.connectWorldProvider(a))),
   );
   server.registerTool(
     'test_world_provider',
-    { description: 'Verify an organization cloud provider credential without creating a billable task world.', inputSchema: { organizationId: z.string(), provider: z.enum(['e2b', 'daytona']) } },
+    { description: 'Verify an organization cloud provider credential without creating a billable task world.', inputSchema: { organizationId: z.string(), provider: z.enum(CLOUD_WORLD_PROVIDERS) } },
     async (a) => wrap(async () => (await ops.testWorldProvider(a.organizationId, a.provider))),
   );
   server.registerTool(
     'disconnect_world_provider',
-    { description: 'Remove an organization cloud provider credential after all worlds using it are gone.', inputSchema: { organizationId: z.string(), provider: z.enum(['e2b', 'daytona']) } },
+    { description: 'Remove an organization cloud provider credential after all worlds using it are gone.', inputSchema: { organizationId: z.string(), provider: z.enum(CLOUD_WORLD_PROVIDERS) } },
     async (a) => wrap(async () => (await ops.disconnectWorldProvider(a.organizationId, a.provider))),
   );
   server.registerTool(
@@ -555,10 +569,11 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
         'Discover valid choices with platform_request GET /api/agent/escalation-targets. ' +
         'Only a selected principal that already holds the requested capabilities and can grant the full task authorization across the expanded scope can approve; approval resumes the task ' +
         'with a newly scoped token. Do not request wildcards. Approval requests are high urgency by default; ' +
-        'pass urgency to raise or lower how loudly the human is alerted.',
+        'pass urgency to raise or lower how loudly the human is alerted. ' + REQUEST_FOR_TASK,
       inputSchema: {
-        capabilities: z.array(z.string().trim().min(1)).max(32),
+        capabilities: z.array(z.string().trim().min(1)).max(32).optional(),
         projectIds: z.array(z.string().trim().min(1)).max(32).optional(),
+        taskId: z.string().trim().min(1).optional(),
         audience: z.array(z.string().trim().min(1)).min(1).max(32).optional(),
         reason: z.string().trim().min(1).max(4_000),
         urgency: z.enum(URGENCY_LEVELS as [Urgency, ...Urgency[]]).optional(),

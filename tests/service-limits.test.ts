@@ -17,6 +17,7 @@ import {
   CLOUDFLARE_TOKEN_HANDLE, evaluateAlerts, mergeServiceLimitSettings, SERVICE_LIMIT_SETTINGS_KEY, SERVICE_LIMIT_STATE_KEY,
   probeError, ServiceLimitsInputError, ServiceLimitsService, type AlertInput, type ServiceLimitAlert,
 } from '../src/ops/service-limits.js';
+import { RECONCILIATION_REPORT_KEY } from '../src/store/object-reconciliation.js';
 
 const NOW = Date.parse('2026-10-08T12:00:00Z');
 const DAY = 86_400_000;
@@ -212,6 +213,31 @@ describe('probes against provider responses', () => {
     expect(header(stub.calls[1]!, 'authorization')).toBe('Bearer dtn_key');
   });
 
+  it('Daytona: a sandbox-scoped key reads what its sandboxes use instead of failing', async () => {
+    // tavya.io's key (2026-10-10): write:sandboxes and delete:sandboxes; the organization's usage answers 403.
+    const stub = stubFetch((url) => {
+      if (url.pathname.endsWith('/api-keys/current'))
+        return reply({ name: 'tavya', organizationId: 'org-123', permissions: ['write:sandboxes', 'delete:sandboxes'] });
+      if (url.pathname.endsWith('/usage')) return reply({ statusCode: 403, message: 'Access denied' }, 403);
+      expect(url.pathname).toBe('/api/sandbox');
+      return url.searchParams.get('cursor') === 'c2'
+        ? reply({ items: [{ state: 'started', cpu: 4, memory: 8, disk: 20 }], nextCursor: null })
+        : reply({ items: [{ state: 'started', cpu: 2, memory: 4, disk: 10 }, { state: 'stopped', cpu: 1, memory: 1, disk: 5 },
+          { state: 'archived', cpu: 1, memory: 1, disk: 3 }], nextCursor: 'c2' });
+    });
+    const result = await daytonaUsage({ fetch: stub.fetch, apiKey: 'dtn_key' });
+    expect(result.plan).toBe('Limited key');
+    // Running sandboxes hold vCPUs and memory; every sandbox not archived holds its disk.
+    expect(result.readings['daytona.capacity']).toEqual({ used: 6, label: 'vCPUs in use', unit: 'count',
+      detail: '6 vCPUs · 12 GiB memory · 35 GiB disk' });
+    expect(stub.calls.every((call) => header(call, 'authorization') === 'Bearer dtn_key')).toBe(true);
+  });
+
+  it('Daytona: a key it does not accept at all is still a failure', async () => {
+    const stub = stubFetch(() => reply({ statusCode: 401, message: 'Invalid credentials' }, 401));
+    await expect(daytonaUsage({ fetch: stub.fetch, apiKey: 'dtn_old' })).rejects.toThrow('Daytona refused the credential (401)');
+  });
+
   it('AgentMail: inboxes from the API, received mail counted by tavya', async () => {
     const stub = stubFetch(() => reply({ count: 2, inboxes: [{ inbox_id: 'a@agentmail.to' }] }));
     expect((await agentMailUsage({ fetch: stub.fetch, apiKey: 'am_key', received: 40 })).readings)
@@ -255,7 +281,7 @@ afterEach(async () => {
 afterAll(async () => { await admin?.end(); });
 
 for (const backend of ['sqlite', ...(postgresUrl ? ['postgres'] : [])]) describe(`service limits on ${backend}`, () => {
-  async function fixture(options: { fetch?: typeof fetch; probeTimeoutMs?: number; heapAge?: number;
+  async function fixture(options: { fetch?: typeof fetch; probeTimeoutMs?: number; heapAge?: number; env?: NodeJS.ProcessEnv;
     notify?: (alerts: ServiceLimitAlert[]) => Promise<void> } = {}) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-service-limits-')); dirs.push(dir);
     if (backend === 'postgres') await admin!.query('DROP SCHEMA public CASCADE; CREATE SCHEMA public');
@@ -265,13 +291,30 @@ for (const backend of ['sqlite', ...(postgresUrl ? ['postgres'] : [])]) describe
     let now = NOW;
     const notices: ServiceLimitAlert[][] = [];
     /** A new instance on the same database and vault: what a restart sees. */
-    const make = () => new ServiceLimitsService({ store, broker, now: () => now, dataDir: dir, env: {},
+    const make = () => new ServiceLimitsService({ store, broker, now: () => now, dataDir: dir, env: options.env ?? {},
       fetch: options.fetch ?? stubFetch(() => reply({}, 500)).fetch, probeTimeoutMs: options.probeTimeoutMs,
       workerHeap: () => ({ usedBytes: 100e6, limitBytes: 2e9, at: now - (options.heapAge ?? 0) }),
       notify: options.notify ?? (async (alerts) => { notices.push(alerts); }) });
     const service = make();
     return { store, broker, service, notices, dir, make, setNow: (value: number) => { now = value; } };
   }
+
+  it('shows untracked and deleted data in the managed bucket from its last reconciliation', async () => {
+    const { store, service } = await fixture();
+    expect((await service.run()).services.find((s) => s.id === 'managed-storage')).toMatchObject({ status: 'not-connected' });
+    const organization = await store.createOrganization({ name: 'nisada-personal' });
+    const tally = (bytes: number) => ({ count: 1, bytes });
+    await store.kvSet(RECONCILIATION_REPORT_KEY, JSON.stringify({ at: NOW, mode: 'report', durationMs: 1, listed: tally(3e9),
+      live: tally(1e9), pendingDelete: tally(1.5e9), pendingWrite: tally(0), untracked: tally(375e6), orphans: tally(375e6),
+      deleted: tally(0), families: [], sample: [], organizations: {
+        [organization.id]: { live: 1e9, pendingDelete: 1.5e9, pendingDeleteUntil: Date.parse('2026-11-09T00:00:00Z'), untracked: 375e6 } } }));
+    const row = (await service.run()).services.find((s) => s.id === 'managed-storage')!;
+    expect(row.status).toBe('ok');
+    expect(row.meters.map((meter) => [meter.id, meter.used, meter.limit, meter.level, meter.detail])).toEqual([
+      ['managed-storage.untracked', 375e6, 1024 ** 3, 0, 'nisada-personal 357.6 MiB'],
+      ['managed-storage.pending-delete', 1.5e9, undefined, 0, 'all purged by 2026-11-09'],
+    ]);
+  });
 
   it('samples the connected accounts, keeps a history and announces each level once', async () => {
     let workers = 85_000;
@@ -358,6 +401,23 @@ for (const backend of ['sqlite', ...(postgresUrl ? ['postgres'] : [])]) describe
     view = await service.run();
     expect(view.services.find((s) => s.id === 'resend')!.meters.map((m) => [m.used, m.usedSource, m.level]))
       .toEqual([[9, 'api', 0], [2_950, 'api', 95]]);
+  });
+
+  it('counts no per-preview certificates once previews share a wildcard, until the old domain\'s leases end', async () => {
+    const env = { KARMAX_PREVIEW_ORIGIN: 'https://usercontent.test', KARMAX_PREVIEW_TLS: 'cloudflare' };
+    const { store, service } = await fixture({ env });
+    let view = await service.run();
+    expect(view.services.find((s) => s.id === 'letsencrypt')).toMatchObject({ status: 'not-needed',
+      note: expect.stringContaining('wildcard') });
+    expect(view.services.find((s) => s.id === 'letsencrypt')!.connect).toBeUndefined();
+    // A host of the previous, on-demand domain still asked this week: counted.
+    await store.countServiceUsage('letsencrypt.certificates', NOW);
+    view = await service.run();
+    expect(view.services.find((s) => s.id === 'letsencrypt')).toMatchObject({ status: 'ok' });
+    expect(view.services.find((s) => s.id === 'letsencrypt')!.meters[0]).toMatchObject({ used: 1, limit: 50, level: 0 });
+    // On demand, the count is the meter, even at zero.
+    const onDemand = await fixture({ env: { KARMAX_PREVIEW_ORIGIN: 'https://preview.tavya.test' } });
+    expect((await onDemand.service.run()).services.find((s) => s.id === 'letsencrypt')!.meters[0]).toMatchObject({ used: 0, limit: 50 });
   });
 
   it('a probe failing twice in a row is an alert; its last readings stand', async () => {

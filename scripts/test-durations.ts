@@ -1,7 +1,9 @@
-/** Refreshes tests/durations.json, which balances CI's test shards, from the
- *  Vitest output of a CI run. Feed it every shard's log, for example:
+/** Refreshes tests/durations.json, which balances CI's test shards, from
+ *  Vitest output. Feed it every shard's log of a CI run, or a local run of the
+ *  files you added or changed, for example:
  *
  *    gh run view <run-id> --log | npm run test:durations
+ *    npx vitest run --reporter=default tests/new.test.ts | npm run test:durations
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -11,7 +13,11 @@ import {
 } from '../tests/helpers/duration-sequencer.js';
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
-const measured = parseReporterDurations(fs.readFileSync(0, 'utf8'));
+// Not readFileSync(0): it fails with EAGAIN on a pipe whose writer is still
+// running, such as a test run.
+let input = '';
+for await (const chunk of process.stdin) input += chunk;
+const measured = parseReporterDurations(input);
 const count = Object.keys(measured).length;
 if (!count) {
   console.error('No Vitest file results on stdin; pass the log of a CI run.');

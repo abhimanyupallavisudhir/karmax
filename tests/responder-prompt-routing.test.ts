@@ -43,9 +43,28 @@ describe('the computer in the World section', () => {
     const prompt = assemblePrompt({ profile, role: 'do', task: task({ kind: 'human', audience: ['@creator'] }),
       world: { ...world, meta: { computer: { cpu: 2, memoryMb: 2048, diskGb: 20 } } } as any });
     expect(prompt).toContain('Computer: 2 CPU · 2 GB · 20 GB disk.');
-    expect(prompt).toMatch(/platform_request\(PATCH, "\/api\/tasks\/[^/]+\/params", \{"params": \{"computer": \{"diskGb": 50\}\}\}\)/);
+    expect(prompt).toMatch(/platform_request\(PATCH, "\/api\/tasks\/[^/]+\/params", \{"params": \{"computer": \{"diskGb": \d+\}\}\}\)/);
     // A local world has no machine of its own to resize.
     expect(assemblePrompt({ profile, role: 'do', task: task({ kind: 'human', audience: ['@creator'] }), world })).not.toContain('Computer:');
+  });
+
+  // compute-disk item 2: the real ceiling, not a generic "diskGb: 50".
+  it('names the disk in use and the largest the account allows, and offers exactly that', () => {
+    const e2b = { ...world, kind: 'e2b', meta: { computer: { cpu: 2, memoryMb: 2048 } } } as any;
+    const limits = { cpu: 8, memoryMb: 8192, diskGb: 29, source: { cpu: 'provider', memoryMb: 'provider', diskGb: 'provider' } as const };
+    const disk = { totalKb: 22 * 2 ** 20, usedKb: 17 * 2 ** 20, availKb: 5 * 2 ** 20 };
+    const prompt = assemblePrompt({ profile, role: 'do', task: task({ kind: 'human', audience: ['@creator'] }), world: e2b, limits, disk,
+      computer: { cpu: 2, memoryMb: 2048 } });
+    expect(prompt).toContain('Computer: 2 CPU · 2 GB · 22 GB disk (17 GB used). This E2B account allows up to 8 CPU, 8 GB memory and 29 GB disk.');
+    expect(prompt).toContain('{"params": {"computer": {"diskGb": 29}}}');
+    expect(prompt).not.toContain('"diskGb": 50');
+    // At the ceiling there is no bigger disk to offer: free space instead.
+    const full = assemblePrompt({ profile, role: 'do', task: task({ kind: 'human', audience: ['@creator'] }),
+      world: { ...e2b, meta: { computer: { cpu: 2, memoryMb: 2048, diskGb: 29 } } }, limits,
+      disk: { totalKb: 29 * 2 ** 20, usedKb: 28 * 2 ** 20, availKb: 2 ** 20 }, computer: { cpu: 2, memoryMb: 2048, diskGb: 29 } });
+    expect(full).toContain('Its disk is the largest this account allows');
+    expect(full).not.toContain('"diskGb"');
+    expect(full).toContain('{"params": {"computer": {"memoryMb": 8192}}}');
   });
 
   // pramana#3: the agent paused on its rebuild job after its owner chose 50 GB;
@@ -60,5 +79,34 @@ describe('the computer in the World section', () => {
     const pending = assemblePrompt({ profile, role: 'do', task: task({ kind: 'human', audience: ['@creator'] }), world: cloud,
       computer: { cpu: 2, memoryMb: 2048, diskGb: 50 } });
     expect(pending).toContain('Computer: 2 CPU · 2 GB. This task\'s computer is now 2 CPU · 2 GB · 50 GB disk: you move to it when the task parks');
+  });
+
+  // A VM world's disk is a volume: it keeps everything and grows in place.
+  it('tells an agent on a VM world that its disk keeps everything and grows at once', () => {
+    const vm = (kind: string) => ({ ...world, kind, meta: { computer: { diskGb: 100 }, machine: { cpu: 2, memoryMb: 2048, diskGb: 100 } } }) as any;
+    const fly = assemblePrompt({ profile, role: 'do', task: task({ kind: 'human', audience: ['@creator'] }), world: vm('fly') });
+    expect(fly).toContain('Computer: 2 CPU · 2 GB · 100 GB disk. Everything on its disk, Git-ignored files included, survives pauses.');
+    expect(fly).toMatch(/\{"computer": \{"diskGb": 200\}\}\}\): it grows at once/);
+    expect(fly).not.toContain('do not carry over');
+    const hetzner = assemblePrompt({ profile, role: 'do', task: task({ kind: 'human', audience: ['@creator'] }), world: vm('hetzner'),
+      computer: { cpu: 4, memoryMb: 8192, diskGb: 100 } });
+    expect(hetzner).toContain('Only your home directory (/home/user) lasts through a long pause');
+    expect(hetzner).toContain('Its CPU and memory become 4 CPU · 8 GB · 100 GB disk at your next pause(3) without jobs');
+  });
+});
+
+// pramana#3: every sub-task copied all 10.5 GB of raw_data. An on-demand
+// resource arrives as a listing, and the prompt says how big it is and how to
+// fetch, and free, only what the task needs.
+describe('on-demand data in the World section', () => {
+  it('names each on-demand resource with its size and the tavya-data command', () => {
+    const prompt = assemblePrompt({ profile, role: 'do', task: task({ kind: 'human', audience: ['@creator'] }),
+      world: { ...world, meta: { resourceProjections: {
+        r1: { target: 'raw_data', access: 'write', onDemand: true, bytes: 10_500_000_000, files: 777_367, parts: 12, held: 0 },
+        r2: { target: 'secrets.env', access: 'read' } } } } as any });
+    expect(prompt).toContain('Project data on demand: raw_data (10.5 GB, 777,367 files in 12 top-level parts; 0 B on this disk).');
+    expect(prompt).toContain('`/world/.karmax-injection/bin/tavya-data get <folder>` fetches a part');
+    expect(prompt).toContain('free space with drop, never rm');
+    expect(assemblePrompt({ profile, role: 'do', task: task({ kind: 'human', audience: ['@creator'] }), world })).not.toContain('on demand');
   });
 });

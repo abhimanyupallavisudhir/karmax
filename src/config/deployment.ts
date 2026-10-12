@@ -2,6 +2,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { parseEnv } from 'node:util';
 import { launchConfig } from '../launch/legal.js';
+import { CLOUD_WORLD_PROVIDERS } from '../domain/computer.js';
 
 export interface DeploymentConfig {
   hosted: boolean;
@@ -55,7 +56,7 @@ const SECRET_FILE_ENV = [
   'STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET',
   'KARMAX_GITHUB_APP_PRIVATE_KEY', 'KARMAX_GITHUB_WEBHOOK_SECRET',
   'KARMAX_GITHUB_CLIENT_SECRET',
-  'E2B_API_KEY', 'DAYTONA_API_KEY', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY',
+  'E2B_API_KEY', 'DAYTONA_API_KEY', 'FLY_API_TOKEN', 'HCLOUD_TOKEN', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY',
   'ARTIFICIAL_ANALYSIS_API_KEY',
 ] as const;
 
@@ -121,6 +122,13 @@ export function validateDeployment(env: NodeJS.ProcessEnv = process.env): Deploy
   if (!previewUrl || previewUrl.protocol !== 'https:') failures.push('KARMAX_PREVIEW_ORIGIN must be an https URL');
   if (publicUrl && previewUrl && publicUrl.origin === previewUrl.origin)
     failures.push('KARMAX_PREVIEW_ORIGIN must use a different origin from KARMAX_PUBLIC_URL');
+  if (env.KARMAX_LEGACY_PREVIEW_ORIGIN?.trim()) {
+    let legacyUrl: URL | undefined;
+    try { legacyUrl = new URL(env.KARMAX_LEGACY_PREVIEW_ORIGIN); } catch {}
+    if (!legacyUrl || legacyUrl.protocol !== 'https:') failures.push('KARMAX_LEGACY_PREVIEW_ORIGIN must be an https URL');
+    else if (publicUrl && publicUrl.origin === legacyUrl.origin)
+      failures.push('KARMAX_LEGACY_PREVIEW_ORIGIN must use a different origin from KARMAX_PUBLIC_URL');
+  }
   if (!env.KARMAX_AUTH_SECRET || env.KARMAX_AUTH_SECRET.length < 32) failures.push('KARMAX_AUTH_SECRET must contain at least 32 characters');
   if (!env.KARMAX_VAULT_KEY || env.KARMAX_VAULT_KEY.length < 32) failures.push('KARMAX_VAULT_KEY must contain at least 32 characters');
   if (!env.KARMAX_WORLD_REF_KEY || env.KARMAX_WORLD_REF_KEY.length < 32) failures.push('KARMAX_WORLD_REF_KEY must contain at least 32 characters');
@@ -137,7 +145,8 @@ export function validateDeployment(env: NodeJS.ProcessEnv = process.env): Deploy
     for (const name of ['KARMAX_S3_ENDPOINT', 'KARMAX_S3_BUCKET', 'KARMAX_S3_ACCESS_KEY_ID', 'KARMAX_S3_SECRET_ACCESS_KEY'])
       if (!env[name]) failures.push(`${name} is required when KARMAX_OBJECT_STORE=s3`);
   }
-  if (!['e2b', 'daytona'].includes(config.cloudWorldProvider!)) failures.push('KARMAX_CLOUD_WORLD_PROVIDER must be e2b or daytona');
+  if (!(CLOUD_WORLD_PROVIDERS as readonly string[]).includes(config.cloudWorldProvider!))
+    failures.push(`KARMAX_CLOUD_WORLD_PROVIDER must be ${CLOUD_WORLD_PROVIDERS.join(', ').replace(/, (?=[^,]*$)/, ' or ')}`);
   const launch = launchConfig(env);
   if (launch.paidLaunch && !launch.ready)
     failures.push(`KARMAX_PAID_LAUNCH=1 requires the explicit launch checklist: ${launch.missing.join(', ')}`);

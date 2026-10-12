@@ -109,6 +109,50 @@ describe('forking an agent from another project', () => {
   });
 });
 
+describe('starting a fork whose authorization does not reach its source', () => {
+  const forkParams = (taskId: string) => ({ prompt: 'continue here', 'agent:do': { resumeFrom: { taskId, role: 'do' } } });
+  const authorization = (...projectIds: string[]) => ({ level: 'developer', scope: 'projects' as const, projectIds });
+
+  it('refuses Run task up front, naming the project to add, and leaves no task behind', async () => {
+    const f = (await fixture());
+    const token = (await f.routeToken('owner', f.target.id));
+    await expect(f.api.createTask(token, { projectId: f.target.id, authorization: authorization(f.target.id), params: forkParams(f.task.id) }))
+      .rejects.toThrow('Add project "Pramana" to this task’s Authorization to fork #1');
+    expect((await f.store.listTasks(f.target.id))).toEqual([]);
+    const started = (await f.api.createTask(token, { projectId: f.target.id,
+      authorization: authorization(f.target.id, f.source.id), params: forkParams(f.task.id) }));
+    expect(started.params.draft).toBe(false);
+    (await f.store.close());
+  });
+
+  it('keeps such a fork a draft when it is queued, until the project is added', async () => {
+    const f = (await fixture());
+    const token = (await f.routeToken('owner', f.target.id));
+    const draft = (await f.api.createTask(token, { projectId: f.target.id, draft: true,
+      authorization: authorization(f.target.id), params: forkParams(f.task.id) }));
+    await expect(f.api.queueTask(token, draft.id)).rejects.toThrow(/Add project "Pramana" to this task’s Authorization/);
+    expect((await f.store.getTask(draft.id))!.params.draft).toBe(true);
+    (await f.api.setTaskAuthorization(token, draft.id, authorization(f.target.id, f.source.id)));
+    expect((await f.api.queueTask(token, draft.id)).params.draft).toBe(false);
+    (await f.store.close());
+  });
+
+  it('judges another agent by its own authority', async () => {
+    const f = (await fixture());
+    const token = (await f.routeToken('owner', f.target.id));
+    const called = (own?: string[]) => ({ prompt: 'continue here',
+      'agent:agent-1': { provider: 'mock', resumeFrom: { taskId: f.task.id, role: 'do' },
+        ...(own ? { authority: { authorization: authorization(...own) } } : {}) } });
+    await expect(f.api.createTask(token, { projectId: f.target.id, authorization: authorization(f.target.id, f.source.id),
+      params: called([f.target.id]) })).rejects.toThrow('Add project "Pramana" to the Agent 1’s Authorization');
+    await expect(f.api.createTask(token, { projectId: f.target.id, authorization: authorization(f.target.id),
+      params: called() })).rejects.toThrow('Add project "Pramana" to this task’s Authorization');
+    expect((await f.api.createTask(token, { projectId: f.target.id, authorization: authorization(f.target.id),
+      params: called([f.target.id, f.source.id]) })).params.draft).toBe(false);
+    (await f.store.close());
+  });
+});
+
 describe('forking an agent from another project over HTTP', () => {
   it('starts the fork from a signed-in browser session', async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-fork-http-'));

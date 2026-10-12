@@ -43,7 +43,8 @@ import { isChatPlatform, type ChatPlatform } from '../integrations/chat-platform
 import { chatThreadKey } from '../integrations/chat-replies.js';
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult, EvalContext, TaskGroup, forClauseValues, attentionCandidates } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
-import { assertInFlightComputerEdit, computerOf, computerResizable, describeMachine, machineShape, normalizeComputer, sameMachine,
+import { providerLabel } from '../domain/computer-limits.js';
+import { applyComputer, assertInFlightComputerEdit, computerOf, computerResizable, describeMachine, machineShape, normalizeComputer, sameMachine,
   type ComputerSpec, type MachineShape } from '../domain/computer.js';
 import { resolveParamsLayers, assembleTaskInput, projectSettingsFor, globalSettingsFor, quickProjectSettingsFor, quickGlobalSettingsFor, effectiveRepos, ValueMap } from './params.js';
 import { REPOSITORY_BRANCHES_RESOLVED_PARAM, applyRepoBranches, normalizeRepoBranches, repositoryBranchDefaults } from './branch-defaults.js';
@@ -59,7 +60,7 @@ import { commitProjectWiki, ensureProjectWikiRepository, mutateAndPublishProject
 import { applyAgentSpec, defaultModel, defaultEffort, ProfileResolver, profileVisibleTo, roleDefaultProfile } from '../agent/profiles.js';
 import { looksLikeConversationUrl, publicConversationShare } from '../agent/panagent.js';
 import { hostLocal as deploymentHostLocal } from '../config/deployment.js';
-import { AuthorizationGrantError, LEVEL_AUDIENCES, type AuthorizationService } from './authorization.js';
+import { AuthorizationGrantError, LEVEL_AUDIENCES, type AuthorizationGap, type AuthorizationService } from './authorization.js';
 import { PermissionRequests, exactCapability, type PermissionRequest } from './permission-requests.js';
 import { AuthorizationRequests, type AuthorizationRequest } from './authorization-requests.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
@@ -907,6 +908,8 @@ export class KarmaxApi {
     if (provider && !['worktree', 'container', 'memory'].includes(provider)
       && !(await this.deps.providerConnections?.available(input.organizationId, provider)))
       throw new Error(`${provider} is not connected and verified`);
+    if (provider && policy.resources && typeof policy.resources === 'object')
+      (await this.deps.providerConnections?.assertFits?.(input.organizationId, provider, machineShape(candidate as Partial<import('../domain/types.js').ProjectConfig>)));
     const runnerPoolId = typeof candidate.runnerPoolId === 'string' ? candidate.runnerPoolId : undefined;
     if (runnerPoolId) {
       const pool = (await this.deps.store.getRunnerPool(runnerPoolId));
@@ -1091,10 +1094,19 @@ export class KarmaxApi {
     const provider = computer?.provider;
     if (provider) {
       const local = ['worktree', 'container', 'memory'].includes(provider);
-      if (local && this.deps.hosted) throw new ValidationError('hosted tasks run on a cloud computer (E2B or Daytona)');
+      if (local && this.deps.hosted) throw new ValidationError('hosted tasks run on a cloud computer (E2B, Daytona, Fly.io or Hetzner)');
       if (!local && this.deps.providerConnections
         && !(await this.deps.providerConnections.available(project.organizationId ?? 'org_personal', provider)))
         throw new ValidationError(`${provider} is not connected. Connect it under Settings → Computers first.`);
+    }
+    // Ask only for what the organization's provider account can give (wiki
+    // features/computers): the sizes this value names, or every effective size
+    // when it moves to another provider.
+    if (computer && (provider || computer.cpu != null || computer.memoryMb != null || computer.diskGb != null)) {
+      const effective = applyComputer(await this.deps.store.effectiveProjectConfig(project), computer);
+      const shape = provider ? machineShape(effective) : machineShape({ resources: computer });
+      try { await this.deps.providerConnections?.assertFits?.(project.organizationId ?? 'org_personal', effective.worldProvider, shape); }
+      catch (error) { throw new ValidationError(error instanceof Error ? error.message : String(error)); }
     }
     return computer;
   }
@@ -1185,6 +1197,38 @@ export class KarmaxApi {
     } else params.base = start.base;
   }
 
+  /**
+   * A task fork reads its source's conversation with the forking agent's own
+   * turn token (`src/activities/core.ts`), so an agent whose authorization does
+   * not reach the source's project fails on its first turn — after the task was
+   * queued. Refuse to start (or arm) such a task instead, naming the project to
+   * add. Mirrors the token's scope: the participant's stored authorization (an
+   * Avatar's own), whose project list must include the source's project.
+   */
+  private async assertForkSourcesReadable(task: TaskRecord, specs?: Map<string, Partial<AgentSpec>>): Promise<void> {
+    specs ??= (await this.taskAgentSpecs(task)).specs;
+    const main = (task.params['agent:do'] ?? task.params['agent:unified']) as Partial<AgentSpec> | undefined;
+    const organizationId = (await this.deps.store.projectOrganizationAsync(task.projectId)) ?? 'org_personal';
+    for (const [participant, spec] of [[MAIN_AGENT, main], ...specs] as [string, Partial<AgentSpec> | undefined][]) {
+      const sourceId = spec?.resumeFrom?.taskId;
+      const source = sourceId ? (await this.deps.store.getTask(sourceId)) : undefined;
+      if (!source) continue;
+      const sourceProject = (await this.deps.store.getProject(source.projectId));
+      const reference = source.num != null ? `#${source.num}` : JSON.stringify(source.title);
+      if ((sourceProject?.organizationId ?? 'org_personal') !== organizationId)
+        throw new ValidationError(`${reference} is in another organization; an agent can only fork from this organization`);
+      const avatar = spec?.avatarId ? (await this.deps.store.getAvatar(spec.avatarId)) : undefined;
+      const own = participant === MAIN_AGENT ? undefined : this.storedAgentAuthorizations(task)[participant];
+      const held: Partial<AuthorizationSelection> | undefined = avatar ? avatar.authorization
+        : own ?? task.params._authorization as Partial<AuthorizationSelection> | undefined;
+      const reaches = held?.scope === 'global' || held?.scope === 'organization'
+        || (held?.scope === 'projects' ? !!held.projectIds?.includes(source.projectId) : source.projectId === task.projectId);
+      if (reaches) continue;
+      const whose = avatar ? `${JSON.stringify(avatar.name)}’s` : own ? `the ${participantLabel(participant)}’s` : 'this task’s';
+      throw new ValidationError(`Add project ${JSON.stringify(sourceProject?.name ?? source.projectId)} to ${whose} Authorization to fork ${reference}`);
+    }
+  }
+
   async createTask(
     token: string,
     args: {
@@ -1223,6 +1267,10 @@ export class KarmaxApi {
       /** `true` accepts the limited package for the task and every agent; a
        * list accepts it for those participants (`do` is the task's own). */
       acceptAttenuation?: boolean | string[];
+      /** Instead of refusing what the caller cannot grant, keep the task as a
+       * draft held for it and return the gap: the caller then asks someone who
+       * can grant it (`requestPermission` with `taskId`). How agents create tasks. */
+      holdForAuthorization?: boolean;
       /** Per-task vault item grants (wiki plans/PLAN-passwords §6): `use-credential:item:…`
        *  / `:tag:…` / `:domain:…` caps layered onto the profile package. */
       credentialGrants?: string[];
@@ -1242,7 +1290,25 @@ export class KarmaxApi {
       confirmationPolicy?: ConfirmationPolicy;
     },
     receivedAt?: { monoMs: number; wallMs: number },
-  ): Promise<TaskRecord> {
+  ): Promise<TaskRecord & { authorizationGap?: AuthorizationGap & { participant?: string } }> {
+    if (args.holdForAuthorization) {
+      const { holdForAuthorization: _hold, ...plain } = args;
+      try {
+        return await this.createTask(token, plain, receivedAt);
+      } catch (error) {
+        // Nothing is persisted before a grant is refused, so this is the same
+        // task saved as a draft, as the console does before it summons someone.
+        if (!(error instanceof AuthorizationGrantError) || !error.gap) throw error;
+        const held = await this.createTask(token, { ...plain, draft: true, allowAttenuation: true }, receivedAt);
+        const { summary, summon } = error.gap;
+        const participant = (error as { participant?: string }).participant;
+        return Object.assign(held, { authorizationGap: { ...error.gap, ...(participant ? { participant } : {}),
+          next: summon
+            ? `Kept as draft ${held.id}: you cannot grant ${summary}. Ask ${summon} (or an audience you name) to grant it with `
+              + `request_permission and task_id "${held.id}"; it starts once approved.`
+            : `Kept as draft ${held.id}: nobody in this organization can grant ${summary}.` } });
+      }
+    }
     receivedAt ??= (await timingEnabled(this.deps.store)) ? { monoMs: performance.now(), wallMs: Date.now() } : undefined;
     const caller = (await this.require(token, 'create_task', { projectId: args.projectId }));
     const project = (await this.deps.store.getProject(args.projectId));
@@ -1426,6 +1492,7 @@ export class KarmaxApi {
         (await this.deps.store.patchTaskParams(task.id, { _agentAuthorization: agents }));
         task = (await this.deps.store.getTask(task.id))!;
       }
+      if (!args.draft) (await this.assertForkSourcesReadable(task, specs));
 
       return { task, delegation };
     });
@@ -2539,19 +2606,27 @@ export class KarmaxApi {
    * limited package nobody accepted refuses the start.
    */
   private async refreshAgentAuthorizationsForQueue(token: string, caller: ScopedToken, task: TaskRecord): Promise<void> {
+    const { specs, fromDefaults, resolvable } = (await this.taskAgentSpecs(task));
+    if (!resolvable) return;
+    const next = (await this.nextAgentAuthorizations(token, caller, task, specs, { mayAttenuate: false, fromDefaults }));
+    this.assertAgentAuthorizationsAccepted(next);
+    if (Object.keys(next).length || task.params?._agentAuthorization !== undefined)
+      (await this.deps.store.patchTaskParams(task.id, { _agentAuthorization: next }));
+    (await this.assertForkSourcesReadable((await this.deps.store.getTask(task.id))!, specs));
+  }
+
+  /** Every agent other than the main one a stored task configures, resolved
+   * against the live defaults as queueing it would. */
+  private async taskAgentSpecs(task: TaskRecord) {
     const project = (await this.deps.store.getProject(task.projectId));
     const start = project && this.resolveStart(task.workflow, task.workflowVersion, project.organizationId);
-    if (!project || !start) return;
+    if (!project || !start) return { specs: new Map<string, Partial<AgentSpec>>(), fromDefaults: new Set<string>(), resolvable: false };
     const overrides = stripPlatformMetadata({ ...task.params }) as ValueMap;
     const resolved = await this.resolveTaskParams(start.manifest, project, overrides);
     const confirmer = start.manifest.params.find((f) => f.type === 'confirmer');
     const group = (await this.deps.store.attemptGroup(task.id));
     if (confirmer && group?.confirmer !== undefined) resolved[confirmer.name] = group.confirmer;
-    const { specs, fromDefaults } = this.agentSpecsOf(start.manifest, { ...resolved, ...calledAgentFields(overrides) }, overrides);
-    const next = (await this.nextAgentAuthorizations(token, caller, task, specs, { mayAttenuate: false, fromDefaults }));
-    this.assertAgentAuthorizationsAccepted(next);
-    if (Object.keys(next).length || task.params?._agentAuthorization !== undefined)
-      (await this.deps.store.patchTaskParams(task.id, { _agentAuthorization: next }));
+    return { ...this.agentSpecsOf(start.manifest, { ...resolved, ...calledAgentFields(overrides) }, overrides), resolvable: true };
   }
 
   /** A copy of a task (an attempt, a series run) gets its own delegated
@@ -3032,6 +3107,10 @@ export class KarmaxApi {
         const computerChange = await this.computerChange(taskId).catch(() => undefined);
         if (computerChange) view = { ...view, computerChange };
       }
+      // The computer's last measured usage and the largest disk its account
+      // allows: the usage meter and the Out of disk action (wiki features/computers).
+      const usage = await this.computerUsage(taskId, view.outOfDisk).catch(() => undefined);
+      if (usage) view = { ...view, usage };
       if (await this.deps.store.kvGet(`project-transfer-history:${taskId}`)) {
         const { world, worldPath, worldAvailable, worldDesktop, worldProvider, ...history } = view;
         view = history;
@@ -3060,6 +3139,7 @@ export class KarmaxApi {
       const group = await this.deps.store.attemptCommitAsync(taskId);
       const subTaskSummaries = await this.deps.store.childTaskSummaries(taskId);
       const forkSummaries = await this.deps.store.forkTaskSummaries(taskId);
+      const forkSourceSummaries = await this.deps.store.forkSourceTaskSummaries(taskId);
       const parentTaskId = view.parentTaskId ?? task?.parentTaskId;
       let parent = parentTaskId ? await this.deps.store.taskMetadataAsync(parentTaskId) : undefined;
       // A parent elsewhere is named only to a caller who may read it.
@@ -3069,6 +3149,7 @@ export class KarmaxApi {
         ...view,
         ...(subTaskSummaries.length ? { subTaskSummaries } : {}),
         ...(forkSummaries.length ? { forkSummaries } : {}),
+        ...(forkSourceSummaries.length ? { forkSourceSummaries } : {}),
         ...(parent ? { parentTask: { id: parent.id, ...(parent.num != null ? { num: parent.num } : {}), title: parent.title } } : {}),
         notes: task?.notes,
         ...(agents ? { agents } : {}),
@@ -4039,9 +4120,10 @@ Act according to your Avatar instructions. When ready, call signal_task for task
    * every capability it grants. */
   async requestPermission(
     token: string,
-    args: { capabilities: string[]; projectIds?: string[]; audience?: string[]; reason: string; urgency?: Urgency },
+    args: { capabilities?: string[]; projectIds?: string[]; taskId?: string; audience?: string[]; reason: string; urgency?: Urgency },
   ): Promise<{ status: 'granted' | 'needs_approval'; requestId?: string; capabilities: string[]; projectIds?: string[]; audience?: string[] }> {
     const caller = (await this.require(token, 'request_permission'));
+    if (args.taskId) return this.requestHeldAuthorization(token, args.taskId, args);
     if (caller.taskId === '*') throw new Error('this endpoint requires a task-agent token');
     const task = (await this.deps.store.getTask(caller.taskId));
     (await this.require(token, 'request_permission', { projectId: task?.projectId, taskId: caller.taskId }));
@@ -4307,6 +4389,34 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     return { special, ...(summon ? { summon } : {}) };
   }
 
+  /**
+   * Ask for what a task you created is held for (`createTask` with
+   * `holdForAuthorization`): the level and credentials it asked for that you
+   * could not grant — the task's own, else those of the first of its other
+   * agents. The asking agent keeps working; a held draft starts once approved.
+   */
+  private async requestHeldAuthorization(token: string, taskId: string, args: { audience?: string[]; reason: string }) {
+    const task = (await this.deps.store.getTask(taskId));
+    if (!task) throw new NotFoundError(`no task ${taskId}`);
+    type Held = { profileAttenuated?: boolean; attenuationAccepted?: boolean; missingCredentialGrants?: string[] };
+    const isHeld = (entry?: Held) => !!entry && !!(entry.profileAttenuated || entry.missingCredentialGrants?.length) && !entry.attenuationAccepted;
+    const own = task.params?._authorization as Held | undefined;
+    const other = isHeld(own) ? undefined
+      : Object.entries(this.storedAgentAuthorizations(task)).find(([, entry]) => isHeld(entry));
+    const authorization = isHeld(own) ? previousTaskGrants(task).authorization
+      : other ? other[1].requested.authorization ?? selectionOf(other[1], task.projectId) : undefined;
+    if (!authorization) throw new ValidationError('this task already has the authorization it asked for');
+    const request = (await this.requestAuthorization(token, {
+      projectId: task.projectId,
+      target: { kind: 'task', taskId, ...(other ? { participant: other[0] } : {}), ...(task.params?.draft ? { queueAfterApproval: true } : {}) },
+      authorization,
+      credentialGrants: (isHeld(own) ? own : other?.[1])?.missingCredentialGrants,
+      audience: args.audience ?? [],
+      reason: args.reason,
+    }));
+    return { status: 'needs_approval' as const, requestId: request.id, capabilities: request.missingCapabilities, audience: request.audience };
+  }
+
   async requestAuthorization(
     token: string,
     input: {
@@ -4357,6 +4467,8 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     const eligibleUsers = new Set(targets.users.map((user) => user.id));
     const eligibleAvatars = new Set(targets.avatars.map((avatar) => avatar.id));
     const audience = [...new Set((input.audience ?? []).map(String).map((value) => value.trim()).filter(Boolean))];
+    // No audience: summon the lowest level that can grant it all, as the console offers first.
+    if (!audience.length && targets.summon) audience.push(targets.summon);
     if (!audience.length || audience.length > 32) throw new ValidationError('choose between 1 and 32 eligible recipients');
     const recipients = new Set<string>();
     const avatarRecipients = new Set<string>();
@@ -6169,11 +6281,17 @@ Act according to your Avatar instructions. When ready, call platform_request POS
         if (world && !world.meta?.computer && !['worktree', 'container', 'memory'].includes(world.kind))
           (await this.deps.store.updateWorldMeta(world, { computer: machineShape(computerBefore) }).catch(() => undefined));
         result.applied = [...new Set([...result.applied, 'computer'])];
+        // A VM world's disk grows now, under the running agent (vm/provider.ts).
+        const resized = await this.resizeInPlace(taskId).catch(() => ({ inPlace: true, grown: undefined }));
+        const grown = resized.grown;
         // A running world moves only once it parks, which a turn or a job wait
         // never does: tell the agent, unless it asked for the size itself.
         const change = caller.taskId === taskId ? undefined : await this.computerChange(taskId).catch(() => undefined);
-        if (change && (await this.deps.store.worldState(taskId)) === 'ready')
-          (await this.deliverWorkflowMessage(taskId, computerChangeNotice(change)).catch(() => undefined));
+        const live = (await this.deps.store.worldState(taskId)) === 'ready';
+        if (change && !task.lastView?.outOfDisk && live)
+          (await this.deliverWorkflowMessage(taskId, computerChangeNotice(change, resized.inPlace)).catch(() => undefined));
+        else if (grown?.disk === 'grown' && live && caller.taskId !== taskId && !task.lastView?.outOfDisk)
+          (await this.deliverWorkflowMessage(taskId, diskGrownNotice(grown.machine.diskGb)).catch(() => undefined));
       }
       (await this.updateAgentSnapshot(taskId, patch, result.applied));
       if (result.applied.includes('target') && typeof patch.target === 'string')
@@ -6191,6 +6309,78 @@ Act according to your Avatar instructions. When ready, call platform_request POS
     } catch (e) {
       throw new Error(unwrapCause(e));
     }
+  }
+
+  /** Grow a running VM world's disk now (its CPU and memory follow at the next
+   * start), recording what changed; undefined for providers that cannot. */
+  private async resizeInPlace(taskId: string): Promise<{ inPlace: boolean;
+    grown?: { disk: 'grown' | 'unchanged'; machine: { diskGb: number } } }> {
+    const world = (await this.deps.store.currentWorld(taskId));
+    const provider = world && this.deps.worlds ? (() => { try { return this.deps.worlds!.get(world.kind); } catch { return undefined; } })() : undefined;
+    if (!world || !provider?.resize) return { inPlace: false };
+    const change = await this.computerChange(taskId);
+    if ((await this.deps.store.worldState(taskId)) !== 'ready' || !change?.to.diskGb || change.to.diskGb <= (change.from.diskGb ?? 0))
+      return { inPlace: true };
+    return { inPlace: true, grown: await this.deps.worlds!.withOperation(taskId, async () => {
+      const result = await provider.resize!(world as import('../world/types.js').WorldHandle, { ...change.from, diskGb: change.to.diskGb });
+      (await this.deps.store.updateWorldMeta(world, { computer: { ...change.from, diskGb: change.to.diskGb }, machine: result.machine }));
+      return result;
+    }) };
+  }
+
+  /** A cloud task's last measured disk and memory, and the largest disk its
+   * provider account allows. Undefined for a task with no cloud computer. */
+  private async computerUsage(taskId: string, outOfDisk?: boolean): Promise<TaskView['usage']> {
+    const raw = await this.deps.store.kvGet(`world-usage:${taskId}`);
+    let reading: TaskView['usage'] | undefined;
+    try { reading = raw ? JSON.parse(raw) : undefined; } catch { reading = undefined; }
+    if (!reading && !outOfDisk) return undefined;
+    // The task's metadata, not its conversation: a task view is read often.
+    const task = await this.deps.store.taskMetadataAsync(taskId);
+    const project = task && (await this.deps.store.getProject(task.projectId));
+    let own: ComputerSpec | undefined;
+    try { own = normalizeComputer(task?.params?.computer); } catch { own = undefined; }
+    const provider = project ? own?.provider ?? (await this.deps.store.effectiveProjectConfig(project)).worldProvider : undefined;
+    const maxDiskGb = provider ? (await this.deps.providerConnections?.limits?.(project!.organizationId ?? 'org_personal', provider))?.diskGb : undefined;
+    return { at: reading?.at ?? 0, ...(provider ? { provider } : {}), ...(reading?.disk ? { disk: reading.disk } : {}),
+      ...(reading?.memory ? { memory: reading.memory } : {}), ...(maxDiskGb != null ? { maxDiskGb } : {}) };
+  }
+
+  /**
+   * Bigger disk (wiki features/computers): give a task's computer more disk, up
+   * to its provider account's ceiling (the default). Only the disk changes. A
+   * task stopped by its full disk is woken, and its agent told how to reach the
+   * new size; at the ceiling there is nothing bigger to give.
+   */
+  async biggerDisk(token: string, taskId: string, requested?: number): Promise<{ diskGb: number; maxDiskGb: number; applied: string[] }> {
+    const task = (await this.deps.store.getTask(taskId));
+    if (!task) throw new NotFoundError(`no task ${taskId}`);
+    const caller = (await this.require(token, 'edit_task', { projectId: task.projectId, taskId }));
+    const project = (await this.deps.store.getProject(task.projectId));
+    if (!project) throw new NotFoundError(`no project ${task.projectId}`);
+    const config = await this.deps.store.effectiveTaskConfig(project, taskId);
+    const provider = config.worldProvider ?? 'worktree';
+    const maxDiskGb = (await this.deps.providerConnections?.limits?.(project.organizationId ?? 'org_personal', provider))?.diskGb;
+    if (maxDiskGb == null) throw new ValidationError('this task\'s computer has no provider disk to grow');
+    const usage = await this.computerUsage(taskId, true).catch(() => undefined);
+    const current = usage?.disk ? Math.round(usage.disk.totalMb / 1024) : config.resources?.diskGb;
+    const diskGb = requested ?? maxDiskGb;
+    if (!Number.isInteger(diskGb) || diskGb < 1) throw new ValidationError('Disk must be a whole number of GB');
+    if (diskGb > maxDiskGb) throw new ValidationError(`Disk can be at most ${maxDiskGb} GB on this ${providerLabel(provider)} account`);
+    if (current != null && diskGb <= current)
+      throw new ValidationError(current >= maxDiskGb
+        ? `This computer already has the largest disk this ${providerLabel(provider)} account allows (${maxDiskGb} GB)`
+        : `This computer already has ${current} GB of disk`);
+    const own = normalizeComputer(task.params.computer) ?? {};
+    const { applied } = await this.updateParams(token, taskId, { computer: { ...own, diskGb } });
+    // A stopped task waits for a message or a Retry; this message is both, and
+    // says what changed. The agent asking for itself needs neither.
+    if (task.lastView?.outOfDisk && caller.taskId !== taskId) {
+      const world = await this.deps.store.currentWorld(taskId);
+      const inPlace = Boolean(world && (() => { try { return this.deps.worlds?.get(world.kind).resize; } catch { return undefined; } })());
+      (await this.deliverWorkflowMessage(taskId, biggerDiskNotice(diskGb, current, inPlace)).catch(() => undefined));
+    }
+    return { diskGb, maxDiskGb, applied };
   }
 
   /** The machine a task's Computer asks for, when its world runs on another. */
@@ -7136,12 +7326,28 @@ function applyExecutionConfig(config: import('../domain/types.js').ProjectConfig
   return next as import('../domain/types.js').ProjectConfig;
 }
 
+/** What a task stopped by its full disk is told when it gets a bigger one. */
+function biggerDiskNotice(diskGb: number, fromGb: number | undefined, inPlace = false): string {
+  // A VM world's disk grows where it is (vm/provider.ts): nothing moves.
+  if (inPlace) return `[${BRAND} bigger disk] The disk was full. It now has ${diskGb} GB, grown in place: every file is where you left it, so carry on.`;
+  return `[${BRAND} bigger disk] The disk was full. This task's computer now has a ${diskGb} GB disk${fromGb != null ? `; you are still on ${fromGb} GB` : ''}. `
+    + 'You move to it when this task parks: end your turn with pause(3) without jobs (stop any job first). '
+    + 'You resume with every tracked file and uncommitted change; Git-ignored files (dependencies, build output) and running processes do not carry over.';
+}
+
 /** What an agent is told when its task's Computer changes under it. */
-function computerChangeNotice(change: { from: MachineShape; to: MachineShape }): string {
+function computerChangeNotice(change: { from: MachineShape; to: MachineShape }, inPlace = false): string {
   return `[${BRAND} computer change]\n\nThis task's computer is now ${describeMachine(change.to)}; you are still on ${describeMachine(change.from)}. `
     + 'You move to it when this task parks: end your turn with pause(3) without jobs. A pause that waits on jobs keeps this machine, '
     + 'so first let them finish or stop them (stop_job); if one is running out of room, stopping it now is usually right. '
-    + 'You resume with every tracked file and uncommitted change; Git-ignored files (dependencies, build output) and running processes do not carry over.';
+    + (inPlace
+      ? 'Its disk keeps everything, Git-ignored files included; only running processes do not carry over.'
+      : 'You resume with every tracked file and uncommitted change; Git-ignored files (dependencies, build output) and running processes do not carry over.');
+}
+
+/** What an agent is told when its running computer's disk grew under it. */
+function diskGrownNotice(diskGb: number): string {
+  return `[${BRAND} computer change]\n\nThis task's disk is now ${diskGb} GB. It grew in place: nothing moved and nothing needs restarting.`;
 }
 
 /** A webhook delivery the hook could not authenticate. */

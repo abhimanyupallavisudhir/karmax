@@ -26,11 +26,11 @@ describe('deployment profiles', () => {
     const dockerfile = fs.readFileSync(path.join(repoRoot, 'deploy', 'Dockerfile'), 'utf8');
     expect(pkg.dependencies['@anthropic-ai/claude-agent-sdk']).toBe('0.3.281');
     const browserImage = fs.readFileSync(path.join(repoRoot, 'environments/browser/Dockerfile'), 'utf8');
-    expect(browserImage).toContain('ARG CODEX_VERSION=0.156.1');
+    expect(browserImage).toContain('ARG CODEX_VERSION=0.162.1');
     expect(browserImage).toContain('ARG CLAUDE_CODE_VERSION=2.1.281');
     // Remote OpenCode runs the pinned package; the template bakes that version.
     expect(browserImage).toContain(`ARG OPENCODE_VERSION=${OPENCODE_VERSION}`);
-    expect(pkg.dependencies['@openai/codex']).toBe('0.156.1');
+    expect(pkg.dependencies['@openai/codex']).toBe('0.162.1');
     expect(pkg.dependencies.pg).toBeTruthy();
     expect(dockerfile).toContain('npm ci --omit=dev');
   });
@@ -64,7 +64,7 @@ describe('deployment profiles', () => {
     [{ KARMAX_TEMPORAL_ADDRESS: '' }, 'KARMAX_TEMPORAL_ADDRESS must point at a durable Temporal service'],
     [{ KARMAX_S3_BUCKET: undefined }, 'KARMAX_S3_BUCKET is required when KARMAX_OBJECT_STORE=s3'],
     [{ KARMAX_S3_SECRET_ACCESS_KEY: '' }, 'KARMAX_S3_SECRET_ACCESS_KEY is required when KARMAX_OBJECT_STORE=s3'],
-    [{ KARMAX_CLOUD_WORLD_PROVIDER: 'worktree' }, 'KARMAX_CLOUD_WORLD_PROVIDER must be e2b or daytona'],
+    [{ KARMAX_CLOUD_WORLD_PROVIDER: 'worktree' }, 'KARMAX_CLOUD_WORLD_PROVIDER must be e2b, daytona, fly or hetzner'],
     [{ KARMAX_SINGLE_NODE: '1', KARMAX_OBJECT_STORE: 'memory' }, 'single-node KARMAX_OBJECT_STORE must be local or s3'],
   ])('refuses a managed cell with %j', (change, failure) => {
     expect(() => validateDeployment({ ...managedCell(), ...change })).toThrow(`hosted deployment is unsafe:\n- ${failure}`);

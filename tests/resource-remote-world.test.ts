@@ -1,4 +1,5 @@
 import { afterEach, expect, it, vi } from 'vitest';
+import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -280,4 +281,46 @@ it('gives a retried merge the same restore command, so the retry finds the resto
   expect(restores).toHaveLength(2);
   expect(restores[1]).toBe(restores[0]);
   expect(fs.readFileSync(path.join(world.handle.root, 'data/seed.txt'), 'utf8')).toBe('seed');
+}, REAL_RESTIC_MS);
+
+// On demand (wiki features/resource-storage): the remote world gets the listing
+// and `tavya-data`, whose restic fetches through the public route with a read
+// grant; saves back up only the parts it holds, as jobs there.
+it('fetches and saves parts of an on-demand resource in a remote world, keeping every part it never fetched', async () => {
+  const f = await fixture();
+  await f.store.updateResourceAttachment(f.attachment.id, { onDemand: true });
+  const pages = Array.from({ length: 20 }, (_, i) => ({ path: `ocr/${i}.txt`, data: crypto.randomBytes(2000 + i) }));
+  const first = await f.resources.importFiles(f.attachment.id, [...pages, { path: 'mt/a.txt', data: Buffer.from('mt') },
+    { path: 'big/blob.bin', data: crypto.randomBytes(4 * 1024 * 1024) }, { path: 'README', data: Buffer.from('top') }]);
+  const { task, world } = await f.sandbox('On demand');
+  world.handle = await f.resources.materialize(f.project.id, task.id, world, 1);
+  world.handle = (await f.store.registerWorld(world.handle, f.project.id)) as typeof world.handle;
+  expect(fs.readdirSync(path.join(world.handle.root, 'data'))).toEqual([]);
+  const grant = JSON.parse(fs.readFileSync(path.join(world.handle.root, `.karmax-injection/data/${f.attachment.id}/grant.json`), 'utf8'));
+  expect(grant.env.RESTIC_REPOSITORY).toMatch(new RegExp(`^rest:${f.gatewayUrl}/resource-repositories/`));
+  expect(fs.statSync(path.join(world.handle.root, `.karmax-injection/data/${f.attachment.id}/grant.json`)).mode & 0o777).toBe(0o600);
+
+  const tool = path.join(world.handle.root, '.karmax-injection/bin/tavya-data');
+  const run = (...args: string[]) => new Promise<{ code: number | null; out: string }>((resolve) => {
+    const child = spawn(tool, args, { cwd: world.handle.root });
+    let out = '';
+    child.stdout.on('data', (chunk) => { out += chunk; });
+    child.stderr.on('data', (chunk) => { out += chunk; });
+    child.on('close', (code) => resolve({ code, out }));
+  });
+  expect(await run('get', 'data/ocr')).toMatchObject({ code: 0 });
+  fs.writeFileSync(path.join(world.handle.root, 'data/ocr/0.txt'), 'corrected');
+  // A file written into a part never fetched joins it.
+  fs.mkdirSync(path.join(world.handle.root, 'data/mt'));
+  fs.writeFileSync(path.join(world.handle.root, 'data/mt/b.txt'), 'new');
+  expect(await f.resources.summarize(task.id, f.attachment.id)).toMatchObject({ added: 1, modified: 1, deleted: 0 });
+  const promoted = await f.resources.promote(task.id, f.attachment.id);
+  const parts = JSON.parse((await f.store.getResourceRevision(promoted.revision.id))!.sealedRef).parts;
+  const before = JSON.parse((await f.store.getResourceRevision(first.id))!.sealedRef).parts;
+  expect(parts.big).toEqual(before.big);
+  expect(parts['.']).toEqual(before['.']);
+  expect(fs.existsSync(path.join(world.handle.root, 'data/big'))).toBe(false);
+  const verified = await f.resources.verifyRevision(f.project.id, f.attachment.id, promoted.revision.id, 0, 1000);
+  expect(verified.status).toBe('complete');
+  expect(verified.files.map((file) => file.path).sort()).toEqual([...pages.map((page) => page.path), 'README', 'big/blob.bin', 'mt/a.txt', 'mt/b.txt'].sort());
 }, REAL_RESTIC_MS);

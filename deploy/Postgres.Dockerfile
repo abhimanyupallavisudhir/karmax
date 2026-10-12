@@ -30,3 +30,5 @@ RUN set -eu; \
     wal-g --version
 
 COPY --chmod=755 postgres/pg-backup.sh /usr/local/bin/karmax-pg-backup
+# The server's entrypoint in compose.turnkey.yml: memory sized to the container's cap.
+COPY --chmod=755 postgres/postgres-memory.sh /usr/local/bin/karmax-postgres

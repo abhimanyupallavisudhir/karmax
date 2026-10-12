@@ -323,7 +323,7 @@ async function reviewUrl(store: Store, taskId: string, world: WorldHandle, value
       createdBy: 'system:review-action', createdAt: Date.now(),
       expiresAt: Date.now() + reviewPreviewTtlMs() }));
     leases.push(lease.id);
-    return previewLeaseUrl(lease.id, `${url.pathname}${url.search}`, token);
+    return previewLeaseUrl(lease, `${url.pathname}${url.search}`, token);
   } catch {
     return value;
   }

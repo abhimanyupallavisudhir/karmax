@@ -106,8 +106,11 @@ ${keys.map(([key, size]) => `<Contents><Key>${key}</Key><LastModified>2026-10-01
       : page([['a b/1.bin', 1], ['a b/2.bin', 2]], 'next/token=='));
     const listed = [];
     for await (const entry of r2(s3.fetch).list('a b/')) listed.push(entry);
+    // With its write time (LastModified): the reconciliation's grace period needs it.
+    const at = Date.parse('2026-10-01T00:00:00.000Z');
     expect(listed).toEqual([
-      { key: 'a b/1.bin', bytes: 1, etag: 'e' }, { key: 'a b/2.bin', bytes: 2, etag: 'e' }, { key: 'a b/3&4.bin', bytes: 7, etag: 'e' },
+      { key: 'a b/1.bin', bytes: 1, etag: 'e', modifiedAt: at }, { key: 'a b/2.bin', bytes: 2, etag: 'e', modifiedAt: at },
+      { key: 'a b/3&4.bin', bytes: 7, etag: 'e', modifiedAt: at },
     ]);
     expect(s3.requests).toHaveLength(2);
     for (const request of s3.requests) {

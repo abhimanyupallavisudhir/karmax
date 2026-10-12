@@ -47,6 +47,7 @@ import { platformRequestPathError } from '../platform/platform-request.js';
 import { ContributionRegistry } from '../contrib/registry.js';
 import { Overlays } from '../store/overlays.js';
 import { activationTaskPrompt, manifest } from '../contrib/manifests.js';
+import { machineShape } from '../domain/computer.js';
 import { projectSettingsFor, globalSettingsFor, quickProjectSettingsFor, quickGlobalSettingsFor, quickScopeKey, settingsToProjectConfig, resolveParams, resolveParamsLayers, effectiveRepos } from '../platform/params.js';
 import { defaultProvider } from '../agent/adapters.js';
 import { findProviderSession } from '../agent/fork.js';
@@ -64,6 +65,7 @@ import { expandPath } from '../util/expand.js';
 import { withTimeout } from '../util/timeout.js';
 import { AgentAuthority, AgentSpec, AuthorizationSelection, Avatar, Provider, Project, ProjectConfig, PrincipalRef, ProjectPrincipalRef, ResourceAttachment, ResourceRevision, ResourceTarget, WorldLocation, normalizeUrgency } from '../domain/types.js';
 import { dotenvFile, dotenvSecretName, parseDotenv } from '../domain/dotenv.js';
+import { CLOUD_WORLD_PROVIDERS } from '../domain/computer.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
 import { MIN_CLI_VERSION, WorkspaceService } from '../world/workspace.js';
@@ -88,8 +90,9 @@ import { localTaskBrowserUrl, WORLD_CDP_URL } from '../autonomy/task-browser.js'
 import { newId } from '../util/id.js';
 import { DurableEventFanout, type FanoutAudience } from './fanout.js';
 import { affects, authorityChanged, authoritySeq, changedSince, onAuthorityChange, type AuthorityChange, type AuthoritySubject } from '../store/authorization-epoch.js';
+import { AGENT_MAIL_MAX_BYTES, MAIL_FROM_HEADER, MAIL_SIGNATURE_HEADER, MAIL_TO_HEADER, verifyMail } from '../edge/agent-mail-signature.js';
 import { configuredPreviewOrigin, hashPreviewToken, newPreviewToken, previewCookieHeader,
-  previewCookieValue, previewLeaseOrigin, previewLeaseUrl, previewTokenMatches } from './previews.js';
+  previewCookieValue, previewLeaseOrigin, previewLeaseUrl, previewOrigins, previewTokenMatches } from './previews.js';
 import type { RemoteAccessController } from '../remote/access.js';
 import { GithubEvents } from '../integrations/github-events.js';
 import { CHAT_CREDENTIALS } from '../integrations/chat-platforms.js';
@@ -165,6 +168,8 @@ export interface GatewayDeps {
   paidLaunchSettings?: import('../launch/settings.js').PaidLaunchSettingsService;
   /** Installation → Service limits (operator accounts and this host against their plans). */
   serviceLimits?: import('../ops/service-limits.js').ServiceLimitsService;
+  /** Compares the managed bucket with the database (store/object-reconciliation.ts). */
+  storageReconciler?: import('../store/object-reconciliation.js').ObjectReconciler;
   cellId?: string;
   hosted?: boolean;
   /** Whether the browser and the host are the same machine (see `hostLocal`).
@@ -1111,14 +1116,16 @@ export class Gateway {
       counts = organizationId ? (await this.approvalCounts(organizationId)) : new Map();
     }
     const count = counts.get(taskId);
-    // Sub-task and fork panels flag a task's approval exactly as its list row does.
+    // Sub-task and fork lineage panels flag a task's approval exactly as its list row does.
     const flag = <T extends ChildTaskSummary>(summary: T): T => {
       const approvalRequests = counts.get(summary.id)?.notify;
       return approvalRequests && summary.lastView ? { ...summary, lastView: { ...summary.lastView, approvalRequests } } : summary;
     };
     const subTaskSummaries = view.subTaskSummaries?.map(flag);
     const forkSummaries = view.forkSummaries?.map(flag);
+    const forkSourceSummaries = view.forkSourceSummaries?.map(flag);
     return { ...view, ...(subTaskSummaries ? { subTaskSummaries } : {}), ...(forkSummaries ? { forkSummaries } : {}),
+      ...(forkSourceSummaries ? { forkSourceSummaries } : {}),
       approvalRequests: count?.notify || undefined, pendingDecisions: count?.pending || undefined };
   }
 
@@ -1317,7 +1324,7 @@ export class Gateway {
       const id = url.pathname.match(/^\/preview\/([^/]+)/)?.[1];
       const lease = id ? await this.deps.store.previewLease(id) : undefined;
       if (!lease || lease.revokedAt || lease.expiresAt <= Date.now()) return;
-      if (configuredPreviewOrigin() && String(req.headers.host ?? '').toLowerCase() !== new URL(previewLeaseOrigin(lease.id)).host.toLowerCase()) return;
+      if (configuredPreviewOrigin() && String(req.headers.host ?? '').toLowerCase() !== new URL(previewLeaseOrigin(lease)).host.toLowerCase()) return;
       const current = await this.deps.store.currentWorld(lease.worldId);
       if (!current || (current.generation ?? 1) !== lease.generation) return;
       if (lease.tokenHash) {
@@ -1710,7 +1717,8 @@ export class Gateway {
     if (previewOrigin && !onPreviewOrigin && p.startsWith('/preview/')) {
       const leaseId = p.match(/^\/preview\/([^/]+)/)?.[1];
       if (!leaseId) return this.json(res, 404, { error: 'not found' });
-      res.writeHead(307, { location: `${previewLeaseOrigin(decodeURIComponent(leaseId))}${p}${url.search}`, 'referrer-policy': 'no-referrer' });
+      const id = decodeURIComponent(leaseId);
+      res.writeHead(307, { location: `${previewLeaseOrigin((await this.deps.store.previewLease(id)) ?? id)}${p}${url.search}`, 'referrer-policy': 'no-referrer' });
       return void res.end();
     }
     if (p.startsWith('/preview/')) return this.serveLeasedPreview(req, res, url);
@@ -1986,6 +1994,28 @@ export class Gateway {
     // unauthenticated endpoints, before the session gate.
     if (p === '/api/agent-mail/ingest' && method === 'POST') {
       const mailMod = await import('../autonomy/agent-mail.js');
+      // The installation's own mail domain (KARMAX_AGENT_MAIL_DOMAIN): the
+      // Cloudflare Email Worker posts each message as raw MIME, signed with the
+      // key it shares with this installation (src/edge/agent-mail-worker.ts).
+      const signature = req.headers[MAIL_SIGNATURE_HEADER];
+      if (typeof signature === 'string') {
+        if (Number(req.headers['content-length'] ?? 0) > AGENT_MAIL_MAX_BYTES)
+          return this.json(res, 413, { error: 'message too large' });
+        let raw: Buffer;
+        try { raw = await this.rawBody(req, AGENT_MAIL_MAX_BYTES); } catch { return this.json(res, 413, { error: 'message too large' }); }
+        const to = String(req.headers[MAIL_TO_HEADER] ?? '').trim().toLowerCase();
+        const from = String(req.headers[MAIL_FROM_HEADER] ?? '').trim().toLowerCase();
+        if (!(await verifyMail(mailMod.agentMailIngestKey(), signature, to, from, raw)))
+          return this.json(res, 401, { error: 'invalid mail signature' });
+        // Only the installation's mail domain arrives this way; every other
+        // address (an organization's own provider) has its own route.
+        const domain = process.env.KARMAX_AGENT_MAIL_DOMAIN?.trim().toLowerCase();
+        if (!domain || !to.endsWith(`@${domain}`)) return this.json(res, 200, { delivered: false });
+        const mail = mailMod.parseRawMail(raw.toString('utf8'));
+        const { delivered } = await new mailMod.AgentMail(this.deps.store).ingest({ to, from: mailMod.cleanAddress(from),
+          subject: mail.subject, text: mail.text, ...(mail.messageId ? { sourceId: `message-id:${mail.messageId}` } : {}) });
+        return this.json(res, 200, { delivered });
+      }
       // Auth: the minted secret (in the copy-pasted webhook URL or a Bearer
       // header) — forwarding services can rarely set custom headers, so the
       // query form is the primary one. Legacy env secret stays accepted.
@@ -2496,14 +2526,13 @@ export class Gateway {
         const enabledCredentials = resolveCredentials(credentials, {
           global: parsePolicy((await store.kvGet(credPolicyKey.organization(organizationId)))),
         });
-        const e2b = (await store.getWorldProviderConnection(organizationId, 'e2b'));
-        const daytona = await store.getWorldProviderConnection(organizationId, 'daytona');
+        const clouds = await Promise.all(CLOUD_WORLD_PROVIDERS.map((provider) => store.getWorldProviderConnection(organizationId, provider)));
         const facts = {
           github: Boolean((await this.deps.identity?.providersForUser(subject.userId))?.includes('github')
             || (await this.deps.githubApp?.status(subject.userId))?.userAuthorized
             || (await store.listGitConnections(organizationId)).some((connection) => !connection.suspendedAt)),
           agentLogin: enabledCredentials.length > 0,
-          e2b: (await Promise.all([e2b, daytona].map(async (connection) => !!connection?.enabled
+          e2b: (await Promise.all(clouds.map(async (connection) => !!connection?.enabled
             && !!await this.deps.broker?.hasHandle(connection.credentialHandle)))).some(Boolean),
           paidPlan: await this.deps.subscriptions?.hasPaidSubscription(organizationId) ?? false,
           vault: (await new VaultItems(store, this.deps.broker, undefined, organizationId).list())
@@ -2626,6 +2655,19 @@ export class Gateway {
         }
         const view = method === 'GET' ? (await service.view()) : (await service.run());
         return this.json(res, 200, { ...view, canManage: write || (await this.deps.tokens.check(token, 'settings:write')).ok });
+      }
+      // The last comparison of the managed bucket with the database, per
+      // organization; POST lists the bucket now. `dryRun` never deletes, even
+      // when KARMAX_STORAGE_RECONCILE=delete.
+      if (p === '/api/settings/storage-reconciliation') {
+        const reconciler = this.deps.storageReconciler;
+        if (!reconciler) return this.json(res, 503, { error: 'storage reconciliation is unavailable' });
+        if (method !== 'GET' && method !== 'POST') return this.json(res, 405, { error: 'method not allowed' });
+        if (!(await this.deps.tokens.check(token, method === 'GET' ? 'settings:read' : 'settings:write')).ok)
+          return this.json(res, 403, { error: `Only a ${(await this.siteName)} installation operator can reconcile storage` });
+        if (method === 'GET') return this.json(res, 200, { report: (await reconciler.report()) ?? null });
+        const body = (await this.body(req).catch(() => ({}))) as { dryRun?: unknown } | undefined;
+        return this.json(res, 200, { report: await reconciler.reconcile({ dryRun: body?.dryRun === true }) });
       }
       if (p === '/api/settings/paid-launch/paddle/provision' && method === 'POST') {
         if (!(await this.deps.tokens.check(token, 'settings:write')).ok)
@@ -2958,6 +3000,9 @@ export class Gateway {
             if (policy.worldProvider && !['worktree', 'container', 'memory'].includes(String(policy.worldProvider))
               && !(await this.deps.providerConnections?.available(organizationId, String(policy.worldProvider))))
               throw new Error(`${policy.worldProvider} is not connected and verified`);
+            if (policy.resources && typeof policy.resources === 'object')
+              (await this.deps.providerConnections?.assertFits?.(organizationId,
+                String(policy.worldProvider ?? (await store.getOrganizationExecutionPolicy(organizationId)).worldProvider ?? ''), machineShape({ resources: policy.resources })));
             if (policy.runnerPoolId) {
               const pool = (await store.getRunnerPool(String(policy.runnerPoolId)));
               if (!pool || pool.organizationId !== organizationId) throw new Error('runner pool does not belong to this organization');
@@ -4196,6 +4241,8 @@ export class Gateway {
             if (effective.worldProvider && !['worktree', 'container', 'memory'].includes(effective.worldProvider)
               && !(await this.deps.providerConnections?.available(project.organizationId!, effective.worldProvider)))
               throw new Error(`${effective.worldProvider} is not connected and verified in Organization settings`);
+            if (override.resources && typeof override.resources === 'object')
+              (await this.deps.providerConnections?.assertFits?.(project.organizationId!, effective.worldProvider, machineShape({ resources: override.resources })));
             if (effective.runnerPoolId) {
               const pool = (await store.getRunnerPool(effective.runnerPoolId));
               if (!pool || pool.organizationId !== project.organizationId) throw new Error('runner pool does not belong to this organization');
@@ -4447,7 +4494,7 @@ export class Gateway {
               storageLocationId: isSnapshotResourceDriver(driver)
                 ? (await this.deps.resources.storageLocationFor(project.organizationId, b.storageLocationId == null ? undefined : String(b.storageLocationId)))
                 : undefined,
-              publish: b.publish === 'review' ? 'review' : 'discard' }));
+              publish: b.publish === 'review' ? 'review' : 'discard', ...(b.onDemand ? { onDemand: true } : {}) }));
             let revision;
             if (isSnapshotResourceDriver(driver)) {
               if (typeof b.sourcePath === 'string') {
@@ -4552,6 +4599,7 @@ export class Gateway {
               ...(b.target !== undefined ? { target: normalizeResourceTarget(b.target, resource.driver, resource.name) } : {}),
               ...(b.access !== undefined ? { access: b.access } : {}), ...(b.isolation !== undefined ? { isolation: b.isolation } : {}),
               ...(b.publish !== undefined ? { publish: b.publish } : {}), ...(b.enabled !== undefined ? { enabled: Boolean(b.enabled) } : {}),
+              ...(b.onDemand !== undefined ? { onDemand: Boolean(b.onDemand) } : {}),
               ...(source ? { source } : {}),
               ...(b.storageLocationId !== undefined && isSnapshotResourceDriver(resource.driver)
                 ? { storageLocationId: (await this.deps.resources?.storageLocationFor(resource.organizationId, String(b.storageLocationId))) }
@@ -5334,6 +5382,16 @@ export class Gateway {
             && (await this.deps.tokens.check(token, 'payment:write', { projectId: task.projectId })).ok,
           spent: (await store.paymentSpent(task.id, false, policy.currency)), released });
       }
+      const biggerDisk = p.match(/^\/api\/tasks\/([^/]+)\/bigger-disk$/);
+      if (biggerDisk && method === 'POST') {
+        const b = await this.body(req);
+        try {
+          return this.json(res, 200, await api.biggerDisk(token, biggerDisk[1]!, b.diskGb == null ? undefined : Number(b.diskGb)));
+        } catch (e) {
+          const status = (e as { status?: number })?.status;
+          return this.json(res, status === 403 || status === 404 ? status : 400, { error: e instanceof Error ? e.message : String(e) });
+        }
+      }
       const editMatch = p.match(/^\/api\/tasks\/([^/]+)\/params$/);
       if (editMatch && method === 'PATCH') {
         const b = await this.body(req);
@@ -5755,6 +5813,7 @@ export class Gateway {
         try {
           return this.json(res, 200, await api.requestPermission(token, {
             ...(b.projectIds !== undefined ? { projectIds: b.projectIds as string[] } : {}),
+            ...(b.taskId ? { taskId: String(b.taskId) } : {}),
             capabilities: Array.isArray(b.capabilities) ? b.capabilities.map(String) : [],
             audience: Array.isArray(b.audience) ? b.audience.map(String) : [],
             reason: String(b.reason ?? ''),
@@ -6118,7 +6177,7 @@ export class Gateway {
           throw error;
         }
         return this.json(res, 200, { ...lease, tokenHash: undefined,
-          url: previewLeaseUrl(lease.id, '/', rawToken) });
+          url: previewLeaseUrl(lease, '/', rawToken) });
       }
       const previewLease = p.match(/^\/api\/preview-leases\/([^/]+)$/);
       if (previewLease && method === 'DELETE') {
@@ -9113,7 +9172,7 @@ export class Gateway {
     const match = url.pathname.match(/^\/preview\/([^/]+)(\/.*)?$/);
     const lease = match ? (await this.deps.store.previewLease(match[1]!)) : undefined;
     if (!lease || lease.revokedAt || lease.expiresAt <= Date.now()) return this.previewStopped(req, res, 404, 'preview not found or expired');
-    if (configuredPreviewOrigin() && String(req.headers.host ?? '').toLowerCase() !== new URL(previewLeaseOrigin(lease.id)).host.toLowerCase())
+    if (configuredPreviewOrigin() && String(req.headers.host ?? '').toLowerCase() !== new URL(previewLeaseOrigin(lease)).host.toLowerCase())
       return this.previewStopped(req, res, 404, 'preview not found or expired');
     const current = (await this.deps.store.currentWorld(lease.worldId));
     if (!current || (current.generation ?? 1) !== lease.generation) return this.previewStopped(req, res, 410, 'preview world generation is no longer current');
@@ -9189,7 +9248,7 @@ export class Gateway {
       };
       if (!lease || lease.revokedAt || lease.expiresAt <= Date.now()) { browser.close(4404, 'preview expired'); return; }
       previewProjectId = lease.projectId;
-      if (configuredPreviewOrigin() && String(req.headers.host ?? '').toLowerCase() !== new URL(previewLeaseOrigin(lease.id)).host.toLowerCase()) {
+      if (configuredPreviewOrigin() && String(req.headers.host ?? '').toLowerCase() !== new URL(previewLeaseOrigin(lease)).host.toLowerCase()) {
         browser.close(4404, 'preview expired'); return;
       }
       const current = (await this.deps.store.currentWorld(lease.worldId));
@@ -9506,14 +9565,15 @@ export class Gateway {
     return resources;
   }
 
+  /** On a preview origin: the current one or one previews moved away from. */
   private requestIsPreviewOrigin(req: http.IncomingMessage): boolean {
-    const origin = configuredPreviewOrigin();
-    if (!origin) return false;
     try {
       const requested = new URL(`http://${String(req.headers.host ?? '').trim()}`);
-      const base = new URL(origin);
-      return (requested.hostname === base.hostname || requested.hostname.endsWith(`.${base.hostname}`))
-        && requested.port === base.port;
+      return previewOrigins().some((origin) => {
+        const base = new URL(origin);
+        return (requested.hostname === base.hostname || requested.hostname.endsWith(`.${base.hostname}`))
+          && requested.port === base.port;
+      });
     } catch { return false; }
   }
 

@@ -130,14 +130,15 @@ describe('software-dev 1.28 on a fork of someone else\'s repository', () => {
     return { repo, project };
   }
 
-  async function start(name: string, project: { id: string }, repo: string) {
+  async function start(name: string, project: { id: string }, repo: string,
+    work = '@run git add -A && git commit -qm fix\n@review Fixed the widget') {
     const task = await h.store.createTask({ projectId: project.id, title: 'Fix the widget', workflow: 'software-dev',
       workflowVersion: '1.28.0', params: { prompt: 'Fix it', base: 'main', target: 'main', _repositoryBranchesResolved: true },
       createdBy: { kind: 'user', userId: 'jane' } });
     const handle = await h.client.workflow.start('softwareDev@1.28.0', {
       taskQueue: TASK_QUEUE, workflowId: task.id, args: [{
         taskId: task.id, projectId: project.id, title: 'Fix the widget',
-        prompt: `@write ${name}.txt :: fixed\n@run git add -A && git commit -qm fix\n@review Fixed the widget`,
+        prompt: `@write ${name}.txt :: fixed\n${work}`,
         base: 'main', target: 'main', githubPollMs: 300, project: { repos: [repo], remote: 'pr' },
       }],
     });
@@ -174,6 +175,8 @@ describe('software-dev 1.28 on a fork of someone else\'s repository', () => {
     expect(page.pathname).toBe(`/${UPSTREAM}/compare/main...jane:widgets:${branch}`);
     expect(page.searchParams.get('quick_pull')).toBe('1');
     expect(page.searchParams.get('title')).toBe('Fix the widget');
+    // The body describes the change (its commit), not "1 file(s) changed.".
+    expect(page.searchParams.get('body')).toBe('fix');
     // The ask says how to skip it next time.
     expect(waiting.waitingFor.detail).toContain('[save a GitHub token](/profile#github-token)');
     // tavya tried no write it could not make.
@@ -204,7 +207,8 @@ describe('software-dev 1.28 on a fork of someone else\'s repository', () => {
       github: { id: 'jane-github', login: 'jane' }, githubToken: PERSONAL_TOKEN });
     try {
       const { repo, project } = await forkProject('token');
-      const { task, handle } = await start('token', project, repo);
+      const { task, handle } = await start('token', project, repo,
+        '@run git add -A && git commit -qm "Fix the frobnicator" -m "It crashed on empty input."');
       const branch = `tavya/${task.id}`;
 
       await expect.poll(async () => (await view(handle)).stage, { timeout: 60_000 }).toBe('review');
@@ -218,6 +222,7 @@ describe('software-dev 1.28 on a fork of someone else\'s repository', () => {
       expect(prs[0]).toMatchObject({ title: 'Fix the widget', head: { ref: branch } });
       // Maintainers see the change, not this deployment's task references.
       expect(prs[0].body).not.toMatch(/task_/);
+      expect(prs[0].body).toBe('Fix the frobnicator\n\nIt crashed on empty input.');
       const opened = upstreamWrites().filter((call) => call.method === 'POST');
       expect(opened).toEqual([expect.objectContaining({ auth: `Bearer ${PERSONAL_TOKEN}`,
         body: expect.objectContaining({ head: `jane:${branch}`, base: 'main' }) })]);

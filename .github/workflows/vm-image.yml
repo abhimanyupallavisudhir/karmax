@@ -1,0 +1,53 @@
+name: VM image
+
+# Publishes karmax's VM image (environments/vm) to GHCR, tagged with the
+# provisioning version (src/world/vm/provision.ts). Fly.io worlds boot it ready
+# instead of provisioning stock Debian. Every merge to master checks whether
+# its version is published and builds it only if not; a running tavya selects
+# the new tag by itself once anyone can pull it (src/world/vm/image.ts).
+# GitHub has no API for package visibility: make the package public once,
+# after its first publish (package settings → visibility); later tags stay public.
+on:
+  push:
+    branches: [master]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: vm-image
+  cancel-in-progress: false
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22.16.0' }
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - id: context
+        run: |
+          tag=$(npx tsx environments/vm/context.ts environments/vm/out)
+          image=$(echo "ghcr.io/${{ github.repository_owner }}/karmax-vm:$tag" | tr '[:upper:]' '[:lower:]')
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        with: { registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}" }
+      - id: published
+        name: Already published?
+        run: |
+          if docker manifest inspect "${{ steps.context.outputs.image }}" > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "${{ steps.context.outputs.image }} is already published." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Build and push
+        if: steps.published.outputs.exists != 'true'
+        env:
+          IMAGE: ${{ steps.context.outputs.image }}
+        run: |
+          docker build --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}" -t "$IMAGE" environments/vm/out
+          docker push "$IMAGE"
+          echo "Published $IMAGE. tavya selects it by itself once it is public (make the karmax-vm package public once)." >> "$GITHUB_STEP_SUMMARY"
