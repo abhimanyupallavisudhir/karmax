@@ -28,6 +28,7 @@
   "tests/agent-startup-diagnostics.test.ts": 0.2,
   "tests/agent-stream-close.test.ts": 2.7,
   "tests/agent-streaming.test.ts": 2,
+  "tests/agent-task-grants.test.ts": 0.6,
   "tests/api-key-settings-ui.test.ts": 2.5,
   "tests/app-grants.test.ts": 1.4,
   "tests/approval-dismissal-ui.test.ts": 0,
