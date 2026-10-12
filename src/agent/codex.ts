@@ -44,6 +44,7 @@ import { readLocalCodexHistory, installLocalCodexSnapshot, publishLocalCodexHist
 import { localProviderCli } from './provider-cli.js';
 import { withTimeout } from '../util/timeout.js';
 import { utf8Tail } from '../util/utf8-tail.js';
+import { stripAnsi } from '../util/ansi.js';
 import { ensureCodexLoginFresh, refreshCodexLogin } from './usage.js';
 import { BRAND } from '../domain/brand.js';
 
@@ -60,6 +61,12 @@ import { BRAND } from '../domain/brand.js';
  *     Threads persist under `$CODEX_HOME` and power resume. The old `codex exec` path
  *     is kept as a fallback (`KARMAX_CODEX_USE_EXEC=1`, or older CLIs without app-server).
  */
+
+/** The end of a CLI's stderr as plain text, for a failure message. */
+function stderrTail(stderr: string, maxBytes: number): string {
+  return utf8Tail(stripAnsi(stderr), maxBytes).trim();
+}
+
 /** Responses-API function tools: every provider-neutral schema, flat-shaped.
  *  Exported so the cross-rail control-tool coverage test reads the SAME list the
  *  rail sends rather than a restatement of it. */
@@ -601,7 +608,7 @@ export class CodexAdapter implements AgentAdapter {
     child.once('close', (code: number | null, signal: NodeJS.Signals | null) => {
       if (!shuttingDown && !turnError) {
         turnError = child.lost?.message
-          ?? `codex app-server connection closed unexpectedly (${signal ? `signal ${signal}` : `code ${code ?? -1}`})${stderr ? `: ${utf8Tail(stderr, 200)}` : ''}`;
+          ?? `codex app-server connection closed unexpectedly (${signal ? `signal ${signal}` : `code ${code ?? -1}`})${stderr ? `: ${stderrTail(stderr, 200)}` : ''}`;
       }
       turnActive = false;
       client.close();
@@ -992,7 +999,7 @@ export class CodexAdapter implements AgentAdapter {
       throw providerFailure(providerFailureDisplay(limit), limit);
     }
     if (turnError) {
-      throw new Error(`codex app-server turn failed: ${turnError}${stderr ? ` · ${utf8Tail(stderr, 300)}` : ''}`);
+      throw new Error(`codex app-server turn failed: ${turnError}${stderr ? ` · ${stderrTail(stderr, 300)}` : ''}`);
     }
     if (terminalStatus !== 'completed') {
       throw new Error('codex app-server stream ended unexpectedly without a completed terminal event');
@@ -1231,7 +1238,7 @@ export class CodexAdapter implements AgentAdapter {
     }
     if (exited.code !== 0) {
       const why = exited.signal ? `signal ${exited.signal}` : `exit ${exited.code}`;
-      const diagnostic = (exited.spawnError ?? turnFailure ?? utf8Tail(stderr, 500)) || '(no diagnostic)';
+      const diagnostic = (exited.spawnError ?? turnFailure ?? stderrTail(stderr, 500)) || '(no diagnostic)';
       throw new Error(
         `codex exec connection terminated before successful completion (${why}): ${diagnostic}`,
       );

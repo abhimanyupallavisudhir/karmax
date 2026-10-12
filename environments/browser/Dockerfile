@@ -7,7 +7,7 @@ ARG PLAYWRIGHT_VERSION=1.61.1
 # launch also verifies this version and falls back to the SDK-declared npx pin
 # when a user has not rebuilt an older template yet.
 ARG CLAUDE_CODE_VERSION=2.1.281
-ARG CODEX_VERSION=0.156.1
+ARG CODEX_VERSION=0.162.1
 # src/agent/acp-packages.ts OPENCODE_VERSION.
 ARG OPENCODE_VERSION=1.18.35
 
@@ -16,7 +16,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     KARMAX_BROWSER_BIN=/opt/karmax/bin
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
+ && apt-get install -y --no-install-recommends ca-certificates curl gnupg bubblewrap \
  && install -d -m 0755 /etc/apt/keyrings \
  && curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /etc/apt/keyrings/google-chrome.gpg \
  && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list \
