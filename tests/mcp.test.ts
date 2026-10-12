@@ -59,6 +59,8 @@ describe('platform MCP server (capability-checked tool calls)', () => {
     const saveSkill = tools.find((t) => t.name === 'save_skill')!;
     expect(saveSkill.description).not.toMatch(/installation-wide/i);
     expect(saveSkill.description).toMatch(/organization/i);
+    expect(tools.find((t) => t.name === 'notify')!.description)
+      .toContain('Notify a person only when you need them to do something; never for updates on your work.');
     const described: any = await client.callTool({ name: 'describe_platform', arguments: {} });
     const catalog = JSON.parse(described.content[0].text);
     expect(catalog.administration).toContain('GET|POST /api/users');
