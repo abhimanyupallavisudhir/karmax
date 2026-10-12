@@ -163,6 +163,7 @@ environment's branch rule is the control.
 | `e2b` | `LIVE_E2B_API_KEY` | `cloud-live`, `e2b-workflow-live` (a task that pauses at Review, resumes and tears down), `e2b-computer-live` (a sized template really has its CPU, memory and disk) |
 | `daytona` | `LIVE_DAYTONA_API_KEY` (+ `LIVE_OPENCODE_ANTHROPIC_API_KEY` for OpenCode) | `daytona-live`, `daytona-environment-live`, `daytona-workflow-live`, `remote-acp-live`, `remote-acp-workflow-live` (OpenCode in a sandbox; skip without their model key) |
 | `vm` | `LIVE_FLY_API_TOKEN`, `LIVE_HETZNER_API_TOKEN` (either; + `LIVE_VM_OPENAI_API_KEY` for the agent turn) | `vm-world-live` (per provider: a 100 GB world, a real OpenCode turn, park and wake, growth to 150 GB; deletes everything. A Fly organization needs a payment method: its free trial stops machines at 5 minutes) |
+| `move` | `LIVE_E2B_API_KEY` and `LIVE_HETZNER_API_TOKEN` (both: the e2b and vm suites' own keys) | `computer-move-live` (an E2B world checkpointed and restored on a 100 GB Hetzner volume through `restoreWhereTaskRuns`, and the fallback to E2B when Hetzner refuses; ~4 min, deletes everything) |
 | `github` | `LIVE_GITHUB_TOKEN`: a fine-grained token for the private `karmax-e2e-tests` repository only (Contents, Issues and Pull requests read and write; Commit statuses read). Clones and pushes go over HTTPS with it. | `github-live` |
 
 The Daytona snapshot build keeps its own switch (`KARMAX_DAYTONA_LIVE_BUILD`)

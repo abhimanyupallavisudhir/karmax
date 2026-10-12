@@ -80,7 +80,7 @@ describe('moving a running task to another provider', () => {
     const { store, task, service, handle, restored, notices } = await fixture();
     (service as any).restore = async (_id: string, kind: string) => {
       restored.push(kind);
-      if (kind === 'hetzner') throw new Error('server limit reached');
+      if (kind === 'hetzner') throw new Error('server limit reached\n');
       return { ...handle, kind, provider: kind };
     };
     const result = await service.restoreWhereTaskRuns('checkpoint-1', handle);
@@ -90,7 +90,7 @@ describe('moving a running task to another provider', () => {
     expect((await store.getTask(task.id))!.params.computer).toEqual({ provider: 'e2b', diskGb: 100 });
     expect((await store.eventsOfType(task.id, 'world.move_failed')).at(-1)?.payload)
       .toMatchObject({ from: 'e2b', to: 'hetzner', error: 'server limit reached' });
-    expect(notices).toEqual([expect.stringMatching(/could not move to Hetzner.*server limit reached/s)]);
+    expect(notices).toEqual([expect.stringMatching(/could not move to Hetzner \(server limit reached\), so it stays on E2B/)]);
   });
 
   it('restores on the same provider when the task asks for no other', async () => {

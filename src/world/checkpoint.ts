@@ -260,7 +260,7 @@ export class WorldCheckpointService {
         + 'build output, caches) and running processes did not carry over: reinstall or restart what you need.');
       return restored;
     } catch (error) {
-      const reason = (error instanceof Error ? error.message : String(error)).slice(0, 300);
+      const reason = (error instanceof Error ? error.message : String(error)).trim().slice(0, 300);
       const task = await this.store.taskMetadataAsync(handle.id);
       let own: Record<string, unknown> = {};
       try { own = { ...normalizeComputer(task?.params?.computer) }; } catch { own = {}; }

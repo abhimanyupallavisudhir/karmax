@@ -65,6 +65,7 @@ eval(extractFn('filterDeletedFromSearchResult'));
 eval(extractFn('isCrossProjectList'));
 eval(extractFn('runSearch'));
 eval(extractFn('refreshTasks'));
+eval(extractFn('isSeries'));
 eval(extractFn('refreshTask'));
 
 (async () => {

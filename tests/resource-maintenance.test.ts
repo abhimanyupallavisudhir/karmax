@@ -95,3 +95,47 @@ it('converts versions saved before restic in place, current first, and releases 
   expect(await f.store.legacyResourceRevisions(10)).toEqual([]);
   expect((await f.resources.maintainRepositories(Date.now())).converted).toBe(0);
 });
+
+it('saves to one repository one at a time, so parallel saves of the same new data store it once', async () => {
+  const f = await fixture();
+  const repository = await f.resources.restic.current(f.attachment);
+  const data = crypto.randomBytes(24 * 1024 * 1024);
+  const sources = [0, 1].map((n) => {
+    const source = fs.mkdtempSync(path.join(f.dir, `parallel-${n}-`));
+    fs.writeFileSync(path.join(source, 'rebuilt.db'), data);
+    return source;
+  });
+  // Two worlds that rebuilt the same file save at once: without taking turns,
+  // each restic loads an index without the other's packs and uploads it all.
+  const saves = await Promise.all(sources.map((source) => f.resources.restic.backupDirectory(source, repository, { quota: false })));
+  expect(saves.map((save) => save.snapshot)).toHaveLength(2);
+  expect(await f.packBytes()).toBeLessThan(data.length * 1.2);
+});
+
+it('a save waits for another save holding the repository, and takes over from one that stopped renewing', async () => {
+  const f = await fixture();
+  const repository = await f.resources.restic.current(f.attachment);
+  await f.resources.restic.prepare(repository);
+  const source = fs.mkdtempSync(path.join(f.dir, 'waiting-'));
+  fs.writeFileSync(path.join(source, 'a.bin'), crypto.randomBytes(100_000));
+  const lease = `restic-save:${repository.name}`;
+  await f.store.kvSet(lease, JSON.stringify({ owner: 'another-save', at: Date.now() }));
+  let done = false;
+  const save = f.resources.restic.backupDirectory(source, repository, { quota: false }).then((capture) => { done = true; return capture; });
+  await new Promise((resolve) => setTimeout(resolve, 1_500));
+  expect(done).toBe(false);
+  expect(await f.snapshots()).toEqual([]);
+  // The other save finishes.
+  await f.store.kvDelete(lease);
+  await save;
+  expect(await f.snapshots()).toHaveLength(1);
+  // Released when done.
+  expect(await f.store.kvGet(lease)).toBeUndefined();
+
+  // A holder that died (no renewal for minutes) does not block saves for good.
+  await f.store.kvSet(lease, JSON.stringify({ owner: 'dead-save', at: Date.now() - 10 * 60_000 }));
+  fs.writeFileSync(path.join(source, 'b.bin'), crypto.randomBytes(100_000));
+  await f.resources.restic.backupDirectory(source, repository, { quota: false });
+  expect(await f.snapshots()).toHaveLength(2);
+  expect(await f.store.kvGet(lease)).toBeUndefined();
+});

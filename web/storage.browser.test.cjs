@@ -31,7 +31,7 @@ const CONTENTS = {
   retainedBytes: 6.2 * GB, quotaBytes: 5 * GB,
   overQuota: { since: NOW - 10 * 86_400_000, deleteAt: Date.parse('2027-09-21T12:00:00Z') },
   pendingDeletion: { bytes: 25.7 * GB, until: Date.parse('2026-11-09T00:00:00Z'), measuredAt: NOW },
-  policy: { finishedTaskCheckpointDays: 30, overQuotaDeletionDays: 365 },
+  policy: { finishedTaskCheckpointDays: 30, overQuotaDeletionDays: 365, olderVersionDays: 30 },
   projects: [
     { projectId: 'p-ml', name: 'Model training', bytes: 5.1 * GB,
       resources: [{ id: 'r-weights', name: 'weights', currentBytes: 2 * GB, olderVersions: 3, olderBytes: 2.9 * GB, taskCopies: 1, taskCopyBytes: 120 * MB }],
@@ -81,7 +81,12 @@ const CONTENTS = {
     assert.deepEqual(projects, ['Model training', 'Storefront'], 'largest first; empty projects hidden');
     assert.equal(await page.locator('[data-older-versions]').count(), 1);
     assert.equal(await page.locator('[data-older-versions]').getAttribute('data-older-versions'), 'r-weights');
-    assert.match(await page.locator('.storage-project').first().textContent(), /3 older versions 2\.9 GB · task copies 120 MB/);
+    assert.match(await page.locator('.storage-project').first().textContent(), /3 older versions 2\.9 GB ⓘ · task copies 120 MB/);
+    // How long older versions are kept, in a tooltip: hosted only (a private installation keeps them all).
+    assert.equal(await page.locator('.storage-project').first().locator('.storage-item .info-dot').first().getAttribute('title'),
+      'Deleted 30 days after a newer version replaces them, unless a task still uses them.');
+    assert.doesNotMatch(await page.evaluate((contents) => storageContentsMarkup({ ...contents, policy: { finishedTaskCheckpointDays: 30, overQuotaDeletionDays: 365 } }), CONTENTS),
+      /newer version replaces/);
     assert.equal(await page.locator('[data-finished-workspaces]').getAttribute('data-finished-workspaces'), 'p-ml');
     assert.match(await page.locator('[data-finished-workspaces]').textContent(), /Delete finished \(60 MB\)/);
     assert.match(await page.locator('.storage-project').nth(1).textContent(), /Review files.*200 MB/);

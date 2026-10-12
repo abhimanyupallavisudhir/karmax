@@ -56,12 +56,17 @@ describe('live-test workflow', () => {
     for (const [name, job] of [['plan', jobs.plan!] as const, ...suites]) expect(job.environment, name).toBe('live');
     const own: Record<string, string[]> = {};
     for (const [name, job] of suites) own[name] = [...JSON.stringify(job).matchAll(/secrets\.(\w+)/g)].map((m) => m[1]!).sort();
+    // Suites that may share a secret: models/agent use one key; move spans the
+    // e2b and vm providers, and gets exactly their keys, nothing else.
+    const sharing = [['models', 'agent'], ['move', 'e2b'], ['move', 'vm']];
+    const share = (a: string, b: string) => sharing.some(([x, y]) => (x === a && y === b) || (x === b && y === a));
     for (const [name, secrets] of Object.entries(own)) {
       expect(secrets.length, name).toBeGreaterThan(0);
       for (const [other, theirs] of Object.entries(own))
-        if (other !== name && !(name === 'models' && other === 'agent') && !(name === 'agent' && other === 'models'))
+        if (other !== name && !share(name, other))
           expect(secrets.filter((secret) => theirs.includes(secret)), `${name} and ${other}`).toEqual([]);
     }
+    expect(own.move).toEqual(['LIVE_E2B_API_KEY', 'LIVE_HETZNER_API_TOKEN']);
     expect(Object.keys(plan.env!).filter((key) => key.startsWith('LIVE_')).sort())
       .toEqual([...new Set(Object.values(own).flat())].sort());
   });
@@ -89,6 +94,9 @@ describe('live-test workflow', () => {
       expect(decide({ LIVE_OPENAI_API_KEY: 'sk' })).toEqual({ ...none, models: 'true', agent: 'true' });
       expect(decide({ LIVE_ANTHROPIC_API_KEY: 'sk-ant' })).toEqual({ ...none, models: 'true' });
       expect(decide({ LIVE_GITHUB_FORK_TOKEN: 'ghp' })).toEqual({ ...none, github: 'true' });
+      // Moving between providers needs both of their keys.
+      expect(decide({ LIVE_HETZNER_API_TOKEN: 'hc' })).toEqual({ ...none, vm: 'true' });
+      expect(decide({ LIVE_E2B_API_KEY: 'e2b', LIVE_HETZNER_API_TOKEN: 'hc' })).toEqual({ ...none, e2b: 'true', vm: 'true', move: 'true' });
       const all = Object.fromEntries(Object.keys(plan.env!).filter((key) => key.startsWith('LIVE_')).map((key) => [key, 'set']));
       expect(decide(all)).toEqual(Object.fromEntries(suites.map(([name]) => [name, 'true'])));
     });
