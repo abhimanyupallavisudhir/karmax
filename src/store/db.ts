@@ -9405,13 +9405,25 @@ export class Store {
     return this.db.transaction(async () => {
 
     const update = this.db.prepare('UPDATE human_delegations SET revokedAt=? WHERE id=? AND revokedAt IS NULL');
+    // As for tokens (revokeScopedTokens): a delegation that also reaches other
+    // projects outlives this one, unless it is its own: its primary project or
+    // its task's. Its tokens and task authorization keep naming the project,
+    // which no longer authorizes anything.
+    const ownsProject = async (record: Record<string, unknown>, projectId: string) => {
+      if (record.projectId === projectId) return true;
+      const projects = Array.isArray(record.projectIds) ? record.projectIds : [];
+      if (!projects.includes(projectId)) return false;
+      if (projects.every((id) => id === projectId)) return true;
+      const task = typeof record.taskId === 'string'
+        ? (await this.db.prepare('SELECT projectId FROM tasks WHERE id=?').get(record.taskId)) as { projectId: string } | undefined : undefined;
+      return task?.projectId === projectId;
+    };
     let revoked = 0;
     for (const row of (await this.db.prepare('SELECT id, json FROM human_delegations WHERE revokedAt IS NULL').all()) as any[]) {
       try {
         const record = JSON.parse(row.json) as Record<string, unknown>;
         if ((scope.taskId && record.taskId === scope.taskId)
-          || (scope.projectId && (record.projectId === scope.projectId
-            || Array.isArray(record.projectIds) && record.projectIds.includes(scope.projectId)))
+          || (scope.projectId && await ownsProject(record, scope.projectId))
           || (scope.organizationId && record.organizationId === scope.organizationId)
           || (scope.humanUserId && record.humanUserId === scope.humanUserId))
           revoked += Number((await update.run(Date.now(), row.id)).changes);

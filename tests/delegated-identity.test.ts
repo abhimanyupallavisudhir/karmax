@@ -134,6 +134,30 @@ describe('delegated human identity authority', () => {
     expect((await tokens.verify(replacement.token))).toBeUndefined();
   });
 
+  // Task #618: deleting a throwaway project an agent had also been granted revoked the
+  // delegation its task token stands on, so every call failed `unauthorized` although
+  // #610 had kept the token itself. Only delegations whose own project it was end.
+  it('keeps an agent working when a throwaway project it was also granted is deleted', async () => {
+    const home = (await store.createProject('Home')), doomed = (await store.createProject('Throwaway'));
+    const own = (await store.createTask({ projectId: home.id, title: 'Agent', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'p' } }));
+    const canary = (await store.createTask({ projectId: doomed.id, title: 'Canary', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'p' } }));
+    const organizationId = home.organizationId!, projectIds = [home.id, doomed.id];
+    const human = (await tokens.mintPrincipal('user:alice', ['task:read'], undefined, 60_000, organizationId));
+    const delegation = (await tokens.delegateHuman(human.token, { taskId: own.id, projectIds, organizationId }))!;
+    const canaryDelegation = (await tokens.deriveHumanDelegation(delegation.id, { taskId: canary.id, projectIds: [doomed.id], organizationId }));
+    const primary = (await tokens.deriveHumanDelegation(delegation.id, { taskId: own.id, projectId: doomed.id, organizationId }));
+    const turn = () => tokens.mint({ taskId: own.id, profileId: 'do', role: 'do', principal: 'user:alice', projectIds, organizationId,
+      ceiling: ['task:read'], grantorCaps: ['task:read'], delegationId: delegation.id });
+    const agent = (await turn());
+
+    (await store.deleteProject(doomed.id));
+
+    expect((await tokens.verify(agent.token))?.humanSubject?.userId).toBe('alice');
+    expect((await tokens.verify((await turn()).token))).toBeDefined();
+    expect((await store.getHumanDelegation(canaryDelegation.id))).toBeUndefined();
+    expect((await store.getHumanDelegation(primary.id))).toBeUndefined();
+  });
+
   it('preserves ordinary interactive browser identity', async () => {
     const human = (await tokens.mintPrincipal('user:alice', ['repository:write']));
     const identity = resolveCallerIdentity(human.record, 'alice');
