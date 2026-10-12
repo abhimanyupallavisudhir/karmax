@@ -84,22 +84,33 @@ shard and `deploy artifacts` pass. To reproduce a failing shard, run the same
 slice locally:
 
 ```bash
-npx vitest run --shard=2/5
+npx vitest run --shard=2/8
 ```
 
 A few files take minutes while most take under a second, so shards are
 balanced by each file's measured duration (`tests/durations.json`, via
-`tests/helpers/duration-sequencer.ts`) rather than by file count. A new file
-counts as a typical one until measured. After larger test changes, refresh the
-measurements from a green CI run:
+`tests/helpers/duration-sequencer.ts`) rather than by file count. Every test
+file needs a measurement (`tests/duration-sequencer.test.ts` fails otherwise):
+an unmeasured file would count as a typical one, under a second, however long
+it really runs. Measure a file you add, or one you make much slower, locally:
+
+```bash
+npx vitest run --reporter=default tests/new.test.ts | npm run test:durations
+```
+
+and after larger test changes refresh all of them from a green CI run:
 
 ```bash
 gh run view <run-id> --log | npm run test:durations
 ```
 
 No shard can finish faster than the slowest single file
-(`github-pr-pipeline.test.ts`, about 3.5 minutes). Adding a number to the `test` job's `shard` list helps
-only while the shards are well above that; past it, split the slowest file.
+(`pipeline.test.ts`, about 4.7 minutes in CI). Each shard must also fit in half
+the `test` job's timeout, so a runner twice as slow still finishes
+(`tests/duration-sequencer.test.ts` checks this against the committed
+durations). When it does not, add a number to the `shard` list; that helps
+only while the shards are well above the slowest file; past it, split that
+file.
 
 Jobs install through `.github/actions/install`, which restores `node_modules`
 from the Actions cache when the lockfile, platform and Node release match an

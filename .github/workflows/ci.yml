@@ -79,7 +79,7 @@ jobs:
       # Report every shard's failures, not just the first one's.
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     services:
       postgres:
         image: postgres:16
@@ -94,8 +94,9 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
-    # About three times a shard's normal runtime: slow runners have taken
-    # twice as long, while a genuine hang still fails reasonably soon.
+    # At least twice a shard's normal runtime: slow runners have taken twice
+    # as long, while a genuine hang still fails reasonably soon. When the
+    # suite grows past half of it, add a shard (tests/duration-sequencer.test.ts).
     timeout-minutes: 25
     env:
       # Paid live suites remain opt-in. These shards run the Docker suites too.
