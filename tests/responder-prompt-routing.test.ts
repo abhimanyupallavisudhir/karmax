@@ -81,6 +81,30 @@ describe('the computer in the World section', () => {
     expect(pending).toContain('Computer: 2 CPU · 2 GB. This task\'s computer is now 2 CPU · 2 GB · 50 GB disk: you move to it when the task parks');
   });
 
+  // pramana#22: ten tasks at E2B's ceiling while the organization had Hetzner.
+  // The agent must know another provider gives more disk, how to move there,
+  // when the move happens, what comes across and what happens if it fails.
+  it('offers a connected provider with more disk, and says how a move works', () => {
+    const e2b = { ...world, kind: 'e2b', meta: { computer: { cpu: 2, memoryMb: 2048, diskGb: 29 } } } as any;
+    const limits = { diskGb: 29, source: { diskGb: 'provider' } as const };
+    const disk = { totalKb: 29 * 2 ** 20, usedKb: 27 * 2 ** 20, availKb: 2 * 2 ** 20 };
+    const base = { profile, role: 'do' as const, task: task({ kind: 'human', audience: ['@creator'] }), world: e2b, limits, disk,
+      computer: { cpu: 2, memoryMb: 2048, diskGb: 29 } };
+    const offer = assemblePrompt({ ...base, providers: [{ provider: 'hetzner', diskGb: 10_240 }, { provider: 'daytona', diskGb: 10 }] });
+    expect(offer).toContain('This organization also has Hetzner (up to 10240 GB disk).');
+    expect(offer).toContain('{"params": {"computer": {"provider": "hetzner", "diskGb": 100}}}');
+    expect(offer).toContain('the move happens at your next pause(3) without jobs');
+    expect(offer).toContain('tracked files, uncommitted changes and project data come across');
+    expect(offer).toContain('If Hetzner cannot take the task, it stays on E2B and you are told why');
+    expect(offer).not.toContain('Daytona'); // no more disk than here
+    expect(assemblePrompt(base)).not.toContain('also has');
+
+    const moving = assemblePrompt({ ...base, moveTo: 'hetzner', providers: [{ provider: 'hetzner', diskGb: 10_240 }] });
+    expect(moving).toContain('This task is moving to Hetzner: you move when the task parks, so end your turn with pause(3) without jobs');
+    expect(moving).toContain('If Hetzner cannot take the task, it stays on E2B and you are told why');
+    expect(moving).not.toContain('also has');
+  });
+
   // A VM world's disk is a volume: it keeps everything and grows in place.
   it('tells an agent on a VM world that its disk keeps everything and grows at once', () => {
     const vm = (kind: string) => ({ ...world, kind, meta: { computer: { diskGb: 100 }, machine: { cpu: 2, memoryMb: 2048, diskGb: 100 } } }) as any;
