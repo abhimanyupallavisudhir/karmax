@@ -402,26 +402,43 @@ export class HetznerDriver implements VmDriver {
     }
   }
 
+  /** One lookup-or-create at a time per project resource: a project's first
+   * world and its snapshot builder start together, and each made its own. */
+  private projectResources = new Map<string, Promise<number>>();
+  private once(connection: ResolvedWorldProviderConnection, name: string, make: () => Promise<number>): Promise<number> {
+    const key = `${crypto.createHash('sha256').update(connection.apiKey).digest('hex')}:${name}`;
+    let pending = this.projectResources.get(key);
+    if (!pending) {
+      pending = make().finally(() => this.projectResources.delete(key));
+      this.projectResources.set(key, pending);
+    }
+    return pending;
+  }
+
   /** The project firewall: inbound SSH to karmax's port, and ping. Made once. */
-  private async firewall(connection: ResolvedWorldProviderConnection): Promise<number> {
-    const existing = await this.pages<{ id: number }>(connection, '/firewalls', 'firewalls', 'karmaxFirewall=vm');
-    if (existing[0]) return existing[0].id;
-    const anywhere = ['0.0.0.0/0', '::/0'];
-    const created = await this.api(connection)('POST', '/firewalls', { name: `karmax-vm-${crypto.randomBytes(3).toString('hex')}`,
-      labels: { karmaxFirewall: 'vm' }, rules: [
-        { direction: 'in', protocol: 'tcp', port: String(VM_SSH_PORT), source_ips: anywhere },
-        { direction: 'in', protocol: 'icmp', source_ips: anywhere },
-      ] }) as { firewall: { id: number } };
-    return created.firewall.id;
+  private firewall(connection: ResolvedWorldProviderConnection): Promise<number> {
+    return this.once(connection, 'firewall', async () => {
+      const existing = await this.pages<{ id: number }>(connection, '/firewalls', 'firewalls', 'karmaxFirewall=vm');
+      if (existing[0]) return existing[0].id;
+      const anywhere = ['0.0.0.0/0', '::/0'];
+      const created = await this.api(connection)('POST', '/firewalls', { name: `karmax-vm-${crypto.randomBytes(3).toString('hex')}`,
+        labels: { karmaxFirewall: 'vm' }, rules: [
+          { direction: 'in', protocol: 'tcp', port: String(VM_SSH_PORT), source_ips: anywhere },
+          { direction: 'in', protocol: 'icmp', source_ips: anywhere },
+        ] }) as { firewall: { id: number } };
+      return created.firewall.id;
+    });
   }
 
   /** A project SSH key nobody holds: with it Hetzner sets no root password. */
-  private async rootKey(connection: ResolvedWorldProviderConnection): Promise<number> {
-    const existing = await this.pages<{ id: number }>(connection, '/ssh_keys', 'ssh_keys', 'karmaxSshKey=no-root-login');
-    if (existing[0]) return existing[0].id;
-    const created = await this.api(connection)('POST', '/ssh_keys', { name: `karmax-no-root-login-${crypto.randomBytes(3).toString('hex')}`,
-      public_key: generateSshKeyPair('karmax-no-root-login').publicKey, labels: { karmaxSshKey: 'no-root-login' } }) as { ssh_key: { id: number } };
-    return created.ssh_key.id;
+  private rootKey(connection: ResolvedWorldProviderConnection): Promise<number> {
+    return this.once(connection, 'root-key', async () => {
+      const existing = await this.pages<{ id: number }>(connection, '/ssh_keys', 'ssh_keys', 'karmaxSshKey=no-root-login');
+      if (existing[0]) return existing[0].id;
+      const created = await this.api(connection)('POST', '/ssh_keys', { name: `karmax-no-root-login-${crypto.randomBytes(3).toString('hex')}`,
+        public_key: generateSshKeyPair('karmax-no-root-login').publicKey, labels: { karmaxSshKey: 'no-root-login' } }) as { ssh_key: { id: number } };
+      return created.ssh_key.id;
+    });
   }
 
   private pricingCache = new Map<string, Promise<{ ipv4Hourly: number; volumeGbMonth: number }>>();
