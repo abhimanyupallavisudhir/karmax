@@ -83,7 +83,7 @@ import {
   type OrganizationEntitlements,
 } from '../domain/entitlements.js';
 import { newId } from '../util/id.js';
-import { EVENT_RETENTION_MS as PROJECT_EVENT_RETENTION_MS, type ProjectEvent, type ProjectEventClaim,
+import { EVENT_RETENTION_MS as PROJECT_EVENT_RETENTION_MS, type EventFollow, type ProjectEvent, type ProjectEventClaim,
   type ProjectEventClaimState } from '../domain/project-events.js';
 import { paymentMerchantMatches } from '../util/payment-merchant.js';
 import { previewHostname } from '../gateway/previews.js';
@@ -937,6 +937,12 @@ export class Store {
         origin TEXT NOT NULL, hops INTEGER NOT NULL, dispatchedAt INTEGER,
         UNIQUE (projectId, source, eventKey)
       );
+      -- Tasks following project events: each match reaches the task's
+      -- conversation as a message (src/domain/project-events.ts EventFollow).
+      CREATE TABLE IF NOT EXISTS task_follows (
+        id TEXT PRIMARY KEY, taskId TEXT NOT NULL, projectId TEXT NOT NULL, filter TEXT NOT NULL,
+        once INTEGER NOT NULL DEFAULT 0, createdAt INTEGER NOT NULL
+      );
       -- What one event did for one armed task: at most one run per pair.
       -- state: pending (a run is starting) | started | deferred | skipped.
       CREATE TABLE IF NOT EXISTS project_event_claims (
@@ -1075,6 +1081,8 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_preview_expiry ON preview_leases(expiresAt, revokedAt);
       CREATE INDEX IF NOT EXISTS idx_delivery_pending ON delivery_outbox(state, nextAt);
       CREATE INDEX IF NOT EXISTS idx_project_events_dispatch ON project_events(dispatchedAt, receivedAt);
+      CREATE INDEX IF NOT EXISTS idx_task_follows_project ON task_follows(projectId);
+      CREATE INDEX IF NOT EXISTS idx_task_follows_task ON task_follows(taskId);
       CREATE INDEX IF NOT EXISTS idx_project_events_project ON project_events(projectId, receivedAt);
       CREATE INDEX IF NOT EXISTS idx_project_events_received ON project_events(receivedAt);
       CREATE INDEX IF NOT EXISTS idx_project_event_claims_state ON project_event_claims(state, receivedAt);
@@ -1918,6 +1926,7 @@ export class Store {
       (await deleteRows(this.db, 'inbox', 'id', authorizationInboxIds));
       (await this.db.prepare('DELETE FROM project_event_claims WHERE eventId IN (SELECT id FROM project_events WHERE projectId=?)').run(id));
       (await this.db.prepare('DELETE FROM project_events WHERE projectId=?').run(id));
+      (await this.db.prepare('DELETE FROM task_follows WHERE projectId=?').run(id));
       // Incoming webhooks (src/integrations/incoming-webhooks.ts). CASE keeps
       // PostgreSQL from parsing every other kv value as JSON.
       (await this.db.prepare(`DELETE FROM kv WHERE k LIKE 'incoming-webhook:%'
@@ -2427,6 +2436,7 @@ export class Store {
       payment_transactions: (await selectRows(this.db, 'payment_transactions', 'organizationId=?', [organizationId])),
       payment_events: (await selectRows(this.db, 'payment_events', 'organizationId=?', [organizationId])),
       project_events: (await selectRows(this.db, 'project_events', 'organizationId=?', [organizationId])),
+      task_follows: (await rowsFor(this.db, 'task_follows', 'projectId', projectIds)),
       project_event_claims: (await rowsFor(this.db, 'project_event_claims', 'eventId',
         ((await this.db.prepare('SELECT id FROM project_events WHERE organizationId=?').all(organizationId)) as Array<{ id: unknown }>).map((r) => String(r.id)))),
       subscription_gifts: (await selectRows(this.db, 'subscription_gifts', 'organizationId=?', [organizationId])),
@@ -2679,6 +2689,7 @@ export class Store {
       (await deleteRows(this.db, 'cards', 'scopeId', [organizationId, ...projectIds]));
       (await this.db.prepare('DELETE FROM project_event_claims WHERE eventId IN (SELECT id FROM project_events WHERE organizationId=?)').run(organizationId));
       (await this.db.prepare('DELETE FROM project_events WHERE organizationId=?').run(organizationId));
+      (await deleteRows(this.db, 'task_follows', 'projectId', projectIds));
       (await this.db.prepare(`DELETE FROM kv WHERE k LIKE 'incoming-webhook:%'
         AND (CASE WHEN k LIKE 'incoming-webhook:%' THEN json_extract(v, '$.organizationId') END)=?`).run(organizationId));
       (await this.db.prepare('DELETE FROM payment_events WHERE organizationId=?').run(organizationId));
@@ -9208,9 +9219,50 @@ export class Store {
     return row?.id ? String(row.id) : undefined;
   }
 
+  async addTaskFollow(follow: EventFollow): Promise<EventFollow> {
+    const { id, taskId, projectId, once, createdAt, ...filter } = follow;
+    await this.db.transaction(async () => {
+      await this.db.prepare('INSERT INTO task_follows (id, taskId, projectId, filter, once, createdAt) VALUES (?,?,?,?,?,?)')
+        .run(id, taskId, projectId, JSON.stringify(filter), once ? 1 : 0, createdAt);
+    });
+    return follow;
+  }
+
+  /** Follows of tasks in a project that is not finished (the dispatcher's candidates). */
+  async liveTaskFollows(projectId: string): Promise<EventFollow[]> {
+    const rows = await this.db.prepare(`SELECT f.* FROM task_follows f JOIN tasks t ON t.id=f.taskId
+      WHERE f.projectId=? AND IFNULL(json_extract(t.lastView, '$.status'), 'active') NOT IN ('done', 'failed', 'cancelled')
+      ORDER BY f.createdAt`).all(projectId);
+    return rows.map(taskFollowFromRow);
+  }
+
+  async taskFollows(taskId: string): Promise<EventFollow[]> {
+    const rows = await this.db.prepare('SELECT * FROM task_follows WHERE taskId=? ORDER BY createdAt').all(taskId);
+    return rows.map(taskFollowFromRow);
+  }
+
+  async getTaskFollow(id: string): Promise<EventFollow | undefined> {
+    const row = await this.db.prepare('SELECT * FROM task_follows WHERE id=?').get(id);
+    return row ? taskFollowFromRow(row) : undefined;
+  }
+
+  async deleteTaskFollow(id: string): Promise<boolean> {
+    return this.db.transaction(async () => Number((await this.db.prepare('DELETE FROM task_follows WHERE id=?').run(id)).changes) === 1);
+  }
+
+  /** Whether this event already reached this task (as its run's start or a message). */
+  async projectEventReached(eventId: string, taskId: string): Promise<boolean> {
+    const row = await this.db.prepare(`SELECT 1 hit FROM project_event_claims WHERE eventId=? AND (taskId=? OR runId=?)
+      AND state IN ('pending', 'started', 'told') LIMIT 1`).get(eventId, taskId, taskId);
+    return !!row;
+  }
+
   async pruneProjectEvents(before: number): Promise<number> {
     return this.db.transaction(async () => {
       await this.db.prepare(`DELETE FROM project_event_claims WHERE receivedAt<?`).run(before);
+      // A finished task hears nothing more; one deleted is gone.
+      await this.db.prepare(`DELETE FROM task_follows WHERE taskId NOT IN (SELECT id FROM tasks WHERE
+        IFNULL(json_extract(lastView, '$.status'), 'active') NOT IN ('done', 'failed', 'cancelled'))`).run();
       return Number((await this.db.prepare(`DELETE FROM project_events WHERE id IN
         (SELECT id FROM project_events WHERE receivedAt<? ORDER BY receivedAt LIMIT 10000)`).run(before)).changes);
     });
@@ -10222,4 +10274,10 @@ function projectEventClaimFromRow(row: any): ProjectEventClaim {
     ...(row.concurrencyKey !== null && row.concurrencyKey !== undefined ? { concurrencyKey: String(row.concurrencyKey) } : {}),
     receivedAt: Number(row.receivedAt), updatedAt: Number(row.updatedAt),
   };
+}
+
+function taskFollowFromRow(row: any): EventFollow {
+  const filter = JSON.parse(String(row.filter)) as Omit<EventFollow, 'id' | 'taskId' | 'projectId' | 'once' | 'createdAt'>;
+  return { id: String(row.id), taskId: String(row.taskId), projectId: String(row.projectId), ...filter,
+    ...(Number(row.once) ? { once: true } : {}), createdAt: Number(row.createdAt) };
 }

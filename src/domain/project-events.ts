@@ -314,3 +314,52 @@ function trimValue(value: unknown, textLimit: number, listLimit: number, depth: 
   if (Array.isArray(value)) return value.slice(0, listLimit).map((item) => trimValue(item, textLimit, listLimit, depth + 1));
   return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, trimValue(item, textLimit, listLimit, depth + 1)]));
 }
+
+// ─── Follows: events delivered into a task's conversation ────────────────────
+
+/**
+ * A task follows project events (wiki features/events-and-automations): each
+ * match reaches its conversation as a message, so its agent hears about it
+ * while it works — and, because a message ends a pause, waiting for an event
+ * is following it and pausing. A run started by an event follows its subject
+ * (an issue's comments reach the run working on that issue).
+ */
+export interface EventFollow {
+  id: string;
+  taskId: string;
+  projectId: string;
+  /** `*` (default), a type, or a family (`github.issue_comment.*`). */
+  type?: string;
+  source?: string;
+  /** An exact subject: the issue, pull request or chat thread. */
+  subject?: string;
+  where?: EventFilter;
+  includeSelf?: boolean;
+  /** Stop following after the first delivery (a wait). */
+  once?: boolean;
+  createdAt: number;
+}
+
+export function followMatches(follow: Pick<EventFollow, 'taskId' | 'type' | 'source' | 'subject' | 'where' | 'includeSelf'>, event: ProjectEvent): boolean {
+  if (!eventTypeMatches(follow.type || '*', event.type) || !eventSourceMatches(follow.source, event.source)) return false;
+  if (follow.subject && event.subject !== follow.subject) return false;
+  if (event.origin === 'self' && !follow.includeSelf) return false;
+  // A task never hears its own emits.
+  if (event.source === `task:${follow.taskId}`) return false;
+  return filterMatches(event.payload, follow.where);
+}
+
+export function validateFollow(input: { type?: unknown; source?: unknown; subject?: unknown; where?: unknown }): string[] {
+  const errors: string[] = [];
+  if (input.type !== undefined && input.type !== '*') {
+    const type = String(input.type);
+    if (!validEventType(type.endsWith('.*') ? type.slice(0, -2) : type)) errors.push(`invalid event type: "${type}"`);
+  }
+  if (input.source !== undefined && (typeof input.source !== 'string' || !input.source)) errors.push('`source` must be text');
+  if (input.subject !== undefined && (typeof input.subject !== 'string' || !input.subject || input.subject.length > MAX_SUBJECT_LENGTH))
+    errors.push('`subject` must be text');
+  errors.push(...validateFilter(input.where));
+  if (input.type === undefined && input.source === undefined && input.subject === undefined && input.where === undefined)
+    errors.push('follow at least a type, a source or a subject');
+  return errors;
+}
