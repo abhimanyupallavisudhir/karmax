@@ -13,7 +13,7 @@ on:
         description: Live suite to run
         type: choice
         default: all
-        options: [all, models, agent, claude, e2b, daytona, vm, github]
+        options: [all, models, agent, claude, e2b, daytona, vm, move, github]
   schedule:
     - cron: '17 6 * * 1'
 
@@ -40,6 +40,7 @@ jobs:
       e2b: ${{ steps.plan.outputs.e2b }}
       daytona: ${{ steps.plan.outputs.daytona }}
       vm: ${{ steps.plan.outputs.vm }}
+      move: ${{ steps.plan.outputs.move }}
       github: ${{ steps.plan.outputs.github }}
     steps:
       # Job conditions cannot read secrets, so their presence is decided here.
@@ -60,10 +61,21 @@ jobs:
           LIVE_GITHUB_FORK_TOKEN: ${{ secrets.LIVE_GITHUB_FORK_TOKEN }}
         run: |
           # decide SUITE SECRET...: the suite runs when selected and any of its secrets is set.
+          # decide_all SUITE SECRET...: the same, but every secret must be set.
           decide() {
             suite=$1; shift
             run=false; why="$* not set"
             for secret in "$@"; do [ -z "$(printenv "$secret")" ] || run=true; done
+            report "$suite"
+          }
+          decide_all() {
+            suite=$1; shift
+            run=true; why="$* not all set"
+            for secret in "$@"; do [ -n "$(printenv "$secret")" ] || run=false; done
+            report "$suite"
+          }
+          report() {
+            suite=$1
             if [ "$SELECTED" != all ] && [ "$SELECTED" != "$suite" ]; then run=false; why='not selected'; fi
             echo "$suite=$run" >> "$GITHUB_OUTPUT"
             if [ "$run" = true ]; then echo "$suite: runs"; else echo "$suite: skipped ($why)"; fi
@@ -74,6 +86,7 @@ jobs:
           decide e2b LIVE_E2B_API_KEY
           decide daytona LIVE_DAYTONA_API_KEY
           decide vm LIVE_FLY_API_TOKEN LIVE_HETZNER_API_TOKEN
+          decide_all move LIVE_E2B_API_KEY LIVE_HETZNER_API_TOKEN
           decide github LIVE_GITHUB_TOKEN LIVE_GITHUB_FORK_TOKEN
 
   models:
@@ -198,6 +211,26 @@ jobs:
           FLY_API_TOKEN: ${{ secrets.LIVE_FLY_API_TOKEN }}
           HCLOUD_TOKEN: ${{ secrets.LIVE_HETZNER_API_TOKEN }}
           OPENAI_API_KEY: ${{ secrets.LIVE_VM_OPENAI_API_KEY }}
+
+  move:
+    name: Moving a running task between providers
+    needs: plan
+    if: github.ref == 'refs/heads/master' && needs.plan.outputs.move == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: live
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/install
+      # An E2B world checkpointed and restored on a 100 GB Hetzner volume, and
+      # its fallback to E2B when Hetzner refuses; deletes everything it creates.
+      - run: npx vitest run tests/computer-move-live.test.ts
+        env:
+          KARMAX_RUN_LIVE: '1'
+          E2B_API_KEY: ${{ secrets.LIVE_E2B_API_KEY }}
+          HCLOUD_TOKEN: ${{ secrets.LIVE_HETZNER_API_TOKEN }}
 
   github:
     name: GitHub pull requests

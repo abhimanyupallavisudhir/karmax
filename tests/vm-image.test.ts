@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { describe, expect, it } from 'vitest';
 import { imagePullable, PublishedVmImage, vmImageRef } from '../src/world/vm/image.js';
 import { vmProvisionVersion } from '../src/world/vm/provision.js';
@@ -25,6 +26,15 @@ describe('the published VM image', () => {
   it('is tagged with the provisioning version, so a world booted from it skips provisioning', () => {
     expect(vmImageRef('ghcr.io/owner/karmax-vm')).toBe(`ghcr.io/owner/karmax-vm:${vmProvisionVersion()}`);
   });
+
+  // Canary of task #610: under Vitest the version differed from production's
+  // (it hashed the compiled function), so live suites never found the snapshot
+  // production had built and provisioned every machine from stock.
+  it('names the same version however its source was compiled', () => {
+    const production = execFileSync(process.execPath, ['--import', 'tsx', '-e',
+      "import('./src/world/vm/provision.ts').then((m) => process.stdout.write(m.vmProvisionVersion()))"], { encoding: 'utf8' });
+    expect(vmProvisionVersion()).toBe(production);
+  }, 60_000);
 
   it('counts as available only when anyone can pull it', async () => {
     const state = { public: true, tags: ['v1'] };

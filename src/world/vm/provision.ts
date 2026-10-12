@@ -99,7 +99,7 @@ function smokeTest(): string {
  * smoke test. Root, idempotent: a machine (or a Fly image / Hetzner snapshot
  * built from one) that already ran this exact script skips it.
  */
-export function vmProvisionScript(): string {
+export function vmProvisionScript(stamp = vmProvisionStamp()): string {
   const node = PINNED_REMOTE_NODE_VERSION;
   const root = `/opt/karmax/node-${node}`;
   return `#!/bin/bash
@@ -149,7 +149,7 @@ export PATH=/opt/karmax/bin:$PATH
 export PLAYWRIGHT_BROWSERS_PATH=/opt/karmax/browsers
 export KARMAX_BROWSER_BIN=/opt/karmax/bin
 EOF
-touch ${quote(vmProvisionStamp())}
+touch ${quote(stamp)}
 `;
 }
 
@@ -159,10 +159,13 @@ export function vmProvisionStamp(): string {
 }
 
 let version: string | undefined;
-/** Short content hash of the provisioning script: names Hetzner snapshots and stamps. */
+/** Short content hash of the provisioning script: names Hetzner snapshots, the
+ * Fly image tag and stamps. It hashes the script a machine runs, never the
+ * function's compiled source, which differs between tsx and Vitest. */
 export function vmProvisionVersion(): string {
   if (!version) {
-    const script = vmProvisionScript.toString() + JSON.stringify([PINNED_REMOTE_NODE_VERSION, PINNED_REMOTE_NPM_VERSION,
+    // The stamp names the version, so the script is hashed with a placeholder for it.
+    const script = vmProvisionScript('/opt/karmax/.vm-provisioned') + JSON.stringify([PINNED_REMOTE_NODE_VERSION, PINNED_REMOTE_NPM_VERSION,
       PLAYWRIGHT_VERSION, PLAYWRIGHT_MCP_VERSION, CHROME_DEVTOOLS_MCP_VERSION, installedClaudeCodeVersion(), CODEX_VERSION,
       OPENCODE_PACKAGE, smokeTest()]);
     version = crypto.createHash('sha256').update(script).digest('hex').slice(0, 12);

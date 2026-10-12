@@ -9486,10 +9486,25 @@ export class Store {
     return this.db.transaction(async () => {
     const now = Date.now();
     let revoked = 0;
-    if (scope.projectId)
+    if (scope.projectId) {
+      // A token that also reaches other projects loses only this one (an agent
+      // granted a throwaway project keeps working when it is deleted), unless
+      // this project is its own: its primary project or its task's.
+      const shared = (await this.db.prepare(`SELECT t.tokenHash, t.json FROM scoped_tokens t
+        JOIN scoped_token_projects p ON p.tokenHash=t.tokenHash AND p.projectId=?
+        WHERE t.revokedAt IS NULL AND EXISTS (SELECT 1 FROM scoped_token_projects o
+          WHERE o.tokenHash=t.tokenHash AND o.projectId<>?)`).all(scope.projectId, scope.projectId)) as Array<{ tokenHash: string; json: string }>;
+      for (const row of shared) {
+        const record = JSON.parse(row.json) as { projectId?: unknown; taskId?: unknown };
+        const task = typeof record.taskId === 'string'
+          ? (await this.db.prepare('SELECT projectId FROM tasks WHERE id=?').get(record.taskId)) as { projectId: string } | undefined : undefined;
+        if (record.projectId !== scope.projectId && task?.projectId !== scope.projectId)
+          (await this.db.prepare('DELETE FROM scoped_token_projects WHERE tokenHash=? AND projectId=?').run(row.tokenHash, scope.projectId));
+      }
       revoked += Number((await this.db.prepare(`UPDATE scoped_tokens SET revokedAt=? WHERE revokedAt IS NULL
         AND tokenHash IN (SELECT tokenHash FROM scoped_token_projects WHERE projectId=?)`)
         .run(now, scope.projectId)).changes);
+    }
     if (scope.organizationId)
       revoked += Number((await this.db.prepare('UPDATE scoped_tokens SET revokedAt=? WHERE revokedAt IS NULL AND organizationId=?')
         .run(now, scope.organizationId)).changes);

@@ -232,6 +232,21 @@ describe.each(storeBackends)('Store ($name)', ({ name, open }) => {
     expect(queries.some((sql) => sql.includes('SELECT tokenHash, json FROM scoped_tokens WHERE revokedAt IS NULL'))).toBe(false);
   });
 
+  it('keeps a token that also reaches other projects when one of them is deleted, without that one', async () => {
+    // Task #610: deleting a throwaway project an agent had been granted revoked the
+    // agent's whole task token, so it could not even open its pull request.
+    const doomed = await store.createProject('Throwaway');
+    const home = await store.createProject('Home');
+    const own = await store.createTask({ projectId: home.id, title: 'Agent', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
+    const inside = await store.createTask({ projectId: doomed.id, title: 'Canary', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
+    await store.putScopedToken('agent', 'one', { principal: 'agent:a', taskId: own.id, projectIds: [home.id, doomed.id] }, Date.now() + 60_000);
+    await store.putScopedToken('canary', 'two', { principal: 'agent:b', taskId: inside.id, projectIds: [doomed.id, home.id] }, Date.now() + 60_000);
+    await store.putScopedToken('primary', 'three', { principal: 'user:c', projectId: doomed.id, projectIds: [home.id] }, Date.now() + 60_000);
+    expect(await store.revokeScopedTokens({ projectId: doomed.id })).toBe(2);
+    expect((await store.db.prepare('SELECT tokenHash FROM scoped_tokens WHERE revokedAt IS NULL').all())).toEqual([{ tokenHash: 'agent' }]);
+    expect((await store.db.prepare('SELECT projectId FROM scoped_token_projects WHERE tokenHash=?').all('agent'))).toEqual([{ projectId: home.id }]);
+  });
+
   it('deprovisions a member without reading every live token body', async () => {
     const org = await store.createOrganization({ name: 'Tokens', ownerUserId: 'owner' });
     await store.setOrganizationMembership(org.id, 'member', 'member');
