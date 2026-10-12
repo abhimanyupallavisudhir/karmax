@@ -3193,14 +3193,16 @@ async function softwareDevImpl(
   }
 
   /** Address `reply` and act on it: agents it names are called, people it names
-   * are notified now (an ask, in their inbox). */
-  async function deliverReply(reply: Message | undefined, to: string[]): Promise<void> {
+   * are notified now — an ask in their inbox, or with `ask` false a reply they
+   * need only read: the task goes on without them (#613). */
+  async function deliverReply(reply: Message | undefined, to: string[], ask = true): Promise<void> {
     if (!reply) return;
     reply.to = [...new Set(to)];
     callAgents(reply);
     const people = reply.to.filter((selector) => !selectorAgent(selector));
     if (people.length) await core.recordEvent(taskId, 'task.mentioned', {
       recipients: people, by: agentSelector(messageAuthor(reply)!), messageId: reply.id, text: clip(reply.text, 500),
+      ...(ask ? {} : { ask: false }),
     });
   }
 
@@ -3222,7 +3224,7 @@ async function softwareDevImpl(
       // by the stage that called them, not here.
       const caller = calledBy[key];
       delete calledBy[key];
-      await deliverReply(turn?.reply, caller ? [caller] : []);
+      await deliverReply(turn?.reply, caller ? [caller] : [], false);
       status = resume.status;
       waitingFor = resume.waitingFor;
       await publish();
@@ -3658,11 +3660,12 @@ Inspect the complete current diff and specifically compare its delta from the re
 
   /** A top-level reply to people goes to them as a mention when the task then
    * waits on something else (a pause, its sub-tasks): no human wait would
-   * carry it, and they would never hear it (pramana#22). */
+   * carry it, and they would never hear it (pramana#22). It is not an ask: the
+   * task waits on that something else, not on them (#613). */
   async function replyUnasked(): Promise<void> {
     const reply = speakersReply;
     speakersReply = undefined;
-    if (reply && !input.parentTaskId && patched(UNASKED_REPLY_TO_SPEAKERS)) await deliverReply(reply, speakers);
+    if (reply && !input.parentTaskId && patched(UNASKED_REPLY_TO_SPEAKERS)) await deliverReply(reply, speakers, false);
   }
 
   /** ` (already sent to Bea, who spoke to it)` when the agent's last reply also

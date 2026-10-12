@@ -47,6 +47,48 @@ describe.each(storeBackends)('attention asks ($name)', ({ open }) => {
     expect((await store.attentionAsks('owner', organization.id)).size).toBe(0);
   });
 
+  /** #613: the Agent answered its owner, then waited on a bigger machine. Its
+   * reply was an @mention ask, so the task stayed on For you after it was read. */
+  it('a reply that asks nothing counts until read; a mention that asks counts until answered', async () => {
+    const store = await open();
+    const organization = await store.createOrganization({ name: 'Team', ownerUserId: 'owner' });
+    const project = await store.createProject('App', {}, organization.id);
+    const make = (title: string) => store.createTask({ projectId: project.id, title, workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: title }, createdBy: { kind: 'user', userId: 'owner' } });
+    const replied = await make('Replied to me');
+    const asked = await make('Asked me');
+    await store.appendEvent({ taskId: replied.id, type: 'task.mentioned', ts: Date.now(),
+      payload: { recipients: ['user:owner'], by: 'agent:do', text: 'Moving to a bigger machine.', ask: false } });
+    await store.appendEvent({ taskId: asked.id, type: 'task.mentioned', ts: Date.now(),
+      payload: { recipients: ['user:owner'], by: 'agent:do', text: 'Which URL style?' } });
+
+    const kinds = async () => Object.fromEntries([...(await store.attentionAsks('owner', organization.id))].map(([id, ask]) => [id, ask.kinds]));
+    expect(await kinds()).toEqual({ [replied.id]: ['mentioned'], [asked.id]: ['mentioned'] });
+    for (const item of await store.listInbox('owner', organization.id)) await store.markInbox('owner', item.id, false);
+    expect(await kinds()).toEqual({ [asked.id]: ['mentioned'] });
+    await store.dischargeMentions(asked.id, 'owner');
+    expect(await kinds()).toEqual({});
+
+    // A later reply is news again; a reply never demotes an ask to news.
+    await store.appendEvent({ taskId: replied.id, type: 'task.mentioned', ts: Date.now(),
+      payload: { recipients: ['user:owner'], by: 'agent:do', text: 'Back. Tests pass.', ask: false } });
+    await store.appendEvent({ taskId: asked.id, type: 'task.mentioned', ts: Date.now(),
+      payload: { recipients: ['user:owner'], by: 'agent:do', text: 'Which URL style?' } });
+    await store.appendEvent({ taskId: asked.id, type: 'task.mentioned', ts: Date.now(),
+      payload: { recipients: ['user:owner'], by: 'agent:do', text: 'Waiting on CI.', ask: false } });
+    for (const item of await store.listInbox('owner', organization.id)) await store.markInbox('owner', item.id, false);
+    expect(await kinds()).toEqual({ [asked.id]: ['mentioned'] });
+    // An ask on the task supersedes a reply that asked nothing.
+    await store.appendEvent({ taskId: replied.id, type: 'task.mentioned', ts: Date.now(),
+      payload: { recipients: ['user:owner'], by: 'agent:do', text: 'Done.', ask: false } });
+    await store.saveView(replied.id, { taskId: replied.id, title: 'r', workflow: 'software-dev', stage: 'review', status: 'waiting',
+      waitingFor: { kind: 'human' }, messages: [], actions: [], state: {}, updatedAt: Date.now() } as any, undefined, undefined, undefined, { lifecycleEvent: false });
+    await store.appendEvent({ taskId: replied.id, type: 'view.updated', ts: Date.now(),
+      payload: { stage: 'review', status: 'waiting', waitingFor: 'human' } });
+    expect((await store.listInbox('owner', organization.id)).filter((item) => item.taskId === replied.id).map((item) => item.kind))
+      .toEqual(['review-requested']);
+  });
+
   it('narrows a task read to the candidates and every draft', async () => {
     const store = await open();
     const organization = await store.createOrganization({ name: 'Team', ownerUserId: 'owner' });

@@ -5373,9 +5373,11 @@ export class Store {
     } else if (ev.type === 'task.mentioned') {
       kind = 'mentioned';
       // An @mention in a task's conversation is addressed to people: an ask, like
-      // a review request. (Historical single-principal mentions stay routine.)
+      // a review request — unless it is a reply the task does not wait on
+      // (`ask: false`), news until read (#613). (Historical single-principal
+      // mentions stay routine.)
       if (Array.isArray(ev.payload.recipients)) {
-        actionable = true;
+        actionable = ev.payload.ask !== false;
         users = (await this.humanAudience(task.id, ev.payload.recipients.map(String)));
       } else {
         const mentioned = ev.payload.principal as PrincipalRef | undefined;
@@ -5427,6 +5429,12 @@ export class Store {
       if (!actionable && !preferences.routine) continue;
       const existing = (await this.db.prepare('SELECT id FROM inbox WHERE userId=? AND taskId=? AND kind=?')
         .get(userId, task.id, kind)) as any;
+      if (existing && kind === 'mentioned') {
+        // Another message to them: unread again, and still an ask if either was.
+        (await this.db.prepare(`UPDATE inbox SET eventSeq=?, actionable=CASE WHEN ?=1 THEN 1 ELSE actionable END, unread=1, readAt=NULL${requested ? ', urgency=?' : ''} WHERE id=?`)
+          .run(eventSeq, actionable ? 1 : 0, ...(requested ? [urgencyRank(requested)] : []), existing.id));
+        continue;
+      }
       if (existing) {
         // The same ask, restated. Point it at the newest event but leave its age
         // and read state alone: a repeat is not a new notification.
@@ -5434,11 +5442,13 @@ export class Store {
           .run(eventSeq, actionable ? 1 : 0, ...(requested ? [urgencyRank(requested)] : []), existing.id));
         continue;
       }
-      if (actionable && kind === 'mentioned') {
+      if (kind === 'mentioned') {
         // A mention never displaces a stronger ask on the same task: the person is
         // already asked to look at it.
         if ((await this.db.prepare("SELECT 1 FROM inbox WHERE userId=? AND taskId=? AND actionable=1 AND kind<>'mentioned'").get(userId, task.id))) continue;
-      } else if (actionable) (await this.deleteInbox('userId=? AND taskId=? AND actionable=1', [userId, task.id]));
+        // An ask supersedes a reply that asked nothing.
+        if (actionable) (await this.deleteInbox("userId=? AND taskId=? AND kind='mentioned' AND actionable=0", [userId, task.id]));
+      } else if (actionable) (await this.deleteInbox("userId=? AND taskId=? AND (actionable=1 OR kind='mentioned')", [userId, task.id]));
       const item: InboxItem = { id: newId('inbox'), organizationId: project.organizationId, userId, eventSeq,
         taskId: task.id, kind, urgency: requested ?? DEFAULT_URGENCY[kind], unread: true, actionable, createdAt: ev.ts };
       const inserted = (await this.db.prepare(`INSERT OR IGNORE INTO inbox
