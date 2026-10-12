@@ -13,7 +13,7 @@ const benchmarks = {
   source: { name: 'Artificial Analysis', url: 'https://artificialanalysis.ai/' },
   fetchedAt: 1,
   models: [
-    { id: 'a', name: 'Claude Opus 5.5 (High, Default Fallback)', creator: 'Anthropic', intelligence: 53.6, price: 8, cost: 0.1, seconds: 28,
+    { id: 'a', name: 'Claude Opus 5.5 (High, Default Fallback)', creator: 'Anthropic', intelligence: 53.6, price: 8, tokens: 4_800, measured: true, cost: 0.1, seconds: 28,
       ref: { provider: 'claude', model: 'claude-opus-5-5', effort: 'high' } },
     { id: 'b', name: 'Claude Opus 5.5 (Low, Default Fallback)', creator: 'Anthropic', intelligence: 42.3, price: 8, cost: 0.02, seconds: 11.8,
       ref: { provider: 'claude', model: 'claude-opus-5-5', effort: 'low' } },
@@ -141,7 +141,7 @@ describe('model field', () => {
     await ui.page.locator('.mf-chart').click();
     const points = ui.page.locator('.mc-point');
     await points.first().waitFor();
-    // GPT-6 Sol has no speed measurement, so neither its cost per answer nor its time is known.
+    // GPT-6 Sol has no prices or speed, so neither its cost per task nor its time is known.
     expect(await points.count()).toBe(4);
     expect(await ui.page.locator('.mc-missing').innerText()).toContain('1 without cost data');
     expect(await ui.page.locator('.mc-point.current').getAttribute('aria-label')).toContain('Claude Opus 5.5 · high');
@@ -151,7 +151,11 @@ describe('model field', () => {
     // ($0.10, 53.6); Gemini ($0.03, 29.7) is dominated.
     expect(await ui.page.locator('.mc-label').allTextContents()).toEqual(['GPT-6 Luna · high', 'Claude Opus 5.5 · low', 'Claude Opus 5.5 · high']);
     expect(await ui.page.locator('.mc-frontier').getAttribute('d')).toMatch(/^M[\d.]+,[\d.]+(?:L[\d.]+,[\d.]+){2}$/);
-    expect(await ui.page.locator('.mc-source a').getAttribute('href')).toBe('https://artificialanalysis.ai/');
+    expect(await ui.page.locator('.mc-source a').evaluateAll((links) => links.map((link) => link.getAttribute('href'))))
+      .toEqual(['https://artificialanalysis.ai/', 'https://livebench.ai/']);
+    // LiveBench measured Opus high's tokens per task; the others are estimates.
+    await ui.page.locator('.mc-point.current').hover();
+    expect(await ui.page.locator('.mc-tip').innerText()).toContain('Intelligence 53.6 · $0.1 per task · 28 s');
 
     await ui.page.getByRole('button', { name: 'Time', exact: true }).click();
     expect(await points.count()).toBe(4);
@@ -165,6 +169,7 @@ describe('model field', () => {
 
     await ui.page.locator('.mc-point', { has: ui.page.locator('[data-harness="codex"]') }).first().hover();
     expect(await ui.page.locator('.mc-tip').innerText()).toContain('codex:gpt-6-luna:high');
+    expect(await ui.page.locator('.mc-tip').innerText()).toContain('≈$0.004 per task · ≈17 s');
     await ui.page.locator('.mc-point', { has: ui.page.locator('[data-harness="codex"]') }).first().click();
     expect(await ui.page.locator('.model-chart').count()).toBe(0);
     expect(await read()).toMatchObject({ provider: 'codex', model: 'gpt-6-luna', effort: 'high' });
