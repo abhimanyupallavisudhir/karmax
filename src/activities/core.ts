@@ -4748,6 +4748,18 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           }));
           return undefined;
         };
+        // A target that moved on since this head may already carry the fix
+        // (task 597: a restore fix landed while a PR without it kept failing
+        // the rehearsal, and Confirm only re-read that failure). Before
+        // rerunning a head that keeps failing, or asking a person about it,
+        // test the proposal as it would land.
+        const updateFromMovedTarget = async (): Promise<GitHubMergeAuthorization | undefined> => {
+          if (!fairLanding || !ref.headSha || !readiness.baseSha) return undefined;
+          const behind = await inspection.api.compare(ref.slug, readiness.baseSha, ref.headSha)
+            .then((comparison) => comparison.behindBy > 0, () => false);
+          return behind ? updateFromTarget(ref, current, (message) =>
+            `${ref.slug.toLowerCase()}#${ref.number}:${ref.headSha}:${readiness.baseSha}:conflict:${message}`) : undefined;
+        };
         const human = decisions.find(({ decision }) => decision.disposition === 'human');
         if (human) return {
           status: 'needs-human', prs: current, actorUserId,
@@ -4771,16 +4783,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             if (reruns.some((event) => Number(event.payload?.runId) === run.id
               && Number(event.payload?.observedAttempt) === run.attempt))
               return { status: 'waiting', prs: current, actorUserId, detail: 'Rerunning CI' };
-            // A target that moved on since this head may already carry the
-            // fix (task 597: a restore fix landed while a PR without it kept
-            // failing the rehearsal, and Confirm only re-read that failure).
-            // Test the proposal as it would land instead of rerunning it or
-            // asking a person.
-            if (fairLanding && ref.headSha && readiness.baseSha
-              && (await inspection.api.compare(ref.slug, readiness.baseSha, ref.headSha)
-                .then((comparison) => comparison.behindBy > 0, () => false)))
-              return updateFromTarget(ref, current, (message) =>
-                `${ref.slug.toLowerCase()}#${ref.number}:${ref.headSha}:${readiness.baseSha}:conflict:${message}`);
+            const updated = await updateFromMovedTarget();
+            if (updated) return updated;
             if (reruns.length) return {
               status: 'needs-human', prs: current, actorUserId,
               waitReason: 'CI failed again after a rerun',
@@ -4811,6 +4815,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             const rejected = await rerun(retry, reruns.length + 1);
             if (rejected) return rejected;
           } else if (!alreadyRequested && reruns.length >= 2) {
+            const updated = await updateFromMovedTarget();
+            if (updated) return updated;
             return {
               status: 'needs-human', prs: current, actorUserId,
               detail: `${brief}\n\nThe exact workflow run remained transiently broken after two automatic reruns. Inspect GitHub's runner or repository configuration before retrying.`,
