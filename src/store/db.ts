@@ -7518,6 +7518,56 @@ export class Store {
       .map(resourceRevisionRow).filter((revision) => !referenced.has(revision.id)).slice(0, limit);
   }
 
+  /** Older versions of data in managed storage whose replacement was saved
+   * before `replacedBefore`: versions saved before the current one (published,
+   * or a sub-task's delivery) with a later non-capture version older than the
+   * cutoff. Never a park capture, a version in a bucket the organization
+   * connected itself, or one a task can still need: anything referenced, the
+   * published version a referenced capture descends from (a restored world's
+   * fork point), or the delivery a sub-task's next delivery builds on.
+   * Oldest first. The caller deletes each with the targeted reference check. */
+  async expiredResourceVersions(replacedBefore: number, limit = 100): Promise<ResourceRevision[]> {
+    const rows = ((await this.db.prepare(`SELECT r.*, a.currentRevisionId AS currentId, l.kind AS locationKind
+      FROM resource_revisions r JOIN resource_attachments a ON a.id=r.attachmentId
+      LEFT JOIN storage_locations l ON l.id=r.storageLocationId
+      WHERE a.currentRevisionId IS NOT NULL ORDER BY r.attachmentId, r.createdAt`).all()) as Array<Parameters<typeof resourceRevisionRow>[0]
+        & { currentId: string; locationKind: string | null }>);
+    const byId = new Map<string, ResourceRevision>();
+    const byAttachment = new Map<string, Array<{ revision: ResourceRevision; current: string; managed: boolean }>>();
+    for (const row of rows) {
+      const revision = resourceRevisionRow(row);
+      byId.set(revision.id, revision);
+      const list = byAttachment.get(revision.attachmentId) ?? [];
+      list.push({ revision, current: String(row.currentId), managed: !revision.storageLocationId || row.locationKind === 'managed' });
+      byAttachment.set(revision.attachmentId, list);
+    }
+    const kept = (await this.referencedResourceRevisionIds());
+    for (const entry of (await this.kvEntries('resource-delivered:'))) kept.add(entry.value);
+    // A capture's copy starts from the published version its parents lead to.
+    for (const id of kept) {
+      const seen = new Set<string>();
+      for (let revision = byId.get(id); revision?.metadata?.checkpoint && revision.parentRevisionId && !seen.has(revision.id);
+        revision = byId.get(revision.parentRevisionId)) {
+        seen.add(revision.id);
+        kept.add(revision.parentRevisionId);
+      }
+    }
+    const expired: ResourceRevision[] = [];
+    for (const list of byAttachment.values()) {
+      const current = byId.get(list[0]!.current);
+      if (!current) continue;
+      // Each version's replacement: the next later version that is not a park capture or a delivery.
+      let replacement: ResourceRevision | undefined;
+      for (let i = list.length - 1; i >= 0; i--) {
+        const { revision, managed } = list[i]!;
+        if (revision.createdAt < current.createdAt && replacement && replacement.createdAt < replacedBefore
+          && managed && !revision.metadata?.checkpoint && revision.id !== current.id && !kept.has(revision.id)) expired.push(revision);
+        if (!revision.metadata?.checkpoint && !revision.metadata?.deliveredTo && revision.createdAt <= current.createdAt) replacement = revision;
+      }
+    }
+    return expired.sort((a, b) => a.createdAt - b.createdAt).slice(0, limit);
+  }
+
   /** Delete a revision row only if nothing references it now. The caller then
    * deletes its objects; a failure there leaks bytes, never a dangling row.
    * `allowCurrent` also clears it as its attachment's current revision. */

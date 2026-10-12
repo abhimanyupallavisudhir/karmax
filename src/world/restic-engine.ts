@@ -169,6 +169,12 @@ const VERIFY_MAX_BYTES = 256 * 1024 * 1024;
 const MERGE_PATTERNS = 1_000;
 /** A creator that has not finished by then has died. */
 const INIT_STALE_MS = 2 * 60_000;
+/** A save holds its repository's save lease ({@link ResticResources.saving}),
+ * renewing it this often; one not renewed for SAVE_STALE_MS was left by a
+ * process that died, and the next save takes it over. */
+const SAVE_RENEW_MS = 20_000;
+const SAVE_STALE_MS = 2 * 60_000;
+const SAVE_POLL_MS = 1_000;
 const HOST_CORES = Math.max(1, Math.min(2, Math.floor(os.cpus().length / 2)));
 
 export class ResticResources {
@@ -292,7 +298,8 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
   /** Save `entry` (`.`: all of it) of a directory on this host: an upload, an import. */
   async backupDirectory(directory: string, attachment: Repository, options: { quota: boolean; parent?: string; entry?: string }): Promise<ResticCapture> {
     await this.ensureRepository(attachment);
-    const run = await this.onHost(attachment, 'append', options.quota, [...backupArgs(options.parent), options.entry ?? '.'], { key: 'host', cwd: directory });
+    const run = await this.saving(attachment, crypto.randomUUID(), {}, () =>
+      this.onHost(attachment, 'append', options.quota, [...backupArgs(options.parent), options.entry ?? '.'], { key: 'host', cwd: directory }));
     if (run.code !== 0) {
       await this.deps.store.kvSet(`restic-prune:${attachment.name}`, String(Date.now()));
       throw resticFailure(run, 'saving the resource');
@@ -642,6 +649,42 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
     this.initialized.add(attachment.name);
   }
 
+  /** Run a save holding its repository's save lease. restic deduplicates
+   * against the index it loads when it starts, so two saves at once would
+   * each upload whatever new data they share (parallel sub-tasks that rebuilt
+   * the same file) and the copies would stay until a prune, then 30 days more
+   * in the store. Saves to one repository take turns instead; reads, dry runs
+   * and saves to other repositories do not wait. */
+  private async saving<T>(repository: Repository, owner: string, options: Pick<ResticRunOptions, 'checkContinue'>, run: () => Promise<T>): Promise<T> {
+    const key = `restic-save:${repository.name}`;
+    let held: string | undefined;
+    for (;;) {
+      const current = await this.deps.store.kvGet(key);
+      let holder: { owner?: string; at?: number } = {};
+      try { holder = JSON.parse(current ?? '{}'); } catch { /* unreadable: stale */ }
+      if (current === undefined || holder.owner === owner || !(Date.now() - Number(holder.at ?? 0) < SAVE_STALE_MS)) {
+        const mine = JSON.stringify({ owner, at: Date.now() });
+        if (await this.deps.store.kvCompareAndSet(key, current, mine)) { held = mine; break; }
+        continue;
+      }
+      await options.checkContinue?.();
+      await new Promise((resolve) => setTimeout(resolve, SAVE_POLL_MS));
+    }
+    // Renewals run one after another, and the release after the last of them.
+    let renewing = Promise.resolve();
+    const renew = setInterval(() => {
+      renewing = renewing.then(async () => {
+        const next = JSON.stringify({ owner, at: Date.now() });
+        if (await this.deps.store.kvCompareAndSet(key, held, next)) held = next;
+      }).catch(() => undefined);
+    }, SAVE_RENEW_MS);
+    try { return await run(); } finally {
+      clearInterval(renew);
+      await renewing;
+      await this.deps.store.kvCompareAndSet(key, held, undefined).catch(() => false);
+    }
+  }
+
   private async backupOnce(place: ResticPlace, attachment: Repository, options: ResticRunOptions & { parent?: string;
     quota: boolean; dryRun?: boolean }): Promise<ResticCapture & { changed: boolean }> {
     // A one-file resource is its content: a link is saved as what it points to.
@@ -660,9 +703,12 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
     const args = [...backupArgs(options.parent, connections), ...(options.dryRun ? ['--dry-run'] : []),
       ...(list ? ['--files-from-verbatim', path.posix.join(place.world.handle.root, list)] : [file ? path.posix.basename(file) : '.'])];
     const progress = options.dryRun ? {} : { onProgress: options.onProgress };
-    const run = await (remote
+    const save = () => remote
       ? this.inWorld(place.world, attachment, 'append', options.quota, args, { ...options, ...progress, cwd: directory })
-      : this.onHost(attachment, 'append', options.quota, args, { ...options, ...progress, cwd: directory }))
+      : this.onHost(attachment, 'append', options.quota, args, { ...options, ...progress, cwd: directory });
+    // A dry run uploads nothing. A retried activity's save is the same owner
+    // as the attempt whose restic may still run in the world.
+    const run = await (options.dryRun ? save() : this.saving(attachment, `${place.world.handle.id}:${options.key}`, options, save))
       .finally(() => list && place.world.exec('rm', ['-f', '--', list], { cwd: place.world.handle.root }).catch(() => undefined));
     if (run.code !== 0) throw resticFailure(run, 'saving the resource');
     const summary = summaryOf(run.stdout);
