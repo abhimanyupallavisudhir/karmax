@@ -162,17 +162,19 @@ describe('separate waiting-world maintenance', () => {
     f.worlds.register({ kind: 'hetzner', capabilities: { remote: true }, parkable: true, open: async (handle: any) => ({ handle }),
       park, status: async () => parked ? 'parked' : 'ready' } as any);
     const restored = (await f.store.registerWorld({ ...f.handle, kind: 'hetzner', provider: 'hetzner', generation: 2 }, f.project.id)) as any;
-    const sameRun = async (runId: string) => {
-      (await f.store.patchTaskParams(f.task.id, { _workflowRunId: 'run' }));
+    // A task started straight from creation (an agent's create_task, a trigger) has no
+    // run pin; the platform then addresses its workflow id's only live run.
+    const sameRun = async (runId: string, pinned = true) => {
+      if (pinned) (await f.store.patchTaskParams(f.task.id, { _workflowRunId: 'run' }));
       vi.spyOn(Context, 'current').mockReturnValue({ heartbeat() {}, cancellationSignal: new AbortController().signal,
         info: { workflowExecution: { runId } } } as any);
     };
     return { ...f, hetznerPark: park, restored, sameRun };
   }
 
-  it('parks the world its own run restored, though the workflow still holds the one it created', async () => {
+  it.each([['pinned', true], ['unpinned', false]])('parks the world its own run restored, though the workflow still holds the one it created (%s)', async (_kind, pinned) => {
     const f = await moved();
-    await f.sameRun('run');
+    await f.sameRun('run', pinned);
     const paused = { ...f.view, waitingFor: { kind: 'timer' as const, detail: 'Waiting 30 min', until: Date.now() + 60_000 } };
     const fence = await f.publish(paused);
     await f.core.parkWaitingWorld(f.task.id, lifecyclePublication(paused), fence!);
@@ -193,9 +195,9 @@ describe('separate waiting-world maintenance', () => {
     expect(f.park).not.toHaveBeenCalled();
   });
 
-  it('suspends the world its own run restored when the task is cancelled', async () => {
+  it.each([['pinned', true], ['unpinned', false]])('suspends the world its own run restored when the task is cancelled (%s)', async (_kind, pinned) => {
     const f = await moved();
-    await f.sameRun('run');
+    await f.sameRun('run', pinned);
     await f.store.createRunnerPool({ id: 'test', organizationId: f.project.organizationId!, name: 'Test', provider: 'hetzner',
       mode: 'customer', capacity: { activeWorlds: 1, cpu: 2, memoryMb: 2048, gpu: 0 }, enabled: true });
     const lease = await f.store.requestWorldLease({ runnerPoolId: 'test', organizationId: f.project.organizationId!,
