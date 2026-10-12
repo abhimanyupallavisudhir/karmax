@@ -2933,6 +2933,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const modelProvider = canonicalModelProvider(args.accountCredentialProvider ?? credentialProvider(profile));
       const managedReservationMicros = fundingSource === 'managed'
         ? managedModelCostCeiling(modelProvider, profile.model) : undefined;
+      // What ran: tokens per task differ several-fold between efforts of one model.
+      const usageMetadata = { role: args.role, model: profile.model, ...(profile.effort ? { effort: profile.effort } : {}) };
       const finishUsage = async (completed: boolean | undefined) => {
         if (usageAdmissionId) {
           const usage = result?.usage ?? providerUsage;
@@ -2942,7 +2944,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             completedUsageEvents.push({ id: `usage:tokens:${usageAdmissionId}`, organizationId, projectId: args.task.projectId,
               taskId: args.taskId, worldId: args.worldHandle.id, provider: modelProvider,
               kind: 'agent.tokens', quantity, unit: 'token', costMicros: 0, fundingSource, costClassification: 'none',
-              startedAt: Date.now(), endedAt: Date.now(), metadata: { role: args.role, model: profile.model,
+              startedAt: Date.now(), endedAt: Date.now(), metadata: { ...usageMetadata,
                 metering: 'provider-reported', inputTokens: usage.inputTokens, outputTokens: usage.outputTokens,
                 cacheReadTokens: usage.cacheReadTokens ?? 0, cacheWriteTokens: usage.cacheWriteTokens ?? 0,
                 inputTokensIncludeCacheRead: usage.inputTokensIncludeCacheRead ?? false } });
@@ -2953,7 +2955,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               taskId: args.taskId, worldId: args.worldHandle.id, provider: modelProvider,
               kind: 'agent.cost', quantity: 0, unit: 'request', costMicros: actualized.costMicros,
               fundingSource, costClassification: actualized.classification,
-              startedAt: Date.now(), endedAt: Date.now(), metadata: { role: args.role, model: profile.model,
+              startedAt: Date.now(), endedAt: Date.now(), metadata: { ...usageMetadata,
                 ...actualized.metadata } });
           }
           // Completion and incurred/estimated cost actualization commit together:
@@ -3014,7 +3016,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             projectId: args.task.projectId, taskId: args.taskId, worldId: args.worldHandle.id,
             provider: modelProvider, kind: 'agent.request', quantity: 1, unit: 'request',
             costMicros: 0, fundingSource, costClassification: 'none', startedAt: Date.now(), endedAt: Date.now(),
-            metadata: { role: args.role, model: profile.model, costBasis: 'request-count-only' } }));
+            metadata: { ...usageMetadata, costBasis: 'request-count-only' } }));
         }
         // Remote subscription CLIs consume provider-world CPU/RAM, not host
         // capacity. API rails and local subprocesses retain the host admission
