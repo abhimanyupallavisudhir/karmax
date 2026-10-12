@@ -44,10 +44,11 @@ export function claudeModelCatalog(discovered: AvailableModel[]): AvailableModel
 /** Preserve the account's native picker, with current models available offline. */
 export function codexModelCatalog(discovered: AvailableModel[]): AvailableModel[] {
   return discovered.length ? discovered : [
-    { id: 'gpt-5.6-sol', isDefault: true },
+    { id: 'gpt-6.1-sol', isDefault: true },
     { id: 'gpt-6-astra' },
     { id: 'gpt-6-sol' },
     { id: 'gpt-6-luna' },
+    { id: 'gpt-5.6-sol' },
     { id: 'gpt-5.6-terra' },
     { id: 'gpt-5.6-luna' },
     { id: 'gpt-5.5' },

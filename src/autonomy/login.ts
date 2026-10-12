@@ -5,6 +5,7 @@ import { ConfigHomeManager, scrubbedEnv, isLoggedIn, isFullyAuthed, KARMAX_TOKEN
 import { Provider } from '../domain/types.js';
 import { trackProcess } from '../util/processes.js';
 import { localProviderCli } from '../agent/provider-cli.js';
+import { stripAnsi } from '../util/ansi.js';
 
 /**
  * Provider account login (SPEC §7.6, §7.3). Mints an isolated config home per
@@ -335,7 +336,7 @@ function captureLoginPrompt(
 
 /** Parse ANSI-decorated provider prompts without coupling the UI to CLI output. */
 export function parseLoginPrompt(output: string): Pick<LoginResult, 'loginUrl' | 'verificationCode' | 'requiresCode'> {
-  const text = output.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '');
+  const text = stripAnsi(output);
   const loginUrl = text.match(/https?:\/\/[^\s'"]+/)?.[0];
   const directCode = text.match(/(?:enter|user(?:_| )?)\s*code\s*[:=]\s*([A-Z0-9][A-Z0-9-]{3,})/i)?.[1];
   const deviceCode = text.match(/(?:one-time|verification|device)\s+code[\s\S]{0,160}?\b([A-Z0-9]{4,}(?:-[A-Z0-9]{3,})+)\b/i)?.[1];

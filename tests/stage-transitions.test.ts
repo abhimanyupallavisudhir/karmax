@@ -816,6 +816,9 @@ describe('task stage transitions', () => {
     expect(source?.forkSummaries).toEqual([expect.objectContaining({ id: fork.id, title: 'Fork', forkOf: [f.task.id],
       lastView: expect.objectContaining({ status: 'done' }) })]);
     expect(source?.parentTask).toBeUndefined();
+    expect(source?.forkSourceSummaries).toBeUndefined();
+    expect((await f.api.getTaskView(f.token, fork.id))?.forkSourceSummaries).toEqual([expect.objectContaining({ id: f.task.id,
+      title: f.task.title, forkOf: [], lastView: expect.objectContaining({ status: 'done' }) })]);
     expect((await f.api.getTaskView(f.token, child.id))?.parentTask).toEqual({ id: f.task.id, num: f.task.num, title: f.task.title });
   });
 

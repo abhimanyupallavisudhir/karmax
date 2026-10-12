@@ -131,8 +131,10 @@ describe('Claude Agent-SDK tool exposure (no drift)', () => {
   it('advertises exact permission elevation as a routed approval request', () => {
     const schema = TOOL_SCHEMAS.find((tool) => tool.name === 'request_permission')!;
     expect(schema).toBeDefined();
-    // No audience summons the lowest level that can grant it.
-    expect(schema.parameters.required).toEqual(['capabilities', 'reason']);
+    // No audience summons the lowest level that can grant it; a task_id (a task
+    // the agent created, held for what it could not grant) replaces capabilities.
+    expect(schema.parameters.required).toEqual(['reason']);
+    expect(schema.parameters.properties.task_id).toMatchObject({ type: 'string' });
     expect(schema.parameters.properties.capabilities).toMatchObject({
       type: 'array',
       minItems: 0,

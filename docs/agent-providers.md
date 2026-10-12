@@ -155,9 +155,39 @@ OpenCode. Profiles and task parameters do not have a second “Credential
 provider” setting.
 
 
+## October 12, 2026 Codex upgrade audit
+
+Codex is now **0.162.1** (from 0.156.1). With a ChatGPT login OpenAI refuses a
+model that the Codex client does not offer: a task set to `gpt-6.1-sol` failed
+with `400 … The 'gpt-6.1-sol' model is not supported when using Codex with a
+ChatGPT account`. On 0.156.1 the account's `model/list` did not include it either.
+GPT-6.1 Sol shipped on 2026-09-29, and Codex 0.161.0 added it (it is also the new
+default); 0.162.1 discovers it without credentials (`tests/models.test.ts`).
+
+- **The Compare models chart only offers models the Codex catalog lists.** It
+  used to map every OpenAI benchmark row to Codex, so it offered a model that was
+  newer than the pinned Codex. Now OpenAI rows need the organization's Codex
+  catalog (the account's discovery, else the offline list), like every vendor
+  except Anthropic.
+- Reviewed 0.157.0–0.162.1 release notes and diffed the generated app-server
+  protocol (`codex app-server generate-ts`). The changes Karmax touches are
+  additive: new `CodexErrorInfo` values (`flexUnavailable`, `tooManyDenials`,
+  open-ended strings; the limit/credential values Karmax classifies are
+  unchanged), optional `parentTurnId`/`rootTurnId` on `turn/start` and
+  `Turn.rootTurnId`, sub-agent `model`/`reasoningEffort` on thread items, and
+  `Turn.error` also set for interrupted turns (the adapter already reads it for
+  any non-completed status). Resume now includes the latest committed history,
+  and SQLite corruption is detected at startup. The real-binary lineage, resume,
+  fork, usage and history tests pass unchanged.
+- Codex logs `Codex could not find bubblewrap on PATH` at ERROR level, in colour,
+  even though Karmax runs it without Codex's sandbox (`dangerFullAccess`) and
+  Codex falls back to its bundled `bwrap`. The browser image and VM provisioning
+  now install `bubblewrap`, and failure messages strip terminal escape codes from
+  the stderr tail.
+
 ## September 23, 2026 harness upgrade audit
 
-The shipped versions are Codex **0.156.1** and Claude Agent SDK **0.3.281**
+The shipped versions were Codex **0.156.1** (now 0.162.1, above) and Claude Agent SDK **0.3.281**
 (paired with Claude Code **2.1.281**; see the September 24 note below). Both dependencies are exact pins: later
 harness changes require another compatibility review. The browser image pins
 match; existing images use the version-checked remote launcher fallback.
