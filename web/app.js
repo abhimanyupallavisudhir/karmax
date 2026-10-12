@@ -8641,6 +8641,7 @@ async function renderSeriesPage(rec) {
       </div></div>
       <div class="tp-foot" id="tp-foot"><div class="tp-foot-inner">
         <button class="btn" id="sd-runagain">Run again</button>
+        ${rec.params?.triggers?.length ? `<button class="btn ghost" id="sd-save-automation" title="Let every project in this organization add it from its automations">Save as automation</button>` : ''}
         <span style="flex:1"></span>
         <button class="btn primary" id="sd-save">Save changes</button>
       </div></div>
@@ -8653,6 +8654,13 @@ async function renderSeriesPage(rec) {
   wireScheduleBuilder(values);
   wireEventTrigger(rec.projectId);
   $('#tp-body').querySelectorAll('[data-runopen]').forEach((el) => wireTaskNav(el, () => el.dataset.runopen));
+  $('#sd-save-automation')?.addEventListener('click', async () => {
+    const name = prompt('Name it', rec.title.replace(/\{\{[^}]*\}\}/g, '').trim() || 'Automation');
+    if (!name) return;
+    const organizationId = projectById(rec.projectId)?.organizationId || 'org_personal';
+    try { await api(`/api/organizations/${encodeURIComponent(organizationId)}/automations`, { method: 'POST', body: JSON.stringify({ taskId: rec.id, name }) }); toast('Saved to the gallery'); }
+    catch (e) { toast(e.message, true); }
+  });
   $('#sd-runagain').addEventListener('click', async () => {
     try { await api(`/api/tasks/${rec.id}/run-again`, { method: 'POST', body: '{}' }); toast('New run started'); closeTask(); refreshTasks(); }
     catch (e) { toast(e.message, true); }
@@ -13049,7 +13057,10 @@ function taskActions(v) {
   const simple = acts.filter((a) => !a.args || a.args.length === 0);
   // Sub-tasks' files arriving before the agent's next turn: a message sent now waits for them.
   const refreshing = v.state?.refreshingResources && v.status === 'active'
-    ? `<button class="btn primary action-pending" disabled aria-busy="true" title="Sub-tasks’ files arrive before the agent’s next turn. Messages sent now are read then.">Bringing in sub-tasks’ data…</button>` : '';
+    ? `<button class="btn primary action-pending" disabled aria-busy="true" title="Sub-tasks’ files arrive before the agent’s next turn. Messages sent now are read then.">Bringing in sub-tasks’ data…</button>`
+    // A sub-task starts from this task's data, saved first: gigabytes take minutes.
+    : v.state?.preparingSubTask && v.status === 'active'
+      ? `<button class="btn primary action-pending" disabled aria-busy="true" title="A sub-task starts from this task’s data, so it is saved first.">${esc(stagingProgress()?.text || 'Saving data for a sub-task…')}</button>` : '';
   let html = `<div class="actions"${refreshing ? ' role="status" aria-live="polite"' : ''}>${refreshing}${biggerDiskButton(v)}`;
   let slot = 0; // digits 1–9 press the Nth ENABLED button (see the command registry)
   for (const a of simple) {
@@ -16235,7 +16246,25 @@ function eventSourceLabel(source, hooks) {
   return esc(source);
 }
 
-function projectEventsHtml(projectId, list, events) {
+const AUTOMATION_NEEDS = { github: ['Needs GitHub', 'Connect a GitHub repository to this project first'], chat: ['Needs a chat bot', 'Connect a chat bot below first'] };
+
+// Ready-made repeatable tasks: adding one creates an ordinary task you can edit.
+function automationsHtml(automations) {
+  const row = (a) => {
+    const need = a.missing?.length && !a.installed.length ? AUTOMATION_NEEDS[a.missing[0]] : null;
+    const action = a.installed.length
+      ? `<button class="btn sm ghost" data-pe-task="${esc(a.installed[0])}">Open</button>`
+      : `<button class="btn sm" data-auto-install="${esc(a.id)}"${need ? ` disabled title="${esc(need[1])}"` : ''}>Add</button>`;
+    return `<div class="setting-row" data-automation="${esc(a.id)}">
+    <span class="setting-label">${esc(a.name)} ${policyTip(a.summary || '')}</span>
+    <span class="setting-value setting-muted">${a.installed.length ? 'On' : need ? esc(need[0]) : ''}</span>
+    <span class="setting-actions">${action}${a.builtIn ? '' : `<button class="btn sm ghost" data-auto-delete title="Remove from the gallery">✕</button>`}</span></div>`;
+  };
+  return `<div class="section-h">Automations ${policyTip('Ready-made tasks that start themselves. Adding one creates a repeatable task you can change like any other. Save your own from a repeatable task’s page.')}</div>
+    <div class="setting-rows">${automations.map(row).join('')}</div>`;
+}
+
+function projectEventsHtml(projectId, list, events, automations = []) {
   const hooks = list.webhooks || [];
   const health = (h) => h.lastError && (!h.lastDeliveryAt || h.lastError.at > h.lastDeliveryAt)
     ? `<span class="warn" title="${esc(h.lastError.message)}">Refused one ${fmtAgo(h.lastError.at)}</span>`
@@ -16249,7 +16278,7 @@ function projectEventsHtml(projectId, list, events) {
     <span class="setting-value">${eventSourceLabel(e.source, hooks)}${e.subject ? ` · ${/^https?:/.test(e.subject) ? `<a href="${esc(e.subject)}" target="_blank" rel="noopener">${esc(e.subject.replace(/^https?:\/\/(www\.)?/, '').slice(0, 60))}</a>` : esc(e.subject.slice(0, 60))}` : ''}<span class="setting-sep">·</span>${eventOutcome(e)}</span>
     <span class="setting-actions setting-muted">${fmtAgo(e.receivedAt)}</span></summary>
     <pre class="pe-payload">${esc(JSON.stringify(e.payload, null, 2))}</pre></details>`;
-  return `<div class="section-h section-h-action"><span>Sources</span><span class="pe-add">
+  return `${automationsHtml(automations)}<div class="section-h section-h-action"><span>Sources</span><span class="pe-add">
       <button class="btn sm ghost" data-pe-new="webhook">＋ Webhook</button><button class="btn sm ghost" data-pe-new="chat">＋ Chat bot</button></span></div>
     <div id="pe-form"></div>
     <div class="setting-rows">${hooks.map(sourceRow).join('')}
@@ -16285,11 +16314,22 @@ async function hydrateProjectEvents(proj) {
   if (!box) return;
   const base = `/api/projects/${encodeURIComponent(proj.id)}`;
   const load = async () => {
-    let list, events;
+    let list, events, automations;
     try {
-      [list, events] = await Promise.all([api(`${base}/webhooks`), api(`${base}/events?limit=25`)]);
+      [list, events, { automations }] = await Promise.all([api(`${base}/webhooks`), api(`${base}/events?limit=25`), api(`${base}/automations`)]);
     } catch (e) { return paneError(box, e, load); }
-    box.innerHTML = projectEventsHtml(proj.id, list, events);
+    box.innerHTML = projectEventsHtml(proj.id, list, events, automations);
+    box.querySelectorAll('[data-auto-install]').forEach((b) => b.addEventListener('click', async () => {
+      b.disabled = true;
+      try { await api(`${base}/automations/${encodeURIComponent(b.dataset.autoInstall)}`, { method: 'POST', body: '{}' }); toast('Added'); refreshTasks(); load(); }
+      catch (e) { toast(e.message, true); b.disabled = false; }
+    }));
+    box.querySelectorAll('[data-auto-delete]').forEach((b) => b.addEventListener('click', async () => {
+      const row = b.closest('[data-automation]');
+      if (!confirm(`Remove “${row.querySelector('.setting-label').textContent.trim()}” from the gallery? Tasks already made from it stay.`)) return;
+      try { await api(`/api/organizations/${encodeURIComponent(proj.organizationId || 'org_personal')}/automations/${encodeURIComponent(row.dataset.automation)}`, { method: 'DELETE' }); load(); }
+      catch (e) { toast(e.message, true); }
+    }));
     const form = $('#pe-form');
     const copy = async (value) => { await copyToClipboard(value); toast('Copied'); };
     box.querySelectorAll('[data-hook-copy]').forEach((b) => b.addEventListener('click', () => copy(b.dataset.hookCopy)));
@@ -16322,10 +16362,9 @@ async function hydrateProjectEvents(proj) {
         button.disabled = true;
         try {
           const created = await api(`${base}/webhooks`, { method: 'POST', body: JSON.stringify({ name: `${CHAT_PLATFORM_LABELS[kind]} bot`, kind, credentials }) });
-          if ($('#pe-starts')?.checked) await api(`${base}/tasks`, { method: 'POST', body: JSON.stringify({
-            title: '{{text}}', prompt: 'Do what this chat message asks. Your final message is posted back to the chat.',
-            params: { repeatable: true, triggers: [{ kind: 'event', type: 'chat.mention', source: `chat:${created.hook.id}`, recurring: true,
-              concurrency: { key: '{{channel.id}}/{{thread}}', mode: 'tell' } }] } }) });
+          // The gallery's chat automation; a project that already has it keeps it.
+          if ($('#pe-starts')?.checked && !automations.find((a) => a.id === 'chat-requests')?.installed.length)
+            await api(`${base}/automations/chat-requests`, { method: 'POST', body: '{}' });
           if (created.verifyToken) { form.innerHTML = revealHtml([['Callback URL', created.url], ['Verify token', created.verifyToken]]); wireForm(); }
           else { toast(`${CHAT_PLATFORM_LABELS[kind]} bot connected`); load(); }
         } catch (err) { toast(err.message, true); button.disabled = false; }

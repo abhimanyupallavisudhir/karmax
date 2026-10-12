@@ -92,6 +92,15 @@ const core = proxyActivities<coreActivities>({
   startToCloseTimeout: '5 minutes',
   retry: { maximumAttempts: 3 },
 });
+// Preparing a sub-task saves the parent's writable project data, gigabytes
+// at times (pramana#22: 11 GB outlived the 5 minutes above). It heartbeats
+// with restic's progress, so only a dead worker times it out; a cancel waits
+// for the save in the world to stop.
+const childPreparation = proxyActivities<coreActivities>({
+  startToCloseTimeout: '12 hours', heartbeatTimeout: '2 minutes',
+  retry: { maximumAttempts: 3, initialInterval: '10 seconds' },
+  cancellationType: ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
+});
 // World provisioning is a long provider operation just like an agent turn. A
 // cancellation must wait until the activity has aborted its provider request
 // and released admission capacity; older pins retain the historical proxy.
@@ -768,6 +777,8 @@ async function softwareDevImpl(
   let applyingResources = false;
   let stagingResources = false;
   let refreshingResources = false;
+  /** Saving this task's data for a sub-task about to start. */
+  let preparingSubTask = false;
   let resourcesApplied = carried?.resourcesApplied ?? false;
   let humanPauseActive = !!recovery?.pausedForHuman;
   let humanPauseWake: { kind: 'retry' | 'followUp' | 'confirm' | 'openPr' | 'workflowChange'; role?: string } | undefined;
@@ -1289,6 +1300,7 @@ async function softwareDevImpl(
         ...(applyingResources ? { applyingResources: true } : {}),
         ...(stagingResources ? { stagingResources: true } : {}),
         ...(refreshingResources ? { refreshingResources: true } : {}),
+        ...(preparingSubTask ? { preparingSubTask: true } : {}),
         cancelled,
         ...(lifecycleReplacement ? { lifecycleReplacement: true } : {}),
         turnsSeen: seen,
@@ -3148,7 +3160,7 @@ async function softwareDevImpl(
     // Someone called it again after its last delivery: it answers that next.
     if (msgs.slice(participantSessions[key]!.seen).some((m) => addressedTo(m, key)))
       agentQueue = enqueueAgents(agentQueue, [key]);
-    if (turn.subTasks?.length) await spawnSubTasks(turn.subTasks);
+    if (turn.subTasks?.length) await spawnSubTasks(turn.subTasks, key);
     if (turn.subTaskResponses?.length) await applySubTaskResponses(turn.subTaskResponses);
     return { ...turn, ...(reply ? { reply } : {}) };
   }
@@ -3360,9 +3372,9 @@ Inspect the complete current diff and specifically compare its delta from the re
    *  off — and merges back into — THIS task's world branch, so `main` sees one merge at
    *  the top. Commit-on-spawn snapshots our work first (worktrees share commits, not the
    *  dirty tree) so children fork the current state. */
-  async function spawnSubTasks(list: SubTaskRequest[]) {
+  async function spawnSubTasks(list: SubTaskRequest[], requester = MAIN_AGENT) {
     await core.commitWork(world as any, `tavya: snapshot before sub-tasks for ${taskId}`);
-    for (const s of list) {
+    for (const [index, s] of list.entries()) {
       // Preserve recorded spawn/drop decisions during replay. New decisions have
       // no per-parent child cap; execution is governed by shared admission control.
       if (!patched('software-dev-unlimited-subtasks-v1')
@@ -3374,7 +3386,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         msgs.push({ id: `st-${msgs.length}`, role: 'user', text: `Sub-task "${s.title}" was NOT spawned: ${reason}.`, ts: msgs.length });
         continue;
       }
-      const childInput = await core.prepareChildTask({
+      const prepare = {
         parentTaskId: taskId,
         projectId: input.projectId,
         title: s.title,
@@ -3390,7 +3402,21 @@ Inspect the complete current diff and specifically compare its delta from the re
         // The child's own agent choice (PL-11). Only the activity's argument
         // changes, never a command, so recorded histories replay unchanged.
         ...(s.params ? { params: s.params } : {}),
-      });
+      };
+      let childInput: Awaited<ReturnType<coreActivities['prepareChildTask']>>;
+      // A sub-task that cannot be prepared (its parent's data cannot be saved,
+      // say) is the asking agent's to handle, not the end of this task (pramana#22).
+      if (patched('subtask-prepare-failure-to-agent-v1')) {
+        preparingSubTask = true;
+        await publish();
+        try { childInput = await childPreparation.prepareChildTask(prepare); }
+        catch (err) {
+          if (isCancellation(err)) throw err;
+          preparingSubTask = false;
+          await unpreparedSubTasks(s, list.slice(index + 1), err, requester);
+          break;
+        } finally { preparingSubTask = false; }
+      } else childInput = await core.prepareChildTask(prepare);
       subTaskIds.push(childInput.taskId);
       outstanding.add(childInput.taskId);
       const detached = patched('software-dev-detached-subtask-cancellation-v1');
@@ -3415,6 +3441,48 @@ Inspect the complete current diff and specifically compare its delta from the re
       trackChild(childInput.taskId, child);
     }
     await publish();
+  }
+
+  /** Tell the agent that asked for `failed` (and the requests after it in the
+   * same turn, not attempted) why it was not created: at its next turn, as a
+   * failed create_sub_task. Outside Do no turn of it follows (a Reviewer at
+   * Review), so the task escalates instead, as a failed publication does, and
+   * Retry prepares them again. */
+  async function unpreparedSubTasks(failed: SubTaskRequest, rest: SubTaskRequest[], err: unknown, requester: string) {
+    const reason = failureHasType(err, 'resource-kept-changing')
+      ? `This task's project data could not be saved for it to start from: ${innermostMessage(err)}` : innermostMessage(err);
+    const others = rest.length
+      ? ` ${rest.map((r) => `"${r.title}"`).join(', ')} ${rest.length === 1 ? 'was' : 'were'} not created either.` : '';
+    const what = `create_sub_task "${failed.title}" failed: no sub-task was created. ${reason}${/[.!?]$/.test(reason) ? '' : '.'}${others}`;
+    const text = `${what} Nothing was lost; call create_sub_task again once that is resolved.`;
+    await core.recordEvent(taskId, 'subtask.failed', { title: failed.title, error: reason, requester,
+      ...(rest.length ? { notAttempted: rest.map((r) => r.title) } : {}) });
+    const addressed = multiAgent && requester !== MAIN_AGENT;
+    msgs.push({ id: `st-${msgs.length}`, role: 'user', text, ts: msgs.length, ...(addressed ? { to: [agentSelector(requester)] } : {}) });
+    if (stage === 'do') {
+      if (addressed) agentQueue = enqueueAgents(agentQueue, [requester]);
+      await publish();
+      return;
+    }
+    const priorStage = stage;
+    stage = 'escalated';
+    status = 'blocked';
+    retryRequested = false;
+    error = `${what} Nothing was lost; Retry creates it again.`;
+    if (input.parentTaskId) {
+      waitingFor = { kind: 'parent' };
+      await notifyParent('blocked', error);
+    }
+    const seenAtEscalation = msgs.length;
+    await publish();
+    await waitServing(() => retryRequested || cancelled || (followUpWakesEscalation && mainUnreadSince(seenAtEscalation)));
+    waitingFor = undefined;
+    error = undefined;
+    stage = priorStage;
+    status = 'active';
+    if (cancelled || !retryRequested) return;
+    retryRequested = false;
+    await spawnSubTasks([failed, ...rest], requester);
   }
 
   /** Send the Do agent's answers down to the children they target (SPEC §5.3). */

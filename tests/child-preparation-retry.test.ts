@@ -82,7 +82,7 @@ it('records the parent\'s resource versions a child starts from', async () => {
   try {
     const child = await core.prepareChildTask({ parentTaskId: parent.id, projectId: project.id, title: 'Child', prompt: 'work',
       base: 'main', target: 'main', parentBranch: `karmax/${parent.id}`, project: {}, profiles: {} } as any);
-    expect(snapshotForks).toHaveBeenCalledWith(expect.objectContaining({ id: parent.id }));
+    expect(snapshotForks).toHaveBeenCalledWith(expect.objectContaining({ id: parent.id }), expect.anything());
     expect((await store.getTask(child.taskId))?.params._parentResources).toEqual({ resource_raw: 'revision_parent_copy' });
   } finally { vi.restoreAllMocks(); await store.close(); }
 });

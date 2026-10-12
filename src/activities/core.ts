@@ -14,7 +14,8 @@ import { turnPlatformRequest } from '../agent/platform-request.js';
 import { acquireConfirmLock } from './confirm-lock.js';
 import { scriptOutput, reviewFiles } from './result-bounds.js';
 import { mapBatches } from '../util/async-batch.js';
-import { ResourceConflictError, type ResourceRefresh, type StagingProgress } from '../world/resources.js';
+import { ResourceConflictError, type ResourceRefresh, type ResourceSaveProgress, type StagingProgress } from '../world/resources.js';
+import { ResourceKeptChangingError } from '../world/resource-conflict.js';
 import { timingEnabled, installationTiming, withTiming, timed } from '../timing/index.js';
 import { McpConnections } from '../mcp/connections/store.js';
 import { preserveReviewArtifacts, unsavedReviewArtifacts } from '../store/review-artifacts.js';
@@ -1557,6 +1558,112 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       if (retryFailure) throw error; // Separate maintenance retries without republishing status.
       (await record(taskId, 'world.warning', { warning: `could not park waiting world: ${error instanceof Error ? error.message : String(error)}` }));
     }
+  }
+
+  /** A sub-task's record and input: its parent's branch pushed and its
+   * writable project data saved for it to start from (prepareChildTask). */
+  async function prepareChild(args: PrepareChildArgs, work: { checkContinue: () => Promise<void>;
+    onProgress: (progress: ResourceSaveProgress) => void }): Promise<TaskInput> {
+    const parent = (await store.getTask(args.parentTaskId));
+    const currentProject = (await store.getProject(args.projectId));
+    const project = currentProject ? (await store.effectiveProjectConfig(currentProject)) : args.project;
+    const parentHandle = (await store.currentWorld(args.parentTaskId)) as WorldHandle | undefined;
+    if (parentHandle && isRemote(parentHandle.kind)) {
+      const parentWorld = await openWorld(parentHandle);
+      await enrollLiveProjectRepositories(parentWorld, args.parentTaskId);
+      // A project without repositories has no branch to seed: its child starts
+      // from an empty world like its parent (upgrade rehearsal, #421).
+      if (worldRepos(parentWorld.handle).length) {
+        const persisted = await publishTaskBranch(parentWorld, args.parentTaskId);
+        if (!persisted.pushed.length || persisted.skipped.length)
+          throw new Error(`could not seed the parent branch for the child task${persisted.skipped.length ? `: ${describePublishFailures(persisted)}` : ''}`);
+        (await record(args.parentTaskId, 'push.branch', {
+          branch: parentWorld.handle.branch, repos: persisted.pushed, reason: 'subtask-bootstrap',
+        }));
+      }
+    }
+    // The parent's copies of its writable resources, saved for the child to
+    // start from, as its branch was pushed above.
+    const resourceRevisions = parentHandle && deps.resources ? await deps.resources.snapshotForks(parentHandle, work) : {};
+    let idempotencyKey: string | undefined;
+    try {
+      const { info } = activityContext.current();
+      if (info.workflowExecution) idempotencyKey = `${args.parentTaskId}:${info.workflowExecution.runId}:${info.activityId}`;
+    } catch { /* Direct calls represent distinct requests. */ }
+    let child = (await store.createTask({
+      projectId: args.projectId,
+      idempotencyKey,
+      listId: parent?.listId,
+      title: args.title,
+      workflow: 'software-dev',
+      workflowVersion: parent?.workflowVersion ?? '1.0.0',
+      // The child's own agent fields first: its prompt and the parent's branch always win.
+      params: { ...args.params, prompt: args.prompt, base: args.base, target: args.target,
+        [REPOSITORY_BRANCHES_RESOLVED_PARAM]: true,
+        ...(Object.keys(resourceRevisions).length ? { [PARENT_RESOURCES_PARAM]: resourceRevisions } : {}),
+        // Stored so a replacement run of this child, which is rebuilt from
+        // its record, keeps the parent's profiles as this first run does.
+        ...(args.profiles ? { profiles: args.profiles } : {}) },
+      parentTaskId: args.parentTaskId,
+      createdBy: { kind: 'task-agent', taskId: args.parentTaskId, role: 'do' },
+      assignee: { kind: 'task-agent', taskId: args.parentTaskId, role: 'do' },
+    }));
+    (await record(args.parentTaskId, 'subtask.created', { childTaskId: child.id, title: args.title }));
+    // Least-privilege grant (SPEC §8.2): the child's delegation caps are attenuated
+    // by the parent's own grant, and its merge cap is scoped to EXACTLY the parent's
+    // branch (which the parent owns and merges into). If no branch is known,
+    // the child gets no merge capability — never a broad fallback.
+    let currentGrant = [
+      ...((parent?.params?._authorization as { capabilities?: string[] } | undefined)?.capabilities ?? args.parentGrant ?? []),
+      ...await new PermissionRequests(store, currentProject?.organizationId ?? 'org_personal').extensionCaps(args.parentTaskId, 'do'),
+    ];
+    const authorizer = (parent?.params?._authorization as { principal?: string } | undefined)?.principal;
+    const parentAvatarId = (parent?.params?.['agent:do'] as { avatarId?: string } | undefined)?.avatarId
+      ?? (authorizer?.startsWith('avatar:') ? authorizer.slice(7) : undefined);
+    if (parentAvatarId) {
+      const avatar = await store.getAvatar(parentAvatarId);
+      currentGrant = attenuate(currentGrant, avatar
+        ? await avatarAuthorizationCapabilities(store, deps.authorization, avatar, args.projectId) : []);
+    }
+    const delegation = attenuate(CHILD_TASK_CEILING, currentGrant);
+    const mergeBack = args.parentBranch && allows(currentGrant, `merge-into:${args.parentBranch}`)
+      ? [`merge-into:${args.parentBranch}`] : [];
+    const grant = [...delegation, ...mergeBack];
+    const parentAuthorization = parent?.params?._authorization as { delegationId?: string } | undefined;
+    const humanDelegation = parentAuthorization?.delegationId && deps.tokens
+      ? (await deps.tokens.deriveHumanDelegation(parentAuthorization.delegationId, {
+          taskId: child.id, projectId: args.projectId,
+          organizationId: (await store.getProject(args.projectId))?.organizationId,
+        }))
+      : undefined;
+    (await store.updateTaskParams(child.id, {
+      ...child.params,
+      _authorization: { profileId: 'inherited-child', principal: `task:${args.parentTaskId}`,
+        capabilities: grant, attenuated: true, ...(humanDelegation ? { delegationId: humanDelegation.id } : {}) },
+      ...(humanDelegation?.externalIdentities?.githubAccountId
+        ? { _githubAccountId: humanDelegation.externalIdentities.githubAccountId } : {}),
+    }));
+    child = (await store.getTask(child.id))!;
+    return {
+      taskId: child.id,
+      projectId: args.projectId,
+      title: args.title,
+      prompt: args.prompt,
+      base: args.base,
+      target: args.target,
+      parentTaskId: args.parentTaskId,
+      project,
+      profiles: args.profiles,
+      // Each agent field overrides the inherited profile for its role, as the
+      // same field does for create_task.
+      ...(args.params ? { agents: assembleTaskInput(manifest('software-dev')!, args.params, {
+        taskId: child.id, projectId: args.projectId, title: args.title, project }).agents } : {}),
+      resolveAgentEnabled: args.resolveAgentEnabled,
+      grant,
+      grantPrincipal: `task:${args.parentTaskId}`,
+      delegationId: humanDelegation?.id,
+      authorizationProfile: 'inherited-child',
+    };
   }
 
   return {
@@ -6192,106 +6299,35 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     },
 
     async prepareChildTask(args: PrepareChildArgs): Promise<TaskInput> {
-      const parent = (await store.getTask(args.parentTaskId));
-      const currentProject = (await store.getProject(args.projectId));
-      const project = currentProject ? (await store.effectiveProjectConfig(currentProject)) : args.project;
-      const parentHandle = (await store.currentWorld(args.parentTaskId)) as WorldHandle | undefined;
-      if (parentHandle && isRemote(parentHandle.kind)) {
-        const parentWorld = await openWorld(parentHandle);
-        await enrollLiveProjectRepositories(parentWorld, args.parentTaskId);
-        // A project without repositories has no branch to seed: its child starts
-        // from an empty world like its parent (upgrade rehearsal, #421).
-        if (worldRepos(parentWorld.handle).length) {
-          const persisted = await publishTaskBranch(parentWorld, args.parentTaskId);
-          if (!persisted.pushed.length || persisted.skipped.length)
-            throw new Error(`could not seed the parent branch for the child task${persisted.skipped.length ? `: ${describePublishFailures(persisted)}` : ''}`);
-          (await record(args.parentTaskId, 'push.branch', {
-            branch: parentWorld.handle.branch, repos: persisted.pushed, reason: 'subtask-bootstrap',
-          }));
-        }
-      }
-      // The parent's copies of its writable resources, saved for the child to
-      // start from, as its branch was pushed above.
-      const resourceRevisions = parentHandle && deps.resources ? await deps.resources.snapshotForks(parentHandle) : {};
-      let idempotencyKey: string | undefined;
-      try {
-        const { info } = activityContext.current();
-        if (info.workflowExecution) idempotencyKey = `${args.parentTaskId}:${info.workflowExecution.runId}:${info.activityId}`;
-      } catch { /* Direct calls represent distinct requests. */ }
-      let child = (await store.createTask({
-        projectId: args.projectId,
-        idempotencyKey,
-        listId: parent?.listId,
-        title: args.title,
-        workflow: 'software-dev',
-        workflowVersion: parent?.workflowVersion ?? '1.0.0',
-        // The child's own agent fields first: its prompt and the parent's branch always win.
-        params: { ...args.params, prompt: args.prompt, base: args.base, target: args.target,
-          [REPOSITORY_BRANCHES_RESOLVED_PARAM]: true,
-          ...(Object.keys(resourceRevisions).length ? { [PARENT_RESOURCES_PARAM]: resourceRevisions } : {}),
-          // Stored so a replacement run of this child, which is rebuilt from
-          // its record, keeps the parent's profiles as this first run does.
-          ...(args.profiles ? { profiles: args.profiles } : {}) },
-        parentTaskId: args.parentTaskId,
-        createdBy: { kind: 'task-agent', taskId: args.parentTaskId, role: 'do' },
-        assignee: { kind: 'task-agent', taskId: args.parentTaskId, role: 'do' },
-      }));
-      (await record(args.parentTaskId, 'subtask.created', { childTaskId: child.id, title: args.title }));
-      // Least-privilege grant (SPEC §8.2): the child's delegation caps are attenuated
-      // by the parent's own grant, and its merge cap is scoped to EXACTLY the parent's
-      // branch (which the parent owns and merges into). If no branch is known,
-      // the child gets no merge capability — never a broad fallback.
-      let currentGrant = [
-        ...((parent?.params?._authorization as { capabilities?: string[] } | undefined)?.capabilities ?? args.parentGrant ?? []),
-        ...await new PermissionRequests(store, currentProject?.organizationId ?? 'org_personal').extensionCaps(args.parentTaskId, 'do'),
-      ];
-      const authorizer = (parent?.params?._authorization as { principal?: string } | undefined)?.principal;
-      const parentAvatarId = (parent?.params?.['agent:do'] as { avatarId?: string } | undefined)?.avatarId
-        ?? (authorizer?.startsWith('avatar:') ? authorizer.slice(7) : undefined);
-      if (parentAvatarId) {
-        const avatar = await store.getAvatar(parentAvatarId);
-        currentGrant = attenuate(currentGrant, avatar
-          ? await avatarAuthorizationCapabilities(store, deps.authorization, avatar, args.projectId) : []);
-      }
-      const delegation = attenuate(CHILD_TASK_CEILING, currentGrant);
-      const mergeBack = args.parentBranch && allows(currentGrant, `merge-into:${args.parentBranch}`)
-        ? [`merge-into:${args.parentBranch}`] : [];
-      const grant = [...delegation, ...mergeBack];
-      const parentAuthorization = parent?.params?._authorization as { delegationId?: string } | undefined;
-      const humanDelegation = parentAuthorization?.delegationId && deps.tokens
-        ? (await deps.tokens.deriveHumanDelegation(parentAuthorization.delegationId, {
-            taskId: child.id, projectId: args.projectId,
-            organizationId: (await store.getProject(args.projectId))?.organizationId,
-          }))
-        : undefined;
-      (await store.updateTaskParams(child.id, {
-        ...child.params,
-        _authorization: { profileId: 'inherited-child', principal: `task:${args.parentTaskId}`,
-          capabilities: grant, attenuated: true, ...(humanDelegation ? { delegationId: humanDelegation.id } : {}) },
-        ...(humanDelegation?.externalIdentities?.githubAccountId
-          ? { _githubAccountId: humanDelegation.externalIdentities.githubAccountId } : {}),
-      }));
-      child = (await store.getTask(child.id))!;
-      return {
-        taskId: child.id,
-        projectId: args.projectId,
-        title: args.title,
-        prompt: args.prompt,
-        base: args.base,
-        target: args.target,
-        parentTaskId: args.parentTaskId,
-        project,
-        profiles: args.profiles,
-        // Each agent field overrides the inherited profile for its role, as the
-        // same field does for create_task.
-        ...(args.params ? { agents: assembleTaskInput(manifest('software-dev')!, args.params, {
-          taskId: child.id, projectId: args.projectId, title: args.title, project }).agents } : {}),
-        resolveAgentEnabled: args.resolveAgentEnabled,
-        grant,
-        grantPrincipal: `task:${args.parentTaskId}`,
-        delegationId: humanDelegation?.id,
-        authorizationProfile: 'inherited-child',
+      let context: ReturnType<typeof activityContext.current> | undefined;
+      try { context = activityContext.current(); } catch { /* direct tests */ }
+      // Saving the parent's data takes minutes for gigabytes: heartbeats say it is
+      // alive and how far it got, so only a dead worker times it out.
+      let progress: ResourceSaveProgress | undefined;
+      let reported = 0;
+      const beat = () => {
+        try { context?.heartbeat({ taskId: args.parentTaskId, operation: 'preparing-sub-task', ...(progress ? { progress } : {}) }); }
+        catch { /* activity completion/cancellation */ }
       };
+      beat();
+      const pulse = setInterval(beat, 5_000);
+      try { return await prepareChild(args, {
+        checkContinue: async () => { context?.cancellationSignal.throwIfAborted(); },
+        onProgress: (next) => {
+          progress = next;
+          beat();
+          if (Date.now() - reported < STAGING_PROGRESS_EVERY_MS) return;
+          reported = Date.now();
+          void record(args.parentTaskId, 'staging.progress', { ...next }).catch(() => undefined);
+        },
+      }); }
+      catch (error) {
+        // Saving again at once would meet the same writer: the agent is told
+        // what to stop (pramana#22), and tries again itself.
+        if (error instanceof ResourceKeptChangingError)
+          throw ApplicationFailure.create({ message: error.message, type: 'resource-kept-changing', nonRetryable: true });
+        throw error;
+      } finally { clearInterval(pulse); }
     },
 
     async autoResolve(args: {

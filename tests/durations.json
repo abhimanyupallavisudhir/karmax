@@ -505,6 +505,8 @@
   "tests/subscription-billing.test.ts": 1,
   "tests/subscription-gifts.browser.test.ts": 5.7,
   "tests/subtask-params-workflow.test.ts": 15,
+  "tests/subtask-preparation-workflow.test.ts": 24,
+  "tests/subtask-preparation.test.ts": 35.4,
   "tests/subtask-response-scope.test.ts": 0.2,
   "tests/super-administrator.test.ts": 1.5,
   "tests/swr-cache.test.ts": 0,

@@ -62,7 +62,7 @@ describe('chat bots', () => {
       from: { id: 7, first_name: 'Ada', is_bot: false }, chat: { id: -100, type: 'supergroup', title: 'Team', username: 'team' }, ...extra } });
     const result = await receive(hook.id, update(1, '@tavya_bot please fix the login page'), { 'x-telegram-bot-api-secret-token': secret });
     expect(result.events).toHaveLength(1);
-    expect(result.events[0]!.event).toMatchObject({ type: 'chat.mention', source: `chat:${hook.id}`, key: 'telegram:1', subject: 'https://t.me/team/501',
+    expect(result.events[0]!.event).toMatchObject({ type: 'chat.mention', source: `chat:${hook.id}`, key: 'telegram:1', subject: `chat:${hook.id}/-100/501`,
       payload: { platform: 'telegram', text: 'please fix the login page', author: { id: '7', name: 'Ada' }, channel: { id: '-100', name: 'Team' }, thread: '501' } });
     expect((await receive(hook.id, update(2, 'just chatting'), { 'x-telegram-bot-api-secret-token': secret })).events).toEqual([]);
     await expect(receive(hook.id, update(3, '@tavya_bot hi'), { 'x-telegram-bot-api-secret-token': 'wrong' })).rejects.toBeInstanceOf(WebhookAuthError);
@@ -72,6 +72,8 @@ describe('chat bots', () => {
     const reply = await receive(hook.id, update(4, 'also the signup page', { reply_to_message: { message_id: 900, from: { id: 42 } } }),
       { 'x-telegram-bot-api-secret-token': secret });
     expect(reply.events[0]!.event.payload).toMatchObject({ thread: '501', text: 'also the signup page' });
+    // …and so is about the same conversation: the run started by the first mention follows it.
+    expect(reply.events[0]!.event.subject).toBe(result.events[0]!.event.subject);
   });
 
   it('Slack: answers the URL check and reads signed app mentions only', async () => {
