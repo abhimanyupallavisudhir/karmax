@@ -63,6 +63,32 @@ describe('duration-balanced test shards', () => {
     const floor = Math.max(total / count, ...Object.values(durations));
     expect(Math.max(...loads)).toBeLessThan(floor * 1.05);
   });
+
+  // An unmeasured file weighs the median, under a second, however long it
+  // runs. Twice an unmeasured multi-minute file overloaded a shard past its
+  // timeout and cancelled CI for every PR whose plan put it there (CI #1750;
+  // #597: tests/resource-on-demand.test.ts, ~4 min).
+  it('has a measured duration for every test file', () => {
+    const durations = readDurations(repoRoot);
+    const unmeasured = ['tests', 'src'].flatMap((dir) =>
+      fs.readdirSync(path.join(repoRoot, dir), { recursive: true, encoding: 'utf8' })
+        .filter((file) => file.endsWith('.test.ts'))
+        .map((file) => `${dir}/${file.split(path.sep).join('/')}`))
+      .filter((file) => !(file in durations));
+    expect(unmeasured, `Measure them: npx vitest run --reporter=default ${unmeasured.join(' ')} | npm run test:durations`)
+      .toEqual([]);
+  });
+
+  // Runners vary up to twice in speed, so a shard must fit its timeout twice
+  // over. The suite outgrew five shards unnoticed: one carried ~24 min of
+  // files under a 25-minute timeout and cancelled every PR it landed on (#597).
+  it('fits each shard in half its timeout, so a runner twice as slow still finishes', () => {
+    const durations = readDurations(repoRoot);
+    const ci = parse(fs.readFileSync(path.join(repoRoot, '.github', 'workflows', 'ci.yml'), 'utf8'));
+    const count: number = ci.jobs.test.strategy.matrix.shard.length;
+    const loads = load(planShards(Object.keys(durations), durations, count), durations);
+    expect(Math.max(...loads)).toBeLessThan(ci.jobs.test['timeout-minutes'] * 60 / 2);
+  });
 });
 
 describe('recorded test durations', () => {
@@ -74,6 +100,7 @@ describe('recorded test durations', () => {
       ' ❯ src/world/merge.test.ts (12 tests | 1 failed) 2400ms',
       ' ✓ tests/git-pass-interop.test.ts (1 test) 10190ms',
       ' ✓ tests/git-pass-interop.test.ts (1 test) 11067ms',
+      ' \u001b[32m✓\u001b[39m tests/coloured.test.ts \u001b[2m(\u001b[22m\u001b[2m3 tests\u001b[22m\u001b[2m)\u001b[22m\u001b[32m 1500\u001b[2mms\u001b[22m\u001b[39m',
       'stderr | tests/postgres.test.ts > PostgreSQL cutover > imports',
     ].join('\n');
     expect(parseReporterDurations(log)).toEqual({
@@ -82,6 +109,7 @@ describe('recorded test durations', () => {
       'src/world/merge.test.ts': 2.4,
       // The gopass compatibility step runs this file a second time.
       'tests/git-pass-interop.test.ts': 11.1,
+      'tests/coloured.test.ts': 1.5,
     });
   });
 
