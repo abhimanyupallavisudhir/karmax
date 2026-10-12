@@ -113,3 +113,20 @@ describe('event triggers', () => {
     expect((await validateTriggers([{ kind: 'event', type: 'a.b', where: { x: { matches: '[' } } }]))[0]).toMatch(/regular expression/);
   });
 });
+
+describe('follows', () => {
+  const follow = (over: Record<string, unknown> = {}) => ({ taskId: 'task_run', ...over });
+  it('match by subject, type family, source and filter, never self echoes or the follower\'s own emits', async () => {
+    const { followMatches, validateFollow } = await import('../src/domain/project-events.js');
+    const comment = event({ type: 'github.issue_comment.created', subject: 'https://github.com/o/r/issues/42', payload: { comment: { body: 'also the footer' } } });
+    expect(followMatches(follow({ subject: 'https://github.com/o/r/issues/42' }), comment)).toBe(true);
+    expect(followMatches(follow({ subject: 'https://github.com/o/r/issues/43' }), comment)).toBe(false);
+    expect(followMatches(follow({ subject: 'https://github.com/o/r/issues/42', type: 'github.issues.*' }), comment)).toBe(false);
+    expect(followMatches(follow({ type: 'github.issue_comment.*', where: { 'comment.body': { contains: 'footer' } } }), comment)).toBe(true);
+    expect(followMatches(follow({ subject: 'https://github.com/o/r/issues/42' }), { ...comment, origin: 'self' })).toBe(false);
+    expect(followMatches(follow({ type: 'feed.item' }), event({ type: 'feed.item', source: 'task:task_run', origin: 'task' }))).toBe(false);
+    expect(validateFollow({})[0]).toMatch(/at least/);
+    expect(validateFollow({ type: 'bad type' })[0]).toMatch(/invalid event type/);
+    expect(validateFollow({ type: 'orders.*', where: { total: { in: [1] } } })).toEqual([]);
+  });
+});

@@ -122,4 +122,40 @@ describe('events in the console', () => {
     await expect.poll(async () => box.locator('[data-hook]').count()).toBe(0);
     expect(errors).toEqual([]);
   });
+
+  it('adds an automation from the gallery, and saves a repeatable task as one', async () => {
+    const { page, errors } = await open('/personal/factory/settings#project-events');
+    const box = page.locator('#project-events-box');
+    const row = (id: string) => box.locator(`[data-automation="${id}"]`);
+    await row('build-planned-issues').waitFor();
+    expect(await box.locator('[data-automation]').count()).toBe(4);
+    // Without a GitHub repository there is nothing for it to hear yet.
+    expect(await row('build-planned-issues').locator('[data-auto-install]').isDisabled()).toBe(true);
+    expect(await row('build-planned-issues').textContent()).toContain('Needs GitHub');
+    expect(await row('chat-requests').textContent()).toContain('Needs a chat bot');
+
+    const repository = await store.upsertRepository({ organizationId: project.organizationId ?? 'org_personal', provider: 'github', providerId: '99',
+      owner: 'acme', name: 'app', sshUrl: 'git@github.com:acme/app.git', defaultBranch: 'main', private: true, gitConnectionId: 'gc_1' });
+    await store.attachProjectRepository({ projectId: project.id, repositoryId: repository.id });
+    await page.reload();
+    await row('build-planned-issues').locator('[data-auto-install]:not([disabled])').click();
+    await expect.poll(async () => row('build-planned-issues').textContent()).toMatch(/On\s*Open/);
+    const series = (await store.listTasks(project.id)).find((task) => task.params?.template === 'build-planned-issues')!;
+    expect(series.params).toMatchObject({ repeatable: true, triggerState: 'armed', triggers: [{ type: 'github.issues.labeled' }] });
+    await page.screenshot({ path: path.join(dir, 'automations.png'), fullPage: false });
+    if (process.env.KARMAX_SCREENSHOT_DIR) await box.screenshot({ path: path.join(process.env.KARMAX_SCREENSHOT_DIR, 'automations.png') });
+
+    await row('build-planned-issues').locator('[data-pe-task]').click();
+    page.once('dialog', (dialog) => dialog.accept('Our planned issues'));
+    await page.locator('#sd-save-automation').click();
+    await expect.poll(async () => (await store.listAutomationTemplates(project.organizationId ?? 'org_personal')).map((a) => a.name)).toEqual(['Our planned issues']);
+    await page.goto(`${base}/personal/factory/settings#project-events`);
+    const own = box.locator('[data-automation^="atm_"]');
+    await own.waitFor();
+    expect(await own.textContent()).toContain('Our planned issues');
+    page.once('dialog', (dialog) => dialog.accept());
+    await own.locator('[data-auto-delete]').click();
+    await expect.poll(async () => box.locator('[data-automation]').count()).toBe(4);
+    expect(errors).toEqual([]);
+  });
 });

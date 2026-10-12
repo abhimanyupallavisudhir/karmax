@@ -198,6 +198,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/organizations\/[^/]+\/conversation-sharing$/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/projects\/[^/]+\/conversation-sharing$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/tasks\/[^/]+\/conversation-share$/.test(p)) return 'task:conversation:share';
+  // Automations an organization saves (src/domain/automations.ts) are shared knowledge, like its wiki.
+  if (/^\/api\/organizations\/[^/]+\/automations(?:\/[^/]+)?$/.test(p)) return 'organization:wiki:write';
   if (p === MCP_CLIENT_METADATA_PATH && read) return 'none';
   if (p === '/api/meta' || p === '/api/session' || p.startsWith('/api/health/')) return 'none';
   const appGrantRoute = appGrantRouteCapability(p);
@@ -373,6 +375,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/projects\/[^/]+\/events$/.test(p)) return read ? 'task:event:read' : 'task:create';
   if (p === '/api/events' && !read) return 'task:create';
   if (/^\/api\/project-events\/[^/]+$/.test(p)) return 'task:event:read';
+  if (/^\/api\/tasks\/[^/]+\/follows(?:\/[^/]+)?$/.test(p)) return read ? 'task:event:read' : 'task:conversation:message';
+  if (/^\/api\/projects\/[^/]+\/automations(?:\/[^/]+)?$/.test(p)) return read ? 'task:read' : 'task:create';
   if (/^\/api\/projects\/[^/]+\/webhooks$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/webhooks\/[^/]+(?:\/rotate)?$/.test(p)) return 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/search$/.test(p)) return 'task:read';
@@ -5146,6 +5150,36 @@ export class Gateway {
         const b = await this.body(req);
         const result = await api.emitProjectEvent(token, undefined, { type: b.type, key: b.key, subject: b.subject, occurredAt: b.occurredAt, payload: b.payload });
         return this.json(res, result.duplicate ? 200 : 201, result);
+      }
+      const automationsMatch = p.match(/^\/api\/projects\/([^/]+)\/automations(?:\/([^/]+))?$/);
+      if (automationsMatch) {
+        if (!automationsMatch[2] && method === 'GET') return this.json(res, 200, { automations: await api.listAutomations(token, automationsMatch[1]!) });
+        if (automationsMatch[2] && method === 'POST') return this.json(res, 201, await api.installAutomation(token, automationsMatch[1]!, automationsMatch[2]));
+      }
+      const savedAutomationsMatch = p.match(/^\/api\/organizations\/([^/]+)\/automations(?:\/([^/]+))?$/);
+      if (savedAutomationsMatch) {
+        if (!savedAutomationsMatch[2] && method === 'POST') {
+          const b = await this.body(req);
+          return this.json(res, 201, await api.saveAutomation(token, savedAutomationsMatch[1]!, { taskId: b.taskId, name: b.name, summary: b.summary }));
+        }
+        if (savedAutomationsMatch[2] && method === 'DELETE') {
+          await api.deleteAutomation(token, savedAutomationsMatch[1]!, savedAutomationsMatch[2]);
+          return this.json(res, 200, { ok: true });
+        }
+      }
+      const followsMatch = p.match(/^\/api\/tasks\/([^/]+)\/follows(?:\/([^/]+))?$/);
+      if (followsMatch) {
+        const taskId = followsMatch[1]!;
+        if (!followsMatch[2] && method === 'GET') return this.json(res, 200, { follows: await api.listTaskFollows(token, taskId) });
+        if (!followsMatch[2] && method === 'POST') {
+          const b = await this.body(req);
+          return this.json(res, 201, await api.followProjectEvents(token, taskId, { type: b.type, source: b.source, subject: b.subject,
+            where: b.where, includeSelf: b.includeSelf === true, once: b.once === true }));
+        }
+        if (followsMatch[2] && method === 'DELETE') {
+          await api.unfollowProjectEvents(token, taskId, followsMatch[2]);
+          return this.json(res, 200, { ok: true });
+        }
       }
       const projectEventMatch = p.match(/^\/api\/project-events\/([^/]+)$/);
       if (projectEventMatch && method === 'GET') return this.json(res, 200, await api.getProjectEvent(token, projectEventMatch[1]!));
