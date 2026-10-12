@@ -118,3 +118,35 @@ describe('fork picker across projects', () => {
     await ui.close();
   });
 });
+
+// The dependency picker opens on Active (`-is:archived`, spelled out in its box);
+// clearing the box reaches archived tasks too, like the task list.
+describe('dependency picker', () => {
+  it('starts on Active and lets an empty query include archived tasks', async () => {
+    const queries: string[] = [];
+    const ui = await consolePage({ path: '/org/workspace', api: signedIn(({ method, path }) => {
+      if (method === 'GET' && path.split('?')[0] === '/api/projects/p/search') {
+        queries.push(new URL(`http://x${path}`).searchParams.get('q') || '');
+        return { tasks: [] };
+      }
+      return undefined;
+    }) });
+    await ui.run('boot()');
+    await ui.page.locator('#main').waitFor();
+    await ui.run(`const box = document.createElement('div');
+      box.innerHTML = '<div id="dep-chips"></div><button type="button" id="dep-add">Add</button>';
+      document.getElementById('main').appendChild(box); wireDepPicker([], 'self')`);
+    await ui.page.locator('#dep-add').click();
+    const search = ui.page.locator('#pk-search');
+    await expect.poll(() => search.inputValue()).toBe('-is:archived ');
+    expect(await ui.page.locator('#pk-views .view-chip.active').innerText()).toBe('≡ Active');
+    await expect.poll(() => queries.at(-1)).toBe('-is:archived -is:run -is:series -is:draft');
+    await search.fill('');
+    await expect.poll(() => queries.at(-1)).toBe('-is:run -is:series -is:draft');
+    expect(await ui.page.locator('#pk-views .view-chip.active').count()).toBe(0);
+    await ui.page.locator('#pk-views [data-pkview="__active__"]').click();
+    await expect.poll(() => search.inputValue()).toBe('-is:archived');
+    expect(ui.errors).toEqual([]);
+    await ui.close();
+  });
+});

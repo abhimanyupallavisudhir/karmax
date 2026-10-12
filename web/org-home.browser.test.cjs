@@ -1,6 +1,6 @@
 // The organization home: `/` lands on `/<org>`, one task list over every
 // project that opens on "For me" (what waits on you, each row saying why), with
-// "All" one click away and bookmarkable, a project filter, project permalinks,
+// "Active" one click away and bookmarkable, the empty query showing archived tasks too, a project filter, project permalinks,
 // a composer that creates the task in a project you pick,
 // the logo as the way home, and a ☰ that folds the sidebar on a wide screen.
 // Run: node web/org-home.browser.test.cjs   (HOME_SCREENSHOTS=<dir> also saves screenshots)
@@ -27,6 +27,7 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
       task(4, 'q', 'Which push provider should we use?', { stage: 'do', status: 'waiting', waitingFor: { kind: 'human', reason: 'input' } }, { parentTaskId: 't5' }),
       task(5, 'q', 'Push notifications', { stage: 'do', status: 'active' }),
       task(6, 'p', 'Grant the deploy key for staging', { stage: 'do', status: 'waiting', waitingFor: { kind: 'human' }, approvalRequests: 1 }),
+      task(7, 'p', 'Old landing page', { stage: 'done', status: 'done' }, { params: { archived: true } }),
     ];
     const reasons = { t1: ['review-requested'], t2: ['draft'], t4: ['escalated'], t6: ['approval-requested', 'mentioned'] };
     const slug = { p: 'website', q: 'mobile-app' };
@@ -69,7 +70,9 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     assert.deepEqual(await rows(), ['t1', 't2', 't4', 't6'], 'what waits on you — a sub-task too — and your draft');
     assert.ok(searches.includes('for:me -is:archived'), `a for: search keeps sub-tasks: ${searches}`);
     const chips = await page.locator('.view-chip[data-view]').evaluateAll((els) => els.map((el) => el.dataset.view));
-    assert.deepEqual(chips.slice(0, 2), ['__for_me__', '__all__'], 'For me, then All');
+    assert.deepEqual(chips.slice(0, 2), ['__for_me__', '__active__'], 'For me, then Active');
+    assert.equal(await page.locator('.view-chip[data-view="__active__"]').innerText(), '≡ Active');
+    assert.equal(await page.locator('.view-chip[data-view="__active__"]').getAttribute('title'), '-is:archived', 'its query is on hover');
     assert.equal(await page.locator('#save-view').count(), 0, 'saved views belong to projects');
     assert.equal(await page.locator('#new-task-project').innerText(), 'website', 'new tasks start in a project you pick');
     const review = page.locator('[data-id="t1"] .chip.attention');
@@ -81,25 +84,34 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     assert.equal(await page.locator('#brand-home').getAttribute('href'), '/org', 'the logo links home');
     if (shots) await page.screenshot({ path: path.join(shots, 'home-desktop.png') });
 
-    // ── All is one click and a bookmark ───────────────────────────────────────
-    await page.locator('.view-chip[data-view="__all__"]').click();
-    await page.waitForFunction(() => location.search === '?q=');
+    // ── Active is one click and a bookmark ────────────────────────────────────
+    await page.locator('.view-chip[data-view="__active__"]').click();
+    await page.waitForFunction(() => location.search === '?q=-is:archived');
     await page.locator('[data-id="t3"]').waitFor();
     await settle();
-    assert.deepEqual(await rows(), ['t1', 't2', 't3', 't5', 't6'], 'All hides sub-tasks as before');
+    assert.deepEqual(await rows(), ['t1', 't2', 't3', 't5', 't6'], 'Active hides archived tasks, and sub-tasks as before');
+    assert.equal(await page.locator('#task-search').inputValue(), '-is:archived', 'the box shows the query');
     await page.reload();
     await page.locator('[data-id="t3"]').waitFor();
-    assert.equal(await activeView(), '__all__', 'a reloaded All stays All');
+    assert.equal(await activeView(), '__active__', 'a reloaded Active stays Active');
 
     // ── the project filter is a project: clause ──────────────────────────────
     await page.locator('#q-project').selectOption('mobile-app');
-    await page.waitForFunction(() => location.search === '?q=project:mobile-app');
+    await page.waitForFunction(() => location.search === '?q=-is:archived+project:mobile-app');
     await page.waitForFunction(() => !document.querySelector('[data-id="t3"]'));
     await settle();
     assert.deepEqual(await rows(), ['t2', 't5'], 'only that project');
-    assert.equal(await page.locator('#task-search').inputValue(), 'project:mobile-app');
+    assert.equal(await page.locator('#task-search').inputValue(), '-is:archived project:mobile-app');
     await page.locator('#q-project').selectOption('');
+    await page.waitForFunction(() => location.search === '?q=-is:archived');
+
+    // ── the empty query is every task, archived ones too ──────────────────────
+    await page.locator('#task-search').fill('');
     await page.waitForFunction(() => location.search === '?q=');
+    await page.locator('[data-id="t7"]').waitFor();
+    await settle();
+    assert.deepEqual(await rows(), ['t1', 't2', 't3', 't5', 't6', 't7'], 'nothing archived is hidden');
+    assert.equal(await page.locator('.view-chip.active').count(), 0, 'and no view is lit');
 
     // ── a row opens its project's task; the logo comes back home ──────────────
     await page.locator('[data-id="t1"] .row-link').click();
