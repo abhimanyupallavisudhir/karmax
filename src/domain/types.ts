@@ -1865,6 +1865,9 @@ export interface TaskInput {
   /** Existing branch to merge (merge-only workflow). */
   branch?: string;
   command?: string;
+  /** software-dev ≥1.29: when `command` (the task's own code) fails, `fail` ends the task;
+   *  `agent` hands it to the Do agent with the output. */
+  onCommandFailure?: 'fail' | 'agent';
   parentTaskId?: string;
   /** Resolved profile ids per role. */
   profiles?: Record<string, string>;
@@ -1985,6 +1988,10 @@ export interface TaskContinuation {
     confirmed: boolean;
     retryRequested: boolean;
     manualEscalationRequested: boolean;
+    /** v1.29: the task's command already ran in this run of the task. */
+    commandRan?: boolean;
+    /** v1.29: it finished cleanly with nothing to review. */
+    commandUnchanged?: boolean;
     resourcesApplied: boolean;
   };
   manualPrConfirmer?: string;

@@ -6,14 +6,20 @@ import type { TokenAuthority } from './tokens.js';
 import {
   normalizeTriggers,
   eventMatchesEventTrigger,
+  projectEventMatchesTrigger,
   statusSatisfiesDependency,
   dependencyMet,
   nextCronFire,
   validateTriggers,
   LIFECYCLE_EVENT,
   type DependencyTrigger,
+  type EventTrigger,
   type ScheduleTrigger,
 } from '../domain/triggers.js';
+import {
+  DEFAULT_MAX_RUNS_PER_HOUR, MAX_EVENT_HOPS, renderTemplate, triggerContext, triggerMessage,
+  type ProjectEvent, type ProjectEventClaim, type ProjectEventClaimState, type TriggerContext,
+} from '../domain/project-events.js';
 
 /**
  * The trigger dispatcher (SPEC §3.3). Triggers gate *when* a task's workflow
@@ -53,6 +59,16 @@ import {
  * once before arming the next timer. Exactly once, not once per missed
  * occurrence: a nightly report that slept through a week's downtime wants today's
  * run, not seven simultaneous ones.
+ *
+ * **Project events are delivered one by one, never coalesced.** An outside
+ * occurrence (a GitHub delivery, an incoming webhook, an event a task emitted)
+ * is a row in the store's inbox before anyone is told about it. Each matching
+ * armed task gets at most one run per event — the `(event, task)` claim is
+ * unique in the database, so a redelivery, a second process or a retry after a
+ * crash cannot start another — and that run receives the event. A claim that
+ * cannot start yet (dependencies, a queued concurrency slot, the hourly limit,
+ * a failed start) is `deferred` and retried by the inbox sweep, oldest event
+ * first; the sweep also offers events another process recorded.
  */
 
 export interface TriggerSchedulerDeps {
@@ -63,7 +79,11 @@ export interface TriggerSchedulerDeps {
    * itself (one-shot); `clone` spawns a fresh copy that runs now and leaves the
    * armed template in place (recurring — cron, or a re-arming event trigger).
    */
-  fire: (taskId: string, mode: 'self' | 'clone') => Promise<unknown>;
+  fire: (taskId: string, mode: 'self' | 'clone', trigger?: TriggerContext) => Promise<unknown>;
+  /** Give an unfinished run a further event of its concurrency key (`tell`). */
+  tell?: (runId: string, trigger: TriggerContext) => Promise<unknown>;
+  /** An event started a run or was told to one (a chat bot answers in its thread). */
+  announce?: (event: ProjectEvent, runId: string, how: 'started' | 'told') => Promise<unknown>;
   /** Injectable clock/timers (tests drive them; prod uses wall-clock). */
   now?: () => number;
   setTimer?: (fn: () => void, ms: number) => unknown;
@@ -72,15 +92,31 @@ export interface TriggerSchedulerDeps {
   /** How often armed dependency triggers are re-derived from the store
    *  (default one minute; `0` disables — tests that count store reads). */
   reconcileMs?: number;
+  /** How often the project-event inbox is swept (default 15 s; `0` disables —
+   *  tests call `sweepProjectEvents()` themselves). */
+  inboxSweepMs?: number;
+}
+
+/** `tell`: the event reaches the run's agent as a message, with a bounded
+ *  credential like a start. */
+export function createTriggerTell(api: Pick<KarmaxApi, 'postTaskMessage'>, tokens: TokenAuthority): NonNullable<TriggerSchedulerDeps['tell']> {
+  return async (runId, trigger) => {
+    const { token } = (await tokens.mintPrincipal('system:triggers', ['*'], undefined, 10 * 60_000));
+    try {
+      return await api.postTaskMessage(token, runId, { text: triggerMessage(trigger) });
+    } finally {
+      (await tokens.revoke(token));
+    }
+  };
 }
 
 /** The dispatcher outlives principal-token TTLs. Give each start its own bounded
  * credential and release it once the API operation completes. */
 export function createTriggerFire(api: Pick<KarmaxApi, 'fireTriggeredTask'>, tokens: TokenAuthority): TriggerSchedulerDeps['fire'] {
-  return async (taskId, mode) => {
+  return async (taskId, mode, trigger) => {
     const { token } = (await tokens.mintPrincipal('system:triggers', ['*'], undefined, 10 * 60_000));
     try {
-      return await api.fireTriggeredTask(token, taskId, mode);
+      return await api.fireTriggeredTask(token, taskId, mode, trigger);
     } finally {
       (await tokens.revoke(token));
     }
@@ -121,6 +157,12 @@ const MAX_CATCHUP_STEPS = 20_000;
 /** The dependency safety net's period: the longest a missed lifecycle event can
  *  delay a dependent. Each pass costs one indexed read per armed dependency. */
 const DEPENDENCY_RECONCILE_MS = 60_000;
+const INBOX_SWEEP_MS = 15_000;
+/** A claim still `pending` this long belongs to a start that never finished. */
+const STALE_PENDING_MS = 10 * 60_000;
+/** A failed start is retried no sooner than this. */
+const FAILED_START_RETRY_MS = 60_000;
+const FAILED_START = 'could not start';
 
 export class TriggerScheduler {
   private armed = new Map<string, ArmedEntry>();
@@ -130,6 +172,10 @@ export class TriggerScheduler {
   private versions = new Map<string, number>();
   private unsub?: () => void;
   private reconcileTimer?: unknown;
+  private inboxTimer?: unknown;
+  /** Project events are offered only once every armed task is registered:
+   *  one offered earlier would be marked dispatched without reaching them. */
+  private started = false;
   private now: () => number;
   private setTimer: (fn: () => void, ms: number) => unknown;
   private clearTimer: (h: unknown) => void;
@@ -177,6 +223,10 @@ export class TriggerScheduler {
     }
     if (this.epoch !== epoch) return;
     this.scheduleDependencyReconcile(epoch);
+    this.started = true;
+    await this.sweepProjectEvents();
+    if (this.epoch !== epoch) return;
+    this.scheduleInboxSweep(epoch);
     const n = this.armed.size;
     if (n) this.log(`trigger dispatcher armed ${n} task(s)`);
   }
@@ -238,10 +288,13 @@ export class TriggerScheduler {
 
   async stop(): Promise<void> {
     this.epoch++;
+    this.started = false;
     this.unsub?.();
     this.unsub = undefined;
     if (this.reconcileTimer !== undefined) this.clearTimer(this.reconcileTimer);
     this.reconcileTimer = undefined;
+    if (this.inboxTimer !== undefined) this.clearTimer(this.inboxTimer);
+    this.inboxTimer = undefined;
     for (const e of this.armed.values()) for (const t of e.timers) this.clearTimer(t);
     this.armed.clear();
     await this.eventTail;
@@ -411,6 +464,179 @@ export class TriggerScheduler {
       }
     }
     return advanced;
+  }
+
+  // ─── Project events (the inbox) ────────────────────────────────────────────
+
+  /** A project event was recorded in this process: offer it now. Events from
+   *  other processes, and any this misses, arrive through the sweep. */
+  projectEventRecorded(event: ProjectEvent): void {
+    if (!this.started) return;
+    this.enqueue(() => this.dispatchProjectEvent(event), 'project event');
+  }
+
+  /** Resolves once queued event work has run (tests, shutdown). */
+  async drain(): Promise<void> {
+    let tail: Promise<void>;
+    do { tail = this.eventTail; await tail; } while (tail !== this.eventTail);
+  }
+
+  /** Offer undispatched events, recover interrupted starts and retry deferred
+   *  claims. Serialized with event routing. */
+  sweepProjectEvents(): Promise<void> {
+    if (!this.started) return Promise.resolve();
+    return this.enqueue(() => this.sweep(), 'project event sweep');
+  }
+
+  private enqueue(work: () => Promise<void>, what: string): Promise<void> {
+    const epoch = this.epoch;
+    const next = this.eventTail.then(() => (this.epoch === epoch ? work() : undefined));
+    this.eventTail = next.catch((error) => this.log(`${what} failed: ${error instanceof Error ? error.message : String(error)}`));
+    return this.eventTail;
+  }
+
+  private scheduleInboxSweep(epoch: number): void {
+    const every = this.deps.inboxSweepMs ?? INBOX_SWEEP_MS;
+    if (!(every > 0)) return;
+    this.inboxTimer = this.setTimer(async () => {
+      if (this.epoch !== epoch) return;
+      await this.sweepProjectEvents();
+      if (this.epoch === epoch) this.scheduleInboxSweep(epoch);
+    }, every);
+  }
+
+  private async dispatchProjectEvent(event: ProjectEvent): Promise<void> {
+    for (const entry of this.armed.values()) {
+      if (entry.fired || entry.task.projectId !== event.projectId || this.armed.get(entry.task.id) !== entry) continue;
+      const trigger = this.projectEventTrigger(entry, event);
+      if (trigger) await this.offerProjectEvent(entry, trigger, event);
+    }
+    await this.deps.store.markProjectEventDispatched(event.id, this.now());
+  }
+
+  private projectEventTrigger(entry: ArmedEntry, event: ProjectEvent): EventTrigger | undefined {
+    return entry.triggers.find((t): t is EventTrigger => t.kind === 'event' && projectEventMatchesTrigger(t, event));
+  }
+
+  private async sweep(): Promise<void> {
+    for (const event of await this.deps.store.undispatchedProjectEvents(100)) await this.dispatchProjectEvent(event);
+    const now = this.now();
+    for (const claim of await this.deps.store.projectEventClaimsInState('pending', { updatedBefore: now - STALE_PENDING_MS })) {
+      const runId = await this.deps.store.projectEventRun(claim.taskId, claim.eventId);
+      await this.deps.store.updateProjectEventClaim(claim.eventId, claim.taskId, ['pending'], runId
+        ? { state: 'started', runId, reason: null, updatedAt: now }
+        : { state: 'deferred', reason: 'its start was interrupted', updatedAt: now });
+    }
+    for (const claim of await this.deps.store.projectEventClaimsInState('deferred')) {
+      if (claim.reason?.startsWith(FAILED_START) && now - claim.updatedAt < FAILED_START_RETRY_MS) continue;
+      const entry = this.armed.get(claim.taskId);
+      if (!entry || entry.fired) {
+        const task = await this.deps.store.taskMetadata(claim.taskId);
+        if (task?.params?.triggerState !== 'armed')
+          await this.settleClaim(claim, 'skipped', 'the task is no longer waiting for events');
+        continue;
+      }
+      const event = await this.deps.store.getProjectEvent(claim.eventId);
+      const trigger = event && this.projectEventTrigger(entry, event);
+      if (!event || !trigger) { await this.settleClaim(claim, 'skipped', 'the task no longer reacts to this event'); continue; }
+      await this.offerProjectEvent(entry, trigger, event, claim);
+    }
+  }
+
+  private async settleClaim(claim: ProjectEventClaim, state: ProjectEventClaimState, reason: string): Promise<void> {
+    await this.deps.store.updateProjectEventClaim(claim.eventId, claim.taskId, [claim.state], { state, reason, updatedAt: this.now() });
+  }
+
+  /**
+   * Decide what one event does for one armed task and record it atomically
+   * (both stores serialize transactions), then start the run if it may start.
+   * `deferred` is the claim being retried; without it the pair must be new.
+   */
+  private async offerProjectEvent(entry: ArmedEntry, trigger: EventTrigger, event: ProjectEvent, deferred?: ProjectEventClaim): Promise<void> {
+    const taskId = entry.task.id;
+    const concurrencyKey = trigger.concurrency ? renderTemplate(trigger.concurrency.key ?? '', event.payload, 300) : undefined;
+    const verdict = await this.deps.store.transaction(async () => {
+      const decided = await this.projectEventVerdict(entry, trigger, event, concurrencyKey);
+      const now = this.now();
+      if (deferred) {
+        if (decided.state === 'deferred' && decided.reason === deferred.reason) return undefined;
+        const moved = await this.deps.store.updateProjectEventClaim(event.id, taskId, ['deferred'],
+          { state: decided.state, reason: decided.reason ?? null, concurrencyKey: concurrencyKey ?? null, updatedAt: now });
+        return moved ? decided : undefined;
+      }
+      const claimed = await this.deps.store.claimProjectEvent({ eventId: event.id, taskId, state: decided.state, reason: decided.reason,
+        concurrencyKey, receivedAt: event.receivedAt, updatedAt: now });
+      return claimed ? decided : undefined;
+    });
+    if (verdict?.state === 'pending' && verdict.tell) await this.tellEventRun(entry, event, verdict.tell, concurrencyKey);
+    else if (verdict?.state === 'pending') await this.startEventRun(entry, event, concurrencyKey);
+  }
+
+  private async projectEventVerdict(entry: ArmedEntry, trigger: EventTrigger, event: ProjectEvent, concurrencyKey: string | undefined):
+    Promise<{ state: ProjectEventClaimState; reason?: string; tell?: string }> {
+    if (event.hops > MAX_EVENT_HOPS) return { state: 'skipped', reason: `stopped a loop: more than ${MAX_EVENT_HOPS} event-to-run steps` };
+    const dependencies = entry.triggers.filter((t): t is DependencyTrigger => t.kind === 'dependency');
+    if (!dependencies.every((t) => dependencyMet(t, entry.satisfiedDeps))) return { state: 'deferred', reason: 'waiting for its dependencies' };
+    const slot = concurrencyKey !== undefined ? await this.deps.store.projectEventSlot(entry.task.id, concurrencyKey) : undefined;
+    if (slot) {
+      const mode = trigger.concurrency?.mode ?? 'skip';
+      if (mode === 'tell' && this.deps.tell) {
+        return slot.runId ? { state: 'pending', tell: slot.runId } : { state: 'deferred', reason: 'waiting for its run to start' };
+      }
+      return mode === 'queue' || mode === 'tell'
+        ? { state: 'deferred', reason: 'queued behind an unfinished run' }
+        : { state: 'skipped', reason: 'a run for it was already unfinished' };
+    }
+    const limit = trigger.maxPerHour ?? DEFAULT_MAX_RUNS_PER_HOUR;
+    if (await this.deps.store.projectEventRunsSince(entry.task.id, this.now() - 3600_000) >= limit)
+      return { state: 'deferred', reason: `waiting for its limit of ${limit} runs an hour` };
+    return { state: 'pending' };
+  }
+
+  private async tellEventRun(entry: ArmedEntry, event: ProjectEvent, runId: string, concurrencyKey: string | undefined): Promise<void> {
+    const taskId = entry.task.id;
+    try {
+      await this.deps.tell!(runId, triggerContext(event, concurrencyKey));
+      await this.deps.store.updateProjectEventClaim(event.id, taskId, ['pending'],
+        { state: 'told', runId, reason: null, updatedAt: this.now() });
+      this.announce(event, runId, 'told');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await this.deps.store.updateProjectEventClaim(event.id, taskId, ['pending'],
+        { state: 'deferred', reason: `${FAILED_START}: ${message}`.slice(0, 300), updatedAt: this.now() });
+    }
+  }
+
+  /** Best effort and off the dispatch path: an answer never holds up an event. */
+  private announce(event: ProjectEvent, runId: string, how: 'started' | 'told'): void {
+    if (!this.deps.announce) return;
+    this.track(Promise.resolve().then(() => this.deps.announce!(event, runId, how))
+      .catch((error) => this.log(`announcing event ${event.id} failed: ${error instanceof Error ? error.message : String(error)}`)));
+  }
+
+  private async startEventRun(entry: ArmedEntry, event: ProjectEvent, concurrencyKey: string | undefined): Promise<void> {
+    const taskId = entry.task.id;
+    const repeatable = !!entry.task.params?.repeatable;
+    if (!repeatable) {
+      entry.fired = true;
+      for (const timer of entry.timers) this.clearTimer(timer);
+      entry.timers = [];
+    }
+    try {
+      const started = await this.deps.fire(taskId, repeatable ? 'clone' : 'self', triggerContext(event, concurrencyKey));
+      const runId = (started as { startedTaskId?: string } | undefined)?.startedTaskId;
+      await this.deps.store.updateProjectEventClaim(event.id, taskId, ['pending'],
+        { state: 'started', runId: runId ?? null, reason: null, updatedAt: this.now() });
+      if (!repeatable && this.armed.get(taskId) === entry) this.disarm(taskId);
+      this.log(`event ${event.type} started ${repeatable ? `a run of ${taskId}` : taskId}`);
+      if (runId) this.announce(event, runId, 'started');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!repeatable && this.armed.get(taskId) === entry) entry.fired = false;
+      await this.deps.store.updateProjectEventClaim(event.id, taskId, ['pending'],
+        { state: 'deferred', reason: `${FAILED_START}: ${message}`.slice(0, 300), updatedAt: this.now() });
+      this.log(`event ${event.type} could not start ${taskId}: ${message}`);
+    }
   }
 
   // ─── Firing ────────────────────────────────────────────────────────────────

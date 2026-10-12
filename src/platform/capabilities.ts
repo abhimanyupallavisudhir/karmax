@@ -277,7 +277,7 @@ export function effectiveAllows(ceiling: Capability[], grantor: Capability[], re
 
 /** The capabilities a tool requires to be invoked (used by the platform MCP). */
 export const TOOL_CAPABILITY: Record<string, Capability> = {
-  create_task: 'task:create', edit_task: 'task:edit', delete_task: 'task:delete',
+  create_task: 'task:create', edit_task: 'task:edit', delete_task: 'task:delete', emit_event: 'task:create',
   create_sub_task: 'task:create', respond_to_sub_task: 'task:signal', wait_for_subtasks: 'task:read',
   raise_to_parent: 'task:signal', create_review_info: 'task:review:write', signal_completion: 'task:signal',
   escalate_to_human: 'task:escalate', request_permission: 'task:escalate',
