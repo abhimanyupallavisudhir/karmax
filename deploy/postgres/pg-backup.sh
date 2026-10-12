@@ -182,12 +182,23 @@ cmd_restore() {
     [ -z "$target" ] || echo "recovery_target_time = '$target'"
   } >> "$PGDATA/postgresql.auto.conf"
   touch "$PGDATA/recovery.signal"
+  # Recovery refuses to start below the primary's max_connections and the
+  # other limits a standby must match (the primary's come from its memory
+  # cap, e.g. KARMAX_POSTGRES_MAX_CONNECTIONS=150 against the default 100),
+  # so start with the values the base backup's control file recorded.
+  local limits
+  limits=$(pg_controldata "$PGDATA" | awk -F': *' '
+    /^max_connections setting/ { printf " -c max_connections=%s", $2 }
+    /^max_worker_processes setting/ { printf " -c max_worker_processes=%s", $2 }
+    /^max_wal_senders setting/ { printf " -c max_wal_senders=%s", $2 }
+    /^max_prepared_xacts setting/ { printf " -c max_prepared_transactions=%s", $2 }
+    /^max_locks_per_xact setting/ { printf " -c max_locks_per_transaction=%s", $2 }')
   # Its own socket and no TCP for this start only: the copy cannot collide
   # with, or be reached as, the server it came from.
   local sock; sock=$(mktemp -d)
   export PGHOST=$sock
   echo "karmax-pg-backup: replaying WAL${target:+ to $target}"
-  if ! pg_ctl -D "$PGDATA" -w -t 3600 -l "$PGDATA/restore.log" -o "-c listen_addresses='' -c unix_socket_directories='$sock'" start; then
+  if ! pg_ctl -D "$PGDATA" -w -t 3600 -l "$PGDATA/restore.log" -o "-c listen_addresses='' -c unix_socket_directories='$sock'$limits" start; then
     tail -n 30 "$PGDATA/restore.log" >&2; die 'the restored server did not start'
   fi
   until [ "$(psql -XAtc 'SELECT pg_is_in_recovery()')" = f ]; do sleep 2; done

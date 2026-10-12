@@ -138,17 +138,20 @@ export function extractMimeText(raw: string): string {
   if (headerEnd < 0) return raw;
   const headers = raw.slice(0, headerEnd);
   const body = raw.slice(headerEnd).replace(/^\r?\n\r?\n/, '');
-  const contentType = /content-type:\s*([^\r\n;]+)(;[^\r\n]*(?:\r?\n[ \t][^\r\n]*)*)?/i.exec(headers);
+  // Anchored to a line's start: a relay's DKIM/ARC signature names the signed
+  // headers in its h= list (`h=from:to:content-transfer-encoding:content-type`),
+  // and an unanchored match there left Cloudflare-routed mail undecoded.
+  const contentType = /^content-type:\s*([^\r\n;]+)(;[^\r\n]*(?:\r?\n[ \t][^\r\n]*)*)?/im.exec(headers);
   const type = contentType?.[1]?.trim().toLowerCase() ?? 'text/plain';
   const params = (contentType?.[2] ?? '').replace(/\r?\n[ \t]/g, ' ');
   if (type.startsWith('multipart/')) {
     const boundary = /boundary\s*=\s*"?([^";\r\n]+)"?/i.exec(params)?.[1];
     if (!boundary) return body;
     const parts = body.split(new RegExp(`--${boundary.replace(/[.*+?^${'{'}}()|[\\]\\\\]/g, '\\$&')}(?:--)?\r?\n?`)).filter((p) => p.trim());
-    const scored = parts.map((p) => ({ text: extractMimeText(p.replace(/^\r?\n/, '')), plain: /content-type:\s*text\/plain/i.test(p) || !/content-type:/i.test(p) }));
+    const scored = parts.map((p) => ({ text: extractMimeText(p.replace(/^\r?\n/, '')), plain: /^content-type:\s*text\/plain/im.test(p) || !/^content-type:/im.test(p) }));
     return (scored.find((s) => s.plain && s.text.trim()) ?? scored.find((s) => s.text.trim()))?.text ?? '';
   }
-  const encoding = /content-transfer-encoding:\s*([^\r\n]+)/i.exec(headers)?.[1]?.trim().toLowerCase();
+  const encoding = /^content-transfer-encoding:\s*([^\r\n]+)/im.exec(headers)?.[1]?.trim().toLowerCase();
   let decoded = body;
   if (encoding === 'base64') {
     try {
