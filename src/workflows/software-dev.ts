@@ -202,6 +202,8 @@ export const agentTurnStateSignal = defineSignal<[{
 }]>(SIG_AGENT_TURN_STATE);
 /** A child raises UP to its parent when it reaches a decision point (SPEC §5.3). */
 const REPLY_TO_SPEAKERS = 'software-dev-reply-to-speakers-v1';
+/** A top-level reply to people that no human wait carries (a pause, sub-tasks). */
+const UNASKED_REPLY_TO_SPEAKERS = 'software-dev-unasked-reply-to-speakers-v1';
 export const raiseFromChildSignal = defineSignal<[ChildRaise]>('raiseFromChild');
 export const subtaskRedirectedSignal = defineSignal<[{ childTaskId: string }]>(SIG.subtaskRedirected);
 /** A parent answers a child that raised to it — maps onto the same confirm/retry/
@@ -937,6 +939,8 @@ async function softwareDevImpl(
   /** People (`user:<id>`) who spoke to the main agent in what its last turn
    * answered (v1.27). */
   let speakers: string[] = [];
+  /** The main agent's reply to `speakers`, until something delivers it. */
+  let speakersReply: Message | undefined;
   const participantSessions: Record<string, { session?: string; home?: string; seen: number }> =
     Object.fromEntries(Object.entries(continued?.participants?.sessions ?? {}).map(([key, value]) => [key, { ...value }]));
   let agentQueue: string[] = [...(continued?.participants?.queue ?? [])];
@@ -2707,6 +2711,7 @@ async function softwareDevImpl(
     // Stopped: nothing it did this turn is folded in; it waits for a message.
     if (!ran) {
       speakers = [];
+      speakersReply = undefined;
       return { completed: false, providerCompleted: false, output: '', stopped: true } as AgentTurnResult & { stopped?: true };
     }
     const turn: AgentTurnResult & { stopped?: true } = ran.value;
@@ -2732,10 +2737,15 @@ async function softwareDevImpl(
       speakers = multiAgent ? [...new Set(msgs.slice(answeredFrom, delivered)
         .filter((m) => m.role === 'user' && m.author?.startsWith('user:') && addressedTo(m, MAIN_AGENT))
         .map((m) => m.author!))] : [];
-      if (input.parentTaskId && speakers.length && patched(REPLY_TO_SPEAKERS)) await deliverReply(reply, speakers);
+      speakersReply = speakers.length ? reply : undefined;
+      if (input.parentTaskId && speakers.length && patched(REPLY_TO_SPEAKERS)) {
+        await deliverReply(reply, speakers);
+        speakersReply = undefined;
+      }
     } else {
       seen = delivered;
       speakers = [];
+      speakersReply = undefined;
     }
     if (turn.reviewInfo) {
       // A proposal-readiness/landing refusal resumes the SAME Do conversation.
@@ -3482,6 +3492,20 @@ Inspect the complete current diff and specifically compare its delta from the re
     return speakers.length && patched(REPLY_TO_SPEAKERS) ? [...new Set([...route, ...speakers])] : route;
   }
 
+  /** `askOf` for a `needs_input` pause's default audience. */
+  function asked(route: string[]): string[] {
+    return speakers.length && !input.parentTaskId && patched(UNASKED_REPLY_TO_SPEAKERS) ? askOf(route) : route;
+  }
+
+  /** A top-level reply to people goes to them as a mention when the task then
+   * waits on something else (a pause, its sub-tasks): no human wait would
+   * carry it, and they would never hear it (pramana#22). */
+  async function replyUnasked(): Promise<void> {
+    const reply = speakersReply;
+    speakersReply = undefined;
+    if (reply && !input.parentTaskId && patched(UNASKED_REPLY_TO_SPEAKERS)) await deliverReply(reply, speakers);
+  }
+
   /** ` (already sent to Bea, who spoke to it)` when the agent's last reply also
    * went to people, so a parent does not relay it to them again. */
   function alsoSentTo(): string {
@@ -3770,6 +3794,7 @@ Inspect the complete current diff and specifically compare its delta from the re
       // which answers at once as it does for a question ending an ordinary
       // turn; people get a Needs input hold.
       const needsInput = turn.wait.needsInput;
+      if (!needsInput) await replyUnasked();
       const question = needsInput?.message ?? (turn.output?.trim() || 'The agent paused for your input.');
       const routed = !!needsInput && !needsInput.audience?.length;
       const askedParent = routed && await notifyParent('needs_info', question);
@@ -3806,7 +3831,7 @@ Inspect the complete current diff and specifically compare its delta from the re
             kind: 'human' as const,
             audience: needsInput.audience?.length ? needsInput.audience
               : rerouted ? rerouted.audience
-              : route?.kind === 'human' && route.audience?.length ? route.audience : ['@creator'],
+              : asked(route?.kind === 'human' && route.audience?.length ? route.audience : ['@creator']),
             detail: question,
             ...(needsInput.urgency ? { urgency: needsInput.urgency } : {}),
           } } : {}),
@@ -3850,6 +3875,7 @@ Inspect the complete current diff and specifically compare its delta from the re
 
     // While children are still running, the parent doesn't leave the Do loop:
     if (outstanding.size > 0) {
+      await replyUnasked();
       if (turn.waitForSubtasks || finishing) {
         // Explicit wait, or a finish deferred by the end-stage barrier — a completion
         // here is held until the children settle (the agent re-signals once they do),

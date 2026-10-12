@@ -220,6 +220,49 @@ describe('software-dev 1.27: one conversation, several agents (real Temporal + g
     await handle.result();
   });
 
+  /** pramana#22: the Agent answered the owner, then paused; nothing told them. */
+  it('a reply to a person reaches them when the Agent then pauses', async () => {
+    const repo = await h.makeRepo('pause-reply');
+    const taskId = newId('task');
+    const handle = await start(taskId, { ...input({ taskId, repo, title: 'PauseReply', prompt: 'Start.\n@incomplete' }), waitMinuteMs: 60_000 });
+    await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 20_000 }).toBe('human');
+    await handle.signal('followUp', { id: 'u-bea', role: 'user', author: 'user:bea', authorLabel: 'Bea', ts: Date.now(),
+      text: 'Why is pigeon missing?\n@pause 30' });
+    await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 20_000 }).toBe('timer');
+    expect((await view(handle)).messages.at(-1)).toMatchObject({ role: 'agent', to: ['user:bea'] });
+    expect((await h.store.eventsOfType(taskId, ['task.mentioned'])).map((e: any) => e.payload.recipients)).toEqual([['user:bea']]);
+    await handle.signal('cancel');
+    await handle.result();
+  });
+
+  it('a reply to a person reaches them when the Agent then waits on its sub-tasks', async () => {
+    const repo = await h.makeRepo('subtasks-reply');
+    const taskId = newId('task');
+    const handle = await start(taskId, input({ taskId, repo, title: 'SubtasksReply', prompt: 'Start.\n@incomplete' }));
+    await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 20_000 }).toBe('human');
+    await handle.signal('followUp', { id: 'u-bea', role: 'user', author: 'user:bea', authorLabel: 'Bea', ts: Date.now(),
+      text: 'Split it up.\n@subtask Child :: Work.\\n@sleep 60000\n@wait' });
+    await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 30_000 }).toBe('subtask');
+    expect((await view(handle)).messages.findLast((m: any) => m.role === 'agent')).toMatchObject({ to: ['user:bea'] });
+    expect((await h.store.eventsOfType(taskId, ['task.mentioned'])).map((e: any) => e.payload.recipients)).toEqual([['user:bea']]);
+    await handle.signal('cancel');
+    await handle.result();
+  }, 60_000);
+
+  it('a needs_input pause answering a person asks them too', async () => {
+    const repo = await h.makeRepo('pause-ask');
+    const taskId = newId('task');
+    const handle = await start(taskId, { ...input({ taskId, repo, title: 'PauseAsk', prompt: 'Start.\n@incomplete' }), waitMinuteMs: 60_000 });
+    await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 20_000 }).toBe('human');
+    await handle.signal('followUp', { id: 'u-bea', role: 'user', author: 'user:bea', authorLabel: 'Bea', ts: Date.now(),
+      text: 'Go ahead.\n@pause 30 :: input -- Which URL style?' });
+    await expect.poll(async () => (await view(handle)).waitingFor?.audience, { timeout: 20_000 }).toEqual(['@creator', 'user:bea']);
+    // Bea is asked by the wait itself; no separate mention.
+    expect(await h.store.eventsOfType(taskId, ['task.mentioned'])).toEqual([]);
+    await handle.signal('cancel');
+    await handle.result();
+  });
+
   it('escalating a pending request redirects it to other people without interrupting the task', async () => {
     const repo = await h.makeRepo('redirect');
     const taskId = newId('task');
