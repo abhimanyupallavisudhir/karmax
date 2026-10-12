@@ -291,9 +291,10 @@ describe('turnkey backup publication', () => {
 describe('turnkey deployment secrets', () => {
   const secretsDir = generateSecrets();
   const secrets = ['auth_secret', 'vault_key', 'world_ref_key'];
-  // Operator-supplied, empty until an S3 object store is configured.
+  // Operator-supplied, empty until an S3 object store, off-host backups or
+  // previews under a wildcard certificate (the Cloudflare DNS token) are configured.
   const optional = ['s3_access_key_id', 's3_secret_access_key',
-    'pg_backup_access_key_id', 'pg_backup_secret_access_key', 'pg_backup_public_key'];
+    'pg_backup_access_key_id', 'pg_backup_secret_access_key', 'pg_backup_public_key', 'cloudflare_dns_api_token'];
 
   // An update runs the installed release's script, which cannot generate a
   // host secret a newer release adds; Compose would refuse to mount it. So

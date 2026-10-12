@@ -41,7 +41,8 @@ global.subTaskState = (rec) => ({
 });
 global.taskUrl = (id) => `/tasks/${id}`;
 
-for (const name of ['taskForkSourceIds', 'agentForkPool', 'agentForkTree', 'subTaskStateHtml', 'agentForksSection']) eval(extractFn(name));
+for (const name of ['taskForkSourceIds', 'agentForkPool', 'agentForkTree', 'subTaskStateHtml', 'forkTreeHtml', 'agentForksSection',
+  'forkSourceTree', 'forkSourcesSection']) eval(extractFn(name));
 
 let pass = 0, fail = 0;
 const ok = (condition, message) => {
@@ -78,6 +79,26 @@ ok(withArchived.indexOf('href="/tasks/fork-done-child"') > withArchived.indexOf(
 ok(withArchived.includes('Try the first approach') && !withArchived.includes('Stale summary title'), 'a live record supersedes its summary');
 ok(agentForksSection({ taskId: 'archived-only', forkSummaries: [{ id: 'x', title: 'Only fork', lastView: { status: 'done' }, forkOf: ['archived-only'] }] }).includes('1 task fork'),
   'a task whose only fork finished still shows it');
+
+// The mirror image: a fork names the tasks it was forked from, oldest first,
+// each nested under the task it was itself forked from.
+const lineage = { taskId: 'grandchild', forkSourceSummaries: [
+  { id: 'root', num: 30, title: 'Archived root', lastView: { stage: 'done', status: 'done' }, forkOf: [] },
+  { id: 'fork-a', num: 21, title: 'Stale summary title', lastView: { stage: 'setup', status: 'active' }, forkOf: ['root'] },
+  { id: 'side', num: 31, title: 'Second source', lastView: { stage: 'done', status: 'done' }, forkOf: [] },
+] };
+const sourceTree = forkSourceTree(lineage);
+ok(sourceTree.map((node) => node.task.id).join() === 'root,side', 'the oldest ancestors occupy the top level');
+ok(sourceTree[0].children[0].task.id === 'fork-a' && !sourceTree[0].children[0].children.length, 'each source nests under the task it forked');
+const sourcesPanel = forkSourcesSection(lineage);
+ok(sourcesPanel.includes('Forked from') && sourcesPanel.includes('3 source tasks'), 'the section names and counts every ancestor');
+ok(sourcesPanel.includes('Try the first approach') && !sourcesPanel.includes('Stale summary title'), 'a live record supersedes its summary');
+ok(sourcesPanel.indexOf('href="/tasks/fork-a"') > sourcesPanel.indexOf('class="fork-tree"', sourcesPanel.indexOf('href="/tasks/root"')), 'a source forked from another renders nested beneath it');
+ok(forkSourcesSection({ taskId: 'source' }) === '', 'a task that is no fork shows no Forked from chrome');
+ok(forkSourcesSection({ taskId: 'x', forkSourceSummaries: [{ id: 'y', title: 'Only source', lastView: { status: 'done' }, forkOf: [] }] }).includes('1 source task<'),
+  'a single source is counted in the singular');
+const cyclic = forkSourceTree({ taskId: 'c', forkSourceSummaries: [{ id: 'p', title: 'P', forkOf: ['q'] }, { id: 'q', title: 'Q', forkOf: ['p'] }] });
+ok(Array.isArray(cyclic), 'cyclic stored parameters do not loop forever');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

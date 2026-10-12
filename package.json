@@ -32,11 +32,13 @@
     "vault-key": "tsx src/scripts/vault-key.ts",
     "model-logins": "tsx src/scripts/model-logins.ts",
     "migrate-objects": "tsx src/scripts/object-store-migrate.ts",
+    "reconcile-storage": "tsx src/scripts/reconcile-storage.ts",
     "object-store-check": "tsx src/scripts/object-store-check.ts",
     "replay-check": "tsx src/scripts/replay-check.ts",
     "benchmark:latency": "tsx benchmarks/latency.ts",
     "timing:report": "tsx src/scripts/timing-report.ts",
-    "deploy-repository-edge": "tsx src/scripts/deploy-repository-edge.ts"
+    "deploy-repository-edge": "tsx src/scripts/deploy-repository-edge.ts",
+    "deploy-agent-mail-edge": "tsx src/scripts/deploy-agent-mail-edge.ts"
   },
   "dependencies": {
     "@1password/sdk": "^0.4.1",
@@ -46,7 +48,7 @@
     "@daytona/sdk": "^0.218.0",
     "@e2b/desktop": "^2.3.1",
     "@modelcontextprotocol/sdk": "^1.32.1",
-    "@openai/codex": "0.156.1",
+    "@openai/codex": "0.162.1",
     "@temporalio/activity": "^1.24.0",
     "@temporalio/client": "^1.24.0",
     "@temporalio/common": "^1.24.0",

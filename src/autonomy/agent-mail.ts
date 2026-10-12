@@ -162,6 +162,45 @@ export function extractMimeText(raw: string): string {
   return type === 'text/html' ? stripHtml(decoded) : decoded;
 }
 
+/** The key the agent-mail Worker signs deliveries with (it holds a copy as a
+ * Worker secret). Derived from the installation's auth secret for this one
+ * purpose (HKDF), so there is no further secret to store, back up or mount;
+ * rotating the auth secret means redeploying the Worker. Empty without one. */
+export function agentMailIngestKey(env: NodeJS.ProcessEnv = process.env): string {
+  const root = env.KARMAX_AUTH_SECRET ?? '';
+  if (root.length < 32) return '';
+  return Buffer.from(crypto.hkdfSync('sha256', root, '', 'tavya agent-mail ingest v1', 32)).toString('base64url');
+}
+
+/** RFC 2047 encoded words (`=?UTF-8?B?…?=`, `=?ISO-8859-1?Q?…?=`) → text.
+ * Sign-up mail often puts the code in the subject, encoded. */
+export function decodeEncodedWords(value: string): string {
+  return value.replace(/=\?([^?\s]+)\?([BbQq])\?([^?\s]*)\?=(?:\s+(?==\?))?/g, (word, charset: string, encoding: string, data: string) => {
+    try {
+      const bytes = encoding.toUpperCase() === 'B' ? Buffer.from(data, 'base64')
+        : Buffer.from(decodeQuotedPrintable(data.replace(/_/g, ' ')), 'latin1');
+      return new TextDecoder(charset.split('*')[0]!.toLowerCase()).decode(bytes);
+    } catch {
+      return word;
+    }
+  });
+}
+
+/** One header of a raw MIME message (unfolded, encoded words decoded). */
+function mimeHeader(headers: string, name: string): string | undefined {
+  const match = new RegExp(`^${name}:[ \\t]*((?:[^\\r\\n]*(?:\\r?\\n[ \\t][^\\r\\n]*)*))`, 'im').exec(headers);
+  return match ? decodeEncodedWords(match[1]!.replace(/\r?\n[ \t]+/g, ' ').trim()) : undefined;
+}
+
+/** A raw RFC 5322 message, as Cloudflare Email Routing hands it to the
+ * agent-mail Worker: its subject, Message-ID (deliveries are deduplicated on
+ * it, so a retried post is filed once) and readable text. */
+export function parseRawMail(raw: string): { subject?: string; messageId?: string; text: string } {
+  const end = raw.search(/\r?\n\r?\n/);
+  const headers = end < 0 ? raw : raw.slice(0, end);
+  return { subject: mimeHeader(headers, 'subject'), messageId: mimeHeader(headers, 'message-id'), text: extractMimeText(raw) };
+}
+
 /**
  * The ready-to-paste Cloudflare Email Worker (§8 "Your own domain"): Cloudflare
  * Email Routing cannot POST to arbitrary URLs — it forwards to addresses or to

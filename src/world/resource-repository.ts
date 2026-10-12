@@ -341,9 +341,10 @@ export class ResourceRepositoryServer {
       const body = await readBody(req, declared);
       if (kind !== 'config' && crypto.createHash('sha256').update(body).digest('hex') !== name)
         throw new HttpError(400, 'file content does not match its name');
-      if (kind !== 'locks') await objects.put(repositoryObjectKey(repository, kind, name), body);
-      await this.deps.store.recordRepositoryFile({ repository, attachmentId: attachment.id, organizationId: attachment.organizationId,
-        storageLocationId, kind, name, bytes: body.length, ...(kind === 'locks' ? { content: body.toString('base64') } : {}) });
+      const key = repositoryObjectKey(repository, kind, name);
+      if (kind !== 'locks') await objects.put(key, body);
+      await this.record({ repository, attachmentId: attachment.id, organizationId: attachment.organizationId,
+        storageLocationId, kind, name, bytes: body.length, ...(kind === 'locks' ? { content: body.toString('base64') } : {}) }, key);
     } finally { this.release(); }
     res.writeHead(200).end();
   }
@@ -355,7 +356,10 @@ export class ResourceRepositoryServer {
    * the file's key and checksum; 409 sends the upload through this server.
    * `stored`: it is, so it is recorded once the store holds an object of
    * exactly the announced size (the store checked its content). Both carry the
-   * world's own grant; neither carries file bytes.
+   * world's own grant; neither carries file bytes. Presigning the URL records
+   * the write as pending (DeferredDeleteObjectStore), so if `stored` never
+   * comes (the world died, the Worker's call failed and restic gave up) the
+   * object is deleted after a grace period instead of lingering unrecorded.
    */
   private async edgeWrite(req: http.IncomingMessage, res: http.ServerResponse, place: RepositoryPlace,
     grant: RepositoryGrant, kind: string, name: string, step: 'intent' | 'stored'): Promise<void> {
@@ -388,9 +392,19 @@ export class ResourceRepositoryServer {
     await this.deps.store.transaction(() => this.deps.store.deleteObjectTombstone(key));
     const stored = await objects.head?.(key);
     if (stored?.bytes !== declared) throw new HttpError(409, 'the store does not hold that file');
-    await this.deps.store.recordRepositoryFile({ repository, attachmentId: attachment.id, organizationId: attachment.organizationId,
-      storageLocationId, kind, name, bytes: declared });
+    await this.record({ repository, attachmentId: attachment.id, organizationId: attachment.organizationId,
+      storageLocationId, kind, name, bytes: declared }, key);
     res.writeHead(200).end();
+  }
+
+  /** Record a stored file and, in the same transaction, settle the pending
+   * write its upload began with (`intent`'s presigned URL, or the relay's
+   * put): from then on the file row accounts for the object. */
+  private async record(file: Parameters<Store['recordRepositoryFile']>[0], key: string): Promise<void> {
+    await this.deps.store.transaction(async () => {
+      await this.deps.store.recordRepositoryFile(file);
+      await this.deps.store.deletePendingObjectWrite(key);
+    });
   }
 
   private async acquire(): Promise<void> {

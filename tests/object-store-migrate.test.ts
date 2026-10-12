@@ -259,14 +259,15 @@ describe('unreferenced object inventory', () => {
     expect(family('resource manifest')).toMatchObject({ referenced: { count: 1 }, unreferenced: { count: 2, bytes: 50 } });
     expect(family('resource manifest').reasons).toEqual({ 'attachment exists, no revision': { count: 1, bytes: 20 },
       'attachment deleted': { count: 1, bytes: 30 } });
-    expect(family('checkpoint')).toMatchObject({ referenced: { count: 1 }, unreferenced: { count: 2, bytes: 90 } });
-    expect(family('checkpoint').reasons).toEqual({ 'pending checkpoint GC': { count: 1, bytes: 40 }, 'no checkpoint row': { count: 1, bytes: 50 } });
+    // Queued for checkpoint GC is a deletion in progress, not an orphan.
+    expect(family('checkpoint')).toMatchObject({ referenced: { count: 1 }, pendingDelete: { count: 1, bytes: 40 }, unreferenced: { count: 1, bytes: 50 } });
+    expect(family('checkpoint').reasons).toEqual({ 'no checkpoint row': { count: 1, bytes: 50 } });
     expect(family('artifact')).toMatchObject({ referenced: { count: 1 }, unreferenced: { count: 1, bytes: 60 } });
     expect(family('resource upload part')).toMatchObject({ referenced: { count: 1 }, unreferenced: { count: 1, bytes: 70 } });
     expect(family('conversation export')).toMatchObject({ referenced: { count: 1, bytes: 5 }, unreferenced: { count: 1, bytes: 90 } });
     expect(family('conversation export').reasons).toEqual({ 'no export row': { count: 1, bytes: 90 } });
     expect(family('unknown')).toMatchObject({ untracked: { count: 1, bytes: 80 } });
-    expect(report.unreferenced).toEqual({ count: 8, bytes: 100 + 50 + 90 + 60 + 70 + 90 });
+    expect(report.unreferenced).toEqual({ count: 7, bytes: 100 + 50 + 50 + 60 + 70 + 90 });
     // Chunks referenced from customer buckets live there, not in the managed store.
     expect(references.chunks.has('org_a/customer')).toBe(false);
     const text = formatInventory(report);
@@ -303,7 +304,7 @@ describe('unreferenced object inventory', () => {
     const copy = await run(['--concurrency', '2']);
     expect(copy.status, copy.stderr).toBe(0);
     expect(copy.stdout).toMatch(/copied 5 objects/);
-    expect(copy.stdout).toMatch(/Unreferenced local objects/);
+    expect(copy.stdout).toMatch(/Unreferenced objects/);
     expect(s3.objects.size).toBe(5);
     const verify = await run(['--verify-only']);
     expect(verify.status, verify.stderr).toBe(0);

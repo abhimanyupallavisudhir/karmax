@@ -16,6 +16,14 @@ function storageOverQuotaMarkup(contents) {
   const date = new Date(contents.overQuota.deleteAt).toLocaleDateString();
   return `<p class="task-sub storage-over">Over the limit: adding data is paused. ${policyTip(`Free space or upgrade by ${date}. After that, stored data is deleted, older versions first, until it fits.`)}</p>`;
 }
+// Deleted data the bucket keeps for its 30-day recovery window: real bytes,
+// but not the organization's to count against its limit.
+function storagePendingDeletionMarkup(contents) {
+  const pending = contents?.pendingDeletion;
+  if (!pending?.bytes) return '';
+  const until = pending.until ? ` until ${new Date(pending.until).toLocaleDateString()}` : '';
+  return `<p class="task-sub storage-pending">+ ${formatBytes(pending.bytes)} being deleted ${policyTip(`Deleted data is kept${until} so it can be recovered, then removed. It doesn’t count toward your limit.`)}</p>`;
+}
 function storageContentsMarkup(contents) {
   const projects = (contents?.projects || []).filter((project) => project.bytes > 0);
   if (!projects.length) return '';
@@ -1006,7 +1014,7 @@ const NODES = [
 const AGENT_PROVIDERS = ['claude', 'codex', 'opencode'];
 const MODELS = {
   claude: ['default', 'opus[1m]', { id: 'claude-opus-5-5', displayName: 'Opus 5.5' }, { id: 'claude-fable-5-1', displayName: 'Fable 5.1' }, 'sonnet', 'haiku'],
-  codex: ['gpt-5.6-sol', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'],
+  codex: ['gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'],
   opencode: ['kimi/k3', 'kimi/kimi-for-coding', 'openai/gpt-5.5', 'anthropic/claude-sonnet-5', 'google/gemini-3-pro', 'xai/grok-code-fast-1'],
 };
 const agentProviderChoice = (provider) => AGENT_PROVIDERS.includes(provider) ? provider : AGENT_PROVIDERS[0];
@@ -10523,11 +10531,8 @@ function agentForkTree(pool, sourceTaskId, lineage = []) {
     .map(({ task }) => ({ task, children: agentForkTree(pool, task.id, [...ancestors]) }));
 }
 
-function agentForksSection(v) {
-  const tree = agentForkTree(agentForkPool(v), v.taskId);
-  if (!tree.length) return '';
-  const countNodes = (nodes) => nodes.reduce((total, node) => total + 1 + countNodes(node.children), 0);
-  const renderNodes = (nodes) => `<ul class="fork-tree">${nodes.map(({ task, children }) => {
+function forkTreeHtml(nodes) {
+  return `<ul class="fork-tree">${nodes.map(({ task, children }) => {
     const state = subTaskState(task);
     return `<li class="fork-tree-item">
       <a class="fork-row" data-spa href="${esc(taskUrl(task.id))}" aria-label="Open ${esc(task.title)} — ${esc(state.label)}">
@@ -10538,9 +10543,15 @@ function agentForksSection(v) {
         </span>
         <span class="fork-arrow" aria-hidden="true">›</span>
       </a>
-      ${children.length ? renderNodes(children) : ''}
+      ${children.length ? forkTreeHtml(children) : ''}
     </li>`;
   }).join('')}</ul>`;
+}
+
+function agentForksSection(v) {
+  const tree = agentForkTree(agentForkPool(v), v.taskId);
+  if (!tree.length) return '';
+  const countNodes = (nodes) => nodes.reduce((total, node) => total + 1 + countNodes(node.children), 0);
   const count = countNodes(tree);
   return `<section class="agent-forks" aria-labelledby="agent-forks-title">
     <div class="agent-forks-head">
@@ -10550,7 +10561,34 @@ function agentForksSection(v) {
       </div>
       <div class="agent-forks-count">${count} task fork${count === 1 ? '' : 's'}</div>
     </div>
-    ${renderNodes(tree)}
+    ${forkTreeHtml(tree)}
+  </section>`;
+}
+
+// The mirror image for a fork: every task it descends from
+// (`forkSourceSummaries`, oldest first), drawn like the forks tree — each
+// source nested under the task it was itself forked from — so the direct
+// source sits deepest, just above this task. A live record is fresher.
+function forkSourceTree(v) {
+  const live = new Map((S.tasks || []).map((task) => [task.id, task]));
+  const pool = (v.forkSourceSummaries || []).map((source) => ({ task: live.get(source.id) || source, sources: source.forkOf || [] }));
+  return pool.filter(({ sources }) => !sources.length)
+    .map(({ task }) => ({ task, children: agentForkTree(pool, task.id, [v.taskId]) }));
+}
+
+function forkSourcesSection(v) {
+  const tree = forkSourceTree(v);
+  if (!tree.length) return '';
+  const count = v.forkSourceSummaries.length;
+  return `<section class="agent-forks" aria-labelledby="fork-sources-title">
+    <div class="agent-forks-head">
+      <div>
+        <div class="agent-forks-kicker">Branched conversation</div>
+        <h3 id="fork-sources-title">Forked from</h3>
+      </div>
+      <div class="agent-forks-count">${count} source task${count === 1 ? '' : 's'}</div>
+    </div>
+    ${forkTreeHtml(tree)}
   </section>`;
 }
 
@@ -10630,6 +10668,7 @@ function overviewTab(v) {
     ? `<div class="section-h">Agent turn</div><div class="card" style="color:var(--ink-2)">${v.agentTurn.state === 'running' ? '▶' : '⏳'} ${esc(agentRoleLabel(v.agentTurn.role))} · ${esc(agentTurnStateText(v))}${agentProviderLabel(v.agentTurn.provider) ? ` · ${esc(agentProviderLabel(v.agentTurn.provider))}` : ''}</div>`
     : '';
   const subtasks = subTasksSection(v);
+  const forkSources = forkSourcesSection(v);
   const agentForks = agentForksSection(v);
   return `
     <div class="section-h">Pipeline</div>
@@ -10638,6 +10677,7 @@ function overviewTab(v) {
     ${waiting}
     ${agentTurn}
     ${subtasks}
+    ${forkSources}
     ${agentForks}
     ${checkoutsSection(v)}
     ${review}
@@ -11508,7 +11548,7 @@ function portableForkCommandFor(session, cwd) {
     'mkdir -p "$HOME/.codex/sessions/tavya"',
     `cp -n "${source}" "$HOME/.codex/sessions/tavya/${filename}"`,
     `cd ${shellQuote(cwd)}`,
-    `CODEX_HOME="$HOME/.codex" npx --yes @openai/codex@${session.requiredCodexVersion || "0.156.1"} fork ${shellQuote(sessionId)}`,
+    `CODEX_HOME="$HOME/.codex" npx --yes @openai/codex@${session.requiredCodexVersion || "0.162.1"} fork ${shellQuote(sessionId)}`,
   ].join('\n');
   if (session.provider === 'claude') return [
     `tavya_cwd="$(cd ${shellQuote(cwd)} && pwd -P)"`,
@@ -19027,13 +19067,17 @@ let refreshVaultRequests = null;
 function agentMailCard() {
   return `<div class="card" id="agent-mail-card">
     <div class="section-h">Agent email</div>
-    <p class="task-sub">An inbox where agents receive confirmation codes. <a href="https://www.agentmail.to/" target="_blank" rel="noopener">Get an AgentMail account ↗</a></p>
+    <p class="task-sub" id="agentmail-hosted" hidden>Agents receive confirmation codes at <code id="agentmail-hosted-address"></code></p>
+    <details class="settings-disclosure compact" id="agentmail-own" open><summary class="task-sub">Use your own AgentMail inbox
+      ${policyTip('Optional: agents then read mail from an AgentMail inbox you own instead.')}</summary>
+    <p class="task-sub"><a href="https://www.agentmail.to/" target="_blank" rel="noopener">Get an AgentMail account ↗</a></p>
     <div class="inline-form">
       <input id="agentmail-address" type="email" placeholder="AgentMail address" />
       <input id="agentmail-key" type="password" placeholder="AgentMail API key" />
       <button class="btn sm" id="agentmail-connect">Set up</button>
     </div>
     <div id="agentmail-result" class="task-sub"></div>
+    </details>
   </div>`;
 }
 async function wireAgentMailCard(organizationId) {
@@ -19044,9 +19088,14 @@ async function wireAgentMailCard(organizationId) {
   const result = $('#agentmail-result');
   try {
     const data = await api(`/api/organizations/${org}/agent-mail`);
-    if (data.configured) {
+    if (data.configured && data.provider === 'agentmail') {
       address.value = data.address;
       result.textContent = 'Connected';
+    } else if (data.configured) {
+      // The installation's own mail domain: every organization has an address.
+      $('#agentmail-hosted-address').textContent = data.address;
+      $('#agentmail-hosted').hidden = false;
+      $('#agentmail-own').open = false;
     }
   } catch {}
   $('#agentmail-connect')?.addEventListener('click', async () => {
@@ -20453,11 +20502,12 @@ function serviceLimitActionsMarkup(service) {
 function serviceLimitsMarkup(view) {
   if (!view) return '';
   const rows = view.services.map((service) => {
-    if (service.status === 'not-connected' || service.status === 'unchecked' || !service.meters.length) {
-      const note = service.status === 'unchecked' ? 'Not checked yet' : 'Not connected';
+    if (['not-connected', 'not-needed', 'unchecked'].includes(service.status) || !service.meters.length) {
+      const note = service.status === 'unchecked' ? 'Not checked yet' : service.status === 'not-needed' ? 'Not needed' : 'Not connected';
+      const why = service.status === 'not-needed' ? service.note : service.connect;
       return `<div class="limits-row off" role="row" data-service="${esc(service.id)}">
         <span class="limits-service" role="rowheader">${serviceLimitNameMarkup(service)}</span>
-        <span class="limits-off" role="cell">${note}${service.connect ? ` ${policyTip(service.connect)}` : ''}</span>
+        <span class="limits-off" role="cell">${note}${why ? ` ${policyTip(why)}` : ''}</span>
         <span class="limits-actions" role="cell">${serviceLimitActionsMarkup(service)}</span>
       </div>`;
     }
@@ -21296,7 +21346,7 @@ async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
       const [storageLocations, contents] = await Promise.all([read('storage').catch(() => []), read('storage-contents').catch(() => null)]);
       if (!live('storage')) return;
       $('#org-storage').innerHTML = `
-        ${storageLocations.map((location) => { const usage = location.usage || {}; const pct = usage.quotaBytes ? Math.min(100, usage.retainedBytes / usage.quotaBytes * 100) : 0; return `<div class="team-block storage-location" data-storage="${esc(location.id)}"><div class="member-row"><span><b>${esc(location.name)}</b> <span class="chip">${location.kind === 'managed' ? 'managed' : 'customer S3'}</span> ${location.isDefault ? '<span class="chip">default</span>' : ''}</span><span>${formatBytes(usage.retainedBytes || 0)}${usage.quotaBytes ? ` / ${formatBytes(usage.quotaBytes)}` : ''}</span>${!location.isDefault && location.status === 'ready' ? '<button class="btn sm storage-default">Make default</button>' : ''}${location.kind === 's3' ? '<button class="btn sm storage-test">Test</button><button class="btn sm danger storage-delete">Remove</button>' : ''}</div>${usage.quotaBytes ? `<div class="progress${pct >= 100 ? ' over' : ''}"><i style="width:${pct}%"></i></div>` : ''}${location.kind === 'managed' ? storageOverQuotaMarkup(contents) : ''}${location.config?.bucket ? `<p class="task-sub mono">${esc(location.config.endpoint)}/${esc(location.config.bucket)}/${esc(location.config.prefix || '')}</p>` : ''}${location.lastError ? `<p class="task-sub" style="color:var(--danger)">${esc(location.lastError)}</p>` : ''}</div>`; }).join('')}
+        ${storageLocations.map((location) => { const usage = location.usage || {}; const pct = usage.quotaBytes ? Math.min(100, usage.retainedBytes / usage.quotaBytes * 100) : 0; return `<div class="team-block storage-location" data-storage="${esc(location.id)}"><div class="member-row"><span><b>${esc(location.name)}</b> <span class="chip">${location.kind === 'managed' ? 'managed' : 'customer S3'}</span> ${location.isDefault ? '<span class="chip">default</span>' : ''}</span><span>${formatBytes(usage.retainedBytes || 0)}${usage.quotaBytes ? ` / ${formatBytes(usage.quotaBytes)}` : ''}</span>${!location.isDefault && location.status === 'ready' ? '<button class="btn sm storage-default">Make default</button>' : ''}${location.kind === 's3' ? '<button class="btn sm storage-test">Test</button><button class="btn sm danger storage-delete">Remove</button>' : ''}</div>${usage.quotaBytes ? `<div class="progress${pct >= 100 ? ' over' : ''}"><i style="width:${pct}%"></i></div>` : ''}${location.kind === 'managed' ? storageOverQuotaMarkup(contents) + storagePendingDeletionMarkup(contents) : ''}${location.config?.bucket ? `<p class="task-sub mono">${esc(location.config.endpoint)}/${esc(location.config.bucket)}/${esc(location.config.prefix || '')}</p>` : ''}${location.lastError ? `<p class="task-sub" style="color:var(--danger)">${esc(location.lastError)}</p>` : ''}</div>`; }).join('')}
         ${storageContentsMarkup(contents)}
         <details class="settings-disclosure compact"><summary><b>Connect customer-owned S3 storage</b></summary><div class="settings-grid">
           <label class="form-row">Name<input id="storage-name" placeholder="Production data"></label><label class="form-row">Endpoint<input id="storage-endpoint" placeholder="https://s3.amazonaws.com"></label>

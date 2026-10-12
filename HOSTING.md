@@ -66,8 +66,11 @@ profile. On top of that:
   Daytona.
 - **Previews are isolated per lease.** Each gets an opaque
   `p-<digest>.<preview-domain>` origin behind an HttpOnly, lease-scoped cookie,
-  and Caddy asks karmax (`/api/tls/preview-allow`) before obtaining a
-  certificate — so the catch-all cannot be used to mint certs for arbitrary names.
+  ideally on a separately registered domain. Either one wildcard certificate
+  covers them (`KARMAX_PREVIEW_TLS=cloudflare`, DNS-01), or Caddy asks karmax
+  (`/api/tls/preview-allow`) before obtaining one per host — so the catch-all
+  cannot be used to mint certs for arbitrary names. A lease keeps its hostname
+  when the preview domain moves (`KARMAX_LEGACY_PREVIEW_ORIGIN`).
 - **Tenancy is enforced in the store, not the UI.** Projects, repositories,
   vault items, config homes, executions, preview leases and usage all carry
   `organizationId`, and the caller's token — not a query parameter — is
