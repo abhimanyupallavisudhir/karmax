@@ -83,6 +83,7 @@ import {
   type OrganizationEntitlements,
 } from '../domain/entitlements.js';
 import { newId } from '../util/id.js';
+import type { AutomationTemplate } from '../domain/automations.js';
 import { EVENT_RETENTION_MS as PROJECT_EVENT_RETENTION_MS, type EventFollow, type ProjectEvent, type ProjectEventClaim,
   type ProjectEventClaimState } from '../domain/project-events.js';
 import { paymentMerchantMatches } from '../util/payment-merchant.js';
@@ -943,6 +944,12 @@ export class Store {
         id TEXT PRIMARY KEY, taskId TEXT NOT NULL, projectId TEXT NOT NULL, filter TEXT NOT NULL,
         once INTEGER NOT NULL DEFAULT 0, createdAt INTEGER NOT NULL
       );
+      -- Automations an organization saved (src/domain/automations.ts); the
+      -- built-ins live in code.
+      CREATE TABLE IF NOT EXISTS automation_templates (
+        id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, name TEXT NOT NULL, summary TEXT NOT NULL,
+        task TEXT NOT NULL, needs TEXT, createdBy TEXT, createdAt INTEGER NOT NULL
+      );
       -- What one event did for one armed task: at most one run per pair.
       -- state: pending (a run is starting) | started | deferred | skipped.
       CREATE TABLE IF NOT EXISTS project_event_claims (
@@ -1082,6 +1089,7 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_delivery_pending ON delivery_outbox(state, nextAt);
       CREATE INDEX IF NOT EXISTS idx_project_events_dispatch ON project_events(dispatchedAt, receivedAt);
       CREATE INDEX IF NOT EXISTS idx_task_follows_project ON task_follows(projectId);
+      CREATE INDEX IF NOT EXISTS idx_automation_templates_org ON automation_templates(organizationId, createdAt);
       CREATE INDEX IF NOT EXISTS idx_task_follows_task ON task_follows(taskId);
       CREATE INDEX IF NOT EXISTS idx_project_events_project ON project_events(projectId, receivedAt);
       CREATE INDEX IF NOT EXISTS idx_project_events_received ON project_events(receivedAt);
@@ -2437,6 +2445,7 @@ export class Store {
       payment_events: (await selectRows(this.db, 'payment_events', 'organizationId=?', [organizationId])),
       project_events: (await selectRows(this.db, 'project_events', 'organizationId=?', [organizationId])),
       task_follows: (await rowsFor(this.db, 'task_follows', 'projectId', projectIds)),
+      automation_templates: (await selectRows(this.db, 'automation_templates', 'organizationId=?', [organizationId])),
       project_event_claims: (await rowsFor(this.db, 'project_event_claims', 'eventId',
         ((await this.db.prepare('SELECT id FROM project_events WHERE organizationId=?').all(organizationId)) as Array<{ id: unknown }>).map((r) => String(r.id)))),
       subscription_gifts: (await selectRows(this.db, 'subscription_gifts', 'organizationId=?', [organizationId])),
@@ -2690,6 +2699,7 @@ export class Store {
       (await this.db.prepare('DELETE FROM project_event_claims WHERE eventId IN (SELECT id FROM project_events WHERE organizationId=?)').run(organizationId));
       (await this.db.prepare('DELETE FROM project_events WHERE organizationId=?').run(organizationId));
       (await deleteRows(this.db, 'task_follows', 'projectId', projectIds));
+      (await this.db.prepare('DELETE FROM automation_templates WHERE organizationId=?').run(organizationId));
       (await this.db.prepare(`DELETE FROM kv WHERE k LIKE 'incoming-webhook:%'
         AND (CASE WHEN k LIKE 'incoming-webhook:%' THEN json_extract(v, '$.organizationId') END)=?`).run(organizationId));
       (await this.db.prepare('DELETE FROM payment_events WHERE organizationId=?').run(organizationId));
@@ -9225,6 +9235,27 @@ export class Store {
     const row = await this.db.prepare(`SELECT id FROM tasks WHERE (id=? OR json_extract(params, '$.runOf')=?)
       AND json_extract(params, '$.trigger.eventId')=? ORDER BY createdAt LIMIT 1`).get(seriesId, seriesId, eventId) as { id?: string } | undefined;
     return row?.id ? String(row.id) : undefined;
+  }
+
+  async saveAutomationTemplate(template: AutomationTemplate & { organizationId: string; createdAt: number }): Promise<AutomationTemplate> {
+    await this.db.transaction(async () => {
+      await this.db.prepare(`INSERT INTO automation_templates (id, organizationId, name, summary, task, needs, createdBy, createdAt)
+        VALUES (?,?,?,?,?,?,?,?)`).run(template.id, template.organizationId, template.name, template.summary, JSON.stringify(template.task),
+        template.needs ? JSON.stringify(template.needs) : null, template.createdBy ?? null, template.createdAt);
+    });
+    return template;
+  }
+
+  async listAutomationTemplates(organizationId: string): Promise<AutomationTemplate[]> {
+    const rows = await this.db.prepare('SELECT * FROM automation_templates WHERE organizationId=? ORDER BY createdAt').all(organizationId);
+    return rows.map((row: any) => ({ id: String(row.id), organizationId: String(row.organizationId), name: String(row.name),
+      summary: String(row.summary), task: JSON.parse(String(row.task)), ...(row.needs ? { needs: JSON.parse(String(row.needs)) } : {}),
+      ...(row.createdBy ? { createdBy: String(row.createdBy) } : {}), createdAt: Number(row.createdAt) }));
+  }
+
+  async deleteAutomationTemplate(organizationId: string, id: string): Promise<boolean> {
+    return this.db.transaction(async () => Number((await this.db.prepare('DELETE FROM automation_templates WHERE organizationId=? AND id=?')
+      .run(organizationId, id)).changes) === 1);
   }
 
   async addTaskFollow(follow: EventFollow): Promise<EventFollow> {

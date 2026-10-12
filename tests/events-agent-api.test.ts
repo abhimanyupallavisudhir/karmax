@@ -100,6 +100,41 @@ describe('events through an agent\'s task token', () => {
     } finally { a.restore(); }
   });
 
+  it('an agent installs automations from the gallery and saves its own for the organization', async () => {
+    const dev = await agent('developer');
+    const maintainer = await agent('maintainer');
+    try {
+      const gallery = json(await dev.request('GET', `/api/projects/${projectId}/automations`)).automations;
+      expect(gallery.map((a: any) => a.id)).toEqual(['repair-github-workflow', 'build-planned-issues', 'triage-issues', 'chat-requests']);
+      expect(Object.fromEntries(gallery.map((a: any) => [a.id, a.missing]))).toEqual({ 'repair-github-workflow': ['github'],
+        'build-planned-issues': ['github'], 'triage-issues': ['github'], 'chat-requests': ['chat'] });
+
+      const installed = json(await dev.request('POST', `/api/projects/${projectId}/automations/build-planned-issues`));
+      const series = (await store.getTask(installed.id))!;
+      expect(series).toMatchObject({ title: '#{{issue.number}} {{issue.title}}', params: { repeatable: true, template: 'build-planned-issues',
+        triggerState: 'armed', triggers: [{ kind: 'event', type: 'github.issues.labeled', where: { 'label.name': 'planned' } }] } });
+      expect(String(series.params.prompt)).toMatch(/comments on it reach you as messages/);
+      const again = await dev.request('POST', `/api/projects/${projectId}/automations/build-planned-issues`).catch((error: Error) => error.message);
+      expect(String(again)).toMatch(/already has it/);
+      expect(json(await dev.request('GET', `/api/projects/${projectId}/automations`)).automations
+        .find((a: any) => a.id === 'build-planned-issues').installed).toEqual([installed.id]);
+
+      // Saving for the whole organization is a maintainer's call.
+      const body = { taskId: installed.id, name: 'Planned issues, our way', summary: 'Builds planned issues.' };
+      const refused = await dev.request('POST', '/api/organizations/org_personal/automations', body).catch((error: Error) => error.message);
+      expect(String(refused)).toMatch(/organization:wiki:write/);
+      const saved = json(await maintainer.request('POST', '/api/organizations/org_personal/automations', body));
+      expect(saved).toMatchObject({ id: expect.stringMatching(/^atm_/), name: 'Planned issues, our way', needs: ['github'],
+        task: { title: '#{{issue.number}} {{issue.title}}', params: { repeatable: true, triggers: [{ type: 'github.issues.labeled' }] } } });
+      expect(saved.task.params).not.toHaveProperty('triggerState');
+      expect(saved.task.params).not.toHaveProperty('template');
+      const copy = json(await maintainer.request('POST', `/api/projects/${projectId}/automations/${saved.id}`));
+      expect((await store.getTask(copy.id))!.params).toMatchObject({ template: saved.id, triggerState: 'armed' });
+      expect(json(await maintainer.request('DELETE', `/api/organizations/org_personal/automations/${saved.id}`))).toEqual({ ok: true });
+      expect(json(await dev.request('GET', `/api/projects/${projectId}/automations`)).automations).toHaveLength(4);
+    } finally { dev.restore(); maintainer.restore(); }
+  });
+
   it('an agent follows events for its own task, waits on one, and unfollows', async () => {
     const a = await agent('developer');
     try {

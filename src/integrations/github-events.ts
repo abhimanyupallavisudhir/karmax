@@ -1,7 +1,7 @@
 import type { Store } from '../store/db.js';
 import type { KarmaxApi } from '../platform/api.js';
 import type { TokenAuthority } from '../platform/tokens.js';
-import type { EventTrigger } from '../domain/triggers.js';
+import { RECOVERY_PROMPT, RECOVERY_TITLE, RECOVERY_TRIGGER, REPAIR_TEMPLATE_ID } from '../domain/automations.js';
 import { normalizeTriggers } from '../domain/triggers.js';
 import { eventTypeMatches } from '../domain/project-events.js';
 import type { GithubProjectWebhookEvent, GithubWebhookResult } from './github-app.js';
@@ -22,21 +22,8 @@ import type { GithubProjectWebhookEvent, GithubWebhookResult } from './github-ap
 /** The marker that a project has (or had, and deleted) its recovery task. */
 export const recoverySeriesKey = (projectId: string) => `github:recovery-series:${projectId}`;
 
-export const RECOVERY_TRIGGER: EventTrigger = {
-  kind: 'event', type: 'github.workflow.failed', recurring: true,
-  // A workflow that is still red while its repair is open is that repair's
-  // business (#554/#555): it hears about it instead of a second repair starting.
-  concurrency: { key: '{{repository}}/{{workflow}}', mode: 'tell' },
-};
-
-export const RECOVERY_TITLE = 'Repair GitHub workflow {{workflow}}';
-
-export const RECOVERY_PROMPT = [
-  'A post-merge GitHub workflow on the default branch failed, or GitHub never created its run. The event below names the repository, workflow, exact revision (`headSha`) and run (`url`).',
-  '`source: deployment_monitor` with `conclusion: missing` means no run was created; its `evidence` records what was checked. `attempt` above 1 means the run failed again after a rerun, so the failure reproduces. `originatingTaskId` names the merged task whose change it followed.',
-  '',
-  'Inspect the complete GitHub evidence and classify it before changing code. For a missing run, check workflow schema/registration and triggers first; the evidence distinguishes direct API absence from webhook delay and records file/API permission failures. If a run exists, distinguish queued/waiting environment approval from a terminal failure. If it is a transient GitHub runner failure, rerun the exact revision once and verify it. If it is billing, permissions, protected-environment approval, secrets, or repository configuration, report the precise human action required and do not manufacture a code change. If it is a deterministic deployment or code defect, repair it through the normal reviewed pull-request workflow and verify recovery. The already-merged originating task is immutable and must remain complete.',
-].join('\n');
+// The repair task is the gallery's first automation (src/domain/automations.ts).
+export { RECOVERY_PROMPT, RECOVERY_TITLE, RECOVERY_TRIGGER } from '../domain/automations.js';
 
 export class GithubEvents {
   constructor(private deps: { api: Pick<KarmaxApi, 'ingestProjectEvent' | 'createTask'>; store: Store; tokens: TokenAuthority }) {}
@@ -85,7 +72,7 @@ export class GithubEvents {
     const { token } = await this.deps.tokens.mintPrincipal('system:github-recovery', ['*'], projectId, 10 * 60_000, organizationId);
     try {
       const task = await this.deps.api.createTask(token, { projectId, title: RECOVERY_TITLE, prompt: RECOVERY_PROMPT,
-        params: { repeatable: true, triggers: [RECOVERY_TRIGGER] } });
+        params: { repeatable: true, triggers: [RECOVERY_TRIGGER], template: REPAIR_TEMPLATE_ID } });
       await this.deps.store.kvSet(key, task.id);
     } catch (error) {
       await this.deps.store.kvDelete(key);

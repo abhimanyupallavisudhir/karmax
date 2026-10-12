@@ -35,6 +35,7 @@ import {
 } from '../coordinators/names.js';
 import { TaskRecord, TaskView, AttentionAsk, Message, Project, TaskInput, ImageRef, FileRef, Tag, SavedView, TaskQuery, AgentRole, AgentSpec, AgentAuthority, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency, remotePolicyOf, ResourceAccess, ResourceTarget } from '../domain/types.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable, awaitsSuccessOf } from '../domain/triggers.js';
+import { BUILT_IN_AUTOMATIONS, automationNeeds, templateTask, type AutomationNeed, type AutomationTemplate } from '../domain/automations.js';
 import { applyTriggerContext, normalizeEventInput, validateFollow, type EventFilter, type EventFollow, type ProjectEvent, type ProjectEventClaim,
   type ProjectEventInput, type ProjectEventOrigin, type TriggerContext } from '../domain/project-events.js';
 import { newId } from '../util/id.js';
@@ -2855,6 +2856,62 @@ export class KarmaxApi {
   }
 
   /** Newest first, each with what it did for every armed task it reached. */
+  // ─── Automations: the gallery of ready-made repeatable tasks ───────────────
+  // src/domain/automations.ts. Installing one creates an ordinary series.
+
+  /** The gallery for a project: built-ins, then the organization's own; each
+   *  says whether the project has it, and what the project lacks for it. */
+  async listAutomations(token: string, projectId: string): Promise<Array<AutomationTemplate & { builtIn: boolean; installed: string[]; missing: AutomationNeed[] }>> {
+    (await this.require(token, 'list_tasks', { projectId }));
+    const project = (await this.deps.store.getProject(projectId));
+    if (!project) throw new NotFoundError(`no project ${projectId}`);
+    const own = (await this.deps.store.listAutomationTemplates(project.organizationId ?? 'org_personal'));
+    const tasks = (await this.deps.store.listTasks(projectId));
+    const has = {
+      github: (await this.deps.store.listProjectRepositories(projectId)).some((entry) => !!entry.repository.gitConnectionId),
+      chat: this.deps.broker ? (await this.incomingWebhooks().list(projectId)).some((hook) => !!hook.kind) : false,
+    };
+    return [...BUILT_IN_AUTOMATIONS.map((template) => ({ ...template, builtIn: true })), ...own.map((template) => ({ ...template, builtIn: false }))]
+      .map((template) => ({ ...template,
+        installed: tasks.filter((task) => task.params?.template === template.id && !task.params?.runOf).map((task) => task.id),
+        missing: automationNeeds(template).filter((need) => !has[need]) }));
+  }
+
+  /** Add an automation to a project: an armed repeatable task, edited like any other. */
+  async installAutomation(token: string, projectId: string, templateId: string): Promise<TaskRecord> {
+    (await this.require(token, 'create_task', { projectId }));
+    const project = (await this.deps.store.getProject(projectId));
+    if (!project) throw new NotFoundError(`no project ${projectId}`);
+    const template = BUILT_IN_AUTOMATIONS.find((candidate) => candidate.id === templateId)
+      ?? (await this.deps.store.listAutomationTemplates(project.organizationId ?? 'org_personal')).find((candidate) => candidate.id === templateId);
+    if (!template) throw new NotFoundError(`no automation ${templateId}`);
+    const existing = (await this.deps.store.listTasks(projectId)).find((task) => task.params?.template === templateId && !task.params?.runOf);
+    if (existing) throw new ValidationError(`this project already has it: ${existing.id}`);
+    return this.createTask(token, { projectId, title: template.task.title, prompt: template.task.prompt, ...(template.task.workflow ? { workflow: template.task.workflow } : {}),
+      params: { ...template.task.params, template: template.id } });
+  }
+
+  /** Save a series as an automation the whole organization can install. */
+  async saveAutomation(token: string, organizationId: string, input: { taskId: string; name: string; summary?: string }): Promise<AutomationTemplate> {
+    const task = (await this.deps.store.getTask(String(input.taskId ?? '')));
+    (await this.require(token, 'get_task', { projectId: task?.projectId ?? '__missing__', taskId: input.taskId }));
+    if (!task || ((await this.deps.store.getProject(task.projectId))?.organizationId ?? 'org_personal') !== organizationId)
+      throw new NotFoundError(`no task ${input.taskId} in this organization`);
+    const caller = (await this.require(token, 'organization:wiki:write', { organizationId }));
+    const name = String(input.name ?? '').trim().slice(0, 80);
+    if (!name) throw new ValidationError('name the automation');
+    if (!hasActiveTriggers(task.params)) throw new ValidationError('only a task with a trigger can be an automation');
+    const saved = templateTask({ title: task.title, workflow: task.workflow, params: task.params as Record<string, unknown> });
+    const template = { id: newId('atm'), organizationId, name, summary: String(input.summary ?? '').trim().slice(0, 300),
+      task: saved, needs: automationNeeds({ task: saved }), createdBy: caller.principal, createdAt: Date.now() };
+    return this.deps.store.saveAutomationTemplate(template);
+  }
+
+  async deleteAutomation(token: string, organizationId: string, templateId: string): Promise<void> {
+    (await this.require(token, 'organization:wiki:write', { organizationId }));
+    if (!(await this.deps.store.deleteAutomationTemplate(organizationId, templateId))) throw new NotFoundError(`no automation ${templateId}`);
+  }
+
   /** A run started by an event follows what the event is about: the issue's
    *  comments, the chat thread's replies reach it as messages. */
   private async followTriggerSubject(task: TaskRecord, trigger: TriggerContext | undefined): Promise<void> {
