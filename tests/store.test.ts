@@ -142,6 +142,49 @@ describe.each(storeBackends)('Store ($name)', ({ name, open }) => {
     expect(await store.kvGet(`resource-checkpoint:${kept.id}:attachment`)).toBeUndefined();
   });
 
+  it('keeps a task\'s delegation and authorization across other projects when one of them is deleted, without that one', async () => {
+    // Task #610: after its agent deleted a throwaway project it had been granted,
+    // every later turn failed to mint ("invalid, expired, or task-mismatched human
+    // delegation"): the whole delegation was revoked, and the task could not run again.
+    const { TokenAuthority } = await import('../src/platform/tokens.js');
+    const tokens = new TokenAuthority(store);
+    const doomed = await store.createProject('Throwaway');
+    const home = await store.createProject('Home');
+    const expiresAt = Date.now() + 60_000;
+    const delegation = (id: string, taskId: string, scope: Record<string, unknown>, parentDelegationId?: string) =>
+      store.putHumanDelegation(id, { id, taskId, humanUserId: 'owner', organizationId: 'org_personal', ...scope,
+        ...(parentDelegationId ? { parentDelegationId } : {}), issuedAt: Date.now(), expiresAt }, expiresAt);
+    const authorization = (delegationId: string) => ({ level: 'developer', scope: 'projects', projectIds: [home.id, doomed.id],
+      organizationId: 'org_personal', capabilities: ['task:read'], delegationId });
+    const own = await store.createTask({ projectId: home.id, title: 'Agent', workflow: 'just-do', workflowVersion: '1',
+      params: { prompt: 'fixture', _authorization: authorization('dlg_own'),
+        _agentAuthorization: { 'agent-1': { ...authorization('dlg_called'), requested: { authorization: { level: 'developer', scope: 'projects', projectIds: [home.id, doomed.id] } } } } } });
+    const inside = await store.createTask({ projectId: doomed.id, title: 'Canary', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'fixture' } });
+    await delegation('dlg_own', own.id, { projectIds: [home.id, doomed.id] });
+    await delegation('dlg_called', own.id, { projectIds: [doomed.id, home.id] }, 'dlg_own');
+    await delegation('dlg_canary', inside.id, { projectIds: [doomed.id, home.id] });
+    await delegation('dlg_only', own.id, { projectIds: [doomed.id] });
+    await delegation('dlg_primary', own.id, { projectId: doomed.id });
+
+    await store.deleteProject(doomed.id);
+
+    const live = async (id: string) => (await store.getHumanDelegation(id))?.projectIds;
+    expect(await live('dlg_own')).toEqual([home.id]);
+    expect(await live('dlg_called')).toEqual([home.id]);
+    for (const id of ['dlg_canary', 'dlg_only', 'dlg_primary']) expect(await store.getHumanDelegation(id)).toBeUndefined();
+    const params = (await store.getTask(own.id))!.params as any;
+    expect(params._authorization.projectIds).toEqual([home.id]);
+    expect(params._authorization.delegationId).toBe('dlg_own');
+    expect(params._agentAuthorization['agent-1'].projectIds).toEqual([home.id]);
+    expect(params._agentAuthorization['agent-1'].requested.authorization.projectIds).toEqual([home.id]);
+    // The next turn mints from what is stored, as `turnAuthority` does.
+    for (const entry of [params._authorization, params._agentAuthorization['agent-1']]) {
+      const minted = await tokens.mint({ taskId: own.id, profileId: 'agent', principal: 'user:owner', projectIds: entry.projectIds,
+        organizationId: 'org_personal', delegationId: entry.delegationId, ceiling: ['task:read'], grantorCaps: ['task:read'] });
+      expect(minted.record.humanSubject?.userId).toBe('owner');
+    }
+  });
+
   it('exports personal data without holding a database write transaction', async () => {
     vi.spyOn(store, 'getSettings').mockImplementation(async () => {
       expect(store.db.inTransaction()).toBe(false);
