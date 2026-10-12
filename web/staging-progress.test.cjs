@@ -52,3 +52,16 @@ test('bringing in sub-tasks\' data says so beside the actions, so a follow-up se
   // With no other action it still shows, rather than "Nothing to do here".
   assert.match(context.taskActions({ taskId: 'task', status: 'active', state: { refreshingResources: true }, actions: [] }), /Bringing in/);
 });
+
+test('saving the task\'s data for a sub-task shows how far it got, and Cancel stays', () => {
+  const S = { taskEvents: [] };
+  const context = vm.createContext({ S });
+  vm.runInContext([esc, fn('formatBytes'), fn('liveOnlyEvent'), fn('stagingProgress'), fn('taskActionLabel'), fn('hasOpenPullRequest'), fn('biggerDiskButton'), fn('taskActions')].join('\n'), context);
+  const cancel = { name: 'cancel', label: 'Cancel', enabled: true, danger: true };
+  const view = { taskId: 'task', status: 'active', state: { preparingSubTask: true }, actions: [cancel] };
+  assert.match(context.taskActions(view), /aria-busy="true"[^>]*>Saving data for a sub-task…<\/button>/);
+  S.taskEvents.push({ type: 'staging.progress', ts: Date.now(),
+    payload: { path: 'raw_data', files: 900, totalFiles: 114000, bytes: 2 * 1024 ** 3, totalBytes: 9.6 * 1024 ** 3 } });
+  assert.match(context.taskActions(view), />Saving raw_data · 2 GB of 9.6 GB<\/button>/);
+  assert.match(context.taskActions(view), /data-act="cancel"/);
+});
