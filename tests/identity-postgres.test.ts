@@ -24,9 +24,13 @@ describe.skipIf(!url)('identity store on PostgreSQL', () => {
     await admin.connect();
     try {
       expect(pool.idleCount).toBeGreaterThan(0);
-      const { rowCount } = await admin.query(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-        WHERE application_name = 'karmax' AND usename = current_user AND pid <> pg_backend_pid()`);
-      expect(rowCount).toBeGreaterThan(0);
+      // Only this pool's own connections: other files in a CI shard share the
+      // process and the server, and killing their idle pools fails this test (#610).
+      const clients = await Promise.all(Array.from({ length: pool.idleCount }, () => pool.connect()));
+      const pids = await Promise.all(clients.map(async (client) => (await client.query('SELECT pg_backend_pid() AS pid')).rows[0].pid as number));
+      for (const client of clients) client.release();
+      const { rowCount } = await admin.query('SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid = ANY($1::int[])', [pids]);
+      expect(rowCount).toBe(pids.length);
       await expect.poll(() => pool.idleCount, { timeout: 5_000 }).toBe(0);
       expect(uncaught).toEqual([]);
       // The pool replaces the lost connection on the next query.
