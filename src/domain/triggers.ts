@@ -278,6 +278,15 @@ export function forcesRepeatable(triggers: TaskTrigger[]): boolean {
   return triggers.some((t) => t.kind === 'schedule' && !!t.cron) || triggers.some(isRecurring);
 }
 
+/**
+ * Is this task a live repeatable series, the row its runs nest under? A draft
+ * (never started, or moved back to drafts) is not, even with `repeatable` set:
+ * it renders as a draft, so its runs must stand on their own.
+ */
+export function isSeries(params: { repeatable?: unknown; draft?: unknown } | undefined): boolean {
+  return !!params?.repeatable && !params?.draft;
+}
+
 /** Params for a run spawned from a series: the original minus trigger + series metadata. */
 export function cloneParamsWithoutTriggers<T extends Record<string, unknown>>(params: T): T {
   const { triggers: _t, triggerState: _s, triggerLastFiredAt: _lf, triggerPending: _tp, draft: _d, repeatable: _r, runOf: _ro, trigger: _tc, ...rest } = params as Record<string, unknown>;

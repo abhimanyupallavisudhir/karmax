@@ -38,7 +38,7 @@ async function main() {
       return [];
     },
   });
-  vm.runInContext(['explanationsEnabled', 'mergeTaskHistory', 'refreshTaskHistory', 'showsTaskApprovals', 'showDraftPage', 'openTask'].map(extract).join('\n'), c);
+  vm.runInContext(['explanationsEnabled', 'mergeTaskHistory', 'refreshTaskHistory', 'showsTaskApprovals', 'showDraftPage', 'isSeries', 'openTask'].map(extract).join('\n'), c);
   let opened = false;
   const opening = c.openTask('task', 'checkin').then(() => { opened = true; });
   await tick();

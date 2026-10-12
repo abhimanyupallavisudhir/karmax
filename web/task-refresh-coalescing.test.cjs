@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const src = fs.readFileSync(`${__dirname}/app.js`, 'utf8');
 const start = src.indexOf('async function refreshTask(');
-const fn = src.slice(start, src.indexOf('\n}', start) + 2);
+const fn = src.slice(start, src.indexOf('\n}', start) + 2) + '\n' + src.slice(src.indexOf('function isSeries('), src.indexOf('\n}', src.indexOf('function isSeries(')) + 2);
 test('RQ-2/UI-6: lifecycle bursts share a read and retain one trailing refresh', async () => {
   const reads = [], releases = [];
   const ctx = vm.createContext({ S: { selected: 't', projectId: 'p', tasks: [] },
