@@ -24,9 +24,11 @@ describe.skipIf(!url)('identity store on PostgreSQL', () => {
     await admin.connect();
     try {
       expect(pool.idleCount).toBeGreaterThan(0);
-      const { rowCount } = await admin.query(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-        WHERE application_name = 'karmax' AND usename = current_user AND pid <> pg_backend_pid()`);
-      expect(rowCount).toBeGreaterThan(0);
+      // This pool's backends only: other files in this process may hold 'karmax'
+      // connections (a checked-out transaction has no idle-error listener).
+      const pids = (pool as unknown as { _clients: pg.Client[] })._clients.map((client) => (client as unknown as { processID: number }).processID);
+      const { rowCount } = await admin.query('SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid = ANY($1::int[])', [pids]);
+      expect(rowCount).toBe(pids.length);
       await expect.poll(() => pool.idleCount, { timeout: 5_000 }).toBe(0);
       expect(uncaught).toEqual([]);
       // The pool replaces the lost connection on the next query.
