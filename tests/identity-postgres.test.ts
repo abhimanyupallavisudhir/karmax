@@ -29,9 +29,14 @@ describe.skipIf(!url)('identity store on PostgreSQL', () => {
       const clients = await Promise.all(Array.from({ length: pool.idleCount }, () => pool.connect()));
       const pids = await Promise.all(clients.map(async (client) => (await client.query('SELECT pg_backend_pid() AS pid')).rows[0].pid as number));
       for (const client of clients) client.release();
+      // The pool reports each lost idle connection as an 'error' and drops it.
+      // Count those rather than wait for no idle connection at all: better-auth
+      // may open another in the background meanwhile.
+      const lost: unknown[] = [];
+      pool.on('error', (error) => { lost.push(error); });
       const { rowCount } = await admin.query('SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid = ANY($1::int[])', [pids]);
       expect(rowCount).toBe(pids.length);
-      await expect.poll(() => pool.idleCount, { timeout: 5_000 }).toBe(0);
+      await expect.poll(() => lost.length, { timeout: 5_000 }).toBe(pids.length);
       expect(uncaught).toEqual([]);
       // The pool replaces the lost connection on the next query.
       expect((await pool.query('SELECT 1 AS one')).rows).toEqual([{ one: 1 }]);
