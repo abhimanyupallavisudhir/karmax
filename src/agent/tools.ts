@@ -203,7 +203,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
       properties: {
         minutes: { type: 'number', description: `Resume after this many minutes at the latest (1–${MAX_WAIT_MINUTES}). With jobs, set it comfortably above their expected run time.` },
         jobs: { type: 'array', items: { type: 'string' }, description: 'Job ids from start_job to wait for.' },
-        needs_input: { type: 'boolean', description: 'While you wait, someone may answer, and you carry on without it at the deadline: ask them and show Needs input instead of Waiting. For an answer you need, use escalate_to_human instead.' },
+        needs_input: { type: 'boolean', description: 'While you wait, someone may answer, and you carry on without it at the deadline: ask them and show Needs input instead of Waiting. Never to report progress. For an answer you need, use escalate_to_human instead.' },
         message: { type: 'string', minLength: 1, maxLength: 4_000, description: 'With needs_input: the question (default: your final response).' },
         audience: {
           type: 'array',
@@ -838,7 +838,8 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'notify',
     description:
-      'Tell or call people and agents of this task without ending your turn. People (user:<id>, @team:<slug>, @creator, ' +
+      'Tell or call people and agents of this task without ending your turn. ' +
+      'Notify a person only when you need them to do something; never for updates on your work. People (user:<id>, @team:<slug>, @creator, ' +
       '@owners, @project, @maintainers, @admins, @all) and Avatars (avatar:<id>) are notified now; agents of this task ' +
       '(agent:do for the main agent, agent:responder, agent:confirm, agent:agent-<n>) are called when your turn ends, in order. ' +
       'The message is said in the task conversation. `agents` calls new agents in, after `to`; each becomes the next ' +
