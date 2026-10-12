@@ -17,6 +17,16 @@ import { taskStatus } from '../domain/search.js';
 /** Ordinal priority names (index = stored value); shared so agents can pass a level name. */
 export const PRIORITY_NAMES = ['none', 'low', 'medium', 'high', 'urgent'] as const;
 
+/** How an agent gives a task it creates what it needs (create_task, both tool surfaces). */
+export const CREATE_TASK_GRANTS = 'Grant it what it needs: `authorization` {level, scope, projectIds?} and vault credentials '
+  + '(`use-credential:item:<id>` | `:tag:<tag>` | `:domain:<domain>`), up to what you hold yourself. '
+  + 'What you cannot grant is not refused: the task is kept as a draft and the result names who can grant it; '
+  + 'ask them with request_permission and its task id.';
+
+/** request_permission's other use: asking for what a task you created is held for. */
+export const REQUEST_FOR_TASK = 'Pass a task id instead to ask for the authorization and credentials a task you created '
+  + 'asked for but you could not grant; you keep working, and a draft starts once they are granted.';
+
 /**
  * The agent roles a task can carry a conversation for. One list so the three
  * role-taking tools agree: `get_conversation` used to advertise `confirm` while

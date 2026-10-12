@@ -1,0 +1,162 @@
+import { describe, expect, it } from 'vitest';
+import { Store } from '../src/store/db.js';
+import { AuthorizationGrantError, AuthorizationService, organizationScope, projectScope } from '../src/platform/authorization.js';
+import { KarmaxApi } from '../src/platform/api.js';
+import { TokenAuthority } from '../src/platform/tokens.js';
+import { VaultItems } from '../src/autonomy/vault-items.js';
+import type { AuthorizationSelection } from '../src/domain/types.js';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { createPlatformMcpServer, apiOps } from '../src/platform/mcp.js';
+import { platformToolHandlers } from '../src/agent/tools.js';
+
+/**
+ * An agent that creates a task gives it the authorization and vault credentials
+ * it needs, up to what the agent itself holds. What it cannot grant is not a dead
+ * end: the task is kept as a draft and the agent asks someone who can grant it,
+ * as a person does from the task form (SPEC §8.2).
+ */
+async function fixture() {
+  const store = await Store.create(':memory:');
+  const organization = await store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
+  const project = await store.createProject('Site', {}, organization.id);
+  const authorization = await AuthorizationService.create(store);
+  await authorization.bootstrapOrganizationOwner('system:test', 'owner', organization.id);
+  for (const userId of ['admin', 'maint', 'dev']) await store.setOrganizationMembership(organization.id, userId, 'member');
+  await authorization.grant('system:test', { principalId: 'user:admin', scopeKey: organizationScope(organization.id), profileId: 'administrator' });
+  await authorization.grant('system:test', { principalId: 'user:maint', scopeKey: projectScope(project.id), profileId: 'maintainer' });
+  await authorization.grant('system:test', { principalId: 'user:dev', scopeKey: projectScope(project.id), profileId: 'developer' });
+  const tokens = new TokenAuthority(store);
+  const started: string[] = [];
+  const client = { workflow: {
+    getHandle: () => ({ executeUpdate: async () => undefined, query: async () => { throw new Error('no live query'); },
+      describe: async () => ({ runId: 'run', status: { name: 'RUNNING' } }), signal: async () => undefined }),
+    start: async (_type: unknown, options: { workflowId: string }) => { started.push(options.workflowId); return {}; },
+  } } as any;
+  const api = new KarmaxApi({ store, client, taskQueue: 'test', tokens, authorization });
+  const human = async (userId: string) => (await tokens.mintPrincipal(`user:${userId}`,
+    await authorization.capabilities(`user:${userId}`, project.id, organization.id), project.id, undefined, organization.id)).token;
+  const vault = new VaultItems(store, undefined, undefined, organization.id);
+  const login = await vault.save({ type: 'login', label: 'Stripe dashboard', domains: ['stripe.com'] });
+  const cap = `use-credential:item:${login.id}`;
+  /** The Do agent of a developer's task: only its own token, no human subject. */
+  const parent = await store.createTask({ projectId: project.id, title: 'Parent', workflow: 'software-dev',
+    workflowVersion: '1.4.0', createdBy: { kind: 'user', userId: 'dev' }, params: { prompt: 'work' } });
+  const agent = async (extra: string[] = []) => {
+    const held = [...await authorization.capabilities('user:dev', project.id, organization.id), ...extra];
+    return (await tokens.mint({ taskId: parent.id, profileId: 'do', role: 'do', principal: `task-agent:${parent.id}:do`,
+      projectId: project.id, organizationId: organization.id, ceiling: held, grantorCaps: held })).token;
+  };
+  const developer: AuthorizationSelection = { level: 'developer', scope: 'projects', projectIds: [project.id] };
+  const maintainer: AuthorizationSelection = { level: 'maintainer', scope: 'projects', projectIds: [project.id] };
+  return { store, organization, project, api, human, agent, cap, developer, maintainer, started, parent };
+}
+
+const credentialsOf = (task: { params: Record<string, unknown> }) =>
+  ((task.params._authorization as { capabilities: string[] }).capabilities).filter((cap) => cap.startsWith('use-credential:'));
+
+describe('an agent creating a task', () => {
+  it('grants it the authorization and credentials the agent holds', async () => {
+    const f = await fixture();
+    const task = await f.api.createTask(await f.agent([f.cap]), { projectId: f.project.id, workflow: 'just-do', prompt: 'pay',
+      authorization: f.developer, credentialGrants: [f.cap], holdForAuthorization: true });
+    expect(task.params.draft).toBe(false);
+    expect(task.authorizationGap).toBeUndefined();
+    expect(task.params._authorization).toMatchObject({ level: 'developer', profileAttenuated: false });
+    expect(credentialsOf(task)).toEqual([f.cap]);
+  });
+
+  it('keeps a task it cannot fully grant as a draft and says whom to ask', async () => {
+    const f = await fixture();
+    const held = await f.api.createTask(await f.agent(), { projectId: f.project.id, workflow: 'just-do', prompt: 'deploy',
+      authorization: f.maintainer, credentialGrants: [f.cap], holdForAuthorization: true });
+    expect(held.params.draft).toBe(true);
+    expect(held.params._authorization).toMatchObject({ profileAttenuated: true, attenuationAccepted: false });
+    expect(held.authorizationGap).toMatchObject({ summon: '@admins', missingCapabilities: expect.arrayContaining(['project:edit', f.cap]) });
+    expect(held.authorizationGap!.next).toContain(`request_permission`);
+    expect(held.authorizationGap!.next).toContain(held.id);
+    // Without the option the API still refuses, so the console can show its dialog.
+    await expect(f.api.createTask(await f.agent(), { projectId: f.project.id, workflow: 'just-do', prompt: 'deploy',
+      authorization: f.maintainer })).rejects.toBeInstanceOf(AuthorizationGrantError);
+  });
+
+  it('asks for the draft’s missing grant with one call, and the task starts once approved', async () => {
+    const f = await fixture();
+    const agent = await f.agent();
+    const held = await f.api.createTask(agent, { projectId: f.project.id, workflow: 'just-do', prompt: 'deploy',
+      authorization: f.maintainer, credentialGrants: [f.cap], holdForAuthorization: true });
+    const asked = await f.api.requestPermission(agent, { taskId: held.id, reason: 'It deploys the site and pays Stripe.' });
+    expect(asked).toMatchObject({ status: 'needs_approval', audience: ['@admins'] });
+    const [request] = await f.api.listAuthorizationRequests(await f.human('owner'), { organizationId: f.organization.id, taskId: held.id });
+    expect(request).toMatchObject({ id: asked.requestId, authorization: f.maintainer, credentialGrants: [f.cap],
+      target: { kind: 'task', taskId: held.id, queueAfterApproval: true }, reason: 'It deploys the site and pays Stripe.' });
+    expect([...request!.recipients].sort()).toEqual(['admin', 'owner']);
+    // Asking does not hold the asking agent's own task.
+    expect((await f.store.getTask(f.parent.id))!.lastView?.waitingFor).toBeUndefined();
+
+    const resolved = await f.api.resolveAuthorizationRequest(await f.human('admin'), {
+      organizationId: f.organization.id, requestId: request!.id, action: 'approve' });
+    expect(resolved).toMatchObject({ status: 'granted', queued: true });
+    const task = (await f.store.getTask(held.id))!;
+    expect(task.params.draft).toBe(false);
+    expect(task.params._authorization).toMatchObject({ level: 'maintainer', profileAttenuated: false });
+    expect(credentialsOf(task)).toEqual([f.cap]);
+  });
+
+  it('routes the ask to the audience it names', async () => {
+    const f = await fixture();
+    const agent = await f.agent();
+    const held = await f.api.createTask(agent, { projectId: f.project.id, workflow: 'just-do', prompt: 'deploy',
+      authorization: f.maintainer, holdForAuthorization: true });
+    expect(held.authorizationGap).toMatchObject({ summon: '@maintainers' });
+    const asked = await f.api.requestPermission(agent, { taskId: held.id, audience: ['user:maint'], reason: 'Deploys.' });
+    expect(asked).toMatchObject({ status: 'needs_approval', audience: ['user:maint'] });
+  });
+
+  it('cannot ask on behalf of a task it did not create, nor for one that needs nothing', async () => {
+    const f = await fixture();
+    const own = await f.api.createTask(await f.agent(), { projectId: f.project.id, workflow: 'just-do', prompt: 'small',
+      authorization: f.developer, draft: true, holdForAuthorization: true });
+    await expect(f.api.requestPermission(await f.agent(), { taskId: own.id, reason: 'x' })).rejects.toThrow(/already has/);
+    const someoneElses = await f.api.createTask(await f.human('dev'), { projectId: f.project.id, workflow: 'just-do',
+      prompt: 'deploy', authorization: f.maintainer, draft: true, allowAttenuation: true });
+    await expect(f.api.requestPermission(await f.agent(), { taskId: someoneElses.id, reason: 'x' }))
+      .rejects.toThrow(/only the task creator/);
+  });
+});
+
+describe('the agent tools', () => {
+  it('create_task grants what it can, keeps the rest as a draft, and request_permission asks for it (MCP)', async () => {
+    const f = await fixture();
+    const agent = await f.agent();
+    const server = createPlatformMcpServer(apiOps(f.api, () => agent));
+    const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverSide);
+    const client = new Client({ name: 'test', version: '1' });
+    await client.connect(clientSide);
+    const text = (result: any) => result.content[0].text as string;
+
+    const plain = await client.callTool({ name: 'create_task', arguments: { projectId: f.project.id, title: 'Small', prompt: 'small',
+      workflow: 'just-do', authorization: f.developer } });
+    expect((await f.store.getTask(text(plain)))!.params._authorization).toMatchObject({ level: 'developer', profileAttenuated: false });
+
+    const held: any = JSON.parse(text(await client.callTool({ name: 'create_task', arguments: { projectId: f.project.id,
+      title: 'Deploy', prompt: 'deploy', workflow: 'just-do', authorization: f.maintainer, credentialGrants: [f.cap] } })));
+    expect(held).toMatchObject({ draft: true, authorizationGap: { summon: '@admins' } });
+    const asked: any = JSON.parse(text(await client.callTool({ name: 'request_permission',
+      arguments: { taskId: held.id, reason: 'It deploys the site.' } })));
+    expect(asked).toMatchObject({ status: 'needs_approval', audience: ['@admins'] });
+  });
+
+  it('create_task and request_permission send the grant and the task id (provider-neutral)', async () => {
+    const calls: Array<{ method: string; path: string; body: any }> = [];
+    const handlers = platformToolHandlers({} as any, { emit() {}, emitActivity() {},
+      platformRequest: async (method: string, path: string, body: unknown) => { calls.push({ method, path, body }); return { id: 'task_x' }; } } as any);
+    const authorization = { level: 'maintainer', scope: 'projects', projectIds: ['p'] };
+    await handlers.create_task!({ project_id: 'p', title: 't', prompt: 'x', authorization, credential_grants: ['use-credential:item:i'] });
+    expect(calls[0]).toMatchObject({ method: 'POST', path: '/api/projects/p/tasks',
+      body: { authorization, credentialGrants: ['use-credential:item:i'], holdForAuthorization: true } });
+    await handlers.request_permission!({ task_id: 'task_x', reason: 'needs it' });
+    expect(calls[1]).toMatchObject({ method: 'POST', path: '/api/agent/permission-requests', body: { taskId: 'task_x', reason: 'needs it' } });
+  });
+});
