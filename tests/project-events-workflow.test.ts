@@ -101,6 +101,29 @@ describe('project events start runs (real gateway + Temporal)', () => {
     expect(bad.status).toBe(400);
   }, 120_000);
 
+  it('delivers a comment on an issue to the run working on it, without a second run', async () => {
+    const issue = 'https://github.com/acme/app/issues/31';
+    const series = await createSeries({ title: 'Build {{issue.title}}', prompt: 'Build what the issue asks.',
+      params: { triggers: [{ kind: 'event', type: 'github.issues.labeled', where: { 'label.name': 'planned' }, recurring: true }] } });
+    const github = (type: string, key: string, payload: Record<string, unknown>) => h.store.recordProjectEvent({ organizationId: 'org_personal', projectId,
+      source: 'github', type, key, subject: issue, occurredAt: Date.now(), receivedAt: Date.now(), origin: 'external', hops: 0, payload });
+    scheduler.projectEventRecorded((await github('github.issues.labeled', 'gh-31-1', { label: { name: 'planned' }, issue: { number: 31, title: 'Dark mode' } })).event);
+    await scheduler.drain();
+    await expect.poll(async () => (await runsOf(series.id)).length, { timeout: 30_000 }).toBe(1);
+    const [run] = await runsOf(series.id);
+    expect(await h.store.taskFollows(run!.id)).toMatchObject([{ subject: issue }]);
+    await expect.poll(async () => (await view(run!.id))?.status, { timeout: 30_000 }).not.toBe(undefined);
+
+    const follows = (await (await fetch(`${base}/api/tasks/${run!.id}/follows`, { headers: auth() })).json()) as { follows: unknown[] };
+    expect(follows.follows).toHaveLength(1);
+    scheduler.projectEventRecorded((await github('github.issue_comment.created', 'gh-31-2',
+      { issue: { number: 31 }, comment: { body: 'Please also cover the settings page.' } })).event);
+    await scheduler.drain();
+    expect(await runsOf(series.id)).toHaveLength(1);
+    await expect.poll(async () => JSON.stringify((await view(run!.id))?.messages ?? []), { timeout: 30_000 })
+      .toContain('Please also cover the settings page.');
+  }, 120_000);
+
   it('repairs a failed deployment with the project\'s own repair task, telling its open run about a repeat', async () => {
     const github = new GithubEvents({ api: h.api, store: h.store, tokens: h.tokens });
     const failure = (runId: number) => ({ projectId, type: 'github.workflow.failed' as const, payload: {
