@@ -24,19 +24,12 @@ describe.skipIf(!url)('identity store on PostgreSQL', () => {
     await admin.connect();
     try {
       expect(pool.idleCount).toBeGreaterThan(0);
-      // Only this pool's own connections: other files in a CI shard share the
-      // process and the server, and killing their idle pools fails this test (#610).
-      const clients = await Promise.all(Array.from({ length: pool.idleCount }, () => pool.connect()));
-      const pids = await Promise.all(clients.map(async (client) => (await client.query('SELECT pg_backend_pid() AS pid')).rows[0].pid as number));
-      for (const client of clients) client.release();
-      // The pool reports each lost idle connection as an 'error' and drops it.
-      // Count those rather than wait for no idle connection at all: better-auth
-      // may open another in the background meanwhile.
-      const lost: unknown[] = [];
-      pool.on('error', (error) => { lost.push(error); });
+      // This pool's backends only: other files in this process may hold 'karmax'
+      // connections (a checked-out transaction has no idle-error listener).
+      const pids = (pool as unknown as { _clients: pg.Client[] })._clients.map((client) => (client as unknown as { processID: number }).processID);
       const { rowCount } = await admin.query('SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid = ANY($1::int[])', [pids]);
       expect(rowCount).toBe(pids.length);
-      await expect.poll(() => lost.length, { timeout: 5_000 }).toBe(pids.length);
+      await expect.poll(() => pool.idleCount, { timeout: 5_000 }).toBe(0);
       expect(uncaught).toEqual([]);
       // The pool replaces the lost connection on the next query.
       expect((await pool.query('SELECT 1 AS one')).rows).toEqual([{ one: 1 }]);

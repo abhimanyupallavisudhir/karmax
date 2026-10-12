@@ -14,7 +14,7 @@
  * (tests/search.test.ts) without booting Temporal.
  */
 import { TaskRecord, TaskQuery, FilterClause, Tag, SortClause, PRIORITIES, AttentionAsk } from './types.js';
-import { normalizeTriggers, isRecurring, nextCronFire, TaskTrigger } from './triggers.js';
+import { normalizeTriggers, isRecurring, isSeries, nextCronFire, TaskTrigger } from './triggers.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
 
 /** A task as seen by search: the stored record, whose `lastView`/`tags` are hydrated. */
@@ -46,6 +46,10 @@ export interface EvalContext {
   people?: Map<string, string>;
   /** project id → its name and URL slug, for `project:` and `group:project`. */
   projects?: Map<string, { name: string; slug?: string }>;
+  /** Ids of live series the evaluated tasks don't include (an archived series
+   *  skipped by the read), so their runs still nest. Series among the evaluated
+   *  tasks are found by themselves. */
+  seriesIds?: Set<string>;
 }
 export interface FieldContext extends EvalContext {
   /** task id → per-project number, so deps can be shown/matched as `#num`. */
@@ -62,6 +66,8 @@ export interface FieldContext extends EvalContext {
   nextRun?: Map<string, number | undefined>;
   /** The asks of each person the query's positive `for:` clauses name. */
   askedOf?: Map<string, AttentionAsk>[];
+  /** Every live series a run may nest under (see `isSeries`). */
+  series?: Set<string>;
 }
 
 export type FieldType = 'text' | 'enum' | 'number' | 'date' | 'tag' | 'facet';
@@ -181,8 +187,11 @@ function facetsOf(t: SearchTask, ctx?: FieldContext): string[] {
   if (triggers.some((x) => x.kind === 'schedule')) f.push('scheduled');
   if (triggers.some(isRecurring) || t.params?.repeatable) f.push('recurring');
   if (isArmed(t) && triggers.some((x) => x.kind === 'dependency')) f.push('blocked-on-deps');
-  if (t.params?.repeatable) f.push('series');
-  if (t.params?.runOf) f.push('run');
+  if (isSeries(t.params)) f.push('series');
+  // A run is nested under its series row, so only while that series is live:
+  // once it is un-ticked, moved to drafts or deleted, the run is an ordinary task.
+  const runOf = t.params?.runOf;
+  if (typeof runOf === 'string' && (ctx?.series ? ctx.series.has(runOf) : true)) f.push('run');
   return f;
 }
 
@@ -633,7 +642,9 @@ function enrichContext(tasks: SearchTask[], ctx: EvalContext, query: TaskQuery):
   for (const t of tasks) if (t.num != null) idToNum.set(t.id, t.num);
   const blockedBy = new Map<string, SearchTask[]>();
   const nextRun = new Map<string, number | undefined>();
+  const series = new Set(ctx.seriesIds);
   for (const t of tasks) {
+    if (isSeries(t.params)) series.add(t.id);
     for (const dep of dependencyIds(t)) {
       const arr = blockedBy.get(dep) ?? blockedBy.set(dep, []).get(dep)!;
       arr.push(t);
@@ -644,7 +655,7 @@ function enrichContext(tasks: SearchTask[], ctx: EvalContext, query: TaskQuery):
       nextRun.set(t.id, nextRunOf(t, ctx.now));
   }
   const askedOf = positiveForUsers(query, ctx).map((user) => ctx.attention?.get(user)).filter((asks): asks is Map<string, AttentionAsk> => !!asks);
-  return { ...ctx, idToNum, blockedBy, nextRun, askedOf };
+  return { ...ctx, idToNum, blockedBy, nextRun, askedOf, series };
 }
 
 export function evaluateQuery(tasks: SearchTask[], query: TaskQuery, ctx: EvalContext): EvalResult {

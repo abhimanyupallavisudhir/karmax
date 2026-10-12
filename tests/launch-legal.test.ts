@@ -150,9 +150,15 @@ describe('paid-launch policies', () => {
     expect(cloudflare).toContain('; and, in a separate bucket, encrypted backups of tavya’s databases (encrypted before upload; kept 31 days); '
       + 'and, for agent mailboxes, inbound email routing that delivers messages to tavya without storing them.');
     expect(cloudflare).toMatch(/^Cloudflare \(R2, Email Routing\) — /);
+  });
+
+  it('says how long older versions of data are kept, as a new policy version (2026-10-12.1)', () => {
+    const retention = policyDocument('data')!.sections.find((section) => section.heading === 'Retention')!.paragraphs.join(' ');
+    expect(retention).toContain('Older versions of project data in managed storage are deleted 30 days after a newer version replaces them, '
+      + 'unless a task still uses them; data in a storage bucket an organization connects itself keeps every version.');
     // A changed disclosure is a new version: acceptance evidence names the text a person saw.
-    expect(policyDocument('subprocessors')!.version).toBe('2026-10-10.1');
-    expect(policyDocument('subprocessors')!.effectiveDate).toBe('October 10, 2026');
+    expect(policyDocument('data')!.version).toBe('2026-10-12.1');
+    expect(policyDocument('data')!.effectiveDate).toBe('October 12, 2026');
   });
 
   it('incorporates a scoped processing addendum without claiming execution or launch approval', () => {
