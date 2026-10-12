@@ -8641,7 +8641,7 @@ async function renderSeriesPage(rec) {
       </div></div>
       <div class="tp-foot" id="tp-foot"><div class="tp-foot-inner">
         <button class="btn" id="sd-runagain">Run again</button>
-        ${rec.params?.triggers?.length ? `<button class="btn ghost" id="sd-save-automation" title="Let every project in this organization add it from Settings → Events">Save as automation</button>` : ''}
+        ${rec.params?.triggers?.length ? `<button class="btn ghost" id="sd-save-automation" title="Let every project in this organization add it from its automations">Save as automation</button>` : ''}
         <span style="flex:1"></span>
         <button class="btn primary" id="sd-save">Save changes</button>
       </div></div>
