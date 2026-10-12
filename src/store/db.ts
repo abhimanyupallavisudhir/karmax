@@ -83,7 +83,8 @@ import {
   type OrganizationEntitlements,
 } from '../domain/entitlements.js';
 import { newId } from '../util/id.js';
-import { EVENT_RETENTION_MS as PROJECT_EVENT_RETENTION_MS, type ProjectEvent, type ProjectEventClaim,
+import type { AutomationTemplate } from '../domain/automations.js';
+import { EVENT_RETENTION_MS as PROJECT_EVENT_RETENTION_MS, type EventFollow, type ProjectEvent, type ProjectEventClaim,
   type ProjectEventClaimState } from '../domain/project-events.js';
 import { paymentMerchantMatches } from '../util/payment-merchant.js';
 import { previewHostname } from '../gateway/previews.js';
@@ -937,6 +938,18 @@ export class Store {
         origin TEXT NOT NULL, hops INTEGER NOT NULL, dispatchedAt INTEGER,
         UNIQUE (projectId, source, eventKey)
       );
+      -- Tasks following project events: each match reaches the task's
+      -- conversation as a message (src/domain/project-events.ts EventFollow).
+      CREATE TABLE IF NOT EXISTS task_follows (
+        id TEXT PRIMARY KEY, taskId TEXT NOT NULL, projectId TEXT NOT NULL, filter TEXT NOT NULL,
+        once INTEGER NOT NULL DEFAULT 0, createdAt INTEGER NOT NULL
+      );
+      -- Automations an organization saved (src/domain/automations.ts); the
+      -- built-ins live in code.
+      CREATE TABLE IF NOT EXISTS automation_templates (
+        id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, name TEXT NOT NULL, summary TEXT NOT NULL,
+        task TEXT NOT NULL, needs TEXT, createdBy TEXT, createdAt INTEGER NOT NULL
+      );
       -- What one event did for one armed task: at most one run per pair.
       -- state: pending (a run is starting) | started | deferred | skipped.
       CREATE TABLE IF NOT EXISTS project_event_claims (
@@ -1075,6 +1088,9 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_preview_expiry ON preview_leases(expiresAt, revokedAt);
       CREATE INDEX IF NOT EXISTS idx_delivery_pending ON delivery_outbox(state, nextAt);
       CREATE INDEX IF NOT EXISTS idx_project_events_dispatch ON project_events(dispatchedAt, receivedAt);
+      CREATE INDEX IF NOT EXISTS idx_task_follows_project ON task_follows(projectId);
+      CREATE INDEX IF NOT EXISTS idx_automation_templates_org ON automation_templates(organizationId, createdAt);
+      CREATE INDEX IF NOT EXISTS idx_task_follows_task ON task_follows(taskId);
       CREATE INDEX IF NOT EXISTS idx_project_events_project ON project_events(projectId, receivedAt);
       CREATE INDEX IF NOT EXISTS idx_project_events_received ON project_events(receivedAt);
       CREATE INDEX IF NOT EXISTS idx_project_event_claims_state ON project_event_claims(state, receivedAt);
@@ -1918,6 +1934,7 @@ export class Store {
       (await deleteRows(this.db, 'inbox', 'id', authorizationInboxIds));
       (await this.db.prepare('DELETE FROM project_event_claims WHERE eventId IN (SELECT id FROM project_events WHERE projectId=?)').run(id));
       (await this.db.prepare('DELETE FROM project_events WHERE projectId=?').run(id));
+      (await this.db.prepare('DELETE FROM task_follows WHERE projectId=?').run(id));
       // Incoming webhooks (src/integrations/incoming-webhooks.ts). CASE keeps
       // PostgreSQL from parsing every other kv value as JSON.
       (await this.db.prepare(`DELETE FROM kv WHERE k LIKE 'incoming-webhook:%'
@@ -2427,6 +2444,8 @@ export class Store {
       payment_transactions: (await selectRows(this.db, 'payment_transactions', 'organizationId=?', [organizationId])),
       payment_events: (await selectRows(this.db, 'payment_events', 'organizationId=?', [organizationId])),
       project_events: (await selectRows(this.db, 'project_events', 'organizationId=?', [organizationId])),
+      task_follows: (await rowsFor(this.db, 'task_follows', 'projectId', projectIds)),
+      automation_templates: (await selectRows(this.db, 'automation_templates', 'organizationId=?', [organizationId])),
       project_event_claims: (await rowsFor(this.db, 'project_event_claims', 'eventId',
         ((await this.db.prepare('SELECT id FROM project_events WHERE organizationId=?').all(organizationId)) as Array<{ id: unknown }>).map((r) => String(r.id)))),
       subscription_gifts: (await selectRows(this.db, 'subscription_gifts', 'organizationId=?', [organizationId])),
@@ -2679,6 +2698,8 @@ export class Store {
       (await deleteRows(this.db, 'cards', 'scopeId', [organizationId, ...projectIds]));
       (await this.db.prepare('DELETE FROM project_event_claims WHERE eventId IN (SELECT id FROM project_events WHERE organizationId=?)').run(organizationId));
       (await this.db.prepare('DELETE FROM project_events WHERE organizationId=?').run(organizationId));
+      (await deleteRows(this.db, 'task_follows', 'projectId', projectIds));
+      (await this.db.prepare('DELETE FROM automation_templates WHERE organizationId=?').run(organizationId));
       (await this.db.prepare(`DELETE FROM kv WHERE k LIKE 'incoming-webhook:%'
         AND (CASE WHEN k LIKE 'incoming-webhook:%' THEN json_extract(v, '$.organizationId') END)=?`).run(organizationId));
       (await this.db.prepare('DELETE FROM payment_events WHERE organizationId=?').run(organizationId));
@@ -4810,6 +4831,7 @@ export class Store {
       (await this.db.prepare('DELETE FROM events WHERE taskId = ?').run(taskId));
       (await this.db.prepare('DELETE FROM task_tags WHERE taskId = ?').run(taskId));
       (await this.db.prepare('DELETE FROM task_subscribers WHERE taskId = ?').run(taskId));
+      (await this.db.prepare('DELETE FROM task_follows WHERE taskId = ?').run(taskId));
       (await this.db.prepare('DELETE FROM task_confirmation WHERE taskId = ?').run(taskId));
       (await this.db.prepare('DELETE FROM confirmation_votes WHERE taskId = ?').run(taskId));
       (await this.db.prepare('DELETE FROM collaboration_requests WHERE requesterTaskId = ? OR targetTaskId = ?').run(taskId, taskId));
@@ -5351,9 +5373,11 @@ export class Store {
     } else if (ev.type === 'task.mentioned') {
       kind = 'mentioned';
       // An @mention in a task's conversation is addressed to people: an ask, like
-      // a review request. (Historical single-principal mentions stay routine.)
+      // a review request — unless it is a reply the task does not wait on
+      // (`ask: false`), news until read (#613). (Historical single-principal
+      // mentions stay routine.)
       if (Array.isArray(ev.payload.recipients)) {
-        actionable = true;
+        actionable = ev.payload.ask !== false;
         users = (await this.humanAudience(task.id, ev.payload.recipients.map(String)));
       } else {
         const mentioned = ev.payload.principal as PrincipalRef | undefined;
@@ -5405,6 +5429,12 @@ export class Store {
       if (!actionable && !preferences.routine) continue;
       const existing = (await this.db.prepare('SELECT id FROM inbox WHERE userId=? AND taskId=? AND kind=?')
         .get(userId, task.id, kind)) as any;
+      if (existing && kind === 'mentioned') {
+        // Another message to them: unread again, and still an ask if either was.
+        (await this.db.prepare(`UPDATE inbox SET eventSeq=?, actionable=CASE WHEN ?=1 THEN 1 ELSE actionable END, unread=1, readAt=NULL${requested ? ', urgency=?' : ''} WHERE id=?`)
+          .run(eventSeq, actionable ? 1 : 0, ...(requested ? [urgencyRank(requested)] : []), existing.id));
+        continue;
+      }
       if (existing) {
         // The same ask, restated. Point it at the newest event but leave its age
         // and read state alone: a repeat is not a new notification.
@@ -5412,11 +5442,13 @@ export class Store {
           .run(eventSeq, actionable ? 1 : 0, ...(requested ? [urgencyRank(requested)] : []), existing.id));
         continue;
       }
-      if (actionable && kind === 'mentioned') {
+      if (kind === 'mentioned') {
         // A mention never displaces a stronger ask on the same task: the person is
         // already asked to look at it.
         if ((await this.db.prepare("SELECT 1 FROM inbox WHERE userId=? AND taskId=? AND actionable=1 AND kind<>'mentioned'").get(userId, task.id))) continue;
-      } else if (actionable) (await this.deleteInbox('userId=? AND taskId=? AND actionable=1', [userId, task.id]));
+        // An ask supersedes a reply that asked nothing.
+        if (actionable) (await this.deleteInbox("userId=? AND taskId=? AND kind='mentioned' AND actionable=0", [userId, task.id]));
+      } else if (actionable) (await this.deleteInbox("userId=? AND taskId=? AND (actionable=1 OR kind='mentioned')", [userId, task.id]));
       const item: InboxItem = { id: newId('inbox'), organizationId: project.organizationId, userId, eventSeq,
         taskId: task.id, kind, urgency: requested ?? DEFAULT_URGENCY[kind], unread: true, actionable, createdAt: ev.ts };
       const inserted = (await this.db.prepare(`INSERT OR IGNORE INTO inbox
@@ -9184,6 +9216,13 @@ export class Store {
   }
 
   /** Runs one armed task started from events since `since` (its hourly limit). */
+  /** Events delivered (or being delivered) to a following task since `since`. */
+  async projectEventsToldSince(taskId: string, since: number): Promise<number> {
+    const row = await this.db.prepare(`SELECT COUNT(*) n FROM project_event_claims
+      WHERE taskId=? AND state IN ('pending', 'told') AND updatedAt>?`).get(taskId, since) as { n: number };
+    return Number(row?.n ?? 0);
+  }
+
   async projectEventRunsSince(taskId: string, since: number): Promise<number> {
     const row = await this.db.prepare(`SELECT COUNT(*) n FROM project_event_claims
       WHERE taskId=? AND state IN ('pending', 'started') AND updatedAt>?`).get(taskId, since) as { n: number };
@@ -9195,7 +9234,7 @@ export class Store {
   async projectEventSlot(taskId: string, concurrencyKey: string): Promise<{ runId?: string } | undefined> {
     const row = await this.db.prepare(`SELECT c.state, c.runId FROM project_event_claims c LEFT JOIN tasks t ON t.id=c.runId
       WHERE c.taskId=? AND c.concurrencyKey=? AND (c.state='pending' OR (c.state='started' AND t.id IS NOT NULL
-        AND IFNULL(json_extract(t.lastView, '$.status'), 'active') NOT IN ('done', 'failed', 'cancelled')))
+        AND COALESCE(json_extract(t.lastView, '$.status'), 'active') NOT IN ('done', 'failed', 'cancelled')))
       ORDER BY CASE c.state WHEN 'started' THEN 0 ELSE 1 END LIMIT 1`).get(taskId, concurrencyKey) as { state?: string; runId?: string } | undefined;
     if (!row) return undefined;
     return row.state === 'started' && row.runId ? { runId: String(row.runId) } : {};
@@ -9208,9 +9247,72 @@ export class Store {
     return row?.id ? String(row.id) : undefined;
   }
 
+  async saveAutomationTemplate(template: AutomationTemplate & { organizationId: string; createdAt: number }): Promise<AutomationTemplate> {
+    await this.db.transaction(async () => {
+      await this.db.prepare(`INSERT INTO automation_templates (id, organizationId, name, summary, task, needs, createdBy, createdAt)
+        VALUES (?,?,?,?,?,?,?,?)`).run(template.id, template.organizationId, template.name, template.summary, JSON.stringify(template.task),
+        template.needs ? JSON.stringify(template.needs) : null, template.createdBy ?? null, template.createdAt);
+    });
+    return template;
+  }
+
+  async listAutomationTemplates(organizationId: string): Promise<AutomationTemplate[]> {
+    const rows = await this.db.prepare('SELECT * FROM automation_templates WHERE organizationId=? ORDER BY createdAt').all(organizationId);
+    return rows.map((row: any) => ({ id: String(row.id), organizationId: String(row.organizationId), name: String(row.name),
+      summary: String(row.summary), task: JSON.parse(String(row.task)), ...(row.needs ? { needs: JSON.parse(String(row.needs)) } : {}),
+      ...(row.createdBy ? { createdBy: String(row.createdBy) } : {}), createdAt: Number(row.createdAt) }));
+  }
+
+  async deleteAutomationTemplate(organizationId: string, id: string): Promise<boolean> {
+    return this.db.transaction(async () => Number((await this.db.prepare('DELETE FROM automation_templates WHERE organizationId=? AND id=?')
+      .run(organizationId, id)).changes) === 1);
+  }
+
+  async addTaskFollow(follow: EventFollow): Promise<EventFollow> {
+    const { id, taskId, projectId, once, createdAt, ...filter } = follow;
+    await this.db.transaction(async () => {
+      await this.db.prepare('INSERT INTO task_follows (id, taskId, projectId, filter, once, createdAt) VALUES (?,?,?,?,?,?)')
+        .run(id, taskId, projectId, JSON.stringify(filter), once ? 1 : 0, createdAt);
+    });
+    return follow;
+  }
+
+  /** Follows of tasks in a project that is not finished (the dispatcher's candidates). */
+  async liveTaskFollows(projectId: string): Promise<Array<EventFollow & { emitter: string }>> {
+    const rows = await this.db.prepare(`SELECT f.*, COALESCE(json_extract(t.params, '$.runOf'), t.id) emitter
+      FROM task_follows f JOIN tasks t ON t.id=f.taskId
+      WHERE f.projectId=? AND COALESCE(json_extract(t.lastView, '$.status'), 'active') NOT IN ('done', 'failed', 'cancelled')
+      ORDER BY f.createdAt`).all(projectId);
+    return rows.map((row: any) => ({ ...taskFollowFromRow(row), emitter: String(row.emitter) }));
+  }
+
+  async taskFollows(taskId: string): Promise<EventFollow[]> {
+    const rows = await this.db.prepare('SELECT * FROM task_follows WHERE taskId=? ORDER BY createdAt').all(taskId);
+    return rows.map(taskFollowFromRow);
+  }
+
+  async getTaskFollow(id: string): Promise<EventFollow | undefined> {
+    const row = await this.db.prepare('SELECT * FROM task_follows WHERE id=?').get(id);
+    return row ? taskFollowFromRow(row) : undefined;
+  }
+
+  async deleteTaskFollow(id: string): Promise<boolean> {
+    return this.db.transaction(async () => Number((await this.db.prepare('DELETE FROM task_follows WHERE id=?').run(id)).changes) === 1);
+  }
+
+  /** Whether this event already reached this task (as its run's start or a message). */
+  async projectEventReached(eventId: string, taskId: string): Promise<boolean> {
+    const row = await this.db.prepare(`SELECT 1 hit FROM project_event_claims WHERE eventId=? AND (taskId=? OR runId=?)
+      AND state IN ('pending', 'started', 'told') LIMIT 1`).get(eventId, taskId, taskId);
+    return !!row;
+  }
+
   async pruneProjectEvents(before: number): Promise<number> {
     return this.db.transaction(async () => {
       await this.db.prepare(`DELETE FROM project_event_claims WHERE receivedAt<?`).run(before);
+      // A finished task hears nothing more; one deleted is gone.
+      await this.db.prepare(`DELETE FROM task_follows WHERE taskId NOT IN (SELECT id FROM tasks WHERE
+        COALESCE(json_extract(lastView, '$.status'), 'active') NOT IN ('done', 'failed', 'cancelled'))`).run();
       return Number((await this.db.prepare(`DELETE FROM project_events WHERE id IN
         (SELECT id FROM project_events WHERE receivedAt<? ORDER BY receivedAt LIMIT 10000)`).run(before)).changes);
     });
@@ -9334,10 +9436,25 @@ export class Store {
     return this.db.transaction(async () => {
     const now = Date.now();
     let revoked = 0;
-    if (scope.projectId)
+    if (scope.projectId) {
+      // A token that also reaches other projects loses only this one (an agent
+      // granted a throwaway project keeps working when it is deleted), unless
+      // this project is its own: its primary project or its task's.
+      const shared = (await this.db.prepare(`SELECT t.tokenHash, t.json FROM scoped_tokens t
+        JOIN scoped_token_projects p ON p.tokenHash=t.tokenHash AND p.projectId=?
+        WHERE t.revokedAt IS NULL AND EXISTS (SELECT 1 FROM scoped_token_projects o
+          WHERE o.tokenHash=t.tokenHash AND o.projectId<>?)`).all(scope.projectId, scope.projectId)) as Array<{ tokenHash: string; json: string }>;
+      for (const row of shared) {
+        const record = JSON.parse(row.json) as { projectId?: unknown; taskId?: unknown };
+        const task = typeof record.taskId === 'string'
+          ? (await this.db.prepare('SELECT projectId FROM tasks WHERE id=?').get(record.taskId)) as { projectId: string } | undefined : undefined;
+        if (record.projectId !== scope.projectId && task?.projectId !== scope.projectId)
+          (await this.db.prepare('DELETE FROM scoped_token_projects WHERE tokenHash=? AND projectId=?').run(row.tokenHash, scope.projectId));
+      }
       revoked += Number((await this.db.prepare(`UPDATE scoped_tokens SET revokedAt=? WHERE revokedAt IS NULL
         AND tokenHash IN (SELECT tokenHash FROM scoped_token_projects WHERE projectId=?)`)
         .run(now, scope.projectId)).changes);
+    }
     if (scope.organizationId)
       revoked += Number((await this.db.prepare('UPDATE scoped_tokens SET revokedAt=? WHERE revokedAt IS NULL AND organizationId=?')
         .run(now, scope.organizationId)).changes);
@@ -10222,4 +10339,10 @@ function projectEventClaimFromRow(row: any): ProjectEventClaim {
     ...(row.concurrencyKey !== null && row.concurrencyKey !== undefined ? { concurrencyKey: String(row.concurrencyKey) } : {}),
     receivedAt: Number(row.receivedAt), updatedAt: Number(row.updatedAt),
   };
+}
+
+function taskFollowFromRow(row: any): EventFollow {
+  const filter = JSON.parse(String(row.filter)) as Omit<EventFollow, 'id' | 'taskId' | 'projectId' | 'once' | 'createdAt'>;
+  return { id: String(row.id), taskId: String(row.taskId), projectId: String(row.projectId), ...filter,
+    ...(Number(row.once) ? { once: true } : {}), createdAt: Number(row.createdAt) };
 }

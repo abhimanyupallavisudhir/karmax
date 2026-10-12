@@ -11,6 +11,7 @@ import { REPOSITORY_ROUTE, RepositoryTokens, parseRepositoryName, repositoryName
   type RepositoryAccess } from './resource-repository.js';
 import { RESTIC_VERSION, hostResticBinary, resticFailure, runHostRestic, worldResticBinary, type ResticRun } from './restic.js';
 import { ensureWorldExcluded } from './secret-exclude.js';
+import { ResourceKeptChangingError } from './resource-conflict.js';
 import type { SnapshotVerification } from './resources.js';
 import type { World, WorldHandle } from './types.js';
 import { isRemoteWorldKind } from './types.js';
@@ -162,6 +163,8 @@ const EDGE_CONNECTIONS = 32;
 const RESTORE_CONNECTIONS = 16;
 /** A save that finds files changed under it saves again, this many times. */
 const SETTLE_ROUNDS = 3;
+/** And waits this long before saving again. */
+const SETTLE_PAUSE_MS = 2_000;
 const VERIFY_MAX_BYTES = 256 * 1024 * 1024;
 /** restic tests every node of a snapshot against every restore pattern, so a
  * merge's pattern count multiplies the resource's size. Past this many, a merge
@@ -226,9 +229,33 @@ export class ResticResources {
       }
       superseded.push(summary.snapshot);
       parent = summary.snapshot;
+      // A writer that is finishing (a job flushing its output) gets a moment;
+      // one that keeps running (a server, an open database) will not settle.
+      if (round + 1 < SETTLE_ROUNDS) await new Promise((resolve) => setTimeout(resolve, SETTLE_PAUSE_MS));
     }
+    // What changed from each save to the next is what something kept writing.
+    const changing = await this.changedBetween(attachment, superseded).catch(() => ({ paths: [], total: 0 }));
     await this.forget(attachment, superseded);
-    throw new Error(`${path.posix.basename(place.path)} kept changing while it was being saved; stop whatever is writing to it, then save it again`);
+    throw new ResourceKeptChangingError(path.posix.basename(place.path), changing.paths, changing.total);
+  }
+
+  /** Files (not directories) whose content or metadata differ between each
+   * of `snapshots` and the next, those changed most often first. */
+  private async changedBetween(attachment: Repository, snapshots: string[]): Promise<{ paths: string[]; total: number }> {
+    const counts = new Map<string, number>();
+    for (let i = 1; i < snapshots.length; i++) {
+      const run = await this.onHost(attachment, 'read', false, ['diff', '--json', '--no-lock', '--metadata', snapshots[i - 1]!, snapshots[i]!], { key: 'host' });
+      if (run.code !== 0) throw resticFailure(run, 'comparing saves of the resource');
+      for (const line of run.stdout.split('\n')) {
+        if (!line.startsWith('{')) continue;
+        const entry = JSON.parse(line);
+        if (entry.message_type !== 'change' || String(entry.path).endsWith('/')) continue;
+        const relative = String(entry.path).replace(/^\/+/, '');
+        counts.set(relative, (counts.get(relative) ?? 0) + 1);
+      }
+    }
+    const paths = [...counts].sort(([a, m], [b, n]) => n - m || (a < b ? -1 : a > b ? 1 : 0)).map(([file]) => file);
+    return { paths: paths.slice(0, 50), total: paths.length };
   }
 
   /** `mirror` also deletes what the snapshot does not have, so the place ends

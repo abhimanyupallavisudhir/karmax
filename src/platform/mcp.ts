@@ -48,6 +48,9 @@ export interface PlatformOps {
     holdForAuthorization?: boolean }): Promise<{ id: string; authorizationGap?: { next: string } }>;
   /** Record a project event; armed tasks whose event trigger matches start runs. */
   emitEvent(a: { projectId: string; type: string; key?: string; subject?: string; payload?: Record<string, unknown> }): Promise<unknown>;
+  /** Follow project events: each match reaches the task's conversation as a message. */
+  followEvents(taskId: string, a: { type?: string; source?: string; subject?: string; where?: Record<string, unknown>; includeSelf?: boolean; once?: boolean }): Promise<unknown>;
+  unfollowEvents(taskId: string, followId?: string): Promise<unknown>;
   getTask(taskId: string): Promise<unknown>;
   listTasks(projectId: string): Promise<{ id: string; title: string; workflow: string }[]>;
   searchTasks(projectId: string, query: string): Promise<{ total: number; tasks: CompactTask[] }>;
@@ -121,6 +124,12 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
     // error for a task that already existed.
     createTask: (a) => api.createTask(getToken(), a),
     emitEvent: ({ projectId, ...event }) => api.emitProjectEvent(getToken(), projectId, event),
+    followEvents: (taskId, a) => api.followProjectEvents(getToken(), taskId, a as Parameters<KarmaxApi['followProjectEvents']>[2]),
+    unfollowEvents: async (taskId, followId) => {
+      const follows = followId ? [{ id: followId }] : await api.listTaskFollows(getToken(), taskId);
+      for (const follow of follows) await api.unfollowProjectEvents(getToken(), taskId, follow.id);
+      return { unfollowed: follows.map((follow) => follow.id) };
+    },
     getTask: (id) => api.getTaskView(getToken(), id) as Promise<unknown>,
     listTasks: async (pid) => (await api.listTaskSummaries(getToken(), pid)).map((t) => ({ id: t.id, title: t.title, workflow: t.workflow })),
     searchTasks: async (pid, query) => {
@@ -221,6 +230,12 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
       return task;
     },
     emitEvent: ({ projectId, ...event }) => req(`/api/projects/${encodeURIComponent(projectId)}/events`, { method: 'POST', body: JSON.stringify(event) }),
+    followEvents: (taskId, a) => req(`/api/tasks/${encodeURIComponent(taskId)}/follows`, { method: 'POST', body: JSON.stringify(a) }),
+    unfollowEvents: async (taskId, followId) => {
+      const follows = followId ? [{ id: followId }] : ((await req(`/api/tasks/${encodeURIComponent(taskId)}/follows`)) as { follows: Array<{ id: string }> }).follows;
+      for (const follow of follows) await req(`/api/tasks/${encodeURIComponent(taskId)}/follows/${encodeURIComponent(follow.id)}`, { method: 'DELETE' });
+      return { unfollowed: follows.map((follow) => follow.id) };
+    },
     getTask: (id) => req(`/api/tasks/${id}`),
     listTasks: (pid) => req(`/api/projects/${pid}/tasks`) as Promise<{ id: string; title: string; workflow: string }[]>,
     searchTasks: async (pid, query) => {
@@ -511,7 +526,8 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
     'notify',
     {
       description:
-        'Tell or call people and agents of this task without ending your turn. People (user:<id>, @team:<slug>, ' +
+        'Tell or call people and agents of this task without ending your turn. ' +
+        'Notify a person only when you need them to do something; never for updates on your work. People (user:<id>, @team:<slug>, ' +
         '@creator, @owners, @project, @maintainers, @admins, @all) and Avatars (avatar:<id>) are notified now and keep ' +
         'their own pace; agents of this task (agent:do for the main agent, agent:responder, agent:confirm, ' +
         'agent:agent-<n>) are called when your turn ends, in order. The message is said in the task conversation. ' +
@@ -610,6 +626,22 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
       payload: z.record(z.string(), z.unknown()).optional().describe('JSON object, at most 64 KB.'),
     },
   }, async (a) => wrap(async () => (await ops.emitEvent(a))));
+  server.registerTool('follow_events', {
+    description: 'Follow project events: each matching event reaches the task\'s conversation as a message. To wait for an event, follow it with once:true, then pause — the message ends the pause. A run started by an event already follows its subject (an issue\'s comments, a chat thread\'s replies).',
+    inputSchema: {
+      taskId: z.string().describe('Usually your own task.'),
+      type: z.string().optional().describe('A type or family, e.g. "github.issue_comment.*" or "deploy.finished".'),
+      source: z.string().optional().describe('e.g. "github", "webhook:<hookId>", "task:<taskId>".'),
+      subject: z.string().optional().describe('An exact subject, e.g. an issue or pull request URL.'),
+      where: z.record(z.string(), z.unknown()).optional().describe('Payload filter, as in an event trigger: {"path.to.field": value | {in|contains|matches|exists}}.'),
+      includeSelf: z.boolean().optional().describe('Also hear what the tavya GitHub App itself did.'),
+      once: z.boolean().optional().describe('Stop following after the first match (a wait).'),
+    },
+  }, async ({ taskId, ...a }) => wrap(async () => (await ops.followEvents(taskId, a))));
+  server.registerTool('unfollow_events', {
+    description: 'Stop following project events: one follow by id, or all of the task\'s follows.',
+    inputSchema: { taskId: z.string(), followId: z.string().optional() },
+  }, async (a) => wrap(async () => (await ops.unfollowEvents(a.taskId, a.followId))));
   server.registerTool('list_events', { description: `Read durable ${BRAND} events for a task after an optional sequence number.`, inputSchema: { taskId: z.string(), since: z.number().int().nonnegative().default(0) } }, async (a) => wrap(async () => (await ops.listEvents(a.taskId, a.since))));
   server.registerTool('list_github_actions_runs', {
     description: 'List GitHub Actions workflow runs for a repository attached to the calling task’s project. The GitHub credential remains in the control plane.',
