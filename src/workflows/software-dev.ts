@@ -4476,6 +4476,21 @@ Inspect the complete current diff and specifically compare its delta from the re
           checkoutApprovals = approveAll(worldRepos(world as any), checkoutHeads, checkoutApprovals);
         break;
       }
+      if (fairLanding && repairValidationPending
+        && patched('software-dev-fair-landing-no-repair-self-review-v1')) {
+        // Under fair landing nothing holds a slot for this repair, and CI has
+        // not run on its head yet. The check that turn did was the Do agent
+        // re-reading its own repair, told it was the final verification at the
+        // front of a queue; it sent a merely-behind branch back to Do although
+        // landing updates one itself, and a turn that ended without a decision
+        // dropped the task back to human Review. The repaired head lands as any
+        // head does: CI on it, branch protection, and the head-bound merge.
+        repairValidationPending = false;
+        landing = { ...landing, validation: 'pending', provider: 'admitting', detail: 'The repaired proposal is requesting landing again.' };
+        if (multiPrEnabled && world)
+          checkoutApprovals = approveAll(worldRepos(world), checkoutHeads, checkoutApprovals);
+        break;
+      }
       if (intentAuthorizedLanding && repairValidationPending) {
         stage = 'merge';
         status = 'waiting';

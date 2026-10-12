@@ -48,6 +48,8 @@ const exactCandidateTurns: { role: string; session?: string; messages: string[] 
 let exactCandidateRevisions = 0;
 // Task 389: an integration turn does not make CI green; only a new run can.
 let ciStaysRedThroughIntegration = false;
+// A Do repair that really fixes CI: its new head comes back green.
+let repairFixesCi = false;
 let actionsHaveSteps = true;
 let actionsRunAttempt = 1;
 let actionsReruns = 0;
@@ -338,6 +340,19 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
             }],
           }, ctx);
         }
+        if (input.role === 'do' && repairFixesCi
+          && input.messages.at(-1)?.text.includes('repair it against the newest target')) {
+          githubReadiness = {};
+          return mock.runTurn({
+            ...input,
+            messages: [...input.messages, {
+              id: `ci-repair-${input.messages.length}`,
+              role: 'user',
+              text: '@write repaired.md :: CI repaired\n@openpr',
+              ts: input.messages.length,
+            }],
+          }, ctx);
+        }
         if (input.role === 'do'
           && input.messages.at(-1)?.text.includes('Add the missing exact-candidate repair.')) {
           return mock.runTurn({
@@ -407,6 +422,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     exactCandidateTurns.length = 0;
     exactCandidateRevisions = 0;
     ciStaysRedThroughIntegration = false;
+    repairFixesCi = false;
     actionsHaveSteps = true;
     actionsRunAttempt = 1;
     actionsReruns = 0;
@@ -1563,6 +1579,62 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
 
     await handle.signal('cancel');
     await expect(handle.result()).resolves.toMatchObject({ stage: 'cancelled' });
+  }, 120_000);
+
+  // Production 2026-10-09..12: every CI repair under fair landing was followed
+  // by a second Do turn told it was the "FINAL AUTOMATED INTEGRATION
+  // verification ... at the front of the landing queue", before CI had run on
+  // the repaired head and with no queue slot held. The same agent re-checked its
+  // own repair; when the target had moved it sent the task back to Do again,
+  // although landing updates a merely-behind branch itself, and a check that
+  // ended without a decision dropped the task back to human Review.
+  it('v1.29 lands a CI repair through CI and the landing checks, without a second self-verification turn', async () => {
+    const repo = await repoWithOrigin('github-fair-repair-lands');
+    const project = (await h.store.createProject('Fair repair lands', { repos: [repo], remote: 'pr' }));
+    const connection = (await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: 'fair-repair', accountLogin: 'acme', accountType: 'Organization' }));
+    const enrolled = (await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+      providerId: 'fair-repair-repo', owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main',
+      private: true, gitConnectionId: connection.id }));
+    (await h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Repair and land', workflow: 'software-dev',
+      workflowVersion: '1.29.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+      createdBy: { kind: 'user', userId: 'a' } }));
+    const handle = await h.client.workflow.start('softwareDev@1.29.0', {
+      taskQueue: TASK_QUEUE, workflowId: task.id, args: [{
+        taskId: task.id, projectId: project.id, title: task.title,
+        prompt: '@write proposal.md :: proposal\n@review Ready', base: 'main', target: 'main',
+        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' }, githubPollMs: 10,
+      }],
+    });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    actionsJobConclusion = 'failure';
+    actionsJobLog = 'FAIL tests/proposal.test.ts > a real defect\nAssertionError: expected 1 to be 2\n';
+    githubReadiness = {
+      mergeStateStatus: 'UNSTABLE',
+      statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
+        __typename: 'CheckRun', name: 'unit tests', status: 'COMPLETED', conclusion: 'FAILURE',
+        detailsUrl: `https://github.com/${SLUG}/actions/runs/42/job/99`,
+      }] } },
+    };
+    repairFixesCi = true;
+    const reviewed = prs[0].head.sha;
+    await handle.signal('confirm');
+
+    expect(await handle.result()).toMatchObject({ stage: 'done' });
+    expect(prs[0].head.sha).not.toBe(reviewed);
+    const origin = remoteBySlug.get(SLUG)!;
+    expect(await gitOrThrow(origin, ['show', 'main:repaired.md'])).toBe('CI repaired');
+    const events = await h.store.eventsSince(task.id, 0);
+    expect(events.filter((event) => event.type === 'github.ci.repair-requested')).toHaveLength(1);
+    // No verification turn, no Merge-stage confirm wait, no second human Review.
+    expect(exactCandidateTurns).toEqual([]);
+    const views = events.filter((event) => event.type === 'view.updated').map((event) => event.payload);
+    expect(views.filter((payload: any) => payload.stage === 'merge' && payload.waitingFor === 'confirm')).toEqual([]);
+    const landingStarted = views.findIndex((payload: any) => payload.stage === 'merge');
+    expect(landingStarted).toBeGreaterThan(0);
+    expect(views.slice(landingStarted).filter((payload: any) => payload.stage === 'review')).toEqual([]);
+    expect((await view(handle)).landing).toMatchObject({ authorization: 'authorized', validation: 'passed' });
   }, 120_000);
 
   it('v1.21 gives each repository its own landing owner and leases only the fallback target', async () => {
