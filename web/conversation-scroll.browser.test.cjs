@@ -25,13 +25,15 @@ function fn(name) {
       window.$ = (s) => document.querySelector(s);
       window.S = { view: { taskId: 'a', title: 'Conversation', actions: [] }, taskTab: 'checkin' };
       window.TASK_TABS = [];
-      for (const name of ['taskRecord', 'parentTaskContext', 'taskBreadcrumb', 'stageIndicator', 'workflowLabel', 'customBranch', 'mergeQueueBadge', 'pullRequestLinks', 'diskMeter', 'taskAttempts', 'taskActions', 'captureFocus', 'captureFollowupFocus', 'captureThreadSelection', 'restoreThreadSelection', 'restoreFocus', 'restoreFollowupFocus', 'closeTask', 'wireAttempts', 'wireStageTransitions', 'wireWorkflowMode', 'wireTiming', 'wireNotes', 'wireResourceInventory', 'wireActions', 'wireTaskOrg', 'wireResourceReview', 'wireReviewActions', 'wireTaskApprovalRequests', 'wireCheckinSidebar', 'wireFollowups', 'wireTerminal', 'wireExplainMessages', 'wireCopyButtons', 'wireMessageCopies', 'typesetMath', 'shouldFocusTaskBody']) window[name] = () => '';
+      for (const name of ['taskRecord', 'parentTaskContext', 'taskBreadcrumb', 'stageIndicator', 'workflowLabel', 'customBranch', 'mergeQueueBadge', 'pullRequestLinks', 'diskMeter', 'taskAttempts', 'taskActions', 'captureFocus', 'captureFollowupFocus', 'captureThreadSelection', 'restoreThreadSelection', 'restoreFocus', 'restoreFollowupFocus', 'closeTask', 'wireAttempts', 'wireStageTransitions', 'wireWorkflowMode', 'wireTiming', 'wireNotes', 'wireResourceInventory', 'wireActions', 'wireTaskOrg', 'wireResourceReview', 'wireReviewActions', 'wireTaskApprovalRequests', 'wireCheckinSidebar', 'wireFollowups', 'wireTerminal', 'wireExplainMessages', 'wireCopyButtons', 'wireMessageCopies', 'typesetMath', 'shouldFocusTaskBody', 'pipeline', 'taskRail', 'wireTaskRail', 'paintApprovalHistory']) window[name] = () => '';
+      window.taskRailOpen = () => false;
+      window.ICON = { sidebar: '' };
       window.esc = (s) => String(s ?? '');
       window.taskUrl = () => '/task/a';
       window.role = 'do'; window.count = 30; window.extra = 0;
       window.taskTabBody = () => `<div class="ck-layout"><div class="ck-side">Agents</div><div class="ck-pane"><div class="ck-thread" id="ck-thread" data-task-id="${S.view.taskId}" data-role="${role}"><div class="thread">${Array.from({ length: count }, (_, i) => `<div class="entry" data-conversation-key="${i}">${i === 0 ? 'Extra<br>'.repeat(extra) : ''}Message ${i}<details><summary>Details</summary><pre>Output</pre></details></div>`).join('')}</div></div></div></div>`;
     });
-    await page.addScriptTag({ content: ['visibleTaskTabs', 'captureConversationScroll', 'restoreConversationScroll', 'retainedTaskNodes', 'syncAttributes', 'patchChildren', 'patchConversationRows', 'patchTaskPage', 'renderTaskPage'].map(fn).join('\n') });
+    await page.addScriptTag({ content: ['visibleTaskTabs', 'captureConversationScroll', 'restoreConversationScroll', 'retainedTaskNodes', 'retainsLiveChild', 'syncAttributes', 'patchChildren', 'patchConversationRows', 'patchTaskPage', 'renderTaskPage'].map(fn).join('\n') });
     const result = await page.evaluate(() => {
       renderTaskPage();
       const thread = document.getElementById('ck-thread');
@@ -107,7 +109,7 @@ function fn(name) {
     // Timing navigation follows installation opt-in and disappears on a live disable.
     await page.addScriptTag({ content: 'const timingReports = new Map();\n' + fn('applyTimingSetting') });
     await page.evaluate(() => {
-      TASK_TABS = [{key:'overview',label:'Overview'},{key:'timing',label:'Timing'}];
+      TASK_TABS = [{key:'checkin',label:'Chat'},{key:'timing',label:'Timing'}];
       S.selected = S.view.taskId; S.meta = {}; renderTaskPage();
     });
     assert.equal(await page.locator('[data-tasktab="timing"]').count(), 0);
@@ -115,7 +117,7 @@ function fn(name) {
     assert.equal(await page.locator('[data-tasktab="timing"]').count(), 1);
     await page.evaluate(() => { S.taskTab = 'timing'; applyTimingSetting(false); });
     assert.equal(await page.locator('[data-tasktab="timing"]').count(), 0);
-    assert.equal(await page.evaluate(() => S.taskTab), 'overview');
+    assert.equal(await page.evaluate(() => S.taskTab), 'checkin');
     console.log('Conversation scroll and timing visibility browser regressions passed');
   } finally { await browser.close(); }
 })().catch((error) => { console.error(error); process.exitCode = 1; });

@@ -1,4 +1,4 @@
-// Hosted checkout actions stay attached to both persistent tab rails.
+// Hosted checkout actions stay attached to the project tab rail and the task details rail.
 // Run: node web/work-locally.test.cjs
 const fs = require('fs');
 const path = require('path');
@@ -17,7 +17,7 @@ const slice = (from, to) => {
 };
 
 const main = slice('function renderMain()', '// ── tasks');
-const task = slice('function renderTaskPage()', '// A text walker');
+const task = slice('function taskRail(v', 'function railAgents(v)');
 const terminal = slice('function terminalPane(v)', 'async function openLocalCheckout(v)');
 const taskModal = slice('function nativeConversationFilename(session)', 'async function openProjectCheckout(project)');
 const projectModal = slice('async function openProjectCheckout(project)', 'async function materializeLocalCheckout');
@@ -25,7 +25,7 @@ const localModal = slice('async function materializeLocalCheckout', 'async funct
 
 ok(main.includes('id="project-local-checkout"'), 'project tab rail includes Work locally');
 ok(main.includes("S.meta?.hosted"), 'project action is hosted-only');
-ok(task.includes('id="local-checkout"'), 'task tab rail includes Work locally');
+ok(task.includes('id="local-checkout"'), 'the task details rail includes Work locally');
 ok(task.includes("S.meta?.hosted"), 'task action is hosted-only');
 ok(!terminal.includes('id="local-checkout"'), 'terminal pane does not duplicate the task action');
 ok(taskModal.includes('Download conversation'), 'task handoff offers a native conversation download');

@@ -474,7 +474,6 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .pipeline .seg.merged { background: var(--merged); opacity: 1; }
 /* 'escalated' = blocked, awaiting a human — flag the whole track, don't fake a position. */
 .pipeline.escalated .seg { background: var(--danger); opacity: 0.32; }
-.pipeline-lg.escalated .bar { background: var(--danger); opacity: 0.4; }
 .pipeline .ponr { width: 9px; height: 9px; transform: rotate(45deg); background: var(--line-strong); margin: 0 1px; flex: none; }
 .pipeline .ponr.passed { background: var(--merged); }
 .pipeline .ponr.current { background: var(--accent); }
@@ -628,17 +627,6 @@ a.git-repo-name:hover { color:var(--accent); }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 
 /* big labeled pipeline on the task page (Overview tab) */
-.pipeline-lg { display: flex; align-items: flex-start; gap: 0; margin: 4px 0 8px; flex-wrap: wrap; }
-.pipeline-lg .node { display: flex; flex-direction: column; align-items: center; gap: 6px; flex: 1; min-width: 52px; }
-.pipeline-lg .node .bar { height: 5px; width: 100%; background: var(--line); border-radius: 3px; }
-.pipeline-lg .node.done .bar { background: var(--accent); opacity: .45; }
-.pipeline-lg .node.current .bar { background: var(--accent); }
-.pipeline-lg .node.merged .bar { background: var(--merged); }
-.pipeline-lg .node .name { font-size: 11px; font-family: var(--font-mono); color: var(--ink-3); }
-.pipeline-lg .node.current .name { color: var(--accent); font-weight: 600; }
-.pipeline-lg .node.done .name { color: var(--ink-2); }
-.pipeline-lg .node .diamond { color: var(--ink-3); font-size: 10px; }
-.pipeline-lg .node.merged .name, .pipeline-lg .node.merged .diamond { color: var(--merged); }
 
 /* ── badges / chips ─────────────────────────────────────────── */
 .chip {
@@ -804,10 +792,8 @@ a.git-repo-name:hover { color:var(--accent); }
 /* Head, body content and foot all share ONE column: max-width 960 incl. 28px
    side padding, centered — so the title, meta, tabs, section content and the
    action buttons line up on the same left edge (the strips stay full-bleed). */
-.tp-head { padding-top: 14px; border-bottom: 1px solid var(--line); background: var(--surface); }
+.tp-head { padding: 14px 0; border-bottom: 1px solid var(--line); background: var(--surface); }
 .tp-head > * { max-width: 960px; margin-left: auto; margin-right: auto; padding: 0 28px; }
-/* No tabs (the repeatable-series config page) → the head needs its own bottom gap. */
-.tp-head:not(:has(.tp-tabs)) { padding-bottom: 14px; }
 .tp-head .row1 { display: flex; align-items: center; gap: 10px; }
 .tp-head h2 { font-size: 17px; margin: 0; flex: 1; letter-spacing: -0.01em; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tp-head .row1 .task-num { font-size: 13px; }
@@ -824,12 +810,6 @@ a.git-repo-name:hover { color:var(--accent); }
 .tp-crumb:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
 .tp-crumb-sep { flex: none; color: var(--ink-3); }
 .tp-head .meta { display: flex; gap: 10px; align-items: center; margin-top: 6px; font-size: 12px; color: var(--ink-3); font-family: var(--font-mono); flex-wrap: wrap; }
-/* margin-top/bottom longhands keep the parent rule's auto side margins (and kill
-   the base .tabs 18px bottom margin — the head's border sits right under the tabs);
-   the 14px side padding cancels the first tab's own padding so its LABEL sits on
-   the column edge. */
-.tp-tabs { margin-top: 10px; margin-bottom: 0; padding: 0 14px; border-bottom: none; position: static; background: transparent; }
-.tp-tabs .tab { text-decoration: none; margin-bottom: 0; }
 .tp-body { flex: 1; overflow-y: auto; }
 /* Focused programmatically for keyboard scrolling — it's the whole active surface, not a control, so no outline. */
 .tp-body:focus, .tp-body:focus-visible { outline: none; }
@@ -837,6 +817,82 @@ a.git-repo-name:hover { color:var(--accent); }
 .tp-foot { border-top: 1px solid var(--line); padding: 12px 0; background: var(--surface-2); }
 .tp-foot-inner { max-width: 960px; margin: 0 auto; padding: 0 28px; display: flex; gap: 8px; align-items: center; }
 .tp-foot-inner > .actions { flex: 1; }
+
+/* The task page proper: one header row (where it is, what it is, its stage,
+   its two views), then the conversation column beside the details rail. The
+   header spans the page; the thread and its dock share one centred column. */
+.tp-head.wide { padding: 10px 20px; }
+.tp-head.wide > * { max-width: none; padding: 0; }
+.tp-head.wide > .tp-crumbs { padding-left: 44px; }
+.tp-head.wide .row1 { flex-wrap: wrap; row-gap: 6px; }
+.tp-head.wide .row1 > .pr-link, .tp-head.wide .row1 > .chip { flex: none; }
+.tp-stage { display: inline-flex; align-items: center; gap: 8px; flex: none; }
+.tp-stage .pipeline .seg { width: 12px; height: 4px; }
+.tp-stage .pipeline .ponr { width: 7px; height: 7px; }
+.tp-views { flex: none; }
+.tp-views .tab { padding: 3px 12px; margin: 0; border: 0; border-radius: 6px; color: var(--ink-3); font-size: 12.5px; font-weight: 500; text-decoration: none; }
+.tp-views .tab:hover { color: var(--ink); }
+.tp-views .tab.active { background: var(--surface); color: var(--ink); font-weight: 600; box-shadow: 0 1px 2px rgb(0 0 0 / .1); }
+.tp-rail-toggle { flex: none; }
+.task-page:not(.rail-closed) .tp-rail-toggle { color: var(--accent); }
+.tp-main { flex: 1; min-height: 0; display: flex; position: relative; }
+.tp-col { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.tp-col .tp-content { max-width: 900px; padding: 20px 20px 48px; }
+.tp-col .tp-foot-inner { max-width: 900px; padding: 0 20px; }
+/* Under the conversation the actions join the composer's dock. */
+.tp-body[data-tab="checkin"] + .tp-foot { border-top: 0; padding: 0 0 12px; background: var(--surface); }
+.tp-foot:has(.tp-foot-inner:empty) { display: none; }
+
+.tp-rail { width: 296px; flex: none; overflow-y: auto; border-left: 1px solid var(--line); background: var(--surface); }
+.task-page.rail-closed .tp-rail { display: none; }
+.rail-inner { display: flex; flex-direction: column; padding: 6px 0 16px; }
+.rail-sec { padding: 12px 16px; border-top: 1px solid var(--line); }
+.rail-inner > :first-child { border-top: 0; }
+.rail-h, .tp-rail .section-h { display: flex; align-items: center; gap: 6px; margin: 0 0 6px; color: var(--ink-3); font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; }
+.rail-sec .ck-item { margin: 0 -8px; padding: 6px 8px; }
+.rail-sec .ck-item svg { flex: none; color: var(--ink-3); }
+.rail-sec button.ck-item { width: calc(100% + 16px); border: 0; background: none; font: inherit; text-align: left; }
+.rail-sec .ck-participant-row { margin: 0 -8px; }
+.rail-sec .ck-participant-row .ck-item { margin: 0; }
+.rail-meta { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; margin-bottom: 8px; color: var(--ink-3); font-size: 12px; }
+.rail-meta .mono { font-family: var(--font-mono); }
+.tp-rail .org-editor { margin-top: 0; }
+#task-notes { width: 100%; box-sizing: border-box; min-height: 52px; padding: 7px 9px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-2); color: var(--ink); font: 13px/1.45 var(--font-ui); resize: vertical; }
+#task-notes:focus { background: var(--surface); }
+.rail-links { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: 10px 12px 0; border-top: 1px solid var(--line); }
+.rail-link { justify-content: flex-start; }
+/* Delegated and forked work, branches and widgets: the same objects as
+   elsewhere, flattened into rail sections. */
+.tp-rail .subtasks, .tp-rail .agent-forks { margin: 0; border: 0; border-top: 1px solid var(--line); border-radius: 0; box-shadow: none; background: transparent; }
+.tp-rail .subtasks-head, .tp-rail .agent-forks-head { align-items: center; padding: 12px 16px 6px; }
+.tp-rail .subtasks-kicker, .tp-rail .agent-forks-kicker { display: none; }
+.tp-rail .subtasks h3, .tp-rail .agent-forks h3 { color: var(--ink-3); font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; }
+.tp-rail .subtasks-count, .tp-rail .agent-forks-count { font-size: 11px; }
+.tp-rail .subtasks-count strong { font-size: 11px; }
+.tp-rail .subtasks-progress { margin: 0 16px 4px; }
+.tp-rail .subtask-list, .tp-rail .fork-tree { padding: 0 8px 6px; }
+.tp-rail .subtask-row { grid-template-columns: auto minmax(0, 1fr) auto; gap: 10px; min-height: 0; padding: 7px 8px; border-top: 0; }
+.tp-rail .subtask-pipeline { display: none; }
+.tp-rail .fork-row { min-height: 0; padding: 7px 8px; border-top: 0; }
+.tp-rail .subtask-arrow, .tp-rail .fork-arrow { font-size: 16px; }
+.tp-rail > .rail-inner > .section-h { margin: 0; padding: 12px 16px 6px; border-top: 1px solid var(--line); }
+.tp-rail .checkout-list { margin: 0 16px 8px; padding: 6px 10px; }
+.tp-rail .checkout-row { flex-wrap: wrap; font-size: 12px; }
+.tp-rail .checkout-row .mono { display: none; }
+.rail-widgets .task-sub { flex-wrap: wrap; font-size: 12px; }
+.rail-widgets .wk-title { margin-top: 4px !important; }
+
+.review-info iframe { display: block; width: 100%; height: 360px; margin-top: 8px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+.review-warn { margin-top: 5px; color: var(--warn, #c60); font-weight: 600; font-size: 12.5px; }
+.msg.system.error { align-self: stretch; max-width: none; padding: 9px 12px; border: 1px solid var(--danger); border-radius: 8px; background: var(--danger-weak); color: var(--ink); font-style: normal; font-size: 12.5px; }
+.msg.system.error .msg-text { white-space: pre-wrap; font-family: var(--font-mono); font-size: 12px; }
+.palette.ah-dialog { width: min(720px, 94vw); }
+.ah-dialog .ah-body { max-height: 70vh; overflow-y: auto; padding: 12px 16px 16px; }
+
+/* Narrow windows: the rail floats over the conversation while open. */
+@media (max-width: 1099px) {
+  .tp-rail { position: absolute; inset: 0 0 0 auto; z-index: 30; width: min(320px, 88vw); box-shadow: var(--shadow); }
+}
 
 /* ── full-page task form (new task / edit draft, SPEC §10.4) ─────────────── */
 /* The expanded form is a PAGE, not a dialog — GitHub-issue-creation shape: a
@@ -905,14 +961,11 @@ a.git-repo-name:hover { color:var(--accent); }
 }
 @media (max-width: 720px) { .task-form-page { left: 0; } } /* the rail is hidden */
 
-/* Check-in tab: a fixed sidebar (agent conversations + the ephemeral terminal)
-   beside a chat-style pane — the thread scrolls, the compose box stays put. */
+/* Chat view: a chat-style pane — the thread scrolls, the compose box stays put.
+   Its agents and the terminal are picked in the details rail. */
 .tp-body[data-tab="checkin"] { overflow: hidden; }
 .tp-body[data-tab="checkin"] > .tp-content { max-width: none; padding: 0; height: 100%; }
-.ck-layout { display: grid; grid-template-columns: 208px 1fr; grid-template-rows: 100%; height: 100%; }
-.ck-side { border-right: 1px solid var(--line); background: var(--surface); overflow-y: auto; padding: 14px 10px; }
-.ck-side-h { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink-3); font-weight: 600; margin: 0 10px 6px; }
-.ck-side-h:not(:first-child) { margin-top: 16px; }
+.ck-layout { height: 100%; }
 .ck-item { display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-radius: 7px; cursor: pointer; color: var(--ink-2); font-size: 13px; }
 .ck-item:hover { background: var(--surface-2); color: var(--ink); }
 .ck-item.sel { background: var(--accent-weak); color: var(--ink); font-weight: 600; }
@@ -935,7 +988,7 @@ a.git-repo-name:hover { color:var(--accent); }
 .ck-pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; height: 100%; overflow: hidden; }
 /* Conversation focus view stays below dialogs, menus and notifications. */
 .ck-pane.ck-fullscreen { position: fixed; inset: 0; z-index: 40; height: 100%; background: var(--paper); }
-.ck-pane-head { display: flex; align-items: center; gap: 10px; padding: 10px 20px; border-bottom: 1px solid var(--line); background: var(--surface); flex-wrap: wrap; }
+.ck-pane-head { display: flex; align-items: center; gap: 10px; padding: 6px 20px; min-height: 40px; box-sizing: border-box; border-bottom: 1px solid var(--line); background: var(--surface); flex-wrap: wrap; }
 .ck-tools { display: inline-flex; align-items: center; gap: 2px; margin-right: -6px; }
 .ck-tools .tool-sep { width: 1px; height: 16px; margin: 0 4px; background: var(--line); }
 /* min-height:0 lets the thread SHRINK below its content (a flex item's default
@@ -2187,11 +2240,17 @@ html[data-theme="dark"] .github-signin-btn:active,
   .composer #draft-task { grid-column:2; }
   .composer input.title-in { min-width:0; width:100%; }
   .tp-head > * { padding: 0 16px; }
-  .tp-tabs { padding: 0 2px; }
   .tp-content { padding: 16px 16px 40px; }
   .tp-foot { padding: 10px 0; }
   .tp-foot-inner { padding: 0 16px; }
-  .ck-layout { grid-template-columns: 148px 1fr; }
+  .tp-head.wide { padding: 8px 12px; }
+  .tp-head.wide h2 { flex-basis: calc(100% - 90px); }
+  .tp-views .tab { padding: 3px 10px; }
+  .tp-stage .pipeline { display: none; }
+  .tp-head.wide .tp-views { margin-left: auto; }
+  .tp-head.wide > .tp-crumbs { padding-left: 0; }
+  .tp-col .tp-content { padding: 16px 16px 40px; }
+  .tp-col .tp-foot-inner { padding: 0 16px; }
 }
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
@@ -2688,8 +2747,6 @@ html[data-theme="dark"] .github-signin-btn:active,
   color: var(--ink-3); font: 12px var(--font-ui); cursor: pointer;
 }
 .org-add-tag:hover, .org-add-tag:focus-visible { border-color: var(--line-strong); color: var(--ink); }
-/* On the task page the editor rides the byline: no extra row, pushed right. */
-.tp-head .meta .org-editor { margin: 0 0 0 auto; font-family: var(--font-ui); }
 
 /* Attempts: one line of single-line cards, then the New attempt action. */
 .attempts { display: flex; align-items: center; gap: 6px; margin-top: 8px; min-width: 0; }
@@ -2708,7 +2765,8 @@ html[data-theme="dark"] .github-signin-btn:active,
 
 .stage-picker { display: inline-flex; align-items: center; }
 .stage-picker select {
-  width: auto; max-width: 230px; margin: 0; padding: 3px 24px 3px 8px;
+  appearance: none; -webkit-appearance: none; /* the label carries its own ▾ */
+  width: auto; max-width: 230px; margin: 0; padding: 3px 10px;
   border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--line));
   border-radius: 999px; background: var(--surface-2); color: var(--ink-2);
   font: inherit; font-size: 11px; font-weight: 600; cursor: pointer;

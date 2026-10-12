@@ -25,7 +25,7 @@ global.esc = (s) => String(s);
 global.projectBase = () => '/org/project';
 global.S = {
   tasks: [{ id: 'attempt-1', title: 'Task', projectId: 'p' }],
-  taskTab: 'overview',
+  taskTab: 'parameters',
   attemptGroup: {
     principalAttemptId: 'attempt-1',
     attempts: [
@@ -68,7 +68,7 @@ ok(html.includes('data-attempt-select="attempt-2"'), 'draft can be selected');
 ok(html.includes('attempt-card selected') && html.includes('aria-current="true"'), 'current attempt is visibly and semantically selected');
 ok(!html.includes('<details') && !html.includes('View full attempt'), 'switching needs no expansion or secondary action');
 ok(!html.includes('data-stage-move='), 'attempt navigation has no nested stage mutation controls');
-ok(html.includes('href="/org/project/tasks/attempt-1/overview"'), 'links pin the execution id and preserve the tab');
+ok(html.includes('href="/org/project/tasks/attempt-1/parameters"'), 'links pin the execution id and preserve the tab');
 ok(html.includes('href="/org/project/tasks/attempt-2"'), 'a draft link pins no tab: its page is its form');
 const formHtml = attemptCard(S.attemptGroup.attempts[1], S.attemptGroup, { taskId: 'attempt-2' }, { form: true });
 ok(!formHtml.includes('<a') && formHtml.includes('aria-current="true"'), 'the draft form marks its own attempt without linking to it');
@@ -168,7 +168,8 @@ eval(extractFn('wireAttempts'));
   global.renderTaskLoadingPage = () => {};
   global.renderTaskPage = () => {};
   global.pendingCancellationView = (view) => view;
-  global.defaultTaskTab = () => 'overview';
+  global.defaultTaskTab = () => 'checkin';
+  global.taskTabOf = (key) => key;
   global.loadParamDefaults = async () => ({});
   let oldView;
   let viewCalls = 0;
@@ -188,8 +189,8 @@ eval(extractFn('wireAttempts'));
   eval(extractFn('refreshTaskHistory'));
   eval(extractFn('showDraftPage'));
   eval(extractFn('openTask'));
-  const staleOpen = openTask('attempt-1', 'overview', true);
-  await openTask('attempt-1', 'overview', true);
+  const staleOpen = openTask('attempt-1', 'checkin', true);
+  await openTask('attempt-1', 'checkin', true);
   oldView({ taskId: 'attempt-1', title: 'Stale' });
   await staleOpen;
   ok(S.view.title === 'Latest', 'older same-attempt loads cannot replace the latest view');

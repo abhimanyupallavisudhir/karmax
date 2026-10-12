@@ -78,10 +78,11 @@ const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
     await page.waitForFunction(() => location.pathname !== '/org/workspace/tasks/3');
     assert.equal(await page.evaluate(() => location.pathname), '/org/workspace/tasks/4', 'j steps from the open task');
 
-    // Review HTML is fetched once per content, however often the page repaints.
+    // Review HTML is fetched once per content, however often the page repaints
+    // (reached by a former Overview link, which now opens the conversation).
     await page.evaluate(() => { history.pushState({ kx: 1 }, '', '/org/workspace/tasks/6/overview'); dispatchEvent(new PopStateEvent('popstate')); });
-    await page.locator('.review iframe').waitFor();
-    await page.evaluate(() => { document.querySelector('.review iframe').original = true; });
+    await page.locator('#review-info-frame').waitFor();
+    await page.evaluate(() => { document.querySelector('#review-info-frame').original = true; });
     for (let i = 0; i < 3; i++) {
       send({ type: 'view.updated', taskId: 't6', payload: { stage: 'review', status: 'waiting' } });
       await wait(150);
@@ -90,10 +91,10 @@ const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
     const reviewReads = () => requests.filter(r => r === 'GET /api/tasks/t6/review-info.html').length;
     assert.ok(viewReads.t6 >= 3, 'the page repainted');
     assert.equal(reviewReads(), 1, 'a repaint keeps the review frame');
-    assert.equal(await page.evaluate(() => document.querySelector('.review iframe').original), true);
+    assert.equal(await page.evaluate(() => document.querySelector('#review-info-frame').original), true);
     views.t6.reviewInfo = { caption: 'Check it', html: '<p>second</p>' };
     send({ type: 'view.updated', taskId: 't6', payload: { stage: 'review', status: 'waiting' } });
-    await page.waitForFunction(() => !document.querySelector('.review iframe').original);
+    await page.waitForFunction(() => !document.querySelector('#review-info-frame').original);
     await wait(300);
     assert.equal(reviewReads(), 2, 'new review content loads once');
 

@@ -26,6 +26,7 @@ function extractConst(name: string): string {
 const context = vm.createContext({
   esc: (value: unknown) => String(value),
   pipeline: () => '',
+  fmtReset: (at: number) => `at ${at}`,
   liveRoleFor: () => 'do',
   // `cancelling` holds the tasks whose cancel click has not yet been reflected by
   // the server; the list patcher reads it through pendingCancellationView().
@@ -39,7 +40,8 @@ vm.runInContext(
     extractFunction('waitingLabel'),
     extractFunction('waitingText'),
     extractFunction('waitDeadline'),
-    extractFunction('agentTurnStateText'),
+    extractFunction('presenceDetail'),
+    extractFunction('conversationWaitNotice'),
     extractFunction('humanWaitDetail'),
     extractFunction('conversationTextKey'),
     extractFunction('conversationInputRequest'),
@@ -55,7 +57,7 @@ vm.runInContext(
 const stageLabel = context.stageLabel as (view: Record<string, any>) => string;
 const waitDeadline = context.waitDeadline as (until: number) => string;
 const waitingText = context.waitingText as (wait: Record<string, any>) => string;
-const agentTurnStateText = context.agentTurnStateText as (view: Record<string, any>) => string;
+const conversationWaitNotice = context.conversationWaitNotice as (view: Record<string, any>) => string;
 const humanWaitDetail = context.humanWaitDetail as (view: Record<string, any>) => string;
 const conversationInputRequest = context.conversationInputRequest as (
   view: Record<string, any>,
@@ -242,17 +244,18 @@ describe('waiting labels in task summaries', () => {
     }
   });
 
-  it('keeps an actionable admission failure in the agent-turn card', () => {
-    expect(agentTurnStateText({
+  it('keeps an actionable admission failure in the conversation', () => {
+    expect(conversationWaitNotice({
       agentTurn: { state: 'waiting-slot' },
       waitingFor: {
         kind: 'agentSlot',
         detail: 'Free allows 1 organization user, but this organization has 2.',
       },
-    })).toBe('Free allows 1 organization user, but this organization has 2.');
-    expect(agentTurnStateText({ agentTurn: { state: 'waiting-slot' } }))
-      .toBe('waiting for an agent slot');
-    expect(agentTurnStateText({ agentTurn: { state: 'running' } })).toBe('running');
+    })).toContain('Free allows 1 organization user, but this organization has 2.');
+    expect(conversationWaitNotice({ waitingFor: { kind: 'account', earliestResetAt: 5 } })).toContain('Earliest at 5');
+    // A plain wait says nothing beyond the header's label.
+    expect(conversationWaitNotice({ agentTurn: { state: 'waiting-slot' }, waitingFor: { kind: 'agentSlot' } })).toBe('');
+    expect(conversationWaitNotice({ agentTurn: { state: 'running' } })).toBe('');
   });
 
   it('retains the concrete question for a targeted human hold', () => {

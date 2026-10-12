@@ -463,11 +463,10 @@ export const MANIFESTS: WorkflowManifest[] = [
       {
         slot: 'task-detail',
         tier: 2,
-        title: 'Progress',
+        // The stage and merge-queue place already head the task page.
+        title: 'Changed files',
         widgets: [
-          { type: 'badge', bind: 'stage', title: 'Stage' },
-          { type: 'gauge', bind: 'mergeQueue', title: 'Merge queue', valueKey: 'position', maxKey: 'total' },
-          { type: 'list', bind: 'reviewInfo.changedFiles', title: 'Changed files', empty: 'No changes yet.' },
+          { type: 'list', bind: 'reviewInfo.changedFiles', empty: 'No changes yet.' },
         ],
       },
       { slot: 'review-area', tier: 4, component: 'review-iframe', title: 'Review' },

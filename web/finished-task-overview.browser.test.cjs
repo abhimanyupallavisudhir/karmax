@@ -1,7 +1,9 @@
 // Real browser regression: a finished task's page keeps what it had while it
 // ran. Its parent and its agent forks are archived out of the live task list
 // once they finish, its sandbox is released, and its work summary gained the
-// landing line — none of that may make the overview lose a section.
+// landing line — none of that may make its page lose a section. Everything the
+// former Overview tab showed is on the one task page: the summary closes the
+// conversation, forks and notes are in the details rail.
 // SCREENSHOT_DIR=<dir> also writes screenshots. APP_SOURCE can test the baseline.
 const { chromium } = require('playwright');
 const fs = require('node:fs');
@@ -79,22 +81,24 @@ const root = __dirname;
       await page.locator(selector).screenshot({ path: path.join(process.env.SCREENSHOT_DIR, name) });
     };
 
-    await open('overview');
+    await open(undefined);
     await page.waitForSelector('.agent-forks');
+    await page.waitForSelector('.review-info');
     await shot('finished-task-overview.png');
     const overview = await page.locator('.task-page').innerText();
     assert.match(await page.locator('.tp-crumbs').innerText(), /^Shop\s*›\s*#10 Ship reporting$/, 'the breadcrumb names the project, then the finished parent by number and title');
-    assert.match(overview, /work summary[\s\S]*3 file\(s\) changed\.[\s\S]*Merged into main as 1a2b3c4d\./i, 'the work summary keeps what the work was');
+    assert.match(overview, /summary[\s\S]*3 file\(s\) changed\.[\s\S]*Merged into main as 1a2b3c4d\./i, 'the work summary keeps what the work was');
+    assert.equal(await page.locator('.review-info').count(), 1, 'the summary shows once');
+    assert.equal(await page.locator('#tp-rail #task-notes').inputValue(), 'Ask design about the icon', 'notes are in the rail');
     assert.match(overview, /Screenshot/, 'review outputs stay openable');
     assert.match(overview, /2 task forks/, 'finished and live forks are both listed');
-    assert.match(overview, /Forked from\s*2 source tasks\s*#8\s*Sketch the export[\s\S]*#9\s*Export as CSV[\s\S]*Agent forks/,
+    assert.match(overview, /Forked from\s*2 source tasks\s*#8\s*Sketch the export[\s\S]*#9\s*Export as CSV[\s\S]*Agent forks/i,
       'the tasks it was forked from are listed, oldest first, above its own forks');
     assert.equal(await page.locator('#fork-sources-title').locator('xpath=ancestor::section').locator('a[href$="/tasks/origin"] + .fork-tree a[href$="/tasks/attempt"]').count(), 1,
       'its direct source nests under the task that one was forked from');
     assert.equal(await page.locator('a[href$="/tasks/fork-done"] .subtask-state.done').count(), 1, 'the finished fork shows as done');
     assert.match(overview, /PR #7\s*merged/i, 'the merged pull request stays linked');
 
-    await open('checkin');
     await page.waitForSelector('#ck-term-item');
     assert.match(await page.locator('#ck-term-item').innerText(), /Workspace closed/, 'a finished task does not claim its workspace never started');
 
