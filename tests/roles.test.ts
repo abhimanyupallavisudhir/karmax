@@ -317,6 +317,11 @@ describe('prompt preamble (SPEC §5.4)', () => {
     expect(GLOBAL_INSTRUCTIONS).toContain('params.triggers [{kind: "dependency", tasks: [<your task id>]}]');
     expect(normalizeTriggers({ triggers: [{ kind: 'dependency', tasks: ['task_a'] }] })).toEqual([{ kind: 'dependency', tasks: ['task_a'] }]);
   });
+
+  it('tells agents to grant tasks they create what they need, and to ask for what they cannot grant', () => {
+    expect(GLOBAL_INSTRUCTIONS).toContain("If you create a task yourself, don't forget to grant it any authorizations or credentials it needs");
+    expect(GLOBAL_INSTRUCTIONS).toContain('request_permission with its task_id');
+  });
 });
 
 // WF-29: time bounds evaluation (see 'bounds catastrophic regex evaluation'

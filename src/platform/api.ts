@@ -54,7 +54,7 @@ import { commitProjectWiki, ensureProjectWikiRepository, mutateAndPublishProject
 import { applyAgentSpec, defaultModel, defaultEffort, ProfileResolver, profileVisibleTo, roleDefaultProfile } from '../agent/profiles.js';
 import { looksLikeConversationUrl, publicConversationShare } from '../agent/panagent.js';
 import { hostLocal as deploymentHostLocal } from '../config/deployment.js';
-import { AuthorizationGrantError, LEVEL_AUDIENCES, type AuthorizationService } from './authorization.js';
+import { AuthorizationGrantError, LEVEL_AUDIENCES, type AuthorizationGap, type AuthorizationService } from './authorization.js';
 import { PermissionRequests, exactCapability, type PermissionRequest } from './permission-requests.js';
 import { AuthorizationRequests, type AuthorizationRequest } from './authorization-requests.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
@@ -1259,6 +1259,10 @@ export class KarmaxApi {
       /** `true` accepts the limited package for the task and every agent; a
        * list accepts it for those participants (`do` is the task's own). */
       acceptAttenuation?: boolean | string[];
+      /** Instead of refusing what the caller cannot grant, keep the task as a
+       * draft held for it and return the gap: the caller then asks someone who
+       * can grant it (`requestPermission` with `taskId`). How agents create tasks. */
+      holdForAuthorization?: boolean;
       /** Per-task vault item grants (wiki plans/PLAN-passwords §6): `use-credential:item:…`
        *  / `:tag:…` / `:domain:…` caps layered onto the profile package. */
       credentialGrants?: string[];
@@ -1278,7 +1282,25 @@ export class KarmaxApi {
       confirmationPolicy?: ConfirmationPolicy;
     },
     receivedAt?: { monoMs: number; wallMs: number },
-  ): Promise<TaskRecord> {
+  ): Promise<TaskRecord & { authorizationGap?: AuthorizationGap & { participant?: string } }> {
+    if (args.holdForAuthorization) {
+      const { holdForAuthorization: _hold, ...plain } = args;
+      try {
+        return await this.createTask(token, plain, receivedAt);
+      } catch (error) {
+        // Nothing is persisted before a grant is refused, so this is the same
+        // task saved as a draft, as the console does before it summons someone.
+        if (!(error instanceof AuthorizationGrantError) || !error.gap) throw error;
+        const held = await this.createTask(token, { ...plain, draft: true, allowAttenuation: true }, receivedAt);
+        const { summary, summon } = error.gap;
+        const participant = (error as { participant?: string }).participant;
+        return Object.assign(held, { authorizationGap: { ...error.gap, ...(participant ? { participant } : {}),
+          next: summon
+            ? `Kept as draft ${held.id}: you cannot grant ${summary}. Ask ${summon} (or an audience you name) to grant it with `
+              + `request_permission and task_id "${held.id}"; it starts once approved.`
+            : `Kept as draft ${held.id}: nobody in this organization can grant ${summary}.` } });
+      }
+    }
     receivedAt ??= (await timingEnabled(this.deps.store)) ? { monoMs: performance.now(), wallMs: Date.now() } : undefined;
     const caller = (await this.require(token, 'create_task', { projectId: args.projectId }));
     const project = (await this.deps.store.getProject(args.projectId));
@@ -3934,9 +3956,10 @@ Act according to your Avatar instructions. When ready, call signal_task for task
    * every capability it grants. */
   async requestPermission(
     token: string,
-    args: { capabilities: string[]; projectIds?: string[]; audience?: string[]; reason: string; urgency?: Urgency },
+    args: { capabilities?: string[]; projectIds?: string[]; taskId?: string; audience?: string[]; reason: string; urgency?: Urgency },
   ): Promise<{ status: 'granted' | 'needs_approval'; requestId?: string; capabilities: string[]; projectIds?: string[]; audience?: string[] }> {
     const caller = (await this.require(token, 'request_permission'));
+    if (args.taskId) return this.requestHeldAuthorization(token, args.taskId, args);
     if (caller.taskId === '*') throw new Error('this endpoint requires a task-agent token');
     const task = (await this.deps.store.getTask(caller.taskId));
     (await this.require(token, 'request_permission', { projectId: task?.projectId, taskId: caller.taskId }));
@@ -4202,6 +4225,34 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     return { special, ...(summon ? { summon } : {}) };
   }
 
+  /**
+   * Ask for what a task you created is held for (`createTask` with
+   * `holdForAuthorization`): the level and credentials it asked for that you
+   * could not grant — the task's own, else those of the first of its other
+   * agents. The asking agent keeps working; a held draft starts once approved.
+   */
+  private async requestHeldAuthorization(token: string, taskId: string, args: { audience?: string[]; reason: string }) {
+    const task = (await this.deps.store.getTask(taskId));
+    if (!task) throw new NotFoundError(`no task ${taskId}`);
+    type Held = { profileAttenuated?: boolean; attenuationAccepted?: boolean; missingCredentialGrants?: string[] };
+    const isHeld = (entry?: Held) => !!entry && !!(entry.profileAttenuated || entry.missingCredentialGrants?.length) && !entry.attenuationAccepted;
+    const own = task.params?._authorization as Held | undefined;
+    const other = isHeld(own) ? undefined
+      : Object.entries(this.storedAgentAuthorizations(task)).find(([, entry]) => isHeld(entry));
+    const authorization = isHeld(own) ? previousTaskGrants(task).authorization
+      : other ? other[1].requested.authorization ?? selectionOf(other[1], task.projectId) : undefined;
+    if (!authorization) throw new ValidationError('this task already has the authorization it asked for');
+    const request = (await this.requestAuthorization(token, {
+      projectId: task.projectId,
+      target: { kind: 'task', taskId, ...(other ? { participant: other[0] } : {}), ...(task.params?.draft ? { queueAfterApproval: true } : {}) },
+      authorization,
+      credentialGrants: (isHeld(own) ? own : other?.[1])?.missingCredentialGrants,
+      audience: args.audience ?? [],
+      reason: args.reason,
+    }));
+    return { status: 'needs_approval' as const, requestId: request.id, capabilities: request.missingCapabilities, audience: request.audience };
+  }
+
   async requestAuthorization(
     token: string,
     input: {
@@ -4252,6 +4303,8 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     const eligibleUsers = new Set(targets.users.map((user) => user.id));
     const eligibleAvatars = new Set(targets.avatars.map((avatar) => avatar.id));
     const audience = [...new Set((input.audience ?? []).map(String).map((value) => value.trim()).filter(Boolean))];
+    // No audience: summon the lowest level that can grant it all, as the console offers first.
+    if (!audience.length && targets.summon) audience.push(targets.summon);
     if (!audience.length || audience.length > 32) throw new ValidationError('choose between 1 and 32 eligible recipients');
     const recipients = new Set<string>();
     const avatarRecipients = new Set<string>();

@@ -3,11 +3,11 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { KarmaxApi, CapabilityError } from './api.js';
 import { PLATFORM_API_CATALOG } from './catalog.js';
-import { URGENCY_LEVELS, type AgentSpec, type Provider, type Urgency } from '../domain/types.js';
+import { URGENCY_LEVELS, type AgentSpec, type AuthorizationSelection, type Provider, type Urgency } from '../domain/types.js';
 import {
   AGENT_ROLE_NAMES, PLATFORM_REQUEST_BODY_SCHEMA, PLATFORM_REQUEST_EXCLUDED_PATHS,
   PRIORITY_NAMES, compactSearch, compactOrganizationSearch, compactTags, normalizePlatformPath, normalizeRequestBody,
-  platformRequestPathError,
+  platformRequestPathError, CREATE_TASK_GRANTS, REQUEST_FOR_TASK,
   type CompactTask,
 } from './platform-request.js';
 import { BRAND } from '../domain/brand.js';
@@ -40,7 +40,12 @@ export interface PlatformOps {
     /** Tag names or `a/b` paths, created on demand (same rules as tag_task). */
     tags?: string[];
     /** Full task-form field values, including trigger definitions. */
-    params?: Record<string, unknown> }): Promise<{ id: string }>;
+    params?: Record<string, unknown>;
+    /** Level and scope its agent gets, and vault credentials (`use-credential:…`) it may use. */
+    authorization?: AuthorizationSelection;
+    credentialGrants?: string[];
+    /** Keep what the caller cannot grant as a held draft rather than refusing it. */
+    holdForAuthorization?: boolean }): Promise<{ id: string; authorizationGap?: { next: string } }>;
   getTask(taskId: string): Promise<unknown>;
   listTasks(projectId: string): Promise<{ id: string; title: string; workflow: string }[]>;
   searchTasks(projectId: string, query: string): Promise<{ total: number; tasks: CompactTask[] }>;
@@ -54,7 +59,7 @@ export interface PlatformOps {
   stopAgent(taskId: string, agent: string): Promise<unknown>;
   escalateToHuman(a: { taskId?: string; audience: string[]; message: string; urgency?: Urgency }): Promise<unknown>;
   notify(a: { to?: string[]; message: string; urgency?: Urgency; agents?: AgentSpec[] }): Promise<unknown>;
-  requestPermission(a: { capabilities: string[]; projectIds?: string[]; audience?: string[]; reason: string; urgency?: Urgency }): Promise<unknown>;
+  requestPermission(a: { capabilities?: string[]; projectIds?: string[]; taskId?: string; audience?: string[]; reason: string; urgency?: Urgency }): Promise<unknown>;
   requestAgentAction(a: { taskId: string; role?: string; action: 'publish_branch'; message?: string }): Promise<unknown>;
   cancelAgentAction(requestId: string): Promise<unknown>;
   reorderQueue(domain: string, taskId: string): Promise<void>;
@@ -332,7 +337,8 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
         'Create a new task on a project task list. It is queued and started immediately unless `draft` is true. '
         + '`params` carries the full task-form field values for the chosen workflow (including `triggers`, so a draft can be armed on a schedule/dependency/event); '
         + '`tags` accepts names or `a/b` paths and creates missing ones. '
-        + 'To inline wiki context into the new task, pass wikiContext: an array of `[[proj:…]]`/`[[org:…]]` references — a page ([[proj:guides/deploy]]), a whole label ([[proj:tag:security]]), or a folder ([[proj:runbooks/*]]). Omit it to inherit the default `default`-labelled pages; pass [] to inline none.',
+        + 'To inline wiki context into the new task, pass wikiContext: an array of `[[proj:…]]`/`[[org:…]]` references — a page ([[proj:guides/deploy]]), a whole label ([[proj:tag:security]]), or a folder ([[proj:runbooks/*]]). Omit it to inherit the default `default`-labelled pages; pass [] to inline none. '
+        + CREATE_TASK_GRANTS,
       inputSchema: {
         projectId: z.string(), title: z.string(), prompt: z.string(), workflow: z.string().optional(),
         wikiContext: z.array(z.string()).optional(),
@@ -340,11 +346,16 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
         priority: z.enum(PRIORITY_NAMES).optional(),
         tags: z.array(z.string()).optional(),
         params: z.record(z.string(), z.unknown()).optional(),
+        authorization: z.object({ level: z.string(), scope: z.enum(['projects', 'organization', 'global']),
+          projectIds: z.array(z.string()).optional() }).optional(),
+        credentialGrants: z.array(z.string()).optional(),
       },
     },
-    async (a) => wrap(async () => (await ops.createTask({
-      ...a, priority: a.priority ? PRIORITY_NAMES.indexOf(a.priority) : undefined,
-    })).id),
+    async (a) => wrap(async () => {
+      const task = await ops.createTask({ ...a, priority: a.priority ? PRIORITY_NAMES.indexOf(a.priority) : undefined,
+        holdForAuthorization: true });
+      return task.authorizationGap ? { id: task.id, draft: true, authorizationGap: task.authorizationGap } : task.id;
+    }),
   );
   server.registerTool(
     'list_world_providers',
@@ -554,10 +565,11 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
         'Discover valid choices with platform_request GET /api/agent/escalation-targets. ' +
         'Only a selected principal that already holds the requested capabilities and can grant the full task authorization across the expanded scope can approve; approval resumes the task ' +
         'with a newly scoped token. Do not request wildcards. Approval requests are high urgency by default; ' +
-        'pass urgency to raise or lower how loudly the human is alerted.',
+        'pass urgency to raise or lower how loudly the human is alerted. ' + REQUEST_FOR_TASK,
       inputSchema: {
-        capabilities: z.array(z.string().trim().min(1)).max(32),
+        capabilities: z.array(z.string().trim().min(1)).max(32).optional(),
         projectIds: z.array(z.string().trim().min(1)).max(32).optional(),
+        taskId: z.string().trim().min(1).optional(),
         audience: z.array(z.string().trim().min(1)).min(1).max(32).optional(),
         reason: z.string().trim().min(1).max(4_000),
         urgency: z.enum(URGENCY_LEVELS as [Urgency, ...Urgency[]]).optional(),

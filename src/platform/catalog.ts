@@ -150,7 +150,7 @@ export const PLATFORM_API_CATALOG = {
     'POST /api/organizations/:organizationId/github/app-manifest|install-url|authorize (verified user subject; delegation accepted for OAuth/install redirects); refresh is capability-only',
   ],
   tasks: [
-    'GET|POST /api/projects/:projectId/tasks', 'GET /api/projects/:projectId/tasks/by-num/:number',
+    'GET|POST /api/projects/:projectId/tasks (POST body {title?, prompt, params?, draft?, authorization?, credentialGrants?, holdForAuthorization?}: authorization and credentials beyond the caller are refused 403, or with holdForAuthorization:true kept as a draft returned with authorizationGap {summary, missingCapabilities, summon, next})', 'GET /api/projects/:projectId/tasks/by-num/:number',
     'GET /api/search?q=&limit=&offset= (every organization at once: one query over every project you can read in each, sorted together; tasks carry projectId, `projects` their organizationId; `for:me` adds reasons)',
     'GET /api/organizations/:organizationId/search?q=&limit=&offset= (the organization task list: one query over every project you can read, sorted together; tasks carry projectId; `for:me` adds reasons)',
     'GET /api/projects/:projectId/search?q=', 'GET|POST /api/projects/:projectId/tags',
@@ -186,7 +186,7 @@ export const PLATFORM_API_CATALOG = {
     'POST /api/agent/escalate (calling task inferred from its token, or taskId of a sub-task whose request you redirect; body {taskId?, audience?, message, urgency?: low|normal|high|critical}; on a task already waiting it redirects the request; no audience asks the task\'s Responder route)',
     'POST /api/agent/notify (calling task inferred from its token; body {to: [agent:<key> | person/team/Avatar selector], message, urgency?}; people are notified now, the task\'s agents are called when your turn ends)',
     'GET /api/authorization/me?method=&path= (your level, scope, held and missing capabilities; with method and path, whether that request would be allowed and what to request if not, decided as the gateway decides without making it; people add projectId= or organizationId=)',
-    'POST /api/agent/permission-requests (body {capabilities, projectIds?, audience?, reason, urgency?}; exact task elevation and additive project scope (capabilities: [] for scope only) routed to people, teams, or Avatars; no audience summons the lowest of @maintainers, @admins, @superadmins that can grant it; high urgency by default)',
+    'POST /api/agent/permission-requests (body {capabilities, projectIds?, audience?, reason, urgency?}, or {taskId, audience?, reason} to ask for what a task you created is held for; exact task elevation and additive project scope (capabilities: [] for scope only) routed to people, teams, or Avatars; no audience summons the lowest of @maintainers, @admins, @superadmins that can grant it; high urgency by default)',
     'GET /api/agent/escalation-targets (people, teams, Avatars, and special audience selectors — @creator, @maintainers, @admins, @superadmins, @owners, @project, @all — available to the calling task)',
     'GET /api/permission-requests?taskId=&organizationId=',
     'POST /api/permission-requests/:id/resolve?organizationId= (routed user delegate or Avatar: body {action: approve|deny|dismiss}; dismiss only silences the request)',
