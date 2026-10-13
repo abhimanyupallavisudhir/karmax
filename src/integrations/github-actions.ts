@@ -504,21 +504,39 @@ export function classifyGithubActionsFailure(
   // A job that started only after an interrupted job finished (an
   // `if: always()` gate over its `needs`) may have failed because of that
   // interruption, so it is not evidence against the revision (task 459).
+  // A job whose only failed steps are the runner's own setup (pulling its
+  // service images, preparing the machine) never ran repository code: Docker
+  // Hub refusing an image failed every shard this way (CI #1711, #1716).
+  const failedSteps = (job: GithubActionsJob) => job.steps.filter(step => step.conclusion?.toLowerCase() === 'failure');
+  const failedInSetup = (job: GithubActionsJob) => job.conclusion?.toLowerCase() === 'failure'
+    && failedSteps(job).length > 0 && failedSteps(job).every(isRunnerSetupStep);
   const interruptedAt = Math.min(...jobs
-    .filter(job => ['cancelled', 'timed_out'].includes(job.conclusion?.toLowerCase() ?? ''))
+    .filter(job => ['cancelled', 'timed_out'].includes(job.conclusion?.toLowerCase() ?? '') || failedInSetup(job))
     .map(job => Date.parse(job.completedAt ?? '')).filter(Number.isFinite));
-  if (jobs.some(job => job.conclusion?.toLowerCase() === 'failure'
+  if (jobs.some(job => job.conclusion?.toLowerCase() === 'failure' && !failedInSetup(job)
     && !(Date.parse(job.startedAt ?? '') >= interruptedAt)
-    && job.steps.some(step => step.conclusion?.toLowerCase() === 'failure'))) return {
+    && failedSteps(job).length > 0)) return {
     ...common, disposition: 'revision',
     reason: 'GitHub reports a failed execution step; repair the proposal using the attached diagnostics.',
   };
   if (structured) return { ...common, ...structured };
+  if (jobs.some(failedInSetup)) return {
+    ...common, disposition: 'retry',
+    reason: 'Every failed job failed while GitHub was setting it up (its runner or service containers), before any repository code ran; a bounded rerun is the repair.',
+  };
   return {
     ...common, disposition: 'human',
     waitReason: 'GitHub Actions failure needs inspection',
     reason: 'GitHub exposed no failed execution step. Inspect the startup and check diagnostics before deciding whether to repair workflow code or resolve an external restriction.',
   };
+}
+
+/** GitHub's own first steps of a job: `Set up job` is always step 1, and
+ * `Initialize containers` (service and job containers) follows it. Matched by
+ * position as well as name, so a repository step cannot claim to be one. */
+function isRunnerSetupStep(step: GithubActionsStep): boolean {
+  return (step.number === 1 && step.name === 'Set up job')
+    || (step.number <= 2 && step.name === 'Initialize containers');
 }
 
 /** Fallback for permission-limited PR checks and speculative merge-group checks.
