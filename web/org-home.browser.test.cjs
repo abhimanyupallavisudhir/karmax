@@ -71,7 +71,7 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     assert.ok(searches.includes('for:me -is:archived'), `a for: search keeps sub-tasks: ${searches}`);
     const chips = await page.locator('.view-chip[data-view]').evaluateAll((els) => els.map((el) => el.dataset.view));
     assert.deepEqual(chips.slice(0, 2), ['__for_me__', '__active__'], 'For me, then Active');
-    assert.equal(await page.locator('.view-chip[data-view="__active__"]').innerText(), '≡ Active');
+    assert.equal(await page.locator('.view-chip[data-view="__active__"]').innerText(), 'Active');
     assert.equal(await page.locator('.view-chip[data-view="__active__"]').getAttribute('title'), '-is:archived', 'its query is on hover');
     assert.equal(await page.locator('#save-view').count(), 0, 'saved views belong to projects');
     assert.equal(await page.locator('#new-task-project').innerText(), 'website', 'new tasks start in a project you pick');

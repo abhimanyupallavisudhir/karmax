@@ -219,7 +219,7 @@ a { color: var(--accent); text-decoration: none; }
   font-size: 10px; font-weight: 700; display: grid; place-items: center;
 }
 .topbar-user {
-  display: inline-flex; align-items: center;
+  display: inline-block; line-height: 32px; box-sizing: border-box; /* a block, so a long name ends in … */
   height: 34px; padding: 0 12px; border: 1px solid var(--line); border-radius: 999px;
   background: var(--surface-2); color: var(--ink-2); cursor: pointer; font-weight: 600;
   max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -400,11 +400,12 @@ a { color: var(--accent); text-decoration: none; }
 
 /* ── task row ───────────────────────────────────────────────── */
 .task-row {
-  display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 14px;
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 14px;
   padding: 13px 16px; border: 1px solid var(--line); border-radius: var(--r);
   background: var(--surface); margin-bottom: 8px; cursor: pointer; transition: border-color .12s, transform .04s;
 }
 .task-row:hover { border-color: var(--line-strong); }
+.task-row:has(> .series-caret) { grid-template-columns: auto minmax(0, 1fr) auto; }
 .task-row:active { transform: translateY(1px); }
 .task-row.archived { opacity: 0.55; }
 .task-row.sel { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak); }
@@ -486,8 +487,8 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .task-row.unread { box-shadow: inset 3px 0 0 var(--accent); }
 .task-row.unread .task-title { font-weight: 650; color: var(--ink); }
 @media (max-width: 700px) {
-  .inbox-row { grid-template-columns:auto minmax(0, 1fr); }
-  .inbox-row .task-right { grid-column:2; justify-content:flex-end; gap:10px; }
+  .inbox-row { grid-template-columns:minmax(0, 1fr); }
+  .inbox-row .task-right { justify-content:flex-end; gap:10px; }
 }
 .priority-bars { letter-spacing:1px; }
 .inbox-row .urgency-chip { white-space:nowrap; }
@@ -508,6 +509,8 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .settings-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:10px 14px; }
 .organization-settings { max-width:1080px; margin:0 auto; }
 .main-inner:has(> .organization-settings) { max-width:1160px; }
+/* Every page under the project tab bar shares one width, so switching tabs never moves the tabs. */
+.main-inner:has(> .tabs) { max-width:1160px; }
 .organization-settings .card { margin-bottom:12px; }
 .organization-settings .settings-grid { grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:10px 14px; }
 .settings-intro { color:var(--ink-2); margin:-8px 0 14px; }
@@ -527,14 +530,8 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 @keyframes pane-in { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:none; } }
 .settings-section-title { margin:0 0 16px; padding-bottom:12px; border-bottom:1px solid var(--line); color:var(--ink); font-size:21px; font-weight:700; letter-spacing:-.02em; }
 .settings-section-title small { display:block; margin-top:3px; color:var(--ink-3); font-size:12.5px; font-weight:400; letter-spacing:0; line-height:1.45; }
-.project-kind-guide { display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:8px; margin:0 0 12px; }
-.project-kind-guide button { display:flex; flex-direction:column; gap:3px; min-width:0; padding:11px 12px; color:var(--ink); text-align:left; cursor:pointer; border:1px solid var(--line); border-radius:10px; background:var(--surface); transition:border-color .15s,transform .15s,background .15s; }
-.project-kind-guide button:hover { border-color:var(--accent); background:var(--accent-weak); transform:translateY(-1px); }
-.project-kind-guide b { font-size:12px; }
-.project-kind-guide span { color:var(--ink-3); font-size:10.5px; line-height:1.35; }
 .project-config-section { display:flex; gap:12px; align-items:flex-start; scroll-margin-top:20px; margin:30px 0 10px; }
 .project-config-section:first-of-type { margin-top:0; }
-.project-config-number { flex:none; display:grid; place-items:center; width:28px; height:28px; border-radius:8px; background:var(--accent-weak); color:var(--accent); font:600 11px var(--font-mono); }
 .project-config-section h2 { margin:1px 0 2px; font-size:16px; letter-spacing:-.01em; }
 .project-config-section p { margin:0; color:var(--ink-3); font-size:12px; line-height:1.45; }
 .project-form-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:13px 14px; margin:14px 0; }
@@ -622,18 +619,26 @@ a.git-repo-name:hover { color:var(--accent); }
 .team-rename-form[hidden] { display:none; }
 .inline-form { display:flex; gap:7px; flex-wrap:wrap; margin-top:12px; }
 .inline-form input, .inline-form select { min-width:0; flex:1; padding:7px 9px; border:1px solid var(--line); background:var(--surface-2); border-radius:7px; }
-@media (max-width: 850px) { .responsibility-editor { grid-template-columns:1fr; } .settings-disclosure > summary span { display:none; } .settings-layout { grid-template-columns:1fr; gap:14px; } .settings-nav { position:sticky; top:0; z-index:4; flex-direction:row; overflow-x:auto; padding:8px 0; border:0; border-bottom:1px solid var(--line); background:var(--paper); } .settings-nav > span { display:none; } .settings-nav a { white-space:nowrap; } .settings-nav a::before { display:none; } .project-kind-guide { grid-template-columns:repeat(2,minmax(0,1fr)); } }
-@media (max-width: 560px) { .project-form-grid { grid-template-columns:1fr; } .project-form-grid .form-row.wide { grid-column:auto; } .project-kind-guide { grid-template-columns:1fr 1fr; } .new-repository-identity { grid-template-columns:1fr; } .new-repository-slash { display:none; } }
+@media (max-width: 850px) { .responsibility-editor { grid-template-columns:1fr; } .settings-disclosure > summary span { display:none; } .settings-layout { grid-template-columns:1fr; gap:14px; } .settings-nav { position:sticky; top:0; z-index:4; flex-direction:row; overflow-x:auto; padding:8px 0; border:0; border-bottom:1px solid var(--line); background:var(--paper); } .settings-nav > span { display:none; } .settings-nav a { white-space:nowrap; } .settings-nav a::before { display:none; } }
+@media (max-width: 560px) { .project-form-grid { grid-template-columns:1fr; } .project-form-grid .form-row.wide { grid-column:auto; } .new-repository-identity { grid-template-columns:1fr; } .new-repository-slash { display:none; } }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 
 /* big labeled pipeline on the task page (Overview tab) */
 
 /* ── badges / chips ─────────────────────────────────────────── */
+/* A label in the UI face. Chips hold text only, so they are inline blocks and
+   ::first-letter can give status chips sentence case (below). */
 .chip {
-  display: inline-flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 600;
-  padding: 3px 8px; border-radius: 999px; font-family: var(--font-mono);
+  display: inline-block; vertical-align: middle; font-size: 11px; line-height: 14px; font-weight: 600;
+  padding: 3px 8px; border-radius: 999px; font-family: var(--font-ui); white-space: nowrap;
   background: var(--surface-2); color: var(--ink-2); border: 1px solid var(--line);
 }
+/* Status chips read in sentence case whatever case the label arrives in;
+   other chips (capabilities, tags, names) keep their exact text. */
+.task-sub > .chip::first-letter, .task-title > .chip::first-letter, .run-row > .chip::first-letter,
+.chip.active::first-letter, .chip.waiting::first-letter, .chip.blocked::first-letter,
+.chip.failed::first-letter, .chip.done::first-letter, .chip.cancelled::first-letter,
+.chip.attention::first-letter, .chip.approval-needed::first-letter { text-transform: uppercase; }
 .chip.active { background: var(--accent-weak); color: var(--accent); border-color: transparent; }
 .chip.waiting { background: var(--working-weak); color: var(--working); border-color: transparent; }
 .chip.blocked, .chip.failed { background: var(--danger-weak); color: var(--danger); border-color: transparent; }
@@ -2245,10 +2250,9 @@ html[data-theme="dark"] .github-signin-btn:active,
   .tabs { overflow-x:auto; scrollbar-width:none; }
   .tabs::-webkit-scrollbar { display:none; }
   .tab { flex:none; white-space:nowrap; }
-  .composer { display:grid; grid-template-columns:minmax(0, 1fr) repeat(3, 42px); }
-  .quick-task-field { grid-column:1 / -1; width:100%; }
-  .composer #draft-task { grid-column:2; }
-  .composer input.title-in { min-width:0; width:100%; }
+  .composer input.title-in { min-width:0; width:100%; padding-left:10px; padding-right:6px; }
+  .composer .quick-task-attach { width:30px; margin-right:2px; }
+  .composer #draft-task { display:none; } /* the full form saves drafts too */
   .tp-head > * { padding: 0 16px; }
   .tp-content { padding: 16px 16px 40px; }
   .tp-foot { padding: 10px 0; }
@@ -2630,8 +2634,15 @@ html[data-theme="dark"] .github-signin-btn:active,
   padding: 2px 6px; border-radius: 6px;
 }
 .search-box .search-x:hover { background: var(--surface); color: var(--ink); }
-.organizer .views-bar { margin: 6px 0 2px; border-top: 1px solid var(--line); padding-top: 8px; }
-.organizer .query-bar { margin: 6px 0 0; }
+/* Views on the left, the Filter/Group/Sort menus on the right, one line. */
+.organizer-row { display: flex; align-items: center; gap: 6px 10px; flex-wrap: wrap; margin-top: 6px; padding-top: 8px; border-top: 1px solid var(--line); }
+.organizer-row .views-bar, .organizer-row .query-bar { margin: 0; }
+.organizer-row .query-bar { margin-left: auto; }
+.search-count { color: var(--ink-3); font-size: 12px; white-space: nowrap; }
+@media (max-width: 700px) {
+  .organizer-row { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; }
+  .organizer-row .views-bar, .organizer-row .query-bar { flex-wrap: nowrap; }
+}
 
 .views-bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 8px 0 4px; }
 .view-chip {
@@ -2654,11 +2665,13 @@ html[data-theme="dark"] .github-signin-btn:active,
 .query-bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 4px 0 2px; }
 .q-sel {
   font-size: 12px; padding: 4px 8px; border-radius: 7px; cursor: pointer;
-  border: 1px solid var(--line); background: var(--surface-2); color: var(--ink-2);
-  font-family: var(--font-ui); max-width: 220px;
+  border: 1px solid var(--line); background: var(--surface); color: var(--ink-2);
+  font-family: var(--font-ui); width: auto; max-width: 150px; flex: none; field-sizing: content;
 }
 .q-sel:hover { border-color: var(--line-strong); }
 .q-spacer { flex: 1; }
+.queue-empty { padding: 12px 16px; color: var(--ink-3); font-size: 13px; }
+.wiki-nav .wiki-new { align-self: flex-start; margin: 0 0 8px 10px; }
 
 .group-h {
   display: flex; align-items: center; gap: 8px; margin: 14px 0 4px;
@@ -3026,12 +3039,13 @@ html[data-theme="dark"] .github-signin-btn:active,
   .ws-offline::before { content: "⟳"; font-size: 12px; } }
 
 /* Avatars — intentionally closer to the Wiki list than to a settings console. */
-.avatars-page { width: min(980px, 100%); margin: 0 auto; padding: 28px 24px 72px; box-sizing: border-box; }
+.avatars-page { width: 100%; box-sizing: border-box; } /* the page's own frame is .main-inner, like its sibling tabs */
 .avatar-list-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
 .avatar-risk-note { display: flex; gap: 10px; align-items: flex-start; margin: 14px 0 0; padding: 11px 12px; border: 1px solid var(--working); border-radius: 10px; background: var(--working-weak); color: var(--ink); font-size: 12px; line-height: 1.5; }
 .avatar-risk-note .avatar-risk-mark { color: var(--working); font-size: 15px; line-height: 1.2; }
 .settings-section-title + .avatar-risk-note { margin: 0 0 12px; }
 .avatar-list { margin-top: 18px; border-top: 1px solid var(--line); }
+.avatar-list:empty { border-top: 0; }
 .avatar-row { width: 100%; display: grid; grid-template-columns: 36px minmax(0,1fr) auto 18px; align-items: center; gap: 12px; padding: 15px 8px; border: 0; border-bottom: 1px solid var(--line); background: transparent; color: var(--ink); text-align: left; cursor: pointer; }
 .avatar-row:hover { background: var(--surface-2); }
 .avatar-mark { display: inline-grid; width: 32px; height: 32px; place-items: center; border-radius: 9px; background: var(--accent-weak); color: var(--accent); font-size: 16px; }

@@ -139,7 +139,7 @@ describe('dependency picker', () => {
     await ui.page.locator('#dep-add').click();
     const search = ui.page.locator('#pk-search');
     await expect.poll(() => search.inputValue()).toBe('-is:archived ');
-    expect(await ui.page.locator('#pk-views .view-chip.active').innerText()).toBe('≡ Active');
+    expect(await ui.page.locator('#pk-views .view-chip.active').innerText()).toBe('Active');
     await expect.poll(() => queries.at(-1)).toBe('-is:archived -is:run -is:series -is:draft');
     await search.fill('');
     await expect.poll(() => queries.at(-1)).toBe('-is:run -is:series -is:draft');

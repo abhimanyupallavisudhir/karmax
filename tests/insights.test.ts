@@ -91,6 +91,20 @@ describe('organization insights', () => {
     } finally { await store.close(); }
   });
 
+  it('counts only a wait a person must end as waiting on people', async () => {
+    const { store, organization, web, task, view } = await seed();
+    try {
+      const parent = await task(web.id, 'Parent', NOW - DAY);
+      await view(parent.id, 'do', 'waiting', { waitingFor: { kind: 'subtask' } }); // its sub-tasks' agents work
+      const question = await task(web.id, 'Question', NOW - DAY);
+      await view(question.id, 'do', 'waiting', { waitingFor: { kind: 'human' } });
+      const insights = await organizationInsights(store, organization.id, { days: 30, now: NOW });
+      expect(insights.waiting.map((ref) => ref.title)).toEqual(['Question']);
+      expect(insights.working.map((ref) => ref.title)).toEqual(['Parent']);
+      expect(insights.pipeline).toMatchObject({ working: 1, waiting: 1 });
+    } finally { await store.close(); }
+  });
+
   it('buckets by the viewer\'s local day', async () => {
     const { store, organization, web, task, view, publish } = await seed();
     try {

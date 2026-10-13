@@ -33,7 +33,7 @@ const { fakeConsole, launch, reply } = require('../tests/helpers/fake-console.cj
     await page.locator('[data-id="t"]').waitFor();
     assert.equal(await page.locator('[data-id="t"] .task-title').textContent(), '#1 Review <script>世界</script>');
     assert.equal(await page.locator('#main script').count(), 0);
-    await page.getByRole('button', { name: '🏷 Tags', exact: true }).click();
+    await page.getByRole('button', { name: 'Tags', exact: true }).click();
     await page.locator('#tagm-name').fill('未保存 <b>draft</b>');
     await page.locator('[data-edittag="tag"]').click();
     assert.equal(await page.locator('#tagm-name').inputValue(), '未保存 <b>draft</b>');

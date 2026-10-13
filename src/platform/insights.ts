@@ -57,6 +57,9 @@ function parseJson(value: unknown): Record<string, any> {
   try { return JSON.parse(String(value)) ?? {}; } catch { return {}; }
 }
 
+/** Waits that agents end by themselves (web/app.js PARKED_WAITS and the working kinds). */
+const AGENT_WAITS = new Set(['subtask', 'timer', 'job', 'collaboration', 'parent', 'agentSlot', 'subagent', 'shell']);
+
 export async function organizationInsights(store: Store, organizationId: string, options: {
   days?: number; utcOffsetMinutes?: number; now?: number; includeSpend?: boolean;
 } = {}): Promise<OrganizationInsights> {
@@ -189,7 +192,10 @@ export async function organizationInsights(store: Store, organizationId: string,
     entry.open++;
     const project = perProject.get(task.projectId);
     if (project) project.open++;
-    if (view.status === 'active') {
+    // A task parked on its sub-tasks, a timer, a job or an agent's own work is
+    // still with the agents; only a wait a person must end is waiting on people.
+    const agentsWait = view.status === 'waiting' && AGENT_WAITS.has(String(view.waitingFor?.kind ?? ''));
+    if (view.status === 'active' || agentsWait) {
       entry.working++; workingCount++;
       if (working.length < LIST_LIMIT) working.push(ref(task));
     } else if (view.status === 'waiting' || view.status === 'blocked') {

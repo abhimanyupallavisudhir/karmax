@@ -123,12 +123,16 @@ const EMPTY = { ...fixture(), totals: { ...fixture().totals, shipped: 0, created
       name: el.querySelector('.ins-node-name').textContent,
       parts: [...el.querySelectorAll('.ins-node-bar i')].map(i => i.className),
     })));
-    assert.deepEqual(nodes.map(n => [n.name, n.n]), [['Setup', '1'], ['Working', '4'], ['Review', '2'], ['PR', '0'], ['Landing', '2'], ['Shipped · 7d', '11']]);
+    assert.deepEqual(nodes.map(n => [n.name, n.n]), [['Setup', '1'], ['Working', '4'], ['Review', '2'], ['PR', '0'], ['Landing', '2'], ['Shipped', '11']]);
     assert.deepEqual(nodes[1].parts, ['w', 'h']);
     assert.deepEqual(nodes[4].parts, ['w', 'q'], 'an open task neither with an agent nor a person reads as queued');
     assert.ok(await page.locator('.ins-node.shipped .ins-delta.good').count(), 'more shipped than last period is good news');
     const foot = await page.locator('.ins-flow-foot').textContent();
-    for (const text of ['5 with agents', '4 waiting on people', '1 escalated', '2 failed', '2 drafts']) assert.ok(foot.includes(text), text);
+    for (const text of ['1 escalated', '2 failed', '2 drafts']) assert.ok(foot.includes(text), text);
+    // Who holds the work is said once, by the panels.
+    assert.ok(!foot.includes('with agents') && !foot.includes('waiting on people'), 'the foot does not repeat the panels');
+    assert.equal(await page.locator('.ins-card-h', { hasText: 'Waiting on people' }).locator('.ins-count').textContent(), '4');
+    assert.equal(await page.locator('.ins-card-h', { hasText: 'With agents' }).locator('.ins-count').textContent(), '5');
 
     // Trend tiles: lower time-to-ship is good; spend only appears with payment access.
     assert.equal(await page.locator('.ins-kpi').count(), 4);

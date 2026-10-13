@@ -44,7 +44,8 @@ describe('installation identity', () => {
   it('uses one dynamic name source throughout public and authenticated UI', () => {
     const app = read('web/app.js');
     expect(app).toContain("function siteName() { return S.meta?.siteName || 'tavya'; }");
-    expect(app).toContain('Site name<input id="site-name"');
+    expect(app).toContain('Site name ${policyTip(');
+    expect(app).toContain('<input id="site-name"');
     expect(app).toContain("api('/api/settings/installation'");
     expect(app).toContain('${siteNameMarkup()}');
   });
