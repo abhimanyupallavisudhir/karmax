@@ -83,6 +83,9 @@ const ICON = {
   insights: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3v16a2 2 0 0 0 2 2h16"/><path d="m7 15 4-5 3.5 3L20 6.5"/></svg>',
   wiki: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 7v14"/><path d="M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3Z"/></svg>',
   settings: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2Z"/><circle cx="12" cy="12" r="3"/></svg>',
+  // Topbar: the inbox bell and the phone sidebar toggle, drawn like the rail icons.
+  bell: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>',
+  menu: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg>',
   docs: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9.5"/><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3"/><path d="M12 17h.01"/></svg>',
   palette: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3V6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3"/></svg>',
   keyboard: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="5" width="20" height="14" rx="2"/><path d="M6 9h.01M10 9h.01M14 9h.01M18 9h.01M8 13h.01M12 13h.01M16 13h.01M7.5 16h9"/></svg>',
@@ -5212,13 +5215,13 @@ function renderShell() {
   const app = $('#app');
   app.innerHTML = `
     <div class="topbar">
-      <button class="icon-btn mobile-menu" id="mobile-menu" aria-controls="rail" aria-label="Sidebar" aria-expanded="true">☰</button>
+      <button class="icon-btn mobile-menu" id="mobile-menu" aria-controls="rail" aria-label="Sidebar" aria-expanded="true">${ICON.menu}</button>
       <a class="brand" id="brand-home" data-spa data-shortcut="nav.home" href="${esc(homeRoute())}" title="Home" aria-label="Home">${brandMark()} ${siteNameMarkup()}</a>
       <div class="spacer"></div>
       <span class="ws-offline hidden" id="ws-offline" role="status">Reconnecting — live updates paused</span>
       <kbd class="key-echo" id="key-echo" aria-hidden="true"></kbd>
       <a class="topbar-user" id="topbar-user" data-spa data-shortcut="nav.profile" href="${profileRoute()}" title="Your profile">${esc(userDisplayName())}</a>
-      <a class="icon-btn has-badge" id="bell" data-shortcut="nav.notifications" data-spa href="${esc(inboxRoute(DEFAULT_LIST_QUERY))}" title="What needs you, in every organization" role="button" aria-label="Inbox">🔔<span class="badge hidden" id="bell-badge">0</span></a>
+      <a class="icon-btn has-badge" id="bell" data-shortcut="nav.notifications" data-spa href="${esc(inboxRoute(DEFAULT_LIST_QUERY))}" title="What needs you, in every organization" role="button" aria-label="Inbox">${ICON.bell}<span class="badge hidden" id="bell-badge">0</span></a>
     </div>
     ${verificationBanner()}
     <div class="body">
@@ -5839,7 +5842,7 @@ function renderMain() {
   const projectScoped = PROJECT_SCOPED_TABS.includes(S.tab);
   const tabbar = projectScoped
     ? `<div class="tabs">${tabs
-        .map((t) => `<a class="tab ${S.tab === t ? 'active' : ''}" data-spa href="${projectRoute(proj?.id, t)}" data-tab="${t}"${PROJECT_TAB_COMMANDS[t] ? ` data-shortcut="${PROJECT_TAB_COMMANDS[t]}"` : ''}>${labels[t]}${t === 'tasks' && S.tasks.length ? `<span class="pill">${S.tasks.length}</span>` : ''}</a>`)
+        .map((t) => `<a class="tab ${S.tab === t ? 'active' : ''}" data-spa href="${projectRoute(proj?.id, t)}" data-tab="${t}"${PROJECT_TAB_COMMANDS[t] ? ` data-shortcut="${PROJECT_TAB_COMMANDS[t]}"` : ''}>${labels[t]}</a>`)
         .join('')}${S.meta?.hosted ? `<span class="tabs-spacer"></span><button class="btn tool tabs-action" id="project-local-checkout" title="Check out this project on your computer">${ICON.laptop}Work locally</button>` : ''}</div>`
     : '';
 
@@ -5917,12 +5920,11 @@ function effectiveQuery(q, facets = ['run', 'subtask']) {
 // Built-in starter views that make useful organization modes and new task shapes
 // first-class instead of buried. Each is just a query string; they
 // can't be deleted (no ✕). Keep the queries in step with the facets in src/domain/search.ts.
+// Views filter the list; grouping lives in the Group menu, so no view only groups.
 const BUILTIN_VIEWS = [
-  { id: 'builtin:sectioned-type', name: 'Sectioned (type)', icon: '§', query: '-is:archived group:tag-type' },
-  { id: 'builtin:sectioned-topic', name: 'Sectioned (topic)', icon: '§', query: '-is:archived group:tag-topic' },
-  { id: 'builtin:scheduled', name: 'Scheduled', icon: '⏰', query: 'is:scheduled -is:archived sort:nextRun-asc' },
-  { id: 'builtin:series', name: 'Repeatable', icon: '🔁', query: 'is:series -is:archived' },
-  { id: 'builtin:archived', name: 'Archived', icon: '🗄', query: 'is:archived' },
+  { id: 'builtin:scheduled', name: 'Scheduled', query: 'is:scheduled -is:archived sort:nextRun-asc' },
+  { id: 'builtin:series', name: 'Repeatable', query: 'is:series -is:archived' },
+  { id: 'builtin:archived', name: 'Archived', query: 'is:archived' },
 ];
 
 // Which view chip a query lights up. A view IS a query, so the query decides —
@@ -5951,7 +5953,7 @@ function viewsBar() {
   const active = viewIdForQuery(S.search);
   const home = isCrossProjectList();
   const builtins = BUILTIN_VIEWS
-    .map((v) => `<div class="view-chip builtin ${active === v.id ? 'active' : ''}" data-view="${v.id}" role="button" tabindex="0" title="${esc(v.query)}">${esc(v.icon)} ${esc(v.name)}</div>`)
+    .map((v) => `<div class="view-chip builtin ${active === v.id ? 'active' : ''}" data-view="${v.id}" role="button" tabindex="0" title="${esc(v.query)}">${esc(v.name)}</div>`)
     .join('');
   const saved = (home ? [] : S.views)
     .map(
@@ -5959,11 +5961,11 @@ function viewsBar() {
     )
     .join('');
   return `<div class="views-bar">
-    <div class="view-chip ${active === FOR_ME_VIEW ? 'active' : ''}" data-view="${FOR_ME_VIEW}" role="button" tabindex="0" title="Waiting on you: reviews, questions, approvals, mentions — and your drafts">◉ For me</div>
-    <div class="view-chip ${active === ACTIVE_VIEW ? 'active' : ''}" data-view="${ACTIVE_VIEW}" role="button" tabindex="0" title="${esc(ACTIVE_VIEW_QUERY)}">≡ Active</div>
+    <div class="view-chip ${active === FOR_ME_VIEW ? 'active' : ''}" data-view="${FOR_ME_VIEW}" role="button" tabindex="0" title="Waiting on you: reviews, questions, approvals, mentions — and your drafts">For me</div>
+    <div class="view-chip ${active === ACTIVE_VIEW ? 'active' : ''}" data-view="${ACTIVE_VIEW}" role="button" tabindex="0" title="${esc(ACTIVE_VIEW_QUERY)}">Active</div>
     ${builtins}
     ${saved}
-    ${home ? '' : '<div class="view-chip add" id="save-view" role="button" tabindex="0" title="Save the current query as a view">＋ Save view</div>'}
+    ${home ? '' : '<div class="view-chip add" id="save-view" role="button" tabindex="0" title="Save the current query as a view">+ Save view</div>'}
   </div>`;
 }
 
@@ -6028,14 +6030,14 @@ function queryToolbarHtml(q, prefix, trailing = '') {
   const opt = (v, label, sel) => `<option value="${esc(v)}" ${sel ? 'selected' : ''}>${esc(label)}</option>`;
   const grp = (label, inner) => (inner ? `<optgroup label="${esc(label)}">${inner}</optgroup>` : '');
   return `<div class="query-bar">
-    <select id="${prefix}-filter-field" class="q-sel" title="Add a filter"><option value="">＋ Filter…</option>
+    <select id="${prefix}-filter-field" class="q-sel" title="Add a filter"><option value="">Filter</option>
       ${filterFields.map((f) => opt(f.key, f.label)).join('')}
       ${grp('Workflow params', params.map((f) => opt(f.key, f.label)).join(''))}</select>
     <select id="${prefix}-group" class="q-sel" title="Group by">
-      ${opt('', 'No grouping', !curGroup)}${grpFields.filter((f) => !f.param).map((f) => opt(f.key, 'Group: ' + f.label, curGroup === f.key)).join('')}
+      ${opt('', 'Group', !curGroup)}${grpFields.filter((f) => !f.param).map((f) => opt(f.key, 'Group: ' + f.label, curGroup === f.key)).join('')}
       ${grp('Workflow params', params.map((f) => opt(f.key, 'Group: ' + f.label, curGroup === f.key)).join(''))}</select>
     <select id="${prefix}-sort" class="q-sel" title="Sort by">
-      ${opt('', 'Sort: default', !curSort)}${sortFields.filter((f) => !f.param).map((f) => opt(f.key + '-desc', 'Sort: ' + f.label + ' ↓', curSort === f.key + '-desc') + opt(f.key + '-asc', 'Sort: ' + f.label + ' ↑', curSort === f.key + '-asc')).join('')}
+      ${opt('', 'Sort', !curSort)}${sortFields.filter((f) => !f.param).map((f) => opt(f.key + '-desc', 'Sort: ' + f.label + ' ↓', curSort === f.key + '-desc') + opt(f.key + '-asc', 'Sort: ' + f.label + ' ↑', curSort === f.key + '-asc')).join('')}
       ${grp('Workflow params', params.map((f) => opt(f.key + '-asc', 'Sort: ' + f.label + ' ↑', curSort === f.key + '-asc') + opt(f.key + '-desc', 'Sort: ' + f.label + ' ↓', curSort === f.key + '-desc')).join(''))}</select>
     ${trailing}
   </div>`;
@@ -6123,30 +6125,28 @@ function tasksView() {
     <div class="composer">
       <div class="quick-task-field">
         ${home ? projectPickerHtml('new-task-project', newTaskProjectId()) : ''}
-        <input class="title-in" id="new-task" data-shortcut="nav.newTask" placeholder="New Task · ↵ for full task form · Ctrl+↵ to send" />
+        <input class="title-in" id="new-task" data-shortcut="nav.newTask" placeholder="New task…" title="↵ opens the full form · ${esc(fmtKeys('meta+Enter'))} starts it" />
         <label class="btn soft icon-only attach-composer quick-task-attach" tabindex="0" title="Attach files (25 MB each)" aria-label="Attach files">${ICON.attach}<input id="new-task-files" type="file" multiple hidden></label>
+        <button class="btn soft icon-only quick-task-attach" id="draft-task" title="Save as draft (Alt+Enter)" aria-label="Save as draft (Alt+Enter)">${ICON.save}</button>
+        <button class="btn soft icon-only quick-task-attach" id="expand-task" data-shortcut="nav.newTaskForm" title="Open full task form (N or ↵)" aria-label="Open full task form">${ICON.form}</button>
       </div>
-      <button class="btn icon-only" id="draft-task" title="Save as draft ( Alt+Enter )" aria-label="Save as draft (Alt+Enter)">${ICON.save}</button>
-      <button class="btn icon-only" id="expand-task" data-shortcut="nav.newTaskForm" title="Open full task form ( N or ↵ )" aria-label="Open full task form">${ICON.form}</button>
       <button class="btn primary icon-only" id="add-task" data-shortcut="list.quickAdd" title="Add directly ( ${esc(fmtKeys('meta+Enter'))} )" aria-label="Add task">${ICON.send}</button>
     </div>
     <div class="img-chips attachment-chips" id="new-task-chips" style="display:none"></div>`;
   const trailing = everywhere ? '' : home ? projectFilterHtml()
-    : `<div class="q-spacer"></div><button class="btn sm" id="manage-tags" title="Manage the project's tags">🏷 Tags</button>`;
-  return `${composer}
+    : `<button class="q-sel" id="manage-tags" title="Manage the project's tags">Tags</button>`;
+  // The bell's page has no tab bar or composer to say where you are.
+  return `${everywhere ? '<h1 class="page-title">Inbox</h1>' : ''}${composer}
     <div class="organizer">
       <div class="search-box${S.searchPending ? ' searching' : ''}">
         <span class="search-ic">⌕</span>
         <input id="task-search" class="task-search" data-shortcut="nav.search" spellcheck="false" autocomplete="off" value="${esc(S.search)}"
-          placeholder="Search &amp; filter…  e.g.  status:active -tag:bug priority:>=2  ( / )" />
+          placeholder="Search tasks" aria-label="Search and filter tasks" />
+        ${S.searchPending ? '<span class="search-pending" role="status">Searching…</span>' : `<span class="search-count">${count} task${count === 1 ? '' : 's'}</span>`}
+        ${policyTip('Type words to search, or filters: status:active  -tag:bug  priority:>=2  group:stage  sort:updated-desc')}
         ${S.search ? `<button class="search-x" id="q-clear" title="Clear (Esc)">✕</button>` : ''}
-        ${S.searchPending ? '<span class="search-pending" role="status">Searching…</span>' : ''}
       </div>
-      ${viewsBar()}
-      ${queryToolbarHtml(S.search || '', 'q', trailing)}
-    </div>
-    <div class="switch" style="justify-content:space-between;margin:6px 2px 4px">
-      <span style="font-size:12px;color:var(--ink-3)">${count} task${count === 1 ? '' : 's'}${S.search ? ' · filtered' : ''}</span>
+      <div class="organizer-row">${viewsBar()}${queryToolbarHtml(S.search || '', 'q', trailing)}</div>
     </div>
     ${notices}${body || empty}`;
 }
@@ -6378,8 +6378,6 @@ function triggerSummary(triggers) {
 function seriesRow(t) {
   const runs = (S._runsBySeries?.[t.id] || []).slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
   const expanded = S.expandedSeries?.has(t.id);
-  const latest = runs[0]?.lastView;
-  const dot = latest ? latest.status || 'active' : 'waiting';
   const bits = [];
   if (t.params?.triggers?.length) bits.push(triggerSummary(t.params.triggers));
   bits.push(`${runs.length} run${runs.length === 1 ? '' : 's'}`);
@@ -6387,7 +6385,6 @@ function seriesRow(t) {
   return `
     <div class="task-row series-row" data-series="${t.id}">
       <button class="icon-btn series-caret" data-expand="${t.id}" title="Show runs">${expanded ? '▾' : '▸'}</button>
-      <span class="status-dot ${dot}" title="repeatable series"></span>
       <div class="task-main">
         <div class="task-title">${esc(t.title)} <span class="chip">repeatable</span></div>
         <div class="task-sub"><span style="color:var(--ink-3)">${esc(bits.join('  ·  '))}</span></div>
@@ -6404,7 +6401,6 @@ function runSubRow(r) {
   const status = v.status || 'active';
   return `
     <div class="task-row run-row" data-id="${r.id}">
-      <span class="status-dot ${status}" title="${esc(status)}"></span>
       <div class="task-main">
         <div class="task-title">${esc(r.title)} <span class="chip ${status}">${esc(stageLabel(v))}</span>${v.approvalRequests ? ' <span class="chip approval-needed">approval needed</span>' : ''}</div>
         <div class="task-sub"><span style="color:var(--ink-3)">${new Date(r.createdAt).toLocaleString()}</span></div>
@@ -6421,7 +6417,6 @@ function taskRow(t, { showTags = true, project = false } = {}) {
   if (t.params?.triggerState === 'armed' && !archived) {
     return `
     <div class="task-row" data-armed="${t.id}">
-      <span class="status-dot waiting" title="waiting for trigger"></span>
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</div>
         <div class="task-sub"><span class="chip">waiting for trigger</span><span style="color:var(--ink-3)">${esc(triggerSummary(t.params.triggers))}</span></div>
@@ -6439,7 +6434,6 @@ function taskRow(t, { showTags = true, project = false } = {}) {
   if (isDraft && !archived) {
     return `
     <div class="task-row" data-draft="${t.id}" tabindex="0" role="group" aria-label="${esc(t.title)}">
-      <span class="status-dot cancelled" title="draft"></span>
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</div>
         <div class="task-sub">${where}<span class="chip">draft</span>${priorityFlag(t)}${showTags ? tagChips(t) : ''}</div>
@@ -6452,7 +6446,6 @@ function taskRow(t, { showTags = true, project = false } = {}) {
   }
   const v = t.lastView || {};
   const status = v.status || 'active';
-  const stage = v.stage || 'setup';
   // In a for: list the reason says what the task waits for; a waiting stage
   // chip ("Needs input") would only repeat it.
   const why = attentionChip(t);
@@ -6463,7 +6456,6 @@ function taskRow(t, { showTags = true, project = false } = {}) {
     : `<button class="icon-btn" data-archive="${t.id}" data-shortcut="list.archive" title="Archive — hide from the list"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8"/><path d="M10 12h4"/></svg></button>`;
   return `
     <div class="task-row ${archived ? 'archived' : ''}${taskHasUnreadAsk(t.id) ? ' unread' : ''}" data-id="${t.id}" tabindex="0" role="group" aria-label="${esc(t.title)}">
-      <span class="status-dot ${status}" title="${esc(status)}"></span>
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}${archived ? ' <span class="chip">archived</span>' : ''}</div>
         <div class="task-sub">
@@ -6578,7 +6570,7 @@ function pipeline(v) {
     }
     segs += `<span class="${cls}"></span>`;
   }
-  return `<div class="pipeline${escalated ? ' escalated' : ''}" title="${escalated ? 'escalated — awaiting a human' : esc(v.stage || '')}">${segs}</div>`;
+  return `<div class="pipeline${escalated ? ' escalated' : ''}" title="${escalated ? 'Escalated — awaiting a human' : esc(stageLabel(v))}">${segs}</div>`;
 }
 
 // ── task-organization control wiring (views bar + query toolbar + modals) ─────
@@ -6699,7 +6691,7 @@ function openFilterPicker(fieldKey, onAdd) {
     // Show the hierarchy as indented paths; picking one adds tag:<path>.
     const rows = S.tags.length
       ? S.tags.map((t) => `<div class="opt" data-val="${esc(tagPathStr(t.id))}">${esc(tagPathStr(t.id))}${t.kind ? ` <span class="pal-sub">${esc(t.kind)}</span>` : ''}</div>`).join('')
-      : `<div class="pal-empty">No tags yet. Create one with the 🏷 Tags button.</div>`;
+      : `<div class="pal-empty">No tags yet. Create one with the Tags button.</div>`;
     inner = rows;
   } else if (field.options) {
     inner = field.options.map((o) => `<div class="opt" data-val="${esc(o.value)}">${esc(o.label)}</div>`).join('');
@@ -6747,10 +6739,9 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['run'], query 
       <div class="search-box">
         <span class="search-ic">⌕</span>
         <input id="pk-search" class="task-search" spellcheck="false" autocomplete="off"
-          placeholder="Search &amp; filter…  e.g.  status:done tag:frontend priority:>=2" />
+          placeholder="Search tasks" aria-label="Search and filter tasks" />
       </div>
-      <div class="views-bar" id="pk-views"></div>
-      <div id="pk-toolbar"></div>
+      <div class="organizer-row"><div class="views-bar" id="pk-views"></div><div class="query-bar-host" id="pk-toolbar"></div></div>
     </div>
     ${hint ? `<div class="pk-hint">${esc(hint)}</div>` : ''}
     <div id="pk-list"></div>
@@ -6772,8 +6763,8 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['run'], query 
   const paintControls = () => {
     const activeView = viewIdForQuery(q);
     $('#pk-views', host).innerHTML = [
-      `<div class="view-chip ${activeView === ACTIVE_VIEW ? 'active' : ''}" data-pkview="${ACTIVE_VIEW}" title="${esc(ACTIVE_VIEW_QUERY)}">≡ Active</div>`,
-      ...BUILTIN_VIEWS.map((v) => `<div class="view-chip builtin ${activeView === v.id ? 'active' : ''}" data-pkview="${v.id}" title="${esc(v.query)}">${esc(v.icon)} ${esc(v.name)}</div>`),
+      `<div class="view-chip ${activeView === ACTIVE_VIEW ? 'active' : ''}" data-pkview="${ACTIVE_VIEW}" title="${esc(ACTIVE_VIEW_QUERY)}">Active</div>`,
+      ...BUILTIN_VIEWS.map((v) => `<div class="view-chip builtin ${activeView === v.id ? 'active' : ''}" data-pkview="${v.id}" title="${esc(v.query)}">${esc(v.name)}</div>`),
       ...S.views.map((v) => `<div class="view-chip ${activeView === v.id ? 'active' : ''}" data-pkview="${v.id}">${v.icon ? esc(v.icon) + ' ' : ''}${esc(v.name)}</div>`),
     ].join('');
     host.querySelectorAll('[data-pkview]').forEach((el) =>
@@ -6818,7 +6809,6 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['run'], query 
     const chipLabel = t.params?.draft ? 'draft' : t.params?.triggerState === 'armed' ? 'waiting for trigger' : stageLabel(v);
     const open = expanded.has(t.id);
     return `<div class="pick-row" data-nav data-task="${t.id}">
-      <span class="status-dot ${status}"></span>
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}${t.params?.archived ? ' <span class="chip">archived</span>' : ''}${t.params?.repeatable ? ' <span class="chip">repeatable</span>' : ''}</div>
         <div class="task-sub">${organizationWide && t.projectId !== S.projectId ? projectLabel(t) : ''}<span class="wf">${esc(workflowLabel(t.workflow))}</span><span class="chip ${status}">${esc(chipLabel)}</span>${priorityFlag(t)}${tagChips(t, false)}</div>
@@ -7908,7 +7898,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     <div class="task-form-page" id="tf-page" tabindex="-1">
       <div class="tf-head">
         <div class="tf-head-inner">
-          <button class="icon-btn" id="tf-close" data-shortcut="nav.close" title="Back (Esc)">←</button>
+          <button class="icon-btn" id="tf-close" data-shortcut="nav.close" title="${editInPlace ? 'Back (Esc) — your changes are kept' : 'Back (Esc) — your work is kept as a draft'}">←</button>
           <h2>${taskFormTitle(draft)}</h2>
           ${proj ? `<span class="tf-crumb">in</span>${projectPickerHtml('tf-project', projectId, !draft)}` : ''}
           ${formAttemptGroup?.attempts?.length > 1 ? `<nav class="attempts-list tf-attempts" aria-label="Choose an attempt">
@@ -7934,7 +7924,6 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
           </div>
           <aside class="tf-side">
             <div class="form-row" data-row="__org">
-              <div class="label-row"><label>Priority &amp; tags</label></div>
               ${orgEditorHtml(draft || { id: null, params: {}, tags: [] })}
             </div>
             ${['software-dev', 'goal'].includes(wf) ? `<div class="form-row" data-row="__github-merge" id="tf-github-merge" style="display:none"></div>` : ''}
@@ -7947,15 +7936,15 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
               <div id="cred-editor-newtask">Loading…</div>
             </div>
             <div class="form-row" data-row="__notes">
-              <div class="label-row"><label>Notes</label></div>
-              <textarea id="tf-notes" rows="4" placeholder="Jot down anything for yourself — not sent to the agent" style="width:100%">${esc(draft?.notes || '')}</textarea>
+              <div class="label-row"><label>Notes</label>${policyTip('Private to you; never sent to the agent.')}</div>
+              <textarea id="tf-notes" rows="3" placeholder="Add a note…" style="width:100%">${esc(draft?.notes || '')}</textarea>
             </div>
           </aside>
         </div>
       </div>
       <div class="tf-foot">
         <div class="tf-foot-inner">
-          <span class="tf-hint">${editInPlace ? 'Closing keeps your changes' : 'Closing keeps your work as a draft'}</span>
+          <span class="tf-hint"></span>
           <button class="btn" id="tf-draft">Save draft</button>
           <button class="btn primary" id="tf-queue">${editInPlace ? 'Save' : 'Run task'}<span class="kbd">${esc(fmtKeys('meta+Enter'))}</span></button>
         </div>
@@ -8729,7 +8718,7 @@ async function renderSeriesPage(rec) {
 function runPageRow(r) {
   const v = r.lastView || {};
   const status = v.status || 'active';
-  return `<div class="run-row" data-runopen="${r.id}"><span class="status-dot ${status}"></span><span class="chip ${status}">${esc(stageLabel(v))}</span><span class="run-when">${new Date(r.createdAt).toLocaleString()}</span></div>`;
+  return `<div class="run-row" data-runopen="${r.id}"><span class="chip ${status}">${esc(stageLabel(v))}</span><span class="run-when">${new Date(r.createdAt).toLocaleString()}</span></div>`;
 }
 
 // Attempt links pin the execution id; the numbered task permalink follows the
@@ -12385,7 +12374,13 @@ async function renderCredentialEditor(el, scope, opts = {}) {
   const byKey = Object.fromEntries((data.credentials || []).map((c) => [c.key, c]));
   // enabled creds in precedence order first, then the disabled ones.
   const ordered = [...(sd.enabled || []).filter((k) => byKey[k]), ...(data.credentials || []).map((c) => c.key).filter((k) => !enabled.has(k))];
-  if (!ordered.length) { el.innerHTML = '<div class="task-sub" style="color:var(--ink-3)">No credentials yet — connect a login or add an API key below.</div>'; return; }
+  // Accounts are added in the organization's Agents settings; only there is the form below.
+  if (!ordered.length) {
+    const here = scope === 'global' && !!el.closest('#settings-agents, [data-pane="settings-agents"]');
+    el.innerHTML = here ? '<div class="setting-muted">No accounts yet</div>'
+      : `<div class="setting-muted">No accounts yet · <a href="${esc(globalRoute('organization'))}#settings-agents">Add one</a></div>`;
+    return;
+  }
   const loginByKey = {};
   for (const l of accounts.logins || []) loginByKey[l.key || `login:${l.provider}:${l.account}`] = l;
   const canManage = scope === 'global'; // rename/delete a login only at the global scope
@@ -13826,7 +13821,7 @@ function mergeQueuePanel() {
   const inMerge = S.tasks.filter((t) => ['merge', 'pr'].includes(t.lastView?.stage)
     && (taskMergeDomains(t.lastView).length > 0 || !providerTaskIds.has(t.id)));
   if (!inMerge.length && !providerOwned.length)
-    return `<div class="card"><div class="empty"><div class="big">Merge queue is empty</div>Tasks show up here when they're ready to merge.</div></div>`;
+    return `<div class="card queue-empty">Nothing waiting to merge</div>`;
   // Group by merge domain — reordering is only meaningful within a single serialization
   // domain. With one domain (the common case) this renders as a single list.
   const groups = new Map();
@@ -13904,7 +13899,7 @@ function agentQueuePanel() {
     }).join('');
   return rows
     ? `<div class="queue-list agent-queue-list">${rows}</div>`
-    : `<div class="card"><div class="empty"><div class="big">Agent queue is empty</div>Agents show up here while they're running or waiting for a free slot.</div></div>`;
+    : `<div class="card queue-empty">No agents running</div>`;
 }
 
 function queuesView() {
@@ -13915,7 +13910,8 @@ function queuesView() {
     const render = renderers[component];
     if (!render) return '';
     const suffix = component === 'agent-queue' ? ` <span class="pill">${(S.agentQueue?.current || []).length}/${S.agentQueue?.capacity ?? 3}</span>` : '';
-    return `<div class="section-h">${esc(x.contribution.title || x.workflow)}${suffix}</div>${render()}`;
+    const tip = { 'merge-queue': 'Tasks ready to land, in the order they merge. Drag to reorder.', 'agent-queue': 'Agents working now, then those waiting for a free slot.' }[component];
+    return `<div class="section-h">${esc(x.contribution.title || x.workflow)}${suffix}${tip ? ` ${policyTip(tip)}` : ''}</div>${render()}`;
   }).join('') || `<div class="empty">No workflows contribute a queue.</div>`;
 }
 
@@ -14397,8 +14393,7 @@ const insMoney = (micros) => `$${(Number(micros || 0) / 1e6).toLocaleString(unde
 function insDelta(current, previous, days, better) {
   current = Number(current) || 0; previous = Number(previous) || 0;
   if (!current && !previous) return '';
-  const tip = `Previous ${days} days: `;
-  if (!previous) return `<span class="ins-delta" title="${tip}none">new</span>`;
+  if (!previous) return ''; // nothing to compare with
   const pct = Math.round(((current - previous) / previous) * 100);
   const tone = !pct || !better ? '' : (pct > 0) === (better === 'up') ? ' good' : ' bad';
   return `<span class="ins-delta${tone}" data-prev="${previous}">${pct > 0 ? '▲' : pct < 0 ? '▼' : ''} ${Math.abs(pct)}%</span>`;
@@ -14450,9 +14445,8 @@ function insightFlowHtml(data) {
   }).join('');
   const stuck = (pipeline.stages.escalated?.open || 0);
   const failed = (pipeline.stages.failed?.open || 0);
+  // Who holds the work is in the panels beside the chart; the foot only flags what needs care.
   const foot = [
-    `<span><i class="ins-key w"></i>${pipeline.working} with agents</span>`,
-    `<span><i class="ins-key h"></i>${pipeline.waiting} waiting on people</span>`,
     stuck ? `<span class="warn" title="Escalated to a person">⚠ ${stuck} escalated</span>` : '',
     failed ? `<span class="warn">✕ ${failed} failed</span>` : '',
     pipeline.drafts ? `<span class="muted">${pipeline.drafts} draft${pipeline.drafts === 1 ? '' : 's'}</span>` : '',
@@ -14462,7 +14456,7 @@ function insightFlowHtml(data) {
       <div class="ins-node shipped${totals.shipped ? '' : ' zero'}" title="Tasks that reached done in the last ${days} days">
         <div class="ins-node-n">${totals.shipped}${insDelta(totals.shipped, previous.shipped, days, 'up')}</div>
         <div class="ins-node-bar"><i></i></div>
-        <div class="ins-node-name">Shipped<span class="ins-period"> · ${days}d</span></div>
+        <div class="ins-node-name">Shipped</div>
       </div>
     </div>
     <div class="ins-flow-foot"><span class="ins-live" title="Updates live"><i></i>Now</span>${foot}</div>
@@ -14728,7 +14722,7 @@ async function renderInsights({ refresh = false } = {}) {
             <div class="ins-plot"></div>
           </section>
           <section class="card ins-card"><div class="ins-card-h"><span>Projects</span></div>${insightProjectsHtml(data)}</section>
-          <section class="card ins-card"><div class="ins-card-h"><span>Models</span></div>${insightModelsHtml(data)}</section>
+          ${data.models?.length ? `<section class="card ins-card"><div class="ins-card-h"><span>Models</span></div>${insightModelsHtml(data)}</section>` : ''}
           <section class="card ins-card"><div class="ins-card-h"><span>Recently shipped</span></div>
             ${data.recent.length ? data.recent.map((ref) => insightTaskRow(ref, 'shipped')).join('') : `<div class="ins-empty">Nothing shipped in ${days} days</div>`}</section>
         </div>
@@ -15156,10 +15150,13 @@ async function hydrateExplanationSettings(scope, projectId, organizationId) {
 function hostCapacityCard() {
   const fields = settingsFields('agent-queue', 'global');
   return `<div class="card" id="host-capacity-card" data-wf="agent-queue">
-    <div class="section-h">Agent turns</div>
-    <p class="task-sub">One host-wide limit protects model subprocesses from competing for the same memory and CPU.</p>
     <div class="wf-form parameter-fields">${renderFields(fields)}</div>
-    <button class="btn primary sm" id="host-capacity-save">Save host capacity</button>
+    <button class="btn primary sm" id="host-capacity-save">Save</button>
+    <div class="setting-rows ruled" style="margin-top:14px"><div class="setting-row">
+      <label class="setting-label" for="timing-enabled">Response timing ${policyTip('Record response measurements and show the Timing tab. Existing measurements are kept when off.')}</label>
+      <span class="setting-value"></span>
+      <span class="setting-actions"><input class="toggle" type="checkbox" id="timing-enabled" ${S.meta?.timingEnabled ? 'checked' : ''}></span>
+    </div></div>
   </div>`;
 }
 
@@ -15169,7 +15166,9 @@ async function wireHostCapacityCard() {
   const fields = settingsFields('agent-queue', 'global');
   let own = {};
   try { own = await api('/api/settings/global/agent-queue'); } catch {}
-  card.querySelector('.wf-form').innerHTML = renderFields(fields, own, {});
+  // Unset fields show the value in effect (the manifest default), not a blank box.
+  const inherited = Object.fromEntries(fields.filter((f) => f.default !== undefined).map((f) => [f.name, f.default]));
+  card.querySelector('.wf-form').innerHTML = renderFields(fields, own, inherited);
   card.querySelector('#host-capacity-save')?.addEventListener('click', async (event) => {
     const values = collectForm(card.querySelector('.wf-form'), fields);
     try {
@@ -15279,17 +15278,17 @@ async function loadAvatarAuthorizationRequests(avatarId) {
 }
 // Shown wherever Avatars are managed. An Avatar acts with a person's delegated
 // authority on whatever it reads, so anything it reads can steer it.
-const AVATAR_RISK_NOTE = '<div class="avatar-risk-note" role="note"><span class="avatar-risk-mark" aria-hidden="true">⚠</span><div><b>NOTE:</b> Avatars are highly risky and subject to prompt injections. Use at your own risk.</div></div>';
+const AVATAR_RISK_NOTE = '<div class="avatar-risk-note" role="note"><span class="avatar-risk-mark" aria-hidden="true">⚠</span><div>Avatars act with your authority, so a prompt injection in anything they read can steer them.</div></div>';
 
 function avatarsView(proj) {
   if (!proj) return '<div class="empty">Select a project.</div>';
   const selected = S.avatars.find((avatar) => avatar.id === S.avatarSelected);
   if (selected) return avatarDetailView(selected);
   const disabled = S.avatarAvailability && !S.avatarAvailability.effective;
-  return `<div class="avatars-page"><div class="settings-header avatar-list-head"><div><h1 class="page-title">Avatars</h1><p class="settings-intro">Trusted agents with delegated authority.</p></div>${disabled ? '' : '<button class="btn primary avatar-new" type="button">+ New avatar</button>'}</div>
+  return `<div class="avatars-page"><div class="settings-header avatar-list-head"><h1 class="page-title">Avatars ${policyTip('Trusted agents with their own instructions and your delegated authority. Call one into a task with @.')}</h1>${disabled ? '' : '<button class="btn primary avatar-new" type="button">+ New avatar</button>'}</div>
     ${AVATAR_RISK_NOTE}
-    ${disabled ? '<div class="avatar-disabled card"><div><b>Avatars are disabled for this project.</b><p>Existing Avatars and their history remain visible, but they cannot be called.</p></div><button class="btn avatar-project-enable" type="button">Enable for project</button></div>' : ''}
-    <div class="avatar-list">${S.avatars.map((avatar) => `<a class="avatar-row" data-spa href="${esc(avatarRoute(proj.id, avatar.id))}" data-avatar="${esc(avatar.id)}"><span class="avatar-mark" aria-hidden="true">✦</span><span class="avatar-row-main"><b>${esc(avatar.name)}</b><span>${esc(avatar.purpose || 'User-authored autonomous principal')}</span><small>Owned by ${esc(avatarOwnerName(avatar))} · ${avatar.authorityMode === 'full' ? 'Full delegation' : 'Restricted'} · ${esc(avatarCallerSummary(avatar))}</small></span><span class="chip ${avatar.effectiveEnabled ? 'success' : ''}">${avatar.effectiveEnabled ? 'Enabled' : 'Disabled'}</span><span class="avatar-chevron">›</span></a>`).join('') || (disabled ? '' : '<div class="empty avatar-empty"><span class="avatar-mark">✦</span><b>No Avatars yet</b><span>Create a trusted agent with its own instructions and delegated authority.</span><button class="btn primary avatar-new" type="button">Create your first Avatar</button></div>')}</div></div>`;
+    ${disabled ? `<div class="avatar-disabled card"><div><b>Disabled for this project</b> ${policyTip('Existing Avatars and their history stay visible, but they cannot be called.')}</div><button class="btn avatar-project-enable" type="button">Enable for project</button></div>` : ''}
+    <div class="avatar-list">${S.avatars.map((avatar) => `<a class="avatar-row" data-spa href="${esc(avatarRoute(proj.id, avatar.id))}" data-avatar="${esc(avatar.id)}"><span class="avatar-mark" aria-hidden="true">✦</span><span class="avatar-row-main"><b>${esc(avatar.name)}</b><span>${esc(avatar.purpose || 'User-authored autonomous principal')}</span><small>Owned by ${esc(avatarOwnerName(avatar))} · ${avatar.authorityMode === 'full' ? 'Full delegation' : 'Restricted'} · ${esc(avatarCallerSummary(avatar))}</small></span><span class="chip ${avatar.effectiveEnabled ? 'success' : ''}">${avatar.effectiveEnabled ? 'Enabled' : 'Disabled'}</span><span class="avatar-chevron">›</span></a>`).join('') || (disabled ? '' : '<div class="empty avatar-empty"><span class="avatar-mark">✦</span><b>No Avatars yet</b><button class="btn primary avatar-new" type="button">Create an Avatar</button></div>')}</div></div>`;
 }
 
 async function openAvatarEditor(proj, avatar) {
@@ -15399,9 +15398,7 @@ function wikiScopeInfo(proj) {
 function wikiView(proj) {
   const info = wikiScopeInfo(proj);
   if (!info) return `<div class="empty">No organization yet.</div>`;
-  return `<div class="organization-settings wiki-page"><div class="settings-header"><div>
-      <h1 class="page-title">${esc(info.title)} — wiki</h1>
-    </div>${proj ? `<label class="wiki-view-picker" title="Show this wiki on another branch, or live in a task's checkout">
+  return `<div class="organization-settings wiki-page"><div class="settings-header">${proj ? '' : '<h1 class="page-title">Wiki</h1>'}${proj ? `<label class="wiki-view-picker" title="Show this wiki on another branch, or live in a task's checkout">
       <span>Viewing</span><select id="wiki-view-select">${wikiViewOptionsHtml(proj)}</select></label>` : ''}</div>
     <div class="settings-layout"><nav class="settings-nav wiki-nav" id="wiki-nav" aria-label="Wiki entries"></nav>
     <div class="settings-content" id="wiki-pane"></div></div></div>`;
@@ -15549,10 +15546,9 @@ async function wireWikiView(proj) {
 
   let indexData;
   const paintNav = (data) => {
-    nav.innerHTML = `<span>${info.scope === 'project' ? 'Project wiki' : 'Organization wiki'}</span>
-      <a href="#" class="${sel ? '' : 'active'}" data-wiki-home>◈ Index</a>
-      ${wikiTreeHtml(data?.toc?.children, sel)}
-      ${data && data.view?.writable !== false ? '<button class="btn sm" id="wiki-new" style="margin:10px 10px 0">＋ New entry</button>' : ''}`;
+    nav.innerHTML = `${data && data.view?.writable !== false ? '<button class="btn sm wiki-new" id="wiki-new">+ New entry</button>' : ''}
+      <a href="#" class="${sel ? '' : 'active'}" data-wiki-home>Index</a>
+      ${wikiTreeHtml(data?.toc?.children, sel)}`;
     nav.querySelectorAll('[data-wiki-home], [data-wiki-path]').forEach((a) => a.addEventListener('click', (ev) => {
       if (isNewTabClick(ev)) return;
       ev.preventDefault();
@@ -16043,9 +16039,11 @@ function wireWikiLocalLinks(root, proj) {
 // full, then the rendered table of contents (importance order, [more…] folds).
 function renderWikiHome(info, proj, pane, data) {
   const bodies = [...(data.unconditional || []).map((u) => u.body || ''), ...(data.tocText ? [data.tocText] : [])];
+  const titled = (u) => (/^\s*#\s+(.+)/.exec(u.body || '')?.[1] || '').trim().toLowerCase() === String(u.name || '').trim().toLowerCase();
+  if (!bodies.length) { pane.innerHTML = '<div class="card queue-empty">No entries yet</div>'; return; }
   pane.innerHTML = (data.unconditional || []).map((u) => `
     <div class="card wiki-uncond">
-      <div class="wiki-uncond-head"><b>${esc(u.name)}</b>${u.builtin ? '<span class="chip">built-in</span>' : ''}<span class="grow"></span>
+      <div class="wiki-uncond-head">${titled(u) ? '' : `<b>${esc(u.name)}</b>`}${u.builtin ? '<span class="chip">built-in</span>' : ''}<span class="grow"></span>
         ${data.view?.writable === false || u.writable === false ? '' : `<button class="btn sm wiki-uncond-edit" data-path="${esc(u.path)}">Edit</button>`}${texToggleHtml(!markdownEnabled())}</div>
       <div class="msg-text md wiki-md"></div>
     </div>`).join('') + (data.tocText ? `
@@ -16072,12 +16070,11 @@ function renderWikiPage(info, proj, pane, page) {
   const remove = page.builtin
     ? (page.overridden ? '<button class="btn sm danger" id="wiki-page-delete">Restore default</button>' : '')
     : '<button class="btn sm danger" id="wiki-page-delete">Delete</button>';
-  pane.innerHTML = `<div class="settings-section-title"><div>${esc(page.name)}
-      <span class="chip">${page.kind}</span><span class="chip">${esc(page.path)}</span>
+  // Kind and path are reference details (the tip); chips are only for states.
+  pane.innerHTML = `<div class="settings-section-title"><div>${esc(page.name)} ${policyTip(`${page.kind} · ${page.path}`)}
       ${wikiIsDefault(page) ? '<span class="chip active" title="Labelled “default” — inlined into every task’s prompt">always in prompt</span>' : ''}
       ${(page.labels || []).filter((l) => l !== 'default').map((l) => `<span class="chip">${esc(l)}</span>`).join('')}
-      ${page.builtin ? '<span class="chip">built-in</span>' : ''}
-      ${page.overridden ? '<span class="chip">customized</span>' : ''}
+      ${page.overridden ? '<span class="chip">customized</span>' : page.builtin ? '<span class="chip">built-in</span>' : ''}
       ${page.description ? `<small>${esc(page.description)}</small>` : ''}</div></div>
     <div class="card">
       <div class="msg-text md wiki-md"></div>
@@ -16217,41 +16214,34 @@ function renderWikiEditor(info, proj, pane, page) {
 }
 function settingsView(proj) {
   if (!proj) return `<div class="empty">Select a project.</div>`;
-  return `<div class="organization-settings"><div class="settings-header"><div><h1 class="page-title">${esc(proj.name)}</h1><p class="settings-intro">Project settings</p></div></div><div class="settings-layout">
+  return `<div class="organization-settings"><div class="settings-header"><h1 class="page-title">${esc(proj.name)}</h1></div><div class="settings-layout">
     <nav class="settings-nav" aria-label="Project settings sections"><span>Project</span><a href="#project">Project</a><a href="#project-agents">Agents</a><a href="#project-defaults">Task defaults</a><a href="#project-payments">Payments</a><a href="#project-people">People &amp; authorization</a><a href="#project-workflows">Workflows</a><a href="#project-advanced" data-settings-advanced hidden>Advanced</a></nav><div class="settings-content">
     <div class="settings-section-title" id="project"><div>Project</div></div>
-    <div class="project-kind-guide" aria-label="Project dependency guide">
-      <button type="button" data-project-jump="project-git"><b>Git &amp; GitHub</b><span>Repositories</span></button>
-      <button type="button" data-project-jump="project-secrets"><b>Secrets</b><span>Keys and tokens</span></button>
-      <button type="button" data-project-jump="project-data"><b>Data</b><span>Versioned files</span></button>
-      <button type="button" data-project-jump="project-services"><b>Services</b><span>Live systems</span></button>
-      <button type="button" data-project-jump="project-environment"><b>Environment</b><span>Tools and setup</span></button>
-      <button type="button" data-project-jump="project-computers"><b>Computers</b><span>Where tasks run</span></button>
-      <button type="button" data-project-jump="project-events"><b>Events</b><span>What starts tasks</span></button>
-    </div>
-    <div class="project-config-section" id="project-git"><div class="project-config-number">01</div><div><h2>Git &amp; GitHub</h2></div></div>
+    <div class="project-config-section" id="project-git"><div><h2>Git &amp; GitHub</h2></div></div>
     <div class="card"><div id="project-repositories">Loading…</div></div>
-    <div class="project-config-section" id="project-secrets"><div class="project-config-number">02</div><div><h2>Secrets</h2></div></div>
+    <div class="project-config-section" id="project-secrets"><div><h2>Secrets</h2></div></div>
     <div class="card"><div id="project-secrets-box">Loading…</div></div>
-    <div class="project-config-section" id="project-data"><div class="project-config-number">03</div><div><h2>Data ${policyTip(`Files ${siteName()} snapshots and versions: datasets, model weights, fixtures, development databases. Choose Data when ${siteName()} should capture and version the files; Storage only decides where the encrypted revisions live. A live S3 bucket, database or API that tasks call directly belongs under Services, with its access key under Secrets.`)}</h2></div></div>
+    <div class="project-config-section" id="project-data"><div><h2>Data ${policyTip(`Files ${siteName()} snapshots and versions: datasets, model weights, fixtures, development databases. Choose Data when ${siteName()} should capture and version the files; Storage only decides where the encrypted revisions live. A live S3 bucket, database or API that tasks call directly belongs under Services, with its access key under Secrets.`)}</h2></div></div>
     <div class="card"><div id="project-data-box">Loading…</div></div>
-    <div class="project-config-section" id="project-services"><div class="project-config-number">04</div><div><h2>Services ${policyTip('Live systems tasks connect to. Use an external service for an API, hosted database or S3 bucket that tasks call directly, and a per-task container for an isolated dependency such as Postgres or Redis. Credentials belong in Secrets.')}</h2></div></div>
+    <div class="project-config-section" id="project-services"><div><h2>Services ${policyTip('Live systems tasks connect to. Use an external service for an API, hosted database or S3 bucket that tasks call directly, and a per-task container for an isolated dependency such as Postgres or Redis. Credentials belong in Secrets.')}</h2></div></div>
     <div class="card"><div id="project-services-box">Loading…</div></div>
-    <div class="project-config-section" id="project-environment"><div class="project-config-number">05</div><div><h2>Environment ${policyTip('The base image, tools, setup and boot commands every task starts with.')}</h2></div></div>
+    <div class="project-config-section" id="project-environment"><div><h2>Environment ${policyTip('The base image, tools, setup and boot commands every task starts with.')}</h2></div></div>
     <div class="card"><div id="project-environment-box">Loading…</div></div>
-    <div class="project-config-section" id="project-computers"><div class="project-config-number">06</div><div><h2>Computers ${policyTip('The cloud computers this organization’s tasks run on. A task’s own computer—its size, experience and network—is set in Task defaults and the task form.')}</h2></div></div>
-    <div class="card"><div id="project-computers-box">Loading…</div></div>
-    <div class="project-config-section" id="project-events"><div class="project-config-number">07</div><div><h2>Events ${policyTip('What happens outside a task: GitHub activity, webhook deliveries, chat messages to your bot, events tasks emit. A task with an “On event” trigger starts a run for each one it matches.')}</h2></div></div>
+    <div class="project-config-section" id="project-computers"><div><h2>Computers ${policyTip('The cloud computers this organization’s tasks run on. A task’s own computer—its size, experience and network—is set in Task defaults and the task form.')}</h2></div></div>
+    <div class="card"><div class="setting-rows"><div class="setting-row"><span class="setting-label">Cloud computers</span>
+      <span class="setting-value setting-muted">Shared by the organization’s projects</span>
+      <span class="setting-actions"><a class="btn sm ghost" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-code">Manage</a></span></div></div></div>
+    <div class="project-config-section" id="project-events"><div><h2>Events ${policyTip('What happens outside a task: GitHub activity, webhook deliveries, chat messages to your bot, events tasks emit. A task with an “On event” trigger starts a run for each one it matches.')}</h2></div></div>
     <div class="card"><div id="project-events-box">Loading…</div></div>
     <div class="settings-section-title" id="project-agents"><div>Agents</div></div>
     <div class="card"><div class="section-h section-h-action"><span>Account order ${policyTip('Tasks in this project use the first available account. Drag to reorder; switch one off to skip it here.')}</span><a class="btn sm ghost organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-agents">Manage accounts</a></div><div id="cred-editor-project">Loading…</div></div>
-    <div class="settings-section-title" id="project-defaults"><div>Task defaults<small>How new tasks begin, unless a task says otherwise</small></div></div>
+    <div class="settings-section-title" id="project-defaults"><div>Task defaults ${policyTip(`How new tasks begin, unless a task says otherwise`)}</div></div>
     ${settingsForms('project', proj.id)}
-    <div class="settings-section-title" id="project-payments"><div>Payments<small>What this project's tasks may spend</small></div></div>${paymentsCard('project')}
-    <div class="settings-section-title" id="project-people"><div>People &amp; authorization<small>Who can work here, and what they may do</small></div></div>
+    <div class="settings-section-title" id="project-payments"><div>Payments ${policyTip(`What this project's tasks may spend`)}</div></div>${paymentsCard('project')}
+    <div class="settings-section-title" id="project-people"><div>People &amp; authorization ${policyTip(`Who can work here, and what they may do`)}</div></div>
     <div class="card"><div id="project-access">Loading…</div></div>
     <div class="card"><div id="project-conversation-sharing">Loading…</div></div>
-    <div class="settings-section-title" id="project-workflows"><div>Workflows<small>The recipes this project's tasks run on</small></div></div>
+    <div class="settings-section-title" id="project-workflows"><div>Workflows ${policyTip(`The recipes this project's tasks run on`)}</div></div>
     <div class="card" id="wf-pins-card">
       <div class="section-h">Versions ${policyTip('New tasks start on the version chosen here; running tasks keep the version they started on. Latest follows platform releases.')}</div>
       <div class="setting-rows" id="wf-pins-list">Loading…</div></div>
@@ -16267,7 +16257,7 @@ function settingsView(proj) {
         <span class="setting-value setting-muted">Removes the project and all its tasks</span>
         <span class="setting-actions"><button class="btn sm danger" id="delete-project">Delete…</button></span></div>
     </div></div>
-    <div class="settings-section-title" id="project-experimental"><div>Experimental<small>Optional features for this project</small></div></div>
+    <div class="settings-section-title" id="project-experimental"><div>Experimental ${policyTip(`Optional features for this project`)}</div></div>
     <div class="card"><div id="project-avatar-settings">Loading…</div></div>
     </div></div></div>`;
 }
@@ -17166,7 +17156,6 @@ function wireSettingsView(proj) {
     go(link.getAttribute('href'));
   }));
   hydrateProjectAccess(proj);
-  hydrateComputers($('#project-computers-box'), proj.organizationId);
   hydrateProjectEvents(proj);
   hydrateConversationSharing('project', proj.id);
   hydrateAvatarAvailability('project', proj.id);
@@ -17370,12 +17359,11 @@ async function hydrateSettingsAccess(scope) {
  * everyone, including on the sign-in screen before any organization is known. */
 function appearanceCard() {
   return `<div class="card" id="appearance-card">
-      <div class="section-h">Site identity <span class="chip">whole instance</span></div>
-      <p style="color:var(--ink-2);margin-top:0;font-size:12px">The name and mark shown in the console, sign-in screen, browser tab, installed app, and account email.</p>
-      <div class="inline-form" style="margin-bottom:16px">
-        <label class="form-row" style="flex:1">Site name<input id="site-name" maxlength="48" autocomplete="off" /></label>
-        <button class="btn sm primary" id="site-name-save" type="button">Save name</button>
-      </div>
+      <div class="setting-rows" style="margin-bottom:14px"><div class="setting-row">
+        <label class="setting-label" for="site-name">Site name ${policyTip('Shown in the console, the sign-in screen, the browser tab, the installed app and account email.')}</label>
+        <span class="setting-value"><input id="site-name" class="setting-input" maxlength="48" autocomplete="off" /></span>
+        <span class="setting-actions"><button class="btn sm primary" id="site-name-save" type="button">Save</button></span>
+      </div></div>
       <div class="brand-picker" id="brand-picker">
         ${BRAND_ICON_CHOICES.map((c) => `<button type="button" class="brand-option" data-icon="${esc(c.id)}" aria-pressed="false">
           <img src="/brand/${esc(c.id)}/icon-192.png" alt="" /><span>${esc(c.label)}</span>
@@ -17439,9 +17427,9 @@ async function wireAppearanceCard() {
 
 function globalSettingsView(embedded = false) {
   return `
-    ${embedded ? '<div class="settings-section-title" id="settings-defaults"><div>Task defaults<small>How new tasks begin, unless a project or task says otherwise</small></div></div>' : '<div class="page-title">Organization settings</div><p style="color:var(--ink-2);margin-top:-8px">How new tasks behave unless a project or task deliberately changes something.</p>'}
+    ${embedded ? '<div class="settings-section-title" id="settings-defaults"><div>Task defaults ${policyTip(`How new tasks begin, unless a project or task says otherwise`)}</div></div>' : '<div class="page-title">Organization settings</div><p style="color:var(--ink-2);margin-top:-8px">How new tasks behave unless a project or task deliberately changes something.</p>'}
     ${settingsForms('global')}
-    <div class="settings-section-title" id="settings-payments"><div>Passwords &amp; payments<small>Credentials agents may use on your behalf, and what tasks may spend</small></div></div>
+    <div class="settings-section-title" id="settings-payments"><div>Passwords &amp; payments ${policyTip(`Credentials agents may use on your behalf, and what tasks may spend`)}</div></div>
     <div class="card" id="settings-connections"><div class="section-h">Connected apps ${policyTip('Apps agents can use through MCP or Composio. Choose which ones new tasks get in Task defaults.')}</div>
       <div id="native-connections">Loading connections…</div></div>
     ${passwordsCard()}
@@ -17482,7 +17470,7 @@ function globalSettingsView(embedded = false) {
       </div>
       </div>
     </div>
-    <div class="settings-section-title" id="settings-installation"><div>Workflows<small>The orchestration recipes tasks run on</small></div></div>
+    <div class="settings-section-title" id="settings-installation"><div>Workflows ${policyTip(`The orchestration recipes tasks run on`)}</div></div>
     <div class="card" id="workflows-card">
       <div class="section-h">Workflows ${policyTip(`Built-ins ship with ${siteName()} and change only with platform releases. Each task keeps the workflow version it started on.`)}</div>
       <div id="workflows-list" class="setting-rows" style="margin-bottom:12px">Loading…</div>
@@ -17751,9 +17739,11 @@ async function hydrateWorkflows(organizationId = S.organizationId) {
     return;
   }
   if (!renderIsCurrent()) return;
+  // The merge, agent and account queues are the platform's own parts, not recipes to choose.
+  list = list.filter((w) => w.kind !== 'coordinator');
   if (!list.length) { box.innerHTML = '<span style="color:var(--ink-3)">No workflows registered.</span>'; return; }
   box.innerHTML = list.map((w) => `<div class="setting-row workflow-line">
-      <span class="setting-value"><b>${esc(w.name)}</b>${w.source === 'bundled' ? '' : '<span class="chip">installed</span>'}<span class="workflow-description" title="${esc(w.description || '')}">${esc(w.description || '')}</span></span>
+      <span class="setting-value"><b>${esc(workflowLabel(w.name))}</b>${w.source === 'bundled' ? '' : '<span class="chip">installed</span>'}<span class="workflow-description" title="${esc(w.description || '')}">${esc(w.description || '')}</span></span>
       <span class="setting-actions"><span class="chip" title="${esc(`${w.versions.length} version${w.versions.length === 1 ? '' : 's'}: ${w.versions.join(', ')}`)}">v${esc(w.latest)}</span></span></div>`).join('');
 }
 // ── payments: budget policy + cards (SPEC §7.6) ──────────────────────────────
@@ -17983,7 +17973,10 @@ async function wirePaidLaunchCard() {
       toast('Paid-launch setup saved');
       S.launch = await api('/api/launch');
       await wirePaidLaunchCard();
-    } catch (error) { toast(error.message, true); await wirePaidLaunchCard(); }
+    } catch (error) {
+      // Keep what was typed (secrets included) so it can be corrected and saved again.
+      toast(error.message, true);
+    }
   });
   box.querySelector('.paid-billing-provider').addEventListener('change', (event) => {
     box.querySelector('.paid-paddle-section').hidden = event.target.value !== 'paddle';
@@ -19530,12 +19523,10 @@ function outboundEmailCard() {
 async function wireOutboundEmailCard() {
   return hydrateInstallationCard('#outbound-email-card', '/api/email', (card, data) => {
     card.innerHTML = `
-    <div class="section-h">Outbound email <span class="chip">installation-wide</span></div>
-    <p style="color:var(--ink-2);margin-top:0;font-size:12px">Let ${siteNameMarkup()} email your users — account confirmation, password resets, and organization invitations. Connect one sender for the whole installation.</p>
     <div id="oe-status" class="task-sub" style="margin-bottom:8px"></div>
     <div class="form-row"><label>Provider</label><select id="oe-provider">
-      <option value="resend">Resend — one API key (simplest)</option>
-      <option value="smtp">SMTP server — any provider or relay</option>
+      <option value="resend">Resend</option>
+      <option value="smtp">SMTP server</option>
     </select></div>
     <div id="oe-help" style="color:var(--ink-3);font-size:12px;margin:0 0 8px"></div>
     <div class="form-row"><label for="oe-from">From address</label><input id="oe-from" placeholder="${siteNameMarkup()} &lt;noreply@yourdomain.com&gt;"></div>
@@ -19565,8 +19556,10 @@ async function wireOutboundEmailCard() {
     if (data.provider) providerSel.value = data.provider;
     if (data.from) $('#oe-from').value = data.from;
     $('#oe-status').innerHTML = data.configured
-      ? `<span style="color:var(--merged)">● Connected</span> — sending from <b>${esc(data.from || '')}</b> via ${esc(data.provider || '')}.`
-      : `<span style="color:var(--ink-3)">● Not configured</span> — until connected, confirmation/reset/invite emails are skipped (invites still show a copyable link).`;
+      ? `<span class="chip done">Connected</span> Sending from <b>${esc(data.from || '')}</b>`
+      : `<span class="chip">Not connected</span> ${policyTip('Until connected, confirmation, reset and invitation emails are skipped; invitations still show a copyable link.')}`;
+    // Nothing to test until a sender is connected.
+    $('#oe-test').disabled = !data.configured;
     applyProvider();
     providerSel.addEventListener('change', applyProvider);
     $('#oe-connect').addEventListener('click', async () => {
@@ -19883,7 +19876,6 @@ function inboxNoticesHtml() {
     const where = (projectId && projectLabel({ projectId }))
       || (organization ? `<span class="task-project" title="${esc(organization.name)}"><span class="task-project-org">${esc(orgSlug(organization))}</span></span>` : '');
     return `<div class="task-row inbox-row ${item.unread ? 'unread' : ''}" data-inbox="${esc(item.id)}" tabindex="0" role="group" aria-label="${esc(inboxTitle(item))}">
-      <span class="status-dot waiting" title="waiting"></span>
       <div class="task-main">
         <div class="task-title">${esc(inboxTitle(item))}</div>
         <div class="task-sub">${where}<span class="chip attention ${esc(item.kind)}">${esc(inboxRowLabel(item))}</span></div>
@@ -19903,9 +19895,9 @@ function wireInboxNotices() {
 // ── notification behaviour, per urgency ─────────────────────────────────────
 // Browser alerts are local to this device; email preferences are stored on the server.
 const NOTIFY_BEHAVIOURS = [
-  { key: 'notify', label: 'System notification' },
+  { key: 'notify', label: 'System' },
   { key: 'sound', label: 'Sound' },
-  { key: 'visual', label: 'Show in app' },
+  { key: 'visual', label: 'In app' },
   { key: 'email', label: 'Email' },
 ];
 // Sensible defaults: silence is the floor, and each level up interrupts a little
@@ -20207,9 +20199,13 @@ async function hydrateProfileGithub() {
 // A clean profile page: identity, the browser display preference (theme), and the
 // one place to end the session. Sign out lives here rather than in the top bar.
 function profileWalkthroughCard(userId) {
+  const row = profileWalkthroughRow(userId);
+  return row ? `<div class="card">${row}</div>` : '';
+}
+function profileWalkthroughRow(userId) {
   if (!S.meta?.hosted || !userId || (!S.installationAccess && userId !== S.user?.id)) return '';
-  return `<div class="card"><div class="setting-row"><span class="setting-label">Walkthrough</span><span class="setting-value setting-muted">Setup guide in each organization</span>
-    <span class="setting-actions"><button class="btn sm" type="button" id="profile-reset-onboarding" data-user-id="${esc(userId)}" title="Existing work and connections are kept">Restart walkthrough</button></span></div></div>`;
+  return `<div class="setting-row"><span class="setting-label">Walkthrough</span><span class="setting-value setting-muted">Setup guide in each organization</span>
+    <span class="setting-actions"><button class="btn sm" type="button" id="profile-reset-onboarding" data-user-id="${esc(userId)}" title="Existing work and connections are kept">Restart walkthrough</button></span></div>`;
 }
 
 function profileView() {
@@ -20235,9 +20231,8 @@ function profileView() {
   return `<div class="profile-page">
     <div class="profile-identity">
       <div class="profile-avatar">${u?.image ? `<img src="${esc(u.image)}" alt="">` : esc(initial)}</div>
-      <div class="profile-meta"><h1 class="page-title">${esc(name)}</h1><div class="profile-email">${email ? esc(email) : 'Profile'}</div></div>
+      <div class="profile-meta"><h1 class="page-title">${esc(name)}</h1></div>
     </div>
-    ${profileWalkthroughCard(u?.id)}
     ${u ? `<div class="card profile-card">
       <div class="section-h">Account</div>
       <div class="setting-rows">
@@ -20320,6 +20315,7 @@ function profileView() {
           <span class="setting-value setting-muted">Typeset LaTeX</span>
           <span class="setting-actions"><input class="toggle" type="checkbox" id="profile-mathjax" ${mathjaxEnabled() ? 'checked' : ''} /></span>
         </label>
+        ${profileWalkthroughRow(u?.id)}
       </div>
     </div>
     ${notificationsCard()}
@@ -20694,9 +20690,6 @@ function wireSettingsNavigation() {
       window.scrollTo(0, 0);
     };
   });
-  layout.querySelectorAll('[data-project-jump]').forEach((button) => {
-    button.onclick = () => document.getElementById(button.dataset.projectJump)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  });
   activate(location.hash.slice(1));
 }
 
@@ -20972,30 +20965,27 @@ function installationView() {
   const phone = hostLocal()
     ? `<div class="card phone-access-card" id="phone-access-card" hidden><div id="phone-access-status"><p class="task-sub">Checking this installation…</p></div></div>`
     : `<div class="card"><p class="task-sub">Phone Access can be changed only from a browser on the machine running ${siteNameMarkup()}.</p></div>`;
-  return `<div class="organization-settings installation-settings"><div class="settings-header"><div>
-    <h1 class="page-title">Installation</h1><p class="settings-intro">Controls that affect every organization and the machine running ${siteNameMarkup()}</p>
-  </div><span class="chip">operator only</span></div>
+  return `<div class="organization-settings installation-settings"><div class="settings-header"><h1 class="page-title">Installation ${policyTip(`Settings for every organization and the machine running ${siteName()}. Only operators see them.`)}</h1></div>
   <div class="settings-layout">
     <nav class="settings-nav" aria-label="Installation settings sections"><span>Installation</span>
       <a href="#installation-appearance">Appearance</a><a href="#installation-health">Health</a><a href="#installation-limits">Service limits</a><a href="#installation-capacity">Host capacity</a>
       <a href="#installation-github">GitHub</a><a href="#installation-composio">Composio</a><a href="#installation-paid-launch">Paid launch</a><a href="#installation-stripe">Agent cards</a><a href="#installation-email">Email</a>
-      ${S.meta.hosted ? '<a href="#installation-users">Users</a>' : ''}<a href="#installation-access">Phone Access</a>
+      <a href="#installation-access">Phone access</a>${S.meta.hosted ? '<a href="#installation-users">Users</a>' : ''}
     </nav><div class="settings-content">
-      <div class="settings-section-title" id="installation-appearance"><div>Appearance<small>The identity shown before an organization is known</small></div></div>${appearanceCard()}
-      <div class="settings-section-title" id="installation-health"><div>Health<small>Load, memory, and every process ${siteNameMarkup()} runs</small></div></div>
+      <div class="settings-section-title" id="installation-appearance"><div>Appearance ${policyTip(`The identity shown before an organization is known`)}</div></div>${appearanceCard()}
+      <div class="settings-section-title" id="installation-health"><div>Health ${policyTip(`Load, memory, and every process ${siteName()} runs`)}</div></div>
       <div id="host-diag"><div class="card" style="color:var(--ink-3)">Loading…</div></div>
       <div id="proc-panel" style="margin-top:12px"><div class="card" style="color:var(--ink-3)">Loading…</div></div>
-      <div class="settings-section-title" id="installation-limits"><div>Service limits<small>Shared accounts and this server against their plans</small></div></div>
+      <div class="settings-section-title" id="installation-limits"><div>Service limits ${policyTip(`Shared accounts and this server against their plans`)}</div></div>
       <div class="card service-limits" id="service-limits-card"><span class="task-sub">Loading…</span></div>
-      <div class="settings-section-title" id="installation-capacity"><div>Host capacity<small>Admission limits shared by all agent work</small></div></div>${hostCapacityCard()}
-      <div class="card"><label title="Record response measurements and show the Timing tab. Existing measurements are retained when off."><input type="checkbox" id="timing-enabled" ${S.meta?.timingEnabled ? 'checked' : ''}> Response timing</label></div>
-      <div class="settings-section-title" id="installation-github"><div>GitHub<small>GitHub App for repository access</small></div></div>${installationGithubCard()}
-      <div class="settings-section-title" id="installation-composio"><div>Composio<small>App connection setup shared by every organization</small></div></div><div class="card" id="installation-composio-card">Loading Composio setup…</div>
-      <div class="settings-section-title" id="installation-paid-launch"><div>Paid launch<small>Subscription billing, legal operator details, and the founder launch checklist</small></div></div>${paidLaunchCard()}
-      <div class="settings-section-title" id="installation-stripe"><div>Agent cards<small>Optional Stripe Connect application for cards agents spend from—not SaaS subscriptions</small></div></div>${stripePlatformCard()}
-      <div class="settings-section-title" id="installation-email"><div>Email<small>Account confirmation, password reset, and organization invitations</small></div></div>${outboundEmailCard()}
-      <div class="settings-section-title" id="installation-access"><div>Phone Access<small>Secure reachability for this host</small></div></div>${phone}
-      ${S.meta.hosted ? '<div class="settings-section-title" id="installation-users"><div>Users<small>View individual user profiles</small></div></div><div class="card" id="installation-users-card">Loading users…</div>' : ''}
+      <div class="settings-section-title" id="installation-capacity"><div>Host capacity ${policyTip(`Admission limits shared by all agent work`)}</div></div>${hostCapacityCard()}
+      <div class="settings-section-title" id="installation-github"><div>GitHub ${policyTip(`GitHub App for repository access`)}</div></div>${installationGithubCard()}
+      <div class="settings-section-title" id="installation-composio"><div>Composio ${policyTip(`App connection setup shared by every organization`)}</div></div><div class="card" id="installation-composio-card">Loading Composio setup…</div>
+      <div class="settings-section-title" id="installation-paid-launch"><div>Paid launch ${policyTip(`Subscription billing, legal operator details, and the founder launch checklist`)}</div></div>${paidLaunchCard()}
+      <div class="settings-section-title" id="installation-stripe"><div>Agent cards ${policyTip(`Optional Stripe Connect application for cards agents spend from—not SaaS subscriptions`)}</div></div>${stripePlatformCard()}
+      <div class="settings-section-title" id="installation-email"><div>Email ${policyTip(`Account confirmation, password reset, and organization invitations`)}</div></div>${outboundEmailCard()}
+      <div class="settings-section-title" id="installation-access"><div>Phone access ${policyTip(`Secure reachability for this host`)}</div></div>${phone}
+      ${S.meta.hosted ? '<div class="settings-section-title" id="installation-users"><div>Users ${policyTip(`Close a person’s account and erase their data`)}</div></div><div class="card" id="installation-users-card">Loading users…</div>' : ''}
     </div>
   </div></div>`;
 }
@@ -21365,19 +21355,18 @@ function openComputerDialog(provider, connection, organizationId, onSaved) {
 function organizationView() {
   const org = S.organizations.find((o) => o.id === S.organizationId);
   const authorizationProjects = S.projects.filter((project) => project.organizationId === S.organizationId);
-  return `<div class="organization-settings"><div class="settings-header"><div><h1 class="page-title">${esc(org?.name || 'Organization')}</h1>
-    <p class="settings-intro">Organization settings</p></div><button class="btn sm" id="create-organization">＋ New organization</button></div>
+  return `<div class="organization-settings"><div class="settings-header"><h1 class="page-title">${esc(org?.name || 'Organization')}</h1></div>
     ${S.inviteNotice ? `<div class="card"><b>${esc(S.inviteNotice)}</b></div>` : ''}
     <div class="settings-layout">
-    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-plan">Plan &amp; billing</a><a href="#settings-code">Projects</a><a href="#settings-agents">Agents</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced" data-settings-advanced hidden>Advanced</a></nav>
+    <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-plan">Plan &amp; billing</a><a href="#settings-code">Resources</a><a href="#settings-agents">Agents</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced" data-settings-advanced hidden>Advanced</a></nav>
     <div class="settings-content">
 
-    <div class="settings-section-title" id="settings-plan"><div>Plan &amp; billing<small>Current organization limits and hosted subscription</small></div></div>
+    <div class="settings-section-title" id="settings-plan"><div>Plan &amp; billing ${policyTip(`Current organization limits and hosted subscription`)}</div></div>
     <div class="card"><div id="org-plan">Loading…</div><div id="org-usage"></div></div>
-    <div class="settings-section-title" id="settings-billing"><div>Subscription billing<small>Hosted subscription and active-user seats—not cards used by agents</small></div></div>
+    <div class="settings-section-title" id="settings-billing"><div>Subscription billing ${policyTip(`Hosted subscription and active-user seats—not cards used by agents`)}</div></div>
     <div class="card" id="org-subscription"><p class="task-sub">Loading verified subscription status…</p></div>
 
-    <div class="settings-section-title" id="settings-people"><div>People &amp; authorization<small>Who is in this organization, and what each person may do</small></div></div>
+    <div class="settings-section-title" id="settings-people"><div>People &amp; authorization ${policyTip(`Who is in this organization, and what each person may do`)}</div></div>
     <div class="card"><div class="section-h">People</div><div id="org-members">Loading…</div>
       <div class="authz-invite-row"><input id="invite-email" type="email" placeholder="teammate@company.com" aria-label="Email to invite">${authorizationEditorHtml('invite-authorization', { level: 'developer', scope: 'organization' }, authorizationProjects)}<button class="btn sm primary" id="invite-member">Invite</button></div><div id="invite-result" class="task-sub"></div></div>
     <div class="card"><div class="section-h">Teams ${policyTip('Teams are reusable review routes: a team named Leaders is available to workflows as @team:leaders.')}</div><div id="org-teams">Loading…</div><datalist id="org-people-options"></datalist><div class="inline-form team-create"><input id="team-name" placeholder="New team name" aria-label="New team name"><button class="btn sm" id="create-team">Create team</button></div></div>
@@ -21388,7 +21377,7 @@ function organizationView() {
       </select></span></div></div>
     <div class="card" id="organization-roles">Loading roles…</div>
     <div class="card"><div id="organization-conversation-sharing">Loading…</div></div>
-    <div class="settings-section-title" id="settings-code"><div>Projects<small>Repositories, computers and storage shared by this organization’s projects</small></div></div>
+    <div class="settings-section-title" id="settings-code"><div>Resources ${policyTip(`GitHub, computers and storage shared by this organization’s projects`)}</div></div>
     <div class="card"><div class="section-h">Git &amp; GitHub</div><div id="org-github">Loading…</div></div>
     <div class="card"><div class="section-h" id="settings-computers">Computers ${policyTip('The cloud computers tasks run on. Each task’s computer—its size, experience and network—is set in the task form and Task defaults.')}</div><div id="org-computers">Loading…</div></div>
     <div class="card"><div class="section-h" id="settings-storage">Data storage ${policyTip(`Managed storage is intentionally bounded. Connect your own bucket for large versioned datasets; for live or frequently changing data, add the bucket as a project Service instead of copying it into ${siteName()}.`)}</div><p class="task-sub">Where encrypted, versioned project Data revisions are retained.</p><div id="org-storage">Loading…</div></div>
@@ -21408,7 +21397,7 @@ function organizationView() {
         <span class="setting-actions"><button class="btn sm danger" id="delete-organization">Delete…</button></span></div>` : ''}
     </div></div>
     <details class="card settings-disclosure" data-settings-access="organization" hidden><summary><b>Single sign-on &amp; directory sync</b><span>For companies with an identity provider</span></summary><p class="task-sub">OIDC signs employees in through your company; SCIM adds, removes and groups them. Use the values your identity administrator gives you.</p><div id="org-identity">Loading…</div></details>
-    <div class="settings-section-title" id="settings-experimental"><div>Experimental<small>Optional features for this organization</small></div></div>
+    <div class="settings-section-title" id="settings-experimental"><div>Experimental ${policyTip(`Optional features for this organization`)}</div></div>
     ${AVATAR_RISK_NOTE}
     <div class="card"><div id="organization-avatar-settings">Loading…</div></div>
     <div id="org-misc-slot"></div>
@@ -21545,7 +21534,6 @@ async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
     hydrateConversationSharing('organization', organizationId);
     hydrateAvatarAvailability('organization', organizationId);
     hydrateOrganizationSubscription(organizationId);
-    setEventHandler($('#create-organization'), 'click', createOrganization);
     setEventHandler($('#export-organization'), 'click', () => location.assign(`/api/organizations/${encodeURIComponent(S.organizationId)}/export`));
     const renameOrganization = async () => {
       const name = $('#organization-name')?.value.trim();
@@ -21793,8 +21781,11 @@ async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
       const usagePeriod = usageSync.some((item) => item.gap) ? 'Incomplete history'
         : coverageFrom > Number(usage?.from || 0)
           ? `Since ${new Date(coverageFrom).toLocaleDateString([], { month: 'short', day: 'numeric' })}` : 'This month';
-      $('#org-usage').innerHTML = usage ? `<div class="settings-divider"></div><div class="stat"><div class="n">$${(usage.costMicros / 1e6).toFixed(2)}</div><div class="l">Metered + estimated usage · ${usagePeriod} · ${usage.events} ledger events${usageSyncLabel}</div></div>
-        <p class="task-sub">Incurred $${((usage.incurredCostMicros || 0) / 1e6).toFixed(2)} · estimated $${((usage.estimatedCostMicros || 0) / 1e6).toFixed(2)} · active managed reservations $${((usage.activeReservationsMicros || 0) / 1e6).toFixed(2)}</p>` : '';
+      // One total; how it splits is the tooltip.
+      const dollars = (micros) => `$${((micros || 0) / 1e6).toFixed(2)}`;
+      const split = `Incurred ${dollars(usage?.incurredCostMicros)} · estimated ${dollars(usage?.estimatedCostMicros)} · reserved for running computers ${dollars(usage?.activeReservationsMicros)} · ${usage?.events} usage record${usage?.events === 1 ? '' : 's'}`;
+      $('#org-usage').innerHTML = usage ? `<div class="setting-rows"><div class="setting-row usage-row"><span class="setting-label">Usage ${policyTip(split)}</span>
+        <span class="setting-value"><b>${dollars(usage.costMicros)}</b> <span class="setting-muted">${usagePeriod}${usageSyncLabel}</span></span></div></div>` : '';
     },
     async identity() {
       const identityPolicy = await read('identity-policy').catch(() => null);
@@ -22381,7 +22372,7 @@ function openPalette() {
     const q = input.value.trim();
     items = [];
     for (const c of allCommands()) {
-      if (c.palette === false || !c.available) continue;
+      if (c.palette === false || !c.available || c.id === 'nav.commandPalette') continue; // not itself
       const score = fuzzyScore(q, c.title);
       if (score < 0) continue;
       items.push({ group: c.group, title: c.title, kbd: c.keybinding, sub: c.workflow, danger: c.danger, score, run: c.run });
@@ -22433,11 +22424,9 @@ function openHelp() {
       ${row('i', 'Show / hide details')}
       ${row('t', 'Terminal / conversation')}
       ${row('u', 'Back to the list')}
-      ${row(esc(fmtKeys('meta+Enter')), 'Send follow-up (from inside the compose box)')}
-      ${row('Esc', 'Close the topmost panel / leave a text field')}
+      ${row(esc(fmtKeys('meta+Enter')), 'Send a message (in the compose box)')}
       <div class="section-h">Quick add</div>
       ${row('↵', 'Open the full task form with what you typed')}
-      ${row(esc(fmtKeys('meta+Enter')), 'Add the task directly')}
     </div></div></div>`;
   $('#help-close').addEventListener('click', () => (root.remove()));
   $('#help-scrim').addEventListener('click', (e) => { if (e.target.id === 'help-scrim') root.remove(); });

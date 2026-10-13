@@ -133,7 +133,8 @@ eq(viewIdForQuery(' -is:archived  '), '__active__', 'whitespace does not matter'
 eq(viewIdForQuery(''), null, 'the empty query (archived included) is not a view');
 eq(viewIdForQuery('for:me -is:archived'), '__for_me__', 'for:me -is:archived is the “For me” view');
 eq(viewIdForQuery('for:me'), null, 'for:me alone includes archived tasks, so it is not “For me”');
-eq(viewIdForQuery('-is:archived group:tag-type'), 'builtin:sectioned-type', 'a built-in view is recognised from its query');
+eq(viewIdForQuery('is:archived'), 'builtin:archived', 'a built-in view is recognised from its query');
+eq(viewIdForQuery('-is:archived group:tag-type'), null, 'grouping is the Group menu’s job, not a view');
 eq(viewIdForQuery('is:archived'), 'builtin:archived', 'and so is Archived');
 eq(viewIdForQuery('sort:nextRun-asc is:scheduled -is:archived'), 'builtin:scheduled', 'token order does not matter');
 eq(viewIdForQuery('tag:bug'), 'V1', 'a saved view is recognised from its stringified query');
@@ -161,7 +162,7 @@ eq(activeChips('-is:archived'), ['__active__'], '-is:archived lights “Active�
 eq(activeChips(''), [], 'an empty query (archived included) lights nothing');
 eq(activeChips('for:me -is:archived'), ['__for_me__'], 'the default query lights “For me”');
 ok(viewsBar().indexOf('__for_me__') < viewsBar().indexOf('__active__'), '“For me” comes first, then “Active”');
-ok(/data-view="__active__"[^>]*title="-is:archived"[^>]*>≡ Active</.test(viewsBar()), 'the chip is called “Active” and shows its query on hover');
+ok(/data-view="__active__"[^>]*title="-is:archived"[^>]*>Active</.test(viewsBar()), 'the chip is called “Active” and shows its query on hover');
 ok(!/>≡ All</.test(viewsBar()), 'there is no “All” chip');
 eq(activeChips('tag:bug priority:>=2'), [], 'an ad-hoc query lights nothing');
 S.search = '';

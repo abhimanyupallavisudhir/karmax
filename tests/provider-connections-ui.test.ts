@@ -122,19 +122,20 @@ describe('organization Computers and usage UI', () => {
   });
 
   it('shows usage under Plan & billing, with reconciliation coverage', async () => {
-    const ui = await organization('#org-usage .stat', usageApi({}));
+    const ui = await organization('#org-usage .usage-row', usageApi({}));
     expect(await ui.page.locator('#org-usage').evaluate((element) => element.closest('.settings-pane')!.getAttribute('data-pane'))).toBe('settings-plan');
-    expect(await usageText(ui)).toContain('Metered + estimated usage · This month · 3 ledger events');
-    expect(await usageText(ui)).toContain('Incurred $1.00 · estimated $0.75 · active managed reservations $0.25');
+    expect(await usageText(ui)).toContain('$1.75 This month');
+    // The split is the tooltip, said once.
+    expect(await ui.page.locator('#org-usage .info-dot').getAttribute('title')).toBe('Incurred $1.00 · estimated $0.75 · reserved for running computers $0.25 · 3 usage records');
     await ui.close();
 
     // Provider reconciliation that only began mid-month narrows the period it vouches for.
-    const late = await organization('#org-usage .stat', usageApi({ sync: [{ provider: 'e2b', status: 'ok', at: Date.now(),
+    const late = await organization('#org-usage .usage-row', usageApi({ sync: [{ provider: 'e2b', status: 'ok', at: Date.now(),
       coverageFrom: Date.UTC(2026, 8, 15, 12) }] }));
-    expect(await usageText(late)).toMatch(/Metered \+ estimated usage · Since Sep 1[45] · 3 ledger events · synced /);
+    expect(await usageText(late)).toMatch(/Since Sep 1[45] · synced /);
     await late.close();
-    const gap = await organization('#org-usage .stat', usageApi({ sync: [{ provider: 'e2b', status: 'error', gap: true, at: Date.now() }] }));
-    expect(await usageText(gap)).toContain('Metered + estimated usage · Incomplete history · 3 ledger events · sync unavailable');
+    const gap = await organization('#org-usage .usage-row', usageApi({ sync: [{ provider: 'e2b', status: 'error', gap: true, at: Date.now() }] }));
+    expect(await usageText(gap)).toContain('Incomplete history · sync unavailable');
     await gap.close();
   });
 });

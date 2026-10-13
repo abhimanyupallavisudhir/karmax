@@ -27,6 +27,8 @@ export interface WorkflowSummary {
   latest: string;
   /** `bundled` = compiled-in built-in; `external` = installed from a git repo. */
   source: 'bundled' | 'external';
+  /** A platform coordinator (merge, agent and account queues): never chosen for a task. */
+  kind?: 'coordinator';
 }
 
 /**
@@ -119,10 +121,12 @@ export class WorkflowManager {
   list(organizationId = 'org_personal'): WorkflowSummary[] {
     const store = this.storeFor(organizationId);
     const bundled = new Set(MANIFESTS.map((m) => m.name));
+    const coordinators = new Set(MANIFESTS.filter((m) => m.kind === 'coordinator').map((m) => m.name));
     const names = [...new Set(store.list().map((p) => p.name))].sort();
     return names.map((name) => {
       const latest = store.resolve(name)!;
-      return { name, description: latest.description, versions: store.versions(name), latest: latest.version, source: bundled.has(name) ? 'bundled' : 'external' };
+      return { name, description: latest.description, versions: store.versions(name), latest: latest.version, source: bundled.has(name) ? 'bundled' : 'external',
+        ...(coordinators.has(name) ? { kind: 'coordinator' as const } : {}) };
     });
   }
 

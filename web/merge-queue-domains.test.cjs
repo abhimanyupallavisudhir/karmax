@@ -121,7 +121,7 @@ ok(mixed.includes('provider queued'), 'the provider participant remains read-onl
 
 // An empty queue still reads as empty, not as a stray group.
 global.S.tasks = [];
-ok(mergeQueuePanel().includes('Merge queue is empty'), 'no tasks ⇒ the empty state');
+ok(mergeQueuePanel().includes('Nothing waiting to merge'), 'no tasks ⇒ the empty state');
 
 console.log(`${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

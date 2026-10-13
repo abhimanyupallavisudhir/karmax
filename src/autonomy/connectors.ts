@@ -139,7 +139,7 @@ export class BitwardenConnector implements CredentialConnector {
       label: 'Bitwarden',
       available: false,
       canPush: false, canUpdate: true,
-      detail: 'needs the `bw` CLI on this host.',
+      detail: 'needs the Bitwarden bw CLI on this host.',
     };
     try {
       const status = JSON.parse(await this.exec('bw', ['status'], { env: await this.env() }));
@@ -148,7 +148,7 @@ export class BitwardenConnector implements CredentialConnector {
         detail: unlocked ? 'ready' : 'The Bitwarden session key is invalid or expired.' };
     } catch {
       return { name: this.name, label: 'Bitwarden', available: false, canPush: false, canUpdate: true,
-        detail: 'needs the `bw` CLI on this host.' };
+        detail: 'needs the Bitwarden bw CLI on this host.' };
     }
   }
   async list(): Promise<ExternalItem[]> {
@@ -229,7 +229,7 @@ export class OnePasswordConnector implements CredentialConnector {
         available: false,
         canPush: false,
         canUpdate: true,
-        detail: 'needs the `op` CLI on this host.',
+        detail: 'needs the 1Password op CLI on this host.',
       };
     try {
       await this.exec('op', ['whoami', '--format=json'], { env: await this.env() });
@@ -241,7 +241,7 @@ export class OnePasswordConnector implements CredentialConnector {
         available: false,
         canPush: false,
         canUpdate: true,
-        detail: 'Check the service-account token and make sure the `op` CLI is installed.',
+        detail: 'Check the service-account token and make sure the 1Password op CLI is installed.',
       };
     }
   }

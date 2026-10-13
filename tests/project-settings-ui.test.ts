@@ -23,11 +23,11 @@ describe('Project settings', () => {
   it('uses the same name-first heading hierarchy for project and organization settings', async () => {
     const project = await settings();
     expect(await project.page.locator('h1.page-title').textContent()).toBe('Workspace');
-    expect(await project.page.locator('h1.page-title + .settings-intro').textContent()).toBe('Project settings');
+    expect(await project.page.locator('.settings-intro').count()).toBe(0); // the active tab already says Project settings
     await project.close();
     const organization = await settings({ path: '/org/settings' });
     expect(await organization.page.locator('h1.page-title').textContent()).toBe('Organization');
-    expect(await organization.page.locator('h1.page-title + .settings-intro').textContent()).toBe('Organization settings');
+    expect(await organization.page.locator('.settings-intro').count()).toBe(0);
     await organization.close();
   });
 
@@ -190,7 +190,7 @@ describe('Project settings', () => {
     const ui = await settings({ path: '/org/settings' });
     const links = await ui.page.locator('.settings-layout a[href^="#settings-"]').evaluateAll((anchors) =>
       anchors.map((anchor) => [anchor.getAttribute('href'), anchor.textContent?.trim()]));
-    expect(links).toContainEqual(['#settings-code', 'Projects']);
+    expect(links).toContainEqual(['#settings-code', 'Resources']);
     expect(links.map(([, label]) => label)).not.toContain('Data storage');
     const projects = ui.page.locator('section.settings-pane', { has: ui.page.locator('#settings-code') });
     expect(await projects.locator('.section-h', { hasText: 'Git & GitHub' }).count()).toBe(1);
