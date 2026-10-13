@@ -55,6 +55,19 @@ it('cleans a legitimately restored generation belonging to the same workflow run
   expect(await f.store.worldState(f.task.id)).toBe('released');
 });
 
+// A task started straight from creation (an agent's create_task, a trigger) has no run
+// pin: its workflow id's only live run is this one. Moving it to Draft after a move left
+// the restored Hetzner server running (#610 follow-up canary, 2026-10-12).
+it('cleans a restored generation of a task without a run pin', async () => {
+  const f = await fixture();
+  expect(await f.store.swapTaskRun(f.task.id, 'original', '')).toBe(true);
+  await f.store.registerWorld({ ...f.handle, generation: 2 }, f.project.id);
+  await f.core.destroyWorld(f.handle);
+  expect(f.open).toHaveBeenCalledWith(expect.objectContaining({ generation: 2 }));
+  expect(f.destroy).toHaveBeenCalledOnce();
+  expect(await f.store.worldState(f.task.id)).toBe('released');
+});
+
 it('does not follow a stale handle without proof that the replacement belongs to this run', async () => {
   const f = await fixture();
   vi.spyOn(Context, 'current').mockImplementation(() => { throw new Error('no activity context'); });
