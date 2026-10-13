@@ -2,26 +2,35 @@ name: CLI release
 
 # Publishes the tavya CLI (src/cli): the bundled npm package `@tavya/cli`, and single
 # executables for each platform on the GitHub release `cli-v<version>`
-# (installed by https://tavya.io/cli/install.sh). Runs by itself when master's
-# cli/package.json changes to a version not released yet (CI's `cli-version`
-# job makes every pull request that changes the CLI bump it), when such a tag
-# is pushed, or by hand (workflow_dispatch) on a branch, which releases that
-# commit's cli/package.json version and creates its tag. npm publishes through
+# (installed by https://tavya.io/cli/install.sh). Runs on every master push that
+# may change what the CLI ships; scripts/cli-release-version.mjs decides whether
+# it did, and the version: the next patch after the newest cli-v* tag, or
+# cli/package.json's version when a pull request raised it (a minor or major
+# release). Pull requests never pick patch versions, so two of them can no
+# longer conflict on that line. Also runs when a cli-v* tag is pushed, or by
+# hand (workflow_dispatch) to republish an existing tag. npm publishes through
 # trusted publishing (no token; job `npm`).
 on:
   push:
     branches: [master]
-    paths: ['cli/package.json']
+    paths: ['src/cli/**', 'src/domain/**', 'src/world/restic-release.json', 'cli/**',
+      'scripts/build-cli.mjs', 'scripts/cli-release-version.mjs', '.github/workflows/cli-release.yml']
     tags: ['cli-v*']
   workflow_dispatch:
     inputs:
       tag:
-        description: An existing cli-v<version> tag to republish; empty releases this branch's version
+        description: An existing cli-v<version> tag to republish
         required: false
         type: string
 
 permissions:
   contents: read
+
+# Queued, never cancelled: each release must see the tag the one before it made,
+# or two master pushes would compute the same next version.
+concurrency:
+  group: cli-release
+  cancel-in-progress: false
 
 jobs:
   bundle:
@@ -29,32 +38,28 @@ jobs:
     timeout-minutes: 10
     outputs:
       tag: ${{ steps.version.outputs.tag }}
-      sha: ${{ steps.version.outputs.sha }}
+      version: ${{ steps.version.outputs.version }}
+      sha: ${{ steps.sha.outputs.sha }}
       release: ${{ steps.version.outputs.release }}
     steps:
       - uses: actions/checkout@v4
-        with: { ref: "${{ inputs.tag || github.sha }}" }
+        # Every tag and the history between them: the version follows the newest
+        # cli-v* tag and what changed since it.
+        with: { ref: "${{ inputs.tag || github.sha }}", fetch-depth: 0 }
       - uses: actions/setup-node@v4
         with: { node-version: '22.16.0' }
+      # The CLI has no runtime dependencies; its build tools are locked in
+      # cli/package-lock.json. (`npm install <tool>` at the root would resolve
+      # the whole root project afresh.)
+      - run: npm ci --prefix cli --ignore-scripts --no-audit --no-fund
+      - id: sha
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      # Writes the version into cli/package.json for this build only; nothing is committed.
       - name: Version
         id: version
         env:
           REQUESTED: "${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || '' }}"
-          ON_MASTER: "${{ github.event_name == 'push' && github.ref_type == 'branch' }}"
-        run: |
-          tag="cli-v$(node -p "require('./cli/package.json').version")"
-          if [ -n "$REQUESTED" ] && [ "$REQUESTED" != "$tag" ]; then echo "::error::$REQUESTED does not match cli/package.json ($tag)"; exit 1; fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          # A master push releases only a version that has no tag yet (any other edit to cli/package.json is not a release).
-          if [ "$ON_MASTER" = true ] && [ -n "$(git ls-remote --tags origin "refs/tags/$tag")" ]; then
-            echo "$tag is already released"; echo "release=false" >> "$GITHUB_OUTPUT"
-          else echo "release=true" >> "$GITHUB_OUTPUT"; fi
-      # The CLI has no runtime dependencies; its build tools are locked in
-      # cli/package-lock.json. (`npm install <tool>` at the root would resolve
-      # the whole root project afresh.)
-      - if: steps.version.outputs.release == 'true'
-        run: npm ci --prefix cli --ignore-scripts --no-audit --no-fund
+        run: node scripts/cli-release-version.mjs --write ${REQUESTED:+--tag "$REQUESTED"}
       - if: steps.version.outputs.release == 'true'
         run: node scripts/build-cli.mjs
       - if: steps.version.outputs.release == 'true'
@@ -82,6 +87,7 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '22.16.0' }
       - run: npm ci --prefix cli --ignore-scripts --no-audit --no-fund
+      - run: node scripts/cli-release-version.mjs --set "${{ needs.bundle.outputs.version }}"
       - run: node scripts/build-cli.mjs --sea
       - name: Inject into a copy of node (Linux)
         if: runner.os == 'Linux'
@@ -149,6 +155,7 @@ jobs:
       - run: npm install -g npm@11
       - uses: actions/download-artifact@v4
         with: { name: tavya-mjs, path: cli/dist }
+      - run: node scripts/cli-release-version.mjs --set "${{ needs.bundle.outputs.version }}"
       - name: Publish
         run: |
           version="$(node -p "require('./cli/package.json').version")"

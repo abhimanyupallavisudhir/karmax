@@ -168,10 +168,11 @@ jobs:
       # runs every web/*.test.cjs.
       - run: npm test -- --shard=${{ matrix.shard }}/${{ strategy.job-total }}
 
-  # Merging a new cli/package.json version publishes @tavya/cli (cli-release.yml),
-  # so a pull request that changes what the CLI ships must bump it.
+  # Reports the @tavya/cli version merging this pull request would publish
+  # (cli-release.yml computes it on master; pull requests never bump it), and
+  # keeps scripts/cli-release-version.mjs working. Never fails on a version.
   cli-version:
-    name: CLI version bump
+    name: CLI release version
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -186,9 +187,7 @@ jobs:
       - if: github.event_name == 'pull_request'
         run: npm ci --prefix cli --ignore-scripts --no-audit --no-fund
       - if: github.event_name == 'pull_request'
-        env:
-          BASE: ${{ github.event.pull_request.base.sha }}
-        run: node scripts/check-cli-version.mjs "$BASE"
+        run: node scripts/cli-release-version.mjs
 
   # Branch protection requires this check. It stands for the jobs above, so it
   # runs even after one of them failed or was cancelled, in order to fail too.

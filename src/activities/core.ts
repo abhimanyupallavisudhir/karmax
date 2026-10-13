@@ -1666,7 +1666,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     };
   }
 
-  return {
+  const activities = {
     async createWorld(args: CreateWorldArgs): Promise<WorldHandle> {
       let activitySignal: AbortSignal | undefined;
       let heartbeat: (() => void) | undefined;
@@ -4502,12 +4502,29 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
      * person's merge rights.
      */
     async mergeGithubPrs(handle: WorldHandle, prs: TaskPullRequest[], options?: {
-      mode?: 'submit' | 'observe' | 'inspect-exact' | 'submit-exact' | 'preflight' | 'claim-provider' | 'submit-fallback';
+      mode?: 'submit' | 'observe' | 'inspect-exact' | 'submit-exact' | 'preflight' | 'claim-provider' | 'submit-fallback' | 'review-ci';
       authority?: LandingAuthority;
+      /** submit-fallback only: walk every pull request up to its merge without
+       * merging, and answer `planned` when each one would merge now. */
+      readyCheck?: boolean;
     }): Promise<GitHubMergeAuthorization> {
       // A PR-policy task may legitimately make no changes. There is nothing
       // external to authorize in that case, so do not manufacture a human gate.
       if (!prs.length) return { status: 'merged', prs };
+      // A task's pull requests land together or not at all: merging each the
+      // moment it alone was ready landed the code while its wiki PR still
+      // waited, and that PR then conflicted (task_mv4cq5d21b04c13faf). Merge
+      // only once every one of them would merge now; what is not ready gets
+      // its update or its wait first, with nothing landed.
+      if (options?.mode === 'submit-fallback' && !options.readyCheck && prs.filter((ref) => !ref.merged).length > 1) {
+        const check = await activities.mergeGithubPrs(handle, prs, { ...options, readyCheck: true });
+        if (check.status !== 'planned') return check;
+      }
+      const readyCheck = options?.mode === 'submit-fallback' && options.readyCheck === true;
+      // While a proposal waits for Review: the same CI and conflict verdicts
+      // landing would reach, so a red or conflicting head goes back to Do before
+      // anyone approves it. Reruns are fine; it never changes the PR branch.
+      const reviewCi = options?.mode === 'review-ci';
       const task = (await store.getTask(handle.id));
       if (!task || !deps.githubApp) {
         return { status: 'needs-authorizer', prs, detail: 'GitHub is not connected for human-attributed merges.' };
@@ -4527,7 +4544,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const events = await store.eventsOfTypes(handle.id, [
         'task.confirmation-voted', 'github.merge.authorization-revoked', 'github.merge.review-stale',
         'github.ci.external-wait', 'github.ci.cancelled-reconciled', 'github.ci.repair-requested',
-        'github.ci.rerun-requested', 'github.ci.superseded', 'github.ci.terminal-observed',
+        'github.ci.rerun-requested', 'github.ci.superseded', 'github.ci.target-red', 'github.ci.terminal-observed',
         'github.ci.validation-current', 'github.pr.branch-update-requested', 'github.pr.queued',
         'github.pr.review-approved', 'github.pr.review-skipped',
       ]);
@@ -4716,6 +4733,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         readiness: GithubPullRequestReadiness,
         current: TaskPullRequest[],
         inspection: Awaited<ReturnType<typeof inspectionFor>>,
+        target?: string,
       ): Promise<GitHubMergeAuthorization | { status: 'checks-satisfied' }> => {
         const summary = ciFailureDetail(ref, readiness);
         const briefSummary = ciFailureDetail(ref, readiness, true);
@@ -4975,11 +4993,53 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // rerunning a head that keeps failing, or asking a person about it,
         // test the proposal as it would land.
         const updateFromMovedTarget = async (): Promise<GitHubMergeAuthorization | undefined> => {
-          if (!fairLanding || !ref.headSha || !readiness.baseSha) return undefined;
+          if (!fairLanding || reviewCi || !ref.headSha || !readiness.baseSha) return undefined;
           const behind = await inspection.api.compare(ref.slug, readiness.baseSha, ref.headSha)
             .then((comparison) => comparison.behindBy > 0, () => false);
           return behind ? updateFromTarget(ref, current, (message) =>
             `${ref.slug.toLowerCase()}#${ref.number}:${ref.headSha}:${readiness.baseSha}:conflict:${message}`) : undefined;
+        };
+        // A failure the target shares is the target's to fix (#597, #553: the
+        // upgrade rehearsal failed on master, and every open PR woke its agent
+        // to find nothing of its own). Wait for the target's fix instead, and
+        // once it is fixed bring it into this head rather than charging Do.
+        const targetFailure = async ({ decision }: (typeof decisions)[number]) => {
+          if (!fairLanding || !target || !inspection.actions) return undefined;
+          const failedHere = new Set([...decision.inspection.jobs, ...decision.inspection.failedJobs]
+            .filter((job) => job.conclusion?.toLowerCase() === 'failure').map((job) => job.name));
+          if (!failedHere.size) return undefined;
+          try {
+            const listed = await inspection.actions.listRuns(ref.slug, {
+              workflow: decision.inspection.run.workflowId, branch: target, event: 'push', status: 'completed', perPage: 5,
+            });
+            const latest = listed.runs.find((run) => run.branch === target && run.event === 'push');
+            if (!latest || String(latest.conclusion ?? '').toLowerCase() !== 'failure') return undefined;
+            const there = await inspection.actions.inspectFailure(ref.slug, latest.id);
+            const failedThere = new Set([...there.jobs, ...there.failedJobs]
+              .filter((job) => job.conclusion?.toLowerCase() === 'failure').map((job) => job.name));
+            return [...failedHere].every((name) => failedThere.has(name))
+              ? { run: latest, checks: [...failedHere].sort() } : undefined;
+          } catch { return undefined; }
+        };
+        const targetRed = async (candidate: (typeof decisions)[number]): Promise<GitHubMergeAuthorization | undefined> => {
+          const failure = await targetFailure(candidate);
+          if (!failure) {
+            if (!events.some((event) => event.type === 'github.ci.target-red' && event.payload?.key === candidate.key)) return undefined;
+            // The target was red when this head failed and is no longer: its fix
+            // may be all this head lacks.
+            return updateFromMovedTarget();
+          }
+          if (!events.some((event) => event.type === 'github.ci.target-red' && event.payload?.key === candidate.key
+            && Number(event.payload?.targetRunId) === failure.run.id)) {
+            (await record(handle.id, 'github.ci.target-red', {
+              key: candidate.key, slug: ref.slug, number: ref.number, candidateHead: ref.headSha,
+              target, targetRunId: failure.run.id, checks: failure.checks,
+            }));
+          }
+          return {
+            status: 'waiting', prs: current, actorUserId, releaseAdmission: true,
+            detail: `"${target}" fails the same check on its own latest run (${failure.checks.join(', ')}: ${failure.run.url}), so this failure is not the proposal's. Waiting for "${target}" to be fixed; its fix is then brought into this pull request. Nothing for the agent to repair.`,
+          };
         };
         const human = decisions.find(({ decision }) => decision.disposition === 'human');
         if (human) return {
@@ -4990,6 +5050,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         };
         const revision = decisions.find(({ decision }) => decision.disposition === 'revision');
         if (revision) {
+          const shared = await targetRed(revision);
+          if (shared) return shared;
           const repairRequested = events.some((event) => event.type === 'github.ci.repair-requested'
             && event.payload?.key === revision.key);
           // The key pins the head, so a repair that is already recorded means
@@ -5193,7 +5255,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             };
           }
           if (readiness?.checks === 'FAILURE' || readiness?.checks === 'ERROR') {
-            const checkDecision = await ciFailureDecision(ref, readiness, current, inspection);
+            const checkDecision = await ciFailureDecision(ref, readiness, current, inspection, live.base);
             if (checkDecision.status !== 'checks-satisfied') return checkDecision;
             // GitHub's rollup can briefly retain an older cancelled duplicate
             // after an equivalent run on this exact head succeeds. The
@@ -5217,6 +5279,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               detail: `Pull request ${ref.slug}#${ref.number} must be updated with its target branch before it can merge. Refresh the task branch, resolve any resulting conflict, and review the new head.`,
             };
           }
+        }
+        if (reviewCi) {
+          settled.push(next);
+          continue;
         }
         // Native queue CI runs on a speculative merge-group commit, so the PR
         // head can remain completely green after GitHub ejects it. Correlate
@@ -5388,7 +5454,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             return errorDecision(error, current);
           }
           if (readiness.checks === 'FAILURE' || readiness.checks === 'ERROR') {
-            const checkDecision = await ciFailureDecision(ref, readiness, current, inspection);
+            const checkDecision = await ciFailureDecision(ref, readiness, current, inspection, live.base);
             if (checkDecision.status !== 'checks-satisfied') return checkDecision;
             readiness = { ...readiness, checks: 'SUCCESS', failedChecks: undefined,
               ...(readiness.mergeStateStatus === 'UNSTABLE' ? { mergeStateStatus: 'CLEAN' as const } : {}) };
@@ -5652,6 +5718,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             };
           }
 
+          if (readyCheck) {
+            settled.push(next);
+            continue;
+          }
           let merged;
           try {
             merged = await api.merge(ref.slug, ref.number, ref.headSha,
@@ -5888,6 +5958,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           ...(!fallback ? { providerQueue: { state: 'queued' as const } } : {}),
         };
       }
+      if (readyCheck) return {
+        status: 'planned', prs: settled, actorUserId, participants,
+        detail: 'Every fallback pull request of this task would merge now.',
+      };
       if (inspectExact && settled.length === prs.length)
         return {
           status: 'candidate-ready', prs: settled, actorUserId, participants,
@@ -6365,6 +6439,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       return newId('task');
     },
   };
+  return activities;
 }
 
 /** Installation-side authorization boundary for platform-funded model calls.
