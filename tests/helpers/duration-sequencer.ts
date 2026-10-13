@@ -16,12 +16,13 @@ export function readDurations(root: string): Durations {
 
 /** Splits `files` into `count` shards of near-equal total duration: longest
  *  first, each onto the currently lightest shard. A file without a measurement
- *  weighs the median measured file; with no measurements at all every file
+ *  weighs the longest measured file, since it may be one: it is then placed
+ *  among the first, one to a shard. With no measurements at all every file
  *  weighs the same, which is an even split by count. Ties break on path and
  *  then shard number, so every CI runner computes the same plan. */
 export function planShards(files: string[], durations: Durations, count: number): string[][] {
-  const measured = Object.values(durations).sort((a, b) => a - b);
-  const fallback = measured[Math.floor(measured.length / 2)] ?? 1;
+  const measured = Object.values(durations);
+  const fallback = measured.length ? Math.max(...measured) : 1;
   const weight = (file: string) => durations[file] ?? fallback;
   const shards = Array.from({ length: count }, () => ({ files: [] as string[], load: 0 }));
   const longestFirst = [...files].sort((a, b) => weight(b) - weight(a) || (a < b ? -1 : a > b ? 1 : 0));

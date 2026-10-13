@@ -12,8 +12,13 @@
  * cannot reproduce (non-reasoning modes, ChatGPT-only and Pro models, efforts
  * the model does not accept) are dropped rather than mislabelled.
  *
- * The list ships with tavya as a snapshot (model-benchmarks.json, refreshed by
- * scripts/refresh-model-benchmarks.ts), so the chart works on any installation
+ * Cost and time are per task: the output tokens (thinking included) a model
+ * and effort spend on a task, at its token price and output speed. LiveBench
+ * measures those tokens for the models it runs; the rest are estimated from
+ * them (see taskTokens).
+ *
+ * The list ships with tavya as a snapshot (model-benchmarks.json and
+ * model-task-tokens.json, refreshed by scripts/refresh-model-benchmarks.ts), so the chart works on any installation
  * without a key. With ARTIFICIAL_ANALYSIS_API_KEY the server also fetches the
  * live list once a day — their free API asks to be called server-side only,
  * cached and credited, and allows 1,000 requests a day — falling back to the
@@ -23,6 +28,7 @@ import type { Provider } from '../domain/types.js';
 import { claudeMessagesEffort, codexReasoningEffort, type Effort } from './effort.js';
 import type { ModelCatalog } from './models.js';
 import bundled from './model-benchmarks.json' with { type: 'json' };
+import bundledTokens from './model-task-tokens.json' with { type: 'json' };
 
 export const ARTIFICIAL_ANALYSIS_URL = 'https://artificialanalysis.ai/api/v2/data/llms/models';
 export const ARTIFICIAL_ANALYSIS_KEY_ENV = 'ARTIFICIAL_ANALYSIS_API_KEY';
@@ -30,9 +36,18 @@ const DAY_MS = 24 * 60 * 60_000;
 /** Older models (than the list) are rarely what anyone wants and crowd the chart. */
 const MAX_AGE_MS = 365 * DAY_MS;
 /** Artificial Analysis times a 1,000-token prompt (`prompt_length: medium`)
- * and reports end-to-end response time for a 500-token answer. */
+ * and reports end-to-end response time for a 500-token answer. A LiveBench
+ * question's prompt is about as long (~1,250 tokens), so a task's prompt is priced as this. */
 const PROMPT_TOKENS = 1_000;
 const ANSWER_TOKENS = 500;
+/** What Artificial Analysis assumes a model thinks when it cannot see the
+ * thinking: its first answer token is timed at exactly this many tokens' worth
+ * of output after its first token. */
+const ASSUMED_THINKING_TOKENS = 2_000;
+/** Within-model elasticity of task tokens to speed-test tokens when too few
+ * models have two measured efforts to fit it (fitted: 0.49 on 2026-10-12). */
+const DEFAULT_ELASTICITY = 0.5;
+export const LIVEBENCH_URL = 'https://livebench.ai/';
 
 export interface ModelRef { provider: Exclude<Provider, 'mock'>; model: string; effort?: Effort }
 
@@ -46,13 +61,16 @@ export interface ModelBenchmark {
   intelligence: number;
   /** USD per million tokens, blended 3:1 input:output. */
   price?: number;
-  /** Seconds to a 500-token answer: time to first answer token + generation. */
+  /** Output tokens, thinking included, spent on a task (see taskTokens). */
+  tokens?: number;
+  /** The tokens were measured by LiveBench for this model and effort, not estimated. */
+  measured?: true;
+  /** Seconds to generate those tokens at the measured output speed. */
   seconds?: number;
   /**
-   * Estimated USD for that answer, thinking included. A price per token alone
-   * would show every effort level of a model at the same cost; what effort
-   * changes is how many tokens are spent. Thinking tokens are the time to the
-   * first answer token at the measured output speed.
+   * USD per task: the prompt and those tokens at the model's prices. A price per
+   * token alone would show every effort level of a model at the same cost, and
+   * models differ several-fold in how many tokens they spend on the same task.
    */
   cost?: number;
   ref: ModelRef;
@@ -148,6 +166,102 @@ export function benchmarkRef(row: { creator: string; slug: string; name: string 
   return undefined;
 }
 
+// ── Tokens per task ──────────────────────────────────────────────────────────
+
+/** Output tokens a LiveBench model spent per question, on average. */
+export interface TokenMeasurement { model: string; outputTokens: number }
+
+/** A LiveBench model id as an Artificial Analysis base slug and effort:
+ * `claude-opus-5-5-max-effort` → claude-opus-5-5, max; `gpt-6.1-sol-xhigh` → gpt-6-1-sol, xhigh. */
+export function measurementKey(model: string): { base: string; effort?: Effort } {
+  const id = model.toLowerCase().replace(/-20\d\d-?\d\d-?\d\d(?=-|$)/, '').replace(/[._]/g, '-');
+  const effort = /-(low|medium|high|xhigh|max)(?:-effort)?$/.exec(id)?.[1] as Effort | undefined;
+  const base = baseSlug(id.replace(/-effort$/, ''));
+  return effort ? { base, effort } : { base };
+}
+
+const measures = (key: { base: string; effort?: Effort }, row: RawModel): boolean =>
+  typeof row.slug === 'string' && typeof row.name === 'string' && baseSlug(row.slug) === key.base
+  // Without an effort, LiveBench ran the model as shipped: the row without a suffix.
+  && (key.effort ? variantEffort(row.name) === key.effort : row.slug.toLowerCase() === key.base);
+
+/**
+ * Thinking plus answer tokens on Artificial Analysis' speed test: the time to
+ * the first answer token at the output speed, plus the 500-token answer.
+ * Undefined when not measured — no speed, or thinking the model does not
+ * stream, which Artificial Analysis fills in as a flat 2,000 tokens.
+ */
+export function probeTokens(row: RawModel): number | undefined {
+  const speed = positive(row.median_output_tokens_per_second);
+  const firstAnswer = positive(row.median_time_to_first_answer_token) ?? positive(row.median_time_to_first_token_seconds);
+  if (!speed || !firstAnswer) return undefined;
+  const firstToken = positive(row.median_time_to_first_token_seconds);
+  if (firstToken && Math.abs((firstAnswer - firstToken) * speed - ASSUMED_THINKING_TOKENS) < ASSUMED_THINKING_TOKENS / 100) return undefined;
+  return firstAnswer * speed + ANSWER_TOKENS;
+}
+
+const mean = (values: number[]) => values.reduce((sum, value) => sum + value, 0) / values.length;
+const groupBy = <T, K>(items: T[], key: (item: T) => K) => {
+  const groups = new Map<K, T[]>();
+  for (const item of items) groups.set(key(item), [...(groups.get(key(item)) ?? []), item]);
+  return groups;
+};
+const median = (values: number[]) => {
+  const sorted = [...values].sort((a, b) => a - b);
+  return (sorted[Math.floor((sorted.length - 1) / 2)]! + sorted[Math.ceil((sorted.length - 1) / 2)]!) / 2;
+};
+
+/**
+ * Output tokens per task for each row of an Artificial Analysis list.
+ *
+ * LiveBench measures them for the model and effort it ran. The speed test's
+ * tokens alone are a poor guide (5× off on a typical model, 50× on the worst,
+ * and worse than assuming the same count for every model): one short prompt
+ * says little about how long a model thinks on real tasks. Across the efforts
+ * of one model, though, they track task tokens closely as a power law,
+ * T ∝ P^k with k ≈ 0.5 — so
+ *  - a row LiveBench measured is that measurement;
+ *  - another effort of a measured model is scaled from the measured efforts by
+ *    (P / P_measured)^k, within ~10%;
+ *  - a model never measured gets the typical model's e^α·P^k, ~2× either way.
+ * k is fitted within models, α across them, from the rows of this list; a row
+ * whose speed test did not measure thinking takes the median speed-test tokens
+ * of its effort level. With nothing measured, the speed test's tokens it is.
+ */
+export function taskTokens(rows: RawModel[], measurements: TokenMeasurement[]): (row: RawModel) => { tokens: number; measured: boolean } | undefined {
+  const measured = new Map<RawModel, number>();
+  for (const measurement of measurements) {
+    const key = measurementKey(measurement.model);
+    for (const row of rows) if (measurement.outputTokens > 0 && measures(key, row)) measured.set(row, measurement.outputTokens);
+  }
+  const group = (row: RawModel) => baseSlug(String(row.slug));
+  const probes = new Map(rows.flatMap((row) => { const probe = probeTokens(row); return probe ? [[row, Math.log(probe)] as const] : []; }));
+  const fitted = [...measured].flatMap(([row, tokens]) => probes.has(row) ? [{ group: group(row), x: probes.get(row)!, y: Math.log(tokens) }] : []);
+  if (!fitted.length) return (row) => { const probe = probeTokens(row); return probe ? { tokens: Math.round(probe), measured: false } : undefined; };
+
+  // Pooled within-model slope: how task tokens grow with speed-test tokens across one model's efforts.
+  let covariance = 0, variance = 0;
+  for (const points of groupBy(fitted, (point) => point.group).values()) {
+    const x = mean(points.map((point) => point.x)), y = mean(points.map((point) => point.y));
+    for (const point of points) { covariance += (point.x - x) * (point.y - y); variance += (point.x - x) ** 2; }
+  }
+  const k = variance > 0 ? covariance / variance : DEFAULT_ELASTICITY;
+  const alpha = mean(fitted.map((point) => point.y - k * point.x));
+  const byEffort = groupBy([...probes.keys()], (row) => variantEffort(String(row.name)));
+  const typical = (effort: ReturnType<typeof variantEffort>) => median((byEffort.get(effort) ?? [...probes.keys()]).map((row) => probes.get(row)!));
+  const x = (row: RawModel) => probes.get(row) ?? typical(variantEffort(String(row.name)));
+
+  return (row) => {
+    const own = measured.get(row);
+    if (own) return { tokens: own, measured: true };
+    const anchors = [...measured].filter(([other]) => group(other) === group(row));
+    const log = anchors.length
+      ? mean(anchors.map(([other, tokens]) => Math.log(tokens) + k * (x(row) - x(other))))
+      : alpha + k * x(row);
+    return { tokens: Math.round(Math.exp(log)), measured: false };
+  };
+}
+
 /** A response reduced to the fields read here, for the bundled snapshot. */
 export function trimModels(data: unknown, now = Date.now()): RawModel[] {
   if (!Array.isArray(data)) return [];
@@ -174,8 +288,10 @@ export function trimModels(data: unknown, now = Date.now()): RawModel[] {
  * The rows of an Artificial Analysis list that some harness can run. `now` is
  * when the list was fetched, so an old snapshot still shows its newest models.
  */
-export function toBenchmarks(data: unknown, catalog: Partial<ModelCatalog>, now = Date.now()): ModelBenchmark[] {
+export function toBenchmarks(data: unknown, catalog: Partial<ModelCatalog>, now = Date.now(),
+  measurements: TokenMeasurement[] = BUNDLED_TASK_TOKENS.data): ModelBenchmark[] {
   if (!Array.isArray(data)) return [];
+  const tokensFor = taskTokens((data as RawModel[]).filter((raw) => raw && typeof raw === 'object'), measurements);
   const out: ModelBenchmark[] = [];
   const seen = new Set<string>();
   for (const raw of data as RawModel[]) {
@@ -188,13 +304,12 @@ export function toBenchmarks(data: unknown, catalog: Partial<ModelCatalog>, now 
     const key = ref && `${ref.provider}:${ref.model}:${ref.effort ?? ''}`;
     if (!ref || seen.has(key!)) continue;
     seen.add(key!);
+    const task = tokensFor(raw);
     const speed = positive(raw.median_output_tokens_per_second);
-    const firstToken = positive(raw.median_time_to_first_answer_token) ?? positive(raw.median_time_to_first_token_seconds);
     const price = positive(raw.pricing?.price_1m_blended_3_to_1);
     const input = positive(raw.pricing?.price_1m_input_tokens);
     const output = positive(raw.pricing?.price_1m_output_tokens);
-    const cost = speed && firstToken && input && output
-      ? (PROMPT_TOKENS * input + (firstToken * speed + ANSWER_TOKENS) * output) / 1e6 : undefined;
+    const cost = task && input && output ? (PROMPT_TOKENS * input + task.tokens * output) / 1e6 : undefined;
     out.push({
       id: raw.id,
       name: raw.name,
@@ -202,7 +317,8 @@ export function toBenchmarks(data: unknown, catalog: Partial<ModelCatalog>, now 
       ...(released ? { released } : {}),
       intelligence,
       ...(price ? { price } : {}),
-      ...(speed && firstToken ? { seconds: Math.round((firstToken + ANSWER_TOKENS / speed) * 10) / 10 } : {}),
+      ...(task ? { tokens: task.tokens, ...(task.measured ? { measured: true as const } : {}) } : {}),
+      ...(task && speed ? { seconds: Math.round((task.tokens / speed) * 10) / 10 } : {}),
       ...(cost ? { cost: Number(cost.toPrecision(3)) } : {}),
       ref,
     });
@@ -211,6 +327,8 @@ export function toBenchmarks(data: unknown, catalog: Partial<ModelCatalog>, now 
 }
 
 export const BUNDLED_MODELS = { at: Date.parse(bundled.fetchedAt), data: bundled.data as unknown[] };
+/** LiveBench's measured output tokens per question (livebench.ai cost table). */
+export const BUNDLED_TASK_TOKENS = { at: Date.parse(bundledTokens.fetchedAt), data: bundledTokens.data as TokenMeasurement[] };
 
 /** The Artificial Analysis model list: the bundled snapshot, or with a key the
  * live list fetched at most once a day. A failed fetch is remembered for a few

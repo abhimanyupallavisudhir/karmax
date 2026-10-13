@@ -37,7 +37,7 @@ it('removes the tab from navigation and clears cached measurements on a live dis
  const context = vm.createContext({ S: {meta:{timingEnabled:true},taskTab:'timing',activity:[{type:'timing'}],taskEvents:[{type:'timing'}]},document:{getElementById:()=>null} });
  vm.runInContext(helpers+'\ntimingReports.set("t", {}); applyTimingSetting(false);',context);
  expect(vm.runInContext('timingReports.size',context)).toBe(0);
- expect(vm.runInContext('S.taskTab',context)).toBe('overview');
+ expect(vm.runInContext('S.taskTab',context)).toBe('checkin');
  expect(vm.runInContext('S.activity.length + S.taskEvents.length',context)).toBe(0);
  const navigation=source.slice(source.indexOf('const TASK_TABS ='),source.indexOf('function visibleTaskTabs()'));
  const visible=source.slice(source.indexOf('function visibleTaskTabs()'),source.indexOf('function defaultTaskTab(v)'));

@@ -144,16 +144,16 @@ describe('GitHub merge authorization UX', () => {
   it('separates PR review confirmation from later GitHub authorization', async () => {
     const ui = await consolePage();
     const render = async (view: Record<string, unknown>) => {
-      await ui.run(`document.getElementById('main').innerHTML = overviewTab(${JSON.stringify(view)}) + taskActions(${JSON.stringify(view)})`);
+      await ui.run(`document.getElementById('main').innerHTML = conversationReviewInfo(${JSON.stringify(view)}) + taskActions(${JSON.stringify(view)})`);
       return {
-        heading: await ui.page.locator('#main .section-h').filter({ hasText: /^(Review|Work summary)$/ }).textContent(),
+        heading: await ui.page.locator('#main .review-info .role').textContent(),
         buttons: await ui.page.locator('#main .actions button').evaluateAll((buttons) => buttons.map((b) => b.dataset.label)),
       };
     };
     const confirm = { name: 'confirm', kind: 'signal', label: 'Confirm PR', enabled: true };
     expect(await render({ stage: 'review', status: 'active', actions: [confirm] })).toEqual({ heading: 'Review', buttons: ['Confirm PR'] });
     expect(await render({ stage: 'merge', status: 'active', reviewInfo: { caption: 'Done' }, waitingFor: { kind: 'human' },
-      actions: [confirm] })).toEqual({ heading: 'Work summary', buttons: ['Authorize GitHub merge'] });
+      actions: [confirm] })).toEqual({ heading: 'Summary', buttons: ['Authorize GitHub merge'] });
     await ui.close();
   });
 });

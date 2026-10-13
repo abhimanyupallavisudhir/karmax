@@ -34,7 +34,7 @@ import {
   AGENT_QUEUE_WORKFLOW,
 } from '../coordinators/names.js';
 import { TaskRecord, TaskView, AttentionAsk, Message, Project, TaskInput, ImageRef, FileRef, Tag, SavedView, TaskQuery, AgentRole, AgentSpec, AgentAuthority, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency, remotePolicyOf, ResourceAccess, ResourceTarget } from '../domain/types.js';
-import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable, awaitsSuccessOf } from '../domain/triggers.js';
+import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable, awaitsSuccessOf, isSeries } from '../domain/triggers.js';
 import { BUILT_IN_AUTOMATIONS, automationNeeds, templateTask, type AutomationNeed, type AutomationTemplate } from '../domain/automations.js';
 import { applyTriggerContext, normalizeEventInput, validateFollow, type EventFilter, type EventFollow, type ProjectEvent, type ProjectEventClaim,
   type ProjectEventInput, type ProjectEventOrigin, type TriggerContext } from '../domain/project-events.js';
@@ -3097,6 +3097,10 @@ export class KarmaxApi {
     const task = (await this.deps.store.getTask(taskId));
     const caller = (await this.require(token, 'edit_task', { projectId: task?.projectId, taskId }));
     if (!task) throw new NotFoundError(`no task ${taskId}`);
+    // A draft stays a draft until it is run. Saving one never arms its triggers
+    // or makes it a series: auto-save of a draft with Repeatable ticked used to,
+    // mid-edit, because the gateway sends a repeatable task here with keepArmed.
+    const keepArmed = opts.keepArmed !== false && !task.params?.draft;
     if (params.paymentPolicy !== undefined)
       params = { ...params, paymentPolicy: withPolicyCurrency(params.paymentPolicy, (await resolvePaymentPolicy(this.deps.store, task.projectId, taskId)).currency) };
     if (params.paymentPolicy !== undefined && JSON.stringify(params.paymentPolicy) !== JSON.stringify((task.params as any).paymentPolicy)) {
@@ -3135,6 +3139,16 @@ export class KarmaxApi {
       // The form cannot resupply the account the task was pinned to at creation.
       ...(_githubAccountId !== undefined ? { _githubAccountId } : {}),
     };
+    const base: Record<string, unknown> = opts.replace ? { ...meta, ...params } : { ...task.params, ...params };
+    // Validate the edited triggers before anything is written: a rejected edit
+    // (a cycle, a dangling or self dependency) must leave the task as it was,
+    // still armed. Saving first left it un-armed with the bad triggers stored,
+    // and the reconcile sweep then failed it as "never started".
+    if (opts.keepArmed !== false && hasActiveTriggers(base)) {
+      const candidate = { ...task, params: { ...base, triggerState: 'armed' } } as TaskRecord;
+      const errs = (await this.armer?.validationErrors?.(candidate)) ?? (await validateTriggers(normalizeTriggers(base)));
+      if (errs.length) throw new Error(`invalid trigger(s): ${errs.join('; ')}`);
+    }
     const start = this.resolveStart(task.workflow, task.workflowVersion,
       (await this.deps.store.getProject(task.projectId))?.organizationId);
     const confirmerField = start?.manifest.params.find((f) => f.type === 'confirmer');
@@ -3153,7 +3167,6 @@ export class KarmaxApi {
         (await this.deps.store.setIntentConfirmer(task.intentId ?? task.id, confirmerField.name, confirmer));
       }
     }
-    const base: Record<string, unknown> = opts.replace ? { ...meta, ...params } : { ...task.params, ...params };
     (await this.prepareForkWorld(task.projectId, base, task.params));
     // Authorization is platform metadata, never a workflow-form field.
     if (_authorization !== undefined) base._authorization = _authorization;
@@ -3167,7 +3180,7 @@ export class KarmaxApi {
       const group = (await this.deps.store.attemptGroup(taskId));
       if (confirmerField && group?.confirmer !== undefined) resolved[confirmerField.name] = group.confirmer;
       const { specs, fromDefaults } = this.agentSpecsOf(start.manifest, { ...resolved, ...calledAgentFields(base) }, base);
-      const staysDraft = opts.keepArmed === false || !(base.repeatable || hasActiveTriggers(base));
+      const staysDraft = !keepArmed || !(base.repeatable || hasActiveTriggers(base));
       base._agentAuthorization = (await this.nextAgentAuthorizations(token, caller, { ...task, params: { ...task.params, ...base } as any }, specs, {
         mayAttenuate: staysDraft && opts.allowAttenuation === true, accept: opts.acceptAttenuation, fromDefaults,
       }));
@@ -3179,13 +3192,13 @@ export class KarmaxApi {
     if (forcesRepeatable(normalizeTriggers(base))) base.repeatable = true;
     // A repeatable series stays a series when saved: persist, then arm it if it
     // has triggers (each fire spawns a run) or leave it as a manual template.
-    if (base.repeatable && opts.keepArmed !== false) {
+    if (base.repeatable && keepArmed) {
       (await this.deps.store.updateTaskParams(taskId, base as any));
       if (hasActiveTriggers(base)) return (await this.armStoredTask(taskId));
       this.armer?.disarm(taskId);
       return (await this.deps.store.getTask(taskId))!;
     }
-    if (opts.keepArmed !== false && hasActiveTriggers(base)) {
+    if (keepArmed && hasActiveTriggers(base)) {
       (await this.deps.store.updateTaskParams(taskId, base as any));
       return (await this.armStoredTask(taskId)); // re-validate + re-arm (disarm old, arm new)
     }
@@ -5340,6 +5353,15 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         ...(candidates ? { candidateIds: [...candidates] } : {}),
       })) tasks.push(...page);
       tags.push(...(await this.deps.store.listTagsAsync(project.id)));
+    }
+    // A run nests under its series only while that series is live. The read may
+    // have skipped the series (archived, or outside the candidates): look those up.
+    const read = new Set(tasks.map((task) => task.id));
+    const unread = [...new Set(tasks.map((task) => task.params?.runOf)
+      .filter((id): id is string => typeof id === 'string' && !read.has(id)))];
+    if (unread.length) {
+      ctx.seriesIds = new Set();
+      for (const id of unread) if (isSeries((await this.deps.store.taskMetadataAsync(id))?.params)) ctx.seriesIds.add(id);
     }
     return { result: evaluateQuery(tasks, q, { ...ctx, tags }), tags };
   }

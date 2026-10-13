@@ -1,3 +1,6 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import * as triggers from '../src/domain/triggers.js';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { Store } from '../src/store/db.js';
@@ -460,7 +463,7 @@ describe('evaluateQuery — triggers, schedules, series', () => {
   it('matches trigger/series facets', () => {
     const sched = armedSchedule('nightly', 1);
     const dep = task({ title: 'after-A', num: 2, params: { prompt: 'x', triggers: [{ kind: 'dependency', tasks: ['task-a'] }], triggerState: 'armed' } as any });
-    const run = task({ title: 'run-7', num: 3, lastView: view('done'), params: { prompt: 'x', runOf: 'series-1' } as any });
+    const run = task({ title: 'run-7', num: 3, lastView: view('done'), params: { prompt: 'x', runOf: sched.id } as any });
     const plain = task({ title: 'plain', num: 4, lastView: view('active') });
     const all = [sched, dep, run, plain];
     const nums = (q: string) => evaluateQuery(all, parseQuery(q), ctx).tasks.map((t) => t.num).sort();
@@ -472,6 +475,26 @@ describe('evaluateQuery — triggers, schedules, series', () => {
     expect(nums('is:series')).toEqual([1]); // repeatable template
     expect(nums('is:run')).toEqual([3]);
     expect(nums('-is:triggered')).toEqual([3, 4]);
+  });
+
+  it('a run nests only under a repeatable series; otherwise it stands on its own (#617)', () => {
+    const series = armedSchedule('nightly', 1);
+    const nested = task({ title: 'nested', num: 2, lastView: view('active'), params: { prompt: 'x', runOf: series.id } as any });
+    // #616 was un-ticked: a draft, no longer repeatable. Its run #617 must not vanish.
+    const unticked = task({ title: 'was repeatable', num: 3, params: { prompt: 'x', draft: true } as any });
+    const orphan = task({ title: 'orphan', num: 4, lastView: view('active'), params: { prompt: 'x', runOf: unticked.id } as any });
+    // A series moved back to drafts has no series row to nest its runs under either.
+    const shelved = task({ title: 'shelved', num: 5, params: { prompt: 'x', draft: true, repeatable: true } as any });
+    const shelvedRun = task({ title: 'shelved run', num: 6, lastView: view('done'), params: { prompt: 'x', runOf: shelved.id } as any });
+    // A run whose series is gone (deleted) stands on its own too.
+    const gone = task({ title: 'gone', num: 7, lastView: view('done'), params: { prompt: 'x', runOf: 'task-deleted' } as any });
+    // A series the read skipped (archived) is named by the caller, so its runs stay nested.
+    const archivedRun = task({ title: 'archived series run', num: 8, lastView: view('done'), params: { prompt: 'x', runOf: 'task-archived-series' } as any });
+    const all = [series, nested, unticked, orphan, shelved, shelvedRun, gone, archivedRun];
+    const nums = (q: string, extra = {}) => evaluateQuery(all, parseQuery(q), { ...ctx, ...extra }).tasks.map((t) => t.num).sort((a, b) => a! - b!);
+    expect(nums('is:run', { seriesIds: new Set(['task-archived-series']) })).toEqual([2, 8]);
+    expect(nums('-is:run', { seriesIds: new Set(['task-archived-series']) })).toEqual([1, 3, 4, 5, 6, 7]);
+    expect(nums('is:series')).toEqual([1]);
   });
 
   it('groups by trigger kind and searches the cron text', () => {
@@ -646,6 +669,31 @@ describe('Store — saved views', () => {
     expect((await store.getView(v.id))!.query.filters?.[0]?.field).toBe('is');
     (await store.deleteView(v.id));
     expect((await store.getView(v.id))).toBeUndefined();
+  });
+
+  it('spells out -is:archived in views saved while the list hid archived tasks implicitly', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-views-'));
+    const filename = path.join(dir, 'store.db');
+    let file = (await Store.create(filename));
+    try {
+      const project = (await file.createProject('Views')).id;
+      const bugs = (await file.createView({ projectId: project, name: 'Bugs', query: parseQuery('tag:bug group:status') }));
+      const archived = (await file.createView({ projectId: project, name: 'Old', query: parseQuery('is:archived') }));
+      const both = (await file.createView({ projectId: project, name: 'Both', query: parseQuery('-is:archived') }));
+      const everything = (await file.createView({ projectId: project, name: 'All', query: {} }));
+      (await file.kvDelete('migration:saved-views-explicit-archived'));
+      (await file.close());
+      file = (await Store.create(filename));
+      expect(stringifyQuery((await file.getView(bugs.id))!.query)).toBe('tag:bug -is:archived group:status');
+      expect(stringifyQuery((await file.getView(archived.id))!.query)).toBe('is:archived');
+      expect(stringifyQuery((await file.getView(both.id))!.query)).toBe('-is:archived');
+      expect(stringifyQuery((await file.getView(everything.id))!.query)).toBe('-is:archived');
+      // Once: a view saved afterwards means exactly what it says.
+      (await file.updateView(everything.id, { query: {} }));
+      (await file.close());
+      file = (await Store.create(filename));
+      expect((await file.getView(everything.id))!.query).toEqual({});
+    } finally { (await file.close()); fs.rmSync(dir, { recursive: true, force: true }); }
   });
 
   it('drops a project’s tags and views when the project is deleted', async () => {

@@ -5,7 +5,7 @@ const vm = require('node:vm');
 const { test } = require('node:test');
 const src = fs.readFileSync(`${__dirname}/app.js`, 'utf8');
 const wire = src.slice(src.indexOf('function resourceReviewPlaceholder('), src.indexOf('\nfunction setStopBtn('));
-const tabs = src.slice(src.indexOf('function taskTabBody('), src.indexOf('\nfunction approvalRequestsTab('));
+const tabs = src.slice(src.indexOf('function taskTabBody('), src.indexOf('\nfunction approvalHistoryHtml('));
 const freshness = src.slice(src.indexOf('function beginAsyncElementRender('), src.indexOf('\n}', src.indexOf('function beginAsyncElementRender(')) + 2);
 const candidate = { resource: { id: 'r1', name: 'Dataset', target: { kind: 'path', path: 'data' } }, candidate: { id: 'c1', state: 'pending', sourceKind: 'path', sourcePath: 'output', worldGeneration: 1 } };
 function extract(name) {
@@ -36,13 +36,13 @@ function setup(api) {
     document: { getElementById: (id) => id === 'review-resource-inventory' ? inventory : wrap }, esc: String, formatBytes: String, confirm: () => true, toast: () => {},
     S: {}, ICON: {}, siteNameMarkup: () => 'Karmax', markdownEnabled: () => false, mathjaxEnabled: () => true, renderAgentMessageBody: String, renderWaitDetail: String, explainMessageAffordance: () => '',
     waitingText: () => 'Waiting', liveRoleFor: () => 'do', conversationPresence: () => ({ tone: 'waiting', label: 'Waiting' }),
-    conversationEntries: () => [], subTasksSection: () => '', forkSourcesSection: () => '', agentForksSection: () => '', pipelineLarge: () => '',
+    conversationEntries: () => [], subTasksSection: () => '', forkSourcesSection: () => '', agentForksSection: () => '',
     checkoutsSection: () => '', renderWidgetGroups: () => '', notesSection: () => '',
-    conversationApprovalRequests: () => '',
-    approvalRequestsTab: () => 'approvals', parametersTab: () => 'parameters',
+    conversationApprovalRequests: () => '', taskTranscripts: () => [{ role: 'do' }],
+    parametersTab: () => 'parameters', timingTab: () => 'timing',
   });
   vm.runInContext(`${freshness}\n${tabs}\n${wire}`, context);
-  for (const name of ['humanWaitDetail', 'conversationTextKey', 'conversationInputRequest', 'overviewTab', 'safeHref', 'reviewActionBtn', 'conversationReviewInfo', 'conversationFullscreenButton', 'conversationPane', 'liveOutputFor', 'renderConversationEntry']) {
+  for (const name of ['humanWaitDetail', 'conversationTextKey', 'conversationInputRequest', 'safeHref', 'contentKey', 'conversationError', 'reviewActionBtn', 'conversationReviewInfo', 'conversationFullscreenButton', 'conversationPane', 'liveOutputFor', 'renderConversationEntry', 'presenceDetail', 'conversationWaitNotice']) {
     vm.runInContext(extract(name), context);
   }
   context.checkinTab = (v) => context.conversationPane(v, { role: 'do' });
@@ -53,24 +53,25 @@ const reviewView = { taskId: 'task', stage: 'review', status: 'waiting', updated
   waitingFor: { kind: 'human', detail: '1 staged project resource candidate must be Adopted or Discarded before this proposal can continue.' },
   actions: [{ name: 'followUp', enabled: true }] };
 
-test('resource controls are on Overview and inside the current Input requested message only', () => {
+test('resource controls close the conversation, or ride the current Input requested message', () => {
   const { context } = setup();
-  assert.match(context.taskTabBody(reviewView, 'overview'), /id="review-resources"/);
   const conversation = context.taskTabBody(reviewView, 'checkin');
   assert.match(conversation, /class="msg agent input-request"[\s\S]*id="review-resources"/);
-  assert.doesNotMatch(conversation, /id="review-resource-inventory"/);
-  for (const tab of ['approvals', 'parameters']) assert.doesNotMatch(context.taskTabBody(reviewView, tab), /review-resources/);
-  assert.doesNotMatch(context.taskTabBody({ ...reviewView, stage: 'do' }, 'checkin'), /review-resources/);
-  assert.doesNotMatch(context.taskTabBody({ ...reviewView, waitingFor: null }, 'checkin'), /review-resources/);
+  assert.equal((conversation.match(/id="review-resources"/g) || []).length, 1, 'the resources show once');
+  assert.match(conversation, /id="review-resource-inventory"/, 'the ignored-output scan reports in the review block');
+  assert.doesNotMatch(context.taskTabBody(reviewView, 'parameters'), /review-resources/);
+  assert.doesNotMatch(context.taskTabBody({ ...reviewView, stage: 'do' }, 'checkin'), /review-resources|review-resource-inventory/);
+  const unasked = context.taskTabBody({ ...reviewView, waitingFor: null }, 'checkin');
+  assert.match(unasked, /class="msg agent review-info"[\s\S]*id="review-resources"/, 'without an input request the review block carries them');
   const old = { type: 'input-request', request: { text: 'An older request' } };
   context.conversationEntries = () => [old];
   const history = context.taskTabBody(reviewView, 'checkin');
   assert.equal((history.match(/id="review-resources"/g) || []).length, 1);
   assert.equal(old.resourceReview, undefined, 'history entries are not mutated');
-  assert.match(src, /wireResourceReview\(v\);[^\n]*\n  if \(tab === 'overview'\)/);
+  assert.match(src, /wireResourceReview\(v\);[^\n]*\n  if \(tab === 'checkin'\) \{\n    wireReviewActions\(v\);\n    wireResourceInventory\(v\);/);
 });
 
-test('first-open Overview shows candidate buttons while the ignored-file scan is still pending', async () => {
+test('first-open review shows candidate buttons while the ignored-file scan is still pending', async () => {
   let finishInventory;
   const h = setup(async (url) => url.endsWith('/inventory')
     ? new Promise((r) => { finishInventory = r; }) : [candidate]);

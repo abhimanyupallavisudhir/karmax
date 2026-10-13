@@ -89,10 +89,12 @@ npx vitest run --shard=2/8
 
 A few files take minutes while most take under a second, so shards are
 balanced by each file's measured duration (`tests/durations.json`, via
-`tests/helpers/duration-sequencer.ts`) rather than by file count. Every test
-file needs a measurement (`tests/duration-sequencer.test.ts` fails otherwise):
-an unmeasured file would count as a typical one, under a second, however long
-it really runs. Measure a file you add, or one you make much slower, locally:
+`tests/helpers/duration-sequencer.ts`) rather than by file count. A file
+without a measurement counts as the longest one, since it might be, which also
+spreads such files one to a shard; up to one per shard is fine, so a new test
+file needs no measurement in its own pull request
+(`tests/duration-sequencer.test.ts` fails past that). Measure them all at once
+when it does, or a file you made much slower, locally:
 
 ```bash
 npx vitest run --reporter=default tests/new.test.ts | npm run test:durations

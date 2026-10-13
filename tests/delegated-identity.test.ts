@@ -135,8 +135,8 @@ describe('delegated human identity authority', () => {
   });
 
   // Task #618: deleting a throwaway project an agent had also been granted revoked the
-  // delegation its task token stands on, so every call failed `unauthorized` although
-  // #610 had kept the token itself. Only delegations whose own project it was end.
+  // delegation its live task token stands on, so every call of the running turn failed
+  // `unauthorized` although #610 had kept the token itself.
   it('keeps an agent working when a throwaway project it was also granted is deleted', async () => {
     const home = (await store.createProject('Home')), doomed = (await store.createProject('Throwaway'));
     const own = (await store.createTask({ projectId: home.id, title: 'Agent', workflow: 'just-do', workflowVersion: '1', params: { prompt: 'p' } }));
@@ -146,14 +146,14 @@ describe('delegated human identity authority', () => {
     const delegation = (await tokens.delegateHuman(human.token, { taskId: own.id, projectIds, organizationId }))!;
     const canaryDelegation = (await tokens.deriveHumanDelegation(delegation.id, { taskId: canary.id, projectIds: [doomed.id], organizationId }));
     const primary = (await tokens.deriveHumanDelegation(delegation.id, { taskId: own.id, projectId: doomed.id, organizationId }));
-    const turn = () => tokens.mint({ taskId: own.id, profileId: 'do', role: 'do', principal: 'user:alice', projectIds, organizationId,
-      ceiling: ['task:read'], grantorCaps: ['task:read'], delegationId: delegation.id });
-    const agent = (await turn());
+    const turn = (scope: string[]) => tokens.mint({ taskId: own.id, profileId: 'do', role: 'do', principal: 'user:alice',
+      projectIds: scope, organizationId, ceiling: ['task:read'], grantorCaps: ['task:read'], delegationId: delegation.id });
+    const agent = (await turn(projectIds));
 
     (await store.deleteProject(doomed.id));
 
     expect((await tokens.verify(agent.token))?.humanSubject?.userId).toBe('alice');
-    expect((await tokens.verify((await turn()).token))).toBeDefined();
+    expect((await tokens.verify((await turn([home.id])).token))).toBeDefined();
     expect((await store.getHumanDelegation(canaryDelegation.id))).toBeUndefined();
     expect((await store.getHumanDelegation(primary.id))).toBeUndefined();
   });

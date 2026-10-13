@@ -145,10 +145,10 @@ it('walks the console under its policy without a violation, and agent HTML still
     return (window as any).QrScanner.scanImage(canvas, { returnDetailedScanResult: true }).then(() => 'decoded', (error: unknown) => String(error));
   });
   expect(scanned).toMatch(/No QR code found/);
-  // Tasks open on Check-in; the review panel is on Overview.
+  // A former Overview link opens the task page, whose conversation ends with the review.
   await go('/org/workspace/tasks/1/overview');
   // The agent's review HTML is its own sandboxed document, so its script runs.
-  await expect.poll(() => page.frameLocator('.review iframe').locator('#state').textContent()).toBe('ran');
+  await expect.poll(() => page.frameLocator('#review-info-frame').locator('#state').textContent()).toBe('ran');
   // An HTML artifact opens as its own document under the gateway's sandbox policy.
   const opened = context.waitForEvent('page');
   await page.locator('.review-action[data-kind="open"]').click();

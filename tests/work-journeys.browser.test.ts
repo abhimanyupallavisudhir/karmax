@@ -73,7 +73,7 @@ describe('self-hosted console journeys (real gateway, mock agent)', () => {
     const project = await consoleRequest(context, url, 'POST', '/api/projects', { name: 'Journey',
       config: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false } });
     try {
-      // "All": the agent's task needs nothing from us, so "For me" would not list it.
+      // Every task: the agent's task needs nothing from us, so "For me" would not list it.
       await step('open the project', () => page.goto(`${url}/personal/journey?q=`));
       await page.locator('#new-task').fill('@write journey.txt :: shipped from the console');
       await page.locator('#new-task').press('Control+Enter');

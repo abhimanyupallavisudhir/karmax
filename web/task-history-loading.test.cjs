@@ -27,7 +27,7 @@ async function main() {
     projectById: () => ({ organizationId: 'org' }),
     renderTaskLoadingPage: () => {},
     renderTaskPage: () => { if (c.S.view) paints.push(c.S.taskEvents.length); },
-    pendingCancellationView: v => v, defaultTaskTab: () => 'checkin',
+    pendingCancellationView: v => v, defaultTaskTab: () => 'checkin', taskTabOf: (key) => key,
     scheduleTaskPageRender: () => c.renderTaskPage(),
     loadParamDefaults: async () => ({}), syncLiveWatch: () => {}, markTaskAsksRead: () => {}, toast: message => { throw new Error(message); },
     api: async url => {
@@ -38,7 +38,7 @@ async function main() {
       return [];
     },
   });
-  vm.runInContext(['explanationsEnabled', 'mergeTaskHistory', 'refreshTaskHistory', 'showsTaskApprovals', 'showDraftPage', 'openTask'].map(extract).join('\n'), c);
+  vm.runInContext(['explanationsEnabled', 'mergeTaskHistory', 'refreshTaskHistory', 'showsTaskApprovals', 'showDraftPage', 'isSeries', 'openTask'].map(extract).join('\n'), c);
   let opened = false;
   const opening = c.openTask('task', 'checkin').then(() => { opened = true; });
   await tick();

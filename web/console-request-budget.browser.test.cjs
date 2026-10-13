@@ -117,11 +117,12 @@ const report = process.env.REQUEST_BUDGET_REPORT === '1';
       await page.locator('#tp-body').waitFor();
     }));
     console.log(`j/k walk ended at ${walkedTo}`);
-    // Approval requests load for the tab that lists them, not for every task open.
+    // Approval requests load for the history that lists them, not for every task open.
     record(await measure('approvals tab', async () => {
-      await page.locator('[data-tasktab="approvals"]').click();
-      await page.locator('#task-approval-requests').waitFor();
+      await page.locator('#approval-history-open').click();
+      await page.locator('#task-approval-history .approval-list').waitFor();
     }));
+    await page.keyboard.press('Escape');
     await page.evaluate(() => { history.pushState({ kx: 1 }, '', '/org/workspace'); dispatchEvent(new PopStateEvent('popstate')); });
     await page.locator('[data-id="t1"]').waitFor();
     await settle();
@@ -202,7 +203,7 @@ const report = process.env.REQUEST_BUDGET_REPORT === '1';
       assert.equal(walkedTo, '/org/workspace/tasks/5', 'every j/k press counts, even before the last task loaded');
       budget('j/k walk (5 keys)', 8, 1);
       for (const list of ['/api/vault/requests', '/api/permission-requests', '/api/authorization-requests'])
-        assert.equal(results['approvals tab'].counts[`GET ${list}`], 1, `the Approvals tab loads ${list}`);
+        assert.equal(results['approvals tab'].counts[`GET ${list}`], 1, `the approval history loads ${list}`);
     }
     console.log('Console request budgets: ok');
   } finally { await browser.close(); }

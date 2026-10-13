@@ -5432,20 +5432,10 @@ export class Gateway {
         const id = editMatch[1]!;
         const t = (await store.getTask(id));
         if (!t) return this.json(res, 404, { error: 'no such task' });
-        // A waiting (armed) task or a repeatable series hasn't started its own
-        // workflow — edit its stored params + triggers in place, then re-arm (or
-        // drop to a draft). `keepArmed:false` (Save as draft) disarms it.
         const attenuation = { allowAttenuation: b.allowAttenuation === true, acceptAttenuation: attenuationAcceptance(b.acceptAttenuation) };
-        if (t.params?.triggerState === 'armed' || t.params?.repeatable) {
-          try {
-            const updated = await api.updateArmedParams(token, id, b.params ?? {}, { replace: b.replace === true, keepArmed: b.keepArmed !== false, ...attenuation });
-            return this.json(res, 200, updated);
-          } catch (e) {
-            return this.json(res, grantRefusal(e).code ? 403 : 400, { error: e instanceof Error ? e.message : String(e), ...grantRefusal(e) });
-          }
-        }
         // A draft has no running workflow — edit its stored params in place; they
-        // re-resolve at queue time (SPEC §10.4).
+        // re-resolve at queue time (SPEC §10.4). Checked first: a draft with
+        // Repeatable ticked or a schedule stays a draft until it is run.
         if (t.params?.draft) {
           try {
             // Use the same full-form replacement path as armed tasks. Besides
@@ -5459,6 +5449,17 @@ export class Gateway {
             return this.json(res, 200, updated);
           } catch (e) {
             return this.json(res, grantRefusal(e).code ? 403 : 409, { error: e instanceof Error ? e.message : String(e), ...grantRefusal(e) });
+          }
+        }
+        // A waiting (armed) task or a repeatable series hasn't started its own
+        // workflow — edit its stored params + triggers in place, then re-arm (or
+        // drop to a draft). `keepArmed:false` (Save as draft) disarms it.
+        if (t.params?.triggerState === 'armed' || t.params?.repeatable) {
+          try {
+            const updated = await api.updateArmedParams(token, id, b.params ?? {}, { replace: b.replace === true, keepArmed: b.keepArmed !== false, ...attenuation });
+            return this.json(res, 200, updated);
+          } catch (e) {
+            return this.json(res, grantRefusal(e).code ? 403 : 400, { error: e instanceof Error ? e.message : String(e), ...grantRefusal(e) });
           }
         }
         // Once queued, params are frozen except the ones the workflow declares

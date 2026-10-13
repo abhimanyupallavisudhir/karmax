@@ -24,10 +24,19 @@ describe.skipIf(!url)('identity store on PostgreSQL', () => {
     await admin.connect();
     try {
       expect(pool.idleCount).toBeGreaterThan(0);
-      const { rowCount } = await admin.query(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-        WHERE application_name = 'karmax' AND usename = current_user AND pid <> pg_backend_pid()`);
-      expect(rowCount).toBeGreaterThan(0);
-      await expect.poll(() => pool.idleCount, { timeout: 5_000 }).toBe(0);
+      // This pool's idle backends only: other files in this process may hold
+      // 'karmax' connections, and a client checked out right now (better-auth's
+      // background schema check) has no idle-error listener, so killing it is
+      // not what this tests and lands in uncaughtException.
+      const idle = (pool as unknown as { _idle: Array<{ client: { processID: number } }> })._idle;
+      const pids = idle.map((item) => item.client.processID);
+      // The pool reports each lost idle connection as an 'error' and drops it;
+      // count those, since better-auth may open another connection meanwhile.
+      const lost: unknown[] = [];
+      pool.on('error', (error) => { lost.push(error); });
+      const { rowCount } = await admin.query('SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid = ANY($1::int[])', [pids]);
+      expect(rowCount).toBe(pids.length);
+      await expect.poll(() => lost.length, { timeout: 5_000 }).toBe(pids.length);
       expect(uncaught).toEqual([]);
       // The pool replaces the lost connection on the next query.
       expect((await pool.query('SELECT 1 AS one')).rows).toEqual([{ one: 1 }]);

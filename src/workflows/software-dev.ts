@@ -311,6 +311,9 @@ const MAX_SHELL_NUDGES = 3;
 /** Transient GitHub/API failures are retried automatically, but unlike a real
  * pending check they are not allowed to disguise a permanent outage forever. */
 const MAX_GITHUB_ERROR_POLLS = 3;
+/** How often a final integration verification that ends by pausing (for its
+ * tests) is resumed for its decision before it goes to human Review instead. */
+const INTEGRATION_REVIEW_RESUMES = 3;
 /** Landing repairs are automatic, but after this many consecutive failures a
  * person is asked for guidance instead of spending agent turns—and, from v1.17,
  * blocking the front landing slot—forever. */
@@ -1573,13 +1576,37 @@ async function softwareDevImpl(
       if (msgs.length > messagesAtWait) return 'do';
     }
 
+    // While the proposal waits for its reviewer, a GitHub change (a check
+    // finished, the target moved) is checked the way landing would check it: a
+    // failure or conflict the agent must repair goes back to Do now rather than
+    // after someone approved a red proposal (#612: CI red at 19:50, approved at
+    // 20:33, repaired only then). Returns the repair request, if any.
+    async function awaitReview(ready: () => boolean): Promise<string | undefined> {
+      const watchesCi = fairLanding && githubAuthoritativeMerge && prs.length > 0 && !!world
+        && patched('software-dev-review-ci-repair-v1');
+      for (;;) {
+        const providerSeen = providerChangeEpoch;
+        await waitServing(() => ready() || (watchesCi && providerChangeEpoch !== providerSeen));
+        if (!watchesCi || ready()) return undefined;
+        const ci = await core.mergeGithubPrs(world!, prs, { mode: 'review-ci' }).catch(() => undefined);
+        if (ready()) return undefined;
+        if (ci?.status === 'needs-revision')
+          return `${ci.detail ?? 'The pull request needs a repair.'}\nThis came up while the proposal waited for Review, so it goes back to you before anyone approves it. Repair it, verify it, then call open_pr again; Review will show the repaired head.`;
+      }
+    }
+    const repairBeforeReview = (text: string): 'do' => {
+      msgs.push({ id: `review-ci-${msgs.length}`, role: 'user', text, ts: msgs.length });
+      return 'do';
+    };
+
     if (input.parentTaskId) {
       waitingFor = { kind: 'parent' };
       await notifyParent(options.raise?.type ?? 'needs_confirmation', reviewInfo?.summary);
       await publish();
-      await waitServing(() => confirmed || cancelled || mainUnreadSince(options.messagesSeen));
+      const repair = await awaitReview(() => confirmed || cancelled || mainUnreadSince(options.messagesSeen));
       waitingFor = undefined;
       if (cancelled) return 'cancelled';
+      if (repair) return repairBeforeReview(repair);
       if (!confirmed) return 'do';
       if (multiPrEnabled && world)
         checkoutApprovals = approveAll(worldRepos(world as any), checkoutHeads, checkoutApprovals);
@@ -1649,9 +1676,10 @@ async function softwareDevImpl(
           if (approved && confirmEpoch === epoch && !mainUnreadSince(options.messagesSeen) && !cancelled)
             confirmed = true;
         }
-        await waitServing(() => confirmed || cancelled || mainUnreadSince(options.messagesSeen) || confirmEpoch !== epoch);
+        const repair = await awaitReview(() => confirmed || cancelled || mainUnreadSince(options.messagesSeen) || confirmEpoch !== epoch);
         waitingFor = undefined;
         if (cancelled) return 'cancelled';
+        if (repair) return repairBeforeReview(repair);
         if (confirmEpoch !== epoch) { layerIndex = 0; confirmed = false; continue; }
         if (!confirmed) return 'do';
         if (multiPrEnabled && world)
@@ -3292,7 +3320,32 @@ Inspect the complete current diff and specifically compare its delta from the re
 - action:"revise" with actionable text when you can repair it in your next Do turn;
 - action:"reject" when the delta is ambiguous, materially changes scope/behavior, or needs a human decision. A reject here escalates to human Review; it does not cancel the task.`;
       msgs.push({ id: `integration-${msgs.length}`, role: 'user', text: prompt, ts: msgs.length });
-      const turn = await doTurn();
+      let turn = await doTurn();
+      // A verification that pauses for its tests (a durable job, or a timer) is
+      // resumed for its decision when they finish, as a Do turn is: ending it
+      // without one sent an intact candidate back to human Review (#610).
+      for (let resumes = 0; !turn.confirmDecision && resumes < INTEGRATION_REVIEW_RESUMES
+        && !cancelled && patched('software-dev-integration-review-pause-v1'); resumes++) {
+        const reminder = unattendedJobsReminder(turn);
+        let note: string | undefined;
+        if (turn.wait && !turn.wait.needsInput) {
+          const held = { status, waitingFor };
+          note = await waitForAgent(turn.wait, {
+            world,
+            ...(input.waitMinuteMs ? { minuteMs: input.waitMinuteMs } : {}),
+            park: async (next) => { status = 'waiting'; waitingFor = next; await publish(); },
+            interrupted: () => cancelled || mainUnread(),
+          });
+          ({ status, waitingFor } = held);
+          await publish();
+          if (cancelled) break;
+          note = `${note ?? '(Resumed: your wait was interrupted by the message above.)'}\n\nFinish this verification: call confirm_decision exactly once.`;
+        } else if (reminder) {
+          note = reminder;
+        } else break;
+        msgs.push({ id: `integration-wait-${msgs.length}`, role: 'user', text: note, ts: msgs.length });
+        turn = await doTurn();
+      }
       const decision = turn.confirmDecision;
       if (decision?.action === 'confirm') return 'confirm';
       if (decision?.action === 'revise') {
@@ -4474,6 +4527,21 @@ Inspect the complete current diff and specifically compare its delta from the re
         // front landing slot.
         if (multiPrEnabled && world)
           checkoutApprovals = approveAll(worldRepos(world as any), checkoutHeads, checkoutApprovals);
+        break;
+      }
+      if (fairLanding && repairValidationPending
+        && patched('software-dev-fair-landing-no-repair-self-review-v1')) {
+        // Under fair landing nothing holds a slot for this repair, and CI has
+        // not run on its head yet. The check that turn did was the Do agent
+        // re-reading its own repair, told it was the final verification at the
+        // front of a queue; it sent a merely-behind branch back to Do although
+        // landing updates one itself, and a turn that ended without a decision
+        // dropped the task back to human Review. The repaired head lands as any
+        // head does: CI on it, branch protection, and the head-bound merge.
+        repairValidationPending = false;
+        landing = { ...landing, validation: 'pending', provider: 'admitting', detail: 'The repaired proposal is requesting landing again.' };
+        if (multiPrEnabled && world)
+          checkoutApprovals = approveAll(worldRepos(world), checkoutHeads, checkoutApprovals);
         break;
       }
       if (intentAuthorizedLanding && repairValidationPending) {

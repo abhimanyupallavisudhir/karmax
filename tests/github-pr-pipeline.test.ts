@@ -46,8 +46,14 @@ let releaseFrontHeldRepair: (() => void) | undefined;
 let frontHeldRepairGate: Promise<void> = Promise.resolve();
 const exactCandidateTurns: { role: string; session?: string; messages: string[] }[] = [];
 let exactCandidateRevisions = 0;
+// #610: the verification starts its tests as a job and pauses for them once.
+let exactCandidatePauses = 0;
 // Task 389: an integration turn does not make CI green; only a new run can.
 let ciStaysRedThroughIntegration = false;
+// A Do repair that really fixes CI: its new head comes back green.
+let repairFixesCi = false;
+// The target branch's own latest push run of the CI workflow (run 50).
+let targetRunConclusion: string | undefined;
 let actionsHaveSteps = true;
 let actionsRunAttempt = 1;
 let actionsReruns = 0;
@@ -115,6 +121,25 @@ const fetcher = (async (url: string, init: RequestInit = {}) => {
     head_sha: prs[0]?.head?.sha, html_url: `https://github.com/${SLUG}/actions/runs/42`,
     created_at: '2026-08-10T00:00:00Z', updated_at: '2026-08-10T00:01:00Z',
   });
+  if (u.pathname === `/repos/${SLUG}/actions/workflows/7/runs` && method === 'GET' && u.searchParams.get('event') === 'push')
+    return json(200, { total_count: targetRunConclusion ? 1 : 0, workflow_runs: targetRunConclusion ? [{
+      id: 50, name: 'CI', workflow_id: 7, run_number: 9, run_attempt: 1, event: 'push', status: 'completed',
+      conclusion: targetRunConclusion, head_branch: u.searchParams.get('branch'), head_sha: 'target-tip',
+      html_url: `https://github.com/${SLUG}/actions/runs/50`,
+      created_at: '2026-08-10T00:00:00Z', updated_at: '2026-08-10T00:01:00Z',
+    }] : [] });
+  if (u.pathname === `/repos/${SLUG}/actions/runs/50` && method === 'GET') return json(200, {
+    id: 50, name: 'CI', workflow_id: 7, run_number: 9, run_attempt: 1, event: 'push', status: 'completed',
+    conclusion: targetRunConclusion, head_branch: 'main', head_sha: 'target-tip',
+    html_url: `https://github.com/${SLUG}/actions/runs/50`, created_at: '2026-08-10T00:00:00Z', updated_at: '2026-08-10T00:01:00Z',
+  });
+  if (u.pathname === `/repos/${SLUG}/actions/runs/50/jobs` && method === 'GET') return json(200, { jobs: [{
+    id: 98, name: 'unit tests', status: 'completed', conclusion: targetRunConclusion,
+    html_url: `https://github.com/${SLUG}/actions/runs/50/job/98`,
+    steps: [{ number: 3, name: 'Run tests', status: 'completed', conclusion: targetRunConclusion }],
+  }] });
+  if (u.pathname === `/repos/${SLUG}/actions/runs/50/artifacts` && method === 'GET') return json(200, { artifacts: [] });
+  if (u.pathname === `/repos/${SLUG}/actions/jobs/98/logs` && method === 'GET') return new Response('FAIL on the target too\n');
   if (u.pathname === `/repos/${SLUG}/actions/workflows/7/runs` && method === 'GET') return json(200, {
     total_count: actionsReplacementSuccess ? 2 : 1, workflow_runs: [{
       id: 42, name: 'CI', workflow_id: 7, run_number: 1, run_attempt: actionsRunAttempt,
@@ -317,8 +342,16 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
             }],
           }, ctx);
         }
-        if (input.role === 'do'
+        if (input.role === 'do' && exactCandidatePauses > 0
           && input.messages.at(-1)?.text.includes('FINAL AUTOMATED INTEGRATION verification')) {
+          exactCandidatePauses--;
+          exactCandidateTurns.push({ role: input.role, session: input.session, messages: input.messages.map((message) => message.text) });
+          return mock.runTurn({ ...input, messages: [...input.messages, { id: `integration-tests-${input.messages.length}`,
+            role: 'user', text: '@job sleep 0.3\n@pause 1 :: last', ts: input.messages.length }] }, ctx);
+        }
+        if (input.role === 'do'
+          && (input.messages.at(-1)?.text.includes('FINAL AUTOMATED INTEGRATION verification')
+            || input.messages.at(-1)?.text.includes('Finish this verification'))) {
           exactCandidateTurns.push({
             role: input.role,
             session: input.session,
@@ -334,6 +367,19 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
               id: `integration-verdict-${input.messages.length}`,
               role: 'user',
               text: verdict,
+              ts: input.messages.length,
+            }],
+          }, ctx);
+        }
+        if (input.role === 'do' && repairFixesCi
+          && /repair it against the newest target|before anyone approves it/.test(input.messages.at(-1)?.text ?? '')) {
+          githubReadiness = {};
+          return mock.runTurn({
+            ...input,
+            messages: [...input.messages, {
+              id: `ci-repair-${input.messages.length}`,
+              role: 'user',
+              text: '@write repaired.md :: CI repaired\n@openpr',
               ts: input.messages.length,
             }],
           }, ctx);
@@ -407,6 +453,8 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     exactCandidateTurns.length = 0;
     exactCandidateRevisions = 0;
     ciStaysRedThroughIntegration = false;
+    repairFixesCi = false;
+    targetRunConclusion = undefined;
     actionsHaveSteps = true;
     actionsRunAttempt = 1;
     actionsReruns = 0;
@@ -1513,6 +1561,50 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     }
   }, 120_000);
 
+  it('resumes an exact-candidate verification that pauses for its tests, instead of asking for human Review (#610)', async () => {
+    const repo = await repoWithOrigin('github-verification-pause');
+    const project = (await h.store.createProject('Verification pause', { repos: [repo], remote: 'pr' }));
+    const connection = (await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: '57', accountLogin: 'acme', accountType: 'Organization' }));
+    const enrolled = (await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '92',
+      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id }));
+    (await h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Verify after tests', workflow: 'software-dev',
+      workflowVersion: '1.18.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+      createdBy: { kind: 'user', userId: 'a' } }));
+    githubReadiness = {};
+    exactCandidateTurns.length = 0;
+    exactCandidatePauses = 1;
+    const handle = await h.client.workflow.start('softwareDev@1.18.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: task.id,
+      args: [{
+        taskId: task.id, projectId: project.id, title: 'Verify after tests',
+        prompt: '@write verified.md :: exact candidate\n@review Ready', base: 'main', target: 'main',
+        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' },
+        githubPollMs: 10, waitMinuteMs: 50,
+      }],
+    });
+    try {
+      await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+      await handle.signal('confirm');
+      // Once approved it never comes back to a person: the paused verification
+      // is resumed in the same session when its job finishes, and confirms.
+      await expect.poll(() => exactCandidatePauses, { timeout: 30_000, interval: 20 }).toBe(0);
+      await expect.poll(async () => (await view(handle)).stage, { timeout: 60_000, interval: 20 })
+        .toSatisfy((stage: string) => stage === 'done' || stage === 'review');
+      expect((await view(handle)).stage).toBe('done');
+      expect(await handle.result()).toMatchObject({ stage: 'done', sha: expect.any(String) });
+      expect(exactCandidatePauses).toBe(0);
+      expect(exactCandidateTurns).toHaveLength(2);
+      expect(new Set(exactCandidateTurns.map((turn) => turn.session)).size).toBe(1);
+      expect(exactCandidateTurns[1]!.messages.at(-1)).toMatch(/your job has finished[\s\S]*Finish this verification/);
+      expect((await view(handle)).landing).toMatchObject({ authorization: 'authorized', validation: 'passed' });
+    } finally {
+      exactCandidatePauses = 0;
+    }
+  }, 120_000);
+
   it('v1.20 releases fallback admission before a CI repair and rejoins only after open_pr', async () => {
     const repo = await repoWithOrigin('github-fair-ejection');
     const project = (await h.store.createProject('Fair landing ejection', { repos: [repo], remote: 'pr' }));
@@ -1563,6 +1655,246 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
 
     await handle.signal('cancel');
     await expect(handle.result()).resolves.toMatchObject({ stage: 'cancelled' });
+  }, 120_000);
+
+  // Production 2026-10-09..12: every CI repair under fair landing was followed
+  // by a second Do turn told it was the "FINAL AUTOMATED INTEGRATION
+  // verification ... at the front of the landing queue", before CI had run on
+  // the repaired head and with no queue slot held. The same agent re-checked its
+  // own repair; when the target had moved it sent the task back to Do again,
+  // although landing updates a merely-behind branch itself, and a check that
+  // ended without a decision dropped the task back to human Review.
+  it('v1.29 lands a CI repair through CI and the landing checks, without a second self-verification turn', async () => {
+    const repo = await repoWithOrigin('github-fair-repair-lands');
+    const project = (await h.store.createProject('Fair repair lands', { repos: [repo], remote: 'pr' }));
+    const connection = (await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: 'fair-repair', accountLogin: 'acme', accountType: 'Organization' }));
+    const enrolled = (await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+      providerId: 'fair-repair-repo', owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main',
+      private: true, gitConnectionId: connection.id }));
+    (await h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Repair and land', workflow: 'software-dev',
+      workflowVersion: '1.29.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+      createdBy: { kind: 'user', userId: 'a' } }));
+    const handle = await h.client.workflow.start('softwareDev@1.29.0', {
+      taskQueue: TASK_QUEUE, workflowId: task.id, args: [{
+        taskId: task.id, projectId: project.id, title: task.title,
+        prompt: '@write proposal.md :: proposal\n@review Ready', base: 'main', target: 'main',
+        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' }, githubPollMs: 10,
+      }],
+    });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    actionsJobConclusion = 'failure';
+    actionsJobLog = 'FAIL tests/proposal.test.ts > a real defect\nAssertionError: expected 1 to be 2\n';
+    githubReadiness = {
+      mergeStateStatus: 'UNSTABLE',
+      statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
+        __typename: 'CheckRun', name: 'unit tests', status: 'COMPLETED', conclusion: 'FAILURE',
+        detailsUrl: `https://github.com/${SLUG}/actions/runs/42/job/99`,
+      }] } },
+    };
+    repairFixesCi = true;
+    const reviewed = prs[0].head.sha;
+    await handle.signal('confirm');
+
+    expect(await handle.result()).toMatchObject({ stage: 'done' });
+    expect(prs[0].head.sha).not.toBe(reviewed);
+    const origin = remoteBySlug.get(SLUG)!;
+    expect(await gitOrThrow(origin, ['show', 'main:repaired.md'])).toBe('CI repaired');
+    const events = await h.store.eventsSince(task.id, 0);
+    expect(events.filter((event) => event.type === 'github.ci.repair-requested')).toHaveLength(1);
+    // No verification turn, no Merge-stage confirm wait, no second human Review.
+    expect(exactCandidateTurns).toEqual([]);
+    const views = events.filter((event) => event.type === 'view.updated').map((event) => event.payload);
+    expect(views.filter((payload: any) => payload.stage === 'merge' && payload.waitingFor === 'confirm')).toEqual([]);
+    const landingStarted = views.findIndex((payload: any) => payload.stage === 'merge');
+    expect(landingStarted).toBeGreaterThan(0);
+    expect(views.slice(landingStarted).filter((payload: any) => payload.stage === 'review')).toEqual([]);
+    expect((await view(handle)).landing).toMatchObject({ authorization: 'authorized', validation: 'passed' });
+  }, 120_000);
+
+  // #597, #553 and others (2026-10-10..11): the upgrade rehearsal failed on
+  // master itself. Every open PR failed it too, and each woke its Do agent to
+  // find "not my change"; the fix then had to be merged into each by hand.
+  it('waits for a target that fails the same check, then brings its fix in without waking Do', async () => {
+    const repo = await repoWithOrigin('github-target-red');
+    const project = (await h.store.createProject('Target red', { repos: [repo], remote: 'pr' }));
+    const connection = (await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: 'target-red', accountLogin: 'acme', accountType: 'Organization' }));
+    const enrolled = (await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+      providerId: 'target-red-repo', owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main',
+      private: true, gitConnectionId: connection.id }));
+    (await h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Behind a red target', workflow: 'software-dev',
+      workflowVersion: '1.29.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+      createdBy: { kind: 'user', userId: 'a' } }));
+    const handle = await h.client.workflow.start('softwareDev@1.29.0', {
+      taskQueue: TASK_QUEUE, workflowId: task.id, args: [{
+        taskId: task.id, projectId: project.id, title: task.title,
+        prompt: '@write red.md :: proposal\n@review Ready', base: 'main', target: 'main',
+        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' }, githubPollMs: 10,
+      }],
+    });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    actionsJobConclusion = 'failure';
+    actionsJobLog = 'FAIL rehearse > restore leaves the app unhealthy\n';
+    targetRunConclusion = 'failure';
+    githubReadiness = {
+      mergeStateStatus: 'UNSTABLE',
+      statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
+        __typename: 'CheckRun', name: 'unit tests', status: 'COMPLETED', conclusion: 'FAILURE',
+        detailsUrl: `https://github.com/${SLUG}/actions/runs/42/job/99`,
+      }] } },
+    };
+    const reviewed = prs[0].head.sha;
+    const turnsBefore = (await h.store.eventsSince(task.id, 0)).filter((event) => event.type === 'turn.prompt').length;
+    await handle.signal('confirm');
+
+    await expect.poll(async () => (await view(handle)).waitingFor?.detail ?? '', { timeout: 30_000 })
+      .toMatch(/"main" fails the same check/);
+    const waiting = await view(handle);
+    expect(waiting.stage).toBe('merge');
+    expect(waiting.waitingFor?.detail).toContain(`https://github.com/${SLUG}/actions/runs/50`);
+    let events = await h.store.eventsSince(task.id, 0);
+    expect(events.filter((event) => event.type === 'github.ci.repair-requested')).toEqual([]);
+    expect(events.filter((event) => event.type === 'github.ci.target-red')).toHaveLength(1);
+    expect(actionsReruns).toBe(0);
+
+    // The target is fixed: a new commit, and its own run passes.
+    const origin = remoteBySlug.get(SLUG)!;
+    const fixed = (await gitOrThrow(origin, ['-c', 'user.name=Neighbour', '-c', 'user.email=neighbour@example.test',
+      'commit-tree', 'main^{tree}', '-p', 'main', '-m', 'Fix the restore on the target'])).trim();
+    await gitOrThrow(origin, ['update-ref', 'refs/heads/main', fixed]);
+    targetRunConclusion = 'success';
+    afterBranchUpdate = () => { githubReadiness = {}; };
+
+    expect(await handle.result()).toMatchObject({ stage: 'done' });
+    expect(branchUpdates).toBe(1);
+    expect(prs[0].head.sha).not.toBe(reviewed);
+    events = await h.store.eventsSince(task.id, 0);
+    expect(events.filter((event) => event.type === 'github.ci.repair-requested')).toEqual([]);
+    expect(events.filter((event) => event.type === 'turn.prompt')).toHaveLength(turnsBefore);
+  }, 120_000);
+
+  // task_mv4cq5d21b04c13faf (2026-10-11): the code PR landed while the wiki PR
+  // still waited, and the wiki PR then conflicted: half the task was on master
+  // and the other half went back to Do. Fallback landing merged each pull
+  // request the moment it alone was ready.
+  it('lands no fallback pull request of a task until every one of them is ready', async () => {
+    const slugA = 'acme/together-a';
+    const slugB = 'acme/together-b';
+    const repoA = await repoWithOrigin('together-a', slugA);
+    const repoB = await repoWithOrigin('together-b', slugB);
+    const project = (await h.store.createProject('Land together', { repos: [repoA, repoB], remote: 'pr' }));
+    const connection = (await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: 'together-installation', accountLogin: 'acme', accountType: 'Organization' }));
+    for (const [providerId, name, slug] of [['together-a', 'together-a', slugA], ['together-b', 'together-b', slugB]] as const) {
+      const enrolled = (await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+        providerId, owner: 'acme', name, sshUrl: `git@github.com:${slug}.git`, defaultBranch: 'main', private: true,
+        gitConnectionId: connection.id }));
+      (await h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+    }
+    githubReadinessBySlug.set(slugB, {
+      mergeStateStatus: 'CLEAN',
+      statusCheckRollup: { state: 'PENDING', contexts: { nodes: [] } },
+    });
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Land two together', workflow: 'software-dev',
+      workflowVersion: '1.29.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+      createdBy: { kind: 'user', userId: 'a' } }));
+    const nameA = path.basename(repoA);
+    const nameB = path.basename(repoB);
+    const handle = await h.client.workflow.start('softwareDev@1.29.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: task.id,
+      args: [{
+        taskId: task.id, projectId: project.id, title: 'Land two together',
+        prompt: `@write ${nameA}/a.md :: A\n@write ${nameB}/b.md :: B\n`
+          + `@run git -C ${nameA} add -A && git -C ${nameA} commit -q -m A\n`
+          + `@run git -C ${nameB} add -A && git -C ${nameB} commit -q -m B\n@openpr`,
+        base: 'main', target: 'main',
+        project: { repos: [repoA, repoB], defaultBase: 'main', defaultTarget: 'main', remote: 'pr', landingAuthority: 'auto' },
+        githubPollMs: 10,
+      }],
+    });
+
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    await handle.signal('confirm');
+    await expect.poll(async () => (await view(handle)).waitingFor?.detail ?? '', { timeout: 30_000 })
+      .toMatch(/required checks/);
+    // Several more landing passes while B's checks run: A must not land alone.
+    for (let i = 0; i < 3; i++) {
+      await handle.signal('providerChanged');
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+    expect(prs.find((candidate) => candidate.repo === slugA)?.merged_at).toBeFalsy();
+    expect(prs.find((candidate) => candidate.repo === slugB)?.merged_at).toBeFalsy();
+
+    githubReadinessBySlug.set(slugB, {
+      mergeStateStatus: 'CLEAN',
+      statusCheckRollup: { state: 'SUCCESS', contexts: { nodes: [] } },
+    });
+    await handle.signal('providerChanged');
+    await expect(handle.result()).resolves.toMatchObject({ stage: 'done' });
+    expect(prs.find((candidate) => candidate.repo === slugA)?.merged_at).toBeTruthy();
+    expect(prs.find((candidate) => candidate.repo === slugB)?.merged_at).toBeTruthy();
+  }, 120_000);
+
+  // #612 (2026-10-12): CI failed at 19:50 while the proposal waited for
+  // Review; the owner approved it at 20:33 and only then did the repair start.
+  it('sends a CI failure found while Review waits to Do before anyone approves', async () => {
+    const repo = await repoWithOrigin('github-review-ci');
+    const project = (await h.store.createProject('Review CI', { repos: [repo], remote: 'pr' }));
+    const connection = (await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: 'review-ci', accountLogin: 'acme', accountType: 'Organization' }));
+    const enrolled = (await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+      providerId: 'review-ci-repo', owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main',
+      private: true, gitConnectionId: connection.id }));
+    (await h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Red during Review', workflow: 'software-dev',
+      workflowVersion: '1.29.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+      createdBy: { kind: 'user', userId: 'a' } }));
+    const handle = await h.client.workflow.start('softwareDev@1.29.0', {
+      taskQueue: TASK_QUEUE, workflowId: task.id, args: [{
+        taskId: task.id, projectId: project.id, title: task.title,
+        prompt: '@write review.md :: proposal\n@review Ready', base: 'main', target: 'main',
+        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' }, githubPollMs: 10,
+      }],
+    });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    const reviewed = prs[0].head.sha;
+    // Pending checks wake Review too, and change nothing.
+    githubReadiness = { statusCheckRollup: { state: 'PENDING', contexts: { nodes: [] } } };
+    await handle.signal('providerChanged');
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect((await view(handle)).stage).toBe('review');
+
+    actionsJobConclusion = 'failure';
+    actionsJobLog = 'FAIL tests/review.test.ts > a real defect\nAssertionError: expected 1 to be 2\n';
+    githubReadiness = {
+      mergeStateStatus: 'UNSTABLE',
+      statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
+        __typename: 'CheckRun', name: 'unit tests', status: 'COMPLETED', conclusion: 'FAILURE',
+        detailsUrl: `https://github.com/${SLUG}/actions/runs/42/job/99`,
+      }] } },
+    };
+    repairFixesCi = true;
+    await handle.signal('providerChanged');
+
+    // Back in Review with the repaired head, which nobody has approved yet.
+    await expect.poll(async () => {
+      const current = await view(handle);
+      return current.stage === 'review' && prs[0].head.sha !== reviewed;
+    }, { timeout: 30_000 }).toBe(true);
+    const repairPrompt = (await view(handle)).messages.map((message: any) => message.text).join('\n');
+    expect(repairPrompt).toMatch(/unit tests[\s\S]*before anyone approves it/);
+    const beforeConfirm = (await h.store.eventsSince(task.id, 0)).at(-1)?.seq ?? 0;
+    await handle.signal('confirm');
+    expect(await handle.result()).toMatchObject({ stage: 'done' });
+    const events = await h.store.eventsSince(task.id, 0);
+    expect(events.filter((event) => event.type === 'github.ci.repair-requested')).toHaveLength(1);
+    // Landing found nothing left to repair.
+    expect((await h.store.eventsSince(task.id, beforeConfirm)).filter((event) => event.type === 'view.updated'
+      && event.payload?.stage === 'do')).toEqual([]);
   }, 120_000);
 
   it('v1.21 gives each repository its own landing owner and leases only the fallback target', async () => {

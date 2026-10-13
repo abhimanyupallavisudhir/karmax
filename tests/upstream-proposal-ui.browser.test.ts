@@ -19,7 +19,7 @@ const view = {
     detail: `[Open the pull request on acme/widgets](${compare})\n\nTo skip this step next time, [save a GitHub token](/profile#github-token).` },
 };
 
-it('shows the upstream pull-request ask as working links, on the overview and in the conversation', async () => {
+it('shows the upstream pull-request ask as working links in the conversation', async () => {
   const ui = await consolePage({ api: (call) => {
     const path = call.path.split('?')[0]!;
     if (path === '/api/tasks/fixture') return view;
@@ -35,7 +35,7 @@ it('shows the upstream pull-request ask as working links, on the overview and in
       S.projects = [{ id: 'p1', slug: 'project', name: 'Project', organizationId: 'o1', config: {} }];
       S.projectId = 'p1'; S.organizationId = 'o1'; S.organizations = [{ id: 'o1', slug: 'org', name: 'Org' }];
       S.meta = { workflows: [] };
-      await openTask('fixture', 'overview');
+      await openTask('fixture', 'checkin');
     })()`);
     const open = ui.page.locator('a', { hasText: 'Open the pull request on acme/widgets' }).first();
     await open.waitFor();

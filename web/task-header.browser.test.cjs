@@ -1,7 +1,8 @@
-// Real browser regression: the task page header stays compact. Attempts sit on
-// one line with the New attempt action, priority and tags share the byline, and
-// the workflow name/version live on the Parameters tab only. Tasks open on
-// Check-in, its toolbar actions share one size, and a draft attempt opens its form.
+// Real browser regression: the task page header stays compact. The title, its
+// pull requests, its stage and the Chat/Parameters switch share one line;
+// attempts head the details rail with the New attempt action; priority and tags live
+// in the details rail; the workflow name/version live on Parameters only. Tasks
+// open on Chat, its toolbar actions share one size, and a draft attempt opens its form.
 // SCREENSHOT_DIR=<dir> also writes screenshots. APP_SOURCE can test the baseline.
 const { chromium } = require('playwright');
 const fs = require('node:fs');
@@ -71,20 +72,20 @@ const attempt = (n, extra = {}) => ({
       await page.locator(selector).screenshot({ path: path.join(process.env.SCREENSHOT_DIR, name) });
     };
 
-    await open('overview');
+    await open('checkin');
     await page.waitForSelector('.attempt-card');
     await shot('task-header-attempts.png');
     const layout = await page.evaluate(() => {
       const top = (el) => Math.round(el.getBoundingClientRect().top + el.getBoundingClientRect().height / 2);
       const head = document.querySelector('.tp-head');
-      const meta = head.querySelector('.meta');
       return {
         headText: head.innerText,
         workflowInHead: !!head.querySelector('#tp-workflow-mode'),
-        cardRows: new Set([...head.querySelectorAll('.attempt-card, #add-attempt')].map(top)).size,
-        cardHeight: Math.max(...[...head.querySelectorAll('.attempt-card')].map((el) => el.getBoundingClientRect().height)),
-        attemptChip: !!head.querySelector('.row1 .attempt-current'),
-        metaRows: new Set([...meta.querySelectorAll('.pr-link, .org-priority, .tag-assignment, .org-add-tag')].map(top)).size,
+        attemptsInHead: head.querySelectorAll('.attempt-card, #add-attempt').length,
+        attemptsFirstInRail: document.querySelector('#tp-rail .rail-inner > :first-child')?.querySelectorAll('.attempt-card').length,
+        cardHeight: Math.max(...[...document.querySelectorAll('#tp-rail .attempt-card')].map((el) => el.getBoundingClientRect().height)),
+        titleRows: new Set([...head.querySelectorAll('.row1 h2, .row1 .pr-link, .tp-stage, .tp-views, #tp-rail-toggle')].map(top)).size,
+        orgInRail: !!document.querySelector('#tp-rail .org-priority') && !head.querySelector('.org-priority'),
         headHeight: head.getBoundingClientRect().height,
       };
     });
@@ -102,20 +103,23 @@ const attempt = (n, extra = {}) => ({
     assert.doesNotMatch(layout.headText, /Software dev|v1\.26\.0/, 'workflow name and version are not in the header');
     assert.doesNotMatch(layout.headText, /\d+ attempts/, 'no attempt-count heading');
     assert.doesNotMatch(layout.headText, /no tags|Shown in task list/, 'no filler text');
-    assert.equal(layout.cardRows, 1, 'attempts and New attempt share one line');
+    assert.equal(layout.attemptsInHead, 0, 'attempts are not in the header');
+    assert.equal(layout.attemptsFirstInRail, 3, 'attempts head the details rail');
     assert.ok(layout.cardHeight <= 32, `attempt cards are single-line (${layout.cardHeight}px)`);
-    assert.equal(layout.attemptChip, false, 'the selected card marks the current attempt; no duplicate title chip');
-    assert.equal(layout.metaRows, 1, 'PR links, priority and tags share one line');
-    assert.ok(layout.headHeight <= 194, `header is compact (${layout.headHeight}px)`);
+    assert.equal(layout.titleRows, 1, 'the title, its pull requests, its stage and the view switch share one line');
+    assert.equal(layout.orgInRail, true, 'priority and tags live in the details rail');
+    assert.ok(layout.headHeight <= 120, `header is compact (${layout.headHeight}px)`);
 
     // Without a pinned tab a task opens on Check-in, whose toolbar is one quiet row.
     await open(undefined);
     await page.waitForSelector('#fork-task-agent');
-    assert.equal(await page.locator('.tp-tabs .tab.active').innerText(), 'Chat');
+    assert.equal(await page.locator('.tp-views .tab.active').innerText(), 'Chat');
+    assert.deepEqual(await page.locator('.tp-views .tab').allInnerTexts(), ['Chat', 'Parameters'], 'two views: the conversation and the parameters');
     await shot('task-checkin-toolbar.png', '.task-page .ck-pane-head');
-    const tools = await page.evaluate(() => [...document.querySelectorAll('.ck-tools .btn, #local-checkout')]
+    const tools = await page.evaluate(() => [...document.querySelectorAll('.ck-tools .btn')]
       .map((el) => Math.round(el.getBoundingClientRect().height)));
     assert.ok(tools.length === 4 && tools.every((h) => h === 28), `toolbar actions share one size (${tools})`);
+    assert.deepEqual(await page.locator('.ck-tools .btn').allInnerTexts().then((t) => t.slice(0, 3).map((x) => x.trim())), ['Share', 'Fork', 'Work locally'], 'Work locally sits beside Share and Fork');
 
     // The crown still selects the principal attempt and the note is a tooltip.
     const crownTitle = await page.locator('.attempt-crown.principal').getAttribute('title');
@@ -129,7 +133,7 @@ const attempt = (n, extra = {}) => ({
     assert.equal(await page.locator('.tp-head #tp-workflow-mode').count(), 0);
 
     // A draft attempt opens straight into its form.
-    await open('overview');
+    await open('checkin');
     await page.locator('[data-attempt-select="a2"]').click();
     await page.waitForSelector('#tf-page');
     assert.match(await page.evaluate(() => location.pathname), /\/tasks\/a2$/);
@@ -137,12 +141,12 @@ const attempt = (n, extra = {}) => ({
 
     // One attempt: no attempt strip, but New attempt remains reachable.
     group = { intentId: 'i1', principalAttemptId: 'a1', attempts: [records[0]] };
-    await open('overview');
-    await page.waitForSelector('#add-attempt');
+    await open('checkin');
+    await page.waitForSelector('#tp-rail #add-attempt');
     await shot('task-header-single.png');
     assert.equal(await page.locator('.attempt-card').count(), 0, 'a single attempt shows no navigation strip');
     const single = await page.evaluate(() => document.querySelector('.tp-head').getBoundingClientRect().height);
-    assert.ok(single <= 158, `single-attempt header is compact (${single}px)`);
+    assert.ok(single <= 76, `single-attempt header is compact (${single}px)`);
     await crumb.click();
     await page.waitForFunction(() => location.pathname === '/test/project');
 
