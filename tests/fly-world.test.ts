@@ -131,7 +131,7 @@ describe.skipIf(!sshdAvailable)('Fly.io worlds (fake Machines API, real sshd)', 
   it('deletes everything it made when provisioning fails', async () => {
     const failing = new VmWorldProvider(new FlyDriver(fly.fetch, 10), async () => connection(fly.token), undefined, {
       socket: fly.socket, user: os.userInfo().username, home: fly.home, provision: { stamp, script: 'echo broken >&2; exit 3', sudo: false } });
-    await expect(failing.create({ taskId: 'task_fail', base: 'main', generation: 1 })).rejects.toThrow(/provisioning the Fly.io machine failed: status 3[\s\S]*broken/);
+    await expect(failing.create({ taskId: 'task_fail', base: 'main', generation: 1 })).rejects.toThrow(/provisioning the Fly.io machine failed: the script exited with status 3:\nbroken/);
     expect(fly.apps.size).toBe(0);
   });
 

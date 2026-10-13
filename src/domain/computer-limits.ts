@@ -53,10 +53,13 @@ export interface ComputerFeatures {
   desktop: boolean;
   /** Outbound network limited to an allowlist (`network.unrestricted: false`). */
   allowlist: boolean;
+  /** Project setup baked into an image or snapshot (Project Settings →
+   * Environment); without it setup runs live in every new world. */
+  environmentBuilds: boolean;
 }
 
-const ALL_FEATURES: ComputerFeatures = { desktop: true, allowlist: true };
-const VM_FEATURES: ComputerFeatures = { desktop: false, allowlist: false };
+const ALL_FEATURES: ComputerFeatures = { desktop: true, allowlist: true, environmentBuilds: true };
+const VM_FEATURES: ComputerFeatures = { desktop: false, allowlist: false, environmentBuilds: false };
 
 /** One entry per cloud provider. A new provider (Fly.io, Hetzner…) adds its
  * documented facts here and, if its API can tell, a probe in provider-limits.ts. */

@@ -5,6 +5,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import ssh2 from 'ssh2';
+import { Readable } from 'node:stream';
 import { generateSshKeyPair, SshTransport } from '../src/world/vm/ssh.js';
 import { VmWorld } from '../src/world/vm/world.js';
 import type { WorldHandle, WorldPtyTermination } from '../src/world/types.js';
@@ -35,6 +36,36 @@ describe('VM world keys', () => {
  * codes, stdin for secrets, files, a PTY that carries a protocol line of any
  * size, reattach without losing or repeating a byte, previews — over SSH.
  */
+describe('VM file reads', () => {
+  // A finished SFTP read stream still closes its remote handle. When the
+  // connection closed first (a park drops it), ssh2 failed that request and the
+  // stream emitted an error nobody listened to: an uncaught exception in the
+  // worker (CI #1934, from hetzner-world's wake test).
+  it('leaves no stream erroring unheard when the connection closes before its handle does', async () => {
+    const transport = new SshTransport(async () => { throw new Error('unused'); });
+    (transport as any).sftp = async () => ({
+      // As ssh2's ReadStream: no auto-destroy, and on 'end' it closes its handle itself.
+      createReadStream: () => {
+        const stream = new Readable({
+          autoDestroy: false, emitClose: false,
+          read() { this.push(Buffer.from('content')); this.push(null); },
+          destroy(_error, callback) { setTimeout(() => callback(new Error('No response from server')), 10); },
+        });
+        stream.on('end', () => stream.destroy());
+        return stream;
+      },
+    });
+    const uncaught: unknown[] = [];
+    const record = (error: unknown) => { uncaught.push(error); };
+    process.prependListener('uncaughtException', record);
+    try {
+      expect((await transport.readFile('/home/user/notes.txt')).toString()).toBe('content');
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } finally { process.off('uncaughtException', record); }
+    expect(uncaught).toEqual([]);
+  });
+});
+
 describe.skipIf(!sshdAvailable)('VM world over SSH', () => {
   let sshd: LocalSshd;
   let transport: SshTransport;

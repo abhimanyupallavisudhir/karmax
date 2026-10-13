@@ -23,7 +23,7 @@ async function fixture() {
     meta: { computer: { diskGb: 100 }, machine: { cpu: 2, memoryMb: 2048, diskGb: 100 } } } as any, project.id) as WorldHandle;
   await store.setWorldState(handle, 'parked');
   const provider = {
-    kind: 'fly', parkable: true,
+    kind: 'fly', parkable: true, capabilities: { remote: true, pty: true, snapshots: true, ports: true, networkPolicy: false },
     resize: vi.fn(async (_handle: WorldHandle, to: { diskGb?: number }) => ({ disk: 'grown' as const, restart: false,
       machine: { cpu: 2, memoryMb: 2048, diskGb: to.diskGb! } })),
     destroy: vi.fn(async () => {}),
@@ -80,4 +80,22 @@ it('never bills a VM world’s runner lease: its provider reports the billable t
   const lease = await runners.acquire({ project: f.project, taskId: f.task.id, worldId: f.task.id, provider: 'fly' });
   await runners.release(lease.leaseId, 'fly');
   expect((await f.store.usageSummary(f.organization.id)).events).toBe(0);
+});
+
+it('deletes a parked VM world through its control plane, never waking it first', async () => {
+  // Done on a parked world: a wake would boot the machine (on Hetzner a new,
+  // billed server that replays the project's setup) only to delete it.
+  const f = await fixture();
+  const open = vi.fn(async () => { throw new Error('a parked world must not be woken to be deleted'); });
+  Object.assign(f.provider, { open });
+  const worlds = new WorldRegistry();
+  worlds.register(f.provider as any);
+  const { makeCoreActivities } = await import('../src/activities/core.js');
+  const { ProfileResolver } = await import('../src/agent/profiles.js');
+  const core = makeCoreActivities({ store: f.store, worlds, adapters: new Map(), profiles: new ProfileResolver(f.store, 'mock') });
+  await core.destroyWorld(f.handle);
+  expect(open).not.toHaveBeenCalled();
+  expect(f.provider.destroy).toHaveBeenCalledWith(expect.objectContaining({ id: f.task.id, kind: 'fly' }));
+  expect(await f.store.worldState(f.task.id)).toBe('released');
+  expect((await f.store.eventsOfType(f.task.id, 'world.destroyed'))).toHaveLength(1);
 });

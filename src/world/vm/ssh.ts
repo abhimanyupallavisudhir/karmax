@@ -237,6 +237,10 @@ export class SshTransport {
     } catch (error) {
       throw sftpError(error, remotePath);
     } finally {
+      // Closing the remote handle can still fail after the last byte (the
+      // connection closed first, say by a park): nothing is lost then, and an
+      // error nobody listens to would be an uncaught exception in the worker.
+      stream.on('error', () => undefined);
       stream.destroy();
     }
   }
