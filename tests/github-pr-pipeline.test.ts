@@ -46,6 +46,8 @@ let releaseFrontHeldRepair: (() => void) | undefined;
 let frontHeldRepairGate: Promise<void> = Promise.resolve();
 const exactCandidateTurns: { role: string; session?: string; messages: string[] }[] = [];
 let exactCandidateRevisions = 0;
+// #610: the verification starts its tests as a job and pauses for them once.
+let exactCandidatePauses = 0;
 // Task 389: an integration turn does not make CI green; only a new run can.
 let ciStaysRedThroughIntegration = false;
 // A Do repair that really fixes CI: its new head comes back green.
@@ -340,8 +342,16 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
             }],
           }, ctx);
         }
-        if (input.role === 'do'
+        if (input.role === 'do' && exactCandidatePauses > 0
           && input.messages.at(-1)?.text.includes('FINAL AUTOMATED INTEGRATION verification')) {
+          exactCandidatePauses--;
+          exactCandidateTurns.push({ role: input.role, session: input.session, messages: input.messages.map((message) => message.text) });
+          return mock.runTurn({ ...input, messages: [...input.messages, { id: `integration-tests-${input.messages.length}`,
+            role: 'user', text: '@job sleep 0.3\n@pause 1 :: last', ts: input.messages.length }] }, ctx);
+        }
+        if (input.role === 'do'
+          && (input.messages.at(-1)?.text.includes('FINAL AUTOMATED INTEGRATION verification')
+            || input.messages.at(-1)?.text.includes('Finish this verification'))) {
           exactCandidateTurns.push({
             role: input.role,
             session: input.session,
@@ -1548,6 +1558,50 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     } finally {
       releaseFrontHeldRepair?.();
       blockFrontHeldRepair = false;
+    }
+  }, 120_000);
+
+  it('resumes an exact-candidate verification that pauses for its tests, instead of asking for human Review (#610)', async () => {
+    const repo = await repoWithOrigin('github-verification-pause');
+    const project = (await h.store.createProject('Verification pause', { repos: [repo], remote: 'pr' }));
+    const connection = (await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: '57', accountLogin: 'acme', accountType: 'Organization' }));
+    const enrolled = (await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '92',
+      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id }));
+    (await h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Verify after tests', workflow: 'software-dev',
+      workflowVersion: '1.18.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+      createdBy: { kind: 'user', userId: 'a' } }));
+    githubReadiness = {};
+    exactCandidateTurns.length = 0;
+    exactCandidatePauses = 1;
+    const handle = await h.client.workflow.start('softwareDev@1.18.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: task.id,
+      args: [{
+        taskId: task.id, projectId: project.id, title: 'Verify after tests',
+        prompt: '@write verified.md :: exact candidate\n@review Ready', base: 'main', target: 'main',
+        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' },
+        githubPollMs: 10, waitMinuteMs: 50,
+      }],
+    });
+    try {
+      await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+      await handle.signal('confirm');
+      // Once approved it never comes back to a person: the paused verification
+      // is resumed in the same session when its job finishes, and confirms.
+      await expect.poll(() => exactCandidatePauses, { timeout: 30_000, interval: 20 }).toBe(0);
+      await expect.poll(async () => (await view(handle)).stage, { timeout: 60_000, interval: 20 })
+        .toSatisfy((stage: string) => stage === 'done' || stage === 'review');
+      expect((await view(handle)).stage).toBe('done');
+      expect(await handle.result()).toMatchObject({ stage: 'done', sha: expect.any(String) });
+      expect(exactCandidatePauses).toBe(0);
+      expect(exactCandidateTurns).toHaveLength(2);
+      expect(new Set(exactCandidateTurns.map((turn) => turn.session)).size).toBe(1);
+      expect(exactCandidateTurns[1]!.messages.at(-1)).toMatch(/your job has finished[\s\S]*Finish this verification/);
+      expect((await view(handle)).landing).toMatchObject({ authorization: 'authorized', validation: 'passed' });
+    } finally {
+      exactCandidatePauses = 0;
     }
   }, 120_000);
 

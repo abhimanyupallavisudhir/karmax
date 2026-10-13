@@ -149,9 +149,9 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     assert.equal(await page.locator('#bell-badge').innerText(), '2');
     if (shots) await page.screenshot({ path: path.join(shots, 'for-you.png') });
 
-    // Every query works here; All is one click away.
-    await page.locator('.view-chip[data-view="__all__"]').click();
-    await page.waitForFunction(() => location.pathname === '/inbox' && location.search === '?q=');
+    // Every query works here; Active is one click away.
+    await page.locator('.view-chip[data-view="__active__"]').click();
+    await page.waitForFunction(() => location.pathname === '/inbox' && location.search === '?q=-is:archived');
     await page.locator('[data-id="t2"]').waitFor();
     await settle();
     assert.deepEqual(await rows(), ['t1', 't2', 't3']);

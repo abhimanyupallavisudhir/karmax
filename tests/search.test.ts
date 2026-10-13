@@ -1,3 +1,6 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import * as triggers from '../src/domain/triggers.js';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { Store } from '../src/store/db.js';
@@ -666,6 +669,31 @@ describe('Store — saved views', () => {
     expect((await store.getView(v.id))!.query.filters?.[0]?.field).toBe('is');
     (await store.deleteView(v.id));
     expect((await store.getView(v.id))).toBeUndefined();
+  });
+
+  it('spells out -is:archived in views saved while the list hid archived tasks implicitly', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-views-'));
+    const filename = path.join(dir, 'store.db');
+    let file = (await Store.create(filename));
+    try {
+      const project = (await file.createProject('Views')).id;
+      const bugs = (await file.createView({ projectId: project, name: 'Bugs', query: parseQuery('tag:bug group:status') }));
+      const archived = (await file.createView({ projectId: project, name: 'Old', query: parseQuery('is:archived') }));
+      const both = (await file.createView({ projectId: project, name: 'Both', query: parseQuery('-is:archived') }));
+      const everything = (await file.createView({ projectId: project, name: 'All', query: {} }));
+      (await file.kvDelete('migration:saved-views-explicit-archived'));
+      (await file.close());
+      file = (await Store.create(filename));
+      expect(stringifyQuery((await file.getView(bugs.id))!.query)).toBe('tag:bug -is:archived group:status');
+      expect(stringifyQuery((await file.getView(archived.id))!.query)).toBe('is:archived');
+      expect(stringifyQuery((await file.getView(both.id))!.query)).toBe('-is:archived');
+      expect(stringifyQuery((await file.getView(everything.id))!.query)).toBe('-is:archived');
+      // Once: a view saved afterwards means exactly what it says.
+      (await file.updateView(everything.id, { query: {} }));
+      (await file.close());
+      file = (await Store.create(filename));
+      expect((await file.getView(everything.id))!.query).toEqual({});
+    } finally { (await file.close()); fs.rmSync(dir, { recursive: true, force: true }); }
   });
 
   it('drops a project’s tags and views when the project is deleted', async () => {

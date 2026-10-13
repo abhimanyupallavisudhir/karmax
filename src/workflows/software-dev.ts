@@ -311,6 +311,9 @@ const MAX_SHELL_NUDGES = 3;
 /** Transient GitHub/API failures are retried automatically, but unlike a real
  * pending check they are not allowed to disguise a permanent outage forever. */
 const MAX_GITHUB_ERROR_POLLS = 3;
+/** How often a final integration verification that ends by pausing (for its
+ * tests) is resumed for its decision before it goes to human Review instead. */
+const INTEGRATION_REVIEW_RESUMES = 3;
 /** Landing repairs are automatic, but after this many consecutive failures a
  * person is asked for guidance instead of spending agent turns—and, from v1.17,
  * blocking the front landing slot—forever. */
@@ -3317,7 +3320,32 @@ Inspect the complete current diff and specifically compare its delta from the re
 - action:"revise" with actionable text when you can repair it in your next Do turn;
 - action:"reject" when the delta is ambiguous, materially changes scope/behavior, or needs a human decision. A reject here escalates to human Review; it does not cancel the task.`;
       msgs.push({ id: `integration-${msgs.length}`, role: 'user', text: prompt, ts: msgs.length });
-      const turn = await doTurn();
+      let turn = await doTurn();
+      // A verification that pauses for its tests (a durable job, or a timer) is
+      // resumed for its decision when they finish, as a Do turn is: ending it
+      // without one sent an intact candidate back to human Review (#610).
+      for (let resumes = 0; !turn.confirmDecision && resumes < INTEGRATION_REVIEW_RESUMES
+        && !cancelled && patched('software-dev-integration-review-pause-v1'); resumes++) {
+        const reminder = unattendedJobsReminder(turn);
+        let note: string | undefined;
+        if (turn.wait && !turn.wait.needsInput) {
+          const held = { status, waitingFor };
+          note = await waitForAgent(turn.wait, {
+            world,
+            ...(input.waitMinuteMs ? { minuteMs: input.waitMinuteMs } : {}),
+            park: async (next) => { status = 'waiting'; waitingFor = next; await publish(); },
+            interrupted: () => cancelled || mainUnread(),
+          });
+          ({ status, waitingFor } = held);
+          await publish();
+          if (cancelled) break;
+          note = `${note ?? '(Resumed: your wait was interrupted by the message above.)'}\n\nFinish this verification: call confirm_decision exactly once.`;
+        } else if (reminder) {
+          note = reminder;
+        } else break;
+        msgs.push({ id: `integration-wait-${msgs.length}`, role: 'user', text: note, ts: msgs.length });
+        turn = await doTurn();
+      }
       const decision = turn.confirmDecision;
       if (decision?.action === 'confirm') return 'confirm';
       if (decision?.action === 'revise') {

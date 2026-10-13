@@ -369,6 +369,7 @@ export class Store {
     (await this.migrate());
     (await this.migrateData());
     (await this.migrateConversations());
+    (await this.migrateSavedViews());
     (await this.paymentTransaction(async () => {
       if ((await this.kvGet('migration:unique-card-names'))) return;
       const rows = (await this.db.prepare(`SELECT c.id, c.label, c.scope, c.scopeId, p.organizationId
@@ -409,6 +410,29 @@ export class Store {
       }
     }
   
+    });
+  }
+
+  /** The task list used to hide archived tasks unless a query mentioned them;
+   * now a query means what it says (the Active view is `-is:archived`). Views
+   * saved under the old rule get the clause they relied on, once. */
+  private async migrateSavedViews(force = false): Promise<void> {
+    return this.db.transaction(async () => {
+    (await this.db.lock('store-migration'));
+    const marker = 'migration:saved-views-explicit-archived';
+    if (!force && await this.kvGet(marker)) return;
+    const rows = (await this.db.prepare('SELECT id, query FROM saved_views').all()) as Array<{ id: string; query: string }>;
+    for (const row of rows) {
+      let query: TaskQuery;
+      try { query = JSON.parse(row.query) as TaskQuery; } catch { continue; }
+      if (!query || typeof query !== 'object') continue;
+      const filters = Array.isArray(query.filters) ? query.filters : [];
+      if (filters.some((c) => (c?.field === 'is' || c?.field === 'has')
+        && Array.isArray(c.values) && c.values.some((v) => String(v).includes('archived')))) continue;
+      const next = { ...query, filters: [...filters, { field: 'is', op: 'is', values: ['archived'], negate: true }] };
+      (await this.db.prepare('UPDATE saved_views SET query=? WHERE id=? AND query=?').run(JSON.stringify(next), row.id, row.query));
+    }
+    (await this.kvSet(marker, '1'));
     });
   }
 
@@ -1916,6 +1940,7 @@ export class Store {
     try {
       (await this.revokeScopedTokens({ projectId: id }));
       (await this.revokeHumanDelegations({ projectId: id }));
+      (await this.withdrawProjectFromTaskAuthorizations(id));
       (await deleteRows(this.db, 'delivery_outbox', 'inboxId', inboxIds));
       (await deleteRows(this.db, 'execution_frames', 'executionId', executionIds));
       (await deleteRows(this.db, 'team_memberships', 'teamId', teamIds));
@@ -9455,21 +9480,61 @@ export class Store {
     return this.db.transaction(async () => {
 
     const update = this.db.prepare('UPDATE human_delegations SET revokedAt=? WHERE id=? AND revokedAt IS NULL');
+    const narrow = this.db.prepare('UPDATE human_delegations SET json=? WHERE id=? AND revokedAt IS NULL');
     let revoked = 0;
     for (const row of (await this.db.prepare('SELECT id, json FROM human_delegations WHERE revokedAt IS NULL').all()) as any[]) {
       try {
         const record = JSON.parse(row.json) as Record<string, unknown>;
-        if ((scope.taskId && record.taskId === scope.taskId)
-          || (scope.projectId && (record.projectId === scope.projectId
-            || Array.isArray(record.projectIds) && record.projectIds.includes(scope.projectId)))
+        const projectIds = Array.isArray(record.projectIds) ? record.projectIds as string[] : [];
+        let revoke = !!((scope.taskId && record.taskId === scope.taskId)
           || (scope.organizationId && record.organizationId === scope.organizationId)
-          || (scope.humanUserId && record.humanUserId === scope.humanUserId))
-          revoked += Number((await update.run(Date.now(), row.id)).changes);
+          || (scope.humanUserId && record.humanUserId === scope.humanUserId));
+        if (!revoke && scope.projectId && (record.projectId === scope.projectId || projectIds.includes(scope.projectId))) {
+          // A delegation that also reaches other projects loses only this one, as
+          // its token does (`revokeScopedTokens`), unless its task is in it: a task
+          // granted a throwaway project keeps running once that is deleted (#610).
+          const others = record.projectId === scope.projectId ? [] : projectIds.filter((projectId) => projectId !== scope.projectId);
+          const task = others.length && typeof record.taskId === 'string'
+            ? (await this.db.prepare('SELECT projectId FROM tasks WHERE id=?').get(record.taskId)) as { projectId: string } | undefined : undefined;
+          if (others.length && task?.projectId !== scope.projectId)
+            (await narrow.run(JSON.stringify({ ...record, projectIds: others }), row.id));
+          else revoke = true;
+        }
+        if (revoke) revoked += Number((await update.run(Date.now(), row.id)).changes);
       } catch { /* malformed historical state is unusable, but must not block cleanup */ }
     }
     return revoked;
   
     });
+  }
+
+  /** A deleted project leaves the selected projects of every other task's
+   * authorization (and its agents'), as it leaves their delegations: each turn
+   * mints within the delegation, so the two must name the same projects. */
+  private async withdrawProjectFromTaskAuthorizations(projectId: string): Promise<void> {
+    type Entry = { scope?: string; projectIds?: string[]; requested?: { authorization?: { projectIds?: string[] } } };
+    const without = (projectIds: string[] | undefined) => {
+      const others = projectIds?.filter((id) => id !== projectId);
+      return others?.length && others.length < projectIds!.length ? others : projectIds;
+    };
+    const narrowed = (entry: Entry): Entry => {
+      const requested = entry.requested?.authorization;
+      return { ...entry, projectIds: without(entry.projectIds),
+        ...(requested?.projectIds ? { requested: { ...entry.requested, authorization: { ...requested, projectIds: without(requested.projectIds) } } } : {}) };
+    };
+    const rows = (await this.db.prepare('SELECT id, params FROM tasks WHERE projectId<>? AND params LIKE ?')
+      .all(projectId, `%${JSON.stringify(projectId)}%`)) as Array<{ id: string; params: string }>;
+    for (const row of rows) {
+      const params = JSON.parse(row.params) as { _authorization?: Entry; _agentAuthorization?: Record<string, Entry> };
+      const patch = {
+        _authorization: params._authorization && narrowed(params._authorization),
+        _agentAuthorization: params._agentAuthorization && Object.fromEntries(Object.entries(params._agentAuthorization)
+          .map(([key, entry]) => [key, narrowed(entry)])),
+      };
+      if (JSON.stringify(patch._authorization) !== JSON.stringify(params._authorization)
+        || JSON.stringify(patch._agentAuthorization) !== JSON.stringify(params._agentAuthorization))
+        (await this.patchTaskParams(row.id, patch));
+    }
   }
 
   async revokeScopedToken(input: { tokenHash?: string; tokenId?: string }): Promise<void> {
@@ -9842,6 +9907,7 @@ export class Store {
     (await this.migrate());
     (await this.migrateData(true));
     (await this.migrateConversations());
+    (await this.migrateSavedViews(true));
   
     });
   }

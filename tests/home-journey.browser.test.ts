@@ -10,7 +10,7 @@ const PASSWORD = 'long-home-password';
 
 // The organization home on the installed app (src/main.ts, embedded Temporal,
 // mock agent): a real workflow's Review ask and a draft are "for me" across two
-// projects, an agent's paused task is not, and "All" shows everything. An agent
+// projects, an agent's paused task is not, and "Active" shows everything. An agent
 // token sees the same list through the same route. Home creates a task in the
 // project you pick, and the bell lists what waits on you in every organization. Home creates a task in the
 // project you pick, and the bell lists what waits on you in every organization.
@@ -38,7 +38,7 @@ async function repository(name: string): Promise<string> {
   return repo;
 }
 
-it('lands on the organization home, For me across projects, All one click away', async () => {
+it('lands on the organization home, For me across projects, Active one click away', async () => {
   const home = path.join(root, 'home');
   fs.mkdirSync(home);
   const [webRepo, appRepo] = [await repository('website'), await repository('mobile')];
@@ -87,15 +87,15 @@ it('lands on the organization home, For me across projects, All one click away',
     expect(forMe.tasks.map((task: any) => task.id).sort()).toEqual(listed);
     expect(forMe.reasons[review.id]).toContain('review-requested');
 
-    await step('All shows the agent\'s own work too', async () => {
-      await page.locator('.view-chip[data-view="__all__"]').click();
-      await page.waitForURL(/\/personal\?q=$/);
+    await step('Active shows the agent\'s own work too', async () => {
+      await page.locator('.view-chip[data-view="__active__"]').click();
+      await page.waitForURL(/\/personal\?q=-is:archived$/);
       await page.locator(`[data-id="${paused.id}"]`).waitFor();
     });
     if (process.env.HOME_SCREENSHOTS) await page.screenshot({ path: path.join(process.env.HOME_SCREENSHOTS, 'app-home-all.png') });
     await step('the project filter narrows to one project', async () => {
       await page.locator('#q-project').selectOption('mobile-app');
-      await page.waitForURL(/q=project:mobile-app$/);
+      await page.waitForURL(/q=-is:archived\+project:mobile-app$/);
       await expect.poll(async () => (await rows()).filter((id) => [paused.id, draft.id, review.id].includes(id))).toEqual([paused.id, draft.id].sort());
     });
     await step('a row opens the task in its project', async () => {
