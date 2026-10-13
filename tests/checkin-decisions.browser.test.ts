@@ -78,10 +78,8 @@ it.each([true, false])('resolves approvals and resource decisions inside the rea
           Object.assign(S, await (await fetch('/state')).json());
           patchTaskPage(document.getElementById('app'), checkinTab(S.view));
           wireTaskApprovalRequests(S.view);
-          if (S.showResourceReview) {
-            document.querySelector('.thread').insertAdjacentHTML('beforeend', resourceReviewPlaceholder());
-            await wireResourceReview(S.view);
-          }
+          // Like renderTaskPage: the review block's resources rewire on every repaint.
+          if (S.showResourceReview) await wireResourceReview(S.view);
         };
       `);
       await w.eval('refreshTask()');
@@ -94,11 +92,9 @@ it.each([true, false])('resolves approvals and resource decisions inside the rea
     await page.locator('#task-approval-requests').waitFor({ state: 'detached' });
     expect(decisions).toEqual(['once', 'deny', 'approve']);
     expect(await page.locator('#ck-thread').count()).toBe(1);
-    await page.evaluate(() => (globalThis as any).eval(`
-      S.showResourceReview = true;
-      document.querySelector('.thread').insertAdjacentHTML('beforeend', resourceReviewPlaceholder());
-      wireResourceReview(S.view);
-    `));
+    // In Review the conversation closes with the resources the confirmation saves.
+    expect(await page.locator('.review-info #review-resources').count()).toBe(1);
+    await page.evaluate(() => (globalThis as any).eval('S.showResourceReview = true; wireResourceReview(S.view)'));
     page.on('dialog', dialog => dialog.accept());
     if (automaticReview) {
       await page.getByRole('button', { name: 'Exclude Dataset', exact: true }).click();

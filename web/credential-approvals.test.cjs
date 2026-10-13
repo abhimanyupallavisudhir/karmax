@@ -49,7 +49,7 @@ const request = {
   task: { id: 'task_opaque', num: 12, title: 'Log in', projectId: 'project_1' },
 };
 const link = credentialRequestTaskLink(request);
-ok(link.includes('href="/personal/app/tasks/12/approvals"'), 'request links directly to the task Approval Requests tab');
+ok(link.includes('href="/personal/app/tasks/12/checkin"'), 'request links to the task conversation, where it waits');
 ok(link.includes('#12 · Log in'), 'request uses the human task number and title');
 ok(!link.includes('task_opaque'), 'opaque task id is hidden when human metadata is available');
 
@@ -88,7 +88,7 @@ const scopeRows = permissionRequestRows([{ ...permission, capabilities: [], proj
 ok(scopeRows.includes('proj_second&lt;script&gt;') && !scopeRows.includes('<script>'), 'project scopes are visible and escaped');
 ok(scopeRows.includes('Existing permissions for all task roles apply there too'), 'scope approval explains its full effect');
 
-ok(defaultTaskTab({ approvalRequests: 1, actions: [] }) === 'approvals', 'a task needing approval opens its dedicated tab');
+ok(defaultTaskTab({ approvalRequests: 1, actions: [] }) === 'checkin', 'a task needing approval opens its conversation, where the request waits');
 ok(defaultTaskTab({ approvalRequests: 0, actions: [{ name: 'confirm', enabled: true }] }) === 'checkin', 'review-only tasks retain the Check-in default');
 ok(defaultTaskTab({ approvalRequests: 0, actions: [] }) === 'checkin', 'tasks open on Check-in by default');
 ok(defaultTaskTab({ approvalRequests: 0, actions: [], state: { draft: true } }) === 'parameters', 'drafts open on their parameters');

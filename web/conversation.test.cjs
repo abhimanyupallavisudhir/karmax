@@ -237,6 +237,10 @@ ok(ordered.join(',') === 'm0,a1,u1,a2', 'sequence-numbered replies sort after th
 // and sessions without a native CLI/config home.
 eval(extractFn('reviewActionBtn'));
 eval(extractFn('conversationReviewInfo'));
+eval(extractFn('conversationError'));
+eval(extractFn('presenceDetail'));
+eval(extractFn('conversationWaitNotice'));
+eval(extractFn('contentKey'));
 eval(extractFn('conversationFullscreenButton'));
 eval(extractFn('conversationPane'));
 eval(extractFn('liveOutputFor'));
@@ -245,6 +249,7 @@ eval(extractFn('wireCheckinSidebar'));
 eval(extractFn('wireStopAgents'));
 global.conversationApprovalRequests = () => '<div>Pending approvals</div>';
 global.liveRoleFor = () => 'do';
+global.taskTranscripts = () => [{ role: 'do' }];
 global.localWorldPath = () => false;
 global.conversationPresence = () => ({ tone: 'muted', label: 'Finished' });
 global.openTaskForm = (...args) => { global.openedForkForm = args; };
@@ -297,14 +302,21 @@ const reviewView = { ...forkView, reviewInfo: {
 } };
 for (const role of ['do', 'merge', 'confirm', 'resolve']) {
   const html = conversationPane(reviewView, { role, messages: [{ id: 'final', role: 'agent', text: 'Final response', ts: 1 }] });
-  ok(html.indexOf('Review info') > html.indexOf('Final response'), `${role} review info follows the conversation`);
+  ok(html.indexOf('>Summary<') > html.indexOf('Final response'), `${role} review info follows the conversation`);
   ok(html.includes('Check &lt;layout&gt;'), 'review caption is escaped');
   ok(html.includes('data-idx="1" data-kind="run"'), 'review actions preserve API indices');
   ok(html.includes('class="raw hidden" id="review-action-out"'), 'command output takes no space until run');
   ok(html.includes('href="#"'), 'unsafe legacy link is neutralized');
-  ok(html.includes('data-tasktab="overview"') && !html.includes('<iframe>'), 'large preview is linked in Overview');
+  ok(html.includes('id="review-info-frame"') && html.includes('sandbox="allow-scripts"') && !html.includes('<iframe>large preview'), 'the preview shows in place, sandboxed, from its own URL');
   ok((html.match(/id="review-actions"/g) || []).length === 1, 'review actions have a single wiring target');
 }
+// The review closes the conversation, so it carries what the Overview tab used to.
+global.resourceReviewPlaceholder = () => '<div id="review-resources"></div>';
+const atReview = conversationReviewInfo({ taskId: 't', stage: 'review', reviewInfo: { completion: 'stalled' } });
+ok(atReview.includes('>Review<') && atReview.includes('id="review-resources"') && atReview.includes('id="review-resource-inventory"'), 'in Review the resources to save close the conversation');
+ok(atReview.includes('without signalling completion'), 'an agent that stopped without signalling completion is flagged');
+ok(!conversationReviewInfo({ taskId: 't', stage: 'review', reviewInfo: { caption: 'x' } }, true).includes('review-resources'), 'an input request already carrying the resources is not repeated');
+ok(conversationError({ error: 'boom <x>' }).includes('boom &lt;x&gt;') && conversationError({}) === '', 'a recorded failure shows once, escaped, in the conversation');
 
 
 // Input prompts use the same model picker, pending/error UI, and durable annotations.

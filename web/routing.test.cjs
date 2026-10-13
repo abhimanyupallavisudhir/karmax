@@ -51,6 +51,8 @@ global.S = S;
 
 // Bring the real declarations into scope.
 eval(extractConst('TASK_TABS'));
+eval(extractConst('TASK_TAB_ALIASES'));
+eval(extractFn('taskTabOf'));
 eval(extractConst('DEFAULT_LIST_QUERY'));
 eval(extractConst('ORG_VIEWS'));
 eval(extractConst('PROJECT_SCOPED_TABS'));
@@ -151,6 +153,9 @@ eq(parseRoute('/acme/website-redesign/tasks/42/file?path=%2Fworkspace%2Fapp%2Fma
 eq(parseRoute('/acme/website-redesign/tasks/42/checkin'),
   { name: 'project', org: 'acme', slug: 'website-redesign', tab: 'tasks', taskKey: '42', taskTab: 'checkin', q: 'for:me -is:archived' },
   'parse a task permalink pinned to a tab');
+// The former Overview and Approval Requests tabs live on the Chat view now; their links still land.
+for (const old of ['overview', 'approvals']) eq(parseRoute(`/acme/website-redesign/tasks/42/${old}`).taskTab, 'checkin', `/${old} opens the conversation`);
+eq(parseRoute('/acme/website-redesign/tasks/42/nonsense').taskTab, null, 'an unknown view pins nothing');
 
 // ── Wiki routes (org-level bottom-left link + project tab) ────────────────────
 eq(globalRoute('orgwiki'), '/acme/wiki', 'internal tab "orgwiki" → URL segment "wiki"');

@@ -3139,6 +3139,16 @@ export class KarmaxApi {
       // The form cannot resupply the account the task was pinned to at creation.
       ...(_githubAccountId !== undefined ? { _githubAccountId } : {}),
     };
+    const base: Record<string, unknown> = opts.replace ? { ...meta, ...params } : { ...task.params, ...params };
+    // Validate the edited triggers before anything is written: a rejected edit
+    // (a cycle, a dangling or self dependency) must leave the task as it was,
+    // still armed. Saving first left it un-armed with the bad triggers stored,
+    // and the reconcile sweep then failed it as "never started".
+    if (opts.keepArmed !== false && hasActiveTriggers(base)) {
+      const candidate = { ...task, params: { ...base, triggerState: 'armed' } } as TaskRecord;
+      const errs = (await this.armer?.validationErrors?.(candidate)) ?? (await validateTriggers(normalizeTriggers(base)));
+      if (errs.length) throw new Error(`invalid trigger(s): ${errs.join('; ')}`);
+    }
     const start = this.resolveStart(task.workflow, task.workflowVersion,
       (await this.deps.store.getProject(task.projectId))?.organizationId);
     const confirmerField = start?.manifest.params.find((f) => f.type === 'confirmer');
@@ -3157,7 +3167,6 @@ export class KarmaxApi {
         (await this.deps.store.setIntentConfirmer(task.intentId ?? task.id, confirmerField.name, confirmer));
       }
     }
-    const base: Record<string, unknown> = opts.replace ? { ...meta, ...params } : { ...task.params, ...params };
     (await this.prepareForkWorld(task.projectId, base, task.params));
     // Authorization is platform metadata, never a workflow-form field.
     if (_authorization !== undefined) base._authorization = _authorization;

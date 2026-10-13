@@ -93,6 +93,26 @@ test('multiple attempts remain visible even when only one has an agent', async (
   await h.click(1); assert.equal(h.picks[0].task.id, 'a');
 });
 
+test('a task that has not run yet offers its agent, forked once it finishes', async () => {
+  const waiting = task('w', 1, { num: 5, params: { triggerState: 'armed' } });
+  const h = harness({ tasks: [waiting], attempts: { w: [waiting] }, agents: { w: {} } });
+  await tick(); await h.click();
+  assert.equal(h.picks.length, 0, 'never picked silently');
+  const html = h.nodes['pk-list'].innerHTML;
+  assert.ok(html.includes('when it finishes'), html);
+  assert.ok(!html.includes('No agent to fork yet'));
+  await h.click(1);
+  assert.equal(h.picks[0].task, waiting); assert.equal(h.picks[0].role, 'do');
+  assert.equal(h.picks[0].session, undefined);
+});
+
+test('a draft that may never run still has no agent to fork', async () => {
+  const draft = task('d', 1, { params: { draft: true } });
+  const h = harness({ tasks: [draft], attempts: { d: [draft] }, agents: { d: {} } });
+  await tick(); await h.click();
+  assert.ok(h.nodes['pk-list'].innerHTML.includes('No agent to fork yet'));
+});
+
 test('multiple roles in one attempt can be selected with arrow keys and Enter', async () => {
   const a = task('a');
   const h = harness({ tasks: [a], attempts: { a: [a] }, agents: { a: { ...session('one'), merge: { id: 'merge' } } } });

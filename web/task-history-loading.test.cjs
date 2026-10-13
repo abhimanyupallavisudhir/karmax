@@ -27,7 +27,7 @@ async function main() {
     projectById: () => ({ organizationId: 'org' }),
     renderTaskLoadingPage: () => {},
     renderTaskPage: () => { if (c.S.view) paints.push(c.S.taskEvents.length); },
-    pendingCancellationView: v => v, defaultTaskTab: () => 'checkin',
+    pendingCancellationView: v => v, defaultTaskTab: () => 'checkin', taskTabOf: (key) => key,
     scheduleTaskPageRender: () => c.renderTaskPage(),
     loadParamDefaults: async () => ({}), syncLiveWatch: () => {}, markTaskAsksRead: () => {}, toast: message => { throw new Error(message); },
     api: async url => {

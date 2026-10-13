@@ -958,11 +958,12 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     // tier-2 declarative widgets resolve against the live view-model (SPEC §10.2)
     const widgets: any = await (await fetch(`${base}/api/tasks/${task.id}/widgets`, { headers: auth() })).json();
     expect(widgets.length).toBeGreaterThan(0);
-    const progress = widgets.find((g: any) => g.title === 'Progress');
-    expect(progress).toBeTruthy();
-    const byType = Object.fromEntries(progress.widgets.map((w: any) => [w.type, w]));
-    expect(byType.badge.data).toBe('review'); // bound to view.stage
-    expect(byType.gauge.data).toBeTruthy(); // merge-queue gauge
+    const changes = widgets.find((g: any) => g.title === 'Changed files');
+    expect(changes).toBeTruthy();
+    const byType = Object.fromEntries(changes.widgets.map((w: any) => [w.type, w]));
+    // The stage and merge-queue place head the task page; the widget adds only what they don't.
+    expect(byType.badge).toBeUndefined();
+    expect(byType.gauge).toBeUndefined();
     expect(Array.isArray(byType.list.data)).toBe(true); // bound to changedFiles
     // the conversation thread is intentionally NOT duplicated here — the drawer's
     // (collapsible) conversation floor already shows it (task 1b).

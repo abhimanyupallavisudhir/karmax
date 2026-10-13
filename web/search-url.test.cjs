@@ -51,6 +51,8 @@ const S = {
 global.S = S;
 
 eval(extractConst('TASK_TABS'));
+eval(extractConst('TASK_TAB_ALIASES'));
+eval(extractFn('taskTabOf'));
 eval(extractConst('DEFAULT_LIST_QUERY'));
 eval(extractConst('ORG_VIEWS'));
 eval(extractConst('PROJECT_SCOPED_TABS'));
