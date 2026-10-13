@@ -42,7 +42,7 @@ jobs:
       sha: ${{ steps.sha.outputs.sha }}
       release: ${{ steps.version.outputs.release }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         # Every tag and the history between them: the version follows the newest
         # cli-v* tag and what changed since it.
         with: { ref: "${{ inputs.tag || github.sha }}", fetch-depth: 0 }
@@ -82,7 +82,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with: { ref: '${{ needs.bundle.outputs.sha }}' }
       - uses: actions/setup-node@v4
         with: { node-version: '22.16.0' }
@@ -148,7 +148,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with: { ref: '${{ needs.bundle.outputs.sha }}' }
       - uses: actions/setup-node@v4
         with: { node-version: '22.16.0', registry-url: 'https://registry.npmjs.org' }
