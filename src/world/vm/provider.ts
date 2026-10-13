@@ -13,7 +13,7 @@ import { taskBranch } from '../../domain/brand.js';
 import { timed } from '../../timing/index.js';
 import { generateSshKeyPair, quote, SshTransport, VmTransportError, type SshEndpoint } from './ssh.js';
 import { VmWorld } from './world.js';
-import { VM_HOME, VM_USER, vmProvisionScript, vmProvisionStamp } from './provision.js';
+import { VM_HOME, VM_USER, vmProvisionFailure, vmProvisionScript, vmProvisionStamp } from './provision.js';
 
 /** What a VM world's machine is: CPU, memory, and the size of its volume. */
 export interface VmShape { cpu: number; memoryMb: number; diskGb: number }
@@ -141,6 +141,8 @@ export class VmWorldProvider implements WorldProvider {
       const transport = this.transportFor(spec.taskId, connection, sealed);
       await timed(`${this.kind}.reachable`, () => waitReachable(transport, this.options.reachableMs ?? REACHABLE_MS, spec.signal));
       await this.ensureProvisioned(transport, spec.signal);
+      // The platform runs the project's setup and boot hooks on this boot, right after.
+      await this.markHooksRan(transport);
       const target = provisionTarget(transport, spec.signal);
       const home = this.home();
       const root = path.posix.join(home, 'karmax');
@@ -188,6 +190,10 @@ export class VmWorldProvider implements WorldProvider {
         await timed(`${this.kind}.reachable`, () => waitReachable(transport!, this.options.reachableMs ?? REACHABLE_MS));
         await this.ensureProvisioned(transport);
       }
+      this.states.set(handle.id, 'ready');
+      const world = this.world(handle, connection, sealed, transport);
+      await this.replayHooks(world, transport);
+      return world;
     }
     this.states.set(handle.id, 'ready');
     return this.world(handle, connection, sealed, transport);
@@ -288,6 +294,44 @@ export class VmWorldProvider implements WorldProvider {
       .catch((error) => { throw new Error(`provisioning the ${this.driver.name} machine failed: ${error instanceof Error ? error.message : String(error)}`); }));
   }
 
+  /**
+   * A VM keeps its files across a park, not its processes, and a Hetzner
+   * server parked past its paid hour comes back as a new server: everything
+   * outside the volume (the project's apt packages, say) is the snapshot's
+   * again. So, as E2B's resume keeps a sandbox as it was, a woken machine
+   * replays what the platform ran when the world was made (`machineHooks`,
+   * project-runtime.ts): the boot hooks after every restart, and setup too on
+   * a root disk that never ran it. A marker on the root disk holds the boot id
+   * they last ran under; it is written after they finish, so an interrupted
+   * replay runs again at the next open. Failures are warnings, as at create.
+   */
+  private async replayHooks(world: World, transport: SshTransport): Promise<void> {
+    const hooks = world.handle.meta?.machineHooks as { setup?: string[]; boot?: string[] } | undefined;
+    const probe = await transport.exec(`cat /proc/sys/kernel/random/boot_id; cat ${quote(this.hooksMark())} 2> /dev/null || true`, { timeoutMs: 30_000 });
+    const [boot = '', ran = ''] = probe.stdout.toString().split('\n').map((line) => line.trim());
+    if (ran === boot) return;
+    const commands = [...(ran ? [] : hooks?.setup ?? []), ...(hooks?.boot ?? [])];
+    for (const command of commands) {
+      const result = await timed(`${this.kind}.hooks`, () => world.exec('bash', ['-lc', command], { timeoutMs: 30 * 60_000 }));
+      if (result.code !== 0)
+        console.warn(`[${this.kind}] ${world.handle.id}: environment command "${command}" failed after a restart: ${(result.stderr || result.stdout).slice(-300)}`);
+    }
+    await this.markHooksRan(transport);
+  }
+
+  private async markHooksRan(transport: SshTransport): Promise<void> {
+    const mark = this.hooksMark();
+    const write = `mkdir -p ${quote(path.posix.dirname(mark))} && cat /proc/sys/kernel/random/boot_id > ${quote(mark)}`;
+    const sudo = (this.options.provision ?? { sudo: true }).sudo;
+    const result = await transport.exec(sudo ? `sudo -n sh -c ${quote(write)}` : write, { timeoutMs: 30_000 });
+    if (result.code !== 0) throw new Error(`could not record the machine's boot: ${result.stderr.toString().slice(-300)}`);
+  }
+
+  /** On the root disk, beside the provisioning stamp: a new root disk has none. */
+  private hooksMark(): string {
+    return path.posix.join(path.posix.dirname((this.options.provision ?? { stamp: vmProvisionStamp() }).stamp), '.world-hooks-boot');
+  }
+
   private async shapeOf(handle: WorldHandle, connection: ResolvedWorldProviderConnection): Promise<VmShape> {
     const made = handle.meta?.machine as VmShape | undefined;
     const wanted = handle.meta?.computer as MachineShape | undefined;
@@ -359,8 +403,8 @@ export async function runDetached(transport: SshTransport, script: string, sudo:
       const code = status.stdout.toString().trim();
       if (code !== '') {
         if (code === '0') { await transport.exec(`${sudo ? 'sudo -n ' : ''}rm -f ${quote(file)} ${quote(`${file}.log`)} ${quote(`${file}.exit`)}`, { timeoutMs: 30_000 }).catch(() => undefined); return; }
-        const log = await transport.exec(`tail -n 40 ${quote(`${file}.log`)}`, { timeoutMs: 30_000 }).catch(() => undefined);
-        throw new Error(`status ${code}: ${log?.stdout.toString().slice(-4000) ?? ''}`);
+        const log = await transport.exec(`tail -n 400 ${quote(`${file}.log`)}`, { timeoutMs: 30_000 }).catch(() => undefined);
+        throw new Error(vmProvisionFailure(log?.stdout.toString() ?? '', code));
       }
     } catch (error) {
       if (!(error instanceof VmTransportError)) throw error;

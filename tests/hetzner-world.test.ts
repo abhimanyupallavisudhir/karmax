@@ -126,6 +126,37 @@ describe.skipIf(!sshdAvailable)('Hetzner worlds (fake Cloud API, real sshd)', ()
     expect((await woken.readFile('big/data.bin')).length).toBe(4096);
   });
 
+  it('replays the boot hooks after a restart, and setup too on a new server’s root disk', async () => {
+    // pramana's setup apt-installs tesseract: outside the volume, so a server
+    // made after the paid hour (from the snapshot) lacks it until setup runs again.
+    const world = await provider.create({ taskId: 'task_hooks', base: 'main', generation: 1, organizationId: 'org_h' });
+    // What activateProjectRuntime ran right after the create, and recorded.
+    await world.exec('sh', ['-c', 'echo setup >> hooks.log; echo boot >> hooks.log']);
+    const handle = { ...world.handle, meta: { ...world.handle.meta,
+      machineHooks: { setup: ['echo setup >> hooks.log'], boot: ['echo boot >> hooks.log'] } } } as WorldHandle;
+    const mark = path.join(path.dirname(stamp), '.world-hooks-boot');
+    const bootId = fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8');
+    expect(fs.readFileSync(mark, 'utf8')).toBe(bootId);
+    // The fake's servers share this host's boot: a park and wake within it replays nothing.
+    await provider.park(handle);
+    expect(await (await provider.open(handle)).readFile('hooks.log')).toBe('setup\nboot\n');
+    // A power-on is a new boot: the boot hooks run again, setup does not.
+    await provider.park(handle);
+    fs.writeFileSync(mark, 'an-earlier-boot\n');
+    expect(await (await provider.open(handle)).readFile('hooks.log')).toBe('setup\nboot\nboot\n');
+    expect(fs.readFileSync(mark, 'utf8')).toBe(bootId);
+    // Past the paid hour the wake is a new server whose root disk is the snapshot's: no mark.
+    await provider.park(handle);
+    [...hetzner.servers.values()][0]!.created = new Date(Date.now() - 57 * 60_000).toISOString();
+    await provider.housekeep('org_h');
+    fs.rmSync(mark);
+    expect(await (await provider.open(handle)).readFile('hooks.log')).toBe('setup\nboot\nboot\nsetup\nboot\n');
+    // Another process opening the running world (a worker restart) replays nothing.
+    const other = new VmWorldProvider(driver, async () => connection(hetzner.token), undefined, {
+      socket: hetzner.socket, user: os.userInfo().username, home: hetzner.home, provision: { stamp, script: 'exit 1', sudo: false } });
+    expect(await (await other.open(handle)).readFile('hooks.log')).toBe('setup\nboot\nboot\nsetup\nboot\n');
+  });
+
   it('parks straight to a deleted server when its paid hour is nearly over', async () => {
     const world = await provider.create({ taskId: 'task_late', base: 'main', generation: 1, organizationId: 'org_h' });
     [...hetzner.servers.values()][0]!.created = new Date(Date.now() - 58 * 60_000).toISOString();

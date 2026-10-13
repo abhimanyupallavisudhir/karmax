@@ -15,6 +15,8 @@ export const VM_HOME = '/home/user';
 /** karmax's sshd port. Not 22: Fly's own `hallpass` SSH listens there. */
 export const VM_SSH_PORT = 2222;
 export const VM_ETC = '/etc/karmax';
+/** How the provisioning script names the step that failed (vmProvisionFailure reads it). */
+const PROVISION_FAILED = 'karmax provisioning failed';
 
 /**
  * Runs as root at every boot, before anything else needs the machine: the VM
@@ -106,19 +108,55 @@ export function vmProvisionScript(stamp = vmProvisionStamp()): string {
 # karmax VM provisioning (src/world/vm/provision.ts), as root.
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
+# Name the step that failed (retry names its own): the error karmax reports leads with it (vmProvisionFailure).
+trap 'echo "${PROVISION_FAILED} (status $?): $BASH_COMMAND" >&2' ERR
 # No package may restart a running service: on Fly, sshd is the machine's main process.
 printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d && chmod 755 /usr/sbin/policy-rc.d
 trap 'rm -f /usr/sbin/policy-rc.d' EXIT
-retry() { for attempt in 1 2 3; do "$@" && return 0; sleep $((attempt * 5)); done; return 1; }
-retry apt-get update -qq
-retry apt-get install -y -qq --no-install-recommends ca-certificates curl gnupg git openssh-server sudo xz-utils \\
-  python3 build-essential procps unzip jq less util-linux e2fsprogs bubblewrap
+retry() {
+  for attempt in 1 2 3 4; do "$@" && return 0; echo "attempt $attempt failed: $*" >&2; [ $attempt = 4 ] || sleep $((attempt * 10)); done
+  echo "${PROVISION_FAILED} (status 1): $*" >&2; return 1
+}
+# A stalled mirror is given up on after 30 s and retried, here and in the
+# world's own setup commands.
+cat > /etc/apt/apt.conf.d/80karmax << 'EOF'
+Acquire::Retries "3";
+Acquire::http::Timeout "30";
+Acquire::https::Timeout "30";
+EOF
+# A source that cannot be reached fails the update: by default it is only a
+# warning, and every install after it fails with "Unable to locate package".
+apt_update() { apt-get update -qq --error-on=any; }
+retry apt_update
+# What the E2B template's base image has (node:22-bookworm, i.e.
+# buildpack-deps), so project setup written for E2B runs here unchanged:
+# build tools and the -dev libraries native packages compile against,
+# ImageMagick, gh, and Python with pip and venv — pip may install outside a
+# virtualenv, as on E2B.
+retry apt-get install -y -qq --no-install-recommends \\
+  ca-certificates curl wget gnupg netbase git openssh-client openssh-server sudo procps less file patch \\
+  xz-utils bzip2 unzip zip rsync jq util-linux e2fsprogs bubblewrap gh \\
+  build-essential autoconf automake libtool dpkg-dev pkg-config imagemagick \\
+  libbz2-dev libcurl4-openssl-dev libdb-dev libevent-dev libffi-dev libgdbm-dev libglib2.0-dev libgmp-dev libjpeg-dev \\
+  libkrb5-dev liblzma-dev libmagickcore-dev libmagickwand-dev libmaxminddb-dev libncurses5-dev libncursesw5-dev libpng-dev \\
+  libpq-dev default-libmysqlclient-dev libreadline-dev libsqlite3-dev libssl-dev libwebp-dev libxml2-dev libxslt1-dev \\
+  libyaml-dev zlib1g-dev python3 python3-dev python3-pip python3-venv python-is-python3
+printf '[global]\nbreak-system-packages = true\n' > /etc/pip.conf
 if [ "$(dpkg --print-architecture)" = amd64 ] && ! command -v google-chrome > /dev/null; then
   install -d -m 0755 /etc/apt/keyrings
-  curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | gpg --batch --yes --dearmor -o /etc/apt/keyrings/google-chrome.gpg
-  echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list
-  retry apt-get update -qq
-  retry apt-get install -y -qq --no-install-recommends google-chrome-stable
+  retry sh -c 'curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | gpg --batch --yes --dearmor -o /etc/apt/keyrings/google-chrome.gpg'
+  # From Hetzner's network dl.google.com answers plain HTTP never and HTTPS at
+  # ~100 KB/s, so the ~140 MB package times out (pramana#39, 2026-10-13).
+  # Google's download CDN serves the same repository at full speed; apt checks
+  # it against Google's key all the same. dl.google.com stays the fallback.
+  chrome_from() {
+    echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.gpg] $1 stable main" > /etc/apt/sources.list.d/google-chrome.list
+    apt_update && apt-get install -y -qq --no-install-recommends google-chrome-stable
+  }
+  retry chrome_from https://edgedl.me.gvt1.com/edgedl/linux/chrome/deb/ || retry chrome_from https://dl.google.com/linux/chrome/deb/
+  # Chrome's package adds dl.google.com as a source of its own: without it
+  # the world's own apt commands never wait on Google. It is not re-added.
+  rm -f /etc/apt/sources.list.d/google-chrome.list /etc/apt/sources.list.d/google-chrome.sources
 fi
 if ! node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 22 ? 0 : 1)' 2> /dev/null; then
   arch=$(uname -m | sed 's/x86_64/x64/; s/aarch64/arm64/')
@@ -151,6 +189,24 @@ export KARMAX_BROWSER_BIN=/opt/karmax/bin
 EOF
 touch ${quote(stamp)}
 `;
+}
+
+/**
+ * What a failed script's log says went wrong, for a person: the step that
+ * failed and the lines that read as errors (apt's `E:`/`W:`, npm's `ERR!`,
+ * curl's and others' `error`), not the last screen of package output — the
+ * cause of pramana#39 (`W: Failed to fetch …`) sat under forty `Setting up …`
+ * lines. Falls back to the log's tail.
+ */
+export function vmProvisionFailure(log: string, status: string | number): string {
+  const lines = log.replace(/\r/g, '').split('\n').map((line) => line.trimEnd()).filter(Boolean);
+  // The last report is the step; the trap also sees `retry` itself return.
+  const step = lines.filter((line) => line.startsWith(PROVISION_FAILED) && !/\): return \d+$/.test(line)).at(-1)?.match(/\(status (\d+)\): (.*)$/);
+  const errors = [...new Set(lines.filter((line) => !line.startsWith(PROVISION_FAILED)
+    && /^(E|W|Err):|\bERR!|\berror\b|\bfatal\b|\bfailed\b|\bnot found\b|\bunable to\b|\bcannot\b|\bno such file\b|\bpermission denied\b|^curl: \(\d+\)|^gpg: /i.test(line)))];
+  const detail = (errors.length ? errors.slice(-12) : lines.slice(-15)).map((line) => line.slice(0, 300)).join('\n');
+  const head = step ? `\`${step[2]!.replace(/\s+/g, ' ').slice(0, 200)}\` exited with status ${step[1]}` : `the script exited with status ${status}`;
+  return `${head}:\n${detail}`;
 }
 
 /** Present on a machine that ran this exact provisioning script. */

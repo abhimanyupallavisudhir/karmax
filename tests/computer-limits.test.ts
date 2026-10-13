@@ -21,11 +21,11 @@ describe('computer limits', () => {
   // A provider's form shows only what it can do: VM worlds have no desktop and
   // no outbound allowlist; providers without a record (this machine) offer all.
   it('says which Computer options each provider supports', () => {
-    expect(providerFeatures('e2b')).toEqual({ desktop: true, allowlist: true });
-    expect(providerFeatures('daytona')).toEqual({ desktop: true, allowlist: true });
-    expect(providerFeatures('fly')).toEqual({ desktop: false, allowlist: false });
-    expect(providerFeatures('hetzner')).toEqual({ desktop: false, allowlist: false });
-    expect(providerFeatures('container')).toEqual({ desktop: true, allowlist: true });
+    expect(providerFeatures('e2b')).toEqual({ desktop: true, allowlist: true, environmentBuilds: true });
+    expect(providerFeatures('daytona')).toEqual({ desktop: true, allowlist: true, environmentBuilds: true });
+    expect(providerFeatures('fly')).toEqual({ desktop: false, allowlist: false, environmentBuilds: false });
+    expect(providerFeatures('hetzner')).toEqual({ desktop: false, allowlist: false, environmentBuilds: false });
+    expect(providerFeatures('container')).toEqual({ desktop: true, allowlist: true, environmentBuilds: true });
   });
   it('reads the limit out of each provider\'s refusal', () => {
     expect(limitFromMessage(E2B.disk)).toEqual({ dimension: 'disk', value: 25600, unit: 'MiB' });

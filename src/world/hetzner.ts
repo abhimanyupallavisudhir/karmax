@@ -3,7 +3,7 @@ import type { MachineShape } from '../domain/computer.js';
 import type { ComputerLimits } from '../domain/computer-limits.js';
 import type { ResolvedWorldProviderConnection } from './connections.js';
 import type { ProviderUsageEvent, WorldLifecycleState } from './types.js';
-import type { VmAllocation, VmBootKeys, VmDriver, VmListing, VmShape } from './vm/provider.js';
+import { runDetached, type VmAllocation, type VmBootKeys, type VmDriver, type VmListing, type VmShape } from './vm/provider.js';
 import { VM_ETC, VM_SSH_PORT, VM_USER, vmBootScript, vmProvisionScript, vmProvisionStamp, vmProvisionVersion } from './vm/provision.js';
 import { generateSshKeyPair, quote, SshTransport } from './vm/ssh.js';
 
@@ -378,10 +378,9 @@ export class HetznerDriver implements VmDriver {
           if (attempt > 60) throw new Error('the image builder never answered SSH');
           await new Promise((resolve) => setTimeout(resolve, 5 * this.pollMs));
         }
-        await transport.writeFile('/tmp/karmax-provision.sh', Buffer.from(vmProvisionScript()), 0o700);
-        const run = await transport.exec('sudo -n bash /tmp/karmax-provision.sh > /tmp/karmax-provision.log 2>&1 || { tail -n 40 /tmp/karmax-provision.log; exit 1; }',
-          { timeoutMs: 30 * 60_000 });
-        if (run.code !== 0) throw new Error(`provisioning failed: ${run.stdout.toString().slice(-2000)}`);
+        // Detached and polled, as a world provisions: minutes of installs must not hang on one channel.
+        await runDetached(transport, vmProvisionScript(), true, 30 * 60_000)
+          .catch((error) => { throw new Error(`provisioning failed: ${error instanceof Error ? error.message : String(error)}`); });
         // Nothing of this server's own may reach the worlds made from it.
         await transport.exec(`sudo -n sh -c ${quote(`rm -rf ${VM_ETC} /etc/ssh/sshd_config.d/00-karmax.conf /var/lib/cloud/scripts/per-boot/karmax-boot.sh; `
           + `test -f ${vmProvisionStamp()} && cloud-init clean --logs --seed; sync`)}`, { timeoutMs: 120_000 });

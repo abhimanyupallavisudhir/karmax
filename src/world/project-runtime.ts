@@ -6,6 +6,7 @@ import { bootCommands, setupCommands } from './environment-build.js';
 import type { ProjectResourceService } from './resources.js';
 import { e2bTemplate, e2bWorldTemplate } from './e2b-template.js';
 import { machineShape } from '../domain/computer.js';
+import { providerFeatures } from '../domain/computer-limits.js';
 import { launchWorldServices } from './services.js';
 import { worldRepos, type World, type WorldHandle } from './types.js';
 
@@ -82,13 +83,17 @@ export async function activateProjectRuntime(args: {
   const { world, selection } = args;
   if (selection.spec && !['worktree', 'memory'].includes(world.handle.kind)) {
     const setup = args.runSetupIfUnbuilt && !selection.built ? setupCommands(selection.spec) : [];
-    if (setup.length)
+    // Advice only where a build exists: a VM world always runs setup live.
+    if (setup.length && providerFeatures(world.handle.kind).environmentBuilds)
       warnings.push('environment build is not ready; setup ran live (build it in Project Settings → Environment for faster worlds)');
-    for (const command of [...setup, ...bootCommands(selection.spec)]) {
+    const boot = bootCommands(selection.spec);
+    for (const command of [...setup, ...boot]) {
       const result = await world.exec('bash', ['-lc', command], { timeoutMs: 30 * 60_000 });
       if (result.code !== 0)
         warnings.push(`environment command "${command}" failed: ${(result.stderr || result.stdout).slice(-300)}`);
     }
+    // A machine that restarts on wake replays them (VM worlds: `machineHooks` in vm/provider.ts).
+    if (setup.length || boot.length) world.handle.meta = { ...world.handle.meta, machineHooks: { setup, boot } };
   }
   // Dependency installs need the checkout, so no snapshot can hold them, and
   // running them here would delay every task (~45 s for a typical Node project)

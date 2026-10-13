@@ -3967,13 +3967,23 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           if (!(await owns())) return;
           await deps.resources?.release(current);
           if (!(await owns())) return;
-          const world = await worlds.open(current);
-          if (!(await owns())) return;
-          await settleSessions(handle.id, browserOutlivesTurns(current.kind) ? world : undefined, true);
-          if (!(await owns())) return;
-          // A remote sandbox takes its jobs with it; a host-side world must stop them.
-          if (!isRemote(current.kind)) await stopJobs(world).catch(() => undefined);
-          await world.destroy();
+          const provider = worlds.get(current.kind);
+          if (isRemote(current.kind) && provider.destroy && await store.worldState(handle.id) === 'parked') {
+            // Never wake a parked world only to delete it: a VM would boot (a
+            // Hetzner one as a new, billed server) and replay its hooks first.
+            // Its sessions were settled as it parked, and nothing runs in it.
+            await settleSessions(handle.id, undefined, true);
+            if (!(await owns())) return;
+            await provider.destroy(current);
+          } else {
+            const world = await worlds.open(current);
+            if (!(await owns())) return;
+            await settleSessions(handle.id, browserOutlivesTurns(current.kind) ? world : undefined, true);
+            if (!(await owns())) return;
+            // A remote sandbox takes its jobs with it; a host-side world must stop them.
+            if (!isRemote(current.kind)) await stopJobs(world).catch(() => undefined);
+            await world.destroy();
+          }
           if (!(await owns())) return;
           await store.setWorldState(current, 'released');
           await record(handle.id, 'world.destroyed', {});
