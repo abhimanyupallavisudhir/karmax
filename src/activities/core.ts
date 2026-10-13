@@ -1435,6 +1435,16 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     }
   }
 
+  /** Whether this activity's workflow run is the task's: the run its pin names
+   * or, with no pin (a task started straight from creation or by a trigger, or
+   * between continue-as-new runs), the workflow id's only live run, this one. */
+  async function runOwnsTask(taskId: string): Promise<boolean> {
+    let runId: string | undefined;
+    try { runId = activityContext.current().info.workflowExecution?.runId; } catch { /* direct tests */ }
+    const pinned = (await store.taskMetadata(taskId))?.params._workflowRunId;
+    return Boolean(runId) && (!pinned || pinned === runId);
+  }
+
   /** The task's world, as the handle its workflow holds names it. A workflow
    * keeps the handle it created, while a restore (a move to another provider, a
    * resize, a recovery) registers a newer generation within the same run; that
@@ -1443,9 +1453,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
   async function ownWorld(handle: WorldHandle): Promise<WorldHandle> {
     const current = (await store.currentWorld(handle.id)) as WorldHandle | undefined;
     if (!current || (current.generation ?? 1) <= (handle.generation ?? 1)) return handle;
-    let runId: string | undefined;
-    try { runId = activityContext.current().info.workflowExecution?.runId; } catch { /* direct tests */ }
-    return runId && (await store.taskMetadata(handle.id))?.params._workflowRunId === runId ? current : handle;
+    return (await runOwnsTask(handle.id)) ? current : handle;
   }
 
   async function maintainWaitingWorld(taskId: string, view: LifecyclePublication, fence: string, retryFailure = true): Promise<void> {
@@ -3934,7 +3942,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // destroying whichever replacement the resolver currently returns.
         if (ownerRun && runId && ownerRun !== runId) return;
         if ((current.kind !== handle.kind || (current.generation ?? 1) !== (handle.generation ?? 1))
-          && (!runId || ownerRun !== runId)) return;
+          && !(await runOwnsTask(handle.id))) return;
         const owns = async () => {
           const latest = await store.currentWorld(handle.id);
           const latestRun = (await store.taskMetadata(handle.id))?.params._workflowRunId;
