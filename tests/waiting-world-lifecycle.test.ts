@@ -152,6 +152,64 @@ describe('separate waiting-world maintenance', () => {
     expect(f.park).not.toHaveBeenCalled();
   });
 
+  // Canary of task #610: after a move (or a resize, or a recovery) the task's world is a
+  // newer generation, here on another provider, that its workflow never hears of. It
+  // never parked again, so a Hetzner server ran on and the sweep never hibernated it.
+  async function moved() {
+    const f = (await fixture('e2b'));
+    let parked = false;
+    const park = vi.fn(async (handle: any) => { parked = true; return handle; });
+    f.worlds.register({ kind: 'hetzner', capabilities: { remote: true }, parkable: true, open: async (handle: any) => ({ handle }),
+      park, status: async () => parked ? 'parked' : 'ready' } as any);
+    const restored = (await f.store.registerWorld({ ...f.handle, kind: 'hetzner', provider: 'hetzner', generation: 2 }, f.project.id)) as any;
+    const sameRun = async (runId: string) => {
+      (await f.store.patchTaskParams(f.task.id, { _workflowRunId: 'run' }));
+      vi.spyOn(Context, 'current').mockReturnValue({ heartbeat() {}, cancellationSignal: new AbortController().signal,
+        info: { workflowExecution: { runId } } } as any);
+    };
+    return { ...f, hetznerPark: park, restored, sameRun };
+  }
+
+  it('parks the world its own run restored, though the workflow still holds the one it created', async () => {
+    const f = await moved();
+    await f.sameRun('run');
+    const paused = { ...f.view, waitingFor: { kind: 'timer' as const, detail: 'Waiting 30 min', until: Date.now() + 60_000 } };
+    const fence = await f.publish(paused);
+    await f.core.parkWaitingWorld(f.task.id, lifecyclePublication(paused), fence!);
+    expect(f.park).not.toHaveBeenCalled();
+    expect(f.hetznerPark).toHaveBeenCalledOnce();
+    expect(f.hetznerPark.mock.calls[0]![0]).toMatchObject({ kind: 'hetzner', generation: 2 });
+    expect(await f.store.worldStateSnapshot(f.restored.id)).toMatchObject({ generation: 2, state: 'parked' });
+    expect((await f.store.eventsOfType(f.task.id, 'world.parked')).at(-1)?.payload).toMatchObject({ provider: 'hetzner' });
+  });
+
+  it('leaves a newer world alone when another run asks', async () => {
+    const f = await moved();
+    await f.sameRun('older-run');
+    const paused = { ...f.view, waitingFor: { kind: 'timer' as const, detail: 'Waiting 30 min', until: Date.now() + 60_000 } };
+    const fence = await f.publish(paused);
+    await f.core.parkWaitingWorld(f.task.id, lifecyclePublication(paused), fence!);
+    expect(f.hetznerPark).not.toHaveBeenCalled();
+    expect(f.park).not.toHaveBeenCalled();
+  });
+
+  it('suspends the world its own run restored when the task is cancelled', async () => {
+    const f = await moved();
+    await f.sameRun('run');
+    await f.store.createRunnerPool({ id: 'test', organizationId: f.project.organizationId!, name: 'Test', provider: 'hetzner',
+      mode: 'customer', capacity: { activeWorlds: 1, cpu: 2, memoryMb: 2048, gpu: 0 }, enabled: true });
+    const lease = await f.store.requestWorldLease({ runnerPoolId: 'test', organizationId: f.project.organizationId!,
+      projectId: f.project.id, taskId: f.task.id, worldId: f.handle.id });
+    await f.store.updateWorldMeta(f.restored, { worldLeaseId: lease.id });
+    const exec = vi.fn(async () => ({ code: 0, stdout: '', stderr: '' }));
+    f.worlds.register({ ...f.worlds.get('hetzner'), open: async (handle: any) => ({ handle, exec }) } as any);
+    await f.store.saveView(f.task.id, { ...f.view, status: 'cancelled', stage: 'cancelled' });
+    await f.core.suspendWorldForRecovery(f.handle);
+    expect(await f.store.eventsOfType(f.task.id, 'world.suspend_failed')).toEqual([]);
+    expect(f.hetznerPark).toHaveBeenCalledOnce();
+    expect(await f.store.worldStateSnapshot(f.restored.id)).toMatchObject({ generation: 2, state: 'parked' });
+  });
+
   it('rechecks a publication changed while checkpointing', async () => {
     const f = (await fixture()), started = deferred(), finish = deferred();
     f.checkpoint.mockImplementation(async () => { started.resolve(); await finish.promise; return { id: 'checkpoint', generation: 1 }; });

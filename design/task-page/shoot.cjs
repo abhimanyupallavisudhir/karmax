@@ -45,7 +45,7 @@ const TASK = (n) => `/personal/video-studio/tasks/${n}`;
       await shot(desktop, '7-desktop-waiting-task');
     }
     await desktop.goto(`${APP}/personal/video-studio`); await desktop.locator('.task-row').first().waitFor();
-    await desktop.locator('.view-chip', { hasText: 'All' }).first().click(); await desktop.waitForTimeout(1500);
+    await desktop.locator('.view-chip', { hasText: 'Active' }).first().click(); await desktop.waitForTimeout(1500);
     await shot(desktop, '8-desktop-task-list');
     const mobile = await open({ width: 390, height: 844 });
     await mobile.evaluate(() => localStorage.removeItem('karmax-task-rail')).catch(() => {});

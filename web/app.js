@@ -28,7 +28,7 @@ function storageContentsMarkup(contents) {
   const projects = (contents?.projects || []).filter((project) => project.bytes > 0);
   if (!projects.length) return '';
   const rows = projects.map((project) => {
-    const resources = project.resources.map((resource) => `<div class="member-row storage-item"><span>${esc(resource.name)}</span><span>${formatBytes(resource.currentBytes)}${resource.olderVersions ? ` · ${resource.olderVersions} older version${resource.olderVersions === 1 ? '' : 's'} ${formatBytes(resource.olderBytes)}` : ''}${resource.taskCopies ? ` · task copies ${formatBytes(resource.taskCopyBytes)}` : ''}</span>${resource.olderVersions ? `<button class="btn sm" data-older-versions="${esc(resource.id)}">Delete older versions</button>` : ''}</div>`).join('');
+    const resources = project.resources.map((resource) => `<div class="member-row storage-item"><span>${esc(resource.name)}</span><span>${formatBytes(resource.currentBytes)}${resource.olderVersions ? ` · ${resource.olderVersions} older version${resource.olderVersions === 1 ? '' : 's'} ${formatBytes(resource.olderBytes)}${contents.policy?.olderVersionDays ? ` ${policyTip(`Deleted ${contents.policy.olderVersionDays} days after a newer version replaces them, unless a task still uses them.`)}` : ''}` : ''}${resource.taskCopies ? ` · task copies ${formatBytes(resource.taskCopyBytes)}` : ''}</span>${resource.olderVersions ? `<button class="btn sm" data-older-versions="${esc(resource.id)}">Delete older versions</button>` : ''}</div>`).join('');
     const workspaces = project.checkpoints.count ? `<div class="member-row storage-item"><span>Saved task workspaces ${policyTip(`Uncommitted files of parked tasks. A finished task's are deleted ${contents.policy.finishedTaskCheckpointDays} days after it ends.`)}</span><span>${formatBytes(project.checkpoints.bytes)}</span>${project.checkpoints.finishedCount ? `<button class="btn sm" data-finished-workspaces="${esc(project.projectId)}">Delete finished (${formatBytes(project.checkpoints.finishedBytes)})</button>` : ''}</div>` : '';
     const artifacts = project.artifacts.count ? `<div class="member-row storage-item"><span>Review files ${policyTip('Files attached to reviews. They are deleted automatically when they expire.')}</span><span>${formatBytes(project.artifacts.bytes)}</span></div>` : '';
     return `<div class="storage-project"><div class="member-row"><b>${esc(project.name)}</b><span>${formatBytes(project.bytes)}</span></div>${resources}${workspaces}${artifacts}</div>`;
@@ -302,6 +302,13 @@ function feedbackFetch(input, opts = {}) {
 
 // Non-principal attempts are intentionally absent from S.tasks because the list
 // has one row per logical task. Page lookups must also consult the loaded group.
+// A live repeatable series: the row its runs nest under. A draft is not one,
+// even with Repeatable ticked: it shows (and runs) as a draft. Mirrors isSeries
+// in src/domain/triggers.ts.
+function isSeries(params) {
+  return !!params?.repeatable && !params?.draft;
+}
+
 function taskRecord(id) {
   return (S.attemptGroup?.attempts || []).find((t) => t.id === id)
     || (S.tasks || []).find((t) => t.id === id)
@@ -327,8 +334,8 @@ function taskRecord(id) {
 //   /<org>/<project>                     → task list (also /queue, /activity, /wiki, /settings)
 //   /<org>/<project>/tasks/:num          → the task's own page (permalink)
 //   /<org>/<project>/tasks/:num/:tab     → the task page pinned to one of its tabs
-// A task list's query rides in ?q=; no ?q means the default `for:me`, and an
-// empty ?q= is "All".
+// A task list's query rides in ?q=; no ?q means the default `for:me -is:archived`,
+// and an empty ?q= is every task.
 // Pre-organization URLs (/dashboard, /organization, /projects/:name/…) are still
 // parsed and then canonicalised to the org form.
 function slugify(s) {
@@ -411,7 +418,7 @@ function orgBase(org = currentOrg()) { return org ? `/${orgSlug(org)}` : ''; }
 const PROJECT_SCOPED_TABS = ['tasks', 'queue', 'activity', 'wiki', 'avatars', 'settings'];
 const PROJECT_TAB_COMMANDS = { tasks: 'nav.tasks', queue: 'nav.queue', wiki: 'nav.wiki', settings: 'nav.settings' };
 // The query a task list opens with: what needs the signed-in person.
-const DEFAULT_LIST_QUERY = 'for:me';
+const DEFAULT_LIST_QUERY = 'for:me -is:archived';
 // Second-segment words that name an organization-level view rather than a project.
 const ORG_VIEWS = { insights: 'insights', settings: 'organization', inbox: 'inbox', wiki: 'orgwiki' };
 
@@ -514,8 +521,8 @@ function projectRoute(pid, tab = 'tasks', q = pid === S.searchScope ? S.search :
   return listRoute(base, q);
 }
 
-// A task list's URL: the default query (`for:me`) is the bare path, anything
-// else — "All" (the empty query) included — is spelled out in ?q=.
+// A task list's URL: the default query (`for:me -is:archived`) is the bare path,
+// anything else — the empty query (every task) included — is spelled out in ?q=.
 function listRoute(base, q) {
   return q === DEFAULT_LIST_QUERY ? base : `${base}?q=${encodeQuery(q || '')}`;
 }
@@ -1301,13 +1308,15 @@ function wireModelField(field, { fallbackProvider } = {}) {
 // ── Compare models: intelligence against cost or time ────────────────────────
 // Artificial Analysis benchmarks (bundled with tavya, or fetched daily by the
 // server when it has a key) of the models a harness here can run, one point per
-// harness:model:effort. The line is the Pareto frontier, drawn as Artificial
-// Analysis draws it: straight through every point no cheaper (or faster) point
-// beats. (A convex hull would skip models that are the best buy for some budget.)
+// harness:model:effort. Cost and time are per task: the tokens LiveBench
+// measured that model and effort spending on a question, or an estimate (≈).
+// The line is the Pareto frontier, drawn as Artificial Analysis draws it:
+// straight through every point no cheaper (or faster) point beats. (A convex
+// hull would skip models that are the best buy for some budget.)
 // Picking a point fills the field.
 const MODEL_CHART_METRICS = {
-  cost: { label: 'Cost', axis: '$ per answer', ticks: [0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5], format: (v) => `$${Number(v.toPrecision(2))}` },
-  seconds: { label: 'Time', axis: 'seconds per answer', ticks: [0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000], format: (v) => `${v < 10 ? Math.round(v * 10) / 10 : Math.round(v)} s` },
+  cost: { label: 'Cost', axis: '$ per task', ticks: [0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5], format: (v) => `$${Number(v.toPrecision(2))}` },
+  seconds: { label: 'Time', axis: 'seconds per task', ticks: [0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000], format: (v) => `${v < 10 ? Math.round(v * 10) / 10 : Math.round(v)} s` },
 };
 function loadModelBenchmarks() {
   const organizationId = S.organizationId || '';
@@ -1405,7 +1414,7 @@ function openModelChart(current, onPick, opener) {
     <div class="mc-plot"><div class="mc-empty">Loading…</div></div>
     <div class="mc-foot">
       <div class="mc-legend"></div>
-      <span class="mc-source">${policyTip('Intelligence is the Artificial Analysis Intelligence Index. Cost and time are for a 500-token answer to a short prompt, thinking included, as Artificial Analysis measures them. Thin lines join one model\'s effort levels; the dark line is the most intelligence you can get for the cost or time.')} Data: <a href="https://artificialanalysis.ai/" target="_blank" rel="noopener">Artificial Analysis</a></span>
+      <span class="mc-source">${policyTip('Intelligence is the Artificial Analysis Intelligence Index. Cost and time are per task: what a model spends answering a LiveBench question, thinking included. LiveBench measured some models and effort levels; the rest (≈) are estimated from them. Thin lines join one model\'s effort levels; the dark line is the most intelligence you can get for the cost or time.')} <span>Data: <a href="https://artificialanalysis.ai/" target="_blank" rel="noopener">Artificial Analysis</a>, <a href="https://livebench.ai/" target="_blank" rel="noopener">LiveBench</a></span></span>
     </div>
   </div>`;
   document.body.appendChild(overlay);
@@ -1418,8 +1427,9 @@ function openModelChart(current, onPick, opener) {
     const model = data?.models[Number(group.dataset.index)];
     if (!model) return;
     const ref = formatModelRef(model.ref);
+    const approx = model.measured ? '' : '≈';
     tip.innerHTML = `<b>${esc(benchmarkLabel(model))}</b><code>${esc(ref)}</code>
-      <span>Intelligence ${esc(String(model.intelligence))}${model.cost ? ` · ${esc(MODEL_CHART_METRICS.cost.format(model.cost))} per answer` : ''}${model.seconds ? ` · ${esc(MODEL_CHART_METRICS.seconds.format(model.seconds))}` : ''}</span>`;
+      <span>Intelligence ${esc(String(model.intelligence))}${model.cost ? ` · ${approx}${esc(MODEL_CHART_METRICS.cost.format(model.cost))} per task` : ''}${model.seconds ? ` · ${approx}${esc(MODEL_CHART_METRICS.seconds.format(model.seconds))}` : ''}</span>`;
     tip.hidden = false;
     const dot = group.querySelector('.mc-dot').getBoundingClientRect();
     const box = plot.getBoundingClientRect();
@@ -1438,7 +1448,7 @@ function openModelChart(current, onPick, opener) {
     const missing = data.models.filter((model) => !hidden.has(model.ref.provider) && !model[metric]).length;
     overlay.querySelector('.mc-legend').innerHTML = harnesses.map((provider) => `<button type="button" class="mc-key" data-harness="${esc(provider)}" aria-pressed="${!hidden.has(provider)}"><i></i>${esc(provider)}</button>`).join('')
       + '<span class="mc-key-frontier"><i></i>Pareto frontier</span>'
-      + (missing && points.length ? `<span class="mc-missing" title="Artificial Analysis has not measured these yet">${missing} without ${MODEL_CHART_METRICS[metric].label.toLowerCase()} data</span>` : '');
+      + (missing && points.length ? `<span class="mc-missing" title="Not measured yet">${missing} without ${MODEL_CHART_METRICS[metric].label.toLowerCase()} data</span>` : '');
   };
   overlay.addEventListener('click', (event) => {
     if (event.target === overlay || event.target.closest('.mc-close')) return close();
@@ -4500,7 +4510,7 @@ async function runSearch() {
   const scope = scopeOf();
   if (S.tab === 'home' ? !organizationId : S.tab !== 'inbox' && !projectId) return false;
   const isCurrent = () => scopeOf() === scope;
-  const q = effectiveQuery(S.search); // adds the default -is:archived unless overridden
+  const q = effectiveQuery(S.search); // adds the default -is:run -is:subtask unless overridden
   const epoch = S.searchEpoch = (S.searchEpoch || 0) + 1;
   S.searchPending = true;
   try {
@@ -5882,24 +5892,25 @@ function taskMatches(t, q) {
   return s.split(/\s+/).every((term) => !term || hay.includes(term));
 }
 
-// The default list transparently hides three kinds of noise unless the query opts in:
-// archived tasks (`-is:archived`), the auto-spawned *runs* of a repeatable series
-// (`-is:run`), and delegated *sub-tasks* (`-is:subtask`) — a sub-task lives under its
-// parent's detail page, not as a sibling at the top level, so a fan-out of children
-// doesn't flood the list. Its parent still shows, and you drill into children with
-// `is:subtask` (or the Sub-tasks/Repeatable/Archived views). These are therefore just
-// facets, not toggles. The clean `S.search` stays in the box; only the evaluated query
-// carries the defaults. If the query already mentions a facet, we leave it.
-// The task-picker overlay passes its own facet list (e.g. the fork search keeps archived).
+// The default list transparently hides two kinds of nesting unless the query opts in:
+// the auto-spawned *runs* of a repeatable series (`-is:run`), and delegated *sub-tasks*
+// (`-is:subtask`) — a sub-task lives under its parent's detail page, not as a sibling
+// at the top level, so a fan-out of children doesn't flood the list. Its parent still
+// shows, and you drill into children with `is:subtask` (or the Repeatable view). These
+// are therefore just facets, not toggles. The clean `S.search` stays in the box; only
+// the evaluated query carries the defaults. If the query already mentions a facet, we
+// leave it. Archived tasks are not hidden implicitly: the views that leave them out say
+// `-is:archived`, so an empty query is every task. The task-picker overlay passes its
+// own facet list.
 function queryMentionsFacet(q, facet) { return new RegExp(`(^|\\s)-?(is|has):[^\\s]*${facet}`, 'i').test(q || ''); }
 // A `for:` query asks what waits on a person, wherever it sits: a sub-task or a
 // run that needs a human routes to them, so those facets are not hidden.
 function queryNamesPerson(q) { return /(^|\s)for:\S/i.test(q || ''); }
 function listShowsNested(q, facet) { return queryMentionsFacet(q, facet) || queryNamesPerson(q); }
-function effectiveQuery(q, facets = ['archived', 'run', 'subtask']) {
+function effectiveQuery(q, facets = ['run', 'subtask']) {
   let s = (q || '').trim();
   for (const facet of facets)
-    if (!queryMentionsFacet(s, facet) && !(facet !== 'archived' && queryNamesPerson(s))) s = `${s} -is:${facet}`.trim();
+    if (!queryMentionsFacet(s, facet) && !queryNamesPerson(s)) s = `${s} -is:${facet}`.trim();
   return s;
 }
 
@@ -5907,10 +5918,10 @@ function effectiveQuery(q, facets = ['archived', 'run', 'subtask']) {
 // first-class instead of buried. Each is just a query string; they
 // can't be deleted (no ✕). Keep the queries in step with the facets in src/domain/search.ts.
 const BUILTIN_VIEWS = [
-  { id: 'builtin:sectioned-type', name: 'Sectioned (type)', icon: '§', query: 'group:tag-type' },
-  { id: 'builtin:sectioned-topic', name: 'Sectioned (topic)', icon: '§', query: 'group:tag-topic' },
-  { id: 'builtin:scheduled', name: 'Scheduled', icon: '⏰', query: 'is:scheduled sort:nextRun-asc' },
-  { id: 'builtin:series', name: 'Repeatable', icon: '🔁', query: 'is:series' },
+  { id: 'builtin:sectioned-type', name: 'Sectioned (type)', icon: '§', query: '-is:archived group:tag-type' },
+  { id: 'builtin:sectioned-topic', name: 'Sectioned (topic)', icon: '§', query: '-is:archived group:tag-topic' },
+  { id: 'builtin:scheduled', name: 'Scheduled', icon: '⏰', query: 'is:scheduled -is:archived sort:nextRun-asc' },
+  { id: 'builtin:series', name: 'Repeatable', icon: '🔁', query: 'is:series -is:archived' },
   { id: 'builtin:archived', name: 'Archived', icon: '🗄', query: 'is:archived' },
 ];
 
@@ -5918,14 +5929,15 @@ const BUILTIN_VIEWS = [
 // there is no separate "selected view" to keep in sync, and a pasted or reloaded
 // ?q= URL lights the right chip for free. Comparison is on the canonical form, so
 // a view still matches when its query was re-spelled by the toolbar or round-tripped
-// through the saved (structured) form. The empty query is the "All" chip; a query
-// that matches no view lights nothing — "no filter" and "a filter I haven't saved"
-// are different states, and only the first of them is All.
-const ALL_VIEW = '__all__'; // the chip standing for the empty (unfiltered) query
+// through the saved (structured) form. A query that matches no view lights nothing —
+// including the empty one, which is every task, archived ones too.
+const ACTIVE_VIEW_QUERY = '-is:archived';
+const ACTIVE_VIEW = '__active__'; // the chip for every task that isn't archived
 const FOR_ME_VIEW = '__for_me__'; // the default chip: what waits on you
 function viewIdForQuery(q) {
   const s = normalizeQuery(q);
-  if (!s) return ALL_VIEW;
+  if (!s) return null;
+  if (s === normalizeQuery(ACTIVE_VIEW_QUERY)) return ACTIVE_VIEW;
   if (s === normalizeQuery(DEFAULT_LIST_QUERY)) return FOR_ME_VIEW;
   return BUILTIN_VIEWS.find((v) => normalizeQuery(v.query) === s)?.id
     || (S.views || []).find((v) => normalizeQuery(stringifyQuery(v.query || {})) === s)?.id
@@ -5933,7 +5945,7 @@ function viewIdForQuery(q) {
 }
 
 // The saved-views switcher — every chip is a query. "For me" is the default, then
-// "All", the built-in starter views, and the project's saved views (each with a ✕
+// "Active", the built-in starter views, and the project's saved views (each with a ✕
 // to delete). Saved views belong to a project, so the organization home has none.
 function viewsBar() {
   const active = viewIdForQuery(S.search);
@@ -5948,7 +5960,7 @@ function viewsBar() {
     .join('');
   return `<div class="views-bar">
     <div class="view-chip ${active === FOR_ME_VIEW ? 'active' : ''}" data-view="${FOR_ME_VIEW}" role="button" tabindex="0" title="Waiting on you: reviews, questions, approvals, mentions — and your drafts">◉ For me</div>
-    <div class="view-chip ${active === ALL_VIEW ? 'active' : ''}" data-view="${ALL_VIEW}" role="button" tabindex="0">≡ All</div>
+    <div class="view-chip ${active === ACTIVE_VIEW ? 'active' : ''}" data-view="${ACTIVE_VIEW}" role="button" tabindex="0" title="${esc(ACTIVE_VIEW_QUERY)}">≡ Active</div>
     ${builtins}
     ${saved}
     ${home ? '' : '<div class="view-chip add" id="save-view" role="button" tabindex="0" title="Save the current query as a view">＋ Save view</div>'}
@@ -6053,7 +6065,14 @@ function tasksView() {
   // not shown at the top level. Build the lookup once for taskRow/seriesRow, and
   // hide runs from every list surface (flat + grouped) below.
   S._runsBySeries = {};
-  for (const t of S.tasks) if (t.params?.runOf) (S._runsBySeries[t.params.runOf] ||= []).push(t);
+  const loaded = new Map();
+  for (const t of S.tasks) {
+    loaded.set(t.id, t);
+    if (t.params?.runOf) (S._runsBySeries[t.params.runOf] ||= []).push(t);
+  }
+  // Only while its series is live: a run whose task was un-ticked, moved to
+  // drafts or deleted is an ordinary task (the server's `is:run` agrees).
+  const nestedRun = (t) => !!t.params?.runOf && isSeries(loaded.get(t.params.runOf)?.params);
   // Runs nest under their series row and sub-tasks nest under their parent's detail page,
   // so by default neither belongs in the flat top-level list. The server already drops both
   // (the -is:run/-is:subtask defaults from effectiveQuery); this is the client-side fallback,
@@ -6061,9 +6080,9 @@ function tasksView() {
   // `is:subtask`, or a hand-typed `is:run`) so those views aren't stripped to empty.
   const keepRun = listShowsNested(S.search, 'run');
   const keepSub = listShowsNested(S.search, 'subtask');
-  const topLevel = (t) => (keepRun || !t.params?.runOf) && (keepSub || !t.parentTaskId);
-  // The server already applied the query (incl. the default -is:archived from effectiveQuery).
-  // Fallback (before the first result lands) filters client-side and drops archived to match.
+  const topLevel = (t) => (keepRun || !nestedRun(t)) && (keepSub || !t.parentTaskId);
+  // The server already applied the query. The fallback (before the first result lands)
+  // filters the open project's rows, which never include archived ones.
   // Before the first result the open project's rows are a fair preview of a text
   // search, but not of a structured one (for:, status:…) nor of the home's.
   const preview = !across && !/(^|\s)-?[\w.#-]+:/.test(S.search || '');
@@ -6398,7 +6417,7 @@ function taskRow(t, { showTags = true, project = false } = {}) {
   const isDraft = t.params?.draft;
   const archived = t.params?.archived;
   const where = project ? projectLabel(t) : '';
-  if (t.params?.repeatable && !archived) return seriesRow(t);
+  if (isSeries(t.params) && !archived) return seriesRow(t);
   if (t.params?.triggerState === 'armed' && !archived) {
     return `
     <div class="task-row" data-armed="${t.id}">
@@ -6565,12 +6584,12 @@ function pipeline(v) {
 // ── task-organization control wiring (views bar + query toolbar + modals) ─────
 function wireOrgControls() {
   const main = $('#main');
-  // Saved-view chips: each selects a query; "All" is the default (empty) view.
+  // Saved-view chips: each selects a query.
   main.querySelectorAll('.view-chip[data-view]').forEach((el) =>
     el.addEventListener('click', (ev) => {
       if (ev.target.closest('[data-delview]')) return; // the ✕ handles itself
       const id = el.dataset.view;
-      if (id === ALL_VIEW) { setQuery(''); return; }
+      if (id === ACTIVE_VIEW) { setQuery(ACTIVE_VIEW_QUERY); return; }
       if (id === FOR_ME_VIEW) { setQuery(DEFAULT_LIST_QUERY); return; }
       const builtin = BUILTIN_VIEWS.find((x) => x.id === id);
       if (builtin) { setQuery(builtin.query); return; }
@@ -6710,13 +6729,13 @@ function openFilterPicker(fieldKey, onAdd) {
 // picks a task row; mode 'agent' picks an unambiguous session directly or shows
 // attempts with compact agent choices → onPick({ task, role, session }).
 // `defaults` are the facets hidden unless the query mentions them (the list's
-// transparent -is:archived -is:run treatment, parameterized per caller — the
-// fork search deliberately keeps archived tasks in).
+// transparent -is:run treatment, parameterized per caller); `query` is where the
+// search starts — the fork search deliberately keeps archived tasks in.
 // Forking may start from any project the organization can read: the agent
 // picker searches organization-wide, starting at `project:<this project> ` so
 // deleting that one token widens it (the trailing space lets typing go straight
 // on to the next clause).
-function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'run'], exclude, onPick }) {
+function openTaskPicker({ title, hint, mode = 'task', defaults = ['run'], query = '', exclude, onPick }) {
   const organizationWide = mode === 'agent' && !!S.organizationId;
   const ownProject = organizationWide ? projectById(S.projectId) : undefined;
   const root = $('#modal-root');
@@ -6741,19 +6760,19 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
   let closed = false;
   let selection = 0; // ignore agent lookups after closing, searching or choosing another task
   const close = () => { closed = true; selection++; host.remove(); };
-  let q = organizationWide && ownProject ? `project:${projectSlug(ownProject)} ` : '';
+  let q = organizationWide && ownProject ? `project:${projectSlug(ownProject)} ${query}` : query;
   let result = null; // last server evaluation
   let hi = 0; // roving highlight over pickable rows
   const sessions = new Map(); // taskId → [{ task: exact attempt, sessions: role→session }]
   const pending = new Map(); // share in-flight lookups on repeated clicks
   const expanded = new Set(); // taskIds whose attempts are shown
 
-  // View chips (All + built-ins + saved) and the toolbar re-render on every query
+  // View chips (Active + built-ins + saved) and the toolbar re-render on every query
   // change so their selected state tracks the picker's own query, not the list's.
   const paintControls = () => {
     const activeView = viewIdForQuery(q);
     $('#pk-views', host).innerHTML = [
-      `<div class="view-chip ${activeView === ALL_VIEW ? 'active' : ''}" data-pkview="${ALL_VIEW}">≡ All</div>`,
+      `<div class="view-chip ${activeView === ACTIVE_VIEW ? 'active' : ''}" data-pkview="${ACTIVE_VIEW}" title="${esc(ACTIVE_VIEW_QUERY)}">≡ Active</div>`,
       ...BUILTIN_VIEWS.map((v) => `<div class="view-chip builtin ${activeView === v.id ? 'active' : ''}" data-pkview="${v.id}" title="${esc(v.query)}">${esc(v.icon)} ${esc(v.name)}</div>`),
       ...S.views.map((v) => `<div class="view-chip ${activeView === v.id ? 'active' : ''}" data-pkview="${v.id}">${v.icon ? esc(v.icon) + ' ' : ''}${esc(v.name)}</div>`),
     ].join('');
@@ -6762,7 +6781,7 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['archived', 'r
         const id = el.dataset.pkview;
         const bv = BUILTIN_VIEWS.find((x) => x.id === id);
         const sv = S.views.find((x) => x.id === id);
-        setQ(id === ALL_VIEW ? '' : bv ? bv.query : sv ? stringifyQuery(sv.query || {}) : '');
+        setQ(id === ACTIVE_VIEW ? ACTIVE_VIEW_QUERY : bv ? bv.query : sv ? stringifyQuery(sv.query || {}) : '');
       }),
     );
     $('#pk-toolbar', host).innerHTML = queryToolbarHtml(q, 'pk');
@@ -7349,7 +7368,7 @@ function eventTriggerHtml(trigger) {
   const conditions = Object.entries(trigger?.where || {}).filter(([, v]) => !(v && typeof v === 'object' && 'exists' in v))
     .map(([path, expected]) => eventConditionHtml(path, ...eventConditionParts(expected))).join('');
   const mode = trigger?.concurrency ? trigger.concurrency.mode || 'skip' : '';
-  return `<div class="ev-trigger" id="ev-trigger">
+  return `<div class="ev-trigger" id="ev-trigger"${trigger ? '' : ' data-fresh="1"'}>
     <input id="ev-type" list="ev-types" placeholder="github.issues.labeled" value="${esc(trigger?.type || '')}" autocomplete="off" spellcheck="false">
     <datalist id="ev-types"></datalist><datalist id="ev-paths"></datalist>
     <div id="ev-conds">${conditions}</div>
@@ -7437,8 +7456,7 @@ function wireEventTrigger(projectId) {
   };
   type.addEventListener('focus', fillTypes, { once: true });
   type.addEventListener('change', () => {
-    const repeatable = $('#trig-repeatable');
-    if (type.value.trim() && more.hidden && repeatable && !repeatable.disabled) repeatable.checked = true;
+    syncAutoRepeatable();
     more.hidden = !type.value.trim();
     fillPaths();
   });
@@ -7459,16 +7477,31 @@ function readCronCells() {
   return CRON_FIELDS.map((f) => ($('#' + f.id)?.value || '').trim() || '*');
 }
 
-// A schedule forces "repeatable" on (a cron fires forever) and locks the box.
+// A schedule forces Repeatable on (a cron fires forever) and locks the box; a new
+// event trigger ticks it. Whatever the form ticks it unticks again once that is
+// cleared, unless the person has set the box themselves (#616: a cleared
+// schedule left it ticked, and Run task then made a repeatable task).
+function syncAutoRepeatable() {
+  const cb = $('#trig-repeatable');
+  if (!cb) return;
+  const cronSet = readCronCells().join(' ') !== '* * * * *';
+  const newEvent = !!$('#ev-type')?.value.trim() && $('#ev-trigger')?.dataset.fresh === '1';
+  if (cronSet || (newEvent && !cb.dataset.owned)) {
+    if (!cb.checked) { cb.checked = true; cb.dataset.auto = '1'; }
+  } else if (cb.dataset.auto) {
+    cb.checked = false;
+    delete cb.dataset.auto;
+  }
+  cb.disabled = cronSet;
+}
+
 function wireScheduleBuilder() {
-  const syncRepeatable = () => {
-    const cb = $('#trig-repeatable');
-    if (!cb) return;
-    const cronSet = readCronCells().join(' ') !== '* * * * *';
-    if (cronSet) { cb.checked = true; cb.disabled = true; } else { cb.disabled = false; }
-  };
-  CRON_FIELDS.forEach((f) => $('#' + f.id)?.addEventListener('input', syncRepeatable));
-  syncRepeatable();
+  $('#trig-repeatable')?.addEventListener('change', (event) => {
+    event.target.dataset.owned = '1';
+    delete event.target.dataset.auto;
+  });
+  CRON_FIELDS.forEach((f) => $('#' + f.id)?.addEventListener('input', syncAutoRepeatable));
+  syncAutoRepeatable();
 }
 
 // The dependency task ids currently chipped into the picker (state lives in the DOM).
@@ -7531,7 +7564,8 @@ function wireDepPicker(values, selfId) {
   btn.addEventListener('click', () =>
     openTaskPicker({
       title: 'Add a dependency',
-      defaults: ['archived', 'run', 'series', 'draft'],
+      defaults: ['run', 'series', 'draft'],
+      query: `${ACTIVE_VIEW_QUERY} `,
       exclude: (t) => t.id === selfId || selectedDepIds().includes(t.id),
       onPick: (t) => { known.set(t.id, t); paint([...selectedDepIds(), t.id], true); },
     }),
@@ -7754,9 +7788,9 @@ async function consumeTaskFormDefaults(projectId, workflow) {
 // it waits for. (HTML: escaped here.)
 function taskFormTitle(draft) {
   const p = draft?.params || {};
-  if (p.triggerState === 'armed' && !p.repeatable && draft.num != null)
+  if (p.triggerState === 'armed' && !isSeries(p) && draft.num != null)
     return `<span class="task-num">#${draft.num}</span> ${esc(draft.title)} <span class="chip waiting" title="Starts by itself when its trigger fires">${esc(triggerSummary(p.triggers) || 'waiting')}</span>`;
-  return !draft ? 'New task' : p.triggerState === 'armed' || p.repeatable ? 'Edit task' : 'Edit draft';
+  return !draft ? 'New task' : p.triggerState === 'armed' || isSeries(p) ? 'Edit task' : 'Edit draft';
 }
 
 function taskFormLoadingPage(project, draft) {
@@ -7797,7 +7831,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   const promptField = cf && cf.type === 'text' ? cf : null;
   const values = draft ? { ...draft.params } : { ...seedParams };
   const armed = draft?.params?.triggerState === 'armed'; // a "waiting for trigger" task
-  const series = !!draft?.params?.repeatable; // a repeatable template
+  const series = isSeries(draft?.params); // a repeatable template
   const editInPlace = armed || series; // neither has a running workflow — edit its stored params
   const workflowEditable = !draft || !!draft.params?.draft;
   // Carry over the quick-add text (or whatever was typed before switching
@@ -8420,8 +8454,19 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
         }
       }
       succeeded = true;
+      // Running a repeatable task starts a new task, its run: name it and go
+      // there, so it is never mistaken for this one (#616/#617).
+      const run = !editInPlace && !draftMode && st.body.repeatable && !st.body.triggers?.length && primaryId
+        ? await api(`/api/tasks/${primaryId}/runs`).then((runs) => runs.reduce((a, b) => (b.createdAt > (a?.createdAt ?? 0) ? b : a), null)).catch(() => null)
+        : null;
       releaseFormKeys();
       root.innerHTML = '';
+      if (run) {
+        toast(run.num != null ? `Started run #${run.num}` : 'Run started');
+        await refreshTasks();
+        goToTask(run.id);
+        return true;
+      }
       if (page && S.selected === draft.id) {
         // A saved draft leaves its page like Back; a started one shows its live page.
         if (draftMode) closeTask();
@@ -8968,7 +9013,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
     if (S.selected !== taskId || S.taskOpenEpoch !== openEpoch) return;
   }
   markTaskAsksRead(taskId);
-  if (rec?.params?.repeatable) {
+  if (isSeries(rec?.params)) {
     await renderSeriesPage(rec);
     return;
   }
@@ -9067,7 +9112,7 @@ async function refreshTask(reason = 'all') {
   if (!S.selected) return;
   // The series config page holds an editable form — don't live-refresh it (that
   // would clobber in-progress edits); it re-renders only on open / explicit save.
-  if (taskRecord(S.selected)?.params?.repeatable) return;
+  if (isSeries(taskRecord(S.selected)?.params)) return;
   const id = S.selected;
   const pending = refreshTask.pending ||= new Map();
   const existing = pending.get(id);

@@ -830,6 +830,49 @@ describe('TriggerScheduler (dispatcher)', () => {
     expect(disarmCalls).toContain(t.id);
   });
 
+  it('auto-saving a draft with Repeatable or a schedule keeps it a draft until it is run (#616)', async () => {
+    (await store.updateProjectConfig(projectId, { repos: ['/tmp/karmax-test-repo'] }));
+    const started: string[] = [];
+    const client = { workflow: { start: async (_t: string, opts: { workflowId: string }) => void started.push(opts.workflowId), getHandle: () => ({}) } } as any;
+    const tokens = new TokenAuthority();
+    const token = (await tokens.mintPrincipal('u', ['*'])).token;
+    const api = new KarmaxApi({ store, client, taskQueue: 'q', tokens });
+    const armCalls: string[] = [];
+    api.setTriggerArmer({ arm: (t) => armCalls.push(t.id), disarm: () => {} });
+
+    const draft = await api.createTask(token, { projectId, workflow: 'just-do', draft: true, params: { prompt: 'p', repeatable: true } });
+    // The form's auto-save: what the gateway sends for a task already flagged repeatable.
+    for (const params of [{ prompt: 'p2', repeatable: true }, { prompt: 'p3', repeatable: true, triggers: [{ kind: 'schedule', cron: '0 3 * * *' }] }]) {
+      const saved = await api.updateArmedParams(token, draft.id, params, { replace: true, keepArmed: true });
+      expect(saved.params.draft).toBe(true);
+      expect(saved.params.triggerState).toBeUndefined();
+    }
+    expect(armCalls).toHaveLength(0);
+    expect(started).toHaveLength(0);
+    expect(await store.runsOf(draft.id)).toHaveLength(0);
+  });
+
+  it('lists a run on its own once its task is no longer a repeatable series, and nests it under an archived one (#617)', async () => {
+    (await store.updateProjectConfig(projectId, { repos: ['/tmp/karmax-test-repo'] }));
+    const client = { workflow: { start: async () => {}, getHandle: () => ({}) } } as any;
+    const tokens = new TokenAuthority();
+    const token = (await tokens.mintPrincipal('u', ['*'])).token;
+    const api = new KarmaxApi({ store, client, taskQueue: 'q', tokens });
+    const series = await api.createTask(token, { projectId, workflow: 'just-do', params: { prompt: 'p', repeatable: true } });
+    const [run] = await store.runsOf(series.id);
+    const listed = async () => (await api.searchTasks(token, projectId, '-is:archived -is:run')).tasks.map((t) => t.id);
+    expect(await listed()).toEqual([series.id]);
+
+    await store.patchTaskParams(series.id, { archived: true });
+    expect(await listed()).toEqual([]); // archived with its series
+
+    await store.patchTaskParams(series.id, { archived: false });
+    // Un-ticking Repeatable and saving makes it a draft; its run must not vanish.
+    await api.updateArmedParams(token, series.id, { prompt: 'p' }, { replace: true, keepArmed: true });
+    expect((await store.getTask(series.id))!.params.draft).toBe(true);
+    expect((await listed()).sort()).toEqual([series.id, run!.id].sort());
+  });
+
   it.each(['legacy', 'member', 'agent'] as const)('a triggerless repeatable task spawns runs with the correct %s creator', async (kind) => {
     (await store.updateProjectConfig(projectId, { repos: ['/tmp/karmax-test-repo'] }));
     const started: string[] = [];

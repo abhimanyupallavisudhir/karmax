@@ -36,6 +36,7 @@ global.S = {
 };
 
 eval(extractFn('taskRecord'));
+eval(extractFn('isSeries'));
 eval(extractFn('stageLabel'));
 eval(extractFn('stageIndicator'));
 eval(extractFn('taskAttempts'));

@@ -10,7 +10,7 @@ import { HetznerDriver } from '../src/world/hetzner.js';
 import { VmWorldProvider, type VmDriver } from '../src/world/vm/provider.js';
 import type { ResolvedWorldProviderConnection } from '../src/world/connections.js';
 import type { World, WorldHandle } from '../src/world/types.js';
-import { serviceHomeLabel } from '../src/world/services.js';
+import { cleanHetzner, hetznerInventory } from './helpers/hetzner-live.js';
 import { liveEnabled } from './helpers/live-gate.js';
 
 /**
@@ -104,7 +104,7 @@ describe.each(providers)('a live $name VM world', ({ name, connection, driver: m
       if (handle) await provider.destroy(handle).catch((error) => { report.destroyError = String(error); });
       // Anything else this run's home label owns (a failed create's leftovers).
       for (const leftover of await provider.listSandboxes().catch(() => [])) await leftover.destroy().catch(() => undefined);
-      if (driver instanceof HetznerDriver) await cleanHetzner(connection, before);
+      if (driver instanceof HetznerDriver) await cleanHetzner(connection, before, { builtSnapshot: true });
       report.leftovers = (await provider.listSandboxes().catch(() => [])).length;
       console.log(`VM-LIVE ${JSON.stringify(report)}`);
       if (process.env.KARMAX_LIVE_VM_REPORT) fs.appendFileSync(process.env.KARMAX_LIVE_VM_REPORT, `${JSON.stringify({ at: new Date().toISOString(), ...report })}\n`);
@@ -179,42 +179,4 @@ function summarize(events: Array<{ kind?: string; activeMs: number; costMicros?:
     diskHours: Math.round(sum('disk').reduce((total, event) => total + event.activeMs, 0) / 36_000) / 100,
     diskUsd: sum('disk').reduce((total, event) => total + (event.costMicros ?? 0), 0) / 1e6,
   };
-}
-
-async function hetznerApi(connection: ResolvedWorldProviderConnection, method: string, route: string): Promise<any> {
-  const response = await fetch(`https://api.hetzner.cloud/v1${route}`, { method, headers: { authorization: `Bearer ${connection.apiKey}` } });
-  if (!response.ok && response.status !== 404) throw new Error(`Hetzner ${method} ${route}: ${response.status}`);
-  return response.status === 204 ? {} : response.json().catch(() => ({}));
-}
-
-async function hetznerInventory(connection: ResolvedWorldProviderConnection) {
-  const { vmProvisionVersion } = await import('../src/world/vm/provision.js');
-  const firewalls = (await hetznerApi(connection, 'GET', '/firewalls?label_selector=karmaxFirewall%3Dvm')).firewalls ?? [];
-  const keys = (await hetznerApi(connection, 'GET', '/ssh_keys?label_selector=karmaxSshKey%3Dno-root-login')).ssh_keys ?? [];
-  const images = (await hetznerApi(connection, 'GET', `/images?type=snapshot&label_selector=karmaxImage%3D${vmProvisionVersion()}`)).images ?? [];
-  return { firewalls: firewalls.length, keys: keys.length, snapshot: images[0] ? String(images[0].id) : undefined };
-}
-
-/** Delete what this run created at project level; keep what existed before it. */
-async function cleanHetzner(connection: ResolvedWorldProviderConnection, before?: { firewalls: number; keys: number; snapshot?: string }) {
-  for (const server of (await hetznerApi(connection, 'GET', `/servers?label_selector=karmaxHome%3D${serviceHomeLabel()}`)).servers ?? [])
-    await hetznerApi(connection, 'DELETE', `/servers/${server.id}`);
-  for (const builder of (await hetznerApi(connection, 'GET', '/servers?label_selector=karmaxImageBuilder')).servers ?? [])
-    await hetznerApi(connection, 'DELETE', `/servers/${builder.id}`);
-  if (process.env.KARMAX_LIVE_KEEP_SNAPSHOT !== '1')
-    for (const image of (await hetznerApi(connection, 'GET', '/images?type=snapshot&label_selector=karmaxImage')).images ?? [])
-      if (String(image.id) !== before?.snapshot) await hetznerApi(connection, 'DELETE', `/images/${image.id}`);
-  if (!before?.firewalls) {
-    for (const firewall of (await hetznerApi(connection, 'GET', '/firewalls?label_selector=karmaxFirewall%3Dvm')).firewalls ?? []) {
-      // A firewall still applied to a server being deleted refuses deletion for a moment.
-      for (let attempt = 0; attempt < 20; attempt++) {
-        const response = await fetch(`https://api.hetzner.cloud/v1/firewalls/${firewall.id}`, { method: 'DELETE', headers: { authorization: `Bearer ${connection.apiKey}` } });
-        if (response.ok || response.status === 404) break;
-        await new Promise((resolve) => setTimeout(resolve, 3_000));
-      }
-    }
-  }
-  if (!before?.keys)
-    for (const key of (await hetznerApi(connection, 'GET', '/ssh_keys?label_selector=karmaxSshKey%3Dno-root-login')).ssh_keys ?? [])
-      await hetznerApi(connection, 'DELETE', `/ssh_keys/${key.id}`);
 }

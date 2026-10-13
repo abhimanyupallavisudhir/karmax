@@ -369,6 +369,7 @@ export class Store {
     (await this.migrate());
     (await this.migrateData());
     (await this.migrateConversations());
+    (await this.migrateSavedViews());
     (await this.paymentTransaction(async () => {
       if ((await this.kvGet('migration:unique-card-names'))) return;
       const rows = (await this.db.prepare(`SELECT c.id, c.label, c.scope, c.scopeId, p.organizationId
@@ -409,6 +410,29 @@ export class Store {
       }
     }
   
+    });
+  }
+
+  /** The task list used to hide archived tasks unless a query mentioned them;
+   * now a query means what it says (the Active view is `-is:archived`). Views
+   * saved under the old rule get the clause they relied on, once. */
+  private async migrateSavedViews(force = false): Promise<void> {
+    return this.db.transaction(async () => {
+    (await this.db.lock('store-migration'));
+    const marker = 'migration:saved-views-explicit-archived';
+    if (!force && await this.kvGet(marker)) return;
+    const rows = (await this.db.prepare('SELECT id, query FROM saved_views').all()) as Array<{ id: string; query: string }>;
+    for (const row of rows) {
+      let query: TaskQuery;
+      try { query = JSON.parse(row.query) as TaskQuery; } catch { continue; }
+      if (!query || typeof query !== 'object') continue;
+      const filters = Array.isArray(query.filters) ? query.filters : [];
+      if (filters.some((c) => (c?.field === 'is' || c?.field === 'has')
+        && Array.isArray(c.values) && c.values.some((v) => String(v).includes('archived')))) continue;
+      const next = { ...query, filters: [...filters, { field: 'is', op: 'is', values: ['archived'], negate: true }] };
+      (await this.db.prepare('UPDATE saved_views SET query=? WHERE id=? AND query=?').run(JSON.stringify(next), row.id, row.query));
+    }
+    (await this.kvSet(marker, '1'));
     });
   }
 
@@ -1916,6 +1940,7 @@ export class Store {
     try {
       (await this.revokeScopedTokens({ projectId: id }));
       (await this.revokeHumanDelegations({ projectId: id }));
+      (await this.withdrawProjectFromTaskAuthorizations(id));
       (await deleteRows(this.db, 'delivery_outbox', 'inboxId', inboxIds));
       (await deleteRows(this.db, 'execution_frames', 'executionId', executionIds));
       (await deleteRows(this.db, 'team_memberships', 'teamId', teamIds));
@@ -5373,9 +5398,11 @@ export class Store {
     } else if (ev.type === 'task.mentioned') {
       kind = 'mentioned';
       // An @mention in a task's conversation is addressed to people: an ask, like
-      // a review request. (Historical single-principal mentions stay routine.)
+      // a review request — unless it is a reply the task does not wait on
+      // (`ask: false`), news until read (#613). (Historical single-principal
+      // mentions stay routine.)
       if (Array.isArray(ev.payload.recipients)) {
-        actionable = true;
+        actionable = ev.payload.ask !== false;
         users = (await this.humanAudience(task.id, ev.payload.recipients.map(String)));
       } else {
         const mentioned = ev.payload.principal as PrincipalRef | undefined;
@@ -5427,6 +5454,12 @@ export class Store {
       if (!actionable && !preferences.routine) continue;
       const existing = (await this.db.prepare('SELECT id FROM inbox WHERE userId=? AND taskId=? AND kind=?')
         .get(userId, task.id, kind)) as any;
+      if (existing && kind === 'mentioned') {
+        // Another message to them: unread again, and still an ask if either was.
+        (await this.db.prepare(`UPDATE inbox SET eventSeq=?, actionable=CASE WHEN ?=1 THEN 1 ELSE actionable END, unread=1, readAt=NULL${requested ? ', urgency=?' : ''} WHERE id=?`)
+          .run(eventSeq, actionable ? 1 : 0, ...(requested ? [urgencyRank(requested)] : []), existing.id));
+        continue;
+      }
       if (existing) {
         // The same ask, restated. Point it at the newest event but leave its age
         // and read state alone: a repeat is not a new notification.
@@ -5434,11 +5467,13 @@ export class Store {
           .run(eventSeq, actionable ? 1 : 0, ...(requested ? [urgencyRank(requested)] : []), existing.id));
         continue;
       }
-      if (actionable && kind === 'mentioned') {
+      if (kind === 'mentioned') {
         // A mention never displaces a stronger ask on the same task: the person is
         // already asked to look at it.
         if ((await this.db.prepare("SELECT 1 FROM inbox WHERE userId=? AND taskId=? AND actionable=1 AND kind<>'mentioned'").get(userId, task.id))) continue;
-      } else if (actionable) (await this.deleteInbox('userId=? AND taskId=? AND actionable=1', [userId, task.id]));
+        // An ask supersedes a reply that asked nothing.
+        if (actionable) (await this.deleteInbox("userId=? AND taskId=? AND kind='mentioned' AND actionable=0", [userId, task.id]));
+      } else if (actionable) (await this.deleteInbox("userId=? AND taskId=? AND (actionable=1 OR kind='mentioned')", [userId, task.id]));
       const item: InboxItem = { id: newId('inbox'), organizationId: project.organizationId, userId, eventSeq,
         taskId: task.id, kind, urgency: requested ?? DEFAULT_URGENCY[kind], unread: true, actionable, createdAt: ev.ts };
       const inserted = (await this.db.prepare(`INSERT OR IGNORE INTO inbox
@@ -7540,6 +7575,56 @@ export class Store {
       .map(resourceRevisionRow).filter((revision) => !referenced.has(revision.id)).slice(0, limit);
   }
 
+  /** Older versions of data in managed storage whose replacement was saved
+   * before `replacedBefore`: versions saved before the current one (published,
+   * or a sub-task's delivery) with a later non-capture version older than the
+   * cutoff. Never a park capture, a version in a bucket the organization
+   * connected itself, or one a task can still need: anything referenced, the
+   * published version a referenced capture descends from (a restored world's
+   * fork point), or the delivery a sub-task's next delivery builds on.
+   * Oldest first. The caller deletes each with the targeted reference check. */
+  async expiredResourceVersions(replacedBefore: number, limit = 100): Promise<ResourceRevision[]> {
+    const rows = ((await this.db.prepare(`SELECT r.*, a.currentRevisionId AS currentId, l.kind AS locationKind
+      FROM resource_revisions r JOIN resource_attachments a ON a.id=r.attachmentId
+      LEFT JOIN storage_locations l ON l.id=r.storageLocationId
+      WHERE a.currentRevisionId IS NOT NULL ORDER BY r.attachmentId, r.createdAt`).all()) as Array<Parameters<typeof resourceRevisionRow>[0]
+        & { currentId: string; locationKind: string | null }>);
+    const byId = new Map<string, ResourceRevision>();
+    const byAttachment = new Map<string, Array<{ revision: ResourceRevision; current: string; managed: boolean }>>();
+    for (const row of rows) {
+      const revision = resourceRevisionRow(row);
+      byId.set(revision.id, revision);
+      const list = byAttachment.get(revision.attachmentId) ?? [];
+      list.push({ revision, current: String(row.currentId), managed: !revision.storageLocationId || row.locationKind === 'managed' });
+      byAttachment.set(revision.attachmentId, list);
+    }
+    const kept = (await this.referencedResourceRevisionIds());
+    for (const entry of (await this.kvEntries('resource-delivered:'))) kept.add(entry.value);
+    // A capture's copy starts from the published version its parents lead to.
+    for (const id of kept) {
+      const seen = new Set<string>();
+      for (let revision = byId.get(id); revision?.metadata?.checkpoint && revision.parentRevisionId && !seen.has(revision.id);
+        revision = byId.get(revision.parentRevisionId)) {
+        seen.add(revision.id);
+        kept.add(revision.parentRevisionId);
+      }
+    }
+    const expired: ResourceRevision[] = [];
+    for (const list of byAttachment.values()) {
+      const current = byId.get(list[0]!.current);
+      if (!current) continue;
+      // Each version's replacement: the next later version that is not a park capture or a delivery.
+      let replacement: ResourceRevision | undefined;
+      for (let i = list.length - 1; i >= 0; i--) {
+        const { revision, managed } = list[i]!;
+        if (revision.createdAt < current.createdAt && replacement && replacement.createdAt < replacedBefore
+          && managed && !revision.metadata?.checkpoint && revision.id !== current.id && !kept.has(revision.id)) expired.push(revision);
+        if (!revision.metadata?.checkpoint && !revision.metadata?.deliveredTo && revision.createdAt <= current.createdAt) replacement = revision;
+      }
+    }
+    return expired.sort((a, b) => a.createdAt - b.createdAt).slice(0, limit);
+  }
+
   /** Delete a revision row only if nothing references it now. The caller then
    * deletes its objects; a failure there leaks bytes, never a dangling row.
    * `allowCurrent` also clears it as its attachment's current revision. */
@@ -9395,21 +9480,61 @@ export class Store {
     return this.db.transaction(async () => {
 
     const update = this.db.prepare('UPDATE human_delegations SET revokedAt=? WHERE id=? AND revokedAt IS NULL');
+    const narrow = this.db.prepare('UPDATE human_delegations SET json=? WHERE id=? AND revokedAt IS NULL');
     let revoked = 0;
     for (const row of (await this.db.prepare('SELECT id, json FROM human_delegations WHERE revokedAt IS NULL').all()) as any[]) {
       try {
         const record = JSON.parse(row.json) as Record<string, unknown>;
-        if ((scope.taskId && record.taskId === scope.taskId)
-          || (scope.projectId && (record.projectId === scope.projectId
-            || Array.isArray(record.projectIds) && record.projectIds.includes(scope.projectId)))
+        const projectIds = Array.isArray(record.projectIds) ? record.projectIds as string[] : [];
+        let revoke = !!((scope.taskId && record.taskId === scope.taskId)
           || (scope.organizationId && record.organizationId === scope.organizationId)
-          || (scope.humanUserId && record.humanUserId === scope.humanUserId))
-          revoked += Number((await update.run(Date.now(), row.id)).changes);
+          || (scope.humanUserId && record.humanUserId === scope.humanUserId));
+        if (!revoke && scope.projectId && (record.projectId === scope.projectId || projectIds.includes(scope.projectId))) {
+          // A delegation that also reaches other projects loses only this one, as
+          // its token does (`revokeScopedTokens`), unless its task is in it: a task
+          // granted a throwaway project keeps running once that is deleted (#610).
+          const others = record.projectId === scope.projectId ? [] : projectIds.filter((projectId) => projectId !== scope.projectId);
+          const task = others.length && typeof record.taskId === 'string'
+            ? (await this.db.prepare('SELECT projectId FROM tasks WHERE id=?').get(record.taskId)) as { projectId: string } | undefined : undefined;
+          if (others.length && task?.projectId !== scope.projectId)
+            (await narrow.run(JSON.stringify({ ...record, projectIds: others }), row.id));
+          else revoke = true;
+        }
+        if (revoke) revoked += Number((await update.run(Date.now(), row.id)).changes);
       } catch { /* malformed historical state is unusable, but must not block cleanup */ }
     }
     return revoked;
   
     });
+  }
+
+  /** A deleted project leaves the selected projects of every other task's
+   * authorization (and its agents'), as it leaves their delegations: each turn
+   * mints within the delegation, so the two must name the same projects. */
+  private async withdrawProjectFromTaskAuthorizations(projectId: string): Promise<void> {
+    type Entry = { scope?: string; projectIds?: string[]; requested?: { authorization?: { projectIds?: string[] } } };
+    const without = (projectIds: string[] | undefined) => {
+      const others = projectIds?.filter((id) => id !== projectId);
+      return others?.length && others.length < projectIds!.length ? others : projectIds;
+    };
+    const narrowed = (entry: Entry): Entry => {
+      const requested = entry.requested?.authorization;
+      return { ...entry, projectIds: without(entry.projectIds),
+        ...(requested?.projectIds ? { requested: { ...entry.requested, authorization: { ...requested, projectIds: without(requested.projectIds) } } } : {}) };
+    };
+    const rows = (await this.db.prepare('SELECT id, params FROM tasks WHERE projectId<>? AND params LIKE ?')
+      .all(projectId, `%${JSON.stringify(projectId)}%`)) as Array<{ id: string; params: string }>;
+    for (const row of rows) {
+      const params = JSON.parse(row.params) as { _authorization?: Entry; _agentAuthorization?: Record<string, Entry> };
+      const patch = {
+        _authorization: params._authorization && narrowed(params._authorization),
+        _agentAuthorization: params._agentAuthorization && Object.fromEntries(Object.entries(params._agentAuthorization)
+          .map(([key, entry]) => [key, narrowed(entry)])),
+      };
+      if (JSON.stringify(patch._authorization) !== JSON.stringify(params._authorization)
+        || JSON.stringify(patch._agentAuthorization) !== JSON.stringify(params._agentAuthorization))
+        (await this.patchTaskParams(row.id, patch));
+    }
   }
 
   async revokeScopedToken(input: { tokenHash?: string; tokenId?: string }): Promise<void> {
@@ -9426,10 +9551,25 @@ export class Store {
     return this.db.transaction(async () => {
     const now = Date.now();
     let revoked = 0;
-    if (scope.projectId)
+    if (scope.projectId) {
+      // A token that also reaches other projects loses only this one (an agent
+      // granted a throwaway project keeps working when it is deleted), unless
+      // this project is its own: its primary project or its task's.
+      const shared = (await this.db.prepare(`SELECT t.tokenHash, t.json FROM scoped_tokens t
+        JOIN scoped_token_projects p ON p.tokenHash=t.tokenHash AND p.projectId=?
+        WHERE t.revokedAt IS NULL AND EXISTS (SELECT 1 FROM scoped_token_projects o
+          WHERE o.tokenHash=t.tokenHash AND o.projectId<>?)`).all(scope.projectId, scope.projectId)) as Array<{ tokenHash: string; json: string }>;
+      for (const row of shared) {
+        const record = JSON.parse(row.json) as { projectId?: unknown; taskId?: unknown };
+        const task = typeof record.taskId === 'string'
+          ? (await this.db.prepare('SELECT projectId FROM tasks WHERE id=?').get(record.taskId)) as { projectId: string } | undefined : undefined;
+        if (record.projectId !== scope.projectId && task?.projectId !== scope.projectId)
+          (await this.db.prepare('DELETE FROM scoped_token_projects WHERE tokenHash=? AND projectId=?').run(row.tokenHash, scope.projectId));
+      }
       revoked += Number((await this.db.prepare(`UPDATE scoped_tokens SET revokedAt=? WHERE revokedAt IS NULL
         AND tokenHash IN (SELECT tokenHash FROM scoped_token_projects WHERE projectId=?)`)
         .run(now, scope.projectId)).changes);
+    }
     if (scope.organizationId)
       revoked += Number((await this.db.prepare('UPDATE scoped_tokens SET revokedAt=? WHERE revokedAt IS NULL AND organizationId=?')
         .run(now, scope.organizationId)).changes);
@@ -9767,6 +9907,7 @@ export class Store {
     (await this.migrate());
     (await this.migrateData(true));
     (await this.migrateConversations());
+    (await this.migrateSavedViews(true));
   
     });
   }

@@ -2504,6 +2504,8 @@ html[data-theme="dark"] .github-signin-btn:active,
 }
 
 /* ── Series row + runs (list + series page) ───────────────────────────────────── */
+/* One more cell than a task row: the expand caret before the status dot. */
+.series-row { grid-template-columns: auto auto 1fr auto; }
 .series-row .series-caret { margin-right: 2px; color: var(--ink-3); background: transparent; border: 0; cursor: pointer; }
 .run-row { position: relative; padding-left: 40px; background: var(--surface-2); }
 .run-row .task-title { font-size: 13px; font-weight: 500; }

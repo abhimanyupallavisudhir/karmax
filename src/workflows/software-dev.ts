@@ -311,6 +311,9 @@ const MAX_SHELL_NUDGES = 3;
 /** Transient GitHub/API failures are retried automatically, but unlike a real
  * pending check they are not allowed to disguise a permanent outage forever. */
 const MAX_GITHUB_ERROR_POLLS = 3;
+/** How often a final integration verification that ends by pausing (for its
+ * tests) is resumed for its decision before it goes to human Review instead. */
+const INTEGRATION_REVIEW_RESUMES = 3;
 /** Landing repairs are automatic, but after this many consecutive failures a
  * person is asked for guidance instead of spending agent turns—and, from v1.17,
  * blocking the front landing slot—forever. */
@@ -3193,14 +3196,16 @@ async function softwareDevImpl(
   }
 
   /** Address `reply` and act on it: agents it names are called, people it names
-   * are notified now (an ask, in their inbox). */
-  async function deliverReply(reply: Message | undefined, to: string[]): Promise<void> {
+   * are notified now — an ask in their inbox, or with `ask` false a reply they
+   * need only read: the task goes on without them (#613). */
+  async function deliverReply(reply: Message | undefined, to: string[], ask = true): Promise<void> {
     if (!reply) return;
     reply.to = [...new Set(to)];
     callAgents(reply);
     const people = reply.to.filter((selector) => !selectorAgent(selector));
     if (people.length) await core.recordEvent(taskId, 'task.mentioned', {
       recipients: people, by: agentSelector(messageAuthor(reply)!), messageId: reply.id, text: clip(reply.text, 500),
+      ...(ask ? {} : { ask: false }),
     });
   }
 
@@ -3222,7 +3227,7 @@ async function softwareDevImpl(
       // by the stage that called them, not here.
       const caller = calledBy[key];
       delete calledBy[key];
-      await deliverReply(turn?.reply, caller ? [caller] : []);
+      await deliverReply(turn?.reply, caller ? [caller] : [], false);
       status = resume.status;
       waitingFor = resume.waitingFor;
       await publish();
@@ -3290,7 +3295,32 @@ Inspect the complete current diff and specifically compare its delta from the re
 - action:"revise" with actionable text when you can repair it in your next Do turn;
 - action:"reject" when the delta is ambiguous, materially changes scope/behavior, or needs a human decision. A reject here escalates to human Review; it does not cancel the task.`;
       msgs.push({ id: `integration-${msgs.length}`, role: 'user', text: prompt, ts: msgs.length });
-      const turn = await doTurn();
+      let turn = await doTurn();
+      // A verification that pauses for its tests (a durable job, or a timer) is
+      // resumed for its decision when they finish, as a Do turn is: ending it
+      // without one sent an intact candidate back to human Review (#610).
+      for (let resumes = 0; !turn.confirmDecision && resumes < INTEGRATION_REVIEW_RESUMES
+        && !cancelled && patched('software-dev-integration-review-pause-v1'); resumes++) {
+        const reminder = unattendedJobsReminder(turn);
+        let note: string | undefined;
+        if (turn.wait && !turn.wait.needsInput) {
+          const held = { status, waitingFor };
+          note = await waitForAgent(turn.wait, {
+            world,
+            ...(input.waitMinuteMs ? { minuteMs: input.waitMinuteMs } : {}),
+            park: async (next) => { status = 'waiting'; waitingFor = next; await publish(); },
+            interrupted: () => cancelled || mainUnread(),
+          });
+          ({ status, waitingFor } = held);
+          await publish();
+          if (cancelled) break;
+          note = `${note ?? '(Resumed: your wait was interrupted by the message above.)'}\n\nFinish this verification: call confirm_decision exactly once.`;
+        } else if (reminder) {
+          note = reminder;
+        } else break;
+        msgs.push({ id: `integration-wait-${msgs.length}`, role: 'user', text: note, ts: msgs.length });
+        turn = await doTurn();
+      }
       const decision = turn.confirmDecision;
       if (decision?.action === 'confirm') return 'confirm';
       if (decision?.action === 'revise') {
@@ -3658,11 +3688,12 @@ Inspect the complete current diff and specifically compare its delta from the re
 
   /** A top-level reply to people goes to them as a mention when the task then
    * waits on something else (a pause, its sub-tasks): no human wait would
-   * carry it, and they would never hear it (pramana#22). */
+   * carry it, and they would never hear it (pramana#22). It is not an ask: the
+   * task waits on that something else, not on them (#613). */
   async function replyUnasked(): Promise<void> {
     const reply = speakersReply;
     speakersReply = undefined;
-    if (reply && !input.parentTaskId && patched(UNASKED_REPLY_TO_SPEAKERS)) await deliverReply(reply, speakers);
+    if (reply && !input.parentTaskId && patched(UNASKED_REPLY_TO_SPEAKERS)) await deliverReply(reply, speakers, false);
   }
 
   /** ` (already sent to Bea, who spoke to it)` when the agent's last reply also

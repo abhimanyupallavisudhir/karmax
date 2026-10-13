@@ -30,9 +30,9 @@ function harness({ tasks, groups, attempts, agents, failure, mode = 'agent' }) {
   const context = vm.createContext({
     document: { createElement: () => new Element() },
     $: selector => nodes[selector.slice(1)],
-    S: { projectId: 'project', views: [] }, ALL_VIEW: 'all', BUILTIN_VIEWS: [],
+    S: { projectId: 'project', views: [] }, ACTIVE_VIEW: 'active', ACTIVE_VIEW_QUERY: '-is:archived', BUILTIN_VIEWS: [],
     esc: v => String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'),
-    viewIdForQuery: () => 'all', queryToolbarHtml: () => '', wireQueryToolbar() {},
+    viewIdForQuery: () => 'active', queryToolbarHtml: () => '', wireQueryToolbar() {},
     effectiveQuery: q => q, stageLabel: () => 'Done', workflowLabel: () => 'Software',
     priorityFlag: () => '', tagChips: () => '', agentRoleLabel: role => role,
     projectById: () => undefined, projectSlug: () => '', projectLabel: () => '',

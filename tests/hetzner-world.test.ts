@@ -170,6 +170,13 @@ describe.skipIf(!sshdAvailable)('Hetzner worlds (fake Cloud API, real sshd)', ()
     expect(await provider.probe(world.handle as WorldHandle)).toBe('missing');
   });
 
+  it('makes the project firewall and key once when several servers start together', async () => {
+    // Canary of task #610: a project's first world and its snapshot builder each made their own.
+    await Promise.all(['task_a', 'task_b', 'task_c'].map((taskId) =>
+      provider.create({ taskId, base: 'main', generation: 1, organizationId: 'org_h' })));
+    expect([hetzner.firewalls.length, hetzner.sshKeys.length]).toEqual([1, 1]);
+  });
+
   it('boots new servers from the provisioned snapshot once one exists', async () => {
     const { vmProvisionVersion } = await import('../src/world/vm/provision.js');
     hetzner.images.push({ id: 4242, status: 'available', labels: { karmaxImage: vmProvisionVersion() } });
