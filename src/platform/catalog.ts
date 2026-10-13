@@ -129,7 +129,6 @@ export const PLATFORM_API_CATALOG = {
     'GET|POST /api/organizations/:organizationId/teams/:teamId/members',
     'DELETE /api/organizations/:organizationId/teams/:teamId/members/:userId',
     'GET|PUT /api/organizations/:organizationId/settings/:workflow (organization:read/edit; Administrator authority)',
-    'GET|PUT /api/organizations/:organizationId/quick-settings/:workflow',
     ...(EXPLANATIONS_ENABLED ? ['GET|PUT /api/organizations/:organizationId/explanation-settings'] : []),
   ],
   sourceControl: [
@@ -242,7 +241,7 @@ export const PLATFORM_API_CATALOG = {
     'GET /api/models/benchmarks (Artificial Analysis intelligence, cost per answer and time of each runnable provider:model:effort)',
     'GET|PUT /api/settings/global/:workflow (shared installation; settings:read/write; God authority)', 'GET|PUT /api/settings/project/:projectId/:workflow',
     ...(EXPLANATIONS_ENABLED ? ['GET|PUT /api/projects/:projectId/explanation-settings'] : []),
-    'GET|PUT /api/settings/quick/global/:workflow', 'GET|PUT /api/settings/quick/project/:projectId/:workflow',
+
     'POST /api/skills',
   ],
   installation: [

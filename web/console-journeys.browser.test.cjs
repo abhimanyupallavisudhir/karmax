@@ -64,7 +64,7 @@ const { fakeConsole, launch, reply } = require('../tests/helpers/fake-console.cj
     await page.locator('#task-search').fill('failure');
     await page.getByText(/Search didn.t run/).first().waitFor();
     failSearch = false;
-    await page.getByRole('button', { name: 'Open full task form', exact: true }).click();
+    await page.getByRole('button', { name: 'New task…', exact: true }).click();
     const draft = '世界 <img src=x onerror=alert(1)> ' + 'long draft '.repeat(200);
     await page.locator('#tf-page textarea').first().fill(draft);
     await page.locator('#rail-palette').click();

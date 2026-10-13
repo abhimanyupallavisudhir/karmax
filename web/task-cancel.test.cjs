@@ -31,7 +31,7 @@ for (const entry of ['footer', 'command', 'form', 'scheduled']) {
         taskActionLabel: () => 'Cancel', taskRecord: () => ({ title: 'Scheduled task' }),
         toast() {}, setTimeout() {}, refreshTask() {}, refreshTasks() {},
         wireOrgControls() {}, wirePromptAttachments() {}, wireAttachmentPicker() {},
-        renderAttachmentChips() {}, requestTaskFormDefaults() {}, applyCursor() {}, wireQuickComposer() {}, wireInboxNotices() {},
+        renderAttachmentChips() {}, requestTaskFormDefaults() {}, applyCursor() {}, wireNewTaskComposer() {}, wireInboxNotices() {},
         esc: text => text,
       });
       vm.runInContext(['confirmTaskAction', 'hasOpenPullRequest', 'confirmMergeRights', 'otherAttemptsConfirmation', 'actionToast',

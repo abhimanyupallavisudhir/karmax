@@ -26,8 +26,7 @@ for (const scope of ['project', 'global'] as const) {
         if (path.endsWith('/__common__')) common = call.body.values;
         return { ok: true };
       }
-      if (path.includes('/api/defaults/')) return { [scope]: { own: common, inherited },
-        [scope === 'project' ? 'projectQuick' : 'globalQuick']: { own: {}, inherited: {} } };
+      if (path.includes('/api/defaults/')) return { [scope]: { own: common, inherited } };
       if (path.endsWith('/__common__')) return common;
       if (path === '/api/profiles') return [{ id: 'prof_do', role: 'do', name: 'Default agent', provider: 'claude', scope: 'inherited', inherited: {} }];
       if (path === `${settings}/vault`) return { credentialGrants: ['use-credential:item:gh'] };
@@ -50,14 +49,13 @@ for (const scope of ['project', 'global'] as const) {
         await hydrateSettingsForms('${scope}', ${projectId}, 'org');
         await hydrateProfiles('${scope}', ${projectId}, 'org');
         await hydrateReviewRoute('${scope}', ${projectId}, 'org');
-        await hydrateQuickSettingsForms('${scope}', ${projectId}, 'org');
         wireTaskDefaultsSave('${scope}', ${projectId}, 'org');
       })()`);
       const card = page.locator(`#task-defaults-${scope}`);
-      // Agent → Responder → Review route → where tasks run, then Quick tasks.
+      // Agent → Responder → Review route → where tasks run.
       expect(await card.locator('[data-profile], [data-row="responder"], [data-row="confirm"], [data-row="base"]').evaluateAll((rows) =>
         rows.map((row) => row.getAttribute('data-profile') ? 'agent' : row.getAttribute('data-row')))).toEqual(['agent', 'responder', 'confirm', 'base']);
-      expect(await page.locator('.task-defaults ~ [data-qwf]').count()).toBe(1);
+      expect(await page.locator('[data-qwf]').count()).toBe(0); // no separate quick-task defaults
       expect(await card.locator('[data-row="multiPr"]').count()).toBe(1);
       expect(await card.locator('[data-field="remote"]').count()).toBe(1);
       // The authorization, vault and payment defaults are the default Agent's.
@@ -92,8 +90,8 @@ for (const scope of ['project', 'global'] as const) {
       await card.locator('[data-save-task-defaults]').click();
       await expect.poll(() => puts.length).toBe(3);
       expect(common).not.toHaveProperty('responder');
-      await page.locator('.quick-defaults-enabled').check();
-      expect(await page.locator('.quick-defaults-body').isVisible()).toBe(true);
+      // Every task uses these defaults: there is no separate set for quick tasks.
+      expect(await page.locator('.quick-defaults-enabled').count()).toBe(0);
       expect(ui.errors).toEqual([]);
     } finally { await ui.close(); }
   });

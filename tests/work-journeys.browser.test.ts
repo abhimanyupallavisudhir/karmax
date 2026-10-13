@@ -55,7 +55,8 @@ describe('self-hosted console journeys (real gateway, mock agent)', () => {
   let cdpUrl = '';
 
   beforeAll(async () => {
-    h = await bootHarness('mock', signInAgent(() => cdpUrl));
+    // Tasks are made in the console's form, which names the default agent (claude).
+    h = await bootHarness('mock', signInAgent(() => cdpUrl), { alsoServe: ['claude'] });
     url = (await h.startGateway()).url;
     // Agent turns run in this process and reach the gateway the way a world's
     // platform tools do (file-isolation restores the environment afterwards).
@@ -67,18 +68,21 @@ describe('self-hosted console journeys (real gateway, mock agent)', () => {
     await h?.stop();
   });
 
-  it('quick-adds a task, lets the agent work, confirms it in Review and lands it on main (CI-38s)', async () => {
+  it('creates a task from New task, lets the agent work, confirms it in Review and lands it on main (CI-38s)', async () => {
     const repo = await h.makeRepo('journey');
     const { page, errors, step, context } = await openConsole(browser);
     const project = await consoleRequest(context, url, 'POST', '/api/projects', { name: 'Journey',
       config: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false } });
+    // The project's default agent has no tools (the browser one cannot start here); the form inherits that.
+    await consoleRequest(context, url, 'PUT', `/api/profiles?projectId=${project.id}`, { role: 'do', mcpConnections: [] });
     try {
       // Every task: the agent's task needs nothing from us, so "For me" would not list it.
       await step('open the project', () => page.goto(`${url}/personal/journey?q=`));
-      await page.locator('#new-task').fill('@write journey.txt :: shipped from the console');
-      await page.locator('#new-task').press('Control+Enter');
+      await page.locator('#expand-task').click();
+      await page.locator('#tf-body textarea[data-field="prompt"]').fill('@write journey.txt :: shipped from the console');
+      await page.locator('#tf-queue').click();
       const row = page.locator('.task-row').filter({ hasText: '@write journey.txt' });
-      await step('the quick-added task is listed', () => row.waitFor());
+      await step('the new task is listed', () => row.waitFor());
       await row.locator('.row-link').click();
       const confirm = page.locator('#tp-foot [data-act="confirm"]:not([disabled])');
       await step('the agent reaches Review', () => confirm.waitFor({ timeout: 30_000 }));
@@ -109,12 +113,15 @@ describe('self-hosted console journeys (real gateway, mock agent)', () => {
       const repo = await h.makeRepo('credential-journey');
       const project = await consoleRequest(context, url, 'POST', '/api/projects', { name: 'Credential journey',
         config: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false } });
+      // The project's default agent has no tools (the browser one cannot start here); the form inherits that.
+      await consoleRequest(context, url, 'PUT', `/api/profiles?projectId=${project.id}`, { role: 'do', mcpConnections: [] });
       await step('open the project', () => page.goto(`${url}/personal/credential-journey`));
-      await page.locator('#new-task').fill(`@signin ${LOGIN_SITE}`);
-      await page.locator('#new-task').press('Control+Enter');
-      const quickAdded = async () => (await h.store.listTasks(project.id)).find((candidate) => candidate.title.includes('@signin'));
-      await step('the quick-added task is created', () => expect.poll(quickAdded).toBeTruthy());
-      const task = await quickAdded();
+      await page.locator('#expand-task').click();
+      await page.locator('#tf-body textarea[data-field="prompt"]').fill(`@signin ${LOGIN_SITE}`);
+      await page.locator('#tf-queue').click();
+      const created = async () => (await h.store.listTasks(project.id)).find((candidate) => candidate.title.includes('@signin'));
+      await step('the task is created', () => expect.poll(created).toBeTruthy());
+      const task = await created();
 
       await step('open Passwords & payments', () => page.goto(`${url}/personal/settings#settings-payments`));
       const request = page.locator('#vault-requests-card .approval-request').filter({ hasText: LOGIN_SITE });

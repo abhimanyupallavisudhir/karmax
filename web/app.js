@@ -6121,18 +6121,12 @@ function tasksView() {
       // does not mean the project has never had a task.
       : `<div class="empty"><div class="big">No open tasks</div>${everywhere || (home && !newTaskProjectId()) ? '' : 'Describe one above. '}Finished tasks move to 🗄 Archived.</div>`;
   // Home creates in one of its projects; with none yet there is nowhere to put a task.
+  // A stand-in for the full task form: the field and Send both open it.
   const composer = everywhere || (home && !newTaskProjectId()) ? '' : `
     <div class="composer">
-      <div class="quick-task-field">
-        ${home ? projectPickerHtml('new-task-project', newTaskProjectId()) : ''}
-        <input class="title-in" id="new-task" data-shortcut="nav.newTask" placeholder="New task…" title="↵ opens the full form · ${esc(fmtKeys('meta+Enter'))} starts it" />
-        <label class="btn soft icon-only attach-composer quick-task-attach" tabindex="0" title="Attach files (25 MB each)" aria-label="Attach files">${ICON.attach}<input id="new-task-files" type="file" multiple hidden></label>
-        <button class="btn soft icon-only quick-task-attach" id="draft-task" title="Save as draft (Alt+Enter)" aria-label="Save as draft (Alt+Enter)">${ICON.save}</button>
-        <button class="btn soft icon-only quick-task-attach" id="expand-task" data-shortcut="nav.newTaskForm" title="Open full task form (N or ↵)" aria-label="Open full task form">${ICON.form}</button>
-      </div>
-      <button class="btn primary icon-only" id="add-task" data-shortcut="list.quickAdd" title="Add directly ( ${esc(fmtKeys('meta+Enter'))} )" aria-label="Add task">${ICON.send}</button>
-    </div>
-    <div class="img-chips attachment-chips" id="new-task-chips" style="display:none"></div>`;
+      <button type="button" class="new-task-field" id="expand-task" data-shortcut="nav.newTask">New task…</button>
+      <button type="button" class="btn primary icon-only" id="add-task" title="New task" aria-label="New task">${ICON.send}</button>
+    </div>`;
   const trailing = everywhere ? '' : home ? projectFilterHtml()
     : `<button class="q-sel" id="manage-tags" title="Manage the project's tags">Tags</button>`;
   // The bell's page has no tab bar or composer to say where you are.
@@ -7138,7 +7132,7 @@ function wireTasksView() {
   );
   $('#retry-search')?.addEventListener('click', async () => { await runSearch(); renderMain(); });
   $('#q-project')?.addEventListener('change', (e) => setQuery(setProjectClause(S.search, e.target.value)));
-  if (S.tab !== 'inbox') wireQuickComposer();
+  if (S.tab !== 'inbox') wireNewTaskComposer();
   wireInboxNotices();
   // list cursor: re-apply after the re-render; Tab-focusing a row syncs it
   applyCursor();
@@ -7147,119 +7141,21 @@ function wireTasksView() {
 
 // The quick composer above a project's list, and above the organization home,
 // where it creates the task in the project its picker shows.
-function wireQuickComposer() {
-  const home = S.tab === 'home';
-  let projectId = home ? newTaskProjectId() : S.projectId;
-  const pick = (next) => {
-    projectId = next;
-    rememberNewTaskProject(next);
-    const wrap = $('#new-task-project')?.closest('.project-pick-wrap');
-    if (wrap) wrap.outerHTML = projectPickerHtml('new-task-project', next);
-    wireProjectPicker($('#new-task-project'), pick);
-    // Attachments are uploaded into a project; they cannot follow the task elsewhere.
-    if (S.newTaskImages?.length || S.newTaskFiles?.length) {
-      S.newTaskImages = [];
-      S.newTaskFiles = [];
-      paintQuickAttachments();
-      toast('Attachments removed — attach them again for this project');
-    }
-    requestTaskFormDefaults(next, QUICK_TASK_WORKFLOW);
-    $('#new-task')?.focus();
-  };
-  wireProjectPicker($('#new-task-project'), pick);
-  const openForm = () => openTaskForm(QUICK_TASK_WORKFLOW, undefined, $('#new-task').value.trim(), undefined, { projectId });
-  const add = async (draft = false) => {
-    const input = $('#new-task');
-    const title = input.value.trim();
-    const images = S.newTaskImages || [];
-    const files = S.newTaskFiles || [];
-    if (!title && !images.length && !files.length) return;
-    const composer = input.closest('.composer');
-    if (composer?.classList.contains('busy')) return;
-    const setBusy = (busy) => {
-      composer?.classList.toggle('busy', busy);
-      composer?.setAttribute('aria-busy', String(busy));
-      composer?.querySelectorAll('button,select,input').forEach((control) => { control.disabled = busy; });
-    };
-    setBusy(true);
-    try {
-      const created = await api(`/api/projects/${projectId}/tasks`, {
-        method: 'POST',
-        body: JSON.stringify(quickTaskPayload(title, images, draft, files)),
-      });
-      input.value = '';
-      S.newTaskImages = [];
-      S.newTaskFiles = [];
-      renderAttachmentChips($('#new-task-chips'), S.newTaskImages, S.newTaskFiles);
-      // A started task works on its own, so "For me" does not list it: the
-      // toast is the way to it.
-      const url = !draft && created?.id ? taskUrl(created.id, { ...created, projectId: created.projectId || projectId }) : '';
-      toast(draft ? 'Draft saved' : 'Task created', false, url ? { label: 'Open', fn: () => spaNavigate(url) } : undefined);
-      await refreshTasks();
-    } catch (e) {
-      toast(e.message, true);
-    } finally {
-      if (composer?.isConnected) setBusy(false);
-    }
-  };
-  $('#draft-task')?.addEventListener('click', () => add(true));
-  $('#add-task')?.addEventListener('click', () => add(false));
-  // Enter opens the FULL form (carrying the typed text into its prompt field) so
-  // the default path invites elaboration; ⌘/Ctrl+Enter adds the task directly;
-  // Alt+Enter saves it as an editable draft.
-  $('#new-task')?.addEventListener('keydown', (e) => {
-    const mode = quickTaskSubmitMode(e);
-    if (!mode) return;
-    e.preventDefault();
-    // Ctrl/Cmd+Enter is also registered as a page-level command so it works
-    // after focus leaves this input. Do not let this local invocation bubble to
-    // that command and attempt the same submission a second time.
-    e.stopPropagation();
-    if (mode === 'draft') add(true);
-    else if (mode === 'add') add(false);
-    else openForm();
-  });
-  // Paste, choose, or drag files into the quick-add box.
-  if (!S.newTaskImages) S.newTaskImages = [];
-  if (!S.newTaskFiles) S.newTaskFiles = [];
-  function paintQuickAttachments() { renderAttachmentChips($('#new-task-chips'), S.newTaskImages, S.newTaskFiles, undefined, projectId); }
-  wirePromptAttachments($('#new-task'), () => S.newTaskImages, () => S.newTaskFiles, paintQuickAttachments, () => projectId);
-  wireAttachmentPicker($('#new-task-files'), () => S.newTaskImages, () => S.newTaskFiles, paintQuickAttachments, () => projectId);
-  paintQuickAttachments();
-  // Opening the full form via "More" carries over whatever was typed in the
-  // quick-add box into the software-dev prompt.
-  $('#expand-task')?.addEventListener('click', openForm);
-  // Hide the defaultBranch/settings round-trip behind the time the user spends
-  // reading or typing in the quick composer.
-  if (projectId) requestTaskFormDefaults(projectId, QUICK_TASK_WORKFLOW);
+// Home creates in the project its new tasks go to (the form can change it); a project list in that project.
+function openNewTaskForm() {
+  const projectId = S.tab === 'home' ? newTaskProjectId() : S.projectId;
+  openTaskForm(NEW_TASK_WORKFLOW, undefined, '', undefined, projectId ? { projectId } : undefined);
 }
-const firstLine = (s) => s.split('\n')[0].slice(0, 80);
-const QUICK_TASK_WORKFLOW = 'software-dev';
-
-// Keyboard modes for the quick composer. Keep this separate from the event
-// listener so the shortcut behavior stays easy to verify without a browser.
-function quickTaskSubmitMode(e) {
-  if (e.key !== 'Enter') return null;
-  if (e.altKey) return 'draft';
-  if (e.metaKey || e.ctrlKey) return 'add';
-  return 'form';
+function wireNewTaskComposer() {
+  $('#expand-task')?.addEventListener('click', openNewTaskForm);
+  $('#add-task')?.addEventListener('click', openNewTaskForm);
+  // Fetch the form's defaults while the person decides what to write.
+  const projectId = S.tab === 'home' ? newTaskProjectId() : S.projectId;
+  if (projectId) requestTaskFormDefaults(projectId, NEW_TASK_WORKFLOW);
 }
+const NEW_TASK_WORKFLOW = 'software-dev';
 
-// The quick composer has two submission modes (start now / save draft), but both
-// must use the exact same sparse quick-defaults payload.
-function quickTaskPayload(title, images, draft = false, files = []) {
-  return {
-    title: firstLine(title || 'Image task'),
-    prompt: title,
-    workflow: QUICK_TASK_WORKFLOW,
-    quick: true,
-    ...(draft ? { draft: true } : {}),
-    ...(images.length ? { images } : {}),
-    ...(files.length ? { files } : {}),
-  };
-}
-
-// The task-scope field that consumes the quick-add "Describe a task" text: the
+// The task-scope field that consumes seed text (a fork's or a caller's): the
 // workflow's prompt field, else its primary required text/string input (e.g.
 // script-exec's Command). This keeps the seed text intact if the workflow is
 // changed inside the expanded form.
@@ -7824,7 +7720,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   const series = isSeries(draft?.params); // a repeatable template
   const editInPlace = armed || series; // neither has a running workflow — edit its stored params
   const workflowEditable = !draft || !!draft.params?.draft;
-  // Carry over the quick-add text (or whatever was typed before switching
+  // Carry over seed text (or whatever was typed before switching
   // workflows) into the field that consumes it, without clobbering a real value.
   if (seedText) {
     if (cf && !values[cf.name]) values[cf.name] = seedText;
@@ -8102,7 +7998,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   paintFormChips();
   if ((values['agent:do'] || values['agent:unified'])?.resumeFrom?.taskId) showForkWorldHelp($('#tf-body'));
   // Focus the consuming field (prompt/command) with the caret at the end, so
-  // Enter-from-quick-add flows straight into elaborating what was typed. `cf`
+  // writing starts at once. `cf`
   // (the consuming field) is resolved once at the top of this function.
   const cfEl = cf && $('#tf-body')?.querySelector(`[data-field="${CSS.escape(cf.name)}"]`);
   if (cfEl) {
@@ -14940,9 +14836,8 @@ async function saveCommonSettings(scope, projectId, organizationId, ownNames, co
   await api(url, { method: 'PUT', body: JSON.stringify({ values }) });
 }
 // Agent defaults live in the profile editor, so manifests correctly declare
-// these controls as task-scoped. Quick tasks still need the same task-agent picker:
+// these controls as task-scoped. Task defaults still need the same task-agent picker:
 // read those task fields directly rather than hiding them behind settings scopes.
-const quickAgentFields = () => schemaFor('software-dev').filter((field) => field.type === 'agent');
 function settingsForms(scope, projectId) {
   const wfs = S.schema
     // Host admission is installation-wide and has a dedicated operator card.
@@ -14973,7 +14868,7 @@ function settingsForms(scope, projectId) {
       </details>`;
     })
     .join('');
-  return common + quickSettingsForms(scope, projectId) + explanationSettingsCard(scope) + unique;
+  return common + explanationSettingsCard(scope) + unique;
 }
 
 // The default Agent's Authorization row in Task defaults: the authorization a
@@ -15199,55 +15094,6 @@ async function hydrateSettingsForms(scope, projectId, organizationId) {
     wireFieldResets(sec, fields);
   }
 }
-
-// ── Quick task defaults (SPEC §10.4) ─────────────────────────────────────────
-// An agent-only overlay applied to tasks added from the quick-task box (not the
-// full task form). All non-agent task defaults continue to use the regular
-// organization/project chain.
-function quickSettingsForms(scope, projectId) {
-  return `<div class="card" data-qwf="__common__" data-schema-wf="software-dev">
-    <label class="switch"><input type="checkbox" class="quick-defaults-enabled"> Different agents for Quick tasks?</label>
-    <div class="quick-defaults-body" hidden><div class="wf-form parameter-fields" style="margin-top:12px"></div>
-      <button class="btn primary sm" data-qsave="__common__">Save Quick agent defaults</button></div>
-  </div>`;
-}
-
-async function hydrateQuickSettingsForms(scope, projectId, organizationId) {
-  const key = scope === 'global' ? 'globalQuick' : 'projectQuick';
-  for (const sec of $('#main').querySelectorAll('[data-qwf]')) {
-    const wf = sec.dataset.qwf;
-    const schemaWf = sec.dataset.schemaWf || wf;
-    let d = null;
-    try { d = await api(`/api/defaults/${projectId || 'global'}/${schemaWf}${organizationId ? `?organizationId=${encodeURIComponent(organizationId)}` : ''}`); } catch {}
-    const own = d?.[key]?.own || {};
-    const inherited = d?.[key]?.inherited || {};
-    const fields = quickAgentFields();
-    const enabled = own._enabled === true || (own._enabled !== false && fields.some((field) => own[field.name] !== undefined));
-    sec.querySelector('.quick-defaults-enabled').checked = enabled;
-    sec.querySelector('.quick-defaults-body').hidden = !enabled;
-    sec.querySelector('.quick-defaults-enabled').addEventListener('change', (event) => { sec.querySelector('.quick-defaults-body').hidden = !event.target.checked; });
-    sec.querySelector('.wf-form').innerHTML = renderFields(fields, own, inherited);
-    sec.dataset.mcpScope = mcpScope(projectId || null, organizationId);
-    wireAgentFields(sec);
-    wireFieldResets(sec, fields);
-  }
-}
-
-// Save handlers for the quick-defaults forms (shared by global + project scopes).
-function wireQuickSettingsSave(scope, projectId, organizationId) {
-  $('#main').querySelectorAll('[data-qsave]').forEach((b) =>
-    b.addEventListener('click', async () => {
-      const wf = b.dataset.qsave;
-      const sec = b.closest('[data-qwf]');
-      const fields = quickAgentFields();
-      const values = { ...collectForm(sec.querySelector('.wf-form'), fields), _enabled: sec.querySelector('.quick-defaults-enabled').checked };
-      const url = scope === 'global' && organizationId ? `/api/organizations/${organizationId}/quick-settings/${wf}`
-        : scope === 'global' ? `/api/settings/quick/global/${wf}` : `/api/settings/quick/project/${projectId}/${wf}`;
-      try { await api(url, { method: 'PUT', body: JSON.stringify({ values }) }); flashSaved(b); } catch (e) { toast(e.message, true); }
-    }),
-  );
-}
-
 
 // ── Avatars ──────────────────────────────────────────────────────────────
 function avatarOwnerName(avatar) { return principalLabel({ kind: 'user', userId: avatar.ownerUserId }); }
@@ -17166,8 +17012,6 @@ function wireSettingsView(proj) {
   hydrateSettingsForms('project', proj.id);
   hydrateResourceDefaults('project', proj.id, proj.organizationId);
   hydrateExplanationSettings('project', proj.id, proj.organizationId);
-  hydrateQuickSettingsForms('project', proj.id);
-  wireQuickSettingsSave('project', proj.id);
   renderCredentialEditor($('#cred-editor-project'), 'project', { projectId: proj.id });
   hydrateProfiles('project', proj.id);
   hydrateReviewRoute('project', proj.id);
@@ -19698,8 +19542,6 @@ function wireGlobalSettings(organizationId) {
   hydrateSettingsForms('global', undefined, organizationId);
   hydrateResourceDefaults('global', undefined, organizationId);
   hydrateExplanationSettings('global', undefined, organizationId || S.organizationId || 'org_personal');
-  hydrateQuickSettingsForms('global', undefined, organizationId);
-  wireQuickSettingsSave('global', undefined, organizationId);
   renderCredentialEditor($('#cred-editor-global'), 'global', { organizationId }); // the organization's accounts + precedence list
   renderAccountStatus(organizationId || S.organizationId);
   hydrateProfiles('global', undefined, organizationId);
@@ -21977,13 +21819,8 @@ function fuzzyScore(q, s) {
 const HOST_COMMANDS = [
   { id: 'nav.commandPalette', title: 'Command palette', key: 'meta+k', run: () => openPalette() },
   { id: 'help.keyboard', title: 'Keyboard shortcuts', key: '?', run: () => openHelp() },
-  // Home and a project list both have the composer; anywhere else opens the project's.
-  { id: 'nav.newTask', title: 'New task (quick add)', key: 'n', run: () => { if (!$('#new-task')) switchTab('tasks'); setTimeout(() => $('#new-task')?.focus(), 30); } },
-  { id: 'nav.newTaskForm', title: 'New task (full form)', key: 'N', run: () => {
-    if ($('#new-task')) return $('#expand-task')?.click();
-    switchTab('tasks');
-    openTaskForm(QUICK_TASK_WORKFLOW);
-  } },
+  // Opens the task form, in the project new tasks go to (Home's choice, else the open project).
+  { id: 'nav.newTask', title: 'New task', key: 'n', run: () => openNewTaskForm() },
   { id: 'nav.search', title: 'Search tasks', key: '/', run: () => { if (!isTaskListTab()) switchTab('tasks'); setTimeout(() => $('#task-search')?.focus(), 0); } },
   { id: 'nav.home', title: 'Go home', key: 'g H', run: () => go(homeRoute(currentOrg(), DEFAULT_LIST_QUERY)) },
   { id: 'nav.tasks', title: 'Go to tasks', key: 'g t', run: () => switchTab('tasks') },
@@ -22014,7 +21851,6 @@ function allCommands() {
   add({ id: 'rail.newProject', title: 'New project', keybinding: 'n', group: 'Projects', available: rail, run: () => newProject() });
   add({ id: 'rail.search', title: 'Search projects', keybinding: '/', group: 'Projects', available: rail, run: () => $('#project-search')?.focus() });
   const listy = ['tasks', 'home', 'queue'].includes(S.tab) && !rail;
-  add({ id: 'list.quickAdd', title: 'Add quick task', keybinding: 'meta+Enter', group: 'List', palette: false, available: !!$('#add-task'), run: () => $('#add-task')?.click() });
   add({ id: 'list.next', title: 'Next task / row', keybinding: 'j', group: 'List', palette: false, available: listy || (!rail && !!S.selected), run: () => (S.selected ? openAdjacentTask(1) : moveCursor(1)) });
   add({ id: 'list.prev', title: 'Previous task / row', keybinding: 'k', group: 'List', palette: false, available: listy || (!rail && !!S.selected), run: () => (S.selected ? openAdjacentTask(-1) : moveCursor(-1)) });
   add({ id: 'list.next.arrow', title: 'Next task / row', keybinding: 'ArrowDown', group: 'List', palette: false, help: false, available: listy && !S.selected, run: () => moveCursor(1) });
@@ -22425,8 +22261,6 @@ function openHelp() {
       ${row('t', 'Terminal / conversation')}
       ${row('u', 'Back to the list')}
       ${row(esc(fmtKeys('meta+Enter')), 'Send a message (in the compose box)')}
-      <div class="section-h">Quick add</div>
-      ${row('↵', 'Open the full task form with what you typed')}
     </div></div></div>`;
   $('#help-close').addEventListener('click', () => (root.remove()));
   $('#help-scrim').addEventListener('click', (e) => { if (e.target.id === 'help-scrim') root.remove(); });

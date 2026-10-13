@@ -8,9 +8,6 @@ import {
   assembleTaskInput,
   projectSettingsFor,
   globalSettingsFor,
-  quickGlobalSettingsFor,
-  quickProjectSettingsFor,
-  quickScopeKey,
   settingsToProjectConfig,
   effectiveRepos,
 } from '../src/platform/params.js';
@@ -234,73 +231,11 @@ describe('projectSettingsFor (lazy back-compat from ProjectConfig)', () => {
   });
 });
 
-describe('quick-task agent defaults (separate overlay for the quick-add box)', () => {
-  // The creation-time chain for an agent field on a quick task (highest → lowest):
-  // task → project-quick → global-quick → project-general → global-general → default.
-  const chain = (layers: {
-    task?: Record<string, unknown>;
-    projectQuick?: Record<string, unknown>;
-    globalQuick?: Record<string, unknown>;
-    project?: Record<string, unknown>;
-    global?: Record<string, unknown>;
-  }) => resolveParamsLayers(sd, [layers.task, layers.projectQuick, layers.globalQuick, layers.project, layers.global]);
-
-  it('scope keys are namespaced so they never collide with general settings', () => {
-    expect(quickScopeKey('global')).toBe('quick:global');
-    expect(quickScopeKey('p1')).toBe('quick:p1');
-    // A project id is never the literal string "global", so no ambiguity.
-    expect(quickScopeKey('p1')).not.toBe('global');
-  });
-
-  it('global-quick overrides the regular agent defaults for a quick task', () => {
-    const r = chain({ globalQuick: { 'agent:do': { provider: 'codex' } }, global: { 'agent:do': { provider: 'claude' } } });
-    expect(r['agent:do']).toMatchObject({ provider: 'codex' });
-  });
-
-  it('organization-quick inherits the regular organization agent when unset', () => {
-    const r = chain({ globalQuick: {}, global: { 'agent:do': { provider: 'claude' } } });
-    expect(r['agent:do']).toMatchObject({ provider: 'claude' });
-  });
-
-  it('project-quick overrides global-quick', () => {
-    const r = chain({ projectQuick: { 'agent:do': { provider: 'claude' } }, globalQuick: { 'agent:do': { provider: 'codex' } } });
-    expect(r['agent:do']).toMatchObject({ provider: 'claude' });
-  });
-
-  it('project-quick inherits from global-quick before the project general default', () => {
-    const r = chain({ globalQuick: { 'agent:do': { provider: 'codex' } }, project: { 'agent:do': { provider: 'claude' } } });
-    expect(r['agent:do']).toMatchObject({ provider: 'codex' });
-  });
-
-  it('project-quick falls through to the regular project agent when neither quick layer sets it', () => {
-    const r = chain({ project: { 'agent:do': { provider: 'claude' } }, global: { 'agent:do': { provider: 'codex' } } });
-    expect(r['agent:do']).toMatchObject({ provider: 'claude' });
-  });
-
-  it('a task override still beats every default layer', () => {
-    const r = chain({
-      task: { 'agent:do': { provider: 'mock' } },
-      projectQuick: { 'agent:do': { provider: 'claude' } },
-      globalQuick: { 'agent:do': { provider: 'codex' } },
-    });
+describe('one defaults chain for every task', () => {
+  it('a task beats its project, which beats its organization (there is no quick-task layer)', () => {
+    const r = resolveParamsLayers(sd, [{ 'agent:do': { provider: 'mock' } }, { 'agent:do': { provider: 'claude' } }, { 'agent:do': { provider: 'codex' } }]);
     expect(r['agent:do']).toMatchObject({ provider: 'mock' });
-  });
-
-  it('quick*SettingsFor read the namespaced rows and default to {}', async () => {
-    const rows: Record<string, Record<string, unknown>> = {
-      'quick:global::software-dev': { confirm: { mode: 'auto' }, 'agent:do': { provider: 'codex' } },
-      'quick:p1::software-dev': { base: 'qb', 'agent:merge': { provider: 'claude' } },
-    };
-    const get = (scopeKey: string, wf: string) => rows[`${scopeKey}::${wf}`];
-    expect((await quickGlobalSettingsFor(get, 'software-dev'))).toEqual({ 'agent:do': { provider: 'codex' } });
-    expect((await quickProjectSettingsFor(get, 'p1', 'software-dev'))).toEqual({ 'agent:merge': { provider: 'claude' } });
-    expect((await quickGlobalSettingsFor(() => undefined, 'software-dev'))).toEqual({});
-    expect((await quickProjectSettingsFor(() => undefined, 'p1', 'software-dev'))).toEqual({});
-  });
-
-  it('can disable the shared Quick overlay without deleting its values', async () => {
-    const get = (_scope: string, workflow: string) => workflow === '__common__' ? { _enabled: false, 'agent:do': { provider: 'codex' } } : undefined;
-    expect((await quickProjectSettingsFor(get, 'p1', 'software-dev'))).toEqual({});
+    expect(resolveParamsLayers(sd, [undefined, { 'agent:do': { provider: 'claude' } }, { 'agent:do': { provider: 'codex' } }])['agent:do']).toMatchObject({ provider: 'claude' });
   });
 });
 

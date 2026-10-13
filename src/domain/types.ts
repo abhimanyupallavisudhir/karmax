@@ -1115,7 +1115,7 @@ export interface TaskParams {
    * references (a page, a whole `[[proj:tag:<label>]]`, or a folder
    * `[[proj:<section>/*]]`). The task-form "wiki context" field seeds this with
    * both scopes' `tag:default` references so default-labelled pages are inlined; a task
-   * opts out by clearing them. Absent (API/quick-add) ⇒ the default tokens apply.
+   * opts out by clearing them. Absent (API callers) ⇒ the default tokens apply.
    * Resolved fresh each turn by `buildWikiPromptContext` (SPEC §5.4), UNION any
    * wiki references written inline in the prompt/follow-ups.
    */

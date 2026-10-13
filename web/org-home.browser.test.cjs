@@ -1,7 +1,7 @@
 // The organization home: `/` lands on `/<org>`, one task list over every
 // project that opens on "For me" (what waits on you, each row saying why), with
 // "Active" one click away and bookmarkable, the empty query showing archived tasks too, a project filter, project permalinks,
-// a composer that creates the task in a project you pick,
+// a New task field that opens the task form in the project new tasks go to,
 // the logo as the way home, and a ☰ that folds the sidebar on a wide screen.
 // Run: node web/org-home.browser.test.cjs   (HOME_SCREENSHOTS=<dir> also saves screenshots)
 const assert = require('node:assert/strict');
@@ -74,7 +74,8 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     assert.equal(await page.locator('.view-chip[data-view="__active__"]').innerText(), 'Active');
     assert.equal(await page.locator('.view-chip[data-view="__active__"]').getAttribute('title'), '-is:archived', 'its query is on hover');
     assert.equal(await page.locator('#save-view').count(), 0, 'saved views belong to projects');
-    assert.equal(await page.locator('#new-task-project').innerText(), 'website', 'new tasks start in a project you pick');
+    assert.equal(await page.locator('#expand-task').innerText(), 'New task…', 'one New task field, which opens the form');
+    assert.equal(await page.locator('#new-task-project').count(), 0, 'the form, not the field, picks the project');
     const review = page.locator('[data-id="t1"] .chip.attention');
     assert.equal(await review.innerText(), 'Review');
     assert.equal(await review.getAttribute('title'), 'Waiting for your review', 'the reason is explained in a tooltip');

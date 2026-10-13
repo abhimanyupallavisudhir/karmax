@@ -39,10 +39,8 @@ export function resolveParams(
 
 /**
  * Resolve field values from an arbitrary ordered stack of overlays, highest
- * precedence first (task → … → global), falling through empty layers to the
- * field default. Generalizes the fixed task/project/global chain so the quick-task
- * defaults layers (quick-project → quick-global) can be spliced above the general
- * ones (SPEC §10.4 overlay).
+ * precedence first (task → project → global), falling through empty layers to
+ * the field default (SPEC §10.4 overlay).
  */
 export function resolveParamsLayers(manifest: WorkflowManifest, layers: (ValueMap | undefined)[]): ValueMap {
   const out: ValueMap = {};
@@ -311,55 +309,6 @@ export async function globalSettingsFor(
       ?? {};
   }
   return (await withCommon(getSettings, 'global', workflow)) ?? {};
-}
-
-/**
- * Quick-task agent defaults (SPEC §10.4) — a separate, agent-only overlay that
- * applies ONLY to tasks added from the quick-task box (not the full task form).
- * It starts empty and is opt-in. Filtering on read also prevents historical
- * non-agent values in these rows from changing branch, review, or remote policy.
- *
- * Effective value for a quick task in a project (highest → lowest precedence):
- *   task override → project-quick → global-quick → project-general → global-general → field default.
- * The chain applies to agent fields only: global-quick inherits from
- * global-general, while project-quick inherits from global-quick and then the
- * project's regular agent defaults.
- */
-export function quickScopeKey(scope: 'global' | string): string {
-  return scope === 'global' ? 'quick:global' : `quick:${scope}`;
-}
-
-function quickAgentsOnly(values: ValueMap | undefined): ValueMap | undefined {
-  if (!values) return undefined;
-  return Object.fromEntries(Object.entries(values).filter(([name]) => name === '_enabled' || name === 'separateAgents' || name.startsWith('agent:')));
-}
-
-export async function quickGlobalSettingsFor(
-  getSettings: (scopeKey: string, workflow: string) => ValueMap | undefined | Promise<ValueMap | undefined>,
-  workflow: string,
-  organizationId?: string,
-): Promise<ValueMap> {
-  if (organizationId) {
-    const key = `quick:organization:${organizationId}`;
-    const common = (await getSettings(key, COMMON_SETTINGS_WORKFLOW));
-    if (common?._enabled === false) return {};
-    return quickAgentsOnly((await withCommon(getSettings, key, workflow))
-      ?? (organizationId === 'org_personal' ? (await withCommon(getSettings, quickScopeKey('global'), workflow)) : undefined))
-      ?? {};
-  }
-  const key = quickScopeKey('global');
-  if ((await getSettings(key, COMMON_SETTINGS_WORKFLOW))?._enabled === false) return {};
-  return quickAgentsOnly((await withCommon(getSettings, key, workflow))) ?? {};
-}
-
-export async function quickProjectSettingsFor(
-  getSettings: (scopeKey: string, workflow: string) => ValueMap | undefined | Promise<ValueMap | undefined>,
-  projectId: string,
-  workflow: string,
-): Promise<ValueMap> {
-  const key = quickScopeKey(projectId);
-  if ((await getSettings(key, COMMON_SETTINGS_WORKFLOW))?._enabled === false) return {};
-  return quickAgentsOnly((await withCommon(getSettings, key, workflow))) ?? {};
 }
 
 /** When project settings are saved, mirror bound-project fields into ProjectConfig (back-compat). */

@@ -88,6 +88,9 @@ export async function bootHarness(
     githubPr?: import('../../src/integrations/github-pr.js').GithubPrApiOptions;
     githubApp?: import('../../src/integrations/github-app.js').GitHubAppService;
     probeUsage?: import('../../src/activities/core.js').CoreActivityDeps['probeUsage'];
+    /** Providers the adapter override also answers for: a task made in the
+     *  console's form names its default agent's provider (claude) explicitly. */
+    alsoServe?: Provider[];
   } = {},
 ): Promise<Harness> {
   const server = await startDevServer({ headless: true, logLevel: 'never' });
@@ -117,7 +120,7 @@ export async function bootHarness(
   const { WorktreeProvider } = await import('../../src/world/worktree.js');
   worlds.register(new WorktreeProvider(worldsHome));
   const adapters = buildAdapters();
-  if (adapterOverride) adapters.set(provider, adapterOverride);
+  if (adapterOverride) for (const served of [provider, ...(overrides.alsoServe ?? [])]) adapters.set(served, adapterOverride);
   const profiles = new ProfileResolver(store, provider);
   const bus = new KarmaxBus();
   store.onEventRecorded((event) => bus.emit(event)); // as src/main.ts wires it

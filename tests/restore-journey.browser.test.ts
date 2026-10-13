@@ -49,8 +49,9 @@ it('restores a backup over lost state, and the console carries the restored task
   await consoleRequest(operator.context, app.url, 'POST', '/api/vault/items', { type: 'login', label: 'Restorable login',
     domains: 'restore.example.test', username: 'restorer', secrets: { password: 'kept-in-the-vault' } });
   await operator.step('open the project', () => operator.page.goto(`${app!.url}/personal/restorable`));
-  await operator.page.locator('#new-task').fill('@write restored.txt :: survived the restore');
-  await operator.page.locator('#new-task').press('Control+Enter');
+  // The task itself is not what this journey checks: start it as an API caller would.
+  await consoleRequest(operator.context, app.url, 'POST', `/api/projects/${project.id}/tasks`,
+    { title: '@write restored.txt', prompt: '@write restored.txt :: survived the restore', workflow: 'software-dev' });
   const reviewed = async () => (await consoleRequest(operator.context, app!.url, 'GET', `/api/projects/${project.id}/tasks`))
     .find((task: any) => task.title.includes('@write restored.txt'))?.lastView?.stage;
   await operator.step('the agent reaches Review', () => expect.poll(reviewed, { timeout: 30_000 }).toBe('review'));
