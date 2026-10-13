@@ -1,6 +1,6 @@
 // Creating tasks from the organization home, and the bell's page: Home creates
-// a task in any of the organization's projects (a project picker in the quick
-// composer and on the task form's "← New task" bar), the topbar has no second
+// a task in any of the organization's projects (a project picker in the task
+// form's "← New task" bar, which Home's New task opens), the topbar has no second
 // search, and the bell opens one Home-like list of what waits on you in every
 // organization, each row naming its organization and project as a slug.
 // Run: node web/for-you.browser.test.cjs   (FOR_YOU_SCREENSHOTS=<dir> also saves screenshots)
@@ -93,41 +93,35 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     assert.equal(style.border, '0px');
     assert.equal(style.background, 'rgba(0, 0, 0, 0)', 'no pill behind it');
 
-    const pick = page.locator('#new-task-project');
-    assert.equal(await pick.innerText(), 'website', 'new tasks go to the current project by default');
-    await pick.click();
-    const menu = page.locator('.project-pick-menu:not([hidden])');
-    assert.deepEqual(await menu.locator('[role="option"]').allInnerTexts(), ['website', 'mobile-app'], 'the organization\'s projects');
-    if (shots) await page.screenshot({ path: path.join(shots, 'home-composer-picker.png') });
-    await menu.locator('[data-project="q"]').click();
-    assert.equal(await pick.innerText(), 'mobile-app');
-    await page.locator('#new-task').fill('Sync reading positions');
-    await page.locator('#new-task').press('Control+Enter');
-    await page.waitForFunction(() => !document.querySelector('#new-task').value);
-    assert.deepEqual(created.map((c) => [c.projectId, c.body.title]), [['q', 'Sync reading positions']], 'created in the chosen project');
-    await page.reload();
-    await page.locator('[data-id="t1"]').waitFor();
-    assert.equal(await page.locator('#new-task-project').innerText(), 'mobile-app', 'the choice is remembered');
-
-    // ── the full form: "← New task" with a project dropdown ──────────────────
-    await page.locator('#new-task').fill('Dark mode');
-    await page.locator('#new-task').press('Enter');
+    // ── New task: a stand-in field that opens the full form; the form picks the project ──
+    assert.equal(await page.locator('#new-task-project').count(), 0, 'the composer has no project picker of its own');
+    assert.equal(await page.locator('#expand-task').evaluate((el) => el.tagName), 'BUTTON', 'the field is a stand-in, not an input');
+    await page.locator('#expand-task').click();
     const formPick = page.locator('#tf-project');
     await formPick.waitFor();
-    assert.equal(await formPick.innerText(), 'mobile-app', 'the form opens in the composer\'s project');
-    assert.equal(await page.locator('#tf-page textarea').first().inputValue(), 'Dark mode');
+    assert.equal(await formPick.innerText(), 'website', 'new tasks go to the current project by default');
     await formPick.click();
+    const menu = page.locator('.project-pick-menu:not([hidden])');
+    assert.deepEqual(await menu.locator('[role="option"]').allInnerTexts(), ['website', 'mobile-app'], 'the organization\'s projects');
     if (shots) await page.screenshot({ path: path.join(shots, 'task-form-project-picker.png') });
-    await page.locator('.project-pick-menu:not([hidden]) [data-project="p"]').click();
-    await page.waitForFunction(() => document.querySelector('#tf-project')?.innerText === 'website');
-    assert.equal(await page.locator('#tf-page textarea').first().inputValue(), 'Dark mode', 'switching keeps what you wrote');
+    await menu.locator('[data-project="q"]').click();
+    await page.waitForFunction(() => document.querySelector('#tf-project')?.innerText === 'mobile-app');
+    await page.locator('#tf-page textarea[data-field="prompt"]').fill('Dark mode');
     await page.locator('#tf-queue').click();
     await page.waitForFunction(() => !document.querySelector('#tf-page'));
-    assert.deepEqual(created.at(-1).projectId, 'p', 'the form runs the task in the chosen project');
+    assert.deepEqual(created.at(-1).projectId, 'q', 'the form runs the task in the chosen project');
     assert.equal(created.at(-1).body.params.prompt, 'Dark mode');
-    // A project's own list has no picker: the project is the page.
+    // Send opens the same form, in the project chosen last.
+    await page.reload();
+    await page.locator('[data-id="t1"]').waitFor();
+    await page.locator('#add-task').click();
+    await page.locator('#tf-project').waitFor();
+    assert.equal(await page.locator('#tf-project').innerText(), 'mobile-app', 'the choice is remembered');
+    await page.locator('#tf-close').click();
+    await page.waitForFunction(() => !document.querySelector('#tf-page'));
+    // A project's own list opens the form in that project.
     await page.goto('http://console.test/org/website');
-    await page.locator('#new-task').waitFor();
+    await page.locator('#expand-task').waitFor();
     assert.equal(await page.locator('#new-task-project').count(), 0);
 
     // ── the bell: what waits on you in every organization ─────────────────────

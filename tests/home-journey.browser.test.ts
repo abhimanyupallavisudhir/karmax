@@ -57,7 +57,7 @@ it('lands on the organization home, For me across projects, Active one click awa
     const web = await consoleRequest(context, app.url, 'POST', '/api/projects', { name: 'Website', config: config(webRepo) });
     const mobile = await consoleRequest(context, app.url, 'POST', '/api/projects', { name: 'Mobile App', config: config(appRepo) });
     const create = (projectId: string, title: string, prompt: string, draft = false) => consoleRequest(context, app!.url, 'POST',
-      `/api/projects/${projectId}/tasks`, { title, prompt, workflow: 'software-dev', quick: true, ...(draft ? { draft: true } : {}) });
+      `/api/projects/${projectId}/tasks`, { title, prompt, workflow: 'software-dev', ...(draft ? { draft: true } : {}) });
     const review = await create(web.id, 'Keep the cart when signing in', '@write cart.txt :: kept');
     const paused = await create(mobile.id, 'Index the reading list overnight', '@pause 120');
     const draft = await create(mobile.id, 'Offline mode for the reading list', 'later', true);
@@ -107,14 +107,15 @@ it('lands on the organization home, For me across projects, Active one click awa
       await page.waitForURL(/\/personal$/);
       await page.locator(`[data-id="${review.id}"]`).waitFor();
     });
-    await step('the composer creates a draft in the project picked for it', async () => {
+    await step('New task opens the form, which creates a draft in the project picked there', async () => {
       // It starts in the project last visited, Mobile App; choose Website.
-      expect(await page.locator('#new-task-project').innerText()).toBe('mobile-app');
-      await page.locator('#new-task-project').click();
+      await page.locator('#expand-task').click();
+      expect(await page.locator('#tf-project').innerText()).toBe('mobile-app');
+      await page.locator('#tf-project').click();
       await page.locator('.project-pick-menu:not([hidden]) [data-project="' + web.id + '"]').click();
-      await page.locator('#new-task').fill('Sync reading positions');
-      await page.locator('#new-task').press('Alt+Enter');
-      await expect.poll(() => page.locator('#new-task').inputValue()).toBe('');
+      await page.locator('#tf-body textarea[data-field="prompt"]').fill('Sync reading positions');
+      await page.locator('#tf-draft').click();
+      await page.locator('#tf-page').waitFor({ state: 'detached' });
     });
     const drafts = await consoleRequest(context, app.url, 'GET', `/api/projects/${web.id}/tasks`);
     expect(drafts.some((task: any) => task.title === 'Sync reading positions' && task.params?.draft)).toBe(true);
@@ -142,7 +143,9 @@ it('lands on the organization home, For me across projects, Active one click awa
 
     await page.goto(`${app.url}/personal`);
     await page.locator(`[data-id="${review.id}"]`).waitFor();
-    expect(await page.locator('#new-task-project').innerText()).toBe('website'); // the choice is remembered
+    await page.locator('#expand-task').click();
+    expect(await page.locator('#tf-project').innerText()).toBe('website'); // the choice is remembered
+    await page.locator('#tf-close').click();
     const shots = process.env.HOME_SCREENSHOTS;
     if (shots) {
       await page.locator('#mobile-menu').click();

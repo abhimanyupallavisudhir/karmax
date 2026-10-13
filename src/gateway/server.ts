@@ -48,7 +48,7 @@ import { ContributionRegistry } from '../contrib/registry.js';
 import { Overlays } from '../store/overlays.js';
 import { activationTaskPrompt, manifest } from '../contrib/manifests.js';
 import { machineShape } from '../domain/computer.js';
-import { projectSettingsFor, globalSettingsFor, quickProjectSettingsFor, quickGlobalSettingsFor, quickScopeKey, settingsToProjectConfig, resolveParams, resolveParamsLayers, effectiveRepos } from '../platform/params.js';
+import { projectSettingsFor, globalSettingsFor, settingsToProjectConfig, resolveParams, effectiveRepos } from '../platform/params.js';
 import { defaultProvider } from '../agent/adapters.js';
 import { findProviderSession } from '../agent/fork.js';
 import { localCodexFiles } from '../agent/codex-history-files.js';
@@ -319,7 +319,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   // Installation-wide outbound email is operator configuration (settings:write),
   // like the mailbox provider. The connected secret never leaves the vault.
   if (p === '/api/email' || p.startsWith('/api/email/')) return read ? 'settings:read' : 'settings:write';
-  if (/^\/api\/settings\/(?:quick\/)?project\//.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
+  if (/^\/api\/settings\/project\//.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (p.startsWith('/api/settings')) return read ? 'settings:read' : 'settings:write';
   if (p.startsWith('/api/defaults/')) return 'task:read';
   if (p === '/api/mcp' || p.startsWith('/api/mcp/')) {
@@ -351,7 +351,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/projects\/[^/]+\/folder$/.test(p)) return 'project:edit';
   if (/^\/api\/projects\/[^/]+\/reorder$/.test(p)) return 'project:edit';
   if (/^\/api\/projects\/[^/]+\/execution-policy$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
-  if (/^\/api\/projects\/[^/]+\/(defaults|settings|quick-settings)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
+  if (/^\/api\/projects\/[^/]+\/(defaults|settings)/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/explanation-settings$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/members/.test(p)) return read ? 'project:read' : 'project:edit';
   // The tavya CLI (wiki planned/tavya-cli). Grants to read a resource are a
@@ -8536,11 +8536,6 @@ export class Gateway {
             target: (detectTarget && repoDefaults[index]?.target) || out.target }));
           return out;
         };
-        // Quick-task agent defaults (SPEC §10.4): an agent-only overlay for tasks
-        // added from the quick box. Project Quick agents inherit through the
-        // organization Quick agents into the regular project/organization agents.
-        const globalQuickVals = (await quickGlobalSettingsFor(gs, wf, organizationId ?? undefined));
-        const projectQuickVals = project ? (await quickProjectSettingsFor(gs, project.id, wf)) : {};
         const hasComputer = m.params.some((field) => field.type === 'computer');
         const withComputer = (values: Record<string, unknown>, value: unknown) => {
           const { worldProvider: _legacy, computer: _stale, ...rest } = values;
@@ -8550,11 +8545,6 @@ export class Gateway {
           task: { own: {}, inherited: withComputer((await enrich(resolveParams(m, { project: projectVals, global: globalVals }), {})), computer.task.inherited) },
           project: { own: withComputer(projectVals, computer.project.own), inherited: withComputer((await enrich(resolveParams(m, { global: globalVals }), projectVals)), computer.project.inherited) },
           global: { own: withComputer(globalVals, computer.global.own), inherited: withComputer((await enrich(resolveParams(m, {}), { ...projectVals, ...globalVals })), computer.global.inherited) },
-          globalQuick: { own: globalQuickVals, inherited: (await enrich(resolveParams(m, { global: globalVals }), globalQuickVals)) },
-          projectQuick: {
-            own: projectQuickVals,
-            inherited: (await enrich(resolveParamsLayers(m, [globalQuickVals, projectVals, globalVals]), { ...projectVals, ...globalVals, ...globalQuickVals, ...projectQuickVals })),
-          },
         });
       }
 
@@ -8573,17 +8563,6 @@ export class Gateway {
             if (computer) (await saveOrganizationComputer(store, organizationId!, computer.value, options));
           } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
           (await store.setSettings(`organization:${organizationId}`, wf!, values));
-          return this.json(res, 200, { ok: true });
-        }
-      }
-      const organizationQuickSettings = p.match(/^\/api\/organizations\/([^/]+)\/quick-settings\/([^/]+)$/);
-      if (organizationQuickSettings) {
-        const [_, organizationId, wf] = organizationQuickSettings;
-        if (method === 'GET') return this.json(res, 200, (await quickGlobalSettingsFor(async (s, w) => (await store.getSettings(s, w)), wf!, organizationId)));
-        if (method === 'PUT') {
-          const b = await this.body(req);
-          (await store.setSettings(`quick:organization:${organizationId}`, wf!,
-            hostedSettingsValues(b.values ?? {}, this.deps.hosted === true)));
           return this.json(res, 200, { ok: true });
         }
       }
@@ -8635,38 +8614,6 @@ export class Gateway {
           // Mirror bound-project fields into ProjectConfig for back-compat.
           const m = manifest(wf);
           if (m) (await store.updateProjectConfig(projectId, settingsToProjectConfig(m, values)));
-          return this.json(res, 200, { ok: true });
-        }
-      }
-
-      // quick-task defaults (SPEC §10.4) — a separate opt-in overlay stored under a
-      // `quick:` namespaced scope; applied only to tasks from the quick-add box.
-      const qgset = p.match(/^\/api\/settings\/quick\/global\/([^/]+)$/);
-      if (qgset) {
-        const wf = qgset[1]!;
-        if (method === 'GET') return this.json(res, 200, (await quickGlobalSettingsFor(async (s, w) => (await store.getSettings(s, w)), wf)));
-        if (method === 'PUT') {
-          const b = await this.body(req);
-          (await store.setSettings(quickScopeKey('global'), wf,
-            hostedSettingsValues(b.values ?? {}, this.deps.hosted === true)));
-          return this.json(res, 200, { ok: true });
-        }
-      }
-      const qpset = p.match(/^\/api\/settings\/quick\/project\/([^/]+)\/([^/]+)$/);
-      if (qpset) {
-        const projectId = qpset[1]!;
-        const wf = qpset[2]!;
-        if (method === 'GET') {
-          const project = (await store.getProject(projectId));
-          if (!project) return this.json(res, 404, { error: 'no project' });
-          return this.json(res, 200, (await quickProjectSettingsFor(async (s, w) => (await store.getSettings(s, w)), projectId, wf)));
-        }
-        if (method === 'PUT') {
-          const b = await this.body(req);
-          // Quick-task defaults are UI-only overlays (never mirrored into ProjectConfig,
-          // which drives full-form/general resolution), so just persist the row.
-          (await store.setSettings(quickScopeKey(projectId), wf,
-            hostedSettingsValues(b.values ?? {}, this.deps.hosted === true)));
           return this.json(res, 200, { ok: true });
         }
       }
@@ -10086,7 +10033,7 @@ export class Gateway {
     const viewId = pathname.match(/^\/api\/views\/([^/]+)/)?.[1];
     const pathProject = pathname.match(/^\/api\/projects\/([^/]+)/)?.[1]
       ?? pathname.match(/^\/api\/defaults\/([^/]+)/)?.[1]
-      ?? pathname.match(/^\/api\/settings\/(?:quick\/)?project\/([^/]+)/)?.[1];
+      ?? pathname.match(/^\/api\/settings\/project\/([^/]+)/)?.[1];
     const artifact = pathname.match(/^\/api\/artifacts\/([^/]+)/)?.[1];
     const artifactRecord = artifact ? (await this.deps.store.getPromotedArtifact(artifact)) : undefined;
     const previewId = pathname.match(/^\/api\/preview-leases\/([^/]+)/)?.[1];

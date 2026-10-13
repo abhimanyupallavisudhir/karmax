@@ -382,20 +382,16 @@ a { color: var(--accent); text-decoration: none; }
 
 /* new-task composer */
 .composer { display: flex; gap: 8px; margin-bottom: 18px; }
-.composer.busy { opacity: .68; cursor: progress; }
-.quick-task-field {
+.new-task-field {
   display: flex; align-items: center; flex: 1; min-width: 0;
   border: 1px solid var(--line); border-radius: var(--r);
   background: var(--surface); box-shadow: var(--shadow);
 }
-.quick-task-field:focus-within { border-color: var(--accent); }
-.composer input.title-in {
-  flex: 1; min-width: 0; padding: 11px 14px; border: 0;
-  background: transparent; outline: none; box-shadow: none;
-}
+/* The new-task field is a stand-in: a button that looks like a field and opens the form. */
+.composer .new-task-field { padding: 11px 14px; font: inherit; color: var(--ink-3); text-align: left; cursor: text; }
+.composer .new-task-field:hover { border-color: var(--line-strong); }
+.composer .new-task-field:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .composer .btn.icon-only { width: 42px; padding-left: 0; padding-right: 0; justify-content: center; flex: none; }
-.composer .attach-composer { cursor: pointer; }
-.composer .quick-task-attach { width: 34px; height: 34px; margin-right: 4px; }
 .composer .btn.icon-only svg { display: block; }
 
 /* ── task row ───────────────────────────────────────────────── */
@@ -683,8 +679,6 @@ a.git-repo-name:hover { color:var(--accent); }
 .project-pick-opt:hover, .project-pick-opt:focus-visible { background: var(--accent-weak); outline: none; }
 .project-pick-opt .task-project { max-width: none; font-size: 12.5px; }
 .project-pick-opt[aria-selected="true"]::after { content: '✓'; color: var(--accent); font-size: 12px; }
-.quick-task-field .project-pick-wrap, .quick-task-field > .project-pick.static { margin-left: 6px; }
-.quick-task-field .project-pick-wrap + .title-in, .quick-task-field > .project-pick.static + .title-in { padding-left: 6px; }
 
 /* GitHub pull request, in the task byline: link + live state. */
 .pr-link {
@@ -2250,9 +2244,6 @@ html[data-theme="dark"] .github-signin-btn:active,
   .tabs { overflow-x:auto; scrollbar-width:none; }
   .tabs::-webkit-scrollbar { display:none; }
   .tab { flex:none; white-space:nowrap; }
-  .composer input.title-in { min-width:0; width:100%; padding-left:10px; padding-right:6px; }
-  .composer .quick-task-attach { width:30px; margin-right:2px; }
-  .composer #draft-task { display:none; } /* the full form saves drafts too */
   .tp-head > * { padding: 0 16px; }
   .tp-content { padding: 16px 16px 40px; }
   .tp-foot { padding: 10px 0; }

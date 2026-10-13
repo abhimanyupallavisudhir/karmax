@@ -48,7 +48,7 @@ import { providerLabel } from '../domain/computer-limits.js';
 import { taskProvider } from '../world/task-provider.js';
 import { applyComputer, assertInFlightComputerEdit, computerOf, computerResizable, describeMachine, machineShape, normalizeComputer, sameMachine,
   type ComputerSpec, type MachineShape } from '../domain/computer.js';
-import { resolveParamsLayers, assembleTaskInput, projectSettingsFor, globalSettingsFor, quickProjectSettingsFor, quickGlobalSettingsFor, effectiveRepos, ValueMap } from './params.js';
+import { resolveParamsLayers, assembleTaskInput, projectSettingsFor, globalSettingsFor, effectiveRepos, ValueMap } from './params.js';
 import { REPOSITORY_BRANCHES_RESOLVED_PARAM, applyRepoBranches, normalizeRepoBranches, repositoryBranchDefaults } from './branch-defaults.js';
 import { withTimeout } from '../util/timeout.js';
 import path from 'node:path';
@@ -1257,9 +1257,6 @@ export class KarmaxApi {
       notes?: string;
       /** Save without starting the workflow (SPEC §10.4 drafts). */
       draft?: boolean;
-      /** Added from the quick-task box (not the full form): layer the quick-task
-       *  defaults over the general defaults when resolving (SPEC §10.4). */
-      quick?: boolean;
       /** Job-shaped permission profile for every agent spawned by this workflow. */
       authorizationProfile?: string;
       /** Canonical level plus its project-list / organization / global scope. */
@@ -1393,7 +1390,7 @@ export class KarmaxApi {
       (await this.validatePromptFiles(args.projectId, promptFiles));
       taskOverrides.files = promptFiles;
     }
-    const resolved = await this.resolveTaskParams(manifest, project, taskOverrides, !!args.quick);
+    const resolved = await this.resolveTaskParams(manifest, project, taskOverrides);
     // Agents called in with `@` are not manifest fields; their specs ride in params.
     const agentValues: ValueMap = { ...resolved, ...calledAgentFields(taskOverrides) };
     const selectedAvatars = (await this.validateTaskAgents(caller, project, manifest, agentValues));
@@ -1705,15 +1702,12 @@ export class KarmaxApi {
    * creation and draft queueing so both pick up the live defaults, and so an
    * unqueued task inherits any default change made after it was saved.
    */
-  private async resolveTaskParams(manifest: WorkflowManifest, project: Project, taskOverrides: ValueMap, quick = false): Promise<ValueMap> {
+  private async resolveTaskParams(manifest: WorkflowManifest, project: Project, taskOverrides: ValueMap): Promise<ValueMap> {
     const getSettings = async (s: string, w: string) => (await this.deps.store.getSettings(s, w));
     const projectVals = (await projectSettingsFor(getSettings, project, manifest.name));
     const globalVals = (await globalSettingsFor(getSettings, manifest.name, project.organizationId));
-    // Quick tasks layer the quick-task defaults (project-quick → global-quick) above
-    // the general defaults; a full-form task skips them entirely (SPEC §10.4).
-    const layers: (ValueMap | undefined)[] = quick
-      ? [taskOverrides, (await quickProjectSettingsFor(getSettings, project.id, manifest.name)), (await quickGlobalSettingsFor(getSettings, manifest.name, project.organizationId)), projectVals, globalVals]
-      : [taskOverrides, projectVals, globalVals];
+    // One chain for every task: its own values, then the project's, then the organization's.
+    const layers: (ValueMap | undefined)[] = [taskOverrides, projectVals, globalVals];
     const resolved = resolveParamsLayers(manifest, layers);
     // The Computer's defaults are the execution policy (already in the project's
     // effective config); only the task's own override is a param. A legacy

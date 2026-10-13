@@ -38,10 +38,7 @@ eval(extractFn('isBareModifier'));
 eval(extractFn('focusedEnterAction'));
 eval(extractFn('fmtKeys'));
 eval(extractFn('fuzzyScore'));
-eval(extractConst('firstLine').replace('const firstLine =', 'global.firstLine ='));
-eval(extractConst('QUICK_TASK_WORKFLOW').replace('const QUICK_TASK_WORKFLOW =', 'global.QUICK_TASK_WORKFLOW ='));
-eval(extractFn('quickTaskSubmitMode'));
-eval(extractFn('quickTaskPayload'));
+eval(extractConst('NEW_TASK_WORKFLOW').replace('const NEW_TASK_WORKFLOW =', 'global.NEW_TASK_WORKFLOW ='));
 eval(extractFn('initialTaskFormSavedSignature'));
 eval(extractFn('taskFormKeyAction'));
 
@@ -49,17 +46,13 @@ let pass = 0, fail = 0;
 const ok = (cond, msg) => { if (cond) { pass++; } else { fail++; console.error('FAIL:', msg); } };
 const ev = (key, mods = {}) => ({ key, metaKey: false, ctrlKey: false, altKey: false, shiftKey: false, ...mods });
 
-// ── Quick-add guidance ──
-ok(
-  src.includes('placeholder="New task…"') && src.includes('title="↵ opens the full form'),
-  'quick-add placeholder is short; its shortcuts are in the tooltip',
-);
-ok(!src.includes('Ctrl+V to paste image') && !src.includes(' · (n)"'), 'quick-add placeholder omits paste and bare-key hints');
-ok(
-  src.includes('class="quick-task-field"')
-    && src.includes('class="btn soft icon-only attach-composer quick-task-attach"'),
-  'quick-add attachment picker is a soft button inside the task field',
-);
+// ── New task: a stand-in field and Send, both opening the full form ──
+ok(src.includes('id="expand-task" data-shortcut="nav.newTask">New task…</button>'), 'the New task field is a button that opens the form');
+ok(extractFn('wireNewTaskComposer').includes("$('#expand-task')?.addEventListener('click', openNewTaskForm)")
+  && extractFn('wireNewTaskComposer').includes("$('#add-task')?.addEventListener('click', openNewTaskForm)"), 'the field and Send both open the form');
+ok(!src.includes('id="new-task"') && !src.includes('id="draft-task"') && !src.includes('id="new-task-files"'), 'no typed quick task, draft or attach buttons beside it');
+ok(!src.includes('quick: true') && !src.includes('quickSettingsForms'), 'no quick-task payload or quick-task settings');
+ok(src.includes("{ id: 'nav.newTask', title: 'New task', key: 'n', run: () => openNewTaskForm() }"), 'n opens the form');
 
 // The Activity feed is an internal debugging page. Its direct route remains
 // usable, but users must not discover it through the tab bar, command palette,
@@ -142,7 +135,7 @@ ok(focusedEnterAction(ev('x'), focused('chip')) === null, 'non-Enter keys do not
 ok(src.includes('if (e.defaultPrevented || e.isComposing) return;'), 'component-level Enter handlers are not activated a second time by the document dispatcher');
 ok(src.indexOf("const focusedAction = focusedEnterAction(e, t)") < src.indexOf('if (dispatchKey(e)) return;', src.indexOf('function bindKeys()')), 'focused Enter activation is resolved before global key dispatch');
 ok(src.indexOf("const focusedAction = focusedEnterAction(e, t)") < src.indexOf('if (overlayOpen)', src.indexOf('function bindKeys()')), 'focused custom controls also activate inside overlays');
-ok(src.includes("id: 'list.quickAdd'") && src.includes("keybinding: 'meta+Enter'") && src.includes("run: () => $('#add-task')?.click()"), 'Ctrl/Cmd+Enter clicks quick-add from anywhere on the task list');
+ok(!src.includes("id: 'list.quickAdd'"), 'no Ctrl/Cmd+Enter quick-add: tasks are written in the form');
 
 // Exercise the actual document handler: a focused row must activate its anchor,
 // whereas a draft or a nested custom control owns a direct click. Native key
@@ -204,17 +197,7 @@ ok(fuzzyScore('task', 'Confirm task') > 0, 'word-boundary bonus applies');
 ok(fuzzyScore('gq', 'Go to queues') >= 0, 'initials-style query matches');
 
 
-// ── Quick-add submission modes ──
-ok(quickTaskSubmitMode(ev('Enter')) === 'form', 'Enter opens the full task form');
-ok(quickTaskSubmitMode(ev('Enter', { metaKey: true })) === 'add', 'Cmd/Ctrl+Enter starts the task');
-ok(quickTaskSubmitMode(ev('Enter', { ctrlKey: true })) === 'add', 'Ctrl+Enter starts the task');
-ok(quickTaskSubmitMode(ev('Enter', { altKey: true })) === 'draft', 'Alt+Enter saves a draft');
-ok(quickTaskSubmitMode(ev('x', { altKey: true })) === null, 'non-Enter keys do not submit the quick task');
-ok(!src.includes('id="new-wf"'), 'quick-add does not show a workflow selector');
-const sent = quickTaskPayload('run it', [], false);
-const draft = quickTaskPayload('save it', ['image-1'], true);
-ok(sent.quick === true && sent.workflow === 'software-dev' && sent.draft === undefined, 'quick send starts immediately with the software-dev workflow');
-ok(draft.quick === true && draft.draft === true && draft.images[0] === 'image-1', 'quick draft uses the same payload plus draft=true');
+ok(!src.includes('id="new-wf"'), 'the list does not show a workflow selector');
 
 // The text carried by Enter into the full form has never been persisted. Closing
 // that form immediately must therefore see a dirty state and create a draft.

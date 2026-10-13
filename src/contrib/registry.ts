@@ -48,8 +48,7 @@ export class ContributionRegistry {
 
 /** Core commands the host registers (keyboard navigation; SPEC §10.1, §10.3). */
 export const CORE_COMMANDS: CommandDecl[] = [
-  { id: 'nav.newTask', title: 'New task (quick add)', keybinding: 'n' },
-  { id: 'nav.newTaskForm', title: 'New task (full form)', keybinding: 'N' },
+  { id: 'nav.newTask', title: 'New task', keybinding: 'n' },
   { id: 'nav.search', title: 'Search', keybinding: '/' },
   { id: 'nav.home', title: 'Go home', keybinding: 'g H' },
   { id: 'nav.tasks', title: 'Go to tasks', keybinding: 'g t' },
