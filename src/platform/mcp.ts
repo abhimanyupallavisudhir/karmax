@@ -739,10 +739,10 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
     'list_credentials',
     {
       description:
-        'List the accounts and other vault credentials this task is authorized to use. Returns non-secret metadata including each item id, label, type, domains, username when present, stored field names, and effective use/reveal policy. Call this before guessing a domain or requesting new access.',
-      inputSchema: {},
+        'List the accounts and other vault credentials this task is authorized to use, or with query search the whole vault, including items not granted yet (granted: false; get, fill or request them by item id and the human is asked). Query words match label, domains, username and tags, e.g. "aws" or "github totp". Returns non-secret metadata: item id, label, type, domains, username, stored field names, effective use/reveal policy. Search before concluding a credential is missing: a one-time-code seed is often its own item, such as "totp/aws", with no domains.',
+      inputSchema: { query: z.string().optional() },
     },
-    async () => wrap(async () => (await ops.platformRequest('GET', '/api/vault/available'))),
+    async (a) => wrap(async () => (await ops.platformRequest('GET', `/api/vault/available${a.query?.trim() ? `?query=${encodeURIComponent(a.query.trim())}` : ''}`))),
   );
   server.registerTool(
     'request_credential',

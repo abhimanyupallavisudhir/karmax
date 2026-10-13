@@ -220,6 +220,65 @@ export function domainMatches(host: string, domain: string): boolean {
   return h === d || h.endsWith(`.${d}`);
 }
 
+// ── search: finding an item by what an agent knows about it ─────────────────
+
+/** Host labels that say nothing about whose credential it is. */
+const GENERIC_HOST_WORDS = new Set(['www', 'signin', 'signup', 'login', 'auth', 'account', 'accounts', 'app', 'my', 'secure', 'id', 'sso', 'portal', 'console']);
+
+/** The words a site's host shares with how people name its credentials:
+ *  `signin.aws.amazon.com` → aws, amazon (a pass entry `totp/aws` has no domain). */
+export function hostWords(host: string): string[] {
+  const labels = host.toLowerCase().replace(/^\*\./, '').replace(/\.$/, '').split('.');
+  return labels.slice(0, -1).filter((word) => word.length > 1 && !GENERIC_HOST_WORDS.has(word));
+}
+
+/** How well one query term names an item: 3 a whole word or a covering domain,
+ *  2 a word prefix, 1 any substring of its non-secret metadata, 0 no match. */
+function termScore(item: VaultItem, term: string): number {
+  const domains = item.domains ?? [];
+  if (term.includes('.') && domains.some((domain) => domainMatches(term, domain))) return 3;
+  const texts = [item.label, ...domains, item.username ?? '', item.envVar ?? '', ...(item.tags ?? [])].map((text) => text.toLowerCase());
+  const words = texts.flatMap((text) => text.split(/[^a-z0-9]+/)).filter(Boolean);
+  if (words.includes(term)) return 3;
+  if (words.some((word) => word.startsWith(term))) return 2;
+  return texts.some((text) => text.includes(term)) ? 1 : 0;
+}
+
+/**
+ * The items best named by `query`, best first: each whitespace-separated term
+ * is matched against the label, domains, username, env var and tags (never a
+ * secret or a note). `every` term must match by default; `some` ranks items by
+ * how many of the words they share. Ties go to the more recently used item.
+ */
+export function searchVaultItems<T extends VaultItem>(items: T[], query: string, opts: { limit?: number; match?: 'every' | 'some' } = {}): T[] {
+  const terms = query.toLowerCase().split(/[\s,]+/).filter(Boolean);
+  if (!terms.length) return [];
+  const scored = items.map((item) => {
+    const scores = terms.map((term) => termScore(item, term));
+    const matched = opts.match === 'some' ? scores.some(Boolean) : scores.every(Boolean);
+    return { item, matched, score: scores.reduce((sum, score) => sum + score, 0) };
+  }).filter((entry) => entry.matched);
+  scored.sort((a, b) => b.score - a.score
+    || (b.item.frecencyScore ?? 0) - (a.item.frecencyScore ?? 0)
+    || a.item.label.localeCompare(b.item.label));
+  return scored.slice(0, opts.limit ?? 20).map((entry) => entry.item);
+}
+
+/** Other items that may hold `field` for `host`: another account on the site,
+ *  or an item named after it with no domains at all — a TOTP seed is often its
+ *  own entry (`totp/aws`), which a lookup by domain never reaches. An item for
+ *  a different site is never a candidate, whatever its name. */
+export function relatedVaultItems<T extends VaultItem>(items: T[], host: string, field: VaultFieldName, exclude?: string): T[] {
+  const words = hostWords(host);
+  return items.flatMap((item) => {
+    if (item.id === exclude || !item.fields.includes(field)) return [];
+    const covers = (item.domains ?? []).some((domain) => domainMatches(host, domain));
+    const named = words.reduce((sum, word) => sum + termScore(item, word), 0);
+    return covers || (!item.domains?.length && named) ? [{ item, score: named + (covers ? 3 : 0) }] : [];
+  }).sort((a, b) => b.score - a.score || (b.item.frecencyScore ?? 0) - (a.item.frecencyScore ?? 0))
+    .slice(0, 5).map((entry) => entry.item);
+}
+
 // ── TOTP (RFC 6238, the broker-side code computation of §5B) ─────────────────
 
 const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';

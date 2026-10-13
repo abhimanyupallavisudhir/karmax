@@ -15,6 +15,9 @@ import {
   totpCode,
   itemCaps,
   domainMatches,
+  hostWords,
+  searchVaultItems,
+  relatedVaultItems,
   itemHandle,
   removeTurnKeys,
   removeLegacyKeyCopies,
@@ -689,5 +692,57 @@ describe('turn key files after a crash', () => {
       expect(fs.readFileSync(path.join(live, 'key'), 'utf8')).toBe('LIVE');
       expect(fs.existsSync(unrelated)).toBe(true);
     } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
+});
+
+describe('vault search (finding an item an agent was not granted yet)', () => {
+  // The shape of a real vault: several accounts on one site, and a pass-style
+  // one-time-code entry with no domains that a domain lookup never reaches.
+  const item = (id: string, label: string, fields: any[], extra: any = {}) =>
+    ({ id, type: 'login', label, fields, policy: { use: 'auto', reveal: 'ask' }, provenance: { source: 'manual' }, ...extra }) as any;
+  const items = [
+    item('s3', 'AWS root — Karmax S3 integration tests', ['password', 'totp'], { domains: ['signin.aws.amazon.com', 'aws.amazon.com'], username: 'abhimanyu+aws-s3@agentmail.to' }),
+    item('personal', 'coding/aws.amazon.com/me@gmail.com', ['password', 'note'], { domains: ['aws.amazon.com'], username: 'me@gmail.com' }),
+    item('totp', 'totp/aws', ['totp', 'note']),
+    item('redwood', 'totp/aws-redwood', ['totp']),
+    item('shop', 'services/www.amazon.com/me@gmail.com', ['password'], { domains: ['www.amazon.com'] }),
+    item('gh', 'github-totp', ['totp'], { domains: ['github.com'], frecencyScore: 9 }),
+    item('jaws', 'Jaws Media', ['password'], { domains: ['example.org'] }),
+  ];
+  const ids = (found: any[]) => found.map((found) => found.id);
+
+  it('finds a domain-less one-time-code item by name, whole words first', () => {
+    const found = ids(searchVaultItems(items, 'aws'));
+    expect(found).toEqual(expect.arrayContaining(['s3', 'personal', 'totp', 'redwood']));
+    expect(found).not.toContain('shop');
+    expect(found.at(-1)).toBe('jaws'); // "aws" is only inside a word of it
+    expect(ids(searchVaultItems(items, 'med'))).toEqual(['jaws']); // a word prefix
+    expect(ids(searchVaultItems(items, 'totp aws'))).toEqual(['totp', 'redwood']);
+  });
+
+  it('matches every term, a covering domain, and the username; never secrets', () => {
+    expect(ids(searchVaultItems(items, 'signin.aws.amazon.com'))).toEqual(expect.arrayContaining(['s3', 'personal']));
+    expect(ids(searchVaultItems(items, 'agentmail'))).toEqual(['s3']);
+    expect(ids(searchVaultItems(items, 'aws nonexistent'))).toEqual([]);
+    expect(searchVaultItems(items, '   ')).toEqual([]);
+  });
+
+  it('breaks ties by recent use and caps the result', () => {
+    expect(ids(searchVaultItems(items, 'totp')).slice(0, 1)).toEqual(['gh']);
+    expect(searchVaultItems(items, 'aws', { limit: 2 })).toHaveLength(2);
+  });
+
+  it('suggests other items holding a field for a site, from the words of its host', () => {
+    expect(hostWords('signin.aws.amazon.com')).toEqual(['aws', 'amazon']);
+    expect(hostWords('www.github.com')).toEqual(['github']);
+    const related = ids(relatedVaultItems(items, 'aws.amazon.com', 'totp', 'personal'));
+    expect(related).toEqual(expect.arrayContaining(['totp', 'redwood', 's3']));
+    expect(related).not.toContain('personal');
+    expect(related).not.toContain('shop'); // no one-time code
+    expect(related).not.toContain('gh'); // another site's
+    // Named after the site is not enough when the item belongs to another one.
+    expect(ids(relatedVaultItems(items, 'shop.amazon.com', 'password'))).toEqual([]);
+    expect(ids(relatedVaultItems(items, 'www.amazon.com', 'password'))).toEqual(['shop']);
+    expect(relatedVaultItems(items, 'localhost', 'totp')).toEqual([]);
   });
 });

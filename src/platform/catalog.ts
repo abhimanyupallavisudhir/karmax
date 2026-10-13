@@ -277,7 +277,7 @@ export const PLATFORM_API_CATALOG = {
     'DELETE /api/organizations/:organizationId/git-connections/:connectionId',
   ],
   vault: [
-    'GET /api/vault/available (non-secret metadata for credentials granted to the calling task)',
+    'GET /api/vault/available?query= (non-secret metadata for credentials granted to the calling task; with query, the best matches in the whole vault, each marked granted or not)',
     'GET|POST /api/vault/items (typed credential items; list/save responses never contain secrets)', 'POST /api/vault/items/:id/reveal (credential:write administration; audited)', 'DELETE /api/vault/items/:id',
     'POST /api/vault/import/bitwarden (one-time plaintext Bitwarden JSON export; idempotent by Bitwarden item id; encrypted immediately and the request body is not retained as a file)',
     'POST /api/vault/store (agent write-back of a newly created credential; body {id?, type, label, domains?, username?, secrets?})',
