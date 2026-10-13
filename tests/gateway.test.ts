@@ -2140,6 +2140,54 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(humanResponse.status).toBe(400);
   });
 
+  it('finds a credential the task was not granted: search, field-aware lookup, suggestions (legibench3#19)', async () => {
+    const save = async (body: any) => (await (await fetch(`${base}/api/vault/items`, { method: 'POST', headers: auth(), body: JSON.stringify(body) })).json()) as any;
+    // The account the task works on, whose one-time code lives in a separate,
+    // domain-less pass entry — and a second account on the same site.
+    const personal = await save({ type: 'login', label: 'coding/aws.amazon.com/me', domains: 'aws.amazon.com', username: 'me@example.com', secrets: { password: 'personal-password' } });
+    const other = await save({ type: 'login', label: 'AWS root — test account', domains: 'aws.amazon.com', username: 'test@example.com', secrets: { password: 'other-password', totp: 'JBSWY3DPEHPK3PXP' } });
+    const seed = await save({ type: 'login', label: 'totp/aws', policy: { use: 'auto', reveal: 'ask' }, secrets: { totp: 'GEZDGNBVGY3TQOJQ' } });
+    await save({ type: 'login', label: 'Unrelated', domains: 'example.org', secrets: { password: 'x' } });
+    const bearer = async (taskId: string, itemIds: string[]) => ({ authorization: `Bearer ${(await h.tokens.mint({
+      taskId, profileId: 'do', principal: 'user:test', ceiling: ['credential:read', 'use-credential:*'],
+      grantorCaps: ['credential:read', ...itemIds.map((id) => `use-credential:item:${id}`)],
+    })).token}`, 'content-type': 'application/json' });
+    const task = await bearer('task_vault_search', [personal.id]);
+
+    // A query searches the whole vault and says what the task may already use.
+    const found: any = await (await fetch(`${base}/api/vault/available?query=aws`, { headers: task })).json();
+    expect(found.map((item: any) => [item.label, item.granted])).toEqual(expect.arrayContaining([
+      ['coding/aws.amazon.com/me', true], ['AWS root — test account', false], ['totp/aws', false],
+    ]));
+    expect(found.map((item: any) => item.label)).not.toContain('Unrelated');
+    expect(found.find((item: any) => item.id === seed.id)).toMatchObject({ fields: ['totp'], policy: { use: 'auto', reveal: 'ask' } });
+    expect(JSON.stringify(found)).not.toMatch(/password'|GEZDGNBV|JBSWY3DP|personal-password/);
+    const granted: any = await (await fetch(`${base}/api/vault/available`, { headers: task })).json();
+    expect(granted.map((item: any) => item.id)).toEqual([personal.id]);
+
+    // The code by domain: the task's own account answers — not the other
+    // account that happens to hold a code — and points at the seed item.
+    const resolve = async (headers: any, body: any) => (await (await fetch(`${base}/api/vault/resolve`, { method: 'POST', headers, body: JSON.stringify(body) })).json()) as any;
+    const miss = await resolve(task, { domain: 'signin.aws.amazon.com', field: 'totp' });
+    expect(miss).toMatchObject({ status: 'not_in_vault', itemId: personal.id });
+    expect(miss.reason).toContain('totp/aws');
+    expect(miss.suggestions.map((item: any) => item.id)).toEqual(expect.arrayContaining([seed.id, other.id]));
+    expect(miss.suggestions.find((item: any) => item.id === seed.id).granted).toBe(false);
+    expect(JSON.stringify(miss)).not.toMatch(/GEZDGNBV|JBSWY3DP/);
+    // With nothing granted, the item that holds the field is the one asked for.
+    expect(await resolve(await bearer('task_vault_search_2', []), { domain: 'aws.amazon.com', field: 'totp' }))
+      .toMatchObject({ status: 'needs_approval', itemId: other.id });
+    // No item for the site at all still says where to look.
+    expect((await resolve(task, { domain: 'nowhere.example.net' })).reason).toMatch(/list_credentials/);
+
+    // Granted, the seed item yields a code; it cannot be typed by origin check.
+    const both = await bearer('task_vault_search_3', [personal.id, seed.id]);
+    expect(await resolve(both, { itemId: seed.id, field: 'totp' })).toMatchObject({ status: 'granted', field: 'totp', value: expect.stringMatching(/^\d{6}$/) });
+    const fill = await fetch(`${base}/api/vault/fill`, { method: 'POST', headers: both, body: JSON.stringify({ itemId: seed.id, field: 'totp', selector: '#code' }) });
+    expect(fill.status).toBe(400);
+    expect((await fill.json() as any).error).toMatch(/get_credential/);
+  });
+
   it('agent pull model: needs_approval → human grants for the task → retry succeeds', async () => {
     const item: any = await (await fetch(`${base}/api/vault/items`, { method: 'POST', headers: auth(), body: JSON.stringify({
       type: 'api-key', label: 'Service key', policy: { use: 'auto', reveal: 'auto' }, secrets: { secret: 'sk-999' },

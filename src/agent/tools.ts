@@ -336,10 +336,12 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'list_credentials',
     description:
-      'List the accounts and other vault credentials this task is authorized to use. Returns non-secret metadata including each item id, label, type, domains, username when present, stored field names, and effective use/reveal policy. Call this before guessing a domain or requesting new access.',
+      'List the accounts and other vault credentials this task is authorized to use, or with query search the whole vault, including items not granted yet (granted: false; get, fill or request them by item id and the human is asked). Query words match label, domains, username and tags, e.g. "aws" or "github totp". Returns non-secret metadata: item id, label, type, domains, username, stored field names, effective use/reveal policy. Search before concluding a credential is missing: a one-time-code seed is often its own item, such as "totp/aws", with no domains.',
     parameters: {
       type: 'object',
-      properties: {},
+      properties: {
+        query: { type: 'string', description: 'Words naming the credential; searches the whole vault.' },
+      },
     },
   },
   {
@@ -349,7 +351,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     parameters: {
       type: 'object',
       properties: {
-        item_id: { type: 'string', description: 'A vault item id. Use list_credentials to inspect credentials already granted to this task.' },
+        item_id: { type: 'string', description: 'A vault item id, from list_credentials (with query to search the whole vault).' },
         domain: { type: 'string', description: 'The site this credential is for, e.g. "github.com" — used when you do not know the item id.' },
         mode: { type: 'string', enum: ['use', 'reveal'], description: 'use = fill/inject without seeing the secret (default); reveal = you need the plaintext.' },
         kind: { type: 'string', enum: ['access', 'reset'], description: 'reset = the stored secret appears invalid; always parks for the human.' },
@@ -1351,8 +1353,9 @@ export function platformToolHandlers(
     async request_connection(args) { return JSON.stringify(await platformRequest('POST', '/api/connections/request', { mcp: args?.mcp, toolkit: args?.toolkit, why: args?.why })); },
     async search_connection_tools(args) { return JSON.stringify(await platformRequest('GET', `/api/connections/${encodeURIComponent(String(args?.connection_id ?? ''))}/tools?search=${encodeURIComponent(String(args?.search ?? ''))}`)); },
     async execute_connection_tool(args) { return JSON.stringify(await platformRequest('POST', `/api/connections/${encodeURIComponent(String(args?.connection_id ?? ''))}/execute`, { tool: args?.tool, arguments: args?.arguments })); },
-    async list_credentials() {
-      return JSON.stringify(await platformRequest('GET', '/api/vault/available'));
+    async list_credentials(args) {
+      const query = String(args?.query ?? '').trim();
+      return JSON.stringify(await platformRequest('GET', `/api/vault/available${query ? `?query=${encodeURIComponent(query)}` : ''}`));
     },
     async request_credential(args) {
       const r: any = await platformRequest('POST', '/api/vault/requests', {

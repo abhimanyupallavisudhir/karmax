@@ -113,7 +113,13 @@ describe('Claude Agent-SDK tool exposure (no drift)', () => {
       emit() {}, emitActivity() {},
     } as any);
     await expect(handlers.list_credentials!({})).resolves.toBe('[]');
-    expect(sent).toEqual([{ method: 'GET', requestPath: '/api/vault/available' }]);
+    await handlers.list_credentials!({ query: ' totp aws ' });
+    expect(sent).toEqual([
+      { method: 'GET', requestPath: '/api/vault/available' },
+      { method: 'GET', requestPath: '/api/vault/available?query=totp%20aws' },
+    ]);
+    expect(schema.parameters.properties.query).toMatchObject({ type: 'string' });
+    expect(schema.description).toMatch(/whole vault/i);
   });
 
   it('offers urgency on every tool that asks a human for something', () => {

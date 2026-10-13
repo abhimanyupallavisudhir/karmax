@@ -106,7 +106,7 @@ import { ensureProjectWikiRepositoryAsync, setProjectWikiRemote } from '../wiki/
 import { worldRepos, worldWorkingDirectory, worldWorkingRelativePath, type WorldHandle } from '../world/types.js';
 import { enumerateCredentials, resolveCredentials, resolveExplanationCredentials } from '../platform/credentials.js';
 import { credPolicyKey, gatherCredentialSources, parsePolicy, readPolicyLayers, remapCredentialPolicy } from '../platform/credential-sources.js';
-import { ITEM_FIELDS, VaultItems, itemHandle, weakensProtection } from '../autonomy/vault-items.js';
+import { ITEM_FIELDS, VaultItems, itemHandle, relatedVaultItems, searchVaultItems, weakensProtection } from '../autonomy/vault-items.js';
 import { INSTALLATION_SCOPE, organizationScope } from '../autonomy/vault-keys.js';
 import type { CredentialAccessRequest } from '../autonomy/vault-items.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
@@ -7096,8 +7096,43 @@ export class Gateway {
         const defaultField = (type: string): any =>
           ({ login: 'password', 'api-key': 'secret', 'ssh-key': 'privateKey', env: 'env', passkey: 'passkey', session: 'session', note: 'note' })[type];
         // A saved browser session is never what a lookup by site means: it has no
-        // field to fill or reveal, and must not shadow the site's login.
-        const findItem = async (b: any) => (b.itemId ? (await vault.get(String(b.itemId))) : b.domain ? (await vault.findByDomain(String(b.domain))).find((i) => i.type !== 'session') : undefined);
+        // field to fill or reveal, and must not shadow the site's login. Among a
+        // site's several items, one this task may already use names the account
+        // it works on; then one that holds the field asked for.
+        const findItem = async (b: any, field?: string) => {
+          if (b.itemId) return vault.get(String(b.itemId));
+          if (!b.domain) return undefined;
+          const ranked = await __asyncCollections.map((await vault.findByDomain(String(b.domain))).filter((i) => i.type !== 'session'),
+            async (item) => ({ item, rank: ((await vault.covered(caps, callerTaskId, item)) ? 0 : 2) + (field && !item.fields.includes(field as VaultFieldName) ? 1 : 0) }));
+          return ranked.sort((a, c) => a.rank - c.rank)[0]?.item;
+        };
+        // What an agent sees of an item it found, never a secret.
+        const itemSummary = async (item: VaultItem) => ({
+          id: item.id,
+          type: item.type,
+          label: item.label,
+          ...(item.domains?.length ? { domains: item.domains } : {}),
+          ...(item.username ? { username: item.username } : {}),
+          ...(item.envVar ? { envVar: item.envVar } : {}),
+          fields: item.fields,
+          policy: (await vault.effectivePolicy(callerTaskId, item)),
+        });
+        // A lookup that found no item, or one without the field, says where else
+        // the field may be, so an agent does not conclude the vault lacks it.
+        const missing = async (b: any, field: VaultFieldName, item?: VaultItem) => {
+          const host = b.domain ? String(b.domain) : item?.domains?.[0];
+          const related = host ? relatedVaultItems((await vault.list()), host, field, item?.id) : [];
+          const suggestions = await __asyncCollections.map(related, async (other) => ({ ...(await itemSummary(other)), granted: await vault.covered(caps, callerTaskId, other) }));
+          const elsewhere = suggestions.length
+            ? ` Other vault items hold a ${field} and may be the one: ${suggestions.map((s) => `"${s.label}" (${s.id})`).join(', ')}.`
+            : ` Search the vault with list_credentials {query}, or ask for it with request_credential.`;
+          return {
+            status: 'not_in_vault',
+            ...(item ? { itemId: item.id } : {}),
+            reason: (item ? `"${item.label}" has no ${field}.` : 'No vault item matches.') + elsewhere,
+            ...(suggestions.length ? { suggestions } : {}),
+          };
+        };
         // Reading the vault regardless of item policy is Super-administrator authority.
         const vaultReadRefusal = async (doing: string) => {
           const refused = (await this.refusal(token, 'credential:reveal', { organizationId }));
@@ -7144,16 +7179,12 @@ export class Gateway {
         }
         if (p === '/api/vault/available' && method === 'GET') {
           if (!callerTaskId) return this.json(res, 400, { error: 'a task-agent token is required' });
-          return this.json(res, 200, (await __asyncCollections.map((await __asyncCollections.filter((await vault.list()), async (item) => (await vault.covered(caps, callerTaskId, item)))), async (item) => ({
-              id: item.id,
-              type: item.type,
-              label: item.label,
-              ...(item.domains?.length ? { domains: item.domains } : {}),
-              ...(item.username ? { username: item.username } : {}),
-              ...(item.envVar ? { envVar: item.envVar } : {}),
-              fields: item.fields,
-              policy: (await vault.effectivePolicy(callerTaskId, item)),
-            }))));
+          // With a query, the whole vault is searched — what a task may not use
+          // yet is exactly what it needs to find before asking for it.
+          const query = url.searchParams.get('query')?.trim();
+          if (query) return this.json(res, 200, (await __asyncCollections.map(searchVaultItems((await vault.list()), query),
+            async (item) => ({ ...(await itemSummary(item)), granted: await vault.covered(caps, callerTaskId, item) }))));
+          return this.json(res, 200, (await __asyncCollections.map((await __asyncCollections.filter((await vault.list()), async (item) => (await vault.covered(caps, callerTaskId, item)))), itemSummary)));
         }
         if (p === '/api/vault/items' && method === 'GET') {
           const canReveal = (await this.deps.tokens.check(token, 'credential:reveal', { organizationId })).ok;
@@ -7314,11 +7345,12 @@ export class Gateway {
         // so it is blind use (§5B) like a browser fill, not a reveal.
         if (p === '/api/vault/resolve' && method === 'POST') {
           const b = await this.body(req);
-          const item = (await findItem(b));
-          if (!item) return this.json(res, 200, { status: 'not_in_vault', reason: 'no matching vault item — use request_credential to ask for it' });
+          const item = (await findItem(b, b.field));
+          if (!item) return this.json(res, 200, (await missing(b, (b.field as VaultFieldName) ?? 'password')));
           const seedOnly = item.type === 'login' && !item.fields.includes('password') && item.fields.includes('totp');
           const field = (b.field as any) ?? (seedOnly ? 'totp' : defaultField(item.type));
-          if (!ITEM_FIELDS[item.type].includes(field) || !item.fields.includes(field)) return this.json(res, 400, { error: `item type ${item.type} has no field ${field}` });
+          if (!ITEM_FIELDS[item.type].includes(field)) return this.json(res, 400, { error: `item type ${item.type} has no field ${field}` });
+          if (!item.fields.includes(field)) return this.json(res, 200, (await missing(b, field, item)));
           const mode: AccessMode = field === 'totp' ? 'use' : 'reveal';
           const decision = (await vault.access(caps, callerTaskId, item, mode, { consume: true }));
           if (decision.status !== 'granted')
@@ -7335,17 +7367,19 @@ export class Gateway {
         // current code computed broker-side from the stored seed.
         if (p === '/api/vault/fill' && method === 'POST') {
           const b = await this.body(req);
-          const item = (await findItem(b));
-          if (!item) return this.json(res, 200, { status: 'not_in_vault', reason: 'no matching vault item — use request_credential to ask for it' });
           const field = String(b.field ?? 'password');
+          const item = (await findItem(b, field === 'username' ? undefined : field));
+          if (!item) return this.json(res, 200, (await missing(b, field === 'totp' ? 'totp' : 'password')));
           if (item.type !== 'login' || !['username', 'password', 'totp'].includes(field))
             return this.json(res, 400, { error: 'browser fill supports only login fields: username, password, totp' });
-          if (!item.domains?.length) return this.json(res, 400, { error: 'browser fill requires credential domains' });
+          if (field !== 'username' && !item.fields.includes(field as VaultFieldName)) return this.json(res, 200, (await missing(b, field as VaultFieldName, item)));
+          // The page origin is checked against the item's domains; an item without
+          // any cannot be typed safely, but its one-time code can still be read.
+          if (!item.domains?.length) return this.json(res, 400, { error: `browser fill requires credential domains; "${item.label}" has none${field === 'totp' ? ' — read its code with get_credential {itemId, field: "totp"} and type it' : ''}` });
           const decision = (await vault.access(caps, callerTaskId, item, 'use'));
           if (decision.status !== 'granted')
             return this.json(res, 200, (await this.autoRaiseCredential(vault, decision, { caps, taskId: callerTaskId, projectId: authRecord?.projectId, item, field: b.field, mode: 'use', why: b.why })));
           if (field === 'username' && !item.username) return this.json(res, 400, { error: `item "${item.label}" has no ${field}` });
-          if (field !== 'username' && !item.fields.includes(field as any)) return this.json(res, 400, { error: `item "${item.label}" has no ${field}` });
           const resolveText = async () => {
             if (field === 'username') return item.username!;
             const granted = await vault.access(caps, callerTaskId, item, 'use', { consume: true });
