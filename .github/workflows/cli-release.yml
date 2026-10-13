@@ -46,7 +46,7 @@ jobs:
         # Every tag and the history between them: the version follows the newest
         # cli-v* tag and what changed since it.
         with: { ref: "${{ inputs.tag || github.sha }}", fetch-depth: 0 }
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with: { node-version: '22.16.0' }
       # The CLI has no runtime dependencies; its build tools are locked in
       # cli/package-lock.json. (`npm install <tool>` at the root would resolve
@@ -84,7 +84,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { ref: '${{ needs.bundle.outputs.sha }}' }
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with: { node-version: '22.16.0' }
       - run: npm ci --prefix cli --ignore-scripts --no-audit --no-fund
       - run: node scripts/cli-release-version.mjs --set "${{ needs.bundle.outputs.version }}"
@@ -150,7 +150,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { ref: '${{ needs.bundle.outputs.sha }}' }
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with: { node-version: '22.16.0', registry-url: 'https://registry.npmjs.org' }
       - run: npm install -g npm@11
       - uses: actions/download-artifact@v4
