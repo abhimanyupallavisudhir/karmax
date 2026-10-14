@@ -112,6 +112,7 @@ export class SshTransport {
     const expected = Buffer.from(endpoint.hostKey.trim().split(/\s+/)[1] ?? '', 'base64');
     if (!expected.length) throw new Error('VM host key is missing');
     const client = new Client();
+    client.setMaxListeners(0); // one `close` listener per open channel, hundreds at once
     return new Promise<Client>((resolve, reject) => {
       let ready = false;
       const forget = () => {
@@ -141,22 +142,30 @@ export class SshTransport {
   /** Start `command` and stream its output. */
   async open(command: string, handlers: { stdout?: (chunk: Buffer) => void; stderr?: (chunk: Buffer) => void } = {}): Promise<SshChannel> {
     const client = await this.connection();
+    let exit: { code: number | null; signal?: string } | undefined;
     const stream = await new Promise<ClientChannel>((resolve, reject) => {
       try {
-        client.exec(command, (error, channel) => error
-          ? reject(isChannelRefusal(error) ? error : new VmTransportError(`SSH exec failed: ${error.message}`, { cause: error }))
-          : resolve(channel));
+        client.exec(command, (error, channel) => {
+          if (error) {
+            reject(isChannelRefusal(error) ? error : new VmTransportError(`SSH exec failed: ${error.message}`, { cause: error }));
+            return;
+          }
+          // Now, not after the await: ssh2 parses a whole received chunk at once,
+          // and a short command's output, exit status and close often arrive in
+          // the exec reply's chunk (behind Fly's TLS edge, under load, mostly).
+          // Output waits in the stream; an `exit` event with no listener is lost.
+          channel.on('exit', (code: number | null, signal?: string) => {
+            exit = { code: typeof code === 'number' ? code : null, ...(signal ? { signal } : {}) };
+          });
+          resolve(channel);
+        });
       } catch (error) {
         reject(new VmTransportError(`SSH exec failed: ${(error as Error).message}`, { cause: error }));
       }
     });
-    let exit: { code: number | null; signal?: string } | undefined;
     const done = new Promise<{ code: number | null; signal?: string }>((resolve, reject) => {
       stream.on('data', (chunk: Buffer) => handlers.stdout?.(chunk));
       stream.stderr.on('data', (chunk: Buffer) => handlers.stderr?.(chunk));
-      stream.on('exit', (code: number | null, signal?: string) => {
-        exit = { code: typeof code === 'number' ? code : null, ...(signal ? { signal } : {}) };
-      });
       const lost = () => reject(new VmTransportError('the SSH connection to the VM was lost'));
       client.once('close', lost);
       stream.on('close', () => {

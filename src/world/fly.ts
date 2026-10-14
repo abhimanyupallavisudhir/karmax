@@ -82,6 +82,7 @@ export class FlyDriver implements VmDriver {
     const app = appName(request.labels);
     await this.assertNotTrial(connection);
     await api('POST', '/apps', { app_name: app, org_slug: organization(connection) });
+    let created: string | undefined;
     try {
       await this.allocateAddress(connection, app);
       request.signal?.throwIfAborted();
@@ -91,10 +92,14 @@ export class FlyDriver implements VmDriver {
       const image = connection.config.image ?? await this.images.image();
       const machine = await api('POST', `/apps/${app}/machines`, { name: 'world', region,
         config: machineConfig(image, request.labels, request.shape, request.keys, volume.id) }) as { id: string };
+      created = machine.id;
       await this.waitFor(connection, app, machine.id, 'started');
       return { ref: { app, machine: machine.id, volume: volume.id, region } };
     } catch (error) {
+      // What Fly recorded (an image pull failure, an exit) dies with the app: keep it in the error.
+      const evidence = created ? await this.evidence(connection, app, created) : '';
       await api('DELETE', `/apps/${app}?force=true`).catch(() => undefined);
+      if (evidence && error instanceof Error) error.message = `${error.message} (${evidence})`;
       throw error;
     }
   }
@@ -106,7 +111,7 @@ export class FlyDriver implements VmDriver {
 
   async start(connection: ResolvedWorldProviderConnection, ref: Record<string, string>, shape: VmShape): Promise<void> {
     const api = this.api(connection);
-    const machine = await api('GET', `/apps/${ref.app}/machines/${ref.machine}`) as FlyMachine;
+    const machine = await this.machine(connection, ref.app!, ref.machine!);
     const guest = flyGuest(shape);
     if (machine.config && !sameGuest(machine.config.guest, guest)) {
       // A new size is a machine update; with skip_launch it stays stopped until started below.
@@ -149,7 +154,7 @@ export class FlyDriver implements VmDriver {
 
   async state(connection: ResolvedWorldProviderConnection, ref: Record<string, string>): Promise<WorldLifecycleState | undefined> {
     try {
-      const machine = await this.api(connection)('GET', `/apps/${ref.app}/machines/${ref.machine}`) as FlyMachine;
+      const machine = await this.machine(connection, ref.app!, ref.machine!);
       if (['started', 'starting', 'replacing', 'updating'].includes(machine.state)) return 'ready';
       if (['stopped', 'stopping', 'suspended', 'suspending', 'created'].includes(machine.state)) return 'parked';
       if (['destroyed', 'destroying'].includes(machine.state)) return 'missing';
@@ -220,7 +225,7 @@ export class FlyDriver implements VmDriver {
 
   /** Fly records an OOM kill on the machine's exit event, even when the machine never answers again. */
   async diagnose(connection: ResolvedWorldProviderConnection, ref: Record<string, string>, window: { since: number; now: number }): Promise<WorldDiagnosis | undefined> {
-    const machine = await this.api(connection)('GET', `/apps/${ref.app}/machines/${ref.machine}`) as FlyMachine;
+    const machine = await this.machine(connection, ref.app!, ref.machine!);
     const oom = (machine.events ?? []).find((event) => event.timestamp >= window.since
       && event.request?.exit_event?.oom_killed);
     if (!oom) return undefined;
@@ -266,13 +271,44 @@ export class FlyDriver implements VmDriver {
   private async waitFor(connection: ResolvedWorldProviderConnection, app: string, machine: string, state: 'started' | 'stopped'): Promise<void> {
     const until = Date.now() + 5 * 60_000;
     for (;;) {
-      const current = await this.api(connection)('GET', `/apps/${app}/machines/${machine}`) as FlyMachine;
+      const current = await this.machine(connection, app, machine);
       if (current.state === state) return;
       if (state === 'started' && ['failed', 'destroyed'].includes(current.state))
         throw new Error(`the Fly machine ${current.state} while starting`);
       if (Date.now() > until) throw new Error(`the Fly machine did not reach ${state} within 5 minutes (it is ${current.state})`);
       await new Promise((resolve) => setTimeout(resolve, this.pollMs));
     }
+  }
+
+  /**
+   * One machine. Fly's Machines API is eventually consistent: a machine it
+   * has just created can answer 404 for a moment (seen live 2026-10-14, right
+   * after create). A 404 means gone only once it persists, or its app is gone.
+   */
+  private async machine(connection: ResolvedWorldProviderConnection, app: string, id: string): Promise<FlyMachine> {
+    const api = this.api(connection);
+    const until = Date.now() + 30 * this.pollMs;
+    for (;;) {
+      try {
+        return await api('GET', `/apps/${app}/machines/${id}`) as FlyMachine;
+      } catch (error) {
+        if ((error as FlyError).status !== 404 || Date.now() >= until) throw error;
+        const appGone = await api('GET', `/apps/${app}`).then(() => false, (failure) => (failure as FlyError).status === 404);
+        if (appGone) throw error;
+        await new Promise((resolve) => setTimeout(resolve, this.pollMs));
+      }
+    }
+  }
+
+  /** The machine's state and last events, for an error message. */
+  private async evidence(connection: ResolvedWorldProviderConnection, app: string, id: string): Promise<string> {
+    const machine = await this.api(connection)('GET', `/apps/${app}/machines/${id}`).catch(() => undefined) as FlyMachine | undefined;
+    if (!machine) return '';
+    const events = [...machine.events ?? []].sort((a, b) => a.timestamp - b.timestamp).slice(-5).map((event) => {
+      const exit = event.request?.exit_event;
+      return `${event.type} ${event.status}${exit ? ` exit ${exit.exit_code ?? '?'}${exit.oom_killed ? ' oom' : ''}` : ''}`;
+    });
+    return `machine ${machine.state}${events.length ? `; events: ${events.join(', ')}` : ''}`;
   }
 
   private api(connection: ResolvedWorldProviderConnection) {
@@ -309,7 +345,7 @@ interface FlyMachine {
   config?: { guest: FlyGuest; metadata?: Record<string, string>; [key: string]: unknown };
   events?: FlyEvent[];
 }
-interface FlyEvent { type: string; status: string; timestamp: number; request?: { exit_event?: { oom_killed?: boolean } } }
+interface FlyEvent { type: string; status: string; timestamp: number; request?: { exit_event?: { oom_killed?: boolean; exit_code?: number } } }
 interface FlyVolume { id: string; size_gb: number; created_at?: string; state?: string }
 
 /** Completed start→stop intervals in a machine's event log. */

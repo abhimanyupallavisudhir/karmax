@@ -5,7 +5,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import ssh2 from 'ssh2';
-import { Readable } from 'node:stream';
+import { Duplex, Readable } from 'node:stream';
 import { generateSshKeyPair, SshTransport } from '../src/world/vm/ssh.js';
 import { VmWorld } from '../src/world/vm/world.js';
 import type { WorldHandle, WorldPtyTermination } from '../src/world/types.js';
@@ -89,6 +89,37 @@ describe.skipIf(!sshdAvailable)('VM world over SSH', () => {
     expect(result).toEqual({ stdout: `out\n${path.join(sshd.home, 'karmax', 'sub')}\nit's here\n`, stderr: 'err\n', code: 3 });
     // A secret reaches a helper on stdin, never on its command line.
     expect((await world.exec('cat', [], { input: 'secret\n' })).stdout).toBe('secret\n');
+  });
+
+  // Behind Fly's TLS edge a short command's exec reply, output, exit status
+  // and close often arrive in one chunk, which ssh2 parses at once: an exit
+  // listener added after the exec callback's await missed it, and the command
+  // read as "the SSH connection to the VM was lost" (2026-10-14, ~40% under load).
+  it('keeps the exit status of a command whose whole reply arrives in one chunk', async () => {
+    const coalescing = new SshTransport(async () => sshd.endpoint, { socket: async (endpoint) => {
+      const tcp = net.connect(endpoint.port, endpoint.host);
+      await new Promise((resolve, reject) => tcp.once('connect', resolve).once('error', reject));
+      let held: Buffer[] = [];
+      let timer: NodeJS.Timeout | undefined;
+      const socket = new Duplex({
+        read() {},
+        write(chunk, _encoding, callback) { tcp.write(chunk, callback); },
+        final(callback) { tcp.end(); callback(); },
+        destroy(error, callback) { tcp.destroy(); callback(error); },
+      });
+      tcp.on('data', (chunk: Buffer) => {
+        held.push(chunk);
+        timer ??= setTimeout(() => { timer = undefined; socket.push(Buffer.concat(held)); held = []; }, 20);
+      });
+      tcp.on('end', () => socket.push(null));
+      tcp.on('error', (error) => socket.destroy(error));
+      return socket;
+    } });
+    try {
+      const results = await Promise.all(Array.from({ length: 30 }, (_, i) => coalescing.exec(`echo ${i}; exit ${i % 3}`)));
+      expect(results.map((result) => [result.stdout.toString().trim(), result.code]))
+        .toEqual(Array.from({ length: 30 }, (_, i) => [String(i), i % 3]));
+    } finally { coalescing.close(); }
   });
 
   it('times a command out instead of returning its status', async () => {
