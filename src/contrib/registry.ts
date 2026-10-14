@@ -59,6 +59,8 @@ export const CORE_COMMANDS: CommandDecl[] = [
   { id: 'nav.orgwiki', title: 'Go to organization wiki', keybinding: 'g W' },
   { id: 'nav.global', title: 'Go to organization settings', keybinding: 'g S' },
   { id: 'nav.projects', title: 'Go to projects', keybinding: 'g P' },
+  { id: 'nav.newProject', title: 'New project', keybinding: 'p n' },
+  { id: 'nav.searchProjects', title: 'Search projects', keybinding: 'p /' },
   { id: 'nav.profile', title: 'Go to your profile', keybinding: 'g A' },
   { id: 'nav.notifications', title: 'Go to inbox', keybinding: 'g N' },
   { id: 'nav.close', title: 'Close panel', keybinding: 'Escape' },
