@@ -81,10 +81,10 @@ it('lands on the organization home, For me across projects, Active one click awa
     expect(await page.locator(`[data-id="${review.id}"] .chip.attention`).innerText()).toBe('Review');
     expect(await page.locator(`[data-id="${review.id}"] .task-project`).innerText()).toBe('website');
     // The search panel stands clear of the list: no tighter above the first row than rows are to each other.
-    const gaps = await page.evaluate(() => {
+    const gaps = await page.evaluate<{ panel: number; rows: number }>(`(() => {
       const [first, second] = [...document.querySelectorAll('#main .task-row')].map((el) => el.getBoundingClientRect());
-      return { panel: first.top - document.querySelector('#main .organizer')!.getBoundingClientRect().bottom, rows: second.top - first.bottom };
-    });
+      return { panel: first.top - document.querySelector('#main .organizer').getBoundingClientRect().bottom, rows: second.top - first.bottom };
+    })()`);
     expect(gaps.panel).toBeGreaterThan(gaps.rows);
     if (process.env.HOME_SCREENSHOTS) await page.screenshot({ path: path.join(process.env.HOME_SCREENSHOTS, 'app-home-for-me.png') });
 
