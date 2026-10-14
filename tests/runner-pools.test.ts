@@ -158,6 +158,64 @@ describe('runner capacity and world lifecycle', () => {
     expect((await store.worldLease(stale.id))?.state).toBe('released');
   });
 
+  it('reclaims a lease a dead setup attempt left on a ready world, which otherwise never parks (pramana#39)', async () => {
+    const store = (await Store.create(':memory:'));
+    const organization = (await store.createOrganization({ name: 'Dead setup attempt', ownerUserId: 'owner' }));
+    const project = (await store.createProject('Cloud', { worldProvider: 'hetzner' }, organization.id));
+    const task = (await createTask(store, project.id, 'Setup retried after a deploy'));
+    const runners = new RunnerPoolService(store);
+    const now = Date.now();
+    const at = async (leaseId: string, time: number) => (await store.db.prepare(
+      'UPDATE world_leases SET createdAt=?, acquiredAt=? WHERE id=?').run(time, time, leaseId));
+    // createWorld's first attempt took a lease, then died with the worker
+    // before it could name the lease in a world or release it.
+    const dead = await runners.acquire({ project, taskId: task.id, worldId: task.id, provider: 'hetzner' });
+    await at(dead.leaseId, now - 15 * 60 * 60_000);
+    // The retry took its own and made the world, naming that lease.
+    const own = await runners.acquire({ project, taskId: task.id, worldId: task.id, provider: 'hetzner' });
+    await at(own.leaseId, now - 10 * 60_000);
+    const handle = (await store.registerWorld({ version: 2, kind: 'hetzner', provider: 'hetzner', id: task.id, generation: 1,
+      root: '/home/user/karmax', workspaceRoot: '/home/user/karmax', branch: `tavya/${task.id}`, base: 'main',
+      meta: { projectId: project.id, worldLeaseId: own.leaseId } }, project.id));
+    (await store.db.prepare('UPDATE world_instances SET createdAt=? WHERE worldId=?').run(now - 8 * 60_000, task.id));
+    // Taken once the world existed: an access to it (an artifact, a terminal) or
+    // a setup of its next generation still in flight. Neither is dead.
+    const later = await runners.acquire({ project, taskId: task.id, worldId: task.id, provider: 'hetzner' });
+    await at(later.leaseId, now - 5 * 60_000);
+
+    await new WorldLifecycleManager(store, new WorldRegistry(), {} as any, 1_000, undefined, runners).sweep(now);
+
+    expect((await store.worldLease(dead.leaseId))?.state).toBe('released');
+    expect((await store.worldLease(own.leaseId))?.state).toBe('active');
+    expect((await store.worldLease(later.leaseId))?.state).toBe('active');
+    // The waiting world's park check counts every other active lease as a user.
+    expect((await store.activeWorldLeaseCount(handle.id))).toBe(2);
+  });
+
+  it('keeps an old lease a live preview borrows on a ready world', async () => {
+    const store = (await Store.create(':memory:'));
+    const organization = (await store.createOrganization({ name: 'Borrowed', ownerUserId: 'owner' }));
+    const project = (await store.createProject('Cloud', { worldProvider: 'e2b' }, organization.id));
+    const task = (await createTask(store, project.id, 'Previewing'));
+    const runners = new RunnerPoolService(store);
+    const now = Date.now();
+    const borrowed = await runners.acquire({ project, taskId: task.id, worldId: task.id, provider: 'e2b' });
+    const own = await runners.acquire({ project, taskId: task.id, worldId: task.id, provider: 'e2b' });
+    (await store.db.prepare('UPDATE world_leases SET createdAt=?, acquiredAt=? WHERE id IN (?,?)')
+      .run(now - 60 * 60_000, now - 60 * 60_000, borrowed.leaseId, own.leaseId));
+    (await store.registerWorld({ version: 2, kind: 'e2b', provider: 'e2b', id: task.id, generation: 1,
+      root: '/workspace', workspaceRoot: '/workspace', branch: `tavya/${task.id}`, base: 'main',
+      meta: { projectId: project.id, worldLeaseId: own.leaseId } }, project.id));
+    (await store.createPreviewLease({ id: 'preview-live', organizationId: organization.id, projectId: project.id,
+      taskId: task.id, worldId: task.id, generation: 1, port: 3000, public: false, provider: 'e2b',
+      runnerLeaseId: borrowed.leaseId, createdBy: 'owner', createdAt: now - 60 * 60_000, expiresAt: now + 60_000 }));
+
+    await new WorldLifecycleManager(store, new WorldRegistry(), {} as any, 1_000, undefined, runners).sweep(now);
+
+    expect((await store.worldLease(borrowed.leaseId))?.state).toBe('active');
+    expect((await store.worldLease(own.leaseId))?.state).toBe('active');
+  });
+
   it('keeps a newly admitted wake-up while it marks its parked world ready', async () => {
     const store = (await Store.create(':memory:'));
     const organization = (await store.createOrganization({ name: 'Wake-up grace', ownerUserId: 'owner' }));
