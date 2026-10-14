@@ -30,7 +30,7 @@ describe('several branches per task: each branch is proposed, reviewed and lands
       provider: 'mock',
       async runTurn(input, ctx) {
         const latest = input.messages.filter((m) => m.role === 'user').at(-1)?.text ?? '';
-        if (input.role === 'do' && /^There is no branch named/.test(latest))
+        if (input.role === 'do' && latest.startsWith('There is no branch named'))
           return mock.runTurn({ ...input, messages: [...input.messages, { id: `stop-${input.messages.length}`, role: 'user', text: '@incomplete', ts: 0 }] }, ctx);
         return mock.runTurn(input, ctx);
       },
@@ -70,7 +70,7 @@ describe('several branches per task: each branch is proposed, reviewed and lands
     await expect.poll(async () => (await branch(handle, 'docs'))?.state, { timeout: 30_000 }).toBe('review');
     await expect.poll(async () => (await view(handle)).status, { timeout: 30_000 }).toBe('waiting');
     const proposed = await view(handle);
-    expect(proposed.messages.some((m: any) => /^Proposed for Review: docs/.test(m.text))).toBe(true);
+    expect(proposed.messages.some((m: any) => m.text.startsWith('Proposed for Review: docs'))).toBe(true);
     const primary = proposed.checkouts.find((c: any) => c.name !== 'docs');
     expect(primary.state).toBe('working');
     expect(proposed.reviewAudience).toEqual(['@creator']);
@@ -85,7 +85,7 @@ describe('several branches per task: each branch is proposed, reviewed and lands
     expect(landed.checkouts.find((c: any) => c.name === primary.name).state).toBe('working');
     // The agent hears that it landed; part of the work is on main now, so the
     // task can no longer be cancelled — only finished.
-    expect(landed.messages.some((m: any) => /^Landed: docs/.test(m.text))).toBe(true);
+    expect(landed.messages.some((m: any) => m.text.startsWith('Landed: docs'))).toBe(true);
     await expect.poll(async () => (await view(handle)).actions.map((a: any) => a.name), { timeout: 30_000 }).toContain('finish');
     expect((await view(handle)).actions.map((a: any) => a.name)).not.toContain('cancel');
 
@@ -171,7 +171,7 @@ describe('several branches per task: each branch is proposed, reviewed and lands
 
   it('a final proposal that is refused does not finish the task', async () => {
     const { repo, handle } = await start(`${SPLIT}@openpr ghost :: final`);
-    await expect.poll(async () => (await view(handle)).messages.some((m: any) => /^There is no branch named ghost/.test(m.text)),
+    await expect.poll(async () => (await view(handle)).messages.some((m: any) => m.text.startsWith('There is no branch named ghost')),
       { timeout: 30_000 }).toBe(true);
     await expect.poll(async () => (await view(handle)).status, { timeout: 30_000 }).toBe('waiting');
     const parked = await view(handle);
