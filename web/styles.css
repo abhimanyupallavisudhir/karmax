@@ -2607,7 +2607,7 @@ html[data-theme="dark"] .github-signin-btn:active,
 /* The task-list "organizer" panel: search box + saved views + query toolbar, grouped
    into one integrated surface at the top of the list. */
 .organizer {
-  margin: 10px 0 2px; padding: 8px 10px; border: 1px solid var(--line);
+  margin: 10px 0 16px; padding: 8px 10px; border: 1px solid var(--line);
   border-radius: 10px; background: var(--surface-2);
 }
 .search-box { display: flex; align-items: center; gap: 8px; padding: 2px 4px; }
