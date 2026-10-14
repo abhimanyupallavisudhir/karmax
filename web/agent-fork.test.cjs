@@ -39,6 +39,7 @@ eval(extractFn('previousTaskGrants'));
 eval(extractFn('previousGrantsSummary'));
 eval(extractFn('wireResumeReauthorization'));
 eval(extractFn('agentRoleLabel'));
+eval(extractFn('taskRecord'));
 eval(extractFn('resumeChosenInner'));
 eval(extractFn('resumeUploadInner'));
 eval(extractFn('mcpPickerHtml'));
@@ -338,7 +339,10 @@ eval(extractFn('eventValue'));
 eval(extractFn('collectEventTrigger'));
 eval(extractFn('collectTriggers'));
 global.numberedTaskTitle = (task) => task.title;
-let depIds = [], depChange, depPickerClick;
+// The 'manual' dependency is archived: its chip is named once its record loads.
+const loadedRecords = [];
+global.loadTaskRecord = async (id) => { loadedRecords.push(id); return id === 'manual' ? { id, title: 'Manual dependency' } : null; };
+let depIds = [], depHtml = '', depChange, depPickerClick;
 const depLabel = { hidden: true };
 const depInput = {
   dataset: { taskId: source.id }, checked: false,
@@ -349,8 +353,8 @@ const depRoot = {
   addEventListener: (_type, callback) => { depChange = callback; },
 };
 const depBox = {
-  set innerHTML(html) { depIds = [...html.matchAll(/data-depid="([^"]+)"/g)].map((match) => match[1]); },
-  querySelectorAll: () => [], closest: () => depRoot,
+  set innerHTML(html) { depHtml = html; depIds = [...html.matchAll(/data-depid="([^"]+)"/g)].map((match) => match[1]); },
+  querySelectorAll: () => [], closest: () => depRoot, isConnected: true,
   dispatchEvent: () => depChange({ target: { closest: () => null } }),
 };
 global.document = { querySelectorAll: () => depIds.map((id) => ({ dataset: { depid: id } })) };
@@ -375,5 +379,12 @@ ok(depInput.checked, 'reopening a saved draft restores the checked state');
 wireDepPicker({}, source.id);
 ok(depLabel.hidden, 'a task cannot select itself as a dependency');
 
-console.log(`\n${pass} passed, ${fail} failed`);
-process.exit(fail ? 1 : 0);
+loadedRecords.length = 0;
+wireDepPicker({ triggers: [{ kind: 'dependency', tasks: ['manual'] }] });
+ok(depHtml.includes('>manual<'), 'an archived dependency is shown by id until its record loads');
+setTimeout(() => {
+  ok(depHtml.includes('Manual dependency') && depIds.join() === 'manual', 'an archived dependency chip is named once its record loads');
+  ok(loadedRecords.join() === 'manual', 'an archived dependency record is fetched once');
+  console.log(`\n${pass} passed, ${fail} failed`);
+  process.exit(fail ? 1 : 0);
+});
