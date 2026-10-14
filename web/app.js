@@ -2249,37 +2249,40 @@ function previousGrantsSummary(task) {
 // hidden: the grants land in the same controls the user would otherwise fill by
 // hand, so what will be granted stays visible and editable, and it is persisted
 // exactly like a manual selection.
-// A fork of another project's task also needs that project (`af-fork-source`):
-// its agent reads the source conversation with the task's own grants, and the
-// task is refused at Run without it. It is added while that source is chosen
-// (removed again with it, unless the user had it already), and kept, with the
-// task's own project, when the source's grants are applied.
+// A fork source or a dependency in another project also needs that project
+// (`af-other-project`): the fork's agent reads the source conversation with the
+// task's own grants, and an armed task watches its dependency; either is refused
+// at Run without it. It is added while such a task is chosen (removed again with
+// the last one, unless the user had it already), and kept, with the task's own
+// project, when a fork source's grants are applied.
 function wireResumeReauthorization(root, host) {
   if (!root) return;
   root.dataset.reauthorizeHost = '';
   root.querySelectorAll('.af-resume-reauth[hidden]').forEach((option) => { option.hidden = false; });
   let stash = null;
-  const sources = new Map(); // agent box → its fork source's project, when another
-  const added = new Map(); // agent box → the project added for it
+  const sources = new Map(); // agent box or `dependency:<id>` → its task's project, when another
+  const added = new Set(); // projects added for them
   const withProjects = (value, ids) => value.scope !== 'projects' ? value
     : { ...value, projectIds: [...new Set([...(value.projectIds || []), ...ids])] };
   // A re-wired host (its controls were re-rendered) replaces the listener.
   root.reauthorizeWiring?.abort();
   const wiring = root.reauthorizeWiring = new AbortController();
-  root.addEventListener('af-fork-source', (event) => {
+  root.addEventListener('af-other-project', (event) => {
     const editor = host.editor();
     const value = readAuthorizationEditor(editor);
     const { enabled, projectId } = event.detail;
-    const box = event.target;
+    const key = event.detail.key ?? event.target;
     if (enabled && projectId && projectId !== host.projectId) {
-      sources.set(box, projectId);
+      sources.set(key, projectId);
       if (value.scope !== 'projects' || value.projectIds?.includes(projectId)) return;
-      added.set(box, projectId);
+      added.add(projectId);
       editor?._setAuthorization?.(withProjects(value, [projectId]));
-    } else if (!enabled && sources.delete(box) && added.has(box)) {
-      const projectId = added.get(box);
-      added.delete(box);
-      if (value.scope !== 'projects' || [...sources.values()].includes(projectId)) return;
+    } else if (!enabled && sources.has(key)) {
+      const projectId = sources.get(key);
+      sources.delete(key);
+      if (!added.has(projectId) || [...sources.values()].includes(projectId)) return;
+      added.delete(projectId);
+      if (value.scope !== 'projects') return;
       editor?._setAuthorization?.({ ...value, projectIds: value.projectIds.filter((id) => id !== projectId) });
     } else return;
     host.changed?.();
@@ -3284,14 +3287,14 @@ function wireAgentBox(box) {
   // Dropping the source also withdraws the grants, project and model it brought along.
   const withdrawReauthorize = () => {
     if (chosen?.querySelector('.af-resume-reauthorize')?.checked) announceReauthorize(false);
-    box.dispatchEvent(new CustomEvent('af-fork-source', { bubbles: true, detail: { enabled: false } }));
+    box.dispatchEvent(new CustomEvent('af-other-project', { bubbles: true, detail: { enabled: false } }));
   };
   // A freshly picked source brings its project into the Authorization (the
   // agent reads the conversation it forks with its own grants), and starts with
   // the source's grants and waiting for it — both still optional. A source that
   // failed or was cancelled may never succeed, so the fork does not wait on it.
   const applyForkDefaults = (task) => {
-    box.dispatchEvent(new CustomEvent('af-fork-source', { bubbles: true, detail: { enabled: true, projectId: task.projectId } }));
+    box.dispatchEvent(new CustomEvent('af-other-project', { bubbles: true, detail: { enabled: true, projectId: task.projectId } }));
     const reauthorize = chosen.querySelector('.af-resume-reauthorize');
     if (reauthorize && !chosen.querySelector('.af-resume-reauth')?.hidden) {
       reauthorize.checked = true;
@@ -6738,12 +6741,12 @@ function openFilterPicker(fieldKey, onAdd) {
 // `defaults` are the facets hidden unless the query mentions them (the list's
 // transparent -is:run treatment, parameterized per caller); `query` is where the
 // search starts — the fork search deliberately keeps archived tasks in.
-// Forking may start from any project the organization can read: the agent
-// picker searches organization-wide, starting at `project:<this project> ` so
-// deleting that one token widens it (the trailing space lets typing go straight
-// on to the next clause).
+// A fork or a dependency may be any task the organization can read: the picker
+// searches organization-wide, starting at `project:<this project> ` so deleting
+// that one token widens it (the trailing space lets typing go straight on to
+// the next clause).
 function openTaskPicker({ title, hint, mode = 'task', defaults = ['run'], query = '', exclude, onPick }) {
-  const organizationWide = mode === 'agent' && !!S.organizationId;
+  const organizationWide = !!S.organizationId;
   const ownProject = organizationWide ? projectById(S.projectId) : undefined;
   const root = $('#modal-root');
   const host = document.createElement('div');
@@ -7439,7 +7442,8 @@ function collectTriggers(existing) {
 }
 
 function dependencyChipHtml(task) {
-  return `<span class="dep-chip" data-depid="${esc(task.id)}">${esc(numberedTaskTitle(task))}<button type="button" class="dep-x" data-depx="${esc(task.id)}" title="Remove">✕</button></span>`;
+  const project = task.projectId && task.projectId !== S.projectId ? projectLabel(task) : '';
+  return `<span class="dep-chip" data-depid="${esc(task.id)}">${project}${esc(numberedTaskTitle(task))}<button type="button" class="dep-x" data-depx="${esc(task.id)}" title="Remove">✕</button></span>`;
 }
 
 // Wire the dependency chips: ✕ removes; "＋ Add a task…" opens the full task-picker
@@ -7469,11 +7473,17 @@ function wireDepPicker(values, selfId) {
     if (!id || id === selfId) return null;
     return chosen._sourceTask?.id === id ? chosen._sourceTask : known.get(id) || taskRecord(id) || null;
   };
+  // A dependency in another project brings that project into the Authorization,
+  // as a fork source does (wireResumeReauthorization).
+  const announce = (id, enabled) => box.dispatchEvent(new CustomEvent('af-other-project', { bubbles: true,
+    detail: { key: `dependency:${id}`, enabled, projectId: taskById(id)?.projectId } }));
   const paint = (ids, changed) => {
     if (changed) {
       const before = selectedDepIds();
       const source = forkSource();
       if (source && before.includes(source.id) !== ids.includes(source.id)) retargetForkBase(root, source, ids.includes(source.id));
+      ids.filter((id) => !before.includes(id)).forEach((id) => announce(id, true));
+      before.filter((id) => !ids.includes(id)).forEach((id) => announce(id, false));
     }
     box.innerHTML = ids.map((id) => dependencyChipHtml(taskById(id) || { id, title: id })).join('');
     resolve(ids);

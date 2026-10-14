@@ -2328,6 +2328,7 @@ html[data-theme="dark"] .github-signin-btn:active,
   font-size: 11px; line-height: 1; padding: 0; opacity: .65;
 }
 .dep-chip .dep-x:hover { opacity: 1; }
+.dep-chip .task-project { color: inherit; opacity: .7; }
 .label-row .hint { font-weight: 400; color: var(--ink-3); font-size: 12px; cursor: help; }
 
 /* ── Overlay task picker (dependency search + fork-from search) ───────────── */
