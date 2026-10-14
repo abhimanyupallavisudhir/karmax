@@ -104,6 +104,55 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     expect(aborted).toBe(true);
   }, 30_000);
 
+  it('software-dev: Retry after a failed Setup shows the retried stage at once, while the world is still being made', async () => {
+    // pramana#39: after Retry the page kept the old error and "blocked" for the
+    // 2.5 minutes a Hetzner world took, so Retry looked dead and was pressed again.
+    const { MANIFESTS } = await import('../src/contrib/manifests.js');
+    const version = MANIFESTS.find((m) => m.name === 'software-dev')!.version;
+    const project = (await h.store.createProject('Flaky setup', { worldProvider: 'flaky-setup' as any }));
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Retry setup', workflow: 'software-dev',
+      workflowVersion: version, params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'a' } }));
+    let failing = true;
+    let creates = 0;
+    let release!: (error: Error) => void;
+    h.worlds.register({
+      kind: 'flaky-setup',
+      capabilities: { remote: true },
+      async create(spec: any) {
+        creates++;
+        if (failing) throw new Error('provisioning the machine failed: E: Unable to locate package google-chrome-stable');
+        return await new Promise((_resolve, reject) => {
+          release = reject;
+          spec.signal?.addEventListener('abort', () => reject(spec.signal.reason ?? new Error('provisioning cancelled')), { once: true });
+        });
+      },
+    } as any);
+    const handle = await h.client.workflow.start(`softwareDev@${version}`, {
+      taskQueue: TASK_QUEUE,
+      workflowId: task.id,
+      args: [{
+        taskId: task.id, projectId: project.id, title: task.title, prompt: 'x', base: 'main', target: 'main',
+        project: { repos: [], worldProvider: 'flaky-setup', defaultBase: 'main', defaultTarget: 'main' },
+      }],
+    });
+    try {
+      await expect.poll(async () => ((await h.store.getTask(task.id))?.lastView as any)?.status, { timeout: 90_000, interval: 500 }).toBe('blocked');
+      expect(((await h.store.getTask(task.id))?.lastView as any)?.error).toMatch(/Unable to locate package/);
+      failing = false;
+      const before = creates;
+      await handle.signal('retry');
+      await expect.poll(() => creates, { timeout: 10_000 }).toBe(before + 1);
+      // The world is still being made: the published view (what the page shows,
+      // not the workflow's own state) already says so, with no stale error.
+      await expect.poll(async () => { const v = (await h.store.getTask(task.id))?.lastView as any;
+        return [v?.stage, v?.status, v?.error ?? null]; }, { timeout: 5_000, interval: 200 }).toEqual(['setup', 'active', null]);
+    } finally {
+      await handle.signal('cancel').catch(() => undefined);
+      release?.(new Error('test cleanup'));
+      await handle.result().catch(() => undefined);
+    }
+  }, 150_000);
+
   it('just-do: a single agent call, work committed to the branch (no merge)', async () => {
     const repo = await h.makeRepo('jd');
     const taskId = newId('task');

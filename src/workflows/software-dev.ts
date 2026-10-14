@@ -2175,6 +2175,7 @@ async function softwareDevImpl(
               if (cancelled || halted()) throw new Cancelled();
               retryRequested = false;
               error = undefined;
+              await publishRetried();
               continue;
             }
             cause = 'infrastructure';
@@ -2222,6 +2223,7 @@ async function softwareDevImpl(
                 retryRequested = false;
                 waitingFor = undefined;
                 status = resumeStatus;
+                await publishRetried();
               }
               continue;
             }
@@ -2381,7 +2383,16 @@ async function softwareDevImpl(
       stage = resumeStage;
       status = 'active';
       error = undefined;
+      await publishRetried();
     }
+  }
+
+  /** A stage that runs again — after a person's Retry, or a wait it ends — shows
+   * so at once. Without this the view kept the error (or the wait) until the
+   * stage's next publication: pramana#39's Retry looked dead for the 2.5 minutes
+   * its Hetzner world took to make, and was pressed again. */
+  async function publishRetried(): Promise<void> {
+    if (patched('software-dev-publish-retried-stage-v1')) await publish();
   }
 
   /** May `session` (minted under `sessionHome`) be resumed under `home` now? Only
