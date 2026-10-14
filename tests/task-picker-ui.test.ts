@@ -37,7 +37,7 @@ describe('tag chips in the task picker', () => {
       const pathname = path.split('?')[0];
       if (method === 'GET' && pathname === '/api/projects/p/tags') return [tag];
       // The task list searches the project; the picker, the organization.
-      if (method === 'GET' && ['/api/projects/p/search', '/api/organizations/o/search'].includes(pathname)) return { tasks: [task] };
+      if (method === 'GET' && (pathname === '/api/projects/p/search' || pathname === '/api/organizations/o/search')) return { tasks: [task] };
       return undefined;
     }) });
     await ui.run('boot()');

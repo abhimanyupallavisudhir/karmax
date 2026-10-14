@@ -43,7 +43,7 @@ async function fixture() {
   return { store, source, target, api, routeToken, task, authorization, bus, fired, scheduler, close };
 }
 
-const after = (...tasks: string[]) => ({ prompt: 'update the client', triggers: [{ kind: 'dependency', tasks }] });
+const after = (...tasks: string[]) => ({ prompt: 'update the client', triggers: [{ kind: 'dependency' as const, tasks }] });
 const authorization = (...projectIds: string[]) => ({ level: 'developer', scope: 'projects' as const, projectIds });
 
 describe('a task depending on a task in another project', () => {
