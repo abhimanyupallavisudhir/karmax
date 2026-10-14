@@ -276,11 +276,14 @@ export class TriggerScheduler {
    * cycles, dangling dependency ids) can only run where a store is in reach —
    * here. Dependency ids are matched the way `arm()` matches them: by declared id,
    * with the principal lookup folding alternate attempts onto one logical task.
+   * A task in another organization does not exist for it: its outcome is that
+   * tenant's data, so waiting on it would reveal when it finished.
    */
   async validationErrors(task: TaskRecord): Promise<string[]> {
+    const organizationId = (await this.organizationOfTask(task.id, task));
     const dependenciesOf = async (id: string): Promise<string[] | undefined> => {
       const t = (await this.deps.store.taskMetadata(id));
-      if (!t) return undefined;
+      if (!t || (await this.organizationOfTask(id, t)) !== organizationId) return undefined;
       const out: string[] = [];
       for (const trig of normalizeTriggers(t.params)) if (trig.kind === 'dependency') out.push(...(trig.tasks ?? []));
       return out;

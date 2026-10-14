@@ -2320,7 +2320,7 @@ html[data-theme="dark"] .github-signin-btn:active,
 .chip-input .chips { display: contents; }
 .dep-chip {
   display: inline-flex; align-items: center; gap: 4px;
-  background: var(--accent-weak); color: var(--accent-ink);
+  background: var(--accent-weak); color: var(--accent);
   border-radius: 999px; padding: 2px 6px 2px 9px; font-size: 12px; white-space: nowrap;
 }
 .dep-chip .dep-x {
@@ -2328,6 +2328,7 @@ html[data-theme="dark"] .github-signin-btn:active,
   font-size: 11px; line-height: 1; padding: 0; opacity: .65;
 }
 .dep-chip .dep-x:hover { opacity: 1; }
+.dep-chip .task-project { color: inherit; opacity: .7; }
 .label-row .hint { font-weight: 400; color: var(--ink-3); font-size: 12px; cursor: help; }
 
 /* ── Overlay task picker (dependency search + fork-from search) ───────────── */

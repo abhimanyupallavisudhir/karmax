@@ -36,7 +36,8 @@ describe('tag chips in the task picker', () => {
     const ui = await consolePage({ path: '/org/workspace', api: signedIn(({ method, path }) => {
       const pathname = path.split('?')[0];
       if (method === 'GET' && pathname === '/api/projects/p/tags') return [tag];
-      if (method === 'GET' && pathname === '/api/projects/p/search') return { tasks: [task] };
+      // The task list searches the project; the picker, the organization.
+      if (method === 'GET' && (pathname === '/api/projects/p/search' || pathname === '/api/organizations/o/search')) return { tasks: [task] };
       return undefined;
     }) });
     await ui.run('boot()');
@@ -119,18 +120,22 @@ describe('fork picker across projects', () => {
   });
 });
 
-// The dependency picker opens on Active (`-is:archived`, spelled out in its box);
-// clearing the box reaches archived tasks too, like the task list.
+// The dependency picker opens on this project's Active tasks (`-is:archived`,
+// spelled out in its box) and, like the fork picker, widens to the organization:
+// clearing the box reaches every project and archived tasks too.
 describe('dependency picker', () => {
-  it('starts on Active and lets an empty query include archived tasks', async () => {
+  it('starts on this project’s active tasks and widens to every project, archived included', async () => {
     const queries: string[] = [];
+    const projects = [{ id: 'p', organizationId: 'o', name: 'Workspace', config: {} }, { id: 'q', organizationId: 'o', name: 'Website', config: {} }];
     const ui = await consolePage({ path: '/org/workspace', api: signedIn(({ method, path }) => {
-      if (method === 'GET' && path.split('?')[0] === '/api/projects/p/search') {
-        queries.push(new URL(`http://x${path}`).searchParams.get('q') || '');
-        return { tasks: [] };
+      if (method === 'GET' && path.split('?')[0] === '/api/organizations/o/search') {
+        const q = new URL(`http://x${path}`).searchParams.get('q') || '';
+        queries.push(q);
+        return { tasks: q.includes('project:workspace') ? [] : [
+          { id: 'task_q', num: 2, projectId: 'q', title: 'Elsewhere', workflow: 'software-dev', params: {}, lastView: { status: 'done' } }] };
       }
       return undefined;
-    }) });
+    }, { projects }) });
     await ui.run('boot()');
     await ui.page.locator('#main').waitFor();
     await ui.run(`const box = document.createElement('div');
@@ -138,14 +143,16 @@ describe('dependency picker', () => {
       document.getElementById('main').appendChild(box); wireDepPicker([], 'self')`);
     await ui.page.locator('#dep-add').click();
     const search = ui.page.locator('#pk-search');
-    await expect.poll(() => search.inputValue()).toBe('-is:archived ');
-    expect(await ui.page.locator('#pk-views .view-chip.active').innerText()).toBe('Active');
-    await expect.poll(() => queries.at(-1)).toBe('-is:archived -is:run -is:series -is:draft');
+    await expect.poll(() => search.inputValue()).toBe('project:workspace -is:archived ');
+    await expect.poll(() => queries.at(-1)).toBe('project:workspace -is:archived -is:run -is:series -is:draft');
     await search.fill('');
     await expect.poll(() => queries.at(-1)).toBe('-is:run -is:series -is:draft');
-    expect(await ui.page.locator('#pk-views .view-chip.active').count()).toBe(0);
-    await ui.page.locator('#pk-views [data-pkview="__active__"]').click();
-    await expect.poll(() => search.inputValue()).toBe('-is:archived');
+    const elsewhere = ui.page.locator('#pk-list .pick-row').filter({ hasText: 'Elsewhere' });
+    expect(await elsewhere.locator('.task-project').innerText()).toBe('website');
+    await elsewhere.click();
+    const chip = ui.page.locator('#dep-chips [data-depid="task_q"]');
+    expect(await chip.locator('.task-project').innerText()).toBe('website');
+    expect(await chip.innerText()).toContain('#2 Elsewhere');
     expect(ui.errors).toEqual([]);
     await ui.close();
   });
