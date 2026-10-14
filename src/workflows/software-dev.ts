@@ -197,6 +197,10 @@ export const openPrSignal = defineSignal<[{ userId: string }?]>('openPr');
  *  the approval lapses by itself if the Do agent moves that branch afterwards. */
 export const approveCheckoutSignal = defineSignal<[{ name: string }]>('approveCheckout');
 export const cancelSignal = defineSignal('cancel');
+/** v1.30, a task with several branches once one of its pull requests has
+ * landed: end it as done — what landed stays, the rest is closed. Offered in
+ * place of Cancel, which could no longer undo it. */
+export const finishSignal = defineSignal('finish');
 /** Graceful stop used only when the platform is about to replace this run.
  * Unlike user cancellation it preserves open PRs, but it still checkpoints and
  * releases execution-owned activity before the replacement starts. */
@@ -906,6 +910,8 @@ async function softwareDevImpl(
   // are being made right now (an update runs alongside the agent's turn).
   const shipments: TaskShipment[] = (continued?.subTasks.shipments ?? []).map((shipment) => ({ ...shipment }));
   let shipping = 0;
+  /** A person chose Finish: the task ends done, closing what has not landed. */
+  let finishing = false;
   /** The agent finished (`open_pr` alone) and its pull requests are open. */
   let pullRequestsOpened = carried?.pullRequestsOpened ?? false;
   let finishRounds = 0;
@@ -1207,6 +1213,16 @@ async function softwareDevImpl(
 
   // ── view-model ──
   function allowed(): DeclaredAction[] {
+    const actions = allowedNow();
+    // v1.30: once a pull request of the task has landed, Cancel cannot undo it;
+    // Finish takes its place, ending the task and closing what has not landed.
+    return shipsBranches && shipments.some((shipment) => shipment.state === 'landed')
+      ? actions.map((action) => action.name === 'cancel'
+        ? { name: 'finish', kind: 'signal', label: 'Finish', enabled: action.enabled && !cancelled, danger: true }
+        : action)
+      : actions;
+  }
+  function allowedNow(): DeclaredAction[] {
     if (applyingResources || stagingResources) return [];
     const pausedRole: AgentRole | undefined =
       stage === 'do' || stage === 'review'
@@ -1945,6 +1961,16 @@ async function softwareDevImpl(
       activeStaging?.cancel();
       cancelChildren(); // and tear down any running sub-task agents
     }
+  });
+  setHandler(finishSignal, () => {
+    if (!shipsBranches || cancelled || pointOfNoReturnPassed || lifecycleTransitionBlocked
+      || !shipments.some((shipment) => shipment.state === 'landed')) return;
+    finishing = true;
+    cancelled = true;
+    activeSetup?.cancel();
+    activeTurn?.cancel();
+    activeStaging?.cancel();
+    cancelChildren();
   });
   setHandler(lifecycleReplacementSignal, () => {
     if (restoresStagePrerequisites && !pointOfNoReturnPassed && !lifecycleTransitionBlocked) {
@@ -3530,6 +3556,28 @@ Inspect the complete current diff and specifically compare its delta from the re
         noteShipmentSettled(childTaskId, 'failed');
       },
     );
+  }
+
+  /** Finish (v1.30): stop the agent and every open pull request — closing them
+   * — and end done with what landed. */
+  async function finish(): Promise<{ stage: Stage }> {
+    await cancelChildren(true);
+    stage = 'done';
+    status = 'done';
+    waitingFor = undefined;
+    const landed = shipments.filter((shipment) => shipment.state === 'landed').map((shipment) => `"${shipment.checkout}"`);
+    const closed = shipments.filter((shipment) => shipment.state !== 'landed').map((shipment) => `"${shipment.checkout}"`);
+    const note = `Finished. Landed: ${landed.join(', ') || 'nothing'}.${closed.length ? ` Closed without landing: ${closed.join(', ')}.` : ''}`;
+    reviewInfo = { ...reviewInfo, summary: reviewInfo?.summary ? `${reviewInfo.summary}\n\n${note}` : note };
+    await publish();
+    const remoteWorld = world ? releaseWorldOnCompletion(world) : false;
+    await core.destroyWorld(world as WorldHandle);
+    if (remoteWorld) {
+      releasedWorld = world;
+      world = undefined;
+      await publish();
+    }
+    return { stage };
   }
 
   /** Hold this task's end until every pull request it opened has settled
@@ -5909,6 +5957,7 @@ Inspect the complete current diff and specifically compare its delta from the re
 
   // ── helpers ──
   async function abort() {
+    if (finishing) return await finish();
     terminalOrigin = stage;
     stage = 'cancelled';
     status = 'cancelled';

@@ -204,6 +204,37 @@ describe('software-dev: every branch of a task lands as its own pull request', (
     expect((await git(repo, ['show', 'main:docs/guide.md'])).code).not.toBe(0);
   }, 120_000);
 
+  it('Finish replaces Cancel once something landed: the task ends done and what did not land is closed', async () => {
+    const repo = await h.makeRepo('ship-finish');
+    const { handle } = await start(repo, ['@branch docs', docsCommit, '@ship docs', '@incomplete'].join('\n'));
+    const { child: docs } = await pullRequest(handle, 1);
+    const actions = async () => ((await view(handle)).actions as any[]).map((action) => action.name);
+    expect(await actions()).toContain('cancel');
+    expect(await actions()).not.toContain('finish');
+    await docs.signal('confirm');
+    expect((await docs.result()).stage).toBe('done');
+    await expect.poll(actions, { timeout: 30_000 }).toContain('finish');
+    expect(await actions()).not.toContain('cancel');
+
+    // More work goes up for review, then the person finishes the task instead.
+    await handle.signal('followUp', { id: 'f1', role: 'user', ts: 0, text: [
+      '@branch api',
+      "@run cd ../api && echo 'export const api = 1;' > api.js && git add -A && git commit -qm api",
+      '@ship api',
+      '@incomplete',
+    ].join('\n') });
+    const { child: api } = await pullRequest(handle, 2);
+    const snapshot = (await view(api)).world.repos[0].root as string;
+    await handle.signal('finish');
+    expect((await handle.result()).stage).toBe('done');
+    expect((await view(handle)).status).toBe('done');
+    expect((await api.result()).stage).toBe('cancelled');
+    expect(fs.existsSync(snapshot)).toBe(false);
+    expect((await git(repo, ['show', 'main:docs/guide.md'])).code).toBe(0);
+    expect((await git(repo, ['show', 'main:api.js'])).code).not.toBe(0);
+    expect((await view(handle)).reviewInfo?.summary).toMatch(/Landed: "docs"\. Closed without landing: "api"\./);
+  }, 150_000);
+
   it('Done waits for every pull request, whichever lands first', async () => {
     const repo = await h.makeRepo('ship-done-waits');
     const { handle } = await start(repo, [

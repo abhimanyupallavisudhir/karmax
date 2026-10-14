@@ -1,7 +1,8 @@
 // Run: node web/branch-pull-requests.test.cjs
-// A task with several branches (software-dev ≥1.30): each branch's row links
-// to its pull request's sub-task, and no branch shows a Review approval mark —
-// pull requests are reviewed on their own tasks.
+// The Branches section of a task with several branches (software-dev ≥1.30):
+// each branch's pull request is its own sub-task. Its row says where that pull
+// request is, links to it, and offers Approve while it waits for a reviewer —
+// whatever the task itself is doing. A branch not proposed yet stays quiet.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
@@ -17,28 +18,44 @@ function extract(name) {
   throw Error(name);
 }
 const context = vm.createContext({
-  esc: (s) => String(s ?? ''), policyTip: () => '', safeHref: String, stageLabel: (v) => v.stage || 'Do',
-  S: { tasks: [{ id: 'task_pr1', num: 41, lastView: { stage: 'review', status: 'waiting' } }] },
+  esc: (s) => String(s ?? ''), policyTip: (text) => `<tip>${text}</tip>`, safeHref: String,
+  taskRecord: () => undefined, numLabel: (id) => id,
 });
-vm.runInContext(['taskRecord', 'numLabel', 'subTaskState', 'checkoutsSection'].map((name) => {
-  if (name === 'taskRecord') return 'function taskRecord(id) { return S.tasks.find((t) => t.id === id); }';
-  return extract(name);
-}).join('\n'), context);
+vm.runInContext(['branchPullRequestState', 'checkoutsSection'].map(extract).join('\n'), context);
+const row = (html, name) => html.split('<div class="checkout-row').find((part) => part.includes(`<b>${name}</b>`)) ?? '';
+const lane = (checkout, childTaskId, state = 'open') =>
+  ({ checkout, childTaskId, branch: `tavya/${childTaskId}`, fromBranch: `tavya/t-${checkout}`, head: 'h', target: 'main', state, requestId: 'r' });
 
-test('a branch with a pull request links to it; one without has no approval mark', () => {
+test('each branch shows where its pull request is, with Approve while it waits for a reviewer', () => {
   const html = context.checkoutsSection({
-    stage: 'do', actions: [],
-    checkouts: [
-      { name: 'app', branch: 'tavya/task_x', base: 'main', target: 'main', approved: false },
-      { name: 'docs', branch: 'tavya/task_x-docs', base: 'main', target: 'main', approved: false },
+    stage: 'do', status: 'active', targetBranch: 'main', actions: [],
+    checkouts: ['app', 'docs', 'api', 'cli', 'web', 'old'].map((name) => ({ name, branch: `tavya/t-${name}`, base: 'main', target: 'main' })),
+    shipments: [lane('docs', 'pr-docs'), lane('api', 'pr-api'), lane('cli', 'pr-cli', 'landed'), lane('web', 'pr-web'), lane('old', 'pr-old', 'cancelled')],
+    subTaskSummaries: [
+      { id: 'pr-docs', num: 41, title: 'docs: x', workflow: 'software-dev', lastView: { stage: 'review', status: 'waiting', waitingFor: { kind: 'human' } } },
+      { id: 'pr-api', num: 42, title: 'api: x', workflow: 'software-dev', lastView: { stage: 'do', status: 'waiting', waitingFor: { kind: 'parent' } } },
+      { id: 'pr-web', num: 44, title: 'web: x', workflow: 'software-dev', lastView: { stage: 'merge', status: 'active' } },
     ],
-    shipments: [{ checkout: 'docs', childTaskId: 'task_pr1', branch: 'tavya/task_pr1', fromBranch: 'tavya/task_x-docs', head: 'abc', target: 'main', state: 'open', requestId: 'r' }],
   });
-  assert.match(html, /data-open="task_pr1"[^>]*>#41</);
-  assert.match(html, /<b>docs<\/b>/);
-  assert.doesNotMatch(html, /data-approve-checkout/);
-  // The docs row shows its pull request, not an approval mark.
-  const docsRow = html.slice(html.indexOf('<b>docs</b>') - 200, html.indexOf('<b>docs</b>'));
-  assert.doesNotMatch(docsRow, /checkout-mark/);
-  assert.doesNotMatch(html, /Not yet approved/);
+  assert.doesNotMatch(row(html, 'app'), /chip|Approve|Not yet approved/, 'a branch not proposed yet stays quiet');
+  assert.match(row(html, 'docs'), /In review/);
+  assert.match(row(html, 'docs'), /data-approve-pr="pr-docs"/);
+  assert.match(row(html, 'docs'), /data-open="pr-docs"[^>]*>#41</);
+  assert.match(row(html, 'api'), /Changes requested/);
+  assert.match(row(html, 'web'), /Landing/);
+  assert.match(row(html, 'cli'), /Landed/);
+  assert.match(row(html, 'cli'), /class="checkout-mark">✓/);
+  assert.match(row(html, 'old'), /Closed/);
+  for (const name of ['api', 'web', 'cli', 'old']) assert.doesNotMatch(row(html, name), /data-approve/);
+});
+
+test('before 1.30, Approve shows only at the task-wide Review', () => {
+  const checkouts = [
+    { name: 'app', branch: 'tavya/t', base: 'main', head: 'a1', approved: false },
+    { name: 'docs', branch: 'tavya/t-docs', base: 'main', head: 'd1', approved: false },
+  ];
+  assert.doesNotMatch(context.checkoutsSection({ stage: 'do', actions: [], checkouts }), /data-approve/);
+  const review = context.checkoutsSection({ stage: 'review', actions: [{ name: 'confirm' }], checkouts });
+  assert.match(review, /data-approve-checkout="docs"/);
+  assert.match(review, /2 of 2 still to review/);
 });

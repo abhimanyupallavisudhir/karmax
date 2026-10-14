@@ -97,9 +97,18 @@ async function landProviderTarget(pr: any, target: string): Promise<string> {
   await refreshPrHead(pr);
   const remote = await remoteForBranch(pr.head.ref, pr.repo);
   if (!remote) throw new Error(`stub GitHub could not find remote branch ${pr.head.ref}`);
-  await gitOrThrow(remote, ['update-ref', `refs/heads/${target}`, pr.head.sha]);
-  pr.merge_commit_sha = pr.head.sha;
-  return pr.head.sha;
+  // Like GitHub: a head that already contains the target fast-forwards it; one
+  // that does not (another pull request landed meanwhile) lands as a merge commit.
+  const tip = (await gitOrThrow(remote, ['rev-parse', `refs/heads/${target}`])).trim();
+  let landed = pr.head.sha;
+  if ((await git(remote, ['merge-base', '--is-ancestor', tip, pr.head.sha])).code !== 0) {
+    const tree = (await gitOrThrow(remote, ['merge-tree', '--write-tree', tip, pr.head.sha])).trim();
+    landed = (await gitOrThrow(remote, ['-c', 'user.name=GitHub', '-c', 'user.email=noreply@github.com',
+      'commit-tree', tree, '-p', tip, '-p', pr.head.sha, '-m', `Merge pull request #${pr.number}`])).trim();
+  }
+  await gitOrThrow(remote, ['update-ref', `refs/heads/${target}`, landed]);
+  pr.merge_commit_sha = landed;
+  return landed;
 }
 
 const fetcher = (async (url: string, init: RequestInit = {}) => {
@@ -515,6 +524,57 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     expect(await gitOrThrow(origin, ['show', 'main:repaired.txt'])).toBe('preserved work');
     expect((await git(origin, ['show-ref', '--verify', '--quiet', 'refs/heads/master'])).code).not.toBe(0);
   }, 120_000);
+
+  // Several branches per task (software-dev 1.30, SPEC §11.1): one agent in one
+  // world; each branch's pull request is a sub-task that lands a snapshot of the
+  // branch on its own timing. Two land one after the other on GitHub.
+  it('v1.30 lands two branches as two pull requests, the second merging over the first', async () => {
+    const repo = await repoWithOrigin('branches-two');
+    const project = (await h.store.createProject('Branches two', { repos: [repo], remote: 'pr', multiPr: true }));
+    const connection = (await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: 'branches-two-installation', accountLogin: 'acme', accountType: 'Organization' }));
+    const enrolled = (await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+      providerId: 'branches-two-repo', owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main',
+      private: true, gitConnectionId: connection.id }));
+    (await h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Split change', workflow: 'software-dev',
+      workflowVersion: '1.30.0', params: { prompt: 'x', multiPr: true, _githubAccountId: 'a-github' },
+      createdBy: { kind: 'user', userId: 'a' } }));
+    const handle = await h.client.workflow.start('softwareDev@1.30.0', {
+      taskQueue: TASK_QUEUE, workflowId: task.id, args: [{
+        taskId: task.id, projectId: project.id, title: task.title,
+        prompt: "@branch docs\n@run cd ../docs && echo '# docs' > DOCS.md && git add -A && git commit -qm docs\n@ship docs\n"
+          + '@write core.js :: export const core = 1;\n@run git add -A && git commit -qm core',
+        base: 'main', target: 'main',
+        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr', multiPr: true }, githubPollMs: 10,
+      }],
+    });
+    const origin = remoteBySlug.get(SLUG)!;
+    const onMain = async (file: string) => (await git(origin, ['show', `main:${file}`])).code === 0;
+    // Both pull requests open, each from its own sub-task's branch.
+    await expect.poll(() => prs.length, { timeout: 30_000 }).toBe(2);
+    await expect.poll(async () => (await view(handle)).subTasks?.length ?? 0, { timeout: 30_000 }).toBe(2);
+    const [docs, core] = (await view(handle)).subTasks as string[];
+    expect(prs.map((pr) => pr.head.ref).sort()).toEqual([`tavya/${docs}`, `tavya/${core}`].sort());
+    const reviewing = async (id: string) => {
+      const child = h.client.workflow.getHandle(id);
+      await expect.poll(async () => { const v = await view(child); return `${v.stage}/${v.waitingFor?.kind}`; }, { timeout: 30_000 }).toBe('review/human');
+      return child;
+    };
+    const first = await reviewing(docs);
+    await first.signal('confirm');
+    expect((await first.result()).stage).toBe('done');
+    expect(await onMain('DOCS.md')).toBe(true);
+    expect(await onMain('core.js')).toBe(false);
+    // The second lands over the first: main keeps both.
+    const second = await reviewing(core);
+    await second.signal('confirm');
+    expect((await second.result()).stage).toBe('done');
+    expect(await handle.result()).toMatchObject({ stage: 'done' });
+    expect(await onMain('core.js')).toBe(true);
+    expect(await onMain('DOCS.md')).toBe(true);
+    expect(prs.every((pr) => pr.merged_at)).toBe(true);
+  }, 150_000);
 
   it('opens the PR at the PR stage and closes it once the merge lands', async () => {
     const repo = await repoWithOrigin('app');
