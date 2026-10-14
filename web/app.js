@@ -11171,11 +11171,10 @@ function conversationEntries(t) {
       .filter((entry) => entry.activity.kind === 'message')
       .map((entry) => `${entry.activityGroup}/${conversationTextKey(entry.activity.title)}`),
   );
-  // User messages carry real epoch-ms timestamps; agent/system replies are stamped
-  // by the deterministic workflow with a per-array sequence number (it has no wall
-  // clock). Carry the last real timestamp forward so a sequence-numbered reply sorts
-  // right after the message it answers, instead of being flung to the top of the
-  // timeline by its tiny `ts`.
+  // Every message carries the epoch-ms time it was written. Transcripts finished
+  // before workflows stamped wall-clock time hold a per-array sequence number for
+  // agent/system messages instead: carry the last real timestamp forward so such a
+  // message sorts right after the one it answers, not at the top of the timeline.
   let carriedTs = 0;
   const messages = (t.messages || [])
     .filter((message) => {

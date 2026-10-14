@@ -138,7 +138,7 @@ async function justDoImpl(
   let stage: Stage = 'setup';
   let status: TaskView['status'] = 'active';
   const msgs: Message[] = input.prompt || input.images?.length || input.files?.length
-    ? [{ id: 'm0', role: 'user', text: input.prompt ?? '', ts: input.createdAt ?? 0, ...(input.images?.length ? { images: input.images } : {}), ...(input.files?.length ? { files: input.files } : {}) }]
+    ? [{ id: 'm0', role: 'user', text: input.prompt ?? '', ts: input.createdAt ?? Date.now(), ...(input.images?.length ? { images: input.images } : {}), ...(input.files?.length ? { files: input.files } : {}) }]
     : [];
   let finalizing = false;
   let confirmed = false;
@@ -265,7 +265,7 @@ async function justDoImpl(
   setHandler(pendingMessagesQuery, (_role, fromIndex) => msgs.slice(Math.max(0, fromIndex)));
   setHandler(followUpSignal, (m) => {
     if (!msgs.some((candidate) => candidate.id === m.id))
-      msgs.push({ ...m, ts: m.ts || msgs.length });
+      msgs.push({ ...m, ts: m.ts || Date.now() });
   });
   // Order-tolerant join set — see the matching handler in software-dev.ts: the
   // settle can beat the request, and a bare delete-then-add would park the task
@@ -277,7 +277,7 @@ async function justDoImpl(
     settledCollaborations.add(requestId);
     pendingCollaborations.delete(requestId);
     if (!msgs.some((candidate) => candidate.id === message.id))
-      msgs.push({ ...message, ts: message.ts || msgs.length });
+      msgs.push({ ...message, ts: message.ts || Date.now() });
   });
   setHandler(resourceResolvedSignal, () => {
     resourceResolutionEpoch++;
@@ -369,7 +369,7 @@ async function justDoImpl(
         interrupted: () => cancelled || msgs.length > seen,
       });
       if (cancelled) break;
-      if (note) msgs.push({ id: `wait-${msgs.length}`, role: 'user', text: note, ts: msgs.length });
+      if (note) msgs.push({ id: `wait-${msgs.length}`, role: 'user', text: note, ts: Date.now() });
       status = 'active';
       waitingFor = undefined;
       continue;
@@ -377,7 +377,7 @@ async function justDoImpl(
     // A job left running without pause: the agent decides what happens to it.
     const jobsReminder = unattendedJobsReminder(turn);
     if (jobsReminder && patched('agent-wait-v1')) {
-      msgs.push({ id: `jobs-${msgs.length}`, role: 'user', text: jobsReminder, ts: msgs.length });
+      msgs.push({ id: `jobs-${msgs.length}`, role: 'user', text: jobsReminder, ts: Date.now() });
       continue;
     }
     if (pendingCollaborations.size > 0) {
@@ -452,12 +452,12 @@ async function justDoImpl(
         if (cancelled) break;
         if (decision?.action === 'confirm') continue; // this layer approves → the next
         if (decision?.action === 'reject') {
-          if (decision.text) msgs.push({ id: `cr${msgs.length}`, role: 'system', text: `Confirm agent rejected: ${decision.text}`, ts: msgs.length });
+          if (decision.text) msgs.push({ id: `cr${msgs.length}`, role: 'system', text: `Confirm agent rejected: ${decision.text}`, ts: Date.now() });
           cancelled = true;
           break;
         }
         if (decision?.action === 'revise') {
-          msgs.push({ id: `cv${msgs.length}`, role: 'user', text: decision.text || 'Please revise per the reviewer feedback.', ts: msgs.length });
+          msgs.push({ id: `cv${msgs.length}`, role: 'user', text: decision.text || 'Please revise per the reviewer feedback.', ts: Date.now() });
           backToDo = true;
           continue;
         }

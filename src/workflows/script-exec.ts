@@ -29,7 +29,7 @@ export async function scriptExec(input: TaskInput): Promise<{ stage: Stage; code
   const taskId = input.taskId;
   let stage: Stage = 'setup';
   let status: TaskView['status'] = 'active';
-  const msgs: Message[] = [{ id: 'm0', role: 'user', text: input.command ?? input.prompt, ts: 0 }];
+  const msgs: Message[] = [{ id: 'm0', role: 'user', text: input.command ?? input.prompt, ts: input.createdAt ?? Date.now() }];
   let world: WorldHandleLike | undefined;
   // A released sandbox is gone, but its branch stays part of the task's record.
   let releasedWorld: WorldHandleLike | undefined;
@@ -68,7 +68,7 @@ export async function scriptExec(input: TaskInput): Promise<{ stage: Stage; code
   const command = input.command ?? input.prompt;
   const result = await (patched('script-exec-heartbeat-v1') ? scripts : long).runScript({ taskId, worldHandle: world as any, command });
   code = result.code;
-  msgs.push({ id: 'out', role: 'system', text: `exit ${result.code}\n${result.output}`.slice(0, 8000), ts: 1 });
+  msgs.push({ id: 'out', role: 'system', text: `exit ${result.code}\n${result.output}`.slice(0, 8000), ts: Date.now() });
 
   stage = 'review';
   status = 'waiting';

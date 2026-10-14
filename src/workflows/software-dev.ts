@@ -746,7 +746,7 @@ async function softwareDevImpl(
   const msgs: Message[] = recovery
     ? recovery.messages.map((m) => ({ ...m }))
     : input.prompt || input.images?.length || input.files?.length
-      ? [{ id: 'm0', role: 'user', text: input.prompt ?? '', ts: input.createdAt ?? 0, ...(input.images?.length ? { images: input.images } : {}), ...(input.files?.length ? { files: input.files } : {}) }]
+      ? [{ id: 'm0', role: 'user', text: input.prompt ?? '', ts: input.createdAt ?? Date.now(), ...(input.images?.length ? { images: input.images } : {}), ...(input.files?.length ? { files: input.files } : {}) }]
       : [];
   let target = recovery?.target ?? input.target ?? input.project.defaultTarget ?? input.base ?? input.project.defaultBase ?? 'main';
   let base = input.base ?? input.project.defaultBase ?? 'main';
@@ -1511,7 +1511,7 @@ async function softwareDevImpl(
       if (isCancellation(err)) throw err;
       const retry = patched('subtask-resource-refresh-retry-v1') && refreshRetries-- > 0;
       if (retry) childLandedSinceRefresh = true;
-      msgs.push({ id: `st-${msgs.length}`, role: 'user', ts: msgs.length,
+      msgs.push({ id: `st-${msgs.length}`, role: 'user', ts: Date.now(),
         text: `Could not bring sub-tasks' saved data into your world: ${innermostMessage(err)} It is kept, and ${retry
           ? 'is tried again before your next turn.' : 'comes in when the next sub-task finishes or when you are confirmed.'}` });
       return;
@@ -1521,7 +1521,7 @@ async function softwareDevImpl(
       const text = r.conflicts
         ? `${r.path} was not updated with a sub-task's data: ${r.conflicts.length === 1 ? 'a file you changed differs' : `${r.conflicts.length} files you changed differ`} from the sub-task's (${r.conflicts.slice(0, 5).join(', ')}${r.conflicts.length > 5 ? ', …' : ''}). Keep one version (rename or remove yours); it comes in when the next sub-task finishes, and your publication fails until it does.`
         : `${r.path} now includes a sub-task's data: ${r.added} new, ${r.modified} changed, ${r.deleted} removed file${r.deleted === 1 ? '' : 's'}.`;
-      msgs.push({ id: `st-${msgs.length}`, role: 'user', ts: msgs.length, text });
+      msgs.push({ id: `st-${msgs.length}`, role: 'user', ts: Date.now(), text });
     }
   }
 
@@ -1595,7 +1595,7 @@ async function softwareDevImpl(
       }
     }
     const repairBeforeReview = (text: string): 'do' => {
-      msgs.push({ id: `review-ci-${msgs.length}`, role: 'user', text, ts: msgs.length });
+      msgs.push({ id: `review-ci-${msgs.length}`, role: 'user', text, ts: Date.now() });
       return 'do';
     };
 
@@ -1645,7 +1645,7 @@ async function softwareDevImpl(
           if (decision?.action === 'reject') {
             if (decision.text) msgs.push({
               id: `cr-${msgs.length}`, role: 'system',
-              text: `Confirm agent rejected the work: ${decision.text}`, ts: msgs.length,
+              text: `Confirm agent rejected the work: ${decision.text}`, ts: Date.now(),
             });
             cancelled = true;
             return 'cancelled';
@@ -1654,7 +1654,7 @@ async function softwareDevImpl(
             automatedRevisions = { ...automatedRevisions, [reviewer]: (automatedRevisions[reviewer] ?? 0) + 1 };
             if (!multiAgent) msgs.push({
               id: `cv-${msgs.length}`, role: 'user',
-              text: decision.text || 'Please revise the work per the reviewer feedback.', ts: msgs.length,
+              text: decision.text || 'Please revise the work per the reviewer feedback.', ts: Date.now(),
             });
             return 'do';
           }
@@ -1788,7 +1788,7 @@ async function softwareDevImpl(
       if (message.role === 'user') automatedRevisions = {};
       whenLoaded(() => {
         if (msgs.some((candidate) => candidate.id === message.id)) return;
-        msgs.push({ ...message, ts: message.ts || msgs.length });
+        msgs.push({ ...message, ts: message.ts || Date.now() });
         callAgents(message);
       });
       if (forMain && responsiveHumanHold && humanPauseActive)
@@ -1805,7 +1805,7 @@ async function softwareDevImpl(
     whenLoaded(() => {
       const target = conversationFor(role);
       if (!target.some((candidate) => candidate.id === m.id))
-        target.push({ ...m, ts: m.ts || target.length });
+        target.push({ ...m, ts: m.ts || Date.now() });
     });
     if (responsiveHumanHold && humanPauseActive)
       humanPauseWake = { kind: 'followUp', role };
@@ -1844,7 +1844,7 @@ async function softwareDevImpl(
     pendingCollaborations.delete(requestId);
     whenLoaded(() => {
       if (!msgs.some((candidate) => candidate.id === message.id))
-        msgs.push({ ...message, ts: message.ts || msgs.length });
+        msgs.push({ ...message, ts: message.ts || Date.now() });
     });
   });
   setHandler(resourceResolvedSignal, () => {
@@ -1974,7 +1974,7 @@ async function softwareDevImpl(
         activeTurn?.cancel();
       }
     } else if (resp.action === 'comment') {
-      if (resp.text) whenLoaded(() => msgs.push({ id: `p-${msgs.length}`, role: 'user', text: resp.text!, ts: msgs.length }));
+      if (resp.text) whenLoaded(() => msgs.push({ id: `p-${msgs.length}`, role: 'user', text: resp.text!, ts: Date.now() }));
       retryRequested = true; // unblocks an escalated child; at Review the new msg drives it
       if (responsiveHumanHold && humanPauseActive)
         humanPauseWake = { kind: 'followUp', role: 'do' };
@@ -2041,7 +2041,7 @@ async function softwareDevImpl(
           id: `mode-${msgs.length}`,
           role: 'user',
           text: 'Workflow switched to Goal. Continue autonomously until the entire task is complete; do not stop after partial progress.',
-          ts: msgs.length,
+          ts: Date.now(),
         }));
         if (responsiveHumanHold && humanPauseActive)
           humanPauseWake = { kind: 'workflowChange', role: 'do' };
@@ -2242,7 +2242,7 @@ async function softwareDevImpl(
               id: `r-in-${resolveMsgs.length}`,
               role: 'user',
               text: `Fix the ${stageName} failure. Error: ${error ?? ''}`,
-              ts: resolveMsgs.length,
+              ts: Date.now(),
             };
             resolveMsgs.push(rin);
             let r;
@@ -2282,7 +2282,7 @@ async function softwareDevImpl(
               error = lastError;
               break;
             }
-            if (r.output?.trim()) resolveMsgs.push({ id: `r-out-${resolveMsgs.length}`, role: 'agent', text: r.output, ts: resolveMsgs.length,
+            if (r.output?.trim()) resolveMsgs.push({ id: `r-out-${resolveMsgs.length}`, role: 'agent', text: r.output, ts: Date.now(),
               ...(r.finalActivity ? { sourceActivity: r.finalActivity } : {}) });
             // Consume the agent's structured verdict (SPEC §5.2, RESOLVE-PLAN §3.2)
             // instead of blindly retrying. This is the fix for "the resolve agent's
@@ -2291,7 +2291,7 @@ async function softwareDevImpl(
             if (decision) {
               const detail =
                 decision.do === 'escalate' ? ` — ${decision.reason}` : decision.do === 'gotoStage' ? ` → ${decision.stage}` : '';
-              resolveMsgs.push({ id: `r-dec-${resolveMsgs.length}`, role: 'system', text: `Resolve decision: ${decision.do}${detail}`, ts: resolveMsgs.length });
+              resolveMsgs.push({ id: `r-dec-${resolveMsgs.length}`, role: 'system', text: `Resolve decision: ${decision.do}${detail}`, ts: Date.now() });
               log.info('resolve decision', { decision: decision.do });
               if (decision.do === 'escalate') {
                 lastError = decision.reason || lastError;
@@ -2750,7 +2750,7 @@ async function softwareDevImpl(
     waitingFor = undefined;
     if (cancelled) return { completed: false, providerCompleted: false, output: '' };
     const outcome = result.state === 'exited' ? `exited ${result.exitCode}` : 'stopped without an exit code';
-    msgs.push({ id: `command-${msgs.length}`, role: 'system', text: `\`${command}\` ${outcome}${result.tail ? `\n\n${result.tail}` : ''}`, ts: msgs.length });
+    msgs.push({ id: `command-${msgs.length}`, role: 'system', text: `\`${command}\` ${outcome}${result.tail ? `\n\n${result.tail}` : ''}`, ts: Date.now() });
     if (result.state === 'exited' && result.exitCode === 0) {
       // The output is a record for people; an agent called in later reads it there.
       seen = msgs.length;
@@ -2761,7 +2761,7 @@ async function softwareDevImpl(
       return { completed: true, providerCompleted: true, output: '', openPrRequested: true };
     }
     if (liveInput.onCommandFailure === 'agent') {
-      msgs.push({ id: `command-fix-${msgs.length}`, role: 'user', ts: msgs.length,
+      msgs.push({ id: `command-fix-${msgs.length}`, role: 'user', ts: Date.now(),
         text: `The task's command \`${command}\` ${outcome} (output above). Find and fix the cause, run the command again to check, then finish the task.` });
       return await doTurn();
     }
@@ -2868,7 +2868,7 @@ async function softwareDevImpl(
     // any follow-up that arrived after the last poll. This keeps the transcript honest
     // and leaves that follow-up AFTER `seen`, so the NEXT turn delivers it.
     if (turn.output?.trim()) {
-      const reply: Message = { id: `a${delivered}`, role: 'agent', text: turn.output, ts: delivered,
+      const reply: Message = { id: `a${delivered}`, role: 'agent', text: turn.output, ts: Date.now(),
         ...(turn.finalActivity ? { sourceActivity: turn.finalActivity } : {}) };
       msgs.splice(delivered, 0, reply);
       seen = delivered + 1;
@@ -2913,7 +2913,7 @@ async function softwareDevImpl(
       id: `m-in-${mergeMsgs.length}`,
       role: 'user',
       text,
-      ts: mergeMsgs.length,
+      ts: Date.now(),
     };
     mergeMsgs.push(mergeIn);
     const mt = await leasedTurn('merge', (
@@ -2947,7 +2947,7 @@ async function softwareDevImpl(
       return undefined;
     });
     if (mt?.output?.trim()) {
-      mergeMsgs.push({ id: `m-out-${mergeMsgs.length}`, role: 'agent', text: mt.output, ts: mergeMsgs.length,
+      mergeMsgs.push({ id: `m-out-${mergeMsgs.length}`, role: 'agent', text: mt.output, ts: Date.now(),
         ...(mt.finalActivity ? { sourceActivity: mt.finalActivity } : {}) });
     }
     return mt;
@@ -2966,7 +2966,7 @@ async function softwareDevImpl(
       const decision = turn?.confirmDecision;
       let reply = turn?.reply;
       if (decision?.action === 'revise' && !reply) {
-        reply = { id: `${reviewer}-${msgs.length}`, role: 'agent', author: reviewer, ts: msgs.length,
+        reply = { id: `${reviewer}-${msgs.length}`, role: 'agent', author: reviewer, ts: Date.now(),
           text: decision.text || 'Please revise the work.' };
         msgs.push(reply);
         participantSessions[reviewer] = { ...participantSessions[reviewer]!, seen: msgs.length };
@@ -2995,7 +2995,7 @@ async function softwareDevImpl(
       changedFiles: (reviewInfo?.changedFiles ?? []).join('\n'),
       transcript: lastOutputs(msgs),
     });
-    confirmMsgs.push({ id: `c-in-${confirmMsgs.length}`, role: 'user', text: request, ts: confirmMsgs.length });
+    confirmMsgs.push({ id: `c-in-${confirmMsgs.length}`, role: 'user', text: request, ts: Date.now() });
     const ct = await withResolve<Awaited<ReturnType<typeof agentTurns.runAgentTurn>>>('confirm', () =>
       leasedTurn('confirm', (
         accountConfigHome,
@@ -3041,13 +3041,13 @@ async function softwareDevImpl(
       log.warn('confirm agent turn failed; falling back to the human gate', { e: String(e) });
       return undefined;
     });
-    if (ct?.output?.trim()) confirmMsgs.push({ id: `c-out-${confirmMsgs.length}`, role: 'agent', text: ct.output, ts: confirmMsgs.length,
+    if (ct?.output?.trim()) confirmMsgs.push({ id: `c-out-${confirmMsgs.length}`, role: 'agent', text: ct.output, ts: Date.now(),
       ...(ct.finalActivity ? { sourceActivity: ct.finalActivity } : {}) });
     // Record the verdict itself in the transcript (the agent's prose may not state
     // it). System role: shown to humans, stripped by adapters on later rounds.
     if (ct?.confirmDecision) {
       const d = ct.confirmDecision;
-      confirmMsgs.push({ id: `c-dec-${confirmMsgs.length}`, role: 'system', text: `confirm_decision: ${d.action}${d.text ? ` — ${d.text}` : ''}`, ts: confirmMsgs.length });
+      confirmMsgs.push({ id: `c-dec-${confirmMsgs.length}`, role: 'system', text: `confirm_decision: ${d.action}${d.text ? ` — ${d.text}` : ''}`, ts: Date.now() });
     }
     return ct?.confirmDecision;
   }
@@ -3077,7 +3077,7 @@ async function softwareDevImpl(
       question,
       transcript: lastOutputs(msgs),
     });
-    responderMsgs.push({ id: `r-in-${responderMsgs.length}`, role: 'user', text: request, ts: responderMsgs.length });
+    responderMsgs.push({ id: `r-in-${responderMsgs.length}`, role: 'user', text: request, ts: Date.now() });
     const rt = await withResolve('responder', () =>
       leasedTurn('responder', (
         accountConfigHome,
@@ -3106,7 +3106,7 @@ async function softwareDevImpl(
       return undefined;
     });
     const output = rt?.output?.trim();
-    if (output) responderMsgs.push({ id: `r-out-${responderMsgs.length}`, role: 'agent', text: output, ts: responderMsgs.length,
+    if (output) responderMsgs.push({ id: `r-out-${responderMsgs.length}`, role: 'agent', text: output, ts: Date.now(),
       ...(rt?.finalActivity ? { sourceActivity: rt.finalActivity } : {}) });
     return output || undefined;
   }
@@ -3190,7 +3190,7 @@ async function softwareDevImpl(
     const delivered = Math.min(Math.max(turn.delivered ?? deliveredNow, deliveredNow), msgs.length);
     let reply: Message | undefined;
     if (turn.output?.trim()) {
-      reply = { id: `${key}-${msgs.length}`, role: 'agent', author: key, text: turn.output, ts: msgs.length, to: [],
+      reply = { id: `${key}-${msgs.length}`, role: 'agent', author: key, text: turn.output, ts: Date.now(), to: [],
         ...(turn.finalActivity ? { sourceActivity: turn.finalActivity } : {}) };
       msgs.splice(delivered, 0, reply);
     }
@@ -3227,7 +3227,7 @@ async function softwareDevImpl(
    * no one: it calls no agent. */
   function noteStopped(key: string, stop?: { by?: string; byLabel?: string }): void {
     lastStoppedBy = stop?.by;
-    msgs.push({ id: `stop-${msgs.length}`, role: 'system', to: [], ts: msgs.length,
+    msgs.push({ id: `stop-${msgs.length}`, role: 'system', to: [], ts: Date.now(),
       text: `${stop?.byLabel ? `${stop.byLabel} stopped` : 'Stopped'} ${participantLabel(key)}.` });
   }
 
@@ -3330,7 +3330,7 @@ Inspect the complete current diff and specifically compare its delta from the re
 - action:"confirm" only when this exact candidate remains within the authorized intent and is safe to land now;
 - action:"revise" with actionable text when you can repair it in your next Do turn;
 - action:"reject" when the delta is ambiguous, materially changes scope/behavior, or needs a human decision. A reject here escalates to human Review; it does not cancel the task.`;
-      msgs.push({ id: `integration-${msgs.length}`, role: 'user', text: prompt, ts: msgs.length });
+      msgs.push({ id: `integration-${msgs.length}`, role: 'user', text: prompt, ts: Date.now() });
       let turn = await doTurn();
       // A verification that pauses for its tests (a durable job, or a timer) is
       // resumed for its decision when they finish, as a Do turn is: ending it
@@ -3354,7 +3354,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         } else if (reminder) {
           note = reminder;
         } else break;
-        msgs.push({ id: `integration-wait-${msgs.length}`, role: 'user', text: note, ts: msgs.length });
+        msgs.push({ id: `integration-wait-${msgs.length}`, role: 'user', text: note, ts: Date.now() });
         turn = await doTurn();
       }
       const decision = turn.confirmDecision;
@@ -3364,7 +3364,7 @@ Inspect the complete current diff and specifically compare its delta from the re
           id: `ir-${msgs.length}`,
           role: 'user',
           text: decision.text || 'Your exact-candidate verification found that the proposal still needs changes. Repair it, verify it, and call open_pr again.',
-          ts: msgs.length,
+          ts: Date.now(),
         });
         return 'revise';
       }
@@ -3406,7 +3406,7 @@ Inspect the complete current diff and specifically compare its delta from the re
           id: `ir-${msgs.length}`,
           role: 'user',
           text: decision.text || 'Automated integration review found that the repair still needs changes.',
-          ts: msgs.length,
+          ts: Date.now(),
         });
         return 'revise';
       }
@@ -3449,7 +3449,7 @@ Inspect the complete current diff and specifically compare its delta from the re
           subTaskIds.length >= 50
             ? "this task's sub-task limit (50 total) is reached"
             : 'too many sub-tasks are running at once (8 max) — wait for some to finish';
-        msgs.push({ id: `st-${msgs.length}`, role: 'user', text: `Sub-task "${s.title}" was NOT spawned: ${reason}.`, ts: msgs.length });
+        msgs.push({ id: `st-${msgs.length}`, role: 'user', text: `Sub-task "${s.title}" was NOT spawned: ${reason}.`, ts: Date.now() });
         continue;
       }
       const prepare = {
@@ -3524,7 +3524,7 @@ Inspect the complete current diff and specifically compare its delta from the re
     await core.recordEvent(taskId, 'subtask.failed', { title: failed.title, error: reason, requester,
       ...(rest.length ? { notAttempted: rest.map((r) => r.title) } : {}) });
     const addressed = multiAgent && requester !== MAIN_AGENT;
-    msgs.push({ id: `st-${msgs.length}`, role: 'user', text, ts: msgs.length, ...(addressed ? { to: [agentSelector(requester)] } : {}) });
+    msgs.push({ id: `st-${msgs.length}`, role: 'user', text, ts: Date.now(), ...(addressed ? { to: [agentSelector(requester)] } : {}) });
     if (stage === 'do') {
       if (addressed) agentQueue = enqueueAgents(agentQueue, [requester]);
       await publish();
@@ -3599,7 +3599,7 @@ Inspect the complete current diff and specifically compare its delta from the re
   function drainChildEvents(): void {
     while (raises.length) {
       const r = raises.shift()!;
-      msgs.push({ id: `st-${msgs.length}`, role: 'user', text: subtaskRaiseText(r), ts: msgs.length });
+      msgs.push({ id: `st-${msgs.length}`, role: 'user', text: subtaskRaiseText(r), ts: Date.now() });
     }
     while (settled.length) {
       const s = settled.shift()!;
@@ -3614,7 +3614,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         id: `st-${msgs.length}`,
         role: 'user',
         text: `Sub-task ${s.childTaskId} finished: ${s.stage}${s.detail ? ` (${s.detail})` : ''}.`,
-        ts: msgs.length,
+        ts: Date.now(),
       });
     }
   }
@@ -3799,7 +3799,7 @@ Inspect the complete current diff and specifically compare its delta from the re
       }
       for (const repo of development) {
         if (repo.branchAdjustment) msgs.push({ id: `branch-warning-${msgs.length}`, role: 'agent',
-          text: `Setup warning: ${repo.branchAdjustment.warning}`, ts: msgs.length });
+          text: `Setup warning: ${repo.branchAdjustment.warning}`, ts: Date.now() });
       }
     }
 
@@ -3857,7 +3857,7 @@ Inspect the complete current diff and specifically compare its delta from the re
     if (!readiness.ready) {
       const detail = readiness.conflict ?? readiness.dirty ?? readiness.note ?? 'the proposal is not ready';
       msgs.push({
-        id: `restore-refused-${msgs.length}`, role: 'user', ts: msgs.length,
+        id: `restore-refused-${msgs.length}`, role: 'user', ts: Date.now(),
         text: `The preserved ${requestedStage} stage could not be restored because ${readiness.note ?? 'proposal validation failed'}.\n${detail}\nRepair the preserved task branch, verify it, then call open_pr again.`,
       });
       recoveryStage = 'do';
@@ -3890,7 +3890,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         restoredReviewApproved = carriesApproval && proposalMatches;
         if (carriesApproval && !proposalMatches) {
           msgs.push({
-            id: `restore-review-changed-${msgs.length}`, role: 'system', ts: msgs.length,
+            id: `restore-review-changed-${msgs.length}`, role: 'system', ts: Date.now(),
             text: 'The pull request identity or head changed while Review was interrupted. The prior confirmation was not applied; the current proposal must pass Review.',
           });
         }
@@ -3913,7 +3913,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         };
         consumed.delete('confirm');
         msgs.push({
-          id: `restore-landing-changed-${msgs.length}`, role: 'system', ts: msgs.length,
+          id: `restore-landing-changed-${msgs.length}`, role: 'system', ts: Date.now(),
           text: 'The pull request identity or head changed while Landing was interrupted. Landing authorization was revoked and the current proposal was returned to Review.',
         });
       }
@@ -4038,7 +4038,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         // pause's `message` is said there as the main agent's own words.
         if (multiAgent && needsInput.message && needsInput.message.trim() !== turn.output?.trim()) {
           const caughtUp = !mainUnread();
-          msgs.push({ id: `ask-${msgs.length}`, role: 'agent', text: needsInput.message, ts: msgs.length });
+          msgs.push({ id: `ask-${msgs.length}`, role: 'agent', text: needsInput.message, ts: Date.now() });
           if (caughtUp) seen = msgs.length;
         }
         await publish();
@@ -4046,7 +4046,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         waitingFor = undefined;
         if (cancelled) return await abort();
         if (answer) {
-          if (!multiAgent) msgs.push({ id: `responder-${msgs.length}`, role: 'user', text: `Responder: ${answer}`, ts: msgs.length });
+          if (!multiAgent) msgs.push({ id: `responder-${msgs.length}`, role: 'user', text: `Responder: ${answer}`, ts: Date.now() });
           continue;
         }
       }
@@ -4081,13 +4081,13 @@ Inspect the complete current diff and specifically compare its delta from the re
         if (await waitAfterStop()) return await abort();
         continue;
       }
-      if (note) msgs.push({ id: `wait-${msgs.length}`, role: 'user', text: note, ts: msgs.length });
+      if (note) msgs.push({ id: `wait-${msgs.length}`, role: 'user', text: note, ts: Date.now() });
       continue;
     }
     // A job left running without pause: the agent decides what happens to it.
     const jobsReminder = unattendedJobsReminder(turn);
     if (jobsReminder && patched('agent-wait-v1')) {
-      msgs.push({ id: `jobs-${msgs.length}`, role: 'user', text: jobsReminder, ts: msgs.length });
+      msgs.push({ id: `jobs-${msgs.length}`, role: 'user', text: jobsReminder, ts: Date.now() });
       continue;
     }
 
@@ -4219,7 +4219,7 @@ Inspect the complete current diff and specifically compare its delta from the re
           text: providerTerminalCompletion
             ? 'Your sub-agents are still running. Wait for all of them to finish, incorporate their results, then finish this turn with the complete result.'
             : 'Your sub-agents are still running. Wait for all of them to finish, incorporate their results, then call signal_completion.',
-          ts: msgs.length,
+          ts: Date.now(),
         });
       }
       stage = 'do';
@@ -4253,7 +4253,7 @@ Inspect the complete current diff and specifically compare its delta from the re
           id: `sh-${msgs.length}`,
           role: 'user',
           text: `Your turn ended while background shells you started were still running, and ending a turn stops them, so their results are lost:\n${turn.stoppedBackgroundShells.map((d) => `- ${d}`).join('\n')}\nIf you need a result, run the command with start_job and then call pause. If it was deliberately temporary (e.g. a dev server), finish now and say so.`,
-          ts: msgs.length,
+          ts: Date.now(),
         });
       } else if (!mainUnread()) {
         msgs.push({
@@ -4262,7 +4262,7 @@ Inspect the complete current diff and specifically compare its delta from the re
           text: providerTerminalCompletion
             ? 'A background job you started (a run_in_background shell) is still running. If you need its result — e.g. a test run — wait for it, fold in the result, then finish the turn. If it is deliberately long-lived (e.g. a dev server), finish now and explain that.'
             : 'A background job you started (a run_in_background shell) is still running. If you are waiting on its result — e.g. a test run — wait for it to finish, fold in the result, then call signal_completion. If you are deliberately leaving it running (e.g. a dev server), call signal_completion now to proceed to review.',
-          ts: msgs.length,
+          ts: Date.now(),
         });
       }
       stage = 'do';
@@ -4286,7 +4286,7 @@ Inspect the complete current diff and specifically compare its delta from the re
             : providerTerminalCompletion
             ? 'Keep going until the goal is fully complete, then finish with the result.'
             : 'Keep going until the goal is fully complete, then call signal_completion.',
-          ts: msgs.length,
+          ts: Date.now(),
         });
         stage = 'do';
         continue;
@@ -4388,7 +4388,7 @@ Inspect the complete current diff and specifically compare its delta from the re
                     id: `responder-${msgs.length}`,
                     role: 'user',
                     text: `Responder: ${answer}`,
-                    ts: msgs.length,
+                    ts: Date.now(),
                   });
                   answered = true;
                   break;
@@ -4443,7 +4443,7 @@ Inspect the complete current diff and specifically compare its delta from the re
             id: `pr-refused-${msgs.length}`,
             role: 'user',
             text: `Open PR was refused: ${readiness.note ?? 'proposal validation failed'}.\n${detail}\nResolve this in the task branch, verify it, then call open_pr again.`,
-            ts: msgs.length,
+            ts: Date.now(),
           });
           prRequested = false;
           stage = 'do';
@@ -4472,7 +4472,7 @@ Inspect the complete current diff and specifically compare its delta from the re
             }
           });
           if (opened.repair) {
-            msgs.push({ id: `pr-conflict-${msgs.length}`, role: 'user', ts: msgs.length,
+            msgs.push({ id: `pr-conflict-${msgs.length}`, role: 'user', ts: Date.now(),
               text: `Open PR needs a branch repair.\n${opened.repair}` });
             prRequested = false;
             branchPreparedForPr = false;
@@ -5268,7 +5268,7 @@ Inspect the complete current diff and specifically compare its delta from the re
                 id: `landing-retry-${msgs.length}`,
                 role: 'user',
                 text: 'A human authorized another automated integration-repair attempt. Resolve against the newest target, verify the result, and call open_pr.',
-                ts: msgs.length,
+                ts: Date.now(),
               });
             }
             confirmed = false;
@@ -5291,7 +5291,7 @@ Inspect the complete current diff and specifically compare its delta from the re
             : explicitPrCycle
               ? `${decision.detail ?? 'The pull request must be revised before it can merge'}\nInspect the live branch, repair the proposal, run the relevant tests, then call open_pr again. The updated head will go through Review again.`
               : `${decision.detail ?? 'The pull request must be revised before it can merge'}\nInspect the live branch, repair the proposal, and run the relevant tests. Finish the Do turn only when the repaired proposal is ready to go through Review again.`,
-          ts: msgs.length,
+          ts: Date.now(),
         });
         confirmed = false;
         prRequested = false;
@@ -5467,7 +5467,7 @@ Inspect the complete current diff and specifically compare its delta from the re
               id: `landing-retry-${msgs.length}`,
               role: 'user',
               text: 'A human authorized another automated integration-repair attempt. Resolve against the newest target, verify the result, and call open_pr.',
-              ts: msgs.length,
+              ts: Date.now(),
             });
           }
           confirmed = false;
@@ -5480,7 +5480,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         text: `Landing the reviewed PR was refused: ${result.note ?? 'the target changed or the branch is not ready'}.\n${detail}\nRepair this in the task branch against the newest target, verify it, then call open_pr again. ${intentAuthorizedLanding
           ? 'The existing intent authorization is preserved; an automated integration reviewer will validate the repair before another landing attempt.'
           : 'The updated proposal must pass Review again.'}`,
-        ts: msgs.length,
+        ts: Date.now(),
       });
       confirmed = false;
       prRequested = false;
@@ -5503,7 +5503,7 @@ Inspect the complete current diff and specifically compare its delta from the re
           id: `m-sys-${mergeMsgs.length}`,
           role: 'system',
           text: `Merge rejected (attempt ${mergeAttempts}/${MAX_MERGE_ATTEMPTS}): ${error}`,
-          ts: mergeMsgs.length,
+          ts: Date.now(),
         });
         error = undefined;
         continue;
