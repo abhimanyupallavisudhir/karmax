@@ -3609,8 +3609,9 @@ Inspect the complete current diff and specifically compare its delta from the re
       await publish();
       return { ok: true, childTaskId: open.childTaskId, branch: open.branch, checkout: open.checkout, target: open.target, updated: true };
     }
-    // Landed exactly as it is: nothing new.
-    if (last?.state === 'landed' && last.head === check.head) return { ok: false, empty: true, reason: `"${named.name}" has nothing new since its pull request landed` };
+    // Settled exactly as it is (landed, or closed without landing): nothing new to propose.
+    if (last && last.state !== 'open' && last.head === check.head)
+      return { ok: false, empty: true, reason: `"${named.name}" has nothing new since its pull request ${last.state === 'landed' ? 'landed' : 'was closed'}` };
     const checkout = check.checkout;
     const title = request.title?.trim() || `${checkout.name}: ${input.title}`;
     const prompt = `The pull request for the branch "${checkout.name}" of task ${taskId} ("${input.title}"), landing on ${check.target}. `

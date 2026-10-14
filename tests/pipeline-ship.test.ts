@@ -85,6 +85,12 @@ describe('software-dev: every branch of a task lands as its own pull request', (
       await child.signal('confirm');
       expect((await child.result()).stage).toBe('done');
       expect((await git(repo, ['show', 'main:docs/guide.md'])).stdout).toContain('# Guide');
+      // Its snapshot worktree is gone from the world; its branch stays.
+      const snapshot = pr.world.repos[0].root as string;
+      expect(fs.existsSync(snapshot)).toBe(false);
+      expect((await git(repo, ['worktree', 'list'])).stdout).not.toContain(snapshot);
+      expect((await git(repo, ['rev-parse', '--verify', `tavya/${childId}`])).code).toBe(0);
+      expect(await h.store.eventsOfType(taskId, 'pull-request.cleanup-failed')).toEqual([]);
       expect((await git(repo, ['log', '--oneline', 'main'])).stdout).toContain(`merge tavya/${childId} into main`);
       expect((await view(handle)).agentTurn?.state).toBe('running');
 
@@ -178,6 +184,25 @@ describe('software-dev: every branch of a task lands as its own pull request', (
     await handle.signal('cancel');
     await handle.result();
   }, 150_000);
+
+  it('a pull request closed without landing leaves the world, and its branch is not proposed again unchanged', async () => {
+    const repo = await h.makeRepo('ship-cancelled');
+    const { taskId, handle } = await start(repo, ['@branch docs', docsCommit, '@ship docs', '@incomplete'].join('\n'));
+    const { childId, child } = await pullRequest(handle, 1);
+    const snapshot = (await view(child)).world.repos[0].root as string;
+    expect(fs.existsSync(snapshot)).toBe(true);
+    await child.signal('cancel');
+    expect((await child.result()).stage).toBe('cancelled');
+    expect(fs.existsSync(snapshot)).toBe(false);
+    expect((await git(repo, ['worktree', 'list'])).stdout).not.toContain(snapshot);
+    expect(await h.store.eventsOfType(taskId, 'pull-request.cleanup-failed')).toEqual([]);
+    // The agent is told; when it finishes, the unchanged branch is not reopened.
+    await expect.poll(async () => (await view(handle)).messages.some((m: any) => m.role === 'user'
+      && m.text.includes(`(sub-task ${childId}) closed without landing`)), { timeout: 30_000 }).toBe(true);
+    expect((await handle.result()).stage).toBe('done');
+    expect((await view(handle)).subTasks).toHaveLength(1);
+    expect((await git(repo, ['show', 'main:docs/guide.md'])).code).not.toBe(0);
+  }, 120_000);
 
   it('Done waits for every pull request, whichever lands first', async () => {
     const repo = await h.makeRepo('ship-done-waits');

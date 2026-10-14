@@ -3976,14 +3976,25 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     },
 
     /** Remove a settled pull request's worktree from its task's world. Its
-     * branch stays; the world goes on (it is the task's). */
-    async closePullRequest(view: WorldHandle): Promise<void> {
-      if (!isPullRequestView(view)) return;
-      const world = await openWorld(view);
-      const repo = worldRepos(world.handle)[0];
-      if (!repo) return;
-      await world.exec('git', ['worktree', 'remove', '--force', repo.root], { cwd: world.handle.root }).catch(() => undefined);
-      await world.exec('git', ['worktree', 'prune'], { cwd: world.handle.root }).catch(() => undefined);
+     * branch stays; the world goes on (it is the task's). Git runs in a checkout
+     * of the same repository: the world root is no repository. A failure is
+     * recorded, never silent: a leftover worktree takes the task's disk. */
+    async closePullRequest(view: WorldHandle): Promise<{ removed: boolean }> {
+      if (!isPullRequestView(view)) return { removed: false };
+      const repo = worldRepos(view)[0];
+      if (!repo) return { removed: false };
+      const world = await openWorld({ ...view, meta: { ...view.meta, pullRequest: undefined } });
+      const sibling = worldRepos(world.handle).find((candidate) => candidate.repo === repo.repo);
+      const removed = sibling
+        ? await world.exec('git', ['worktree', 'remove', '--force', repo.root], { cwd: sibling.root })
+        : { code: 1, stdout: '', stderr: `no checkout of "${repo.name}" left in the world` };
+      if (sibling) await world.exec('git', ['worktree', 'prune'], { cwd: sibling.root });
+      if (removed.code !== 0 && (await world.exec('git', ['rev-parse', '--git-dir'], { cwd: repo.root }).catch(() => undefined))?.code === 0) {
+        (await record(view.id, 'pull-request.cleanup-failed', { checkout: repo.name, childTaskId: view.meta?.pullRequest,
+          root: repo.root, error: (removed.stderr || removed.stdout).slice(0, 500) }));
+        return { removed: false };
+      }
+      return { removed: true };
     },
 
     /** The current world, including checkouts added during Do, determines whether
