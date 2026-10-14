@@ -327,6 +327,42 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     expect(res.code).toBe(0);
   });
 
+  // The conversation shows messages in time order, so every message the workflow
+  // writes (agent replies, job reminders, command output, review notes) carries the
+  // time it was written — never a position in the transcript.
+  it('stamps every workflow-written message with the time it was written', async () => {
+    const wallClock = (messages: any[], since: number) => {
+      const times = messages.map((message) => message.ts);
+      expect(times.every((ts) => ts >= since && ts <= Date.now()), JSON.stringify(messages.map((m) => [m.id, m.ts]))).toBe(true);
+      expect(times).toEqual([...times].sort((a, b) => a - b));
+    };
+    const started = Date.now();
+    const run = async (type: string, input: any, untilStage = 'review') => {
+      const taskId = newId('task');
+      const handle = await h.client.workflow.start(type, { taskQueue: TASK_QUEUE, workflowId: taskId,
+        args: [baseInput(taskId, await h.makeRepo('ts'), { createdAt: started, ...input })] });
+      await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe(untilStage);
+      return handle;
+    };
+
+    const script = await run('scriptExec', { title: 'echo', command: 'echo stamped' });
+    wallClock((await view(script)).messages, started);
+    await script.signal('cancel');
+
+    const job = await run('justDo', { title: 'job', prompt: '@job sleep 1; echo "@write note.txt :: from the job"\n@pause 30 :: last' });
+    const jobMessages = (await view(job)).messages;
+    expect(jobMessages.some((message: any) => message.id.startsWith('wait-'))).toBe(true);
+    wallClock(jobMessages, started);
+    await job.signal('cancel');
+
+    const dev = await run('softwareDev', { title: 'dev', prompt: '@write a.txt :: first' });
+    await dev.signal('followUp', { id: 'again', role: 'user', text: '@write b.txt :: second', ts: Date.now() }, 'do');
+    await expect.poll(async () => (await view(dev)).messages.filter((message: any) => message.role === 'agent').length,
+      { timeout: 30_000 }).toBe(2);
+    wallClock((await view(dev)).messages, started);
+    await dev.signal('cancel');
+  }, 90_000);
+
   it('goal: completes and merges without a human review gate', async () => {
     const repo = await h.makeRepo('goal');
     const taskId = newId('task');

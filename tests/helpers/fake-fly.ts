@@ -24,6 +24,9 @@ export class FakeFly {
   private ids = 0;
   /** An organization with no payment method: Fly's free trial. */
   trial = false;
+  /** Fly's eventual consistency: this many GETs of a just-created machine answer 404. */
+  notFoundAfterCreate = 0;
+  private unseen = new Map<string, number>();
   readonly root = fs.mkdtempSync(path.join(os.tmpdir(), 'fake-fly-'));
   /** The VM home every machine sees: a symlink to its volume while it runs. */
   readonly home = path.join(this.root, 'home');
@@ -105,10 +108,13 @@ export class FakeFly {
     if (method === 'POST' && !id) {
       const machine = { id: `m_${++this.ids}`, app: appName, region: body.region, state: 'created', config: body.config, events: [] as any[] };
       this.machines.set(machine.id, machine);
+      if (this.notFoundAfterCreate) this.unseen.set(machine.id, this.notFoundAfterCreate);
       if (!body.skip_launch) await this.boot(machine);
       return json(200, machine);
     }
     if (!id) return json(200, [...this.machines.values()].filter((value) => value.app === appName).map(view));
+    const unseen = this.unseen.get(id) ?? 0;
+    if (method === 'GET' && unseen > 0) { this.unseen.set(id, unseen - 1); return json(404, { error: 'machine not found' }); }
     const machine = this.machines.get(id);
     if (!machine || machine.app !== appName) return json(404, { error: 'machine not found' });
     if (method === 'GET' && !action) return json(200, view(machine));

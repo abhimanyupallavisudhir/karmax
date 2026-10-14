@@ -39,6 +39,7 @@ eval(extractFn('previousTaskGrants'));
 eval(extractFn('previousGrantsSummary'));
 eval(extractFn('wireResumeReauthorization'));
 eval(extractFn('agentRoleLabel'));
+eval(extractFn('taskRecord'));
 eval(extractFn('resumeChosenInner'));
 eval(extractFn('resumeUploadInner'));
 eval(extractFn('mcpPickerHtml'));
@@ -297,6 +298,21 @@ editor._authorizationValue = { level: 'developer', scope: 'projects', projectIds
 picker.onPick({ task: otherProject, role: 'do', session: { id: 'session-2', provider: 'codex' } });
 listeners.get('chosen:click')({ target: { closest: (sel) => sel === '.af-resume-clear' ? {} : null } });
 ok(editor._authorizationValue.projectIds.join() === 'p1,p2', 'a project the user had chosen stays when the source is cleared');
+
+// ── a dependency in another project shares that bookkeeping with fork sources
+const otherProjectEvent = (detail) => hostListeners.get('af-other-project')({ target: {}, detail });
+editor._authorizationValue = { level: 'developer', scope: 'projects', projectIds: ['p1'] };
+otherProjectEvent({ key: 'dependency:task_other', enabled: true, projectId: 'p2' });
+ok(editor._authorizationValue.projectIds.join() === 'p1,p2', 'a dependency in another project adds that project');
+picker.onPick({ task: otherProject, role: 'do', session: { id: 'session-2', provider: 'codex' } });
+ok(editor._authorizationValue.projectIds.join() === 'p1,p2', 'forking from that project too adds nothing more');
+otherProjectEvent({ key: 'dependency:task_other', enabled: false });
+ok(editor._authorizationValue.projectIds.join() === 'p1,p2', 'the project stays while the fork source still needs it');
+listeners.get('chosen:click')({ target: { closest: (sel) => sel === '.af-resume-clear' ? {} : null } });
+ok(editor._authorizationValue.projectIds.join() === 'p1', 'it goes with the last task that needed it');
+otherProjectEvent({ key: 'dependency:task_same', enabled: true, projectId: 'p1' });
+otherProjectEvent({ key: 'dependency:task_same', enabled: false });
+ok(editor._authorizationValue.projectIds.join() === 'p1', 'a dependency in this project leaves the Authorization alone');
 editor._authorizationValue = { level: 'developer', scope: 'organization' };
 const orgCalls = editorCalls.length;
 picker.onPick({ task: otherProject, role: 'do', session: { id: 'session-2', provider: 'codex' } });
@@ -338,7 +354,11 @@ eval(extractFn('eventValue'));
 eval(extractFn('collectEventTrigger'));
 eval(extractFn('collectTriggers'));
 global.numberedTaskTitle = (task) => task.title;
-let depIds = [], depChange, depPickerClick;
+global.projectLabel = (task) => `[${task.projectId}]`;
+// The 'manual' dependency is archived: its chip is named once its record loads.
+const loadedRecords = [];
+global.loadTaskRecord = async (id) => { loadedRecords.push(id); return id === 'manual' ? { id, title: 'Manual dependency' } : null; };
+let depIds = [], depHtml = '', depChange, depPickerClick;
 const depLabel = { hidden: true };
 const depInput = {
   dataset: { taskId: source.id }, checked: false,
@@ -349,10 +369,14 @@ const depRoot = {
   addEventListener: (_type, callback) => { depChange = callback; },
 };
 const depBox = {
-  set innerHTML(html) { depIds = [...html.matchAll(/data-depid="([^"]+)"/g)].map((match) => match[1]); },
-  querySelectorAll: () => [], closest: () => depRoot,
-  dispatchEvent: () => depChange({ target: { closest: () => null } }),
+  set innerHTML(html) { depHtml = html; depIds = [...html.matchAll(/data-depid="([^"]+)"/g)].map((match) => match[1]); },
+  querySelectorAll: () => [], closest: () => depRoot, isConnected: true,
+  dispatchEvent: (event) => {
+    if (event.type === 'af-other-project') depAnnounced.push(event.detail);
+    else depChange({ target: { closest: () => null } });
+  },
 };
+const depAnnounced = [];
 global.document = { querySelectorAll: () => depIds.map((id) => ({ dataset: { depid: id } })) };
 global.$ = (selector) => selector === '#dep-chips' ? depBox : selector === '#dep-add' ? { addEventListener: (_type, callback) => { depPickerClick = callback; } } : null;
 global.readCronCells = () => ['*', '*', '*', '*', '*'];
@@ -375,5 +399,23 @@ ok(depInput.checked, 'reopening a saved draft restores the checked state');
 wireDepPicker({}, source.id);
 ok(depLabel.hidden, 'a task cannot select itself as a dependency');
 
-console.log(`\n${pass} passed, ${fail} failed`);
-process.exit(fail ? 1 : 0);
+// ── a dependency in another project brings that project into the Authorization
+wireDepPicker({});
+depAnnounced.length = 0;
+depPickerClick();
+picker.onPick({ id: 'task_billing', num: 4, title: 'Billing API', projectId: 'p2', params: {} });
+ok(depHtml.includes('[p2]Billing API'), 'another project’s dependency is labelled with its project');
+ok(JSON.stringify(depAnnounced) === JSON.stringify([{ key: 'dependency:task_billing', enabled: true, projectId: 'p2' }]),
+  'picking it announces its project to the Authorization');
+depChange({ target: { closest: () => null } });
+ok(depAnnounced.length === 1, 'repainting announces nothing new');
+
+loadedRecords.length = 0;
+wireDepPicker({ triggers: [{ kind: 'dependency', tasks: ['manual'] }] });
+ok(depHtml.includes('>manual<'), 'an archived dependency is shown by id until its record loads');
+setTimeout(() => {
+  ok(depHtml.includes('Manual dependency') && depIds.join() === 'manual', 'an archived dependency chip is named once its record loads');
+  ok(loadedRecords.join() === 'manual', 'an archived dependency record is fetched once');
+  console.log(`\n${pass} passed, ${fail} failed`);
+  process.exit(fail ? 1 : 0);
+});

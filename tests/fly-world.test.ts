@@ -122,6 +122,13 @@ describe.skipIf(!sshdAvailable)('Fly.io worlds (fake Machines API, real sshd)', 
     await expect(provider.open(world.handle as WorldHandle)).rejects.toMatchObject({ status: 404 });
   });
 
+  it('waits out Fly answering 404 for a machine it has just created', async () => {
+    fly.notFoundAfterCreate = 3;
+    const world = await provider.create({ taskId: 'task_404', base: 'main', generation: 1, organizationId: 'org_a' });
+    expect((await world.exec('sh', ['-c', 'echo ok'])).stdout).toBe('ok\n');
+    expect(await provider.probe(world.handle as WorldHandle)).toBe('ready');
+  });
+
   it('replaces a machine an interrupted create left behind instead of billing for two', async () => {
     await provider.create({ taskId: 'task_retry', base: 'main', generation: 1, organizationId: 'org_a' });
     await provider.create({ taskId: 'task_retry', base: 'main', generation: 1, organizationId: 'org_a' });

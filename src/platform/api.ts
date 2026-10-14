@@ -1226,11 +1226,50 @@ export class KarmaxApi {
       const own = participant === MAIN_AGENT ? undefined : this.storedAgentAuthorizations(task)[participant];
       const held: Partial<AuthorizationSelection> | undefined = avatar ? avatar.authorization
         : own ?? task.params._authorization as Partial<AuthorizationSelection> | undefined;
-      const reaches = held?.scope === 'global' || held?.scope === 'organization'
-        || (held?.scope === 'projects' ? !!held.projectIds?.includes(source.projectId) : source.projectId === task.projectId);
-      if (reaches) continue;
+      if (authorizationReaches(held, source.projectId, task.projectId)) continue;
       const whose = avatar ? `${JSON.stringify(avatar.name)}’s` : own ? `the ${participantLabel(participant)}’s` : 'this task’s';
       throw new ValidationError(`Add project ${JSON.stringify(sourceProject?.name ?? source.projectId)} to ${whose} Authorization to fork ${reference}`);
+    }
+  }
+
+  /**
+   * The dependency counterpart of `validateAndAuthorizeResumeSources`: a dependency
+   * reads another task's outcome, so whoever names one must be able to read
+   * that task, judged in its own project. An unknown id is left to the trigger
+   * graph check, which reports it when the task is armed.
+   */
+  private async authorizeDependencies(token: string, params: Record<string, unknown> | undefined): Promise<void> {
+    for (const trigger of normalizeTriggers(params)) {
+      if (trigger.kind !== 'dependency') continue;
+      for (const id of trigger.tasks ?? []) {
+        const dependency = (await this.deps.store.taskMetadata(id));
+        if (dependency) (await this.requireAsPerson(token, 'get_task', { projectId: dependency.projectId, taskId: id }));
+      }
+    }
+  }
+
+  /**
+   * The dependency counterpart of `assertForkSourcesReadable`. An armed task
+   * keeps watching the task it waits on, and its agent then usually reads what
+   * that task did, so the task's own Authorization — not only whoever armed
+   * it — must reach the other project. Refused when the task is armed (Run,
+   * queue, saving an armed task), naming the project to add.
+   */
+  private async assertDependenciesReachable(task: TaskRecord): Promise<void> {
+    const organizationId = (await this.deps.store.projectOrganizationAsync(task.projectId)) ?? 'org_personal';
+    const held = task.params._authorization as Partial<AuthorizationSelection> | undefined;
+    for (const trigger of normalizeTriggers(task.params)) {
+      if (trigger.kind !== 'dependency') continue;
+      for (const id of trigger.tasks ?? []) {
+        const dependency = (await this.deps.store.taskMetadata(id));
+        if (!dependency || dependency.projectId === task.projectId) continue;
+        const project = (await this.deps.store.getProject(dependency.projectId));
+        const reference = dependency.num != null ? `#${dependency.num}` : JSON.stringify(dependency.title);
+        if ((project?.organizationId ?? 'org_personal') !== organizationId)
+          throw new ValidationError(`${reference} is in another organization; a task can only depend on tasks in this organization`);
+        if (authorizationReaches(held, dependency.projectId, task.projectId)) continue;
+        throw new ValidationError(`Add project ${JSON.stringify(project?.name ?? dependency.projectId)} to this task’s Authorization to depend on ${reference}`);
+      }
     }
   }
 
@@ -1378,6 +1417,7 @@ export class KarmaxApi {
     // A `resumeFrom` pointer reads another task's conversation — authorize it
     // against that task's project before anything is created.
     (await this.validateAndAuthorizeResumeSources(token, taskOverrides));
+    (await this.authorizeDependencies(token, taskOverrides));
     (await this.prepareForkWorld(args.projectId, taskOverrides));
     const inheritedFiles = (await this.inheritedResumeFiles(taskOverrides));
     // Resume authorization above grants conversation-read authority. Extend each
@@ -2034,6 +2074,7 @@ export class KarmaxApi {
     // registered with the dispatcher, i.e. waiting forever with nothing to fire it.
     const errs = (await this.armer?.validationErrors?.(task)) ?? (await validateTriggers(normalizeTriggers(task.params)));
     if (errs.length) throw new Error(`invalid trigger(s): ${errs.join('; ')}`);
+    (await this.assertDependenciesReachable(task));
     // Arming is the queue transition for triggered work, so this also assigns
     // the logical task's human-facing number if it has never been queued before.
     (await this.deps.store.clearDraft(taskId));
@@ -3121,8 +3162,10 @@ export class KarmaxApi {
     if (project) this.assertProfilesVisible(params.profiles, project);
     if (project) (await this.normalizeTaskComputer(project, params));
     // Editing params can introduce a `resumeFrom` pointer at another task, so
-    // the same source-side conversation check as createTask applies here.
+    // the same source-side conversation check as createTask applies here, and
+    // edited triggers the same dependency check.
     (await this.validateAndAuthorizeResumeSources(token, params));
+    (await this.authorizeDependencies(token, params));
     const inheritedFiles = (await this.inheritedResumeFiles(params));
     for (const file of inheritedFiles) (await this.deps.store.grantAttachment(file.id, task.projectId));
     const promptFiles = uniqueFileRefs([
@@ -3153,6 +3196,7 @@ export class KarmaxApi {
       const candidate = { ...task, params: { ...base, triggerState: 'armed' } } as TaskRecord;
       const errs = (await this.armer?.validationErrors?.(candidate)) ?? (await validateTriggers(normalizeTriggers(base)));
       if (errs.length) throw new Error(`invalid trigger(s): ${errs.join('; ')}`);
+      (await this.assertDependenciesReachable(candidate));
     }
     const start = this.resolveStart(task.workflow, task.workflowVersion,
       (await this.deps.store.getProject(task.projectId))?.organizationId);
@@ -5560,11 +5604,12 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     // authorized landing that failed resumes as an integration repair.
     const failedFrom = view.state?.failedFrom as Stage | undefined;
     const checkpoint = (await this.transitionCheckpoint({ ...view, stage: failedFrom ?? view.stage }, 'do'));
+    const now = Date.now();
     const messages = [...checkpoint.messages, {
-      id: `recovery-${Date.now()}`,
+      id: `recovery-${now}`,
       role: 'user' as const,
       text: `${BRAND} recovered this task after its prior execution failed. Continue from the existing worktree and conversation; preserve and finish the work already present. Previous failure: ${view.error ?? 'unknown error'}`,
-      ts: checkpoint.messages.length,
+      ts: now,
     }];
     input.recovery = { ...checkpoint, world, messages };
 
@@ -7415,6 +7460,13 @@ function selectionOf(authorization: { level?: string; profileId?: string; scope?
   const scope = authorization.scope ?? 'projects';
   return { level: authorization.level ?? authorization.profileId ?? 'developer', scope,
     ...(scope === 'projects' ? { projectIds: authorization.projectIds?.length ? authorization.projectIds : [projectId] } : {}) };
+}
+
+/** Does a stored authorization selection reach `projectId`? One without a
+ * scope is the task's own project only. */
+function authorizationReaches(held: Partial<AuthorizationSelection> | undefined, projectId: string, ownProjectId: string): boolean {
+  return held?.scope === 'global' || held?.scope === 'organization'
+    || (held?.scope === 'projects' ? !!held.projectIds?.includes(projectId) : projectId === ownProjectId);
 }
 
 export function previousTaskGrants(task: TaskRecord): {

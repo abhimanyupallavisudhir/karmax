@@ -2198,7 +2198,7 @@ function showForkWorldHelp(root) {
 // (wireResumeReauthorization), since only a form with Authorization / Vault
 // credentials controls can honour it.
 function resumeChosenInner(rf, task) {
-  const t = task || (S.tasks || []).find((x) => x.id === rf.taskId);
+  const t = task || taskRecord(rf.taskId);
   const source = agentRoleLabel(rf.role).toLowerCase();
   const ref = `${t?.num != null ? `#${t.num} ` : ''}${t ? t.title : rf.taskId}`;
   const link = t && projectById(t.projectId)
@@ -2226,6 +2226,15 @@ function previousTaskGrants(task) {
     credentialPolicies: JSON.parse(JSON.stringify(stored.credentialPolicies || {})),
   };
 }
+// A task's record, also when the task list does not hold it: the list has only
+// active tasks, while a finished (archived) task is the one most often forked or
+// waited on. Its attempt group carries its record either way.
+async function loadTaskRecord(taskId) {
+  const known = taskRecord(taskId);
+  if (known) return known;
+  const group = await api(`/api/tasks/${encodeURIComponent(taskId)}/attempts`).catch(() => null);
+  return group?.attempts?.find((attempt) => attempt.id === taskId) || null;
+}
 function previousGrantsSummary(task) {
   const grants = previousTaskGrants(task);
   if (!grants) return '';
@@ -2240,37 +2249,40 @@ function previousGrantsSummary(task) {
 // hidden: the grants land in the same controls the user would otherwise fill by
 // hand, so what will be granted stays visible and editable, and it is persisted
 // exactly like a manual selection.
-// A fork of another project's task also needs that project (`af-fork-source`):
-// its agent reads the source conversation with the task's own grants, and the
-// task is refused at Run without it. It is added while that source is chosen
-// (removed again with it, unless the user had it already), and kept, with the
-// task's own project, when the source's grants are applied.
+// A fork source or a dependency in another project also needs that project
+// (`af-other-project`): the fork's agent reads the source conversation with the
+// task's own grants, and an armed task watches its dependency; either is refused
+// at Run without it. It is added while such a task is chosen (removed again with
+// the last one, unless the user had it already), and kept, with the task's own
+// project, when a fork source's grants are applied.
 function wireResumeReauthorization(root, host) {
   if (!root) return;
   root.dataset.reauthorizeHost = '';
   root.querySelectorAll('.af-resume-reauth[hidden]').forEach((option) => { option.hidden = false; });
   let stash = null;
-  const sources = new Map(); // agent box → its fork source's project, when another
-  const added = new Map(); // agent box → the project added for it
+  const sources = new Map(); // agent box or `dependency:<id>` → its task's project, when another
+  const added = new Set(); // projects added for them
   const withProjects = (value, ids) => value.scope !== 'projects' ? value
     : { ...value, projectIds: [...new Set([...(value.projectIds || []), ...ids])] };
   // A re-wired host (its controls were re-rendered) replaces the listener.
   root.reauthorizeWiring?.abort();
   const wiring = root.reauthorizeWiring = new AbortController();
-  root.addEventListener('af-fork-source', (event) => {
+  root.addEventListener('af-other-project', (event) => {
     const editor = host.editor();
     const value = readAuthorizationEditor(editor);
     const { enabled, projectId } = event.detail;
-    const box = event.target;
+    const key = event.detail.key ?? event.target;
     if (enabled && projectId && projectId !== host.projectId) {
-      sources.set(box, projectId);
+      sources.set(key, projectId);
       if (value.scope !== 'projects' || value.projectIds?.includes(projectId)) return;
-      added.set(box, projectId);
+      added.add(projectId);
       editor?._setAuthorization?.(withProjects(value, [projectId]));
-    } else if (!enabled && sources.delete(box) && added.has(box)) {
-      const projectId = added.get(box);
-      added.delete(box);
-      if (value.scope !== 'projects' || [...sources.values()].includes(projectId)) return;
+    } else if (!enabled && sources.has(key)) {
+      const projectId = sources.get(key);
+      sources.delete(key);
+      if (!added.has(projectId) || [...sources.values()].includes(projectId)) return;
+      added.delete(projectId);
+      if (value.scope !== 'projects') return;
       editor?._setAuthorization?.({ ...value, projectIds: value.projectIds.filter((id) => id !== projectId) });
     } else return;
     host.changed?.();
@@ -3217,7 +3229,7 @@ function wireAgentBox(box) {
     try {
       const rf = JSON.parse(chosen?.dataset.resume || 'null');
       if (!rf?.taskId) return null;
-      return chosen._sourceTask?.id === rf.taskId ? chosen._sourceTask : (S.tasks || []).find((x) => x.id === rf.taskId);
+      return chosen._sourceTask?.id === rf.taskId ? chosen._sourceTask : taskRecord(rf.taskId);
     } catch { return null; }
   };
   const announceReauthorize = (on) => {
@@ -3275,14 +3287,14 @@ function wireAgentBox(box) {
   // Dropping the source also withdraws the grants, project and model it brought along.
   const withdrawReauthorize = () => {
     if (chosen?.querySelector('.af-resume-reauthorize')?.checked) announceReauthorize(false);
-    box.dispatchEvent(new CustomEvent('af-fork-source', { bubbles: true, detail: { enabled: false } }));
+    box.dispatchEvent(new CustomEvent('af-other-project', { bubbles: true, detail: { enabled: false } }));
   };
   // A freshly picked source brings its project into the Authorization (the
   // agent reads the conversation it forks with its own grants), and starts with
   // the source's grants and waiting for it — both still optional. A source that
   // failed or was cancelled may never succeed, so the fork does not wait on it.
   const applyForkDefaults = (task) => {
-    box.dispatchEvent(new CustomEvent('af-fork-source', { bubbles: true, detail: { enabled: true, projectId: task.projectId } }));
+    box.dispatchEvent(new CustomEvent('af-other-project', { bubbles: true, detail: { enabled: true, projectId: task.projectId } }));
     const reauthorize = chosen.querySelector('.af-resume-reauthorize');
     if (reauthorize && !chosen.querySelector('.af-resume-reauth')?.hidden) {
       reauthorize.checked = true;
@@ -3378,6 +3390,18 @@ function wireAgentBox(box) {
     } catch (error) {
       toast(error.message, true);
     }
+  });
+  // The Fork button picks its source the way the picker does.
+  box._pickResume = setResume;
+  // A stored source (a reopened draft, the Parameters view) that is not in the
+  // task list is fetched, so its chip names it and offers its options.
+  const stored = chosen?.dataset.resume;
+  const storedId = (() => { try { return JSON.parse(stored || 'null')?.taskId; } catch { return undefined; } })();
+  if (storedId && !sourceTask()) loadTaskRecord(storedId).then((task) => {
+    if (!task || signal.aborted || chosen.dataset.resume !== stored) return;
+    chosen._sourceTask = task;
+    chosen.innerHTML = resumeChosenInner(JSON.parse(stored), task);
+    syncForkState();
   });
   syncForkState();
   syncAvatar();
@@ -5582,10 +5606,10 @@ function renderRail() {
     rail.querySelectorAll('.proj, .rail-search-empty').forEach((row) => row.remove());
     $('#rail-projects-end').insertAdjacentHTML('beforebegin', railProjectRows(projectScoped));
   } else rail.innerHTML = `
-    <div class="label rail-heading"><span title="${esc(commandHint('Focus projects', 'nav.projects'))}">Projects</span><button class="rail-add" id="new-project" type="button" data-shortcut="nav.projects rail.newProject" title="${esc(commandHint('New project', 'nav.projects', 'n'))}" aria-label="New project">${ICON.plus}</button></div>
+    <div class="label rail-heading"><span title="${esc(commandHint('Focus projects', 'nav.projects'))}">Projects</span><button class="rail-add" id="new-project" type="button" data-shortcut="nav.newProject" title="${esc(commandHint('New project', 'nav.newProject'))}" aria-label="New project">${ICON.plus}</button></div>
     <label class="rail-search-box">
       <svg class="rail-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4.5 4.5"/></svg>
-    <input id="project-search" class="rail-search" type="search" data-shortcut="nav.projects rail.search" aria-label="Search projects" placeholder="Search projects…" title="${esc(commandHint('Search projects', 'nav.projects', '/'))}" value="${esc(S.projectSearch || '')}" autocomplete="off" spellcheck="false">
+    <input id="project-search" class="rail-search" type="search" data-shortcut="nav.searchProjects" aria-label="Search projects" placeholder="Search projects…" title="${esc(commandHint('Search projects', 'nav.searchProjects'))}" value="${esc(S.projectSearch || '')}" autocomplete="off" spellcheck="false">
     </label>
     ${railProjectRows(projectScoped)}
     <div class="grow" id="rail-projects-end"></div>`;
@@ -6717,12 +6741,12 @@ function openFilterPicker(fieldKey, onAdd) {
 // `defaults` are the facets hidden unless the query mentions them (the list's
 // transparent -is:run treatment, parameterized per caller); `query` is where the
 // search starts — the fork search deliberately keeps archived tasks in.
-// Forking may start from any project the organization can read: the agent
-// picker searches organization-wide, starting at `project:<this project> ` so
-// deleting that one token widens it (the trailing space lets typing go straight
-// on to the next clause).
+// A fork or a dependency may be any task the organization can read: the picker
+// searches organization-wide, starting at `project:<this project> ` so deleting
+// that one token widens it (the trailing space lets typing go straight on to
+// the next clause).
 function openTaskPicker({ title, hint, mode = 'task', defaults = ['run'], query = '', exclude, onPick }) {
-  const organizationWide = mode === 'agent' && !!S.organizationId;
+  const organizationWide = !!S.organizationId;
   const ownProject = organizationWide ? projectById(S.projectId) : undefined;
   const root = $('#modal-root');
   const host = document.createElement('div');
@@ -7418,7 +7442,8 @@ function collectTriggers(existing) {
 }
 
 function dependencyChipHtml(task) {
-  return `<span class="dep-chip" data-depid="${esc(task.id)}">${esc(numberedTaskTitle(task))}<button type="button" class="dep-x" data-depx="${esc(task.id)}" title="Remove">✕</button></span>`;
+  const project = task.projectId && task.projectId !== S.projectId ? projectLabel(task) : '';
+  return `<span class="dep-chip" data-depid="${esc(task.id)}">${project}${esc(numberedTaskTitle(task))}<button type="button" class="dep-x" data-depx="${esc(task.id)}" title="Remove">✕</button></span>`;
 }
 
 // Wire the dependency chips: ✕ removes; "＋ Add a task…" opens the full task-picker
@@ -7428,22 +7453,40 @@ function wireDepPicker(values, selfId) {
   const btn = $('#dep-add');
   if (!box || !btn) return;
   const known = new Map(); // tasks picked from the overlay that S.tasks may not hold yet
-  const taskById = (id) => known.get(id) || (S.tasks || []).find((t) => t.id === id) || { id, title: id };
+  const taskById = (id) => known.get(id) || taskRecord(id);
+  // A dependency the task list does not hold (an archived one) is fetched once,
+  // so its chip names it.
+  const requested = new Set();
+  const resolve = (ids) => ids.filter((id) => !taskById(id) && !requested.has(id)).forEach((id) => {
+    requested.add(id);
+    loadTaskRecord(id).then((task) => {
+      if (!task || !box.isConnected) return;
+      known.set(id, task);
+      if (selectedDepIds().includes(id)) paint(selectedDepIds());
+    });
+  });
   const root = box.closest('#tf-body');
   // The task the do agent forks from, if any (an archived one only rides on the chip).
   const forkSource = () => {
     const chosen = root?.querySelector('.agent-field[data-agent="do"] .af-resume-chosen, .agent-field[data-agent="unified"] .af-resume-chosen');
     const id = (() => { try { return JSON.parse(chosen?.dataset.resume || 'null')?.taskId; } catch { return undefined; } })();
     if (!id || id === selfId) return null;
-    return chosen._sourceTask?.id === id ? chosen._sourceTask : known.get(id) || (S.tasks || []).find((t) => t.id === id) || null;
+    return chosen._sourceTask?.id === id ? chosen._sourceTask : known.get(id) || taskRecord(id) || null;
   };
+  // A dependency in another project brings that project into the Authorization,
+  // as a fork source does (wireResumeReauthorization).
+  const announce = (id, enabled) => box.dispatchEvent(new CustomEvent('af-other-project', { bubbles: true,
+    detail: { key: `dependency:${id}`, enabled, projectId: taskById(id)?.projectId } }));
   const paint = (ids, changed) => {
     if (changed) {
       const before = selectedDepIds();
       const source = forkSource();
       if (source && before.includes(source.id) !== ids.includes(source.id)) retargetForkBase(root, source, ids.includes(source.id));
+      ids.filter((id) => !before.includes(id)).forEach((id) => announce(id, true));
+      before.filter((id) => !ids.includes(id)).forEach((id) => announce(id, false));
     }
-    box.innerHTML = ids.map((id) => dependencyChipHtml(taskById(id))).join('');
+    box.innerHTML = ids.map((id) => dependencyChipHtml(taskById(id) || { id, title: id })).join('');
+    resolve(ids);
     box.querySelectorAll('[data-depx]').forEach((b) => (b.onclick = (e) => { e.preventDefault(); paint(selectedDepIds().filter((x) => x !== b.dataset.depx), true); }));
     if (changed) box.dispatchEvent(new Event('change', { bubbles: true })); // the form's auto-save listens for change
   };
@@ -8202,6 +8245,26 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   }
   $('#tf-body').addEventListener('input', autoSaveSoon);
   $('#tf-body').addEventListener('change', autoSaveSoon);
+  // The Fork button: the source is picked as in the form (its grants, waiting
+  // for it), and that is what the form opened with — not yet worth a draft.
+  if (opts?.fork) {
+    const forkBox = $('#tf-body').querySelector('.agent-field[data-agent="do"], .agent-field[data-agent="unified"]');
+    forkBox?._pickResume?.(opts.fork.resumeFrom, opts.fork.task, opts.fork.session);
+    clearTimeout(saveTimer);
+    lastSaved = stateSig(formState());
+    $('#tf-savestate').textContent = '';
+  }
+  // The payments row fills in its inherited policy once the cards load; that is
+  // not an edit either, so an untouched form stays untouched.
+  const openedSignature = lastSaved;
+  if (openedSignature) mainPaymentsReady.then(() => {
+    if (activeFormToken !== formToken || lastSaved !== openedSignature) return;
+    try {
+      const st = formState();
+      const { paymentPolicy: _paymentPolicy, ...body } = st.body;
+      if (stateSig({ ...st, body }) === openedSignature) lastSaved = stateSig(st);
+    } catch {}
+  });
 
   // ── Priority + tags editor (organization; never sent to the agent) ──────────
   // IMPORTANT: this is ONE of TWO places the tag/priority editor lives — here in the full
@@ -11170,11 +11233,10 @@ function conversationEntries(t) {
       .filter((entry) => entry.activity.kind === 'message')
       .map((entry) => `${entry.activityGroup}/${conversationTextKey(entry.activity.title)}`),
   );
-  // User messages carry real epoch-ms timestamps; agent/system replies are stamped
-  // by the deterministic workflow with a per-array sequence number (it has no wall
-  // clock). Carry the last real timestamp forward so a sequence-numbered reply sorts
-  // right after the message it answers, instead of being flung to the top of the
-  // timeline by its tiny `ts`.
+  // Every message carries the epoch-ms time it was written. Transcripts finished
+  // before workflows stamped wall-clock time hold a per-array sequence number for
+  // agent/system messages instead: carry the last real timestamp forward so such a
+  // message sorts right after the one it answers, not at the top of the timeline.
   let carriedTs = 0;
   const messages = (t.messages || [])
     .filter((message) => {
@@ -11673,11 +11735,13 @@ function wireCheckinSidebar(v) {
   $('#main').querySelectorAll('.escalate-request').forEach((el) => el.addEventListener('click', () => openEscalateDialog(v)));
   $('#conversation-fullscreen')?.addEventListener('click', () => setConversationFullscreen(!S.conversationFullscreen));
   $('#share-task-conversation')?.addEventListener('click', event => openConversationShare(v, event.currentTarget.dataset.role));
-  $('#fork-task-agent')?.addEventListener('click', (event) => {
+  $('#fork-task-agent')?.addEventListener('click', async (event) => {
+    const resumeFrom = { taskId: v.taskId, role: event.currentTarget.dataset.role };
+    const task = await loadTaskRecord(v.taskId);
     openTaskForm('software-dev', undefined, undefined, {
-      ...forkBranchDefaults(v),
-      'agent:do': { resumeFrom: { taskId: v.taskId, role: event.currentTarget.dataset.role } },
-    });
+      ...forkBranchDefaults(task || v),
+      'agent:do': { resumeFrom },
+    }, task ? { fork: { resumeFrom, task, session: S.sessions?.[resumeFrom.role] } } : undefined);
   });
   $('#terminal-native')?.addEventListener('click', () => copyNativeAttachCommand(v));
   $('#main').querySelectorAll('.fork-local').forEach((button) => button.addEventListener('click', () => forkCloudSessionLocally(v, button)));
@@ -21845,11 +21909,10 @@ function fmtKeys(binding) {
     .map((s) => `${s.ctrl ? 'Ctrl+' : ''}${s.alt ? (mac ? '⌥' : 'Alt+') : ''}${s.meta ? (mac ? '⌘' : 'Ctrl+') : ''}${s.shift ? '⇧' : ''}${NAME[s.key] || s.key}`)
     .join(' ');
 }
-function commandHint(label, id, next) {
+function commandHint(label, id) {
   const declared = (S.contributions?.commands || []).find((command) => command.id === id);
   const binding = declared ? declared.keybinding : HOST_COMMANDS.find((command) => command.id === id)?.key;
-  const keys = [binding && fmtKeys(binding), next].filter(Boolean).join(' → ');
-  return keys ? `${label} (${keys})` : label;
+  return binding ? `${label} (${fmtKeys(binding)})` : label;
 }
 // Subsequence fuzzy match: score (higher = better), or -1 for no match.
 function fuzzyScore(q, s) {
@@ -21884,6 +21947,8 @@ const HOST_COMMANDS = [
   { id: 'nav.orgwiki', title: 'Go to organization wiki', key: 'g W', run: () => go(globalRoute('orgwiki')) },
   { id: 'nav.global', title: 'Go to organization settings', key: 'g S', run: () => switchTab('global') },
   { id: 'nav.projects', title: 'Go to projects', key: 'g P', run: () => focusRail() },
+  { id: 'nav.newProject', title: 'New project', key: 'p n', group: 'Projects', run: () => newProject() },
+  { id: 'nav.searchProjects', title: 'Search projects', key: 'p /', group: 'Projects', run: () => { revealRail(); $('#project-search')?.focus(); } },
   { id: 'nav.profile', title: 'Go to your profile', key: 'g A', run: () => go(profileRoute()) },
   { id: 'nav.notifications', title: 'Go to inbox', key: 'g N', run: () => go(inboxRoute(DEFAULT_LIST_QUERY)) },
   { id: 'nav.close', title: 'Close panel', key: null, run: () => closeTopOverlay() }, // Esc — handled by the dispatcher
@@ -21895,14 +21960,12 @@ function allCommands() {
   const add = (c) => out.push({ available: true, ...c, keys: c.keybinding ? parseKeybinding(c.keybinding) : null });
   for (const h of HOST_COMMANDS) {
     const d = declared.get(h.id);
-    add({ id: h.id, title: d?.title || h.title, keybinding: d ? d.keybinding : h.key, group: 'Navigation', available: !(['nav.newTask', 'nav.search'].includes(h.id) && inRail()), run: h.run });
+    add({ id: h.id, title: d?.title || h.title, keybinding: d ? d.keybinding : h.key, group: h.group || 'Navigation', run: h.run });
   }
   // Interaction grammar (host-owned, not server-declared): a list cursor on the
   // tasks/queue views; with a task page open the same keys walk between tasks. When
   // focus sits in the projects rail (g p), the same keys walk the rail instead.
   const rail = inRail();
-  add({ id: 'rail.newProject', title: 'New project', keybinding: 'n', group: 'Projects', available: rail, run: () => newProject() });
-  add({ id: 'rail.search', title: 'Search projects', keybinding: '/', group: 'Projects', available: rail, run: () => $('#project-search')?.focus() });
   const listy = ['tasks', 'home', 'queue'].includes(S.tab) && !rail;
   add({ id: 'list.next', title: 'Next task / row', keybinding: 'j', group: 'List', palette: false, available: listy || (!rail && !!S.selected), run: () => (S.selected ? openAdjacentTask(1) : moveCursor(1)) });
   add({ id: 'list.prev', title: 'Previous task / row', keybinding: 'k', group: 'List', palette: false, available: listy || (!rail && !!S.selected), run: () => (S.selected ? openAdjacentTask(-1) : moveCursor(-1)) });
@@ -22095,6 +22158,13 @@ function railRows() {
   return [...document.querySelectorAll('#rail .rail-icon, #rail .rail-add, #project-search, #rail .project-link' + folders)];
 }
 function inRail() { return !!(document.activeElement && document.activeElement.closest && document.activeElement.closest('#rail')); }
+// Unfold a folded sidebar (or slide it over a phone's page) so it can take focus.
+function revealRail() {
+  if (!narrowViewport()) return railCollapsed() && setRailCollapsed(false);
+  $('#rail')?.classList.add('mobile-open');
+  $('#rail-scrim')?.classList.add('visible');
+  syncRailToggle();
+}
 function focusRail() {
   const rows = railRows();
   (rows.find((r) => r.dataset.project === S.projectId) || rows[0])?.focus();
@@ -22127,8 +22197,7 @@ function closeTopOverlay() {
 // its keys in the topbar for a moment, so the console teaches its own keyboard.
 // A chord prefix ('g') shows until the chord completes or lapses. The keys come
 // from the same registry as dispatch: clickable controls name their command in
-// `data-shortcut` (space-separated ids form a sequence: 'nav.projects
-// rail.newProject' is g P then n), or a raw binding in `data-keys`.
+// `data-shortcut` (its id), or a raw binding in `data-keys`.
 function echoKeys(keys, title = '', pending = false) {
   const el = $('#key-echo');
   if (!el) return;
@@ -22147,9 +22216,8 @@ function controlShortcut(control) {
     const keys = bound ? fmtKeys(bound.keybinding) : control.querySelector('.kbd')?.textContent;
     return keys ? { keys, title: control.dataset.label } : null;
   }
-  const steps = control.dataset.shortcut.split(' ').map((id) => cmds.find((c) => c.id === id));
-  if (!steps.every((c) => c?.keybinding)) return null;
-  return { keys: steps.map((c) => fmtKeys(c.keybinding)).join(' '), title: steps.at(-1).title };
+  const command = cmds.find((c) => c.id === control.dataset.shortcut);
+  return command?.keybinding ? { keys: fmtKeys(command.keybinding), title: command.title } : null;
 }
 function echoClickedShortcut(e) {
   // Clicks a command fires itself (digits press action buttons) are untrusted;
