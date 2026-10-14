@@ -65,9 +65,12 @@ import {
   TaskContinuation,
   TaskRecoveryCheckpoint,
   TaskParticipant,
+  BranchLedger,
+  OpenPrProposal,
 } from './contract.js';
 import { mergeQueueDomains, releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider,
-  landingAuthorityOf, samePosition, MERGE_POLL, reviewCheckouts, approveAll, worldRepos, landedNote } from './contract.js';
+  landingAuthorityOf, samePosition, MERGE_POLL, reviewCheckouts, approveAll, worldRepos, landedNote,
+  approveProposed, movedSinceProposal, landableBranches, combineProposals } from './contract.js';
 import type { CheckoutApprovals } from './contract.js';
 import { SIG, SIG_AGENT_TURN_STATE } from './names.js';
 import { agentTurnId } from './turn-id.js';
@@ -192,6 +195,10 @@ export const openPrSignal = defineSignal<[{ userId: string }?]>('openPr');
  *  Lets a human confirm the finished branches and send a follow-up about the rest;
  *  the approval lapses by itself if the Do agent moves that branch afterwards. */
 export const approveCheckoutSignal = defineSignal<[{ name: string }]>('approveCheckout');
+/** v1.30 multi-PR: finish the task now, keeping what landed. */
+export const finishSignal = defineSignal('finish');
+/** The workflow's own notices to a multi-PR agent: a branch was proposed, or landed. */
+const BRANCH_NOTICE = /^(Proposed for Review|Landed):/;
 export const cancelSignal = defineSignal('cancel');
 /** Graceful stop used only when the platform is about to replace this run.
  * Unlike user cancellation it preserves open PRs, but it still checkpoints and
@@ -536,13 +543,19 @@ export async function softwareDevV1_29(input: SoftwareDevInput): Promise<{ stage
   return softwareDevImpl(input, '1.29.0');
 }
 
+/** v1.30: each branch of a multi-PR task is proposed, reviewed and landed on
+ * its own while the agent keeps working (SPEC §11.1). */
+export async function softwareDevV1_30(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevImpl(input, '1.30.0');
+}
+
 /** Replay-compatible entry for executions already recorded as
  * `softwareDev@1.0.0`. v1 published Resolve before invoking autoResolve. */
 export async function softwareDevV1(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevImpl(input, '1.0.0');
 }
 
-type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0' | '1.14.0' | '1.15.0' | '1.16.0' | '1.17.0' | '1.18.0' | '1.19.0' | '1.20.0' | '1.21.0' | '1.22.0' | '1.23.0' | '1.24.0' | '1.25.0' | '1.26.0' | '1.27.0' | '1.28.0' | '1.29.0';
+type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0' | '1.14.0' | '1.15.0' | '1.16.0' | '1.17.0' | '1.18.0' | '1.19.0' | '1.20.0' | '1.21.0' | '1.22.0' | '1.23.0' | '1.24.0' | '1.25.0' | '1.26.0' | '1.27.0' | '1.28.0' | '1.29.0' | '1.30.0';
 
 
 /** The minor of a behavior version. Every feature gate below is a `>=` test on
@@ -708,6 +721,13 @@ async function softwareDevImpl(
   // per-checkout Review gate. Gated from 1.9 on so an execution recorded before
   // it keeps the single-branch Review semantics on replay.
   const multiPrEnabled = !repositoryless && minor >= 9 && !!input.project.multiPr;
+  // v1.30 (SPEC §11.1): each branch of a multi-PR task has its OWN Review →
+  // landing lifecycle. The agent proposes a branch (open_pr with `branches`) and
+  // is resumed at once to keep working; Review no longer parks it; an approved
+  // branch lands at the agent's next pause; and the task finishes once its final
+  // proposal has landed, or when a person finishes it. Landing still runs at a
+  // turn boundary, never beside a running turn: the task has one stage at a time.
+  const branchLifecycle = multiPrEnabled && explicitPrCycle && minor >= 30;
   const agentTurns = minor >= 6 ? cancellationAwareTurns : turns;
   // Activity retry options are recorded with the ScheduleActivityTask command, so
   // bounding the coordinator's unlimited default is a versioned behavior change.
@@ -768,6 +788,30 @@ async function softwareDevImpl(
   // checkout name -> head sha it was approved at (multi-PR Review).
   let checkoutApprovals: CheckoutApprovals = recovery?.checkoutApprovals ?? {};
   let checkoutHeads: Record<string, string> = { ...continued?.checkoutHeads };
+  // v1.30 multi-PR: each branch's proposal and landing (checkout name → head).
+  let ledger: BranchLedger = {
+    proposed: { ...recovery?.branches?.proposed }, landed: { ...recovery?.branches?.landed },
+    ...(recovery?.branches?.finish ? { finish: true } : {}),
+    ...(recovery?.branches?.repairing?.length ? { repairing: [...recovery.branches.repairing] } : {}),
+  };
+  /** Commits each branch has of its own (v1.30), read with the heads. */
+  let checkoutAhead: Record<string, number> = {};
+  /** The branches landing right now; their pull requests are `prs` meanwhile,
+   * and every other branch's waits in `parkedPrs`. */
+  let landingBatch: string[] = [];
+  let parkedPrs: TaskPullRequest[] = [];
+  /** What the agent's last open_pr asked for, until it is proposed. */
+  let pendingProposal: OpenPrProposal | undefined;
+  /** A person (or the managing parent) asked to finish the task now. */
+  let finishRequested = false;
+  /** Bumped by every branch approval, so a parked task wakes to land it. */
+  let approvalEpoch = 0;
+  /** The proposals a parent was last told about, so it is asked once per change. */
+  let parentToldOf: string | undefined;
+  /** Back from Landing: decide before running the agent again. */
+  let branchIdle = carried?.branchIdle ?? false;
+  /** The boundary chose to finish the task. */
+  let finishingBranches = false;
   let cancelled = false;
   let lifecycleReplacement = false;
   let retryRequested = carried?.retryRequested ?? false;
@@ -1158,6 +1202,14 @@ async function softwareDevImpl(
 
   // ── view-model ──
   function allowed(): DeclaredAction[] {
+    const actions = allowedNow();
+    // v1.30: once part of a multi-PR task has landed, Cancel can no longer undo
+    // it; Finish ends the task instead, closing what has not landed.
+    return branchLifecycle && pointOfNoReturnPassed && actions.some((action) => action.name === 'cancel')
+      ? [...actions, { name: 'finish', kind: 'signal', label: 'Finish', enabled: !lifecycleTransitionBlocked && !finishRequested, danger: true }]
+      : actions;
+  }
+  function allowedNow(): DeclaredAction[] {
     if (applyingResources || stagingResources) return [];
     const pausedRole: AgentRole | undefined =
       stage === 'do' || stage === 'review'
@@ -1178,7 +1230,8 @@ async function softwareDevImpl(
       enabled: !pointOfNoReturnPassed && !lifecycleTransitionBlocked,
       danger: true,
     };
-    const confirm: DeclaredAction = { name: 'confirm', kind: 'signal', label: explicitPrCycle ? 'Confirm PR' : 'Confirm', enabled: true };
+    const confirm: DeclaredAction = { name: 'confirm', kind: 'signal',
+      label: branchLifecycle && stage === 'review' ? 'Approve all' : explicitPrCycle ? 'Confirm PR' : 'Confirm', enabled: true };
     const openPr: DeclaredAction = { name: 'openPr', kind: 'signal', label: 'Open PR', enabled: true };
     const setTarget: DeclaredAction = {
       name: 'setTarget',
@@ -1264,6 +1317,274 @@ async function softwareDevImpl(
     return t;
   }
 
+  // ── Several branches per task, each with its own lifecycle (v1.30) ──
+
+  /** Every pull request this task has, including those waiting while a batch lands. */
+  function allPrs(): TaskPullRequest[] {
+    return parkedPrs.length ? [...prs, ...parkedPrs.filter((parked) => !prs.some((own) => own.repo === parked.repo))] : prs;
+  }
+  /** `base` with `updates` replacing the pull request of the same checkout. */
+  function withPrs(base: TaskPullRequest[], updates: TaskPullRequest[]): TaskPullRequest[] {
+    return [...base.filter((candidate) => !updates.some((update) => update.repo === candidate.repo)), ...updates];
+  }
+  function proposedNames(): string[] {
+    return Object.keys(ledger.proposed);
+  }
+  /** Who may approve a proposed branch: the task's human Review layers. */
+  function reviewAudienceNow(): string[] {
+    const humans = softwareDevConfirmLayers.filter((layer) => layer.kind === 'human');
+    return humans.length ? [...new Set(humans.flatMap((layer) => layer.audience?.length ? layer.audience : ['@creator']))] : ['@creator'];
+  }
+  /** Confirm (or a parent's confirm) outside Landing approves every proposed branch. */
+  function approveAllProposed(): boolean {
+    if (!branchLifecycle || stage === 'merge' || !proposedNames().length) return false;
+    checkoutApprovals = approveProposed(ledger, checkoutApprovals);
+    approvalEpoch++;
+    return true;
+  }
+  function unpropose(names: string[], keepApproval = false): void {
+    const proposed = { ...ledger.proposed };
+    const approvals = { ...checkoutApprovals };
+    for (const name of names) {
+      delete proposed[name];
+      if (!keepApproval) delete approvals[name];
+    }
+    ledger = { ...ledger, proposed };
+    checkoutApprovals = approvals;
+  }
+  /** Read every branch's head and own commits; a proposed branch the agent has
+   * moved since lapses (its new commits were never reviewed). */
+  async function refreshBranches(): Promise<void> {
+    const progress = await core.checkoutProgress(world as any, target, Object.keys(ledger.landed));
+    checkoutHeads = progress.heads;
+    checkoutAhead = progress.ahead;
+    const moved = movedSinceProposal(ledger, checkoutHeads);
+    if (!moved.length) return;
+    unpropose(moved);
+    msgs.push({ id: `branch-moved-${msgs.length}`, role: 'user', ts: Date.now(),
+      text: `${moved.join(', ')} changed after ${moved.length === 1 ? 'it was' : 'they were'} proposed, so ${moved.length === 1 ? 'its' : 'their'} Review starts over: propose ${moved.length === 1 ? 'it' : 'them'} again with open_pr when ready.` });
+  }
+  /** The approved branches that may land now. */
+  function landableNow(): string[] {
+    return landableBranches(worldRepos(world as any), ledger, checkoutApprovals, checkoutHeads);
+  }
+  /** The world as one landing batch sees it: only the branches landing now. */
+  function landingWorld(): WorldHandleLike {
+    if (!branchLifecycle || !world) return world!;
+    return { ...world, repos: worldRepos(world as any).filter((repo) => landingBatch.includes(repo.name)) } as WorldHandleLike;
+  }
+  /** The proposal a branch's Review plays at proposal time: agent Reviewers run
+   * now, one after another; people approve whenever they like, without parking
+   * the agent (several human layers collapse into one approval by any of them);
+   * with no layer at all it is approved as it is made. A sub-task's parent
+   * confirms instead. */
+  async function reviewBranches(names: string[]): Promise<'approved' | 'pending' | 'revise' | 'cancelled'> {
+    if (input.parentTaskId) return 'pending';
+    if (commandUnchanged) return 'approved';
+    const layers = modeSwitching && goalMode ? [] : softwareDevConfirmLayers;
+    let agents = 0;
+    let undecided = false;
+    for (const layer of layers) {
+      if (layer.kind !== 'agent') continue;
+      const reviewer = reviewerKey(agents++);
+      waitingFor = { kind: 'confirm', detail: `Review of ${names.join(', ')}` };
+      await publish();
+      const decision = await confirmTurn(layer, reviewer);
+      waitingFor = undefined;
+      if (cancelled) return 'cancelled';
+      if (decision?.action === 'confirm') continue;
+      if (decision?.action === 'revise' || decision?.action === 'reject') {
+        if (!multiAgent || decision.action === 'reject')
+          msgs.push({ id: `branch-review-${msgs.length}`, role: 'user', ts: Date.now(),
+            text: `${participantLabel(reviewer)} ${decision.action === 'reject' ? 'rejected' : 'asked for changes to'} ${names.join(', ')}: ${decision.text || 'please revise the work.'}` });
+        return 'revise';
+      }
+      undecided = true; // a Reviewer that could not decide hands it to people
+    }
+    return undecided || layers.some((layer) => layer.kind === 'human') ? 'pending' : 'approved';
+  }
+  /** Propose what the agent (or a person, with Open PR) asked for: validate the
+   * branches, open or refresh their pull requests, and play their Review. Says
+   * what happened in the conversation; the agent is resumed to keep working
+   * unless this proposal completes the task. */
+  async function proposeBranches(proposal: OpenPrProposal, confirmer?: string): Promise<'done' | 'cancelled'> {
+    if (proposal.final !== undefined) ledger = { ...ledger, finish: proposal.final };
+    else if (!proposal.branches) ledger = { ...ledger, finish: true };
+    const repos = worldRepos(world as any);
+    const unknown = (proposal.branches ?? []).filter((name) => !repos.some((repo) => repo.name === name));
+    const changedSinceLanding = (name: string) => !ledger.landed[name] || ledger.landed[name] !== checkoutHeads[name];
+    let names = (proposal.branches ?? repos.map((repo) => repo.name)).filter((name) => repos.some((repo) => repo.name === name)
+      && (checkoutAhead[name] ?? 0) > 0 && changedSinceLanding(name) && ledger.proposed[name] !== checkoutHeads[name]);
+    const idle = (proposal.branches ?? []).filter((name) => !unknown.includes(name) && !names.includes(name)
+      && ledger.proposed[name] !== checkoutHeads[name]);
+    const notes: string[] = [];
+    if (unknown.length) notes.push(`There is no branch named ${unknown.join(', ')}; your branches are ${repos.map((repo) => repo.name).join(', ')}.`);
+    if (idle.length) notes.push(`${idle.join(', ')} ${idle.length === 1 ? 'has' : 'have'} no commits to propose.`);
+    if (names.length) {
+      stage = 'pr';
+      status = 'active';
+      await publish();
+      if (cancelled) return 'cancelled';
+      const readiness = await core.checkProposal(world as any, names);
+      if (!readiness.ready) {
+        const detail = readiness.conflict ?? readiness.dirty ?? readiness.note ?? 'the proposal is not ready';
+        notes.push(`Proposing ${names.join(', ')} was refused: ${readiness.note ?? 'proposal validation failed'}.\n${detail}\nResolve this, verify it, then call open_pr again.`);
+        names = [];
+      }
+    }
+    if (names.length && githubAuthoritativeMerge) {
+      targetLocked = true;
+      const opened = await withResolve('pr', async () => {
+        try {
+          return { prs: await core.openPr(world as any, target, {
+            title: input.title,
+            summary: pullRequestSummary(reviewInfo?.summary, msgs, false),
+            only: names, landed: Object.keys(ledger.landed),
+          }) };
+        } catch (err) {
+          if (failureHasType(err, 'task-branch-conflict')) return { repair: describeError(err) };
+          throw err;
+        }
+      });
+      if (opened.repair) {
+        notes.push(`Proposing ${names.join(', ')} needs a branch repair.\n${opened.repair}`);
+        names = [];
+      } else {
+        prs = withPrs(prs, opened.prs ?? []);
+        pr = prs[0];
+        const without = names.filter((name) => !opened.prs?.some((candidate) => candidate.repo === name));
+        if (without.length) notes.push(`${without.join(', ')} ${without.length === 1 ? 'has' : 'have'} nothing GitHub would merge, so ${without.length === 1 ? 'it was' : 'they were'} not proposed.`);
+        names = names.filter((name) => !without.includes(name));
+      }
+    }
+    if (names.length) {
+      targetLocked = true;
+      // Re-read heads: preparing a proposal may refresh a branch (ancestry repair).
+      await refreshBranches();
+      const repairing = ledger.repairing ?? [];
+      ledger = {
+        ...ledger,
+        proposed: { ...ledger.proposed, ...Object.fromEntries(names.filter((name) => checkoutHeads[name]).map((name) => [name, checkoutHeads[name]!])) },
+        ...(repairing.length ? { repairing: repairing.filter((name) => !names.includes(name)) } : {}),
+      };
+      const approvals = { ...checkoutApprovals };
+      for (const name of names) delete approvals[name];
+      checkoutApprovals = approvals;
+      // A mechanical repair of an approved branch keeps its approval.
+      const reapproved = names.filter((name) => repairing.includes(name));
+      if (reapproved.length) checkoutApprovals = approveProposed(ledger, checkoutApprovals, reapproved);
+      const review = await core.buildReview(world as any, base, names).catch(() => undefined);
+      if (review) reviewInfo = { ...reviewInfo, summary: reviewInfo?.summary ?? review.summary, changedFiles: review.changedFiles };
+      const outcome = reapproved.length === names.length ? 'approved' : await reviewBranches(names);
+      if (outcome === 'cancelled') return 'cancelled';
+      if (outcome === 'revise') unpropose(names);
+      else {
+        if (outcome === 'approved') checkoutApprovals = approveProposed(ledger, checkoutApprovals, names);
+        else if (confirmer && await core.confirmManualPr(taskId, confirmer)) checkoutApprovals = approveProposed(ledger, checkoutApprovals, names);
+        const links = allPrs().filter((candidate) => names.includes(candidate.repo)).map((candidate) => `${candidate.repo} #${candidate.number}`);
+        if (!ledger.finish)
+          msgs.push({ id: `branch-proposed-${msgs.length}`, role: 'user', ts: Date.now(),
+            text: `Proposed for Review: ${names.join(', ')}${links.length ? ` (${links.join(', ')})` : ''}. Keep working on the rest of the task while ${names.length === 1 ? 'it is' : 'they are'} reviewed; propose each branch with open_pr when it is ready, and pass final: true with the proposal that completes the task.` });
+      }
+    }
+    if (notes.length)
+      msgs.push({ id: `branch-refused-${msgs.length}`, role: 'user', ts: Date.now(), text: notes.join('\n') });
+    return 'done';
+  }
+  /** v1.30: what follows a Do turn, and what a task back from Landing does
+   * before its agent's next turn. Proposes what was asked; then, if nothing
+   * calls the agent, lands what is approved, finishes, or parks until one of
+   * those can happen. `question` is what the agent's last turn ended with. */
+  async function branchBoundary(question: string | undefined): Promise<'turn' | 'land' | 'finish' | 'cancelled'> {
+    for (;;) {
+      await refreshBranches();
+      if (pendingProposal || prRequested) {
+        const proposal = pendingProposal ?? {};
+        const confirmer = pendingProposal ? undefined : manualPrConfirmer;
+        pendingProposal = undefined;
+        prRequested = false;
+        manualPrConfirmer = undefined;
+        if (await proposeBranches(proposal, confirmer) === 'cancelled') return 'cancelled';
+      }
+      if (cancelled) return 'cancelled';
+      if (finishRequested) return 'finish';
+      if (mainUnread()) return 'turn';
+      if (landableNow().length) return 'land';
+      if (ledger.finish && !proposedNames().length) return 'finish';
+      // Park: for a person (or the parent) to review, answer, propose or finish.
+      const reviewing = proposedNames().filter((name) => checkoutApprovals[name] !== ledger.proposed[name]);
+      stage = reviewing.length ? 'review' : 'do';
+      status = 'waiting';
+      const reviewText = reviewing.length ? `Review ${reviewing.join(', ')}.` : '';
+      const asking = question?.trim() && !BRANCH_NOTICE.test(lastInputToMain()) ? question.trim() : '';
+      if (input.parentTaskId) {
+        waitingFor = { kind: 'parent', detail: reviewText || 'Waiting for the managing agent' };
+        const told = JSON.stringify([ledger.proposed, asking]);
+        if (told !== parentToldOf && (reviewing.length || asking)) {
+          parentToldOf = told;
+          await notifyParent(reviewing.length ? 'needs_confirmation' : 'needs_info',
+            [reviewText && `${reviewText} Confirm to approve ${reviewing.length === 1 ? 'it' : 'them'}.`, asking].filter(Boolean).join('\n\n'));
+        }
+      } else {
+        waitingFor = {
+          kind: 'human',
+          audience: reviewing.length ? [...new Set([...reviewAudienceNow(), ...askOf(['@creator'])])] : askOf(['@creator']),
+          detail: [reviewText, asking].filter(Boolean).join('\n\n') || 'Send a follow-up, open the PR, or finish the task.',
+        };
+      }
+      await publish();
+      const approvals = approvalEpoch;
+      await waitServing(() => cancelled || mainUnread() || prRequested || finishRequested || approvalEpoch !== approvals);
+      waitingFor = undefined;
+      status = 'active';
+      stage = 'do';
+      question = undefined;
+      if (cancelled) return 'cancelled';
+    }
+  }
+  /** The last message that called the main agent: a branch notice gets no reply worth asking anyone about. */
+  function lastInputToMain(): string {
+    return [...msgs].reverse().find((m) => m.role === 'user' && addressedTo(m, MAIN_AGENT))?.text ?? '';
+  }
+  /** Hand the approved branches to Landing: their pull requests become `prs`. */
+  function startLanding(names: string[]): void {
+    landingBatch = names;
+    parkedPrs = prs.filter((candidate) => !names.includes(candidate.repo));
+    prs = prs.filter((candidate) => names.includes(candidate.repo));
+    pr = prs[0];
+    repairValidationPending = false;
+    providerQueueAccepted = false;
+    landing = {
+      authorization: 'authorized', validation: 'pending', provider: 'admitting',
+      authorizedHeads: prHeadMap(prs), repairAttempts: 0,
+      detail: `Landing ${names.join(', ')}.`,
+    };
+  }
+  /** Landing returned the batch to Do (a repair, or a person's follow-up): it is
+   * no longer proposed. An approval Landing kept (a mechanical repair) comes
+   * back when it is proposed again; a pull request that did merge counts. */
+  function settleLanding(): void {
+    const batch = landingBatch;
+    landingBatch = [];
+    const merged = batch.filter((name) => prs.some((candidate) => candidate.repo === name && candidate.merged));
+    prs = withPrs(parkedPrs, prs);
+    parkedPrs = [];
+    pr = prs[0];
+    if (merged.length) recordLanded(merged);
+    const rest = batch.filter((name) => !merged.includes(name));
+    const keep = repairValidationPending;
+    unpropose(rest, false);
+    if (keep && rest.length) ledger = { ...ledger, repairing: [...new Set([...ledger.repairing ?? [], ...rest])] };
+    repairValidationPending = false;
+  }
+  function recordLanded(names: string[]): void {
+    const landed = { ...ledger.landed };
+    for (const name of names) landed[name] = ledger.proposed[name] ?? checkoutHeads[name] ?? '';
+    unpropose(names);
+    ledger = { ...ledger, landed };
+    pointOfNoReturnPassed = true;
+  }
+
   async function releaseRetainedLandingDomains(): Promise<void> {
     const domains = retainedMergeDomains;
     retainedMergeDomains = [];
@@ -1329,9 +1650,11 @@ async function softwareDevImpl(
       ...(!repositoryless ? { branch: recordWorld?.branch, base, targetBranch: target } : {}),
       world,
       worldPath: world?.workdir ?? world?.root,
-      pr,
-      ...(prs.length ? { prs } : {}),
-      ...(multiPrEnabled && recordWorld ? { checkouts: reviewCheckouts(worldRepos(recordWorld as any), checkoutHeads, checkoutApprovals, prs) } : {}),
+      pr: branchLifecycle ? allPrs()[0] : pr,
+      ...(allPrs().length ? { prs: allPrs() } : {}),
+      ...(multiPrEnabled && recordWorld ? { checkouts: reviewCheckouts(worldRepos(recordWorld as any), checkoutHeads, checkoutApprovals, allPrs(),
+        branchLifecycle ? { ledger, landing: landingBatch } : undefined) } : {}),
+      ...(branchLifecycle && !input.parentTaskId && Object.keys(ledger.proposed).length ? { reviewAudience: reviewAudienceNow() } : {}),
       mergeQueue: mergeQueuePos,
       ...(intentAuthorizedLanding ? { landing } : {}),
       subTasks: subTaskIds.length ? subTaskIds : undefined,
@@ -1784,6 +2107,8 @@ async function softwareDevImpl(
         manualPrConfirmer = undefined;
         responderRounds = 0;
         subtaskNags = 0;
+        // New input may ask for more: the agent says again whether it is done.
+        if (branchLifecycle && ledger.finish) ledger = { ...ledger, finish: false };
       }
       if (message.role === 'user') automatedRevisions = {};
       whenLoaded(() => {
@@ -1861,6 +2186,8 @@ async function softwareDevImpl(
       if (escalationAction === 'confirm') manualEscalationRequested = true;
       return;
     }
+    // v1.30: Confirm outside Landing approves every proposed branch.
+    if (approveAllProposed()) return;
     confirmed = true;
     if (responsiveHumanHold && humanPauseActive)
       humanPauseWake = { kind: 'confirm' };
@@ -1884,8 +2211,21 @@ async function softwareDevImpl(
   // send a follow-up about the rest. It is recorded against that branch's CURRENT
   // head, which is what makes it lapse by itself if the Do agent moves it.
   setHandler(approveCheckoutSignal, ({ name }) => {
+    // v1.30: an approval binds to the head the branch was PROPOSED at — what its
+    // pull request showed the reviewer — and lands it at the agent's next pause.
+    if (branchLifecycle) {
+      if (!ledger.proposed[name]) return;
+      checkoutApprovals = approveProposed(ledger, checkoutApprovals, [name]);
+      approvalEpoch++;
+      return;
+    }
     const head = checkoutHeads[name];
     if (head) checkoutApprovals = { ...checkoutApprovals, [name]: head };
+  });
+  // v1.30: end a multi-PR task now. Its landed branches stay landed; the rest
+  // are closed. Offered once something landed, when Cancel no longer can be.
+  setHandler(finishSignal, () => {
+    if (branchLifecycle && !cancelled) finishRequested = true;
   });
   setHandler(cancelSignal, () => {
     if (!pointOfNoReturnPassed && !lifecycleTransitionBlocked) {
@@ -1958,6 +2298,7 @@ async function softwareDevImpl(
         prRequested = true;
         return;
       }
+      if (approveAllProposed()) return;
       confirmed = true;
       if (responsiveHumanHold && humanPauseActive)
         humanPauseWake = { kind: 'confirm' };
@@ -1972,7 +2313,7 @@ async function softwareDevImpl(
       if (!pointOfNoReturnPassed && !lifecycleTransitionBlocked) {
         cancelled = true;
         activeTurn?.cancel();
-      }
+      } else if (branchLifecycle && pointOfNoReturnPassed) finishRequested = true;
     } else if (resp.action === 'comment') {
       if (resp.text) whenLoaded(() => msgs.push({ id: `p-${msgs.length}`, role: 'user', text: resp.text!, ts: Date.now() }));
       retryRequested = true; // unblocks an escalated child; at Review the new msg drives it
@@ -2902,6 +3243,7 @@ async function softwareDevImpl(
     // replay is unaffected.
     if (multiPrEnabled && turn.worldHandle) world = turn.worldHandle as WorldHandleLike;
     if (explicitPrCycle && turn.openPrRequested) prRequested = true;
+    if (branchLifecycle && turn.openPrRequested) pendingProposal = combineProposals(pendingProposal, turn.openPrProposal ?? {});
     return turn;
   }
 
@@ -3640,6 +3982,7 @@ Inspect the complete current diff and specifically compare its delta from the re
     return { ...next, base, goalMode, responder: liveResponder, recovery: {
       resumeStage: 'do', messages: [], world: world as TaskRecoveryCheckpoint['world'], session, sessionHome, seen, target,
       prs, reviewInfo, checkoutApprovals, landing, repairValidationPending,
+      ...(branchLifecycle ? { branches: ledger } : {}),
       continued: {
         conversation,
         ...(explicitPrCycle && mergeMsgs.length ? { mergeMessages: mergeMsgs } : {}),
@@ -3654,6 +3997,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         accountPool,
         flags: { targetLocked, pointOfNoReturnPassed, branchPreparedForPr, forceHumanRepairReview, providerQueueAccepted,
           prRequested, confirmed, retryRequested, manualEscalationRequested, resourcesApplied,
+          ...(branchLifecycle && branchIdle ? { branchIdle } : {}),
           ...(taskCommand ? { commandRan, commandUnchanged } : {}) },
         ...(manualPrConfirmer ? { manualPrConfirmer } : {}),
         ...(escalationAction ? { escalationAction } : {}),
@@ -3846,6 +4190,12 @@ Inspect the complete current diff and specifically compare its delta from the re
   const restoredReviewBackToDo =
     recoveryStage === 'review'
     && (pauseWake?.kind === 'followUp' || pauseWake?.kind === 'workflowChange');
+  // v1.30: a multi-PR task's branches carry their own Review and landing
+  // state (the ledger), so a replacement resumes at Do and lands from there.
+  if (branchLifecycle && ['pr', 'review', 'merge'].includes(recoveryStage)) {
+    recoveryStage = 'do';
+    branchIdle = true;
+  }
   if (restoresStagePrerequisites && recovery && ['pr', 'review', 'merge'].includes(recoveryStage)) {
     const requestedStage = recoveryStage;
     const reviewedPrs = recovery.prs?.map((candidate) => ({ ...candidate })) ?? [];
@@ -3984,6 +4334,18 @@ Inspect the complete current diff and specifically compare its delta from the re
       await continueRun();
       if (cancelled) return await abort();
     }
+    // v1.30: back from Landing, what it did not land is no longer proposed; and
+    // unless something calls the agent, the boundary decides what comes next.
+    if (branchLifecycle && landingBatch.length) settleLanding();
+    if (branchLifecycle && branchIdle && !mainUnread()) {
+      branchIdle = false;
+      const next = await branchBoundary(undefined);
+      if (next === 'cancelled') return await abort();
+      if (next === 'land') { startLanding(landableNow()); break; }
+      if (next === 'finish') { finishingBranches = true; break; }
+      continue;
+    }
+    branchIdle = false;
 
     // A human/parent may request Open PR while the task is already parked. That
     // transition uses the proposal the Do agent just produced; it must not spend
@@ -4289,6 +4651,18 @@ Inspect the complete current diff and specifically compare its delta from the re
           ts: Date.now(),
         });
         stage = 'do';
+        continue;
+      }
+      // v1.30: a multi-PR turn proposes what it named and goes on working; the
+      // boundary lands what is approved, finishes, or parks (it never blocks
+      // the agent on Review).
+      if (branchLifecycle) {
+        const next = await branchBoundary(turn.raise?.detail?.trim() || turn.output?.trim());
+        if (next === 'cancelled') return await abort();
+        if (next === 'land') { startLanding(landableNow()); break; }
+        if (next === 'finish') { finishingBranches = true; break; }
+        stage = 'do';
+        status = 'active';
         continue;
       }
       // Attach a git-derived changed-files summary; the agent's own review info
@@ -4623,6 +4997,24 @@ Inspect the complete current diff and specifically compare its delta from the re
   }
   }
 
+  // v1.30: finishing a multi-PR task. What landed stays; a pull request for a
+  // branch that did not land is closed, so nothing is left proposing work that
+  // never will. The task's own output is published as at any approval.
+  if (branchLifecycle && finishingBranches) {
+    const open = prs.filter((candidate) => candidate.state === 'open' && !candidate.merged);
+    if (open.length && world && githubPrLifecycle) {
+      const closed = await core.closePrs(world as any, open,
+        'The tavya task finished without landing this branch; closing the pull request.').catch(() => undefined);
+      prs = withPrs(prs, closed ?? open.map((candidate) => ({ ...candidate, state: 'closed' as const })));
+      pr = prs[0];
+    }
+    if (resourceCandidateReview && patched('automatic-resource-review-v1') && !resourcesApplied) {
+      await core.beginResourceReview(taskId, `${workflowInfo().runId}:${++resourceReviewSequence}`);
+      if ((await applyReviewedResources(true, false)) !== 'applied') return await abort();
+    }
+    break proposalCycle;
+  }
+
   // Recovery may carry an already-approved proposal across a replacement run
   // and bypass the review gate. Finish any interrupted resource publication too.
   if (restoredReviewApproved && resourceCandidateReview && !resourcesApplied
@@ -4783,6 +5175,7 @@ Inspect the complete current diff and specifically compare its delta from the re
       const proposal = await withResolve('pr', () => core.proposeUpstream(world!, target, {
         title: input.title,
         summary: pullRequestSummary(reviewInfo?.summary, msgs, false),
+        ...(branchLifecycle ? { only: landingBatch } : {}),
       }));
       const known = new Set(prs.map(prKey));
       const added = proposal.prs.filter((candidate) => !known.has(prKey(candidate)));
@@ -4935,7 +5328,7 @@ Inspect the complete current diff and specifically compare its delta from the re
     const domains = participantLanding && githubAuthoritativeMerge
       ? [...new Set(plannedParticipants.filter((candidate) => candidate.owner === 'karmax')
         .map((candidate) => candidate.domain))].sort()
-      : observesProviderQueue ? [] : mergeQueueDomains(world, target, input.projectId);
+      : observesProviderQueue ? [] : mergeQueueDomains(landingWorld(), target, input.projectId);
     if (participantLanding) internalMergeAdmissionActive = domains.length > 0;
     const held: string[] = (frontHeldLanding || fairLanding) ? [...retainedMergeDomains] : [];
     let retainFront = false;
@@ -5111,7 +5504,9 @@ Inspect the complete current diff and specifically compare its delta from the re
         } else {
           // …then the authoritative, deterministic local merge that guarantees
           // work lands for non-PR and replay-pinned historical workflows.
-          result = await runLandingActivity(() => long.finalizeMergeActivity(world as any, target));
+          result = await runLandingActivity(() => branchLifecycle
+            ? long.finalizeMergeActivity(world as any, target, landingBatch)
+            : long.finalizeMergeActivity(world as any, target));
         }
       } catch (err) {
         if (githubAuthoritativeMerge) {
@@ -5296,7 +5691,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         confirmed = false;
         prRequested = false;
         branchPreparedForPr = false;
-        if (!intentAuthorizedLanding || decision.repair?.preserveAuthorization !== true) checkoutApprovals = {};
+        if ((!intentAuthorizedLanding || decision.repair?.preserveAuthorization !== true) && !branchLifecycle) checkoutApprovals = {};
         stage = 'do';
         status = 'active';
         githubErrorPolls = 0;
@@ -5386,7 +5781,7 @@ Inspect the complete current diff and specifically compare its delta from the re
           prRequested = false;
           branchPreparedForPr = false;
           if (intentAuthorizedLanding && landing.authorization !== 'none') repairValidationPending = true;
-          else checkoutApprovals = {};
+          else if (!branchLifecycle) checkoutApprovals = {};
           githubErrorPolls = 0;
           stage = 'do';
           status = 'active';
@@ -5425,7 +5820,8 @@ Inspect the complete current diff and specifically compare its delta from the re
       // the machine — push it (and under 'pr', GitHub marks the PR merged).
       // Best-effort: the merge IS the deliverable; a failed push is recorded, not fatal.
       if (remotePolicyOf(input.project) !== 'none') {
-        const pushed = await core.pushTarget(world as any, target).catch(() => undefined);
+        const pushed = await (branchLifecycle ? core.pushTarget(world as any, target, landingBatch)
+          : core.pushTarget(world as any, target)).catch(() => undefined);
         // Under 'pr' the pull request is part of the deliverable: reconcile it
         // with what actually landed (merged / closed / still open, and why).
         if (githubPrLifecycle && prs.length) {
@@ -5485,7 +5881,7 @@ Inspect the complete current diff and specifically compare its delta from the re
       confirmed = false;
       prRequested = false;
       branchPreparedForPr = false;
-      if (!intentAuthorizedLanding) checkoutApprovals = {};
+      if (!intentAuthorizedLanding && !branchLifecycle) checkoutApprovals = {};
       stage = 'do';
       status = 'active';
       continue proposalCycle;
@@ -5540,10 +5936,31 @@ Inspect the complete current diff and specifically compare its delta from the re
     mergeAttempts = 0; // a human/parent retry grants a fresh loop-back budget
   }
 
+  if (branchLifecycle) {
+    // The batch landed. Unless the agent's final proposal is now all landed,
+    // the task goes on: the agent hears it (its other branches may build on
+    // this one) unless it already said it was done.
+    const names = landingBatch;
+    landingBatch = [];
+    prs = withPrs(parkedPrs, prs);
+    parkedPrs = [];
+    pr = prs[0];
+    recordLanded(names);
+    landing = { ...landing, validation: 'passed', provider: 'none',
+      detail: `Landed ${names.join(', ')}${sha ? ` as ${sha.slice(0, 8)}` : ''}.` };
+    if (!finishRequested && !(ledger.finish && !proposedNames().length)) {
+      if (!ledger.finish) msgs.push({ id: `branch-landed-${msgs.length}`, role: 'user', ts: Date.now(),
+        text: `Landed: ${names.join(', ')} into ${target}${sha ? ` as ${sha.slice(0, 8)}` : ''}. Carry on with any remaining work; when the task is complete, call open_pr with final: true.` });
+      branchIdle = true;
+      stage = 'do';
+      status = 'active';
+      continue proposalCycle;
+    }
+  }
   break proposalCycle;
   }
 
-  if (intentAuthorizedLanding) {
+  if (intentAuthorizedLanding && !branchLifecycle) {
     landing = {
       ...landing,
       validation: 'passed',
@@ -5554,7 +5971,10 @@ Inspect the complete current diff and specifically compare its delta from the re
   stage = 'done';
   status = 'done';
   // The landing adds to the work summary; it never replaces it.
-  const landed = landedNote(world, target, sha);
+  const landedBranches = Object.keys(ledger.landed);
+  const landed = branchLifecycle
+    ? landedBranches.length ? `Landed ${landedBranches.join(', ')} into ${target}.` : `Nothing landed in ${target}.`
+    : landedNote(world, target, sha);
   if (landed) reviewInfo = { ...reviewInfo, summary: reviewInfo?.summary ? `${reviewInfo.summary}\n\n${landed}` : landed };
   await publish();
   const remoteWorld = world ? releaseWorldOnCompletion(world) : false;
@@ -5580,6 +6000,7 @@ Inspect the complete current diff and specifically compare its delta from the re
       await cancelChildren(liveAgentStates);
     // A cancelled task must not leave an open pull request proposing work that
     // will never land.
+    if (branchLifecycle) { prs = allPrs(); parkedPrs = []; }
     if (!lifecycleReplacement && githubPrLifecycle && world && prs.length
       && (githubAuthoritativeCancellation || prs.some((p) => p.state === 'open'))) {
       const reconciled = await core.closePrs(world as any, prs,

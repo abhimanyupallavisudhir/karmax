@@ -46,7 +46,9 @@ import { SUB_TASK_ACTIONS, type SubTaskAction } from '../domain/types.js';
  *                                   report `fresh session` and go on
  *   @decide <action> :: <reason>    resolve agent verdict (resume/retryStage/gotoStage/parkUntil/escalate)
  *   @confirm <action> [:: text]     confirm agent verdict (confirm/revise/reject)
- *   @openpr                         explicitly request the PR/Review cycle
+ *   @openpr [branch …] [:: final|more]
+ *                                   explicitly request the PR/Review cycle; a multi-PR
+ *                                   task may name branches and say whether it is final
  *   @incomplete                     do NOT signal completion this turn
  *   @profile                        echo this turn's model/effort (`profile: <model>/<effort>`)
  *   @sleep <ms>                     await, but abort promptly if cancelled (tests mid-turn cancel)
@@ -58,6 +60,8 @@ import { SUB_TASK_ACTIONS, type SubTaskAction } from '../domain/types.js';
  * ≥1.27) reads other agents' messages, not directive-bearing prompts, so it also
  * acts on directives in its configured instructions ("Instructions for you:").
  */
+/** The workflow's own notices to a multi-PR agent (software-dev ≥1.30). */
+const BRANCH_NOTICE = /^(Proposed for Review|Landed):/;
 // @failonce ledger: activity retries land in the same world, so keying by world+message
 // makes the second attempt succeed. Module-level: survives across turn invocations.
 const failedOnce = new Set<string>();
@@ -91,6 +95,7 @@ export class MockAdapter implements AgentAdapter {
     }
 
     let complete = true;
+    let openedPr = false;
     let pendingSubagents = 0;
     let lastJob: string | undefined;
     let revealed: string | undefined;
@@ -347,10 +352,18 @@ export class MockAdapter implements AgentAdapter {
           }
           break;
         }
-        case 'openpr':
-          ctx.openPr();
-          outputs.push('open PR');
+        case 'openpr': {
+          // @openpr [branch …] [:: final|more] — open_pr, optionally naming
+          // branches and whether the proposal completes the task.
+          const [names, flag = ''] = splitOn(rest, '::');
+          const branches = names.trim().split(/\s+/).filter(Boolean);
+          const final = flag.trim() === 'final' ? true : flag.trim() === 'more' ? false : undefined;
+          await ctx.openPr(branches.length || final !== undefined
+            ? { ...(branches.length ? { branches } : {}), ...(final !== undefined ? { final } : {}) } : undefined);
+          openedPr = true;
+          outputs.push(`open PR${branches.length ? `: ${branches.join(' ')}` : ''}`);
           break;
+        }
         case 'incomplete':
           complete = false;
           break;
@@ -450,7 +463,9 @@ export class MockAdapter implements AgentAdapter {
       // PR when its work is complete. Auxiliary roles never own this transition.
       // Some adapter-only unit fixtures intentionally provide a partial context;
       // production runtimes always install the control bridge.
-      if (input.role === 'do') ctx.openPr?.();
+      // It never widens a proposal it made explicitly, and a multi-PR notice
+      // (a branch proposed or landed while it works on) is not a request to ship.
+      if (input.role === 'do' && !openedPr && !BRANCH_NOTICE.test(initialText)) ctx.openPr?.();
     }
     ctx.emitActivity({ id: `message-${deliveredIndex}`, kind: 'message', phase: 'completed', title: outputs.join('\n') });
     return {

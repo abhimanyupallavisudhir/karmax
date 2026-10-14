@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { reviewCheckouts, allCheckoutsApproved, approveAll } from '../src/domain/checkouts.js';
+import { reviewCheckouts, allCheckoutsApproved, approveAll, approveProposed, movedSinceProposal, landableBranches } from '../src/domain/checkouts.js';
+import type { BranchLedger } from '../src/domain/types.js';
 import { runTurn } from '../src/agent/runtime.js';
 import { MockAdapter } from '../src/agent/mock.js';
 import { WorldRepo } from '../src/world/types.js';
@@ -70,6 +71,67 @@ describe('per-checkout review approval', () => {
     const view = reviewCheckouts(stacked, {}, {}, []);
     expect(view.find((c) => c.name === 'api')!.stackedOn).toBe('alpha');
     expect(view.find((c) => c.name === 'alpha')!.stackedOn).toBeUndefined();
+  });
+});
+
+/**
+ * Software-dev ≥1.30: each branch has its own Review → landing lifecycle while
+ * the agent keeps working in the others. An approval binds to the head the
+ * branch was PROPOSED at, which is what its pull request showed the reviewer.
+ */
+describe('per-branch lifecycle', () => {
+  const ledger = (proposed: Record<string, string>, landed: Record<string, string> = {}): BranchLedger => ({ proposed, landed });
+
+  it('reports each branch\'s own state', () => {
+    const view = reviewCheckouts(
+      [repo('alpha', 'tavya/t'), repo('docs', 'tavya/t-docs'), repo('api', 'tavya/t-api'), repo('cli', 'tavya/t-cli')],
+      { alpha: 'a1', docs: 'd1', api: 'p1', cli: 'c1' },
+      { docs: 'd1', api: 'p1' },
+      [],
+      { ledger: ledger({ docs: 'd1', api: 'p1', cli: 'c1' }, { old: 'x' }), landing: ['api'] },
+    );
+    expect(view.map((c) => [c.name, c.state, c.approved])).toEqual([
+      ['alpha', 'working', false],
+      ['docs', 'approved', true],
+      ['api', 'landing', true],
+      ['cli', 'review', false],
+    ]);
+    expect(view.find((c) => c.name === 'cli')!.proposedHead).toBe('c1');
+  });
+
+  it('shows a landed branch as landed, with the commit it landed as', () => {
+    const [c] = reviewCheckouts([repo('docs', 'tavya/t-docs')], { docs: 'd1' }, {}, [],
+      { ledger: ledger({}, { docs: 'm1' }), landing: [] });
+    expect([c!.state, c!.landedSha]).toEqual(['landed', 'm1']);
+  });
+
+  it('approves at the PROPOSED head, not at whatever the branch holds now', () => {
+    const approvals = approveProposed(ledger({ docs: 'd1' }), {}, ['docs']);
+    expect(approvals).toEqual({ docs: 'd1' });
+    // The agent committed again after proposing: nothing it did since was reviewed.
+    expect(landableBranches([repo('docs', 'tavya/t-docs')], ledger({ docs: 'd1' }), approvals, { docs: 'd2' })).toEqual([]);
+    expect(movedSinceProposal(ledger({ docs: 'd1' }), { docs: 'd2' })).toEqual(['docs']);
+  });
+
+  it('approves nothing that was not proposed', () => {
+    expect(approveProposed(ledger({ docs: 'd1' }), {}, ['alpha'])).toEqual({});
+    expect(approveProposed(ledger({ docs: 'd1', api: 'p1' }), {})).toEqual({ docs: 'd1', api: 'p1' });
+  });
+
+  it('does not treat an unreadable head as a move', () => {
+    expect(movedSinceProposal(ledger({ docs: 'd1' }), {})).toEqual([]);
+  });
+
+  it('lands only approved branches, and a stacked one only with or after its base', () => {
+    const repos = [repo('alpha', 'tavya/t'), repo('api', 'tavya/t-api', 'tavya/t'), repo('docs', 'tavya/t-docs')];
+    const heads = { alpha: 'a1', api: 'p1', docs: 'd1' };
+    const proposed = ledger({ alpha: 'a1', api: 'p1', docs: 'd1' });
+    // api is approved but stacks on alpha, which is not: it waits.
+    expect(landableBranches(repos, proposed, { api: 'p1', docs: 'd1' }, heads)).toEqual(['docs']);
+    // Approved together, they land together (merge orders the stack).
+    expect(landableBranches(repos, proposed, { alpha: 'a1', api: 'p1' }, heads)).toEqual(['alpha', 'api']);
+    // Its base already landed: it lands alone.
+    expect(landableBranches(repos, ledger({ api: 'p1' }, { alpha: 'm1' }), { api: 'p1' }, heads)).toEqual(['api']);
   });
 });
 

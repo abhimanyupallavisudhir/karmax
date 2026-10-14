@@ -56,8 +56,9 @@ export interface MergeResult {
  * Checkouts are merged in stack order (`orderCheckouts`), so a branch based on a
  * sibling lands after it and each pull request carries only its own change.
  */
-export async function finalizeMerge(world: World, target: string, identity?: WorldGitIdentity): Promise<MergeResult> {
-  const repos = orderCheckouts(worldRepos(world.handle));
+export async function finalizeMerge(world: World, target: string, identity?: WorldGitIdentity, only?: string[]): Promise<MergeResult> {
+  // A multi-PR task (software-dev ≥1.30) lands only the branches approved now.
+  const repos = orderCheckouts(worldRepos(world.handle)).filter((repo) => !only || only.includes(repo.name));
   if (!repos.length) return { merged: false, landedFiles: [], note: 'no source repo (non-git world)' };
   if (repos.length === 1) return finalizeMergeRepo(repos[0]!, worldRepoTarget(repos[0]!, target), world.handle.id, identity);
 

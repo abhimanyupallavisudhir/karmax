@@ -29,6 +29,7 @@ import {
   softwareDevV1_27,
   softwareDevV1_28,
   softwareDevV1_29,
+  softwareDevV1_30,
   SoftwareDevInput,
 } from './software-dev.js';
 import { TaskInput, Stage } from './contract.js';
@@ -184,6 +185,11 @@ export async function goalV1_28(input: TaskInput): Promise<{ stage: Stage; sha?:
 
 export async function goalV1_29(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevV1_29({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
+}
+
+/** Each branch of a multi-PR task lands on its own. */
+export async function goalV1_30(input: TaskInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevV1_30({ ...(input as SoftwareDevInput), goalMode: true, autoConfirm: true });
 }
 
 /** Immutable replay entry for executions pinned to goal@1.0.0. */

@@ -311,6 +311,16 @@ export interface OpenPrDetails {
   title?: string;
   /** Human-facing summary of the work — normally the task's review info. */
   summary?: string;
+  /** Software-dev ≥1.30 multi-PR: propose only these checkouts (by name). */
+  only?: string[];
+  /** Checkouts already landed: a branch stacked on one proposes against the
+   *  target instead, since its base's change is there now. */
+  landed?: string[];
+}
+
+/** The checkouts an activity acts on: all of them, or the named ones. */
+function scopedRepos<T extends { name: string }>(repos: T[], only?: string[]): T[] {
+  return only ? repos.filter((repo) => only.includes(repo.name)) : repos;
 }
 
 /** The PR description: the task's own summary, plus the provenance line that
@@ -2914,6 +2924,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         globalInstructions: (globalInstructions ?? '') + forkContext + agentForkContext + attemptContext + paymentContext,
         projectInstructions,
         bindings,
+        ...(args.task.project?.multiPr && Number(String(preparationTask?.workflowVersion ?? '').split('.')[1] ?? 0) >= 30
+          ? { branchLifecycle: true } : {}),
       });
       // Snapshot the journaled turn input (SPEC §5.4).
       (await record(args.taskId, 'turn.prompt', { role: args.role, profile: profile.id, provider: profile.provider }));
@@ -3620,9 +3632,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     /** Auto-derive the changed-files summary so Review always shows what changed
      *  (§5.5). Diffs are intentionally NOT computed — they were removed from the
      *  review packet; reviewers use the changed-files list + the in-world terminal. */
-    async buildReview(handle: WorldHandle, base: string): Promise<{ summary: string; changedFiles: string[] }> {
+    async buildReview(handle: WorldHandle, base: string, only?: string[]): Promise<{ summary: string; changedFiles: string[] }> {
       const world = await openWorld(handle);
-      const repos = worldRepos(handle);
+      const allRepos = worldRepos(handle);
+      const repos = scopedRepos(allRepos, only);
       if (!repos.length) {
         const files = (await world.listFiles()).map((file) => `${file} (new)`);
         const { changedFiles, truncated } = reviewFiles(files);
@@ -3631,7 +3644,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         return { summary, changedFiles };
       }
       const roots = repos;
-      const developmentRepos = repos.filter((repo) => repo.role !== 'project-wiki');
+      // Prefixes follow the whole world, so a branch reviewed on its own reads the same.
+      const developmentRepos = allRepos.filter((repo) => repo.role !== 'project-wiki');
       const changedFiles: string[] = [];
       for (const repo of roots) {
         const repoBase = 'base' in repo ? repo.base : base;
@@ -3670,7 +3684,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     /** Readiness check for the explicit Open PR transition. The Do agent owns
      * commit-vs-ignore judgment; machinery refuses unresolved/uncommitted state
      * and may add the narrow, content-neutral ancestry repair described below. */
-    async checkProposal(handle: WorldHandle): Promise<{
+    async checkProposal(handle: WorldHandle, only?: string[]): Promise<{
       ready: boolean;
       dirty?: string;
       conflict?: string;
@@ -3679,7 +3693,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const world = await openWorld(handle);
       const dirty: string[] = [];
       const conflicts: string[] = [];
-      for (const repo of worldRepos(world.handle)) {
+      for (const repo of scopedRepos(worldRepos(world.handle), only)) {
         const unresolved = await world.exec('git', ['-c', 'core.quotePath=false', 'diff', '--name-only', '--diff-filter=U'], { cwd: repo.root });
         if (unresolved.stdout.trim()) {
           conflicts.push(...unresolved.stdout.trim().split('\n').filter(Boolean).map((file) => `${repo.name}/${file}`));
@@ -3716,7 +3730,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       return { ready: true };
     },
 
-    async finalizeMergeActivity(handle: WorldHandle, target: string): Promise<MergeResult> {
+    async finalizeMergeActivity(handle: WorldHandle, target: string, only?: string[]): Promise<MergeResult> {
       const world = await openWorld(handle);
       // Merge commits carry the world's profile identity too (wiki plans/PLAN-git-config
       // §4A) — they land on the target, where worktree-scoped config doesn't reach.
@@ -3731,8 +3745,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
       }
       const result = isRemote(handle.kind)
-        ? await brokerFinalizeMerge(world, target, identity, (await brokerAuthFor(handle, handle.id)))
-        : await finalizeMerge(world, target, identity);
+        ? await brokerFinalizeMerge(world, target, identity, (await brokerAuthFor(handle, handle.id)), only)
+        : await finalizeMerge(world, target, identity, only);
       (await record(handle.id, 'merge.result', { merged: result.merged, sha: result.sha, conflict: result.conflict, dirty: result.dirty }));
       return result;
     },
@@ -3866,6 +3880,29 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (head?.code === 0 && head.stdout.trim()) heads[repo.name] = head.stdout.trim();
       }
       return heads;
+    },
+
+    /**
+     * Where each branch of a multi-PR task stands (software-dev ≥1.30): its head,
+     * and how many commits it has of its own — counted against the sibling it is
+     * stacked on, or against its target once that sibling has landed — so
+     * "propose everything" proposes only branches with work to review.
+     */
+    async checkoutProgress(handle: WorldHandle, target: string, landed: string[] = []): Promise<{
+      heads: Record<string, string>; ahead: Record<string, number>;
+    }> {
+      const world = await openWorld(handle);
+      const repos = worldRepos(world.handle);
+      const heads: Record<string, string> = {};
+      const ahead: Record<string, number> = {};
+      for (const repo of repos) {
+        const head = await world.exec('git', ['rev-parse', 'HEAD'], { cwd: repo.root }).catch(() => undefined);
+        if (head?.code === 0 && head.stdout.trim()) heads[repo.name] = head.stdout.trim();
+        const stacked = repos.some((other) => other.name !== repo.name && other.branch === repo.base && !landed.includes(other.name));
+        const count = await commitsAheadOfPrBase(world, repo, stacked ? repo.base : worldRepoTarget(repo, target)).catch(() => undefined);
+        if (count?.code === 0) ahead[repo.name] = Number(count.stdout.trim()) || 0;
+      }
+      return { heads, ahead };
     },
 
     /** The current world, including checkouts added during Do, determines whether
@@ -4315,8 +4352,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
      */
     async openPr(handle: WorldHandle, target: string, details: OpenPrDetails = {}): Promise<TaskPullRequest[]> {
       const world = await openWorld(handle);
-      const repos = worldRepos(world.handle);
-      const targets = await githubPrTargets(world, handle);
+      const allRepos = worldRepos(world.handle);
+      const repos = scopedRepos(allRepos, details.only);
+      const targets = (await githubPrTargets(world, handle))
+        .filter(({ repo }) => !details.only || details.only.includes(repo.name));
       if (!targets.length) {
         throw new Error('remote policy "pr" is on, but no repository in this world has a GitHub origin remote'
           + ' — set the project\'s remote policy to "push"/"none", or give the repository a github.com origin');
@@ -4351,7 +4390,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // A checkout whose base is a SIBLING's branch is a stacked pull request:
         // open it against that branch so GitHub renders the stack and its diff
         // shows only this branch's own change, not the base's as well.
-        const stacked = repos.some((other) => other !== repo && other.branch === repo.base);
+        const stacked = allRepos.some((other) => other.name !== repo.name && other.branch === repo.base
+          && !details.landed?.includes(other.name));
         const base = stacked ? repo.base : worldRepoTarget(repo, target);
         // karmax's own model lets a worktree stay dirty until the merge stage
         // (wiki plans/PLAN-git-config §6 loops that back to the merge agent), so arriving
@@ -4428,11 +4468,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           opening = await api.openOrUpdate(slug, {
             head: repo.branch, base,
             // With several branches in flight the task title alone names none of
-            // them; say which pull request this one is.
-            title: changed.length > 1
+            // them; say which pull request this one is. A branch proposed on its
+            // own is still one of several.
+            title: changed.length > 1 || (details.only && allRepos.length > 1)
               ? `${details.title?.trim() || BRAND} (${repo.name})`
               : details.title?.trim() || `${BRAND}: ${repo.branch}`,
-            body: prBody(handle, details, (await store.getTask(handle.id))?.num, changed.length > 1 ? repo.name : undefined),
+            body: prBody(handle, details, (await store.getTask(handle.id))?.num,
+              changed.length > 1 || (details.only && allRepos.length > 1) ? repo.name : undefined),
           });
         } catch (error) {
           // GitHub decides what the PR would contain. The local count can only
@@ -4465,7 +4507,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     async proposeUpstream(ref: WorldHandleRef, target: string, details: OpenPrDetails = {}): Promise<UpstreamProposal> {
       const handle = ref as WorldHandle;
       const world = await openWorld(handle);
-      const targets = (await githubPrTargets(world, handle)).filter((candidate) => candidate.headRepository);
+      const targets = (await githubPrTargets(world, handle)).filter((candidate) => candidate.headRepository
+        && (!details.only || details.only.includes(candidate.repo.name)));
       const changed: Array<(typeof targets)[number] & { base: string }> = [];
       for (const candidate of targets) {
         const base = worldRepoTarget(candidate.repo, target);
@@ -6139,13 +6182,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
      * 'push'/'pr', wiki plans/PLAN-git-config §5). Best-effort by contract: the local
      * merge is the deliverable; every skip/failure is recorded, never thrown.
      */
-    async pushTarget(handle: WorldHandle, target: string): Promise<{ pushed: string[]; skipped: string[] }> {
+    async pushTarget(handle: WorldHandle, target: string, only?: string[]): Promise<{ pushed: string[]; skipped: string[] }> {
       const env = { GIT_TERMINAL_PROMPT: '0', ...(await gitEnvFor(handle, handle.id)) };
       const world = await openWorld(handle);
       const pushed: string[] = [];
       const skipped: string[] = [];
       if (isRemote(handle.kind)) {
-        for (const r of worldRepos(handle)) {
+        for (const r of scopedRepos(worldRepos(handle), only)) {
           if (!r.localPath) {
             // brokerFinalizeMerge already performed the authenticated target push;
             // report the policy step as satisfied without re-exporting credentials.
@@ -6171,7 +6214,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
         return { pushed, skipped };
       }
-      for (const r of worldRepos(handle)) {
+      for (const r of scopedRepos(worldRepos(handle), only)) {
         const repoTarget = r.targetPinned === false ? target : (r.target ?? target);
         const repository = await enrolledRepositoryForCheckout(handle, r);
         const appConnected = Boolean(repository?.gitConnectionId && deps.githubApp);

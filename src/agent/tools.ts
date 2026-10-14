@@ -229,7 +229,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'create_branch',
     description:
-      'Multi-PR tasks ONLY: split this task\'s change across another branch, so it is reviewed and merged as its own pull request. The branch is checked out beside your current one immediately — work in it during this same turn (`cd` to the path returned). Use it when one review would mix unrelated concerns: a prep/refactor under a feature, or slices of different repos. Stack with `base`: pass a SIBLING checkout\'s name and this branch builds on it and lands after it. All branches stay one task with one Review and one Merge — if a piece needs its own review timing or cancellation, use create_sub_task instead. Fails on a single-branch task; do not retry, just keep working in the one branch.',
+      'Several-branch tasks ONLY: split this task\'s change across another branch, so it is reviewed and merged as its own pull request. The branch is checked out beside your current one immediately — work in it during this same turn (`cd` to the path returned). Use it when one review would mix unrelated concerns: a prep/refactor under a feature, or slices of different repos. Stack with `base`: pass a SIBLING checkout\'s name and this branch builds on it and lands after it. Propose a finished branch with open_pr(branches: [name]) and keep working in the others; each lands once approved. Fails on a single-branch task; do not retry, just keep working in the one branch.',
     parameters: {
       type: 'object',
       properties: {
@@ -1015,8 +1015,14 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'open_pr',
     description:
-      'Do agents ONLY. Open (or refresh) this task\'s pull request and send its exact committed proposal to Review. Call this only as your final action after the requested work is truly complete, all intended files are committed, unwanted files are ignored or removed, and relevant tests pass. Ending a turn or asking a human for input does not open a PR.',
-    parameters: { type: 'object', properties: {} },
+      'Do agents ONLY. Open (or refresh) this task\'s pull request and send its exact committed proposal to Review. Call this only as your final action after the requested work is truly complete, all intended files are committed, unwanted files are ignored or removed, and relevant tests pass. Ending a turn or asking a human for input does not open a PR. In a task split into several branches (create_branch), name `branches` to propose only those: end your turn, and you are resumed at once to keep working while they are reviewed and land on their own.',
+    parameters: {
+      type: 'object',
+      properties: {
+        branches: { type: 'array', items: { type: 'string' }, description: 'Several-branch tasks only: the checkout names to propose (default: every branch with work not yet landed).' },
+        final: { type: 'boolean', description: 'Several-branch tasks only: this proposal completes the task, which finishes once everything proposed has landed. Default: true when branches is omitted, else false.' },
+      },
+    },
   },
   {
     name: 'signal_completion',
@@ -1732,9 +1738,14 @@ export function platformToolHandlers(
       await ctx.signalCompletion(args?.summary ? String(args.summary) : undefined);
       return 'completion recorded';
     },
-    async open_pr() {
-      await ctx.openPr();
-      return 'pull request requested; finish this turn now';
+    async open_pr(args) {
+      const branches = Array.isArray(args?.branches) ? args.branches.map(String).filter(Boolean) : undefined;
+      const final = typeof args?.final === 'boolean' ? args.final : undefined;
+      await ctx.openPr(branches?.length || final !== undefined
+        ? { ...(branches?.length ? { branches } : {}), ...(final !== undefined ? { final } : {}) } : undefined);
+      return branches?.length && final !== true
+        ? `${branches.join(', ')} will be proposed when this turn ends; finish this turn now, and you will be resumed to keep working`
+        : 'pull request requested; finish this turn now';
     },
     async resolve_decision(args) {
       const t = parseTransition(args);

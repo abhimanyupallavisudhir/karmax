@@ -9,7 +9,7 @@ import { validGitBranch } from '../util/git-ref.js';
 import os from 'node:os';
 import path from 'node:path';
 import type { World, WorldGitIdentity, WorldRepo } from './types.js';
-import { sharesHostRefDatabase, worldRepos, worldRepoSource, worldRepoTarget } from './types.js';
+import { orderCheckouts, sharesHostRefDatabase, worldRepos, worldRepoSource, worldRepoTarget } from './types.js';
 import { ensureIdentity, git, isGitRepo } from './git.js';
 import { finalizeMergeRepo, scratchWorktreeHome, type MergeResult } from './merge.js';
 import { materializeGitCredential, type GitCredential } from './git-credential.js';
@@ -616,9 +616,11 @@ export async function brokerFinalizeMerge(
   target: string,
   identity: WorldGitIdentity | undefined,
   auth: GitBrokerAuth,
+  only?: string[],
 ): Promise<MergeResult> {
-  const repos = worldRepos(world.handle);
-  if (!repos.length) return { merged: false, landedFiles: [], note: 'cloud scratch world has no remote repository' };
+  const all = worldRepos(world.handle);
+  const repos = orderCheckouts(all).filter((repo) => !only || only.includes(repo.name));
+  if (!all.length) return { merged: false, landedFiles: [], note: 'cloud scratch world has no remote repository' };
   if (!validGitBranch(target)) throw new Error(`invalid target branch "${target}"`);
   const landedFiles: string[] = [];
   let sha: string | undefined;

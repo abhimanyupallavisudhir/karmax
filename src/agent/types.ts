@@ -1,4 +1,5 @@
-import { AgentActivity, AgentProfile, AgentRole, AgentWait, Message, Provider, ReviewInfo, SubTaskRequest, SubTaskResponse, RaiseToParent, ConfirmDecision } from '../domain/types.js';
+import { AgentActivity, AgentProfile, AgentRole, AgentWait, Message, OpenPrProposal, Provider, ReviewInfo, SubTaskRequest, SubTaskResponse, RaiseToParent, ConfirmDecision } from '../domain/types.js';
+export type { OpenPrProposal } from '../domain/types.js';
 import type { Transition } from '../resolve/transitions.js';
 import { World } from '../world/types.js';
 
@@ -12,8 +13,10 @@ import { World } from '../world/types.js';
 export interface PlatformToolContext {
   /** Do-agent ONLY: declare that the completed, committed proposal is ready to
    *  publish and enter Review. This is deliberately distinct from merely ending
-   *  a model turn or asking a human for input. */
-  openPr(): void | Promise<void>;
+   *  a model turn or asking a human for input. A multi-PR task (software-dev
+   *  ≥1.30) may propose only some `branches`, and says with `final` whether the
+   *  proposal completes the task. */
+  openPr(proposal?: OpenPrProposal): void | Promise<void>;
   /** Optional structured completion summary; provider terminal success is authoritative. */
   signalCompletion(summary?: string): void | Promise<void>;
   /** Optionally attach terse, click-to-verify actions/outputs for the Review stage. */
@@ -205,6 +208,8 @@ export interface TurnResult {
   completed: boolean;
   /** The Do agent explicitly requested the PR/Review cycle. */
   openPrRequested?: boolean;
+  /** What it proposed, when it named branches or said whether it is final. */
+  openPrProposal?: OpenPrProposal;
   output: string;
   usage?: AdapterTurn['usage'];
   /** Provider timeline item carrying `output`, when the adapter emitted one. */

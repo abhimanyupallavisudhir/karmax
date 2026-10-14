@@ -895,6 +895,43 @@ export interface TaskCheckout {
   /** Name of the sibling checkout this one is stacked on, if any. */
   stackedOn?: string;
   pr?: TaskPullRequest;
+  /** Software-dev ≥1.30: where this branch is in its own Review → landing
+   *  lifecycle (SPEC §11.1). Absent on older versions, whose task-wide stage
+   *  says it for every branch at once. */
+  state?: BranchState;
+  /** The head the branch was proposed at — what an approval binds to. */
+  proposedHead?: string;
+  /** The commit it landed as. */
+  landedSha?: string;
+}
+
+/** A multi-PR branch's own lifecycle (software-dev ≥1.30): `working` (not
+ * proposed), `review` (proposed, waiting for approval), `approved` (lands at
+ * the agent's next pause), `landing`, `landed`. */
+export type BranchState = 'working' | 'review' | 'approved' | 'landing' | 'landed';
+
+/** What a multi-PR task (software-dev ≥1.30) remembers about its branches
+ * across turns, continue-as-new and replacement runs. Keyed by checkout name. */
+export interface BranchLedger {
+  /** Proposed for Review and not landed since: the head each was proposed at. */
+  proposed: Record<string, string>;
+  /** Landed: the commit each landed as. */
+  landed: Record<string, string>;
+  /** The agent's last proposal said it completes the task: the task finishes
+   * once nothing proposed is left to land. A person's follow-up clears it. */
+  finish?: boolean;
+  /** Approved branches a landing sent back for a mechanical repair with the
+   * approval intact: proposed again, they are approved again. */
+  repairing?: string[];
+}
+
+/** A multi-PR `open_pr` (software-dev ≥1.30): which branches, by checkout
+ * name (default: every branch with work not yet landed), and whether this
+ * proposal completes the task (default: true when no branches are named;
+ * naming branches keeps what the agent last said). */
+export interface OpenPrProposal {
+  branches?: string[];
+  final?: boolean;
 }
 
 export interface TaskPullRequest {
@@ -1739,6 +1776,10 @@ export interface TaskView {
   /** Every branch this task is opening a pull request for (SPEC §11.1). Present
    *  only for a multi-PR task; a single-branch task keeps `branch`/`prs` alone. */
   checkouts?: TaskCheckout[];
+  /** Software-dev ≥1.30 multi-PR: who may approve a proposed branch. Present
+   *  while a branch waits for Review, which no longer parks the agent, so an
+   *  approval can arrive while the task waits on something else. */
+  reviewAudience?: HumanAudience;
   /** `unreachable` distinguishes "the coordinator could not be queried" from
    *  the identical-looking "position -1 of an empty queue". */
   mergeQueue?: { position: number; total: number; unreachable?: boolean };
@@ -1942,6 +1983,8 @@ export interface TaskRecoveryCheckpoint {
   checkoutApprovals?: Record<string, string>;
   /** Landing state carried across replacement executions and manual stage moves. */
   landing?: TaskLandingState;
+  /** Software-dev ≥1.30 multi-PR: each branch's proposal and landing. */
+  branches?: BranchLedger;
   /** The preserved intent-authorized proposal changed in Do and needs an
    * automatic integration review before provider re-admission. */
   repairValidationPending?: boolean;
@@ -1992,6 +2035,8 @@ export interface TaskContinuation {
     commandRan?: boolean;
     /** v1.29: it finished cleanly with nothing to review. */
     commandUnchanged?: boolean;
+    /** v1.30 multi-PR: back from Landing, the next run decides before a turn. */
+    branchIdle?: boolean;
     resourcesApplied: boolean;
   };
   manualPrConfirmer?: string;

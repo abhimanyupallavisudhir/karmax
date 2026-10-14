@@ -3,6 +3,7 @@ import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput, TurnResult }
 import type { Transition } from '../resolve/transitions.js';
 import { assertReviewInfoTotal, validateReviewInfoCall } from './review-info.js';
 import { AgentActivity, AgentWait, Provider, ReviewInfo, SubTaskRequest, SubTaskResponse, RaiseToParent, ConfirmDecision } from '../domain/types.js';
+import { combineProposals } from '../domain/checkouts.js';
 import { jobStatuses } from '../world/jobs.js';
 import { BRAND } from '../domain/brand.js';
 import { formatMinorUnits } from '../util/currency.js';
@@ -32,6 +33,7 @@ export function spendReviewSummary(outcome: { status: string; reason?: string; s
 export interface TurnJournal {
   completed?: boolean;
   openPrRequested?: boolean;
+  openPrProposal?: import('./types.js').OpenPrProposal;
   reviewInfo?: ReviewInfo;
   resolution?: Transition;
   confirmDecision?: ConfirmDecision;
@@ -196,6 +198,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
   const restored = deps.journal?.restored ?? {};
   let completed = restored.completed ?? false;
   let openPrRequested = restored.openPrRequested ?? false;
+  let openPrProposal = restored.openPrProposal;
   let reviewInfo: ReviewInfo | undefined = restored.reviewInfo;
   let reviewPublication = Promise.resolve();
   let resolution: Transition | undefined = restored.resolution;
@@ -221,6 +224,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     if (!deps.journal) return Promise.resolve();
     const snapshot: TurnJournal = {
       ...(completed ? { completed } : {}), ...(openPrRequested ? { openPrRequested } : {}),
+      ...(openPrProposal ? { openPrProposal } : {}),
       ...(reviewInfo ? { reviewInfo } : {}), ...(resolution ? { resolution } : {}),
       ...(confirmDecision ? { confirmDecision } : {}), ...(raise ? { raise } : {}),
       ...(waitForSubtasks ? { waitForSubtasks } : {}),
@@ -265,8 +269,11 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
   }); });
 
   const ctx: PlatformToolContext = {
-    openPr() {
+    openPr(proposal) {
       if (input.role !== 'do') throw new Error('open_pr is available only to the Do agent');
+      // Calls in one turn add up: every branch named is proposed, a call naming
+      // none proposes everything, and the last word on `final` stands.
+      openPrProposal = combineProposals(openPrRequested ? openPrProposal ?? {} : undefined, proposal ?? {});
       openPrRequested = true;
       completed = true;
       return journal();
@@ -493,6 +500,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     providerTermination: turn.termination,
     completed,
     ...(openPrRequested ? { openPrRequested: true } : {}),
+    ...(openPrProposal ? { openPrProposal } : {}),
     output: turn.output,
     usage: turn.usage,
     delivered: turn.delivered,

@@ -58,7 +58,7 @@ const TOOLS_PREAMBLE = `You are running inside ${BRAND}, an agent-orchestration 
 - follow_events(taskId, type?, source?, subject?, where?, once?) / unfollow_events(taskId, followId?): matching project events reach the task's conversation as messages. To wait for an event, follow it with once: true and pause; the message ends the pause. A run started by an event already follows its subject (an issue's comments, a chat thread's replies).
 - list_events(taskId?, since?) and describe_platform(): inspect ${BRAND} event/diagnostic context and discover the automation surface.
 - platform_request(method, path, body?): call any authenticated /api operation not covered by a dedicated tool. Your task-scoped KARMAX_TOKEN is enforced by ${BRAND} for every request; this is the complete escape hatch for projects, users, authorization, credentials, payments, settings, review actions, and future UI operations.
-- open_pr(): Do agents only. Open or refresh the task's pull request and send that exact committed proposal to Review. Call it only when the requested work is truly complete, the worktree is clean, intended changes are committed, and relevant tests pass. This is the final action of a completed Do turn.
+- open_pr(branches?, final?): Do agents only. Open or refresh the task's pull request and send that exact committed proposal to Review. Call it only when the requested work is truly complete, the worktree is clean, intended changes are committed, and relevant tests pass. This is the final action of a completed Do turn. branches and final apply only to a task split into several branches (create_branch).
 - confirm_decision(action, text?): use only when the workflow explicitly asks this turn to review or verify an already-open exact candidate. A final Do-agent integration verification uses this tool instead of open_pr and must not edit the proposal in that verification turn.
 - my_authorization(method?, path?): what your authorization covers, and whether one platform_request would be allowed without making it. Check it before attempting something you may lack or asking a person to do something for you: do what it covers yourself, and ask for what it lacks with request_permission(capabilities, projectIds?, reason).
 - notify(to, message, urgency?): tell or call people and this task's agents without ending your turn. People are notified now; agents (agent:do, agent:responder, agent:confirm, agent:agent-<n>) are called when your turn ends; its agents argument calls new ones in (e.g. a fork of another task's agent). Messages from other people and agents in this task reach you labelled with who said them. Your final response is posted in the conversation: answer there whatever you were just asked, even when you then pause. It alerts nobody unless your task then waits on someone (a question, Review). Notify a person only when you need them to do something; never for updates on your work.
@@ -100,6 +100,8 @@ export interface AssembleArgs {
   moveTo?: string;
   /** Extra bindings for non-do roles (error, stage, transcript, reviewInfo, skills). */
   bindings?: Record<string, string>;
+  /** Software-dev ≥1.30 multi-PR task: each branch is proposed and lands on its own. */
+  branchLifecycle?: boolean;
 }
 
 const AGENT_AUTHORED_BINDINGS = ['transcript', 'reviewInfo', 'changedFiles', 'error'] as const;
@@ -128,7 +130,7 @@ Git ancestry for recovered, forked, or retargeted work: "recorded base" is the i
     title: args.task.title,
     prompt: args.task.prompt,
     worldPath: worldWorkingDirectory(args.world),
-    worldRepos: [describeRepos(args.world), describeEnvironment(args.world), describeComputer(args.world, args.task.taskId, args.computer, args.disk, args.limits, args.providers, args.moveTo),
+    worldRepos: [describeRepos(args.world), args.role === 'do' && args.branchLifecycle ? BRANCH_LIFECYCLE : '', describeEnvironment(args.world), describeComputer(args.world, args.task.taskId, args.computer, args.disk, args.limits, args.providers, args.moveTo),
       describeData(args.world)].filter(Boolean).join('\n'),
     branch: args.world.branch,
     base: args.world.base,
@@ -295,9 +297,14 @@ function gigabytes(bytes: number): string {
 function describeRepos(world: WorldHandle): string {
   const repos = worldRepos(world);
   if (repos.length <= 1) return '';
-  const lines = repos.map((r) => `- ${r.root}/ — checkout of ${r.repo}${r.role === 'project-wiki' ? ' (project wiki)' : ''}`).join('\n');
-  return (
-    `This world spans ${repos.length} repositories inside the world boundary ${world.root} ` +
-    `(all on branch ${world.branch}). Use these checkout paths for repository-specific work:\n${lines}`
-  );
+  // A multi-PR world holds several branches; name each where they differ.
+  const oneBranch = repos.every((r) => r.branch === world.branch);
+  const lines = repos.map((r) => `- ${r.root}/ — checkout of ${r.repo}${r.role === 'project-wiki' ? ' (project wiki)' : ''}`
+    + `${oneBranch ? '' : ` on branch ${r.branch} (checkout name "${r.name}")`}`).join('\n');
+  const spans = oneBranch ? `${repos.length} repositories inside the world boundary ${world.root} (all on branch ${world.branch})`
+    : `${repos.length} checkouts inside the world boundary ${world.root}`;
+  return `This world spans ${spans}. Use these checkout paths for repository-specific work:\n${lines}`;
 }
+
+/** Software-dev ≥1.30 multi-PR: how the agent's branches reach Review and land. */
+const BRANCH_LIFECYCLE = `This task may split its change into several branches, each its own pull request: create_branch adds one beside your checkout. When a branch is finished, committed and verified, propose it with open_pr(branches: [name]) and end your turn: you are resumed at once to keep working while it is reviewed, and it lands as soon as it is approved and you pause. With your last proposal, pass final: true (or call open_pr() with no branches to propose all of them): the task then finishes once everything proposed has landed. A branch you change after proposing it must be proposed again.`;

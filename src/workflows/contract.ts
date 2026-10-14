@@ -43,6 +43,8 @@ export type {
   UpstreamProposal,
   TaskLandingState,
   TaskCheckout,
+  BranchLedger,
+  OpenPrProposal,
   WorldHandleRef,
 } from '../domain/types.js';
 
@@ -50,7 +52,7 @@ export type {
 export { mergeQueueDomains, remotePolicyOf, landingAuthorityOf, samePosition, MERGE_POLL } from '../domain/types.js';
 // Multi-PR Review bookkeeping (SPEC §11.1) and the world's checkout list. Both
 // are pure data transforms over the handle, so they are sandbox-safe too.
-export { reviewCheckouts, allCheckoutsApproved, approveAll } from '../domain/checkouts.js';
+export { reviewCheckouts, allCheckoutsApproved, approveAll, approveProposed, movedSinceProposal, landableBranches, combineProposals } from '../domain/checkouts.js';
 export type { CheckoutApprovals } from '../domain/checkouts.js';
 export { worldRepos } from '../world/types.js';
 import { worldRepos } from '../world/types.js';
