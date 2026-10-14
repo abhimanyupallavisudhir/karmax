@@ -245,6 +245,8 @@ eval(extractFn('conversationFullscreenButton'));
 eval(extractFn('conversationPane'));
 eval(extractFn('liveOutputFor'));
 eval(extractFn('forkBranchDefaults'));
+eval(extractFn('taskRecord'));
+eval(`async ${extractFn('loadTaskRecord')}`);
 eval(extractFn('wireCheckinSidebar'));
 eval(extractFn('wireStopAgents'));
 global.conversationApprovalRequests = () => '<div>Pending approvals</div>';
@@ -252,8 +254,14 @@ global.liveRoleFor = () => 'do';
 global.taskTranscripts = () => [{ role: 'do' }];
 global.localWorldPath = () => false;
 global.conversationPresence = () => ({ tone: 'muted', label: 'Finished' });
-global.openTaskForm = (...args) => { global.openedForkForm = args; };
+const openedForkForms = [];
+global.openTaskForm = (...args) => { openedForkForms.push(args); };
 const forkView = { taskId: 'source-task', status: 'done', branch: 'tavya/source-task', targetBranch: 'release', actions: [] };
+// The source is archived (not in the task list): its record comes from its attempt group.
+global.api = async (url) => url === '/api/tasks/source-task/attempts'
+  ? { attempts: [{ id: 'source-task', projectId: 'p1', params: {}, lastView: { ...forkView } }] } : null;
+S.sessions = { do: { provider: 'claude' } };
+const forkClicks = [];
 for (const status of ['done', 'cancelled', 'waiting']) {
   forkView.status = status;
   for (const role of ['do', 'merge', 'confirm', 'resolve']) {
@@ -267,15 +275,24 @@ for (const status of ['done', 'cancelled', 'waiting']) {
         ? { addEventListener: (_type, handler) => { click = handler; } }
         : null;
     wireCheckinSidebar(forkView);
-    click({ currentTarget: { dataset: { role } } });
-    const [workflow, draft, prompt, params] = global.openedForkForm;
-    ok(workflow === 'software-dev' && !draft && !prompt
-      && params['agent:do'].resumeFrom.taskId === 'source-task'
-      && params['agent:do'].resumeFrom.role === role
-      && params.base === (status === 'done' ? 'release' : 'tavya/source-task'),
-      `${status} ${role} fork opens a new task form with the correct source, branch and an empty next instruction`);
+    forkClicks.push(click({ currentTarget: { dataset: { role } } }));
   }
 }
+// The click first resolves the source's record, so each form opens a moment later.
+const forkFormsChecked = Promise.all(forkClicks).then(() => {
+  ok(openedForkForms.length === 12, 'every fork click opens the task form');
+  for (const [workflow, draft, prompt, params, opts] of openedForkForms) {
+    const { role } = params['agent:do'].resumeFrom;
+    const status = opts?.fork?.task?.lastView?.status;
+    ok(workflow === 'software-dev' && !draft && !prompt
+      && params['agent:do'].resumeFrom.taskId === 'source-task'
+      && params.base === (status === 'done' ? 'release' : 'tavya/source-task'),
+      `${status} ${role} fork opens a new task form with the correct source, branch and an empty next instruction`);
+    ok(opts.fork.task.id === 'source-task' && opts.fork.resumeFrom === params['agent:do'].resumeFrom
+      && opts.fork.session === S.sessions[role],
+      `${status} ${role} fork picks its archived source the way the form's picker does`);
+  }
+});
 ok(!conversationPane(forkView, null).includes('fork-task-agent'), 'missing conversations have no fork action');
 const keyTranscript = { role: 'do', messages: [] };
 S.taskEvents = [{ seq: 900, ts: 1710000001000, type: 'agent.activity', payload: {
@@ -404,5 +421,7 @@ ok(conversationPane({ ...revisionView, status: 'active', waitingFor: undefined }
   .indexOf('Choose a deployment target.') < conversationPane({ ...revisionView, status: 'active', waitingFor: undefined }, laterTranscript)
   .indexOf('Later follow-up'), 'resolved revision-stamped request survives a bounded history reload in order');
 
-console.log(`\n${pass} passed, ${fail} failed`);
-process.exit(fail ? 1 : 0);
+forkFormsChecked.then(() => {
+  console.log(`\n${pass} passed, ${fail} failed`);
+  process.exit(fail ? 1 : 0);
+});
