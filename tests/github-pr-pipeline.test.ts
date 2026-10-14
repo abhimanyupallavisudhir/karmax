@@ -554,7 +554,7 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     // Both pull requests open, each from its own sub-task's branch.
     await expect.poll(() => prs.length, { timeout: 30_000 }).toBe(2);
     await expect.poll(async () => (await view(handle)).subTasks?.length ?? 0, { timeout: 30_000 }).toBe(2);
-    const [docs, core] = (await view(handle)).subTasks as string[];
+    const [docs, core] = (await view(handle)).subTasks as [string, string];
     expect(prs.map((pr) => pr.head.ref).sort()).toEqual([`tavya/${docs}`, `tavya/${core}`].sort());
     const reviewing = async (id: string) => {
       const child = h.client.workflow.getHandle(id);
