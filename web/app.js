@@ -5606,10 +5606,10 @@ function renderRail() {
     rail.querySelectorAll('.proj, .rail-search-empty').forEach((row) => row.remove());
     $('#rail-projects-end').insertAdjacentHTML('beforebegin', railProjectRows(projectScoped));
   } else rail.innerHTML = `
-    <div class="label rail-heading"><span title="${esc(commandHint('Focus projects', 'nav.projects'))}">Projects</span><button class="rail-add" id="new-project" type="button" data-shortcut="nav.projects rail.newProject" title="${esc(commandHint('New project', 'nav.projects', 'n'))}" aria-label="New project">${ICON.plus}</button></div>
+    <div class="label rail-heading"><span title="${esc(commandHint('Focus projects', 'nav.projects'))}">Projects</span><button class="rail-add" id="new-project" type="button" data-shortcut="nav.newProject" title="${esc(commandHint('New project', 'nav.newProject'))}" aria-label="New project">${ICON.plus}</button></div>
     <label class="rail-search-box">
       <svg class="rail-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4.5 4.5"/></svg>
-    <input id="project-search" class="rail-search" type="search" data-shortcut="nav.projects rail.search" aria-label="Search projects" placeholder="Search projects…" title="${esc(commandHint('Search projects', 'nav.projects', '/'))}" value="${esc(S.projectSearch || '')}" autocomplete="off" spellcheck="false">
+    <input id="project-search" class="rail-search" type="search" data-shortcut="nav.searchProjects" aria-label="Search projects" placeholder="Search projects…" title="${esc(commandHint('Search projects', 'nav.searchProjects'))}" value="${esc(S.projectSearch || '')}" autocomplete="off" spellcheck="false">
     </label>
     ${railProjectRows(projectScoped)}
     <div class="grow" id="rail-projects-end"></div>`;
@@ -21856,11 +21856,10 @@ function fmtKeys(binding) {
     .map((s) => `${s.ctrl ? 'Ctrl+' : ''}${s.alt ? (mac ? '⌥' : 'Alt+') : ''}${s.meta ? (mac ? '⌘' : 'Ctrl+') : ''}${s.shift ? '⇧' : ''}${NAME[s.key] || s.key}`)
     .join(' ');
 }
-function commandHint(label, id, next) {
+function commandHint(label, id) {
   const declared = (S.contributions?.commands || []).find((command) => command.id === id);
   const binding = declared ? declared.keybinding : HOST_COMMANDS.find((command) => command.id === id)?.key;
-  const keys = [binding && fmtKeys(binding), next].filter(Boolean).join(' → ');
-  return keys ? `${label} (${keys})` : label;
+  return binding ? `${label} (${fmtKeys(binding)})` : label;
 }
 // Subsequence fuzzy match: score (higher = better), or -1 for no match.
 function fuzzyScore(q, s) {
@@ -21895,6 +21894,8 @@ const HOST_COMMANDS = [
   { id: 'nav.orgwiki', title: 'Go to organization wiki', key: 'g W', run: () => go(globalRoute('orgwiki')) },
   { id: 'nav.global', title: 'Go to organization settings', key: 'g S', run: () => switchTab('global') },
   { id: 'nav.projects', title: 'Go to projects', key: 'g P', run: () => focusRail() },
+  { id: 'nav.newProject', title: 'New project', key: 'p n', group: 'Projects', run: () => newProject() },
+  { id: 'nav.searchProjects', title: 'Search projects', key: 'p /', group: 'Projects', run: () => { revealRail(); $('#project-search')?.focus(); } },
   { id: 'nav.profile', title: 'Go to your profile', key: 'g A', run: () => go(profileRoute()) },
   { id: 'nav.notifications', title: 'Go to inbox', key: 'g N', run: () => go(inboxRoute(DEFAULT_LIST_QUERY)) },
   { id: 'nav.close', title: 'Close panel', key: null, run: () => closeTopOverlay() }, // Esc — handled by the dispatcher
@@ -21906,14 +21907,12 @@ function allCommands() {
   const add = (c) => out.push({ available: true, ...c, keys: c.keybinding ? parseKeybinding(c.keybinding) : null });
   for (const h of HOST_COMMANDS) {
     const d = declared.get(h.id);
-    add({ id: h.id, title: d?.title || h.title, keybinding: d ? d.keybinding : h.key, group: 'Navigation', available: !(['nav.newTask', 'nav.search'].includes(h.id) && inRail()), run: h.run });
+    add({ id: h.id, title: d?.title || h.title, keybinding: d ? d.keybinding : h.key, group: h.group || 'Navigation', run: h.run });
   }
   // Interaction grammar (host-owned, not server-declared): a list cursor on the
   // tasks/queue views; with a task page open the same keys walk between tasks. When
   // focus sits in the projects rail (g p), the same keys walk the rail instead.
   const rail = inRail();
-  add({ id: 'rail.newProject', title: 'New project', keybinding: 'n', group: 'Projects', available: rail, run: () => newProject() });
-  add({ id: 'rail.search', title: 'Search projects', keybinding: '/', group: 'Projects', available: rail, run: () => $('#project-search')?.focus() });
   const listy = ['tasks', 'home', 'queue'].includes(S.tab) && !rail;
   add({ id: 'list.next', title: 'Next task / row', keybinding: 'j', group: 'List', palette: false, available: listy || (!rail && !!S.selected), run: () => (S.selected ? openAdjacentTask(1) : moveCursor(1)) });
   add({ id: 'list.prev', title: 'Previous task / row', keybinding: 'k', group: 'List', palette: false, available: listy || (!rail && !!S.selected), run: () => (S.selected ? openAdjacentTask(-1) : moveCursor(-1)) });
@@ -22106,6 +22105,13 @@ function railRows() {
   return [...document.querySelectorAll('#rail .rail-icon, #rail .rail-add, #project-search, #rail .project-link' + folders)];
 }
 function inRail() { return !!(document.activeElement && document.activeElement.closest && document.activeElement.closest('#rail')); }
+// Unfold a folded sidebar (or slide it over a phone's page) so it can take focus.
+function revealRail() {
+  if (!narrowViewport()) return railCollapsed() && setRailCollapsed(false);
+  $('#rail')?.classList.add('mobile-open');
+  $('#rail-scrim')?.classList.add('visible');
+  syncRailToggle();
+}
 function focusRail() {
   const rows = railRows();
   (rows.find((r) => r.dataset.project === S.projectId) || rows[0])?.focus();
@@ -22138,8 +22144,7 @@ function closeTopOverlay() {
 // its keys in the topbar for a moment, so the console teaches its own keyboard.
 // A chord prefix ('g') shows until the chord completes or lapses. The keys come
 // from the same registry as dispatch: clickable controls name their command in
-// `data-shortcut` (space-separated ids form a sequence: 'nav.projects
-// rail.newProject' is g P then n), or a raw binding in `data-keys`.
+// `data-shortcut` (its id), or a raw binding in `data-keys`.
 function echoKeys(keys, title = '', pending = false) {
   const el = $('#key-echo');
   if (!el) return;
@@ -22158,9 +22163,8 @@ function controlShortcut(control) {
     const keys = bound ? fmtKeys(bound.keybinding) : control.querySelector('.kbd')?.textContent;
     return keys ? { keys, title: control.dataset.label } : null;
   }
-  const steps = control.dataset.shortcut.split(' ').map((id) => cmds.find((c) => c.id === id));
-  if (!steps.every((c) => c?.keybinding)) return null;
-  return { keys: steps.map((c) => fmtKeys(c.keybinding)).join(' '), title: steps.at(-1).title };
+  const command = cmds.find((c) => c.id === control.dataset.shortcut);
+  return command?.keybinding ? { keys: fmtKeys(command.keybinding), title: command.title } : null;
 }
 function echoClickedShortcut(e) {
   // Clicks a command fires itself (digits press action buttons) are untrusted;
