@@ -129,14 +129,19 @@ export class RunnerPoolService {
   /** Repair reservations whose activity owner disappeared before it could
    * publish or release them. Terminal tasks own no workflow capacity. Likewise,
    * a parked/hibernated/released world cannot own an old active reservation: a
-   * genuine wake-up has a short grace period in which to mark the world ready. */
+   * genuine wake-up has a short grace period in which to mark the world ready.
+   * And a running world's current generation names the one lease its setup
+   * took: a lease taken before that generation existed, which it does not name
+   * and nothing borrows, is a setup attempt that died with its worker (a
+   * deploy). Left active it reads as another user of the world, which then
+   * never parks, so never moves to a new size (pramana#39). */
   async reconcileWorldLeases(now = Date.now()): Promise<number> {
     let released = 0;
     for (const lease of (await this.store.unreleasedWorldLeases())) {
       const task = (await this.store.taskMetadata(String(lease.taskId)));
       const world = (await this.store.currentWorld(String(lease.worldId)));
-      const worldState = (await this.store.worldState(String(lease.worldId)));
-      const passiveWorld = ['parked', 'hibernated', 'released'].includes(worldState ?? '');
+      const snapshot = (await this.store.worldStateSnapshot(String(lease.worldId)));
+      const passiveWorld = ['parked', 'hibernated', 'released'].includes(snapshot?.state ?? '');
       const terminal = !task || ['done', 'cancelled', 'failed'].includes(task.lastView?.status ?? 'active');
       const stale = Number(lease.acquiredAt ?? lease.createdAt) <= now - STALE_PARKED_LEASE_MS;
       const borrowed = (await this.store.worldLeaseHasLiveAccessor(String(lease.id), now));
@@ -146,7 +151,12 @@ export class RunnerPoolService {
         && passiveWorld
         && stale
         && !borrowed;
-      if (!terminalWorkflowLease && !stalePassiveLease) continue;
+      const deadSetupLease = !!world && !!snapshot
+        && world.meta?.worldLeaseId !== lease.id
+        && Number(lease.createdAt) < snapshot.createdAt
+        && stale
+        && !borrowed;
+      if (!terminalWorkflowLease && !stalePassiveLease && !deadSetupLease) continue;
       // Reconciliation fixes an internal reservation leak; it must not bill the
       // tenant for wall time in which the provider world was already parked.
       (await this.store.releaseWorldLease(String(lease.id)));
