@@ -2198,7 +2198,7 @@ function showForkWorldHelp(root) {
 // (wireResumeReauthorization), since only a form with Authorization / Vault
 // credentials controls can honour it.
 function resumeChosenInner(rf, task) {
-  const t = task || (S.tasks || []).find((x) => x.id === rf.taskId);
+  const t = task || taskRecord(rf.taskId);
   const source = agentRoleLabel(rf.role).toLowerCase();
   const ref = `${t?.num != null ? `#${t.num} ` : ''}${t ? t.title : rf.taskId}`;
   const link = t && projectById(t.projectId)
@@ -2225,6 +2225,15 @@ function previousTaskGrants(task) {
       .filter((c) => c.startsWith('use-credential:item:')).map((c) => c.slice('use-credential:item:'.length)),
     credentialPolicies: JSON.parse(JSON.stringify(stored.credentialPolicies || {})),
   };
+}
+// A task's record, also when the task list does not hold it: the list has only
+// active tasks, while a finished (archived) task is the one most often forked or
+// waited on. Its attempt group carries its record either way.
+async function loadTaskRecord(taskId) {
+  const known = taskRecord(taskId);
+  if (known) return known;
+  const group = await api(`/api/tasks/${encodeURIComponent(taskId)}/attempts`).catch(() => null);
+  return group?.attempts?.find((attempt) => attempt.id === taskId) || null;
 }
 function previousGrantsSummary(task) {
   const grants = previousTaskGrants(task);
@@ -3217,7 +3226,7 @@ function wireAgentBox(box) {
     try {
       const rf = JSON.parse(chosen?.dataset.resume || 'null');
       if (!rf?.taskId) return null;
-      return chosen._sourceTask?.id === rf.taskId ? chosen._sourceTask : (S.tasks || []).find((x) => x.id === rf.taskId);
+      return chosen._sourceTask?.id === rf.taskId ? chosen._sourceTask : taskRecord(rf.taskId);
     } catch { return null; }
   };
   const announceReauthorize = (on) => {
@@ -3378,6 +3387,18 @@ function wireAgentBox(box) {
     } catch (error) {
       toast(error.message, true);
     }
+  });
+  // The Fork button picks its source the way the picker does.
+  box._pickResume = setResume;
+  // A stored source (a reopened draft, the Parameters view) that is not in the
+  // task list is fetched, so its chip names it and offers its options.
+  const stored = chosen?.dataset.resume;
+  const storedId = (() => { try { return JSON.parse(stored || 'null')?.taskId; } catch { return undefined; } })();
+  if (storedId && !sourceTask()) loadTaskRecord(storedId).then((task) => {
+    if (!task || signal.aborted || chosen.dataset.resume !== stored) return;
+    chosen._sourceTask = task;
+    chosen.innerHTML = resumeChosenInner(JSON.parse(stored), task);
+    syncForkState();
   });
   syncForkState();
   syncAvatar();
@@ -7428,14 +7449,25 @@ function wireDepPicker(values, selfId) {
   const btn = $('#dep-add');
   if (!box || !btn) return;
   const known = new Map(); // tasks picked from the overlay that S.tasks may not hold yet
-  const taskById = (id) => known.get(id) || (S.tasks || []).find((t) => t.id === id) || { id, title: id };
+  const taskById = (id) => known.get(id) || taskRecord(id);
+  // A dependency the task list does not hold (an archived one) is fetched once,
+  // so its chip names it.
+  const requested = new Set();
+  const resolve = (ids) => ids.filter((id) => !taskById(id) && !requested.has(id)).forEach((id) => {
+    requested.add(id);
+    loadTaskRecord(id).then((task) => {
+      if (!task || !box.isConnected) return;
+      known.set(id, task);
+      if (selectedDepIds().includes(id)) paint(selectedDepIds());
+    });
+  });
   const root = box.closest('#tf-body');
   // The task the do agent forks from, if any (an archived one only rides on the chip).
   const forkSource = () => {
     const chosen = root?.querySelector('.agent-field[data-agent="do"] .af-resume-chosen, .agent-field[data-agent="unified"] .af-resume-chosen');
     const id = (() => { try { return JSON.parse(chosen?.dataset.resume || 'null')?.taskId; } catch { return undefined; } })();
     if (!id || id === selfId) return null;
-    return chosen._sourceTask?.id === id ? chosen._sourceTask : known.get(id) || (S.tasks || []).find((t) => t.id === id) || null;
+    return chosen._sourceTask?.id === id ? chosen._sourceTask : known.get(id) || taskRecord(id) || null;
   };
   const paint = (ids, changed) => {
     if (changed) {
@@ -7443,7 +7475,8 @@ function wireDepPicker(values, selfId) {
       const source = forkSource();
       if (source && before.includes(source.id) !== ids.includes(source.id)) retargetForkBase(root, source, ids.includes(source.id));
     }
-    box.innerHTML = ids.map((id) => dependencyChipHtml(taskById(id))).join('');
+    box.innerHTML = ids.map((id) => dependencyChipHtml(taskById(id) || { id, title: id })).join('');
+    resolve(ids);
     box.querySelectorAll('[data-depx]').forEach((b) => (b.onclick = (e) => { e.preventDefault(); paint(selectedDepIds().filter((x) => x !== b.dataset.depx), true); }));
     if (changed) box.dispatchEvent(new Event('change', { bubbles: true })); // the form's auto-save listens for change
   };
@@ -8202,6 +8235,26 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   }
   $('#tf-body').addEventListener('input', autoSaveSoon);
   $('#tf-body').addEventListener('change', autoSaveSoon);
+  // The Fork button: the source is picked as in the form (its grants, waiting
+  // for it), and that is what the form opened with — not yet worth a draft.
+  if (opts?.fork) {
+    const forkBox = $('#tf-body').querySelector('.agent-field[data-agent="do"], .agent-field[data-agent="unified"]');
+    forkBox?._pickResume?.(opts.fork.resumeFrom, opts.fork.task, opts.fork.session);
+    clearTimeout(saveTimer);
+    lastSaved = stateSig(formState());
+    $('#tf-savestate').textContent = '';
+  }
+  // The payments row fills in its inherited policy once the cards load; that is
+  // not an edit either, so an untouched form stays untouched.
+  const openedSignature = lastSaved;
+  if (openedSignature) mainPaymentsReady.then(() => {
+    if (activeFormToken !== formToken || lastSaved !== openedSignature) return;
+    try {
+      const st = formState();
+      const { paymentPolicy: _paymentPolicy, ...body } = st.body;
+      if (stateSig({ ...st, body }) === openedSignature) lastSaved = stateSig(st);
+    } catch {}
+  });
 
   // ── Priority + tags editor (organization; never sent to the agent) ──────────
   // IMPORTANT: this is ONE of TWO places the tag/priority editor lives — here in the full
@@ -11621,11 +11674,13 @@ function wireCheckinSidebar(v) {
   $('#main').querySelectorAll('.escalate-request').forEach((el) => el.addEventListener('click', () => openEscalateDialog(v)));
   $('#conversation-fullscreen')?.addEventListener('click', () => setConversationFullscreen(!S.conversationFullscreen));
   $('#share-task-conversation')?.addEventListener('click', event => openConversationShare(v, event.currentTarget.dataset.role));
-  $('#fork-task-agent')?.addEventListener('click', (event) => {
+  $('#fork-task-agent')?.addEventListener('click', async (event) => {
+    const resumeFrom = { taskId: v.taskId, role: event.currentTarget.dataset.role };
+    const task = await loadTaskRecord(v.taskId);
     openTaskForm('software-dev', undefined, undefined, {
-      ...forkBranchDefaults(v),
-      'agent:do': { resumeFrom: { taskId: v.taskId, role: event.currentTarget.dataset.role } },
-    });
+      ...forkBranchDefaults(task || v),
+      'agent:do': { resumeFrom },
+    }, task ? { fork: { resumeFrom, task, session: S.sessions?.[resumeFrom.role] } } : undefined);
   });
   $('#terminal-native')?.addEventListener('click', () => copyNativeAttachCommand(v));
   $('#main').querySelectorAll('.fork-local').forEach((button) => button.addEventListener('click', () => forkCloudSessionLocally(v, button)));
