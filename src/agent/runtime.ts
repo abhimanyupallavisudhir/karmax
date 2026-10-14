@@ -5,6 +5,7 @@ import { assertReviewInfoTotal, validateReviewInfoCall } from './review-info.js'
 import { AgentActivity, AgentWait, Provider, ReviewInfo, SubTaskRequest, SubTaskResponse, RaiseToParent, ConfirmDecision } from '../domain/types.js';
 import { jobStatuses } from '../world/jobs.js';
 import { removeCheckout } from '../world/checkout.js';
+import { worldRepos } from '../world/types.js';
 import { BRAND } from '../domain/brand.js';
 import { formatMinorUnits } from '../util/currency.js';
 
@@ -383,7 +384,12 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       const current = worldHandle ?? input.world.handle;
       // A retried turn asks again: the workflow answers a ship it already made.
       if (!deps.shipBranch) throw new Error('opening one branch\'s pull request is not available in this turn; finish with open_pr instead');
-      const outcome = await deps.shipBranch({ name, ...(title ? { title } : {}), handle: current });
+      const repos = worldRepos(current);
+      const checkout = repos.find((repo) => repo.name === name) ?? repos.find((repo) => repo.branch === name);
+      if (!checkout) throw new Error(`this task has no branch named "${name}"; its branches are ${repos.map((repo) => `"${repo.name}"`).join(', ')}`);
+      const head = await input.world.exec('git', ['rev-parse', 'HEAD'], { cwd: checkout.root });
+      if (head.code !== 0 || !head.stdout.trim()) throw new Error(`could not read the head of "${checkout.name}": ${head.stderr || head.stdout}`);
+      const outcome = await deps.shipBranch({ name: checkout.name, ...(title ? { title } : {}), head: head.stdout.trim(), handle: current });
       if (!outcome.ok) throw new Error(outcome.reason);
       worldHandle = await removeCheckout(input.world, outcome.checkout);
       if (!shipped.some((entry) => entry.childTaskId === outcome.childTaskId))

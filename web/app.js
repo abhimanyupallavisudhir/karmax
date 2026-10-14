@@ -10609,6 +10609,9 @@ function taskForkSourceIds(task) {
     for (const child of Object.values(value)) visit(child);
   };
   visit(task?.params);
+  // A shipped branch's task is listed as its parent's sub-task, not also as a fork.
+  const shippedFrom = task?.params?._shippedFrom?.taskId;
+  if (typeof shippedFrom === 'string') sources.delete(shippedFrom);
   return [...sources];
 }
 

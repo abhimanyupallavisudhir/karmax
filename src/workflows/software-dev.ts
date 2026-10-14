@@ -3555,8 +3555,9 @@ Inspect the complete current diff and specifically compare its delta from the re
       repos: [check.source], multiPr: false,
       confirm: { layers: softwareDevConfirmLayers },
       ...(liveResponder ? { responder: liveResponder } : {}),
-      // The agent that wrote the branch, forked, answers its Review.
-      ...(doSpec?.provider ? { 'agent:do': { ...doSpec, resumeFrom: { taskId, role: 'do' } } } : {}),
+      // The agent that wrote the branch answers its Review: prepareChildTask
+      // forks it (resolving its profile when the task names no provider).
+      ...(doSpec ? { 'agent:do': doSpec } : {}),
       _shippedFrom: { taskId, checkout: checkout.name },
     };
     const childInput = await childPreparation.prepareChildTask({

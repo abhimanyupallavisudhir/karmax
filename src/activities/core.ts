@@ -1580,6 +1580,18 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
    * writable project data saved for it to start from (prepareChildTask). */
   async function prepareChild(args: PrepareChildArgs, work: { checkContinue: () => Promise<void>;
     onProgress: (progress: ResourceSaveProgress) => void }): Promise<TaskInput> {
+    if (args.ship) {
+      // A shipped branch's Review is answered by the agent that wrote it: a fork
+      // of the parent's, with the parent's agent fields or, when it names none,
+      // the provider/model/effort its profile resolves to now.
+      const named = args.params?.['agent:do'];
+      const resolved = named?.provider ? named : await (async () => {
+        const profile = await profiles.resolve('do', args.profiles, undefined, args.projectId);
+        return { ...named, provider: profile.provider, ...(profile.model ? { model: profile.model } : {}),
+          ...(profile.effort ? { effort: profile.effort } : {}) };
+      })();
+      args = { ...args, params: { ...args.params, 'agent:do': { ...resolved, resumeFrom: { taskId: args.parentTaskId, role: 'do' } } } };
+    }
     const parent = (await store.getTask(args.parentTaskId));
     const currentProject = (await store.getProject(args.projectId));
     const project = currentProject ? (await store.effectiveProjectConfig(currentProject)) : args.project;
@@ -2580,8 +2592,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (spec.resumeFrom.taskId) {
           const source = (await store.getTask(spec.resumeFrom.taskId));
           const sourceOrganization = source ? (await store.getProject(source.projectId))?.organizationId ?? 'org_personal' : undefined;
+          // A shipped branch's task continues the agent of the task that shipped
+          // it (SPEC §11.1): the platform made that fork, under an authority
+          // attenuated from that task's own, so it needs no grant to read it.
+          const shippedFromSource = !!source && args.task.shippedFrom?.taskId === source.id && args.task.parentTaskId === source.id;
           const readable = !!source && sourceOrganization === organizationId
-            && (!deps.tokens || !token
+            && (!deps.tokens || !token || shippedFromSource
               || (await deps.tokens.check(token, 'task:conversation:read', { taskId: source.id })).ok);
           if (!readable) {
             (await record(args.taskId, 'session.fork-failed', { from: spec.resumeFrom, reason: 'source-not-authorized' }));
@@ -3318,7 +3334,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             const turnId = args.agentTurnId ?? legacyAgentTurnId ?? 'turn';
             try {
               return await deps.client!.workflow.getHandle(args.taskId).executeUpdate('shipBranch', {
-                args: [{ ...request, requestId: `${turnId}:${request.name}` }],
+                args: [{ ...request, requestId: `${turnId}:${request.name}:${request.head}` }],
               }) as import('../agent/runtime.js').ShipBranchOutcome;
             } catch (error) {
               return { ok: false as const, reason: `this task cannot open one branch's pull request on its own right now (${error instanceof Error ? error.message : String(error)}); finish with open_pr instead` };

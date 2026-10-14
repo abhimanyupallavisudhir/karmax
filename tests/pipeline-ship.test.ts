@@ -5,7 +5,6 @@ import path from 'node:path';
 import { bootHarness, type Harness } from './helpers/harness.js';
 import { TASK_QUEUE } from '../src/temporal/config.js';
 import { git } from '../src/world/git.js';
-import { newId } from '../src/util/id.js';
 
 /**
  * Several branches per task (SPEC §11.1): the agent may open a pull request for
@@ -21,14 +20,20 @@ describe('software-dev: shipping branches of a multi-branch task on their own', 
   afterAll(async () => { await h?.stop(); });
 
   const view = (handle: { query: (name: string) => Promise<unknown> }) => handle.query('view') as Promise<any>;
-  const start = (taskId: string, repo: string, prompt: string) => h.client.workflow.start('softwareDev@1.30.0', {
-    taskQueue: TASK_QUEUE,
-    workflowId: taskId,
-    args: [{
-      taskId, projectId: 'p1', title: 'Docs and a feature', prompt, base: 'main', target: 'main',
-      project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false, multiPr: true },
-    }],
-  });
+  // A task of a real project, so its shipped sub-tasks are made, routed and
+  // forked from records exactly as in the product.
+  const start = async (repo: string, prompt: string) => {
+    const config = { repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false, multiPr: true };
+    const project = await h.store.createProject(`Ship ${path.basename(repo)}`, config);
+    const task = await h.store.createTask({ projectId: project.id, title: 'Docs and a feature', workflow: 'software-dev',
+      workflowVersion: '1.30.0', params: { prompt, multiPr: true }, createdBy: { kind: 'user', userId: 'a' } });
+    const handle = await h.client.workflow.start('softwareDev@1.30.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: task.id,
+      args: [{ taskId: task.id, projectId: project.id, title: task.title, prompt, base: 'main', target: 'main', project: config }],
+    });
+    return { taskId: task.id, handle };
+  };
   const shippedChild = async (handle: any) => {
     await expect.poll(async () => (await view(handle)).subTasks?.length ?? 0, { timeout: 30_000 }).toBe(1);
     const childId = (await view(handle)).subTasks[0] as string;
@@ -40,8 +45,7 @@ describe('software-dev: shipping branches of a multi-branch task on their own', 
   it('a branch lands on its own while the agent keeps working, then the agent opens the rest', async () => {
     const repo = await h.makeRepo('ship-while-working');
     const gate = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'ship-gate-')), 'go');
-    const taskId = newId('task');
-    const handle = await start(taskId, repo, [
+    const { taskId, handle } = await start(repo, [
       '@branch docs',
       docsCommit,
       '@ship docs',
@@ -89,8 +93,7 @@ describe('software-dev: shipping branches of a multi-branch task on their own', 
 
   it('the final proposal does not wait for an earlier PR, but Done does', async () => {
     const repo = await h.makeRepo('ship-done-waits');
-    const taskId = newId('task');
-    const handle = await start(taskId, repo, [
+    const { handle } = await start(repo, [
       '@branch docs',
       docsCommit,
       '@ship docs',
@@ -118,8 +121,7 @@ describe('software-dev: shipping branches of a multi-branch task on their own', 
 
   it('with everything already shipped, finishing needs no Review of its own', async () => {
     const repo = await h.makeRepo('ship-everything');
-    const taskId = newId('task');
-    const handle = await start(taskId, repo, ['@branch docs', docsCommit, '@ship docs'].join('\n'));
+    const { taskId, handle } = await start(repo, ['@branch docs', docsCommit, '@ship docs'].join('\n'));
     const { child } = await shippedChild(handle);
     await expect.poll(async () => (await view(child)).stage, { timeout: 30_000 }).toBe('review');
     // The agent finished with nothing left to propose: it waits for its PR, not for a reviewer.
@@ -133,8 +135,7 @@ describe('software-dev: shipping branches of a multi-branch task on their own', 
 
   it('a reviewer\'s change request is made in the shipped branch, which then lands', async () => {
     const repo = await h.makeRepo('ship-revise');
-    const taskId = newId('task');
-    const handle = await start(taskId, repo, ['@branch docs', docsCommit, '@ship docs', '@incomplete'].join('\n'));
+    const { taskId, handle } = await start(repo, ['@branch docs', docsCommit, '@ship docs', '@incomplete'].join('\n'));
     const { child } = await shippedChild(handle);
     await expect.poll(async () => (await view(child)).waitingFor?.kind, { timeout: 30_000 }).toBe('human');
 
@@ -151,6 +152,15 @@ describe('software-dev: shipping branches of a multi-branch task on their own', 
       { timeout: 30_000 }).toBe('review/human');
     expect((await h.store.eventsOfType((await view(child)).taskId, 'agent.output'))
       .some((event) => String(event.payload.text).includes('HAS-GUIDE'))).toBe(true);
+    // The agent answering is a fork of the one that wrote the branch, though the
+    // task names no provider: it resolved its profile when the branch shipped.
+    const childTask = await h.store.getTask((await view(child)).taskId);
+    expect(childTask?.params['agent:do']).toMatchObject({ provider: 'mock', resumeFrom: { taskId, role: 'do' } });
+    expect((await h.store.eventsOfType(childTask!.id, 'session.forked'))
+      .some((event) => (event.payload as any).from?.taskId === taskId)).toBe(true);
+    // Each fact once: it is listed as the task's sub-task, not also as its fork.
+    expect(await h.store.forkTaskSummaries(taskId)).toEqual([]);
+    expect(await h.store.forkSourceTaskSummaries(childTask!.id)).toEqual([]);
     await child.signal('confirm');
     expect((await child.result()).stage).toBe('done');
     expect((await git(repo, ['show', 'main:docs/faq.md'])).code).toBe(0);
@@ -164,10 +174,32 @@ describe('software-dev: shipping branches of a multi-branch task on their own', 
     await handle.result();
   }, 150_000);
 
+  it('shipping a recreated branch again is refused aloud, never answered with the earlier PR', async () => {
+    const repo = await h.makeRepo('ship-again');
+    const { handle } = await start(repo, [
+      '@branch docs',
+      docsCommit,
+      '@ship docs',
+      // Same turn: the agent takes the branch name up again and adds to it.
+      '@branch docs',
+      "@run cd ../docs && echo more >> docs/guide.md && git commit -qam more",
+      '@ship docs',
+      '@incomplete',
+    ].join('\n'));
+    await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 30_000 }).toBe('human');
+    const said = (await view(handle)).messages.filter((m: any) => m.role === 'agent').map((m: any) => m.text).join('\n');
+    expect(said).toMatch(/shipped: docs as /);
+    expect(said).toMatch(/ship refused: the earlier pull request for "docs" .* has not landed yet/);
+    // One pull request, and the new work is still in the agent's world.
+    expect((await view(handle)).subTasks).toHaveLength(1);
+    expect((await view(handle)).checkouts.map((c: any) => c.name)).toContain('docs');
+    await handle.signal('cancel');
+    await handle.result();
+  }, 120_000);
+
   it('refuses what cannot land on its own, and tells the agent why', async () => {
     const repo = await h.makeRepo('ship-refusals');
-    const taskId = newId('task');
-    const handle = await start(taskId, repo, [
+    const { handle } = await start(repo, [
       '@branch docs',
       '@run cd ../docs && echo draft > draft.md',
       '@ship docs',                      // uncommitted work

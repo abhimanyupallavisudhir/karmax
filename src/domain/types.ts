@@ -903,6 +903,9 @@ export interface TaskCheckout {
 export interface ShipBranchRequest {
   name: string;
   title?: string;
+  /** The commit the agent shipped: with the turn, what identifies this request,
+   *  so a retried turn gets its ship back and a later one is a new request. */
+  head: string;
   /** The turn's world handle: a branch added this turn is only in it. */
   handle: WorldHandleRef;
 }
