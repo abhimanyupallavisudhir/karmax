@@ -392,6 +392,36 @@ describe('seeding a cloud world from its local checkout', () => {
     expect(fs.readFileSync(path.join(world, 'remote-only.txt'), 'utf8')).toContain('new target state');
   });
 
+  it('checks out a task branch shipped to it in development repositories only (SPEC §11.1)', async () => {
+    const { root, source, env } = await makeRepoPair('karmax-provision-shipped-');
+    const remote = path.join(root, 'remote.git');
+    // The shipping task published the branch, named for the task that now owns it.
+    await gitOrThrow(source, ['checkout', '-q', '-b', 'tavya/shipped-task']);
+    fs.writeFileSync(path.join(source, 'guide.md'), '# guide\n');
+    await gitOrThrow(source, ['add', '-A']);
+    await gitOrThrow(source, ['commit', '-q', '-m', 'guide']);
+    await gitOrThrow(source, ['push', '-q', remote, 'tavya/shipped-task']);
+    const shipped = await gitOrThrow(source, ['rev-parse', 'HEAD']);
+    // A companion repository (the project wiki) has no such branch.
+    const wiki = path.join(root, 'wiki.git');
+    await gitOrThrow(root, ['clone', '-q', '--bare', remote, wiki]);
+    await gitOrThrow(wiki, ['branch', '-D', 'tavya/shipped-task']);
+
+    const world = path.join(root, 'world');
+    const { repos } = await provisionGitRepos(hostTarget(env), {
+      taskId: 'shipped-task', repos: ['git@example:remote.git', 'git@example:wiki.git'], base: 'main', target: 'main',
+      existingBranchSources: ['git@example:remote.git'],
+    }, { root: world, home: root, sshUrlError: 'ssh required', copyGlobsWarning: 'no host checkout' });
+
+    const [development, companion] = repos;
+    expect(development).toMatchObject({ branch: 'tavya/shipped-task', base: 'main' });
+    expect(await gitOrThrow(development!.root, ['rev-parse', 'HEAD'])).toBe(shipped);
+    // Its base stays a local branch, as for a created one: diffs and merges name it.
+    expect(await gitOrThrow(development!.root, ['rev-parse', 'main'])).toBe(await gitOrThrow(remote, ['rev-parse', 'main']));
+    expect(companion).toMatchObject({ branch: 'tavya/shipped-task', base: 'main' });
+    expect(await gitOrThrow(companion!.root, ['rev-parse', 'HEAD'])).toBe(await gitOrThrow(wiki, ['rev-parse', 'main']));
+  });
+
   it('reviews a branch that exists only in the local checkout', async () => {
     const { root, source, env } = await makeRepoPair('karmax-provision-branch-');
     await gitOrThrow(source, ['branch', 'tavya/other-task']);

@@ -4,6 +4,7 @@ import type { Transition } from '../resolve/transitions.js';
 import { assertReviewInfoTotal, validateReviewInfoCall } from './review-info.js';
 import { AgentActivity, AgentWait, Provider, ReviewInfo, SubTaskRequest, SubTaskResponse, RaiseToParent, ConfirmDecision } from '../domain/types.js';
 import { jobStatuses } from '../world/jobs.js';
+import { removeCheckout } from '../world/checkout.js';
 import { BRAND } from '../domain/brand.js';
 import { formatMinorUnits } from '../util/currency.js';
 
@@ -43,6 +44,8 @@ export interface TurnJournal {
   subTaskResponses?: SubTaskResponse[];
   skills?: { name: string; content: string }[];
   worldHandle?: import('../world/types.js').WorldHandle;
+  /** Branches shipped as their own pull requests this turn (`open_pr` with `branch`). */
+  shipped?: Array<{ checkout: string; childTaskId: string; branch: string }>;
   /** Absolute `msgs` index delivered so far (initial snapshot + mid-turn follow-ups). */
   delivered?: number;
 }
@@ -91,11 +94,17 @@ export interface RunTurnDeps {
    *  added, rotated or disabled in project settings reaches the running turn. */
   pullSecretEnv?: () => Promise<Record<string, string>>;
   platformRequest?: (method: string, path: string, body?: unknown) => Promise<unknown>;
+  /** Ask the task's workflow to ship one branch as its own pull request (SPEC
+   *  §11.1). It answers once the sub-task owning it exists, or with why not. */
+  shipBranch?: (request: ShipBranchRequest) => Promise<ShipBranchOutcome>;
   fillPaymentCard?: (args: {
     requestId: string;
     selectors: import('../autonomy/card-fill.js').CardFillSelectors;
   }) => Promise<{ filled: true; origin: string }>;
 }
+
+export type { ShipBranchRequest, ShipBranchOutcome } from '../domain/types.js';
+import type { ShipBranchRequest, ShipBranchOutcome } from '../domain/types.js';
 
 export const SECRET_ENV_POLL_MS = 5_000;
 
@@ -214,6 +223,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
   };
   // Set only if the agent partitioned its change across another branch this turn.
   let worldHandle: import('../world/types.js').WorldHandle | undefined = restored.worldHandle;
+  const shipped: NonNullable<TurnJournal['shipped']> = [...(restored.shipped ?? [])];
   let delivered = restored.delivered;
   // Saves are serialized so a later snapshot can never be overwritten by an earlier one.
   let journalSaves = Promise.resolve();
@@ -228,7 +238,8 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       ...(subTasks.length ? { subTasks: [...subTasks] } : {}),
       ...(subTaskResponses.length ? { subTaskResponses: [...subTaskResponses] } : {}),
       ...(skills.length ? { skills: [...skills] } : {}),
-      ...(worldHandle ? { worldHandle } : {}), ...(delivered !== undefined ? { delivered } : {}),
+      ...(worldHandle ? { worldHandle } : {}), ...(shipped.length ? { shipped: [...shipped] } : {}),
+      ...(delivered !== undefined ? { delivered } : {}),
     };
     // A failed save leaves this attempt's in-memory outcome intact; only a later
     // retry would lose it, which is no worse than before the journal existed.
@@ -364,6 +375,21 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       if (!added) throw new Error('checkout was not recorded on the world handle');
       await journal();
       return { name: added.name, root: added.root, branch: added.branch };
+    },
+    // The pull request opens now, as its own sub-task, while the agent keeps
+    // working; the branch then leaves this world so nothing here touches it again.
+    async shipBranch({ name, title }) {
+      if (input.role !== 'do') throw new Error('only the Do agent opens pull requests');
+      const current = worldHandle ?? input.world.handle;
+      // A retried turn asks again: the workflow answers a ship it already made.
+      if (!deps.shipBranch) throw new Error('opening one branch\'s pull request is not available in this turn; finish with open_pr instead');
+      const outcome = await deps.shipBranch({ name, ...(title ? { title } : {}), handle: current });
+      if (!outcome.ok) throw new Error(outcome.reason);
+      worldHandle = await removeCheckout(input.world, outcome.checkout);
+      if (!shipped.some((entry) => entry.childTaskId === outcome.childTaskId))
+        shipped.push({ checkout: outcome.checkout, childTaskId: outcome.childTaskId, branch: outcome.branch });
+      await journal();
+      return { childTaskId: outcome.childTaskId, branch: outcome.branch };
     },
     async requestSpend(args) {
       if (!deps.budget || !deps.spendCtx) return { status: 'denied', reason: 'payments not configured' };
@@ -510,6 +536,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     subTaskResponses: subTaskResponses.length ? subTaskResponses : undefined,
     skills: skills.length ? skills : undefined,
     ...(worldHandle ? { worldHandle } : {}),
+    ...(shipped.length ? { shipped } : {}),
     // Legacy v1.0/v1.1 workflows use this old no-signal marker. New versions use
     // providerCompleted and do not interpret a missing optional tool call as a stall.
     needsInput:

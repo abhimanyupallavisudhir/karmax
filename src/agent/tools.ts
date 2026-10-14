@@ -229,7 +229,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'create_branch',
     description:
-      'Multi-PR tasks ONLY: split this task\'s change across another branch, so it is reviewed and merged as its own pull request. The branch is checked out beside your current one immediately — work in it during this same turn (`cd` to the path returned). Use it when one review would mix unrelated concerns: a prep/refactor under a feature, or slices of different repos. Stack with `base`: pass a SIBLING checkout\'s name and this branch builds on it and lands after it. All branches stay one task with one Review and one Merge — if a piece needs its own review timing or cancellation, use create_sub_task instead. Fails on a single-branch task; do not retry, just keep working in the one branch.',
+      'Tasks allowing several branches ONLY: split this task\'s change across another branch, so it is reviewed and merged as its own pull request. The branch is checked out beside your current one immediately — work in it during this same turn (`cd` to the path returned). Use it when one review would mix unrelated concerns, or for each piece you want reviewed and landed as soon as it is ready: commit it, then open_pr with `branch` opens its pull request on its own while you keep working. Branches you do not open that way land together when you finish. Stack with `base`: pass a SIBLING checkout\'s name and this branch builds on it and lands after it (open the base first; the stacked one can open on its own once the base has landed). Fails on a single-branch task; do not retry, just keep working in the one branch.',
     parameters: {
       type: 'object',
       properties: {
@@ -1015,8 +1015,15 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'open_pr',
     description:
-      'Do agents ONLY. Open (or refresh) this task\'s pull request and send its exact committed proposal to Review. Call this only as your final action after the requested work is truly complete, all intended files are committed, unwanted files are ignored or removed, and relevant tests pass. Ending a turn or asking a human for input does not open a PR.',
-    parameters: { type: 'object', properties: {} },
+      'Do agents ONLY. Open (or refresh) this task\'s pull request and send its exact committed proposal to Review. Call this only as your final action after the requested work is truly complete, all intended files are committed, unwanted files are ignored or removed, and relevant tests pass. Ending a turn or asking a human for input does not open a PR. '
+      + 'Tasks allowing several branches: pass `branch` (a branch you added with create_branch, committed) to open ITS pull request now and keep working — it leaves your world and becomes its own sub-task, reviewed and landed on its own; you are told when it lands. The task finishes when you call open_pr without `branch` and every pull request it opened has landed.',
+    parameters: {
+      type: 'object',
+      properties: {
+        branch: { type: 'string', description: 'Several-branch tasks: the name of a branch you added, to open its pull request now while you keep working. Omit for your final proposal.' },
+        title: { type: 'string', description: 'With `branch`: a title for that pull request (default: the branch name and this task\'s title).' },
+      },
+    },
   },
   {
     name: 'signal_completion',
@@ -1296,7 +1303,8 @@ export function platformToolHandlers(
         });
         ctx.emit(`branch ${added.branch} checked out at ${added.root}`);
         return `branch "${added.branch}" is checked out at ${added.root} — work in that directory for the change`
-          + ` belonging to this pull request, and commit it there. It is reviewed and merged with the rest of this task.`;
+          + ` belonging to this pull request, and commit it there. Once it is committed, open_pr with branch "${added.name}"`
+          + ' opens its pull request on its own while you keep working; otherwise it lands with the rest of this task.';
       } catch (e: any) {
         // A refusal here is informational, not a turn failure: the agent can
         // simply carry on in the branch it already has.
@@ -1732,7 +1740,13 @@ export function platformToolHandlers(
       await ctx.signalCompletion(args?.summary ? String(args.summary) : undefined);
       return 'completion recorded';
     },
-    async open_pr() {
+    async open_pr(args) {
+      if (args?.branch !== undefined && String(args.branch).trim()) {
+        if (!ctx.shipBranch) throw new Error('opening one branch\'s pull request is not available in this turn; finish with open_pr instead');
+        const shipped = await ctx.shipBranch({ name: String(args.branch).trim(), ...(args?.title ? { title: String(args.title) } : {}) });
+        return `The pull request for "${String(args.branch).trim()}" is opening as its own sub-task (${shipped.childTaskId}, branch ${shipped.branch}); it is reviewed and lands on its own. `
+          + 'Its checkout has left your world, so do not change it here. Keep working; call open_pr without a branch when you are finished.';
+      }
       await ctx.openPr();
       return 'pull request requested; finish this turn now';
     },

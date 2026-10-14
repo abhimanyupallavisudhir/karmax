@@ -65,12 +65,16 @@ import {
   TaskContinuation,
   TaskRecoveryCheckpoint,
   TaskParticipant,
+  TaskShipment,
+  ShipBranchRequest,
+  ShipBranchOutcome,
 } from './contract.js';
 import { mergeQueueDomains, releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider,
   landingAuthorityOf, samePosition, MERGE_POLL, reviewCheckouts, approveAll, worldRepos, landedNote } from './contract.js';
 import type { CheckoutApprovals } from './contract.js';
 import { SIG, SIG_AGENT_TURN_STATE } from './names.js';
 import { agentTurnId } from './turn-id.js';
+import { taskBranch } from '../domain/brand.js';
 import { conversationPublisher, type TurnConversationBase } from '../domain/view-publication.js';
 import { unattendedJobsReminder, waitForAgent } from './agent-wait.js';
 
@@ -227,6 +231,10 @@ export const subtaskRedirectedSignal = defineSignal<[{ childTaskId: string }]>(S
  *  cancel/follow-up transitions a human would drive (SPEC §5.3). */
 export const parentResponseSignal = defineSignal<[ParentResponse]>('parentResponse');
 export const setTargetUpdate = defineUpdate<boolean, [string]>('setTarget');
+/** The Do agent opens one branch's pull request while it keeps working
+ * (`open_pr` with `branch`, SPEC §11.1): the branch becomes its own sub-task.
+ * Answered once that sub-task has started, or with why it cannot. */
+export const shipBranchUpdate = defineUpdate<ShipBranchOutcome, [ShipBranchRequest & { requestId: string }]>('shipBranch');
 /**
  * Generic in-flight param edit (SPEC §4.5/§5.5). Validated: the validator rejects
  * (before admission, SPEC §2) any field not currently editable per its declared
@@ -536,13 +544,20 @@ export async function softwareDevV1_29(input: SoftwareDevInput): Promise<{ stage
   return softwareDevImpl(input, '1.29.0');
 }
 
+/** v1.30: a task allowing several branches opens a branch's pull request on
+ * its own while its agent keeps working; the branch becomes a sub-task with its
+ * own Review and landing, and the task is done once all of them have landed. */
+export async function softwareDevV1_30(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
+  return softwareDevImpl(input, '1.30.0');
+}
+
 /** Replay-compatible entry for executions already recorded as
  * `softwareDev@1.0.0`. v1 published Resolve before invoking autoResolve. */
 export async function softwareDevV1(input: SoftwareDevInput): Promise<{ stage: Stage; sha?: string }> {
   return softwareDevImpl(input, '1.0.0');
 }
 
-type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0' | '1.14.0' | '1.15.0' | '1.16.0' | '1.17.0' | '1.18.0' | '1.19.0' | '1.20.0' | '1.21.0' | '1.22.0' | '1.23.0' | '1.24.0' | '1.25.0' | '1.26.0' | '1.27.0' | '1.28.0' | '1.29.0';
+type BehaviorVersion = '1.0.0' | '1.1.0' | '1.2.0' | '1.3.0' | '1.4.0' | '1.5.0' | '1.6.0' | '1.7.0' | '1.8.0' | '1.9.0' | '1.10.0' | '1.11.0' | '1.12.0' | '1.13.0' | '1.14.0' | '1.15.0' | '1.16.0' | '1.17.0' | '1.18.0' | '1.19.0' | '1.20.0' | '1.21.0' | '1.22.0' | '1.23.0' | '1.24.0' | '1.25.0' | '1.26.0' | '1.27.0' | '1.28.0' | '1.29.0' | '1.30.0';
 
 
 /** The minor of a behavior version. Every feature gate below is a `>=` test on
@@ -708,6 +723,15 @@ async function softwareDevImpl(
   // per-checkout Review gate. Gated from 1.9 on so an execution recorded before
   // it keeps the single-branch Review semantics on replay.
   const multiPrEnabled = !repositoryless && minor >= 9 && !!input.project.multiPr;
+  // v1.30: the Do agent may open one branch's pull request while it keeps
+  // working (SPEC §11.1). That branch leaves the world and becomes a sub-task,
+  // reviewed and landed on its own timing; this task is done once all have.
+  const shipsBranches = multiPrEnabled && minor >= 30;
+  // This task is such a sub-task: it goes straight to its PR, and its Review and
+  // questions follow its own routes (inherited from the task that shipped it),
+  // not the managing agent, which has moved on.
+  const shippedBranch = !repositoryless && minor >= 30 && !!input.shippedFrom;
+  const managedByParent = !!input.parentTaskId && !shippedBranch;
   const agentTurns = minor >= 6 ? cancellationAwareTurns : turns;
   // Activity retry options are recorded with the ScheduleActivityTask command, so
   // bounding the coordinator's unlimited default is a versioned behavior change.
@@ -758,7 +782,8 @@ async function softwareDevImpl(
   let resourceConflict = false;
   let keepOwnRequested = false;
   let manualEscalationRequested = carried?.manualEscalationRequested ?? false;
-  let prRequested = carried?.prRequested ?? recoveryStage === 'pr';
+  // A shipped branch arrives committed and ready: it opens its PR at once.
+  let prRequested = carried?.prRequested ?? (recoveryStage === 'pr' || (shippedBranch && !recovery));
   // v1.29: Do runs the task's own command instead of the agent — once per run
   // of the task; a revise, or a failure handed to the agent, continues with it.
   const taskCommand = minor >= 29 ? input.command?.trim() || undefined : undefined;
@@ -864,6 +889,10 @@ async function softwareDevImpl(
   const raises: ChildRaise[] = [...continued?.subTasks.raises ?? []];
   const settled: { childTaskId: string; stage: string; detail?: string }[] = [...continued?.subTasks.settled ?? []];
   const outstanding = new Set<string>(continued?.subTasks.outstanding);
+  // Branches shipped as their own pull requests (v1.30), and how many ships
+  // are being made right now (an update runs alongside the agent's turn).
+  const shipments: TaskShipment[] = (continued?.subTasks.shipments ?? []).map((shipment) => ({ ...shipment }));
+  let shipping = 0;
   const awaitingResponse = new Set<string>(continued?.subTasks.awaitingResponse);
   // Cross-task collaboration is a durable, event-driven join. The requesting
   // agent keeps working for the rest of its current turn; if it finishes before
@@ -881,7 +910,10 @@ async function softwareDevImpl(
   let targetLocked = carried ? carried.targetLocked : restoresStagePrerequisites && !!recovery
     && (['pr', 'review', 'merge'].includes(recoveryStage) || !!recovery.prs?.length);
   let mergeGranted = false;
-  let seen = recovery?.seen ?? 0; // messages the Do agent has already processed
+  // messages the Do agent has already processed. A shipped branch's task has
+  // no work to do before its PR; its agent's first turn (a revision) starts a
+  // fresh or forked session, which is handed the whole conversation anyway.
+  let seen = recovery?.seen ?? (shippedBranch ? msgs.length : 0);
   // Per-role transcripts surfaced in the view-model (SPEC §5.5): the Do agent's
   // conversation is `msgs`; auxiliary agents run on their own message arrays.
   // `resolveMsgs` remains only for historical executions created before the
@@ -1332,6 +1364,7 @@ async function softwareDevImpl(
       pr,
       ...(prs.length ? { prs } : {}),
       ...(multiPrEnabled && recordWorld ? { checkouts: reviewCheckouts(worldRepos(recordWorld as any), checkoutHeads, checkoutApprovals, prs) } : {}),
+      ...(shipments.length ? { shipments: shipments.map((shipment) => ({ ...shipment })) } : {}),
       mergeQueue: mergeQueuePos,
       ...(intentAuthorizedLanding ? { landing } : {}),
       subTasks: subTaskIds.length ? subTaskIds : undefined,
@@ -1427,7 +1460,7 @@ async function softwareDevImpl(
       retryRequested = false;
       error = `Could not save ${unsaved.map((item) => item.path).join(', ')}`
         + `${unsaved[0]!.error ? `: ${unsaved[0]!.error}` : ''}. Nothing was deleted; Retry saves it again.`;
-      if (input.parentTaskId) {
+      if (managedByParent) {
         waitingFor = { kind: 'parent' };
         await notifyParent('blocked', error);
       }
@@ -1475,7 +1508,7 @@ async function softwareDevImpl(
       error = resourceConflict
         ? `Could not publish resources: ${failure} Nothing was lost: Retry publishes again, or keep this task’s version of those files.`
         : `Could not publish resources: ${failure} Nothing was lost; Retry publishes again.`;
-      if (input.parentTaskId) {
+      if (managedByParent) {
         waitingFor = { kind: 'parent' };
         await notifyParent('blocked', error, resourceConflict ? ['keep_own'] : undefined);
       }
@@ -1599,7 +1632,7 @@ async function softwareDevImpl(
       return 'do';
     };
 
-    if (input.parentTaskId) {
+    if (managedByParent) {
       waitingFor = { kind: 'parent' };
       await notifyParent(options.raise?.type ?? 'needs_confirmation', reviewInfo?.summary);
       await publish();
@@ -1923,7 +1956,10 @@ async function softwareDevImpl(
   // settlement: the task goes on in a successor run (WF-31).
   const durableChildSettlement = patched('software-dev-durable-child-settlement-v1');
   if ((recovery && patched('software-dev-preserve-replacement-children-v1')) || durableChildSettlement)
-    setHandler(defineSignal<[ { childTaskId: string; stage: Stage } ]>('childSettled'), (result) => { settled.push(result); });
+    setHandler(defineSignal<[ { childTaskId: string; stage: Stage } ]>('childSettled'), (result) => {
+      settled.push(result);
+      noteShipmentSettled(result.childTaskId, result.stage);
+    });
   setHandler(raiseFromChildSignal, (r) => {
     if (!awaitingResponse.has(r.childTaskId)) subtaskNags = 0;
     raises.push(r);
@@ -1994,6 +2030,20 @@ async function softwareDevImpl(
   });
   setHandler(agentSlotGrantedSignal, ({ turnId }) => {
     agentSlotGrants.add(turnId);
+  });
+  setHandler(shipBranchUpdate, async (request): Promise<ShipBranchOutcome> => {
+    const made = shipments.find((shipment) => shipment.requestId === request.requestId);
+    if (made) return { ok: true, childTaskId: made.childTaskId, branch: made.branch, checkout: made.checkout, target: made.target };
+    if (!shipsBranches) return { ok: false, reason: multiPrEnabled
+      ? 'this task runs an earlier version of its workflow, which lands all its branches together: finish with open_pr'
+      : 'this task has a single branch, which lands when you finish with open_pr; work that needs its own review belongs in a sub-task (create_sub_task)' };
+    if (stage !== 'do' || cancelled) return { ok: false, reason: 'a branch\'s pull request can open on its own only while the task is working' };
+    shipping++;
+    try { return await shipBranch(request); }
+    catch (err) {
+      if (isCancellation(err)) throw err;
+      return { ok: false, reason: `its pull request could not be opened: ${innermostMessage(err)}` };
+    } finally { shipping--; }
   });
   setHandler(setTargetUpdate, (b) => {
     // Back-compat shim over the same window as updateParams({ target }), but
@@ -2332,7 +2382,7 @@ async function softwareDevImpl(
       // and asks whoever can fix its cause (domain/escalation.ts). A sub-task's
       // parent still hears every failure first; it can escalate further.
       escalatedFrom = multiAgent ? resumeStage : undefined;
-      if (input.parentTaskId) {
+      if (managedByParent) {
         waitingFor = { kind: 'parent' };
         await notifyParent('blocked', lastError);
       } else if (multiAgent) {
@@ -2879,7 +2929,7 @@ async function softwareDevImpl(
         .filter((m) => m.role === 'user' && m.author?.startsWith('user:') && addressedTo(m, MAIN_AGENT))
         .map((m) => m.author!))] : [];
       speakersReply = speakers.length ? reply : undefined;
-      if (input.parentTaskId && speakers.length && patched(REPLY_TO_SPEAKERS)) {
+      if (managedByParent && speakers.length && patched(REPLY_TO_SPEAKERS)) {
         await deliverReply(reply, speakers);
         speakersReply = undefined;
       }
@@ -3429,9 +3479,119 @@ Inspect the complete current diff and specifically compare its delta from the re
           return;
         }
         settled.push({ childTaskId, stage: (res as { stage: Stage }).stage });
+        noteShipmentSettled(childTaskId, (res as { stage: Stage }).stage);
       },
-      (err) => settled.push({ childTaskId, stage: 'failed', detail: describeError(err) }),
+      (err) => {
+        settled.push({ childTaskId, stage: 'failed', detail: describeError(err) });
+        noteShipmentSettled(childTaskId, 'failed');
+      },
     );
+  }
+
+  /** Hold this task's end until every pull request it shipped has settled
+   * (v1.30). True if it was cancelled meanwhile. */
+  async function awaitShipments(): Promise<boolean> {
+    for (;;) {
+      const open = openShipments();
+      if (!open.length || cancelled) break;
+      status = 'waiting';
+      waitingFor = { kind: 'subtask', detail: open.length === 1
+        ? `Waiting for the pull request for "${open[0]!.checkout}" to land`
+        : `Waiting for ${open.length} pull requests to land` };
+      await publish();
+      // A settlement arrives by the child's result or its durable signal; one
+      // restored without a handle is also read again now and then.
+      if (!(await condition(() => cancelled || openShipments().length !== open.length, '5 minutes'))) {
+        const children = await coreChild.settledChildTasks(taskId, open.map((shipment) => shipment.childTaskId)).catch(() => []);
+        for (const child of children) {
+          if (!outstanding.has(child.taskId)) continue;
+          settled.push({ childTaskId: child.taskId, stage: child.stage });
+          noteShipmentSettled(child.taskId, child.stage);
+        }
+      }
+    }
+    waitingFor = undefined;
+    if (!cancelled) status = 'active';
+    return cancelled;
+  }
+
+  /** A shipped branch's sub-task settled: so has that pull request. */
+  function noteShipmentSettled(childTaskId: string, childStage: string): void {
+    const shipment = shipments.find((candidate) => candidate.childTaskId === childTaskId && candidate.state === 'open');
+    if (shipment) shipment.state = childStage === 'done' ? 'landed' : childStage === 'cancelled' ? 'cancelled' : 'failed';
+  }
+
+  /** Open shipments, and whether a branch still in this world is stacked on one:
+   *  this task's own proposal must not carry a pull request that has not landed. */
+  const openShipments = () => shipments.filter((shipment) => shipment.state === 'open');
+  const stackedOnOpenShipment = (): TaskShipment | undefined => {
+    const repos = world ? worldRepos(world as WorldHandle) : [];
+    return openShipments().find((shipment) => repos.some((repo) => repo.base === shipment.fromBranch));
+  };
+
+  /**
+   * Ship one branch as its own pull request while the agent keeps working
+   * (SPEC §11.1): it becomes a sub-task that checks the branch out at the
+   * shipped commit, opens its PR at once and takes this task's Review route
+   * (people, not this agent). Runs as an update beside the running Do turn.
+   */
+  async function shipBranch(request: ShipBranchRequest & { requestId: string }): Promise<ShipBranchOutcome> {
+    const repos = worldRepos(request.handle as WorldHandle);
+    const named = repos.find((repo) => repo.name === request.name) ?? repos.find((repo) => repo.branch === request.name);
+    const name = named?.name ?? request.name;
+    const earlier = shipments.filter((shipment) => shipment.checkout === name);
+    const pending = earlier.find((shipment) => shipment.state === 'open');
+    if (pending) return { ok: false, reason: `the earlier pull request for "${name}" (sub-task ${pending.childTaskId}) has not landed yet; once it has, bring a branch up to date with ${pending.target} and open its pull request` };
+    const base = named ? shipments.find((shipment) => shipment.fromBranch === named.base) : undefined;
+    if (base?.state === 'open') return { ok: false, reason: `"${name}" builds on "${base.checkout}", whose pull request (sub-task ${base.childTaskId}) has not landed yet; once it has, bring "${name}" up to date with ${base.target} and open it` };
+    const check = await core.checkShipment(request.handle as WorldHandle, { checkout: request.name, target, current: earlier.length > 0 || !!base });
+    if (!check.ok) return check;
+    const checkout = check.checkout;
+    const title = request.title?.trim() || `${checkout.name}: ${input.title}`;
+    const prompt = `This task owns the pull request for the branch "${checkout.name}" of task ${taskId} ("${input.title}"), whose agent opened it on its own while it kept working. It lands on ${check.target}.\n\n`
+      + `If Review asks for changes, make them in this branch only, verify them, then call open_pr.`;
+    const doSpec = liveInput.agents?.do;
+    const params = {
+      repos: [check.source], multiPr: false,
+      confirm: { layers: softwareDevConfirmLayers },
+      ...(liveResponder ? { responder: liveResponder } : {}),
+      // The agent that wrote the branch, forked, answers its Review.
+      ...(doSpec?.provider ? { 'agent:do': { ...doSpec, resumeFrom: { taskId, role: 'do' } } } : {}),
+      _shippedFrom: { taskId, checkout: checkout.name },
+    };
+    const childInput = await childPreparation.prepareChildTask({
+      parentTaskId: taskId, projectId: input.projectId, title, prompt,
+      base: check.target, target: check.target,
+      project: input.project, profiles: input.profiles, resolveAgentEnabled: input.resolveAgentEnabled,
+      // Its merge capability is the target's, which this task may merge into.
+      parentBranch: check.target, parentGrant: input.grant,
+      params: params as unknown as SubTaskRequest['params'],
+      ship: { checkout, head: check.head, handle: request.handle as WorldHandle },
+    });
+    const shipment: TaskShipment = {
+      checkout: checkout.name, childTaskId: childInput.taskId, branch: taskBranch(childInput.taskId), fromBranch: checkout.branch,
+      head: check.head, target: check.target, state: 'open', requestId: request.requestId,
+    };
+    const child = await startChild<typeof softwareDev>(childWorkflowType(behaviorVersion), {
+      workflowId: childInput.taskId,
+      args: [{
+        ...childInput,
+        project: { ...childInput.project, repos: [check.source], multiPr: false },
+        confirm: { layers: softwareDevConfirmLayers },
+        ...(liveResponder ? { responder: liveResponder } : {}),
+        shippedFrom: { taskId, checkout: checkout.name },
+      } as SoftwareDevInput],
+      parentClosePolicy: ParentClosePolicy.ABANDON,
+    });
+    shipments.push(shipment);
+    subTaskIds.push(childInput.taskId);
+    outstanding.add(childInput.taskId);
+    childHandles.set(childInput.taskId, child);
+    trackChild(childInput.taskId, child);
+    // It has left this world: the view stops listing it as one of this task's branches.
+    if (world) world = { ...world, repos: worldRepos(world as WorldHandle).filter((repo) => repo.name !== checkout.name) };
+    await publish();
+    return { ok: true, childTaskId: childInput.taskId, branch: shipment.branch, checkout: checkout.name, target: check.target };
   }
 
   /** Spawn sub-tasks as branch-stacked, detached children (SPEC §5.3). Each branches
@@ -3535,7 +3695,7 @@ Inspect the complete current diff and specifically compare its delta from the re
     status = 'blocked';
     retryRequested = false;
     error = `${what} Nothing was lost; Retry creates it again.`;
-    if (input.parentTaskId) {
+    if (managedByParent) {
       waitingFor = { kind: 'parent' };
       await notifyParent('blocked', error);
     }
@@ -3610,10 +3770,15 @@ Inspect the complete current diff and specifically compare its delta from the re
       if (s.stage === 'done') childLandedSinceRefresh = true;
       outstanding.delete(s.childTaskId);
       awaitingResponse.delete(s.childTaskId);
+      const shipment = shipments.find((candidate) => candidate.childTaskId === s.childTaskId);
       msgs.push({
         id: `st-${msgs.length}`,
         role: 'user',
-        text: `Sub-task ${s.childTaskId} finished: ${s.stage}${s.detail ? ` (${s.detail})` : ''}.`,
+        text: shipment
+          ? s.stage === 'done'
+            ? `The pull request for "${shipment.checkout}" (sub-task ${s.childTaskId}) landed on ${shipment.target}.`
+            : `The pull request for "${shipment.checkout}" (sub-task ${s.childTaskId}) did not land: ${s.stage}${s.detail ? ` (${s.detail})` : ''}.`
+          : `Sub-task ${s.childTaskId} finished: ${s.stage}${s.detail ? ` (${s.detail})` : ''}.`,
         ts: msgs.length,
       });
     }
@@ -3647,7 +3812,8 @@ Inspect the complete current diff and specifically compare its delta from the re
         updatedAtBase: (continued?.updatedAtBase ?? 0) + workflowInfo().historyLength,
         goalMode,
         confirmLayers: softwareDevConfirmLayers,
-        subTasks: { ids: subTaskIds, outstanding: [...outstanding], awaitingResponse: [...awaitingResponse], raises, settled },
+        subTasks: { ids: subTaskIds, outstanding: [...outstanding], awaitingResponse: [...awaitingResponse], raises, settled,
+          ...(shipments.length ? { shipments } : {}) },
         collaborations: { pending: [...pendingCollaborations], settled: [...settledCollaborations] },
         consumed: [...consumed],
         checkoutHeads,
@@ -3719,7 +3885,7 @@ Inspect the complete current diff and specifically compare its delta from the re
 
   /** `askOf` for a `needs_input` pause's default audience. */
   function asked(route: string[]): string[] {
-    return speakers.length && !input.parentTaskId && patched(UNASKED_REPLY_TO_SPEAKERS) ? askOf(route) : route;
+    return speakers.length && !managedByParent && patched(UNASKED_REPLY_TO_SPEAKERS) ? askOf(route) : route;
   }
 
   /** A top-level reply to people goes to them as a mention when the task then
@@ -3729,7 +3895,7 @@ Inspect the complete current diff and specifically compare its delta from the re
   async function replyUnasked(): Promise<void> {
     const reply = speakersReply;
     speakersReply = undefined;
-    if (reply && !input.parentTaskId && patched(UNASKED_REPLY_TO_SPEAKERS)) await deliverReply(reply, speakers, false);
+    if (reply && !managedByParent && patched(UNASKED_REPLY_TO_SPEAKERS)) await deliverReply(reply, speakers, false);
   }
 
   /** ` (already sent to Bea, who spoke to it)` when the agent's last reply also
@@ -3746,9 +3912,9 @@ Inspect the complete current diff and specifically compare its delta from the re
    *  parent is gone the child stays human-resolvable via its own retry/confirm. */
   /** Raise to the parent; false when there is none (or it is gone). */
   async function notifyParent(type: ChildRaise['type'], detail?: string, choices?: ChildRaise['choices']): Promise<boolean> {
-    if (!input.parentTaskId) return false;
+    if (!managedByParent) return false;
     try {
-      await getExternalWorkflowHandle(input.parentTaskId).signal(raiseFromChildSignal, {
+      await getExternalWorkflowHandle(input.parentTaskId!).signal(raiseFromChildSignal, {
         childTaskId: taskId,
         childTitle: input.title,
         type,
@@ -3781,7 +3947,8 @@ Inspect the complete current diff and specifically compare its delta from the re
   if (cancellableSetup && cancelled) return await abort();
   if (!world) {
     const create = () => {
-      const args = { taskId, ...(remoteWorldProvider(kind) ? { projectId: input.projectId } : {}), repos: input.project.repos, base, target, copyGlobs: input.project.copyGlobs, gitProfile: input.project.gitProfile, kind, resetBranch: input.discardProgress, ...(input.project.multiPr ? { multiPr: true } : {}) };
+      const args = { taskId, ...(remoteWorldProvider(kind) ? { projectId: input.projectId } : {}), repos: input.project.repos, base, target, copyGlobs: input.project.copyGlobs, gitProfile: input.project.gitProfile, kind, resetBranch: input.discardProgress, ...(input.project.multiPr ? { multiPr: true } : {}),
+        ...(shippedBranch ? { adoptTaskBranch: true } : {}) };
       if (!cancellableSetup) return core.createWorld(args);
       const scope = new CancellationScope({ cancellable: true });
       activeSetup = scope;
@@ -3955,6 +4122,8 @@ Inspect the complete current diff and specifically compare its delta from the re
   // Otherwise every `continue proposalCycle` silently resubmits the unchanged
   // stale head and exact-candidate verification repeats forever.
   let recoveredLandingNeedsDo = false;
+  /** v1.30: the agent finished with all its work already shipped. */
+  let nothingLeftToPropose = false;
   proposalCycle: for (;;) {
   // ── Do ⇄ Needs input ⇒ PR ⇄ Review ──
   if (!restoredReviewApproved
@@ -3999,6 +4168,8 @@ Inspect the complete current diff and specifically compare its delta from the re
     )
       ? { completed: true, providerCompleted: true, output: '', openPrRequested: true }
       : taskCommand && !commandRan ? await commandTurn() : await doTurn();
+    // A branch the turn shipped is acted on below only once its sub-task exists.
+    if (shipping) await condition(() => shipping === 0);
     if (taskCommand) {
       if (cancelled) return await abort();
       const failed = (turn as { commandFailed?: string }).commandFailed;
@@ -4105,7 +4276,13 @@ Inspect the complete current diff and specifically compare its delta from the re
     const finishing = turnFinished || (!providerTerminalCompletion && turn.needsInput) || turn.raise;
 
     // While children are still running, the parent doesn't leave the Do loop:
-    if (outstanding.size > 0) {
+    // except for branches it shipped (v1.30), which land on their own and hold
+    // only this task's end — unless the agent waits for them, or a branch still
+    // here is stacked on one that has not landed.
+    const stackedOn = shipsBranches ? stackedOnOpenShipment() : undefined;
+    const holding = !shipsBranches ? outstanding.size : [...outstanding].filter((id) => turn.waitForSubtasks
+      || (finishing && stackedOn?.childTaskId === id) || !shipments.some((shipment) => shipment.childTaskId === id)).length;
+    if (holding > 0) {
       await replyUnasked();
       if (turn.waitForSubtasks || finishing) {
         // Explicit wait, or a finish deferred by the end-stage barrier — a completion
@@ -4355,7 +4532,7 @@ Inspect the complete current diff and specifically compare its delta from the re
           status = 'waiting';
           const question = turn.raise?.detail?.trim() || turn.output?.trim()
             || 'The agent finished its turn. Send a follow-up, or open the PR if the work is truly complete.';
-          if (input.parentTaskId) {
+          if (managedByParent) {
             waitingFor = { kind: 'parent', detail: 'Waiting for the managing agent to open the PR' };
             // The parent answers from this text alone, so it carries the child's
             // own last words (its question, or what it says it finished).
@@ -4433,6 +4610,14 @@ Inspect the complete current diff and specifically compare its delta from the re
           }
         }
 
+        // Everything this task did went out through branches it shipped: it has
+        // nothing of its own to review, only those pull requests to see land.
+        if (shipsBranches && shipments.length && !stackedOnOpenShipment()
+          && !(await core.proposalHasWork(world as WorldHandle, target))) {
+          prRequested = false;
+          nothingLeftToPropose = true;
+          break;
+        }
         // The Do agent owns commit-vs-ignore judgment. The workflow validates
         // the result, and a refused proposal goes back to the same conversation
         // instead of invoking a second "Merge" personality.
@@ -4621,6 +4806,22 @@ Inspect the complete current diff and specifically compare its delta from the re
       stage = 'do'; status = 'active'; continue;
     }
   }
+  }
+  if (nothingLeftToPropose) {
+    if (await awaitShipments()) return await abort();
+    stage = 'done';
+    status = 'done';
+    const note = `Everything this task did landed through the pull requests it opened for ${shipments.map((shipment) => `"${shipment.checkout}"`).join(', ')}.`;
+    reviewInfo = { ...reviewInfo, summary: reviewInfo?.summary ? `${reviewInfo.summary}\n\n${note}` : note };
+    await publish();
+    const remoteWorld = world ? releaseWorldOnCompletion(world) : false;
+    await core.destroyWorld(world as WorldHandle);
+    if (remoteWorld) {
+      releasedWorld = world;
+      world = undefined;
+      await publish();
+    }
+    return { stage };
   }
 
   // Recovery may carry an already-approved proposal across a replacement run
@@ -5516,7 +5717,7 @@ Inspect the complete current diff and specifically compare its delta from the re
     stage = 'escalated';
     status = 'blocked';
     retryRequested = false;
-    if (input.parentTaskId) {
+    if (managedByParent) {
       waitingFor = { kind: 'parent' };
       await notifyParent('blocked', error);
     }
@@ -5551,6 +5752,9 @@ Inspect the complete current diff and specifically compare its delta from the re
       detail: `The exact integration candidate landed successfully${sha ? ` as ${sha.slice(0, 8)}` : ''}.`,
     };
   }
+  // Done means every pull request this task opened has landed (or closed),
+  // not only its own last one.
+  if (shipsBranches && await awaitShipments()) return await abort();
   stage = 'done';
   status = 'done';
   // The landing adds to the work summary; it never replaces it.

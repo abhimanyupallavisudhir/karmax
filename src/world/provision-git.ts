@@ -128,8 +128,11 @@ export async function provisionGitRepos(target: ProvisionTarget, spec: WorldSpec
     .filter((value): value is string => Boolean(value)))];
   const repos = await concurrentMap(sources, 3, async (source, index): Promise<WorldRepo> => {
     const recorded = spec.checkouts?.[index];
-    const repoSpec = { ...spec, ...recorded };
     const branch = recorded?.branch ?? spec.branch ?? taskBranch(spec.taskId);
+    // A task that owns a branch someone else already published (a shipped
+    // branch, SPEC §11.1) checks it out instead of creating it from base.
+    const adopted = spec.existingBranchSources?.includes(source) ? { branch } : {};
+    const repoSpec = { ...spec, ...adopted, ...recorded };
     const branchPolicy = recorded ?? spec.repositoryBranches?.[source];
     let base = branchPolicy?.base ?? spec.base;
     let targetBranch = branchPolicy?.target ?? spec.target;
@@ -306,8 +309,11 @@ async function configureRepo(target: ProvisionTarget, root: string, spec: WorldS
   // Commit signing stays in the trusted Git broker. Leaving a long-lived signing
   // key in an agent-controlled world would make the isolation boundary moot.
   if (!hasOrigin) return;
+  // An existing branch is checked out as is; its base is kept as a local
+  // branch too, as for a created one, since diffs and merges name it.
   const checkout = spec.branch
-    ? `git -C ${quote(root)} checkout -q -B ${quote(spec.branch)} ${quote(`origin/${spec.branch}`)}`
+    ? `${spec.branch !== base ? `(git -C ${quote(root)} branch -f -q ${quote(base)} ${quote(`origin/${base}`)} 2>/dev/null || true) && ` : ''}`
+      + `git -C ${quote(root)} checkout -q -B ${quote(spec.branch)} ${quote(`origin/${spec.branch}`)}`
     : requestedRemoteRefExists
       ? `git -C ${quote(root)} checkout -q -B ${quote(base)} ${quote(`origin/${base}`)} && git -C ${quote(root)} checkout -q -b ${quote(branch)}`
       : `git -C ${quote(root)} checkout -q -b ${quote(branch)}`;

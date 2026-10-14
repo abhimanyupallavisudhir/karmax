@@ -271,6 +271,19 @@ export async function brokerPublishBranch(
   });
 }
 
+/** Publish one branch of one checkout to its authority, exactly as
+ * `brokerPublishBranch` publishes a task branch: `repo.branch` names the ref to
+ * transport (it need not be checked out). A multi-branch task uses it to hand a
+ * shipped branch to the sub-task that owns its pull request (SPEC §11.1). */
+export async function brokerPublishRepo(world: World, repo: WorldRepo, auth: GitBrokerAuth,
+  onPublished?: OriginPublicationRecorder): Promise<void> {
+  const shared = sharesHostRefDatabase(world.handle.kind);
+  const local = await localAuthority(repo, shared);
+  if (local && shared) await verifySharedWorktreeBranch(world, repo, local);
+  else if (local) await importBranchToLocal(world, repo, local);
+  else await pushBranchToOrigin(world, repo, auth, undefined, onPublished);
+}
+
 /** The host-local repository this repo is authoritative to, if any. A recorded
  * checkout that has since vanished is a loud error — silently falling back to
  * origin would reintroduce the split-brain this field exists to prevent.

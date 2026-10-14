@@ -43,6 +43,9 @@ export type {
   UpstreamProposal,
   TaskLandingState,
   TaskCheckout,
+  TaskShipment,
+  ShipBranchRequest,
+  ShipBranchOutcome,
   WorldHandleRef,
 } from '../domain/types.js';
 

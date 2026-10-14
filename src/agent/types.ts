@@ -43,6 +43,11 @@ export interface PlatformToolContext {
    *  Performed immediately so the agent can work in it during the SAME turn; the
    *  updated world handle rides back on the turn result for the workflow to adopt. */
   addCheckout(spec: import('../world/types.js').WorldCheckoutSpec): Promise<{ name: string; root: string; branch: string }>;
+  /** Do-agent ONLY, multi-branch tasks (software-dev ≥1.30): open the pull
+   *  request for one branch NOW and keep working. The branch leaves this world
+   *  and becomes its own sub-task, reviewed and landed on its own; the result
+   *  names it. Refusals throw, with what to do instead. */
+  shipBranch?(args: { name: string; title?: string }): Promise<{ childTaskId: string; branch: string }>;
   /** Resolve agent's structured verdict (RESOLVE-PLAN §3.2): a bounded recovery
    *  transition the workflow executes (resume/retryStage/gotoStage/parkUntil/escalate)
    *  instead of guessing. Also marks the resolve turn complete. */
@@ -236,6 +241,10 @@ export interface TurnResult {
    *  Present only when it changed, so a workflow version that predates multi-PR
    *  — and every turn that added nothing — is untouched. */
   worldHandle?: import('../world/types.js').WorldHandle;
+  /** Branches this turn shipped as their own pull requests (`open_pr` with
+   *  `branch`). The workflow recorded each when it was shipped; this is the record
+   *  the turn's journal keeps of it. */
+  shipped?: Array<{ checkout: string; childTaskId: string; branch: string }>;
   needsInput?: boolean;
   /** Absolute count of conversation messages the turn delivered (see AdapterTurn.delivered). */
   delivered?: number;

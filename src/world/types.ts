@@ -145,6 +145,11 @@ export interface WorldSpec {
   target?: string;
   /** Check out this existing branch instead of creating karmax/<taskId> (merge-only). */
   branch?: string;
+  /** Sources (keys like `repos`) whose task branch already exists at their
+   * authority: it is checked out rather than created from `base`, which stays
+   * what the branch is compared with and lands on. Local worktrees reuse an
+   * existing branch anyway. */
+  existingBranchSources?: string[];
   /** Delete an existing task branch before provisioning it from `base`. */
   resetBranch?: boolean;
   /** @deprecated Host-local compatibility input. Resource attachments replace

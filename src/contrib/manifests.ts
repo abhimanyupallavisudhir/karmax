@@ -122,12 +122,14 @@ const landingAuthorityField = (): FieldSpec => ({
 // branches with `create_branch`, each landing as its own pull request — so the
 // world nests its checkouts from Setup, which is the only structural difference
 // and is why this is a task-scoped field rather than something inferred later.
-// The lifecycle stays singular: one Review, one Merge, one point of no return.
+// From software-dev 1.30 the agent may also open a branch's pull request while
+// it keeps working (`open_pr` with `branch`): that branch becomes a sub-task
+// with its own Review and landing, and the task is done once all have landed.
 const multiPrField = (): FieldSpec => ({
   name: 'multiPr',
   type: 'boolean',
   label: 'Allow several branches per task',
-  help: 'Let the agent split one task\'s change into several branches, each reviewed and merged as its own pull request (including stacked ones). They share a single Review gate and a single Merge — work that needs its own review timing belongs in a separate task.',
+  help: 'The agent can open several pull requests over time, each reviewed and merged on its own while it keeps working. The task is done when the agent has finished and all of them have landed.',
   default: false,
   scopes: ALL,
   bind: 'project',
@@ -448,7 +450,7 @@ export interface WorkflowManifest {
 export const MANIFESTS: WorkflowManifest[] = [
   {
     name: 'software-dev',
-    version: '1.29.0',
+    version: '1.30.0',
     description: `World → do/wait → review → proposal to a fork's upstream → optional per-PR provider/external landing or canonical ${BRAND} fallback admission; lifecycle restoration rebuilds proposal prerequisites, and task views track GitHub’s actual PR state.`,
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],
@@ -558,7 +560,7 @@ export const MANIFESTS: WorkflowManifest[] = [
   },
   {
     name: 'goal',
-    version: '1.29.0',
+    version: '1.30.0',
     description: 'Software Dev in autonomous completion mode with prerequisite-aware lifecycle restoration, GitHub-authoritative PR state, per-PR multi-repository landing ownership, canonical fallback admission, and reviewed adoption of task-created resources.',
     requires: ['merge-queue'],
     capabilities: ['create-sub-task', 'create-review-info', 'signal-completion', 'save-skill', 'merge-into:*'],

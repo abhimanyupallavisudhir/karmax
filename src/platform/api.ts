@@ -1966,6 +1966,10 @@ export class KarmaxApi {
     if ((images as ImageRef[] | undefined)?.length) input.images = images as ImageRef[];
     if ((files as FileRef[] | undefined)?.length) input.files = files as FileRef[];
     if (_discardProgress === true) input.discardProgress = true;
+    // A branch its parent shipped (SPEC §11.1): every run checks it out and
+    // follows the task's own routes, as the first one did.
+    const shippedFrom = task.params._shippedFrom as TaskInput['shippedFrom'] | undefined;
+    if (task.parentTaskId && shippedFrom?.taskId === task.parentTaskId) input.shippedFrom = shippedFrom;
     const transferLock = await this.deps.store.kvGet(`project-transfer-lock:${project.id}`);
     if ((await this.deps.store.getProject(project.id))?.organizationId !== project.organizationId
       || transferLock && JSON.parse(transferLock).expiresAt > Date.now()

@@ -591,10 +591,11 @@ export interface ProjectConfig {
    * the fair fallback admission queue. */
   landingAuthority?: LandingAuthority;
   /** Allow one task to partition its change across several branches, each landing
-   *  as its own pull request (SPEC §11.1, the agent's `create_branch`). Its only
-   *  structural effect is that the world nests its checkouts at Setup, so a
-   *  branch added later has somewhere to live inside the world boundary; the
-   *  task's lifecycle stays singular (one Review, one Merge). */
+   *  as its own pull request (SPEC §11.1, the agent's `create_branch`). The world
+   *  nests its checkouts at Setup, so a branch added later has somewhere to live
+   *  inside the world boundary. Branches land together at the task's Review and
+   *  Merge, except one the agent opens on its own (`open_pr` with `branch`,
+   *  software-dev ≥1.30), which becomes a sub-task with its own. */
   multiPr?: boolean;
   /** @deprecated Human-created development ignores this field and always uses
    *  the creator's user-owned default Git profile. Retained for replay and for
@@ -895,6 +896,42 @@ export interface TaskCheckout {
   /** Name of the sibling checkout this one is stacked on, if any. */
   stackedOn?: string;
   pr?: TaskPullRequest;
+}
+
+/** What a Do turn asks its workflow when the agent opens one branch's pull
+ * request while it keeps working (`open_pr` with `branch`, SPEC §11.1). */
+export interface ShipBranchRequest {
+  name: string;
+  title?: string;
+  /** The turn's world handle: a branch added this turn is only in it. */
+  handle: WorldHandleRef;
+}
+export type ShipBranchOutcome =
+  | { ok: true; childTaskId: string; branch: string; checkout: string; target: string }
+  | { ok: false; reason: string };
+
+/**
+ * A branch a multi-branch task opened its pull request for while it kept
+ * working (SPEC §11.1, `open_pr` with `branch`). The branch left the task's
+ * world and became its own sub-task, which is reviewed and lands on its own;
+ * the task is done only once every one of these has settled.
+ */
+export interface TaskShipment {
+  /** The checkout's name in this task's world when it was shipped. */
+  checkout: string;
+  /** The sub-task that owns its pull request. */
+  childTaskId: string;
+  /** Its branch (the sub-task's own: `tavya/<childTaskId>`). */
+  branch: string;
+  /** The checkout's own branch in this task's world, which a sibling may be stacked on. */
+  fromBranch: string;
+  /** The commit it was shipped at. */
+  head: string;
+  /** The branch it lands on. */
+  target: string;
+  state: 'open' | 'landed' | 'cancelled' | 'failed';
+  /** The Do turn's request that made it: a retried turn asking again gets it back. */
+  requestId: string;
 }
 
 export interface TaskPullRequest {
@@ -1739,6 +1776,8 @@ export interface TaskView {
   /** Every branch this task is opening a pull request for (SPEC §11.1). Present
    *  only for a multi-PR task; a single-branch task keeps `branch`/`prs` alone. */
   checkouts?: TaskCheckout[];
+  /** Branches this task shipped as their own pull requests (software-dev ≥1.30). */
+  shipments?: TaskShipment[];
   /** `unreachable` distinguishes "the coordinator could not be queried" from
    *  the identical-looking "position -1 of an empty queue". */
   mergeQueue?: { position: number; total: number; unreachable?: boolean };
@@ -1864,6 +1903,11 @@ export interface TaskInput {
   repoBranches?: RepoBranches;
   /** Existing branch to merge (merge-only workflow). */
   branch?: string;
+  /** software-dev ≥1.30: this task owns a branch its parent shipped while it
+   *  kept working. Its world checks out that branch (its own task branch, which
+   *  the parent created at the shipped commit), it goes straight to its PR, and
+   *  its Review and questions follow the task's own routes, not the parent. */
+  shippedFrom?: { taskId: string; checkout: string };
   command?: string;
   /** software-dev ≥1.29: when `command` (the task's own code) fails, `fail` ends the task;
    *  `agent` hands it to the Do agent with the output. */
@@ -1973,6 +2017,8 @@ export interface TaskContinuation {
     awaitingResponse: string[];
     raises: ChildRaise[];
     settled: { childTaskId: string; stage: string; detail?: string }[];
+    /** v1.30: branches shipped as their own pull requests. */
+    shipments?: TaskShipment[];
   };
   collaborations: { pending: string[]; settled: string[] };
   consumed: string[];
