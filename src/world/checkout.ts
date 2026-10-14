@@ -120,33 +120,3 @@ export async function addCheckoutViaExec(world: World, spec: WorldCheckoutSpec):
   world.handle = next;
   return next;
 }
-
-/**
- * Hand a checkout added with `addCheckout` out of this world: its worktree is
- * removed and it leaves the handle, so nothing in this task proposes, merges or
- * re-publishes it again (a multi-branch task shipping it as its own pull
- * request, SPEC §11.1). Its branch stays in the repository for whoever owns it
- * now. The checkouts the world was provisioned with carry the task's own
- * branch and cannot be removed. Works on every backend through `exec`, and is
- * idempotent: a retried turn removing it again finds it already gone.
- */
-export async function removeCheckout(world: World, name: string): Promise<WorldHandle> {
-  const repos = worldRepos(world.handle);
-  const repo = repos.find((candidate) => candidate.name === name);
-  if (!repo) return world.handle;
-  if (!shippableCheckout(world.handle, repo)) throw new Error(`checkout "${name}" carries this task's own branch and cannot leave its world`);
-  const keeper = repos.find((candidate) => candidate !== repo && candidate.repo === repo.repo) ?? repos.find((candidate) => candidate !== repo);
-  const cwd = keeper?.root ?? world.handle.root;
-  await world.exec('git', ['worktree', 'remove', '--force', repo.root], { cwd });
-  await world.exec('rm', ['-rf', repo.root], { cwd: world.handle.root });
-  await world.exec('git', ['worktree', 'prune'], { cwd });
-  const next = { ...world.handle, repos: repos.filter((candidate) => candidate !== repo) };
-  world.handle = next;
-  return next;
-}
-
-/** A checkout the agent added (create_branch), as opposed to one the world was
- * provisioned with: those carry the task's own branch and land with the task. */
-export function shippableCheckout(handle: WorldHandle, repo: WorldRepo): boolean {
-  return repo.branch !== handle.branch && repo.role !== 'project-wiki' && repo.root !== handle.root;
-}

@@ -7,21 +7,24 @@ import { TASK_QUEUE } from '../src/temporal/config.js';
 import { git } from '../src/world/git.js';
 
 /**
- * Several branches per task (SPEC §11.1): the agent may open a pull request for
- * one branch while it keeps working (`open_pr` with `branch`). That branch
- * becomes its own sub-task, reviewed and landed on its own timing; the task is
- * done once its agent has finished AND every pull request it opened has landed.
+ * Several branches per task (SPEC §11.1): ONE agent in ONE world, a checkout
+ * per branch, and every branch landing as its own pull request on its own
+ * timing. `open_pr({branch})` opens (or updates) one branch's pull request
+ * while the agent keeps working; `open_pr` alone means it is finished. Each pull
+ * request is a sub-task that reviews and lands a snapshot of the branch from a
+ * worktree in the task's world — no second sandbox, no second agent: changes a
+ * pull request needs come back to the one agent. The task is done once its
+ * agent has finished and every pull request has settled.
  *
  * Real Temporal + git, mock agent. `@ship <name>` is `open_pr({ branch: name })`.
  */
-describe('software-dev: shipping branches of a multi-branch task on their own', () => {
+describe('software-dev: every branch of a task lands as its own pull request', () => {
   let h: Harness;
   beforeAll(async () => { h = await bootHarness(); }, 60_000);
   afterAll(async () => { await h?.stop(); });
 
   const view = (handle: { query: (name: string) => Promise<unknown> }) => handle.query('view') as Promise<any>;
-  // A task of a real project, so its shipped sub-tasks are made, routed and
-  // forked from records exactly as in the product.
+  /** A task of a real project, so its pull requests are made and routed from records as in the product. */
   const start = async (repo: string, prompt: string) => {
     const config = { repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false, multiPr: true };
     const project = await h.store.createProject(`Ship ${path.basename(repo)}`, config);
@@ -34,64 +37,149 @@ describe('software-dev: shipping branches of a multi-branch task on their own', 
     });
     return { taskId: task.id, handle };
   };
-  const shippedChild = async (handle: any) => {
-    await expect.poll(async () => (await view(handle)).subTasks?.length ?? 0, { timeout: 30_000 }).toBe(1);
-    const childId = (await view(handle)).subTasks[0] as string;
-    return { childId, child: h.client.workflow.getHandle(childId) };
+  /** The task's `n`th pull request, once it waits for a person's Review. */
+  const pullRequest = async (handle: any, n: number) => {
+    await expect.poll(async () => (await view(handle)).subTasks?.length ?? 0, { timeout: 30_000 }).toBeGreaterThanOrEqual(n);
+    const childId = (await view(handle)).subTasks[n - 1] as string;
+    const child = h.client.workflow.getHandle(childId);
+    await expect.poll(async () => { const v = await view(child); return `${v.stage}/${v.waitingFor?.kind}`; },
+      { timeout: 30_000 }).toBe('review/human');
+    return { childId, child };
   };
-  // Commit the docs branch, as an agent must before it can open its pull request.
+  const said = async (handle: any) => (await view(handle)).messages
+    .filter((m: any) => m.role === 'agent').map((m: any) => m.text).join('\n');
+  // Commit to the docs branch, as an agent must before its pull request opens.
   const docsCommit = "@run cd ../docs && mkdir -p docs && echo '# Guide' > docs/guide.md && git add -A && git commit -qm docs";
 
-  it('a branch lands on its own while the agent keeps working, then the agent opens the rest', async () => {
+  it('one agent, one world: a pull request lands while the agent keeps working, then its last one', async () => {
     const repo = await h.makeRepo('ship-while-working');
     const gate = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'ship-gate-')), 'go');
     const { taskId, handle } = await start(repo, [
       '@branch docs',
       docsCommit,
       '@ship docs',
-      // The agent keeps working in the same turn while the docs PR is reviewed.
+      // The agent keeps working in the same turn while the docs pull request is reviewed.
       `@run while [ ! -f ${gate} ]; do sleep 0.2; done`,
       '@write feature.js :: export const feature = 1;',
       '@run git add -A && git commit -qm feature',
     ].join('\n'));
-
     try {
-      const { childId, child } = await shippedChild(handle);
-      // The shipped branch is its own task: its own branch, landing on main, at
-      // Review — a person's, not the parent agent's.
-      await expect.poll(async () => { const v = await view(child); return `${v.stage}/${v.waitingFor?.kind}`; },
-        { timeout: 30_000 }).toBe('review/human');
-      const childView = await view(child);
-      expect(childView.branch).toBe(`tavya/${childId}`);
-      expect(childView.targetBranch).toBe('main');
-      expect(childView.parentTaskId).toBe(taskId);
+      const { childId, child } = await pullRequest(handle, 1);
+      const pr = await view(child);
+      expect(pr.branch).toBe(`tavya/${childId}`);
+      expect(pr.targetBranch).toBe('main');
+      expect(pr.parentTaskId).toBe(taskId);
+      // It lands from a worktree in the task's own world: no world of its own.
+      expect(pr.world.id).toBe(taskId);
+      expect(pr.world.repos.map((r: any) => r.name)).toEqual(['docs']);
+      expect(pr.world.repos[0].root).toContain(path.join('.karmax-injection', 'pull-requests', childId));
+      expect(await h.store.currentWorld(childId)).toBeFalsy();
 
-      // The parent is still working, and has handed the branch off.
-      const parentWorking = await view(handle);
-      expect(parentWorking.stage).toBe('do');
-      expect(parentWorking.agentTurn?.state).toBe('running');
-      expect(parentWorking.checkouts?.map((c: any) => c.name) ?? []).not.toContain('docs');
-      expect(parentWorking.shipments).toEqual([expect.objectContaining({ checkout: 'docs', childTaskId: childId })]);
+      // The agent is still working.
+      const parent = await view(handle);
+      expect(parent.stage).toBe('do');
+      expect(parent.agentTurn?.state).toBe('running');
+      expect(parent.shipments).toEqual([expect.objectContaining({ checkout: 'docs', childTaskId: childId, state: 'open' })]);
 
-      // The reviewer approves the docs PR; it lands while the agent still works.
+      // The reviewer approves it; it lands while the agent still works.
       await child.signal('confirm');
       expect((await child.result()).stage).toBe('done');
       expect((await git(repo, ['show', 'main:docs/guide.md'])).stdout).toContain('# Guide');
       expect((await git(repo, ['log', '--oneline', 'main'])).stdout).toContain(`merge tavya/${childId} into main`);
       expect((await view(handle)).agentTurn?.state).toBe('running');
-      expect((await git(repo, ['show', 'main:feature.js'])).code).not.toBe(0);
 
-      // The agent finishes; the rest of its work goes through the task's own Review.
+      // The agent finishes: its other branch opens as its own pull request,
+      // and the task waits for it — it never has a Review of its own.
       fs.writeFileSync(gate, '');
-      await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
-      await handle.signal('confirm');
+      const { childId: lastId, child: last } = await pullRequest(handle, 2);
+      expect((await view(handle)).waitingFor?.kind).toBe('subtask');
+      expect((await view(handle)).stage).toBe('do');
+      await last.signal('confirm');
       expect((await handle.result()).stage).toBe('done');
       expect((await git(repo, ['show', 'main:feature.js'])).stdout).toContain('feature');
-      expect((await view(handle)).shipments).toEqual([expect.objectContaining({ checkout: 'docs', state: 'landed' })]);
+      expect((await git(repo, ['log', '--oneline', 'main'])).stdout).toContain(`merge tavya/${lastId} into main`);
+      expect((await git(repo, ['log', '--oneline', 'main'])).stdout).not.toContain(`merge tavya/${taskId} into main`);
+      expect((await view(handle)).shipments.map((s: any) => s.state)).toEqual(['landed', 'landed']);
+      // Its branches stayed in its world throughout.
+      expect((await view(handle)).checkouts.map((c: any) => c.name)).toContain('docs');
     } finally { fs.writeFileSync(gate, ''); }
   }, 150_000);
 
-  it('the final proposal does not wait for an earlier PR, but Done does', async () => {
+  it('a change Review asks for is made by the same agent in its own checkout, and the pull request lands with it', async () => {
+    const repo = await h.makeRepo('ship-revise');
+    const { taskId, handle } = await start(repo, ['@branch docs', docsCommit, '@ship docs', '@incomplete'].join('\n'));
+    const { child } = await pullRequest(handle, 1);
+
+    // The reviewer asks the pull request for more. It has no agent: the task's
+    // agent gets the request, makes the change in its docs checkout and opens
+    // the pull request again.
+    await child.signal('followUp', { id: 'rv1', role: 'user', ts: 0, text: [
+      "@run cd ../docs && echo '# FAQ' > docs/faq.md && git add -A && git commit -qm faq",
+      '@ship docs',
+      '@incomplete',
+    ].join('\n') });
+    await expect.poll(async () => (await view(handle)).messages.some((m: any) => m.role === 'user'
+      && m.text.startsWith('Changes are needed in the pull request for "docs"')), { timeout: 30_000 }).toBe(true);
+    await expect.poll(async () => said(handle), { timeout: 30_000 }).toMatch(/shipped: docs as /g);
+    // Still one pull request, back at Review with the new commit.
+    const { child: again } = await pullRequest(handle, 1);
+    expect((await view(handle)).subTasks).toHaveLength(1);
+    expect((await h.store.eventsOfType(taskId, 'agent.output')).some((e) => String(e.payload.text).includes('echo \'# FAQ\''))).toBe(true);
+    await again.signal('confirm');
+    expect((await again.result()).stage).toBe('done');
+    expect((await git(repo, ['show', 'main:docs/faq.md'])).code).toBe(0);
+    expect((await git(repo, ['show', 'main:docs/guide.md'])).code).toBe(0);
+
+    // Finishing with nothing new: no more pull requests, and the task is done.
+    await handle.signal('followUp', { id: 'f1', role: 'user', ts: 0, text: 'That is all.' });
+    expect((await handle.result()).stage).toBe('done');
+    expect((await view(handle)).subTasks).toHaveLength(1);
+  }, 150_000);
+
+  it('opening a pull request again before Review updates it; after it lands, the branch opens a new one', async () => {
+    const repo = await h.makeRepo('ship-again');
+    const { handle } = await start(repo, [
+      '@branch docs',
+      docsCommit,
+      '@ship docs',
+      "@run cd ../docs && echo more >> docs/guide.md && git commit -qam more",
+      '@ship docs',
+      '@incomplete',
+    ].join('\n'));
+    await expect.poll(async () => said(handle), { timeout: 30_000 }).toMatch(/shipped: docs as .*\n.*\n.*shipped: docs as /);
+    expect((await view(handle)).subTasks).toHaveLength(1);
+    // Review is of the commit the agent opened it at last.
+    const docsBranch = (await view(handle)).checkouts.find((c: any) => c.name === 'docs').branch;
+    const head = (await git(repo, ['rev-parse', docsBranch])).stdout.trim();
+    await expect.poll(async () => (await h.store.eventsOfType((await view(handle)).taskId, 'pull-request.snapshot'))
+      .some((event) => (event.payload as any).head === head), { timeout: 30_000 }).toBe(true);
+    const { child } = await pullRequest(handle, 1);
+    await child.signal('confirm');
+    expect((await child.result()).stage).toBe('done');
+    expect((await git(repo, ['show', 'main:docs/guide.md'])).stdout).toContain('more');
+
+    // Later in the same session the agent adds to the branch: it must take in
+    // what landed first, and then it is a new pull request.
+    await handle.signal('followUp', { id: 'f1', role: 'user', ts: 0, text: [
+      "@run cd ../docs && echo faq > faq.md && git add -A && git commit -qm faq",
+      '@ship docs',
+      '@incomplete',
+    ].join('\n') });
+    await expect.poll(async () => said(handle), { timeout: 30_000 }).toMatch(/ship refused: bring "docs" up to date with main/);
+    await handle.signal('followUp', { id: 'f2', role: 'user', ts: 0, text: [
+      '@run cd ../docs && git merge -q --no-edit main',
+      '@ship docs',
+      '@incomplete',
+    ].join('\n') });
+    const { child: second } = await pullRequest(handle, 2);
+    await second.signal('confirm');
+    expect((await second.result()).stage).toBe('done');
+    expect((await git(repo, ['show', 'main:faq.md'])).code).toBe(0);
+    await handle.signal('cancel');
+    await handle.result();
+  }, 150_000);
+
+  it('Done waits for every pull request, whichever lands first', async () => {
     const repo = await h.makeRepo('ship-done-waits');
     const { handle } = await start(repo, [
       '@branch docs',
@@ -100,104 +188,19 @@ describe('software-dev: shipping branches of a multi-branch task on their own', 
       '@write feature.js :: export const feature = 1;',
       '@run git add -A && git commit -qm feature',
     ].join('\n'));
-    const { child } = await shippedChild(handle);
-
-    // Both proposals are in Review at once: neither waits for the other.
-    await expect.poll(async () => (await view(child)).waitingFor?.kind, { timeout: 30_000 }).toBe('human');
-    await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 30_000 }).toBe('human');
-    expect((await view(child)).stage).toBe('review');
-    expect((await view(handle)).stage).toBe('review');
-
-    // The task's own PR lands first; the task is not done while the docs PR is open.
-    await handle.signal('confirm');
-    await expect.poll(async () => (await git(repo, ['show', 'main:feature.js'])).code, { timeout: 30_000 }).toBe(0);
+    const { child: docs } = await pullRequest(handle, 1);
+    const { child: feature } = await pullRequest(handle, 2);
+    await feature.signal('confirm');
+    expect((await feature.result()).stage).toBe('done');
     await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 30_000 }).toBe('subtask');
     expect((await view(handle)).status).not.toBe('done');
-
-    await child.signal('confirm');
+    await docs.signal('confirm');
     expect((await handle.result()).stage).toBe('done');
     expect((await git(repo, ['show', 'main:docs/guide.md'])).code).toBe(0);
+    expect((await git(repo, ['show', 'main:feature.js'])).code).toBe(0);
   }, 150_000);
 
-  it('with everything already shipped, finishing needs no Review of its own', async () => {
-    const repo = await h.makeRepo('ship-everything');
-    const { taskId, handle } = await start(repo, ['@branch docs', docsCommit, '@ship docs'].join('\n'));
-    const { child } = await shippedChild(handle);
-    await expect.poll(async () => (await view(child)).stage, { timeout: 30_000 }).toBe('review');
-    // The agent finished with nothing left to propose: it waits for its PR, not for a reviewer.
-    await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 30_000 }).toBe('subtask');
-    expect((await view(handle)).stage).not.toBe('review');
-
-    await child.signal('confirm');
-    expect((await handle.result()).stage).toBe('done');
-    expect((await git(repo, ['log', '--oneline', 'main'])).stdout).not.toContain(`merge tavya/${taskId} into main`);
-  }, 120_000);
-
-  it('a reviewer\'s change request is made in the shipped branch, which then lands', async () => {
-    const repo = await h.makeRepo('ship-revise');
-    const { taskId, handle } = await start(repo, ['@branch docs', docsCommit, '@ship docs', '@incomplete'].join('\n'));
-    const { child } = await shippedChild(handle);
-    await expect.poll(async () => (await view(child)).waitingFor?.kind, { timeout: 30_000 }).toBe('human');
-
-    // The reviewer asks for more; the shipped branch's own agent works in a
-    // world holding exactly that branch, and proposes it again.
-    await child.signal('followUp', { id: 'rv1', role: 'user', ts: 0, text: [
-      '@run test -f docs/guide.md && echo HAS-GUIDE',
-      '@write docs/faq.md :: # FAQ',
-      '@run git add -A && git commit -qm faq',
-    ].join('\n') });
-    await expect.poll(async () => (await view(child)).messages.some((m: any) => m.role === 'agent' && m.text.includes('ran: test -f docs/guide.md')),
-      { timeout: 30_000 }).toBe(true);
-    await expect.poll(async () => { const v = await view(child); return `${v.stage}/${v.waitingFor?.kind}`; },
-      { timeout: 30_000 }).toBe('review/human');
-    expect((await h.store.eventsOfType((await view(child)).taskId, 'agent.output'))
-      .some((event) => String(event.payload.text).includes('HAS-GUIDE'))).toBe(true);
-    // The agent answering is a fork of the one that wrote the branch, though the
-    // task names no provider: it resolved its profile when the branch shipped.
-    const childTask = await h.store.getTask((await view(child)).taskId);
-    expect(childTask?.params['agent:do']).toMatchObject({ provider: 'mock', resumeFrom: { taskId, role: 'do' } });
-    expect((await h.store.eventsOfType(childTask!.id, 'session.forked'))
-      .some((event) => (event.payload as any).from?.taskId === taskId)).toBe(true);
-    // Each fact once: it is listed as the task's sub-task, not also as its fork.
-    expect(await h.store.forkTaskSummaries(taskId)).toEqual([]);
-    expect(await h.store.forkSourceTaskSummaries(childTask!.id)).toEqual([]);
-    await child.signal('confirm');
-    expect((await child.result()).stage).toBe('done');
-    expect((await git(repo, ['show', 'main:docs/faq.md'])).code).toBe(0);
-    expect((await git(repo, ['show', 'main:docs/guide.md'])).code).toBe(0);
-
-    // The managing task hears that its pull request landed at its next turn.
-    await handle.signal('followUp', { id: 'f1', role: 'user', ts: 0, text: 'Anything left?\n@incomplete' });
-    await expect.poll(async () => (await view(handle)).messages.some((m: any) => m.role === 'user'
-      && /The pull request for "docs" .* landed on main/.test(m.text)), { timeout: 30_000 }).toBe(true);
-    await handle.signal('cancel');
-    await handle.result();
-  }, 150_000);
-
-  it('shipping a recreated branch again is refused aloud, never answered with the earlier PR', async () => {
-    const repo = await h.makeRepo('ship-again');
-    const { handle } = await start(repo, [
-      '@branch docs',
-      docsCommit,
-      '@ship docs',
-      // Same turn: the agent takes the branch name up again and adds to it.
-      '@branch docs',
-      "@run cd ../docs && echo more >> docs/guide.md && git commit -qam more",
-      '@ship docs',
-      '@incomplete',
-    ].join('\n'));
-    await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 30_000 }).toBe('human');
-    const said = (await view(handle)).messages.filter((m: any) => m.role === 'agent').map((m: any) => m.text).join('\n');
-    expect(said).toMatch(/shipped: docs as /);
-    expect(said).toMatch(/ship refused: the earlier pull request for "docs" .* has not landed yet/);
-    // One pull request, and the new work is still in the agent's world.
-    expect((await view(handle)).subTasks).toHaveLength(1);
-    expect((await view(handle)).checkouts.map((c: any) => c.name)).toContain('docs');
-    await handle.signal('cancel');
-    await handle.result();
-  }, 120_000);
-
-  it('refuses what cannot land on its own, and tells the agent why', async () => {
+  it('refuses what cannot open, and tells the agent why', async () => {
     const repo = await h.makeRepo('ship-refusals');
     const { handle } = await start(repo, [
       '@branch docs',
@@ -205,16 +208,14 @@ describe('software-dev: shipping branches of a multi-branch task on their own', 
       '@ship docs',                      // uncommitted work
       '@branch empty',
       '@ship empty',                     // nothing to propose
-      `@ship ${path.basename(repo)}`,    // the task's own branch lands with the task
       '@ship nope',                      // no such branch
       '@incomplete',
     ].join('\n'));
     await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 30_000 }).toBe('human');
-    const said = (await view(handle)).messages.filter((m: any) => m.role === 'agent').map((m: any) => m.text).join('\n');
-    expect(said).toMatch(/ship refused: .*docs.*uncommitted/i);
-    expect(said).toMatch(/ship refused: .*empty.*no commits/i);
-    expect(said).toMatch(/ship refused: .*lands with this task/i);
-    expect(said).toMatch(/ship refused: .*no branch named "nope"/i);
+    const text = await said(handle);
+    expect(text).toMatch(/ship refused: .*docs.*uncommitted/i);
+    expect(text).toMatch(/ship refused: .*empty.*no commits/i);
+    expect(text).toMatch(/ship refused: .*no branch named "nope"/i);
     expect((await view(handle)).subTasks ?? []).toHaveLength(0);
     await handle.signal('cancel');
     await handle.result();

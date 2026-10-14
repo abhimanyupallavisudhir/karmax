@@ -4,7 +4,6 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { WorktreeProvider } from '../src/world/worktree.js';
 import { finalizeMerge } from '../src/world/merge.js';
-import { removeCheckout } from '../src/world/checkout.js';
 import { worldRepos } from '../src/world/types.js';
 import { mergeQueueDomains } from '../src/domain/types.js';
 import { git, gitOrThrow, ensureIdentity } from '../src/world/git.js';
@@ -152,26 +151,6 @@ describe('multi-PR tasks (several branches in one world, real git)', () => {
     const world = await provider.create({ taskId: 't-flat', repo, base: 'main', target: 'main' });
     expect(worldRepos(world.handle)[0]!.root).toBe(world.handle.root); // flat: root IS the worktree
     await expect(world.addCheckout!({ name: 'docs' })).rejects.toThrow(/nested/i);
-    await world.destroy();
-  });
-
-  it('hands a shipped checkout out of the world, keeping its branch for its new owner', async () => {
-    const provider = new WorktreeProvider(home);
-    const world = await provider.create({ taskId: 't-ship', repo, base: 'main', target: 'main', layout: 'nested' });
-    await world.addCheckout!({ name: 'docs' });
-    const docs = worldRepos(world.handle)[1]!;
-    await commitIn(docs.root, 'README.md', '# docs\n', 'docs');
-
-    const handle = await removeCheckout(world, 'docs');
-    expect(worldRepos(handle).map((r) => r.name)).toEqual([worldRepos(handle)[0]!.name]);
-    expect(world.handle).toBe(handle);
-    expect(fs.existsSync(docs.root)).toBe(false);
-    // The branch stays, no longer checked out anywhere: another world can take it.
-    expect((await git(repo, ['rev-parse', '--verify', docs.branch])).code).toBe(0);
-    expect((await git(repo, ['worktree', 'list'])).stdout).not.toContain(docs.root);
-    // Idempotent, and the task's own branch cannot leave.
-    expect(await removeCheckout(world, 'docs')).toBe(handle);
-    await expect(removeCheckout(world, worldRepos(handle)[0]!.name)).rejects.toThrow(/own branch/);
     await world.destroy();
   });
 

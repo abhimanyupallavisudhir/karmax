@@ -10609,9 +10609,6 @@ function taskForkSourceIds(task) {
     for (const child of Object.values(value)) visit(child);
   };
   visit(task?.params);
-  // A shipped branch's task is listed as its parent's sub-task, not also as a fork.
-  const shippedFrom = task?.params?._shippedFrom?.taskId;
-  if (typeof shippedFrom === 'string') sources.delete(shippedFrom);
   return [...sources];
 }
 
@@ -10710,14 +10707,29 @@ function checkoutsSection(v) {
   const checkouts = v.checkouts || [];
   if (checkouts.length < 2) return '';                      // one branch: `branch`/`prs` already say it all
   const atReview = v.stage === 'review' && (v.actions || []).some((a) => a.name === 'confirm');
+  // software-dev ≥1.30: each branch's pull request is its own sub-task, opened
+  // whenever the agent is ready (the branch's latest one links to it).
+  const shipped = new Map((v.shipments || []).map((s) => [s.checkout, s]));
   const rows = checkouts.map((c) => {
+    const lane = shipped.get(c.name);
+    if (lane) {
+      const state = subTaskState(taskRecord(lane.childTaskId) || { lastView: { status: lane.state === 'open' ? 'active' : lane.state === 'landed' ? 'done' : lane.state } });
+      return `<div class="checkout-row">
+      <span class="subtask-state ${esc(state.tone)}" title="${esc(state.label)}"></span>
+      <b>${esc(c.name)}</b>
+      <span class="mono" style="color:var(--ink-3)">⎇ ${esc(c.branch)}</span>
+      <span style="color:var(--ink-3)">→ ${esc(lane.target)}</span>
+      <span style="flex:1"></span>
+      <button type="button" class="btn sm" data-open="${esc(lane.childTaskId)}" title="Its pull request: ${esc(state.label)}">${esc(numLabel(lane.childTaskId))}</button>
+    </div>`;
+    }
     const dest = c.stackedOn ? `on ${c.stackedOn}` : `→ ${c.target || v.targetBranch || 'target'}`;
     const pr = c.pr
       ? `<a class="pr-link ${c.pr.merged ? 'merged' : c.pr.state === 'closed' ? 'closed' : 'open'}"
            href="${esc(safeHref(c.pr.url))}" target="_blank" rel="noopener">⇱ #${c.pr.number}</a>`
       : '';
     return `<div class="checkout-row ${c.approved ? 'approved' : ''}">
-      <span class="checkout-mark" title="${c.approved ? 'Approved at this commit' : 'Not yet approved'}">${c.approved ? '✓' : '○'}</span>
+      ${atReview || c.approved ? `<span class="checkout-mark" title="${c.approved ? 'Approved at this commit' : 'Not yet approved'}">${c.approved ? '✓' : '○'}</span>` : '<span class="checkout-mark"></span>'}
       <b>${esc(c.name)}</b>
       <span class="mono" style="color:var(--ink-3)">⎇ ${esc(c.branch)}</span>
       <span style="color:var(--ink-3)">${esc(dest)}</span>

@@ -17,10 +17,6 @@ export function taskForkSourceIds(params: unknown): string[] {
     for (const child of Object.values(value)) visit(child);
   };
   visit(params);
-  // A shipped branch's task forks the agent of the task that shipped it
-  // (SPEC §11.1); it is shown as that task's sub-task, not also as a fork.
-  const shippedFrom = (params as { _shippedFrom?: { taskId?: unknown } } | undefined)?._shippedFrom?.taskId;
-  if (typeof shippedFrom === 'string') sources.delete(shippedFrom);
   return [...sources];
 }
 

@@ -910,17 +910,17 @@ export interface ShipBranchRequest {
   handle: WorldHandleRef;
 }
 export type ShipBranchOutcome =
-  | { ok: true; childTaskId: string; branch: string; checkout: string; target: string }
+  | { ok: true; childTaskId: string; branch: string; checkout: string; target: string; updated?: boolean }
   | { ok: false; reason: string };
 
 /**
- * A branch a multi-branch task opened its pull request for while it kept
- * working (SPEC §11.1, `open_pr` with `branch`). The branch left the task's
- * world and became its own sub-task, which is reviewed and lands on its own;
- * the task is done only once every one of these has settled.
+ * One pull request of a task with several branches (SPEC §11.1): a snapshot of
+ * one of its checkouts, reviewed and landed by its own sub-task from a worktree
+ * in the task's world while the agent keeps working. The agent opens it again
+ * to update it. The task is done only once every one of these has settled.
  */
 export interface TaskShipment {
-  /** The checkout's name in this task's world when it was shipped. */
+  /** The checkout it is a snapshot of. */
   checkout: string;
   /** The sub-task that owns its pull request. */
   childTaskId: string;
@@ -928,12 +928,12 @@ export interface TaskShipment {
   branch: string;
   /** The checkout's own branch in this task's world, which a sibling may be stacked on. */
   fromBranch: string;
-  /** The commit it was shipped at. */
+  /** The commit it is a snapshot of: the agent's latest `open_pr` of it. */
   head: string;
   /** The branch it lands on. */
   target: string;
   state: 'open' | 'landed' | 'cancelled' | 'failed';
-  /** The Do turn's request that made it: a retried turn asking again gets it back. */
+  /** The Do turn's request that last opened it: a retried turn asking again gets its answer back. */
   requestId: string;
 }
 
@@ -1906,11 +1906,12 @@ export interface TaskInput {
   repoBranches?: RepoBranches;
   /** Existing branch to merge (merge-only workflow). */
   branch?: string;
-  /** software-dev ≥1.30: this task owns a branch its parent shipped while it
-   *  kept working. Its world checks out that branch (its own task branch, which
-   *  the parent created at the shipped commit), it goes straight to its PR, and
-   *  its Review and questions follow the task's own routes, not the parent. */
-  shippedFrom?: { taskId: string; checkout: string };
+  /** software-dev ≥1.30: this task is one pull request of its parent, which
+   *  allows several branches (SPEC §11.1). It reviews and lands a snapshot of
+   *  the parent's checkout `checkout` through `world`, a view of the PARENT's
+   *  world narrowed to that snapshot's worktree; it has no world or agent of its
+   *  own. Changes it needs go to the parent's agent, which opens it again. */
+  shippedFrom?: { taskId: string; checkout: string; world?: WorldHandleRef };
   command?: string;
   /** software-dev ≥1.29: when `command` (the task's own code) fails, `fail` ends the task;
    *  `agent` hands it to the Do agent with the output. */
@@ -2041,6 +2042,8 @@ export interface TaskContinuation {
     commandRan?: boolean;
     /** v1.29: it finished cleanly with nothing to review. */
     commandUnchanged?: boolean;
+    /** v1.30: the agent finished, and its pull requests are open. */
+    pullRequestsOpened?: boolean;
     resourcesApplied: boolean;
   };
   manualPrConfirmer?: string;

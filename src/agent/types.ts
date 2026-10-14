@@ -43,11 +43,12 @@ export interface PlatformToolContext {
    *  Performed immediately so the agent can work in it during the SAME turn; the
    *  updated world handle rides back on the turn result for the workflow to adopt. */
   addCheckout(spec: import('../world/types.js').WorldCheckoutSpec): Promise<{ name: string; root: string; branch: string }>;
-  /** Do-agent ONLY, multi-branch tasks (software-dev ≥1.30): open the pull
-   *  request for one branch NOW and keep working. The branch leaves this world
-   *  and becomes its own sub-task, reviewed and landed on its own; the result
-   *  names it. Refusals throw, with what to do instead. */
-  shipBranch?(args: { name: string; title?: string }): Promise<{ childTaskId: string; branch: string }>;
+  /** Do-agent ONLY, tasks with several branches (software-dev ≥1.30): open
+   *  one branch's pull request NOW (or update it to the branch's commit) and
+   *  keep working. It is a sub-task that reviews and lands a snapshot of the
+   *  branch; changes it needs come back to this agent. Refusals throw, with
+   *  what to do instead. */
+  shipBranch?(args: { name: string; title?: string }): Promise<{ childTaskId: string; branch: string; updated?: boolean }>;
   /** Resolve agent's structured verdict (RESOLVE-PLAN §3.2): a bounded recovery
    *  transition the workflow executes (resume/retryStage/gotoStage/parkUntil/escalate)
    *  instead of guessing. Also marks the resolve turn complete. */

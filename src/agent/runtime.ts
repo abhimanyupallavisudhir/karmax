@@ -4,7 +4,6 @@ import type { Transition } from '../resolve/transitions.js';
 import { assertReviewInfoTotal, validateReviewInfoCall } from './review-info.js';
 import { AgentActivity, AgentWait, Provider, ReviewInfo, SubTaskRequest, SubTaskResponse, RaiseToParent, ConfirmDecision } from '../domain/types.js';
 import { jobStatuses } from '../world/jobs.js';
-import { removeCheckout } from '../world/checkout.js';
 import { worldRepos } from '../world/types.js';
 import { BRAND } from '../domain/brand.js';
 import { formatMinorUnits } from '../util/currency.js';
@@ -377,8 +376,8 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       await journal();
       return { name: added.name, root: added.root, branch: added.branch };
     },
-    // The pull request opens now, as its own sub-task, while the agent keeps
-    // working; the branch then leaves this world so nothing here touches it again.
+    // The branch's pull request opens (or, opened before, moves to this commit)
+    // as its own sub-task, while the agent keeps working in its checkout.
     async shipBranch({ name, title }) {
       if (input.role !== 'do') throw new Error('only the Do agent opens pull requests');
       const current = worldHandle ?? input.world.handle;
@@ -391,11 +390,10 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       if (head.code !== 0 || !head.stdout.trim()) throw new Error(`could not read the head of "${checkout.name}": ${head.stderr || head.stdout}`);
       const outcome = await deps.shipBranch({ name: checkout.name, ...(title ? { title } : {}), head: head.stdout.trim(), handle: current });
       if (!outcome.ok) throw new Error(outcome.reason);
-      worldHandle = await removeCheckout(input.world, outcome.checkout);
       if (!shipped.some((entry) => entry.childTaskId === outcome.childTaskId))
         shipped.push({ checkout: outcome.checkout, childTaskId: outcome.childTaskId, branch: outcome.branch });
       await journal();
-      return { childTaskId: outcome.childTaskId, branch: outcome.branch };
+      return { childTaskId: outcome.childTaskId, branch: outcome.branch, ...(outcome.updated ? { updated: true } : {}) };
     },
     async requestSpend(args) {
       if (!deps.budget || !deps.spendCtx) return { status: 'denied', reason: 'payments not configured' };
