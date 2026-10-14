@@ -10298,8 +10298,9 @@ async function openArtifact(url, external, target = '') {
     setTimeout(() => URL.revokeObjectURL(obj), 60_000);
   } catch (e) { toast(e.message, true); }
 }
-// Approve ONE branch of a multi-PR task. It records that this branch has been
-// reviewed at the commit it is on now; `confirm` still passes the gate.
+// Approve ONE branch of a multi-PR task: from software-dev 1.30 it lands that
+// branch at the agent's next pause; before, it records the branch reviewed at
+// its current commit and Confirm still passes the gate.
 function wireCheckoutApprovals(v) {
   document.querySelectorAll('[data-approve-checkout]').forEach((btn) =>
     btn.addEventListener('click', async () => {
@@ -10750,37 +10751,49 @@ function forkSourcesSection(v) {
 
 // The branches a multi-PR task is opening pull requests for (SPEC §11.1). Each is
 // its own reviewable unit, so each gets a row: where it lands, what it stacks on,
-// its pull request, and — at Review — an Approve button.
+// and its pull request.
 //
-// Approving marks a branch as reviewed AT ITS CURRENT HEAD. That is what makes the
-// loop-back cheap: send a follow-up about one branch, and when the task comes back
-// from Do the ones the agent did not touch are still approved, so only the changed
-// work needs another look. Confirm PR remains the single act that passes Review.
+// Software-dev ≥1.30 gives each branch its own lifecycle (`state`): it is
+// proposed while the agent keeps working, approved here whenever its reviewer
+// likes, and lands at the agent's next pause — so Approve shows on any branch
+// in review, whatever the task is doing. Older versions keep one Review: there
+// Approve marks a branch reviewed AT ITS CURRENT HEAD, and Confirm PR passes it.
+const BRANCH_STATE = {
+  review: ['In review', 'waiting'], approved: ['Approved', 'active'], landing: ['Landing', 'active'], landed: ['Landed', 'done'],
+};
 function checkoutsSection(v) {
   const checkouts = v.checkouts || [];
   if (checkouts.length < 2) return '';                      // one branch: `branch`/`prs` already say it all
-  const atReview = v.stage === 'review' && (v.actions || []).some((a) => a.name === 'confirm');
+  const lifecycle = checkouts.some((c) => c.state);
+  const atReview = !lifecycle && v.stage === 'review' && (v.actions || []).some((a) => a.name === 'confirm');
   const rows = checkouts.map((c) => {
     const dest = c.stackedOn ? `on ${c.stackedOn}` : `→ ${c.target || v.targetBranch || 'target'}`;
     const pr = c.pr
       ? `<a class="pr-link ${c.pr.merged ? 'merged' : c.pr.state === 'closed' ? 'closed' : 'open'}"
            href="${esc(safeHref(c.pr.url))}" target="_blank" rel="noopener">⇱ #${c.pr.number}</a>`
       : '';
-    return `<div class="checkout-row ${c.approved ? 'approved' : ''}">
-      <span class="checkout-mark" title="${c.approved ? 'Approved at this commit' : 'Not yet approved'}">${c.approved ? '✓' : '○'}</span>
+    const done = lifecycle ? c.state === 'landed' : c.approved;
+    const [label, tone] = BRANCH_STATE[c.state] || [];
+    const commit = c.landedSha || c.proposedHead || c.head;
+    const approvable = lifecycle ? c.state === 'review' : atReview && !c.approved;
+    return `<div class="checkout-row ${done ? 'approved' : ''}" data-branch-state="${esc(c.state || '')}">
+      <span class="checkout-mark" title="${lifecycle ? esc(label || 'Not proposed yet') : c.approved ? 'Approved at this commit' : 'Not yet approved'}">${done ? '✓' : '○'}</span>
       <b>${esc(c.name)}</b>
       <span class="mono" style="color:var(--ink-3)">⎇ ${esc(c.branch)}</span>
       <span style="color:var(--ink-3)">${esc(dest)}</span>
-      ${c.head ? `<span class="mono" style="color:var(--ink-3)">${esc(c.head.slice(0, 7))}</span>` : ''}
+      ${commit ? `<span class="mono" style="color:var(--ink-3)">${esc(commit.slice(0, 7))}</span>` : ''}
       ${pr}
       <span style="flex:1"></span>
-      ${atReview && !c.approved ? `<button class="btn sm" data-approve-checkout="${esc(c.name)}">Approve</button>` : ''}
+      ${label ? `<span class="chip ${tone}">${label}</span>` : ''}
+      ${approvable ? `<button class="btn sm" data-approve-checkout="${esc(c.name)}">Approve</button>` : ''}
     </div>`;
   }).join('');
   const pending = checkouts.filter((c) => !c.approved).length;
+  const inReview = checkouts.filter((c) => c.state === 'review').length;
   return `<div class="section-h">Branches</div>
     <div class="card checkout-list">
       ${rows}
+      ${lifecycle && inReview ? `<div class="task-sub" style="margin-top:6px">${inReview} in review ${policyTip('An approved branch lands as soon as the agent pauses. A branch the agent changes after proposing it goes back to it to propose again.')}</div>` : ''}
       ${atReview ? `<div class="task-sub" style="margin-top:6px">${pending
         ? `${pending} of ${checkouts.length} still to review ${policyTip('Approving one keeps it approved when the task comes back from Do, as long as the agent does not touch it. Confirm PR approves the rest and passes Review.')}`
         : 'Every branch approved. Confirm PR to pass Review.'}</div>` : ''}
@@ -13091,8 +13104,8 @@ function taskActions(v) {
  */
 function actionToast(signal, label) {
   if (signal === 'confirm' && String(label).toLowerCase() === 'done') return 'Confirmation sent';
-  const standard = { confirm: 'confirm', openPr: 'manually open & confirm pr', cancel: 'cancel', retry: 'retry', resume: 'resume', followUp: 'send' };
-  const done = { confirm: 'Confirmed', openPr: 'Opening PR and requesting confirmation', cancel: 'Cancelled', retry: 'Retrying', resume: 'Resumed', followUp: 'Sent' };
+  const standard = { confirm: 'confirm', openPr: 'manually open & confirm pr', cancel: 'cancel', finish: 'finish', retry: 'retry', resume: 'resume', followUp: 'send' };
+  const done = { confirm: 'Confirmed', openPr: 'Opening PR and requesting confirmation', cancel: 'Cancelled', finish: 'Finishing', retry: 'Retrying', resume: 'Resumed', followUp: 'Sent' };
   const text = String(label || signal).trim();
   if (signal === 'openPr' && text.toLowerCase() === 'return to review & confirm') return 'Returning to Review';
   return text.toLowerCase() === standard[signal] ? done[signal] : `${text} — done`;
@@ -13104,6 +13117,7 @@ const returnToReviewConfirmation = () => `Return this pull request to Review and
 
 function confirmTaskAction(action, v = S.view) {
   if (action === 'cancel') return confirm('Cancel this task?');
+  if (action === 'finish') return confirm('Finish this task? Branches that have not landed are closed.');
   return action !== 'openPr' || confirm(v?.stage === 'escalated'
     ? ERROR_OPEN_PR_CONFIRMATION
     : hasOpenPullRequest(v) ? returnToReviewConfirmation()

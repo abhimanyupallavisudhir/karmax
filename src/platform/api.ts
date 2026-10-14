@@ -3,7 +3,7 @@ import { resolvePaymentPolicy, validatePaymentPolicy, withPolicyCurrency } from 
 import { randomUUID } from 'node:crypto';
 import { timingEnabled, installationTiming, timingReport } from '../timing/index.js';
 import { expectedTaskRemoteHeads, recordTaskPublication } from '../world/publication.js';
-import { recordHumanConfirmation } from './review-confirmation.js';
+import { recordBranchApproval, recordHumanConfirmation } from './review-confirmation.js';
 import { notifyChildSettlement } from './child-settlement.js';
 import { WorkflowExecutionAlreadyStartedError, WorkflowNotFoundError, type Client, type WorkflowExecutionDescription } from '@temporalio/client';
 import { WorkflowIdReusePolicy } from '@temporalio/common';
@@ -33,6 +33,7 @@ import {
   MERGE_QUEUE_WORKFLOW,
   AGENT_QUEUE_WORKFLOW,
 } from '../coordinators/names.js';
+import { approvalsOf, branchLedgerOf } from '../domain/checkouts.js';
 import { TaskRecord, TaskView, AttentionAsk, Message, Project, TaskInput, ImageRef, FileRef, Tag, SavedView, TaskQuery, AgentRole, AgentSpec, AgentAuthority, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency, remotePolicyOf, ResourceAccess, ResourceTarget } from '../domain/types.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable, awaitsSuccessOf, isSeries } from '../domain/triggers.js';
 import { BUILT_IN_AUTOMATIONS, automationNeeds, templateTask, type AutomationNeed, type AutomationTemplate } from '../domain/automations.js';
@@ -3672,9 +3673,11 @@ export class KarmaxApi {
       // is not asked to re-approve branches nothing has touched. Each is still
       // pinned to the head it was given at, so a moved branch lapses regardless.
       ...(view.checkouts?.some((checkout) => checkout.approved)
-        ? { checkoutApprovals: Object.fromEntries(view.checkouts.filter((c) => c.approved && c.head).map((c) => [c.name, c.head!])) }
+        ? { checkoutApprovals: approvalsOf(view.checkouts) }
         : {}),
       ...(view.landing ? { landing: { ...view.landing, authorizedHeads: { ...(view.landing.authorizedHeads ?? {}) } } } : {}),
+      // Software-dev ≥1.30: each branch's own proposal and landing.
+      ...(view.checkouts?.some((checkout) => checkout.state) ? { branches: branchLedgerOf(view.checkouts, view.state) } : {}),
     };
     const {
       humanWait: savedHumanWait,
@@ -5869,7 +5872,7 @@ Act according to your Avatar instructions. When ready, call platform_request POS
     // `review:approve` (maintainer and above — not the default developer
     // profile), because the workflow parks on the same `confirmed` flag
     // whichever layer is playing and the signal would pre-satisfy the human one.
-    if (signal === SIG.confirm && caller.kind === 'agent' && !allows(caller.caps, 'review:approve'))
+    if ((signal === SIG.confirm || signal === SIG.approveCheckout) && caller.kind === 'agent' && !allows(caller.caps, 'review:approve'))
       throw new CapabilityError('confirming a Review gate needs review:approve (a maintainer-level authorization); an agent reviewing a task records its verdict with confirm_decision');
     if (signal === SIG.openPr && heldOrigin && heldOrigin !== 'do')
       throw new Error(`this is a hold on ${stageName(heldOrigin)}, not a proposal waiting to be opened`);
@@ -5879,7 +5882,25 @@ Act according to your Avatar instructions. When ready, call platform_request POS
       && attemptGroup.attempts.some((a) => a.id !== taskId && !['done', 'cancelled', 'failed'].includes(a.lastView?.status ?? ''));
     if (needsAttemptChoice && (await this.deps.store.otherAttemptsDefault(taskId)) === 'ask' && !attemptChoice?.otherAttempts)
       throw new ValidationError('Choose whether to keep or cancel the other attempts when confirming this proposal.');
-    if ((signal === SIG.confirm || signal === SIG.openPr || signal === SIG.approveCheckout)
+    // Software-dev ≥1.30: a branch's Review no longer parks the task, so an
+    // approval may come while it waits on something else (the agent working,
+    // a landing). It lands work all the same: only the task's reviewers.
+    const branchReview = scopedTask?.lastView?.reviewAudience;
+    if (branchReview?.length && (signal === SIG.approveCheckout
+      || (signal === SIG.confirm && scopedTask.lastView?.stage !== 'merge'))) {
+      // An undelegated agent with review:approve stands in for the human its
+      // task works for, and passes only where that human would.
+      const userId = caller.humanSubject?.userId;
+      if (!userId && !(caller.kind === 'agent' && allows(caller.caps, 'review:approve')))
+        throw new CapabilityError('only a reviewer, or an agent authorized with review:approve, can approve a branch');
+      const actingUserId = userId
+        ?? (caller.taskId !== '*' ? (await this.deps.store.taskCreatorUserId(caller.taskId)) : undefined);
+      if (!actingUserId || !(await this.deps.store.humanAudience(taskId, branchReview)).includes(actingUserId))
+        throw new CapabilityError('only this task\'s reviewers can approve its branches');
+      const names = signal === SIG.approveCheckout ? [text ?? '']
+        : (scopedTask.lastView?.checkouts ?? []).filter((checkout) => checkout.state === 'review').map((checkout) => checkout.name);
+      (await recordBranchApproval(this.deps.store, taskId, userId ?? caller.principal, names));
+    } else if ((signal === SIG.confirm || signal === SIG.openPr || signal === SIG.approveCheckout)
       && scopedTask?.lastView?.waitingFor?.kind === 'human') {
       // Master's authorization parity: the human is the verified subject, not the
       // token's grantor principal. An agent authorized with `review:approve`

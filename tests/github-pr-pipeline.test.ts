@@ -97,9 +97,18 @@ async function landProviderTarget(pr: any, target: string): Promise<string> {
   await refreshPrHead(pr);
   const remote = await remoteForBranch(pr.head.ref, pr.repo);
   if (!remote) throw new Error(`stub GitHub could not find remote branch ${pr.head.ref}`);
-  await gitOrThrow(remote, ['update-ref', `refs/heads/${target}`, pr.head.sha]);
-  pr.merge_commit_sha = pr.head.sha;
-  return pr.head.sha;
+  // Like GitHub: a head that already contains the target fast-forwards it; one
+  // that does not (another pull request landed meanwhile) lands as a merge commit.
+  const tip = (await gitOrThrow(remote, ['rev-parse', `refs/heads/${target}`])).trim();
+  let landed = pr.head.sha;
+  if ((await git(remote, ['merge-base', '--is-ancestor', tip, pr.head.sha])).code !== 0) {
+    const tree = (await gitOrThrow(remote, ['merge-tree', '--write-tree', tip, pr.head.sha])).trim();
+    landed = (await gitOrThrow(remote, ['-c', 'user.name=GitHub', '-c', 'user.email=noreply@github.com',
+      'commit-tree', tree, '-p', tip, '-p', pr.head.sha, '-m', `Merge pull request #${pr.number}`])).trim();
+  }
+  await gitOrThrow(remote, ['update-ref', `refs/heads/${target}`, landed]);
+  pr.merge_commit_sha = landed;
+  return landed;
 }
 
 const fetcher = (async (url: string, init: RequestInit = {}) => {
@@ -514,6 +523,79 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
     const origin = path.join(originDir, `missing-base-${version}.git`);
     expect(await gitOrThrow(origin, ['show', 'main:repaired.txt'])).toBe('preserved work');
     expect((await git(origin, ['show-ref', '--verify', '--quiet', 'refs/heads/master'])).code).not.toBe(0);
+  }, 120_000);
+
+  // Several branches per task (software-dev 1.30, SPEC §11.1): each branch is its
+  // own pull request with its own Review and landing, while the agent works on.
+  async function multiBranchTask(name: string) {
+    const repo = await repoWithOrigin(name);
+    const project = (await h.store.createProject(`Branches ${name}`, { repos: [repo], remote: 'pr', multiPr: true }));
+    const connection = (await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: `${name}-installation`, accountLogin: 'acme', accountType: 'Organization' }));
+    const enrolled = (await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+      providerId: `${name}-repo`, owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main',
+      private: true, gitConnectionId: connection.id }));
+    (await h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Split change', workflow: 'software-dev',
+      workflowVersion: '1.30.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+      createdBy: { kind: 'user', userId: 'a' } }));
+    const handle = await h.client.workflow.start('softwareDev@1.30.0', {
+      taskQueue: TASK_QUEUE, workflowId: task.id, args: [{
+        taskId: task.id, projectId: project.id, title: task.title,
+        prompt: '@write core.js :: export const core = 1;\n@run git add -A && git commit -qm core\n'
+          + "@branch docs\n@run cd ../docs && echo '# docs' > DOCS.md && git add -A && git commit -qm docs\n@openpr docs",
+        base: 'main', target: 'main',
+        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr', multiPr: true }, githubPollMs: 10,
+      }],
+    });
+    const origin = remoteBySlug.get(SLUG)!;
+    const onMain = async (file: string) => (await git(origin, ['show', `main:${file}`])).code === 0;
+    const branch = async (checkout: string) => (await view(handle)).checkouts?.find((c: any) => c.name === checkout);
+    return { task, handle, onMain, branch };
+  }
+
+  it('v1.30 opens and lands one branch\'s pull request while the other branch is still being worked on', async () => {
+    const { task, handle, onMain, branch } = await multiBranchTask('branches-land');
+    await expect.poll(async () => (await branch('docs'))?.state, { timeout: 30_000 }).toBe('review');
+    // Only docs is proposed: one pull request, from docs's own branch, named for it.
+    expect(prs).toHaveLength(1);
+    expect(prs[0].head.ref).toBe(`tavya/${task.id}-docs`);
+    expect(prs[0].title).toMatch(/\(docs\)$/);
+    expect((await branch('docs')).pr).toMatchObject({ number: prs[0].number, state: 'open' });
+
+    await handle.signal('approveCheckout', { name: 'docs' });
+    await expect.poll(async () => (await branch('docs'))?.state, { timeout: 30_000 }).toBe('landed');
+    expect(prs[0].merged_at).toBeTruthy();
+    expect(await onMain('DOCS.md')).toBe(true);
+    expect(await onMain('core.js')).toBe(false);
+    expect((await view(handle)).status).not.toBe('done');
+
+    await handle.signal('followUp', { id: 'f1', role: 'user', text: '@openpr', ts: 0 });
+    await expect.poll(() => prs.length, { timeout: 30_000 }).toBe(2);
+    expect(prs[1].head.ref).toBe(`tavya/${task.id}`);
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    await handle.signal('confirm');
+    expect(await handle.result()).toMatchObject({ stage: 'done' });
+    expect(await onMain('core.js')).toBe(true);
+    expect(await onMain('DOCS.md')).toBe(true);
+    expect((await view(handle)).prs.map((p: any) => [p.repo === 'docs' ? 'docs' : 'primary', p.merged])).toEqual(
+      expect.arrayContaining([['docs', true], ['primary', true]]));
+  }, 120_000);
+
+  it('v1.30 Finish closes the pull request of a branch that did not land', async () => {
+    const { handle, onMain, branch } = await multiBranchTask('branches-finish');
+    await expect.poll(async () => (await branch('docs'))?.state, { timeout: 30_000 }).toBe('review');
+    await handle.signal('approveCheckout', { name: 'docs' });
+    await expect.poll(async () => (await branch('docs'))?.state, { timeout: 30_000 }).toBe('landed');
+    // The rest is proposed but never approved.
+    await handle.signal('followUp', { id: 'f1', role: 'user', text: '@openpr', ts: 0 });
+    await expect.poll(() => prs.length, { timeout: 30_000 }).toBe(2);
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    await handle.signal('finish');
+    expect(await handle.result()).toMatchObject({ stage: 'done' });
+    expect(prs[1]).toMatchObject({ state: 'closed', merged_at: null });
+    expect(await onMain('DOCS.md')).toBe(true);
+    expect(await onMain('core.js')).toBe(false);
   }, 120_000);
 
   it('opens the PR at the PR stage and closes it once the merge lands', async () => {

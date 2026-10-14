@@ -120,14 +120,15 @@ const landingAuthorityField = (): FieldSpec => ({
 // Multi-PR (SPEC §11.1). Off, a task is one branch per repo,
 // exactly as before. On, the Do agent may partition its change across several
 // branches with `create_branch`, each landing as its own pull request — so the
-// world nests its checkouts from Setup, which is the only structural difference
-// and is why this is a task-scoped field rather than something inferred later.
-// The lifecycle stays singular: one Review, one Merge, one point of no return.
+// world nests its checkouts from Setup, which is why this is a task-scoped field
+// rather than something inferred later. From software-dev 1.30 each branch has
+// its own Review and landing while the agent keeps working (one sandbox, one
+// agent); before, they shared one Review and one Merge.
 const multiPrField = (): FieldSpec => ({
   name: 'multiPr',
   type: 'boolean',
   label: 'Allow several branches per task',
-  help: 'Let the agent split one task\'s change into several branches, each reviewed and merged as its own pull request (including stacked ones). They share a single Review gate and a single Merge — work that needs its own review timing belongs in a separate task.',
+  help: 'The agent may split its work into several branches, each its own pull request. Each is reviewed and lands on its own while the agent keeps working; the task finishes when its last proposal lands.',
   default: false,
   scopes: ALL,
   bind: 'project',

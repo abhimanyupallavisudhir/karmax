@@ -2004,6 +2004,8 @@ export interface TaskContinuation {
   conversation: string;
   /** The Merge transcript when the view hides it (explicit PR cycles). */
   mergeMessages?: Message[];
+  /** v1.30 multi-PR: an open_pr not yet acted on. */
+  branchProposal?: OpenPrProposal;
   /** The run held the task's run pin, which the next run takes over. */
   runPinned: boolean;
   /** Keeps `TaskView.updatedAt` increasing across runs. */

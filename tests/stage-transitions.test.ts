@@ -1423,6 +1423,38 @@ describe('task stage transitions', () => {
     await expect(f.api.changeWorkflow((await agent(['task:*', 'review:approve'])), f.task.id, 'goal')).resolves.toBeTruthy();
   });
 
+  /** Software-dev ≥1.30: a branch's Review does not park the task, so its
+   * approval is checked against the task's reviewers whatever it waits on. */
+  it('lets only a reviewer approve a proposed branch while the agent works', async () => {
+    const f = (await fixture());
+    (await f.store.setOrganizationMembership('org_personal', 'qa', 'member'));
+    (await f.store.saveView(f.task.id, {
+      ...f.view, stage: 'do', status: 'active', waitingFor: undefined,
+      reviewAudience: ['user:qa'],
+      checkouts: [{ name: 'docs', branch: 'tavya/t-docs', base: 'main', state: 'review', proposedHead: 'd1', head: 'd1' }],
+      actions: [{ name: 'followUp', kind: 'signal', label: 'Send follow-up', enabled: true }],
+    }));
+    const agent = async (caps: string[]) => (await f.tokens.mint({
+      taskId: f.task.id, profileId: 'do', role: 'do', principal: `task-agent:${f.task.id}:do`,
+      projectId: f.project.id, ceiling: caps, grantorCaps: caps,
+    })).token;
+    // The creator is not this task's reviewer; its own developer-level agent is not either.
+    await expect(f.api.signalTask(f.token, f.task.id, 'approveCheckout', 'docs')).rejects.toThrow(/reviewers/);
+    await expect(f.api.signalTask((await agent(['task:*'])), f.task.id, 'approveCheckout', 'docs')).rejects.toThrow(/review:approve/);
+    await expect(f.api.signalTask(f.token, f.task.id, 'confirm')).rejects.toThrow(/reviewers/);
+    expect(f.signalled.filter((s) => s.signal === 'approveCheckout' || s.signal === 'confirm')).toHaveLength(0);
+    // The reviewer approves.
+    const qa = (await f.tokens.mintPrincipal('user:qa', ['*'], f.project.id)).token;
+    await f.api.signalTask(qa, f.task.id, 'approveCheckout', 'docs');
+    expect(f.signalled.filter((s) => s.signal === 'approveCheckout').map((s) => s.args)).toEqual([[{ name: 'docs' }]]);
+    // The approval is the reviewer's vote, so their GitHub authorization lands it.
+    expect((await f.store.eventsSince(f.task.id, 0)).filter((e) => e.type === 'task.confirmation-voted').at(-1)?.payload)
+      .toMatchObject({ userId: 'qa', branches: ['docs'], satisfied: true });
+    // While a branch lands, approving another still takes a reviewer.
+    (await f.store.saveView(f.task.id, { ...(await f.store.getTask(f.task.id))!.lastView!, stage: 'merge' }));
+    await expect(f.api.signalTask(f.token, f.task.id, 'approveCheckout', 'docs')).rejects.toThrow(/reviewers/);
+  });
+
   /** PL-1: an agent stands in for the human it acts for, never for more. */
   it('refuses a review:approve agent whose human is outside the Review audience, as it refuses that human', async () => {
     const f = (await fixture());

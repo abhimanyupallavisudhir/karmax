@@ -26,3 +26,20 @@ export async function recordHumanConfirmation(store: Store, taskId: string, user
       })),
     } }));
 }
+
+/** Software-dev ≥1.30: a person approved proposed branches of a multi-PR task.
+ * Their Review no longer parks the task, so the vote is journaled from the
+ * branches themselves: it authorizes the intent of exactly their pull requests,
+ * which is whose GitHub authorization lands them. */
+export async function recordBranchApproval(store: Store, taskId: string, userId: string, names: string[]): Promise<void> {
+  const task = (await store.getTask(taskId));
+  const branches = (task?.lastView?.checkouts ?? []).filter((checkout) => names.includes(checkout.name) && checkout.state === 'review');
+  if (!branches.length) return;
+  const prs = branches.flatMap((checkout) => checkout.pr ? [checkout.pr] : []);
+  (await store.appendEvent({ taskId, type: 'task.confirmation-voted', ts: Date.now(),
+    payload: {
+      userId, audience: task?.lastView?.reviewAudience ?? ['@creator'], satisfied: true, branches: branches.map((checkout) => checkout.name),
+      githubMergeAuthorized: prs.length > 0, githubMergeIntentAuthorized: prs.length > 0,
+      githubPrHeads: prs.map((ref) => ({ slug: ref.slug, number: ref.number, headSha: ref.headSha })),
+    } }));
+}

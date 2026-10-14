@@ -71,7 +71,7 @@ describe('several branches per task: each branch is proposed, reviewed and lands
     // task can no longer be cancelled — only finished.
     expect(landed.messages.some((m: any) => /^Landed: docs/.test(m.text))).toBe(true);
     await expect.poll(async () => (await view(handle)).actions.map((a: any) => a.name), { timeout: 30_000 }).toContain('finish');
-    expect((await view(handle)).actions.find((a: any) => a.name === 'cancel')?.enabled).toBe(false);
+    expect((await view(handle)).actions.map((a: any) => a.name)).not.toContain('cancel');
 
     // The last proposal: everything not yet landed, final. Only the primary has work.
     await handle.signal('followUp', { id: 'f1', role: 'user', text: '@openpr', ts: 0 });
@@ -97,19 +97,60 @@ describe('several branches per task: each branch is proposed, reviewed and lands
     const { repo, handle } = await start(`${SPLIT}@openpr docs`);
     await expect.poll(async () => (await branch(handle, 'docs'))?.state, { timeout: 30_000 }).toBe('review');
     await expect.poll(async () => (await view(handle)).status, { timeout: 30_000 }).toBe('waiting');
+    const reviewed = (await branch(handle, 'docs')).proposedHead;
 
-    // The agent commits to docs again before anyone approves it.
+    // The reviewer approves docs while the agent is committing to it again.
     await handle.signal('followUp', { id: 'f1', role: 'user', ts: 0,
-      text: "@run cd ../docs && echo more >> DOCS.md && git commit -qam more\n@incomplete" });
-    await expect.poll(async () => (await branch(handle, 'docs'))?.state, { timeout: 30_000 }).toBe('working');
-    // An approval now has nothing proposed to bind to.
+      text: '@run cd ../docs && echo more >> DOCS.md && git commit -qam more\n@sleep 1500' });
+    await expect.poll(async () => (await view(handle)).agentTurn?.state ?? (await view(handle)).status, { timeout: 30_000 }).toBe('running');
     await handle.signal('approveCheckout', { name: 'docs' });
+
+    // The approval was of the head the reviewer saw; the new one goes back to Review.
     await expect.poll(async () => (await view(handle)).status, { timeout: 30_000 }).toBe('waiting');
-    expect((await branch(handle, 'docs'))?.state).toBe('working');
+    const docs = await branch(handle, 'docs');
+    expect(docs.state).toBe('review');
+    expect(docs.proposedHead).not.toBe(reviewed);
+    expect(docs.approved).toBe(false);
     expect(await onMain(repo, 'DOCS.md')).toBe(false);
     expect((await view(handle)).messages.some((m: any) => /docs changed after it was proposed/.test(m.text))).toBe(true);
     await handle.signal('cancel');
     expect((await handle.result()).stage).toBe('cancelled');
+  }, 120_000);
+
+  it('keeps every branch\'s state when the task continues as new between turns', async () => {
+    // A continued run reads its conversation back from the task's stored view.
+    const repo = await h.makeRepo('continued');
+    const project = await h.store.createProject('Continued', { repos: [repo], multiPr: true });
+    const task = await h.store.createTask({ projectId: project.id, title: 'Continued', workflow: 'software-dev',
+      workflowVersion: '1.30.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'a' } });
+    const taskId = task.id;
+    const first = await h.client.workflow.start(VERSION, {
+      taskQueue: TASK_QUEUE, workflowId: taskId,
+      args: [{
+        taskId, projectId: project.id, title: 'Continued', prompt: `${SPLIT}@openpr docs`, base: 'main', target: 'main',
+        continueAfterEvents: 80,
+        project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false, multiPr: true },
+      }],
+    });
+    const handle = h.client.workflow.getHandle(taskId);
+    const loaded = async () => { for (;;) { try { return await view(handle); } catch { await new Promise((r) => setTimeout(r, 100)); } } };
+    const branch = async (_handle: any, name: string) => (await loaded()).checkouts?.find((c: any) => c.name === name);
+    await expect.poll(async () => (await branch(handle, 'docs'))?.state, { timeout: 30_000 }).toBe('review');
+    await expect.poll(async () => (await loaded()).status, { timeout: 30_000 }).toBe('waiting');
+    const proposedIn = (await handle.describe()).runId;
+    await handle.signal('approveCheckout', { name: 'docs' });
+    await expect.poll(async () => (await branch(handle, 'docs'))?.state, { timeout: 30_000 }).toBe('landed');
+    await expect.poll(async () => (await loaded()).status, { timeout: 30_000 }).toBe('waiting');
+    await handle.signal('followUp', { id: 'f1', role: 'user', text: '@openpr', ts: 0 });
+    await expect.poll(async () => (await loaded()).stage, { timeout: 30_000 }).toBe('review');
+    expect((await branch(handle, 'docs'))?.state).toBe('landed');
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
+    // It continued as new after docs was proposed, and docs's state came along.
+    expect((await handle.describe()).runId).not.toBe(first.firstExecutionRunId);
+    expect((await handle.describe()).runId).not.toBe(proposedIn);
+    expect(await onMain(repo, 'DOCS.md')).toBe(true);
+    expect(await onMain(repo, 'core.js')).toBe(true);
   }, 120_000);
 
   it('a final proposal approved at once lands and finishes without another turn', async () => {

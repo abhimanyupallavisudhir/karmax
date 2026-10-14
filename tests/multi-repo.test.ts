@@ -227,6 +227,22 @@ describe('prompt assembly surfaces the multi-repo layout', () => {
     expect(out).toContain('backend/');
   });
 
+  it('names each checkout\'s branch in a world holding several branches, and tells a v1.30 multi-PR agent how they land', () => {
+    const world = {
+      kind: 'worktree', id: 't', root: '/w/t', branch: 'tavya/t', base: 'main', target: 'main',
+      repos: [
+        { name: 'app', repo: '/src/app', root: '/w/t/app', branch: 'tavya/t', base: 'main' },
+        { name: 'docs', repo: '/src/app', root: '/w/t/docs', branch: 'tavya/t-docs', base: 'main' },
+      ],
+    } as any;
+    const out = assemblePrompt({ profile: profile(), role: 'do', task, world, branchLifecycle: true });
+    expect(out).toContain('spans 2 checkouts');
+    expect(out).toContain('/w/t/docs/ — checkout of /src/app on branch tavya/t-docs (checkout name "docs")');
+    expect(out).toContain('propose it with open_pr(branches: [name])');
+    expect(assemblePrompt({ profile: profile(), role: 'do', task, world })).not.toContain('open_pr(branches: [name])');
+    expect(assemblePrompt({ profile: profile(), role: 'confirm', task, world, branchLifecycle: true })).not.toContain('open_pr(branches: [name])');
+  });
+
   it('adds no repo block for a single-repo world', () => {
     const world = { kind: 'worktree', id: 't', root: '/w/t', branch: 'tavya/t', base: 'main', target: 'main', repo: '/src/only', repos: [{ name: 'only', repo: '/src/only', root: '/w/t', branch: 'tavya/t', base: 'main' }] } as any;
     const out = assemblePrompt({ profile: profile(), role: 'do', task, world });

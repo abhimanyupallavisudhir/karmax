@@ -108,7 +108,7 @@ export function landableBranches(
     .map(([name]) => name));
   for (let changed = true; changed;) {
     changed = false;
-    for (const name of [...ready]) {
+    for (const name of ready) {
       const repo = repos.find((candidate) => candidate.name === name);
       const base = repo ? stackedOn(repo, repos) : undefined;
       if (base && !ledger.landed[base] && !ready.has(base)) { ready.delete(name); changed = true; }
@@ -149,4 +149,26 @@ export function combineProposals(earlier: OpenPrProposal | undefined, later: Ope
     : [...new Set([...earlier?.branches ?? [], ...later.branches])];
   const final = later.final ?? earlier?.final;
   return { ...(branches ? { branches } : {}), ...(final !== undefined ? { final } : {}) };
+}
+
+/** A replacement run's branch ledger, rebuilt from the last published view:
+ *  what was proposed (landing counts — it lands again) and what landed. The
+ *  view's `state` carries the agent's last word on finishing. */
+export function branchLedgerOf(checkouts: TaskCheckout[], state?: Record<string, unknown>): BranchLedger {
+  const proposed: Record<string, string> = {};
+  const landed: Record<string, string> = {};
+  for (const checkout of checkouts) {
+    if (checkout.proposedHead && checkout.state && checkout.state !== 'landed' && checkout.state !== 'working')
+      proposed[checkout.name] = checkout.proposedHead;
+    if (checkout.landedSha) landed[checkout.name] = checkout.landedSha;
+  }
+  const repairing = Array.isArray(state?.branchesRepairing) ? state.branchesRepairing.filter((name): name is string => typeof name === 'string') : [];
+  return { proposed, landed, ...(state?.branchesFinal === true ? { finish: true } : {}), ...(repairing.length ? { repairing } : {}) };
+}
+
+/** The approvals a replacement run keeps: with a ledger, each approved branch
+ *  at the head it was proposed at; otherwise at the head it had. */
+export function approvalsOf(checkouts: TaskCheckout[]): CheckoutApprovals {
+  return Object.fromEntries(checkouts.filter((c) => c.approved && (c.state ? c.proposedHead : c.head))
+    .map((c) => [c.name, (c.state ? c.proposedHead : c.head)!]));
 }

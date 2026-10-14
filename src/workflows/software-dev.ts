@@ -801,7 +801,7 @@ async function softwareDevImpl(
   let landingBatch: string[] = [];
   let parkedPrs: TaskPullRequest[] = [];
   /** What the agent's last open_pr asked for, until it is proposed. */
-  let pendingProposal: OpenPrProposal | undefined;
+  let pendingProposal: OpenPrProposal | undefined = continued?.branchProposal;
   /** A person (or the managing parent) asked to finish the task now. */
   let finishRequested = false;
   /** Bumped by every branch approval, so a parked task wakes to land it. */
@@ -1204,9 +1204,11 @@ async function softwareDevImpl(
   function allowed(): DeclaredAction[] {
     const actions = allowedNow();
     // v1.30: once part of a multi-PR task has landed, Cancel can no longer undo
-    // it; Finish ends the task instead, closing what has not landed.
-    return branchLifecycle && pointOfNoReturnPassed && actions.some((action) => action.name === 'cancel')
-      ? [...actions, { name: 'finish', kind: 'signal', label: 'Finish', enabled: !lifecycleTransitionBlocked && !finishRequested, danger: true }]
+    // it; Finish takes its place, ending the task and closing what has not landed.
+    return branchLifecycle && pointOfNoReturnPassed
+      ? actions.map((action) => action.name === 'cancel'
+        ? { name: 'finish', kind: 'signal', label: 'Finish', enabled: !landingBatch.length && !finishRequested, danger: true }
+        : action)
       : actions;
   }
   function allowedNow(): DeclaredAction[] {
@@ -1319,6 +1321,10 @@ async function softwareDevImpl(
 
   // ── Several branches per task, each with its own lifecycle (v1.30) ──
 
+  /** The live world as the activities take it (multi-PR code runs only with one). */
+  function worldHandle(): WorldHandle {
+    return world as WorldHandle;
+  }
   /** Every pull request this task has, including those waiting while a batch lands. */
   function allPrs(): TaskPullRequest[] {
     return parkedPrs.length ? [...prs, ...parkedPrs.filter((parked) => !prs.some((own) => own.repo === parked.repo))] : prs;
@@ -1355,7 +1361,7 @@ async function softwareDevImpl(
   /** Read every branch's head and own commits; a proposed branch the agent has
    * moved since lapses (its new commits were never reviewed). */
   async function refreshBranches(): Promise<void> {
-    const progress = await core.checkoutProgress(world as any, target, Object.keys(ledger.landed));
+    const progress = await core.checkoutProgress(worldHandle(), target, Object.keys(ledger.landed));
     checkoutHeads = progress.heads;
     checkoutAhead = progress.ahead;
     const moved = movedSinceProposal(ledger, checkoutHeads);
@@ -1366,12 +1372,12 @@ async function softwareDevImpl(
   }
   /** The approved branches that may land now. */
   function landableNow(): string[] {
-    return landableBranches(worldRepos(world as any), ledger, checkoutApprovals, checkoutHeads);
+    return landableBranches(worldRepos(worldHandle()), ledger, checkoutApprovals, checkoutHeads);
   }
   /** The world as one landing batch sees it: only the branches landing now. */
   function landingWorld(): WorldHandleLike {
     if (!branchLifecycle || !world) return world!;
-    return { ...world, repos: worldRepos(world as any).filter((repo) => landingBatch.includes(repo.name)) } as WorldHandleLike;
+    return { ...world, repos: worldRepos(worldHandle()).filter((repo) => landingBatch.includes(repo.name)) } as WorldHandleLike;
   }
   /** The proposal a branch's Review plays at proposal time: agent Reviewers run
    * now, one after another; people approve whenever they like, without parking
@@ -1410,7 +1416,7 @@ async function softwareDevImpl(
   async function proposeBranches(proposal: OpenPrProposal, confirmer?: string): Promise<'done' | 'cancelled'> {
     if (proposal.final !== undefined) ledger = { ...ledger, finish: proposal.final };
     else if (!proposal.branches) ledger = { ...ledger, finish: true };
-    const repos = worldRepos(world as any);
+    const repos = worldRepos(worldHandle());
     const unknown = (proposal.branches ?? []).filter((name) => !repos.some((repo) => repo.name === name));
     const changedSinceLanding = (name: string) => !ledger.landed[name] || ledger.landed[name] !== checkoutHeads[name];
     let names = (proposal.branches ?? repos.map((repo) => repo.name)).filter((name) => repos.some((repo) => repo.name === name)
@@ -1425,7 +1431,7 @@ async function softwareDevImpl(
       status = 'active';
       await publish();
       if (cancelled) return 'cancelled';
-      const readiness = await core.checkProposal(world as any, names);
+      const readiness = await core.checkProposal(worldHandle(), names);
       if (!readiness.ready) {
         const detail = readiness.conflict ?? readiness.dirty ?? readiness.note ?? 'the proposal is not ready';
         notes.push(`Proposing ${names.join(', ')} was refused: ${readiness.note ?? 'proposal validation failed'}.\n${detail}\nResolve this, verify it, then call open_pr again.`);
@@ -1436,7 +1442,7 @@ async function softwareDevImpl(
       targetLocked = true;
       const opened = await withResolve('pr', async () => {
         try {
-          return { prs: await core.openPr(world as any, target, {
+          return { prs: await core.openPr(worldHandle(), target, {
             title: input.title,
             summary: pullRequestSummary(reviewInfo?.summary, msgs, false),
             only: names, landed: Object.keys(ledger.landed),
@@ -1473,7 +1479,7 @@ async function softwareDevImpl(
       // A mechanical repair of an approved branch keeps its approval.
       const reapproved = names.filter((name) => repairing.includes(name));
       if (reapproved.length) checkoutApprovals = approveProposed(ledger, checkoutApprovals, reapproved);
-      const review = await core.buildReview(world as any, base, names).catch(() => undefined);
+      const review = await core.buildReview(worldHandle(), base, names).catch(() => undefined);
       if (review) reviewInfo = { ...reviewInfo, summary: reviewInfo?.summary ?? review.summary, changedFiles: review.changedFiles };
       const outcome = reapproved.length === names.length ? 'approved' : await reviewBranches(names);
       if (outcome === 'cancelled') return 'cancelled';
@@ -1517,6 +1523,21 @@ async function softwareDevImpl(
       status = 'waiting';
       const reviewText = reviewing.length ? `Review ${reviewing.join(', ')}.` : '';
       const asking = question?.trim() && !BRANCH_NOTICE.test(lastInputToMain()) ? question.trim() : '';
+      // A question with nothing in review takes the task's ordinary input route.
+      const route = routedInputResponder ? liveResponder : undefined;
+      if (!reviewing.length && asking && !input.parentTaskId && route?.kind === 'agent' && responderRounds < 3) {
+        responderRounds++;
+        waitingFor = { kind: 'responder', detail: asking };
+        await publish();
+        const answer = await responderTurn(route, asking);
+        waitingFor = undefined;
+        if (cancelled) return 'cancelled';
+        if (answer) {
+          if (!multiAgent) msgs.push({ id: `responder-${msgs.length}`, role: 'user', text: `Responder: ${answer}`, ts: Date.now() });
+          return 'turn';
+        }
+      }
+      const inputAudience = route?.kind === 'human' && route.audience?.length ? route.audience : ['@creator'];
       if (input.parentTaskId) {
         waitingFor = { kind: 'parent', detail: reviewText || 'Waiting for the managing agent' };
         const told = JSON.stringify([ledger.proposed, asking]);
@@ -1528,12 +1549,13 @@ async function softwareDevImpl(
       } else {
         waitingFor = {
           kind: 'human',
-          audience: reviewing.length ? [...new Set([...reviewAudienceNow(), ...askOf(['@creator'])])] : askOf(['@creator']),
+          audience: reviewing.length ? [...new Set([...reviewAudienceNow(), ...askOf(inputAudience)])] : askOf(inputAudience),
           detail: [reviewText, asking].filter(Boolean).join('\n\n') || 'Send a follow-up, open the PR, or finish the task.',
         };
       }
-      await publish();
+      // Read before publishing: an approval may arrive while the view goes out.
       const approvals = approvalEpoch;
+      await publish();
       await waitServing(() => cancelled || mainUnread() || prRequested || finishRequested || approvalEpoch !== approvals);
       waitingFor = undefined;
       status = 'active';
@@ -1576,6 +1598,26 @@ async function softwareDevImpl(
     unpropose(rest, false);
     if (keep && rest.length) ledger = { ...ledger, repairing: [...new Set([...ledger.repairing ?? [], ...rest])] };
     repairValidationPending = false;
+  }
+  /** Finishing: what landed stays; a pull request for a branch that did not
+   * land is closed, so nothing is left proposing work that never will. The
+   * task's own output is published as at any approval. False: cancelled. */
+  async function finishBranches(): Promise<boolean> {
+    // Sub-tasks still running belong to work that will not land now.
+    if (outstanding.size) await cancelChildren(liveAgentStates);
+    const open = allPrs().filter((candidate) => candidate.state === 'open' && !candidate.merged);
+    if (open.length && world && githubPrLifecycle) {
+      const closed = await core.closePrs(worldHandle(), open,
+        'The tavya task finished without landing this branch; closing the pull request.').catch(() => undefined);
+      prs = withPrs(allPrs(), closed ?? open.map((candidate) => ({ ...candidate, state: 'closed' as const })));
+      parkedPrs = [];
+      pr = prs[0];
+    }
+    if (resourceCandidateReview && patched('automatic-resource-review-v1') && !resourcesApplied) {
+      await core.beginResourceReview(taskId, `${workflowInfo().runId}:${++resourceReviewSequence}`);
+      if ((await applyReviewedResources(true, false)) !== 'applied') return false;
+    }
+    return true;
   }
   function recordLanded(names: string[]): void {
     const landed = { ...ledger.landed };
@@ -1646,13 +1688,16 @@ async function softwareDevImpl(
         ...(terminalOrigin ? { cancelledFrom: terminalOrigin } : {}),
         ...(humanPauseActive ? { humanPauseOrigin: recoveryStage } : {}),
         ...(interlocksLandingTransitions && lifecycleTransitionBlocked ? { lifecycleTransitionBlocked: true } : {}),
+        // v1.30: the part of the branch ledger the checkouts do not show.
+        ...(branchLifecycle && ledger.finish ? { branchesFinal: true } : {}),
+        ...(branchLifecycle && ledger.repairing?.length ? { branchesRepairing: ledger.repairing } : {}),
       },
       ...(!repositoryless ? { branch: recordWorld?.branch, base, targetBranch: target } : {}),
       world,
       worldPath: world?.workdir ?? world?.root,
       pr: branchLifecycle ? allPrs()[0] : pr,
       ...(allPrs().length ? { prs: allPrs() } : {}),
-      ...(multiPrEnabled && recordWorld ? { checkouts: reviewCheckouts(worldRepos(recordWorld as any), checkoutHeads, checkoutApprovals, allPrs(),
+      ...(multiPrEnabled && recordWorld ? { checkouts: reviewCheckouts(worldRepos(recordWorld as WorldHandle), checkoutHeads, checkoutApprovals, allPrs(),
         branchLifecycle ? { ledger, landing: landingBatch } : undefined) } : {}),
       ...(branchLifecycle && !input.parentTaskId && Object.keys(ledger.proposed).length ? { reviewAudience: reviewAudienceNow() } : {}),
       mergeQueue: mergeQueuePos,
@@ -3984,6 +4029,7 @@ Inspect the complete current diff and specifically compare its delta from the re
       prs, reviewInfo, checkoutApprovals, landing, repairValidationPending,
       ...(branchLifecycle ? { branches: ledger } : {}),
       continued: {
+        ...(pendingProposal ? { branchProposal: pendingProposal } : {}),
         conversation,
         ...(explicitPrCycle && mergeMsgs.length ? { mergeMessages: mergeMsgs } : {}),
         runPinned,
@@ -4330,13 +4376,16 @@ Inspect the complete current diff and specifically compare its delta from the re
     // review that returned here) speaks before the main agent's next turn.
     await runCalledAgents();
     if (cancelled) return await abort();
+    // v1.30: back from Landing, what it did not land is no longer proposed
+    // (settled before a run may continue as new, which carries only the ledger).
+    if (branchLifecycle && landingBatch.length) settleLanding();
     if (continuesAsNew && historyGrown() && patched('software-dev-continue-as-new-v1')) {
       await continueRun();
       if (cancelled) return await abort();
     }
-    // v1.30: back from Landing, what it did not land is no longer proposed; and
-    // unless something calls the agent, the boundary decides what comes next.
-    if (branchLifecycle && landingBatch.length) settleLanding();
+    // A person's Finish takes effect before another turn.
+    if (branchLifecycle && finishRequested) { finishingBranches = true; break; }
+    // Unless something calls the agent, the boundary decides what comes next.
     if (branchLifecycle && branchIdle && !mainUnread()) {
       branchIdle = false;
       const next = await branchBoundary(undefined);
@@ -4431,7 +4480,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         park: async (next) => { status = 'waiting'; waitingFor = next; await publish(); },
         // A Needs input hold offers Open PR, like any input hold in Do (and a parent may send it).
         interrupted: () => cancelled || mainUnread() || raises.length > 0 || settled.length > 0
-          || (!!needsInput && prRequested) || halted(),
+          || (!!needsInput && prRequested) || halted() || (branchLifecycle && finishRequested),
         // Agents called while the main agent is paused run now; its pause goes
         // on unless what they say is for it.
         ...(multiAgent ? { serveable: () => agentQueue.length > 0 && !cancelled, serve: runCalledAgents } : {}),
@@ -5001,17 +5050,7 @@ Inspect the complete current diff and specifically compare its delta from the re
   // branch that did not land is closed, so nothing is left proposing work that
   // never will. The task's own output is published as at any approval.
   if (branchLifecycle && finishingBranches) {
-    const open = prs.filter((candidate) => candidate.state === 'open' && !candidate.merged);
-    if (open.length && world && githubPrLifecycle) {
-      const closed = await core.closePrs(world as any, open,
-        'The tavya task finished without landing this branch; closing the pull request.').catch(() => undefined);
-      prs = withPrs(prs, closed ?? open.map((candidate) => ({ ...candidate, state: 'closed' as const })));
-      pr = prs[0];
-    }
-    if (resourceCandidateReview && patched('automatic-resource-review-v1') && !resourcesApplied) {
-      await core.beginResourceReview(taskId, `${workflowInfo().runId}:${++resourceReviewSequence}`);
-      if ((await applyReviewedResources(true, false)) !== 'applied') return await abort();
-    }
+    if (!(await finishBranches())) return await abort();
     break proposalCycle;
   }
 
@@ -5505,7 +5544,7 @@ Inspect the complete current diff and specifically compare its delta from the re
           // …then the authoritative, deterministic local merge that guarantees
           // work lands for non-PR and replay-pinned historical workflows.
           result = await runLandingActivity(() => branchLifecycle
-            ? long.finalizeMergeActivity(world as any, target, landingBatch)
+            ? long.finalizeMergeActivity(worldHandle(), target, landingBatch)
             : long.finalizeMergeActivity(world as any, target));
         }
       } catch (err) {
@@ -5820,7 +5859,7 @@ Inspect the complete current diff and specifically compare its delta from the re
       // the machine — push it (and under 'pr', GitHub marks the PR merged).
       // Best-effort: the merge IS the deliverable; a failed push is recorded, not fatal.
       if (remotePolicyOf(input.project) !== 'none') {
-        const pushed = await (branchLifecycle ? core.pushTarget(world as any, target, landingBatch)
+        const pushed = await (branchLifecycle ? core.pushTarget(worldHandle(), target, landingBatch)
           : core.pushTarget(world as any, target)).catch(() => undefined);
         // Under 'pr' the pull request is part of the deliverable: reconcile it
         // with what actually landed (merged / closed / still open, and why).
@@ -5956,6 +5995,7 @@ Inspect the complete current diff and specifically compare its delta from the re
       status = 'active';
       continue proposalCycle;
     }
+    if (!(await finishBranches())) return await abort();
   }
   break proposalCycle;
   }
