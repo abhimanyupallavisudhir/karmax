@@ -21,7 +21,11 @@ export async function stubGateway(overrides: Partial<GatewayDeps> = {}) {
     client: {} as any, api: {} as any, taskQueue: 'test', staticDir: home,
     agentInfo: { provider: 'mock', reason: 'regression test' }, worlds: new WorldRegistry(),
     ...overrides });
-  const running = await gateway.listen(nextPort++);
+  const running = await gateway.listen(nextPort);
+  // Never reuse an origin: listen may skip a busy port, and fetch pools
+  // keep-alive sockets per origin, so a socket to an earlier closed gateway on
+  // the same port fails the next request with "other side closed".
+  nextPort = running.port + 1;
   return { gateway, store, tokens, base: running.internalUrl, async close() {
     await running.close(); await store.close(); fs.rmSync(home, { recursive: true, force: true });
   } };
