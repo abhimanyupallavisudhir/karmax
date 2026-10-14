@@ -166,7 +166,7 @@ async function mergeOnlyImpl(
   let stage: Stage = 'setup';
   let status: TaskView['status'] = 'active';
   const msgs: Message[] = input.prompt || input.images?.length || input.files?.length
-    ? [{ id: 'm0', role: 'user', text: input.prompt ?? '', ts: input.createdAt ?? 0, ...(input.images?.length ? { images: input.images } : {}), ...(input.files?.length ? { files: input.files } : {}) }]
+    ? [{ id: 'm0', role: 'user', text: input.prompt ?? '', ts: input.createdAt ?? Date.now(), ...(input.images?.length ? { images: input.images } : {}), ...(input.files?.length ? { files: input.files } : {}) }]
     : [];
   const base = input.base ?? input.project.defaultBase ?? 'main';
   let target = input.target ?? input.project.defaultTarget ?? base;
@@ -308,7 +308,7 @@ async function mergeOnlyImpl(
           taskId,
           role: 'confirm',
           worldHandle: world as any,
-          messages: [{ id: 'c-in-0', role: 'user', text: request, ts: 0 }],
+          messages: [{ id: 'c-in-0', role: 'user', text: request, ts: Date.now() }],
           task,
           bindings: {
             reviewInfo: reviewInfo?.summary ?? '',
@@ -371,7 +371,7 @@ async function mergeOnlyImpl(
   });
   setHandler(followUpSignal, (m) => {
     if (!msgs.some((candidate) => candidate.id === m.id))
-      msgs.push({ ...m, ts: m.ts || msgs.length });
+      msgs.push({ ...m, ts: m.ts || Date.now() });
   });
   setHandler(cancelSignal, () => {
     if (!pointOfNoReturnPassed) {
@@ -451,7 +451,7 @@ async function mergeOnlyImpl(
         if (confirmEpoch !== epoch) { li = 0; continue; } // verdict was about a route since replaced
         if (decision?.action === 'confirm') { li++; continue; }
         if (decision?.action === 'reject') {
-          if (decision.text) msgs.push({ id: `cr${msgs.length}`, role: 'system', text: `Confirm agent rejected: ${decision.text}`, ts: msgs.length });
+          if (decision.text) msgs.push({ id: `cr${msgs.length}`, role: 'system', text: `Confirm agent rejected: ${decision.text}`, ts: Date.now() });
           cancelled = true;
         } else {
           leftToHuman = true;

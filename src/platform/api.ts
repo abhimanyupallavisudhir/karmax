@@ -5549,11 +5549,12 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     // authorized landing that failed resumes as an integration repair.
     const failedFrom = view.state?.failedFrom as Stage | undefined;
     const checkpoint = (await this.transitionCheckpoint({ ...view, stage: failedFrom ?? view.stage }, 'do'));
+    const now = Date.now();
     const messages = [...checkpoint.messages, {
-      id: `recovery-${Date.now()}`,
+      id: `recovery-${now}`,
       role: 'user' as const,
       text: `${BRAND} recovered this task after its prior execution failed. Continue from the existing worktree and conversation; preserve and finish the work already present. Previous failure: ${view.error ?? 'unknown error'}`,
-      ts: checkpoint.messages.length,
+      ts: now,
     }];
     input.recovery = { ...checkpoint, world, messages };
 

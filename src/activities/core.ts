@@ -2414,7 +2414,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                   + ` ${INTERRUPTED_COMMANDS} ${INTERRUPTED_REPLY})`
                 // The only undiagnosed cause left is a lost heartbeat: turns have no time limit.
                 : `(This turn was interrupted mid-run — the worker restarted, the connection dropped, or the host slept. ${INTERRUPTED_COMMANDS} ${INTERRUPTED_REPLY})`,
-              ts: 0,
+              ts: Date.now(),
             },
           ];
           (await record(args.taskId, 'turn.resumed', { role: args.role, attempt: actx.info.attempt }));
@@ -2962,7 +2962,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const request = [...args.messages].reverse().find((m) => m.role === 'user');
         if (request) {
           const id = `${args.taskId}:${request.id}`;
-          if (!shared.some((m) => m.id === id)) shared.push({ ...request, id, ts: shared.length });
+          if (!shared.some((m) => m.id === id)) shared.push({ ...request, id, ts: request.ts || Date.now() });
         }
         // Sibling task attempts deliberately start a fresh provider session and replay
         // the intent-wide transcript. A retry of THIS SAME Temporal activity is
@@ -3463,11 +3463,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (confirmTranscript) {
           const outputId = timingTurnId ? `${timingTurnId}:out` : `${args.taskId}:out:${confirmTranscript.length}`;
           if (result.output?.trim() && !confirmTranscript.some(m => m.id === outputId))
-            confirmTranscript.push({ id: outputId, role: 'agent', text: result.output, ts: confirmTranscript.length });
+            confirmTranscript.push({ id: outputId, role: 'agent', text: result.output, ts: Date.now() });
           if (result.confirmDecision) {
             const d = result.confirmDecision;
             const decisionId = timingTurnId ? `${timingTurnId}:decision` : `${args.taskId}:decision:${confirmTranscript.length}`;
-            if (!confirmTranscript.some(m => m.id === decisionId)) confirmTranscript.push({ id: decisionId, role: 'system', text: `confirm_decision: ${d.action}${d.otherAttempts ? `; other attempts: ${d.otherAttempts}` : ''}${d.text ? ` — ${d.text}` : ''}`, ts: confirmTranscript.length });
+            if (!confirmTranscript.some(m => m.id === decisionId)) confirmTranscript.push({ id: decisionId, role: 'system', text: `confirm_decision: ${d.action}${d.otherAttempts ? `; other attempts: ${d.otherAttempts}` : ''}${d.text ? ` — ${d.text}` : ''}`, ts: Date.now() });
           }
           (await store.kvSet(`confirm-transcript:${conversationTaskId}`, JSON.stringify(confirmTranscript)));
         }
