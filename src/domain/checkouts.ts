@@ -163,7 +163,8 @@ export function branchLedgerOf(checkouts: TaskCheckout[], state?: Record<string,
     if (checkout.landedSha) landed[checkout.name] = checkout.landedSha;
   }
   const repairing = Array.isArray(state?.branchesRepairing) ? state.branchesRepairing.filter((name): name is string => typeof name === 'string') : [];
-  return { proposed, landed, ...(state?.branchesFinal === true ? { finish: true } : {}), ...(repairing.length ? { repairing } : {}) };
+  const final = Array.isArray(state?.branchesFinal) ? state.branchesFinal.filter((name): name is string => typeof name === 'string') : undefined;
+  return { proposed, landed, ...(final ? { finish: true, finalBranches: final } : {}), ...(repairing.length ? { repairing } : {}) };
 }
 
 /** The approvals a replacement run keeps: with a ledger, each approved branch

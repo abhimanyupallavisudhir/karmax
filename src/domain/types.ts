@@ -918,8 +918,12 @@ export interface BranchLedger {
   /** Landed: the commit each landed as. */
   landed: Record<string, string>;
   /** The agent's last proposal said it completes the task: the task finishes
-   * once nothing proposed is left to land. A person's follow-up clears it. */
+   * once nothing proposed is left to land and `finalBranches` all landed. A
+   * person's follow-up clears it. */
   finish?: boolean;
+  /** The branches that final proposal covers. One that lapses, is sent back or
+   * is refused keeps the task from finishing until it lands. */
+  finalBranches?: string[];
   /** Approved branches a landing sent back for a mechanical repair with the
    * approval intact: proposed again, they are approved again. */
   repairing?: string[];

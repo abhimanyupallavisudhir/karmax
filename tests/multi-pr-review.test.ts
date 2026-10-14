@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { reviewCheckouts, allCheckoutsApproved, approveAll, approveProposed, movedSinceProposal, landableBranches } from '../src/domain/checkouts.js';
+import { reviewCheckouts, allCheckoutsApproved, approveAll, approveProposed, movedSinceProposal, landableBranches, branchLedgerOf, approvalsOf, combineProposals } from '../src/domain/checkouts.js';
 import type { BranchLedger } from '../src/domain/types.js';
 import { runTurn } from '../src/agent/runtime.js';
 import { MockAdapter } from '../src/agent/mock.js';
@@ -132,6 +132,32 @@ describe('per-branch lifecycle', () => {
     expect(landableBranches(repos, proposed, { alpha: 'a1', api: 'p1' }, heads)).toEqual(['alpha', 'api']);
     // Its base already landed: it lands alone.
     expect(landableBranches(repos, ledger({ api: 'p1' }, { alpha: 'm1' }), { api: 'p1' }, heads)).toEqual(['api']);
+  });
+});
+
+describe('carrying branch state into a replacement run', () => {
+  it('rebuilds the ledger and approvals from the last view', () => {
+    const checkouts = reviewCheckouts(
+      [repo('alpha', 'tavya/t'), repo('docs', 'tavya/t-docs'), repo('api', 'tavya/t-api'), repo('cli', 'tavya/t-cli')],
+      { alpha: 'a2', docs: 'd1', api: 'p1', cli: 'c1' }, { docs: 'd1', api: 'p1' }, [],
+      { ledger: { proposed: { docs: 'd1', api: 'p1', cli: 'c1' }, landed: { alpha: 'a1' } }, landing: ['api'] },
+    );
+    expect(branchLedgerOf(checkouts, { branchesFinal: ['cli'], branchesRepairing: ['x'] })).toEqual({
+      // A branch that was landing is proposed again: it lands again.
+      proposed: { docs: 'd1', api: 'p1', cli: 'c1' }, landed: { alpha: 'a1' }, finish: true, finalBranches: ['cli'], repairing: ['x'],
+    });
+    // Approvals bind to the proposed head, not the head the checkout has now.
+    expect(approvalsOf(checkouts)).toEqual({ docs: 'd1', api: 'p1' });
+    expect(branchLedgerOf(checkouts).finish).toBeUndefined();
+  });
+});
+
+describe('several open_pr calls before the workflow acts', () => {
+  it('add up: every branch named, everything once a call names none, the last word on final', () => {
+    expect(combineProposals(undefined, { branches: ['a'] })).toEqual({ branches: ['a'] });
+    expect(combineProposals({ branches: ['a'] }, { branches: ['b'], final: true })).toEqual({ branches: ['a', 'b'], final: true });
+    expect(combineProposals({ branches: ['a'], final: true }, {})).toEqual({ final: true });
+    expect(combineProposals({}, { branches: ['b'], final: false })).toEqual({ final: false });
   });
 });
 

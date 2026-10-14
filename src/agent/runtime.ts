@@ -273,7 +273,9 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       if (input.role !== 'do') throw new Error('open_pr is available only to the Do agent');
       // Calls in one turn add up: every branch named is proposed, a call naming
       // none proposes everything, and the last word on `final` stands.
-      openPrProposal = combineProposals(openPrRequested ? openPrProposal ?? {} : undefined, proposal ?? {});
+      const combined = combineProposals(openPrRequested ? openPrProposal ?? {} : undefined, proposal ?? {});
+      // A plain open_pr (everything, final) records nothing beyond openPrRequested.
+      openPrProposal = Object.keys(combined).length ? combined : undefined;
       openPrRequested = true;
       completed = true;
       return journal();

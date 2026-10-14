@@ -3,7 +3,10 @@ import type { Harness } from './helpers/harness.js';
 import { TASK_QUEUE } from '../src/temporal/config.js';
 import { git } from '../src/world/git.js';
 import { newId } from '../src/util/id.js';
-import { bootPipelineHarness, pipelineGates, stopPipelineHarness, view } from './helpers/pipeline-harness.js';
+import { bootHarness } from './helpers/harness.js';
+import { MockAdapter } from '../src/agent/mock.js';
+import type { AgentAdapter } from '../src/agent/types.js';
+import { view } from './helpers/pipeline-harness.js';
 
 /**
  * Several branches per task (software-dev ≥1.30, SPEC §11.1): one task, one
@@ -19,9 +22,22 @@ const VERSION = 'softwareDev@1.30.0';
 
 describe('several branches per task: each branch is proposed, reviewed and lands on its own', () => {
   let h: Harness;
-  const gates = pipelineGates();
-  beforeAll(async () => { h = await bootPipelineHarness(gates); }, 60_000);
-  afterAll(() => stopPipelineHarness(h, gates));
+  beforeAll(async () => {
+    const mock = new MockAdapter();
+    // The mock agent, except that told its proposal was refused it stops there
+    // instead of proposing again — what decides whether the task may finish.
+    const adapter: AgentAdapter = {
+      provider: 'mock',
+      async runTurn(input, ctx) {
+        const latest = input.messages.filter((m) => m.role === 'user').at(-1)?.text ?? '';
+        if (input.role === 'do' && /^There is no branch named/.test(latest))
+          return mock.runTurn({ ...input, messages: [...input.messages, { id: `stop-${input.messages.length}`, role: 'user', text: '@incomplete', ts: 0 }] }, ctx);
+        return mock.runTurn(input, ctx);
+      },
+    };
+    h = await bootHarness('mock', adapter);
+  }, 60_000);
+  afterAll(() => h?.stop());
 
   const start = async (prompt: string) => {
     const repo = await h.makeRepo('app');
@@ -151,6 +167,19 @@ describe('several branches per task: each branch is proposed, reviewed and lands
     expect((await handle.describe()).runId).not.toBe(proposedIn);
     expect(await onMain(repo, 'DOCS.md')).toBe(true);
     expect(await onMain(repo, 'core.js')).toBe(true);
+  }, 120_000);
+
+  it('a final proposal that is refused does not finish the task', async () => {
+    const { repo, handle } = await start(`${SPLIT}@openpr ghost :: final`);
+    await expect.poll(async () => (await view(handle)).messages.some((m: any) => /^There is no branch named ghost/.test(m.text)),
+      { timeout: 30_000 }).toBe(true);
+    await expect.poll(async () => (await view(handle)).status, { timeout: 30_000 }).toBe('waiting');
+    const parked = await view(handle);
+    expect(parked.stage).toBe('do');
+    expect(parked.checkouts.every((c: any) => c.state === 'working')).toBe(true);
+    expect(await onMain(repo, 'core.js')).toBe(false);
+    await handle.signal('cancel');
+    expect((await handle.result()).stage).toBe('cancelled');
   }, 120_000);
 
   it('a final proposal approved at once lands and finishes without another turn', async () => {

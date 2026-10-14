@@ -791,7 +791,7 @@ async function softwareDevImpl(
   // v1.30 multi-PR: each branch's proposal and landing (checkout name → head).
   let ledger: BranchLedger = {
     proposed: { ...recovery?.branches?.proposed }, landed: { ...recovery?.branches?.landed },
-    ...(recovery?.branches?.finish ? { finish: true } : {}),
+    ...(recovery?.branches?.finish ? { finish: true, finalBranches: [...recovery.branches.finalBranches ?? []] } : {}),
     ...(recovery?.branches?.repairing?.length ? { repairing: [...recovery.branches.repairing] } : {}),
   };
   /** Commits each branch has of its own (v1.30), read with the heads. */
@@ -1414,8 +1414,11 @@ async function softwareDevImpl(
    * what happened in the conversation; the agent is resumed to keep working
    * unless this proposal completes the task. */
   async function proposeBranches(proposal: OpenPrProposal, confirmer?: string): Promise<'done' | 'cancelled'> {
-    if (proposal.final !== undefined) ledger = { ...ledger, finish: proposal.final };
-    else if (!proposal.branches) ledger = { ...ledger, finish: true };
+    // Naming branches without `final` keeps the agent's last word; a refused
+    // proposal never makes the task final (see the end).
+    const final = proposal.final ?? (proposal.branches ? undefined : true);
+    if (final === false) ledger = { ...ledger, finish: false, finalBranches: [] };
+    let refused = false;
     const repos = worldRepos(worldHandle());
     const unknown = (proposal.branches ?? []).filter((name) => !repos.some((repo) => repo.name === name));
     const changedSinceLanding = (name: string) => !ledger.landed[name] || ledger.landed[name] !== checkoutHeads[name];
@@ -1424,6 +1427,7 @@ async function softwareDevImpl(
     const idle = (proposal.branches ?? []).filter((name) => !unknown.includes(name) && !names.includes(name)
       && ledger.proposed[name] !== checkoutHeads[name]);
     const notes: string[] = [];
+    if (unknown.length) refused = true;
     if (unknown.length) notes.push(`There is no branch named ${unknown.join(', ')}; your branches are ${repos.map((repo) => repo.name).join(', ')}.`);
     if (idle.length) notes.push(`${idle.join(', ')} ${idle.length === 1 ? 'has' : 'have'} no commits to propose.`);
     if (names.length) {
@@ -1436,6 +1440,7 @@ async function softwareDevImpl(
         const detail = readiness.conflict ?? readiness.dirty ?? readiness.note ?? 'the proposal is not ready';
         notes.push(`Proposing ${names.join(', ')} was refused: ${readiness.note ?? 'proposal validation failed'}.\n${detail}\nResolve this, verify it, then call open_pr again.`);
         names = [];
+        refused = true;
       }
     }
     if (names.length && githubAuthoritativeMerge) {
@@ -1455,6 +1460,7 @@ async function softwareDevImpl(
       if (opened.repair) {
         notes.push(`Proposing ${names.join(', ')} needs a branch repair.\n${opened.repair}`);
         names = [];
+        refused = true;
       } else {
         prs = withPrs(prs, opened.prs ?? []);
         pr = prs[0];
@@ -1483,8 +1489,10 @@ async function softwareDevImpl(
       if (review) reviewInfo = { ...reviewInfo, summary: reviewInfo?.summary ?? review.summary, changedFiles: review.changedFiles };
       const outcome = reapproved.length === names.length ? 'approved' : await reviewBranches(names);
       if (outcome === 'cancelled') return 'cancelled';
-      if (outcome === 'revise') unpropose(names);
+      if (outcome === 'revise') { unpropose(names); refused = true; }
       else {
+        if (final && !refused) ledger = { ...ledger, finish: true,
+          finalBranches: [...new Set([...ledger.finish ? ledger.finalBranches ?? [] : [], ...names])] };
         if (outcome === 'approved') checkoutApprovals = approveProposed(ledger, checkoutApprovals, names);
         else if (confirmer && await core.confirmManualPr(taskId, confirmer)) checkoutApprovals = approveProposed(ledger, checkoutApprovals, names);
         const links = allPrs().filter((candidate) => names.includes(candidate.repo)).map((candidate) => `${candidate.repo} #${candidate.number}`);
@@ -1493,6 +1501,8 @@ async function softwareDevImpl(
             text: `Proposed for Review: ${names.join(', ')}${links.length ? ` (${links.join(', ')})` : ''}. Keep working on the rest of the task while ${names.length === 1 ? 'it is' : 'they are'} reviewed; propose each branch with open_pr when it is ready, and pass final: true with the proposal that completes the task.` });
       }
     }
+    // Final with nothing (left) to propose: the task is done once what is in flight lands.
+    if (final && !refused && !names.length) ledger = { ...ledger, finish: true, finalBranches: ledger.finish ? ledger.finalBranches ?? [] : [] };
     if (notes.length)
       msgs.push({ id: `branch-refused-${msgs.length}`, role: 'user', ts: Date.now(), text: notes.join('\n') });
     return 'done';
@@ -1516,7 +1526,7 @@ async function softwareDevImpl(
       if (finishRequested) return 'finish';
       if (mainUnread()) return 'turn';
       if (landableNow().length) return 'land';
-      if (ledger.finish && !proposedNames().length) return 'finish';
+      if (finalLanded()) return 'finish';
       // Park: for a person (or the parent) to review, answer, propose or finish.
       const reviewing = proposedNames().filter((name) => checkoutApprovals[name] !== ledger.proposed[name]);
       stage = reviewing.length ? 'review' : 'do';
@@ -1619,6 +1629,10 @@ async function softwareDevImpl(
     }
     return true;
   }
+  /** The agent's final proposal has all landed, and nothing else is proposed. */
+  function finalLanded(): boolean {
+    return !!ledger.finish && !proposedNames().length && (ledger.finalBranches ?? []).every((name) => !!ledger.landed[name]);
+  }
   function recordLanded(names: string[]): void {
     const landed = { ...ledger.landed };
     for (const name of names) landed[name] = ledger.proposed[name] ?? checkoutHeads[name] ?? '';
@@ -1689,7 +1703,7 @@ async function softwareDevImpl(
         ...(humanPauseActive ? { humanPauseOrigin: recoveryStage } : {}),
         ...(interlocksLandingTransitions && lifecycleTransitionBlocked ? { lifecycleTransitionBlocked: true } : {}),
         // v1.30: the part of the branch ledger the checkouts do not show.
-        ...(branchLifecycle && ledger.finish ? { branchesFinal: true } : {}),
+        ...(branchLifecycle && ledger.finish ? { branchesFinal: ledger.finalBranches ?? [] } : {}),
         ...(branchLifecycle && ledger.repairing?.length ? { branchesRepairing: ledger.repairing } : {}),
       },
       ...(!repositoryless ? { branch: recordWorld?.branch, base, targetBranch: target } : {}),
@@ -2153,7 +2167,7 @@ async function softwareDevImpl(
         responderRounds = 0;
         subtaskNags = 0;
         // New input may ask for more: the agent says again whether it is done.
-        if (branchLifecycle && ledger.finish) ledger = { ...ledger, finish: false };
+        if (branchLifecycle && ledger.finish) ledger = { ...ledger, finish: false, finalBranches: [] };
       }
       if (message.role === 'user') automatedRevisions = {};
       whenLoaded(() => {
@@ -5987,7 +6001,7 @@ Inspect the complete current diff and specifically compare its delta from the re
     recordLanded(names);
     landing = { ...landing, validation: 'passed', provider: 'none',
       detail: `Landed ${names.join(', ')}${sha ? ` as ${sha.slice(0, 8)}` : ''}.` };
-    if (!finishRequested && !(ledger.finish && !proposedNames().length)) {
+    if (!finishRequested && !finalLanded()) {
       if (!ledger.finish) msgs.push({ id: `branch-landed-${msgs.length}`, role: 'user', ts: Date.now(),
         text: `Landed: ${names.join(', ')} into ${target}${sha ? ` as ${sha.slice(0, 8)}` : ''}. Carry on with any remaining work; when the task is complete, call open_pr with final: true.` });
       branchIdle = true;
