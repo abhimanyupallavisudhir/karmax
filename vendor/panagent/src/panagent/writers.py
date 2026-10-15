@@ -424,7 +424,6 @@ def write_codex(
                             "type": "message",
                             "role": message_role,
                             "content": [{"type": "output_text" if message_role == "assistant" else "input_text", "text": rendered}],
-                            **({"id": f"msg_{uuid4().hex}"} if message_role == "assistant" else {}),
                             "internal_chat_message_metadata_passthrough": {"panagent_provenance": item.get("provenance", {})},
                         },
                     }
