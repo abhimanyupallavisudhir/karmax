@@ -5,6 +5,8 @@ import path from 'node:path';
 import { bootHarness, type Harness } from './helpers/harness.js';
 import { TASK_QUEUE } from '../src/temporal/config.js';
 import { git } from '../src/world/git.js';
+import { ensureProjectWikiRepository } from '../src/wiki/repository.js';
+import { worldRepoTarget } from '../src/world/types.js';
 import { MERGE_QUEUE_WORKFLOW, SIG_ENQUEUE, SIG_RELEASE, mergeQueueId } from '../src/coordinators/names.js';
 
 /**
@@ -284,6 +286,57 @@ describe('software-dev: every branch of a task lands as its own pull request', (
     expect((await git(repo, ['show', 'main:docs/guide.md'])).code).toBe(0);
     expect((await git(repo, ['show', 'main:feature.js'])).code).toBe(0);
   }, 150_000);
+
+  it('a sub-task\'s wiki pages land on its parent\'s wiki branch, and reach wiki main only through the parent\'s wiki pull request (pramana#39)', async () => {
+    const repo = await h.makeRepo('ship-subtask-wiki');
+    // Commit a page in this world's project-wiki checkout (a sibling of the code checkout).
+    const note = (name: string) => `@run for d in ../*/; do case "$(git -C "$d" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" in */wiki/project/*) mkdir -p "$d/memories/${name}" && printf 'from ${name}' > "$d/memories/${name}/MEMORY.md" && git -C "$d" add -A && git -C "$d" commit -qm ${name};; esac; done`;
+    const { taskId, handle } = await start(repo, `${note('parent')}\n@subtask Child :: ${note('child')}\n@incomplete`);
+    const wiki = ensureProjectWikiRepository(h.contentDir, (await h.store.getTask(taskId))!.projectId);
+    const parentBranch = `tavya/${taskId}`;
+    try {
+      // The sub-task (not a pull request of the parent) stacks its wiki on the parent's branch…
+      await expect.poll(async () => (await view(handle)).subTasks?.length ?? 0, { timeout: 30_000 }).toBeGreaterThanOrEqual(1);
+      const childId = (await view(handle)).subTasks[0] as string;
+      const child = h.client.workflow.getHandle(childId);
+      await expect.poll(async () => {
+        const checkout = ((await view(child)).state?.recoveryWorld?.repos ?? []).find((r: any) => r.role === 'project-wiki');
+        return checkout && [checkout.base, worldRepoTarget(checkout, '')];
+      }, { timeout: 30_000 }).toEqual([parentBranch, parentBranch]);
+      // …and lands there once approved, wherever its own pull requests are.
+      for (let n = 0; n < 20 && (await view(child)).stage !== 'done'; n++) {
+        const v = await view(child);
+        const open = v.subTasks?.length ? v.subTasks.map((id: string) => h.client.workflow.getHandle(id)) : [child];
+        for (const pr of open) {
+          const pv = await view(pr).catch(() => undefined);
+          if (pv?.stage === 'review' && pv.waitingFor?.kind === 'human') await pr.signal('confirm');
+          if (pv?.stage === 'review' && pv.waitingFor?.kind === 'parent') await handle.signal('followUp', { id: `r${n}`, role: 'user', text: '@respond confirm', ts: 0 });
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+      }
+      expect((await view(child)).stage).toBe('done');
+      expect((await git(wiki, ['show', `${parentBranch}:memories/child/MEMORY.md`])).stdout).toContain('from child');
+      expect((await git(wiki, ['show', 'main:memories/child/MEMORY.md'])).code).not.toBe(0);
+      expect((await git(wiki, ['show', 'main:memories/parent/MEMORY.md'])).code).not.toBe(0);
+
+      // The parent finishes: its wiki checkout opens as its own pull request to main, carrying both pages.
+      await handle.signal('followUp', { id: 'done', role: 'user', text: '@openpr', ts: 0 });
+      await expect.poll(async () => {
+        for (const id of (await view(handle)).subTasks.slice(1) as string[]) {
+          const pr = h.client.workflow.getHandle(id);
+          const pv = await view(pr);
+          if (pv.stage === 'review' && pv.waitingFor?.kind === 'human') await pr.signal('confirm');
+        }
+        return (await view(handle)).stage;
+      }, { timeout: 60_000, interval: 1000 }).toBe('done');
+      expect((await view(handle)).shipments).toEqual(expect.arrayContaining([
+        expect.objectContaining({ target: 'main', state: 'landed' })]));
+      expect((await git(wiki, ['show', 'main:memories/parent/MEMORY.md'])).stdout).toContain('from parent');
+      expect((await git(wiki, ['show', 'main:memories/child/MEMORY.md'])).stdout).toContain('from child');
+    } finally {
+      await handle.signal('cancel').catch(() => undefined);
+    }
+  }, 180_000);
 
   it('refuses what cannot open, and tells the agent why', async () => {
     const repo = await h.makeRepo('ship-refusals');
