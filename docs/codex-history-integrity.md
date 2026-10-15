@@ -37,6 +37,19 @@ Runtime resume and fork preparation apply the same recovery automatically
 (including identities retained in Temporal retry heartbeats), so a manual repair
 is only needed for offline homes or to audit.
 
+## Imported conversations with invented item ids
+
+panagent 0.3.0 and earlier, which converts a Claude conversation into a Codex
+one (a fork that switches agents), gave each assistant message an invented id
+(`msg_` and 32 hex digits), and a Codex fork copies it. Codex sends item ids back
+to the model. OpenAI's Responses API now looks up any id it did not issue, so the
+first turn failed with `400 Supplied input item IDs require persisted-item lookup
+that is not supported` (task #643, 2026-10-15). panagent no longer writes them.
+The same preparation removes them from histories that descend from a panagent
+import (a `session_meta` with `originator: "panagent"`, which forks keep) and
+resumes the rewritten copy. Ids that Codex assigns (UUID-shaped) and ids OpenAI
+issues are left alone (`tests/codex-imported-ids.test.ts`).
+
 ## Rules
 
 - Never rewrite source histories, change ancestor files, or delete originals after
