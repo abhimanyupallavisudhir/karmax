@@ -103,6 +103,10 @@ interface Scan {
   expected: number;
   previousDecimal: boolean;
   repaired: boolean;
+  /** The history descends from a panagent import (a `session_meta` it wrote,
+   * which a fork keeps), and an item has an id shaped like the ones it invented. */
+  imported: boolean;
+  inventedIds: boolean;
   fault?: string;
 }
 const scans = new Map<string, { bytes: number; digest: string; scan: Scan; held: number }>();
@@ -124,8 +128,10 @@ function scanHistory(key: string, session: string, content: Buffer): Scan {
     if (!scan) {
       held = raw.length;
       const base = value.payload?.history_base?.end_ordinal_exclusive;
-      scan = { first: value, expected: Number.isSafeInteger(base) ? base : 0, previousDecimal: false, repaired: false };
+      scan = { first: value, expected: Number.isSafeInteger(base) ? base : 0, previousDecimal: false, repaired: false, imported: false, inventedIds: false };
     }
+    if (value.type === 'session_meta' && value.payload?.originator === 'panagent') scan.imported = true;
+    if (!scan.inventedIds && inventedId(value)) scan.inventedIds = true;
     if (scan.first.payload?.history_mode !== 'paginated' || scan.fault) return;
     const ordinal = value.ordinal;
     if (!Number.isSafeInteger(ordinal) || ordinal < 0) { scan.fault = `missing or invalid ordinal in ${session}`; return; }
@@ -152,6 +158,17 @@ function scanHistory(key: string, session: string, content: Buffer): Scan {
   return scan!;
 }
 
+/** panagent ≤ 0.3.0 gave each imported assistant message an id of its own
+ * (`msg_` and 32 hex digits), and a Codex fork copies it. Codex sends item ids
+ * back to the model, and OpenAI looks up any id it did not issue, refusing the
+ * whole turn: "Supplied input item IDs require persisted-item lookup" (task
+ * #643). Only histories that descend from a panagent import are rewritten; ids
+ * Codex assigns (UUID-shaped) and ids OpenAI issues (longer) never match. */
+function inventedId(record: any): boolean {
+  const id = record?.type === 'response_item' ? record.payload?.id : undefined;
+  return typeof id === 'string' && /^msg_[0-9a-f]{32}$/.test(id);
+}
+
 function leadingMetadata(record: any): any {
   if (record?.type !== 'session_meta' || !record.payload || typeof record.payload !== 'object')
     throw new CodexHistoryError('missing leading session metadata');
@@ -169,7 +186,7 @@ export async function prepareCodexHistory(session: string,
   if (!validCodexSessionId(session)) throw new CodexHistoryError('invalid session identity');
   const seen = new Set<string>();
   const segments: Segment[] = [];
-  let repaired = false;
+  let repaired = false, imported = false, inventedIds = false;
   async function visit(id: string, cutoff?: { bytes: number; ordinal: number }): Promise<void> {
     if (seen.has(id)) throw new CodexHistoryError(`cyclic lineage at ${id}`);
     seen.add(id);
@@ -180,6 +197,8 @@ export async function prepareCodexHistory(session: string,
     const content = source.content.subarray(0, bytes);
     const scan = scanHistory(cutoff ? `${id}@${bytes}` : id, id, content);
     const meta = leadingMetadata(scan.first);
+    if (scan.imported) imported = true;
+    if (scan.inventedIds) inventedIds = true;
     if ((meta.id ?? meta.session_id) !== id) throw new CodexHistoryError(`metadata identity mismatch for ${id}`);
     const base = meta.history_base;
     if (base != null) {
@@ -202,7 +221,8 @@ export async function prepareCodexHistory(session: string,
   const toolsChanged = options.dynamicTools !== undefined
     && !isDeepStrictEqual(metadata.payload.dynamic_tools, options.dynamicTools);
   const canonicalName = /(?:^|\/)rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-[0-9a-f-]{36}\.jsonl$/i.test(leaf.source.file);
-  if (!options.snapshot && !repaired && !toolsChanged && canonicalName) return undefined;
+  const invented = imported && inventedIds;
+  if (!options.snapshot && !repaired && !invented && !toolsChanged && canonicalName) return undefined;
   const sources = segments.map((segment) => ({ session: segment.session, file: segment.source.file,
     bytes: segment.source.content.length, sha256: hash(segment.source.content) }));
   // Changing captured bytes or tools produces another identity. Never overwrite
@@ -216,6 +236,7 @@ export async function prepareCodexHistory(session: string,
   const lines = segments.map((segment) => parseLines(segment.source.content, segment.session));
   const body = lines.flatMap((segment) => segment.slice(1));
   const out = [metadata, ...body.map((line) => structuredClone(line.value))];
+  if (invented) for (const record of out) if (inventedId(record)) delete record.payload.id;
   const meta = metadata.payload;
   if (meta.subagent_history_start_ordinal != null) {
     const boundary = meta.subagent_history_start_ordinal;
