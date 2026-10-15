@@ -201,6 +201,9 @@ export const cancelSignal = defineSignal('cancel');
  * landed: end it as done — what landed stays, the rest is closed. Offered in
  * place of Cancel, which could no longer undo it. */
 export const finishSignal = defineSignal('finish');
+/** Its task finished (v1.30): a pull request not yet approved closes; one
+ * approved or landing goes on and lands as reviewed. */
+export const closePullRequestSignal = defineSignal('closePullRequest');
 /** Graceful stop used only when the platform is about to replace this run.
  * Unlike user cancellation it preserves open PRs, but it still checkpoints and
  * releases execution-owned activity before the replacement starts. */
@@ -1970,7 +1973,16 @@ async function softwareDevImpl(
     activeSetup?.cancel();
     activeTurn?.cancel();
     activeStaging?.cancel();
-    cancelChildren();
+  });
+  // This task is a pull request whose task finished (v1.30): close unless it
+  // has been approved — what was approved lands as reviewed.
+  setHandler(closePullRequestSignal, () => {
+    // Waiting for its agent (Review asked a change, or landing a repair), it
+    // closes whatever it was: that agent has stopped.
+    if (!shippedBranch || cancelled || pointOfNoReturnPassed || lifecycleTransitionBlocked
+      || (waitingFor?.kind !== 'parent' && (consumed.has('confirm') || stage === 'merge'))) return;
+    cancelled = true;
+    activeTurn?.cancel();
   });
   setHandler(lifecycleReplacementSignal, () => {
     if (restoresStagePrerequisites && !pointOfNoReturnPassed && !lifecycleTransitionBlocked) {
@@ -2094,6 +2106,11 @@ async function softwareDevImpl(
   setHandler(pullRequestNoticeSignal, ({ childTaskId, kind, text }) => {
     const shipment = shipments.find((candidate) => candidate.childTaskId === childTaskId);
     if (!shipsBranches || !shipment) return;
+    // Finishing: the agent has stopped, so a pull request needing it closes.
+    if (finishing) {
+      if (kind === 'needs-work') void getExternalWorkflowHandle(childTaskId).signal(closePullRequestSignal).catch(() => undefined);
+      return;
+    }
     const name = `the pull request for "${shipment.checkout}" (sub-task ${childTaskId})`;
     const said = kind === 'needs-work'
       ? `Changes are needed in ${name}:\n\n${text}\n\nMake them in "${shipment.checkout}", commit, and call open_pr with branch "${shipment.checkout}" to update it.`
@@ -3561,7 +3578,28 @@ Inspect the complete current diff and specifically compare its delta from the re
   /** Finish (v1.30): stop the agent and every open pull request — closing them
    * — and end done with what landed. */
   async function finish(): Promise<{ stage: Stage }> {
-    await cancelChildren(true);
+    // Sub-tasks of the agent's stop; pull requests not yet approved close, and
+    // the rest land as reviewed. The world stays until every one has settled:
+    // a landing uses it.
+    const others: string[] = [];
+    for (const cid of outstanding) {
+      const lane = shipments.some((shipment) => shipment.childTaskId === cid && shipment.state === 'open');
+      if (!lane) others.push(cid);
+      await getExternalWorkflowHandle(cid).signal(lane ? closePullRequestSignal : cancelSignal).catch(() => undefined);
+    }
+    if (others.length) await condition(() => others.every((cid) => settled.some((s) => s.childTaskId === cid)), '10 seconds');
+    for (;;) {
+      const open = openShipments();
+      if (!open.length) break;
+      status = 'waiting';
+      waitingFor = { kind: 'subtask', detail: `Finishing: waiting for ${open.length === 1
+        ? `the pull request for "${open[0]!.checkout}"` : `${open.length} pull requests`} to land or close` };
+      await publish();
+      if (!(await condition(() => openShipments().length !== open.length, '1 minute'))) {
+        const children = await coreChild.settledChildTasks(taskId, open.map((shipment) => shipment.childTaskId)).catch(() => []);
+        for (const child of children) noteShipmentSettled(child.taskId, child.stage);
+      }
+    }
     stage = 'done';
     status = 'done';
     waitingFor = undefined;

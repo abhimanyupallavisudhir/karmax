@@ -5,6 +5,7 @@ import path from 'node:path';
 import { bootHarness, type Harness } from './helpers/harness.js';
 import { TASK_QUEUE } from '../src/temporal/config.js';
 import { git } from '../src/world/git.js';
+import { MERGE_QUEUE_WORKFLOW, SIG_ENQUEUE, SIG_RELEASE, mergeQueueId } from '../src/coordinators/names.js';
 
 /**
  * Several branches per task (SPEC §11.1): ONE agent in ONE world, a checkout
@@ -204,9 +205,15 @@ describe('software-dev: every branch of a task lands as its own pull request', (
     expect((await git(repo, ['show', 'main:docs/guide.md'])).code).not.toBe(0);
   }, 120_000);
 
-  it('Finish replaces Cancel once something landed: the task ends done and what did not land is closed', async () => {
+  it('Finish replaces Cancel once something landed: unapproved pull requests close, a landing one lands, then done', async () => {
     const repo = await h.makeRepo('ship-finish');
     const { handle } = await start(repo, ['@branch docs', docsCommit, '@ship docs', '@incomplete'].join('\n'));
+    // Something else holds the merge slot, so an approved pull request waits in
+    // its landing for as long as the test likes.
+    const domain = `${repo}:main`;
+    const holder = `holder-${path.basename(repo)}`;
+    const queue = (signal: string) => h.client.workflow.signalWithStart(MERGE_QUEUE_WORKFLOW, {
+      workflowId: mergeQueueId(domain), taskQueue: TASK_QUEUE, args: [{ domain }], signal, signalArgs: [{ taskId: holder }] });
     const { child: docs } = await pullRequest(handle, 1);
     const actions = async () => ((await view(handle)).actions as any[]).map((action) => action.name);
     expect(await actions()).toContain('cancel');
@@ -216,24 +223,46 @@ describe('software-dev: every branch of a task lands as its own pull request', (
     await expect.poll(actions, { timeout: 30_000 }).toContain('finish');
     expect(await actions()).not.toContain('cancel');
 
-    // More work goes up for review, then the person finishes the task instead.
+    // Two more pull requests: api is approved and waits in its landing; cli
+    // waits for its Review.
     await handle.signal('followUp', { id: 'f1', role: 'user', ts: 0, text: [
       '@branch api',
       "@run cd ../api && echo 'export const api = 1;' > api.js && git add -A && git commit -qm api",
       '@ship api',
+      '@branch cli',
+      "@run cd ../cli && echo 'export const cli = 1;' > cli.js && git add -A && git commit -qm cli",
+      '@ship cli',
       '@incomplete',
     ].join('\n') });
     const { child: api } = await pullRequest(handle, 2);
-    const snapshot = (await view(api)).world.repos[0].root as string;
-    await handle.signal('finish');
-    expect((await handle.result()).stage).toBe('done');
-    expect((await view(handle)).status).toBe('done');
-    expect((await api.result()).stage).toBe('cancelled');
-    expect(fs.existsSync(snapshot)).toBe(false);
-    expect((await git(repo, ['show', 'main:docs/guide.md'])).code).toBe(0);
-    expect((await git(repo, ['show', 'main:api.js'])).code).not.toBe(0);
-    expect((await view(handle)).reviewInfo?.summary).toMatch(/Landed: "docs"\. Closed without landing: "api"\./);
-  }, 150_000);
+    const { child: cli } = await pullRequest(handle, 3);
+    const holding = await h.client.workflow.start('pingWorkflow', { taskQueue: TASK_QUEUE, workflowId: holder, args: ['hold'] });
+    try {
+      await queue(SIG_ENQUEUE);
+      await expect.poll(async () => ((await h.client.workflow.getHandle(mergeQueueId(domain)).query('queue')) as any).current,
+        { timeout: 20_000 }).toBe(holder);
+      await api.signal('confirm');
+      await expect.poll(async () => (await view(api)).stage, { timeout: 30_000 }).toBe('merge');
+
+      await handle.signal('finish');
+      // The unapproved one closes; the task waits for the landing one, and says so.
+      expect((await cli.result()).stage).toBe('cancelled');
+      await expect.poll(async () => (await view(handle)).waitingFor?.detail, { timeout: 30_000 })
+        .toMatch(/Finishing: waiting for the pull request for "api" to land or close/);
+      expect((await view(handle)).status).not.toBe('done');
+      expect((await view(api)).stage).toBe('merge');
+
+      await queue(SIG_RELEASE);
+      expect((await api.result()).stage).toBe('done');
+      expect((await handle.result()).stage).toBe('done');
+      expect((await git(repo, ['show', 'main:api.js'])).code).toBe(0);
+      expect((await git(repo, ['show', 'main:cli.js'])).code).not.toBe(0);
+      expect((await view(handle)).reviewInfo?.summary).toMatch(/Landed: "docs", "api"\. Closed without landing: "cli"\./);
+    } finally {
+      await queue(SIG_RELEASE).catch(() => undefined);
+      await holding.signal('finish').catch(() => undefined);
+    }
+  }, 180_000);
 
   it('Done waits for every pull request, whichever lands first', async () => {
     const repo = await h.makeRepo('ship-done-waits');
