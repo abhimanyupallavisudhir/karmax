@@ -402,7 +402,7 @@ async function fastForwardWorldFromOrigin(
   const transferRef = `refs/karmax/remote-ahead/${cryptoSafeName(repo.branch)}`;
   const incomingRef = 'refs/karmax/remote-ahead';
   const bundleName = `.karmax-remote-ahead-${repo.name.replace(/[^A-Za-z0-9_.-]/g, '-')}.bundle`;
-  const bundleRelative = worldRepos(world.handle).length > 1 ? `${repo.name}/${bundleName}` : bundleName;
+  const bundleRelative = inCheckout(world, repo, bundleName);
   const bundlePath = path.join(clone, bundleName);
   try {
     const staged = await git(clone, ['update-ref', transferRef, trackingRef]);
@@ -483,7 +483,7 @@ export async function brokerRefreshBranch(world: World, auth: GitBrokerAuth): Pr
 
     const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-git-refresh-'));
     const bundleName = `.karmax-incoming-${crypto.randomUUID()}.bundle`;
-    const bundleRelative = repos.length > 1 ? `${repo.name}/${bundleName}` : bundleName;
+    const bundleRelative = inCheckout(world, repo, bundleName);
     try {
       const known = await knownGitCommits(args => world.exec('git', args, { cwd: repo.root }));
       const bundle = await authorityBundle(temp, repo, repo.branch, auth, known, sharesHostRefDatabase(world.handle.kind));
@@ -564,7 +564,7 @@ async function brokerFetchRef(world: World, destinationRepo: WorldRepo, branch: 
   if (!validGitBranch(branch)) throw new Error(`Git broker rejected invalid branch "${branch}"`);
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-git-import-'));
   const bundleName = `.karmax-import-${crypto.randomUUID()}.bundle`;
-  const bundleRelative = worldRepos(world.handle).length > 1 ? `${destinationRepo.name}/${bundleName}` : bundleName;
+  const bundleRelative = inCheckout(world, destinationRepo, bundleName);
   try {
     const known = await knownGitCommits(args => world.exec('git', args, { cwd: destinationRepo.root }),
       destinationRepo.baseSha ? [destinationRepo.baseSha] : [], [destinationRef]);
@@ -735,10 +735,21 @@ async function publishRepositories(repos: WorldRepo[], run: (repo: WorldRepo) =>
 
 /** Negotiate against the actual receiving repository, never stale sandbox
  * origin refs. Pin and import only the named task branch, independently of HEAD. */
+/** A file in a checkout's directory, as a world-relative path for the file
+ * API: `<name>/<file>` for a nested checkout, `<file>` for one at the world
+ * root, and wherever else a checkout lives (a pull request's worktree,
+ * SPEC §11.1). */
+function inCheckout(world: World, repo: WorldRepo, file: string): string {
+  const relative = path.posix.relative(world.handle.root, repo.root);
+  if (relative.startsWith('..') || path.posix.isAbsolute(relative))
+    return worldRepos(world.handle).length > 1 ? `${repo.name}/${file}` : file;
+  return relative ? path.posix.join(relative, file) : file;
+}
+
 async function importWorldBranch(world: World, repo: WorldRepo, receiver: string, destinationRef: string, temp: string): Promise<void> {
   if (!validGitBranch(repo.branch)) throw new Error('Git broker rejected an invalid task branch');
   const transferName = `.karmax-transfer-${crypto.randomUUID()}.bundle`;
-  const transferRel = worldRepos(world.handle).length > 1 ? `${repo.name}/${transferName}` : transferName;
+  const transferRel = inCheckout(world, repo, transferName);
   const known = await knownGitCommits(args => git(receiver, args), repo.baseSha ? [repo.baseSha] : [],
     [destinationRef, `refs/remotes/origin/${repo.branch}`]);
   try {

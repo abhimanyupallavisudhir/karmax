@@ -20,7 +20,7 @@ import { timingEnabled, installationTiming, withTiming, timed } from '../timing/
 import { McpConnections } from '../mcp/connections/store.js';
 import { preserveReviewArtifacts, unsavedReviewArtifacts } from '../store/review-artifacts.js';
 import { prepareConnections } from '../mcp/connections/runtime.js';
-import { expectedTaskRemoteHeads } from '../world/publication.js';
+import { checkoutBranches, expectedTaskRemoteHeads } from '../world/publication.js';
 import { applyConversationPatch, conversationPage, hasLiveWorldWork, watchesJobs, lifecycleEventPayload, transcriptOf, type PublishedView, type TurnConversationBase, type ViewConversation, type LifecyclePublication } from '../domain/view-publication.js';
 import { recordHumanConfirmation } from '../platform/review-confirmation.js';
 import { WorkflowNotFoundError, type Client } from '@temporalio/client';
@@ -33,7 +33,7 @@ import { usageAdmissionId as admissionIdFor } from '../domain/turn-admission.js'
 import { hostStats, hostMemoryTight } from './agent-slots.js';
 import { Store, type ViewPublicationOrder } from '../store/db.js';
 import { WorldRegistry } from '../world/registry.js';
-import { World, WorldHandle, WorldKind, WorldSpec, worldWorkingDirectory, type WorldDiagnosis } from '../world/types.js';
+import { World, WorldHandle, WorldKind, WorldSpec, type WorldRepo, worldWorkingDirectory, type WorldDiagnosis } from '../world/types.js';
 import { finalizeMerge, MergeResult } from '../world/merge.js';
 import { applyAgentSpec, ProfileResolver } from '../agent/profiles.js';
 import {
@@ -64,6 +64,7 @@ import { PermissionRequests } from '../platform/permission-requests.js';
 import { applyAvatarProfile, avatarAuthorizationCapabilities, avatarForRole, avatarPrincipal } from '../platform/avatars.js';
 import { GitProfiles, userGitScope } from '../autonomy/git-profiles.js';
 import { worldRepos, worldRepoSource, worldRepoTarget } from '../world/types.js';
+import { pullRequestHandle, pullRequestView, isPullRequestView } from '../world/pr-view.js';
 import { git as hostGit, isolatedGitEnvironment } from '../world/git.js';
 import { brokerFinalizeMerge, brokerPublishBranch, brokerPushBranches, describePublishFailures, type GitBrokerAuth } from '../world/git-broker.js';
 import { enrollWorldRepositories } from '../world/repository-enrollment.js';
@@ -535,6 +536,10 @@ export interface PrepareChildArgs {
   /** The child's own agent fields from create_sub_task `params` (PL-11),
    *  validated by `subTaskParams` when the tool ran. */
   params?: SubTaskRequest['params'];
+  /** software-dev ≥1.30: the child is one pull request of its parent (SPEC
+   *  §11.1): it lands a branch from the parent's own world, so nothing of the
+   *  parent's (its branch, its data) is seeded for it. */
+  pullRequest?: boolean;
 }
 
 /** Side-effecting activities the workflows drive (SPEC §3.1). */
@@ -1077,7 +1082,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
   async function publishTaskBranch(world: World, taskId: string, idleCheckpoint = false) {
     return brokerPublishBranch(world, (await brokerAuthFor(world.handle, taskId)),
-      (await expectedTaskRemoteHeads(store, taskId)), recordOriginPublication(taskId), { omitUnchangedBase: idleCheckpoint });
+      (await expectedTaskRemoteHeads(store, taskId, checkoutBranches(worldRepos(world.handle)))), recordOriginPublication(taskId), { omitUnchangedBase: idleCheckpoint });
   }
 
   async function pushTaskBranches(
@@ -1086,7 +1091,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     env: Record<string, string>,
     repos: ReturnType<typeof worldRepos>,
   ) {
-    const expectedRemoteHeads = (await expectedTaskRemoteHeads(store, handle.id));
+    const expectedRemoteHeads = (await expectedTaskRemoteHeads(store, handle.id, checkoutBranches(repos)));
     if (isRemote(handle.kind))
       return brokerPushBranches(world, (await brokerAuthFor(handle, handle.id)), repos, expectedRemoteHeads,
         recordOriginPublication(handle.id));
@@ -1194,7 +1199,25 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
    * while repository attachment is intentionally live platform state. Reconcile
    * those two views inside the trusted activity before any operation that must
    * cover every checkout. */
+  /** A pull request's worktree is the task's world's, outside its recorded
+   * checkouts: a world restored from a checkpoint may come back without it.
+   * Put it back from its branch (`tavya/<sub-task>`, which a checkpoint and
+   * every publication keep). */
+  async function restorePullRequest(view: World, world: World): Promise<World> {
+    const repo = worldRepos(view.handle)[0];
+    if (!repo) return view;
+    if ((await world.exec('git', ['rev-parse', '--git-dir'], { cwd: repo.root }).catch(() => undefined))?.code === 0) return view;
+    const sibling = worldRepos(world.handle).find((candidate) => candidate.repo === repo.repo);
+    if (!sibling) throw new Error(`the pull request's repository "${repo.name}" is no longer in its task's world`);
+    await world.exec('git', ['worktree', 'prune'], { cwd: sibling.root });
+    const added = await world.exec('git', ['worktree', 'add', '-q', repo.root, repo.branch], { cwd: sibling.root });
+    if (added.code !== 0) throw new Error(`could not restore the pull request's worktree: ${added.stderr || added.stdout}`);
+    return view;
+  }
+
   async function enrollLiveProjectRepositories(world: World, taskId: string): Promise<string[]> {
+    // A pull request's view lands its one checkout; the world's own list is its task's.
+    if (isPullRequestView(world.handle)) return [];
     const task = (await store.getTask(taskId));
     if (!task) throw new Error(`no task ${taskId}`);
     const linked = (await store.listProjectRepositories(task.projectId));
@@ -1335,6 +1358,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       for (;;) {
         await ensureRunnerLease(handle, taskId);
         const world = await (worlds.withOperation ? worlds.withOperation(handle.id, open) : open());
+        // One pull request of a task's world (SPEC §11.1): the task's world,
+        // narrowed to that pull request's worktree.
+        if (world && isPullRequestView(handle)) return await restorePullRequest(pullRequestView(world, handle), world);
         if (world) return world;
         // A park already in flight may have released the lease while we waited
         // for its transition. Re-enter admission before opening the provider.
@@ -1576,7 +1602,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     const currentProject = (await store.getProject(args.projectId));
     const project = currentProject ? (await store.effectiveProjectConfig(currentProject)) : args.project;
     const parentHandle = (await store.currentWorld(args.parentTaskId)) as WorldHandle | undefined;
-    if (parentHandle && isRemote(parentHandle.kind)) {
+    if (parentHandle && isRemote(parentHandle.kind) && !args.pullRequest) {
       const parentWorld = await openWorld(parentHandle);
       await enrollLiveProjectRepositories(parentWorld, args.parentTaskId);
       // A project without repositories has no branch to seed: its child starts
@@ -1592,7 +1618,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     }
     // The parent's copies of its writable resources, saved for the child to
     // start from, as its branch was pushed above.
-    const resourceRevisions = parentHandle && deps.resources ? await deps.resources.snapshotForks(parentHandle, work) : {};
+    const resourceRevisions = parentHandle && deps.resources && !args.pullRequest ? await deps.resources.snapshotForks(parentHandle, work) : {};
     let idempotencyKey: string | undefined;
     try {
       const { info } = activityContext.current();
@@ -1616,7 +1642,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       createdBy: { kind: 'task-agent', taskId: args.parentTaskId, role: 'do' },
       assignee: { kind: 'task-agent', taskId: args.parentTaskId, role: 'do' },
     }));
-    (await record(args.parentTaskId, 'subtask.created', { childTaskId: child.id, title: args.title }));
+    (await record(args.parentTaskId, 'subtask.created', { childTaskId: child.id, title: args.title, ...(args.pullRequest ? { pullRequest: true } : {}) }));
     // Least-privilege grant (SPEC §8.2): the child's delegation caps are attenuated
     // by the parent's own grant, and its merge cap is scoped to EXACTLY the parent's
     // branch (which the parent owns and merges into). If no branch is known,
@@ -3284,6 +3310,18 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           signal,
           heartbeat,
           pullFollowUps,
+          // `open_pr` with `branch` (SPEC §11.1): the workflow ships it while this
+          // turn goes on, and answers once the sub-task owning it exists.
+          ...(deps.client && args.role === 'do' ? { shipBranch: async (request: import('../agent/runtime.js').ShipBranchRequest) => {
+            const turnId = args.agentTurnId ?? legacyAgentTurnId ?? 'turn';
+            try {
+              return await deps.client!.workflow.getHandle(args.taskId).executeUpdate('shipBranch', {
+                args: [{ ...request, requestId: `${turnId}:${request.name}:${request.head}` }],
+              }) as import('../agent/runtime.js').ShipBranchOutcome;
+            } catch (error) {
+              return { ok: false as const, reason: `this task cannot open one branch's pull request on its own right now (${error instanceof Error ? error.message : String(error)}); finish with open_pr instead` };
+            }
+          } } : {}),
           ...(turnSessionKey ? { journal: {
             restored: restoredJournal,
             save: async (journal: import('../agent/runtime.js').TurnJournal) => {
@@ -3872,6 +3910,97 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       return heads;
     },
 
+    /**
+     * Can this checkout's pull request open now (`open_pr` with `branch`, SPEC
+     * §11.1)? `handle` is the running turn's: a branch added this turn is not in
+     * the durable handle yet. Refusals say what to do instead. `current`: the
+     * branch must already contain its target, because work it builds on (an
+     * earlier pull request from it, or the branch it is stacked on) has landed
+     * there and must not be proposed again.
+     */
+    async checkShipment(handle: WorldHandle, args: { checkout: string; target: string; current?: boolean; stackedOn?: string }): Promise<
+      { ok: true; checkout: WorldRepo; head: string; target: string } | { ok: false; empty?: boolean; reason: string }> {
+      const repos = worldRepos(handle);
+      const repo = repos.find((candidate) => candidate.name === args.checkout)
+        ?? repos.find((candidate) => candidate.branch === args.checkout);
+      if (!repo) return { ok: false, reason: `this task has no branch named "${args.checkout}"; its branches are ${repos.map((candidate) => `"${candidate.name}"`).join(', ')}` };
+      const world = await openWorld(handle);
+      const status = await world.exec('git', ['-c', 'core.quotePath=false', 'status', '--porcelain'], { cwd: repo.root });
+      if (status.code !== 0) return { ok: false, reason: `could not inspect "${repo.name}": ${status.stderr || status.stdout}` };
+      if (status.stdout.trim()) return { ok: false, reason: `"${repo.name}" has uncommitted changes: commit what should land and ignore or remove what should not, then open its pull request again.\n${status.stdout.trim()}` };
+      const target = worldRepoTarget(repo, args.target);
+      const ahead = await commitsAheadOfPrBase(world, repo, target);
+      if (ahead.code !== 0) return { ok: false, reason: `could not compare "${repo.name}" with ${target}: ${ahead.stderr || ahead.stdout}` };
+      if (Number(ahead.stdout.trim()) === 0) return { ok: false, empty: true, reason: `"${repo.name}" has no commits to propose beyond ${target}` };
+      const sibling = repos.find((candidate) => candidate !== repo && candidate.branch === repo.base);
+      if (sibling && sibling.name !== args.stackedOn) return { ok: false, reason: `"${repo.name}" builds on "${sibling.name}", which has not landed: open "${sibling.name}"'s pull request first; once it has landed, bring "${repo.name}" up to date with ${target} and open it.` };
+      if (args.current || sibling) {
+        const refs = [`refs/heads/${target}`, `refs/remotes/origin/${target}`];
+        const listed = await world.exec('git', ['for-each-ref', '--format=%(refname)', ...refs], { cwd: repo.root });
+        for (const ref of listed.stdout.split('\n').map((line) => line.trim()).filter(Boolean)) {
+          const contained = await world.exec('git', ['merge-base', '--is-ancestor', ref, 'HEAD'], { cwd: repo.root });
+          if (contained.code !== 0) return { ok: false, reason: `bring "${repo.name}" up to date with ${target} first (refresh_upstream, then merge or rebase), so its pull request shows only its own new work.` };
+        }
+      }
+      const head = await world.exec('git', ['rev-parse', 'HEAD'], { cwd: repo.root });
+      if (head.code !== 0 || !head.stdout.trim()) return { ok: false, reason: `could not read the head of "${repo.name}": ${head.stderr || head.stdout}` };
+      return { ok: true, checkout: repo, head: head.stdout.trim(), target };
+    },
+
+    /**
+     * Put a pull request's snapshot in place in its task's world (SPEC §11.1):
+     * a worktree of the checkout's repository on the pull request's own branch
+     * (`tavya/<sub-task>`) at `head` — created the first time, moved to the new
+     * head when the agent opens the pull request again. Returns the view handle
+     * the sub-task lands it through.
+     */
+    async openPullRequest(handle: WorldHandle, args: { checkout: WorldRepo; head: string; childTaskId: string; target: string }): Promise<WorldHandle> {
+      const world = await openWorld(handle);
+      const view = pullRequestHandle(world.handle, args.checkout, args.childTaskId, args.target);
+      const repo = worldRepos(view)[0]!;
+      const exists = (await world.exec('git', ['rev-parse', '--is-inside-work-tree'], { cwd: repo.root }).catch(() => undefined))?.code === 0;
+      const moved = exists
+        ? await world.exec('git', ['reset', '-q', '--hard', args.head], { cwd: repo.root })
+        : await world.exec('git', ['worktree', 'add', '-q', '-B', repo.branch, repo.root, args.head], { cwd: args.checkout.root });
+      if (moved.code !== 0) throw new Error(`could not put the pull request of "${args.checkout.name}" in place: ${moved.stderr || moved.stdout}`);
+      (await record(handle.id, 'pull-request.snapshot', { checkout: args.checkout.name, childTaskId: args.childTaskId, branch: repo.branch, head: args.head }));
+      return view;
+    },
+
+    /** Move a pull request's worktree (and branch) to `head`, the commit its
+     * task's agent opened it at again. Only before its Review: what is reviewed
+     * is exactly what lands. */
+    async movePullRequest(view: WorldHandle, head: string): Promise<void> {
+      const world = await openWorld(view);
+      const repo = worldRepos(world.handle)[0];
+      if (!repo) throw new Error('this pull request has no worktree');
+      const moved = await world.exec('git', ['reset', '-q', '--hard', head], { cwd: repo.root });
+      if (moved.code !== 0) throw new Error(`could not move the pull request to ${head}: ${moved.stderr || moved.stdout}`);
+      (await record(view.id, 'pull-request.snapshot', { checkout: repo.name, childTaskId: view.meta?.pullRequest, branch: repo.branch, head }));
+    },
+
+    /** Remove a settled pull request's worktree from its task's world. Its
+     * branch stays; the world goes on (it is the task's). Git runs in a checkout
+     * of the same repository: the world root is no repository. A failure is
+     * recorded, never silent: a leftover worktree takes the task's disk. */
+    async closePullRequest(view: WorldHandle): Promise<{ removed: boolean }> {
+      if (!isPullRequestView(view)) return { removed: false };
+      const repo = worldRepos(view)[0];
+      if (!repo) return { removed: false };
+      const world = await openWorld({ ...view, meta: { ...view.meta, pullRequest: undefined } });
+      const sibling = worldRepos(world.handle).find((candidate) => candidate.repo === repo.repo);
+      const removed = sibling
+        ? await world.exec('git', ['worktree', 'remove', '--force', repo.root], { cwd: sibling.root })
+        : { code: 1, stdout: '', stderr: `no checkout of "${repo.name}" left in the world` };
+      if (sibling) await world.exec('git', ['worktree', 'prune'], { cwd: sibling.root });
+      if (removed.code !== 0 && (await world.exec('git', ['rev-parse', '--git-dir'], { cwd: repo.root }).catch(() => undefined))?.code === 0) {
+        (await record(view.id, 'pull-request.cleanup-failed', { checkout: repo.name, childTaskId: view.meta?.pullRequest,
+          root: repo.root, error: (removed.stderr || removed.stdout).slice(0, 500) }));
+        return { removed: false };
+      }
+      return { removed: true };
+    },
+
     /** The current world, including checkouts added during Do, determines whether
      * Git persistence is needed. A missing configured checkout is never treated
      * as a resource-only success. Checkpoint before releasing remote compute:
@@ -4423,7 +4552,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             ? await api.update(slug, existing.number, { title, body: upstreamPrBody(details, title) }).catch(() => existing)
             : existing;
           const ref = upstreamRef(repo.name, slug, headRepository, live);
-          (await record(handle.id, 'pr.updated', { ...ref, base }));
+          (await record(handle.id, 'pr.updated', { ...ref, base, branch: repo.branch }));
           opened.push(ref);
           continue;
         }
@@ -4453,7 +4582,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           ...(pr.headSha ? { headSha: pr.headSha } : {}),
           ...(pr.nodeId ? { nodeId: pr.nodeId } : {}),
         };
-        (await record(handle.id, created ? 'pr.opened' : 'pr.updated', { ...ref, base }));
+        (await record(handle.id, created ? 'pr.opened' : 'pr.updated', { ...ref, base, branch: repo.branch }));
         opened.push(ref);
       }
       return opened;
@@ -4499,7 +4628,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           const opening = await api.openOrUpdate(slug, { head: repo.branch, base, title, body, headOwner });
           pr = opening.pr;
           (await record(handle.id, opening.created ? 'pr.opened' : 'pr.updated',
-            { ...upstreamRef(repo.name, slug, headRepository!, pr), base }));
+            { ...upstreamRef(repo.name, slug, headRepository!, pr), base, branch: repo.branch }));
         }
         if (pr) {
           result.prs.push(upstreamRef(repo.name, slug, headRepository!, pr));

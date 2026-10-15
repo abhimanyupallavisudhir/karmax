@@ -10311,6 +10311,23 @@ async function openArtifact(url, external, target = '') {
 // Approve ONE branch of a multi-PR task. It records that this branch has been
 // reviewed at the commit it is on now; `confirm` still passes the gate.
 function wireCheckoutApprovals(v) {
+  // A branch's pull request (software-dev ≥1.30) is approved on its own task:
+  // the same Confirm its page offers, from here.
+  document.querySelectorAll('[data-approve-pr]').forEach((btn) =>
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      try {
+        await api(`/api/tasks/${encodeURIComponent(btn.dataset.approvePr)}/signal`, {
+          method: 'POST',
+          body: JSON.stringify({ signal: 'confirm' }),
+        });
+        toast(`Approved ${btn.dataset.branch}`);
+      } catch (e) {
+        btn.disabled = false;
+        toast(e?.message || 'Could not approve that pull request', true);
+      }
+    }),
+  );
   document.querySelectorAll('[data-approve-checkout]').forEach((btn) =>
     btn.addEventListener('click', async () => {
       const name = btn.getAttribute('data-approve-checkout');
@@ -10766,18 +10783,53 @@ function forkSourcesSection(v) {
 // loop-back cheap: send a follow-up about one branch, and when the task comes back
 // from Do the ones the agent did not touch are still approved, so only the changed
 // work needs another look. Confirm PR remains the single act that passes Review.
+// Where a branch's pull request (its sub-task, software-dev ≥1.30) is:
+// [label, chip tone, approvable here].
+function branchPullRequestState(view, lane) {
+  if (lane.state === 'landed') return ['Landed', 'done', false];
+  if (lane.state !== 'open') return ['Closed', 'cancelled', false];
+  if (!view) return ['Opening', 'active', false];
+  if (view.status === 'done' || view.stage === 'done') return ['Landed', 'done', false];
+  if (view.status === 'cancelled' || view.status === 'failed') return ['Closed', 'cancelled', false];
+  if (view.stage === 'review' && view.waitingFor?.kind === 'human') return ['In review', 'waiting', true];
+  if (view.waitingFor?.kind === 'parent') return ['Changes requested', 'waiting', false];
+  if (view.stage === 'merge') return ['Landing', 'active', false];
+  if (view.stage === 'escalated' || view.status === 'blocked') return ['Needs attention', 'blocked', false];
+  return ['Opening', 'active', false];
+}
+
 function checkoutsSection(v) {
   const checkouts = v.checkouts || [];
   if (checkouts.length < 2) return '';                      // one branch: `branch`/`prs` already say it all
   const atReview = v.stage === 'review' && (v.actions || []).some((a) => a.name === 'confirm');
+  // software-dev ≥1.30: each branch's pull request is its own sub-task, opened
+  // whenever the agent is ready. Its row says where that pull request is, links
+  // to it, and approves it right here while it waits for a reviewer.
+  const shipped = new Map((v.shipments || []).map((s) => [s.checkout, s]));
+  const summaries = new Map((v.subTaskSummaries || []).map((summary) => [summary.id, summary]));
   const rows = checkouts.map((c) => {
+    const lane = shipped.get(c.name);
+    if (lane) {
+      const rec = summaries.get(lane.childTaskId) || taskRecord(lane.childTaskId);
+      const [label, tone, approvable] = branchPullRequestState(rec?.lastView, lane);
+      return `<div class="checkout-row ${lane.state === 'landed' ? 'approved' : ''}" data-branch-state="${esc(label)}">
+      <span class="checkout-mark">${lane.state === 'landed' ? '✓' : ''}</span>
+      <b>${esc(c.name)}</b>
+      <span class="mono" style="color:var(--ink-3)">⎇ ${esc(c.branch)}</span>
+      <span style="color:var(--ink-3)">→ ${esc(lane.target)}</span>
+      <span style="flex:1"></span>
+      <span class="chip ${esc(tone)}">${esc(label)}</span>
+      <button type="button" class="btn sm ghost" data-open="${esc(lane.childTaskId)}" title="Open its pull request">${esc(rec?.num != null ? `#${rec.num}` : numLabel(lane.childTaskId))}</button>
+      ${approvable ? `<button type="button" class="btn sm" data-approve-pr="${esc(lane.childTaskId)}" data-branch="${esc(c.name)}">Approve</button>` : ''}
+    </div>`;
+    }
     const dest = c.stackedOn ? `on ${c.stackedOn}` : `→ ${c.target || v.targetBranch || 'target'}`;
     const pr = c.pr
       ? `<a class="pr-link ${c.pr.merged ? 'merged' : c.pr.state === 'closed' ? 'closed' : 'open'}"
            href="${esc(safeHref(c.pr.url))}" target="_blank" rel="noopener">⇱ #${c.pr.number}</a>`
       : '';
     return `<div class="checkout-row ${c.approved ? 'approved' : ''}">
-      <span class="checkout-mark" title="${c.approved ? 'Approved at this commit' : 'Not yet approved'}">${c.approved ? '✓' : '○'}</span>
+      ${atReview || c.approved ? `<span class="checkout-mark" title="${c.approved ? 'Approved at this commit' : 'Not yet approved'}">${c.approved ? '✓' : '○'}</span>` : '<span class="checkout-mark"></span>'}
       <b>${esc(c.name)}</b>
       <span class="mono" style="color:var(--ink-3)">⎇ ${esc(c.branch)}</span>
       <span style="color:var(--ink-3)">${esc(dest)}</span>
@@ -13101,8 +13153,8 @@ function taskActions(v) {
  */
 function actionToast(signal, label) {
   if (signal === 'confirm' && String(label).toLowerCase() === 'done') return 'Confirmation sent';
-  const standard = { confirm: 'confirm', openPr: 'manually open & confirm pr', cancel: 'cancel', retry: 'retry', resume: 'resume', followUp: 'send' };
-  const done = { confirm: 'Confirmed', openPr: 'Opening PR and requesting confirmation', cancel: 'Cancelled', retry: 'Retrying', resume: 'Resumed', followUp: 'Sent' };
+  const standard = { confirm: 'confirm', openPr: 'manually open & confirm pr', cancel: 'cancel', finish: 'finish', retry: 'retry', resume: 'resume', followUp: 'send' };
+  const done = { confirm: 'Confirmed', openPr: 'Opening PR and requesting confirmation', cancel: 'Cancelled', finish: 'Finishing', retry: 'Retrying', resume: 'Resumed', followUp: 'Sent' };
   const text = String(label || signal).trim();
   if (signal === 'openPr' && text.toLowerCase() === 'return to review & confirm') return 'Returning to Review';
   return text.toLowerCase() === standard[signal] ? done[signal] : `${text} — done`;
@@ -13114,6 +13166,7 @@ const returnToReviewConfirmation = () => `Return this pull request to Review and
 
 function confirmTaskAction(action, v = S.view) {
   if (action === 'cancel') return confirm('Cancel this task?');
+  if (action === 'finish') return confirm('Finish this task? Pull requests that have not landed are closed.');
   return action !== 'openPr' || confirm(v?.stage === 'escalated'
     ? ERROR_OPEN_PR_CONFIRMATION
     : hasOpenPullRequest(v) ? returnToReviewConfirmation()

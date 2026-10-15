@@ -2,7 +2,7 @@ import * as __asyncCollections from '../util/async-collections.js';
 import { resolvePaymentPolicy, validatePaymentPolicy, withPolicyCurrency } from '../autonomy/payments.js';
 import { randomUUID } from 'node:crypto';
 import { timingEnabled, installationTiming, timingReport } from '../timing/index.js';
-import { expectedTaskRemoteHeads, recordTaskPublication } from '../world/publication.js';
+import { checkoutBranches, expectedTaskRemoteHeads, recordTaskPublication } from '../world/publication.js';
 import { recordHumanConfirmation } from './review-confirmation.js';
 import { notifyChildSettlement } from './child-settlement.js';
 import { WorkflowExecutionAlreadyStartedError, WorkflowNotFoundError, type Client, type WorkflowExecutionDescription } from '@temporalio/client';
@@ -72,6 +72,7 @@ import type { KarmaxBus } from '../contrib/bus.js';
 import type { WorldRegistry } from '../world/registry.js';
 import type { WorldHandle } from '../world/types.js';
 import { worldRepos, worldRepoSource } from '../world/types.js';
+import { pullRequestHandle } from '../world/pr-view.js';
 import { brokerImportTaskBranch, brokerPublishBranch, brokerRefreshUpstream, describePublishFailures, type GitBrokerAuth } from '../world/git-broker.js';
 import { sameRepository } from '../world/repository-identity.js';
 import { forkLandingBranch, forkWorldSource, type ForkWorldSource } from '../world/fork.js';
@@ -706,7 +707,7 @@ export class KarmaxApi {
         (await this.deps.store.appendEvent({ taskId: task.id, type: 'branch.ancestry-repaired', ts: Date.now(), payload: repair }));
       }
       const result = await brokerPublishBranch(access.world, (await this.gitBrokerAuth(task.projectId)),
-        (await expectedTaskRemoteHeads(this.deps.store, task.id)), recordTaskPublication(this.deps.store, task.id));
+        (await expectedTaskRemoteHeads(this.deps.store, task.id, checkoutBranches(worldRepos(access.world.handle)))), recordTaskPublication(this.deps.store, task.id));
       if (!result.pushed.length || result.skipped.length)
         throw new Error(`could not publish ${result.skipped.length ? describePublishFailures(result) : 'task branch'}`);
       const event = { taskId: task.id, type: 'push.branch', ts: Date.now(), payload: {
@@ -2006,6 +2007,16 @@ export class KarmaxApi {
     if ((images as ImageRef[] | undefined)?.length) input.images = images as ImageRef[];
     if ((files as FileRef[] | undefined)?.length) input.files = files as FileRef[];
     if (_discardProgress === true) input.discardProgress = true;
+    // One pull request of its parent (SPEC §11.1): every run lands it through
+    // its parent's world, as the first one did.
+    const shippedFrom = task.params._shippedFrom as TaskInput['shippedFrom'] | undefined;
+    if (task.parentTaskId && shippedFrom?.taskId === task.parentTaskId) {
+      const parentWorld = (await this.deps.store.currentWorld(task.parentTaskId)) as WorldHandle | undefined;
+      const checkout = parentWorld ? worldRepos(parentWorld).find((repo) => repo.name === shippedFrom.checkout) : undefined;
+      input.shippedFrom = { taskId: shippedFrom.taskId, checkout: shippedFrom.checkout,
+        ...(parentWorld && checkout ? { world: pullRequestHandle(parentWorld, checkout, task.id,
+          String(task.params.target ?? input.target ?? parentWorld.target ?? parentWorld.base)) } : {}) };
+    }
     const transferLock = await this.deps.store.kvGet(`project-transfer-lock:${project.id}`);
     if ((await this.deps.store.getProject(project.id))?.organizationId !== project.organizationId
       || transferLock && JSON.parse(transferLock).expiresAt > Date.now()
