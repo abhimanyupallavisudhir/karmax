@@ -10635,7 +10635,9 @@ function subTasksSection(v) {
   // fetched with the parent and patched from the child's events, so it wins over
   // any other copy of the child the console happens to hold.
   const summaries = new Map((v.subTaskSummaries || []).map((summary) => [summary.id, summary]));
-  const ids = [...new Set([...summaries.keys(), ...(v.subTasks || [])])];
+  // A pull request of this task (software-dev ≥1.30) is part of it, shown under Branches.
+  const pullRequests = new Set((v.shipments || []).map((shipment) => shipment.childTaskId));
+  const ids = [...new Set([...summaries.keys(), ...(v.subTasks || [])])].filter((id) => !pullRequests.has(id));
   if (!ids.length) return '';
   const children = ids.map((id) => {
     const rec = summaries.get(id) || taskRecord(id);
@@ -10819,7 +10821,7 @@ function checkoutsSection(v) {
       <span style="color:var(--ink-3)">→ ${esc(lane.target)}</span>
       <span style="flex:1"></span>
       <span class="chip ${esc(tone)}">${esc(label)}</span>
-      <button type="button" class="btn sm ghost" data-open="${esc(lane.childTaskId)}" title="Open its pull request">${esc(rec?.num != null ? `#${rec.num}` : numLabel(lane.childTaskId))}</button>
+      <button type="button" class="btn sm ghost" data-open="${esc(lane.childTaskId)}" title="Its Review and landing">Open</button>
       ${approvable ? `<button type="button" class="btn sm" data-approve-pr="${esc(lane.childTaskId)}" data-branch="${esc(c.name)}">Approve</button>` : ''}
     </div>`;
     }

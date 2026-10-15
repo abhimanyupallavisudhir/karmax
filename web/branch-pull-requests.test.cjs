@@ -40,7 +40,7 @@ test('each branch shows where its pull request is, with Approve while it waits f
   assert.doesNotMatch(row(html, 'app'), /chip|Approve|Not yet approved/, 'a branch not proposed yet stays quiet');
   assert.match(row(html, 'docs'), /In review/);
   assert.match(row(html, 'docs'), /data-approve-pr="pr-docs"/);
-  assert.match(row(html, 'docs'), /data-open="pr-docs"[^>]*>#41</);
+  assert.match(row(html, 'docs'), /data-open="pr-docs"[^>]*>Open</);
   assert.match(row(html, 'api'), /Changes requested/);
   assert.match(row(html, 'web'), /Landing/);
   assert.match(row(html, 'cli'), /Landed/);

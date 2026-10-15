@@ -64,7 +64,7 @@ import { PermissionRequests } from '../platform/permission-requests.js';
 import { applyAvatarProfile, avatarAuthorizationCapabilities, avatarForRole, avatarPrincipal } from '../platform/avatars.js';
 import { GitProfiles, userGitScope } from '../autonomy/git-profiles.js';
 import { worldRepos, worldRepoSource, worldRepoTarget } from '../world/types.js';
-import { pullRequestHandle, pullRequestView, isPullRequestView } from '../world/pr-view.js';
+import { pullRequestHandle, pullRequestView, isPullRequestView, proposalCheckouts } from '../world/pr-view.js';
 import { git as hostGit, isolatedGitEnvironment } from '../world/git.js';
 import { brokerFinalizeMerge, brokerPublishBranch, brokerPushBranches, describePublishFailures, type GitBrokerAuth } from '../world/git-broker.js';
 import { enrollWorldRepositories } from '../world/repository-enrollment.js';
@@ -1216,8 +1216,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
   }
 
   async function enrollLiveProjectRepositories(world: World, taskId: string): Promise<string[]> {
-    // A pull request's view lands its one checkout; the world's own list is its task's.
-    if (isPullRequestView(world.handle)) return [];
+    // A view lands only its checkouts; the world's own list is its task's.
+    if (isPullRequestView(world.handle) || proposalCheckouts(world.handle)) return [];
     const task = (await store.getTask(taskId));
     if (!task) throw new Error(`no task ${taskId}`);
     const linked = (await store.listProjectRepositories(task.projectId));
@@ -1361,6 +1361,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // One pull request of a task's world (SPEC §11.1): the task's world,
         // narrowed to that pull request's worktree.
         if (world && isPullRequestView(handle)) return await restorePullRequest(pullRequestView(world, handle), world);
+        // The task's own proposal, without checkouts that are pull requests of their own.
+        const only = proposalCheckouts(handle);
+        if (world && only) return pullRequestView(world, { ...world.handle, repos: worldRepos(world.handle).filter((repo) => only.includes(repo.name)) });
         if (world) return world;
         // A park already in flight may have released the lease while we waited
         // for its transition. Re-enter admission before opening the provider.
@@ -3977,6 +3980,22 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const moved = await world.exec('git', ['reset', '-q', '--hard', head], { cwd: repo.root });
       if (moved.code !== 0) throw new Error(`could not move the pull request to ${head}: ${moved.stderr || moved.stdout}`);
       (await record(view.id, 'pull-request.snapshot', { checkout: repo.name, childTaskId: view.meta?.pullRequest, branch: repo.branch, head }));
+    },
+
+    /** The checkouts with something to propose — uncommitted changes, or
+     * commits beyond their target — and their heads (SPEC §11.1: what a task
+     * with several branches proposes itself when its agent finishes). */
+    async checkoutsWithWork(handle: WorldHandle, target: string): Promise<Array<{ name: string; head?: string }>> {
+      const world = await openWorld(handle);
+      const out: Array<{ name: string; head?: string }> = [];
+      for (const repo of worldRepos(world.handle)) {
+        const status = await world.exec('git', ['status', '--porcelain'], { cwd: repo.root });
+        const ahead = await commitsAheadOfPrBase(world, repo, worldRepoTarget(repo, target));
+        if (status.code === 0 && !status.stdout.trim() && ahead.code === 0 && Number(ahead.stdout.trim()) === 0) continue;
+        const head = await world.exec('git', ['rev-parse', 'HEAD'], { cwd: repo.root });
+        out.push({ name: repo.name, ...(head.code === 0 && head.stdout.trim() ? { head: head.stdout.trim() } : {}) });
+      }
+      return out;
     },
 
     /** Remove a settled pull request's worktree from its task's world. Its

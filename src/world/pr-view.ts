@@ -56,3 +56,12 @@ export function pullRequestView(world: World, view: WorldHandle): World {
     },
   });
 }
+
+/** The task's own proposal, when some of its checkouts already went out as
+ * pull requests of their own (SPEC §11.1): a handle whose `meta.proposalCheckouts`
+ * names the checkouts it covers. `openWorld` serves the world narrowed to them,
+ * so readiness, PR, Review packet and landing cover exactly those. */
+export function proposalCheckouts(handle: Pick<WorldHandle, 'meta'> | undefined): string[] | undefined {
+  const names = handle?.meta?.proposalCheckouts;
+  return Array.isArray(names) ? names.map(String) : undefined;
+}

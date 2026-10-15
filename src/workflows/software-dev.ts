@@ -317,6 +317,9 @@ const PARENT_RAISE_OUTPUT_CHARS = 2_000;
 /** A pull request landing (SPEC §11.1) is news for the agent's next turn, not a
  * reason to start one: such a notice wakes nothing. */
 const QUIET_NOTICE = 'prn-';
+/** Several branches: finishing lands the task's own repositories together,
+ * through its own Review, not as a pull request each. */
+const FINISH_TOGETHER = 'several-branches-finish-together-v1';
 const quietNotice = (m: Message): boolean => m.id.startsWith(QUIET_NOTICE);
 const clip = (text: string, max: number) => text.length > max ? `${text.slice(0, max)}…` : text;
 /** A turn can return while the agent's own in-harness sub-agents (Claude Agent SDK
@@ -918,6 +921,8 @@ async function softwareDevImpl(
   /** The agent finished (`open_pr` alone) and its pull requests are open. */
   let pullRequestsOpened = carried?.pullRequestsOpened ?? false;
   let finishRounds = 0;
+  /** The whole world, while `world` is narrowed to the task's own proposal. */
+  let fullWorld: WorldHandleLike | undefined;
   /** A pull request (v1.30): the commit its agent opened it at again, not yet in its worktree. */
   let pendingHead: string | undefined;
   const awaitingResponse = new Set<string>(continued?.subTasks.awaitingResponse);
@@ -2115,7 +2120,7 @@ async function softwareDevImpl(
     const said = kind === 'needs-work'
       ? `Changes are needed in ${name}:\n\n${text}\n\nMake them in "${shipment.checkout}", commit, and call open_pr with branch "${shipment.checkout}" to update it.`
       : `Your latest commits for "${shipment.checkout}" are not in ${name}, which was already approved and lands as reviewed: ${text}\nOnce it has landed, bring "${shipment.checkout}" up to date with ${shipment.target} and open its pull request again.`;
-    whenLoaded(() => msgs.push({ id: `pr-${msgs.length}`, role: 'user', text: said, ts: msgs.length }));
+    whenLoaded(() => msgs.push({ id: `pr-${msgs.length}`, role: 'user', text: said, ts: Date.now() }));
   });
   // This task is a pull request (v1.30): its agent opened it again at `head`.
   // Before approval it goes back through Review with it; after, it lands as
@@ -2125,7 +2130,7 @@ async function softwareDevImpl(
     if (stage === 'setup' || stage === 'do' || stage === 'review' || (stage === 'pr' && !consumed.has('confirm'))) {
       pendingHead = head;
       prRequested = true;
-      whenLoaded(() => msgs.push({ id: `pru-${msgs.length}`, role: 'user', ts: msgs.length,
+      whenLoaded(() => msgs.push({ id: `pru-${msgs.length}`, role: 'user', ts: Date.now(),
         text: `The task's agent updated this pull request to ${head.slice(0, 8)}; it goes through Review again.` }));
       return;
     }
@@ -3660,7 +3665,7 @@ Inspect the complete current diff and specifically compare its delta from the re
       ? `${name} landed on ${shipment.target}.${stacked.length ? ` ${stacked.join(', ')} can open now: bring it up to date with ${shipment.target}, then open_pr with its branch.` : ''}`
       : `${name} closed without landing (${childStage}).${stacked.length ? ` ${stacked.join(', ')} builds on it.` : ''}`;
     const quiet = shipment.state === 'landed' && !stacked.length;
-    whenLoaded(() => msgs.push({ id: `${quiet ? QUIET_NOTICE : 'pr-'}${msgs.length}`, role: 'user', text, ts: msgs.length }));
+    whenLoaded(() => msgs.push({ id: `${quiet ? QUIET_NOTICE : 'pr-'}${msgs.length}`, role: 'user', text, ts: Date.now() }));
   }
 
   const openShipments = () => shipments.filter((shipment) => shipment.state === 'open');
@@ -4328,6 +4333,8 @@ Inspect the complete current diff and specifically compare its delta from the re
     // Each iteration starts fresh in Do — clears any park state left by a prior
     // sub-task wait (status 'waiting'/waitingFor 'subtask').
     stage = 'do';
+    // A proposal narrowed to the task's own checkouts went back to its agent.
+    if (fullWorld) { world = fullWorld; fullWorld = undefined; }
     status = 'active';
     waitingFor = undefined;
     // Fold in anything the children did since our last turn (SPEC §5.3) so the agent
@@ -4808,14 +4815,58 @@ Inspect the complete current diff and specifically compare its delta from the re
           }
         }
 
-        // Several branches (v1.30): the agent finished. Every branch with
-        // something new opens as (or updates) its own pull request, and this
-        // task waits for them to land, waking its agent for what they need.
-        if (shipsBranches) {
+        // Several branches: the agent finished. The task's own repositories —
+        // and any branch it never opened a pull request for — land together,
+        // through this task's own Review, as a single-branch task's do. Its
+        // open pull requests take its latest commits and settle first, its
+        // agent still answering what they need.
+        if (shipsBranches && patched(FINISH_TOGETHER)) {
+          const refusals: string[] = [];
+          const round = ++finishRounds;
+          for (const shipment of openShipments()) {
+            const outcome = await openPullRequestOf({ name: shipment.checkout, handle: world!, requestId: `finish-${round}:${shipment.checkout}` });
+            if (!outcome.ok && !('empty' in outcome && outcome.empty)) refusals.push(`- "${shipment.checkout}": ${outcome.reason}`);
+          }
+          if (refusals.length) {
+            prRequested = false;
+            msgs.push({ id: `pr-refused-${msgs.length}`, role: 'user', ts: Date.now(),
+              text: `These pull requests could not take your latest commits:\n${refusals.join('\n')}\nResolve this, then call open_pr again.` });
+            stage = 'do';
+            status = 'active';
+            continue;
+          }
+          if (openShipments().length) {
+            pullRequestsOpened = true;
+            const next = await awaitPullRequests();
+            if (next === 'cancelled') return await abort();
+            stage = 'do';
+            status = 'active';
+            if (next === 'agent') continue;
+          }
+          // With pull requests of its own behind it, the task proposes only
+          // what has new work — not what a pull request landed (or closed)
+          // unchanged — and with nothing left, it is done without a Review.
+          if (shipments.length) {
+            const settledAt = (name: string) => [...shipments].reverse().find((shipment) => shipment.checkout === name)?.head;
+            const own: string[] = (await core.checkoutsWithWork(world as WorldHandle, target))
+              .filter((checkout) => !checkout.head || checkout.head !== settledAt(checkout.name)).map((checkout) => checkout.name);
+            if (!own.length) {
+              prRequested = false;
+              pullRequestsSettled = true;
+              break;
+            }
+            // The narrowed view `openWorld` serves (src/world/pr-view.ts
+            // `proposalCheckouts`), for this proposal only: the agent's next
+            // turn has its whole world back.
+            fullWorld = world;
+            world = { ...world!, repos: worldRepos(world as WorldHandle).filter((repo) => own.includes(repo.name)),
+              meta: { ...world!.meta, proposalCheckouts: own } } as WorldHandleLike;
+          }
+        } else if (shipsBranches) {
           prRequested = false;
           const refusals = await openRemainingPullRequests();
           if (refusals.length) {
-            msgs.push({ id: `pr-refused-${msgs.length}`, role: 'user', ts: msgs.length,
+            msgs.push({ id: `pr-refused-${msgs.length}`, role: 'user', ts: Date.now(),
               text: `These branches could not open their pull requests:\n${refusals.join('\n')}\nResolve this, then call open_pr again.` });
             stage = 'do';
             status = 'active';
@@ -5968,6 +6019,7 @@ Inspect the complete current diff and specifically compare its delta from the re
       detail: `The exact integration candidate landed successfully${sha ? ` as ${sha.slice(0, 8)}` : ''}.`,
     };
   }
+  if (fullWorld) { world = fullWorld; fullWorld = undefined; }
   stage = 'done';
   status = 'done';
   // The landing adds to the work summary; it never replaces it.
@@ -5995,6 +6047,8 @@ Inspect the complete current diff and specifically compare its delta from the re
 
   // ── helpers ──
   async function abort() {
+    // Whatever happens to the world now happens to all of it.
+    if (fullWorld) { world = fullWorld; fullWorld = undefined; }
     if (finishing) return await finish();
     terminalOrigin = stage;
     stage = 'cancelled';
