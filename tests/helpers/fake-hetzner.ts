@@ -43,6 +43,9 @@ export class FakeHetzner {
   sshKeys: Array<{ id: number; labels: Labels }> = [];
   images: Array<{ id: number; status: string; labels: Labels }> = [];
   requests: Array<{ method: string; path: string; body?: any }> = [];
+  /** The project's limit on shared vCPU across all its servers, on or off
+   * (Hetzner Console → Limits); no API reads it. */
+  sharedCoresLimit?: number;
   private ids = 100;
   readonly root = fs.mkdtempSync(path.join(os.tmpdir(), 'fake-hetzner-'));
   readonly home = path.join(this.root, 'home');
@@ -108,6 +111,13 @@ export class FakeHetzner {
           if (!TYPES.some((type) => type.name === body.server_type)) return json(422, { error: { code: 'invalid_input', message: 'unknown server type' } });
           const where = TYPES.find((type) => type.name === body.server_type).locations?.find((entry: any) => entry.name === body.location);
           if (where && where.available === false) return json(422, { error: { code: 'invalid_input', message: 'unsupported location for server type' } });
+          const type = TYPES.find((entry) => entry.name === body.server_type);
+          const sharedInUse = [...this.servers.values()].filter((entry) => entry.server_type.cpu_type === 'shared')
+            .reduce((sum, entry) => sum + entry.server_type.cores, 0);
+          // Hetzner's answer, verbatim from pramana#58 (2026-10-15).
+          if (this.sharedCoresLimit !== undefined && type.cpu_type === 'shared' && sharedInUse + type.cores > this.sharedCoresLimit)
+            return json(403, { error: { code: 'resource_limit_exceeded', message: 'shared core limit exceeded',
+              details: { limits: [{ name: 'server_shared_cores_limit' }] } } });
           const server: FakeServer = { id: ++this.ids, name: body.name, status: 'initializing', created: new Date().toISOString(),
             labels: body.labels ?? {}, server_type: TYPES.find((type) => type.name === body.server_type), volumes: body.volumes ?? [],
             ip: `10.0.0.${this.ids % 250}`, userData: body.user_data, datacenter: { location: { name: body.location } } };

@@ -162,6 +162,16 @@ export class ProviderOutage extends Error {
   }
 }
 
+/** A provider account's limit across all its machines is full (a Hetzner
+ * project's shared-CPU limit). Like an outage, only time fixes it, as other
+ * machines stop, so setup waits it out before asking a person. */
+export class ProviderCapacityFull extends ProviderOutage {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = 'ProviderCapacityFull';
+  }
+}
+
 // A request-level safety decision says nothing about the shared login's health.
 export function isProviderPolicyRejection(value: unknown, options: LimitClassifierOptions = {}): boolean {
   const diagnostic = nativeProviderDiagnostic(value);
