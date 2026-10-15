@@ -57,6 +57,8 @@ export interface Harness {
   bus: KarmaxBus;
   worlds: WorldRegistry;
   worldsHome: string;
+  /** Where project wikis' canonical repositories live. */
+  contentDir: string;
   tokens: TokenAuthority;
   api: KarmaxApi;
   resources: ProjectResourceService;
@@ -181,6 +183,7 @@ export async function bootHarness(
     bus,
     worlds,
     worldsHome,
+    contentDir,
     tokens,
     api,
     resources,

@@ -201,6 +201,10 @@ describe('per-repository branches', () => {
         parentTaskId: task.id, params: { prompt: 'x', repoBranches: { [libUrl]: { base: 'master' } } } });
       await core.createWorld({ taskId: child.id, repos: [appUrl, libUrl], base: `tavya/${task.id}`, target: `tavya/${task.id}`, kind: 'fake-cloud' });
       expect(received.repositoryBranches[libUrl]).toEqual({ base: `tavya/${task.id}`, target: `tavya/${task.id}` });
+      // The project wiki too: a sub-task's wiki edits land with its parent's
+      // proposal, so a sub-task that merges its parent's branch cannot carry
+      // the parent's unreviewed wiki commits onto main (pramana#39).
+      expect(received.repositoryBranches[wikiUrl]).toEqual({ base: `tavya/${task.id}`, target: `tavya/${task.id}` });
     });
   });
 });

@@ -1910,10 +1910,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         !remote && sourceResolutions[index]?.localPath && transportSources[index] !== source
           ? [[source, transportSources[index]!]]
           : []));
+      // The wiki lands on its main branch, except a sub-task's: like its code,
+      // it stacks on the parent's branch and reaches main with the parent's
+      // proposal. Otherwise a sub-task that merged its parent's branch carried
+      // the parent's unreviewed wiki commits onto main (pramana#39).
       if (wikiRoot && requestedSources.includes(wikiRoot))
-        repositoryBranches[remote ? worldSources[worldSources.length - 1]! : wikiRoot] = {
-        base: PROJECT_WIKI_BRANCH, target: PROJECT_WIKI_BRANCH,
-      };
+        repositoryBranches[remote ? worldSources[worldSources.length - 1]! : wikiRoot] = childStack
+          ? { base: args.base!, target: args.target ?? args.base! }
+          : { base: PROJECT_WIKI_BRANCH, target: PROJECT_WIKI_BRANCH };
       if (forkSource) {
         for (const [index, source] of worldSources.entries()) {
           const saved = forkSource.repos.find((repo) => sameRepository(repo.source, source)
