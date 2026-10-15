@@ -18,6 +18,7 @@ import { SUB_TASK_ACTIONS, type SubTaskAction } from '../domain/types.js';
  *   @subtaskwith <json> :: <title> :: <prompt>
  *                                   spawn a child task with create_sub_task `params`
  *   @branch <name> [:: <base>]      add another branch/PR to this task (multi-PR)
+ *   @ship <name> [:: <title>]       open that branch's PR on its own now (open_pr with branch)
  *   @respond <action> [:: text]     parent answers a raising child (open_pr/confirm/comment/retry/cancel)
  *   @raise <type> [:: detail]       child raises to its parent (needs_info/needs_permission/…)
  *   @wait                           parent parks until its sub-tasks finish/raise
@@ -177,6 +178,19 @@ export class MockAdapter implements AgentAdapter {
             outputs.push(`branch: ${added.branch} at ${added.root}`);
           } catch (e: any) {
             outputs.push(`branch failed: ${e?.message ?? e}`);
+          }
+          break;
+        }
+        case 'ship': {
+          // @ship <name> [:: title] — open_pr with `branch`: that branch's pull
+          // request opens on its own and the turn goes on (SPEC §11.1).
+          const [name, title = ''] = splitOn(rest, '::');
+          try {
+            if (!ctx.shipBranch) throw new Error('not available in this turn');
+            const shipped = await ctx.shipBranch({ name: name.trim(), ...(title.trim() ? { title: title.trim() } : {}) });
+            outputs.push(`shipped: ${name.trim()} as ${shipped.childTaskId} on ${shipped.branch}`);
+          } catch (e: any) {
+            outputs.push(`ship refused: ${e?.message ?? e}`);
           }
           break;
         }
