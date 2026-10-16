@@ -264,6 +264,19 @@ export class WorldLifecycleManager {
           if (!(await unchanged())) return;
           this.probedAt.set(key, now);
           const state = await this.worlds.probe(candidate.handle as any).catch(() => undefined);
+          // A VM the provider has stopped, that nothing holds or uses, is
+          // parked whatever the store says: a wake that failed before its
+          // undo existed left such worlds ready, so they never hibernated and
+          // kept their volumes (pramana#60). An E2B pause keeps processes and
+          // is left alone.
+          if (state === 'parked' && this.worlds.get(candidate.handle.kind).parkStopsProcesses && (await unchanged())
+            && !(await this.worlds.hasActiveAccess?.(candidate.handle.id))) {
+            const leaseId = candidate.handle.meta?.worldLeaseId;
+            if (typeof leaseId === 'string' && (await this.store.worldLease(leaseId))?.state === 'active') return;
+            await this.store.setWorldState(candidate.handle, 'parked');
+            await this.recordLifecycle(candidate.handle, 'world.parked', { reason: 'reconciled' });
+            return;
+          }
           if (state !== 'missing' || !(await unchanged())) return;
           await this.store.setWorldState(candidate.handle, 'degraded');
           await this.recordLifecycle(candidate.handle, 'world.providerLost', {});
