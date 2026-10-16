@@ -31,7 +31,7 @@ const code = [
   statement('const URGENCY_LEVELS = '), statement('const NOTIFY_DEFAULTS = '), statement('const systemNotifications = '), statement('const liveInboxItem = '),
   ...['urgencyRank', 'inboxUnreadCount', 'inboxRowLabel', 'notifyPrefs', 'inboxArrivals',
     'announceInbox', 'inboxTitle', 'showVisualNotification', 'showSystemNotification', 'syncNotificationAlerts', 'updateBell',
-    'markInboxItemReadLocally', 'loadInbox'].map(fn),
+    'markInboxItemReadLocally', 'markInboxItemRead', 'isNewTabClick', 'loadInbox'].map(fn),
 ].join('\n');
 
 (async () => {
@@ -58,6 +58,7 @@ const code = [
       // The real opener marks the item read locally before navigating.
       window.opened = [];
       window.openInboxItem = (item) => { opened.push(item); markInboxItemReadLocally(item); };
+      window.inboxItemRoute = (item) => (item.task ? `/org/project/tasks/${item.task.num ?? item.task.id}` : null);
       (0, eval)(code);
     }, code);
 

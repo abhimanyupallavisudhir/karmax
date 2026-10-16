@@ -51,7 +51,7 @@ describe('default organization browser behavior', () => {
     const organizations = extractFunction('loadOrganizations');
     const profile = extractFunction('profileView');
     const wiring = extractFunction('wireProfileView');
-    const tabSwitch = extractFunction('switchTab');
+    const tabSwitch = extractFunction('tabRoute');
 
     expect(organizations).toContain("api('/api/user/default-organization')");
     expect(organizations).not.toContain('S.organizations[0]');
