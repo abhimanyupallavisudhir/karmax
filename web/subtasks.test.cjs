@@ -33,6 +33,7 @@ global.S = {
 global.pipeline = (v) => `<i class="test-pipeline">${esc(v.stage || 'setup')}</i>`;
 global.PARKED_WAITS = new Set(['timer', 'job', 'subtask', 'collaboration', 'parent']);
 global.waitDeadline = () => '4:00 PM';
+global.taskUrl = (id, rec) => `/acme/web/tasks/${rec?.num ?? id}`;
 
 // The real stage vocabulary, not a stub: a child must read exactly as it does in
 // the task list and on its own page.
@@ -46,7 +47,7 @@ const ok = (condition, message) => {
 
 const parentLink = parentTaskContext({ taskId: 'child-a', parentTaskId: 'parent' });
 ok(parentLink.includes('#10 Ship the new workspace') && parentLink.includes('aria-label="Open parent task #10 Ship the new workspace"'), 'child names its parent in the masthead');
-ok(parentLink.includes('data-open="parent"') && parentLink.startsWith('<button'), 'parent context is one keyboard-operable navigation target');
+ok(parentLink.includes('data-open="parent"') && parentLink.startsWith('<a ') && parentLink.includes('href="/acme/web/tasks/10"'), 'parent context is one link, so it opens in a new tab too');
 ok(parentTaskContext({ taskId: 'parent' }) === '', 'top-level tasks do not render empty parent chrome');
 // A finished parent is archived out of the live list; the view still names it.
 const archivedParent = parentTaskContext({ taskId: 'orphan', parentTaskId: 'gone', parentTask: { id: 'gone', num: 7, title: 'Finished parent' } });
@@ -93,6 +94,7 @@ const panel = subTasksSection({
 ok(panel.includes('Polish navigation') && panel.includes('Verify keyboard access') && panel.includes('Resolve visual regression'), 'rows use human titles instead of only ids');
 ok(panel.includes('<strong>1</strong> of 3 complete') && panel.includes('--subtask-progress:33%'), 'panel summarizes group progress');
 ok((panel.match(/class="subtask-row"/g) || []).length === 3, 'every child is one large navigation row');
+ok(/<a class="subtask-row" data-open="child-a" data-spa href="\/acme\/web\/tasks\/11"/.test(panel), 'and a link to the child, so it opens in a new tab too');
 ok(!/In progress|Ready to return|Needs direction/.test(panel), 'no second state vocabulary beside the real one');
 ok(panel.includes('>working<') && panel.includes('>escalated<'), 'each row carries its task-list label');
 ok(panel.includes('aria-label="Open Polish navigation — working"'), 'the accessible name carries the same label');

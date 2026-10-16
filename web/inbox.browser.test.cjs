@@ -54,6 +54,7 @@ function constant(name) {
       window.formatBytes = n => `${n} B`;
       window.opened = [];
       window.openInboxItem = item => opened.push(item.id);
+      window.inboxItemRoute = item => (item.subject?.kind === 'credential' ? '/fixture/settings#settings-agents' : `/fixture/karmax/avatars/${item.id}`);
       window.workflowLabel = () => 'Software development';
       window.customBranch = () => false;
       window.stageLabel = () => 'Review';
@@ -68,7 +69,7 @@ function constant(name) {
     await page.addScriptTag({ content: [
       constant('URGENCY_LEVELS'), 'const systemNotifications = new Map();',
       ...['updateBell', 'syncNotificationAlerts', 'urgencyRank', 'inboxUnreadCount', 'taskHasUnreadAsk', 'inboxRowLabel', 'inboxTitle', 'urgencyChip',
-        'inboxNotices', 'inboxNoticesHtml', 'wireInboxNotices', 'slugify', 'projectSlug', 'projectPath', 'orgSlug', 'projectLabel',
+        'inboxNotices', 'inboxNoticesHtml', 'wireInboxNotices', 'isNewTabClick', 'wireRowLink', 'markInboxItemRead', 'slugify', 'projectSlug', 'projectPath', 'orgSlug', 'projectLabel',
         'rowKey', 'cursorRows', 'applyCursor', 'moveCursor', 'openListRow', 'isSeries', 'taskRow'].map(fn),
       'renderMain();',
     ].join('\n') });
@@ -94,7 +95,7 @@ function constant(name) {
     assert.equal(label.text, 'fixture/karmax');
     assert.match(label.font, /mono/i);
     assert.deepEqual([label.border, label.background, label.radius], ['0px', 'rgba(0, 0, 0, 0)', '0px']);
-    await page.locator('[data-inbox="resource"] .task-title').click();
+    await page.locator('[data-inbox="resource"] a.row-link').click(); // the row is a link to what it is about
     assert.deepEqual(await page.evaluate(() => opened), ['resource']);
     await page.locator('[data-inbox="login"]').focus();
     await page.keyboard.press('Enter');

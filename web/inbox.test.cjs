@@ -101,7 +101,7 @@ for (const name of ['taskRow', 'seriesRow']) ok(!extractFn(name).includes('workf
 
 const openItem = extractFn('openInboxItem');
 ok(!openItem.includes('await loadTasks'), 'opening an inbox task does not preload its project before navigation');
-ok(openItem.indexOf('markInboxItemReadLocally(item)') < openItem.indexOf('return go('),
+ok(openItem.indexOf('markInboxItemRead(item)') < openItem.indexOf('return go('),
   'opening an inbox task updates bookkeeping locally and navigates immediately');
 
 console.log(`${pass} passed, ${fail} failed`);
