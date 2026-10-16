@@ -308,6 +308,12 @@ const MAX_RESOLVE_ATTEMPTS = 2;
 /** Historical workflow pins loop rejected merges through their Merge agent this
  * many times. Current explicit-PR runs return to Do and replay PR + Review. */
 const MAX_MERGE_ATTEMPTS = 3;
+/** Rounds the agent gets to combine resource files that conflict at
+ * publication (pramana#56), before a person is asked. */
+const MAX_RESOURCE_MERGE_ROUNDS = 3;
+/** Times in a row a conflict found before Review sends the task back to the
+ * agent; then Review goes ahead and publication merges again. */
+const MAX_INTEGRATION_BOUNCES = 2;
 /** Default re-prompt cadence for a parent holding an unanswered child raise (SPEC §5.3).
  *  Bounds the subtask-wait so an ignored raise re-enters Do instead of parking forever. */
 const DEFAULT_SUBTASK_NAG_MS = 60_000;
@@ -828,6 +834,11 @@ async function softwareDevImpl(
   let applyingResources = false;
   let stagingResources = false;
   let refreshingResources = false;
+  /** The agent is combining resource files that conflict at publication. */
+  let mergingResources = false;
+  /** Newer published data is being merged into this world before Review. */
+  let integratingResources = false;
+  let integrationBounces = 0;
   /** Saving this task's data for a sub-task about to start. */
   let preparingSubTask = false;
   let resourcesApplied = carried?.resourcesApplied ?? false;
@@ -1231,7 +1242,7 @@ async function softwareDevImpl(
       : actions;
   }
   function allowedNow(): DeclaredAction[] {
-    if (applyingResources || stagingResources) return [];
+    if (applyingResources || stagingResources || mergingResources) return [];
     const pausedRole: AgentRole | undefined =
       stage === 'do' || stage === 'review'
         ? 'do'
@@ -1289,7 +1300,8 @@ async function softwareDevImpl(
       case 'resolve':
         return [cancel];
       case 'escalated':
-        return [retry, ...(resourceConflict ? [keepOwnResources] : []), ...(escalationAction === 'openPr'
+        // Publishing again cannot settle a conflict: someone must choose.
+        return [...(resourceConflict ? [keepOwnResources] : [retry]), ...(escalationAction === 'openPr'
           ? [{ ...openPr, label: 'Commit changes, open & confirm PR' }]
           : escalationAction === 'confirm' ? [confirm] : []), followUp, cancel];
       default:
@@ -1376,6 +1388,8 @@ async function softwareDevImpl(
         ...(applyingResources ? { applyingResources: true } : {}),
         ...(stagingResources ? { stagingResources: true } : {}),
         ...(refreshingResources ? { refreshingResources: true } : {}),
+        ...(mergingResources ? { mergingResources: true } : {}),
+        ...(integratingResources ? { integratingResources: true } : {}),
         ...(preparingSubTask ? { preparingSubTask: true } : {}),
         cancelled,
         ...(lifecycleReplacement ? { lifecycleReplacement: true } : {}),
@@ -1520,17 +1534,21 @@ async function softwareDevImpl(
   }
 
   /** `cancelled` when a cancel stopped it: nothing is adopted for a cancelled
-   * task. A publication that fails (a file another task changed differently,
-   * say) escalates with the reason instead of failing the task, whose world
-   * keeps the output: Retry publishes again, merging what was published
-   * meanwhile, and with `followUpReturnsToDo` a follow-up goes to the agent. */
+   * task. Files another task changed differently that do not merge line by
+   * line go to the agent, as a git conflict at landing does, and publishing
+   * resumes after its turn. A publication that still fails escalates with the
+   * reason instead of failing the task, whose world keeps the output: Retry
+   * publishes again (or, for a conflict, this task's version is kept), and
+   * with `followUpReturnsToDo` a follow-up goes to the agent. */
   async function applyReviewedResources(stageFirst = true, followUpReturnsToDo = false): Promise<'applied' | 'cancelled' | 'do'> {
     if (stageFirst && await stageResources() && cancelled) return 'cancelled';
+    let mergeRounds = 0;
     for (;;) {
       applyingResources = true;
       status = 'active';
       await publish();
       let failure: string;
+      let guide: string | undefined;
       try {
         await runLandingActivity(() => keepOwnRequested
           ? resourceActivities.settleResourceReview(taskId, { keepOwn: true })
@@ -1541,13 +1559,29 @@ async function softwareDevImpl(
         if (isCancellation(err) || !patched('resource-publish-escalates-v1')) throw err;
         failure = innermostMessage(err);
         resourceConflict = failureType(err) === 'resource-conflict';
+        guide = resourceConflict ? conflictGuide(err) : undefined;
       } finally { applyingResources = false; keepOwnRequested = false; }
+      if (guide && world && mergeRounds < MAX_RESOURCE_MERGE_ROUNDS && patched('resource-conflict-agent-v1')) {
+        mergeRounds++;
+        resourceConflict = false;
+        msgs.push({ id: `resource-merge-${msgs.length}`, role: 'user', ts: Date.now(),
+          text: `This task is confirmed, but publishing its resources needs you first.\n${guide}\nDo only that, then end your turn: publishing resumes after it.` });
+        mergingResources = true;
+        await publish();
+        // The proposal is already confirmed: an open_pr in this turn changes nothing.
+        const proposal = prRequested;
+        try { await doTurn(); }
+        catch (err) { if (isCancellation(err)) throw err; log.warn('resource merge turn failed', { err: String(err) }); }
+        finally { mergingResources = false; prRequested = proposal; }
+        if (cancelled) return 'cancelled';
+        continue;
+      }
       const priorStage = stage;
       stage = 'escalated';
       status = 'blocked';
       retryRequested = false;
       error = resourceConflict
-        ? `Could not publish resources: ${failure} Nothing was lost: Retry publishes again, or keep this task’s version of those files.`
+        ? `Could not publish resources: ${failure} ${mergeRounds ? 'The agent did not combine them. ' : ''}Nothing was lost: keep this task’s version of those files, or send a follow-up.`
         : `Could not publish resources: ${failure} Nothing was lost; Retry publishes again.`;
       if (managedByParent) {
         waitingFor = { kind: 'parent' };
@@ -1566,6 +1600,30 @@ async function softwareDevImpl(
       if (!retryRequested) return 'do';
       retryRequested = false;
     }
+  }
+
+  /** Before Review, as a branch takes in its target: what was published
+   * since this world's copies of writable resources forked is merged into
+   * them, so Review shows what would be published. Files that conflict send
+   * the task back to the agent (`do`), a few times in a row at most. */
+  async function integratePublishedResources(): Promise<'do' | undefined> {
+    let reports: Awaited<ReturnType<coreActivities['integratePublishedResources']>>;
+    integratingResources = true;
+    await publish();
+    try { reports = (await resourceStaging.integratePublishedResources(taskId)) ?? []; }
+    catch (err) {
+      if (isCancellation(err)) throw err;
+      // Publication merges again at Confirm; Review need not wait for this.
+      log.warn('merging newer published resources before Review failed', { err: String(err) });
+      return undefined;
+    } finally { integratingResources = false; }
+    const conflicted = reports.filter((report) => report.conflicts?.length);
+    if (!conflicted.length || integrationBounces >= MAX_INTEGRATION_BOUNCES) { integrationBounces = 0; return undefined; }
+    integrationBounces++;
+    msgs.push({ id: `resource-integrate-${msgs.length}`, role: 'user', ts: Date.now(),
+      text: `Before Review, newer published versions of this task's resources were merged into your world, except:\n${conflicted
+        .map((report) => report.guide ?? `${report.path}: ${report.conflicts!.join(', ')} also changed in a newer published version.`).join('\n\n')}\nThen finish as you were going to.` });
+    return 'do';
   }
 
   /** Once a sub-task has landed, this world takes in what it handed over
@@ -1592,7 +1650,9 @@ async function softwareDevImpl(
     } finally { refreshingResources = false; }
     refreshRetries = 1;
     for (const r of refreshed) {
-      const text = r.conflicts
+      const text = r.conflicts && r.guide
+        ? `${r.path} was not updated with a sub-task's data.\n${r.guide}\nIt comes in when the next sub-task finishes, or when this task is confirmed.`
+        : r.conflicts
         ? `${r.path} was not updated with a sub-task's data: ${r.conflicts.length === 1 ? 'a file you changed differs' : `${r.conflicts.length} files you changed differ`} from the sub-task's (${r.conflicts.slice(0, 5).join(', ')}${r.conflicts.length > 5 ? ', …' : ''}). Keep one version (rename or remove yours); it comes in when the next sub-task finishes, and your publication fails until it does.`
         : `${r.path} now includes a sub-task's data: ${r.added} new, ${r.modified} changed, ${r.deleted} removed file${r.deleted === 1 ? '' : 's'}.`;
       msgs.push({ id: `st-${msgs.length}`, role: 'user', ts: Date.now(), text });
@@ -1613,6 +1673,10 @@ async function softwareDevImpl(
     if (clearsConfirmOnGate) confirmed = false;
 
     const automaticResources = resourceCandidateReview && patched('automatic-resource-review-v1');
+    if (automaticResources && world && patched('resource-integrate-before-review-v1')) {
+      const integration = await integratePublishedResources();
+      if (integration) return integration;
+    }
     if (automaticResources) await core.beginResourceReview(taskId, `${workflowInfo().runId}:${++resourceReviewSequence}`);
     if (await stageResources() && cancelled) return 'cancelled';
     // Review shows saved output only: a save that failed every retry is an
@@ -6135,6 +6199,15 @@ function failureType(err: any): string | undefined {
   let type: string | undefined;
   for (let e: any = err, depth = 0; e && depth < 6; depth++, e = e.cause) if (typeof e.type === 'string') type = e.type;
   return type;
+}
+
+/** What a refused resource publication tells the agent to combine its files (the activity failure's details). */
+function conflictGuide(err: any): string | undefined {
+  for (let e: any = err, depth = 0; e && depth < 6; depth++, e = e.cause) {
+    const guide = Array.isArray(e.details) ? e.details[0]?.guide : undefined;
+    if (typeof guide === 'string' && guide) return guide;
+  }
+  return undefined;
 }
 
 function innermostMessage(err: any): string {

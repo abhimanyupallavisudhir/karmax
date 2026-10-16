@@ -809,7 +809,7 @@ describe('WF-37: a failed merge-only or just-do run releases its world', () => {
 // only "finished: failed".
 describe('resource publication by sub-tasks', () => {
   const child = { ...input, taskId: 'child', parentTaskId: 'parent' };
-  const conflict = 'raw_data: a file was changed both by this task and in a newer published version (index.txt). Keep one version: rename or remove this task\'s copy.';
+  const conflict = 'raw_data: a file was changed both by this task and in a newer published version (index.txt).';
 
   function reviewAndConfirm() {
     wf.activities.accountPoolSize.mockResolvedValue(0);
@@ -860,9 +860,11 @@ describe('resource publication by sub-tasks', () => {
       wf.handlers.get('keepOwnResources')!();
     };
     const result = await softwareDevV1_27(child);
-    expect(escalated.actions.map((a: any) => a.name)).toEqual(expect.arrayContaining(['retry', 'keepOwnResources']));
+    // Publishing again would be refused the same way: no Retry.
+    expect(escalated.actions.map((a: any) => a.name)).toContain('keepOwnResources');
+    expect(escalated.actions.map((a: any) => a.name)).not.toContain('retry');
     expect(escalated.actions.find((a: any) => a.name === 'keepOwnResources').label).toBe('Keep this task’s version');
-    expect(escalated.error).toMatch(/or keep this task’s version of those files\.$/);
+    expect(escalated.error).toBe(`Could not publish resources: ${conflict} Nothing was lost: keep this task’s version of those files, or send a follow-up.`);
     expect(wf.activities.settleResourceReview.mock.calls).toEqual([['child'], ['child', { keepOwn: true }]]);
     expect(result.stage).toBe('done');
     expect(views.at(-1).actions.map((a: any) => a.name)).not.toContain('keepOwnResources');
@@ -885,6 +887,92 @@ describe('resource publication by sub-tasks', () => {
     expect((await softwareDevV1_27(child)).stage).toBe('done');
     expect(wf.childSignal).toHaveBeenCalledWith('raiseFromChild', expect.objectContaining({ type: 'blocked', choices: ['keep_own'] }));
     expect(wf.activities.settleResourceReview.mock.calls).toEqual([['child'], ['child', { keepOwn: true }]]);
+  });
+
+  // pramana#56: the conflict reached a person, whose Retry re-saved 13 GB
+  // to be refused the same way. Like a git conflict at landing, it now goes
+  // to the agent first, with what it needs to combine the files.
+  const guide = 'raw_data: 1 file this task changed was also changed by a newer published version, and could not be combined automatically:\n- index.txt (both edited it; the line merge conflicts)';
+  const combinable = () => Object.assign(new Error('Activity task failed'),
+    { cause: Object.assign(new Error(conflict), { type: 'resource-conflict', details: [{ guide }] }) });
+
+  it('gives the agent a turn to combine conflicting files, then publishes', async () => {
+    const views = reviewAndConfirm();
+    wf.activities.settleResourceReview = vi.fn().mockRejectedValueOnce(combinable()).mockResolvedValue(undefined);
+    const turns: any[] = [];
+    wf.activities.runAgentTurn.mockImplementation(async (args: any) => {
+      turns.push({ args, view: wf.handlers.get('view')!() });
+      return { openPrRequested: true, completed: true };
+    });
+    const result = await softwareDevV1_27(child);
+    expect(result.stage).toBe('done');
+    expect(wf.activities.settleResourceReview).toHaveBeenCalledTimes(2);
+    const merge = turns.at(-1)!;
+    expect(merge.args.role).toBe('do');
+    expect(merge.view).toMatchObject({ stage: 'review', state: { mergingResources: true } });
+    expect(merge.view.messages.at(-1).text)
+      .toBe(`This task is confirmed, but publishing its resources needs you first.\n${guide}\nDo only that, then end your turn: publishing resumes after it.`);
+    expect(merge.view.actions).toEqual([]);
+    expect(views.some((view) => view.stage === 'escalated')).toBe(false);
+    expect(wf.childSignal).not.toHaveBeenCalledWith('raiseFromChild', expect.objectContaining({ type: 'blocked' }));
+  });
+
+  it('asks a person only after the agent\'s rounds, offering no Retry', async () => {
+    reviewAndConfirm();
+    wf.activities.settleResourceReview = vi.fn().mockRejectedValueOnce(combinable()).mockRejectedValueOnce(combinable())
+      .mockRejectedValueOnce(combinable()).mockRejectedValueOnce(combinable()).mockResolvedValue(undefined);
+    let escalated: any;
+    wf.wait = () => {
+      const view = wf.handlers.get('view')!();
+      if (view.stage !== 'escalated' || escalated) return;
+      escalated = view;
+      wf.handlers.get('parentResponse')!({ action: 'keep_own' });
+    };
+    expect((await softwareDevV1_27(child)).stage).toBe('done');
+    expect(escalated.error).toBe(`Could not publish resources: ${conflict} The agent did not combine them. Nothing was lost: keep this task’s version of those files, or send a follow-up.`);
+    expect(escalated.actions.map((a: any) => a.name)).not.toContain('retry');
+    expect(wf.childSignal).toHaveBeenCalledWith('raiseFromChild', expect.objectContaining({ type: 'blocked', choices: ['keep_own'] }));
+    // Three rounds for the agent, then the parent's choice.
+    expect(wf.activities.settleResourceReview.mock.calls).toEqual([['child'], ['child'], ['child'], ['child'], ['child', { keepOwn: true }]]);
+  });
+
+  it('keeps histories recorded before the agent rounds escalating at once', async () => {
+    reviewAndConfirm();
+    wf.absentPatches = new Set(['resource-conflict-agent-v1']);
+    wf.activities.settleResourceReview = vi.fn().mockRejectedValueOnce(combinable()).mockResolvedValue(undefined);
+    wf.wait = () => {
+      if (wf.handlers.get('view')!().stage === 'escalated') wf.handlers.get('parentResponse')!({ action: 'keep_own' });
+    };
+    expect((await softwareDevV1_27(child)).stage).toBe('done');
+    expect(wf.activities.settleResourceReview.mock.calls).toEqual([['child'], ['child', { keepOwn: true }]]);
+  });
+
+  it('merges newer published data in before Review, and sends a conflict back to the agent first', async () => {
+    reviewAndConfirm();
+    wf.activities.settleResourceReview = vi.fn(async () => undefined);
+    wf.activities.integratePublishedResources = vi.fn()
+      .mockResolvedValueOnce([{ attachmentId: 'r1', name: 'raw_data', path: 'resources/raw_data', revisionId: 'rev', added: 0, modified: 0, deleted: 0,
+        conflicts: ['index.txt'], guide }])
+      .mockResolvedValue([{ attachmentId: 'r1', name: 'raw_data', path: 'resources/raw_data', revisionId: 'rev', added: 3, modified: 0, deleted: 0 }]);
+    const heard: string[] = [];
+    wf.activities.runAgentTurn.mockImplementation(async () => {
+      heard.push(wf.handlers.get('view')!().messages.at(-1)?.text ?? '');
+      return { openPrRequested: true, completed: true };
+    });
+    expect((await softwareDevV1_27(child)).stage).toBe('done');
+    expect(wf.activities.integratePublishedResources).toHaveBeenCalledTimes(2);
+    expect(heard).toHaveLength(2);
+    expect(heard[1]).toBe(`Before Review, newer published versions of this task's resources were merged into your world, except:\n${guide}\nThen finish as you were going to.`);
+  });
+
+  it('goes to Review after the conflict has gone back to the agent twice', async () => {
+    reviewAndConfirm();
+    wf.activities.settleResourceReview = vi.fn(async () => undefined);
+    wf.activities.integratePublishedResources = vi.fn(async () => [{ attachmentId: 'r1', name: 'raw_data', path: 'resources/raw_data',
+      revisionId: 'rev', added: 0, modified: 0, deleted: 0, conflicts: ['index.txt'], guide }]);
+    expect((await softwareDevV1_27(child)).stage).toBe('done');
+    expect(wf.activities.integratePublishedResources).toHaveBeenCalledTimes(3);
+    expect(wf.activities.runAgentTurn).toHaveBeenCalledTimes(3);
   });
 
   it('names the extra answers a raise accepts', () => {
