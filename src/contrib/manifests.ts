@@ -117,7 +117,7 @@ const landingAuthorityField = (): FieldSpec => ({
   scopes: ['project', 'global'],
   bind: 'project',
 });
-// Multi-PR (SPEC §11.1). Off, a task is one branch per repo,
+// Multi-PR (SPEC §11.1), on by default. Off, a task is one branch per repo,
 // exactly as before. On, the Do agent may partition its change across several
 // branches with `create_branch`, each landing as its own pull request — so the
 // world nests its checkouts from Setup, which is the only structural difference
@@ -130,7 +130,7 @@ const multiPrField = (): FieldSpec => ({
   type: 'boolean',
   label: 'Allow several branches per task',
   help: 'The agent can open several pull requests over time, each reviewed and merged on its own while it keeps working. The task is done when the agent has finished and all of them have landed.',
-  default: false,
+  default: true,
   scopes: ALL,
   bind: 'project',
 });

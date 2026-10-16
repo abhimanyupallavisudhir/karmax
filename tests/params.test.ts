@@ -28,6 +28,14 @@ describe('resolveParams (overlay: task → project → global → default)', () 
     expect(r.remote).toBe('none'); // field default
   });
 
+  it('allows several branches per task unless a layer turns it off', () => {
+    expect(resolveParams(sd, {}).multiPr).toBe(true);
+    expect(resolveParams(sd, { project: { multiPr: false } }).multiPr).toBe(false);
+    expect(resolveParams(sd, { task: { multiPr: true }, project: { multiPr: false } }).multiPr).toBe(true);
+    expect(assembleTaskInput(sd, resolveParams(sd, { task: { prompt: 'x' } }),
+      { taskId: 't1', projectId: 'p1', title: 'X', project: {} }).project.multiPr).toBe(true);
+  });
+
   it('migrates the former unified Do/Merge wire value onto the sole Do agent', () => {
     const doAgent = { provider: 'codex', model: 'do-model', resumeFrom: { taskId: 'old' } };
     const mergeAgent = { provider: 'claude', model: 'merge-model', resumeFrom: { taskId: 'merge-old' } };
