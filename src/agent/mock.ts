@@ -438,6 +438,19 @@ export class MockAdapter implements AgentAdapter {
       }
       outputs.push('repaired target race');
     }
+    // A resource conflict handed to the agent (resource-file-merge.ts): a
+    // competent agent combines each file; this one takes the other version,
+    // then marks it resolved.
+    for (const [, copies, folder] of initialText.matchAll(/This task's cop(?:y is|ies are in) (\S+)\. In (\S+): base\//g)) {
+      const single = !initialText.includes(`This task's copies are in ${copies}.`);
+      await input.world.exec('bash', ['-c', `set -e; cd -- "$2"
+while IFS= read -r p; do [ -n "$p" ] || continue
+  if [ "$3" = 1 ]; then d="$1"; else d="$1/$p"; fi
+  if [ -e "other/$p" ]; then mkdir -p -- "$(dirname -- "$d")"; cp -f -- "other/$p" "$d"; else rm -f -- "$d"; fi
+done < unresolved
+: > unresolved`, 'combine', copies!, folder!, single ? '1' : '0'], { cwd: input.world.handle.root });
+      outputs.push(`combined resource files in ${copies}`);
+    }
     // Catch any follow-up that landed near the end of the turn (or during a non-sleep
     // turn) — process it in-flight rather than deferring it to the next turn.
     await drainFollowUps();

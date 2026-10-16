@@ -190,7 +190,7 @@ describe('project resources', () => {
     // A file both tasks changed differently is a conflict, never overwritten.
     await world.writeFileBuffer!('resources/model/model.bin', Buffer.from('conflicting task edit'));
     await resources.beginReview(task.id, 'second-review');
-    await expect(resources.settleReview(task.id)).rejects.toThrow(/model\.bin\).*rename or remove/);
+    await expect(resources.settleReview(task.id)).rejects.toThrow(/changed both by this task and in a newer published version \(model\.bin\)\.$/);
     await expect(resources.setReviewExcluded(task.id, volume.id, true)).rejects.toThrow(/confirmed/);
     // A revised proposal can exclude the conflict without changing the other task's baseline.
     const headBeforeExclude = (await store.getResourceAttachment(volume.id))!.currentRevisionId;

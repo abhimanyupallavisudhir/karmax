@@ -1,9 +1,20 @@
-/** Files a task changed that a newer published version also changed, differently. */
+/** Files a task changed that a newer published version also changed,
+ * differently, and that could not be combined line by line. `guide` tells
+ * the task's agent how to combine them, when the world holds what it needs. */
 export class ResourceConflictError extends Error {
-  constructor(readonly resource: string, readonly paths: string[], source = 'a newer published version') {
+  constructor(readonly resource: string, readonly paths: string[], source = 'a newer published version', readonly guide?: string) {
     super(`${resource}: ${paths.length === 1 ? 'a file was' : `${paths.length} files were`} changed both by this task and in ${source}`
-      + ` (${paths.slice(0, 5).join(', ')}${paths.length > 5 ? ', …' : ''}). Keep one version: rename or remove this task's copy.`);
+      + ` (${paths.slice(0, 5).join(', ')}${paths.length > 5 ? ', …' : ''}).`);
     this.name = 'ResourceConflictError';
+  }
+
+  /** Several resources' conflicts as one, so the agent combines them in one turn. */
+  static combine(errors: ResourceConflictError[]): ResourceConflictError {
+    if (errors.length === 1) return errors[0]!;
+    const combined = new ResourceConflictError(errors.map((error) => error.resource).join(', '), errors.flatMap((error) => error.paths), undefined,
+      errors.some((error) => error.guide) ? errors.map((error) => error.guide).filter(Boolean).join('\n\n') : undefined);
+    combined.message = errors.map((error) => error.message).join(' ');
+    return combined;
   }
 }
 

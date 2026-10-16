@@ -538,6 +538,48 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
     }
   }
 
+  /** The sizes of `paths` (relative to the snapshot's root) that `snapshot` holds. */
+  async sizes(attachment: Repository, snapshot: string, paths: string[]): Promise<Map<string, number>> {
+    const wanted = new Set(paths);
+    const sizes = new Map<string, number>();
+    if (!wanted.size) return sizes;
+    // restic lists only what it is given, a few hundred paths per run; past that, all of it.
+    const batches = wanted.size > 1_000 ? [[]] : chunks([...wanted], 250);
+    for (const batch of batches) {
+      const run = await this.onHost(attachment, 'read', false, ['ls', '--json', '--no-lock', snapshot, ...batch.map((file) => `/${file}`)], { key: 'host' });
+      if (run.code !== 0) throw resticFailure(run, 'listing the resource');
+      for (const line of run.stdout.split('\n')) {
+        if (!line.startsWith('{')) continue;
+        const node = JSON.parse(line);
+        const relative = String(node.path ?? '').replace(/^\/+/, '');
+        if (node.type === 'file' && wanted.has(relative)) sizes.set(relative, Number(node.size ?? 0));
+      }
+    }
+    return sizes;
+  }
+
+  /** Restore `paths` of `snapshot` under `target`, a folder of the world,
+   * {@link MERGE_PATTERNS} at a time (restic tests every node against every pattern). */
+  async restoreFiles(world: World, attachment: Repository, snapshot: string, paths: string[], target: string, options: ResticRunOptions): Promise<void> {
+    const awkward = paths.find((file) => /[\n\r]/.test(file) || file.split('/').includes('..'));
+    if (awkward !== undefined) throw new Error(`cannot restore a file named ${JSON.stringify(awkward)}`);
+    for (const [index, batch] of chunks(paths, MERGE_PATTERNS).entries()) {
+      const key = `${options.key}:${index}`;
+      const list = `.karmax-injection/restore-files-${crypto.createHash('sha256').update(key).digest('hex').slice(0, 12)}`;
+      await world.writeFile(list, patternList(batch));
+      try {
+        const args = ['restore', snapshot, '--target', target, '--include-file', path.posix.join(world.handle.root, list), '--no-lock', '--json',
+          '-o', `rest.connections=${RESTORE_CONNECTIONS}`];
+        const run = isRemoteWorldKind(world.handle.kind)
+          ? await this.inWorld(world, attachment, 'read', false, args, { ...options, key, prefix: `mkdir -p -- ${quote(target)}` })
+          : (fs.mkdirSync(target, { recursive: true }), await this.onHost(attachment, 'read', false, args, { ...options, key }));
+        if (run.code !== 0) throw resticFailure(run, 'restoring files of the resource');
+      } finally {
+        await world.exec('rm', ['-f', '--', list], { cwd: world.handle.root }).catch(() => undefined);
+      }
+    }
+  }
+
   /** Read back files of a version, decrypting and checking every byte, a page at a time. */
   async verify(attachment: Repository, ref: StoredRef, offset: number, limit: number): Promise<SnapshotVerification> {
     let files: Array<{ path: string; bytes: number }>;
@@ -898,6 +940,12 @@ function collapse(files: Iterable<string>, directories: Set<string>): string[] {
   const out = new Set<string>();
   for (const file of files) out.add(ancestors(file).find((directory) => directories.has(directory)) ?? file);
   return [...out].sort();
+}
+
+function chunks<T>(items: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
 }
 
 function patternList(files: string[]): string {

@@ -4434,8 +4434,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         });
       } catch (error) {
         // Saving again cannot resolve a conflict: the task's people must.
+        // Its guide is what the agent needs to combine them.
         if (error instanceof ResourceConflictError)
-          throw ApplicationFailure.create({ message: error.message, type: 'resource-conflict', nonRetryable: true });
+          throw ApplicationFailure.create({ message: error.message, type: 'resource-conflict', nonRetryable: true,
+            ...(error.guide ? { details: [{ guide: error.guide }] } : {}) });
         throw error;
       } finally { clearInterval(pulse); }
     },
@@ -4451,6 +4453,21 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }, 5_000);
       try {
         return (await deps.resources?.takeDeliveries(taskId, {
+          checkContinue: async () => { context?.cancellationSignal.throwIfAborted(); } })) ?? [];
+      } finally { clearInterval(pulse); }
+    },
+
+    /** Before Review, merge into the world's copies of writable resources
+     * what was published since they forked; conflicts are reported. */
+    async integratePublishedResources(taskId: string): Promise<ResourceRefresh[]> {
+      let context: ReturnType<typeof activityContext.current> | undefined;
+      try { context = activityContext.current(); } catch { /* direct tests */ }
+      const pulse = setInterval(() => {
+        try { context?.heartbeat({ taskId, operation: 'integrating-resources' }); }
+        catch { /* activity completion/cancellation */ }
+      }, 5_000);
+      try {
+        return (await deps.resources?.integratePublished(taskId, {
           checkContinue: async () => { context?.cancellationSignal.throwIfAborted(); } })) ?? [];
       } finally { clearInterval(pulse); }
     },

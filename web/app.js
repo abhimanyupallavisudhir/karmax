@@ -13172,12 +13172,18 @@ function taskActions(v) {
     const idle = v.state?.applyingResources ? 'Applying resources…' : 'Saving resources…';
     return `<div class="actions" role="status" aria-live="polite"><button class="btn primary action-pending" disabled aria-busy="true"${progress?.title ? ` title="${esc(progress.title)}"` : ''}>${esc(progress?.text || idle)}</button></div>`;
   }
+  // Confirmed, but files another task changed too need the agent before they publish.
+  if (v.state?.mergingResources && v.status === 'active')
+    return `<div class="actions" role="status" aria-live="polite"><button class="btn primary action-pending" disabled aria-busy="true" title="Another task changed some of the same files. The agent is combining them; publishing resumes after it.">Combining resources…</button></div>`;
   if (v.state?.finalizing) return `<div class="actions" role="status" aria-live="polite"><button class="btn primary action-pending" disabled aria-busy="true">Finishing…</button><span>Saving task output</span></div>`;
   const acts = v.actions || [];
   const simple = acts.filter((a) => !a.args || a.args.length === 0);
   // Sub-tasks' files arriving before the agent's next turn: a message sent now waits for them.
   const refreshing = v.state?.refreshingResources && v.status === 'active'
     ? `<button class="btn primary action-pending" disabled aria-busy="true" title="Sub-tasks’ files arrive before the agent’s next turn. Messages sent now are read then.">Bringing in sub-tasks’ data…</button>`
+    // Before Review: data other tasks published meanwhile is merged in.
+    : v.state?.integratingResources && v.status === 'active'
+      ? `<button class="btn primary action-pending" disabled aria-busy="true" title="Data other tasks published since this one started is merged in, so Review shows what would be published.">Bringing in newer data…</button>`
     // A sub-task starts from this task's data, saved first: gigabytes take minutes.
     : v.state?.preparingSubTask && v.status === 'active'
       ? `<button class="btn primary action-pending" disabled aria-busy="true" title="A sub-task starts from this task’s data, so it is saved first.">${esc(stagingProgress()?.text || 'Saving data for a sub-task…')}</button>` : '';
