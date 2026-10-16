@@ -1055,6 +1055,10 @@ a.git-repo-name:hover { color:var(--accent); }
   transition: background .12s, transform .04s;
 }
 .subtask-row:first-child { border-top-color: transparent; }
+.subtask-draft { display: flex; align-items: center; gap: 8px; border-top: 1px solid var(--line); }
+.subtask-draft:first-child { border-top-color: transparent; }
+.subtask-draft > .subtask-row { flex: 1; min-width: 0; border-top: 0; }
+.subtask-draft > .btn { flex: none; margin-right: 8px; }
 .subtask-row:hover { background: var(--surface-2); }
 .subtask-row:active { transform: translateY(1px); }
 .subtask-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }

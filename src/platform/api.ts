@@ -84,7 +84,7 @@ import { VaultItems, type VaultItemPolicy, type VaultTaskPolicyOverrides } from 
 import { itemHandle, loosensPolicy } from '../autonomy/vault-items.js';
 import { applyAvatarProfile, avatarAuthorizationCapabilities, avatarCallableBy, avatarEnabled } from './avatars.js';
 import { CapabilityError, NotFoundError, ValidationError } from './errors.js';
-import { assertAgentSpec } from './agent-params.js';
+import { assertAgentSpec, subTaskParams } from './agent-params.js';
 import { CALLED_AGENT_FIELD, agentSpecsByParticipant, authorityKey, normalizeAgentAuthority, type StoredAgentAuthorization } from './agent-authority.js';
 import { AGENT_SELECTOR, MAIN_AGENT, agentSelector, conversationFor, isParticipantKey, nextAgentKey, participantLabel, selectorAgent } from '../domain/participants.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
@@ -403,6 +403,14 @@ export interface KarmaxApiDeps {
  * these calls; every call is capability-checked against a scoped token (§8.3),
  * so authz lives in exactly one place.
  */
+/** Why `parent` can take no more sub-tasks (it has ended), if it cannot. */
+function subTaskParentEnded(parent: TaskRecord): string | undefined {
+  const view = parent.lastView;
+  if (view && (['done', 'cancelled', 'failed'].includes(view.status) || ['done', 'cancelled'].includes(view.stage)))
+    return `its parent task has ${view.status === 'failed' ? 'failed' : 'ended'}`;
+  return undefined;
+}
+
 export class KarmaxApi {
   private remoteWikiReadCache?: RemoteWikiSnapshots;
   private get remoteWikiReads(): RemoteWikiSnapshots {
@@ -2108,6 +2116,75 @@ export class KarmaxApi {
     }
   }
 
+  /** Save a draft sub-task of `parentTaskId` (POST /api/tasks/:taskId/sub-tasks;
+   * create_sub_task with `draft: true`). Nothing is prepared yet: it starts when
+   * queued, off its parent's work as it is then (`queueSubTaskDraft`). Its
+   * params take only agent fields, as create_sub_task's do. */
+  async createSubTaskDraft(token: string, parentTaskId: string,
+    input: { title?: unknown; prompt?: unknown; params?: unknown }): Promise<TaskRecord> {
+    const parent = (await this.deps.store.getTask(parentTaskId));
+    if (!parent) throw new NotFoundError(`no task ${parentTaskId}`);
+    const caller = (await this.require(token, 'create_sub_task', { projectId: parent.projectId, taskId: parentTaskId }));
+    if (parent.workflow !== 'software-dev' && parent.workflow !== 'goal')
+      throw new ValidationError(`a ${parent.workflow} task has no sub-tasks`);
+    const ended = subTaskParentEnded(parent);
+    if (ended) throw new ValidationError(ended);
+    const prompt = typeof input.prompt === 'string' ? input.prompt : '';
+    if (!prompt.trim()) throw new ValidationError('a sub-task needs a prompt');
+    const title = (typeof input.title === 'string' && input.title.trim()) || 'sub-task';
+    const params = (await subTaskParams(this.deps.store, { projectId: parent.projectId, parentTaskId, params: input.params }));
+    const parentAgent = { kind: 'task-agent' as const, taskId: parentTaskId, role: 'do' as const };
+    const ownAgent = caller.kind === 'agent' && caller.taskId === parentTaskId;
+    const child = (await this.deps.store.createTask({
+      projectId: parent.projectId,
+      listId: parent.listId,
+      title,
+      workflow: 'software-dev',
+      workflowVersion: parent.workflowVersion ?? '1.0.0',
+      params: { ...params, prompt, draft: true },
+      parentTaskId,
+      createdBy: ownAgent ? parentAgent : (await this.taskCreator(caller, parent.projectId)) ?? parentAgent,
+      assignee: parentAgent,
+    }));
+    const event = { taskId: parentTaskId, type: 'subtask.created', ts: Date.now(), payload: { childTaskId: child.id, title, draft: true } };
+    const seq = (await this.deps.store.appendEvent(event));
+    this.deps.bus?.emit({ ...event, seq });
+    return child;
+  }
+
+  /** Queue a draft sub-task: its parent prepares and starts it after its agent's
+   * current turn, as it does one its agent asks for. Only a parent at work (in
+   * Do) can: a sub-task builds on its parent's branch and returns to it. Anyone
+   * other than the parent's own agent is said to have queued it, in the
+   * parent's conversation, which also wakes a parent that waits. */
+  private async queueSubTaskDraft(caller: ScopedToken, task: TaskRecord): Promise<TaskRecord> {
+    const parent = (await this.deps.store.getTask(task.parentTaskId!));
+    const ended = parent ? subTaskParentEnded(parent) : 'its parent task is gone';
+    if (ended || !parent) throw new ValidationError(`${ended}. A sub-task starts from its parent's work and returns to it, so this draft cannot start now`);
+    const stage = parent.lastView?.stage;
+    if (stage !== 'do') {
+      const where = !stage ? 'not started' : ({ setup: 'setting up', pr: 'in Review', review: 'in Review', merge: 'landing',
+        escalated: 'blocked' } as Record<string, string>)[stage] ?? `in ${stage}`;
+      throw new ValidationError(`its parent task is ${where}; a sub-task starts only while its parent works (Do)`);
+    }
+    await (await this.workflowHandle(parent.id)).signal(SIG.queueSubTask, { taskId: task.id, title: task.title });
+    (await this.deps.store.patchTaskParams(task.id, { _queuedAt: Date.now() }));
+    const event = { taskId: parent.id, type: 'subtask.queued', ts: Date.now(), payload: { childTaskId: task.id, title: task.title } };
+    const seq = (await this.deps.store.appendEvent(event));
+    this.deps.bus?.emit({ ...event, seq });
+    if (!(caller.kind === 'agent' && caller.taskId === parent.id)) {
+      const userId = caller.humanSubject?.userId;
+      const label = userId ? (await this.deps.store.userDisplayName(userId)) : undefined;
+      const author: Partial<Message> = userId ? { author: `user:${userId}`, ...(label ? { authorLabel: label } : {}) }
+        : caller.kind === 'agent' && caller.taskId && caller.taskId !== '*' ? { author: `task:${caller.taskId}` } : {};
+      const message: Message = { id: `u${randomUUID()}`, role: 'user', ...author, ts: Date.now(),
+        text: `Queued your draft sub-task "${task.title}" (${task.id}). It starts off your work as it is when your current turn ends (at once if you are not working).` };
+      await (await this.workflowHandle(parent.id)).signal(SIG.followUp, message);
+      (await this.publishConversationMessage(parent.id, MAIN_AGENT, message));
+    }
+    return (await this.deps.store.getTask(task.id))!;
+  }
+
   /** Start a previously-saved draft (SPEC §10.4). */
   async queueTask(token: string, taskId: string): Promise<TaskRecord> {
     const receivedAt = (await timingEnabled(this.deps.store)) ? { monoMs: performance.now(), wallMs: Date.now() } : undefined;
@@ -2124,6 +2201,8 @@ export class KarmaxApi {
         { credentialGrants: storedAuthorization.missingCredentialGrants })
         : new AuthorizationGrantError('you cannot grant the agent more authorization than you have');
     }
+    // A draft sub-task is started by its parent, under the parent's grant.
+    if (task.parentTaskId && task.params?.draft) return this.queueSubTaskDraft(caller, task);
     (await this.assertStoredGrantQueueable(token, caller, task));
     (await this.refreshAgentAuthorizationsForQueue(token, caller, task));
     const group = (await this.deps.store.attemptGroup(taskId));
