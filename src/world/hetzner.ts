@@ -6,7 +6,7 @@ import type { ProviderUsageEvent, WorldLifecycleState } from './types.js';
 import { runDetached, type VmAllocation, type VmBootKeys, type VmDriver, type VmListing, type VmShape } from './vm/provider.js';
 import { VM_ETC, VM_SSH_PORT, VM_USER, vmBootScript, vmProvisionScript, vmProvisionStamp, vmProvisionVersion } from './vm/provision.js';
 import { generateSshKeyPair, quote, SshTransport } from './vm/ssh.js';
-import { ProviderCapacityFull } from '../agent/limits.js';
+import { ProviderCapacityFull, ProviderOutage } from '../agent/limits.js';
 
 /**
  * Hetzner Cloud servers as VM worlds (`vm/provider.ts`). The world's files
@@ -26,6 +26,13 @@ import { ProviderCapacityFull } from '../agent/limits.js';
  * from stock Debian. A project firewall admits only karmax's SSH port, and a
  * project SSH key whose private half was never kept stops Hetzner generating
  * (and mailing) a root password.
+ *
+ * Hetzner's failures are ordinary (pramana#59: a power-on failed "Unknown
+ * Error" and the same request a second later worked), so nothing here trusts
+ * one answer: refusals are asked again, failed actions run again, a server
+ * that will not start or stop is replaced (the world is its volume), a sold-out
+ * server type gives way to the next, and what still fails is a
+ * `ProviderOutage`, which the platform waits out before asking a person.
  */
 
 const API = 'https://api.hetzner.cloud/v1';
@@ -37,6 +44,17 @@ export const HETZNER_DEFAULT_DISK_GB = 20;
 /** Delete a parked server once less than this is left of its paid hour. */
 const PARK_DELETE_MARGIN_MS = 6 * 60_000;
 const BUILDER_STALE_MS = 60 * 60_000;
+/** How often one API request is sent again (waits of 1, 2, 4 and 8 s). */
+const API_RETRIES = 4;
+/** How many server types a create tries when Hetzner has none of one left. */
+const TYPE_FALLBACKS = 3;
+/** Refusals that change nothing: any request may be sent again. */
+const REFUSED = new Set(['rate_limit_exceeded', 'locked', 'conflict', 'maintenance', 'unavailable']);
+/** Failures that pass but may have done something: only a request that
+ * means the same the second time (not a POST) is sent again at once. */
+const FAILED = new Set(['server_error', 'service_error', 'timeout']);
+/** None of the asked-for server type at the location just now. */
+const SOLD_OUT = new Set(['resource_unavailable', 'placement_error']);
 /** Hetzner prices in euros; usage is booked in dollars. */
 const usdPerEur = () => Number(process.env.KARMAX_USD_PER_EUR ?? 1.17);
 
@@ -73,6 +91,7 @@ export class HetznerDriver implements VmDriver {
   private types = new Map<string, { at: number; types: Promise<ServerType[]> }>();
   private building = new Map<string, Promise<void>>();
 
+  /** `pollMs` is the driver's second: every wait is a multiple of it (tests shrink it). */
   constructor(private fetchImpl: Fetch = fetch, private pollMs = 1_000,
     /** Test seam: how the snapshot builder reaches its server over SSH. */
     private builderTransport?: (server: Server, keys: { privateKey: string; hostKey: string }) => SshTransport) {}
@@ -91,7 +110,8 @@ export class HetznerDriver implements VmDriver {
     const location = connection.config.region ?? HETZNER_DEFAULT_LOCATION;
     const name = worldName(request.labels);
     const labels = { ...request.labels, karmaxWorld: name };
-    const created = await api('POST', '/volumes', { name, size: request.shape.diskGb, location, labels, format: 'ext4', automount: false }) as
+    const created = await api('POST', '/volumes', { name, size: request.shape.diskGb, location, labels, format: 'ext4', automount: false })
+      .catch(async (error) => { throw projectLimit(error) ? await this.volumesFull(connection, `a ${request.shape.diskGb} GB disk`, error) : error; }) as
       { volume: Volume; action?: { id: number } };
     const ref = { volume: String(created.volume.id), location, world: name };
     try {
@@ -113,38 +133,51 @@ export class HetznerDriver implements VmDriver {
   }
 
   async start(connection: ResolvedWorldProviderConnection, ref: Record<string, string>, shape: VmShape, keys: VmBootKeys): Promise<void> {
-    const api = this.api(connection);
     const volume = await this.volume(connection, ref);
-    const server = volume.server ? await api('GET', `/servers/${volume.server}`).then((value) => (value as { server: Server }).server, () => undefined) : undefined;
+    const server = volume.server ? await this.server(connection, volume.server) : undefined;
     const type = await this.serverType(connection, shape);
-    if (server && server.server_type.name === type.name) {
+    if (server && server.status !== 'deleting' && sameSize(server.server_type, type)) {
       // Parked within its paid hour: power it back on.
-      if (server.status !== 'running') {
-        const action = await api('POST', `/servers/${server.id}/actions/poweron`) as { action: { id: number } };
-        await this.waitAction(connection, action.action.id);
+      try {
+        if (server.status !== 'running') await this.serverAction(connection, server.id, 'poweron');
+        await this.api(connection)('PUT', `/servers/${server.id}`, { labels: withoutParked(server.labels) });
+        return;
+      } catch (error) {
+        if (!(error instanceof ProviderOutage)) throw error;
+        // pramana#59. The server holds nothing the world needs; its volume does.
+        console.warn(`[hetzner] ${ref.world}: Hetzner could not start server ${server.id}, so it is replaced: ${error.message}`);
       }
-      await api('PUT', `/servers/${server.id}`, { labels: withoutParked(server.labels) });
-      return;
     }
-    if (server) await this.deleteServer(connection, server);
+    await this.replace(connection, ref, shape, keys);
+  }
+
+  /** A new server on the world's volume, in place of any it has: for a new
+   * size, and for a server that will not start or never answers. */
+  async replace(connection: ResolvedWorldProviderConnection, ref: Record<string, string>, shape: VmShape, keys: VmBootKeys): Promise<void> {
+    const volume = await this.volume(connection, ref);
+    const attached = volume.server ? await this.server(connection, volume.server) : undefined;
+    // Also a server an interrupted replacement made but never attached: it holds the world's name.
+    const stale = await this.servers(connection, `karmaxWorld=${ref.world}`);
+    for (const server of [...(attached ? [attached] : []), ...stale.filter((server) => server.id !== attached?.id)])
+      await this.deleteServer(connection, server);
     await this.createServer(connection, ref, volume, shape, keys, volume.labels);
   }
 
   async stop(connection: ResolvedWorldProviderConnection, ref: Record<string, string>): Promise<void> {
     const server = await this.serverOf(connection, ref);
     if (!server) return;
-    const api = this.api(connection);
     if (server.status !== 'off') {
-      // A clean shutdown first; Hetzner's poweroff is pulling the plug.
-      const shutdown = await api('POST', `/servers/${server.id}/actions/shutdown`) as { action: { id: number } };
-      await this.waitAction(connection, shutdown.action.id);
-      if (!(await this.waitStatus(connection, server.id, 'off', 60_000))) {
-        const off = await api('POST', `/servers/${server.id}/actions/poweroff`) as { action: { id: number } };
-        await this.waitAction(connection, off.action.id);
+      try { await this.halt(connection, server.id, 60); }
+      catch (error) {
+        if (!(error instanceof ProviderOutage)) throw error;
+        // A server that will not stop bills on and holds nothing the world needs (its volume does).
+        console.warn(`[hetzner] ${ref.world}: Hetzner could not stop server ${server.id}, so it is deleted: ${error.message}`);
+        await this.deleteServer(connection, server);
+        return;
       }
     }
     if (paidMsLeft(server, Date.now()) < PARK_DELETE_MARGIN_MS || parkGraceDisabled()) await this.deleteServer(connection, server);
-    else await api('PUT', `/servers/${server.id}`, { labels: { ...server.labels, karmaxParkedAt: String(Date.now()) } });
+    else await this.api(connection)('PUT', `/servers/${server.id}`, { labels: { ...server.labels, karmaxParkedAt: String(Date.now()) } });
   }
 
   async destroy(connection: ResolvedWorldProviderConnection, ref: Record<string, string>): Promise<void> {
@@ -171,7 +204,9 @@ export class HetznerDriver implements VmDriver {
     if (diskGb > HETZNER_MAX_DISK_GB) throw new Error(`A Hetzner volume holds at most ${HETZNER_MAX_DISK_GB} GB`);
     const volume = await this.volume(connection, ref);
     if (volume.size >= diskGb) return false;
-    const resized = await this.api(connection)('POST', `/volumes/${volume.id}/actions/resize`, { size: diskGb }) as { action: { id: number } };
+    const resized = await this.api(connection)('POST', `/volumes/${volume.id}/actions/resize`, { size: diskGb })
+      .catch(async (error) => { throw projectLimit(error) ? await this.volumesFull(connection, `growing a disk to ${diskGb} GB`, error) : error; }) as
+      { action: { id: number } };
     await this.waitAction(connection, resized.action.id);
     return true;
   }
@@ -237,13 +272,16 @@ export class HetznerDriver implements VmDriver {
   /** Delete parked servers as their paid hour runs out, and builders that died mid-build. */
   async housekeep(connection: ResolvedWorldProviderConnection, home: string): Promise<void> {
     const now = Date.now();
-    for (const server of await this.servers(connection, `karmaxHome=${home}`)) {
-      if (server.labels.karmaxParkedAt && server.status === 'off' && paidMsLeft(server, now) < PARK_DELETE_MARGIN_MS)
-        await this.deleteServer(connection, server);
-    }
-    for (const builder of await this.servers(connection, 'karmaxImageBuilder'))
-      if (now - Date.parse(builder.created) > BUILDER_STALE_MS && !this.building.has(builder.labels.karmaxImageBuilder ?? ''))
-        await this.deleteServer(connection, builder);
+    const doomed = [
+      ...(await this.servers(connection, `karmaxHome=${home}`)).filter((server) =>
+        server.labels.karmaxParkedAt && server.status === 'off' && paidMsLeft(server, now) < PARK_DELETE_MARGIN_MS),
+      ...(await this.servers(connection, 'karmaxImageBuilder')).filter((builder) =>
+        now - Date.parse(builder.created) > BUILDER_STALE_MS && !this.building.has(builder.labels.karmaxImageBuilder ?? '')),
+    ];
+    // One server Hetzner will not delete must not keep the rest billing.
+    const failures: unknown[] = [];
+    for (const server of doomed) await this.deleteServer(connection, server).catch((error) => { failures.push(error); });
+    if (failures.length) throw failures[0];
   }
 
   /** The largest machine the project can have at its location: the biggest
@@ -261,13 +299,31 @@ export class HetznerDriver implements VmDriver {
 
   // ---------------------------------------------------------------------------
 
+  /** A server for the volume: the cheapest type that covers the shape, else,
+   * while Hetzner has none of it left at the location, the next ones. */
   private async createServer(connection: ResolvedWorldProviderConnection, ref: Record<string, string>, volume: Volume,
     shape: VmShape, keys: VmBootKeys, labels: Record<string, string>): Promise<Server> {
-    const api = this.api(connection);
-    const type = await this.serverType(connection, shape);
     const snapshot = await this.snapshot(connection);
     if (!snapshot) this.buildSnapshot(connection);
     const [firewall, sshKey] = await Promise.all([this.firewall(connection), this.rootKey(connection)]);
+    const types = (await this.serverTypes(connection, shape)).slice(0, TYPE_FALLBACKS);
+    let soldOut: unknown;
+    for (const type of types) {
+      try { return await this.createServerOf(connection, ref, volume, type, { snapshot, firewall, sshKey }, keys, labels); }
+      catch (error) {
+        if (!isSoldOut(error)) throw error;
+        soldOut = error;
+        this.types.delete(this.key(connection)); // what is orderable changed within the hour types are cached for
+      }
+    }
+    throw new ProviderCapacityFull(`Hetzner has no ${types.map((type) => type.name).join(', ')} server free at ${ref.location} just now. `
+      + 'tavya keeps retrying for about 20 minutes; to start sooner, give this task another size.', { cause: soldOut });
+  }
+
+  private async createServerOf(connection: ResolvedWorldProviderConnection, ref: Record<string, string>, volume: Volume, type: ServerType,
+    project: { snapshot?: string; firewall: number; sshKey: number }, keys: VmBootKeys, labels: Record<string, string>): Promise<Server> {
+    const api = this.api(connection);
+    const { snapshot, firewall, sshKey } = project;
     const create = () => api('POST', '/servers', {
       name: ref.world, server_type: type.name, location: ref.location, image: snapshot ?? connection.config.image ?? HETZNER_DEFAULT_IMAGE,
       labels: withoutParked(labels), volumes: [volume.id], automount: false, start_after_create: true,
@@ -287,8 +343,22 @@ export class HetznerDriver implements VmDriver {
       try { created = await create(); }
       catch (again) { throw projectLimit(again) ? await this.limitFull(connection, type, projectLimit(again)!, again) : again; }
     }
-    await this.waitAction(connection, created.action.id);
+    try { await this.waitAction(connection, created.action.id); }
+    catch (error) {
+      // A server Hetzner failed to make is no use, and would hold the world's name and volume.
+      await this.deleteServer(connection, created.server).catch(() => undefined);
+      throw error;
+    }
     return created.server;
+  }
+
+  /** What a full volume limit is, what holds it, and what a person can do. */
+  private async volumesFull(connection: ResolvedWorldProviderConnection, what: string, cause: unknown): Promise<ProviderCapacityFull> {
+    const volumes = await this.pages<Volume>(connection, '/volumes', 'volumes').catch(() => [] as Volume[]);
+    const used = volumes.reduce((sum, volume) => sum + volume.size, 0);
+    return new ProviderCapacityFull(`Hetzner refused ${what}: this Hetzner project's limit on the total size of its volumes is full, `
+      + `with ${used} GB in ${volumes.length} volume${volumes.length === 1 ? '' : 's'}. tavya keeps retrying for about 20 minutes; `
+      + 'to start sooner, give this task a smaller disk, delete another task, or ask Hetzner to raise the limit (Hetzner Console → Limits).', { cause });
   }
 
   /** What a full project limit is, what holds it, and what a person can do. */
@@ -306,8 +376,13 @@ export class HetznerDriver implements VmDriver {
 
   /** The server type for a shape: cheapest current x86 type at the location that covers it. */
   private async serverType(connection: ResolvedWorldProviderConnection, want: { cpu: number; memoryMb: number }): Promise<ServerType> {
+    return (await this.serverTypes(connection, want))[0]!;
+  }
+
+  /** Every current x86 type at the location that covers a shape, cheapest first. */
+  private async serverTypes(connection: ResolvedWorldProviderConnection, want: { cpu: number; memoryMb: number }): Promise<ServerType[]> {
     const location = connection.config.region ?? HETZNER_DEFAULT_LOCATION;
-    const key = crypto.createHash('sha256').update(connection.apiKey).digest('hex');
+    const key = this.key(connection);
     let cached = this.types.get(key);
     if (!cached || Date.now() - cached.at > 3_600_000) {
       cached = { at: Date.now(), types: this.pages<ServerType>(connection, '/server_types', 'server_types') };
@@ -319,7 +394,11 @@ export class HetznerDriver implements VmDriver {
       && Number.isFinite(price(type)) && type.cores >= want.cpu && type.memory * 1024 >= want.memoryMb)
       .sort((a, b) => price(a) - price(b) || a.cores - b.cores);
     if (!fits[0]) throw new Error(`Hetzner has no server at ${location} with ${want.cpu} CPU and ${Math.round(want.memoryMb / 1024)} GB of memory`);
-    return fits[0];
+    return fits;
+  }
+
+  private key(connection: ResolvedWorldProviderConnection): string {
+    return crypto.createHash('sha256').update(connection.apiKey).digest('hex');
   }
 
   private async volume(connection: ResolvedWorldProviderConnection, ref: Record<string, string>): Promise<Volume> {
@@ -328,10 +407,39 @@ export class HetznerDriver implements VmDriver {
 
   private async serverOf(connection: ResolvedWorldProviderConnection, ref: Record<string, string>): Promise<Server | undefined> {
     const volume = await this.volume(connection, ref);
-    if (!volume.server) return undefined;
-    return ((await this.api(connection)('GET', `/servers/${volume.server}`).catch((error) => {
+    return volume.server ? this.server(connection, volume.server) : undefined;
+  }
+
+  /** The server, or undefined when it is gone (only a 404 says so). */
+  private async server(connection: ResolvedWorldProviderConnection, id: number): Promise<Server | undefined> {
+    return ((await this.api(connection)('GET', `/servers/${id}`).catch((error) => {
       if ((error as HetznerError).status === 404) return { server: undefined }; throw error;
     })) as { server?: Server }).server;
+  }
+
+  /** Run a server action, again if Hetzner fails it: it fails the odd one
+   * (start_server "Unknown Error", pramana#59) and runs it a moment later. */
+  private async serverAction(connection: ResolvedWorldProviderConnection, id: number, verb: string, attempts = 3): Promise<void> {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        const started = await this.api(connection)('POST', `/servers/${id}/actions/${verb}`) as { action: { id: number } };
+        await this.waitAction(connection, started.action.id);
+        return;
+      } catch (error) {
+        if (!(error instanceof ProviderOutage) || attempt >= attempts) throw error;
+        await this.sleep(2 ** attempt);
+      }
+    }
+  }
+
+  /** Stop a server: a clean shutdown, and pull the plug if it is not off within `seconds`. */
+  private async halt(connection: ResolvedWorldProviderConnection, id: number, seconds: number): Promise<void> {
+    const asked = await this.serverAction(connection, id, 'shutdown').then(() => true, (error) => {
+      if (!(error instanceof ProviderOutage)) throw error;
+      return false;
+    });
+    if (asked && await this.waitStatus(connection, id, 'off', seconds * this.pollMs)) return;
+    await this.serverAction(connection, id, 'poweroff');
   }
 
   private servers(connection: ResolvedWorldProviderConnection, selector?: string): Promise<Server[]> {
@@ -359,7 +467,7 @@ export class HetznerDriver implements VmDriver {
     for (;;) {
       const ready = await this.snapshot(connection);
       if (ready) return ready;
-      const key = `${crypto.createHash('sha256').update(connection.apiKey).digest('hex')}:${vmProvisionVersion()}`;
+      const key = `${this.key(connection)}:${vmProvisionVersion()}`;
       const building = this.building.get(key);
       if (building) await building;
       else if (!(await this.servers(connection, `karmaxImageBuilder=${vmProvisionVersion()}`)).length)
@@ -372,7 +480,7 @@ export class HetznerDriver implements VmDriver {
   /** Build the provisioned snapshot in the background, once per project and version. */
   private buildSnapshot(connection: ResolvedWorldProviderConnection): void {
     const version = vmProvisionVersion();
-    const key = `${crypto.createHash('sha256').update(connection.apiKey).digest('hex')}:${version}`;
+    const key = `${this.key(connection)}:${version}`;
     if (this.building.has(key) || process.env.KARMAX_HETZNER_SNAPSHOTS === '0') return;
     const build = this.runBuild(connection, version).catch((error) => {
       console.warn(`[hetzner] building the karmax VM snapshot failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -414,12 +522,7 @@ export class HetznerDriver implements VmDriver {
       } finally {
         transport.close();
       }
-      const shutdown = await api('POST', `/servers/${server.id}/actions/shutdown`) as { action: { id: number } };
-      await this.waitAction(connection, shutdown.action.id);
-      if (!(await this.waitStatus(connection, server.id, 'off', 120_000))) {
-        const off = await api('POST', `/servers/${server.id}/actions/poweroff`) as { action: { id: number } };
-        await this.waitAction(connection, off.action.id);
-      }
+      await this.halt(connection, server.id, 120);
       const image = await api('POST', `/servers/${server.id}/actions/create_image`, {
         type: 'snapshot', description: `karmax VM ${version}`, labels: { karmaxImage: version } }) as { action: { id: number } };
       await this.waitAction(connection, image.action.id, 30 * 60_000);
@@ -432,7 +535,7 @@ export class HetznerDriver implements VmDriver {
    * world and its snapshot builder start together, and each made its own. */
   private projectResources = new Map<string, Promise<number>>();
   private once(connection: ResolvedWorldProviderConnection, name: string, make: () => Promise<number>): Promise<number> {
-    const key = `${crypto.createHash('sha256').update(connection.apiKey).digest('hex')}:${name}`;
+    const key = `${this.key(connection)}:${name}`;
     let pending = this.projectResources.get(key);
     if (!pending) {
       pending = make().finally(() => this.projectResources.delete(key));
@@ -469,7 +572,7 @@ export class HetznerDriver implements VmDriver {
 
   private pricingCache = new Map<string, Promise<{ ipv4Hourly: number; volumeGbMonth: number }>>();
   private pricing(connection: ResolvedWorldProviderConnection): Promise<{ ipv4Hourly: number; volumeGbMonth: number }> {
-    const key = crypto.createHash('sha256').update(connection.apiKey).digest('hex');
+    const key = this.key(connection);
     let cached = this.pricingCache.get(key);
     if (!cached) {
       cached = this.api(connection)('GET', '/pricing').then((value) => {
@@ -485,15 +588,25 @@ export class HetznerDriver implements VmDriver {
     return cached;
   }
 
+  /** Wait for an action. A failed or endless one is an outage: Hetzner says
+   * nothing more than "Unknown Error", and the same request later works. */
   private async waitAction(connection: ResolvedWorldProviderConnection, id: number, ms = 10 * 60_000): Promise<void> {
     const until = Date.now() + ms;
-    for (;;) {
-      const { action } = await this.api(connection)('GET', `/actions/${id}`) as { action: { status: string; error?: { message?: string } } };
+    for (let poll = 0; ; poll++) {
+      const { action } = await this.api(connection)('GET', `/actions/${id}`) as
+        { action: { status: string; command?: string; error?: { code?: string; message?: string } } };
+      const what = `Hetzner's ${action.command ?? 'action'} ${id}`;
       if (action.status === 'success') return;
-      if (action.status === 'error') throw new HetznerError(`Hetzner action failed: ${action.error?.message ?? 'unknown error'}`);
-      if (Date.now() > until) throw new Error('a Hetzner action did not finish in time');
-      await new Promise((resolve) => setTimeout(resolve, this.pollMs));
+      if (action.status === 'error')
+        throw new HetznerOutage(`${what} failed: ${action.error?.message ?? 'no reason given'}${action.error?.code ? ` (${action.error.code})` : ''}`,
+          undefined, action.error?.code);
+      if (Date.now() > until) throw new HetznerOutage(`${what} did not finish within ${Math.round(ms / 60_000)} minutes`);
+      await this.sleep(Math.min(5, 1 + Math.floor(poll / 10)));
     }
+  }
+
+  private sleep(seconds: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, seconds * this.pollMs));
   }
 
   private async waitStatus(connection: ResolvedWorldProviderConnection, id: number, status: string, ms: number): Promise<boolean> {
@@ -518,30 +631,81 @@ export class HetznerDriver implements VmDriver {
     return items;
   }
 
+  /**
+   * One API request. A refusal (rate limit, a resource locked by a running
+   * action, maintenance) changed nothing and is sent again whatever it is; a
+   * failure that may have done something (a 5xx, no answer) is sent again
+   * only if it means the same the second time — never a POST, which would
+   * make a second volume or server. What still fails and passes with time is
+   * a `HetznerOutage`; the rest (a 404, a refused limit, bad input) a `HetznerError`.
+   */
   private api(connection: ResolvedWorldProviderConnection) {
     return async (method: string, path: string, body?: unknown): Promise<unknown> => {
+      const route = `${method} ${path.split('?')[0]}`;
+      const resend = method !== 'POST';
+      const redact = (text: string) => text.split(connection.apiKey).join('[redacted]');
       for (let attempt = 0; ; attempt++) {
-        const response = await this.fetchImpl(`${API}${path}`, {
-          method, headers: { authorization: `Bearer ${connection.apiKey.trim()}`, ...(body !== undefined ? { 'content-type': 'application/json' } : {}) },
-          ...(body !== undefined ? { body: JSON.stringify(body) } : {}), signal: AbortSignal.timeout(120_000),
-        });
-        if (response.ok) {
-          const text = await response.text();
-          return text ? JSON.parse(text) : {};
+        const last = attempt >= API_RETRIES;
+        let response: Response;
+        let text: string;
+        try {
+          response = await this.fetchImpl(`${API}${path}`, {
+            method, headers: { authorization: `Bearer ${connection.apiKey.trim()}`, ...(body !== undefined ? { 'content-type': 'application/json' } : {}) },
+            ...(body !== undefined ? { body: JSON.stringify(body) } : {}), signal: AbortSignal.timeout(120_000),
+          });
+          text = await response.text();
+        } catch (error) {
+          if (resend && !last) { await this.sleep(2 ** attempt); continue; }
+          throw new HetznerOutage(`Hetzner ${route} got no answer: ${redact(error instanceof Error ? error.message : String(error))}`,
+            undefined, undefined, undefined, { cause: error });
         }
-        const detail = (await response.text().catch(() => '')).slice(0, 500).split(connection.apiKey).join('[redacted]');
-        if ((response.status === 429 || response.status >= 500) && attempt < 2 && method === 'GET') {
-          await new Promise((resolve) => setTimeout(resolve, 1_000 * (attempt + 1)));
-          continue;
-        }
-        throw new HetznerError(`Hetzner ${method} ${path.split('?')[0]} failed (${response.status}): ${detail}`, response.status, detail);
+        if (response.ok) return text ? JSON.parse(text) : {};
+        const detail = redact(text.slice(0, 500));
+        const code = errorCode(text);
+        const refused = response.status === 429 || REFUSED.has(code ?? '');
+        const failed = response.status >= 500 || FAILED.has(code ?? '');
+        if (!last && (refused || (failed && resend))) { await this.sleep(retryAfter(response) ?? 2 ** attempt); continue; }
+        const message = `Hetzner ${route} failed (${response.status}): ${detail}`;
+        if (refused || failed || SOLD_OUT.has(code ?? '')) throw new HetznerOutage(message, response.status, code, detail);
+        throw new HetznerError(message, response.status, detail, code);
       }
     };
   }
 }
 
 export class HetznerError extends Error {
-  constructor(message: string, readonly status?: number, readonly body?: string) { super(message); this.name = 'HetznerError'; }
+  constructor(message: string, readonly status?: number, readonly body?: string, readonly code?: string) { super(message); this.name = 'HetznerError'; }
+}
+
+/** A Hetzner failure that passes with time: retried by the platform as infrastructure, never the agent's. */
+export class HetznerOutage extends ProviderOutage {
+  constructor(message: string, readonly status?: number, readonly code?: string, readonly body?: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = 'HetznerOutage';
+  }
+}
+
+/** Hetzner's error code (`locked`, `resource_limit_exceeded`…) in a response body. */
+function errorCode(body: string): string | undefined {
+  try { return (JSON.parse(body) as { error?: { code?: string } }).error?.code; } catch { return undefined; }
+}
+
+/** Seconds until Hetzner's rate limit lets requests through again (at most a minute). */
+function retryAfter(response: Response): number | undefined {
+  if (response.status !== 429) return undefined;
+  const reset = Number(response.headers.get('ratelimit-reset'));
+  return Number.isFinite(reset) && reset > 0 ? Math.min(60, Math.max(1, Math.ceil(reset - Date.now() / 1000))) : undefined;
+}
+
+/** Hetzner has none of the server type at the location just now, or no longer offers it there. */
+function isSoldOut(error: unknown): boolean {
+  const code = (error as HetznerError | HetznerOutage | undefined)?.code;
+  return SOLD_OUT.has(code ?? '') || (code === 'invalid_input' && /unsupported location for server type/i.test((error as Error).message));
+}
+
+/** Whether a server is the size a type is: the same CPUs, memory and kind of CPU. */
+function sameSize(a: ServerType, b: ServerType): boolean {
+  return a.cores === b.cores && a.memory === b.memory && a.cpu_type === b.cpu_type;
 }
 
 /** The project limit a refusal names (`server_shared_cores_limit`…), when
