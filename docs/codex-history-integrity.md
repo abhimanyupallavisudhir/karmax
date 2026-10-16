@@ -48,7 +48,10 @@ that is not supported` (task #643, 2026-10-15). panagent no longer writes them.
 The same preparation removes them from histories that descend from a panagent
 import (a `session_meta` with `originator: "panagent"`, which forks keep) and
 resumes the rewritten copy. Ids that Codex assigns (UUID-shaped) and ids OpenAI
-issues are left alone (`tests/codex-imported-ids.test.ts`).
+issues are left alone (`tests/codex-imported-ids.test.ts`). The rewrite is part of
+the copy's identity: an earlier release had already named a copy of the same
+history that kept the ids, and reusing that name failed every retry with
+"conflicting copies … histories diverge".
 
 ## Rules
 
