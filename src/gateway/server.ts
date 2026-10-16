@@ -5933,7 +5933,15 @@ export class Gateway {
         }
       }
       if (p === '/api/agent/escalation-targets' && method === 'GET') {
-        try { return this.json(res, 200, (await api.humanEscalationTargets(token))); }
+        // With what you would ask for: only those who can grant it, nearest first.
+        const list = (name: string) => url.searchParams.getAll(name).flatMap((value) => value.split(',')).map((value) => value.trim()).filter(Boolean);
+        const capabilities = list('capabilities');
+        const projectIds = list('projectIds');
+        try {
+          if (capabilities.length || projectIds.length)
+            return this.json(res, 200, await api.permissionGrantorsFor(token, { capabilities, projectIds }));
+          return this.json(res, 200, (await api.humanEscalationTargets(token)));
+        }
         catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
       }
       if (p === '/api/permission-requests' && method === 'GET') {

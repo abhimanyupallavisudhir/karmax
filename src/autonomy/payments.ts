@@ -3,6 +3,7 @@ import { participantAuthorization } from '../platform/agent-authority.js';
 import { MAIN_AGENT, participantLabel } from '../domain/participants.js';
 import { allows, attenuate } from '../platform/capabilities.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
+import { delegatedFromParent } from '../platform/delegation.js';
 import * as __asyncCollections from '../util/async-collections.js';
 import { Store } from '../store/db.js';
 import { newId } from '../util/id.js';
@@ -1396,7 +1397,13 @@ export async function resolvePaymentPolicy(store: Store, projectId: string, task
   const g = ((await store.getSettings(`organization:${org}`, 'payments'))
     ?? (org === 'org_personal' ? (await store.getSettings('global', 'payments')) : undefined) ?? {}) as any;
   const p = ((await store.getSettings(projectId, 'payments')) ?? {}) as any;
-  const t = taskId ? ((await store.getTask(taskId))?.params as any)?.paymentPolicy : undefined;
+  const task = taskId ? await store.getTask(taskId) : undefined;
+  const t = (task?.params as any)?.paymentPolicy;
+  // A sub-task without its own policy spends under its parent's (delegation.ts).
+  if (!t && delegatedFromParent(task)) {
+    const parent = await store.getTask(task.parentTaskId);
+    if (parent) return resolvePaymentPolicy(store, parent.projectId, parent.id);
+  }
   const layer = t ?? p;
   // The currency travels with whichever layer set the budget.
   const source = Object.hasOwn(layer, 'budget') || layer.allowance != null ? layer : g;

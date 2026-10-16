@@ -6,6 +6,7 @@ import type { Store } from '../store/db.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import { INSTALLATION_SCOPE, organizationScope } from '../autonomy/vault-keys.js';
 import { newId } from '../util/id.js';
+import { delegatingAncestors } from '../platform/delegation.js';
 import { beginOAuth, finishOAuth, connectionHeaders, leasedOAuthRefresh, type OAuthVault, type OAuthTarget } from '../mcp/connections/oauth.js';
 import { RefreshLeases } from '../autonomy/refresh-lease.js';
 import { authorizesWithGitHub, openRemoteMcp, remoteMcpAuth, type RemoteMcpTransport } from '../mcp/connections/remote.js';
@@ -191,12 +192,18 @@ export class ServiceConnections {
     return 'karmax_' + crypto.createHash('sha256').update(JSON.stringify([installation, c.organizationId, c.ownerId])).digest('hex');
       });
   }
-  canUse(c: ServiceConnection, taskId: string, projectId: string) {
-    return c.taskId === taskId || c.projectIds.includes(projectId);
+  /** `taskIds`: the task and those it acts with the authority of (a sub-task's parents, delegation.ts). */
+  canUse(c: ServiceConnection, taskIds: string[], projectId: string) {
+    return (!!c.taskId && taskIds.includes(c.taskId)) || c.projectIds.includes(projectId);
+  }
+  /** A task and the tasks whose connections it uses, nearest first. */
+  private async taskChain(taskId: string): Promise<string[]> {
+    return [taskId, ...(await delegatingAncestors(this.store, taskId)).map((task) => task.id)];
   }
   async list(org: string, ctx: { ownerId?: string; taskId?: string; projectId?: string }) {
+    const chain = ctx.taskId ? await this.taskChain(ctx.taskId) : [];
     return (await this.all()).filter(c => c.organizationId === org && (ctx.taskId
-      ? this.canUse(c, ctx.taskId, ctx.projectId!) : c.ownerId === ctx.ownerId || (!!ctx.projectId && c.projectIds.includes(ctx.projectId)))).map(c => this.view(c));
+      ? this.canUse(c, chain, ctx.projectId!) : c.ownerId === ctx.ownerId || (!!ctx.projectId && c.projectIds.includes(ctx.projectId)))).map(c => this.view(c));
   }
   async pending(taskId: string) { return (await this.all()).filter(c => c.taskId === taskId && ['requested', 'connecting'].includes(c.status)); }
   async catalog(search = '') { return this.remote(async () => (await this.backend()).catalog(search.slice(0, 200))); }
@@ -207,6 +214,11 @@ export class ServiceConnections {
     (await this.store.lock(`service-connections:${org}:${taskId}`));
     const existing = (await this.all()).find(c => c.organizationId === org && c.toolkit === toolkit && c.taskId === taskId && !['disconnected', 'expired'].includes(c.status));
     if (existing) return existing;
+    // A sub-task uses the account its parent connected.
+    const ancestors = (await this.taskChain(taskId)).slice(1);
+    const inherited = (await this.all()).find(c => c.organizationId === org && c.toolkit === toolkit && c.status === 'active'
+      && !!c.taskId && ancestors.includes(c.taskId));
+    if (inherited) return inherited;
     return (await this.save({ id: newId('conn'), organizationId: org, toolkit, label: toolkit,
       taskId, role, why: why.slice(0, 2000), projectIds: [], status: 'requested', createdAt: Date.now(), updatedAt: Date.now() }));
       });
@@ -229,7 +241,9 @@ export class ServiceConnections {
       registry: { name: entry.name, version: entry.version } };
   }
   async requestMcp(org: string, server: Awaited<ReturnType<ServiceConnections['resolveMcp']>>, taskId: string, role: string, why: string) {
-    const open = async () => (await this.all()).find(c => c.organizationId === org && c.mcp?.url === server.transport.url && c.taskId === taskId && !['disconnected', 'expired'].includes(c.status));
+    const ancestors = (await this.taskChain(taskId)).slice(1);
+    const open = async () => (await this.all()).find(c => c.organizationId === org && c.mcp?.url === server.transport.url && c.taskId === taskId && !['disconnected', 'expired'].includes(c.status))
+      ?? (await this.all()).find(c => c.organizationId === org && c.mcp?.url === server.transport.url && c.status === 'active' && !!c.taskId && ancestors.includes(c.taskId));
     const prior = (await open());
     if (prior) return prior;
     let auth: McpServer['auth'];
@@ -398,7 +412,7 @@ export class ServiceConnections {
   private async authorized(org: string, id: string, taskId: string, projectId: string) {
     const c = (await this.get(org, id));
     if (!c.ownerId || !(await this.store.organizationMembership(org, c.ownerId))) throw new ConnectionError('The account owner is no longer a member of this organization', 403);
-    if (!this.canUse(c, taskId, projectId)) throw new ConnectionError('This account has not been shared with this task or project', 403);
+    if (!this.canUse(c, await this.taskChain(taskId), projectId)) throw new ConnectionError('This account has not been shared with this task or project', 403);
     const account = c.grantedConnectionId && c.status === 'active' ? (await this.get(org, c.grantedConnectionId)) : c;
     if (c.status !== 'active' || account.ownerId !== c.ownerId || account.status !== 'active' || !(account.mcp || account.sessionId))
       throw new ConnectionError('Reconnect this account in Connections before using it', 409);

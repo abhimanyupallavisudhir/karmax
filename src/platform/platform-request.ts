@@ -23,6 +23,12 @@ export const CREATE_TASK_GRANTS = 'Grant it what it needs: `authorization` {leve
   + 'What you cannot grant is not refused: the task is kept as a draft and the result names who can grant it; '
   + 'ask them with request_permission and its task id.';
 
+/** Whom request_permission asks (KarmaxApi.permissionGrantors), shared by both tool surfaces. */
+export const PERMISSION_ROUTING = 'Audience selectors: task:<id>, avatar:<id>, user:<id>, @team:<slug>, @creator, @maintainers, @admins, @superadmins, @owners, @project, or @all. '
+  + 'Omit audience to ask the nearest who can grant it: a task you act for that holds it (your parent, or the task whose agent created yours; its agent decides), '
+  + 'else the lowest of @maintainers, @admins and @superadmins that can. platform_request(GET, "/api/agent/escalation-targets?capabilities=<a,b>") lists '
+  + 'everyone who can, nearest first; the result names them too (canGrant). A sub-task already holds everything its parent does. ';
+
 /** request_permission's other use: asking for what a task you created is held for. */
 export const REQUEST_FOR_TASK = 'Pass a task id instead to ask for the authorization and credentials a task you created '
   + 'asked for but you could not grant; you keep working, and a draft starts once they are granted.';
