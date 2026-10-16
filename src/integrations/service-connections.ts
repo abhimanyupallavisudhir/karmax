@@ -16,6 +16,8 @@ const PREFIX = 'service-connection:';
 const MCP_CREDENTIALS = 'service-connection-mcp:';
 const KEY = 'service-connections:composio:api-key';
 const TTL = 30 * 60_000;
+/** A request still waiting on a person: before sign-in, or during it. */
+const OPEN: ServiceConnection['status'][] = ['requested', 'connecting'];
 export interface ServiceConnection {
   id: string;
   organizationId: string;
@@ -40,6 +42,8 @@ export interface ServiceConnection {
   /** Changes on every sign-in, so a stale OAuth exchange cannot overwrite it. */
   revision?: string;
   notifiedAt?: number;
+  /** An open request a person ignored: it no longer notifies anyone, but stays open. */
+  dismissed?: { by: string; at: number };
 }
 /** `github`: the server authorizes through GitHub, so the owner signs in with
  * the installation's GitHub App; `githubAccountId` pins the account used. */
@@ -177,7 +181,12 @@ export class ServiceConnections {
     if (!c || c.organizationId !== org) throw new ConnectionError('Connection not found', 404);
     return c;
   }
-  private async save(c: ServiceConnection) { c.updatedAt = Date.now(); (await this.store.kvSet(PREFIX + c.id, JSON.stringify(c))); return c; }
+  private async save(c: ServiceConnection) {
+    c.updatedAt = Date.now();
+    // Ignoring silences one open request; an account that later needs attention asks afresh.
+    if (!OPEN.includes(c.status)) delete c.dismissed;
+    (await this.store.kvSet(PREFIX + c.id, JSON.stringify(c))); return c;
+  }
   view(c: ServiceConnection) {
     const { accountId, sessionId, notifiedAt, ...view } = c;
     return { ...view, ...(c.status === 'disconnected' && accountId ? { disconnectPending: true } : {}) };
@@ -198,7 +207,7 @@ export class ServiceConnections {
     return (await this.all()).filter(c => c.organizationId === org && (ctx.taskId
       ? this.canUse(c, ctx.taskId, ctx.projectId!) : c.ownerId === ctx.ownerId || (!!ctx.projectId && c.projectIds.includes(ctx.projectId)))).map(c => this.view(c));
   }
-  async pending(taskId: string) { return (await this.all()).filter(c => c.taskId === taskId && ['requested', 'connecting'].includes(c.status)); }
+  async pending(taskId: string) { return (await this.all()).filter(c => c.taskId === taskId && OPEN.includes(c.status)); }
   async catalog(search = '') { return this.remote(async () => (await this.backend()).catalog(search.slice(0, 200))); }
   async request(org: string, toolkit: string, taskId: string, role: string, why: string) {
     return this.store.transaction(async () => {
@@ -378,6 +387,16 @@ export class ServiceConnections {
     c.projectIds = [...new Set(projectIds)];
     (await this.audit(c, ownerId, 'access-changed'));
     return this.view((await this.save(c)));
+    });
+  }
+  /** Silence an open request without answering it: the task keeps waiting. */
+  async dismiss(org: string, id: string, by: string) {
+    return this.locked(id, async () => {
+      const c = (await this.get(org, id));
+      if (!OPEN.includes(c.status)) throw new ConnectionError(`This connection is ${c.status}, not a request`);
+      c.dismissed ??= { by, at: Date.now() };
+      (await this.audit((await this.save(c)), by, 'dismissed'));
+      return this.view(c);
     });
   }
   async disconnect(org: string, id: string, ownerId: string) {

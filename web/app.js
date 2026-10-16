@@ -4383,8 +4383,8 @@ function inboxEventChanges(ev) {
   return ev.type.includes('escalat')
     || /(^|-)review-requested$/.test(ev.type.replace(/[._]/g, '-'))
     || ['task.responsibility-changed', 'task.assigned', 'task.mentioned',
-      'credential.approval-requested', 'credential.approval-resolved', 'connection.requested', 'connection.resolved',
-      'permission.approval-requested', 'permission.approval-resolved', 'permission.approval-dismissed',
+      'credential.approval-requested', 'credential.approval-resolved', 'credential.approval-dismissed',
+      'connection.requested', 'connection.resolved', 'connection.dismissed', 'permission.approval-requested', 'permission.approval-resolved', 'permission.approval-dismissed',
       'authorization.approval-requested', 'authorization.approval-resolved', 'authorization.approval-dismissed'].includes(ev.type);
 }
 let inboxRefreshTimer;
@@ -4728,6 +4728,7 @@ const LIST_RELOAD_EVENTS = new Set([
   'task.responsibility-changed',
   'credential.approval-requested', 'connection.requested',
   'credential.approval-resolved',
+  'credential.approval-dismissed', 'connection.dismissed',
   'permission.approval-requested',
   'permission.approval-resolved',
   'permission.approval-dismissed',
@@ -4804,7 +4805,7 @@ function patchSubTaskSummaryFromEvent(ev) {
 // An approval request carries no lifecycle fields to patch, and the child's
 // summary only learns its count from the server: refetch the open parent.
 function subTaskSummaryEventNeedsRefresh(ev) {
-  if (!/\.approval-(?:requested|resolved|dismissed)$|^connection\.(?:requested|resolved)$/.test(ev.type || '')) return false;
+  if (!/\.approval-(?:requested|resolved|dismissed)$|^connection\.(?:requested|resolved|dismissed)$/.test(ev.type || '')) return false;
   return (S.view?.subTaskSummaries || []).some((summary) => summary.id === ev.taskId);
 }
 
@@ -10935,10 +10936,18 @@ function taskRail(v, rec = taskRecord(v.taskId)) {
     ${renderWidgetGroups(S.widgets)}
     ${notesSection(v)}
     <div class="rail-links">
-      ${rec?.params?.draft ? '' : '<button type="button" class="btn tool rail-link" id="approval-history-open" title="Every app, credential and permission request this task raised">Approval requests</button>'}
+      ${rec?.params?.draft ? '' : approvalHistoryLink(v)}
       ${railTerminal(v)}
     </div>
   </div>`;
+}
+
+// The record of every request the task raised, with how many still wait on a
+// decision — ignored ones too: the agent waits on those all the same.
+function approvalHistoryLink(v) {
+  const pending = v.pendingDecisions || 0;
+  return `<button type="button" class="btn tool rail-link" id="approval-history-open" title="Every app, credential and permission request this task raised">Approval requests${pending
+    ? ` <span class="rail-link-count" aria-label="${pending} pending">${pending}</span>` : ''}</button>`;
 }
 
 // The shell, last in the rail: rarely needed. It shows in place of the
@@ -18457,12 +18466,13 @@ function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = 
     ? pending.map((request) => {
       const bound = request.itemId ? undefined : credentialRequestBindings.get(request.id);
       const unbound = !request.itemId && !bound;
-      return `<div class="approval-request" data-vreq="${esc(request.id)}"${bound ? ` data-vreq-item="${esc(bound.id)}"` : ''}>
+      return `<div class="approval-request${request.dismissed ? ' approval-request-dismissed' : ''}" data-vreq="${esc(request.id)}"${bound ? ` data-vreq-item="${esc(bound.id)}"` : ''}>
         <div class="approval-request-main">
           <div class="approval-request-title">${request.itemId
             ? esc(itemLabel(request.itemId))
             : `${esc(request.domain || '?')} <span class="chip approval-needed">not in vault</span>`}
             ${request.kind === 'reset' ? '<span class="chip approval-needed">reported invalid</span>' : `<span class="chip">${esc(request.mode)}</span>`}
+            ${request.dismissed ? ignoredChip() : ''}
           </div>
           <div class="task-sub">${credentialRequestTaskLink(request)}${request.why ? ` — ${esc(request.why)}` : ''}</div>
           ${request.kind === 'reset' ? `<div class="approval-request-help">The stored secret failed. Update it or send the task a reset code, then approve; ${siteNameMarkup()} will resume the agent automatically.</div>`
@@ -18476,6 +18486,7 @@ function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = 
           <button class="btn sm" data-vreq-act="task" ${unbound ? 'disabled' : ''}>This task</button>
           <button class="btn sm" data-vreq-act="always" ${unbound ? 'disabled' : ''}>Always</button>
           <button class="btn sm" data-vreq-act="deny">Deny</button>
+          ${request.dismissed ? '' : ignoreRequestButton('data-vreq-act')}
           ${policyTip(`Once: ${({
             passkey: 'Loads this passkey into the agent\'s browser for one sign-in session, up to 3 minutes. The agent can use it on the site until then.',
             session: 'Signs the agent\'s browser into this site once. It stays signed in until the site ends the session.',
@@ -18505,7 +18516,7 @@ function permissionRequestRows(requests, { historyLimit = 20 } = {}) {
   const pendingHtml = pending.map((request) => `<div class="approval-request${request.dismissed ? ' approval-request-dismissed' : ''}" data-preq="${esc(request.id)}">
     <div class="approval-request-main">
       <div class="approval-request-title">${esc(request.role || 'task')} agent permission
-        ${request.dismissed ? '<span class="chip">dismissed</span>' : '<span class="chip approval-needed">approval needed</span>'}
+        ${request.dismissed ? ignoredChip() : '<span class="chip approval-needed">approval needed</span>'}
       </div>
       <div class="approval-request-caps">${request.capabilities.map((capability) =>
         `<span class="chip mono">${esc(capability)}</span>`).join(' ')}</div>
@@ -18516,7 +18527,7 @@ function permissionRequestRows(requests, { historyLimit = 20 } = {}) {
     <div class="approval-request-actions">
       <button class="btn sm primary" data-preq-act="approve">Approve for agent</button>
       <button class="btn sm" data-preq-act="deny">Deny</button>
-      ${!request.dismissed ? '<button class="btn sm" data-preq-act="dismiss" aria-label="Dismiss request" title="Dismiss without notifying the agent">×</button>' : ''}
+      ${request.dismissed ? '' : ignoreRequestButton('data-preq-act')}
     </div>
   </div>`).join('');
   const history = recent.length
@@ -18537,7 +18548,7 @@ function authorizationRequestRows(requests, { historyLimit = 20 } = {}) {
     return `<div class="approval-request${request.dismissed ? ' approval-request-dismissed' : ''}" data-areq="${esc(request.id)}">
     <div class="approval-request-main">
       <div class="approval-request-title">${request.target.kind === 'avatar' ? 'Avatar' : 'Task agent'} authorization
-        ${request.dismissed ? '<span class="chip">dismissed</span>' : '<span class="chip approval-needed">approval needed</span>'}
+        ${request.dismissed ? ignoredChip() : '<span class="chip approval-needed">approval needed</span>'}
       </div>
       <div class="approval-request-caps"><span class="chip">${esc(authorizationSummary(request.authorization,
         S.projects.filter((project) => project.organizationId === request.organizationId)))}</span></div>
@@ -18547,7 +18558,7 @@ function authorizationRequestRows(requests, { historyLimit = 20 } = {}) {
     <div class="approval-request-actions">
       ${canResolve ? '<button class="btn sm primary" data-areq-act="approve">Approve authorization</button><button class="btn sm" data-areq-act="deny">Deny</button>'
         : '<span class="task-sub">Awaiting a routed approver</span>'}
-      ${canResolve && !request.dismissed ? '<button class="btn sm" data-areq-act="dismiss" aria-label="Dismiss request" title="Dismiss without notifying the agent">×</button>' : ''}
+      ${canResolve && !request.dismissed ? ignoreRequestButton('data-areq-act') : ''}
     </div>
   </div>`;
   }).join('');
@@ -18567,7 +18578,7 @@ function wireAuthorizationRequestActions(root, organizationId, onResolved) {
         const result = await api(`/api/authorization-requests/${row.dataset.areq}/resolve?organizationId=${encodeURIComponent(organizationId || '')}`, {
           method: 'POST', body: JSON.stringify({ action: button.dataset.areqAct }),
         });
-        toast(button.dataset.areqAct === 'dismiss' ? 'Request dismissed' : button.dataset.areqAct === 'deny' ? 'Authorization denied'
+        toast(button.dataset.areqAct === 'dismiss' ? 'Request ignored' : button.dataset.areqAct === 'deny' ? 'Authorization denied'
           : result.queued ? 'Approved — task queued' : 'Authorization approved');
         await onResolved?.(result);
       } catch (error) { button.disabled = false; toast(error.message, true); }
@@ -18584,7 +18595,7 @@ function wirePermissionRequestActions(root, organizationId, onResolved) {
           method: 'POST',
           body: JSON.stringify({ action: button.dataset.preqAct }),
         });
-        const decision = button.dataset.preqAct === 'dismiss' ? 'Request dismissed' : button.dataset.preqAct === 'deny' ? 'Denied' : 'Approved';
+        const decision = button.dataset.preqAct === 'dismiss' ? 'Request ignored' : button.dataset.preqAct === 'deny' ? 'Denied' : 'Approved';
         toast(button.dataset.preqAct === 'dismiss' ? decision : result.resume?.resumed ? `${decision} — task resumed automatically`
           : `${decision}${result.resume?.reason ? ` — ${result.resume.reason}` : ''}`,
         button.dataset.preqAct !== 'dismiss' && !result.resume?.resumed && !!result.resume?.reason);
@@ -18625,6 +18636,11 @@ function wireCredentialRequestActions(root, organizationId, onResolved) {
         method: 'POST',
         body: JSON.stringify({ action: button.dataset.vreqAct, itemId }),
       });
+      if (button.dataset.vreqAct === 'dismiss') {
+        toast('Request ignored');
+        await onResolved?.(result);
+        return;
+      }
       credentialRequestBindings.delete(row.dataset.vreq);
       const decision = button.dataset.vreqAct === 'deny' ? 'Denied' : 'Granted';
       toast(result.resume?.resumed ? `${decision} — task resumed automatically`
@@ -18668,8 +18684,9 @@ function connectionRows(connections, inTask = false) {
     const accountNames = connectionAccountNames(reusable);
     const status = { requested: c.reusable?.length ? 'access requested' : 'sign-in needed', connecting: 'waiting for sign-in', active: 'connected', expired: 'reconnect needed', disconnected: 'disconnected', denied: 'declined' }[c.status] || c.status;
     const projects = S.projects.filter(p => p.organizationId === c.organizationId);
-    return `<div class="approval-request" data-connection="${esc(c.id)}">
-      <div class="approval-request-main"><div class="approval-request-title">${esc(c.label)} <span class="chip">${esc(status)}</span></div>
+    const open = ['requested', 'connecting'].includes(c.status);
+    return `<div class="approval-request${open && c.dismissed ? ' approval-request-dismissed' : ''}" data-connection="${esc(c.id)}">
+      <div class="approval-request-main"><div class="approval-request-title">${esc(c.label)} <span class="chip">${esc(status)}</span>${open && c.dismissed ? ` ${ignoredChip()}` : ''}</div>
         ${c.why && inTask ? `<p class="task-sub">${esc(c.why)}</p>` : ''}
         <p class="task-sub">${c.taskId ? 'This account may be used by the requesting task.' : 'Private until you share it with a project.'}</p>
         ${own && !inTask ? `<details><summary>Project access</summary><p class="task-sub">Selected projects may run app actions using this account, within the permissions you granted at sign-in.</p>
@@ -18683,8 +18700,19 @@ function connectionRows(connections, inTask = false) {
         ${own && c.status === 'connecting' ? '<button type="button" class="btn sm" data-connection-action="restart">Start again</button>' : ''}
         ${own && !c.grantedConnectionId && ['active', 'connecting'].includes(c.status) ? '<button type="button" class="btn sm" data-connection-action="refresh">Check status</button>' : ''}
         ${canConnect && (c.status !== 'disconnected' || c.disconnectPending) ? `<button type="button" class="btn sm" data-connection-action="disconnect">${c.disconnectPending ? 'Retry disconnect' : c.grantedConnectionId ? 'Revoke' : c.ownerId ? 'Disconnect' : 'Decline'}</button>` : ''}
+        ${canConnect && inTask && open && !c.dismissed ? ignoreRequestButton('data-connection-action') : ''}
       </div></div>`;
   }).join('');
+}
+
+// Ignoring a request silences it — no inbox row, alert or "approval needed"
+// badge — without answering it: the agent keeps waiting, and the request stays
+// in Approval requests (and the rail's count) until someone decides it.
+function ignoredChip() {
+  return '<span class="chip">ignored</span>';
+}
+function ignoreRequestButton(attribute) {
+  return `<button type="button" class="btn sm" ${attribute}="dismiss" aria-label="Ignore request" title="Ignore: no more notifications. It stays in Approval requests.">×</button>`;
 }
 
 /** Distinct names for a person's accounts of one app: its name, then when each was connected. */
@@ -18730,6 +18758,7 @@ function wireConnectionActions(root, organizationId, refresh) {
       } else {
         const body = action === 'access' ? { projectIds: [...row.querySelectorAll('input:checked')].map(input => input.value) } : {};
         await api(`/api/connections/${encodeURIComponent(id)}/${action}${oq}`, { method: action === 'access' ? 'PUT' : 'POST', body: JSON.stringify(body) });
+        if (action === 'dismiss') toast('Request ignored');
         await refresh();
       }
     } catch (e) { popup?.close(); toast(e.message, true); }

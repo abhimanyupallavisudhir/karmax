@@ -366,6 +366,39 @@ describe('gateway request scope for bare-id routes', () => {
       .toEqual(['settings:read']);
   });
 
+  it('dismisses a credential request: silent, still pending, and not by the asking agent', async () => {
+    const task = (await store.createTask({ projectId: mine, title: 'Log in', workflow: 'software-dev',
+      workflowVersion: '1.9.0', params: { prompt: 'log in' }, createdBy: { kind: 'user', userId: 'a' } }));
+    (await store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'do',
+      status: 'active', messages: [], actions: [], state: {}, updatedAt: Date.now() }));
+    liveView = (await store.getTask(task.id))!.lastView;
+    const agent = (await tokens.mint({ taskId: task.id, profileId: 'do-default', role: 'do', principal: 'user:a',
+      projectId: mine, organizationId: acmeId, ceiling: ['credential:read', 'credential:write'],
+      grantorCaps: ['credential:read', 'credential:write'] })).token;
+    const requested: any = await (await fetch(`${base}/api/vault/requests?organizationId=${acmeId}`, {
+      method: 'POST', headers: { authorization: `Bearer ${agent}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ domain: 'example.com', why: 'log in' }),
+    })).json();
+    expect(requested).toMatchObject({ status: 'not_in_vault', requestId: expect.any(String) });
+    const resolve = (bearer: string) => fetch(`${base}/api/vault/requests/${requested.requestId}/resolve?organizationId=${acmeId}`,
+      { method: 'POST', headers: { authorization: `Bearer ${bearer}`, 'content-type': 'application/json' }, body: JSON.stringify({ action: 'dismiss' }) });
+    const own = await resolve(agent);
+    expect(own.status).toBe(403);
+    expect(await own.json()).toMatchObject({ error: 'an agent cannot dismiss its own request' });
+
+    const approver = (await tokens.mintPrincipal('user:a', ['task:read', 'credential:write'], mine, 60_000, acmeId)).token;
+    const viewUrl = `${base}/api/tasks/${task.id}`;
+    const headers = { authorization: `Bearer ${approver}` };
+    expect(await (await fetch(viewUrl, { headers })).json()).toMatchObject({ approvalRequests: 1, pendingDecisions: 1 });
+    const dismissed = await resolve(approver);
+    expect(dismissed.status).toBe(200);
+    expect(await dismissed.json()).toMatchObject({ status: 'pending', dismissed: { by: 'user:a' } });
+    const after = await (await fetch(viewUrl, { headers })).json();
+    expect(after).not.toHaveProperty('approvalRequests');
+    expect(after).toMatchObject({ pendingDecisions: 1 });
+    expect((await store.eventsOfType(task.id, 'credential.approval-dismissed'))).toHaveLength(1);
+  });
+
   // A child paused on an approval request read "Paused until …" in its parent's
   // Sub-tasks panel while the task list flagged it "approval needed": the
   // parent's summaries must carry the same pending-approval count.

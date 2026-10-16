@@ -855,6 +855,7 @@ a.git-repo-name:hover { color:var(--accent); }
 #task-notes:focus { background: var(--surface); }
 .rail-links { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: 10px 12px 0; border-top: 1px solid var(--line); }
 .rail-link { justify-content: flex-start; }
+.rail-link-count { font-family: var(--font-mono); font-size: 11px; color: var(--ink-3); }
 /* The shell, last: a quiet row like the links above it. */
 .rail-links .ck-terminal-item { align-self: stretch; margin: 0; border-radius: var(--r-sm); font-size: 12.5px; }
 .rail-links .ck-terminal-open { padding: 5px 6px 5px 4px; }

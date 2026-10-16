@@ -202,6 +202,18 @@ const PRUNE_OUTPUT_STATUS = new Set<string>(['done', 'cancelled']);
  */
 const WITHDRAW_REQUESTS_STATUS = new Set<string>(['done', 'cancelled']);
 
+/** Approval asks, the events that decide them, and the events that only silence
+ * them (a person ignored the ask; the task still waits on it). As SQL lists. */
+const sqlList = (types: string[]) => types.map((type) => `'${type}'`).join(', ');
+const APPROVAL_ASKS = sqlList(['credential.approval-requested', 'permission.approval-requested',
+  'authorization.approval-requested', 'connection.requested']);
+const APPROVAL_DECISION_TYPES = ['credential.approval-resolved', 'connection.resolved',
+  'permission.approval-resolved', 'authorization.approval-resolved'];
+const APPROVAL_DISMISSAL_TYPES = ['credential.approval-dismissed', 'permission.approval-dismissed',
+  'authorization.approval-dismissed', 'connection.dismissed'];
+const APPROVAL_DECISIONS = sqlList(APPROVAL_DECISION_TYPES);
+const APPROVAL_SILENCERS = sqlList([...APPROVAL_DECISION_TYPES, ...APPROVAL_DISMISSAL_TYPES]);
+
 /**
  * Does an event type mean "a human is being asked to review this"? Such events
  * are routed to the review audience as an ACTIONABLE inbox item.
@@ -5361,12 +5373,11 @@ export class Store {
   /** Approval asks on a task that no `*.approval-resolved` event has answered. */
   private async hasPendingApprovals(taskId: string, includeDismissed = false): Promise<boolean> {
     return Boolean((await this.db.prepare(`SELECT 1 FROM events e
-      WHERE e.taskId=? AND e.type IN ('credential.approval-requested', 'permission.approval-requested', 'authorization.approval-requested', 'connection.requested')
+      WHERE e.taskId=? AND e.type IN (${APPROVAL_ASKS})
         AND NOT EXISTS (SELECT 1 FROM events r WHERE r.taskId=e.taskId
-          AND r.type IN ('credential.approval-resolved', 'connection.resolved', 'permission.approval-resolved', 'authorization.approval-resolved', 'permission.approval-dismissed', 'authorization.approval-dismissed')
-          AND (?=0 OR r.type NOT IN ('permission.approval-dismissed', 'authorization.approval-dismissed'))
+          AND r.type IN (${includeDismissed ? APPROVAL_DECISIONS : APPROVAL_SILENCERS})
           AND json_extract(r.payload, '$.requestId') = json_extract(e.payload, '$.requestId'))
-      LIMIT 1`).get(taskId, includeDismissed ? 1 : 0)));
+      LIMIT 1`).get(taskId)));
   }
 
   /**
@@ -5399,9 +5410,7 @@ export class Store {
     const escalated = ev.type === 'view.updated' && ev.payload.stage === 'escalated' && !finished;
 
     // ── Discharge: drop what the task no longer needs from anybody ───────────
-    if (ev.type === 'credential.approval-resolved' || ev.type === 'connection.resolved' || ev.type === 'permission.approval-resolved'
-      || ev.type === 'authorization.approval-resolved' || ev.type === 'permission.approval-dismissed'
-      || ev.type === 'authorization.approval-dismissed') {
+    if (APPROVAL_DECISION_TYPES.includes(ev.type) || APPROVAL_DISMISSAL_TYPES.includes(ev.type)) {
       if (!(await this.hasPendingApprovals(task.id))) (await this.deleteInbox("taskId=? AND kind='approval-requested'", [task.id]));
       return;
     }
@@ -5541,9 +5550,9 @@ export class Store {
     if ((await this.db.prepare("SELECT 1 FROM inbox WHERE kind='approval-requested' LIMIT 1").get())) {
       dropped += (await this.deleteInbox(`subject IS NULL AND kind='approval-requested' AND taskId NOT IN (
         SELECT e.taskId FROM events e
-        WHERE e.type IN ('credential.approval-requested', 'permission.approval-requested', 'authorization.approval-requested', 'connection.requested')
+        WHERE e.type IN (${APPROVAL_ASKS})
           AND NOT EXISTS (SELECT 1 FROM events r WHERE r.taskId=e.taskId
-            AND r.type IN ('credential.approval-resolved', 'connection.resolved', 'permission.approval-resolved', 'authorization.approval-resolved', 'permission.approval-dismissed', 'authorization.approval-dismissed')
+            AND r.type IN (${APPROVAL_SILENCERS})
             AND json_extract(r.payload, '$.requestId') = json_extract(e.payload, '$.requestId')))`, []));
     }
     (await this.backfillEscalations());
@@ -9751,12 +9760,10 @@ export class Store {
       viewSnapshots, publicationFences, turnSessions, permissionRequests,
       events: Number((await this.db.prepare(`DELETE FROM events WHERE seq IN
         (SELECT e.seq FROM events e WHERE e.ts<?
-          AND (e.type NOT IN ('credential.approval-requested', 'permission.approval-requested',
-            'authorization.approval-requested', 'connection.requested')
+          -- An ignored ask is still pending, so only a decision lets it age out.
+          AND (e.type NOT IN (${APPROVAL_ASKS})
             OR EXISTS (SELECT 1 FROM events r WHERE r.taskId=e.taskId
-              AND r.type IN ('credential.approval-resolved', 'permission.approval-resolved',
-                'authorization.approval-resolved', 'connection.resolved',
-                'permission.approval-dismissed', 'authorization.approval-dismissed')
+              AND r.type IN (${APPROVAL_DECISIONS})
               AND json_extract(r.payload, '$.requestId')=json_extract(e.payload, '$.requestId')))
           -- The newest published head per repository is state: force-with-lease
           -- reads it (expectedTaskRemoteHeads), however long the task was idle (audit R-8).
