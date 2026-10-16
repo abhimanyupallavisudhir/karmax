@@ -6,6 +6,7 @@ import type { ProviderUsageEvent, WorldLifecycleState } from './types.js';
 import { runDetached, type VmAllocation, type VmBootKeys, type VmDriver, type VmListing, type VmShape } from './vm/provider.js';
 import { VM_ETC, VM_SSH_PORT, VM_USER, vmBootScript, vmProvisionScript, vmProvisionStamp, vmProvisionVersion } from './vm/provision.js';
 import { generateSshKeyPair, quote, SshTransport } from './vm/ssh.js';
+import { ProviderCapacityFull } from '../agent/limits.js';
 
 /**
  * Hetzner Cloud servers as VM worlds (`vm/provider.ts`). The world's files
@@ -267,14 +268,40 @@ export class HetznerDriver implements VmDriver {
     const snapshot = await this.snapshot(connection);
     if (!snapshot) this.buildSnapshot(connection);
     const [firewall, sshKey] = await Promise.all([this.firewall(connection), this.rootKey(connection)]);
-    const created = await api('POST', '/servers', {
+    const create = () => api('POST', '/servers', {
       name: ref.world, server_type: type.name, location: ref.location, image: snapshot ?? connection.config.image ?? HETZNER_DEFAULT_IMAGE,
       labels: withoutParked(labels), volumes: [volume.id], automount: false, start_after_create: true,
       firewalls: [{ firewall: firewall }], ssh_keys: [sshKey], public_net: { enable_ipv4: true, enable_ipv6: true },
       user_data: cloudInit(keys, volume.linux_device ?? `/dev/disk/by-id/scsi-0HC_Volume_${volume.id}`),
-    }) as { server: Server; action: { id: number } };
+    }) as Promise<{ server: Server; action: { id: number } }>;
+    let created: { server: Server; action: { id: number } };
+    try { created = await create(); }
+    catch (error) {
+      const limit = projectLimit(error);
+      if (!limit) throw error;
+      // A parked server waits out its paid hour for a free wake, yet holds its
+      // CPUs against the project's limit: give them to a world that runs now.
+      const parked = (await this.servers(connection, `karmaxHome=${labels.karmaxHome},karmaxParkedAt`))
+        .filter((server) => server.status === 'off');
+      for (const server of parked) await this.deleteServer(connection, server);
+      try { created = await create(); }
+      catch (again) { throw projectLimit(again) ? await this.limitFull(connection, type, projectLimit(again)!, again) : again; }
+    }
     await this.waitAction(connection, created.action.id);
     return created.server;
+  }
+
+  /** What a full project limit is, what holds it, and what a person can do. */
+  private async limitFull(connection: ResolvedWorldProviderConnection, type: ServerType, limit: string, cause: unknown): Promise<ProviderCapacityFull> {
+    const servers = await this.servers(connection).catch(() => [] as Server[]);
+    const cores = limit === 'server_dedicated_cores_limit' ? 'dedicated' : limit === 'server_shared_cores_limit' ? 'shared' : undefined;
+    const holding = cores ? servers.filter((server) => server.server_type.cpu_type === cores) : servers;
+    const inUse = holding.reduce((sum, server) => sum + server.server_type.cores, 0);
+    const what = cores ? `limit on ${cores} CPUs is full, with ${inUse} in use by ${holding.length} other server${holding.length === 1 ? '' : 's'}`
+      : `${limit.replace(/_/g, ' ')} is reached, with ${servers.length} server${servers.length === 1 ? '' : 's'}`;
+    return new ProviderCapacityFull(`Hetzner refused a ${type.cores}-CPU server: this Hetzner project's ${what}. `
+      + 'tavya keeps retrying for about 20 minutes; to start sooner, give this task fewer CPUs, stop another task, '
+      + 'or ask Hetzner to raise the limit (Hetzner Console → Limits).', { cause });
   }
 
   /** The server type for a shape: cheapest current x86 type at the location that covers it. */
@@ -307,7 +334,7 @@ export class HetznerDriver implements VmDriver {
     })) as { server?: Server }).server;
   }
 
-  private servers(connection: ResolvedWorldProviderConnection, selector: string): Promise<Server[]> {
+  private servers(connection: ResolvedWorldProviderConnection, selector?: string): Promise<Server[]> {
     return this.pages<Server>(connection, '/servers', 'servers', selector);
   }
 
@@ -507,14 +534,25 @@ export class HetznerDriver implements VmDriver {
           await new Promise((resolve) => setTimeout(resolve, 1_000 * (attempt + 1)));
           continue;
         }
-        throw new HetznerError(`Hetzner ${method} ${path.split('?')[0]} failed (${response.status}): ${detail}`, response.status);
+        throw new HetznerError(`Hetzner ${method} ${path.split('?')[0]} failed (${response.status}): ${detail}`, response.status, detail);
       }
     };
   }
 }
 
 export class HetznerError extends Error {
-  constructor(message: string, readonly status?: number) { super(message); this.name = 'HetznerError'; }
+  constructor(message: string, readonly status?: number, readonly body?: string) { super(message); this.name = 'HetznerError'; }
+}
+
+/** The project limit a refusal names (`server_shared_cores_limit`…), when
+ * Hetzner refused because one is reached. */
+function projectLimit(error: unknown): string | undefined {
+  if (!(error instanceof HetznerError) || error.status !== 403 || !error.body) return undefined;
+  try {
+    const refusal = JSON.parse(error.body) as { error?: { code?: string; details?: { limits?: Array<{ name?: string }> } } };
+    if (refusal.error?.code !== 'resource_limit_exceeded') return undefined;
+    return refusal.error.details?.limits?.[0]?.name ?? 'resource limit';
+  } catch { return undefined; }
 }
 
 /** cloud-init for every server: the boot script (run at every boot), its keys and the volume's device. */

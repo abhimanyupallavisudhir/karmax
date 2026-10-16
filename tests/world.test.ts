@@ -18,6 +18,7 @@ import { LocalObjectStore } from '../src/store/objects.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { CredentialBroker } from '../src/autonomy/broker.js';
 import { INSTALLATION_SCOPE } from '../src/autonomy/vault-keys.js';
+import { ProviderCapacityFull } from '../src/agent/limits.js';
 
 describe('WorktreeProvider (real git)', () => {
   let home: string;
@@ -69,6 +70,28 @@ describe('WorktreeProvider (real git)', () => {
         target: 'main', kind: 'fake-remote' as any }).catch((error) => error);
       expect(failure).toBeInstanceOf(ApplicationFailure);
       expect(failure).toMatchObject({ type: 'world-infra', nonRetryable: false });
+    } finally {
+      (await store.close());
+    }
+  });
+
+  it('tags a full provider limit as a wait, keeping what holds it (pramana#58)', async () => {
+    const store = (await Store.create(':memory:'));
+    const worlds = new WorldRegistry();
+    const full = 'Hetzner refused an 8-CPU server: this Hetzner project\'s limit on shared CPUs is full, with 16 in use by 2 other servers.';
+    worlds.register({
+      kind: 'fake-remote',
+      capabilities: { remote: true },
+      async create() { throw new ProviderCapacityFull(full); },
+      async open() { throw new Error('unused'); },
+      async destroy() {},
+    } as any);
+    const core = makeCoreActivities({ store, worlds, adapters: new Map(),
+      profiles: new ProfileResolver(store, 'mock') });
+    try {
+      const failure = await core.createWorld({ taskId: 'limit-full', base: 'main',
+        target: 'main', kind: 'fake-remote' as any }).catch((error) => error);
+      expect(failure).toMatchObject({ type: 'world-infra', nonRetryable: false, message: full });
     } finally {
       (await store.close());
     }

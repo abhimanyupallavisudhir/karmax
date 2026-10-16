@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { cloudInit, HetznerDriver, paidMsLeft } from '../src/world/hetzner.js';
+import { isTransportError, ProviderCapacityFull } from '../src/agent/limits.js';
 import { VmWorldProvider } from '../src/world/vm/provider.js';
 import type { ResolvedWorldProviderConnection } from '../src/world/connections.js';
 import type { WorldHandle } from '../src/world/types.js';
@@ -206,6 +207,34 @@ describe.skipIf(!sshdAvailable)('Hetzner worlds (fake Cloud API, real sshd)', ()
     await Promise.all(['task_a', 'task_b', 'task_c'].map((taskId) =>
       provider.create({ taskId, base: 'main', generation: 1, organizationId: 'org_h' })));
     expect([hetzner.firewalls.length, hetzner.sshKeys.length]).toEqual([1, 1]);
+  });
+
+  it('frees parked servers when the project\'s shared vCPU limit refuses a new one (pramana#58)', async () => {
+    hetzner.sharedCoresLimit = 4;
+    const parked = await provider.create({ taskId: 'task_parked', base: 'main', generation: 1, organizationId: 'org_h' });
+    await provider.park(parked.handle as WorldHandle);
+    // Off but kept for a free wake within its paid hour, it still holds 2 of the 4 cores.
+    expect([...hetzner.servers.values()]).toEqual([expect.objectContaining({ status: 'off' })]);
+    const world = await provider.create({ taskId: 'task_big', base: 'main', generation: 1, organizationId: 'org_h', resources: { cpu: 4, memoryMb: 8192 } });
+    expect([...hetzner.servers.values()].map((server) => server.server_type.name)).toEqual(['cpx31']);
+    expect((await world.exec('sh', ['-c', 'echo ok'])).stdout).toBe('ok\n');
+    // The parked world wakes on a new server later, as after its paid hour.
+    expect(await provider.probe(parked.handle as WorldHandle)).toBe('parked');
+  });
+
+  it('says what holds a full shared vCPU limit, as a wait rather than a failure (pramana#58)', async () => {
+    hetzner.sharedCoresLimit = 4;
+    await provider.create({ taskId: 'task_busy', base: 'main', generation: 1, organizationId: 'org_h' });
+    const refused = await provider.create({ taskId: 'task_big', base: 'main', generation: 1, organizationId: 'org_h',
+      resources: { cpu: 4, memoryMb: 8192 } }).then(() => undefined, (error: unknown) => error);
+    expect(refused).toBeInstanceOf(ProviderCapacityFull);
+    // Setup waits it out like an outage (world-infra) instead of asking a person at once.
+    expect(isTransportError(refused)).toBe(true);
+    expect((refused as Error).message).toBe('Hetzner refused a 4-CPU server: this Hetzner project\'s limit on shared CPUs is full, '
+      + 'with 2 in use by 1 other server. tavya keeps retrying for about 20 minutes; to start sooner, give this task fewer CPUs, '
+      + 'stop another task, or ask Hetzner to raise the limit (Hetzner Console → Limits).');
+    // Nothing of the refused world is left behind.
+    expect([hetzner.servers.size, hetzner.volumes.size]).toEqual([1, 1]);
   });
 
   it('boots new servers from the provisioned snapshot once one exists', async () => {
