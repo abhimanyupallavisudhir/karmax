@@ -162,7 +162,7 @@ export async function saveParts(restic: ResticResources, place: { world: World; 
       { ...options, key: `${options.key}:${name}`, ...(prior ? { parent: prior.snapshot } : {}) });
     if (prior) {
       const changes = await restic.diff(repository, prior.snapshot, capture.snapshot);
-      if (changes.added + changes.modified + changes.deleted === 0) { await restic.forget(repository, [capture.snapshot]); continue; }
+      if (changes.added + changes.modified + changes.deleted === 0) { await restic.discard(repository, [capture.snapshot]); continue; }
     }
     parts[name] = { snapshot: capture.snapshot, files: capture.files, bytes: capture.bytes };
     fresh.push(capture.snapshot);

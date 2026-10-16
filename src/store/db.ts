@@ -7343,6 +7343,15 @@ export class Store {
   }
 
   /** True when the file was there to delete. */
+  /** Remove a repository's lock files not rewritten since `before`: restic
+   * refreshes a live lock every 5 minutes and counts one 30 minutes old as
+   * stale, yet still refuses to work beside it until `restic unlock`. */
+  async expireRepositoryLocks(repository: string, before: number): Promise<number> {
+    const result = (await this.db.prepare("DELETE FROM resource_repository_files WHERE repository=? AND kind='locks' AND createdAt < ?")
+      .run(repository, before)) as { changes?: number };
+    return Number(result?.changes ?? 0);
+  }
+
   async deleteRepositoryFile(repository: string, kind: string, name: string): Promise<boolean> {
     const result = (await this.db.prepare('DELETE FROM resource_repository_files WHERE repository=? AND kind=? AND name=?')
       .run(repository, kind, name)) as { changes?: number };

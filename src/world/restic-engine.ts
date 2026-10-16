@@ -178,6 +178,16 @@ const INIT_STALE_MS = 2 * 60_000;
 const SAVE_RENEW_MS = 20_000;
 const SAVE_STALE_MS = 2 * 60_000;
 const SAVE_POLL_MS = 1_000;
+/** How long a command that takes restic's repository lock waits for one held
+ * by another (`--retry-lock`). A save waits out upkeep's forget or prune, and
+ * a lock its holder died with, which the server expires (resource-repository.ts
+ * `STALE_LOCK_MS`). Without it, any overlap failed the save with exit 11. */
+const SAVE_LOCK_WAIT = '1h';
+/** Upkeep gives way instead: it runs again within the hour. */
+const UPKEEP_LOCK_WAIT = '1m';
+/** Snapshots a save made that no version came to name, forgotten by upkeep
+ * ({@link ResticResources.forgetDiscarded}): `restic-discard:<repository>:<snapshot>`. */
+const DISCARD_PREFIX = 'restic-discard:';
 const HOST_CORES = Math.max(1, Math.min(2, Math.floor(os.cpus().length / 2)));
 
 export class ResticResources {
@@ -228,7 +238,7 @@ export class ResticResources {
         });
       const settled = await this.backupOnce(place, attachment, { ...options, parent: summary.snapshot, dryRun: true, key: `${options.key}:${round}:check` });
       if (!settled.changed) {
-        if (superseded.length) await this.forget(attachment, superseded);
+        if (superseded.length) await this.discard(attachment, superseded);
         // The finished figures, also for a save shorter than restic's progress interval.
         options.onProgress?.({ files: summary.files, totalFiles: summary.files, bytes: summary.bytes, totalBytes: summary.bytes });
         return { snapshot: summary.snapshot, files: summary.files, bytes: summary.bytes, added: summary.added };
@@ -241,7 +251,7 @@ export class ResticResources {
     }
     // What changed from each save to the next is what something kept writing.
     const changing = await this.changedBetween(attachment, superseded).catch(() => ({ paths: [], total: 0 }));
-    await this.forget(attachment, superseded);
+    await this.discard(attachment, superseded);
     throw new ResourceKeptChangingError(path.posix.basename(place.path), changing.paths, changing.total);
   }
 
@@ -377,7 +387,7 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
       const rewrite = async (name: string, filter: string[]) => {
         // A part that is already the whole snapshot is not rewritten: restic says so.
         if ((name === ROOT_PART ? !folders.length : !loose && folders.length === 1)) { made.push({ name, snapshot }); return; }
-        const run = await this.onHost(repository, 'append', false, ['rewrite', snapshot, ...filter, '-v'], { key: 'host' });
+        const run = await this.onHost(repository, 'append', false, ['rewrite', snapshot, ...filter, '-v', '--retry-lock', SAVE_LOCK_WAIT], { key: 'host' });
         if (run.code !== 0) throw resticFailure(run, 'splitting the resource into parts');
         const short = /saved new snapshot ([0-9a-f]{8,64})/.exec(`${run.stdout}\n${run.stderr}`)?.[1];
         if (!short) { made.push({ name, snapshot }); return; }
@@ -398,7 +408,7 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
       const totals = await this.snapshotTotals(repository, [...new Set(made.map((part) => part.snapshot))]);
       return { parts: Object.fromEntries(made.map((part) => [part.name, { snapshot: part.snapshot, ...totals.get(part.snapshot)! }])), fresh };
     } catch (error) {
-      await this.forget(repository, fresh).catch(() => undefined);
+      await this.discard(repository, fresh);
       throw error;
     } finally { fs.rmSync(scratch, { recursive: true, force: true }); }
   }
@@ -638,21 +648,69 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
     });
   }
 
-  /** Drop snapshots; their data goes with the next {@link prune}. */
-  async forget(attachment: Repository, snapshots: string[]): Promise<void> {
+  /** Drop snapshots now; their data goes with the next {@link prune}.
+   * Forgetting needs restic's exclusive lock, which any save in progress
+   * holds a share of, so only upkeep and a person's deletion call this: work
+   * that merely made a snapshot it no longer needs {@link discard}s it. */
+  async forget(attachment: Repository, snapshots: string[]): Promise<number> {
     const present = new Set((await this.deps.store.listRepositoryFiles(attachment.name, 'snapshots')).map((file) => file.name));
-    const gone = snapshots.filter((snapshot) => present.has(snapshot));
-    if (!gone.length) return;
-    const run = await this.onHost(attachment, 'admin', false, ['forget', '--json', ...gone], { key: 'host' });
+    const gone = [...new Set(snapshots)].filter((snapshot) => present.has(snapshot));
+    if (!gone.length) return 0;
+    const run = await this.onHost(attachment, 'admin', false, ['forget', '--json', '--retry-lock', UPKEEP_LOCK_WAIT, ...gone], { key: 'host' });
     if (run.code !== 0) throw resticFailure(run, 'forgetting resource versions');
     await this.deps.store.kvSet(`restic-prune:${attachment.name}`, String(Date.now()));
+    return gone.length;
   }
 
   /** Drop those of `snapshots` that no version of the resource names (an
    * on-demand version shares its unchanged parts with others). */
-  async forgetUnreferenced(attachment: Repository, snapshots: string[]): Promise<void> {
+  async forgetUnreferenced(attachment: Repository, snapshots: string[]): Promise<number> {
     const referenced = await this.deps.store.referencedRepositorySnapshots(attachment.attachment.id, snapshots);
-    await this.forget(attachment, [...new Set(snapshots)].filter((snapshot) => !referenced.has(snapshot)));
+    return this.forget(attachment, [...new Set(snapshots)].filter((snapshot) => !referenced.has(snapshot)));
+  }
+
+  /** Leave snapshots a save made, and no version came to name, for upkeep to
+   * forget ({@link forgetDiscarded}). Never fails the save, park or merge that
+   * made them: before, its forget met another world's save holding the
+   * repository and failed it with exit 11 (pramana, 2026-10-14: hibernations,
+   * parks and sub-task preparations). */
+  async discard(attachment: Repository, snapshots: string[]): Promise<void> {
+    for (const snapshot of new Set(snapshots))
+      await this.deps.store.kvSet(`${DISCARD_PREFIX}${attachment.name}:${snapshot}`, String(Date.now()));
+  }
+
+  /** Forget what was {@link discard}ed, in every repository no save holds
+   * (restic's exclusive lock would wait for it); those still busy go next time.
+   * A snapshot some version names by now (on demand: a shared part) stays. */
+  async forgetDiscarded(repositoryNamed: (name: string) => Promise<Repository | undefined>): Promise<number> {
+    const byRepository = new Map<string, Array<{ key: string; snapshot: string }>>();
+    for (const { key } of await this.deps.store.kvEntries(DISCARD_PREFIX)) {
+      const rest = key.slice(DISCARD_PREFIX.length);
+      const at = rest.lastIndexOf(':');
+      if (at < 0) { await this.deps.store.kvDelete(key); continue; }
+      const name = rest.slice(0, at);
+      byRepository.set(name, [...byRepository.get(name) ?? [], { key, snapshot: rest.slice(at + 1) }]);
+    }
+    let forgotten = 0;
+    for (const [name, entries] of byRepository) {
+      const repository = await repositoryNamed(name);
+      if (repository && await this.saveInProgress(repository)) continue;
+      try {
+        if (repository) forgotten += await this.forgetUnreferenced(repository, entries.map((entry) => entry.snapshot));
+        for (const entry of entries) await this.deps.store.kvDelete(entry.key);
+      } catch (error) {
+        console.warn(`resource repository ${name}: discarded versions not forgotten yet: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    return forgotten;
+  }
+
+  /** Whether a save holds the repository ({@link saving}): upkeep's exclusive
+   * forget and prune would only wait for it. */
+  async saveInProgress(repository: Repository): Promise<boolean> {
+    const current = await this.deps.store.kvGet(`restic-save:${repository.name}`);
+    if (current === undefined) return false;
+    try { return Date.now() - Number(JSON.parse(current).at ?? 0) < SAVE_STALE_MS; } catch { return false; }
   }
 
   /** What an agent's own restic needs to fetch parts in a world (`tavya-data`):
@@ -666,10 +724,10 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
     return { binary, env: await this.env(repository, base, 'read', false), expiresAt };
   }
 
-  /** Delete the data no snapshot uses. Waits out a save in progress, which
-   * holds the repository; locks left by a world that died expire by themselves. */
+  /** Delete the data no snapshot uses. Upkeep only, when no save holds the
+   * repository; locks left by a process that died expire on the server. */
   async prune(attachment: Repository): Promise<void> {
-    const run = await this.onHost(attachment, 'admin', false, ['prune', '--max-unused', '5%', '--retry-lock', '1m'], { key: 'host' });
+    const run = await this.onHost(attachment, 'admin', false, ['prune', '--max-unused', '5%', '--retry-lock', UPKEEP_LOCK_WAIT], { key: 'host' });
     if (run.code !== 0) throw resticFailure(run, 'pruning the resource');
     await this.deps.store.kvDelete(`restic-prune:${attachment.name}`);
   }
@@ -921,7 +979,7 @@ function backupArgs(parent?: string, connections = CONNECTIONS): string[] {
   // unchanged, so a restored world is not read again in full. (An edit that
   // keeps both, by setting the old mtime back, would go unnoticed.)
   return ['backup', '--json', '--host', 'tavya', '--ignore-inode', '--exclude', '.git', '--exclude', '.karmax-injection',
-    '-o', `rest.connections=${connections}`, ...(parent ? ['--parent', parent] : [])];
+    '-o', `rest.connections=${connections}`, '--retry-lock', SAVE_LOCK_WAIT, ...(parent ? ['--parent', parent] : [])];
 }
 
 /** A restic pattern matching exactly `file`: glob characters escaped, `$`
