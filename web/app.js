@@ -7605,6 +7605,54 @@ function vaultItemSearchText(item) {
   ].filter(Boolean).join(' ').toLowerCase();
 }
 
+// The keyboard of the vault credential dialogs, as in the other pickers: focus
+// stays in the search box while ↑/↓ move a highlighted row (kept in view); from a
+// row's checkbox or button they carry focus to the same control a row away.
+// Enter runs `onEnter(row)`, ⌘/Ctrl+Enter `onSubmit()`, Esc `close()`. Keys it
+// handles never reach the page's shortcuts beneath. Call the returned `sync()`
+// after the rows change (search); it keeps the highlight when still shown.
+// `start` is the row highlighted first (else the first row).
+function wireVaultListKeys(overlay, { search, rows, start, onEnter, onSubmit, close }) {
+  let current = null;
+  const shown = () => rows().filter((row) => !row.hidden);
+  const highlight = (row) => {
+    current?.classList.remove('active');
+    current = row || null;
+    current?.classList.add('active');
+    current?.scrollIntoView({ block: 'nearest' });
+  };
+  const sync = () => { const list = shown(); highlight(list.includes(current) ? current : list[0]); };
+  const rowOf = (el) => rows().find((row) => row.contains(el));
+  const twin = (row, control) => [...row.querySelectorAll(control.tagName)].find((c) =>
+    c.className === control.className && c.type === control.type
+    && Object.keys(c.dataset).join() === Object.keys(control.dataset).join()
+    && !c.disabled && c.getClientRects().length);
+  overlay.addEventListener('focusin', (e) => { const row = rowOf(e.target); if (row && row !== current) highlight(row); });
+  overlay.addEventListener('keydown', (e) => {
+    const t = e.target;
+    if (e.isComposing || e.defaultPrevented) return;
+    const plain = !e.altKey && !e.shiftKey && !e.metaKey && !e.ctrlKey;
+    if (e.key === 'Escape') close();
+    else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && onSubmit) onSubmit();
+    else if ((e.key === 'ArrowDown' || e.key === 'ArrowUp') && plain && !t.matches('select, textarea, pre')) {
+      const list = shown();
+      const at = list.indexOf(current);
+      const row = list[at < 0 ? 0 : Math.max(0, Math.min(list.length - 1, at + (e.key === 'ArrowDown' ? 1 : -1)))];
+      if (row) {
+        highlight(row);
+        if (t !== search) (rowOf(t) && twin(row, t) || search).focus();
+      }
+    } else if (e.key === 'Enter' && plain && (t === search || t.matches('input[type="checkbox"], input[type="radio"]') && rowOf(t))) {
+      if (current) onEnter(current);
+    } else return;
+    e.preventDefault();
+    e.stopPropagation();
+  });
+  highlight(start);
+  sync();
+  return sync;
+}
+
 // Full vault-item chooser used by the compact task-form button. It mirrors the
 // password-manager import panel, while allowing sparse policy overrides for this
 // task. "Inherit" deliberately stays sparse so global policy edits keep flowing.
@@ -7658,7 +7706,7 @@ function openVaultGrantPicker(items, selectedIds, policyOverrides, onApply, { si
     </div>
     <div class="vault-grant-actions">
       <button type="button" class="btn sm" data-vault-cancel>Cancel</button>
-      <button type="button" class="btn sm primary" data-vault-apply>Apply</button>
+      <button type="button" class="btn sm primary" data-vault-apply title="Apply (${fmtKeys('meta+Enter')})">Apply</button>
     </div>
   </div>`;
   document.body.appendChild(overlay);
@@ -7710,18 +7758,27 @@ function openVaultGrantPicker(items, selectedIds, policyOverrides, onApply, { si
     });
     overlay.querySelector('.vault-search-empty').hidden = visible > 0 || !items.length;
     refreshCount();
+    syncKeys();
   });
-  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
-  overlay.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); close(); }
-  });
-  overlay.querySelector('[data-vault-cancel]').addEventListener('click', close);
-  overlay.querySelector('[data-vault-apply]').addEventListener('click', () => {
+  const apply = () => {
     const selected = new Set(picks.filter((pick) => pick.checked).map((pick) => pick.value));
     const selectedPolicies = Object.fromEntries(Object.entries(localPolicies).filter(([itemId]) => selected.has(itemId)));
     onApply(selected, selectedPolicies);
     close();
+  };
+  // Enter ticks the highlighted credential; a single choice is then made.
+  const syncKeys = wireVaultListKeys(overlay, {
+    search, rows: () => rows, start: rows.find((row) => selectedIds.has(row.dataset.vaultItem)), close, onSubmit: apply,
+    onEnter: (row) => {
+      const pick = row.querySelector('.vault-grant-pick');
+      if (!single) return pick.click();
+      pick.checked = true;
+      apply();
+    },
   });
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+  overlay.querySelector('[data-vault-cancel]').addEventListener('click', close);
+  overlay.querySelector('[data-vault-apply]').addEventListener('click', apply);
   search.focus();
 }
 
@@ -18981,7 +19038,9 @@ async function wireVaultCards(organizationId) {
       });
       const empty = list.querySelector('.vault-search-empty');
       if (empty) empty.hidden = visible > 0 || !vaultItems.length;
+      syncKeys?.();
     };
+    let syncKeys;
     const paint = () => {
       list.innerHTML = vaultItems.length
         ? sortVaultItems(vaultItems).map((i) => `<div class="queue-item vault-manager-item" data-vi="${esc(i.id)}">
@@ -19109,12 +19168,23 @@ async function wireVaultCards(organizationId) {
       filterRows();
     };
     paint();
+    const opener = document.activeElement;
     const close = () => {
       overlay.querySelectorAll('.vault-reveal-panel').forEach((panel) => panel._conceal?.());
       overlay.remove();
+      opener?.focus?.();
     };
+    // Enter opens the highlighted credential, as View does.
+    syncKeys = wireVaultListKeys(overlay, {
+      search, rows: () => [...list.querySelectorAll('[data-vi]')], close,
+      onEnter: (row) => {
+        const view = row.querySelector('[data-vi-reveal]');
+        if (view.disabled) return;
+        if (row.querySelector('.vault-reveal-panel').hidden) view.click();
+        else row.querySelector('[data-vi-reveal-load]').focus();
+      },
+    });
     overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
-    overlay.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
     overlay.querySelector('[data-vault-manager-close]').addEventListener('click', close);
     search.addEventListener('input', filterRows);
     search.focus();
@@ -22379,7 +22449,10 @@ function bindKeys() {
     // The check-in terminal is a focusable <pre> that behaves like a text field:
     // keystrokes go to the shell, not to app shortcuts. Treat it as "typing".
     const typing = t && t.matches && (t.matches('input, textarea, select, .term-screen') || t.isContentEditable);
-    const overlayOpen = $('#overlay-root').childElementCount > 0 || $('#modal-root').childElementCount > 0;
+    // Security and vault dialogs are direct body children: modal too, but they
+    // close themselves, so Esc must not also pop whatever lies beneath them.
+    const dialogOpen = !!document.querySelector('body > .modal-overlay');
+    const overlayOpen = dialogOpen || $('#overlay-root').childElementCount > 0 || $('#modal-root').childElementCount > 0;
     if (e.key === 'Escape' && !overlayOpen && $('.ck-fullscreen')) {
       e.preventDefault();
       resetChord();
@@ -22407,7 +22480,7 @@ function bindKeys() {
       return;
     }
     if (overlayOpen) { // an overlay owns the keyboard; Esc pops it
-      if (e.key === 'Escape') closeTopOverlay();
+      if (e.key === 'Escape' && !dialogOpen) closeTopOverlay();
       return;
     }
     if (e.key === 'Escape') {
