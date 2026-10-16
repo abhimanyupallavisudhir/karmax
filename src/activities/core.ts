@@ -1338,7 +1338,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     // Pin access before admission, but never wait for capacity while holding a
     // transition lock: the previous owner needs that lock to release its lease.
     const releaseAccess = await worlds.holdAccess?.(handle.id);
-    const open = async (): Promise<World | undefined> => {
+    /** `woke`: the lease this call took to wake a parked world. */
+    const open = async (woke?: string): Promise<World | undefined> => {
       const current = ((await store.currentWorld(handle.id)) ?? handle) as WorldHandle;
       if (isRemote(current.kind) && deps.runners) {
         const leaseId = current.meta?.worldLeaseId;
@@ -1347,17 +1348,21 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let world: World;
       try { world = await (recover ? worlds.open(current) : worlds.withoutRecovery(() => worlds.open(current))); }
       catch (e) {
-        if (!recover) throw e;
-        const recovered = await recoverVanishedWorld(current, taskId, e);
-        if (!recovered) throw e;
+        if (!recover) { await unwake(current, woke); throw e; }
+        const recovered = await recoverVanishedWorld(current, taskId, e).catch(async (error) => { await unwake(current, woke); throw error; });
+        if (!recovered) { await unwake(current, woke); throw e; }
         world = recovered;
       }
       return deps.resources ? await deps.resources.prepare(world) : world;
     };
     try {
       for (;;) {
-        await ensureRunnerLease(handle, taskId);
-        const world = await (worlds.withOperation ? worlds.withOperation(handle.id, open) : open());
+        const parked = (await store.worldState(handle.id)) === 'parked';
+        const before = ((await store.currentWorld(handle.id)) ?? handle) as WorldHandle;
+        const leased = await ensureRunnerLease(handle, taskId);
+        const lease = leased.meta?.worldLeaseId;
+        const woke = parked && typeof lease === 'string' && lease !== before.meta?.worldLeaseId ? lease : undefined;
+        const world = await (worlds.withOperation ? worlds.withOperation(handle.id, () => open(woke)) : open(woke));
         // One pull request of a task's world (SPEC §11.1): the task's world,
         // narrowed to that pull request's worktree.
         if (world && isPullRequestView(handle)) return await restorePullRequest(pullRequestView(world, handle), world);
@@ -1369,6 +1374,25 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // for its transition. Re-enter admission before opening the provider.
       }
     } finally { releaseAccess?.(); }
+  }
+
+  /** A wake that failed leaves the world as it was: parked, the lease it took
+   * released. Marked ready with a lease held, nothing parks or hibernates it
+   * again (pramana#60: a cancelled task's world, waking to be suspended, met a
+   * full Hetzner CPU limit and kept its 120 GB volume and its lease). Runs
+   * under the world's operation lock: an opener that shared the lease finds it
+   * gone and asks for capacity again. */
+  async function unwake(current: WorldHandle, woke: string | undefined): Promise<void> {
+    if (!woke || current.meta?.worldLeaseId !== woke) return;
+    try {
+      (await deps.runners?.release(woke, current.kind));
+      const now = ((await store.currentWorld(current.id)) ?? current) as WorldHandle;
+      if ((now.generation ?? 1) !== (current.generation ?? 1)) return;
+      (await store.updateWorldMeta(now, { worldLeaseId: null }));
+      (await store.setWorldState(((await store.currentWorld(current.id)) ?? now) as WorldHandle, 'parked'));
+    } catch (error) {
+      console.warn(`[world] ${current.id}: could not return a world that failed to wake to parked: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   // A remote sandbox can vanish out-of-band while a task is parked (provider GC,
@@ -2338,8 +2362,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       } catch (error) {
         // Reconnecting/resuming a cloud sandbox is part of the turn's transport
         // boundary. A control-plane outage here is no more agent-actionable than
-        // a PTY or filesystem request failing after the adapter starts.
-        throw classifyTurnError(error, profile.provider);
+        // a PTY or filesystem request failing after the adapter starts, and no
+        // provider failure to wake a world is the agent's (pramana#59: Hetzner's
+        // power-on "Unknown Error" blocked the task as an agent error): it waits
+        // out as infrastructure, then reaches a person, never Resolve.
+        const failure = classifyTurnError(error, profile.provider);
+        if (failure instanceof ApplicationFailure && failure.type === 'agent-error')
+          throw ApplicationFailure.create({ message: failure.message, type: 'world-infra', nonRetryable: false, cause: error instanceof Error ? error : undefined });
+        throw failure;
       }
       // A cloud world's disk, before its agent starts (wiki features/computers).
       const remoteWorld = isRemote(args.worldHandle.kind);
@@ -4176,6 +4206,15 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       try {
         if (!(await valid())) return;
         let current = (await store.currentWorld(handle.id)) as WorldHandle;
+        // A parked VM is already what this makes of a world: parking pushed its
+        // branch, took its checkpoint, released its capacity and stopped every
+        // process. Waking it to suspend it again costs a machine (a Hetzner
+        // server-hour) and, with the project's CPUs full, failed and left the
+        // world marked ready, never parked or hibernated (pramana#60, #61, #75).
+        if (worlds.get(current.kind).parkStopsProcesses && (await store.worldState(handle.id)) === 'parked') {
+          (await record(current.id, 'world.suspended', { provider: current.kind, parkable: true, alreadyParked: true }));
+          return;
+        }
         // Capacity admission cannot hold the transition lock: an existing
         // accessor may need that lock to release the capacity we are awaiting.
         // A remote world is opened even without repositories: a paused E2B

@@ -155,3 +155,30 @@ describe('sandbox-caused turn failures', () => {
     expect(error).toMatchObject({ type: 'agent-infra', nonRetryable: false, message: failure.message });
   });
 });
+
+describe('a world that fails to open', () => {
+  // pramana#59 (2026-10-16): Hetzner failed the parked server's power-on with
+  // "Unknown Error" (a second later the same request worked), and the turn
+  // blocked the task as a non-retryable agent error.
+  it('waits it out as infrastructure, never as the agent\'s error', async () => {
+    const store = (await Store.create(':memory:'));
+    const worlds = new WorldRegistry();
+    const handle = { kind: 'fake-remote', id: 'wake-task', root: '/workspace', branch: 'tavya/wake-task', base: 'main' };
+    worlds.register({ kind: 'fake-remote', capabilities: { remote: true }, async create() { throw new Error('unused'); },
+      async open() { throw new Error('Hetzner\'s start_server 661871646694797 failed: Unknown Error (unknown_error)'); },
+      async destroy() {} } as any);
+    const adapters = new Map([['mock', { provider: 'mock', async runTurn() { throw new Error('the agent never starts'); } }]]) as any;
+    const core = makeCoreActivities({ store, worlds, adapters, profiles: new ProfileResolver(store, 'mock') });
+    try {
+      const error = await core.runAgentTurn({
+        taskId: 'wake-task', role: 'do', worldHandle: handle,
+        messages: [{ id: 'm0', role: 'user', text: 'go on', ts: 0 }],
+        task: { projectId: 'project', title: 'Wake', prompt: 'go on', project: {}, workflow: 'software-dev' },
+      } as any).then(() => undefined, (caught) => caught);
+      expect(error).toMatchObject({ type: 'world-infra', nonRetryable: false, message: expect.stringMatching(/Unknown Error/) });
+    } finally {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      (await store.close());
+    }
+  });
+});

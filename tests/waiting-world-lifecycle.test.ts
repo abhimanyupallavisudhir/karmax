@@ -16,7 +16,7 @@ function deferred() {
 }
 const stores: Store[] = [];
 afterEach(async () => { vi.restoreAllMocks(); (await __asyncCollections.forEach(stores.splice(0), async store => (await store.close()))); });
-async function fixture(kind: 'memory' | 'e2b' = 'memory') {
+async function fixture(kind: 'memory' | 'e2b' | 'hetzner' = 'memory') {
   const store = (await Store.create(':memory:')); stores.push(store);
   const project = (await store.createProject('Lifecycle'));
   const task = (await store.createTask({ projectId: project.id, title: 'Wait', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'work' } }));
@@ -25,7 +25,7 @@ async function fixture(kind: 'memory' | 'e2b' = 'memory') {
   let parked = false;
   const open = vi.fn(async () => { parked = false; return { handle } as any; });
   const park = vi.fn(async () => { parked = true; return handle; });
-  worlds.register({ kind, capabilities: { remote: kind === 'e2b' }, parkable: true, open, park,
+  worlds.register({ kind, capabilities: { remote: kind !== 'memory' }, parkable: true, parkStopsProcesses: kind === 'hetzner', open, park,
     status: async () => parked ? 'parked' : 'ready' } as any);
   const checkpoint = vi.fn(async () => ({ id: 'checkpoint', generation: 1 }));
   const runners = { release: vi.fn(async (id: string) => (await store.releaseWorldLease(id))), acquire: vi.fn() };
@@ -86,6 +86,21 @@ describe('cancelled-world recovery', () => {
     await f.core.suspendWorldForRecovery(f.handle);
     expect(steps).toEqual(['stop job-0000000a', 'park']);
     expect(await f.store.worldState(f.handle.id)).toBe('parked');
+  });
+
+  // pramana#60, #61, #75 (2026-10-16): waking a parked Hetzner world to suspend
+  // it met the project's full CPU limit and left the world ready with a lease,
+  // so nothing parked or hibernated it again and it kept its volume.
+  it('leaves a parked VM world parked: parking already did what suspending does', async () => {
+    const f = await fixture('hetzner');
+    await f.store.setWorldState(f.handle, 'parked');
+    f.setParked();
+    await f.store.saveView(f.task.id, { ...f.view, status: 'cancelled', stage: 'cancelled' });
+    await f.core.suspendWorldForRecovery(f.handle);
+    expect([f.open, f.park, f.checkpoint, f.runners.acquire].map((spy) => spy.mock.calls.length)).toEqual([0, 0, 0, 0]);
+    expect(await f.store.worldState(f.handle.id)).toBe('parked');
+    expect(await f.store.eventsOfType(f.task.id, 'world.suspended')).toEqual([
+      expect.objectContaining({ payload: expect.objectContaining({ alreadyParked: true }) })]);
   });
 
   it('rechecks cancellation after slow checkpointing', async () => {
@@ -367,6 +382,30 @@ describe('separate waiting-world maintenance', () => {
     finish.resolve(); await maintenance; await rejected;
     expect(f.runners.acquire).toHaveBeenCalledOnce();
     expect(f.open).toHaveBeenCalledOnce();
+  });
+
+  it('returns a world that failed to wake to parked, with its lease released (pramana#59/#60)', async () => {
+    const f = await fixture('hetzner');
+    await f.store.createRunnerPool({ id: 'test', organizationId: f.project.organizationId!, name: 'Test', provider: 'hetzner',
+      mode: 'customer', capacity: { activeWorlds: 1, cpu: 2, memoryMb: 2048, gpu: 0 }, enabled: true });
+    await f.store.setWorldState(f.handle, 'parked');
+    let taken: string | undefined;
+    f.runners.acquire.mockImplementation(async () => {
+      taken = (await f.store.requestWorldLease({ runnerPoolId: 'test', organizationId: f.project.organizationId!,
+        projectId: f.project.id, taskId: f.task.id, worldId: f.handle.id })).id;
+      return { leaseId: taken, runnerPoolId: 'test' };
+    });
+    f.open.mockImplementation(async () => { throw new Error('Hetzner\'s start_server 1 failed: Unknown Error (unknown_error)'); });
+    vi.spyOn(Context, 'current').mockReturnValue({ heartbeat() {}, cancellationSignal: new AbortController().signal,
+      info: { attempt: 1, workflowExecution: { runId: 'run', workflowId: f.task.id }, activityId: 'turn',
+        currentAttemptScheduledTimestampMs: Date.now() } } as any);
+    const failed = await f.core.runAgentTurn({ taskId: f.task.id, role: 'do', agentTurnId: `${f.task.id}#1`, messages: [],
+      worldHandle: f.handle, task: { taskId: f.task.id, projectId: f.project.id, title: f.task.title, prompt: 'work',
+        project: {}, workflow: 'just-do', agents: { do: { provider: 'mock' } } } } as any).then(() => undefined, (error) => error);
+    expect(failed).toMatchObject({ type: 'world-infra', nonRetryable: false });
+    expect(await f.store.worldState(f.handle.id)).toBe('parked');
+    expect((await f.store.worldLease(taken!))?.state).not.toBe('active');
+    expect((await f.store.currentWorld(f.handle.id))?.meta?.worldLeaseId ?? null).toBeNull();
   });
 
   it('propagates maintenance failure without repeating the authoritative publication', async () => {

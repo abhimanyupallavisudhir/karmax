@@ -11,6 +11,7 @@ import { serviceHomeLabel } from '../services.js';
 import { provisionGitCredentials, provisionGitRepos, runOrThrow, provisionTimeoutMs, type ProvisionTarget } from '../provision-git.js';
 import { taskBranch } from '../../domain/brand.js';
 import { timed } from '../../timing/index.js';
+import { ProviderOutage } from '../../agent/limits.js';
 import { generateSshKeyPair, quote, SshTransport, VmTransportError, type SshEndpoint } from './ssh.js';
 import { VmWorld } from './world.js';
 import { VM_HOME, VM_USER, vmProvisionFailure, vmProvisionScript, vmProvisionStamp } from './provision.js';
@@ -60,6 +61,8 @@ export interface VmDriver {
   endpoint(connection: ResolvedWorldProviderConnection, ref: Record<string, string>): Promise<Pick<SshEndpoint, 'host' | 'port' | 'tls'>>;
   /** Wake a parked machine at `shape` (CPU and memory may have changed). */
   start(connection: ResolvedWorldProviderConnection, ref: Record<string, string>, shape: VmShape, keys: VmBootKeys): Promise<void>;
+  /** A new machine on the same volume, for one that started but never answers SSH. */
+  replace?(connection: ResolvedWorldProviderConnection, ref: Record<string, string>, shape: VmShape, keys: VmBootKeys): Promise<void>;
   /** Stop paying for compute; keep the volume. */
   stop(connection: ResolvedWorldProviderConnection, ref: Record<string, string>): Promise<void>;
   /** Delete the machine and its volume. A missing one is already gone. */
@@ -96,6 +99,7 @@ const PROVISION_MS = 25 * 60_000;
 export class VmWorldProvider implements WorldProvider {
   readonly kind: string;
   readonly parkable = true;
+  readonly parkStopsProcesses = true;
   // No network policy: the VM user has root (as on E2B), so an in-VM firewall
   // would be advisory. Restricted networks are refused up front instead.
   readonly capabilities = { remote: true, pty: true, snapshots: true, ports: true, networkPolicy: false } as const;
@@ -185,10 +189,32 @@ export class VmWorldProvider implements WorldProvider {
       transport = this.transportFor(handle.id, connection, sealed);
       if (state !== 'ready') {
         const shape = await this.shapeOf(handle, connection);
-        await timed(`${this.kind}.start`, () => this.driver.start(connection, sealed, shape, keysOf(sealed)));
-        transport.reset();
+        try {
+          await timed(`${this.kind}.start`, () => this.driver.start(connection, sealed, shape, keysOf(sealed)));
+          transport.reset();
+          const reachable = () => timed(`${this.kind}.reachable`, () => waitReachable(transport!, this.options.reachableMs ?? REACHABLE_MS));
+          try { await reachable(); }
+          catch (error) {
+            // A machine that never answers is broken, not busy; the world is its volume.
+            if (!(error instanceof MachineUnreachable) || !this.driver.replace) throw error;
+            console.warn(`[${this.kind}] ${handle.id}: the woken machine never answered SSH, so it is replaced`);
+            await timed(`${this.kind}.replace`, () => this.driver.replace!(connection, sealed, shape, keysOf(sealed)));
+            transport.reset();
+            await reachable();
+          }
+          await this.ensureProvisioned(transport);
+        } catch (error) {
+          // A wake that fails leaves the world as it found it, parked: not a
+          // machine billing for nothing until someone notices.
+          this.dropTransport(handle.id);
+          await this.driver.stop(connection, sealed).catch(() => undefined);
+          this.states.set(handle.id, 'parked');
+          throw error;
+        }
+      } else {
+        // Running, but this process has not reached it yet: another one may
+        // have just woken it, and it is still booting. Answers at once if not.
         await timed(`${this.kind}.reachable`, () => waitReachable(transport!, this.options.reachableMs ?? REACHABLE_MS));
-        await this.ensureProvisioned(transport);
       }
       this.states.set(handle.id, 'ready');
       const world = this.world(handle, connection, sealed, transport);
@@ -418,6 +444,11 @@ async function growFilesystem(transport: SshTransport, home: string): Promise<vo
   await transport.exec(`sudo -n resize2fs "$(findmnt -no SOURCE ${quote(home)})"`, { timeoutMs: 120_000 });
 }
 
+/** A machine that never answered SSH: retried as infrastructure (a new machine, or a later try). */
+export class MachineUnreachable extends ProviderOutage {
+  constructor(message: string) { super(message); this.name = 'MachineUnreachable'; }
+}
+
 /** Wait for sshd: a booting machine refuses or resets connections for a while. */
 async function waitReachable(transport: SshTransport, ms: number, signal?: AbortSignal): Promise<void> {
   const until = Date.now() + ms;
@@ -430,7 +461,8 @@ async function waitReachable(transport: SshTransport, ms: number, signal?: Abort
     } catch (error) { last = error; transport.reset(); }
     await new Promise((resolve) => setTimeout(resolve, Math.min(5_000, 500 * (attempt + 1))));
   }
-  throw new Error(`the machine did not answer SSH within ${Math.round(ms / 60_000)} minutes: ${last instanceof Error ? last.message : String(last)}`);
+  throw new MachineUnreachable(`the machine did not answer SSH within ${Math.max(1, Math.round(ms / 60_000))} minute${ms > 90_000 ? 's' : ''}: `
+    + `${last instanceof Error ? last.message : String(last)}`);
 }
 
 /** Trusted provisioning over the world's own SSH connection. */
