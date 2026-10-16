@@ -65,6 +65,10 @@ it('calls a new agent into a task from the follow-up box with @+', async () => {
   if (shots) await page.screenshot({ path: path.join(shots, 'mention-menu.png') });
   // In a short window the expanded People list still fits on screen.
   await page.setViewportSize({ width: 1280, height: 420 });
+  // A loaded runner can report the new height before the page is laid out for
+  // it; a menu placed then follows the box where it was (CI #1991: 684 > 420).
+  await step('the page is laid out for the short window', () => expect.poll(() =>
+    box.evaluate((el) => el.getBoundingClientRect().bottom <= 420)).toBe(true));
   await box.fill('');
   await box.type('@');
   await menu.locator('.am-opt').filter({ hasText: 'People' }).dispatchEvent('mousedown');

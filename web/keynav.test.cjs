@@ -145,7 +145,7 @@ eval(extractFn('openListRow'));
 let keydown;
 new Function('document', '$', 'focusedEnterAction', 'openListRow',
   `${extractFn('bindKeys')}\nbindKeys();`)(
-  { addEventListener: (_type, handler) => { keydown = handler; } },
+  { addEventListener: (_type, handler) => { keydown = handler; }, querySelector: () => null },
   () => ({ childElementCount: 0 }), focusedEnterAction, openListRow,
 );
 for (const kind of ['task', 'queue', 'draft', 'nested']) {
@@ -257,6 +257,7 @@ global.$ = (selector) => {
 };
 global.document = {
   querySelectorAll: (selector) => selector === '[data-attempt-select]' ? links : [],
+  querySelector: () => null,
   addEventListener: (name, handler) => { attemptKeydown = handler; },
 };
 global.CHORD = { pending: [], timer: null };
