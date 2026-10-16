@@ -14,7 +14,9 @@ import { createServer } from 'node:http';
 import { once } from 'node:events';
 import { CodexAppServerClient } from '../src/agent/codex-app-server-client.js';
 import { localProviderCli } from '../src/agent/provider-cli.js';
-import { prepareCodexHistory } from '../src/agent/codex-history.js';
+import crypto from 'node:crypto';
+import { codexRolloutFilename, prepareCodexHistory } from '../src/agent/codex-history.js';
+import { publishLocalCodexHistory, readLocalCodexHistory } from '../src/agent/codex-history-files.js';
 import { ensureLocalCodexSessionTools } from '../src/agent/codex.js';
 
 const imported = '0199aaaa-0000-7000-8000-000000000001';
@@ -49,6 +51,33 @@ it('drops only the item ids panagent invented, leaving ids Codex or OpenAI issue
   const own = Buffer.from(panagentHistory.replace('"originator":"panagent"', '"originator":"codex_cli_rs"'));
   expect(await prepareCodexHistory(imported, async () => ({ file: `rollout-2026-10-10T00-00-00-${imported}.jsonl`, content: own })))
     .toBeUndefined();
+});
+
+it('names the repaired copy apart from the one a previous release made of the same history (#643)', async () => {
+  // #643's first attempt (before the repair) had already prepared the import
+  // for Codex's tools: a copy that kept the invented ids, named from the same
+  // source bytes and tools. The repaired copy must not claim that name, or
+  // publishing it meets diverging bytes and every retry fails.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-codex-imported-'));
+  try {
+    const tools = [{ type: 'function', name: 'open_pr', description: 'x', inputSchema: { type: 'object' } }];
+    const source = publishLocalCodexHistory(home, { file: codexRolloutFilename('2026-10-10T00:00:00Z', imported),
+      content: Buffer.from(panagentHistory) }, imported);
+    const sha = crypto.createHash('sha256').update(fs.readFileSync(source)).digest('hex');
+    const hex = crypto.createHash('sha256').update(JSON.stringify(['codex-history-v1', imported, [[imported, sha]], tools]))
+      .digest('hex').slice(0, 32).split('');
+    hex[12] = '4'; hex[16] = '8';
+    const earlier = hex.join('').replace(/^(.{8})(.{4})(.{4})(.{4})(.{12})$/, '$1-$2-$3-$4-$5');
+    const kept = panagentHistory.trim().split('\n').map((line) => JSON.parse(line));
+    Object.assign(kept[0].payload, { id: earlier, history_mode: 'paginated', dynamic_tools: tools });
+    publishLocalCodexHistory(home, { file: codexRolloutFilename('2026-10-10T00:00:00Z', earlier),
+      content: Buffer.from(jsonl(kept.map((record, ordinal) => ({ ...record, ordinal })))) }, earlier);
+
+    const session = await ensureLocalCodexSessionTools(home, imported, tools);
+    expect(session).not.toBe(earlier);
+    expect(readLocalCodexHistory(home, session).content.toString()).not.toContain(INVENTED);
+    expect(readLocalCodexHistory(home, earlier).content.toString()).toContain(INVENTED); // never rewritten
+  } finally { fs.rmSync(home, { recursive: true, force: true }); }
 });
 
 it('resumes a Codex fork of an imported conversation without sending invented ids (#643)', async () => {

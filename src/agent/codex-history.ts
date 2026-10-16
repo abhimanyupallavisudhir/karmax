@@ -225,10 +225,12 @@ export async function prepareCodexHistory(session: string,
   if (!options.snapshot && !repaired && !invented && !toolsChanged && canonicalName) return undefined;
   const sources = segments.map((segment) => ({ session: segment.session, file: segment.source.file,
     bytes: segment.source.content.length, sha256: hash(segment.source.content) }));
-  // Changing captured bytes or tools produces another identity. Never overwrite
-  // the snapshot a descendant might already reference.
+  // Changing captured bytes, tools or how records are rewritten produces another
+  // identity. Never overwrite the snapshot a descendant might already reference:
+  // releases before the invented-id repair already named a copy that kept them (#643).
   const hex = hash(JSON.stringify(['codex-history-v1', session,
-    sources.map(({ session: id, sha256 }) => [id, sha256]), options.dynamicTools ?? metadata.payload.dynamic_tools])).slice(0, 32).split('');
+    sources.map(({ session: id, sha256 }) => [id, sha256]), options.dynamicTools ?? metadata.payload.dynamic_tools,
+    ...(invented ? ['without-invented-ids'] : [])])).slice(0, 32).split('');
   hex[12] = '4'; hex[16] = '8';
   const identity = hex.join('');
   const next = options.identity ?? `${identity.slice(0, 8)}-${identity.slice(8, 12)}-${identity.slice(12, 16)}-${identity.slice(16, 20)}-${identity.slice(20)}`;
