@@ -13862,6 +13862,10 @@ function wireFollowups(v) {
         if (liveTa) liveTa.value = '';
         else if (ta) ta.value = '';
         paint();
+        // Sent: hand the keyboard back to the page (u, j/k, …), as Gmail does
+        // after a reply; f composes again. The repaint then focuses the thread.
+        const active = document.activeElement;
+        if (active?.closest?.('.followup-box')?.dataset.role === role) active.blur();
         toast(shared && to && (to.length > 1 || to[0] !== 'agent:do')
           ? `Sent to ${to.map((selector) => recipientLabel(selector, v)).join(', ')}` : 'Follow-up sent');
         renderTaskPage();
@@ -22479,6 +22483,15 @@ function focusedEnterAction(e, target) {
   if (target.closest('[role="button"], [tabindex="0"]')) return 'click';
   return null;
 }
+// Does the focused element take typed text, so a letter is input rather than a
+// shortcut? A checkbox, radio, slider or button input takes none: clicking one
+// must not leave every shortcut dead. The check-in terminal is a focusable
+// <pre> whose keystrokes go to the shell.
+function takesTypedKeys(el) {
+  if (!el?.matches) return false;
+  if (el.isContentEditable || el.matches('textarea, select, .term-screen')) return true;
+  return el.matches('input') && !['checkbox', 'radio', 'range', 'color', 'file', 'button', 'submit', 'reset', 'image'].includes(el.type);
+}
 function dispatchKey(e) {
   if (isBareModifier(e.key)) return false;
   const snap = { key: e.key, metaKey: e.metaKey, ctrlKey: e.ctrlKey, altKey: e.altKey, shiftKey: e.shiftKey };
@@ -22501,9 +22514,7 @@ function bindKeys() {
     // A component-level handler that prevented the event already owns it (for
     // example a composite role=button with richer Enter/Space behavior).
     if (e.defaultPrevented || e.isComposing) return;
-    // The check-in terminal is a focusable <pre> that behaves like a text field:
-    // keystrokes go to the shell, not to app shortcuts. Treat it as "typing".
-    const typing = t && t.matches && (t.matches('input, textarea, select, .term-screen') || t.isContentEditable);
+    const typing = takesTypedKeys(t);
     // Security and vault dialogs are direct body children: modal too, but they
     // close themselves, so Esc must not also pop whatever lies beneath them.
     const dialogOpen = !!document.querySelector('body > .modal-overlay');
@@ -22521,6 +22532,9 @@ function bindKeys() {
       else if ((e.metaKey || e.ctrlKey) && !overlayOpen) dispatchKey(e);
       return;
     }
+    // A checkbox, radio or slider keeps the named keys it uses (Space, Enter,
+    // arrows); letters still reach the shortcuts. Escape still pops the page.
+    if (t?.matches?.('input') && e.key.length > 1 && e.key !== 'Escape') return;
     // Focus wins over global commands for plain Enter, including inside an
     // overlay. Native controls need no help; custom tabindex/role controls do.
     const focusedAction = focusedEnterAction(e, t);
