@@ -924,8 +924,7 @@ a.git-repo-name:hover { color:var(--accent); }
 .tf-head-inner { display: flex; align-items: center; gap: 10px; }
 .tf-head h2 { margin: 0; font-size: 17px; letter-spacing: -0.01em; white-space: nowrap; }
 .tf-crumb { color: var(--ink-3); font-size: 13px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.tf-savestate { margin-left: auto; color: var(--ink-3); font-size: 12px; flex: none; }
-.tf-savestate:not(:empty)::before { content: '✓ '; color: var(--merged); }
+.tf-savestate { margin-left: auto; flex: none; }
 /* Attempt switcher in the Edit draft bar: the task page's cards, minus the crown. */
 .tf-attempts { flex: 0 100 auto; margin-left: 4px; } /* scrolls before the crumb truncates */
 .tf-attempts .attempt-card { padding-right: 10px; }
@@ -2420,16 +2419,10 @@ html[data-theme="dark"] .github-signin-btn:active,
 }
 .params-save-bar {
   position: sticky; bottom: 0; z-index: 2; display: flex; align-items: center;
-  justify-content: space-between; gap: 16px; margin-top: 14px; padding: 12px 0 2px;
+  justify-content: flex-end; gap: 10px; margin-top: 14px; padding: 12px 0 2px;
   background: linear-gradient(180deg, transparent, var(--surface) 13px);
 }
-.params-save-status { display: inline-flex; align-items: center; gap: 8px; color: var(--ink-3); font-size: 12px; }
-.params-save-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--merged); }
-.params-save-bar[data-save-state="dirty"] .params-save-status { color: var(--working); font-weight: 650; }
-.params-save-bar[data-save-state="dirty"] .params-save-dot {
-  background: var(--working); box-shadow: 0 0 0 3px color-mix(in srgb, var(--working) 15%, transparent);
-}
-.params-save-bar[data-save-state="saving"] .params-save-dot { background: var(--accent); }
+.params-save-bar .save-state[data-state="saved"] { animation: save-state-fade 2.4s ease forwards; }
 .agent-profile-controls {
   display: grid; grid-template-columns: minmax(105px,.65fr) minmax(170px,1.6fr) minmax(115px,.75fr) 90px; gap: 8px;
 }
@@ -3482,6 +3475,11 @@ html[data-theme="dark"] .github-signin-btn:active,
 .task-defaults > .td-section:first-child { border-top: 0; padding-top: 2px; }
 .task-defaults .td-profile { margin-bottom: 8px; }
 .task-defaults .td-actions { display: flex; align-items: center; gap: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
+/* A long card keeps its Save in view while something is unsaved. */
+.task-defaults .td-actions:has(> .save-state[data-state="dirty"]) {
+  position: sticky; bottom: 0; z-index: 3; padding-bottom: 10px; margin-bottom: -10px; background: var(--surface);
+}
+.task-defaults .td-actions > .save-state + .btn { margin-left: 0; }
 .task-defaults .td-actions .resource-error { color: var(--danger); font-size: 12px; }
 .parameter-fields .agent-controls:has(.pf-maxturns) { grid-template-columns: minmax(105px,.65fr) minmax(170px,1.6fr) minmax(115px,.75fr) 90px; }
 .parameter-fields .agent-field .agent-controls .pf-maxturns { width: 100%; }
@@ -3757,3 +3755,35 @@ input.toggle:disabled { opacity:.45; cursor:not-allowed; }
 .setting-value .warn { color:var(--warn); }
 .pe-new input.toggle { flex:none; min-width:0; }
 .triggers-block label[for="ev-type"] { align-self:start; padding-top:8px; }
+
+/* ── Save state ─────────────────────────────────────────────────────────────
+   One note for every form whose edits wait to be saved: beside its Save
+   button (settings cards, task Parameters) and, quieter, in the task form
+   head. Amber only while something is unsaved; never a check mark then. */
+.save-state {
+  display: inline-flex; align-items: center; gap: 6px; vertical-align: middle;
+  font-size: 12px; line-height: 22px; color: var(--ink-3); white-space: nowrap;
+}
+.save-state:empty { display: none; }
+.save-state::before { content: ''; flex: none; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.save-state[data-state="dirty"] {
+  padding: 0 10px 0 9px; border-radius: 999px; font-weight: 600;
+  color: color-mix(in srgb, var(--working) 72%, var(--ink));
+  background: var(--working-weak);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--working) 32%, transparent);
+}
+.save-state[data-state="dirty"]::before {
+  background: var(--working); box-shadow: 0 0 0 3px color-mix(in srgb, var(--working) 22%, transparent);
+}
+.save-state.quiet[data-state="dirty"] { padding: 0; background: none; box-shadow: none; font-weight: 500; }
+.save-state[data-state="saving"]::before { background: var(--accent); animation: save-state-pulse 1s ease-in-out infinite; }
+.save-state[data-state="saved"]::before {
+  content: '✓'; width: auto; height: auto; border-radius: 0; background: none; color: var(--merged); font-weight: 700;
+}
+.save-state[data-state="error"] { color: var(--danger); }
+.save-state + [data-unsaved-save] { margin-left: 8px; }
+@keyframes save-state-pulse { 50% { opacity: .3; } }
+@keyframes save-state-fade { 0%, 70% { opacity: 1; } 100% { opacity: 0; } }
+@media (prefers-reduced-motion: reduce) {
+  .save-state::before, .params-save-bar .save-state { animation: none !important; }
+}
