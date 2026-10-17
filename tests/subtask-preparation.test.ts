@@ -15,6 +15,8 @@ import { ResourceKeptChangingError } from '../src/world/resource-conflict.js';
 import { ProfileResolver } from '../src/agent/profiles.js';
 import { makeCoreActivities } from '../src/activities/core.js';
 import type { WorldHandle } from '../src/world/types.js';
+import { VmTransportError } from '../src/world/vm/ssh.js';
+import { gitOrThrow } from '../src/world/git.js';
 
 // pramana#22: creating a sub-task saves the parent's writable project data
 // first. A process writing into it made that save fail ("kept changing")
@@ -142,5 +144,41 @@ it('tells the agent beforehand that create_sub_task saves its writable data firs
   const prompt = assemblePrompt({ profile: { id: 'do', name: 'Do', provider: 'claude', role: 'do', capabilities: [] } as any, role: 'do',
     task: { taskId: 't', projectId: 'p', title: 'Corpus', prompt: 'work' } as any,
     world: { kind: 'worktree', id: 't', root: '/w/t', branch: 'tavya/t', base: 'main' } as any });
-  expect(prompt).toMatch(/- create_sub_task\(title, prompt, params\?\):[^\n]*saves this task's writable project data/);
+  expect(prompt).toMatch(/- create_sub_task\(title, prompt, params\?, draft\?\):[^\n]*saves this task's writable project data/);
+  expect(prompt).toMatch(/- create_sub_task\([^\n]*draft: true it is only saved, and starts when you call queue_task/);
+});
+
+// pramana#39/#43: "could not seed the parent branch for the child task:
+// pramana-wiki-1320f0a7: the SSH connection to the VM was lost" reached the
+// agent as its failed create_sub_task. A parent world that stays unreachable
+// is infrastructure: the workflow waits it out, then asks a person.
+it.each([
+  ['a connection that stays lost', () => new VmTransportError('the SSH connection to the VM was lost'), 'world-infra'],
+  ['a command that fails', () => new Error('fatal: not a git repository'), undefined],
+] as const)('prepareChildTask reports a parent VM world it cannot seed through %s as %s'.replace('%s as %s', '%s'), async (_name, failure, type) => {
+  const store = await Store.create(':memory:');
+  cleanups.push(() => store.close());
+  const project = await store.createProject('Corpus');
+  const parent = await store.createTask({ projectId: project.id, title: 'Parent', workflow: 'software-dev', workflowVersion: '1', params: { prompt: 'fixture' } });
+  // Landed in a host checkout, as a self-hosted project's are: no network.
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-seed-'));
+  cleanups.push(() => fs.rmSync(local, { recursive: true, force: true }));
+  await gitOrThrow(local, ['init', '-qb', 'main']);
+  const handle = { id: parent.id, kind: 'hetzner', root: '/home/user/karmax', branch: `tavya/${parent.id}`, base: 'main',
+    repos: [{ name: 'pramana-wiki', root: '/home/user/karmax/pramana-wiki', repo: 'git@github.com:o/pramana-wiki.git', localPath: local,
+      branch: `tavya/${parent.id}`, base: 'main' }], meta: { projectId: project.id } };
+  await store.registerWorld(handle as any, project.id);
+  activityContext();
+  const worlds = new WorldRegistry();
+  const exec = vi.fn(async () => { throw failure(); });
+  worlds.register({ kind: 'hetzner', parkable: true, capabilities: { remote: true, pty: true, snapshots: false, ports: true, networkPolicy: false }, create: async () => { throw new Error('unused'); },
+    open: async (opened: WorldHandle) => ({ handle: opened, exec }) as any } as any);
+  const core = makeCoreActivities({ store, worlds, adapters: new Map(), profiles: new ProfileResolver(store, 'mock') });
+  const error = await core.prepareChildTask({ parentTaskId: parent.id, projectId: project.id, title: 'Child', prompt: 'work',
+    base: 'main', target: 'main', parentBranch: handle.branch, project: {}, profiles: {} } as any).then((r) => ({ resolved: r }), (e) => e);
+  expect(exec).toHaveBeenCalled();
+  expect(error?.message).toMatch(/^could not seed the parent branch for the child task: pramana-wiki: /);
+  if (type) expect(error).toMatchObject({ type, nonRetryable: false });
+  else expect(error).not.toBeInstanceOf(ApplicationFailure);
+  expect(await store.childTasks(parent.id)).toEqual([]);
 });

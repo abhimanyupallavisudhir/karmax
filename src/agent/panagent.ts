@@ -6,9 +6,9 @@ import { execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import type { Message, Provider } from '../domain/types.js';
-import { claudeCwdSlug } from './fork.js';
+import { claudeCwdSlug, findProviderSession } from './fork.js';
 import { codexHistoryMetadata, codexRolloutFilename, prepareCodexHistory, CodexHistoryError } from './codex-history.js';
-import { installLocalCodexSnapshot, readLocalCodexHistory } from './codex-history-files.js';
+import { installLocalCodexSnapshot, localCodexCopies, readLocalCodexHistory } from './codex-history-files.js';
 import { publicFetch, publicUrl } from '../mcp/connections/http.js';
 import { BRAND } from '../domain/brand.js';
 
@@ -291,7 +291,12 @@ async function runPanagent(args: string[], reportFile: string): Promise<Panagent
 
 function installNativeImport(provider: 'claude' | 'codex', source: string, sessionId: string,
   forkHome: string, worldPath: string): void {
-  const first = fs.readFileSync(source, 'utf8').split(/\r?\n/).find((line) => line.trim());
+  installNativeImportContent(provider, fs.readFileSync(source), sessionId, forkHome, worldPath);
+}
+
+function installNativeImportContent(provider: 'claude' | 'codex', content: Buffer, sessionId: string,
+  forkHome: string, worldPath: string): void {
+  const first = content.toString('utf8').split(/\r?\n/).find((line) => line.trim());
   if (!first) throw new PanagentError('panagent produced an empty native session');
   let record: any;
   try { record = JSON.parse(first); } catch { throw new PanagentError('panagent produced invalid native JSONL'); }
@@ -300,9 +305,30 @@ function installNativeImport(provider: 'claude' | 'codex', source: string, sessi
   const destination = provider === 'claude'
     ? path.join(forkHome, 'projects', claudeCwdSlug(worldPath), `${sessionId}.jsonl`)
     : path.join(forkHome, 'sessions', 'forked', codexRolloutFilename(record.payload.timestamp, sessionId));
-  fs.mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 });
-  fs.copyFileSync(source, destination);
-  fs.chmodSync(destination, 0o600);
+  // The import's own copies: the id is this task's alone (stableImportSessionId).
+  const others = provider === 'codex' ? localCodexCopies(forkHome, sessionId).map((copy) => copy.file) : [];
+  for (const file of new Set([destination, ...others])) {
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(file, content, { mode: 0o600 });
+    fs.chmodSync(file, 0o600);
+  }
+}
+
+/** Continue the conversion an earlier attempt made of this import, instead of
+ * converting again. A retry used to convert again under the same id; panagent's
+ * bytes are not stable (a release changed them, and every run stamps fresh
+ * ids), and a world that already holds the first conversion refuses a different
+ * second one (#643: "conflicting Codex copies … histories diverge"). In a cloud
+ * world the world's copy is the one Codex saw, so the host takes it; locally
+ * the home's copy is. Returns whether there was one. */
+export async function reuseNativeImport(opts: { provider: 'claude' | 'codex'; sessionId: string; forkHome: string;
+  worldPath: string; readWorld?: () => Promise<Buffer | undefined> }): Promise<boolean> {
+  if (opts.readWorld) {
+    const content = await opts.readWorld();
+    if (content) installNativeImportContent(opts.provider, content, opts.sessionId, opts.forkHome, opts.worldPath);
+    return !!content;
+  }
+  return !!findProviderSession({ provider: opts.provider, session: opts.sessionId, forkHome: opts.forkHome });
 }
 
 function safeSourceName(name?: string): string {

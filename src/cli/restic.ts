@@ -13,7 +13,8 @@ export const RESTIC_VERSION: string = release.version;
  * so a laptop's snapshot and a world's deduplicate against each other. */
 export function backupArgs(parent?: string): string[] {
   return ['backup', '--json', '--host', 'tavya', '--ignore-inode', '--exclude', '.git', '--exclude', '.karmax-injection',
-    '-o', 'rest.connections=32', ...(parent ? ['--parent', parent] : [])];
+    // A save waits for a lock tavya's upkeep holds, as a world's does.
+    '-o', 'rest.connections=32', '--retry-lock', '1h', ...(parent ? ['--parent', parent] : [])];
 }
 
 /**

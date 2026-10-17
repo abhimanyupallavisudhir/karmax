@@ -7,7 +7,7 @@ import { URGENCY_LEVELS, type AgentSpec, type AuthorizationSelection, type Provi
 import {
   AGENT_ROLE_NAMES, PLATFORM_REQUEST_BODY_SCHEMA, PLATFORM_REQUEST_EXCLUDED_PATHS,
   PRIORITY_NAMES, compactSearch, compactOrganizationSearch, compactTags, normalizePlatformPath, normalizeRequestBody,
-  platformRequestPathError, CREATE_TASK_GRANTS, REQUEST_FOR_TASK,
+  platformRequestPathError, CREATE_TASK_GRANTS, REQUEST_FOR_TASK, QUEUE_TASK_DESCRIPTION, queuedTaskReply,
   type CompactTask,
 } from './platform-request.js';
 import { BRAND } from '../domain/brand.js';
@@ -53,6 +53,7 @@ export interface PlatformOps {
   followEvents(taskId: string, a: { type?: string; source?: string; subject?: string; where?: Record<string, unknown>; includeSelf?: boolean; once?: boolean }): Promise<unknown>;
   unfollowEvents(taskId: string, followId?: string): Promise<unknown>;
   getTask(taskId: string): Promise<unknown>;
+  queueTask(taskId: string): Promise<{ id?: string; parentTaskId?: string; params?: Record<string, unknown> }>;
   listTasks(projectId: string): Promise<{ id: string; title: string; workflow: string }[]>;
   searchTasks(projectId: string, query: string): Promise<{ total: number; tasks: CompactTask[] }>;
   /** The organization task list: every project of it the caller can read. */
@@ -132,6 +133,7 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
       return { unfollowed: follows.map((follow) => follow.id) };
     },
     getTask: (id) => api.getTaskView(getToken(), id) as Promise<unknown>,
+    queueTask: (id) => api.queueTask(getToken(), id),
     listTasks: async (pid) => (await api.listTaskSummaries(getToken(), pid)).map((t) => ({ id: t.id, title: t.title, workflow: t.workflow })),
     searchTasks: async (pid, query) => {
       const [result, tags] = await Promise.all([api.searchTasks(getToken(), pid, query), api.listTags(getToken(), pid)]);
@@ -238,6 +240,7 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
       return { unfollowed: follows.map((follow) => follow.id) };
     },
     getTask: (id) => req(`/api/tasks/${id}`),
+    queueTask: (id) => req(`/api/tasks/${id}/queue`, { method: 'POST', body: '{}' }) as Promise<{ id?: string }>,
     listTasks: (pid) => req(`/api/projects/${pid}/tasks`) as Promise<{ id: string; title: string; workflow: string }[]>,
     searchTasks: async (pid, query) => {
       const [result, tags] = await Promise.all([req(`/api/projects/${pid}/search?q=${encodeURIComponent(query)}`), req(`/api/projects/${pid}/tags`)]);
@@ -376,6 +379,11 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
         holdForAuthorization: true });
       return task.authorizationGap ? { id: task.id, draft: true, authorizationGap: task.authorizationGap } : task.id;
     }),
+  );
+  server.registerTool(
+    'queue_task',
+    { description: QUEUE_TASK_DESCRIPTION, inputSchema: { taskId: z.string() } },
+    async (a) => wrap(async () => queuedTaskReply(await ops.queueTask(a.taskId), a.taskId)),
   );
   server.registerTool(
     'list_world_providers',

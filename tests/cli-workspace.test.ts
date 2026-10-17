@@ -4,8 +4,10 @@ import path from 'node:path';
 import { gitOrThrow } from '../src/world/git.js';
 import { parseRef, resolveTarget } from '../src/cli/refs.js';
 import type { Api } from '../src/cli/api.js';
-import { githubSshAliases } from '../src/cli/commands/sync.js';
+import { githubSshAliases, latestGitProgress } from '../src/cli/commands/sync.js';
 import { cliFixture, files } from './helpers/cli-fixture.js';
+import { VERSION } from '../src/cli/version.js';
+import { MIN_CLI_VERSION } from '../src/world/workspace.js';
 
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
@@ -19,6 +21,9 @@ it('clones a project as its world: repositories and wiki, data, secret files; st
   const ws = path.join(f.laptop, 'ws');
   expect(fs.readFileSync(path.join(ws, 'site', 'README.md'), 'utf8')).toBe('# site\n');
   expect(fs.existsSync(path.join(ws, 'site-wiki', '.git'))).toBe(true);
+  // Blobless: only the checked-out commit's files cross the network (a full clone of karmax took a user 10 minutes).
+  for (const repository of ['site', 'site-wiki'])
+    expect(fs.readFileSync(path.join(ws, repository, '.git', 'config'), 'utf8')).toMatch(/partialclonefilter = blob:none/);
   for (const file of f.corpus) expect(fs.readFileSync(path.join(ws, 'site', 'data', file.path)).equals(file.data)).toBe(true);
   const secretFile = path.join(ws, 'site', 'config', 'sa.json');
   expect(fs.readFileSync(secretFile, 'utf8')).toBe('{"key":"x"}');
@@ -187,4 +192,27 @@ it('reads github.com host aliases from an OpenSSH config', () => {
     'Match host other', '  HostName github.com',
   ].join('\n'))).toEqual(['srajma.github.com', 'gh-srajma', 'Work']);
   expect(githubSshAliases('')).toEqual([]);
+});
+
+it("shows git's newest progress record", () => {
+  expect(latestGitProgress(["Cloning into 'karmax'...", 'remote: Enumerating objects: 34594, done.',
+    'remote: Compressing objects:  12% (900/7500)', 'Receiving objects:  45% (15567/34594), 12.30 MiB | 1.20 MiB/s']))
+    .toBe('Receiving objects:  45% (15567/34594), 12.30 MiB | 1.20 MiB/s');
+  expect(latestGitProgress(['remote: Counting objects:  50% (3/6)', "warning: redirecting to https://github.com/x/"]))
+    .toBe('Counting objects:  50% (3/6)');
+  expect(latestGitProgress(["Cloning into 'karmax'...", 'fatal: early EOF', ''])).toBeUndefined();
+});
+
+it('refuses a CLI older than the server speaks to; other clients and current CLIs pass', async () => {
+  const f = await fixture();
+  const meta = (agent: string) => fetch(`${f.server.url}/api/meta`, { headers: { 'user-agent': agent } });
+  const old = await meta('tavya-cli/0.9.9');
+  expect(old.status).toBe(426);
+  expect(((await old.json()) as { error: string }).error).toBe(`tavya 0.9.9 is too old for this server, which needs ${MIN_CLI_VERSION} or newer`);
+  for (const agent of [`tavya-cli/${VERSION}`, `tavya-cli/${MIN_CLI_VERSION}`, 'node', 'Mozilla/5.0'])
+    expect((await meta(agent)).status, agent).toBe(200);
+  // The CLI sends its version on every call (here it is current, so it is served).
+  const served = await f.tavya(f.laptop, ['api', 'GET', '/api/meta']);
+  expect(served.code, served.stderr).toBe(0);
+  expect(JSON.parse(served.stdout).cli).toEqual({ minVersion: MIN_CLI_VERSION });
 });

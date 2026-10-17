@@ -69,6 +69,7 @@ import { CLOUD_WORLD_PROVIDERS } from '../domain/computer.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
 import { MIN_CLI_VERSION, WorkspaceService } from '../world/workspace.js';
+import { cliVersionOf, olderVersion } from '../domain/cli-version.js';
 import { WorkspaceConflict } from '../world/resources.js';
 import { acpModels, claudeModelCatalog, claudeModels, codexModelCatalog, codexModels, opencodeModels, openCodeKeyModels, mergeModels,
   modelDiscoveryFailureReason, type ModelCatalog } from '../agent/models.js';
@@ -1102,13 +1103,13 @@ export class Gateway {
       counts.set(taskId, count);
     };
     for (const request of (await new VaultItems(this.deps.store, this.deps.broker, undefined, organizationId)
-      .requests({ status: 'pending' }))) add(request.taskId);
+      .requests({ status: 'pending' }))) add(request.taskId, !!request.dismissed);
     for (const request of (await new PermissionRequests(this.deps.store, organizationId).requests({ status: 'pending' })))
       add(request.taskId, !!request.dismissed);
     for (const request of (await new AuthorizationRequests(this.deps.store, organizationId).requests({ status: 'pending' })))
       if (request.target.kind === 'task') add(request.target.taskId, !!request.dismissed);
     for (const connection of (await this.connections()?.all()) ?? [])
-      if (['requested', 'connecting'].includes(connection.status)) add(connection.taskId);
+      if (['requested', 'connecting'].includes(connection.status)) add(connection.taskId, !!connection.dismissed);
     return counts;
   }
 
@@ -1753,6 +1754,10 @@ export class Gateway {
     if (p.startsWith('/scim/v2/')) return this.scim(req, res, url);
     if (p.startsWith('/brand/')) return this.brand(p, res, req);
     if (p === '/app.webmanifest' && req.method === 'GET') return (await this.webManifest(res));
+    // A CLI older than this server speaks to is told to update, not left to misread a newer API.
+    const cliVersion = cliVersionOf(req.headers['user-agent']);
+    if (p.startsWith('/api/') && cliVersion && olderVersion(cliVersion, MIN_CLI_VERSION))
+      return this.json(res, 426, { error: `tavya ${cliVersion} is too old for this server, which needs ${MIN_CLI_VERSION} or newer` });
     if (p.startsWith('/api/')) return (await this.api(req, res, url, receivedAt));
     if (p === '/ws') return; // handled by ws
     return (await this.static(p, res, req));
@@ -5391,6 +5396,11 @@ export class Gateway {
         if (project) await this.wikiForTaskStart(project, callerIdentity.humanSubject?.userId);
         return this.json(res, 200, await api.queueTask(token, queueMatch[1]!));
       }
+      const subTasksMatch = p.match(/^\/api\/tasks\/([^/]+)\/sub-tasks$/);
+      if (subTasksMatch && method === 'POST') {
+        const body = (await this.body(req)) as { title?: unknown; prompt?: unknown; params?: unknown };
+        return this.json(res, 200, await api.createSubTaskDraft(token, subTasksMatch[1]!, body ?? {}));
+      }
       const taskPayments = p.match(/^\/api\/tasks\/([^/]+)\/payments$/);
       if (taskPayments && (method === 'GET' || method === 'PUT')) {
         const task = (await store.getTask(taskPayments[1]!));
@@ -7033,7 +7043,7 @@ export class Gateway {
             if (result.connection.status === 'active') this.sweepConnections();
             return this.json(res, 200, result);
           }
-          const match = p.match(/^\/api\/connections\/([^/]+)\/(refresh|access|disconnect|callback|tools|execute)$/);
+          const match = p.match(/^\/api\/connections\/([^/]+)\/(refresh|access|disconnect|dismiss|callback|tools|execute)$/);
           if (match) {
             const id = match[1]!; const action = match[2]!;
             const c = (await service.get(org, id));
@@ -7052,7 +7062,7 @@ export class Gateway {
               }
             } else {
               const userId = requireOwner();
-              if (callerTaskId || (c.ownerId !== userId && !(action === 'disconnect' && !c.ownerId && c.taskId && (await this.deps.tokens.check(token, 'task:edit', { projectId: (await store.getTask(c.taskId))?.projectId, organizationId: org })).ok))) return this.json(res, 403, { error: 'Only the connection owner can manage this account' });
+              if (callerTaskId || (c.ownerId !== userId && !(['disconnect', 'dismiss'].includes(action) && !c.ownerId && c.taskId && (await this.deps.tokens.check(token, 'task:edit', { projectId: (await store.getTask(c.taskId))?.projectId, organizationId: org })).ok))) return this.json(res, 403, { error: 'Only the connection owner can manage this account' });
               if (action === 'callback' && method === 'POST') {
                 const result = await service.finishMcp(org, id, userId, b.state, b.code); this.sweepConnections();
                 return this.json(res, 200, result);
@@ -7070,6 +7080,12 @@ export class Gateway {
               }
               if (action === 'disconnect' && method === 'POST') {
                 const result = await service.disconnect(org, id, userId); this.sweepConnections();
+                return this.json(res, 200, result);
+              }
+              if (action === 'dismiss' && method === 'POST') {
+                const result = (await service.dismiss(org, id, `user:${userId}`));
+                if (c.taskId) (await this.emitTaskEvent({ taskId: c.taskId, type: 'connection.dismissed', ts: Date.now(),
+                  payload: { requestId: c.id } }));
                 return this.json(res, 200, result);
               }
             }
@@ -7444,7 +7460,22 @@ export class Gateway {
         if (vres && method === 'POST') {
           const b = await this.body(req);
           const action = String(b.action ?? '');
-          if (!['once', 'task', 'always', 'deny'].includes(action)) return this.json(res, 400, { error: 'action must be once | task | always | deny' });
+          if (!['once', 'task', 'always', 'deny', 'dismiss'].includes(action)) return this.json(res, 400, { error: 'action must be once | task | always | deny | dismiss' });
+          if (action === 'dismiss') {
+            // Silencing an ask is for whoever it would notify, never the agent asking.
+            const request = (await vault.requests()).find((candidate) => candidate.id === vres[1]);
+            if (request && callerTaskId === request.taskId) return this.json(res, 403, { error: 'an agent cannot dismiss its own request' });
+            try {
+              const dismissed = (await vault.dismiss(vres[1]!, principal));
+              const task = (await store.getTask(dismissed.taskId));
+              if (task && (await store.getProject(task.projectId))?.organizationId === organizationId)
+                (await this.emitTaskEvent({ taskId: dismissed.taskId, type: 'credential.approval-dismissed', ts: Date.now(),
+                  payload: { requestId: dismissed.id } }));
+              return this.json(res, 200, (await this.credentialRequestView(dismissed, organizationId)));
+            } catch (e) {
+              return this.json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+            }
+          }
           // Approving hands the requester the secret; anyone who manages credentials may refuse.
           if (action !== 'deny') {
             const refused = (await vaultReadRefusal('approve credential requests'));

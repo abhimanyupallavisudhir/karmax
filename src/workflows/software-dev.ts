@@ -57,6 +57,7 @@ import {
   SubTaskAction,
   ParentResponse,
   SubTaskRequest,
+  QueuedSubTask,
   SubTaskResponse,
   TaskPullRequest,
   GithubLandingParticipant,
@@ -212,6 +213,9 @@ export const retrySignal = defineSignal('retry');
 export const keepOwnResourcesSignal = defineSignal(SIG.keepOwnResources);
 export const mergeGrantedSignal = defineSignal(SIG_MERGE_GRANTED);
 type CredentialKind = 'login' | 'ambient' | 'key';
+/** A sub-task to start: one an agent asked for this turn, or a queued draft
+ * whose saved record (`draftTaskId`) holds its title, prompt and agents. */
+type SpawnRequest = SubTaskRequest & { draftTaskId?: string };
 export const accountGrantedSignal = defineSignal<[{
   turnId: string;
   accountId: string;
@@ -234,6 +238,10 @@ const REPLY_TO_SPEAKERS = 'software-dev-reply-to-speakers-v1';
 const UNASKED_REPLY_TO_SPEAKERS = 'software-dev-unasked-reply-to-speakers-v1';
 export const raiseFromChildSignal = defineSignal<[ChildRaise]>('raiseFromChild');
 export const subtaskRedirectedSignal = defineSignal<[{ childTaskId: string }]>(SIG.subtaskRedirected);
+/** A draft sub-task of this task was queued (POST /api/tasks/:id/queue): the
+ * task prepares and starts it like one its agent creates, after the agent's
+ * current turn. */
+export const queueSubTaskSignal = defineSignal<[QueuedSubTask]>(SIG.queueSubTask);
 /** A parent answers a child that raised to it — maps onto the same confirm/retry/
  *  cancel/follow-up transitions a human would drive (SPEC §5.3). */
 export const parentResponseSignal = defineSignal<[ParentResponse]>('parentResponse');
@@ -335,6 +343,11 @@ const HUMAN_STEP_OWN_CONFIRM = 'software-dev-human-step-own-confirm-v1';
 /** A message to the agent at a failed landing returns the proposal to Do,
  * as at every other Merge wait on people, instead of retrying the merge. */
 const ESCALATED_MERGE_MESSAGE_TO_DO = 'software-dev-escalated-merge-message-to-do-v1';
+/** Open PR's checks wake a parked world, and wait out one that cannot wake (pramana#56). */
+const OPEN_PR_WAITS_FOR_WORLD = 'software-dev-open-pr-waits-for-world-v1';
+/** A sub-task whose parent world cannot be reached is waited out, then a
+ * person's, never the asking agent's (pramana#39/#43). */
+const SUBTASK_PREPARE_WAITS_FOR_WORLD = 'software-dev-subtask-prepare-waits-for-world-v1';
 const quietNotice = (m: Message): boolean => m.id.startsWith(QUIET_NOTICE);
 const clip = (text: string, max: number) => text.length > max ? `${text.slice(0, max)}…` : text;
 /** A turn can return while the agent's own in-harness sub-agents (Claude Agent SDK
@@ -953,6 +966,8 @@ async function softwareDevImpl(
   /** A pull request (v1.30): the commit its agent opened it at again, not yet in its worktree. */
   let pendingHead: string | undefined;
   const awaitingResponse = new Set<string>(continued?.subTasks.awaitingResponse);
+  /** Draft sub-tasks queued and not yet started (`queueSubTaskSignal`). */
+  const queuedSubTasks: QueuedSubTask[] = [...continued?.subTasks.queued ?? []];
   // Cross-task collaboration is a durable, event-driven join. The requesting
   // agent keeps working for the rest of its current turn; if it finishes before
   // the target publishes, the workflow parks here and wakes on settlement.
@@ -2132,6 +2147,11 @@ async function softwareDevImpl(
   setHandler(subtaskRedirectedSignal, ({ childTaskId }) => {
     if (awaitingResponse.delete(childTaskId)) subtaskNags = 0;
   });
+  setHandler(queueSubTaskSignal, (queued) => {
+    if (!queued?.taskId || subTaskIds.includes(queued.taskId)
+      || queuedSubTasks.some((q) => q.taskId === queued.taskId)) return;
+    queuedSubTasks.push({ taskId: queued.taskId, title: String(queued.title ?? '') });
+  });
   // Our parent answered a raise. Map its decision onto the SAME flags a human drives
   // (confirm/retry/cancel/follow-up) so the parent is literally our confirmer.
   setHandler(parentResponseSignal, (resp) => {
@@ -2638,6 +2658,22 @@ async function softwareDevImpl(
    * its Hetzner world took to make, and was pressed again. */
   async function publishRetried(): Promise<void> {
     if (patched('software-dev-publish-retried-stage-v1')) await publish();
+  }
+
+  /** Open PR's readiness check, which wakes a parked world. A provider can
+   * refuse that wake for a while (pramana#56: the Hetzner project's CPU limit
+   * was full, and the task failed). So the click shows at once as the
+   * proposal being prepared (`announce`), and a world that cannot wake is
+   * waited out like any stage's infrastructure, then escalated with Retry. */
+  async function checkProposal(announce = true): ReturnType<coreActivities['checkProposal']> {
+    if (!patched(OPEN_PR_WAITS_FOR_WORLD)) return core.checkProposal(world as any);
+    if (announce) {
+      stage = 'pr';
+      status = 'active';
+      waitingFor = undefined;
+      await publish();
+    }
+    return withResolve('pr', () => core.checkProposal(world as any));
   }
 
   /** May `session` (minted under `sessionHome`) be resumed under `home` now? Only
@@ -3446,6 +3482,7 @@ async function softwareDevImpl(
     if (msgs.slice(participantSessions[key]!.seen).some((m) => addressedTo(m, key)))
       agentQueue = enqueueAgents(agentQueue, [key]);
     if (turn.subTasks?.length) await spawnSubTasks(turn.subTasks, key);
+    await startQueuedSubTasks();
     if (turn.subTaskResponses?.length) await applySubTaskResponses(turn.subTaskResponses);
     return { ...turn, ...(reply ? { reply } : {}) };
   }
@@ -3902,7 +3939,7 @@ Inspect the complete current diff and specifically compare its delta from the re
    *  off — and merges back into — THIS task's world branch, so `main` sees one merge at
    *  the top. Commit-on-spawn snapshots our work first (worktrees share commits, not the
    *  dirty tree) so children fork the current state. */
-  async function spawnSubTasks(list: SubTaskRequest[], requester = MAIN_AGENT) {
+  async function spawnSubTasks(list: SpawnRequest[], requester = MAIN_AGENT) {
     await core.commitWork(world as any, `tavya: snapshot before sub-tasks for ${taskId}`);
     for (const [index, s] of list.entries()) {
       // Preserve recorded spawn/drop decisions during replay. New decisions have
@@ -3932,6 +3969,8 @@ Inspect the complete current diff and specifically compare its delta from the re
         // The child's own agent choice (PL-11). Only the activity's argument
         // changes, never a command, so recorded histories replay unchanged.
         ...(s.params ? { params: s.params } : {}),
+        // A queued draft: its saved record is prepared, not a new one.
+        ...(s.draftTaskId ? { draftTaskId: s.draftTaskId } : {}),
       };
       let childInput: Awaited<ReturnType<coreActivities['prepareChildTask']>>;
       // A sub-task that cannot be prepared (its parent's data cannot be saved,
@@ -3939,7 +3978,7 @@ Inspect the complete current diff and specifically compare its delta from the re
       if (patched('subtask-prepare-failure-to-agent-v1')) {
         preparingSubTask = true;
         await publish();
-        try { childInput = await childPreparation.prepareChildTask(prepare); }
+        try { childInput = await prepareSubTask(s, prepare); }
         catch (err) {
           if (isCancellation(err)) throw err;
           preparingSubTask = false;
@@ -3973,23 +4012,57 @@ Inspect the complete current diff and specifically compare its delta from the re
     await publish();
   }
 
+  /** Prepare a sub-task. Its parent's world can be unreachable for longer
+   * than the activity's retries (a VM whose connection stays lost): that is
+   * waited out as any stage's infrastructure is, visibly, a Retry or a cancel
+   * ending a wait early. */
+  async function prepareSubTask(request: SubTaskRequest, prepare: Parameters<coreActivities['prepareChildTask']>[0]) {
+    for (let waits = 0; ; waits++) {
+      try { return await childPreparation.prepareChildTask(prepare); }
+      catch (err) {
+        if (!isInfraFailure(err) || waits >= INFRA_BACKOFF_MS.length || !patched(SUBTASK_PREPARE_WAITS_FOR_WORLD)) throw err;
+        const wait = INFRA_BACKOFF_MS[waits]!;
+        const resumeStatus = status;
+        status = 'waiting';
+        waitingFor = { kind: 'retry', detail: `Retry ${waits + 1} of ${INFRA_BACKOFF_MS.length}`, until: Date.now() + wait };
+        error = `infrastructure: ${describeError(err)} — preparing sub-task "${request.title}" again in ${Math.round(wait / 1000)}s`;
+        await publish();
+        await condition(() => cancelled || retryRequested || halted(), wait);
+        waitingFor = undefined;
+        status = resumeStatus;
+        error = undefined;
+        if (cancelled || halted()) throw new Cancelled();
+        retryRequested = false;
+        await publish();
+      }
+    }
+  }
+
   /** Tell the agent that asked for `failed` (and the requests after it in the
    * same turn, not attempted) why it was not created: at its next turn, as a
    * failed create_sub_task. Outside Do no turn of it follows (a Reviewer at
    * Review), so the task escalates instead, as a failed publication does, and
    * Retry prepares them again. */
-  async function unpreparedSubTasks(failed: SubTaskRequest, rest: SubTaskRequest[], err: unknown, requester: string) {
+  async function unpreparedSubTasks(failed: SpawnRequest, rest: SpawnRequest[], err: unknown, requester: string) {
     const reason = failureHasType(err, 'resource-kept-changing')
       ? `This task's project data could not be saved for it to start from: ${innermostMessage(err)}` : innermostMessage(err);
     const others = rest.length
-      ? ` ${rest.map((r) => `"${r.title}"`).join(', ')} ${rest.length === 1 ? 'was' : 'were'} not created either.` : '';
-    const what = `create_sub_task "${failed.title}" failed: no sub-task was created. ${reason}${/[.!?]$/.test(reason) ? '' : '.'}${others}`;
-    const text = `${what} Nothing was lost; call create_sub_task again once that is resolved.`;
+      ? ` ${rest.map((r) => `"${r.title}"`).join(', ')} ${rest.length === 1 ? 'was' : 'were'} not ${failed.draftTaskId ? 'started' : 'created'} either.` : '';
+    const ended = `${reason}${/[.!?]$/.test(reason) ? '' : '.'}${others}`;
+    const what = failed.draftTaskId
+      ? `Starting the draft sub-task "${failed.title}" (${failed.draftTaskId}) failed: it is still a draft. ${ended}`
+      : `create_sub_task "${failed.title}" failed: no sub-task was created. ${ended}`;
+    const text = `${what} Nothing was lost; ${failed.draftTaskId ? 'queue it again (queue_task)' : 'call create_sub_task again'} once that is resolved.`;
     await core.recordEvent(taskId, 'subtask.failed', { title: failed.title, error: reason, requester,
       ...(rest.length ? { notAttempted: rest.map((r) => r.title) } : {}) });
     const addressed = multiAgent && requester !== MAIN_AGENT;
-    msgs.push({ id: `st-${msgs.length}`, role: 'user', text, ts: Date.now(), ...(addressed ? { to: [agentSelector(requester)] } : {}) });
-    if (stage === 'do') {
+    const tell = () => msgs.push({ id: `st-${msgs.length}`, role: 'user', text, ts: Date.now(), ...(addressed ? { to: [agentSelector(requester)] } : {}) });
+    // An unreachable world, still so after the waits, is no agent's to fix: a
+    // person's Retry creates it. The agent hears only if the person answers
+    // otherwise (a follow-up), so it can ask again itself.
+    const infrastructure = isInfraFailure(err) && patched(SUBTASK_PREPARE_WAITS_FOR_WORLD);
+    if (!infrastructure) tell();
+    if (stage === 'do' && !infrastructure) {
       if (addressed) agentQueue = enqueueAgents(agentQueue, [requester]);
       await publish();
       return;
@@ -4010,9 +4083,16 @@ Inspect the complete current diff and specifically compare its delta from the re
     error = undefined;
     stage = priorStage;
     status = 'active';
-    if (cancelled || !retryRequested) return;
+    if (cancelled) return;
+    if (!retryRequested) { if (infrastructure) tell(); return; }
     retryRequested = false;
     await spawnSubTasks([failed, ...rest], requester);
+  }
+
+  /** Prepare and start the draft sub-tasks queued since the last call. */
+  async function startQueuedSubTasks() {
+    const drafts = queuedSubTasks.splice(0).filter((queued) => !subTaskIds.includes(queued.taskId));
+    if (drafts.length) await spawnSubTasks(drafts.map((queued) => ({ title: queued.title, prompt: '', draftTaskId: queued.taskId })));
   }
 
   /** Send the Do agent's answers down to the children they target (SPEC §5.3). */
@@ -4114,7 +4194,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         goalMode,
         confirmLayers: softwareDevConfirmLayers,
         subTasks: { ids: subTaskIds, outstanding: [...outstanding], awaitingResponse: [...awaitingResponse], raises, settled,
-          ...(shipments.length ? { shipments } : {}) },
+          ...(shipments.length ? { shipments } : {}), ...(queuedSubTasks.length ? { queued: queuedSubTasks } : {}) },
         collaborations: { pending: [...pendingCollaborations], settled: [...settledCollaborations] },
         consumed: [...consumed],
         checkoutHeads,
@@ -4326,7 +4406,7 @@ Inspect the complete current diff and specifically compare its delta from the re
     status = 'active';
     waitingFor = undefined;
     await publish();
-    const readiness = await core.checkProposal(world as any);
+    const readiness = await checkProposal(false);
     if (!readiness.ready) {
       const detail = readiness.conflict ?? readiness.dirty ?? readiness.note ?? 'the proposal is not ready';
       msgs.push({
@@ -4447,6 +4527,8 @@ Inspect the complete current diff and specifically compare its delta from the re
     // sees their raises/results at the top of this turn — this is what lets us keep
     // working while they run, rather than blocking on them.
     drainChildEvents();
+    // Drafts queued while the task waited start before the agent's turn.
+    await startQueuedSubTasks();
     if (childLandedSinceRefresh) {
       childLandedSinceRefresh = false;
       if (resourceCandidateReview && patched('subtask-resource-refresh-v1')) await refreshResourcesFromChildren();
@@ -4497,6 +4579,7 @@ Inspect the complete current diff and specifically compare its delta from the re
     // Sub-tasks run in the BACKGROUND: spawn is non-blocking, and answers go straight
     // down to the children they target (SPEC §5.3).
     if (turn.subTasks?.length) await spawnSubTasks(turn.subTasks);
+    await startQueuedSubTasks();
     if (turn.subTaskResponses?.length) await applySubTaskResponses(turn.subTaskResponses);
     // Agents called while the main agent worked run now, in call order, before
     // its turn is acted on: what they say may call it back (mainUnread below).
@@ -4614,7 +4697,7 @@ Inspect the complete current diff and specifically compare its delta from the re
           : { kind: 'subtask' };
         openPrInert = needsHuman;
         await publish();
-        const wake = () => raises.length > 0 || settled.length > 0 || cancelled || mainUnread();
+        const wake = () => raises.length > 0 || settled.length > 0 || cancelled || mainUnread() || queuedSubTasks.length > 0;
         // If a child is still awaiting OUR reply (it raised a needs_confirmation /
         // needs_info / blocked that we drained but haven't answered), we must not
         // park forever: a child at Review neither re-raises nor settles, so `wake`
@@ -4968,7 +5051,9 @@ Inspect the complete current diff and specifically compare its delta from the re
           // unchanged — and with nothing left, it is done without a Review.
           if (shipments.length) {
             const settledAt = (name: string) => [...shipments].reverse().find((shipment) => shipment.checkout === name)?.head;
-            const own: string[] = (await core.checkoutsWithWork(world as WorldHandle, target))
+            // The world may have parked while they settled: wake it as Open PR does.
+            const withWork = () => core.checkoutsWithWork(world as WorldHandle, target);
+            const own: string[] = (await (patched(OPEN_PR_WAITS_FOR_WORLD) ? withResolve('pr', withWork) : withWork()))
               .filter((checkout) => !checkout.head || checkout.head !== settledAt(checkout.name)).map((checkout) => checkout.name);
             if (!own.length) {
               prRequested = false;
@@ -5006,7 +5091,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         // The Do agent owns commit-vs-ignore judgment. The workflow validates
         // the result, and a refused proposal goes back to the same conversation
         // instead of invoking a second "Merge" personality.
-        const readiness = await core.checkProposal(world as any);
+        const readiness = await checkProposal();
         if (!readiness.ready) {
           const detail = readiness.conflict ?? readiness.dirty ?? readiness.note ?? 'the proposal is not ready';
           msgs.push({

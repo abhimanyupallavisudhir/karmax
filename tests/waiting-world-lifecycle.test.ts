@@ -1,6 +1,8 @@
 import * as __asyncCollections from '../src/util/async-collections.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Context } from '@temporalio/activity';
+import { ApplicationFailure } from '@temporalio/common';
+import { ProviderCapacityFull } from '../src/agent/limits.js';
 import { Store } from '../src/store/db.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { WorldAccessService } from '../src/world/access.js';
@@ -406,6 +408,26 @@ describe('separate waiting-world maintenance', () => {
     expect(await f.store.worldState(f.handle.id)).toBe('parked');
     expect((await f.store.worldLease(taken!))?.state).not.toBe('active');
     expect((await f.store.currentWorld(f.handle.id))?.meta?.worldLeaseId ?? null).toBeNull();
+  });
+
+  // pramana#56: Return to Review woke a parked Hetzner world for checkProposal,
+  // Hetzner refused (the project's CPU limit was full), and the failure reached
+  // the workflow as a plain "ProviderCapacityFull" error, which failed the task.
+  it('reports a world that cannot wake for any activity as infrastructure to wait out', async () => {
+    const f = await fixture('hetzner');
+    await f.store.setWorldState(f.handle, 'parked');
+    f.runners.acquire.mockImplementation(async () => ({ leaseId: (await f.store.requestWorldLease({ runnerPoolId: 'test-cap',
+      organizationId: f.project.organizationId!, projectId: f.project.id, taskId: f.task.id, worldId: f.handle.id })).id,
+    runnerPoolId: 'test-cap' }));
+    await f.store.createRunnerPool({ id: 'test-cap', organizationId: f.project.organizationId!, name: 'Test', provider: 'hetzner',
+      mode: 'customer', capacity: { activeWorlds: 1, cpu: 2, memoryMb: 2048, gpu: 0 }, enabled: true });
+    f.open.mockImplementation(async () => { throw new ProviderCapacityFull("Hetzner refused a 16-CPU server: this Hetzner project's limit on shared CPUs is full"); });
+    vi.spyOn(Context, 'current').mockReturnValue({ heartbeat() {}, cancellationSignal: new AbortController().signal } as any);
+    const failed = await f.core.checkProposal(f.handle).then(() => undefined, (error) => error);
+    expect(failed).toBeInstanceOf(ApplicationFailure);
+    expect(failed).toMatchObject({ type: 'world-infra', nonRetryable: false });
+    expect(failed.message).toContain('shared CPUs is full');
+    expect(await f.store.worldState(f.handle.id)).toBe('parked');
   });
 
   it('propagates maintenance failure without repeating the authoritative publication', async () => {

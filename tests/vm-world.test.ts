@@ -6,7 +6,8 @@ import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import ssh2 from 'ssh2';
 import { Duplex, Readable } from 'node:stream';
-import { generateSshKeyPair, SshTransport } from '../src/world/vm/ssh.js';
+import { generateSshKeyPair, SshTransport, VmTransportError } from '../src/world/vm/ssh.js';
+import { isTransportError } from '../src/agent/limits.js';
 import { VmWorld } from '../src/world/vm/world.js';
 import type { WorldHandle, WorldPtyTermination } from '../src/world/types.js';
 import { sshdAvailable, startLocalSshd, type LocalSshd } from './helpers/local-sshd.js';
@@ -44,6 +45,7 @@ describe('VM file reads', () => {
   it('leaves no stream erroring unheard when the connection closes before its handle does', async () => {
     const transport = new SshTransport(async () => { throw new Error('unused'); });
     (transport as any).sftp = async () => ({
+      once() {}, removeListener() {},
       // As ssh2's ReadStream: no auto-destroy, and on 'end' it closes its handle itself.
       createReadStream: () => {
         const stream = new Readable({
@@ -226,6 +228,142 @@ describe.skipIf(!sshdAvailable)('VM world over SSH', () => {
     expect(await world.diagnose!({ since: Date.now() - 60_000 })).toBeUndefined();
     await world.destroy();
     expect(destroyed).toBe(1);
+  });
+});
+
+/**
+ * A connection that drops (pramana#39/#41/#43, 2026-10-14: "could not seed the
+ * parent branch for the child task: …: the SSH connection to the VM was lost").
+ * Branch publication is dozens of commands and file transfers in a row; one
+ * dropped connection failed all of it, the sub-task with it. The transport
+ * reconnects instead: a command runs once and its result is collected after
+ * the drop, a read resumes from the byte it reached, a write is sent again.
+ */
+describe.skipIf(!sshdAvailable)('VM world over a connection that drops', () => {
+  let sshd: LocalSshd;
+  let root: string;
+  beforeAll(async () => {
+    sshd = await startLocalSshd();
+    root = path.join(sshd.home, 'karmax');
+    fs.mkdirSync(root, { recursive: true });
+  });
+  afterAll(async () => { await sshd?.stop(); });
+
+  /** A transport whose connection the test cuts like a network would: no
+   * goodbye, the socket just dies (optionally once `afterBytes` were sent). */
+  function droppable(options: { refuseAfter?: number } = {}) {
+    const sockets: net.Socket[] = [];
+    let dials = 0;
+    let sentLimit: number | undefined;
+    const transport = new SshTransport(async () => sshd.endpoint, {
+      reconnectDelaysMs: [50, 100, 200],
+      socket: async (endpoint) => {
+        dials++;
+        if (options.refuseAfter !== undefined && dials > options.refuseAfter)
+          throw Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' });
+        const tcp = net.connect(endpoint.port, endpoint.host);
+        await new Promise((resolve, reject) => tcp.once('connect', resolve).once('error', reject));
+        sockets.push(tcp);
+        let sent = 0;
+        const write = tcp.write.bind(tcp);
+        tcp.write = ((chunk: any, ...rest: any[]) => {
+          sent += chunk.length;
+          if (sentLimit !== undefined && sent > sentLimit) { sentLimit = undefined; tcp.destroy(); return false; }
+          return write(chunk, ...rest);
+        }) as typeof tcp.write;
+        return tcp;
+      },
+    });
+    return {
+      transport,
+      dials: () => dials,
+      drop: () => sockets.at(-1)!.destroy(),
+      dropAfterSending: (bytes: number) => { sentLimit = bytes; },
+    };
+  }
+  const handle = (): WorldHandle => ({ version: 2, kind: 'vmtest', provider: 'vmtest', id: 'task_drop', root, workspaceRoot: root,
+    branch: 'karmax/task_drop', base: 'main', sealedProviderRef: 'test' });
+
+  it('runs a command once and returns its result when the connection drops while it runs', async () => {
+    const link = droppable();
+    const world = new VmWorld(handle(), link.transport, sshd.home, { destroy: async () => undefined });
+    try {
+      // It prints into the channel while the connection is gone: without care,
+      // that alone kills it (EPIPE), and it must not run a second time.
+      const marker = `line-${Date.now()}`;
+      const running = world.exec('sh', ['-c', `echo run >> runs.log; for i in 1 2 3 4 5 6; do echo "${marker} $i"; sleep 0.2; done; echo oops >&2; exit 3`]);
+      await waitFor(() => fs.existsSync(path.join(root, 'runs.log')));
+      link.drop();
+      expect(await running).toEqual({ stdout: [1, 2, 3, 4, 5, 6].map((i) => `${marker} ${i}\n`).join(''), stderr: 'oops\n', code: 3 });
+      expect(fs.readFileSync(path.join(root, 'runs.log'), 'utf8')).toBe('run\n');
+      expect(link.dials()).toBe(2);
+      // Its receipt goes with the next command, which the client sends knowing it has the result.
+      await world.exec('true', []);
+      const receipts = (await world.exec('sh', ['-c', `grep -l "${marker}" /dev/shm/karmax-exec/* /tmp/karmax-exec/* 2>/dev/null | wc -l`])).stdout.trim();
+      expect(receipts).toBe('0');
+    } finally { link.transport.close(); }
+  });
+
+  it('collects a short command that finished while the connection was down', async () => {
+    const link = droppable();
+    try {
+      const running = link.transport.exec(`sleep 0.3; echo finished; echo ran >> ${path.join(root, 'short.log')}`, { timeoutMs: 30_000 });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      link.drop();
+      const result = await running;
+      expect([result.stdout.toString(), result.code]).toEqual(['finished\n', 0]);
+      expect(fs.readFileSync(path.join(root, 'short.log'), 'utf8')).toBe('ran\n');
+    } finally { link.transport.close(); }
+  });
+
+  it('resumes a file read from the byte it reached, and sends a write again', async () => {
+    const link = droppable();
+    const world = new VmWorld(handle(), link.transport, sshd.home, { destroy: async () => undefined });
+    try {
+      const big = Buffer.from(Array.from({ length: 6 * 1024 * 1024 }, (_, i) => i % 251));
+      fs.writeFileSync(path.join(root, 'read.bin'), big);
+      const chunks: Buffer[] = [];
+      for await (const chunk of world.readFileStream!('read.bin')) {
+        if (!chunks.length) link.drop();
+        chunks.push(chunk);
+      }
+      expect(Buffer.concat(chunks).equals(big)).toBe(true);
+
+      await world.exec('true', []);
+      link.dropAfterSending(2 * 1024 * 1024);
+      await world.writeFileBuffer!('written.bin', big);
+      expect(fs.readFileSync(path.join(root, 'written.bin')).equals(big)).toBe(true);
+      expect(link.dials()).toBe(3);
+    } finally { link.transport.close(); }
+  });
+
+  it('never runs a command given input twice: one cut while it runs fails as a lost connection', async () => {
+    const link = droppable();
+    try {
+      const running = link.transport.exec(`cat > /dev/null; echo run >> ${path.join(root, 'input.log')}; sleep 1`, { input: 'secret\n', timeoutMs: 30_000 });
+      await waitFor(() => fs.existsSync(path.join(root, 'input.log')));
+      link.drop();
+      const error = await running.catch((caught) => caught);
+      expect(error).toBeInstanceOf(VmTransportError);
+      expect(isTransportError(error)).toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 1_500));
+      expect(fs.readFileSync(path.join(root, 'input.log'), 'utf8')).toBe('run\n');
+    } finally { link.transport.close(); }
+  });
+
+  it('gives up after a few reconnects when the machine stays unreachable, as a transport failure', async () => {
+    const link = droppable({ refuseAfter: 1 });
+    try {
+      await link.transport.exec('true');
+      link.drop();
+      await new Promise((resolve) => setTimeout(resolve, 50)); // the client has seen it close
+      const started = Date.now();
+      const error = await link.transport.exec('echo hello').catch((caught) => caught);
+      expect(error).toBeInstanceOf(VmTransportError);
+      expect(isTransportError(error)).toBe(true);
+      expect(link.dials()).toBe(5); // the first connection, then 1 + 3 retries
+      expect(Date.now() - started).toBeLessThan(5_000);
+    } finally { link.transport.close(); }
   });
 });
 
