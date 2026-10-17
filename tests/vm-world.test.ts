@@ -1,4 +1,5 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
@@ -91,6 +92,26 @@ describe.skipIf(!sshdAvailable)('VM world over SSH', () => {
     expect(result).toEqual({ stdout: `out\n${path.join(sshd.home, 'karmax', 'sub')}\nit's here\n`, stderr: 'err\n', code: 3 });
     // A secret reaches a helper on stdin, never on its command line.
     expect((await world.exec('cat', [], { input: 'secret\n' })).stdout).toBe('secret\n');
+  });
+
+  // A receipt id is base64url, so one in 64 starts with "-"; the wrapper's
+  // `rm -f <id>.*` then read the files as options and deleted none of the
+  // batch, so receipts piled up on the VM (and "drops while it runs" below
+  // flaked on CI #2041 and #2052 when its next command carried such an id).
+  it('deletes a collected receipt whose id starts with a dash', async () => {
+    const random = crypto.randomBytes;
+    const spy = vi.spyOn(crypto, 'randomBytes').mockImplementation(((size: number) => {
+      const bytes = random(size);
+      if (size === 9) bytes[0] = 0xf8; // base64url "-"
+      return bytes;
+    }) as typeof crypto.randomBytes);
+    const marker = `dash-${Date.now()}`;
+    try {
+      expect((await world.exec('echo', [marker])).stdout).toBe(`${marker}\n`);
+      await world.exec('true', []);
+    } finally { spy.mockRestore(); }
+    const left = (await world.exec('sh', ['-c', `grep -l "${marker}" /dev/shm/karmax-exec/* /tmp/karmax-exec/* 2>/dev/null; true`])).stdout;
+    expect(left).toBe('');
   });
 
   // Behind Fly's TLS edge a short command's exec reply, output, exit status

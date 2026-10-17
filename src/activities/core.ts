@@ -38,6 +38,7 @@ import { finalizeMerge, MergeResult } from '../world/merge.js';
 import { applyAgentSpec, ProfileResolver } from '../agent/profiles.js';
 import {
   apiKeyEnv,
+  assertRunnableProvider,
   canonicalModelProvider,
   credentialAliases,
   credentialMatchesProfile,
@@ -2406,6 +2407,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const selectedTurn = (await turnProfile(args.task, args.role, args.explicitProfileId));
       const avatar = selectedTurn.avatar;
       let profile = selectedTurn.profile;
+      try { assertRunnableProvider(profile); } catch (error) {
+        throw ApplicationFailure.create({ message: (error as Error).message, type: 'agent-error', nonRetryable: true });
+      }
       const leasedCredentialProvider = args.accountCredentialProvider
         ? canonicalModelProvider(args.accountCredentialProvider)
         : undefined;
