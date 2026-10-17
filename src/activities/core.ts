@@ -101,9 +101,9 @@ import { localTaskBrowserUrl, WORLD_CDP_URL } from '../autonomy/task-browser.js'
 import { tokenToInject } from '../autonomy/config-homes.js';
 import { findProviderSession, materializeFork } from '../agent/fork.js';
 import { CodexHistoryError } from '../agent/codex-history.js';
-import { importWithPanagent, stableImportSessionId, looksLikeConversationUrl, publicConversationShare, type PanagentSource } from '../agent/panagent.js';
+import { importWithPanagent, reuseNativeImport, stableImportSessionId, looksLikeConversationUrl, publicConversationShare, type PanagentSource } from '../agent/panagent.js';
 import { publicShare, publicConversationHtml } from '../gateway/conversation-sharing.js';
-import { isRemoteAgentWorld, materializeRemoteSession, prewarmRemoteAgentHome } from '../agent/remote-process.js';
+import { isRemoteAgentWorld, materializeRemoteSession, prewarmRemoteAgentHome, readRemoteImport } from '../agent/remote-process.js';
 import { checkWorldDisk, diskNotice, diskRatio, diskWasFull, DISK_REARM_RATIO, DISK_WARN_RATIO, isDiskFullMessage, largestWorldPaths,
   outOfDiskMessage, worldUsage, type DiskCheck } from '../world/disk.js';
 import { computerLimits } from '../domain/computer-limits.js';
@@ -2684,17 +2684,30 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           : profile.provider === 'opencode' ? path.join('.local', 'share', 'opencode')
           : '.claude';
         const forkHome = resolvedAuth?.configHome || path.join(os.homedir(), ambientHome);
-        // An import runs only while this role has no session, so a retry may
-        // replace the copy an earlier attempt wrote: the same source keeps one id.
+        // An import runs only while this role has no session; the same source
+        // keeps one id. A retry continues the conversion an earlier attempt made
+        // (in a cloud world, the world's copy): converting again gives other
+        // bytes under that id, which the world refuses (#643).
         const applyPanagent = async (source: PanagentSource, mode: 'context' | 'transcript', origin: string) => {
+          const native = !apiRail && (profile.provider === 'claude' || profile.provider === 'codex');
+          const sessionId = stableImportSessionId(args.taskId, args.role, profile.provider, origin);
+          if (native && await reuseNativeImport({
+            provider: profile.provider as 'claude' | 'codex', sessionId, forkHome,
+            worldPath: worldWorkingDirectory(world.handle),
+            ...(remoteSubscriptionRail ? { readWorld: () => readRemoteImport(world, profile.provider as 'claude' | 'codex', forkHome, sessionId) } : {}),
+          })) {
+            session = sessionId;
+            (await record(args.taskId, 'session.import.reused', { session: sessionId }));
+            return 'native' as const;
+          }
           const imported = await importWithPanagent({
             source,
             provider: profile.provider,
             forkHome,
             worldPath: worldWorkingDirectory(world.handle),
             mode,
-            native: !apiRail && ['claude', 'codex'].includes(profile.provider),
-            sessionId: stableImportSessionId(args.taskId, args.role, profile.provider, origin),
+            native,
+            sessionId,
           });
           if (imported.kind === 'native') session = imported.sessionId;
           else {

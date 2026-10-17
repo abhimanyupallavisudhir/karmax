@@ -53,6 +53,13 @@ the copy's identity: an earlier release had already named a copy of the same
 history that kept the ids, and reusing that name failed every retry with
 "conflicting copies … histories diverge".
 
+A retried import continues the conversion its first attempt made instead of
+converting again (`reuseNativeImport`): the id is stable per task, role and
+source, but panagent's bytes are not (a release changed them, and each run stamps
+fresh ids), and a cloud world that already holds the first conversion refuses a
+different second one under the same id. In a cloud world the world's copy wins
+and is copied to the host before seeding; locally the home's copy is reused.
+
 ## Rules
 
 - Never rewrite source histories, change ancestor files, or delete originals after
