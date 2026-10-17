@@ -51,7 +51,8 @@ vi.mock('@temporalio/workflow', async (importOriginal) => ({
 }));
 import { justDoV1_7 } from '../src/workflows/just-do.js';
 import { mergeOnlyV1_7 } from '../src/workflows/merge-only.js';
-import { softwareDevV1_20, softwareDevV1_26, softwareDevV1_27, softwareDevV1_28, subtaskRaiseText } from '../src/workflows/software-dev.js';
+import { softwareDevV1_20, softwareDevV1_26, softwareDevV1_27, softwareDevV1_28, softwareDevV1_29, subtaskRaiseText } from '../src/workflows/software-dev.js';
+import { ActivityFailure, ApplicationFailure, RetryState } from '@temporalio/common';
 import { createAgentTurnLeaser } from '../src/workflows/agent-turn-lease.js';
 import { makeTurnPreparationActivities } from '../src/activities/turn-preparation.js';
 
@@ -1241,5 +1242,69 @@ describe('a sub-task that cannot be prepared', () => {
     wf.wait = () => wf.handlers.get('cancel')!();
     await expect(softwareDevV1_28(withRepo)).rejects.toThrow('Activity task failed');
     expect(wf.activities.runAgentTurn).toHaveBeenCalledOnce();
+  });
+});
+
+// pramana#56: "Return to Review & Confirm" on a task whose parked Hetzner world
+// could not start (the project's CPU limit was full). Nothing changed on the
+// page for the 17 s the wake took, a second click queued another, and then the
+// task failed outright: checkProposal's world-infra failure escaped the workflow.
+describe('Return to Review while the world cannot wake (pramana#56)', () => {
+  const withRepo = { ...input, project: { repos: ['/tmp/repo'] } };
+  const wakeFailure = () => new ActivityFailure('Activity task failed', 'checkProposal', '7', RetryState.MAXIMUM_ATTEMPTS_REACHED, 'worker',
+    ApplicationFailure.create({ type: 'world-infra', nonRetryable: false,
+      message: "Hetzner refused a 16-CPU server: this Hetzner project's limit on shared CPUs is full, with 14 in use by 4 other servers." }));
+
+  const drive = (checkProposal: ReturnType<typeof vi.fn>) => {
+    wf.activities.accountPoolSize.mockResolvedValue(0);
+    wf.activities.checkProposal = checkProposal;
+    wf.activities.openPr = vi.fn(async () => []);
+    wf.activities.buildReview = vi.fn(async () => ({ summary: 'Put the file back', changedFiles: ['a.py'] }));
+    // The agent finished its turn without open_pr: it waits for a person in Do.
+    wf.activities.runAgentTurn.mockResolvedValue({ output: 'I put the file back.', providerCompleted: true });
+    const views: any[] = [];
+    let asked = false;
+    wf.wait = () => {
+      const view = wf.handlers.get('view')!();
+      views.push(structuredClone(view));
+      if (view.stage === 'do' && view.waitingFor?.kind === 'human' && !asked) { asked = true; wf.handlers.get('openPr')!(); return; }
+      if (['review', 'merge'].includes(view.stage) || view.status === 'blocked') wf.handlers.get('cancel')!();
+    };
+    return views;
+  };
+
+  it('shows the transition at once and waits the outage out instead of failing the task', async () => {
+    const stagesAtCheck: string[] = [];
+    const checkProposal = vi.fn(async () => {
+      stagesAtCheck.push(wf.handlers.get('view')!().stage);
+      if (checkProposal.mock.calls.length <= 2) throw wakeFailure();
+      return { ready: true };
+    });
+    const views = drive(checkProposal);
+    expect(await softwareDevV1_29(withRepo)).toEqual({ stage: 'cancelled' });
+    // The click is visible before the world is even reached.
+    expect(stagesAtCheck[0]).toBe('pr');
+    // The outage is a visible wait, then the proposal goes on to Review.
+    const waiting = views.find((view) => view.waitingFor?.kind === 'retry');
+    expect(waiting).toMatchObject({ stage: 'pr', status: 'waiting' });
+    expect(waiting.error).toContain('shared CPUs is full');
+    expect(checkProposal).toHaveBeenCalledTimes(3);
+    expect(views.some((view) => ['review', 'merge'].includes(view.stage))).toBe(true);
+  });
+
+  it('escalates with Retry, the world intact, when the outage outlasts the waits', async () => {
+    const views = drive(vi.fn(async () => { throw wakeFailure(); }));
+    expect(await softwareDevV1_29(withRepo)).toEqual({ stage: 'cancelled' });
+    const escalated = views.find((view) => view.status === 'blocked');
+    // A failure is not a stage (v1.27): it asks a person, the stage kept.
+    expect(escalated).toMatchObject({ stage: 'pr', waitingFor: { kind: 'human', reason: 'error' } });
+    expect(escalated.error).toContain('shared CPUs is full');
+    expect(escalated.actions.map((a: any) => a.name)).toContain('retry');
+  });
+
+  it('keeps histories recorded before it as they were', async () => {
+    wf.absentPatches = new Set(['software-dev-open-pr-waits-for-world-v1']);
+    drive(vi.fn(async () => { throw wakeFailure(); }));
+    await expect(softwareDevV1_29(withRepo)).rejects.toThrow('Activity task failed');
   });
 });

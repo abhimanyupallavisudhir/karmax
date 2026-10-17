@@ -334,6 +334,8 @@ const QUIET_NOTICE = 'prn-';
 /** Several branches: finishing lands the task's own repositories together,
  * through its own Review, not as a pull request each. */
 const FINISH_TOGETHER = 'several-branches-finish-together-v1';
+/** Open PR's checks wake a parked world, and wait out one that cannot wake (pramana#56). */
+const OPEN_PR_WAITS_FOR_WORLD = 'software-dev-open-pr-waits-for-world-v1';
 const quietNotice = (m: Message): boolean => m.id.startsWith(QUIET_NOTICE);
 const clip = (text: string, max: number) => text.length > max ? `${text.slice(0, max)}…` : text;
 /** A turn can return while the agent's own in-harness sub-agents (Claude Agent SDK
@@ -2623,6 +2625,22 @@ async function softwareDevImpl(
     if (patched('software-dev-publish-retried-stage-v1')) await publish();
   }
 
+  /** Open PR's readiness check, which wakes a parked world. A provider can
+   * refuse that wake for a while (pramana#56: the Hetzner project's CPU limit
+   * was full, and the task failed). So the click shows at once as the
+   * proposal being prepared (`announce`), and a world that cannot wake is
+   * waited out like any stage's infrastructure, then escalated with Retry. */
+  async function checkProposal(announce = true): ReturnType<coreActivities['checkProposal']> {
+    if (!patched(OPEN_PR_WAITS_FOR_WORLD)) return core.checkProposal(world as any);
+    if (announce) {
+      stage = 'pr';
+      status = 'active';
+      waitingFor = undefined;
+      await publish();
+    }
+    return withResolve('pr', () => core.checkProposal(world as any));
+  }
+
   /** May `session` (minted under `sessionHome`) be resumed under `home` now? Only
    *  if the homes match — provider sessions are login-bound (§2.5). Passthrough
    *  (no leased home) is tracked as '(profile)'. */
@@ -4318,7 +4336,7 @@ Inspect the complete current diff and specifically compare its delta from the re
     status = 'active';
     waitingFor = undefined;
     await publish();
-    const readiness = await core.checkProposal(world as any);
+    const readiness = await checkProposal(false);
     if (!readiness.ready) {
       const detail = readiness.conflict ?? readiness.dirty ?? readiness.note ?? 'the proposal is not ready';
       msgs.push({
@@ -4949,7 +4967,9 @@ Inspect the complete current diff and specifically compare its delta from the re
           // unchanged — and with nothing left, it is done without a Review.
           if (shipments.length) {
             const settledAt = (name: string) => [...shipments].reverse().find((shipment) => shipment.checkout === name)?.head;
-            const own: string[] = (await core.checkoutsWithWork(world as WorldHandle, target))
+            // The world may have parked while they settled: wake it as Open PR does.
+            const withWork = () => core.checkoutsWithWork(world as WorldHandle, target);
+            const own: string[] = (await (patched(OPEN_PR_WAITS_FOR_WORLD) ? withResolve('pr', withWork) : withWork()))
               .filter((checkout) => !checkout.head || checkout.head !== settledAt(checkout.name)).map((checkout) => checkout.name);
             if (!own.length) {
               prRequested = false;
@@ -4987,7 +5007,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         // The Do agent owns commit-vs-ignore judgment. The workflow validates
         // the result, and a refused proposal goes back to the same conversation
         // instead of invoking a second "Merge" personality.
-        const readiness = await core.checkProposal(world as any);
+        const readiness = await checkProposal();
         if (!readiness.ready) {
           const detail = readiness.conflict ?? readiness.dirty ?? readiness.note ?? 'the proposal is not ready';
           msgs.push({

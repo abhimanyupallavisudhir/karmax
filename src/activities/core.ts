@@ -1376,7 +1376,20 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // A park already in flight may have released the lease while we waited
         // for its transition. Re-enter admission before opening the provider.
       }
+    } catch (error) {
+      throw worldUnreachable(handle, error);
     } finally { releaseAccess?.(); }
+  }
+
+  /** A cloud world that cannot be woken or reached right now (a provider
+   * outage, a provider limit that is full, a lost connection) is
+   * infrastructure for every activity, not only an agent's turn: the
+   * workflow waits it out, then asks a person (pramana#56: Hetzner's full CPU
+   * limit reached the workflow as a plain error and failed the task). */
+  function worldUnreachable(handle: WorldHandle, error: unknown): unknown {
+    if (error instanceof ApplicationFailure || !isRemote(handle.kind) || !isTransportError(error)) return error;
+    return ApplicationFailure.create({ message: error instanceof Error ? error.message : String(error), type: 'world-infra',
+      nonRetryable: false, cause: error instanceof Error ? error : undefined });
   }
 
   /** A wake that failed leaves the world as it was: parked, the lease it took
@@ -2397,9 +2410,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // provider failure to wake a world is the agent's (pramana#59: Hetzner's
         // power-on "Unknown Error" blocked the task as an agent error): it waits
         // out as infrastructure, then reaches a person, never Resolve.
-        const failure = classifyTurnError(error, profile.provider);
+        // A turn classifies what the provider said, not openWorld's wrapper.
+        const cause = error instanceof ApplicationFailure && error.type === 'world-infra' && error.cause ? error.cause : error;
+        const failure = classifyTurnError(cause, profile.provider);
         if (failure instanceof ApplicationFailure && failure.type === 'agent-error')
-          throw ApplicationFailure.create({ message: failure.message, type: 'world-infra', nonRetryable: false, cause: error instanceof Error ? error : undefined });
+          throw ApplicationFailure.create({ message: failure.message, type: 'world-infra', nonRetryable: false, cause: cause instanceof Error ? cause : undefined });
         throw failure;
       }
       // A cloud world's disk, before its agent starts (wiki features/computers).
