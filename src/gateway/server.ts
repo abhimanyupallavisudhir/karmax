@@ -5564,8 +5564,8 @@ export class Gateway {
           });
           return this.json(res, 200, { ok: true, ...posted });
         }
-        const message = await api.messageAgent(token, messageMatch[1]!, String(b.text ?? ''), b.role);
-        return this.json(res, 200, { ok: true, ...(message ? { message, role: b.role ?? 'do' } : {}) });
+        const sent = await api.messageAgent(token, messageMatch[1]!, String(b.text ?? ''), b.role);
+        return this.json(res, 200, { ok: true, ...sent, ...(sent.message ? { role: b.role ?? 'do' } : {}) });
       }
       const mergeEligibilityMatch = p.match(/^\/api\/tasks\/([^/]+)\/merge-eligibility$/);
       if (mergeEligibilityMatch && method === 'GET') {

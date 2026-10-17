@@ -4,6 +4,8 @@ import { PlatformToolContext } from './types.js';
 import { parseTransition } from '../resolve/transitions.js';
 import { MAX_REVIEW_TEXT_LENGTH, ReviewInfoRejected, validateReviewInfoCall } from './review-info.js';
 import { World } from '../world/types.js';
+import { continuedReply } from '../domain/forks.js';
+import { applicableSubTaskActions } from '../domain/sub-task-responses.js';
 import { readWorldFilePrefix } from '../world/file-prefix.js';
 import { startJob, jobStatuses, describeJobs, listJobs, stopJobs, MAX_JOB_NAME } from '../world/jobs.js';
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
@@ -1193,6 +1195,14 @@ export function platformToolHandlers(
       const action = String(args?.action ?? '');
       if (!(SUB_TASK_ACTIONS as readonly string[]).includes(action))
         return `invalid action — use ${SUB_TASK_ACTIONS.join(' | ')}`;
+      // An answer its wait cannot act on would leave it, and this task, waiting.
+      if (args?.child_task_id && ctx.platformRequest) {
+        const child = await Promise.resolve(ctx.platformRequest('GET', `/api/tasks/${encodeURIComponent(String(args.child_task_id))}`))
+          .catch(() => undefined) as Parameters<typeof applicableSubTaskActions>[0] | undefined;
+        const applicable = child?.stage ? applicableSubTaskActions(child) : undefined;
+        if (applicable && !applicable.includes(action as SubTaskAction))
+          return `"${action}" does not apply now: that sub-task is at ${child!.stage === 'escalated' || child!.status === 'blocked' ? 'a failed step' : child!.stage === 'review' ? 'Review' : 'the end of a turn'}. Answer with ${applicable.join(' | ')}.`;
+      }
       await ctx.respondToSubTask({
         childTaskId: args?.child_task_id ? String(args.child_task_id) : undefined,
         action: action as SubTaskAction,
@@ -1625,8 +1635,8 @@ export function platformToolHandlers(
     },
     async message_agent(args) {
       const taskId = encodeURIComponent(String(args?.task_id ?? ''));
-      await platformRequest('POST', `/api/tasks/${taskId}/messages`, { role: args?.role ?? 'do', text: args?.message });
-      return 'message delivered';
+      const sent = await platformRequest('POST', `/api/tasks/${taskId}/messages`, { role: args?.role ?? 'do', text: args?.message }) as { continuedIn?: { id: string; num?: number } } | undefined;
+      return continuedReply(sent?.continuedIn);
     },
     async request_agent_action(args) {
       return JSON.stringify(await platformRequest('POST', '/api/agent/collaboration/request', {

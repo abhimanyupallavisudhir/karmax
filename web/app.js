@@ -11183,6 +11183,9 @@ function conversationPane(v, t) {
   const presence = conversationPresence(v, t);
   const transcripts = taskTranscripts(v);
   const followUp = (v.actions || []).find((a) => a.name === 'followUp');
+  // After Confirm the approved PR lands as it is: a message to the agent
+  // carries the work on in a new task (wiki features/continue-after-confirm).
+  const continues = followUp?.label === 'Continue';
   const canFollowUp = followUp && (!followUp.roles?.length || followUp.roles.includes(t.role));
   const requestedInput = canFollowUp ? conversationInputRequest(v, entries) : '';
   if (requestedInput && !entries.some((entry) => entry.type === 'input-request' && entry.request.text === requestedInput)) {
@@ -11205,7 +11208,7 @@ function conversationPane(v, t) {
           <div class="prompt-attach-row"><label class="attach-file-button" tabindex="0">Attach files<input class="followup-files" type="file" multiple hidden></label><span>25 MB each · 50 MB per prompt</span></div>
         </div>
         ${t.shared && stoppableAgent(v) ? stopAgentButton(stoppableAgent(v), 'btn followup-stop') : ''}
-        <button class="btn primary followup-send" data-keys="meta+Enter" ${followUp.enabled ? '' : 'disabled'}>Send</button>
+        <button class="btn primary followup-send" data-keys="meta+Enter" ${followUp.enabled ? '' : 'disabled'}${continues ? ' title="The approved PR lands as it is. The agent carries on in a new task."' : ''}>${continues ? 'Continue' : 'Send'}</button>
       </div></div>`
     : '';
   return `
@@ -13808,6 +13811,17 @@ function wireFollowups(v) {
           countMentions(to);
           delete S.followupMentions[key];
           delete S.followupNewAgents[key];
+        }
+        if (result?.continuedIn) {
+          delete S.followupDrafts[key];
+          delete S.followupHeights[key];
+          images.length = 0;
+          files.length = 0;
+          toast(`Continuing in #${result.continuedIn.num ?? result.continuedIn.id}`);
+          refreshTasks();
+          const { id, num } = result.continuedIn;
+          spaNavigate(taskUrl(id, { projectId: taskRecord(v.taskId)?.projectId || S.projectId, num }));
+          return;
         }
         // Render immediately even if this browser's event WebSocket is reconnecting.
         // The durable WS copy is de-duplicated by conversationEntries once it lands.
