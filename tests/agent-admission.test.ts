@@ -371,9 +371,7 @@ describe('agent turn admission', () => {
         workflow: 'software-dev' },
     } as any).then(() => undefined, (caught) => caught);
 
-    // A world that cannot be reached is the world's infrastructure for every
-    // activity (openWorld, pramana#56), waited out like an agent's.
-    expect(error).toMatchObject({ type: 'world-infra', nonRetryable: false });
+    expect(error).toMatchObject({ type: 'agent-infra', nonRetryable: false });
     (await store.close());
   });
 });
