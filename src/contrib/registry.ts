@@ -63,6 +63,8 @@ export const CORE_COMMANDS: CommandDecl[] = [
   { id: 'nav.searchProjects', title: 'Search projects', keybinding: 'p /' },
   { id: 'nav.profile', title: 'Go to your profile', keybinding: 'g A' },
   { id: 'nav.notifications', title: 'Go to inbox', keybinding: 'g N' },
+  { id: 'nav.vault', title: 'Go to passwords & payments', keybinding: 'g V' },
+  { id: 'view.save', title: 'Save search as view', keybinding: 'v s' },
   { id: 'nav.close', title: 'Close panel', keybinding: 'Escape' },
   { id: 'nav.commandPalette', title: 'Command palette', keybinding: 'meta+k' },
   { id: 'help.keyboard', title: 'Keyboard shortcuts', keybinding: '?' },

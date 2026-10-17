@@ -153,7 +153,7 @@ export const PLATFORM_API_CATALOG = {
     'GET /api/search?q=&limit=&offset= (every organization at once: one query over every project you can read in each, sorted together; tasks carry projectId, `projects` their organizationId; `for:me` adds reasons)',
     'GET /api/organizations/:organizationId/search?q=&limit=&offset= (the organization task list: one query over every project you can read, sorted together; tasks carry projectId; `for:me` adds reasons)',
     'GET /api/projects/:projectId/search?q=', 'GET|POST /api/projects/:projectId/tags',
-    'PATCH|DELETE /api/tags/:id', 'GET|POST /api/projects/:projectId/views',
+    'PATCH|DELETE /api/tags/:id', 'GET|POST /api/projects/:projectId/views', 'GET|POST /api/organizations/:organizationId/views',
     'PATCH|DELETE /api/views/:id', 'POST /api/views/:id/reorder',
     'GET|DELETE /api/tasks/:taskId', 'POST /api/tasks/:taskId/queue (start a draft; a draft sub-task starts when its parent\'s agent ends its turn, and only while the parent is in Do)',
     'POST /api/tasks/:taskId/sub-tasks (body {title, prompt, params?}; saves a draft sub-task of the task, agent fields only in params; start it with POST /api/tasks/:id/queue)',

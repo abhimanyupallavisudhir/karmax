@@ -229,6 +229,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   // The organization task list spans its projects; like global search, each
   // project is authorized in searchableProjects / searchOrganizationTasks.
   if (/^\/api\/organizations\/[^/]+\/search$/.test(p) && read) return 'none';
+  // The organization home's saved views are task-list queries, like a project's.
+  if (/^\/api\/organizations\/[^/]+\/views$/.test(p)) return read ? 'task:read' : 'task:edit';
   if (/^\/api\/organizations\/[^/]+\/projects/.test(p)) return read ? 'project:read' : 'project:create';
   if (/^\/api\/organizations\/[^/]+\/runner-pools/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/organizations\/[^/]+\/world-providers/.test(p)) return read ? 'organization:read' : 'organization:edit';
@@ -5249,6 +5251,16 @@ export class Gateway {
           return this.json(res, 200, await api.createView(token, { projectId, name: b.name, query: b.query ?? {}, icon: b.icon }));
         }
       }
+      // The organization home's views: the same, over every project of the organization.
+      const organizationViewsMatch = p.match(/^\/api\/organizations\/([^/]+)\/views$/);
+      if (organizationViewsMatch) {
+        const organizationId = decodeURIComponent(organizationViewsMatch[1]!);
+        if (method === 'GET') return this.json(res, 200, await api.listOrganizationViews(token, organizationId));
+        if (method === 'POST') {
+          const b = await this.body(req);
+          return this.json(res, 200, await api.createOrganizationView(token, { organizationId, name: b.name, query: b.query ?? {}, icon: b.icon }));
+        }
+      }
       const savedViewMatch = p.match(/^\/api\/views\/([^/]+)$/);
       if (savedViewMatch) {
         const id = savedViewMatch[1]!;
@@ -10069,8 +10081,9 @@ export class Gateway {
     // them outrank a task's own project handed any caller the right to read and
     // act on another tenant's task by naming a project of its own. Every
     // identifier that names a scope must agree, or the request is refused.
+    const viewRecord = viewId ? (await this.deps.store.getView(viewId)) : undefined;
     const recordProject = (tagId ? (await this.deps.store.getTag(tagId))?.projectId : undefined)
-      ?? (viewId ? (await this.deps.store.getView(viewId))?.projectId : undefined)
+      ?? (viewRecord?.projectId || undefined)
       ?? (taskId ? await this.deps.store.taskProjectIdAsync(taskId) : undefined);
     const queryProject = url.searchParams.get('projectId') ?? undefined;
     const projects = [recordProject, pathProject, queryProject].filter((value): value is string => Boolean(value));
@@ -10078,7 +10091,7 @@ export class Gateway {
     const resolvedProjectId = projects[0];
     const projectOrganization = resolvedProjectId ? await this.deps.store.projectOrganizationAsync(resolvedProjectId) : undefined;
     const organizations = [pathname.match(/^\/api\/organizations\/([^/]+)/)?.[1], url.searchParams.get('organizationId') ?? undefined,
-      projectOrganization].filter((value): value is string => Boolean(value));
+      projectOrganization, viewRecord?.organizationId].filter((value): value is string => Boolean(value));
     if (new Set(organizations).size > 1) return { conflict: 'organizationId does not match the addressed record' };
     return { projectId: resolvedProjectId, organizationId: organizations[0], ...(taskId ? { taskId } : {}) };
   }

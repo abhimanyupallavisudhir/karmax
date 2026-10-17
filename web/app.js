@@ -150,6 +150,8 @@ const S = {
   // Task organization: a view IS a saved query.
   tags: [], // project tag catalogue (labels + topics, hierarchical)
   views: [], // saved views (named queries)
+  orgViews: [], // the organization home's saved views
+  orgViewsFor: null, // which organization S.orgViews were loaded for
   fields: [], // searchable-field registry (drives the filter/sort/group menus)
   searchResult: null, // { tasks, groups, total } from the last server evaluation
   searchFailed: false, // last evaluation errored — distinct from "nothing matched"
@@ -952,7 +954,8 @@ async function applyListRoute(tab, scope, r, routeIsCurrent) {
   const readable = firstProjectForOrganization(S.organizationId);
   const fields = S.fields.length || !readable ? null
     : api(`/api/search/fields?projectId=${encodeURIComponent(readable.id)}`).then((value) => { S.fields = value || []; }).catch(() => {});
-  await Promise.all([runSearch().catch(() => {}), fields]);
+  const views = tab === 'home' && S.orgViewsFor !== S.organizationId ? loadOrgViews() : null;
+  await Promise.all([runSearch().catch(() => {}), fields, views]);
   if (!routeIsCurrent() || S.tab !== tab) return;
   renderMain();
 }
@@ -6008,7 +6011,7 @@ function renderMain() {
   const tabbar = projectScoped
     ? `<div class="tabs">${tabs
         .map((t) => `<a class="tab ${S.tab === t ? 'active' : ''}" data-spa href="${projectRoute(proj?.id, t)}" data-tab="${t}"${PROJECT_TAB_COMMANDS[t] ? ` data-shortcut="${PROJECT_TAB_COMMANDS[t]}"` : ''}>${labels[t]}</a>`)
-        .join('')}${S.meta?.hosted ? `<span class="tabs-spacer"></span><button class="btn tool tabs-action" id="project-local-checkout" title="Check out this project on your computer">${ICON.laptop}Work locally</button>` : ''}</div>`
+        .join('')}${S.meta?.hosted ? `<span class="tabs-spacer"></span><button class="btn tool tabs-action" id="project-local-checkout" data-tool="Work locally" title="Check out this project on your computer">${ICON.laptop}Work locally</button>` : ''}</div>`
     : '';
 
   let content = '';
@@ -6107,33 +6110,54 @@ function viewIdForQuery(q) {
   if (s === normalizeQuery(ACTIVE_VIEW_QUERY)) return ACTIVE_VIEW;
   if (s === normalizeQuery(DEFAULT_LIST_QUERY)) return FOR_ME_VIEW;
   return BUILTIN_VIEWS.find((v) => normalizeQuery(v.query) === s)?.id
-    || (S.views || []).find((v) => normalizeQuery(stringifyQuery(v.query || {})) === s)?.id
+    || savedViews().find((v) => normalizeQuery(stringifyQuery(v.query || {})) === s)?.id
     || null;
 }
 
+// The saved views of the list on screen: a project's own, or (on the
+// organization home) the organization's. The inbox spans organizations and has none.
+function savedViews(tab = S.tab) {
+  if (tab === 'home') return S.orgViewsFor === S.organizationId ? S.orgViews || [] : [];
+  return tab === 'inbox' ? [] : S.views || [];
+}
+function canSaveViews(tab = S.tab) { return tab === 'home' ? !!S.organizationId : tab === 'tasks' && !!S.projectId; }
+async function loadOrgViews(organizationId = S.organizationId) {
+  if (!organizationId) return;
+  const views = await api(`/api/organizations/${encodeURIComponent(organizationId)}/views`).catch(() => []);
+  if (S.organizationId !== organizationId) return;
+  S.orgViews = views || [];
+  S.orgViewsFor = organizationId;
+}
+
+// Every view chip of the list in its order — For me, Active, the built-ins, then
+// the saved ones. Their position is their number: `v 1` … `v 9`.
+function listViewChips(tab = S.tab) {
+  return [
+    { id: FOR_ME_VIEW, name: 'For me', query: DEFAULT_LIST_QUERY },
+    { id: ACTIVE_VIEW, name: 'Active', query: ACTIVE_VIEW_QUERY },
+    ...BUILTIN_VIEWS,
+    ...savedViews(tab).map((v) => ({ id: v.id, name: v.name, icon: v.icon, query: stringifyQuery(v.query || {}), saved: true })),
+  ];
+}
+
 // The saved-views switcher — every chip is a query. "For me" is the default, then
-// "Active", the built-in starter views, and the project's saved views (each with a ✕
-// to delete). Saved views belong to a project, so the organization home has none.
+// "Active", the built-in starter views, and the list's saved views (each with a ✕
+// to delete): a project's on its list, the organization's on its home.
 // A chip is a real link to its list URL, so Ctrl/⌘/middle-click opens the view in
 // a new tab; wireOrgControls() keeps a plain click an in-place query switch.
+// Its number (`v 1`…`v 9`) shows on it while `v` is held down as a chord prefix.
 function viewsBar() {
   const active = viewIdForQuery(S.search);
-  const home = isCrossProjectList();
-  const chip = (id, query, label, cls = '', extra = '') =>
-    `<a class="view-chip ${cls}${active === id ? ' active' : ''}" data-view="${esc(id)}" href="${esc(listQueryRoute(query))}"${extra}>${label}</a>`;
-  const builtins = BUILTIN_VIEWS
-    .map((v) => chip(v.id, v.query, esc(v.name), 'builtin', ` title="${esc(v.query)}"`))
-    .join('');
-  const saved = (home ? [] : S.views)
-    .map((v) => chip(v.id, viewQuery(v.id), `${v.icon ? esc(v.icon) + ' ' : ''}${esc(v.name)}<span class="view-x" data-delview="${v.id}" title="Delete view">✕</span>`))
-    .join('');
-  return `<div class="views-bar">
-    ${chip(FOR_ME_VIEW, DEFAULT_LIST_QUERY, 'For me', '', ' title="Waiting on you: reviews, questions, approvals, mentions — and your drafts"')}
-    ${chip(ACTIVE_VIEW, ACTIVE_VIEW_QUERY, 'Active', '', ` title="${esc(ACTIVE_VIEW_QUERY)}"`)}
-    ${builtins}
-    ${saved}
-    ${home ? '' : '<div class="view-chip add" id="save-view" role="button" tabindex="0" title="Save the current query as a view">+ Save view</div>'}
-  </div>`;
+  const title = { [FOR_ME_VIEW]: 'Waiting on you: reviews, questions, approvals, mentions — and your drafts' };
+  const chips = listViewChips().map((v, i) => {
+    const label = `${v.icon ? esc(v.icon) + ' ' : ''}${esc(v.name)}${v.saved ? `<span class="view-x" data-delview="${esc(v.id)}" title="Delete view">✕</span>` : ''}`;
+    const tip = title[v.id] || (v.saved ? '' : v.query);
+    return `<a class="view-chip${BUILTIN_VIEWS.includes(v) ? ' builtin' : ''}${active === v.id ? ' active' : ''}" data-view="${esc(v.id)}" href="${esc(listQueryRoute(v.query))}"${tip ? ` title="${esc(tip)}"` : ''}${i < 9 ? ` data-shortcut="view.${i + 1}"` : ''}>${label}</a>`;
+  }).join('');
+  // Saving is offered once the query is not already a view.
+  const save = canSaveViews() && S.search.trim() && !active
+    ? '<button type="button" class="view-chip add" id="save-view" data-shortcut="view.save">+ Save view</button>' : '';
+  return `<div class="views-bar">${chips}${save}</div>`;
 }
 
 // The query a view chip stands for ('' for an unknown id).
@@ -6142,7 +6166,7 @@ function viewQuery(id) {
   if (id === FOR_ME_VIEW) return DEFAULT_LIST_QUERY;
   const builtin = BUILTIN_VIEWS.find((x) => x.id === id);
   if (builtin) return builtin.query;
-  const saved = (S.views || []).find((x) => x.id === id);
+  const saved = savedViews().find((x) => x.id === id);
   return saved ? stringifyQuery(saved.query || {}) : '';
 }
 
@@ -6762,11 +6786,12 @@ function wireOrgControls() {
       ev.preventDefault(); // the ✕ sits inside the chip's link
       ev.stopPropagation();
       const id = x.dataset.delview;
-      const v = S.views.find((y) => y.id === id);
+      const v = savedViews().find((y) => y.id === id);
       if (!confirm(`Delete the view “${v?.name || 'this view'}”? This can't be undone.`)) return;
       try {
         await api(`/api/views/${id}`, { method: 'DELETE' });
         S.views = S.views.filter((y) => y.id !== id);
+        S.orgViews = S.orgViews.filter((y) => y.id !== id);
         renderMain(); // the query stays in hand (and in the URL); only the chip is gone
         toast('View deleted');
       } catch (e) { toast(e.message, true); }
@@ -6787,18 +6812,23 @@ function wireOrgControls() {
   wireQueryToolbar(main, 'q', { get: () => S.search, set: (q) => setQuery(q) });
 }
 
-// Persist the current working query as a named view (Save-view button).
+// Persist the current working query as a named view (Save-view button, `v s`):
+// in the project whose list it is, or in the organization on its home.
 async function saveCurrentView() {
-  const name = await promptText('Name this view:', S.search ? S.search.slice(0, 40) : 'My view');
+  if (!canSaveViews() || !S.search.trim()) return toast('Search for something to save it as a view', true);
+  if (viewIdForQuery(S.search)) return toast('This search is already a view');
+  const home = S.tab === 'home';
+  const organizationId = S.organizationId;
+  const name = await promptText('Name this view', S.search.slice(0, 40));
   if (!name) return;
   try {
     // The API persists a structured TaskQuery, so parse the working string into one
     // (parseQueryClient mirrors the server grammar; it round-trips back through it).
-    const v = await api(`/api/projects/${S.projectId}/views`, {
+    const v = await api(home ? `/api/organizations/${encodeURIComponent(organizationId)}/views` : `/api/projects/${S.projectId}/views`, {
       method: 'POST',
       body: JSON.stringify({ name, query: parseQueryClient(S.search) }),
     });
-    S.views.push(v);
+    if (home) { if (S.orgViewsFor === organizationId) S.orgViews.push(v); } else S.views.push(v);
     renderMain(); // the new chip lights up on its own — it is the query already in the box
     toast(`Saved view “${name}”`);
   } catch (err) { toast(err.message, true); }
@@ -11264,7 +11294,7 @@ function conversationError(v) {
 function conversationFullscreenButton() {
   const active = !!S.conversationFullscreen;
   const label = active ? 'Exit full screen' : 'Full screen';
-  return `<button type="button" class="btn tool icon" id="conversation-fullscreen" aria-label="${label}" title="${active ? 'Exit full screen (Esc)' : label}" aria-pressed="${active}">${active ? ICON.collapse : ICON.expand}</button>`;
+  return `<button type="button" class="btn tool icon" id="conversation-fullscreen" data-tool="Full screen" aria-label="${label}" title="${active ? 'Exit full screen (Esc)' : label}" aria-pressed="${active}">${active ? ICON.collapse : ICON.expand}</button>`;
 }
 
 function setConversationFullscreen(active) {
@@ -11299,9 +11329,9 @@ function conversationPane(v, t) {
   const forkCmd = sess?.id && sess?.home && localWorldPath(v) ? forkCommandFor(sess, v.worldPath) : '';
   const remoteFork = sess?.id && sess?.home && v.worldAvailable && !v.worldPath && !v.agentTurn && hostLocal();
   const copy = forkCmd
-    ? `<button class="btn tool copy-cmd" data-cmd="${esc(forkCmd)}" title="Copy a CLI command to fork this agent into your terminal — a branched copy, safe to open even while it's running">${ICON.terminal}Fork in CLI</button>`
+    ? `<button class="btn tool copy-cmd" data-tool="Fork in CLI" data-cmd="${esc(forkCmd)}" title="Copy a CLI command to fork this agent into your terminal — a branched copy, safe to open even while it's running">${ICON.terminal}Fork in CLI</button>`
     : remoteFork
-      ? `<button class="btn tool fork-local" data-provider="${esc(sess.provider)}" data-session="${esc(sess.id)}" data-home="${esc(sess.home)}" title="Materialize the cloud branch locally, then copy a native session-fork command">${ICON.laptop}Fork locally</button>`
+      ? `<button class="btn tool fork-local" data-tool="Fork locally" data-provider="${esc(sess.provider)}" data-session="${esc(sess.id)}" data-home="${esc(sess.home)}" title="Materialize the cloud branch locally, then copy a native session-fork command">${ICON.laptop}Fork locally</button>`
       : '';
   // The follow-up affordance (SPEC §5.6) lives inside each agent's conversation,
   // so a human can address any agent — Do, Merge, or Confirm — not just Do. It
@@ -11346,9 +11376,9 @@ function conversationPane(v, t) {
         : presence.tone === 'idle' || presence.tone === 'done' ? '' : `<span class="conversation-presence ${presence.tone}"><span class="presence-dot"></span>${esc(presence.label)}</span>`}
       <span style="flex:1"></span>
       <div class="ck-tools">
-        <button class="btn tool" id="share-task-conversation" data-role="${esc(t.role)}" title="Share this conversation">${ICON.share}Share</button>
-        <button class="btn tool" id="fork-task-agent" data-role="${esc(t.role)}" title="Create a new task from this agent’s conversation">${ICON.fork}Fork</button>
-        ${S.meta?.hosted ? `<button type="button" class="btn tool" id="local-checkout" title="Check out this task on your computer">${ICON.laptop}Work locally</button>` : ''}
+        <button class="btn tool" id="share-task-conversation" data-tool="Share" data-role="${esc(t.role)}" title="Share this conversation">${ICON.share}Share</button>
+        <button class="btn tool" id="fork-task-agent" data-tool="Fork" data-role="${esc(t.role)}" title="Create a new task from this agent’s conversation">${ICON.fork}Fork</button>
+        ${S.meta?.hosted ? `<button type="button" class="btn tool" id="local-checkout" data-tool="Work locally" title="Check out this task on your computer">${ICON.laptop}Work locally</button>` : ''}
         ${copy}
         <span class="tool-sep" aria-hidden="true"></span>
         ${conversationFullscreenButton()}
@@ -18581,6 +18611,25 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
 }
 
 // ── vault items + credential access requests (wiki plans/PLAN-passwords §§4–10) ──
+// The vault manager's type names, order and marks.
+const VAULT_TYPE_ORDER = ['login', 'api-key', 'ssh-key', 'env', 'session', 'passkey', 'note'];
+const VAULT_TYPE_LABELS = { login: 'Logins', 'api-key': 'API keys', 'ssh-key': 'SSH keys', env: 'Env files', session: 'Sessions', passkey: 'Passkeys', note: 'Notes' };
+const vaultSvg = (paths) => `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths}</svg>`;
+const VAULT_KEY_PATH = '<circle cx="7.5" cy="15.5" r="4.5"/><path d="m10.7 12.3 9.3-9.3M17 6l3 3M14.5 8.5l2 2"/>';
+const VAULT_TYPE_ICON = {
+  login: vaultSvg('<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>'),
+  'api-key': vaultSvg(VAULT_KEY_PATH),
+  'ssh-key': vaultSvg('<rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M13 15h4"/>'),
+  env: vaultSvg('<path d="M8 3H7a2 2 0 0 0-2 2v5a2 2 0 0 1-2 2 2 2 0 0 1 2 2v5a2 2 0 0 0 2 2h1M16 3h1a2 2 0 0 1 2 2v5a2 2 0 0 0 2 2 2 2 0 0 0-2 2v5a2 2 0 0 1-2 2h-1"/>'),
+  session: vaultSvg('<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/>'),
+  passkey: vaultSvg('<path d="M12 11v3M8.5 7.5a5 5 0 0 1 8.5 3.5c0 3-.5 5.5-2 8M7 11c0 2.5-.3 4.6-1.2 6.5M12 4a7 7 0 0 1 7 7M5 11a7 7 0 0 1 2-5"/>'),
+  note: vaultSvg('<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6M8 13h8M8 17h5"/>'),
+};
+const VAULT_ACTION_ICON = {
+  view: vaultSvg('<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>'),
+  rotate: vaultSvg('<path d="M21 12a9 9 0 1 1-2.6-6.4L21 8"/><path d="M21 3v5h-5"/>'),
+  delete: vaultSvg('<path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0-1 14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2L4 6M10 11v6M14 11v6"/>'),
+};
 const VAULT_SECRET_LABELS = {
   login: [['password', 'password'], ['totp', 'TOTP seed (base32, otpauth:// URI, or paste image of QR code)'], ['note', 'Notes']],
   'api-key': [['secret', 'API key']],
@@ -19117,8 +19166,8 @@ function passwordsCard() {
         Always prefer to connect services via <a href="#settings-connections">MCP or Composio</a>, if available.</div>
     </div>
     <button type="button" class="btn vault-manage-button" id="vault-manage-open" disabled>
-      <span>Vault credentials</span>
-      <span class="vault-manage-count">Loading…</span>
+      ${VAULT_TYPE_ICON['api-key']}<span>Vault credentials</span>
+      <span class="vault-manage-count">Loading…</span><span class="vm-chevron" aria-hidden="true">›</span>
     </button>
 
     <div class="section-sub" style="display:flex;align-items:center;gap:6px;font-weight:600;margin-bottom:6px">Import or sync from a password manager
@@ -19145,7 +19194,7 @@ function passwordsCard() {
       <div class="form-row"><div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center">
         <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px">blind use ${policyTip(POL_USE_TIP)} <select class="vi-use"><option>auto</option><option>ask</option></select></label>
         <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px">agent sees ${policyTip(POL_REVEAL_TIP)} <select class="vi-reveal"><option>ask</option><option>auto</option><option>never</option></select></label>
-        <button class="btn primary vi-add">Add</button>
+        <button class="btn primary vi-add" data-submit>Add</button>
       </div></div>
       </div>
     </details>
@@ -19188,9 +19237,9 @@ async function wireVaultCards(organizationId) {
   secretRows();
   box.querySelector('.vi-type').addEventListener('change', secretRows);
   let vaultItems = [];
-  const sourceBadge = (src) => src?.startsWith('connector:') ? `<span class="chip" title="Mirrored from ${esc(src.slice(10))}">from ${esc(src.slice(10))}</span>`
-    : src?.startsWith('import:') ? `<span class="chip" title="File imports are snapshots and cannot write back">${esc(src.slice(7))} · one-way import</span>`
-    : src?.startsWith('task:') ? '<span class="chip">agent-made</span>' : '';
+  const sourceBadge = (src) => src?.startsWith('connector:') ? `<span class="vm-source" title="Mirrored from ${esc(src.slice(10))}">${esc(src.slice(10))}</span>`
+    : src?.startsWith('import:') ? `<span class="vm-source" title="A one-way import from ${esc(src.slice(7))}: a snapshot that never writes back">${esc(src.slice(7))} import</span>`
+    : src?.startsWith('task:') ? '<span class="vm-source" title="Saved by an agent">agent-made</span>' : '';
   const renderItems = async () => {
     const button = box.querySelector('#vault-manage-open');
     try {
@@ -19204,51 +19253,115 @@ async function wireVaultCards(organizationId) {
     }
     return vaultItems;
   };
+  // The vault, as a table: tick rows (or Select all of what the search and
+  // type filter show) and the head turns into the bulk bar — set either policy
+  // or delete them all at once, as the import and task pickers select.
   const openVaultManager = () => {
     const overlay = document.createElement('div');
     overlay.className = 'modal-overlay';
+    const selected = new Set();
+    let type = '';
+    const types = () => [...new Set(vaultItems.map((i) => i.type))].sort((a, b) => VAULT_TYPE_ORDER.indexOf(a) - VAULT_TYPE_ORDER.indexOf(b));
     overlay.innerHTML = `<div class="modal-card vault-manager-modal" role="dialog" aria-modal="true" aria-labelledby="vault-manager-title">
       <div class="vault-manager-head">
-        <div><div class="section-h" id="vault-manager-title">Vault credentials</div>
-          <p class="vault-grant-help">Inspect, rotate, or remove credentials and manage organization defaults. Every reveal is recorded in the audit log.</p></div>
+        <h2 class="vm-title" id="vault-manager-title">Vault credentials</h2>
+        <span class="vm-total"></span>
+        ${policyTip('Every reveal is recorded in the audit log.')}
+        <span class="vm-spacer"></span>
         <button type="button" class="icon-btn" data-vault-manager-close aria-label="Close">×</button>
       </div>
-      <input class="vault-search" type="search" placeholder="Search vault credentials…" aria-label="Search vault credentials" />
-      <div class="vault-manager-list"></div>
+      <div class="vm-toolbar">
+        <input class="vault-search" type="search" placeholder="Search vault credentials…" aria-label="Search vault credentials" />
+        <div class="vm-types" role="group" aria-label="Type"></div>
+      </div>
+      <div class="vm-table">
+        <div class="vm-row vm-headrow">
+          <input type="checkbox" class="vault-manage-all" aria-label="Select all" />
+          <span class="vm-headlabel"></span>
+          <span class="vm-cols"><span>Blind use ${policyTip(POL_USE_TIP)}</span><span>Agent sees ${policyTip(POL_REVEAL_TIP)}</span></span>
+          <span class="vm-bulk" hidden>
+            <select class="vm-bulk-use" aria-label="Blind use for the selected credentials"><option value="">Blind use…</option><option>auto</option><option>ask</option></select>
+            <select class="vm-bulk-reveal" aria-label="Agent sees for the selected credentials"><option value="">Agent sees…</option><option>auto</option><option>ask</option><option>never</option></select>
+            <button type="button" class="btn sm danger" data-vm-bulk-delete>Delete</button>
+            <button type="button" class="icon-btn" data-vm-bulk-clear aria-label="Clear selection" title="Clear selection">×</button>
+          </span>
+        </div>
+        <div class="vault-manager-list"></div>
+      </div>
     </div>`;
     document.body.appendChild(overlay);
     const list = overlay.querySelector('.vault-manager-list');
     const search = overlay.querySelector('.vault-search');
+    const all = overlay.querySelector('.vault-manage-all');
+    const rowsOf = () => [...list.querySelectorAll('[data-vi]')];
+    const itemOf = (row) => vaultItems.find((candidate) => candidate.id === row.dataset.vi);
+    // The head: Select all over what is shown; "N selected" and the bulk bar once something is.
+    const syncSelection = () => {
+      for (const id of selected) if (!vaultItems.some((item) => item.id === id)) selected.delete(id);
+      const shown = rowsOf().filter((row) => !row.hidden);
+      const ticked = shown.filter((row) => selected.has(row.dataset.vi)).length;
+      all.disabled = !shown.length;
+      all.checked = !!shown.length && ticked === shown.length;
+      all.indeterminate = ticked > 0 && ticked < shown.length;
+      rowsOf().forEach((row) => {
+        const on = selected.has(row.dataset.vi);
+        row.classList.toggle('selected', on);
+        row.querySelector('.vault-manage-pick').checked = on;
+      });
+      overlay.querySelector('.vm-headlabel').textContent = selected.size ? `${selected.size} selected`
+        : shown.length === vaultItems.length ? 'Select all' : `Select ${shown.length} shown`;
+      overlay.querySelector('.vm-bulk').hidden = !selected.size;
+      overlay.querySelector('.vm-cols').hidden = !!selected.size;
+      overlay.querySelector('.vm-total').textContent = vaultItems.length ? String(vaultItems.length) : '';
+    };
+    const paintTypes = () => {
+      const present = types();
+      if (type && !present.includes(type)) type = '';
+      const count = (t) => vaultItems.filter((item) => !t || item.type === t).length;
+      overlay.querySelector('.vm-types').innerHTML = present.length > 1 ? ['', ...present].map((t) =>
+        `<button type="button" class="vm-type${t === type ? ' active' : ''}" data-vm-type="${esc(t)}" aria-pressed="${t === type}">${esc(t ? VAULT_TYPE_LABELS[t] || t : 'All')} <span>${count(t)}</span></button>`).join('') : '';
+    };
     const filterRows = () => {
       const query = search.value.trim().toLowerCase();
       let visible = 0;
-      list.querySelectorAll('[data-vi]').forEach((row) => {
-        const item = vaultItems.find((candidate) => candidate.id === row.dataset.vi);
-        row.hidden = !!query && !vaultItemSearchText(item).includes(query);
+      rowsOf().forEach((row) => {
+        const item = itemOf(row);
+        row.hidden = (!!query && !vaultItemSearchText(item).includes(query)) || (!!type && item.type !== type);
         if (!row.hidden) visible++;
       });
       const empty = list.querySelector('.vault-search-empty');
       if (empty) empty.hidden = visible > 0 || !vaultItems.length;
+      syncSelection();
       syncKeys?.();
     };
     let syncKeys;
+    // One credential's organization policy; the other field keeps its value.
+    const savePolicy = (item, policy) => api(`/api/vault/items${oq}`, { method: 'POST', body: JSON.stringify({ id: item.id, type: item.type, label: item.label, domains: item.domains, username: item.username, tags: item.tags, envVar: item.envVar,
+      policy: { use: item.policy?.use || 'auto', reveal: item.policy?.reveal || 'ask', ...policy } }) })
+      .then((updated) => Object.assign(item, updated.item || updated));
+    const meta = (i) => [i.username, ...(i.domains || []), i.envVar ? `$${i.envVar}` : '', ...(i.tags || []).map((tag) => `#${tag}`)].filter(Boolean);
     const paint = () => {
       list.innerHTML = vaultItems.length
-        ? sortVaultItems(vaultItems).map((i) => `<div class="queue-item vault-manager-item" data-vi="${esc(i.id)}">
-          <div style="flex:1"><b>${esc(i.label)}</b> <span class="chip">${esc(i.type)}</span> ${sourceBadge(i.provenance?.source)}
-            ${i.username ? `<span class="mono" style="color:var(--ink-3);font-size:11px">${esc(i.username)}</span>` : ''}
-            ${i.envVar ? `<span class="mono" style="color:var(--ink-3);font-size:11px" title="Environment variable agents receive">$${esc(i.envVar)}</span>` : ''}
-            <div class="task-sub" style="color:var(--ink-3)">${esc((i.domains || []).join(', '))}${i.tags?.length ? ` · tags: ${esc(i.tags.join(', '))}` : ''}</div></div>
-          <label title="${esc(POL_USE_TIP)}">blind use <select class="vi-pol-use">${['auto', 'ask'].map((v) => `<option ${i.policy?.use === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
-          <label title="${esc(POL_REVEAL_TIP)}">agent sees <select class="vi-pol-reveal">${['auto', 'ask', 'never'].map((v) => `<option ${i.policy?.reveal === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
-          ${i.type === 'session' ? `<label title="${esc(SESSION_EXCLUSIVE_TIP)}">one task at a time <input type="checkbox" class="vi-exclusive" ${i.exclusive ? 'checked' : ''}></label>` : ''}
-          <button class="btn sm" data-vi-reveal="${esc(i.id)}" title="${i.canReveal === false ? 'Viewing secrets needs Super-administrator authorization' : 'Temporarily inspect one stored field (audited)'}" ${(i.fields || []).length && i.canReveal !== false ? '' : 'disabled'}>View</button>
-          ${i.type === 'session' ? '' : `<button class="btn sm" data-vi-rotate="${esc(i.id)}" title="Replace the stored secret (metadata unchanged)">Update secret</button>`}
-          <button class="btn sm" data-vi-del="${esc(i.id)}">Delete</button>
+        ? sortVaultItems(vaultItems).map((i) => `<div class="vm-row vault-manager-item" data-vi="${esc(i.id)}" data-type="${esc(i.type)}">
+          <input type="checkbox" class="vault-manage-pick" aria-label="Select ${esc(i.label)}" ${selected.has(i.id) ? 'checked' : ''} />
+          <span class="vm-icon" title="${esc(i.type)}" aria-hidden="true">${VAULT_TYPE_ICON[i.type] || VAULT_TYPE_ICON.login}</span>
+          <span class="vm-main">
+            <span class="vm-label">${esc(i.label)}${sourceBadge(i.provenance?.source)}</span>
+            <span class="vm-meta">${esc(VAULT_TYPE_LABELS[i.type]?.replace(/s$/, '') || i.type)}${meta(i).map((part) => ` · <span class="mono">${esc(part)}</span>`).join('')}${i.type === 'session' ? `<label class="vm-exclusive" title="${esc(SESSION_EXCLUSIVE_TIP)}"><input type="checkbox" class="vi-exclusive" ${i.exclusive ? 'checked' : ''}>One task at a time</label>` : ''}</span>
+          </span>
+          <span class="vm-cols">
+            <select class="vi-pol-use" aria-label="Blind use" title="${esc(POL_USE_TIP)}">${['auto', 'ask'].map((v) => `<option ${i.policy?.use === v ? 'selected' : ''}>${v}</option>`).join('')}</select>
+            <select class="vi-pol-reveal" aria-label="Agent sees" title="${esc(POL_REVEAL_TIP)}">${['auto', 'ask', 'never'].map((v) => `<option ${i.policy?.reveal === v ? 'selected' : ''}>${v}</option>`).join('')}</select>
+          </span>
+          <span class="vm-actions">
+            <button type="button" class="icon-btn vm-act" data-vi-reveal="${esc(i.id)}" aria-label="View" title="${i.canReveal === false ? 'Viewing secrets needs Super-administrator authorization' : 'View a stored field (audited)'}" ${(i.fields || []).length && i.canReveal !== false ? '' : 'disabled'}>${VAULT_ACTION_ICON.view}</button>
+            ${i.type === 'session' ? '' : `<button type="button" class="icon-btn vm-act" data-vi-rotate="${esc(i.id)}" aria-label="Update secret" title="Replace the stored secret (metadata unchanged)">${VAULT_ACTION_ICON.rotate}</button>`}
+            <button type="button" class="icon-btn vm-act danger" data-vi-del="${esc(i.id)}" aria-label="Delete" title="Delete">${VAULT_ACTION_ICON.delete}</button>
+          </span>
           <div class="vault-reveal-panel" hidden>
-            <label>Stored field <select class="vi-reveal-field">${(i.fields || []).map((field) => `<option value="${esc(field)}">${esc(field)}</option>`).join('')}</select></label>
+            <select class="vi-reveal-field" aria-label="Stored field">${(i.fields || []).map((field) => `<option value="${esc(field)}">${esc(field)}</option>`).join('')}</select>
             <button type="button" class="btn sm primary" data-vi-reveal-load>Reveal</button>
-            <span class="task-sub">Hidden again after 60 seconds.</span>
+            <span class="task-sub">Hidden again after 60 seconds</span>
             <div class="vault-reveal-value" hidden>
               <pre class="mono" tabindex="0"></pre>
               <div style="display:flex;gap:6px">
@@ -19260,13 +19373,12 @@ async function wireVaultCards(organizationId) {
         : '<span class="vault-grant-empty">No passwords yet — sync from a password manager or add one by hand.</span>';
       list.insertAdjacentHTML('beforeend', '<span class="vault-grant-empty vault-search-empty" hidden>No credentials match your search.</span>');
       list.querySelectorAll('[data-vi]').forEach((row) => {
-        const item = vaultItems.find((candidate) => candidate.id === row.dataset.vi);
-        const savePolicy = async () => {
+        const item = itemOf(row);
+        const policyChanged = async () => {
           const controls = row.querySelectorAll('select');
           controls.forEach(control => { control.disabled = true; });
           try {
-            const updated = await api(`/api/vault/items${oq}`, { method: 'POST', body: JSON.stringify({ id: item.id, type: item.type, label: item.label, domains: item.domains, username: item.username, tags: item.tags, envVar: item.envVar, policy: { use: row.querySelector('.vi-pol-use').value, reveal: row.querySelector('.vi-pol-reveal').value } }) });
-            Object.assign(item, updated.item || updated);
+            await savePolicy(item, { use: row.querySelector('.vi-pol-use').value, reveal: row.querySelector('.vi-pol-reveal').value });
             toast('Policy saved');
           } catch (e) {
             row.querySelector('.vi-pol-use').value = item.policy?.use || 'auto';
@@ -19274,8 +19386,12 @@ async function wireVaultCards(organizationId) {
             toast(e.message, true);
           } finally { controls.forEach(control => { control.disabled = false; }); }
         };
-        row.querySelector('.vi-pol-use').addEventListener('change', savePolicy);
-        row.querySelector('.vi-pol-reveal').addEventListener('change', savePolicy);
+        row.querySelector('.vi-pol-use').addEventListener('change', policyChanged);
+        row.querySelector('.vi-pol-reveal').addEventListener('change', policyChanged);
+        row.querySelector('.vault-manage-pick').addEventListener('change', (event) => {
+          if (event.target.checked) selected.add(item.id); else selected.delete(item.id);
+          syncSelection();
+        });
         row.querySelector('.vi-exclusive')?.addEventListener('change', async (event) => {
           const box = event.target;
           box.disabled = true;
@@ -19293,6 +19409,7 @@ async function wireVaultCards(organizationId) {
         const row = button.closest('[data-vi]');
         const panel = row.querySelector('.vault-reveal-panel');
         panel.hidden = !panel.hidden;
+        button.setAttribute('aria-expanded', String(!panel.hidden));
         if (panel.hidden) panel._conceal?.();
         else panel.querySelector('[data-vi-reveal-load]').focus();
       }));
@@ -19349,15 +19466,75 @@ async function wireVaultCards(organizationId) {
         } catch (e) { toast(e.message, true); }
       }));
       list.querySelectorAll('[data-vi-del]').forEach((button) => button.addEventListener('click', async () => {
-        if (!confirm('Delete this vault item (and its secrets)?')) return;
+        const item = vaultItems.find((candidate) => candidate.id === button.dataset.viDel);
+        if (!confirm(`Delete “${item?.label || 'this vault item'}” and its secrets?`)) return;
         try {
-          await api(`/api/vault/items/${button.dataset.viDel}${oq}`, { method: 'DELETE' });
-          await renderItems();
-          paint();
+          await api(`/api/vault/items/${encodeURIComponent(button.dataset.viDel)}${oq}`, { method: 'DELETE' });
+          await repaint();
         } catch (e) { toast(e.message, true); }
       }));
+      paintTypes();
       filterRows();
     };
+    const repaint = async () => {
+      const focusedRow = document.activeElement?.closest?.('[data-vi]')?.dataset.vi;
+      await renderItems();
+      paint();
+      if (focusedRow && !list.querySelector(`[data-vi="${CSS.escape(focusedRow)}"]`)) search.focus();
+    };
+    // Bulk actions over the ticked credentials, a few requests at a time.
+    const eachSelected = async (button, verb, run) => {
+      const targets = vaultItems.filter((item) => selected.has(item.id));
+      if (!targets.length) return [];
+      if (button) button.disabled = true;
+      const failed = [];
+      let next = 0;
+      await Promise.all(Array.from({ length: Math.min(4, targets.length) }, async () => {
+        while (next < targets.length) {
+          const item = targets[next++];
+          try { await run(item); } catch (error) { failed.push([item, error]); }
+        }
+      }));
+      if (button) button.disabled = false;
+      const done = targets.length - failed.length;
+      if (failed.length) toast(`${verb} ${done} of ${targets.length}. ${failed[0][0].label}: ${failed[0][1].message}`, true);
+      else toast(`${verb} ${done} credential${done === 1 ? '' : 's'}`);
+      return failed;
+    };
+    overlay.querySelector('[data-vm-bulk-delete]').addEventListener('click', async (event) => {
+      const n = selected.size;
+      if (!confirm(`Delete ${n} credential${n === 1 ? '' : 's'} and their secrets?`)) return;
+      const failed = await eachSelected(event.currentTarget, 'Deleted',
+        (item) => api(`/api/vault/items/${encodeURIComponent(item.id)}${oq}`, { method: 'DELETE' }));
+      selected.clear();
+      failed.forEach(([item]) => selected.add(item.id));
+      await repaint();
+      if (!list.contains(document.activeElement)) search.focus();
+    });
+    for (const [selector, field] of [['.vm-bulk-use', 'use'], ['.vm-bulk-reveal', 'reveal']]) {
+      const control = overlay.querySelector(selector);
+      control.addEventListener('change', async () => {
+        const value = control.value;
+        if (!value) return;
+        control.disabled = true;
+        await eachSelected(null, `${field === 'use' ? 'Blind use' : 'Agent sees'} “${value}” for`, (item) => savePolicy(item, { [field]: value }));
+        control.disabled = false;
+        control.value = '';
+        paint();
+      });
+    }
+    overlay.querySelector('[data-vm-bulk-clear]').addEventListener('click', () => { selected.clear(); syncSelection(); search.focus(); });
+    all.addEventListener('change', () => {
+      rowsOf().filter((row) => !row.hidden).forEach((row) => { if (all.checked) selected.add(row.dataset.vi); else selected.delete(row.dataset.vi); });
+      syncSelection();
+    });
+    overlay.querySelector('.vm-types').addEventListener('click', (event) => {
+      const chip = event.target.closest('[data-vm-type]');
+      if (!chip) return;
+      type = chip.dataset.vmType;
+      paintTypes();
+      filterRows();
+    });
     paint();
     const opener = document.activeElement;
     const close = () => {
@@ -19365,10 +19542,12 @@ async function wireVaultCards(organizationId) {
       overlay.remove();
       opener?.focus?.();
     };
-    // Enter opens the highlighted credential, as View does.
+    // Enter opens the highlighted credential, as View does; on its checkbox it ticks it.
     syncKeys = wireVaultListKeys(overlay, {
-      search, rows: () => [...list.querySelectorAll('[data-vi]')], close,
+      search, rows: rowsOf, close,
       onEnter: (row) => {
+        const pick = row.querySelector('.vault-manage-pick');
+        if (document.activeElement === pick) return pick.click();
         const view = row.querySelector('[data-vi-reveal]');
         if (view.disabled) return;
         if (row.querySelector('.vault-reveal-panel').hidden) view.click();
@@ -22319,6 +22498,8 @@ const HOST_COMMANDS = [
   { id: 'nav.searchProjects', title: 'Search projects', key: 'p /', group: 'Projects', run: () => { revealRail(); $('#project-search')?.focus(); } },
   { id: 'nav.profile', title: 'Go to your profile', key: 'g A', ...navCommand(() => profileRoute()) },
   { id: 'nav.notifications', title: 'Go to inbox', key: 'g N', ...navCommand(() => inboxRoute(DEFAULT_LIST_QUERY)) },
+  { id: 'nav.vault', title: 'Go to passwords & payments', key: 'g V', ...navCommand(() => `${globalRoute('organization')}#settings-payments`) },
+  { id: 'view.save', title: 'Save search as view', key: 'v s', group: 'Views', available: () => isTaskListTab() && !S.selected && canSaveViews(), run: () => saveCurrentView() },
   { id: 'nav.close', title: 'Close panel', key: null, run: () => closeTopOverlay() }, // Esc — handled by the dispatcher
 ];
 
@@ -22328,8 +22509,12 @@ function allCommands() {
   const add = (c) => out.push({ available: true, ...c, keys: c.keybinding ? parseKeybinding(c.keybinding) : null });
   for (const h of HOST_COMMANDS) {
     const d = declared.get(h.id);
-    add({ id: h.id, title: d?.title || h.title, keybinding: d ? d.keybinding : h.key, group: h.group || 'Navigation', run: h.run, href: h.href });
+    add({ id: h.id, title: d?.title || h.title, keybinding: d ? d.keybinding : h.key, group: h.group || 'Navigation', run: h.run, href: h.href,
+      ...(h.available ? { available: h.available() } : {}) });
   }
+  // The list's views (`v 1`…`v 9`) and the page's toolbar buttons (`. 1`…`. 9`).
+  viewCommands().forEach(add);
+  toolbarCommands().forEach(add);
   // Interaction grammar (host-owned, not server-declared): a list cursor on the
   // tasks/queue views; with a task page open the same keys walk between tasks. When
   // focus sits in the projects rail (g p), the same keys walk the rail instead.
@@ -22439,7 +22624,7 @@ function openActionForm(a) {
     <div style="padding:14px 16px">${(a.args || []).map(control).join('')}</div>
     <div style="padding:12px 16px;border-top:1px solid var(--line);display:flex;gap:8px;justify-content:flex-end;background:var(--surface-2)">
       <button class="btn" id="act-cancel">Cancel</button>
-      <button class="btn ${a.danger ? 'danger' : 'primary'}" id="act-send">${esc(a.label || a.name)}</button>
+      <button class="btn ${a.danger ? 'danger' : 'primary'}" id="act-send" data-submit>${esc(a.label || a.name)}</button>
     </div></div></div>`;
   const close = () => (root.remove());
   $('#act-scrim').addEventListener('click', (e) => { if (e.target.id === 'act-scrim') close(); });
@@ -22584,21 +22769,135 @@ function controlShortcut(control) {
     const keys = bound ? fmtKeys(bound.keybinding) : control.querySelector('.kbd')?.textContent;
     return keys ? { keys, title: control.dataset.label } : null;
   }
-  const command = cmds.find((c) => c.id === control.dataset.shortcut);
+  const command = cmds.find((c) => c.target === control) || cmds.find((c) => c.id === control.dataset.shortcut);
   return command?.keybinding ? { keys: fmtKeys(command.keybinding), title: command.title } : null;
 }
 function echoClickedShortcut(e) {
   // Clicks a command fires itself (digits press action buttons) are untrusted;
   // the keys that fired it are already showing.
   if (!e.isTrusted || !e.target?.closest) return;
-  const control = e.target.closest('[data-shortcut], [data-keys], #tp-foot [data-act]');
+  const control = e.target.closest('[data-shortcut], [data-keys], [data-tool], #tp-foot [data-act]');
   const hint = control && controlShortcut(control);
-  if (hint) echoKeys(hint.keys, hint.title);
+  if (hint) return echoKeys(hint.keys, hint.title);
+  // The button ⌘/Ctrl+Enter would press from here teaches that, too.
+  const button = e.target.closest('button');
+  if (button && submitsByKey(button)) echoKeys(fmtKeys('meta+Enter'), actionLabel(button));
+}
+
+// -- views: `v 1`…`v 9` switch the list's view, `v s` saves the search as one --
+// Numbered in the order the chips show. Away from a list they open the
+// organization home in that view.
+function viewCommands() {
+  const onList = isTaskListTab() && !S.selected;
+  const tab = onList ? S.tab : 'home';
+  const route = (q) => (onList ? listQueryRoute(q) : homeRoute(undefined, q));
+  return listViewChips(tab).slice(0, 9).map((v, i) => ({
+    id: `view.${i + 1}`, title: `View: ${v.name}`, keybinding: `v ${i + 1}`, group: 'Views', help: false,
+    available: onList || !!S.organizationId,
+    href: () => route(v.query), run: () => (onList ? setQuery(v.query) : go(route(v.query))),
+  }));
+}
+
+// -- toolbar: `. 1`…`. 9` press the page's tool buttons -----------------------
+// A task's Share, Fork, Work locally, full screen; a project's Work locally.
+// Numbered in the order they show, which is the order their hints appear in.
+function toolbarButtons() {
+  return [...document.querySelectorAll('[data-tool]')].filter((b) => !b.disabled && b.getClientRects().length);
+}
+function toolbarCommands() {
+  return toolbarButtons().slice(0, 9).map((b, i) => ({
+    id: `tool.${i + 1}`, title: b.dataset.tool, keybinding: `. ${i + 1}`, group: 'Toolbar', help: false,
+    target: b, run: () => b.click(),
+  }));
+}
+
+// -- chord hints: a pending prefix badges what it can reach -------------------
+// After `v`, `.` or `g`, every visible control the next key would press shows
+// that key beside it — the same registry as dispatch, so the badges are always
+// the keys that work. Controls name their command in `data-shortcut`, or the
+// command carries its `target`.
+function showChordHints(cmds) {
+  hideChordHints();
+  const layer = document.createElement('div');
+  layer.id = 'chord-hints';
+  layer.setAttribute('aria-hidden', 'true');
+  const steps = CHORD.pending.length;
+  for (const c of cmds) {
+    if (c.keys.length <= steps || !CHORD.pending.every((p, i) => stepMatches(c.keys[i], p))) continue;
+    const targets = c.target ? [c.target] : document.querySelectorAll(`[data-shortcut="${CSS.escape(c.id)}"]`);
+    for (const target of targets) {
+      const r = target.getBoundingClientRect();
+      if (!r.width || r.bottom < 0 || r.top > innerHeight) continue;
+      const hint = document.createElement('kbd');
+      hint.className = 'chord-hint';
+      hint.textContent = fmtKeys(c.keybinding).split(' ').slice(steps).join(' ');
+      hint.style.left = `${Math.round(r.right)}px`;
+      hint.style.top = `${Math.round(r.top)}px`;
+      layer.appendChild(hint);
+    }
+  }
+  if (!layer.childElementCount) return 0;
+  document.body.appendChild(layer);
+  return layer.childElementCount;
+}
+function hideChordHints() { document.getElementById('chord-hints')?.remove(); }
+if (typeof window !== 'undefined') {
+  window.addEventListener('scroll', hideChordHints, true);
+  window.addEventListener('resize', hideChordHints);
+}
+
+// -- ⌘/Ctrl+Enter: the main button of where you are --------------------------
+// In a dialog: its one primary button (Apply, Save, Create, Continue …), or the
+// one nearest the focus. On a page: the primary button of the form or card you
+// are typing in, else the Save of the one form with unsaved changes. A control
+// marks itself `data-submit` to be the pick where a surface has several. Pure
+// DOM — no surface registers anything.
+const SUBMIT_SAVES = '[data-unsaved-save], .params-save-bar .btn.primary';
+const SUBMIT_PRIMARY = `${SUBMIT_SAVES}, [data-submit], button.btn.primary, button[type="submit"]`;
+const SUBMIT_FORM = 'form, .card, [data-unsaved], .params-save-bar, .modal-card, dialog';
+function topSurface() {
+  const dialogs = [...document.querySelectorAll('body > .modal-overlay, dialog[open]')];
+  return dialogs.at(-1) || $('#modal-root')?.lastElementChild || $('#overlay-root')?.firstElementChild || null;
+}
+function submitTarget(from = document.activeElement) {
+  const surface = topSurface();
+  const root = surface || $('#main');
+  if (!root) return null;
+  const inside = from && from !== document.body && root.contains(from) ? from : null;
+  const usable = (b) => {
+    if (b.disabled || !b.getClientRects().length || b.closest('[hidden], [inert]')) return false;
+    if (!b.matches('[data-unsaved-save]')) return true;
+    const region = b.closest('[data-unsaved]');
+    return !region || region.contains(inside) || unsavedState(region).dirty;
+  };
+  const among = (el, selector) => [...el.querySelectorAll(selector)].filter(usable);
+  if (inside?.matches(SUBMIT_PRIMARY) && usable(inside)) return inside;
+  // Nearest first: the one button of the form you are in. On a page, a plain
+  // primary button counts only inside that form; beyond it, only saves.
+  let selector = SUBMIT_PRIMARY;
+  for (let el = inside; el && el !== root && root.contains(el); el = el.parentElement) {
+    const found = among(el, selector);
+    if (found.length === 1) return found[0];
+    if (found.length > 1) break;
+    if (!surface && el.matches(SUBMIT_FORM)) selector = SUBMIT_SAVES;
+  }
+  const all = among(root, surface ? SUBMIT_PRIMARY : SUBMIT_SAVES);
+  if (all.length === 1) return all[0];
+  const marked = all.filter((b) => b.matches('[data-submit]'));
+  return marked.length === 1 ? marked[0] : null;
+}
+// Is `button` what ⌘/Ctrl+Enter presses while typing in its form? Then a click
+// on it teaches that key in the topbar echo.
+function submitsByKey(button) {
+  const form = button.closest(SUBMIT_FORM) || topSurface();
+  const field = [...(form?.querySelectorAll('textarea, select, input:not([type="hidden"]):not([type="file"])') || [])]
+    .find((el) => el.getClientRects().length);
+  return !!field && submitTarget(field) === button;
 }
 
 // -- the dispatcher ------------------------------------------------------------
 const CHORD = { pending: [], timer: 0 };
-function resetChord() { CHORD.pending = []; clearTimeout(CHORD.timer); clearPendingEcho(); }
+function resetChord() { CHORD.pending = []; clearTimeout(CHORD.timer); clearPendingEcho(); hideChordHints(); }
 // A bare modifier keydown (Shift/Ctrl/Alt/Meta) fires on its own before the key
 // it modifies. It must be transparent to the chord buffer — otherwise pressing
 // Shift for the second step of a shifted chord (`g P`, `g W`, `g D`, `g S`, …)
@@ -22636,8 +22935,10 @@ function dispatchKey(e) {
   if (exact && !longer) { resetChord(); echoKeys(fmtKeys(exact.keybinding), exact.title); exact.run(); return true; }
   CHORD.pending.push(snap); // a chord prefix ('g' …) — wait briefly for the rest
   echoKeys(fmtKeys(candidates[0].keybinding).split(' ').slice(0, CHORD.pending.length).join(' '), '', true);
+  // The controls the prefix can reach show their next key; reading them takes longer.
+  const hinted = showChordHints(cmds);
   clearTimeout(CHORD.timer);
-  CHORD.timer = setTimeout(resetChord, 900);
+  CHORD.timer = setTimeout(resetChord, hinted ? 4000 : 900);
   return true;
 }
 function bindKeys() {
@@ -22646,6 +22947,17 @@ function bindKeys() {
     // A component-level handler that prevented the event already owns it (for
     // example a composite role=button with richer Enter/Space behavior).
     if (e.defaultPrevented || e.isComposing) return;
+    // ⌘/Ctrl+Enter presses the main button of where you are (a dialog's, the
+    // form's Save), whatever has focus — unless a control already took it.
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey) {
+      const button = submitTarget(t);
+      if (button) {
+        e.preventDefault();
+        resetChord();
+        if (!e.repeat) { echoKeys(fmtKeys('meta+Enter'), actionLabel(button)); button.click(); }
+        return;
+      }
+    }
     const typing = takesTypedKeys(t);
     // Security and vault dialogs are direct body children: modal too, but they
     // close themselves, so Esc must not also pop whatever lies beneath them.
@@ -22747,25 +23059,39 @@ function openPalette() {
 }
 
 // -- "?" help: the same registry, grouped — includes every workflow's commands -
+// Rows come from the registry; the families of numbered keys (views, toolbar,
+// action buttons) and the keys that are not commands (⌘↵, Esc, the task-page
+// grammar documented before a task is open) are listed once each.
+const HELP_GENERAL = ['nav.commandPalette', 'help.keyboard', 'nav.newTask', 'nav.search'];
 function openHelp() {
   const root = createTransientOverlay();
   const cmds = allCommands().filter((c) => c.keybinding && c.help !== false);
-  const groups = [...new Set(cmds.map((c) => c.group))];
-  const row = (k, title, sub) => `<div class="help-row"><span class="key">${k}</span><span>${title}${sub ? ` <span class="pal-sub">${esc(sub)}</span>` : ''}</span></div>`;
-  root.innerHTML = `<div class="palette-scrim" id="help-scrim"><div class="palette" style="width:min(560px,92vw);max-height:80vh;overflow:auto">
-    <div style="padding:14px 16px;border-bottom:1px solid var(--line);display:flex;align-items:center"><b>Keyboard shortcuts</b><span style="flex:1"></span><button class="icon-btn" id="help-close">✕</button></div>
-    <div style="padding:6px 16px 16px">
-      ${groups.map((g) => `<div class="section-h">${esc(g)}</div>${cmds.filter((c) => c.group === g).map((c) => row(esc(fmtKeys(c.keybinding)), esc(c.title), c.workflow)).join('')}`).join('')}
-      <div class="section-h">On a task page</div>
-      ${row('1–9', 'Press the Nth action button (whatever the workflow declares)')}
-      ${row('[ / ]', 'Chat / Parameters')}
-      ${row('{ / }', 'Previous / next attempt')}
-      ${row('a n', 'New attempt (open editable draft)')}
-      ${row('i', 'Show / hide details')}
-      ${row('t', 'Terminal / conversation')}
-      ${row('u', 'Back to the list')}
-      ${row(esc(fmtKeys('meta+Enter')), 'Send a message (in the compose box)')}
-    </div></div></div>`;
+  const row = (k, title, sub) => `<div class="help-row"><span class="key">${esc(k)}</span><span>${esc(title)}${sub ? ` <span class="pal-sub">${esc(sub)}</span>` : ''}</span></div>`;
+  const rows = (list) => list.map((c) => row(fmtKeys(c.keybinding), c.title, c.workflow)).join('');
+  const group = (g) => cmds.filter((c) => c.group === g && !HELP_GENERAL.includes(c.id));
+  const sections = [
+    ['General', rows(HELP_GENERAL.map((id) => cmds.find((c) => c.id === id)).filter(Boolean))
+      + row(fmtKeys('meta+Enter'), 'Save, apply or send')
+      + row('Esc', 'Close · leave a field · exit full screen')],
+    ['Navigation', rows(group('Navigation'))],
+    ['Views', row('v 1–9', 'Switch view') + rows(group('Views'))],
+    ['List', rows(group('List'))],
+    ['On a task page', rows(group('Task'))
+      + row('1–9', 'Action buttons')
+      + row('. 1–9', 'Share, Fork, Work locally, Full screen')
+      + row('[ / ]', 'Chat / Parameters')
+      + row('{ / }', 'Previous / next attempt')
+      + row('a n', 'New attempt')
+      + row('i', 'Show / hide details')
+      + row('t', 'Terminal / conversation')
+      + row('u', 'Back to the list')],
+    ['Projects', rows(group('Projects'))],
+    ['Settings', row('{ / }', 'Previous / next section')],
+  ];
+  root.innerHTML = `<div class="palette-scrim" id="help-scrim"><div class="palette help-panel" role="dialog" aria-label="Keyboard shortcuts">
+    <div class="help-head"><b>Keyboard shortcuts</b><span class="help-tip">${policyTip('Press a prefix key (g, v, .) and the keys it can reach show beside their buttons.')}</span><span style="flex:1"></span><button class="icon-btn" id="help-close" aria-label="Close">✕</button></div>
+    <div class="help-grid">${sections.filter(([, body]) => body).map(([title, body]) => `<section class="help-section"><div class="section-h">${esc(title)}</div>${body}</section>`).join('')}</div>
+  </div></div>`;
   $('#help-close').addEventListener('click', () => (root.remove()));
   $('#help-scrim').addEventListener('click', (e) => { if (e.target.id === 'help-scrim') root.remove(); });
 }
