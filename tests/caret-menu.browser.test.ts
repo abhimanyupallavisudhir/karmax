@@ -55,7 +55,7 @@ it('keeps one caret menu across a re-render, and an orphaned one never acts', as
     expect(await first!.evaluate(el => el.isConnected)).toBe(false);
     // The orphan's options do nothing to the box that is gone, and it closes.
     await page.locator('.agent-mention-menu .am-opt').first().dispatchEvent('mousedown');
-    expect(await first!.evaluate(el => (el as HTMLTextAreaElement).value)).toBe('@');
+    expect(await first!.evaluate(el => (el as unknown as { value: string }).value)).toBe('@');
     await expect.poll(() => menus.count()).toBe(0);
 
     await box.click();
