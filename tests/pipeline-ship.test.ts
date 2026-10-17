@@ -28,9 +28,10 @@ describe('software-dev: every branch of a task lands as its own pull request', (
 
   const view = (handle: { query: (name: string) => Promise<unknown> }) => handle.query('view') as Promise<any>;
   /** A task of a real project, so its pull requests are made and routed from records as in the product. */
-  const start = async (repo: string, prompt: string) => {
+  const start = async (repo: string, prompt: string, setup?: (project: Awaited<ReturnType<Harness['store']['createProject']>>) => Promise<unknown>) => {
     const config = { repos: [repo], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false, multiPr: true };
     const project = await h.store.createProject(`Ship ${path.basename(repo)}`, config);
+    await setup?.(project);
     const task = await h.store.createTask({ projectId: project.id, title: 'Docs and a feature', workflow: 'software-dev',
       workflowVersion: '1.30.0', params: { prompt, multiPr: true }, createdBy: { kind: 'user', userId: 'a' } });
     const handle = await h.client.workflow.start('softwareDev@1.30.0', {
@@ -191,6 +192,57 @@ describe('software-dev: every branch of a task lands as its own pull request', (
     await handle.signal('cancel');
     await handle.result();
   }, 150_000);
+
+  it('changed data goes through the task\'s own Review even when every branch already landed', async () => {
+    const repo = await h.makeRepo('ship-data');
+    fs.writeFileSync(path.join(repo, '.gitignore'), 'raw_data/\n');
+    await git(repo, ['add', '-A']);
+    await git(repo, ['commit', '-qm', 'ignore the data']);
+    const { taskId, handle } = await start(repo, [
+      '@branch docs',
+      docsCommit,
+      '@ship docs',
+      '@write raw_data/index.txt ::the second version\\n',
+    ].join('\n'), async (project) => {
+      const data = await h.store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+        name: 'Raw data', driver: 'volume@1', target: { kind: 'path', path: 'raw_data' }, access: 'write',
+        isolation: 'fork', source: {}, credentialHandles: [], publish: 'review' });
+      await h.resources.importFiles(data.id, [{ path: 'index.txt', data: Buffer.from('one\n') }]);
+      return data.id;
+    });
+    const { child: docs } = await pullRequest(handle, 1);
+    await docs.signal('confirm');
+    expect((await docs.result()).stage).toBe('done');
+    // The code all landed, but the data did not: it is reviewed like any proposal, never dropped with the world.
+    await expect.poll(async () => { const v = await view(handle); return `${v.stage}/${v.waitingFor?.kind}`; },
+      { timeout: 60_000 }).toBe('review/human');
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
+    expect((await view(handle)).reviewInfo?.summary).toContain('Landed 1 pull request: "docs". Published its data.');
+    const projectId = (await h.store.getTask(taskId))!.projectId;
+    const [attachment] = await h.store.listResourceAttachments(projectId);
+    const revision = (await h.store.getResourceAttachment(attachment!.id))!.currentRevisionId!;
+    const { files } = await h.resources.verifyRevision(projectId, attachment!.id, revision, 0, 100);
+    expect(files.find((file: any) => file.path === 'index.txt')?.bytes).toBe('the second version\n'.length);
+  }, 180_000);
+
+  it('data left as it was adds no Review once every branch has landed', async () => {
+    const repo = await h.makeRepo('ship-data-unchanged');
+    fs.writeFileSync(path.join(repo, '.gitignore'), 'raw_data/\n');
+    await git(repo, ['add', '-A']);
+    await git(repo, ['commit', '-qm', 'ignore the data']);
+    const { handle } = await start(repo, ['@branch docs', docsCommit, '@ship docs', '@run cat raw_data/index.txt'].join('\n'),
+      async (project) => {
+        const data = await h.store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+          name: 'Raw data', driver: 'volume@1', target: { kind: 'path', path: 'raw_data' }, access: 'write',
+          isolation: 'fork', source: {}, credentialHandles: [], publish: 'review' });
+        await h.resources.importFiles(data.id, [{ path: 'index.txt', data: Buffer.from('one\n') }]);
+      });
+    const { child: docs } = await pullRequest(handle, 1);
+    await docs.signal('confirm');
+    expect((await docs.result()).stage).toBe('done');
+    expect((await handle.result()).stage).toBe('done');
+  }, 180_000);
 
   it('a pull request closed without landing leaves the world, and its branch is not proposed again unchanged', async () => {
     const repo = await h.makeRepo('ship-cancelled');
