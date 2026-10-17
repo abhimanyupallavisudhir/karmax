@@ -48,6 +48,11 @@ it('discovers all pages, requires organization ownership, and does not reuse ano
     switchAccount = false;
     // Restore the first account through the public API before subsequent requests.
     await service.setActiveUserAccount('me', '1');
+    // A new workspace takes the person's own installation, unless they
+    // administer a GitHub organization of the same name.
+    expect(await service.ownInstallation('me', '1')).toBe('101');
+    expect(await service.ownInstallation('me', '1', 'Owned-Org')).toBe('102');
+    expect(await service.ownInstallation('me', '1', 'member-org')).toBe('101');
     malformed = true;
     await expect(service.connectableInstallations('me')).rejects.toThrow('no installation list');
     malformed = false;
