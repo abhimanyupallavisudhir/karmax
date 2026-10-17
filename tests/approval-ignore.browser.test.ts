@@ -2,8 +2,9 @@ import fs from 'node:fs';
 import { chromium } from 'playwright';
 import { expect, it } from 'vitest';
 
-// Every kind of approval request can be ignored from the conversation: it stays
-// there (dimmed, still decidable) and in the rail's pending count.
+// Every kind of approval request can be ignored from the conversation: it
+// leaves the conversation, and stays counted and decidable in the rail's
+// Approval requests, since the agent still waits on it.
 it('ignores each kind of approval request without deciding it', async () => {
   const browser = await chromium.launch({ headless: true });
   try {
@@ -20,9 +21,14 @@ it('ignores each kind of approval request without deciding it', async () => {
     const dismissed: string[] = [];
     await page.route('http://approvals.test/**', async route => {
       const url = new URL(route.request().url());
-      if (url.pathname === '/') return route.fulfill({ contentType: 'text/html', body: '<div id="main"><div id="app"></div><aside class="tp-rail" id="rail"></aside></div>' });
+      if (url.pathname === '/') return route.fulfill({ contentType: 'text/html', body: '<div id="main"><div id="app"></div><aside class="tp-rail" id="rail"></aside></div><div id="modal-root"></div>' });
       if (url.pathname.startsWith('/fonts/')) return route.fulfill({ body: fs.readFileSync(`web${url.pathname}`) });
       if (url.pathname === '/state') return route.fulfill({ json: state });
+      // What the rail's Approval requests panel reads.
+      const lists: Record<string, any[]> = { '/api/vault/requests': state.approvalRequests!, '/api/permission-requests': state.permissionRequests!,
+        '/api/authorization-requests': state.authorizationRequests!, '/api/connections': state.connections!,
+        '/api/vault/items': [{ id: 'item', label: 'GitHub login', type: 'login' }] };
+      if (route.request().method() === 'GET' && lists[url.pathname]) return route.fulfill({ json: lists[url.pathname] });
       const ignore = (rows: any[], field = 'dismissed') => {
         rows[0][field] = { by: 'user:user', at: Date.now() };
         dismissed.push(rows === state.approvalRequests ? 'credential' : rows === state.permissionRequests ? 'permission'
@@ -61,6 +67,7 @@ it('ignores each kind of approval request without deciding it', async () => {
           document.getElementById('app').innerHTML = conversationApprovalRequests();
           document.getElementById('rail').innerHTML = '<div class="rail-links">' + approvalHistoryLink(S.view) + '</div>';
           wireTaskApprovalRequests(S.view);
+          document.getElementById('approval-history-open').onclick = () => openApprovalHistory(S.view);
         };
       `);
       await (globalThis as any).eval('refreshTask()');
@@ -71,16 +78,21 @@ it('ignores each kind of approval request without deciding it', async () => {
     expect((await page.locator('#approval-history-open').innerText()).replace(/\s+/g, ' ')).toBe('Approval requests 4');
     for (const row of ['[data-connection="connection"]', '[data-preq="permission"]', '[data-areq="authorization"]', '[data-vreq="credential"]']) {
       await page.locator(`${row} [aria-label="Ignore request"]`).click();
-      await page.locator(`${row}.approval-request-dismissed`).waitFor();
+      await page.locator(`#app ${row}`).waitFor({ state: 'detached' });
     }
     expect(dismissed.sort()).toEqual(['authorization', 'connection', 'credential', 'permission']);
-    expect(await ignoreButtons.count()).toBe(0);
-    // Still in the conversation, still decidable, still counted.
-    expect(await page.locator('.approval-request-dismissed').count()).toBe(4);
-    expect(await page.locator('.approval-request-dismissed .chip', { hasText: 'ignored' }).count()).toBe(4);
-    for (const action of ['[data-vreq-act="task"]', '[data-preq-act="approve"]', '[data-areq-act="approve"]', '[data-connection-action="connect"]'])
-      expect(await page.locator(action).isEnabled()).toBe(true);
+    // Out of the conversation; still counted in the rail.
+    expect(await page.locator('#app').innerHTML()).toBe('');
     expect((await page.locator('#approval-history-open').innerText()).replace(/\s+/g, ' ')).toBe('Approval requests 4');
+    // Still decidable from the rail's Approval requests.
+    await page.locator('#approval-history-open').click();
+    const history = page.locator('#task-approval-history');
+    await history.locator('.approval-request-dismissed').first().waitFor();
+    expect(await history.locator('.approval-request-dismissed').count()).toBe(4);
+    expect(await history.locator('.approval-request-dismissed .chip', { hasText: 'ignored' }).count()).toBe(4);
+    expect(await history.getByRole('button', { name: 'Ignore request' }).count()).toBe(0);
+    for (const action of ['[data-vreq-act="task"]', '[data-preq-act="approve"]', '[data-areq-act="approve"]', '[data-connection-action="connect"]'])
+      expect(await history.locator(action).isEnabled()).toBe(true);
     if (process.env.APPROVAL_SCREENSHOT) await page.screenshot({ path: process.env.APPROVAL_SCREENSHOT, fullPage: true });
     expect(errors).toEqual([]);
   } finally { await browser.close(); }

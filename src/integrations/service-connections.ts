@@ -185,7 +185,20 @@ export class ServiceConnections {
     c.updatedAt = Date.now();
     // Ignoring silences one open request; an account that later needs attention asks afresh.
     if (!OPEN.includes(c.status)) delete c.dismissed;
-    (await this.store.kvSet(PREFIX + c.id, JSON.stringify(c))); return c;
+    if (!c.taskId) { (await this.store.kvSet(PREFIX + c.id, JSON.stringify(c))); return c; }
+    // A task's request is announced on the task with the write that changed it,
+    // whichever path changed it: its conversation and inbox follow the events.
+    return this.store.transaction(async () => {
+      const raw = (await this.store.kvGet(PREFIX + c.id));
+      const before: ServiceConnection | undefined = raw ? JSON.parse(raw) : undefined;
+      (await this.store.kvSet(PREFIX + c.id, JSON.stringify(c)));
+      const announce = async (type: string, payload: Record<string, unknown>) =>
+        (await this.store.appendEvent({ taskId: c.taskId!, type, ts: c.updatedAt, payload: { requestId: c.id, ...payload } }));
+      if (!before) (await announce('connection.requested', { connectionId: c.id, toolkit: c.toolkit, ...(c.why ? { why: c.why } : {}) }));
+      else if (before.status !== c.status) (await announce('connection.updated', { connectionId: c.id, status: c.status }));
+      if (c.dismissed && !before?.dismissed) (await announce('connection.dismissed', {}));
+      return c;
+    });
   }
   view(c: ServiceConnection) {
     const { accountId, sessionId, notifiedAt, ...view } = c;

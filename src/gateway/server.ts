@@ -7020,8 +7020,6 @@ export class Gateway {
               if (available) return this.json(res, 200, { status: 'connected', connection: available });
               c = (await service.request(org, toolkit, task.id, authRecord.role ?? 'do', why));
             }
-            if (c.status === 'requested') (await this.emitTaskEvent({ taskId: task.id, type: 'connection.requested', ts: Date.now(),
-              payload: { requestId: c.id, connectionId: c.id, toolkit: c.toolkit, why: c.why } }));
             return this.json(res, 200, { status: c.status === 'denied' || c.status === 'disconnected' ? 'denied' : 'needs_connection',
               connection: service.view(c), detail: 'A Connect button is available in this task’s Approval Requests. Continue independent work; the task resumes after sign-in.' });
           }
@@ -7083,10 +7081,7 @@ export class Gateway {
                 return this.json(res, 200, result);
               }
               if (action === 'dismiss' && method === 'POST') {
-                const result = (await service.dismiss(org, id, `user:${userId}`));
-                if (c.taskId) (await this.emitTaskEvent({ taskId: c.taskId, type: 'connection.dismissed', ts: Date.now(),
-                  payload: { requestId: c.id } }));
-                return this.json(res, 200, result);
+                return this.json(res, 200, (await service.dismiss(org, id, `user:${userId}`)));
               }
             }
           }
@@ -7423,7 +7418,7 @@ export class Gateway {
         if (p === '/api/vault/requests' && method === 'POST') {
           const b = await this.body(req);
           if (!callerTaskId) return this.json(res, 400, { error: 'a task-agent token is required to request credential access' });
-          const priorPending = new Set((await vault.requests({ taskId: callerTaskId, status: 'pending' })).map((request) => request.id));
+          // The vault announces a new request on the task itself.
           const decision = (await vault.request({
             taskId: callerTaskId,
             projectId: authRecord?.projectId,
@@ -7434,26 +7429,8 @@ export class Gateway {
             mode: b.mode,
             kind: b.kind === 'reset' ? 'reset' : undefined,
             why: b.why ? String(b.why) : undefined,
+            ...(b.urgency ? { urgency: normalizeUrgency(b.urgency) } : {}),
           }));
-          if (decision.requestId && !priorPending.has(decision.requestId)) {
-            const task = (await store.getTask(callerTaskId));
-            const taskOrganization = task && (await store.getProject(task.projectId))?.organizationId;
-            if (task && taskOrganization === organizationId) (await this.emitTaskEvent({
-              taskId: task.id,
-              type: 'credential.approval-requested',
-              ts: Date.now(),
-              payload: {
-                requestId: decision.requestId,
-                status: 'approval-needed',
-                mode: b.mode === 'reveal' ? 'reveal' : 'use',
-                kind: b.kind === 'reset' ? 'reset' : 'access',
-                ...(decision.itemId ? { itemId: decision.itemId } : {}),
-                ...(b.domain ? { domain: String(b.domain) } : {}),
-                ...(b.why ? { why: String(b.why) } : {}),
-                ...(b.urgency ? { urgency: normalizeUrgency(b.urgency) } : {}),
-              },
-            }));
-          }
           return this.json(res, 200, decision);
         }
         const vres = p.match(/^\/api\/vault\/requests\/([^/]+)\/resolve$/);
