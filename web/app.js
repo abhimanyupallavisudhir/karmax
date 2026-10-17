@@ -12053,7 +12053,7 @@ async function openLocalCheckout(v) {
   const rec = taskRecord(v.taskId);
   const project = projectById(rec?.projectId || S.projectId);
   return cliHandoffDialog({
-    command: `npx @tavya/cli clone ${cliTarget(project, rec?.num)}`,
+    command: `npx @tavya/cli@latest clone ${cliTarget(project, rec?.num)}`,
     note: `Code, data and secrets, as this task's world has them. <span class="mono nowrap">tavya push</span> brings your work back here; <span class="mono nowrap">tavya resume --fork</span> continues its agent on your machine.`,
     gitOnly: async (body) => {
       const [plan, preparedSessions] = await Promise.all([
@@ -12082,7 +12082,7 @@ async function openLocalCheckout(v) {
 async function openProjectCheckout(project) {
   if (!project?.id) return;
   return cliHandoffDialog({
-    command: `npx @tavya/cli clone ${cliTarget(project)}`,
+    command: `npx @tavya/cli@latest clone ${cliTarget(project)}`,
     note: `Code, data and secrets, as a task's world has them. <span class="mono nowrap">tavya pull</span> and <span class="mono nowrap">tavya push</span> keep them in step.`,
     gitOnly: async (body) => {
       const plan = await api(`/api/projects/${encodeURIComponent(project.id)}/checkout`);
@@ -13690,7 +13690,7 @@ function wireAgentMention(ta, box, v, key) {
     ta.dispatchEvent(new Event('input', { bubbles: true }));
   };
   const choose = (item) => {
-    if (!item || !token) return close();
+    if (!item || !token || !ta.isConnected) return close();
     if (item.kind === 'people') { peopleMode = true; active = 0; items = build(); return render(); }
     if (item.kind === 'new') {
       const agentKey = nextAgentKeyFor([...(v.participants || []).map((p) => p.key), ...Object.keys(followupNewAgents(key))]);
@@ -13702,7 +13702,7 @@ function wireAgentMention(ta, box, v, key) {
     insert(item.token || `@${item.label}`, item.selector);
   };
   const render = () => {
-    if (!menu) { menu = document.createElement('div'); menu.className = 'wiki-mention-menu agent-mention-menu'; menu.setAttribute('role', 'listbox'); document.body.appendChild(menu); }
+    if (!menu?.isConnected) { menu = openCaretMenu('wiki-mention-menu agent-mention-menu'); menu.setAttribute('role', 'listbox'); }
     const scrolled = menu.scrollTop;
     let sawAgent = false;
     menu.innerHTML = items.length ? items.map((item, i) => {
@@ -15953,6 +15953,16 @@ function textareaCaretXY(ta, pos) {
 }
 // A caret menu opens below the caret's line, or above it when there is more room
 // there, and stays inside the viewport — scrolling rather than running off it.
+// One caret menu (@ or [[) at a time, on <body> so no box clips it. Opening one
+// removes any other, including one left by a box a re-render replaced (its
+// options would write into a box no longer on the page).
+function openCaretMenu(className) {
+  document.querySelectorAll('.wiki-mention-menu').forEach((other) => other.remove());
+  const menu = document.createElement('div');
+  menu.className = className;
+  document.body.appendChild(menu);
+  return menu;
+}
 function placeCaretMenu(menu, ta, pos) {
   const edge = 8, xy = textareaCaretXY(ta, pos);
   const below = window.innerHeight - xy.top - edge, above = xy.lineTop - edge;
@@ -16035,7 +16045,7 @@ function wireWikiMention(ta, projectId) {
 
   const highlight = () => menu?.querySelectorAll('.wm-opt').forEach((el, i) => el.classList.toggle('active', i === active));
   const choose = (s) => {
-    if (!s || !token) return close();
+    if (!s || !token || !ta.isConnected) return close();
     const insert = `${tokenFor(s)} `;
     ta.value = ta.value.slice(0, token.start) + insert + ta.value.slice(token.end);
     const caret = token.start + insert.length;
@@ -16045,7 +16055,7 @@ function wireWikiMention(ta, projectId) {
     ta.dispatchEvent(new Event('input', { bubbles: true }));
   };
   const render = () => {
-    if (!menu) { menu = document.createElement('div'); menu.className = 'wiki-mention-menu'; document.body.appendChild(menu); }
+    if (!menu?.isConnected) menu = openCaretMenu('wiki-mention-menu');
     menu.innerHTML = items.length ? items.map((s, i) => `
       <div class="wm-opt ${i === active ? 'active' : ''}" data-i="${i}">
         <span class="wm-glyph">${glyph(s)}</span>
@@ -24003,7 +24013,7 @@ async function hydrateAppGrants() {
           · ${grant.lastUsedAt ? `used ${esc(fmtAgo(grant.lastUsedAt))}` : 'never used'}
           · <span title="${esc(`Created ${new Date(grant.createdAt).toLocaleString()}`)}">${grant.kind === 'token' ? 'expires' : 'expires if unused by'} ${esc(day(grant.expiresAt))}</span></p></div>
       <button class="btn sm danger" type="button" data-revoke-grant="${esc(grant.id)}">Revoke</button></div>`).join('')
-    : '<p class="task-sub app-grants-empty">Nothing signed in yet. Sign in a terminal with <code>npx @tavya/cli login</code>.</p>';
+    : '<p class="task-sub app-grants-empty">Nothing signed in yet. Sign in a terminal with <code>npx @tavya/cli@latest login</code>.</p>';
   box.querySelectorAll('[data-revoke-grant]').forEach((button) => button.addEventListener('click', async () => {
     const name = button.closest('.app-grant-row')?.querySelector('b')?.textContent || 'this';
     if (!confirm(`Revoke ${name}? It is signed out at once.`)) return;

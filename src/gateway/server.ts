@@ -69,6 +69,7 @@ import { CLOUD_WORLD_PROVIDERS } from '../domain/computer.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { ReviewActionRunner } from './review-actions.js';
 import { MIN_CLI_VERSION, WorkspaceService } from '../world/workspace.js';
+import { cliVersionOf, olderVersion } from '../domain/cli-version.js';
 import { WorkspaceConflict } from '../world/resources.js';
 import { acpModels, claudeModelCatalog, claudeModels, codexModelCatalog, codexModels, opencodeModels, openCodeKeyModels, mergeModels,
   modelDiscoveryFailureReason, type ModelCatalog } from '../agent/models.js';
@@ -1753,6 +1754,10 @@ export class Gateway {
     if (p.startsWith('/scim/v2/')) return this.scim(req, res, url);
     if (p.startsWith('/brand/')) return this.brand(p, res, req);
     if (p === '/app.webmanifest' && req.method === 'GET') return (await this.webManifest(res));
+    // A CLI older than this server speaks to is told to update, not left to misread a newer API.
+    const cliVersion = cliVersionOf(req.headers['user-agent']);
+    if (p.startsWith('/api/') && cliVersion && olderVersion(cliVersion, MIN_CLI_VERSION))
+      return this.json(res, 426, { error: `tavya ${cliVersion} is too old for this server, which needs ${MIN_CLI_VERSION} or newer` });
     if (p.startsWith('/api/')) return (await this.api(req, res, url, receivedAt));
     if (p === '/ws') return; // handled by ws
     return (await this.static(p, res, req));

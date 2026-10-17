@@ -6,6 +6,8 @@ import { parseRef, resolveTarget } from '../src/cli/refs.js';
 import type { Api } from '../src/cli/api.js';
 import { githubSshAliases, latestGitProgress } from '../src/cli/commands/sync.js';
 import { cliFixture, files } from './helpers/cli-fixture.js';
+import { VERSION } from '../src/cli/version.js';
+import { MIN_CLI_VERSION } from '../src/world/workspace.js';
 
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
@@ -199,4 +201,18 @@ it("shows git's newest progress record", () => {
   expect(latestGitProgress(['remote: Counting objects:  50% (3/6)', "warning: redirecting to https://github.com/x/"]))
     .toBe('Counting objects:  50% (3/6)');
   expect(latestGitProgress(["Cloning into 'karmax'...", 'fatal: early EOF', ''])).toBeUndefined();
+});
+
+it('refuses a CLI older than the server speaks to; other clients and current CLIs pass', async () => {
+  const f = await fixture();
+  const meta = (agent: string) => fetch(`${f.server.url}/api/meta`, { headers: { 'user-agent': agent } });
+  const old = await meta('tavya-cli/0.9.9');
+  expect(old.status).toBe(426);
+  expect(((await old.json()) as { error: string }).error).toBe(`tavya 0.9.9 is too old for this server, which needs ${MIN_CLI_VERSION} or newer`);
+  for (const agent of [`tavya-cli/${VERSION}`, `tavya-cli/${MIN_CLI_VERSION}`, 'node', 'Mozilla/5.0'])
+    expect((await meta(agent)).status, agent).toBe(200);
+  // The CLI sends its version on every call (here it is current, so it is served).
+  const served = await f.tavya(f.laptop, ['api', 'GET', '/api/meta']);
+  expect(served.code, served.stderr).toBe(0);
+  expect(JSON.parse(served.stdout).cli).toEqual({ minVersion: MIN_CLI_VERSION });
 });

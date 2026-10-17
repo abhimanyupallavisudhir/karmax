@@ -1,8 +1,13 @@
 import process from 'node:process';
 import { Credentials, DEFAULT_SERVER, normalizeServer, type StoredCredential } from './config.js';
 import { CliError, EXIT } from './util.js';
+import { CLI_USER_AGENT } from '../domain/cli-version.js';
+import { updateCommand } from './update.js';
+import { VERSION } from './version.js';
 
 export const CLI_CLIENT_ID = 'tavya-cli';
+/** Lets a server refuse a CLI older than it speaks to (426) instead of misreading it. */
+const USER_AGENT = `${CLI_USER_AGENT}/${VERSION}`;
 
 export class HttpError extends CliError {
   constructor(readonly status: number, message: string, readonly body: Record<string, unknown> = {}) {
@@ -63,7 +68,7 @@ export class Api {
     let response: Response;
     try {
       response = await fetch(new URL('/oauth/token', this.server), { method: 'POST', signal: AbortSignal.timeout(30_000),
-        headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
+        headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json', 'user-agent': USER_AGENT },
         body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: credential.refreshToken, client_id: clientId }) });
     } catch (error) {
       throw new CliError(`cannot reach ${this.server} to renew your sign-in: ${(error as Error & { cause?: Error }).cause?.message ?? (error as Error).message}`);
@@ -107,7 +112,7 @@ export class Api {
   private async send(method: string, path: string, body?: unknown): Promise<{ response: Response; credential: StoredCredential | undefined }> {
     const token = await this.token();
     const credential = this.credential;
-    const headers: Record<string, string> = { authorization: `Bearer ${token}`, accept: 'application/json' };
+    const headers: Record<string, string> = { authorization: `Bearer ${token}`, accept: 'application/json', 'user-agent': USER_AGENT };
     if (body !== undefined) headers['content-type'] = 'application/json';
     try {
       return { response: await fetch(new URL(path, this.server), { method, headers, ...(body !== undefined ? { body: JSON.stringify(body) } : {}) }), credential };
@@ -141,5 +146,6 @@ async function httpError(response: Response): Promise<HttpError> {
 function errorFrom(status: number, body: unknown): HttpError {
   const record = body && typeof body === 'object' ? body as Record<string, unknown> : {};
   const message = typeof record.error === 'string' ? record.error : typeof body === 'string' && body ? body.slice(0, 300) : `HTTP ${status}`;
-  return new HttpError(status, status === 401 ? `${message}; run \`tavya login\`` : message, record);
+  return new HttpError(status, status === 401 ? `${message}; run \`tavya login\``
+    : status === 426 ? `${message}\nUpdate: ${updateCommand()}` : message, record);
 }
