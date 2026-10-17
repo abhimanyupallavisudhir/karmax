@@ -33,10 +33,19 @@ describe('check-in pending decisions', () => {
     c.S.connections[0].status = 'active';
     expect(c.conversationApprovalRequests()).toBe('');
   });
-  it('keeps dismissed requests actionable and reconnects visible', () => {
+  it('leaves ignored requests to Approval requests and keeps reconnects visible', () => {
     const c = setup();
-    c.S.permissionRequests = [{ id: 'permission', status: 'pending', dismissed: { by: 'user' }, capabilities: [], audience: [] }];
-    expect(c.conversationApprovalRequests()).toContain('data-preq-act="approve"');
+    // Ignoring one takes it out of the conversation; it is still decided from the rail's Approval requests.
+    const dismissed = { by: 'user', at: 1 };
+    c.S.approvalRequests = [{ id: 'vault', itemId: 'item', status: 'pending', dismissed }];
+    c.S.permissionRequests = [{ id: 'permission', status: 'pending', dismissed, capabilities: [], audience: [] }];
+    c.S.authorizationRequests = [{ id: 'authorization', status: 'pending', dismissed, recipients: ['user'], target: { kind: 'task' }, audience: [] }];
+    c.S.connections = [{ id: 'connection', status: 'requested', dismissed }];
+    expect(c.conversationApprovalRequests()).toBe('');
+    c.S.permissionRequests = [{ id: 'live', status: 'pending', capabilities: [], audience: [] }];
+    expect(c.conversationApprovalRequests()).toContain('data-preq="live"');
+    expect(c.conversationApprovalRequests()).not.toMatch(/data-(?:vreq|areq|connection)="/);
+    c.S.approvalRequests = []; c.S.authorizationRequests = [];
     c.S.permissionRequests = [];
     for (const status of ['requested', 'connecting', 'expired']) {
       c.S.connections = [{ id: 'connection', status }];

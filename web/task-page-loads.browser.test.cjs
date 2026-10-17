@@ -1,5 +1,6 @@
-// What the task page loads, and that nothing loaded is lost: a decision dismissed
-// from the inbox still blocks its agent, so the page loads and shows it; a
+// What the task page loads, and that nothing loaded is lost: a decision ignored
+// still blocks its agent, so the rail counts it, but the conversation leaves it
+// to the rail's Approval requests; a
 // websocket refresh racing the approvals load keeps what that load found; a j/k
 // walk continues from the page actually open; and agent review HTML is fetched
 // once per content, not on every repaint (UI-6).
@@ -48,9 +49,12 @@ const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
     page.on('pageerror', error => { errors.push(error.message); console.error('page:', error.message); });
     const send = (event) => sockets.at(-1).send(JSON.stringify({ projectId: 'p', ts: Date.now(), ...event }));
 
-    // A decision dismissed from the inbox is still pending; its conversation shows it.
+    // An ignored decision is still pending: counted in the rail, not in the conversation.
     await page.goto('http://console.test/org/workspace/tasks/1/checkin');
-    await page.locator('#ck-thread [data-preq="dismissed"]').waitFor();
+    await page.locator('#ck-thread').waitFor();
+    assert.equal((await page.locator('#approval-history-open').innerText()).replace(/\s+/g, ' '), 'Approval requests 1');
+    await wait(400);
+    assert.equal(await page.locator('#ck-thread [data-preq="dismissed"]').count(), 0, 'an ignored decision leaves the conversation');
 
     // A refresh that started before the approvals load finished keeps what it found.
     slowRefresh = true;

@@ -4727,7 +4727,7 @@ const LIST_RELOAD_EVENTS = new Set([
   'subtask.created',
   'task.responsibility-changed',
   'credential.approval-requested', 'connection.requested',
-  'credential.approval-resolved',
+  'credential.approval-resolved', 'connection.resolved', 'connection.updated',
   'credential.approval-dismissed', 'connection.dismissed',
   'permission.approval-requested',
   'permission.approval-resolved',
@@ -4805,7 +4805,7 @@ function patchSubTaskSummaryFromEvent(ev) {
 // An approval request carries no lifecycle fields to patch, and the child's
 // summary only learns its count from the server: refetch the open parent.
 function subTaskSummaryEventNeedsRefresh(ev) {
-  if (!/\.approval-(?:requested|resolved|dismissed)$|^connection\.(?:requested|resolved|dismissed)$/.test(ev.type || '')) return false;
+  if (!/\.approval-(?:requested|resolved|dismissed)$|^connection\.(?:requested|resolved|updated|dismissed)$/.test(ev.type || '')) return false;
   return (S.view?.subTaskSummaries || []).some((summary) => summary.id === ev.taskId);
 }
 
@@ -9000,31 +9000,36 @@ async function refreshTaskHistory(taskId) {
 const TASK_WALK_SETTLE_MS = 150;
 
 // Approval decisions load for the pages that show them: a task with pending
-// decisions (dismissed ones too: the conversation keeps them, because the agent
-// still waits), or the open approval history (UI-6). Vault item names only label
-// credential requests, so they load only when there are some.
+// decisions not ignored (the conversation shows those), or the open approval
+// history (UI-6). Vault item names only label credential requests, so they load
+// only when there are some. `force` reloads loaded ones, with the task's
+// connections, and the newest reload wins.
 function showsTaskApprovals(view) {
-  return !!(view?.approvalRequests || view?.pendingDecisions || S.approvalHistoryOpen);
+  return !!(view?.approvalRequests || S.approvalHistoryOpen);
 }
-function ensureTaskApprovals(taskId) {
-  if (S.taskApprovalsFor === taskId) return Promise.resolve();
+function ensureTaskApprovals(taskId, { force = false } = {}) {
+  if (!force && S.taskApprovalsFor === taskId) return Promise.resolve();
   const epoch = S.taskOpenEpoch;
   const inFlight = ensureTaskApprovals.pending;
-  if (inFlight?.taskId === taskId && inFlight.epoch === epoch) return inFlight.promise;
+  if (!force && inFlight?.taskId === taskId && inFlight.epoch === epoch) return inFlight.promise;
   const rec = taskRecord(taskId);
   const draft = !!rec?.params?.draft;
   const organizationId = projectById(rec?.projectId || S.projectId)?.organizationId || S.organizationId;
   const query = `taskId=${encodeURIComponent(taskId)}&organizationId=${encodeURIComponent(organizationId || '')}`;
+  // What the server counted when this read began; refreshTask reloads on any other count.
+  const count = S.view?.pendingDecisions || 0;
   const promise = (async () => {
-    const [approvalRequests, permissionRequests, authorizationRequests] = await Promise.all([
+    const [approvalRequests, permissionRequests, authorizationRequests, connections] = await Promise.all([
       draft ? [] : api(`/api/vault/requests?${query}`).catch(() => []),
       draft ? [] : api(`/api/permission-requests?${query}`).catch(() => []),
       api(`/api/authorization-requests?${query}`).catch(() => []),
+      force ? api(`/api/connections?${query}`).catch(() => undefined) : undefined,
     ]);
     const approvalItems = approvalRequests.length
       ? await api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`).catch(() => []) : [];
-    if (S.selected !== taskId || S.taskOpenEpoch !== epoch) return;
-    Object.assign(S, { approvalRequests, permissionRequests, authorizationRequests, approvalItems, taskApprovalsFor: taskId });
+    if (S.selected !== taskId || S.taskOpenEpoch !== epoch || ensureTaskApprovals.pending?.promise !== promise) return;
+    Object.assign(S, { approvalRequests, permissionRequests, authorizationRequests, approvalItems,
+      ...(connections ? { connections } : {}), taskApprovalsFor: taskId, taskApprovalsCount: count });
     scheduleTaskPageRender();
   })().finally(() => { if (ensureTaskApprovals.pending?.promise === promise) ensureTaskApprovals.pending = null; });
   ensureTaskApprovals.pending = { taskId, epoch, promise };
@@ -9197,22 +9202,18 @@ async function refreshTask(reason = 'all') {
     const rec = taskRecord(id);
     const organizationId = projectById(rec?.projectId || S.projectId)?.organizationId || S.organizationId;
     const approvalQuery = `taskId=${encodeURIComponent(id)}&organizationId=${encodeURIComponent(organizationId || '')}`;
-    const approvals = S.taskApprovalsFor === id;
     // Only what this refresh fetched is written back; the rest (undefined) keeps
     // whatever landed meanwhile, e.g. the approvals ensureTaskApprovals loaded.
     const load = (wanted, url) => wanted ? api(url).catch(() => undefined) : undefined;
-    const [view, widgets, sessions, attempts, approvalRequests, permissionRequests, authorizationRequests, approvalItems, connections] = await Promise.all([
+    const [view, widgets, sessions, attempts, connections] = await Promise.all([
       api(`/api/tasks/${id}`),
       // Widgets are resolved against the view (the rail's stage and changed
       // files), so every lifecycle publication re-resolves them.
       load(has(/view\.updated|review|stage|turn\.result/), `/api/tasks/${id}/widgets`),
       load(has(/session|turn.result|stage/), `/api/tasks/${id}/sessions?metadata=1`),
       load(has(/attempt|turn.result|merge.result/), `/api/tasks/${id}/attempts`),
-      load(approvals && has(/credential\.approval/), `/api/vault/requests?${approvalQuery}`),
-      load(approvals && has(/permission\.approval/), `/api/permission-requests?${approvalQuery}`),
-      load(approvals && has(/authorization\.approval/), `/api/authorization-requests?${approvalQuery}`),
-      load(approvals && has(/credential\.approval/), `/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`),
-      load(has(/^connection\./), `/api/connections?${approvalQuery}`),
+      // With loaded decisions, a connection event reloads them all, connections included.
+      load(has(/^connection\./) && S.taskApprovalsFor !== id, `/api/connections?${approvalQuery}`),
     ]);
     // The user may have opened another task while this websocket-driven refresh
     // was in flight. Never pair task A's response with task B's selected page.
@@ -9224,11 +9225,16 @@ async function refreshTask(reason = 'all') {
     }
     const becameDraft = !!view?.state?.draft && !S.view?.state?.draft;
     S.view = pendingCancellationView(view, id);
-    Object.assign(S, Object.fromEntries(Object.entries({ widgets, sessions, attemptGroup: attempts, approvalRequests,
-      permissionRequests, authorizationRequests, approvalItems, connections }).filter(([, value]) => value !== undefined)));
+    Object.assign(S, Object.fromEntries(Object.entries({ widgets, sessions, attemptGroup: attempts, connections })
+      .filter(([, value]) => value !== undefined)));
     // Moved back to a draft (stage picker) while open: its page becomes its form.
     if (becameDraft) showDraftPage(id);
-    if (!approvals && showsTaskApprovals(S.view)) ensureTaskApprovals(id);
+    // Loaded decisions are stale on any decision event, and whenever the view's
+    // pending count is not the one they were read at: a request whose event
+    // never reached this page (another tab, a missed publish) still shows.
+    const approvalsStale = S.taskApprovalsFor === id
+      && (has(/\.approval-|^connection\./) || (S.view.pendingDecisions || 0) !== S.taskApprovalsCount);
+    if (approvalsStale || showsTaskApprovals(S.view)) ensureTaskApprovals(id, { force: approvalsStale });
     // paramDefaults are NOT refetched here: they key off (project, workflow), which
     // can't change under a live task, so the value from openTask still holds. This
     // refresh runs on every `view.updated` WS push — re-resolving defaults would
@@ -9957,11 +9963,12 @@ function paintApprovalHistory(v) {
 }
 
 // Keep decisions in the conversation only while they still need attention.
-// Dismissal silences a notification; it does not resolve the underlying request.
+// An ignored one leaves it: still undecided (the agent waits on it), it is
+// decided from the rail's Approval requests.
 function conversationApprovalRequests() {
-  const pending = (requests) => (requests || []).filter((request) => request.status === 'pending');
-  const connections = (S.connections || []).filter((connection) =>
-    ['requested', 'connecting', 'expired'].includes(connection.status) || connection.disconnectPending);
+  const pending = (requests) => (requests || []).filter((request) => request.status === 'pending' && !request.dismissed);
+  const connections = (S.connections || []).filter((connection) => !connection.dismissed
+    && (['requested', 'connecting', 'expired'].includes(connection.status) || connection.disconnectPending));
   const rows = connectionRows(connections, true)
     + permissionRequestRows(pending(S.permissionRequests))
     + authorizationRequestRows(pending(S.authorizationRequests))
