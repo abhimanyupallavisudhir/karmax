@@ -321,6 +321,19 @@ describe('the pull model: requests + human resolutions (§7)', () => {
     expect((await items.access([], 't2', item, 'use')).status).toBe('needs_approval');
   });
 
+  it('dismissing silences a request without deciding it', async () => {
+    const { items, store } = makeService();
+    const r = (await items.request({ taskId: 't1', caps: [], domain: 'github.com', mode: 'use', why: 'log in' }));
+    const dismissed = (await items.dismiss(r.requestId!, 'user:alice'));
+    expect(dismissed).toMatchObject({ status: 'pending', dismissed: { by: 'user:alice' } });
+    expect((await items.requests({ status: 'pending' }))).toEqual([expect.objectContaining({ dismissed: expect.any(Object) })]);
+    expect(store.audit.at(-1)).toMatchObject({ principalId: 'user:alice', action: 'vault.request.dismissed' });
+    // A repeated ask stays the same, still silent, request.
+    expect((await items.request({ taskId: 't1', caps: [], domain: 'github.com', mode: 'use', why: 'again' })).requestId).toBe(r.requestId);
+    expect((await items.resolve(r.requestId!, { action: 'deny', by: 'user:alice' })).status).toBe('denied');
+    await expect(items.dismiss(r.requestId!, 'user:alice')).rejects.toThrow('already denied');
+  });
+
   it('"once" grants exactly one consumed use', async () => {
     const { items } = makeService();
     const item = (await items.save({ type: 'login', label: 'gh', domains: ['gh.com'], policy: { use: 'ask' }, secrets: { password: 'p' } }));

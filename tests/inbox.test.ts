@@ -69,6 +69,28 @@ describe.each(storeBackends)('inbox ($name)', ({ name, open }) => {
     expect((await f.inbox())).toEqual([]);
   });
 
+  it('silences dismissed credential and connection asks', async () => {
+    const f = (await fixture(open));
+    try {
+      (await f.store.appendEvent({ taskId: f.task.id, type: 'credential.approval-requested', ts: Date.now(),
+        payload: { requestId: 'credential' } }));
+      expect((await f.inbox('owner'))).toHaveLength(1);
+      (await f.store.appendEvent({ taskId: f.task.id, type: 'credential.approval-dismissed', ts: Date.now(),
+        payload: { requestId: 'credential' } }));
+      expect((await f.inbox('owner'))).toEqual([]);
+      (await f.store.appendEvent({ taskId: f.task.id, type: 'connection.requested', ts: Date.now(),
+        payload: { requestId: 'connection' } }));
+      expect((await f.inbox('owner'))).toHaveLength(1);
+      (await f.store.appendEvent({ taskId: f.task.id, type: 'connection.dismissed', ts: Date.now(),
+        payload: { requestId: 'connection' } }));
+      expect((await f.inbox('owner'))).toEqual([]);
+      // Both still hold the task, but a lifecycle tick must not re-raise them.
+      (await f.view({ status: 'waiting', waitingFor: { kind: 'human' } }));
+      (await f.store.pruneStaleInbox());
+      expect((await f.inbox('owner'))).toEqual([]);
+    } finally { (await f.store.close()); }
+  });
+
   it('keeps a connection ask visible while another approval is dismissed', async () => {
     const f = (await fixture(open));
     try {
