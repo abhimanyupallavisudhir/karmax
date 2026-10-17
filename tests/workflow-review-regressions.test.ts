@@ -845,6 +845,43 @@ describe('resource publication by sub-tasks', () => {
     expect(views.at(-1).error).toBeUndefined();
   });
 
+  // pramana#79 (2026-10-17): publishing woke the parked Hetzner world, the
+  // project's IP limit was full, and the publication escalated at once to the
+  // parent, showing Hetzner's raw JSON.
+  const ipLimitFull = () => new ActivityFailure('Activity task failed', 'settleResourceReview', '9', RetryState.MAXIMUM_ATTEMPTS_REACHED, 'w',
+    ApplicationFailure.create({ type: 'world-infra', nonRetryable: false,
+      message: "Hetzner refused a new server: this Hetzner project's limit on public IP addresses is full, with 5 servers using them.",
+      cause: ApplicationFailure.create({ type: 'HetznerError', message: 'Hetzner POST /servers failed (403): {"error":{"code":"resource_limit_exceeded"}}' }) }));
+
+  it('waits for a machine instead of escalating when the provider cannot start the world', async () => {
+    const views = reviewAndConfirm();
+    wf.activities.settleResourceReview = vi.fn()
+      .mockRejectedValueOnce(ipLimitFull()).mockRejectedValueOnce(ipLimitFull()).mockResolvedValue(undefined);
+    wf.wait = () => { if (wf.handlers.get('view')!().stage === 'escalated') wf.handlers.get('cancel')!(); };
+    const result = await softwareDevV1_27(child);
+    expect(views.some((view) => view.stage === 'escalated')).toBe(false);
+    const waiting = views.find((view) => view.waitingFor?.kind === 'retry');
+    expect(waiting).toMatchObject({ status: 'waiting' });
+    expect(waiting.waitingFor.detail).toBe("Hetzner refused a new server: this Hetzner project's limit on public IP addresses is full, with 5 servers using them.");
+    expect(wf.activities.settleResourceReview).toHaveBeenCalledTimes(3);
+    expect(result.stage).toBe('done');
+  });
+
+  it('escalates in the provider\'s own words once the wait is long over', async () => {
+    reviewAndConfirm();
+    wf.activities.settleResourceReview = vi.fn(async () => { throw ipLimitFull(); });
+    let escalated: any;
+    wf.wait = () => {
+      const view = wf.handlers.get('view')!();
+      if (view.stage === 'escalated' && !escalated) { escalated = view; wf.handlers.get('cancel')!(); }
+    };
+    await softwareDevV1_27(child);
+    expect(escalated.error).toBe("Could not publish resources: Hetzner refused a new server: this Hetzner project's limit on public IP addresses is full, "
+      + 'with 5 servers using them. Nothing was lost; Retry publishes again.');
+    // Three hours of waits, the last ones ten minutes apart.
+    expect(wf.activities.settleResourceReview.mock.calls.length).toBeGreaterThan(15);
+  });
+
   // pramana#3 (2026-10-09): 7,854 pages both sides had added differently; the
   // escalation's only way forward was removing the task's copy.
   it('offers to keep this task\'s version of conflicting files, and publishes with it', async () => {

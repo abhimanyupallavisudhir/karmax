@@ -1,3 +1,4 @@
+import { ProviderCapacityFull } from '../src/agent/limits.js';
 import { describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -517,6 +518,19 @@ describe('project resources', () => {
       expect(await resources.stageCandidates(task.id, { final: true })).toEqual({ staged: [raw.candidate.id], failed: [] });
       expect((await store.getResourceCandidate(raw.candidate.id))?.error ?? undefined).toBeUndefined();
       expect(await resources.unsavedCandidates(task.id)).toEqual([]);
+    } finally { vi.restoreAllMocks(); await cleanup(); }
+  });
+
+  // pramana#79: a provider that cannot start the world (its account limit full)
+  // is not a failed save: even the last attempt leaves it to the workflow's wait.
+  it('leaves output whose world the provider cannot start yet to a wait, even on the last attempt', async () => {
+    const { store, task, resources, cleanup } = await candidateFixture('stage-provider-full');
+    try {
+      const raw = await resources.proposePath(task.id, { path: 'raw', name: 'Raw', target: { kind: 'path', path: 'raw' } });
+      vi.spyOn(resources['worlds'], 'open').mockRejectedValue(
+        new ProviderCapacityFull("Hetzner refused a new server: this Hetzner project's limit on public IP addresses is full"));
+      await expect(resources.stageCandidates(task.id, { final: true })).rejects.toBeInstanceOf(ProviderCapacityFull);
+      expect((await store.getResourceCandidate(raw.candidate.id))?.state).toBe('pending');
     } finally { vi.restoreAllMocks(); await cleanup(); }
   });
 

@@ -440,3 +440,25 @@ describe('separate waiting-world maintenance', () => {
     expect((await f.store.worldState(f.task.id))).toBe('parked');
   });
 });
+
+// pramana#79 (2026-10-17): publishing woke a parked Hetzner world, Hetzner's IP
+// limit was full, and the publication escalated at once with Hetzner's raw JSON.
+describe('resource work on a world the provider cannot start', () => {
+  it('is infrastructure to wait out, in its own words', async () => {
+    const store = await Store.create(':memory:');
+    const full = () => Object.assign(new ProviderCapacityFull("Hetzner refused a new server: this Hetzner project's limit on public IP addresses is full"),
+      { cause: new Error('Hetzner POST /servers failed (403): {"error":{"code":"resource_limit_exceeded"}}') });
+    const resources = { settleReview: async () => { throw full(); }, takeDeliveries: async () => { throw full(); },
+      integratePublished: async () => { throw full(); }, stageCandidates: async () => { throw full(); } };
+    const core = makeCoreActivities({ store, worlds: new WorldRegistry(), adapters: new Map(),
+      profiles: new ProfileResolver(store, 'mock'), resources: resources as any });
+    for (const run of [() => core.settleResourceReview('task'), () => core.refreshResourceForks('task'),
+      () => core.integratePublishedResources('task'), () => core.stageResourceCandidates('task')]) {
+      const failed = await run().then(() => undefined, (error: unknown) => error);
+      expect(failed).toBeInstanceOf(ApplicationFailure);
+      expect(failed).toMatchObject({ type: 'world-infra', nonRetryable: false });
+      expect((failed as Error).message).toContain('limit on public IP addresses is full');
+    }
+    await store.close();
+  });
+});

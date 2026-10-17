@@ -39,7 +39,7 @@ import {
   participantLabel, participantRole, reviewerKey, selectorAgent,
 } from '../domain/participants.js';
 import { resetAtFromHint } from '../agent/limits.js';
-import { isInfraFailure, limitFailureClassification, INFRA_BACKOFF_MS } from './failures.js';
+import { isInfraFailure, limitFailureClassification, INFRA_BACKOFF_MS, WORLD_WAIT_MS, WORLD_WAIT_LIMIT_MS } from './failures.js';
 import {
   TaskInput,
   TaskView,
@@ -336,6 +336,9 @@ const QUIET_NOTICE = 'prn-';
 const FINISH_TOGETHER = 'several-branches-finish-together-v1';
 /** Open PR's checks wake a parked world, and wait out one that cannot wake (pramana#56). */
 const OPEN_PR_WAITS_FOR_WORLD = 'software-dev-open-pr-waits-for-world-v1';
+/** Saving and publishing resources, and preparing a sub-task, wait for a
+ * machine the provider cannot start yet instead of escalating (pramana#79). */
+const RESOURCES_WAIT_FOR_WORLD = 'resources-wait-for-world-v1';
 const quietNotice = (m: Message): boolean => m.id.startsWith(QUIET_NOTICE);
 const clip = (text: string, max: number) => text.length > max ? `${text.slice(0, max)}…` : text;
 /** A turn can return while the agent's own in-harness sub-agents (Claude Agent SDK
@@ -1507,7 +1510,7 @@ async function softwareDevImpl(
     await publish();
     const scope = new CancellationScope({ cancellable: true });
     activeStaging = scope; // from here a cancel reaches the activity; before, it is seen below
-    try { if (!cancelled) await scope.run(() => resourceStaging.stageResourceCandidates(taskId)); }
+    try { if (!cancelled) await scope.run(() => waitingForWorld(() => resourceStaging.stageResourceCandidates(taskId))); }
     catch (err) { if (isCancellation(err) && !cancelled) throw err; }
     finally { activeStaging = undefined; stagingResources = false; status = priorStatus; }
     return true;
@@ -1562,9 +1565,9 @@ async function softwareDevImpl(
       let failure: string;
       let guide: string | undefined;
       try {
-        await runLandingActivity(() => keepOwnRequested
+        await waitingForWorld(() => runLandingActivity(() => keepOwnRequested
           ? resourceActivities.settleResourceReview(taskId, { keepOwn: true })
-          : resourceActivities.settleResourceReview(taskId));
+          : resourceActivities.settleResourceReview(taskId)));
         resourcesApplied = true;
         return 'applied';
       } catch (err) {
@@ -2639,6 +2642,34 @@ async function softwareDevImpl(
       await publish();
     }
     return withResolve('pr', () => core.checkProposal(world as any));
+  }
+
+  /** Run work that needs the task's world, waiting while its provider cannot
+   * start it (an outage, a full account limit: pramana#79's Hetzner IP limit
+   * escalated a publication at once). The wait shows why, and ends early on
+   * Retry; after {@link WORLD_WAIT_LIMIT_MS} the failure goes to the caller,
+   * which asks a person as before. */
+  async function waitingForWorld<T>(work: () => Promise<T>): Promise<T> {
+    if (!patched(RESOURCES_WAIT_FOR_WORLD)) return work();
+    let waited = 0;
+    for (let round = 0; ; round++) {
+      try { return await work(); }
+      catch (err) {
+        if (cancelled || halted() || isCancellation(err) || !isInfraFailure(err) || waited >= WORLD_WAIT_LIMIT_MS) throw err;
+        const wait = WORLD_WAIT_MS[Math.min(round, WORLD_WAIT_MS.length - 1)]!;
+        waited += wait;
+        const resume = { status, waitingFor };
+        status = 'waiting';
+        waitingFor = { kind: 'retry', detail: innermostMessage(err), until: Date.now() + wait };
+        retryRequested = false;
+        await publish();
+        await condition(() => cancelled || retryRequested || halted(), wait);
+        ({ status, waitingFor } = resume);
+        retryRequested = false;
+        if (cancelled || halted()) throw new Cancelled();
+        await publish();
+      }
+    }
   }
 
   /** May `session` (minted under `sessionHome`) be resumed under `home` now? Only
@@ -3942,7 +3973,7 @@ Inspect the complete current diff and specifically compare its delta from the re
       if (patched('subtask-prepare-failure-to-agent-v1')) {
         preparingSubTask = true;
         await publish();
-        try { childInput = await childPreparation.prepareChildTask(prepare); }
+        try { childInput = await waitingForWorld(() => childPreparation.prepareChildTask(prepare)); }
         catch (err) {
           if (isCancellation(err)) throw err;
           preparingSubTask = false;
@@ -6270,7 +6301,13 @@ function conflictGuide(err: any): string | undefined {
 function innermostMessage(err: any): string {
   let e: any = err;
   let message = '';
-  for (let depth = 0; e && depth < 6; depth++) { if (e.message) message = e.message; e = e.cause; }
+  for (let depth = 0; e && depth < 6; depth++) {
+    if (e.message) message = e.message;
+    // A world the provider cannot start says so in people's words; what is
+    // under it is the provider's raw answer (pramana#79: Hetzner's JSON).
+    if (e.type === 'world-infra') break;
+    e = e.cause;
+  }
   return message || String(err);
 }
 
