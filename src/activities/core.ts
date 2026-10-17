@@ -26,7 +26,7 @@ import { recordHumanConfirmation } from '../platform/review-confirmation.js';
 import { WorkflowNotFoundError, type Client } from '@temporalio/client';
 import { Context as activityContext } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
-import { AgentChannelLost, ProviderPolicyFailure, SandboxProviderFailure, confirmSandboxFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, isContextOverflow, type LimitClassification } from '../agent/limits.js';
+import { AgentChannelLost, ProviderOutage, ProviderPolicyFailure, SandboxProviderFailure, confirmSandboxFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, isContextOverflow, type LimitClassification } from '../agent/limits.js';
 import { probeClaudeUsage, probeCodexUsage, type UsageResult } from '../agent/usage.js';
 import { markCheckpointStale } from '../world/checkpoint-staleness.js';
 import { usageAdmissionId as admissionIdFor } from '../domain/turn-admission.js';
@@ -172,6 +172,15 @@ const DEFAULT_GRANT = [
   'github:actions:read',
 ];
 
+
+/** A provider that cannot start or reach a world right now (an outage, a
+ * full account limit) is infrastructure wherever resource work meets it:
+ * the workflow waits for a machine instead of asking a person at once
+ * (pramana#79: a full Hetzner IP limit escalated a publication). */
+function providerUnavailable(error: unknown): unknown {
+  if (!(error instanceof ProviderOutage)) return error;
+  return ApplicationFailure.create({ message: error.message, type: 'world-infra', nonRetryable: false, cause: error });
+}
 
 /**
  * Tag a thrown turn error for Temporal's retry policy (the `turns` proxy in the
@@ -4507,7 +4516,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (error instanceof ResourceConflictError)
           throw ApplicationFailure.create({ message: error.message, type: 'resource-conflict', nonRetryable: true,
             ...(error.guide ? { details: [{ guide: error.guide }] } : {}) });
-        throw error;
+        throw providerUnavailable(error);
       } finally { clearInterval(pulse); }
     },
 
@@ -4523,7 +4532,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       try {
         return (await deps.resources?.takeDeliveries(taskId, {
           checkContinue: async () => { context?.cancellationSignal.throwIfAborted(); } })) ?? [];
-      } finally { clearInterval(pulse); }
+      } catch (error) { throw providerUnavailable(error); } finally { clearInterval(pulse); }
     },
 
     /** Before Review, merge into the world's copies of writable resources
@@ -4538,7 +4547,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       try {
         return (await deps.resources?.integratePublished(taskId, {
           checkContinue: async () => { context?.cancellationSignal.throwIfAborted(); } })) ?? [];
-      } finally { clearInterval(pulse); }
+      } catch (error) { throw providerUnavailable(error); } finally { clearInterval(pulse); }
     },
 
     /** Snapshot staged path candidates while the producing world is still live.
@@ -4568,7 +4577,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           },
         });
         return { staged: result?.staged.length ?? 0, failed: result?.failed.length ?? 0 };
-      } finally { clearInterval(pulse); }
+      } catch (error) { throw providerUnavailable(error); } finally { clearInterval(pulse); }
     },
 
     async unsavedResourceCandidates(taskId: string): Promise<Array<{ path: string; error?: string }>> {
@@ -6697,7 +6706,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // what to stop (pramana#22), and tries again itself.
         if (error instanceof ResourceKeptChangingError)
           throw ApplicationFailure.create({ message: error.message, type: 'resource-kept-changing', nonRetryable: true });
-        throw error;
+        throw providerUnavailable(error);
       } finally { clearInterval(pulse); }
     },
 

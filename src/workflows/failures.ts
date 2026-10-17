@@ -64,3 +64,13 @@ export function limitFailureClassification(err: unknown): LimitClassification | 
  * then escalate to a human once the schedule is exhausted.
  */
 export const INFRA_BACKOFF_MS = [30_000, 60_000, 120_000, 300_000, 600_000] as const;
+
+/**
+ * How a task waits for a machine its provider cannot start right now (an
+ * outage, a full account limit) when resource work needs its world: a full
+ * limit frees only as other tasks' machines stop, which can take hours, so
+ * the waits grow to ten minutes and go on for three hours before a person is
+ * asked (pramana#79). Retry, a cancel or a stop ends a wait early.
+ */
+export const WORLD_WAIT_MS = [30_000, 60_000, 120_000, 300_000, 600_000] as const;
+export const WORLD_WAIT_LIMIT_MS = 3 * 3_600_000;

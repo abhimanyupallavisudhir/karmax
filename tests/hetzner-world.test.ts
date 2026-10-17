@@ -231,9 +231,34 @@ describe.skipIf(!sshdAvailable)('Hetzner worlds (fake Cloud API, real sshd)', ()
     // Setup waits it out like an outage (world-infra) instead of asking a person at once.
     expect(isTransportError(refused)).toBe(true);
     expect((refused as Error).message).toBe('Hetzner refused a 4-CPU server: this Hetzner project\'s limit on shared CPUs is full, '
-      + 'with 2 in use by 1 other server. tavya keeps retrying for about 20 minutes; to start sooner, give this task fewer CPUs, '
+      + 'with 2 in use by 1 other server. tavya waits until enough are free; to start sooner, give this task fewer CPUs, '
       + 'stop another task, or ask Hetzner to raise the limit (Hetzner Console → Limits).');
     // Nothing of the refused world is left behind.
+    expect([hetzner.servers.size, hetzner.volumes.size]).toEqual([1, 1]);
+  });
+
+  // pramana#79 (2026-10-17): a publication woke a parked world and Hetzner
+  // refused "Primary IP limit exceeded": every server held an IPv4 and an IPv6
+  // address, so the project's limit of ten admitted five servers.
+  it('gives each server one public address, so the project\'s IP limit admits twice as many (pramana#79)', async () => {
+    hetzner.primaryIpLimit = 4;
+    for (const taskId of ['task_ip1', 'task_ip2', 'task_ip3', 'task_ip4'])
+      await provider.create({ taskId, base: 'main', generation: 1, organizationId: 'org_h' });
+    expect(hetzner.servers.size).toBe(4);
+    expect(hetzner.requests.filter((request) => request.method === 'POST' && request.path.endsWith('/servers'))
+      .every((request) => request.body.public_net?.enable_ipv6 === false)).toBe(true);
+  });
+
+  it('says what a full IP limit is, as a wait rather than a failure (pramana#79)', async () => {
+    hetzner.primaryIpLimit = 1;
+    await provider.create({ taskId: 'task_ip', base: 'main', generation: 1, organizationId: 'org_h' });
+    const refused = await provider.create({ taskId: 'task_ip_more', base: 'main', generation: 1, organizationId: 'org_h' })
+      .then(() => undefined, (error: unknown) => error);
+    expect(refused).toBeInstanceOf(ProviderCapacityFull);
+    expect(isTransportError(refused)).toBe(true);
+    expect((refused as Error).message).toBe('Hetzner refused a new server: this Hetzner project\'s limit on public IP addresses is full, '
+      + 'with 1 server using them. tavya waits until one is free; to start sooner, stop another task, '
+      + 'or ask Hetzner to raise the limit (Hetzner Console → Limits).');
     expect([hetzner.servers.size, hetzner.volumes.size]).toEqual([1, 1]);
   });
 
@@ -338,7 +363,7 @@ describe.skipIf(!sshdAvailable)('Hetzner worlds (fake Cloud API, real sshd)', ()
     expect(refused).toBeInstanceOf(ProviderCapacityFull);
     expect(isTransportError(refused)).toBe(true);
     expect((refused as Error).message).toBe('Hetzner refused a 70 GB disk: this Hetzner project\'s limit on the total size of its volumes '
-      + 'is full, with 100 GB in 1 volume. tavya keeps retrying for about 20 minutes; to start sooner, give this task a smaller disk, '
+      + 'is full, with 100 GB in 1 volume. tavya waits until there is room; to start sooner, give this task a smaller disk, '
       + 'delete another task, or ask Hetzner to raise the limit (Hetzner Console → Limits).');
     expect(hetzner.volumes.size).toBe(1);
   });

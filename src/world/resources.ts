@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { ProviderOutage } from '../agent/limits.js';
 import { transferResourceChunk } from './resource-transfer.js';
 import { forEachConcurrent } from '../util/async-batch.js';
 import { timed } from '../timing/index.js';
@@ -1199,7 +1200,9 @@ export class ProjectResourceService {
         const reason = error instanceof Error ? error.message : String(error);
         const staged = Boolean((await this.store.getResourceAttachment(candidate.attachmentId))?.currentRevisionId);
         if (!staged && !(error instanceof UnstageableCandidate)) await this.store.recordResourceCandidateError(candidate.id, reason);
-        if (!options.final && !(error instanceof UnstageableCandidate)) { transient.push(error); continue; }
+        // A provider that cannot start the world yet (an outage, a full
+        // account limit) is waited out by the workflow, last attempt or not.
+        if ((!options.final || error instanceof ProviderOutage) && !(error instanceof UnstageableCandidate)) { transient.push(error); continue; }
         // A refresh that still fails keeps the snapshot already taken.
         if (staged) continue;
         if (error instanceof UnstageableCandidate) {
