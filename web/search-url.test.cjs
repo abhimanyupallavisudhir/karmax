@@ -82,6 +82,9 @@ eval(extractFn('normalizeQuery'));
 eval(extractConst('ACTIVE_VIEW_QUERY'));
 eval(extractConst('ACTIVE_VIEW'));
 eval(extractConst('FOR_ME_VIEW'));
+eval(extractConst('STORE_VIEW'));
+eval(extractConst('STORE_VIEW_QUERY'));
+eval(extractFn('isStoreQuery'));
 eval(extractFn('viewIdForQuery'));
 global.location = { pathname: '/', search: '' };
 
@@ -132,6 +135,8 @@ eq(viewIdForQuery('-is:archived'), '__active__', '-is:archived is the “Active�
 eq(viewIdForQuery(' -is:archived  '), '__active__', 'whitespace does not matter');
 eq(viewIdForQuery(''), null, 'the empty query (archived included) is not a view');
 eq(viewIdForQuery('for:me -is:archived'), '__for_me__', 'for:me -is:archived is the “For me” view');
+eq(viewIdForQuery('is:store'), '__store__', 'is:store is the Task store view');
+eq(viewIdForQuery('is:store wiki'), '__store__', 'words filter the Task store view');
 eq(viewIdForQuery('for:me'), null, 'for:me alone includes archived tasks, so it is not “For me”');
 eq(viewIdForQuery('is:archived'), 'builtin:archived', 'a built-in view is recognised from its query');
 eq(viewIdForQuery('-is:archived group:tag-type'), null, 'grouping is the Group menu’s job, not a view');

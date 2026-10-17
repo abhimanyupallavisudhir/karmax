@@ -46,7 +46,7 @@ import { participantAuthorization } from '../platform/agent-authority.js';
 import { platformRequestPathError } from '../platform/platform-request.js';
 import { ContributionRegistry } from '../contrib/registry.js';
 import { Overlays } from '../store/overlays.js';
-import { activationTaskPrompt, manifest } from '../contrib/manifests.js';
+import { manifest } from '../contrib/manifests.js';
 import { machineShape } from '../domain/computer.js';
 import { projectSettingsFor, globalSettingsFor, settingsToProjectConfig, resolveParams, effectiveRepos } from '../platform/params.js';
 import { defaultProvider } from '../agent/adapters.js';
@@ -199,8 +199,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/organizations\/[^/]+\/conversation-sharing$/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/projects\/[^/]+\/conversation-sharing$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/tasks\/[^/]+\/conversation-share$/.test(p)) return 'task:conversation:share';
-  // Automations an organization saves (src/domain/automations.ts) are shared knowledge, like its wiki.
-  if (/^\/api\/organizations\/[^/]+\/automations(?:\/[^/]+)?$/.test(p)) return 'organization:wiki:write';
+  // Tasks an organization saves to its task store (src/domain/task-store.ts) are shared knowledge, like its wiki.
+  if (/^\/api\/organizations\/[^/]+\/(?:task-store|automations)(?:\/[^/]+)?$/.test(p)) return 'organization:wiki:write';
   if (p === MCP_CLIENT_METADATA_PATH && read) return 'none';
   if (p === '/api/meta' || p === '/api/session' || p.startsWith('/api/health/')) return 'none';
   const appGrantRoute = appGrantRouteCapability(p);
@@ -377,7 +377,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p === '/api/events' && !read) return 'task:create';
   if (/^\/api\/project-events\/[^/]+$/.test(p)) return 'task:event:read';
   if (/^\/api\/tasks\/[^/]+\/follows(?:\/[^/]+)?$/.test(p)) return read ? 'task:event:read' : 'task:conversation:message';
-  if (/^\/api\/projects\/[^/]+\/automations(?:\/[^/]+)?$/.test(p)) return read ? 'task:read' : 'task:create';
+  if (/^\/api\/projects\/[^/]+\/(?:task-store|automations)(?:\/[^/]+)?$/.test(p)) return read ? 'task:read' : 'task:create';
   if (/^\/api\/projects\/[^/]+\/webhooks$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/webhooks\/[^/]+(?:\/rotate)?$/.test(p)) return 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/search$/.test(p)) return 'task:read';
@@ -3408,7 +3408,6 @@ export class Gateway {
           if (callerIdentity.humanSubject) (await store.setProjectMembership(project.id,
             { kind: 'user', userId: callerIdentity.humanSubject.userId }, 'owner'));
           await this.ensureProjectWiki(project, callerIdentity.humanSubject?.userId);
-          await this.spawnProjectPrepTask(token, project.id);
           return this.json(res, 200, project);
         }
       }
@@ -4085,7 +4084,6 @@ export class Gateway {
           (await store.setProjectMembership(project.id,
             { kind: 'user', userId: callerIdentity.humanSubject.userId }, 'owner'));
         await this.ensureProjectWiki(project, callerIdentity.humanSubject?.userId);
-        await this.spawnProjectPrepTask(token, project.id);
         return this.json(res, 200, project);
       }
       const projectTransfer = p.match(/^\/api\/projects\/([^/]+)\/transfer$/);
@@ -5156,19 +5154,23 @@ export class Gateway {
         const result = await api.emitProjectEvent(token, undefined, { type: b.type, key: b.key, subject: b.subject, occurredAt: b.occurredAt, payload: b.payload });
         return this.json(res, result.duplicate ? 200 : 201, result);
       }
-      const automationsMatch = p.match(/^\/api\/projects\/([^/]+)\/automations(?:\/([^/]+))?$/);
-      if (automationsMatch) {
-        if (!automationsMatch[2] && method === 'GET') return this.json(res, 200, { automations: await api.listAutomations(token, automationsMatch[1]!) });
-        if (automationsMatch[2] && method === 'POST') return this.json(res, 201, await api.installAutomation(token, automationsMatch[1]!, automationsMatch[2]));
-      }
-      const savedAutomationsMatch = p.match(/^\/api\/organizations\/([^/]+)\/automations(?:\/([^/]+))?$/);
-      if (savedAutomationsMatch) {
-        if (!savedAutomationsMatch[2] && method === 'POST') {
-          const b = await this.body(req);
-          return this.json(res, 201, await api.saveAutomation(token, savedAutomationsMatch[1]!, { taskId: b.taskId, name: b.name, summary: b.summary }));
+      // The task store (src/domain/task-store.ts); `automations` is its former name.
+      const storeMatch = p.match(/^\/api\/projects\/([^/]+)\/(?:task-store|automations)(?:\/([^/]+))?$/);
+      if (storeMatch) {
+        if (!storeMatch[2] && method === 'GET') {
+          const tasks = await api.listTaskStore(token, storeMatch[1]!);
+          return this.json(res, 200, p.endsWith('/automations') ? { automations: tasks } : { tasks });
         }
-        if (savedAutomationsMatch[2] && method === 'DELETE') {
-          await api.deleteAutomation(token, savedAutomationsMatch[1]!, savedAutomationsMatch[2]);
+        if (storeMatch[2] && method === 'POST') return this.json(res, 201, await api.runStoreTask(token, storeMatch[1]!, storeMatch[2]));
+      }
+      const savedStoreMatch = p.match(/^\/api\/organizations\/([^/]+)\/(?:task-store|automations)(?:\/([^/]+))?$/);
+      if (savedStoreMatch) {
+        if (!savedStoreMatch[2] && method === 'POST') {
+          const b = await this.body(req);
+          return this.json(res, 201, await api.saveStoreTask(token, savedStoreMatch[1]!, { taskId: b.taskId, name: b.name, summary: b.summary }));
+        }
+        if (savedStoreMatch[2] && method === 'DELETE') {
+          await api.deleteStoreTask(token, savedStoreMatch[1]!, savedStoreMatch[2]);
           return this.json(res, 200, { ok: true });
         }
       }
@@ -5357,12 +5359,7 @@ export class Gateway {
         return void res.end(html);
       }
       if (viewMatch && method === 'DELETE') {
-        // Hard-delete is for drafts only (they never started a workflow). Running
-        // tasks must be cancelled, not deleted out from under their workflow.
-        const t = (await store.getTask(viewMatch[1]!));
-        if (!t) return this.json(res, 404, { error: 'no such task' });
-        if (!t.params?.draft) return this.json(res, 400, { error: 'only drafts can be deleted; cancel a running task instead' });
-        (await store.deleteTask(viewMatch[1]!));
+        (await api.deleteTask(token, viewMatch[1]!));
         return this.json(res, 200, { ok: true });
       }
       const principalMatch = p.match(/^\/api\/tasks\/([^/]+)\/principal$/);
@@ -8672,33 +8669,6 @@ export class Gateway {
       if (declared) return this.json(res, declared, { error: (e as Error).message,
         ...(code ? { code: String(code) } : {}), ...(e instanceof AuthorizationGrantError ? e.gap : {}) });
       throw e;
-    }
-  }
-
-  /**
-   * Seed a brand-new project with its preparation task (SPEC §4.6). A new project's
-   * tasks default to the `software-dev` workflow, so we seed that workflow's
-   * `onActivate` prep task — "make this project karmax-ready" — as the first task on
-   * the list. The manifest supplies hosted-specific copy because isolated cloud
-   * worlds do not need the local-worktree resource-collision scan. It's created as
-   * a **draft** so project creation never immediately spends an agent turn. The
-   * user may queue it before attaching a repository; software-dev treats that as
-   * its supported state-only, zero-repo case.
-   * Best-effort: a failure here must never fail project creation.
-   */
-  private async spawnProjectPrepTask(token: string, projectId: string): Promise<void> {
-    const prep = manifest('software-dev')?.onActivate?.spawnTask;
-    if (!prep) return;
-    try {
-      await this.deps.api.createTask(token, {
-        projectId,
-        title: prep.title,
-        prompt: activationTaskPrompt(prep, this.deps.hosted === true),
-        workflow: prep.workflow,
-        draft: true,
-      });
-    } catch (error) {
-      console.warn(`[karmax] could not spawn prep task for ${projectId}:`, error instanceof Error ? error.message : error);
     }
   }
 

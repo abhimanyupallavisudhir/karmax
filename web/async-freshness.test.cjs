@@ -57,6 +57,7 @@ global.projectById = () => ({ organizationId: 'org' });
 global.taskRecord = (id) => S.tasks.find((task) => task.id === id);
 global.taskRefreshPromise = null;
 global.taskRefreshQueued = false;
+global.taskStoreForQuery = () => null;
 
 eval(extractFn('pendingCancellationView'));
 eval(extractFn('pendingCancellationTask'));

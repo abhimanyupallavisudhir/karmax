@@ -184,9 +184,12 @@ const report = process.env.REQUEST_BUDGET_REPORT === '1';
         assert.ok(results[name].requests <= requests, `${name}: ${results[name].requests} requests > ${requests}\n${JSON.stringify(results[name].counts)}`);
         if (depth != null) assert.ok(results[name].depth <= depth, `${name}: ${results[name].depth} round trips > ${depth}`);
       };
-      budget('boot', 24, 5);
-      budget('boot (other organization)', 24, 5);
-      budget('boot (home)', 24, 5);
+      // 25: the default view reads the project's task store, in parallel, for its
+      // recommendations (none once dismissed).
+      budget('boot', 25, 5);
+      budget('boot (other organization)', 25, 5);
+      budget('boot (home)', 25, 5);
+      assert.equal(results.boot.counts['GET /api/projects/p/task-store'], 1, 'the default view reads the task store once');
       assert.equal(results['boot (home)'].counts['GET /api/organizations/o/search'], 1, 'the home searches its organization once');
       budget('organization action (create team)', 6);
       // The route that switches organization and the settings page it paints share one read.

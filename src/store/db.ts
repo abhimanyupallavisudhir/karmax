@@ -89,7 +89,7 @@ import {
   type OrganizationEntitlements,
 } from '../domain/entitlements.js';
 import { newId } from '../util/id.js';
-import type { AutomationTemplate } from '../domain/automations.js';
+import type { StoreTask } from '../domain/task-store.js';
 import { EVENT_RETENTION_MS as PROJECT_EVENT_RETENTION_MS, type EventFollow, type ProjectEvent, type ProjectEventClaim,
   type ProjectEventClaimState } from '../domain/project-events.js';
 import { paymentMerchantMatches } from '../util/payment-merchant.js';
@@ -990,7 +990,7 @@ export class Store {
         id TEXT PRIMARY KEY, taskId TEXT NOT NULL, projectId TEXT NOT NULL, filter TEXT NOT NULL,
         once INTEGER NOT NULL DEFAULT 0, createdAt INTEGER NOT NULL
       );
-      -- Automations an organization saved (src/domain/automations.ts); the
+      -- Tasks an organization saved to its task store (src/domain/task-store.ts); the
       -- built-ins live in code.
       CREATE TABLE IF NOT EXISTS automation_templates (
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, name TEXT NOT NULL, summary TEXT NOT NULL,
@@ -9373,7 +9373,7 @@ export class Store {
     return row?.id ? String(row.id) : undefined;
   }
 
-  async saveAutomationTemplate(template: AutomationTemplate & { organizationId: string; createdAt: number }): Promise<AutomationTemplate> {
+  async saveStoreTask(template: StoreTask & { organizationId: string; createdAt: number }): Promise<StoreTask> {
     await this.db.transaction(async () => {
       await this.db.prepare(`INSERT INTO automation_templates (id, organizationId, name, summary, task, needs, createdBy, createdAt)
         VALUES (?,?,?,?,?,?,?,?)`).run(template.id, template.organizationId, template.name, template.summary, JSON.stringify(template.task),
@@ -9382,14 +9382,14 @@ export class Store {
     return template;
   }
 
-  async listAutomationTemplates(organizationId: string): Promise<AutomationTemplate[]> {
+  async listStoreTasks(organizationId: string): Promise<StoreTask[]> {
     const rows = await this.db.prepare('SELECT * FROM automation_templates WHERE organizationId=? ORDER BY createdAt').all(organizationId);
     return rows.map((row: any) => ({ id: String(row.id), organizationId: String(row.organizationId), name: String(row.name),
       summary: String(row.summary), task: JSON.parse(String(row.task)), ...(row.needs ? { needs: JSON.parse(String(row.needs)) } : {}),
       ...(row.createdBy ? { createdBy: String(row.createdBy) } : {}), createdAt: Number(row.createdAt) }));
   }
 
-  async deleteAutomationTemplate(organizationId: string, id: string): Promise<boolean> {
+  async deleteStoreTask(organizationId: string, id: string): Promise<boolean> {
     return this.db.transaction(async () => Number((await this.db.prepare('DELETE FROM automation_templates WHERE organizationId=? AND id=?')
       .run(organizationId, id)).changes) === 1);
   }
