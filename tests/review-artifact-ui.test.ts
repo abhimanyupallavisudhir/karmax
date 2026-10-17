@@ -40,7 +40,7 @@ describe('review artifact reader', () => {
     };
     let shellKeydown: (event: any) => void;
     const context = vm.createContext({
-      document: { activeElement: null, createElement: () => dialog,
+      document: { activeElement: null, createElement: () => dialog, querySelector: () => null,
         body: { appendChild: vi.fn() },
         addEventListener: (_name: string, handler: (event: any) => void) => { shellKeydown = handler; } },
       URL: { createObjectURL: () => 'blob:test' }, esc: (s: string) => s,

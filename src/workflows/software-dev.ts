@@ -1671,6 +1671,9 @@ async function softwareDevImpl(
     let manualConfirmer = manualPrConfirmer;
     manualPrConfirmer = undefined; // applies only to this proposal and one human layer
     if (clearsConfirmOnGate) confirmed = false;
+    // GitHub changes Review has checked, counted from the moment the task shows
+    // Review (before any await), so none arriving while it gets there is lost.
+    let providerChecked = providerChangeEpoch;
 
     const automaticResources = resourceCandidateReview && patched('automatic-resource-review-v1');
     if (automaticResources && world && patched('resource-integrate-before-review-v1')) {
@@ -1722,10 +1725,14 @@ async function softwareDevImpl(
     async function awaitReview(ready: () => boolean): Promise<string | undefined> {
       const watchesCi = fairLanding && githubAuthoritativeMerge && prs.length > 0 && !!world
         && patched('software-dev-review-ci-repair-v1');
+      // Before this patch a change that came while Review was being set up, or
+      // during a check, was absorbed unchecked until someone approved.
+      const sinceGate = watchesCi && patched('software-dev-review-ci-since-gate-v1');
       for (;;) {
-        const providerSeen = providerChangeEpoch;
+        const providerSeen = sinceGate ? providerChecked : providerChangeEpoch;
         await waitServing(() => ready() || (watchesCi && providerChangeEpoch !== providerSeen));
         if (!watchesCi || ready()) return undefined;
+        providerChecked = providerChangeEpoch;
         const ci = await core.mergeGithubPrs(world!, prs, { mode: 'review-ci' }).catch(() => undefined);
         if (ready()) return undefined;
         if (ci?.status === 'needs-revision')

@@ -50,7 +50,7 @@ it('restores a backup over lost state, and the console carries the restored task
     domains: 'restore.example.test', username: 'restorer', secrets: { password: 'kept-in-the-vault' } });
   await operator.step('open the project', () => operator.page.goto(`${app!.url}/personal/restorable`));
   // The task itself is not what this journey checks: start it as an API caller would.
-  await consoleRequest(operator.context, app.url, 'POST', `/api/projects/${project.id}/tasks`,
+  const created = await consoleRequest(operator.context, app.url, 'POST', `/api/projects/${project.id}/tasks`,
     { title: '@write restored.txt', prompt: '@write restored.txt :: survived the restore', workflow: 'software-dev' });
   const reviewed = async () => (await consoleRequest(operator.context, app!.url, 'GET', `/api/projects/${project.id}/tasks`))
     .find((task: any) => task.title.includes('@write restored.txt'))?.lastView?.stage;
@@ -88,7 +88,13 @@ it('restores a backup over lost state, and the console carries the restored task
   await step('its restored workflow is still waiting in Review', () => confirm.waitFor({ timeout: 30_000 }));
   await confirm.click();
   await step('it lands on main', () => expect.poll(async () => (await git(repo, ['show', 'main:restored.txt'])).stdout,
-    { timeout: 30_000 }).toContain('survived the restore'));
+    { timeout: 30_000 }).toContain('survived the restore').catch(async (error) => {
+    // Landing stalled once in CI (#1993) and rarely locally: say where the task was.
+    const view = await consoleRequest(operator.context, app!.url, 'GET', `/api/tasks/${created.id}`);
+    const events = await consoleRequest(operator.context, app!.url, 'GET', `/api/tasks/${created.id}/events?since=0&limit=300`);
+    const tail = (events.events ?? events).slice(-25).map((event: any) => `${event.type}${event.payload?.error ? `: ${event.payload.error}` : ''}`);
+    throw new Error(`${error.message}\nstage ${view.stage}, status ${view.status}, waiting ${JSON.stringify(view.waitingFor)}, landing ${JSON.stringify(view.landing)}\n${tail.join('\n')}`);
+  }));
   await step('open Passwords & payments', () => page.goto(`${app!.url}/personal/settings#settings-payments`));
   await step('the restored vault item is listed', async () => {
     await page.locator('#vault-manage-open').getByText('1 item').waitFor();
