@@ -20,7 +20,7 @@ const context = vm.createContext({
   document: { addEventListener: (type, handler) => keydown = handler, querySelector: () => null },
   resetChord() {}, focusedEnterAction: () => null, closeTopOverlay() { overlayClosed = true; },
 });
-vm.runInContext(fn('conversationFullscreenButton') + '\n' + fn('setConversationFullscreen') + '\n' + fn('bindKeys'), context);
+vm.runInContext(fn('conversationFullscreenButton') + '\n' + fn('setConversationFullscreen') + '\n' + fn('takesTypedKeys') + '\n' + fn('bindKeys'), context);
 assert.match(context.conversationFullscreenButton(), /aria-label="Full screen"/);
 context.setConversationFullscreen(true);
 assert.equal(pane.fullscreen, true);
