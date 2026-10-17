@@ -65,7 +65,27 @@ export function credentialMatchesProfile(
 }
 
 export function isAgentProvider(value: unknown): value is Provider {
-  return typeof value === 'string' && (AGENT_PROVIDERS as readonly string[]).includes(value);
+  return typeof value === 'string' && (AGENT_PROVIDERS as readonly string[]).includes(value)
+    && (value !== 'mock' || mockAgentEnabled());
+}
+
+/** The mock agent is a test fixture: a turn on it does no work and says so in
+ * one line. It exists only where the operator forces it with
+ * `KARMAX_AGENT_PROVIDER=mock` (the test suite, demos); anywhere else it can be
+ * neither chosen nor run. tavya.io once seeded it as every role's default
+ * because the host had no credentials at first boot, and a new organization's
+ * task "ran" on it, shown in the console as "claude · default model". */
+export function mockAgentEnabled(): boolean {
+  return process.env.KARMAX_AGENT_PROVIDER === 'mock';
+}
+
+/** Refuse a turn on an agent this installation cannot run, before any work
+ * starts, with what to do about it. */
+export function assertRunnableProvider(profile: Pick<AgentProfile, 'provider'>): void {
+  if (profile.provider === 'mock' && !mockAgentEnabled()) {
+    throw new Error('This agent has no model: it names the mock agent, a test fixture that does no work. '
+      + 'Choose a model for it (for example claude:claude-opus-5-5) in the task\'s Parameters, then retry.');
+  }
 }
 
 export function isLoginProvider(value: unknown): value is Provider {

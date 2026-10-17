@@ -7,6 +7,7 @@ import { jobStatuses } from '../world/jobs.js';
 import { worldRepos } from '../world/types.js';
 import { BRAND } from '../domain/brand.js';
 import { formatMinorUnits } from '../util/currency.js';
+import { assertRunnableProvider } from './provider-registry.js';
 
 /** An amount in minor units of `currency`, as the approver reads it: 1250 JPY, 12.500 KWD. */
 const money = (minor: number | undefined, currency = 'usd') => `${formatMinorUnits(minor ?? 0, currency)} ${currency.toUpperCase()}`;
@@ -194,6 +195,7 @@ export async function runRuntimeTurn(request: RuntimeTurnRequestV1, deps: RunTur
  * structured TurnResult. Errors propagate so the workflow's Resolve path runs.
  */
 export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<TurnResult> {
+  assertRunnableProvider(input.profile);
   const adapter = deps.adapters.get(input.profile.provider);
   if (!adapter) throw new Error(`no agent adapter for provider "${input.profile.provider}"`);
 

@@ -80,7 +80,7 @@ describe('reasoning-effort → provider parameter mapping (SPEC §10.5)', () => 
   describe('the Claude default model', () => {
     it('is a real model id, shared by both fallbacks, and effort-capable', () => {
       expect(defaultModel('claude')).toBe(CLAUDE_DEFAULT_MODEL);
-      expect(CLAUDE_DEFAULT_MODEL).toBe('claude-sonnet-4-6');
+      expect(CLAUDE_DEFAULT_MODEL).toBe('claude-opus-5-5');
       expect(claudeMessagesEffort(CLAUDE_DEFAULT_MODEL, 'high')).toBe('high');
     });
   });
