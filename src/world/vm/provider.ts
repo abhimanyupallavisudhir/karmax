@@ -456,7 +456,7 @@ async function waitReachable(transport: SshTransport, ms: number, signal?: Abort
   for (let attempt = 0; Date.now() < until; attempt++) {
     signal?.throwIfAborted();
     try {
-      const probe = await transport.exec('true', { timeoutMs: 20_000 });
+      const probe = await transport.exec('true', { timeoutMs: 20_000, retry: false });
       if (probe.code === 0) return;
     } catch (error) { last = error; transport.reset(); }
     await new Promise((resolve) => setTimeout(resolve, Math.min(5_000, 500 * (attempt + 1))));

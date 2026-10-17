@@ -1,5 +1,4 @@
 import process from 'node:process';
-import pkg from '../../cli/package.json' with { type: 'json' };
 import { parseArgs } from 'node:util';
 import { Api, resolveServer } from './api.js';
 import { Credentials } from './config.js';
@@ -15,8 +14,10 @@ import { add, untrack } from './commands/track.js';
 import { exec, preview } from './commands/world.js';
 import { gitCredential } from './commands/git-credential.js';
 import { emit } from './commands/events.js';
+import { updateCheck, updateCheckWanted } from './update.js';
+import { VERSION } from './version.js';
 
-export const VERSION: string = pkg.version;
+export { VERSION } from './version.js';
 
 const HELP = `tavya — work on tavya projects and tasks from your own machine
 
@@ -215,7 +216,8 @@ async function apiCommand(api: Api, args: string[], flags: Record<string, any>, 
   return 0;
 }
 
-export async function cli(argv?: string[]): Promise<never> {
+export async function cli(argv = process.argv.slice(2)): Promise<never> {
+  const update = updateCheckWanted(argv, interactive()) ? updateCheck(VERSION) : undefined;
   let code: number;
   try { code = await main(argv); }
   catch (error) {
@@ -223,5 +225,7 @@ export async function cli(argv?: string[]): Promise<never> {
     process.stderr.write(`tavya: ${failure.message}\n`);
     code = failure.code;
   }
+  const notice = await update?.notice().catch(() => undefined);
+  if (notice) process.stderr.write(`${notice}\n`);
   process.exit(code);
 }

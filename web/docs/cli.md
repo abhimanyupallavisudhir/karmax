@@ -16,7 +16,9 @@ Or, anywhere with Node.js 22 or later:
 npm install -g @tavya/cli
 ```
 
-Without installing, prefix any command with `npx @tavya/cli` instead of `tavya`.
+Without installing, prefix any command with `npx @tavya/cli@latest` instead of `tavya`.
+
+On a terminal, `tavya` says when a newer version is out (it asks npm at most once a day; `TAVYA_NO_UPDATE_CHECK=1` turns that off).
 
 ## Sign in
 

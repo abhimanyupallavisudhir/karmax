@@ -1271,6 +1271,70 @@ describe('a sub-task that cannot be prepared', () => {
     expect(wf.handlers.get('view')!().subTasks).toEqual(['child']);
   });
 
+  // pramana#39/#43: "could not seed the parent branch for the child task: …:
+  // the SSH connection to the VM was lost" reached the agent as its own failure.
+  const unreachable = () => new ActivityFailure('Activity task failed', 'prepareChildTask', '9', RetryState.MAXIMUM_ATTEMPTS_REACHED, 'worker',
+    ApplicationFailure.create({ type: 'world-infra', nonRetryable: false,
+      message: 'could not seed the parent branch for the child task: pramana-wiki: the SSH connection to the VM was lost' }));
+  const delegate = () => wf.activities.runAgentTurn.mockImplementation(async () => {
+    if (wf.activities.runAgentTurn.mock.calls.length === 1)
+      return { output: 'Delegating', providerCompleted: true, subTasks: [{ title: 'OCR', prompt: 'p' }] };
+    wf.handlers.get('cancel')!();
+    return { output: 'Waiting for it', providerCompleted: true };
+  });
+  beforeEach(() => { wf.activities.recordEvent = vi.fn(async () => undefined); });
+  const failureNotes = () => (wf.handlers.get('view')!().messages as any[]).filter((m) => /create_sub_task "OCR" failed/.test(m.text));
+
+  it('waits out a parent world that cannot be reached, visibly, and then creates the child', async () => {
+    wf.activities.accountPoolSize.mockResolvedValue(0);
+    wf.activities.prepareChildTask = vi.fn().mockRejectedValueOnce(unreachable()).mockRejectedValueOnce(unreachable())
+      .mockResolvedValue({ ...input, taskId: 'child' });
+    delegate();
+    const waits: any[] = [];
+    wf.wait = () => {
+      const view = wf.handlers.get('view')!();
+      if (view.waitingFor?.kind === 'retry') waits.push({ waitingFor: view.waitingFor, error: view.error, timeout: wf.timeout });
+      else wf.handlers.get('cancel')!();
+    };
+    await softwareDevV1_28(withRepo);
+    expect(wf.activities.prepareChildTask).toHaveBeenCalledTimes(3);
+    expect(waits.map((w) => [w.waitingFor.detail, w.timeout])).toEqual([['Retry 1 of 5', 30_000], ['Retry 2 of 5', 60_000]]);
+    expect(waits[0].error).toMatch(/^infrastructure: .*the SSH connection to the VM was lost — preparing sub-task "OCR" again in 30s$/);
+    expect(wf.handlers.get('view')!().subTasks).toEqual(['child']);
+    expect(failureNotes()).toEqual([]);
+    expect(wf.activities.recordEvent).not.toHaveBeenCalledWith('task', 'subtask.failed', expect.anything());
+  });
+
+  it('asks a person when the world stays unreachable, and Retry creates the child; the agent is not told it failed', async () => {
+    wf.activities.accountPoolSize.mockResolvedValue(0);
+    const prepare = vi.fn();
+    for (let i = 0; i < 6; i++) prepare.mockRejectedValueOnce(unreachable());
+    wf.activities.prepareChildTask = prepare.mockResolvedValue({ ...input, taskId: 'child' });
+    delegate();
+    let escalated: any;
+    wf.wait = () => {
+      const view = wf.handlers.get('view')!();
+      if (view.stage === 'escalated' && !escalated) { escalated = structuredClone(view); wf.handlers.get('retry')!(); }
+      else if (view.waitingFor?.kind !== 'retry') wf.handlers.get('cancel')!();
+    };
+    await softwareDevV1_28(withRepo);
+    expect(escalated.status).toBe('blocked');
+    expect(escalated.error).toMatch(/^create_sub_task "OCR" failed: no sub-task was created\. could not seed the parent branch .*the SSH connection to the VM was lost\. Nothing was lost; Retry creates it again\.$/);
+    expect(prepare).toHaveBeenCalledTimes(7);
+    expect(wf.handlers.get('view')!().subTasks).toEqual(['child']);
+    expect(failureNotes()).toEqual([]);
+  });
+
+  it('keeps histories recorded before the wait telling the agent at once', async () => {
+    wf.absentPatches = new Set(['software-dev-subtask-prepare-waits-for-world-v1']);
+    wf.activities.accountPoolSize.mockResolvedValue(0);
+    wf.activities.prepareChildTask = vi.fn().mockRejectedValue(unreachable());
+    delegate();
+    await softwareDevV1_28(withRepo);
+    expect(wf.activities.prepareChildTask).toHaveBeenCalledOnce();
+    expect(failureNotes()).toHaveLength(1);
+  });
+
   it('keeps histories recorded before it failing the task', async () => {
     wf.absentPatches = new Set(['subtask-prepare-failure-to-agent-v1']);
     wf.activities.accountPoolSize.mockResolvedValue(0);
