@@ -107,6 +107,24 @@ describe('continue after Confirm', () => {
     await f.store.close();
   });
 
+  // andhbhakt.com#5 (2026-10-17): the source was archived when it finished, its
+  // continuation copied `archived` and started out archived, and so never
+  // showed in its creator's default list while it waited on them.
+  it('a continuation starts out unarchived, though its finished source was archived', async () => {
+    const f = await fixture();
+    await f.store.saveView(f.source.id, f.landed);
+    expect((await f.store.getTask(f.source.id))?.params.archived).toBe(true);
+    const owner = await f.tokenFor('user:owner');
+    const posted = await f.api.postTaskMessage(owner, f.source.id, { text: 'Now the next piece' });
+    const next = (await f.store.getTask(posted.continuedIn!.id))!;
+    expect(next.params.archived).toBeUndefined();
+    // Nor can any caller create a task that starts out archived.
+    const created = await f.api.createTask(owner, { projectId: f.project.id, workflow: 'software-dev',
+      params: { prompt: 'x', archived: true } });
+    expect((await f.store.getTask(created.id))?.params.archived).toBeUndefined();
+    await f.store.close();
+  });
+
   it('while the approved proposal lands, the continuation starts from its unlanded branch', async () => {
     const f = await fixture();
     await f.store.saveView(f.source.id, { ...f.landed, stage: 'merge', status: 'waiting', waitingFor: { kind: 'github', detail: 'CI' } });
