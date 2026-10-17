@@ -36,6 +36,11 @@ import { ProviderCapacityFull, ProviderOutage } from '../agent/limits.js';
  */
 
 const API = 'https://api.hetzner.cloud/v1';
+/** One public address per server, IPv4: karmax reaches it by SSH over IPv4,
+ * and much of what a world fetches (GitHub) has no IPv6. Hetzner counts every
+ * primary IP, IPv6 too, against the project's limit, so an IPv6 address
+ * each halved how many servers it admitted (pramana#79: five). */
+const PUBLIC_NET = { enable_ipv4: true, enable_ipv6: false };
 export const HETZNER_DEFAULT_LOCATION = 'fsn1';
 export const HETZNER_DEFAULT_IMAGE = 'debian-12';
 export const HETZNER_MIN_DISK_GB = 10;
@@ -317,7 +322,7 @@ export class HetznerDriver implements VmDriver {
       }
     }
     throw new ProviderCapacityFull(`Hetzner has no ${types.map((type) => type.name).join(', ')} server free at ${ref.location} just now. `
-      + 'tavya keeps retrying for about 20 minutes; to start sooner, give this task another size.', { cause: soldOut });
+      + 'tavya waits until one is free; to start sooner, give this task another size.', { cause: soldOut });
   }
 
   private async createServerOf(connection: ResolvedWorldProviderConnection, ref: Record<string, string>, volume: Volume, type: ServerType,
@@ -327,7 +332,7 @@ export class HetznerDriver implements VmDriver {
     const create = () => api('POST', '/servers', {
       name: ref.world, server_type: type.name, location: ref.location, image: snapshot ?? connection.config.image ?? HETZNER_DEFAULT_IMAGE,
       labels: withoutParked(labels), volumes: [volume.id], automount: false, start_after_create: true,
-      firewalls: [{ firewall: firewall }], ssh_keys: [sshKey], public_net: { enable_ipv4: true, enable_ipv6: true },
+      firewalls: [{ firewall: firewall }], ssh_keys: [sshKey], public_net: PUBLIC_NET,
       user_data: cloudInit(keys, volume.linux_device ?? `/dev/disk/by-id/scsi-0HC_Volume_${volume.id}`),
     }) as Promise<{ server: Server; action: { id: number } }>;
     let created: { server: Server; action: { id: number } };
@@ -357,21 +362,27 @@ export class HetznerDriver implements VmDriver {
     const volumes = await this.pages<Volume>(connection, '/volumes', 'volumes').catch(() => [] as Volume[]);
     const used = volumes.reduce((sum, volume) => sum + volume.size, 0);
     return new ProviderCapacityFull(`Hetzner refused ${what}: this Hetzner project's limit on the total size of its volumes is full, `
-      + `with ${used} GB in ${volumes.length} volume${volumes.length === 1 ? '' : 's'}. tavya keeps retrying for about 20 minutes; `
+      + `with ${used} GB in ${volumes.length} volume${volumes.length === 1 ? '' : 's'}. tavya waits until there is room; `
       + 'to start sooner, give this task a smaller disk, delete another task, or ask Hetzner to raise the limit (Hetzner Console → Limits).', { cause });
   }
 
   /** What a full project limit is, what holds it, and what a person can do. */
   private async limitFull(connection: ResolvedWorldProviderConnection, type: ServerType, limit: string, cause: unknown): Promise<ProviderCapacityFull> {
     const servers = await this.servers(connection).catch(() => [] as Server[]);
+    const raise = 'or ask Hetzner to raise the limit (Hetzner Console → Limits).';
     const cores = limit === 'server_dedicated_cores_limit' ? 'dedicated' : limit === 'server_shared_cores_limit' ? 'shared' : undefined;
-    const holding = cores ? servers.filter((server) => server.server_type.cpu_type === cores) : servers;
-    const inUse = holding.reduce((sum, server) => sum + server.server_type.cores, 0);
-    const what = cores ? `limit on ${cores} CPUs is full, with ${inUse} in use by ${holding.length} other server${holding.length === 1 ? '' : 's'}`
-      : `${limit.replace(/_/g, ' ')} is reached, with ${servers.length} server${servers.length === 1 ? '' : 's'}`;
-    return new ProviderCapacityFull(`Hetzner refused a ${type.cores}-CPU server: this Hetzner project's ${what}. `
-      + 'tavya keeps retrying for about 20 minutes; to start sooner, give this task fewer CPUs, stop another task, '
-      + 'or ask Hetzner to raise the limit (Hetzner Console → Limits).', { cause });
+    if (cores) {
+      const holding = servers.filter((server) => server.server_type.cpu_type === cores);
+      const inUse = holding.reduce((sum, server) => sum + server.server_type.cores, 0);
+      return new ProviderCapacityFull(`Hetzner refused a ${type.cores}-CPU server: this Hetzner project's limit on ${cores} CPUs is full, `
+        + `with ${inUse} in use by ${holding.length} other server${holding.length === 1 ? '' : 's'}. tavya waits until enough are free; `
+        + `to start sooner, give this task fewer CPUs, stop another task, ${raise}`, { cause });
+    }
+    const counted = `${servers.length} server${servers.length === 1 ? '' : 's'}`;
+    const what = limit === 'primary_ip_limit' ? `limit on public IP addresses is full, with ${counted} using them`
+      : `${limit.replace(/_/g, ' ')} is reached, with ${counted}`;
+    return new ProviderCapacityFull(`Hetzner refused a new server: this Hetzner project's ${what}. tavya waits until one is free; `
+      + `to start sooner, stop another task, ${raise}`, { cause });
   }
 
   /** The server type for a shape: cheapest current x86 type at the location that covers it. */
@@ -498,7 +509,7 @@ export class HetznerDriver implements VmDriver {
     const created = await api('POST', '/servers', {
       name: `karmax-image-${version}`, server_type: type.name, location: connection.config.region ?? HETZNER_DEFAULT_LOCATION,
       image: HETZNER_DEFAULT_IMAGE, labels: { karmaxImageBuilder: version }, start_after_create: true,
-      firewalls: [{ firewall }], ssh_keys: [sshKey], public_net: { enable_ipv4: true, enable_ipv6: true },
+      firewalls: [{ firewall }], ssh_keys: [sshKey], public_net: PUBLIC_NET,
       user_data: cloudInit({ hostPrivateKey: host.privateKey, authorizedKey: client.publicKey }),
     }) as { server: Server; action: { id: number } };
     try {

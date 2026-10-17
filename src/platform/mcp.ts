@@ -11,6 +11,7 @@ import {
   type CompactTask,
 } from './platform-request.js';
 import { BRAND } from '../domain/brand.js';
+import { continuedReply } from '../domain/forks.js';
 import { CLOUD_WORLD_PROVIDERS, type CloudWorldProvider } from '../domain/computer.js';
 
 // Re-exported so the platform MCP module stays the one place a reader looks for
@@ -61,7 +62,7 @@ export interface PlatformOps {
   tagTask(taskId: string, add?: string[], remove?: string[]): Promise<{ tags: string[] }>;
   setTaskPriority(taskId: string, priority: number): Promise<void>;
   signalTask(taskId: string, signal: string, text?: string, role?: string, otherAttempts?: 'keep' | 'cancel', saveOtherAttemptsDefault?: boolean): Promise<void>;
-  messageAgent(taskId: string, text: string, role?: string): Promise<void>;
+  messageAgent(taskId: string, text: string, role?: string): Promise<string>;
   stopAgent(taskId: string, agent: string): Promise<unknown>;
   escalateToHuman(a: { taskId?: string; audience: string[]; message: string; urgency?: Urgency }): Promise<unknown>;
   notify(a: { to?: string[]; message: string; urgency?: Urgency; agents?: AgentSpec[] }): Promise<unknown>;
@@ -145,7 +146,7 @@ export function apiOps(api: KarmaxApi, getToken: () => string): PlatformOps {
     tagTask: (id, add, remove) => api.tagTask(getToken(), id, { add, remove }),
     setTaskPriority: (id, priority) => api.setTaskPriority(getToken(), id, priority),
     signalTask: async (id, sig, text, role, otherAttempts, saveOtherAttemptsDefault) => void (await api.signalTask(getToken(), id, sig as any, text, role, undefined, undefined, { otherAttempts, saveOtherAttemptsDefault })),
-    messageAgent: async (id, text, role) => void (await api.messageAgent(getToken(), id, text, role)),
+    messageAgent: async (id, text, role) => continuedReply((await api.messageAgent(getToken(), id, text, role)).continuedIn),
     stopAgent: (id, agent) => api.stopAgent(getToken(), id, agent),
     escalateToHuman: (a) => api.escalateToHuman(getToken(), a),
     notify: (a) => api.notify(getToken(), a),
@@ -252,7 +253,7 @@ export function httpOps(baseUrl: string, token: string | (() => Promise<string |
     tagTask: (id, add, remove) => req(`/api/tasks/${id}/tag`, { method: 'POST', body: JSON.stringify({ add, remove }) }) as Promise<{ tags: string[] }>,
     setTaskPriority: async (id, priority) => void (await req(`/api/tasks/${id}/priority`, { method: 'PUT', body: JSON.stringify({ priority }) })),
     signalTask: async (id, signal, text, role, otherAttempts, saveOtherAttemptsDefault) => void (await req(`/api/tasks/${id}/signal`, { method: 'POST', body: JSON.stringify({ signal, text, role, otherAttempts, saveOtherAttemptsDefault }) })),
-    messageAgent: async (id, text, role) => void (await req(`/api/tasks/${id}/messages`, { method: 'POST', body: JSON.stringify({ text, role }) })),
+    messageAgent: async (id, text, role) => continuedReply(((await req(`/api/tasks/${id}/messages`, { method: 'POST', body: JSON.stringify({ text, role }) })) as { continuedIn?: { id: string; num?: number } } | undefined)?.continuedIn),
     stopAgent: (id, agent) => req(`/api/tasks/${id}/agents/${encodeURIComponent(agent)}/stop`, { method: 'POST' }),
     escalateToHuman: (a) => req('/api/agent/escalate', { method: 'POST', body: JSON.stringify(a) }),
     notify: (a) => req('/api/agent/notify', { method: 'POST', body: JSON.stringify(a) }),
@@ -508,7 +509,7 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
   server.registerTool(
     'message_agent',
     { description: `Send a follow-up into an attached agent conversation (${AGENT_ROLE_NAMES.join(', ')}). This works for original or forked tasks and is delivered live when that agent is running.`, inputSchema: { taskId: z.string(), role: z.enum(AGENT_ROLE_NAMES).default('do'), message: z.string() } },
-    async (a) => wrap(async () => { await ops.messageAgent(a.taskId, a.message, a.role); return 'message delivered'; }),
+    async (a) => wrap(async () => ops.messageAgent(a.taskId, a.message, a.role)),
   );
   server.registerTool(
     'escalate_to_human',

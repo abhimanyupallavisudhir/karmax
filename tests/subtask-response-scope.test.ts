@@ -52,3 +52,32 @@ describe('respond_to_sub_task', () => {
     expect(await handlers.respond_to_sub_task!({ action: 'merge' })).toMatch(/invalid action — use open_pr \| confirm \| comment \| retry \| cancel \| keep_own/);
   });
 });
+
+describe('an answer the waiting sub-task cannot act on', () => {
+  // Answering, the parent stops waiting for the child; an answer whose flag its
+  // wait never reads left both tasks standing still for good.
+  it('is refused with the answers that apply, and queued when the child is not waiting for it', async () => {
+    const { platformToolHandlers } = await import('../src/agent/tools.js');
+    const { applicableSubTaskActions } = await import('../src/domain/sub-task-responses.js');
+    let child: Record<string, unknown> = { stage: 'review', status: 'waiting', waitingFor: { kind: 'parent' }, actions: [] };
+    const responses: unknown[] = [];
+    const handlers = platformToolHandlers({ handle: { id: 'task', root: '/w', branch: 'b', base: 'main' } } as any,
+      { respondToSubTask: (r: unknown) => { responses.push(r); }, platformRequest: async () => child } as any);
+    expect(await handlers.respond_to_sub_task!({ action: 'open_pr', child_task_id: 'child' }))
+      .toBe('"open_pr" does not apply now: that sub-task is at Review. Answer with confirm | comment | cancel.');
+    expect(await handlers.respond_to_sub_task!({ action: 'retry', child_task_id: 'child' })).toMatch(/does not apply/);
+    expect(await handlers.respond_to_sub_task!({ action: 'confirm', child_task_id: 'child' })).toMatch(/confirm queued/);
+    child = { stage: 'do', status: 'waiting', waitingFor: { kind: 'parent' } };
+    expect(await handlers.respond_to_sub_task!({ action: 'keep_own', child_task_id: 'child' }))
+      .toMatch(/the end of a turn\. Answer with open_pr \| confirm \| comment \| cancel/);
+    expect(await handlers.respond_to_sub_task!({ action: 'open_pr', child_task_id: 'child' })).toMatch(/queued/);
+    // Still working: an answer waits for its next stop.
+    child = { stage: 'do', status: 'active' };
+    expect(await handlers.respond_to_sub_task!({ action: 'retry', child_task_id: 'child' })).toMatch(/queued/);
+    expect(responses).toHaveLength(3);
+    expect(applicableSubTaskActions({ stage: 'escalated', status: 'blocked', waitingFor: { kind: 'parent' },
+      actions: [{ name: 'keepOwnResources' }, { name: 'followUp' }] })).toEqual(['retry', 'comment', 'cancel', 'keep_own']);
+    expect(applicableSubTaskActions({ stage: 'merge', status: 'blocked', waitingFor: { kind: 'parent' },
+      actions: [{ name: 'confirm' }, { name: 'openPr' }] })).toEqual(['retry', 'comment', 'cancel', 'confirm', 'open_pr']);
+  });
+});
