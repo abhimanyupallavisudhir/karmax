@@ -328,6 +328,9 @@ const QUIET_NOTICE = 'prn-';
 const FINISH_TOGETHER = 'several-branches-finish-together-v1';
 /** Open PR's checks wake a parked world, and wait out one that cannot wake (pramana#56). */
 const OPEN_PR_WAITS_FOR_WORLD = 'software-dev-open-pr-waits-for-world-v1';
+/** A sub-task whose parent world cannot be reached is waited out, then a
+ * person's, never the asking agent's (pramana#39/#43). */
+const SUBTASK_PREPARE_WAITS_FOR_WORLD = 'software-dev-subtask-prepare-waits-for-world-v1';
 const quietNotice = (m: Message): boolean => m.id.startsWith(QUIET_NOTICE);
 const clip = (text: string, max: number) => text.length > max ? `${text.slice(0, max)}…` : text;
 /** A turn can return while the agent's own in-harness sub-agents (Claude Agent SDK
@@ -3917,7 +3920,7 @@ Inspect the complete current diff and specifically compare its delta from the re
       if (patched('subtask-prepare-failure-to-agent-v1')) {
         preparingSubTask = true;
         await publish();
-        try { childInput = await childPreparation.prepareChildTask(prepare); }
+        try { childInput = await prepareSubTask(s, prepare); }
         catch (err) {
           if (isCancellation(err)) throw err;
           preparingSubTask = false;
@@ -3951,6 +3954,32 @@ Inspect the complete current diff and specifically compare its delta from the re
     await publish();
   }
 
+  /** Prepare a sub-task. Its parent's world can be unreachable for longer
+   * than the activity's retries (a VM whose connection stays lost): that is
+   * waited out as any stage's infrastructure is, visibly, a Retry or a cancel
+   * ending a wait early. */
+  async function prepareSubTask(request: SubTaskRequest, prepare: Parameters<coreActivities['prepareChildTask']>[0]) {
+    for (let waits = 0; ; waits++) {
+      try { return await childPreparation.prepareChildTask(prepare); }
+      catch (err) {
+        if (!isInfraFailure(err) || waits >= INFRA_BACKOFF_MS.length || !patched(SUBTASK_PREPARE_WAITS_FOR_WORLD)) throw err;
+        const wait = INFRA_BACKOFF_MS[waits]!;
+        const resumeStatus = status;
+        status = 'waiting';
+        waitingFor = { kind: 'retry', detail: `Retry ${waits + 1} of ${INFRA_BACKOFF_MS.length}`, until: Date.now() + wait };
+        error = `infrastructure: ${describeError(err)} — preparing sub-task "${request.title}" again in ${Math.round(wait / 1000)}s`;
+        await publish();
+        await condition(() => cancelled || retryRequested || halted(), wait);
+        waitingFor = undefined;
+        status = resumeStatus;
+        error = undefined;
+        if (cancelled || halted()) throw new Cancelled();
+        retryRequested = false;
+        await publish();
+      }
+    }
+  }
+
   /** Tell the agent that asked for `failed` (and the requests after it in the
    * same turn, not attempted) why it was not created: at its next turn, as a
    * failed create_sub_task. Outside Do no turn of it follows (a Reviewer at
@@ -3966,8 +3995,13 @@ Inspect the complete current diff and specifically compare its delta from the re
     await core.recordEvent(taskId, 'subtask.failed', { title: failed.title, error: reason, requester,
       ...(rest.length ? { notAttempted: rest.map((r) => r.title) } : {}) });
     const addressed = multiAgent && requester !== MAIN_AGENT;
-    msgs.push({ id: `st-${msgs.length}`, role: 'user', text, ts: Date.now(), ...(addressed ? { to: [agentSelector(requester)] } : {}) });
-    if (stage === 'do') {
+    const tell = () => msgs.push({ id: `st-${msgs.length}`, role: 'user', text, ts: Date.now(), ...(addressed ? { to: [agentSelector(requester)] } : {}) });
+    // An unreachable world, still so after the waits, is no agent's to fix: a
+    // person's Retry creates it. The agent hears only if the person answers
+    // otherwise (a follow-up), so it can ask again itself.
+    const infrastructure = isInfraFailure(err) && patched(SUBTASK_PREPARE_WAITS_FOR_WORLD);
+    if (!infrastructure) tell();
+    if (stage === 'do' && !infrastructure) {
       if (addressed) agentQueue = enqueueAgents(agentQueue, [requester]);
       await publish();
       return;
@@ -3988,7 +4022,8 @@ Inspect the complete current diff and specifically compare its delta from the re
     error = undefined;
     stage = priorStage;
     status = 'active';
-    if (cancelled || !retryRequested) return;
+    if (cancelled) return;
+    if (!retryRequested) { if (infrastructure) tell(); return; }
     retryRequested = false;
     await spawnSubTasks([failed, ...rest], requester);
   }

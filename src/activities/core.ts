@@ -1644,13 +1644,20 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     const parentHandle = (await store.currentWorld(args.parentTaskId)) as WorldHandle | undefined;
     if (parentHandle && isRemote(parentHandle.kind) && !args.pullRequest) {
       const parentWorld = await openWorld(parentHandle);
-      await enrollLiveProjectRepositories(parentWorld, args.parentTaskId);
+      // A parent world that stays unreachable through the transport's own
+      // reconnects is infrastructure, waited out, never the asking agent's
+      // failure (pramana#39/#43: "the SSH connection to the VM was lost").
+      try { await enrollLiveProjectRepositories(parentWorld, args.parentTaskId); }
+      catch (error) { throw worldUnreachable(parentHandle, error); }
       // A project without repositories has no branch to seed: its child starts
       // from an empty world like its parent (upgrade rehearsal, #421).
       if (worldRepos(parentWorld.handle).length) {
         const persisted = await publishTaskBranch(parentWorld, args.parentTaskId);
-        if (!persisted.pushed.length || persisted.skipped.length)
-          throw new Error(`could not seed the parent branch for the child task${persisted.skipped.length ? `: ${describePublishFailures(persisted)}` : ''}`);
+        if (!persisted.pushed.length || persisted.skipped.length) {
+          const message = `could not seed the parent branch for the child task${persisted.skipped.length ? `: ${describePublishFailures(persisted)}` : ''}`;
+          if (persisted.unreachable) throw ApplicationFailure.create({ message, type: 'world-infra', nonRetryable: false });
+          throw new Error(message);
+        }
         (await record(args.parentTaskId, 'push.branch', {
           branch: parentWorld.handle.branch, repos: persisted.pushed, reason: 'subtask-bootstrap',
         }));
