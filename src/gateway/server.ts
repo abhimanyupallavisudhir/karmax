@@ -9822,9 +9822,11 @@ export class Gateway {
     const member = this.searchMember(session);
     if (!member) return this.json(res, 200, await this.deps.api.searchOrganizationTasks(session.apiToken, organizationId, query, page));
     const projects = await this.searchableProjects(res, session, organizationId);
-    // An empty list is an answer only to a member; anyone else is refused, like
-    // every other route that names a foreign organization.
-    if (!projects.length && !(await this.deps.store.organizationMembership(organizationId, member)))
+    // An empty list is an answer only to a member or to someone who may read the
+    // organization's tasks (an installation administrator); anyone else is
+    // refused, like every other route that names a foreign organization.
+    if (!projects.length && !(await this.deps.store.organizationMembership(organizationId, member))
+      && !allows(await this.personCaps(session, undefined, organizationId), 'task:read'))
       return this.json(res, 403, { error: 'You are not a member of this organization' });
     return this.json(res, 200, await this.deps.api.searchAuthorizedOrganization(projects, query, `user:${member}`, page));
   }
