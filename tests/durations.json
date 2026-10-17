@@ -92,6 +92,7 @@
   "tests/cli-login.test.ts": 9.4,
   "tests/cli-release-version.test.ts": 0.3,
   "tests/cli-task.test.ts": 25.5,
+  "tests/cli-update.test.ts": 0.3,
   "tests/cli-workspace.test.ts": 43.2,
   "tests/cli.test.ts": 0.4,
   "tests/cloud-live.test.ts": 0,
