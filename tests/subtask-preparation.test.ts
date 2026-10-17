@@ -144,7 +144,8 @@ it('tells the agent beforehand that create_sub_task saves its writable data firs
   const prompt = assemblePrompt({ profile: { id: 'do', name: 'Do', provider: 'claude', role: 'do', capabilities: [] } as any, role: 'do',
     task: { taskId: 't', projectId: 'p', title: 'Corpus', prompt: 'work' } as any,
     world: { kind: 'worktree', id: 't', root: '/w/t', branch: 'tavya/t', base: 'main' } as any });
-  expect(prompt).toMatch(/- create_sub_task\(title, prompt, params\?\):[^\n]*saves this task's writable project data/);
+  expect(prompt).toMatch(/- create_sub_task\(title, prompt, params\?, draft\?\):[^\n]*saves this task's writable project data/);
+  expect(prompt).toMatch(/- create_sub_task\([^\n]*draft: true it is only saved, and starts when you call queue_task/);
 });
 
 // pramana#39/#43: "could not seed the parent branch for the child task:

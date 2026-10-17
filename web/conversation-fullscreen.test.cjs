@@ -17,7 +17,7 @@ let overlayClosed = false;
 const context = vm.createContext({
   S: {}, ICON: { expand: 'expand', collapse: 'collapse' },
   $: selector => selector === '#conversation-fullscreen' ? button : selector === '.ck-pane' ? pane : selector === '.ck-fullscreen' ? (pane.fullscreen ? pane : null) : roots,
-  document: { addEventListener: (type, handler) => keydown = handler },
+  document: { addEventListener: (type, handler) => keydown = handler, querySelector: () => null },
   resetChord() {}, focusedEnterAction: () => null, closeTopOverlay() { overlayClosed = true; },
 });
 vm.runInContext(fn('conversationFullscreenButton') + '\n' + fn('setConversationFullscreen') + '\n' + fn('bindKeys'), context);

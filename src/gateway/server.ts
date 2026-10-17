@@ -5391,6 +5391,11 @@ export class Gateway {
         if (project) await this.wikiForTaskStart(project, callerIdentity.humanSubject?.userId);
         return this.json(res, 200, await api.queueTask(token, queueMatch[1]!));
       }
+      const subTasksMatch = p.match(/^\/api\/tasks\/([^/]+)\/sub-tasks$/);
+      if (subTasksMatch && method === 'POST') {
+        const body = (await this.body(req)) as { title?: unknown; prompt?: unknown; params?: unknown };
+        return this.json(res, 200, await api.createSubTaskDraft(token, subTasksMatch[1]!, body ?? {}));
+      }
       const taskPayments = p.match(/^\/api\/tasks\/([^/]+)\/payments$/);
       if (taskPayments && (method === 'GET' || method === 'PUT')) {
         const task = (await store.getTask(taskPayments[1]!));

@@ -124,7 +124,7 @@ import { assembleTaskInput } from '../platform/params.js';
 import { subTaskParams } from '../platform/agent-params.js';
 import { allows, attenuate, CHILD_TASK_CEILING } from '../platform/capabilities.js';
 import { Provider, Message, TaskInput, TaskView, AgentRole, remotePolicyOf, landingAuthorityOf, type Repository, type TaskPullRequest,
-  type GitHubMergeAuthorization, type GithubLandingParticipant, type LandingAuthority, type UpstreamProposal, type SubTaskRequest, type SubTaskResponse, type WorldHandleRef } from '../domain/types.js';
+  type GitHubMergeAuthorization, type GithubLandingParticipant, type LandingAuthority, type UpstreamProposal, type SubTaskRequest, type SubTaskResponse, type TaskRecord, type WorldHandleRef } from '../domain/types.js';
 import { newId } from '../util/id.js';
 import { SIG_AGENT_TURN_STATE } from '../workflows/names.js';
 import { destroyWorldServices } from '../world/services.js';
@@ -540,6 +540,9 @@ export interface PrepareChildArgs {
    *  §11.1): it lands a branch from the parent's own world, so nothing of the
    *  parent's (its branch, its data) is seeded for it. */
   pullRequest?: boolean;
+  /** A queued draft sub-task: its saved record is prepared (its title, prompt
+   *  and agent fields as they are now), instead of a new one created. */
+  draftTaskId?: string;
 }
 
 /** Side-effecting activities the workflows drive (SPEC §3.1). */
@@ -1634,10 +1637,27 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     }
   }
 
+  /** The saved record of a draft sub-task its parent was asked to start: still
+   * a draft, or prepared by an earlier attempt of this activity and never run. */
+  async function queuedDraft(taskId: string, parentTaskId: string): Promise<TaskRecord> {
+    const draft = (await store.getTask(taskId));
+    const unavailable = (why: string) => ApplicationFailure.create({ message: why, type: 'subtask-draft-unavailable', nonRetryable: true });
+    if (!draft || draft.parentTaskId !== parentTaskId) throw unavailable('it is no longer a draft sub-task of this task (it was deleted)');
+    if (!draft.params?.draft && draft.lastView) throw unavailable('it has already started');
+    return draft;
+  }
+
   /** A sub-task's record and input: its parent's branch pushed and its
    * writable project data saved for it to start from (prepareChildTask). */
   async function prepareChild(args: PrepareChildArgs, work: { checkContinue: () => Promise<void>;
     onProgress: (progress: ResourceSaveProgress) => void }): Promise<TaskInput> {
+    const draft = args.draftTaskId ? (await queuedDraft(args.draftTaskId, args.parentTaskId)) : undefined;
+    if (draft) {
+      const { prompt, ...fields } = draft.params;
+      const agentFields = Object.fromEntries(Object.entries(fields).filter(([name]) => name.startsWith('agent:')));
+      args = { ...args, title: draft.title, prompt: String(prompt ?? ''),
+        ...(Object.keys(agentFields).length ? { params: agentFields as SubTaskRequest['params'] } : {}) };
+    }
     const parent = (await store.getTask(args.parentTaskId));
     const currentProject = (await store.getProject(args.projectId));
     const project = currentProject ? (await store.effectiveProjectConfig(currentProject)) : args.project;
@@ -1671,25 +1691,36 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const { info } = activityContext.current();
       if (info.workflowExecution) idempotencyKey = `${args.parentTaskId}:${info.workflowExecution.runId}:${info.activityId}`;
     } catch { /* Direct calls represent distinct requests. */ }
-    let child = (await store.createTask({
-      projectId: args.projectId,
-      idempotencyKey,
-      listId: parent?.listId,
-      title: args.title,
-      workflow: 'software-dev',
-      workflowVersion: parent?.workflowVersion ?? '1.0.0',
-      // The child's own agent fields first: its prompt and the parent's branch always win.
-      params: { ...args.params, prompt: args.prompt, base: args.base, target: args.target,
-        [REPOSITORY_BRANCHES_RESOLVED_PARAM]: true,
-        ...(Object.keys(resourceRevisions).length ? { [PARENT_RESOURCES_PARAM]: resourceRevisions } : {}),
-        // Stored so a replacement run of this child, which is rebuilt from
-        // its record, keeps the parent's profiles as this first run does.
-        ...(args.profiles ? { profiles: args.profiles } : {}) },
-      parentTaskId: args.parentTaskId,
-      createdBy: { kind: 'task-agent', taskId: args.parentTaskId, role: 'do' },
-      assignee: { kind: 'task-agent', taskId: args.parentTaskId, role: 'do' },
-    }));
-    (await record(args.parentTaskId, 'subtask.created', { childTaskId: child.id, title: args.title, ...(args.pullRequest ? { pullRequest: true } : {}) }));
+    // The child's own agent fields first: its prompt and the parent's branch always win.
+    const childParams = { ...args.params, prompt: args.prompt, base: args.base, target: args.target,
+      [REPOSITORY_BRANCHES_RESOLVED_PARAM]: true,
+      ...(Object.keys(resourceRevisions).length ? { [PARENT_RESOURCES_PARAM]: resourceRevisions } : {}),
+      // Stored so a replacement run of this child, which is rebuilt from
+      // its record, keeps the parent's profiles as this first run does.
+      ...(args.profiles ? { profiles: args.profiles } : {}) };
+    let child: TaskRecord;
+    if (draft) {
+      // What else the draft holds (a Computer a person set, its tags) stays.
+      const { _queuedAt: _queued, ...kept } = draft.params;
+      (await store.updateTaskParams(draft.id, { ...kept, ...childParams, draft: true }));
+      (await store.clearDraft(draft.id));
+      child = (await store.getTask(draft.id))!;
+      (await record(args.parentTaskId, 'subtask.started', { childTaskId: child.id, title: args.title }));
+    } else {
+      child = (await store.createTask({
+        projectId: args.projectId,
+        idempotencyKey,
+        listId: parent?.listId,
+        title: args.title,
+        workflow: 'software-dev',
+        workflowVersion: parent?.workflowVersion ?? '1.0.0',
+        params: childParams,
+        parentTaskId: args.parentTaskId,
+        createdBy: { kind: 'task-agent', taskId: args.parentTaskId, role: 'do' },
+        assignee: { kind: 'task-agent', taskId: args.parentTaskId, role: 'do' },
+      }));
+      (await record(args.parentTaskId, 'subtask.created', { childTaskId: child.id, title: args.title, ...(args.pullRequest ? { pullRequest: true } : {}) }));
+    }
     // Least-privilege grant (SPEC §8.2): the child's delegation caps are attenuated
     // by the parent's own grant, and its merge cap is scoped to EXACTLY the parent's
     // branch (which the parent owns and merges into). If no branch is known,
@@ -3521,6 +3552,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             ? {
                 platformRequest: (method: string, requestPath: string, body?: unknown) =>
                   turnPlatformRequest({ token, method, path: requestPath, body, signal }),
+                createSubTaskDraft: async (t: SubTaskRequest) => (await turnPlatformRequest({ token, method: 'POST',
+                  path: `/api/tasks/${encodeURIComponent(args.taskId)}/sub-tasks`, body: { title: t.title, prompt: t.prompt, params: t.params },
+                  signal }) as { id: string }).id,
               }
             : {}),
         },

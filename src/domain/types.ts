@@ -1699,7 +1699,8 @@ export interface ChildTaskSummary {
   title: string;
   workflow: string;
   /** `approvalRequests` is the gateway's projection, as on a task-list row. */
-  lastView?: Pick<TaskView, 'stage' | 'status' | 'waitingFor' | 'pointOfNoReturnPassed' | 'approvalRequests'> & { state?: { draft?: boolean } };
+  /** A draft sub-task that never ran reads `state.draft` (`queued` once queued, until its parent starts it). */
+  lastView?: Pick<TaskView, 'stage' | 'status' | 'waitingFor' | 'pointOfNoReturnPassed' | 'approvalRequests'> & { state?: { draft?: boolean; queued?: boolean } };
 }
 
 /** A task in a fork lineage, as the Agent forks and Forked from panels show it;
@@ -2023,6 +2024,8 @@ export interface TaskContinuation {
     settled: { childTaskId: string; stage: string; detail?: string }[];
     /** v1.30: branches shipped as their own pull requests. */
     shipments?: TaskShipment[];
+    /** Draft sub-tasks queued but not yet started. */
+    queued?: QueuedSubTask[];
   };
   collaborations: { pending: string[]; settled: string[] };
   consumed: string[];
@@ -2108,6 +2111,15 @@ export interface SubTaskRequest {
   title: string;
   prompt: string;
   params?: Record<string, AgentSpec>;
+  /** Save it now without starting it: a draft sub-task, started later by
+   *  `queue_task` (POST /api/tasks/:id/queue), when its parent prepares it. */
+  draft?: boolean;
+}
+
+/** A draft sub-task someone queued, for its parent to prepare and start. */
+export interface QueuedSubTask {
+  taskId: string;
+  title: string;
 }
 
 /** A parent-agent response emitted in a turn. `childTaskId` omitted ⇒ all children

@@ -30,6 +30,30 @@ function httpsUrl(sshUrl: string): string {
   return match ? `https://github.com/${match[1]}` : sshUrl;
 }
 
+/** The newest of git's progress records ("Receiving objects:  45% (…), 12.30 MiB | 1.20 MiB/s"), if any. */
+export function latestGitProgress(records: string[]): string | undefined {
+  for (let index = records.length - 1; index >= 0; index--) {
+    const record = records[index]!.replace(/^remote: /, '').trim();
+    if (/^[A-Z][a-z]+(?: [a-z]+)*: /.test(record)) return record;
+  }
+  return undefined;
+}
+
+/** Git's progress on one terminal line, as restic's is shown; nothing with --json or without a terminal. */
+function cloneProgress(out: Output, label: string) {
+  if (out.json || !process.stderr.isTTY) return undefined;
+  let pending = '';
+  return {
+    onStderr: (chunk: string) => {
+      const records = (pending + chunk).split(/[\r\n]/);
+      pending = records.pop()!;
+      const record = latestGitProgress(records);
+      if (record) process.stderr.write(`\r${`${label}: ${record}`.slice(0, (process.stderr.columns || 80) - 1)}\x1b[K`);
+    },
+    done: () => process.stderr.write('\r\x1b[K'),
+  };
+}
+
 async function cloneRepository(destination: string, repository: Manifest['repositories'][number], out: Output, viaTavya = false): Promise<boolean> {
   const root = path.dirname(destination);
   fs.mkdirSync(root, { recursive: true });
@@ -37,14 +61,21 @@ async function cloneRepository(destination: string, repository: Manifest['reposi
   // `--config` is written into the new repository before it fetches, so the clone itself uses it.
   const config = viaTavya ? tavyaCredentialConfig().flatMap((entry) => ['--config', entry]) : [];
   const url = viaTavya ? httpsUrl(repository.sshUrl) : repository.sshUrl;
-  let result = await git(root, ['clone', '--quiet', ...config, '--branch', repository.branch, url, destination]);
+  const progress = cloneProgress(out, `Cloning ${repository.name}`);
+  // Blobless: every commit and tree, but only the files of the checked-out commit; Git fetches older
+  // files when something (log -p, blame, checking out another commit) first needs them.
+  const cloneAt = (branch: string) => git(root, ['clone', progress ? '--progress' : '--quiet', '--filter=blob:none', ...config,
+    '--branch', branch, url, destination], progress ? { onStderr: progress.onStderr } : {});
+  let result = await cloneAt(repository.branch);
   if (result.code !== 0 && repository.base && repository.base !== repository.branch) {
     // A task's wiki branch exists only once the task changed its wiki.
-    result = await git(root, ['clone', '--quiet', ...config, '--branch', repository.base, url, destination]);
+    result = await cloneAt(repository.base);
   }
+  progress?.done();
   if (result.code === 0) return true;
   const output = (result.stderr || result.stdout).trim();
-  const reason = output.split('\n').slice(-2).join(' ');
+  const reason = output.split(/[\r\n]+/).filter((line) => !latestGitProgress([line]) && !line.startsWith('Cloning into '))
+    .slice(-2).join(' ');
   if (repository.role === 'project-wiki') { out.warn(`project wiki not cloned: ${reason}`); return false; }
   throw new CliError(`cloning ${repository.sshUrl} failed: ${reason}\n${!viaTavya && /access rights|Repository not found|Permission denied/i.test(output)
     ? aliasHint(repository.sshUrl) ?? GENERIC_HINT : GENERIC_HINT}`);
