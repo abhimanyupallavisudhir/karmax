@@ -91,7 +91,9 @@ const RECONNECT_DELAYS_MS = [1_000, 3_000, 10_000];
  * files it finishes, and the next connection collects its result (COLLECT)
  * instead of running it again. The client deletes a receipt only once it has
  * it, through the next command's $3: on a silent drop sshd still takes the
- * output, so the wrapper cannot tell it arrived. Leftovers older than a day go.
+ * output, so the wrapper cannot tell it arrived (`--`: an id may start with
+ * "-", and rm would read every file of the batch as options). Leftovers older
+ * than a day go.
  * Without a writable receipt directory the command just runs.
  */
 const RECEIPT_RUN = `trap '' HUP
@@ -101,7 +103,7 @@ for b in /dev/shm /tmp; do
   d=
 done
 [ -n "$d" ] && echo $$ > "$d/$1.pid" 2>/dev/null || exec sh -c "$2"
-[ -z "$3" ] || (cd "$d" && rm -f $(printf '%s.* ' $3))
+[ -z "$3" ] || (cd "$d" && rm -f -- $(printf '%s.* ' $3))
 [ -n "$3" ] || find "$d" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null
 f=$d/$1
 setsid sh -c "$2" < /dev/null > "$f.out" 2> "$f.err" &
