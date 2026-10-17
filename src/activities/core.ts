@@ -2417,10 +2417,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // provider failure to wake a world is the agent's (pramana#59: Hetzner's
         // power-on "Unknown Error" blocked the task as an agent error): it waits
         // out as infrastructure, then reaches a person, never Resolve.
-        if (error instanceof ApplicationFailure && error.type === 'world-infra') throw error;
-        const failure = classifyTurnError(error, profile.provider);
+        // A turn classifies what the provider said, not openWorld's wrapper.
+        const cause = error instanceof ApplicationFailure && error.type === 'world-infra' && error.cause ? error.cause : error;
+        const failure = classifyTurnError(cause, profile.provider);
         if (failure instanceof ApplicationFailure && failure.type === 'agent-error')
-          throw ApplicationFailure.create({ message: failure.message, type: 'world-infra', nonRetryable: false, cause: error instanceof Error ? error : undefined });
+          throw ApplicationFailure.create({ message: failure.message, type: 'world-infra', nonRetryable: false, cause: cause instanceof Error ? cause : undefined });
         throw failure;
       }
       // A cloud world's disk, before its agent starts (wiki features/computers).
