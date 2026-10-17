@@ -43,6 +43,21 @@ export class FakeHetzner {
   sshKeys: Array<{ id: number; labels: Labels }> = [];
   images: Array<{ id: number; status: string; labels: Labels }> = [];
   requests: Array<{ method: string; path: string; body?: any }> = [];
+  /** The project's limit on shared vCPU across all its servers, on or off
+   * (Hetzner Console → Limits); no API reads it. */
+  sharedCoresLimit?: number;
+  /** The project's limit on the total size of its volumes, in GB. */
+  volumesLimitGb?: number;
+  /** Server types Hetzner has none of at the moment (sold out at the location). */
+  soldOut = new Set<string>();
+  /** Server actions (`poweron`, `shutdown`…) that fail, and how many more times. */
+  failingActions = new Map<string, number>();
+  /** How many more servers boot without ever answering SSH (a broken host). */
+  deafBoots = 0;
+  /** Answers that replace the API's own, consulted first; one returning a
+   * Response is used (and stays unless it removes itself). */
+  faults: Array<(request: { method: string; path: string; body?: any }) => Response | undefined> = [];
+  private actions = new Map<number, { id: number; command: string; status: string; error?: { code: string; message: string } }>();
   private ids = 100;
   readonly root = fs.mkdtempSync(path.join(os.tmpdir(), 'fake-hetzner-'));
   readonly home = path.join(this.root, 'home');
@@ -54,12 +69,37 @@ export class FakeHetzner {
     const method = (init.method ?? 'GET').toUpperCase();
     if (new Headers(init.headers).get('authorization') !== `Bearer ${this.token}`) return json(401, { error: { code: 'unauthorized', message: 'unable to authenticate' } });
     const body = init.body ? JSON.parse(String(init.body)) : undefined;
-    this.requests.push({ method, path: url.pathname + url.search, body });
+    const request = { method, path: url.pathname + url.search, body };
+    this.requests.push(request);
+    for (const fault of this.faults) { const answer = fault(request); if (answer) return answer; }
     const parts = url.pathname.replace(/^\/v1\//, '').split('/');
     return this.route(method, parts, url.searchParams, body);
   };
 
-  private action() { return { id: ++this.ids, status: 'success' }; }
+  /** Refuse matching requests `times` times with Hetzner's error body. */
+  refuse(method: string, path: RegExp, status: number, code: string, message: string, times = 1): void {
+    const fault = (request: { method: string; path: string }) => {
+      if (request.method !== method || !path.test(request.path)) return undefined;
+      if (--times <= 0) this.faults.splice(this.faults.indexOf(fault), 1);
+      return json(status, { error: { code, message, details: {} } });
+    };
+    this.faults.push(fault);
+  }
+
+  private action(command = 'action', failed = false) {
+    const action = { id: ++this.ids, command, status: failed ? 'error' : 'success',
+      ...(failed ? { error: { code: 'unknown_error', message: 'Unknown Error' } } : {}) };
+    this.actions.set(action.id, action);
+    return { id: action.id, command, status: 'running' };
+  }
+
+  /** Whether the next `verb` action fails (Hetzner's start_server "Unknown Error", pramana#59). */
+  private fails(verb: string): boolean {
+    const left = this.failingActions.get(verb) ?? 0;
+    if (left <= 0) return false;
+    this.failingActions.set(verb, left - 1);
+    return true;
+  }
 
   private async route(method: string, parts: string[], query: URLSearchParams, body: any): Promise<Response> {
     const [kind, idText, sub, verb] = parts;
@@ -67,7 +107,8 @@ export class FakeHetzner {
     const list = <T extends { labels: Labels }>(items: T[], field: string) =>
       json(200, { [field]: items.filter((item) => matches(item.labels, query.get('label_selector'))), meta: { pagination: { next_page: null } } });
     switch (kind) {
-      case 'actions': return json(200, { action: { id, status: 'success' } });
+      case 'actions': return this.actions.has(id) ? json(200, { action: this.actions.get(id) })
+        : json(404, { error: { code: 'not_found', message: 'action not found' } });
       case 'server_types': return json(200, { server_types: TYPES, meta: { pagination: { next_page: null } } });
       case 'pricing': return json(200, { pricing: { currency: 'EUR', volume: { price_per_gb_month: { net: '0.0440' } },
         primary_ips: [{ type: 'ipv4', prices: [{ location: 'fsn1', price_hourly: { net: '0.0008' } }] }] } });
@@ -80,12 +121,16 @@ export class FakeHetzner {
       case 'images': return list(this.images, 'images');
       case 'volumes': {
         if (method === 'POST' && !idText) {
+          const used = [...this.volumes.values()].reduce((sum, entry) => sum + entry.size, 0);
+          // Hetzner's answer, verbatim from pramana#59's sub-tasks (2026-10-16): no details.
+          if (this.volumesLimitGb !== undefined && used + body.size > this.volumesLimitGb)
+            return json(403, { error: { code: 'resource_limit_exceeded', message: 'volumes size limit exceeded', details: {} } });
           const volume: FakeVolume = { id: ++this.ids, name: body.name, size: body.size, created: new Date().toISOString(), server: null,
             labels: body.labels ?? {}, location: { name: body.location }, linux_device: `/dev/disk/by-id/scsi-0HC_Volume_${this.ids}`,
             dir: path.join(this.root, `vol_${this.ids}`) };
           fs.mkdirSync(volume.dir);
           this.volumes.set(volume.id, volume);
-          return json(201, { volume: strip(volume), action: this.action() });
+          return json(201, { volume: strip(volume), action: this.action('create_volume') });
         }
         if (!idText) return list([...this.volumes.values()].map(strip), 'volumes');
         const volume = this.volumes.get(id);
@@ -98,8 +143,11 @@ export class FakeHetzner {
         }
         if (method === 'POST' && sub === 'actions' && verb === 'resize') {
           if (body.size <= volume.size) return json(422, { error: { code: 'invalid_input', message: 'size must grow' } });
+          const used = [...this.volumes.values()].reduce((sum, entry) => sum + entry.size, 0);
+          if (this.volumesLimitGb !== undefined && used - volume.size + body.size > this.volumesLimitGb)
+            return json(403, { error: { code: 'resource_limit_exceeded', message: 'volumes size limit exceeded', details: {} } });
           volume.size = body.size;
-          return json(201, { action: this.action() });
+          return json(201, { action: this.action('resize_volume') });
         }
         return json(200, { volume: strip(volume) });
       }
@@ -108,6 +156,15 @@ export class FakeHetzner {
           if (!TYPES.some((type) => type.name === body.server_type)) return json(422, { error: { code: 'invalid_input', message: 'unknown server type' } });
           const where = TYPES.find((type) => type.name === body.server_type).locations?.find((entry: any) => entry.name === body.location);
           if (where && where.available === false) return json(422, { error: { code: 'invalid_input', message: 'unsupported location for server type' } });
+          const type = TYPES.find((entry) => entry.name === body.server_type);
+          if (this.soldOut.has(type.name))
+            return json(412, { error: { code: 'resource_unavailable', message: 'error during placement', details: {} } });
+          const sharedInUse = [...this.servers.values()].filter((entry) => entry.server_type.cpu_type === 'shared')
+            .reduce((sum, entry) => sum + entry.server_type.cores, 0);
+          // Hetzner's answer, verbatim from pramana#58 (2026-10-15).
+          if (this.sharedCoresLimit !== undefined && type.cpu_type === 'shared' && sharedInUse + type.cores > this.sharedCoresLimit)
+            return json(403, { error: { code: 'resource_limit_exceeded', message: 'shared core limit exceeded',
+              details: { limits: [{ name: 'server_shared_cores_limit' }] } } });
           const server: FakeServer = { id: ++this.ids, name: body.name, status: 'initializing', created: new Date().toISOString(),
             labels: body.labels ?? {}, server_type: TYPES.find((type) => type.name === body.server_type), volumes: body.volumes ?? [],
             ip: `10.0.0.${this.ids % 250}`, userData: body.user_data, datacenter: { location: { name: body.location } } };
@@ -118,7 +175,7 @@ export class FakeHetzner {
           }
           this.servers.set(server.id, server);
           if (body.start_after_create !== false) await this.boot(server);
-          return json(201, { server: this.view(server), action: this.action(), root_password: body.ssh_keys?.length ? null : 'secret' });
+          return json(201, { server: this.view(server), action: this.action('create_server'), root_password: body.ssh_keys?.length ? null : 'secret' });
         }
         if (!idText) return list([...this.servers.values()].map((server) => this.view(server)), 'servers');
         const server = this.servers.get(id);
@@ -127,14 +184,15 @@ export class FakeHetzner {
           await this.halt(server);
           for (const volume of this.volumes.values()) if (volume.server === id) volume.server = null;
           this.servers.delete(id);
-          return json(200, { action: this.action() });
+          return json(200, { action: this.action('delete_server') });
         }
         if (method === 'PUT') { server.labels = body.labels ?? server.labels; return json(200, { server: this.view(server) }); }
         if (method === 'POST' && sub === 'actions') {
+          if (this.fails(verb!)) return json(201, { action: this.action(verb, true) });
           if (verb === 'shutdown' || verb === 'poweroff') await this.halt(server);
           else if (verb === 'poweron') await this.boot(server);
           else if (verb === 'create_image') this.images.push({ id: ++this.ids, status: 'available', labels: body.labels ?? {} });
-          return json(201, { action: this.action() });
+          return json(201, { action: this.action(verb) });
         }
         return json(200, { server: this.view(server) });
       }
@@ -159,6 +217,7 @@ export class FakeHetzner {
       fs.rmSync(this.home, { force: true });
       fs.symlinkSync(this.volumes.get(server.volumes[0])!.dir, this.home);
     }
+    if (this.deafBoots > 0) { this.deafBoots--; server.status = 'running'; return; }
     server.sshd = await startLocalSshd({ hostKey: { privateKey: hostPrivate, publicKey: `${parsed.type} ${parsed.getPublicSSH().toString('base64')}` },
       clientKey: { privateKey: '', publicKey: files.get('/etc/karmax/authorized_keys')!.trim() } });
     server.status = 'running';

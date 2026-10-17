@@ -1,3 +1,9 @@
+import { notPullRequestSql, pullRequestOf, type PullRequestOf } from '../domain/pull-requests.js';
+
+/** A task as a list row or a notification names it. */
+export interface TaskHeader { id: string; num?: number; title: string; projectId: string; status?: string; stage?: string;
+  /** Set when the row is a pull request of its task (SPEC §11.1): the header is its task's. */
+  pullRequest?: { taskId: string; checkout: string } }
 import { applyComputer, normalizeComputer, type ComputerSpec } from '../domain/computer.js';
 import { AdmissionBackpressureError } from '../domain/admission-error.js';
 import { utf8Tail } from '../util/utf8-tail.js';
@@ -134,14 +140,18 @@ export interface ViewPublicationOrder {
 
 type TaskSummaryRow = { id: string; num: number | null; title: string; workflow: string; lastView: string | null };
 
-/** A related task's list fields, without its conversation. */
-function taskSummary(row: TaskSummaryRow): ChildTaskSummary {
+/** A related task's list fields, without its conversation. `params` tells a
+ * draft that never ran (a draft sub-task), which has no view of its own. */
+function taskSummary(row: TaskSummaryRow, params?: string | Record<string, unknown>): ChildTaskSummary {
   const view = row.lastView ? JSON.parse(row.lastView) as TaskView : undefined;
+  const fields = !view && params ? (typeof params === 'string' ? JSON.parse(params) : params) as Record<string, unknown> : undefined;
   return {
     id: row.id,
     ...(row.num != null ? { num: row.num } : {}),
     title: row.title,
     workflow: row.workflow,
+    ...(fields?.draft ? { lastView: { stage: 'setup', status: 'waiting',
+      state: { draft: true, ...(fields._queuedAt ? { queued: true } : {}) } } } : {}),
     ...(view ? { lastView: {
       stage: view.stage,
       status: view.status,
@@ -195,6 +205,18 @@ const PRUNE_OUTPUT_STATUS = new Set<string>(['done', 'cancelled']);
  * recovery resumes them still waiting on their requests.
  */
 const WITHDRAW_REQUESTS_STATUS = new Set<string>(['done', 'cancelled']);
+
+/** Approval asks, the events that decide them, and the events that only silence
+ * them (a person ignored the ask; the task still waits on it). As SQL lists. */
+const sqlList = (types: string[]) => types.map((type) => `'${type}'`).join(', ');
+const APPROVAL_ASKS = sqlList(['credential.approval-requested', 'permission.approval-requested',
+  'authorization.approval-requested', 'connection.requested']);
+const APPROVAL_DECISION_TYPES = ['credential.approval-resolved', 'connection.resolved',
+  'permission.approval-resolved', 'authorization.approval-resolved'];
+const APPROVAL_DISMISSAL_TYPES = ['credential.approval-dismissed', 'permission.approval-dismissed',
+  'authorization.approval-dismissed', 'connection.dismissed'];
+const APPROVAL_DECISIONS = sqlList(APPROVAL_DECISION_TYPES);
+const APPROVAL_SILENCERS = sqlList([...APPROVAL_DECISION_TYPES, ...APPROVAL_DISMISSAL_TYPES]);
 
 /**
  * Does an event type mean "a human is being asked to review this"? Such events
@@ -3875,7 +3897,8 @@ export class Store {
     }
     for (const itemId of credentialIds((t.params._authorization as any)?.capabilities)) selections[itemId] ??= t.createdAt;
     await this.db.prepare('UPDATE tasks SET credentialSelections = ? WHERE id = ?').run(JSON.stringify(selections), t.id);
-    if (!input.intentId && !input.params.draft) t.num = (await this.allocateTaskNum(t.projectId, t.id));
+    // A pull request of its task (SPEC §11.1) is part of it, not a numbered task.
+    if (!input.intentId && !input.params.draft && !pullRequestOf(t)) t.num = (await this.allocateTaskNum(t.projectId, t.id));
     if (t.createdBy?.kind === 'user') (await this.subscribeTask(t.id, t.createdBy));
     if (t.assignee) (await this.subscribeTask(t.id, t.assignee));
     if (!input.intentId) {
@@ -3923,7 +3946,7 @@ export class Store {
     const rows = (await this.db.prepare(`SELECT t.*, COALESCE(t.num, root.num) AS resolvedNum FROM tasks t
       JOIN task_intents i ON i.id=t.intentId AND i.principalAttemptId=t.id
       JOIN tasks root ON root.id=i.id
-      WHERE t.projectId=? ORDER BY root.ord,root.createdAt`).all(projectId)) as any[];
+      WHERE t.projectId=? AND ${notPullRequestSql(this.db.dialect)} ORDER BY root.ord,root.createdAt`).all(projectId)) as any[];
     return (await this.attachTags(projectId, rows.map(rowToTask)));
   }
 
@@ -3947,7 +3970,7 @@ export class Store {
       FROM tasks t
       JOIN task_intents i ON i.id=t.intentId AND i.principalAttemptId=t.id
       JOIN tasks root ON root.id=i.id
-      WHERE t.projectId=? ORDER BY root.ord,root.createdAt`).all(projectId)) as any[];
+      WHERE t.projectId=? AND ${notPullRequestSql(this.db.dialect)} ORDER BY root.ord,root.createdAt`).all(projectId)) as any[];
     return (await this.attachTags(projectId, rows.map(rowToTask)));
   }
 
@@ -3978,7 +4001,7 @@ export class Store {
       : ` AND ${draft}` : '';
     const identities = await this.readRows<{ id: string }>(`SELECT i.id FROM tasks t
       JOIN task_intents i ON i.id=t.intentId AND i.principalAttemptId=t.id
-      JOIN tasks root ON root.id=i.id WHERE t.projectId=?${this.taskArchivePredicate(options.includeArchived ?? true)}${narrowed}
+      JOIN tasks root ON root.id=i.id WHERE t.projectId=? AND ${notPullRequestSql(this.db.dialect)}${this.taskArchivePredicate(options.includeArchived ?? true)}${narrowed}
       ORDER BY root.ord, root.createdAt, root.id`, [projectId, ...(candidates ?? []), ...(candidates ?? [])]);
     for (let offset = 0; offset < identities.length; offset += 200) {
       const ids = identities.slice(offset, offset + 200).map(row => row.id);
@@ -4010,7 +4033,7 @@ export class Store {
       throw new Error('limit must be 1–200 and offset must be a non-negative integer');
     const selection = intentIds ? ` AND i.id IN (${intentIds.map(() => '?').join(',')})` : '';
     const from = `FROM tasks t JOIN task_intents i ON i.id=t.intentId AND i.principalAttemptId=t.id
-      JOIN tasks root ON root.id=i.id WHERE t.projectId=?${this.taskArchivePredicate(options.includeArchived)}${selection}`;
+      JOIN tasks root ON root.id=i.id WHERE t.projectId=? AND ${notPullRequestSql(this.db.dialect)}${this.taskArchivePredicate(options.includeArchived)}${selection}`;
     const params = [projectId, ...(intentIds ?? [])];
     const projection = includeConversation ? 't.*' : `t.id, t.num, t.projectId, t.listId, t.title, t.workflow,
       t.executionWorkflow, t.workflowVersion, t.params, t.createdAt, t.statusChangedAt, t.ord, t.parentTaskId,
@@ -4234,11 +4257,11 @@ export class Store {
   /** Each child's list fields, archived children included, for its parent's
    * Sub-tasks panel (`TaskView.subTaskSummaries`). */
   async childTaskSummaries(parentTaskId: string): Promise<ChildTaskSummary[]> {
-    const rows = await this.readRows<TaskSummaryRow>(
+    const rows = await this.readRows<TaskSummaryRow & { params: string }>(
       // Children spawned in one turn share a millisecond and ids end in random
       // bytes; `ord` is the list position allocated at insert on both databases.
-      'SELECT id, num, title, workflow, lastView FROM tasks WHERE parentTaskId = ? ORDER BY createdAt, ord, rowid', [parentTaskId]);
-    return rows.map(taskSummary);
+      'SELECT id, num, title, workflow, lastView, params FROM tasks WHERE parentTaskId = ? ORDER BY createdAt, ord, rowid', [parentTaskId]);
+    return rows.map((row) => taskSummary(row, row.params));
   }
 
   /** Every task forked from this one's agents, forks of forks included, archived
@@ -5029,9 +5052,12 @@ export class Store {
     const rows = (await this.db.prepare(`SELECT taskId, kind, createdAt FROM inbox WHERE userId=? AND organizationId=?
       AND kind<>'update' AND (actionable=1 OR unread=1) AND subject IS NULL ORDER BY urgency DESC, createdAt DESC`)
       .all(userId, organizationId)) as Array<{ taskId: string; kind: string; createdAt: number }>;
+    // A pull request's ask is its task's (SPEC §11.1): it is the task that waits on them.
+    const headers = await this.taskHeaders(rows.map((row) => String(row.taskId)));
     const out = new Map<string, AttentionAsk>();
     for (const row of rows) {
-      const ask = out.get(String(row.taskId)) ?? out.set(String(row.taskId), { kinds: [], at: 0 }).get(String(row.taskId))!;
+      const taskId = headers.get(String(row.taskId))?.id ?? String(row.taskId);
+      const ask = out.get(taskId) ?? out.set(taskId, { kinds: [], at: 0 }).get(taskId)!;
       ask.kinds.push(String(row.kind));
       ask.at = Math.max(ask.at, Number(row.createdAt));
     }
@@ -5044,16 +5070,35 @@ export class Store {
    * exact allocation pattern `listTaskSummaries` documents as pushing a few
    * hundred tasks past 1 GiB RSS. Project the six fields the panel renders.
    */
-  async taskHeaders(taskIds: string[]): Promise<Map<string, { id: string; num?: number; title: string; projectId: string; status?: string; stage?: string }>> {
-    const out = new Map<string, { id: string; num?: number; title: string; projectId: string; status?: string; stage?: string }>();
+  async taskHeaders(taskIds: string[]): Promise<Map<string, TaskHeader>> {
+    const out = new Map<string, TaskHeader>();
+    const pullRequests = new Map<string, PullRequestOf>();
     (await chunked([...new Set(taskIds)], async (chunk) => {
-      const rows = (await this.db.prepare(`SELECT id, num, title, projectId,
-        json_extract(lastView, '$.status') status, json_extract(lastView, '$.stage') stage
+      const rows = (await this.db.prepare(`SELECT id, num, title, projectId, parentTaskId,
+        json_extract(lastView, '$.status') status, json_extract(lastView, '$.stage') stage,
+        json_extract(params, '$._shippedFrom') shippedFrom
         FROM tasks WHERE id IN (${chunk.map(() => '?').join(',')})`).all(...chunk)) as any[];
-      for (const row of rows) out.set(String(row.id), { id: String(row.id),
-        ...(row.num == null ? {} : { num: Number(row.num) }), title: String(row.title), projectId: String(row.projectId),
-        ...(row.status ? { status: String(row.status) } : {}), ...(row.stage ? { stage: String(row.stage) } : {}) });
+      for (const row of rows) {
+        out.set(String(row.id), { id: String(row.id),
+          ...(row.num == null ? {} : { num: Number(row.num) }), title: String(row.title), projectId: String(row.projectId),
+          ...(row.status ? { status: String(row.status) } : {}), ...(row.stage ? { stage: String(row.stage) } : {}) });
+        const shippedFrom = typeof row.shippedFrom === 'string' ? JSON.parse(row.shippedFrom) : row.shippedFrom;
+        const of = pullRequestOf({ parentTaskId: row.parentTaskId ?? undefined, params: { _shippedFrom: shippedFrom } });
+        if (of) pullRequests.set(String(row.id), of);
+      }
     }));
+    // A pull request of a task (SPEC §11.1) is presented as that task: what it
+    // asks is asked as its task's, and opening it opens its task.
+    if (pullRequests.size) {
+      const parents = await this.taskHeaders([...new Set([...pullRequests.values()].map((of) => of.taskId))]);
+      for (const [id, of] of pullRequests) {
+        const parent = parents.get(of.taskId);
+        const own = out.get(id)!;
+        if (parent) out.set(id, { ...parent, title: `${parent.title} · pull request "${of.checkout}"`,
+          ...(own.status ? { status: own.status } : {}), ...(own.stage ? { stage: own.stage } : {}),
+          pullRequest: { taskId: id, checkout: of.checkout } });
+      }
+    }
     return out;
   }
 
@@ -5332,12 +5377,11 @@ export class Store {
   /** Approval asks on a task that no `*.approval-resolved` event has answered. */
   private async hasPendingApprovals(taskId: string, includeDismissed = false): Promise<boolean> {
     return Boolean((await this.db.prepare(`SELECT 1 FROM events e
-      WHERE e.taskId=? AND e.type IN ('credential.approval-requested', 'permission.approval-requested', 'authorization.approval-requested', 'connection.requested')
+      WHERE e.taskId=? AND e.type IN (${APPROVAL_ASKS})
         AND NOT EXISTS (SELECT 1 FROM events r WHERE r.taskId=e.taskId
-          AND r.type IN ('credential.approval-resolved', 'connection.resolved', 'permission.approval-resolved', 'authorization.approval-resolved', 'permission.approval-dismissed', 'authorization.approval-dismissed')
-          AND (?=0 OR r.type NOT IN ('permission.approval-dismissed', 'authorization.approval-dismissed'))
+          AND r.type IN (${includeDismissed ? APPROVAL_DECISIONS : APPROVAL_SILENCERS})
           AND json_extract(r.payload, '$.requestId') = json_extract(e.payload, '$.requestId'))
-      LIMIT 1`).get(taskId, includeDismissed ? 1 : 0)));
+      LIMIT 1`).get(taskId)));
   }
 
   /**
@@ -5370,9 +5414,7 @@ export class Store {
     const escalated = ev.type === 'view.updated' && ev.payload.stage === 'escalated' && !finished;
 
     // ── Discharge: drop what the task no longer needs from anybody ───────────
-    if (ev.type === 'credential.approval-resolved' || ev.type === 'connection.resolved' || ev.type === 'permission.approval-resolved'
-      || ev.type === 'authorization.approval-resolved' || ev.type === 'permission.approval-dismissed'
-      || ev.type === 'authorization.approval-dismissed') {
+    if (APPROVAL_DECISION_TYPES.includes(ev.type) || APPROVAL_DISMISSAL_TYPES.includes(ev.type)) {
       if (!(await this.hasPendingApprovals(task.id))) (await this.deleteInbox("taskId=? AND kind='approval-requested'", [task.id]));
       return;
     }
@@ -5512,9 +5554,9 @@ export class Store {
     if ((await this.db.prepare("SELECT 1 FROM inbox WHERE kind='approval-requested' LIMIT 1").get())) {
       dropped += (await this.deleteInbox(`subject IS NULL AND kind='approval-requested' AND taskId NOT IN (
         SELECT e.taskId FROM events e
-        WHERE e.type IN ('credential.approval-requested', 'permission.approval-requested', 'authorization.approval-requested', 'connection.requested')
+        WHERE e.type IN (${APPROVAL_ASKS})
           AND NOT EXISTS (SELECT 1 FROM events r WHERE r.taskId=e.taskId
-            AND r.type IN ('credential.approval-resolved', 'connection.resolved', 'permission.approval-resolved', 'authorization.approval-resolved', 'permission.approval-dismissed', 'authorization.approval-dismissed')
+            AND r.type IN (${APPROVAL_SILENCERS})
             AND json_extract(r.payload, '$.requestId') = json_extract(e.payload, '$.requestId')))`, []));
     }
     (await this.backfillEscalations());
@@ -7314,6 +7356,15 @@ export class Store {
   }
 
   /** True when the file was there to delete. */
+  /** Remove a repository's lock files not rewritten since `before`: restic
+   * refreshes a live lock every 5 minutes and counts one 30 minutes old as
+   * stale, yet still refuses to work beside it until `restic unlock`. */
+  async expireRepositoryLocks(repository: string, before: number): Promise<number> {
+    const result = (await this.db.prepare("DELETE FROM resource_repository_files WHERE repository=? AND kind='locks' AND createdAt < ?")
+      .run(repository, before)) as { changes?: number };
+    return Number(result?.changes ?? 0);
+  }
+
   async deleteRepositoryFile(repository: string, kind: string, name: string): Promise<boolean> {
     const result = (await this.db.prepare('DELETE FROM resource_repository_files WHERE repository=? AND kind=? AND name=?')
       .run(repository, kind, name)) as { changes?: number };
@@ -9722,12 +9773,10 @@ export class Store {
       viewSnapshots, publicationFences, turnSessions, permissionRequests,
       events: Number((await this.db.prepare(`DELETE FROM events WHERE seq IN
         (SELECT e.seq FROM events e WHERE e.ts<?
-          AND (e.type NOT IN ('credential.approval-requested', 'permission.approval-requested',
-            'authorization.approval-requested', 'connection.requested')
+          -- An ignored ask is still pending, so only a decision lets it age out.
+          AND (e.type NOT IN (${APPROVAL_ASKS})
             OR EXISTS (SELECT 1 FROM events r WHERE r.taskId=e.taskId
-              AND r.type IN ('credential.approval-resolved', 'permission.approval-resolved',
-                'authorization.approval-resolved', 'connection.resolved',
-                'permission.approval-dismissed', 'authorization.approval-dismissed')
+              AND r.type IN (${APPROVAL_DECISIONS})
               AND json_extract(r.payload, '$.requestId')=json_extract(e.payload, '$.requestId')))
           -- The newest published head per repository is state: force-with-lease
           -- reads it (expectedTaskRemoteHeads), however long the task was idle (audit R-8).

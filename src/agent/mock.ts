@@ -16,6 +16,8 @@ import { SUB_TASK_ACTIONS, type SubTaskAction } from '../domain/types.js';
  *   @run <command...>               run a shell command in the world
  *   @subtask <title> :: <prompt>    spawn a child task (\n in <prompt> decoded to newlines)
  *   @subtaskwith <json> :: <title> :: <prompt>
+ *   @draftsubtask <title> :: <prompt>  save a draft sub-task (create_sub_task draft: true)
+ *   @queue <taskId>                 start a draft (the queue_task tool); a refusal is output
  *                                   spawn a child task with create_sub_task `params`
  *   @branch <name> [:: <base>]      add another branch/PR to this task (multi-PR)
  *   @ship <name> [:: <title>]       open that branch's PR on its own now (open_pr with branch)
@@ -166,6 +168,17 @@ export class MockAdapter implements AgentAdapter {
             if (directive !== 'subtaskwith') throw e;
             outputs.push(`subtask refused: ${e?.message ?? e}`);
           }
+          break;
+        }
+        case 'draftsubtask': {
+          const [title, prompt = ''] = splitOn(rest, '::');
+          outputs.push(await platformToolHandlers(input.world, ctx).create_sub_task!({ title: title.trim(),
+            prompt: prompt.trim().replace(/\\n/g, '\n'), draft: true }));
+          break;
+        }
+        case 'queue': {
+          try { outputs.push(await platformToolHandlers(input.world, ctx).queue_task!({ task_id: rest.trim() })); }
+          catch (e: any) { outputs.push(`queue refused: ${e?.message ?? e}`); }
           break;
         }
         case 'branch': {
@@ -437,6 +450,19 @@ export class MockAdapter implements AgentAdapter {
         }
       }
       outputs.push('repaired target race');
+    }
+    // A resource conflict handed to the agent (resource-file-merge.ts): a
+    // competent agent combines each file; this one takes the other version,
+    // then marks it resolved.
+    for (const [, copies, folder] of initialText.matchAll(/This task's cop(?:y is|ies are in) (\S+)\. In (\S+): base\//g)) {
+      const single = !initialText.includes(`This task's copies are in ${copies}.`);
+      await input.world.exec('bash', ['-c', `set -e; cd -- "$2"
+while IFS= read -r p; do [ -n "$p" ] || continue
+  if [ "$3" = 1 ]; then d="$1"; else d="$1/$p"; fi
+  if [ -e "other/$p" ]; then mkdir -p -- "$(dirname -- "$d")"; cp -f -- "other/$p" "$d"; else rm -f -- "$d"; fi
+done < unresolved
+: > unresolved`, 'combine', copies!, folder!, single ? '1' : '0'], { cwd: input.world.handle.root });
+      outputs.push(`combined resource files in ${copies}`);
     }
     // Catch any follow-up that landed near the end of the turn (or during a non-sleep
     // turn) — process it in-flight rather than deferring it to the next turn.

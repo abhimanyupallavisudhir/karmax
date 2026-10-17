@@ -4,11 +4,14 @@ import { PlatformToolContext } from './types.js';
 import { parseTransition } from '../resolve/transitions.js';
 import { MAX_REVIEW_TEXT_LENGTH, ReviewInfoRejected, validateReviewInfoCall } from './review-info.js';
 import { World } from '../world/types.js';
+import { continuedReply } from '../domain/forks.js';
+import { applicableSubTaskActions } from '../domain/sub-task-responses.js';
 import { readWorldFilePrefix } from '../world/file-prefix.js';
 import { startJob, jobStatuses, describeJobs, listJobs, stopJobs, MAX_JOB_NAME } from '../world/jobs.js';
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
 import {
   PLATFORM_REQUEST_BODY_SCHEMA, PRIORITY_NAMES, AGENT_ROLE_NAMES, CREATE_TASK_GRANTS, REQUEST_FOR_TASK,
+  QUEUE_TASK_DESCRIPTION, queuedTaskReply,
   compactSearch, compactOrganizationSearch, compactTags, normalizeRequestBody, platformRequestPathError,
 } from '../platform/platform-request.js';
 import { SUB_TASK_ACTIONS, URGENCY_LEVELS, type AgentWait, type SubTaskAction, type Urgency } from '../domain/types.js';
@@ -135,16 +138,23 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     name: 'create_sub_task',
     description:
       'Delegate to a child task. It branches off your current work and merges back into YOUR branch (not main), and YOU are its confirmer: when it reaches Review or gets stuck it will raise to you (surfaced as a message) and you answer with respond_to_sub_task. It starts when your current turn ends, and first saves this task\'s writable project data for it to start from: stop anything writing into it (a server, a job, an open SQLite database) before you call it, or the save fails and no sub-task is created. You manage your children to completion before you finish. '
-      + 'It runs your agent unless `params` choose another: create_task\'s task-form fields, e.g. {"agent:do": {"provider": "codex", "model": "gpt-5.5", "effort": "high"}} or {"agent:do": {"avatarId": "…"}}. Only the agent fields can be set; the branch, project and authorization stay yours. An invalid or unavailable choice is refused and nothing is created.',
+      + 'It runs your agent unless `params` choose another: create_task\'s task-form fields, e.g. {"agent:do": {"provider": "codex", "model": "gpt-5.5", "effort": "high"}} or {"agent:do": {"avatarId": "…"}}. Only the agent fields can be set; the branch, project and authorization stay yours. An invalid or unavailable choice is refused and nothing is created. '
+      + 'With `draft: true` it is saved now and not started, and its task id returned: start it later with queue_task (people can also start it from your Sub-tasks). It then branches off your work as it is at that moment. Plan many sub-tasks as drafts and start them in batches when they should not all run at once (e.g. a cloud provider\'s machine limits).',
     parameters: {
       type: 'object',
       properties: {
         title: { type: 'string' },
         prompt: { type: 'string' },
         params: { type: 'object', description: 'Task-form agent fields for the child (e.g. "agent:do"), as in create_task; omit to run your agent.' },
+        draft: { type: 'boolean', description: 'Save it without starting it; start it later with queue_task.' },
       },
       required: ['title', 'prompt'],
     },
+  },
+  {
+    name: 'queue_task',
+    description: QUEUE_TASK_DESCRIPTION,
+    parameters: { type: 'object', properties: { task_id: { type: 'string' } }, required: ['task_id'] },
   },
   {
     name: 'respond_to_sub_task',
@@ -1185,14 +1195,29 @@ export function platformToolHandlers(
       return 'review info recorded';
     },
     async create_sub_task(args) {
-      await ctx.createSubTask({ title: String(args?.title ?? 'sub-task'), prompt: String(args?.prompt ?? ''),
-        ...(args?.params !== undefined ? { params: args.params } : {}) });
-      return 'sub-task queued: it starts when this turn ends (branches off your work; you are its confirmer)';
+      const draft = args?.draft === true;
+      const id = await ctx.createSubTask({ title: String(args?.title ?? 'sub-task'), prompt: String(args?.prompt ?? ''),
+        ...(args?.params !== undefined ? { params: args.params } : {}), ...(draft ? { draft } : {}) });
+      return draft
+        ? `draft sub-task ${id} saved, not started: start it with queue_task("${id}") (you are its confirmer)`
+        : 'sub-task queued: it starts when this turn ends (branches off your work; you are its confirmer)';
+    },
+    async queue_task(args) {
+      const id = String(args?.task_id ?? '');
+      return queuedTaskReply(await platformRequest('POST', `/api/tasks/${encodeURIComponent(id)}/queue`, {}) as Parameters<typeof queuedTaskReply>[0], id);
     },
     async respond_to_sub_task(args) {
       const action = String(args?.action ?? '');
       if (!(SUB_TASK_ACTIONS as readonly string[]).includes(action))
         return `invalid action — use ${SUB_TASK_ACTIONS.join(' | ')}`;
+      // An answer its wait cannot act on would leave it, and this task, waiting.
+      if (args?.child_task_id && ctx.platformRequest) {
+        const child = await Promise.resolve(ctx.platformRequest('GET', `/api/tasks/${encodeURIComponent(String(args.child_task_id))}`))
+          .catch(() => undefined) as Parameters<typeof applicableSubTaskActions>[0] | undefined;
+        const applicable = child?.stage ? applicableSubTaskActions(child) : undefined;
+        if (applicable && !applicable.includes(action as SubTaskAction))
+          return `"${action}" does not apply now: that sub-task is at ${child!.stage === 'escalated' || child!.status === 'blocked' ? 'a failed step' : child!.stage === 'review' ? 'Review' : 'the end of a turn'}. Answer with ${applicable.join(' | ')}.`;
+      }
       await ctx.respondToSubTask({
         childTaskId: args?.child_task_id ? String(args.child_task_id) : undefined,
         action: action as SubTaskAction,
@@ -1625,8 +1650,8 @@ export function platformToolHandlers(
     },
     async message_agent(args) {
       const taskId = encodeURIComponent(String(args?.task_id ?? ''));
-      await platformRequest('POST', `/api/tasks/${taskId}/messages`, { role: args?.role ?? 'do', text: args?.message });
-      return 'message delivered';
+      const sent = await platformRequest('POST', `/api/tasks/${taskId}/messages`, { role: args?.role ?? 'do', text: args?.message }) as { continuedIn?: { id: string; num?: number } } | undefined;
+      return continuedReply(sent?.continuedIn);
     },
     async request_agent_action(args) {
       return JSON.stringify(await platformRequest('POST', '/api/agent/collaboration/request', {

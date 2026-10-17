@@ -196,7 +196,7 @@ test('opening a notification marks it read in its own organization before naviga
   b.ctx.projectById = () => ({ id: 'project' });
   b.ctx.projectBase = () => '/personal/project';
   b.ctx.go = async url => { requests.push(url); };
-  vm.runInContext(['markInboxItemReadLocally', 'openInboxItem'].map(extractFn).join('\n'), b.ctx);
+  vm.runInContext(['markInboxItemReadLocally', 'markInboxItemRead', 'inboxItemRoute', 'openInboxItem'].map(extractFn).join('\n'), b.ctx);
   await b.ctx.openInboxItem(item);
   assert.equal(item.unread, false);
   assert.deepEqual(requests, ['/api/inbox/a?organizationId=personal', '/personal/project/tasks/7']);

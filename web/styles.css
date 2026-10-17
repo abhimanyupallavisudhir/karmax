@@ -855,6 +855,7 @@ a.git-repo-name:hover { color:var(--accent); }
 #task-notes:focus { background: var(--surface); }
 .rail-links { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: 10px 12px 0; border-top: 1px solid var(--line); }
 .rail-link { justify-content: flex-start; }
+.rail-link-count { font-family: var(--font-mono); font-size: 11px; color: var(--ink-3); }
 /* The shell, last: a quiet row like the links above it. */
 .rail-links .ck-terminal-item { align-self: stretch; margin: 0; border-radius: var(--r-sm); font-size: 12.5px; }
 .rail-links .ck-terminal-open { padding: 5px 6px 5px 4px; }
@@ -1051,10 +1052,14 @@ a.git-repo-name:hover { color:var(--accent); }
   appearance: none; width: 100%; display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto;
   align-items: center; gap: 13px; min-height: 64px; padding: 10px 12px;
   border: 0; border-top: 1px solid var(--line); border-radius: 8px;
-  background: transparent; color: var(--ink); text-align: left; cursor: pointer;
+  background: transparent; color: var(--ink); text-align: left; text-decoration: none; cursor: pointer;
   transition: background .12s, transform .04s;
 }
 .subtask-row:first-child { border-top-color: transparent; }
+.subtask-draft { display: flex; align-items: center; gap: 8px; border-top: 1px solid var(--line); }
+.subtask-draft:first-child { border-top-color: transparent; }
+.subtask-draft > .subtask-row { flex: 1; min-width: 0; border-top: 0; }
+.subtask-draft > .btn { flex: none; margin-right: 8px; }
 .subtask-row:hover { background: var(--surface-2); }
 .subtask-row:active { transform: translateY(1px); }
 .subtask-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
@@ -1664,7 +1669,7 @@ a.ins-task-title:hover { color: var(--accent); }
   box-shadow: 0 8px 24px rgba(0,0,0,0.14); padding: 4px;
 }
 .combo-menu[hidden] { display: none; }
-.combo-opt { padding: 7px 10px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+.combo-opt { display: block; padding: 7px 10px; border-radius: 6px; cursor: pointer; font-size: 13px; color: inherit; text-decoration: none; }
 .combo-opt.active { background: var(--accent-weak); }
 .combo-opt-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
 .combo-opt-head span { min-width: 0; font-weight: 550; }
@@ -1699,7 +1704,7 @@ a.ins-task-title:hover { color: var(--accent); }
 .palette-scrim { position: fixed; inset: 0; background: rgba(20,24,34,.3); z-index: 70; display: grid; place-items: start center; padding-top: 14vh; }
 .palette { width: min(560px, 92vw); background: var(--surface); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); overflow: hidden; }
 .palette input { width: 100%; padding: 14px 16px; border: 0; border-bottom: 1px solid var(--line); outline: none; background: transparent; font-size: 15px; }
-.palette .opt { padding: 10px 16px; cursor: pointer; display: flex; align-items: center; gap: 10px; }
+.palette .opt { padding: 10px 16px; cursor: pointer; display: flex; align-items: center; gap: 10px; color: inherit; text-decoration: none; }
 .palette .opt.active { background: var(--accent-weak); }
 .palette .opt.danger { color: var(--danger); }
 .palette .opt .key { margin-left: auto; font-family: var(--font-mono); font-size: 11px; color: var(--ink-3); border: 1px solid var(--line); border-radius: 5px; padding: 1px 6px; white-space: nowrap; }
@@ -2961,6 +2966,7 @@ html[data-theme="dark"] .github-signin-btn:active,
 .vault-grant-item { display: flex; gap: 12px; align-items: center; padding: 7px 5px; }
 .vault-grant-item[hidden], .vault-manager-item[hidden], .vault-grant-empty[hidden] { display: none !important; }
 .vault-grant-item:hover { background: var(--surface-2); border-radius: 6px; }
+.vault-grant-item.active { background: var(--accent-weak); border-radius: 6px; scroll-margin: 8px 0; }
 .vault-grant-choice { display: flex; flex: 1; min-width: 180px; gap: 8px; align-items: flex-start; cursor: pointer; }
 .vault-grant-choice > input { margin-top: 2px; }
 .vault-grant-item-text { min-width: 0; display: flex; flex-direction: column; gap: 1px; font-size: 12px; }
@@ -2981,6 +2987,7 @@ html[data-theme="dark"] .github-signin-btn:active,
 .vault-manager-list { min-height: 90px; max-height: 62vh; overflow-y: auto; border: 1px solid var(--line); border-radius: 8px; }
 .vault-manager-item { margin: 0; border: 0; border-radius: 0; border-bottom: 1px solid var(--line); padding: 10px; flex-wrap: wrap; }
 .vault-manager-item:last-of-type { border-bottom: 0; }
+.vault-manager-item.active { background: var(--accent-weak); }
 .vault-reveal-panel { flex-basis: 100%; padding: 10px; border-radius: 7px; background: var(--surface-2); display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .vault-reveal-panel[hidden], .vault-reveal-value[hidden] { display: none !important; }
 .vault-reveal-value { flex-basis: 100%; min-width: 0; }

@@ -38,6 +38,7 @@ import { REPOSITORY_ROUTE, RepositoryTokens, ResourceRepositoryServer, parseRepo
 import { RESTIC_ENGINE, ROOT_PART, ResticResources, isParted, isPartsCapture, partsTotals, resticRef, storedRef, type Parts, type PartsCapture,
   type Repository, type ResticCapture, type ResticPlace } from './restic-engine.js';
 import { ResourceConflictError } from './resource-conflict.js';
+import { applyMerged, clearMerge, conflictKind, mergeFiles, type FileMerge } from './resource-file-merge.js';
 import { installTool, mergeParts, partChanges, readFetched, readGrant, readManifest, removeGrants, saveParts, topLevel,
   writeFetched, writeGrant, writeManifest } from './resource-on-demand.js';
 
@@ -95,7 +96,8 @@ const PUBLISH_ATTEMPTS = 3;
 
 interface ChangeCount { added: number; modified: number; deleted: number }
 /** What a sub-task's delivery brought into its parent's world, or the files that conflict. */
-export interface ResourceRefresh extends ChangeCount { attachmentId: string; name: string; path: string; revisionId: string; conflicts?: string[] }
+export interface ResourceRefresh extends ChangeCount { attachmentId: string; name: string; path: string; revisionId: string; conflicts?: string[];
+  /** How the agent combines the conflicting files. */ guide?: string }
 
 /** A sub-task's output waiting for its parent's world (kv `resource-delivery:<parent>:<attachment>:<sub-task>`):
  * its changes to a fork, relative to `baseRevisionId`, or a proposed output. */
@@ -650,7 +652,7 @@ export class ProjectResourceService {
     const fields = this.restic.revisionFields({ parts: split.parts, ...partsTotals(split.parts), added: 0, fresh: split.fresh }, repository);
     if (await this.store.partResourceRevision(revision.id, revision.sealedRef, fields)) return split.parts;
     // Split by someone else meanwhile.
-    await this.restic.forgetUnreferenced(repository, split.fresh);
+    await this.restic.discard(repository, split.fresh);
     const again = await this.store.getResourceRevision(revision.id);
     const parts = again && storedRef(again).parts;
     if (!parts) throw new Error(`resource "${attachment.name}" changed while it was being split into parts; try again`);
@@ -987,8 +989,11 @@ export class ProjectResourceService {
     if (!attachment) return;
     // An on-demand version's unchanged parts are other versions' too.
     const ref = storedRef(revision);
-    await this.restic.forgetUnreferenced(this.restic.of(attachment, revision),
-      ref.snapshot ? [ref.snapshot] : Object.values(ref.parts ?? {}).map((part) => part.snapshot));
+    const repository = this.restic.of(attachment, revision);
+    const snapshots = ref.snapshot ? [ref.snapshot] : Object.values(ref.parts ?? {}).map((part) => part.snapshot);
+    // Now, so its space is freed at the next prune; a save holding the
+    // repository leaves it to upkeep.
+    await this.restic.forgetUnreferenced(repository, snapshots).catch(() => this.restic.discard(repository, snapshots));
   }
 
   /** Hourly upkeep of the resource repositories: forget snapshots no version
@@ -996,14 +1001,15 @@ export class ProjectResourceService {
    * that freed, and move a batch of versions saved before restic into it
    * (10 GiB a run: the bytes pass through this host). */
   async maintainRepositories(now = Date.now(), options: { convertBytes?: number } = {}): Promise<{ forgotten: number; pruned: number; converted: number }> {
-    let forgotten = 0;
+    // What saves discarded first: known to be unneeded, it need not wait a day.
+    let forgotten = await this.restic.forgetDiscarded((name) => this.repositoryNamed(name));
     const byRepository = new Map<string, string[]>();
     for (const snapshot of await this.store.unreferencedRepositorySnapshots(now - 24 * 3_600_000))
       byRepository.set(snapshot.repository, [...byRepository.get(snapshot.repository) ?? [], snapshot.name]);
     for (const [name, snapshots] of byRepository) {
       const repository = await this.repositoryNamed(name);
-      if (!repository) continue;
-      try { await this.restic.forget(repository, snapshots); forgotten += snapshots.length; }
+      if (!repository || await this.restic.saveInProgress(repository)) continue;
+      try { forgotten += await this.restic.forget(repository, snapshots); }
       catch (error) { console.warn(`resource repository ${name}: could not forget unused versions: ${message(error)}`); }
     }
     const converted = await this.convertLegacyRevisions(options.convertBytes ?? 10 * 2 ** 30);
@@ -1017,6 +1023,7 @@ export class ProjectResourceService {
       const repository = await this.repositoryNamed(key.slice('restic-prune:'.length));
       if (!repository) { await this.store.kvDelete(key); continue; }
       // A save holding the repository makes this wait for the next run.
+      if (await this.restic.saveInProgress(repository)) continue;
       try { await this.restic.prune(repository); pruned++; }
       catch (error) { console.warn(`resource repository ${repository.name}: prune deferred: ${message(error)}`); }
     }
@@ -1053,7 +1060,7 @@ export class ProjectResourceService {
       changed = true;
     }
     const used = new Set(Object.values(parts).map((part) => part.snapshot));
-    await restic.forget(repository, split.fresh.filter((id) => !used.has(id)));
+    await restic.discard(repository, split.fresh.filter((id) => !used.has(id)));
     return { capture: { parts, ...partsTotals(parts), added: base ? added : capture.added, fresh: split.fresh.filter((id) => used.has(id)) }, changed };
   }
 
@@ -1092,7 +1099,7 @@ export class ProjectResourceService {
         if (await this.store.convertResourceRevision(revision.id, revision.sealedRef, fields)) {
           await this.engine.delete?.(revision, attachment);
           converted++; bytes += revision.bytes;
-        } else await restic.forget(repository, [capture.snapshot]);
+        } else await restic.discard(repository, [capture.snapshot]);
       } catch (error) {
         console.warn(`resource revision ${revision.id}: not converted to restic yet: ${message(error)}`);
       } finally { await fs.promises.rm(scratch, { recursive: true, force: true }); }
@@ -1268,7 +1275,7 @@ export class ProjectResourceService {
     if (parent) {
       const changes = await restic.diff(repository, parent, capture.snapshot);
       if (changes.added + changes.modified + changes.deleted === 0) {
-        await restic.forget(repository, [capture.snapshot]);
+        await restic.discard(repository, [capture.snapshot]);
         return undefined;
       }
     }
@@ -1441,8 +1448,9 @@ export class ProjectResourceService {
   async settleReview(taskId: string, work: ResourceWork = {}): Promise<void> {
     // A parent publishes what its sub-tasks handed it too: anything still
     // waiting for its world goes in first, and a conflict stops publication.
-    const conflicted = (await this.takeDeliveries(taskId, work)).find((delivery) => delivery.conflicts);
-    if (conflicted) throw new ResourceConflictError(conflicted.path, conflicted.conflicts!, 'a sub-task');
+    const conflicted = (await this.takeDeliveries(taskId, work)).filter((delivery) => delivery.conflicts);
+    if (conflicted.length) throw ResourceConflictError.combine(conflicted.map((delivery) =>
+      new ResourceConflictError(delivery.path, delivery.conflicts!, 'a sub-task', delivery.guide)));
     const selection = await this.store.resourceReview(taskId, { freeze: true });
     const excluded = new Set(selection.excluded);
     const principal = `task:${taskId}:confirmation`;
@@ -1472,6 +1480,8 @@ export class ProjectResourceService {
       if (excluded.has(resource.id)) { await this.discard(taskId, resource.id); continue; }
       forks.push(resource);
     }
+    // Every resource is tried: the agent combines all their conflicts at once.
+    const conflicts: ResourceConflictError[] = [];
     for (const [index, resource] of forks.entries()) {
       await work.checkContinue?.();
       // One save per resource: the snapshot taken to see what changed is the
@@ -1481,10 +1491,12 @@ export class ProjectResourceService {
       const { summary } = inspection;
       if (summary.added + summary.modified + summary.deleted > 0 && parent?.forks.has(resource.id))
         await this.deliver(taskId, resource, inspection, parent.taskId);
-      else if (!summary.promoted && summary.added + summary.modified + summary.deleted > 0)
-        await this.promoteReviewed(taskId, resource.id, inspection, { keepOwn: work.keepOwn });
-      else await this.discardCapture(inspection.repository, inspection.capture);
+      else if (!summary.promoted && summary.added + summary.modified + summary.deleted > 0) {
+        try { await this.promoteReviewed(taskId, resource.id, inspection, { keepOwn: work.keepOwn }); }
+        catch (error) { if (!(error instanceof ResourceConflictError)) throw error; conflicts.push(error); }
+      } else await this.discardCapture(inspection.repository, inspection.capture);
     }
+    if (conflicts.length) throw ResourceConflictError.combine(conflicts);
   }
 
   /** The parent of a sub-task whose world is still to receive output, and
@@ -1600,7 +1612,7 @@ export class ProjectResourceService {
       } catch (error) {
         if (!(error instanceof ResourceConflictError)) throw error;
         taken.push({ ...report, path: (report as Partial<ResourceRefresh>).path ?? attachment.name,
-          revisionId: (report as Partial<ResourceRefresh>).revisionId ?? '', conflicts: error.paths });
+          revisionId: (report as Partial<ResourceRefresh>).revisionId ?? '', conflicts: error.paths, ...(error.guide ? { guide: error.guide } : {}) });
       }
     }
     return taken;
@@ -1629,7 +1641,8 @@ export class ProjectResourceService {
     const { attachment, world, lease, target, handle } = await this.worldResource(taskId, attachmentId);
     // What changed is relative to the version the copy forked from (a
     // sub-task's: its parent's copy), also once restored from a park's capture.
-    const forkedId = await this.ownForkPoint(taskId, lease.revisionId);
+    // Or from the newest version merged into it before Review.
+    const forkedId = await this.integratedBase(taskId, handle, lease, attachmentId) ?? await this.ownForkPoint(taskId, lease.revisionId);
     const started = forkedId ? await this.store.getResourceRevision(forkedId) : undefined;
     const restoredFrom = lease.revisionId && lease.revisionId !== forkedId ? await this.store.getResourceRevision(lease.revisionId) : started;
     const label = attachment.target.kind === 'path' ? locationLabel(attachment.target) : attachment.name;
@@ -1748,7 +1761,8 @@ export class ProjectResourceService {
       const captured = await this.capture({ world, path: resourceAbsolutePath(handle, attachment), file: fileShaped(attachment) },
         attachment, baseline, { key: `checkpoint:${lease.id}`, quota: false, checkContinue, ...progress });
       const revisionId = !captured && baseline ? baseline.id : (await this.store.saveResourceRevision({ attachmentId: attachment.id,
-        parentRevisionId: lease.revisionId, ...captured!.fields, metadata: { checkpoint: true }, createdByTaskId: lease.taskId })).id;
+        parentRevisionId: lease.revisionId, ...captured!.fields, metadata: { checkpoint: true, ...carriedIntegration(baseline, lease.taskId) },
+        createdByTaskId: lease.taskId })).id;
       (await this.store.kvSet(baselineKey, JSON.stringify({ leaseId: lease.id, revisionId })));
       refs.push({ attachmentId: attachment.id, revisionId });
     }
@@ -1800,8 +1814,8 @@ export class ProjectResourceService {
     revisionId?: string): Promise<string> {
     const unchanged = saved.baseline && sameParts(saved.base, saved.capture.parts);
     const id = revisionId ?? (unchanged ? saved.baseline!.id : (await this.store.saveResourceRevision({ attachmentId: attachment.id,
-      parentRevisionId: lease.revisionId, ...this.restic.revisionFields(saved.capture, saved.repository), metadata: { checkpoint: true },
-      createdByTaskId: lease.taskId })).id);
+      parentRevisionId: lease.revisionId, ...this.restic.revisionFields(saved.capture, saved.repository),
+      metadata: { checkpoint: true, ...carriedIntegration(saved.baseline, lease.taskId) }, createdByTaskId: lease.taskId })).id);
     await this.store.kvSet(`resource-checkpoint:${handle.id}:${attachment.id}`, JSON.stringify({ leaseId: lease.id, revisionId: id }));
     await this.store.kvSet(`resource-fetched:${lease.taskId}:${attachment.id}`, JSON.stringify([...saved.fetched].sort()));
     await writeFetched(world, attachment.id, saved.fetched);
@@ -1818,17 +1832,16 @@ export class ProjectResourceService {
     if (held) await this.store.kvSet(`resource-fetched:${taskId}:${attachmentId}`, JSON.stringify([...held].sort()));
   }
 
-  /** Forget the snapshots a save made that no version came to name. */
+  /** Leave the snapshots a save made that no version came to name for upkeep to forget. */
   private async discardCapture(repository: Repository, capture: ResticCapture | PartsCapture): Promise<void> {
-    if (isPartsCapture(capture)) await this.restic.forgetUnreferenced(repository, capture.fresh);
-    else await this.restic.forget(repository, [capture.snapshot]);
+    await this.restic.discard(repository, isPartsCapture(capture) ? capture.fresh : [capture.snapshot]);
   }
 
   /** {@link mergePublished} for a copy saved in parts. */
   private async mergeWorldParts(place: { world: World; path: string }, attachment: ResourceAttachment, repository: Repository,
     baseId: string | undefined, currentId: string | undefined, mine: PartsCapture, held: Set<string>,
     options: { key: string; quota: boolean; checkContinue?: () => Promise<void>; applied?: ChangeCount; source?: string;
-      keepOwn?: boolean; kept?: Set<string>; ownChangesOnly?: boolean }): Promise<{ merged?: PartsCapture | 'none'; fetched: Set<string> }> {
+      keepOwn?: boolean; kept?: Set<string>; merged?: Set<string>; ownChangesOnly?: boolean }): Promise<{ merged?: PartsCapture | 'none'; fetched: Set<string> }> {
     const [base, current] = await Promise.all([baseId ? this.store.getResourceRevision(baseId) : undefined,
       currentId ? this.store.getResourceRevision(currentId) : undefined]);
     const here = (revision: ResourceRevision | undefined) => revision?.engine === RESTIC_ENGINE && this.restic.of(attachment, revision).name === repository.name;
@@ -1838,7 +1851,7 @@ export class ProjectResourceService {
     const [baseParts, currentParts] = [base ? await this.partsOf(attachment, base) : {}, await this.partsOf(attachment, current)];
     if (options.ownChangesOnly && sameParts(baseParts, mine.parts)) return { merged: 'none', fetched: held };
     const label = attachment.target.kind === 'path' ? path.posix.basename(attachment.target.path) : attachment.name;
-    const result = await mergeParts(this.restic, place, repository, baseParts, currentParts, mine.parts, held, { ...options, label });
+    const result = await mergeParts(this.restic, place, repository, baseParts, currentParts, mine.parts, held, { ...options, label, theirsId: currentId });
     return { ...(result.merged ? { merged: result.merged } : {}), fetched: result.fetched };
   }
 
@@ -1910,7 +1923,7 @@ export class ProjectResourceService {
     if (parent) {
       const changes = await this.restic.diff(repository, parent, snapshot);
       if (changes.added + changes.modified + changes.deleted === 0) {
-        await this.restic.forget(repository, [snapshot]);
+        await this.restic.discard(repository, [snapshot]);
         return { revision: baseline, unchanged: true };
       }
       added = changes.bytes;
@@ -1941,7 +1954,7 @@ export class ProjectResourceService {
     const bytes = files.reduce((sum, file) => sum + file.bytes, 0);
     const stored = await this.storedCapture(attachment, repository, { snapshot, files: files.length, bytes, added: bytes }, baseline);
     if (!stored.changed && baseline) {
-      if (isPartsCapture(stored.capture)) await this.restic.forgetUnreferenced(repository, stored.capture.fresh);
+      if (isPartsCapture(stored.capture)) await this.restic.discard(repository, stored.capture.fresh);
       return { revision: baseline, unchanged: true };
     }
     let revision: ResourceRevision;
@@ -2026,7 +2039,8 @@ export class ProjectResourceService {
     // serialized operation is the tiny baseline pointer CAS, so a multi-GB
     // upload cannot block another publication merely while bytes are moving.
     const { summary, repository, capture } = inspection ?? await this.inspect(taskId, attachmentId);
-    const forkedId = await this.ownForkPoint(taskId, lease.revisionId);
+    const integrated = await this.integratedBase(taskId, handle, lease, attachmentId);
+    const forkedId = integrated ?? await this.ownForkPoint(taskId, lease.revisionId);
     const started = forkedId ? await this.store.getResourceRevision(forkedId) : undefined;
     // Identical to what the world started from: there is nothing to publish.
     if (started?.attachmentId === attachment.id && summary.added + summary.modified + summary.deleted === 0) {
@@ -2034,28 +2048,29 @@ export class ProjectResourceService {
       return { attachment, revision: started, summary };
     }
     const place = { world, path: target, file: fileShaped(attachment) };
-    let base = await this.mergeBase(taskId, attachment.currentRevisionId, await this.forkPoint(lease.revisionId));
+    let base = await this.mergeBase(taskId, attachment.currentRevisionId, integrated ?? await this.forkPoint(lease.revisionId));
     let saved = capture;
     // The parts the world holds (a merge may fetch more).
     let held = isPartsCapture(capture) ? (await readFetched(world, attachmentId)) ?? new Set(Object.keys(capture.parts)) : undefined;
     const kept = new Set<string>();
+    const merged = new Set<string>();
     for (let attempt = 1; ; attempt++) {
       // Whatever other tasks (a sibling sub-task, say) published since this
       // world forked is merged in, so publications combine instead of refusing.
       const currentId = (await this.requiredAttachment(attachmentId)).currentRevisionId;
       if (currentId !== base) {
-        const merging = { key: `publish:${lease.id}:${attempt}`, quota: true, ownChangesOnly: true, keepOwn: choice.keepOwn, kept };
-        let merged: ResticCapture | PartsCapture | 'none' | undefined;
+        const merging = { key: `publish:${lease.id}:${attempt}`, quota: true, ownChangesOnly: true, keepOwn: choice.keepOwn, kept, merged };
+        let combined: ResticCapture | PartsCapture | 'none' | undefined;
         if (isPartsCapture(saved)) {
           const result = await this.mergeWorldParts(place, attachment, repository, base, currentId, saved, held!, merging);
-          merged = result.merged; held = result.fetched;
-        } else merged = await this.mergePublished(place, repository, base, currentId, saved.snapshot, merging);
-        if (merged === 'none') {
+          combined = result.merged; held = result.fetched;
+        } else combined = await this.mergePublished(place, repository, base, currentId, saved.snapshot, merging);
+        if (combined === 'none') {
           // Everything here was published already (by this task, before others built on it).
           await this.discardCapture(repository, capture);
           return { attachment: (await this.requiredAttachment(attachmentId)), revision: (await this.store.getResourceRevision(currentId!))!, summary };
         }
-        if (merged) saved = merged;
+        if (combined) saved = combined;
         base = currentId;
       }
       const revision = (await this.store.saveResourceRevision({ attachmentId, parentRevisionId: base,
@@ -2065,7 +2080,8 @@ export class ProjectResourceService {
           const promoted = (await this.store.promoteResourceRevision(attachmentId, revision.id, base));
           (await this.store.appendAudit({ principalId: `task:${taskId}`, action: 'resource:promote',
             scopeKey: `project:${attachment.projectId}`, detail: { attachmentId, from: base, to: revision.id, summary,
-              ...(kept.size ? { keptOwn: kept.size, keptOwnPaths: [...kept].slice(0, 100) } : {}) } }));
+              ...(kept.size ? { keptOwn: kept.size, keptOwnPaths: [...kept].slice(0, 100) } : {}),
+              ...(merged.size ? { lineMerged: merged.size, lineMergedPaths: [...merged].slice(0, 100) } : {}) } }));
           return { attachment: promoted, revision, summary };
         });
         // The world holds what it published: later saves (after a follow-up) start from it.
@@ -2091,6 +2107,7 @@ export class ProjectResourceService {
       /** Who made the changes brought in, for a conflict's message. */ source?: string;
       /** Keep this copy's version of a file both changed differently; such files are added to `kept`. */
       keepOwn?: boolean; kept?: Set<string>;
+      /** Files merged line by line are added to it. */ merged?: Set<string>;
       /** Merge nothing into a copy without changes of its own: answer `none`. */ ownChangesOnly?: boolean }): Promise<ResticCapture | 'none' | undefined> {
     const label = path.posix.basename(place.path);
     const [base, current] = await Promise.all([baseId ? this.store.getResourceRevision(baseId) : undefined,
@@ -2106,30 +2123,44 @@ export class ProjectResourceService {
       restic.changeSet(repository, baseSnapshot, mine)]);
     if (options.ownChangesOnly && !ours.files.size) return 'none';
     const both = [...theirs.files.keys()].filter((file) => ours.files.has(file));
+    let fileMerge: FileMerge | undefined;
     if (both.length) {
       const differing = (await restic.changeSet(repository, currentSnapshot, mine)).files;
       const conflicts = both.filter((file) => differing.has(file));
-      if (conflicts.length && !options.keepOwn) throw new ResourceConflictError(label, conflicts, options.source);
-      // Kept: the loop below brings in only files this copy did not change.
-      for (const file of conflicts) options.kept?.add(file);
+      if (conflicts.length && !options.keepOwn) {
+        // Merged line by line, else combined by the agent (whose copy is then kept).
+        fileMerge = await mergeFiles(restic, place, repository, [{ base: baseSnapshot, theirs: currentSnapshot, mine,
+          files: conflicts.map((file) => ({ path: file, kind: conflictKind(theirs.files.get(file), ours.files.get(file)) })) }],
+        { ...options, key: `${options.key}:files`, label, theirsId: currentId });
+        for (const file of conflicts) if (fileMerge.resolved.has(file)) options.kept?.add(file);
+      } else for (const file of conflicts) options.kept?.add(file);
+      // The loop below brings in only files this copy did not change.
     }
     const paths: string[] = []; const deletions: string[] = [];
     for (const [file, change] of theirs.files) {
-      if (ours.files.has(file)) continue; // the same change is already here
+      if (ours.files.has(file)) continue; // the same change is already here, or merged
       (change === '-' ? deletions : paths).push(file);
       if (options.applied) options.applied[change === '+' ? 'added' : change === 'M' ? 'modified' : 'deleted']++;
     }
-    if (!paths.length && !deletions.length) return undefined;
+    if (!paths.length && !deletions.length && !fileMerge?.merged.size) {
+      await clearMerge(place.world, repository.attachment.id);
+      return undefined;
+    }
     await options.checkContinue?.();
-    if (place.file) await restic.restore(place, repository, currentSnapshot, options);
-    else await restic.applyPaths(place, repository, currentSnapshot,
+    if (place.file && (paths.length || deletions.length)) await restic.restore(place, repository, currentSnapshot, options);
+    else if (paths.length || deletions.length) await restic.applyPaths(place, repository, currentSnapshot,
       { paths, deletions, removedDirectories: theirs.removedDirectories, addedDirectories: theirs.addedDirectories, own: ours }, options);
+    if (fileMerge) {
+      await applyMerged(place, fileMerge);
+      for (const file of fileMerge.merged.keys()) options.merged?.add(file);
+    }
     const merged = await restic.backup(place, repository, { ...options, key: `${options.key}:save`, parent: mine });
     // The merge is right only if it differs from the published version
     // exactly where this world's own changes are.
     const stray = [...(await restic.changeSet(repository, currentSnapshot, merged.snapshot)).files.keys()]
       .filter((file) => !ours.files.has(file));
     if (stray.length) throw new Error(`${label} changed while newer published changes were merged into it (${stray.slice(0, 3).join(', ')}); try again`);
+    await clearMerge(place.world, repository.attachment.id);
     return merged;
   }
 
@@ -2146,6 +2177,76 @@ export class ProjectResourceService {
       id = revision.parentRevisionId;
     }
     return id;
+  }
+
+  /** The published version merged into a world's copy before Review
+   * ({@link integratePublished}), if any: its latest capture names it. */
+  private async integratedBase(taskId: string, handle: WorldHandle, lease: { id: string; revisionId?: string }, attachmentId: string)
+    : Promise<string | undefined> {
+    const integrated = carriedIntegration(await this.worldBase(handle, lease, attachmentId), taskId).integrated;
+    return integrated && (await this.store.getResourceRevision(integrated))?.attachmentId === attachmentId ? integrated : undefined;
+  }
+
+  /** Before Review, as a branch takes in its target: merge into a world's
+   * copy of each writable resource what was published since it forked, so
+   * Review shows the copy as it would be published, its changes are measured
+   * from the newest version, and conflicts reach the agent while it works. A
+   * copy that conflicts is reported, untouched. A sub-task's copy of its
+   * parent's resource is left alone: its parent publishes it. */
+  async integratePublished(taskId: string, work: { checkContinue?: () => Promise<void> } = {}): Promise<ResourceRefresh[]> {
+    const handle = (await this.store.currentWorld(taskId)) as WorldHandle | undefined;
+    if (!handle) return [];
+    const parent = await this.parentWorld(taskId);
+    const reports: ResourceRefresh[] = [];
+    const going = work.checkContinue ? { checkContinue: work.checkContinue } : {};
+    for (const lease of await this.store.listResourceLeases(handle.id, handle.generation ?? 1)) {
+      await work.checkContinue?.();
+      if (lease.state !== 'active') continue;
+      const attachment = await this.store.getResourceAttachment(lease.attachmentId);
+      if (!attachment || !isSnapshotDriver(attachment.driver) || attachment.publish !== 'review' || attachment.access !== 'write'
+        || attachment.isolation !== 'fork' || attachment.target.kind !== 'path' || parent?.forks.has(attachment.id)) continue;
+      const currentId = attachment.currentRevisionId;
+      const integrated = await this.integratedBase(taskId, handle, lease, attachment.id);
+      const base = await this.mergeBase(taskId, currentId, integrated ?? await this.forkPoint(lease.revisionId));
+      if (!currentId || currentId === base) continue;
+      const { world, target } = await this.worldResource(taskId, attachment.id);
+      const report: ResourceRefresh = { attachmentId: attachment.id, name: attachment.name, path: locationLabel(attachment.target),
+        revisionId: currentId, added: 0, modified: 0, deleted: 0 };
+      const key = `integrate:${lease.id}:${currentId}`;
+      const merging = { key: `${key}:merge`, quota: false, applied: report, ...going };
+      const marked = { checkpoint: true, integrated: currentId };
+      try {
+        const baseline = await this.worldBase(handle, lease, attachment.id);
+        if (await this.partedWorld(handle, attachment, baseline)) {
+          const mine = await this.saveWorldParts(world, handle, lease, attachment, baseline, { key, quota: false, ...going });
+          const result = await this.mergeWorldParts({ world, path: target }, attachment, mine.repository, base, currentId,
+            mine.capture, mine.fetched, merging);
+          const capture = result.merged && result.merged !== 'none' ? result.merged : mine.capture;
+          const revision = await this.store.saveResourceRevision({ attachmentId: attachment.id, parentRevisionId: lease.revisionId,
+            ...this.restic.revisionFields(capture, mine.repository), metadata: marked, createdByTaskId: taskId });
+          await this.recordWorld(world, handle, lease, attachment, { ...mine, capture, fetched: result.fetched }, revision.id);
+        } else {
+          const repository = await this.restic.current(attachment);
+          const place = { world, path: target, file: fileShaped(attachment) };
+          const parentSnapshot = this.parentIn(repository, baseline);
+          const mine = await this.restic.backup(place, repository, { key, quota: false, ...(parentSnapshot ? { parent: parentSnapshot } : {}), ...going });
+          const merged = await this.mergePublished(place, repository, base, currentId, mine.snapshot, merging);
+          const capture = merged && merged !== 'none' ? merged : mine;
+          const revision = await this.store.saveResourceRevision({ attachmentId: attachment.id, parentRevisionId: lease.revisionId,
+            ...this.restic.revisionFields(capture, repository), metadata: marked, createdByTaskId: taskId });
+          await this.store.kvSet(`resource-checkpoint:${handle.id}:${attachment.id}`, JSON.stringify({ leaseId: lease.id, revisionId: revision.id }));
+        }
+        (await this.store.appendAudit({ principalId: `task:${taskId}`, action: 'resource:integrate',
+          scopeKey: `project:${attachment.projectId}`, detail: { ...report } }));
+      } catch (error) {
+        // A version in another repository (moved, or not converted yet) is merged at publication.
+        if (/baseline changed/.test(message(error))) continue;
+        if (!(error instanceof ResourceConflictError)) throw error;
+        Object.assign(report, { conflicts: error.paths, ...(error.guide ? { guide: error.guide } : {}) });
+      }
+      reports.push(report);
+    }
+    return reports;
   }
 
   /** The version a world's copy started from as this task saw it: through
@@ -2482,4 +2583,11 @@ async function takeProgress(store: ProgressStore, key: Buffer | undefined, attac
       ? { ids: head.held.map(([id]) => id), storageLocationId: head.storageLocationId } : { ids: [] };
   }
   throw new Error('resource capture progress kept changing');
+}
+
+/** A capture's record of the published version merged into the copy before
+ * Review, carried on by the next capture of the same task. */
+function carriedIntegration(revision: ResourceRevision | undefined, taskId: string): { integrated?: string } {
+  const integrated = revision?.createdByTaskId === taskId ? revision.metadata?.integrated : undefined;
+  return typeof integrated === 'string' ? { integrated } : {};
 }

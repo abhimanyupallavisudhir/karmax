@@ -10,7 +10,7 @@ function fn(name) {
   return src.slice(start, end + 2);
 }
 test('UI-1: stored tag kinds cannot escape class attributes', () => {
-  const ctx = vm.createContext({ tagById: () => ({ kind: 'flag" onclick="alert(1)' }), tagPathStr: () => '<tag>' });
+  const ctx = vm.createContext({ tagById: () => ({ kind: 'flag" onclick="alert(1)' }), tagPathStr: () => '<tag>', tagSectionRoute: () => '/acme/web?q=group:tag' });
   vm.runInContext(src.slice(src.indexOf('const esc ='), src.indexOf('\n\n', src.indexOf('const esc ='))) + '\n' + fn('tagChips'), ctx);
   assert.match(ctx.tagChips({ tags: ['tag'] }), /flag&quot; onclick=&quot;/);
   assert.doesNotMatch(src, /\$\{(?:tag|t)\.kind \|\| ''\}/);

@@ -2,8 +2,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { ResourceChangeSummary } from '../domain/types.js';
-import { ResourceConflictError } from './resource-conflict.js';
-import { ROOT_PART, partsTotals, validPartName, type ChangeSet, type Parts, type PartsCapture, type Repository,
+import { applyMerged, clearMerge, conflictKind, mergeFiles, type ConflictGroup, type FileMerge } from './resource-file-merge.js';
+import { ROOT_PART, partOf, partsTotals, validPartName, type ChangeSet, type Parts, type PartsCapture, type Repository,
   type ResticResources, type ResticRunOptions } from './restic-engine.js';
 import type { World } from './types.js';
 import { isRemoteWorldKind } from './types.js';
@@ -162,7 +162,7 @@ export async function saveParts(restic: ResticResources, place: { world: World; 
       { ...options, key: `${options.key}:${name}`, ...(prior ? { parent: prior.snapshot } : {}) });
     if (prior) {
       const changes = await restic.diff(repository, prior.snapshot, capture.snapshot);
-      if (changes.added + changes.modified + changes.deleted === 0) { await restic.forget(repository, [capture.snapshot]); continue; }
+      if (changes.added + changes.modified + changes.deleted === 0) { await restic.discard(repository, [capture.snapshot]); continue; }
     }
     parts[name] = { snapshot: capture.snapshot, files: capture.files, bytes: capture.bytes };
     fresh.push(capture.snapshot);
@@ -212,7 +212,7 @@ export interface PartsMerge {
 export async function mergeParts(restic: ResticResources, place: { world: World; path: string }, repository: Repository,
   base: Parts, theirs: Parts, mine: Parts, fetched: Set<string>,
   options: ResticRunOptions & { quota: boolean; applied?: { added: number; modified: number; deleted: number }; source?: string;
-    keepOwn?: boolean; kept?: Set<string>; label: string }): Promise<PartsMerge> {
+    keepOwn?: boolean; kept?: Set<string>; merged?: Set<string>; label: string; theirsId?: string }): Promise<PartsMerge> {
   const held = new Set(fetched);
   const result: Parts = {};
   const fresh: string[] = [];
@@ -223,7 +223,7 @@ export async function mergeParts(restic: ResticResources, place: { world: World;
   };
   // Conflicts are found in every part before any is touched.
   const plans: Array<{ name: string; theirs: ChangeSet; ours: ChangeSet }> = [];
-  const conflicts: string[] = [];
+  const conflicts: ConflictGroup[] = [];
   const names = [...new Set([...Object.keys(base), ...Object.keys(theirs), ...Object.keys(mine)])].sort();
   for (const name of names) {
     const b = base[name]?.snapshot; const t = theirs[name]?.snapshot; const o = mine[name]?.snapshot;
@@ -233,17 +233,19 @@ export async function mergeParts(restic: ResticResources, place: { world: World;
     const both = [...theirsChange.files.keys()].filter((file) => oursChange.files.has(file));
     if (both.length) {
       const differing = (await partChangeSet(restic, repository, t, o)).files;
-      for (const file of both.filter((candidate) => differing.has(candidate))) {
-        conflicts.push(file);
-        options.kept?.add(file);
-      }
+      const files = both.filter((candidate) => differing.has(candidate))
+        .map((file) => ({ path: file, kind: conflictKind(theirsChange.files.get(file), oursChange.files.get(file)) }));
+      if (files.length) conflicts.push({ base: b, theirs: t, mine: o, files });
     }
     plans.push({ name, theirs: theirsChange, ours: oursChange });
   }
+  // Merged line by line, else combined by the agent (whose copy is then kept).
+  let fileMerge: FileMerge | undefined;
   if (conflicts.length && !options.keepOwn) {
-    for (const file of conflicts) options.kept?.delete(file);
-    throw new ResourceConflictError(options.label, conflicts, options.source);
-  }
+    fileMerge = await mergeFiles(restic, place, repository, conflicts, { ...options, key: `${options.key}:files` });
+    for (const file of fileMerge.resolved) options.kept?.add(file);
+  } else for (const group of conflicts) for (const file of group.files) options.kept?.add(file.path);
+  const mergedIn = (name: string) => [...fileMerge?.merged ?? []].filter(([file]) => partOf(file) === name);
   for (const name of names) {
     const b = base[name]?.snapshot; const t = theirs[name]?.snapshot; const o = mine[name]?.snapshot;
     if (t === b || t === o || o !== b) continue;
@@ -268,7 +270,8 @@ export async function mergeParts(restic: ResticResources, place: { world: World;
       if (plan.ours.files.has(file)) continue;
       (kind === '-' ? deletions : paths).push(file);
     }
-    if (!paths.length && !deletions.length) { if (mine[name]) result[name] = mine[name]!; continue; }
+    const lineMerged = mergedIn(name);
+    if (!paths.length && !deletions.length && !lineMerged.length) { if (mine[name]) result[name] = mine[name]!; continue; }
     if (options.applied) for (const file of paths) options.applied[plan.theirs.files.get(file) === '+' ? 'added' : 'modified']++;
     if (options.applied) options.applied.deleted += deletions.length;
     // Merged in the world: it needs this copy's version of the part on its disk.
@@ -280,6 +283,10 @@ export async function mergeParts(restic: ResticResources, place: { world: World;
     if (t) await restic.applyPaths(place, repository, t, { paths, deletions, removedDirectories: plan.theirs.removedDirectories,
       addedDirectories: plan.theirs.addedDirectories, own: plan.ours }, { ...options, key: `${options.key}:${name}:apply` });
     else await removeEntries(place, deletions);
+    if (lineMerged.length) {
+      await applyMerged(place, { merged: new Map(lineMerged), resolved: new Set() });
+      for (const [file] of lineMerged) options.merged?.add(file);
+    }
     const disk = await topLevel(place.world, place.path);
     const entries = name === ROOT_PART ? disk.loose : disk.folders.includes(name) ? [name] : [];
     if (!entries.length) { held.delete(name); changed = true; continue; }
@@ -292,6 +299,7 @@ export async function mergeParts(restic: ResticResources, place: { world: World;
     fresh.push(saved.snapshot);
     changed = true;
   }
+  await clearMerge(place.world, repository.attachment.id);
   return { ...(changed ? { merged: { parts: result, ...partsTotals(result), added: 0, fresh } } : {}), fetched: held };
 }
 

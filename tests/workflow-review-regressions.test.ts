@@ -51,7 +51,8 @@ vi.mock('@temporalio/workflow', async (importOriginal) => ({
 }));
 import { justDoV1_7 } from '../src/workflows/just-do.js';
 import { mergeOnlyV1_7 } from '../src/workflows/merge-only.js';
-import { softwareDevV1_20, softwareDevV1_26, softwareDevV1_27, softwareDevV1_28, subtaskRaiseText } from '../src/workflows/software-dev.js';
+import { softwareDevV1_20, softwareDevV1_26, softwareDevV1_27, softwareDevV1_28, softwareDevV1_29, subtaskRaiseText } from '../src/workflows/software-dev.js';
+import { ActivityFailure, ApplicationFailure, RetryState } from '@temporalio/common';
 import { createAgentTurnLeaser } from '../src/workflows/agent-turn-lease.js';
 import { makeTurnPreparationActivities } from '../src/activities/turn-preparation.js';
 
@@ -809,7 +810,7 @@ describe('WF-37: a failed merge-only or just-do run releases its world', () => {
 // only "finished: failed".
 describe('resource publication by sub-tasks', () => {
   const child = { ...input, taskId: 'child', parentTaskId: 'parent' };
-  const conflict = 'raw_data: a file was changed both by this task and in a newer published version (index.txt). Keep one version: rename or remove this task\'s copy.';
+  const conflict = 'raw_data: a file was changed both by this task and in a newer published version (index.txt).';
 
   function reviewAndConfirm() {
     wf.activities.accountPoolSize.mockResolvedValue(0);
@@ -860,9 +861,11 @@ describe('resource publication by sub-tasks', () => {
       wf.handlers.get('keepOwnResources')!();
     };
     const result = await softwareDevV1_27(child);
-    expect(escalated.actions.map((a: any) => a.name)).toEqual(expect.arrayContaining(['retry', 'keepOwnResources']));
+    // Publishing again would be refused the same way: no Retry.
+    expect(escalated.actions.map((a: any) => a.name)).toContain('keepOwnResources');
+    expect(escalated.actions.map((a: any) => a.name)).not.toContain('retry');
     expect(escalated.actions.find((a: any) => a.name === 'keepOwnResources').label).toBe('Keep this task’s version');
-    expect(escalated.error).toMatch(/or keep this task’s version of those files\.$/);
+    expect(escalated.error).toBe(`Could not publish resources: ${conflict} Nothing was lost: keep this task’s version of those files, or send a follow-up.`);
     expect(wf.activities.settleResourceReview.mock.calls).toEqual([['child'], ['child', { keepOwn: true }]]);
     expect(result.stage).toBe('done');
     expect(views.at(-1).actions.map((a: any) => a.name)).not.toContain('keepOwnResources');
@@ -885,6 +888,92 @@ describe('resource publication by sub-tasks', () => {
     expect((await softwareDevV1_27(child)).stage).toBe('done');
     expect(wf.childSignal).toHaveBeenCalledWith('raiseFromChild', expect.objectContaining({ type: 'blocked', choices: ['keep_own'] }));
     expect(wf.activities.settleResourceReview.mock.calls).toEqual([['child'], ['child', { keepOwn: true }]]);
+  });
+
+  // pramana#56: the conflict reached a person, whose Retry re-saved 13 GB
+  // to be refused the same way. Like a git conflict at landing, it now goes
+  // to the agent first, with what it needs to combine the files.
+  const guide = 'raw_data: 1 file this task changed was also changed by a newer published version, and could not be combined automatically:\n- index.txt (both edited it; the line merge conflicts)';
+  const combinable = () => Object.assign(new Error('Activity task failed'),
+    { cause: Object.assign(new Error(conflict), { type: 'resource-conflict', details: [{ guide }] }) });
+
+  it('gives the agent a turn to combine conflicting files, then publishes', async () => {
+    const views = reviewAndConfirm();
+    wf.activities.settleResourceReview = vi.fn().mockRejectedValueOnce(combinable()).mockResolvedValue(undefined);
+    const turns: any[] = [];
+    wf.activities.runAgentTurn.mockImplementation(async (args: any) => {
+      turns.push({ args, view: wf.handlers.get('view')!() });
+      return { openPrRequested: true, completed: true };
+    });
+    const result = await softwareDevV1_27(child);
+    expect(result.stage).toBe('done');
+    expect(wf.activities.settleResourceReview).toHaveBeenCalledTimes(2);
+    const merge = turns.at(-1)!;
+    expect(merge.args.role).toBe('do');
+    expect(merge.view).toMatchObject({ stage: 'review', state: { mergingResources: true } });
+    expect(merge.view.messages.at(-1).text)
+      .toBe(`This task is confirmed, but publishing its resources needs you first.\n${guide}\nDo only that, then end your turn: publishing resumes after it.`);
+    expect(merge.view.actions).toEqual([]);
+    expect(views.some((view) => view.stage === 'escalated')).toBe(false);
+    expect(wf.childSignal).not.toHaveBeenCalledWith('raiseFromChild', expect.objectContaining({ type: 'blocked' }));
+  });
+
+  it('asks a person only after the agent\'s rounds, offering no Retry', async () => {
+    reviewAndConfirm();
+    wf.activities.settleResourceReview = vi.fn().mockRejectedValueOnce(combinable()).mockRejectedValueOnce(combinable())
+      .mockRejectedValueOnce(combinable()).mockRejectedValueOnce(combinable()).mockResolvedValue(undefined);
+    let escalated: any;
+    wf.wait = () => {
+      const view = wf.handlers.get('view')!();
+      if (view.stage !== 'escalated' || escalated) return;
+      escalated = view;
+      wf.handlers.get('parentResponse')!({ action: 'keep_own' });
+    };
+    expect((await softwareDevV1_27(child)).stage).toBe('done');
+    expect(escalated.error).toBe(`Could not publish resources: ${conflict} The agent did not combine them. Nothing was lost: keep this task’s version of those files, or send a follow-up.`);
+    expect(escalated.actions.map((a: any) => a.name)).not.toContain('retry');
+    expect(wf.childSignal).toHaveBeenCalledWith('raiseFromChild', expect.objectContaining({ type: 'blocked', choices: ['keep_own'] }));
+    // Three rounds for the agent, then the parent's choice.
+    expect(wf.activities.settleResourceReview.mock.calls).toEqual([['child'], ['child'], ['child'], ['child'], ['child', { keepOwn: true }]]);
+  });
+
+  it('keeps histories recorded before the agent rounds escalating at once', async () => {
+    reviewAndConfirm();
+    wf.absentPatches = new Set(['resource-conflict-agent-v1']);
+    wf.activities.settleResourceReview = vi.fn().mockRejectedValueOnce(combinable()).mockResolvedValue(undefined);
+    wf.wait = () => {
+      if (wf.handlers.get('view')!().stage === 'escalated') wf.handlers.get('parentResponse')!({ action: 'keep_own' });
+    };
+    expect((await softwareDevV1_27(child)).stage).toBe('done');
+    expect(wf.activities.settleResourceReview.mock.calls).toEqual([['child'], ['child', { keepOwn: true }]]);
+  });
+
+  it('merges newer published data in before Review, and sends a conflict back to the agent first', async () => {
+    reviewAndConfirm();
+    wf.activities.settleResourceReview = vi.fn(async () => undefined);
+    wf.activities.integratePublishedResources = vi.fn()
+      .mockResolvedValueOnce([{ attachmentId: 'r1', name: 'raw_data', path: 'resources/raw_data', revisionId: 'rev', added: 0, modified: 0, deleted: 0,
+        conflicts: ['index.txt'], guide }])
+      .mockResolvedValue([{ attachmentId: 'r1', name: 'raw_data', path: 'resources/raw_data', revisionId: 'rev', added: 3, modified: 0, deleted: 0 }]);
+    const heard: string[] = [];
+    wf.activities.runAgentTurn.mockImplementation(async () => {
+      heard.push(wf.handlers.get('view')!().messages.at(-1)?.text ?? '');
+      return { openPrRequested: true, completed: true };
+    });
+    expect((await softwareDevV1_27(child)).stage).toBe('done');
+    expect(wf.activities.integratePublishedResources).toHaveBeenCalledTimes(2);
+    expect(heard).toHaveLength(2);
+    expect(heard[1]).toBe(`Before Review, newer published versions of this task's resources were merged into your world, except:\n${guide}\nThen finish as you were going to.`);
+  });
+
+  it('goes to Review after the conflict has gone back to the agent twice', async () => {
+    reviewAndConfirm();
+    wf.activities.settleResourceReview = vi.fn(async () => undefined);
+    wf.activities.integratePublishedResources = vi.fn(async () => [{ attachmentId: 'r1', name: 'raw_data', path: 'resources/raw_data',
+      revisionId: 'rev', added: 0, modified: 0, deleted: 0, conflicts: ['index.txt'], guide }]);
+    expect((await softwareDevV1_27(child)).stage).toBe('done');
+    expect(wf.activities.integratePublishedResources).toHaveBeenCalledTimes(3);
+    expect(wf.activities.runAgentTurn).toHaveBeenCalledTimes(3);
   });
 
   it('names the extra answers a raise accepts', () => {
@@ -1145,6 +1234,70 @@ describe('a sub-task that cannot be prepared', () => {
     expect(wf.handlers.get('view')!().subTasks).toEqual(['child']);
   });
 
+  // pramana#39/#43: "could not seed the parent branch for the child task: …:
+  // the SSH connection to the VM was lost" reached the agent as its own failure.
+  const unreachable = () => new ActivityFailure('Activity task failed', 'prepareChildTask', '9', RetryState.MAXIMUM_ATTEMPTS_REACHED, 'worker',
+    ApplicationFailure.create({ type: 'world-infra', nonRetryable: false,
+      message: 'could not seed the parent branch for the child task: pramana-wiki: the SSH connection to the VM was lost' }));
+  const delegate = () => wf.activities.runAgentTurn.mockImplementation(async () => {
+    if (wf.activities.runAgentTurn.mock.calls.length === 1)
+      return { output: 'Delegating', providerCompleted: true, subTasks: [{ title: 'OCR', prompt: 'p' }] };
+    wf.handlers.get('cancel')!();
+    return { output: 'Waiting for it', providerCompleted: true };
+  });
+  beforeEach(() => { wf.activities.recordEvent = vi.fn(async () => undefined); });
+  const failureNotes = () => (wf.handlers.get('view')!().messages as any[]).filter((m) => /create_sub_task "OCR" failed/.test(m.text));
+
+  it('waits out a parent world that cannot be reached, visibly, and then creates the child', async () => {
+    wf.activities.accountPoolSize.mockResolvedValue(0);
+    wf.activities.prepareChildTask = vi.fn().mockRejectedValueOnce(unreachable()).mockRejectedValueOnce(unreachable())
+      .mockResolvedValue({ ...input, taskId: 'child' });
+    delegate();
+    const waits: any[] = [];
+    wf.wait = () => {
+      const view = wf.handlers.get('view')!();
+      if (view.waitingFor?.kind === 'retry') waits.push({ waitingFor: view.waitingFor, error: view.error, timeout: wf.timeout });
+      else wf.handlers.get('cancel')!();
+    };
+    await softwareDevV1_28(withRepo);
+    expect(wf.activities.prepareChildTask).toHaveBeenCalledTimes(3);
+    expect(waits.map((w) => [w.waitingFor.detail, w.timeout])).toEqual([['Retry 1 of 5', 30_000], ['Retry 2 of 5', 60_000]]);
+    expect(waits[0].error).toMatch(/^infrastructure: .*the SSH connection to the VM was lost — preparing sub-task "OCR" again in 30s$/);
+    expect(wf.handlers.get('view')!().subTasks).toEqual(['child']);
+    expect(failureNotes()).toEqual([]);
+    expect(wf.activities.recordEvent).not.toHaveBeenCalledWith('task', 'subtask.failed', expect.anything());
+  });
+
+  it('asks a person when the world stays unreachable, and Retry creates the child; the agent is not told it failed', async () => {
+    wf.activities.accountPoolSize.mockResolvedValue(0);
+    const prepare = vi.fn();
+    for (let i = 0; i < 6; i++) prepare.mockRejectedValueOnce(unreachable());
+    wf.activities.prepareChildTask = prepare.mockResolvedValue({ ...input, taskId: 'child' });
+    delegate();
+    let escalated: any;
+    wf.wait = () => {
+      const view = wf.handlers.get('view')!();
+      if (view.stage === 'escalated' && !escalated) { escalated = structuredClone(view); wf.handlers.get('retry')!(); }
+      else if (view.waitingFor?.kind !== 'retry') wf.handlers.get('cancel')!();
+    };
+    await softwareDevV1_28(withRepo);
+    expect(escalated.status).toBe('blocked');
+    expect(escalated.error).toMatch(/^create_sub_task "OCR" failed: no sub-task was created\. could not seed the parent branch .*the SSH connection to the VM was lost\. Nothing was lost; Retry creates it again\.$/);
+    expect(prepare).toHaveBeenCalledTimes(7);
+    expect(wf.handlers.get('view')!().subTasks).toEqual(['child']);
+    expect(failureNotes()).toEqual([]);
+  });
+
+  it('keeps histories recorded before the wait telling the agent at once', async () => {
+    wf.absentPatches = new Set(['software-dev-subtask-prepare-waits-for-world-v1']);
+    wf.activities.accountPoolSize.mockResolvedValue(0);
+    wf.activities.prepareChildTask = vi.fn().mockRejectedValue(unreachable());
+    delegate();
+    await softwareDevV1_28(withRepo);
+    expect(wf.activities.prepareChildTask).toHaveBeenCalledOnce();
+    expect(failureNotes()).toHaveLength(1);
+  });
+
   it('keeps histories recorded before it failing the task', async () => {
     wf.absentPatches = new Set(['subtask-prepare-failure-to-agent-v1']);
     wf.activities.accountPoolSize.mockResolvedValue(0);
@@ -1153,5 +1306,69 @@ describe('a sub-task that cannot be prepared', () => {
     wf.wait = () => wf.handlers.get('cancel')!();
     await expect(softwareDevV1_28(withRepo)).rejects.toThrow('Activity task failed');
     expect(wf.activities.runAgentTurn).toHaveBeenCalledOnce();
+  });
+});
+
+// pramana#56: "Return to Review & Confirm" on a task whose parked Hetzner world
+// could not start (the project's CPU limit was full). Nothing changed on the
+// page for the 17 s the wake took, a second click queued another, and then the
+// task failed outright: checkProposal's world-infra failure escaped the workflow.
+describe('Return to Review while the world cannot wake (pramana#56)', () => {
+  const withRepo = { ...input, project: { repos: ['/tmp/repo'] } };
+  const wakeFailure = () => new ActivityFailure('Activity task failed', 'checkProposal', '7', RetryState.MAXIMUM_ATTEMPTS_REACHED, 'worker',
+    ApplicationFailure.create({ type: 'world-infra', nonRetryable: false,
+      message: "Hetzner refused a 16-CPU server: this Hetzner project's limit on shared CPUs is full, with 14 in use by 4 other servers." }));
+
+  const drive = (checkProposal: ReturnType<typeof vi.fn>) => {
+    wf.activities.accountPoolSize.mockResolvedValue(0);
+    wf.activities.checkProposal = checkProposal;
+    wf.activities.openPr = vi.fn(async () => []);
+    wf.activities.buildReview = vi.fn(async () => ({ summary: 'Put the file back', changedFiles: ['a.py'] }));
+    // The agent finished its turn without open_pr: it waits for a person in Do.
+    wf.activities.runAgentTurn.mockResolvedValue({ output: 'I put the file back.', providerCompleted: true });
+    const views: any[] = [];
+    let asked = false;
+    wf.wait = () => {
+      const view = wf.handlers.get('view')!();
+      views.push(structuredClone(view));
+      if (view.stage === 'do' && view.waitingFor?.kind === 'human' && !asked) { asked = true; wf.handlers.get('openPr')!(); return; }
+      if (['review', 'merge'].includes(view.stage) || view.status === 'blocked') wf.handlers.get('cancel')!();
+    };
+    return views;
+  };
+
+  it('shows the transition at once and waits the outage out instead of failing the task', async () => {
+    const stagesAtCheck: string[] = [];
+    const checkProposal = vi.fn(async () => {
+      stagesAtCheck.push(wf.handlers.get('view')!().stage);
+      if (checkProposal.mock.calls.length <= 2) throw wakeFailure();
+      return { ready: true };
+    });
+    const views = drive(checkProposal);
+    expect(await softwareDevV1_29(withRepo)).toEqual({ stage: 'cancelled' });
+    // The click is visible before the world is even reached.
+    expect(stagesAtCheck[0]).toBe('pr');
+    // The outage is a visible wait, then the proposal goes on to Review.
+    const waiting = views.find((view) => view.waitingFor?.kind === 'retry');
+    expect(waiting).toMatchObject({ stage: 'pr', status: 'waiting' });
+    expect(waiting.error).toContain('shared CPUs is full');
+    expect(checkProposal).toHaveBeenCalledTimes(3);
+    expect(views.some((view) => ['review', 'merge'].includes(view.stage))).toBe(true);
+  });
+
+  it('escalates with Retry, the world intact, when the outage outlasts the waits', async () => {
+    const views = drive(vi.fn(async () => { throw wakeFailure(); }));
+    expect(await softwareDevV1_29(withRepo)).toEqual({ stage: 'cancelled' });
+    const escalated = views.find((view) => view.status === 'blocked');
+    // A failure is not a stage (v1.27): it asks a person, the stage kept.
+    expect(escalated).toMatchObject({ stage: 'pr', waitingFor: { kind: 'human', reason: 'error' } });
+    expect(escalated.error).toContain('shared CPUs is full');
+    expect(escalated.actions.map((a: any) => a.name)).toContain('retry');
+  });
+
+  it('keeps histories recorded before it as they were', async () => {
+    wf.absentPatches = new Set(['software-dev-open-pr-waits-for-world-v1']);
+    drive(vi.fn(async () => { throw wakeFailure(); }));
+    await expect(softwareDevV1_29(withRepo)).rejects.toThrow('Activity task failed');
   });
 });

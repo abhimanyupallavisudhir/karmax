@@ -84,8 +84,9 @@ import { VaultItems, type VaultItemPolicy, type VaultTaskPolicyOverrides } from 
 import { itemHandle, loosensPolicy } from '../autonomy/vault-items.js';
 import { applyAvatarProfile, avatarAuthorizationCapabilities, avatarCallableBy, avatarEnabled } from './avatars.js';
 import { CapabilityError, NotFoundError, ValidationError } from './errors.js';
-import { assertAgentSpec } from './agent-params.js';
+import { assertAgentSpec, subTaskParams } from './agent-params.js';
 import { CALLED_AGENT_FIELD, agentSpecsByParticipant, authorityKey, normalizeAgentAuthority, type StoredAgentAuthorization } from './agent-authority.js';
+import { continuesInNewTask } from '../domain/forks.js';
 import { AGENT_SELECTOR, MAIN_AGENT, agentSelector, conversationFor, isParticipantKey, nextAgentKey, participantLabel, selectorAgent } from '../domain/participants.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import type { ProjectResourceService } from '../world/resources.js';
@@ -287,6 +288,16 @@ const FAILED_RECOVERY_ACTIONS = (pointOfNoReturnPassed?: boolean): TaskView['act
   ...(pointOfNoReturnPassed ? [] : [{ name: 'cancel', kind: 'signal' as const, label: 'Cancel', enabled: true, danger: true }]),
 ];
 
+/** A message to a confirmed task's agent, which continues in a new task. */
+const CONTINUE_ACTION = (): TaskView['actions'][number] => ({
+  name: 'followUp',
+  kind: 'signal',
+  label: 'Continue',
+  enabled: true,
+  args: [{ name: 'text', type: 'text', label: 'Message', required: true }],
+  roles: ['do'],
+});
+
 const FOLLOW_UP_ACTION = (role?: AgentRole): TaskView['actions'][number] => ({
   name: 'followUp',
   kind: 'signal',
@@ -403,6 +414,14 @@ export interface KarmaxApiDeps {
  * these calls; every call is capability-checked against a scoped token (§8.3),
  * so authz lives in exactly one place.
  */
+/** Why `parent` can take no more sub-tasks (it has ended), if it cannot. */
+function subTaskParentEnded(parent: TaskRecord): string | undefined {
+  const view = parent.lastView;
+  if (view && (['done', 'cancelled', 'failed'].includes(view.status) || ['done', 'cancelled'].includes(view.stage)))
+    return `its parent task has ${view.status === 'failed' ? 'failed' : 'ended'}`;
+  return undefined;
+}
+
 export class KarmaxApi {
   private remoteWikiReadCache?: RemoteWikiSnapshots;
   private get remoteWikiReads(): RemoteWikiSnapshots {
@@ -2108,6 +2127,75 @@ export class KarmaxApi {
     }
   }
 
+  /** Save a draft sub-task of `parentTaskId` (POST /api/tasks/:taskId/sub-tasks;
+   * create_sub_task with `draft: true`). Nothing is prepared yet: it starts when
+   * queued, off its parent's work as it is then (`queueSubTaskDraft`). Its
+   * params take only agent fields, as create_sub_task's do. */
+  async createSubTaskDraft(token: string, parentTaskId: string,
+    input: { title?: unknown; prompt?: unknown; params?: unknown }): Promise<TaskRecord> {
+    const parent = (await this.deps.store.getTask(parentTaskId));
+    if (!parent) throw new NotFoundError(`no task ${parentTaskId}`);
+    const caller = (await this.require(token, 'create_sub_task', { projectId: parent.projectId, taskId: parentTaskId }));
+    if (parent.workflow !== 'software-dev' && parent.workflow !== 'goal')
+      throw new ValidationError(`a ${parent.workflow} task has no sub-tasks`);
+    const ended = subTaskParentEnded(parent);
+    if (ended) throw new ValidationError(ended);
+    const prompt = typeof input.prompt === 'string' ? input.prompt : '';
+    if (!prompt.trim()) throw new ValidationError('a sub-task needs a prompt');
+    const title = (typeof input.title === 'string' && input.title.trim()) || 'sub-task';
+    const params = (await subTaskParams(this.deps.store, { projectId: parent.projectId, parentTaskId, params: input.params }));
+    const parentAgent = { kind: 'task-agent' as const, taskId: parentTaskId, role: 'do' as const };
+    const ownAgent = caller.kind === 'agent' && caller.taskId === parentTaskId;
+    const child = (await this.deps.store.createTask({
+      projectId: parent.projectId,
+      listId: parent.listId,
+      title,
+      workflow: 'software-dev',
+      workflowVersion: parent.workflowVersion ?? '1.0.0',
+      params: { ...params, prompt, draft: true },
+      parentTaskId,
+      createdBy: ownAgent ? parentAgent : (await this.taskCreator(caller, parent.projectId)) ?? parentAgent,
+      assignee: parentAgent,
+    }));
+    const event = { taskId: parentTaskId, type: 'subtask.created', ts: Date.now(), payload: { childTaskId: child.id, title, draft: true } };
+    const seq = (await this.deps.store.appendEvent(event));
+    this.deps.bus?.emit({ ...event, seq });
+    return child;
+  }
+
+  /** Queue a draft sub-task: its parent prepares and starts it after its agent's
+   * current turn, as it does one its agent asks for. Only a parent at work (in
+   * Do) can: a sub-task builds on its parent's branch and returns to it. Anyone
+   * other than the parent's own agent is said to have queued it, in the
+   * parent's conversation, which also wakes a parent that waits. */
+  private async queueSubTaskDraft(caller: ScopedToken, task: TaskRecord): Promise<TaskRecord> {
+    const parent = (await this.deps.store.getTask(task.parentTaskId!));
+    const ended = parent ? subTaskParentEnded(parent) : 'its parent task is gone';
+    if (ended || !parent) throw new ValidationError(`${ended}. A sub-task starts from its parent's work and returns to it, so this draft cannot start now`);
+    const stage = parent.lastView?.stage;
+    if (stage !== 'do') {
+      const where = !stage ? 'not started' : ({ setup: 'setting up', pr: 'in Review', review: 'in Review', merge: 'landing',
+        escalated: 'blocked' } as Record<string, string>)[stage] ?? `in ${stage}`;
+      throw new ValidationError(`its parent task is ${where}; a sub-task starts only while its parent works (Do)`);
+    }
+    await (await this.workflowHandle(parent.id)).signal(SIG.queueSubTask, { taskId: task.id, title: task.title });
+    (await this.deps.store.patchTaskParams(task.id, { _queuedAt: Date.now() }));
+    const event = { taskId: parent.id, type: 'subtask.queued', ts: Date.now(), payload: { childTaskId: task.id, title: task.title } };
+    const seq = (await this.deps.store.appendEvent(event));
+    this.deps.bus?.emit({ ...event, seq });
+    if (!(caller.kind === 'agent' && caller.taskId === parent.id)) {
+      const userId = caller.humanSubject?.userId;
+      const label = userId ? (await this.deps.store.userDisplayName(userId)) : undefined;
+      const author: Partial<Message> = userId ? { author: `user:${userId}`, ...(label ? { authorLabel: label } : {}) }
+        : caller.kind === 'agent' && caller.taskId && caller.taskId !== '*' ? { author: `task:${caller.taskId}` } : {};
+      const message: Message = { id: `u${randomUUID()}`, role: 'user', ...author, ts: Date.now(),
+        text: `Queued your draft sub-task "${task.title}" (${task.id}). It starts off your work as it is when your current turn ends (at once if you are not working).` };
+      await (await this.workflowHandle(parent.id)).signal(SIG.followUp, message);
+      (await this.publishConversationMessage(parent.id, MAIN_AGENT, message));
+    }
+    return (await this.deps.store.getTask(task.id))!;
+  }
+
   /** Start a previously-saved draft (SPEC §10.4). */
   async queueTask(token: string, taskId: string): Promise<TaskRecord> {
     const receivedAt = (await timingEnabled(this.deps.store)) ? { monoMs: performance.now(), wallMs: Date.now() } : undefined;
@@ -2124,6 +2212,8 @@ export class KarmaxApi {
         { credentialGrants: storedAuthorization.missingCredentialGrants })
         : new AuthorizationGrantError('you cannot grant the agent more authorization than you have');
     }
+    // A draft sub-task is started by its parent, under the parent's grant.
+    if (task.parentTaskId && task.params?.draft) return this.queueSubTaskDraft(caller, task);
     (await this.assertStoredGrantQueueable(token, caller, task));
     (await this.refreshAgentAuthorizationsForQueue(token, caller, task));
     const group = (await this.deps.store.attemptGroup(taskId));
@@ -3325,7 +3415,7 @@ export class KarmaxApi {
         ...(task ? { stageTransitions: (await this.availableStageTransitions(task, view, group)) } : {}),
         ...(view.status === 'failed' && RECOVERABLE_WORKFLOWS.has(view.workflow)
           ? { actions: FAILED_RECOVERY_ACTIONS(view.pointOfNoReturnPassed) }
-          : { actions: this.lifecycleActions(view) }),
+          : { actions: this.lifecycleActions(view, task) }),
         ...((await this.deps.store.kvGet(`project-transfer-history:${taskId}`))
           ? { actions: [], stageTransitions: [] } : {}),
       };
@@ -3545,8 +3635,12 @@ export class KarmaxApi {
    * A displayed action must either release the hold or be a deliberate non-waking
    * edit; roles prevents an unrelated, stale conversation from accepting input.
    */
-  private lifecycleActions(view: TaskView): TaskView['actions'] {
+  private lifecycleActions(view: TaskView, task?: TaskRecord): TaskView['actions'] {
     const actions = [...view.actions];
+    // A confirmed proposal lands on its own; a message carries the work on in
+    // a new task (wiki features/continue-after-confirm).
+    if (task && continuesInNewTask(task, view) && !actions.some((action) => action.name === 'followUp'))
+      actions.push(CONTINUE_ACTION());
     // software-dev's infrastructure path deliberately remains in its public
     // stage while it backs off, and its retry signal can wake that timer early.
     // The workflow used to advertise Retry only after the outage exhausted every
@@ -5683,7 +5777,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   async postTaskMessage(token: string, taskId: string, input: {
     text: string; to?: string[]; agents?: Record<string, AgentSpec>;
     images?: ImageRef[]; files?: FileRef[]; urgency?: Urgency;
-  }): Promise<{ message?: Message; notified: string[] }> {
+  }): Promise<{ message?: Message; notified: string[]; continuedIn?: TaskLink }> {
     const task = (await this.deps.store.getTask(taskId));
     if (!task) throw new NotFoundError(`no task ${taskId}`);
     const caller = (await this.require(token, 'message_agent', { projectId: task.projectId, taskId }));
@@ -5732,6 +5826,21 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       if (selector.startsWith('avatar:')) continue; // validated where it is dispatched
       if (!(await this.deps.store.humanAudience(task.id, [selector])).length)
         throw new ValidationError(`${selector} does not resolve to anyone in this organization`);
+    }
+    // Its proposal is confirmed: the agent carries on in a new task instead of
+    // pulling the proposal back to Do (wiki features/continue-after-confirm).
+    const onlyMain = !newAgents.length && (to === undefined
+      || (to.includes(agentSelector(MAIN_AGENT)) && !to.some((selector) => selector.startsWith(AGENT_SELECTOR) && selectorAgent(selector) !== MAIN_AGENT)));
+    if (onlyMain && this.continues(caller, task)) {
+      const next = await this.continueTask(token, taskId, { text, images: input.images, files: input.files });
+      const people = (to ?? []).filter((selector) => !selector.startsWith(AGENT_SELECTOR) && !selector.startsWith('avatar:'));
+      if (people.length) {
+        const event = { taskId: next.id, type: 'task.mentioned', ts: Date.now(), payload: {
+          recipients: people, by: caller.humanSubject?.userId ? `user:${caller.humanSubject.userId}` : caller.principal,
+          text: text.slice(0, 500), urgency: normalizeUrgency(input.urgency, DEFAULT_URGENCY.mentioned) } };
+        this.deps.bus?.emit({ ...event, seq: (await this.deps.store.appendEvent(event)) });
+      }
+      return { notified: people, continuedIn: taskLink(next) };
     }
     // Who is speaking: the task's own agent (by the agent its token was minted
     // for), a person, or another task's agent.
@@ -5839,8 +5948,55 @@ Act according to your Avatar instructions. When ready, call platform_request POS
     }
   }
 
-  async messageAgent(token: string, taskId: string, text: string, role?: string): Promise<Message | undefined> {
-    return this.deliverSignal('message_agent', token, taskId, SIG.followUp, text, role);
+  async messageAgent(token: string, taskId: string, text: string, role?: string): Promise<{ message?: Message; continuedIn?: TaskLink }> {
+    const task = (await this.deps.store.getTask(taskId));
+    if (task && (!role || role === MAIN_AGENT)
+      && this.continues((await this.require(token, 'message_agent', { projectId: task.projectId, taskId })), task))
+      return { continuedIn: taskLink(await this.continueTask(token, taskId, { text })) };
+    const message = await this.deliverSignal('message_agent', token, taskId, SIG.followUp, text, role);
+    return message ? { message } : {};
+  }
+
+  /** Whether a message from `caller` to the task's main agent continues the
+   * work in a new task: a person's, or another task's agent's — never the
+   * task's own agents, and never an event the platform delivers. */
+  private continues(caller: { kind: string; taskId?: string; humanSubject?: { userId?: string } }, task: TaskRecord): boolean {
+    const speaks = !!caller.humanSubject?.userId || (caller.kind === 'agent' && caller.taskId !== task.id);
+    return speaks && continuesInNewTask(task, task.lastView);
+  }
+
+  /**
+   * Carry a confirmed task's work on in a new task (wiki
+   * features/continue-after-confirm). The approved proposal lands exactly as
+   * it was reviewed; the new task forks its agent (session, and world while
+   * the proposal is still landing), keeps its settings and authorization, and
+   * starts from the message. It shows as a fork of this task.
+   */
+  async continueTask(token: string, taskId: string, input: { text: string; images?: ImageRef[]; files?: FileRef[] }): Promise<TaskRecord> {
+    const source = (await this.deps.store.getTask(taskId));
+    (await this.require(token, 'fork_agent', { projectId: source?.projectId, taskId }));
+    if (!source) throw new NotFoundError(`no task ${taskId}`);
+    if (!continuesInNewTask(source, source.lastView))
+      throw new ValidationError('only a task whose proposal was confirmed continues in a new task; message its agent instead');
+    if (!input.text.trim() && !input.images?.length && !input.files?.length) throw new ValidationError('a message needs text or an attachment');
+    const params: ValueMap = stripPlatformMetadata(cloneParamsWithoutTriggers({ ...source.params } as ValueMap));
+    for (const name of ['prompt', 'images', 'files', 'base', 'branch', 'attempts']) delete params[name];
+    for (const name of Object.keys(params)) if (CALLED_AGENT_FIELD.test(name)) delete params[name];
+    const field = params['agent:do'] === undefined && params['agent:unified'] !== undefined ? 'agent:unified' : 'agent:do';
+    const { resumeFrom: _previous, ...agent } = (params[field] ?? {}) as Partial<AgentSpec>;
+    params[field] = { ...agent, resumeFrom: { taskId, role: MAIN_AGENT } };
+    params.prompt = input.text;
+    const previous = previousTaskGrants(source);
+    return this.createTask(token, {
+      projectId: source.projectId,
+      workflow: source.workflow,
+      params,
+      ...(input.images?.length ? { images: input.images } : {}),
+      ...(input.files?.length ? { files: input.files } : {}),
+      ...(previous.authorization ? { authorization: previous.authorization } : {}),
+      credentialGrants: previous.credentialGrants,
+      credentialPolicies: previous.credentialPolicies,
+    });
   }
 
   /**
@@ -5926,6 +6082,11 @@ Act according to your Avatar instructions. When ready, call platform_request POS
     // whichever layer is playing and the signal would pre-satisfy the human one.
     if (signal === SIG.confirm && caller.kind === 'agent' && !allows(caller.caps, 'review:approve'))
       throw new CapabilityError('confirming a Review gate needs review:approve (a maintainer-level authorization); an agent reviewing a task records its verdict with confirm_decision');
+    // A Reviewer agent is deciding: Confirm would approve the step after it
+    // unseen. Wait for its verdict, or stop it and decide.
+    if (signal === SIG.confirm && heldView?.stage === 'review' && (heldView.waitingFor?.kind === 'confirm'
+      || heldView.participants?.some((participant) => participant.role === 'confirm' && participant.state !== 'idle')))
+      throw new ValidationError('a Reviewer agent is reviewing this proposal; wait for its verdict, or stop it to decide yourself');
     if (signal === SIG.openPr && heldOrigin && heldOrigin !== 'do')
       throw new Error(`this is a hold on ${stageName(heldOrigin)}, not a proposal waiting to be opened`);
     const attemptGroup = scopedTask && (await this.deps.store.attemptGroup(taskId));
@@ -7467,6 +7628,13 @@ function selectionOf(authorization: { level?: string; profileId?: string; scope?
 function authorizationReaches(held: Partial<AuthorizationSelection> | undefined, projectId: string, ownProjectId: string): boolean {
   return held?.scope === 'global' || held?.scope === 'organization'
     || (held?.scope === 'projects' ? !!held.projectIds?.includes(projectId) : projectId === ownProjectId);
+}
+
+/** A task as a link: where a message continued (`continuedIn`). */
+export interface TaskLink { id: string; num?: number; title: string }
+
+function taskLink(task: TaskRecord): TaskLink {
+  return { id: task.id, ...(task.num != null ? { num: task.num } : {}), title: task.title };
 }
 
 export function previousTaskGrants(task: TaskRecord): {

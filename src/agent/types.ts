@@ -19,8 +19,9 @@ export interface PlatformToolContext {
   /** Optionally attach terse, click-to-verify actions/outputs for the Review stage. */
   createReviewInfo(info: ReviewInfo): void | Promise<void>;
   /** Spawn a child task the parent manages (branches off + merges back into the
-   *  parent's world branch; the parent is its confirmer, SPEC §5.2/§5.3). */
-  createSubTask(t: SubTaskRequest): void | Promise<void>;
+   *  parent's world branch; the parent is its confirmer, SPEC §5.2/§5.3). A
+   *  `draft` is saved at once, not started, and its task id returned. */
+  createSubTask(t: SubTaskRequest): void | string | Promise<void | string>;
   /** Parent-agent ONLY: answer a child that raised to you (open_pr/comment/retry/
    *  cancel; `confirm` is a replay-compatible alias). */
   respondToSubTask(r: SubTaskResponse): void | Promise<void>;

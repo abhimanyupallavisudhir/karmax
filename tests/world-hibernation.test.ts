@@ -281,3 +281,27 @@ it('tears down a degraded world whose task has finished, marked or not', async (
   await f2.lifecycle.sweep();
   expect(await f2.store.worldState(f2.handle.id)).toBe('degraded');
 });
+
+// pramana#60, #61, #75 (2026-10-16): cancelled, their Hetzner worlds failed to
+// wake and stayed marked ready with no server, so they were never hibernated
+// and kept 310 GB of the project's volume quota.
+it.each(['stuck', 'not a VM', 'leased', 'accessed'])('records a ready VM world its provider has parked as parked: %s', async (variant) => {
+  const f = await fixture();
+  await f.store.setWorldState(f.handle, 'ready');
+  (f.worlds.get('memory') as any).parkStopsProcesses = variant !== 'not a VM';
+  f.probe.mockResolvedValue('parked');
+  if (variant === 'leased') {
+    await f.store.createRunnerPool({ id: 'test', organizationId: f.project.organizationId!, name: 'Test', provider: 'memory',
+      mode: 'customer', capacity: { activeWorlds: 1, cpu: 2, memoryMb: 2048, gpu: 0 }, enabled: true });
+    const lease = await f.store.requestWorldLease({ runnerPoolId: 'test', organizationId: f.project.organizationId!,
+      projectId: f.project.id, taskId: f.handle.id, worldId: f.handle.id });
+    await f.store.updateWorldMeta(f.handle, { worldLeaseId: lease.id });
+  }
+  const release = variant === 'accessed' ? await f.worlds.holdAccess(f.handle.id) : undefined;
+  try { await f.lifecycle.sweep(Date.now() + 20 * 60_000); }
+  finally { release?.(); }
+  const healed = variant === 'stuck';
+  expect(await f.store.eventsOfType(f.handle.id, 'world.parked')).toHaveLength(healed ? 1 : 0);
+  // Parked, it hibernates like any parked world (this project after 0 ms).
+  expect(await f.store.worldState(f.handle.id)).toBe(healed ? 'hibernated' : 'ready');
+});

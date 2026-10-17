@@ -4,7 +4,8 @@ import type { Store } from '../store/db.js';
 export function makeChildActivities(store: Store) {
   return {
     async restoreChildTasks(parentTaskId: string) {
-      const children = await store.childTasks(parentTaskId);
+      // A draft never ran: nothing waits on it until it is queued.
+      const children = (await store.childTasks(parentTaskId)).filter((child) => !child.params?.draft);
       return children.filter((child) => child.lastView?.state?.lifecycleReplacement
         || !['done', 'cancelled', 'failed'].includes(child.lastView?.status ?? ''))
         .map((child) => ({ taskId: child.id, title: child.title,

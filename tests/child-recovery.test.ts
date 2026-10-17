@@ -6,6 +6,8 @@ it('restores only unfinished children and carries their pending question', async
   const store = { childTasks: vi.fn(async () => [
     { id: 'live', title: 'Child', lastView: { status: 'waiting', waitingFor: { kind: 'parent', detail: 'Review me' } } },
     ...['done', 'cancelled', 'failed'].map(status => ({ id: status, lastView: { status } })),
+    // A draft sub-task never ran: a rebuilt parent must not wait on it.
+    { id: 'draft', title: 'Draft', params: { draft: true } },
   ]) };
   expect(await makeChildActivities(store as any).restoreChildTasks('parent')).toEqual([
     { taskId: 'live', title: 'Child', waiting: true, detail: 'Review me' },

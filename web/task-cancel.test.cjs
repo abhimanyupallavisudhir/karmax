@@ -30,7 +30,7 @@ for (const entry of ['footer', 'command', 'form', 'scheduled']) {
         reflectAcceptedTaskAction: (...args) => reflected.push(args),
         taskActionLabel: () => 'Cancel', taskRecord: () => ({ title: 'Scheduled task' }),
         toast() {}, setTimeout() {}, refreshTask() {}, refreshTasks() {},
-        wireOrgControls() {}, wirePromptAttachments() {}, wireAttachmentPicker() {},
+        wireOrgControls() {}, scrollToHashedTagSection() {}, wirePromptAttachments() {}, wireAttachmentPicker() {},
         renderAttachmentChips() {}, requestTaskFormDefaults() {}, applyCursor() {}, wireNewTaskComposer() {}, wireInboxNotices() {},
         esc: text => text,
       });

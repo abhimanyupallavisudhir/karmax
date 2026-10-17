@@ -19,7 +19,7 @@ function extract(name) {
 }
 const context = vm.createContext({
   esc: (s) => String(s ?? ''), policyTip: (text) => `<tip>${text}</tip>`, safeHref: String,
-  taskRecord: () => undefined, numLabel: (id) => id,
+  taskRecord: () => undefined, numLabel: (id) => id, taskUrl: (id, rec) => `/acme/web/tasks/${rec?.num ?? id}`,
 });
 vm.runInContext(['branchPullRequestState', 'checkoutsSection'].map(extract).join('\n'), context);
 const row = (html, name) => html.split('<div class="checkout-row').find((part) => part.includes(`<b>${name}</b>`)) ?? '';
@@ -40,7 +40,7 @@ test('each branch shows where its pull request is, with Approve while it waits f
   assert.doesNotMatch(row(html, 'app'), /chip|Approve|Not yet approved/, 'a branch not proposed yet stays quiet');
   assert.match(row(html, 'docs'), /In review/);
   assert.match(row(html, 'docs'), /data-approve-pr="pr-docs"/);
-  assert.match(row(html, 'docs'), /data-open="pr-docs"[^>]*>#41</);
+  assert.match(row(html, 'docs'), /<a [^>]*data-open="pr-docs" data-spa href="\/acme\/web\/tasks\/41"[^>]*>Open</, 'Open is a link to its pull-request task');
   assert.match(row(html, 'api'), /Changes requested/);
   assert.match(row(html, 'web'), /Landing/);
   assert.match(row(html, 'cli'), /Landed/);

@@ -456,6 +456,9 @@ export interface WorldProvider {
   };
   /** Whether this provider supports snapshot-on-park (SPEC §11.3). */
   readonly parkable: boolean;
+  /** Parking stops the machine, so a parked world runs nothing (a VM); an E2B
+   * sandbox's pause keeps its processes. */
+  readonly parkStopsProcesses?: boolean;
   create(spec: WorldSpec): Promise<World>;
   /** Reconstruct a live world from a persisted handle. */
   open(handle: WorldHandle): Promise<World>;

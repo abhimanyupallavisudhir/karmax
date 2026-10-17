@@ -208,6 +208,17 @@ describe('connection gateway flow', () => {
     expect(response.status).toBe(200);
     expect((await service.pending(taskId))).toHaveLength(0);
   });
+  it('dismisses a request silently: it stays pending, the agent cannot dismiss it', async () => {
+    const pending = (await service.request(org, 'notion', taskId, 'do', 'Read Notion'));
+    const dismiss = (token?: string) => request(`/api/connections/${pending.id}/dismiss?organizationId=${org}`, { method: 'POST', body: {}, token });
+    expect((await dismiss(agent)).status).toBe(403);
+    const response = await dismiss();
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ status: 'requested', dismissed: { by: 'user:alice' } });
+    expect((await service.pending(taskId))).toEqual(expect.arrayContaining([expect.objectContaining({ id: pending.id, dismissed: expect.any(Object) })]));
+    expect((await store.eventsOfType(taskId, 'connection.dismissed'))).toEqual([expect.objectContaining({ payload: { requestId: pending.id } })]);
+    (await service.disconnect(org, pending.id, 'alice'));
+  });
   it('keeps provider configuration installation-scoped and write-only', async () => {
     expect(routeCapability('PUT', '/api/connections/config')).toBe('settings:write');
     const config = await request('/api/connections/config', { token: agent });

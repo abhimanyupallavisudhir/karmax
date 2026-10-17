@@ -885,6 +885,16 @@ function isNewTabClick(ev) {
   return ev.button !== 0 || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey;
 }
 
+// A click handler for a link whose plain click does something in place (switch
+// a query, open a form, close a page): every "new tab" click stays the browser's.
+function plainClick(fn) {
+  return (ev) => {
+    if (isNewTabClick(ev)) return;
+    ev.preventDefault();
+    fn(ev);
+  };
+}
+
 // Navigate to an in-app path, remembering the list to return to when opening a
 // task from a non-task page (so Esc / j-k walking returns to the list, not the
 // previous task). Generalises the old goToTask logic to any SPA link.
@@ -926,16 +936,18 @@ function installInfoDotTips() {
   });
 }
 
-// Tag chips are navigation everywhere they appear. Capture before row/form click
-// handlers so a chip never opens a task or mutates its tags as a side effect.
+// Tag chips are navigation everywhere they appear: links to their section, so a
+// modified click opens it in a new tab. Capture before row/form click handlers so
+// a chip never opens a task or mutates its tags as a side effect.
 // A dialog owns its chips: navigating from one would leave it over the list or
 // tear it down behind its close handler.
 function installTagRouter() {
   document.addEventListener('click', (ev) => {
     const chip = ev.target.closest('[data-tag-link]');
     if (!chip || chip.closest('#modal-root')) return;
-    ev.preventDefault();
     ev.stopPropagation();
+    if (isNewTabClick(ev)) return;
+    ev.preventDefault();
     navigateToTagSection(chip.dataset.tagLink);
   }, true);
 }
@@ -954,11 +966,15 @@ function goToTask(id) { return spaNavigate(taskUrl(id)); }
 // drag-to-reorder. `getId()` returns the task id (falsy → leave the row inert).
 function wireTaskNav(el, getId) {
   const id = getId();
-  if (!id) return;
+  if (id) wireRowLink(el, taskUrl(id));
+}
+
+// The overlay link itself, for a row that opens any in-app URL.
+function wireRowLink(el, href) {
   el.classList.add('has-row-link');
   const a = document.createElement('a');
   a.className = 'row-link';
-  a.href = taskUrl(id);
+  a.href = href;
   a.dataset.spa = '';
   a.draggable = false;
   a.tabIndex = -1;
@@ -2555,7 +2571,9 @@ function organizationComboHtml(id, selectedId, label) {
   </div>`;
 }
 
-function wireOrganizationCombo(root, selectedId, onSelect, discover = false) {
+// `hrefFor(id)` makes each option a link to where choosing it goes, so it opens in
+// a new tab too; a plain click still chooses it.
+function wireOrganizationCombo(root, selectedId, onSelect, discover = false, hrefFor = null) {
   if (!root) return;
   const input = root.querySelector('input');
   const menu = root.querySelector('.combo-menu');
@@ -2592,10 +2610,14 @@ function wireOrganizationCombo(root, selectedId, onSelect, discover = false) {
     if (discover && (!query || 'new organization'.includes(query.toLowerCase())))
       matches.push({ id: '__new', name: '＋ New organization', accessible: true });
     active = -1;
-    menu.innerHTML = matches.length ? matches.map((o, index) => `<div class="combo-opt" role="option" id="${root.id}-option-${index}" data-index="${index}" aria-selected="${o.id === selectedId()}" aria-disabled="${!o.accessible}">
+    menu.innerHTML = matches.length ? matches.map((o, index) => {
+      const href = o.accessible && hrefFor?.(o.id);
+      const tag = href ? 'a' : 'div';
+      return `<${tag} class="combo-opt" role="option"${href ? ` href="${esc(href)}"` : ''} id="${root.id}-option-${index}" data-index="${index}" aria-selected="${o.id === selectedId()}" aria-disabled="${!o.accessible}">
       <div class="combo-opt-head"><span>${esc(o.name)}</span></div>
       ${o.accessible ? '' : '<div class="combo-opt-description">Membership required — ask an organization administrator for access</div>'}
-    </div>`).join('') : '<div class="combo-empty" role="status">No matching organizations</div>';
+    </${tag}>`;
+    }).join('') : '<div class="combo-empty" role="status">No matching organizations</div>';
     paint();
     const rect = root.getBoundingClientRect();
     const width = Math.min(Math.max(rect.width, 320), window.innerWidth - 16);
@@ -2665,7 +2687,9 @@ function wireOrganizationCombo(root, selectedId, onSelect, discover = false) {
   menu.addEventListener('mousedown', (event) => event.preventDefault());
   menu.addEventListener('click', (event) => {
     const option = event.target.closest('[data-index]');
-    if (option) void choose(Number(option.dataset.index));
+    if (!option || isNewTabClick(event)) return; // a linked option opens in a new tab
+    event.preventDefault();
+    void choose(Number(option.dataset.index));
   });
 }
 
@@ -3987,11 +4011,14 @@ function toast(msg, err = false, action) {
   t.appendChild(span);
   // An optional action (e.g. Undo) — gives the toast a clickable button and more
   // dwell time. Backward-compatible: existing toast(msg[, err]) calls are unchanged.
+  // An action with an `href` is a link (so it opens in a new tab too) instead.
   if (action) {
-    const btn = document.createElement('button');
+    const btn = document.createElement(action.href ? 'a' : 'button');
     btn.className = 'toast-action';
     btn.textContent = action.label;
-    btn.addEventListener('click', () => { t.remove(); action.fn(); });
+    if (action.href) { btn.href = action.href; btn.dataset.spa = ''; }
+    // Removed after the click, so a link it was still opens.
+    btn.addEventListener('click', () => { setTimeout(() => t.remove()); action.fn?.(); });
     t.appendChild(btn);
   } else if (err) {
     // An error is often a form's only feedback and may need reading twice, so it
@@ -4013,26 +4040,26 @@ function showTaskError(error, projectId) {
   if (/add a git repo in project settings/i.test(message)) {
     return toast('Please add a git repo in', true, {
       label: 'project settings',
-      fn: () => go(projectRoute(projectId, 'settings')),
+      href: projectRoute(projectId, 'settings'),
     });
   }
   if (/choose a GitHub repo .*project settings/i.test(message)) {
     return toast('Please choose an attached GitHub repo in', true, {
       label: 'project settings',
-      fn: () => go(projectRoute(projectId, 'settings')),
+      href: projectRoute(projectId, 'settings'),
     });
   }
   if (/connect GitHub in organization settings/i.test(message)) {
     const project = projectById(projectId);
     return toast('Please connect GitHub in', true, {
       label: 'organization settings',
-      fn: () => go(`${globalRoute('organization', organizationById(project?.organizationId))}#settings-code`),
+      href: `${globalRoute('organization', organizationById(project?.organizationId))}#settings-code`,
     });
   }
   if (/(?:connect|reconnect) GitHub on your profile/i.test(message)) {
     return toast(message.replace(/ on your profile.*$/i, ' in'), true, {
       label: 'your profile',
-      fn: () => go(globalRoute('profile')),
+      href: profileRoute(),
     });
   }
   return toast(message, true);
@@ -4356,8 +4383,8 @@ function inboxEventChanges(ev) {
   return ev.type.includes('escalat')
     || /(^|-)review-requested$/.test(ev.type.replace(/[._]/g, '-'))
     || ['task.responsibility-changed', 'task.assigned', 'task.mentioned',
-      'credential.approval-requested', 'credential.approval-resolved', 'connection.requested', 'connection.resolved',
-      'permission.approval-requested', 'permission.approval-resolved', 'permission.approval-dismissed',
+      'credential.approval-requested', 'credential.approval-resolved', 'credential.approval-dismissed',
+      'connection.requested', 'connection.resolved', 'connection.dismissed', 'permission.approval-requested', 'permission.approval-resolved', 'permission.approval-dismissed',
       'authorization.approval-requested', 'authorization.approval-resolved', 'authorization.approval-dismissed'].includes(ev.type);
 }
 let inboxRefreshTimer;
@@ -4585,6 +4612,11 @@ function syncQueryUrl() {
   if (path !== currentPath()) history.replaceState({ kx: 1 }, '', path);
 }
 
+// The URL of the task list on screen with query `q` — what a view chip links to.
+function listQueryRoute(q) {
+  return S.tab === 'inbox' ? inboxRoute(q) : S.tab === 'home' ? homeRoute(undefined, q) : projectRoute(S.projectId, 'tasks', q);
+}
+
 // The query-driven task lists: a project's, the organization home, and the
 // bell's page over every organization.
 function isTaskListTab(tab = S.tab) { return tab === 'tasks' || isCrossProjectList(tab); }
@@ -4625,11 +4657,26 @@ async function setQuery(q) {
 async function navigateToTagSection(tagId) {
   const tag = tagById(tagId);
   if (!tag) return;
-  // Section by the tag's own kind so the target section is present in the grouping.
+  // wireTasksView() scrolls to the section once it is painted. From the same list
+  // the hash alone changes, which is no new place to go Back to.
+  const route = tagSectionRoute(tag);
+  await go(route, { replace: route.split('#')[0] === currentPath() });
+}
+
+// A tag's section: its project's list sectioned by the tag's own kind (so the
+// section is present in the grouping), the section named in the hash — so the
+// link also lands on it in a new tab.
+function tagSectionRoute(tag) {
   const q = tag.kind === 'type' || tag.kind === 'topic' ? `group:tag-${tag.kind}` : TAG_SECTION_QUERY;
-  await go(projectRoute(tag.projectId, 'tasks', q));
-  const section = document.getElementById(tagSectionId(tagId));
+  return `${projectRoute(tag.projectId, 'tasks', q)}#${tagSectionId(tag.id)}`;
+}
+
+// Once the section a tag link names (#tag-section-<id>) is painted, bring it into
+// view and drop the hash, so later repaints of the list leave the scroll alone.
+function scrollToHashedTagSection() {
+  const section = location.hash.startsWith('#tag-section-') && document.getElementById(decodeRoutePart(location.hash.slice(1), true));
   if (!section) return;
+  history.replaceState(history.state, '', currentPath());
   section.scrollIntoView({ behavior: 'smooth', block: 'start' });
   section.classList.remove('tag-section-target');
   requestAnimationFrame(() => section.classList.add('tag-section-target'));
@@ -4681,6 +4728,7 @@ const LIST_RELOAD_EVENTS = new Set([
   'task.responsibility-changed',
   'credential.approval-requested', 'connection.requested',
   'credential.approval-resolved',
+  'credential.approval-dismissed', 'connection.dismissed',
   'permission.approval-requested',
   'permission.approval-resolved',
   'permission.approval-dismissed',
@@ -4757,7 +4805,7 @@ function patchSubTaskSummaryFromEvent(ev) {
 // An approval request carries no lifecycle fields to patch, and the child's
 // summary only learns its count from the server: refetch the open parent.
 function subTaskSummaryEventNeedsRefresh(ev) {
-  if (!/\.approval-(?:requested|resolved|dismissed)$|^connection\.(?:requested|resolved)$/.test(ev.type || '')) return false;
+  if (!/\.approval-(?:requested|resolved|dismissed)$|^connection\.(?:requested|resolved|dismissed)$/.test(ev.type || '')) return false;
   return (S.view?.subTaskSummaries || []).some((summary) => summary.id === ev.taskId);
 }
 
@@ -4860,7 +4908,9 @@ function connectWs() {
       if (ev.type === 'view.updated' || ev.type.includes('stage') || ev.type === 'merge.result' || ev.type === 'turn.result'
         || ev.type.endsWith('.approval-requested') || ev.type.endsWith('.approval-resolved')) {
         refreshTask(ev.type);
-      } else if (ev.type === 'session.started' || ev.type === 'review.updated' || ev.type.startsWith('connection.') || ev.type.endsWith('.approval-dismissed')) {
+      } else if (ev.type === 'session.started' || ev.type === 'review.updated' || ev.type.startsWith('connection.') || ev.type.endsWith('.approval-dismissed')
+        // A draft sub-task saved, queued or started: only the server's summaries know it.
+        || ev.type === 'subtask.created' || ev.type === 'subtask.queued' || ev.type === 'subtask.started') {
         // Mid-turn metadata changes must not clear output or patch lifecycle state.
         refreshTask(ev.type);
       } else if (ev.type !== 'agent.output') scheduleTaskPageRender(); // sub-task fan-out, pushes, PR/world events: sections derived from S.taskEvents
@@ -5299,7 +5349,7 @@ function renderShell() {
     const route = organizationLandingRoute(id);
     if (route) await go(route);
     else toast('Organization access is no longer available', true);
-  }, true);
+  }, true, (id) => (id === '__new' ? null : organizationLandingRoute(id)));
   syncRailNav();
   renderOnboarding();
   // The rail/main are painted by applyRoute() (boot calls it right after), so the
@@ -5731,12 +5781,13 @@ function dropFolder(row) {
   return '';
 }
 
-function switchTab(tab) {
-  if (tab === 'insights') return go(globalRoute('insights'));
-  if (tab === 'global' || tab === 'organization') return go(globalRoute('organization'));
-  if (tab === 'inbox') return go(inboxRoute(DEFAULT_LIST_QUERY));
+function switchTab(tab) { return go(tabRoute(tab)); }
+function tabRoute(tab) {
+  if (tab === 'insights') return globalRoute('insights');
+  if (tab === 'global' || tab === 'organization') return globalRoute('organization');
+  if (tab === 'inbox') return inboxRoute(DEFAULT_LIST_QUERY);
   const pid = S.projectId || firstProjectForOrganization(S.organizationId)?.id;
-  return go(pid ? projectRoute(pid, tab) : globalRoute('insights'));
+  return pid ? projectRoute(pid, tab) : globalRoute('insights');
 }
 
 // Preserve the focused field (value + caret) across a renderMain() innerHTML
@@ -5973,24 +6024,36 @@ function viewIdForQuery(q) {
 // The saved-views switcher — every chip is a query. "For me" is the default, then
 // "Active", the built-in starter views, and the project's saved views (each with a ✕
 // to delete). Saved views belong to a project, so the organization home has none.
+// A chip is a real link to its list URL, so Ctrl/⌘/middle-click opens the view in
+// a new tab; wireOrgControls() keeps a plain click an in-place query switch.
 function viewsBar() {
   const active = viewIdForQuery(S.search);
   const home = isCrossProjectList();
+  const chip = (id, query, label, cls = '', extra = '') =>
+    `<a class="view-chip ${cls}${active === id ? ' active' : ''}" data-view="${esc(id)}" href="${esc(listQueryRoute(query))}"${extra}>${label}</a>`;
   const builtins = BUILTIN_VIEWS
-    .map((v) => `<div class="view-chip builtin ${active === v.id ? 'active' : ''}" data-view="${v.id}" role="button" tabindex="0" title="${esc(v.query)}">${esc(v.name)}</div>`)
+    .map((v) => chip(v.id, v.query, esc(v.name), 'builtin', ` title="${esc(v.query)}"`))
     .join('');
   const saved = (home ? [] : S.views)
-    .map(
-      (v) => `<div class="view-chip ${active === v.id ? 'active' : ''}" data-view="${v.id}" role="button" tabindex="0">${v.icon ? esc(v.icon) + ' ' : ''}${esc(v.name)}<span class="view-x" data-delview="${v.id}" title="Delete view">✕</span></div>`,
-    )
+    .map((v) => chip(v.id, viewQuery(v.id), `${v.icon ? esc(v.icon) + ' ' : ''}${esc(v.name)}<span class="view-x" data-delview="${v.id}" title="Delete view">✕</span>`))
     .join('');
   return `<div class="views-bar">
-    <div class="view-chip ${active === FOR_ME_VIEW ? 'active' : ''}" data-view="${FOR_ME_VIEW}" role="button" tabindex="0" title="Waiting on you: reviews, questions, approvals, mentions — and your drafts">For me</div>
-    <div class="view-chip ${active === ACTIVE_VIEW ? 'active' : ''}" data-view="${ACTIVE_VIEW}" role="button" tabindex="0" title="${esc(ACTIVE_VIEW_QUERY)}">Active</div>
+    ${chip(FOR_ME_VIEW, DEFAULT_LIST_QUERY, 'For me', '', ' title="Waiting on you: reviews, questions, approvals, mentions — and your drafts"')}
+    ${chip(ACTIVE_VIEW, ACTIVE_VIEW_QUERY, 'Active', '', ` title="${esc(ACTIVE_VIEW_QUERY)}"`)}
     ${builtins}
     ${saved}
     ${home ? '' : '<div class="view-chip add" id="save-view" role="button" tabindex="0" title="Save the current query as a view">+ Save view</div>'}
   </div>`;
+}
+
+// The query a view chip stands for ('' for an unknown id).
+function viewQuery(id) {
+  if (id === ACTIVE_VIEW) return ACTIVE_VIEW_QUERY;
+  if (id === FOR_ME_VIEW) return DEFAULT_LIST_QUERY;
+  const builtin = BUILTIN_VIEWS.find((x) => x.id === id);
+  if (builtin) return builtin.query;
+  const saved = (S.views || []).find((x) => x.id === id);
+  return saved ? stringifyQuery(saved.query || {}) : '';
 }
 
 // Workflow params are searchable/organizable too, via synthetic fields the server
@@ -6347,7 +6410,7 @@ function tagChips(t, link = true) {
   if (!t.tags || !t.tags.length) return '';
   return t.tags
     .map((id) => { const tag = tagById(id); if (!tag) return ''; const c = tag.color ? ` style="--tag:${esc(tag.color)}"` : '';
-      return link ? `<button type="button" class="tag-chip tag-link ${esc(tag.kind || '')}" data-tag-link="${esc(id)}" title="Go to ${esc(tagPathStr(id))}"${c}>${esc(tagPathStr(id))}</button>`
+      return link ? `<a class="tag-chip tag-link ${esc(tag.kind || '')}" data-tag-link="${esc(id)}" href="${esc(tagSectionRoute(tag))}" title="Go to ${esc(tagPathStr(id))}"${c}>${esc(tagPathStr(id))}</a>`
         : `<span class="tag-chip ${esc(tag.kind || '')}"${c}>${esc(tagPathStr(id))}</span>`; })
     .join('');
 }
@@ -6595,22 +6658,18 @@ function pipeline(v) {
 function wireOrgControls() {
   const main = $('#main');
   // Saved-view chips: each selects a query.
+  // A chip is a link (new tab on a modified click); a plain click switches the
+  // query in place, replacing the history entry as typing a query does.
   main.querySelectorAll('.view-chip[data-view]').forEach((el) =>
     el.addEventListener('click', (ev) => {
       if (ev.target.closest('[data-delview]')) return; // the ✕ handles itself
-      const id = el.dataset.view;
-      if (id === ACTIVE_VIEW) { setQuery(ACTIVE_VIEW_QUERY); return; }
-      if (id === FOR_ME_VIEW) { setQuery(DEFAULT_LIST_QUERY); return; }
-      const builtin = BUILTIN_VIEWS.find((x) => x.id === id);
-      if (builtin) { setQuery(builtin.query); return; }
-      const v = S.views.find((x) => x.id === id);
-      if (!v) return;
-      setQuery(stringifyQuery(v.query || {}));
+      plainClick(() => setQuery(viewQuery(el.dataset.view)))(ev);
     }),
   );
   // Delete a saved view (with confirmation) — the API/gateway already support it.
   main.querySelectorAll('[data-delview]').forEach((x) =>
     x.addEventListener('click', async (ev) => {
+      ev.preventDefault(); // the ✕ sits inside the chip's link
       ev.stopPropagation();
       const id = x.dataset.delview;
       const v = S.views.find((y) => y.id === id);
@@ -6964,7 +7023,7 @@ function openTagsManager(initialEditId = null) {
     const sorted = S.tags.slice().sort((a, b) => tagPathStr(a.id).localeCompare(tagPathStr(b.id)));
     const rows = S.tags.length
       ? sorted.map((t) => `<div class="tagm-row ${editingId === t.id ? 'active' : ''}">
-          <button type="button" class="tag-chip tag-link ${esc(t.kind || '')}" data-tag-link="${esc(t.id)}" ${t.color ? `style="--tag:${esc(t.color)}"` : ''} title="Go to this section">${esc(tagPathStr(t.id))}</button>
+          <a class="tag-chip tag-link ${esc(t.kind || '')}" data-tag-link="${esc(t.id)}" href="${esc(tagSectionRoute(t))}" ${t.color ? `style="--tag:${esc(t.color)}"` : ''} title="Go to this section">${esc(tagPathStr(t.id))}</a>
           <span class="tagm-summary">
             <span class="pal-sub">${esc(t.kind || '—')}</span>
             ${t.description ? `<span class="tagm-description">${esc(t.description)}</span>` : ''}
@@ -7020,10 +7079,10 @@ function openTagsManager(initialEditId = null) {
     const close = () => (root.innerHTML = '');
     $('#tagm-scrim').addEventListener('click', (e) => { if (e.target.id === 'tagm-scrim') close(); });
     $('#tagm-close').addEventListener('click', close);
-    root.querySelectorAll('.tagm-row [data-tag-link]').forEach((chip) => chip.addEventListener('click', () => {
+    root.querySelectorAll('.tagm-row [data-tag-link]').forEach((chip) => chip.addEventListener('click', plainClick(() => {
       close();
       navigateToTagSection(chip.dataset.tagLink);
-    }));
+    })));
     const addTag = async () => {
       const name = $('#tagm-name').value.trim(); if (!name) return;
       try {
@@ -7081,6 +7140,7 @@ function openTagsManager(initialEditId = null) {
 
 function wireTasksView() {
   wireOrgControls();
+  scrollToHashedTagSection();
   $('#main').querySelectorAll('[data-edit-tag]').forEach((button) =>
     button.addEventListener('click', (ev) => {
       ev.stopPropagation();
@@ -7089,13 +7149,15 @@ function wireTasksView() {
   );
   const home = isCrossProjectList();
   $('#main').querySelectorAll('.task-row[data-id]').forEach((e) => wireTaskNav(e, () => e.dataset.id));
-  // On the organization home (and the bell's page) a draft or armed row may
-  // belong to any project: it opens on its own project's page rather than in a
-  // form bound to this one.
-  if (home) $('#main').querySelectorAll('[data-draft], [data-armed]').forEach((e) => wireTaskNav(e, () => e.dataset.draft || e.dataset.armed));
-  else $('#main').querySelectorAll('[data-draft]').forEach((e) =>
-    e.addEventListener('click', (ev) => { if (!ev.target.dataset.queue && !ev.target.dataset.deldraft) openTaskForm(undefined, taskRecord(e.dataset.draft)); }),
-  );
+  // A draft or armed row links to its task page, where it opens in the task form.
+  // In its own project's list a plain click opens that form in place instead
+  // (below); on the organization home (and the bell's page) it may belong to any
+  // project, so it navigates to its own project's page.
+  $('#main').querySelectorAll('[data-draft], [data-armed]').forEach((e) => wireTaskNav(e, () => e.dataset.draft || e.dataset.armed));
+  const editInPlace = (e, id) => e.addEventListener('click', (ev) => {
+    if (!ev.target.closest('button')) plainClick(() => openTaskForm(undefined, taskRecord(id)))(ev);
+  });
+  if (!home) $('#main').querySelectorAll('[data-draft]').forEach((e) => editInPlace(e, e.dataset.draft));
   $('#main').querySelectorAll('[data-queue]').forEach((b) =>
     b.addEventListener('click', async (ev) => { ev.stopPropagation(); try { await api(`/api/tasks/${b.dataset.queue}/queue`, { method: 'POST', body: '{}' }); toast('Task started'); refreshTasks(); } catch (e) { showTaskError(e, taskRecord(b.dataset.queue)?.projectId); } }),
   );
@@ -7123,9 +7185,7 @@ function wireTasksView() {
     }),
   );
   // Clicking a waiting task's body opens the same form as a draft — fully editable, triggers included.
-  if (!home) $('#main').querySelectorAll('[data-armed]').forEach((e) =>
-    e.addEventListener('click', (ev) => { if (!ev.target.dataset.runnow && !ev.target.dataset.canceltrig) openTaskForm(undefined, taskRecord(e.dataset.armed)); }),
-  );
+  if (!home) $('#main').querySelectorAll('[data-armed]').forEach((e) => editInPlace(e, e.dataset.armed));
   // Repeatable series: run again, expand/collapse its runs, edit (body click), delete.
   $('#main').querySelectorAll('[data-runagain]').forEach((b) =>
     b.addEventListener('click', async (ev) => { ev.stopPropagation(); try { await api(`/api/tasks/${b.dataset.runagain}/run-again`, { method: 'POST', body: '{}' }); toast('New run started'); refreshTasks(); } catch (e) { toast(e.message, true); } }),
@@ -7548,6 +7608,54 @@ function vaultItemSearchText(item) {
   ].filter(Boolean).join(' ').toLowerCase();
 }
 
+// The keyboard of the vault credential dialogs, as in the other pickers: focus
+// stays in the search box while ↑/↓ move a highlighted row (kept in view); from a
+// row's checkbox or button they carry focus to the same control a row away.
+// Enter runs `onEnter(row)`, ⌘/Ctrl+Enter `onSubmit()`, Esc `close()`. Keys it
+// handles never reach the page's shortcuts beneath. Call the returned `sync()`
+// after the rows change (search); it keeps the highlight when still shown.
+// `start` is the row highlighted first (else the first row).
+function wireVaultListKeys(overlay, { search, rows, start, onEnter, onSubmit, close }) {
+  let current = null;
+  const shown = () => rows().filter((row) => !row.hidden);
+  const highlight = (row) => {
+    current?.classList.remove('active');
+    current = row || null;
+    current?.classList.add('active');
+    current?.scrollIntoView({ block: 'nearest' });
+  };
+  const sync = () => { const list = shown(); highlight(list.includes(current) ? current : list[0]); };
+  const rowOf = (el) => rows().find((row) => row.contains(el));
+  const twin = (row, control) => [...row.querySelectorAll(control.tagName)].find((c) =>
+    c.className === control.className && c.type === control.type
+    && Object.keys(c.dataset).join() === Object.keys(control.dataset).join()
+    && !c.disabled && c.getClientRects().length);
+  overlay.addEventListener('focusin', (e) => { const row = rowOf(e.target); if (row && row !== current) highlight(row); });
+  overlay.addEventListener('keydown', (e) => {
+    const t = e.target;
+    if (e.isComposing || e.defaultPrevented) return;
+    const plain = !e.altKey && !e.shiftKey && !e.metaKey && !e.ctrlKey;
+    if (e.key === 'Escape') close();
+    else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && onSubmit) onSubmit();
+    else if ((e.key === 'ArrowDown' || e.key === 'ArrowUp') && plain && !t.matches('select, textarea, pre')) {
+      const list = shown();
+      const at = list.indexOf(current);
+      const row = list[at < 0 ? 0 : Math.max(0, Math.min(list.length - 1, at + (e.key === 'ArrowDown' ? 1 : -1)))];
+      if (row) {
+        highlight(row);
+        if (t !== search) (rowOf(t) && twin(row, t) || search).focus();
+      }
+    } else if (e.key === 'Enter' && plain && (t === search || t.matches('input[type="checkbox"], input[type="radio"]') && rowOf(t))) {
+      if (current) onEnter(current);
+    } else return;
+    e.preventDefault();
+    e.stopPropagation();
+  });
+  highlight(start);
+  sync();
+  return sync;
+}
+
 // Full vault-item chooser used by the compact task-form button. It mirrors the
 // password-manager import panel, while allowing sparse policy overrides for this
 // task. "Inherit" deliberately stays sparse so global policy edits keep flowing.
@@ -7601,7 +7709,7 @@ function openVaultGrantPicker(items, selectedIds, policyOverrides, onApply, { si
     </div>
     <div class="vault-grant-actions">
       <button type="button" class="btn sm" data-vault-cancel>Cancel</button>
-      <button type="button" class="btn sm primary" data-vault-apply>Apply</button>
+      <button type="button" class="btn sm primary" data-vault-apply title="Apply (${fmtKeys('meta+Enter')})">Apply</button>
     </div>
   </div>`;
   document.body.appendChild(overlay);
@@ -7653,18 +7761,27 @@ function openVaultGrantPicker(items, selectedIds, policyOverrides, onApply, { si
     });
     overlay.querySelector('.vault-search-empty').hidden = visible > 0 || !items.length;
     refreshCount();
+    syncKeys();
   });
-  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
-  overlay.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); close(); }
-  });
-  overlay.querySelector('[data-vault-cancel]').addEventListener('click', close);
-  overlay.querySelector('[data-vault-apply]').addEventListener('click', () => {
+  const apply = () => {
     const selected = new Set(picks.filter((pick) => pick.checked).map((pick) => pick.value));
     const selectedPolicies = Object.fromEntries(Object.entries(localPolicies).filter(([itemId]) => selected.has(itemId)));
     onApply(selected, selectedPolicies);
     close();
+  };
+  // Enter ticks the highlighted credential; a single choice is then made.
+  const syncKeys = wireVaultListKeys(overlay, {
+    search, rows: () => rows, start: rows.find((row) => selectedIds.has(row.dataset.vaultItem)), close, onSubmit: apply,
+    onEnter: (row) => {
+      const pick = row.querySelector('.vault-grant-pick');
+      if (!single) return pick.click();
+      pick.checked = true;
+      apply();
+    },
   });
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+  overlay.querySelector('[data-vault-cancel]').addEventListener('click', close);
+  overlay.querySelector('[data-vault-apply]').addEventListener('click', apply);
   search.focus();
 }
 
@@ -8572,7 +8689,7 @@ function renderTaskLoadingPage(rec, error, notStarted = false) {
   const title = rec?.title || 'Task';
   main.innerHTML = `<div class="task-page" aria-busy="${error || notStarted ? 'false' : 'true'}">
     <div class="tp-head wide">${taskBreadcrumb({ taskId: rec?.id, parentTaskId: rec?.parentTaskId })}<div class="row1">
-      <button class="icon-btn" id="tp-back" data-shortcut="nav.close" title="Back (Esc)">←</button>
+      <a class="icon-btn" id="tp-back" href="${esc(taskBackRoute())}" data-shortcut="nav.close" title="Back (Esc)">←</a>
       ${rec?.num != null ? `<span class="task-num">#${rec.num}</span>` : ''}
       <h2>${esc(title)}</h2>
     </div></div>
@@ -8582,7 +8699,7 @@ function renderTaskLoadingPage(rec, error, notStarted = false) {
       ? `<div class="task-load-error"><b>Couldn’t load this task</b><span>${esc(error)}</span><button class="btn sm" id="task-load-retry">Try again</button></div>`
       : '<span class="global-search-loading">Loading task…</span>'}</div>
   </div>`;
-  $('#tp-back')?.addEventListener('click', closeTask);
+  $('#tp-back')?.addEventListener('click', plainClick(closeTask));
   $('#task-load-retry')?.addEventListener('click', () => openTask(rec?.id || S.selected, S.taskTab, !!S.viewingAttempt));
 }
 
@@ -8605,7 +8722,7 @@ async function renderSeriesPage(rec) {
       <div class="tp-head">
         ${taskBreadcrumb({ taskId: rec.id, parentTaskId: rec.parentTaskId })}
         <div class="row1">
-          <button class="icon-btn" id="tp-back" data-shortcut="nav.close" title="Back (Esc)">←</button>
+          <a class="icon-btn" id="tp-back" href="${esc(taskBackRoute())}" data-shortcut="nav.close" title="Back (Esc)">←</a>
           ${rec.num != null ? `<span class="task-num">#${rec.num}</span>` : ''}
           <h2>${esc(rec.title)}</h2>
           <span class="chip">repeatable</span>
@@ -8641,7 +8758,7 @@ async function renderSeriesPage(rec) {
         <button class="btn primary" id="sd-save">Save changes</button>
       </div></div>
     </div>`;
-  $('#tp-back').addEventListener('click', closeTask);
+  $('#tp-back').addEventListener('click', plainClick(closeTask));
   wireAgentFields($('#tf-body'));
   wireFieldResets($('#tf-body'), fields);
   renderCredentialEditor($('#cred-editor-newtask'), 'task', { projectId: rec.projectId, taskId: rec.id });
@@ -9137,13 +9254,17 @@ async function refreshTask(reason = 'all') {
 // then repaints the list. Kept as a navigation so the URL + history stay in sync
 // (the ← button, Esc and the palette all route through here).
 function closeTask() {
-  const pid = (S.view && taskRecord(S.view.taskId)?.projectId) || S.projectId;
-  const back = S.returnRoute || (pid ? projectRoute(pid) : globalRoute('insights'));
+  const back = taskBackRoute();
   S.returnRoute = null;
   // A push, not a replace: Back after closing reopens the task that was just
   // closed, and Back from the task page returns to the list — the history a
   // user expects. Replacing left two identical list entries, so Back did nothing.
   return go(back);
+}
+// Where closing the task page goes — also the ← link's href, for a new tab.
+function taskBackRoute() {
+  const pid = (S.view && taskRecord(S.view.taskId)?.projectId) || S.projectId;
+  return S.returnRoute || (pid ? projectRoute(pid) : globalRoute('insights'));
 }
 // Drop the open task's page state without navigating (called by applyRoute()).
 function closeTaskDom() {
@@ -9175,7 +9296,7 @@ function orgEditorHtml(rec) {
     const t = tagById(id); if (!t) return '';
     const color = t.color ? `style="--tag:${esc(t.color)}"` : '';
     return `<span class="tag-assignment" ${color}>
-      <button type="button" class="tag-chip tag-link ${esc(t.kind || '')}" data-tag-link="${esc(id)}" title="Go to ${esc(tagPathStr(id))}">${esc(tagPathStr(id))}</button>
+      <a class="tag-chip tag-link ${esc(t.kind || '')}" data-tag-link="${esc(id)}" href="${esc(tagSectionRoute(t))}" title="Go to ${esc(tagPathStr(id))}">${esc(tagPathStr(id))}</a>
       <button type="button" class="tag-remove" data-untag="${esc(id)}" title="Remove ${esc(tagPathStr(id))} from this task" aria-label="Remove tag">×</button>
     </span>`;
   }).join('');
@@ -9584,7 +9705,7 @@ function renderTaskPage() {
       <div class="tp-head wide">
         ${taskBreadcrumb(v)}
         <div class="row1">
-          <button class="icon-btn" id="tp-back" data-shortcut="nav.close" title="Back to the list (Esc)">←</button>
+          <a class="icon-btn" id="tp-back" href="${esc(taskBackRoute())}" data-shortcut="nav.close" title="Back to the list (Esc)">←</a>
           ${v.num != null ? `<span class="task-num" title="Task #${v.num} — permalink ${esc(base)}">#${v.num}</span>` : ''}
           <h2>${esc(v.title)}</h2>
           ${v.approvalRequests ? `<span class="chip approval-needed">approval needed</span>` : ''}
@@ -9604,16 +9725,14 @@ function renderTaskPage() {
         <aside class="tp-rail" id="tp-rail" aria-label="Task details">${taskRail(v, rec)}</aside>
       </div>
     </div>`);
-  $('#tp-back').addEventListener('click', closeTask);
+  $('#tp-back').addEventListener('click', plainClick(closeTask));
   // The tabs are real links (Ctrl/⌘-click or middle-click opens the pinned tab in
   // a new browser tab); a plain click switches in place without a refetch.
   main.querySelectorAll('[data-tasktab]').forEach((a) =>
-    a.addEventListener('click', (e) => {
-      if (e.ctrlKey || e.metaKey || e.shiftKey) return; // the browser handles new-tab/new-window opens
-      e.preventDefault();
+    a.addEventListener('click', plainClick(() => {
       if (a.dataset.tasktab === 'checkin' && S.taskTab === 'checkin' && checkinSelection(v) === 'terminal') selectCheckinPane(v, liveRoleFor(v));
       else setTaskTab(a.dataset.tasktab);
-    }),
+    })),
   );
   wireAttempts(v);
   wireStageTransitions(v);
@@ -10609,7 +10728,7 @@ function parentTaskContext(v) {
   const label = parent
     ? `${parent.num != null ? `#${parent.num} ` : ''}${parent.title}`
     : numLabel(parentId);
-  return `<button type="button" class="tp-crumb tp-parent" data-open="${esc(parentId)}" title="Parent task" aria-label="Open parent task ${esc(label)}">${esc(label)}</button>`;
+  return `<a class="tp-crumb tp-parent" data-open="${esc(parentId)}" data-spa href="${esc(taskUrl(parentId, parent))}" title="Parent task" aria-label="Open parent task ${esc(label)}">${esc(label)}</a>`;
 }
 
 // A child reads exactly as it does in the task list and on its own page: the
@@ -10620,7 +10739,10 @@ function parentTaskContext(v) {
 function subTaskState(rec) {
   const v = rec?.lastView || {};
   const done = v.status === 'done' || v.stage === 'done';
-  const tone = v.state?.draft ? 'draft' : done ? 'done' : v.stage === 'escalated' ? 'blocked' : v.status || 'active';
+  // A draft sub-task waits to be run; once queued, for its parent to start it.
+  if (v.state?.draft) return { label: v.state.queued ? 'queued' : 'draft', tone: v.state.queued ? 'waiting' : 'draft',
+    complete: false, approval: false, draft: !v.state.queued };
+  const tone = done ? 'done' : v.stage === 'escalated' ? 'blocked' : v.status || 'active';
   return { label: stageLabel(v), tone, complete: done, approval: !!v.approvalRequests };
 }
 
@@ -10635,7 +10757,9 @@ function subTasksSection(v) {
   // fetched with the parent and patched from the child's events, so it wins over
   // any other copy of the child the console happens to hold.
   const summaries = new Map((v.subTaskSummaries || []).map((summary) => [summary.id, summary]));
-  const ids = [...new Set([...summaries.keys(), ...(v.subTasks || [])])];
+  // A pull request of this task (software-dev ≥1.30) is part of it, shown under Branches.
+  const pullRequests = new Set((v.shipments || []).map((shipment) => shipment.childTaskId));
+  const ids = [...new Set([...summaries.keys(), ...(v.subTasks || [])])].filter((id) => !pullRequests.has(id));
   if (!ids.length) return '';
   const children = ids.map((id) => {
     const rec = summaries.get(id) || taskRecord(id);
@@ -10647,15 +10771,17 @@ function subTasksSection(v) {
   const rows = children.map(({ id, rec, state }) => {
     const title = rec?.title || `Sub-task ${numLabel(id)}`;
     const childView = { workflow: rec?.workflow || v.workflow, ...(rec?.lastView || {}) };
-    return `<button type="button" class="subtask-row" data-open="${esc(id)}" aria-label="Open ${esc(title)} — ${esc(state.label)}">
+    const row = `<a class="subtask-row" data-open="${esc(id)}" data-spa href="${esc(taskUrl(id, rec))}" aria-label="Open ${esc(title)} — ${esc(state.label)}">
       <span class="subtask-state ${esc(state.tone)}" aria-hidden="true"></span>
       <span class="subtask-identity">
         <span class="subtask-title">${rec?.num != null ? `<span class="task-num">#${rec.num}</span>` : ''}<strong>${esc(title)}</strong></span>
         ${subTaskStateHtml(state, 'subtask-copy')}
       </span>
-      <span class="subtask-pipeline" aria-hidden="true">${pipeline(childView)}</span>
+      <span class="subtask-pipeline" aria-hidden="true">${state.draft || state.label === 'queued' ? '' : pipeline(childView)}</span>
       <span class="subtask-arrow" aria-hidden="true">›</span>
-    </button>`;
+    </a>`;
+    // A draft runs from here; it starts off this task's work as it is then.
+    return state.draft ? `<div class="subtask-draft">${row}<button type="button" class="btn sm" data-run-subtask="${esc(id)}" title="Start it from this task's current work">Run</button></div>` : row;
   }).join('');
   return `<section class="subtasks" aria-labelledby="subtasks-title">
     <div class="subtasks-head">
@@ -10819,7 +10945,7 @@ function checkoutsSection(v) {
       <span style="color:var(--ink-3)">→ ${esc(lane.target)}</span>
       <span style="flex:1"></span>
       <span class="chip ${esc(tone)}">${esc(label)}</span>
-      <button type="button" class="btn sm ghost" data-open="${esc(lane.childTaskId)}" title="Open its pull request">${esc(rec?.num != null ? `#${rec.num}` : numLabel(lane.childTaskId))}</button>
+      <a class="btn sm ghost" data-open="${esc(lane.childTaskId)}" data-spa href="${esc(taskUrl(lane.childTaskId, rec))}" title="Its Review and landing">Open</a>
       ${approvable ? `<button type="button" class="btn sm" data-approve-pr="${esc(lane.childTaskId)}" data-branch="${esc(c.name)}">Approve</button>` : ''}
     </div>`;
     }
@@ -10874,10 +11000,18 @@ function taskRail(v, rec = taskRecord(v.taskId)) {
     ${renderWidgetGroups(S.widgets)}
     ${notesSection(v)}
     <div class="rail-links">
-      ${rec?.params?.draft ? '' : '<button type="button" class="btn tool rail-link" id="approval-history-open" title="Every app, credential and permission request this task raised">Approval requests</button>'}
+      ${rec?.params?.draft ? '' : approvalHistoryLink(v)}
       ${railTerminal(v)}
     </div>
   </div>`;
+}
+
+// The record of every request the task raised, with how many still wait on a
+// decision — ignored ones too: the agent waits on those all the same.
+function approvalHistoryLink(v) {
+  const pending = v.pendingDecisions || 0;
+  return `<button type="button" class="btn tool rail-link" id="approval-history-open" title="Every app, credential and permission request this task raised">Approval requests${pending
+    ? ` <span class="rail-link-count" aria-label="${pending} pending">${pending}</span>` : ''}</button>`;
 }
 
 // The shell, last in the rail: rarely needed. It shows in place of the
@@ -10924,6 +11058,21 @@ function wireTaskRail(v) {
     S.taskRailOverlay = false; // the shell shows in place of the floating rail
     toggleTaskTerminal(v);
   });
+  wireSubTaskDrafts(v);
+}
+
+// Run a draft sub-task: its parent starts it after its agent's current turn.
+function wireSubTaskDrafts(v) {
+  document.querySelectorAll('[data-run-subtask]').forEach((b) => b.addEventListener('click', async () => {
+    b.disabled = true;
+    try {
+      await api(`/api/tasks/${encodeURIComponent(b.dataset.runSubtask)}/queue`, { method: 'POST', body: '{}' });
+      const summary = (v.subTaskSummaries || []).find((child) => child.id === b.dataset.runSubtask);
+      if (summary) summary.lastView = { ...summary.lastView, state: { draft: true, queued: true } };
+      toast('Queued');
+      renderTaskPage();
+    } catch (e) { b.disabled = false; showTaskError(e, v.projectId); }
+  }));
 }
 
 // The page's details rail, open or closed (the header toggle, i).
@@ -11065,6 +11214,9 @@ function conversationPane(v, t) {
   const presence = conversationPresence(v, t);
   const transcripts = taskTranscripts(v);
   const followUp = (v.actions || []).find((a) => a.name === 'followUp');
+  // After Confirm the approved PR lands as it is: a message to the agent
+  // carries the work on in a new task (wiki features/continue-after-confirm).
+  const continues = followUp?.label === 'Continue';
   const canFollowUp = followUp && (!followUp.roles?.length || followUp.roles.includes(t.role));
   const requestedInput = canFollowUp ? conversationInputRequest(v, entries) : '';
   if (requestedInput && !entries.some((entry) => entry.type === 'input-request' && entry.request.text === requestedInput)) {
@@ -11087,7 +11239,7 @@ function conversationPane(v, t) {
           <div class="prompt-attach-row"><label class="attach-file-button" tabindex="0">Attach files<input class="followup-files" type="file" multiple hidden></label><span>25 MB each · 50 MB per prompt</span></div>
         </div>
         ${t.shared && stoppableAgent(v) ? stopAgentButton(stoppableAgent(v), 'btn followup-stop') : ''}
-        <button class="btn primary followup-send" data-keys="meta+Enter" ${followUp.enabled ? '' : 'disabled'}>Send</button>
+        <button class="btn primary followup-send" data-keys="meta+Enter" ${followUp.enabled ? '' : 'disabled'}${continues ? ' title="The approved PR lands as it is. The agent carries on in a new task."' : ''}>${continues ? 'Continue' : 'Send'}</button>
       </div></div>`
     : '';
   return `
@@ -11697,11 +11849,10 @@ async function openConversationShare(v, role) {
         <p>Anyone with this link can read the user and agent message text, including any sensitive information in it. Attachments, system messages, and tool activity are excluded. Later messages will not be added.</p>
         ${state.url ? `<label class="form-row"><span>Public snapshot link</span><input data-link readonly value="${esc(new URL(state.url, location.origin).href)}"></label><p class="task-sub">Created ${esc(new Date(state.createdAt).toLocaleString())}. Revoke this link before creating a new snapshot.</p><div class="inline-form"><button class="btn sm" data-copy>Copy link</button><a class="btn sm" href="${esc(state.url)}" target="_blank" rel="noopener noreferrer">Open snapshot</a><button class="btn sm" data-revoke>Revoke link</button></div>` : `<details><summary>Preview message text</summary>${(preview?.messages || []).filter(m => m.role === 'user' || m.role === 'agent').map(m => `<article><b>${m.role === 'user' ? 'User' : 'Agent'}</b><pre style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(m.text)}</pre></article>`).join('')}</details><button class="btn primary" data-create ${state.enabled ? '' : 'disabled'}>Create public link</button>`}</div>`;
       dialog.querySelector('[data-close]').onclick = () => dialog.close();
-      dialog.querySelector('[data-sharing-settings]')?.addEventListener('click', event => {
-        event.preventDefault();
+      dialog.querySelector('[data-sharing-settings]')?.addEventListener('click', plainClick(() => {
         dialog.close();
         go(settingsUrl);
-      });
+      }));
       dialog.querySelector('[data-copy]')?.addEventListener('click', async () => {
         try { await navigator.clipboard.writeText(new URL(state.url, location.origin).href); toast('Link copied'); }
         catch { dialog.querySelector('[data-link]').select(); toast('Select and copy the link above'); }
@@ -11905,7 +12056,7 @@ async function openLocalCheckout(v) {
   const rec = taskRecord(v.taskId);
   const project = projectById(rec?.projectId || S.projectId);
   return cliHandoffDialog({
-    command: `npx @tavya/cli clone ${cliTarget(project, rec?.num)}`,
+    command: `npx @tavya/cli@latest clone ${cliTarget(project, rec?.num)}`,
     note: `Code, data and secrets, as this task's world has them. <span class="mono nowrap">tavya push</span> brings your work back here; <span class="mono nowrap">tavya resume --fork</span> continues its agent on your machine.`,
     gitOnly: async (body) => {
       const [plan, preparedSessions] = await Promise.all([
@@ -11934,7 +12085,7 @@ async function openLocalCheckout(v) {
 async function openProjectCheckout(project) {
   if (!project?.id) return;
   return cliHandoffDialog({
-    command: `npx @tavya/cli clone ${cliTarget(project)}`,
+    command: `npx @tavya/cli@latest clone ${cliTarget(project)}`,
     note: `Code, data and secrets, as a task's world has them. <span class="mono nowrap">tavya pull</span> and <span class="mono nowrap">tavya push</span> keep them in step.`,
     gitOnly: async (body) => {
       const plan = await api(`/api/projects/${encodeURIComponent(project.id)}/checkout`);
@@ -12390,7 +12541,7 @@ async function renderCredentialEditor(el, scope, opts = {}) {
   if (!ordered.length) {
     const here = scope === 'global' && !!el.closest('#settings-agents, [data-pane="settings-agents"]');
     el.innerHTML = here ? '<div class="setting-muted">No accounts yet</div>'
-      : `<div class="setting-muted">No accounts yet · <a href="${esc(globalRoute('organization'))}#settings-agents">Add one</a></div>`;
+      : `<div class="setting-muted">No accounts yet · <a data-spa href="${esc(globalRoute('organization'))}#settings-agents">Add one</a></div>`;
     return;
   }
   const loginByKey = {};
@@ -13112,12 +13263,18 @@ function taskActions(v) {
     const idle = v.state?.applyingResources ? 'Applying resources…' : 'Saving resources…';
     return `<div class="actions" role="status" aria-live="polite"><button class="btn primary action-pending" disabled aria-busy="true"${progress?.title ? ` title="${esc(progress.title)}"` : ''}>${esc(progress?.text || idle)}</button></div>`;
   }
+  // Confirmed, but files another task changed too need the agent before they publish.
+  if (v.state?.mergingResources && v.status === 'active')
+    return `<div class="actions" role="status" aria-live="polite"><button class="btn primary action-pending" disabled aria-busy="true" title="Another task changed some of the same files. The agent is combining them; publishing resumes after it.">Combining resources…</button></div>`;
   if (v.state?.finalizing) return `<div class="actions" role="status" aria-live="polite"><button class="btn primary action-pending" disabled aria-busy="true">Finishing…</button><span>Saving task output</span></div>`;
   const acts = v.actions || [];
   const simple = acts.filter((a) => !a.args || a.args.length === 0);
   // Sub-tasks' files arriving before the agent's next turn: a message sent now waits for them.
   const refreshing = v.state?.refreshingResources && v.status === 'active'
     ? `<button class="btn primary action-pending" disabled aria-busy="true" title="Sub-tasks’ files arrive before the agent’s next turn. Messages sent now are read then.">Bringing in sub-tasks’ data…</button>`
+    // Before Review: data other tasks published meanwhile is merged in.
+    : v.state?.integratingResources && v.status === 'active'
+      ? `<button class="btn primary action-pending" disabled aria-busy="true" title="Data other tasks published since this one started is merged in, so Review shows what would be published.">Bringing in newer data…</button>`
     // A sub-task starts from this task's data, saved first: gigabytes take minutes.
     : v.state?.preparingSubTask && v.status === 'active'
       ? `<button class="btn primary action-pending" disabled aria-busy="true" title="A sub-task starts from this task’s data, so it is saved first.">${esc(stagingProgress()?.text || 'Saving data for a sub-task…')}</button>` : '';
@@ -13265,7 +13422,6 @@ function wireActions(v) {
       }
     }),
   );
-  $('#main').querySelectorAll('[data-open]').forEach((e) => wireTaskNav(e, () => e.dataset.open));
 }
 
 function wireFollowupSizing(ta, key) {
@@ -13537,7 +13693,7 @@ function wireAgentMention(ta, box, v, key) {
     ta.dispatchEvent(new Event('input', { bubbles: true }));
   };
   const choose = (item) => {
-    if (!item || !token) return close();
+    if (!item || !token || !ta.isConnected) return close();
     if (item.kind === 'people') { peopleMode = true; active = 0; items = build(); return render(); }
     if (item.kind === 'new') {
       const agentKey = nextAgentKeyFor([...(v.participants || []).map((p) => p.key), ...Object.keys(followupNewAgents(key))]);
@@ -13549,7 +13705,7 @@ function wireAgentMention(ta, box, v, key) {
     insert(item.token || `@${item.label}`, item.selector);
   };
   const render = () => {
-    if (!menu) { menu = document.createElement('div'); menu.className = 'wiki-mention-menu agent-mention-menu'; menu.setAttribute('role', 'listbox'); document.body.appendChild(menu); }
+    if (!menu?.isConnected) { menu = openCaretMenu('wiki-mention-menu agent-mention-menu'); menu.setAttribute('role', 'listbox'); }
     const scrolled = menu.scrollTop;
     let sawAgent = false;
     menu.innerHTML = items.length ? items.map((item, i) => {
@@ -13686,6 +13842,17 @@ function wireFollowups(v) {
           countMentions(to);
           delete S.followupMentions[key];
           delete S.followupNewAgents[key];
+        }
+        if (result?.continuedIn) {
+          delete S.followupDrafts[key];
+          delete S.followupHeights[key];
+          images.length = 0;
+          files.length = 0;
+          toast(`Continuing in #${result.continuedIn.num ?? result.continuedIn.id}`);
+          refreshTasks();
+          const { id, num } = result.continuedIn;
+          spaNavigate(taskUrl(id, { projectId: taskRecord(v.taskId)?.projectId || S.projectId, num }));
+          return;
         }
         // Render immediately even if this browser's event WebSocket is reconnecting.
         // The durable WS copy is de-duplicated by conversationEntries once it lands.
@@ -15226,7 +15393,7 @@ function avatarCallerSummary(avatar) {
   return callers.length === 1 ? callers[0].replace(/^@?/, '') : `${callers.length} people or teams`;
 }
 function avatarDetailView(avatar) {
-  return `<div class="avatars-page avatar-detail"><button class="avatar-back icon-btn" type="button" aria-label="Back to Avatars">←</button>
+  return `<div class="avatars-page avatar-detail"><a class="avatar-back icon-btn" data-spa href="${esc(avatarRoute(S.projectId))}" aria-label="Back to Avatars">←</a>
     <div class="avatar-detail-head"><div class="avatar-mark" aria-hidden="true">✦</div><div class="avatar-identity"><h1 class="page-title">${esc(avatar.name)}</h1><p>${esc(avatar.purpose || 'User-authored autonomous principal')}</p><span class="task-sub">Owned by ${esc(avatarOwnerName(avatar))} · Prompt version ${avatar.promptVersion}</span></div><span class="chip ${avatar.effectiveEnabled ? 'success' : ''}">${avatar.effectiveEnabled ? 'Enabled' : 'Disabled'}</span></div>
     <div class="avatar-actions">${avatar.callable && avatar.effectiveEnabled ? '<button class="btn primary avatar-start" type="button">Create task with Avatar</button>' : ''}${avatar.canEdit ? '<button class="btn avatar-edit" type="button">Edit</button>' : ''}${avatar.canDisable ? `<button class="btn avatar-toggle" type="button">${avatar.enabled ? 'Disable' : 'Enable'}</button>` : ''}${avatar.canEdit || avatar.canDisable ? '<button class="icon-btn avatar-remove" type="button" aria-label="Remove Avatar">⋯</button>' : ''}</div>
     ${(S.avatarAuthorizationRequests || []).length ? `<section class="card avatar-authorization-requests"><div class="section-h">Authorization request</div>${authorizationRequestRows(S.avatarAuthorizationRequests)}</section>` : ''}
@@ -15333,7 +15500,7 @@ async function fillAvatarEditor(overlay, close, proj, avatar) {
 }
 
 function wireAvatarsView(proj) {
-  if (!proj) return; document.querySelectorAll('.avatar-new').forEach((button) => button.addEventListener('click', () => openAvatarEditor(proj))); document.querySelector('.avatar-back')?.addEventListener('click', () => go(avatarRoute(proj.id)));
+  if (!proj) return; document.querySelectorAll('.avatar-new').forEach((button) => button.addEventListener('click', () => openAvatarEditor(proj)));
   const avatar = S.avatars.find((item) => item.id === S.avatarSelected); document.querySelector('.avatar-edit')?.addEventListener('click', () => openAvatarEditor(proj, avatar)); document.querySelector('.avatar-start')?.addEventListener('click', () => { S.pendingAvatarId = avatar.id; openTaskForm('software-dev'); });
   document.querySelector('.avatar-toggle')?.addEventListener('click', async () => { try { await api(`/api/projects/${proj.id}/avatars/${avatar.id}`, { method: 'PUT', body: JSON.stringify({ enabled: !avatar.enabled }) }); await loadAvatars(); renderMain(); } catch (error) { toast(error.message, true); } });
   document.querySelector('.avatar-remove')?.addEventListener('click', async () => { if (!confirm(`Remove ${avatar.name}? Its audit history will be retained.`)) return; try { await api(`/api/projects/${proj.id}/avatars/${avatar.id}`, { method: 'DELETE' }); await loadAvatars(); await go(avatarRoute(proj.id), { replace: true }); } catch (error) { toast(error.message, true); } });
@@ -15452,9 +15619,13 @@ function paintWikiRead(read, paint, fail) {
 // Entries are history entries, so Back returns to the previous one.
 function openWikiEntry(proj, path, { replace = false } = {}) {
   S.wikiEditing = null;
-  history[replace ? 'replaceState' : 'pushState']({ kx: 1 }, '',
-    `${location.pathname}${location.search}${path ? `#${encodeURIComponent(path)}` : ''}`);
+  history[replace ? 'replaceState' : 'pushState']({ kx: 1 }, '', wikiEntryHref(path));
   wireWikiView(proj);
+}
+
+// The URL of an entry of the wiki on screen (its Index when `path` is empty).
+function wikiEntryHref(path) {
+  return `${location.pathname}${location.search}${path ? `#${encodeURIComponent(path)}` : ''}`;
 }
 
 // The entry that encloses `path` (an attachment or a sub-folder of one), if any.
@@ -15510,7 +15681,7 @@ async function wireWikiView(proj) {
   let indexData;
   const paintNav = (data) => {
     nav.innerHTML = `${data && data.view?.writable !== false ? '<button class="btn sm wiki-new" id="wiki-new">+ New entry</button>' : ''}
-      <a href="#" class="${sel ? '' : 'active'}" data-wiki-home>Index</a>
+      <a href="${esc(wikiEntryHref(''))}" class="${sel ? '' : 'active'}" data-wiki-home>Index</a>
       ${wikiTreeHtml(data?.toc?.children, sel)}`;
     nav.querySelectorAll('[data-wiki-home], [data-wiki-path]').forEach((a) => a.addEventListener('click', (ev) => {
       if (isNewTabClick(ev)) return;
@@ -15796,6 +15967,16 @@ function textareaCaretXY(ta, pos) {
 }
 // A caret menu opens below the caret's line, or above it when there is more room
 // there, and stays inside the viewport — scrolling rather than running off it.
+// One caret menu (@ or [[) at a time, on <body> so no box clips it. Opening one
+// removes any other, including one left by a box a re-render replaced (its
+// options would write into a box no longer on the page).
+function openCaretMenu(className) {
+  document.querySelectorAll('.wiki-mention-menu').forEach((other) => other.remove());
+  const menu = document.createElement('div');
+  menu.className = className;
+  document.body.appendChild(menu);
+  return menu;
+}
 function placeCaretMenu(menu, ta, pos) {
   const edge = 8, xy = textareaCaretXY(ta, pos);
   const below = window.innerHeight - xy.top - edge, above = xy.lineTop - edge;
@@ -15878,7 +16059,7 @@ function wireWikiMention(ta, projectId) {
 
   const highlight = () => menu?.querySelectorAll('.wm-opt').forEach((el, i) => el.classList.toggle('active', i === active));
   const choose = (s) => {
-    if (!s || !token) return close();
+    if (!s || !token || !ta.isConnected) return close();
     const insert = `${tokenFor(s)} `;
     ta.value = ta.value.slice(0, token.start) + insert + ta.value.slice(token.end);
     const caret = token.start + insert.length;
@@ -15888,7 +16069,7 @@ function wireWikiMention(ta, projectId) {
     ta.dispatchEvent(new Event('input', { bubbles: true }));
   };
   const render = () => {
-    if (!menu) { menu = document.createElement('div'); menu.className = 'wiki-mention-menu'; document.body.appendChild(menu); }
+    if (!menu?.isConnected) menu = openCaretMenu('wiki-mention-menu');
     menu.innerHTML = items.length ? items.map((s, i) => `
       <div class="wm-opt ${i === active ? 'active' : ''}" data-i="${i}">
         <span class="wm-glyph">${glyph(s)}</span>
@@ -15990,11 +16171,13 @@ function wireWikiPathEditor(el, warnEl, kindOf) {
 // Local Markdown links inside rendered wiki content (data-md-local, emitted by
 // mdInline for scheme-less targets) address other wiki pages by path — route
 // them through the wiki view rather than leaving them inert.
+// Each becomes a link to the entry's URL, so it opens in a new tab too.
 function wireWikiLocalLinks(root, proj) {
-  root?.querySelectorAll('a[data-md-local]').forEach((a) => a.addEventListener('click', (ev) => {
-    ev.preventDefault();
-    openWikiEntry(proj, (a.dataset.mdLocal || '').replace(/^\.?\//, '').replace(/[?#].*$/, '').replace(/\/+$/, ''));
-  }));
+  root?.querySelectorAll('a[data-md-local]').forEach((a) => {
+    const path = (a.dataset.mdLocal || '').replace(/^\.?\//, '').replace(/[?#].*$/, '').replace(/\/+$/, '');
+    a.href = wikiEntryHref(path);
+    a.addEventListener('click', plainClick(() => openWikiEntry(proj, path)));
+  });
 }
 
 // ── panes ────────────────────────────────────────────────────────────────────
@@ -16193,11 +16376,11 @@ function settingsView(proj) {
     <div class="project-config-section" id="project-computers"><div><h2>Computers ${policyTip('The cloud computers this organization’s tasks run on. A task’s own computer—its size, experience and network—is set in Task defaults and the task form.')}</h2></div></div>
     <div class="card"><div class="setting-rows"><div class="setting-row"><span class="setting-label">Cloud computers</span>
       <span class="setting-value setting-muted">Shared by the organization’s projects</span>
-      <span class="setting-actions"><a class="btn sm ghost" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-code">Manage</a></span></div></div></div>
+      <span class="setting-actions"><a class="btn sm ghost" data-spa href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-code">Manage</a></span></div></div></div>
     <div class="project-config-section" id="project-events"><div><h2>Events ${policyTip('What happens outside a task: GitHub activity, webhook deliveries, chat messages to your bot, events tasks emit. A task with an “On event” trigger starts a run for each one it matches.')}</h2></div></div>
     <div class="card"><div id="project-events-box">Loading…</div></div>
     <div class="settings-section-title" id="project-agents"><div>Agents</div></div>
-    <div class="card"><div class="section-h section-h-action"><span>Account order ${policyTip('Tasks in this project use the first available account. Drag to reorder; switch one off to skip it here.')}</span><a class="btn sm ghost organization-settings-link" href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-agents">Manage accounts</a></div><div id="cred-editor-project">Loading…</div></div>
+    <div class="card"><div class="section-h section-h-action"><span>Account order ${policyTip('Tasks in this project use the first available account. Drag to reorder; switch one off to skip it here.')}</span><a class="btn sm ghost organization-settings-link" data-spa href="${globalRoute('organization', organizationById(proj.organizationId))}#settings-agents">Manage accounts</a></div><div id="cred-editor-project">Loading…</div></div>
     <div class="settings-section-title" id="project-defaults"><div>Task defaults ${policyTip(`How new tasks begin, unless a task says otherwise`)}</div></div>
     ${settingsForms('project', proj.id)}
     <div class="settings-section-title" id="project-payments"><div>Payments ${policyTip(`What this project's tasks may spend`)}</div></div>${paymentsCard('project')}
@@ -16232,7 +16415,7 @@ function eventOutcome(event) {
   const claims = event.claims || [];
   if (!claims.length) return '<span class="setting-muted">No task waits for this</span>';
   return claims.map((c) => {
-    const run = c.runId ? `<a href="#" data-pe-task="${esc(c.runId)}">a run</a>` : 'a run';
+    const run = c.runId ? `<a data-pe-task="${esc(c.runId)}" data-spa href="${esc(taskUrl(c.runId))}">a run</a>` : 'a run';
     if (c.state === 'started') return `Started ${run}`;
     if (c.state === 'told') return `Told ${run}`;
     if (c.state === 'pending') return 'Starting a run…';
@@ -16245,7 +16428,7 @@ function eventSourceLabel(source, hooks) {
   const hook = hooks.find((h) => h.id === id);
   if (hook) return esc(hook.name);
   if (source === 'github') return 'GitHub';
-  if (source.startsWith('task:')) return `<a href="#" data-pe-task="${esc(id)}">a task</a>`;
+  if (source.startsWith('task:')) return `<a data-pe-task="${esc(id)}" data-spa href="${esc(taskUrl(id))}">a task</a>`;
   if (source.startsWith('user:')) return 'a person';
   return esc(source);
 }
@@ -16257,7 +16440,7 @@ function automationsHtml(automations) {
   const row = (a) => {
     const need = a.missing?.length && !a.installed.length ? AUTOMATION_NEEDS[a.missing[0]] : null;
     const action = a.installed.length
-      ? `<button class="btn sm ghost" data-pe-task="${esc(a.installed[0])}">Open</button>`
+      ? `<a class="btn sm ghost" data-pe-task="${esc(a.installed[0])}" data-spa href="${esc(taskUrl(a.installed[0]))}">Open</a>`
       : `<button class="btn sm" data-auto-install="${esc(a.id)}"${need ? ` disabled title="${esc(need[1])}"` : ''}>Add</button>`;
     return `<div class="setting-row" data-automation="${esc(a.id)}">
     <span class="setting-label">${esc(a.name)} ${policyTip(a.summary || '')}</span>
@@ -16337,7 +16520,6 @@ async function hydrateProjectEvents(proj) {
     const form = $('#pe-form');
     const copy = async (value) => { await copyToClipboard(value); toast('Copied'); };
     box.querySelectorAll('[data-hook-copy]').forEach((b) => b.addEventListener('click', () => copy(b.dataset.hookCopy)));
-    box.querySelectorAll('[data-pe-task]').forEach((a) => a.addEventListener('click', (e) => { e.preventDefault(); openTask(a.dataset.peTask); }));
     box.querySelectorAll('[data-hook-delete]').forEach((b) => b.addEventListener('click', async () => {
       const row = b.closest('[data-hook]');
       if (!confirm(`Delete “${row.querySelector('.setting-label').textContent}”? It stops receiving events.`)) return;
@@ -17114,10 +17296,6 @@ async function hydrateWorkflowPins(projectId) {
 function wireSettingsView(proj) {
   wireSettingsNavigation();
   hydrateSettingsAccess({ projectId: proj.id });
-  $('#main').querySelectorAll('.organization-settings-link').forEach((link) => link.addEventListener('click', (event) => {
-    event.preventDefault();
-    go(link.getAttribute('href'));
-  }));
   hydrateProjectAccess(proj);
   hydrateProjectEvents(proj);
   hydrateConversationSharing('project', proj.id);
@@ -18391,12 +18569,13 @@ function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = 
     ? pending.map((request) => {
       const bound = request.itemId ? undefined : credentialRequestBindings.get(request.id);
       const unbound = !request.itemId && !bound;
-      return `<div class="approval-request" data-vreq="${esc(request.id)}"${bound ? ` data-vreq-item="${esc(bound.id)}"` : ''}>
+      return `<div class="approval-request${request.dismissed ? ' approval-request-dismissed' : ''}" data-vreq="${esc(request.id)}"${bound ? ` data-vreq-item="${esc(bound.id)}"` : ''}>
         <div class="approval-request-main">
           <div class="approval-request-title">${request.itemId
             ? esc(itemLabel(request.itemId))
             : `${esc(request.domain || '?')} <span class="chip approval-needed">not in vault</span>`}
             ${request.kind === 'reset' ? '<span class="chip approval-needed">reported invalid</span>' : `<span class="chip">${esc(request.mode)}</span>`}
+            ${request.dismissed ? ignoredChip() : ''}
           </div>
           <div class="task-sub">${credentialRequestTaskLink(request)}${request.why ? ` — ${esc(request.why)}` : ''}</div>
           ${request.kind === 'reset' ? `<div class="approval-request-help">The stored secret failed. Update it or send the task a reset code, then approve; ${siteNameMarkup()} will resume the agent automatically.</div>`
@@ -18410,6 +18589,7 @@ function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = 
           <button class="btn sm" data-vreq-act="task" ${unbound ? 'disabled' : ''}>This task</button>
           <button class="btn sm" data-vreq-act="always" ${unbound ? 'disabled' : ''}>Always</button>
           <button class="btn sm" data-vreq-act="deny">Deny</button>
+          ${request.dismissed ? '' : ignoreRequestButton('data-vreq-act')}
           ${policyTip(`Once: ${({
             passkey: 'Loads this passkey into the agent\'s browser for one sign-in session, up to 3 minutes. The agent can use it on the site until then.',
             session: 'Signs the agent\'s browser into this site once. It stays signed in until the site ends the session.',
@@ -18439,7 +18619,7 @@ function permissionRequestRows(requests, { historyLimit = 20 } = {}) {
   const pendingHtml = pending.map((request) => `<div class="approval-request${request.dismissed ? ' approval-request-dismissed' : ''}" data-preq="${esc(request.id)}">
     <div class="approval-request-main">
       <div class="approval-request-title">${esc(request.role || 'task')} agent permission
-        ${request.dismissed ? '<span class="chip">dismissed</span>' : '<span class="chip approval-needed">approval needed</span>'}
+        ${request.dismissed ? ignoredChip() : '<span class="chip approval-needed">approval needed</span>'}
       </div>
       <div class="approval-request-caps">${request.capabilities.map((capability) =>
         `<span class="chip mono">${esc(capability)}</span>`).join(' ')}</div>
@@ -18450,7 +18630,7 @@ function permissionRequestRows(requests, { historyLimit = 20 } = {}) {
     <div class="approval-request-actions">
       <button class="btn sm primary" data-preq-act="approve">Approve for agent</button>
       <button class="btn sm" data-preq-act="deny">Deny</button>
-      ${!request.dismissed ? '<button class="btn sm" data-preq-act="dismiss" aria-label="Dismiss request" title="Dismiss without notifying the agent">×</button>' : ''}
+      ${request.dismissed ? '' : ignoreRequestButton('data-preq-act')}
     </div>
   </div>`).join('');
   const history = recent.length
@@ -18471,7 +18651,7 @@ function authorizationRequestRows(requests, { historyLimit = 20 } = {}) {
     return `<div class="approval-request${request.dismissed ? ' approval-request-dismissed' : ''}" data-areq="${esc(request.id)}">
     <div class="approval-request-main">
       <div class="approval-request-title">${request.target.kind === 'avatar' ? 'Avatar' : 'Task agent'} authorization
-        ${request.dismissed ? '<span class="chip">dismissed</span>' : '<span class="chip approval-needed">approval needed</span>'}
+        ${request.dismissed ? ignoredChip() : '<span class="chip approval-needed">approval needed</span>'}
       </div>
       <div class="approval-request-caps"><span class="chip">${esc(authorizationSummary(request.authorization,
         S.projects.filter((project) => project.organizationId === request.organizationId)))}</span></div>
@@ -18481,7 +18661,7 @@ function authorizationRequestRows(requests, { historyLimit = 20 } = {}) {
     <div class="approval-request-actions">
       ${canResolve ? '<button class="btn sm primary" data-areq-act="approve">Approve authorization</button><button class="btn sm" data-areq-act="deny">Deny</button>'
         : '<span class="task-sub">Awaiting a routed approver</span>'}
-      ${canResolve && !request.dismissed ? '<button class="btn sm" data-areq-act="dismiss" aria-label="Dismiss request" title="Dismiss without notifying the agent">×</button>' : ''}
+      ${canResolve && !request.dismissed ? ignoreRequestButton('data-areq-act') : ''}
     </div>
   </div>`;
   }).join('');
@@ -18501,7 +18681,7 @@ function wireAuthorizationRequestActions(root, organizationId, onResolved) {
         const result = await api(`/api/authorization-requests/${row.dataset.areq}/resolve?organizationId=${encodeURIComponent(organizationId || '')}`, {
           method: 'POST', body: JSON.stringify({ action: button.dataset.areqAct }),
         });
-        toast(button.dataset.areqAct === 'dismiss' ? 'Request dismissed' : button.dataset.areqAct === 'deny' ? 'Authorization denied'
+        toast(button.dataset.areqAct === 'dismiss' ? 'Request ignored' : button.dataset.areqAct === 'deny' ? 'Authorization denied'
           : result.queued ? 'Approved — task queued' : 'Authorization approved');
         await onResolved?.(result);
       } catch (error) { button.disabled = false; toast(error.message, true); }
@@ -18518,7 +18698,7 @@ function wirePermissionRequestActions(root, organizationId, onResolved) {
           method: 'POST',
           body: JSON.stringify({ action: button.dataset.preqAct }),
         });
-        const decision = button.dataset.preqAct === 'dismiss' ? 'Request dismissed' : button.dataset.preqAct === 'deny' ? 'Denied' : 'Approved';
+        const decision = button.dataset.preqAct === 'dismiss' ? 'Request ignored' : button.dataset.preqAct === 'deny' ? 'Denied' : 'Approved';
         toast(button.dataset.preqAct === 'dismiss' ? decision : result.resume?.resumed ? `${decision} — task resumed automatically`
           : `${decision}${result.resume?.reason ? ` — ${result.resume.reason}` : ''}`,
         button.dataset.preqAct !== 'dismiss' && !result.resume?.resumed && !!result.resume?.reason);
@@ -18559,6 +18739,11 @@ function wireCredentialRequestActions(root, organizationId, onResolved) {
         method: 'POST',
         body: JSON.stringify({ action: button.dataset.vreqAct, itemId }),
       });
+      if (button.dataset.vreqAct === 'dismiss') {
+        toast('Request ignored');
+        await onResolved?.(result);
+        return;
+      }
       credentialRequestBindings.delete(row.dataset.vreq);
       const decision = button.dataset.vreqAct === 'deny' ? 'Denied' : 'Granted';
       toast(result.resume?.resumed ? `${decision} — task resumed automatically`
@@ -18602,8 +18787,9 @@ function connectionRows(connections, inTask = false) {
     const accountNames = connectionAccountNames(reusable);
     const status = { requested: c.reusable?.length ? 'access requested' : 'sign-in needed', connecting: 'waiting for sign-in', active: 'connected', expired: 'reconnect needed', disconnected: 'disconnected', denied: 'declined' }[c.status] || c.status;
     const projects = S.projects.filter(p => p.organizationId === c.organizationId);
-    return `<div class="approval-request" data-connection="${esc(c.id)}">
-      <div class="approval-request-main"><div class="approval-request-title">${esc(c.label)} <span class="chip">${esc(status)}</span></div>
+    const open = ['requested', 'connecting'].includes(c.status);
+    return `<div class="approval-request${open && c.dismissed ? ' approval-request-dismissed' : ''}" data-connection="${esc(c.id)}">
+      <div class="approval-request-main"><div class="approval-request-title">${esc(c.label)} <span class="chip">${esc(status)}</span>${open && c.dismissed ? ` ${ignoredChip()}` : ''}</div>
         ${c.why && inTask ? `<p class="task-sub">${esc(c.why)}</p>` : ''}
         <p class="task-sub">${c.taskId ? 'This account may be used by the requesting task.' : 'Private until you share it with a project.'}</p>
         ${own && !inTask ? `<details><summary>Project access</summary><p class="task-sub">Selected projects may run app actions using this account, within the permissions you granted at sign-in.</p>
@@ -18617,8 +18803,19 @@ function connectionRows(connections, inTask = false) {
         ${own && c.status === 'connecting' ? '<button type="button" class="btn sm" data-connection-action="restart">Start again</button>' : ''}
         ${own && !c.grantedConnectionId && ['active', 'connecting'].includes(c.status) ? '<button type="button" class="btn sm" data-connection-action="refresh">Check status</button>' : ''}
         ${canConnect && (c.status !== 'disconnected' || c.disconnectPending) ? `<button type="button" class="btn sm" data-connection-action="disconnect">${c.disconnectPending ? 'Retry disconnect' : c.grantedConnectionId ? 'Revoke' : c.ownerId ? 'Disconnect' : 'Decline'}</button>` : ''}
+        ${canConnect && inTask && open && !c.dismissed ? ignoreRequestButton('data-connection-action') : ''}
       </div></div>`;
   }).join('');
+}
+
+// Ignoring a request silences it — no inbox row, alert or "approval needed"
+// badge — without answering it: the agent keeps waiting, and the request stays
+// in Approval requests (and the rail's count) until someone decides it.
+function ignoredChip() {
+  return '<span class="chip">ignored</span>';
+}
+function ignoreRequestButton(attribute) {
+  return `<button type="button" class="btn sm" ${attribute}="dismiss" aria-label="Ignore request" title="Ignore: no more notifications. It stays in Approval requests.">×</button>`;
 }
 
 /** Distinct names for a person's accounts of one app: its name, then when each was connected. */
@@ -18664,6 +18861,7 @@ function wireConnectionActions(root, organizationId, refresh) {
       } else {
         const body = action === 'access' ? { projectIds: [...row.querySelectorAll('input:checked')].map(input => input.value) } : {};
         await api(`/api/connections/${encodeURIComponent(id)}/${action}${oq}`, { method: action === 'access' ? 'PUT' : 'POST', body: JSON.stringify(body) });
+        if (action === 'dismiss') toast('Request ignored');
         await refresh();
       }
     } catch (e) { popup?.close(); toast(e.message, true); }
@@ -18909,7 +19107,9 @@ async function wireVaultCards(organizationId) {
       });
       const empty = list.querySelector('.vault-search-empty');
       if (empty) empty.hidden = visible > 0 || !vaultItems.length;
+      syncKeys?.();
     };
+    let syncKeys;
     const paint = () => {
       list.innerHTML = vaultItems.length
         ? sortVaultItems(vaultItems).map((i) => `<div class="queue-item vault-manager-item" data-vi="${esc(i.id)}">
@@ -19037,12 +19237,23 @@ async function wireVaultCards(organizationId) {
       filterRows();
     };
     paint();
+    const opener = document.activeElement;
     const close = () => {
       overlay.querySelectorAll('.vault-reveal-panel').forEach((panel) => panel._conceal?.());
       overlay.remove();
+      opener?.focus?.();
     };
+    // Enter opens the highlighted credential, as View does.
+    syncKeys = wireVaultListKeys(overlay, {
+      search, rows: () => [...list.querySelectorAll('[data-vi]')], close,
+      onEnter: (row) => {
+        const view = row.querySelector('[data-vi-reveal]');
+        if (view.disabled) return;
+        if (row.querySelector('.vault-reveal-panel').hidden) view.click();
+        else row.querySelector('[data-vi-reveal-load]').focus();
+      },
+    });
     overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
-    overlay.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
     overlay.querySelector('[data-vault-manager-close]').addEventListener('click', close);
     search.addEventListener('input', filterRows);
     search.focus();
@@ -19843,11 +20054,25 @@ function inboxNoticesHtml() {
     </div>`;
   }).join('');
 }
+// A notice links to what it is about, so it opens in a new tab too (and still
+// counts as read); a plain click marks it read and navigates in place.
 function wireInboxNotices() {
   $('#main').querySelectorAll('[data-inbox]').forEach((row) => {
-    const open = () => openInboxItem(S.inbox.find((item) => item.id === row.dataset.inbox));
-    row.addEventListener('click', open);
-    row.addEventListener('keydown', (event) => { if (event.key === 'Enter' && event.target === row) { event.preventDefault(); open(); } });
+    const item = () => S.inbox.find((candidate) => candidate.id === row.dataset.inbox);
+    const route = inboxItemRoute(item());
+    if (route) wireRowLink(row, route);
+    const openedElsewhere = (event) => {
+      if (!event.target.closest('a.row-link')) return;
+      markInboxItemRead(item());
+      row.classList.remove('unread');
+    };
+    row.addEventListener('click', (event) => {
+      if (isNewTabClick(event)) return openedElsewhere(event);
+      event.preventDefault();
+      openInboxItem(item());
+    });
+    row.addEventListener('auxclick', (event) => { if (event.button === 1) openedElsewhere(event); });
+    row.addEventListener('keydown', (event) => { if (event.key === 'Enter' && event.target === row) { event.preventDefault(); openInboxItem(item()); } });
   });
 }
 
@@ -19924,8 +20149,19 @@ function showVisualNotification(item) {
   const alert = document.createElement('div');
   alert.className = 'notification-alert';
   alert.dataset.id = item.id;
-  alert.innerHTML = `<button class="notification-open"><strong>${esc(inboxTitle(item, '') || siteName())}</strong><span>${esc(item.urgency)} · ${esc(inboxRowLabel(item))}</span></button><button class="btn sm" aria-label="Dismiss notification">×</button>`;
-  alert.firstElementChild.onclick = () => { alert.remove(); openInboxItem(liveInboxItem(item)); };
+  // A link to what it is about, so it opens in a new tab like the inbox row.
+  const route = inboxItemRoute(item);
+  const body = `<strong>${esc(inboxTitle(item, '') || siteName())}</strong><span>${esc(item.urgency)} · ${esc(inboxRowLabel(item))}</span>`;
+  alert.innerHTML = `${route ? `<a class="notification-open" href="${esc(route)}">${body}</a>` : `<button class="notification-open">${body}</button>`}<button class="btn sm" aria-label="Dismiss notification">×</button>`;
+  // Removed after the click, so its link still opens in a new tab.
+  const openedElsewhere = () => { setTimeout(() => alert.remove()); markInboxItemRead(liveInboxItem(item)); };
+  alert.firstElementChild.onclick = (event) => {
+    if (isNewTabClick(event)) return openedElsewhere();
+    event.preventDefault();
+    alert.remove();
+    openInboxItem(liveInboxItem(item));
+  };
+  alert.firstElementChild.onauxclick = (event) => { if (event.button === 1) openedElsewhere(); };
   alert.lastElementChild.onclick = () => alert.remove();
   region.prepend(alert);
   while (region.children.length > 5) region.lastElementChild.remove();
@@ -19994,29 +20230,35 @@ function playNotificationSound(urgency = 'normal') {
 
 async function openInboxItem(item) {
   if (!item?.task && !item?.subject) return;
-  if (item.unread) {
-    // Reading the notification is bookkeeping, not a prerequisite for opening
-    // its task. Update the badge locally and let the PATCH finish behind the
-    // navigation; restore unread state if it fails.
-    markInboxItemReadLocally(item);
-    api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(item.organizationId)}`, { method: 'PATCH', body: JSON.stringify({ unread: false }) })
-      .catch(() => { item.unread = true; updateBell(); });
+  markInboxItemRead(item);
+  const route = inboxItemRoute(item);
+  if (route) return go(route);
+}
+
+// Reading the notification is bookkeeping, not a prerequisite for opening
+// its task. Update the badge locally and let the PATCH finish behind the
+// navigation; restore unread state if it fails.
+function markInboxItemRead(item) {
+  if (!item?.unread) return;
+  markInboxItemReadLocally(item);
+  api(`/api/inbox/${item.id}?organizationId=${encodeURIComponent(item.organizationId)}`, { method: 'PATCH', body: JSON.stringify({ unread: false }) })
+    .catch(() => { item.unread = true; updateBell(); });
+}
+
+// Where an inbox item opens — null when it is about nothing reachable.
+function inboxItemRoute(item) {
+  if (item?.subject?.kind === 'credential') return `${globalRoute('organization', organizationById(item.organizationId))}#settings-agents`;
+  if (item?.subject?.kind === 'storage') return `${globalRoute('organization', organizationById(item.organizationId))}#settings-storage`;
+  if (item?.subject?.kind === 'service-limit') return `${installationRoute()}#installation-limits`;
+  if (item?.subject?.kind === 'avatar-authorization') {
+    const project = projectById(item.subject.projectId);
+    return project ? avatarRoute(project.id, item.subject.avatarId) : null;
   }
-  if (item.subject?.kind === 'credential') {
-    return go(`${globalRoute('organization', organizationById(item.organizationId))}#settings-agents`);
-  }
-  if (item.subject?.kind === 'storage') {
-    return go(`${globalRoute('organization', organizationById(item.organizationId))}#settings-storage`);
-  }
-  if (item.subject?.kind === 'service-limit') return go(`${installationRoute()}#installation-limits`);
-  if (item.subject?.kind === 'avatar-authorization') {
-    const project = projectById(item.subject.projectId); if (!project) return;
-    return go(avatarRoute(project.id, item.subject.avatarId));
-  }
-  const project = projectById(item.task.projectId); if (!project) return;
+  const project = item?.task && projectById(item.task.projectId);
+  if (!project) return null;
   // A pending request waits in the task's conversation.
   const tab = item.kind === 'approval-requested' ? '/checkin' : '';
-  return go(`${projectBase(project.id)}/tasks/${item.task.num ?? item.task.id}${tab}`);
+  return `${projectBase(project.id)}/tasks/${item.task.num ?? item.task.id}${tab}`;
 }
 
 // The signed-in person's display name for the topbar/rail. The legacy single-user
@@ -20642,6 +20884,7 @@ function wireSettingsNavigation() {
     // onclick assignment (not addEventListener) keeps re-wiring idempotent —
     // renderMain and hydrateOrganizationView can both land here on one paint.
     link.onclick = (event) => {
+      if (isNewTabClick(event)) return; // the browser opens the pane in a new tab
       event.preventDefault();
       history.replaceState(history.state, '', location.pathname + link.getAttribute('href'));
       activate(link.getAttribute('href').slice(1));
@@ -21930,6 +22173,9 @@ function fuzzyScore(q, s) {
 }
 
 // -- the assembled registry ---------------------------------------------------
+// A command that goes somewhere: its `href` is where, so the palette offers it
+// as a link (it opens in a new tab too) and running it goes there in place.
+function navCommand(href) { return { href, run: () => go(href()) }; }
 // Host commands. `key` is only the fallback — the binding of record comes from
 // the server's command registry (S.contributions), so packages can rebind ids.
 const HOST_COMMANDS = [
@@ -21938,19 +22184,19 @@ const HOST_COMMANDS = [
   // Opens the task form, in the project new tasks go to (Home's choice, else the open project).
   { id: 'nav.newTask', title: 'New task', key: 'n', run: () => openNewTaskForm() },
   { id: 'nav.search', title: 'Search tasks', key: '/', run: () => { if (!isTaskListTab()) switchTab('tasks'); setTimeout(() => $('#task-search')?.focus(), 0); } },
-  { id: 'nav.home', title: 'Go home', key: 'g H', run: () => go(homeRoute(currentOrg(), DEFAULT_LIST_QUERY)) },
-  { id: 'nav.tasks', title: 'Go to tasks', key: 'g t', run: () => switchTab('tasks') },
-  { id: 'nav.queue', title: 'Go to queues', key: 'g q', run: () => switchTab('queue') },
-  { id: 'nav.insights', title: 'Go to insights', key: 'g I', run: () => switchTab('insights') },
-  { id: 'nav.settings', title: 'Go to project settings', key: 'g s', run: () => switchTab('settings') },
-  { id: 'nav.wiki', title: 'Go to project wiki', key: 'g w', run: () => switchTab('wiki') },
-  { id: 'nav.orgwiki', title: 'Go to organization wiki', key: 'g W', run: () => go(globalRoute('orgwiki')) },
-  { id: 'nav.global', title: 'Go to organization settings', key: 'g S', run: () => switchTab('global') },
+  { id: 'nav.home', title: 'Go home', key: 'g H', ...navCommand(() => homeRoute(currentOrg(), DEFAULT_LIST_QUERY)) },
+  { id: 'nav.tasks', title: 'Go to tasks', key: 'g t', ...navCommand(() => tabRoute('tasks')) },
+  { id: 'nav.queue', title: 'Go to queues', key: 'g q', ...navCommand(() => tabRoute('queue')) },
+  { id: 'nav.insights', title: 'Go to insights', key: 'g I', ...navCommand(() => tabRoute('insights')) },
+  { id: 'nav.settings', title: 'Go to project settings', key: 'g s', ...navCommand(() => tabRoute('settings')) },
+  { id: 'nav.wiki', title: 'Go to project wiki', key: 'g w', ...navCommand(() => tabRoute('wiki')) },
+  { id: 'nav.orgwiki', title: 'Go to organization wiki', key: 'g W', ...navCommand(() => globalRoute('orgwiki')) },
+  { id: 'nav.global', title: 'Go to organization settings', key: 'g S', ...navCommand(() => tabRoute('global')) },
   { id: 'nav.projects', title: 'Go to projects', key: 'g P', run: () => focusRail() },
   { id: 'nav.newProject', title: 'New project', key: 'p n', group: 'Projects', run: () => newProject() },
   { id: 'nav.searchProjects', title: 'Search projects', key: 'p /', group: 'Projects', run: () => { revealRail(); $('#project-search')?.focus(); } },
-  { id: 'nav.profile', title: 'Go to your profile', key: 'g A', run: () => go(profileRoute()) },
-  { id: 'nav.notifications', title: 'Go to inbox', key: 'g N', run: () => go(inboxRoute(DEFAULT_LIST_QUERY)) },
+  { id: 'nav.profile', title: 'Go to your profile', key: 'g A', ...navCommand(() => profileRoute()) },
+  { id: 'nav.notifications', title: 'Go to inbox', key: 'g N', ...navCommand(() => inboxRoute(DEFAULT_LIST_QUERY)) },
   { id: 'nav.close', title: 'Close panel', key: null, run: () => closeTopOverlay() }, // Esc — handled by the dispatcher
 ];
 
@@ -21960,7 +22206,7 @@ function allCommands() {
   const add = (c) => out.push({ available: true, ...c, keys: c.keybinding ? parseKeybinding(c.keybinding) : null });
   for (const h of HOST_COMMANDS) {
     const d = declared.get(h.id);
-    add({ id: h.id, title: d?.title || h.title, keybinding: d ? d.keybinding : h.key, group: h.group || 'Navigation', run: h.run });
+    add({ id: h.id, title: d?.title || h.title, keybinding: d ? d.keybinding : h.key, group: h.group || 'Navigation', run: h.run, href: h.href });
   }
   // Interaction grammar (host-owned, not server-declared): a list cursor on the
   // tasks/queue views; with a task page open the same keys walk between tasks. When
@@ -21986,7 +22232,7 @@ function allCommands() {
   // (Gmail-style — Esc does too, once overlays are popped), [ / ] switch the
   // page's views, { / } its attempts, i the details rail, t the terminal. Documented in the help panel's static "On a task page" section
   // (help: false here) so they're discoverable before a page is open.
-  add({ id: 'task.back', title: 'Back to the list', keybinding: 'u', group: 'Task', help: false, available: !!S.selected, run: () => closeTask() });
+  add({ id: 'task.back', title: 'Back to the list', keybinding: 'u', group: 'Task', help: false, available: !!S.selected, run: () => closeTask(), href: () => taskBackRoute() });
   const attemptsAvailable = !!(S.selected && S.view && document.querySelectorAll('[data-attempt-select]').length > 1);
   add({ id: 'task.attempt.prev', title: 'Previous attempt', keybinding: '{', group: 'Task', help: false, available: attemptsAvailable, run: () => cycleAttempt(-1) });
   add({ id: 'task.attempt.next', title: 'Next attempt', keybinding: '}', group: 'Task', help: false, available: attemptsAvailable, run: () => cycleAttempt(1) });
@@ -22272,7 +22518,10 @@ function bindKeys() {
     // The check-in terminal is a focusable <pre> that behaves like a text field:
     // keystrokes go to the shell, not to app shortcuts. Treat it as "typing".
     const typing = t && t.matches && (t.matches('input, textarea, select, .term-screen') || t.isContentEditable);
-    const overlayOpen = $('#overlay-root').childElementCount > 0 || $('#modal-root').childElementCount > 0;
+    // Security and vault dialogs are direct body children: modal too, but they
+    // close themselves, so Esc must not also pop whatever lies beneath them.
+    const dialogOpen = !!document.querySelector('body > .modal-overlay');
+    const overlayOpen = dialogOpen || $('#overlay-root').childElementCount > 0 || $('#modal-root').childElementCount > 0;
     if (e.key === 'Escape' && !overlayOpen && $('.ck-fullscreen')) {
       e.preventDefault();
       resetChord();
@@ -22300,7 +22549,7 @@ function bindKeys() {
       return;
     }
     if (overlayOpen) { // an overlay owns the keyboard; Esc pops it
-      if (e.key === 'Escape') closeTopOverlay();
+      if (e.key === 'Escape' && !dialogOpen) closeTopOverlay();
       return;
     }
     if (e.key === 'Escape') {
@@ -22332,7 +22581,7 @@ function openPalette() {
       if (c.palette === false || !c.available || c.id === 'nav.commandPalette') continue; // not itself
       const score = fuzzyScore(q, c.title);
       if (score < 0) continue;
-      items.push({ group: c.group, title: c.title, kbd: c.keybinding, sub: c.workflow, danger: c.danger, score, run: c.run });
+      items.push({ group: c.group, title: c.title, kbd: c.keybinding, sub: c.workflow, danger: c.danger, score, run: c.run, href: c.href?.() });
     }
     items.sort((a, b) => (GROUP_ORDER[a.group] ?? 9) - (GROUP_ORDER[b.group] ?? 9) || b.score - a.score);
     items = items.slice(0, 14);
@@ -22344,7 +22593,8 @@ function openPalette() {
     list.innerHTML = items.map((it, i) => {
       const head = it.group !== lastGroup ? `<div class="pal-group">${esc(it.group)}</div>` : '';
       lastGroup = it.group;
-      return `${head}<div class="opt ${i === active ? 'active' : ''}${it.danger ? ' danger' : ''}" data-i="${i}">${esc(it.title)}${it.sub ? `<span class="pal-sub">${esc(it.sub)}</span>` : ''}${it.kbd ? `<span class="key">${esc(fmtKeys(it.kbd))}</span>` : ''}</div>`;
+      const tag = it.href ? 'a' : 'div';
+      return `${head}<${tag} class="opt ${i === active ? 'active' : ''}${it.danger ? ' danger' : ''}"${it.href ? ` href="${esc(it.href)}"` : ''} data-i="${i}">${esc(it.title)}${it.sub ? `<span class="pal-sub">${esc(it.sub)}</span>` : ''}${it.kbd ? `<span class="key">${esc(fmtKeys(it.kbd))}</span>` : ''}</${tag}>`;
     }).join('') || `<div class="pal-empty">No matches</div>`;
     list.querySelector('.opt.active')?.scrollIntoView({ block: 'nearest' });
   };
@@ -22356,7 +22606,8 @@ function openPalette() {
     else if (e.key === 'ArrowUp') { e.preventDefault(); active = Math.max(0, active - 1); draw(); }
     else if (e.key === 'Enter') { e.preventDefault(); run(active); }
   });
-  list.addEventListener('click', (e) => { const o = e.target.closest('.opt'); if (o) run(Number(o.dataset.i)); });
+  // A command that goes somewhere is a link: a modified click opens it in a new tab.
+  list.addEventListener('click', (e) => { const o = e.target.closest('.opt'); if (o) plainClick(() => run(Number(o.dataset.i)))(e); });
   list.addEventListener('mousemove', (e) => { const o = e.target.closest('.opt'); if (o && Number(o.dataset.i) !== active) { active = Number(o.dataset.i); draw(); } });
   $('#pal-scrim').addEventListener('click', (e) => { if (e.target.id === 'pal-scrim') close(); });
   build();
@@ -22698,8 +22949,8 @@ function renderLanding() {
         <a href="/pricing" class="landing-text-link">Pricing</a>
         <a href="https://github.com/abhimanyupallavisudhir/krmax-issues/issues" class="landing-text-link">GitHub</a>
         <button class="landing-theme" id="landing-theme" type="button" aria-label="Switch theme"><svg class="sun" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="3.4"/><path d="M10 1.8v2M10 16.2v2M1.8 10h2M16.2 10h2M4.2 4.2l1.4 1.4M14.4 14.4l1.4 1.4M4.2 15.8l1.4-1.4M14.4 5.6l1.4-1.4"/></svg><svg class="moon" viewBox="0 0 20 20" aria-hidden="true"><path d="M16.4 12.6A6.8 6.8 0 0 1 7.4 3.6a6.8 6.8 0 1 0 9 9z"/></svg></button>
-        <button class="landing-sign-in" id="landing-sign-in" type="button">Sign in</button>
-        <button class="landing-start" id="landing-start" type="button">Get started</button>
+        <a class="landing-sign-in" id="landing-sign-in" href="/login">Sign in</a>
+        <a class="landing-start" id="landing-start" href="/signup">Get started</a>
       </div>
     </div></header>
 
@@ -22709,7 +22960,7 @@ function renderLanding() {
           <h1 id="landing-title" class="landing-analogy"><span>vscode was a fancy <b>text editor.</b></span> <span>${siteNameMarkup()} is a fancy <b>to-do list.</b></span></h1>
           <p class="landing-intro">The interface for the era of <strong>managing agents</strong> rather than <s>manually coding/working</s>.</p>
           <div class="landing-hero-actions">
-            <button class="landing-start landing-start-large" id="landing-hero-start" type="button">Start managing agents <span aria-hidden="true">→</span></button>
+            <a class="landing-start landing-start-large" id="landing-hero-start" href="/signup">Start managing agents <span aria-hidden="true">→</span></a>
           </div>
         </div>
 
@@ -22770,7 +23021,7 @@ function renderLanding() {
       <section class="landing-final" aria-labelledby="final-title">
         <div class="landing-final-mark" aria-hidden="true">${brandMark()}</div>
         <h2 id="final-title">Leave the permanent<br>underclass today.</h2>
-        <button class="landing-start landing-start-large" id="landing-final-start" type="button">Get started with ${siteNameMarkup()} <span aria-hidden="true">→</span></button>
+        <a class="landing-start landing-start-large" id="landing-final-start" href="/signup">Get started with ${siteNameMarkup()} <span aria-hidden="true">→</span></a>
       </section>
     </main>
 
@@ -22779,8 +23030,8 @@ function renderLanding() {
 
   const signIn = () => openPublicAuth('/login', renderLogin);
   const signUp = () => openPublicAuth('/signup', renderSignup);
-  $('#landing-sign-in')?.addEventListener('click', signIn);
-  ['landing-start', 'landing-hero-start', 'landing-final-start'].forEach((id) => $(`#${id}`)?.addEventListener('click', signUp));
+  $('#landing-sign-in')?.addEventListener('click', plainClick(signIn));
+  ['landing-start', 'landing-hero-start', 'landing-final-start'].forEach((id) => $(`#${id}`)?.addEventListener('click', plainClick(signUp)));
   const theme = $('#landing-theme');
   if (theme) {
     labelLandingTheme(theme);
@@ -22816,7 +23067,7 @@ function renderLogin() {
     ${googleBtn('google-btn')}
     ${githubBtn('github-btn')}
     ${S.sso ? `<button class="btn" id="sso-btn" style="width:100%;margin-top:8px"${S.sso.unavailable ? ' disabled title="Company sign-in is temporarily unavailable. Try again in a few minutes."' : ''}>Continue with company SSO</button>` : ''}
-    <button class="btn" id="signup-open" style="width:100%;margin-top:8px">Create account</button>
+    <a class="btn" id="signup-open" href="/signup" style="width:100%;margin-top:8px">Create account</a>
     ${S.emailDelivery ? '<div style="text-align:center;margin-top:10px"><a href="#" id="forgot-open" style="color:var(--ink-3);font-size:12px">Forgot password?</a></div>' : ''}
     <div id="login-err" style="color:var(--danger);font-size:12px;margin-top:8px">${S.signInError ? esc(S.signInError) : ''}</div>
   </div></div>`;
@@ -22835,7 +23086,7 @@ function renderLogin() {
     } catch { $('#login-err').textContent = 'Login failed'; }
   };
   $('#login-btn').addEventListener('click', go);
-  $('#login-home')?.addEventListener('click', (e) => { e.preventDefault(); history.pushState({ kx: 1 }, '', '/'); renderLanding(); });
+  $('#login-home')?.addEventListener('click', plainClick(() => openPublicAuth('/', renderLanding)));
   wireSocialBtn('google-btn', 'google', '#login-err');
   wireSocialBtn('github-btn', 'github', '#login-err');
   $('#sso-btn')?.addEventListener('click', async () => {
@@ -22848,7 +23099,7 @@ function renderLogin() {
   });
   // An invitee stays on the invitation link: boot() accepts it once the account
   // exists, and /signup would drop its token.
-  $('#signup-open').addEventListener('click', () => S.pendingInvite ? renderSignup() : openPublicAuth('/signup', renderSignup));
+  $('#signup-open').addEventListener('click', plainClick(() => S.pendingInvite ? renderSignup() : openPublicAuth('/signup', renderSignup)));
   $('#forgot-open')?.addEventListener('click', (e) => { e.preventDefault(); renderForgotPassword(); });
   $('#pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
 }
@@ -22862,7 +23113,7 @@ function renderForgotPassword() {
     <p class="task-sub">Enter your email and we'll send you a link to choose a new password.</p>
     <div class="form-row"><label for="forgot-email">Email</label><input type="email" id="forgot-email" autocomplete="username" /></div>
     <button class="btn primary" id="forgot-btn" style="width:100%">Send reset link</button>
-    <button class="btn" id="forgot-back" style="width:100%;margin-top:8px">Back to sign in</button>
+    <a class="btn" id="forgot-back" href="/login" style="width:100%;margin-top:8px">Back to sign in</a>
     <div id="forgot-msg" style="font-size:12px;margin-top:8px"></div>
   </div></div>`;
   const go = async () => {
@@ -22883,7 +23134,7 @@ function renderForgotPassword() {
     $('#forgot-btn').disabled = false;
   };
   $('#forgot-btn').addEventListener('click', go);
-  $('#forgot-back').addEventListener('click', renderLogin);
+  $('#forgot-back').addEventListener('click', plainClick(renderLogin));
   $('#forgot-email').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
 }
 
@@ -22895,7 +23146,7 @@ function renderResetPassword(token) {
     ${token ? `<div class="form-row"><label for="reset-pw">New password (10+ characters)</label><input type="password" id="reset-pw" autocomplete="new-password" /></div>
     <button class="btn primary" id="reset-btn" style="width:100%">Set new password</button>`
       : `<p class="task-sub">This reset link is missing its token or has expired. Request a new one from the sign-in page.</p>`}
-    <button class="btn" id="reset-back" style="width:100%;margin-top:8px">Back to sign in</button>
+    <a class="btn" id="reset-back" href="/login" style="width:100%;margin-top:8px">Back to sign in</a>
     <div id="reset-msg" style="font-size:12px;margin-top:8px"></div>
   </div></div>`;
   const go = async () => {
@@ -22918,7 +23169,7 @@ function renderResetPassword(token) {
     } catch { $('#reset-msg').style.color = 'var(--danger)'; $('#reset-msg').textContent = 'Could not reset password.'; $('#reset-btn').disabled = false; }
   };
   $('#reset-btn')?.addEventListener('click', go);
-  $('#reset-back').addEventListener('click', () => { history.replaceState({ kx: 1 }, '', '/'); renderLogin(); });
+  $('#reset-back').addEventListener('click', plainClick(() => { history.replaceState({ kx: 1 }, '', '/login'); renderLogin(); }));
   $('#reset-pw')?.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
 }
 
@@ -22938,7 +23189,7 @@ function renderSignup() {
     <button class="btn primary" id="signup-btn" style="width:100%">Create account</button>
     ${googleBtn('signup-google-btn')}
     ${githubBtn('signup-github-btn')}
-    <button class="btn" id="signup-back" style="width:100%;margin-top:8px">Back to sign in</button>
+    <a class="btn" id="signup-back" href="/login" style="width:100%;margin-top:8px">Back to sign in</a>
     <div id="signup-err" style="color:var(--danger);font-size:12px;margin-top:8px"></div>
   </div></div>`;
   const go = async () => {
@@ -22969,8 +23220,8 @@ function renderSignup() {
       const reason = body.error || body.message || 'Could not create account';
       const el = $('#signup-err');
       if (/already exists/i.test(reason)) {
-        el.innerHTML = `An account with that email already exists. <a href="#" id="signup-to-login" style="color:var(--accent)">Sign in instead</a> — or reset your password.`;
-        $('#signup-to-login')?.addEventListener('click', (e) => { e.preventDefault(); renderLogin(); });
+        el.innerHTML = `An account with that email already exists. <a href="/login" id="signup-to-login" style="color:var(--accent)">Sign in instead</a> — or reset your password.`;
+        $('#signup-to-login')?.addEventListener('click', plainClick(() => (S.pendingInvite ? renderLogin() : openPublicAuth('/login', renderLogin))));
       } else {
         el.textContent = reason;
       }
@@ -22981,7 +23232,7 @@ function renderSignup() {
   $('#signup-btn').addEventListener('click', go);
   wireSocialBtn('signup-google-btn', 'google', '#signup-err', true);
   wireSocialBtn('signup-github-btn', 'github', '#signup-err', true);
-  $('#signup-back').addEventListener('click', () => S.pendingInvite ? renderLogin() : openPublicAuth('/login', renderLogin));
+  $('#signup-back').addEventListener('click', plainClick(() => S.pendingInvite ? renderLogin() : openPublicAuth('/login', renderLogin)));
   $('#signup-pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
 }
 
@@ -23776,7 +24027,7 @@ async function hydrateAppGrants() {
           · ${grant.lastUsedAt ? `used ${esc(fmtAgo(grant.lastUsedAt))}` : 'never used'}
           · <span title="${esc(`Created ${new Date(grant.createdAt).toLocaleString()}`)}">${grant.kind === 'token' ? 'expires' : 'expires if unused by'} ${esc(day(grant.expiresAt))}</span></p></div>
       <button class="btn sm danger" type="button" data-revoke-grant="${esc(grant.id)}">Revoke</button></div>`).join('')
-    : '<p class="task-sub app-grants-empty">Nothing signed in yet. Sign in a terminal with <code>npx @tavya/cli login</code>.</p>';
+    : '<p class="task-sub app-grants-empty">Nothing signed in yet. Sign in a terminal with <code>npx @tavya/cli@latest login</code>.</p>';
   box.querySelectorAll('[data-revoke-grant]').forEach((button) => button.addEventListener('click', async () => {
     const name = button.closest('.app-grant-row')?.querySelector('b')?.textContent || 'this';
     if (!confirm(`Revoke ${name}? It is signed out at once.`)) return;

@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { cloudInit, HetznerDriver, paidMsLeft } from '../src/world/hetzner.js';
+import { isTransportError, ProviderCapacityFull, ProviderOutage } from '../src/agent/limits.js';
 import { VmWorldProvider } from '../src/world/vm/provider.js';
 import type { ResolvedWorldProviderConnection } from '../src/world/connections.js';
 import type { WorldHandle } from '../src/world/types.js';
@@ -206,6 +207,164 @@ describe.skipIf(!sshdAvailable)('Hetzner worlds (fake Cloud API, real sshd)', ()
     await Promise.all(['task_a', 'task_b', 'task_c'].map((taskId) =>
       provider.create({ taskId, base: 'main', generation: 1, organizationId: 'org_h' })));
     expect([hetzner.firewalls.length, hetzner.sshKeys.length]).toEqual([1, 1]);
+  });
+
+  it('frees parked servers when the project\'s shared vCPU limit refuses a new one (pramana#58)', async () => {
+    hetzner.sharedCoresLimit = 4;
+    const parked = await provider.create({ taskId: 'task_parked', base: 'main', generation: 1, organizationId: 'org_h' });
+    await provider.park(parked.handle as WorldHandle);
+    // Off but kept for a free wake within its paid hour, it still holds 2 of the 4 cores.
+    expect([...hetzner.servers.values()]).toEqual([expect.objectContaining({ status: 'off' })]);
+    const world = await provider.create({ taskId: 'task_big', base: 'main', generation: 1, organizationId: 'org_h', resources: { cpu: 4, memoryMb: 8192 } });
+    expect([...hetzner.servers.values()].map((server) => server.server_type.name)).toEqual(['cpx31']);
+    expect((await world.exec('sh', ['-c', 'echo ok'])).stdout).toBe('ok\n');
+    // The parked world wakes on a new server later, as after its paid hour.
+    expect(await provider.probe(parked.handle as WorldHandle)).toBe('parked');
+  });
+
+  it('says what holds a full shared vCPU limit, as a wait rather than a failure (pramana#58)', async () => {
+    hetzner.sharedCoresLimit = 4;
+    await provider.create({ taskId: 'task_busy', base: 'main', generation: 1, organizationId: 'org_h' });
+    const refused = await provider.create({ taskId: 'task_big', base: 'main', generation: 1, organizationId: 'org_h',
+      resources: { cpu: 4, memoryMb: 8192 } }).then(() => undefined, (error: unknown) => error);
+    expect(refused).toBeInstanceOf(ProviderCapacityFull);
+    // Setup waits it out like an outage (world-infra) instead of asking a person at once.
+    expect(isTransportError(refused)).toBe(true);
+    expect((refused as Error).message).toBe('Hetzner refused a 4-CPU server: this Hetzner project\'s limit on shared CPUs is full, '
+      + 'with 2 in use by 1 other server. tavya keeps retrying for about 20 minutes; to start sooner, give this task fewer CPUs, '
+      + 'stop another task, or ask Hetzner to raise the limit (Hetzner Console → Limits).');
+    // Nothing of the refused world is left behind.
+    expect([hetzner.servers.size, hetzner.volumes.size]).toEqual([1, 1]);
+  });
+
+  it('wakes a parked world although Hetzner fails the power-on (pramana#59)', async () => {
+    // Production, 2026-10-16 12:32:06: start_server failed "Unknown Error"; the same request a second later worked.
+    const world = await provider.create({ taskId: 'task_wake', base: 'main', generation: 1, organizationId: 'org_h' });
+    await world.writeFile('kept.txt', 'kept');
+    const handle = world.handle as WorldHandle;
+    await provider.park(handle);
+    const [server] = [...hetzner.servers.values()];
+    hetzner.failingActions.set('poweron', 1);
+    const woken = await provider.open(handle);
+    expect([...hetzner.servers.keys()]).toEqual([server!.id]);
+    expect(server!.labels.karmaxParkedAt).toBeUndefined();
+    expect(await woken.readFile('kept.txt')).toBe('kept');
+  });
+
+  it('replaces a server Hetzner cannot start with a new one on the same volume', async () => {
+    const world = await provider.create({ taskId: 'task_stuck', base: 'main', generation: 1, organizationId: 'org_h' });
+    await world.writeFile('kept.txt', 'kept');
+    const handle = world.handle as WorldHandle;
+    await provider.park(handle);
+    const [stuck] = [...hetzner.servers.values()];
+    hetzner.failingActions.set('poweron', Infinity);
+    const woken = await provider.open(handle);
+    const [fresh] = [...hetzner.servers.values()];
+    expect(hetzner.servers.size).toBe(1);
+    expect(fresh!.id).not.toBe(stuck!.id);
+    expect(fresh!.volumes).toEqual([[...hetzner.volumes.keys()][0]]);
+    expect(await woken.readFile('kept.txt')).toBe('kept');
+  });
+
+  it('replaces a woken server that never answers SSH', async () => {
+    const reachable = new VmWorldProvider(driver, async () => connection(hetzner.token), undefined, {
+      socket: hetzner.socket, user: os.userInfo().username, home: hetzner.home, reachableMs: 1_500,
+      provision: { stamp, script: `echo provisioned > ${stamp}`, sudo: false },
+    });
+    const world = await reachable.create({ taskId: 'task_deaf', base: 'main', generation: 1, organizationId: 'org_h' });
+    await world.writeFile('kept.txt', 'kept');
+    const handle = world.handle as WorldHandle;
+    await reachable.park(handle);
+    const [deaf] = [...hetzner.servers.values()];
+    hetzner.deafBoots = 1;
+    const woken = await reachable.open(handle);
+    expect([...hetzner.servers.keys()]).not.toContain(deaf!.id);
+    expect(await woken.readFile('kept.txt')).toBe('kept');
+    // Twice deaf: a retryable outage, not an error for the agent or a person.
+    await reachable.park(woken.handle as WorldHandle);
+    hetzner.deafBoots = 2;
+    const refused = await reachable.open(handle).then(() => undefined, (error: unknown) => error);
+    expect(isTransportError(refused)).toBe(true);
+    expect((refused as Error).message).toMatch(/did not answer SSH/);
+    // Nothing is left billing for a machine that does nothing.
+    expect([...hetzner.servers.values()].filter((server) => server.status !== 'off')).toEqual([]);
+  });
+
+  it('makes every Hetzner failure that passes a retryable outage, never the agent\'s error', async () => {
+    const world = await provider.create({ taskId: 'task_out', base: 'main', generation: 1, organizationId: 'org_h' });
+    const handle = world.handle as WorldHandle;
+    await provider.park(handle);
+    hetzner.failingActions.set('poweron', Infinity);
+    hetzner.refuse('POST', /^\/v1\/servers$/, 503, 'unavailable', 'service unavailable', Infinity);
+    const refused = await provider.open(handle).then(() => undefined, (error: unknown) => error);
+    expect(refused).toBeInstanceOf(ProviderOutage);
+    expect(isTransportError(refused)).toBe(true);
+    expect((refused as Error).message).toMatch(/Hetzner/);
+    // The volume, the world's files, is never what a failed wake gives up.
+    expect(hetzner.volumes.size).toBe(1);
+  });
+
+  it('retries Hetzner\'s refusals (rate limit, locked) on any request, and sends no create twice on a 500', async () => {
+    hetzner.refuse('POST', /^\/v1\/servers$/, 429, 'rate_limit_exceeded', 'limit of 3600 requests per hour reached');
+    hetzner.refuse('POST', /^\/v1\/volumes$/, 423, 'locked', 'resource is locked');
+    const world = await provider.create({ taskId: 'task_busy_api', base: 'main', generation: 1, organizationId: 'org_h' });
+    expect((await world.exec('sh', ['-c', 'echo ok'])).stdout).toBe('ok\n');
+    // A 500 to a create may have created it: not sent again here; the create's own retry deletes leftovers first.
+    hetzner.refuse('POST', /^\/v1\/volumes$/, 500, 'server_error', 'internal server error');
+    const before = hetzner.requests.filter((request) => request.method === 'POST' && request.path === '/v1/volumes').length;
+    const failed = await provider.create({ taskId: 'task_500', base: 'main', generation: 1, organizationId: 'org_h' })
+      .then(() => undefined, (error: unknown) => error);
+    expect(isTransportError(failed)).toBe(true);
+    expect(hetzner.requests.filter((request) => request.method === 'POST' && request.path === '/v1/volumes').length).toBe(before + 1);
+  });
+
+  it('takes the next server type when Hetzner has none of the cheapest left', async () => {
+    hetzner.soldOut.add('cx22');
+    const world = await provider.create({ taskId: 'task_sold', base: 'main', generation: 1, organizationId: 'org_h' });
+    expect([...hetzner.servers.values()].map((server) => server.server_type.name)).toEqual(['cpx31']);
+    expect((await world.exec('sh', ['-c', 'echo ok'])).stdout).toBe('ok\n');
+    // A type the location stopped offering within the hour the types are cached for, too.
+    hetzner.soldOut.clear();
+    hetzner.refuse('POST', /^\/v1\/servers$/, 422, 'invalid_input', 'unsupported location for server type');
+    await provider.create({ taskId: 'task_gone', base: 'main', generation: 1, organizationId: 'org_h' });
+    expect(hetzner.servers.size).toBe(2);
+  });
+
+  it('says what holds a full volume limit, as a wait rather than a failure', async () => {
+    hetzner.volumesLimitGb = 150;
+    await provider.create({ taskId: 'task_disk', base: 'main', generation: 1, organizationId: 'org_h', resources: { diskGb: 100 } });
+    const refused = await provider.create({ taskId: 'task_disk2', base: 'main', generation: 1, organizationId: 'org_h', resources: { diskGb: 70 } })
+      .then(() => undefined, (error: unknown) => error);
+    expect(refused).toBeInstanceOf(ProviderCapacityFull);
+    expect(isTransportError(refused)).toBe(true);
+    expect((refused as Error).message).toBe('Hetzner refused a 70 GB disk: this Hetzner project\'s limit on the total size of its volumes '
+      + 'is full, with 100 GB in 1 volume. tavya keeps retrying for about 20 minutes; to start sooner, give this task a smaller disk, '
+      + 'delete another task, or ask Hetzner to raise the limit (Hetzner Console → Limits).');
+    expect(hetzner.volumes.size).toBe(1);
+  });
+
+  it('parks a server that will not shut down by deleting it; the volume stays', async () => {
+    const world = await provider.create({ taskId: 'task_nostop', base: 'main', generation: 1, organizationId: 'org_h' });
+    await world.writeFile('kept.txt', 'kept');
+    const handle = world.handle as WorldHandle;
+    hetzner.failingActions.set('shutdown', Infinity);
+    hetzner.failingActions.set('poweroff', Infinity);
+    await provider.park(handle);
+    expect([hetzner.servers.size, hetzner.volumes.size]).toEqual([0, 1]);
+    expect(await provider.probe(handle)).toBe('parked');
+    expect(await (await provider.open(handle)).readFile('kept.txt')).toBe('kept');
+  });
+
+  it('keeps housekeeping past a server it cannot delete', async () => {
+    for (const taskId of ['task_h1', 'task_h2']) {
+      const world = await provider.create({ taskId, base: 'main', generation: 1, organizationId: 'org_h' });
+      await provider.park(world.handle as WorldHandle);
+    }
+    for (const server of hetzner.servers.values()) server.created = new Date(Date.now() - 57 * 60_000).toISOString();
+    const [first] = [...hetzner.servers.keys()];
+    hetzner.refuse('DELETE', new RegExp(`^/v1/servers/${first}$`), 403, 'protected', 'server is protected', Infinity);
+    await expect(provider.housekeep('org_h')).rejects.toThrow(/protected/);
+    expect([...hetzner.servers.keys()]).toEqual([first]);
   });
 
   it('boots new servers from the provisioned snapshot once one exists', async () => {

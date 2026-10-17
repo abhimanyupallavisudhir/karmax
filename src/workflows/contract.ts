@@ -28,6 +28,7 @@ export type {
   ChildRaise,
   ParentResponse,
   SubTaskRequest,
+  QueuedSubTask,
   SubTaskResponse,
   RaiseToParent,
   AgentWait,

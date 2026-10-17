@@ -135,6 +135,60 @@ describe('software-dev 1.27: one conversation, several agents (real Temporal + g
     await handle.result();
   }, 60_000);
 
+  it('Open PR after stopping the Agent returns the proposal to Review at once, without another turn (#659)', async () => {
+    const repo = await h.makeRepo('stopped-open-pr');
+    const taskId = newId('task');
+    const handle = h.client.workflow.start('softwareDev@1.30.0', { taskQueue: TASK_QUEUE, workflowId: taskId,
+      args: [input({ taskId, repo, title: 'StoppedOpenPr', prompt: 'Do.\n@write a.txt :: one' })] });
+    const started = await handle;
+    await expect.poll(async () => (await view(started)).stage, { timeout: 20_000 }).toBe('review');
+    // A message in Review returns it to Do; the person thinks better of it and stops the Agent.
+    await started.signal('followUp', { id: 'u-more', role: 'user', author: 'user:ann', authorLabel: 'Ann', ts: Date.now(),
+      text: 'Also start on the next thing.\n@sleep 4000\n@write b.txt :: two' });
+    await expect.poll(async () => (await view(started)).participants?.find((p: any) => p.key === 'do')?.state, { timeout: 20_000 })
+      .toBe('running');
+    await started.signal('stopAgent', { key: 'do', by: 'user:ann', byLabel: 'Ann' });
+    await expect.poll(async () => (await view(started)).waitingFor?.detail, { timeout: 10_000 })
+      .toBe('Stopped. Send a message to continue.');
+    const turns = authored(await view(started)).filter((a: string) => a === 'do').length;
+    // "Return to Review & Confirm": the proposal as it stands, no turn first.
+    await started.signal('openPr', { userId: 'ann' });
+    await expect.poll(async () => (await view(started)).stage, { timeout: 20_000 }).toBe('review');
+    let v = await view(started);
+    expect(v.agentTurn?.state).not.toBe('running');
+    expect(authored(v).filter((a: string) => a === 'do')).toHaveLength(turns);
+    // The message it never answered still reaches it next time it runs.
+    await started.signal('followUp', { id: 'u-after', role: 'user', author: 'user:ann', authorLabel: 'Ann', ts: Date.now(), text: 'What did I ask?\n@heard' });
+    await expect.poll(async () => authored(await view(started)).filter((a: string) => a === 'do').length, { timeout: 30_000 })
+      .toBeGreaterThan(turns);
+    v = await view(started);
+    expect(v.messages.filter((m: any) => m.role === 'agent' && !m.author).at(-1)?.text)
+      .toContain('Also start on the next thing.');
+    await started.signal('cancel');
+    await started.result();
+  }, 90_000);
+
+  it('a Confirm sent while the Reviewer works approves neither its step nor the human one after it', async () => {
+    const repo = await h.makeRepo('reviewer-then-human');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev@1.30.0', { taskQueue: TASK_QUEUE, workflowId: taskId, args: [{
+      ...input({ taskId, repo, title: 'TwoSteps', prompt: 'Do.\n@write a.txt :: one' }),
+      confirm: { layers: [{ kind: 'agent', provider: 'mock', prompt: '@sleep 3000\n@confirm confirm' }, { kind: 'human', audience: ['@creator'] }] },
+    }] });
+    await expect.poll(async () => (await view(handle)).participants?.find((p: any) => p.key === 'confirm')?.state, { timeout: 30_000 })
+      .toBe('running');
+    // Not offered while the Reviewer decides; one sent anyway is not the human step's.
+    expect((await view(handle)).actions.map((a: any) => a.name)).not.toContain('confirm');
+    await handle.signal('confirm');
+    await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 30_000 }).toBe('human');
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    const v = await view(handle);
+    expect(v.stage).toBe('review');
+    expect(v.actions.map((a: any) => a.name)).toContain('confirm');
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
+  }, 90_000);
+
   it('a failure automatic recovery cannot fix keeps its stage and asks the task’s people, not an Escalated stage', async () => {
     const repo = await h.makeRepo('failing');
     const taskId = newId('task');

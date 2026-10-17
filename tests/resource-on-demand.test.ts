@@ -285,6 +285,36 @@ describe('on-demand resources', () => {
     expect(await f.version(await f.current())).toEqual(f.hashed({ ...CORPUS, 'ocr/page-1.txt': 'two', 'ocr/page-4.txt': 'two adds' }));
   }, 240_000);
 
+  // pramana#56: a file both changed differently refused the whole publication.
+  it('merges a file both edited line by line, in a part the world dropped too, and hands the rest to the agent', async () => {
+    const f = await fixture({ ...CORPUS, 'ocr/log.txt': 'a\nb\nc\nd\n', 'mt/notes.txt': 'x\n' });
+    const one = await f.task('One');
+    const two = await f.task('Two');
+    await f.tool(one.world, 'get', `${RESOURCE}/ocr`, `${RESOURCE}/mt`);
+    await f.tool(two.world, 'get', `${RESOURCE}/ocr`, `${RESOURCE}/mt`);
+    f.write(one.world, 'ocr/log.txt', 'A\nb\nc\nd\n');
+    f.write(one.world, 'mt/notes.txt', 'one\n');
+    f.write(two.world, 'ocr/log.txt', 'a\nb\nc\nD\n');
+    f.write(two.world, 'mt/notes.txt', 'two\n');
+    await f.publish(one.task.id, 'one');
+    const head = await f.current();
+    // Two saves its copy and drops ocr: the line merge needs it again and fetches it.
+    await f.resources.checkpoint(two.world.handle);
+    expect((await f.tool(two.world, 'drop', `${RESOURCE}/ocr`)).code).toBe(0);
+    const refused = await f.publish(two.task.id, 'two').then(() => undefined, (error) => error) as ResourceConflictError;
+    expect(refused).toBeInstanceOf(ResourceConflictError);
+    expect(refused.paths).toEqual(['mt/notes.txt']);
+    expect((await f.current()).id).toBe(head.id);
+    const folder = path.join(two.world.handle.root, '.karmax-injection/resource-merge', f.data.id);
+    expect(fs.readFileSync(path.join(folder, 'other/mt/notes.txt'), 'utf8')).toBe('one\n');
+
+    f.write(two.world, 'mt/notes.txt', 'one\ntwo\n');
+    fs.writeFileSync(path.join(folder, 'unresolved'), '');
+    await f.publish(two.task.id, 'two-again');
+    expect(await f.version(await f.current())).toEqual(f.hashed({ ...CORPUS, 'ocr/log.txt': 'A\nb\nc\nD\n', 'mt/notes.txt': 'one\ntwo\n' }));
+    expect(fs.existsSync(folder)).toBe(false);
+  }, 240_000);
+
   it('hands a sub-task\'s changes to its parent part by part; the parent publishes everything once', async () => {
     const f = await fixture(CORPUS);
     const parent = await f.task('Integrator');

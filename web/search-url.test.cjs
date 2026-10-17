@@ -151,9 +151,12 @@ function ok(condition, message) {
 // it, which is what makes deleting the separate S.activeView state safe.
 global.esc = (s) => String(s ?? ''); // escaping is not what this test is about
 eval(extractFn('viewsBar'));
+eval(extractFn('viewQuery'));
+eval(extractFn('listQueryRoute'));
+S.tab = 'tasks';
 const activeChips = (q) => {
   S.search = q;
-  return (viewsBar().match(/<div class="view-chip[^"]*active[^"]*"[^>]*>/g) || [])
+  return (viewsBar().match(/<a class="view-chip[^"]*active[^"]*"[^>]*>/g) || [])
     .map((c) => (c.match(/data-view="([^"]+)"/) || [])[1]);
 };
 eq(activeChips('tag:bug'), ['V1'], 'a URL naming a saved view’s query lights that chip');
@@ -165,6 +168,19 @@ ok(viewsBar().indexOf('__for_me__') < viewsBar().indexOf('__active__'), '“For 
 ok(/data-view="__active__"[^>]*title="-is:archived"[^>]*>Active</.test(viewsBar()), 'the chip is called “Active” and shows its query on hover');
 ok(!/>≡ All</.test(viewsBar()), 'there is no “All” chip');
 eq(activeChips('tag:bug priority:>=2'), [], 'an ad-hoc query lights nothing');
+
+// ── every chip is a link to its view's URL, so it opens in a new tab ─────────
+const chipHref = (id) => (viewsBar().match(new RegExp(`<a [^>]*data-view="${id}" href="([^"]+)"`)) || [])[1];
+eq(chipHref('__for_me__'), '/acme/website-redesign', '“For me” links to the bare list (the default query)');
+eq(chipHref('__active__'), '/acme/website-redesign?q=-is:archived', '“Active” links to its query');
+eq(chipHref('builtin:archived'), '/acme/website-redesign?q=is:archived', 'a built-in view links to its query');
+eq(chipHref('V1'), '/acme/website-redesign?q=tag:bug', 'a saved view links to its query');
+eq(parseRoute(chipHref('builtin:scheduled')).q, 'is:scheduled -is:archived sort:nextRun-asc', 'a chip’s URL round-trips to its query');
+S.tab = 'home'; S.searchScope = 'org:org_acme';
+eq(chipHref('builtin:archived'), '/acme?q=is:archived', 'on the organization home a chip links to the home list');
+S.tab = 'inbox';
+eq(chipHref('__active__'), '/inbox?q=-is:archived', 'and on the inbox, to the inbox');
+S.tab = 'tasks'; S.searchScope = 'P1';
 S.search = '';
 
 // ── the address bar follows the query (the write direction) ──────────────────
@@ -252,6 +268,7 @@ eval(extractFn('setQuery'));
   global.globalRoute = () => '/acme/dashboard';
   global.closeTaskFormPage = () => {};
   eval(extractFn('spaNavigate'));
+  eval(extractFn('taskBackRoute'));
   eval(extractFn('closeTask'));
 
   await setQuery('tag:bug sort:priority-desc');

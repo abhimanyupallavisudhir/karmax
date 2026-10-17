@@ -5,6 +5,8 @@ import path from 'node:path';
 import { bootHarness, type Harness } from './helpers/harness.js';
 import { TASK_QUEUE } from '../src/temporal/config.js';
 import { git } from '../src/world/git.js';
+import { ensureProjectWikiRepository } from '../src/wiki/repository.js';
+import { worldRepoTarget } from '../src/world/types.js';
 import { MERGE_QUEUE_WORKFLOW, SIG_ENQUEUE, SIG_RELEASE, mergeQueueId } from '../src/coordinators/names.js';
 
 /**
@@ -75,6 +77,9 @@ describe('software-dev: every branch of a task lands as its own pull request', (
       expect(pr.world.repos.map((r: any) => r.name)).toEqual(['docs']);
       expect(pr.world.repos[0].root).toContain(path.join('.karmax-injection', 'pull-requests', childId));
       expect(await h.store.currentWorld(childId)).toBeFalsy();
+      // It is part of its task, not a task: no number, no row in the task list.
+      expect((await h.store.getTask(childId))?.num ?? undefined).toBeUndefined();
+      expect((await h.store.listTasksAsync((await h.store.getTask(taskId))!.projectId, false)).map((t) => t.id)).toEqual([taskId]);
 
       // The agent is still working.
       const parent = await view(handle);
@@ -95,18 +100,19 @@ describe('software-dev: every branch of a task lands as its own pull request', (
       expect((await git(repo, ['log', '--oneline', 'main'])).stdout).toContain(`merge tavya/${childId} into main`);
       expect((await view(handle)).agentTurn?.state).toBe('running');
 
-      // The agent finishes: its other branch opens as its own pull request,
-      // and the task waits for it — it never has a Review of its own.
+      // The agent finishes: the rest of its work — its own branch — goes
+      // through the task's own Review, not as another pull request of its own.
       fs.writeFileSync(gate, '');
-      const { childId: lastId, child: last } = await pullRequest(handle, 2);
-      expect((await view(handle)).waitingFor?.kind).toBe('subtask');
-      expect((await view(handle)).stage).toBe('do');
-      await last.signal('confirm');
+      await expect.poll(async () => { const v = await view(handle); return `${v.stage}/${v.waitingFor?.kind}`; },
+        { timeout: 30_000 }).toBe('review/human');
+      expect((await view(handle)).subTasks).toHaveLength(1);
+      // Its Review is of its own work only: docs landed already.
+      expect((await view(handle)).checkouts.map((c: any) => c.name)).not.toContain('docs');
+      await handle.signal('confirm');
       expect((await handle.result()).stage).toBe('done');
       expect((await git(repo, ['show', 'main:feature.js'])).stdout).toContain('feature');
-      expect((await git(repo, ['log', '--oneline', 'main'])).stdout).toContain(`merge tavya/${lastId} into main`);
-      expect((await git(repo, ['log', '--oneline', 'main'])).stdout).not.toContain(`merge tavya/${taskId} into main`);
-      expect((await view(handle)).shipments.map((s: any) => s.state)).toEqual(['landed', 'landed']);
+      expect((await git(repo, ['log', '--oneline', 'main'])).stdout).toContain(`merge tavya/${taskId} into main`);
+      expect((await view(handle)).shipments.map((s: any) => s.state)).toEqual(['landed']);
       // Its branches stayed in its world throughout.
       expect((await view(handle)).checkouts.map((c: any) => c.name)).toContain('docs');
     } finally { fs.writeFileSync(gate, ''); }
@@ -264,9 +270,9 @@ describe('software-dev: every branch of a task lands as its own pull request', (
     }
   }, 180_000);
 
-  it('Done waits for every pull request, whichever lands first', async () => {
+  it('finishing waits for the pull requests still open, then proposes the rest through the task\'s own Review', async () => {
     const repo = await h.makeRepo('ship-done-waits');
-    const { handle } = await start(repo, [
+    const { taskId, handle } = await start(repo, [
       '@branch docs',
       docsCommit,
       '@ship docs',
@@ -274,16 +280,92 @@ describe('software-dev: every branch of a task lands as its own pull request', (
       '@run git add -A && git commit -qm feature',
     ].join('\n'));
     const { child: docs } = await pullRequest(handle, 1);
-    const { child: feature } = await pullRequest(handle, 2);
-    await feature.signal('confirm');
-    expect((await feature.result()).stage).toBe('done');
-    await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 30_000 }).toBe('subtask');
-    expect((await view(handle)).status).not.toBe('done');
+    // The agent finished while docs is in review: the task waits for it, and says so.
+    await expect.poll(async () => (await view(handle)).waitingFor?.detail, { timeout: 30_000 })
+      .toBe('Waiting for the pull request for "docs" to land');
+    expect((await view(handle)).stage).toBe('do');
     await docs.signal('confirm');
+    expect((await docs.result()).stage).toBe('done');
+    await expect.poll(async () => { const v = await view(handle); return `${v.stage}/${v.waitingFor?.kind}`; },
+      { timeout: 30_000 }).toBe('review/human');
+    expect((await view(handle)).subTasks).toHaveLength(1);
+    await handle.signal('confirm');
     expect((await handle.result()).stage).toBe('done');
     expect((await git(repo, ['show', 'main:docs/guide.md'])).code).toBe(0);
     expect((await git(repo, ['show', 'main:feature.js'])).code).toBe(0);
+    expect((await git(repo, ['log', '--oneline', 'main'])).stdout).toContain(`merge tavya/${taskId} into main`);
   }, 150_000);
+
+  it('a task across several repositories lands them together through one Review (task #644)', async () => {
+    const front = await h.makeRepo('ship-together-front');
+    const back = await h.makeRepo('ship-together-back');
+    const config = { repos: [front, back], defaultBase: 'main', defaultTarget: 'main', openGithubPr: false, multiPr: true };
+    const project = await h.store.createProject('Ship together', config);
+    const prompt = [
+      `@write ${path.basename(front)}/client.js :: export const call = 1;`,
+      `@write ${path.basename(back)}/server.js :: export const serve = 1;`,
+      `@run cd ../${path.basename(front)} && git add -A && git commit -qm client && cd ../${path.basename(back)} && git add -A && git commit -qm server`,
+    ].join('\n');
+    const task = await h.store.createTask({ projectId: project.id, title: 'Across repositories', workflow: 'software-dev',
+      workflowVersion: '1.30.0', params: { prompt, multiPr: true }, createdBy: { kind: 'user', userId: 'a' } });
+    const handle = await h.client.workflow.start('softwareDev@1.30.0', { taskQueue: TASK_QUEUE, workflowId: task.id,
+      args: [{ taskId: task.id, projectId: project.id, title: task.title, prompt, base: 'main', target: 'main', project: config }] });
+    await expect.poll(async () => { const v = await view(handle); return `${v.stage}/${v.waitingFor?.kind}`; },
+      { timeout: 30_000 }).toBe('review/human');
+    expect((await view(handle)).subTasks ?? []).toHaveLength(0);
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
+    expect((await git(front, ['show', 'main:client.js'])).code).toBe(0);
+    expect((await git(back, ['show', 'main:server.js'])).code).toBe(0);
+    expect((await view(handle)).shipments ?? []).toHaveLength(0);
+  }, 120_000);
+
+  it('a sub-task\'s wiki pages land on its parent\'s wiki branch, and reach wiki main only through the parent\'s wiki pull request (pramana#39)', async () => {
+    const repo = await h.makeRepo('ship-subtask-wiki');
+    // Commit a page in this world's project-wiki checkout (a sibling of the code checkout).
+    const note = (name: string) => `@run for d in ../*/; do case "$(git -C "$d" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" in */wiki/project/*) mkdir -p "$d/memories/${name}" && printf 'from ${name}' > "$d/memories/${name}/MEMORY.md" && git -C "$d" add -A && git -C "$d" commit -qm ${name};; esac; done`;
+    const { taskId, handle } = await start(repo, `${note('parent')}\n@subtask Child :: ${note('child')}\n@incomplete`);
+    const wiki = ensureProjectWikiRepository(h.contentDir, (await h.store.getTask(taskId))!.projectId);
+    const parentBranch = `tavya/${taskId}`;
+    try {
+      // The sub-task (not a pull request of the parent) stacks its wiki on the parent's branch…
+      await expect.poll(async () => (await view(handle)).subTasks?.length ?? 0, { timeout: 30_000 }).toBeGreaterThanOrEqual(1);
+      const childId = (await view(handle)).subTasks[0] as string;
+      const child = h.client.workflow.getHandle(childId);
+      await expect.poll(async () => {
+        const checkout = ((await view(child)).state?.recoveryWorld?.repos ?? []).find((r: any) => r.role === 'project-wiki');
+        return checkout && [checkout.base, worldRepoTarget(checkout, '')];
+      }, { timeout: 30_000 }).toEqual([parentBranch, parentBranch]);
+      // …and lands there once approved, wherever its own pull requests are.
+      for (let n = 0; n < 20 && (await view(child)).stage !== 'done'; n++) {
+        const v = await view(child);
+        const open = v.subTasks?.length ? v.subTasks.map((id: string) => h.client.workflow.getHandle(id)) : [child];
+        for (const pr of open) {
+          const pv = await view(pr).catch(() => undefined);
+          if (pv?.stage === 'review' && pv.waitingFor?.kind === 'human') await pr.signal('confirm');
+          if (pv?.stage === 'review' && pv.waitingFor?.kind === 'parent') await handle.signal('followUp', { id: `r${n}`, role: 'user', text: '@respond confirm', ts: 0 });
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+      }
+      expect((await view(child)).stage).toBe('done');
+      expect((await git(wiki, ['show', `${parentBranch}:memories/child/MEMORY.md`])).stdout).toContain('from child');
+      expect((await git(wiki, ['show', 'main:memories/child/MEMORY.md'])).code).not.toBe(0);
+      expect((await git(wiki, ['show', 'main:memories/parent/MEMORY.md'])).code).not.toBe(0);
+
+      // The parent finishes: its wiki goes to main through the parent's own
+      // Review, carrying both pages — not as a pull request of its own.
+      await handle.signal('followUp', { id: 'done', role: 'user', text: '@openpr', ts: 0 });
+      await expect.poll(async () => { const v = await view(handle); return `${v.stage}/${v.waitingFor?.kind}`; },
+        { timeout: 60_000 }).toBe('review/human');
+      await handle.signal('confirm');
+      expect((await handle.result()).stage).toBe('done');
+      expect((await view(handle)).shipments ?? []).toHaveLength(0);
+      expect((await git(wiki, ['show', 'main:memories/parent/MEMORY.md'])).stdout).toContain('from parent');
+      expect((await git(wiki, ['show', 'main:memories/child/MEMORY.md'])).stdout).toContain('from child');
+    } finally {
+      await handle.signal('cancel').catch(() => undefined);
+    }
+  }, 180_000);
 
   it('refuses what cannot open, and tells the agent why', async () => {
     const repo = await h.makeRepo('ship-refusals');

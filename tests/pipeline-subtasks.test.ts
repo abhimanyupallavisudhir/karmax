@@ -5,6 +5,7 @@ import type { Harness } from './helpers/harness.js';
 import { TASK_QUEUE } from '../src/temporal/config.js';
 import { git } from '../src/world/git.js';
 import { newId } from '../src/util/id.js';
+import { ensureProjectWikiRepository } from '../src/wiki/repository.js';
 import { bootPipelineHarness, pipelineGates, stopPipelineHarness, input, view } from './helpers/pipeline-harness.js';
 
 describe('software-dev pipeline: sub-tasks and in-harness sub-agents (real Temporal + git, mock agent)', () => {
@@ -83,6 +84,50 @@ describe('software-dev pipeline: sub-tasks and in-harness sub-agents (real Tempo
   // #396 review item 8: a running child's follow-up gate asks its workflow only
   // after a journal entry. The parent's answer is pushed by the parent workflow,
   // so without one it waited for the 30 s backstop instead of the next poll.
+  it('a sub-task\'s project-wiki edits stack onto the parent\'s wiki branch and reach wiki main only with the parent (pramana#39)', async () => {
+    const repo = await h.makeRepo('app-sub-wiki');
+    const project = (await h.store.createProject('Wiki stack', { repos: [repo], defaultBase: 'main', defaultTarget: 'main' }));
+    const wiki = ensureProjectWikiRepository(h.contentDir, project.id);
+    // Write a page into this world's project-wiki checkout (a sibling of the code checkout).
+    const note = (name: string) => `@run for d in ../*/; do case "$(git -C "$d" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" in */wiki/project/*) mkdir -p "$d/memories/${name}" && printf 'from ${name}' > "$d/memories/${name}/MEMORY.md";; esac; done`;
+    const prompt = `${note('parent')}\n@subtask Child :: ${note('child')}`;
+    const parent = (await h.store.createTask({ projectId: project.id, title: 'Parent', workflow: 'software-dev', workflowVersion: '1.0.0', params: { prompt } }));
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: parent.id,
+      args: [input({ taskId: parent.id, projectId: project.id, repo, title: 'Parent', prompt })],
+    });
+    try {
+      await expect.poll(async () => (await view(handle)).subTasks?.length, { timeout: 30_000 }).toBe(1);
+      const parentBranch = (await view(handle)).branch as string;
+      const childId = (await view(handle)).subTasks![0]!;
+      const child = h.client.workflow.getHandle(childId);
+      // The child's wiki checkout starts from the parent's branch: it already has the parent's page.
+      await expect.poll(async () => {
+        const repos = ((await child.query('view')) as any).state?.recoveryWorld?.repos ?? [];
+        const checkout = repos.find((r: any) => r.role === 'project-wiki');
+        return checkout ? [checkout.base, fs.existsSync(path.join(checkout.root, 'memories/parent/MEMORY.md'))] : undefined;
+      }, { timeout: 30_000 }).toEqual([parentBranch, true]);
+
+      await parentSawRaise(handle, 'needs_confirmation');
+      await handle.signal('followUp', { id: 'r1', role: 'user', text: '@respond confirm', ts: 0 });
+      expect((await child.result() as any).stage).toBe('done');
+      await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+
+      // The child landed on the parent's wiki branch; the wiki's main has neither page yet.
+      expect((await git(wiki, ['show', `${parentBranch}:memories/child/MEMORY.md`])).stdout).toContain('from child');
+      expect((await git(wiki, ['show', 'main:memories/child/MEMORY.md'])).code).not.toBe(0);
+      expect((await git(wiki, ['show', 'main:memories/parent/MEMORY.md'])).code).not.toBe(0);
+
+      await handle.signal('confirm');
+      expect((await handle.result()).stage).toBe('done');
+      expect((await git(wiki, ['show', 'main:memories/parent/MEMORY.md'])).stdout).toContain('from parent');
+      expect((await git(wiki, ['show', 'main:memories/child/MEMORY.md'])).stdout).toContain('from child');
+    } finally {
+      await handle.signal('cancel').catch(() => undefined);
+    }
+  }, 120_000);
+
   it('a parent comment reaches its running child mid-turn within the follow-up latency', async () => {
     const repo = await h.makeRepo('app-sub-comment');
     const taskId = newId('task');

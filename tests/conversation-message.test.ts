@@ -90,7 +90,7 @@ describe('conversation message events', () => {
     const api = new KarmaxApi({ store, client: { workflow: { getHandle: () => ({ signal }) } } as any, taskQueue: 'test', tokens });
 
     const messenger = (await mint(['task:read', 'task:conversation:message']));
-    const message = await api.messageAgent(messenger, task.id, 'Please rebase', 'do');
+    const { message } = await api.messageAgent(messenger, task.id, 'Please rebase', 'do');
     expect(signal).toHaveBeenCalledWith('followUp', message, 'do');
     expect(message).toMatchObject({ role: 'user', text: 'Please rebase' });
     await expect(api.signalTask(messenger, task.id, 'cancel')).rejects.toThrow(/task:signal/);
@@ -98,6 +98,28 @@ describe('conversation message events', () => {
     signal.mockClear();
     await expect(api.messageAgent((await mint(['task:read', 'task:signal'])), task.id, 'hi', 'do'))
       .rejects.toThrow(/task:conversation:message/);
+    expect(signal).not.toHaveBeenCalled();
+  });
+});
+
+describe('Confirm while a Reviewer agent decides', () => {
+  // It only set a flag the Reviewer's turn never read: the click was lost on a
+  // "revise", or approved the next human step unseen — skipping its audience.
+  it('is refused until the Reviewer has decided', async () => {
+    const store = (await Store.create(':memory:'));
+    onTestFinished(async () => (await store.close()));
+    const tokens = new TokenAuthority();
+    const caps = ['task:read', 'task:signal', 'review:approve'];
+    const token = (await tokens.mint({ taskId: 'operator', profileId: 'do', principal: 'user:test', ceiling: caps, grantorCaps: caps })).token;
+    const project = (await store.createProject('Review'));
+    const task = (await store.createTask({ projectId: project.id, title: 'Reviewed', workflow: 'software-dev', workflowVersion: '1.30.0', params: { prompt: 'x' } }));
+    const signal = vi.fn(async () => undefined);
+    const api = new KarmaxApi({ store, client: { workflow: { getHandle: () => ({ signal }) } } as any, taskQueue: 'test', tokens });
+    const review = { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'review', status: 'waiting', messages: [], actions: [], state: {}, updatedAt: 1 };
+    (await store.saveView(task.id, { ...review, waitingFor: { kind: 'confirm' } } as any));
+    await expect(api.signalTask(token, task.id, 'confirm')).rejects.toThrow(/Reviewer agent is reviewing/);
+    (await store.saveView(task.id, { ...review, participants: [{ key: 'confirm', label: 'Reviewer', role: 'confirm', state: 'running', messages: 0 }] } as any));
+    await expect(api.signalTask(token, task.id, 'confirm')).rejects.toThrow(/Reviewer agent is reviewing/);
     expect(signal).not.toHaveBeenCalled();
   });
 });

@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it } from 'vitest';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import zlib from 'node:zlib';
 import { Store } from '../src/store/db.js';
 import { LocalObjectStore } from '../src/store/objects.js';
 import { Vault } from '../src/autonomy/vault.js';
@@ -21,7 +23,7 @@ import type { World } from '../src/world/types.js';
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { while (cleanups.length) await cleanups.pop()!(); });
 
-async function fixture(initial: Record<string, string>) {
+async function fixture(initial: Record<string, string | Buffer>) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-resource-merge-'));
   const repo = path.join(dir, 'repo'); fs.mkdirSync(repo);
   await gitOrThrow(repo, ['init', '-q', '-b', 'main']); await ensureIdentity(repo);
@@ -37,7 +39,7 @@ async function fixture(initial: Record<string, string>) {
   const data = await store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
     name: 'raw_data', driver: 'volume@1', target: { kind: 'path', path: 'resources/raw_data' }, access: 'write',
     isolation: 'fork', source: {}, credentialHandles: [], publish: 'review' });
-  const first = await resources.importFiles(data.id, Object.entries(initial).map(([file, text]) => ({ path: file, data: Buffer.from(text) })));
+  const first = await resources.importFiles(data.id, Object.entries(initial).map(([file, text]) => ({ path: file, data: Buffer.isBuffer(text) ? text : Buffer.from(text) })));
   const opened: World[] = [];
   cleanups.push(async () => {
     for (const world of opened) { await resources.release(world.handle).catch(() => undefined); await world.destroy().catch(() => undefined); }
@@ -89,7 +91,9 @@ async function fixture(initial: Record<string, string>) {
   };
   const lease = async (world: World) => (await store.listResourceLeases(world.handle.id, world.handle.generation ?? 1))
     .find((candidate) => candidate.attachmentId === data.id && candidate.state === 'active')!;
-  return { store, resources, data, first, task, subTask, worldFor, write, remove, inWorld, current, published, publish, lease };
+  /** What a merge left for the world's agent. */
+  const mergeFolder = (world: World) => path.join(world.handle.root, '.karmax-injection/resource-merge', data.id);
+  return { store, resources, data, first, task, subTask, worldFor, write, remove, inWorld, current, published, publish, lease, mergeFolder };
 }
 
 describe('combining publications of one resource', () => {
@@ -307,5 +311,232 @@ describe('combining publications of one resource', () => {
     await f.write(child.world, 'out.txt', 'from worker');
     await f.publish(child.task.id, 'worker');
     expect(await f.published()).toEqual({ 'index.txt': 'v1', 'out.txt': 'from worker' });
+  }, 180_000);
+});
+
+// pramana#56 (2026-10-16): two tasks forked raw_data; one published OCR
+// verdicts, the other had rewritten the same verdicts file as a side effect.
+// The second publication was refused, and its Retry re-saved 13 GB to be
+// refused the same way: nothing combined the file or asked the agent to.
+describe('combining files both sides changed', () => {
+  const lines = (...values: string[]) => values.map((value) => `${value}\n`).join('');
+
+  it('merges a text file both edited in different places, line by line', async () => {
+    const f = await fixture({ 'notes.txt': lines('a', 'b', 'c', 'd', 'e') });
+    const one = await f.task('One');
+    const two = await f.task('Two');
+    await f.write(one.world, 'notes.txt', lines('A', 'b', 'c', 'd', 'e'));
+    await f.write(two.world, 'notes.txt', lines('a', 'b', 'c', 'd', 'E'));
+    await f.write(two.world, 'two.txt', '2');
+    await f.publish(one.task.id, 'one');
+    await f.publish(two.task.id, 'two');
+    const expected = { 'notes.txt': lines('A', 'b', 'c', 'd', 'E'), 'two.txt': '2' };
+    expect(await f.published()).toEqual(expected);
+    expect(f.inWorld(two.world)).toEqual(expected);
+    expect(fs.existsSync(f.mergeFolder(two.world))).toBe(false);
+  }, 180_000);
+
+  it('combines lines both only appended to a log, the published ones first, gzipped too', async () => {
+    const f = await fixture({ 'ledger.jsonl': lines('{"id":1}'), 'cache.jsonl.gz': zlib.gzipSync(lines('{"k":1}')) });
+    const one = await f.task('One');
+    const two = await f.task('Two');
+    const gz = (world: World, text: string) => fs.writeFileSync(path.join(world.handle.root, 'resources/raw_data/cache.jsonl.gz'), zlib.gzipSync(text));
+    await f.write(one.world, 'ledger.jsonl', lines('{"id":1}', '{"id":2}'));
+    gz(one.world, lines('{"k":1}', '{"k":2}'));
+    // Two repeats the line one appended, then adds its own: the repeat goes once.
+    await f.write(two.world, 'ledger.jsonl', lines('{"id":1}', '{"id":2}', '{"id":3}'));
+    gz(two.world, lines('{"k":1}', '{"k":3}'));
+    await f.publish(one.task.id, 'one');
+    await f.publish(two.task.id, 'two');
+    const reader = (await f.task('Reader')).world;
+    const root = path.join(reader.handle.root, 'resources/raw_data');
+    expect(fs.readFileSync(path.join(root, 'ledger.jsonl'), 'utf8')).toBe(lines('{"id":1}', '{"id":2}', '{"id":3}'));
+    expect(zlib.gunzipSync(fs.readFileSync(path.join(root, 'cache.jsonl.gz'))).toString()).toBe(lines('{"k":1}', '{"k":2}', '{"k":3}'));
+  }, 180_000);
+
+  it('hands what it cannot merge to the agent, both versions beside it, and publishes the agent\'s result', async () => {
+    const f = await fixture({ 'index.txt': lines('v1'), 'keep.txt': 'k' });
+    const one = await f.task('One');
+    const two = await f.task('Two');
+    await f.write(one.world, 'index.txt', lines('one'));
+    await f.write(one.world, 'keep.txt', 'edited');
+    await f.write(one.world, 'from-one.txt', '1');
+    await f.write(two.world, 'index.txt', lines('two'));
+    f.remove(two.world, 'keep.txt'); // deleted here, edited there
+    await f.write(two.world, 'from-two.txt', '2');
+    await f.publish(one.task.id, 'one');
+    const head = await f.current();
+
+    const refused = await f.publish(two.task.id, 'two').then(() => undefined, (error) => error) as ResourceConflictError;
+    expect(refused).toBeInstanceOf(ResourceConflictError);
+    expect(refused.paths.sort()).toEqual(['index.txt', 'keep.txt']);
+    expect(refused.message).toBe('raw_data: 2 files were changed both by this task and in a newer published version (index.txt, keep.txt).');
+    const folder = f.mergeFolder(two.world);
+    expect(refused.guide).toContain('- index.txt (both edited it; the line merge conflicts)');
+    expect(refused.guide).toContain('- keep.txt (this task deleted it, a newer published version changed it)');
+    expect(refused.guide).toContain(`In ${folder}: base/ holds each file as both started`);
+    expect(refused.guide).toContain(`remove its line from ${folder}/unresolved`);
+    const read = (file: string) => fs.readFileSync(path.join(folder, file), 'utf8');
+    expect([read('base/index.txt'), read('other/index.txt'), read('base/keep.txt'), read('other/keep.txt')])
+      .toEqual([lines('v1'), lines('one'), 'k', 'edited']);
+    expect(read('conflicts/index.txt')).toBe(lines('<<<<<<< this task', 'two', '||||||| started from', 'v1', '=======', 'one', '>>>>>>> published'));
+    expect(read('unresolved').split('\n').filter(Boolean).sort()).toEqual(['index.txt', 'keep.txt']);
+    // Nothing published, nothing in the resource touched.
+    expect((await f.current()).id).toBe(head.id);
+    expect(f.inWorld(two.world)).toEqual({ 'index.txt': lines('two'), 'from-two.txt': '2' });
+
+    // The agent combines index.txt, takes the published keep.txt, and says so.
+    await f.write(two.world, 'index.txt', lines('one', 'two'));
+    fs.copyFileSync(path.join(folder, 'other/keep.txt'), path.join(two.world.handle.root, 'resources/raw_data/keep.txt'));
+    fs.writeFileSync(path.join(folder, 'unresolved'), '');
+    await f.publish(two.task.id, 'two-again');
+    const expected = { 'index.txt': lines('one', 'two'), 'keep.txt': 'edited', 'from-one.txt': '1', 'from-two.txt': '2' };
+    expect(await f.published()).toEqual(expected);
+    expect(f.inWorld(two.world)).toEqual(expected);
+    expect(fs.existsSync(folder)).toBe(false);
+  }, 180_000);
+
+  it('names files the disk has no room to copy, and leaves a script that fetches them', async () => {
+    const f = await fixture({ 'index.txt': lines('v1') });
+    const one = await f.task('One');
+    const two = await f.task('Two');
+    await f.write(one.world, 'index.txt', lines('one'));
+    await f.write(two.world, 'index.txt', lines('two'));
+    await f.publish(one.task.id, 'one');
+    // A full disk: df reports 1 KiB available.
+    const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-full-disk-'));
+    fs.writeFileSync(path.join(bin, 'df'), '#!/bin/sh\necho "Filesystem 1024-blocks Used Available Capacity Mounted"\necho "full 100 99 1 99% /"\n', { mode: 0o755 });
+    const PATH = process.env.PATH;
+    process.env.PATH = `${bin}:${PATH}`;
+    let refused: ResourceConflictError;
+    try { refused = await f.publish(two.task.id, 'two').then(() => undefined, (error) => error) as ResourceConflictError; }
+    finally { process.env.PATH = PATH; fs.rmSync(bin, { recursive: true, force: true }); }
+    const folder = f.mergeFolder(two.world);
+    expect(refused!.guide).toContain(`- index.txt (both edited it; 4 B, no room for copies: free space, then run ${folder}/fetch)`);
+    expect(fs.existsSync(path.join(folder, 'other/index.txt'))).toBe(false);
+    expect(fs.statSync(path.join(folder, 'fetch')).mode & 0o777).toBe(0o700);
+    // Asynchronously: the repository server it reads from runs in this process.
+    const fetched = await new Promise<{ code: number | null; stderr: string }>((resolve) => {
+      const child = spawn(path.join(folder, 'fetch'));
+      let stderr = '';
+      child.stderr.on('data', (chunk) => { stderr += chunk; });
+      child.on('close', (code) => resolve({ code, stderr }));
+    });
+    expect(fetched.code, fetched.stderr).toBe(0);
+    expect(fs.readFileSync(path.join(folder, 'base/index.txt'), 'utf8')).toBe(lines('v1'));
+    expect(fs.readFileSync(path.join(folder, 'other/index.txt'), 'utf8')).toBe(lines('one'));
+  }, 180_000);
+
+  it('keeps the agent\'s copy of a file it marked resolved, even one it left as it was', async () => {
+    const f = await fixture({ 'index.txt': lines('v1') });
+    const one = await f.task('One');
+    const two = await f.task('Two');
+    await f.write(one.world, 'index.txt', lines('one'));
+    await f.write(two.world, 'index.txt', lines('two'));
+    await f.publish(one.task.id, 'one');
+    await expect(f.publish(two.task.id, 'two')).rejects.toBeInstanceOf(ResourceConflictError);
+    // A file still listed stays a conflict.
+    await expect(f.publish(two.task.id, 'two-unchanged')).rejects.toBeInstanceOf(ResourceConflictError);
+    fs.writeFileSync(path.join(f.mergeFolder(two.world), 'unresolved'), '');
+    await f.publish(two.task.id, 'two-kept');
+    expect(await f.published()).toEqual({ 'index.txt': lines('two') });
+  }, 180_000);
+
+  it('does not apply a resolution made for an older published version', async () => {
+    const f = await fixture({ 'index.txt': lines('v1') });
+    const one = await f.task('One');
+    const two = await f.task('Two');
+    await f.write(one.world, 'index.txt', lines('one'));
+    await f.write(two.world, 'index.txt', lines('two'));
+    await f.publish(one.task.id, 'one');
+    await expect(f.publish(two.task.id, 'two')).rejects.toBeInstanceOf(ResourceConflictError);
+    fs.writeFileSync(path.join(f.mergeFolder(two.world), 'unresolved'), '');
+    // Before two publishes again, three does, changing index.txt again.
+    const three = await f.task('Three');
+    await f.write(three.world, 'index.txt', lines('three'));
+    await f.publish(three.task.id, 'three');
+    const refused = await f.publish(two.task.id, 'two-again').then(() => undefined, (error) => error) as ResourceConflictError;
+    expect(refused?.paths).toEqual(['index.txt']);
+    expect(fs.readFileSync(path.join(f.mergeFolder(two.world), 'other/index.txt'), 'utf8')).toBe(lines('three'));
+  }, 240_000);
+});
+
+// The same merge before Review, as a branch takes in its target before its
+// pull request: Review then shows the copy as it would be published.
+describe('merging newer published versions in before Review', () => {
+  const lines = (...values: string[]) => values.map((value) => `${value}\n`).join('');
+
+  async function twoTasks() {
+    const f = await fixture({ 'notes.txt': lines('a', 'b', 'c', 'd', 'e') });
+    const one = await f.task('One');
+    const two = await f.task('Two');
+    await f.write(one.world, 'notes.txt', lines('A', 'b', 'c', 'd', 'e'));
+    await f.write(one.world, 'from-one.txt', '1');
+    await f.write(two.world, 'notes.txt', lines('a', 'b', 'c', 'd', 'E'));
+    await f.write(two.world, 'from-two.txt', '2');
+    await f.publish(one.task.id, 'one');
+    return { f, one, two, afterOne: await f.current() };
+  }
+  const combined = { 'notes.txt': lines('A', 'b', 'c', 'd', 'E'), 'from-one.txt': '1', 'from-two.txt': '2' };
+
+  it('merges it into the copy, whose Review then shows only its own changes, and publishes on top of it', async () => {
+    const { f, two, afterOne } = await twoTasks();
+    expect(await f.resources.integratePublished(two.task.id)).toEqual([expect.objectContaining({ name: 'raw_data',
+      path: 'resources/raw_data', revisionId: afterOne.id, added: 1, modified: 0, deleted: 0 })]);
+    expect(f.inWorld(two.world)).toEqual(combined);
+    expect(await f.resources.summarize(two.task.id, f.data.id)).toMatchObject({ baseRevisionId: afterOne.id, added: 1, modified: 1, deleted: 0 });
+    // Nothing newer: nothing to do.
+    expect(await f.resources.integratePublished(two.task.id)).toEqual([]);
+    await f.publish(two.task.id, 'two');
+    expect(await f.current()).toMatchObject({ parentRevisionId: afterOne.id, createdByTaskId: two.task.id });
+    expect(await f.published()).toEqual(combined);
+  }, 180_000);
+
+  it('still measures from the merged version after the world is parked and restored', async () => {
+    const { f, two, afterOne } = await twoTasks();
+    await f.resources.integratePublished(two.task.id);
+    await f.write(two.world, 'after.txt', 'later');
+    const parked = await f.resources.checkpoint(two.world.handle);
+    await f.resources.release(two.world.handle);
+    await two.world.destroy();
+    const restored = await f.worldFor(two.task.id, Object.fromEntries(parked.map((ref) => [ref.attachmentId, ref.revisionId])), 2);
+    expect(f.inWorld(restored)).toEqual({ ...combined, 'after.txt': 'later' });
+    expect(await f.resources.summarize(two.task.id, f.data.id)).toMatchObject({ baseRevisionId: afterOne.id, added: 2, modified: 1, deleted: 0 });
+    await f.publish(two.task.id, 'two');
+    expect(await f.published()).toEqual({ ...combined, 'after.txt': 'later' });
+  }, 180_000);
+
+  it('reports a conflict for the agent and leaves the copy as it was, then merges once the agent has combined it', async () => {
+    const f = await fixture({ 'index.txt': lines('v1') });
+    const one = await f.task('One');
+    const two = await f.task('Two');
+    await f.write(one.world, 'index.txt', lines('one'));
+    await f.write(one.world, 'from-one.txt', '1');
+    await f.write(two.world, 'index.txt', lines('two'));
+    await f.publish(one.task.id, 'one');
+    const [report] = await f.resources.integratePublished(two.task.id);
+    expect(report).toMatchObject({ name: 'raw_data', conflicts: ['index.txt'] });
+    expect(report!.guide).toContain('- index.txt (both edited it; the line merge conflicts)');
+    expect(f.inWorld(two.world)).toEqual({ 'index.txt': lines('two') });
+    expect(await f.resources.summarize(two.task.id, f.data.id)).toMatchObject({ baseRevisionId: f.first.id });
+
+    await f.write(two.world, 'index.txt', lines('one', 'two'));
+    fs.writeFileSync(path.join(f.mergeFolder(two.world), 'unresolved'), '');
+    const [merged] = await f.resources.integratePublished(two.task.id);
+    expect(merged!.conflicts).toBeUndefined();
+    expect(f.inWorld(two.world)).toEqual({ 'index.txt': lines('one', 'two'), 'from-one.txt': '1' });
+    await f.publish(two.task.id, 'two');
+    expect(await f.published()).toEqual({ 'index.txt': lines('one', 'two'), 'from-one.txt': '1' });
+  }, 180_000);
+
+  it('leaves a sub-task\'s copy of its parent\'s resource to the parent', async () => {
+    const f = await fixture({ 'index.txt': lines('v1') });
+    const parent = await f.task('Integrator');
+    const child = await f.subTask('Worker', parent);
+    const other = await f.task('Other');
+    await f.write(other.world, 'other.txt', 'o');
+    await f.publish(other.task.id, 'other');
+    expect(await f.resources.integratePublished(child.task.id)).toEqual([]);
+    expect(f.inWorld(child.world)).toEqual({ 'index.txt': lines('v1') });
   }, 180_000);
 });

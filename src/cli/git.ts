@@ -5,14 +5,14 @@ import { CliError } from './util.js';
 
 export interface GitResult { code: number; stdout: string; stderr: string }
 
-/** Git with the user's own configuration and credentials. */
-export function git(cwd: string, args: string[], options: { inherit?: boolean } = {}): Promise<GitResult> {
+/** Git with the user's own configuration and credentials. `onStderr` sees stderr as it arrives (progress). */
+export function git(cwd: string, args: string[], options: { inherit?: boolean; onStderr?: (chunk: string) => void } = {}): Promise<GitResult> {
   return new Promise((resolve, reject) => {
     const child = spawn('git', args, { cwd, stdio: options.inherit ? ['ignore', 'inherit', 'inherit'] : ['ignore', 'pipe', 'pipe'],
       env: { ...process.env, GIT_TERMINAL_PROMPT: process.stdin.isTTY ? process.env.GIT_TERMINAL_PROMPT ?? '1' : '0' } });
     let stdout = ''; let stderr = '';
     child.stdout?.on('data', (chunk: Buffer) => { stdout += chunk.toString('utf8'); });
-    child.stderr?.on('data', (chunk: Buffer) => { stderr += chunk.toString('utf8'); });
+    child.stderr?.on('data', (chunk: Buffer) => { const text = chunk.toString('utf8'); stderr += text; options.onStderr?.(text); });
     child.on('error', (error) => reject((error as NodeJS.ErrnoException).code === 'ENOENT' ? new CliError('git is not installed') : error));
     child.on('close', (code) => resolve({ code: code ?? -1, stdout, stderr }));
   });

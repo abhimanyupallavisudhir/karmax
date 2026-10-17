@@ -19,7 +19,7 @@ const html = fs.readFileSync(path.join(webDir, 'index.html'), 'utf8');
 function handlerAfter(anchor: string): string {
   const at = app.indexOf(anchor);
   expect(at, `anchor not found: ${anchor}`).toBeGreaterThan(-1);
-  return app.slice(at, at + 1200);
+  return app.slice(at, at + 1600);
 }
 
 describe('toasts are reachable', () => {

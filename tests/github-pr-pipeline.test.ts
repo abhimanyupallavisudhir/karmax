@@ -526,9 +526,9 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
   }, 120_000);
 
   // Several branches per task (software-dev 1.30, SPEC §11.1): one agent in one
-  // world; each branch's pull request is a sub-task that lands a snapshot of the
-  // branch on its own timing. Two land one after the other on GitHub.
-  it('v1.30 lands two branches as two pull requests, the second merging over the first', async () => {
+  // world. A branch it opens mid-work lands as its own pull request; when it
+  // finishes, the rest lands through the task's own Review — over the first.
+  it('v1.30 lands a branch opened mid-work, then the task\'s own pull request merging over it', async () => {
     const repo = await repoWithOrigin('branches-two');
     const project = (await h.store.createProject('Branches two', { repos: [repo], remote: 'pr', multiPr: true }));
     const connection = (await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
@@ -549,31 +549,33 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
         project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr', multiPr: true }, githubPollMs: 10,
       }],
     });
-    const origin = remoteBySlug.get(SLUG)!;
-    const onMain = async (file: string) => (await git(origin, ['show', `main:${file}`])).code === 0;
-    // Both pull requests open, each from its own sub-task's branch.
-    await expect.poll(() => prs.length, { timeout: 30_000 }).toBe(2);
-    await expect.poll(async () => (await view(handle)).subTasks?.length ?? 0, { timeout: 30_000 }).toBe(2);
-    const [docs, core] = (await view(handle)).subTasks as [string, string];
-    expect(prs.map((pr) => pr.head.ref).sort()).toEqual([`tavya/${docs}`, `tavya/${core}`].sort());
-    const reviewing = async (id: string) => {
-      const child = h.client.workflow.getHandle(id);
-      await expect.poll(async () => { const v = await view(child); return `${v.stage}/${v.waitingFor?.kind}`; }, { timeout: 30_000 }).toBe('review/human');
-      return child;
-    };
-    const first = await reviewing(docs);
-    await first.signal('confirm');
-    expect((await first.result()).stage).toBe('done');
-    expect(await onMain('DOCS.md')).toBe(true);
-    expect(await onMain('core.js')).toBe(false);
-    // The second lands over the first: main keeps both.
-    const second = await reviewing(core);
-    await second.signal('confirm');
-    expect((await second.result()).stage).toBe('done');
-    expect(await handle.result()).toMatchObject({ stage: 'done' });
-    expect(await onMain('core.js')).toBe(true);
-    expect(await onMain('DOCS.md')).toBe(true);
-    expect(prs.every((pr) => pr.merged_at)).toBe(true);
+    try {
+      const origin = remoteBySlug.get(SLUG)!;
+      const onMain = async (file: string) => (await git(origin, ['show', `main:${file}`])).code === 0;
+      // The branch opened mid-work: its own pull request, from its own branch.
+      await expect.poll(async () => (await view(handle)).subTasks?.length ?? 0, { timeout: 30_000 }).toBe(1);
+      const docsId = (await view(handle)).subTasks[0] as string;
+      await expect.poll(() => prs.length, { timeout: 30_000 }).toBe(1);
+      expect(prs[0].head.ref).toBe(`tavya/${docsId}`);
+      const docs = h.client.workflow.getHandle(docsId);
+      await expect.poll(async () => { const v = await view(docs); return `${v.stage}/${v.waitingFor?.kind}`; }, { timeout: 30_000 }).toBe('review/human');
+      await docs.signal('confirm');
+      expect((await docs.result()).stage).toBe('done');
+      expect(await onMain('DOCS.md')).toBe(true);
+      expect(await onMain('core.js')).toBe(false);
+      // The agent had finished: the rest is the task's own pull request and Review.
+      await expect.poll(async () => { const v = await view(handle); return `${v.stage}/${v.waitingFor?.kind}`; }, { timeout: 30_000 }).toBe('review/human');
+      expect(prs).toHaveLength(2);
+      expect(prs[1].head.ref).toBe(`tavya/${task.id}`);
+      await handle.signal('confirm');
+      expect(await handle.result()).toMatchObject({ stage: 'done' });
+      // It lands over the first: main keeps both.
+      expect(await onMain('core.js')).toBe(true);
+      expect(await onMain('DOCS.md')).toBe(true);
+      expect(prs.every((pr) => pr.merged_at)).toBe(true);
+    } finally {
+      await handle.signal('cancel').catch(() => undefined);
+    }
   }, 150_000);
 
   it('opens the PR at the PR stage and closes it once the merge lands', async () => {

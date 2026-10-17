@@ -127,7 +127,8 @@ it('composes a task whose Responder and Reviewer carry their own authority', asy
     await page.locator('#tf-close').click();
     // Lists open on For me; this draft has no creator, so it is under Active.
     await page.locator('.views-bar [data-view="__active__"]').click();
-    await page.locator('#main').getByText('Legacy', { exact: true }).first().click();
+    // The draft's row is a link to it (so it opens in a new tab too); a plain click edits it here.
+    await page.locator('#main .task-row[data-draft]').filter({ hasText: 'Legacy' }).locator('a.row-link').click();
     await expect.poll(() => page.locator('#tf-body .responder-field .ab-instructions').inputValue()).toBe('');
     expect(errors).toEqual([]);
   } finally {
