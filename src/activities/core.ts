@@ -4588,6 +4588,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       return (await deps.resources?.unsavedCandidates(taskId)) ?? [];
     },
 
+    /** Data this task would publish at its Review (SPEC §11.1: a task whose
+     * branches all landed as their own pull requests still reviews its data). */
+    async resourcesToReview(taskId: string): Promise<boolean> {
+      return (await deps.resources?.hasChangesToReview(taskId)) ?? false;
+    },
+
     async pendingResourceCandidates(taskId: string): Promise<number> {
       return (await store.listResourceCandidates(taskId)).filter((candidate) =>
         candidate.state === 'pending' || candidate.state === 'discarding').length;
