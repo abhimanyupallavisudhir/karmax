@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { ProviderOutage } from '../agent/limits.js';
 import { transferResourceChunk } from './resource-transfer.js';
 import { forEachConcurrent } from '../util/async-batch.js';
 import { timed } from '../timing/index.js';
@@ -652,7 +653,7 @@ export class ProjectResourceService {
     const fields = this.restic.revisionFields({ parts: split.parts, ...partsTotals(split.parts), added: 0, fresh: split.fresh }, repository);
     if (await this.store.partResourceRevision(revision.id, revision.sealedRef, fields)) return split.parts;
     // Split by someone else meanwhile.
-    await this.restic.forgetUnreferenced(repository, split.fresh);
+    await this.restic.discard(repository, split.fresh);
     const again = await this.store.getResourceRevision(revision.id);
     const parts = again && storedRef(again).parts;
     if (!parts) throw new Error(`resource "${attachment.name}" changed while it was being split into parts; try again`);
@@ -989,8 +990,11 @@ export class ProjectResourceService {
     if (!attachment) return;
     // An on-demand version's unchanged parts are other versions' too.
     const ref = storedRef(revision);
-    await this.restic.forgetUnreferenced(this.restic.of(attachment, revision),
-      ref.snapshot ? [ref.snapshot] : Object.values(ref.parts ?? {}).map((part) => part.snapshot));
+    const repository = this.restic.of(attachment, revision);
+    const snapshots = ref.snapshot ? [ref.snapshot] : Object.values(ref.parts ?? {}).map((part) => part.snapshot);
+    // Now, so its space is freed at the next prune; a save holding the
+    // repository leaves it to upkeep.
+    await this.restic.forgetUnreferenced(repository, snapshots).catch(() => this.restic.discard(repository, snapshots));
   }
 
   /** Hourly upkeep of the resource repositories: forget snapshots no version
@@ -998,14 +1002,15 @@ export class ProjectResourceService {
    * that freed, and move a batch of versions saved before restic into it
    * (10 GiB a run: the bytes pass through this host). */
   async maintainRepositories(now = Date.now(), options: { convertBytes?: number } = {}): Promise<{ forgotten: number; pruned: number; converted: number }> {
-    let forgotten = 0;
+    // What saves discarded first: known to be unneeded, it need not wait a day.
+    let forgotten = await this.restic.forgetDiscarded((name) => this.repositoryNamed(name));
     const byRepository = new Map<string, string[]>();
     for (const snapshot of await this.store.unreferencedRepositorySnapshots(now - 24 * 3_600_000))
       byRepository.set(snapshot.repository, [...byRepository.get(snapshot.repository) ?? [], snapshot.name]);
     for (const [name, snapshots] of byRepository) {
       const repository = await this.repositoryNamed(name);
-      if (!repository) continue;
-      try { await this.restic.forget(repository, snapshots); forgotten += snapshots.length; }
+      if (!repository || await this.restic.saveInProgress(repository)) continue;
+      try { forgotten += await this.restic.forget(repository, snapshots); }
       catch (error) { console.warn(`resource repository ${name}: could not forget unused versions: ${message(error)}`); }
     }
     const converted = await this.convertLegacyRevisions(options.convertBytes ?? 10 * 2 ** 30);
@@ -1019,6 +1024,7 @@ export class ProjectResourceService {
       const repository = await this.repositoryNamed(key.slice('restic-prune:'.length));
       if (!repository) { await this.store.kvDelete(key); continue; }
       // A save holding the repository makes this wait for the next run.
+      if (await this.restic.saveInProgress(repository)) continue;
       try { await this.restic.prune(repository); pruned++; }
       catch (error) { console.warn(`resource repository ${repository.name}: prune deferred: ${message(error)}`); }
     }
@@ -1055,7 +1061,7 @@ export class ProjectResourceService {
       changed = true;
     }
     const used = new Set(Object.values(parts).map((part) => part.snapshot));
-    await restic.forget(repository, split.fresh.filter((id) => !used.has(id)));
+    await restic.discard(repository, split.fresh.filter((id) => !used.has(id)));
     return { capture: { parts, ...partsTotals(parts), added: base ? added : capture.added, fresh: split.fresh.filter((id) => used.has(id)) }, changed };
   }
 
@@ -1094,7 +1100,7 @@ export class ProjectResourceService {
         if (await this.store.convertResourceRevision(revision.id, revision.sealedRef, fields)) {
           await this.engine.delete?.(revision, attachment);
           converted++; bytes += revision.bytes;
-        } else await restic.forget(repository, [capture.snapshot]);
+        } else await restic.discard(repository, [capture.snapshot]);
       } catch (error) {
         console.warn(`resource revision ${revision.id}: not converted to restic yet: ${message(error)}`);
       } finally { await fs.promises.rm(scratch, { recursive: true, force: true }); }
@@ -1194,7 +1200,9 @@ export class ProjectResourceService {
         const reason = error instanceof Error ? error.message : String(error);
         const staged = Boolean((await this.store.getResourceAttachment(candidate.attachmentId))?.currentRevisionId);
         if (!staged && !(error instanceof UnstageableCandidate)) await this.store.recordResourceCandidateError(candidate.id, reason);
-        if (!options.final && !(error instanceof UnstageableCandidate)) { transient.push(error); continue; }
+        // A provider that cannot start the world yet (an outage, a full
+        // account limit) is waited out by the workflow, last attempt or not.
+        if ((!options.final || error instanceof ProviderOutage) && !(error instanceof UnstageableCandidate)) { transient.push(error); continue; }
         // A refresh that still fails keeps the snapshot already taken.
         if (staged) continue;
         if (error instanceof UnstageableCandidate) {
@@ -1270,7 +1278,7 @@ export class ProjectResourceService {
     if (parent) {
       const changes = await restic.diff(repository, parent, capture.snapshot);
       if (changes.added + changes.modified + changes.deleted === 0) {
-        await restic.forget(repository, [capture.snapshot]);
+        await restic.discard(repository, [capture.snapshot]);
         return undefined;
       }
     }
@@ -1827,10 +1835,9 @@ export class ProjectResourceService {
     if (held) await this.store.kvSet(`resource-fetched:${taskId}:${attachmentId}`, JSON.stringify([...held].sort()));
   }
 
-  /** Forget the snapshots a save made that no version came to name. */
+  /** Leave the snapshots a save made that no version came to name for upkeep to forget. */
   private async discardCapture(repository: Repository, capture: ResticCapture | PartsCapture): Promise<void> {
-    if (isPartsCapture(capture)) await this.restic.forgetUnreferenced(repository, capture.fresh);
-    else await this.restic.forget(repository, [capture.snapshot]);
+    await this.restic.discard(repository, isPartsCapture(capture) ? capture.fresh : [capture.snapshot]);
   }
 
   /** {@link mergePublished} for a copy saved in parts. */
@@ -1919,7 +1926,7 @@ export class ProjectResourceService {
     if (parent) {
       const changes = await this.restic.diff(repository, parent, snapshot);
       if (changes.added + changes.modified + changes.deleted === 0) {
-        await this.restic.forget(repository, [snapshot]);
+        await this.restic.discard(repository, [snapshot]);
         return { revision: baseline, unchanged: true };
       }
       added = changes.bytes;
@@ -1950,7 +1957,7 @@ export class ProjectResourceService {
     const bytes = files.reduce((sum, file) => sum + file.bytes, 0);
     const stored = await this.storedCapture(attachment, repository, { snapshot, files: files.length, bytes, added: bytes }, baseline);
     if (!stored.changed && baseline) {
-      if (isPartsCapture(stored.capture)) await this.restic.forgetUnreferenced(repository, stored.capture.fresh);
+      if (isPartsCapture(stored.capture)) await this.restic.discard(repository, stored.capture.fresh);
       return { revision: baseline, unchanged: true };
     }
     let revision: ResourceRevision;

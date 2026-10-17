@@ -51,8 +51,10 @@ describe('review artifact reader', () => {
     vm.runInContext(source + '\n' + app.slice(app.indexOf('function closeTopOverlay()'),
       app.indexOf('// -- the dispatcher')) + '\n' + app.slice(app.indexOf('function bindKeys()'),
       app.indexOf('// -- the ⌘K palette')), context);
-    const fullscreenStart = app.indexOf('function setConversationFullscreen(');
-    vm.runInContext(app.slice(fullscreenStart, app.indexOf('\n}', fullscreenStart) + 2), context);
+    for (const name of ['setConversationFullscreen', 'takesTypedKeys']) {
+      const start = app.indexOf(`function ${name}(`);
+      vm.runInContext(app.slice(start, app.indexOf('\n}', start) + 2), context);
+    }
     context.showArtifactReader('report', 'markdown', 'report.md', {});
     context.bindKeys();
     const event = { key: 'Escape', defaultPrevented: false, stopPropagation: vi.fn(),

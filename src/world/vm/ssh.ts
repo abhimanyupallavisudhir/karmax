@@ -22,12 +22,15 @@ export interface SshEndpoint {
 }
 
 /** A dropped connection, so callers (and isTransportError) can tell it from
- * a command's own failure. */
+ * a command's own failure. `retryable`: whether doing the same again is safe,
+ * which it is not once a command may have run with nobody to collect it. */
 export class VmTransportError extends Error {
   readonly code = 'ECONNRESET';
-  constructor(message: string, options?: { cause?: unknown }) {
+  readonly retryable: boolean;
+  constructor(message: string, options?: { cause?: unknown; retryable?: boolean }) {
     super(message, options);
     this.name = 'VmTransportError';
+    this.retryable = options?.retryable ?? true;
   }
 }
 
@@ -74,25 +77,81 @@ export interface SshChannel {
 export interface ExecBytesResult { stdout: Buffer; stderr: Buffer; code: number }
 
 const CONNECT_TIMEOUT_MS = 30_000;
+/** Waits before each reconnect: a dropped connection is usually back at once,
+ * a VM whose sshd stalls under load within seconds. Longer outages are the
+ * caller's (world-infra: Temporal's retries, then the workflow's). */
+const RECONNECT_DELAYS_MS = [1_000, 3_000, 10_000];
+
+/**
+ * Every command runs under this wrapper ($1 id, $2 command, $3 receipts the
+ * client already has): its output and status go to a receipt in the VM's
+ * memory (/dev/shm, else /tmp), then to the channel. A command keeps running
+ * when its connection drops (sshd does not signal a session without a
+ * terminal), but one printing into a dead channel dies of EPIPE; writing to
+ * files it finishes, and the next connection collects its result (COLLECT)
+ * instead of running it again. The client deletes a receipt only once it has
+ * it, through the next command's $3: on a silent drop sshd still takes the
+ * output, so the wrapper cannot tell it arrived (`--`: an id may start with
+ * "-", and rm would read every file of the batch as options). Leftovers older
+ * than a day go.
+ * Without a writable receipt directory the command just runs.
+ */
+const RECEIPT_RUN = `trap '' HUP
+for b in /dev/shm /tmp; do
+  d=$b/karmax-exec
+  { [ -d "$d" ] || mkdir -m 700 "$d" 2>/dev/null; } && [ -w "$d" ] && break
+  d=
+done
+[ -n "$d" ] && echo $$ > "$d/$1.pid" 2>/dev/null || exec sh -c "$2"
+[ -z "$3" ] || (cd "$d" && rm -f -- $(printf '%s.* ' $3))
+[ -n "$3" ] || find "$d" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null
+f=$d/$1
+setsid sh -c "$2" < /dev/null > "$f.out" 2> "$f.err" &
+echo $! > "$f.job"
+wait $!
+s=$?
+echo $s > "$f.st" && mv -f "$f.st" "$f.status"
+cat "$f.out" && cat "$f.err" >&2
+exit $s`;
+
+/** The result of a receipt's command ($1 id), waiting while it still runs:
+ * a first line `done <status>` then its output, or `missing` / `lost`. */
+const RECEIPT_COLLECT = `f=
+for b in /dev/shm /tmp; do [ -e "$b/karmax-exec/$1.pid" ] && f=$b/karmax-exec/$1 && break; done
+[ -n "$f" ] || { echo missing; exit 0; }
+while [ ! -e "$f.status" ] && kill -0 "$(cat "$f.pid" 2>/dev/null)" 2>/dev/null; do sleep 0.1; done
+[ -e "$f.status" ] || { echo lost; exit 0; }
+echo "done $(cat "$f.status")"
+cat "$f.out" && cat "$f.err" >&2`;
+
+/** Stop a receipt's command and everything it started (its own session). */
+const RECEIPT_KILL = `for b in /dev/shm /tmp; do j=$b/karmax-exec/$1.job; [ -e "$j" ] && kill -TERM -"$(cat "$j")" 2>/dev/null; done; true`;
 
 /**
  * One multiplexed SSH connection to a VM, reopened on demand. Every command,
- * file transfer and port forward is a channel on it; a connection that drops
- * fails the channels open on it (VmTransportError) and the next call dials
- * again, through `endpoint()` so a VM that moved (a woken Hetzner server has a
- * new address) is found where it is now.
+ * file transfer and port forward is a channel on it, and each rides out a
+ * connection that drops (pramana#39/#41/#43): the call dials again, through
+ * `endpoint()` so a VM that moved (a woken Hetzner server has a new address)
+ * is found where it is now, and carries on — a command is collected from its
+ * receipt (it ran once), a read resumes from the byte it reached, a write is
+ * sent again. Only a command given input (secrets, never written down) that
+ * lost its connection while it ran fails, as it may have run. A connection
+ * that stays lost through the reconnects is a VmTransportError: infrastructure.
  */
 export class SshTransport {
   private client?: Promise<Client>;
   private live?: Client;
   private sftpSession?: Promise<SFTPWrapper>;
   private closed = false;
+  /** Receipts the client has collected, deleted by the next command. */
+  private collected: string[] = [];
 
   constructor(private endpoint: () => Promise<SshEndpoint>, private options: {
     /** Test seam and proxy hook: open the byte stream SSH runs over. */
     socket?: (endpoint: SshEndpoint) => Promise<Duplex>;
     connectTimeoutMs?: number;
     keepaliveMs?: number;
+    reconnectDelaysMs?: number[];
   } = {}) {}
 
   /** Dial (or reuse) the connection. */
@@ -108,7 +167,10 @@ export class SshTransport {
 
   private async dial(): Promise<Client> {
     const endpoint = await this.endpoint();
-    const sock = await (this.options.socket ?? defaultSocket)(endpoint);
+    const sock = await (this.options.socket ?? defaultSocket)(endpoint).catch((error) => {
+      throw error instanceof VmTransportError ? error
+        : new VmTransportError(`could not reach the VM at ${endpoint.host}:${endpoint.port}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+    });
     const expected = Buffer.from(endpoint.hostKey.trim().split(/\s+/)[1] ?? '', 'base64');
     if (!expected.length) throw new Error('VM host key is missing');
     const client = new Client();
@@ -139,8 +201,26 @@ export class SshTransport {
     });
   }
 
-  /** Start `command` and stream its output. */
+  /** Start `command` and stream its output. Opening it rides out a dropped
+   * connection; once it runs, `done` reports one (the caller may reattach). */
   async open(command: string, handlers: { stdout?: (chunk: Buffer) => void; stderr?: (chunk: Buffer) => void } = {}): Promise<SshChannel> {
+    return this.reconnecting(() => this.channel(command, handlers));
+  }
+
+  /** Do `operation` again after a retryable transport failure, dialing anew. */
+  private async reconnecting<T>(operation: () => Promise<T>): Promise<T> {
+    const delays = this.options.reconnectDelaysMs ?? RECONNECT_DELAYS_MS;
+    for (let attempt = 0; ; attempt++) {
+      try { return await operation(); }
+      catch (error) {
+        if (!(error instanceof VmTransportError) || !error.retryable || this.closed || attempt >= delays.length) throw error;
+        await new Promise((resolve) => setTimeout(resolve, delays[attempt]));
+      }
+    }
+  }
+
+  /** One channel, once: failures before the command starts are retryable. */
+  private async channel(command: string, handlers: { stdout?: (chunk: Buffer) => void; stderr?: (chunk: Buffer) => void }): Promise<SshChannel> {
     const client = await this.connection();
     let exit: { code: number | null; signal?: string } | undefined;
     const stream = await new Promise<ClientChannel>((resolve, reject) => {
@@ -166,7 +246,8 @@ export class SshTransport {
     const done = new Promise<{ code: number | null; signal?: string }>((resolve, reject) => {
       stream.on('data', (chunk: Buffer) => handlers.stdout?.(chunk));
       stream.stderr.on('data', (chunk: Buffer) => handlers.stderr?.(chunk));
-      const lost = () => reject(new VmTransportError('the SSH connection to the VM was lost'));
+      const lost = () => reject(new VmTransportError(this.live === client
+        ? 'the SSH channel closed without the command\'s exit status' : 'the SSH connection to the VM was lost', { retryable: false }));
       client.once('close', lost);
       stream.on('close', () => {
         client.removeListener('close', lost);
@@ -188,32 +269,89 @@ export class SshTransport {
 
   /** Run a command to completion. A command still running at `timeoutMs` is
    * killed with its process group (coreutils `timeout`) and reported as a
-   * timeout, not an exit status. */
-  async exec(command: string, options: { input?: string | Buffer; timeoutMs?: number; signal?: AbortSignal } = {}): Promise<ExecBytesResult> {
+   * timeout, not an exit status. It runs once, whatever the connection does
+   * (RECEIPT_RUN); `retry: false` asks once and runs it bare (a reachability
+   * probe with its own loop). */
+  async exec(command: string, options: { input?: string | Buffer; timeoutMs?: number; signal?: AbortSignal; retry?: false } = {}): Promise<ExecBytesResult> {
     options.signal?.throwIfAborted();
     const seconds = options.timeoutMs ? Math.max(1, Math.ceil(options.timeoutMs / 1000)) : undefined;
     const line = seconds ? `exec timeout -k 5 ${seconds} sh -c ${quote(command)}` : command;
-    const stdout: Buffer[] = [], stderr: Buffer[] = [];
     const started = Date.now();
-    const channel = await this.open(line, { stdout: (chunk) => stdout.push(chunk), stderr: (chunk) => stderr.push(chunk) });
+    const run = { ...(seconds ? { deadline: started + (seconds + 15) * 1000, timeoutMs: options.timeoutMs } : {}), signal: options.signal };
+    let result: ExecBytesResult;
+    if (options.retry === false) result = await this.run(line, run);
+    // Input is never written down, so a command given some is only sent again
+    // when it never started.
+    else if (options.input !== undefined) result = await this.reconnecting(() => this.run(line, { ...run, input: options.input }));
+    else {
+      const id = crypto.randomBytes(9).toString('base64url');
+      let ran = false;
+      try {
+        result = await this.reconnecting(async () => {
+          if (ran) return this.collect(id, run);
+          const collected = this.collected.splice(0, 64);
+          try {
+            return await this.run(`sh -c ${quote(RECEIPT_RUN)} karmax-exec ${id} ${quote(line)} ${quote(collected.join(' '))}`,
+              { ...run, rerunnable: true, onStart: () => { ran = true; },
+                onAbort: () => { void this.exec(`sh -c ${quote(RECEIPT_KILL)} karmax-kill ${id}`, { retry: false, timeoutMs: 15_000 }).catch(() => undefined); } });
+          } catch (error) {
+            if (!ran) this.collected.push(...collected);
+            throw error;
+          }
+        });
+      } finally {
+        // Collected, or nobody will: either way the next command deletes it.
+        if (ran) this.collected.push(id);
+      }
+    }
+    if (seconds && (result.code === 124 || result.code === 137) && Date.now() - started >= seconds * 1000)
+      throw timeoutError(options.timeoutMs!);
+    return result;
+  }
+
+  /** The result of a command that lost its connection, from its receipt. */
+  private async collect(id: string, run: { deadline?: number; timeoutMs?: number; signal?: AbortSignal }): Promise<ExecBytesResult> {
+    const result = await this.run(`sh -c ${quote(RECEIPT_COLLECT)} karmax-collect ${id}`, { ...run, rerunnable: true });
+    const newline = result.stdout.indexOf(10);
+    const header = result.stdout.subarray(0, newline < 0 ? undefined : newline).toString();
+    const status = /^done (\d+)$/.exec(header);
+    if (!status) throw new VmTransportError(header === 'lost'
+      ? 'the connection to the VM was lost while a command ran, and the command ended without an exit status'
+      : 'the connection to the VM was lost while a command ran, and its result was not kept', { retryable: false });
+    return { stdout: result.stdout.subarray(newline + 1), stderr: result.stderr, code: Number(status[1]) };
+  }
+
+  /** One channel to completion. A transport failure after the command started
+   * is retryable only when it is `rerunnable` (it has a receipt). */
+  private async run(remote: string, options: { input?: string | Buffer; deadline?: number; timeoutMs?: number; signal?: AbortSignal;
+    rerunnable?: boolean; onStart?: () => void; onAbort?: () => void }): Promise<ExecBytesResult> {
+    options.signal?.throwIfAborted();
+    const stdout: Buffer[] = [], stderr: Buffer[] = [];
+    const channel = await this.channel(remote, { stdout: (chunk) => stdout.push(chunk), stderr: (chunk) => stderr.push(chunk) });
+    options.onStart?.();
     if (options.input !== undefined) await channel.write(options.input).catch(() => undefined);
     channel.end();
     let timer: NodeJS.Timeout | undefined;
-    const abort = () => channel.close();
-    options.signal?.addEventListener('abort', abort, { once: true });
+    let abort: (() => void) | undefined;
     try {
-      const backstop = seconds ? new Promise<never>((_, reject) => {
-        timer = setTimeout(() => { channel.close(); reject(timeoutError(options.timeoutMs!)); }, (seconds + 15) * 1000);
-      }) : undefined;
-      const exit = await (backstop ? Promise.race([channel.done, backstop]) : channel.done);
-      options.signal?.throwIfAborted();
-      if (seconds && (exit.code === 124 || exit.code === 137) && Date.now() - started >= seconds * 1000)
-        throw timeoutError(options.timeoutMs!);
+      const waits: Promise<{ code: number | null; signal?: string }>[] = [channel.done];
+      if (options.deadline) waits.push(new Promise<never>((_, reject) => {
+        // A backstop past `timeout`'s own kill, for a channel that never closes.
+        timer = setTimeout(() => { channel.close(); reject(timeoutError(options.timeoutMs ?? 0)); }, Math.max(15_000, options.deadline! - Date.now()));
+      }));
+      if (options.signal) waits.push(new Promise<never>((_, reject) => {
+        abort = () => { channel.close(); options.onAbort?.(); reject(options.signal!.reason); };
+        options.signal!.addEventListener('abort', abort, { once: true });
+      }));
+      const exit = await Promise.race(waits).catch((error) => {
+        if (error instanceof VmTransportError && options.rerunnable) throw new VmTransportError(error.message, { cause: error });
+        throw error;
+      });
       return { stdout: Buffer.concat(stdout), stderr: Buffer.concat(stderr),
         code: exit.code ?? (exit.signal ? 128 + (SIGNALS[exit.signal] ?? 0) : -1) };
     } finally {
       if (timer) clearTimeout(timer);
-      options.signal?.removeEventListener('abort', abort);
+      if (abort) options.signal?.removeEventListener('abort', abort);
     }
   }
 
@@ -237,40 +375,78 @@ export class SshTransport {
     return Buffer.concat(chunks);
   }
 
-  /** A file's bytes, streamed; stops reading when the consumer stops. */
+  /** A file's bytes, streamed; stops reading when the consumer stops. A
+   * dropped connection resumes the read from the byte it reached. */
   async *readStream(remotePath: string, range: { start?: number; end?: number } = {}): AsyncGenerator<Buffer> {
-    const sftp = await this.sftp();
-    const stream = sftp.createReadStream(remotePath, { ...range, highWaterMark: 256 * 1024 });
-    try {
-      for await (const chunk of stream) yield chunk as Buffer;
-    } catch (error) {
-      throw sftpError(error, remotePath);
-    } finally {
-      // Closing the remote handle can still fail after the last byte (the
-      // connection closed first, say by a park): nothing is lost then, and an
-      // error nobody listens to would be an uncaught exception in the worker.
-      stream.on('error', () => undefined);
-      stream.destroy();
+    let position = range.start ?? 0;
+    const delays = this.options.reconnectDelaysMs ?? RECONNECT_DELAYS_MS;
+    for (let failures = 0; ; ) {
+      let session: Promise<SFTPWrapper> | undefined;
+      try {
+        session = this.sftp();
+        const sftp = await session;
+        const stream = sftp.createReadStream(remotePath, { start: position, ...(range.end !== undefined ? { end: range.end } : {}),
+          highWaterMark: 256 * 1024 });
+        const lost = () => stream.destroy(sessionLost(remotePath));
+        sftp.once('close', lost);
+        try {
+          for await (const chunk of stream) {
+            position += (chunk as Buffer).length;
+            yield chunk as Buffer;
+          }
+          return;
+        } catch (error) {
+          throw sftpError(error, remotePath);
+        } finally {
+          // Closing the remote handle can still fail after the last byte (the
+          // connection closed first, say by a park): nothing is lost then, and an
+          // error nobody listens to would be an uncaught exception in the worker.
+          sftp.removeListener('close', lost);
+          stream.on('error', () => undefined);
+          stream.destroy();
+        }
+      } catch (error) {
+        if (!(error instanceof VmTransportError) || !error.retryable || this.closed || failures >= delays.length) throw error;
+        this.forgetSftp(session);
+        await new Promise((resolve) => setTimeout(resolve, delays[failures++]));
+      }
     }
   }
 
+  /** Write a whole file; a dropped connection sends all of it again. */
   async writeFile(remotePath: string, content: Buffer, mode = 0o644): Promise<void> {
-    const sftp = await this.sftp();
-    await new Promise<void>((resolve, reject) => {
-      const stream = sftp.createWriteStream(remotePath, { mode });
-      stream.on('error', (error: unknown) => reject(sftpError(error, remotePath)));
-      stream.on('close', () => resolve());
-      stream.end(content);
+    await this.reconnecting(async () => {
+      const session = this.sftp();
+      const sftp = await session;
+      await new Promise<void>((resolve, reject) => {
+        const stream = sftp.createWriteStream(remotePath, { mode });
+        // ssh2 fails no pending write when its session closes: a write waiting
+        // for the channel's window would wait for ever.
+        const lost = () => { stream.destroy(); reject(sessionLost(remotePath)); };
+        sftp.once('close', lost);
+        stream.on('error', (error: unknown) => reject(sftpError(error, remotePath)));
+        stream.on('close', () => { sftp.removeListener('close', lost); resolve(); });
+        stream.end(content);
+      }).catch((error) => { if (error instanceof VmTransportError) this.forgetSftp(session); throw error; });
     });
+  }
+
+  /** An SFTP session a transfer failed on is not asked again. */
+  private forgetSftp(session: Promise<SFTPWrapper> | undefined): void {
+    if (session && this.sftpSession === session) this.sftpSession = undefined;
   }
 
   /** A byte stream to `127.0.0.1:port` inside the VM (an SSH direct-tcpip
    * channel), so nothing in the VM listens publicly for previews. */
   async forward(port: number): Promise<Duplex> {
-    const client = await this.connection();
-    return new Promise<Duplex>((resolve, reject) => client.forwardOut('127.0.0.1', 0, '127.0.0.1', port, (error, stream) =>
-      error ? reject(Object.assign(new Error(`nothing is listening on port ${port} in the VM: ${error.message}`), { code: 'ECONNREFUSED' }))
-        : resolve(stream)));
+    return this.reconnecting(async () => {
+      const client = await this.connection();
+      return new Promise<Duplex>((resolve, reject) => client.forwardOut('127.0.0.1', 0, '127.0.0.1', port, (error, stream) => {
+        if (!error) resolve(stream);
+        else if (this.live !== client) reject(new VmTransportError(`the SSH connection to the VM was lost: ${error.message}`, { cause: error }));
+        else reject(Object.assign(new Error(`nothing is listening on port ${port} in the VM: ${error.message}`), { code: 'ECONNREFUSED' }));
+      }));
+    });
   }
 
   /** Drop the connection; the next call dials again. */
@@ -310,12 +486,21 @@ function isChannelRefusal(error: Error): boolean {
   return /open failed|administratively prohibited/i.test(error.message);
 }
 
+function sessionLost(remotePath: string): VmTransportError {
+  return new VmTransportError(`the SSH connection to the VM was lost while transferring ${remotePath}`);
+}
+
 function sftpError(error: unknown, remotePath: string): Error {
   const code = (error as { code?: number })?.code;
   // SFTP status 2 is "no such file": never a missing VM (isMissingSandbox).
   if (code === 2) return Object.assign(new Error(`no such file in the VM: ${remotePath}`), { name: 'FileNotFoundError', code: 'ENOENT' });
   if (code === 3) return Object.assign(new Error(`permission denied in the VM: ${remotePath}`), { code: 'EACCES' });
-  return error instanceof Error ? error : new Error(String(error));
+  if (error instanceof VmTransportError) return error;
+  // Any other status is the server's answer (a full disk, say); no status is
+  // ssh2 giving up on the request ("No response from server"): the connection.
+  if (typeof code === 'number') return error instanceof Error ? error : new Error(String(error));
+  const message = error instanceof Error ? error.message : String(error);
+  return new VmTransportError(`SFTP failed for ${remotePath}: ${message}`, { cause: error });
 }
 
 function timeoutError(ms: number): Error {

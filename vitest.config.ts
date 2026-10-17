@@ -9,6 +9,8 @@ export default defineConfig({
     // host pressure must not park them based on the CI runner's live RAM/load;
     // agent-slots.test.ts enables each gate explicitly when exercising it.
     env: {
+      // The mock agent exists only where it is forced (src/agent/provider-registry.ts).
+      KARMAX_AGENT_PROVIDER: 'mock',
       KARMAX_AGENT_MIN_FREE_MB: '0',
       KARMAX_AGENT_MAX_LOAD_FACTOR: '0',
     },

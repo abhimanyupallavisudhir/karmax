@@ -19,8 +19,10 @@ const out = path.join(root, 'cli', 'dist');
 const sea = process.argv.includes('--sea');
 fs.mkdirSync(out, { recursive: true });
 const common = { bundle: true, platform: 'node', target: 'node22', legalComments: 'none', logLevel: 'warning', minifySyntax: true };
+// How a copy was installed, so it names the right update command (src/cli/update.ts).
+const packaging = (how) => ({ define: { 'process.env.TAVYA_PACKAGING': JSON.stringify(how) } });
 
-const { metafile } = await build({ ...common, entryPoints: [path.join(root, 'src/cli/bin.ts')], format: 'esm', outfile: path.join(out, 'tavya.mjs'),
+const { metafile } = await build({ ...common, ...packaging('npm'), entryPoints: [path.join(root, 'src/cli/bin.ts')], format: 'esm', outfile: path.join(out, 'tavya.mjs'),
   banner: { js: '#!/usr/bin/env node' }, metafile: true, absWorkingDir: root });
 // Its inputs, for scripts/cli-release-version.mjs.
 fs.writeFileSync(path.join(out, 'meta.json'), JSON.stringify(metafile));
@@ -28,7 +30,7 @@ fs.chmodSync(path.join(out, 'tavya.mjs'), 0o755);
 
 if (sea) {
   // A single executable embeds one CommonJS script.
-  await build({ ...common, entryPoints: [path.join(root, 'src/cli/bin.ts')], format: 'cjs', outfile: path.join(out, 'tavya.cjs') });
+  await build({ ...common, ...packaging('binary'), entryPoints: [path.join(root, 'src/cli/bin.ts')], format: 'cjs', outfile: path.join(out, 'tavya.cjs') });
   const config = path.join(out, 'sea-config.json');
   fs.writeFileSync(config, JSON.stringify({ main: path.join(out, 'tavya.cjs'), output: path.join(out, 'sea-prep.blob'),
     disableExperimentalSEAWarning: true, useCodeCache: false }));

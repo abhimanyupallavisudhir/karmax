@@ -79,7 +79,7 @@ describe('editable in-flight task parameters', () => {
 
     const saved = paramsSection(view);
     expect(saved).toContain('data-save-state="saved"');
-    expect(saved).toContain('All parameter changes saved');
+    expect(saved).not.toContain('Unsaved changes');
     expect(saved).toMatch(/id="params-save" disabled/);
 
     state.paramEditDrafts = {
@@ -91,7 +91,7 @@ describe('editable in-flight task parameters', () => {
     };
     const dirty = paramsSection(view);
     expect(dirty).toContain('data-save-state="dirty"');
-    expect(dirty).toContain('Unsaved parameter changes');
+    expect(dirty).toContain('Unsaved changes');
     expect(dirty).not.toMatch(/id="params-save" disabled/);
     state.paramEditDrafts = {};
   });

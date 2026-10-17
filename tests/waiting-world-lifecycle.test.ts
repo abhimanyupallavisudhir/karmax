@@ -1,6 +1,8 @@
 import * as __asyncCollections from '../src/util/async-collections.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Context } from '@temporalio/activity';
+import { ApplicationFailure } from '@temporalio/common';
+import { ProviderCapacityFull } from '../src/agent/limits.js';
 import { Store } from '../src/store/db.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { WorldAccessService } from '../src/world/access.js';
@@ -408,6 +410,26 @@ describe('separate waiting-world maintenance', () => {
     expect((await f.store.currentWorld(f.handle.id))?.meta?.worldLeaseId ?? null).toBeNull();
   });
 
+  // pramana#56: Return to Review woke a parked Hetzner world for checkProposal,
+  // Hetzner refused (the project's CPU limit was full), and the failure reached
+  // the workflow as a plain "ProviderCapacityFull" error, which failed the task.
+  it('reports a world that cannot wake for any activity as infrastructure to wait out', async () => {
+    const f = await fixture('hetzner');
+    await f.store.setWorldState(f.handle, 'parked');
+    f.runners.acquire.mockImplementation(async () => ({ leaseId: (await f.store.requestWorldLease({ runnerPoolId: 'test-cap',
+      organizationId: f.project.organizationId!, projectId: f.project.id, taskId: f.task.id, worldId: f.handle.id })).id,
+    runnerPoolId: 'test-cap' }));
+    await f.store.createRunnerPool({ id: 'test-cap', organizationId: f.project.organizationId!, name: 'Test', provider: 'hetzner',
+      mode: 'customer', capacity: { activeWorlds: 1, cpu: 2, memoryMb: 2048, gpu: 0 }, enabled: true });
+    f.open.mockImplementation(async () => { throw new ProviderCapacityFull("Hetzner refused a 16-CPU server: this Hetzner project's limit on shared CPUs is full"); });
+    vi.spyOn(Context, 'current').mockReturnValue({ heartbeat() {}, cancellationSignal: new AbortController().signal } as any);
+    const failed = await f.core.checkProposal(f.handle).then(() => undefined, (error) => error);
+    expect(failed).toBeInstanceOf(ApplicationFailure);
+    expect(failed).toMatchObject({ type: 'world-infra', nonRetryable: false });
+    expect(failed.message).toContain('shared CPUs is full');
+    expect(await f.store.worldState(f.handle.id)).toBe('parked');
+  });
+
   it('propagates maintenance failure without repeating the authoritative publication', async () => {
     const f = (await fixture());
     const fence = await f.publish();
@@ -416,5 +438,27 @@ describe('separate waiting-world maintenance', () => {
     await f.core.parkWaitingWorld(f.task.id, lifecyclePublication(f.view), fence!);
     expect((await f.store.eventsSince(f.task.id, 0)).filter(e => e.type === 'view.updated')).toHaveLength(1);
     expect((await f.store.worldState(f.task.id))).toBe('parked');
+  });
+});
+
+// pramana#79 (2026-10-17): publishing woke a parked Hetzner world, Hetzner's IP
+// limit was full, and the publication escalated at once with Hetzner's raw JSON.
+describe('resource work on a world the provider cannot start', () => {
+  it('is infrastructure to wait out, in its own words', async () => {
+    const store = await Store.create(':memory:');
+    const full = () => Object.assign(new ProviderCapacityFull("Hetzner refused a new server: this Hetzner project's limit on public IP addresses is full"),
+      { cause: new Error('Hetzner POST /servers failed (403): {"error":{"code":"resource_limit_exceeded"}}') });
+    const resources = { settleReview: async () => { throw full(); }, takeDeliveries: async () => { throw full(); },
+      integratePublished: async () => { throw full(); }, stageCandidates: async () => { throw full(); } };
+    const core = makeCoreActivities({ store, worlds: new WorldRegistry(), adapters: new Map(),
+      profiles: new ProfileResolver(store, 'mock'), resources: resources as any });
+    for (const run of [() => core.settleResourceReview('task'), () => core.refreshResourceForks('task'),
+      () => core.integratePublishedResources('task'), () => core.stageResourceCandidates('task')]) {
+      const failed = await run().then(() => undefined, (error: unknown) => error);
+      expect(failed).toBeInstanceOf(ApplicationFailure);
+      expect(failed).toMatchObject({ type: 'world-infra', nonRetryable: false });
+      expect((failed as Error).message).toContain('limit on public IP addresses is full');
+    }
+    await store.close();
   });
 });

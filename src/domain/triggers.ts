@@ -289,7 +289,8 @@ export function isSeries(params: { repeatable?: unknown; draft?: unknown } | und
 
 /** Params for a run spawned from a series: the original minus trigger + series metadata. */
 export function cloneParamsWithoutTriggers<T extends Record<string, unknown>>(params: T): T {
-  const { triggers: _t, triggerState: _s, triggerLastFiredAt: _lf, triggerPending: _tp, draft: _d, repeatable: _r, runOf: _ro, trigger: _tc, ...rest } = params as Record<string, unknown>;
+  // A clone is a new task: none of its source's lifecycle state, archived included, comes along.
+  const { triggers: _t, triggerState: _s, triggerLastFiredAt: _lf, triggerPending: _tp, draft: _d, archived: _a, repeatable: _r, runOf: _ro, trigger: _tc, ...rest } = params as Record<string, unknown>;
   return rest as T;
 }
 

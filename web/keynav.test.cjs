@@ -144,7 +144,7 @@ ok(!src.includes("id: 'list.quickAdd'"), 'no Ctrl/Cmd+Enter quick-add: tasks are
 eval(extractFn('openListRow'));
 let keydown;
 new Function('document', '$', 'focusedEnterAction', 'openListRow',
-  `${extractFn('bindKeys')}\nbindKeys();`)(
+  `${extractFn('takesTypedKeys')}\n${extractFn('bindKeys')}\nbindKeys();`)(
   { addEventListener: (_type, handler) => { keydown = handler; }, querySelector: () => null },
   () => ({ childElementCount: 0 }), focusedEnterAction, openListRow,
 );
@@ -261,7 +261,7 @@ global.document = {
   addEventListener: (name, handler) => { attemptKeydown = handler; },
 };
 global.CHORD = { pending: [], timer: null };
-for (const name of ['cycleAttempt', 'allCommands', 'echoKeys', 'clearPendingEcho', 'resetChord', 'dispatchKey', 'bindKeys']) eval(extractFn(name));
+for (const name of ['cycleAttempt', 'allCommands', 'echoKeys', 'clearPendingEcho', 'resetChord', 'dispatchKey', 'takesTypedKeys', 'bindKeys']) eval(extractFn(name));
 bindKeys();
 const press = (key, typing = false) => attemptKeydown({
   ...ev(key), preventDefault() {},

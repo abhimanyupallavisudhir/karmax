@@ -139,3 +139,92 @@ it('a save waits for another save holding the repository, and takes over from on
   expect(await f.snapshots()).toHaveLength(2);
   expect(await f.store.kvGet(lease)).toBeUndefined();
 });
+
+// restic's locks (pramana, 2026-10-12…16: dozens of "repository is already
+// locked … (restic exit 11)"). A save met the server's forget or prune and
+// failed at once; a forget met a world's save and failed the park, hibernation
+// or sub-task around it; and a lock its process died holding (a deploy, a
+// sandbox gone) stays until `restic unlock`, which nothing ran.
+async function locks(f: Awaited<ReturnType<typeof fixture>>) {
+  const repository = await f.resources.restic.current(f.attachment);
+  const recorded: Array<{ exclusive: boolean; row: Parameters<Store['recordRepositoryFile']>[0] }> = [];
+  let exclusive = false;
+  const record = f.store.recordRepositoryFile.bind(f.store);
+  f.store.recordRepositoryFile = async (file) => {
+    if (file.kind === 'locks') recorded.push({ exclusive, row: file });
+    return record(file);
+  };
+  // One real lock of each kind, as restic wrote them.
+  const source = fs.mkdtempSync(path.join(f.dir, 'locks-'));
+  fs.writeFileSync(path.join(source, 'a.bin'), crypto.randomBytes(50_000));
+  const orphan = await f.resources.restic.backupDirectory(source, repository, { quota: false });
+  exclusive = true;
+  await f.resources.restic.forget(repository, [orphan.snapshot]);
+  f.store.recordRepositoryFile = record;
+  const held = (kind: boolean) => recorded.find((lock) => lock.exclusive === kind)!.row;
+  const place = async (kind: boolean, ageMs = 0) => {
+    const row = held(kind);
+    await f.store.recordRepositoryFile(row);
+    if (ageMs) await (f.store as any).db.prepare('UPDATE resource_repository_files SET createdAt=? WHERE repository=? AND kind=? AND name=?')
+      .run(Date.now() - ageMs, row.repository, 'locks', row.name);
+    return () => f.store.deleteRepositoryFile(row.repository, 'locks', row.name);
+  };
+  const lockFiles = async () => (await f.store.listRepositoryFiles(repository.name, 'locks')).length;
+  return { repository, place, lockFiles, source };
+}
+
+it('a save waits for an exclusive lock to be released instead of failing', async () => {
+  const f = await fixture();
+  await f.resources.importFiles(f.attachment.id, [{ path: 'a.bin', data: crypto.randomBytes(100_000) }]);
+  const l = await locks(f);
+  const release = await l.place(true);
+  fs.writeFileSync(path.join(l.source, 'b.bin'), crypto.randomBytes(100_000));
+  let done = false;
+  const save = f.resources.restic.backupDirectory(l.source, l.repository, { quota: false }).then((capture) => { done = true; return capture; });
+  await new Promise((resolve) => setTimeout(resolve, 2_000));
+  expect(done).toBe(false);
+  await release();
+  expect((await save).snapshot).toMatch(/^[0-9a-f]{64}$/);
+}, 120_000);
+
+it('a lock its process stopped refreshing expires, as restic itself counts it stale', async () => {
+  const f = await fixture();
+  await f.resources.importFiles(f.attachment.id, [{ path: 'a.bin', data: crypto.randomBytes(100_000) }]);
+  const l = await locks(f);
+  // An exclusive lock 40 minutes old: its prune died with a deploy.
+  await l.place(true, 40 * 60_000);
+  fs.writeFileSync(path.join(l.source, 'b.bin'), crypto.randomBytes(100_000));
+  const started = Date.now();
+  await f.resources.restic.backupDirectory(l.source, l.repository, { quota: false });
+  expect(Date.now() - started).toBeLessThan(15_000);
+  expect(await l.lockFiles()).toBe(0);
+  // A lock refreshed recently is a live process's: kept.
+  await l.place(false, 20 * 60_000);
+  await f.resources.restic.backupDirectory(l.source, l.repository, { quota: false });
+  expect(await l.lockFiles()).toBe(1);
+}, 120_000);
+
+it('dropping a save’s leftover snapshot never fails the save: upkeep forgets it later', async () => {
+  const f = await fixture();
+  const data = crypto.randomBytes(100_000);
+  const kept = await f.resources.importFiles(f.attachment.id, [{ path: 'a.bin', data }]);
+  const l = await locks(f);
+  // The same content saved again (a laptop's push of nothing new) while a
+  // world's save holds the repository.
+  const same = fs.mkdtempSync(path.join(f.dir, 'same-'));
+  fs.writeFileSync(path.join(same, 'a.bin'), data);
+  const again = await f.resources.restic.backupDirectory(same, l.repository, { quota: false });
+  const release = await l.place(false);
+  const adopted = await f.resources.adoptWorkspaceSnapshot(f.attachment.id, again.snapshot, kept.id, 'user:test')
+    .then((result) => result, (error) => error);
+  expect(adopted).toMatchObject({ unchanged: true });
+  // Upkeep waits while the repository is busy with a save, then forgets it.
+  await f.store.kvSet(`restic-save:${l.repository.name}`, JSON.stringify({ owner: 'a-world', at: Date.now() }));
+  expect((await f.resources.maintainRepositories()).forgotten).toBe(0);
+  await f.store.kvDelete(`restic-save:${l.repository.name}`);
+  await release();
+  expect(await f.snapshots()).toContain(again.snapshot);
+  expect((await f.resources.maintainRepositories()).forgotten).toBe(1);
+  expect(await f.snapshots()).not.toContain(again.snapshot);
+  expect(await f.snapshots()).toContain(kept.rootDigest);
+}, 120_000);

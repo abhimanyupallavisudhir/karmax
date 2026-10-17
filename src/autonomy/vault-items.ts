@@ -12,6 +12,7 @@ import { organizationScope } from './vault-keys.js';
 import { deleteItemConnectorWrites } from './connector-writes.js';
 import { Capability, allows } from '../platform/capabilities.js';
 import { newId } from '../util/id.js';
+import type { Urgency } from '../domain/types.js';
 import { isEnvName } from '../util/shell.js';
 import { envEntryProblem, type SkippedEnv } from '../util/work-env.js';
 import { parseSavedSession, sessionDomainError } from './browser-session.js';
@@ -157,6 +158,8 @@ export interface CredentialAccessRequest {
   why?: string;
   status: 'pending' | 'granted' | 'denied';
   resolution?: { action: 'once' | 'task' | 'always' | 'deny'; by: string; at: number };
+  /** Ignored by a person: it no longer notifies anyone, but stays pending. */
+  dismissed?: { by: string; at: number };
   createdAt: number;
   /** Human-facing task metadata added by the gateway; never persisted in the
    * organization-scoped request record. */
@@ -178,6 +181,11 @@ export interface VaultItemStore {
   /** One range read of every key under a prefix; stores without it are read per key. */
   kvEntries?(prefix: string): Promise<Array<{ key: string; value: string }>>;
   appendAudit(entry: { principalId: string; action: string; scopeKey?: string; detail?: Record<string, unknown> }): (number) | Promise<number>;
+  /** Store.appendEvent and the task's tenant: a parked request is announced on
+   * its task in the same transaction (see `park`). Stores without them are
+   * standalone vaults with no tasks to announce on. */
+  appendEvent?(event: { taskId: string; type: string; ts: number; payload: Record<string, unknown> }): Promise<number>;
+  taskAttribution?(taskId: string): Promise<{ organizationId: string } | undefined>;
 }
 
 // Items and access requests are ORGANIZATION resources (the tenant boundary):
@@ -892,7 +900,7 @@ export class VaultItems {
    * (no matching item; parked with the domain so the human can add one or say
    * "create it yourself") | denied (hard policy no).
    */
-  async request(args: { taskId: string; projectId?: string; caps: Capability[]; itemId?: string; domain?: string; field?: VaultFieldName; mode?: AccessMode; kind?: 'access' | 'reset'; why?: string }): Promise<{ status: AccessStatus | 'not_in_vault'; reason?: string; requestId?: string; itemId?: string }> {
+  async request(args: { taskId: string; projectId?: string; caps: Capability[]; itemId?: string; domain?: string; field?: VaultFieldName; mode?: AccessMode; kind?: 'access' | 'reset'; why?: string; urgency?: Urgency }): Promise<{ status: AccessStatus | 'not_in_vault'; reason?: string; requestId?: string; itemId?: string }> {
     const mode: AccessMode = args.mode === 'reveal' ? 'reveal' : 'use';
     const kind = args.kind === 'reset' ? 'reset' : 'access';
     const item = args.itemId
@@ -921,7 +929,12 @@ export class VaultItems {
     return { status: 'needs_approval', reason: kind === 'reset' ? `reported invalid: "${item.label}" — the human will update it (or send a reset code)` : undefined, requestId: parked.id, itemId: item.id };
   }
 
-  private async park(args: { taskId: string; projectId?: string; itemId?: string; domain?: string; field?: VaultFieldName; mode: AccessMode; kind?: 'access' | 'reset'; why?: string }): Promise<CredentialAccessRequest> {
+  /** Park a request, or join the identical one still pending. A new one is
+   * announced on its task in the same transaction, whichever route raised it
+   * (request_credential, a blocked reveal, fill or session restore): the
+   * conversation, the inbox and notifications all learn of it from that event,
+   * and a route that forgot to emit it left the ask invisible until a reload. */
+  private async park(args: { taskId: string; projectId?: string; itemId?: string; domain?: string; field?: VaultFieldName; mode: AccessMode; kind?: 'access' | 'reset'; why?: string; urgency?: Urgency }): Promise<CredentialAccessRequest> {
     return this.store.transaction(async () => {
     await this.lockVault();
     const all = (await this.requests());
@@ -943,6 +956,13 @@ export class VaultItems {
       createdAt: Date.now(),
     };
     (await this.saveRequests([...all, req]));
+    // A task of another tenant never hears of this organization's requests.
+    if (this.store.appendEvent && (await this.store.taskAttribution?.(req.taskId))?.organizationId === this.organizationId)
+      (await this.store.appendEvent({ taskId: req.taskId, type: 'credential.approval-requested', ts: req.createdAt, payload: {
+        requestId: req.id, status: 'approval-needed', mode: req.mode, kind: req.kind ?? 'access',
+        ...(req.itemId ? { itemId: req.itemId } : {}), ...(req.domain ? { domain: req.domain } : {}),
+        ...(req.why ? { why: req.why } : {}), ...(args.urgency ? { urgency: args.urgency } : {}),
+      } }));
     return req;
 
     });
@@ -978,6 +998,22 @@ export class VaultItems {
     req.resolution = { action: args.action, by: args.by, at: Date.now() };
     (await this.saveRequests(all));
     (await this.store.appendAudit({ principalId: args.by, action: 'vault.request.resolved', detail: { requestId, taskId: req.taskId, itemId: req.itemId, action: args.action } }));
+    return req;
+
+    });
+  }
+
+  /** Silence a parked request without deciding it: the agent keeps waiting. */
+  async dismiss(requestId: string, by: string): Promise<CredentialAccessRequest> {
+    return this.store.transaction(async () => {
+    await this.lockVault();
+    const all = (await this.requests());
+    const req = all.find((r) => r.id === requestId);
+    if (!req) throw new Error(`no credential request ${requestId}`);
+    if (req.status !== 'pending') throw new Error(`request ${requestId} is already ${req.status}`);
+    req.dismissed ??= { by, at: Date.now() };
+    (await this.saveRequests(all));
+    (await this.store.appendAudit({ principalId: by, action: 'vault.request.dismissed', detail: { requestId, taskId: req.taskId } }));
     return req;
 
     });

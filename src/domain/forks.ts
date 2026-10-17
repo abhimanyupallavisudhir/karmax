@@ -26,3 +26,30 @@ export function taskForkSourceIds(params: unknown): string[] {
 export function forkSourceRole(resumeFrom: { role?: string }, role: string): string {
   return resumeFrom.role ?? (role === 'agent' ? 'do' : role);
 }
+
+/**
+ * Once a person has confirmed a task's proposal it is sealed: it lands (or has
+ * landed) exactly as approved. Talking to its agent then carries the work on in
+ * a new task that forks the agent — its session, and its world while the
+ * proposal is still landing — instead of pulling the proposal back to Do. While
+ * landing waits on people (a repair it could not make, a merge only they may
+ * authorize) a message is about that proposal and still goes to the agent.
+ * Top-level software-dev tasks with an agent only: a sub-task's work belongs to
+ * its parent, and a command task has no agent to continue.
+ */
+export function continuesInNewTask(
+  task: { workflow: string; parentTaskId?: string; params?: Record<string, unknown> },
+  view: { stage: string; status: string; waitingFor?: { kind: string }; state?: Record<string, unknown> } | undefined,
+): boolean {
+  if (!view || task.workflow !== 'software-dev' || task.parentTaskId || task.params?.command) return false;
+  if (view.stage === 'done') return view.status === 'done' && !view.state?.manuallyDoneFrom;
+  return view.stage === 'merge' && (view.status === 'active' || view.status === 'waiting')
+    && view.waitingFor?.kind !== 'human' && view.waitingFor?.kind !== 'parent';
+}
+
+/** What `message_agent` tells the agent that sent a message. */
+export function continuedReply(continuedIn?: { id: string; num?: number }): string {
+  return continuedIn
+    ? `That task's proposal is confirmed, so its agent continues in a new task: ${continuedIn.num != null ? `#${continuedIn.num} ` : ''}(${continuedIn.id}).`
+    : 'message delivered';
+}

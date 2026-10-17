@@ -208,6 +208,36 @@ describe('connection gateway flow', () => {
     expect(response.status).toBe(200);
     expect((await service.pending(taskId))).toHaveLength(0);
   });
+  it('dismisses a request silently: it stays pending, the agent cannot dismiss it', async () => {
+    const pending = (await service.request(org, 'notion', taskId, 'do', 'Read Notion'));
+    const dismiss = (token?: string) => request(`/api/connections/${pending.id}/dismiss?organizationId=${org}`, { method: 'POST', body: {}, token });
+    expect((await dismiss(agent)).status).toBe(403);
+    const response = await dismiss();
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ status: 'requested', dismissed: { by: 'user:alice' } });
+    expect((await service.pending(taskId))).toEqual(expect.arrayContaining([expect.objectContaining({ id: pending.id, dismissed: expect.any(Object) })]));
+    expect((await store.eventsOfType(taskId, 'connection.dismissed'))).toEqual([expect.objectContaining({ payload: { requestId: pending.id } })]);
+    (await service.disconnect(org, pending.id, 'alice'));
+  });
+  it('announces each change of a task\'s request on the task, once, however it changed', async () => {
+    // The conversation's Connect row follows these events; a change saved
+    // without one (a sign-in started in another tab, an account the agent's
+    // call found gone) stayed stale until a reload.
+    const ask = async () => (await (await request('/api/connections/request', { token: agent, method: 'POST', body: { toolkit: 'linear', why: 'Track issues' } })).json()) as any;
+    const id = (await ask()).connection.id;
+    expect((await ask()).connection.id).toBe(id);
+    const events = async () => (await store.eventsSince(taskId, 0))
+      .filter(event => event.type.startsWith('connection.') && (event.payload as any).requestId === id).map(event => [event.type, event.payload]);
+    expect(await events()).toEqual([['connection.requested', { requestId: id, connectionId: id, toolkit: 'linear', why: 'Track issues' }]]);
+    (await service.dismiss(org, id, 'user:alice'));
+    (await service.connect(org, 'alice', { id }));
+    (await service.disconnect(org, id, 'alice'));
+    expect((await events()).slice(1)).toEqual([
+      ['connection.dismissed', { requestId: id }],
+      ['connection.updated', { requestId: id, connectionId: id, status: 'connecting' }],
+      ['connection.updated', { requestId: id, connectionId: id, status: 'disconnected' }],
+    ]);
+  });
   it('keeps provider configuration installation-scoped and write-only', async () => {
     expect(routeCapability('PUT', '/api/connections/config')).toBe('settings:write');
     const config = await request('/api/connections/config', { token: agent });

@@ -3,6 +3,7 @@ import { AgentProfile, AgentRole, AgentSpec, Provider } from '../domain/types.js
 import { Store } from '../store/db.js';
 import { allRoles } from '../contrib/manifests.js';
 import { CLAUDE_DEFAULT_MODEL } from './effort.js';
+import { mockAgentEnabled } from './provider-registry.js';
 
 export const DEFAULT_MCP_CONNECTIONS = ['browser:chrome-devtools'];
 
@@ -28,12 +29,8 @@ export function makeDefaultProfiles(provider: Provider): AgentProfile[] {
 
 export function defaultModel(provider: Provider): string | undefined {
   if (provider === 'codex') return process.env.KARMAX_OPENAI_MODEL ?? 'gpt-5.5';
-  // Must stay identical to CLAUDE_DEFAULT_MODEL in src/agent/claude.ts: this one
-  // is stamped onto every role by seedProfiles(), that one is the fallback for a
-  // model-less profile on the metered rail. They used to disagree (`claude-sonnet-5`
-  // — which never existed — vs `claude-sonnet-4-5`, which fails the effort gate),
-  // so a model-less profile silently lost its reasoning effort. Imported rather
-  // than duplicated so they cannot drift again.
+  // The same constant the metered rail falls back to for a model-less profile,
+  // imported rather than duplicated so the two cannot drift again.
   if (provider === 'claude') return process.env.KARMAX_CLAUDE_MODEL ?? CLAUDE_DEFAULT_MODEL;
   if (provider === 'opencode') return process.env.KARMAX_OPENCODE_MODEL ?? 'kimi/kimi-for-coding';
   if (provider === 'kimi') return process.env.KARMAX_KIMI_MODEL ?? 'kimi-for-coding';
@@ -146,4 +143,33 @@ export async function seedProfiles(store: Store, provider: Provider) {
   for (const p of makeDefaultProfiles(provider)) {
     if (!(await store.getProfile(p.id))) (await store.upsertProfile(p));
   }
+  (await repairMockProfiles(store, provider));
+}
+
+/** Move every stored profile and Avatar that names the mock agent onto the
+ * installation's default agent, unless the mock is enabled here. An earlier
+ * release seeded the mock as every role's default on a host that had no agent
+ * credential at first boot (tavya.io), and every organization without defaults
+ * of its own inherited it. Everything but the harness and model is kept.
+ * Returns how many records changed. */
+export async function repairMockProfiles(store: Store, provider: Provider): Promise<number> {
+  if (mockAgentEnabled() || provider === 'mock') return 0;
+  const model = defaultModel(provider);
+  let changed = 0;
+  for (const profile of await store.listProfiles()) {
+    if (profile.provider !== 'mock') continue;
+    const { model: _model, ...rest } = profile;
+    (await store.upsertProfile({ ...rest, provider, ...(model ? { model } : {}) }));
+    changed++;
+  }
+  for (const avatar of await store.listAvatars()) {
+    if (avatar.runtime.provider !== 'mock') continue;
+    const { model: _model, ...runtime } = avatar.runtime;
+    try {
+      (await store.upsertAvatar({ ...avatar, runtime: { ...runtime, provider, ...(model ? { model } : {}) } }));
+      changed++;
+    } catch { /* its owner's account is closed: it can no longer run */ }
+  }
+  if (changed) console.warn(`  • Moved ${changed} agent profile(s) off the mock agent onto ${provider}${model ? `:${model}` : ''}`);
+  return changed;
 }

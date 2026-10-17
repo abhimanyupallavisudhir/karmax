@@ -56,7 +56,8 @@ export async function cliFixture(cleanups: Array<() => Promise<void> | void>, op
     await gitOrThrow(dir, ['clone', '-q', '--bare', seed, path.join(remotes, 'acme', `${name}.git`)]);
   }
   const gitconfig = path.join(dir, 'gitconfig');
-  fs.writeFileSync(gitconfig, `[url "${remotes}/"]\n\tinsteadOf = git@github.com:\n\tinsteadOf = https://github.com/\n[user]\n\tname = Laptop\n\temail = laptop@example.com\n[init]\n\tdefaultBranch = main\n`);
+  // file:// (not a bare path, which Git clones locally) so `--filter` reaches upload-pack, as on GitHub.
+  fs.writeFileSync(gitconfig, `[url "file://${remotes}/"]\n\tinsteadOf = git@github.com:\n\tinsteadOf = https://github.com/\n[uploadpack]\n\tallowFilter = true\n[user]\n\tname = Laptop\n\temail = laptop@example.com\n[init]\n\tdefaultBranch = main\n`);
 
   const store = await Store.create(':memory:');
   cleanups.push(() => store.close());

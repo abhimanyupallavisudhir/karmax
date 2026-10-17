@@ -51,6 +51,12 @@ const MAX_UPLOAD_BYTES = 160 * 1024 * 1024;
 /** Uploads held in memory at once, across every repository. */
 const UPLOAD_SLOTS = 24;
 const REDIRECT_SECONDS = 15 * 60;
+/** restic rewrites a live lock every 5 minutes and calls one 30 minutes old
+ * stale, but leaves it in place: every exclusive command (and, for an
+ * exclusive one, every save) then fails until someone runs `restic unlock`.
+ * A process that died holding one (a sandbox gone, a deploy) is common here,
+ * so the listing restic reads its locks from drops them at this age. */
+export const STALE_LOCK_MS = 35 * 60_000;
 /** The edge starts its upload as soon as it has the URL. */
 const UPLOAD_URL_SECONDS = 15 * 60;
 const TOKEN_KEY_HANDLE = 'resource-repositories:token-key';
@@ -250,6 +256,7 @@ export class ResourceRepositoryServer {
     if (extra.length || !(kind === 'config' ? !name : KINDS.has(kind))) throw new HttpError(404, 'not found');
     if (kind !== 'config' && name === '') {
       if (method !== 'GET') throw new HttpError(405, 'method not allowed');
+      if (kind === 'locks') await this.deps.store.expireRepositoryLocks(repository, Date.now() - STALE_LOCK_MS);
       const files = await this.deps.store.listRepositoryFiles(repository, kind);
       const v2 = (req.headers.accept ?? '').includes('application/vnd.x.restic.rest.v2');
       res.writeHead(200, { 'content-type': v2 ? 'application/vnd.x.restic.rest.v2' : 'application/vnd.x.restic.rest.v1' });

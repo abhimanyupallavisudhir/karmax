@@ -39,7 +39,7 @@ import {
   participantLabel, participantRole, reviewerKey, selectorAgent,
 } from '../domain/participants.js';
 import { resetAtFromHint } from '../agent/limits.js';
-import { isInfraFailure, limitFailureClassification, INFRA_BACKOFF_MS } from './failures.js';
+import { isInfraFailure, limitFailureClassification, INFRA_BACKOFF_MS, WORLD_WAIT_MS, WORLD_WAIT_LIMIT_MS } from './failures.js';
 import {
   TaskInput,
   TaskView,
@@ -57,6 +57,7 @@ import {
   SubTaskAction,
   ParentResponse,
   SubTaskRequest,
+  QueuedSubTask,
   SubTaskResponse,
   TaskPullRequest,
   GithubLandingParticipant,
@@ -212,6 +213,9 @@ export const retrySignal = defineSignal('retry');
 export const keepOwnResourcesSignal = defineSignal(SIG.keepOwnResources);
 export const mergeGrantedSignal = defineSignal(SIG_MERGE_GRANTED);
 type CredentialKind = 'login' | 'ambient' | 'key';
+/** A sub-task to start: one an agent asked for this turn, or a queued draft
+ * whose saved record (`draftTaskId`) holds its title, prompt and agents. */
+type SpawnRequest = SubTaskRequest & { draftTaskId?: string };
 export const accountGrantedSignal = defineSignal<[{
   turnId: string;
   accountId: string;
@@ -234,6 +238,10 @@ const REPLY_TO_SPEAKERS = 'software-dev-reply-to-speakers-v1';
 const UNASKED_REPLY_TO_SPEAKERS = 'software-dev-unasked-reply-to-speakers-v1';
 export const raiseFromChildSignal = defineSignal<[ChildRaise]>('raiseFromChild');
 export const subtaskRedirectedSignal = defineSignal<[{ childTaskId: string }]>(SIG.subtaskRedirected);
+/** A draft sub-task of this task was queued (POST /api/tasks/:id/queue): the
+ * task prepares and starts it like one its agent creates, after the agent's
+ * current turn. */
+export const queueSubTaskSignal = defineSignal<[QueuedSubTask]>(SIG.queueSubTask);
 /** A parent answers a child that raised to it — maps onto the same confirm/retry/
  *  cancel/follow-up transitions a human would drive (SPEC §5.3). */
 export const parentResponseSignal = defineSignal<[ParentResponse]>('parentResponse');
@@ -326,6 +334,23 @@ const QUIET_NOTICE = 'prn-';
 /** Several branches: finishing lands the task's own repositories together,
  * through its own Review, not as a pull request each. */
 const FINISH_TOGETHER = 'several-branches-finish-together-v1';
+/** A person's Open PR publishes the proposal without first running the agent
+ * on messages it had not read (a stopped turn's). */
+const OPEN_PR_AS_IT_STANDS = 'software-dev-open-pr-as-it-stands-v1';
+/** A Confirm sent while a Reviewer agent worked approved the next human step
+ * unseen; each human step now waits for its own. */
+const HUMAN_STEP_OWN_CONFIRM = 'software-dev-human-step-own-confirm-v1';
+/** A message to the agent at a failed landing returns the proposal to Do,
+ * as at every other Merge wait on people, instead of retrying the merge. */
+const ESCALATED_MERGE_MESSAGE_TO_DO = 'software-dev-escalated-merge-message-to-do-v1';
+/** Open PR's checks wake a parked world, and wait out one that cannot wake (pramana#56). */
+const OPEN_PR_WAITS_FOR_WORLD = 'software-dev-open-pr-waits-for-world-v1';
+/** Saving and publishing resources wait for a machine the provider cannot
+ * start yet instead of escalating (pramana#79). */
+const RESOURCES_WAIT_FOR_WORLD = 'resources-wait-for-world-v1';
+/** A sub-task whose parent world cannot be reached is waited out, then a
+ * person's, never the asking agent's (pramana#39/#43). */
+const SUBTASK_PREPARE_WAITS_FOR_WORLD = 'software-dev-subtask-prepare-waits-for-world-v1';
 const quietNotice = (m: Message): boolean => m.id.startsWith(QUIET_NOTICE);
 const clip = (text: string, max: number) => text.length > max ? `${text.slice(0, max)}…` : text;
 /** A turn can return while the agent's own in-harness sub-agents (Claude Agent SDK
@@ -813,6 +838,13 @@ async function softwareDevImpl(
   let manualEscalationRequested = carried?.manualEscalationRequested ?? false;
   // A pull request arrives committed and ready: it opens at once.
   let prRequested = carried?.prRequested ?? (recoveryStage === 'pr' || (shippedBranch && !recovery));
+  /** How much of the conversation there was when a person (or the parent)
+   * asked for Open PR: they took the proposal as it stood, so what the agent
+   * had not read by then does not make it run first (#659). */
+  let openPrAskedAt: number | undefined = continued?.openPrAskedAt;
+  /** Messages an Open PR answered: they wake nothing, but the agent still
+   * reads them on its next turn (`seen` is what it has been given). */
+  let heardThrough = continued?.heardThrough ?? 0;
   // v1.29: Do runs the task's own command instead of the agent — once per run
   // of the task; a revise, or a failure handed to the agent, continues with it.
   const taskCommand = minor >= 29 ? input.command?.trim() || undefined : undefined;
@@ -937,6 +969,8 @@ async function softwareDevImpl(
   /** A pull request (v1.30): the commit its agent opened it at again, not yet in its worktree. */
   let pendingHead: string | undefined;
   const awaitingResponse = new Set<string>(continued?.subTasks.awaitingResponse);
+  /** Draft sub-tasks queued and not yet started (`queueSubTaskSignal`). */
+  const queuedSubTasks: QueuedSubTask[] = [...continued?.subTasks.queued ?? []];
   // Cross-task collaboration is a durable, event-driven join. The requesting
   // agent keeps working for the rest of its current turn; if it finishes before
   // the target publishes, the workflow parks here and wakes on settlement.
@@ -1066,7 +1100,8 @@ async function softwareDevImpl(
   const mainUnreadSince = (from: number): boolean => multiAgent
     ? msgs.slice(Math.max(0, from)).some((m) => addressedTo(m, MAIN_AGENT) && !quietNotice(m))
     : shipsBranches ? msgs.slice(Math.max(0, from)).some((m) => !quietNotice(m)) : msgs.length > from;
-  const mainUnread = (): boolean => mainUnreadSince(seen);
+  const unreadFrom = (): number => Math.max(seen, heardThrough);
+  const mainUnread = (): boolean => mainUnreadSince(unreadFrom());
   /** The agents this task lists right now, main agent first. */
   const participantKeys = (): string[] => {
     const keys = [MAIN_AGENT];
@@ -1241,6 +1276,13 @@ async function softwareDevImpl(
         : action)
       : actions;
   }
+  /** A Do wait on people that Open PR cannot end (sub-tasks outstanding, an
+   * app to connect): it is not offered there. */
+  let openPrInert = false;
+  /** A person approved the Review step whose Reviewer agent failed. */
+  let stepConfirmedByPerson = false;
+  const reviewerWorking = (): boolean => waitingFor?.kind === 'confirm'
+    || (!!runningParticipant && participantRole(runningParticipant) === 'confirm');
   function allowedNow(): DeclaredAction[] {
     if (applyingResources || stagingResources || mergingResources) return [];
     const pausedRole: AgentRole | undefined =
@@ -1286,10 +1328,11 @@ async function softwareDevImpl(
       case 'setup':
         return [cancel];
       case 'do':
-        return [...(explicitPrCycle && waitingFor?.kind === 'human' ? [openPr] : []), followUp,
+        return [...(explicitPrCycle && waitingFor?.kind === 'human' && !openPrInert ? [openPr] : []), followUp,
           ...(!repositoryless ? [setTarget] : []), cancel];
       case 'review':
-        return [...(awaitingResourceDecision ? [] : [confirm]), followUp,
+        // A Reviewer agent is deciding: wait for its verdict, or stop it to decide.
+        return [...(awaitingResourceDecision || reviewerWorking() ? [] : [confirm]), followUp,
           ...(!repositoryless ? [setTarget] : []), cancel];
       case 'pr':
         return [cancel];
@@ -1495,7 +1538,7 @@ async function softwareDevImpl(
     await publish();
     const scope = new CancellationScope({ cancellable: true });
     activeStaging = scope; // from here a cancel reaches the activity; before, it is seen below
-    try { if (!cancelled) await scope.run(() => resourceStaging.stageResourceCandidates(taskId)); }
+    try { if (!cancelled) await scope.run(() => waitingForWorld(() => resourceStaging.stageResourceCandidates(taskId))); }
     catch (err) { if (isCancellation(err) && !cancelled) throw err; }
     finally { activeStaging = undefined; stagingResources = false; status = priorStatus; }
     return true;
@@ -1550,9 +1593,9 @@ async function softwareDevImpl(
       let failure: string;
       let guide: string | undefined;
       try {
-        await runLandingActivity(() => keepOwnRequested
+        await waitingForWorld(() => runLandingActivity(() => keepOwnRequested
           ? resourceActivities.settleResourceReview(taskId, { keepOwn: true })
-          : resourceActivities.settleResourceReview(taskId));
+          : resourceActivities.settleResourceReview(taskId)));
         resourcesApplied = true;
         return 'applied';
       } catch (err) {
@@ -1782,7 +1825,12 @@ async function softwareDevImpl(
         if (layer.kind === 'agent' && !revisionBound) {
           waitingFor = { kind: 'confirm', ...(gateDetail ? { detail: gateDetail } : {}) };
           await publish();
+          stepConfirmedByPerson = false;
           const decision = await confirmTurn(layer, reviewer);
+          // A Confirm that came while the Reviewer worked is not the next
+          // human step's: its people decide, the gate shown first. A person
+          // approving this step when its Reviewer failed is.
+          if (confirmed && !stepConfirmedByPerson && patched(HUMAN_STEP_OWN_CONFIRM)) confirmed = false;
           waitingFor = undefined;
           if (cancelled) return 'cancelled';
           if (confirmEpoch !== epoch) { layerIndex = 0; continue; }
@@ -2021,6 +2069,7 @@ async function softwareDevImpl(
     if (!explicitPrCycle || stage !== 'do') return;
     prRequested = true;
     manualPrConfirmer = request?.userId;
+    whenLoaded(() => { openPrAskedAt = msgs.length; });
     if (responsiveHumanHold && humanPauseActive)
       humanPauseWake = { kind: 'openPr' };
   });
@@ -2101,6 +2150,11 @@ async function softwareDevImpl(
   setHandler(subtaskRedirectedSignal, ({ childTaskId }) => {
     if (awaitingResponse.delete(childTaskId)) subtaskNags = 0;
   });
+  setHandler(queueSubTaskSignal, (queued) => {
+    if (!queued?.taskId || subTaskIds.includes(queued.taskId)
+      || queuedSubTasks.some((q) => q.taskId === queued.taskId)) return;
+    queuedSubTasks.push({ taskId: queued.taskId, title: String(queued.title ?? '') });
+  });
   // Our parent answered a raise. Map its decision onto the SAME flags a human drives
   // (confirm/retry/cancel/follow-up) so the parent is literally our confirmer.
   setHandler(parentResponseSignal, (resp) => {
@@ -2110,6 +2164,7 @@ async function softwareDevImpl(
         return;
       }
       prRequested = true;
+      whenLoaded(() => { openPrAskedAt = msgs.length; });
       if (responsiveHumanHold && humanPauseActive)
         humanPauseWake = { kind: 'openPr' };
     } else if (resp.action === 'confirm') {
@@ -2606,6 +2661,50 @@ async function softwareDevImpl(
    * its Hetzner world took to make, and was pressed again. */
   async function publishRetried(): Promise<void> {
     if (patched('software-dev-publish-retried-stage-v1')) await publish();
+  }
+
+  /** Open PR's readiness check, which wakes a parked world. A provider can
+   * refuse that wake for a while (pramana#56: the Hetzner project's CPU limit
+   * was full, and the task failed). So the click shows at once as the
+   * proposal being prepared (`announce`), and a world that cannot wake is
+   * waited out like any stage's infrastructure, then escalated with Retry. */
+  async function checkProposal(announce = true): ReturnType<coreActivities['checkProposal']> {
+    if (!patched(OPEN_PR_WAITS_FOR_WORLD)) return core.checkProposal(world as any);
+    if (announce) {
+      stage = 'pr';
+      status = 'active';
+      waitingFor = undefined;
+      await publish();
+    }
+    return withResolve('pr', () => core.checkProposal(world as any));
+  }
+
+  /** Run work that needs the task's world, waiting while its provider cannot
+   * start it (an outage, a full account limit: pramana#79's Hetzner IP limit
+   * escalated a publication at once). The wait shows why, and ends early on
+   * Retry; after {@link WORLD_WAIT_LIMIT_MS} the failure goes to the caller,
+   * which asks a person as before. */
+  async function waitingForWorld<T>(work: () => Promise<T>): Promise<T> {
+    if (!patched(RESOURCES_WAIT_FOR_WORLD)) return work();
+    let waited = 0;
+    for (let round = 0; ; round++) {
+      try { return await work(); }
+      catch (err) {
+        if (cancelled || halted() || isCancellation(err) || !isInfraFailure(err) || waited >= WORLD_WAIT_LIMIT_MS) throw err;
+        const wait = WORLD_WAIT_MS[Math.min(round, WORLD_WAIT_MS.length - 1)]!;
+        waited += wait;
+        const resume = { status, waitingFor };
+        status = 'waiting';
+        waitingFor = { kind: 'retry', detail: innermostMessage(err), until: Date.now() + wait };
+        retryRequested = false;
+        await publish();
+        await condition(() => cancelled || retryRequested || halted(), wait);
+        ({ status, waitingFor } = resume);
+        retryRequested = false;
+        if (cancelled || halted()) throw new Cancelled();
+        await publish();
+      }
+    }
   }
 
   /** May `session` (minted under `sessionHome`) be resumed under `home` now? Only
@@ -3246,6 +3345,7 @@ async function softwareDevImpl(
         action: 'confirm',
         finish: async () => {
           confirmed = true;
+          stepConfirmedByPerson = true;
           return { completed: true, output: '' };
         },
       } : undefined,
@@ -3413,6 +3513,7 @@ async function softwareDevImpl(
     if (msgs.slice(participantSessions[key]!.seen).some((m) => addressedTo(m, key)))
       agentQueue = enqueueAgents(agentQueue, [key]);
     if (turn.subTasks?.length) await spawnSubTasks(turn.subTasks, key);
+    await startQueuedSubTasks();
     if (turn.subTaskResponses?.length) await applySubTaskResponses(turn.subTaskResponses);
     return { ...turn, ...(reply ? { reply } : {}) };
   }
@@ -3869,7 +3970,7 @@ Inspect the complete current diff and specifically compare its delta from the re
    *  off — and merges back into — THIS task's world branch, so `main` sees one merge at
    *  the top. Commit-on-spawn snapshots our work first (worktrees share commits, not the
    *  dirty tree) so children fork the current state. */
-  async function spawnSubTasks(list: SubTaskRequest[], requester = MAIN_AGENT) {
+  async function spawnSubTasks(list: SpawnRequest[], requester = MAIN_AGENT) {
     await core.commitWork(world as any, `tavya: snapshot before sub-tasks for ${taskId}`);
     for (const [index, s] of list.entries()) {
       // Preserve recorded spawn/drop decisions during replay. New decisions have
@@ -3899,6 +4000,8 @@ Inspect the complete current diff and specifically compare its delta from the re
         // The child's own agent choice (PL-11). Only the activity's argument
         // changes, never a command, so recorded histories replay unchanged.
         ...(s.params ? { params: s.params } : {}),
+        // A queued draft: its saved record is prepared, not a new one.
+        ...(s.draftTaskId ? { draftTaskId: s.draftTaskId } : {}),
       };
       let childInput: Awaited<ReturnType<coreActivities['prepareChildTask']>>;
       // A sub-task that cannot be prepared (its parent's data cannot be saved,
@@ -3906,7 +4009,7 @@ Inspect the complete current diff and specifically compare its delta from the re
       if (patched('subtask-prepare-failure-to-agent-v1')) {
         preparingSubTask = true;
         await publish();
-        try { childInput = await childPreparation.prepareChildTask(prepare); }
+        try { childInput = await prepareSubTask(s, prepare); }
         catch (err) {
           if (isCancellation(err)) throw err;
           preparingSubTask = false;
@@ -3940,23 +4043,57 @@ Inspect the complete current diff and specifically compare its delta from the re
     await publish();
   }
 
+  /** Prepare a sub-task. Its parent's world can be unreachable for longer
+   * than the activity's retries (a VM whose connection stays lost): that is
+   * waited out as any stage's infrastructure is, visibly, a Retry or a cancel
+   * ending a wait early. */
+  async function prepareSubTask(request: SubTaskRequest, prepare: Parameters<coreActivities['prepareChildTask']>[0]) {
+    for (let waits = 0; ; waits++) {
+      try { return await childPreparation.prepareChildTask(prepare); }
+      catch (err) {
+        if (!isInfraFailure(err) || waits >= INFRA_BACKOFF_MS.length || !patched(SUBTASK_PREPARE_WAITS_FOR_WORLD)) throw err;
+        const wait = INFRA_BACKOFF_MS[waits]!;
+        const resumeStatus = status;
+        status = 'waiting';
+        waitingFor = { kind: 'retry', detail: `Retry ${waits + 1} of ${INFRA_BACKOFF_MS.length}`, until: Date.now() + wait };
+        error = `infrastructure: ${describeError(err)} — preparing sub-task "${request.title}" again in ${Math.round(wait / 1000)}s`;
+        await publish();
+        await condition(() => cancelled || retryRequested || halted(), wait);
+        waitingFor = undefined;
+        status = resumeStatus;
+        error = undefined;
+        if (cancelled || halted()) throw new Cancelled();
+        retryRequested = false;
+        await publish();
+      }
+    }
+  }
+
   /** Tell the agent that asked for `failed` (and the requests after it in the
    * same turn, not attempted) why it was not created: at its next turn, as a
    * failed create_sub_task. Outside Do no turn of it follows (a Reviewer at
    * Review), so the task escalates instead, as a failed publication does, and
    * Retry prepares them again. */
-  async function unpreparedSubTasks(failed: SubTaskRequest, rest: SubTaskRequest[], err: unknown, requester: string) {
+  async function unpreparedSubTasks(failed: SpawnRequest, rest: SpawnRequest[], err: unknown, requester: string) {
     const reason = failureHasType(err, 'resource-kept-changing')
       ? `This task's project data could not be saved for it to start from: ${innermostMessage(err)}` : innermostMessage(err);
     const others = rest.length
-      ? ` ${rest.map((r) => `"${r.title}"`).join(', ')} ${rest.length === 1 ? 'was' : 'were'} not created either.` : '';
-    const what = `create_sub_task "${failed.title}" failed: no sub-task was created. ${reason}${/[.!?]$/.test(reason) ? '' : '.'}${others}`;
-    const text = `${what} Nothing was lost; call create_sub_task again once that is resolved.`;
+      ? ` ${rest.map((r) => `"${r.title}"`).join(', ')} ${rest.length === 1 ? 'was' : 'were'} not ${failed.draftTaskId ? 'started' : 'created'} either.` : '';
+    const ended = `${reason}${/[.!?]$/.test(reason) ? '' : '.'}${others}`;
+    const what = failed.draftTaskId
+      ? `Starting the draft sub-task "${failed.title}" (${failed.draftTaskId}) failed: it is still a draft. ${ended}`
+      : `create_sub_task "${failed.title}" failed: no sub-task was created. ${ended}`;
+    const text = `${what} Nothing was lost; ${failed.draftTaskId ? 'queue it again (queue_task)' : 'call create_sub_task again'} once that is resolved.`;
     await core.recordEvent(taskId, 'subtask.failed', { title: failed.title, error: reason, requester,
       ...(rest.length ? { notAttempted: rest.map((r) => r.title) } : {}) });
     const addressed = multiAgent && requester !== MAIN_AGENT;
-    msgs.push({ id: `st-${msgs.length}`, role: 'user', text, ts: Date.now(), ...(addressed ? { to: [agentSelector(requester)] } : {}) });
-    if (stage === 'do') {
+    const tell = () => msgs.push({ id: `st-${msgs.length}`, role: 'user', text, ts: Date.now(), ...(addressed ? { to: [agentSelector(requester)] } : {}) });
+    // An unreachable world, still so after the waits, is no agent's to fix: a
+    // person's Retry creates it. The agent hears only if the person answers
+    // otherwise (a follow-up), so it can ask again itself.
+    const infrastructure = isInfraFailure(err) && patched(SUBTASK_PREPARE_WAITS_FOR_WORLD);
+    if (!infrastructure) tell();
+    if (stage === 'do' && !infrastructure) {
       if (addressed) agentQueue = enqueueAgents(agentQueue, [requester]);
       await publish();
       return;
@@ -3977,9 +4114,16 @@ Inspect the complete current diff and specifically compare its delta from the re
     error = undefined;
     stage = priorStage;
     status = 'active';
-    if (cancelled || !retryRequested) return;
+    if (cancelled) return;
+    if (!retryRequested) { if (infrastructure) tell(); return; }
     retryRequested = false;
     await spawnSubTasks([failed, ...rest], requester);
+  }
+
+  /** Prepare and start the draft sub-tasks queued since the last call. */
+  async function startQueuedSubTasks() {
+    const drafts = queuedSubTasks.splice(0).filter((queued) => !subTaskIds.includes(queued.taskId));
+    if (drafts.length) await spawnSubTasks(drafts.map((queued) => ({ title: queued.title, prompt: '', draftTaskId: queued.taskId })));
   }
 
   /** Send the Do agent's answers down to the children they target (SPEC §5.3). */
@@ -4081,7 +4225,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         goalMode,
         confirmLayers: softwareDevConfirmLayers,
         subTasks: { ids: subTaskIds, outstanding: [...outstanding], awaitingResponse: [...awaitingResponse], raises, settled,
-          ...(shipments.length ? { shipments } : {}) },
+          ...(shipments.length ? { shipments } : {}), ...(queuedSubTasks.length ? { queued: queuedSubTasks } : {}) },
         collaborations: { pending: [...pendingCollaborations], settled: [...settledCollaborations] },
         consumed: [...consumed],
         checkoutHeads,
@@ -4092,6 +4236,8 @@ Inspect the complete current diff and specifically compare its delta from the re
           ...(pullRequestsOpened ? { pullRequestsOpened } : {}) },
         ...(manualPrConfirmer ? { manualPrConfirmer } : {}),
         ...(escalationAction ? { escalationAction } : {}),
+        ...(openPrAskedAt !== undefined ? { openPrAskedAt } : {}),
+        ...(heardThrough ? { heardThrough } : {}),
         ...(error ? { error } : {}),
         counters: { responderRounds, subtaskNags, subagentNudges, shellNudges, landingWatchSequence, resourceReviewSequence },
         ...(multiAgent ? { participants: { sessions: participantSessions, queue: agentQueue, calledBy, revisions: automatedRevisions } } : {}),
@@ -4291,7 +4437,7 @@ Inspect the complete current diff and specifically compare its delta from the re
     status = 'active';
     waitingFor = undefined;
     await publish();
-    const readiness = await core.checkProposal(world as any);
+    const readiness = await checkProposal(false);
     if (!readiness.ready) {
       const detail = readiness.conflict ?? readiness.dirty ?? readiness.note ?? 'the proposal is not ready';
       msgs.push({
@@ -4412,6 +4558,8 @@ Inspect the complete current diff and specifically compare its delta from the re
     // sees their raises/results at the top of this turn — this is what lets us keep
     // working while they run, rather than blocking on them.
     drainChildEvents();
+    // Drafts queued while the task waited start before the agent's turn.
+    await startQueuedSubTasks();
     if (childLandedSinceRefresh) {
       childLandedSinceRefresh = false;
       if (resourceCandidateReview && patched('subtask-resource-refresh-v1')) await refreshResourcesFromChildren();
@@ -4430,13 +4578,19 @@ Inspect the complete current diff and specifically compare its delta from the re
     // A human/parent may request Open PR while the task is already parked. That
     // transition uses the proposal the Do agent just produced; it must not spend
     // another model turn before publishing it.
+    // It takes the proposal as it stood when they asked: what the agent had
+    // not read by then (a stopped turn's messages) reaches it on its next
+    // turn instead of running it now (#659). Anything said since still does.
+    if (explicitPrCycle && prRequested && openPrAskedAt !== undefined && openPrAskedAt > unreadFrom()
+      && !mainUnreadSince(openPrAskedAt) && patched(OPEN_PR_AS_IT_STANDS)) heardThrough = openPrAskedAt;
+    openPrAskedAt = undefined;
     const preventsUnreadOpenPrSpin = patched('software-dev-open-pr-unread-message-spin-v1');
     const turn: Awaited<ReturnType<typeof doTurn>> = shippedBranch ? await pullRequestTurn() : mayReuseCompletedProposalForOpenPr(
       explicitPrCycle,
       prRequested,
       // Messages only for other agents are not unread by the main agent.
-      multiAgent && !mainUnread() ? seen : msgs.length,
-      seen,
+      multiAgent && !mainUnread() ? unreadFrom() : msgs.length,
+      unreadFrom(),
       preventsUnreadOpenPrSpin,
     )
       ? { completed: true, providerCompleted: true, output: '', openPrRequested: true }
@@ -4456,6 +4610,7 @@ Inspect the complete current diff and specifically compare its delta from the re
     // Sub-tasks run in the BACKGROUND: spawn is non-blocking, and answers go straight
     // down to the children they target (SPEC §5.3).
     if (turn.subTasks?.length) await spawnSubTasks(turn.subTasks);
+    await startQueuedSubTasks();
     if (turn.subTaskResponses?.length) await applySubTaskResponses(turn.subTaskResponses);
     // Agents called while the main agent worked run now, in call order, before
     // its turn is acted on: what they say may call it back (mainUnread below).
@@ -4526,7 +4681,11 @@ Inspect the complete current diff and specifically compare its delta from the re
         if (await waitAfterStop()) return await abort();
         continue;
       }
-      if (note) msgs.push({ id: `wait-${msgs.length}`, role: 'user', text: note, ts: Date.now() });
+      // Open PR ended it: the proposal goes as it stands, with no note to
+      // read first (one would run the agent before publishing).
+      const endedByOpenPr = !!needsInput && prRequested && !mainUnread() && raises.length === 0 && settled.length === 0;
+      if (note && !(endedByOpenPr && patched(OPEN_PR_AS_IT_STANDS)))
+        msgs.push({ id: `wait-${msgs.length}`, role: 'user', text: note, ts: Date.now() });
       continue;
     }
     // A job left running without pause: the agent decides what happens to it.
@@ -4567,8 +4726,9 @@ Inspect the complete current diff and specifically compare its delta from the re
         waitingFor = needsHuman
           ? { kind: 'human', audience: ['@creator'], detail: 'The managing agent has not answered its children after three reminders. Send guidance to continue.' }
           : { kind: 'subtask' };
+        openPrInert = needsHuman;
         await publish();
-        const wake = () => raises.length > 0 || settled.length > 0 || cancelled || mainUnread();
+        const wake = () => raises.length > 0 || settled.length > 0 || cancelled || mainUnread() || queuedSubTasks.length > 0;
         // If a child is still awaiting OUR reply (it raised a needs_confirmation /
         // needs_info / blocked that we drained but haven't answered), we must not
         // park forever: a child at Review neither re-raises nor settles, so `wake`
@@ -4603,6 +4763,7 @@ Inspect the complete current diff and specifically compare its delta from the re
             chosen = wake();
           }
         }
+        openPrInert = false;
         if (cancelled) return await abort();
       }
       // Otherwise the agent kept working (spawned/answered this turn) — loop and run
@@ -4631,9 +4792,11 @@ Inspect the complete current diff and specifically compare its delta from the re
       while (await core.pendingServiceConnections(taskId) && !cancelled && !mainUnread()) {
         status = 'waiting';
         waitingFor = { kind: 'human', detail: 'Connect the requested app in Approval Requests to continue.' };
+        openPrInert = true;
         await publish();
         if (patched('service-connections-signal-wait-v1')) await waitServing(() => cancelled || mainUnread());
         else await condition(() => cancelled || msgs.length > seen, '30 seconds');
+        openPrInert = false;
       }
       if (cancelled) return await abort();
       if (mainUnread()) { status = 'active'; waitingFor = undefined; continue; }
@@ -4919,7 +5082,9 @@ Inspect the complete current diff and specifically compare its delta from the re
           // unchanged — and with nothing left, it is done without a Review.
           if (shipments.length) {
             const settledAt = (name: string) => [...shipments].reverse().find((shipment) => shipment.checkout === name)?.head;
-            const own: string[] = (await core.checkoutsWithWork(world as WorldHandle, target))
+            // The world may have parked while they settled: wake it as Open PR does.
+            const withWork = () => core.checkoutsWithWork(world as WorldHandle, target);
+            const own: string[] = (await (patched(OPEN_PR_WAITS_FOR_WORLD) ? withResolve('pr', withWork) : withWork()))
               .filter((checkout) => !checkout.head || checkout.head !== settledAt(checkout.name)).map((checkout) => checkout.name);
             if (!own.length) {
               prRequested = false;
@@ -4957,7 +5122,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         // The Do agent owns commit-vs-ignore judgment. The workflow validates
         // the result, and a refused proposal goes back to the same conversation
         // instead of invoking a second "Merge" personality.
-        const readiness = await core.checkProposal(world as any);
+        const readiness = await checkProposal();
         if (!readiness.ready) {
           const detail = readiness.conflict ?? readiness.dirty ?? readiness.note ?? 'the proposal is not ready';
           msgs.push({
@@ -5135,7 +5300,7 @@ Inspect the complete current diff and specifically compare its delta from the re
       const reviewOutcome = await playReviewGate({
         turnFinished,
         ...(turn.raise ? { raise: { type: turn.raise.type } } : {}),
-        messagesSeen: seen,
+        messagesSeen: unreadFrom(),
       });
       if (reviewOutcome === 'cancelled') return await abort();
       if (reviewOutcome === 'approved') break;
@@ -6073,6 +6238,19 @@ Inspect the complete current diff and specifically compare its delta from the re
         (msgs.length > seenAtEscalation || mergeMsgs.length > mergeSeenAtEscalation)));
     waitingFor = undefined;
     if (cancelled) return await abort();
+    if (explicitPrCycle && !retryRequested && mainUnreadSince(seenAtEscalation)
+      && patched(ESCALATED_MERGE_MESSAGE_TO_DO)) {
+      // What it does with the message is new work: it goes through Review again.
+      error = undefined;
+      confirmed = false;
+      prRequested = false;
+      branchPreparedForPr = false;
+      checkoutApprovals = {};
+      mergeAttempts = 0;
+      stage = 'do';
+      status = 'active';
+      continue proposalCycle;
+    }
     stage = 'merge';
     status = 'active';
     error = undefined;
@@ -6220,7 +6398,13 @@ function conflictGuide(err: any): string | undefined {
 function innermostMessage(err: any): string {
   let e: any = err;
   let message = '';
-  for (let depth = 0; e && depth < 6; depth++) { if (e.message) message = e.message; e = e.cause; }
+  for (let depth = 0; e && depth < 6; depth++) {
+    if (e.message) message = e.message;
+    // A world the provider cannot start says so in people's words; what is
+    // under it is the provider's raw answer (pramana#79: Hetzner's JSON).
+    if (e.type === 'world-infra') break;
+    e = e.cause;
+  }
   return message || String(err);
 }
 

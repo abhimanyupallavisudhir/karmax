@@ -140,14 +140,18 @@ export interface ViewPublicationOrder {
 
 type TaskSummaryRow = { id: string; num: number | null; title: string; workflow: string; lastView: string | null };
 
-/** A related task's list fields, without its conversation. */
-function taskSummary(row: TaskSummaryRow): ChildTaskSummary {
+/** A related task's list fields, without its conversation. `params` tells a
+ * draft that never ran (a draft sub-task), which has no view of its own. */
+function taskSummary(row: TaskSummaryRow, params?: string | Record<string, unknown>): ChildTaskSummary {
   const view = row.lastView ? JSON.parse(row.lastView) as TaskView : undefined;
+  const fields = !view && params ? (typeof params === 'string' ? JSON.parse(params) : params) as Record<string, unknown> : undefined;
   return {
     id: row.id,
     ...(row.num != null ? { num: row.num } : {}),
     title: row.title,
     workflow: row.workflow,
+    ...(fields?.draft ? { lastView: { stage: 'setup', status: 'waiting',
+      state: { draft: true, ...(fields._queuedAt ? { queued: true } : {}) } } } : {}),
     ...(view ? { lastView: {
       stage: view.stage,
       status: view.status,
@@ -201,6 +205,18 @@ const PRUNE_OUTPUT_STATUS = new Set<string>(['done', 'cancelled']);
  * recovery resumes them still waiting on their requests.
  */
 const WITHDRAW_REQUESTS_STATUS = new Set<string>(['done', 'cancelled']);
+
+/** Approval asks, the events that decide them, and the events that only silence
+ * them (a person ignored the ask; the task still waits on it). As SQL lists. */
+const sqlList = (types: string[]) => types.map((type) => `'${type}'`).join(', ');
+const APPROVAL_ASKS = sqlList(['credential.approval-requested', 'permission.approval-requested',
+  'authorization.approval-requested', 'connection.requested']);
+const APPROVAL_DECISION_TYPES = ['credential.approval-resolved', 'connection.resolved',
+  'permission.approval-resolved', 'authorization.approval-resolved'];
+const APPROVAL_DISMISSAL_TYPES = ['credential.approval-dismissed', 'permission.approval-dismissed',
+  'authorization.approval-dismissed', 'connection.dismissed'];
+const APPROVAL_DECISIONS = sqlList(APPROVAL_DECISION_TYPES);
+const APPROVAL_SILENCERS = sqlList([...APPROVAL_DECISION_TYPES, ...APPROVAL_DISMISSAL_TYPES]);
 
 /**
  * Does an event type mean "a human is being asked to review this"? Such events
@@ -4241,11 +4257,11 @@ export class Store {
   /** Each child's list fields, archived children included, for its parent's
    * Sub-tasks panel (`TaskView.subTaskSummaries`). */
   async childTaskSummaries(parentTaskId: string): Promise<ChildTaskSummary[]> {
-    const rows = await this.readRows<TaskSummaryRow>(
+    const rows = await this.readRows<TaskSummaryRow & { params: string }>(
       // Children spawned in one turn share a millisecond and ids end in random
       // bytes; `ord` is the list position allocated at insert on both databases.
-      'SELECT id, num, title, workflow, lastView FROM tasks WHERE parentTaskId = ? ORDER BY createdAt, ord, rowid', [parentTaskId]);
-    return rows.map(taskSummary);
+      'SELECT id, num, title, workflow, lastView, params FROM tasks WHERE parentTaskId = ? ORDER BY createdAt, ord, rowid', [parentTaskId]);
+    return rows.map((row) => taskSummary(row, row.params));
   }
 
   /** Every task forked from this one's agents, forks of forks included, archived
@@ -5361,12 +5377,11 @@ export class Store {
   /** Approval asks on a task that no `*.approval-resolved` event has answered. */
   private async hasPendingApprovals(taskId: string, includeDismissed = false): Promise<boolean> {
     return Boolean((await this.db.prepare(`SELECT 1 FROM events e
-      WHERE e.taskId=? AND e.type IN ('credential.approval-requested', 'permission.approval-requested', 'authorization.approval-requested', 'connection.requested')
+      WHERE e.taskId=? AND e.type IN (${APPROVAL_ASKS})
         AND NOT EXISTS (SELECT 1 FROM events r WHERE r.taskId=e.taskId
-          AND r.type IN ('credential.approval-resolved', 'connection.resolved', 'permission.approval-resolved', 'authorization.approval-resolved', 'permission.approval-dismissed', 'authorization.approval-dismissed')
-          AND (?=0 OR r.type NOT IN ('permission.approval-dismissed', 'authorization.approval-dismissed'))
+          AND r.type IN (${includeDismissed ? APPROVAL_DECISIONS : APPROVAL_SILENCERS})
           AND json_extract(r.payload, '$.requestId') = json_extract(e.payload, '$.requestId'))
-      LIMIT 1`).get(taskId, includeDismissed ? 1 : 0)));
+      LIMIT 1`).get(taskId)));
   }
 
   /**
@@ -5399,9 +5414,7 @@ export class Store {
     const escalated = ev.type === 'view.updated' && ev.payload.stage === 'escalated' && !finished;
 
     // ── Discharge: drop what the task no longer needs from anybody ───────────
-    if (ev.type === 'credential.approval-resolved' || ev.type === 'connection.resolved' || ev.type === 'permission.approval-resolved'
-      || ev.type === 'authorization.approval-resolved' || ev.type === 'permission.approval-dismissed'
-      || ev.type === 'authorization.approval-dismissed') {
+    if (APPROVAL_DECISION_TYPES.includes(ev.type) || APPROVAL_DISMISSAL_TYPES.includes(ev.type)) {
       if (!(await this.hasPendingApprovals(task.id))) (await this.deleteInbox("taskId=? AND kind='approval-requested'", [task.id]));
       return;
     }
@@ -5541,9 +5554,9 @@ export class Store {
     if ((await this.db.prepare("SELECT 1 FROM inbox WHERE kind='approval-requested' LIMIT 1").get())) {
       dropped += (await this.deleteInbox(`subject IS NULL AND kind='approval-requested' AND taskId NOT IN (
         SELECT e.taskId FROM events e
-        WHERE e.type IN ('credential.approval-requested', 'permission.approval-requested', 'authorization.approval-requested', 'connection.requested')
+        WHERE e.type IN (${APPROVAL_ASKS})
           AND NOT EXISTS (SELECT 1 FROM events r WHERE r.taskId=e.taskId
-            AND r.type IN ('credential.approval-resolved', 'connection.resolved', 'permission.approval-resolved', 'authorization.approval-resolved', 'permission.approval-dismissed', 'authorization.approval-dismissed')
+            AND r.type IN (${APPROVAL_SILENCERS})
             AND json_extract(r.payload, '$.requestId') = json_extract(e.payload, '$.requestId')))`, []));
     }
     (await this.backfillEscalations());
@@ -7343,6 +7356,15 @@ export class Store {
   }
 
   /** True when the file was there to delete. */
+  /** Remove a repository's lock files not rewritten since `before`: restic
+   * refreshes a live lock every 5 minutes and counts one 30 minutes old as
+   * stale, yet still refuses to work beside it until `restic unlock`. */
+  async expireRepositoryLocks(repository: string, before: number): Promise<number> {
+    const result = (await this.db.prepare("DELETE FROM resource_repository_files WHERE repository=? AND kind='locks' AND createdAt < ?")
+      .run(repository, before)) as { changes?: number };
+    return Number(result?.changes ?? 0);
+  }
+
   async deleteRepositoryFile(repository: string, kind: string, name: string): Promise<boolean> {
     const result = (await this.db.prepare('DELETE FROM resource_repository_files WHERE repository=? AND kind=? AND name=?')
       .run(repository, kind, name)) as { changes?: number };
@@ -9751,12 +9773,10 @@ export class Store {
       viewSnapshots, publicationFences, turnSessions, permissionRequests,
       events: Number((await this.db.prepare(`DELETE FROM events WHERE seq IN
         (SELECT e.seq FROM events e WHERE e.ts<?
-          AND (e.type NOT IN ('credential.approval-requested', 'permission.approval-requested',
-            'authorization.approval-requested', 'connection.requested')
+          -- An ignored ask is still pending, so only a decision lets it age out.
+          AND (e.type NOT IN (${APPROVAL_ASKS})
             OR EXISTS (SELECT 1 FROM events r WHERE r.taskId=e.taskId
-              AND r.type IN ('credential.approval-resolved', 'permission.approval-resolved',
-                'authorization.approval-resolved', 'connection.resolved',
-                'permission.approval-dismissed', 'authorization.approval-dismissed')
+              AND r.type IN (${APPROVAL_DECISIONS})
               AND json_extract(r.payload, '$.requestId')=json_extract(e.payload, '$.requestId')))
           -- The newest published head per repository is state: force-with-lease
           -- reads it (expectedTaskRemoteHeads), however long the task was idle (audit R-8).

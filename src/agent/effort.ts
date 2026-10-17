@@ -16,15 +16,14 @@ export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
 /**
  * The single Claude default model id, shared by `defaultModel('claude')` (which
- * `seedProfiles()` stamps onto every role on first boot) and the Messages-API
- * rail's fallback for a profile with no model. It lives in this leaf module
- * precisely so those two cannot drift: they previously named `claude-sonnet-5`
- * (a model id that has never existed — the installed SDK names sonnet-4-6,
- * opus-4-6/4-8 and fable-5) and `claude-sonnet-4-5` (real, but not effort-capable,
- * so a model-less profile silently lost its reasoning effort on the metered rail).
+ * `seedProfiles()` stamps onto every role on first boot, so every organization
+ * and project without defaults of its own) and the Messages-API rail's fallback
+ * for a profile with no model. It lives in this leaf module precisely so those
+ * two cannot drift: they previously disagreed, and a model-less profile silently
+ * lost its reasoning effort on the metered rail.
  * Anything set here MUST satisfy `claudeMessagesEffort()` below.
  */
-export const CLAUDE_DEFAULT_MODEL = 'claude-sonnet-4-6';
+export const CLAUDE_DEFAULT_MODEL = 'claude-opus-5-5';
 
 /**
  * Family + generation parsed out of a Claude model id, or `undefined` when the

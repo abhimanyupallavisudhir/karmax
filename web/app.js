@@ -233,6 +233,96 @@ function installInteractionTracking() {
 }
 if (typeof document !== 'undefined') installInteractionTracking();
 
+// ── Unsaved changes ──────────────────────────────────────────────────────────
+// A form whose edits wait for a Save button marks its region `data-unsaved`
+// and that button `data-unsaved-save`. While what is on screen differs from
+// what was last saved, a `.save-state` note says "Unsaved changes" beside the
+// button. The comparison point is taken when someone starts interacting with
+// the region (it is fully loaded by then), so late hydration never reads as
+// an edit; it moves on only once a save succeeds (`markSaved`, which
+// `flashSaved` calls) or the region re-renders.
+const unsavedRegions = new WeakMap(); // region -> { baseline, pending, dirty }
+// Search boxes and menus inside pickers are navigation, not values.
+const UNSAVED_IGNORE = '.mcp-menu, .combo-menu, [role="listbox"], .mcp-filter, .payment-search, [data-unsaved-ignore]';
+function unsavedSignature(region) {
+  const parts = [];
+  for (const el of region.querySelectorAll('input, select, textarea, .mcp-picker, .task-payments, .authz-editor, [data-unsaved-value]')) {
+    if (el.closest(UNSAVED_IGNORE) || ['button', 'submit', 'reset', 'file'].includes(el.type)) continue;
+    if (el.hasAttribute('data-unsaved-value')) parts.push(el.dataset.unsavedValue);
+    else if (el.matches('.mcp-picker')) parts.push(el.dataset.value || '');
+    else if (el.matches('.task-payments')) parts.push(el.dataset.policy || '');
+    else if (el.matches('.authz-editor')) parts.push(el.dataset.authorization || '');
+    else if (el.type === 'checkbox' || el.type === 'radio') parts.push(el.checked);
+    else if (el.multiple) parts.push([...el.selectedOptions].map((option) => option.value));
+    else parts.push(el.value);
+  }
+  return JSON.stringify(parts);
+}
+function unsavedState(region) {
+  let state = unsavedRegions.get(region);
+  if (!state) unsavedRegions.set(region, state = { baseline: null, pending: null, dirty: false });
+  return state;
+}
+const SAVE_STATE_TEXT = { dirty: 'Unsaved changes', saving: 'Saving…', saved: 'Saved', error: 'Not saved' };
+/** Paint a `.save-state` note: dirty | saving | saved | error, or '' to hide it. */
+function paintSaveState(note, state, text = SAVE_STATE_TEXT[state] || '') {
+  if (!note) return;
+  note.dataset.state = state || '';
+  note.textContent = state ? text : '';
+}
+function paintUnsaved(region) {
+  const button = region.querySelector('[data-unsaved-save]');
+  if (!button) return;
+  let note = button.previousElementSibling;
+  if (!note?.matches('.save-state')) {
+    if (!unsavedState(region).dirty) return;
+    note = document.createElement('span');
+    note.className = 'save-state';
+    note.setAttribute('role', 'status');
+    button.before(note);
+  }
+  paintSaveState(note, unsavedState(region).dirty ? 'dirty' : '');
+}
+/** Re-compare a region with its saved state, e.g. after a picker outside it changed its value. */
+function checkUnsaved(el) {
+  const region = el?.closest?.('[data-unsaved]');
+  if (!region) return;
+  const state = unsavedState(region);
+  if (state.baseline == null) return;
+  state.dirty = unsavedSignature(region) !== state.baseline;
+  paintUnsaved(region);
+}
+/** The save started from `button` landed: what was on screen then is now saved. */
+function markSaved(button) {
+  const region = button?.closest?.('[data-unsaved]');
+  if (!region) return;
+  const state = unsavedState(region);
+  state.baseline = state.pending ?? unsavedSignature(region);
+  state.pending = null;
+  checkUnsaved(region);
+}
+function installUnsavedTracking() {
+  const begin = (event) => {
+    const region = event.target.closest?.('[data-unsaved]');
+    if (!region) return;
+    const state = unsavedState(region);
+    if (!state.dirty) state.baseline = unsavedSignature(region);
+  };
+  document.addEventListener('pointerdown', begin, true);
+  document.addEventListener('focusin', begin, true);
+  document.addEventListener('input', (event) => checkUnsaved(event.target));
+  document.addEventListener('change', (event) => checkUnsaved(event.target));
+  let clicked = null;
+  document.addEventListener('click', (event) => {
+    clicked = event.target.closest?.('[data-unsaved]') || null;
+    if (clicked && event.target.closest('[data-unsaved-save]')) unsavedState(clicked).pending = unsavedSignature(clicked);
+  }, true);
+  // Add/remove buttons change the form without an input event (and may remove
+  // themselves, so the region is the one found before the click ran).
+  document.addEventListener('click', () => { if (clicked?.isConnected) checkUnsaved(clicked); clicked = null; });
+}
+if (typeof document !== 'undefined') installUnsavedTracking();
+
 function actionLabel(control) {
   return String(control?.getAttribute?.('aria-label') || control?.title || control?.textContent || 'Action')
     .replace(/\s+/g, ' ').trim().slice(0, 80) || 'Action';
@@ -4383,8 +4473,8 @@ function inboxEventChanges(ev) {
   return ev.type.includes('escalat')
     || /(^|-)review-requested$/.test(ev.type.replace(/[._]/g, '-'))
     || ['task.responsibility-changed', 'task.assigned', 'task.mentioned',
-      'credential.approval-requested', 'credential.approval-resolved', 'connection.requested', 'connection.resolved',
-      'permission.approval-requested', 'permission.approval-resolved', 'permission.approval-dismissed',
+      'credential.approval-requested', 'credential.approval-resolved', 'credential.approval-dismissed',
+      'connection.requested', 'connection.resolved', 'connection.dismissed', 'permission.approval-requested', 'permission.approval-resolved', 'permission.approval-dismissed',
       'authorization.approval-requested', 'authorization.approval-resolved', 'authorization.approval-dismissed'].includes(ev.type);
 }
 let inboxRefreshTimer;
@@ -4727,7 +4817,8 @@ const LIST_RELOAD_EVENTS = new Set([
   'subtask.created',
   'task.responsibility-changed',
   'credential.approval-requested', 'connection.requested',
-  'credential.approval-resolved',
+  'credential.approval-resolved', 'connection.resolved', 'connection.updated',
+  'credential.approval-dismissed', 'connection.dismissed',
   'permission.approval-requested',
   'permission.approval-resolved',
   'permission.approval-dismissed',
@@ -4804,7 +4895,7 @@ function patchSubTaskSummaryFromEvent(ev) {
 // An approval request carries no lifecycle fields to patch, and the child's
 // summary only learns its count from the server: refetch the open parent.
 function subTaskSummaryEventNeedsRefresh(ev) {
-  if (!/\.approval-(?:requested|resolved|dismissed)$|^connection\.(?:requested|resolved)$/.test(ev.type || '')) return false;
+  if (!/\.approval-(?:requested|resolved|dismissed)$|^connection\.(?:requested|resolved|updated|dismissed)$/.test(ev.type || '')) return false;
   return (S.view?.subTaskSummaries || []).some((summary) => summary.id === ev.taskId);
 }
 
@@ -4907,7 +4998,9 @@ function connectWs() {
       if (ev.type === 'view.updated' || ev.type.includes('stage') || ev.type === 'merge.result' || ev.type === 'turn.result'
         || ev.type.endsWith('.approval-requested') || ev.type.endsWith('.approval-resolved')) {
         refreshTask(ev.type);
-      } else if (ev.type === 'session.started' || ev.type === 'review.updated' || ev.type.startsWith('connection.') || ev.type.endsWith('.approval-dismissed')) {
+      } else if (ev.type === 'session.started' || ev.type === 'review.updated' || ev.type.startsWith('connection.') || ev.type.endsWith('.approval-dismissed')
+        // A draft sub-task saved, queued or started: only the server's summaries know it.
+        || ev.type === 'subtask.created' || ev.type === 'subtask.queued' || ev.type === 'subtask.started') {
         // Mid-turn metadata changes must not clear output or patch lifecycle state.
         refreshTask(ev.type);
       } else if (ev.type !== 'agent.output') scheduleTaskPageRender(); // sub-task fan-out, pushes, PR/world events: sections derived from S.taskEvents
@@ -7957,7 +8050,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
           ${formAttemptGroup?.attempts?.length > 1 ? `<nav class="attempts-list tf-attempts" aria-label="Choose an attempt">
             ${formAttemptGroup.attempts.map((a) => attemptCard(a, formAttemptGroup, { taskId: draft.id }, { form: true })).join('')}
           </nav>` : ''}
-          <span class="tf-savestate" id="tf-savestate" aria-live="polite"></span>
+          <span class="tf-savestate save-state quiet" id="tf-savestate" role="status"></span>
           <select id="tf-wf" title="${workflowEditable ? 'Workflow' : 'Workflow is locked after the task is queued'}" ${workflowEditable ? '' : 'disabled'}>${taskFormWorkflows(wf, draft).map((w) => `<option value="${esc(w.id)}" ${w.id === wf ? 'selected' : ''}>${esc(w.label)}</option>`).join('')}</select>
         </div>
       </div>
@@ -8311,12 +8404,15 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     // in the chain runs — e.g. closeForm clears the form right after queuing the flush).
     const sig = stateSig(st);
     saveChain = saveChain.then(async () => {
-      if (!draftId && !hasContent(st)) return; // nothing worth creating a draft for yet
-      if (sig === lastSaved) return; // no change since the last write landed
-      if (activeFormToken === formToken) {
-        const ss = $('#tf-savestate');
-        if (ss) ss.textContent = editInPlace ? 'Saving…' : 'Saving draft…';
+      const current = activeFormToken === formToken;
+      // Nothing to write: the head must not keep saying "Unsaved changes".
+      if ((!draftId && !hasContent(st)) || sig === lastSaved) {
+        if (current && $('#tf-savestate')?.dataset.state === 'dirty') {
+          paintSaveState($('#tf-savestate'), draftId ? 'saved' : '', editInPlace ? 'Saved' : 'Draft saved');
+        }
+        return;
       }
+      if (current) paintSaveState($('#tf-savestate'), 'saving', editInPlace ? 'Saving…' : 'Saving draft…');
       try {
         if (!draftId) {
           const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, draft: true, allowAttenuation: true }) });
@@ -8334,15 +8430,14 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
         lastSaved = sig;
         // Quiet auto-save indicator in the page head. Guard on the form token: this
         // chain link can land after a NEWER form instance has mounted its own head.
-        if (activeFormToken === formToken) { const ss = $('#tf-savestate'); if (ss) ss.textContent = editInPlace ? 'Saved' : 'Draft saved'; }
+        if (activeFormToken === formToken) paintSaveState($('#tf-savestate'), 'saved', editInPlace ? 'Saved' : 'Draft saved');
         refreshTasks();
       } catch {
         // Auto-save used to fail silently, leaving the form looking saved while
         // the latest edit existed only in this tab. Keep the form open and the
         // dirty signature retryable, but tell the user the durable write missed.
         if (activeFormToken === formToken) {
-          const ss = $('#tf-savestate');
-          if (ss) ss.textContent = `${editInPlace ? 'Not saved' : 'Draft not saved'} — keep editing to retry`;
+          paintSaveState($('#tf-savestate'), 'error', `${editInPlace ? 'Not saved' : 'Draft not saved'} — keep editing to retry`);
         }
       }
     });
@@ -8352,8 +8447,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   // Debounced auto-save while typing.
   let saveTimer = null;
   function autoSaveSoon() {
-    const ss = $('#tf-savestate');
-    if (ss) ss.textContent = 'Unsaved changes';
+    paintSaveState($('#tf-savestate'), 'dirty');
     clearTimeout(saveTimer);
     saveTimer = setTimeout(() => { if (activeFormToken !== formToken) return; persistDraft(); }, 800);
   }
@@ -8366,7 +8460,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     forkBox?._pickResume?.(opts.fork.resumeFrom, opts.fork.task, opts.fork.session);
     clearTimeout(saveTimer);
     lastSaved = stateSig(formState());
-    $('#tf-savestate').textContent = '';
+    paintSaveState($('#tf-savestate'), '');
   }
   // The payments row fills in its inherited policy once the cards load; that is
   // not an edit either, so an untouched form stays untouched.
@@ -8423,10 +8517,9 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       submitInFlight = true;
       activeFeedback = beginActionFeedback(draftMode ? $('#tf-draft') : $('#tf-queue'));
       submitButtons.forEach((button) => { button.disabled = true; });
-      const saveState = $('#tf-savestate');
-      if (saveState) saveState.textContent = draftMode
+      paintSaveState($('#tf-savestate'), 'saving', draftMode
         ? 'Saving draft…'
-        : editInPlace ? 'Saving…' : 'Starting task…';
+        : editInPlace ? 'Saving…' : 'Starting task…');
     }
     let succeeded = false;
     clearTimeout(saveTimer);
@@ -8608,7 +8701,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
         });
         if (!succeeded) {
           const saveState = $('#tf-savestate');
-          if (saveState && !/not saved/i.test(saveState.textContent || '')) saveState.textContent = 'Not submitted — ready to retry';
+          if (saveState?.dataset.state !== 'error') paintSaveState(saveState, 'error', 'Not submitted — ready to retry');
         }
       }
     }
@@ -8997,31 +9090,36 @@ async function refreshTaskHistory(taskId) {
 const TASK_WALK_SETTLE_MS = 150;
 
 // Approval decisions load for the pages that show them: a task with pending
-// decisions (dismissed ones too: the conversation keeps them, because the agent
-// still waits), or the open approval history (UI-6). Vault item names only label
-// credential requests, so they load only when there are some.
+// decisions not ignored (the conversation shows those), or the open approval
+// history (UI-6). Vault item names only label credential requests, so they load
+// only when there are some. `force` reloads loaded ones, with the task's
+// connections, and the newest reload wins.
 function showsTaskApprovals(view) {
-  return !!(view?.approvalRequests || view?.pendingDecisions || S.approvalHistoryOpen);
+  return !!(view?.approvalRequests || S.approvalHistoryOpen);
 }
-function ensureTaskApprovals(taskId) {
-  if (S.taskApprovalsFor === taskId) return Promise.resolve();
+function ensureTaskApprovals(taskId, { force = false } = {}) {
+  if (!force && S.taskApprovalsFor === taskId) return Promise.resolve();
   const epoch = S.taskOpenEpoch;
   const inFlight = ensureTaskApprovals.pending;
-  if (inFlight?.taskId === taskId && inFlight.epoch === epoch) return inFlight.promise;
+  if (!force && inFlight?.taskId === taskId && inFlight.epoch === epoch) return inFlight.promise;
   const rec = taskRecord(taskId);
   const draft = !!rec?.params?.draft;
   const organizationId = projectById(rec?.projectId || S.projectId)?.organizationId || S.organizationId;
   const query = `taskId=${encodeURIComponent(taskId)}&organizationId=${encodeURIComponent(organizationId || '')}`;
+  // What the server counted when this read began; refreshTask reloads on any other count.
+  const count = S.view?.pendingDecisions || 0;
   const promise = (async () => {
-    const [approvalRequests, permissionRequests, authorizationRequests] = await Promise.all([
+    const [approvalRequests, permissionRequests, authorizationRequests, connections] = await Promise.all([
       draft ? [] : api(`/api/vault/requests?${query}`).catch(() => []),
       draft ? [] : api(`/api/permission-requests?${query}`).catch(() => []),
       api(`/api/authorization-requests?${query}`).catch(() => []),
+      force ? api(`/api/connections?${query}`).catch(() => undefined) : undefined,
     ]);
     const approvalItems = approvalRequests.length
       ? await api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`).catch(() => []) : [];
-    if (S.selected !== taskId || S.taskOpenEpoch !== epoch) return;
-    Object.assign(S, { approvalRequests, permissionRequests, authorizationRequests, approvalItems, taskApprovalsFor: taskId });
+    if (S.selected !== taskId || S.taskOpenEpoch !== epoch || ensureTaskApprovals.pending?.promise !== promise) return;
+    Object.assign(S, { approvalRequests, permissionRequests, authorizationRequests, approvalItems,
+      ...(connections ? { connections } : {}), taskApprovalsFor: taskId, taskApprovalsCount: count });
     scheduleTaskPageRender();
   })().finally(() => { if (ensureTaskApprovals.pending?.promise === promise) ensureTaskApprovals.pending = null; });
   ensureTaskApprovals.pending = { taskId, epoch, promise };
@@ -9194,22 +9292,18 @@ async function refreshTask(reason = 'all') {
     const rec = taskRecord(id);
     const organizationId = projectById(rec?.projectId || S.projectId)?.organizationId || S.organizationId;
     const approvalQuery = `taskId=${encodeURIComponent(id)}&organizationId=${encodeURIComponent(organizationId || '')}`;
-    const approvals = S.taskApprovalsFor === id;
     // Only what this refresh fetched is written back; the rest (undefined) keeps
     // whatever landed meanwhile, e.g. the approvals ensureTaskApprovals loaded.
     const load = (wanted, url) => wanted ? api(url).catch(() => undefined) : undefined;
-    const [view, widgets, sessions, attempts, approvalRequests, permissionRequests, authorizationRequests, approvalItems, connections] = await Promise.all([
+    const [view, widgets, sessions, attempts, connections] = await Promise.all([
       api(`/api/tasks/${id}`),
       // Widgets are resolved against the view (the rail's stage and changed
       // files), so every lifecycle publication re-resolves them.
       load(has(/view\.updated|review|stage|turn\.result/), `/api/tasks/${id}/widgets`),
       load(has(/session|turn.result|stage/), `/api/tasks/${id}/sessions?metadata=1`),
       load(has(/attempt|turn.result|merge.result/), `/api/tasks/${id}/attempts`),
-      load(approvals && has(/credential\.approval/), `/api/vault/requests?${approvalQuery}`),
-      load(approvals && has(/permission\.approval/), `/api/permission-requests?${approvalQuery}`),
-      load(approvals && has(/authorization\.approval/), `/api/authorization-requests?${approvalQuery}`),
-      load(approvals && has(/credential\.approval/), `/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`),
-      load(has(/^connection\./), `/api/connections?${approvalQuery}`),
+      // With loaded decisions, a connection event reloads them all, connections included.
+      load(has(/^connection\./) && S.taskApprovalsFor !== id, `/api/connections?${approvalQuery}`),
     ]);
     // The user may have opened another task while this websocket-driven refresh
     // was in flight. Never pair task A's response with task B's selected page.
@@ -9221,11 +9315,16 @@ async function refreshTask(reason = 'all') {
     }
     const becameDraft = !!view?.state?.draft && !S.view?.state?.draft;
     S.view = pendingCancellationView(view, id);
-    Object.assign(S, Object.fromEntries(Object.entries({ widgets, sessions, attemptGroup: attempts, approvalRequests,
-      permissionRequests, authorizationRequests, approvalItems, connections }).filter(([, value]) => value !== undefined)));
+    Object.assign(S, Object.fromEntries(Object.entries({ widgets, sessions, attemptGroup: attempts, connections })
+      .filter(([, value]) => value !== undefined)));
     // Moved back to a draft (stage picker) while open: its page becomes its form.
     if (becameDraft) showDraftPage(id);
-    if (!approvals && showsTaskApprovals(S.view)) ensureTaskApprovals(id);
+    // Loaded decisions are stale on any decision event, and whenever the view's
+    // pending count is not the one they were read at: a request whose event
+    // never reached this page (another tab, a missed publish) still shows.
+    const approvalsStale = S.taskApprovalsFor === id
+      && (has(/\.approval-|^connection\./) || (S.view.pendingDecisions || 0) !== S.taskApprovalsCount);
+    if (approvalsStale || showsTaskApprovals(S.view)) ensureTaskApprovals(id, { force: approvalsStale });
     // paramDefaults are NOT refetched here: they key off (project, workflow), which
     // can't change under a live task, so the value from openTask still holds. This
     // refresh runs on every `view.updated` WS push — re-resolving defaults would
@@ -9954,11 +10053,12 @@ function paintApprovalHistory(v) {
 }
 
 // Keep decisions in the conversation only while they still need attention.
-// Dismissal silences a notification; it does not resolve the underlying request.
+// An ignored one leaves it: still undecided (the agent waits on it), it is
+// decided from the rail's Approval requests.
 function conversationApprovalRequests() {
-  const pending = (requests) => (requests || []).filter((request) => request.status === 'pending');
-  const connections = (S.connections || []).filter((connection) =>
-    ['requested', 'connecting', 'expired'].includes(connection.status) || connection.disconnectPending);
+  const pending = (requests) => (requests || []).filter((request) => request.status === 'pending' && !request.dismissed);
+  const connections = (S.connections || []).filter((connection) => !connection.dismissed
+    && (['requested', 'connecting', 'expired'].includes(connection.status) || connection.disconnectPending));
   const rows = connectionRows(connections, true)
     + permissionRequestRows(pending(S.permissionRequests))
     + authorizationRequestRows(pending(S.authorizationRequests))
@@ -10736,7 +10836,10 @@ function parentTaskContext(v) {
 function subTaskState(rec) {
   const v = rec?.lastView || {};
   const done = v.status === 'done' || v.stage === 'done';
-  const tone = v.state?.draft ? 'draft' : done ? 'done' : v.stage === 'escalated' ? 'blocked' : v.status || 'active';
+  // A draft sub-task waits to be run; once queued, for its parent to start it.
+  if (v.state?.draft) return { label: v.state.queued ? 'queued' : 'draft', tone: v.state.queued ? 'waiting' : 'draft',
+    complete: false, approval: false, draft: !v.state.queued };
+  const tone = done ? 'done' : v.stage === 'escalated' ? 'blocked' : v.status || 'active';
   return { label: stageLabel(v), tone, complete: done, approval: !!v.approvalRequests };
 }
 
@@ -10765,15 +10868,17 @@ function subTasksSection(v) {
   const rows = children.map(({ id, rec, state }) => {
     const title = rec?.title || `Sub-task ${numLabel(id)}`;
     const childView = { workflow: rec?.workflow || v.workflow, ...(rec?.lastView || {}) };
-    return `<a class="subtask-row" data-open="${esc(id)}" data-spa href="${esc(taskUrl(id, rec))}" aria-label="Open ${esc(title)} — ${esc(state.label)}">
+    const row = `<a class="subtask-row" data-open="${esc(id)}" data-spa href="${esc(taskUrl(id, rec))}" aria-label="Open ${esc(title)} — ${esc(state.label)}">
       <span class="subtask-state ${esc(state.tone)}" aria-hidden="true"></span>
       <span class="subtask-identity">
         <span class="subtask-title">${rec?.num != null ? `<span class="task-num">#${rec.num}</span>` : ''}<strong>${esc(title)}</strong></span>
         ${subTaskStateHtml(state, 'subtask-copy')}
       </span>
-      <span class="subtask-pipeline" aria-hidden="true">${pipeline(childView)}</span>
+      <span class="subtask-pipeline" aria-hidden="true">${state.draft || state.label === 'queued' ? '' : pipeline(childView)}</span>
       <span class="subtask-arrow" aria-hidden="true">›</span>
     </a>`;
+    // A draft runs from here; it starts off this task's work as it is then.
+    return state.draft ? `<div class="subtask-draft">${row}<button type="button" class="btn sm" data-run-subtask="${esc(id)}" title="Start it from this task's current work">Run</button></div>` : row;
   }).join('');
   return `<section class="subtasks" aria-labelledby="subtasks-title">
     <div class="subtasks-head">
@@ -10992,10 +11097,18 @@ function taskRail(v, rec = taskRecord(v.taskId)) {
     ${renderWidgetGroups(S.widgets)}
     ${notesSection(v)}
     <div class="rail-links">
-      ${rec?.params?.draft ? '' : '<button type="button" class="btn tool rail-link" id="approval-history-open" title="Every app, credential and permission request this task raised">Approval requests</button>'}
+      ${rec?.params?.draft ? '' : approvalHistoryLink(v)}
       ${railTerminal(v)}
     </div>
   </div>`;
+}
+
+// The record of every request the task raised, with how many still wait on a
+// decision — ignored ones too: the agent waits on those all the same.
+function approvalHistoryLink(v) {
+  const pending = v.pendingDecisions || 0;
+  return `<button type="button" class="btn tool rail-link" id="approval-history-open" title="Every app, credential and permission request this task raised">Approval requests${pending
+    ? ` <span class="rail-link-count" aria-label="${pending} pending">${pending}</span>` : ''}</button>`;
 }
 
 // The shell, last in the rail: rarely needed. It shows in place of the
@@ -11042,6 +11155,21 @@ function wireTaskRail(v) {
     S.taskRailOverlay = false; // the shell shows in place of the floating rail
     toggleTaskTerminal(v);
   });
+  wireSubTaskDrafts(v);
+}
+
+// Run a draft sub-task: its parent starts it after its agent's current turn.
+function wireSubTaskDrafts(v) {
+  document.querySelectorAll('[data-run-subtask]').forEach((b) => b.addEventListener('click', async () => {
+    b.disabled = true;
+    try {
+      await api(`/api/tasks/${encodeURIComponent(b.dataset.runSubtask)}/queue`, { method: 'POST', body: '{}' });
+      const summary = (v.subTaskSummaries || []).find((child) => child.id === b.dataset.runSubtask);
+      if (summary) summary.lastView = { ...summary.lastView, state: { draft: true, queued: true } };
+      toast('Queued');
+      renderTaskPage();
+    } catch (e) { b.disabled = false; showTaskError(e, v.projectId); }
+  }));
 }
 
 // The page's details rail, open or closed (the header toggle, i).
@@ -11183,6 +11311,9 @@ function conversationPane(v, t) {
   const presence = conversationPresence(v, t);
   const transcripts = taskTranscripts(v);
   const followUp = (v.actions || []).find((a) => a.name === 'followUp');
+  // After Confirm the approved PR lands as it is: a message to the agent
+  // carries the work on in a new task (wiki features/continue-after-confirm).
+  const continues = followUp?.label === 'Continue';
   const canFollowUp = followUp && (!followUp.roles?.length || followUp.roles.includes(t.role));
   const requestedInput = canFollowUp ? conversationInputRequest(v, entries) : '';
   if (requestedInput && !entries.some((entry) => entry.type === 'input-request' && entry.request.text === requestedInput)) {
@@ -11205,7 +11336,7 @@ function conversationPane(v, t) {
           <div class="prompt-attach-row"><label class="attach-file-button" tabindex="0">Attach files<input class="followup-files" type="file" multiple hidden></label><span>25 MB each · 50 MB per prompt</span></div>
         </div>
         ${t.shared && stoppableAgent(v) ? stopAgentButton(stoppableAgent(v), 'btn followup-stop') : ''}
-        <button class="btn primary followup-send" data-keys="meta+Enter" ${followUp.enabled ? '' : 'disabled'}>Send</button>
+        <button class="btn primary followup-send" data-keys="meta+Enter" ${followUp.enabled ? '' : 'disabled'}${continues ? ' title="The approved PR lands as it is. The agent carries on in a new task."' : ''}>${continues ? 'Continue' : 'Send'}</button>
       </div></div>`
     : '';
   return `
@@ -12022,7 +12153,7 @@ async function openLocalCheckout(v) {
   const rec = taskRecord(v.taskId);
   const project = projectById(rec?.projectId || S.projectId);
   return cliHandoffDialog({
-    command: `npx @tavya/cli clone ${cliTarget(project, rec?.num)}`,
+    command: `npx @tavya/cli@latest clone ${cliTarget(project, rec?.num)}`,
     note: `Code, data and secrets, as this task's world has them. <span class="mono nowrap">tavya push</span> brings your work back here; <span class="mono nowrap">tavya resume --fork</span> continues its agent on your machine.`,
     gitOnly: async (body) => {
       const [plan, preparedSessions] = await Promise.all([
@@ -12051,7 +12182,7 @@ async function openLocalCheckout(v) {
 async function openProjectCheckout(project) {
   if (!project?.id) return;
   return cliHandoffDialog({
-    command: `npx @tavya/cli clone ${cliTarget(project)}`,
+    command: `npx @tavya/cli@latest clone ${cliTarget(project)}`,
     note: `Code, data and secrets, as a task's world has them. <span class="mono nowrap">tavya pull</span> and <span class="mono nowrap">tavya push</span> keep them in step.`,
     gitOnly: async (body) => {
       const plan = await api(`/api/projects/${encodeURIComponent(project.id)}/checkout`);
@@ -12158,7 +12289,7 @@ function mainAuthorityParams(v) {
         ${payments}
       </div>
       <div class="params-save-bar" data-save-state="saved">
-        <span class="params-save-status" id="tp-auth-status" role="status" aria-live="polite">All authorization changes saved</span>
+        <span class="save-state" id="tp-auth-status" role="status"></span>
         <button class="btn sm primary" id="tp-auth-save" disabled>Save authorization</button>
       </div>
     </div>` };
@@ -12204,9 +12335,12 @@ async function wireTaskAuthorization(v) {
     if (!sameJson(draft.saved, draft.values) || draft.saving) edits[v.taskId] = draft;
     else delete edits[v.taskId];
     saveBtn.disabled = draft.saving || !dirty;
-    saveBtn.textContent = draft.saving ? 'Saving authorization…' : 'Save authorization';
-    status.textContent = draft.saving ? 'Saving authorization…' : dirty ? 'Unsaved authorization changes' : 'All authorization changes saved';
-    saveBtn.closest('.params-save-bar').dataset.saveState = draft.saving ? 'saving' : dirty ? 'dirty' : 'saved';
+    const bar = saveBtn.closest('.params-save-bar');
+    const state = draft.saving ? 'saving' : dirty ? 'dirty' : 'saved';
+    // "Saved" shows once, as a save lands; an untouched form says nothing.
+    const landed = state === 'saved' && (bar.dataset.saveState === 'saving' || status.dataset.state === 'saved');
+    paintSaveState(status, state === 'saved' && !landed ? '' : state);
+    bar.dataset.saveState = state;
   };
   draft.sync = syncAuthorization;
   syncAuthorization();
@@ -12949,10 +13083,7 @@ function paramsSection(v) {
         <div class="pf-ro">${esc(triggerSummary(rec.params.triggers))}</div></div>` : '';
   const footer = editable.size
     ? `<div class="params-save-bar" data-save-state="${editDraft?.dirtyNames?.length ? 'dirty' : 'saved'}">
-        <span class="params-save-status" id="params-save-status" role="status" aria-live="polite">
-          <span class="params-save-dot" aria-hidden="true"></span>
-          <span>${editDraft?.dirtyNames?.length ? 'Unsaved parameter changes' : 'All parameter changes saved'}</span>
-        </span>
+        <span class="save-state" id="params-save-status" role="status" data-state="${editDraft?.dirtyNames?.length ? 'dirty' : ''}">${editDraft?.dirtyNames?.length ? 'Unsaved changes' : ''}</span>
         <button class="btn sm primary" id="params-save" ${editDraft?.dirtyNames?.length ? '' : 'disabled'}>Save parameter changes</button>
       </div>`
     : `<div class="task-sub" style="color:var(--ink-3)">${terminal
@@ -13099,14 +13230,13 @@ function paramDirtyNames(saved, current, fields) {
 }
 
 function setParamSaveState(root, saveBtn, status, state) {
+  // "Saved" shows once, as a save lands; an untouched form says nothing.
+  const landed = state === 'saved' && (root.dataset.saveState === 'saving' || status.dataset.state === 'saved');
   root.dataset.saveState = state;
   const bar = saveBtn.closest('.params-save-bar');
   if (bar) bar.dataset.saveState = state;
   saveBtn.disabled = state !== 'dirty';
-  saveBtn.textContent = state === 'saving' ? 'Saving parameter changes…' : 'Save parameter changes';
-  status.lastElementChild.textContent = state === 'dirty'
-    ? 'Unsaved parameter changes'
-    : state === 'saving' ? 'Saving parameter changes…' : 'All parameter changes saved';
+  paintSaveState(status, state === 'saved' && !landed ? '' : state);
 }
 
 function wireParams(v) {
@@ -13617,11 +13747,17 @@ function wireNewAgentForms(box, v, key) {
 
 // The @ menu: numbered agents, a new agent, frequently mentioned people, and a
 // searchable list of everyone. Digits pick an agent, + adds one, letters search.
+// A view update rebuilds the box while it is open and refocuses the new one, so
+// the open menu is recorded here and carries over to it, as it was.
+let openAgentMention = null; // { key, owner: the textarea, peopleMode, active }
 function wireAgentMention(ta, box, v, key) {
   if (!ta || ta.dataset.amWired) return;
   ta.dataset.amWired = '1';
   let menu = null, items = [], active = 0, token = null, peopleMode = false;
-  const close = () => { menu?.remove(); menu = null; items = []; token = null; peopleMode = false; };
+  const close = () => {
+    menu?.remove(); menu = null; items = []; token = null; peopleMode = false;
+    if (openAgentMention?.owner === ta) openAgentMention = null;
+  };
   const tokenAt = () => {
     const pos = ta.selectionStart;
     if (pos == null || pos !== ta.selectionEnd) return null;
@@ -13659,7 +13795,7 @@ function wireAgentMention(ta, box, v, key) {
     ta.dispatchEvent(new Event('input', { bubbles: true }));
   };
   const choose = (item) => {
-    if (!item || !token) return close();
+    if (!item || !token || !ta.isConnected) return close();
     if (item.kind === 'people') { peopleMode = true; active = 0; items = build(); return render(); }
     if (item.kind === 'new') {
       const agentKey = nextAgentKeyFor([...(v.participants || []).map((p) => p.key), ...Object.keys(followupNewAgents(key))]);
@@ -13671,7 +13807,7 @@ function wireAgentMention(ta, box, v, key) {
     insert(item.token || `@${item.label}`, item.selector);
   };
   const render = () => {
-    if (!menu) { menu = document.createElement('div'); menu.className = 'wiki-mention-menu agent-mention-menu'; menu.setAttribute('role', 'listbox'); document.body.appendChild(menu); }
+    if (!menu?.isConnected) { menu = openCaretMenu('wiki-mention-menu agent-mention-menu'); menu.setAttribute('role', 'listbox'); }
     const scrolled = menu.scrollTop;
     let sawAgent = false;
     menu.innerHTML = items.length ? items.map((item, i) => {
@@ -13692,6 +13828,7 @@ function wireAgentMention(ta, box, v, key) {
     placeCaretMenu(menu, ta, token.start);
     menu.scrollTop = scrolled;
     revealActiveOption(menu);
+    openAgentMention = { key, owner: ta, peopleMode, active };
   };
   const update = () => {
     token = tokenAt();
@@ -13718,6 +13855,15 @@ function wireAgentMention(ta, box, v, key) {
     else if (ev.key === 'Enter' || ev.key === 'Tab') { ev.preventDefault(); ev.stopImmediatePropagation(); choose(items[active]); }
   });
   ta.addEventListener('blur', () => setTimeout(close, 150));
+  // Focus is given back before the caret is (restoreFollowupFocus), so look once
+  // both are in place.
+  ta.addEventListener('focus', () => queueMicrotask(() => {
+    const was = openAgentMention;
+    if (!was || was.key !== key || was.owner === ta || was.owner.isConnected || document.activeElement !== ta) return;
+    openAgentMention = null;
+    peopleMode = was.peopleMode; active = was.active;
+    update();
+  }));
 }
 
 // Escalate: pass the request this task is waiting on to other people. The same
@@ -13809,6 +13955,17 @@ function wireFollowups(v) {
           delete S.followupMentions[key];
           delete S.followupNewAgents[key];
         }
+        if (result?.continuedIn) {
+          delete S.followupDrafts[key];
+          delete S.followupHeights[key];
+          images.length = 0;
+          files.length = 0;
+          toast(`Continuing in #${result.continuedIn.num ?? result.continuedIn.id}`);
+          refreshTasks();
+          const { id, num } = result.continuedIn;
+          spaNavigate(taskUrl(id, { projectId: taskRecord(v.taskId)?.projectId || S.projectId, num }));
+          return;
+        }
         // Render immediately even if this browser's event WebSocket is reconnecting.
         // The durable WS copy is de-duplicated by conversationEntries once it lands.
         if (result?.message && !S.taskEvents.some((event) => event.type === 'conversation.message' && event.payload?.message?.id === result.message.id)) {
@@ -13831,6 +13988,10 @@ function wireFollowups(v) {
         if (liveTa) liveTa.value = '';
         else if (ta) ta.value = '';
         paint();
+        // Sent: hand the keyboard back to the page (u, j/k, …), as Gmail does
+        // after a reply; f composes again. The repaint then focuses the thread.
+        const active = document.activeElement;
+        if (active?.closest?.('.followup-box')?.dataset.role === role) active.blur();
         toast(shared && to && (to.length > 1 || to[0] !== 'agent:do')
           ? `Sent to ${to.map((selector) => recipientLabel(selector, v)).join(', ')}` : 'Follow-up sent');
         renderTaskPage();
@@ -15042,6 +15203,7 @@ function fmtReset(epoch) {
 // Confirmation happens where the eye already is: the pressed button itself says
 // Saved for a moment, instead of a toast in the far corner naming wire ids.
 function flashSaved(button) {
+  markSaved(button);
   if (!button || button.dataset.flashing) return;
   button.dataset.flashing = '1';
   const label = button.textContent;
@@ -15085,7 +15247,7 @@ function settingsForms(scope, projectId) {
   // collapsed Authorization row with the authorization, vault and payment
   // defaults), the Responder, the Review route, the Computer, then branches —
   // saved together.
-  const common = `<div class="card task-defaults parameter-fields" id="task-defaults-${scope}">
+  const common = `<div class="card task-defaults parameter-fields" id="task-defaults-${scope}" data-unsaved>
       <section class="td-section td-agent"><div id="profiles-list-${scope}">Loading…</div></section>
       <section class="td-section td-routes"><div id="review-route-${scope}">Loading…</div></section>
       <section class="td-section td-computer" data-wf="__common__" data-schema-wf="software-dev" data-part="computer">
@@ -15094,16 +15256,16 @@ function settingsForms(scope, projectId) {
       <section class="td-section td-where" data-wf="__common__" data-schema-wf="software-dev">
         <div class="wf-form parameter-fields">${renderFields(commonSettingsFields(scope))}</div>
       </section>
-      <div class="td-actions"><button class="btn primary sm" data-save-task-defaults>Save task defaults</button><span class="resource-error" role="status"></span></div>
+      <div class="td-actions"><button class="btn primary sm" data-save-task-defaults data-unsaved-save>Save task defaults</button><span class="resource-error" role="status"></span></div>
     </div>`;
   const unique = wfs
     .map((s) => {
       const fields = settingsFields(s.name, scope).filter((field) => !COMMON_DEFAULT_NAMES.has(field.name));
       if (!fields.length) return '';
-      return `<details class="card" data-wf="${esc(s.name)}" ${s.name === 'software-dev' ? 'open' : ''}>
+      return `<details class="card" data-wf="${esc(s.name)}" data-unsaved ${s.name === 'software-dev' ? 'open' : ''}>
         <summary style="cursor:pointer;font-weight:600">${esc(s.name)} <span style="color:var(--ink-3);font-weight:400;font-size:12px">— workflow-specific</span></summary>
         <div class="wf-form parameter-fields" style="margin-top:10px">${renderFields(fields)}</div>
-        <button class="btn primary sm" data-save="${esc(s.name)}">Save ${esc(s.name)} defaults</button>
+        <button class="btn primary sm" data-save="${esc(s.name)}" data-unsaved-save>Save ${esc(s.name)} defaults</button>
       </details>`;
     })
     .join('');
@@ -15193,6 +15355,8 @@ async function hydrateResourceDefaults(scope, projectId, organizationId) {
     const paint = () => {
       if (summary) summary.textContent = agentAuthoritySummary(box._current(), projects);
       button.querySelector('.tf-vault-count').textContent = `${ids.size} selected`;
+      // The vault choice lives in this closure; expose it to the unsaved check.
+      box.dataset.unsavedValue = JSON.stringify([[...ids].sort(), policies]);
     };
     box._current = () => ({ authorization: readAuthorizationEditor(editor), credentialGrants: [...ids].map(id => `use-credential:item:${id}`),
       credentialPolicies: policies, paymentPolicy: readTaskPayments(payments) });
@@ -15200,7 +15364,7 @@ async function hydrateResourceDefaults(scope, projectId, organizationId) {
     editor.querySelector('.authz-level-select').title = 'The authorization a task gets unless it chooses one; never more than its creator holds. An empty project list means the task’s own project.';
     const button = box.querySelector('.resource-vault');
     button.disabled = false;
-    button.onclick = () => openVaultGrantPicker(items, ids, policies, (selected, overrides) => { ids = new Set(selected); policies = overrides; vaultDirty = true; paint(); });
+    button.onclick = () => openVaultGrantPicker(items, ids, policies, (selected, overrides) => { ids = new Set(selected); policies = overrides; vaultDirty = true; paint(); checkUnsaved(box); });
     const payments = box.querySelector('.task-payments');
     await wireTaskPayments(payments, projectId, undefined, undefined, organizationId);
     if (!current()) return;
@@ -15237,7 +15401,7 @@ async function hydrateResourceDefaults(scope, projectId, organizationId) {
 function explanationSettingsCard(scope) {
   if (!explanationsEnabled()) return '';
   const id = scope === 'project' ? 'project-explanation' : 'settings-explanation';
-  return `<div class="card explanation-settings" id="${id}">
+  return `<div class="card explanation-settings" id="${id}" data-unsaved>
     <div class="section-h">Explanation model</div>
     <p class="task-sub">Used by “Explain this” below agent messages. It always uses a registered API key, never a Codex or Claude subscription.</p>
     <div class="settings-grid">
@@ -15246,7 +15410,7 @@ function explanationSettingsCard(scope) {
       <label class="form-row wide"><span>Prompt sent to the explanation model</span><textarea class="explanation-setting-prompt" rows="5"></textarea></label>
     </div>
     <p class="task-sub explanation-setting-effective"></p>
-    <button class="btn primary sm explanation-settings-save">Save explanation defaults</button>
+    <button class="btn primary sm explanation-settings-save" data-unsaved-save>Save explanation defaults</button>
   </div>`;
 }
 
@@ -15272,21 +15436,22 @@ async function hydrateExplanationSettings(scope, projectId, organizationId) {
   prompt.placeholder = inherited.prompt;
   card.querySelector('.explanation-setting-effective').textContent = `Effective model: ${data.effective?.model || inherited.model}`;
   card.querySelector('.explanation-settings-save').addEventListener('click', async (event) => {
+    const button = event.currentTarget; // null once the save has been awaited
     const values = { endpoint: endpoint.value.trim(), model: model.value.trim(), prompt: prompt.value.trim() };
     try {
       const saved = await api(url, { method: 'PUT', body: JSON.stringify({ values }) });
       card.querySelector('.explanation-setting-effective').textContent = `Effective model: ${saved.effective.model}`;
-      flashSaved(event.currentTarget);
+      flashSaved(button);
     } catch (error) { toast(error.message, true); }
   });
 }
 
 function hostCapacityCard() {
   const fields = settingsFields('agent-queue', 'global');
-  return `<div class="card" id="host-capacity-card" data-wf="agent-queue">
+  return `<div class="card" id="host-capacity-card" data-wf="agent-queue" data-unsaved>
     <div class="wf-form parameter-fields">${renderFields(fields)}</div>
-    <button class="btn primary sm" id="host-capacity-save">Save</button>
-    <div class="setting-rows ruled" style="margin-top:14px"><div class="setting-row">
+    <button class="btn primary sm" id="host-capacity-save" data-unsaved-save>Save</button>
+    <div class="setting-rows ruled" style="margin-top:14px" data-unsaved-ignore><div class="setting-row">
       <label class="setting-label" for="timing-enabled">Response timing ${policyTip('Record response measurements and show the Timing tab. Existing measurements are kept when off.')}</label>
       <span class="setting-value"></span>
       <span class="setting-actions"><input class="toggle" type="checkbox" id="timing-enabled" ${S.meta?.timingEnabled ? 'checked' : ''}></span>
@@ -15304,10 +15469,11 @@ async function wireHostCapacityCard() {
   const inherited = Object.fromEntries(fields.filter((f) => f.default !== undefined).map((f) => [f.name, f.default]));
   card.querySelector('.wf-form').innerHTML = renderFields(fields, own, inherited);
   card.querySelector('#host-capacity-save')?.addEventListener('click', async (event) => {
+    const button = event.currentTarget; // null once the save has been awaited
     const values = collectForm(card.querySelector('.wf-form'), fields);
     try {
       await api('/api/settings/global/agent-queue', { method: 'PUT', body: JSON.stringify({ values }) });
-      flashSaved(event.currentTarget);
+      flashSaved(button);
     } catch (error) { toast(error.message, true); }
   });
 }
@@ -15922,6 +16088,16 @@ function textareaCaretXY(ta, pos) {
 }
 // A caret menu opens below the caret's line, or above it when there is more room
 // there, and stays inside the viewport — scrolling rather than running off it.
+// One caret menu (@ or [[) at a time, on <body> so no box clips it. Opening one
+// removes any other, including one left by a box a re-render replaced (its
+// options would write into a box no longer on the page).
+function openCaretMenu(className) {
+  document.querySelectorAll('.wiki-mention-menu').forEach((other) => other.remove());
+  const menu = document.createElement('div');
+  menu.className = className;
+  document.body.appendChild(menu);
+  return menu;
+}
 function placeCaretMenu(menu, ta, pos) {
   const edge = 8, xy = textareaCaretXY(ta, pos);
   const below = window.innerHeight - xy.top - edge, above = xy.lineTop - edge;
@@ -16004,7 +16180,7 @@ function wireWikiMention(ta, projectId) {
 
   const highlight = () => menu?.querySelectorAll('.wm-opt').forEach((el, i) => el.classList.toggle('active', i === active));
   const choose = (s) => {
-    if (!s || !token) return close();
+    if (!s || !token || !ta.isConnected) return close();
     const insert = `${tokenFor(s)} `;
     ta.value = ta.value.slice(0, token.start) + insert + ta.value.slice(token.end);
     const caret = token.start + insert.length;
@@ -16014,7 +16190,7 @@ function wireWikiMention(ta, projectId) {
     ta.dispatchEvent(new Event('input', { bubbles: true }));
   };
   const render = () => {
-    if (!menu) { menu = document.createElement('div'); menu.className = 'wiki-mention-menu'; document.body.appendChild(menu); }
+    if (!menu?.isConnected) menu = openCaretMenu('wiki-mention-menu');
     menu.innerHTML = items.length ? items.map((s, i) => `
       <div class="wm-opt ${i === active ? 'active' : ''}" data-i="${i}">
         <span class="wm-glyph">${glyph(s)}</span>
@@ -16317,7 +16493,7 @@ function settingsView(proj) {
     <div class="project-config-section" id="project-services"><div><h2>Services ${policyTip('Live systems tasks connect to. Use an external service for an API, hosted database or S3 bucket that tasks call directly, and a per-task container for an isolated dependency such as Postgres or Redis. Credentials belong in Secrets.')}</h2></div></div>
     <div class="card"><div id="project-services-box">Loading…</div></div>
     <div class="project-config-section" id="project-environment"><div><h2>Environment ${policyTip('The base image, tools, setup and boot commands every task starts with.')}</h2></div></div>
-    <div class="card"><div id="project-environment-box">Loading…</div></div>
+    <div class="card"><div id="project-environment-box" data-unsaved>Loading…</div></div>
     <div class="project-config-section" id="project-computers"><div><h2>Computers ${policyTip('The cloud computers this organization’s tasks run on. A task’s own computer—its size, experience and network—is set in Task defaults and the task form.')}</h2></div></div>
     <div class="card"><div class="setting-rows"><div class="setting-row"><span class="setting-label">Cloud computers</span>
       <span class="setting-value setting-muted">Shared by the organization’s projects</span>
@@ -16338,9 +16514,9 @@ function settingsView(proj) {
       <div class="setting-rows" id="wf-pins-list">Loading…</div></div>
     <div class="settings-section-title" id="project-advanced" data-settings-advanced hidden><div>Advanced</div></div>
     <div class="card" data-settings-advanced hidden><div class="setting-rows">
-      <div class="setting-row" data-settings-access="project" hidden><span class="setting-label">Name ${policyTip('Use / to put the project in folders, e.g. Clients/Website.')}</span>
+      <div class="setting-row" data-settings-access="project" data-unsaved hidden><span class="setting-label">Name ${policyTip('Use / to put the project in folders, e.g. Clients/Website.')}</span>
         <span class="setting-value"><input id="project-name" class="setting-input" value="${esc(projectPath(proj))}" placeholder="Folder/Project" aria-label="Project name, including folders"></span>
-        <span class="setting-actions"><button class="btn sm primary" id="rename-project">Save</button></span></div>
+        <span class="setting-actions"><button class="btn sm primary" id="rename-project" data-unsaved-save>Save</button></span></div>
       <div class="setting-row" data-settings-access="projectTransfer" hidden><span class="setting-label">Organization</span>
         <span class="setting-value">${esc(organizationById(proj.organizationId)?.name || '')}</span>
         <span class="setting-actions"><button class="btn sm" id="move-project">Move…</button></span></div>
@@ -16838,7 +17014,7 @@ async function hydrateProjectEnvironment(proj) {
         <label class="form-row wide"><span title="Runs as each task starts">Boot commands</span><textarea id="environment-boot" rows="3" placeholder="npm run db:migrate&#10;python manage.py migrate&#10;uv run python manage.py migrate">${esc((spec?.boot || []).join('\n'))}</textarea></label>
         <label class="switch form-row wide"><input id="environment-docker" type="checkbox" ${spec?.includeDocker ? 'checked' : ''}><span><b>Include Docker</b><small class="field-help">Required when per-task Services run as containers inside the world.</small></span></label>
       </div>
-      <div class="project-form-actions"><button class="btn sm" id="environment-save">Save recipe</button><button class="btn sm primary" id="environment-build">Build now</button></div>
+      <div class="project-form-actions"><button class="btn sm" id="environment-save" data-unsaved-save>Save recipe</button><button class="btn sm primary" id="environment-build">Build now</button></div>
       ${builds.length ? `<div class="section-h">Builds</div>${builds.map(build).join('')}` : ''}`;
     box.querySelectorAll('[data-environment-recover]').forEach(button => button.addEventListener('click', async () => {
       const record = builds.find(build => build.recoveryRevision === button.dataset.environmentRecover);
@@ -16872,6 +17048,7 @@ async function hydrateProjectEnvironment(proj) {
         box.querySelector('#environment-evidence').innerHTML = proposal.evidence.length
           ? `<p class="task-sub">Evidence: ${proposal.evidence.map(esc).join(' · ')}</p>`
           : '<p class="task-sub">No devcontainer or recognized lockfile found.</p>';
+        checkUnsaved(box);
       } catch (error) { toast(error.message, true); }
     });
     box.querySelector('#environment-save')?.addEventListener('click', async () => {
@@ -17443,10 +17620,10 @@ async function hydrateSettingsAccess(scope) {
  * everyone, including on the sign-in screen before any organization is known. */
 function appearanceCard() {
   return `<div class="card" id="appearance-card">
-      <div class="setting-rows" style="margin-bottom:14px"><div class="setting-row">
+      <div class="setting-rows" style="margin-bottom:14px"><div class="setting-row" data-unsaved>
         <label class="setting-label" for="site-name">Site name ${policyTip('Shown in the console, the sign-in screen, the browser tab, the installed app and account email.')}</label>
         <span class="setting-value"><input id="site-name" class="setting-input" maxlength="48" autocomplete="off" /></span>
-        <span class="setting-actions"><button class="btn sm primary" id="site-name-save" type="button">Save</button></span>
+        <span class="setting-actions"><button class="btn sm primary" id="site-name-save" type="button" data-unsaved-save>Save</button></span>
       </div></div>
       <div class="brand-picker" id="brand-picker">
         ${BRAND_ICON_CHOICES.map((c) => `<button type="button" class="brand-option" data-icon="${esc(c.id)}" aria-pressed="false">
@@ -17511,7 +17688,7 @@ async function wireAppearanceCard() {
 
 function globalSettingsView(embedded = false) {
   return `
-    ${embedded ? '<div class="settings-section-title" id="settings-defaults"><div>Task defaults ${policyTip(`How new tasks begin, unless a project or task says otherwise`)}</div></div>' : '<div class="page-title">Organization settings</div><p style="color:var(--ink-2);margin-top:-8px">How new tasks behave unless a project or task deliberately changes something.</p>'}
+    ${embedded ? `<div class="settings-section-title" id="settings-defaults"><div>Task defaults ${policyTip('How new tasks begin, unless a project or task says otherwise')}</div></div>` : '<div class="page-title">Organization settings</div><p style="color:var(--ink-2);margin-top:-8px">How new tasks behave unless a project or task deliberately changes something.</p>'}
     ${settingsForms('global')}
     <div class="settings-section-title" id="settings-payments"><div>Passwords &amp; payments ${policyTip(`Credentials agents may use on your behalf, and what tasks may spend`)}</div></div>
     <div class="card" id="settings-connections"><div class="section-h">Connected apps ${policyTip('Apps agents can use through MCP or Composio. Choose which ones new tasks get in Task defaults.')}</div>
@@ -17890,7 +18067,7 @@ function paymentsCard(scope) {
 }
 
 function stripePlatformCard() {
-  return '<div class="card" id="stripe-platform-card"><div class="task-sub">Loading Stripe platform setup…</div></div>';
+  return '<div class="card" id="stripe-platform-card" data-unsaved><div class="task-sub">Loading Stripe platform setup…</div></div>';
 }
 
 async function wireStripePlatformCard() {
@@ -17912,7 +18089,7 @@ async function wireStripePlatformCard() {
       <label class="form-row">OAuth callback URL<input value="${esc(platform.callbackUrl)}" readonly /></label>
       <label class="form-row">Webhook destination URL<input value="${esc(platform.webhookUrl)}" readonly /></label>
     </div>
-    <button class="btn sm primary stripe-platform-save">Save Stripe platform setup</button>
+    <button class="btn sm primary stripe-platform-save" data-unsaved-save>Save Stripe platform setup</button>
     ${platform.source === 'environment' ? '<p class="task-sub">Environment values currently supply this setup. Saved replacements use the encrypted vault and take precedence.</p>' : ''}`;
   box.querySelector('.stripe-platform-save')?.addEventListener('click', async (event) => {
     try {
@@ -17928,7 +18105,7 @@ async function wireStripePlatformCard() {
 }
 
 function paidLaunchCard() {
-  return '<div class="card" id="paid-launch-card"><div class="task-sub">Loading paid-launch setup…</div></div>';
+  return '<div class="card" id="paid-launch-card" data-unsaved><div class="task-sub">Loading paid-launch setup…</div></div>';
 }
 
 async function wirePaidLaunchCard() {
@@ -18013,7 +18190,7 @@ async function wirePaidLaunchCard() {
     <div class="card" style="margin-top:18px;padding:14px;border-color:${state.paidLaunch ? 'var(--ok,#4ec9a3)' : 'var(--line)'}">
       <label style="display:flex;gap:10px;align-items:flex-start"><input type="checkbox" class="paid-launch-enabled" ${state.paidLaunch ? 'checked' : ''} ${state.canEnable || state.paidLaunch ? '' : 'disabled'} /><span><b>Enable real paid checkout</b><span class="task-sub" style="display:block">Requires completed legal and live billing setup. Disabling closes new checkout without deleting existing subscriptions.</span></span></label>
     </div>
-    <button class="btn primary paid-launch-save" style="margin-top:14px" ${state.canManage ? '' : 'disabled'}>Save paid-launch setup</button>
+    <button class="btn primary paid-launch-save" style="margin-top:14px" ${state.canManage ? '' : 'disabled'} data-unsaved-save>Save paid-launch setup</button>
     ${state.source === 'environment-bootstrap' ? '<p class="task-sub">Legacy environment values may currently be supplying some fields. Saving this form moves the editable configuration into Installation settings; saved values take precedence.</p>' : ''}`;
   box.querySelector('.paid-launch-save')?.addEventListener('click', async () => {
     try {
@@ -18514,12 +18691,13 @@ function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = 
     ? pending.map((request) => {
       const bound = request.itemId ? undefined : credentialRequestBindings.get(request.id);
       const unbound = !request.itemId && !bound;
-      return `<div class="approval-request" data-vreq="${esc(request.id)}"${bound ? ` data-vreq-item="${esc(bound.id)}"` : ''}>
+      return `<div class="approval-request${request.dismissed ? ' approval-request-dismissed' : ''}" data-vreq="${esc(request.id)}"${bound ? ` data-vreq-item="${esc(bound.id)}"` : ''}>
         <div class="approval-request-main">
           <div class="approval-request-title">${request.itemId
             ? esc(itemLabel(request.itemId))
             : `${esc(request.domain || '?')} <span class="chip approval-needed">not in vault</span>`}
             ${request.kind === 'reset' ? '<span class="chip approval-needed">reported invalid</span>' : `<span class="chip">${esc(request.mode)}</span>`}
+            ${request.dismissed ? ignoredChip() : ''}
           </div>
           <div class="task-sub">${credentialRequestTaskLink(request)}${request.why ? ` — ${esc(request.why)}` : ''}</div>
           ${request.kind === 'reset' ? `<div class="approval-request-help">The stored secret failed. Update it or send the task a reset code, then approve; ${siteNameMarkup()} will resume the agent automatically.</div>`
@@ -18533,6 +18711,7 @@ function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = 
           <button class="btn sm" data-vreq-act="task" ${unbound ? 'disabled' : ''}>This task</button>
           <button class="btn sm" data-vreq-act="always" ${unbound ? 'disabled' : ''}>Always</button>
           <button class="btn sm" data-vreq-act="deny">Deny</button>
+          ${request.dismissed ? '' : ignoreRequestButton('data-vreq-act')}
           ${policyTip(`Once: ${({
             passkey: 'Loads this passkey into the agent\'s browser for one sign-in session, up to 3 minutes. The agent can use it on the site until then.',
             session: 'Signs the agent\'s browser into this site once. It stays signed in until the site ends the session.',
@@ -18562,7 +18741,7 @@ function permissionRequestRows(requests, { historyLimit = 20 } = {}) {
   const pendingHtml = pending.map((request) => `<div class="approval-request${request.dismissed ? ' approval-request-dismissed' : ''}" data-preq="${esc(request.id)}">
     <div class="approval-request-main">
       <div class="approval-request-title">${esc(request.role || 'task')} agent permission
-        ${request.dismissed ? '<span class="chip">dismissed</span>' : '<span class="chip approval-needed">approval needed</span>'}
+        ${request.dismissed ? ignoredChip() : '<span class="chip approval-needed">approval needed</span>'}
       </div>
       <div class="approval-request-caps">${request.capabilities.map((capability) =>
         `<span class="chip mono">${esc(capability)}</span>`).join(' ')}</div>
@@ -18576,7 +18755,7 @@ function permissionRequestRows(requests, { historyLimit = 20 } = {}) {
     <div class="approval-request-actions">
       <button class="btn sm primary" data-preq-act="approve">Approve for agent</button>
       <button class="btn sm" data-preq-act="deny">Deny</button>
-      ${!request.dismissed ? '<button class="btn sm" data-preq-act="dismiss" aria-label="Dismiss request" title="Dismiss without notifying the agent">×</button>' : ''}
+      ${request.dismissed ? '' : ignoreRequestButton('data-preq-act')}
     </div>
   </div>`).join('');
   const history = recent.length
@@ -18597,7 +18776,7 @@ function authorizationRequestRows(requests, { historyLimit = 20 } = {}) {
     return `<div class="approval-request${request.dismissed ? ' approval-request-dismissed' : ''}" data-areq="${esc(request.id)}">
     <div class="approval-request-main">
       <div class="approval-request-title">${request.target.kind === 'avatar' ? 'Avatar' : 'Task agent'} authorization
-        ${request.dismissed ? '<span class="chip">dismissed</span>' : '<span class="chip approval-needed">approval needed</span>'}
+        ${request.dismissed ? ignoredChip() : '<span class="chip approval-needed">approval needed</span>'}
       </div>
       <div class="approval-request-caps"><span class="chip">${esc(authorizationSummary(request.authorization,
         S.projects.filter((project) => project.organizationId === request.organizationId)))}</span></div>
@@ -18610,7 +18789,7 @@ function authorizationRequestRows(requests, { historyLimit = 20 } = {}) {
     <div class="approval-request-actions">
       ${canResolve ? '<button class="btn sm primary" data-areq-act="approve">Approve authorization</button><button class="btn sm" data-areq-act="deny">Deny</button>'
         : '<span class="task-sub">Awaiting a routed approver</span>'}
-      ${canResolve && !request.dismissed ? '<button class="btn sm" data-areq-act="dismiss" aria-label="Dismiss request" title="Dismiss without notifying the agent">×</button>' : ''}
+      ${canResolve && !request.dismissed ? ignoreRequestButton('data-areq-act') : ''}
     </div>
   </div>`;
   }).join('');
@@ -18630,7 +18809,7 @@ function wireAuthorizationRequestActions(root, organizationId, onResolved) {
         const result = await api(`/api/authorization-requests/${row.dataset.areq}/resolve?organizationId=${encodeURIComponent(organizationId || '')}`, {
           method: 'POST', body: JSON.stringify({ action: button.dataset.areqAct }),
         });
-        toast(button.dataset.areqAct === 'dismiss' ? 'Request dismissed' : button.dataset.areqAct === 'deny' ? 'Authorization denied'
+        toast(button.dataset.areqAct === 'dismiss' ? 'Request ignored' : button.dataset.areqAct === 'deny' ? 'Authorization denied'
           : result.queued ? 'Approved — task queued' : 'Authorization approved');
         await onResolved?.(result);
       } catch (error) { button.disabled = false; toast(error.message, true); }
@@ -18647,7 +18826,7 @@ function wirePermissionRequestActions(root, organizationId, onResolved) {
           method: 'POST',
           body: JSON.stringify({ action: button.dataset.preqAct }),
         });
-        const decision = button.dataset.preqAct === 'dismiss' ? 'Request dismissed' : button.dataset.preqAct === 'deny' ? 'Denied' : 'Approved';
+        const decision = button.dataset.preqAct === 'dismiss' ? 'Request ignored' : button.dataset.preqAct === 'deny' ? 'Denied' : 'Approved';
         toast(button.dataset.preqAct === 'dismiss' ? decision : result.resume?.resumed ? `${decision} — task resumed automatically`
           : `${decision}${result.resume?.reason ? ` — ${result.resume.reason}` : ''}`,
         button.dataset.preqAct !== 'dismiss' && !result.resume?.resumed && !!result.resume?.reason);
@@ -18688,6 +18867,11 @@ function wireCredentialRequestActions(root, organizationId, onResolved) {
         method: 'POST',
         body: JSON.stringify({ action: button.dataset.vreqAct, itemId }),
       });
+      if (button.dataset.vreqAct === 'dismiss') {
+        toast('Request ignored');
+        await onResolved?.(result);
+        return;
+      }
       credentialRequestBindings.delete(row.dataset.vreq);
       const decision = button.dataset.vreqAct === 'deny' ? 'Denied' : 'Granted';
       toast(result.resume?.resumed ? `${decision} — task resumed automatically`
@@ -18731,13 +18915,14 @@ function connectionRows(connections, inTask = false) {
     const accountNames = connectionAccountNames(reusable);
     const status = { requested: c.reusable?.length ? 'access requested' : 'sign-in needed', connecting: 'waiting for sign-in', active: 'connected', expired: 'reconnect needed', disconnected: 'disconnected', denied: 'declined' }[c.status] || c.status;
     const projects = S.projects.filter(p => p.organizationId === c.organizationId);
-    return `<div class="approval-request" data-connection="${esc(c.id)}">
-      <div class="approval-request-main"><div class="approval-request-title">${esc(c.label)} <span class="chip">${esc(status)}</span></div>
+    const open = ['requested', 'connecting'].includes(c.status);
+    return `<div class="approval-request${open && c.dismissed ? ' approval-request-dismissed' : ''}" data-connection="${esc(c.id)}">
+      <div class="approval-request-main"><div class="approval-request-title">${esc(c.label)} <span class="chip">${esc(status)}</span>${open && c.dismissed ? ` ${ignoredChip()}` : ''}</div>
         ${c.why && inTask ? `<p class="task-sub">${esc(c.why)}</p>` : ''}
         <p class="task-sub">${c.taskId ? 'This account may be used by the requesting task.' : 'Private until you share it with a project.'}</p>
-        ${own && !inTask ? `<details><summary>Project access</summary><p class="task-sub">Selected projects may run app actions using this account, within the permissions you granted at sign-in.</p>
+        ${own && !inTask ? `<details data-unsaved><summary>Project access</summary><p class="task-sub">Selected projects may run app actions using this account, within the permissions you granted at sign-in.</p>
           ${projects.map(p => `<label class="connection-project"><input type="checkbox" value="${esc(p.id)}" ${c.projectIds.includes(p.id) ? 'checked' : ''}> ${esc(p.name)}</label>`).join('')}
-          <button type="button" class="btn sm" data-connection-action="access">Save access</button></details>` : ''}
+          <button type="button" class="btn sm" data-connection-action="access" data-unsaved-save>Save access</button></details>` : ''}
         <span data-connection-result role="status"></span>
       </div><div class="approval-request-actions">
         ${reusable.length > 1 ? `<select class="connection-account" data-connection-account aria-label="Account" title="Your connected accounts, newest first">${reusable.map((account, i) => `<option value="${esc(account.id)}">${esc(accountNames[i])}</option>`).join('')}</select>` : ''}
@@ -18746,8 +18931,19 @@ function connectionRows(connections, inTask = false) {
         ${own && c.status === 'connecting' ? '<button type="button" class="btn sm" data-connection-action="restart">Start again</button>' : ''}
         ${own && !c.grantedConnectionId && ['active', 'connecting'].includes(c.status) ? '<button type="button" class="btn sm" data-connection-action="refresh">Check status</button>' : ''}
         ${canConnect && (c.status !== 'disconnected' || c.disconnectPending) ? `<button type="button" class="btn sm" data-connection-action="disconnect">${c.disconnectPending ? 'Retry disconnect' : c.grantedConnectionId ? 'Revoke' : c.ownerId ? 'Disconnect' : 'Decline'}</button>` : ''}
+        ${canConnect && inTask && open && !c.dismissed ? ignoreRequestButton('data-connection-action') : ''}
       </div></div>`;
   }).join('');
+}
+
+// Ignoring a request silences it — no inbox row, alert or "approval needed"
+// badge — without answering it: the agent keeps waiting, and the request stays
+// in Approval requests (and the rail's count) until someone decides it.
+function ignoredChip() {
+  return '<span class="chip">ignored</span>';
+}
+function ignoreRequestButton(attribute) {
+  return `<button type="button" class="btn sm" ${attribute}="dismiss" aria-label="Ignore request" title="Ignore: no more notifications. It stays in Approval requests.">×</button>`;
 }
 
 /** Distinct names for a person's accounts of one app: its name, then when each was connected. */
@@ -18793,6 +18989,7 @@ function wireConnectionActions(root, organizationId, refresh) {
       } else {
         const body = action === 'access' ? { projectIds: [...row.querySelectorAll('input:checked')].map(input => input.value) } : {};
         await api(`/api/connections/${encodeURIComponent(id)}/${action}${oq}`, { method: action === 'access' ? 'PUT' : 'POST', body: JSON.stringify(body) });
+        if (action === 'dismiss') toast('Request ignored');
         await refresh();
       }
     } catch (e) { popup?.close(); toast(e.message, true); }
@@ -20915,11 +21112,11 @@ function accountErasureMarkup(preview) {
     ${record ? `<p class="task-sub">${esc(record.state)} · completed cleanup: ${esc(record.steps.join(', '))}${record.retryRequired ? ' · cleanup incomplete; retry required' : ''}${due ? ' · retention review overdue' : ''}</p>
       <a class="btn sm" href="/api/users/${encodeURIComponent(preview.userId)}/erasure/export" download>Download suppression manifest</a>
       <p class="task-sub">Keep the manifest securely outside the backup restore set. Reapply its closure and content actions before restoring service. This is a manual recovery control, not an automatic restore filter.</p>
-      ${closed ? record.items.map((item, index) => `<div class="card" data-erasure-item="${index}"><p>${esc(item.label)}</p>
+      ${closed ? record.items.map((item, index) => `<div class="card" data-erasure-item="${index}" data-unsaved><p>${esc(item.label)}</p>
         <label class="form-row">Outcome<select data-erasure-outcome><option value="">Unreviewed</option>${['erased', 'redacted', 'retained', 'not-applicable'].map(outcome => `<option value="${outcome}" ${item.decision?.outcome === outcome ? 'selected' : ''}>${outcome}</option>`).join('')}</select></label>
         <label class="form-row">Evidence / controller instructions / lawful retention reason<textarea data-erasure-evidence maxlength="4000" placeholder="References and reasoning only; do not copy personal content.">${esc(item.decision?.evidence || '')}</textarea></label>
         <label class="form-row">Review / expiry date (required for retention and backups)<input type="date" data-erasure-review-at value="${item.decision?.reviewAt ? new Date(item.decision.reviewAt).toISOString().slice(0, 10) : ''}"></label>
-        <button class="btn sm" data-erasure-save="${index}">Save decision</button></div>`).join('') : ''}
+        <button class="btn sm" data-erasure-save="${index}" data-unsaved-save>Save decision</button></div>`).join('') : ''}
       ${closed ? `<p class="task-sub">Review completion records your decisions; it is not proof of universal erasure. Retention exceptions remain subject to their review dates.</p>
         <label class="form-row">Type REVIEWED ${esc(preview.userId)}<input id="erasure-reviewed" autocomplete="off"></label>
         <button class="btn" id="erasure-complete" ${record.items.some(item => !item.decision) || due ? 'disabled' : ''}>Mark review complete</button>` : ''}` : ''}
@@ -21041,11 +21238,11 @@ function serviceLimitEditorMarkup(view, service) {
   const organization = ['e2b', 'daytona', 'agentmail'].includes(service.id) ? field('Account of',
     `<select data-operator-organization>${(S.organizations || []).map((organization) => `<option value="${esc(organization.id)}" ${organization.id === view.operatorOrganizationId ? 'selected' : ''}>${esc(organization.name)}</option>`).join('')}</select>`,
     'The organization whose E2B, Daytona and AgentMail connections are yours.') : '';
-  return `<div class="limits-editor" data-limits-editor="${esc(service.id)}">
+  return `<div class="limits-editor" data-limits-editor="${esc(service.id)}" data-unsaved>
     ${field('Plan', `<input data-plan maxlength="60" value="${esc(service.planSource === 'entered' ? service.plan : '')}" placeholder="${esc(service.planSource !== 'entered' && service.plan ? service.plan : 'Plan name')}">`)}
     ${limits}${cloudflare}${organization}
     ${field('Upgrade link', `<input type="url" data-link value="" placeholder="${esc(service.link?.url || 'https://…')}">`)}
-    <div class="limits-editor-actions"><button type="button" class="btn sm primary" data-limits-save>Save</button>
+    <div class="limits-editor-actions"><button type="button" class="btn sm primary" data-limits-save data-unsaved-save>Save</button>
       <button type="button" class="btn sm" data-limits-reset title="Use the published plan, limits and link">Reset</button>
       <button type="button" class="btn sm" data-limits-cancel>Cancel</button></div>
   </div>`;
@@ -21118,7 +21315,7 @@ function installationView() {
       <div class="settings-section-title" id="installation-stripe"><div>Agent cards ${policyTip(`Optional Stripe Connect application for cards agents spend from—not SaaS subscriptions`)}</div></div>${stripePlatformCard()}
       <div class="settings-section-title" id="installation-email"><div>Email ${policyTip(`Account confirmation, password reset, and organization invitations`)}</div></div>${outboundEmailCard()}
       <div class="settings-section-title" id="installation-access"><div>Phone access ${policyTip(`Secure reachability for this host`)}</div></div>${phone}
-      ${S.meta.hosted ? '<div class="settings-section-title" id="installation-users"><div>Users ${policyTip(`Close a person’s account and erase their data`)}</div></div><div class="card" id="installation-users-card">Loading users…</div>' : ''}
+      ${S.meta.hosted ? `<div class="settings-section-title" id="installation-users"><div>Users ${policyTip('Close a person’s account and erase their data')}</div></div><div class="card" id="installation-users-card">Loading users…</div>` : ''}
     </div>
   </div></div>`;
 }
@@ -21519,9 +21716,9 @@ function organizationView() {
 
     <div class="settings-section-title" id="settings-advanced" data-settings-advanced hidden><div>Advanced</div></div>
     <div class="card" data-settings-access="organization" hidden><div class="setting-rows">
-      <div class="setting-row"><span class="setting-label">Name ${policyTip('Also its web address. Links to the old one keep working.')}</span>
+      <div class="setting-row" data-unsaved><span class="setting-label">Name ${policyTip('Also its web address. Links to the old one keep working.')}</span>
         <span class="setting-value"><input id="organization-name" class="setting-input" value="${esc(org?.name || '')}" aria-label="Organization name"></span>
-        <span class="setting-actions"><button class="btn sm primary" id="rename-organization">Save</button></span></div>
+        <span class="setting-actions"><button class="btn sm primary" id="rename-organization" data-unsaved-save>Save</button></span></div>
       <div class="setting-row"><span class="setting-label">Data ${policyTip('A readable JSON archive of this organization, grouped into complete record collections. Passwords, tokens and stored credentials are never included.')}</span>
         <span class="setting-value setting-muted">JSON archive</span>
         <span class="setting-actions"><button class="btn sm" id="export-organization" type="button">Export</button></span></div>
@@ -21529,7 +21726,7 @@ function organizationView() {
         <span class="setting-value setting-muted">Permanent</span>
         <span class="setting-actions"><button class="btn sm danger" id="delete-organization">Delete…</button></span></div>` : ''}
     </div></div>
-    <details class="card settings-disclosure" data-settings-access="organization" hidden><summary><b>Single sign-on &amp; directory sync</b><span>For companies with an identity provider</span></summary><p class="task-sub">OIDC signs employees in through your company; SCIM adds, removes and groups them. Use the values your identity administrator gives you.</p><div id="org-identity">Loading…</div></details>
+    <details class="card settings-disclosure" data-settings-access="organization" hidden><summary><b>Single sign-on &amp; directory sync</b><span>For companies with an identity provider</span></summary><p class="task-sub">OIDC signs employees in through your company; SCIM adds, removes and groups them. Use the values your identity administrator gives you.</p><div id="org-identity" data-unsaved>Loading…</div></details>
     <div class="settings-section-title" id="settings-experimental"><div>Experimental ${policyTip(`Optional features for this organization`)}</div></div>
     ${AVATAR_RISK_NOTE}
     <div class="card"><div id="organization-avatar-settings">Loading…</div></div>
@@ -21926,9 +22123,9 @@ async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
       if (identityPolicy) $('#org-identity').innerHTML = `<label class="form-row">OIDC provider ID<input id="oidc-provider" value="${esc(identityPolicy.oidcProviderId || S.sso?.providerId || '')}" /></label>
         <label class="form-row">Verified email domains<input id="identity-domains" value="${esc((identityPolicy.verifiedDomains || []).join(', '))}" placeholder="company.com" /></label>
         <label class="switch"><input id="enforce-sso" type="checkbox" ${identityPolicy.enforceSso ? 'checked' : ''}/>Require SSO for this organization</label>
-        <div class="inline-form"><button class="btn sm primary" id="save-identity">Save policy</button><button class="btn sm" id="rotate-scim">Rotate SCIM token</button></div>
+        <div class="inline-form"><button class="btn sm primary" id="save-identity" data-unsaved-save>Save policy</button><button class="btn sm" id="rotate-scim">Rotate SCIM token</button></div>
         <div id="scim-result" class="task-sub">SCIM base URL: <span class="mono">${esc(location.origin)}/scim/v2/${esc(S.organizationId)}</span></div>`;
-      setEventHandler($('#save-identity'), 'click', async () => { try { await api(`/api/organizations/${S.organizationId}/identity-policy`, { method: 'PUT', body: JSON.stringify({ oidcProviderId: $('#oidc-provider').value.trim(), verifiedDomains: $('#identity-domains').value.split(',').map((x) => x.trim()).filter(Boolean), enforceSso: $('#enforce-sso').checked }) }); toast('Identity policy saved'); } catch (e) { toast(e.message, true); } });
+      setEventHandler($('#save-identity'), 'click', async () => { try { await api(`/api/organizations/${S.organizationId}/identity-policy`, { method: 'PUT', body: JSON.stringify({ oidcProviderId: $('#oidc-provider').value.trim(), verifiedDomains: $('#identity-domains').value.split(',').map((x) => x.trim()).filter(Boolean), enforceSso: $('#enforce-sso').checked }) }); markSaved($('#save-identity')); toast('Identity policy saved'); } catch (e) { toast(e.message, true); } });
       setEventHandler($('#rotate-scim'), 'click', async () => { try { const result = await api(`/api/organizations/${S.organizationId}/scim-token`, { method: 'POST', body: '{}' }); $('#scim-result').innerHTML = `Copy this token now; it is stored only as a hash:<br><span class="mono">${esc(result.token)}</span>`; } catch (e) { toast(e.message, true); } });
     },
   };
@@ -22424,6 +22621,15 @@ function focusedEnterAction(e, target) {
   if (target.closest('[role="button"], [tabindex="0"]')) return 'click';
   return null;
 }
+// Does the focused element take typed text, so a letter is input rather than a
+// shortcut? A checkbox, radio, slider or button input takes none: clicking one
+// must not leave every shortcut dead. The check-in terminal is a focusable
+// <pre> whose keystrokes go to the shell.
+function takesTypedKeys(el) {
+  if (!el?.matches) return false;
+  if (el.isContentEditable || el.matches('textarea, select, .term-screen')) return true;
+  return el.matches('input') && !['checkbox', 'radio', 'range', 'color', 'file', 'button', 'submit', 'reset', 'image'].includes(el.type);
+}
 function dispatchKey(e) {
   if (isBareModifier(e.key)) return false;
   const snap = { key: e.key, metaKey: e.metaKey, ctrlKey: e.ctrlKey, altKey: e.altKey, shiftKey: e.shiftKey };
@@ -22446,9 +22652,7 @@ function bindKeys() {
     // A component-level handler that prevented the event already owns it (for
     // example a composite role=button with richer Enter/Space behavior).
     if (e.defaultPrevented || e.isComposing) return;
-    // The check-in terminal is a focusable <pre> that behaves like a text field:
-    // keystrokes go to the shell, not to app shortcuts. Treat it as "typing".
-    const typing = t && t.matches && (t.matches('input, textarea, select, .term-screen') || t.isContentEditable);
+    const typing = takesTypedKeys(t);
     // Security and vault dialogs are direct body children: modal too, but they
     // close themselves, so Esc must not also pop whatever lies beneath them.
     const dialogOpen = !!document.querySelector('body > .modal-overlay');
@@ -22466,6 +22670,9 @@ function bindKeys() {
       else if ((e.metaKey || e.ctrlKey) && !overlayOpen) dispatchKey(e);
       return;
     }
+    // A checkbox, radio or slider keeps the named keys it uses (Space, Enter,
+    // arrows); letters still reach the shortcuts. Escape still pops the page.
+    if (t?.matches?.('input') && e.key.length > 1 && e.key !== 'Escape') return;
     // Focus wins over global commands for plain Enter, including inside an
     // overlay. Native controls need no help; custom tabindex/role controls do.
     const focusedAction = focusedEnterAction(e, t);
@@ -23958,7 +24165,7 @@ async function hydrateAppGrants() {
           · ${grant.lastUsedAt ? `used ${esc(fmtAgo(grant.lastUsedAt))}` : 'never used'}
           · <span title="${esc(`Created ${new Date(grant.createdAt).toLocaleString()}`)}">${grant.kind === 'token' ? 'expires' : 'expires if unused by'} ${esc(day(grant.expiresAt))}</span></p></div>
       <button class="btn sm danger" type="button" data-revoke-grant="${esc(grant.id)}">Revoke</button></div>`).join('')
-    : '<p class="task-sub app-grants-empty">Nothing signed in yet. Sign in a terminal with <code>npx @tavya/cli login</code>.</p>';
+    : '<p class="task-sub app-grants-empty">Nothing signed in yet. Sign in a terminal with <code>npx @tavya/cli@latest login</code>.</p>';
   box.querySelectorAll('[data-revoke-grant]').forEach((button) => button.addEventListener('click', async () => {
     const name = button.closest('.app-grant-row')?.querySelector('b')?.textContent || 'this';
     if (!confirm(`Revoke ${name}? It is signed out at once.`)) return;

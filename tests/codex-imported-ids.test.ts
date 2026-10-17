@@ -18,6 +18,11 @@ import crypto from 'node:crypto';
 import { codexRolloutFilename, prepareCodexHistory } from '../src/agent/codex-history.js';
 import { publishLocalCodexHistory, readLocalCodexHistory } from '../src/agent/codex-history-files.js';
 import { ensureLocalCodexSessionTools } from '../src/agent/codex.js';
+import { spawnSync } from 'node:child_process';
+import type { World } from '../src/world/types.js';
+import { openLocalPty } from '../src/world/local-execution.js';
+import { ensureRemoteCodexSessionTools, readRemoteImport, remoteAgentHomeRelative, seedRemoteAgentHome } from '../src/agent/remote-process.js';
+import { reuseNativeImport } from '../src/agent/panagent.js';
 
 const imported = '0199aaaa-0000-7000-8000-000000000001';
 const INVENTED = 'msg_0bc8f1e848af4d6dba49e5cb0f5f0fa3';
@@ -139,3 +144,64 @@ it('resumes a Codex fork of an imported conversation without sending invented id
     fs.rmSync(dir, { recursive: true, force: true });
   }
 }, 60_000);
+
+/** A world on this host, reached only through the World interface. */
+function diskWorld(root: string): World {
+  fs.mkdirSync(path.join(root, 'system-bin'), { recursive: true });
+  const write = async (file: string, content: string | Buffer) => {
+    fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+    fs.writeFileSync(path.join(root, file), content);
+  };
+  return {
+    openPty: (spec: any) => openLocalPty(root, spec),
+    handle: { root },
+    readFile: async (file: string) => fs.readFileSync(path.join(root, file), 'utf8'),
+    readFileBuffer: async (file: string) => fs.readFileSync(path.join(root, file)),
+    writeFile: write, writeFileBuffer: write,
+    exec: async (command: string, args: string[]) => {
+      const r = spawnSync(command, args.map((arg) => arg.replaceAll('/usr/local/bin', path.join(root, 'system-bin'))),
+        { cwd: root, encoding: 'utf8' });
+      if (r.error) throw r.error;
+      return { code: r.status ?? 1, stdout: r.stdout, stderr: r.stderr };
+    },
+  } as unknown as World;
+}
+
+it('a retry continues the conversion the world already holds instead of converting again (#643)', async () => {
+  // #643: the first attempt seeded panagent 0.3.0's conversion (with invented
+  // ids) into its cloud world. Every retry converted again under the same id;
+  // the new panagent's bytes differ, and seeding refused: "conflicting Codex
+  // copies for d891ed7b…: histories diverge".
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-codex-import-retry-'));
+  try {
+    const host = path.join(dir, 'host');
+    const world = diskWorld(path.join(dir, 'world'));
+    const name = codexRolloutFilename('2026-10-10T00:00:00Z', imported);
+    await world.writeFileBuffer!(`${remoteAgentHomeRelative('codex', host)}/sessions/forked/${name}`, Buffer.from(panagentHistory));
+    const reconverted = panagentHistory.replace(`,"id":"${INVENTED}"`, '');
+    fs.mkdirSync(path.join(host, 'sessions', 'forked'), { recursive: true });
+    fs.writeFileSync(path.join(host, 'sessions', 'forked', name), reconverted);
+    await expect(seedRemoteAgentHome(world, 'codex', host, imported)).rejects.toThrow(/histories diverge/);
+
+    expect(await reuseNativeImport({ provider: 'codex', sessionId: imported, forkHome: host, worldPath: dir,
+      readWorld: () => readRemoteImport(world, 'codex', host, imported) })).toBe(true);
+    expect(readLocalCodexHistory(host, imported).content.toString()).toBe(panagentHistory);
+    const home = await seedRemoteAgentHome(world, 'codex', host, imported);
+    const session = await ensureRemoteCodexSessionTools(world, home, imported, [])!;
+    expect(session).not.toBe(imported);
+    const prepared = fs.readdirSync(path.join(world.handle.root, home.relative), { recursive: true, encoding: 'utf8' })
+      .find((file) => file.endsWith(`${session}.jsonl`))!;
+    const content = fs.readFileSync(path.join(world.handle.root, home.relative, prepared), 'utf8');
+    expect(content).toContain('imported-assistant-marker');
+    expect(content).not.toContain(INVENTED);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}, 60_000);
+
+it('a local retry continues the conversion the home already holds', async () => {
+  const host = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-codex-import-local-'));
+  try {
+    expect(await reuseNativeImport({ provider: 'codex', sessionId: imported, forkHome: host, worldPath: host })).toBe(false);
+    publishLocalCodexHistory(host, { file: codexRolloutFilename('2026-10-10T00:00:00Z', imported), content: Buffer.from(panagentHistory) }, imported);
+    expect(await reuseNativeImport({ provider: 'codex', sessionId: imported, forkHome: host, worldPath: host })).toBe(true);
+  } finally { fs.rmSync(host, { recursive: true, force: true }); }
+});

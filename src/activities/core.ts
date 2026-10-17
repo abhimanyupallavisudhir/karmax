@@ -26,7 +26,7 @@ import { recordHumanConfirmation } from '../platform/review-confirmation.js';
 import { WorkflowNotFoundError, type Client } from '@temporalio/client';
 import { Context as activityContext } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
-import { AgentChannelLost, ProviderPolicyFailure, SandboxProviderFailure, confirmSandboxFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, isContextOverflow, type LimitClassification } from '../agent/limits.js';
+import { AgentChannelLost, ProviderOutage, ProviderPolicyFailure, SandboxProviderFailure, confirmSandboxFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, isContextOverflow, type LimitClassification } from '../agent/limits.js';
 import { probeClaudeUsage, probeCodexUsage, type UsageResult } from '../agent/usage.js';
 import { markCheckpointStale } from '../world/checkpoint-staleness.js';
 import { usageAdmissionId as admissionIdFor } from '../domain/turn-admission.js';
@@ -38,6 +38,7 @@ import { finalizeMerge, MergeResult } from '../world/merge.js';
 import { applyAgentSpec, ProfileResolver } from '../agent/profiles.js';
 import {
   apiKeyEnv,
+  assertRunnableProvider,
   canonicalModelProvider,
   credentialAliases,
   credentialMatchesProfile,
@@ -103,9 +104,9 @@ import { localTaskBrowserUrl, WORLD_CDP_URL } from '../autonomy/task-browser.js'
 import { tokenToInject } from '../autonomy/config-homes.js';
 import { findProviderSession, materializeFork } from '../agent/fork.js';
 import { CodexHistoryError } from '../agent/codex-history.js';
-import { importWithPanagent, stableImportSessionId, looksLikeConversationUrl, publicConversationShare, type PanagentSource } from '../agent/panagent.js';
+import { importWithPanagent, reuseNativeImport, stableImportSessionId, looksLikeConversationUrl, publicConversationShare, type PanagentSource } from '../agent/panagent.js';
 import { publicShare, publicConversationHtml } from '../gateway/conversation-sharing.js';
-import { isRemoteAgentWorld, materializeRemoteSession, prewarmRemoteAgentHome } from '../agent/remote-process.js';
+import { isRemoteAgentWorld, materializeRemoteSession, prewarmRemoteAgentHome, readRemoteImport } from '../agent/remote-process.js';
 import { checkWorldDisk, diskNotice, diskRatio, diskWasFull, DISK_REARM_RATIO, DISK_WARN_RATIO, isDiskFullMessage, largestWorldPaths,
   outOfDiskMessage, worldUsage, type DiskCheck } from '../world/disk.js';
 import { computerLimits } from '../domain/computer-limits.js';
@@ -126,7 +127,7 @@ import { assembleTaskInput } from '../platform/params.js';
 import { subTaskParams } from '../platform/agent-params.js';
 import { allows, attenuate, CHILD_TASK_CEILING } from '../platform/capabilities.js';
 import { Provider, Message, TaskInput, TaskView, AgentRole, remotePolicyOf, landingAuthorityOf, type Repository, type TaskPullRequest,
-  type GitHubMergeAuthorization, type GithubLandingParticipant, type LandingAuthority, type UpstreamProposal, type SubTaskRequest, type SubTaskResponse, type WorldHandleRef } from '../domain/types.js';
+  type GitHubMergeAuthorization, type GithubLandingParticipant, type LandingAuthority, type UpstreamProposal, type SubTaskRequest, type SubTaskResponse, type TaskRecord, type WorldHandleRef } from '../domain/types.js';
 import { newId } from '../util/id.js';
 import { SIG_AGENT_TURN_STATE } from '../workflows/names.js';
 import { destroyWorldServices } from '../world/services.js';
@@ -174,6 +175,15 @@ const DEFAULT_GRANT = [
   'github:actions:read',
 ];
 
+
+/** A provider that cannot start or reach a world right now (an outage, a
+ * full account limit) is infrastructure wherever resource work meets it:
+ * the workflow waits for a machine instead of asking a person at once
+ * (pramana#79: a full Hetzner IP limit escalated a publication). */
+function providerUnavailable(error: unknown): unknown {
+  if (!(error instanceof ProviderOutage)) return error;
+  return ApplicationFailure.create({ message: error.message, type: 'world-infra', nonRetryable: false, cause: error });
+}
 
 /**
  * Tag a thrown turn error for Temporal's retry policy (the `turns` proxy in the
@@ -542,6 +552,9 @@ export interface PrepareChildArgs {
    *  §11.1): it lands a branch from the parent's own world, so nothing of the
    *  parent's (its branch, its data) is seeded for it. */
   pullRequest?: boolean;
+  /** A queued draft sub-task: its saved record is prepared (its title, prompt
+   *  and agent fields as they are now), instead of a new one created. */
+  draftTaskId?: string;
 }
 
 /** Side-effecting activities the workflows drive (SPEC §3.1). */
@@ -1380,7 +1393,20 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // A park already in flight may have released the lease while we waited
         // for its transition. Re-enter admission before opening the provider.
       }
+    } catch (error) {
+      throw worldUnreachable(handle, error);
     } finally { releaseAccess?.(); }
+  }
+
+  /** A cloud world that cannot be woken or reached right now (a provider
+   * outage, a provider limit that is full, a lost connection) is
+   * infrastructure for every activity, not only an agent's turn: the
+   * workflow waits it out, then asks a person (pramana#56: Hetzner's full CPU
+   * limit reached the workflow as a plain error and failed the task). */
+  function worldUnreachable(handle: WorldHandle, error: unknown): unknown {
+    if (error instanceof ApplicationFailure || !isRemote(handle.kind) || !isTransportError(error)) return error;
+    return ApplicationFailure.create({ message: error instanceof Error ? error.message : String(error), type: 'world-infra',
+      nonRetryable: false, cause: error instanceof Error ? error : undefined });
   }
 
   /** A wake that failed leaves the world as it was: parked, the lease it took
@@ -1628,23 +1654,47 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     }
   }
 
+  /** The saved record of a draft sub-task its parent was asked to start: still
+   * a draft, or prepared by an earlier attempt of this activity and never run. */
+  async function queuedDraft(taskId: string, parentTaskId: string): Promise<TaskRecord> {
+    const draft = (await store.getTask(taskId));
+    const unavailable = (why: string) => ApplicationFailure.create({ message: why, type: 'subtask-draft-unavailable', nonRetryable: true });
+    if (!draft || draft.parentTaskId !== parentTaskId) throw unavailable('it is no longer a draft sub-task of this task (it was deleted)');
+    if (!draft.params?.draft && draft.lastView) throw unavailable('it has already started');
+    return draft;
+  }
+
   /** A sub-task's record and input: its parent's branch pushed and its
    * writable project data saved for it to start from (prepareChildTask). */
   async function prepareChild(args: PrepareChildArgs, work: { checkContinue: () => Promise<void>;
     onProgress: (progress: ResourceSaveProgress) => void }): Promise<TaskInput> {
+    const draft = args.draftTaskId ? (await queuedDraft(args.draftTaskId, args.parentTaskId)) : undefined;
+    if (draft) {
+      const { prompt, ...fields } = draft.params;
+      const agentFields = Object.fromEntries(Object.entries(fields).filter(([name]) => name.startsWith('agent:')));
+      args = { ...args, title: draft.title, prompt: String(prompt ?? ''),
+        ...(Object.keys(agentFields).length ? { params: agentFields as SubTaskRequest['params'] } : {}) };
+    }
     const parent = (await store.getTask(args.parentTaskId));
     const currentProject = (await store.getProject(args.projectId));
     const project = currentProject ? (await store.effectiveProjectConfig(currentProject)) : args.project;
     const parentHandle = (await store.currentWorld(args.parentTaskId)) as WorldHandle | undefined;
     if (parentHandle && isRemote(parentHandle.kind) && !args.pullRequest) {
       const parentWorld = await openWorld(parentHandle);
-      await enrollLiveProjectRepositories(parentWorld, args.parentTaskId);
+      // A parent world that stays unreachable through the transport's own
+      // reconnects is infrastructure, waited out, never the asking agent's
+      // failure (pramana#39/#43: "the SSH connection to the VM was lost").
+      try { await enrollLiveProjectRepositories(parentWorld, args.parentTaskId); }
+      catch (error) { throw worldUnreachable(parentHandle, error); }
       // A project without repositories has no branch to seed: its child starts
       // from an empty world like its parent (upgrade rehearsal, #421).
       if (worldRepos(parentWorld.handle).length) {
         const persisted = await publishTaskBranch(parentWorld, args.parentTaskId);
-        if (!persisted.pushed.length || persisted.skipped.length)
-          throw new Error(`could not seed the parent branch for the child task${persisted.skipped.length ? `: ${describePublishFailures(persisted)}` : ''}`);
+        if (!persisted.pushed.length || persisted.skipped.length) {
+          const message = `could not seed the parent branch for the child task${persisted.skipped.length ? `: ${describePublishFailures(persisted)}` : ''}`;
+          if (persisted.unreachable) throw ApplicationFailure.create({ message, type: 'world-infra', nonRetryable: false });
+          throw new Error(message);
+        }
         (await record(args.parentTaskId, 'push.branch', {
           branch: parentWorld.handle.branch, repos: persisted.pushed, reason: 'subtask-bootstrap',
         }));
@@ -1658,25 +1708,36 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const { info } = activityContext.current();
       if (info.workflowExecution) idempotencyKey = `${args.parentTaskId}:${info.workflowExecution.runId}:${info.activityId}`;
     } catch { /* Direct calls represent distinct requests. */ }
-    let child = (await store.createTask({
-      projectId: args.projectId,
-      idempotencyKey,
-      listId: parent?.listId,
-      title: args.title,
-      workflow: 'software-dev',
-      workflowVersion: parent?.workflowVersion ?? '1.0.0',
-      // The child's own agent fields first: its prompt and the parent's branch always win.
-      params: { ...args.params, prompt: args.prompt, base: args.base, target: args.target,
-        [REPOSITORY_BRANCHES_RESOLVED_PARAM]: true,
-        ...(Object.keys(resourceRevisions).length ? { [PARENT_RESOURCES_PARAM]: resourceRevisions } : {}),
-        // Stored so a replacement run of this child, which is rebuilt from
-        // its record, keeps the parent's profiles as this first run does.
-        ...(args.profiles ? { profiles: args.profiles } : {}) },
-      parentTaskId: args.parentTaskId,
-      createdBy: { kind: 'task-agent', taskId: args.parentTaskId, role: 'do' },
-      assignee: { kind: 'task-agent', taskId: args.parentTaskId, role: 'do' },
-    }));
-    (await record(args.parentTaskId, 'subtask.created', { childTaskId: child.id, title: args.title, ...(args.pullRequest ? { pullRequest: true } : {}) }));
+    // The child's own agent fields first: its prompt and the parent's branch always win.
+    const childParams = { ...args.params, prompt: args.prompt, base: args.base, target: args.target,
+      [REPOSITORY_BRANCHES_RESOLVED_PARAM]: true,
+      ...(Object.keys(resourceRevisions).length ? { [PARENT_RESOURCES_PARAM]: resourceRevisions } : {}),
+      // Stored so a replacement run of this child, which is rebuilt from
+      // its record, keeps the parent's profiles as this first run does.
+      ...(args.profiles ? { profiles: args.profiles } : {}) };
+    let child: TaskRecord;
+    if (draft) {
+      // What else the draft holds (a Computer a person set, its tags) stays.
+      const { _queuedAt: _queued, ...kept } = draft.params;
+      (await store.updateTaskParams(draft.id, { ...kept, ...childParams, draft: true }));
+      (await store.clearDraft(draft.id));
+      child = (await store.getTask(draft.id))!;
+      (await record(args.parentTaskId, 'subtask.started', { childTaskId: child.id, title: args.title }));
+    } else {
+      child = (await store.createTask({
+        projectId: args.projectId,
+        idempotencyKey,
+        listId: parent?.listId,
+        title: args.title,
+        workflow: 'software-dev',
+        workflowVersion: parent?.workflowVersion ?? '1.0.0',
+        params: childParams,
+        parentTaskId: args.parentTaskId,
+        createdBy: { kind: 'task-agent', taskId: args.parentTaskId, role: 'do' },
+        assignee: { kind: 'task-agent', taskId: args.parentTaskId, role: 'do' },
+      }));
+      (await record(args.parentTaskId, 'subtask.created', { childTaskId: child.id, title: args.title, ...(args.pullRequest ? { pullRequest: true } : {}) }));
+    }
     // Least-privilege grant (SPEC §8.2): the child's delegation caps are attenuated
     // by the parent's authority now (task-authority.ts), and its merge cap is scoped
     // to EXACTLY the parent's branch (which the parent owns and merges into). If no
@@ -2345,6 +2406,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const selectedTurn = (await turnProfile(args.task, args.role, args.explicitProfileId));
       const avatar = selectedTurn.avatar;
       let profile = selectedTurn.profile;
+      try { assertRunnableProvider(profile); } catch (error) {
+        throw ApplicationFailure.create({ message: (error as Error).message, type: 'agent-error', nonRetryable: true });
+      }
       const leasedCredentialProvider = args.accountCredentialProvider
         ? canonicalModelProvider(args.accountCredentialProvider)
         : undefined;
@@ -2365,9 +2429,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // provider failure to wake a world is the agent's (pramana#59: Hetzner's
         // power-on "Unknown Error" blocked the task as an agent error): it waits
         // out as infrastructure, then reaches a person, never Resolve.
-        const failure = classifyTurnError(error, profile.provider);
+        // A turn classifies what the provider said, not openWorld's wrapper.
+        const cause = error instanceof ApplicationFailure && error.type === 'world-infra' && error.cause ? error.cause : error;
+        const failure = classifyTurnError(cause, profile.provider);
         if (failure instanceof ApplicationFailure && failure.type === 'agent-error')
-          throw ApplicationFailure.create({ message: failure.message, type: 'world-infra', nonRetryable: false, cause: error instanceof Error ? error : undefined });
+          throw ApplicationFailure.create({ message: failure.message, type: 'world-infra', nonRetryable: false, cause: cause instanceof Error ? cause : undefined });
         throw failure;
       }
       // A cloud world's disk, before its agent starts (wiki features/computers).
@@ -2637,17 +2703,30 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           : profile.provider === 'opencode' ? path.join('.local', 'share', 'opencode')
           : '.claude';
         const forkHome = resolvedAuth?.configHome || path.join(os.homedir(), ambientHome);
-        // An import runs only while this role has no session, so a retry may
-        // replace the copy an earlier attempt wrote: the same source keeps one id.
+        // An import runs only while this role has no session; the same source
+        // keeps one id. A retry continues the conversion an earlier attempt made
+        // (in a cloud world, the world's copy): converting again gives other
+        // bytes under that id, which the world refuses (#643).
         const applyPanagent = async (source: PanagentSource, mode: 'context' | 'transcript', origin: string) => {
+          const native = !apiRail && (profile.provider === 'claude' || profile.provider === 'codex');
+          const sessionId = stableImportSessionId(args.taskId, args.role, profile.provider, origin);
+          if (native && await reuseNativeImport({
+            provider: profile.provider as 'claude' | 'codex', sessionId, forkHome,
+            worldPath: worldWorkingDirectory(world.handle),
+            ...(remoteSubscriptionRail ? { readWorld: () => readRemoteImport(world, profile.provider as 'claude' | 'codex', forkHome, sessionId) } : {}),
+          })) {
+            session = sessionId;
+            (await record(args.taskId, 'session.import.reused', { session: sessionId }));
+            return 'native' as const;
+          }
           const imported = await importWithPanagent({
             source,
             provider: profile.provider,
             forkHome,
             worldPath: worldWorkingDirectory(world.handle),
             mode,
-            native: !apiRail && ['claude', 'codex'].includes(profile.provider),
-            sessionId: stableImportSessionId(args.taskId, args.role, profile.provider, origin),
+            native,
+            sessionId,
           });
           if (imported.kind === 'native') session = imported.sessionId;
           else {
@@ -3499,6 +3578,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             ? {
                 platformRequest: (method: string, requestPath: string, body?: unknown) =>
                   turnPlatformRequest({ token, method, path: requestPath, body, signal }),
+                createSubTaskDraft: async (t: SubTaskRequest) => (await turnPlatformRequest({ token, method: 'POST',
+                  path: `/api/tasks/${encodeURIComponent(args.taskId)}/sub-tasks`, body: { title: t.title, prompt: t.prompt, params: t.params },
+                  signal }) as { id: string }).id,
               }
             : {}),
         },
@@ -4437,7 +4519,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (error instanceof ResourceConflictError)
           throw ApplicationFailure.create({ message: error.message, type: 'resource-conflict', nonRetryable: true,
             ...(error.guide ? { details: [{ guide: error.guide }] } : {}) });
-        throw error;
+        throw providerUnavailable(error);
       } finally { clearInterval(pulse); }
     },
 
@@ -4453,7 +4535,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       try {
         return (await deps.resources?.takeDeliveries(taskId, {
           checkContinue: async () => { context?.cancellationSignal.throwIfAborted(); } })) ?? [];
-      } finally { clearInterval(pulse); }
+      } catch (error) { throw providerUnavailable(error); } finally { clearInterval(pulse); }
     },
 
     /** Before Review, merge into the world's copies of writable resources
@@ -4468,7 +4550,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       try {
         return (await deps.resources?.integratePublished(taskId, {
           checkContinue: async () => { context?.cancellationSignal.throwIfAborted(); } })) ?? [];
-      } finally { clearInterval(pulse); }
+      } catch (error) { throw providerUnavailable(error); } finally { clearInterval(pulse); }
     },
 
     /** Snapshot staged path candidates while the producing world is still live.
@@ -4498,7 +4580,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           },
         });
         return { staged: result?.staged.length ?? 0, failed: result?.failed.length ?? 0 };
-      } finally { clearInterval(pulse); }
+      } catch (error) { throw providerUnavailable(error); } finally { clearInterval(pulse); }
     },
 
     async unsavedResourceCandidates(taskId: string): Promise<Array<{ path: string; error?: string }>> {
@@ -6627,7 +6709,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // what to stop (pramana#22), and tries again itself.
         if (error instanceof ResourceKeptChangingError)
           throw ApplicationFailure.create({ message: error.message, type: 'resource-kept-changing', nonRetryable: true });
-        throw error;
+        throw providerUnavailable(error);
       } finally { clearInterval(pulse); }
     },
 

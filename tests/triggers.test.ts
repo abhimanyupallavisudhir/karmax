@@ -233,7 +233,7 @@ describe('trigger helpers', () => {
     expect(isRecurring({ kind: 'schedule', at: 123 })).toBe(false); // one-shot by default
     expect(isRecurring({ kind: 'dependency', tasks: ['a'] })).toBe(false);
     expect(isRecurring({ kind: 'event', type: 'a', recurring: true })).toBe(true);
-    const cloned = cloneParamsWithoutTriggers({ prompt: 'p', triggers: [{ kind: 'schedule', cron: '* * * * *' }], triggerState: 'armed', triggerPending: true, draft: true });
+    const cloned = cloneParamsWithoutTriggers({ prompt: 'p', triggers: [{ kind: 'schedule', cron: '* * * * *' }], triggerState: 'armed', triggerPending: true, draft: true, archived: true });
     expect(cloned).toEqual({ prompt: 'p' });
   });
 });

@@ -8,7 +8,7 @@ import { startLocalSshd, type LocalSshd } from './local-sshd.js';
 
 type Labels = Record<string, string>;
 interface FakeServer { id: number; name: string; status: string; created: string; labels: Labels; server_type: any;
-  volumes: number[]; ip: string; userData: string; sshd?: LocalSshd; datacenter: { location: { name: string } } }
+  volumes: number[]; ip: string; ipv6: boolean; userData: string; sshd?: LocalSshd; datacenter: { location: { name: string } } }
 interface FakeVolume { id: number; name: string; size: number; created: string; server: number | null; labels: Labels;
   location: { name: string }; linux_device: string; dir: string }
 
@@ -46,6 +46,9 @@ export class FakeHetzner {
   /** The project's limit on shared vCPU across all its servers, on or off
    * (Hetzner Console → Limits); no API reads it. */
   sharedCoresLimit?: number;
+  /** The project's limit on primary IPs, IPv4 and IPv6 each counting one
+   * (Hetzner's default was what pramana#79 met: five servers with both). */
+  primaryIpLimit?: number;
   /** The project's limit on the total size of its volumes, in GB. */
   volumesLimitGb?: number;
   /** Server types Hetzner has none of at the moment (sold out at the location). */
@@ -165,9 +168,15 @@ export class FakeHetzner {
           if (this.sharedCoresLimit !== undefined && type.cpu_type === 'shared' && sharedInUse + type.cores > this.sharedCoresLimit)
             return json(403, { error: { code: 'resource_limit_exceeded', message: 'shared core limit exceeded',
               details: { limits: [{ name: 'server_shared_cores_limit' }] } } });
+          const wantsIpv6 = body.public_net?.enable_ipv6 !== false;
+          const ipsInUse = [...this.servers.values()].reduce((sum, entry) => sum + 1 + (entry.ipv6 ? 1 : 0), 0);
+          // Hetzner's answer, verbatim from pramana#79 (2026-10-17).
+          if (this.primaryIpLimit !== undefined && ipsInUse + 1 + (wantsIpv6 ? 1 : 0) > this.primaryIpLimit)
+            return json(403, { error: { code: 'resource_limit_exceeded', message: 'Primary IP limit exceeded',
+              details: { limits: [{ name: 'primary_ip_limit' }] } } });
           const server: FakeServer = { id: ++this.ids, name: body.name, status: 'initializing', created: new Date().toISOString(),
             labels: body.labels ?? {}, server_type: TYPES.find((type) => type.name === body.server_type), volumes: body.volumes ?? [],
-            ip: `10.0.0.${this.ids % 250}`, userData: body.user_data, datacenter: { location: { name: body.location } } };
+            ip: `10.0.0.${this.ids % 250}`, ipv6: wantsIpv6, userData: body.user_data, datacenter: { location: { name: body.location } } };
           for (const volumeId of server.volumes) {
             const volume = this.volumes.get(volumeId)!;
             if (volume.server) return json(422, { error: { code: 'volume_already_attached', message: 'attached' } });
@@ -201,8 +210,8 @@ export class FakeHetzner {
   }
 
   private view(server: FakeServer) {
-    const { sshd: _sshd, userData: _userData, ip, ...rest } = server;
-    return { ...rest, public_net: { ipv4: { ip }, ipv6: { ip: '2a01::/64' } } };
+    const { sshd: _sshd, userData: _userData, ip, ipv6, ...rest } = server;
+    return { ...rest, public_net: { ipv4: { ip }, ipv6: ipv6 ? { ip: '2a01::/64' } : null } };
   }
 
   /** What cloud-init and the boot script do: sshd with the delivered keys, the volume as home. */

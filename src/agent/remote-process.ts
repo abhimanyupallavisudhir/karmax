@@ -1255,6 +1255,23 @@ async function remoteHomeFiles(world: World, absolute: string): Promise<Set<stri
   return new Set(files);
 }
 
+/** The conversion an earlier attempt placed in this world for an imported
+ * session (panagent into Codex or Claude), if any: a retry continues it rather
+ * than converting again (#643). Copies of one session must agree. */
+export async function readRemoteImport(world: World, provider: 'claude' | 'codex', localHome: string,
+  session: string): Promise<Buffer | undefined> {
+  if (!validCodexSessionId(session)) return undefined;
+  const relative = remoteAgentHomeRelative(provider, localHome);
+  const roots = (provider === 'codex' ? ['sessions', 'archived_sessions'] : ['projects']).map((dir) => `${relative}/${dir}/`);
+  const files = [...await remoteHomeFiles(world, path.posix.join(world.handle.root, relative))]
+    .filter((file) => roots.some((root) => file.startsWith(root)) && path.posix.basename(file).endsWith(`${session}.jsonl`));
+  if (!files.length) return undefined;
+  const budget: HistoryBudget = { bytes: 0, files: 0 };
+  const copies = [];
+  for (const file of files) copies.push({ file, content: await readRemoteHistory(world, file, budget) });
+  return selectCodexHistoryCopy(copies, session).content;
+}
+
 /** Repair stale aliases left by earlier seeding, including on host-only retries.
  * Rollouts are append-only: remove a shorter copy only after verifying it is an
  * exact byte prefix of the retained copy. Never guess between divergent histories.
