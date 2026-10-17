@@ -129,7 +129,7 @@ describe('events in the console', () => {
     const recs = page.locator('.store-recs');
     await recs.waitFor();
     expect(await recs.locator('.task-group-heading').textContent()).toMatch(/Recommended from the Task store/);
-    expect(await recs.locator('[data-store-task]').evaluateAll((rows) => rows.map((row) => (row as HTMLElement).dataset.storeTask)))
+    expect(await recs.locator('[data-store-task]').evaluateAll((rows) => rows.map((row) => row.getAttribute('data-store-task'))))
       .toEqual(['project-wiki', 'repair-github-workflow', 'build-planned-issues', 'triage-issues', 'chat-requests']);
     if (process.env.KARMAX_SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.KARMAX_SCREENSHOT_DIR, 'store-recommended.png') });
     await recs.locator('#store-recs-dismiss').click();

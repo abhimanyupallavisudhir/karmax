@@ -67,17 +67,17 @@ it('lands on the organization home, For me across projects, Active one click awa
       { timeout: 60_000 }).toBe('timer'));
 
     const rows = async () => await page.evaluate<string[]>(
-      "[...document.querySelectorAll('#main .task-row')].map((el) => el.dataset.id || el.dataset.draft).sort()");
+      "[...document.querySelectorAll('#main .task-row:not(.store-row)')].map((el) => el.dataset.id || el.dataset.draft).sort()");
     await step('the root lands on the organization home, For me', async () => {
       await page.goto(app!.url);
       await page.waitForURL(/\/personal$/);
       await page.locator(`[data-id="${review.id}"] .chip.attention`).waitFor();
     });
-    // A new project seeds its own setup draft for whoever created it: also theirs.
+    // A new project starts empty: the default view recommends the task store instead.
     const listed = await rows();
-    expect(listed).toEqual(expect.arrayContaining([review.id, draft.id]));
-    expect(listed).not.toContain(paused.id);
-    expect(await page.locator('#main .task-row[data-draft]').count()).toBe(listed.length - 1);
+    expect(listed).toEqual([review.id, draft.id].sort());
+    expect(await page.locator('#main .task-row[data-draft]').count()).toBe(1);
+    expect(await page.locator('.store-recs .store-row[data-store-task="project-wiki"]').count()).toBe(1);
     expect(await page.locator(`[data-id="${review.id}"] .chip.attention`).innerText()).toBe('Review');
     expect(await page.locator(`[data-id="${review.id}"] .task-project`).innerText()).toBe('website');
     // The search panel stands clear of the list: no tighter above the first row than rows are to each other.
