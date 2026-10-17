@@ -696,6 +696,22 @@ describe('Store — saved views', () => {
     } finally { (await file.close()); fs.rmSync(dir, { recursive: true, force: true }); }
   });
 
+  it('keeps an organization home’s views apart from its projects’ views', async () => {
+    const org = (await store.createOrganization({ name: 'Home', ownerUserId: 'u' }));
+    const project = (await store.createProject('Inside', {}, org.id)).id;
+    (await store.createView({ projectId: project, name: 'Project view', query: {} }));
+    const first = (await store.createView({ organizationId: org.id, name: 'Mine', query: parseQuery('for:me is:review') }));
+    const second = (await store.createView({ organizationId: org.id, name: 'Bugs', query: parseQuery('tag:bug') }));
+    expect([first.order, second.order]).toEqual([0, 1]);
+    expect(first).toMatchObject({ projectId: '', organizationId: org.id });
+    expect((await store.listOrganizationViews(org.id)).map((v) => v.name)).toEqual(['Mine', 'Bugs']);
+    expect((await store.listViews(project)).map((v) => v.name)).toEqual(['Project view']);
+    expect((await store.getView(first.id))!.organizationId).toBe(org.id);
+    await expect(store.createView({ name: 'Nowhere', query: {} })).rejects.toThrow(/project or an organization/);
+    (await store.deleteOrganization(org.id));
+    expect((await store.listOrganizationViews(org.id))).toEqual([]);
+  });
+
   it('drops a project’s tags and views when the project is deleted', async () => {
     (await store.createTag({ projectId: pid, name: 'bug' }));
     (await store.createView({ projectId: pid, name: 'V', query: {} }));

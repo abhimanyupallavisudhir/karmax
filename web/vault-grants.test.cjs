@@ -59,14 +59,15 @@ ok(!passwords.includes('class="vault-items-list"'), 'settings no longer renders 
 ok(vaultCards.includes('class="modal-card vault-manager-modal"'), 'settings button opens a full vault manager');
 ok(vaultCards.includes('class="vault-search"'), 'settings manager offers credential search');
 ok(vaultCards.includes('data-vi-rotate'), 'settings manager retains secret rotation');
-ok(/i\.type === 'session' \? `<label title="\$\{esc\(SESSION_EXCLUSIVE_TIP\)\}">one task at a time <input type="checkbox" class="vi-exclusive"/.test(vaultCards), 'a saved session can be limited to one task at a time');
+ok(/i\.type === 'session' \? `<label class="vm-exclusive" title="\$\{esc\(SESSION_EXCLUSIVE_TIP\)\}"><input type="checkbox" class="vi-exclusive"/.test(vaultCards), 'a saved session can be limited to one task at a time');
 ok(vaultCards.includes("JSON.stringify({ id: item.id, type: item.type, label: item.label, exclusive: box.checked })"), 'the one-at-a-time toggle saves through the item API');
-ok(/i\.type === 'session' \? '' : `<button class="btn sm" data-vi-rotate=/.test(vaultCards), 'a saved session is refreshed by signing in again, not by typing a secret');
+ok(/i\.type === 'session' \? '' : `<button type="button" class="icon-btn vm-act" data-vi-rotate=/.test(vaultCards), 'a saved session is refreshed by signing in again, not by typing a secret');
 ok(vaultCards.includes('data-vi-reveal'), 'settings manager lets a vault administrator inspect a credential');
 ok(vaultCards.includes('/reveal'), 'settings manager uses the audited administrative reveal endpoint');
 ok(vaultCards.includes('Every reveal is recorded in the audit log'), 'settings manager explains that plaintext inspection is audited');
 ok(vaultCards.includes('data-vi-del'), 'settings manager retains deletion');
 ok(vaultCards.includes('class="vi-pol-use"'), 'settings manager retains global policy actions');
+ok(vaultCards.includes('class="vault-manage-all"') && vaultCards.includes('data-vm-bulk-delete'), 'settings manager selects credentials and acts on them in bulk');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

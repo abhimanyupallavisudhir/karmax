@@ -5750,23 +5750,39 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     return (await this.deps.store.createView(input));
   }
 
+  /** The organization home's views: queries over every project of the organization. */
+  async listOrganizationViews(token: string, organizationId: string): Promise<SavedView[]> {
+    (await this.require(token, 'list_views', { organizationId }));
+    return (await this.deps.store.listOrganizationViews(organizationId));
+  }
+
+  async createOrganizationView(token: string, input: { organizationId: string; name: string; query: TaskQuery; icon?: string }): Promise<SavedView> {
+    if (!(await this.deps.store.getOrganization(input.organizationId))) throw new NotFoundError(`no such organization ${input.organizationId}`);
+    (await this.require(token, 'manage_view', { organizationId: input.organizationId }));
+    return (await this.deps.store.createView({ organizationId: input.organizationId, name: input.name, query: input.query, icon: input.icon }));
+  }
+
   // As with tags: `/api/views/:id` has no project in the path, so the view is
-  // resolved first and its project supplied as the scope to check against.
-  async updateView(token: string, id: string, patch: { name?: string; query?: TaskQuery; icon?: string | null }): Promise<SavedView | undefined> {
+  // resolved first and its project (or, for a home view, its organization)
+  // supplied as the scope to check against.
+  private async requireViewScope(token: string, id: string) {
     const view = (await this.deps.store.getView(id));
-    (await this.require(token, 'manage_view', { projectId: view?.projectId }));
+    (await this.require(token, 'manage_view', view && !view.projectId && view.organizationId
+      ? { organizationId: view.organizationId } : { projectId: view?.projectId }));
+  }
+
+  async updateView(token: string, id: string, patch: { name?: string; query?: TaskQuery; icon?: string | null }): Promise<SavedView | undefined> {
+    (await this.requireViewScope(token, id));
     return (await this.deps.store.updateView(id, patch));
   }
 
   async reorderView(token: string, id: string, ord: number): Promise<void> {
-    const view = (await this.deps.store.getView(id));
-    (await this.require(token, 'manage_view', { projectId: view?.projectId }));
+    (await this.requireViewScope(token, id));
     (await this.deps.store.reorderView(id, ord));
   }
 
   async deleteView(token: string, id: string): Promise<void> {
-    const view = (await this.deps.store.getView(id));
-    (await this.require(token, 'manage_view', { projectId: view?.projectId }));
+    (await this.requireViewScope(token, id));
     (await this.deps.store.deleteView(id));
   }
 
