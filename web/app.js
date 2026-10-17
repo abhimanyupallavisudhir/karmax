@@ -13747,11 +13747,17 @@ function wireNewAgentForms(box, v, key) {
 
 // The @ menu: numbered agents, a new agent, frequently mentioned people, and a
 // searchable list of everyone. Digits pick an agent, + adds one, letters search.
+// A view update rebuilds the box while it is open and refocuses the new one, so
+// the open menu is recorded here and carries over to it, as it was.
+let openAgentMention = null; // { key, owner: the textarea, peopleMode, active }
 function wireAgentMention(ta, box, v, key) {
   if (!ta || ta.dataset.amWired) return;
   ta.dataset.amWired = '1';
   let menu = null, items = [], active = 0, token = null, peopleMode = false;
-  const close = () => { menu?.remove(); menu = null; items = []; token = null; peopleMode = false; };
+  const close = () => {
+    menu?.remove(); menu = null; items = []; token = null; peopleMode = false;
+    if (openAgentMention?.owner === ta) openAgentMention = null;
+  };
   const tokenAt = () => {
     const pos = ta.selectionStart;
     if (pos == null || pos !== ta.selectionEnd) return null;
@@ -13822,6 +13828,7 @@ function wireAgentMention(ta, box, v, key) {
     placeCaretMenu(menu, ta, token.start);
     menu.scrollTop = scrolled;
     revealActiveOption(menu);
+    openAgentMention = { key, owner: ta, peopleMode, active };
   };
   const update = () => {
     token = tokenAt();
@@ -13848,6 +13855,15 @@ function wireAgentMention(ta, box, v, key) {
     else if (ev.key === 'Enter' || ev.key === 'Tab') { ev.preventDefault(); ev.stopImmediatePropagation(); choose(items[active]); }
   });
   ta.addEventListener('blur', () => setTimeout(close, 150));
+  // Focus is given back before the caret is (restoreFollowupFocus), so look once
+  // both are in place.
+  ta.addEventListener('focus', () => queueMicrotask(() => {
+    const was = openAgentMention;
+    if (!was || was.key !== key || was.owner === ta || was.owner.isConnected || document.activeElement !== ta) return;
+    openAgentMention = null;
+    peopleMode = was.peopleMode; active = was.active;
+    update();
+  }));
 }
 
 // Escalate: pass the request this task is waiting on to other people. The same
