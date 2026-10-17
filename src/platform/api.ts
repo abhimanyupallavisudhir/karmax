@@ -68,6 +68,7 @@ import { AuthorizationRequests, type AuthorizationRequest } from './authorizatio
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
 import { confirmLayersOf } from '../domain/confirm.js';
 import { untrustedBlock } from '../domain/untrusted.js';
+import { taskAuthorityNow } from './task-authority.js';
 import type { KarmaxBus } from '../contrib/bus.js';
 import type { WorldRegistry } from '../world/registry.js';
 import type { WorldHandle } from '../world/types.js';
@@ -117,6 +118,31 @@ export interface EscalationTargets {
   teams: Array<{ id: string; name: string; slug: string; selector: string }>;
   special: Array<{ selector: string; description: string }>;
   avatars: Array<{ id: string; name: string; purpose?: string; selector: string; roles: string[] }>;
+}
+
+/** Who can grant a task agent's permission request, nearest first (`permissionGrantors`). */
+export interface PermissionGrantors {
+  /** Tasks it acts for that hold it: their agents decide. */
+  tasks: Array<{ taskId: string; num?: number; title: string; selector: string }>;
+  users: Array<{ id: string; selector: string; name?: string }>;
+  teams: Array<{ id: string; name: string; slug: string; selector: string; eligibleUserIds: string[] }>;
+  /** Level groups, owners and everyone, each standing for its members who can. */
+  special: Array<{ selector: string; eligibleUserIds: string[] }>;
+  avatars: Array<{ id: string; name: string; selector: string }>;
+  /** Whom a request naming no audience asks. */
+  default?: string;
+}
+
+/** The selectors a grantor list offers, in the order to ask them. */
+function grantorSelectors(grantors: PermissionGrantors): string[] {
+  return [...new Set([...grantors.tasks.map((task) => task.selector), ...(grantors.default ? [grantors.default] : []),
+    ...grantors.special.map((group) => group.selector), ...grantors.teams.map((team) => team.selector),
+    ...grantors.users.map((user) => user.selector), ...grantors.avatars.map((avatar) => avatar.selector)])];
+}
+
+/** The task whose authority a task was given: its parent, else the task whose agent created it. */
+function delegatorOf(task: TaskRecord): string | undefined {
+  return task.parentTaskId ?? (task.createdBy?.kind === 'task-agent' ? task.createdBy.taskId : undefined);
 }
 
 /** The refusal for an ask that names nobody: what the tool is for, the
@@ -4388,7 +4414,9 @@ Act according to your Avatar instructions. When ready, call signal_task for task
   async requestPermission(
     token: string,
     args: { capabilities?: string[]; projectIds?: string[]; taskId?: string; audience?: string[]; reason: string; urgency?: Urgency },
-  ): Promise<{ status: 'granted' | 'needs_approval'; requestId?: string; capabilities: string[]; projectIds?: string[]; audience?: string[] }> {
+  ): Promise<{ status: 'granted' | 'needs_approval'; requestId?: string; capabilities: string[]; projectIds?: string[]; audience?: string[];
+    /** Everyone who could grant it, nearest first. */
+    canGrant?: string[] }> {
     const caller = (await this.require(token, 'request_permission'));
     if (args.taskId) return this.requestHeldAuthorization(token, args.taskId, args);
     if (caller.taskId === '*') throw new Error('this endpoint requires a task-agent token');
@@ -4421,14 +4449,22 @@ Act according to your Avatar instructions. When ready, call signal_task for task
     if (!missing.length && !projectIds.length) return { status: 'granted', capabilities };
 
     let audience = [...new Set((args.audience ?? []).map((selector) => String(selector).trim()).filter(Boolean))];
-    // No audience: summon the lowest level whose members can grant it, else the creator.
-    if (!audience.length) audience = [(await this.permissionSummon(task, project.organizationId,
-      projectIds.length ? capabilities : missing, projectIds, baseAuthorization)) ?? '@creator'];
+    const grantors = await this.permissionGrantors(task, project.organizationId,
+      projectIds.length ? capabilities : missing, projectIds, baseAuthorization);
+    // No audience: the nearest who can grant it (permissionGrantors), else the creator.
+    if (!audience.length) audience = [grantors.default ?? '@creator'];
     if (audience.length > 32) throw new Error('at most 32 audience selectors may be used');
     const recipients = new Set<string>();
     const avatarRecipients = new Set<string>();
+    const taskRecipients = new Set<string>();
     const initiatingUserId = (await this.deps.store.taskCreatorUserId(task.id));
     for (const selector of audience) {
+      if (selector.startsWith('task:')) {
+        if (!grantors.tasks.some((grantor) => grantor.selector === selector))
+          throw new CapabilityError(`${selector} cannot grant this: only a task this one acts for, which holds it, can`);
+        taskRecipients.add(selector.slice(5));
+        continue;
+      }
       if (selector.startsWith('avatar:')) {
         const avatar = (await this.deps.store.getAvatar(selector.slice(7)));
         if (!avatar || avatar.projectId !== task.projectId || !(await avatarEnabled(this.deps.store, avatar)))
@@ -4458,6 +4494,7 @@ Act according to your Avatar instructions. When ready, call signal_task for task
       audience,
       recipients: [...recipients],
       avatarRecipients: [...avatarRecipients],
+      taskRecipients: [...taskRecipients],
       reason: args.reason,
       requestedBy: `task-agent:${task.id}:${caller.profileId}`,
     }));
@@ -4474,6 +4511,7 @@ Act according to your Avatar instructions. When ready, call signal_task for task
           audience: request.audience,
           recipients: request.recipients,
           avatarRecipients: request.avatarRecipients,
+          taskRecipients: request.taskRecipients,
           reason: request.reason,
           requestedBy: request.requestedBy,
           // An approval blocks the agent on a person, so it is high by default —
@@ -4494,6 +4532,7 @@ Act according to your Avatar instructions. When ready, call signal_task for task
           detail: `Permission requested: ${request.capabilities.join(', ')}${request.projectIds?.length ? `; add projects: ${request.projectIds.join(', ')}` : ''} — ${request.reason}`,
         });
       }
+      for (const grantorId of taskRecipients) await this.askTaskToGrant(grantorId, task, request, project.organizationId);
       for (const avatarId of avatarRecipients) {
         const avatar = (await this.deps.store.getAvatar(avatarId))!;
         try {
@@ -4531,28 +4570,110 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       capabilities: request.capabilities,
       ...(request.projectIds?.length ? { projectIds: request.projectIds } : {}),
       audience: request.audience,
+      canGrant: grantorSelectors(grantors),
     };
   }
 
-  /** Whom a permission request summons by default: members who could approve
-   * it (they hold every capability throughout the task's scope, expanded by any
-   * requested projects), grouped as `summonable` groups them. */
-  private async permissionSummon(task: TaskRecord, organizationId: string, capabilities: Capability[],
-    projectIds: string[], baseAuthorization?: AuthorizationSelection): Promise<string | undefined> {
-    const authorization = this.deps.authorization;
-    if (!authorization) return undefined;
+  /** Tell a task's agent that a task acting for it asks for what it holds,
+   *  and how to decide. Its reply is the decision, not a message. */
+  private async askTaskToGrant(grantorId: string, task: TaskRecord, request: PermissionRequest, organizationId: string) {
+    const grantor = await this.deps.store.getTask(grantorId);
+    if (!grantor) return;
+    const asked = request.capabilities.join(', ')
+      + (request.projectIds?.length ? `${request.capabilities.length ? '; ' : ''}projects ${request.projectIds.join(', ')}` : '');
+    const text = `Task #${task.num ?? task.id} "${task.title}" (${task.id}) asks you for ${asked}, which you hold. `
+      + `Grant it if its work needs it: platform_request(POST, "/api/permission-requests/${request.id}/resolve?organizationId=${organizationId}", {"action": "approve"}), `
+      + `or {"action": "deny"}.\n${untrustedBlock('its reason', request.reason)}`;
+    try {
+      if (this.sharedConversation(grantor)) {
+        const message: Message = { id: `u${randomUUID()}`, role: 'user', author: `task:${task.id}`,
+          authorLabel: `Task #${task.num ?? task.id}`, text, ts: Date.now() };
+        await (await this.workflowHandle(grantor.id)).signal(SIG.followUp, message);
+        await this.publishConversationMessage(grantor.id, MAIN_AGENT, message);
+      } else await this.deliverWorkflowMessage(grantor.id, text);
+    } catch (error) {
+      const failed = { taskId: task.id, type: 'permission.grantor-unreachable', ts: Date.now(),
+        payload: { requestId: request.id, grantorTaskId: grantorId, error: error instanceof Error ? error.message : String(error) } };
+      const seq = (await this.deps.store.appendEvent(failed));
+      this.deps.bus?.emit({ ...failed, seq });
+    }
+  }
+
+  /** Who can grant a task agent what it asks for (`GET /api/agent/escalation-targets?capabilities=`). */
+  async permissionGrantorsFor(token: string, input: { capabilities?: string[]; projectIds?: string[] }): Promise<PermissionGrantors & { missing: Capability[] }> {
+    const caller = (await this.require(token, 'request_permission'));
+    if (caller.taskId === '*') throw new Error('this endpoint requires a task-agent token');
+    const task = (await this.deps.store.getTask(caller.taskId));
+    if (!task) throw new NotFoundError(`no task ${caller.taskId}`);
+    const organizationId = (await this.deps.store.getProject(task.projectId))?.organizationId;
+    if (!organizationId) throw new Error('task project has no organization');
+    const capabilities = [...new Set((input.capabilities ?? []).map(exactCapability))];
+    const projectIds = [...new Set(input.projectIds ?? [])].filter((id) => caller.projectId ? caller.projectId !== id
+      : caller.projectIds?.length ? !caller.projectIds.includes(id) : false);
+    const missing = projectIds.length ? capabilities : capabilities.filter((capability) => !allows(caller.caps, capability));
+    const baseAuthorization = projectIds.length ? previousTaskGrants(task).authorization : undefined;
+    return { ...(await this.permissionGrantors(task, organizationId, missing, projectIds, baseAuthorization)), missing };
+  }
+
+  /**
+   * Who can grant a task what it asks for, nearest first (SPEC §8.2). First
+   * the tasks it acts for — its parent, or the task that created it, and theirs
+   * in turn — that are still working and hold it all throughout the scope
+   * asked for; then the people (as summon groups, teams and individuals) and
+   * Avatars who hold it. `default` is whom a request naming no audience asks:
+   * the nearest such task, else the lowest level of people that can.
+   */
+  private async permissionGrantors(task: TaskRecord, organizationId: string, capabilities: Capability[],
+    projectIds: string[], baseAuthorization?: AuthorizationSelection): Promise<PermissionGrantors> {
     const taskCaps = (task.params?._authorization as { capabilities?: string[] } | undefined)?.capabilities ?? [];
     const required = projectIds.length ? [...taskCaps, ...capabilities] : capabilities;
     const scope = [...new Set([...(baseAuthorization?.projectIds ?? previousTaskGrants(task).authorization?.projectIds ?? [task.projectId]), ...projectIds])];
-    const members = (await this.deps.store.listOrganizationMemberships(organizationId)).map((member) => member.userId);
-    const eligible = await __asyncCollections.filter(members, async (userId) => {
+    const authorization = this.deps.authorization;
+    const tasks: PermissionGrantors['tasks'] = [];
+    const seen = new Set([task.id]);
+    for (let next = delegatorOf(task); next && !seen.has(next); ) {
+      seen.add(next);
+      const candidate = await this.deps.store.getTask(next);
+      if (!candidate) break;
+      next = delegatorOf(candidate);
+      if (['done', 'cancelled', 'failed'].includes(candidate.lastView?.status ?? '')) continue;
+      if ((await this.deps.store.getProject(candidate.projectId))?.organizationId !== organizationId) continue;
+      const held = await taskAuthorityNow(this.deps.store, authorization, candidate);
+      const reaches = held.scope === 'organization' || held.scope === 'global' ? true
+        : scope.every((id) => (held.scope === 'projects' ? held.projectIds ?? [] : [candidate.projectId]).includes(id));
+      if (reaches && required.every((capability) => allows(held.capabilities, capability)))
+        tasks.push({ taskId: candidate.id, ...(candidate.num ? { num: candidate.num } : {}), title: candidate.title, selector: `task:${candidate.id}` });
+    }
+    if (!authorization) return { tasks, users: [], teams: [], special: [], avatars: [], ...(tasks[0] ? { default: tasks[0].selector } : {}) };
+    const holdsAll = async (held: (projectId: string) => Promise<Capability[]>) => {
       for (const projectId of scope) {
-        const held = await authorization.capabilities(`user:${userId}`, projectId, organizationId);
-        if (!required.every((capability) => allows(held, capability))) return false;
+        const caps = await held(projectId);
+        if (!required.every((capability) => allows(caps, capability))) return false;
       }
       return true;
+    };
+    const members = (await this.deps.store.listOrganizationMemberships(organizationId)).map((member) => member.userId);
+    const eligible = await __asyncCollections.filter(members, (userId) =>
+      holdsAll((projectId) => authorization.capabilities(`user:${userId}`, projectId, organizationId)));
+    const eligibleSet = new Set(eligible);
+    const users = await __asyncCollections.map(eligible, async (id) => {
+      const name = (await this.deps.store.userDisplayName(id));
+      return { id, selector: `user:${id}`, ...(name ? { name } : {}) };
     });
-    return (await this.summonable(task.projectId, organizationId, eligible)).summon;
+    const teams = (await __asyncCollections.map((await this.deps.store.listTeams(organizationId, task.projectId)), async (team) => ({
+      id: team.id, name: team.name, slug: team.slug, selector: `@team:${team.slug}`,
+      eligibleUserIds: (await this.deps.store.listTeamMemberships(team.id)).map((member) => member.userId).filter((id) => eligibleSet.has(id)) })))
+      .filter((team) => team.eligibleUserIds.length);
+    const creatorUserId = (await this.deps.store.taskCreatorUserId(task.id));
+    const avatars = !creatorUserId ? [] : (await __asyncCollections.filter((await this.deps.store.listAvatars(task.projectId)), async (avatar) =>
+      (await avatarEnabled(this.deps.store, avatar))
+        && (!avatar.roles.length || avatar.roles.includes('authorize'))
+        && (await avatarCallableBy(this.deps.store, avatar, creatorUserId))
+        && (await holdsAll((projectId) => avatarAuthorizationCapabilities(this.deps.store, authorization, avatar, projectId)))))
+      .map((avatar) => ({ id: avatar.id, name: avatar.name, selector: `avatar:${avatar.id}` }));
+    const { special, summon } = await this.summonable(task.projectId, organizationId, eligible);
+    const nearest = tasks[0]?.selector ?? summon;
+    return { tasks, users, teams, special, avatars, ...(nearest ? { default: nearest } : {}) };
   }
 
   async authorizationEscalationTargets(
@@ -4928,17 +5049,14 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       organizationId: input.organizationId,
     }));
     if (!task || project?.organizationId !== input.organizationId) return [];
-    return (await new PermissionRequests(this.deps.store, input.organizationId)
-      .requests({ taskId: input.taskId, status: input.status }))
-      .map((request) => ({
-        ...request,
-        task: {
-          id: task.id,
-          ...(task.num != null ? { num: task.num } : {}),
-          title: task.title,
-          projectId: task.projectId,
-        },
-      }));
+    const summary = (record: TaskRecord) => ({ id: record.id, ...(record.num != null ? { num: record.num } : {}),
+      title: record.title, projectId: record.projectId });
+    return __asyncCollections.map(await new PermissionRequests(this.deps.store, input.organizationId)
+      .requests({ taskId: input.taskId, status: input.status }), async (request) => {
+        const grantors = (await __asyncCollections.map(request.taskRecipients ?? [], (id) => this.deps.store.getTask(id)))
+          .filter((record): record is TaskRecord => !!record);
+        return { ...request, task: summary(task), ...(grantors.length ? { grantorTasks: grantors.map(summary) } : {}) };
+      });
   }
 
   async resolvePermissionRequest(
@@ -4961,11 +5079,14 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       projectId: request.projectId,
       organizationId: input.organizationId,
     }));
-    const avatarId = caller.kind === 'agent' && caller.principal.startsWith('avatar:')
+    // A task the request was routed to decides through its own agent (permissionGrantors).
+    const grantorTaskId = caller.kind === 'agent' && caller.taskId !== '*'
+      && (request.taskRecipients ?? []).includes(caller.taskId) ? caller.taskId : undefined;
+    const avatarId = !grantorTaskId && caller.kind === 'agent' && caller.principal.startsWith('avatar:')
       ? caller.principal.slice(7) : undefined;
-    const humanUserId = avatarId ? undefined : caller.humanSubject?.userId;
-    if (!humanUserId && !avatarId)
-      throw new CapabilityError('a routed human or Avatar principal is required to resolve a permission request');
+    const humanUserId = avatarId || grantorTaskId ? undefined : caller.humanSubject?.userId;
+    if (!humanUserId && !avatarId && !grantorTaskId)
+      throw new CapabilityError('a routed person, Avatar or task is required to resolve a permission request');
     if (humanUserId && !request.recipients.includes(humanUserId)
       || avatarId && !(request.avatarRecipients ?? []).includes(avatarId))
       throw new CapabilityError('this permission request was not routed to you');

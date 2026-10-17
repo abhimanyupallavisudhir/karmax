@@ -172,6 +172,13 @@ export class TokenAuthority {
     return record;
   }
 
+  /** Whether a token for this scope may carry the human delegation `id`. */
+  async delegationCovers(id: string, scope: { projectId?: string; projectIds?: string[]; organizationId?: string }): Promise<boolean> {
+    const delegation = await this.delegation(id);
+    if (!delegation) return false;
+    try { this.assertScopeWithin(delegation, scope); return true; } catch { return false; }
+  }
+
   private assertScopeWithin(parent: Pick<ScopedToken | HumanDelegation, 'projectId' | 'projectIds' | 'organizationId'>,
     target: { projectId?: string; projectIds?: string[]; organizationId?: string }): void {
     if (parent.organizationId && target.organizationId !== parent.organizationId)

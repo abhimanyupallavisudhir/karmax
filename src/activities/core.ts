@@ -63,6 +63,8 @@ import { CredentialBroker } from '../autonomy/broker.js';
 import { VaultItems, removeTurnKeys, turnKeyDirectory } from '../autonomy/vault-items.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
 import { applyAvatarProfile, avatarAuthorizationCapabilities, avatarForRole, avatarPrincipal } from '../platform/avatars.js';
+import { DELEGATED_PROFILE, delegatedFromParent } from '../platform/delegation.js';
+import { baseTaskAuthority, delegationReaching, taskAuthorityNow, tokenScopeOf } from '../platform/task-authority.js';
 import { GitProfiles, userGitScope } from '../autonomy/git-profiles.js';
 import { worldRepos, worldRepoSource, worldRepoTarget } from '../world/types.js';
 import { pullRequestHandle, pullRequestView, isPullRequestView, proposalCheckouts } from '../world/pr-view.js';
@@ -1285,7 +1287,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     // An agent other than the main one acts with its own authority when it has
     // one (wiki features/collaboration-model); otherwise with the task's.
     const agentAuthorization = participantAuthorization(preparationTask?.params, participant);
-    const storedAuthorization = (agentAuthorization ?? preparationTask?.params?._authorization) as {
+    // A sub-task acts with its parent's authority as it is now (delegation.ts).
+    const delegated = !agentAuthorization && !avatar && delegatedFromParent(preparationTask)
+      ? await baseTaskAuthority(store, deps.authorization, preparationTask) : undefined;
+    const storedAuthorization = (agentAuthorization
+      ?? (delegated ? { ...preparationTask?.params?._authorization as object, ...delegated } : preparationTask?.params?._authorization)) as {
       capabilities?: string[];
       principal?: string;
       scope?: 'projects' | 'organization' | 'global';
@@ -1341,6 +1347,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         : (storedAuthorization?.delegationId ?? args.task.delegationId),
       externalIdentities: avatar?.githubAccountId ? { githubAccountId: avatar.githubAccountId } : undefined,
     };
+    if (delegated && deps.tokens) Object.assign(mintScope, await delegationReaching(store, deps.tokens, preparationTask!, mintScope));
     return { participant, preparationTask, orgVaultItems, grant, ceiling, effective, mintScope };
   }
 
@@ -1732,35 +1739,27 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       (await record(args.parentTaskId, 'subtask.created', { childTaskId: child.id, title: args.title, ...(args.pullRequest ? { pullRequest: true } : {}) }));
     }
     // Least-privilege grant (SPEC §8.2): the child's delegation caps are attenuated
-    // by the parent's own grant, and its merge cap is scoped to EXACTLY the parent's
-    // branch (which the parent owns and merges into). If no branch is known,
-    // the child gets no merge capability — never a broad fallback.
-    let currentGrant = [
-      ...((parent?.params?._authorization as { capabilities?: string[] } | undefined)?.capabilities ?? args.parentGrant ?? []),
-      ...await new PermissionRequests(store, currentProject?.organizationId ?? 'org_personal').extensionCaps(args.parentTaskId, 'do'),
-    ];
-    const authorizer = (parent?.params?._authorization as { principal?: string } | undefined)?.principal;
-    const parentAvatarId = (parent?.params?.['agent:do'] as { avatarId?: string } | undefined)?.avatarId
-      ?? (authorizer?.startsWith('avatar:') ? authorizer.slice(7) : undefined);
-    if (parentAvatarId) {
-      const avatar = await store.getAvatar(parentAvatarId);
-      currentGrant = attenuate(currentGrant, avatar
-        ? await avatarAuthorizationCapabilities(store, deps.authorization, avatar, args.projectId) : []);
-    }
+    // by the parent's authority now (task-authority.ts), and its merge cap is scoped
+    // to EXACTLY the parent's branch (which the parent owns and merges into). If no
+    // branch is known, the child gets no merge capability — never a broad fallback.
+    // This is the record it starts with; every turn it acts with its parent's
+    // authority as it is then (delegation.ts).
+    const parentNow = parent ? await taskAuthorityNow(store, deps.authorization, parent, { grant: args.parentGrant }) : undefined;
+    const currentGrant = parentNow?.capabilities ?? args.parentGrant ?? [];
     const delegation = attenuate(CHILD_TASK_CEILING, currentGrant);
     const mergeBack = args.parentBranch && allows(currentGrant, `merge-into:${args.parentBranch}`)
       ? [`merge-into:${args.parentBranch}`] : [];
     const grant = [...delegation, ...mergeBack];
     const parentAuthorization = parent?.params?._authorization as { delegationId?: string } | undefined;
-    const humanDelegation = parentAuthorization?.delegationId && deps.tokens
-      ? (await deps.tokens.deriveHumanDelegation(parentAuthorization.delegationId, {
-          taskId: child.id, projectId: args.projectId,
-          organizationId: (await store.getProject(args.projectId))?.organizationId,
-        }))
+    // The child's human delegation reaches as far as its tokens will: its parent's scope.
+    const humanDelegation = parent && parentAuthorization?.delegationId && deps.tokens
+      ? (await deps.tokens.deriveHumanDelegation(parentAuthorization.delegationId, { taskId: child.id,
+          ...tokenScopeOf(parentNow!, args.projectId,
+            (await store.getProject(args.projectId))?.organizationId) }))
       : undefined;
     (await store.updateTaskParams(child.id, {
       ...child.params,
-      _authorization: { profileId: 'inherited-child', principal: `task:${args.parentTaskId}`,
+      _authorization: { profileId: DELEGATED_PROFILE, principal: `task:${args.parentTaskId}`,
         capabilities: grant, attenuated: true, ...(humanDelegation ? { delegationId: humanDelegation.id } : {}) },
       ...(humanDelegation?.externalIdentities?.githubAccountId
         ? { _githubAccountId: humanDelegation.externalIdentities.githubAccountId } : {}),
@@ -1784,7 +1783,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       grant,
       grantPrincipal: `task:${args.parentTaskId}`,
       delegationId: humanDelegation?.id,
-      authorizationProfile: 'inherited-child',
+      authorizationProfile: DELEGATED_PROFILE,
     };
   }
 

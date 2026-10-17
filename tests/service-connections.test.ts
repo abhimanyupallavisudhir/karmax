@@ -46,6 +46,18 @@ describe('service connections', () => {
     const view = JSON.stringify((await service.list(org, { taskId: 'task_a', projectId: project })));
     for (const value of ['project-key-private', 'session-private', 'ca_exact', '/link/secret']) expect(view).not.toContain(value);
   });
+  it('lets a sub-task use the account its parent connected, and no other task', async () => {
+    const parent = await store.createTask({ projectId: project, title: 'Parent', workflow: 'software-dev', workflowVersion: '1', params: { prompt: '' } });
+    const child = await store.createTask({ projectId: project, title: 'Child', workflow: 'software-dev', workflowVersion: '1', parentTaskId: parent.id,
+      params: { prompt: '', _authorization: { profileId: 'inherited-child', principal: `task:${parent.id}`, capabilities: ['connection:use'] } } });
+    const peer = await store.createTask({ projectId: project, title: 'Peer', workflow: 'software-dev', workflowVersion: '1', params: { prompt: '' } });
+    const id = await connected(parent.id);
+    expect((await service.list(org, { taskId: child.id, projectId: project })).map((c) => c.id)).toEqual([id]);
+    expect((await service.request(org, 'gmail', child.id, 'do', 'Read mail')).id).toBe(id);
+    await expect(service.execute(org, id, child.id, project, 'GMAIL_FETCH_EMAILS', {})).resolves.toBeDefined();
+    expect(await service.list(org, { taskId: peer.id, projectId: project })).toEqual([]);
+    await expect(service.execute(org, id, peer.id, project, 'GMAIL_FETCH_EMAILS', {})).rejects.toThrow(/not been shared/);
+  });
   it('shares one durable provider identity across concurrent connection requests', async () => {
     const [gmail, slack] = await Promise.all([
       service.request(org, 'gmail', 'task_a', 'do', 'Read mail'),

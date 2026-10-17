@@ -18747,7 +18747,10 @@ function permissionRequestRows(requests, { historyLimit = 20 } = {}) {
         `<span class="chip mono">${esc(capability)}</span>`).join(' ')}</div>
       ${request.projectIds?.length ? `<div class="approval-request-projects">Add projects: ${request.projectIds.map((id) => `<span class="chip mono">${esc(projectById(id)?.name || id)}</span>`).join(' ')}</div>` : ''}
       <div class="task-sub">${credentialRequestTaskLink(request)} — ${esc(request.reason)}</div>
-      <div class="approval-request-help">Requested from ${request.audience.map(esc).join(', ')}. ${request.projectIds?.length ? `Approval grants the full ${esc(request.baseAuthorization?.level || 'selected')} authorization across these and the existing projects. Existing permissions for all task roles apply there too. Listed capabilities are granted to the ${esc(request.role || 'requesting')} agent.` : `Approval grants only these exact capabilities to this task’s ${esc(request.role || 'requesting')} agent.`}</div>
+      <div class="approval-request-help">Requested from ${request.audience.map((selector) => {
+        const grantor = selector.startsWith('task:') ? (request.grantorTasks || []).find((task) => task.id === selector.slice(5)) : undefined;
+        return grantor ? credentialRequestTaskLink({ taskId: grantor.id, task: grantor }) : esc(selector);
+      }).join(', ')}. ${request.projectIds?.length ? `Approval grants the full ${esc(request.baseAuthorization?.level || 'selected')} authorization across these and the existing projects. Existing permissions for all task roles apply there too. Listed capabilities are granted to the ${esc(request.role || 'requesting')} agent.` : `Approval grants only these exact capabilities to this task’s ${esc(request.role || 'requesting')} agent.`}</div>
     </div>
     <div class="approval-request-actions">
       <button class="btn sm primary" data-preq-act="approve">Approve for agent</button>
@@ -18778,7 +18781,10 @@ function authorizationRequestRows(requests, { historyLimit = 20 } = {}) {
       <div class="approval-request-caps"><span class="chip">${esc(authorizationSummary(request.authorization,
         S.projects.filter((project) => project.organizationId === request.organizationId)))}</span></div>
       <div class="task-sub">${esc(request.reason)}</div>
-      <div class="approval-request-help">Requested from ${request.audience.map(esc).join(', ')}. Approval delegates this authorization directly to the ${esc(request.target.kind)}; it does not elevate the requester.</div>
+      <div class="approval-request-help">Requested from ${request.audience.map((selector) => {
+        const grantor = selector.startsWith('task:') ? (request.grantorTasks || []).find((task) => task.id === selector.slice(5)) : undefined;
+        return grantor ? credentialRequestTaskLink({ taskId: grantor.id, task: grantor }) : esc(selector);
+      }).join(', ')}. Approval delegates this authorization directly to the ${esc(request.target.kind)}; it does not elevate the requester.</div>
     </div>
     <div class="approval-request-actions">
       ${canResolve ? '<button class="btn sm primary" data-areq-act="approve">Approve authorization</button><button class="btn sm" data-areq-act="deny">Deny</button>'
