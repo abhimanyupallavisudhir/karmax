@@ -233,6 +233,96 @@ function installInteractionTracking() {
 }
 if (typeof document !== 'undefined') installInteractionTracking();
 
+// ── Unsaved changes ──────────────────────────────────────────────────────────
+// A form whose edits wait for a Save button marks its region `data-unsaved`
+// and that button `data-unsaved-save`. While what is on screen differs from
+// what was last saved, a `.save-state` note says "Unsaved changes" beside the
+// button. The comparison point is taken when someone starts interacting with
+// the region (it is fully loaded by then), so late hydration never reads as
+// an edit; it moves on only once a save succeeds (`markSaved`, which
+// `flashSaved` calls) or the region re-renders.
+const unsavedRegions = new WeakMap(); // region -> { baseline, pending, dirty }
+// Search boxes and menus inside pickers are navigation, not values.
+const UNSAVED_IGNORE = '.mcp-menu, .combo-menu, [role="listbox"], .mcp-filter, .payment-search, [data-unsaved-ignore]';
+function unsavedSignature(region) {
+  const parts = [];
+  for (const el of region.querySelectorAll('input, select, textarea, .mcp-picker, .task-payments, .authz-editor, [data-unsaved-value]')) {
+    if (el.closest(UNSAVED_IGNORE) || ['button', 'submit', 'reset', 'file'].includes(el.type)) continue;
+    if (el.hasAttribute('data-unsaved-value')) parts.push(el.dataset.unsavedValue);
+    else if (el.matches('.mcp-picker')) parts.push(el.dataset.value || '');
+    else if (el.matches('.task-payments')) parts.push(el.dataset.policy || '');
+    else if (el.matches('.authz-editor')) parts.push(el.dataset.authorization || '');
+    else if (el.type === 'checkbox' || el.type === 'radio') parts.push(el.checked);
+    else if (el.multiple) parts.push([...el.selectedOptions].map((option) => option.value));
+    else parts.push(el.value);
+  }
+  return JSON.stringify(parts);
+}
+function unsavedState(region) {
+  let state = unsavedRegions.get(region);
+  if (!state) unsavedRegions.set(region, state = { baseline: null, pending: null, dirty: false });
+  return state;
+}
+const SAVE_STATE_TEXT = { dirty: 'Unsaved changes', saving: 'Saving…', saved: 'Saved', error: 'Not saved' };
+/** Paint a `.save-state` note: dirty | saving | saved | error, or '' to hide it. */
+function paintSaveState(note, state, text = SAVE_STATE_TEXT[state] || '') {
+  if (!note) return;
+  note.dataset.state = state || '';
+  note.textContent = state ? text : '';
+}
+function paintUnsaved(region) {
+  const button = region.querySelector('[data-unsaved-save]');
+  if (!button) return;
+  let note = button.previousElementSibling;
+  if (!note?.matches('.save-state')) {
+    if (!unsavedState(region).dirty) return;
+    note = document.createElement('span');
+    note.className = 'save-state';
+    note.setAttribute('role', 'status');
+    button.before(note);
+  }
+  paintSaveState(note, unsavedState(region).dirty ? 'dirty' : '');
+}
+/** Re-compare a region with its saved state, e.g. after a picker outside it changed its value. */
+function checkUnsaved(el) {
+  const region = el?.closest?.('[data-unsaved]');
+  if (!region) return;
+  const state = unsavedState(region);
+  if (state.baseline == null) return;
+  state.dirty = unsavedSignature(region) !== state.baseline;
+  paintUnsaved(region);
+}
+/** The save started from `button` landed: what was on screen then is now saved. */
+function markSaved(button) {
+  const region = button?.closest?.('[data-unsaved]');
+  if (!region) return;
+  const state = unsavedState(region);
+  state.baseline = state.pending ?? unsavedSignature(region);
+  state.pending = null;
+  checkUnsaved(region);
+}
+function installUnsavedTracking() {
+  const begin = (event) => {
+    const region = event.target.closest?.('[data-unsaved]');
+    if (!region) return;
+    const state = unsavedState(region);
+    if (!state.dirty) state.baseline = unsavedSignature(region);
+  };
+  document.addEventListener('pointerdown', begin, true);
+  document.addEventListener('focusin', begin, true);
+  document.addEventListener('input', (event) => checkUnsaved(event.target));
+  document.addEventListener('change', (event) => checkUnsaved(event.target));
+  let clicked = null;
+  document.addEventListener('click', (event) => {
+    clicked = event.target.closest?.('[data-unsaved]') || null;
+    if (clicked && event.target.closest('[data-unsaved-save]')) unsavedState(clicked).pending = unsavedSignature(clicked);
+  }, true);
+  // Add/remove buttons change the form without an input event (and may remove
+  // themselves, so the region is the one found before the click ran).
+  document.addEventListener('click', () => { if (clicked?.isConnected) checkUnsaved(clicked); clicked = null; });
+}
+if (typeof document !== 'undefined') installUnsavedTracking();
+
 function actionLabel(control) {
   return String(control?.getAttribute?.('aria-label') || control?.title || control?.textContent || 'Action')
     .replace(/\s+/g, ' ').trim().slice(0, 80) || 'Action';
@@ -7960,7 +8050,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
           ${formAttemptGroup?.attempts?.length > 1 ? `<nav class="attempts-list tf-attempts" aria-label="Choose an attempt">
             ${formAttemptGroup.attempts.map((a) => attemptCard(a, formAttemptGroup, { taskId: draft.id }, { form: true })).join('')}
           </nav>` : ''}
-          <span class="tf-savestate" id="tf-savestate" aria-live="polite"></span>
+          <span class="tf-savestate save-state quiet" id="tf-savestate" role="status"></span>
           <select id="tf-wf" title="${workflowEditable ? 'Workflow' : 'Workflow is locked after the task is queued'}" ${workflowEditable ? '' : 'disabled'}>${taskFormWorkflows(wf, draft).map((w) => `<option value="${esc(w.id)}" ${w.id === wf ? 'selected' : ''}>${esc(w.label)}</option>`).join('')}</select>
         </div>
       </div>
@@ -8314,12 +8404,15 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     // in the chain runs — e.g. closeForm clears the form right after queuing the flush).
     const sig = stateSig(st);
     saveChain = saveChain.then(async () => {
-      if (!draftId && !hasContent(st)) return; // nothing worth creating a draft for yet
-      if (sig === lastSaved) return; // no change since the last write landed
-      if (activeFormToken === formToken) {
-        const ss = $('#tf-savestate');
-        if (ss) ss.textContent = editInPlace ? 'Saving…' : 'Saving draft…';
+      const current = activeFormToken === formToken;
+      // Nothing to write: the head must not keep saying "Unsaved changes".
+      if ((!draftId && !hasContent(st)) || sig === lastSaved) {
+        if (current && $('#tf-savestate')?.dataset.state === 'dirty') {
+          paintSaveState($('#tf-savestate'), draftId ? 'saved' : '', editInPlace ? 'Saved' : 'Draft saved');
+        }
+        return;
       }
+      if (current) paintSaveState($('#tf-savestate'), 'saving', editInPlace ? 'Saving…' : 'Saving draft…');
       try {
         if (!draftId) {
           const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, draft: true, allowAttenuation: true }) });
@@ -8337,15 +8430,14 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
         lastSaved = sig;
         // Quiet auto-save indicator in the page head. Guard on the form token: this
         // chain link can land after a NEWER form instance has mounted its own head.
-        if (activeFormToken === formToken) { const ss = $('#tf-savestate'); if (ss) ss.textContent = editInPlace ? 'Saved' : 'Draft saved'; }
+        if (activeFormToken === formToken) paintSaveState($('#tf-savestate'), 'saved', editInPlace ? 'Saved' : 'Draft saved');
         refreshTasks();
       } catch {
         // Auto-save used to fail silently, leaving the form looking saved while
         // the latest edit existed only in this tab. Keep the form open and the
         // dirty signature retryable, but tell the user the durable write missed.
         if (activeFormToken === formToken) {
-          const ss = $('#tf-savestate');
-          if (ss) ss.textContent = `${editInPlace ? 'Not saved' : 'Draft not saved'} — keep editing to retry`;
+          paintSaveState($('#tf-savestate'), 'error', `${editInPlace ? 'Not saved' : 'Draft not saved'} — keep editing to retry`);
         }
       }
     });
@@ -8355,8 +8447,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   // Debounced auto-save while typing.
   let saveTimer = null;
   function autoSaveSoon() {
-    const ss = $('#tf-savestate');
-    if (ss) ss.textContent = 'Unsaved changes';
+    paintSaveState($('#tf-savestate'), 'dirty');
     clearTimeout(saveTimer);
     saveTimer = setTimeout(() => { if (activeFormToken !== formToken) return; persistDraft(); }, 800);
   }
@@ -8369,7 +8460,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     forkBox?._pickResume?.(opts.fork.resumeFrom, opts.fork.task, opts.fork.session);
     clearTimeout(saveTimer);
     lastSaved = stateSig(formState());
-    $('#tf-savestate').textContent = '';
+    paintSaveState($('#tf-savestate'), '');
   }
   // The payments row fills in its inherited policy once the cards load; that is
   // not an edit either, so an untouched form stays untouched.
@@ -8426,10 +8517,9 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       submitInFlight = true;
       activeFeedback = beginActionFeedback(draftMode ? $('#tf-draft') : $('#tf-queue'));
       submitButtons.forEach((button) => { button.disabled = true; });
-      const saveState = $('#tf-savestate');
-      if (saveState) saveState.textContent = draftMode
+      paintSaveState($('#tf-savestate'), 'saving', draftMode
         ? 'Saving draft…'
-        : editInPlace ? 'Saving…' : 'Starting task…';
+        : editInPlace ? 'Saving…' : 'Starting task…');
     }
     let succeeded = false;
     clearTimeout(saveTimer);
@@ -8611,7 +8701,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
         });
         if (!succeeded) {
           const saveState = $('#tf-savestate');
-          if (saveState && !/not saved/i.test(saveState.textContent || '')) saveState.textContent = 'Not submitted — ready to retry';
+          if (saveState?.dataset.state !== 'error') paintSaveState(saveState, 'error', 'Not submitted — ready to retry');
         }
       }
     }
@@ -12199,7 +12289,7 @@ function mainAuthorityParams(v) {
         ${payments}
       </div>
       <div class="params-save-bar" data-save-state="saved">
-        <span class="params-save-status" id="tp-auth-status" role="status" aria-live="polite">All authorization changes saved</span>
+        <span class="save-state" id="tp-auth-status" role="status"></span>
         <button class="btn sm primary" id="tp-auth-save" disabled>Save authorization</button>
       </div>
     </div>` };
@@ -12245,9 +12335,12 @@ async function wireTaskAuthorization(v) {
     if (!sameJson(draft.saved, draft.values) || draft.saving) edits[v.taskId] = draft;
     else delete edits[v.taskId];
     saveBtn.disabled = draft.saving || !dirty;
-    saveBtn.textContent = draft.saving ? 'Saving authorization…' : 'Save authorization';
-    status.textContent = draft.saving ? 'Saving authorization…' : dirty ? 'Unsaved authorization changes' : 'All authorization changes saved';
-    saveBtn.closest('.params-save-bar').dataset.saveState = draft.saving ? 'saving' : dirty ? 'dirty' : 'saved';
+    const bar = saveBtn.closest('.params-save-bar');
+    const state = draft.saving ? 'saving' : dirty ? 'dirty' : 'saved';
+    // "Saved" shows once, as a save lands; an untouched form says nothing.
+    const landed = state === 'saved' && (bar.dataset.saveState === 'saving' || status.dataset.state === 'saved');
+    paintSaveState(status, state === 'saved' && !landed ? '' : state);
+    bar.dataset.saveState = state;
   };
   draft.sync = syncAuthorization;
   syncAuthorization();
@@ -12990,10 +13083,7 @@ function paramsSection(v) {
         <div class="pf-ro">${esc(triggerSummary(rec.params.triggers))}</div></div>` : '';
   const footer = editable.size
     ? `<div class="params-save-bar" data-save-state="${editDraft?.dirtyNames?.length ? 'dirty' : 'saved'}">
-        <span class="params-save-status" id="params-save-status" role="status" aria-live="polite">
-          <span class="params-save-dot" aria-hidden="true"></span>
-          <span>${editDraft?.dirtyNames?.length ? 'Unsaved parameter changes' : 'All parameter changes saved'}</span>
-        </span>
+        <span class="save-state" id="params-save-status" role="status" data-state="${editDraft?.dirtyNames?.length ? 'dirty' : ''}">${editDraft?.dirtyNames?.length ? 'Unsaved changes' : ''}</span>
         <button class="btn sm primary" id="params-save" ${editDraft?.dirtyNames?.length ? '' : 'disabled'}>Save parameter changes</button>
       </div>`
     : `<div class="task-sub" style="color:var(--ink-3)">${terminal
@@ -13140,14 +13230,13 @@ function paramDirtyNames(saved, current, fields) {
 }
 
 function setParamSaveState(root, saveBtn, status, state) {
+  // "Saved" shows once, as a save lands; an untouched form says nothing.
+  const landed = state === 'saved' && (root.dataset.saveState === 'saving' || status.dataset.state === 'saved');
   root.dataset.saveState = state;
   const bar = saveBtn.closest('.params-save-bar');
   if (bar) bar.dataset.saveState = state;
   saveBtn.disabled = state !== 'dirty';
-  saveBtn.textContent = state === 'saving' ? 'Saving parameter changes…' : 'Save parameter changes';
-  status.lastElementChild.textContent = state === 'dirty'
-    ? 'Unsaved parameter changes'
-    : state === 'saving' ? 'Saving parameter changes…' : 'All parameter changes saved';
+  paintSaveState(status, state === 'saved' && !landed ? '' : state);
 }
 
 function wireParams(v) {
@@ -15098,6 +15187,7 @@ function fmtReset(epoch) {
 // Confirmation happens where the eye already is: the pressed button itself says
 // Saved for a moment, instead of a toast in the far corner naming wire ids.
 function flashSaved(button) {
+  markSaved(button);
   if (!button || button.dataset.flashing) return;
   button.dataset.flashing = '1';
   const label = button.textContent;
@@ -15141,7 +15231,7 @@ function settingsForms(scope, projectId) {
   // collapsed Authorization row with the authorization, vault and payment
   // defaults), the Responder, the Review route, the Computer, then branches —
   // saved together.
-  const common = `<div class="card task-defaults parameter-fields" id="task-defaults-${scope}">
+  const common = `<div class="card task-defaults parameter-fields" id="task-defaults-${scope}" data-unsaved>
       <section class="td-section td-agent"><div id="profiles-list-${scope}">Loading…</div></section>
       <section class="td-section td-routes"><div id="review-route-${scope}">Loading…</div></section>
       <section class="td-section td-computer" data-wf="__common__" data-schema-wf="software-dev" data-part="computer">
@@ -15150,16 +15240,16 @@ function settingsForms(scope, projectId) {
       <section class="td-section td-where" data-wf="__common__" data-schema-wf="software-dev">
         <div class="wf-form parameter-fields">${renderFields(commonSettingsFields(scope))}</div>
       </section>
-      <div class="td-actions"><button class="btn primary sm" data-save-task-defaults>Save task defaults</button><span class="resource-error" role="status"></span></div>
+      <div class="td-actions"><button class="btn primary sm" data-save-task-defaults data-unsaved-save>Save task defaults</button><span class="resource-error" role="status"></span></div>
     </div>`;
   const unique = wfs
     .map((s) => {
       const fields = settingsFields(s.name, scope).filter((field) => !COMMON_DEFAULT_NAMES.has(field.name));
       if (!fields.length) return '';
-      return `<details class="card" data-wf="${esc(s.name)}" ${s.name === 'software-dev' ? 'open' : ''}>
+      return `<details class="card" data-wf="${esc(s.name)}" data-unsaved ${s.name === 'software-dev' ? 'open' : ''}>
         <summary style="cursor:pointer;font-weight:600">${esc(s.name)} <span style="color:var(--ink-3);font-weight:400;font-size:12px">— workflow-specific</span></summary>
         <div class="wf-form parameter-fields" style="margin-top:10px">${renderFields(fields)}</div>
-        <button class="btn primary sm" data-save="${esc(s.name)}">Save ${esc(s.name)} defaults</button>
+        <button class="btn primary sm" data-save="${esc(s.name)}" data-unsaved-save>Save ${esc(s.name)} defaults</button>
       </details>`;
     })
     .join('');
@@ -15249,6 +15339,8 @@ async function hydrateResourceDefaults(scope, projectId, organizationId) {
     const paint = () => {
       if (summary) summary.textContent = agentAuthoritySummary(box._current(), projects);
       button.querySelector('.tf-vault-count').textContent = `${ids.size} selected`;
+      // The vault choice lives in this closure; expose it to the unsaved check.
+      box.dataset.unsavedValue = JSON.stringify([[...ids].sort(), policies]);
     };
     box._current = () => ({ authorization: readAuthorizationEditor(editor), credentialGrants: [...ids].map(id => `use-credential:item:${id}`),
       credentialPolicies: policies, paymentPolicy: readTaskPayments(payments) });
@@ -15256,7 +15348,7 @@ async function hydrateResourceDefaults(scope, projectId, organizationId) {
     editor.querySelector('.authz-level-select').title = 'The authorization a task gets unless it chooses one; never more than its creator holds. An empty project list means the task’s own project.';
     const button = box.querySelector('.resource-vault');
     button.disabled = false;
-    button.onclick = () => openVaultGrantPicker(items, ids, policies, (selected, overrides) => { ids = new Set(selected); policies = overrides; vaultDirty = true; paint(); });
+    button.onclick = () => openVaultGrantPicker(items, ids, policies, (selected, overrides) => { ids = new Set(selected); policies = overrides; vaultDirty = true; paint(); checkUnsaved(box); });
     const payments = box.querySelector('.task-payments');
     await wireTaskPayments(payments, projectId, undefined, undefined, organizationId);
     if (!current()) return;
@@ -15293,7 +15385,7 @@ async function hydrateResourceDefaults(scope, projectId, organizationId) {
 function explanationSettingsCard(scope) {
   if (!explanationsEnabled()) return '';
   const id = scope === 'project' ? 'project-explanation' : 'settings-explanation';
-  return `<div class="card explanation-settings" id="${id}">
+  return `<div class="card explanation-settings" id="${id}" data-unsaved>
     <div class="section-h">Explanation model</div>
     <p class="task-sub">Used by “Explain this” below agent messages. It always uses a registered API key, never a Codex or Claude subscription.</p>
     <div class="settings-grid">
@@ -15302,7 +15394,7 @@ function explanationSettingsCard(scope) {
       <label class="form-row wide"><span>Prompt sent to the explanation model</span><textarea class="explanation-setting-prompt" rows="5"></textarea></label>
     </div>
     <p class="task-sub explanation-setting-effective"></p>
-    <button class="btn primary sm explanation-settings-save">Save explanation defaults</button>
+    <button class="btn primary sm explanation-settings-save" data-unsaved-save>Save explanation defaults</button>
   </div>`;
 }
 
@@ -15328,21 +15420,22 @@ async function hydrateExplanationSettings(scope, projectId, organizationId) {
   prompt.placeholder = inherited.prompt;
   card.querySelector('.explanation-setting-effective').textContent = `Effective model: ${data.effective?.model || inherited.model}`;
   card.querySelector('.explanation-settings-save').addEventListener('click', async (event) => {
+    const button = event.currentTarget; // null once the save has been awaited
     const values = { endpoint: endpoint.value.trim(), model: model.value.trim(), prompt: prompt.value.trim() };
     try {
       const saved = await api(url, { method: 'PUT', body: JSON.stringify({ values }) });
       card.querySelector('.explanation-setting-effective').textContent = `Effective model: ${saved.effective.model}`;
-      flashSaved(event.currentTarget);
+      flashSaved(button);
     } catch (error) { toast(error.message, true); }
   });
 }
 
 function hostCapacityCard() {
   const fields = settingsFields('agent-queue', 'global');
-  return `<div class="card" id="host-capacity-card" data-wf="agent-queue">
+  return `<div class="card" id="host-capacity-card" data-wf="agent-queue" data-unsaved>
     <div class="wf-form parameter-fields">${renderFields(fields)}</div>
-    <button class="btn primary sm" id="host-capacity-save">Save</button>
-    <div class="setting-rows ruled" style="margin-top:14px"><div class="setting-row">
+    <button class="btn primary sm" id="host-capacity-save" data-unsaved-save>Save</button>
+    <div class="setting-rows ruled" style="margin-top:14px" data-unsaved-ignore><div class="setting-row">
       <label class="setting-label" for="timing-enabled">Response timing ${policyTip('Record response measurements and show the Timing tab. Existing measurements are kept when off.')}</label>
       <span class="setting-value"></span>
       <span class="setting-actions"><input class="toggle" type="checkbox" id="timing-enabled" ${S.meta?.timingEnabled ? 'checked' : ''}></span>
@@ -15360,10 +15453,11 @@ async function wireHostCapacityCard() {
   const inherited = Object.fromEntries(fields.filter((f) => f.default !== undefined).map((f) => [f.name, f.default]));
   card.querySelector('.wf-form').innerHTML = renderFields(fields, own, inherited);
   card.querySelector('#host-capacity-save')?.addEventListener('click', async (event) => {
+    const button = event.currentTarget; // null once the save has been awaited
     const values = collectForm(card.querySelector('.wf-form'), fields);
     try {
       await api('/api/settings/global/agent-queue', { method: 'PUT', body: JSON.stringify({ values }) });
-      flashSaved(event.currentTarget);
+      flashSaved(button);
     } catch (error) { toast(error.message, true); }
   });
 }
@@ -16383,7 +16477,7 @@ function settingsView(proj) {
     <div class="project-config-section" id="project-services"><div><h2>Services ${policyTip('Live systems tasks connect to. Use an external service for an API, hosted database or S3 bucket that tasks call directly, and a per-task container for an isolated dependency such as Postgres or Redis. Credentials belong in Secrets.')}</h2></div></div>
     <div class="card"><div id="project-services-box">Loading…</div></div>
     <div class="project-config-section" id="project-environment"><div><h2>Environment ${policyTip('The base image, tools, setup and boot commands every task starts with.')}</h2></div></div>
-    <div class="card"><div id="project-environment-box">Loading…</div></div>
+    <div class="card"><div id="project-environment-box" data-unsaved>Loading…</div></div>
     <div class="project-config-section" id="project-computers"><div><h2>Computers ${policyTip('The cloud computers this organization’s tasks run on. A task’s own computer—its size, experience and network—is set in Task defaults and the task form.')}</h2></div></div>
     <div class="card"><div class="setting-rows"><div class="setting-row"><span class="setting-label">Cloud computers</span>
       <span class="setting-value setting-muted">Shared by the organization’s projects</span>
@@ -16404,9 +16498,9 @@ function settingsView(proj) {
       <div class="setting-rows" id="wf-pins-list">Loading…</div></div>
     <div class="settings-section-title" id="project-advanced" data-settings-advanced hidden><div>Advanced</div></div>
     <div class="card" data-settings-advanced hidden><div class="setting-rows">
-      <div class="setting-row" data-settings-access="project" hidden><span class="setting-label">Name ${policyTip('Use / to put the project in folders, e.g. Clients/Website.')}</span>
+      <div class="setting-row" data-settings-access="project" data-unsaved hidden><span class="setting-label">Name ${policyTip('Use / to put the project in folders, e.g. Clients/Website.')}</span>
         <span class="setting-value"><input id="project-name" class="setting-input" value="${esc(projectPath(proj))}" placeholder="Folder/Project" aria-label="Project name, including folders"></span>
-        <span class="setting-actions"><button class="btn sm primary" id="rename-project">Save</button></span></div>
+        <span class="setting-actions"><button class="btn sm primary" id="rename-project" data-unsaved-save>Save</button></span></div>
       <div class="setting-row" data-settings-access="projectTransfer" hidden><span class="setting-label">Organization</span>
         <span class="setting-value">${esc(organizationById(proj.organizationId)?.name || '')}</span>
         <span class="setting-actions"><button class="btn sm" id="move-project">Move…</button></span></div>
@@ -16904,7 +16998,7 @@ async function hydrateProjectEnvironment(proj) {
         <label class="form-row wide"><span title="Runs as each task starts">Boot commands</span><textarea id="environment-boot" rows="3" placeholder="npm run db:migrate&#10;python manage.py migrate&#10;uv run python manage.py migrate">${esc((spec?.boot || []).join('\n'))}</textarea></label>
         <label class="switch form-row wide"><input id="environment-docker" type="checkbox" ${spec?.includeDocker ? 'checked' : ''}><span><b>Include Docker</b><small class="field-help">Required when per-task Services run as containers inside the world.</small></span></label>
       </div>
-      <div class="project-form-actions"><button class="btn sm" id="environment-save">Save recipe</button><button class="btn sm primary" id="environment-build">Build now</button></div>
+      <div class="project-form-actions"><button class="btn sm" id="environment-save" data-unsaved-save>Save recipe</button><button class="btn sm primary" id="environment-build">Build now</button></div>
       ${builds.length ? `<div class="section-h">Builds</div>${builds.map(build).join('')}` : ''}`;
     box.querySelectorAll('[data-environment-recover]').forEach(button => button.addEventListener('click', async () => {
       const record = builds.find(build => build.recoveryRevision === button.dataset.environmentRecover);
@@ -16938,6 +17032,7 @@ async function hydrateProjectEnvironment(proj) {
         box.querySelector('#environment-evidence').innerHTML = proposal.evidence.length
           ? `<p class="task-sub">Evidence: ${proposal.evidence.map(esc).join(' · ')}</p>`
           : '<p class="task-sub">No devcontainer or recognized lockfile found.</p>';
+        checkUnsaved(box);
       } catch (error) { toast(error.message, true); }
     });
     box.querySelector('#environment-save')?.addEventListener('click', async () => {
@@ -17509,10 +17604,10 @@ async function hydrateSettingsAccess(scope) {
  * everyone, including on the sign-in screen before any organization is known. */
 function appearanceCard() {
   return `<div class="card" id="appearance-card">
-      <div class="setting-rows" style="margin-bottom:14px"><div class="setting-row">
+      <div class="setting-rows" style="margin-bottom:14px"><div class="setting-row" data-unsaved>
         <label class="setting-label" for="site-name">Site name ${policyTip('Shown in the console, the sign-in screen, the browser tab, the installed app and account email.')}</label>
         <span class="setting-value"><input id="site-name" class="setting-input" maxlength="48" autocomplete="off" /></span>
-        <span class="setting-actions"><button class="btn sm primary" id="site-name-save" type="button">Save</button></span>
+        <span class="setting-actions"><button class="btn sm primary" id="site-name-save" type="button" data-unsaved-save>Save</button></span>
       </div></div>
       <div class="brand-picker" id="brand-picker">
         ${BRAND_ICON_CHOICES.map((c) => `<button type="button" class="brand-option" data-icon="${esc(c.id)}" aria-pressed="false">
@@ -17577,7 +17672,7 @@ async function wireAppearanceCard() {
 
 function globalSettingsView(embedded = false) {
   return `
-    ${embedded ? '<div class="settings-section-title" id="settings-defaults"><div>Task defaults ${policyTip(`How new tasks begin, unless a project or task says otherwise`)}</div></div>' : '<div class="page-title">Organization settings</div><p style="color:var(--ink-2);margin-top:-8px">How new tasks behave unless a project or task deliberately changes something.</p>'}
+    ${embedded ? `<div class="settings-section-title" id="settings-defaults"><div>Task defaults ${policyTip('How new tasks begin, unless a project or task says otherwise')}</div></div>` : '<div class="page-title">Organization settings</div><p style="color:var(--ink-2);margin-top:-8px">How new tasks behave unless a project or task deliberately changes something.</p>'}
     ${settingsForms('global')}
     <div class="settings-section-title" id="settings-payments"><div>Passwords &amp; payments ${policyTip(`Credentials agents may use on your behalf, and what tasks may spend`)}</div></div>
     <div class="card" id="settings-connections"><div class="section-h">Connected apps ${policyTip('Apps agents can use through MCP or Composio. Choose which ones new tasks get in Task defaults.')}</div>
@@ -17956,7 +18051,7 @@ function paymentsCard(scope) {
 }
 
 function stripePlatformCard() {
-  return '<div class="card" id="stripe-platform-card"><div class="task-sub">Loading Stripe platform setup…</div></div>';
+  return '<div class="card" id="stripe-platform-card" data-unsaved><div class="task-sub">Loading Stripe platform setup…</div></div>';
 }
 
 async function wireStripePlatformCard() {
@@ -17978,7 +18073,7 @@ async function wireStripePlatformCard() {
       <label class="form-row">OAuth callback URL<input value="${esc(platform.callbackUrl)}" readonly /></label>
       <label class="form-row">Webhook destination URL<input value="${esc(platform.webhookUrl)}" readonly /></label>
     </div>
-    <button class="btn sm primary stripe-platform-save">Save Stripe platform setup</button>
+    <button class="btn sm primary stripe-platform-save" data-unsaved-save>Save Stripe platform setup</button>
     ${platform.source === 'environment' ? '<p class="task-sub">Environment values currently supply this setup. Saved replacements use the encrypted vault and take precedence.</p>' : ''}`;
   box.querySelector('.stripe-platform-save')?.addEventListener('click', async (event) => {
     try {
@@ -17994,7 +18089,7 @@ async function wireStripePlatformCard() {
 }
 
 function paidLaunchCard() {
-  return '<div class="card" id="paid-launch-card"><div class="task-sub">Loading paid-launch setup…</div></div>';
+  return '<div class="card" id="paid-launch-card" data-unsaved><div class="task-sub">Loading paid-launch setup…</div></div>';
 }
 
 async function wirePaidLaunchCard() {
@@ -18079,7 +18174,7 @@ async function wirePaidLaunchCard() {
     <div class="card" style="margin-top:18px;padding:14px;border-color:${state.paidLaunch ? 'var(--ok,#4ec9a3)' : 'var(--line)'}">
       <label style="display:flex;gap:10px;align-items:flex-start"><input type="checkbox" class="paid-launch-enabled" ${state.paidLaunch ? 'checked' : ''} ${state.canEnable || state.paidLaunch ? '' : 'disabled'} /><span><b>Enable real paid checkout</b><span class="task-sub" style="display:block">Requires completed legal and live billing setup. Disabling closes new checkout without deleting existing subscriptions.</span></span></label>
     </div>
-    <button class="btn primary paid-launch-save" style="margin-top:14px" ${state.canManage ? '' : 'disabled'}>Save paid-launch setup</button>
+    <button class="btn primary paid-launch-save" style="margin-top:14px" ${state.canManage ? '' : 'disabled'} data-unsaved-save>Save paid-launch setup</button>
     ${state.source === 'environment-bootstrap' ? '<p class="task-sub">Legacy environment values may currently be supplying some fields. Saving this form moves the editable configuration into Installation settings; saved values take precedence.</p>' : ''}`;
   box.querySelector('.paid-launch-save')?.addEventListener('click', async () => {
     try {
@@ -18803,9 +18898,9 @@ function connectionRows(connections, inTask = false) {
       <div class="approval-request-main"><div class="approval-request-title">${esc(c.label)} <span class="chip">${esc(status)}</span>${open && c.dismissed ? ` ${ignoredChip()}` : ''}</div>
         ${c.why && inTask ? `<p class="task-sub">${esc(c.why)}</p>` : ''}
         <p class="task-sub">${c.taskId ? 'This account may be used by the requesting task.' : 'Private until you share it with a project.'}</p>
-        ${own && !inTask ? `<details><summary>Project access</summary><p class="task-sub">Selected projects may run app actions using this account, within the permissions you granted at sign-in.</p>
+        ${own && !inTask ? `<details data-unsaved><summary>Project access</summary><p class="task-sub">Selected projects may run app actions using this account, within the permissions you granted at sign-in.</p>
           ${projects.map(p => `<label class="connection-project"><input type="checkbox" value="${esc(p.id)}" ${c.projectIds.includes(p.id) ? 'checked' : ''}> ${esc(p.name)}</label>`).join('')}
-          <button type="button" class="btn sm" data-connection-action="access">Save access</button></details>` : ''}
+          <button type="button" class="btn sm" data-connection-action="access" data-unsaved-save>Save access</button></details>` : ''}
         <span data-connection-result role="status"></span>
       </div><div class="approval-request-actions">
         ${reusable.length > 1 ? `<select class="connection-account" data-connection-account aria-label="Account" title="Your connected accounts, newest first">${reusable.map((account, i) => `<option value="${esc(account.id)}">${esc(accountNames[i])}</option>`).join('')}</select>` : ''}
@@ -20995,11 +21090,11 @@ function accountErasureMarkup(preview) {
     ${record ? `<p class="task-sub">${esc(record.state)} · completed cleanup: ${esc(record.steps.join(', '))}${record.retryRequired ? ' · cleanup incomplete; retry required' : ''}${due ? ' · retention review overdue' : ''}</p>
       <a class="btn sm" href="/api/users/${encodeURIComponent(preview.userId)}/erasure/export" download>Download suppression manifest</a>
       <p class="task-sub">Keep the manifest securely outside the backup restore set. Reapply its closure and content actions before restoring service. This is a manual recovery control, not an automatic restore filter.</p>
-      ${closed ? record.items.map((item, index) => `<div class="card" data-erasure-item="${index}"><p>${esc(item.label)}</p>
+      ${closed ? record.items.map((item, index) => `<div class="card" data-erasure-item="${index}" data-unsaved><p>${esc(item.label)}</p>
         <label class="form-row">Outcome<select data-erasure-outcome><option value="">Unreviewed</option>${['erased', 'redacted', 'retained', 'not-applicable'].map(outcome => `<option value="${outcome}" ${item.decision?.outcome === outcome ? 'selected' : ''}>${outcome}</option>`).join('')}</select></label>
         <label class="form-row">Evidence / controller instructions / lawful retention reason<textarea data-erasure-evidence maxlength="4000" placeholder="References and reasoning only; do not copy personal content.">${esc(item.decision?.evidence || '')}</textarea></label>
         <label class="form-row">Review / expiry date (required for retention and backups)<input type="date" data-erasure-review-at value="${item.decision?.reviewAt ? new Date(item.decision.reviewAt).toISOString().slice(0, 10) : ''}"></label>
-        <button class="btn sm" data-erasure-save="${index}">Save decision</button></div>`).join('') : ''}
+        <button class="btn sm" data-erasure-save="${index}" data-unsaved-save>Save decision</button></div>`).join('') : ''}
       ${closed ? `<p class="task-sub">Review completion records your decisions; it is not proof of universal erasure. Retention exceptions remain subject to their review dates.</p>
         <label class="form-row">Type REVIEWED ${esc(preview.userId)}<input id="erasure-reviewed" autocomplete="off"></label>
         <button class="btn" id="erasure-complete" ${record.items.some(item => !item.decision) || due ? 'disabled' : ''}>Mark review complete</button>` : ''}` : ''}
@@ -21121,11 +21216,11 @@ function serviceLimitEditorMarkup(view, service) {
   const organization = ['e2b', 'daytona', 'agentmail'].includes(service.id) ? field('Account of',
     `<select data-operator-organization>${(S.organizations || []).map((organization) => `<option value="${esc(organization.id)}" ${organization.id === view.operatorOrganizationId ? 'selected' : ''}>${esc(organization.name)}</option>`).join('')}</select>`,
     'The organization whose E2B, Daytona and AgentMail connections are yours.') : '';
-  return `<div class="limits-editor" data-limits-editor="${esc(service.id)}">
+  return `<div class="limits-editor" data-limits-editor="${esc(service.id)}" data-unsaved>
     ${field('Plan', `<input data-plan maxlength="60" value="${esc(service.planSource === 'entered' ? service.plan : '')}" placeholder="${esc(service.planSource !== 'entered' && service.plan ? service.plan : 'Plan name')}">`)}
     ${limits}${cloudflare}${organization}
     ${field('Upgrade link', `<input type="url" data-link value="" placeholder="${esc(service.link?.url || 'https://…')}">`)}
-    <div class="limits-editor-actions"><button type="button" class="btn sm primary" data-limits-save>Save</button>
+    <div class="limits-editor-actions"><button type="button" class="btn sm primary" data-limits-save data-unsaved-save>Save</button>
       <button type="button" class="btn sm" data-limits-reset title="Use the published plan, limits and link">Reset</button>
       <button type="button" class="btn sm" data-limits-cancel>Cancel</button></div>
   </div>`;
@@ -21198,7 +21293,7 @@ function installationView() {
       <div class="settings-section-title" id="installation-stripe"><div>Agent cards ${policyTip(`Optional Stripe Connect application for cards agents spend from—not SaaS subscriptions`)}</div></div>${stripePlatformCard()}
       <div class="settings-section-title" id="installation-email"><div>Email ${policyTip(`Account confirmation, password reset, and organization invitations`)}</div></div>${outboundEmailCard()}
       <div class="settings-section-title" id="installation-access"><div>Phone access ${policyTip(`Secure reachability for this host`)}</div></div>${phone}
-      ${S.meta.hosted ? '<div class="settings-section-title" id="installation-users"><div>Users ${policyTip(`Close a person’s account and erase their data`)}</div></div><div class="card" id="installation-users-card">Loading users…</div>' : ''}
+      ${S.meta.hosted ? `<div class="settings-section-title" id="installation-users"><div>Users ${policyTip('Close a person’s account and erase their data')}</div></div><div class="card" id="installation-users-card">Loading users…</div>` : ''}
     </div>
   </div></div>`;
 }
@@ -21599,9 +21694,9 @@ function organizationView() {
 
     <div class="settings-section-title" id="settings-advanced" data-settings-advanced hidden><div>Advanced</div></div>
     <div class="card" data-settings-access="organization" hidden><div class="setting-rows">
-      <div class="setting-row"><span class="setting-label">Name ${policyTip('Also its web address. Links to the old one keep working.')}</span>
+      <div class="setting-row" data-unsaved><span class="setting-label">Name ${policyTip('Also its web address. Links to the old one keep working.')}</span>
         <span class="setting-value"><input id="organization-name" class="setting-input" value="${esc(org?.name || '')}" aria-label="Organization name"></span>
-        <span class="setting-actions"><button class="btn sm primary" id="rename-organization">Save</button></span></div>
+        <span class="setting-actions"><button class="btn sm primary" id="rename-organization" data-unsaved-save>Save</button></span></div>
       <div class="setting-row"><span class="setting-label">Data ${policyTip('A readable JSON archive of this organization, grouped into complete record collections. Passwords, tokens and stored credentials are never included.')}</span>
         <span class="setting-value setting-muted">JSON archive</span>
         <span class="setting-actions"><button class="btn sm" id="export-organization" type="button">Export</button></span></div>
@@ -21609,7 +21704,7 @@ function organizationView() {
         <span class="setting-value setting-muted">Permanent</span>
         <span class="setting-actions"><button class="btn sm danger" id="delete-organization">Delete…</button></span></div>` : ''}
     </div></div>
-    <details class="card settings-disclosure" data-settings-access="organization" hidden><summary><b>Single sign-on &amp; directory sync</b><span>For companies with an identity provider</span></summary><p class="task-sub">OIDC signs employees in through your company; SCIM adds, removes and groups them. Use the values your identity administrator gives you.</p><div id="org-identity">Loading…</div></details>
+    <details class="card settings-disclosure" data-settings-access="organization" hidden><summary><b>Single sign-on &amp; directory sync</b><span>For companies with an identity provider</span></summary><p class="task-sub">OIDC signs employees in through your company; SCIM adds, removes and groups them. Use the values your identity administrator gives you.</p><div id="org-identity" data-unsaved>Loading…</div></details>
     <div class="settings-section-title" id="settings-experimental"><div>Experimental ${policyTip(`Optional features for this organization`)}</div></div>
     ${AVATAR_RISK_NOTE}
     <div class="card"><div id="organization-avatar-settings">Loading…</div></div>
@@ -22006,9 +22101,9 @@ async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
       if (identityPolicy) $('#org-identity').innerHTML = `<label class="form-row">OIDC provider ID<input id="oidc-provider" value="${esc(identityPolicy.oidcProviderId || S.sso?.providerId || '')}" /></label>
         <label class="form-row">Verified email domains<input id="identity-domains" value="${esc((identityPolicy.verifiedDomains || []).join(', '))}" placeholder="company.com" /></label>
         <label class="switch"><input id="enforce-sso" type="checkbox" ${identityPolicy.enforceSso ? 'checked' : ''}/>Require SSO for this organization</label>
-        <div class="inline-form"><button class="btn sm primary" id="save-identity">Save policy</button><button class="btn sm" id="rotate-scim">Rotate SCIM token</button></div>
+        <div class="inline-form"><button class="btn sm primary" id="save-identity" data-unsaved-save>Save policy</button><button class="btn sm" id="rotate-scim">Rotate SCIM token</button></div>
         <div id="scim-result" class="task-sub">SCIM base URL: <span class="mono">${esc(location.origin)}/scim/v2/${esc(S.organizationId)}</span></div>`;
-      setEventHandler($('#save-identity'), 'click', async () => { try { await api(`/api/organizations/${S.organizationId}/identity-policy`, { method: 'PUT', body: JSON.stringify({ oidcProviderId: $('#oidc-provider').value.trim(), verifiedDomains: $('#identity-domains').value.split(',').map((x) => x.trim()).filter(Boolean), enforceSso: $('#enforce-sso').checked }) }); toast('Identity policy saved'); } catch (e) { toast(e.message, true); } });
+      setEventHandler($('#save-identity'), 'click', async () => { try { await api(`/api/organizations/${S.organizationId}/identity-policy`, { method: 'PUT', body: JSON.stringify({ oidcProviderId: $('#oidc-provider').value.trim(), verifiedDomains: $('#identity-domains').value.split(',').map((x) => x.trim()).filter(Boolean), enforceSso: $('#enforce-sso').checked }) }); markSaved($('#save-identity')); toast('Identity policy saved'); } catch (e) { toast(e.message, true); } });
       setEventHandler($('#rotate-scim'), 'click', async () => { try { const result = await api(`/api/organizations/${S.organizationId}/scim-token`, { method: 'POST', body: '{}' }); $('#scim-result').innerHTML = `Copy this token now; it is stored only as a hash:<br><span class="mono">${esc(result.token)}</span>`; } catch (e) { toast(e.message, true); } });
     },
   };

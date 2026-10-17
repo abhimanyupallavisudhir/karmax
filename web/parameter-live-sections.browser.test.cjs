@@ -104,7 +104,7 @@ const root = __dirname;
     // Saving is not followed by a Loading… repaint either.
     await page.locator('#tp-auth-save').click();
     await page.waitForFunction(() => document.querySelector('#tp-auth-save').disabled
-      && document.querySelector('#tp-auth-status').textContent === 'All authorization changes saved');
+      && document.querySelector('#tp-auth-status').dataset.state === 'saved');
     assert.deepEqual(puts, [{ cardIds: ['c1'], budget: 750, currency: 'eur' }]);
     assert.equal(await page.locator('#tp-payments .payment-spent').textContent(), `${new Intl.NumberFormat(undefined, { style: 'currency', currency: 'eur' }).format(2.5)} spent`);
     await page.evaluate(() => { window.parameterTest.S.tasks[0].params.paymentPolicy = { cardIds: ['c1'], budget: 750, currency: 'eur' }; });
