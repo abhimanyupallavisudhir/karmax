@@ -1413,6 +1413,10 @@ export class KarmaxApi {
     // delegated subject or substitute the task-pinned external account through
     // the otherwise-open workflow params bag.
     stripPlatformMetadata(taskOverrides);
+    // Archived is where a task goes once it is finished or put away, never where
+    // a new one starts: params copied from a finished task (a continuation, a
+    // fork) carry it, and a task born archived waits unseen (andhbhakt.com#5).
+    delete taskOverrides.archived;
     for (const [k, v] of Object.entries({ prompt: args.prompt, base: args.base, target: args.target, command: args.command, branch: args.branch })) {
       if (v !== undefined && taskOverrides[k] === undefined) taskOverrides[k] = v;
     }
