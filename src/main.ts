@@ -349,6 +349,7 @@ async function main() {
     paymentRegistry,
     configHomes,
     resources,
+    providerConnections,
     objects: objectStore,
     contentDir: p.content,
     hostLocal: deployment.hostLocal,

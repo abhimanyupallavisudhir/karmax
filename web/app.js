@@ -18695,7 +18695,7 @@ function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = 
         <div class="approval-request-main">
           <div class="approval-request-title">${request.itemId
             ? esc(itemLabel(request.itemId))
-            : `${esc(request.domain || '?')} <span class="chip approval-needed">not in vault</span>`}
+            : `${esc(request.domain || request.name || '?')} <span class="chip approval-needed">not in vault</span>`}
             ${request.kind === 'reset' ? '<span class="chip approval-needed">reported invalid</span>' : `<span class="chip">${esc(request.mode)}</span>`}
             ${request.dismissed ? ignoredChip() : ''}
           </div>
@@ -18729,7 +18729,7 @@ Deny: Rejects this request.`, '?')}
   const history = recent.length
     ? `<div class="approval-history"><div class="section-h">Recent decisions</div>${recent.map((request) =>
       `<div class="approval-history-row"><span class="chip ${request.status === 'denied' ? 'failed' : 'done'}">${esc(request.status)}</span>
-        <span>${request.itemId ? esc(itemLabel(request.itemId)) : esc(request.domain || '?')}</span>
+        <span>${request.itemId ? esc(itemLabel(request.itemId)) : esc(request.domain || request.name || '?')}</span>
         <span class="task-sub">${esc(request.resolution?.action || '')}</span></div>`).join('')}</div>`
     : '';
   return pendingHtml + history;

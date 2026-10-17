@@ -85,7 +85,7 @@ import { VaultItems, type VaultItemPolicy, type VaultTaskPolicyOverrides } from 
 import { itemHandle, loosensPolicy } from '../autonomy/vault-items.js';
 import { applyAvatarProfile, avatarAuthorizationCapabilities, avatarCallableBy, avatarEnabled } from './avatars.js';
 import { CapabilityError, NotFoundError, ValidationError } from './errors.js';
-import { assertAgentSpec, subTaskParams } from './agent-params.js';
+import { assertAgentSpec, childComputer, subTaskParams } from './agent-params.js';
 import { CALLED_AGENT_FIELD, agentSpecsByParticipant, authorityKey, normalizeAgentAuthority, type StoredAgentAuthorization } from './agent-authority.js';
 import { continuesInNewTask } from '../domain/forks.js';
 import { AGENT_SELECTOR, MAIN_AGENT, agentSelector, conversationFor, isParticipantKey, nextAgentKey, participantLabel, selectorAgent } from '../domain/participants.js';
@@ -2173,7 +2173,11 @@ export class KarmaxApi {
     const prompt = typeof input.prompt === 'string' ? input.prompt : '';
     if (!prompt.trim()) throw new ValidationError('a sub-task needs a prompt');
     const title = (typeof input.title === 'string' && input.title.trim()) || 'sub-task';
-    const params = (await subTaskParams(this.deps.store, { projectId: parent.projectId, parentTaskId, params: input.params }));
+    const params = (await subTaskParams(this.deps.store, { projectId: parent.projectId, parentTaskId, params: input.params,
+      ...(this.deps.providerConnections ? { computers: this.deps.providerConnections } : {}) }));
+    // The draft shows the machine it will run on: its parent's own Computer,
+    // with what it chose over it (a person can still change it before it runs).
+    const computer = childComputer(parent.params, params?.computer);
     const parentAgent = { kind: 'task-agent' as const, taskId: parentTaskId, role: 'do' as const };
     const ownAgent = caller.kind === 'agent' && caller.taskId === parentTaskId;
     const child = (await this.deps.store.createTask({
@@ -2182,7 +2186,7 @@ export class KarmaxApi {
       title,
       workflow: 'software-dev',
       workflowVersion: parent.workflowVersion ?? '1.0.0',
-      params: { ...params, prompt, draft: true },
+      params: { ...params, ...(computer ? { computer } : {}), prompt, draft: true },
       parentTaskId,
       createdBy: ownAgent ? parentAgent : (await this.taskCreator(caller, parent.projectId)) ?? parentAgent,
       assignee: parentAgent,

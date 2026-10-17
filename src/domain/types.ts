@@ -2111,10 +2111,14 @@ export interface ParentResponse {
 
 /** A child the Do agent asked for in a turn (`create_sub_task`, SPEC §5.3). `params`
  *  are the child's own task-form values (PL-11), validated when the tool ran. */
+/** A sub-task's own task-form values (create_sub_task's `params`): its agents
+ * and its Computer. Everything else it shares with its parent. */
+export type SubTaskParams = { [field: `agent:${string}`]: AgentSpec } & { computer?: import('./computer.js').ComputerSpec };
+
 export interface SubTaskRequest {
   title: string;
   prompt: string;
-  params?: Record<string, AgentSpec>;
+  params?: SubTaskParams;
   /** Save it now without starting it: a draft sub-task, started later by
    *  `queue_task` (POST /api/tasks/:id/queue), when its parent prepares it. */
   draft?: boolean;

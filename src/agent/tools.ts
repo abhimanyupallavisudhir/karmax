@@ -138,14 +138,14 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     name: 'create_sub_task',
     description:
       'Delegate to a child task. It branches off your current work and merges back into YOUR branch (not main), and YOU are its confirmer: when it reaches Review or gets stuck it will raise to you (surfaced as a message) and you answer with respond_to_sub_task. It starts when your current turn ends, and first saves this task\'s writable project data for it to start from: stop anything writing into it (a server, a job, an open SQLite database) before you call it, or the save fails and no sub-task is created. You manage your children to completion before you finish. '
-      + 'It runs your agent unless `params` choose another: create_task\'s task-form fields, e.g. {"agent:do": {"provider": "codex", "model": "gpt-5.5", "effort": "high"}} or {"agent:do": {"avatarId": "…"}}. Only the agent fields can be set; the branch and project stay yours. It acts with your authority, including whatever you are granted later, so there is nothing to grant it. An invalid or unavailable choice is refused and nothing is created. '
+      + 'It runs your agent on a computer like yours (your own Computer: provider and size) unless `params` choose others: create_task\'s task-form fields, e.g. {"agent:do": {"provider": "codex", "model": "gpt-5.5", "effort": "high"}}, {"agent:do": {"avatarId": "…"}} or {"computer": {"cpu": 2, "memoryMb": 4096, "diskGb": 30}} (the sizes it names, over yours). Only the agent fields and the computer can be set; the branch and project stay yours. It acts with your authority, including whatever you are granted later, so there is nothing to grant it. An invalid or unavailable choice is refused and nothing is created. '
       + 'With `draft: true` it is saved now and not started, and its task id returned: start it later with queue_task (people can also start it from your Sub-tasks). It then branches off your work as it is at that moment. Plan many sub-tasks as drafts and start them in batches when they should not all run at once (e.g. a cloud provider\'s machine limits).',
     parameters: {
       type: 'object',
       properties: {
         title: { type: 'string' },
         prompt: { type: 'string' },
-        params: { type: 'object', description: 'Task-form agent fields for the child (e.g. "agent:do"), as in create_task; omit to run your agent.' },
+        params: { type: 'object', description: 'Task-form agent fields (e.g. "agent:do") and "computer" for the child, as in create_task; omit to run your agent on a computer like yours.' },
         draft: { type: 'boolean', description: 'Save it without starting it; start it later with queue_task.' },
       },
       required: ['title', 'prompt'],

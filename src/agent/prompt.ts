@@ -39,7 +39,7 @@ import { BRAND } from '../domain/brand.js';
  * here.
  */
 const TOOLS_PREAMBLE = `You are running inside ${BRAND}, an agent-orchestration platform. Your work happens in a git world (working directory). You have these platform tools available:
-- create_sub_task(title, prompt, params?, draft?): spawn a child task the parent awaits. It acts with your authority (also what you are granted later), so there is nothing to grant it. It runs your agent unless params choose another, e.g. {"agent:do": {"provider": "codex"}}. It first saves this task's writable project data for the child to start from, so stop anything writing into it (a server, a job, an open SQLite database) before you call it. With draft: true it is only saved, and starts when you call queue_task(id) (or a person runs it): plan sub-tasks as drafts to start them in batches.
+- create_sub_task(title, prompt, params?, draft?): spawn a child task the parent awaits. It acts with your authority (also what you are granted later), so there is nothing to grant it. It runs your agent on your computer's size and provider unless params choose others, e.g. {"agent:do": {"provider": "codex"}, "computer": {"cpu": 2, "memoryMb": 4096}}. It first saves this task's writable project data for the child to start from, so stop anything writing into it (a server, a job, an open SQLite database) before you call it. With draft: true it is only saved, and starts when you call queue_task(id) (or a person runs it): plan sub-tasks as drafts to start them in batches.
 - create_review_info(caption?, actions?): optional click-to-verify affordances for the Review stage. Use only when relevant: "run" actions for verification commands or starting an app/server (set server:true + openUrls to open it), and "open" actions for human-readable outputs such as reports, documents, images, or videos. Source code is not a human-readable output. The optional caption says WHAT to verify and is limited to 280 characters. Put summaries of changes/answers in your normal response, or in a file only when requested. The changed-files list is added automatically.
 - save_skill(name, content): persist a reusable skill for future tasks.
 - read_wiki(scope, id, path?) and search_wiki(scope, id, query): navigate and grep the organization/project wikis (skills, memories, prompts). Your instructions include each wiki's table of contents and scope ids; read_wiki with a section path expands any [more…] fold. These run host-side, so they work from every world, including cloud sandboxes.
@@ -100,6 +100,8 @@ export interface AssembleArgs {
   moveTo?: string;
   /** Extra bindings for non-do roles (error, stage, transcript, reviewInfo, skills). */
   bindings?: Record<string, string>;
+  /** A sub-task's siblings: its parent's other sub-tasks still at work. */
+  siblings?: Array<{ id: string; title: string; num?: number }>;
 }
 
 const AGENT_AUTHORED_BINDINGS = ['transcript', 'reviewInfo', 'changedFiles', 'error'] as const;
@@ -117,6 +119,7 @@ export function assemblePrompt(args: AssembleArgs): string {
 
 Input routing for this task: its ordinary Waiting-for-input Responder is an agent. When you need a decision or information that this Responder can supply, do not call escalate_to_human. End the turn without open_pr and make your final response the concrete question; ${BRAND} will send it to the Responder and return the answer to this same Do conversation. Use escalate_to_human only for what only a person can give (an approval, a secret, an action in the real world, a personal decision).`;
   }
+  if (args.role === 'do' && args.task.parentTaskId) preamble += describeSiblings(args.task.parentTaskId, args.siblings ?? []);
   const target = args.task.target ?? args.world.target ?? args.world.base;
   if (args.role === 'do' && (target !== args.world.base || args.task.agents?.do?.resumeFrom)) {
     preamble += `
@@ -147,6 +150,18 @@ Git ancestry for recovered, forked, or retargeted work: "recorded base" is the i
   // summary and file names, a failing stage's output — are quoted as data.
   for (const key of AGENT_AUTHORED_BINDINGS) if (values[key]) values[key] = untrustedBlock(key, values[key]);
   return tpl.replace(/\{\{(\w+)\}\}/g, (_, k: string) => values[k] ?? '');
+}
+
+/** Who a sub-task works beside: its parent, and the parent's other sub-tasks,
+ * which it can talk to directly rather than through the parent. */
+function describeSiblings(parentTaskId: string, siblings: Array<{ id: string; title: string; num?: number }>): string {
+  const listed = siblings.slice(0, 20).map((sibling) => `${sibling.num ? `#${sibling.num} ` : ''}"${sibling.title}" (${sibling.id})`);
+  const more = siblings.length > listed.length ? `, and ${siblings.length - listed.length} more` : '';
+  return `
+
+You are a sub-task of task ${parentTaskId}, which answers your questions and reviews your work.${listed.length
+    ? ` Its other sub-tasks at work: ${listed.join(', ')}${more}. To agree something with one of them directly (a shared interface, a finding), use message_agent(task_id, message): it reaches that agent while it works, or wakes it.`
+    : ''}`;
 }
 
 /** The project's install commands, which the agent runs itself, and where a

@@ -148,6 +148,9 @@ export interface CredentialAccessRequest {
   itemId?: string;
   /** Set when the agent asked by site rather than by item (incl. not-in-vault). */
   domain?: string;
+  /** What the agent named when no item matched it (an id or a name such as
+   * "R2"), so the person sees what is being asked for. */
+  name?: string;
   field?: VaultFieldName;
   mode: AccessMode;
   /** `access` (default) = the task lacks a grant/policy approval. `reset` = the
@@ -453,6 +456,18 @@ export class VaultItems {
 
   async get(id: string): Promise<VaultItem | undefined> {
     return (await this.list()).find((i) => i.id === id);
+  }
+
+  /** The one item an agent named by its label rather than its id ("R2"):
+   * the label itself, else the only label containing it. */
+  async findByName(name: string): Promise<VaultItem | undefined> {
+    const wanted = name.trim().toLowerCase();
+    if (!wanted) return undefined;
+    const items = await this.list();
+    const exact = items.filter((item) => item.label.trim().toLowerCase() === wanted);
+    if (exact.length) return exact.length === 1 ? exact[0] : undefined;
+    const partial = items.filter((item) => item.label.toLowerCase().includes(wanted));
+    return partial.length === 1 ? partial[0] : undefined;
   }
 
   /** Items whose `domains` cover `host` (subdomains match). */
@@ -904,13 +919,13 @@ export class VaultItems {
     const mode: AccessMode = args.mode === 'reveal' ? 'reveal' : 'use';
     const kind = args.kind === 'reset' ? 'reset' : 'access';
     const item = args.itemId
-      ? (await this.get(args.itemId))
+      ? (await this.get(args.itemId)) ?? (await this.findByName(args.itemId))
       : args.domain
         ? (await this.findByDomain(args.domain))[0]
         : undefined;
     if (!item) {
       if (!args.itemId && !args.domain) throw new Error('itemId or domain required');
-      const parked = (await this.park({ ...args, mode, kind, itemId: undefined }));
+      const parked = (await this.park({ ...args, mode, kind, itemId: undefined, ...(args.itemId ? { name: args.itemId } : {}) }));
       (await this.store.appendAudit({ principalId: `task:${args.taskId}`, action: 'vault.requested', detail: { domain: args.domain, itemId: args.itemId, mode, kind, status: 'not_in_vault' } }));
       return { status: 'not_in_vault', reason: args.itemId ? `no vault item ${args.itemId}` : `no vault item matches ${args.domain}`, requestId: parked.id };
     }
@@ -934,13 +949,13 @@ export class VaultItems {
    * (request_credential, a blocked reveal, fill or session restore): the
    * conversation, the inbox and notifications all learn of it from that event,
    * and a route that forgot to emit it left the ask invisible until a reload. */
-  private async park(args: { taskId: string; projectId?: string; itemId?: string; domain?: string; field?: VaultFieldName; mode: AccessMode; kind?: 'access' | 'reset'; why?: string; urgency?: Urgency }): Promise<CredentialAccessRequest> {
+  private async park(args: { taskId: string; projectId?: string; itemId?: string; domain?: string; name?: string; field?: VaultFieldName; mode: AccessMode; kind?: 'access' | 'reset'; why?: string; urgency?: Urgency }): Promise<CredentialAccessRequest> {
     return this.store.transaction(async () => {
     await this.lockVault();
     const all = (await this.requests());
     const existing = all.find((r) => r.status === 'pending' && r.taskId === args.taskId && r.mode === args.mode
       && (r.kind ?? 'access') === (args.kind ?? 'access')
-      && (args.itemId ? r.itemId === args.itemId : !r.itemId && r.domain === args.domain));
+      && (args.itemId ? r.itemId === args.itemId : !r.itemId && r.domain === args.domain && r.name === args.name));
     if (existing) return existing;
     const req: CredentialAccessRequest = {
       id: newId('vreq'),
@@ -948,6 +963,7 @@ export class VaultItems {
       ...(args.projectId ? { projectId: args.projectId } : {}),
       ...(args.itemId ? { itemId: args.itemId } : {}),
       ...(args.domain ? { domain: args.domain } : {}),
+      ...(args.name ? { name: args.name } : {}),
       ...(args.field ? { field: args.field } : {}),
       mode: args.mode,
       ...(args.kind === 'reset' ? { kind: 'reset' as const } : {}),
@@ -961,6 +977,7 @@ export class VaultItems {
       (await this.store.appendEvent({ taskId: req.taskId, type: 'credential.approval-requested', ts: req.createdAt, payload: {
         requestId: req.id, status: 'approval-needed', mode: req.mode, kind: req.kind ?? 'access',
         ...(req.itemId ? { itemId: req.itemId } : {}), ...(req.domain ? { domain: req.domain } : {}),
+        ...(req.name ? { name: req.name } : {}),
         ...(req.why ? { why: req.why } : {}), ...(args.urgency ? { urgency: args.urgency } : {}),
       } }));
     return req;

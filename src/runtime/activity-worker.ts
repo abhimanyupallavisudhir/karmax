@@ -76,10 +76,10 @@ export async function createActivityWorkerRuntime(): Promise<WorkerProcessRuntim
     const services = await createExecutionServices({ store, client, broker, githubApp, p, deployment,
       provider: defaultProvider().provider, coordinationDirectory: path.join(p.state, 'world-coordination') });
     const { worlds, adapters, profiles, tokens, checkpoints, runners, payments,
-      paymentRegistry, configHomes, resources, objectStore } = services;
+      paymentRegistry, configHomes, resources, objectStore, providerConnections } = services;
     const worker = new WorkerManager(conn, { store, client, broker, authorization, githubApp,
       worlds, adapters, profiles, tokens, checkpoints, runners, payments, paymentRegistry,
-      configHomes, resources, objects: objectStore, bus: new KarmaxBus(),
+      configHomes, resources, providerConnections, objects: objectStore, bus: new KarmaxBus(),
       contentDir: p.content, hostLocal: deployment.hostLocal, taskQueue: TASK_QUEUE,
     }, error => {
       console.error('[activity-worker] stopped unexpectedly:', error);

@@ -321,6 +321,21 @@ describe('the pull model: requests + human resolutions (§7)', () => {
     expect((await items.access([], 't2', item, 'use')).status).toBe('needs_approval');
   });
 
+  // A request naming a credential by its name ("R2") found no item by that
+  // id, was parked without it, and reached people as "?".
+  it('finds an item an agent named by its label, and keeps a name nothing matches', async () => {
+    const { items } = makeService();
+    const r2 = (await items.save({ type: 'login', label: 'Cloudflare R2', secrets: { password: 'p' } }));
+    (await items.save({ type: 'login', label: 'GitHub', secrets: { password: 'p' } }));
+    const named = (await items.request({ taskId: 't1', caps: [], itemId: 'r2', mode: 'use', why: 'upload' }));
+    expect(named).toMatchObject({ status: 'needs_approval', itemId: r2.id });
+    const missing = (await items.request({ taskId: 't1', caps: [], itemId: 'Hetzner token', mode: 'use', why: 'servers' }));
+    expect(missing.status).toBe('not_in_vault');
+    expect((await items.requests({ status: 'pending' })).find((request) => request.id === missing.requestId))
+      .toMatchObject({ name: 'Hetzner token', why: 'servers' });
+    expect((await items.request({ taskId: 't1', caps: [], itemId: 'Hetzner token', mode: 'use' })).requestId).toBe(missing.requestId);
+  });
+
   it('dismissing silences a request without deciding it', async () => {
     const { items, store } = makeService();
     const r = (await items.request({ taskId: 't1', caps: [], domain: 'github.com', mode: 'use', why: 'log in' }));
