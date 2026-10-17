@@ -533,6 +533,60 @@ describe('software-dev pipeline: landing, review and the merge queue (real Tempo
     expect((await git(repo, ['show', 'main:proposal.js'])).stdout).toContain('ready = true');
   }, 120_000);
 
+  it('a message to the agent at a failed landing returns the proposal to it instead of retrying the merge', async () => {
+    const repo = await h.makeRepo('escalated-landing-message');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev@1.30.0', {
+      taskQueue: TASK_QUEUE, workflowId: taskId,
+      args: [input({ taskId, repo, title: 'Blocked landing', prompt: '@write landed.txt :: one' })],
+    });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 20_000 }).toBe('review');
+    // Someone's uncommitted work in the target's checkout: a refusal no repair turn is for.
+    const scratch = path.join(repo, 'scratch.txt');
+    fs.writeFileSync(scratch, 'local edit\n');
+    await handle.signal('confirm');
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('escalated');
+    expect((await view(handle)).actions.map((a: any) => a.name)).toContain('followUp');
+    const turns = (await view(handle)).messages.filter((m: any) => m.role === 'agent').length;
+    fs.rmSync(scratch);
+    await handle.signal('followUp', { id: 'u-hold', role: 'user', ts: Date.now(), text: 'Wait, also add a note.\n@write note.txt :: two' });
+    // The agent reads it in Do and proposes again, for Review; the merge is not simply retried.
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    expect((await view(handle)).messages.filter((m: any) => m.role === 'agent').length).toBeGreaterThan(turns);
+    expect((await git(repo, ['show', 'main:landed.txt'])).code).not.toBe(0);
+    await handle.signal('confirm');
+    expect(await handle.result()).toMatchObject({ stage: 'done' });
+    expect((await git(repo, ['show', 'main:note.txt'])).stdout).toContain('two');
+  }, 120_000);
+
+  it('Open PR from a needs-input pause that watches a job publishes without another turn', async () => {
+    const repo = await h.makeRepo('open-pr-pause-job');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev@1.30.0', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [input({
+        taskId,
+        repo,
+        title: 'Proposal with a job',
+        prompt: 'Prepare it.\n@write proposal.js :: export const ready = true;\n'
+          + '@run git add -A && git commit -q -m "prepare proposal"\n@job sleep 600\n@pause 600 :: last input -- Ship as is?',
+      })],
+    });
+    await expect.poll(async () => {
+      const current = await view(handle);
+      return `${current.stage}/${current.waitingFor?.kind}/${current.waitingFor?.detail}`;
+    }, { timeout: 30_000 }).toBe('do/human/Ship as is?');
+    const turns = (await view(handle)).messages.filter((m: any) => m.role === 'agent').length;
+    await handle.signal('openPr');
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    const v = await view(handle);
+    expect(v.messages.filter((m: any) => m.role === 'agent')).toHaveLength(turns);
+    expect(v.messages.some((m: any) => m.id.startsWith('wait-'))).toBe(false);
+    await handle.signal('cancel');
+    await handle.result();
+  }, 120_000);
+
   it.each([{ authorized: true, failed: true }, { authorized: false, failed: true },
     { authorized: true, failed: false }, { authorized: false, failed: false }])('manual opening confirms only an authorized reviewer ($authorized, failed: $failed)', async ({ authorized, failed }) => {
     const repo = await h.makeRepo(`manual-confirm-${authorized}-${failed}`);

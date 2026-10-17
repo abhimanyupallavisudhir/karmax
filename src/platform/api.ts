@@ -86,6 +86,7 @@ import { applyAvatarProfile, avatarAuthorizationCapabilities, avatarCallableBy, 
 import { CapabilityError, NotFoundError, ValidationError } from './errors.js';
 import { assertAgentSpec, subTaskParams } from './agent-params.js';
 import { CALLED_AGENT_FIELD, agentSpecsByParticipant, authorityKey, normalizeAgentAuthority, type StoredAgentAuthorization } from './agent-authority.js';
+import { continuesInNewTask } from '../domain/forks.js';
 import { AGENT_SELECTOR, MAIN_AGENT, agentSelector, conversationFor, isParticipantKey, nextAgentKey, participantLabel, selectorAgent } from '../domain/participants.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import type { ProjectResourceService } from '../world/resources.js';
@@ -286,6 +287,16 @@ const FAILED_RECOVERY_ACTIONS = (pointOfNoReturnPassed?: boolean): TaskView['act
   },
   ...(pointOfNoReturnPassed ? [] : [{ name: 'cancel', kind: 'signal' as const, label: 'Cancel', enabled: true, danger: true }]),
 ];
+
+/** A message to a confirmed task's agent, which continues in a new task. */
+const CONTINUE_ACTION = (): TaskView['actions'][number] => ({
+  name: 'followUp',
+  kind: 'signal',
+  label: 'Continue',
+  enabled: true,
+  args: [{ name: 'text', type: 'text', label: 'Message', required: true }],
+  roles: ['do'],
+});
 
 const FOLLOW_UP_ACTION = (role?: AgentRole): TaskView['actions'][number] => ({
   name: 'followUp',
@@ -3404,7 +3415,7 @@ export class KarmaxApi {
         ...(task ? { stageTransitions: (await this.availableStageTransitions(task, view, group)) } : {}),
         ...(view.status === 'failed' && RECOVERABLE_WORKFLOWS.has(view.workflow)
           ? { actions: FAILED_RECOVERY_ACTIONS(view.pointOfNoReturnPassed) }
-          : { actions: this.lifecycleActions(view) }),
+          : { actions: this.lifecycleActions(view, task) }),
         ...((await this.deps.store.kvGet(`project-transfer-history:${taskId}`))
           ? { actions: [], stageTransitions: [] } : {}),
       };
@@ -3624,8 +3635,12 @@ export class KarmaxApi {
    * A displayed action must either release the hold or be a deliberate non-waking
    * edit; roles prevents an unrelated, stale conversation from accepting input.
    */
-  private lifecycleActions(view: TaskView): TaskView['actions'] {
+  private lifecycleActions(view: TaskView, task?: TaskRecord): TaskView['actions'] {
     const actions = [...view.actions];
+    // A confirmed proposal lands on its own; a message carries the work on in
+    // a new task (wiki features/continue-after-confirm).
+    if (task && continuesInNewTask(task, view) && !actions.some((action) => action.name === 'followUp'))
+      actions.push(CONTINUE_ACTION());
     // software-dev's infrastructure path deliberately remains in its public
     // stage while it backs off, and its retry signal can wake that timer early.
     // The workflow used to advertise Retry only after the outage exhausted every
@@ -5762,7 +5777,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   async postTaskMessage(token: string, taskId: string, input: {
     text: string; to?: string[]; agents?: Record<string, AgentSpec>;
     images?: ImageRef[]; files?: FileRef[]; urgency?: Urgency;
-  }): Promise<{ message?: Message; notified: string[] }> {
+  }): Promise<{ message?: Message; notified: string[]; continuedIn?: TaskLink }> {
     const task = (await this.deps.store.getTask(taskId));
     if (!task) throw new NotFoundError(`no task ${taskId}`);
     const caller = (await this.require(token, 'message_agent', { projectId: task.projectId, taskId }));
@@ -5811,6 +5826,21 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       if (selector.startsWith('avatar:')) continue; // validated where it is dispatched
       if (!(await this.deps.store.humanAudience(task.id, [selector])).length)
         throw new ValidationError(`${selector} does not resolve to anyone in this organization`);
+    }
+    // Its proposal is confirmed: the agent carries on in a new task instead of
+    // pulling the proposal back to Do (wiki features/continue-after-confirm).
+    const onlyMain = !newAgents.length && (to === undefined
+      || (to.includes(agentSelector(MAIN_AGENT)) && !to.some((selector) => selector.startsWith(AGENT_SELECTOR) && selectorAgent(selector) !== MAIN_AGENT)));
+    if (onlyMain && this.continues(caller, task)) {
+      const next = await this.continueTask(token, taskId, { text, images: input.images, files: input.files });
+      const people = (to ?? []).filter((selector) => !selector.startsWith(AGENT_SELECTOR) && !selector.startsWith('avatar:'));
+      if (people.length) {
+        const event = { taskId: next.id, type: 'task.mentioned', ts: Date.now(), payload: {
+          recipients: people, by: caller.humanSubject?.userId ? `user:${caller.humanSubject.userId}` : caller.principal,
+          text: text.slice(0, 500), urgency: normalizeUrgency(input.urgency, DEFAULT_URGENCY.mentioned) } };
+        this.deps.bus?.emit({ ...event, seq: (await this.deps.store.appendEvent(event)) });
+      }
+      return { notified: people, continuedIn: taskLink(next) };
     }
     // Who is speaking: the task's own agent (by the agent its token was minted
     // for), a person, or another task's agent.
@@ -5918,8 +5948,55 @@ Act according to your Avatar instructions. When ready, call platform_request POS
     }
   }
 
-  async messageAgent(token: string, taskId: string, text: string, role?: string): Promise<Message | undefined> {
-    return this.deliverSignal('message_agent', token, taskId, SIG.followUp, text, role);
+  async messageAgent(token: string, taskId: string, text: string, role?: string): Promise<{ message?: Message; continuedIn?: TaskLink }> {
+    const task = (await this.deps.store.getTask(taskId));
+    if (task && (!role || role === MAIN_AGENT)
+      && this.continues((await this.require(token, 'message_agent', { projectId: task.projectId, taskId })), task))
+      return { continuedIn: taskLink(await this.continueTask(token, taskId, { text })) };
+    const message = await this.deliverSignal('message_agent', token, taskId, SIG.followUp, text, role);
+    return message ? { message } : {};
+  }
+
+  /** Whether a message from `caller` to the task's main agent continues the
+   * work in a new task: a person's, or another task's agent's — never the
+   * task's own agents, and never an event the platform delivers. */
+  private continues(caller: { kind: string; taskId?: string; humanSubject?: { userId?: string } }, task: TaskRecord): boolean {
+    const speaks = !!caller.humanSubject?.userId || (caller.kind === 'agent' && caller.taskId !== task.id);
+    return speaks && continuesInNewTask(task, task.lastView);
+  }
+
+  /**
+   * Carry a confirmed task's work on in a new task (wiki
+   * features/continue-after-confirm). The approved proposal lands exactly as
+   * it was reviewed; the new task forks its agent (session, and world while
+   * the proposal is still landing), keeps its settings and authorization, and
+   * starts from the message. It shows as a fork of this task.
+   */
+  async continueTask(token: string, taskId: string, input: { text: string; images?: ImageRef[]; files?: FileRef[] }): Promise<TaskRecord> {
+    const source = (await this.deps.store.getTask(taskId));
+    (await this.require(token, 'fork_agent', { projectId: source?.projectId, taskId }));
+    if (!source) throw new NotFoundError(`no task ${taskId}`);
+    if (!continuesInNewTask(source, source.lastView))
+      throw new ValidationError('only a task whose proposal was confirmed continues in a new task; message its agent instead');
+    if (!input.text.trim() && !input.images?.length && !input.files?.length) throw new ValidationError('a message needs text or an attachment');
+    const params: ValueMap = stripPlatformMetadata(cloneParamsWithoutTriggers({ ...source.params } as ValueMap));
+    for (const name of ['prompt', 'images', 'files', 'base', 'branch', 'attempts']) delete params[name];
+    for (const name of Object.keys(params)) if (CALLED_AGENT_FIELD.test(name)) delete params[name];
+    const field = params['agent:do'] === undefined && params['agent:unified'] !== undefined ? 'agent:unified' : 'agent:do';
+    const { resumeFrom: _previous, ...agent } = (params[field] ?? {}) as Partial<AgentSpec>;
+    params[field] = { ...agent, resumeFrom: { taskId, role: MAIN_AGENT } };
+    params.prompt = input.text;
+    const previous = previousTaskGrants(source);
+    return this.createTask(token, {
+      projectId: source.projectId,
+      workflow: source.workflow,
+      params,
+      ...(input.images?.length ? { images: input.images } : {}),
+      ...(input.files?.length ? { files: input.files } : {}),
+      ...(previous.authorization ? { authorization: previous.authorization } : {}),
+      credentialGrants: previous.credentialGrants,
+      credentialPolicies: previous.credentialPolicies,
+    });
   }
 
   /**
@@ -6005,6 +6082,11 @@ Act according to your Avatar instructions. When ready, call platform_request POS
     // whichever layer is playing and the signal would pre-satisfy the human one.
     if (signal === SIG.confirm && caller.kind === 'agent' && !allows(caller.caps, 'review:approve'))
       throw new CapabilityError('confirming a Review gate needs review:approve (a maintainer-level authorization); an agent reviewing a task records its verdict with confirm_decision');
+    // A Reviewer agent is deciding: Confirm would approve the step after it
+    // unseen. Wait for its verdict, or stop it and decide.
+    if (signal === SIG.confirm && heldView?.stage === 'review' && (heldView.waitingFor?.kind === 'confirm'
+      || heldView.participants?.some((participant) => participant.role === 'confirm' && participant.state !== 'idle')))
+      throw new ValidationError('a Reviewer agent is reviewing this proposal; wait for its verdict, or stop it to decide yourself');
     if (signal === SIG.openPr && heldOrigin && heldOrigin !== 'do')
       throw new Error(`this is a hold on ${stageName(heldOrigin)}, not a proposal waiting to be opened`);
     const attemptGroup = scopedTask && (await this.deps.store.attemptGroup(taskId));
@@ -7546,6 +7628,13 @@ function selectionOf(authorization: { level?: string; profileId?: string; scope?
 function authorizationReaches(held: Partial<AuthorizationSelection> | undefined, projectId: string, ownProjectId: string): boolean {
   return held?.scope === 'global' || held?.scope === 'organization'
     || (held?.scope === 'projects' ? !!held.projectIds?.includes(projectId) : projectId === ownProjectId);
+}
+
+/** A task as a link: where a message continued (`continuedIn`). */
+export interface TaskLink { id: string; num?: number; title: string }
+
+function taskLink(task: TaskRecord): TaskLink {
+  return { id: task.id, ...(task.num != null ? { num: task.num } : {}), title: task.title };
 }
 
 export function previousTaskGrants(task: TaskRecord): {

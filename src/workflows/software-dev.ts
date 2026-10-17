@@ -334,6 +334,15 @@ const QUIET_NOTICE = 'prn-';
 /** Several branches: finishing lands the task's own repositories together,
  * through its own Review, not as a pull request each. */
 const FINISH_TOGETHER = 'several-branches-finish-together-v1';
+/** A person's Open PR publishes the proposal without first running the agent
+ * on messages it had not read (a stopped turn's). */
+const OPEN_PR_AS_IT_STANDS = 'software-dev-open-pr-as-it-stands-v1';
+/** A Confirm sent while a Reviewer agent worked approved the next human step
+ * unseen; each human step now waits for its own. */
+const HUMAN_STEP_OWN_CONFIRM = 'software-dev-human-step-own-confirm-v1';
+/** A message to the agent at a failed landing returns the proposal to Do,
+ * as at every other Merge wait on people, instead of retrying the merge. */
+const ESCALATED_MERGE_MESSAGE_TO_DO = 'software-dev-escalated-merge-message-to-do-v1';
 /** Open PR's checks wake a parked world, and wait out one that cannot wake (pramana#56). */
 const OPEN_PR_WAITS_FOR_WORLD = 'software-dev-open-pr-waits-for-world-v1';
 /** A sub-task whose parent world cannot be reached is waited out, then a
@@ -826,6 +835,13 @@ async function softwareDevImpl(
   let manualEscalationRequested = carried?.manualEscalationRequested ?? false;
   // A pull request arrives committed and ready: it opens at once.
   let prRequested = carried?.prRequested ?? (recoveryStage === 'pr' || (shippedBranch && !recovery));
+  /** How much of the conversation there was when a person (or the parent)
+   * asked for Open PR: they took the proposal as it stood, so what the agent
+   * had not read by then does not make it run first (#659). */
+  let openPrAskedAt: number | undefined = continued?.openPrAskedAt;
+  /** Messages an Open PR answered: they wake nothing, but the agent still
+   * reads them on its next turn (`seen` is what it has been given). */
+  let heardThrough = continued?.heardThrough ?? 0;
   // v1.29: Do runs the task's own command instead of the agent — once per run
   // of the task; a revise, or a failure handed to the agent, continues with it.
   const taskCommand = minor >= 29 ? input.command?.trim() || undefined : undefined;
@@ -1081,7 +1097,8 @@ async function softwareDevImpl(
   const mainUnreadSince = (from: number): boolean => multiAgent
     ? msgs.slice(Math.max(0, from)).some((m) => addressedTo(m, MAIN_AGENT) && !quietNotice(m))
     : shipsBranches ? msgs.slice(Math.max(0, from)).some((m) => !quietNotice(m)) : msgs.length > from;
-  const mainUnread = (): boolean => mainUnreadSince(seen);
+  const unreadFrom = (): number => Math.max(seen, heardThrough);
+  const mainUnread = (): boolean => mainUnreadSince(unreadFrom());
   /** The agents this task lists right now, main agent first. */
   const participantKeys = (): string[] => {
     const keys = [MAIN_AGENT];
@@ -1256,6 +1273,13 @@ async function softwareDevImpl(
         : action)
       : actions;
   }
+  /** A Do wait on people that Open PR cannot end (sub-tasks outstanding, an
+   * app to connect): it is not offered there. */
+  let openPrInert = false;
+  /** A person approved the Review step whose Reviewer agent failed. */
+  let stepConfirmedByPerson = false;
+  const reviewerWorking = (): boolean => waitingFor?.kind === 'confirm'
+    || (!!runningParticipant && participantRole(runningParticipant) === 'confirm');
   function allowedNow(): DeclaredAction[] {
     if (applyingResources || stagingResources || mergingResources) return [];
     const pausedRole: AgentRole | undefined =
@@ -1301,10 +1325,11 @@ async function softwareDevImpl(
       case 'setup':
         return [cancel];
       case 'do':
-        return [...(explicitPrCycle && waitingFor?.kind === 'human' ? [openPr] : []), followUp,
+        return [...(explicitPrCycle && waitingFor?.kind === 'human' && !openPrInert ? [openPr] : []), followUp,
           ...(!repositoryless ? [setTarget] : []), cancel];
       case 'review':
-        return [...(awaitingResourceDecision ? [] : [confirm]), followUp,
+        // A Reviewer agent is deciding: wait for its verdict, or stop it to decide.
+        return [...(awaitingResourceDecision || reviewerWorking() ? [] : [confirm]), followUp,
           ...(!repositoryless ? [setTarget] : []), cancel];
       case 'pr':
         return [cancel];
@@ -1797,7 +1822,12 @@ async function softwareDevImpl(
         if (layer.kind === 'agent' && !revisionBound) {
           waitingFor = { kind: 'confirm', ...(gateDetail ? { detail: gateDetail } : {}) };
           await publish();
+          stepConfirmedByPerson = false;
           const decision = await confirmTurn(layer, reviewer);
+          // A Confirm that came while the Reviewer worked is not the next
+          // human step's: its people decide, the gate shown first. A person
+          // approving this step when its Reviewer failed is.
+          if (confirmed && !stepConfirmedByPerson && patched(HUMAN_STEP_OWN_CONFIRM)) confirmed = false;
           waitingFor = undefined;
           if (cancelled) return 'cancelled';
           if (confirmEpoch !== epoch) { layerIndex = 0; continue; }
@@ -2036,6 +2066,7 @@ async function softwareDevImpl(
     if (!explicitPrCycle || stage !== 'do') return;
     prRequested = true;
     manualPrConfirmer = request?.userId;
+    whenLoaded(() => { openPrAskedAt = msgs.length; });
     if (responsiveHumanHold && humanPauseActive)
       humanPauseWake = { kind: 'openPr' };
   });
@@ -2130,6 +2161,7 @@ async function softwareDevImpl(
         return;
       }
       prRequested = true;
+      whenLoaded(() => { openPrAskedAt = msgs.length; });
       if (responsiveHumanHold && humanPauseActive)
         humanPauseWake = { kind: 'openPr' };
     } else if (resp.action === 'confirm') {
@@ -3282,6 +3314,7 @@ async function softwareDevImpl(
         action: 'confirm',
         finish: async () => {
           confirmed = true;
+          stepConfirmedByPerson = true;
           return { completed: true, output: '' };
         },
       } : undefined,
@@ -4172,6 +4205,8 @@ Inspect the complete current diff and specifically compare its delta from the re
           ...(pullRequestsOpened ? { pullRequestsOpened } : {}) },
         ...(manualPrConfirmer ? { manualPrConfirmer } : {}),
         ...(escalationAction ? { escalationAction } : {}),
+        ...(openPrAskedAt !== undefined ? { openPrAskedAt } : {}),
+        ...(heardThrough ? { heardThrough } : {}),
         ...(error ? { error } : {}),
         counters: { responderRounds, subtaskNags, subagentNudges, shellNudges, landingWatchSequence, resourceReviewSequence },
         ...(multiAgent ? { participants: { sessions: participantSessions, queue: agentQueue, calledBy, revisions: automatedRevisions } } : {}),
@@ -4512,13 +4547,19 @@ Inspect the complete current diff and specifically compare its delta from the re
     // A human/parent may request Open PR while the task is already parked. That
     // transition uses the proposal the Do agent just produced; it must not spend
     // another model turn before publishing it.
+    // It takes the proposal as it stood when they asked: what the agent had
+    // not read by then (a stopped turn's messages) reaches it on its next
+    // turn instead of running it now (#659). Anything said since still does.
+    if (explicitPrCycle && prRequested && openPrAskedAt !== undefined && openPrAskedAt > unreadFrom()
+      && !mainUnreadSince(openPrAskedAt) && patched(OPEN_PR_AS_IT_STANDS)) heardThrough = openPrAskedAt;
+    openPrAskedAt = undefined;
     const preventsUnreadOpenPrSpin = patched('software-dev-open-pr-unread-message-spin-v1');
     const turn: Awaited<ReturnType<typeof doTurn>> = shippedBranch ? await pullRequestTurn() : mayReuseCompletedProposalForOpenPr(
       explicitPrCycle,
       prRequested,
       // Messages only for other agents are not unread by the main agent.
-      multiAgent && !mainUnread() ? seen : msgs.length,
-      seen,
+      multiAgent && !mainUnread() ? unreadFrom() : msgs.length,
+      unreadFrom(),
       preventsUnreadOpenPrSpin,
     )
       ? { completed: true, providerCompleted: true, output: '', openPrRequested: true }
@@ -4609,7 +4650,11 @@ Inspect the complete current diff and specifically compare its delta from the re
         if (await waitAfterStop()) return await abort();
         continue;
       }
-      if (note) msgs.push({ id: `wait-${msgs.length}`, role: 'user', text: note, ts: Date.now() });
+      // Open PR ended it: the proposal goes as it stands, with no note to
+      // read first (one would run the agent before publishing).
+      const endedByOpenPr = !!needsInput && prRequested && !mainUnread() && raises.length === 0 && settled.length === 0;
+      if (note && !(endedByOpenPr && patched(OPEN_PR_AS_IT_STANDS)))
+        msgs.push({ id: `wait-${msgs.length}`, role: 'user', text: note, ts: Date.now() });
       continue;
     }
     // A job left running without pause: the agent decides what happens to it.
@@ -4650,6 +4695,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         waitingFor = needsHuman
           ? { kind: 'human', audience: ['@creator'], detail: 'The managing agent has not answered its children after three reminders. Send guidance to continue.' }
           : { kind: 'subtask' };
+        openPrInert = needsHuman;
         await publish();
         const wake = () => raises.length > 0 || settled.length > 0 || cancelled || mainUnread() || queuedSubTasks.length > 0;
         // If a child is still awaiting OUR reply (it raised a needs_confirmation /
@@ -4686,6 +4732,7 @@ Inspect the complete current diff and specifically compare its delta from the re
             chosen = wake();
           }
         }
+        openPrInert = false;
         if (cancelled) return await abort();
       }
       // Otherwise the agent kept working (spawned/answered this turn) — loop and run
@@ -4714,9 +4761,11 @@ Inspect the complete current diff and specifically compare its delta from the re
       while (await core.pendingServiceConnections(taskId) && !cancelled && !mainUnread()) {
         status = 'waiting';
         waitingFor = { kind: 'human', detail: 'Connect the requested app in Approval Requests to continue.' };
+        openPrInert = true;
         await publish();
         if (patched('service-connections-signal-wait-v1')) await waitServing(() => cancelled || mainUnread());
         else await condition(() => cancelled || msgs.length > seen, '30 seconds');
+        openPrInert = false;
       }
       if (cancelled) return await abort();
       if (mainUnread()) { status = 'active'; waitingFor = undefined; continue; }
@@ -5220,7 +5269,7 @@ Inspect the complete current diff and specifically compare its delta from the re
       const reviewOutcome = await playReviewGate({
         turnFinished,
         ...(turn.raise ? { raise: { type: turn.raise.type } } : {}),
-        messagesSeen: seen,
+        messagesSeen: unreadFrom(),
       });
       if (reviewOutcome === 'cancelled') return await abort();
       if (reviewOutcome === 'approved') break;
@@ -6158,6 +6207,19 @@ Inspect the complete current diff and specifically compare its delta from the re
         (msgs.length > seenAtEscalation || mergeMsgs.length > mergeSeenAtEscalation)));
     waitingFor = undefined;
     if (cancelled) return await abort();
+    if (explicitPrCycle && !retryRequested && mainUnreadSince(seenAtEscalation)
+      && patched(ESCALATED_MERGE_MESSAGE_TO_DO)) {
+      // What it does with the message is new work: it goes through Review again.
+      error = undefined;
+      confirmed = false;
+      prRequested = false;
+      branchPreparedForPr = false;
+      checkoutApprovals = {};
+      mergeAttempts = 0;
+      stage = 'do';
+      status = 'active';
+      continue proposalCycle;
+    }
     stage = 'merge';
     status = 'active';
     error = undefined;

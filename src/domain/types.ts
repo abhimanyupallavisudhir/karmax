@@ -2051,6 +2051,10 @@ export interface TaskContinuation {
   };
   manualPrConfirmer?: string;
   escalationAction?: 'openPr' | 'confirm';
+  /** Conversation length when a person or the parent asked for Open PR. */
+  openPrAskedAt?: number;
+  /** Messages an Open PR answered: they no longer wake the main agent. */
+  heardThrough?: number;
   error?: string;
   counters: { responderRounds: number; subtaskNags: number; subagentNudges: number; shellNudges: number;
     landingWatchSequence: number; resourceReviewSequence: number };
