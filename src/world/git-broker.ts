@@ -15,6 +15,7 @@ import { finalizeMergeRepo, scratchWorktreeHome, type MergeResult } from './merg
 import { materializeGitCredential, type GitCredential } from './git-credential.js';
 import { canonicalRepositoryIdentity } from './repository-identity.js';
 import { BRAND } from '../domain/brand.js';
+import { isTransportError } from '../agent/limits.js';
 import { mirroredClone, type MirroredClone } from './git-mirror.js';
 
 /** Clone options for the broker's throwaway repositories. `git fetch` and
@@ -39,6 +40,9 @@ export interface GitBrokerPublishResult {
   skipped: string[];
   /** Per-repository diagnostics for partial publication failures. */
   errors?: Record<string, string>;
+  /** Every skipped repository failed because the world could not be reached
+   * (a connection that stayed lost): infrastructure, not the task's. */
+  unreachable?: true;
 }
 
 export interface GitBrokerEnrollmentSpec {
@@ -716,11 +720,12 @@ async function publishRepositories(repos: WorldRepo[], run: (repo: WorldRepo) =>
     group.push({ repo, index }); groups.set(key, group);
   });
   const failures: Array<string | undefined> = new Array(repos.length);
+  const causes: unknown[] = [];
   const omitted = new Set<number>();
   await concurrentMap([...groups.values()], 3, async group => {
     for (const { repo, index } of group) {
       try { if ((await run(repo)) === 'omitted') omitted.add(index); }
-      catch (error) { failures[index] = error instanceof Error ? error.message : String(error); }
+      catch (error) { failures[index] = error instanceof Error ? error.message : String(error); causes.push(error); }
     }
   });
   const pushed: string[] = [], skipped: string[] = [];
@@ -730,7 +735,8 @@ async function publishRepositories(repos: WorldRepo[], run: (repo: WorldRepo) =>
     if (failures[index] === undefined) pushed.push(repo.name);
     else { skipped.push(repo.name); errors[repo.name] = failures[index]!; }
   });
-  return { pushed, skipped, ...(skipped.length ? { errors } : {}) };
+  return { pushed, skipped, ...(skipped.length ? { errors } : {}),
+    ...(causes.length && causes.every(isTransportError) ? { unreachable: true as const } : {}) };
 }
 
 /** Negotiate against the actual receiving repository, never stale sandbox
