@@ -791,10 +791,14 @@ export class GitHubAppService {
   }
 
   /** The installation on the GitHub user's own account. GitHub organizations
-   * the user administers are deliberately excluded: choosing one is ambiguous. */
-  async ownInstallation(userId: string, githubAccountId: string): Promise<string | undefined> {
-    return (await this.connectableInstallations(userId, githubAccountId))
-      .find(installation => installation.accountType === 'User')?.id;
+   * the user administers are excluded, since choosing one is ambiguous, unless
+   * one is named `preferLogin` (a new workspace's slug). */
+  async ownInstallation(userId: string, githubAccountId?: string, preferLogin?: string): Promise<string | undefined> {
+    const installations = await this.connectableInstallations(userId, githubAccountId);
+    const preferred = preferLogin?.toLowerCase();
+    return (installations.find(installation => installation.accountType === 'Organization'
+        && installation.accountLogin.toLowerCase() === preferred)
+      ?? installations.find(installation => installation.accountType === 'User'))?.id;
   }
 
   async installationUrl(state: string): Promise<string> {

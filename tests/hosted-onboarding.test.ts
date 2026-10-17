@@ -28,7 +28,28 @@ afterAll(async () => {
   for (const dir of tempDirs) fs.rmSync(dir, { recursive: true, force: true });
 });
 
-async function boot(hosted: boolean) {
+/** The GitHub App as seen by a person signed in to GitHub, whose own
+ * account has the App installed only if `installationId` is given. */
+function signedInGithubApp(store: Store, installationId?: string) {
+  const calls: Array<{ organizationId: string; installationId: string }> = [];
+  const lookups: Array<string | undefined> = [];
+  return { calls, lookups, app: {
+    configured: async () => true,
+    status: async () => ({ configured: true, oauthConfigured: true, webhookConfigured: false,
+      syncMode: 'on-demand', userAuthorized: true }),
+    ownInstallation: async (_userId: string, _accountId?: string, preferLogin?: string) => {
+      lookups.push(preferLogin);
+      return installationId;
+    },
+    connectInstallation: async (organizationId: string, id: string) => {
+      calls.push({ organizationId, installationId: id });
+      return { connection: await store.upsertGitConnection({ organizationId, provider: 'github',
+        installationId: id, accountLogin: 'alice', accountType: 'User' }), repositories: [] };
+    },
+  } };
+}
+
+async function boot(hosted: boolean, githubApp?: (store: Store) => object) {
   const port = await findFreePortFrom(48260);
   const identity = await IdentityService.open(':memory:', { baseURL: `http://127.0.0.1:${port}` });
   const store = (await Store.create(':memory:'));
@@ -55,6 +76,7 @@ async function boot(hosted: boolean) {
     providerConnections: providers,
     subscriptions,
     hosted,
+    ...(githubApp ? { githubApp: githubApp(store) as any } : {}),
   }));
   const running = await gateway.listen(port);
   closers.push(() => running.close());
@@ -276,6 +298,45 @@ describe('hosted onboarding status API', () => {
       complete: false,
       completedRequired: 0,
     });
+  });
+
+  it('connects a new organization to the creator’s own GitHub installation', async () => {
+    let github!: ReturnType<typeof signedInGithubApp>;
+    const { store, onboarding, base, cookie } = await boot(true, (s) => (github = signedInGithubApp(s, '77')).app);
+    const created = await fetch(`${base}/api/organizations`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Andhbhakt' }),
+    });
+    expect(created.status).toBe(200);
+    const organization = await created.json() as any;
+    expect((await store.listGitConnections(organization.id)).map((c) => c.installationId)).toEqual(['77']);
+    // A GitHub organization named like the new workspace wins over the personal account.
+    expect(github.lookups).toEqual([organization.slug]);
+    const status = await (await onboarding(organization.id)).json() as any;
+    expect(status.steps.github.complete).toBe(true);
+    expect(status.completedRequired).toBe(1);
+  });
+
+  it('does not mark GitHub done for an organization that has no installation', async () => {
+    let github!: ReturnType<typeof signedInGithubApp>;
+    const { store, onboarding, request, base, cookie } = await boot(true, (s) => (github = signedInGithubApp(s)).app);
+    // Signed in to GitHub, but the App is installed nowhere this person owns.
+    expect((await (await request()).json() as any).steps.github.complete).toBe(false);
+    const created = await fetch(`${base}/api/organizations`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'No installation team' }),
+    });
+    expect(created.status).toBe(200);
+    const organization = await created.json() as any;
+    expect(github.calls).toEqual([]);
+    expect(await store.listGitConnections(organization.id)).toEqual([]);
+    const status = await (await onboarding(organization.id)).json() as any;
+    expect(status.steps.github.complete).toBe(false);
+    expect(status.completedRequired).toBe(0);
+    // Another organization's connection is not this one's either.
+    await store.upsertGitConnection({ organizationId: 'org_personal', provider: 'github',
+      installationId: 'personal-only', accountLogin: 'alice', accountType: 'User' });
+    expect((await (await onboarding(organization.id)).json() as any).steps.github.complete).toBe(false);
   });
 
   it('does not count an unrelated vault item as an optional password', async () => {

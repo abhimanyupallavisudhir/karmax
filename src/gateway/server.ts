@@ -2537,9 +2537,8 @@ export class Gateway {
         });
         const clouds = await Promise.all(CLOUD_WORLD_PROVIDERS.map((provider) => store.getWorldProviderConnection(organizationId, provider)));
         const facts = {
-          github: Boolean((await this.deps.identity?.providersForUser(subject.userId))?.includes('github')
-            || (await this.deps.githubApp?.status(subject.userId))?.userAuthorized
-            || (await store.listGitConnections(organizationId)).some((connection) => !connection.suspendedAt)),
+          // This organization's own repository access; signing in with GitHub alone gives it none.
+          github: (await store.listGitConnections(organizationId)).some((connection) => !connection.suspendedAt),
           agentLogin: enabledCredentials.length > 0,
           e2b: (await Promise.all(clouds.map(async (connection) => !!connection?.enabled
             && !!await this.deps.broker?.hasHandle(connection.credentialHandle)))).some(Boolean),
@@ -2763,6 +2762,7 @@ export class Gateway {
         } catch (error) { return this.badRequest(res, error); }
         (await this.deps.authorization?.bootstrapOrganizationOwner(actorPrincipal(callerIdentity.actor), subject.userId, organization.id));
         (await this.deps.resources?.storageLocationService()?.ensureManaged(organization.id));
+        (await this.linkOwnGithubInstallation(subject.userId, organization));
         if (this.deps.hosted) (await this.enableHostedOnboarding(subject.userId, organization.id));
         return this.json(res, 200, organization);
       }
@@ -9762,25 +9762,40 @@ export class Gateway {
 
   /** Connecting GitHub must give the personal organization repository access,
    * not only a commit identity. Link the App installation on the user's own
-   * GitHub account (the same check as connecting an existing installation);
-   * when there is none, return the GitHub installation URL if `install`. */
+   * GitHub account; when there is none, return the GitHub installation URL if `install`. */
   private async linkPersonalGithubInstallation(userId: string,
     account: import('../integrations/github-app.js').GitHubUserIdentity, install: boolean): Promise<string | undefined> {
-    const githubApp = this.deps.githubApp!;
     const personal = (await this.deps.store.listOrganizations(userId)).find((organization) => organization.kind === 'personal');
-    if (!personal || (await this.deps.store.listGitConnections(personal.id)).length) return undefined;
+    if (!personal) return undefined;
+    return this.linkOwnGithubInstallation(userId, personal, { account, install });
+  }
+
+  /** A workspace someone creates starts with their GitHub: the App installation
+   * on their own GitHub account, or on a GitHub organization of the workspace's
+   * name that they administer (the same check as connecting an existing
+   * installation). A convenience only: failure leaves the workspace unconnected,
+   * and with `install` and no installation returns the GitHub installation URL. */
+  private async linkOwnGithubInstallation(userId: string, organization: Organization,
+    options: { account?: import('../integrations/github-app.js').GitHubUserIdentity; install?: boolean } = {}): Promise<string | undefined> {
+    const githubApp = this.deps.githubApp;
+    if (!githubApp || (await this.deps.store.listGitConnections(organization.id)).length) return undefined;
     try {
-      const installationId = (await githubApp.ownInstallation(userId, account.id));
-      if (!installationId) {
-        return install ? await githubApp.installationUrl((await this.deps.store.createGithubInstallState(personal.id, userId,
-          { returnTo: 'profile', githubAccountId: account.id, githubLogin: account.login }))) : undefined;
+      if (!options.account) {
+        const status = await githubApp.status(userId);
+        if (!status.configured || !status.userAuthorized) return undefined;
       }
-      await githubApp.connectInstallation(personal.id, installationId);
-      for (const project of (await this.deps.store.listProjects()).filter((candidate) => candidate.organizationId === personal.id))
+      const installationId = (await githubApp.ownInstallation(userId, options.account?.id,
+        organization.kind === 'personal' ? undefined : organization.slug));
+      if (!installationId) {
+        return options.install && options.account ? await githubApp.installationUrl((await this.deps.store.createGithubInstallState(organization.id, userId,
+          { returnTo: 'profile', githubAccountId: options.account.id, githubLogin: options.account.login }))) : undefined;
+      }
+      await githubApp.connectInstallation(organization.id, installationId);
+      for (const project of (await this.deps.store.listProjects()).filter((candidate) => candidate.organizationId === organization.id))
         await this.ensureProjectWiki(project, userId);
     } catch (error) {
-      // A convenience only: sign-in succeeded, and organization settings can still connect.
-      console.warn(`[github] personal installation link failed: ${error instanceof Error ? error.message : String(error)}`);
+      // Sign-in or creation succeeded, and organization settings can still connect.
+      console.warn(`[github] installation link failed for ${organization.id}: ${error instanceof Error ? error.message : String(error)}`);
     }
     return undefined;
   }
@@ -9983,6 +9998,7 @@ export class Gateway {
       (await this.deps.authorization?.bootstrapOrganizationOwner(`user:${userId}`, userId, organization.id));
       (await this.deps.resources?.storageLocationService()?.ensureManaged(organization.id));
       (await inheritPersonalGithubProfile(this.deps.store, this.deps.broker, userId));
+      (await this.linkOwnGithubInstallation(userId, organization));
       if (this.deps.hosted) (await this.enableHostedOnboarding(userId, organization.id));
       return true;
     } catch (e) {
