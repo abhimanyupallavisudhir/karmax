@@ -10,7 +10,7 @@ import { readWorldFilePrefix } from '../world/file-prefix.js';
 import { startJob, jobStatuses, describeJobs, listJobs, stopJobs, MAX_JOB_NAME } from '../world/jobs.js';
 import { PLATFORM_API_CATALOG } from '../platform/catalog.js';
 import {
-  PLATFORM_REQUEST_BODY_SCHEMA, PRIORITY_NAMES, AGENT_ROLE_NAMES, CREATE_TASK_GRANTS, REQUEST_FOR_TASK,
+  PLATFORM_REQUEST_BODY_SCHEMA, PRIORITY_NAMES, AGENT_ROLE_NAMES, CREATE_TASK_GRANTS, REQUEST_FOR_TASK, PERMISSION_ROUTING,
   QUEUE_TASK_DESCRIPTION, queuedTaskReply,
   compactSearch, compactOrganizationSearch, compactTags, normalizeRequestBody, platformRequestPathError,
 } from '../platform/platform-request.js';
@@ -138,7 +138,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     name: 'create_sub_task',
     description:
       'Delegate to a child task. It branches off your current work and merges back into YOUR branch (not main), and YOU are its confirmer: when it reaches Review or gets stuck it will raise to you (surfaced as a message) and you answer with respond_to_sub_task. It starts when your current turn ends, and first saves this task\'s writable project data for it to start from: stop anything writing into it (a server, a job, an open SQLite database) before you call it, or the save fails and no sub-task is created. You manage your children to completion before you finish. '
-      + 'It runs your agent unless `params` choose another: create_task\'s task-form fields, e.g. {"agent:do": {"provider": "codex", "model": "gpt-5.5", "effort": "high"}} or {"agent:do": {"avatarId": "…"}}. Only the agent fields can be set; the branch, project and authorization stay yours. An invalid or unavailable choice is refused and nothing is created. '
+      + 'It runs your agent unless `params` choose another: create_task\'s task-form fields, e.g. {"agent:do": {"provider": "codex", "model": "gpt-5.5", "effort": "high"}} or {"agent:do": {"avatarId": "…"}}. Only the agent fields can be set; the branch and project stay yours. It acts with your authority, including whatever you are granted later, so there is nothing to grant it. An invalid or unavailable choice is refused and nothing is created. '
       + 'With `draft: true` it is saved now and not started, and its task id returned: start it later with queue_task (people can also start it from your Sub-tasks). It then branches off your work as it is at that moment. Plan many sub-tasks as drafts and start them in batches when they should not all run at once (e.g. a cloud provider\'s machine limits).',
     parameters: {
       type: 'object',
@@ -898,8 +898,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     name: 'request_permission',
     description:
       `Request exact ${BRAND} capabilities and/or additional projectIds for this task. Project expansion retains existing projects and applies the task authorization in added projects. The request appears in Approval Requests and is routed ` +
-      'to selected people, teams, or Avatars. Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @maintainers, @admins, @superadmins, @owners, @project, or @all; ' +
-      'omit audience to summon the lowest level that can grant it. Discover choices with platform_request(GET, "/api/agent/escalation-targets"). Only a selected principal that already ' +
+      'to the selected tasks, people, teams, or Avatars. ' + PERMISSION_ROUTING + 'Only a selected principal that already ' +
       'holds the requested capabilities and can grant the full task authorization across the expanded scope can approve. Do not request wildcards. An approval or denial resumes the task. '
       + REQUEST_FOR_TASK,
     parameters: {
@@ -920,7 +919,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
           items: { type: 'string' },
           minItems: 1,
           maxItems: 32,
-          description: 'Person/team/Avatar routing selectors; any selected capable principal may decide. Omit to summon @maintainers, @admins or @superadmins, whichever is the lowest level that can grant it.',
+          description: 'Task/person/team/Avatar selectors; any selected capable principal may decide. Omit to ask the nearest who can grant it.',
         },
         reason: {
           type: 'string',

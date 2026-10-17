@@ -199,8 +199,8 @@ promises_client_addresses() {
   git -C "$WORK/origin.git" show "$DEPLOY_SHA:deploy/compose.turnkey.yml" | grep -q 'KARMAX_TRUSTED_PROXY_IP'
 }
 
-# Point the app at the E2B stand-in, and let it run the mock agent (a release
-# refuses the mock unless the operator forces it with KARMAX_AGENT_PROVIDER=mock).
+# Point the app at the E2B stand-in, and admit the mock agent the rehearsal's
+# tasks run on (it exists only under KARMAX_AGENT_PROVIDER=mock).
 # $KARMAX_HOME/karmax.env is the operator's settings file, loaded at start (the
 # real environment wins), and it lives in the data volume, so an update's new
 # app reads it on its first boot.

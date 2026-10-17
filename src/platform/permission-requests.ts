@@ -20,6 +20,8 @@ export interface PermissionRequest {
   /** Avatar principals selected at request time. Kept separate from human ids
    * so the inbox never attempts to materialize an Avatar as a user. */
   avatarRecipients?: string[];
+  /** Tasks the requester acts for that hold what it asks: their agents decide. */
+  taskRecipients?: string[];
   reason: string;
   requestedBy: string;
   status: 'pending' | 'granted' | 'denied' | 'withdrawn';
@@ -30,6 +32,8 @@ export interface PermissionRequest {
   createdAt: number;
   /** Human-facing metadata projected by the gateway, never persisted. */
   task?: { id: string; num?: number; title: string; projectId: string };
+  /** The tasks in `taskRecipients`, projected the same way. */
+  grantorTasks?: Array<{ id: string; num?: number; title: string; projectId: string }>;
 }
 
 /** Before PL-8 every request of an organization lived in this one blob. */
@@ -174,6 +178,7 @@ export class PermissionRequests {
     audience: string[];
     recipients: string[];
     avatarRecipients?: string[];
+    taskRecipients?: string[];
     reason: string;
     requestedBy: string;
   }): Promise<PermissionRequest> {
@@ -187,7 +192,9 @@ export class PermissionRequests {
     const audience = [...new Set(input.audience.map((value) => String(value).trim()).filter(Boolean))];
     const recipients = [...new Set(input.recipients.map(String).filter(Boolean))];
     const avatarRecipients = [...new Set((input.avatarRecipients ?? []).map(String).filter(Boolean))];
-    if (!audience.length || (!recipients.length && !avatarRecipients.length)) throw new Error('choose at least one person, team, or Avatar');
+    const taskRecipients = [...new Set((input.taskRecipients ?? []).map(String).filter(Boolean))];
+    if (!audience.length || (!recipients.length && !avatarRecipients.length && !taskRecipients.length))
+      throw new Error('choose at least one task, person, team, or Avatar');
     const reason = String(input.reason).trim();
     if (!reason) throw new Error('reason is required');
     if ([...reason].length > 4_000) throw new Error('reason must be at most 4000 characters');
@@ -212,6 +219,7 @@ export class PermissionRequests {
       audience,
       recipients,
       ...(avatarRecipients.length ? { avatarRecipients } : {}),
+      ...(taskRecipients.length ? { taskRecipients } : {}),
       reason,
       requestedBy: input.requestedBy,
       status: 'pending',
@@ -222,7 +230,7 @@ export class PermissionRequests {
       principalId: input.requestedBy,
       action: 'permission.requested',
       scopeKey: `project:${input.projectId}`,
-      detail: { requestId: request.id, taskId: input.taskId, role: input.role, capabilities, projectIds, baseAuthorization: input.baseAuthorization, audience, recipients, avatarRecipients },
+      detail: { requestId: request.id, taskId: input.taskId, role: input.role, capabilities, projectIds, baseAuthorization: input.baseAuthorization, audience, recipients, avatarRecipients, taskRecipients },
     }));
     return request;
 
