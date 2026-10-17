@@ -4907,7 +4907,9 @@ function connectWs() {
       if (ev.type === 'view.updated' || ev.type.includes('stage') || ev.type === 'merge.result' || ev.type === 'turn.result'
         || ev.type.endsWith('.approval-requested') || ev.type.endsWith('.approval-resolved')) {
         refreshTask(ev.type);
-      } else if (ev.type === 'session.started' || ev.type === 'review.updated' || ev.type.startsWith('connection.') || ev.type.endsWith('.approval-dismissed')) {
+      } else if (ev.type === 'session.started' || ev.type === 'review.updated' || ev.type.startsWith('connection.') || ev.type.endsWith('.approval-dismissed')
+        // A draft sub-task saved, queued or started: only the server's summaries know it.
+        || ev.type === 'subtask.created' || ev.type === 'subtask.queued' || ev.type === 'subtask.started') {
         // Mid-turn metadata changes must not clear output or patch lifecycle state.
         refreshTask(ev.type);
       } else if (ev.type !== 'agent.output') scheduleTaskPageRender(); // sub-task fan-out, pushes, PR/world events: sections derived from S.taskEvents
@@ -10736,7 +10738,10 @@ function parentTaskContext(v) {
 function subTaskState(rec) {
   const v = rec?.lastView || {};
   const done = v.status === 'done' || v.stage === 'done';
-  const tone = v.state?.draft ? 'draft' : done ? 'done' : v.stage === 'escalated' ? 'blocked' : v.status || 'active';
+  // A draft sub-task waits to be run; once queued, for its parent to start it.
+  if (v.state?.draft) return { label: v.state.queued ? 'queued' : 'draft', tone: v.state.queued ? 'waiting' : 'draft',
+    complete: false, approval: false, draft: !v.state.queued };
+  const tone = done ? 'done' : v.stage === 'escalated' ? 'blocked' : v.status || 'active';
   return { label: stageLabel(v), tone, complete: done, approval: !!v.approvalRequests };
 }
 
@@ -10765,15 +10770,17 @@ function subTasksSection(v) {
   const rows = children.map(({ id, rec, state }) => {
     const title = rec?.title || `Sub-task ${numLabel(id)}`;
     const childView = { workflow: rec?.workflow || v.workflow, ...(rec?.lastView || {}) };
-    return `<a class="subtask-row" data-open="${esc(id)}" data-spa href="${esc(taskUrl(id, rec))}" aria-label="Open ${esc(title)} — ${esc(state.label)}">
+    const row = `<a class="subtask-row" data-open="${esc(id)}" data-spa href="${esc(taskUrl(id, rec))}" aria-label="Open ${esc(title)} — ${esc(state.label)}">
       <span class="subtask-state ${esc(state.tone)}" aria-hidden="true"></span>
       <span class="subtask-identity">
         <span class="subtask-title">${rec?.num != null ? `<span class="task-num">#${rec.num}</span>` : ''}<strong>${esc(title)}</strong></span>
         ${subTaskStateHtml(state, 'subtask-copy')}
       </span>
-      <span class="subtask-pipeline" aria-hidden="true">${pipeline(childView)}</span>
+      <span class="subtask-pipeline" aria-hidden="true">${state.draft || state.label === 'queued' ? '' : pipeline(childView)}</span>
       <span class="subtask-arrow" aria-hidden="true">›</span>
     </a>`;
+    // A draft runs from here; it starts off this task's work as it is then.
+    return state.draft ? `<div class="subtask-draft">${row}<button type="button" class="btn sm" data-run-subtask="${esc(id)}" title="Start it from this task's current work">Run</button></div>` : row;
   }).join('');
   return `<section class="subtasks" aria-labelledby="subtasks-title">
     <div class="subtasks-head">
@@ -11042,6 +11049,21 @@ function wireTaskRail(v) {
     S.taskRailOverlay = false; // the shell shows in place of the floating rail
     toggleTaskTerminal(v);
   });
+  wireSubTaskDrafts(v);
+}
+
+// Run a draft sub-task: its parent starts it after its agent's current turn.
+function wireSubTaskDrafts(v) {
+  document.querySelectorAll('[data-run-subtask]').forEach((b) => b.addEventListener('click', async () => {
+    b.disabled = true;
+    try {
+      await api(`/api/tasks/${encodeURIComponent(b.dataset.runSubtask)}/queue`, { method: 'POST', body: '{}' });
+      const summary = (v.subTaskSummaries || []).find((child) => child.id === b.dataset.runSubtask);
+      if (summary) summary.lastView = { ...summary.lastView, state: { draft: true, queued: true } };
+      toast('Queued');
+      renderTaskPage();
+    } catch (e) { b.disabled = false; showTaskError(e, v.projectId); }
+  }));
 }
 
 // The page's details rail, open or closed (the header toggle, i).

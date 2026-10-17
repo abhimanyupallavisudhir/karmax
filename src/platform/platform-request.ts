@@ -23,6 +23,19 @@ export const CREATE_TASK_GRANTS = 'Grant it what it needs: `authorization` {leve
   + 'What you cannot grant is not refused: the task is kept as a draft and the result names who can grant it; '
   + 'ask them with request_permission and its task id.';
 
+/** queue_task (both tool surfaces): start a draft. */
+export const QUEUE_TASK_DESCRIPTION = 'Start a draft task (one saved with create_task or create_sub_task `draft: true`). '
+  + 'A draft sub-task of yours starts when your current turn ends, branching off your work as it is then; '
+  + 'one of another task starts when that task\'s agent ends its turn. A draft with triggers is armed instead.';
+
+/** What queue_task answers for the task POST /api/tasks/:id/queue returned. */
+export function queuedTaskReply(task: { id?: string; parentTaskId?: string; params?: Record<string, unknown> } | undefined, fallbackId: string): string {
+  const id = task?.id ?? fallbackId;
+  if (task?.params?.triggerState === 'armed') return `armed ${id}: it starts when its triggers fire`;
+  return task?.parentTaskId && task.params?.draft
+    ? `queued ${id}: it starts when its parent task's agent ends its turn` : `started ${id}`;
+}
+
 /** request_permission's other use: asking for what a task you created is held for. */
 export const REQUEST_FOR_TASK = 'Pass a task id instead to ask for the authorization and credentials a task you created '
   + 'asked for but you could not grant; you keep working, and a draft starts once they are granted.';

@@ -61,6 +61,9 @@ export interface RunTurnDeps {
   /** Validate and normalize create_sub_task `params` (PL-11). A refusal throws,
    *  so the agent gets a tool error and nothing is queued. */
   subTaskParams?: (params: unknown) => Promise<SubTaskRequest['params']>;
+  /** Save a draft sub-task of this task now (POST /api/tasks/:id/sub-tasks),
+   *  returning its task id; it starts when queued. */
+  createSubTaskDraft?: (t: SubTaskRequest) => Promise<string>;
   /** Budget service + scope for request_spend (SPEC §7.6); omitted = payments off. */
   budget?: {
     request(ctx: { projectId: string; taskId: string; organizationId?: string; capabilities?: string[] }, args: { amount: number; merchant?: string; why?: string; cardId?: string }): Promise<{
@@ -319,6 +322,12 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       await publication;
     },
     async createSubTask(t) {
+      // A draft is a task now, not a request for the end of the turn: nothing
+      // of this turn's is journaled for it.
+      if (t.draft) {
+        if (!deps.createSubTaskDraft) throw new Error('draft sub-tasks are unavailable in this turn');
+        return deps.createSubTaskDraft({ title: t.title, prompt: t.prompt, ...(t.params !== undefined ? { params: t.params } : {}) });
+      }
       // Unvalidated params never reach a child: without a validator, refuse them.
       if (t.params !== undefined && !deps.subTaskParams) throw new Error('sub-task params are unavailable in this turn');
       const params = t.params === undefined ? undefined : (await deps.subTaskParams!(t.params));

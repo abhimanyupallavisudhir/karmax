@@ -136,6 +136,8 @@ export const SIG = {
   followUp: 'followUp',
   /** A sub-task's request was passed on to people: it no longer waits on its parent. */
   subtaskRedirected: 'subtaskRedirected',
+  /** A draft sub-task was queued: its parent prepares and starts it. */
+  queueSubTask: 'queueSubTask',
   collaborationRequested: 'collaborationRequested',
   collaborationSettled: 'collaborationSettled',
   resourceResolved: 'resourceResolved',
