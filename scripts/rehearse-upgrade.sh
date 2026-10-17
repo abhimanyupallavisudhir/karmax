@@ -199,14 +199,16 @@ promises_client_addresses() {
   git -C "$WORK/origin.git" show "$DEPLOY_SHA:deploy/compose.turnkey.yml" | grep -q 'KARMAX_TRUSTED_PROXY_IP'
 }
 
-# Point the app at the E2B stand-in. $KARMAX_HOME/karmax.env is the operator's
-# settings file, loaded at start (the real environment wins), and it lives in
-# the data volume, so an update's new app reads it on its first boot.
+# Point the app at the E2B stand-in, and let it run the mock agent (a release
+# refuses the mock unless the operator forces it with KARMAX_AGENT_PROVIDER=mock).
+# $KARMAX_HOME/karmax.env is the operator's settings file, loaded at start (the
+# real environment wins), and it lives in the data volume, so an update's new
+# app reads it on its first boot.
 use_fake_e2b() {
   [ -n "$E2B_HOST" ] || { echo "rehearse: the E2B stand-in has no address" >&2; return 1; }
   local id dc; id=$(app_container)
   if ! docker exec "$id" grep -q '^E2B_API_URL=' /var/lib/karmax/karmax.env 2>/dev/null; then
-    docker exec "$id" sh -c "printf 'E2B_API_URL=http://%s:%s\nE2B_SANDBOX_URL=http://%s:%s\n' \
+    docker exec "$id" sh -c "printf 'E2B_API_URL=http://%s:%s\nE2B_SANDBOX_URL=http://%s:%s\nKARMAX_AGENT_PROVIDER=mock\n' \
       $E2B_HOST $E2B_API_PORT $E2B_HOST $E2B_ENVD_PORT >> /var/lib/karmax/karmax.env"
     docker restart "$id" >/dev/null
     until docker exec "$id" node -e "fetch('http://127.0.0.1:4505/api/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" >/dev/null 2>&1; do sleep 2; done
