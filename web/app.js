@@ -13659,7 +13659,7 @@ function wireAgentMention(ta, box, v, key) {
     ta.dispatchEvent(new Event('input', { bubbles: true }));
   };
   const choose = (item) => {
-    if (!item || !token) return close();
+    if (!item || !token || !ta.isConnected) return close();
     if (item.kind === 'people') { peopleMode = true; active = 0; items = build(); return render(); }
     if (item.kind === 'new') {
       const agentKey = nextAgentKeyFor([...(v.participants || []).map((p) => p.key), ...Object.keys(followupNewAgents(key))]);
@@ -13671,7 +13671,7 @@ function wireAgentMention(ta, box, v, key) {
     insert(item.token || `@${item.label}`, item.selector);
   };
   const render = () => {
-    if (!menu) { menu = document.createElement('div'); menu.className = 'wiki-mention-menu agent-mention-menu'; menu.setAttribute('role', 'listbox'); document.body.appendChild(menu); }
+    if (!menu?.isConnected) { menu = openCaretMenu('wiki-mention-menu agent-mention-menu'); menu.setAttribute('role', 'listbox'); }
     const scrolled = menu.scrollTop;
     let sawAgent = false;
     menu.innerHTML = items.length ? items.map((item, i) => {
@@ -15922,6 +15922,16 @@ function textareaCaretXY(ta, pos) {
 }
 // A caret menu opens below the caret's line, or above it when there is more room
 // there, and stays inside the viewport — scrolling rather than running off it.
+// One caret menu (@ or [[) at a time, on <body> so no box clips it. Opening one
+// removes any other, including one left by a box a re-render replaced (its
+// options would write into a box no longer on the page).
+function openCaretMenu(className) {
+  document.querySelectorAll('.wiki-mention-menu').forEach((other) => other.remove());
+  const menu = document.createElement('div');
+  menu.className = className;
+  document.body.appendChild(menu);
+  return menu;
+}
 function placeCaretMenu(menu, ta, pos) {
   const edge = 8, xy = textareaCaretXY(ta, pos);
   const below = window.innerHeight - xy.top - edge, above = xy.lineTop - edge;
@@ -16004,7 +16014,7 @@ function wireWikiMention(ta, projectId) {
 
   const highlight = () => menu?.querySelectorAll('.wm-opt').forEach((el, i) => el.classList.toggle('active', i === active));
   const choose = (s) => {
-    if (!s || !token) return close();
+    if (!s || !token || !ta.isConnected) return close();
     const insert = `${tokenFor(s)} `;
     ta.value = ta.value.slice(0, token.start) + insert + ta.value.slice(token.end);
     const caret = token.start + insert.length;
@@ -16014,7 +16024,7 @@ function wireWikiMention(ta, projectId) {
     ta.dispatchEvent(new Event('input', { bubbles: true }));
   };
   const render = () => {
-    if (!menu) { menu = document.createElement('div'); menu.className = 'wiki-mention-menu'; document.body.appendChild(menu); }
+    if (!menu?.isConnected) menu = openCaretMenu('wiki-mention-menu');
     menu.innerHTML = items.length ? items.map((s, i) => `
       <div class="wm-opt ${i === active ? 'active' : ''}" data-i="${i}">
         <span class="wm-glyph">${glyph(s)}</span>
