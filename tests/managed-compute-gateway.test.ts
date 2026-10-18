@@ -101,7 +101,7 @@ describe('managed compute API', () => {
 
     expect((await call(tokenFor.operator!, 'PUT', '/api/settings/managed-compute/e2b', { enabled: false })).status).toBe(200);
     expect(await (await call(tokenFor.tenantOwner!, 'GET', `/api/organizations/${organizationId}/world-providers`)).json()).toEqual([]);
-    expect((await (await call(tokenFor.tenantOwner!, 'GET', `/api/organizations/${organizationId}/entitlements`)).json()).compute).toBeNull();
+    expect(((await (await call(tokenFor.tenantOwner!, 'GET', `/api/organizations/${organizationId}/entitlements`)).json()) as { compute: unknown }).compute).toBeNull();
     expect((await call(tokenFor.operator!, 'DELETE', '/api/settings/managed-compute/e2b')).status).toBe(200);
   });
 });

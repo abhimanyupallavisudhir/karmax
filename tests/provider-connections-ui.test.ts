@@ -3,7 +3,6 @@ import { closeConsoleBrowser, consolePage, emptySettings, signedIn, type ApiHand
 
 afterAll(closeConsoleBrowser);
 
-type Console = Awaited<ReturnType<typeof consolePage>>;
 const month = Date.UTC(2026, 8, 1);
 
 /** Organization settings, open at the section holding `selector`. */
