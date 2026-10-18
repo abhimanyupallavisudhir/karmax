@@ -1071,6 +1071,7 @@ export class ClaudeAdapter implements AgentAdapter {
         }
         if (e instanceof ProviderFailure || e instanceof AgentChannelLost) throw e;
         if (remoteProcess?.lost) throw remoteProcess.lost;
+        if (remoteProcess?.unavailable) throw remoteProcess.unavailable;
         throw e; // preserve the original stack for unrelated SDK failures
       }
     } finally {
@@ -1090,6 +1091,7 @@ export class ClaudeAdapter implements AgentAdapter {
     if (ctx.signal?.aborted) throw new Error('Claude Agent SDK turn cancelled');
     if (!successfulResult) {
       if (remoteProcess?.lost) throw remoteProcess.lost;
+      if (remoteProcess?.unavailable) throw remoteProcess.unavailable;
       throw new Error('Claude Agent SDK stream ended unexpectedly without a successful result event');
     }
     // Only a subtype=success result is a turn boundary. `delivered` = every message

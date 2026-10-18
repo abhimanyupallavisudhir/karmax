@@ -106,7 +106,7 @@ import { findProviderSession, materializeFork } from '../agent/fork.js';
 import { CodexHistoryError } from '../agent/codex-history.js';
 import { importWithPanagent, reuseNativeImport, stableImportSessionId, looksLikeConversationUrl, publicConversationShare, type PanagentSource } from '../agent/panagent.js';
 import { publicShare, publicConversationHtml } from '../gateway/conversation-sharing.js';
-import { isRemoteAgentWorld, materializeRemoteSession, prewarmRemoteAgentHome, readRemoteImport } from '../agent/remote-process.js';
+import { isRemoteAgentWorld, materializeRemoteSession, prewarmRemoteAgentHome, readRemoteImport, RemoteAgentCliUnavailable } from '../agent/remote-process.js';
 import { checkWorldDisk, diskNotice, diskRatio, diskWasFull, DISK_REARM_RATIO, DISK_WARN_RATIO, isDiskFullMessage, largestWorldPaths,
   outOfDiskMessage, worldUsage, type DiskCheck } from '../world/disk.js';
 import { computerLimits } from '../domain/computer-limits.js';
@@ -216,7 +216,7 @@ function classifyTurnError(err: unknown, provider?: Provider, sandbox?: { diagno
   // backpressure/outages therefore cannot be an agent error and must retain
   // their retryable infrastructure classification through this outer boundary.
   if (err instanceof AdmissionBackpressureError || err instanceof AgentAdmissionInfrastructureError
-    || err instanceof AgentResourcesUnavailableError || err instanceof AgentChannelLost) {
+    || err instanceof AgentResourcesUnavailableError || err instanceof AgentChannelLost || err instanceof RemoteAgentCliUnavailable) {
     return ApplicationFailure.create({ message: msg, type: 'agent-infra', nonRetryable: false, cause });
   }
   if (err instanceof ProviderPolicyFailure || isProviderPolicyRejection(err)) {

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { makeCoreActivities } from '../src/activities/core.js';
 import { ProfileResolver } from '../src/agent/profiles.js';
+import { RemoteAgentCliUnavailable } from '../src/agent/remote-process.js';
 import { Store } from '../src/store/db.js';
 import { WorldRegistry } from '../src/world/registry.js';
 
@@ -71,6 +72,18 @@ describe('out of disk', () => {
     const { turn, close } = await harness(() => usage(10, 22), async () => { throw new Error('Claude Code process exited with code 1'); });
     try {
       expect(await turn().then(() => undefined, (caught) => caught)).toMatchObject({ type: 'agent-error' });
+    } finally { await close(); }
+  });
+
+  // Task 701: a sandbox whose npm could not install a working CLI blocked the task
+  // as the agent's own error. It is the sandbox's, and a retry installs again.
+  it('retries a turn whose sandbox could not install a working CLI', async () => {
+    const { turn, close } = await harness(() => usage(10, 22), async () => {
+      throw new RemoteAgentCliUnavailable('@anthropic-ai/claude-code@2.1.281');
+    });
+    try {
+      expect(await turn().then(() => undefined, (caught) => caught)).toMatchObject({ type: 'agent-infra', nonRetryable: false,
+        message: expect.stringMatching(/^Could not start @anthropic-ai\/claude-code@2\.1\.281 in the sandbox/) });
     } finally { await close(); }
   });
 

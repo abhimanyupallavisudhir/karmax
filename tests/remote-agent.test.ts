@@ -27,7 +27,7 @@ import { CodexAdapter, codexDynamicTools } from '../src/agent/codex.js';
 import { ensureRemoteBrowser, installedClaudeCodeVersion, materializeRemoteSession, remoteAgentCommand, remoteAgentEnv,
   remoteAgentHomeRelative, seedRemoteAgentHome, syncRemoteAgentHome,
   reconcileRemoteCodexSessionCopies, RemoteSpawnedProcess, CODEX_REMOTE_REFRESH_SENTINEL, installMemoryGuard,
-  spawnRemoteAgentProcess } from '../src/agent/remote-process.js';
+  spawnRemoteAgentProcess, REMOTE_CLI_UNAVAILABLE, RemoteAgentCliUnavailable } from '../src/agent/remote-process.js';
 import { ensureClaudeAccessTokenFresh } from '../src/agent/usage.js';
 import { classifyProviderTurnError, isTransportError, ProviderFailure, ProviderOutage, SandboxProviderFailure } from '../src/agent/limits.js';
 import type { World, WorldPty, WorldPtySpec, WorldPtyTermination } from '../src/world/types.js';
@@ -284,6 +284,95 @@ describe('remote subscription agents', () => {
       expect(spawnSync('kill', ['-0', String(guardPid)]).status).toBe(0);
       process.kill(guardPid, 'SIGTERM');
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  // Task 701: npm skipped Claude Code's native binary (an optional dependency)
+  // after a failed download and still exited 0. npx's cache kept the stub, which
+  // exits 1, so that turn and every Retry died at once with "exited with code 1".
+  describe('a CLI npm installed without its native binary', () => {
+    const launch = (installs: (n: number) => 'broken' | 'working') => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-remote-reinstall-'));
+      const stubs = path.join(root, 'stubs');
+      const home = path.join(root, '.karmax-injection', 'agent', 'claude', 'home');
+      const install = path.join(root, 'npm', '_npx', '4e8841d163654a8d');
+      fs.mkdirSync(stubs); fs.mkdirSync(home, { recursive: true });
+      const count = path.join(root, 'installs');
+      const cli = { broken: 'echo "Error: claude native binary not installed." >&2; exit 1',
+        working: 'case "$1" in --version) echo "2.1.281 (Claude Code)" ;; *) echo "agent args=$*" ;; esac' };
+      fs.writeFileSync(path.join(stubs, 'npx'), [
+        '#!/bin/sh',
+        `n=$(( $(cat ${count} 2>/dev/null || echo 0) + 1 )); echo $n > ${count}`,
+        `if [ ! -x ${install}/node_modules/.bin/claude ]; then mkdir -p ${install}/node_modules/.bin`,
+        `  case $n in ${[1, 2, 3, 4].map(n => `${n}) printf '#!/bin/sh\\n%s\\n' '${cli[installs(n)]}' ;;`).join(' ')} esac > ${install}/node_modules/.bin/claude`,
+        `  chmod +x ${install}/node_modules/.bin/claude; fi`,
+        `echo ${install}/node_modules/.bin/claude`,
+      ].join('\n'), { mode: 0o755 });
+      let spec: WorldPtySpec | undefined;
+      const world = { handle: { root, id: 'reinstall' }, async exec(command: string, args: string[], options: { timeoutMs?: number }) {
+        const result = spawnSync(command, args, { cwd: root, encoding: 'utf8', timeout: options?.timeoutMs });
+        return { code: result.status ?? 1, stdout: result.stdout, stderr: result.stderr };
+      }, async writeFile(file: string, content: string) {
+        fs.writeFileSync(path.join(root, file), content);
+      }, async openPty(options: WorldPtySpec) {
+        spec = options;
+        return { onData: () => () => {}, onExit: () => () => {}, write: async () => {}, resize: async () => {}, close: async () => {} };
+      } } as unknown as World;
+      return { root, home, world, count, run: async () => {
+        const child = spawnRemoteAgentProcess({ world, provider: 'claude', command: '/sdk/claude', args: ['--output-format', 'stream-json'],
+          cwd: root, env: { CLAUDE_CONFIG_DIR: home } });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        const run = spawnSync('bash', ['-c', spec!.command!], { cwd: root, encoding: 'utf8',
+          env: { ...process.env, ...spec!.env, PATH: `${stubs}:${process.env.PATH}` } });
+        const steps = ((await child.startupDiagnostics() as any).sandbox.steps as any[]).map(step => step.phase);
+        return { run, steps, stderr: fs.readFileSync(path.join(home, 'agent-stderr.log'), 'utf8'), installs: Number(fs.readFileSync(count, 'utf8')) };
+      } };
+    };
+
+    it('reinstalls it and starts the agent', async () => {
+      const { root, run } = launch(n => n === 1 ? 'broken' : 'working');
+      try {
+        const { run: result, steps, stderr, installs } = await run();
+        expect(result.status).toBe(0);
+        expect(result.stdout).toContain('agent args=--print --output-format stream-json');
+        expect(installs).toBe(2);
+        expect(steps).toEqual(expect.arrayContaining(['cli-resolve', 'cli-reinstall', 'cli-exec']));
+        expect(stderr).not.toContain('does not run');
+      } finally { fs.rmSync(root, { recursive: true, force: true }); }
+    });
+
+    it('gives up after three installs with a status the host recognizes', async () => {
+      const { root, run } = launch(() => 'broken');
+      try {
+        const { run: result, steps, stderr, installs } = await run();
+        expect(result.status).toBe(REMOTE_CLI_UNAVAILABLE);
+        expect(installs).toBe(3);
+        expect(steps.filter(step => step === 'cli-reinstall')).toHaveLength(2);
+        expect(steps).not.toContain('cli-exec');
+        expect(stderr).toMatch(/^@anthropic-ai\/claude-code@[\d.]+ does not run \(.*\/claude --version failed\)$/m);
+      } finally { fs.rmSync(root, { recursive: true, force: true }); }
+    });
+
+    it('reports that status as an uninstallable CLI, any other early exit as the agent\'s own', async () => {
+      const ending = async (code: number) => {
+        let exit!: (code: number | null) => void;
+        const world = fakeWorld();
+        world.openPty = async () => ({ onData: () => () => {}, onExit: (listener) => { exit = listener; return () => {}; },
+          write: async () => {}, resize: async () => {}, close: async () => {} });
+        world.exec = async () => ({ code: 0, stdout: '', stderr: '' });
+        const child = new RemoteSpawnedProcess(world, 'command', '/workspace', {}, undefined, '/home/agent-stderr.log',
+          undefined, undefined, '@anthropic-ai/claude-code@2.1.281');
+        const exited = new Promise((resolve) => child.once('exit', resolve));
+        await Promise.resolve();
+        exit(code);
+        await exited;
+        return child.unavailable;
+      };
+      const unavailable = await ending(REMOTE_CLI_UNAVAILABLE);
+      expect(unavailable).toBeInstanceOf(RemoteAgentCliUnavailable);
+      expect(unavailable?.message).toBe('Could not start @anthropic-ai/claude-code@2.1.281 in the sandbox: it did not run after 3 fresh installs '
+        + '(npm skips a native binary it fails to download). Retry installs it again.');
+      expect(await ending(1)).toBeUndefined();
+    });
   });
 
   // Tasks 361/362: Daytona types the launcher into an interactive shell whose

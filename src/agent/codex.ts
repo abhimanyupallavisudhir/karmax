@@ -998,6 +998,7 @@ export class CodexAdapter implements AgentAdapter {
       // workflow rotates to another login (RESOLVE-PLAN §2.4).
       throw providerFailure(providerFailureDisplay(limit), limit);
     }
+    if (child.unavailable) throw child.unavailable;
     if (turnError) {
       throw new Error(`codex app-server turn failed: ${turnError}${stderr ? ` · ${stderrTail(stderr, 300)}` : ''}`);
     }

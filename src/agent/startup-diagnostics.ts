@@ -1,7 +1,7 @@
 import type { World } from '../world/types.js';
 
 export const STARTUP_PHASES = ['shell-started', 'previous-process-check', 'previous-process-stopped',
-  'protocol-ready', 'cli-version-check', 'cli-resolve', 'cli-exec', 'relay-started', 'child-spawned',
+  'protocol-ready', 'cli-version-check', 'cli-resolve', 'cli-reinstall', 'cli-exec', 'relay-started', 'child-spawned',
   'stdin-received', 'stdin-ended', 'child-error', 'child-exited'] as const;
 const FRAME_TYPES = new Set(['control_request', 'control_response', 'control_cancel_request', 'system', 'user',
   'assistant', 'result', 'stream_event', 'keep_alive']);
@@ -17,7 +17,7 @@ export function startupStderrSummary(text: string, bytes: number) {
   return { bytes, codes: CODES.filter(code => text.includes(code)), flags: [
     /unauthorized|authentication|oauth|401|403/i.test(text) && 'auth',
     /network|connect|socket|timed? out|dns/i.test(text) && 'network',
-    /npm (?:err|error)|cannot find module/i.test(text) && 'package',
+    /npm (?:err|error)|cannot find module|binary not installed/i.test(text) && 'package',
     /heap out of memory|allocation failed|enomem/i.test(text) && 'memory',
   ].filter(Boolean) };
 }
@@ -92,7 +92,7 @@ console.log(JSON.stringify({ steps, processes: all.filter(p => roots.has(p.pid))
   stderr: { bytes: stderr.bytes, codes: ${JSON.stringify(CODES)}.filter(code => stderr.text.includes(code)),
     flags: [/unauthorized|authentication|oauth|401|403/i.test(stderr.text) && 'auth',
       /network|connect|socket|timed? out|dns/i.test(stderr.text) && 'network',
-      /npm (?:err|error)|cannot find module/i.test(stderr.text) && 'package',
+      /npm (?:err|error)|cannot find module|binary not installed/i.test(stderr.text) && 'package',
       /heap out of memory|allocation failed|enomem/i.test(stderr.text) && 'memory'].filter(Boolean) } }));
 `;
 

@@ -297,6 +297,21 @@ function syncedCodexHistory(relative: string, history: Array<{ relative: string;
   return copies.every(copy => copy.id && synced.has(copy.id)) ? synced : undefined;
 }
 
+/** The launcher's status when the agent's CLI still does not run after
+ * {@link REMOTE_CLI_INSTALLS} fresh installs (sysexits' EX_UNAVAILABLE). */
+export const REMOTE_CLI_UNAVAILABLE = 69;
+const REMOTE_CLI_INSTALLS = 3;
+
+/** The sandbox could not install a working agent CLI. Not the agent's fault
+ * and usually transient (a dropped registry download), so the turn retries. */
+export class RemoteAgentCliUnavailable extends Error {
+  constructor(readonly packageSpec: string) {
+    super(`Could not start ${packageSpec} in the sandbox: it did not run after ${REMOTE_CLI_INSTALLS} fresh installs `
+      + '(npm skips a native binary it fails to download). Retry installs it again.');
+    this.name = 'RemoteAgentCliUnavailable';
+  }
+}
+
 // Exit statuses by which the bootstrap command names the step that failed.
 const BOOTSTRAP_NODE = 64, BOOTSTRAP_EXPOSE = 65, BOOTSTRAP_QUIESCE = 66, BOOTSTRAP_PROTECT = 67, BOOTSTRAP_LOCKED = 68;
 /** sandboxLock's status when another holder kept the lock past its wait. */
@@ -964,7 +979,16 @@ export function spawnRemoteAgentProcess(opts: {
   // Resolve the paired CLI through npx's cache, then exec it directly: running
   // it *under* npx kept a ~150 MB npm process alive for the whole session.
   const resolved = `npx --yes --package=${quote(packageSpec)} -c ${quote(`command -v ${opts.provider}`)}`;
-  const selectedCommand = `${trace('cli-version-check')}; if ${bakedMatches}; then bin=${quote(bakedExecutable)}; else ${trace('cli-resolve')}; bin=$(${resolved}) || exit 127; fi; `
+  // Claude Code, Codex and OpenCode ship their native binary as an optional
+  // dependency, and npm still exits 0 when it fails to download one: npx's
+  // cache then holds a CLI that only says "native binary not installed", and
+  // every later turn and Retry reused it (task 701, whose resize gave it a
+  // fresh sandbox). Run the CLI once before trusting it; reinstall a broken one.
+  const runnable = `tries=0; while :; do bin=$(${resolved}) || exit 127; `
+    + `"$bin" --version </dev/null >/dev/null 2>&1 && break; tries=$((tries+1)); install="\${bin%/node_modules/.bin/*}"; `
+    + `case "$install" in */_npx/*) if [ "$tries" -lt ${REMOTE_CLI_INSTALLS} ]; then ${trace('cli-reinstall')}; rm -rf -- "$install"; continue; fi;; esac; `
+    + `printf '%s does not run (%s --version failed)\\n' ${quote(packageSpec)} "$bin" >&2; exit ${REMOTE_CLI_UNAVAILABLE}; done`;
+  const selectedCommand = `${trace('cli-version-check')}; if ${bakedMatches}; then bin=${quote(bakedExecutable)}; else ${trace('cli-resolve')}; ${runnable}; fi; `
     // Later commands of this turn (an ACP session export) run the same CLI.
     + `printf '%s' "$bin" > ${quote(path.posix.join(home, 'karmax-agent-bin'))}; `
     + (opts.prelude ? `${trace('cli-prelude')}; ${opts.prelude}; ` : '')
@@ -1007,7 +1031,7 @@ export function spawnRemoteAgentProcess(opts: {
   if (relative.startsWith('..') || path.posix.isAbsolute(relative))
     throw new Error(`remote agent home ${home} is outside the world root`);
   return new RemoteSpawnedProcess(opts.world, `exec sh ${quote(launcher)}`, opts.cwd, opts.env, opts.signal,
-    stderr, startupTrace, { path: relative, script: `rm -f -- "$0"; ${shell}\n` });
+    stderr, startupTrace, { path: relative, script: `rm -f -- "$0"; ${shell}\n` }, packageSpec);
 }
 
 export class RemoteSpawnedProcess extends EventEmitter {
@@ -1020,6 +1044,8 @@ export class RemoteSpawnedProcess extends EventEmitter {
   /** Set when the provider stream ended without the process exiting. The
    * ChildProcess contract has no such state, so adapters must check it. */
   lost?: Error;
+  /** Set when the launcher could install no working CLI ({@link REMOTE_CLI_UNAVAILABLE}). */
+  unavailable?: RemoteAgentCliUnavailable;
   private pty?: WorldPty;
   private ready: Promise<WorldPty>;
   private protocolGate: Promise<void>;
@@ -1039,7 +1065,8 @@ export class RemoteSpawnedProcess extends EventEmitter {
   private received = new StartupProtocolTrace();
 
   constructor(private world: World, command: string, cwd: string, env: Record<string, string>, signal?: AbortSignal,
-    private stderrFile?: string, private startupTraceFile?: string, launcher?: { path: string; script: string }) {
+    private stderrFile?: string, private startupTraceFile?: string, launcher?: { path: string; script: string },
+    private packageSpec?: string) {
     super();
     this.protocolGate = new Promise<void>((resolve) => { this.openProtocolGate = resolve; });
     const open = () => world.openPty({ command, cwd, env, cols: 200, rows: 40 });
@@ -1128,6 +1155,9 @@ export class RemoteSpawnedProcess extends EventEmitter {
     if (ending && 'lost' in ending) this.lost = new Error(
       `lost the connection to the agent in the sandbox; it may still be running there (${ending.lost.message})`,
       { cause: ending.lost });
+    // Only the launcher exits so before the agent has said anything.
+    if (code === REMOTE_CLI_UNAVAILABLE && this.startup && !this.received.snapshot().length && this.packageSpec)
+      this.unavailable = new RemoteAgentCliUnavailable(this.packageSpec);
     this.openProtocolGate();
     // The protocol owns PTY stdout; native stderr is redirected to a file.
     // Recover a bounded tail before close so startup failures retain their cause.
