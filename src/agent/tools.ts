@@ -1031,6 +1031,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
       properties: {
         branch: { type: 'string', description: 'Several-branch tasks: a branch (checkout) name, to open or update its pull request now while you keep working. Omit when you are finished.' },
         title: { type: 'string', description: 'With `branch`: a title for that pull request (default: the branch name and this task\'s title).' },
+        data: { type: 'boolean', description: 'With `branch`: true makes the pull request also publish this task\'s data (its changes to writable project resources) as it is now, when approved and before its code lands; use it when that code needs the data. false removes it. Omit to keep what the pull request has; data not published this way publishes when you finish.' },
       },
     },
   },
@@ -1768,7 +1769,7 @@ export function platformToolHandlers(
       if (args?.branch !== undefined && String(args.branch).trim()) {
         if (!ctx.shipBranch) throw new Error('opening one branch\'s pull request is not available in this turn; finish with open_pr instead');
         const name = String(args.branch).trim();
-        const shipped = await ctx.shipBranch({ name, ...(args?.title ? { title: String(args.title) } : {}) });
+        const shipped = await ctx.shipBranch({ name, ...(args?.title ? { title: String(args.title) } : {}), ...(typeof args?.data === 'boolean' ? { data: args.data } : {}) });
         return shipped.updated
           ? `The pull request for "${name}" (sub-task ${shipped.childTaskId}) now has your latest commit of it and goes through Review again. Keep working.`
           : `The pull request for "${name}" is open as sub-task ${shipped.childTaskId} (branch ${shipped.branch}): it is reviewed and lands on its own, as committed now. `

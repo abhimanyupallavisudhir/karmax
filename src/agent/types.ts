@@ -49,7 +49,7 @@ export interface PlatformToolContext {
    *  keep working. It is a sub-task that reviews and lands a snapshot of the
    *  branch; changes it needs come back to this agent. Refusals throw, with
    *  what to do instead. */
-  shipBranch?(args: { name: string; title?: string }): Promise<{ childTaskId: string; branch: string; updated?: boolean }>;
+  shipBranch?(args: { name: string; title?: string; data?: boolean }): Promise<{ childTaskId: string; branch: string; updated?: boolean }>;
   /** Resolve agent's structured verdict (RESOLVE-PLAN §3.2): a bounded recovery
    *  transition the workflow executes (resume/retryStage/gotoStage/parkUntil/escalate)
    *  instead of guessing. Also marks the resolve turn complete. */

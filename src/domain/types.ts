@@ -908,6 +908,24 @@ export interface ShipBranchRequest {
   head: string;
   /** The turn's world handle: a branch added this turn is only in it. */
   handle: WorldHandleRef;
+  /** `true`: the pull request also publishes the task's data as it is now —
+   *  what it changed in writable resources, reviewed with the code and
+   *  published when the pull request is approved, before its code lands.
+   *  `false`: it publishes none. Omitted: it keeps what it carries. */
+  data?: boolean;
+}
+/** One writable resource a pull request publishes: a snapshot of the task's
+ *  copy taken when the agent opened it, published only on top of the version
+ *  it was taken against (`baseRevisionId`). */
+export interface PullRequestData {
+  attachmentId: string;
+  name: string;
+  path: string;
+  /** The snapshot (an unpublished capture of the task's copy). */
+  revisionId: string;
+  /** The published version the copy held when the snapshot was taken. */
+  baseRevisionId?: string;
+  summary: ResourceChangeSummary;
 }
 export type ShipBranchOutcome =
   | { ok: true; childTaskId: string; branch: string; checkout: string; target: string; updated?: boolean }
@@ -935,6 +953,8 @@ export interface TaskShipment {
   state: 'open' | 'landed' | 'cancelled' | 'failed';
   /** The Do turn's request that last opened it: a retried turn asking again gets its answer back. */
   requestId: string;
+  /** The task's data it publishes, if the agent opened it with its data. */
+  data?: PullRequestData[];
 }
 
 export interface TaskPullRequest {
@@ -1946,7 +1966,7 @@ export interface TaskInput {
    *  the parent's checkout `checkout` through `world`, a view of the PARENT's
    *  world narrowed to that snapshot's worktree; it has no world or agent of its
    *  own. Changes it needs go to the parent's agent, which opens it again. */
-  shippedFrom?: { taskId: string; checkout: string; world?: WorldHandleRef };
+  shippedFrom?: { taskId: string; checkout: string; world?: WorldHandleRef; data?: PullRequestData[] };
   command?: string;
   /** software-dev ≥1.29: when `command` (the task's own code) fails, `fail` ends the task;
    *  `agent` hands it to the Do agent with the output. */

@@ -69,6 +69,7 @@ import {
   TaskShipment,
   ShipBranchRequest,
   ShipBranchOutcome,
+  PullRequestData,
 } from './contract.js';
 import { mergeQueueDomains, releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider,
   landingAuthorityOf, samePosition, MERGE_POLL, reviewCheckouts, approveAll, worldRepos, landedNote } from './contract.js';
@@ -250,7 +251,7 @@ export const parentResponseSignal = defineSignal<[ParentResponse]>('parentRespon
  * sent came after Review and is not in it. */
 export const pullRequestNoticeSignal = defineSignal<[{ childTaskId: string; kind: 'needs-work' | 'update-refused'; text: string }]>('pullRequestNotice');
 /** The task's agent opened the pull request again at `head`: it returns to Review with it. */
-export const pullRequestUpdatedSignal = defineSignal<[{ head: string }]>('pullRequestUpdated');
+export const pullRequestUpdatedSignal = defineSignal<[{ head: string; data?: PullRequestData[] }]>('pullRequestUpdated');
 export const setTargetUpdate = defineUpdate<boolean, [string]>('setTarget');
 /** The Do agent opens (or updates) one branch's pull request while it keeps
  * working (`open_pr` with `branch`, SPEC §11.1). Answered once that pull
@@ -971,6 +972,18 @@ async function softwareDevImpl(
   let fullWorld: WorldHandleLike | undefined;
   /** A pull request (v1.30): the commit its agent opened it at again, not yet in its worktree. */
   let pendingHead: string | undefined;
+  // A pull request opened with its task's data (SPEC §11.1): what it publishes
+  // when approved. Undefined for one opened before pull requests carried data.
+  let pullRequestData: PullRequestData[] | undefined = input.shippedFrom?.data;
+  const pullRequestDataKey = input.shippedFrom ? `${input.shippedFrom.taskId}:${input.shippedFrom.checkout}` : '';
+  /** Review says what data a pull request publishes with its code. */
+  const withPullRequestData = (info: ReviewInfo | undefined): ReviewInfo | undefined => {
+    if (!pullRequestData?.length) return info;
+    const counts = (summary: PullRequestData['summary']) => ([['added', summary.added], ['modified', summary.modified], ['deleted', summary.deleted]] as const)
+      .filter(([, n]) => n).map(([label, n]) => `${n} ${label}`).join(', ');
+    const note = `Publishes data: ${pullRequestData.map((item) => `${item.path} (${counts(item.summary)})`).join('; ')}.`;
+    return { ...info, summary: info?.summary ? `${info.summary}\n\n${note}` : note };
+  };
   const awaitingResponse = new Set<string>(continued?.subTasks.awaitingResponse);
   /** Draft sub-tasks queued and not yet started (`queueSubTaskSignal`). */
   const queuedSubTasks: QueuedSubTask[] = [...continued?.subTasks.queued ?? []];
@@ -1427,7 +1440,7 @@ async function softwareDevImpl(
       messages: msgs,
       transcripts: buildTranscripts(),
       ...(multiAgent ? { participants: buildParticipants() } : {}),
-      reviewInfo,
+      reviewInfo: withPullRequestData(reviewInfo),
       actions: allowed(),
       state: {
         confirmed,
@@ -1897,6 +1910,15 @@ async function softwareDevImpl(
       const applied = await applyReviewedResources(true, true);
       if (applied !== 'applied') return applied;
     }
+    // A pull request with its task's data publishes it as approved, before its
+    // code lands; a newer version goes back to the agent, which opens it again.
+    if (shippedBranch && pullRequestData?.length) {
+      const published = await resourceActivities.publishPullRequestData(input.shippedFrom!.taskId, pullRequestDataKey);
+      if (!published.ok) {
+        msgs.push({ id: `prd-${msgs.length}`, role: 'user', ts: Date.now(), text: `Its data could not be published: ${published.reason}` });
+        return 'do';
+      }
+    }
     confirmed = true;
     if (intentAuthorizedLanding) {
       landing = {
@@ -2254,10 +2276,11 @@ async function softwareDevImpl(
   // This task is a pull request (v1.30): its agent opened it again at `head`.
   // Before approval it goes back through Review with it; after, it lands as
   // approved and the agent is told the update is not in it.
-  setHandler(pullRequestUpdatedSignal, ({ head }) => {
+  setHandler(pullRequestUpdatedSignal, ({ head, data }) => {
     if (!shippedBranch) return;
     if (stage === 'setup' || stage === 'do' || stage === 'review' || (stage === 'pr' && !consumed.has('confirm'))) {
       pendingHead = head;
+      if (data) pullRequestData = data;
       prRequested = true;
       whenLoaded(() => msgs.push({ id: `pru-${msgs.length}`, role: 'user', ts: Date.now(),
         text: `The task's agent updated this pull request to ${head.slice(0, 8)}; it goes through Review again.` }));
@@ -3852,7 +3875,7 @@ Inspect the complete current diff and specifically compare its delta from the re
    * as an update beside the agent's turn, or when the agent finishes. `empty`:
    * nothing new to propose there.
    */
-  async function openPullRequestOf(request: { name: string; title?: string; handle: WorldHandleLike; requestId: string }):
+  async function openPullRequestOf(request: { name: string; title?: string; handle: WorldHandleLike; requestId: string; data?: boolean }):
     Promise<ShipBranchOutcome | { ok: false; empty: true; reason: string }> {
     const made = shipments.find((shipment) => shipment.requestId === request.requestId);
     if (made) return { ok: true, childTaskId: made.childTaskId, branch: made.branch, checkout: made.checkout, target: made.target };
@@ -3867,17 +3890,33 @@ Inspect the complete current diff and specifically compare its delta from the re
     const check = await core.checkShipment(request.handle as WorldHandle, { checkout: named.name, target,
       current: !open && mine.length > 0, ...(base ? { stackedOn: base.checkout } : {}) });
     if (!check.ok) return check.empty ? { ok: false, empty: true, reason: check.reason } : check;
+    // `data: true`: the task's data as it is now, published when the pull
+    // request is approved; `false`: none; omitted: whatever it carries already.
+    const dataKey = `${taskId}:${named.name}`;
+    const takeData = async (): Promise<{ ok: true; data?: PullRequestData[] } | { ok: false; reason: string }> => {
+      if (request.data === true) return resourceActivities.snapshotPullRequestData(taskId, dataKey);
+      if (request.data === false && open?.data?.length) { await core.releasePullRequestData(dataKey); return { ok: true, data: [] }; }
+      return { ok: true, ...(open?.data ? { data: open.data } : {}) };
+    };
     if (open) {
-      if (open.head === check.head) return { ok: true, childTaskId: open.childTaskId, branch: open.branch, checkout: open.checkout, target: open.target, updated: true };
+      const dataChanges = request.data === true || (request.data === false && !!open.data?.length);
+      if (open.head === check.head && !dataChanges)
+        return { ok: true, childTaskId: open.childTaskId, branch: open.branch, checkout: open.checkout, target: open.target, updated: true };
+      const taken = await takeData();
+      if (!taken.ok) return taken;
       open.head = check.head;
       open.requestId = request.requestId;
-      await getExternalWorkflowHandle(open.childTaskId).signal(pullRequestUpdatedSignal, { head: check.head });
+      open.data = taken.data?.length ? taken.data : undefined;
+      await getExternalWorkflowHandle(open.childTaskId).signal(pullRequestUpdatedSignal,
+        { head: check.head, ...(dataChanges ? { data: taken.data ?? [] } : {}) });
       await publish();
       return { ok: true, childTaskId: open.childTaskId, branch: open.branch, checkout: open.checkout, target: open.target, updated: true };
     }
     // Settled exactly as it is (landed, or closed without landing): nothing new to propose.
     if (last && last.state !== 'open' && last.head === check.head)
       return { ok: false, empty: true, reason: `"${named.name}" has nothing new since its pull request ${last.state === 'landed' ? 'landed' : 'was closed'}` };
+    const taken = await takeData();
+    if (!taken.ok) return taken;
     const checkout = check.checkout;
     const title = request.title?.trim() || `${checkout.name}: ${input.title}`;
     const prompt = `The pull request for the branch "${checkout.name}" of task ${taskId} ("${input.title}"), landing on ${check.target}. `
@@ -3902,6 +3941,7 @@ Inspect the complete current diff and specifically compare its delta from the re
     const shipment: TaskShipment = {
       checkout: checkout.name, childTaskId: childInput.taskId, branch: taskBranch(childInput.taskId), fromBranch: checkout.branch,
       head: check.head, target: check.target, state: 'open', requestId: request.requestId,
+      ...(taken.data?.length ? { data: taken.data } : {}),
     };
     const child = await startChild<typeof softwareDev>(childWorkflowType(behaviorVersion), {
       workflowId: childInput.taskId,
@@ -3910,7 +3950,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         project: { ...childInput.project, multiPr: false },
         confirm: { layers: softwareDevConfirmLayers },
         ...(liveResponder ? { responder: liveResponder } : {}),
-        shippedFrom: { taskId, checkout: checkout.name, world: view },
+        shippedFrom: { taskId, checkout: checkout.name, world: view, ...(request.data === true ? { data: taken.data ?? [] } : {}) },
       } as SoftwareDevInput],
       parentClosePolicy: ParentClosePolicy.ABANDON,
     });
@@ -6291,6 +6331,7 @@ Inspect the complete current diff and specifically compare its delta from the re
   // removes its own worktree.
   if (shippedBranch) {
     await core.closePullRequest(world as WorldHandle).catch(() => undefined);
+    if (pullRequestData !== undefined) await core.releasePullRequestData(pullRequestDataKey).catch(() => undefined);
     return { stage, sha };
   }
   const remoteWorld = world ? releaseWorldOnCompletion(world) : false;
@@ -6331,6 +6372,7 @@ Inspect the complete current diff and specifically compare its delta from the re
     await publish();
     if (world && shippedBranch) {
       if (!lifecycleReplacement) await core.closePullRequest(world as WorldHandle).catch(() => undefined);
+      if (!lifecycleReplacement && pullRequestData !== undefined) await core.releasePullRequestData(pullRequestDataKey).catch(() => undefined);
     } else if (world) {
       if (restoresStagePrerequisites) {
         // Cancel is reversible. Keep the world/branch checkpoint addressable;

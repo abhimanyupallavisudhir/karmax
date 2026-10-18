@@ -7786,6 +7786,13 @@ export class Store {
     for (const entry of (await this.kvEntries('resource-checkpoint:'))) {
       try { const revisionId = JSON.parse(entry.value)?.revisionId; if (revisionId) ids.add(String(revisionId)); } catch {}
     }
+    // The data a pull request of a task will publish (snapshots and the versions they build on).
+    for (const entry of (await this.kvEntries('resource-pull-request:'))) {
+      try {
+        for (const item of JSON.parse(entry.value) as Array<{ revisionId?: string; baseRevisionId?: string }>)
+          for (const id of [item?.revisionId, item?.baseRevisionId]) if (id) ids.add(String(id));
+      } catch {}
+    }
     // A sub-task's output waiting for its parent's world, and the version it is relative to.
     for (const entry of (await this.kvEntries('resource-delivery:'))) {
       try {
@@ -7883,6 +7890,7 @@ export class Store {
     if ((await this.db.prepare("SELECT 1 FROM resource_leases WHERE state<>'released' AND revisionId=?").get(id))) return true;
     if ((await this.db.prepare('SELECT 1 FROM world_checkpoints WHERE manifest LIKE ?').get(`%"revisionId":"${id}"%`))) return true;
     if ((await this.kvEntries('resource-checkpoint:')).some((entry) => entry.value.includes(`"revisionId":"${id}"`))) return true;
+    if ((await this.kvEntries('resource-pull-request:')).some((entry) => entry.value.includes(`"${id}"`))) return true;
     return (await this.kvEntries('resource-delivery:')).some((entry) => entry.value.includes(`"${id}"`));
   }
 

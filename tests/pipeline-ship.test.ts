@@ -244,6 +244,92 @@ describe('software-dev: every branch of a task lands as its own pull request', (
     expect((await handle.result()).stage).toBe('done');
   }, 180_000);
 
+  /** A project with writable data at raw_data/ (ignored by git), holding `files`. */
+  const withData = async (repo: string, files: Record<string, string>) => {
+    fs.writeFileSync(path.join(repo, '.gitignore'), 'raw_data/\n');
+    await git(repo, ['add', '-A']);
+    await git(repo, ['commit', '-qm', 'ignore the data']);
+    let attachmentId = '';
+    let projectId = '';
+    const setup = async (project: Awaited<ReturnType<Harness['store']['createProject']>>) => {
+      const data = await h.store.createResourceAttachment({ organizationId: project.organizationId!, projectId: project.id,
+        name: 'Raw data', driver: 'volume@1', target: { kind: 'path', path: 'raw_data' }, access: 'write',
+        isolation: 'fork', source: {}, credentialHandles: [], publish: 'review' });
+      await h.resources.importFiles(data.id, Object.entries(files).map(([file, text]) => ({ path: file, data: Buffer.from(text) })));
+      attachmentId = data.id;
+      projectId = project.id;
+    };
+    /** The published version's files and their sizes. */
+    const published = async () => {
+      const revision = (await h.store.getResourceAttachment(attachmentId))!.currentRevisionId!;
+      const { files: listed } = await h.resources.verifyRevision(projectId, attachmentId, revision, 0, 100);
+      return Object.fromEntries(listed.map((file: any) => [file.path, file.bytes]));
+    };
+    return { setup, published, id: () => attachmentId };
+  };
+
+  it('a pull request opened with its data publishes it when approved; the task\'s own Review shows only what came after', async () => {
+    const repo = await h.makeRepo('ship-with-data');
+    const data = await withData(repo, { 'index.txt': 'one\n' });
+    const { taskId, handle } = await start(repo, [
+      '@branch docs',
+      docsCommit,
+      '@write raw_data/index.txt ::the second version\\n',
+      '@ship docs +data',
+      '@write raw_data/notes.txt ::later\\n',
+      '@write feature.js :: export const feature = 1;',
+      '@run git add feature.js && git commit -qm feature',
+    ].join('\n'), data.setup);
+    const { childId, child: docs } = await pullRequest(handle, 1);
+    expect((await view(docs)).reviewInfo?.summary).toContain('Publishes data: raw_data (1 modified).');
+    expect(await data.published()).toEqual({ 'index.txt': 4 });
+    await docs.signal('confirm');
+    expect((await docs.result()).stage).toBe('done');
+    // Published as reviewed: the later notes are not in it.
+    expect(await data.published()).toEqual({ 'index.txt': 'the second version\n'.length });
+    expect(await h.store.kvGet(`resource-pull-request:${taskId}:docs`)).toBeUndefined();
+    expect(childId).toBeTruthy();
+    await expect.poll(async () => { const v = await view(handle); return `${v.stage}/${v.waitingFor?.kind}`; },
+      { timeout: 60_000 }).toBe('review/human');
+    // The task's own Review: only what changed since its pull request published.
+    const summary = await h.resources.summarize(taskId, data.id());
+    expect(summary.changedPaths).toEqual(['notes.txt']);
+    await handle.signal('confirm');
+    expect((await handle.result()).stage).toBe('done');
+    expect(await data.published()).toEqual({ 'index.txt': 'the second version\n'.length, 'notes.txt': 'later\n'.length });
+  }, 180_000);
+
+  it('data published elsewhere since a pull request took its own sends it back; opened again, it takes that version in', async () => {
+    const repo = await h.makeRepo('ship-data-newer');
+    const data = await withData(repo, { 'index.txt': 'one\n' });
+    const { handle } = await start(repo, [
+      '@branch docs',
+      docsCommit,
+      '@write raw_data/mine.txt ::from the task\\n',
+      '@ship docs +data',
+      '@incomplete',
+    ].join('\n'), data.setup);
+    const { child: docs } = await pullRequest(handle, 1);
+    // Someone else publishes a newer version meanwhile.
+    await h.resources.importFiles(data.id(), [{ path: 'index.txt', data: Buffer.from('one\n') }, { path: 'theirs.txt', data: Buffer.from('from elsewhere\n') }]);
+    await docs.signal('confirm');
+    await expect.poll(async () => (await view(handle)).messages.map((m: any) => m.text).join('\n'), { timeout: 30_000 })
+      .toMatch(/Its data could not be published: raw_data has a newer version/);
+    // Nothing of it was published, and its code has not landed.
+    expect(await data.published()).toEqual({ 'index.txt': 4, 'theirs.txt': 'from elsewhere\n'.length });
+    expect((await git(repo, ['show', 'main:docs/guide.md'])).code).not.toBe(0);
+    await handle.signal('followUp', { id: 'f1', role: 'user', ts: 0, text: ['@ship docs +data', '@incomplete'].join('\n') });
+    await expect.poll(async () => { const v = await view(docs); return `${v.stage}/${v.waitingFor?.kind}`; },
+      { timeout: 60_000 }).toBe('review/human');
+    await docs.signal('confirm');
+    expect((await docs.result()).stage).toBe('done');
+    // Both: what was published elsewhere, and the task's own.
+    expect(await data.published()).toEqual({ 'index.txt': 4, 'theirs.txt': 'from elsewhere\n'.length, 'mine.txt': 'from the task\n'.length });
+    expect((await git(repo, ['show', 'main:docs/guide.md'])).code).toBe(0);
+    await handle.signal('cancel');
+    await handle.result();
+  }, 180_000);
+
   it('a pull request closed without landing leaves the world, and its branch is not proposed again unchanged', async () => {
     const repo = await h.makeRepo('ship-cancelled');
     const { taskId, handle } = await start(repo, ['@branch docs', docsCommit, '@ship docs', '@incomplete'].join('\n'));

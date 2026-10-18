@@ -4621,6 +4621,37 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       return (await deps.resources?.hasChangesToReview(taskId)) ?? false;
     },
 
+    /** Snapshot the task's data for a pull request that carries it (SPEC §11.1). */
+    async snapshotPullRequestData(taskId: string, key: string): Promise<{ ok: true; data: import('../domain/types.js').PullRequestData[] } | { ok: false; reason: string }> {
+      if (!deps.resources) return { ok: true, data: [] };
+      let context: ReturnType<typeof activityContext.current> | undefined;
+      try { context = activityContext.current(); } catch { /* direct tests */ }
+      const pulse = setInterval(() => { try { context?.heartbeat({ taskId, operation: 'saving-pull-request-data' }); } catch { /* done */ } }, 5_000);
+      try {
+        return { ok: true, data: await deps.resources.snapshotForPullRequest(taskId, key,
+          { checkContinue: async () => { context?.cancellationSignal.throwIfAborted(); } }) };
+      } catch (error) {
+        // A conflict, or a version it could not take in: the agent's to resolve before opening again.
+        if (error instanceof ResourceConflictError)
+          return { ok: false, reason: `${error.message}${error.guide ? `\n${error.guide}` : ''}` };
+        if (error instanceof Error && /newer version/.test(error.message)) return { ok: false, reason: error.message };
+        throw error;
+      } finally { clearInterval(pulse); }
+    },
+
+    /** Publish the data a pull request carries, once it is approved. */
+    async publishPullRequestData(taskId: string, key: string): Promise<{ ok: true } | { ok: false; reason: string }> {
+      try { await deps.resources?.publishPullRequestData(taskId, key); return { ok: true }; }
+      catch (error) {
+        if (error instanceof Error && /newer version|snapshot of .* is gone/.test(error.message)) return { ok: false, reason: error.message };
+        throw error;
+      }
+    },
+
+    async releasePullRequestData(key: string): Promise<void> {
+      await deps.resources?.releasePullRequestData(key);
+    },
+
     async pendingResourceCandidates(taskId: string): Promise<number> {
       return (await store.listResourceCandidates(taskId)).filter((candidate) =>
         candidate.state === 'pending' || candidate.state === 'discarding').length;

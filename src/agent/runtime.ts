@@ -389,7 +389,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     },
     // The branch's pull request opens (or, opened before, moves to this commit)
     // as its own sub-task, while the agent keeps working in its checkout.
-    async shipBranch({ name, title }) {
+    async shipBranch({ name, title, data }) {
       if (input.role !== 'do') throw new Error('only the Do agent opens pull requests');
       const current = worldHandle ?? input.world.handle;
       // A retried turn asks again: the workflow answers a ship it already made.
@@ -399,7 +399,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
       if (!checkout) throw new Error(`this task has no branch named "${name}"; its branches are ${repos.map((repo) => `"${repo.name}"`).join(', ')}`);
       const head = await input.world.exec('git', ['rev-parse', 'HEAD'], { cwd: checkout.root });
       if (head.code !== 0 || !head.stdout.trim()) throw new Error(`could not read the head of "${checkout.name}": ${head.stderr || head.stdout}`);
-      const outcome = await deps.shipBranch({ name: checkout.name, ...(title ? { title } : {}), head: head.stdout.trim(), handle: current });
+      const outcome = await deps.shipBranch({ name: checkout.name, ...(title ? { title } : {}), ...(data !== undefined ? { data } : {}), head: head.stdout.trim(), handle: current });
       if (!outcome.ok) throw new Error(outcome.reason);
       if (!shipped.some((entry) => entry.childTaskId === outcome.childTaskId))
         shipped.push({ checkout: outcome.checkout, childTaskId: outcome.childTaskId, branch: outcome.branch });

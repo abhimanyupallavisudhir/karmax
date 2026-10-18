@@ -195,12 +195,14 @@ export class MockAdapter implements AgentAdapter {
           break;
         }
         case 'ship': {
-          // @ship <name> [:: title] — open_pr with `branch`: that branch's pull
-          // request opens on its own and the turn goes on (SPEC §11.1).
-          const [name, title = ''] = splitOn(rest, '::');
+          // @ship <name> [+data] [:: title] — open_pr with `branch` (and `data`):
+          // that branch's pull request opens on its own and the turn goes on (SPEC §11.1).
+          const [named, title = ''] = splitOn(rest, '::');
+          const data = /\s\+data\s*$/.test(named);
+          const name = named.replace(/\s\+data\s*$/, '');
           try {
             if (!ctx.shipBranch) throw new Error('not available in this turn');
-            const shipped = await ctx.shipBranch({ name: name.trim(), ...(title.trim() ? { title: title.trim() } : {}) });
+            const shipped = await ctx.shipBranch({ name: name.trim(), ...(title.trim() ? { title: title.trim() } : {}), ...(data ? { data: true } : {}) });
             outputs.push(`shipped: ${name.trim()} as ${shipped.childTaskId} on ${shipped.branch}`);
           } catch (e: any) {
             outputs.push(`ship refused: ${e?.message ?? e}`);
