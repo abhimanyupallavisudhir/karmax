@@ -38,41 +38,46 @@ it('gifts, changes, and removes plans from the organization billing screen throu
     page.on('pageerror', error => errors.push(error.message));
     page.on('dialog', dialog => dialog.accept());
     await page.goto(`${server.url}/${recipient.slug}/settings#settings-plan`);
-    await page.getByRole('combobox', { name: 'Gift subscription' }).selectOption('individual');
+    const plan = page.locator('#org-plan');
+    await plan.locator('.plan-operator > summary').click();
+    await page.getByRole('combobox', { name: 'Gift plan' }).selectOption('individual');
     await page.getByRole('button', { name: 'Gift', exact: true }).click();
-    await page.locator('#org-plan .section-h').filter({ hasText: 'Individual' }).waitFor();
-    expect(await page.locator('#org-plan .chip').textContent()).toBe('Gifted');
+    await plan.locator('.plan-name').filter({ hasText: 'Individual' }).waitFor();
+    expect(await plan.locator('.plan-head .chip').textContent()).toBe('Gifted');
     expect((await store.organizationEntitlements(recipient.id)).maxActiveAgentRuns).toBe(10);
-    await page.getByRole('combobox', { name: 'Gift subscription' }).selectOption('team');
-    await page.getByRole('button', { name: 'Update gift', exact: true }).click();
-    await page.locator('#org-plan .section-h').filter({ hasText: 'Team' }).waitFor();
+    await page.getByRole('combobox', { name: 'Gift plan' }).selectOption('team');
+    await page.getByRole('button', { name: 'Update', exact: true }).click();
+    await plan.locator('.plan-name').filter({ hasText: 'Team' }).waitFor();
     expect((await store.organizationEntitlements(recipient.id)).maxActiveAgentRuns).toBe(20);
     expect(provider.calls).toHaveLength(0);
     await store.setOrganizationMembership(recipient.id, 'second-member', 'member');
     await page.reload();
-    await page.getByRole('button', { name: 'Update gift', exact: true }).waitFor();
-    expect(await page.locator('#org-plan input').nth(2).inputValue()).toBe('25 active agent runs');
-    expect(await page.locator('#org-subscription').textContent()).toContain('Gifted · no expiry');
+    await plan.locator('.plan-operator > summary').click();
+    await page.getByRole('button', { name: 'Update', exact: true }).waitFor();
+    expect(await plan.locator('.plan-limits').innerText()).toMatch(/25 at once/);
     expect(await page.locator('.billing-checkout').count()).toBe(0);
-    // Gifted storage packs: any plan, no billing provider, shown apart in the plan card.
-    await page.getByRole('spinbutton', { name: 'Gift storage packs' }).fill('2');
-    await page.getByRole('button', { name: 'Gift packs', exact: true }).click();
-    await page.locator('#org-plan .plan-storage-extra.gifted').filter({ hasText: '+ 200 GB gifted' }).waitFor();
-    expect(await page.locator('#org-plan .plan-storage-base').innerText()).toBe('110 GB');
-    expect((await store.organizationEntitlements(recipient.id)).storageQuotaBytes).toBe(310 * 1024 ** 3);
-    expect(await page.locator('#org-subscription').innerText()).toContain('2 gifted storage packs');
+    // Gifted storage and compute packs: any plan, no billing provider; the tooltip says where the storage comes from.
+    await page.getByRole('spinbutton', { name: 'Gifted storage packs' }).fill('2');
+    await plan.locator('.billing-gift-packs[data-kind="storage"]').click();
+    await expect.poll(async () => (await store.organizationEntitlements(recipient.id)).storageQuotaBytes).toBe(310 * 1024 ** 3);
+    await plan.locator('[data-limit="storage"]').filter({ hasText: 'of 310 GB' }).waitFor();
+    expect(await plan.locator('[data-limit="storage"] .info-dot').getAttribute('title')).toContain('110 GB with Team + 200 GB gifted');
+    await page.getByRole('spinbutton', { name: 'Gifted compute packs' }).fill('1');
+    await plan.locator('.billing-gift-packs[data-kind="compute"]').click();
+    await expect.poll(async () => (await store.organizationEntitlements(recipient.id)).giftedComputePacks).toBe(1);
+    expect((await store.organizationEntitlements(recipient.id)).computeCreditMicros).toBe(13_000_000 + 10_000_000);
     expect(provider.calls).toHaveLength(0);
     if (process.env.KARMAX_REVIEW_SCREENSHOT) await page.locator('#org-plan').screenshot({ path: process.env.KARMAX_REVIEW_SCREENSHOT });
-    await page.getByRole('button', { name: 'Remove gifted packs', exact: true }).click();
+    await page.getByRole('spinbutton', { name: 'Gifted storage packs' }).fill('0');
+    await plan.locator('.billing-gift-packs[data-kind="storage"]').click();
     await expect.poll(async () => (await store.organizationEntitlements(recipient.id)).giftedStoragePacks).toBe(0);
-    await expect.poll(() => page.locator('#org-plan .plan-storage-extra').count()).toBe(0);
     await page.setViewportSize({ width: 390, height: 844 });
-    await page.getByRole('button', { name: 'Remove gift', exact: true }).click();
-    await page.locator('#org-plan .section-h').filter({ hasText: 'Free' }).waitFor();
+    await page.getByRole('button', { name: 'Remove', exact: true }).click();
+    await plan.locator('.plan-name').filter({ hasText: 'Free' }).waitFor();
     expect((await billing.current(recipient.id)).gift).toBeNull();
-    expect(await page.locator('#org-plan').innerText()).toContain('Agent runs are paused');
-    // Free: the plan offers say how to get more storage.
-    expect(await page.locator('#org-subscription').innerText()).toContain('100 GB storage packs');
+    expect(await plan.innerText()).toContain('over the limit: agents are paused');
+    // Free: the plan choices say what each plan includes.
+    expect(await plan.locator('.plan-choice[data-plan="individual"]').innerText()).toContain('50 GB storage');
 
     // Render using a real, attenuated API token: ordinary organization admins
     // may read the gift, but the server never advertises gift controls to them.
@@ -86,8 +91,8 @@ it('gifts, changes, and removes plans from the organization billing screen throu
       await route.fulfill({ json: body });
     });
     await page.reload();
-    await page.locator('#org-subscription .section-h').first().waitFor();
-    await expect.poll(() => page.getByRole('combobox', { name: 'Gift subscription' }).count()).toBe(0);
+    await page.locator('#org-plan .plan-name').first().waitFor();
+    await expect.poll(() => page.locator('#org-plan .plan-operator').count()).toBe(0);
     expect(errors).toEqual([]);
   } finally {
     await browser.close();
@@ -160,6 +165,7 @@ it('opens a purchased subscription from the profile and upgrades or cancels it i
       expect(await otherList.json()).toEqual({ subscriptions: [] });
     } finally { await otherContext.close(); }
     await page.locator('#profile-paid-subscriptions').getByRole('link', { name: 'Plans & billing' }).click();
+    await page.getByRole('button', { name: 'Close setup guide' }).click({ timeout: 10_000 }).catch(() => undefined);
     await page.getByRole('button', { name: 'Upgrade to Team', exact: true }).click({ timeout: 10_000 }).catch(async error => {
       throw new Error(`${error.message}\nURL: ${page.url()}\nPage: ${await page.locator('body').innerText()}\nErrors: ${errors.join('; ')}`);
     });
@@ -168,16 +174,16 @@ it('opens a purchased subscription from the profile and upgrades or cancels it i
     // Provider confirmation, not a click alone, changes the displayed plan.
     await subscription('team');
     await page.reload();
-    await page.getByRole('button', { name: 'Downgrade to Individual', exact: true }).waitFor();
-    await page.getByRole('button', { name: 'Cancel online at period end', exact: true }).click();
+    await page.getByRole('button', { name: 'Switch to Individual', exact: true }).waitFor();
+    await page.getByRole('button', { name: 'Cancel plan', exact: true }).click();
     await expect.poll(() => provider.calls.filter(call => call.method === 'cancelAtPeriodEnd').length).toBe(1);
     await subscription('team', true);
     await page.reload();
-    await page.locator('#org-subscription .chip').filter({ hasText: /^ends / }).waitFor();
-    expect(await page.getByRole('button', { name: 'Cancel online at period end', exact: true }).count()).toBe(0);
+    await page.locator('#org-plan .plan-head .chip').filter({ hasText: /^Ends / }).waitFor();
+    expect(await page.getByRole('button', { name: 'Cancel plan', exact: true }).count()).toBe(0);
     // A portal session is fetched only after an explicit user action.
     await page.route('https://portal.test/**', route => route.fulfill({ body: 'Test billing portal' }));
-    await page.getByRole('button', { name: 'Billing portal', exact: true }).click();
+    await page.getByRole('button', { name: 'Billing', exact: true }).click();
     await page.waitForURL('https://portal.test/session');
     expect(provider.calls.filter(call => call.method === 'createPortal')).toHaveLength(1);
     expect(errors).toEqual([]);

@@ -35,7 +35,7 @@ import { fileURLToPath } from 'node:url';
 import { WebSocket as WebSocketClient, WebSocketServer } from 'ws';
 import type { Client } from '@temporalio/client';
 import { KarmaxApi, CapabilityError, ValidationError } from '../platform/api.js';
-import type { ChildTaskSummary, KarmaxEvent, Organization, TaskView } from '../domain/types.js';
+import type { ChildTaskSummary, KarmaxEvent, Organization, TaskView, WorldProviderConnection } from '../domain/types.js';
 import { BRAND_FILES, brandIconOf, isBrandIcon, siteNameError, siteNameOf, BRAND } from '../domain/brand.js';
 import { Store } from '../store/db.js';
 import { ProjectTransfers, ProjectTransferError } from '../platform/project-transfer.js';
@@ -60,7 +60,9 @@ import { DEFAULT_MCP_CONNECTIONS, defaultModel, defaultEffort, organizationProfi
 import { repositoryBranchDefaults } from '../platform/branch-defaults.js';
 import { sameRepository } from '../world/repository-identity.js';
 import { QRY_AGENT_QUEUE, accountCoordinatorId, agentQueueId } from '../coordinators/names.js';
-import { hostedMonthlyPriceCents } from '../domain/entitlements.js';
+import { COMPUTE_PRICE_MULTIPLIER, computeChargeMicros, hostedMonthlyPriceCents } from '../domain/entitlements.js';
+import { computeCredit, computeMonth } from '../world/managed-compute.js';
+import { MANAGED_COMPUTE } from '../world/connections.js';
 import { SIG as WORKFLOW_SIG } from '../workflows/names.js';
 import { findFreePortFrom } from '../util/ports.js';
 import { expandPath } from '../util/expand.js';
@@ -245,8 +247,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/organizations\/[^/]+\/insights$/.test(p)) return 'organization:read';
   if (/^\/api\/organizations\/[^/]+\/entitlements$/.test(p)) return 'organization:read';
   if (/^\/api\/organizations\/[^/]+\/subscription\/status$/.test(p)) return 'organization:read';
-  if (/^\/api\/organizations\/[^/]+\/subscription\/(?:gift|gift-storage)$/.test(p)) return 'subscription:gift';
-  if (/^\/api\/organizations\/[^/]+\/subscription\/(?:checkout|portal|change|cancel|sync-seats|storage-packs|reconcile)$/.test(p))
+  if (/^\/api\/organizations\/[^/]+\/subscription\/(?:gift|gift-storage|gift-compute)$/.test(p)) return 'subscription:gift';
+  if (/^\/api\/organizations\/[^/]+\/subscription\/(?:checkout|portal|change|cancel|sync-seats|storage-packs|compute-packs|reconcile)$/.test(p))
     return 'payment:write';
   if (/^\/api\/organizations\/[^/]+\/payments\/stripe\/platform$/.test(p)) return read ? 'settings:read' : 'settings:write';
   if (/^\/api\/organizations\/[^/]+\/payments(?:\/|$)/.test(p)) return read ? 'payment:read' : 'payment:write';
@@ -1841,9 +1843,14 @@ export class Gateway {
       }
       return this.json(res, 200, { authRequired: true });
     }
-    if (p === '/api/launch' && method === 'GET')
-      return this.json(res, 200, (await this.deps.paidLaunchSettings?.publicLaunchInfo((await this.siteName)))
-        ?? publicLaunchInfo(process.env, undefined, (await this.siteName)));
+    if (p === '/api/launch' && method === 'GET') {
+      const info = (await this.deps.paidLaunchSettings?.publicLaunchInfo((await this.siteName)))
+        ?? publicLaunchInfo(process.env, undefined, (await this.siteName));
+      // Managed compute is priced only where the installation offers it.
+      const managedCompute = this.deps.store.hosted
+        ? ((await this.deps.providerConnections?.managedConnections().catch(() => [])) ?? []).map((value) => value.provider) : [];
+      return this.json(res, 200, { ...info, managedCompute });
+    }
     const legalMatch = p.match(/^\/api\/legal\/([^/]+)$/);
     if (legalMatch && method === 'GET') {
       const document = (await this.deps.paidLaunchSettings?.policyDocument(legalMatch[1]!, (await this.siteName)))
@@ -2697,6 +2704,52 @@ export class Gateway {
         const view = method === 'GET' ? (await service.view()) : (await service.run());
         return this.json(res, 200, { ...view, canManage: write || (await this.deps.tokens.check(token, 'settings:write')).ok });
       }
+      // Managed compute (wiki features/managed-compute): the installation's
+      // own provider accounts, which organizations without their own use and
+      // are charged for. GET lists them with this month's use; PUT saves one
+      // (key write-only, `config.maxRunning` its concurrency); POST …/test
+      // checks the key and reads the account's limits.
+      const managedCompute = p.match(/^\/api\/settings\/managed-compute(?:\/([a-z0-9-]+)(\/test)?)?$/);
+      if (managedCompute) {
+        const connections = this.deps.providerConnections;
+        if (!connections) return this.json(res, 503, { error: 'provider connections are unavailable' });
+        const provider = managedCompute[1];
+        try {
+          if (!provider && method === 'GET') {
+            const month = computeMonth(Date.now());
+            const costs = await store.managedComputeCosts(month.from, month.to);
+            const accounts = await connections.list(MANAGED_COMPUTE);
+            return this.json(res, 200, { from: month.from, to: month.to, multiplier: COMPUTE_PRICE_MULTIPLIER,
+              providers: await Promise.all(accounts.map(async (account) => {
+                const rows = costs.filter((row) => row.provider === account.provider);
+                const costMicros = rows.reduce((total, row) => total + row.costMicros, 0);
+                return { ...account, running: await store.runningManagedWorlds(account.provider), organizations: rows.length,
+                  costMicros, chargedMicros: computeChargeMicros(costMicros), seconds: rows.reduce((total, row) => total + row.seconds, 0) };
+              })) });
+          }
+          if (provider && managedCompute[2] && method === 'POST') return this.json(res, 200, await connections.test(MANAGED_COMPUTE, provider));
+          if (provider && !managedCompute[2] && method === 'PUT') {
+            const b = await this.body(req);
+            const saved = await connections.save({ organizationId: MANAGED_COMPUTE, provider,
+              apiKey: b.apiKey ? String(b.apiKey) : undefined,
+              config: b.config && typeof b.config === 'object' ? b.config as WorldProviderConnection['config'] : {}, enabled: b.enabled !== false });
+            await this.deps.authorization?.audit(actorPrincipal(callerIdentity.actor), 'managed-compute.save', `installation:${provider}`,
+              { enabled: saved.enabled, maxRunning: saved.config.maxRunning, keyChanged: Boolean(b.apiKey), ...identityAuditDetail(callerIdentity) });
+            return this.json(res, 200, saved);
+          }
+          if (provider && !managedCompute[2] && method === 'DELETE') {
+            const running = await store.runningManagedWorlds(provider);
+            const held = (await store.listWorldInstances('ready')).concat(await store.listWorldInstances('parked'))
+              .filter(({ handle }) => (handle.provider ?? handle.kind) === provider && (handle as { meta?: Record<string, unknown> }).meta?.funding === 'managed');
+            if (running || held.length) return this.json(res, 409, { error: `${held.length || running} task computer(s) still run on it; disable it instead, so they finish` });
+            const deleted = Boolean(await connections.delete(MANAGED_COMPUTE, provider));
+            await this.deps.authorization?.audit(actorPrincipal(callerIdentity.actor), 'managed-compute.delete', `installation:${provider}`,
+              { ...identityAuditDetail(callerIdentity) });
+            return this.json(res, 200, { deleted });
+          }
+          return this.json(res, 405, { error: 'method not allowed' });
+        } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
+      }
       // The last comparison of the managed bucket with the database, per
       // organization; POST lists the bucket now. `dryRun` never deletes, even
       // when KARMAX_STORAGE_RECONCILE=delete.
@@ -2855,18 +2908,26 @@ export class Gateway {
             queuedAgentRuns = queue.queue.length;
           } catch { /* The organization has not run an agent yet. */ }
         }
+        // What the plan's limits are against: stored bytes, and this month's
+        // managed compute (only where the installation offers it).
+        const managedLocation = (await store.listStorageLocations(organizationId)).find((location) => location.kind === 'managed');
+        const managedProviders = ((await this.deps.providerConnections?.managedConnections()) ?? []).map((value) => value.provider);
+        const compute = entitlements.deployment === 'hosted' && managedProviders.length
+          ? { ...(await computeCredit(store, organizationId)), providers: managedProviders } : null;
         return this.json(res, 200, {
           ...entitlements,
           gift: await this.deps.subscriptions?.currentGift(organizationId) ?? null,
           activeUsers,
+          storageUsedBytes: managedLocation ? (await store.storageLocationUsage(managedLocation.id)).retainedBytes : null,
+          compute,
           currentMonthlyPriceCents: entitlements.plan
-            ? hostedMonthlyPriceCents(entitlements.plan, activeUsers, entitlements.storagePacks)
+            ? hostedMonthlyPriceCents(entitlements.plan, activeUsers, entitlements.storagePacks, entitlements.computePacks)
             : null,
           activeAgentRuns,
           queuedAgentRuns,
         });
       }
-      const subscription = p.match(/^\/api\/organizations\/([^/]+)\/subscription\/(status|checkout|portal|change|cancel|sync-seats|storage-packs|reconcile|gift|gift-storage)$/);
+      const subscription = p.match(/^\/api\/organizations\/([^/]+)\/subscription\/(status|checkout|portal|change|cancel|sync-seats|storage-packs|compute-packs|reconcile|gift|gift-storage|gift-compute)$/);
       if (subscription) {
         const organizationId = subscription[1]!;
         const action = subscription[2]!;
@@ -2883,13 +2944,14 @@ export class Gateway {
           return this.json(res, 200, { ...(await billing.current(organizationId)), canManage, canGift });
         }
         if (method !== 'POST') return this.json(res, 405, { error: 'method not allowed' });
-        if (action === 'gift-storage') {
+        if (action === 'gift-storage' || action === 'gift-compute') {
           try {
             const body = await this.body(req);
             const key = typeof req.headers['idempotency-key'] === 'string' ? req.headers['idempotency-key'] : '';
             const actor = actorPrincipal(callerIdentity.actor);
-            const result = await billing.giftStoragePacks(organizationId, body.packs, actor, key);
-            await this.deps.authorization?.audit(actor, 'subscription.gift-storage', `organization:${organizationId}`,
+            const result = action === 'gift-storage' ? await billing.giftStoragePacks(organizationId, body.packs, actor, key)
+              : await billing.giftComputePacks(organizationId, body.packs, actor, key);
+            await this.deps.authorization?.audit(actor, `subscription.${action}`, `organization:${organizationId}`,
               { packs: body.packs, requestKey: key, ...identityAuditDetail(callerIdentity) });
             return this.json(res, 200, result);
           } catch (error) {
@@ -2949,6 +3011,8 @@ export class Gateway {
           if (action === 'cancel') return this.json(res, 202, await billing.cancel(organizationId, idempotencyKey));
           if (action === 'storage-packs')
             return this.json(res, 202, await billing.storagePacks(organizationId, (await this.body(req)).packs, idempotencyKey));
+          if (action === 'compute-packs')
+            return this.json(res, 202, await billing.computePacks(organizationId, (await this.body(req)).packs, idempotencyKey));
           if (action === 'reconcile') return this.json(res, 200, await billing.reconcilePending(organizationId));
           await billing.syncSeats(organizationId);
           return this.json(res, 202, { syncing: true });
@@ -3089,7 +3153,7 @@ export class Gateway {
         }
         await this.deps.githubApp?.disconnectOrganization(organizationId);
         for (const connection of (await this.deps.providerConnections?.list(organizationId)) ?? [])
-          (await this.deps.providerConnections?.delete(organizationId, connection.provider));
+          if (!connection.managed) (await this.deps.providerConnections?.delete(organizationId, connection.provider));
         const storageLocations = this.deps.resources?.storageLocationService();
         for (const location of (await storageLocations?.list(organizationId)) ?? [])
           if (location.kind === 's3') (await storageLocations!.delete(organizationId, location.id));
@@ -3505,6 +3569,10 @@ export class Gateway {
           return this.json(res, status === 403 || status === 404 ? status : 400, { error: e instanceof Error ? e.message : String(e) });
         }
       }
+      // Managed compute accounts belong to the installation: only
+      // /api/settings/managed-compute reaches them, never an organization path.
+      if (/^\/api\/organizations\/installation\/world-providers(?:\/|$)/.test(p))
+        return this.json(res, 404, { error: 'organization not found' });
       const worldProviders = p.match(/^\/api\/organizations\/([^/]+)\/world-providers$/);
       if (worldProviders && method === 'GET') {
         return this.json(res, 200, (await this.deps.providerConnections?.list(worldProviders[1]!)) ?? []);

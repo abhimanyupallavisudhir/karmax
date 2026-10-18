@@ -93,7 +93,7 @@ export async function createExecutionServices(input: {
       world: () => process.env.KARMAX_PUBLIC_URL?.trim() || undefined,
       edge: () => process.env.KARMAX_RESOURCE_EDGE_URL?.trim() || undefined });
   const checkpoints = new WorldCheckpointService(store, worlds, objectStore, broker, githubApp, resources);
-  const runners = new RunnerPoolService(store);
+  const runners = new RunnerPoolService(store, providerConnections);
   const worldAccess = new WorldAccessService(store, worlds, runners, resources);
   worlds.setHandleResolver(async (handle) => (await store.currentWorld(handle.id)) as import('../world/types.js').WorldHandle | undefined);
   // Rebuild a world from its last checkpoint ONLY when the provider has genuinely

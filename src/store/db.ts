@@ -1087,6 +1087,10 @@ export class Store {
         organizationId TEXT PRIMARY KEY, packs INTEGER NOT NULL,
         grantedBy TEXT NOT NULL, grantedAt INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS compute_pack_gifts (
+        organizationId TEXT PRIMARY KEY, packs INTEGER NOT NULL,
+        grantedBy TEXT NOT NULL, grantedAt INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS subscription_billing_checkouts (
         provider TEXT NOT NULL, checkoutId TEXT NOT NULL, organizationId TEXT NOT NULL,
         createdAt INTEGER NOT NULL, subscriptionId TEXT, state TEXT NOT NULL DEFAULT 'pending', PRIMARY KEY (provider, checkoutId)
@@ -1476,6 +1480,8 @@ export class Store {
       (await this.db.exec("ALTER TABLE organizations ADD COLUMN nameVisibility TEXT NOT NULL DEFAULT 'members'"));
     if (!organizationCols.some((c) => c.name === 'storagePacks'))
       (await this.db.exec('ALTER TABLE organizations ADD COLUMN storagePacks INTEGER NOT NULL DEFAULT 0'));
+    if (!organizationCols.some((c) => c.name === 'computePacks'))
+      (await this.db.exec('ALTER TABLE organizations ADD COLUMN computePacks INTEGER NOT NULL DEFAULT 0'));
     const policyAcceptanceCols = (await this.db.prepare('PRAGMA table_info(policy_acceptances)').all()) as { name: string }[];
     if (!policyAcceptanceCols.some((c) => c.name === 'organizationId'))
       (await this.db.exec('ALTER TABLE policy_acceptances ADD COLUMN organizationId TEXT'));
@@ -1493,6 +1499,8 @@ export class Store {
       (await this.db.exec('ALTER TABLE subscription_billing_accounts ADD COLUMN lastEventRank INTEGER NOT NULL DEFAULT 0'));
     if (!subscriptionBillingCols.some((c) => c.name === 'storagePacks'))
       (await this.db.exec('ALTER TABLE subscription_billing_accounts ADD COLUMN storagePacks INTEGER NOT NULL DEFAULT 0'));
+    if (!subscriptionBillingCols.some((c) => c.name === 'computePacks'))
+      (await this.db.exec('ALTER TABLE subscription_billing_accounts ADD COLUMN computePacks INTEGER NOT NULL DEFAULT 0'));
     (await this.db.exec(`UPDATE subscription_billing_accounts SET lastEventRank=CASE status
       WHEN 'canceled' THEN 690 WHEN 'incomplete_expired' THEN 680
       WHEN 'unpaid' THEN 670 WHEN 'paused' THEN 660 WHEN 'incomplete' THEN 650
@@ -2283,13 +2291,24 @@ export class Store {
     const organization = (await this.getOrganization(organizationId));
     if (!organization) throw new Error(`no organization ${organizationId}`);
     return organizationEntitlements(organization.plan, this.hosted,
-      (await this.listOrganizationMemberships(organizationId)).length, organization.storagePacks ?? 0,
-      (await this.storagePackGift(organizationId))?.packs ?? 0);
+      (await this.listOrganizationMemberships(organizationId)).length, {
+        storagePacks: organization.storagePacks ?? 0, giftedStoragePacks: (await this.storagePackGift(organizationId))?.packs ?? 0,
+        computePacks: organization.computePacks ?? 0, giftedComputePacks: (await this.computePackGift(organizationId))?.packs ?? 0,
+      });
   }
 
   /** Storage packs the operator gifted, independent of billing. */
   async storagePackGift(organizationId: string): Promise<{ packs: number; grantedBy: string; grantedAt: number } | null> {
-    const row = (await this.db.prepare('SELECT packs, grantedBy, grantedAt FROM storage_pack_gifts WHERE organizationId=?')
+    return this.packGift('storage_pack_gifts', organizationId);
+  }
+
+  /** Compute packs the operator gifted, independent of billing. */
+  async computePackGift(organizationId: string): Promise<{ packs: number; grantedBy: string; grantedAt: number } | null> {
+    return this.packGift('compute_pack_gifts', organizationId);
+  }
+
+  private async packGift(table: 'storage_pack_gifts' | 'compute_pack_gifts', organizationId: string) {
+    const row = (await this.db.prepare(`SELECT packs, grantedBy, grantedAt FROM ${table} WHERE organizationId=?`)
       .get(organizationId)) as { packs: number | string; grantedBy: string; grantedAt: number | string } | undefined;
     return row ? { packs: Number(row.packs), grantedBy: row.grantedBy, grantedAt: Number(row.grantedAt) } : null;
   }
@@ -2297,11 +2316,20 @@ export class Store {
   /** Gift `packs` storage packs (0 removes the gift). Billing's
    * SubscriptionBillingService.giftStoragePacks is the caller. */
   async setStoragePackGift(organizationId: string, packs: number, grantedBy: string): Promise<void> {
+    await this.setPackGift('storage_pack_gifts', organizationId, packs, grantedBy);
+  }
+
+  /** Gift `packs` compute packs (0 removes the gift). */
+  async setComputePackGift(organizationId: string, packs: number, grantedBy: string): Promise<void> {
+    await this.setPackGift('compute_pack_gifts', organizationId, packs, grantedBy);
+  }
+
+  private async setPackGift(table: 'storage_pack_gifts' | 'compute_pack_gifts', organizationId: string, packs: number, grantedBy: string): Promise<void> {
     await this.db.transaction(async () => {
-      if (!Number.isSafeInteger(packs) || packs < 0) throw new Error('gifted storage packs must be a non-negative integer');
+      if (!Number.isSafeInteger(packs) || packs < 0) throw new Error('gifted packs must be a non-negative integer');
       if (!(await this.getOrganization(organizationId))) throw new Error(`no organization ${organizationId}`);
-      if (packs === 0) (await this.db.prepare('DELETE FROM storage_pack_gifts WHERE organizationId=?').run(organizationId));
-      else (await this.db.prepare(`INSERT INTO storage_pack_gifts (organizationId, packs, grantedBy, grantedAt) VALUES (?, ?, ?, ?)
+      if (packs === 0) (await this.db.prepare(`DELETE FROM ${table} WHERE organizationId=?`).run(organizationId));
+      else (await this.db.prepare(`INSERT INTO ${table} (organizationId, packs, grantedBy, grantedAt) VALUES (?, ?, ?, ?)
         ON CONFLICT(organizationId) DO UPDATE SET packs=excluded.packs, grantedBy=excluded.grantedBy, grantedAt=excluded.grantedAt`)
         .run(organizationId, packs, grantedBy, Date.now()));
       this.notifyOrganizationEntitlementsChanged(organizationId);
@@ -2315,6 +2343,17 @@ export class Store {
       if (!Number.isSafeInteger(storagePacks) || storagePacks < 0) throw new Error('storage packs must be a non-negative integer');
       if (!(await this.getOrganization(organizationId))) throw new Error(`no organization ${organizationId}`);
       (await this.db.prepare('UPDATE organizations SET storagePacks=? WHERE id=?').run(storagePacks, organizationId));
+      this.notifyOrganizationEntitlementsChanged(organizationId);
+      return (await this.getOrganization(organizationId))!;
+    });
+  }
+
+  /** Billing's compute-pack mutation boundary, like setOrganizationStoragePacks. */
+  async setOrganizationComputePacks(organizationId: string, computePacks: number): Promise<Organization> {
+    return this.db.transaction(async () => {
+      if (!Number.isSafeInteger(computePacks) || computePacks < 0) throw new Error('compute packs must be a non-negative integer');
+      if (!(await this.getOrganization(organizationId))) throw new Error(`no organization ${organizationId}`);
+      (await this.db.prepare('UPDATE organizations SET computePacks=? WHERE id=?').run(computePacks, organizationId));
       this.notifyOrganizationEntitlementsChanged(organizationId);
       return (await this.getOrganization(organizationId))!;
     });
@@ -2593,6 +2632,7 @@ export class Store {
         ((await this.db.prepare('SELECT id FROM project_events WHERE organizationId=?').all(organizationId)) as Array<{ id: unknown }>).map((r) => String(r.id)))),
       subscription_gifts: (await selectRows(this.db, 'subscription_gifts', 'organizationId=?', [organizationId])),
       storage_pack_gifts: (await selectRows(this.db, 'storage_pack_gifts', 'organizationId=?', [organizationId])),
+      compute_pack_gifts: (await selectRows(this.db, 'compute_pack_gifts', 'organizationId=?', [organizationId])),
       subscription_billing_accounts: (await selectRows(this.db, 'subscription_billing_accounts', 'organizationId=?', [organizationId])),
       subscription_billing_checkouts: (await selectRows(this.db, 'subscription_billing_checkouts', 'organizationId=?', [organizationId])),
       subscription_billing_locks: (await selectRows(this.db, 'subscription_billing_locks', 'organizationId=?', [organizationId])),
@@ -2854,6 +2894,7 @@ export class Store {
       (await this.db.prepare('DELETE FROM subscription_billing_requests WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM subscription_gifts WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM storage_pack_gifts WHERE organizationId=?').run(organizationId));
+      (await this.db.prepare('DELETE FROM compute_pack_gifts WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM subscription_billing_accounts WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM subscription_billing_checkouts WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM subscription_billing_locks WHERE organizationId=?').run(organizationId));
@@ -5305,6 +5346,43 @@ export class Store {
   /** The organization owners' storage notice (one current stage at a time),
    * or none once the organization is back within its quota. Email is sent by
    * the notifier itself, so only browser and Slack delivery are queued here. */
+  /** An organization's owners' "out of compute" inbox item: one per owner and
+   * month while the month's managed compute credit is spent, withdrawn once
+   * there is credit again or the month ends. Returns how many owners were
+   * newly told (they are emailed too). */
+  async syncComputeInbox(organizationId: string, userIds: string[],
+    notice: { month: string; usedMicros: number; creditMicros: number; renewsAt: number } | undefined, createdAt = Date.now()): Promise<number> {
+    return this.db.transaction(async () => {
+      (await this.lockOrganization(organizationId));
+      const ids = new Map<string, string>();
+      if (notice) for (const userId of new Set(userIds)) ids.set(`inbox_compute_${crypto.createHash('sha256')
+        .update(JSON.stringify([organizationId, userId, notice.month])).digest('hex').slice(0, 24)}`, userId);
+      const stale = ((await this.db.prepare(`SELECT id FROM inbox WHERE organizationId=? AND json_extract(subject, '$.kind')='compute'`)
+        .all(organizationId)) as Array<{ id: string }>).map((row) => String(row.id)).filter((id) => !ids.has(id));
+      if (stale.length) {
+        (await deleteRows(this.db, 'delivery_outbox', 'inboxId', stale));
+        (await deleteRows(this.db, 'inbox', 'id', stale));
+      }
+      if (!notice) return 0;
+      let told = 0;
+      for (const [id, userId] of ids) {
+        const inserted = (await this.db.prepare(`INSERT OR IGNORE INTO inbox
+          (id, organizationId, userId, eventSeq, taskId, kind, urgency, unread, actionable, createdAt, subject)
+          VALUES (?, ?, ?, ?, ?, 'escalated', ?, 1, 1, ?, ?)`).run(
+          id, organizationId, userId, createdAt * 1000, `compute:${organizationId}`, urgencyRank('high'), createdAt,
+          JSON.stringify({ kind: 'compute', ...notice })));
+        if (!Number(inserted.changes)) continue;
+        told++;
+        const preferences = (await this.getDeliveryPreferences(userId, organizationId));
+        for (const channel of [preferences.browser && 'browser', preferences.slack && 'slack'].filter(Boolean) as string[])
+          (await this.db.prepare(`INSERT OR IGNORE INTO delivery_outbox
+            (id, inboxId, channel, state, attempts, nextAt, createdAt) VALUES (?, ?, ?, 'pending', 0, ?, ?)`)
+            .run(newId('delivery'), id, channel, createdAt, createdAt));
+      }
+      return told;
+    });
+  }
+
   async syncStorageInbox(organizationId: string, userIds: string[],
     notice: { stage: string; retainedBytes: number; quotaBytes: number; deleteAt: number } | undefined, createdAt = Date.now()): Promise<void> {
     return this.db.transaction(async () => {
@@ -7916,10 +7994,14 @@ export class Store {
   }
 
   /** Everything an organization keeps in storage, for the storage page and the
-   * over-quota policy. Sizes are logical bytes: revisions share unchanged
-   * chunks, so deleting one frees only what is unique to it. */
+   * over-quota policy. Revision sizes are logical bytes: revisions share
+   * unchanged chunks, so deleting one frees only what is unique to it, and
+   * `repositoryBytes` is what each resource physically stores. */
   async organizationStorageContents(organizationId: string): Promise<{
     attachments: Array<Pick<ResourceAttachment, 'id' | 'projectId' | 'name' | 'storageLocationId' | 'currentRevisionId'>>;
+    /** Physical bytes each resource's repository holds in managed storage:
+     * every version, deduplicated, as the quota counts them. */
+    repositoryBytes: Map<string, number>;
     revisions: Array<Pick<ResourceRevision, 'id' | 'attachmentId' | 'bytes' | 'createdAt' | 'storageLocationId' | 'createdByTaskId'> & { checkpoint: boolean }>;
     checkpoints: Array<{ id: string; projectId: string; worldId: string; bytes: number; createdAt: number; taskStatus?: string }>;
     artifacts: PromotedArtifact[];
@@ -7946,7 +8028,20 @@ export class Store {
     const artifacts = ((await this.db.prepare('SELECT * FROM promoted_artifacts WHERE organizationId=? ORDER BY createdAt').all(organizationId)) as Array<
       Omit<PromotedArtifact, 'expiresAt'> & { expiresAt: number | null }>)
       .map((row) => ({ ...row, bytes: Number(row.bytes), createdAt: Number(row.createdAt), expiresAt: row.expiresAt == null ? undefined : Number(row.expiresAt) }));
-    return { attachments, revisions, checkpoints: checkpoints.filter((checkpoint) => !queued.has(checkpoint.id)), artifacts };
+    const managed = ((await this.db.prepare(`SELECT id FROM storage_locations WHERE organizationId=? AND kind='managed'`)
+      .get(organizationId)) as { id?: string } | undefined)?.id ?? null;
+    const repositoryBytes = new Map(((await this.db.prepare(`SELECT attachmentId, COALESCE(SUM(bytes), 0) AS bytes
+      FROM resource_repository_files WHERE organizationId=? AND kind<>'locks'
+        AND (storageLocationId=? OR storageLocationId IS NULL) GROUP BY attachmentId`)
+      .all(organizationId, managed)) as Array<{ attachmentId: string; bytes: number }>)
+      .map((row) => [String(row.attachmentId), Number(row.bytes)] as const));
+    return { attachments, repositoryBytes, revisions, checkpoints: checkpoints.filter((checkpoint) => !queued.has(checkpoint.id)), artifacts };
+  }
+
+  /** What one resource's repository stores, every version deduplicated. */
+  async resourceStoredBytes(attachmentId: string): Promise<number> {
+    return Number(((await this.db.prepare(`SELECT COALESCE(SUM(bytes), 0) AS bytes FROM resource_repository_files
+      WHERE attachmentId=? AND kind<>'locks'`).get(attachmentId)) as { bytes?: number } | undefined)?.bytes ?? 0);
   }
 
   /** When an organization's managed storage first exceeded its quota, and which
@@ -8009,7 +8104,8 @@ export class Store {
     return this.db.transaction(async () => {
 
     (await this.lockOrganization(input.organizationId));
-    if (!(await this.getOrganization(input.organizationId))) throw new Error('organization not found');
+    // 'installation' owns managed compute accounts (src/world/connections.ts MANAGED_COMPUTE).
+    if (input.organizationId !== 'installation' && !(await this.getOrganization(input.organizationId))) throw new Error('organization not found');
     if (!/^[a-z][a-z0-9-]{0,31}$/.test(input.provider)) throw new Error('invalid world provider');
     const existing = (await this.getWorldProviderConnection(input.organizationId, input.provider));
     const now = Date.now();
@@ -8138,7 +8234,14 @@ export class Store {
     const pool = (await this.getRunnerPool(input.runnerPoolId));
     if (!pool?.enabled || pool.organizationId !== input.organizationId) throw new Error('runner pool is unavailable');
     const remote = !['worktree', 'container', 'memory'].includes(pool.provider);
-    const hostedCustomerWorld = remote && this.hosted && pool.mode === 'customer';
+    // Only the pool RunnerPoolService keeps for managed compute is centrally
+    // funded; any other pool claiming to be would resell the organization's
+    // own account as the installation's (src/world/runners.ts).
+    if (remote && this.hosted && pool.mode === 'managed' && !isManagedComputePool(pool))
+      throw new Error('centrally funded remote sandbox pools are not enabled; connect the organization provider account');
+    // Hosted remote worlds, on the organization's own account or managed
+    // compute alike, count against the plan's active worlds.
+    const hostedCustomerWorld = remote && this.hosted && (pool.mode === 'customer' || pool.mode === 'managed');
     const project = (await this.getProject(input.projectId));
     const taskProjectId = await this.taskProjectIdAsync(input.taskId);
     if (!project || project.organizationId !== input.organizationId || taskProjectId !== project.id)
@@ -8158,8 +8261,6 @@ export class Store {
       if (project.config.monthlyBudgetMicros != null
         && (await this.usageSummary(input.organizationId, month.from, month.to, project.id)).costMicros >= project.config.monthlyBudgetMicros)
         throw new Error('project monthly cloud budget is exhausted');
-      if (remote && this.hosted && pool.mode === 'managed')
-        throw new Error('centrally funded remote sandbox pools are not enabled; connect the organization provider account');
       let organizationActive = 0;
       if (remote) {
         organizationActive = Number(((await this.db.prepare(`SELECT COUNT(*) n FROM world_leases l
@@ -8216,8 +8317,8 @@ export class Store {
       if (!pool?.enabled || pool.organizationId !== candidate.organizationId) continue;
       const remote = !['worktree', 'container', 'memory'].includes(pool.provider);
       if (filter.remoteOnly && !remote) continue;
-      if (remote && this.hosted && pool.mode === 'managed') continue;
-      const hostedCustomerWorld = remote && this.hosted && pool.mode === 'customer';
+      if (remote && this.hosted && pool.mode === 'managed' && !isManagedComputePool(pool)) continue;
+      const hostedCustomerWorld = remote && this.hosted && (pool.mode === 'customer' || pool.mode === 'managed');
       const policy = (await this.getOrganizationUsagePolicy(candidate.organizationId));
       if (remote) {
         const organizationActive = Number(((await this.db.prepare(`SELECT COUNT(*) n FROM world_leases l
@@ -8590,6 +8691,36 @@ export class Store {
     }
   
     });
+  }
+
+  /** What managed compute cost the provider, per organization and provider,
+   * in [from, to): rows of the installation's own accounts (fundingSource
+   * 'managed'), machine time and disk, prorated to the window like
+   * usageSummary. `organizationId` narrows it to one organization. */
+  async managedComputeCosts(from: number, to: number, organizationId?: string): Promise<Array<{
+    organizationId: string; provider: string; costMicros: number; seconds: number }>> {
+    const rows = (await this.db.prepare(`SELECT organizationId, provider, kind, quantity, costMicros, startedAt, endedAt FROM usage_events
+      WHERE fundingSource='managed' AND kind IN ('world.active','world.disk')${organizationId ? ' AND organizationId=?' : ''}
+        AND startedAt<? AND ((endedAt>startedAt AND endedAt>?) OR (endedAt<=startedAt AND startedAt>=?))`)
+      .all(...(organizationId ? [organizationId] : []), to, from, from)) as Array<Record<string, unknown>>;
+    const totals = new Map<string, { organizationId: string; provider: string; costMicros: number; seconds: number }>();
+    for (const row of rows) {
+      const startedAt = Number(row.startedAt), endedAt = Number(row.endedAt), duration = endedAt - startedAt;
+      const share = duration > 0 ? Math.max(0, Math.min(endedAt, to) - Math.max(startedAt, from)) / duration : 1;
+      const key = `${row.organizationId}\u0000${row.provider}`;
+      const entry = totals.get(key) ?? { organizationId: String(row.organizationId), provider: String(row.provider), costMicros: 0, seconds: 0 };
+      entry.costMicros += Number(row.costMicros) * share;
+      if (row.kind === 'world.active') entry.seconds += Number(row.quantity) * share;
+      totals.set(key, entry);
+    }
+    return [...totals.values()].map((entry) => ({ ...entry, costMicros: Math.round(entry.costMicros), seconds: Math.round(entry.seconds) }));
+  }
+
+  /** Machines of the installation's `provider` account running now, across
+   * every organization: active leases in managed runner pools. */
+  async runningManagedWorlds(provider: string): Promise<number> {
+    return Number(((await this.db.prepare(`SELECT COUNT(*) n FROM world_leases l JOIN runner_pools p ON p.id=l.runnerPoolId
+      WHERE l.state='active' AND p.mode='managed' AND p.provider=? AND p.id=p.organizationId || ':tavya-' || p.provider`).get(provider)) as { n?: number } | undefined)?.n ?? 0);
   }
 
   async usageSummary(organizationId: string, from = 0, to = Date.now() + 1, projectId?: string): Promise<{
@@ -10395,6 +10526,11 @@ function validateProjectExecutionConfig(config: ProjectConfig): void {
   }
 }
 
+/** The runner pool of an organization's managed compute (RunnerPoolService.ensureDefaultPool). */
+export function isManagedComputePool(pool: { id: string; organizationId: string; provider: string; mode: string }): boolean {
+  return pool.mode === 'managed' && pool.id === `${pool.organizationId}:tavya-${pool.provider}`;
+}
+
 function monthWindow(now: number): { from: number; to: number } {
   const date = new Date(now);
   return { from: Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1),
@@ -10470,7 +10606,8 @@ function requiredTargets(policy: ConfirmationPolicy): number {
 
 function rowToOrganization(r: any): Organization {
   return { id: r.id, name: r.name, slug: r.slug, kind: r.kind, nameVisibility: r.nameVisibility === 'public' ? 'public' : 'members',
-    plan: isHostedPlanId(r.plan) ? r.plan : 'free', storagePacks: Number(r.storagePacks ?? 0) || 0, createdAt: r.createdAt };
+    plan: isHostedPlanId(r.plan) ? r.plan : 'free', storagePacks: Number(r.storagePacks ?? 0) || 0,
+    computePacks: Number(r.computePacks ?? 0) || 0, createdAt: r.createdAt };
 }
 
 function rowToTeam(r: any): Team {

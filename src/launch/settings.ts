@@ -75,7 +75,7 @@ export const FOUNDER_TASKS = [
 
 const PADDLE_TASKS = [
   { id: 'paddle-account', group: 'Paddle Billing', title: 'Verify the Paddle account', instructions: 'Complete identity and website review as an individual or company, configure payouts, and enable MFA.', href: 'https://login.paddle.com/signup' },
-  { id: 'paddle-catalog', group: 'Paddle Billing', title: 'Provision prices and webhooks', instructions: 'Use automated setup after saving the API key. Confirm the $9, $19, $5 and $4 storage-pack monthly USD prices and pricing for products below $10.' },
+  { id: 'paddle-catalog', group: 'Paddle Billing', title: 'Provision prices and webhooks', instructions: 'Use automated setup after saving the API key. Confirm the $9, $19, $5, $4 storage-pack and $10 compute-pack monthly USD prices and pricing for products below $10.' },
   { id: 'paddle-checkout', group: 'Paddle Billing', title: 'Approve the checkout domain', instructions: 'Set the default payment link to the checkout URL below and complete Paddle domain review. Create a client-side token for the same environment.', href: 'https://vendors.paddle.com' },
 ];
 
@@ -120,6 +120,7 @@ export class PaidLaunchSettingsService {
       teamBasePriceId: c.teamBasePriceId ?? clean(bootstrap('KARMAX_SUBSCRIPTION_PADDLE_TEAM_BASE_PRICE_ID')),
       teamSeatPriceId: c.teamSeatPriceId ?? clean(bootstrap('KARMAX_SUBSCRIPTION_PADDLE_TEAM_SEAT_PRICE_ID')),
       storagePackPriceId: c.storagePackPriceId ?? clean(bootstrap('KARMAX_SUBSCRIPTION_PADDLE_STORAGE_PACK_PRICE_ID')),
+      computePackPriceId: c.computePackPriceId ?? clean(bootstrap('KARMAX_SUBSCRIPTION_PADDLE_COMPUTE_PACK_PRICE_ID')),
     };
   }
   async provisionPaddle(publicUrl: string, siteName: string, fetcher: typeof fetch = fetch) {
@@ -190,6 +191,8 @@ export class PaidLaunchSettingsService {
         individualPriceId: paddle.individualPriceId, teamBasePriceId: paddle.teamBasePriceId, teamSeatPriceId: paddle.teamSeatPriceId,
         individualProductId: paddle.individualProductId, teamProductId: paddle.teamProductId,
         storagePackPriceId: paddle.storagePackPriceId, storagePackProductId: paddle.storagePackProductId,
+        // Optional, like no other price: compute packs are offered once it exists.
+        computePackPriceId: paddle.computePackPriceId, computePackProductId: paddle.computePackProductId,
         secretKeyConfigured: Boolean(paddle.apiKey), webhookSecretConfigured: Boolean(paddle.webhookSecret),
         configured: paddleMissing.length === 0, missing: paddleMissing,
         webhookUrl: `${publicUrl.replace(/\/$/, '')}/api/subscriptions/paddle/webhook`,
@@ -247,7 +250,8 @@ export class PaidLaunchSettingsService {
       paddle = { environment, clientToken, individualPriceId: paddleId('individualPriceId', 'pri'),
         teamBasePriceId: paddleId('teamBasePriceId', 'pri'), teamSeatPriceId: paddleId('teamSeatPriceId', 'pri'),
         individualProductId: paddleId('individualProductId', 'pro'), teamProductId: paddleId('teamProductId', 'pro'),
-        storagePackPriceId: paddleId('storagePackPriceId', 'pri'), storagePackProductId: paddleId('storagePackProductId', 'pro') };
+        storagePackPriceId: paddleId('storagePackPriceId', 'pri'), storagePackProductId: paddleId('storagePackProductId', 'pro'),
+        computePackPriceId: paddleId('computePackPriceId', 'pri'), computePackProductId: paddleId('computePackProductId', 'pro') };
       if (apiKey) secrets.push([`platform:paddle-subscriptions:${environment}:api-key`, apiKey]);
       if (webhookSecret) secrets.push([`platform:paddle-subscriptions:${environment}:webhook-secret`, webhookSecret]);
     }

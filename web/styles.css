@@ -1575,9 +1575,36 @@ a.ins-task-title:hover { color: var(--accent); }
   padding: 9px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); outline: none;
 }
 .form-row input:focus, .form-row select:focus { border-color: var(--accent); }
-.plan-storage { display: flex; flex-wrap: wrap; gap: 6px; padding: 9px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); }
-.plan-storage-extra { color: var(--accent); font-weight: 600; }
-.plan-storage-extra.gifted { color: var(--merged); }
+/* Plan & billing: the plan, then each limit against its use (a thin meter, the
+   figures, and the pack stepper that raises it). */
+.plan-head { display:flex; align-items:center; flex-wrap:wrap; gap:8px; min-height:40px; padding-bottom:6px; }
+.plan-name { font-size:17px; font-weight:650; letter-spacing:-0.01em; }
+.plan-price { font-size:13px; font-variant-numeric:tabular-nums; }
+.plan-limits .setting-value { flex-wrap:nowrap; gap:10px; font-variant-numeric:tabular-nums; }
+.plan-meter { flex:0 1 160px; min-width:64px; height:6px; border-radius:999px; background:var(--line); overflow:hidden; }
+.plan-meter > i { display:block; height:100%; border-radius:inherit; background:var(--accent); }
+.plan-meter.near > i { background:var(--working); }
+.plan-meter.over > i { background:var(--danger); }
+.pack-stepper { display:inline-flex; align-items:center; gap:2px; font-variant-numeric:tabular-nums; }
+.pack-stepper > b { min-width:20px; text-align:center; }
+.pack-stepper .setting-muted { min-width:38px; margin-left:4px; font-size:12.5px; }
+.plan-note { display:flex; align-items:center; flex-wrap:wrap; gap:8px; margin:6px 0; font-size:13px; color:var(--ink-2); }
+.plan-note.danger { color:var(--danger); }
+.plan-note.warn { color:var(--working); }
+.plan-note.ok { color:var(--merged); }
+.plan-choices { display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:10px; margin-top:14px; }
+.plan-choice { display:flex; flex-direction:column; gap:8px; padding:12px 14px; border:1px solid var(--line); border-radius:var(--r); background:var(--surface-2); }
+.plan-choice-head { display:flex; align-items:baseline; justify-content:space-between; gap:8px; }
+.plan-choice-head > span { font-size:16px; font-weight:650; font-variant-numeric:tabular-nums; }
+.plan-choice-head small { font-size:12px; font-weight:400; color:var(--ink-3); }
+.plan-choice ul { margin:0; padding:0; list-style:none; font-size:12.5px; color:var(--ink-2); display:grid; gap:3px; }
+.plan-choice .btn { align-self:flex-start; margin-top:auto; }
+.plan-terms { display:flex; align-items:center; gap:6px; margin-top:10px; font-size:12.5px; }
+.plan-operator { margin-top:12px; font-size:13px; }
+.plan-operator > summary { cursor:pointer; color:var(--ink-3); }
+.plan-gift-count { width:6em; }
+.plan-foot { margin:10px 0 0; font-size:12px; }
+.plan-limits .warn { color:var(--working); }
 .switch { display: flex; align-items: center; gap: 10px; }
 .switch input { width: 38px; height: 22px; }
 .switch.disabled { opacity: .55; cursor: not-allowed; }
@@ -2070,6 +2097,9 @@ html[data-theme="light"] .landing-theme .moon { display: block; }
 .legal-grid small { margin-top:8px; color:#647086; line-height:1.5; }
 .legal-grid i { margin-top:auto; padding-top:18px; color:#315ee7; font-style:normal; font:12px var(--font-mono); }
 .legal-footer { min-height:80px; display:flex; flex-wrap:wrap; align-items:center; justify-content:center; gap:24px; padding:20px 24px; border-top:1px solid #dfe3eb; background:#fff; color:#536078; font-size:12px; }
+.pricing-addons { display:flex; flex-wrap:wrap; align-items:baseline; gap:6px 22px; margin:14px 0 0; padding:16px 24px; border:1px solid #dfe3eb; border-radius:16px; background:#fff; color:#536078; font-size:14px; }
+.pricing-addons b { color:#15181e; }
+.pricing-addons small { color:#647086; flex-basis:100%; font-size:12px; }
 .price-card { max-width:620px; margin-top:36px; padding:32px; border:1px solid #dfe3eb; border-radius:16px; background:#fff; box-shadow:0 16px 45px rgba(30,44,77,.06); }
 .price-value { font-size:30px; font-weight:750; letter-spacing:-.035em; }
 .price-value small { font-size:14px; font-weight:500; letter-spacing:0; color:#647086; }
@@ -3377,13 +3407,23 @@ html[data-theme="dark"] .github-signin-btn:active,
 .text-prompt::backdrop { background:rgba(0,0,0,.4); }
 
 /* Organization storage: usage bar, over-limit note and what uses the space. */
-.storage-location .progress { height: 4px; margin: 6px 0 2px; overflow: hidden; border-radius: 999px; background: var(--line); }
-.storage-location .progress > i { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
-.storage-location .progress.over > i { background: var(--danger); }
 .storage-over { color: var(--danger); }
-.storage-project { padding: 6px 0; border-top: 1px solid var(--line); }
-.storage-project .storage-item { padding-left: 14px; font-size: .92em; color: var(--ink-2); }
-.storage-project .storage-item > span:first-child { flex: 1; }
+/* What uses the space: one row per project (folded), its resources beneath;
+   sizes line up in one column. */
+.storage-contents { margin:4px 0 8px; border-top:1px solid var(--line); }
+.storage-project { border-bottom:1px solid var(--line); }
+.storage-project > summary, .storage-item { display:grid; grid-template-columns:minmax(0,1fr) 84px 132px; align-items:center; gap:10px; min-height:38px; }
+.storage-project > summary { cursor:pointer; font-weight:600; list-style:none; }
+.storage-project > summary::-webkit-details-marker { display:none; }
+.storage-project > summary .storage-item-name::before { content:'▸'; display:inline-block; width:14px; text-align:center; color:var(--ink-3); transition:transform .12s; transform-origin:50% 50%; }
+.storage-project[open] > summary .storage-item-name::before { transform:rotate(90deg); }
+.storage-project .storage-item { padding-left:14px; font-size:13px; color:var(--ink-2); min-height:34px; }
+.storage-other .storage-item { padding-left:0; }
+.storage-item-name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.storage-size { text-align:right; font-variant-numeric:tabular-nums; }
+.storage-item-action { display:flex; justify-content:flex-end; }
+.storage-bucket { font-size:12px; color:var(--ink-2); overflow-wrap:anywhere; }
+.storage-connect { margin-top:8px; }
 
 /* Installation → Service limits. One row per measure; every row shares the
    same columns so bars line up. The track is scored at 80% and 95%, where

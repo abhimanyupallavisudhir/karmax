@@ -34,7 +34,7 @@ import { addCheckoutViaExec } from './checkout.js';
 import { boundedResponseBody } from './http.js';
 import { sliceStream } from './file-prefix.js';
 import { serviceHomeLabel } from './services.js';
-import type { ResolvedWorldProviderConnection } from './connections.js';
+import { connectionScope, fundingRef, type ResolvedWorldProviderConnection } from './connections.js';
 import { provisionGitCredentials, provisionGitRepos, runOrThrow as provisionRun, type ProvisionTarget } from './provision-git.js';
 import { taskBranch } from '../domain/brand.js';
 import { isTransportError } from '../agent/limits.js';
@@ -271,8 +271,9 @@ export class E2BWorldProvider implements WorldProvider {
         repo: repos[0]?.repo,
         repos,
         ...(workdir ? { workdir } : {}),
-        sealedProviderRef: this.sealRef({ sandboxId: sandbox.sandboxId, ...(spec.organizationId ? { organizationId: spec.organizationId } : {}) }),
-        meta: { releaseOnCompletion: true, environmentFlavor: flavor,
+        sealedProviderRef: this.sealRef({ sandboxId: sandbox.sandboxId, ...(spec.organizationId ? { organizationId: spec.organizationId } : {}),
+          ...fundingRef(connection) }),
+        meta: { releaseOnCompletion: true, environmentFlavor: flavor, ...fundingRef(connection),
           ...(ephemeralPaths.length ? { ephemeralPaths } : {}),
           ...(selectedTemplate ? { environmentArtifact: selectedTemplate } : {}) },
         ...(warnings.length || sizeWarnings.length ? { warnings: [...warnings, ...sizeWarnings] } : {}),
@@ -461,7 +462,7 @@ export class E2BWorldProvider implements WorldProvider {
   private refOf(handle: WorldHandle): { sandboxId: string; organizationId?: string } {
     if (handle.sealedProviderRef) {
       const value = this.openRef(handle.sealedProviderRef);
-      if (value.sandboxId) return { sandboxId: value.sandboxId, organizationId: value.organizationId };
+      if (value.sandboxId) return { sandboxId: value.sandboxId, organizationId: connectionScope(value) };
     }
     throw new Error('invalid E2B world handle');
   }

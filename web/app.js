@@ -8,8 +8,11 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const esc = (s) =>
   String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
-// Organization storage page: the over-limit state of managed storage and what
-// uses it, with the clean-up an owner can do. `contents` is null without
+// Organization storage page: where data is kept and what uses the space.
+// Sizes are what is stored — every version of a resource deduplicated — so
+// the parts add up to the total the plan's limit counts (pramana's page once
+// added up every version's full size: 1.22 TB against 56 GB stored). The
+// limit itself is on Plan & billing. `contents` is null without
 // organization:edit.
 function storageOverQuotaMarkup(contents) {
   if (!contents?.overQuota) return '';
@@ -22,18 +25,47 @@ function storagePendingDeletionMarkup(contents) {
   const pending = contents?.pendingDeletion;
   if (!pending?.bytes) return '';
   const until = pending.until ? ` until ${new Date(pending.until).toLocaleDateString()}` : '';
-  return `<p class="task-sub storage-pending">+ ${formatBytes(pending.bytes)} being deleted ${policyTip(`Deleted data is kept${until} so it can be recovered, then removed. It doesn’t count toward your limit.`)}</p>`;
+  return `<span class="setting-muted storage-pending">+ ${formatBytes(pending.bytes)} being deleted ${policyTip(`Deleted data is kept${until} so it can be recovered, then removed. It doesn’t count toward your limit.`)}</span>`;
 }
 function storageContentsMarkup(contents) {
   const projects = (contents?.projects || []).filter((project) => project.bytes > 0);
-  if (!projects.length) return '';
+  if (!projects.length && !contents?.otherBytes) return '';
+  const versionsTip = contents?.policy?.olderVersionDays
+    ? ` Older versions are deleted ${contents.policy.olderVersionDays} days after a newer one replaces them, unless a task still uses them.` : '';
+  const item = (label, bytes, action = '', tip = '') => `<div class="storage-item"><span class="storage-item-name">${label}${tip ? ` ${policyTip(tip)}` : ''}</span><span class="storage-size">${formatBytes(bytes)}</span><span class="storage-item-action">${action}</span></div>`;
   const rows = projects.map((project) => {
-    const resources = project.resources.map((resource) => `<div class="member-row storage-item"><span>${esc(resource.name)}</span><span>${formatBytes(resource.currentBytes)}${resource.olderVersions ? ` · ${resource.olderVersions} older version${resource.olderVersions === 1 ? '' : 's'} ${formatBytes(resource.olderBytes)}${contents.policy?.olderVersionDays ? ` ${policyTip(`Deleted ${contents.policy.olderVersionDays} days after a newer version replaces them, unless a task still uses them.`)}` : ''}` : ''}${resource.taskCopies ? ` · task copies ${formatBytes(resource.taskCopyBytes)}` : ''}</span>${resource.olderVersions ? `<button class="btn sm" data-older-versions="${esc(resource.id)}">Delete older versions</button>` : ''}</div>`).join('');
-    const workspaces = project.checkpoints.count ? `<div class="member-row storage-item"><span>Saved task workspaces ${policyTip(`Uncommitted files of parked tasks. A finished task's are deleted ${contents.policy.finishedTaskCheckpointDays} days after it ends.`)}</span><span>${formatBytes(project.checkpoints.bytes)}</span>${project.checkpoints.finishedCount ? `<button class="btn sm" data-finished-workspaces="${esc(project.projectId)}">Delete finished (${formatBytes(project.checkpoints.finishedBytes)})</button>` : ''}</div>` : '';
-    const artifacts = project.artifacts.count ? `<div class="member-row storage-item"><span>Review files ${policyTip('Files attached to reviews. They are deleted automatically when they expire.')}</span><span>${formatBytes(project.artifacts.bytes)}</span></div>` : '';
-    return `<div class="storage-project"><div class="member-row"><b>${esc(project.name)}</b><span>${formatBytes(project.bytes)}</span></div>${resources}${workspaces}${artifacts}</div>`;
+    const resources = project.resources.map((resource) => {
+      const versions = resource.olderVersions + 1;
+      const label = `${esc(resource.name)}<span class="setting-muted"> · ${versions} version${versions === 1 ? '' : 's'}</span>`;
+      const tip = `Current version ${formatBytes(resource.currentBytes)}. Versions share unchanged files, so this is what all ${versions} take together.${resource.taskCopies ? ` Includes ${resource.taskCopies} unsaved task cop${resource.taskCopies === 1 ? 'y' : 'ies'}.` : ''}${versionsTip}`;
+      return item(label, resource.bytes, resource.olderVersions ? `<button class="btn sm ghost" data-older-versions="${esc(resource.id)}">Delete older</button>` : '', tip);
+    }).join('');
+    const workspaces = project.checkpoints.count ? item('Task workspaces', project.checkpoints.bytes,
+      project.checkpoints.finishedCount ? `<button class="btn sm ghost" data-finished-workspaces="${esc(project.projectId)}" title="Delete the workspaces of finished tasks (${formatBytes(project.checkpoints.finishedBytes)})">Delete finished</button>` : '',
+      `Uncommitted files of paused tasks. A finished task’s are deleted ${contents.policy.finishedTaskCheckpointDays} days after it ends.`) : '';
+    const artifacts = project.artifacts.count ? item('Review files', project.artifacts.bytes, '', 'Files attached to reviews. They are deleted when they expire.') : '';
+    return `<details class="storage-project"><summary><span class="storage-item-name">${esc(project.name)}</span><span class="storage-size">${formatBytes(project.bytes)}</span><span class="storage-item-action"></span></summary>${resources}${workspaces}${artifacts}</details>`;
   }).join('');
-  return `<details class="settings-disclosure compact"><summary><b>What's using space</b> ${policyTip('Sizes before sharing: versions share unchanged files, so deleting one frees only what is unique to it.')}</summary>${rows}</details>`;
+  const other = contents.otherBytes ? `<div class="storage-project storage-other">${item('Other', contents.otherBytes, '', 'Data saved before each resource had its own store. It goes as those versions are converted or deleted.')}</div>` : '';
+  return `<div class="storage-contents">${rows}${other}</div>`;
+}
+function storageSectionMarkup(locations, contents, organizationId) {
+  const managed = locations.find((location) => location.kind === 'managed');
+  const own = locations.filter((location) => location.kind !== 'managed');
+  const managedRow = managed ? `<div class="setting-row storage-location" data-storage="${esc(managed.id)}"><span class="setting-label">${esc(siteName())} ${policyTip(`Encrypted and versioned in ${siteName()}’s storage. Its limit is in Plan & billing.`)}</span>
+    <span class="setting-value"><b>${formatBytes(managed.usage?.retainedBytes || 0)}</b><span class="setting-muted">stored</span>${storagePendingDeletionMarkup(contents)}${managed.isDefault && own.length ? '<span class="chip">default</span>' : ''}</span>
+    <span class="setting-actions">${!managed.isDefault && managed.status === 'ready' ? '<button class="btn sm storage-default">Make default</button>' : ''}</span></div>` : '';
+  const ownRows = own.map((location) => `<div class="setting-row storage-location" data-storage="${esc(location.id)}"><span class="setting-label">${esc(location.name)}</span>
+    <span class="setting-value"><span class="mono storage-bucket">${esc(location.config?.bucket || '')}${location.config?.prefix ? `/${esc(location.config.prefix)}` : ''}</span>${location.isDefault ? '<span class="chip">default</span>' : ''}${location.lastError ? `<span class="chip failed" title="${esc(location.lastError)}">failing</span>` : ''}</span>
+    <span class="setting-actions">${!location.isDefault && location.status === 'ready' ? '<button class="btn sm storage-default">Make default</button>' : ''}<button class="btn sm storage-test">Test</button><button class="icon-btn storage-delete" aria-label="Remove ${esc(location.name)}" title="Remove">${trashIcon()}</button></span></div>`).join('');
+  return `<div class="setting-rows">${managedRow}</div>${storageOverQuotaMarkup(contents)}${storageContentsMarkup(contents)}
+    <div class="setting-rows">${ownRows}</div>
+    <details class="settings-disclosure compact storage-connect"><summary><b>Connect your own bucket ${policyTip('Any S3-compatible bucket. Data there isn’t counted toward your plan and keeps every version. Use a key restricted to the prefix; it is encrypted and never shown again.')}</b></summary><div class="settings-grid">
+      <label class="form-row">Name<input id="storage-name" placeholder="Production data"></label><label class="form-row">Endpoint<input id="storage-endpoint" placeholder="https://s3.amazonaws.com"></label>
+      <label class="form-row">Bucket<input id="storage-bucket" placeholder="company-data"></label><label class="form-row">Region<input id="storage-region" value="us-east-1"></label>
+      <label class="form-row">Prefix<input id="storage-prefix" value="tavya/${esc(organizationId)}"></label><label class="form-row">Access key ID<input id="storage-access-key" autocomplete="off"></label>
+      <label class="form-row">Secret access key<input id="storage-secret-key" type="password" autocomplete="new-password"></label></div>
+      <button class="btn sm primary" id="storage-connect">Connect</button></details>`;
 }
 
 function formatBytes(value) {
@@ -20950,6 +20982,7 @@ function inboxRowLabel(item) {
   if (item.subject?.kind === 'avatar-authorization') return 'Avatar authorization approval';
   if (item.subject?.kind === 'service-limit') return item.subject.level === 'failed' ? `Can’t read ${item.subject.serviceName} usage`
     : `${item.subject.serviceName} at ${Math.floor((item.subject.used / item.subject.limit) * 100)}% of its limit${item.subject.level === 95 ? ' — upgrade now' : ''}`;
+  if (item.subject?.kind === 'compute') return `Out of compute — renews ${new Date(item.subject.renewsAt).toLocaleDateString()}`;
   if (item.subject?.kind === 'storage') return item.subject.stage === 'deleted'
     ? 'Stored data deleted to fit the limit'
     : `Over the storage limit — free space by ${new Date(item.subject.deleteAt).toLocaleDateString()}`;
@@ -20964,6 +20997,7 @@ function inboxRowLabel(item) {
 function inboxTitle(item, fallback = item.kind) {
   if (item.subject?.kind === 'credential') return `${item.subject.provider}:${item.subject.account}`;
   if (item.subject?.kind === 'storage') return `Storage · ${formatBytes(item.subject.retainedBytes)} of ${formatBytes(item.subject.quotaBytes)}`;
+  if (item.subject?.kind === 'compute') return `Compute · $${(item.subject.usedMicros / 1e6).toFixed(2)} of $${(item.subject.creditMicros / 1e6).toFixed(2)}`;
   if (item.subject?.kind === 'service-limit') return item.subject.level === 'failed' ? `${item.subject.serviceName} · ${item.subject.error}`
     : `${item.subject.serviceName} · ${item.subject.label} ${limitAmount(item.subject.used, item.subject.unit)} of ${limitAmount(item.subject.limit, item.subject.unit, true)}`;
   return item.task?.title || item.resource?.name || fallback;
@@ -21191,6 +21225,7 @@ function markInboxItemRead(item) {
 function inboxItemRoute(item) {
   if (item?.subject?.kind === 'credential') return `${globalRoute('organization', organizationById(item.organizationId))}#settings-agents`;
   if (item?.subject?.kind === 'storage') return `${globalRoute('organization', organizationById(item.organizationId))}#settings-storage`;
+  if (item?.subject?.kind === 'compute') return `${globalRoute('organization', organizationById(item.organizationId))}#settings-plan`;
   if (item?.subject?.kind === 'service-limit') return `${installationRoute()}#installation-limits`;
   if (item?.subject?.kind === 'avatar-authorization') {
     const project = projectById(item.subject.projectId);
@@ -22112,7 +22147,7 @@ function installationView() {
   return `<div class="organization-settings installation-settings"><div class="settings-header"><h1 class="page-title">Installation ${policyTip(`Settings for every organization and the machine running ${siteName()}. Only operators see them.`)}</h1></div>
   <div class="settings-layout">
     <nav class="settings-nav" aria-label="Installation settings sections"><span>Installation</span>
-      <a href="#installation-appearance">Appearance</a><a href="#installation-health">Health</a><a href="#installation-limits">Service limits</a><a href="#installation-capacity">Host capacity</a>
+      <a href="#installation-appearance">Appearance</a><a href="#installation-health">Health</a><a href="#installation-limits">Service limits</a><a href="#installation-compute">Managed compute</a><a href="#installation-capacity">Host capacity</a>
       <a href="#installation-github">GitHub</a><a href="#installation-composio">Composio</a><a href="#installation-paid-launch">Paid launch</a><a href="#installation-stripe">Agent cards</a><a href="#installation-email">Email</a>
       <a href="#installation-access">Phone access</a>${S.meta.hosted ? '<a href="#installation-users">Users</a>' : ''}
     </nav><div class="settings-content">
@@ -22122,6 +22157,8 @@ function installationView() {
       <div id="proc-panel" style="margin-top:12px"><div class="card" style="color:var(--ink-3)">Loading…</div></div>
       <div class="settings-section-title" id="installation-limits"><div>Service limits ${policyTip(`Shared accounts and this server against their plans`)}</div></div>
       <div class="card service-limits" id="service-limits-card"><span class="task-sub">Loading…</span></div>
+      <div class="settings-section-title" id="installation-compute"><div>Managed compute ${policyTip(`${siteName()}’s own provider accounts. Organizations without their own account run on them, charged to their plan’s monthly compute at twice the provider’s price.`)}</div></div>
+      <div class="card" id="managed-compute-card"><span class="task-sub">Loading…</span></div>
       <div class="settings-section-title" id="installation-capacity"><div>Host capacity ${policyTip(`Admission limits shared by all agent work`)}</div></div>${hostCapacityCard()}
       <div class="settings-section-title" id="installation-github"><div>GitHub ${policyTip(`GitHub App for repository access`)}</div></div>${installationGithubCard()}
       <div class="settings-section-title" id="installation-composio"><div>Composio ${policyTip(`App connection setup shared by every organization`)}</div></div><div class="card" id="installation-composio-card">Loading Composio setup…</div>
@@ -22134,214 +22171,252 @@ function installationView() {
   </div></div>`;
 }
 
+// ── Managed compute (Installation) ───────────────────────────────────────────
+// One row per provider: whether organizations are offered it, how many of its
+// machines run now against the account's limit, and this month's provider cost
+// against what organizations were charged.
+function managedComputeMarkup(view) {
+  const money = (micros) => `$${(Number(micros || 0) / 1e6).toFixed(2)}`;
+  const rows = Object.entries(COMPUTER_PROVIDERS).map(([id, info]) => {
+    const account = (view.providers || []).find((candidate) => candidate.provider === id);
+    const state = !account ? null : !account.enabled ? ['Off', ''] : account.status === 'error' ? ['Failing', 'failed'] : ['On', 'done'];
+    const hours = account ? Math.round(account.seconds / 360) / 10 : 0;
+    return `<div class="computer-provider" data-provider="${id}"><b>${esc(info.name)}</b>
+      ${state ? `<span class="chip ${state[1]}"${account.lastError ? ` title="${esc(account.lastError)}"` : ''}>${state[0]}</span>` : ''}
+      ${account ? `<span class="setting-muted" title="Machines running now${account.config?.maxRunning ? ', of the account’s limit' : ''}">${account.running}${account.config?.maxRunning ? ` of ${account.config.maxRunning}` : ''} running</span>
+        <span class="setting-muted managed-month" title="${esc(`This month: ${hours} machine-hours for ${account.organizations} organization${account.organizations === 1 ? '' : 's'}. The provider’s price, then what organizations were charged.`)}">${money(account.costMicros)} → ${money(account.chargedMicros)}</span>` : ''}
+      <span class="label-row-fill"></span>
+      ${account ? `<button class="icon-btn computer-edit" type="button" title="Edit ${esc(info.name)}" aria-label="Edit ${esc(info.name)}">✎</button><button class="btn sm computer-test" type="button">Test</button>`
+        : `<button class="btn sm computer-connect" type="button">Connect</button>`}</div>`;
+  }).join('');
+  return `<div class="computer-providers">${rows}</div>`;
+}
+async function wireManagedComputeCard() {
+  const card = $('#managed-compute-card');
+  if (!card) return;
+  let view;
+  try { view = await api('/api/settings/managed-compute'); }
+  catch (error) { if (card.isConnected) paneError(card, error, () => wireManagedComputeCard()); return; }
+  if (!card.isConnected) return;
+  card.innerHTML = managedComputeMarkup(view);
+  card.querySelectorAll('.computer-provider').forEach((row) => {
+    const provider = row.dataset.provider;
+    const account = (view.providers || []).find((candidate) => candidate.provider === provider);
+    const open = () => openComputerDialog(provider, account, null, wireManagedComputeCard, { managed: true });
+    row.querySelector('.computer-edit')?.addEventListener('click', open);
+    row.querySelector('.computer-connect')?.addEventListener('click', open);
+    row.querySelector('.computer-test')?.addEventListener('click', async (event) => {
+      event.currentTarget.disabled = true;
+      try { await api(`/api/settings/managed-compute/${provider}/test`, { method: 'POST', body: '{}' }); toast(`${COMPUTER_PROVIDERS[provider].name} works`); }
+      catch (error) { toast(error.message, true); }
+      await wireManagedComputeCard();
+    });
+  });
+}
+
 function billingRequestKey() {
   try { return crypto.randomUUID(); } catch { return `billing-${Date.now()}-${Math.random().toString(36).slice(2)}`; }
 }
 
-async function hydrateOrganizationSubscription(organizationId) {
-  const box = $('#org-subscription');
-  if (!box) return;
-  let state;
-  try { state = await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/status`); }
-  catch (error) { box.innerHTML = `<p class="task-sub" style="color:var(--danger)">${esc(error.message)}</p>`; return; }
-  if (!$('#org-subscription') || S.organizationId !== organizationId) return;
-  // A private installation has no hosted subscription to show.
-  if (!state.managed) {
-    box.hidden = true;
-    const heading = $('#settings-billing');
-    if (heading) heading.hidden = true;
-    return;
+// ── Plan & billing (Organization settings) ───────────────────────────────────
+// One card: the plan and what it costs, then each limit against its use —
+// people, agents at once, storage, compute — with the packs that raise a limit
+// beside it. A Free organization chooses a plan below; the operator's gifts are
+// folded away. `e` is GET …/entitlements, `state` GET …/subscription/status
+// (null on a private installation or when billing is unavailable).
+const PLAN_ACTIVE = ['active', 'trialing', 'past_due'];
+function planMoney(cents) {
+  const value = Number(cents || 0) / 100;
+  return `$${Number.isInteger(value) ? value : value.toFixed(2)}`;
+}
+function planDollars(micros) { return `$${(Number(micros || 0) / 1e6).toFixed(2)}`; }
+function planMeter(used, limit) {
+  if (!limit) return '';
+  const pct = Math.min(100, (Number(used) || 0) / limit * 100);
+  return `<span class="plan-meter${pct >= 100 ? ' over' : pct >= 80 ? ' near' : ''}" role="meter" aria-valuemin="0" aria-valuemax="${esc(limit)}" aria-valuenow="${esc(Math.min(Number(used) || 0, limit))}"><i style="width:${pct.toFixed(1)}%"></i></span>`;
+}
+function planStepper(kind, count, title) {
+  return `<span class="pack-stepper" title="${esc(title)}"><button class="icon-btn billing-packs" data-kind="${kind}" data-packs="${count - 1}" aria-label="Remove a ${kind} pack" ${count > 0 ? '' : 'disabled'}>−</button>`
+    + `<b>${count}</b><button class="icon-btn billing-packs" data-kind="${kind}" data-packs="${count + 1}" aria-label="Add a ${kind} pack">+</button><span class="setting-muted">pack${count === 1 ? '' : 's'}</span></span>`;
+}
+function planBillingMarkup(e, state) {
+  if (!e) return '<span class="task-sub">Plan information is temporarily unavailable.</span>';
+  if (e.deployment === 'private') return `<div class="setting-rows"><div class="setting-row"><span class="setting-label">Plan</span>
+    <span class="setting-value"><b>Private installation</b> ${policyTip('Hosted plan limits don’t apply. Users, projects and agents are limited only by this installation’s capacity.')}</span></div></div>`;
+  const plural = (count, word) => `${count} ${word}${count === 1 ? '' : 's'}`;
+  const day = (ms) => new Date(ms).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  const catalog = Object.fromEntries((state?.catalog || []).map((plan) => [plan.id, plan]));
+  const billed = state?.billedPlan || e.plan;
+  const subscribed = Boolean(state) && billed !== 'free' && !['none', 'canceled', 'incomplete_expired'].includes(state.status);
+  const paying = subscribed && PLAN_ACTIVE.includes(state.status);
+  const owner = Boolean(state?.canManage);
+  const busy = state?.pendingRequest;
+  const disabled = !owner ? 'disabled title="Only an organization owner can change the plan"' : busy ? 'disabled title="Wait for the pending billing request"' : '';
+  // Header: the plan, its state when it isn't plainly active, and its price.
+  const statusChip = state?.gift && !subscribed ? 'Gifted'
+    : state?.cancelAtPeriodEnd && state.currentPeriodEnd ? `Ends ${day(state.currentPeriodEnd)}`
+    : ({ past_due: 'Payment failed', unpaid: 'Unpaid', paused: 'Paused', incomplete: 'Checkout incomplete', trialing: 'Trial' })[state?.status] || '';
+  const price = (state?.gift && !subscribed) || e.plan === 'free' ? '' : `${planMoney(e.currentMonthlyPriceCents)}/month`;
+  const renews = paying && !state.cancelAtPeriodEnd && state.currentPeriodEnd ? ` · renews ${day(state.currentPeriodEnd)}` : '';
+  const change = paying && billed === 'individual' ? `<button class="btn sm billing-change" data-plan="team" ${disabled}>Upgrade to Team</button>`
+    : paying && billed === 'team' ? `<button class="btn sm billing-change" data-plan="individual" ${disabled || (e.activeUsers > 1 ? 'disabled title="Remove other members first"' : '')}>Switch to Individual</button>` : '';
+  const head = `<div class="plan-head"><span class="plan-name">${esc(e.planName)}</span>${statusChip ? `<span class="chip${state?.status === 'past_due' || state?.status === 'unpaid' ? ' failed' : ''}">${esc(statusChip)}</span>` : ''}
+    <span class="setting-muted plan-price">${esc(price + renews)}</span><span class="label-row-fill"></span>
+    ${change}${subscribed ? `<button class="btn sm billing-portal" ${owner ? '' : disabled} title="Payment method and invoices">Billing</button>` : ''}
+    ${paying && !state.cancelAtPeriodEnd ? `<button class="btn sm ghost billing-cancel" ${owner ? '' : disabled}>Cancel plan</button>` : ''}</div>`;
+  // People.
+  const members = Number(e.currentMemberCount ?? e.activeUsers ?? 0);
+  const people = e.maxMembers != null ? `${members} of ${e.maxMembers}` : `${members} ${members === 1 ? 'person' : 'people'}`;
+  const seatTip = e.plan === 'team' ? `First person included, then ${planMoney(e.monthlyAdditionalActiveUserPriceCents)}/month each.` : '';
+  const seatsPending = state?.seatDeficit && billed === 'team'
+    ? `<span class="warn">${plural(state.seatDeficit, 'seat')} not yet billed</span>` : '';
+  const peopleRow = `<div class="setting-row"><span class="setting-label">People${seatTip ? ` ${policyTip(seatTip)}` : ''}</span>
+    <span class="setting-value"><b>${esc(people)}</b>${e.overMemberLimit ? '<span class="warn">over the limit: agents are paused</span>' : ''}${seatsPending}</span>
+    ${seatsPending ? `<span class="setting-actions"><button class="btn sm billing-sync" ${disabled}>Bill seats</button></span>` : ''}</div>`;
+  // Agents at once.
+  const running = Number(e.activeAgentRuns || 0), waiting = Number(e.queuedAgentRuns || 0);
+  const agentsRow = `<div class="setting-row"><span class="setting-label">Agents ${policyTip('How many agents can work at the same time. More wait in line until one finishes.')}</span>
+    <span class="setting-value"><b>${esc(e.maxActiveAgentRuns)} at once</b>${running || waiting ? `<span class="setting-muted">${running} working${waiting ? `, ${waiting} waiting` : ''}</span>` : ''}</span></div>`;
+  // Storage: used of the quota, the plan's share and the packs in the tooltip.
+  const storagePack = state?.storagePack || { bytes: e.storagePackBytes, monthlyPriceCents: 400 };
+  const storageParts = [`${formatBytes(e.includedStorageBytes)} with ${e.planName}`,
+    e.storagePacks ? `${formatBytes(e.storagePacks * e.storagePackBytes)} in ${plural(e.storagePacks, 'pack')}` : '',
+    e.giftedStoragePacks ? `${formatBytes(e.giftedStoragePacks * e.storagePackBytes)} gifted` : ''].filter(Boolean).join(' + ');
+  const canStorage = paying && owner && state?.storagePack?.available;
+  const storageRow = `<div class="setting-row plan-limit" data-limit="storage"><span class="setting-label">Storage ${policyTip(`Project data, saved task workspaces and review files. ${storageParts}.`)}</span>
+    <span class="setting-value">${planMeter(e.storageUsedBytes, e.storageQuotaBytes)}<span><b>${esc(formatBytes(e.storageUsedBytes ?? 0))}</b> <span class="setting-muted">of ${esc(formatBytes(e.storageQuotaBytes))}</span></span></span>
+    ${canStorage ? `<span class="setting-actions">${planStepper('storage', Number(state.storagePacks || 0), `Each pack adds ${formatBytes(storagePack.bytes)} for ${planMoney(storagePack.monthlyPriceCents)}/month`)}</span>` : ''}</div>`;
+  // Compute: only where the installation runs computers itself.
+  let computeRow = '';
+  if (e.compute) {
+    const credit = Number(e.computeCreditMicros || 0);
+    const pack = state?.computePack || { creditMicros: e.computePackCreditMicros, monthlyPriceCents: 1000 };
+    const providers = (e.compute.providers || []).map((id) => COMPUTER_PROVIDERS[id]?.name || id).join(', ');
+    const parts = [`${planDollars(e.includedComputeCreditMicros)} with ${e.planName}`,
+      e.computePacks ? `${planDollars(e.computePacks * e.computePackCreditMicros)} in ${plural(e.computePacks, 'pack')}` : '',
+      e.giftedComputePacks ? `${planDollars(e.giftedComputePacks * e.computePackCreditMicros)} gifted` : ''].filter(Boolean).join(' + ');
+    const tip = `Cloud computers ${siteName()} runs for you (${providers}), at twice the provider’s price: a 2 CPU · 2 GB E2B computer is about $0.27 an hour. Resets ${day(e.compute.to)}. Computers on your own provider accounts aren’t counted. ${credit ? `${parts}.` : ''}`;
+    const canCompute = paying && owner && state?.computePack?.available;
+    computeRow = `<div class="setting-row plan-limit" data-limit="compute"><span class="setting-label">Compute ${policyTip(tip.trim())}</span>
+      <span class="setting-value">${credit ? `${planMeter(e.compute.usedMicros, credit)}<span><b>${esc(planDollars(e.compute.usedMicros))}</b> <span class="setting-muted">of ${esc(planDollars(credit))} this month</span></span>`
+        : '<span class="setting-muted">With a paid plan</span>'}</span>
+      ${canCompute ? `<span class="setting-actions">${planStepper('compute', Number(state.computePacks || 0), `Each pack adds ${planDollars(pack.creditMicros)} of compute a month for ${planMoney(pack.monthlyPriceCents)}/month`)}</span>` : ''}</div>`;
   }
-  box.hidden = false;
-  if ($('#settings-billing')) $('#settings-billing').hidden = false;
-  const catalog = Object.fromEntries((state.catalog || []).map((plan) => [plan.id, plan]));
-  const names = Object.fromEntries(Object.values(catalog).map((plan) => [plan.id, plan.name]));
-  const price = (cents) => `$${(Number(cents || 0) / 100).toLocaleString(undefined,
-    { minimumFractionDigits: 0, maximumFractionDigits: 2 })}`;
-  const statusNames = { none: 'free', active: 'active', trialing: 'trial', past_due: 'payment failed',
-    unpaid: 'unpaid', incomplete: 'checkout incomplete', incomplete_expired: 'checkout expired',
-    paused: 'paused', canceled: 'canceled' };
-  const problem = ['past_due', 'unpaid', 'incomplete', 'incomplete_expired', 'paused'].includes(state.status);
-  const period = state.currentPeriodEnd ? new Date(state.currentPeriodEnd).toLocaleDateString() : '';
-  const billedPlan = state.billedPlan || state.plan;
-  const hasSubscription = billedPlan !== 'free' && !['none', 'canceled', 'incomplete_expired'].includes(state.status);
-  const seats = state.gift?.plan === 'team' && !hasSubscription
-    ? `<b>${state.activeUsers}</b> active user${state.activeUsers === 1 ? '' : 's'}`
-    : billedPlan === 'team'
-    ? `<b>${state.activeUsers}</b> active user${state.activeUsers === 1 ? '' : 's'} · <b>${state.seats}</b> verified billed seat${state.seats === 1 ? '' : 's'}${state.seatDeficit ? ` · <span style="color:var(--danger)">${state.seatDeficit} awaiting reconciliation</span>` : ''}`
-    : `<b>${state.activeUsers}</b> of 1 user`;
-  const grace = state.access === 'grace' && state.graceEndsAt
-    ? ` Access continues through ${new Date(state.graceEndsAt).toLocaleDateString()}.` : '';
-  const checkoutReturn = new URLSearchParams(location.search).get('billing');
-  const checkoutNotice = checkoutReturn === 'success'
-    ? '<div class="card" style="margin:12px 0;padding:12px;border-color:var(--ok,#4ec9a3)"><b>Checkout completed</b><p class="task-sub">Waiting for the billing provider’s signed subscription confirmation. This page will show the new plan after reconciliation.</p></div>'
-    : checkoutReturn === 'canceled'
-      ? '<div class="card" style="margin:12px 0;padding:12px"><b>Checkout canceled</b><p class="task-sub">No plan change was applied.</p></div>' : '';
-  const alert = problem ? `<div class="card" style="margin:12px 0;padding:12px;border-color:var(--danger)"><b>Billing needs attention</b><p class="task-sub">${esc(state.lastError || 'Open the billing portal to update the payment method. Plan access may be restricted until payment is confirmed.')}${esc(grace)}</p></div>` : '';
-  const individual = catalog.individual || {};
-  const team = catalog.team || {};
-  const ownerDisabled = state.canManage ? '' : 'disabled title="Only an organization owner can administer this subscription"';
-  const checkoutReady = state.providerConfigured && S.launch?.paidLaunch && S.launch?.ready;
-  const teamTotal = Number(team.monthlyBasePriceCents || 0)
-    + Math.max(0, Number(state.activeUsers || 0) - Number(team.includedActiveUsers || 1))
-      * Number(team.monthlyAdditionalActiveUserPriceCents || 0);
-  const teamConcurrency = Number(team.maxActiveAgentRuns || 0)
-    + Math.max(0, Number(state.activeUsers || 0) - Number(team.includedActiveUsers || 1))
-      * Number(team.additionalActiveUserAgentRuns || 0);
-  const pack = state.storagePack || {};
-  const packs = Number(state.storagePacks || 0);
-  const giftedPacks = Number(state.giftedStoragePacks || 0);
-  const packOffer = pack.available ? ` Add ${esc(formatBytes(pack.bytes))} storage packs for ${esc(price(pack.monthlyPriceCents))}/month each.` : '';
-  const disclosures = S.launch?.checkoutDisclosures || {};
-  const planCards = !hasSubscription && !state.gift ? `<div class="billing-commercial-terms">
-      <b>Before checkout</b><p class="task-sub">${esc(disclosures.renewalDisclosure || 'Subscriptions renew monthly until canceled.')} ${esc(disclosures.cancellationDisclosure || 'Cancel online from Organization settings before renewal.')} ${esc(disclosures.refundDisclosure || 'Payments are non-refundable except where law requires.')}</p>
-      ${policyAcceptanceMarkup('checkout', 'checkout-policy-acceptance')}</div>
-    <div class="settings-grid" style="margin-top:14px">
-      <div class="card" style="padding:14px"><b>${esc(individual.name || 'Individual')}</b><div class="section-h" style="margin-top:6px">${esc(price(individual.monthlyBasePriceCents))} / month</div><p class="task-sub">${esc(individual.includedActiveUsers || 1)} user · unlimited projects · ${esc(individual.maxActiveAgentRuns)} shared concurrent agent runs · ${esc(formatBytes(individual.storageBytes))} storage.${packOffer}</p><button class="btn sm primary billing-checkout" data-plan="individual" ${checkoutReady ? ownerDisabled : 'disabled'}>Choose Individual</button></div>
-      <div class="card" style="padding:14px"><b>${esc(team.name || 'Team')}</b><div class="section-h" style="margin-top:6px">${esc(price(team.monthlyBasePriceCents))} / month</div><p class="task-sub">First active user included, then ${esc(price(team.monthlyAdditionalActiveUserPriceCents))} / additional active user / month. With ${esc(state.activeUsers)} active user${state.activeUsers === 1 ? '' : 's'}: ${esc(price(teamTotal))} / month and ${esc(teamConcurrency)} shared concurrent agent runs. Unlimited projects · ${esc(team.maxActiveAgentRuns)} base concurrency + ${esc(team.additionalActiveUserAgentRuns)} per additional active user · ${esc(formatBytes(team.storageBytes))} storage + ${esc(formatBytes(team.additionalActiveUserStorageBytes))} per additional active user.${packOffer}</p><button class="btn sm primary billing-checkout" data-plan="team" ${checkoutReady ? ownerDisabled : 'disabled'}>Choose Team</button></div>
-      <div class="card" style="padding:14px"><b>Enterprise</b><p class="task-sub">Custom deployment and support. Not available as a self-service launch plan.</p></div></div>` : '';
-  const downgradeDisabled = ownerDisabled || (state.activeUsers > 1
-    ? 'disabled title="Remove additional active users first"' : '');
-  const changes = billedPlan === 'individual' && ['active', 'trialing', 'past_due'].includes(state.status)
-    ? `<button class="btn sm billing-change" data-plan="team" ${ownerDisabled}>Upgrade to Team</button>`
-    : billedPlan === 'team' && ['active', 'trialing', 'past_due'].includes(state.status)
-      ? `<button class="btn sm billing-change" data-plan="individual" ${downgradeDisabled}>Downgrade to Individual</button>` : '';
-  const giftControls = state.canGift ? `<div class="inline-form" style="margin-top:14px">
-    <label for="billing-gift-plan">Gift subscription</label>
-    <select id="billing-gift-plan" aria-label="Gift subscription">${Object.values(catalog).filter(plan => plan.id !== 'free').map(plan => `<option value="${esc(plan.id)}" ${state.gift?.plan === plan.id ? 'selected' : ''}>${esc(plan.name)}</option>`).join('')}</select>
-    <button class="btn sm billing-gift" title="Complimentary access until removed. Existing paid billing continues.">${state.gift ? 'Update gift' : 'Gift'}</button>
-    ${state.gift ? '<button class="btn sm billing-gift-remove">Remove gift</button>' : ''}</div>
-    <div class="inline-form" style="margin-top:8px">
-    <label for="billing-gift-packs">Gift storage packs</label>
-    <input id="billing-gift-packs" type="number" min="0" max="1000" step="1" value="${esc(giftedPacks)}" style="flex:0 0 6em;width:6em">
-    <button class="btn sm billing-gift-packs" title="Each pack adds ${esc(formatBytes(pack.bytes || 0))} on any plan until removed. Nothing is billed.">Gift packs</button>
-    ${giftedPacks ? '<button class="btn sm billing-gift-packs-remove">Remove gifted packs</button>' : ''}</div>` : '';
-  const packBusy = ownerDisabled || (state.pendingRequest ? 'disabled title="Wait for the pending billing request"' : '');
-  const storagePacks = hasSubscription && pack.available && ['active', 'trialing', 'past_due'].includes(state.status)
-    ? `<div class="member-row"><span>Storage packs ${policyTip(`Each pack adds ${formatBytes(pack.bytes)} of storage for ${price(pack.monthlyPriceCents)}/month, prorated on your next bill. Packs end with the subscription.`)}</span>
-      <span class="team-actions"><button class="btn sm billing-packs" data-packs="${packs - 1}" aria-label="Remove a storage pack" ${packs > 0 ? packBusy : 'disabled'}>−</button><b>${packs}</b><button class="btn sm billing-packs" data-packs="${packs + 1}" aria-label="Add a storage pack" ${state.status === 'past_due' ? 'disabled title="Update the payment method first"' : packBusy}>+</button>
-      <span class="task-sub">${packs ? `${esc(price(packs * pack.monthlyPriceCents))}/month` : `${esc(price(pack.monthlyPriceCents))}/month each`}</span></span></div>` : '';
-  const giftNotice = state.gift && hasSubscription ? `<div class="member-row"><span><b>${esc(names[state.gift.plan])}</b> <span class="chip">Gifted · no expiry</span></span></div>` : '';
-  const packsOnPaidPlan = !hasSubscription && state.gift && pack.available
-    ? `<div class="member-row"><span>Storage packs ${policyTip(`Packs of ${formatBytes(pack.bytes)} for ${price(pack.monthlyPriceCents)}/month are added to a paid subscription.`)}</span><span class="task-sub">With a paid plan</span></div>` : '';
-  const giftedPacksNotice = giftedPacks ? `<div class="member-row"><span><b>${esc(giftedPacks)} gifted storage pack${giftedPacks === 1 ? '' : 's'}</b> <span class="chip">Gifted · no expiry</span></span><span class="task-sub">+${esc(formatBytes(giftedPacks * Number(pack.bytes || 0)))}</span></div>` : '';
-  const effective = hasSubscription && state.plan !== billedPlan ? ` · effective access: ${esc(names[state.plan] || state.plan)}` : '';
-  box.innerHTML = `<div class="member-row"><span><span class="section-h">${esc(names[hasSubscription ? billedPlan : state.plan] || state.plan)} <span class="chip">${esc(state.gift && !hasSubscription ? 'Gifted · no expiry' : statusNames[state.status] || state.status)}</span></span><span class="task-sub">${seats}${effective}</span></span>
-    <span class="team-actions">${state.cancelAtPeriodEnd ? `<span class="chip">ends ${esc(period || 'after this period')}</span>` : period ? `<span class="task-sub">Renews ${esc(period)}</span>` : ''}</span></div>
-    ${storagePacks}${packsOnPaidPlan}${giftNotice}${giftedPacksNotice}${giftControls}${state.gift && hasSubscription ? '<p class="task-sub">Existing paid billing continues. Manage it in the billing portal.</p>' : ''}${checkoutNotice}${alert}${!state.gift && !state.providerConfigured ? '<p class="task-sub" style="color:var(--warn)">Checkout is temporarily unavailable because hosted billing has not been configured by the operator.</p>' : ''}${!state.gift && state.providerConfigured && !checkoutReady ? '<p class="task-sub" style="color:var(--warn)">Checkout is disabled until the operator completes and enables the founder-reviewed paid-launch configuration.</p>' : ''}${!state.canManage && !state.canGift && !state.gift ? '<p class="task-sub">Only an organization owner can administer this subscription.</p>' : ''}
-    ${planCards}<div class="inline-form" style="margin-top:14px">${changes}${hasSubscription ? `<button class="btn sm billing-portal" ${ownerDisabled}>Billing portal</button>` : ''}${hasSubscription && !state.cancelAtPeriodEnd && ['active', 'trialing', 'past_due'].includes(state.status) ? `<button class="btn sm danger billing-cancel" ${ownerDisabled}>Cancel online at period end</button>` : ''}${state.seatDeficit && billedPlan === 'team' ? `<button class="btn sm billing-sync" ${ownerDisabled}>Reconcile seats</button>` : ''}</div>
-    ${state.pendingRequest ? `<p class="task-sub">A billing request is pending confirmation. Wait a minute, then check its result before retrying. <button class="btn sm billing-reconcile" ${ownerDisabled}>Check pending billing request</button></p>` : ''}
-    ${state.pendingCheckout && !hasSubscription ? `<p class="task-sub">An unpaid checkout is open. <button class="btn sm billing-cancel-checkout" ${ownerDisabled}>Cancel pending checkout</button></p>` : ''}
-    ${!state.gift || hasSubscription ? `<p class="task-sub" style="margin-top:12px">Subscription charges are separate from cards agents use for purchases. Paid plan and seat changes take effect after billing confirmation. ${policyLinks(['billing'])}</p>` : ''}`;
-  const saveGift = async (plan, button) => {
+  // One-line notices, only when something needs attention.
+  const notes = [];
+  const returned = new URLSearchParams(location.search).get('billing');
+  if (returned === 'success' && !subscribed) notes.push(['ok', 'Payment received. The plan changes as soon as the payment provider confirms it.']);
+  if (['past_due', 'unpaid', 'paused', 'incomplete'].includes(state?.status)) {
+    const grace = state.access === 'grace' && state.graceEndsAt ? ` The plan continues until ${day(state.graceEndsAt)}.` : '';
+    notes.push(['danger', `${state.lastError || 'Update the payment method in Billing.'}${grace}`]);
+  }
+  if (busy) notes.push(['warn', `A billing change is waiting for confirmation. <button class="btn sm billing-reconcile" ${owner ? '' : 'disabled'}>Check</button>`]);
+  if (state?.pendingCheckout && !subscribed) notes.push(['', `A checkout is still open. <button class="btn sm billing-cancel-checkout" ${owner ? '' : 'disabled'}>Cancel it</button>`]);
+  const noteHtml = notes.map(([tone, html]) => `<p class="plan-note ${tone}">${tone === 'warn' || tone === '' ? html : esc(html)}</p>`).join('');
+  // Choosing a plan (Free, nothing gifted).
+  let choices = '';
+  if (state?.managed && !subscribed && !state.gift) {
+    const ready = state.providerConfigured && S.launch?.paidLaunch && S.launch?.ready;
+    const card = (plan) => {
+      if (!plan) return '';
+      const team = plan.id === 'team';
+      const per = (text, extra) => (team && extra ? `${text} (+${extra}/person)` : text);
+      const dollars = (micros) => planDollars(micros).replace('.00', '');
+      const items = [team ? 'Any number of people' : '1 person',
+        per(`${plan.maxActiveAgentRuns} agents at once`, plan.additionalActiveUserAgentRuns),
+        per(`${formatBytes(plan.storageBytes)} storage`, plan.additionalActiveUserStorageBytes && formatBytes(plan.additionalActiveUserStorageBytes)),
+        ...(e.compute ? [per(`${dollars(plan.computeCreditMicros)} compute a month`, plan.additionalActiveUserComputeCreditMicros && dollars(plan.additionalActiveUserComputeCreditMicros))] : [])];
+      return `<div class="plan-choice" data-plan="${esc(plan.id)}"><div class="plan-choice-head"><b>${esc(plan.name)}</b><span>${esc(planMoney(plan.monthlyBasePriceCents))}<small>/month${team ? ` + ${planMoney(plan.monthlyAdditionalActiveUserPriceCents)}/person` : ''}</small></span></div>
+        <ul>${items.map((item) => `<li>${esc(item)}</li>`).join('')}</ul>
+        <button class="btn sm primary billing-checkout" data-plan="${esc(plan.id)}" ${ready && owner ? '' : `disabled title="${esc(!owner ? 'Only an organization owner can choose a plan' : 'Checkout isn’t open yet')}"`}>Choose ${esc(plan.name)}</button></div>`;
+    };
+    const d = S.launch?.checkoutDisclosures || {};
+    const terms = [d.renewalDisclosure || 'Plans renew monthly until canceled.', d.cancellationDisclosure || 'Cancel online here before renewal.',
+      d.refundDisclosure || 'Payments are non-refundable except where the law requires.'].join(' ');
+    choices = `<div class="plan-choices">${card(catalog.individual)}${card(catalog.team)}</div>
+      <div class="plan-terms">${policyAcceptanceMarkup('checkout', 'checkout-policy-acceptance')} ${policyTip(terms)}</div>`;
+  }
+  // The operator's complimentary plan and packs.
+  const gifts = state?.canGift ? `<details class="plan-operator"><summary>Gifts</summary><div class="setting-rows">
+    <div class="setting-row"><span class="setting-label">Plan ${policyTip('Free access until removed. Paid billing, if any, continues separately.')}</span><span class="setting-value">
+      <select id="billing-gift-plan" aria-label="Gift plan">${Object.values(catalog).filter((plan) => plan.id !== 'free').map((plan) => `<option value="${esc(plan.id)}" ${state.gift?.plan === plan.id ? 'selected' : ''}>${esc(plan.name)}</option>`).join('')}</select></span>
+      <span class="setting-actions"><button class="btn sm billing-gift">${state.gift ? 'Update' : 'Gift'}</button>${state.gift ? '<button class="btn sm ghost billing-gift-remove">Remove</button>' : ''}</span></div>
+    <div class="setting-row"><span class="setting-label">Storage packs ${policyTip(`${formatBytes(storagePack.bytes)} each, on any plan, until set to 0. Nothing is billed.`)}</span><span class="setting-value">
+      <input id="billing-gift-packs" type="number" min="0" max="1000" step="1" value="${esc(state.giftedStoragePacks || 0)}" class="plan-gift-count" aria-label="Gifted storage packs"></span>
+      <span class="setting-actions"><button class="btn sm billing-gift-packs" data-kind="storage">Save</button></span></div>
+    <div class="setting-row"><span class="setting-label">Compute packs ${policyTip(`${planDollars(state.computePack?.creditMicros ?? e.computePackCreditMicros)} of compute a month each, on any plan, until set to 0. Nothing is billed.`)}</span><span class="setting-value">
+      <input id="billing-gift-compute" type="number" min="0" max="1000" step="1" value="${esc(state.giftedComputePacks || 0)}" class="plan-gift-count" aria-label="Gifted compute packs"></span>
+      <span class="setting-actions"><button class="btn sm billing-gift-packs" data-kind="compute">Save</button></span></div>
+  </div></details>` : '';
+  return `${head}${noteHtml}<div class="setting-rows ruled plan-limits">${peopleRow}${agentsRow}${storageRow}${computeRow}</div>${choices}${gifts}
+    ${subscribed ? `<p class="plan-foot setting-muted">Separate from the cards agents pay with. <a href="/legal/billing" data-public>Billing terms</a></p>` : ''}`;
+}
+
+async function hydratePlanAndBilling(organizationId) {
+  const box = $('#org-plan');
+  if (!box) return;
+  const base = `/api/organizations/${encodeURIComponent(organizationId)}`;
+  const [entitlements, state] = await Promise.all([api(`${base}/entitlements`).catch(() => null),
+    api(`${base}/subscription/status`).catch(() => null)]);
+  if (!$('#org-plan') || S.organizationId !== organizationId) return;
+  const giftsOpen = box.querySelector('.plan-operator')?.open;
+  box.innerHTML = planBillingMarkup(entitlements, state?.managed ? state : null);
+  if (giftsOpen && box.querySelector('.plan-operator')) box.querySelector('.plan-operator').open = true;
+  const reload = () => hydratePlanAndBilling(organizationId);
+  const post = (path, body) => api(`${base}/subscription/${path}`, { method: 'POST', headers: { 'idempotency-key': billingRequestKey() },
+    ...(body ? { body: JSON.stringify(body) } : {}) });
+  const act = (selector, run) => box.querySelectorAll(selector).forEach((button) => button.addEventListener('click', async () => {
     button.disabled = true;
-    try {
-      await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/gift`, {
-        method: 'POST', headers: { 'idempotency-key': billingRequestKey() }, body: JSON.stringify({ plan }),
-      });
-      toast(plan ? 'Subscription gifted' : 'Gift removed');
-      if (S.organizationId !== organizationId) return;
-      await hydrateOrganizationSubscription(organizationId);
-      const entitlements = await api(`/api/organizations/${encodeURIComponent(organizationId)}/entitlements`);
-      if (S.organizationId === organizationId && $('#org-plan')) $('#org-plan').innerHTML = organizationPlanMarkup(entitlements);
-    } catch (error) { button.disabled = false; toast(error.message, true); }
-  };
-  const saveGiftPacks = async (packs, button) => {
-    button.disabled = true;
-    try {
-      await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/gift-storage`, {
-        method: 'POST', headers: { 'idempotency-key': billingRequestKey() }, body: JSON.stringify({ packs }),
-      });
-      toast(packs ? 'Storage packs gifted' : 'Gifted packs removed');
-      if (S.organizationId !== organizationId) return;
-      await hydrateOrganizationSubscription(organizationId);
-      const entitlements = await api(`/api/organizations/${encodeURIComponent(organizationId)}/entitlements`);
-      if (S.organizationId === organizationId && $('#org-plan')) $('#org-plan').innerHTML = organizationPlanMarkup(entitlements);
-    } catch (error) { button.disabled = false; toast(error.message, true); }
-  };
-  box.querySelector('.billing-gift-packs')?.addEventListener('click', event => {
-    const packs = Number(box.querySelector('#billing-gift-packs').value);
-    if (!Number.isInteger(packs) || packs < 0 || packs > 1000) { toast('Enter a whole number of packs from 0 to 1000', true); return; }
-    void saveGiftPacks(packs, event.currentTarget);
-  });
-  box.querySelector('.billing-gift-packs-remove')?.addEventListener('click', event => {
-    if (!confirm('Remove the gifted storage packs? Data above the remaining quota becomes read-only.')) return;
-    void saveGiftPacks(0, event.currentTarget);
-  });
-  box.querySelector('.billing-gift')?.addEventListener('click', event => {
-    const plan = box.querySelector('#billing-gift-plan').value;
-    if (hasSubscription && !confirm(`Gift ${names[plan]} access? Existing paid billing will continue until canceled separately.`)) return;
-    void saveGift(plan, event.currentTarget);
-  });
-  box.querySelector('.billing-gift-remove')?.addEventListener('click', event => {
-    if (!confirm('Remove this gift? Access will return to the paid subscription or Free plan.')) return;
-    void saveGift(null, event.currentTarget);
-  });
-  box.querySelectorAll('.billing-checkout').forEach((button) => button.addEventListener('click', async () => {
-    button.disabled = true;
-    try {
-      const acceptance = readPolicyAcceptance('checkout');
-      const result = await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/checkout`, {
-        method: 'POST', headers: { 'idempotency-key': billingRequestKey() }, body: JSON.stringify({
-          plan: button.dataset.plan, acceptedPolicies: acceptance.accepted, policyVersions: acceptance.versions,
-        }),
-      });
-      location.assign(result.url);
-    } catch (error) { button.disabled = false; toast(error.message, true); }
+    try { await run(button); } catch (error) { toast(error.message, true); }
+    if (box.isConnected) await reload();
   }));
-  box.querySelector('.billing-portal')?.addEventListener('click', async (event) => {
-    event.currentTarget.disabled = true;
-    try { location.assign((await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/portal`, {
-      method: 'POST', headers: { 'idempotency-key': billingRequestKey() },
-    })).url); } catch (error) { event.currentTarget.disabled = false; toast(error.message, true); }
+  act('.billing-checkout', async (button) => {
+    const acceptance = readPolicyAcceptance('checkout');
+    const result = await post('checkout', { plan: button.dataset.plan, acceptedPolicies: acceptance.accepted, policyVersions: acceptance.versions });
+    location.assign(result.url);
   });
-  box.querySelector('.billing-change')?.addEventListener('click', async (event) => {
-    const plan = event.currentTarget.dataset.plan;
-    if (!confirm(`Change this organization to ${names[plan]}? The billing provider will prorate the current billing period.`)) return;
-    try { await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/change`, {
-      method: 'POST', headers: { 'idempotency-key': billingRequestKey() }, body: JSON.stringify({ plan }),
-    }); toast('Plan change submitted. Waiting for billing confirmation.'); await hydrateOrganizationSubscription(organizationId); }
-    catch (error) { toast(error.message, true); }
+  act('.billing-portal', async () => { location.assign((await post('portal')).url); });
+  act('.billing-change', async (button) => {
+    const name = state?.catalog?.find((plan) => plan.id === button.dataset.plan)?.name || button.dataset.plan;
+    if (!confirm(`Change to ${name}? The difference is prorated on your next bill.`)) return;
+    await post('change', { plan: button.dataset.plan }); toast('Plan change sent. It applies once payment is confirmed.');
   });
-  box.querySelectorAll('.billing-packs').forEach((button) => button.addEventListener('click', async () => {
+  act('.billing-cancel', async () => {
+    if (!confirm('Cancel the plan at the end of this billing period?')) return;
+    await post('cancel'); toast('Cancellation sent.');
+  });
+  act('.billing-cancel-checkout', async () => {
+    if (!confirm('Cancel the open checkout? Its payment link stops working.')) return;
+    await post('cancel'); toast('Checkout canceled.');
+  });
+  act('.billing-sync', async () => { await post('sync-seats'); toast('Seats sent for billing.'); });
+  act('.billing-reconcile', async () => {
+    const result = await api(`${base}/subscription/reconcile`, { method: 'POST' });
+    toast(!result.reconciled ? 'Still unconfirmed. Nothing has been charged twice; contact billing support if it stays this way.'
+      : result.applied === false ? 'Nothing was changed or charged. You can try again.' : 'Confirmed.', !result.reconciled);
+  });
+  act('.billing-packs', async (button) => {
+    const kind = button.dataset.kind;
     const next = Number(button.dataset.packs);
-    if (!confirm(next > packs ? `Add a ${formatBytes(pack.bytes)} storage pack for ${price(pack.monthlyPriceCents)}/month?` : 'Remove a storage pack?')) return;
-    button.disabled = true;
-    try { await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/storage-packs`, {
-      method: 'POST', headers: { 'idempotency-key': billingRequestKey() }, body: JSON.stringify({ packs: next }),
-    }); toast('Storage change submitted. Waiting for billing confirmation.'); await hydrateOrganizationSubscription(organizationId); }
-    catch (error) { button.disabled = false; toast(error.message, true); }
-  }));
-  box.querySelector('.billing-cancel')?.addEventListener('click', async () => {
-    if (!confirm('Cancel this subscription at the end of its current billing period?')) return;
-    try { await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/cancel`, {
-      method: 'POST', headers: { 'idempotency-key': billingRequestKey() },
-    }); toast('Cancellation submitted. Waiting for billing confirmation.'); await hydrateOrganizationSubscription(organizationId); }
-    catch (error) { toast(error.message, true); }
+    const current = Number(kind === 'compute' ? state.computePacks : state.storagePacks) || 0;
+    const pack = kind === 'compute' ? state.computePack : state.storagePack;
+    const what = kind === 'compute' ? `${planDollars(pack.creditMicros)} of compute a month` : formatBytes(pack.bytes);
+    if (!confirm(next > current ? `Add ${what} for ${planMoney(pack.monthlyPriceCents)}/month?` : `Remove ${what} (${planMoney(pack.monthlyPriceCents)}/month)?`)) return;
+    await post(`${kind}-packs`, { packs: next }); toast('Sent. It applies once payment is confirmed.');
   });
-  box.querySelector('.billing-sync')?.addEventListener('click', async () => {
-    try { await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/sync-seats`, {
-      method: 'POST', headers: { 'idempotency-key': billingRequestKey() },
-    }); toast('Seat reconciliation submitted.'); } catch (error) { toast(error.message, true); }
+  act('.billing-gift', async () => {
+    const plan = $('#billing-gift-plan').value;
+    await post('gift', { plan }); toast('Plan gifted');
   });
-  box.querySelector('.billing-reconcile')?.addEventListener('click', async () => {
-    try {
-      const result = await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/reconcile`, { method: 'POST' });
-      toast(!result.reconciled ? 'Result still uncertain. Contact billing support; no payment has been retried.'
-        : result.applied === false ? 'Nothing was changed or charged. You can try again.'
-        : 'Billing result confirmed. You can continue.', !result.reconciled);
-      await hydrateOrganizationSubscription(organizationId);
-    } catch (error) { toast(error.message, true); }
+  act('.billing-gift-remove', async () => {
+    if (!confirm('Remove the gifted plan?')) return;
+    await post('gift', { plan: null }); toast('Gift removed');
   });
-  box.querySelector('.billing-cancel-checkout')?.addEventListener('click', async () => {
-    if (!confirm('Cancel the unpaid checkout? Its existing payment link will stop working.')) return;
-    try {
-      await api(`/api/organizations/${encodeURIComponent(organizationId)}/subscription/cancel`, {
-        method: 'POST', headers: { 'idempotency-key': billingRequestKey() },
-      });
-      toast('Pending checkout canceled.');
-      await hydrateOrganizationSubscription(organizationId);
-    } catch (error) { toast(error.message, true); }
+  act('.billing-gift-packs', async (button) => {
+    const kind = button.dataset.kind;
+    const packs = Number($(kind === 'compute' ? '#billing-gift-compute' : '#billing-gift-packs').value);
+    if (!Number.isInteger(packs) || packs < 0 || packs > 1000) throw new Error('Enter a whole number from 0 to 1000');
+    await post(kind === 'compute' ? 'gift-compute' : 'gift-storage', { packs }); toast(packs ? 'Packs gifted' : 'Gifted packs removed');
   });
 }
 
@@ -22352,6 +22427,7 @@ function wireInstallationSettings() {
   refreshHostDiag();
   refreshProcPanel();
   wireServiceLimitsCard();
+  wireManagedComputeCard();
   wireHostCapacityCard();
   $('#timing-enabled')?.addEventListener('change', async event => {
     const control = event.currentTarget; control.disabled = true;
@@ -22392,6 +22468,7 @@ const COMPUTER_PROVIDERS = {
 };
 function computerConnectionState(connection) {
   if (!connection) return { label: 'not connected', tone: '' };
+  if (connection.managed) return { label: 'included', tone: 'done' };
   if (!connection.enabled) return { label: 'disabled', tone: '' };
   if (connection.status === 'ready') return { label: 'connected', tone: 'done' };
   return { label: connection.status === 'error' ? 'failing' : String(connection.status || 'unverified'), tone: 'failed' };
@@ -22429,11 +22506,12 @@ function computersMarkup(connections, held = []) {
     const state = computerConnectionState(connection);
     const mine = held.filter((computer) => computer.provider === id);
     return `<div class="computer-provider" data-provider="${id}"><b>${esc(info.name)}</b>
-      <span class="chip ${state.tone}"${connection?.lastError ? ` title="${esc(connection.lastError)}"` : ''}>${esc(state.label)}</span>
+      <span class="chip ${state.tone}"${connection?.managed ? ` title="${esc(`Runs on ${siteName()}’s ${info.name} account, charged to this organization’s monthly compute (Plan & billing). Connect your own account to use it instead.`)}"` : connection?.lastError ? ` title="${esc(connection.lastError)}"` : ''}>${esc(state.label)}</span>
       ${connection?.limits ? computerLimitsSummary(id, connection.limits) : ''}
       ${mine.length ? `<button class="chip computer-held-toggle" type="button" aria-expanded="false" title="Tasks holding a machine or disk here">${mine.length} in use</button>` : ''}
       <span class="label-row-fill"></span>
-      ${connection ? `<button class="icon-btn computer-edit" type="button" title="Edit ${esc(info.name)}" aria-label="Edit ${esc(info.name)}">✎</button>
+      ${connection?.managed ? `<button class="btn sm ghost computer-connect" type="button" title="Use your own ${esc(info.name)} account instead">Use own account</button>`
+      : connection ? `<button class="icon-btn computer-edit" type="button" title="Edit ${esc(info.name)}" aria-label="Edit ${esc(info.name)}">✎</button>
         <button class="btn sm computer-test" type="button">Test</button>`
       : `<button class="btn sm computer-connect" type="button">Connect</button>`}</div>
       ${mine.length ? `<div class="computer-held" data-held-provider="${id}" hidden>${mine.map(heldComputerRow).join('')}</div>` : ''}`;
@@ -22468,7 +22546,9 @@ async function hydrateComputers(box, organizationId) {
   }));
   box.querySelectorAll('.computer-provider').forEach((row) => {
     const provider = row.dataset.provider;
-    const connection = connections.find((candidate) => candidate.provider === provider);
+    const found = connections.find((candidate) => candidate.provider === provider);
+    // Managed compute is the installation's: connecting here adds the organization's own.
+    const connection = found?.managed ? undefined : found;
     const open = () => openComputerDialog(provider, connection, organizationId, reload);
     row.querySelector('.computer-edit')?.addEventListener('click', open);
     row.querySelector('.computer-connect')?.addEventListener('click', open);
@@ -22480,7 +22560,9 @@ async function hydrateComputers(box, organizationId) {
     });
   });
 }
-function openComputerDialog(provider, connection, organizationId, onSaved) {
+/** The edit dialog of a provider account: an organization's own, or (with
+ * `managed`) one of the installation's managed compute accounts. */
+function openComputerDialog(provider, connection, organizationId, onSaved, { managed = false } = {}) {
   const info = COMPUTER_PROVIDERS[provider];
   const config = connection?.config || {};
   const overlay = document.createElement('div'); overlay.className = 'modal-overlay';
@@ -22488,6 +22570,9 @@ function openComputerDialog(provider, connection, organizationId, onSaved) {
     <div class="modal-head"><b>${esc(info.name)}</b>${info.tip ? policyTip(info.tip) : ''}<span class="label-row-fill"></span><button class="icon-btn computer-close" type="button" aria-label="Close">×</button></div>
     <label class="form-row"><span>API key <a class="computer-key-link" href="${esc(info.keys)}" target="_blank" rel="noopener noreferrer">Get a key</a></span>
       <input class="computer-key" type="password" autocomplete="new-password" placeholder="${connection ? 'Blank to leave unchanged' : 'Required'}"></label>
+    ${managed ? `<div class="settings-grid"><label class="form-row"><span>Machines at once ${policyTip(`The account’s concurrency limit (E2B Hobby: 20). Beyond it, tasks wait for a machine instead of being refused by ${info.name}. Blank: no limit.`)}</span>
+      <input class="computer-max-running" type="number" min="1" step="1" inputmode="numeric" value="${esc(config.maxRunning ?? '')}" placeholder="No limit"></label>
+      <label class="switch computer-enabled-row"><input class="toggle computer-enabled" type="checkbox" ${connection?.enabled === false ? '' : 'checked'}>Offer to organizations</label></div>` : ''}
     <details class="computer-advanced"><summary>Advanced</summary><div class="settings-grid">
       ${info.advanced.map(([key, label, placeholder]) => `<label class="form-row">${esc(label)}<input data-config="${esc(key)}" value="${esc(config[key] || '')}" placeholder="${esc(placeholder)}"></label>`).join('')}
       ${[['cpu', 'Max CPU'], ['memoryMb', 'Max memory (GB)'], ['diskGb', 'Max disk (GB)']].map(([key, label]) => {
@@ -22502,7 +22587,7 @@ function openComputerDialog(provider, connection, organizationId, onSaved) {
   </div>`;
   const close = () => { document.removeEventListener('keydown', keydown); overlay.remove(); };
   const keydown = (event) => { if (event.key === 'Escape') close(); };
-  const base = `/api/organizations/${encodeURIComponent(organizationId)}/world-providers/${provider}`;
+  const base = managed ? `/api/settings/managed-compute/${provider}` : `/api/organizations/${encodeURIComponent(organizationId)}/world-providers/${provider}`;
   overlay.addEventListener('click', (event) => { if (event.target === overlay) close(); });
   overlay.querySelector('.computer-close').addEventListener('click', close);
   overlay.querySelector('.computer-cancel').addEventListener('click', close);
@@ -22512,8 +22597,11 @@ function openComputerDialog(provider, connection, organizationId, onSaved) {
     const limits = Object.fromEntries([...overlay.querySelectorAll('[data-limit]')]
       .filter((input) => input.value.trim() !== '' && Number(input.value) > 0)
       .map((input) => [input.dataset.limit, input.dataset.limit === 'memoryMb' ? Math.round(Number(input.value) * 1024) : Math.round(Number(input.value))]));
+    const maxRunning = Number(overlay.querySelector('.computer-max-running')?.value);
     const body = { apiKey: overlay.querySelector('.computer-key').value.trim() || undefined,
-      config: { ...Object.fromEntries([...overlay.querySelectorAll('[data-config]')].map((input) => [input.dataset.config, input.value.trim()])), limits } };
+      ...(managed ? { enabled: overlay.querySelector('.computer-enabled').checked } : {}),
+      config: { ...Object.fromEntries([...overlay.querySelectorAll('[data-config]')].map((input) => [input.dataset.config, input.value.trim()])), limits,
+        ...(managed && maxRunning > 0 ? { maxRunning: Math.round(maxRunning) } : {}) } };
     // A refused save changed nothing: keep what was typed. A saved one is
     // verified at once, and its state (or error) shows on the row.
     try { await api(base, { method: 'PUT', body: JSON.stringify(body) }); }
@@ -22524,7 +22612,7 @@ function openComputerDialog(provider, connection, organizationId, onSaved) {
     await onSaved?.();
   });
   overlay.querySelector('.computer-disconnect')?.addEventListener('click', async () => {
-    if (!confirm(`Disconnect ${info.name}? Tasks running on it must finish or be removed first.`)) return;
+    if (!confirm(managed ? `Remove ${siteName()}’s ${info.name} account? Organizations then need their own.` : `Disconnect ${info.name}? Tasks running on it must finish or be removed first.`)) return;
     try { await api(base, { method: 'DELETE' }); close(); await onSaved?.(); }
     catch (error) { toast(error.message, true); }
   });
@@ -22541,10 +22629,8 @@ function organizationView() {
     <nav class="settings-nav" aria-label="Settings sections"><span>Organization</span><a href="#settings-plan">Plan &amp; billing</a><a href="#settings-code">Resources</a><a href="#settings-agents">Agents</a><a href="#settings-defaults">Task defaults</a><a href="#settings-payments">Passwords &amp; payments</a><a href="#settings-people">People &amp; authorization</a><a href="#settings-installation">Workflows</a><a href="#settings-advanced" data-settings-advanced hidden>Advanced</a></nav>
     <div class="settings-content">
 
-    <div class="settings-section-title" id="settings-plan"><div>Plan &amp; billing ${policyTip(`Current organization limits and hosted subscription`)}</div></div>
-    <div class="card"><div id="org-plan">Loading…</div><div id="org-usage"></div></div>
-    <div class="settings-section-title" id="settings-billing"><div>Subscription billing ${policyTip(`Hosted subscription and active-user seats—not cards used by agents`)}</div></div>
-    <div class="card" id="org-subscription"><p class="task-sub">Loading verified subscription status…</p></div>
+    <div class="settings-section-title" id="settings-plan"><div>Plan &amp; billing ${policyTip(`What this organization’s plan includes, what it uses, and its subscription`)}</div></div>
+    <div class="card plan-card" id="settings-billing"><div id="org-plan">Loading…</div></div>
 
     <div class="settings-section-title" id="settings-people"><div>People &amp; authorization ${policyTip(`Who is in this organization, and what each person may do`)}</div></div>
     <div class="card"><div class="section-h">People</div><div id="org-members">Loading…</div>
@@ -22560,7 +22646,7 @@ function organizationView() {
     <div class="settings-section-title" id="settings-code"><div>Resources ${policyTip(`GitHub, computers and storage shared by this organization’s projects`)}</div></div>
     <div class="card"><div class="section-h">Git &amp; GitHub</div><div id="org-github">Loading…</div></div>
     <div class="card"><div class="section-h" id="settings-computers">Computers ${policyTip('The cloud computers tasks run on. Each task’s computer—its size, experience and network—is set in the task form and Task defaults.')}</div><div id="org-computers">Loading…</div></div>
-    <div class="card"><div class="section-h" id="settings-storage">Data storage ${policyTip(`Managed storage is intentionally bounded. Connect your own bucket for large versioned datasets; for live or frequently changing data, add the bucket as a project Service instead of copying it into ${siteName()}.`)}</div><p class="task-sub">Where encrypted, versioned project Data revisions are retained.</p><div id="org-storage">Loading…</div></div>
+    <div class="card"><div class="section-h" id="settings-storage">Data storage ${policyTip(`Where project data, saved task workspaces and review files are kept, and what uses the space. For live or fast-changing data, add the bucket to a project as a service instead of copying it into ${siteName()}.`)}</div><div id="org-storage">Loading…</div></div>
 
     ${globalSettingsView(true)}
 
@@ -22587,37 +22673,6 @@ function organizationView() {
 function pendingInvitationRow(invitation, projects) {
   const authorization = invitation.authorization || { level: invitation.profileId || 'developer', scope: 'organization' };
   return `<div class="member-row" data-invitation="${esc(invitation.id)}"><span>${esc(invitation.email)}</span><span class="chip">${esc(authorizationSummary(authorization, projects))}</span></div>`;
-}
-
-function organizationPlanMarkup(entitlements) {
-  if (!entitlements) return '<span class="task-sub">Plan information is temporarily unavailable.</span>';
-  if (entitlements.deployment === 'private') return `<div class="setting-row"><span class="setting-label">Plan</span>
-    <span class="setting-value"><b>Private installation</b> ${policyTip('Hosted plan restrictions are not applied. Users, projects and agent runs are limited only by this installation’s own capacity settings.')}</span>
-    <span class="setting-actions"><span class="chip">unmetered</span></span></div>`;
-  const memberCount = Number(entitlements.currentMemberCount ?? entitlements.activeUsers ?? 0);
-  const users = entitlements.maxMembers == null
-    ? `${memberCount} active user${memberCount === 1 ? '' : 's'} · unlimited`
-    : `${memberCount} of ${entitlements.maxMembers} user${entitlements.maxMembers === 1 ? '' : 's'}${entitlements.overMemberLimit ? ' · over limit' : ''}`;
-  const projects = entitlements.unlimitedProjects ? 'Unlimited projects' : `${entitlements.maxProjects} projects`;
-  const runs = `${entitlements.maxActiveAgentRuns} active agent run${entitlements.maxActiveAgentRuns === 1 ? '' : 's'}`;
-  const monthly = Number(entitlements.currentMonthlyPriceCents || 0) / 100;
-  const price = entitlements.gift ? 'Gifted' : monthly ? `$${Number.isInteger(monthly) ? monthly : monthly.toFixed(2)}/month` : '$0/month';
-  const usage = `${entitlements.activeAgentRuns || 0} active · ${entitlements.queuedAgentRuns || 0} queued`;
-  const packBytes = Number(entitlements.storagePackBytes || 0);
-  const paidPacks = Number(entitlements.storagePacks || 0);
-  const giftedPacks = Number(entitlements.giftedStoragePacks || 0);
-  const plural = (count, word) => `${count} ${word}${count === 1 ? '' : 's'}`;
-  const storage = entitlements.includedStorageBytes == null ? '' : `<div class="form-row">Storage<div class="plan-storage">
-    <span class="plan-storage-base" title="Included with ${esc(entitlements.planName)}">${esc(formatBytes(entitlements.includedStorageBytes))}</span>
-    ${paidPacks ? `<span class="plan-storage-extra" title="${esc(plural(paidPacks, 'storage pack'))}">+ ${esc(formatBytes(paidPacks * packBytes))} packs</span>` : ''}
-    ${giftedPacks ? `<span class="plan-storage-extra gifted" title="${esc(plural(giftedPacks, 'gifted storage pack'))}">+ ${esc(formatBytes(giftedPacks * packBytes))} gifted</span>` : ''}</div></div>`;
-  const memberWarning = entitlements.overMemberLimit
-    ? `<div class="card" style="padding:10px;border-color:var(--warn);margin:10px 0"><b>Agent runs are paused</b><div class="task-sub">${esc(entitlements.planName)} allows ${esc(entitlements.maxMembers)} organization user${entitlements.maxMembers === 1 ? '' : 's'}, but this organization has ${esc(memberCount)}. Remove ${esc(memberCount - entitlements.maxMembers)} extra member${memberCount - entitlements.maxMembers === 1 ? '' : 's'} in <a href="#settings-people">People &amp; authorization</a>, or restore Team. Running agents may finish; no new agent run will start until this is resolved.</div></div>`
-    : '';
-  return `<div class="section-h">${esc(entitlements.planName)} <span class="chip">${esc(price)}</span></div>
-    ${memberWarning}
-    <div class="settings-grid"><label class="form-row">People<input value="${esc(users)}" readonly></label><label class="form-row">Projects<input value="${esc(projects)}" readonly></label>${storage}<label class="form-row">Agent concurrency<input value="${esc(runs)}" readonly></label><label class="form-row">Current agent usage<input value="${esc(usage)}" readonly></label></div>
-    <p class="task-sub">Concurrency is a shared maximum for this organization. Work above the limit waits in queue; it is not reserved capacity.</p>`;
 }
 
 function appendPendingInvitation(invitation, projects) {
@@ -22713,7 +22768,6 @@ async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
     hydrateSettingsAccess({ organizationId });
     hydrateConversationSharing('organization', organizationId);
     hydrateAvatarAvailability('organization', organizationId);
-    hydrateOrganizationSubscription(organizationId);
     setEventHandler($('#export-organization'), 'click', () => location.assign(`/api/organizations/${encodeURIComponent(S.organizationId)}/export`));
     const renameOrganization = async () => {
       const name = $('#organization-name')?.value.trim();
@@ -22897,15 +22951,7 @@ async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
     async storage() {
       const [storageLocations, contents] = await Promise.all([read('storage').catch(() => []), read('storage-contents').catch(() => null)]);
       if (!live('storage')) return;
-      $('#org-storage').innerHTML = `
-        ${storageLocations.map((location) => { const usage = location.usage || {}; const pct = usage.quotaBytes ? Math.min(100, usage.retainedBytes / usage.quotaBytes * 100) : 0; return `<div class="team-block storage-location" data-storage="${esc(location.id)}"><div class="member-row"><span><b>${esc(location.name)}</b> <span class="chip">${location.kind === 'managed' ? 'managed' : 'customer S3'}</span> ${location.isDefault ? '<span class="chip">default</span>' : ''}</span><span>${formatBytes(usage.retainedBytes || 0)}${usage.quotaBytes ? ` / ${formatBytes(usage.quotaBytes)}` : ''}</span>${!location.isDefault && location.status === 'ready' ? '<button class="btn sm storage-default">Make default</button>' : ''}${location.kind === 's3' ? '<button class="btn sm storage-test">Test</button><button class="btn sm danger storage-delete">Remove</button>' : ''}</div>${usage.quotaBytes ? `<div class="progress${pct >= 100 ? ' over' : ''}"><i style="width:${pct}%"></i></div>` : ''}${location.kind === 'managed' ? storageOverQuotaMarkup(contents) + storagePendingDeletionMarkup(contents) : ''}${location.config?.bucket ? `<p class="task-sub mono">${esc(location.config.endpoint)}/${esc(location.config.bucket)}/${esc(location.config.prefix || '')}</p>` : ''}${location.lastError ? `<p class="task-sub" style="color:var(--danger)">${esc(location.lastError)}</p>` : ''}</div>`; }).join('')}
-        ${storageContentsMarkup(contents)}
-        <details class="settings-disclosure compact"><summary><b>Connect customer-owned S3 storage</b></summary><div class="settings-grid">
-          <label class="form-row">Name<input id="storage-name" placeholder="Production data"></label><label class="form-row">Endpoint<input id="storage-endpoint" placeholder="https://s3.amazonaws.com"></label>
-          <label class="form-row">Bucket<input id="storage-bucket" placeholder="company-tavya"></label><label class="form-row">Region<input id="storage-region" value="us-east-1"></label>
-          <label class="form-row">Restricted prefix<input id="storage-prefix" value="tavya/${esc(organizationId)}"></label><label class="form-row">Access key ID<input id="storage-access-key" autocomplete="off"></label>
-          <label class="form-row">Secret access key<input id="storage-secret-key" type="password" autocomplete="new-password"></label></div>
-          <p class="task-sub">Use a dedicated bucket policy restricted to this prefix. Credentials are encrypted in the ${siteNameMarkup()} vault and never returned by the API.</p><button class="btn sm primary" id="storage-connect">Connect &amp; test</button></details>`;
+      $('#org-storage').innerHTML = storageSectionMarkup(storageLocations, contents, organizationId);
       setEventHandler($('#storage-connect'), 'click', async () => {
         try {
           const created = await api(`/api/organizations/${organizationId}/storage`, { method: 'POST', body: JSON.stringify({
@@ -22914,7 +22960,7 @@ async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
             accessKeyId: $('#storage-access-key').value, secretAccessKey: $('#storage-secret-key').value,
           }) });
           await api(`/api/organizations/${organizationId}/storage/${encodeURIComponent(created.id)}/test`, { method: 'POST', body: '{}' });
-          toast('Customer storage connected'); await refresh('storage');
+          toast('Bucket connected'); await refresh('storage');
         } catch (error) { toast(error.message, true); }
       });
       $('#org-storage')?.querySelectorAll('[data-older-versions]').forEach((button) => button.addEventListener('click', async () => {
@@ -22947,25 +22993,7 @@ async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
       });
     },
     async usage() {
-      const [entitlements, usage] = await Promise.all([
-        read('entitlements').catch(() => null),
-        read('usage').catch(() => null),
-      ]);
-      if (!live('usage')) return;
-      $('#org-plan').innerHTML = organizationPlanMarkup(entitlements);
-      const usageSync = (usage?.sync || []).filter((item) => ['e2b', 'fly', 'hetzner'].includes(item.provider));
-      const usageSyncLabel = usageSync.some((item) => item.status === 'error') ? ' · sync unavailable'
-        : usageSync.some((item) => item.status === 'pending') ? ' · first sync pending'
-          : usageSync.length ? ` · synced ${fmtAgo(Math.max(...usageSync.map((item) => Number(item.at || 0))))}` : '';
-      const coverageFrom = usageSync.length ? Math.max(...usageSync.map((item) => Number(item.coverageFrom || 0))) : 0;
-      const usagePeriod = usageSync.some((item) => item.gap) ? 'Incomplete history'
-        : coverageFrom > Number(usage?.from || 0)
-          ? `Since ${new Date(coverageFrom).toLocaleDateString([], { month: 'short', day: 'numeric' })}` : 'This month';
-      // One total; how it splits is the tooltip.
-      const dollars = (micros) => `$${((micros || 0) / 1e6).toFixed(2)}`;
-      const split = `Incurred ${dollars(usage?.incurredCostMicros)} · estimated ${dollars(usage?.estimatedCostMicros)} · reserved for running computers ${dollars(usage?.activeReservationsMicros)} · ${usage?.events} usage record${usage?.events === 1 ? '' : 's'}`;
-      $('#org-usage').innerHTML = usage ? `<div class="setting-rows"><div class="setting-row usage-row"><span class="setting-label">Usage ${policyTip(split)}</span>
-        <span class="setting-value"><b>${dollars(usage.costMicros)}</b> <span class="setting-muted">${usagePeriod}${usageSyncLabel}</span></span></div></div>` : '';
+      if (live('usage')) await hydratePlanAndBilling(organizationId);
     },
     async identity() {
       const identityPolicy = await read('identity-policy').catch(() => null);
@@ -24125,22 +24153,34 @@ function renderPricing() {
   const catalog = S.launch?.pricingCatalog || [];
   const checkoutReady = S.launch?.paidLaunch && S.launch?.ready;
   const team = catalog.find((plan) => plan.id === 'team');
+  const packs = S.launch?.packs;
+  const compute = (S.launch?.managedCompute || []).length > 0;
+  const money = (cents, currency) => formatCatalogPrice(cents, currency);
+  const credit = (micros) => formatCatalogPrice(Number(micros || 0) / 10_000);
   const cards = catalog.map((plan) => {
-    const price = formatCatalogPrice(plan.monthlyBasePriceCents, plan.currency);
-    const users = plan.id === 'team'
-      ? `First active user included, then ${formatCatalogPrice(plan.monthlyAdditionalActiveUserPriceCents, plan.currency)} per additional active user per month`
-      : `${plan.maxMembers} user`;
-    const priceLine = plan.id === 'free' ? price : `${price}<small> / month</small>`;
+    const isTeam = plan.id === 'team';
+    const per = (base, extra) => (isTeam && extra ? `${base} + ${extra} per person` : base);
+    const items = [isTeam ? 'Any number of people' : `${plan.maxMembers} person`, 'Unlimited projects',
+      `${per(plan.maxActiveAgentRuns, plan.additionalActiveUserAgentRuns)} agents at once`,
+      `${per(formatBytes(plan.storageBytes), plan.additionalActiveUserStorageBytes ? formatBytes(plan.additionalActiveUserStorageBytes) : '')} storage`,
+      ...(compute ? [plan.computeCreditMicros
+        ? `${per(credit(plan.computeCreditMicros), plan.additionalActiveUserComputeCreditMicros ? credit(plan.additionalActiveUserComputeCreditMicros) : '')} of compute a month`
+        : 'Your own cloud computer account'] : [])];
+    const priceLine = plan.id === 'free' ? money(0, plan.currency)
+      : `${money(plan.monthlyBasePriceCents, plan.currency)}<small> / month${isTeam ? ` + ${money(plan.monthlyAdditionalActiveUserPriceCents, plan.currency)} per extra person` : ''}</small>`;
     return `<article class="price-card" data-plan="${esc(plan.id)}"><div class="price-name">${esc(plan.name)}</div>
-      <div class="price-value">${priceLine}</div><p>${esc(users)}</p><ul><li>Unlimited projects</li>
-      <li>${esc(plan.maxActiveAgentRuns)} concurrent agent run${plan.maxActiveAgentRuns === 1 ? '' : 's'}${plan.id === 'team' ? ` shared across the organization + ${esc(plan.additionalActiveUserAgentRuns)} per additional active user` : ''}</li>
-      <li>${esc(formatBytes(plan.storageBytes))} storage${plan.id === 'team' ? ` + ${esc(formatBytes(plan.additionalActiveUserStorageBytes))} per additional active user` : ''}</li></ul>
+      <div class="price-value">${priceLine}</div><ul>${items.map((item) => `<li>${esc(item)}</li>`).join('')}</ul>
       ${plan.id === 'free' || checkoutReady ? '<a class="btn primary" href="/signup">Create account</a>' : '<span class="price-unavailable">Paid checkout is not yet enabled.</span>'}</article>`;
   }).join('');
+  const addOns = packs ? `<div class="pricing-addons"><b>Need more?</b>
+      <span>${esc(formatBytes(packs.storage.bytes))} more storage · ${esc(money(packs.storage.monthlyPriceCents))}/month</span>
+      ${compute ? `<span>${esc(credit(packs.compute.creditMicros))} more compute · ${esc(money(packs.compute.monthlyPriceCents))}/month</span>` : ''}
+      <small>On Individual and Team, as many as you like.</small></div>` : '';
+  const computeTerms = compute && packs ? `<p>Compute is the cloud computers agents work on. ${esc(siteName())} runs them for you at ${packs.computePriceMultiplier}× the provider’s list price (a 2 CPU · 2 GB E2B computer is about $0.27 an hour) and stops starting new work when the month’s compute is used up. Computers on your own E2B, Daytona, Fly.io or Hetzner account cost nothing extra and aren’t counted.</p>` : '';
   renderPublicShell('/pricing', `<main class="pricing-page"><div class="legal-kicker">Hosted plans</div><h1>Free, Individual, and Team</h1>
-      <p class="legal-summary">All plans include unlimited projects. Concurrency is a maximum number of active agent runs, not reserved capacity.</p>
-      <div class="pricing-grid">${cards}</div>
-      <div class="pricing-terms"><p>Individual and Team renew monthly until canceled. Team is ${esc(formatCatalogPrice(team?.monthlyBasePriceCents, team?.currency))} per month including the first active user, plus ${esc(formatCatalogPrice(team?.monthlyAdditionalActiveUserPriceCents, team?.currency))} per additional active user per month. Cancel online from Organization settings; cancellation normally stops the next renewal and access continues through the paid period. Refunds are subject to applicable law and the payment provider’s buyer terms. Request refunds through billing support or the payment provider.</p>
+      <p class="legal-summary">Every plan has unlimited projects. “Agents at once” is how many can work at the same time; more wait in line.</p>
+      <div class="pricing-grid">${cards}</div>${addOns}
+      <div class="pricing-terms">${computeTerms}<p>Individual and Team renew monthly until canceled. Team is ${esc(money(team?.monthlyBasePriceCents, team?.currency))} per month including the first person, plus ${esc(money(team?.monthlyAdditionalActiveUserPriceCents, team?.currency))} per additional person per month. Cancel online from Organization settings; cancellation normally stops the next renewal and access continues through the paid period. Refunds are subject to applicable law and the payment provider’s buyer terms. Request refunds through billing support or the payment provider.</p>
       ${!checkoutReady ? '<p class="legal-unresolved"><b>Paid checkout disabled:</b> the operator must complete the founder-reviewed entity, jurisdiction, and contact launch configuration before accepting charges.</p>' : ''}
       <p class="price-policy">${policyLinks(['terms', 'privacy', 'billing'])}</p></div></main>`);
 }
