@@ -2648,7 +2648,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           executionId: args.agentTurnId ?? legacyAgentTurnId,
           executionAttempt: activityAttempt,
           executionRunId: workflowRunId,
-          worldGeneration: args.worldHandle.generation,
+          // The generation this turn opened: a world restored from a checkpoint
+          // (a resize, a hibernation) is newer than the workflow's handle, and
+          // generation-bound calls (propose_project_resource) compare the two.
+          worldGeneration: world.handle.generation ?? args.worldHandle.generation,
           ceiling,
           grantorCaps: grant,
         }));
@@ -4517,7 +4520,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const { participant, preparationTask, orgVaultItems, grant, ceiling, effective, mintScope } = await turnAuthority({
         taskId: args.taskId, task: args.task, role: 'do', organizationId });
       const minted = deps.tokens ? (await deps.tokens.mint({ ...mintScope, taskId: args.taskId, profileId: 'command', role: 'do',
-        participant, audience: 'karmax-platform', worldGeneration: args.worldHandle.generation, ceiling, grantorCaps: grant })) : undefined;
+        participant, audience: 'karmax-platform', worldGeneration: world.handle.generation ?? args.worldHandle.generation, ceiling, grantorCaps: grant })) : undefined;
       if (minted) (await record(args.taskId, 'token.minted', { tokenId: minted.record.id, profile: 'command', caps: effective,
         audience: minted.record.audience, expiresAt: minted.record.expiresAt, participant }));
       const skippedEnv: SkippedEnv[] = [];
