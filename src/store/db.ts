@@ -23,6 +23,7 @@ import { watchAuthorityWrites } from './authorization-epoch.js';
 import { setImmediate as yieldTurn } from 'node:timers/promises';
 import { importSqliteDatabase, type SqliteImportResult } from './postgres-migration.js';
 import { passEntryMetadata } from '../autonomy/pass-path.js';
+import { COMMON_SETTINGS_WORKFLOW, SHARED_SETTING_NAMES, isWorkflowSettings, splitSharedSettings } from '../domain/shared-settings.js';
 import {
   Project,
   ProjectConfig,
@@ -394,6 +395,7 @@ export class Store {
     (await this.migrateData());
     (await this.migrateConversations());
     (await this.migrateSavedViews());
+    (await this.migrateSharedSettings());
     (await this.paymentTransaction(async () => {
       if ((await this.kvGet('migration:unique-card-names'))) return;
       const rows = (await this.db.prepare(`SELECT c.id, c.label, c.scope, c.scopeId, p.organizationId
@@ -455,6 +457,61 @@ export class Store {
         && Array.isArray(c.values) && c.values.some((v) => String(v).includes('archived')))) continue;
       const next = { ...query, filters: [...filters, { field: 'is', op: 'is', values: ['archived'], negate: true }] };
       (await this.db.prepare('UPDATE saved_views SET query=? WHERE id=? AND query=?').run(JSON.stringify(next), row.id, row.query));
+    }
+    (await this.kvSet(marker, '1'));
+    });
+  }
+
+  /** Two settings-row repairs, once:
+   * - The personal tenant read the installation's old `global` rows only while
+   *   it had none of its own for that workflow, so its first save of one card
+   *   silently dropped the rest (and payments, vault and authorization were
+   *   enforced from different rows than the console showed). Copy each such
+   *   row it lacks, so every reader sees the same values.
+   * - Fields that moved into Task defaults left their old values in workflow
+   *   rows, where they shadowed every later save (SHARED_SETTING_NAMES). Move
+   *   them into each scope's shared row. Per field, software-dev's value wins —
+   *   it is what the Task defaults form showed — then the shared row's, then
+   *   the first other workflow's. */
+  private async migrateSharedSettings(force = false): Promise<void> {
+    return this.db.transaction(async () => {
+    (await this.db.lock('store-migration'));
+    const marker = 'migration:shared-settings-in-common';
+    if (!force && await this.kvGet(marker)) return;
+    const installationOnly = ['agent-queue', 'appearance', 'timing'];
+    (await this.db.prepare(`INSERT INTO settings (scopeKey, workflow, json) SELECT 'organization:org_personal', workflow, json
+      FROM settings WHERE scopeKey='global' AND workflow NOT IN (${installationOnly.map(() => '?').join(', ')})
+      ON CONFLICT(scopeKey, workflow) DO NOTHING`).run(...installationOnly));
+    const rows = (await this.db.prepare('SELECT scopeKey, workflow, json FROM settings ORDER BY scopeKey, workflow').all()) as Array<{ scopeKey: string; workflow: string; json: string }>;
+    const scopes = new Map<string, Array<{ workflow: string; json: string; values: Record<string, unknown> }>>();
+    for (const row of rows) {
+      let values: Record<string, unknown>;
+      try { values = JSON.parse(row.json) as Record<string, unknown>; } catch { continue; }
+      if (!values || typeof values !== 'object' || Array.isArray(values)) continue;
+      const list = scopes.get(row.scopeKey) ?? [];
+      list.push({ workflow: row.workflow, json: row.json, values });
+      scopes.set(row.scopeKey, list);
+    }
+    const update = this.db.prepare('UPDATE settings SET json=? WHERE scopeKey=? AND workflow=? AND json=?');
+    for (const [scopeKey, list] of scopes) {
+      const stale = list.filter((row) => isWorkflowSettings(row.workflow) && Object.keys(row.values).some((key) => SHARED_SETTING_NAMES.has(key)))
+        .sort((a, b) => Number(b.workflow === 'software-dev') - Number(a.workflow === 'software-dev'));
+      if (!stale.length) continue;
+      const common = list.find((row) => row.workflow === COMMON_SETTINGS_WORKFLOW);
+      const next: Record<string, unknown> = { ...(common?.values ?? {}) };
+      for (const key of SHARED_SETTING_NAMES) {
+        const primary = stale[0]!.workflow === 'software-dev' && stale[0]!.values[key] !== undefined ? stale[0]!.values[key] : undefined;
+        if (primary !== undefined) next[key] = primary;
+        else if (next[key] === undefined) {
+          const other = stale.find((row) => row.values[key] !== undefined);
+          if (other) next[key] = other.values[key];
+        }
+      }
+      if (common) (await update.run(JSON.stringify(next), scopeKey, COMMON_SETTINGS_WORKFLOW, common.json));
+      else (await this.db.prepare('INSERT INTO settings (scopeKey, workflow, json) VALUES (?, ?, ?) ON CONFLICT(scopeKey, workflow) DO NOTHING')
+        .run(scopeKey, COMMON_SETTINGS_WORKFLOW, JSON.stringify(next)));
+      for (const row of stale)
+        (await update.run(JSON.stringify(splitSharedSettings(row.workflow, row.values).own), scopeKey, row.workflow, row.json));
     }
     (await this.kvSet(marker, '1'));
     });
@@ -6829,9 +6886,14 @@ export class Store {
       throw new Error('otherAttempts must be ask, keep, or cancel');
     if (process.env.KARMAX_DEPLOYMENT === 'hosted' && values.remote === 'none')
       throw new Error('hosted GitHub projects require remote policy "pr" or the advanced direct-push policy');
-    (await this.db
-      .prepare('INSERT INTO settings (scopeKey, workflow, json) VALUES (?, ?, ?) ON CONFLICT(scopeKey, workflow) DO UPDATE SET json = excluded.json')
-      .run(scopeKey, workflow, JSON.stringify(values)));
+    const write = this.db.prepare('INSERT INTO settings (scopeKey, workflow, json) VALUES (?, ?, ?) ON CONFLICT(scopeKey, workflow) DO UPDATE SET json = excluded.json');
+    // Shared fields live only in the shared row (SHARED_SETTING_NAMES).
+    const { own, shared } = splitSharedSettings(workflow, values);
+    if (Object.keys(shared).length) {
+      (await write.run(scopeKey, COMMON_SETTINGS_WORKFLOW, JSON.stringify({ ...((await this.getSettings(scopeKey, COMMON_SETTINGS_WORKFLOW)) ?? {}), ...shared })));
+      values = own;
+    }
+    (await write.run(scopeKey, workflow, JSON.stringify(values)));
   
     });
   }
@@ -9983,6 +10045,7 @@ export class Store {
     (await this.migrateData(true));
     (await this.migrateConversations());
     (await this.migrateSavedViews(true));
+    (await this.migrateSharedSettings(true));
   
     });
   }

@@ -56,11 +56,11 @@ const responderField = (): FieldSpec => ({
   // the workflow's point of no return; an edit also reroutes a pause already open.
   mutable: 'always',
 });
-const baseField = (): FieldSpec => ({ name: 'base', type: 'branch', label: 'Base (branch-from) branch', default: 'main', scopes: ALL, bind: 'top' });
+const baseField = (): FieldSpec => ({ name: 'base', type: 'branch', label: 'Base (branch-from) branch', default: 'main', placeholder: 'Repository default', scopes: ALL, bind: 'top' });
 // `untilUsed`: editable in-flight until the target becomes load-bearing (a PR
 // opened against it or the merge enqueue). software-dev re-reads `target` at
 // PR/merge, so the edit genuinely takes effect (SPEC §4.5/§5.5, §2 setTarget).
-const targetField = (): FieldSpec => ({ name: 'target', type: 'branch', label: 'Target (merge-to) branch', default: 'main', scopes: ALL, bind: 'top', mutable: 'untilUsed' });
+const targetField = (): FieldSpec => ({ name: 'target', type: 'branch', label: 'Target (merge-to) branch', default: 'main', placeholder: 'Repository default', scopes: ALL, bind: 'top', mutable: 'untilUsed' });
 // Multi-repository projects whose repositories do not share branch names (one
 // uses main, another master). Off, every repository uses the common base/target.
 // Task and project scopes only: an organization has no repository list.
