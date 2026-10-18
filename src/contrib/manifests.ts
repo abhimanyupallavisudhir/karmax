@@ -10,8 +10,7 @@ import { BRAND } from '../domain/brand.js';
  * Workflow manifests (SPEC §4.3). Data-only declarations the host reads to wire
  * a workflow in: name/version, `requires` (transitive deps), emitted event
  * schemas, capability ceiling, UI slot contributions, command registrations,
- * the typed parameter schema (§10.4), and an optional onActivate hook. Pure data
- * so any layer can import them.
+ * the typed parameter schema (§10.4). Pure data so any layer can import them.
  */
 
 // ── reusable field builders ──
@@ -186,16 +185,6 @@ export interface CommandDecl {
   title: string;
   /** Default keybinding (a view over the command registry; SPEC §10.1). */
   keybinding?: string;
-}
-
-export interface OnActivateDecl {
-  /** Spawn a preparation task when the workflow is added to a project (SPEC §4.6). */
-  spawnTask?: { workflow: string; title: string; prompt: string; hostedPrompt?: string };
-}
-
-/** Deployment-aware activation copy remains manifest data, not gateway policy. */
-export function activationTaskPrompt(task: NonNullable<OnActivateDecl['spawnTask']>, hosted: boolean): string {
-  return hosted ? task.hostedPrompt ?? task.prompt : task.prompt;
 }
 
 /**
@@ -439,7 +428,6 @@ export interface WorkflowManifest {
   stages?: StageDef[];
   /** Typed parameter schema (SPEC §10.4) — drives task forms + settings + defaults. */
   params: FieldSpec[];
-  onActivate?: OnActivateDecl;
   /** Coordinators are long-lived singletons (SPEC §6), not task workflows. */
   kind?: 'task' | 'coordinator';
   /** False for replay/backward-compatible workflows that remain runnable by
@@ -504,16 +492,6 @@ export const MANIFESTS: WorkflowManifest[] = [
       responderField(),
       confirmerField(),
     ],
-    onActivate: {
-      spawnTask: {
-        workflow: 'software-dev',
-        title: 'tavya init',
-        prompt:
-          `## Initial set-up task for ${BRAND}-readiness\n1) Migrate AGENTS.md, CLAUDE.md or any other similar agent context systems to ${BRAND}'s project wiki.\n2) If no such files exist, or if they are out of date, please compile a new wiki page containing everything essential for a new developer/agent to get up and running with it.\n3) For brownfield repos, scan for hardcoded resources (e.g. ports) that would collide between worktrees and fix them.\nIt is important to use the "default" tag on wiki articles that must appear in the context of every new agent.\nReport what you changed.\n[To humans: This is not for you. Just press "Queue" and the agent will do the above.]`,
-        hostedPrompt:
-          `## Initial set-up task for ${BRAND}-readiness\n1) Migrate AGENTS.md, CLAUDE.md or any other similar agent context systems to ${BRAND}'s project wiki.\n2) If no such files exist, or if they are out of date, please compile a new wiki page containing everything essential for a new developer/agent to get up and running with it.\nIt is important to use the "default" tag on wiki articles that must appear in the context of every new agent.\nReport what you changed.\n[To humans: This is not for you. Just press "Queue" and the agent will do the above.]`,
-      },
-    },
   },
   {
     name: 'just-do',

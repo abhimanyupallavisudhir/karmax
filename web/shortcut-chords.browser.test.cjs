@@ -46,12 +46,12 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     await page.goto('http://console.test/org');
     await page.locator('.view-chip[data-view="view_bugs"]').waitFor();
     const chipNames = await page.locator('.views-bar .view-chip[data-view]').allInnerTexts();
-    assert.deepEqual(chipNames.map((name) => name.replace('✕', '').trim()), ['For me', 'Active', 'Scheduled', 'Repeatable', 'Archived', 'Bugs'],
-      'the home shows the organization’s saved views after the built-in ones');
+    assert.deepEqual(chipNames.map((name) => name.replace('✕', '').trim()), ['For me', 'Active', 'Scheduled', 'Repeatable', 'Archived', 'Task store', 'Bugs'],
+      'the home shows the organization’s saved views after the built-in ones and the Task store');
     await page.evaluate(() => document.activeElement?.blur());
     await page.keyboard.press('v');
     await echoIs('v');
-    assert.deepEqual(await hints(), ['1', '2', '3', '4', '5', '6'], 'pressing v numbers every view chip');
+    assert.deepEqual(await hints(), ['1', '2', '3', '4', '5', '6', '7'], 'pressing v numbers every view chip');
     if (shots) await page.screenshot({ path: `${shots}/view-hints.png` });
     await page.keyboard.press('3');
     await echoIs('v 3');
@@ -60,8 +60,12 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     assert.ok(await page.locator('.view-chip.active[data-view="builtin:scheduled"]').count(), 'v 3 is Scheduled');
     await page.keyboard.press('v');
     await page.keyboard.press('6');
+    await page.waitForFunction(() => new URL(location.href).searchParams.get('q') === 'is:store');
+    assert.ok(await page.locator('.view-chip.active[data-view="__store__"]').count(), 'v 6 is the Task store');
+    await page.keyboard.press('v');
+    await page.keyboard.press('7');
     await page.waitForFunction(() => new URL(location.href).searchParams.get('q') === 'bug');
-    assert.ok(await page.locator('.view-chip.active[data-view="view_bugs"]').count(), 'v 6 is the saved view');
+    assert.ok(await page.locator('.view-chip.active[data-view="view_bugs"]').count(), 'v 7 is the saved view');
     await page.keyboard.press('v');
     await page.keyboard.press('Escape');
     assert.equal(await page.locator('#chord-hints').count(), 0, 'Esc drops a pending prefix and its badges');
@@ -92,7 +96,7 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     assert.ok(JSON.stringify(created[0].query).includes('urgent'), 'the view keeps the query');
     assert.equal(await page.locator('#save-view').count(), 0, 'and it is a view now');
     await page.keyboard.press('v');
-    assert.deepEqual(await hints(), ['1', '2', '3', '4', '5', '6', '7'], 'the new view takes the next number');
+    assert.deepEqual(await hints(), ['1', '2', '3', '4', '5', '6', '7', '8'], 'the new view takes the next number');
     await page.keyboard.press('Escape');
 
     // ── the task page's tool buttons ──

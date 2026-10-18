@@ -19,7 +19,8 @@ import type { Project } from '../src/domain/types.js';
 
 /**
  * The console's side of events (wiki features/events-and-automations):
- * the task form's "On event" trigger and command, and Project settings → Events.
+ * the task form's "On event" trigger and command, Project settings → Events,
+ * and the task store (its view, the default view's recommendations).
  */
 describe('events in the console', () => {
   let dir: string, store: Store, project: Project, browser: Browser, base: string, close: () => Promise<void>;
@@ -123,39 +124,90 @@ describe('events in the console', () => {
     expect(errors).toEqual([]);
   });
 
-  it('adds an automation from the gallery, and saves a repeatable task as one', async () => {
-    const { page, errors } = await open('/personal/factory/settings#project-events');
-    const box = page.locator('#project-events-box');
-    const row = (id: string) => box.locator(`[data-automation="${id}"]`);
+  it('recommends the task store on the default view until dismissed', async () => {
+    const { page, errors } = await open('/personal/factory');
+    const recs = page.locator('.store-recs');
+    await recs.waitFor();
+    expect(await recs.locator('.task-group-heading').textContent()).toMatch(/Recommended from the Task store/);
+    expect(await recs.locator('[data-store-task]').evaluateAll((rows) => rows.map((row) => row.getAttribute('data-store-task'))))
+      .toEqual(['project-wiki', 'repair-github-workflow', 'build-planned-issues', 'triage-issues', 'chat-requests']);
+    if (process.env.KARMAX_SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.KARMAX_SCREENSHOT_DIR, 'store-recommended.png') });
+    await recs.locator('#store-recs-dismiss').click();
+    expect(await recs.count()).toBe(0);
+    // A preference of the person, not of this browser: another device agrees.
+    await expect.poll(async () => (await store.userPreferences('me')).dismissed).toEqual([`task-store:${project.id}`]);
+    const elsewhere = await open('/personal/factory');
+    await elsewhere.page.locator('#task-search').waitFor();
+    await elsewhere.page.waitForTimeout(500);
+    expect(await elsewhere.page.locator('.store-recs').count()).toBe(0);
+    // Bringing it back is the same preference.
+    await store.updateUserPreferences('me', { undismiss: [`task-store:${project.id}`] });
+    await elsewhere.page.reload();
+    await elsewhere.page.locator('.store-recs').waitFor();
+    expect(errors).toEqual([]);
+    expect(elsewhere.errors).toEqual([]);
+  });
+
+  it('runs and installs from the Task store view; a deleted series is on offer again', async () => {
+    const { page, errors } = await open('/personal/factory');
+    await page.locator('.view-chip[data-view="__store__"]').click();
+    await expect.poll(() => page.url()).toMatch(/q=is(:|%3A)store/);
+    const row = (id: string) => page.locator(`.store-row[data-store-task="${id}"]`);
     await row('build-planned-issues').waitFor();
-    expect(await box.locator('[data-automation]').count()).toBe(4);
+    expect(await page.locator('.view-chip[data-view="__store__"]').getAttribute('class')).toContain('active');
+    expect(await page.locator('.store-row').count()).toBe(5);
     // Without a GitHub repository there is nothing for it to hear yet.
-    expect(await row('build-planned-issues').locator('[data-auto-install]').isDisabled()).toBe(true);
+    expect(await row('build-planned-issues').locator('[data-store-run]').isDisabled()).toBe(true);
     expect(await row('build-planned-issues').textContent()).toContain('Needs GitHub');
     expect(await row('chat-requests').textContent()).toContain('Needs a chat bot');
+    expect(await row('project-wiki').locator('[data-store-run]').textContent()).toBe('Run');
 
     const repository = await store.upsertRepository({ organizationId: project.organizationId ?? 'org_personal', provider: 'github', providerId: '99',
       owner: 'acme', name: 'app', sshUrl: 'git@github.com:acme/app.git', defaultBranch: 'main', private: true, gitConnectionId: 'gc_1' });
     await store.attachProjectRepository({ projectId: project.id, repositoryId: repository.id });
     await page.reload();
-    await row('build-planned-issues').locator('[data-auto-install]:not([disabled])').click();
-    await expect.poll(async () => row('build-planned-issues').textContent()).toMatch(/On\s*Open/);
+    await row('build-planned-issues').locator('[data-store-run]:not([disabled])').click();
+    await expect.poll(async () => row('build-planned-issues').textContent()).toMatch(/installed[\s\S]*Open/);
     const series = (await store.listTasks(project.id)).find((task) => task.params?.template === 'build-planned-issues')!;
     expect(series.params).toMatchObject({ repeatable: true, triggerState: 'armed', triggers: [{ type: 'github.issues.labeled' }] });
-    await page.screenshot({ path: path.join(dir, 'automations.png'), fullPage: false });
-    if (process.env.KARMAX_SCREENSHOT_DIR) await box.screenshot({ path: path.join(process.env.KARMAX_SCREENSHOT_DIR, 'automations.png') });
+    if (process.env.KARMAX_SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.KARMAX_SCREENSHOT_DIR, 'task-store.png') });
 
-    await row('build-planned-issues').locator('[data-pe-task]').click();
-    page.once('dialog', (dialog) => dialog.accept('Our planned issues'));
-    await page.locator('#sd-save-automation').click();
-    await expect.poll(async () => (await store.listAutomationTemplates(project.organizationId ?? 'org_personal')).map((a) => a.name)).toEqual(['Our planned issues']);
-    await page.goto(`${base}/personal/factory/settings#project-events`);
-    const own = box.locator('[data-automation^="atm_"]');
-    await own.waitFor();
-    expect(await own.textContent()).toContain('Our planned issues');
+    // An ordinary one runs at once and opens.
+    await row('project-wiki').locator('[data-store-run]').click();
+    await expect.poll(async () => (await store.listTasks(project.id)).filter((task) => task.params?.template === 'project-wiki').length).toBe(1);
+    await expect.poll(() => page.url()).toMatch(/\/tasks\/\d+$/);
+
+    // The series page deletes it, and the store offers it again.
+    await page.goto(`${base}/personal/factory?q=is%3Astore`);
+    await row('build-planned-issues').locator('a', { hasText: 'Open' }).click();
+    expect(await page.locator('#sd-save-store').count()).toBe(0);
     page.once('dialog', (dialog) => dialog.accept());
-    await own.locator('[data-auto-delete]').click();
-    await expect.poll(async () => box.locator('[data-automation]').count()).toBe(4);
+    await page.locator('#sd-delete').click();
+    await expect.poll(async () => store.getTask(series.id)).toBeFalsy();
+
+    await page.goto(`${base}/personal/factory?q=is%3Astore`);
+    await expect.poll(async () => row('build-planned-issues').locator('[data-store-run]').textContent()).toBe('Install');
+    // The rest of the query filters the store by its words.
+    await page.locator('#task-search').fill('is:store planned');
+    await expect.poll(async () => page.locator('.store-row').count()).toBe(1);
+
+    // Settings no longer carries a gallery.
+    await page.goto(`${base}/personal/factory/settings#project-events`);
+    await page.locator('#project-events-box [data-pe-new="webhook"]').waitFor();
+    expect(await page.locator('#project-events-box').textContent()).not.toContain('Automations');
+    expect(errors).toEqual([]);
+  });
+
+  it('deletes a repeatable task from its row in the list', async () => {
+    const created = await store.createTask({ projectId: project.id, title: 'Nightly report', workflow: 'software-dev', workflowVersion: '1.28.0',
+      params: { prompt: 'Report.', repeatable: true } });
+    const { page, errors } = await open('/personal/factory?q=is%3Aseries%20-is%3Aarchived');
+    const row = page.locator(`.series-row[data-series="${created.id}"]`);
+    await row.waitFor();
+    page.once('dialog', (dialog) => dialog.accept());
+    await row.locator('[data-delseries]').click();
+    await expect.poll(async () => row.count()).toBe(0);
+    expect(await store.getTask(created.id)).toBeFalsy();
     expect(errors).toEqual([]);
   });
 });
