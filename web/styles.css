@@ -587,16 +587,28 @@ a.git-repo-name:hover { color:var(--accent); }
 .new-repository-slash { padding-bottom:10px; color:var(--ink-3); font:600 14px var(--font-mono); }
 .new-repository-private { width:max-content; margin:2px 0 18px; font-size:13px; }
 .new-repository-actions { display:flex; justify-content:flex-end; gap:8px; padding-top:14px; border-top:1px solid var(--line); }
-.new-project-dialog { width:min(460px,calc(100vw - 28px)); }
-.new-project-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin:-4px 0 18px; }
-.new-project-head > div { display:grid; gap:4px; }
+.new-project-dialog { width:min(520px,calc(100vw - 28px)); max-height:calc(100vh - 40px); overflow-y:auto; box-sizing:border-box; }
+.new-project-head { display:flex; align-items:center; justify-content:space-between; gap:12px; margin:-4px 0 18px; }
 .new-project-head b { font-size:16px; letter-spacing:-.01em; }
-.new-project-head span, .new-project-preview { color:var(--ink-3); font-size:12px; line-height:1.45; }
-.new-project-dialog .form-row > span { color:var(--ink-2); font-size:12px; font-weight:600; }
-.new-project-dialog .form-row input { width:100%; box-sizing:border-box; }
-.new-project-preview { margin:8px 0 2px; }
+.new-project-dialog .form-row > span, .np-h, .np-fold > summary { color:var(--ink-2); font-size:12px; font-weight:600; }
+.new-project-dialog .form-row input, .new-project-dialog textarea { width:100%; box-sizing:border-box; }
+.new-project-dialog textarea { padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--surface-2); outline:none; resize:vertical; font:12px/1.5 var(--font-mono); }
+.new-project-dialog textarea:focus { border-color:var(--accent); }
+.np-h { margin-bottom:6px; }
+.np-loading { padding:10px 0; color:var(--ink-3); font-size:12px; }
+.np-github .setting-row { min-height:40px; }
+.np-github .setting-label { width:auto; min-width:64px; }
+.np-fold { margin-top:12px; padding-top:12px; border-top:1px solid var(--line); }
+.np-fold > summary { display:flex; align-items:center; gap:6px; cursor:pointer; list-style:none; }
+.np-fold > summary::-webkit-details-marker { display:none; }
+.np-fold > summary::before { content:'›'; width:10px; color:var(--ink-3); font-size:16px; line-height:1; transition:transform .12s; }
+.np-fold[open] > summary::before { transform:rotate(90deg); }
+.np-fold[open] > summary { margin-bottom:8px; }
+.np-env .form-row { margin-bottom:10px; }
 .new-project-error { margin-top:10px; color:var(--danger); font-size:12px; }
 .new-project-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:18px; padding-top:14px; border-top:1px solid var(--line); }
+/* A long form scrolls under its actions, which stay in reach. */
+.new-project-dialog .new-project-actions { position:sticky; bottom:-18px; margin-bottom:-18px; padding-bottom:18px; background:var(--surface); }
 .btn.saved { color:var(--ok, #4ec9a3); border-color:currentColor; }
 .settings-divider { height:1px; background:var(--line); margin:22px 0 18px; }
 .proposal-card { margin:10px 0; padding:12px; display:flex; align-items:center; gap:12px; border:1px solid var(--accent); border-radius:10px; background:var(--accent-weak); }

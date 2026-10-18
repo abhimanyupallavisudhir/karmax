@@ -134,7 +134,7 @@ describe('hosted console journeys (real gateway, stubbed paid providers)', () =>
       await page.locator('#onboarding-new-project').click();
       await page.locator('#new-project-name').fill('First project');
       await page.locator('.new-project-dialog').getByRole('button', { name: 'Create project' }).click();
-      await step('the new project opens', () => page.waitForURL(`**/${organization.slug}/first-project/settings`));
+      await step('the new project opens', () => page.waitForURL((url) => url.pathname === `/${organization.slug}/first-project`));
       await step('setup completes', () => expect.poll(() => page.evaluate((id) => fetch(`/api/user/onboarding?organizationId=${id}`)
         .then((response) => response.json()), organization.id)).toMatchObject({ complete: true, completedRequired: 4 }));
       await step('the guide steps aside', () => page.locator('#hosted-onboarding .onboarding-card').waitFor({ state: 'detached' }));
