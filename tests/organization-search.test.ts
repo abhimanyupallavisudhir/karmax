@@ -153,6 +153,25 @@ describe('organization task list', () => {
       expect((await f.call(f.ana, 'org_missing', 'q=')).status).toBe(404);
     } finally { await f.store.close(); }
   });
+
+  it('answers an installation administrator with an empty list for an organization without projects', async () => {
+    const f = await fixture();
+    try {
+      // Someone else's new personal organization: no projects, and the
+      // administrator is not a member — but sees it in the organization list.
+      const empty = await f.store.createOrganization({ name: 'Newcomer', ownerUserId: 'newcomer' });
+      await f.authorization.bootstrapOrganizationOwner('system:test', 'newcomer', empty.id);
+      await f.authorization.grant('system:test', { principalId: 'user:admin', scopeKey: 'global', profileId: 'god' });
+      const admin = { user: 'Admin', userId: 'admin', email: 'admin@example.com', apiToken: 'session' };
+      const { status, body } = await f.call(admin, empty.id, 'q=');
+      expect(status).toBe(200);
+      expect(body.tasks).toEqual([]);
+      // So does an installation-wide token; anyone else is still refused.
+      const { token } = await f.tokens.mintPrincipal('user:admin', ['project:read', 'task:read']);
+      expect((await f.call({ user: 'agent', apiToken: token }, empty.id, 'q=')).body.tasks).toEqual([]);
+      expect((await f.call(f.ana, empty.id, 'q=')).status).toBe(403);
+    } finally { await f.store.close(); }
+  });
 });
 
 /**

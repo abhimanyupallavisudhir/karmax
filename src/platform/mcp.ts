@@ -372,6 +372,7 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
         authorization: z.object({ level: z.string(), scope: z.enum(['projects', 'organization', 'global']),
           projectIds: z.array(z.string()).optional() }).optional(),
         credentialGrants: z.array(z.string()).optional(),
+        templateId: z.string().optional().describe('Start from this task template (GET /api/projects/:projectId/templates); everything else given overrides it.'),
       },
     },
     async (a) => wrap(async () => {

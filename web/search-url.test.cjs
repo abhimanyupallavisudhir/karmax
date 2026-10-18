@@ -71,6 +71,7 @@ eval(extractFn('listRoute'));
 eval(extractFn('homeRoute'));
 eval(extractFn('isTaskListTab'));
 eval(extractFn('isCrossProjectList'));
+eval(extractFn('savedViews'));
 eval(extractFn('inboxRoute'));
 eval(extractFn('globalRoute'));
 eval(extractFn('encodeQuery'));
@@ -82,6 +83,9 @@ eval(extractFn('normalizeQuery'));
 eval(extractConst('ACTIVE_VIEW_QUERY'));
 eval(extractConst('ACTIVE_VIEW'));
 eval(extractConst('FOR_ME_VIEW'));
+eval(extractConst('STORE_VIEW'));
+eval(extractConst('STORE_VIEW_QUERY'));
+eval(extractFn('isStoreQuery'));
 eval(extractFn('viewIdForQuery'));
 global.location = { pathname: '/', search: '' };
 
@@ -132,6 +136,8 @@ eq(viewIdForQuery('-is:archived'), '__active__', '-is:archived is the “Active�
 eq(viewIdForQuery(' -is:archived  '), '__active__', 'whitespace does not matter');
 eq(viewIdForQuery(''), null, 'the empty query (archived included) is not a view');
 eq(viewIdForQuery('for:me -is:archived'), '__for_me__', 'for:me -is:archived is the “For me” view');
+eq(viewIdForQuery('is:store'), '__store__', 'is:store is the Task store view');
+eq(viewIdForQuery('is:store wiki'), '__store__', 'words filter the Task store view');
 eq(viewIdForQuery('for:me'), null, 'for:me alone includes archived tasks, so it is not “For me”');
 eq(viewIdForQuery('is:archived'), 'builtin:archived', 'a built-in view is recognised from its query');
 eq(viewIdForQuery('-is:archived group:tag-type'), null, 'grouping is the Group menu’s job, not a view');
@@ -150,6 +156,8 @@ function ok(condition, message) {
 // viewIdForQuery is exercised above; this pins that viewsBar() actually consumes
 // it, which is what makes deleting the separate S.activeView state safe.
 global.esc = (s) => String(s ?? ''); // escaping is not what this test is about
+eval(extractFn('listViewChips'));
+eval(extractFn('canSaveViews'));
 eval(extractFn('viewsBar'));
 eval(extractFn('viewQuery'));
 eval(extractFn('listQueryRoute'));
@@ -175,11 +183,17 @@ eq(chipHref('__for_me__'), '/acme/website-redesign', '“For me” links to the 
 eq(chipHref('__active__'), '/acme/website-redesign?q=-is:archived', '“Active” links to its query');
 eq(chipHref('builtin:archived'), '/acme/website-redesign?q=is:archived', 'a built-in view links to its query');
 eq(chipHref('V1'), '/acme/website-redesign?q=tag:bug', 'a saved view links to its query');
+eq(activeChips('is:store'), ['__store__'], '“Task store” lights for its query');
+eq(chipHref('__store__'), '/acme/website-redesign?q=is:store', '“Task store” links to its query');
+ok(viewsBar().indexOf('builtin:archived') < viewsBar().indexOf('__store__') && viewsBar().indexOf('__store__') < viewsBar().indexOf('"V1"'),
+  '“Task store” follows the built-in views, before the saved ones');
+
 eq(parseRoute(chipHref('builtin:scheduled')).q, 'is:scheduled -is:archived sort:nextRun-asc', 'a chip’s URL round-trips to its query');
 S.tab = 'home'; S.searchScope = 'org:org_acme';
 eq(chipHref('builtin:archived'), '/acme?q=is:archived', 'on the organization home a chip links to the home list');
 S.tab = 'inbox';
 eq(chipHref('__active__'), '/inbox?q=-is:archived', 'and on the inbox, to the inbox');
+eq(chipHref('__store__'), undefined, 'the inbox spans organizations: no task store there');
 S.tab = 'tasks'; S.searchScope = 'P1';
 S.search = '';
 

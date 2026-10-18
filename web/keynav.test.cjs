@@ -46,13 +46,15 @@ let pass = 0, fail = 0;
 const ok = (cond, msg) => { if (cond) { pass++; } else { fail++; console.error('FAIL:', msg); } };
 const ev = (key, mods = {}) => ({ key, metaKey: false, ctrlKey: false, altKey: false, shiftKey: false, ...mods });
 
-// ── New task: a stand-in field and Send, both opening the full form ──
-ok(src.includes('id="expand-task" data-shortcut="nav.newTask">New task…</button>'), 'the New task field is a button that opens the form');
-ok(extractFn('wireNewTaskComposer').includes("$('#expand-task')?.addEventListener('click', openNewTaskForm)")
-  && extractFn('wireNewTaskComposer').includes("$('#add-task')?.addEventListener('click', openNewTaskForm)"), 'the field and Send both open the form');
+// ── New task: a stand-in field and Send open the form; beside them, the templates ──
+ok(src.includes('id="expand-task" data-shortcut="nav.newTaskDefault">New task…</button>'), 'the New task field is a button that opens the form (N)');
+ok(src.includes('id="new-from-template" data-shortcut="nav.newTask"'), 'a button beside it picks a template (n)');
+ok(extractFn('wireNewTaskComposer').includes("$('#expand-task')?.addEventListener('click', () => openNewTaskForm())")
+  && extractFn('wireNewTaskComposer').includes("$('#add-task')?.addEventListener('click', () => openNewTaskForm())"), 'the field and Send both open the form');
 ok(!src.includes('id="new-task"') && !src.includes('id="draft-task"') && !src.includes('id="new-task-files"'), 'no typed quick task, draft or attach buttons beside it');
 ok(!src.includes('quick: true') && !src.includes('quickSettingsForms'), 'no quick-task payload or quick-task settings');
-ok(src.includes("{ id: 'nav.newTask', title: 'New task', key: 'n', run: () => openNewTaskForm() }"), 'n opens the form');
+ok(src.includes("{ id: 'nav.newTask', title: 'New task from template', key: 'n', run: () => openTemplatePicker() }"), 'n picks a template');
+ok(src.includes("{ id: 'nav.newTaskDefault', title: 'New task', key: 'N', run: () => openNewTaskForm() }"), 'N opens the form with the Task defaults');
 
 // The Activity feed is an internal debugging page. Its direct route remains
 // usable, but users must not discover it through the tab bar, command palette,
@@ -236,6 +238,10 @@ ok(openTaskFormSource.includes("activeFormToken !== formToken || !root.querySele
 // Exercise the task page's keys through the real command registry and key dispatcher.
 global.S = { selected: 'one', view: {}, tab: 'tasks' };
 global.HOST_COMMANDS = [];
+// The numbered families read the page; this model page has neither views nor tools.
+global.viewCommands = global.toolbarCommands = global.templateCommands = () => [];
+global.showChordHints = () => 0;
+global.hideChordHints = () => {};
 global.inRail = () => false;
 global.openCursorRow = global.archiveCursorRow = () => {};
 let newAttempts = 0, taskMoves = 0, attemptKeydown;

@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { Overlays } from '../src/store/overlays.js';
-import { activationTaskPrompt, resolveRequires, manifest } from '../src/contrib/manifests.js';
+import { resolveRequires } from '../src/contrib/manifests.js';
+import { STORE_TASKS, PROJECT_WIKI_TEMPLATE_ID } from '../src/domain/task-store.js';
 
 describe('overlay resolution + safe mode (SPEC §9)', () => {
   it('resolves project → user → bundled, and safe mode uses bundled only', () => {
@@ -27,24 +28,19 @@ describe('overlay resolution + safe mode (SPEC §9)', () => {
 describe('manifest dependency resolution (SPEC §4.6)', () => {
   it('resolves the transitive closure of requires', () => {
     expect(resolveRequires(['software-dev']).sort()).toEqual(['merge-queue', 'software-dev'].sort());
-    expect(manifest('software-dev')?.onActivate?.spawnTask?.workflow).toBe('software-dev');
   });
 
-  it('tailors the initial tavya-readiness task to the deployment', () => {
-    const prep = manifest('software-dev')!.onActivate!.spawnTask!;
-    const local = activationTaskPrompt(prep, false);
-    const hosted = activationTaskPrompt(prep, true);
-    const expectedHosted = `## Initial set-up task for tavya-readiness
-1) Migrate AGENTS.md, CLAUDE.md or any other similar agent context systems to tavya's project wiki.
-2) If no such files exist, or if they are out of date, please compile a new wiki page containing everything essential for a new developer/agent to get up and running with it.
-It is important to use the "default" tag on wiki articles that must appear in the context of every new agent.
-Report what you changed.
-[To humans: This is not for you. Just press "Queue" and the agent will do the above.]`;
-    expect(local).toContain('Migrate AGENTS.md, CLAUDE.md');
-    expect(local).toContain('compile a new wiki page');
-    expect(local).toContain('use the "default" tag');
-    expect(local).toContain('hardcoded resources (e.g. ports)');
-    expect(local).not.toContain('Ensure git is initialized');
-    expect(hosted).toBe(expectedHosted);
+  it('tailors the store\'s project-wiki task to the deployment', () => {
+    const wiki = STORE_TASKS.find((task) => task.id === PROJECT_WIKI_TEMPLATE_ID)!.task;
+    expect(wiki.workflow).toBe('software-dev');
+    for (const prompt of [wiki.prompt, wiki.hostedPrompt!]) {
+      expect(prompt).toContain('Migrate AGENTS.md, CLAUDE.md');
+      expect(prompt).toContain('memories for facts worth knowing, skills for procedures worth repeating');
+      expect(prompt).toContain('"default" label');
+      expect(prompt).not.toContain('Queue');
+    }
+    // Isolated cloud worlds have no worktrees to collide.
+    expect(wiki.prompt).toContain('hardcoded resources (e.g. ports)');
+    expect(wiki.hostedPrompt).not.toContain('ports');
   });
 });

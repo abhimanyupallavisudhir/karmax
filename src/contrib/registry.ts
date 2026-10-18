@@ -48,7 +48,8 @@ export class ContributionRegistry {
 
 /** Core commands the host registers (keyboard navigation; SPEC §10.1, §10.3). */
 export const CORE_COMMANDS: CommandDecl[] = [
-  { id: 'nav.newTask', title: 'New task', keybinding: 'n' },
+  { id: 'nav.newTask', title: 'New task from template', keybinding: 'n' },
+  { id: 'nav.newTaskDefault', title: 'New task', keybinding: 'N' },
   { id: 'nav.search', title: 'Search', keybinding: '/' },
   { id: 'nav.home', title: 'Go home', keybinding: 'g H' },
   { id: 'nav.tasks', title: 'Go to tasks', keybinding: 'g t' },
@@ -63,6 +64,8 @@ export const CORE_COMMANDS: CommandDecl[] = [
   { id: 'nav.searchProjects', title: 'Search projects', keybinding: 'p /' },
   { id: 'nav.profile', title: 'Go to your profile', keybinding: 'g A' },
   { id: 'nav.notifications', title: 'Go to inbox', keybinding: 'g N' },
+  { id: 'nav.vault', title: 'Go to passwords & payments', keybinding: 'g V' },
+  { id: 'view.save', title: 'Save search as view', keybinding: 'v s' },
   { id: 'nav.close', title: 'Close panel', keybinding: 'Escape' },
   { id: 'nav.commandPalette', title: 'Command palette', keybinding: 'meta+k' },
   { id: 'help.keyboard', title: 'Keyboard shortcuts', keybinding: '?' },

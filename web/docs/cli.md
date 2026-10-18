@@ -81,6 +81,7 @@ Inside a project's folder, a task is its number; anywhere else, `my-org/my-proje
 | Command | What it does |
 |---|---|
 | `tavya task new "Fix the login bug"` | Start a task (add `--prompt` for details) |
+| `tavya task new "Release 2.0" --template 2` | Start a task from a template, by its number or name (`tavya task templates` lists them) |
 | `tavya task list` | List tasks |
 | `tavya task logs 42 -f` | Follow a task |
 | `tavya task say 42 "Use the staging database"` | Message its agent |

@@ -356,6 +356,9 @@ const RESOURCES_WAIT_FOR_WORLD = 'resources-wait-for-world-v1';
 const STAGES_WAIT_FOR_CAPACITY = 'stages-wait-for-capacity-v1';
 /** A pause a message interrupted goes on after the turn that answered it. */
 const PAUSE_GOES_ON = 'pause-goes-on-after-interruption-v1';
+/** A task whose branches all landed as their own pull requests still reviews
+ * the data it changed, instead of finishing and losing it with its world. */
+const SEVERAL_BRANCHES_DATA_REVIEW = 'several-branches-data-review-v1';
 /** A sub-task whose parent world cannot be reached is waited out, then a
  * person's, never the asking agent's (pramana#39/#43). */
 const SUBTASK_PREPARE_WAITS_FOR_WORLD = 'software-dev-subtask-prepare-waits-for-world-v1';
@@ -5145,6 +5148,15 @@ Inspect the complete current diff and specifically compare its delta from the re
             const own: string[] = (await (patched(OPEN_PR_WAITS_FOR_WORLD) ? withResolve('pr', withWork) : withWork()))
               .filter((checkout) => !checkout.head || checkout.head !== settledAt(checkout.name)).map((checkout) => checkout.name);
             if (!own.length) {
+              // Pull requests carry code only; the task's data is still its own to publish.
+              if (resourceCandidateReview && patched(SEVERAL_BRANCHES_DATA_REVIEW)
+                && await withResolve('pr', () => resourceActivities.resourcesToReview(taskId))) {
+                stage = 'review';
+                status = 'waiting';
+                const reviewOutcome = await playReviewGate({ turnFinished, messagesSeen: unreadFrom() });
+                if (reviewOutcome === 'cancelled') return await abort();
+                if (reviewOutcome === 'do') { prRequested = false; stage = 'do'; status = 'active'; continue; }
+              }
               prRequested = false;
               pullRequestsSettled = true;
               break;
@@ -5370,9 +5382,9 @@ Inspect the complete current diff and specifically compare its delta from the re
     stage = 'done';
     status = 'done';
     const landed = shipments.filter((shipment) => shipment.state === 'landed');
-    const note = landed.length
+    const note = (landed.length
       ? `Landed ${landed.length} pull request${landed.length === 1 ? '' : 's'}: ${landed.map((shipment) => `"${shipment.checkout}"`).join(', ')}.`
-      : 'Nothing to land.';
+      : 'Nothing to land.') + (resourcesApplied ? ' Published its data.' : '');
     reviewInfo = { ...reviewInfo, summary: reviewInfo?.summary ? `${reviewInfo.summary}\n\n${note}` : note };
     await publish();
     const remoteWorld = world ? releaseWorldOnCompletion(world) : false;

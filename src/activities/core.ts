@@ -23,7 +23,7 @@ import { prepareConnections } from '../mcp/connections/runtime.js';
 import { checkoutBranches, expectedTaskRemoteHeads } from '../world/publication.js';
 import { applyConversationPatch, conversationPage, hasLiveWorldWork, watchesJobs, lifecycleEventPayload, transcriptOf, type PublishedView, type TurnConversationBase, type ViewConversation, type LifecyclePublication } from '../domain/view-publication.js';
 import { recordHumanConfirmation } from '../platform/review-confirmation.js';
-import { WorkflowNotFoundError, type Client } from '@temporalio/client';
+import { ServiceError, WorkflowNotFoundError, WorkflowUpdateFailedError, isGrpcServiceError, type Client } from '@temporalio/client';
 import { Context as activityContext } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
 import { AgentChannelLost, ProviderCapacityFull, ProviderOutage, ProviderPolicyFailure, SandboxProviderFailure, confirmSandboxFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, isContextOverflow, type LimitClassification } from '../agent/limits.js';
@@ -428,7 +428,21 @@ export interface CreateWorldArgs {
   gitProfile?: string;
 }
 
-async function acquireWorkflowAgentSlot(args: {
+/** Consecutive interrupted waits before admission gives up as an outage. */
+const QUEUE_RUN_INTERRUPTIONS = 5;
+
+/** The queue's workflow task or run ended under this Update rather than
+ * answering it: a rotation's task failed because a signal arrived meanwhile
+ * (the server then aborts the Updates it carried with FAILED_PRECONDITION), or
+ * the run closed. Its state rolled back or rode along, so asking again keeps
+ * this turn's place. */
+function queueRunInterrupted(error: unknown): boolean {
+  if (error instanceof WorkflowUpdateFailedError) return true;
+  const FAILED_PRECONDITION = 9;
+  return error instanceof ServiceError && isGrpcServiceError(error.cause) && error.cause.code === FAILED_PRECONDITION;
+}
+
+export async function acquireWorkflowAgentSlot(args: {
   client: Client;
   taskQueue: string;
   store: Store;
@@ -458,23 +472,37 @@ async function acquireWorkflowAgentSlot(args: {
   try {
     if (args.signal?.aborted)
       throw args.signal.reason instanceof Error ? args.signal.reason : new Error('agent queue wait cancelled');
-    // Keep the long-running activity lease alive while one durable Workflow
-    // Update waits for promotion. This creates O(waiters), not O(waiters × time),
+    // Keep the long-running activity lease alive while a durable Workflow Update
+    // (one per run of the queue) waits for promotion. This creates O(waiters), not O(waiters × time),
     // Temporal requests and cannot fill the consistent-query buffer.
     heartbeatTimer = setInterval(() => {
       try { args.heartbeat?.(); } catch { /* activity cancellation is handled below */ }
     }, 10_000);
     heartbeatTimer.unref?.();
-    const admission = args.client.workflow.getHandle(id).executeUpdate(UPD_WAIT_AGENT, {
-      args: [{
-        taskId: args.taskId,
-        turnId: args.turnId,
-        role: args.role,
-        provider: args.provider,
-        title: args.title,
-        projectId: args.projectId,
-      }],
-    }) as Promise<boolean>;
+    const item = {
+      taskId: args.taskId,
+      turnId: args.turnId,
+      role: args.role,
+      provider: args.provider,
+      title: args.title,
+      projectId: args.projectId,
+    };
+    // `null`: the queue answered before continuing as new. The item rode along
+    // in its state, so asking the next run again keeps this turn's place.
+    const admission = (async () => {
+      for (let interrupted = 0; ;) {
+        let granted: boolean | null;
+        try {
+          granted = await args.client.workflow.getHandle(id).executeUpdate(UPD_WAIT_AGENT, { args: [item] }) as boolean | null;
+        } catch (error) {
+          if (!queueRunInterrupted(error) || ++interrupted > QUEUE_RUN_INTERRUPTIONS) throw error;
+          await new Promise((resolve) => setTimeout(resolve, 250));
+          granted = null;
+        }
+        if (granted !== null) return granted;
+        if (args.signal?.aborted) return false;
+      }
+    })();
     let removeAbortListener = () => {};
     const granted = await (args.signal
       ? Promise.race([
@@ -4642,6 +4670,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
 
     async unsavedResourceCandidates(taskId: string): Promise<Array<{ path: string; error?: string }>> {
       return (await deps.resources?.unsavedCandidates(taskId)) ?? [];
+    },
+
+    /** Data this task would publish at its Review (SPEC §11.1: a task whose
+     * branches all landed as their own pull requests still reviews its data). */
+    async resourcesToReview(taskId: string): Promise<boolean> {
+      return (await deps.resources?.hasChangesToReview(taskId)) ?? false;
     },
 
     async pendingResourceCandidates(taskId: string): Promise<number> {

@@ -285,6 +285,7 @@ export const TOOL_CAPABILITY: Record<string, Capability> = {
   get_task: 'task:read', find_task: 'task:read', list_tasks: 'task:read', search_tasks: 'task:read',
   list_tags: 'task:read', list_views: 'task:read', search_fields: 'task:read',
   manage_tag: 'task:edit', set_task_tags: 'task:edit', set_task_priority: 'task:edit', manage_view: 'task:edit',
+  list_templates: 'task:read', manage_template: 'task:create',
   list_workflows: 'workflow:read', edit_workflow: 'workflow:edit', install_workflow: 'workflow:install',
   list_projects: 'project:read', create_project: 'project:create', edit_project: 'project:edit', delete_project: 'project:delete',
   get_settings: 'settings:read', set_settings: 'settings:write',

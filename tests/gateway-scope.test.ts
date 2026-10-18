@@ -463,6 +463,26 @@ describe('gateway request scope for bare-id routes', () => {
     expect(ok.status).toBe(200);
   });
 
+  it('serves the organization home’s views and refuses another organization’s', async () => {
+    const otherOrg = (await store.getProject(theirs))!.organizationId!;
+    const created = await fetch(`${base}/api/organizations/${acmeId}/views`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ name: 'Waiting on me', query: { filters: [{ field: 'is', op: 'is', values: ['review'] }] } }) });
+    const view = await created.json() as any;
+    expect(created.status, JSON.stringify(view)).toBe(200);
+    expect(view).toMatchObject({ organizationId: acmeId, name: 'Waiting on me' });
+    const listed = await (await fetch(`${base}/api/organizations/${acmeId}/views`, { headers: auth() })).json() as any[];
+    expect(listed.map((v) => v.id)).toContain(view.id);
+
+    const foreign = (await store.createView({ organizationId: otherOrg, name: 'Theirs', query: {} as any }));
+    expect((await fetch(`${base}/api/organizations/${otherOrg}/views`, { headers: auth() })).status).toBe(403);
+    expect((await fetch(`${base}/api/organizations/${otherOrg}/views`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ name: 'smuggled', query: {} }) })).status).toBe(403);
+    for (const [method, body] of [['PATCH', JSON.stringify({ name: 'pwned' })], ['DELETE', undefined]] as const)
+      expect((await fetch(`${base}/api/views/${foreign.id}`, { method, headers: auth(), body })).status, method).toBe(403);
+    expect((await store.getView(foreign.id))?.name).toBe('Theirs');
+    expect((await fetch(`${base}/api/views/${view.id}`, { method: 'DELETE', headers: auth() })).status).toBe(200);
+  });
+
   // `?projectId=` used to outrank the addressed task's own project, so a token
   // for one project could read, and run review actions in, any tenant's task
   // just by naming its own project. The record decides; a contradiction is refused.
@@ -533,6 +553,26 @@ describe('gateway request scope for bare-id routes', () => {
     expect((await send(otherTask.id, messenger)).status).toBe(403);
     const signaller = (await tokens.mintPrincipal('user:a', ['task:read', 'task:signal'], mine, 60_000, acmeId)).token;
     expect((await send(acmeTask.id, signaller)).status).toBe(403);
+  });
+
+  it('serves the organization home’s views and refuses another organization’s', async () => {
+    const otherOrg = (await store.getProject(theirs))!.organizationId!;
+    const created = await fetch(`${base}/api/organizations/${acmeId}/views`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ name: 'Waiting on me', query: { filters: [{ field: 'is', op: 'is', values: ['review'] }] } }) });
+    expect(created.status).toBe(200);
+    const view = await created.json() as any;
+    expect(view).toMatchObject({ organizationId: acmeId, name: 'Waiting on me' });
+    const listed = await (await fetch(`${base}/api/organizations/${acmeId}/views`, { headers: auth() })).json() as any[];
+    expect(listed.map((v) => v.id)).toContain(view.id);
+
+    const foreign = (await store.createView({ organizationId: otherOrg, name: 'Theirs', query: {} as any }));
+    expect((await fetch(`${base}/api/organizations/${otherOrg}/views`, { headers: auth() })).status).toBe(403);
+    expect((await fetch(`${base}/api/organizations/${otherOrg}/views`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ name: 'smuggled', query: {} }) })).status).toBe(403);
+    for (const [method, body] of [['PATCH', JSON.stringify({ name: 'pwned' })], ['DELETE', undefined]] as const)
+      expect((await fetch(`${base}/api/views/${foreign.id}`, { method, headers: auth(), body })).status, method).toBe(403);
+    expect((await store.getView(foreign.id))?.name).toBe('Theirs');
+    expect((await fetch(`${base}/api/views/${view.id}`, { method: 'DELETE', headers: auth() })).status).toBe(200);
   });
 
   // `?projectId=` used to outrank the addressed task's own project, so a token

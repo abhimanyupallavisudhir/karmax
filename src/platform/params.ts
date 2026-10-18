@@ -4,6 +4,7 @@ import { applyComputer, normalizeComputer } from '../domain/computer.js';
 import { WorkflowManifest } from '../contrib/manifests.js';
 import { expandPath } from '../util/expand.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
+import { COMMON_SETTINGS_WORKFLOW, isWorkflowSettings, splitSharedSettings } from '../domain/shared-settings.js';
 
 /**
  * Parameter resolution + assembly (SPEC §10.4). A single declared FieldSpec
@@ -13,21 +14,20 @@ import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
  * value into TaskInput via the field's `bind`, so no per-workflow code is needed.
  */
 
+export { COMMON_SETTINGS_WORKFLOW };
 export type ValueMap = Record<string, unknown>;
-/** Shared settings are declared once and consumed by every workflow that has a
- * field with the same name. Workflow rows now contain only genuinely unique
- * settings; the merge keeps historical per-workflow rows working. */
-export const COMMON_SETTINGS_WORKFLOW = '__common__';
 
 async function withCommon(
   getSettings: (scopeKey: string, workflow: string) => ValueMap | undefined | Promise<ValueMap | undefined>,
   scopeKey: string,
   workflow: string,
 ): Promise<ValueMap | undefined> {
-  const common = (await getSettings(scopeKey, COMMON_SETTINGS_WORKFLOW));
   const specific = (await getSettings(scopeKey, workflow));
-  if (common === specific) return specific;
-  return common || specific ? { ...(common ?? {}), ...(specific ?? {}) } : undefined;
+  // Payments, vault and the like are rows of their own; Task defaults are not
+  // theirs (a read-merge-write of them would copy the shared fields in).
+  if (!isWorkflowSettings(workflow)) return specific;
+  const common = (await getSettings(scopeKey, COMMON_SETTINGS_WORKFLOW));
+  return common || specific ? { ...common, ...(specific && splitSharedSettings(workflow, specific).own) } : undefined;
 }
 
 export function resolveParams(

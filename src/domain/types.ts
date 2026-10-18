@@ -1289,13 +1289,47 @@ export interface TaskQuery {
 /** A named, saved query — the user's custom "view" of a project's tasks. */
 export interface SavedView {
   id: string;
+  /** The project whose task list shows it; '' for an organization's view. */
   projectId: string;
+  /** Set on a view of the organization home (every project's list) instead of one project's. */
+  organizationId?: string;
   name: string;
   query: TaskQuery;
   /** Optional icon/emoji shown in the views sidebar. */
   icon?: string;
   order: number;
   createdAt: number;
+}
+
+/**
+ * A task template: a named, saved task form — everything a new task's form
+ * holds (its workflow, prompt and every parameter, authorization, vault
+ * grants, notes, tags, priority) — that a new task starts from. A project's
+ * templates and its organization's are offered together, numbered by when
+ * they were added; template 0 is the Task defaults themselves, never stored.
+ * Task-specific references (attachments, dependencies, a forked session) are
+ * not part of a template.
+ */
+export interface TaskTemplate {
+  id: string;
+  organizationId: string;
+  /** The project it belongs to; '' for an organization's template (every project's). */
+  projectId: string;
+  name: string;
+  workflow: string;
+  /** The task form's params, as `createTask` takes them. */
+  params: Record<string, unknown>;
+  notes?: string;
+  /** Absent projectIds on a `projects` scope mean the new task's own project. */
+  authorization?: AuthorizationSelection;
+  credentialGrants?: string[];
+  credentialPolicies?: Record<string, unknown>;
+  /** Tag names: a task started from it gets the project's tags of these names. */
+  tags?: string[];
+  priority?: number;
+  createdBy?: string;
+  createdAt: number;
+  updatedAt: number;
 }
 
 // ─── The view-model (SPEC §10.2 — the mandatory typed projection) ─────────────

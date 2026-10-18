@@ -91,6 +91,24 @@ describe('KarmaxApi cross-project / cross-tenant scope', () => {
     await expect(api.updateView(token, own.id, { name: 'Renamed' })).resolves.toMatchObject({ name: 'Renamed' });
   });
 
+  it('scopes the organization home’s views to the organization', async () => {
+    const acme = (await store.getProject(mine))!.organizationId!;
+    const other = (await store.getProject(theirs))!.organizationId!;
+    const foreign = (await store.createView({ organizationId: other, name: 'Theirs', query: {} as any }));
+
+    await denied(() => api.listOrganizationViews(token, other));
+    await denied(() => api.createOrganizationView(token, { organizationId: other, name: 'smuggled', query: {} as any }));
+    await denied(() => api.updateView(token, foreign.id, { name: 'pwned' }));
+    await denied(() => api.deleteView(token, foreign.id));
+    expect((await store.getView(foreign.id))?.name).toBe('Theirs');
+
+    const own = await api.createOrganizationView(token, { organizationId: acme, name: 'Mine', query: {} as any });
+    expect((await api.listOrganizationViews(token, acme)).map((v) => v.id)).toEqual([own.id]);
+    await expect(api.updateView(token, own.id, { name: 'Renamed' })).resolves.toMatchObject({ name: 'Renamed' });
+    await api.deleteView(token, own.id);
+    expect((await store.getView(own.id))).toBeUndefined();
+  });
+
   /** The task-shaped siblings that also omitted their scope. */
   it('refuses task lifecycle operations against another project’s task', async () => {
     const foreign = (await store.createTask({ projectId: theirs, title: 'Theirs', workflow: 'software-dev',

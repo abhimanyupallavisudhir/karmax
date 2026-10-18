@@ -73,7 +73,7 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     assert.deepEqual(chips.slice(0, 2), ['__for_me__', '__active__'], 'For me, then Active');
     assert.equal(await page.locator('.view-chip[data-view="__active__"]').innerText(), 'Active');
     assert.equal(await page.locator('.view-chip[data-view="__active__"]').getAttribute('title'), '-is:archived', 'its query is on hover');
-    assert.equal(await page.locator('#save-view').count(), 0, 'saved views belong to projects');
+    assert.equal(await page.locator('#save-view').count(), 0, 'a search that is already a view offers no Save view');
     assert.equal(await page.locator('#expand-task').innerText(), 'New task…', 'one New task field, which opens the form');
     assert.equal(await page.locator('#new-task-project').count(), 0, 'the form, not the field, picks the project');
     const review = page.locator('[data-id="t1"] .chip.attention');

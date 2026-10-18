@@ -53,6 +53,25 @@ export async function projects(api: Api, args: string[], out: Output, flags: Rec
   return 0;
 }
 
+interface TaskTemplate { id: string; name: string; projectId: string }
+
+/** A template by its number (as `n` shows it; 0 is the Task defaults) or its name. */
+async function resolveTemplate(api: Api, projectId: string, ref: string): Promise<TaskTemplate | undefined> {
+  const templates = await api.get<TaskTemplate[]>(`/api/projects/${encodeURIComponent(projectId)}/templates`);
+  if (/^\d+$/.test(ref)) {
+    const n = Number(ref);
+    if (n === 0) return undefined;
+    if (templates[n - 1]) return templates[n - 1];
+  } else {
+    const wanted = ref.trim().toLowerCase();
+    const exact = templates.filter((entry) => entry.name.toLowerCase() === wanted);
+    const matches = exact.length ? exact : templates.filter((entry) => entry.name.toLowerCase().startsWith(wanted));
+    if (matches.length === 1) return matches[0];
+    if (matches.length > 1) throw new CliError(`"${ref}" names ${matches.length} templates: ${matches.map((entry) => entry.name).join(', ')}`, EXIT.usage);
+  }
+  throw new CliError(`no template "${ref}" in this project (tavya task templates lists them)`, EXIT.notFound);
+}
+
 interface TaskView { taskId?: string; id?: string; title: string; num?: number; status?: string; stage?: string;
   waitingFor?: { kind?: string; summary?: string }; branch?: string; lastView?: TaskView }
 
@@ -66,14 +85,24 @@ export async function task(api: Api, args: string[], out: Output, flags: Record<
   switch (action) {
     case 'new': case 'create': {
       const title = rest.join(' ').trim();
-      if (!title) throw new CliError('usage: tavya task new <title> [--prompt <text> | --prompt-file <file> | stdin]', EXIT.usage);
+      if (!title) throw new CliError('usage: tavya task new <title> [--template <number|name>] [--prompt <text> | --prompt-file <file> | stdin]', EXIT.usage);
       const target = await resolveProject(api, flags.project, workspace);
+      // A template's own prompt stands unless one is given; without one, the title is the prompt.
+      const template = flags.template ? await resolveTemplate(api, target.project.id, flags.template) : undefined;
+      const fallback = template ? undefined : title;
       const prompt = flags.prompt ?? (flags['prompt-file'] ? fs.readFileSync(flags['prompt-file'], 'utf8')
-        : process.stdin.isTTY ? title : (await readStdin()).trim() || title);
+        : process.stdin.isTTY ? fallback : (await readStdin()).trim() || fallback);
       const created = await api.post<{ id: string; num?: number }>(`/api/projects/${encodeURIComponent(target.project.id)}/tasks`,
-        { title, prompt, ...(flags.workflow ? { workflow: flags.workflow } : {}), ...(flags.draft ? { draft: true } : {}) });
+        { title, ...(prompt !== undefined ? { prompt } : {}), ...(template ? { templateId: template.id } : {}),
+          ...(flags.workflow ? { workflow: flags.workflow } : {}), ...(flags.draft ? { draft: true } : {}) });
       const url = taskUrl(api.server, { ...target, taskId: created.id, ...(created.num != null ? { taskNumber: created.num } : {}) }, workspace?.manifest.organization);
       out.result({ ...created, url }, `${created.num != null ? `#${created.num} ` : ''}${title}\n${url}`);
+      return 0;
+    }
+    case 'templates': {
+      const target = await resolveProject(api, flags.project, workspace);
+      const templates = await api.get<TaskTemplate[]>(`/api/projects/${encodeURIComponent(target.project.id)}/templates`);
+      out.result(templates, table([['0', 'Default', ''], ...templates.map((entry, i) => [String(i + 1), entry.name, entry.projectId ? '' : 'organization'])]));
       return 0;
     }
     case 'list': case 'ls': {
