@@ -167,6 +167,11 @@ const SETTLE_ROUNDS = 5;
 /** And waits this long before saving again, doubled each round (2, 4, 8, 16 s:
  * a build or a job finishing its output gets half a minute). */
 const SETTLE_PAUSE_MS = 2_000;
+/** The first pause; `KARMAX_RESOURCE_SETTLE_PAUSE_MS` shortens it (tests). */
+function settlePauseMs(): number {
+  const configured = Number(process.env.KARMAX_RESOURCE_SETTLE_PAUSE_MS);
+  return Number.isFinite(configured) && configured >= 0 ? configured : SETTLE_PAUSE_MS;
+}
 const VERIFY_MAX_BYTES = 256 * 1024 * 1024;
 /** restic tests every node of a snapshot against every restore pattern, so a
  * merge's pattern count multiplies the resource's size. Past this many, a merge
@@ -252,7 +257,7 @@ export class ResticResources {
       // A writer that is finishing (a job flushing its output) gets a while,
       // longer each time; one that keeps running (a server, an open database)
       // will not settle.
-      if (round + 1 < SETTLE_ROUNDS) await new Promise((resolve) => setTimeout(resolve, SETTLE_PAUSE_MS * 2 ** round));
+      if (round + 1 < SETTLE_ROUNDS) await new Promise((resolve) => setTimeout(resolve, settlePauseMs() * 2 ** round));
     }
     // What changed from each save to the next is what something kept writing.
     const changing = await this.changedBetween(attachment, superseded).catch(() => ({ paths: [], total: 0 }));
