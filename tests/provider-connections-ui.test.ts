@@ -20,7 +20,6 @@ const usageApi = (usage: Record<string, unknown>): ApiHandler => ({ path }) => p
   ? { costMicros: 1_750_000, incurredCostMicros: 1_000_000, estimatedCostMicros: 750_000, activeReservationsMicros: 250_000,
     events: 3, from: month, ...usage }
   : undefined;
-const usageText = async (ui: Console) => (await ui.page.locator('#org-usage').textContent())!;
 
 describe('organization Computers and usage UI', () => {
   const connected = [{ provider: 'e2b', status: 'ready', enabled: true, credentialConfigured: true, config: { template: 'my-template' } },
@@ -121,21 +120,18 @@ describe('organization Computers and usage UI', () => {
     await ui.close();
   });
 
-  it('shows usage under Plan & billing, with reconciliation coverage', async () => {
-    const ui = await organization('#org-usage .usage-row', usageApi({}));
-    expect(await ui.page.locator('#org-usage').evaluate((element) => element.closest('.settings-pane')!.getAttribute('data-pane'))).toBe('settings-plan');
-    expect(await usageText(ui)).toContain('$1.75 This month');
-    // The split is the tooltip, said once.
-    expect(await ui.page.locator('#org-usage .info-dot').getAttribute('title')).toBe('Incurred $1.00 · estimated $0.75 · reserved for running computers $0.25 · 3 usage records');
+  // Plan & billing shows what the plan includes and uses; an organization's own
+  // provider bill is not a plan fact (it read "Usage $1.75" and confused owners).
+  it('shows the plan\'s limits under Plan & billing, not the organization\'s own provider bill', async () => {
+    const entitlements = { deployment: 'hosted', plan: 'free', planName: 'Free', currentMonthlyPriceCents: 0, maxMembers: 1,
+      currentMemberCount: 1, maxActiveAgentRuns: 5, storageQuotaBytes: 5 * 1024 ** 3, includedStorageBytes: 5 * 1024 ** 3,
+      storageUsedBytes: 1024 ** 3, storagePackBytes: 100 * 1024 ** 3, compute: null };
+    const ui = await organization('#org-plan .plan-limits', (call) => call.path === '/api/organizations/o/entitlements' ? entitlements : usageApi({})(call));
+    expect(await ui.page.locator('#org-plan .plan-limits').evaluate((element) => element.closest('.settings-pane')!.getAttribute('data-pane'))).toBe('settings-plan');
+    expect(await ui.page.locator('#org-plan .plan-limits').innerText()).toMatch(/Storage[\s\S]*1 GB\s+of 5 GB/);
+    expect(await ui.page.locator('#org-usage').count()).toBe(0);
+    expect(await ui.page.locator('#org-plan').innerText()).not.toContain('$1.75');
+    expect(ui.calls.some((call) => call.path === '/api/organizations/o/usage')).toBe(false);
     await ui.close();
-
-    // Provider reconciliation that only began mid-month narrows the period it vouches for.
-    const late = await organization('#org-usage .usage-row', usageApi({ sync: [{ provider: 'e2b', status: 'ok', at: Date.now(),
-      coverageFrom: Date.UTC(2026, 8, 15, 12) }] }));
-    expect(await usageText(late)).toMatch(/Since Sep 1[45] · synced /);
-    await late.close();
-    const gap = await organization('#org-usage .usage-row', usageApi({ sync: [{ provider: 'e2b', status: 'error', gap: true, at: Date.now() }] }));
-    expect(await usageText(gap)).toContain('Incomplete history · sync unavailable');
-    await gap.close();
   });
 });
