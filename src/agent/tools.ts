@@ -795,7 +795,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   },
   {
     name: 'message_agent',
-    description: 'Send a follow-up to an original or forked task agent; it is injected live when running.',
+    description: 'Message another task\'s agent — any task of your project (find_task resolves a #number). It reads it as from your task ("Task #N"): at once if working, else it wakes.',
     parameters: { type: 'object', properties: { task_id: { type: 'string' }, role: { type: 'string' }, message: { type: 'string' } }, required: ['task_id', 'message'] },
   },
   {
