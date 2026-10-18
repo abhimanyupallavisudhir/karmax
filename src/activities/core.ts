@@ -127,11 +127,12 @@ import { assembleTaskInput } from '../platform/params.js';
 import { childComputer, subTaskParams } from '../platform/agent-params.js';
 import { allows, attenuate, CHILD_TASK_CEILING } from '../platform/capabilities.js';
 import { Provider, Message, TaskInput, TaskView, AgentRole, remotePolicyOf, landingAuthorityOf, type Repository, type TaskPullRequest,
-  type GitHubMergeAuthorization, type GithubLandingParticipant, type LandingAuthority, type UpstreamProposal, type SubTaskRequest, type SubTaskResponse, type TaskRecord, type WorldHandleRef } from '../domain/types.js';
+  type GitHubMergeAuthorization, type GithubLandingParticipant, type LandingAuthority, type UpstreamProposal, type SubTaskRequest, type SubTaskResponse, type TaskRecord, type WorldHandleRef, type AdoptedRepositories, type KeptWorkspace } from '../domain/types.js';
 import { newId } from '../util/id.js';
 import { SIG_AGENT_TURN_STATE } from '../workflows/names.js';
 import { destroyWorldServices } from '../world/services.js';
 import { sameRepository } from '../world/repository-identity.js';
+import { STORAGE_POLICY } from '../world/managed-storage.js';
 import { forkDevelopmentSources, forkRecordedAuthority, type ForkWorldSource } from '../world/fork.js';
 import { REPOSITORY_BRANCHES_RESOLVED_PARAM, normalizeRepoBranches, repoBranchesFor } from '../platform/branch-defaults.js';
 
@@ -3974,7 +3975,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           identity = undefined; // fall back to ensureIdentity inside finalizeMerge
         }
       }
-      const result = isRemote(handle.kind)
+      // A local world whose checkouts were all enrolled from their origin
+      // while it ran (it began without repositories) has no host repository
+      // to merge in: it lands through the broker, as a cloud world does.
+      const enrolledOnly = worldRepos(world.handle).length > 0
+        && worldRepos(world.handle).every((repo) => !path.isAbsolute(repo.repo) && repo.sourceAuthority === 'origin');
+      const result = isRemote(handle.kind) || enrolledOnly
         ? await brokerFinalizeMerge(world, target, identity, (await brokerAuthFor(handle, handle.id)))
         : await finalizeMerge(world, target, identity);
       (await record(handle.id, 'merge.result', { merged: result.merged, sha: result.sha, conflict: result.conflict, dirty: result.dirty }));
@@ -4226,11 +4232,23 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
      * Git, without promoting any project resource head. */
     async checkpointResourceOnlyWork(handle: WorldHandle, configuredRepos: string[]): Promise<boolean> {
       const world = await openWorld(handle);
-      if (worldRepos(world.handle).length) return false;
-      const projectId = (await store.getTask(handle.id))?.projectId ?? String(world.handle.meta?.projectId ?? '');
-      const project = (await store.getProject(projectId));
-      if (configuredRepos.length || project?.config.repos?.length || (await store.listProjectRepositories(projectId)).length)
-        throw new Error('configured repositories are missing from the task world');
+      if (worldRepos(world.handle).length) {
+        // Began without repositories and gained one mid-task: its Git work is
+        // committed and published as usual, and the files it made before stay
+        // in a checkpoint (those outside the checkout are in nothing else).
+        if (!configuredRepos.length && deps.checkpoints) {
+          const checkpoint = await deps.checkpoints.checkpoint(world.handle);
+          (await record(handle.id, 'checkpoint.created', { checkpointId: checkpoint.id,
+            generation: checkpoint.generation, bytes: checkpoint.filesystemDelta?.bytes ?? 0 }));
+        }
+        return false;
+      }
+      // The task's own configuration named a repository its world lacks: a
+      // provisioning failure, never resource-only output. A repository the
+      // project gained after the task started is not the task's (it joins at
+      // the agent's next turn, `adoptAttachedRepositories`), so the world it
+      // has is the work and is saved.
+      if (configuredRepos.length) throw new Error('configured repositories are missing from the task world');
       if (deps.checkpoints) {
         const checkpoint = await deps.checkpoints.checkpoint(world.handle);
         (await record(handle.id, 'checkpoint.created', { checkpointId: checkpoint.id,
@@ -4241,6 +4259,67 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // Local worlds that are retained remain directly inspectable even when
       // the caller does not configure the optional checkpoint service.
       return true;
+    },
+
+    /** A repository attached to the project after this task's world was made
+     * (by anyone: Settings → Git & GitHub, or the API) joins a world that has
+     * no checkout yet, at the agent's next turn. The workflow learns the
+     * world's checkouts here, never from its creation-time project snapshot.
+     * Undefined while the world has none (nothing attached, or a repository
+     * it cannot take: a failure is recorded and tried again next turn). */
+    async adoptAttachedRepositories(handleInput: WorldHandle, taskId: string): Promise<AdoptedRepositories | undefined> {
+      const projectId = (await store.getTask(taskId))?.projectId ?? String(handleInput.meta?.projectId ?? '');
+      const development = (handle: WorldHandle) => worldRepos(handle).filter((repo) => repo.role !== 'project-wiki');
+      const linked = projectId ? (await store.listProjectRepositories(projectId)) : [];
+      let current = ((await store.currentWorld(taskId)) ?? handleInput) as WorldHandle;
+      if (linked.some((attachment) => !development(current)
+        .some((repo) => sameRepository(worldRepoSource(repo), attachment.repository.sshUrl)))) {
+        try {
+          await enrollLiveProjectRepositories(await openWorld(current, taskId), taskId);
+        } catch (error) {
+          (await record(taskId, 'world.warning', { warning: `could not add the repository attached to this project: ${error instanceof Error ? error.message : String(error)}` }));
+        }
+        current = ((await store.currentWorld(taskId)) ?? current) as WorldHandle;
+      }
+      const checkouts = development(current);
+      if (!checkouts.length) return undefined;
+      const project = (await store.effectiveProjectConfig(projectId));
+      return {
+        world: current,
+        checkouts: checkouts.map((repo) => ({ name: repo.name, path: path.posix.relative(current.root, repo.root) || '.',
+          branch: repo.branch, base: repo.base, source: worldRepoSource(repo) })),
+        project: { repos: checkouts.map(worldRepoSource),
+          ...(project.defaultBase ? { defaultBase: project.defaultBase } : {}),
+          ...(project.defaultTarget ? { defaultTarget: project.defaultTarget } : {}),
+          ...(project.remote ? { remote: project.remote } : {}),
+          ...(project.openGithubPr !== undefined ? { openGithubPr: project.openGithubPr } : {}),
+          ...(project.landingAuthority ? { landingAuthority: project.landingAuthority } : {}) },
+      };
+    },
+
+    /** A task without repositories is finishing: its world is its work. Keep
+     * a final checkpoint before the world is released, so Confirm never
+     * discards what the agent made; it is kept as a finished task's saved
+     * workspace, and Continue starts from it. A world that gained a checkout
+     * meanwhile publishes its branch first (the checkpoint's committed layer).
+     * `destroy: false` keeps a local world when nothing can checkpoint it. */
+    async keepFinalWorkspace(handle: WorldHandle): Promise<KeptWorkspace> {
+      const world = await openWorld(handle);
+      if (!deps.checkpoints) {
+        if (isRemote(world.handle.kind) || world.handle.meta?.releaseOnCompletion === true)
+          throw new Error('world checkpoints are required to keep the work of a task without repositories');
+        return { destroy: false };
+      }
+      if (isRemote(world.handle.kind) && worldRepos(world.handle).length) {
+        const pushed = await publishTaskBranch(world, handle.id, true);
+        if (pushed.skipped.length) throw new Error(`could not persist branch for ${describePublishFailures(pushed)}`);
+        (await record(handle.id, 'push.branch', { branch: world.handle.branch, repos: pushed.pushed, reason: 'checkpoint' }));
+      }
+      const checkpoint = await deps.checkpoints.checkpoint(world.handle);
+      (await record(handle.id, 'checkpoint.created', { checkpointId: checkpoint.id,
+        generation: checkpoint.generation, bytes: checkpoint.filesystemDelta?.bytes ?? 0 }));
+      return { destroy: true, checkpointId: checkpoint.id, files: checkpoint.filesystemDelta?.files ?? 0,
+        keptDays: Math.round(STORAGE_POLICY.finishedTaskCheckpointMs / 86_400_000) };
     },
 
     async commitWork(handle: WorldHandle, message: string): Promise<{ committed: boolean; sha?: string }> {

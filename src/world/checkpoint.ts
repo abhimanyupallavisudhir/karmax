@@ -3,6 +3,7 @@ import { providerLabel } from '../domain/computer-limits.js';
 import { taskProvider } from './task-provider.js';
 import * as __asyncCollections from '../util/async-collections.js';
 import crypto from 'node:crypto';
+import path from 'node:path';
 import zlib from 'node:zlib';
 import { promisify } from 'node:util';
 import { Context as activityContext } from '@temporalio/activity';
@@ -22,6 +23,7 @@ import { sameRepository } from './repository-identity.js';
 import { clearCheckpointStale } from './checkpoint-staleness.js';
 import { ChunkedCheckpointStore, CheckpointRefusedError, formatBytes, type CaptureEntry } from './checkpoint-chunks.js';
 import { transferResourceChunk } from './resource-transfer.js';
+import { isPullRequestView, proposalCheckouts } from './pr-view.js';
 
 import type { PortableDelta } from './checkpoint-encoding.js';
 const gunzip = promisify(zlib.gunzip);
@@ -133,10 +135,12 @@ export class WorldCheckpointService {
         ...(repo.targetPinned !== undefined ? { targetPinned: repo.targetPinned } : {}),
         ...(repo.role ? { role: repo.role } : {}) });
     }
-    // A repositoryless task still owns ordinary output files. Resource-backed
+    // Files outside every checkout are task output too: all of a world without
+    // repositories, and whatever sits beside nested checkouts (a world that
+    // gained a repository mid-task keeps its earlier work there). Resource-backed
     // paths have their own revisions; injected credentials are never outputs.
-    if (!worldRepos(world.handle).length) {
-      for (const file of await world.listFiles()) {
+    {
+      for (const file of await filesOutsideCheckouts(world)) {
         if (!safeDeltaPath(file) || file === '.env' || file.startsWith('.karmax-injection/')
           || ephemeralPaths.has(file)
           || resourcePaths.some((target) => target === '.' || file === target || file.startsWith(`${target}/`))) continue;
@@ -420,7 +424,10 @@ export class WorldCheckpointService {
       }
       if (pinnedHeads && primary) world.handle.branch = primary.branch;
       const developmentRepos = worldRepos(world.handle).filter((repo) => repo.role !== 'project-wiki');
-      world.handle.workdir = developmentRepos.length === 1 ? developmentRepos[0]!.root : world.handle.root;
+      // A world that kept its root as the working directory while it had a
+      // nested checkout (it began without repositories) keeps it there.
+      const rootWorkdir = previousHandle?.workdir !== undefined && previousHandle.workdir === previousHandle.root;
+      world.handle.workdir = developmentRepos.length === 1 && !rootWorkdir ? developmentRepos[0]!.root : world.handle.root;
       if (this.resources) {
         const revisions = Object.fromEntries((checkpoint.resources ?? []).map((resource) => [resource.attachmentId, resource.revisionId]));
         world.handle = await this.resources.materialize(checkpoint.projectId, checkpoint.worldId, world,
@@ -428,7 +435,9 @@ export class WorldCheckpointService {
       }
       const writes: Array<[string, RestoredFile]> = [];
       for await (const file of delta) {
-        const checkout = checkpoint.repos.find(repo => repo.checkoutPath === file.repo) ?? checkpoint.repos[0];
+        // `repo: ''` is a file outside every checkout, relative to the world root.
+        const checkout = file.repo === '' ? undefined
+          : checkpoint.repos.find(repo => repo.checkoutPath === file.repo) ?? checkpoint.repos[0];
         const relative = checkout && checkout.checkoutPath !== '.' ? `${checkout.checkoutPath}/${file.path}` : file.path;
         if (file.deleted) {
           const removed = await world.exec('rm', ['-f', '--', file.path], { cwd: worldRepos(world.handle).find((repo) => repo.name === file.repo)?.root });
@@ -502,13 +511,14 @@ export class WorldCheckpointService {
       destination.baseSha = repo.headSha;
       destinations.set(repo.checkoutPath === '.' ? worldRepos(world.handle)[0]!.name : repo.checkoutPath, destination);
       // Single-repo legacy deltas store the checkout name even though the manifest says '.'.
-      if (checkpoint.repos.length === 1) for (const file of files) destinations.set(file.repo, destination);
+      if (checkpoint.repos.length === 1) for (const file of files) if (file.repo !== '') destinations.set(file.repo, destination);
     }
     const writes: Array<[string, RestoredFile]> = [];
     for (const file of files) {
       options.signal?.throwIfAborted();
       const repo = destinations.get(file.repo);
-      const plain = checkpoint.repos.length === 0 && file.repo === '' && worldRepos(world.handle).length === 0;
+      // Outside every checkout: relative to the world root.
+      const plain = file.repo === '';
       if ((!repo && !plain) || !safeDeltaPath(file.path)) throw new Error('invalid fork delta path');
       const relative = repo && repo.root !== world.handle.root ? `${repo.name}/${file.path}` : file.path;
       if (file.deleted) {
@@ -663,6 +673,22 @@ function parseStatus(value: string): Array<{ path: string; deleted: boolean }> {
     if (safeDeltaPath(path)) out.push({ path, deleted: status.includes('D') });
   }
   return out;
+}
+
+/** Root-relative paths of every file and link outside the world's checkouts.
+ * A world whose root is itself a checkout has none; a narrowed view (one pull
+ * request, or the checkouts a proposal still covers) is not the whole world. */
+async function filesOutsideCheckouts(world: World): Promise<string[]> {
+  const repos = worldRepos(world.handle);
+  if (!repos.length) return world.listFiles();
+  const root = world.handle.root;
+  if (isPullRequestView(world.handle) || proposalCheckouts(world.handle)
+    || repos.some((repo) => repo.root === root || !repo.root.startsWith(`${root}/`))) return [];
+  const pruned = [...repos.map((repo) => `./${path.posix.relative(root, repo.root)}`), './.karmax-injection'];
+  const listed = await world.exec('find', ['.', '(', '-name', '.git', ...pruned.flatMap((entry) => ['-o', '-path', entry]), ')',
+    '-prune', '-o', '(', '-type', 'f', '-o', '-type', 'l', ')', '-print0'], { cwd: root, timeoutMs: 120_000 });
+  if (listed.code !== 0) throw new Error(`could not list the files beside the checkouts: ${listed.stderr || listed.stdout}`);
+  return listed.stdout.split('\0').filter(Boolean).map((entry) => entry.replace(/^\.\//, ''));
 }
 
 function safeDeltaPath(value: string | undefined): value is string {
