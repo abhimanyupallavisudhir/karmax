@@ -4156,6 +4156,8 @@ async function boot() {
   const session = await sessionRead;
   // Account email (confirmation, password reset) only when the installation can send it.
   S.emailDelivery = session.emailDelivery === true;
+  // Preferences that follow the person to every device (GET|PATCH /api/user/preferences).
+  if (session.preferences) S.preferences = session.preferences;
   S.sso = session.sso || null;
   S.google = session.google || false;
   S.github = session.github || false;
@@ -6303,7 +6305,7 @@ function storeRowHtml(item) {
         <div class="task-title">${esc(item.name)} ${item.summary ? policyTip(item.summary) : ''}</div>
         <div class="task-sub">${item.repeatable ? `<span class="chip">${installed ? 'installed' : 'repeatable'}</span>` : ''}${need ? `<span>${esc(need[0])}</span>` : ''}</div>
       </div>
-      <div class="task-right">${action}${item.builtIn ? '' : '<button class="icon-btn" data-store-remove title="Remove from the task store">✕</button>'}</div>
+      <div class="task-right">${action}</div>
     </div>`;
 }
 // The store's rows the query's words match (name or summary).
@@ -6321,21 +6323,32 @@ function storeViewHtml() {
 function taskStoreForQuery() {
   if (isStoreQuery(S.search)) return loadTaskStore(storeProjectId(), { force: true });
   if (viewIdForQuery(S.search) === FOR_ME_VIEW && !storeRecsDismissed(storeProjectId()))
-    loadTaskStore(storeProjectId()).then((changed) => { if (changed && isTaskListTab() && !S.selected) bgRenderMain(); });
+    Promise.all([loadTaskStore(storeProjectId()), loadPreferences()])
+      .then((changed) => { if (changed.some(Boolean) && isTaskListTab() && !S.selected) bgRenderMain(); });
   return null;
 }
 // The default view recommends what the project has not taken from the store yet,
-// until dismissed (per project, in this browser).
-const STORE_RECS_KEY = 'tavya.storeRecsDismissed';
-function storeRecsDismissed(projectId) {
-  try { return !!JSON.parse(localStorage.getItem(STORE_RECS_KEY) || '{}')[projectId]; } catch { return false; }
+// until the person dismisses it there; the dismissal is theirs on every device.
+// Preferences come with the session; a session without them reads them once.
+async function loadPreferences() {
+  if (S.preferences) return false;
+  S.preferences = await api('/api/user/preferences').catch(() => null);
+  return !!S.preferences;
 }
-function dismissStoreRecs(projectId) {
-  try { localStorage.setItem(STORE_RECS_KEY, JSON.stringify({ ...JSON.parse(localStorage.getItem(STORE_RECS_KEY) || '{}'), [projectId]: Date.now() })); } catch {}
+const storeRecsKey = (projectId) => `task-store:${projectId}`;
+function storeRecsDismissed(projectId) {
+  return !!S.preferences?.dismissed?.includes(storeRecsKey(projectId));
+}
+async function dismissStoreRecs(projectId) {
+  const before = S.preferences;
+  S.preferences = { ...before, dismissed: [...(before?.dismissed || []), storeRecsKey(projectId)] };
+  renderMain();
+  try { S.preferences = await api('/api/user/preferences', { method: 'PATCH', body: JSON.stringify({ dismiss: [storeRecsKey(projectId)] }) }); }
+  catch (e) { S.preferences = before; toast(e.message, true); renderMain(); }
 }
 function storeRecsHtml() {
   const projectId = storeProjectId();
-  if (S.tab === 'inbox' || viewIdForQuery(S.search) !== FOR_ME_VIEW || !projectId || storeRecsDismissed(projectId)) return '';
+  if (S.tab === 'inbox' || viewIdForQuery(S.search) !== FOR_ME_VIEW || !projectId || !S.preferences || storeRecsDismissed(projectId)) return '';
   const items = (S.taskStore?.[projectId] || []).filter((item) => !item.installed?.length);
   if (!items.length) return '';
   return `<section class="store-recs">
@@ -6347,7 +6360,7 @@ function wireTaskStore() {
   const main = $('#main');
   const projectId = storeProjectId();
   main.querySelectorAll('a[data-store-view]').forEach((a) => a.addEventListener('click', plainClick(() => setQuery(STORE_VIEW_QUERY))));
-  $('#store-recs-dismiss')?.addEventListener('click', () => { dismissStoreRecs(projectId); renderMain(); });
+  $('#store-recs-dismiss')?.addEventListener('click', () => dismissStoreRecs(projectId));
   main.querySelectorAll('[data-store-run]').forEach((button) => button.addEventListener('click', async () => {
     const item = (S.taskStore?.[projectId] || []).find((candidate) => candidate.id === button.dataset.storeRun);
     button.disabled = true;
@@ -6358,17 +6371,6 @@ function wireTaskStore() {
       if (item?.repeatable) { toast('Installed'); renderMain(); }
       else go(taskUrl(task.id, task));
     } catch (e) { button.disabled = false; showTaskError(e, projectId); }
-  }));
-  main.querySelectorAll('[data-store-remove]').forEach((button) => button.addEventListener('click', async () => {
-    const row = button.closest('[data-store-task]');
-    const name = (S.taskStore?.[projectId] || []).find((item) => item.id === row.dataset.storeTask)?.name || 'this task';
-    if (!confirm(`Remove “${name}” from the task store? Tasks already made from it stay.`)) return;
-    const organizationId = projectById(projectId)?.organizationId || 'org_personal';
-    try {
-      await api(`/api/organizations/${encodeURIComponent(organizationId)}/task-store/${encodeURIComponent(row.dataset.storeTask)}`, { method: 'DELETE' });
-      await loadTaskStore(projectId, { force: true });
-      renderMain();
-    } catch (e) { toast(e.message, true); }
   }));
 }
 
@@ -8884,7 +8886,6 @@ async function renderSeriesPage(rec) {
       </div></div>
       <div class="tp-foot" id="tp-foot"><div class="tp-foot-inner">
         <button class="btn" id="sd-runagain">Run again</button>
-        ${rec.params?.triggers?.length ? `<button class="btn ghost" id="sd-save-store" title="Offer it in the task store of every project in this organization">Save to task store</button>` : ''}
         <span style="flex:1"></span>
         <button class="btn danger" id="sd-delete">Delete</button>
         <button class="btn primary" id="sd-save">Save changes</button>
@@ -8898,16 +8899,6 @@ async function renderSeriesPage(rec) {
   wireScheduleBuilder(values);
   wireEventTrigger(rec.projectId);
   $('#tp-body').querySelectorAll('[data-runopen]').forEach((el) => wireTaskNav(el, () => el.dataset.runopen));
-  $('#sd-save-store')?.addEventListener('click', async () => {
-    const name = prompt('Name it', rec.title.replace(/\{\{[^}]*\}\}/g, '').trim() || 'Automation');
-    if (!name) return;
-    const organizationId = projectById(rec.projectId)?.organizationId || 'org_personal';
-    try {
-      await api(`/api/organizations/${encodeURIComponent(organizationId)}/task-store`, { method: 'POST', body: JSON.stringify({ taskId: rec.id, name }) });
-      S.taskStore = {};
-      toast('Saved to the task store');
-    } catch (e) { toast(e.message, true); }
-  });
   $('#sd-delete').addEventListener('click', async () => { if (await deleteSeries(rec.id)) { closeTask(); refreshTasks(); } });
   $('#sd-runagain').addEventListener('click', async () => {
     try { await api(`/api/tasks/${rec.id}/run-again`, { method: 'POST', body: '{}' }); toast('New run started'); closeTask(); refreshTasks(); }

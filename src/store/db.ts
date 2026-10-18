@@ -89,7 +89,6 @@ import {
   type OrganizationEntitlements,
 } from '../domain/entitlements.js';
 import { newId } from '../util/id.js';
-import type { StoreTask } from '../domain/task-store.js';
 import { EVENT_RETENTION_MS as PROJECT_EVENT_RETENTION_MS, type EventFollow, type ProjectEvent, type ProjectEventClaim,
   type ProjectEventClaimState } from '../domain/project-events.js';
 import { paymentMerchantMatches } from '../util/payment-merchant.js';
@@ -98,6 +97,9 @@ import { PermissionRequests } from '../platform/permission-requests.js';
 import { withPullRequestStates } from '../integrations/github-pr.js';
 import { lifecycleEventPayload } from '../domain/view-publication.js';
 import { taskForkSourceIds } from '../domain/forks.js';
+
+/** How many dismissals a person's preferences keep (the newest). */
+const MAX_DISMISSED = 500;
 
 // Shared by Store instances in this process, never by another gateway/worker.
 const PROCESS_EVENT_ORIGIN = crypto.randomUUID();
@@ -640,8 +642,10 @@ export class Store {
         organizationId TEXT NOT NULL, userId TEXT NOT NULL, role TEXT NOT NULL,
         joinedAt INTEGER NOT NULL, PRIMARY KEY (organizationId, userId)
       );
+      -- A person's preferences, wherever they sign in: their default
+      -- organization, and what they dismissed (JSON array of keys).
       CREATE TABLE IF NOT EXISTS user_preferences (
-        userId TEXT PRIMARY KEY, defaultOrganizationId TEXT
+        userId TEXT PRIMARY KEY, defaultOrganizationId TEXT, dismissed TEXT
       );
       CREATE TABLE IF NOT EXISTS policy_acceptances (
         id TEXT PRIMARY KEY, userId TEXT NOT NULL, email TEXT,
@@ -990,8 +994,9 @@ export class Store {
         id TEXT PRIMARY KEY, taskId TEXT NOT NULL, projectId TEXT NOT NULL, filter TEXT NOT NULL,
         once INTEGER NOT NULL DEFAULT 0, createdAt INTEGER NOT NULL
       );
-      -- Tasks an organization saved to its task store (src/domain/task-store.ts); the
-      -- built-ins live in code.
+      -- Retired: automations organizations saved before the task store held
+      -- only built-in tasks (2026-10-18). Kept so organization export and
+      -- deletion still cover those rows; nothing reads or writes it otherwise.
       CREATE TABLE IF NOT EXISTS automation_templates (
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, name TEXT NOT NULL, summary TEXT NOT NULL,
         task TEXT NOT NULL, needs TEXT, createdBy TEXT, createdAt INTEGER NOT NULL
@@ -1249,6 +1254,8 @@ export class Store {
     if (!eventCols.some(column => column.name === 'origin')) await this.db.exec('ALTER TABLE events ADD COLUMN origin TEXT');
     const providerCols = await this.db.prepare('PRAGMA table_info(world_provider_connections)').all() as { name: string }[];
     if (!providerCols.some(column => column.name === 'limits')) await this.db.exec('ALTER TABLE world_provider_connections ADD COLUMN limits TEXT');
+    const preferenceCols = await this.db.prepare('PRAGMA table_info(user_preferences)').all() as { name: string }[];
+    if (!preferenceCols.some(column => column.name === 'dismissed')) await this.db.exec('ALTER TABLE user_preferences ADD COLUMN dismissed TEXT');
     const repositoryCols = await this.db.prepare('PRAGMA table_info(repositories)').all() as { name: string }[];
     if (!repositoryCols.some(column => column.name === 'upstream')) await this.db.exec('ALTER TABLE repositories ADD COLUMN upstream TEXT');
     const candidateCols = await this.db.prepare('PRAGMA table_info(resource_candidates)').all() as { name: string }[];
@@ -2398,6 +2405,26 @@ export class Store {
     });
   }
 
+  /** What a person set for the console, on every device: what they dismissed
+   *  (keys such as `task-store:<projectId>`). */
+  async userPreferences(userId: string): Promise<{ dismissed: string[] }> {
+    const row = (await this.db.prepare('SELECT dismissed FROM user_preferences WHERE userId=?').get(userId)) as { dismissed?: string | null } | undefined;
+    return { dismissed: parseJsonOptional(row?.dismissed ?? undefined) as string[] | undefined ?? [] };
+  }
+
+  /** Dismiss or bring back keys; the newest {@link MAX_DISMISSED} are kept. */
+  async updateUserPreferences(userId: string, change: { dismiss?: string[]; undismiss?: string[] }): Promise<{ dismissed: string[] }> {
+    return this.db.transaction(async () => {
+      (await this.db.lock(`account:${userId}`));
+      const { dismissed } = await this.userPreferences(userId);
+      const removed = new Set([...(change.dismiss ?? []), ...(change.undismiss ?? [])]);
+      const next = [...dismissed.filter((key) => !removed.has(key)), ...new Set(change.dismiss ?? [])].slice(-MAX_DISMISSED);
+      (await this.db.prepare(`INSERT INTO user_preferences (userId, dismissed) VALUES (?, ?)
+        ON CONFLICT(userId) DO UPDATE SET dismissed=excluded.dismissed`).run(userId, JSON.stringify(next)));
+      return { dismissed: next };
+    });
+  }
+
   /** Complete, secret-redacted tenant export. The table-oriented envelope is
    * intentionally stable, apart from declared redactions: future import/migration tools can retain
    * records they do not yet understand without flattening the task model. */
@@ -2637,7 +2664,8 @@ export class Store {
       // Export the stored preference without revalidating it under a member-only
       // scope: an operator may have selected an organization they do not belong to.
       preferences: { defaultOrganizationId: ((await this.db.prepare('SELECT defaultOrganizationId FROM user_preferences WHERE userId=?')
-        .get(userId)) as { defaultOrganizationId: string } | undefined)?.defaultOrganizationId ?? (await this.defaultOrganization(userId))?.id ?? null },
+        .get(userId)) as { defaultOrganizationId: string } | undefined)?.defaultOrganizationId ?? (await this.defaultOrganization(userId))?.id ?? null,
+        ...(await this.userPreferences(userId)) },
       security: {
         secretsIncluded: false,
         omitted: ['password hashes', 'session tokens', 'OAuth tokens and state', 'credential values and handles',
@@ -2804,7 +2832,7 @@ export class Store {
       (await deleteRows(this.db, 'teams', 'id', teamIds));
       (await deleteRows(this.db, 'tasks', 'id', taskIds));
       (await deleteRows(this.db, 'projects', 'id', projectIds));
-      (await this.db.prepare('DELETE FROM user_preferences WHERE defaultOrganizationId=?').run(organizationId));
+      (await this.db.prepare('UPDATE user_preferences SET defaultOrganizationId=NULL WHERE defaultOrganizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM organizations WHERE id=?').run(organizationId));
       (await this.db.exec('COMMIT'));
     } catch (error) {
@@ -2822,7 +2850,7 @@ export class Store {
 
     const organization = (await this.getOrganization('org_personal'))!;
     (await this.setOrganizationMembership(organization.id, userId, 'owner'));
-    if (!(await this.db.prepare('SELECT 1 FROM user_preferences WHERE userId=?').get(userId)))
+    if (!(await this.db.prepare('SELECT 1 FROM user_preferences WHERE userId=? AND defaultOrganizationId IS NOT NULL').get(userId)))
       (await this.setDefaultOrganization(userId, organization.id));
     if (name && organization.name === 'Personal') {
       const next = (await this.assertOrganizationNameAvailable(name,
@@ -2949,7 +2977,7 @@ export class Store {
       if (owners <= 1) throw new Error('an organization must retain at least one owner');
     }
     (await this.db.prepare('DELETE FROM organization_memberships WHERE organizationId=? AND userId=?').run(organizationId, userId));
-    (await this.db.prepare('DELETE FROM user_preferences WHERE userId=? AND defaultOrganizationId=?').run(userId, organizationId));
+    (await this.db.prepare('UPDATE user_preferences SET defaultOrganizationId=NULL WHERE userId=? AND defaultOrganizationId=?').run(userId, organizationId));
     if (membership) {
       (await this.reconcileHostedUsageCapacity(organizationId));
       this.notifyOrganizationEntitlementsChanged(organizationId);
@@ -9371,27 +9399,6 @@ export class Store {
     const row = await this.db.prepare(`SELECT id FROM tasks WHERE (id=? OR json_extract(params, '$.runOf')=?)
       AND json_extract(params, '$.trigger.eventId')=? ORDER BY createdAt LIMIT 1`).get(seriesId, seriesId, eventId) as { id?: string } | undefined;
     return row?.id ? String(row.id) : undefined;
-  }
-
-  async saveStoreTask(template: StoreTask & { organizationId: string; createdAt: number }): Promise<StoreTask> {
-    await this.db.transaction(async () => {
-      await this.db.prepare(`INSERT INTO automation_templates (id, organizationId, name, summary, task, needs, createdBy, createdAt)
-        VALUES (?,?,?,?,?,?,?,?)`).run(template.id, template.organizationId, template.name, template.summary, JSON.stringify(template.task),
-        template.needs ? JSON.stringify(template.needs) : null, template.createdBy ?? null, template.createdAt);
-    });
-    return template;
-  }
-
-  async listStoreTasks(organizationId: string): Promise<StoreTask[]> {
-    const rows = await this.db.prepare('SELECT * FROM automation_templates WHERE organizationId=? ORDER BY createdAt').all(organizationId);
-    return rows.map((row: any) => ({ id: String(row.id), organizationId: String(row.organizationId), name: String(row.name),
-      summary: String(row.summary), task: JSON.parse(String(row.task)), ...(row.needs ? { needs: JSON.parse(String(row.needs)) } : {}),
-      ...(row.createdBy ? { createdBy: String(row.createdBy) } : {}), createdAt: Number(row.createdAt) }));
-  }
-
-  async deleteStoreTask(organizationId: string, id: string): Promise<boolean> {
-    return this.db.transaction(async () => Number((await this.db.prepare('DELETE FROM automation_templates WHERE organizationId=? AND id=?')
-      .run(organizationId, id)).changes) === 1);
   }
 
   async addTaskFollow(follow: EventFollow): Promise<EventFollow> {

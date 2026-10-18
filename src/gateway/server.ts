@@ -199,8 +199,6 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/organizations\/[^/]+\/conversation-sharing$/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/projects\/[^/]+\/conversation-sharing$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/tasks\/[^/]+\/conversation-share$/.test(p)) return 'task:conversation:share';
-  // Tasks an organization saves to its task store (src/domain/task-store.ts) are shared knowledge, like its wiki.
-  if (/^\/api\/organizations\/[^/]+\/(?:task-store|automations)(?:\/[^/]+)?$/.test(p)) return 'organization:wiki:write';
   if (p === MCP_CLIENT_METADATA_PATH && read) return 'none';
   if (p === '/api/meta' || p === '/api/session' || p.startsWith('/api/health/')) return 'none';
   const appGrantRoute = appGrantRouteCapability(p);
@@ -216,7 +214,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p.startsWith('/api/processes')) return read ? 'process:read' : 'process:kill';
   if (p === '/api/users/erasure-cases' || /^\/api\/users\/[^/]+\/erasure(?:\/export)?$/.test(p)) return 'user:write';
   if (p.startsWith('/api/users')) return read ? 'user:read' : 'user:write';
-  if (p === '/api/user/export' || p === '/api/user/default-organization' || p === '/api/user/paid-subscriptions'
+  if (p === '/api/user/export' || p === '/api/user/default-organization' || p === '/api/user/preferences' || p === '/api/user/paid-subscriptions'
     || p === '/api/user/onboarding' || p === '/api/user/onboarding/reset' || p === '/api/user/account-deletion-request') return 'none';
   // A signed-in person always owns their own Git identity. It is not an
   // organization credential grant and must remain editable after they join a
@@ -1795,6 +1793,7 @@ export class Gateway {
           const gitOnboarding = (await this.deps.store.kvGet(onboardingKey)) === 'pending';
           if (gitOnboarding) (await this.deps.store.kvSet(onboardingKey, 'seen'));
           return this.json(res, 200, { authRequired: true, authenticated: true, user: current.user, gitOnboarding,
+          preferences: (await this.deps.store.userPreferences(current.user.id)),
           emailDelivery: (await this.deps.identity.canSendEmail?.()) ?? false,
           sso: ssoSession(this.deps.identity),
           google: this.deps.identity.googleEnabled,
@@ -1825,7 +1824,7 @@ export class Gateway {
           this.passwordlessSession = undefined; throw error;
         }));
         res.setHeader('set-cookie', this.sessionCookie(req, sid));
-        return this.json(res, 200, { authRequired: false, token: sid, user: 'me' });
+        return this.json(res, 200, { authRequired: false, token: sid, user: 'me', preferences: (await this.deps.store.userPreferences('me')) });
       }
       return this.json(res, 200, { authRequired: true });
     }
@@ -2506,6 +2505,17 @@ export class Gateway {
         } catch (error) {
           return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
         }
+      }
+      // A person's console preferences, the same on every device they sign in on.
+      if (p === '/api/user/preferences' && (method === 'GET' || method === 'PATCH')) {
+        const subject = requireHumanSubject(callerIdentity);
+        if (method === 'GET') return this.json(res, 200, (await store.userPreferences(subject.userId)));
+        const b = await this.body(req);
+        const keys = (value: unknown) => value === undefined ? [] : Array.isArray(value) && value.length <= 50
+          && value.every((key) => typeof key === 'string' && key.length > 0 && key.length <= 200) ? value as string[] : undefined;
+        const dismiss = keys(b.dismiss), undismiss = keys(b.undismiss);
+        if (!dismiss || !undismiss) return this.json(res, 400, { error: 'dismiss and undismiss are lists of up to 50 keys (strings of up to 200 characters)' });
+        return this.json(res, 200, (await store.updateUserPreferences(subject.userId, { dismiss, undismiss })));
       }
       if (p === '/api/user/onboarding' && (method === 'GET' || method === 'PUT')) {
         const subject = requireHumanSubject(callerIdentity);
@@ -5162,17 +5172,6 @@ export class Gateway {
           return this.json(res, 200, p.endsWith('/automations') ? { automations: tasks } : { tasks });
         }
         if (storeMatch[2] && method === 'POST') return this.json(res, 201, await api.runStoreTask(token, storeMatch[1]!, storeMatch[2]));
-      }
-      const savedStoreMatch = p.match(/^\/api\/organizations\/([^/]+)\/(?:task-store|automations)(?:\/([^/]+))?$/);
-      if (savedStoreMatch) {
-        if (!savedStoreMatch[2] && method === 'POST') {
-          const b = await this.body(req);
-          return this.json(res, 201, await api.saveStoreTask(token, savedStoreMatch[1]!, { taskId: b.taskId, name: b.name, summary: b.summary }));
-        }
-        if (savedStoreMatch[2] && method === 'DELETE') {
-          await api.deleteStoreTask(token, savedStoreMatch[1]!, savedStoreMatch[2]);
-          return this.json(res, 200, { ok: true });
-        }
       }
       const followsMatch = p.match(/^\/api\/tasks\/([^/]+)\/follows(?:\/([^/]+))?$/);
       if (followsMatch) {

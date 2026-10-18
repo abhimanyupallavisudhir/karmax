@@ -35,7 +35,7 @@ import {
 } from '../coordinators/names.js';
 import { TaskRecord, TaskView, AttentionAsk, Message, Project, TaskInput, ImageRef, FileRef, Tag, SavedView, TaskQuery, AgentRole, AgentSpec, AgentAuthority, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency, remotePolicyOf, ResourceAccess, ResourceTarget } from '../domain/types.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable, awaitsSuccessOf, isSeries } from '../domain/triggers.js';
-import { BUILT_IN_STORE_TASKS, storeTaskNeeds, storeTaskRepeatable, templateTask, type StoreNeed, type StoreTask } from '../domain/task-store.js';
+import { STORE_TASKS, storeTaskNeeds, storeTaskRepeatable, type StoreNeed, type StoreTask } from '../domain/task-store.js';
 import { applyTriggerContext, normalizeEventInput, validateFollow, type EventFilter, type EventFollow, type ProjectEvent, type ProjectEventClaim,
   type ProjectEventInput, type ProjectEventOrigin, type TriggerContext } from '../domain/project-events.js';
 import { newId } from '../util/id.js';
@@ -3016,26 +3016,23 @@ export class KarmaxApi {
   // src/domain/task-store.ts. An ordinary one runs at once; a repeatable one
   // installs as an ordinary series.
 
-  /** The store for a project: built-ins, then the organization's own; each
-   *  says which of the project's tasks came from it (a repeatable one's
-   *  series, an ordinary one's runs) and what the project lacks for it. */
+  /** The store for a project: each task says which of the project's tasks
+   *  came from it (a repeatable one's series, an ordinary one's runs) and what
+   *  the project lacks for it. */
   async listTaskStore(token: string, projectId: string): Promise<Array<Omit<StoreTask, 'task'> & { task: Omit<StoreTask['task'], 'hostedPrompt'>;
-    builtIn: boolean; repeatable: boolean; installed: string[]; missing: StoreNeed[] }>> {
+    repeatable: boolean; installed: string[]; missing: StoreNeed[] }>> {
     (await this.require(token, 'list_tasks', { projectId }));
-    const project = (await this.deps.store.getProject(projectId));
-    if (!project) throw new NotFoundError(`no project ${projectId}`);
-    const own = (await this.deps.store.listStoreTasks(project.organizationId ?? 'org_personal'));
+    if (!(await this.deps.store.getProject(projectId))) throw new NotFoundError(`no project ${projectId}`);
     const tasks = (await this.deps.store.listTasks(projectId));
     const has = {
       github: (await this.deps.store.listProjectRepositories(projectId)).some((entry) => !!entry.repository.gitConnectionId),
       chat: this.deps.broker ? (await this.incomingWebhooks().list(projectId)).some((hook) => !!hook.kind) : false,
     };
-    return [...BUILT_IN_STORE_TASKS.map((template) => ({ ...template, builtIn: true })), ...own.map((template) => ({ ...template, builtIn: false }))]
-      .map(({ task: { hostedPrompt, ...task }, ...template }) => ({ ...template, task: { ...task, prompt: this.storePrompt({ task: { ...task, hostedPrompt } }) },
-        repeatable: storeTaskRepeatable({ task }),
-        installed: tasks.filter((candidate) => candidate.params?.template === template.id && !candidate.params?.runOf)
-          .sort((a, b) => b.createdAt - a.createdAt).map((candidate) => candidate.id),
-        missing: storeTaskNeeds({ task, needs: template.needs }).filter((need) => !has[need]) }));
+    return STORE_TASKS.map(({ task: { hostedPrompt, ...task }, ...template }) => ({ ...template, task: { ...task, prompt: this.storePrompt({ task: { ...task, hostedPrompt } }) },
+      repeatable: storeTaskRepeatable({ task }),
+      installed: tasks.filter((candidate) => candidate.params?.template === template.id && !candidate.params?.runOf)
+        .sort((a, b) => b.createdAt - a.createdAt).map((candidate) => candidate.id),
+      missing: storeTaskNeeds({ task, needs: template.needs }).filter((need) => !has[need]) }));
   }
 
   private storePrompt(template: Pick<StoreTask, 'task'>): string {
@@ -3046,10 +3043,8 @@ export class KarmaxApi {
    *  asked); a repeatable one becomes the project's armed series, once. */
   async runStoreTask(token: string, projectId: string, templateId: string): Promise<TaskRecord> {
     (await this.require(token, 'create_task', { projectId }));
-    const project = (await this.deps.store.getProject(projectId));
-    if (!project) throw new NotFoundError(`no project ${projectId}`);
-    const template = BUILT_IN_STORE_TASKS.find((candidate) => candidate.id === templateId)
-      ?? (await this.deps.store.listStoreTasks(project.organizationId ?? 'org_personal')).find((candidate) => candidate.id === templateId);
+    if (!(await this.deps.store.getProject(projectId))) throw new NotFoundError(`no project ${projectId}`);
+    const template = STORE_TASKS.find((candidate) => candidate.id === templateId);
     if (!template) throw new NotFoundError(`no store task ${templateId}`);
     if (storeTaskRepeatable(template)) {
       const existing = (await this.deps.store.listTasks(projectId)).find((task) => task.params?.template === templateId && !task.params?.runOf);
@@ -3057,27 +3052,6 @@ export class KarmaxApi {
     }
     return this.createTask(token, { projectId, title: template.task.title, prompt: this.storePrompt(template), ...(template.task.workflow ? { workflow: template.task.workflow } : {}),
       params: { ...template.task.params, template: template.id } });
-  }
-
-  /** Save a series to the store of every project in the organization. */
-  async saveStoreTask(token: string, organizationId: string, input: { taskId: string; name: string; summary?: string }): Promise<StoreTask> {
-    const task = (await this.deps.store.getTask(String(input.taskId ?? '')));
-    (await this.require(token, 'get_task', { projectId: task?.projectId ?? '__missing__', taskId: input.taskId }));
-    if (!task || ((await this.deps.store.getProject(task.projectId))?.organizationId ?? 'org_personal') !== organizationId)
-      throw new NotFoundError(`no task ${input.taskId} in this organization`);
-    const caller = (await this.require(token, 'organization:wiki:write', { organizationId }));
-    const name = String(input.name ?? '').trim().slice(0, 80);
-    if (!name) throw new ValidationError('name it');
-    if (!hasActiveTriggers(task.params)) throw new ValidationError('only a task with a trigger can be saved to the task store');
-    const saved = templateTask({ title: task.title, workflow: task.workflow, params: task.params as Record<string, unknown> });
-    const template = { id: newId('atm'), organizationId, name, summary: String(input.summary ?? '').trim().slice(0, 300),
-      task: saved, needs: storeTaskNeeds({ task: saved }), createdBy: caller.principal, createdAt: Date.now() };
-    return this.deps.store.saveStoreTask(template);
-  }
-
-  async deleteStoreTask(token: string, organizationId: string, templateId: string): Promise<void> {
-    (await this.require(token, 'organization:wiki:write', { organizationId }));
-    if (!(await this.deps.store.deleteStoreTask(organizationId, templateId))) throw new NotFoundError(`no store task ${templateId}`);
   }
 
   /** A run started by an event follows what the event is about: the issue's

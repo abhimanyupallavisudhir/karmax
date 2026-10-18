@@ -100,7 +100,7 @@ describe('events through an agent\'s task token', () => {
     } finally { a.restore(); }
   });
 
-  it('an agent runs and installs tasks from the task store, deletes a series, and saves its own', async () => {
+  it('an agent runs and installs tasks from the task store, and deletes a series to offer it again', async () => {
     const dev = await agent('developer');
     const maintainer = await agent('maintainer');
     const storeOf = async () => json(await dev.request('GET', `/api/projects/${projectId}/task-store`)).tasks;
@@ -140,19 +140,11 @@ describe('events through an agent\'s task token', () => {
       expect((await storeOf()).find((t: any) => t.id === 'build-planned-issues').installed).toEqual([]);
       const reinstalled = json(await dev.request('POST', `/api/projects/${projectId}/task-store/build-planned-issues`));
 
-      // Saving for the whole organization is a maintainer's call.
-      const body = { taskId: reinstalled.id, name: 'Planned issues, our way', summary: 'Builds planned issues.' };
-      const refused = await dev.request('POST', '/api/organizations/org_personal/task-store', body).catch((error: Error) => error.message);
-      expect(String(refused)).toMatch(/organization:wiki:write/);
-      const saved = json(await maintainer.request('POST', '/api/organizations/org_personal/task-store', body));
-      expect(saved).toMatchObject({ id: expect.stringMatching(/^atm_/), name: 'Planned issues, our way', needs: ['github'],
-        task: { title: '#{{issue.number}} {{issue.title}}', params: { repeatable: true, triggers: [{ type: 'github.issues.labeled' }] } } });
-      expect(saved.task.params).not.toHaveProperty('triggerState');
-      expect(saved.task.params).not.toHaveProperty('template');
-      const copy = json(await maintainer.request('POST', `/api/projects/${projectId}/task-store/${saved.id}`));
-      expect((await store.getTask(copy.id))!.params).toMatchObject({ template: saved.id, triggerState: 'armed' });
-      expect((await storeOf()).find((t: any) => t.id === saved.id)).toMatchObject({ builtIn: false, repeatable: true, installed: [copy.id] });
-      expect(json(await maintainer.request('DELETE', `/api/organizations/org_personal/task-store/${saved.id}`))).toEqual({ ok: true });
+      expect((await storeOf()).find((t: any) => t.id === 'build-planned-issues').installed).toEqual([reinstalled.id]);
+      // The store holds the platform's tasks only: nobody publishes into everyone's store.
+      const published = await maintainer.request('POST', '/api/organizations/org_personal/task-store', { taskId: reinstalled.id, name: 'Ours' })
+        .catch((error: Error) => error.message);
+      expect(String(published)).toMatch(/not found|missing capability/);
       expect(await storeOf()).toHaveLength(5);
     } finally { dev.restore(); maintainer.restore(); }
   });

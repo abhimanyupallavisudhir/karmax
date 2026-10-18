@@ -40,7 +40,7 @@ const report = process.env.REQUEST_BUDGET_REPORT === '1';
       let data = [], m;
       if (p === '/api/meta') data = { siteName: 'Fixture', hostLocal: true, consoleRevision: 'one', agent: { provider: 'mock' }, worldProviders: [] };
       else if (p === '/api/launch') data = {};
-      else if (p === '/api/session') data = { authenticated: true, user: { id: 'u', name: 'Tester' } };
+      else if (p === '/api/session') data = { authenticated: true, user: { id: 'u', name: 'Tester' }, preferences: { dismissed: [] } };
       else if (p === '/api/settings/installation') data = { canManage: false };
       else if (p === '/api/organizations') data = organizations;
       else if (p === '/api/user/default-organization') data = { organizationId: 'o' };
@@ -190,6 +190,7 @@ const report = process.env.REQUEST_BUDGET_REPORT === '1';
       budget('boot (other organization)', 25, 5);
       budget('boot (home)', 25, 5);
       assert.equal(results.boot.counts['GET /api/projects/p/task-store'], 1, 'the default view reads the task store once');
+      assert.equal(results.boot.counts['GET /api/user/preferences'], undefined, 'preferences come with the session');
       assert.equal(results['boot (home)'].counts['GET /api/organizations/o/search'], 1, 'the home searches its organization once');
       budget('organization action (create team)', 6);
       // The route that switches organization and the settings page it paints share one read.

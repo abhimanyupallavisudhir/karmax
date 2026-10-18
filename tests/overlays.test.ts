@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { Overlays } from '../src/store/overlays.js';
 import { resolveRequires } from '../src/contrib/manifests.js';
-import { BUILT_IN_STORE_TASKS, PROJECT_WIKI_TEMPLATE_ID } from '../src/domain/task-store.js';
+import { STORE_TASKS, PROJECT_WIKI_TEMPLATE_ID } from '../src/domain/task-store.js';
 
 describe('overlay resolution + safe mode (SPEC §9)', () => {
   it('resolves project → user → bundled, and safe mode uses bundled only', () => {
@@ -31,7 +31,7 @@ describe('manifest dependency resolution (SPEC §4.6)', () => {
   });
 
   it('tailors the store\'s project-wiki task to the deployment', () => {
-    const wiki = BUILT_IN_STORE_TASKS.find((task) => task.id === PROJECT_WIKI_TEMPLATE_ID)!.task;
+    const wiki = STORE_TASKS.find((task) => task.id === PROJECT_WIKI_TEMPLATE_ID)!.task;
     expect(wiki.workflow).toBe('software-dev');
     for (const prompt of [wiki.prompt, wiki.hostedPrompt!]) {
       expect(prompt).toContain('Migrate AGENTS.md, CLAUDE.md');

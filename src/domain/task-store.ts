@@ -7,8 +7,7 @@ import type { EventTrigger, TaskTrigger } from './triggers.js';
  * moment it is chosen; a repeatable one (an automation: a task plus its
  * trigger) installs as an ordinary series, which the task form edits and
  * deletes like any other. Either way `params.template` remembers where it came
- * from. The built-ins below ship with the platform; an organization adds its
- * own by saving one of its series.
+ * from. They ship with the platform.
  */
 export interface StoreTask {
   id: string;
@@ -20,10 +19,6 @@ export interface StoreTask {
     hostedPrompt?: string };
   /** What the project must have for it to do anything (default: what its triggers listen to). */
   needs?: StoreNeed[];
-  /** Set on templates an organization saved. */
-  organizationId?: string;
-  createdBy?: string;
-  createdAt?: number;
 }
 
 /** What a project must have for a store task to do anything. */
@@ -58,7 +53,7 @@ const projectWikiPrompt = (hosted: boolean) => [
   'Report what you changed.',
 ].join('\n');
 
-export const BUILT_IN_STORE_TASKS: readonly StoreTask[] = [
+export const STORE_TASKS: readonly StoreTask[] = [
   {
     id: PROJECT_WIKI_TEMPLATE_ID,
     name: 'Auto-create project wiki (memories, skills, AGENTS.md)',
@@ -129,12 +124,4 @@ export function storeTaskNeeds(template: Pick<StoreTask, 'task' | 'needs'>): Sto
     if (trigger.type.startsWith('chat.') || trigger.source?.startsWith('chat:')) needs.add('chat');
   }
   return [...needs];
-}
-
-/** What a saved template keeps of a series: its definition, not its run state. */
-export function templateTask(task: { title: string; workflow?: string; params: Record<string, unknown> }): StoreTask['task'] {
-  const { prompt, triggerState: _s, triggerLastFiredAt: _f, triggerPending: _p, draft: _d, runOf: _r, trigger: _t, template: _template,
-    archived: _a, ...params } = task.params;
-  return { title: task.title, prompt: typeof prompt === 'string' ? prompt : '', ...(task.workflow ? { workflow: task.workflow } : {}),
-    params: { ...params, repeatable: true } };
 }

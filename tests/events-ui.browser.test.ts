@@ -134,11 +134,18 @@ describe('events in the console', () => {
     if (process.env.KARMAX_SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.KARMAX_SCREENSHOT_DIR, 'store-recommended.png') });
     await recs.locator('#store-recs-dismiss').click();
     expect(await recs.count()).toBe(0);
-    await page.reload();
-    await page.locator('#task-search').waitFor();
-    await page.waitForTimeout(300);
-    expect(await page.locator('.store-recs').count()).toBe(0);
+    // A preference of the person, not of this browser: another device agrees.
+    await expect.poll(async () => (await store.userPreferences('me')).dismissed).toEqual([`task-store:${project.id}`]);
+    const elsewhere = await open('/personal/factory');
+    await elsewhere.page.locator('#task-search').waitFor();
+    await elsewhere.page.waitForTimeout(500);
+    expect(await elsewhere.page.locator('.store-recs').count()).toBe(0);
+    // Bringing it back is the same preference.
+    await store.updateUserPreferences('me', { undismiss: [`task-store:${project.id}`] });
+    await elsewhere.page.reload();
+    await elsewhere.page.locator('.store-recs').waitFor();
     expect(errors).toEqual([]);
+    expect(elsewhere.errors).toEqual([]);
   });
 
   it('runs and installs from the Task store view; a deleted series is on offer again', async () => {
@@ -170,27 +177,19 @@ describe('events in the console', () => {
     await expect.poll(async () => (await store.listTasks(project.id)).filter((task) => task.params?.template === 'project-wiki').length).toBe(1);
     await expect.poll(() => page.url()).toMatch(/\/tasks\/\d+$/);
 
-    // The series page saves it to the store, and deletes it.
+    // The series page deletes it, and the store offers it again.
     await page.goto(`${base}/personal/factory?q=is%3Astore`);
     await row('build-planned-issues').locator('a', { hasText: 'Open' }).click();
-    page.once('dialog', (dialog) => dialog.accept('Our planned issues'));
-    await page.locator('#sd-save-store').click();
-    await expect.poll(async () => (await store.listStoreTasks(project.organizationId ?? 'org_personal')).map((a) => a.name)).toEqual(['Our planned issues']);
+    expect(await page.locator('#sd-save-store').count()).toBe(0);
     page.once('dialog', (dialog) => dialog.accept());
     await page.locator('#sd-delete').click();
     await expect.poll(async () => store.getTask(series.id)).toBeFalsy();
 
     await page.goto(`${base}/personal/factory?q=is%3Astore`);
     await expect.poll(async () => row('build-planned-issues').locator('[data-store-run]').textContent()).toBe('Install');
-    const own = page.locator('.store-row[data-store-task^="atm_"]');
-    expect(await own.textContent()).toContain('Our planned issues');
     // The rest of the query filters the store by its words.
     await page.locator('#task-search').fill('is:store planned');
-    await expect.poll(async () => page.locator('.store-row').count()).toBe(2);
-    page.once('dialog', (dialog) => dialog.accept());
-    await own.locator('[data-store-remove]').click();
     await expect.poll(async () => page.locator('.store-row').count()).toBe(1);
-    expect(await store.listStoreTasks(project.organizationId ?? 'org_personal')).toEqual([]);
 
     // Settings no longer carries a gallery.
     await page.goto(`${base}/personal/factory/settings#project-events`);
