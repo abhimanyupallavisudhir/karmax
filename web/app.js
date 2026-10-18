@@ -7632,10 +7632,11 @@ function templatesSettingsRoute(projectId) { return `${projectRoute(projectId, '
 
 // The `n` picker: digits pick by number (at once, unless a longer number
 // starts with them), words search the names, Enter takes the highlighted one —
-// with nothing typed, template 0.
-function openTemplatePicker() {
-  const projectId = newTaskTarget();
-  if (!projectId) return openNewTaskForm();
+// with nothing typed, template 0. `pick(template?)` gets the choice (the task
+// form's own button reloads that form); by default it opens the new task form.
+function openTemplatePicker(projectId = newTaskTarget(), pick = openNewTaskForm) {
+  if (!projectId) return pick();
+  const previousFocus = document.activeElement;
   const root = createTransientOverlay();
   root.innerHTML = `<div class="palette-scrim" id="tpl-scrim"><div class="palette tpl-picker" role="dialog" aria-label="New task from template">
     <input id="tpl-in" placeholder="New task from template…" autocomplete="off" aria-label="Template name or number" />
@@ -7645,8 +7646,9 @@ function openTemplatePicker() {
   const input = root.querySelector('#tpl-in'), list = root.querySelector('#tpl-list');
   let templates = loadedTemplates(projectId), shown = [], active = 0;
   const close = () => root.remove();
+  const dismiss = () => { close(); previousFocus?.focus?.(); };
   const entries = () => [{ n: 0, name: 'Default', template: null }, ...(templates || []).map((template, i) => ({ n: i + 1, name: template.name, template }))];
-  const choose = (entry) => { if (!entry) return; close(); openNewTaskForm(entry.template || undefined); };
+  const choose = (entry) => { if (!entry) return; close(); pick(entry.template || undefined); };
   const draw = () => {
     list.innerHTML = shown.map((entry, i) => `<div class="opt${i === active ? ' active' : ''}" role="option" aria-selected="${i === active}" data-i="${i}">
       <span class="tpl-num">${entry.n}</span><span class="tpl-name">${esc(entry.name)}</span>${entry.template && templateScopeLabel(entry.template) ? `<span class="pal-sub">${esc(templateScopeLabel(entry.template))}</span>` : ''}${i === active ? '<span class="key">↵</span>' : ''}</div>`).join('')
@@ -7670,14 +7672,14 @@ function openTemplatePicker() {
   };
   input.addEventListener('input', () => update(true));
   input.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') { e.stopPropagation(); close(); }
+    if (e.key === 'Escape') { e.stopPropagation(); dismiss(); }
     else if (e.key === 'ArrowDown') { e.preventDefault(); active = Math.min(shown.length - 1, active + 1); draw(); }
     else if (e.key === 'ArrowUp') { e.preventDefault(); active = Math.max(0, active - 1); draw(); }
     else if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); choose(shown[active]); }
   });
   list.addEventListener('click', (e) => { const o = e.target.closest('.opt'); if (o) choose(shown[Number(o.dataset.i)]); });
   list.addEventListener('mousemove', (e) => { const o = e.target.closest('.opt'); if (o && Number(o.dataset.i) !== active) { active = Number(o.dataset.i); draw(); } });
-  root.querySelector('#tpl-scrim').addEventListener('click', (e) => { if (e.target.id === 'tpl-scrim') close(); });
+  root.querySelector('#tpl-scrim').addEventListener('click', (e) => { if (e.target.id === 'tpl-scrim') dismiss(); });
   root.querySelector('.tpl-manage').addEventListener('click', () => close());
   update(false);
   input.focus();
@@ -8463,6 +8465,8 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   const series = isSeries(draft?.params); // a repeatable template
   const editInPlace = armed || series; // neither has a running workflow — edit its stored params
   const workflowEditable = !draft || !!draft.params?.draft;
+  // A new task can start over from another template (a fork keeps its own form).
+  const templatePickable = !draft && !templateEdit && !opts?.fork;
   // Carry over seed text (or whatever was typed before switching
   // workflows) into the field that consumes it, without clobbering a real value.
   if (seedText) {
@@ -8542,11 +8546,11 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
           <h2>${formTitle || taskFormTitle(draft)}</h2>
           ${templateEdit ? `<input id="tf-template-name" class="tf-template-name" placeholder="Template name" aria-label="Template name" maxlength="120" value="${esc(templateEdit.name ?? templateEdit.template?.name ?? '')}">`
             : proj ? `<span class="tf-crumb">in</span>${projectPickerHtml('tf-project', projectId, !draft)}` : ''}
-          ${opts?.template ? `<span class="chip tf-template-chip" title="Started from this template">${esc(opts.template.name)}</span>` : ''}
           ${formAttemptGroup?.attempts?.length > 1 ? `<nav class="attempts-list tf-attempts" aria-label="Choose an attempt">
             ${formAttemptGroup.attempts.map((a) => attemptCard(a, formAttemptGroup, { taskId: draft.id }, { form: true })).join('')}
           </nav>` : ''}
           <span class="tf-savestate save-state quiet" id="tf-savestate" role="status"></span>
+          ${templatePickable ? `<button type="button" class="tf-template" id="tf-template" title="Start from a template" aria-label="Template${opts?.template ? `: ${esc(opts.template.name)}` : ''}">${ICON.template}${opts?.template ? `<span class="tf-template-label">${esc(opts.template.name)}</span>` : ''}</button>` : ''}
           <select id="tf-wf" title="${workflowEditable ? 'Workflow' : 'Workflow is locked after the task is queued'}" ${workflowEditable ? '' : 'disabled'}>${taskFormWorkflows(wf, draft).map((w) => `<option value="${esc(w.id)}" ${w.id === wf ? 'selected' : ''}>${esc(w.label)}</option>`).join('')}</select>
         </div>
       </div>
@@ -8651,6 +8655,30 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     if (hadAttachments) toast('Attachments removed — attach them again for this project');
     openTaskForm(wf, undefined, carried.trim(), undefined, { projectId: nextProjectId });
   });
+  // Another template: the form starts over from it, keeping what you wrote
+  // (an untouched prompt is the old template's, so the new one's replaces it)
+  // and your attachments. The draft auto-saved here gives way to the new form.
+  $('#tf-template')?.addEventListener('click', () => openTemplatePicker(projectId, async (template) => {
+    const promptName = consumingField(fields)?.name;
+    const typed = promptName ? ($('#tf-body')?.querySelector(`[data-field="${CSS.escape(promptName)}"]`)?.value || '').trim() : '';
+    const untouched = promptName && opts?.template ? String(seedParams?.[promptName] ?? '').trim() : '';
+    const carried = typed === untouched ? '' : typed;
+    const nextWorkflow = template?.workflow || NEW_TASK_WORKFLOW;
+    const params = { ...template?.params,
+      ...(formImages.length ? { images: [...formImages] } : {}), ...(formFiles.length ? { files: [...formFiles] } : {}) };
+    const nextPromptName = consumingField(schemaFor(nextWorkflow).filter((f) => f.scopes.includes('task')))?.name;
+    if (carried && nextPromptName) delete params[nextPromptName];
+    clearTimeout(saveTimer);
+    releaseFormKeys();
+    await saveChain;
+    if (draftId) {
+      const autoSaved = draftId;
+      draftId = null;
+      await api(`/api/tasks/${autoSaved}`, { method: 'DELETE' }).catch(() => {});
+      removeDeletedTaskLocally(autoSaved);
+    }
+    openTaskForm(nextWorkflow, undefined, carried, params, { projectId, ...(template ? { template } : {}) });
+  }));
   $('#tf-close').addEventListener('click', () => closeForm());
   // The other agents' Authorization rows start from the main agent's, live.
   const mainAuthority = () => ({
@@ -8714,8 +8742,8 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     });
   }
   // Prompt attachments are form-local handles; their bytes are already durable.
-  const formImages = Array.isArray(draft?.params?.images) ? [...draft.params.images] : [];
-  const formFiles = Array.isArray(draft?.params?.files) ? [...draft.params.files] : [];
+  const formImages = Array.isArray(values.images) ? [...values.images] : [];
+  const formFiles = Array.isArray(values.files) ? [...values.files] : [];
   // Repaint chips and (unless first paint) auto-save — attaching a file fires no
   // 'input' event, so the debounced auto-save wouldn't otherwise pick it up.
   // `autoSaveSoon` is a hoisted declaration further down this same scope.

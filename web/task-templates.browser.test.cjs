@@ -58,6 +58,7 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
         return created;
       }
       if (p === '/api/projects/p/tasks' && method === 'POST') { posts.push([p, body()]); return { id: 'draft_new', projectId: 'p' }; }
+      if (p === '/api/tasks/draft_new' && method === 'DELETE') { posts.push([`DELETE ${p}`]); return { ok: true }; }
       if (p === '/api/tasks/t') return taskView(task, { transcripts: [{ role: 'do', label: 'Agent', messages: [{ id: 'm', role: 'user', text: 'Ship it' }] }] });
     } });
     context.setDefaultTimeout(8000);
@@ -87,7 +88,7 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     assert.equal(await page.locator('#tpl-in').count(), 0, 'the picker closes');
     assert.equal(await prompt(), 'Write the release notes');
     assert.equal(await page.locator('#tf-notes').inputValue(), 'every Friday');
-    assert.equal(await page.locator('.tf-template-chip').innerText(), 'Release notes');
+    assert.equal(await page.locator('#tf-template').innerText(), 'Release notes');
     assert.equal(await page.locator('#tf-page .org-priority').inputValue(), '3', 'its priority');
     assert.deepEqual(await page.locator('#tf-page .org-editor .tag-chip').allInnerTexts(), ['docs'], 'its tags');
     if (shots) await page.screenshot({ path: `${shots}/template-form.png` });
@@ -113,7 +114,7 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     await page.keyboard.press('Enter');
     await page.locator('#tf-page').waitFor();
     assert.equal(await prompt(), '');
-    assert.equal(await page.locator('.tf-template-chip').count(), 0);
+    assert.equal(await page.locator('#tf-template').innerText(), '', 'no template named');
     await closeForm();
     await page.keyboard.press('Shift+N');
     await page.locator('#tf-page').waitFor();
@@ -136,6 +137,61 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     assert.equal(saved[1].name, 'Dependencies');
     assert.equal(saved[1].params.prompt, 'Bump the dependencies\nand run the tests');
     assert.equal(saved[1].workflow, 'software-dev');
+    await closeForm();
+
+    // ── The form's template button, beside the workflow: the same picker ──
+    const templateButton = page.locator('#tf-template');
+    const pickInForm = async (key) => {
+      await templateButton.click();
+      await page.locator('#tpl-in').waitFor();
+      await page.waitForFunction(() => document.querySelectorAll('#tpl-list .opt').length === 4);
+      await page.keyboard.press(key);
+      await page.locator('#tpl-in').waitFor({ state: 'detached' });
+    };
+    await page.keyboard.press('n');
+    await page.locator('#tpl-in').waitFor();
+    await page.keyboard.press('2');
+    await templateButton.waitFor(); // #tf-page alone may still be the loading page
+    assert.equal(await page.locator('#tf-template + #tf-wf').count(), 1, 'right before the workflow');
+    assert.equal(await templateButton.innerText(), 'Release notes', 'names the template the form started from');
+    // Another template reloads the form from it; an untouched prompt is the new template's.
+    await pickInForm('1');
+    await page.locator('#tf-template', { hasText: 'Bug triage' }).waitFor();
+    assert.equal(await prompt(), 'Triage the newest bug');
+    assert.equal(await page.locator('#tf-notes').inputValue(), '', 'nothing of the old template stays');
+    assert.equal(await page.locator('#tf-page .org-priority').inputValue(), '0');
+    // What you wrote stays; the draft it made gives way to the new form.
+    const draftsBeforeEdit = tasksPosted();
+    await page.locator('#tf-page textarea[data-field="prompt"]').fill('Fix the login page');
+    await page.waitForFunction(() => document.querySelector('#tf-savestate')?.dataset.state === 'saved');
+    assert.equal(tasksPosted(), draftsBeforeEdit + 1);
+    // Escape closes only the picker.
+    await templateButton.click();
+    await page.locator('#tpl-in').waitFor();
+    await page.keyboard.press('Escape');
+    await page.locator('#tpl-in').waitFor({ state: 'detached' });
+    assert.equal(await page.locator('#tf-page').count(), 1, 'the form stays open');
+    assert.equal(await page.evaluate(() => document.activeElement?.id), 'tf-template', 'focus returns to the button');
+    await pickInForm('2');
+    await page.locator('#tf-template', { hasText: 'Release notes' }).waitFor();
+    assert.equal(await prompt(), 'Fix the login page', 'your prompt is kept');
+    assert.equal(await page.locator('#tf-notes').inputValue(), 'every Friday');
+    assert.equal(await page.locator('#tf-page .org-priority').inputValue(), '3');
+    assert.ok(posts.some(([p]) => p === 'DELETE /api/tasks/draft_new'), 'the auto-saved draft is replaced, not left behind');
+    if (shots) {
+      await page.locator('#tf-page').evaluate((el) => Promise.all(el.getAnimations().map((a) => a.finished)));
+      await page.locator('.tf-head').screenshot({ path: `${shots}/template-form-button.png` });
+      await templateButton.click();
+      await page.locator('#tpl-in').waitFor();
+      await page.screenshot({ path: `${shots}/template-form-picker.png` });
+      await page.keyboard.press('Escape');
+    }
+    // Default (Enter with nothing typed): the Task defaults alone.
+    await pickInForm('Enter');
+    await page.locator('#tf-template', { hasText: 'Release notes' }).waitFor({ state: 'detached' });
+    assert.equal(await templateButton.innerText(), '', 'just the icon');
+    assert.equal(await prompt(), 'Fix the login page');
+    assert.equal(await page.locator('#tf-notes').inputValue(), '');
     await closeForm();
 
     // Many templates: a number that starts longer ones waits for more digits.
@@ -176,6 +232,7 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     assert.equal(await page.locator('#tf-template-name').inputValue(), 'Release notes');
     assert.equal(await prompt(), 'Write the release notes');
     assert.equal(await page.locator('#tf-draft').count(), 0, 'no drafts here');
+    assert.equal(await page.locator('#tf-template').count(), 0, 'nor a template to start from');
     await page.locator('#tf-page textarea[data-field="prompt"]').fill('Write the release notes and post them');
     await page.locator('#tf-template-name').fill('Release notes (weekly)');
     assert.equal(await page.locator('#tf-savestate').getAttribute('data-state'), 'dirty');
