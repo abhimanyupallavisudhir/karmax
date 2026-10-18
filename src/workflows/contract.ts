@@ -4,6 +4,8 @@
  * contract for that purpose.
  */
 export type {
+  AdoptedRepositories,
+  KeptWorkspace,
   TaskInput,
   TaskRecoveryCheckpoint,
   TaskContinuation,

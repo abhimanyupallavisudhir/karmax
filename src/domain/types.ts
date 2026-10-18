@@ -278,6 +278,26 @@ export interface OrganizationIdentityPolicy {
   updatedAt: number;
 }
 
+/** A world that began without repositories, with the ones attached to its
+ * project since (`adoptAttachedRepositories`): what its run needs to carry on
+ * as a task with repositories. */
+export interface AdoptedRepositories {
+  world: WorldHandleRef;
+  checkouts: Array<{ name: string; path: string; branch: string; base: string; source: string }>;
+  /** The project's Git settings as the task now needs them; `repos` are the world's checkouts. */
+  project: Pick<ProjectConfig, 'repos' | 'defaultBase' | 'defaultTarget' | 'remote' | 'openGithubPr' | 'landingAuthority'>;
+}
+
+/** What a task without repositories kept of its world as it finished. */
+export interface KeptWorkspace {
+  /** False keeps the world itself: a local world nothing can checkpoint. */
+  destroy: boolean;
+  checkpointId?: string;
+  files?: number;
+  /** How long a finished task's saved workspace is kept. */
+  keptDays?: number;
+}
+
 export interface WorldCheckpoint {
   id: string;
   worldId: string;

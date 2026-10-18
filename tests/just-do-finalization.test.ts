@@ -133,13 +133,18 @@ describe('just-do durable finalization', () => {
     } finally { failure.mockRestore(); }
   });
 
-  it('does not treat missing configured checkouts as a resource-only world', async () => {
-    const { task, handle, world } = await start();
-    (await h.store.updateProjectConfig(task.projectId, { repos: ['/missing/configured/repository'] }));
+  it('saves a repo-less world whose project gained a repository after it started', async () => {
+    // The task's own configuration named none: what it made is its work. A
+    // repository its configuration names but its world lacks still fails
+    // (tests/repository-adoption.test.ts).
+    const { task, handle } = await start();
+    (await h.store.updateProjectConfig(task.projectId, { repos: ['/configured/after/the/task/started'] }));
     await handle.signal('confirm');
-    await expect(handle.result()).rejects.toThrow();
-    expect(fs.existsSync(world.root)).toBe(true);
-    expect(JSON.stringify(await handle.fetchHistory())).toContain('configured repositories are missing');
+    expect(await handle.result()).toEqual({ stage: 'done' });
+    const saved = (await h.store.currentWorld(task.id))!;
+    const checkpoint = (await h.store.getWorldCheckpoint(saved.checkpointId!))!;
+    expect(checkpoint.repos).toEqual([]);
+    expect(checkpoint.filesystemDelta?.files).toBe(1);
   });
 
   it.each(['1.0.0', '1.5.0', '1.6.0'])('keeps the legacy %s activity sequence replayable', async (version) => {

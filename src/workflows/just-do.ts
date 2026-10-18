@@ -14,14 +14,16 @@ import {
 } from '@temporalio/workflow';
 import { ActivityCancellationType, ApplicationFailure } from '@temporalio/common';
 import type { coreActivities } from '../activities/core.js';
+import type { WorldHandle } from '../world/types.js';
 import type { coordinatorActivities } from '../activities/coordinator.js';
 import { isInfraFailure, INFRA_BACKOFF_MS } from './failures.js';
 import { confirmLayersOf } from '../domain/confirm.js';
-import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldHandleLike, ConfirmDecision, ConfirmLayer,
+import { TaskInput, TaskView, Stage, Message, ReviewInfo, DeclaredAction, WorldHandleLike, ConfirmDecision, ConfirmLayer, AdoptedRepositories,
   releaseWorldOnCompletion, remoteWorldProvider } from './contract.js';
 import { AgentTurnCancelled, CredentialUnavailable, createAgentTurnLeaser } from './agent-turn-lease.js';
 import { SIG } from './names.js';
 import { unattendedJobsReminder, waitForAgent } from './agent-wait.js';
+import { ADOPT_ATTACHED_REPOSITORIES, adoptedRepositoriesNote } from '../domain/adopted-repositories.js';
 
 const resourceActivities = proxyActivities<coreActivities>({
   startToCloseTimeout: '45 minutes', heartbeatTimeout: '2 minutes', retry: { maximumAttempts: 3 },
@@ -34,6 +36,8 @@ const resourceStaging = proxyActivities<coreActivities>({
   cancellationType: ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
 });
 const core = proxyActivities<coreActivities>({ startToCloseTimeout: '5 minutes', retry: { maximumAttempts: 3 } });
+// Adopting a repository attached mid-task clones it into the world.
+const enrollment = proxyActivities<coreActivities>({ startToCloseTimeout: '30 minutes', retry: { maximumAttempts: 2 } });
 // An agent turn has no wall-clock limit: long investigations and builds are
 // normal work. The 2-minute heartbeat timeout is what detects a dead worker or
 // a slept host. Temporal requires some start-to-close bound, so this one is
@@ -305,9 +309,22 @@ async function justDoImpl(
   if (leaser) await leaser.init();
 
   let infraRetries = 0;
+  // A repository attached to the project while this task runs without one
+  // joins its world before the agent's next turn: what it commits there is
+  // saved on the task's branch, and the files it made before are checkpointed.
+  let adoptsRepositories = resourceOnlyFinalization && !input.project.repos?.length;
   for (stage = 'do'; ; ) {
     await publish();
     if (cancelled) break;
+    if (adoptsRepositories && world && patched(ADOPT_ATTACHED_REPOSITORIES)) {
+      const adopted: AdoptedRepositories | undefined = await enrollment.adoptAttachedRepositories(world as WorldHandle, taskId);
+      if (adopted) {
+        world = adopted.world;
+        adoptsRepositories = false;
+        msgs.push({ id: `repos-${msgs.length}`, role: 'user', text: adoptedRepositoriesNote(adopted, false), ts: Date.now() });
+        await publish();
+      }
+    }
     let turn;
     // How many leading `msgs` are actually delivered this turn — captured at
     // schedule time, NOT after. A follow-up that arrives WHILE the turn runs lands

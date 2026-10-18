@@ -7648,7 +7648,9 @@ export class Store {
 
     const current = (await this.currentWorld(handle.id));
     if (!current || (current.generation ?? 1) !== (handle.generation ?? 1)) throw new Error('cannot update a stale world generation');
-    const next = { ...current, repos };
+    // A world that began without checkouts keeps its root as the working
+    // directory: the agent's session, files and resources all live there.
+    const next = { ...current, repos, ...(!current.repos?.length && repos.length ? { workdir: current.workdir ?? current.root } : {}) };
     (await this.db.prepare('UPDATE world_instances SET handle=?, updatedAt=? WHERE worldId=? AND generation=?')
       .run(JSON.stringify(next), Date.now(), handle.id, handle.generation ?? 1));
     return next;
