@@ -155,6 +155,7 @@ const S = {
   fields: [], // searchable-field registry (drives the filter/sort/group menus)
   searchResult: null, // { tasks, groups, total } from the last server evaluation
   searchFailed: false, // last evaluation errored — distinct from "nothing matched"
+  searchRefusal: '', // …because the server refused it (4xx), in the server's words
   searchPending: false, // a new query is being evaluated; the list labels its interim local preview
   wsOnline: true, // live socket up; false shows the topbar "Reconnecting" pill
   orgProjectId: null, // which project S.tags/S.views were loaded for (staleness guard)
@@ -4681,13 +4682,15 @@ async function runSearch() {
     S.searchFailed = false;
     S.searchPending = false;
     return true;
-  } catch {
+  } catch (error) {
     // Distinguish "the server couldn't evaluate this" from "nothing matched".
     // Without the flag the view falls back to a client-side filter and shows
     // "No matching tasks", so a server outage reads as a bad query and the user
-    // edits a perfectly good one.
+    // edits a perfectly good one. A refusal (4xx) is the server's answer, not an
+    // outage: it is shown in the server's words, with no retry.
     if (S.searchEpoch === epoch && isCurrent()) {
       S.searchResult = null; S.searchFailed = true; S.searchPending = false;
+      S.searchRefusal = error?.status >= 400 && error.status < 500 ? String(error.message || `HTTP ${error.status}`) : '';
     }
     return false;
   }
@@ -6312,7 +6315,9 @@ function tasksView() {
     body = flat.map((t) => row(t)).join('');
   }
   const empty = S.searchFailed
-    ? `<div class="empty"><div class="big">Search didn’t run</div>Couldn’t reach the server. <button class="btn sm" id="retry-search">Try again</button></div>`
+    ? `<div class="empty"><div class="big">Search didn’t run</div>${S.searchRefusal
+      ? esc(S.searchRefusal.replace(/[.!]?$/, '.'))
+      : 'Couldn’t reach the server. <button class="btn sm" id="retry-search">Try again</button>'}</div>`
     : !r && S.searchPending ? ''
     : viewIdForQuery(S.search) === FOR_ME_VIEW
       ? (notices ? '' : `<div class="empty for-me-empty"><div class="big">All clear</div>Nothing is waiting on you.</div>`)

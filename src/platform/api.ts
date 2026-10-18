@@ -5540,8 +5540,10 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       if ((await this.deps.tokens.check(token, 'project:read', scope)).ok && (await this.deps.tokens.check(token, 'task:read', scope)).ok)
         readable.push(project);
     }
-    // An empty list is an answer only inside the caller's own organization.
-    if (!readable.length && !(caller.organizationId === organizationId && allows(caller.caps, 'task:read')))
+    // An empty list is an answer only to a caller who may read the organization's
+    // tasks: inside its own organization, or with installation-wide authority.
+    if (!readable.length && !(caller.organizationId === organizationId && allows(caller.caps, 'task:read'))
+      && !(await this.deps.tokens.check(token, 'task:read', { organizationId })).ok)
       throw new CapabilityError(`denied: task:read in no project of organization ${organizationId}`);
     return this.searchAuthorizedOrganization(readable, query, caller.principal, page, now);
   }
