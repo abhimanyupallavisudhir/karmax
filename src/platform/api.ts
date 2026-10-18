@@ -6878,6 +6878,23 @@ Act according to your Avatar instructions. When ready, call platform_request POS
   }
 
   /**
+   * Bring a sub-task's project data into its parent's world now, before it is
+   * confirmed, so the parent can test the merged work with it (its code comes
+   * with import_task_branch). Its Confirm then delivers only what changed
+   * since. Not while the sub-task works: its copy must hold still to be saved.
+   */
+  async deliverSubTaskData(token: string, taskId: string): Promise<{ taken: import('../world/resources.js').ResourceRefresh[] }> {
+    const task = (await this.deps.store.getTask(taskId));
+    if (!task) throw new NotFoundError(`no task ${taskId}`);
+    (await this.require(token, 'edit_task', { projectId: task.projectId, taskId }));
+    if (!task.parentTaskId) throw new ValidationError('only a sub-task delivers data to a parent');
+    if (task.lastView?.status === 'active') throw new ValidationError('the sub-task is working; ask again when it pauses or reaches Review');
+    if (!this.deps.resources) throw new ValidationError('this installation has no project data');
+    try { return { taken: await this.deps.resources.deliverNow(taskId) }; }
+    catch (error) { throw new ValidationError(error instanceof Error ? error.message : String(error)); }
+  }
+
+  /**
    * What each task of an organization holds at its cloud providers — running,
    * parked or lost machines and their disks — in the projects the caller can
    * read: one place to see why a provider's limit is full, and what to free.

@@ -497,6 +497,26 @@ describe('files that need no merge, and conflicts told once', () => {
     expect(f.inWorld(two.world)['db.sqlite-shm']).toBe('two');
   }, 240_000);
 
+  // A sub-task's data reached its parent only at its Confirm, so the parent
+  // could not test the merged work with it first (A2's and K5's tests failed).
+  it('brings a sub-task\'s data into its parent before Confirm, and Confirm then brings only what changed since', async () => {
+    const f = await fixture({ 'index.txt': 'v1' });
+    const parent = await f.task('Integrator');
+    const child = await f.subTask('A2', parent);
+    await f.write(child.world, 'a2/records.txt', 'first pass');
+    const early = await f.resources.deliverNow(child.task.id);
+    expect(early).toMatchObject([{ added: 1, modified: 0, deleted: 0 }]);
+    expect(f.inWorld(parent.world)).toEqual({ 'index.txt': 'v1', 'a2/records.txt': 'first pass' });
+    // The parent tests and builds on it; the sub-task goes on and is confirmed.
+    await f.write(parent.world, 'a2/records.txt', 'first pass, checked by the parent');
+    await f.write(child.world, 'a2/more.txt', 'second pass');
+    await f.publish(child.task.id, 'a2');
+    const [taken] = await f.resources.takeDeliveries(parent.task.id);
+    expect(taken).toMatchObject({ added: 1, modified: 0, deleted: 0 });
+    expect(taken!.conflicts).toBeUndefined();
+    expect(f.inWorld(parent.world)).toEqual({ 'index.txt': 'v1', 'a2/records.txt': 'first pass, checked by the parent', 'a2/more.txt': 'second pass' });
+  }, 240_000);
+
   it('keeps one conflict\'s folder while a second sub-task waits, tells each conflict once, and resolves in one step', async () => {
     const f = await fixture({ 'index.bin': '\u0000v1' });
     const parent = await f.task('Integrator');

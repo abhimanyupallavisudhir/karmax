@@ -5436,6 +5436,14 @@ export class Gateway {
             && (await this.deps.tokens.check(token, 'payment:write', { projectId: task.projectId })).ok,
           spent: (await store.paymentSpent(task.id, false, policy.currency)), released });
       }
+      const deliverData = p.match(/^\/api\/tasks\/([^/]+)\/deliver-data$/);
+      if (deliverData && method === 'POST') {
+        try { return this.json(res, 200, await api.deliverSubTaskData(token, deliverData[1]!)); }
+        catch (e) {
+          const status = (e as { status?: number })?.status;
+          return this.json(res, status === 403 || status === 404 ? status : 400, { error: e instanceof Error ? e.message : String(e) });
+        }
+      }
       const releaseComputer = p.match(/^\/api\/tasks\/([^/]+)\/release-computer$/);
       if (releaseComputer && method === 'POST') {
         try { return this.json(res, 200, await api.releaseComputer(token, releaseComputer[1]!)); }

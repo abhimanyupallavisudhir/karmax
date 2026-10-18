@@ -940,7 +940,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   },
   {
     name: 'import_task_branch',
-    description: 'Fetch another task’s published branch into a namespaced local ref for inspection, testing, cherry-picking, or merging.',
+    description: 'Fetch another task’s published branch into a namespaced local ref for inspection, testing, cherry-picking, or merging. A sub-task\'s project data comes into your world before you confirm it with platform_request(POST, "/api/tasks/<its id>/deliver-data").',
     parameters: { type: 'object', properties: { source_task_id: { type: 'string' } }, required: ['source_task_id'] },
   },
   {

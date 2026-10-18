@@ -1504,6 +1504,31 @@ export class ProjectResourceService {
     if (conflicts.length) throw ResourceConflictError.combine(conflicts);
   }
 
+  /**
+   * A sub-task's data for its parent before Confirm (POST /api/tasks/:id/deliver-data),
+   * so the parent can test its merged work with it: its changes to each
+   * writable resource the parent forked are delivered as at Confirm — whose
+   * delivery then builds on this one — and taken into the parent's world now.
+   * Returns what the parent's world took in, conflicts included.
+   */
+  async deliverNow(taskId: string, work: { checkContinue?: () => Promise<void> } = {}): Promise<ResourceRefresh[]> {
+    const parent = await this.parentWorld(taskId);
+    if (!parent) throw new Error('this task has no parent world to bring its data into');
+    const world = await this.store.currentWorld(taskId) as WorldHandle | undefined;
+    if (!world) throw new Error('this task has no world yet');
+    for (const lease of await this.store.listResourceLeases(world.id, world.generation ?? 1)) {
+      if (lease.state !== 'active' || !parent.forks.has(lease.attachmentId)) continue;
+      const resource = await this.store.getResourceAttachment(lease.attachmentId);
+      if (!resource || resource.access !== 'write' || resource.isolation !== 'fork' || resource.target.kind !== 'path') continue;
+      await work.checkContinue?.();
+      const inspection = await this.inspect(taskId, resource.id, work);
+      const { summary } = inspection;
+      if (summary.added + summary.modified + summary.deleted > 0) await this.deliver(taskId, resource, inspection, parent.taskId);
+      else await this.discardCapture(inspection.repository, inspection.capture);
+    }
+    return this.takeDeliveries(parent.taskId, work);
+  }
+
   /** The parent of a sub-task whose world is still to receive output, and
    * the writable resources it forked (any generation). */
   private async parentWorld(taskId: string): Promise<{ taskId: string; handle: WorldHandle; forks: Set<string> } | undefined> {

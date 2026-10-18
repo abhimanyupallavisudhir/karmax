@@ -688,7 +688,7 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
     description: `Publish this task’s clean, committed branch through ${BRAND}’s trusted Git broker so another agent can import it.`, inputSchema: {},
   }, async () => wrap(async () => (await ops.publishTaskBranch())));
   server.registerTool('import_task_branch', {
-    description: 'Fetch another task’s published branch into namespaced refs in this world. Inspect/test/cherry-pick or merge it locally afterward.',
+    description: 'Fetch another task’s published branch into namespaced refs in this world. Inspect/test/cherry-pick or merge it locally afterward. A sub-task\'s project data comes into your world before you confirm it with platform_request POST /api/tasks/<its id>/deliver-data.',
     inputSchema: { sourceTaskId: z.string() },
   }, async (a) => wrap(async () => (await ops.importTaskBranch(a.sourceTaskId))));
   server.registerTool('refresh_upstream', {
