@@ -33,7 +33,8 @@ import {
   MERGE_QUEUE_WORKFLOW,
   AGENT_QUEUE_WORKFLOW,
 } from '../coordinators/names.js';
-import { TaskRecord, TaskView, AttentionAsk, Message, Project, TaskInput, ImageRef, FileRef, Tag, SavedView, TaskQuery, AgentRole, AgentSpec, AgentAuthority, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency, remotePolicyOf, ResourceAccess, ResourceTarget } from '../domain/types.js';
+import { templateContent, templateName, templateParams, templateAuthorization } from '../domain/task-templates.js';
+import { TaskRecord, TaskView, AttentionAsk, Message, Project, TaskInput, ImageRef, FileRef, Tag, SavedView, TaskTemplate, TaskQuery, AgentRole, AgentSpec, AgentAuthority, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency, remotePolicyOf, ResourceAccess, ResourceTarget } from '../domain/types.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable, awaitsSuccessOf, isSeries } from '../domain/triggers.js';
 import { BUILT_IN_AUTOMATIONS, automationNeeds, templateTask, type AutomationNeed, type AutomationTemplate } from '../domain/automations.js';
 import { applyTriggerContext, normalizeEventInput, validateFollow, type EventFilter, type EventFollow, type ProjectEvent, type ProjectEventClaim,
@@ -1374,9 +1375,16 @@ export class KarmaxApi {
       assignee?: PrincipalRef;
       delegate?: PrincipalRef;
       confirmationPolicy?: ConfirmationPolicy;
+      /** Start from this task template (the project's or its organization's);
+       *  every other argument overrides it, `params` field by field. */
+      templateId?: string;
     },
     receivedAt?: { monoMs: number; wallMs: number },
   ): Promise<TaskRecord & { authorizationGap?: AuthorizationGap & { participant?: string } }> {
+    if (args.templateId) {
+      const { templateId, ...plain } = args;
+      return this.createTask(token, await this.withTemplate(token, templateId, plain), receivedAt);
+    }
     if (args.holdForAuthorization) {
       const { holdForAuthorization: _hold, ...plain } = args;
       try {
@@ -5784,6 +5792,97 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
   async deleteView(token: string, id: string): Promise<void> {
     (await this.requireViewScope(token, id));
     (await this.deps.store.deleteView(id));
+  }
+
+  // ─── Task templates (a template is a saved task form) ─────────────────────────
+  /** The templates a project offers: its organization's and its own, oldest
+   *  first — numbered 1, 2, … after the Task defaults (template 0). */
+  async listProjectTemplates(token: string, projectId: string): Promise<TaskTemplate[]> {
+    (await this.require(token, 'list_templates', { projectId }));
+    const organizationId = (await this.deps.store.projectOrganizationAsync(projectId));
+    if (!organizationId) throw new NotFoundError(`no project ${projectId}`);
+    return (await this.deps.store.listTaskTemplates(organizationId, projectId));
+  }
+
+  /** An organization's own templates, which every project of it offers. */
+  async listOrganizationTemplates(token: string, organizationId: string): Promise<TaskTemplate[]> {
+    (await this.require(token, 'list_templates', { organizationId }));
+    return (await this.deps.store.listTaskTemplates(organizationId));
+  }
+
+  /** Saves a task form as a template of a project (`projectId`) or of an organization. */
+  async createTemplate(token: string, input: { projectId?: string; organizationId?: string; name: unknown } & Record<string, unknown>): Promise<TaskTemplate> {
+    const projectId = typeof input.projectId === 'string' && input.projectId ? input.projectId : undefined;
+    const organizationId = projectId ? (await this.deps.store.projectOrganizationAsync(projectId))
+      : typeof input.organizationId === 'string' && (await this.deps.store.getOrganization(input.organizationId)) ? input.organizationId : undefined;
+    if (!organizationId) throw new NotFoundError(projectId ? `no project ${projectId}` : `no such organization ${String(input.organizationId)}`);
+    const caller = (await this.require(token, 'manage_template', projectId ? { projectId } : { organizationId }));
+    const name = templateName(input.name);
+    return (await this.deps.store.createTaskTemplate({ organizationId, projectId, name, createdBy: caller.principal,
+      ...templateContent(input, projectId) }));
+  }
+
+  /** Saves a task — any task, running or finished — as a template: its form
+   *  contents as they are stored, without what only meant something for it. */
+  async createTemplateFromTask(token: string, taskId: string, input: { name: unknown; scope?: unknown }): Promise<TaskTemplate> {
+    const task = (await this.deps.store.getTask(taskId));
+    if (!task) throw new NotFoundError(`no such task ${taskId}`);
+    (await this.require(token, 'get_task', { projectId: task.projectId, taskId }));
+    const organizationId = (await this.deps.store.projectOrganizationAsync(task.projectId));
+    const held = task.params._authorization as { capabilities?: string[]; credentialPolicies?: Record<string, unknown> } | undefined;
+    const tags = (await this.deps.store.listTags(task.projectId));
+    const byId = new Map(tags.map((tag) => [tag.id, tag]));
+    return this.createTemplate(token, {
+      ...(input.scope === 'organization' ? { organizationId } : { projectId: task.projectId }),
+      name: input.name, workflow: task.workflow, params: task.params, notes: task.notes,
+      authorization: templateAuthorization(held, task.projectId),
+      credentialGrants: (held?.capabilities ?? []).filter((capability) => capability.startsWith('use-credential:')),
+      credentialPolicies: held?.credentialPolicies,
+      tags: (await this.deps.store.tagsFor(taskId)).map((id) => byId.get(id)).filter((tag): tag is Tag => !!tag).map((tag) => tagPath(tag, byId)),
+      priority: task.params.priority,
+    });
+  }
+
+  // `/api/templates/:id` names no scope: the template's own decides.
+  private async requireTemplateScope(token: string, id: string): Promise<TaskTemplate> {
+    const template = (await this.deps.store.getTaskTemplate(id));
+    (await this.require(token, 'manage_template', template?.projectId ? { projectId: template.projectId }
+      : { organizationId: template?.organizationId ?? '' }));
+    if (!template) throw new NotFoundError(`no such template ${id}`);
+    return template;
+  }
+
+  /** Renames a template, and with `workflow`/`params` replaces its contents as a whole. */
+  async updateTemplate(token: string, id: string, patch: Record<string, unknown>): Promise<TaskTemplate | undefined> {
+    const template = (await this.requireTemplateScope(token, id));
+    const name = patch.name === undefined ? undefined : templateName(patch.name);
+    const content = patch.params !== undefined || patch.workflow !== undefined
+      ? templateContent({ workflow: template.workflow, ...patch }, template.projectId || undefined) : undefined;
+    return (await this.deps.store.updateTaskTemplate(id, { name, content }));
+  }
+
+  async deleteTemplate(token: string, id: string): Promise<void> {
+    (await this.requireTemplateScope(token, id));
+    (await this.deps.store.deleteTaskTemplate(id));
+  }
+
+  /** `createTask` arguments starting from a template: whatever the caller
+   *  names wins, its `params` over the template's field by field. */
+  private async withTemplate<T extends { projectId: string; params?: ValueMap } & Record<string, unknown>>(token: string, templateId: string, args: T): Promise<T> {
+    const template = (await this.deps.store.getTaskTemplate(templateId));
+    const organizationId = (await this.deps.store.projectOrganizationAsync(args.projectId));
+    (await this.require(token, 'list_templates', { projectId: args.projectId }));
+    if (!template || template.organizationId !== organizationId || (template.projectId && template.projectId !== args.projectId))
+      throw new NotFoundError(`no template ${templateId} in this project`);
+    const params: ValueMap = { ...templateParams(template.params), ...(args.params ?? {}) };
+    for (const key of ['prompt', 'base', 'target', 'command', 'branch'] as const)
+      if (args[key] !== undefined && args.params?.[key] === undefined) params[key] = args[key];
+    const authorization = template.authorization && (template.authorization.scope === 'projects' && !template.authorization.projectIds?.length
+      ? { ...template.authorization, projectIds: [args.projectId] } : template.authorization);
+    const pick = <K extends string>(key: K, fallback: unknown) => (args[key] !== undefined ? {} : fallback !== undefined ? { [key]: fallback } : {});
+    return { ...args, params, ...pick('workflow', template.workflow), ...pick('notes', template.notes),
+      ...pick('authorization', authorization), ...pick('credentialGrants', template.credentialGrants),
+      ...pick('credentialPolicies', template.credentialPolicies), ...pick('tags', template.tags), ...pick('priority', template.priority) };
   }
 
   /** Restart a terminally failed software-dev execution without running Setup.

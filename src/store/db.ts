@@ -38,6 +38,7 @@ import {
   KarmaxEvent,
   Tag,
   SavedView,
+  TaskTemplate,
   TaskQuery,
   Organization,
   OrganizationExecutionPolicy,
@@ -89,6 +90,7 @@ import {
   type OrganizationEntitlements,
 } from '../domain/entitlements.js';
 import { newId } from '../util/id.js';
+import type { TaskTemplateContent } from '../domain/task-templates.js';
 import type { AutomationTemplate } from '../domain/automations.js';
 import { EVENT_RETENTION_MS as PROJECT_EVENT_RETENTION_MS, type EventFollow, type ProjectEvent, type ProjectEventClaim,
   type ProjectEventClaimState } from '../domain/project-events.js';
@@ -1051,6 +1053,10 @@ export class Store {
         id TEXT PRIMARY KEY, projectId TEXT NOT NULL, name TEXT NOT NULL,
         query TEXT NOT NULL, icon TEXT, ord INTEGER NOT NULL, createdAt INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS task_templates (
+        id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, projectId TEXT NOT NULL, name TEXT NOT NULL,
+        workflow TEXT NOT NULL, content TEXT NOT NULL, createdBy TEXT, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS authorization_profiles (
         scopeKey TEXT NOT NULL,
         id TEXT NOT NULL,
@@ -1148,6 +1154,7 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_tags_project ON tags(projectId);
       CREATE INDEX IF NOT EXISTS idx_task_tags_tag ON task_tags(tagId);
       CREATE INDEX IF NOT EXISTS idx_saved_views_project ON saved_views(projectId);
+      CREATE INDEX IF NOT EXISTS idx_task_templates_scope ON task_templates(organizationId, projectId);
       CREATE INDEX IF NOT EXISTS idx_payment_requests_task_status ON payment_spend_requests(taskId, status, createdAt);
       CREATE INDEX IF NOT EXISTS idx_payment_requests_org_status ON payment_spend_requests(organizationId, status, createdAt);
       CREATE INDEX IF NOT EXISTS idx_payment_transactions_org_time ON payment_transactions(organizationId, createdAt DESC);
@@ -2012,7 +2019,7 @@ export class Store {
       (await this.deletePermissionRequestKv(project.organizationId, taskIds));
       (await this.deleteAuthorizationRequestKv(project.organizationId, { kind: 'avatar', ids: avatarIds }));
       (await this.deleteProjectKv([id], taskIds));
-      for (const table of ['project_memberships', 'project_repositories', 'project_wikis', 'task_lists', 'tags', 'saved_views', 'world_checkpoints'] as const)
+      for (const table of ['project_memberships', 'project_repositories', 'project_wikis', 'task_lists', 'tags', 'saved_views', 'task_templates', 'world_checkpoints'] as const)
         (await this.db.prepare(`DELETE FROM ${table} WHERE projectId=?`).run(id));
       (await deleteRows(this.db, 'teams', 'id', teamIds));
       (await deleteRows(this.db, 'tasks', 'id', taskIds));
@@ -2459,6 +2466,7 @@ export class Store {
       task_tags: (await rowsFor(this.db, 'task_tags', 'taskId', taskIds)),
       saved_views: [...(await rowsFor(this.db, 'saved_views', 'projectId', projectIds)),
         ...(await selectRows(this.db, 'saved_views', "organizationId=? AND projectId=''", [organizationId]))],
+      task_templates: (await selectRows(this.db, 'task_templates', 'organizationId=?', [organizationId])),
       git_connections: (await selectRows(this.db, 'git_connections', 'organizationId=?', [organizationId])),
       repositories: (await rowsFor(this.db, 'repositories', 'id', repositoryIds)),
       project_repositories: (await rowsFor(this.db, 'project_repositories', 'projectId', projectIds)),
@@ -2773,6 +2781,7 @@ export class Store {
       for (const table of ['project_memberships', 'project_repositories', 'project_wikis', 'task_lists', 'tags', 'saved_views', 'world_checkpoints'] as const)
         (await deleteRows(this.db, table, 'projectId', projectIds));
       (await this.db.prepare("DELETE FROM saved_views WHERE organizationId=? AND projectId=''").run(organizationId));
+      (await this.db.prepare('DELETE FROM task_templates WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM preview_leases WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM executions WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM promoted_artifacts WHERE organizationId=?').run(organizationId));
@@ -5963,6 +5972,53 @@ export class Store {
     (await this.db.prepare('DELETE FROM saved_views WHERE id = ?').run(id));
   
     });
+  }
+
+  // ─── Task templates (a template is a saved task form) ─────────────────────────
+
+  /** An organization's own templates (`projectId` ''), or with `projectId` the
+   *  ones that project offers: the organization's and its own, oldest first. */
+  async listTaskTemplates(organizationId: string, projectId?: string): Promise<TaskTemplate[]> {
+    const rows = (projectId
+      ? await this.db.prepare("SELECT * FROM task_templates WHERE organizationId = ? AND (projectId = '' OR projectId = ?) ORDER BY createdAt, id").all(organizationId, projectId)
+      : await this.db.prepare("SELECT * FROM task_templates WHERE organizationId = ? AND projectId = '' ORDER BY createdAt, id").all(organizationId)) as any[];
+    return rows.map(rowToTaskTemplate);
+  }
+
+  async getTaskTemplate(id: string): Promise<TaskTemplate | undefined> {
+    const row = (await this.db.prepare('SELECT * FROM task_templates WHERE id = ?').get(id)) as any;
+    return row ? rowToTaskTemplate(row) : undefined;
+  }
+
+  async createTaskTemplate(input: { organizationId: string; projectId?: string; name: string; createdBy?: string } & TaskTemplateContent): Promise<TaskTemplate> {
+    const { organizationId, projectId = '', name, createdBy, ...content } = input;
+    // Templates are numbered by when they were added: never let two share an instant.
+    const last = (await this.db.prepare("SELECT COALESCE(MAX(createdAt), 0) AS m FROM task_templates WHERE organizationId = ?").get(organizationId)) as { m: number };
+    const now = Math.max(Date.now(), Number(last.m) + 1);
+    const template: TaskTemplate = { id: newId('tmpl'), organizationId, projectId, name, ...content,
+      ...(createdBy ? { createdBy } : {}), createdAt: now, updatedAt: now };
+    (await this.db.prepare('INSERT INTO task_templates (id, organizationId, projectId, name, workflow, content, createdBy, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(template.id, organizationId, projectId, name, content.workflow, JSON.stringify(taskTemplateContentOf(template)), createdBy ?? null, now, now));
+    return template;
+  }
+
+  /** Renames a template and/or replaces its contents (all of them, as a form saves). */
+  async updateTaskTemplate(id: string, patch: { name?: string; content?: TaskTemplateContent }): Promise<TaskTemplate | undefined> {
+    return this.db.transaction(async () => {
+      if (this.db.dialect === 'postgres') (await this.db.prepare('SELECT 1 FROM task_templates WHERE id = ? FOR UPDATE').get(id));
+      const current = (await this.getTaskTemplate(id));
+      if (!current) return undefined;
+      const base = { id: current.id, organizationId: current.organizationId, projectId: current.projectId, name: patch.name ?? current.name,
+        ...(current.createdBy ? { createdBy: current.createdBy } : {}), createdAt: current.createdAt, updatedAt: Date.now() };
+      const next: TaskTemplate = { ...base, ...(patch.content ?? taskTemplateContentOf(current)) };
+      (await this.db.prepare('UPDATE task_templates SET name = ?, workflow = ?, content = ?, updatedAt = ? WHERE id = ?')
+        .run(next.name, next.workflow, JSON.stringify(taskTemplateContentOf(next)), next.updatedAt, id));
+      return next;
+    });
+  }
+
+  async deleteTaskTemplate(id: string): Promise<void> {
+    (await this.db.prepare('DELETE FROM task_templates WHERE id = ?').run(id));
   }
 
   // ─── Profiles ──────────────────────────────────────────────────────────────
@@ -10433,6 +10489,20 @@ function rowToTag(r: any): Tag {
     kind: r.kind ?? undefined,
     description: r.description ?? undefined,
     createdAt: r.createdAt,
+  };
+}
+function taskTemplateContentOf(template: TaskTemplate): Omit<TaskTemplateContent, 'workflow'> {
+  const { params, notes, authorization, credentialGrants, credentialPolicies, tags, priority } = template;
+  return { params, notes, authorization, credentialGrants, credentialPolicies, tags, priority };
+}
+function rowToTaskTemplate(r: any): TaskTemplate {
+  const content = JSON.parse(r.content) as Omit<TaskTemplateContent, 'workflow'>;
+  return {
+    id: r.id, organizationId: r.organizationId, projectId: r.projectId ?? '', name: r.name, workflow: r.workflow,
+    params: content.params ?? {},
+    ...Object.fromEntries(Object.entries(content).filter(([key, value]) => key !== 'params' && value !== undefined && value !== null)),
+    ...(r.createdBy ? { createdBy: r.createdBy } : {}),
+    createdAt: Number(r.createdAt), updatedAt: Number(r.updatedAt),
   };
 }
 function rowToView(r: any): SavedView {
