@@ -481,6 +481,38 @@ describe('software-dev pipeline: follow-ups, confirmation modes and recovery (re
     expect(cancelled.waitingFor).toBeUndefined();
   }, 120_000);
 
+  // A full provider limit (Hetzner CPUs, volumes, public IPs) used to be five
+  // infrastructure waits over about twenty minutes, then a person asked to
+  // retry — dozens of times for one agent's batch. It waits for room instead,
+  // saying why, and tries again on its own schedule; Retry tries at once.
+  it('waits for room while its provider\'s limit is full, past the infrastructure retries', async () => {
+    const repo = await h.makeRepo('app-capacity-wait');
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('softwareDev', {
+      taskQueue: TASK_QUEUE,
+      workflowId: taskId,
+      args: [input({ taskId, repo, title: 'Capacity', resolveAgentEnabled: false,
+        prompt: '@capacityfull 7 Hetzner refused a new server: the CPU limit is full\n@review done' })],
+    });
+    for (let round = 0; round < 7; round++) {
+      await expect.poll(async () => (await view(handle)).waitingFor?.summary, { timeout: 30_000, interval: 200 }).toBe('Waiting for a machine');
+      const waiting = await view(handle);
+      expect(waiting).toMatchObject({ stage: 'do', status: 'waiting',
+        waitingFor: { kind: 'retry', detail: expect.stringContaining('the CPU limit is full') } });
+      // Not one activity retry at once: the first wait is 30 s, the fourth and later 5 min.
+      expect(waiting.waitingFor.until - Date.now()).toBeLessThanOrEqual([30_000, 60_000, 120_000][round] ?? 300_000);
+      expect(waiting.waitingFor.until - Date.now()).toBeGreaterThan(([30_000, 60_000, 120_000][round] ?? 300_000) - 15_000);
+      await handle.signal('retry');
+      await expect.poll(async () => (await view(handle)).waitingFor?.until, { timeout: 15_000, interval: 200 }).not.toBe(waiting.waitingFor.until);
+    }
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    const reviewed = await view(handle);
+    expect(reviewed.error).toBeUndefined();
+    expect((await h.store.eventsSince(taskId, 0)).some((e) => e.type === 'resolve.auto')).toBe(false);
+    await handle.signal('cancel');
+    await handle.result();
+  }, 180_000);
+
   // legibench3#18: a session converted from a 44 MB Codex history was larger than
   // Claude's context, so every retry and follow-up resumed it into the same refusal.
   it('restarts Do on a fresh session when its session outgrew the model\'s context', async () => {

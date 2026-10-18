@@ -25,7 +25,12 @@ export function isInfraFailure(err: unknown): boolean {
   if (!(err instanceof ActivityFailure)) return false;
   const cause = err.cause;
   if (cause instanceof TimeoutFailure) return true;
-  return cause instanceof ApplicationFailure && (cause.type === 'agent-infra' || cause.type === 'world-infra');
+  return cause instanceof ApplicationFailure && (cause.type === 'agent-infra' || cause.type === 'world-infra' || cause.type === 'world-capacity');
+}
+
+/** A provider account's limit that is full ('world-capacity', also infrastructure). */
+export function isCapacityFailure(err: unknown): boolean {
+  return err instanceof ActivityFailure && err.cause instanceof ApplicationFailure && err.cause.type === 'world-capacity';
 }
 
 /** Recover provider-ground-truth limit metadata serialized by runAgentTurn. Old
@@ -74,3 +79,13 @@ export const INFRA_BACKOFF_MS = [30_000, 60_000, 120_000, 300_000, 600_000] as c
  */
 export const WORLD_WAIT_MS = [30_000, 60_000, 120_000, 300_000, 600_000] as const;
 export const WORLD_WAIT_LIMIT_MS = 3 * 3_600_000;
+
+/**
+ * How a stage waits for room when its provider account's limit is full (a
+ * Hetzner project's CPUs, volume space or public IPs): it tries again every
+ * few minutes, as other tasks' machines stop, for a day before a person is
+ * asked, instead of five waits over twenty minutes (pramana: retried by hand
+ * dozens of times). Retry tries at once; a cancel ends it.
+ */
+export const CAPACITY_WAIT_MS = [30_000, 60_000, 120_000, 300_000] as const;
+export const CAPACITY_WAIT_LIMIT_MS = 24 * 3_600_000;

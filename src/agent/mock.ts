@@ -1,6 +1,6 @@
 import { AdapterTurn, AgentAdapter, PlatformToolContext, TurnInput } from './types.js';
 import { parseTransition } from '../resolve/transitions.js';
-import { providerErrorFromMessage } from './limits.js';
+import { ProviderCapacityFull, providerErrorFromMessage } from './limits.js';
 import { worldRepoTarget, worldRepos, worldWorkingRelativePath } from '../world/types.js';
 import { platformToolHandlers } from './tools.js';
 import { SUB_TASK_ACTIONS, type SubTaskAction } from '../domain/types.js';
@@ -44,6 +44,8 @@ import { SUB_TASK_ACTIONS, type SubTaskAction } from '../domain/types.js';
  *                                   transient-infra retry path — no Resolve)
  *   @failworld <message>            throw on this and every later turn in this world, the
  *                                   retries' resume prompts included (a fault that persists)
+ *   @capacityfull <n> <message>     fail this and the next n-1 turns in this world as a
+ *                                   provider account's full limit (ProviderCapacityFull)
  *   @overflow [always]              fail as a context overflow while resuming a session
  *                                   (`always`: in a fresh one too); in a fresh session
  *                                   report `fresh session` and go on
@@ -66,6 +68,8 @@ import { SUB_TASK_ACTIONS, type SubTaskAction } from '../domain/types.js';
 const failedOnce = new Set<string>();
 // @failworld ledger: worlds whose every turn fails with the recorded message.
 const failingWorlds = new Map<string, string>();
+// @capacityfull ledger: worlds whose next turns meet a full provider limit, and why.
+const capacityFull = new Map<string, { left: number; message: string }>();
 // `@subagents N` ledger: the sub-agent count drains by one each turn (keyed by world),
 // so a turn that "finished" is HELD in Do until the count reaches 0 — modelling
 // auto-backgrounded Claude Agent SDK sub-agents that settle over several turns.
@@ -421,6 +425,11 @@ export class MockAdapter implements AgentAdapter {
     if (persistent) throw providerErrorFromMessage('mock', persistent);
     const recent = input.messages.filter((m) => m.role === 'user');
     const initialText = recent.length ? recent[recent.length - 1]!.text : input.systemPrompt;
+    const full = initialText.match(/^@capacityfull\s+(\d+)\s*(.*)$/m);
+    if (full && !capacityFull.has(input.world.handle.id))
+      capacityFull.set(input.world.handle.id, { left: Number(full[1]), message: full[2] || 'mock provider limit is full' });
+    const limit = capacityFull.get(input.world.handle.id);
+    if (limit && limit.left > 0) { limit.left--; throw new ProviderCapacityFull(limit.message); }
     if (input.role !== 'do') {
       const instructions = input.systemPrompt.match(/Instructions for you:\n([\s\S]*?)(?:\n\n|$)/)?.[1];
       if (instructions && recent.length) await processText(instructions);

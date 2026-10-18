@@ -39,7 +39,7 @@ import {
   participantLabel, participantRole, reviewerKey, selectorAgent,
 } from '../domain/participants.js';
 import { resetAtFromHint } from '../agent/limits.js';
-import { isInfraFailure, limitFailureClassification, INFRA_BACKOFF_MS, WORLD_WAIT_MS, WORLD_WAIT_LIMIT_MS } from './failures.js';
+import { isCapacityFailure, isInfraFailure, limitFailureClassification, CAPACITY_WAIT_MS, CAPACITY_WAIT_LIMIT_MS, INFRA_BACKOFF_MS, WORLD_WAIT_MS, WORLD_WAIT_LIMIT_MS } from './failures.js';
 import {
   TaskInput,
   TaskView,
@@ -348,6 +348,8 @@ const OPEN_PR_WAITS_FOR_WORLD = 'software-dev-open-pr-waits-for-world-v1';
 /** Saving and publishing resources wait for a machine the provider cannot
  * start yet instead of escalating (pramana#79). */
 const RESOURCES_WAIT_FOR_WORLD = 'resources-wait-for-world-v1';
+/** A stage whose provider limit is full waits for room for a day (failures.ts CAPACITY_WAIT_MS). */
+const STAGES_WAIT_FOR_CAPACITY = 'stages-wait-for-capacity-v1';
 /** A sub-task whose parent world cannot be reached is waited out, then a
  * person's, never the asking agent's (pramana#39/#43). */
 const SUBTASK_PREPARE_WAITS_FOR_WORLD = 'software-dev-subtask-prepare-waits-for-world-v1';
@@ -2351,6 +2353,8 @@ async function softwareDevImpl(
     for (;;) {
       let attempt = 0;
       let infraRetries = 0;
+      let capacityWaited = 0;
+      let capacityRounds = 0;
       let freshContext = false;
       for (; attempt <= MAX_RESOLVE_ATTEMPTS; attempt++) {
         limitReportedToCoordinator = false;
@@ -2422,6 +2426,24 @@ async function softwareDevImpl(
           // outage that outlived those retries: park with backoff and re-run the
           // stage. Doesn't consume resolve attempts. A human Retry or a cancel
           // wakes the park early.
+          // A provider limit that is full frees only as other tasks' machines
+          // stop: wait for room, trying again every few minutes, for a day.
+          if (isCapacityFailure(err) && capacityWaited < CAPACITY_WAIT_LIMIT_MS && patched(STAGES_WAIT_FOR_CAPACITY)) {
+            const wait = CAPACITY_WAIT_MS[Math.min(capacityRounds++, CAPACITY_WAIT_MS.length - 1)]!;
+            capacityWaited += wait;
+            attempt--; // waiting for room is not a resolve attempt
+            const resume = { status, waitingFor };
+            status = 'waiting';
+            waitingFor = { kind: 'retry', summary: 'Waiting for a machine', detail: innermostMessage(err), until: Date.now() + wait };
+            retryRequested = false;
+            await publish();
+            await condition(() => cancelled || retryRequested || halted(), wait);
+            ({ status, waitingFor } = resume);
+            if (cancelled || halted()) throw new Cancelled();
+            retryRequested = false;
+            await publish();
+            continue;
+          }
           if (isInfraFailure(err)) {
             if (infraRetries < INFRA_BACKOFF_MS.length) {
               const wait = INFRA_BACKOFF_MS[infraRetries++]!;
@@ -6402,7 +6424,7 @@ function innermostMessage(err: any): string {
     if (e.message) message = e.message;
     // A world the provider cannot start says so in people's words; what is
     // under it is the provider's raw answer (pramana#79: Hetzner's JSON).
-    if (e.type === 'world-infra') break;
+    if (e.type === 'world-infra' || e.type === 'world-capacity') break;
     e = e.cause;
   }
   return message || String(err);

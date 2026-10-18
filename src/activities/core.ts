@@ -26,7 +26,7 @@ import { recordHumanConfirmation } from '../platform/review-confirmation.js';
 import { WorkflowNotFoundError, type Client } from '@temporalio/client';
 import { Context as activityContext } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
-import { AgentChannelLost, ProviderOutage, ProviderPolicyFailure, SandboxProviderFailure, confirmSandboxFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, isContextOverflow, type LimitClassification } from '../agent/limits.js';
+import { AgentChannelLost, ProviderCapacityFull, ProviderOutage, ProviderPolicyFailure, SandboxProviderFailure, confirmSandboxFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, isContextOverflow, type LimitClassification } from '../agent/limits.js';
 import { probeClaudeUsage, probeCodexUsage, type UsageResult } from '../agent/usage.js';
 import { markCheckpointStale } from '../world/checkpoint-staleness.js';
 import { usageAdmissionId as admissionIdFor } from '../domain/turn-admission.js';
@@ -182,7 +182,22 @@ const DEFAULT_GRANT = [
  * (pramana#79: a full Hetzner IP limit escalated a publication). */
 function providerUnavailable(error: unknown): unknown {
   if (!(error instanceof ProviderOutage)) return error;
-  return ApplicationFailure.create({ message: error.message, type: 'world-infra', nonRetryable: false, cause: error });
+  return capacityFailure(error) ?? ApplicationFailure.create({ message: error.message, type: 'world-infra', nonRetryable: false, cause: error });
+}
+
+/** A provider account's limit that is full (ProviderCapacityFull, anywhere in
+ * the cause chain) as `world-capacity`: only other tasks' machines stopping
+ * frees it, so the workflow waits for room on its own schedule, for hours,
+ * instead of the activity retrying at once and then a person being asked
+ * after twenty minutes (failures.ts CAPACITY_WAIT_LIMIT_MS). */
+function capacityFailure(error: unknown): ApplicationFailure | undefined {
+  for (let cause = error, depth = 0; cause && depth < 8; cause = (cause as { cause?: unknown }).cause, depth++) {
+    if (cause instanceof ProviderCapacityFull || (cause as { name?: string }).name === 'ProviderCapacityFull') {
+      const message = (cause as Error).message;
+      return ApplicationFailure.create({ message, type: 'world-capacity', nonRetryable: true, cause: cause instanceof Error ? cause : undefined });
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -192,6 +207,8 @@ function providerUnavailable(error: unknown): unknown {
  * rides in ApplicationFailure.details for account rotation and auto-resolve.
  */
 function classifyTurnError(err: unknown, provider?: Provider, sandbox?: { diagnosis?: WorldDiagnosis }): Error {
+  const full = capacityFailure(err);
+  if (full) return full;
   const msg = err instanceof Error ? err.message : String(err);
   const cause = err instanceof Error ? err : undefined;
   // Admission happens before a provider process exists. Temporal coordinator
@@ -1421,6 +1438,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
    * limit reached the workflow as a plain error and failed the task). */
   function worldUnreachable(handle: WorldHandle, error: unknown): unknown {
     if (error instanceof ApplicationFailure || !isRemote(handle.kind) || !isTransportError(error)) return error;
+    const full = capacityFailure(error);
+    if (full) return full;
     return ApplicationFailure.create({ message: error instanceof Error ? error.message : String(error), type: 'world-infra',
       nonRetryable: false, cause: error instanceof Error ? error : undefined });
   }
@@ -2139,6 +2158,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           if (acquired) (await deps.runners?.release(acquired.leaseId, args.kind));
           stopCancellationHeartbeat();
           if (remote && isTransportError(error)) {
+            const full = capacityFailure(error);
+            if (full) throw full;
             const message = error instanceof Error ? error.message : String(error);
             throw ApplicationFailure.create({
               message,
@@ -2455,6 +2476,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // power-on "Unknown Error" blocked the task as an agent error): it waits
         // out as infrastructure, then reaches a person, never Resolve.
         // A turn classifies what the provider said, not openWorld's wrapper.
+        const full = capacityFailure(error);
+        if (full) throw full;
         const cause = error instanceof ApplicationFailure && error.type === 'world-infra' && error.cause ? error.cause : error;
         const failure = classifyTurnError(cause, profile.provider);
         if (failure instanceof ApplicationFailure && failure.type === 'agent-error')

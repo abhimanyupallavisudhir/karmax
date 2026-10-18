@@ -11910,7 +11910,7 @@ function conversationPresence(v, t) {
 function presenceDetail(v) {
   const w = v.waitingFor;
   if (!w) return '';
-  const detail = ['account', 'agentSlot'].includes(w.kind) && typeof w.detail === 'string' ? w.detail.trim() : '';
+  const detail = (['account', 'agentSlot'].includes(w.kind) || (w.kind === 'retry' && w.summary)) && typeof w.detail === 'string' ? w.detail.trim() : '';
   return [detail, w.earliestResetAt ? `Earliest ${fmtReset(w.earliestResetAt)}` : ''].filter(Boolean).join(' · ');
 }
 
@@ -12473,6 +12473,9 @@ function waitingText(w) {
   // A paused agent's ask carries the time it carries on without an answer.
   if (w?.kind === 'human') return Number.isFinite(w.until) ? `Needs input until ${waitDeadline(w.until)}` : 'Needs input';
   if (w?.kind === 'timer') return Number.isFinite(w.until) ? `Waiting until ${waitDeadline(w.until)}` : 'Waiting';
+  // A full provider limit: what it waits for, and when it tries again.
+  if (w?.kind === 'retry' && typeof w.summary === 'string' && w.summary.trim())
+    return `${w.summary.trim().slice(0, 48)}${Number.isFinite(w.until) ? `, trying at ${waitDeadline(w.until)}` : ''}`;
   if (w?.kind === 'retry') return Number.isFinite(w.until) ? `Retrying at ${waitDeadline(w.until)}` : 'Retrying';
   // A job is shown by the name its agent gave it. The deadline is when the
   // agent resumes even if the job never finishes.
