@@ -550,6 +550,106 @@ it('never lets an orphaned prewarm stop the agent launched after it was requeste
   } finally { agent.kill('SIGKILL'); }
 });
 
+// A pid names a process only within one boot. A parked VM world (Hetzner)
+// boots again on every wake and hands out the same pids, so a pidfile the
+// last boot wrote can name the new launcher itself (pramana#90, exit 143) or
+// an unrelated process. Only the very process the launcher recorded is stopped.
+const OTHER_BOOT = '00000000-0000-4000-8000-000000000000';
+const startTick = (pid: number) => fs.readFileSync(`/proc/${pid}/stat`, 'utf8').replace(/^.*\) /s, '').split(' ')[19]!;
+const exited = (child: ReturnType<typeof spawn>, ms: number) => new Promise<boolean>((resolve) => {
+  if (child.exitCode !== null || child.signalCode !== null) return resolve(true);
+  const timer = setTimeout(() => resolve(false), ms);
+  child.once('exit', () => { clearTimeout(timer); resolve(true); });
+});
+
+function claudeLauncher() {
+  const root = temp('karmax-sandbox-');
+  const home = path.join(root, '.karmax-injection/agent/claude/0123456789abcdef0123');
+  fs.mkdirSync(home, { recursive: true });
+  const scripts: string[] = [];
+  const world = { handle: { root }, writeFile: async (_file: string, script: string) => { scripts.push(script); },
+    openPty: () => new Promise(() => {}) } as unknown as World;
+  const stubs = temp('karmax-stubs-');
+  fs.writeFileSync(path.join(stubs, 'stty'), '#!/bin/bash\nexit 0\n', { mode: 0o755 });
+  // `exec sh -c <select CLI; exec agent>` becomes a long-running stand-in agent.
+  fs.writeFileSync(path.join(stubs, 'sh'), '#!/bin/bash\n[ "$1" = -c ] && exec -a claude-agent sleep 30\nexit 0\n', { mode: 0o755 });
+  const children: ReturnType<typeof spawn>[] = [];
+  /** Run a fresh launcher as the PTY would, `prefix` first in the same process. */
+  const launch = async (prefix = '') => {
+    spawnRemoteAgentProcess({ world, provider: 'claude', command: 'claude', args: [], cwd: root, env: { CLAUDE_CONFIG_DIR: home } });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const launcher = path.join(home, `launch-${children.length}.sh`);
+    fs.writeFileSync(launcher, scripts.at(-1)!);
+    // detached: like a PTY session, the launcher leads its own process group.
+    const child = spawn('/bin/bash', ['-c', `${prefix}exec /bin/sh "$0"`, launcher],
+      { env: { PATH: `${stubs}:${process.env.PATH}` }, detached: true, stdio: 'ignore' });
+    children.push(child);
+    return child;
+  };
+  const pidfile = path.join(home, 'karmax-agent.pid');
+  const recorded = async () => {
+    for (let i = 0; i < 100 && !fs.existsSync(pidfile); i++) await new Promise((resolve) => setTimeout(resolve, 20));
+    return fs.readFileSync(pidfile, 'utf8');
+  };
+  const cleanup = () => { for (const child of children) { try { process.kill(-child.pid!, 'SIGKILL'); } catch { /* gone */ } } };
+  return { home, pidfile, launch, recorded, cleanup };
+}
+
+it.each([
+  ['the release before boot identities', '1792351412000'],
+  ['another boot', `1792351412000 ${OTHER_BOOT}:42`],
+])('never stops the launcher itself when a pidfile from %s names its pid', async (_, rest) => {
+  const fixture = claudeLauncher();
+  try {
+    // What the last boot's launcher wrote, naming the pid this boot gave the new one.
+    const launcher = await fixture.launch(`printf '%s %s\\n' "$$" '${rest}' > ${JSON.stringify(fixture.pidfile)}; `);
+    expect(await exited(launcher, 1500)).toBe(false);
+    expect((await fixture.recorded()).split(' ')[0]).toBe(String(launcher.pid));
+  } finally { fixture.cleanup(); }
+});
+
+it.each([
+  ['the release before boot identities', () => ''],
+  ['another boot', (pid: number) => ` ${OTHER_BOOT}:${startTick(pid)}`],
+])('leaves a process alone that reuses the pid a pidfile from %s names', async (_, identity) => {
+  const fixture = claudeLauncher();
+  const stranger = spawn('/bin/bash', ['-c', 'exec -a claude-unrelated sleep 30'], { detached: true, stdio: 'ignore' });
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    fs.writeFileSync(fixture.pidfile, `${stranger.pid} 1792351412000${identity(stranger.pid!)}\n`);
+    const launcher = await fixture.launch();
+    expect(await exited(launcher, 1500)).toBe(false);
+    expect(await exited(stranger, 0)).toBe(false);
+  } finally { stranger.kill('SIGKILL'); fixture.cleanup(); }
+});
+
+it('stops the agent the previous launcher started, identified by its boot and start time', async () => {
+  const fixture = claudeLauncher();
+  try {
+    const previous = await fixture.launch();
+    expect(await fixture.recorded()).toMatch(new RegExp(`^${previous.pid} \\d+ [0-9a-f-]*:\\d+\\n$`));
+    const next = await fixture.launch();
+    expect(await exited(previous, 5000)).toBe(true);
+    expect(await exited(next, 500)).toBe(false);
+  } finally { fixture.cleanup(); }
+});
+
+it('never lets a Codex bootstrap stop a process that reuses a pid from another boot', async () => {
+  const root = temp('karmax-sandbox-'), localHome = temp('karmax-codex-home-');
+  stageRemoteRuntime(root);
+  const stranger = spawn('/bin/bash', ['-c', 'exec -a codex-unrelated sleep 30'], { detached: true, stdio: 'ignore' });
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const pidfile = path.join(root, remoteAgentHomeRelative('codex', localHome), 'karmax-agent.pid');
+    for (const identity of ['', ` ${OTHER_BOOT}:${startTick(stranger.pid!)}`]) {
+      write(pidfile, `${stranger.pid} 1${identity}\n`);
+      await seedRemoteAgentHome(directorySandbox(root, newMeter()), 'codex', localHome);
+      expect(await exited(stranger, 0)).toBe(false);
+      expect(fs.existsSync(pidfile)).toBe(false);
+    }
+  } finally { stranger.kill('SIGKILL'); }
+});
+
 it('bounds the runtime lock wait with a timeout BusyBox flock accepts, and says when it is busy', async () => {
   const root = temp('karmax-sandbox-'), localHome = temp('karmax-codex-home-');
   stageRemoteRuntime(root);
