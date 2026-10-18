@@ -71,6 +71,7 @@ eval(extractFn('listRoute'));
 eval(extractFn('homeRoute'));
 eval(extractFn('isTaskListTab'));
 eval(extractFn('isCrossProjectList'));
+eval(extractFn('savedViews'));
 eval(extractFn('inboxRoute'));
 eval(extractFn('globalRoute'));
 eval(extractFn('encodeQuery'));
@@ -150,6 +151,8 @@ function ok(condition, message) {
 // viewIdForQuery is exercised above; this pins that viewsBar() actually consumes
 // it, which is what makes deleting the separate S.activeView state safe.
 global.esc = (s) => String(s ?? ''); // escaping is not what this test is about
+eval(extractFn('listViewChips'));
+eval(extractFn('canSaveViews'));
 eval(extractFn('viewsBar'));
 eval(extractFn('viewQuery'));
 eval(extractFn('listQueryRoute'));

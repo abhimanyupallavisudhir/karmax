@@ -1289,7 +1289,10 @@ export interface TaskQuery {
 /** A named, saved query — the user's custom "view" of a project's tasks. */
 export interface SavedView {
   id: string;
+  /** The project whose task list shows it; '' for an organization's view. */
   projectId: string;
+  /** Set on a view of the organization home (every project's list) instead of one project's. */
+  organizationId?: string;
   name: string;
   query: TaskQuery;
   /** Optional icon/emoji shown in the views sidebar. */
