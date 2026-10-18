@@ -252,10 +252,50 @@ describe('software-dev 1.27: one conversation, several agents (real Temporal + g
       text: 'A. Give me exact steps.\n@incomplete' });
     await expect.poll(async () => (await view(handle)).messages.at(-1), { timeout: 20_000 })
       .toMatchObject({ role: 'agent', to: ['user:bea'] });
-    await expect.poll(async () => (await h.store.eventsOfType(taskId, ['task.mentioned'])).map((e: any) => e.payload.recipients), { timeout: 10_000 })
-      .toEqual([['user:bea']]);
+    // It waits for an answer, so Bea is asked, not just told.
+    await expect.poll(async () => (await h.store.eventsOfType(taskId, ['task.mentioned'])).map((e: any) => e.payload), { timeout: 10_000 })
+      .toEqual([expect.not.objectContaining({ ask: false })]);
+    expect((await h.store.eventsOfType(taskId, ['task.mentioned']))[0]?.payload.recipients).toEqual(['user:bea']);
     // Still the parent's to manage: the sub-task waits on it, as before.
     await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 10_000 }).toBe('parent');
+    await handle.signal('cancel');
+    await handle.result();
+  });
+
+  /** pramana#91: a sub-task answered its owner, then paused on its own job;
+   * the reply was an ask, so the task stayed in their For me after they read it. */
+  it("a sub-task's reply to a person is news, not an ask, when it then pauses", async () => {
+    const repo = await h.makeRepo('subtask-pause-reply');
+    const taskId = newId('task');
+    const handle = await start(taskId, { ...input({ taskId, repo, title: 'SubPauseReply', prompt: 'Set it up.\n@incomplete' }),
+      parentTaskId: newId('task'), waitMinuteMs: 60_000 });
+    await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 20_000 }).toBe('parent');
+    await handle.signal('followUp', { id: 'u-bea', role: 'user', author: 'user:bea', authorLabel: 'Bea', ts: Date.now(),
+      text: 'Was it uploaded?\n@pause 30' });
+    await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 20_000 }).toBe('timer');
+    expect((await view(handle)).messages.at(-1)).toMatchObject({ role: 'agent', to: ['user:bea'] });
+    expect((await h.store.eventsOfType(taskId, ['task.mentioned'])).map((e: any) => e.payload))
+      .toEqual([expect.objectContaining({ recipients: ['user:bea'], ask: false })]);
+    await handle.signal('cancel');
+    await handle.result();
+  });
+
+  it("a sub-task's reply to a person who interrupted its pause is news, and the pause goes on", async () => {
+    const repo = await h.makeRepo('subtask-interrupt-reply');
+    const taskId = newId('task');
+    // The current version: a pause goes on after the turn that answers a message.
+    const handle = await h.client.workflow.start('softwareDev@1.30.0', { taskQueue: TASK_QUEUE, workflowId: taskId,
+      args: [{ ...input({ taskId, repo, title: 'SubInterruptReply', prompt: 'Build.\n@pause 30' }),
+        parentTaskId: newId('task'), waitMinuteMs: 60_000 }] });
+    await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 20_000 }).toBe('timer');
+    const until = (await view(handle)).waitingFor.until;
+    await handle.signal('followUp', { id: 'u-bea', role: 'user', author: 'user:bea', authorLabel: 'Bea', ts: Date.now(),
+      text: 'How is it going?\n@incomplete' });
+    await expect.poll(async () => (await view(handle)).messages.at(-1), { timeout: 20_000 })
+      .toMatchObject({ role: 'agent', to: ['user:bea'] });
+    await expect.poll(async () => (await view(handle)).waitingFor, { timeout: 10_000 }).toMatchObject({ kind: 'timer', until });
+    expect((await h.store.eventsOfType(taskId, ['task.mentioned'])).map((e: any) => e.payload))
+      .toEqual([expect.objectContaining({ recipients: ['user:bea'], ask: false })]);
     await handle.signal('cancel');
     await handle.result();
   });
