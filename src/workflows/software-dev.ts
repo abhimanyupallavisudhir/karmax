@@ -319,6 +319,10 @@ const MAX_MERGE_ATTEMPTS = 3;
 /** Rounds the agent gets to combine resource files that conflict at
  * publication (pramana#56), before a person is asked. */
 const MAX_RESOURCE_MERGE_ROUNDS = 3;
+/** However many sub-tasks' deliveries conflict in turn, at most this many rounds. */
+const MAX_RESOURCE_MERGE_ROUNDS_TOTAL = 10;
+/** pramana#59: one conflicting delivery at a time, each with its own rounds. */
+const MERGE_ROUNDS_PER_CONFLICT = 'resource-merge-rounds-per-conflict-v1';
 /** Times in a row a conflict found before Review sends the task back to the
  * agent; then Review goes ahead and publication merges again. */
 const MAX_INTEGRATION_BOUNCES = 2;
@@ -1592,6 +1596,10 @@ async function softwareDevImpl(
   async function applyReviewedResources(stageFirst = true, followUpReturnsToDo = false): Promise<'applied' | 'cancelled' | 'do'> {
     if (stageFirst && await stageResources() && cancelled) return 'cancelled';
     let mergeRounds = 0;
+    // MERGE_ROUNDS_PER_CONFLICT: rounds count per unchanged conflict, so each
+    // sub-task's delivery that conflicts in turn gets its own; bounded overall.
+    let lastGuide: string | undefined;
+    let totalMergeRounds = 0;
     for (;;) {
       applyingResources = true;
       status = 'active';
@@ -1610,8 +1618,13 @@ async function softwareDevImpl(
         resourceConflict = failureType(err) === 'resource-conflict';
         guide = resourceConflict ? conflictGuide(err) : undefined;
       } finally { applyingResources = false; keepOwnRequested = false; }
-      if (guide && world && mergeRounds < MAX_RESOURCE_MERGE_ROUNDS && patched('resource-conflict-agent-v1')) {
-        mergeRounds++;
+      const perConflict = !!guide && !!world && patched(MERGE_ROUNDS_PER_CONFLICT);
+      const roundsLeft = perConflict
+        ? (guide === lastGuide ? mergeRounds : 0) < MAX_RESOURCE_MERGE_ROUNDS && totalMergeRounds < MAX_RESOURCE_MERGE_ROUNDS_TOTAL
+        : mergeRounds < MAX_RESOURCE_MERGE_ROUNDS;
+      if (guide && world && roundsLeft && patched('resource-conflict-agent-v1')) {
+        if (perConflict) { mergeRounds = guide === lastGuide ? mergeRounds + 1 : 1; lastGuide = guide; totalMergeRounds++; }
+        else mergeRounds++;
         resourceConflict = false;
         msgs.push({ id: `resource-merge-${msgs.length}`, role: 'user', ts: Date.now(),
           text: `This task is confirmed, but publishing its resources needs you first.\n${guide}\nDo only that, then end your turn: publishing resumes after it.` });
