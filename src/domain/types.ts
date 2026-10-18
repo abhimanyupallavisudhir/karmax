@@ -1846,6 +1846,10 @@ export interface TaskView {
   /** The task computer's last measured usage, and the largest disk its provider
    * account allows (`maxDiskGb`); added by the API from the world's readings. */
   usage?: { at: number; provider?: string; disk?: { usedMb: number; totalMb: number }; memory?: { usedMb: number; totalMb: number }; maxDiskGb?: number };
+  /** The machine or disk the task holds at its cloud provider while it does
+   * not work (parked, or left running), which Free computer releases
+   * (POST /api/tasks/:id/release-computer); added by the API. */
+  heldComputer?: { provider: string; state: 'ready' | 'parked' | 'degraded' };
   updatedAt: number;
 }
 

@@ -305,3 +305,70 @@ it.each(['stuck', 'not a VM', 'leased', 'accessed'])('records a ready VM world i
   // Parked, it hibernates like any parked world (this project after 0 ms).
   expect(await f.store.worldState(f.handle.id)).toBe(healed ? 'hibernated' : 'ready');
 });
+
+// Finished and cancelled tasks kept their servers and disks: a cancelled
+// task's parked world for 7 days (hibernateAfterDays), and a world still
+// running when its task was marked Done by hand for good, since the sweep only
+// freed parked worlds. On Hetzner both count against the project's limits.
+async function endedFixture(status: 'done' | 'cancelled' | 'failed' | 'waiting', state: 'parked' | 'ready', manual = false) {
+  const store = await Store.create(':memory:'); stores.push(store);
+  const project = await store.createProject('Ended', { hibernateAfterMs: 7 * 24 * 60 * 60 * 1000 });
+  const task = await store.createTask({ projectId: project.id, title: 'Ended task', workflow: 'software-dev',
+    workflowVersion: '1.0.0', params: { prompt: 'fixture' } });
+  await store.saveView(task.id, { taskId: task.id, title: 'Ended task', workflow: 'software-dev', stage: status === 'waiting' ? 'do' : status,
+    status, messages: [], actions: [], ...(manual ? { state: { manuallyDoneFrom: 'do' } } : {}) } as any);
+  const handle = await store.registerWorld({ kind: 'memory', id: task.id, root: '/fixture', branch: 'main', base: 'main' }, project.id) as WorldHandle;
+  await store.setWorldState(handle, state);
+  const worlds = new WorldRegistry();
+  const destroy = vi.fn(async () => {});
+  worlds.register({ kind: 'memory', open: vi.fn(async () => ({ handle, destroy })), probe: vi.fn(async () => undefined) } as any);
+  const checkpointWorld = vi.fn(async () => ({ id: 'checkpoint-1', worldId: handle.id, generation: 1, projectId: project.id,
+    runnerPoolId: 'local', environmentDigest: 'test', repos: [], createdAt: Date.now() }));
+  const lifecycle = new WorldLifecycleManager(store, worlds, { checkpoint: checkpointWorld } as any);
+  return { store, task, handle, destroy, checkpointWorld, lifecycle };
+}
+
+it.each([['cancelled', 'parked', false], ['failed', 'parked', false], ['done', 'ready', true], ['cancelled', 'ready', false]] as const)(
+  'frees the world of a %s task (%s) half an hour after it was last used, keeping a checkpoint', async (status, state, manual) => {
+    const f = await endedFixture(status, state, manual);
+    expect(await f.lifecycle.sweep(Date.now() + 20 * 60_000)).toBe(0);
+    expect(await f.lifecycle.sweep(Date.now() + 31 * 60_000)).toBe(1);
+    expect(f.checkpointWorld).toHaveBeenCalledOnce();
+    expect(f.destroy).toHaveBeenCalledOnce();
+    expect(await f.store.worldState(f.task.id)).toBe('hibernated');
+    expect((await f.store.eventsOfType(f.task.id, 'world.hibernated'))[0]?.payload).toMatchObject({ reason: 'task-ended' });
+  });
+
+it('deletes the leftover world of a task that finished normally without checkpointing it', async () => {
+  const f = await endedFixture('done', 'ready');
+  expect(await f.lifecycle.sweep(Date.now() + 31 * 60_000)).toBe(1);
+  expect(f.checkpointWorld).not.toHaveBeenCalled();
+  expect(f.destroy).toHaveBeenCalledOnce();
+  expect(await f.store.worldState(f.task.id)).toBe('released');
+});
+
+it('keeps the parked world of a task that is only waiting for its usual idle period', async () => {
+  const f = await endedFixture('waiting', 'parked');
+  expect(await f.lifecycle.sweep(Date.now() + 2 * 60 * 60_000)).toBe(0);
+  expect(await f.store.worldState(f.task.id)).toBe('parked');
+});
+
+it('frees a task\'s computer on request, unless the task is working', async () => {
+  const waiting = await endedFixture('waiting', 'parked');
+  expect(await waiting.lifecycle.release(waiting.task.id)).toEqual({ state: 'hibernated' });
+  expect(waiting.destroy).toHaveBeenCalledOnce();
+  expect((await waiting.store.eventsOfType(waiting.task.id, 'world.hibernated'))[0]?.payload).toMatchObject({ reason: 'released' });
+  await expect(waiting.lifecycle.release(waiting.task.id)).rejects.toThrow(/holds no computer/);
+
+  const done = await endedFixture('done', 'ready');
+  expect(await done.lifecycle.release(done.task.id)).toEqual({ state: 'released' });
+
+  const active = await endedFixture('waiting', 'ready');
+  await active.store.saveView(active.task.id, { taskId: active.task.id, title: 't', workflow: 'software-dev', stage: 'do',
+    status: 'active', messages: [], actions: [] } as any);
+  await expect(active.lifecycle.release(active.task.id)).rejects.toThrow(/working/);
+  const held = await endedFixture('waiting', 'parked');
+  const release = await (held.lifecycle as any).worlds.holdAccess(held.task.id);
+  try { await expect(held.lifecycle.release(held.task.id)).rejects.toThrow(/something is using this computer/); }
+  finally { release(); }
+});

@@ -319,15 +319,22 @@ export class WorldLifecycleManager {
     await this.step('provider upkeep', () => this.housekeepProviders());
     let hibernated = 0;
     const parked = await this.store.listWorldInstances('parked');
-    const parkedIds = new Set(parked.map(candidate => candidate.handle.id));
-    for (const id of this.hibernateFailures.keys()) if (!parkedIds.has(id)) this.hibernateFailures.delete(id);
-    for (const candidate of parked) {
+    // A world still ready under a task that ended — marked Done by hand, or a
+    // teardown that never happened (the open item of wiki features/computers)
+    // — is a machine nothing will use: it is freed like a parked one.
+    const abandoned = [];
+    for (const candidate of await this.store.listWorldInstances('ready', now - ENDED_TASK_GRACE_MS))
+      if (await taskEnded(this.store, candidate.handle.id)) abandoned.push(candidate);
+    const candidateIds = new Set([...parked, ...abandoned].map(candidate => candidate.handle.id));
+    for (const id of this.hibernateFailures.keys()) if (!candidateIds.has(id)) this.hibernateFailures.delete(id);
+    /** The failure schedule of one candidate snapshot: undefined while it waits out its backoff. */
+    const attempt = (candidate: { handle: WorldHandleRef; updatedAt: number }) => {
       const failed = this.hibernateFailures.get(candidate.handle.id);
       const sameSnapshot = failed?.generation === (candidate.handle.generation ?? 1)
         && failed.updatedAt === Number(candidate.updatedAt);
-      if (failed && sameSnapshot && now < failed.retryAt) continue;
+      if (failed && sameSnapshot && now < failed.retryAt) return undefined;
       const attempts = sameSnapshot ? failed!.attempts + 1 : 1;
-      const hibernateFailed = (error: unknown) => {
+      return (error: unknown) => {
         const retryAt = now + Math.min(HIBERNATE_RETRY_MS * 2 ** (attempts - 1), HIBERNATE_RETRY_MAX_MS);
         this.hibernateFailures.set(candidate.handle.id, { generation: candidate.handle.generation ?? 1,
           updatedAt: Number(candidate.updatedAt), attempts, retryAt });
@@ -335,11 +342,26 @@ export class WorldLifecycleManager {
           error: error instanceof Error ? error.message : String(error), attempts, retryAt,
         });
       };
+    };
+    for (const candidate of abandoned) {
+      const hibernateFailed = attempt(candidate);
+      if (!hibernateFailed) continue;
+      await this.step(`release ${candidate.handle.id}`, async () => {
+        if (await this.hibernate(candidate, { expect: 'ready', onFailure: hibernateFailed })) hibernated++;
+      });
+    }
+    for (const candidate of parked) {
+      const hibernateFailed = attempt(candidate);
+      if (!hibernateFailed) continue;
       try {
       const projectId = String(candidate.handle.meta?.projectId ?? '');
       const project = (await this.store.getProject(projectId));
       const config = project ? (await this.store.effectiveTaskConfig(project, candidate.handle.id)) : undefined;
-      const after = config?.hibernateAfterMs ?? 7 * 24 * 60 * 60 * 1000;
+      // A task that ended keeps nothing for long (wiki features/computers): its
+      // disk and machine count against the provider's limits, and a Retry
+      // restores the checkpoint.
+      const ended = await taskEnded(this.store, candidate.handle.id);
+      const after = Math.min(config?.hibernateAfterMs ?? 7 * 24 * 60 * 60 * 1000, ended ? ENDED_TASK_GRACE_MS : Infinity);
       // A task whose Computer now asks for another size moves to a machine of
       // that size: hibernate now, and the next wake restores the checkpoint onto
       // it (checkpoint.ts restore). Worlds made before sizes were recorded are
@@ -368,66 +390,143 @@ export class WorldLifecycleManager {
         });
         continue;
       }
-      // Selection is only a hint: a gateway or activity can resume this world
-      // while the sweep awaits another provider. Own the complete destructive
-      // transition, and recheck after every potentially slow preparation step.
-      await this.worlds.withOperation(candidate.handle.id, () => this.worlds.withoutRecovery(async () => {
-        const eligible = async (checkSelection = false) => {
-          const current = await this.store.worldStateSnapshot(candidate.handle.id);
-          return !!current && current.generation === (candidate.handle.generation ?? 1)
-            && current.state === 'parked'
-            && (!checkSelection || current.updatedAt === Number(candidate.updatedAt))
-            && await this.store.activeWorldLeaseCount(candidate.handle.id) === 0
-            && !(await this.worlds.hasActiveAccess(candidate.handle.id))
-            && (await this.store.taskMetadata(candidate.handle.id))?.lastView?.status !== 'active'
-            // Hibernating keeps only the checkpoint, never ignored output: a world
-            // holding proposed output that is not saved yet stays as it is.
-            && !(await holdsUnsavedOutput(this.store, candidate.handle.id));
-        };
-        if (!(await eligible(true))) return;
-        let checkpoint = await this.store.latestWorldCheckpoint(candidate.handle.id);
-        // A failed park checkpoint leaves newer work only in the sandbox: capture it
-        // first. If that fails too the sandbox stays, under the sweep's backoff
-        // (WD-2), rather than being destroyed against the older one (audit R-6).
-        if (!checkpoint || checkpoint.generation !== (candidate.handle.generation ?? 1)
-          || await checkpointStale(this.store, candidate.handle))
-          checkpoint = await this.checkpoints.checkpoint(candidate.handle);
-        if (!checkpoint || checkpoint.generation !== (candidate.handle.generation ?? 1) || !(await eligible())) return;
-        try {
-          const provider = this.worlds.get(candidate.handle.kind);
-          if (provider.destroy) await provider.destroy(candidate.handle as any);
-          else {
-            const world = await this.worlds.open(candidate.handle as any);
-            if (!(await eligible())) return;
-            await world.destroy();
-          }
-        } catch (error) {
-          // A timeout/5xx is not proof of eviction. Preserve the recoverable
-          // state and let the next sweep retry unless the provider proves loss.
-          const state = await this.worlds.probe(candidate.handle as any).catch(() => undefined);
-          if (state !== 'missing' || !(await eligible())) {
-            await hibernateFailed(error);
-            return;
-          }
-          await this.store.setWorldState(candidate.handle, 'hibernated');
-          await this.recordLifecycle(candidate.handle, 'world.hibernated', { checkpointId: checkpoint.id, providerEvicted: true,
-            ...(resize ? { resize } : {}), ...(move ? { move } : {}) });
-          if (resize && !move) await this.checkpoints.addNotice?.(candidate.handle.id, resizeNotice(resize.to));
-          hibernated++;
-          return;
-        }
-        await this.store.setWorldState(candidate.handle, 'hibernated');
-        await this.recordLifecycle(candidate.handle, 'world.hibernated', { checkpointId: checkpoint.id,
-          ...(resize ? { resize } : {}), ...(move ? { move } : {}) });
-        // A move is told when it lands (or fails), by the restore.
-        if (resize && !move) await this.checkpoints.addNotice?.(candidate.handle.id, resizeNotice(resize.to));
-        hibernated++;
-      }));
+      if (await this.hibernate(candidate, { resize, move, onFailure: hibernateFailed })) hibernated++;
       } catch (error) {
         await hibernateFailed(error);
       }
     }
     return hibernated;
+  }
+
+  /**
+   * Free a task's computer now (POST /api/tasks/:id/release-computer): its
+   * world is checkpointed and its machine and disk deleted, so it holds
+   * nothing at its provider until it next runs, which restores the checkpoint
+   * (Git-ignored files and processes do not come back). A task that finished
+   * normally needs no checkpoint: its world is just deleted. Refused while
+   * the task works or something uses its world.
+   */
+  async release(taskId: string): Promise<{ state: 'hibernated' | 'released' }> {
+    const task = await this.store.taskMetadata(taskId);
+    if (!task) throw new Error(`no task ${taskId}`);
+    if (task.lastView?.status === 'active') throw new Error('the task is working; stop it or wait until it pauses');
+    const handle = await this.store.currentWorld(taskId);
+    const snapshot = await this.store.worldStateSnapshot(taskId);
+    if (!handle || !snapshot || !['ready', 'parked', 'degraded'].includes(snapshot.state))
+      throw new Error('this task holds no computer');
+    const lost = async () => {
+      // Already lost at its provider; whatever is left is deleted.
+      await this.worlds.get(handle.kind as any).destroy?.(handle as any).catch(() => undefined);
+      await this.store.setWorldState(handle, 'released');
+      await this.recordLifecycle(handle, 'world.destroyed', { reason: 'released' });
+      return { state: 'released' as const };
+    };
+    if (snapshot.state === 'degraded') return lost();
+    let failure: unknown;
+    const freed = await this.hibernate({ handle, updatedAt: snapshot.updatedAt },
+      { expect: snapshot.state as 'ready' | 'parked', released: true, onFailure: async (error) => { failure = error; } });
+    if (!freed && (await this.store.worldState(taskId)) === 'degraded') return lost();
+    if (!freed) throw new Error(failure instanceof Error ? `could not free it: ${failure.message}`
+      : 'something is using this computer (a terminal, a preview or a job); try again when it is idle');
+    return { state: (await this.store.worldState(taskId)) === 'released' ? 'released' : 'hibernated' };
+  }
+
+  /** Checkpoint a parked (or idle ready) world and delete it at its provider;
+   * a world whose task finished normally is deleted without a checkpoint.
+   * True when it was freed. Selection is only a hint: a gateway or activity
+   * can resume this world while the sweep awaits another provider, so the
+   * whole destructive transition is owned, and rechecked after every
+   * potentially slow preparation step. */
+  private async hibernate(candidate: { handle: WorldHandleRef; updatedAt: number }, options: {
+    expect?: 'ready' | 'parked'; resize?: { from: MachineShape; to: MachineShape }; move?: { from: string; to: string };
+    released?: boolean; onFailure?: (error: unknown) => Promise<unknown>;
+  } = {}): Promise<boolean> {
+    const { resize, move } = options;
+    const expected = options.expect ?? 'parked';
+    return this.worlds.withOperation(candidate.handle.id, () => this.worlds.withoutRecovery(async () => {
+      const eligible = async (checkSelection = false) => {
+        const current = await this.store.worldStateSnapshot(candidate.handle.id);
+        return !!current && current.generation === (candidate.handle.generation ?? 1)
+          && current.state === expected
+          && (!checkSelection || current.updatedAt === Number(candidate.updatedAt))
+          && await this.store.activeWorldLeaseCount(candidate.handle.id) === 0
+          && !(await this.worlds.hasActiveAccess(candidate.handle.id))
+          && (await this.store.taskMetadata(candidate.handle.id))?.lastView?.status !== 'active'
+          // Hibernating keeps only the checkpoint, never ignored output: a world
+          // holding proposed output that is not saved yet stays as it is.
+          && !(await holdsUnsavedOutput(this.store, candidate.handle.id));
+      };
+      if (!(await eligible(true))) return false;
+      const reason = options.released ? { reason: 'released' } : (await taskEnded(this.store, candidate.handle.id)) ? { reason: 'task-ended' } : {};
+      // Its work landed: nothing in the world is needed again.
+      if (!resize && !move && await finishedNormally(this.store, candidate.handle.id)) {
+        try { if (!(await this.destroyAtProvider(candidate.handle, eligible))) return false; }
+        catch (error) {
+          if (await this.worlds.probe(candidate.handle as any).catch(() => undefined) !== 'missing' || !(await eligible())) {
+            await options.onFailure?.(error);
+            return false;
+          }
+        }
+        if (!(await eligible())) return false;
+        await this.store.setWorldState(candidate.handle, 'released');
+        await this.recordLifecycle(candidate.handle, 'world.destroyed', reason);
+        return true;
+      }
+      try {
+        let checkpoint = await this.store.latestWorldCheckpoint(candidate.handle.id);
+        // A failed park checkpoint leaves newer work only in the sandbox, and a
+        // ready world may have changed since: capture it first. If that fails
+        // too the sandbox stays, under the sweep's backoff (WD-2), rather than
+        // being destroyed against the older one (audit R-6).
+        if (!checkpoint || checkpoint.generation !== (candidate.handle.generation ?? 1) || expected === 'ready'
+          || await checkpointStale(this.store, candidate.handle))
+          checkpoint = await this.checkpoints.checkpoint(candidate.handle);
+        if (!checkpoint || checkpoint.generation !== (candidate.handle.generation ?? 1) || !(await eligible())) return false;
+        let providerEvicted = false;
+        try { if (!(await this.destroyAtProvider(candidate.handle, eligible))) return false; }
+        catch (error) {
+          // A timeout/5xx is not proof of eviction. Preserve the recoverable
+          // state and let the next sweep retry unless the provider proves loss.
+          const state = await this.worlds.probe(candidate.handle as any).catch(() => undefined);
+          if (state !== 'missing' || !(await eligible())) {
+            await options.onFailure?.(error);
+            return false;
+          }
+          providerEvicted = true;
+        }
+        await this.store.setWorldState(candidate.handle, 'hibernated');
+        await this.recordLifecycle(candidate.handle, 'world.hibernated', { checkpointId: checkpoint.id,
+          ...(providerEvicted ? { providerEvicted: true } : {}), ...reason,
+          ...(resize ? { resize } : {}), ...(move ? { move } : {}) });
+        // A move is told when it lands (or fails), by the restore.
+        if (resize && !move) await this.checkpoints.addNotice?.(candidate.handle.id, resizeNotice(resize.to));
+        return true;
+      } catch (error) {
+        // A sandbox its provider already deleted cannot be checkpointed, ever:
+        // it is lost, not failing (degraded worlds of ended tasks are released).
+        if (await this.worlds.probe(candidate.handle as any).catch(() => undefined) === 'missing' && await eligible()) {
+          await this.store.setWorldState(candidate.handle, 'degraded');
+          await this.recordLifecycle(candidate.handle, 'world.providerLost', {});
+          return false;
+        }
+        await options.onFailure?.(error);
+        return false;
+      }
+    }));
+  }
+
+  /** Delete a world at its provider, through the world itself when the
+   * provider has no direct delete. */
+  private async destroyAtProvider(handle: WorldHandleRef, eligible: () => Promise<boolean>): Promise<boolean> {
+    const provider = this.worlds.get(handle.kind as any);
+    if (provider.destroy) await provider.destroy(handle as any);
+    else {
+      // Opening may restore another generation: then nothing is destroyed.
+      const world = await this.worlds.open(handle as any);
+      if (!(await eligible())) return false;
+      await world.destroy();
+    }
+    return true;
   }
 
   private async reconcileProviderUsage(now: number): Promise<void> {
@@ -617,6 +716,10 @@ function inPlaceResizeNotice(shape: MachineShape): string {
 }
 
 const HIBERNATE_RETRY_MS = 5 * 60_000;
+/** How long the world of a task that ended (done, cancelled, failed) is kept
+ * before its machine and disk are freed: long enough for an accidental cancel
+ * to be retried without a restore. */
+const ENDED_TASK_GRACE_MS = 30 * 60_000;
 const HIBERNATE_RETRY_MAX_MS = 6 * 60 * 60_000;
 
 /** How long a ready world may go untouched before its provider is probed.
@@ -643,6 +746,12 @@ function monthWindow(now: number): { from: number; to: number } {
 }
 
 /** Proposed output of this world's task that has no snapshot yet. */
+/** A task that finished normally (not marked Done by hand): its work landed. */
+async function finishedNormally(store: Store, taskId: string): Promise<boolean> {
+  const view = (await store.taskMetadata(taskId))?.lastView;
+  return view?.status === 'done' && !view.state?.manuallyDoneFrom;
+}
+
 async function holdsUnsavedOutput(store: Store, taskId: string): Promise<boolean> {
   for (const candidate of await store.listResourceCandidates(taskId, false)) {
     if (candidate.state !== 'pending' || candidate.sourceKind !== 'path') continue;

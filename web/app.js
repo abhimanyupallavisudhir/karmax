@@ -1701,6 +1701,17 @@ function diskMeter(v) {
   const ratio = disk.usedMb / disk.totalMb;
   return `<button type="button" class="disk-meter${ratio >= 0.9 ? ' warn' : ''}" title="${esc(tip)}" aria-label="${esc(tip)}" style="--used:${Math.min(100, Math.round(ratio * 100))}%">Disk ${Math.round(disk.usedMb / 1024)}/${Math.round(disk.totalMb / 1024)} GB</button>`;
 }
+// Free computer: a task that is not working gives back the machine and disk
+// it holds at its provider, which count against that account's limits.
+function freeComputerButton(v) {
+  const held = v?.heldComputer;
+  if (!held) return '';
+  const label = COMPUTER_PROVIDER_LABELS[held.provider] || held.provider;
+  const tip = v.status === 'done' && !v.state?.manuallyDoneFrom
+    ? `Delete this task's computer at ${label} now.`
+    : `Delete this task's computer at ${label} now. Its files are saved and come back if it runs again; installed packages and running programs do not.`;
+  return `<button type="button" class="chip free-computer" id="free-computer" title="${esc(tip)}" aria-label="${esc(tip)}">Free computer</button>`;
+}
 // Bigger disk: the Out of disk fix, up to the account's ceiling.
 function biggerDiskButton(v) {
   if (!v?.outOfDisk) return '';
@@ -11085,6 +11096,7 @@ function taskRail(v, rec = taskRecord(v.taskId)) {
     v.landing?.provider && v.landing.provider !== 'none'
       ? `<span title="${esc(v.landing.detail || 'Provider landing state')}">landing: ${esc(v.landing.provider)}</span>` : '',
     diskMeter(v),
+    freeComputerButton(v),
   ].filter(Boolean).join('');
   const attempts = S.attemptGroup?.attempts?.length || 0;
   return `<div class="rail-inner">
@@ -11148,6 +11160,19 @@ function wireTaskRail(v) {
     if (!page.classList.contains('rail-closed') && taskRailNarrow()) setRail(false);
   });
   $('#approval-history-open')?.addEventListener('click', () => openApprovalHistory(v));
+  $('#free-computer')?.addEventListener('click', async (event) => {
+    const btn = event.currentTarget;
+    if (btn.disabled) return;
+    btn.disabled = true;
+    try {
+      await api(`/api/tasks/${v.taskId}/release-computer`, { method: 'POST', body: JSON.stringify({}) });
+      toast('Computer freed');
+      setTimeout(refreshTask, 250);
+    } catch (e) {
+      toast(e.message, true);
+      btn.disabled = false;
+    }
+  });
   wireTaskOrg(v);
   wireNotes(v);
   wireCheckoutApprovals(v);
@@ -21593,17 +21618,36 @@ function computerLimitsSummary(provider, limits) {
     + (guessed ? ` Some are ${name}'s documented defaults; set them under ✎ → Advanced if its support raised them.` : '');
   return `<span class="setting-muted computer-limits" title="${esc(tip)}">≤ ${esc(parts.join(' · '))}</span>`;
 }
-function computersMarkup(connections) {
+const HELD_STATE_LABELS = { ready: 'Running', parked: 'Parked', degraded: 'Lost' };
+// One task's machine at a provider: what it is, and Free when it does not work.
+function heldComputerRow(held) {
+  const project = projectById(held.projectId);
+  const href = project ? `${projectBase(project.id)}/tasks/${held.num ?? held.taskId}` : '';
+  const name = `${held.num != null ? `#${held.num} ` : ''}${held.title}`;
+  const size = held.machine ? describeMachineShape(held.machine) : '';
+  const since = `${HELD_STATE_LABELS[held.state] || held.state} since ${new Date(held.since).toLocaleString()}${held.taskStatus ? `; the task is ${held.taskStatus}` : ''}`;
+  return `<div class="computer-held-row" data-held-task="${esc(held.taskId)}">
+    ${href ? `<a data-spa href="${esc(href)}">${esc(name)}</a>` : `<span>${esc(name)}</span>`}
+    <span class="chip" title="${esc(since)}">${esc(HELD_STATE_LABELS[held.state] || held.state)}</span>
+    ${size ? `<span class="setting-muted">${esc(size)}</span>` : ''}
+    <span class="label-row-fill"></span>
+    ${held.releasable ? '<button class="btn sm computer-free" type="button" title="Delete its machine and disk now. Its files are saved and come back if it runs again; installed packages and running programs do not.">Free</button>' : ''}
+  </div>`;
+}
+function computersMarkup(connections, held = []) {
   return `<div class="computer-providers">${Object.entries(COMPUTER_PROVIDERS).map(([id, info]) => {
     const connection = connections.find((candidate) => candidate.provider === id);
     const state = computerConnectionState(connection);
+    const mine = held.filter((computer) => computer.provider === id);
     return `<div class="computer-provider" data-provider="${id}"><b>${esc(info.name)}</b>
       <span class="chip ${state.tone}"${connection?.lastError ? ` title="${esc(connection.lastError)}"` : ''}>${esc(state.label)}</span>
       ${connection?.limits ? computerLimitsSummary(id, connection.limits) : ''}
+      ${mine.length ? `<button class="chip computer-held-toggle" type="button" aria-expanded="false" title="Tasks holding a machine or disk here">${mine.length} in use</button>` : ''}
       <span class="label-row-fill"></span>
       ${connection ? `<button class="icon-btn computer-edit" type="button" title="Edit ${esc(info.name)}" aria-label="Edit ${esc(info.name)}">✎</button>
         <button class="btn sm computer-test" type="button">Test</button>`
-      : `<button class="btn sm computer-connect" type="button">Connect</button>`}</div>`;
+      : `<button class="btn sm computer-connect" type="button">Connect</button>`}</div>
+      ${mine.length ? `<div class="computer-held" data-held-provider="${id}" hidden>${mine.map(heldComputerRow).join('')}</div>` : ''}`;
   }).join('')}</div>`;
 }
 async function hydrateComputers(box, organizationId) {
@@ -21614,8 +21658,25 @@ async function hydrateComputers(box, organizationId) {
   catch (error) { if (current()) paneError(box, error, () => hydrateComputers(box, organizationId)); return; }
   if (!current()) return;
   if (organizationId === S.organizationId) S.worldProviderConnections = connections;
-  box.innerHTML = computersMarkup(connections);
+  // What tasks hold there; the providers show without it.
+  const held = (await api(`/api/organizations/${encodeURIComponent(organizationId)}/computers`).catch(() => undefined))?.computers || [];
+  if (!current()) return;
+  const open = new Set([...box.querySelectorAll('.computer-held:not([hidden])')].map((list) => list.dataset.heldProvider));
+  box.innerHTML = computersMarkup(connections, held);
   const reload = () => hydrateComputers(box, organizationId);
+  box.querySelectorAll('.computer-held').forEach((list) => {
+    const toggle = box.querySelector(`.computer-provider[data-provider="${list.dataset.heldProvider}"] .computer-held-toggle`);
+    const show = (visible) => { list.hidden = !visible; toggle?.setAttribute('aria-expanded', String(visible)); };
+    show(open.has(list.dataset.heldProvider));
+    toggle?.addEventListener('click', () => show(list.hidden));
+  });
+  box.querySelectorAll('.computer-free').forEach((button) => button.addEventListener('click', async () => {
+    const taskId = button.closest('[data-held-task]').dataset.heldTask;
+    button.disabled = true;
+    try { await api(`/api/tasks/${encodeURIComponent(taskId)}/release-computer`, { method: 'POST', body: '{}' }); toast('Computer freed'); }
+    catch (error) { toast(error.message, true); }
+    await reload();
+  }));
   box.querySelectorAll('.computer-provider').forEach((row) => {
     const provider = row.dataset.provider;
     const connection = connections.find((candidate) => candidate.provider === provider);

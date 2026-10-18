@@ -72,7 +72,7 @@ import { taskAuthorityNow } from './task-authority.js';
 import type { KarmaxBus } from '../contrib/bus.js';
 import type { WorldRegistry } from '../world/registry.js';
 import type { WorldHandle } from '../world/types.js';
-import { worldRepos, worldRepoSource } from '../world/types.js';
+import { isRemoteWorldKind, worldRepos, worldRepoSource } from '../world/types.js';
 import { pullRequestHandle } from '../world/pr-view.js';
 import { brokerImportTaskBranch, brokerPublishBranch, brokerRefreshUpstream, describePublishFailures, type GitBrokerAuth } from '../world/git-broker.js';
 import { sameRepository } from '../world/repository-identity.js';
@@ -421,6 +421,8 @@ export interface KarmaxApiDeps {
   /** Durable execution-capacity leases. Production always supplies this; small
    * unit harnesses may omit it and still get direct store-level release. */
   runners?: RunnerPoolService;
+  /** The world lifecycle sweep, which frees a task's computer on request. */
+  worldLifecycle?: Pick<import('../world/runners.js').WorldLifecycleManager, 'release'>;
   resources?: ProjectResourceService;
   broker?: CredentialBroker;
   githubApp?: import('../integrations/github-app.js').GitHubAppService;
@@ -3404,6 +3406,13 @@ export class KarmaxApi {
       // allows: the usage meter and the Out of disk action (wiki features/computers).
       const usage = await this.computerUsage(taskId, view.outOfDisk).catch(() => undefined);
       if (usage) view = { ...view, usage };
+      // A cloud machine or disk held while the task does not work: Free computer.
+      if (view.status !== 'active' && rec && !rec.params?.draft) {
+        const held = await this.deps.store.worldStateSnapshot(taskId).catch(() => undefined);
+        const world = held && ['ready', 'parked', 'degraded'].includes(held.state) ? await this.deps.store.currentWorld(taskId) : undefined;
+        if (world && held && isRemoteWorldKind(world.kind))
+          view = { ...view, heldComputer: { provider: world.kind, state: held.state as 'ready' | 'parked' | 'degraded' } };
+      }
       if (await this.deps.store.kvGet(`project-transfer-history:${taskId}`)) {
         const { world, worldPath, worldAvailable, worldDesktop, worldProvider, ...history } = view;
         view = history;
@@ -6852,6 +6861,56 @@ Act according to your Avatar instructions. When ready, call platform_request POS
     return { diskGb, maxDiskGb, applied };
   }
 
+  /**
+   * Free a task's computer now (wiki features/computers): its world is
+   * checkpointed and its machine and disk deleted at the provider, so it
+   * counts against no limit and bills nothing until the task next runs (which
+   * restores the checkpoint; Git-ignored files and processes do not come
+   * back). A task that finished normally is just deleted. Not while it works.
+   */
+  async releaseComputer(token: string, taskId: string): Promise<{ state: 'hibernated' | 'released' }> {
+    const task = (await this.deps.store.getTask(taskId));
+    if (!task) throw new NotFoundError(`no task ${taskId}`);
+    (await this.require(token, 'edit_task', { projectId: task.projectId, taskId }));
+    if (!this.deps.worldLifecycle) throw new ValidationError('this installation cannot free computers');
+    try { return await this.deps.worldLifecycle.release(taskId); }
+    catch (error) { throw new ValidationError(error instanceof Error ? error.message : String(error)); }
+  }
+
+  /**
+   * What each task of an organization holds at its cloud providers — running,
+   * parked or lost machines and their disks — in the projects the caller can
+   * read: one place to see why a provider's limit is full, and what to free.
+   */
+  async listComputers(token: string, organizationId: string): Promise<{ computers: HeldComputer[] }> {
+    if (!(await this.deps.store.getOrganization(organizationId))) throw new NotFoundError(`no such organization ${organizationId}`);
+    const projects = await this.deps.store.listOrganizationProjects(organizationId);
+    const readable: Project[] = [];
+    for (const project of projects)
+      if ((await this.deps.tokens.check(token, 'task:read', { projectId: project.id, organizationId })).ok) readable.push(project);
+    if (!readable.length) {
+      (await this.require(token, 'get_task', { organizationId }));
+      return { computers: [] };
+    }
+    const names = new Map(readable.map((project) => [project.id, project.name]));
+    const editable = new Map<string, boolean>();
+    const computers: HeldComputer[] = [];
+    for (const held of await this.deps.store.heldWorlds(readable.map((project) => project.id))) {
+      if (!editable.has(held.task.projectId))
+        editable.set(held.task.projectId, (await this.deps.tokens.check(token, 'task:edit', { projectId: held.task.projectId, taskId: held.task.id })).ok);
+      const machine = held.handle.meta?.computer as MachineShape | undefined;
+      computers.push({
+        taskId: held.task.id, ...(held.task.num != null ? { num: held.task.num } : {}), title: held.task.title,
+        projectId: held.task.projectId, projectName: names.get(held.task.projectId) ?? held.task.projectId,
+        ...(held.task.status ? { taskStatus: held.task.status } : {}),
+        provider: held.handle.kind, state: held.state as HeldComputer['state'], since: held.updatedAt,
+        ...(machine ? { machine } : {}),
+        releasable: held.task.status !== 'active' && (editable.get(held.task.projectId) ?? false),
+      });
+    }
+    return { computers };
+  }
+
   /** The machine a task's Computer asks for, when its world runs on another
    * (another size, or another provider the task itself chose). */
   private async computerChange(taskId: string): Promise<ComputerChange | undefined> {
@@ -7861,4 +7920,22 @@ function parseWebhookBody(raw: Buffer, contentType: string | undefined): Record<
   } catch {
     return { body: text };
   }
+}
+
+/** A task's machine or disk at a cloud provider (GET /api/organizations/:id/computers). */
+export interface HeldComputer {
+  taskId: string;
+  num?: number;
+  title: string;
+  projectId: string;
+  projectName: string;
+  taskStatus?: string;
+  provider: string;
+  /** ready: running (or its provider paused it); parked: stopped, disk kept; degraded: lost at its provider. */
+  state: 'ready' | 'parked' | 'degraded';
+  /** When its state last changed. */
+  since: number;
+  machine?: MachineShape;
+  /** Whether the caller can free it now (POST /api/tasks/:taskId/release-computer). */
+  releasable: boolean;
 }
