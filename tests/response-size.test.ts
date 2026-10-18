@@ -43,7 +43,7 @@ it('platform_request describes a response too large to return, and returns the f
     .toEqual({ applied: ['computer'], view: { stage: 'do' } });
   const list = Array.from({ length: 2_000 }, (_, i) => ({ id: `t${i}`, title: 'x'.repeat(40), params: { prompt: 'y'.repeat(100) } }));
   expect(JSON.parse(boundedJson(list))).toMatchObject({ truncated: true, items: 2_000, itemFields: { id: expect.any(Number), params: expect.any(Number) } });
-  expect(selectFields(list, ['id']).slice(0, 2)).toEqual([{ id: 't0' }, { id: 't1' }]);
+  expect((selectFields(list, ['id']) as unknown[]).slice(0, 2)).toEqual([{ id: 't0' }, { id: 't1' }]);
   expect(JSON.parse(agentPlatformResponse({ small: true }))).toEqual({ small: true });
 });
 
