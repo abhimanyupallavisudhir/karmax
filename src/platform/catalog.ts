@@ -18,7 +18,7 @@ export const PLATFORM_API_CATALOG = {
       'POST /api/organizations/:organizationId/repositories/create',
       'GET /api/projects/:projectId/github-merge-eligibility',
       'POST /api/organizations/:organizationId/git-profiles/reuse-user',
-      'GET /api/user/export', 'GET /api/user/paid-subscriptions', 'GET|PUT /api/user/default-organization', 'GET|PUT /api/user/onboarding', 'POST /api/user/onboarding/reset',
+      'GET /api/user/export', 'GET /api/user/paid-subscriptions', 'GET|PUT /api/user/default-organization', 'GET|PATCH /api/user/preferences', 'GET|PUT /api/user/onboarding', 'POST /api/user/onboarding/reset',
       'POST /api/user/account-deletion-request', 'POST /api/invitations/accept',
       'POST|PUT|DELETE /api/projects/:projectId/avatars/:avatarId (owner delegation; may not grant beyond token authority)',
       'PUT /api/organizations/:organizationId/usage-policy (funding/concurrency changes require owner delegation)',
@@ -109,6 +109,7 @@ export const PLATFORM_API_CATALOG = {
   organizations: [
     'GET /api/organization-directory (verified user subject; names only, public or member organizations; operator sees all; does not grant resource access)',
     'GET|PUT /api/user/default-organization (the signed-in user’s startup workspace)',
+    'GET|PATCH /api/user/preferences (the signed-in user’s console preferences on every device: {dismissed: keys such as task-store:<projectId>, which hides the default view’s task store recommendations there}; PATCH {dismiss?: [key], undismiss?: [key]}, up to 50 keys per call)',
     'GET /api/user/paid-subscriptions (unscoped verified human subject; subscriptions attributed to their checkout records, with organization settings links; excludes unpaid checkouts and gifts)',
     'GET|PUT /api/user/onboarding?organizationId= (hosted-only setup progress + display: expanded|minimized|closed)',
     'POST /api/user/onboarding/reset (restart the signed-in user’s hosted walkthrough in each organization)',

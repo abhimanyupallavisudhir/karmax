@@ -6410,7 +6410,7 @@ async function loadTaskStore(projectId, { force = false } = {}) {
   return loading;
 }
 
-const STORE_NEEDS = { github: ['Needs GitHub', 'Connect a GitHub repository to this project first'], chat: ['Needs a chat bot', 'Connect a chat bot in Settings → Events first'] };
+const STORE_NEEDS = { github: ['Needs GitHub', 'Connect a GitHub repository to this project first'], chat: ['Needs a chat bot', 'Connect a chat bot to this project first'] };
 function storeRowHtml(item) {
   const installed = item.repeatable && item.installed?.length;
   const need = !installed && item.missing?.length ? STORE_NEEDS[item.missing[0]] : null;
