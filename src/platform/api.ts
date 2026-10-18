@@ -33,9 +33,10 @@ import {
   MERGE_QUEUE_WORKFLOW,
   AGENT_QUEUE_WORKFLOW,
 } from '../coordinators/names.js';
-import { TaskRecord, TaskView, AttentionAsk, Message, Project, TaskInput, ImageRef, FileRef, Tag, SavedView, TaskQuery, AgentRole, AgentSpec, AgentAuthority, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency, remotePolicyOf, ResourceAccess, ResourceTarget } from '../domain/types.js';
+import { templateContent, templateName, templateParams, templateAuthorization } from '../domain/task-templates.js';
+import { TaskRecord, TaskView, AttentionAsk, Message, Project, TaskInput, ImageRef, FileRef, Tag, SavedView, TaskTemplate, TaskQuery, AgentRole, AgentSpec, AgentAuthority, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency, remotePolicyOf, ResourceAccess, ResourceTarget } from '../domain/types.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable, awaitsSuccessOf, isSeries } from '../domain/triggers.js';
-import { BUILT_IN_AUTOMATIONS, automationNeeds, templateTask, type AutomationNeed, type AutomationTemplate } from '../domain/automations.js';
+import { STORE_TASKS, storeTaskNeeds, storeTaskRepeatable, type StoreNeed, type StoreTask } from '../domain/task-store.js';
 import { applyTriggerContext, normalizeEventInput, validateFollow, type EventFilter, type EventFollow, type ProjectEvent, type ProjectEventClaim,
   type ProjectEventInput, type ProjectEventOrigin, type TriggerContext } from '../domain/project-events.js';
 import { newId } from '../util/id.js';
@@ -49,6 +50,7 @@ import { taskProvider } from '../world/task-provider.js';
 import { applyComputer, assertInFlightComputerEdit, computerOf, computerResizable, describeMachine, machineShape, normalizeComputer, sameMachine,
   type ComputerSpec, type MachineShape } from '../domain/computer.js';
 import { resolveParamsLayers, assembleTaskInput, projectSettingsFor, globalSettingsFor, effectiveRepos, ValueMap } from './params.js';
+import { splitSharedSettings } from '../domain/shared-settings.js';
 import { REPOSITORY_BRANCHES_RESOLVED_PARAM, applyRepoBranches, normalizeRepoBranches, repositoryBranchDefaults } from './branch-defaults.js';
 import { withTimeout } from '../util/timeout.js';
 import path from 'node:path';
@@ -1374,9 +1376,16 @@ export class KarmaxApi {
       assignee?: PrincipalRef;
       delegate?: PrincipalRef;
       confirmationPolicy?: ConfirmationPolicy;
+      /** Start from this task template (the project's or its organization's);
+       *  every other argument overrides it, `params` field by field. */
+      templateId?: string;
     },
     receivedAt?: { monoMs: number; wallMs: number },
   ): Promise<TaskRecord & { authorizationGap?: AuthorizationGap & { participant?: string } }> {
+    if (args.templateId) {
+      const { templateId, ...plain } = args;
+      return this.createTask(token, await this.withTemplate(token, templateId, plain), receivedAt);
+    }
     if (args.holdForAuthorization) {
       const { holdForAuthorization: _hold, ...plain } = args;
       try {
@@ -2982,6 +2991,23 @@ export class KarmaxApi {
     return this.fireTriggeredTask(token, taskId, 'self');
   }
 
+  /**
+   * Delete a task that never started a workflow of its own: a draft, a
+   * repeatable series (its runs stay, as ordinary tasks) or a task armed on a
+   * trigger. A started task is cancelled instead: deleting it would pull its
+   * record out from under a running workflow.
+   */
+  async deleteTask(token: string, taskId: string): Promise<void> {
+    const task = (await this.deps.store.getTask(taskId));
+    (await this.require(token, 'delete_task', { projectId: task?.projectId ?? '__missing__', taskId }));
+    if (!task) throw new NotFoundError('no such task');
+    const series = !!task.params?.repeatable && !task.params?.runOf;
+    if (!task.params?.draft && !series && task.params?.triggerState !== 'armed')
+      throw new ValidationError('a started task cannot be deleted; cancel it instead');
+    this.armer?.disarm(taskId);
+    (await this.deps.store.deleteTask(taskId));
+  }
+
   // ─── Project events and incoming webhooks ─────────────────────────────────
   // wiki features/events-and-automations: an outside occurrence is
   // one row in the project's inbox; armed tasks whose event triggers match it
@@ -3021,61 +3047,46 @@ export class KarmaxApi {
     return { event, duplicate: !created };
   }
 
-  /** Newest first, each with what it did for every armed task it reached. */
-  // ─── Automations: the gallery of ready-made repeatable tasks ───────────────
-  // src/domain/automations.ts. Installing one creates an ordinary series.
+  // ─── Task store: ready-made tasks ──────────────────────────────────────────
+  // src/domain/task-store.ts. An ordinary one runs at once; a repeatable one
+  // installs as an ordinary series.
 
-  /** The gallery for a project: built-ins, then the organization's own; each
-   *  says whether the project has it, and what the project lacks for it. */
-  async listAutomations(token: string, projectId: string): Promise<Array<AutomationTemplate & { builtIn: boolean; installed: string[]; missing: AutomationNeed[] }>> {
+  /** The store for a project: each task says which of the project's tasks
+   *  came from it (a repeatable one's series, an ordinary one's runs) and what
+   *  the project lacks for it. */
+  async listTaskStore(token: string, projectId: string): Promise<Array<Omit<StoreTask, 'task'> & { task: Omit<StoreTask['task'], 'hostedPrompt'>;
+    repeatable: boolean; installed: string[]; missing: StoreNeed[] }>> {
     (await this.require(token, 'list_tasks', { projectId }));
-    const project = (await this.deps.store.getProject(projectId));
-    if (!project) throw new NotFoundError(`no project ${projectId}`);
-    const own = (await this.deps.store.listAutomationTemplates(project.organizationId ?? 'org_personal'));
+    if (!(await this.deps.store.getProject(projectId))) throw new NotFoundError(`no project ${projectId}`);
     const tasks = (await this.deps.store.listTasks(projectId));
     const has = {
       github: (await this.deps.store.listProjectRepositories(projectId)).some((entry) => !!entry.repository.gitConnectionId),
       chat: this.deps.broker ? (await this.incomingWebhooks().list(projectId)).some((hook) => !!hook.kind) : false,
     };
-    return [...BUILT_IN_AUTOMATIONS.map((template) => ({ ...template, builtIn: true })), ...own.map((template) => ({ ...template, builtIn: false }))]
-      .map((template) => ({ ...template,
-        installed: tasks.filter((task) => task.params?.template === template.id && !task.params?.runOf).map((task) => task.id),
-        missing: automationNeeds(template).filter((need) => !has[need]) }));
+    return STORE_TASKS.map(({ task: { hostedPrompt, ...task }, ...template }) => ({ ...template, task: { ...task, prompt: this.storePrompt({ task: { ...task, hostedPrompt } }) },
+      repeatable: storeTaskRepeatable({ task }),
+      installed: tasks.filter((candidate) => candidate.params?.template === template.id && !candidate.params?.runOf)
+        .sort((a, b) => b.createdAt - a.createdAt).map((candidate) => candidate.id),
+      missing: storeTaskNeeds({ task, needs: template.needs }).filter((need) => !has[need]) }));
   }
 
-  /** Add an automation to a project: an armed repeatable task, edited like any other. */
-  async installAutomation(token: string, projectId: string, templateId: string): Promise<TaskRecord> {
+  private storePrompt(template: Pick<StoreTask, 'task'>): string {
+    return this.deps.hosted ? template.task.hostedPrompt ?? template.task.prompt : template.task.prompt;
+  }
+
+  /** Take a task from the store: an ordinary one starts now (as often as
+   *  asked); a repeatable one becomes the project's armed series, once. */
+  async runStoreTask(token: string, projectId: string, templateId: string): Promise<TaskRecord> {
     (await this.require(token, 'create_task', { projectId }));
-    const project = (await this.deps.store.getProject(projectId));
-    if (!project) throw new NotFoundError(`no project ${projectId}`);
-    const template = BUILT_IN_AUTOMATIONS.find((candidate) => candidate.id === templateId)
-      ?? (await this.deps.store.listAutomationTemplates(project.organizationId ?? 'org_personal')).find((candidate) => candidate.id === templateId);
-    if (!template) throw new NotFoundError(`no automation ${templateId}`);
-    const existing = (await this.deps.store.listTasks(projectId)).find((task) => task.params?.template === templateId && !task.params?.runOf);
-    if (existing) throw new ValidationError(`this project already has it: ${existing.id}`);
-    return this.createTask(token, { projectId, title: template.task.title, prompt: template.task.prompt, ...(template.task.workflow ? { workflow: template.task.workflow } : {}),
+    if (!(await this.deps.store.getProject(projectId))) throw new NotFoundError(`no project ${projectId}`);
+    const template = STORE_TASKS.find((candidate) => candidate.id === templateId);
+    if (!template) throw new NotFoundError(`no store task ${templateId}`);
+    if (storeTaskRepeatable(template)) {
+      const existing = (await this.deps.store.listTasks(projectId)).find((task) => task.params?.template === templateId && !task.params?.runOf);
+      if (existing) throw new ValidationError(`this project already has it: ${existing.id}`);
+    }
+    return this.createTask(token, { projectId, title: template.task.title, prompt: this.storePrompt(template), ...(template.task.workflow ? { workflow: template.task.workflow } : {}),
       params: { ...template.task.params, template: template.id } });
-  }
-
-  /** Save a series as an automation the whole organization can install. */
-  async saveAutomation(token: string, organizationId: string, input: { taskId: string; name: string; summary?: string }): Promise<AutomationTemplate> {
-    const task = (await this.deps.store.getTask(String(input.taskId ?? '')));
-    (await this.require(token, 'get_task', { projectId: task?.projectId ?? '__missing__', taskId: input.taskId }));
-    if (!task || ((await this.deps.store.getProject(task.projectId))?.organizationId ?? 'org_personal') !== organizationId)
-      throw new NotFoundError(`no task ${input.taskId} in this organization`);
-    const caller = (await this.require(token, 'organization:wiki:write', { organizationId }));
-    const name = String(input.name ?? '').trim().slice(0, 80);
-    if (!name) throw new ValidationError('name the automation');
-    if (!hasActiveTriggers(task.params)) throw new ValidationError('only a task with a trigger can be an automation');
-    const saved = templateTask({ title: task.title, workflow: task.workflow, params: task.params as Record<string, unknown> });
-    const template = { id: newId('atm'), organizationId, name, summary: String(input.summary ?? '').trim().slice(0, 300),
-      task: saved, needs: automationNeeds({ task: saved }), createdBy: caller.principal, createdAt: Date.now() };
-    return this.deps.store.saveAutomationTemplate(template);
-  }
-
-  async deleteAutomation(token: string, organizationId: string, templateId: string): Promise<void> {
-    (await this.require(token, 'organization:wiki:write', { organizationId }));
-    if (!(await this.deps.store.deleteAutomationTemplate(organizationId, templateId))) throw new NotFoundError(`no automation ${templateId}`);
   }
 
   /** A run started by an event follows what the event is about: the issue's
@@ -3121,6 +3132,7 @@ export class KarmaxApi {
     (await this.deps.store.deleteTaskFollow(followId));
   }
 
+  /** Newest first, each with what it did for every armed task it reached. */
   async listProjectEvents(token: string, projectId: string, options: { limit?: number; before?: number; type?: string; source?: string } = {}):
     Promise<Array<ProjectEvent & { claims: ProjectEventClaim[] }>> {
     (await this.require(token, 'list_events', { projectId }));
@@ -5788,6 +5800,105 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     (await this.deps.store.deleteView(id));
   }
 
+  // ─── Task templates (a template is a saved task form) ─────────────────────────
+  /** The templates a project offers: its organization's and its own, oldest
+   *  first — numbered 1, 2, … after the Task defaults (template 0). */
+  async listProjectTemplates(token: string, projectId: string): Promise<TaskTemplate[]> {
+    (await this.require(token, 'list_templates', { projectId }));
+    const organizationId = (await this.deps.store.projectOrganizationAsync(projectId));
+    if (!organizationId) throw new NotFoundError(`no project ${projectId}`);
+    return (await this.deps.store.listTaskTemplates(organizationId, projectId));
+  }
+
+  /** An organization's own templates, which every project of it offers. */
+  async listOrganizationTemplates(token: string, organizationId: string): Promise<TaskTemplate[]> {
+    (await this.require(token, 'list_templates', { organizationId }));
+    return (await this.deps.store.listTaskTemplates(organizationId));
+  }
+
+  /** Saves a task form as a template of a project (`projectId`) or of an organization. */
+  async createTemplate(token: string, input: { projectId?: string; organizationId?: string; name: unknown } & Record<string, unknown>): Promise<TaskTemplate> {
+    const projectId = typeof input.projectId === 'string' && input.projectId ? input.projectId : undefined;
+    const organizationId = projectId ? (await this.deps.store.projectOrganizationAsync(projectId))
+      : typeof input.organizationId === 'string' && (await this.deps.store.getOrganization(input.organizationId)) ? input.organizationId : undefined;
+    if (!organizationId) throw new NotFoundError(projectId ? `no project ${projectId}` : `no such organization ${String(input.organizationId)}`);
+    const caller = (await this.require(token, 'manage_template', projectId ? { projectId } : { organizationId }));
+    const name = templateName(input.name);
+    return (await this.deps.store.createTaskTemplate({ organizationId, projectId, name, createdBy: caller.principal,
+      ...templateContent(input, projectId) }));
+  }
+
+  /** Saves a task — any task, running or finished — as a template: its form
+   *  contents as they are stored, without what only meant something for it. */
+  async createTemplateFromTask(token: string, taskId: string, input: { name: unknown; scope?: unknown }): Promise<TaskTemplate> {
+    const task = (await this.deps.store.getTask(taskId));
+    if (!task) throw new NotFoundError(`no such task ${taskId}`);
+    (await this.require(token, 'get_task', { projectId: task.projectId, taskId }));
+    const organizationId = (await this.deps.store.projectOrganizationAsync(task.projectId));
+    const held = task.params._authorization as { capabilities?: string[]; credentialPolicies?: Record<string, unknown> } | undefined;
+    const tags = (await this.deps.store.listTags(task.projectId));
+    const byId = new Map(tags.map((tag) => [tag.id, tag]));
+    return this.createTemplate(token, {
+      ...(input.scope === 'organization' ? { organizationId } : { projectId: task.projectId }),
+      name: input.name, workflow: task.workflow, params: task.params, notes: task.notes,
+      authorization: templateAuthorization(held, task.projectId),
+      credentialGrants: (held?.capabilities ?? []).filter((capability) => capability.startsWith('use-credential:')),
+      credentialPolicies: held?.credentialPolicies,
+      tags: (await this.deps.store.tagsFor(taskId)).map((id) => byId.get(id)).filter((tag): tag is Tag => !!tag).map((tag) => tagPath(tag, byId)),
+      priority: task.params.priority,
+    });
+  }
+
+  // `/api/templates/:id` names no scope: the template's own decides.
+  private async requireTemplateScope(token: string, id: string): Promise<TaskTemplate> {
+    const template = (await this.deps.store.getTaskTemplate(id));
+    (await this.require(token, 'manage_template', template?.projectId ? { projectId: template.projectId }
+      : { organizationId: template?.organizationId ?? '' }));
+    if (!template) throw new NotFoundError(`no such template ${id}`);
+    return template;
+  }
+
+  /** Renames a template, and with `workflow`/`params` replaces its contents as a whole. */
+  async updateTemplate(token: string, id: string, patch: Record<string, unknown>): Promise<TaskTemplate | undefined> {
+    const template = (await this.requireTemplateScope(token, id));
+    const name = patch.name === undefined ? undefined : templateName(patch.name);
+    const content = patch.params !== undefined || patch.workflow !== undefined
+      ? templateContent({ workflow: template.workflow, ...patch }, template.projectId || undefined) : undefined;
+    return (await this.deps.store.updateTaskTemplate(id, { name, content }));
+  }
+
+  async deleteTemplate(token: string, id: string): Promise<void> {
+    (await this.requireTemplateScope(token, id));
+    (await this.deps.store.deleteTaskTemplate(id));
+  }
+
+  /** `createTask` arguments starting from a template: whatever the caller
+   *  names wins, its `params` over the template's field by field. */
+  private async withTemplate<T extends { projectId: string; params?: ValueMap } & Record<string, unknown>>(token: string, templateId: string, args: T): Promise<T> {
+    const template = (await this.deps.store.getTaskTemplate(templateId));
+    const organizationId = (await this.deps.store.projectOrganizationAsync(args.projectId));
+    (await this.require(token, 'list_templates', { projectId: args.projectId }));
+    if (!template || template.organizationId !== organizationId || (template.projectId && template.projectId !== args.projectId))
+      throw new NotFoundError(`no template ${templateId} in this project`);
+    const params: ValueMap = { ...templateParams(template.params), ...args.params };
+    for (const key of ['prompt', 'base', 'target', 'command', 'branch'] as const)
+      if (args[key] !== undefined && args[key] !== '' && args.params?.[key] === undefined) params[key] = args[key];
+    const authorization = template.authorization && (template.authorization.scope === 'projects' && !template.authorization.projectIds?.length
+      ? { ...template.authorization, projectIds: [args.projectId] } : template.authorization);
+    // A template's tags are names: they apply where this project has them.
+    let tags = template.tags;
+    if (tags?.length && args.tags === undefined) {
+      const known = (await this.deps.store.listTags(args.projectId));
+      const byId = new Map(known.map((tag) => [tag.id, tag]));
+      const names = new Set(known.flatMap((tag) => [tag.name.toLowerCase(), tagPath(tag, byId).toLowerCase()]));
+      tags = tags.filter((name) => names.has(name.toLowerCase()));
+    }
+    const pick = <K extends string>(key: K, fallback: unknown) => (args[key] !== undefined ? {} : fallback !== undefined ? { [key]: fallback } : {});
+    return { ...args, params, ...pick('workflow', template.workflow), ...pick('notes', template.notes),
+      ...pick('authorization', authorization), ...pick('credentialGrants', template.credentialGrants),
+      ...pick('credentialPolicies', template.credentialPolicies), ...pick('tags', tags), ...pick('priority', template.priority) };
+  }
+
   /** Restart a terminally failed software-dev execution without running Setup.
    * Setup's createWorld deliberately replaces stale worktrees; doing that here
    * would erase the exact dirty work a recovery exists to preserve. */
@@ -6273,7 +6384,10 @@ Act according to your Avatar instructions. When ready, call platform_request POS
     if (confirmsProposal && scopedTask && (chosenOtherAttempts === 'keep' || chosenOtherAttempts === 'cancel')) {
       (await this.deps.store.kvSet(`attempt-choice:${taskId}`, chosenOtherAttempts));
       if (attemptChoice?.saveOtherAttemptsDefault) {
-        const defaults = (await this.deps.store.getSettings(scopedTask.projectId, '__common__')) ?? {};
+        // A project's first settings row must keep what it inherited from its config.
+        const project = (await this.deps.store.getProject(scopedTask.projectId));
+        const defaults = (await this.deps.store.getSettings(scopedTask.projectId, '__common__'))
+          ?? (project ? splitSharedSettings('software-dev', (await projectSettingsFor(async (scope, workflow) => (await this.deps.store.getSettings(scope, workflow)), project, 'software-dev'))).shared : {});
         (await this.deps.store.setSettings(scopedTask.projectId, '__common__', { ...defaults, otherAttempts: chosenOtherAttempts }));
       }
     }

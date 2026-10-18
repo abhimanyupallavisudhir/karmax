@@ -68,6 +68,7 @@ const ICON = {
   project: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 6h11"/><path d="M10 12h11"/><path d="M10 18h11"/><path d="m3 6 1.5 1.5L7.5 4.5"/><path d="m3 12 1.5 1.5L7.5 10.5"/><path d="m3 18 1.5 1.5L7.5 16.5"/></svg>',
   plus: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14"/><path d="M5 12h14"/></svg>',
   // Toolbar actions (conversation head, tab rails): one stroke weight and size.
+  template: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="7" x="3" y="3" rx="1"/><rect width="9" height="7" x="3" y="14" rx="1"/><rect width="5" height="7" x="16" y="14" rx="1"/></svg>',
   share: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12v7a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-7"/><path d="m16 6-4-4-4 4"/><path d="M12 2v13"/></svg>',
   fork: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><path d="M18 9v2c0 .6-.4 1-1 1H7c-.6 0-1-.4-1-1V9"/><path d="M12 12v3"/></svg>',
   terminal: '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 17 6-6-6-6"/><path d="M12 19h8"/></svg>',
@@ -4250,6 +4251,8 @@ async function boot() {
   const session = await sessionRead;
   // Account email (confirmation, password reset) only when the installation can send it.
   S.emailDelivery = session.emailDelivery === true;
+  // Preferences that follow the person to every device (GET|PATCH /api/user/preferences).
+  if (session.preferences) S.preferences = session.preferences;
   S.sso = session.sso || null;
   S.google = session.google || false;
   S.github = session.github || false;
@@ -4552,6 +4555,20 @@ async function loadOrg() {
 
 // The map id→tag for quick lookups + hierarchy path rendering.
 function tagById(id) { return S.tags.find((t) => t.id === id); }
+/** A tag of the project on screen by its name or a/b path, as a template names it. */
+function tagIdByPath(name) {
+  const wanted = String(name || '').trim().toLowerCase();
+  return S.tags.find((t) => t.name.toLowerCase() === wanted || tagPathStr(t.id).toLowerCase() === wanted)?.id;
+}
+/** A template's authorization: a project scope listing only the form's own
+ *  project means each new task's own project. */
+function templateAuthorizationFor(selection, projectId) {
+  if (!selection?.level) return undefined;
+  if (selection.scope !== 'projects') return { level: selection.level, scope: selection.scope };
+  const ids = selection.projectIds || [];
+  return ids.length === 0 || (ids.length === 1 && ids[0] === projectId) ? { level: selection.level, scope: 'projects' }
+    : { level: selection.level, scope: 'projects', projectIds: ids };
+}
 function tagPathStr(id) {
   const parts = [];
   const seen = new Set();
@@ -4657,6 +4674,8 @@ async function runSearch() {
   const scopeOf = () => (S.tab === 'inbox' ? 'all' : S.tab === 'home' ? `org:${S.organizationId}` : S.projectId);
   const scope = scopeOf();
   if (S.tab === 'home' ? !organizationId : S.tab !== 'inbox' && !projectId) return false;
+  const store = taskStoreForQuery();
+  if (store) { S.searchPending = false; S.searchFailed = false; return store; }
   const isCurrent = () => scopeOf() === scope;
   const q = effectiveQuery(S.search); // adds the default -is:run -is:subtask unless overridden
   const epoch = S.searchEpoch = (S.searchEpoch || 0) + 1;
@@ -6107,9 +6126,15 @@ const BUILTIN_VIEWS = [
 const ACTIVE_VIEW_QUERY = '-is:archived';
 const ACTIVE_VIEW = '__active__'; // the chip for every task that isn't archived
 const FOR_ME_VIEW = '__for_me__'; // the default chip: what waits on you
+// The task store lists ready-made tasks, not the project's: the console answers
+// `is:store` itself (the rest of the query filters the store by its words).
+const STORE_VIEW = '__store__';
+const STORE_VIEW_QUERY = 'is:store';
+function isStoreQuery(q) { return /(^|\s)is:store(\s|$)/i.test(q || ''); }
 function viewIdForQuery(q) {
   const s = normalizeQuery(q);
   if (!s) return null;
+  if (isStoreQuery(s)) return STORE_VIEW;
   if (s === normalizeQuery(ACTIVE_VIEW_QUERY)) return ACTIVE_VIEW;
   if (s === normalizeQuery(DEFAULT_LIST_QUERY)) return FOR_ME_VIEW;
   return BUILTIN_VIEWS.find((v) => normalizeQuery(v.query) === s)?.id
@@ -6132,13 +6157,14 @@ async function loadOrgViews(organizationId = S.organizationId) {
   S.orgViewsFor = organizationId;
 }
 
-// Every view chip of the list in its order — For me, Active, the built-ins, then
-// the saved ones. Their position is their number: `v 1` … `v 9`.
+// Every view chip of the list in its order — For me, Active, the built-ins, the
+// Task store, then the saved ones. Their position is their number: `v 1` … `v 9`.
 function listViewChips(tab = S.tab) {
   return [
     { id: FOR_ME_VIEW, name: 'For me', query: DEFAULT_LIST_QUERY },
     { id: ACTIVE_VIEW, name: 'Active', query: ACTIVE_VIEW_QUERY },
     ...BUILTIN_VIEWS,
+    ...(tab === 'inbox' ? [] : [{ id: STORE_VIEW, name: 'Task store', query: STORE_VIEW_QUERY }]),
     ...savedViews(tab).map((v) => ({ id: v.id, name: v.name, icon: v.icon, query: stringifyQuery(v.query || {}), saved: true })),
   ];
 }
@@ -6151,11 +6177,12 @@ function listViewChips(tab = S.tab) {
 // Its number (`v 1`…`v 9`) shows on it while `v` is held down as a chord prefix.
 function viewsBar() {
   const active = viewIdForQuery(S.search);
-  const title = { [FOR_ME_VIEW]: 'Waiting on you: reviews, questions, approvals, mentions — and your drafts' };
+  const title = { [FOR_ME_VIEW]: 'Waiting on you: reviews, questions, approvals, mentions — and your drafts',
+    [STORE_VIEW]: 'Ready-made tasks: run one now, or install one that runs itself' };
   const chips = listViewChips().map((v, i) => {
     const label = `${v.icon ? esc(v.icon) + ' ' : ''}${esc(v.name)}${v.saved ? `<span class="view-x" data-delview="${esc(v.id)}" title="Delete view">✕</span>` : ''}`;
     const tip = title[v.id] || (v.saved ? '' : v.query);
-    return `<a class="view-chip${BUILTIN_VIEWS.includes(v) ? ' builtin' : ''}${active === v.id ? ' active' : ''}" data-view="${esc(v.id)}" href="${esc(listQueryRoute(v.query))}"${tip ? ` title="${esc(tip)}"` : ''}${i < 9 ? ` data-shortcut="view.${i + 1}"` : ''}>${label}</a>`;
+    return `<a class="view-chip${BUILTIN_VIEWS.includes(v) || v.id === STORE_VIEW ? ' builtin' : ''}${active === v.id ? ' active' : ''}" data-view="${esc(v.id)}" href="${esc(listQueryRoute(v.query))}"${tip ? ` title="${esc(tip)}"` : ''}${i < 9 ? ` data-shortcut="view.${i + 1}"` : ''}>${label}</a>`;
   }).join('');
   // Saving is offered once the query is not already a view.
   const save = canSaveViews() && S.search.trim() && !active
@@ -6166,6 +6193,7 @@ function viewsBar() {
 // The query a view chip stands for ('' for an unknown id).
 function viewQuery(id) {
   if (id === ACTIVE_VIEW) return ACTIVE_VIEW_QUERY;
+  if (id === STORE_VIEW) return STORE_VIEW_QUERY;
   if (id === FOR_ME_VIEW) return DEFAULT_LIST_QUERY;
   const builtin = BUILTIN_VIEWS.find((x) => x.id === id);
   if (builtin) return builtin.query;
@@ -6300,8 +6328,11 @@ function tasksView() {
   const groups = r && r.groups ? r.groups : null;
   const count = flat.length;
   const notices = inboxNoticesHtml();
+  const store = isStoreQuery(S.search);
   let body;
-  if (groups) {
+  if (store) {
+    body = storeViewHtml();
+  } else if (groups) {
     body = r.hierarchical
       ? [
         ...(groups.find((g) => g.key === '__untagged__')?.tasks || []).filter(topLevel).map((t) => row(t, { showTags: false })),
@@ -6330,7 +6361,8 @@ function tasksView() {
   // A stand-in for the full task form: the field and Send both open it.
   const composer = everywhere || (home && !newTaskProjectId()) ? '' : `
     <div class="composer">
-      <button type="button" class="new-task-field" id="expand-task" data-shortcut="nav.newTask">New task…</button>
+      <button type="button" class="new-task-field" id="expand-task" data-shortcut="nav.newTaskDefault">New task…</button>
+      <button type="button" class="btn icon-only" id="new-from-template" data-shortcut="nav.newTask" title="New task from template" aria-label="New task from template">${ICON.template}</button>
       <button type="button" class="btn primary icon-only" id="add-task" title="New task" aria-label="New task">${ICON.send}</button>
     </div>`;
   const trailing = everywhere ? '' : home ? projectFilterHtml()
@@ -6342,13 +6374,13 @@ function tasksView() {
         <span class="search-ic">⌕</span>
         <input id="task-search" class="task-search" data-shortcut="nav.search" spellcheck="false" autocomplete="off" value="${esc(S.search)}"
           placeholder="Search tasks" aria-label="Search and filter tasks" />
-        ${S.searchPending ? '<span class="search-pending" role="status">Searching…</span>' : `<span class="search-count">${count} task${count === 1 ? '' : 's'}</span>`}
+        ${S.searchPending ? '<span class="search-pending" role="status">Searching…</span>' : store ? '' : `<span class="search-count">${count} task${count === 1 ? '' : 's'}</span>`}
         ${policyTip('Type words to search, or filters: status:active  -tag:bug  priority:>=2  group:stage  sort:updated-desc')}
         ${S.search ? `<button class="search-x" id="q-clear" title="Clear (Esc)">✕</button>` : ''}
       </div>
       <div class="organizer-row">${viewsBar()}${queryToolbarHtml(S.search || '', 'q', trailing)}</div>
     </div>
-    ${notices}${body || empty}`;
+    ${notices}${storeRecsHtml()}${store ? body : body || empty}`;
 }
 
 // The organization home's project filter: a `project:` clause in the query, so
@@ -6370,6 +6402,112 @@ function queryProjectSlug(q) {
 function setProjectClause(q, slug) {
   const rest = (q || '').replace(/(?:^|\s)project:("[^"]*"|\S+)/g, '').replace(/\s+/g, ' ').trim();
   return slug ? addClause(rest, 'project', slug) : rest;
+}
+
+// ── Task store: ready-made tasks (src/domain/task-store.ts) ──────────────────
+// An ordinary one runs at once; a repeatable one installs as a series, and is on
+// offer again once that series is deleted. On the organization home they go to
+// the project a new task would.
+function storeProjectId() {
+  return S.tab === 'home' ? newTaskProjectId() : S.tab === 'inbox' ? null : S.projectId;
+}
+// Fetches a project's store (at most one request at a time); resolves whether it changed.
+async function loadTaskStore(projectId, { force = false } = {}) {
+  if (!projectId) return false;
+  S.taskStore ||= {};
+  S.taskStoreLoading ||= {};
+  if (S.taskStore[projectId] && !force) return false;
+  if (S.taskStoreLoading[projectId] && !force) return S.taskStoreLoading[projectId];
+  const loading = api(`/api/projects/${encodeURIComponent(projectId)}/task-store`)
+    .then(({ tasks }) => { S.taskStore[projectId] = tasks || []; return true; })
+    .catch(() => false)
+    .finally(() => { if (S.taskStoreLoading[projectId] === loading) delete S.taskStoreLoading[projectId]; });
+  S.taskStoreLoading[projectId] = loading;
+  return loading;
+}
+
+const STORE_NEEDS = { github: ['Needs GitHub', 'Connect a GitHub repository to this project first'], chat: ['Needs a chat bot', 'Connect a chat bot to this project first'] };
+function storeRowHtml(item) {
+  const installed = item.repeatable && item.installed?.length;
+  const need = !installed && item.missing?.length ? STORE_NEEDS[item.missing[0]] : null;
+  const disabled = need ? ` disabled title="${esc(need[1])}"` : '';
+  const action = installed
+    ? `<a class="btn sm" data-spa href="${esc(taskUrl(item.installed[0], { projectId: storeProjectId() }))}">Open</a>`
+    : item.repeatable
+      ? `<button class="btn sm" data-store-run="${esc(item.id)}"${disabled}>Install</button>`
+      : `<button class="btn sm primary" data-store-run="${esc(item.id)}"${disabled}>Run</button>`;
+  return `<div class="task-row store-row" data-store-task="${esc(item.id)}">
+      <div class="task-main">
+        <div class="task-title">${esc(item.name)} ${item.summary ? policyTip(item.summary) : ''}</div>
+        <div class="task-sub">${item.repeatable ? `<span class="chip">${installed ? 'installed' : 'repeatable'}</span>` : ''}${need ? `<span>${esc(need[0])}</span>` : ''}</div>
+      </div>
+      <div class="task-right">${action}</div>
+    </div>`;
+}
+// The store's rows the query's words match (name or summary).
+function storeViewHtml() {
+  const projectId = storeProjectId();
+  const items = S.taskStore?.[projectId];
+  if (!projectId) return '<div class="empty"><div class="big">No project yet</div>Create a project to run tasks from the store.</div>';
+  if (!items) return '';
+  const words = (S.search || '').replace(/(^|\s)-?[\w.#-]+:\S*/g, ' ').toLowerCase().split(/\s+/).filter(Boolean);
+  const shown = items.filter((item) => words.every((word) => `${item.name} ${item.summary}`.toLowerCase().includes(word)));
+  return shown.length ? shown.map(storeRowHtml).join('') : `<div class="empty"><div class="big">Nothing matches</div>No ready-made task matches <code>${esc(S.search)}</code>.</div>`;
+}
+// The Task store view is not a search of tasks: it loads the store (a promise
+// in place of the search). The default view loads it alongside, to recommend from.
+function taskStoreForQuery() {
+  if (isStoreQuery(S.search)) return loadTaskStore(storeProjectId(), { force: true });
+  if (viewIdForQuery(S.search) === FOR_ME_VIEW && !storeRecsDismissed(storeProjectId()))
+    Promise.all([loadTaskStore(storeProjectId()), loadPreferences()])
+      .then((changed) => { if (changed.some(Boolean) && isTaskListTab() && !S.selected) bgRenderMain(); });
+  return null;
+}
+// The default view recommends what the project has not taken from the store yet,
+// until the person dismisses it there; the dismissal is theirs on every device.
+// Preferences come with the session; a session without them reads them once.
+async function loadPreferences() {
+  if (S.preferences) return false;
+  S.preferences = await api('/api/user/preferences').catch(() => null);
+  return !!S.preferences;
+}
+const storeRecsKey = (projectId) => `task-store:${projectId}`;
+function storeRecsDismissed(projectId) {
+  return !!S.preferences?.dismissed?.includes(storeRecsKey(projectId));
+}
+async function dismissStoreRecs(projectId) {
+  const before = S.preferences;
+  S.preferences = { ...before, dismissed: [...(before?.dismissed || []), storeRecsKey(projectId)] };
+  renderMain();
+  try { S.preferences = await api('/api/user/preferences', { method: 'PATCH', body: JSON.stringify({ dismiss: [storeRecsKey(projectId)] }) }); }
+  catch (e) { S.preferences = before; toast(e.message, true); renderMain(); }
+}
+function storeRecsHtml() {
+  const projectId = storeProjectId();
+  if (S.tab === 'inbox' || viewIdForQuery(S.search) !== FOR_ME_VIEW || !projectId || !S.preferences || storeRecsDismissed(projectId)) return '';
+  const items = (S.taskStore?.[projectId] || []).filter((item) => !item.installed?.length);
+  if (!items.length) return '';
+  return `<section class="store-recs">
+      <h2 class="task-group-heading"><span>Recommended from the <a href="${esc(listQueryRoute(STORE_VIEW_QUERY))}" data-store-view>Task store</a></span><button class="btn sm ghost" id="store-recs-dismiss">Dismiss</button></h2>
+      ${items.map(storeRowHtml).join('')}
+    </section>`;
+}
+function wireTaskStore() {
+  const main = $('#main');
+  const projectId = storeProjectId();
+  main.querySelectorAll('a[data-store-view]').forEach((a) => a.addEventListener('click', plainClick(() => setQuery(STORE_VIEW_QUERY))));
+  $('#store-recs-dismiss')?.addEventListener('click', () => dismissStoreRecs(projectId));
+  main.querySelectorAll('[data-store-run]').forEach((button) => button.addEventListener('click', async () => {
+    const item = (S.taskStore?.[projectId] || []).find((candidate) => candidate.id === button.dataset.storeRun);
+    button.disabled = true;
+    try {
+      const task = await api(`/api/projects/${encodeURIComponent(projectId)}/task-store/${encodeURIComponent(button.dataset.storeRun)}`, { method: 'POST', body: '{}' });
+      await loadTaskStore(projectId, { force: true });
+      refreshTasks();
+      if (item?.repeatable) { toast('Installed'); renderMain(); }
+      else go(taskUrl(task.id, task));
+    } catch (e) { button.disabled = false; showTaskError(e, projectId); }
+  }));
 }
 
 // Why a row is in a `for:` list, from the inbox kind of the ask, most pressing first.
@@ -7265,6 +7403,7 @@ function openTagsManager(initialEditId = null) {
 
 function wireTasksView() {
   wireOrgControls();
+  wireTaskStore();
   scrollToHashedTagSection();
   $('#main').querySelectorAll('[data-edit-tag]').forEach((button) =>
     button.addEventListener('click', (ev) => {
@@ -7319,7 +7458,7 @@ function wireTasksView() {
     b.addEventListener('click', (ev) => { ev.stopPropagation(); S.expandedSeries ||= new Set(); const id = b.dataset.expand; S.expandedSeries.has(id) ? S.expandedSeries.delete(id) : S.expandedSeries.add(id); renderMain(); }),
   );
   $('#main').querySelectorAll('[data-delseries]').forEach((b) =>
-    b.addEventListener('click', async (ev) => { ev.stopPropagation(); if (!confirm('Delete this repeatable task? Its past runs are kept.')) return; try { await api(`/api/tasks/${b.dataset.delseries}`, { method: 'DELETE' }); toast('Repeatable task deleted'); refreshTasks(); } catch (e) { toast(e.message, true); } }),
+    b.addEventListener('click', async (ev) => { ev.stopPropagation(); if (await deleteSeries(b.dataset.delseries)) refreshTasks(); }),
   );
   $('#main').querySelectorAll('[data-series]').forEach((e) => wireTaskNav(e, () => e.dataset.series));
   const setArchived = async (id, archived) => {
@@ -7351,16 +7490,219 @@ function wireTasksView() {
 // The quick composer above a project's list, and above the organization home,
 // where it creates the task in the project its picker shows.
 // Home creates in the project its new tasks go to (the form can change it); a project list in that project.
-function openNewTaskForm() {
-  const projectId = S.tab === 'home' ? newTaskProjectId() : S.projectId;
-  openTaskForm(NEW_TASK_WORKFLOW, undefined, '', undefined, projectId ? { projectId } : undefined);
+// `template`: start from a task template instead of the Task defaults alone.
+function openNewTaskForm(template) {
+  const projectId = newTaskTarget();
+  openTaskForm(template?.workflow || NEW_TASK_WORKFLOW, undefined, '', template?.params,
+    { ...(projectId ? { projectId } : {}), ...(template ? { template } : {}) });
 }
+function newTaskTarget() { return S.tab === 'home' ? newTaskProjectId() : S.projectId; }
 function wireNewTaskComposer() {
-  $('#expand-task')?.addEventListener('click', openNewTaskForm);
-  $('#add-task')?.addEventListener('click', openNewTaskForm);
+  $('#expand-task')?.addEventListener('click', () => openNewTaskForm());
+  $('#add-task')?.addEventListener('click', () => openNewTaskForm());
+  $('#new-from-template')?.addEventListener('click', () => openTemplatePicker());
   // Fetch the form's defaults while the person decides what to write.
-  const projectId = S.tab === 'home' ? newTaskProjectId() : S.projectId;
+  const projectId = newTaskTarget();
   if (projectId) requestTaskFormDefaults(projectId, NEW_TASK_WORKFLOW);
+}
+
+// ── Task templates ──────────────────────────────────────────────────────────
+// A template is a saved task form, a project's or its organization's. A project
+// offers both, numbered by when they were added after template 0, the Task
+// defaults themselves (never stored). `n` picks one; `N` is template 0.
+const templateRequests = new Map(); // projectId → Promise<template[]>
+function projectTemplates(projectId, fresh = false) {
+  if (!projectId) return Promise.resolve([]);
+  if (fresh || !templateRequests.has(projectId)) {
+    const request = api(`/api/projects/${encodeURIComponent(projectId)}/templates`)
+      .then((list) => { request.list = Array.isArray(list) ? list : []; return request.list; })
+      .catch(() => { templateRequests.delete(projectId); return []; });
+    templateRequests.set(projectId, request);
+  }
+  return templateRequests.get(projectId);
+}
+/** Palette entries for each template of the project new tasks go to, once loaded. */
+function templateCommands() {
+  return (loadedTemplates(newTaskTarget()) || []).map((template, i) => ({ id: `template.${template.id}`,
+    title: `New task: ${template.name}`, group: 'Navigation', help: false, sub: `n ${i + 1}`, run: () => openNewTaskForm(template) }));
+}
+/** The templates a project offers, if already loaded (the palette lists them). */
+function loadedTemplates(projectId) { return templateRequests.get(projectId)?.list || null; }
+function templatesChanged() {
+  templateRequests.clear();
+  document.querySelectorAll('[data-templates-card]').forEach((card) => hydrateTemplatesCard(card));
+}
+function templateScopeLabel(template) { return template.projectId ? '' : 'Organization'; }
+function templatesSettingsRoute(projectId) { return `${projectRoute(projectId, 'settings')}#project-defaults`; }
+
+// The `n` picker: digits pick by number (at once, unless a longer number
+// starts with them), words search the names, Enter takes the highlighted one —
+// with nothing typed, template 0.
+function openTemplatePicker() {
+  const projectId = newTaskTarget();
+  if (!projectId) return openNewTaskForm();
+  const root = createTransientOverlay();
+  root.innerHTML = `<div class="palette-scrim" id="tpl-scrim"><div class="palette tpl-picker" role="dialog" aria-label="New task from template">
+    <input id="tpl-in" placeholder="New task from template…" autocomplete="off" aria-label="Template name or number" />
+    <div id="tpl-list" role="listbox"></div>
+    <a class="tpl-manage" href="${esc(templatesSettingsRoute(projectId))}" data-spa>Manage templates</a>
+  </div></div>`;
+  const input = root.querySelector('#tpl-in'), list = root.querySelector('#tpl-list');
+  let templates = loadedTemplates(projectId), shown = [], active = 0;
+  const close = () => root.remove();
+  const entries = () => [{ n: 0, name: 'Default', template: null }, ...(templates || []).map((template, i) => ({ n: i + 1, name: template.name, template }))];
+  const choose = (entry) => { if (!entry) return; close(); openNewTaskForm(entry.template || undefined); };
+  const draw = () => {
+    list.innerHTML = shown.map((entry, i) => `<div class="opt${i === active ? ' active' : ''}" role="option" aria-selected="${i === active}" data-i="${i}">
+      <span class="tpl-num">${entry.n}</span><span class="tpl-name">${esc(entry.name)}</span>${entry.template && templateScopeLabel(entry.template) ? `<span class="pal-sub">${esc(templateScopeLabel(entry.template))}</span>` : ''}${i === active ? '<span class="key">↵</span>' : ''}</div>`).join('')
+      || '<div class="pal-empty">No such template</div>';
+    list.querySelector('.opt.active')?.scrollIntoView({ block: 'nearest' });
+  };
+  const update = (typed) => {
+    const q = input.value.trim();
+    const all = entries();
+    if (/^\d+$/.test(q)) {
+      shown = all.filter((entry) => String(entry.n).startsWith(q));
+      active = Math.max(0, shown.findIndex((entry) => String(entry.n) === q));
+      // A number nothing longer starts with is a choice already.
+      if (typed && templates && shown.length === 1 && String(shown[0].n) === q) return choose(shown[0]);
+    } else if (q) {
+      shown = all.map((entry) => ({ entry, score: fuzzyScore(q, entry.name) })).filter((x) => x.score >= 0)
+        .sort((a, b) => b.score - a.score).map((x) => x.entry);
+      active = 0;
+    } else { shown = all; active = 0; }
+    draw();
+  };
+  input.addEventListener('input', () => update(true));
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.stopPropagation(); close(); }
+    else if (e.key === 'ArrowDown') { e.preventDefault(); active = Math.min(shown.length - 1, active + 1); draw(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); active = Math.max(0, active - 1); draw(); }
+    else if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); choose(shown[active]); }
+  });
+  list.addEventListener('click', (e) => { const o = e.target.closest('.opt'); if (o) choose(shown[Number(o.dataset.i)]); });
+  list.addEventListener('mousemove', (e) => { const o = e.target.closest('.opt'); if (o && Number(o.dataset.i) !== active) { active = Number(o.dataset.i); draw(); } });
+  root.querySelector('#tpl-scrim').addEventListener('click', (e) => { if (e.target.id === 'tpl-scrim') close(); });
+  root.querySelector('.tpl-manage').addEventListener('click', () => close());
+  update(false);
+  input.focus();
+  // Always fresh (someone may have added one); digits typed before the list
+  // arrived still pick by number once it does.
+  projectTemplates(projectId, true).then((list) => {
+    if (!root.isConnected) return;
+    const picked = templates === null;
+    templates = list;
+    update(picked && !!input.value.trim());
+  });
+}
+
+/** Asks what to call a new template and where it belongs. Resolves
+ *  `{ name, scope: 'project'|'organization' }`, or null. */
+function templateSaveDialog(initialName = '') {
+  return new Promise((resolve) => {
+    const previousFocus = document.activeElement;
+    const dialog = document.createElement('dialog');
+    dialog.className = 'text-prompt template-save';
+    dialog.setAttribute('aria-label', 'Save as template');
+    dialog.innerHTML = `<form method="dialog"><label class="form-row">Template name<input name="name" value="${esc(initialName)}" autocomplete="off" required maxlength="120"></label>
+      <div class="tpl-scope"><span class="tpl-scope-label">Save to</span><span class="segmented" role="group" aria-label="Save to">
+        <button type="button" data-scope="project" aria-pressed="true">Project</button><button type="button" data-scope="organization" aria-pressed="false">Organization</button>
+      </span>${policyTip('A project’s templates are offered in that project; an organization’s in every one of its projects.')}</div>
+      <div class="inline-form" style="justify-content:flex-end"><button type="button" class="btn" data-cancel>Cancel</button><button class="btn primary" value="submit">Save template</button></div></form>`;
+    let scope = 'project';
+    dialog.querySelectorAll('[data-scope]').forEach((button) => button.addEventListener('click', () => {
+      scope = button.dataset.scope;
+      dialog.querySelectorAll('[data-scope]').forEach((other) => other.setAttribute('aria-pressed', String(other === button)));
+    }));
+    dialog.querySelector('[data-cancel]').onclick = () => dialog.close();
+    dialog.addEventListener('keydown', (event) => {
+      event.stopPropagation();
+      if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) { event.preventDefault(); dialog.querySelector('form').requestSubmit(dialog.querySelector('button[value="submit"]')); }
+    });
+    dialog.addEventListener('close', () => {
+      const name = dialog.querySelector('input[name="name"]').value.trim();
+      dialog.remove(); previousFocus?.focus?.();
+      resolve(dialog.returnValue === 'submit' && name ? { name, scope } : null);
+    }, { once: true });
+    document.body.appendChild(dialog);
+    dialog.showModal();
+    dialog.querySelector('input[name="name"]').select();
+  });
+}
+
+/** After a save: which number `n` gives it in `projectId`. */
+async function announceTemplate(saved, projectId) {
+  templatesChanged();
+  const list = await projectTemplates(projectId);
+  const n = list.findIndex((template) => template.id === saved.id) + 1;
+  toast(n > 0 ? `Saved as template ${n}` : `Saved template “${saved.name}”`);
+}
+
+// Saves a task as it is stored (any task: a draft, a running or a finished one).
+async function saveTaskAsTemplate(taskId) {
+  const record = taskRecord(taskId) || S.view;
+  const choice = await templateSaveDialog(record?.title || '');
+  if (!choice) return;
+  try {
+    const saved = await api(`/api/tasks/${encodeURIComponent(taskId)}/template`, { method: 'POST', body: JSON.stringify(choice) });
+    await announceTemplate(saved, record?.projectId || S.projectId);
+  } catch (e) { toast(e.message, true); }
+}
+
+// ── Templates in Task defaults (project and organization settings) ──────────
+// `scope` is 'project' or 'global' (the organization), as for the defaults card.
+function templatesCardHtml(scope, projectId) {
+  return `<div class="card task-templates" data-templates-card="${scope}" data-project-id="${esc(projectId || '')}">
+    <div class="section-h">Templates ${policyTip(scope === 'project'
+      ? 'Saved task forms. n opens one by its number; N, or n 0, starts from Default — the defaults below.'
+      : 'Saved task forms offered in every project. n opens one by its number; N, or n 0, starts from Default — the defaults below.')}</div>
+    <div class="setting-rows tpl-rows">Loading…</div>
+  </div>`;
+}
+async function hydrateTemplatesCard(card) {
+  if (!card?.isConnected) return;
+  const scope = card.dataset.templatesCard;
+  const projectId = card.dataset.projectId || undefined;
+  const organizationId = projectId ? projectById(projectId)?.organizationId : S.organizationId;
+  const rows = card.querySelector('.tpl-rows');
+  const current = beginAsyncElementRender(rows);
+  let list;
+  try {
+    list = scope === 'project' ? await projectTemplates(projectId, true)
+      : await api(`/api/organizations/${encodeURIComponent(organizationId)}/templates`);
+  } catch (e) { if (current()) rows.innerHTML = `<div class="setting-muted">${esc(e.message)}</div>`; return; }
+  if (!current()) return;
+  // An organization's template is edited in its settings; a project shows where.
+  const orgLink = `${globalRoute('organization', organizationById(organizationId) || currentOrg())}#settings-defaults`;
+  const number = (n) => scope === 'project' ? `<span class="tpl-num">${n}</span>` : '';
+  rows.innerHTML = `<div class="setting-row tpl-row">${number(0)}<span class="tpl-name">Default</span><span class="setting-muted tpl-where">Task defaults below</span></div>
+    ${list.map((template, i) => `<div class="setting-row tpl-row" data-template-id="${esc(template.id)}">${number(i + 1)}
+      <span class="tpl-name">${esc(template.name)}</span>
+      ${template.projectId || scope !== 'project'
+        ? `<span class="setting-actions"><button type="button" class="btn sm" data-edit-template>Edit</button><button type="button" class="icon-btn" data-delete-template aria-label="Delete ${esc(template.name)}" title="Delete">✕</button></span>`
+        : `<a class="setting-muted tpl-where" href="${esc(orgLink)}" data-spa title="An organization template: edit it in organization settings">Organization ↗</a>`}
+    </div>`).join('')}
+    <div class="setting-row tpl-foot"><button type="button" class="btn sm" data-new-template>＋ New template</button>
+      ${scope === 'project' ? `<a class="setting-muted" href="${esc(orgLink)}" data-spa>Organization templates ↗</a>`
+        : '<span class="setting-muted">Project templates are in each project’s settings.</span>'}</div>`;
+  // The form a template is edited in needs a project for its defaults; an
+  // organization's template uses one of the organization's.
+  const formProject = projectId || [newTaskProjectId(), ...S.projects.map((project) => project.id)]
+    .find((id) => projectById(id)?.organizationId === organizationId);
+  const edit = (template) => openTaskForm(template?.workflow || NEW_TASK_WORKFLOW, undefined, '', template?.params,
+    { projectId: formProject, templateEdit: { template, projectId: scope === 'project' ? projectId : '', organizationId } });
+  const add = rows.querySelector('[data-new-template]');
+  if (!formProject) { add.disabled = true; add.title = 'Add a project first'; }
+  add.addEventListener('click', () => edit(null));
+  rows.querySelectorAll('[data-template-id]').forEach((row) => {
+    const template = list.find((candidate) => candidate.id === row.dataset.templateId);
+    row.querySelector('[data-edit-template]')?.addEventListener('click', () => { if (formProject) edit(template); });
+    row.querySelector('[data-delete-template]')?.addEventListener('click', async () => {
+      if (!confirm(`Delete template “${template.name}”?`)) return;
+      try { await api(`/api/templates/${encodeURIComponent(template.id)}`, { method: 'DELETE' }); toast('Template deleted'); templatesChanged(); }
+      catch (e) { toast(e.message, true); }
+    });
+  });
 }
 const NEW_TASK_WORKFLOW = 'software-dev';
 
@@ -7376,8 +7718,19 @@ function consumingField(fields) {
   );
 }
 
+// A series never ran a workflow of its own, so it is deleted like a draft; its
+// runs stay as ordinary tasks, and the task store offers it again.
+async function deleteSeries(id) {
+  if (!confirm('Delete this repeatable task? Its past runs are kept.')) return false;
+  const projectId = taskRecord(id)?.projectId;
+  if (!(await deleteDraft(id))) return false;
+  if (projectId) delete S.taskStore?.[projectId];
+  toast('Repeatable task deleted');
+  return true;
+}
+
 async function deleteDraft(id) {
-  // Drafts never started a workflow, so the record is hard-deleted server-side.
+  // A draft (or series) never started a workflow, so the record is hard-deleted server-side.
   // A 404 means it's already gone (e.g. a racing double-delete) — treat that as
   // success rather than surfacing a confusing "no such task" error.
   // Returns whether the draft is gone, so the caller doesn't announce success
@@ -7964,12 +8317,12 @@ function taskFormTitle(draft) {
   return !draft ? 'New task' : p.triggerState === 'armed' || isSeries(p) ? 'Edit task' : 'Edit draft';
 }
 
-function taskFormLoadingPage(project, draft) {
+function taskFormLoadingPage(project, draft, title) {
   return `<div class="task-form-page" id="tf-page" tabindex="-1" aria-busy="true">
     <div class="tf-head"><div class="tf-head-inner">
       <button class="icon-btn" id="tf-close" data-shortcut="nav.close" title="Back (Esc)">←</button>
-      <h2>${taskFormTitle(draft)}</h2>
-      ${project ? `<span class="tf-crumb">in</span>${projectPickerHtml('tf-project', project.id, false)}` : ''}
+      <h2>${title ? esc(title) : taskFormTitle(draft)}</h2>
+      ${project && !title ? `<span class="tf-crumb">in</span>${projectPickerHtml('tf-project', project.id, false)}` : ''}
     </div></div>
     <div class="tf-loading" role="status"><span class="global-search-loading">Loading task form…</span></div>
   </div>`;
@@ -8001,6 +8354,16 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   const cf = consumingField(fields);
   const promptField = cf && cf.type === 'text' ? cf : null;
   const values = draft ? { ...draft.params } : { ...seedParams };
+  // `templateEdit`: the form edits a template ({ template?, projectId, organizationId })
+  // instead of a task — nothing is drafted, Save writes the template. `template`:
+  // a new task starts from one. Either way the template seeds what params cannot hold.
+  const templateEdit = opts?.templateEdit || null;
+  const seed = draft ? null : templateEdit?.template || opts?.template || null;
+  // Priority and tags: a task's own once it has an id; until then a
+  // template's (its tags where this project has them), applied on create.
+  const orgRec = draft
+    ? { id: draft.id, params: { priority: draft.params?.priority || 0 }, tags: (draft.tags || []).slice() }
+    : { id: null, params: { priority: seed?.priority || 0 }, tags: (seed?.tags || []).map(tagIdByPath).filter(Boolean) };
   const armed = draft?.params?.triggerState === 'armed'; // a "waiting for trigger" task
   const series = isSeries(draft?.params); // a repeatable template
   const editInPlace = armed || series; // neither has a running workflow — edit its stored params
@@ -8016,7 +8379,8 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   // currently slow. Usually the prefetched defaults below are already resolved
   // and this loading page never reaches a paint; otherwise it provides instant
   // feedback while keeping the not-yet-hydrated controls safely non-interactive.
-  root.innerHTML = taskFormLoadingPage(proj, draft);
+  const formTitle = templateEdit ? (templateEdit.template ? 'Edit template' : 'New template') : '';
+  root.innerHTML = taskFormLoadingPage(proj, draft, formTitle);
   // Closing a draft's own page returns to where the task was opened from —
   // unless a navigation is what closed it.
   const leavePage = (navigating) => {
@@ -8030,7 +8394,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   });
   const projectOrganizationId = S.projects.find((project) => project.id === projectId)?.organizationId;
   const authorizationProjects = S.projects.filter((project) => project.organizationId === projectOrganizationId);
-  const storedAuthorization = draft?.params?._authorization || {};
+  const storedAuthorization = draft?.params?._authorization || seed?.authorization || {};
   const selectedAuthorization = normalizedAuthorization({
     level: storedAuthorization.level || storedAuthorization.profileId || 'developer',
     scope: storedAuthorization.scope || 'projects',
@@ -8080,8 +8444,10 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       <div class="tf-head">
         <div class="tf-head-inner">
           <button class="icon-btn" id="tf-close" data-shortcut="nav.close" title="${editInPlace ? 'Back (Esc) — your changes are kept' : 'Back (Esc) — your work is kept as a draft'}">←</button>
-          <h2>${taskFormTitle(draft)}</h2>
-          ${proj ? `<span class="tf-crumb">in</span>${projectPickerHtml('tf-project', projectId, !draft)}` : ''}
+          <h2>${formTitle || taskFormTitle(draft)}</h2>
+          ${templateEdit ? `<input id="tf-template-name" class="tf-template-name" placeholder="Template name" aria-label="Template name" maxlength="120" value="${esc(templateEdit.name ?? templateEdit.template?.name ?? '')}">`
+            : proj ? `<span class="tf-crumb">in</span>${projectPickerHtml('tf-project', projectId, !draft)}` : ''}
+          ${opts?.template ? `<span class="chip tf-template-chip" title="Started from this template">${esc(opts.template.name)}</span>` : ''}
           ${formAttemptGroup?.attempts?.length > 1 ? `<nav class="attempts-list tf-attempts" aria-label="Choose an attempt">
             ${formAttemptGroup.attempts.map((a) => attemptCard(a, formAttemptGroup, { taskId: draft.id }, { form: true })).join('')}
           </nav>` : ''}
@@ -8105,29 +8471,30 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
           </div>
           <aside class="tf-side">
             <div class="form-row" data-row="__org">
-              ${orgEditorHtml(draft || { id: null, params: {}, tags: [] })}
+              ${orgEditorHtml(orgRec)}
             </div>
             ${['software-dev', 'goal'].includes(wf) ? `<div class="form-row" data-row="__github-merge" id="tf-github-merge" style="display:none"></div>` : ''}
-            ${!draft ? `<div class="form-row tf-inline" data-row="__attempts" title="Attempts created here are queued together. Attempts added later start as editable drafts.">
+            ${!draft && !templateEdit ? `<div class="form-row tf-inline" data-row="__attempts" title="Attempts created here are queued together. Attempts added later start as editable drafts.">
               <label for="tf-attempt-count">Attempts</label>
               <input id="tf-attempt-count" type="number" min="1" max="8" value="1">
             </div>` : ''}
-            <div class="form-row" data-row="__creds">
+            ${templateEdit ? '' : `<div class="form-row" data-row="__creds">
               <div class="label-row"><label>Codex/Claude</label>${policyTip('Drag to reorder, toggle to disable — for this task only.')}<span class="label-row-fill"></span></div>
               <div id="cred-editor-newtask">Loading…</div>
-            </div>
+            </div>`}
             <div class="form-row" data-row="__notes">
               <div class="label-row"><label>Notes</label>${policyTip('Private to you; never sent to the agent.')}</div>
-              <textarea id="tf-notes" rows="3" placeholder="Add a note…" style="width:100%">${esc(draft?.notes || '')}</textarea>
+              <textarea id="tf-notes" rows="3" placeholder="Add a note…" style="width:100%">${esc(draft?.notes || seed?.notes || '')}</textarea>
             </div>
           </aside>
         </div>
       </div>
       <div class="tf-foot">
         <div class="tf-foot-inner">
+          ${templateEdit ? '<span class="tf-hint"></span>' : `<button class="btn ghost" id="tf-save-template" title="Save this form as a template, to start new tasks from" aria-label="Save as template">${ICON.template}<span class="tf-save-template-label">Save as template</span></button>
           <span class="tf-hint"></span>
-          <button class="btn" id="tf-draft">Save draft</button>
-          <button class="btn primary" id="tf-queue">${editInPlace ? 'Save' : 'Run task'}<span class="kbd">${esc(fmtKeys('meta+Enter'))}</span></button>
+          <button class="btn" id="tf-draft">Save draft</button>`}
+          <button class="btn primary" id="tf-queue">${templateEdit ? 'Save template' : editInPlace ? 'Save' : 'Run task'}<span class="kbd">${esc(fmtKeys('meta+Enter'))}</span></button>
         </div>
       </div>
     </div>`;
@@ -8161,7 +8528,8 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       const carried = consumingField(fields)
         ? $('#tf-body')?.querySelector(`[data-field="${CSS.escape(consumingField(fields).name)}"]`)?.value
         : '';
-      openTaskForm(nextWorkflow, undefined, (carried || '').trim());
+      openTaskForm(nextWorkflow, undefined, (carried || '').trim(), undefined, { projectId,
+        ...(templateEdit ? { templateEdit: { ...templateEdit, name: $('#tf-template-name')?.value ?? '' } } : {}) });
     } catch (error) {
       select.value = wf;
       select.disabled = !workflowEditable;
@@ -8297,9 +8665,9 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   // A draft has an id → edit its policy directly. A brand-new task has none, so the
   // editor runs in `local` mode: changes are held here and applied on create (below).
   let taskCredPolicy = {};
-  const localCred = !draft;
+  const localCred = !draft && !templateEdit;
   if (draft) renderCredentialEditor($('#cred-editor-newtask'), 'task', { projectId, taskId: draft.id });
-  else renderCredentialEditor($('#cred-editor-newtask'), 'task', { local: true, projectId, policy: taskCredPolicy, onChange: (p) => { taskCredPolicy = p; autoSaveSoon(); } });
+  else if (!templateEdit) renderCredentialEditor($('#cred-editor-newtask'), 'task', { local: true, projectId, policy: taskCredPolicy, onChange: (p) => { taskCredPolicy = p; autoSaveSoon(); } });
   // The main agent's collapsed Authorization row says what it holds.
   const paintMainAuthority = () => {
     const summary = $('#tf-authorization')?.closest('.agent-authority')?.querySelector('.aa-summary');
@@ -8314,9 +8682,9 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   // sidebar stays one compact button; the full checkbox list lives in a modal.
   // Applying a selection dispatches a change event into the form's auto-save
   // listener; grants persist via createTask/PATCH authorization.
-  const vaultGrantIds = new Set((draft?.params?._authorization?.capabilities ?? inheritedVault.credentialGrants ?? [])
+  const vaultGrantIds = new Set((draft?.params?._authorization?.capabilities ?? seed?.credentialGrants ?? inheritedVault.credentialGrants ?? [])
     .filter((c) => c.startsWith('use-credential:item:')).map((c) => c.slice('use-credential:item:'.length)));
-  let vaultCredentialPolicies = JSON.parse(JSON.stringify(draft?.params?._authorization?.credentialPolicies ?? inheritedVault.credentialPolicies ?? {}));
+  let vaultCredentialPolicies = JSON.parse(JSON.stringify(draft?.params?._authorization?.credentialPolicies ?? seed?.credentialPolicies ?? inheritedVault.credentialPolicies ?? {}));
   let refreshVaultCount = () => {};
   // A fork's "Re-authorize previous grants?" writes into these same controls.
   wireResumeReauthorization($('#tf-body'), {
@@ -8369,6 +8737,8 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   // The id of the draft this form is editing. Starts as the passed-in draft; a
   // brand-new task gets one lazily the first time auto-save persists real content.
   let draftId = draft?.id || null;
+  const orgSeed = () => orgRec.id || templateEdit ? {} : { ...(orgRec.params.priority ? { priority: orgRec.params.priority } : {}),
+    ...(orgRec.tags.length ? { tags: orgRec.tags.map(tagPathStr) } : {}) };
   const hasPolicy = () => !!(taskCredPolicy.order?.length || taskCredPolicy.on?.length || taskCredPolicy.off?.length || taskCredPolicy.explainerOnly?.length);
   // Prompt attachments ride inside `params` (references only), so they flow
   // through auto-save, draft, and queue the same way the prompt text does.
@@ -8425,6 +8795,10 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   // stale snapshot reverts it. That is the "saved draft contents disappear" bug: only a
   // real change in THIS form (its signature diverging from the seed) now triggers a write.
   let lastSaved = initialTaskFormSavedSignature(draft, seedText, stateSig(formState()));
+  // A template's form is saved only by its button; this is what it opened with.
+  const templateExtras = () => JSON.stringify([$('#tf-template-name')?.value.trim() ?? '', orgRec.params.priority || 0, orgRec.tags]);
+  const openedExtras = templateExtras();
+  const templateDirty = () => stateSig(formState()) !== lastSaved || templateExtras() !== openedExtras;
   // Saves are SERIALIZED through this chain. Overlapping writes otherwise race:
   // if a debounced create is still in flight when the user types more or closes the
   // form (which flushes), `draftId` is still null, so the next save POSTs a *second*
@@ -8435,6 +8809,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   // `lastSaved` and lands in order, so the most recent edit always wins.
   let saveChain = Promise.resolve();
   function persistDraft(st = formState()) {
+    if (templateEdit) return saveChain; // a template is saved only by its Save button
     // Snapshot the signature at CALL time (the DOM may be gone by the time this link
     // in the chain runs — e.g. closeForm clears the form right after queuing the flush).
     const sig = stateSig(st);
@@ -8450,7 +8825,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       if (current) paintSaveState($('#tf-savestate'), 'saving', editInPlace ? 'Saving…' : 'Saving draft…');
       try {
         if (!draftId) {
-          const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, draft: true, allowAttenuation: true }) });
+          const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ ...orgSeed(), workflow: wf, params: st.body, notes: st.notes, authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, draft: true, allowAttenuation: true }) });
           draftId = created.id;
         } else {
           await Promise.all([
@@ -8482,6 +8857,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   // Debounced auto-save while typing.
   let saveTimer = null;
   function autoSaveSoon() {
+    if (templateEdit) return paintSaveState($('#tf-savestate'), templateDirty() ? 'dirty' : '');
     paintSaveState($('#tf-savestate'), 'dirty');
     clearTimeout(saveTimer);
     saveTimer = setTimeout(() => { if (activeFormToken !== formToken) return; persistDraft(); }, 800);
@@ -8521,29 +8897,81 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     if (draftId) return draftId;
     // Empty form, but the user is organizing it — mint a bare draft to hold the tags.
     const state = formState();
-    const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: state.body, authorization: state.authorization, credentialGrants: state.credentialGrants, credentialPolicies: state.credentialPolicies, draft: true, allowAttenuation: true }) });
+    const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ ...orgSeed(), workflow: wf, params: state.body, authorization: state.authorization, credentialGrants: state.credentialGrants, credentialPolicies: state.credentialPolicies, draft: true, allowAttenuation: true }) });
     draftId = created.id;
     refreshTasks();
     return draftId;
   }
-  const orgRec = draft
-    ? { id: draft.id, params: { priority: draft.params?.priority || 0 }, tags: (draft.tags || []).slice() }
-    : { id: null, params: {}, tags: [] };
   const refreshOrg = () => {
     const box = root.querySelector('[data-row="__org"] .org-editor');
-    if (box) { box.outerHTML = orgEditorHtml(orgRec); wireOrgEditor(root, orgRec, { ensureId: ensureDraft, afterChange: refreshOrg }); }
+    if (box) { box.outerHTML = orgEditorHtml(orgRec); wireOrgEditor(root, orgRec, { ensureId: ensureDraft, afterChange: refreshOrg, local: !!templateEdit }); }
+    if (templateEdit) autoSaveSoon();
     if (S.tab === 'tasks') renderMain();
   };
-  wireOrgEditor(root, orgRec, { ensureId: ensureDraft, afterChange: refreshOrg });
+  wireOrgEditor(root, orgRec, { ensureId: ensureDraft, afterChange: refreshOrg, local: !!templateEdit });
 
   // Flush any pending edits when the form is dismissed, so closing without
   // clicking a button still keeps the draft.
   closeForm = () => { clearTimeout(saveTimer); const st = formState(); const navigating = navigatingAway(); releaseFormKeys(); root.innerHTML = ''; persistDraft(st); leavePage(navigating); };
 
+  // ── Templates: this form as a template (Save as template), or a template's own form ──
+  const templateBody = (st = formState()) => ({ workflow: wf, params: st.body, notes: st.notes,
+    authorization: templateAuthorizationFor(st.authorization, projectId),
+    credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies,
+    tags: orgRec.tags.map(tagPathStr), priority: orgRec.params.priority || 0 });
+  if (templateEdit) {
+    $('#tf-template-name')?.addEventListener('input', autoSaveSoon);
+    if (!$('#tf-template-name')?.value) setTimeout(() => $('#tf-template-name')?.focus(), 0);
+    closeForm = () => {
+      const navigating = navigatingAway();
+      if (!navigating && templateDirty() && !confirm('Discard your changes to this template?')) return;
+      releaseFormKeys(); root.innerHTML = '';
+    };
+  }
+  let templateSaving = false;
+  const saveTemplate = async () => {
+    const nameInput = $('#tf-template-name');
+    const name = nameInput?.value.trim();
+    if (!name) { nameInput?.focus(); toast('Name the template', true); return false; }
+    if (templateSaving) return false;
+    templateSaving = true;
+    $('#tf-queue').disabled = true;
+    paintSaveState($('#tf-savestate'), 'saving', 'Saving…');
+    try {
+      const body = JSON.stringify({ name, ...templateBody() });
+      const existing = templateEdit.template;
+      const saved = existing ? await api(`/api/templates/${encodeURIComponent(existing.id)}`, { method: 'PATCH', body })
+        : await api(templateEdit.projectId ? `/api/projects/${encodeURIComponent(templateEdit.projectId)}/templates`
+          : `/api/organizations/${encodeURIComponent(templateEdit.organizationId)}/templates`, { method: 'POST', body });
+      releaseFormKeys(); root.innerHTML = '';
+      templatesChanged();
+      toast(existing ? 'Template saved' : `Added template “${saved.name}”`);
+      return true;
+    } catch (e) {
+      if ($('#tf-queue')) $('#tf-queue').disabled = false;
+      paintSaveState($('#tf-savestate'), 'error', 'Not saved');
+      toast(e.message, true);
+      return false;
+    } finally { templateSaving = false; }
+  };
+  $('#tf-save-template')?.addEventListener('click', async () => {
+    const st = formState();
+    const prompt = cf ? String(st.body[cf.name] || '') : '';
+    const choice = await templateSaveDialog(prompt.split('\n')[0].trim().slice(0, 60));
+    if (!choice) return;
+    try {
+      const saved = await api(choice.scope === 'organization'
+        ? `/api/organizations/${encodeURIComponent(projectOrganizationId || S.organizationId)}/templates`
+        : `/api/projects/${encodeURIComponent(projectId)}/templates`, { method: 'POST', body: JSON.stringify({ name: choice.name, ...templateBody(st) }) });
+      await announceTemplate(saved, projectId);
+    } catch (e) { toast(e.message, true); }
+  });
+
   let submitInFlight = false;
   // `accepted`: the agents (`do` is the main one) whose limited authorization
   // the user chose to run with ("Use my authorization").
   const submit = async (draftMode, accepted = [], activeFeedback) => {
+    if (templateEdit) return saveTemplate();
     const ownsFeedback = !activeFeedback;
     if (ownsFeedback && submitInFlight) return false;
     const submitButtons = [$('#tf-draft'), $('#tf-queue')].filter(Boolean);
@@ -8611,13 +9039,13 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       } else if (hasPolicy()) {
         // Custom per-task credential order/enablement: create as a draft first so the
         // override is persisted BEFORE the workflow starts leasing, then queue.
-        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, draft: true, attempts: attemptCount, ...createOptions, allowAttenuation: true }) });
+        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ ...orgSeed(), workflow: wf, params: st.body, notes: st.notes, authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, draft: true, attempts: attemptCount, ...createOptions, allowAttenuation: true }) });
         draftId = created.id;
         createdWithAttempts = true;
         await api(`/api/organizations/${encodeURIComponent(projectById(projectId)?.organizationId || S.organizationId)}/credentials/policy`, { method: 'POST', body: JSON.stringify({ scope: 'task', taskId: created.id, policy: taskCredPolicy }) });
         primaryId = created.id;
       } else {
-        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, draft: draftMode, attempts: attemptCount, ...createOptions }) });
+        const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ ...orgSeed(), workflow: wf, params: st.body, notes: st.notes, authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, draft: draftMode, attempts: attemptCount, ...createOptions }) });
         primaryId = created.id;
         createdWithAttempts = true;
       }
@@ -8696,7 +9124,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
           }
           let targetId = draftId || draft?.id;
           if (!targetId) {
-            const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({
+            const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ ...orgSeed(),
               workflow: wf, params: st.body, notes: st.notes, authorization: st.authorization,
               credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies,
               draft: true, attempts: attemptCount, allowAttenuation: true,
@@ -8742,7 +9170,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     }
     return succeeded;
   };
-  $('#tf-draft').addEventListener('click', () => submit(true));
+  $('#tf-draft')?.addEventListener('click', () => submit(true));
   $('#tf-queue').addEventListener('click', () => submit(false));
   // Capture at the document boundary so this still works after an editor
   // re-renders its focused control and focus falls back to <body>. A secondary
@@ -8878,8 +9306,8 @@ async function renderSeriesPage(rec) {
       </div></div>
       <div class="tp-foot" id="tp-foot"><div class="tp-foot-inner">
         <button class="btn" id="sd-runagain">Run again</button>
-        ${rec.params?.triggers?.length ? `<button class="btn ghost" id="sd-save-automation" title="Let every project in this organization add it from its automations">Save as automation</button>` : ''}
         <span style="flex:1"></span>
+        <button class="btn danger" id="sd-delete">Delete</button>
         <button class="btn primary" id="sd-save">Save changes</button>
       </div></div>
     </div>`;
@@ -8891,13 +9319,7 @@ async function renderSeriesPage(rec) {
   wireScheduleBuilder(values);
   wireEventTrigger(rec.projectId);
   $('#tp-body').querySelectorAll('[data-runopen]').forEach((el) => wireTaskNav(el, () => el.dataset.runopen));
-  $('#sd-save-automation')?.addEventListener('click', async () => {
-    const name = prompt('Name it', rec.title.replace(/\{\{[^}]*\}\}/g, '').trim() || 'Automation');
-    if (!name) return;
-    const organizationId = projectById(rec.projectId)?.organizationId || 'org_personal';
-    try { await api(`/api/organizations/${encodeURIComponent(organizationId)}/automations`, { method: 'POST', body: JSON.stringify({ taskId: rec.id, name }) }); toast('Saved to the gallery'); }
-    catch (e) { toast(e.message, true); }
-  });
+  $('#sd-delete').addEventListener('click', async () => { if (await deleteSeries(rec.id)) { closeTask(); refreshTasks(); } });
   $('#sd-runagain').addEventListener('click', async () => {
     try { await api(`/api/tasks/${rec.id}/run-again`, { method: 'POST', body: '{}' }); toast('New run started'); closeTask(); refreshTasks(); }
     catch (e) { toast(e.message, true); }
@@ -9452,6 +9874,8 @@ function wireOrgEditor(rootEl, rec, opts) {
   const afterChange = opts.afterChange || (() => {});
   box.querySelector('.org-priority')?.addEventListener('change', async (e) => {
     const priority = Number(e.target.value);
+    // `local`: a template's form — kept in `rec`, saved with the form.
+    if (opts.local) { rec.params = { ...rec.params, priority }; e.target.classList.toggle('unset', !priority); afterChange(); return; }
     try {
       const id = await ensureId(); if (!id) return;
       rec.id = id;
@@ -9467,6 +9891,7 @@ function wireOrgEditor(rootEl, rec, opts) {
     }
   });
   const setTags = async (ids) => {
+    if (opts.local) { rec.tags = ids; afterChange(); return; }
     const id = await ensureId(); if (!id) return;
     rec.id = id;
     const r = await api(`/api/tasks/${id}/tags`, { method: 'PUT', body: JSON.stringify({ tagIds: ids }) });
@@ -11385,6 +11810,7 @@ function conversationPane(v, t) {
         <button class="btn tool" id="fork-task-agent" data-tool="Fork" data-role="${esc(t.role)}" title="Create a new task from this agent’s conversation">${ICON.fork}Fork</button>
         ${S.meta?.hosted ? `<button type="button" class="btn tool" id="local-checkout" data-tool="Work locally" title="Check out this task on your computer">${ICON.laptop}Work locally</button>` : ''}
         ${copy}
+        <button class="btn tool" id="save-task-template" data-tool="Template" title="Save this task’s form as a template, to start new tasks from">${ICON.template}Template</button>
         <span class="tool-sep" aria-hidden="true"></span>
         ${conversationFullscreenButton()}
       </div>
@@ -12018,6 +12444,7 @@ function wireCheckinSidebar(v) {
   $('#main').querySelectorAll('.escalate-request').forEach((el) => el.addEventListener('click', () => openEscalateDialog(v)));
   $('#conversation-fullscreen')?.addEventListener('click', () => setConversationFullscreen(!S.conversationFullscreen));
   $('#share-task-conversation')?.addEventListener('click', event => openConversationShare(v, event.currentTarget.dataset.role));
+  $('#save-task-template')?.addEventListener('click', () => saveTaskAsTemplate(v.taskId));
   $('#fork-task-agent')?.addEventListener('click', async (event) => {
     const resumeFrom = { taskId: v.taskId, role: event.currentTarget.dataset.role };
     const task = await loadTaskRecord(v.taskId);
@@ -15304,7 +15731,7 @@ function settingsForms(scope, projectId) {
       </details>`;
     })
     .join('');
-  return common + explanationSettingsCard(scope) + unique;
+  return templatesCardHtml(scope, projectId) + common + explanationSettingsCard(scope) + unique;
 }
 
 // The default Agent's Authorization row in Task defaults: the authorization a
@@ -16589,25 +17016,7 @@ function eventSourceLabel(source, hooks) {
   return esc(source);
 }
 
-const AUTOMATION_NEEDS = { github: ['Needs GitHub', 'Connect a GitHub repository to this project first'], chat: ['Needs a chat bot', 'Connect a chat bot below first'] };
-
-// Ready-made repeatable tasks: adding one creates an ordinary task you can edit.
-function automationsHtml(automations) {
-  const row = (a) => {
-    const need = a.missing?.length && !a.installed.length ? AUTOMATION_NEEDS[a.missing[0]] : null;
-    const action = a.installed.length
-      ? `<a class="btn sm ghost" data-pe-task="${esc(a.installed[0])}" data-spa href="${esc(taskUrl(a.installed[0]))}">Open</a>`
-      : `<button class="btn sm" data-auto-install="${esc(a.id)}"${need ? ` disabled title="${esc(need[1])}"` : ''}>Add</button>`;
-    return `<div class="setting-row" data-automation="${esc(a.id)}">
-    <span class="setting-label">${esc(a.name)} ${policyTip(a.summary || '')}</span>
-    <span class="setting-value setting-muted">${a.installed.length ? 'On' : need ? esc(need[0]) : ''}</span>
-    <span class="setting-actions">${action}${a.builtIn ? '' : `<button class="btn sm ghost" data-auto-delete title="Remove from the gallery">✕</button>`}</span></div>`;
-  };
-  return `<div class="section-h">Automations ${policyTip('Ready-made tasks that start themselves. Adding one creates a repeatable task you can change like any other. Save your own from a repeatable task’s page.')}</div>
-    <div class="setting-rows">${automations.map(row).join('')}</div>`;
-}
-
-function projectEventsHtml(projectId, list, events, automations = []) {
+function projectEventsHtml(projectId, list, events) {
   const hooks = list.webhooks || [];
   const health = (h) => h.lastError && (!h.lastDeliveryAt || h.lastError.at > h.lastDeliveryAt)
     ? `<span class="warn" title="${esc(h.lastError.message)}">Refused one ${fmtAgo(h.lastError.at)}</span>`
@@ -16621,7 +17030,7 @@ function projectEventsHtml(projectId, list, events, automations = []) {
     <span class="setting-value">${eventSourceLabel(e.source, hooks)}${e.subject ? ` · ${/^https?:/.test(e.subject) ? `<a href="${esc(e.subject)}" target="_blank" rel="noopener">${esc(e.subject.replace(/^https?:\/\/(www\.)?/, '').slice(0, 60))}</a>` : esc(e.subject.slice(0, 60))}` : ''}<span class="setting-sep">·</span>${eventOutcome(e)}</span>
     <span class="setting-actions setting-muted">${fmtAgo(e.receivedAt)}</span></summary>
     <pre class="pe-payload">${esc(JSON.stringify(e.payload, null, 2))}</pre></details>`;
-  return `${automationsHtml(automations)}<div class="section-h section-h-action"><span>Sources</span><span class="pe-add">
+  return `<div class="section-h section-h-action"><span>Sources</span><span class="pe-add">
       <button class="btn sm ghost" data-pe-new="webhook">＋ Webhook</button><button class="btn sm ghost" data-pe-new="chat">＋ Chat bot</button></span></div>
     <div id="pe-form"></div>
     <div class="setting-rows">${hooks.map(sourceRow).join('')}
@@ -16657,22 +17066,11 @@ async function hydrateProjectEvents(proj) {
   if (!box) return;
   const base = `/api/projects/${encodeURIComponent(proj.id)}`;
   const load = async () => {
-    let list, events, automations;
+    let list, events;
     try {
-      [list, events, { automations }] = await Promise.all([api(`${base}/webhooks`), api(`${base}/events?limit=25`), api(`${base}/automations`)]);
+      [list, events] = await Promise.all([api(`${base}/webhooks`), api(`${base}/events?limit=25`)]);
     } catch (e) { return paneError(box, e, load); }
-    box.innerHTML = projectEventsHtml(proj.id, list, events, automations);
-    box.querySelectorAll('[data-auto-install]').forEach((b) => b.addEventListener('click', async () => {
-      b.disabled = true;
-      try { await api(`${base}/automations/${encodeURIComponent(b.dataset.autoInstall)}`, { method: 'POST', body: '{}' }); toast('Added'); refreshTasks(); load(); }
-      catch (e) { toast(e.message, true); b.disabled = false; }
-    }));
-    box.querySelectorAll('[data-auto-delete]').forEach((b) => b.addEventListener('click', async () => {
-      const row = b.closest('[data-automation]');
-      if (!confirm(`Remove “${row.querySelector('.setting-label').textContent.trim()}” from the gallery? Tasks already made from it stay.`)) return;
-      try { await api(`/api/organizations/${encodeURIComponent(proj.organizationId || 'org_personal')}/automations/${encodeURIComponent(row.dataset.automation)}`, { method: 'DELETE' }); load(); }
-      catch (e) { toast(e.message, true); }
-    }));
+    box.innerHTML = projectEventsHtml(proj.id, list, events);
     const form = $('#pe-form');
     const copy = async (value) => { await copyToClipboard(value); toast('Copied'); };
     box.querySelectorAll('[data-hook-copy]').forEach((b) => b.addEventListener('click', () => copy(b.dataset.hookCopy)));
@@ -16704,9 +17102,11 @@ async function hydrateProjectEvents(proj) {
         button.disabled = true;
         try {
           const created = await api(`${base}/webhooks`, { method: 'POST', body: JSON.stringify({ name: `${CHAT_PLATFORM_LABELS[kind]} bot`, kind, credentials }) });
-          // The gallery's chat automation; a project that already has it keeps it.
-          if ($('#pe-starts')?.checked && !automations.find((a) => a.id === 'chat-requests')?.installed.length)
-            await api(`${base}/automations/chat-requests`, { method: 'POST', body: '{}' });
+          // The task store's chat automation; a project that already has it keeps it.
+          if ($('#pe-starts')?.checked && !(await api(`${base}/task-store`)).tasks.find((t) => t.id === 'chat-requests')?.installed.length) {
+            await api(`${base}/task-store/chat-requests`, { method: 'POST', body: '{}' });
+            delete S.taskStore?.[proj.id];
+          }
           if (created.verifyToken) { form.innerHTML = revealHtml([['Callback URL', created.url], ['Verify token', created.verifyToken]]); wireForm(); }
           else { toast(`${CHAT_PLATFORM_LABELS[kind]} bot connected`); load(); }
         } catch (err) { toast(err.message, true); button.disabled = false; }
@@ -17496,6 +17896,7 @@ function wireSettingsView(proj) {
   hydrateProjectEnvironment(proj);
   hydrateSettingsForms('project', proj.id);
   hydrateResourceDefaults('project', proj.id, proj.organizationId);
+  hydrateTemplatesCard($('[data-templates-card="project"]'));
   hydrateExplanationSettings('project', proj.id, proj.organizationId);
   renderCredentialEditor($('#cred-editor-project'), 'project', { projectId: proj.id });
   hydrateProfiles('project', proj.id);
@@ -20214,6 +20615,7 @@ async function hydrateAccounts(organizationId = S.organizationId) {
 function wireGlobalSettings(organizationId) {
   hydrateSettingsForms('global', undefined, organizationId);
   hydrateResourceDefaults('global', undefined, organizationId);
+  hydrateTemplatesCard($('[data-templates-card="global"]'));
   hydrateExplanationSettings('global', undefined, organizationId || S.organizationId || 'org_personal');
   renderCredentialEditor($('#cred-editor-global'), 'global', { organizationId }); // the organization's accounts + precedence list
   renderAccountStatus(organizationId || S.organizationId);
@@ -22631,7 +23033,9 @@ const HOST_COMMANDS = [
   { id: 'nav.commandPalette', title: 'Command palette', key: 'meta+k', run: () => openPalette() },
   { id: 'help.keyboard', title: 'Keyboard shortcuts', key: '?', run: () => openHelp() },
   // Opens the task form, in the project new tasks go to (Home's choice, else the open project).
-  { id: 'nav.newTask', title: 'New task', key: 'n', run: () => openNewTaskForm() },
+  // `n` picks a template (0, the Task defaults, is Enter); `N` skips the picker.
+  { id: 'nav.newTask', title: 'New task from template', key: 'n', run: () => openTemplatePicker() },
+  { id: 'nav.newTaskDefault', title: 'New task', key: 'N', run: () => openNewTaskForm() },
   { id: 'nav.search', title: 'Search tasks', key: '/', run: () => { if (!isTaskListTab()) switchTab('tasks'); setTimeout(() => $('#task-search')?.focus(), 0); } },
   { id: 'nav.home', title: 'Go home', key: 'g H', ...navCommand(() => homeRoute(currentOrg(), DEFAULT_LIST_QUERY)) },
   { id: 'nav.tasks', title: 'Go to tasks', key: 'g t', ...navCommand(() => tabRoute('tasks')) },
@@ -22663,6 +23067,7 @@ function allCommands() {
   // The list's views (`v 1`…`v 9`) and the page's toolbar buttons (`. 1`…`. 9`).
   viewCommands().forEach(add);
   toolbarCommands().forEach(add);
+  templateCommands().forEach(add);
   // Interaction grammar (host-owned, not server-declared): a list cursor on the
   // tasks/queue views; with a task page open the same keys walk between tasks. When
   // focus sits in the projects rail (g p), the same keys walk the rail instead.
@@ -22947,7 +23352,7 @@ function viewCommands() {
 }
 
 // -- toolbar: `. 1`…`. 9` press the page's tool buttons -----------------------
-// A task's Share, Fork, Work locally, full screen; a project's Work locally.
+// A task's Share, Fork, Work locally, Template, full screen; a project's Work locally.
 // Numbered in the order they show, which is the order their hints appear in.
 function toolbarButtons() {
   return [...document.querySelectorAll('[data-tool]')].filter((b) => !b.disabled && b.getClientRects().length);
@@ -23173,7 +23578,7 @@ function openPalette() {
       if (c.palette === false || !c.available || c.id === 'nav.commandPalette') continue; // not itself
       const score = fuzzyScore(q, c.title);
       if (score < 0) continue;
-      items.push({ group: c.group, title: c.title, kbd: c.keybinding, sub: c.workflow, danger: c.danger, score, run: c.run, href: c.href?.() });
+      items.push({ group: c.group, title: c.title, kbd: c.keybinding, sub: c.sub || c.workflow, danger: c.danger, score, run: c.run, href: c.href?.() });
     }
     items.sort((a, b) => (GROUP_ORDER[a.group] ?? 9) - (GROUP_ORDER[b.group] ?? 9) || b.score - a.score);
     items = items.slice(0, 14);
@@ -23204,13 +23609,16 @@ function openPalette() {
   $('#pal-scrim').addEventListener('click', (e) => { if (e.target.id === 'pal-scrim') close(); });
   build();
   input.focus();
+  // Templates are offered once loaded; the first ⌘K after boot loads them.
+  const target = newTaskTarget();
+  if (target && !loadedTemplates(target)) projectTemplates(target).then(() => { if (root.isConnected) build(); });
 }
 
 // -- "?" help: the same registry, grouped — includes every workflow's commands -
 // Rows come from the registry; the families of numbered keys (views, toolbar,
 // action buttons) and the keys that are not commands (⌘↵, Esc, the task-page
 // grammar documented before a task is open) are listed once each.
-const HELP_GENERAL = ['nav.commandPalette', 'help.keyboard', 'nav.newTask', 'nav.search'];
+const HELP_GENERAL = ['nav.commandPalette', 'help.keyboard', 'nav.newTask', 'nav.newTaskDefault', 'nav.search'];
 function openHelp() {
   const root = createTransientOverlay();
   const cmds = allCommands().filter((c) => c.keybinding && c.help !== false);
@@ -23226,7 +23634,7 @@ function openHelp() {
     ['List', rows(group('List'))],
     ['On a task page', rows(group('Task'))
       + row('1–9', 'Action buttons')
-      + row('. 1–9', 'Share, Fork, Work locally, Full screen')
+      + row('. 1–9', 'Share, Fork, Work locally, Template, Full screen')
       + row('[ / ]', 'Chat / Parameters')
       + row('{ / }', 'Previous / next attempt')
       + row('a n', 'New attempt')

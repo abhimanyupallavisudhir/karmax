@@ -44,6 +44,35 @@ describe('project transfer', () => {
     expect((await store.auditSince()).filter(r => r.scopeKey === 'organization:' + source.id).some(r => r.action === 'project.transferred')).toBe(true);
   });
 
+  it('takes the project\'s task templates along, without what names the organization it left', async () => {
+    const { store, source, destination, project, transfers } = (await fixture());
+    const own = (await store.createTaskTemplate({ organizationId: source.id, projectId: project.id, name: 'Release notes', workflow: 'software-dev',
+      params: { prompt: 'Write them', computer: { cpu: 4 }, paymentPolicy: { cardIds: ['card_1'] } }, notes: 'weekly', tags: ['docs'], priority: 2,
+      authorization: { level: 'role_source', scope: 'projects' }, credentialGrants: ['use-credential:item:vi_1'], credentialPolicies: { vi_1: {} } }));
+    const organizations = (await store.createTaskTemplate({ organizationId: source.id, name: 'Source-wide', workflow: 'software-dev', params: {} }));
+    const preview = (await transfers.preview(project.id, destination.id));
+    await transfers.move(project.id, destination.id, preview.id);
+    expect((await store.listTaskTemplates(destination.id, project.id)).map((t) => t.name)).toEqual(['Release notes']);
+    const moved = (await store.getTaskTemplate(own.id))!;
+    expect(moved).toMatchObject({ organizationId: destination.id, projectId: project.id, params: { prompt: 'Write them' }, notes: 'weekly', tags: ['docs'], priority: 2 });
+    expect(moved.params.computer).toBeUndefined();
+    expect(moved.params.paymentPolicy).toBeUndefined();
+    expect([moved.authorization, moved.credentialGrants, moved.credentialPolicies]).toEqual([undefined, undefined, undefined]);
+    expect((await store.getTaskTemplate(organizations.id))?.organizationId).toBe(source.id);
+  });
+
+  // Branch policy travels with the project as it is now — not as an old copy in
+  // its config, which Task defaults stopped updating.
+  it('keeps the project\'s current branch policy, not a stale config copy', async () => {
+    const { store, destination, project, transfers } = (await fixture());
+    (await store.updateProjectConfig(project.id, { defaultBase: 'stale', remote: 'push', multiPr: false }));
+    (await store.setSettings(project.id, '__common__', { base: 'develop', landingAuthority: 'external', otherAttempts: 'cancel' }));
+    const preview = (await transfers.preview(project.id, destination.id));
+    await transfers.move(project.id, destination.id, preview.id);
+    expect(JSON.parse(JSON.stringify((await store.getProject(project.id))?.config))).toEqual({ defaultBase: 'develop', landingAuthority: 'external' });
+    expect((await store.getSettings(project.id, '__common__'))).toEqual({ base: 'develop', landingAuthority: 'external' });
+  });
+
   it('rejects a stale preview without changing ownership or access', async () => {
     const { store, destination, project, transfers } = (await fixture());
     const preview = (await transfers.preview(project.id, destination.id));

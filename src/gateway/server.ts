@@ -46,7 +46,7 @@ import { participantAuthorization } from '../platform/agent-authority.js';
 import { platformRequestPathError } from '../platform/platform-request.js';
 import { ContributionRegistry } from '../contrib/registry.js';
 import { Overlays } from '../store/overlays.js';
-import { activationTaskPrompt, manifest } from '../contrib/manifests.js';
+import { manifest } from '../contrib/manifests.js';
 import { machineShape } from '../domain/computer.js';
 import { projectSettingsFor, globalSettingsFor, settingsToProjectConfig, resolveParams, effectiveRepos } from '../platform/params.js';
 import { defaultProvider } from '../agent/adapters.js';
@@ -199,8 +199,6 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/organizations\/[^/]+\/conversation-sharing$/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/projects\/[^/]+\/conversation-sharing$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/tasks\/[^/]+\/conversation-share$/.test(p)) return 'task:conversation:share';
-  // Automations an organization saves (src/domain/automations.ts) are shared knowledge, like its wiki.
-  if (/^\/api\/organizations\/[^/]+\/automations(?:\/[^/]+)?$/.test(p)) return 'organization:wiki:write';
   if (p === MCP_CLIENT_METADATA_PATH && read) return 'none';
   if (p === '/api/meta' || p === '/api/session' || p.startsWith('/api/health/')) return 'none';
   const appGrantRoute = appGrantRouteCapability(p);
@@ -216,7 +214,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p.startsWith('/api/processes')) return read ? 'process:read' : 'process:kill';
   if (p === '/api/users/erasure-cases' || /^\/api\/users\/[^/]+\/erasure(?:\/export)?$/.test(p)) return 'user:write';
   if (p.startsWith('/api/users')) return read ? 'user:read' : 'user:write';
-  if (p === '/api/user/export' || p === '/api/user/default-organization' || p === '/api/user/paid-subscriptions'
+  if (p === '/api/user/export' || p === '/api/user/default-organization' || p === '/api/user/preferences' || p === '/api/user/paid-subscriptions'
     || p === '/api/user/onboarding' || p === '/api/user/onboarding/reset' || p === '/api/user/account-deletion-request') return 'none';
   // A signed-in person always owns their own Git identity. It is not an
   // organization credential grant and must remain editable after they join a
@@ -231,6 +229,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/organizations\/[^/]+\/search$/.test(p) && read) return 'none';
   // The organization home's saved views are task-list queries, like a project's.
   if (/^\/api\/organizations\/[^/]+\/views$/.test(p)) return read ? 'task:read' : 'task:edit';
+  // Templates are saved task forms: whoever may create tasks may save one.
+  if (/^\/api\/organizations\/[^/]+\/templates$/.test(p)) return read ? 'task:read' : 'task:create';
   if (/^\/api\/organizations\/[^/]+\/projects/.test(p)) return read ? 'project:read' : 'project:create';
   if (/^\/api\/organizations\/[^/]+\/runner-pools/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/organizations\/[^/]+\/world-providers/.test(p)) return read ? 'organization:read' : 'organization:edit';
@@ -379,12 +379,15 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p === '/api/events' && !read) return 'task:create';
   if (/^\/api\/project-events\/[^/]+$/.test(p)) return 'task:event:read';
   if (/^\/api\/tasks\/[^/]+\/follows(?:\/[^/]+)?$/.test(p)) return read ? 'task:event:read' : 'task:conversation:message';
-  if (/^\/api\/projects\/[^/]+\/automations(?:\/[^/]+)?$/.test(p)) return read ? 'task:read' : 'task:create';
+  if (/^\/api\/projects\/[^/]+\/(?:task-store|automations)(?:\/[^/]+)?$/.test(p)) return read ? 'task:read' : 'task:create';
   if (/^\/api\/projects\/[^/]+\/webhooks$/.test(p)) return read ? 'project:settings:read' : 'project:settings:write';
   if (/^\/api\/webhooks\/[^/]+(?:\/rotate)?$/.test(p)) return 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/search$/.test(p)) return 'task:read';
   if (/^\/api\/projects\/[^/]+\/(tags|views)$/.test(p)) return read ? 'task:read' : 'task:edit';
   if (/^\/api\/(tags|views)\//.test(p)) return read ? 'task:read' : 'task:edit';
+  if (/^\/api\/projects\/[^/]+\/templates$/.test(p) || /^\/api\/templates\/[^/]+$/.test(p)) return read ? 'task:read' : 'task:create';
+  // Reading the task is what the gateway checks; saving where it is asked to, the API.
+  if (/^\/api\/tasks\/[^/]+\/template$/.test(p)) return 'task:read';
   if (/^\/api\/projects\/[^/]+\/workflow-pins$/.test(p)) return read ? 'workflow:read' : 'workflow:edit';
   if (/^\/api\/projects\/[^/]+\/propose-workflow-edit$/.test(p)) return 'workflow:edit';
   if (/\/(events|timing)$/.test(p) || p === '/api/activity') return 'task:event:read';
@@ -1797,6 +1800,7 @@ export class Gateway {
           const gitOnboarding = (await this.deps.store.kvGet(onboardingKey)) === 'pending';
           if (gitOnboarding) (await this.deps.store.kvSet(onboardingKey, 'seen'));
           return this.json(res, 200, { authRequired: true, authenticated: true, user: current.user, gitOnboarding,
+          preferences: (await this.deps.store.userPreferences(current.user.id)),
           emailDelivery: (await this.deps.identity.canSendEmail?.()) ?? false,
           sso: ssoSession(this.deps.identity),
           google: this.deps.identity.googleEnabled,
@@ -1827,7 +1831,7 @@ export class Gateway {
           this.passwordlessSession = undefined; throw error;
         }));
         res.setHeader('set-cookie', this.sessionCookie(req, sid));
-        return this.json(res, 200, { authRequired: false, token: sid, user: 'me' });
+        return this.json(res, 200, { authRequired: false, token: sid, user: 'me', preferences: (await this.deps.store.userPreferences('me')) });
       }
       return this.json(res, 200, { authRequired: true });
     }
@@ -2508,6 +2512,17 @@ export class Gateway {
         } catch (error) {
           return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) });
         }
+      }
+      // A person's console preferences, the same on every device they sign in on.
+      if (p === '/api/user/preferences' && (method === 'GET' || method === 'PATCH')) {
+        const subject = requireHumanSubject(callerIdentity);
+        if (method === 'GET') return this.json(res, 200, (await store.userPreferences(subject.userId)));
+        const b = await this.body(req);
+        const keys = (value: unknown) => value === undefined ? [] : Array.isArray(value) && value.length <= 50
+          && value.every((key) => typeof key === 'string' && key.length > 0 && key.length <= 200) ? value as string[] : undefined;
+        const dismiss = keys(b.dismiss), undismiss = keys(b.undismiss);
+        if (!dismiss || !undismiss) return this.json(res, 400, { error: 'dismiss and undismiss are lists of up to 50 keys (strings of up to 200 characters)' });
+        return this.json(res, 200, (await store.updateUserPreferences(subject.userId, { dismiss, undismiss })));
       }
       if (p === '/api/user/onboarding' && (method === 'GET' || method === 'PUT')) {
         const subject = requireHumanSubject(callerIdentity);
@@ -3413,7 +3428,6 @@ export class Gateway {
           if (callerIdentity.humanSubject) (await store.setProjectMembership(project.id,
             { kind: 'user', userId: callerIdentity.humanSubject.userId }, 'owner'));
           await this.ensureProjectWiki(project, callerIdentity.humanSubject?.userId);
-          await this.spawnProjectPrepTask(token, project.id);
           return this.json(res, 200, project);
         }
       }
@@ -4092,7 +4106,6 @@ export class Gateway {
           (await store.setProjectMembership(project.id,
             { kind: 'user', userId: callerIdentity.humanSubject.userId }, 'owner'));
         await this.ensureProjectWiki(project, callerIdentity.humanSubject?.userId);
-        await this.spawnProjectPrepTask(token, project.id);
         return this.json(res, 200, project);
       }
       const projectTransfer = p.match(/^\/api\/projects\/([^/]+)\/transfer$/);
@@ -5158,21 +5171,14 @@ export class Gateway {
         const result = await api.emitProjectEvent(token, undefined, { type: b.type, key: b.key, subject: b.subject, occurredAt: b.occurredAt, payload: b.payload });
         return this.json(res, result.duplicate ? 200 : 201, result);
       }
-      const automationsMatch = p.match(/^\/api\/projects\/([^/]+)\/automations(?:\/([^/]+))?$/);
-      if (automationsMatch) {
-        if (!automationsMatch[2] && method === 'GET') return this.json(res, 200, { automations: await api.listAutomations(token, automationsMatch[1]!) });
-        if (automationsMatch[2] && method === 'POST') return this.json(res, 201, await api.installAutomation(token, automationsMatch[1]!, automationsMatch[2]));
-      }
-      const savedAutomationsMatch = p.match(/^\/api\/organizations\/([^/]+)\/automations(?:\/([^/]+))?$/);
-      if (savedAutomationsMatch) {
-        if (!savedAutomationsMatch[2] && method === 'POST') {
-          const b = await this.body(req);
-          return this.json(res, 201, await api.saveAutomation(token, savedAutomationsMatch[1]!, { taskId: b.taskId, name: b.name, summary: b.summary }));
+      // The task store (src/domain/task-store.ts); `automations` is its former name.
+      const storeMatch = p.match(/^\/api\/projects\/([^/]+)\/(?:task-store|automations)(?:\/([^/]+))?$/);
+      if (storeMatch) {
+        if (!storeMatch[2] && method === 'GET') {
+          const tasks = await api.listTaskStore(token, storeMatch[1]!);
+          return this.json(res, 200, p.endsWith('/automations') ? { automations: tasks } : { tasks });
         }
-        if (savedAutomationsMatch[2] && method === 'DELETE') {
-          await api.deleteAutomation(token, savedAutomationsMatch[1]!, savedAutomationsMatch[2]);
-          return this.json(res, 200, { ok: true });
-        }
+        if (storeMatch[2] && method === 'POST') return this.json(res, 201, await api.runStoreTask(token, storeMatch[1]!, storeMatch[2]));
       }
       const followsMatch = p.match(/^\/api\/tasks\/([^/]+)\/follows(?:\/([^/]+))?$/);
       if (followsMatch) {
@@ -5273,6 +5279,33 @@ export class Gateway {
           return this.json(res, 200, { ok: true });
         }
       }
+      // Task templates — saved task forms, a project's and its organization's.
+      const projectTemplatesMatch = p.match(/^\/api\/projects\/([^/]+)\/templates$/);
+      if (projectTemplatesMatch) {
+        const projectId = decodeURIComponent(projectTemplatesMatch[1]!);
+        if (method === 'GET') return this.json(res, 200, await api.listProjectTemplates(token, projectId));
+        if (method === 'POST') return this.json(res, 200, await api.createTemplate(token, { ...(await this.body(req)), organizationId: undefined, projectId }));
+      }
+      const organizationTemplatesMatch = p.match(/^\/api\/organizations\/([^/]+)\/templates$/);
+      if (organizationTemplatesMatch) {
+        const organizationId = decodeURIComponent(organizationTemplatesMatch[1]!);
+        if (method === 'GET') return this.json(res, 200, await api.listOrganizationTemplates(token, organizationId));
+        if (method === 'POST') return this.json(res, 200, await api.createTemplate(token, { ...(await this.body(req)), projectId: undefined, organizationId }));
+      }
+      const templateMatch = p.match(/^\/api\/templates\/([^/]+)$/);
+      if (templateMatch) {
+        const id = decodeURIComponent(templateMatch[1]!);
+        if (method === 'PATCH') return this.json(res, 200, await api.updateTemplate(token, id, await this.body(req)));
+        if (method === 'DELETE') {
+          await api.deleteTemplate(token, id);
+          return this.json(res, 200, { ok: true });
+        }
+      }
+      const taskTemplateMatch = p.match(/^\/api\/tasks\/([^/]+)\/template$/);
+      if (taskTemplateMatch && method === 'POST') {
+        const b = await this.body(req);
+        return this.json(res, 200, await api.createTemplateFromTask(token, decodeURIComponent(taskTemplateMatch[1]!), { name: b.name, scope: b.scope }));
+      }
       const viewReorderMatch = p.match(/^\/api\/views\/([^/]+)\/reorder$/);
       if (viewReorderMatch && method === 'POST') {
         const b = await this.body(req);
@@ -5369,12 +5402,7 @@ export class Gateway {
         return void res.end(html);
       }
       if (viewMatch && method === 'DELETE') {
-        // Hard-delete is for drafts only (they never started a workflow). Running
-        // tasks must be cancelled, not deleted out from under their workflow.
-        const t = (await store.getTask(viewMatch[1]!));
-        if (!t) return this.json(res, 404, { error: 'no such task' });
-        if (!t.params?.draft) return this.json(res, 400, { error: 'only drafts can be deleted; cancel a running task instead' });
-        (await store.deleteTask(viewMatch[1]!));
+        (await api.deleteTask(token, viewMatch[1]!));
         return this.json(res, 200, { ok: true });
       }
       const principalMatch = p.match(/^\/api\/tasks\/([^/]+)\/principal$/);
@@ -8551,13 +8579,21 @@ export class Gateway {
         const repoDefaults = repos.length > 1
           ? await Promise.all(repos.map((source) => repositoryBranchDefaults(store, project!, source).catch(() => undefined)))
           : [];
-        const enrich = async (vals: Record<string, unknown>, lower: Record<string, unknown>) => {
+        // A scope inherits from the layers below it only — never from its own
+        // value, or a saved branch would match what it "inherits" and the next
+        // save would drop it. Unset below, a task uses the repository's branch;
+        // with no repository to name (organization settings), say nothing.
+        const unset = (value: unknown) => value === undefined || value === null || value === '';
+        const enrich = async (vals: Record<string, unknown>, below: Record<string, unknown>) => {
           const out = (await this.enrichAgentDefaults(m, vals, projectId, organizationId ?? undefined));
-          const detectBase = lower.base === undefined && globalVals.base === undefined && projectVals.base === undefined;
-          const detectTarget = lower.target === undefined && globalVals.target === undefined && projectVals.target === undefined;
+          const detectBase = unset(below.base);
+          const detectTarget = unset(below.target);
           if (branches) {
             if (detectBase) out.base = branches.base;
             if (detectTarget) out.target = branches.target;
+          } else if (!project) {
+            if (detectBase) delete out.base;
+            if (detectTarget) delete out.target;
           }
           if (repos.length > 1) out._repositoryBranches = repos.map((source, index) => ({ source,
             base: (detectBase && repoDefaults[index]?.base) || out.base,
@@ -8570,9 +8606,9 @@ export class Gateway {
           return hasComputer ? { ...rest, computer: value } : rest;
         };
         return this.json(res, 200, {
-          task: { own: {}, inherited: withComputer((await enrich(resolveParams(m, { project: projectVals, global: globalVals }), {})), computer.task.inherited) },
-          project: { own: withComputer(projectVals, computer.project.own), inherited: withComputer((await enrich(resolveParams(m, { global: globalVals }), projectVals)), computer.project.inherited) },
-          global: { own: withComputer(globalVals, computer.global.own), inherited: withComputer((await enrich(resolveParams(m, {}), { ...projectVals, ...globalVals })), computer.global.inherited) },
+          task: { own: {}, inherited: withComputer((await enrich(resolveParams(m, { project: projectVals, global: globalVals }), { ...globalVals, ...projectVals })), computer.task.inherited) },
+          project: { own: withComputer(projectVals, computer.project.own), inherited: withComputer((await enrich(resolveParams(m, { global: globalVals }), globalVals)), computer.project.inherited) },
+          global: { own: withComputer(globalVals, computer.global.own), inherited: withComputer((await enrich(resolveParams(m, {}), {})), computer.global.inherited) },
         });
       }
 
@@ -8695,17 +8731,6 @@ export class Gateway {
     }
   }
 
-  /**
-   * Seed a brand-new project with its preparation task (SPEC §4.6). A new project's
-   * tasks default to the `software-dev` workflow, so we seed that workflow's
-   * `onActivate` prep task — "make this project karmax-ready" — as the first task on
-   * the list. The manifest supplies hosted-specific copy because isolated cloud
-   * worlds do not need the local-worktree resource-collision scan. It's created as
-   * a **draft** so project creation never immediately spends an agent turn. The
-   * user may queue it before attaching a repository; software-dev treats that as
-   * its supported state-only, zero-repo case.
-   * Best-effort: a failure here must never fail project creation.
-   */
   /** A project's requested repository sources. Hosted projects may only use
    * repositories the organization's GitHub connection reaches. */
   private async requestedRepositorySources(value: unknown, organizationId: string): Promise<string[]> {
@@ -8716,22 +8741,6 @@ export class Gateway {
       if (unknown.length) throw new Error('Hosted projects must select repositories available through the organization GitHub connection');
     }
     return repos;
-  }
-
-  private async spawnProjectPrepTask(token: string, projectId: string): Promise<void> {
-    const prep = manifest('software-dev')?.onActivate?.spawnTask;
-    if (!prep) return;
-    try {
-      await this.deps.api.createTask(token, {
-        projectId,
-        title: prep.title,
-        prompt: activationTaskPrompt(prep, this.deps.hosted === true),
-        workflow: prep.workflow,
-        draft: true,
-      });
-    } catch (error) {
-      console.warn(`[karmax] could not spawn prep task for ${projectId}:`, error instanceof Error ? error.message : error);
-    }
   }
 
   /** Initialize the local canonical wiki immediately. When GitHub is fully
@@ -10089,6 +10098,7 @@ export class Gateway {
     // view, because the check had no project to compare its scope against.
     const tagId = pathname.match(/^\/api\/tags\/([^/]+)/)?.[1];
     const viewId = pathname.match(/^\/api\/views\/([^/]+)/)?.[1];
+    const templateId = pathname.match(/^\/api\/templates\/([^/]+)/)?.[1];
     const pathProject = pathname.match(/^\/api\/projects\/([^/]+)/)?.[1]
       ?? pathname.match(/^\/api\/defaults\/([^/]+)/)?.[1]
       ?? pathname.match(/^\/api\/settings\/project\/([^/]+)/)?.[1];
@@ -10104,8 +10114,10 @@ export class Gateway {
     // act on another tenant's task by naming a project of its own. Every
     // identifier that names a scope must agree, or the request is refused.
     const viewRecord = viewId ? (await this.deps.store.getView(viewId)) : undefined;
+    const templateRecord = templateId ? (await this.deps.store.getTaskTemplate(decodeURIComponent(templateId))) : undefined;
     const recordProject = (tagId ? (await this.deps.store.getTag(tagId))?.projectId : undefined)
       ?? (viewRecord?.projectId || undefined)
+      ?? (templateRecord?.projectId || undefined)
       ?? (taskId ? await this.deps.store.taskProjectIdAsync(taskId) : undefined);
     const queryProject = url.searchParams.get('projectId') ?? undefined;
     const projects = [recordProject, pathProject, queryProject].filter((value): value is string => Boolean(value));
@@ -10113,7 +10125,7 @@ export class Gateway {
     const resolvedProjectId = projects[0];
     const projectOrganization = resolvedProjectId ? await this.deps.store.projectOrganizationAsync(resolvedProjectId) : undefined;
     const organizations = [pathname.match(/^\/api\/organizations\/([^/]+)/)?.[1], url.searchParams.get('organizationId') ?? undefined,
-      projectOrganization, viewRecord?.organizationId].filter((value): value is string => Boolean(value));
+      projectOrganization, viewRecord?.organizationId, templateRecord?.organizationId].filter((value): value is string => Boolean(value));
     if (new Set(organizations).size > 1) return { conflict: 'organizationId does not match the addressed record' };
     return { projectId: resolvedProjectId, organizationId: organizations[0], ...(taskId ? { taskId } : {}) };
   }

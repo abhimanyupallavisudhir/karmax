@@ -43,7 +43,8 @@ Workspaces (a project or task, assembled as its cloud world is)
 
 Tasks
   task new <title> [--prompt <text>]     Start a task (in the workspace's project, or --project)
-  task list|show|open|logs [-f]|say      Follow and steer tasks
+           [--template <number|name>]    … from a template, as numbered by 'task templates'
+  task list|templates|show|open|logs [-f]|say   Follow and steer tasks; list the templates
   task confirm|cancel|retry [<task>]
   emit <type> [-d <json>|@file|@-]       Record a project event; tasks waiting on it start runs
                                          (--key collapses repeats, --subject links what it is about)
@@ -75,7 +76,7 @@ const OPTIONS = {
   data: { type: 'string', short: 'd', multiple: true }, list: { type: 'boolean' }, yes: { type: 'boolean', short: 'y' }, port: { type: 'string' },
   cwd: { type: 'string' }, 'git-via-tavya': { type: 'boolean' }, secret: { type: 'string', multiple: true },
   skip: { type: 'string', multiple: true }, github: { type: 'string' }, 'dry-run': { type: 'boolean' }, repository: { type: 'string' },
-  key: { type: 'string' }, subject: { type: 'string' },
+  key: { type: 'string' }, subject: { type: 'string' }, template: { type: 'string' },
 } as const;
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {

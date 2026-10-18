@@ -62,8 +62,10 @@ const { fakeConsole, launch } = require('../tests/helpers/fake-console.cjs');
     await page.keyboard.press('Shift+P');
     await page.waitForFunction(() => !!document.activeElement?.closest('#rail'));
     await page.keyboard.press('n');
-    await page.locator('#tf-page').waitFor();
+    await page.locator('#tpl-in').waitFor();
     assert.equal(await dialog.count(), 0, 'bare n in the rail is New task, not New project');
+    await page.keyboard.press('Enter');
+    await page.locator('#tf-page').waitFor();
 
     // A folded sidebar unfolds for p /.
     await open();

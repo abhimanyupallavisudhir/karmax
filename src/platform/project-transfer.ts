@@ -4,6 +4,7 @@ import { Store, deleteRows, slugify } from '../store/db.js';
 import { ProjectEnvironment } from '../store/project-environment.js';
 import type { Project } from '../domain/types.js';
 import { PermissionRequests } from './permission-requests.js';
+import { projectSettingsFor } from './params.js';
 
 export class ProjectTransferError extends Error {
   constructor(message: string, public status = 409) { super(message); }
@@ -135,7 +136,7 @@ export class ProjectTransfers {
       changes: [
         'Project identity, tasks, conversations, wiki, and files are preserved.',
         'Existing project access is replaced by destination organization owners. Add other members after moving.',
-        'The project moves to the destination’s top level. Task defaults and compute settings inherit from the destination.',
+        'The project moves to the destination’s top level. Its branch settings stay; other Task defaults and compute settings inherit from the destination.',
         'Credentials, connections, payment authority, and public conversation links do not carry over.',
         'Completed tasks remain readable history; start new tasks for further work. Drafts need new authorization; unavailable creators are replaced by destination owners for decisions.',
       ] };
@@ -281,7 +282,13 @@ export class ProjectTransfers {
     (await deleteRows(s.db, 'team_memberships', 'teamId', teamIds));
     (await deleteRows(s.db, 'team_aliases', 'teamId', teamIds));
     (await deleteRows(s.db, 'teams', 'id', teamIds));
+    // Branch policy travels as the project has it now (Task defaults), not as
+    // the config copy those stopped updating; everything else inherits.
+    const current = (await projectSettingsFor(async (scope, workflow) => (await s.getSettings(scope, workflow)), plan.project, 'software-dev'));
+    const branchPolicy = Object.fromEntries(['base', 'target', 'repoBranches', 'remote', 'landingAuthority', 'multiPr']
+      .filter((key) => current[key] !== undefined).map((key) => [key, current[key]]));
     (await s.db.prepare('DELETE FROM settings WHERE scopeKey IN (?, ?)').run(id, `quick:${id}`));
+    if (Object.keys(branchPolicy).length) (await s.setSettings(id, '__common__', branchPolicy));
     const profilePrefix = `${id}::`;
     (await s.db.prepare('DELETE FROM profiles WHERE substr(id, 1, length(?))=?').run(profilePrefix, profilePrefix));
     for (const key of [`authz:default:project:${id}`, `credpolicy:project:${id}`, `project-environment-builds:${id}`, `avatars:project:${id}`]) (await s.kvDelete(key));
@@ -289,8 +296,8 @@ export class ProjectTransfers {
     (await s.kvSet(`conversation-sharing:project:${id}`, 'disabled'));
     // Retain only portable code/branch policy. Compute and profile selectors are
     // organization-owned; the preview explicitly describes their reset.
-    const { repos, defaultBase, defaultTarget, remote, landingAuthority, multiPr } = plan.project.config;
-    const config = { repos, defaultBase, defaultTarget, remote, landingAuthority, multiPr };
+    const { base: defaultBase, target: defaultTarget, remote, landingAuthority, multiPr } = branchPolicy;
+    const config = { repos: plan.project.config.repos, defaultBase, defaultTarget, remote, landingAuthority, multiPr };
     const order = Number(((await s.db.prepare('SELECT COALESCE(MAX(ord), -1)+1 n FROM projects WHERE organizationId=?').get(destination)) as any).n);
     (await s.db.prepare('UPDATE projects SET organizationId=?, folder=NULL, ord=?, config=? WHERE id=?')
       .run(destination, order, JSON.stringify(config), id));
@@ -302,6 +309,7 @@ export class ProjectTransfers {
     // Object keys are immutable, project-scoped managed artifacts. Their access
     // follows the project; billing and execution provenance stay in the source.
     (await s.db.prepare('UPDATE promoted_artifacts SET organizationId=? WHERE projectId=?').run(destination, id));
+    (await s.moveProjectTaskTemplates(id, destination));
     for (const org of [plan.project.organizationId!, destination]) (await s.appendAudit({ principalId: this.actor.principal,
       action: 'project.transferred', scopeKey: `organization:${org}`, detail: { projectId: id,
         sourceOrganizationId: plan.project.organizationId, destinationOrganizationId: destination } }));

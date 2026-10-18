@@ -23,6 +23,7 @@ import { watchAuthorityWrites } from './authorization-epoch.js';
 import { setImmediate as yieldTurn } from 'node:timers/promises';
 import { importSqliteDatabase, type SqliteImportResult } from './postgres-migration.js';
 import { passEntryMetadata } from '../autonomy/pass-path.js';
+import { COMMON_SETTINGS_WORKFLOW, SHARED_SETTING_NAMES, isWorkflowSettings, splitSharedSettings } from '../domain/shared-settings.js';
 import {
   Project,
   ProjectConfig,
@@ -38,6 +39,7 @@ import {
   KarmaxEvent,
   Tag,
   SavedView,
+  TaskTemplate,
   TaskQuery,
   Organization,
   OrganizationExecutionPolicy,
@@ -89,7 +91,7 @@ import {
   type OrganizationEntitlements,
 } from '../domain/entitlements.js';
 import { newId } from '../util/id.js';
-import type { AutomationTemplate } from '../domain/automations.js';
+import type { TaskTemplateContent } from '../domain/task-templates.js';
 import { EVENT_RETENTION_MS as PROJECT_EVENT_RETENTION_MS, type EventFollow, type ProjectEvent, type ProjectEventClaim,
   type ProjectEventClaimState } from '../domain/project-events.js';
 import { paymentMerchantMatches } from '../util/payment-merchant.js';
@@ -98,6 +100,9 @@ import { PermissionRequests } from '../platform/permission-requests.js';
 import { withPullRequestStates } from '../integrations/github-pr.js';
 import { lifecycleEventPayload } from '../domain/view-publication.js';
 import { taskForkSourceIds } from '../domain/forks.js';
+
+/** How many dismissals a person's preferences keep (the newest). */
+const MAX_DISMISSED = 500;
 
 // Shared by Store instances in this process, never by another gateway/worker.
 const PROCESS_EVENT_ORIGIN = crypto.randomUUID();
@@ -392,6 +397,7 @@ export class Store {
     (await this.migrateData());
     (await this.migrateConversations());
     (await this.migrateSavedViews());
+    (await this.migrateSharedSettings());
     (await this.paymentTransaction(async () => {
       if ((await this.kvGet('migration:unique-card-names'))) return;
       const rows = (await this.db.prepare(`SELECT c.id, c.label, c.scope, c.scopeId, p.organizationId
@@ -453,6 +459,61 @@ export class Store {
         && Array.isArray(c.values) && c.values.some((v) => String(v).includes('archived')))) continue;
       const next = { ...query, filters: [...filters, { field: 'is', op: 'is', values: ['archived'], negate: true }] };
       (await this.db.prepare('UPDATE saved_views SET query=? WHERE id=? AND query=?').run(JSON.stringify(next), row.id, row.query));
+    }
+    (await this.kvSet(marker, '1'));
+    });
+  }
+
+  /** Two settings-row repairs, once:
+   * - The personal tenant read the installation's old `global` rows only while
+   *   it had none of its own for that workflow, so its first save of one card
+   *   silently dropped the rest (and payments, vault and authorization were
+   *   enforced from different rows than the console showed). Copy each such
+   *   row it lacks, so every reader sees the same values.
+   * - Fields that moved into Task defaults left their old values in workflow
+   *   rows, where they shadowed every later save (SHARED_SETTING_NAMES). Move
+   *   them into each scope's shared row. Per field, software-dev's value wins —
+   *   it is what the Task defaults form showed — then the shared row's, then
+   *   the first other workflow's. */
+  private async migrateSharedSettings(force = false): Promise<void> {
+    return this.db.transaction(async () => {
+    (await this.db.lock('store-migration'));
+    const marker = 'migration:shared-settings-in-common';
+    if (!force && await this.kvGet(marker)) return;
+    const installationOnly = ['agent-queue', 'appearance', 'timing'];
+    (await this.db.prepare(`INSERT INTO settings (scopeKey, workflow, json) SELECT 'organization:org_personal', workflow, json
+      FROM settings WHERE scopeKey='global' AND workflow NOT IN (${installationOnly.map(() => '?').join(', ')})
+      ON CONFLICT(scopeKey, workflow) DO NOTHING`).run(...installationOnly));
+    const rows = (await this.db.prepare('SELECT scopeKey, workflow, json FROM settings ORDER BY scopeKey, workflow').all()) as Array<{ scopeKey: string; workflow: string; json: string }>;
+    const scopes = new Map<string, Array<{ workflow: string; json: string; values: Record<string, unknown> }>>();
+    for (const row of rows) {
+      let values: Record<string, unknown>;
+      try { values = JSON.parse(row.json) as Record<string, unknown>; } catch { continue; }
+      if (!values || typeof values !== 'object' || Array.isArray(values)) continue;
+      const list = scopes.get(row.scopeKey) ?? [];
+      list.push({ workflow: row.workflow, json: row.json, values });
+      scopes.set(row.scopeKey, list);
+    }
+    const update = this.db.prepare('UPDATE settings SET json=? WHERE scopeKey=? AND workflow=? AND json=?');
+    for (const [scopeKey, list] of scopes) {
+      const stale = list.filter((row) => isWorkflowSettings(row.workflow) && Object.keys(row.values).some((key) => SHARED_SETTING_NAMES.has(key)))
+        .sort((a, b) => Number(b.workflow === 'software-dev') - Number(a.workflow === 'software-dev'));
+      if (!stale.length) continue;
+      const common = list.find((row) => row.workflow === COMMON_SETTINGS_WORKFLOW);
+      const next: Record<string, unknown> = { ...(common?.values ?? {}) };
+      for (const key of SHARED_SETTING_NAMES) {
+        const primary = stale[0]!.workflow === 'software-dev' && stale[0]!.values[key] !== undefined ? stale[0]!.values[key] : undefined;
+        if (primary !== undefined) next[key] = primary;
+        else if (next[key] === undefined) {
+          const other = stale.find((row) => row.values[key] !== undefined);
+          if (other) next[key] = other.values[key];
+        }
+      }
+      if (common) (await update.run(JSON.stringify(next), scopeKey, COMMON_SETTINGS_WORKFLOW, common.json));
+      else (await this.db.prepare('INSERT INTO settings (scopeKey, workflow, json) VALUES (?, ?, ?) ON CONFLICT(scopeKey, workflow) DO NOTHING')
+        .run(scopeKey, COMMON_SETTINGS_WORKFLOW, JSON.stringify(next)));
+      for (const row of stale)
+        (await update.run(JSON.stringify(splitSharedSettings(row.workflow, row.values).own), scopeKey, row.workflow, row.json));
     }
     (await this.kvSet(marker, '1'));
     });
@@ -640,8 +701,10 @@ export class Store {
         organizationId TEXT NOT NULL, userId TEXT NOT NULL, role TEXT NOT NULL,
         joinedAt INTEGER NOT NULL, PRIMARY KEY (organizationId, userId)
       );
+      -- A person's preferences, wherever they sign in: their default
+      -- organization, and what they dismissed (JSON array of keys).
       CREATE TABLE IF NOT EXISTS user_preferences (
-        userId TEXT PRIMARY KEY, defaultOrganizationId TEXT
+        userId TEXT PRIMARY KEY, defaultOrganizationId TEXT, dismissed TEXT
       );
       CREATE TABLE IF NOT EXISTS policy_acceptances (
         id TEXT PRIMARY KEY, userId TEXT NOT NULL, email TEXT,
@@ -990,8 +1053,9 @@ export class Store {
         id TEXT PRIMARY KEY, taskId TEXT NOT NULL, projectId TEXT NOT NULL, filter TEXT NOT NULL,
         once INTEGER NOT NULL DEFAULT 0, createdAt INTEGER NOT NULL
       );
-      -- Automations an organization saved (src/domain/automations.ts); the
-      -- built-ins live in code.
+      -- Retired: automations organizations saved before the task store held
+      -- only built-in tasks (2026-10-18). Kept so organization export and
+      -- deletion still cover those rows; nothing reads or writes it otherwise.
       CREATE TABLE IF NOT EXISTS automation_templates (
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, name TEXT NOT NULL, summary TEXT NOT NULL,
         task TEXT NOT NULL, needs TEXT, createdBy TEXT, createdAt INTEGER NOT NULL
@@ -1050,6 +1114,10 @@ export class Store {
       CREATE TABLE IF NOT EXISTS saved_views (
         id TEXT PRIMARY KEY, projectId TEXT NOT NULL, name TEXT NOT NULL,
         query TEXT NOT NULL, icon TEXT, ord INTEGER NOT NULL, createdAt INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS task_templates (
+        id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, projectId TEXT NOT NULL, name TEXT NOT NULL,
+        workflow TEXT NOT NULL, content TEXT NOT NULL, createdBy TEXT, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS authorization_profiles (
         scopeKey TEXT NOT NULL,
@@ -1148,6 +1216,7 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_tags_project ON tags(projectId);
       CREATE INDEX IF NOT EXISTS idx_task_tags_tag ON task_tags(tagId);
       CREATE INDEX IF NOT EXISTS idx_saved_views_project ON saved_views(projectId);
+      CREATE INDEX IF NOT EXISTS idx_task_templates_scope ON task_templates(organizationId, projectId);
       CREATE INDEX IF NOT EXISTS idx_payment_requests_task_status ON payment_spend_requests(taskId, status, createdAt);
       CREATE INDEX IF NOT EXISTS idx_payment_requests_org_status ON payment_spend_requests(organizationId, status, createdAt);
       CREATE INDEX IF NOT EXISTS idx_payment_transactions_org_time ON payment_transactions(organizationId, createdAt DESC);
@@ -1249,6 +1318,8 @@ export class Store {
     if (!eventCols.some(column => column.name === 'origin')) await this.db.exec('ALTER TABLE events ADD COLUMN origin TEXT');
     const providerCols = await this.db.prepare('PRAGMA table_info(world_provider_connections)').all() as { name: string }[];
     if (!providerCols.some(column => column.name === 'limits')) await this.db.exec('ALTER TABLE world_provider_connections ADD COLUMN limits TEXT');
+    const preferenceCols = await this.db.prepare('PRAGMA table_info(user_preferences)').all() as { name: string }[];
+    if (!preferenceCols.some(column => column.name === 'dismissed')) await this.db.exec('ALTER TABLE user_preferences ADD COLUMN dismissed TEXT');
     const repositoryCols = await this.db.prepare('PRAGMA table_info(repositories)').all() as { name: string }[];
     if (!repositoryCols.some(column => column.name === 'upstream')) await this.db.exec('ALTER TABLE repositories ADD COLUMN upstream TEXT');
     const savedViewCols = await this.db.prepare('PRAGMA table_info(saved_views)').all() as { name: string }[];
@@ -2012,7 +2083,7 @@ export class Store {
       (await this.deletePermissionRequestKv(project.organizationId, taskIds));
       (await this.deleteAuthorizationRequestKv(project.organizationId, { kind: 'avatar', ids: avatarIds }));
       (await this.deleteProjectKv([id], taskIds));
-      for (const table of ['project_memberships', 'project_repositories', 'project_wikis', 'task_lists', 'tags', 'saved_views', 'world_checkpoints'] as const)
+      for (const table of ['project_memberships', 'project_repositories', 'project_wikis', 'task_lists', 'tags', 'saved_views', 'task_templates', 'world_checkpoints'] as const)
         (await this.db.prepare(`DELETE FROM ${table} WHERE projectId=?`).run(id));
       (await deleteRows(this.db, 'teams', 'id', teamIds));
       (await deleteRows(this.db, 'tasks', 'id', taskIds));
@@ -2401,6 +2472,26 @@ export class Store {
     });
   }
 
+  /** What a person set for the console, on every device: what they dismissed
+   *  (keys such as `task-store:<projectId>`). */
+  async userPreferences(userId: string): Promise<{ dismissed: string[] }> {
+    const row = (await this.db.prepare('SELECT dismissed FROM user_preferences WHERE userId=?').get(userId)) as { dismissed?: string | null } | undefined;
+    return { dismissed: parseJsonOptional(row?.dismissed ?? undefined) as string[] | undefined ?? [] };
+  }
+
+  /** Dismiss or bring back keys; the newest {@link MAX_DISMISSED} are kept. */
+  async updateUserPreferences(userId: string, change: { dismiss?: string[]; undismiss?: string[] }): Promise<{ dismissed: string[] }> {
+    return this.db.transaction(async () => {
+      (await this.db.lock(`account:${userId}`));
+      const { dismissed } = await this.userPreferences(userId);
+      const removed = new Set([...(change.dismiss ?? []), ...(change.undismiss ?? [])]);
+      const next = [...dismissed.filter((key) => !removed.has(key)), ...new Set(change.dismiss ?? [])].slice(-MAX_DISMISSED);
+      (await this.db.prepare(`INSERT INTO user_preferences (userId, dismissed) VALUES (?, ?)
+        ON CONFLICT(userId) DO UPDATE SET dismissed=excluded.dismissed`).run(userId, JSON.stringify(next)));
+      return { dismissed: next };
+    });
+  }
+
   /** Complete, secret-redacted tenant export. The table-oriented envelope is
    * intentionally stable, apart from declared redactions: future import/migration tools can retain
    * records they do not yet understand without flattening the task model. */
@@ -2459,6 +2550,7 @@ export class Store {
       task_tags: (await rowsFor(this.db, 'task_tags', 'taskId', taskIds)),
       saved_views: [...(await rowsFor(this.db, 'saved_views', 'projectId', projectIds)),
         ...(await selectRows(this.db, 'saved_views', "organizationId=? AND projectId=''", [organizationId]))],
+      task_templates: (await selectRows(this.db, 'task_templates', 'organizationId=?', [organizationId])),
       git_connections: (await selectRows(this.db, 'git_connections', 'organizationId=?', [organizationId])),
       repositories: (await rowsFor(this.db, 'repositories', 'id', repositoryIds)),
       project_repositories: (await rowsFor(this.db, 'project_repositories', 'projectId', projectIds)),
@@ -2641,7 +2733,8 @@ export class Store {
       // Export the stored preference without revalidating it under a member-only
       // scope: an operator may have selected an organization they do not belong to.
       preferences: { defaultOrganizationId: ((await this.db.prepare('SELECT defaultOrganizationId FROM user_preferences WHERE userId=?')
-        .get(userId)) as { defaultOrganizationId: string } | undefined)?.defaultOrganizationId ?? (await this.defaultOrganization(userId))?.id ?? null },
+        .get(userId)) as { defaultOrganizationId: string } | undefined)?.defaultOrganizationId ?? (await this.defaultOrganization(userId))?.id ?? null,
+        ...(await this.userPreferences(userId)) },
       security: {
         secretsIncluded: false,
         omitted: ['password hashes', 'session tokens', 'OAuth tokens and state', 'credential values and handles',
@@ -2773,6 +2866,7 @@ export class Store {
       for (const table of ['project_memberships', 'project_repositories', 'project_wikis', 'task_lists', 'tags', 'saved_views', 'world_checkpoints'] as const)
         (await deleteRows(this.db, table, 'projectId', projectIds));
       (await this.db.prepare("DELETE FROM saved_views WHERE organizationId=? AND projectId=''").run(organizationId));
+      (await this.db.prepare('DELETE FROM task_templates WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM preview_leases WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM executions WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM promoted_artifacts WHERE organizationId=?').run(organizationId));
@@ -2809,7 +2903,7 @@ export class Store {
       (await deleteRows(this.db, 'teams', 'id', teamIds));
       (await deleteRows(this.db, 'tasks', 'id', taskIds));
       (await deleteRows(this.db, 'projects', 'id', projectIds));
-      (await this.db.prepare('DELETE FROM user_preferences WHERE defaultOrganizationId=?').run(organizationId));
+      (await this.db.prepare('UPDATE user_preferences SET defaultOrganizationId=NULL WHERE defaultOrganizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM organizations WHERE id=?').run(organizationId));
       (await this.db.exec('COMMIT'));
     } catch (error) {
@@ -2827,7 +2921,7 @@ export class Store {
 
     const organization = (await this.getOrganization('org_personal'))!;
     (await this.setOrganizationMembership(organization.id, userId, 'owner'));
-    if (!(await this.db.prepare('SELECT 1 FROM user_preferences WHERE userId=?').get(userId)))
+    if (!(await this.db.prepare('SELECT 1 FROM user_preferences WHERE userId=? AND defaultOrganizationId IS NOT NULL').get(userId)))
       (await this.setDefaultOrganization(userId, organization.id));
     if (name && organization.name === 'Personal') {
       const next = (await this.assertOrganizationNameAvailable(name,
@@ -2954,7 +3048,7 @@ export class Store {
       if (owners <= 1) throw new Error('an organization must retain at least one owner');
     }
     (await this.db.prepare('DELETE FROM organization_memberships WHERE organizationId=? AND userId=?').run(organizationId, userId));
-    (await this.db.prepare('DELETE FROM user_preferences WHERE userId=? AND defaultOrganizationId=?').run(userId, organizationId));
+    (await this.db.prepare('UPDATE user_preferences SET defaultOrganizationId=NULL WHERE userId=? AND defaultOrganizationId=?').run(userId, organizationId));
     if (membership) {
       (await this.reconcileHostedUsageCapacity(organizationId));
       this.notifyOrganizationEntitlementsChanged(organizationId);
@@ -5965,6 +6059,68 @@ export class Store {
     });
   }
 
+  // ─── Task templates (a template is a saved task form) ─────────────────────────
+
+  /** An organization's own templates (`projectId` ''), or with `projectId` the
+   *  ones that project offers: the organization's and its own, oldest first. */
+  async listTaskTemplates(organizationId: string, projectId?: string): Promise<TaskTemplate[]> {
+    const rows = (projectId
+      ? await this.db.prepare("SELECT * FROM task_templates WHERE organizationId = ? AND (projectId = '' OR projectId = ?) ORDER BY createdAt, id").all(organizationId, projectId)
+      : await this.db.prepare("SELECT * FROM task_templates WHERE organizationId = ? AND projectId = '' ORDER BY createdAt, id").all(organizationId)) as TaskTemplateRow[];
+    return rows.map(rowToTaskTemplate);
+  }
+
+  async getTaskTemplate(id: string): Promise<TaskTemplate | undefined> {
+    const row = (await this.db.prepare('SELECT * FROM task_templates WHERE id = ?').get(id)) as TaskTemplateRow | undefined;
+    return row ? rowToTaskTemplate(row) : undefined;
+  }
+
+  async createTaskTemplate(input: { organizationId: string; projectId?: string; name: string; createdBy?: string } & TaskTemplateContent): Promise<TaskTemplate> {
+    const { organizationId, projectId = '', name, createdBy, ...content } = input;
+    // Templates are numbered by when they were added: never let two share an instant.
+    const last = (await this.db.prepare("SELECT COALESCE(MAX(createdAt), 0) AS m FROM task_templates WHERE organizationId = ?").get(organizationId)) as { m: number };
+    const now = Math.max(Date.now(), Number(last.m) + 1);
+    const template: TaskTemplate = { id: newId('tmpl'), organizationId, projectId, name, ...content,
+      ...(createdBy ? { createdBy } : {}), createdAt: now, updatedAt: now };
+    (await this.db.prepare('INSERT INTO task_templates (id, organizationId, projectId, name, workflow, content, createdBy, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(template.id, organizationId, projectId, name, content.workflow, JSON.stringify(taskTemplateContentOf(template)), createdBy ?? null, now, now));
+    return template;
+  }
+
+  /** Renames a template and/or replaces its contents (all of them, as a form saves). */
+  async updateTaskTemplate(id: string, patch: { name?: string; content?: TaskTemplateContent }): Promise<TaskTemplate | undefined> {
+    return this.db.transaction(async () => {
+      if (this.db.dialect === 'postgres') (await this.db.prepare('SELECT 1 FROM task_templates WHERE id = ? FOR UPDATE').get(id));
+      const current = (await this.getTaskTemplate(id));
+      if (!current) return undefined;
+      const base = { id: current.id, organizationId: current.organizationId, projectId: current.projectId, name: patch.name ?? current.name,
+        ...(current.createdBy ? { createdBy: current.createdBy } : {}), createdAt: current.createdAt, updatedAt: Date.now() };
+      const next: TaskTemplate = { ...base, ...(patch.content ?? { workflow: current.workflow, ...taskTemplateContentOf(current) }) };
+      (await this.db.prepare('UPDATE task_templates SET name = ?, workflow = ?, content = ?, updatedAt = ? WHERE id = ?')
+        .run(next.name, next.workflow, JSON.stringify(taskTemplateContentOf(next)), next.updatedAt, id));
+      return next;
+    });
+  }
+
+  /** A project moved to another organization: its templates go along, without
+   *  what names the organization it left (vault items, cards, its computers,
+   *  an authorization level of its own). New tasks fill them from Task defaults. */
+  async moveProjectTaskTemplates(projectId: string, organizationId: string): Promise<void> {
+    if (!projectId) return;
+    const rows = (await this.db.prepare('SELECT * FROM task_templates WHERE projectId = ?').all(projectId)) as TaskTemplateRow[];
+    for (const row of rows) {
+      const template = rowToTaskTemplate(row);
+      const { paymentPolicy: _payments, computer: _computer, ...params } = template.params;
+      const { authorization: _authorization, credentialGrants: _grants, credentialPolicies: _policies, ...kept } = taskTemplateContentOf(template);
+      (await this.db.prepare('UPDATE task_templates SET organizationId = ?, content = ?, updatedAt = ? WHERE id = ?')
+        .run(organizationId, JSON.stringify({ ...kept, params }), Date.now(), row.id));
+    }
+  }
+
+  async deleteTaskTemplate(id: string): Promise<void> {
+    (await this.db.prepare('DELETE FROM task_templates WHERE id = ?').run(id));
+  }
+
   // ─── Profiles ──────────────────────────────────────────────────────────────
 
   async upsertProfile(p: AgentProfile) {
@@ -6801,9 +6957,14 @@ export class Store {
       throw new Error('otherAttempts must be ask, keep, or cancel');
     if (process.env.KARMAX_DEPLOYMENT === 'hosted' && values.remote === 'none')
       throw new Error('hosted GitHub projects require remote policy "pr" or the advanced direct-push policy');
-    (await this.db
-      .prepare('INSERT INTO settings (scopeKey, workflow, json) VALUES (?, ?, ?) ON CONFLICT(scopeKey, workflow) DO UPDATE SET json = excluded.json')
-      .run(scopeKey, workflow, JSON.stringify(values)));
+    const write = this.db.prepare('INSERT INTO settings (scopeKey, workflow, json) VALUES (?, ?, ?) ON CONFLICT(scopeKey, workflow) DO UPDATE SET json = excluded.json');
+    // Shared fields live only in the shared row (SHARED_SETTING_NAMES).
+    const { own, shared } = splitSharedSettings(workflow, values);
+    if (Object.keys(shared).length) {
+      (await write.run(scopeKey, COMMON_SETTINGS_WORKFLOW, JSON.stringify({ ...((await this.getSettings(scopeKey, COMMON_SETTINGS_WORKFLOW)) ?? {}), ...shared })));
+      values = own;
+    }
+    (await write.run(scopeKey, workflow, JSON.stringify(values)));
   
     });
   }
@@ -9392,27 +9553,6 @@ export class Store {
     return row?.id ? String(row.id) : undefined;
   }
 
-  async saveAutomationTemplate(template: AutomationTemplate & { organizationId: string; createdAt: number }): Promise<AutomationTemplate> {
-    await this.db.transaction(async () => {
-      await this.db.prepare(`INSERT INTO automation_templates (id, organizationId, name, summary, task, needs, createdBy, createdAt)
-        VALUES (?,?,?,?,?,?,?,?)`).run(template.id, template.organizationId, template.name, template.summary, JSON.stringify(template.task),
-        template.needs ? JSON.stringify(template.needs) : null, template.createdBy ?? null, template.createdAt);
-    });
-    return template;
-  }
-
-  async listAutomationTemplates(organizationId: string): Promise<AutomationTemplate[]> {
-    const rows = await this.db.prepare('SELECT * FROM automation_templates WHERE organizationId=? ORDER BY createdAt').all(organizationId);
-    return rows.map((row: any) => ({ id: String(row.id), organizationId: String(row.organizationId), name: String(row.name),
-      summary: String(row.summary), task: JSON.parse(String(row.task)), ...(row.needs ? { needs: JSON.parse(String(row.needs)) } : {}),
-      ...(row.createdBy ? { createdBy: String(row.createdBy) } : {}), createdAt: Number(row.createdAt) }));
-  }
-
-  async deleteAutomationTemplate(organizationId: string, id: string): Promise<boolean> {
-    return this.db.transaction(async () => Number((await this.db.prepare('DELETE FROM automation_templates WHERE organizationId=? AND id=?')
-      .run(organizationId, id)).changes) === 1);
-  }
-
   async addTaskFollow(follow: EventFollow): Promise<EventFollow> {
     const { id, taskId, projectId, once, createdAt, ...filter } = follow;
     await this.db.transaction(async () => {
@@ -9976,6 +10116,7 @@ export class Store {
     (await this.migrateData(true));
     (await this.migrateConversations());
     (await this.migrateSavedViews(true));
+    (await this.migrateSharedSettings(true));
   
     });
   }
@@ -10433,6 +10574,22 @@ function rowToTag(r: any): Tag {
     kind: r.kind ?? undefined,
     description: r.description ?? undefined,
     createdAt: r.createdAt,
+  };
+}
+function taskTemplateContentOf(template: TaskTemplate): Omit<TaskTemplateContent, 'workflow'> {
+  const { params, notes, authorization, credentialGrants, credentialPolicies, tags, priority } = template;
+  return { params, notes, authorization, credentialGrants, credentialPolicies, tags, priority };
+}
+interface TaskTemplateRow { id: string; organizationId: string; projectId: string | null; name: string; workflow: string;
+  content: string; createdBy: string | null; createdAt: number | string; updatedAt: number | string }
+function rowToTaskTemplate(r: TaskTemplateRow): TaskTemplate {
+  const content = JSON.parse(r.content) as Omit<TaskTemplateContent, 'workflow'>;
+  return {
+    id: r.id, organizationId: r.organizationId, projectId: r.projectId ?? '', name: r.name, workflow: r.workflow,
+    params: content.params ?? {},
+    ...Object.fromEntries(Object.entries(content).filter(([key, value]) => key !== 'params' && value !== undefined && value !== null)),
+    ...(r.createdBy ? { createdBy: r.createdBy } : {}),
+    createdAt: Number(r.createdAt), updatedAt: Number(r.updatedAt),
   };
 }
 function rowToView(r: any): SavedView {

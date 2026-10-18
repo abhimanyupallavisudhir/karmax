@@ -396,6 +396,58 @@ describe.each(storeBackends)('Store ($name)', ({ name, open }) => {
     }
   });
 
+  // Task defaults own the shared fields (multiPr, remote, …) in `__common__`;
+  // a copy in a workflow row would shadow them and revert every save.
+  it('routes shared fields written to a workflow row into the shared row', async () => {
+    const project = (await store.createProject('Shared settings'));
+    (await store.setSettings(project.id, '__common__', { otherAttempts: 'cancel', multiPr: true }));
+    (await store.setSettings(project.id, 'software-dev', { multiPr: false, onCommandFailure: 'continue' }));
+    expect((await store.getSettings(project.id, 'software-dev'))).toEqual({ onCommandFailure: 'continue' });
+    expect((await store.getSettings(project.id, '__common__'))).toEqual({ otherAttempts: 'cancel', multiPr: false });
+    // Rows that are not a workflow's keep their keys.
+    (await store.setSettings(project.id, 'payments', { budget: 5 }));
+    expect((await store.getSettings(project.id, 'payments'))).toEqual({ budget: 5 });
+  });
+
+  it.skipIf(name !== 'SQLite')('moves shared fields out of old workflow rows, keeping what software-dev showed', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-shared-settings-mig-'));
+    const dbPath = path.join(dir, 'karmax.db');
+    const legacy = (await Store.create(dbPath));
+    const project = (await legacy.createProject('Old rows'));
+    (await legacy.kvDelete('migration:shared-settings-in-common')); // Simulate a pre-migration database.
+    (await legacy.close());
+    const raw = new DatabaseSync(dbPath);
+    const put = raw.prepare('INSERT INTO settings (scopeKey, workflow, json) VALUES (?, ?, ?)');
+    put.run(project.id, '__common__', JSON.stringify({ otherAttempts: 'cancel', target: 'shared' }));
+    put.run(project.id, 'software-dev', JSON.stringify({ multiPr: false, otherAttempts: 'ask', onCommandFailure: 'continue' }));
+    put.run(project.id, 'goal', JSON.stringify({ target: 'goal-only', remote: 'push' }));
+    put.run('organization:org_team', 'software-dev', JSON.stringify({ base: 'develop' }));
+    put.run(project.id, 'payments', JSON.stringify({ budget: 5 }));
+    // The personal tenant's old installation rows, read only while it had none.
+    put.run('global', '__common__', JSON.stringify({ remote: 'pr' }));
+    put.run('global', 'software-dev', JSON.stringify({ multiPr: false, onCommandFailure: 'agent' }));
+    put.run('global', 'payments', JSON.stringify({ budget: 7 }));
+    put.run('global', 'timing', JSON.stringify({ enabled: true }));
+    put.run('organization:org_personal', 'software-dev', JSON.stringify({ onCommandFailure: 'fail' }));
+    raw.close();
+
+    const migrated = (await Store.create(dbPath));
+    // software-dev's stale value wins (it was what the form showed), the shared
+    // row keeps the rest, and another workflow fills only what neither had.
+    expect((await migrated.getSettings(project.id, '__common__'))).toEqual({ otherAttempts: 'ask', target: 'shared', multiPr: false, remote: 'push' });
+    expect((await migrated.getSettings(project.id, 'software-dev'))).toEqual({ onCommandFailure: 'continue' });
+    expect((await migrated.getSettings(project.id, 'goal'))).toEqual({});
+    expect((await migrated.getSettings('organization:org_team', '__common__'))).toEqual({ base: 'develop' });
+    expect((await migrated.getSettings('organization:org_team', 'software-dev'))).toEqual({});
+    expect((await migrated.getSettings(project.id, 'payments'))).toEqual({ budget: 5 });
+    expect((await migrated.getSettings('organization:org_personal', '__common__'))).toEqual({ remote: 'pr' });
+    expect((await migrated.getSettings('organization:org_personal', 'software-dev'))).toEqual({ onCommandFailure: 'fail' });
+    expect((await migrated.getSettings('organization:org_personal', 'payments'))).toEqual({ budget: 7 });
+    expect((await migrated.getSettings('organization:org_personal', 'timing'))).toBeUndefined();
+    (await migrated.close());
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   it.skipIf(name !== 'SQLite')('removes legacy E2B lease estimates while preserving reconciled executions', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-e2b-usage-mig-'));
     const dbPath = path.join(dir, 'karmax.db');
