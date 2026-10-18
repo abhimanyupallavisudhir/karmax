@@ -81,7 +81,8 @@ it('starts tasks from templates, saves the form as one and edits one in Task def
     await step('Task defaults edits a template in the task form', async () => {
       await page.goto(`${g.url}/acme/website/settings#project-defaults`);
       const card = page.locator('[data-templates-card="project"]');
-      await expect.poll(() => card.locator('.tpl-row .tpl-name').allInnerTexts()).toEqual(['Default', 'Bug triage', 'Release notes', 'Release notes 2.0']);
+      // The settings page loads its panes in parallel; a busy CI runner takes longer than poll's 1 s default.
+      await expect.poll(() => card.locator('.tpl-row .tpl-name').allInnerTexts(), { timeout: 10_000 }).toEqual(['Default', 'Bug triage', 'Release notes', 'Release notes 2.0']);
       await card.locator(`[data-template-id="${notes.id}"] [data-edit-template]`).click();
       await page.locator('#tf-template-name').waitFor();
       await expect.poll(() => prompt.inputValue()).toBe('Write the release notes');
