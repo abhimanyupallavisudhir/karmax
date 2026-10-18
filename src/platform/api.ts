@@ -6114,12 +6114,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     const ownAgent = caller.kind === 'agent' && caller.taskId === taskId;
     const speakerKey = ownAgent ? (caller.participant ?? (caller.role && isParticipantKey(caller.role) ? caller.role : MAIN_AGENT)) : undefined;
     const userId = caller.humanSubject?.userId;
-    const authorFields: Partial<Message> = ownAgent && shared
-      ? { role: 'agent', author: speakerKey }
-      : userId ? { author: `user:${userId}`, ...((await this.deps.store.userDisplayName(userId)) ? { authorLabel: (await this.deps.store.userDisplayName(userId))! } : {}) }
-        : caller.kind === 'agent' && caller.taskId && caller.taskId !== '*'
-          ? { author: `task:${caller.taskId}`, authorLabel: `Task ${(await this.deps.store.getTask(caller.taskId))?.num ? `#${(await this.deps.store.getTask(caller.taskId))!.num}` : caller.taskId}` }
-          : {};
+    const authorFields: Partial<Message> = ownAgent && shared ? { role: 'agent', author: speakerKey } : await this.speaker(caller);
     const callsAgents = to === undefined || to.some((selector) => selector.startsWith(AGENT_SELECTOR));
     let message: Message | undefined;
     if (shared || callsAgents) {
@@ -6217,11 +6212,28 @@ Act according to your Avatar instructions. When ready, call platform_request POS
 
   async messageAgent(token: string, taskId: string, text: string, role?: string): Promise<{ message?: Message; continuedIn?: TaskLink }> {
     const task = (await this.deps.store.getTask(taskId));
-    if (task && (!role || role === MAIN_AGENT)
-      && this.continues((await this.require(token, 'message_agent', { projectId: task.projectId, taskId })), task))
+    const caller = task ? (await this.require(token, 'message_agent', { projectId: task.projectId, taskId })) : undefined;
+    if (task && caller && (!role || role === MAIN_AGENT) && this.continues(caller, task))
       return { continuedIn: taskLink(await this.continueTask(token, taskId, { text })) };
-    const message = await this.deliverSignal('message_agent', token, taskId, SIG.followUp, text, role);
+    // Another task's agent or a person says it as themselves; the task's own
+    // agents address their colleagues unlabelled, as before.
+    const from = caller && !(caller.kind === 'agent' && caller.taskId === taskId) ? await this.speaker(caller) : undefined;
+    const message = await this.deliverSignal('message_agent', token, taskId, SIG.followUp, text, role,
+      undefined, undefined, undefined, undefined, from);
     return message ? { message } : {};
+  }
+
+  /** Who says a message from outside a task's own agents: a person by name, or
+   * another task's agent as "Task #N", so whoever reads it knows who to answer. */
+  private async speaker(caller: { kind: string; taskId?: string; humanSubject?: { userId?: string } }): Promise<Partial<Message>> {
+    const userId = caller.humanSubject?.userId;
+    if (userId) {
+      const name = await this.deps.store.userDisplayName(userId);
+      return { author: `user:${userId}`, ...(name ? { authorLabel: name } : {}) };
+    }
+    if (caller.kind !== 'agent' || !caller.taskId || caller.taskId === '*') return {};
+    const num = (await this.deps.store.getTask(caller.taskId))?.num;
+    return { author: `task:${caller.taskId}`, authorLabel: `Task ${num ? `#${num}` : caller.taskId}` };
   }
 
   /** Whether a message from `caller` to the task's main agent continues the
