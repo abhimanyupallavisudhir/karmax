@@ -23,6 +23,12 @@ export const CREATE_TASK_GRANTS = 'Grant it what it needs: `authorization` {leve
   + 'What you cannot grant is not refused: the task is kept as a draft and the result names who can grant it; '
   + 'ask them with request_permission and its task id.';
 
+/** Whom request_permission asks (KarmaxApi.permissionGrantors), shared by both tool surfaces. */
+export const PERMISSION_ROUTING = 'Audience selectors: task:<id>, avatar:<id>, user:<id>, @team:<slug>, @creator, @maintainers, @admins, @superadmins, @owners, @project, or @all. '
+  + 'Omit audience to ask the nearest who can grant it: a task you act for that holds it (your parent, or the task whose agent created yours; its agent decides), '
+  + 'else the lowest of @maintainers, @admins and @superadmins that can. platform_request(GET, "/api/agent/escalation-targets?capabilities=<a,b>") lists '
+  + 'everyone who can, nearest first; the result names them too (canGrant). A sub-task already holds everything its parent does. ';
+
 /** queue_task (both tool surfaces): start a draft. */
 export const QUEUE_TASK_DESCRIPTION = 'Start a draft task (one saved with create_task or create_sub_task `draft: true`). '
   + 'A draft sub-task of yours starts when your current turn ends, branching off your work as it is then; '

@@ -150,9 +150,12 @@ const S = {
   // Task organization: a view IS a saved query.
   tags: [], // project tag catalogue (labels + topics, hierarchical)
   views: [], // saved views (named queries)
+  orgViews: [], // the organization home's saved views
+  orgViewsFor: null, // which organization S.orgViews were loaded for
   fields: [], // searchable-field registry (drives the filter/sort/group menus)
   searchResult: null, // { tasks, groups, total } from the last server evaluation
   searchFailed: false, // last evaluation errored — distinct from "nothing matched"
+  searchRefusal: '', // …because the server refused it (4xx), in the server's words
   searchPending: false, // a new query is being evaluated; the list labels its interim local preview
   wsOnline: true, // live socket up; false shows the topbar "Reconnecting" pill
   orgProjectId: null, // which project S.tags/S.views were loaded for (staleness guard)
@@ -232,6 +235,96 @@ function installInteractionTracking() {
   document.addEventListener('keydown', rememberInteractionOrigin, true);
 }
 if (typeof document !== 'undefined') installInteractionTracking();
+
+// ── Unsaved changes ──────────────────────────────────────────────────────────
+// A form whose edits wait for a Save button marks its region `data-unsaved`
+// and that button `data-unsaved-save`. While what is on screen differs from
+// what was last saved, a `.save-state` note says "Unsaved changes" beside the
+// button. The comparison point is taken when someone starts interacting with
+// the region (it is fully loaded by then), so late hydration never reads as
+// an edit; it moves on only once a save succeeds (`markSaved`, which
+// `flashSaved` calls) or the region re-renders.
+const unsavedRegions = new WeakMap(); // region -> { baseline, pending, dirty }
+// Search boxes and menus inside pickers are navigation, not values.
+const UNSAVED_IGNORE = '.mcp-menu, .combo-menu, [role="listbox"], .mcp-filter, .payment-search, [data-unsaved-ignore]';
+function unsavedSignature(region) {
+  const parts = [];
+  for (const el of region.querySelectorAll('input, select, textarea, .mcp-picker, .task-payments, .authz-editor, [data-unsaved-value]')) {
+    if (el.closest(UNSAVED_IGNORE) || ['button', 'submit', 'reset', 'file'].includes(el.type)) continue;
+    if (el.hasAttribute('data-unsaved-value')) parts.push(el.dataset.unsavedValue);
+    else if (el.matches('.mcp-picker')) parts.push(el.dataset.value || '');
+    else if (el.matches('.task-payments')) parts.push(el.dataset.policy || '');
+    else if (el.matches('.authz-editor')) parts.push(el.dataset.authorization || '');
+    else if (el.type === 'checkbox' || el.type === 'radio') parts.push(el.checked);
+    else if (el.multiple) parts.push([...el.selectedOptions].map((option) => option.value));
+    else parts.push(el.value);
+  }
+  return JSON.stringify(parts);
+}
+function unsavedState(region) {
+  let state = unsavedRegions.get(region);
+  if (!state) unsavedRegions.set(region, state = { baseline: null, pending: null, dirty: false });
+  return state;
+}
+const SAVE_STATE_TEXT = { dirty: 'Unsaved changes', saving: 'Saving…', saved: 'Saved', error: 'Not saved' };
+/** Paint a `.save-state` note: dirty | saving | saved | error, or '' to hide it. */
+function paintSaveState(note, state, text = SAVE_STATE_TEXT[state] || '') {
+  if (!note) return;
+  note.dataset.state = state || '';
+  note.textContent = state ? text : '';
+}
+function paintUnsaved(region) {
+  const button = region.querySelector('[data-unsaved-save]');
+  if (!button) return;
+  let note = button.previousElementSibling;
+  if (!note?.matches('.save-state')) {
+    if (!unsavedState(region).dirty) return;
+    note = document.createElement('span');
+    note.className = 'save-state';
+    note.setAttribute('role', 'status');
+    button.before(note);
+  }
+  paintSaveState(note, unsavedState(region).dirty ? 'dirty' : '');
+}
+/** Re-compare a region with its saved state, e.g. after a picker outside it changed its value. */
+function checkUnsaved(el) {
+  const region = el?.closest?.('[data-unsaved]');
+  if (!region) return;
+  const state = unsavedState(region);
+  if (state.baseline == null) return;
+  state.dirty = unsavedSignature(region) !== state.baseline;
+  paintUnsaved(region);
+}
+/** The save started from `button` landed: what was on screen then is now saved. */
+function markSaved(button) {
+  const region = button?.closest?.('[data-unsaved]');
+  if (!region) return;
+  const state = unsavedState(region);
+  state.baseline = state.pending ?? unsavedSignature(region);
+  state.pending = null;
+  checkUnsaved(region);
+}
+function installUnsavedTracking() {
+  const begin = (event) => {
+    const region = event.target.closest?.('[data-unsaved]');
+    if (!region) return;
+    const state = unsavedState(region);
+    if (!state.dirty) state.baseline = unsavedSignature(region);
+  };
+  document.addEventListener('pointerdown', begin, true);
+  document.addEventListener('focusin', begin, true);
+  document.addEventListener('input', (event) => checkUnsaved(event.target));
+  document.addEventListener('change', (event) => checkUnsaved(event.target));
+  let clicked = null;
+  document.addEventListener('click', (event) => {
+    clicked = event.target.closest?.('[data-unsaved]') || null;
+    if (clicked && event.target.closest('[data-unsaved-save]')) unsavedState(clicked).pending = unsavedSignature(clicked);
+  }, true);
+  // Add/remove buttons change the form without an input event (and may remove
+  // themselves, so the region is the one found before the click ran).
+  document.addEventListener('click', () => { if (clicked?.isConnected) checkUnsaved(clicked); clicked = null; });
+}
+if (typeof document !== 'undefined') installUnsavedTracking();
 
 function actionLabel(control) {
   return String(control?.getAttribute?.('aria-label') || control?.title || control?.textContent || 'Action')
@@ -862,7 +955,8 @@ async function applyListRoute(tab, scope, r, routeIsCurrent) {
   const readable = firstProjectForOrganization(S.organizationId);
   const fields = S.fields.length || !readable ? null
     : api(`/api/search/fields?projectId=${encodeURIComponent(readable.id)}`).then((value) => { S.fields = value || []; }).catch(() => {});
-  await Promise.all([runSearch().catch(() => {}), fields]);
+  const views = tab === 'home' && S.orgViewsFor !== S.organizationId ? loadOrgViews() : null;
+  await Promise.all([runSearch().catch(() => {}), fields, views]);
   if (!routeIsCurrent() || S.tab !== tab) return;
   renderMain();
 }
@@ -4592,13 +4686,15 @@ async function runSearch() {
     S.searchFailed = false;
     S.searchPending = false;
     return true;
-  } catch {
+  } catch (error) {
     // Distinguish "the server couldn't evaluate this" from "nothing matched".
     // Without the flag the view falls back to a client-side filter and shows
     // "No matching tasks", so a server outage reads as a bad query and the user
-    // edits a perfectly good one.
+    // edits a perfectly good one. A refusal (4xx) is the server's answer, not an
+    // outage: it is shown in the server's words, with no retry.
     if (S.searchEpoch === epoch && isCurrent()) {
       S.searchResult = null; S.searchFailed = true; S.searchPending = false;
+      S.searchRefusal = error?.status >= 400 && error.status < 500 ? String(error.message || `HTTP ${error.status}`) : '';
     }
     return false;
   }
@@ -5922,7 +6018,7 @@ function renderMain() {
   const tabbar = projectScoped
     ? `<div class="tabs">${tabs
         .map((t) => `<a class="tab ${S.tab === t ? 'active' : ''}" data-spa href="${projectRoute(proj?.id, t)}" data-tab="${t}"${PROJECT_TAB_COMMANDS[t] ? ` data-shortcut="${PROJECT_TAB_COMMANDS[t]}"` : ''}>${labels[t]}</a>`)
-        .join('')}${S.meta?.hosted ? `<span class="tabs-spacer"></span><button class="btn tool tabs-action" id="project-local-checkout" title="Check out this project on your computer">${ICON.laptop}Work locally</button>` : ''}</div>`
+        .join('')}${S.meta?.hosted ? `<span class="tabs-spacer"></span><button class="btn tool tabs-action" id="project-local-checkout" data-tool="Work locally" title="Check out this project on your computer">${ICON.laptop}Work locally</button>` : ''}</div>`
     : '';
 
   let content = '';
@@ -6027,34 +6123,56 @@ function viewIdForQuery(q) {
   if (s === normalizeQuery(ACTIVE_VIEW_QUERY)) return ACTIVE_VIEW;
   if (s === normalizeQuery(DEFAULT_LIST_QUERY)) return FOR_ME_VIEW;
   return BUILTIN_VIEWS.find((v) => normalizeQuery(v.query) === s)?.id
-    || (S.views || []).find((v) => normalizeQuery(stringifyQuery(v.query || {})) === s)?.id
+    || savedViews().find((v) => normalizeQuery(stringifyQuery(v.query || {})) === s)?.id
     || null;
 }
 
+// The saved views of the list on screen: a project's own, or (on the
+// organization home) the organization's. The inbox spans organizations and has none.
+function savedViews(tab = S.tab) {
+  if (tab === 'home') return S.orgViewsFor === S.organizationId ? S.orgViews || [] : [];
+  return tab === 'inbox' ? [] : S.views || [];
+}
+function canSaveViews(tab = S.tab) { return tab === 'home' ? !!S.organizationId : tab === 'tasks' && !!S.projectId; }
+async function loadOrgViews(organizationId = S.organizationId) {
+  if (!organizationId) return;
+  const views = await api(`/api/organizations/${encodeURIComponent(organizationId)}/views`).catch(() => []);
+  if (S.organizationId !== organizationId) return;
+  S.orgViews = views || [];
+  S.orgViewsFor = organizationId;
+}
+
+// Every view chip of the list in its order — For me, Active, the built-ins, the
+// Task store, then the saved ones. Their position is their number: `v 1` … `v 9`.
+function listViewChips(tab = S.tab) {
+  return [
+    { id: FOR_ME_VIEW, name: 'For me', query: DEFAULT_LIST_QUERY },
+    { id: ACTIVE_VIEW, name: 'Active', query: ACTIVE_VIEW_QUERY },
+    ...BUILTIN_VIEWS,
+    ...(tab === 'inbox' ? [] : [{ id: STORE_VIEW, name: 'Task store', query: STORE_VIEW_QUERY }]),
+    ...savedViews(tab).map((v) => ({ id: v.id, name: v.name, icon: v.icon, query: stringifyQuery(v.query || {}), saved: true })),
+  ];
+}
+
 // The saved-views switcher — every chip is a query. "For me" is the default, then
-// "Active", the built-in starter views, and the project's saved views (each with a ✕
-// to delete). Saved views belong to a project, so the organization home has none.
+// "Active", the built-in starter views, and the list's saved views (each with a ✕
+// to delete): a project's on its list, the organization's on its home.
 // A chip is a real link to its list URL, so Ctrl/⌘/middle-click opens the view in
 // a new tab; wireOrgControls() keeps a plain click an in-place query switch.
+// Its number (`v 1`…`v 9`) shows on it while `v` is held down as a chord prefix.
 function viewsBar() {
   const active = viewIdForQuery(S.search);
-  const home = isCrossProjectList();
-  const chip = (id, query, label, cls = '', extra = '') =>
-    `<a class="view-chip ${cls}${active === id ? ' active' : ''}" data-view="${esc(id)}" href="${esc(listQueryRoute(query))}"${extra}>${label}</a>`;
-  const builtins = BUILTIN_VIEWS
-    .map((v) => chip(v.id, v.query, esc(v.name), 'builtin', ` title="${esc(v.query)}"`))
-    .join('');
-  const saved = (home ? [] : S.views)
-    .map((v) => chip(v.id, viewQuery(v.id), `${v.icon ? esc(v.icon) + ' ' : ''}${esc(v.name)}<span class="view-x" data-delview="${v.id}" title="Delete view">✕</span>`))
-    .join('');
-  return `<div class="views-bar">
-    ${chip(FOR_ME_VIEW, DEFAULT_LIST_QUERY, 'For me', '', ' title="Waiting on you: reviews, questions, approvals, mentions — and your drafts"')}
-    ${chip(ACTIVE_VIEW, ACTIVE_VIEW_QUERY, 'Active', '', ` title="${esc(ACTIVE_VIEW_QUERY)}"`)}
-    ${builtins}
-    ${S.tab === 'inbox' ? '' : chip(STORE_VIEW, STORE_VIEW_QUERY, 'Task store', 'builtin', ' title="Ready-made tasks: run one now, or install one that runs itself"')}
-    ${saved}
-    ${home ? '' : '<div class="view-chip add" id="save-view" role="button" tabindex="0" title="Save the current query as a view">+ Save view</div>'}
-  </div>`;
+  const title = { [FOR_ME_VIEW]: 'Waiting on you: reviews, questions, approvals, mentions — and your drafts',
+    [STORE_VIEW]: 'Ready-made tasks: run one now, or install one that runs itself' };
+  const chips = listViewChips().map((v, i) => {
+    const label = `${v.icon ? esc(v.icon) + ' ' : ''}${esc(v.name)}${v.saved ? `<span class="view-x" data-delview="${esc(v.id)}" title="Delete view">✕</span>` : ''}`;
+    const tip = title[v.id] || (v.saved ? '' : v.query);
+    return `<a class="view-chip${BUILTIN_VIEWS.includes(v) || v.id === STORE_VIEW ? ' builtin' : ''}${active === v.id ? ' active' : ''}" data-view="${esc(v.id)}" href="${esc(listQueryRoute(v.query))}"${tip ? ` title="${esc(tip)}"` : ''}${i < 9 ? ` data-shortcut="view.${i + 1}"` : ''}>${label}</a>`;
+  }).join('');
+  // Saving is offered once the query is not already a view.
+  const save = canSaveViews() && S.search.trim() && !active
+    ? '<button type="button" class="view-chip add" id="save-view" data-shortcut="view.save">+ Save view</button>' : '';
+  return `<div class="views-bar">${chips}${save}</div>`;
 }
 
 // The query a view chip stands for ('' for an unknown id).
@@ -6064,7 +6182,7 @@ function viewQuery(id) {
   if (id === FOR_ME_VIEW) return DEFAULT_LIST_QUERY;
   const builtin = BUILTIN_VIEWS.find((x) => x.id === id);
   if (builtin) return builtin.query;
-  const saved = (S.views || []).find((x) => x.id === id);
+  const saved = savedViews().find((x) => x.id === id);
   return saved ? stringifyQuery(saved.query || {}) : '';
 }
 
@@ -6213,7 +6331,9 @@ function tasksView() {
     body = flat.map((t) => row(t)).join('');
   }
   const empty = S.searchFailed
-    ? `<div class="empty"><div class="big">Search didn’t run</div>Couldn’t reach the server. <button class="btn sm" id="retry-search">Try again</button></div>`
+    ? `<div class="empty"><div class="big">Search didn’t run</div>${S.searchRefusal
+      ? esc(S.searchRefusal.replace(/[.!]?$/, '.'))
+      : 'Couldn’t reach the server. <button class="btn sm" id="retry-search">Try again</button>'}</div>`
     : !r && S.searchPending ? ''
     : viewIdForQuery(S.search) === FOR_ME_VIEW
       ? (notices ? '' : `<div class="empty for-me-empty"><div class="big">All clear</div>Nothing is waiting on you.</div>`)
@@ -6793,11 +6913,12 @@ function wireOrgControls() {
       ev.preventDefault(); // the ✕ sits inside the chip's link
       ev.stopPropagation();
       const id = x.dataset.delview;
-      const v = S.views.find((y) => y.id === id);
+      const v = savedViews().find((y) => y.id === id);
       if (!confirm(`Delete the view “${v?.name || 'this view'}”? This can't be undone.`)) return;
       try {
         await api(`/api/views/${id}`, { method: 'DELETE' });
         S.views = S.views.filter((y) => y.id !== id);
+        S.orgViews = S.orgViews.filter((y) => y.id !== id);
         renderMain(); // the query stays in hand (and in the URL); only the chip is gone
         toast('View deleted');
       } catch (e) { toast(e.message, true); }
@@ -6818,18 +6939,23 @@ function wireOrgControls() {
   wireQueryToolbar(main, 'q', { get: () => S.search, set: (q) => setQuery(q) });
 }
 
-// Persist the current working query as a named view (Save-view button).
+// Persist the current working query as a named view (Save-view button, `v s`):
+// in the project whose list it is, or in the organization on its home.
 async function saveCurrentView() {
-  const name = await promptText('Name this view:', S.search ? S.search.slice(0, 40) : 'My view');
+  if (!canSaveViews() || !S.search.trim()) return toast('Search for something to save it as a view', true);
+  if (viewIdForQuery(S.search)) return toast('This search is already a view');
+  const home = S.tab === 'home';
+  const organizationId = S.organizationId;
+  const name = await promptText('Name this view', S.search.slice(0, 40));
   if (!name) return;
   try {
     // The API persists a structured TaskQuery, so parse the working string into one
     // (parseQueryClient mirrors the server grammar; it round-trips back through it).
-    const v = await api(`/api/projects/${S.projectId}/views`, {
+    const v = await api(home ? `/api/organizations/${encodeURIComponent(organizationId)}/views` : `/api/projects/${S.projectId}/views`, {
       method: 'POST',
       body: JSON.stringify({ name, query: parseQueryClient(S.search) }),
     });
-    S.views.push(v);
+    if (home) { if (S.orgViewsFor === organizationId) S.orgViews.push(v); } else S.views.push(v);
     renderMain(); // the new chip lights up on its own — it is the query already in the box
     toast(`Saved view “${name}”`);
   } catch (err) { toast(err.message, true); }
@@ -8093,7 +8219,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
           ${formAttemptGroup?.attempts?.length > 1 ? `<nav class="attempts-list tf-attempts" aria-label="Choose an attempt">
             ${formAttemptGroup.attempts.map((a) => attemptCard(a, formAttemptGroup, { taskId: draft.id }, { form: true })).join('')}
           </nav>` : ''}
-          <span class="tf-savestate" id="tf-savestate" aria-live="polite"></span>
+          <span class="tf-savestate save-state quiet" id="tf-savestate" role="status"></span>
           <select id="tf-wf" title="${workflowEditable ? 'Workflow' : 'Workflow is locked after the task is queued'}" ${workflowEditable ? '' : 'disabled'}>${taskFormWorkflows(wf, draft).map((w) => `<option value="${esc(w.id)}" ${w.id === wf ? 'selected' : ''}>${esc(w.label)}</option>`).join('')}</select>
         </div>
       </div>
@@ -8447,12 +8573,15 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     // in the chain runs — e.g. closeForm clears the form right after queuing the flush).
     const sig = stateSig(st);
     saveChain = saveChain.then(async () => {
-      if (!draftId && !hasContent(st)) return; // nothing worth creating a draft for yet
-      if (sig === lastSaved) return; // no change since the last write landed
-      if (activeFormToken === formToken) {
-        const ss = $('#tf-savestate');
-        if (ss) ss.textContent = editInPlace ? 'Saving…' : 'Saving draft…';
+      const current = activeFormToken === formToken;
+      // Nothing to write: the head must not keep saying "Unsaved changes".
+      if ((!draftId && !hasContent(st)) || sig === lastSaved) {
+        if (current && $('#tf-savestate')?.dataset.state === 'dirty') {
+          paintSaveState($('#tf-savestate'), draftId ? 'saved' : '', editInPlace ? 'Saved' : 'Draft saved');
+        }
+        return;
       }
+      if (current) paintSaveState($('#tf-savestate'), 'saving', editInPlace ? 'Saving…' : 'Saving draft…');
       try {
         if (!draftId) {
           const created = await api(`/api/projects/${projectId}/tasks`, { method: 'POST', body: JSON.stringify({ workflow: wf, params: st.body, notes: st.notes, authorization: st.authorization, credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies, draft: true, allowAttenuation: true }) });
@@ -8470,15 +8599,14 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
         lastSaved = sig;
         // Quiet auto-save indicator in the page head. Guard on the form token: this
         // chain link can land after a NEWER form instance has mounted its own head.
-        if (activeFormToken === formToken) { const ss = $('#tf-savestate'); if (ss) ss.textContent = editInPlace ? 'Saved' : 'Draft saved'; }
+        if (activeFormToken === formToken) paintSaveState($('#tf-savestate'), 'saved', editInPlace ? 'Saved' : 'Draft saved');
         refreshTasks();
       } catch {
         // Auto-save used to fail silently, leaving the form looking saved while
         // the latest edit existed only in this tab. Keep the form open and the
         // dirty signature retryable, but tell the user the durable write missed.
         if (activeFormToken === formToken) {
-          const ss = $('#tf-savestate');
-          if (ss) ss.textContent = `${editInPlace ? 'Not saved' : 'Draft not saved'} — keep editing to retry`;
+          paintSaveState($('#tf-savestate'), 'error', `${editInPlace ? 'Not saved' : 'Draft not saved'} — keep editing to retry`);
         }
       }
     });
@@ -8488,8 +8616,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   // Debounced auto-save while typing.
   let saveTimer = null;
   function autoSaveSoon() {
-    const ss = $('#tf-savestate');
-    if (ss) ss.textContent = 'Unsaved changes';
+    paintSaveState($('#tf-savestate'), 'dirty');
     clearTimeout(saveTimer);
     saveTimer = setTimeout(() => { if (activeFormToken !== formToken) return; persistDraft(); }, 800);
   }
@@ -8502,7 +8629,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     forkBox?._pickResume?.(opts.fork.resumeFrom, opts.fork.task, opts.fork.session);
     clearTimeout(saveTimer);
     lastSaved = stateSig(formState());
-    $('#tf-savestate').textContent = '';
+    paintSaveState($('#tf-savestate'), '');
   }
   // The payments row fills in its inherited policy once the cards load; that is
   // not an edit either, so an untouched form stays untouched.
@@ -8559,10 +8686,9 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       submitInFlight = true;
       activeFeedback = beginActionFeedback(draftMode ? $('#tf-draft') : $('#tf-queue'));
       submitButtons.forEach((button) => { button.disabled = true; });
-      const saveState = $('#tf-savestate');
-      if (saveState) saveState.textContent = draftMode
+      paintSaveState($('#tf-savestate'), 'saving', draftMode
         ? 'Saving draft…'
-        : editInPlace ? 'Saving…' : 'Starting task…';
+        : editInPlace ? 'Saving…' : 'Starting task…');
     }
     let succeeded = false;
     clearTimeout(saveTimer);
@@ -8744,7 +8870,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
         });
         if (!succeeded) {
           const saveState = $('#tf-savestate');
-          if (saveState && !/not saved/i.test(saveState.textContent || '')) saveState.textContent = 'Not submitted — ready to retry';
+          if (saveState?.dataset.state !== 'error') paintSaveState(saveState, 'error', 'Not submitted — ready to retry');
         }
       }
     }
@@ -11301,7 +11427,7 @@ function conversationError(v) {
 function conversationFullscreenButton() {
   const active = !!S.conversationFullscreen;
   const label = active ? 'Exit full screen' : 'Full screen';
-  return `<button type="button" class="btn tool icon" id="conversation-fullscreen" aria-label="${label}" title="${active ? 'Exit full screen (Esc)' : label}" aria-pressed="${active}">${active ? ICON.collapse : ICON.expand}</button>`;
+  return `<button type="button" class="btn tool icon" id="conversation-fullscreen" data-tool="Full screen" aria-label="${label}" title="${active ? 'Exit full screen (Esc)' : label}" aria-pressed="${active}">${active ? ICON.collapse : ICON.expand}</button>`;
 }
 
 function setConversationFullscreen(active) {
@@ -11336,9 +11462,9 @@ function conversationPane(v, t) {
   const forkCmd = sess?.id && sess?.home && localWorldPath(v) ? forkCommandFor(sess, v.worldPath) : '';
   const remoteFork = sess?.id && sess?.home && v.worldAvailable && !v.worldPath && !v.agentTurn && hostLocal();
   const copy = forkCmd
-    ? `<button class="btn tool copy-cmd" data-cmd="${esc(forkCmd)}" title="Copy a CLI command to fork this agent into your terminal — a branched copy, safe to open even while it's running">${ICON.terminal}Fork in CLI</button>`
+    ? `<button class="btn tool copy-cmd" data-tool="Fork in CLI" data-cmd="${esc(forkCmd)}" title="Copy a CLI command to fork this agent into your terminal — a branched copy, safe to open even while it's running">${ICON.terminal}Fork in CLI</button>`
     : remoteFork
-      ? `<button class="btn tool fork-local" data-provider="${esc(sess.provider)}" data-session="${esc(sess.id)}" data-home="${esc(sess.home)}" title="Materialize the cloud branch locally, then copy a native session-fork command">${ICON.laptop}Fork locally</button>`
+      ? `<button class="btn tool fork-local" data-tool="Fork locally" data-provider="${esc(sess.provider)}" data-session="${esc(sess.id)}" data-home="${esc(sess.home)}" title="Materialize the cloud branch locally, then copy a native session-fork command">${ICON.laptop}Fork locally</button>`
       : '';
   // The follow-up affordance (SPEC §5.6) lives inside each agent's conversation,
   // so a human can address any agent — Do, Merge, or Confirm — not just Do. It
@@ -11383,9 +11509,9 @@ function conversationPane(v, t) {
         : presence.tone === 'idle' || presence.tone === 'done' ? '' : `<span class="conversation-presence ${presence.tone}"><span class="presence-dot"></span>${esc(presence.label)}</span>`}
       <span style="flex:1"></span>
       <div class="ck-tools">
-        <button class="btn tool" id="share-task-conversation" data-role="${esc(t.role)}" title="Share this conversation">${ICON.share}Share</button>
-        <button class="btn tool" id="fork-task-agent" data-role="${esc(t.role)}" title="Create a new task from this agent’s conversation">${ICON.fork}Fork</button>
-        ${S.meta?.hosted ? `<button type="button" class="btn tool" id="local-checkout" title="Check out this task on your computer">${ICON.laptop}Work locally</button>` : ''}
+        <button class="btn tool" id="share-task-conversation" data-tool="Share" data-role="${esc(t.role)}" title="Share this conversation">${ICON.share}Share</button>
+        <button class="btn tool" id="fork-task-agent" data-tool="Fork" data-role="${esc(t.role)}" title="Create a new task from this agent’s conversation">${ICON.fork}Fork</button>
+        ${S.meta?.hosted ? `<button type="button" class="btn tool" id="local-checkout" data-tool="Work locally" title="Check out this task on your computer">${ICON.laptop}Work locally</button>` : ''}
         ${copy}
         <span class="tool-sep" aria-hidden="true"></span>
         ${conversationFullscreenButton()}
@@ -12326,7 +12452,7 @@ function mainAuthorityParams(v) {
         ${payments}
       </div>
       <div class="params-save-bar" data-save-state="saved">
-        <span class="params-save-status" id="tp-auth-status" role="status" aria-live="polite">All authorization changes saved</span>
+        <span class="save-state" id="tp-auth-status" role="status"></span>
         <button class="btn sm primary" id="tp-auth-save" disabled>Save authorization</button>
       </div>
     </div>` };
@@ -12372,9 +12498,12 @@ async function wireTaskAuthorization(v) {
     if (!sameJson(draft.saved, draft.values) || draft.saving) edits[v.taskId] = draft;
     else delete edits[v.taskId];
     saveBtn.disabled = draft.saving || !dirty;
-    saveBtn.textContent = draft.saving ? 'Saving authorization…' : 'Save authorization';
-    status.textContent = draft.saving ? 'Saving authorization…' : dirty ? 'Unsaved authorization changes' : 'All authorization changes saved';
-    saveBtn.closest('.params-save-bar').dataset.saveState = draft.saving ? 'saving' : dirty ? 'dirty' : 'saved';
+    const bar = saveBtn.closest('.params-save-bar');
+    const state = draft.saving ? 'saving' : dirty ? 'dirty' : 'saved';
+    // "Saved" shows once, as a save lands; an untouched form says nothing.
+    const landed = state === 'saved' && (bar.dataset.saveState === 'saving' || status.dataset.state === 'saved');
+    paintSaveState(status, state === 'saved' && !landed ? '' : state);
+    bar.dataset.saveState = state;
   };
   draft.sync = syncAuthorization;
   syncAuthorization();
@@ -13117,10 +13246,7 @@ function paramsSection(v) {
         <div class="pf-ro">${esc(triggerSummary(rec.params.triggers))}</div></div>` : '';
   const footer = editable.size
     ? `<div class="params-save-bar" data-save-state="${editDraft?.dirtyNames?.length ? 'dirty' : 'saved'}">
-        <span class="params-save-status" id="params-save-status" role="status" aria-live="polite">
-          <span class="params-save-dot" aria-hidden="true"></span>
-          <span>${editDraft?.dirtyNames?.length ? 'Unsaved parameter changes' : 'All parameter changes saved'}</span>
-        </span>
+        <span class="save-state" id="params-save-status" role="status" data-state="${editDraft?.dirtyNames?.length ? 'dirty' : ''}">${editDraft?.dirtyNames?.length ? 'Unsaved changes' : ''}</span>
         <button class="btn sm primary" id="params-save" ${editDraft?.dirtyNames?.length ? '' : 'disabled'}>Save parameter changes</button>
       </div>`
     : `<div class="task-sub" style="color:var(--ink-3)">${terminal
@@ -13267,14 +13393,13 @@ function paramDirtyNames(saved, current, fields) {
 }
 
 function setParamSaveState(root, saveBtn, status, state) {
+  // "Saved" shows once, as a save lands; an untouched form says nothing.
+  const landed = state === 'saved' && (root.dataset.saveState === 'saving' || status.dataset.state === 'saved');
   root.dataset.saveState = state;
   const bar = saveBtn.closest('.params-save-bar');
   if (bar) bar.dataset.saveState = state;
   saveBtn.disabled = state !== 'dirty';
-  saveBtn.textContent = state === 'saving' ? 'Saving parameter changes…' : 'Save parameter changes';
-  status.lastElementChild.textContent = state === 'dirty'
-    ? 'Unsaved parameter changes'
-    : state === 'saving' ? 'Saving parameter changes…' : 'All parameter changes saved';
+  paintSaveState(status, state === 'saved' && !landed ? '' : state);
 }
 
 function wireParams(v) {
@@ -13785,11 +13910,17 @@ function wireNewAgentForms(box, v, key) {
 
 // The @ menu: numbered agents, a new agent, frequently mentioned people, and a
 // searchable list of everyone. Digits pick an agent, + adds one, letters search.
+// A view update rebuilds the box while it is open and refocuses the new one, so
+// the open menu is recorded here and carries over to it, as it was.
+let openAgentMention = null; // { key, owner: the textarea, peopleMode, active }
 function wireAgentMention(ta, box, v, key) {
   if (!ta || ta.dataset.amWired) return;
   ta.dataset.amWired = '1';
   let menu = null, items = [], active = 0, token = null, peopleMode = false;
-  const close = () => { menu?.remove(); menu = null; items = []; token = null; peopleMode = false; };
+  const close = () => {
+    menu?.remove(); menu = null; items = []; token = null; peopleMode = false;
+    if (openAgentMention?.owner === ta) openAgentMention = null;
+  };
   const tokenAt = () => {
     const pos = ta.selectionStart;
     if (pos == null || pos !== ta.selectionEnd) return null;
@@ -13860,6 +13991,7 @@ function wireAgentMention(ta, box, v, key) {
     placeCaretMenu(menu, ta, token.start);
     menu.scrollTop = scrolled;
     revealActiveOption(menu);
+    openAgentMention = { key, owner: ta, peopleMode, active };
   };
   const update = () => {
     token = tokenAt();
@@ -13886,6 +14018,15 @@ function wireAgentMention(ta, box, v, key) {
     else if (ev.key === 'Enter' || ev.key === 'Tab') { ev.preventDefault(); ev.stopImmediatePropagation(); choose(items[active]); }
   });
   ta.addEventListener('blur', () => setTimeout(close, 150));
+  // Focus is given back before the caret is (restoreFollowupFocus), so look once
+  // both are in place.
+  ta.addEventListener('focus', () => queueMicrotask(() => {
+    const was = openAgentMention;
+    if (!was || was.key !== key || was.owner === ta || was.owner.isConnected || document.activeElement !== ta) return;
+    openAgentMention = null;
+    peopleMode = was.peopleMode; active = was.active;
+    update();
+  }));
 }
 
 // Escalate: pass the request this task is waiting on to other people. The same
@@ -15225,6 +15366,7 @@ function fmtReset(epoch) {
 // Confirmation happens where the eye already is: the pressed button itself says
 // Saved for a moment, instead of a toast in the far corner naming wire ids.
 function flashSaved(button) {
+  markSaved(button);
   if (!button || button.dataset.flashing) return;
   button.dataset.flashing = '1';
   const label = button.textContent;
@@ -15268,7 +15410,7 @@ function settingsForms(scope, projectId) {
   // collapsed Authorization row with the authorization, vault and payment
   // defaults), the Responder, the Review route, the Computer, then branches —
   // saved together.
-  const common = `<div class="card task-defaults parameter-fields" id="task-defaults-${scope}">
+  const common = `<div class="card task-defaults parameter-fields" id="task-defaults-${scope}" data-unsaved>
       <section class="td-section td-agent"><div id="profiles-list-${scope}">Loading…</div></section>
       <section class="td-section td-routes"><div id="review-route-${scope}">Loading…</div></section>
       <section class="td-section td-computer" data-wf="__common__" data-schema-wf="software-dev" data-part="computer">
@@ -15277,16 +15419,16 @@ function settingsForms(scope, projectId) {
       <section class="td-section td-where" data-wf="__common__" data-schema-wf="software-dev">
         <div class="wf-form parameter-fields">${renderFields(commonSettingsFields(scope))}</div>
       </section>
-      <div class="td-actions"><button class="btn primary sm" data-save-task-defaults>Save task defaults</button><span class="resource-error" role="status"></span></div>
+      <div class="td-actions"><button class="btn primary sm" data-save-task-defaults data-unsaved-save>Save task defaults</button><span class="resource-error" role="status"></span></div>
     </div>`;
   const unique = wfs
     .map((s) => {
       const fields = settingsFields(s.name, scope).filter((field) => !COMMON_DEFAULT_NAMES.has(field.name));
       if (!fields.length) return '';
-      return `<details class="card" data-wf="${esc(s.name)}" ${s.name === 'software-dev' ? 'open' : ''}>
+      return `<details class="card" data-wf="${esc(s.name)}" data-unsaved ${s.name === 'software-dev' ? 'open' : ''}>
         <summary style="cursor:pointer;font-weight:600">${esc(s.name)} <span style="color:var(--ink-3);font-weight:400;font-size:12px">— workflow-specific</span></summary>
         <div class="wf-form parameter-fields" style="margin-top:10px">${renderFields(fields)}</div>
-        <button class="btn primary sm" data-save="${esc(s.name)}">Save ${esc(s.name)} defaults</button>
+        <button class="btn primary sm" data-save="${esc(s.name)}" data-unsaved-save>Save ${esc(s.name)} defaults</button>
       </details>`;
     })
     .join('');
@@ -15376,6 +15518,8 @@ async function hydrateResourceDefaults(scope, projectId, organizationId) {
     const paint = () => {
       if (summary) summary.textContent = agentAuthoritySummary(box._current(), projects);
       button.querySelector('.tf-vault-count').textContent = `${ids.size} selected`;
+      // The vault choice lives in this closure; expose it to the unsaved check.
+      box.dataset.unsavedValue = JSON.stringify([[...ids].sort(), policies]);
     };
     box._current = () => ({ authorization: readAuthorizationEditor(editor), credentialGrants: [...ids].map(id => `use-credential:item:${id}`),
       credentialPolicies: policies, paymentPolicy: readTaskPayments(payments) });
@@ -15383,7 +15527,7 @@ async function hydrateResourceDefaults(scope, projectId, organizationId) {
     editor.querySelector('.authz-level-select').title = 'The authorization a task gets unless it chooses one; never more than its creator holds. An empty project list means the task’s own project.';
     const button = box.querySelector('.resource-vault');
     button.disabled = false;
-    button.onclick = () => openVaultGrantPicker(items, ids, policies, (selected, overrides) => { ids = new Set(selected); policies = overrides; vaultDirty = true; paint(); });
+    button.onclick = () => openVaultGrantPicker(items, ids, policies, (selected, overrides) => { ids = new Set(selected); policies = overrides; vaultDirty = true; paint(); checkUnsaved(box); });
     const payments = box.querySelector('.task-payments');
     await wireTaskPayments(payments, projectId, undefined, undefined, organizationId);
     if (!current()) return;
@@ -15420,7 +15564,7 @@ async function hydrateResourceDefaults(scope, projectId, organizationId) {
 function explanationSettingsCard(scope) {
   if (!explanationsEnabled()) return '';
   const id = scope === 'project' ? 'project-explanation' : 'settings-explanation';
-  return `<div class="card explanation-settings" id="${id}">
+  return `<div class="card explanation-settings" id="${id}" data-unsaved>
     <div class="section-h">Explanation model</div>
     <p class="task-sub">Used by “Explain this” below agent messages. It always uses a registered API key, never a Codex or Claude subscription.</p>
     <div class="settings-grid">
@@ -15429,7 +15573,7 @@ function explanationSettingsCard(scope) {
       <label class="form-row wide"><span>Prompt sent to the explanation model</span><textarea class="explanation-setting-prompt" rows="5"></textarea></label>
     </div>
     <p class="task-sub explanation-setting-effective"></p>
-    <button class="btn primary sm explanation-settings-save">Save explanation defaults</button>
+    <button class="btn primary sm explanation-settings-save" data-unsaved-save>Save explanation defaults</button>
   </div>`;
 }
 
@@ -15455,21 +15599,22 @@ async function hydrateExplanationSettings(scope, projectId, organizationId) {
   prompt.placeholder = inherited.prompt;
   card.querySelector('.explanation-setting-effective').textContent = `Effective model: ${data.effective?.model || inherited.model}`;
   card.querySelector('.explanation-settings-save').addEventListener('click', async (event) => {
+    const button = event.currentTarget; // null once the save has been awaited
     const values = { endpoint: endpoint.value.trim(), model: model.value.trim(), prompt: prompt.value.trim() };
     try {
       const saved = await api(url, { method: 'PUT', body: JSON.stringify({ values }) });
       card.querySelector('.explanation-setting-effective').textContent = `Effective model: ${saved.effective.model}`;
-      flashSaved(event.currentTarget);
+      flashSaved(button);
     } catch (error) { toast(error.message, true); }
   });
 }
 
 function hostCapacityCard() {
   const fields = settingsFields('agent-queue', 'global');
-  return `<div class="card" id="host-capacity-card" data-wf="agent-queue">
+  return `<div class="card" id="host-capacity-card" data-wf="agent-queue" data-unsaved>
     <div class="wf-form parameter-fields">${renderFields(fields)}</div>
-    <button class="btn primary sm" id="host-capacity-save">Save</button>
-    <div class="setting-rows ruled" style="margin-top:14px"><div class="setting-row">
+    <button class="btn primary sm" id="host-capacity-save" data-unsaved-save>Save</button>
+    <div class="setting-rows ruled" style="margin-top:14px" data-unsaved-ignore><div class="setting-row">
       <label class="setting-label" for="timing-enabled">Response timing ${policyTip('Record response measurements and show the Timing tab. Existing measurements are kept when off.')}</label>
       <span class="setting-value"></span>
       <span class="setting-actions"><input class="toggle" type="checkbox" id="timing-enabled" ${S.meta?.timingEnabled ? 'checked' : ''}></span>
@@ -15487,10 +15632,11 @@ async function wireHostCapacityCard() {
   const inherited = Object.fromEntries(fields.filter((f) => f.default !== undefined).map((f) => [f.name, f.default]));
   card.querySelector('.wf-form').innerHTML = renderFields(fields, own, inherited);
   card.querySelector('#host-capacity-save')?.addEventListener('click', async (event) => {
+    const button = event.currentTarget; // null once the save has been awaited
     const values = collectForm(card.querySelector('.wf-form'), fields);
     try {
       await api('/api/settings/global/agent-queue', { method: 'PUT', body: JSON.stringify({ values }) });
-      flashSaved(event.currentTarget);
+      flashSaved(button);
     } catch (error) { toast(error.message, true); }
   });
 }
@@ -16510,7 +16656,7 @@ function settingsView(proj) {
     <div class="project-config-section" id="project-services"><div><h2>Services ${policyTip('Live systems tasks connect to. Use an external service for an API, hosted database or S3 bucket that tasks call directly, and a per-task container for an isolated dependency such as Postgres or Redis. Credentials belong in Secrets.')}</h2></div></div>
     <div class="card"><div id="project-services-box">Loading…</div></div>
     <div class="project-config-section" id="project-environment"><div><h2>Environment ${policyTip('The base image, tools, setup and boot commands every task starts with.')}</h2></div></div>
-    <div class="card"><div id="project-environment-box">Loading…</div></div>
+    <div class="card"><div id="project-environment-box" data-unsaved>Loading…</div></div>
     <div class="project-config-section" id="project-computers"><div><h2>Computers ${policyTip('The cloud computers this organization’s tasks run on. A task’s own computer—its size, experience and network—is set in Task defaults and the task form.')}</h2></div></div>
     <div class="card"><div class="setting-rows"><div class="setting-row"><span class="setting-label">Cloud computers</span>
       <span class="setting-value setting-muted">Shared by the organization’s projects</span>
@@ -16531,9 +16677,9 @@ function settingsView(proj) {
       <div class="setting-rows" id="wf-pins-list">Loading…</div></div>
     <div class="settings-section-title" id="project-advanced" data-settings-advanced hidden><div>Advanced</div></div>
     <div class="card" data-settings-advanced hidden><div class="setting-rows">
-      <div class="setting-row" data-settings-access="project" hidden><span class="setting-label">Name ${policyTip('Use / to put the project in folders, e.g. Clients/Website.')}</span>
+      <div class="setting-row" data-settings-access="project" data-unsaved hidden><span class="setting-label">Name ${policyTip('Use / to put the project in folders, e.g. Clients/Website.')}</span>
         <span class="setting-value"><input id="project-name" class="setting-input" value="${esc(projectPath(proj))}" placeholder="Folder/Project" aria-label="Project name, including folders"></span>
-        <span class="setting-actions"><button class="btn sm primary" id="rename-project">Save</button></span></div>
+        <span class="setting-actions"><button class="btn sm primary" id="rename-project" data-unsaved-save>Save</button></span></div>
       <div class="setting-row" data-settings-access="projectTransfer" hidden><span class="setting-label">Organization</span>
         <span class="setting-value">${esc(organizationById(proj.organizationId)?.name || '')}</span>
         <span class="setting-actions"><button class="btn sm" id="move-project">Move…</button></span></div>
@@ -17004,7 +17150,7 @@ async function hydrateProjectEnvironment(proj) {
         <label class="form-row wide"><span title="Runs as each task starts">Boot commands</span><textarea id="environment-boot" rows="3" placeholder="npm run db:migrate&#10;python manage.py migrate&#10;uv run python manage.py migrate">${esc((spec?.boot || []).join('\n'))}</textarea></label>
         <label class="switch form-row wide"><input id="environment-docker" type="checkbox" ${spec?.includeDocker ? 'checked' : ''}><span><b>Include Docker</b><small class="field-help">Required when per-task Services run as containers inside the world.</small></span></label>
       </div>
-      <div class="project-form-actions"><button class="btn sm" id="environment-save">Save recipe</button><button class="btn sm primary" id="environment-build">Build now</button></div>
+      <div class="project-form-actions"><button class="btn sm" id="environment-save" data-unsaved-save>Save recipe</button><button class="btn sm primary" id="environment-build">Build now</button></div>
       ${builds.length ? `<div class="section-h">Builds</div>${builds.map(build).join('')}` : ''}`;
     box.querySelectorAll('[data-environment-recover]').forEach(button => button.addEventListener('click', async () => {
       const record = builds.find(build => build.recoveryRevision === button.dataset.environmentRecover);
@@ -17038,6 +17184,7 @@ async function hydrateProjectEnvironment(proj) {
         box.querySelector('#environment-evidence').innerHTML = proposal.evidence.length
           ? `<p class="task-sub">Evidence: ${proposal.evidence.map(esc).join(' · ')}</p>`
           : '<p class="task-sub">No devcontainer or recognized lockfile found.</p>';
+        checkUnsaved(box);
       } catch (error) { toast(error.message, true); }
     });
     box.querySelector('#environment-save')?.addEventListener('click', async () => {
@@ -17609,10 +17756,10 @@ async function hydrateSettingsAccess(scope) {
  * everyone, including on the sign-in screen before any organization is known. */
 function appearanceCard() {
   return `<div class="card" id="appearance-card">
-      <div class="setting-rows" style="margin-bottom:14px"><div class="setting-row">
+      <div class="setting-rows" style="margin-bottom:14px"><div class="setting-row" data-unsaved>
         <label class="setting-label" for="site-name">Site name ${policyTip('Shown in the console, the sign-in screen, the browser tab, the installed app and account email.')}</label>
         <span class="setting-value"><input id="site-name" class="setting-input" maxlength="48" autocomplete="off" /></span>
-        <span class="setting-actions"><button class="btn sm primary" id="site-name-save" type="button">Save</button></span>
+        <span class="setting-actions"><button class="btn sm primary" id="site-name-save" type="button" data-unsaved-save>Save</button></span>
       </div></div>
       <div class="brand-picker" id="brand-picker">
         ${BRAND_ICON_CHOICES.map((c) => `<button type="button" class="brand-option" data-icon="${esc(c.id)}" aria-pressed="false">
@@ -17677,7 +17824,7 @@ async function wireAppearanceCard() {
 
 function globalSettingsView(embedded = false) {
   return `
-    ${embedded ? '<div class="settings-section-title" id="settings-defaults"><div>Task defaults ${policyTip(`How new tasks begin, unless a project or task says otherwise`)}</div></div>' : '<div class="page-title">Organization settings</div><p style="color:var(--ink-2);margin-top:-8px">How new tasks behave unless a project or task deliberately changes something.</p>'}
+    ${embedded ? `<div class="settings-section-title" id="settings-defaults"><div>Task defaults ${policyTip('How new tasks begin, unless a project or task says otherwise')}</div></div>` : '<div class="page-title">Organization settings</div><p style="color:var(--ink-2);margin-top:-8px">How new tasks behave unless a project or task deliberately changes something.</p>'}
     ${settingsForms('global')}
     <div class="settings-section-title" id="settings-payments"><div>Passwords &amp; payments ${policyTip(`Credentials agents may use on your behalf, and what tasks may spend`)}</div></div>
     <div class="card" id="settings-connections"><div class="section-h">Connected apps ${policyTip('Apps agents can use through MCP or Composio. Choose which ones new tasks get in Task defaults.')}</div>
@@ -18056,7 +18203,7 @@ function paymentsCard(scope) {
 }
 
 function stripePlatformCard() {
-  return '<div class="card" id="stripe-platform-card"><div class="task-sub">Loading Stripe platform setup…</div></div>';
+  return '<div class="card" id="stripe-platform-card" data-unsaved><div class="task-sub">Loading Stripe platform setup…</div></div>';
 }
 
 async function wireStripePlatformCard() {
@@ -18078,7 +18225,7 @@ async function wireStripePlatformCard() {
       <label class="form-row">OAuth callback URL<input value="${esc(platform.callbackUrl)}" readonly /></label>
       <label class="form-row">Webhook destination URL<input value="${esc(platform.webhookUrl)}" readonly /></label>
     </div>
-    <button class="btn sm primary stripe-platform-save">Save Stripe platform setup</button>
+    <button class="btn sm primary stripe-platform-save" data-unsaved-save>Save Stripe platform setup</button>
     ${platform.source === 'environment' ? '<p class="task-sub">Environment values currently supply this setup. Saved replacements use the encrypted vault and take precedence.</p>' : ''}`;
   box.querySelector('.stripe-platform-save')?.addEventListener('click', async (event) => {
     try {
@@ -18094,7 +18241,7 @@ async function wireStripePlatformCard() {
 }
 
 function paidLaunchCard() {
-  return '<div class="card" id="paid-launch-card"><div class="task-sub">Loading paid-launch setup…</div></div>';
+  return '<div class="card" id="paid-launch-card" data-unsaved><div class="task-sub">Loading paid-launch setup…</div></div>';
 }
 
 async function wirePaidLaunchCard() {
@@ -18179,7 +18326,7 @@ async function wirePaidLaunchCard() {
     <div class="card" style="margin-top:18px;padding:14px;border-color:${state.paidLaunch ? 'var(--ok,#4ec9a3)' : 'var(--line)'}">
       <label style="display:flex;gap:10px;align-items:flex-start"><input type="checkbox" class="paid-launch-enabled" ${state.paidLaunch ? 'checked' : ''} ${state.canEnable || state.paidLaunch ? '' : 'disabled'} /><span><b>Enable real paid checkout</b><span class="task-sub" style="display:block">Requires completed legal and live billing setup. Disabling closes new checkout without deleting existing subscriptions.</span></span></label>
     </div>
-    <button class="btn primary paid-launch-save" style="margin-top:14px" ${state.canManage ? '' : 'disabled'}>Save paid-launch setup</button>
+    <button class="btn primary paid-launch-save" style="margin-top:14px" ${state.canManage ? '' : 'disabled'} data-unsaved-save>Save paid-launch setup</button>
     ${state.source === 'environment-bootstrap' ? '<p class="task-sub">Legacy environment values may currently be supplying some fields. Saving this form moves the editable configuration into Installation settings; saved values take precedence.</p>' : ''}`;
   box.querySelector('.paid-launch-save')?.addEventListener('click', async () => {
     try {
@@ -18570,6 +18717,25 @@ async function wirePaymentsCard(scope, projectId, organizationId) {
 }
 
 // ── vault items + credential access requests (wiki plans/PLAN-passwords §§4–10) ──
+// The vault manager's type names, order and marks.
+const VAULT_TYPE_ORDER = ['login', 'api-key', 'ssh-key', 'env', 'session', 'passkey', 'note'];
+const VAULT_TYPE_LABELS = { login: 'Logins', 'api-key': 'API keys', 'ssh-key': 'SSH keys', env: 'Env files', session: 'Sessions', passkey: 'Passkeys', note: 'Notes' };
+const vaultSvg = (paths) => `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths}</svg>`;
+const VAULT_KEY_PATH = '<circle cx="7.5" cy="15.5" r="4.5"/><path d="m10.7 12.3 9.3-9.3M17 6l3 3M14.5 8.5l2 2"/>';
+const VAULT_TYPE_ICON = {
+  login: vaultSvg('<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>'),
+  'api-key': vaultSvg(VAULT_KEY_PATH),
+  'ssh-key': vaultSvg('<rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M13 15h4"/>'),
+  env: vaultSvg('<path d="M8 3H7a2 2 0 0 0-2 2v5a2 2 0 0 1-2 2 2 2 0 0 1 2 2v5a2 2 0 0 0 2 2h1M16 3h1a2 2 0 0 1 2 2v5a2 2 0 0 0 2 2 2 2 0 0 0-2 2v5a2 2 0 0 1-2 2h-1"/>'),
+  session: vaultSvg('<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/>'),
+  passkey: vaultSvg('<path d="M12 11v3M8.5 7.5a5 5 0 0 1 8.5 3.5c0 3-.5 5.5-2 8M7 11c0 2.5-.3 4.6-1.2 6.5M12 4a7 7 0 0 1 7 7M5 11a7 7 0 0 1 2-5"/>'),
+  note: vaultSvg('<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6M8 13h8M8 17h5"/>'),
+};
+const VAULT_ACTION_ICON = {
+  view: vaultSvg('<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>'),
+  rotate: vaultSvg('<path d="M21 12a9 9 0 1 1-2.6-6.4L21 8"/><path d="M21 3v5h-5"/>'),
+  delete: vaultSvg('<path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0-1 14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2L4 6M10 11v6M14 11v6"/>'),
+};
 const VAULT_SECRET_LABELS = {
   login: [['password', 'password'], ['totp', 'TOTP seed (base32, otpauth:// URI, or paste image of QR code)'], ['note', 'Notes']],
   'api-key': [['secret', 'API key']],
@@ -18736,7 +18902,10 @@ function permissionRequestRows(requests, { historyLimit = 20 } = {}) {
         `<span class="chip mono">${esc(capability)}</span>`).join(' ')}</div>
       ${request.projectIds?.length ? `<div class="approval-request-projects">Add projects: ${request.projectIds.map((id) => `<span class="chip mono">${esc(projectById(id)?.name || id)}</span>`).join(' ')}</div>` : ''}
       <div class="task-sub">${credentialRequestTaskLink(request)} — ${esc(request.reason)}</div>
-      <div class="approval-request-help">Requested from ${request.audience.map(esc).join(', ')}. ${request.projectIds?.length ? `Approval grants the full ${esc(request.baseAuthorization?.level || 'selected')} authorization across these and the existing projects. Existing permissions for all task roles apply there too. Listed capabilities are granted to the ${esc(request.role || 'requesting')} agent.` : `Approval grants only these exact capabilities to this task’s ${esc(request.role || 'requesting')} agent.`}</div>
+      <div class="approval-request-help">Requested from ${request.audience.map((selector) => {
+        const grantor = selector.startsWith('task:') ? (request.grantorTasks || []).find((task) => task.id === selector.slice(5)) : undefined;
+        return grantor ? credentialRequestTaskLink({ taskId: grantor.id, task: grantor }) : esc(selector);
+      }).join(', ')}. ${request.projectIds?.length ? `Approval grants the full ${esc(request.baseAuthorization?.level || 'selected')} authorization across these and the existing projects. Existing permissions for all task roles apply there too. Listed capabilities are granted to the ${esc(request.role || 'requesting')} agent.` : `Approval grants only these exact capabilities to this task’s ${esc(request.role || 'requesting')} agent.`}</div>
     </div>
     <div class="approval-request-actions">
       <button class="btn sm primary" data-preq-act="approve">Approve for agent</button>
@@ -18767,7 +18936,10 @@ function authorizationRequestRows(requests, { historyLimit = 20 } = {}) {
       <div class="approval-request-caps"><span class="chip">${esc(authorizationSummary(request.authorization,
         S.projects.filter((project) => project.organizationId === request.organizationId)))}</span></div>
       <div class="task-sub">${esc(request.reason)}</div>
-      <div class="approval-request-help">Requested from ${request.audience.map(esc).join(', ')}. Approval delegates this authorization directly to the ${esc(request.target.kind)}; it does not elevate the requester.</div>
+      <div class="approval-request-help">Requested from ${request.audience.map((selector) => {
+        const grantor = selector.startsWith('task:') ? (request.grantorTasks || []).find((task) => task.id === selector.slice(5)) : undefined;
+        return grantor ? credentialRequestTaskLink({ taskId: grantor.id, task: grantor }) : esc(selector);
+      }).join(', ')}. Approval delegates this authorization directly to the ${esc(request.target.kind)}; it does not elevate the requester.</div>
     </div>
     <div class="approval-request-actions">
       ${canResolve ? '<button class="btn sm primary" data-areq-act="approve">Approve authorization</button><button class="btn sm" data-areq-act="deny">Deny</button>'
@@ -18903,9 +19075,9 @@ function connectionRows(connections, inTask = false) {
       <div class="approval-request-main"><div class="approval-request-title">${esc(c.label)} <span class="chip">${esc(status)}</span>${open && c.dismissed ? ` ${ignoredChip()}` : ''}</div>
         ${c.why && inTask ? `<p class="task-sub">${esc(c.why)}</p>` : ''}
         <p class="task-sub">${c.taskId ? 'This account may be used by the requesting task.' : 'Private until you share it with a project.'}</p>
-        ${own && !inTask ? `<details><summary>Project access</summary><p class="task-sub">Selected projects may run app actions using this account, within the permissions you granted at sign-in.</p>
+        ${own && !inTask ? `<details data-unsaved><summary>Project access</summary><p class="task-sub">Selected projects may run app actions using this account, within the permissions you granted at sign-in.</p>
           ${projects.map(p => `<label class="connection-project"><input type="checkbox" value="${esc(p.id)}" ${c.projectIds.includes(p.id) ? 'checked' : ''}> ${esc(p.name)}</label>`).join('')}
-          <button type="button" class="btn sm" data-connection-action="access">Save access</button></details>` : ''}
+          <button type="button" class="btn sm" data-connection-action="access" data-unsaved-save>Save access</button></details>` : ''}
         <span data-connection-result role="status"></span>
       </div><div class="approval-request-actions">
         ${reusable.length > 1 ? `<select class="connection-account" data-connection-account aria-label="Account" title="Your connected accounts, newest first">${reusable.map((account, i) => `<option value="${esc(account.id)}">${esc(accountNames[i])}</option>`).join('')}</select>` : ''}
@@ -19106,8 +19278,8 @@ function passwordsCard() {
         Always prefer to connect services via <a href="#settings-connections">MCP or Composio</a>, if available.</div>
     </div>
     <button type="button" class="btn vault-manage-button" id="vault-manage-open" disabled>
-      <span>Vault credentials</span>
-      <span class="vault-manage-count">Loading…</span>
+      ${VAULT_TYPE_ICON['api-key']}<span>Vault credentials</span>
+      <span class="vault-manage-count">Loading…</span><span class="vm-chevron" aria-hidden="true">›</span>
     </button>
 
     <div class="section-sub" style="display:flex;align-items:center;gap:6px;font-weight:600;margin-bottom:6px">Import or sync from a password manager
@@ -19134,7 +19306,7 @@ function passwordsCard() {
       <div class="form-row"><div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center">
         <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px">blind use ${policyTip(POL_USE_TIP)} <select class="vi-use"><option>auto</option><option>ask</option></select></label>
         <label style="font-size:12px;display:inline-flex;align-items:center;gap:4px">agent sees ${policyTip(POL_REVEAL_TIP)} <select class="vi-reveal"><option>ask</option><option>auto</option><option>never</option></select></label>
-        <button class="btn primary vi-add">Add</button>
+        <button class="btn primary vi-add" data-submit>Add</button>
       </div></div>
       </div>
     </details>
@@ -19177,9 +19349,9 @@ async function wireVaultCards(organizationId) {
   secretRows();
   box.querySelector('.vi-type').addEventListener('change', secretRows);
   let vaultItems = [];
-  const sourceBadge = (src) => src?.startsWith('connector:') ? `<span class="chip" title="Mirrored from ${esc(src.slice(10))}">from ${esc(src.slice(10))}</span>`
-    : src?.startsWith('import:') ? `<span class="chip" title="File imports are snapshots and cannot write back">${esc(src.slice(7))} · one-way import</span>`
-    : src?.startsWith('task:') ? '<span class="chip">agent-made</span>' : '';
+  const sourceBadge = (src) => src?.startsWith('connector:') ? `<span class="vm-source" title="Mirrored from ${esc(src.slice(10))}">${esc(src.slice(10))}</span>`
+    : src?.startsWith('import:') ? `<span class="vm-source" title="A one-way import from ${esc(src.slice(7))}: a snapshot that never writes back">${esc(src.slice(7))} import</span>`
+    : src?.startsWith('task:') ? '<span class="vm-source" title="Saved by an agent">agent-made</span>' : '';
   const renderItems = async () => {
     const button = box.querySelector('#vault-manage-open');
     try {
@@ -19193,51 +19365,115 @@ async function wireVaultCards(organizationId) {
     }
     return vaultItems;
   };
+  // The vault, as a table: tick rows (or Select all of what the search and
+  // type filter show) and the head turns into the bulk bar — set either policy
+  // or delete them all at once, as the import and task pickers select.
   const openVaultManager = () => {
     const overlay = document.createElement('div');
     overlay.className = 'modal-overlay';
+    const selected = new Set();
+    let type = '';
+    const types = () => [...new Set(vaultItems.map((i) => i.type))].sort((a, b) => VAULT_TYPE_ORDER.indexOf(a) - VAULT_TYPE_ORDER.indexOf(b));
     overlay.innerHTML = `<div class="modal-card vault-manager-modal" role="dialog" aria-modal="true" aria-labelledby="vault-manager-title">
       <div class="vault-manager-head">
-        <div><div class="section-h" id="vault-manager-title">Vault credentials</div>
-          <p class="vault-grant-help">Inspect, rotate, or remove credentials and manage organization defaults. Every reveal is recorded in the audit log.</p></div>
+        <h2 class="vm-title" id="vault-manager-title">Vault credentials</h2>
+        <span class="vm-total"></span>
+        ${policyTip('Every reveal is recorded in the audit log.')}
+        <span class="vm-spacer"></span>
         <button type="button" class="icon-btn" data-vault-manager-close aria-label="Close">×</button>
       </div>
-      <input class="vault-search" type="search" placeholder="Search vault credentials…" aria-label="Search vault credentials" />
-      <div class="vault-manager-list"></div>
+      <div class="vm-toolbar">
+        <input class="vault-search" type="search" placeholder="Search vault credentials…" aria-label="Search vault credentials" />
+        <div class="vm-types" role="group" aria-label="Type"></div>
+      </div>
+      <div class="vm-table">
+        <div class="vm-row vm-headrow">
+          <input type="checkbox" class="vault-manage-all" aria-label="Select all" />
+          <span class="vm-headlabel"></span>
+          <span class="vm-cols"><span>Blind use ${policyTip(POL_USE_TIP)}</span><span>Agent sees ${policyTip(POL_REVEAL_TIP)}</span></span>
+          <span class="vm-bulk" hidden>
+            <select class="vm-bulk-use" aria-label="Blind use for the selected credentials"><option value="">Blind use…</option><option>auto</option><option>ask</option></select>
+            <select class="vm-bulk-reveal" aria-label="Agent sees for the selected credentials"><option value="">Agent sees…</option><option>auto</option><option>ask</option><option>never</option></select>
+            <button type="button" class="btn sm danger" data-vm-bulk-delete>Delete</button>
+            <button type="button" class="icon-btn" data-vm-bulk-clear aria-label="Clear selection" title="Clear selection">×</button>
+          </span>
+        </div>
+        <div class="vault-manager-list"></div>
+      </div>
     </div>`;
     document.body.appendChild(overlay);
     const list = overlay.querySelector('.vault-manager-list');
     const search = overlay.querySelector('.vault-search');
+    const all = overlay.querySelector('.vault-manage-all');
+    const rowsOf = () => [...list.querySelectorAll('[data-vi]')];
+    const itemOf = (row) => vaultItems.find((candidate) => candidate.id === row.dataset.vi);
+    // The head: Select all over what is shown; "N selected" and the bulk bar once something is.
+    const syncSelection = () => {
+      for (const id of selected) if (!vaultItems.some((item) => item.id === id)) selected.delete(id);
+      const shown = rowsOf().filter((row) => !row.hidden);
+      const ticked = shown.filter((row) => selected.has(row.dataset.vi)).length;
+      all.disabled = !shown.length;
+      all.checked = !!shown.length && ticked === shown.length;
+      all.indeterminate = ticked > 0 && ticked < shown.length;
+      rowsOf().forEach((row) => {
+        const on = selected.has(row.dataset.vi);
+        row.classList.toggle('selected', on);
+        row.querySelector('.vault-manage-pick').checked = on;
+      });
+      overlay.querySelector('.vm-headlabel').textContent = selected.size ? `${selected.size} selected`
+        : shown.length === vaultItems.length ? 'Select all' : `Select ${shown.length} shown`;
+      overlay.querySelector('.vm-bulk').hidden = !selected.size;
+      overlay.querySelector('.vm-cols').hidden = !!selected.size;
+      overlay.querySelector('.vm-total').textContent = vaultItems.length ? String(vaultItems.length) : '';
+    };
+    const paintTypes = () => {
+      const present = types();
+      if (type && !present.includes(type)) type = '';
+      const count = (t) => vaultItems.filter((item) => !t || item.type === t).length;
+      overlay.querySelector('.vm-types').innerHTML = present.length > 1 ? ['', ...present].map((t) =>
+        `<button type="button" class="vm-type${t === type ? ' active' : ''}" data-vm-type="${esc(t)}" aria-pressed="${t === type}">${esc(t ? VAULT_TYPE_LABELS[t] || t : 'All')} <span>${count(t)}</span></button>`).join('') : '';
+    };
     const filterRows = () => {
       const query = search.value.trim().toLowerCase();
       let visible = 0;
-      list.querySelectorAll('[data-vi]').forEach((row) => {
-        const item = vaultItems.find((candidate) => candidate.id === row.dataset.vi);
-        row.hidden = !!query && !vaultItemSearchText(item).includes(query);
+      rowsOf().forEach((row) => {
+        const item = itemOf(row);
+        row.hidden = (!!query && !vaultItemSearchText(item).includes(query)) || (!!type && item.type !== type);
         if (!row.hidden) visible++;
       });
       const empty = list.querySelector('.vault-search-empty');
       if (empty) empty.hidden = visible > 0 || !vaultItems.length;
+      syncSelection();
       syncKeys?.();
     };
     let syncKeys;
+    // One credential's organization policy; the other field keeps its value.
+    const savePolicy = (item, policy) => api(`/api/vault/items${oq}`, { method: 'POST', body: JSON.stringify({ id: item.id, type: item.type, label: item.label, domains: item.domains, username: item.username, tags: item.tags, envVar: item.envVar,
+      policy: { use: item.policy?.use || 'auto', reveal: item.policy?.reveal || 'ask', ...policy } }) })
+      .then((updated) => Object.assign(item, updated.item || updated));
+    const meta = (i) => [i.username, ...(i.domains || []), i.envVar ? `$${i.envVar}` : '', ...(i.tags || []).map((tag) => `#${tag}`)].filter(Boolean);
     const paint = () => {
       list.innerHTML = vaultItems.length
-        ? sortVaultItems(vaultItems).map((i) => `<div class="queue-item vault-manager-item" data-vi="${esc(i.id)}">
-          <div style="flex:1"><b>${esc(i.label)}</b> <span class="chip">${esc(i.type)}</span> ${sourceBadge(i.provenance?.source)}
-            ${i.username ? `<span class="mono" style="color:var(--ink-3);font-size:11px">${esc(i.username)}</span>` : ''}
-            ${i.envVar ? `<span class="mono" style="color:var(--ink-3);font-size:11px" title="Environment variable agents receive">$${esc(i.envVar)}</span>` : ''}
-            <div class="task-sub" style="color:var(--ink-3)">${esc((i.domains || []).join(', '))}${i.tags?.length ? ` · tags: ${esc(i.tags.join(', '))}` : ''}</div></div>
-          <label title="${esc(POL_USE_TIP)}">blind use <select class="vi-pol-use">${['auto', 'ask'].map((v) => `<option ${i.policy?.use === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
-          <label title="${esc(POL_REVEAL_TIP)}">agent sees <select class="vi-pol-reveal">${['auto', 'ask', 'never'].map((v) => `<option ${i.policy?.reveal === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
-          ${i.type === 'session' ? `<label title="${esc(SESSION_EXCLUSIVE_TIP)}">one task at a time <input type="checkbox" class="vi-exclusive" ${i.exclusive ? 'checked' : ''}></label>` : ''}
-          <button class="btn sm" data-vi-reveal="${esc(i.id)}" title="${i.canReveal === false ? 'Viewing secrets needs Super-administrator authorization' : 'Temporarily inspect one stored field (audited)'}" ${(i.fields || []).length && i.canReveal !== false ? '' : 'disabled'}>View</button>
-          ${i.type === 'session' ? '' : `<button class="btn sm" data-vi-rotate="${esc(i.id)}" title="Replace the stored secret (metadata unchanged)">Update secret</button>`}
-          <button class="btn sm" data-vi-del="${esc(i.id)}">Delete</button>
+        ? sortVaultItems(vaultItems).map((i) => `<div class="vm-row vault-manager-item" data-vi="${esc(i.id)}" data-type="${esc(i.type)}">
+          <input type="checkbox" class="vault-manage-pick" aria-label="Select ${esc(i.label)}" ${selected.has(i.id) ? 'checked' : ''} />
+          <span class="vm-icon" title="${esc(i.type)}" aria-hidden="true">${VAULT_TYPE_ICON[i.type] || VAULT_TYPE_ICON.login}</span>
+          <span class="vm-main">
+            <span class="vm-label">${esc(i.label)}${sourceBadge(i.provenance?.source)}</span>
+            <span class="vm-meta">${esc(VAULT_TYPE_LABELS[i.type]?.replace(/s$/, '') || i.type)}${meta(i).map((part) => ` · <span class="mono">${esc(part)}</span>`).join('')}${i.type === 'session' ? `<label class="vm-exclusive" title="${esc(SESSION_EXCLUSIVE_TIP)}"><input type="checkbox" class="vi-exclusive" ${i.exclusive ? 'checked' : ''}>One task at a time</label>` : ''}</span>
+          </span>
+          <span class="vm-cols">
+            <select class="vi-pol-use" aria-label="Blind use" title="${esc(POL_USE_TIP)}">${['auto', 'ask'].map((v) => `<option ${i.policy?.use === v ? 'selected' : ''}>${v}</option>`).join('')}</select>
+            <select class="vi-pol-reveal" aria-label="Agent sees" title="${esc(POL_REVEAL_TIP)}">${['auto', 'ask', 'never'].map((v) => `<option ${i.policy?.reveal === v ? 'selected' : ''}>${v}</option>`).join('')}</select>
+          </span>
+          <span class="vm-actions">
+            <button type="button" class="icon-btn vm-act" data-vi-reveal="${esc(i.id)}" aria-label="View" title="${i.canReveal === false ? 'Viewing secrets needs Super-administrator authorization' : 'View a stored field (audited)'}" ${(i.fields || []).length && i.canReveal !== false ? '' : 'disabled'}>${VAULT_ACTION_ICON.view}</button>
+            ${i.type === 'session' ? '' : `<button type="button" class="icon-btn vm-act" data-vi-rotate="${esc(i.id)}" aria-label="Update secret" title="Replace the stored secret (metadata unchanged)">${VAULT_ACTION_ICON.rotate}</button>`}
+            <button type="button" class="icon-btn vm-act danger" data-vi-del="${esc(i.id)}" aria-label="Delete" title="Delete">${VAULT_ACTION_ICON.delete}</button>
+          </span>
           <div class="vault-reveal-panel" hidden>
-            <label>Stored field <select class="vi-reveal-field">${(i.fields || []).map((field) => `<option value="${esc(field)}">${esc(field)}</option>`).join('')}</select></label>
+            <select class="vi-reveal-field" aria-label="Stored field">${(i.fields || []).map((field) => `<option value="${esc(field)}">${esc(field)}</option>`).join('')}</select>
             <button type="button" class="btn sm primary" data-vi-reveal-load>Reveal</button>
-            <span class="task-sub">Hidden again after 60 seconds.</span>
+            <span class="task-sub">Hidden again after 60 seconds</span>
             <div class="vault-reveal-value" hidden>
               <pre class="mono" tabindex="0"></pre>
               <div style="display:flex;gap:6px">
@@ -19249,13 +19485,12 @@ async function wireVaultCards(organizationId) {
         : '<span class="vault-grant-empty">No passwords yet — sync from a password manager or add one by hand.</span>';
       list.insertAdjacentHTML('beforeend', '<span class="vault-grant-empty vault-search-empty" hidden>No credentials match your search.</span>');
       list.querySelectorAll('[data-vi]').forEach((row) => {
-        const item = vaultItems.find((candidate) => candidate.id === row.dataset.vi);
-        const savePolicy = async () => {
+        const item = itemOf(row);
+        const policyChanged = async () => {
           const controls = row.querySelectorAll('select');
           controls.forEach(control => { control.disabled = true; });
           try {
-            const updated = await api(`/api/vault/items${oq}`, { method: 'POST', body: JSON.stringify({ id: item.id, type: item.type, label: item.label, domains: item.domains, username: item.username, tags: item.tags, envVar: item.envVar, policy: { use: row.querySelector('.vi-pol-use').value, reveal: row.querySelector('.vi-pol-reveal').value } }) });
-            Object.assign(item, updated.item || updated);
+            await savePolicy(item, { use: row.querySelector('.vi-pol-use').value, reveal: row.querySelector('.vi-pol-reveal').value });
             toast('Policy saved');
           } catch (e) {
             row.querySelector('.vi-pol-use').value = item.policy?.use || 'auto';
@@ -19263,8 +19498,12 @@ async function wireVaultCards(organizationId) {
             toast(e.message, true);
           } finally { controls.forEach(control => { control.disabled = false; }); }
         };
-        row.querySelector('.vi-pol-use').addEventListener('change', savePolicy);
-        row.querySelector('.vi-pol-reveal').addEventListener('change', savePolicy);
+        row.querySelector('.vi-pol-use').addEventListener('change', policyChanged);
+        row.querySelector('.vi-pol-reveal').addEventListener('change', policyChanged);
+        row.querySelector('.vault-manage-pick').addEventListener('change', (event) => {
+          if (event.target.checked) selected.add(item.id); else selected.delete(item.id);
+          syncSelection();
+        });
         row.querySelector('.vi-exclusive')?.addEventListener('change', async (event) => {
           const box = event.target;
           box.disabled = true;
@@ -19282,6 +19521,7 @@ async function wireVaultCards(organizationId) {
         const row = button.closest('[data-vi]');
         const panel = row.querySelector('.vault-reveal-panel');
         panel.hidden = !panel.hidden;
+        button.setAttribute('aria-expanded', String(!panel.hidden));
         if (panel.hidden) panel._conceal?.();
         else panel.querySelector('[data-vi-reveal-load]').focus();
       }));
@@ -19338,15 +19578,75 @@ async function wireVaultCards(organizationId) {
         } catch (e) { toast(e.message, true); }
       }));
       list.querySelectorAll('[data-vi-del]').forEach((button) => button.addEventListener('click', async () => {
-        if (!confirm('Delete this vault item (and its secrets)?')) return;
+        const item = vaultItems.find((candidate) => candidate.id === button.dataset.viDel);
+        if (!confirm(`Delete “${item?.label || 'this vault item'}” and its secrets?`)) return;
         try {
-          await api(`/api/vault/items/${button.dataset.viDel}${oq}`, { method: 'DELETE' });
-          await renderItems();
-          paint();
+          await api(`/api/vault/items/${encodeURIComponent(button.dataset.viDel)}${oq}`, { method: 'DELETE' });
+          await repaint();
         } catch (e) { toast(e.message, true); }
       }));
+      paintTypes();
       filterRows();
     };
+    const repaint = async () => {
+      const focusedRow = document.activeElement?.closest?.('[data-vi]')?.dataset.vi;
+      await renderItems();
+      paint();
+      if (focusedRow && !list.querySelector(`[data-vi="${CSS.escape(focusedRow)}"]`)) search.focus();
+    };
+    // Bulk actions over the ticked credentials, a few requests at a time.
+    const eachSelected = async (button, verb, run) => {
+      const targets = vaultItems.filter((item) => selected.has(item.id));
+      if (!targets.length) return [];
+      if (button) button.disabled = true;
+      const failed = [];
+      let next = 0;
+      await Promise.all(Array.from({ length: Math.min(4, targets.length) }, async () => {
+        while (next < targets.length) {
+          const item = targets[next++];
+          try { await run(item); } catch (error) { failed.push([item, error]); }
+        }
+      }));
+      if (button) button.disabled = false;
+      const done = targets.length - failed.length;
+      if (failed.length) toast(`${verb} ${done} of ${targets.length}. ${failed[0][0].label}: ${failed[0][1].message}`, true);
+      else toast(`${verb} ${done} credential${done === 1 ? '' : 's'}`);
+      return failed;
+    };
+    overlay.querySelector('[data-vm-bulk-delete]').addEventListener('click', async (event) => {
+      const n = selected.size;
+      if (!confirm(`Delete ${n} credential${n === 1 ? '' : 's'} and their secrets?`)) return;
+      const failed = await eachSelected(event.currentTarget, 'Deleted',
+        (item) => api(`/api/vault/items/${encodeURIComponent(item.id)}${oq}`, { method: 'DELETE' }));
+      selected.clear();
+      failed.forEach(([item]) => selected.add(item.id));
+      await repaint();
+      if (!list.contains(document.activeElement)) search.focus();
+    });
+    for (const [selector, field] of [['.vm-bulk-use', 'use'], ['.vm-bulk-reveal', 'reveal']]) {
+      const control = overlay.querySelector(selector);
+      control.addEventListener('change', async () => {
+        const value = control.value;
+        if (!value) return;
+        control.disabled = true;
+        await eachSelected(null, `${field === 'use' ? 'Blind use' : 'Agent sees'} “${value}” for`, (item) => savePolicy(item, { [field]: value }));
+        control.disabled = false;
+        control.value = '';
+        paint();
+      });
+    }
+    overlay.querySelector('[data-vm-bulk-clear]').addEventListener('click', () => { selected.clear(); syncSelection(); search.focus(); });
+    all.addEventListener('change', () => {
+      rowsOf().filter((row) => !row.hidden).forEach((row) => { if (all.checked) selected.add(row.dataset.vi); else selected.delete(row.dataset.vi); });
+      syncSelection();
+    });
+    overlay.querySelector('.vm-types').addEventListener('click', (event) => {
+      const chip = event.target.closest('[data-vm-type]');
+      if (!chip) return;
+      type = chip.dataset.vmType;
+      paintTypes();
+      filterRows();
+    });
     paint();
     const opener = document.activeElement;
     const close = () => {
@@ -19354,10 +19654,12 @@ async function wireVaultCards(organizationId) {
       overlay.remove();
       opener?.focus?.();
     };
-    // Enter opens the highlighted credential, as View does.
+    // Enter opens the highlighted credential, as View does; on its checkbox it ticks it.
     syncKeys = wireVaultListKeys(overlay, {
-      search, rows: () => [...list.querySelectorAll('[data-vi]')], close,
+      search, rows: rowsOf, close,
       onEnter: (row) => {
+        const pick = row.querySelector('.vault-manage-pick');
+        if (document.activeElement === pick) return pick.click();
         const view = row.querySelector('[data-vi-reveal]');
         if (view.disabled) return;
         if (row.querySelector('.vault-reveal-panel').hidden) view.click();
@@ -21095,11 +21397,11 @@ function accountErasureMarkup(preview) {
     ${record ? `<p class="task-sub">${esc(record.state)} · completed cleanup: ${esc(record.steps.join(', '))}${record.retryRequired ? ' · cleanup incomplete; retry required' : ''}${due ? ' · retention review overdue' : ''}</p>
       <a class="btn sm" href="/api/users/${encodeURIComponent(preview.userId)}/erasure/export" download>Download suppression manifest</a>
       <p class="task-sub">Keep the manifest securely outside the backup restore set. Reapply its closure and content actions before restoring service. This is a manual recovery control, not an automatic restore filter.</p>
-      ${closed ? record.items.map((item, index) => `<div class="card" data-erasure-item="${index}"><p>${esc(item.label)}</p>
+      ${closed ? record.items.map((item, index) => `<div class="card" data-erasure-item="${index}" data-unsaved><p>${esc(item.label)}</p>
         <label class="form-row">Outcome<select data-erasure-outcome><option value="">Unreviewed</option>${['erased', 'redacted', 'retained', 'not-applicable'].map(outcome => `<option value="${outcome}" ${item.decision?.outcome === outcome ? 'selected' : ''}>${outcome}</option>`).join('')}</select></label>
         <label class="form-row">Evidence / controller instructions / lawful retention reason<textarea data-erasure-evidence maxlength="4000" placeholder="References and reasoning only; do not copy personal content.">${esc(item.decision?.evidence || '')}</textarea></label>
         <label class="form-row">Review / expiry date (required for retention and backups)<input type="date" data-erasure-review-at value="${item.decision?.reviewAt ? new Date(item.decision.reviewAt).toISOString().slice(0, 10) : ''}"></label>
-        <button class="btn sm" data-erasure-save="${index}">Save decision</button></div>`).join('') : ''}
+        <button class="btn sm" data-erasure-save="${index}" data-unsaved-save>Save decision</button></div>`).join('') : ''}
       ${closed ? `<p class="task-sub">Review completion records your decisions; it is not proof of universal erasure. Retention exceptions remain subject to their review dates.</p>
         <label class="form-row">Type REVIEWED ${esc(preview.userId)}<input id="erasure-reviewed" autocomplete="off"></label>
         <button class="btn" id="erasure-complete" ${record.items.some(item => !item.decision) || due ? 'disabled' : ''}>Mark review complete</button>` : ''}` : ''}
@@ -21221,11 +21523,11 @@ function serviceLimitEditorMarkup(view, service) {
   const organization = ['e2b', 'daytona', 'agentmail'].includes(service.id) ? field('Account of',
     `<select data-operator-organization>${(S.organizations || []).map((organization) => `<option value="${esc(organization.id)}" ${organization.id === view.operatorOrganizationId ? 'selected' : ''}>${esc(organization.name)}</option>`).join('')}</select>`,
     'The organization whose E2B, Daytona and AgentMail connections are yours.') : '';
-  return `<div class="limits-editor" data-limits-editor="${esc(service.id)}">
+  return `<div class="limits-editor" data-limits-editor="${esc(service.id)}" data-unsaved>
     ${field('Plan', `<input data-plan maxlength="60" value="${esc(service.planSource === 'entered' ? service.plan : '')}" placeholder="${esc(service.planSource !== 'entered' && service.plan ? service.plan : 'Plan name')}">`)}
     ${limits}${cloudflare}${organization}
     ${field('Upgrade link', `<input type="url" data-link value="" placeholder="${esc(service.link?.url || 'https://…')}">`)}
-    <div class="limits-editor-actions"><button type="button" class="btn sm primary" data-limits-save>Save</button>
+    <div class="limits-editor-actions"><button type="button" class="btn sm primary" data-limits-save data-unsaved-save>Save</button>
       <button type="button" class="btn sm" data-limits-reset title="Use the published plan, limits and link">Reset</button>
       <button type="button" class="btn sm" data-limits-cancel>Cancel</button></div>
   </div>`;
@@ -21298,7 +21600,7 @@ function installationView() {
       <div class="settings-section-title" id="installation-stripe"><div>Agent cards ${policyTip(`Optional Stripe Connect application for cards agents spend from—not SaaS subscriptions`)}</div></div>${stripePlatformCard()}
       <div class="settings-section-title" id="installation-email"><div>Email ${policyTip(`Account confirmation, password reset, and organization invitations`)}</div></div>${outboundEmailCard()}
       <div class="settings-section-title" id="installation-access"><div>Phone access ${policyTip(`Secure reachability for this host`)}</div></div>${phone}
-      ${S.meta.hosted ? '<div class="settings-section-title" id="installation-users"><div>Users ${policyTip(`Close a person’s account and erase their data`)}</div></div><div class="card" id="installation-users-card">Loading users…</div>' : ''}
+      ${S.meta.hosted ? `<div class="settings-section-title" id="installation-users"><div>Users ${policyTip('Close a person’s account and erase their data')}</div></div><div class="card" id="installation-users-card">Loading users…</div>` : ''}
     </div>
   </div></div>`;
 }
@@ -21699,9 +22001,9 @@ function organizationView() {
 
     <div class="settings-section-title" id="settings-advanced" data-settings-advanced hidden><div>Advanced</div></div>
     <div class="card" data-settings-access="organization" hidden><div class="setting-rows">
-      <div class="setting-row"><span class="setting-label">Name ${policyTip('Also its web address. Links to the old one keep working.')}</span>
+      <div class="setting-row" data-unsaved><span class="setting-label">Name ${policyTip('Also its web address. Links to the old one keep working.')}</span>
         <span class="setting-value"><input id="organization-name" class="setting-input" value="${esc(org?.name || '')}" aria-label="Organization name"></span>
-        <span class="setting-actions"><button class="btn sm primary" id="rename-organization">Save</button></span></div>
+        <span class="setting-actions"><button class="btn sm primary" id="rename-organization" data-unsaved-save>Save</button></span></div>
       <div class="setting-row"><span class="setting-label">Data ${policyTip('A readable JSON archive of this organization, grouped into complete record collections. Passwords, tokens and stored credentials are never included.')}</span>
         <span class="setting-value setting-muted">JSON archive</span>
         <span class="setting-actions"><button class="btn sm" id="export-organization" type="button">Export</button></span></div>
@@ -21709,7 +22011,7 @@ function organizationView() {
         <span class="setting-value setting-muted">Permanent</span>
         <span class="setting-actions"><button class="btn sm danger" id="delete-organization">Delete…</button></span></div>` : ''}
     </div></div>
-    <details class="card settings-disclosure" data-settings-access="organization" hidden><summary><b>Single sign-on &amp; directory sync</b><span>For companies with an identity provider</span></summary><p class="task-sub">OIDC signs employees in through your company; SCIM adds, removes and groups them. Use the values your identity administrator gives you.</p><div id="org-identity">Loading…</div></details>
+    <details class="card settings-disclosure" data-settings-access="organization" hidden><summary><b>Single sign-on &amp; directory sync</b><span>For companies with an identity provider</span></summary><p class="task-sub">OIDC signs employees in through your company; SCIM adds, removes and groups them. Use the values your identity administrator gives you.</p><div id="org-identity" data-unsaved>Loading…</div></details>
     <div class="settings-section-title" id="settings-experimental"><div>Experimental ${policyTip(`Optional features for this organization`)}</div></div>
     ${AVATAR_RISK_NOTE}
     <div class="card"><div id="organization-avatar-settings">Loading…</div></div>
@@ -22106,9 +22408,9 @@ async function hydrateOrganizationView(panes = ORGANIZATION_PANES) {
       if (identityPolicy) $('#org-identity').innerHTML = `<label class="form-row">OIDC provider ID<input id="oidc-provider" value="${esc(identityPolicy.oidcProviderId || S.sso?.providerId || '')}" /></label>
         <label class="form-row">Verified email domains<input id="identity-domains" value="${esc((identityPolicy.verifiedDomains || []).join(', '))}" placeholder="company.com" /></label>
         <label class="switch"><input id="enforce-sso" type="checkbox" ${identityPolicy.enforceSso ? 'checked' : ''}/>Require SSO for this organization</label>
-        <div class="inline-form"><button class="btn sm primary" id="save-identity">Save policy</button><button class="btn sm" id="rotate-scim">Rotate SCIM token</button></div>
+        <div class="inline-form"><button class="btn sm primary" id="save-identity" data-unsaved-save>Save policy</button><button class="btn sm" id="rotate-scim">Rotate SCIM token</button></div>
         <div id="scim-result" class="task-sub">SCIM base URL: <span class="mono">${esc(location.origin)}/scim/v2/${esc(S.organizationId)}</span></div>`;
-      setEventHandler($('#save-identity'), 'click', async () => { try { await api(`/api/organizations/${S.organizationId}/identity-policy`, { method: 'PUT', body: JSON.stringify({ oidcProviderId: $('#oidc-provider').value.trim(), verifiedDomains: $('#identity-domains').value.split(',').map((x) => x.trim()).filter(Boolean), enforceSso: $('#enforce-sso').checked }) }); toast('Identity policy saved'); } catch (e) { toast(e.message, true); } });
+      setEventHandler($('#save-identity'), 'click', async () => { try { await api(`/api/organizations/${S.organizationId}/identity-policy`, { method: 'PUT', body: JSON.stringify({ oidcProviderId: $('#oidc-provider').value.trim(), verifiedDomains: $('#identity-domains').value.split(',').map((x) => x.trim()).filter(Boolean), enforceSso: $('#enforce-sso').checked }) }); markSaved($('#save-identity')); toast('Identity policy saved'); } catch (e) { toast(e.message, true); } });
       setEventHandler($('#rotate-scim'), 'click', async () => { try { const result = await api(`/api/organizations/${S.organizationId}/scim-token`, { method: 'POST', body: '{}' }); $('#scim-result').innerHTML = `Copy this token now; it is stored only as a hash:<br><span class="mono">${esc(result.token)}</span>`; } catch (e) { toast(e.message, true); } });
     },
   };
@@ -22308,6 +22610,8 @@ const HOST_COMMANDS = [
   { id: 'nav.searchProjects', title: 'Search projects', key: 'p /', group: 'Projects', run: () => { revealRail(); $('#project-search')?.focus(); } },
   { id: 'nav.profile', title: 'Go to your profile', key: 'g A', ...navCommand(() => profileRoute()) },
   { id: 'nav.notifications', title: 'Go to inbox', key: 'g N', ...navCommand(() => inboxRoute(DEFAULT_LIST_QUERY)) },
+  { id: 'nav.vault', title: 'Go to passwords & payments', key: 'g V', ...navCommand(() => `${globalRoute('organization')}#settings-payments`) },
+  { id: 'view.save', title: 'Save search as view', key: 'v s', group: 'Views', available: () => isTaskListTab() && !S.selected && canSaveViews(), run: () => saveCurrentView() },
   { id: 'nav.close', title: 'Close panel', key: null, run: () => closeTopOverlay() }, // Esc — handled by the dispatcher
 ];
 
@@ -22317,8 +22621,12 @@ function allCommands() {
   const add = (c) => out.push({ available: true, ...c, keys: c.keybinding ? parseKeybinding(c.keybinding) : null });
   for (const h of HOST_COMMANDS) {
     const d = declared.get(h.id);
-    add({ id: h.id, title: d?.title || h.title, keybinding: d ? d.keybinding : h.key, group: h.group || 'Navigation', run: h.run, href: h.href });
+    add({ id: h.id, title: d?.title || h.title, keybinding: d ? d.keybinding : h.key, group: h.group || 'Navigation', run: h.run, href: h.href,
+      ...(h.available ? { available: h.available() } : {}) });
   }
+  // The list's views (`v 1`…`v 9`) and the page's toolbar buttons (`. 1`…`. 9`).
+  viewCommands().forEach(add);
+  toolbarCommands().forEach(add);
   // Interaction grammar (host-owned, not server-declared): a list cursor on the
   // tasks/queue views; with a task page open the same keys walk between tasks. When
   // focus sits in the projects rail (g p), the same keys walk the rail instead.
@@ -22428,7 +22736,7 @@ function openActionForm(a) {
     <div style="padding:14px 16px">${(a.args || []).map(control).join('')}</div>
     <div style="padding:12px 16px;border-top:1px solid var(--line);display:flex;gap:8px;justify-content:flex-end;background:var(--surface-2)">
       <button class="btn" id="act-cancel">Cancel</button>
-      <button class="btn ${a.danger ? 'danger' : 'primary'}" id="act-send">${esc(a.label || a.name)}</button>
+      <button class="btn ${a.danger ? 'danger' : 'primary'}" id="act-send" data-submit>${esc(a.label || a.name)}</button>
     </div></div></div>`;
   const close = () => (root.remove());
   $('#act-scrim').addEventListener('click', (e) => { if (e.target.id === 'act-scrim') close(); });
@@ -22573,21 +22881,135 @@ function controlShortcut(control) {
     const keys = bound ? fmtKeys(bound.keybinding) : control.querySelector('.kbd')?.textContent;
     return keys ? { keys, title: control.dataset.label } : null;
   }
-  const command = cmds.find((c) => c.id === control.dataset.shortcut);
+  const command = cmds.find((c) => c.target === control) || cmds.find((c) => c.id === control.dataset.shortcut);
   return command?.keybinding ? { keys: fmtKeys(command.keybinding), title: command.title } : null;
 }
 function echoClickedShortcut(e) {
   // Clicks a command fires itself (digits press action buttons) are untrusted;
   // the keys that fired it are already showing.
   if (!e.isTrusted || !e.target?.closest) return;
-  const control = e.target.closest('[data-shortcut], [data-keys], #tp-foot [data-act]');
+  const control = e.target.closest('[data-shortcut], [data-keys], [data-tool], #tp-foot [data-act]');
   const hint = control && controlShortcut(control);
-  if (hint) echoKeys(hint.keys, hint.title);
+  if (hint) return echoKeys(hint.keys, hint.title);
+  // The button ⌘/Ctrl+Enter would press from here teaches that, too.
+  const button = e.target.closest('button');
+  if (button && submitsByKey(button)) echoKeys(fmtKeys('meta+Enter'), actionLabel(button));
+}
+
+// -- views: `v 1`…`v 9` switch the list's view, `v s` saves the search as one --
+// Numbered in the order the chips show. Away from a list they open the
+// organization home in that view.
+function viewCommands() {
+  const onList = isTaskListTab() && !S.selected;
+  const tab = onList ? S.tab : 'home';
+  const route = (q) => (onList ? listQueryRoute(q) : homeRoute(undefined, q));
+  return listViewChips(tab).slice(0, 9).map((v, i) => ({
+    id: `view.${i + 1}`, title: `View: ${v.name}`, keybinding: `v ${i + 1}`, group: 'Views', help: false,
+    available: onList || !!S.organizationId,
+    href: () => route(v.query), run: () => (onList ? setQuery(v.query) : go(route(v.query))),
+  }));
+}
+
+// -- toolbar: `. 1`…`. 9` press the page's tool buttons -----------------------
+// A task's Share, Fork, Work locally, full screen; a project's Work locally.
+// Numbered in the order they show, which is the order their hints appear in.
+function toolbarButtons() {
+  return [...document.querySelectorAll('[data-tool]')].filter((b) => !b.disabled && b.getClientRects().length);
+}
+function toolbarCommands() {
+  return toolbarButtons().slice(0, 9).map((b, i) => ({
+    id: `tool.${i + 1}`, title: b.dataset.tool, keybinding: `. ${i + 1}`, group: 'Toolbar', help: false,
+    target: b, run: () => b.click(),
+  }));
+}
+
+// -- chord hints: a pending prefix badges what it can reach -------------------
+// After `v`, `.` or `g`, every visible control the next key would press shows
+// that key beside it — the same registry as dispatch, so the badges are always
+// the keys that work. Controls name their command in `data-shortcut`, or the
+// command carries its `target`.
+function showChordHints(cmds) {
+  hideChordHints();
+  const layer = document.createElement('div');
+  layer.id = 'chord-hints';
+  layer.setAttribute('aria-hidden', 'true');
+  const steps = CHORD.pending.length;
+  for (const c of cmds) {
+    if (c.keys.length <= steps || !CHORD.pending.every((p, i) => stepMatches(c.keys[i], p))) continue;
+    const targets = c.target ? [c.target] : document.querySelectorAll(`[data-shortcut="${CSS.escape(c.id)}"]`);
+    for (const target of targets) {
+      const r = target.getBoundingClientRect();
+      if (!r.width || r.bottom < 0 || r.top > innerHeight) continue;
+      const hint = document.createElement('kbd');
+      hint.className = 'chord-hint';
+      hint.textContent = fmtKeys(c.keybinding).split(' ').slice(steps).join(' ');
+      hint.style.left = `${Math.round(r.right)}px`;
+      hint.style.top = `${Math.round(r.top)}px`;
+      layer.appendChild(hint);
+    }
+  }
+  if (!layer.childElementCount) return 0;
+  document.body.appendChild(layer);
+  return layer.childElementCount;
+}
+function hideChordHints() { document.getElementById('chord-hints')?.remove(); }
+if (typeof window !== 'undefined') {
+  window.addEventListener('scroll', hideChordHints, true);
+  window.addEventListener('resize', hideChordHints);
+}
+
+// -- ⌘/Ctrl+Enter: the main button of where you are --------------------------
+// In a dialog: its one primary button (Apply, Save, Create, Continue …), or the
+// one nearest the focus. On a page: the primary button of the form or card you
+// are typing in, else the Save of the one form with unsaved changes. A control
+// marks itself `data-submit` to be the pick where a surface has several. Pure
+// DOM — no surface registers anything.
+const SUBMIT_SAVES = '[data-unsaved-save], .params-save-bar .btn.primary';
+const SUBMIT_PRIMARY = `${SUBMIT_SAVES}, [data-submit], button.btn.primary, button[type="submit"]`;
+const SUBMIT_FORM = 'form, .card, [data-unsaved], .params-save-bar, .modal-card, dialog';
+function topSurface() {
+  const dialogs = [...document.querySelectorAll('body > .modal-overlay, dialog[open]')];
+  return dialogs.at(-1) || $('#modal-root')?.lastElementChild || $('#overlay-root')?.firstElementChild || null;
+}
+function submitTarget(from = document.activeElement) {
+  const surface = topSurface();
+  const root = surface || $('#main');
+  if (!root) return null;
+  const inside = from && from !== document.body && root.contains(from) ? from : null;
+  const usable = (b) => {
+    if (b.disabled || !b.getClientRects().length || b.closest('[hidden], [inert]')) return false;
+    if (!b.matches('[data-unsaved-save]')) return true;
+    const region = b.closest('[data-unsaved]');
+    return !region || region.contains(inside) || unsavedState(region).dirty;
+  };
+  const among = (el, selector) => [...el.querySelectorAll(selector)].filter(usable);
+  if (inside?.matches(SUBMIT_PRIMARY) && usable(inside)) return inside;
+  // Nearest first: the one button of the form you are in. On a page, a plain
+  // primary button counts only inside that form; beyond it, only saves.
+  let selector = SUBMIT_PRIMARY;
+  for (let el = inside; el && el !== root && root.contains(el); el = el.parentElement) {
+    const found = among(el, selector);
+    if (found.length === 1) return found[0];
+    if (found.length > 1) break;
+    if (!surface && el.matches(SUBMIT_FORM)) selector = SUBMIT_SAVES;
+  }
+  const all = among(root, surface ? SUBMIT_PRIMARY : SUBMIT_SAVES);
+  if (all.length === 1) return all[0];
+  const marked = all.filter((b) => b.matches('[data-submit]'));
+  return marked.length === 1 ? marked[0] : null;
+}
+// Is `button` what ⌘/Ctrl+Enter presses while typing in its form? Then a click
+// on it teaches that key in the topbar echo.
+function submitsByKey(button) {
+  const form = button.closest(SUBMIT_FORM) || topSurface();
+  const field = [...(form?.querySelectorAll('textarea, select, input:not([type="hidden"]):not([type="file"])') || [])]
+    .find((el) => el.getClientRects().length);
+  return !!field && submitTarget(field) === button;
 }
 
 // -- the dispatcher ------------------------------------------------------------
 const CHORD = { pending: [], timer: 0 };
-function resetChord() { CHORD.pending = []; clearTimeout(CHORD.timer); clearPendingEcho(); }
+function resetChord() { CHORD.pending = []; clearTimeout(CHORD.timer); clearPendingEcho(); hideChordHints(); }
 // A bare modifier keydown (Shift/Ctrl/Alt/Meta) fires on its own before the key
 // it modifies. It must be transparent to the chord buffer — otherwise pressing
 // Shift for the second step of a shifted chord (`g P`, `g W`, `g D`, `g S`, …)
@@ -22625,8 +23047,10 @@ function dispatchKey(e) {
   if (exact && !longer) { resetChord(); echoKeys(fmtKeys(exact.keybinding), exact.title); exact.run(); return true; }
   CHORD.pending.push(snap); // a chord prefix ('g' …) — wait briefly for the rest
   echoKeys(fmtKeys(candidates[0].keybinding).split(' ').slice(0, CHORD.pending.length).join(' '), '', true);
+  // The controls the prefix can reach show their next key; reading them takes longer.
+  const hinted = showChordHints(cmds);
   clearTimeout(CHORD.timer);
-  CHORD.timer = setTimeout(resetChord, 900);
+  CHORD.timer = setTimeout(resetChord, hinted ? 4000 : 900);
   return true;
 }
 function bindKeys() {
@@ -22635,6 +23059,17 @@ function bindKeys() {
     // A component-level handler that prevented the event already owns it (for
     // example a composite role=button with richer Enter/Space behavior).
     if (e.defaultPrevented || e.isComposing) return;
+    // ⌘/Ctrl+Enter presses the main button of where you are (a dialog's, the
+    // form's Save), whatever has focus — unless a control already took it.
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey) {
+      const button = submitTarget(t);
+      if (button) {
+        e.preventDefault();
+        resetChord();
+        if (!e.repeat) { echoKeys(fmtKeys('meta+Enter'), actionLabel(button)); button.click(); }
+        return;
+      }
+    }
     const typing = takesTypedKeys(t);
     // Security and vault dialogs are direct body children: modal too, but they
     // close themselves, so Esc must not also pop whatever lies beneath them.
@@ -22736,25 +23171,39 @@ function openPalette() {
 }
 
 // -- "?" help: the same registry, grouped — includes every workflow's commands -
+// Rows come from the registry; the families of numbered keys (views, toolbar,
+// action buttons) and the keys that are not commands (⌘↵, Esc, the task-page
+// grammar documented before a task is open) are listed once each.
+const HELP_GENERAL = ['nav.commandPalette', 'help.keyboard', 'nav.newTask', 'nav.search'];
 function openHelp() {
   const root = createTransientOverlay();
   const cmds = allCommands().filter((c) => c.keybinding && c.help !== false);
-  const groups = [...new Set(cmds.map((c) => c.group))];
-  const row = (k, title, sub) => `<div class="help-row"><span class="key">${k}</span><span>${title}${sub ? ` <span class="pal-sub">${esc(sub)}</span>` : ''}</span></div>`;
-  root.innerHTML = `<div class="palette-scrim" id="help-scrim"><div class="palette" style="width:min(560px,92vw);max-height:80vh;overflow:auto">
-    <div style="padding:14px 16px;border-bottom:1px solid var(--line);display:flex;align-items:center"><b>Keyboard shortcuts</b><span style="flex:1"></span><button class="icon-btn" id="help-close">✕</button></div>
-    <div style="padding:6px 16px 16px">
-      ${groups.map((g) => `<div class="section-h">${esc(g)}</div>${cmds.filter((c) => c.group === g).map((c) => row(esc(fmtKeys(c.keybinding)), esc(c.title), c.workflow)).join('')}`).join('')}
-      <div class="section-h">On a task page</div>
-      ${row('1–9', 'Press the Nth action button (whatever the workflow declares)')}
-      ${row('[ / ]', 'Chat / Parameters')}
-      ${row('{ / }', 'Previous / next attempt')}
-      ${row('a n', 'New attempt (open editable draft)')}
-      ${row('i', 'Show / hide details')}
-      ${row('t', 'Terminal / conversation')}
-      ${row('u', 'Back to the list')}
-      ${row(esc(fmtKeys('meta+Enter')), 'Send a message (in the compose box)')}
-    </div></div></div>`;
+  const row = (k, title, sub) => `<div class="help-row"><span class="key">${esc(k)}</span><span>${esc(title)}${sub ? ` <span class="pal-sub">${esc(sub)}</span>` : ''}</span></div>`;
+  const rows = (list) => list.map((c) => row(fmtKeys(c.keybinding), c.title, c.workflow)).join('');
+  const group = (g) => cmds.filter((c) => c.group === g && !HELP_GENERAL.includes(c.id));
+  const sections = [
+    ['General', rows(HELP_GENERAL.map((id) => cmds.find((c) => c.id === id)).filter(Boolean))
+      + row(fmtKeys('meta+Enter'), 'Save, apply or send')
+      + row('Esc', 'Close · leave a field · exit full screen')],
+    ['Navigation', rows(group('Navigation'))],
+    ['Views', row('v 1–9', 'Switch view') + rows(group('Views'))],
+    ['List', rows(group('List'))],
+    ['On a task page', rows(group('Task'))
+      + row('1–9', 'Action buttons')
+      + row('. 1–9', 'Share, Fork, Work locally, Full screen')
+      + row('[ / ]', 'Chat / Parameters')
+      + row('{ / }', 'Previous / next attempt')
+      + row('a n', 'New attempt')
+      + row('i', 'Show / hide details')
+      + row('t', 'Terminal / conversation')
+      + row('u', 'Back to the list')],
+    ['Projects', rows(group('Projects'))],
+    ['Settings', row('{ / }', 'Previous / next section')],
+  ];
+  root.innerHTML = `<div class="palette-scrim" id="help-scrim"><div class="palette help-panel" role="dialog" aria-label="Keyboard shortcuts">
+    <div class="help-head"><b>Keyboard shortcuts</b><span class="help-tip">${policyTip('Press a prefix key (g, v, .) and the keys it can reach show beside their buttons.')}</span><span style="flex:1"></span><button class="icon-btn" id="help-close" aria-label="Close">✕</button></div>
+    <div class="help-grid">${sections.filter(([, body]) => body).map(([title, body]) => `<section class="help-section"><div class="section-h">${esc(title)}</div>${body}</section>`).join('')}</div>
+  </div></div>`;
   $('#help-close').addEventListener('click', () => (root.remove()));
   $('#help-scrim').addEventListener('click', (e) => { if (e.target.id === 'help-scrim') root.remove(); });
 }

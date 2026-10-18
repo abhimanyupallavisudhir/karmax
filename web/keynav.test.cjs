@@ -236,6 +236,10 @@ ok(openTaskFormSource.includes("activeFormToken !== formToken || !root.querySele
 // Exercise the task page's keys through the real command registry and key dispatcher.
 global.S = { selected: 'one', view: {}, tab: 'tasks' };
 global.HOST_COMMANDS = [];
+// The numbered families read the page; this model page has neither views nor tools.
+global.viewCommands = global.toolbarCommands = () => [];
+global.showChordHints = () => 0;
+global.hideChordHints = () => {};
 global.inRail = () => false;
 global.openCursorRow = global.archiveCursorRow = () => {};
 let newAttempts = 0, taskMoves = 0, attemptKeydown;

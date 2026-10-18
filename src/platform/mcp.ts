@@ -7,7 +7,7 @@ import { URGENCY_LEVELS, type AgentSpec, type AuthorizationSelection, type Provi
 import {
   AGENT_ROLE_NAMES, PLATFORM_REQUEST_BODY_SCHEMA, PLATFORM_REQUEST_EXCLUDED_PATHS,
   PRIORITY_NAMES, compactSearch, compactOrganizationSearch, compactTags, normalizePlatformPath, normalizeRequestBody,
-  platformRequestPathError, CREATE_TASK_GRANTS, REQUEST_FOR_TASK, QUEUE_TASK_DESCRIPTION, queuedTaskReply,
+  platformRequestPathError, CREATE_TASK_GRANTS, REQUEST_FOR_TASK, PERMISSION_ROUTING, QUEUE_TASK_DESCRIPTION, queuedTaskReply,
   type CompactTask,
 } from './platform-request.js';
 import { BRAND } from '../domain/brand.js';
@@ -589,9 +589,7 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
     {
       description:
         'Request exact capabilities and/or additional projectIds for this task. Project expansion retains existing projects and applies the task authorization in added projects. The request appears in the task Approval Requests tab ' +
-        'and is routed to selected people, teams, or Avatars. Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @maintainers, @admins, ' +
-        '@superadmins, @owners, @project, or @all; omit audience to summon the lowest level that can grant it (@maintainers, @admins or @superadmins). ' +
-        'Discover valid choices with platform_request GET /api/agent/escalation-targets. ' +
+        'and is routed to the selected tasks, people, teams, or Avatars. ' + PERMISSION_ROUTING +
         'Only a selected principal that already holds the requested capabilities and can grant the full task authorization across the expanded scope can approve; approval resumes the task ' +
         'with a newly scoped token. Do not request wildcards. Approval requests are high urgency by default; ' +
         'pass urgency to raise or lower how loudly the human is alerted. ' + REQUEST_FOR_TASK,

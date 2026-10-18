@@ -1258,6 +1258,9 @@ export class Store {
     if (!preferenceCols.some(column => column.name === 'dismissed')) await this.db.exec('ALTER TABLE user_preferences ADD COLUMN dismissed TEXT');
     const repositoryCols = await this.db.prepare('PRAGMA table_info(repositories)').all() as { name: string }[];
     if (!repositoryCols.some(column => column.name === 'upstream')) await this.db.exec('ALTER TABLE repositories ADD COLUMN upstream TEXT');
+    const savedViewCols = await this.db.prepare('PRAGMA table_info(saved_views)').all() as { name: string }[];
+    if (!savedViewCols.some(column => column.name === 'organizationId')) await this.db.exec('ALTER TABLE saved_views ADD COLUMN organizationId TEXT');
+    await this.db.exec('CREATE INDEX IF NOT EXISTS idx_saved_views_organization ON saved_views(organizationId)');
     const candidateCols = await this.db.prepare('PRAGMA table_info(resource_candidates)').all() as { name: string }[];
     if (!candidateCols.some(column => column.name === 'error')) await this.db.exec('ALTER TABLE resource_candidates ADD COLUMN error TEXT');
     const cols = (await this.db.prepare('PRAGMA table_info(tasks)').all()) as any[];
@@ -2481,7 +2484,8 @@ export class Store {
       events: (await rowsFor(this.db, 'events', 'taskId', taskIds)).filter(row => includeTiming || row.type !== 'timing'),
       tags: (await rowsFor(this.db, 'tags', 'projectId', projectIds)),
       task_tags: (await rowsFor(this.db, 'task_tags', 'taskId', taskIds)),
-      saved_views: (await rowsFor(this.db, 'saved_views', 'projectId', projectIds)),
+      saved_views: [...(await rowsFor(this.db, 'saved_views', 'projectId', projectIds)),
+        ...(await selectRows(this.db, 'saved_views', "organizationId=? AND projectId=''", [organizationId]))],
       git_connections: (await selectRows(this.db, 'git_connections', 'organizationId=?', [organizationId])),
       repositories: (await rowsFor(this.db, 'repositories', 'id', repositoryIds)),
       project_repositories: (await rowsFor(this.db, 'project_repositories', 'projectId', projectIds)),
@@ -2796,6 +2800,7 @@ export class Store {
       (await this.deleteProjectKv(projectIds, taskIds));
       for (const table of ['project_memberships', 'project_repositories', 'project_wikis', 'task_lists', 'tags', 'saved_views', 'world_checkpoints'] as const)
         (await deleteRows(this.db, table, 'projectId', projectIds));
+      (await this.db.prepare("DELETE FROM saved_views WHERE organizationId=? AND projectId=''").run(organizationId));
       (await this.db.prepare('DELETE FROM preview_leases WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM executions WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM promoted_artifacts WHERE organizationId=?').run(organizationId));
@@ -5910,20 +5915,34 @@ export class Store {
     ).map(rowToView);
   }
 
+  /** The organization home's views (rows with no project). */
+  async listOrganizationViews(organizationId: string): Promise<SavedView[]> {
+    return (
+      (await this.db.prepare("SELECT * FROM saved_views WHERE organizationId = ? AND projectId = '' ORDER BY ord, createdAt").all(organizationId)) as any[]
+    ).map(rowToView);
+  }
+
   async getView(id: string): Promise<SavedView | undefined> {
     const r = (await this.db.prepare('SELECT * FROM saved_views WHERE id = ?').get(id)) as any;
     return r ? rowToView(r) : undefined;
   }
 
-  async createView(input: { projectId: string; name: string; query: TaskQuery; icon?: string }): Promise<SavedView> {
+  /** A view of one project's list, or (`organizationId`, no project) of the organization home. */
+  async createView(input: { projectId?: string; organizationId?: string; name: string; query: TaskQuery; icon?: string }): Promise<SavedView> {
+    const projectId = input.projectId ?? '';
+    const organizationId = projectId ? undefined : input.organizationId;
+    if (!projectId && !organizationId) throw new Error('a saved view belongs to a project or an organization');
     return this.db.transaction(async () => {
-    (await this.db.lock(`project:${input.projectId}`));
+    (await this.db.lock(projectId ? `project:${projectId}` : `organization-views:${organizationId}`));
 
-    const ord =
-      ((await this.db.prepare('SELECT COALESCE(MAX(ord), -1) AS m FROM saved_views WHERE projectId = ?').get(input.projectId)) as any).m + 1;
+    const last = (await (projectId
+      ? this.db.prepare('SELECT COALESCE(MAX(ord), -1) AS m FROM saved_views WHERE projectId = ?').get(projectId)
+      : this.db.prepare("SELECT COALESCE(MAX(ord), -1) AS m FROM saved_views WHERE organizationId = ? AND projectId = ''").get(organizationId))) as { m: number };
+    const ord = Number(last.m) + 1;
     const v: SavedView = {
       id: newId('view'),
-      projectId: input.projectId,
+      projectId,
+      ...(organizationId ? { organizationId } : {}),
       name: input.name.trim() || 'Untitled view',
       query: input.query ?? {},
       icon: input.icon,
@@ -5931,8 +5950,8 @@ export class Store {
       createdAt: Date.now(),
     };
     (await this.db
-      .prepare('INSERT INTO saved_views (id, projectId, name, query, icon, ord, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?)')
-      .run(v.id, v.projectId, v.name, JSON.stringify(v.query), v.icon ?? null, v.order, v.createdAt));
+      .prepare('INSERT INTO saved_views (id, projectId, organizationId, name, query, icon, ord, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(v.id, v.projectId, organizationId ?? null, v.name, JSON.stringify(v.query), v.icon ?? null, v.order, v.createdAt));
     return v;
   
     });
@@ -10427,6 +10446,7 @@ function rowToView(r: any): SavedView {
   return {
     id: r.id,
     projectId: r.projectId,
+    ...(r.organizationId && !r.projectId ? { organizationId: r.organizationId } : {}),
     name: r.name,
     query: JSON.parse(r.query),
     icon: r.icon ?? undefined,

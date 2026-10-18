@@ -79,6 +79,7 @@ global.S = {
 eval(extractFn('applyRoute'));
 eval(extractFn('applyHomeRoute'));
 eval(extractFn('applyListRoute'));
+global.loadOrgViews = async () => { calls.push('loadOrgViews'); };
 
 let pass = 0, fail = 0;
 const ok = (cond, msg) => { if (cond) { pass++; } else { fail++; console.error('FAIL:', msg); } };

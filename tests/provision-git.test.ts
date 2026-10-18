@@ -197,7 +197,14 @@ function hostTarget(env: Record<string, string>): ProvisionTarget {
 
 describe('seeding a cloud world from its local checkout', () => {
   const cleanups: string[] = [];
-  afterEach(() => { for (const dir of cleanups.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
+  // A straggling writer (see NO_MAINTENANCE) must not fail the cleanup.
+  afterEach(() => { for (const dir of cleanups.splice(0)) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
+
+  // Newer Git starts `git maintenance run --auto` in the background after a
+  // fetch or commit, which then writes into a clone being deleted (ENOTEMPTY,
+  // CI #2053; wiki ops/ci "Git background maintenance"). Never in these repos.
+  const NO_MAINTENANCE = [['maintenance.auto', 'false'], ['gc.auto', '0']] as const;
+  const quiet = async (repo: string) => { for (const [key, value] of NO_MAINTENANCE) await gitOrThrow(repo, ['config', key, value]); };
 
   async function makeRepoPair(prefix: string): Promise<{ root: string; source: string; env: Record<string, string> }> {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -205,16 +212,17 @@ describe('seeding a cloud world from its local checkout', () => {
     const source = path.join(root, 'source');
     fs.mkdirSync(source);
     await gitOrThrow(source, ['init', '-q', '-b', 'main']);
+    await quiet(source);
     await ensureIdentity(source);
     fs.writeFileSync(path.join(source, 'README.md'), '# base\n');
     await gitOrThrow(source, ['add', '-A']);
     await gitOrThrow(source, ['commit', '-q', '-m', 'base']);
     await gitOrThrow(root, ['clone', '-q', '--bare', source, path.join(root, 'remote.git')]);
-    const env = {
-      GIT_CONFIG_COUNT: '1',
-      GIT_CONFIG_KEY_0: `url.file://${root}/.insteadOf`,
-      GIT_CONFIG_VALUE_0: 'git@example:',
-    };
+    await quiet(path.join(root, 'remote.git'));
+    // Provisioning runs with this environment, so the world's clone is quiet too.
+    const config = [[`url.file://${root}/.insteadOf`, 'git@example:'], ...NO_MAINTENANCE];
+    const env: Record<string, string> = { GIT_CONFIG_COUNT: String(config.length) };
+    config.forEach(([key, value], index) => { env[`GIT_CONFIG_KEY_${index}`] = key; env[`GIT_CONFIG_VALUE_${index}`] = value; });
     return { root, source, env };
   }
 
@@ -250,6 +258,7 @@ describe('seeding a cloud world from its local checkout', () => {
     const { root, env } = await makeRepoPair('karmax-multi-fallback-');
     const second = path.join(root, 'second.git');
     await gitOrThrow(root, ['clone', '-q', '--bare', path.join(root, 'remote.git'), second]);
+    await quiet(second);
     await gitOrThrow(second, ['branch', '-m', 'main', 'master']);
     const result = await provisionGitRepos(hostTarget(env), {
       taskId: 'multi', base: 'master', target: 'master', repos: ['git@example:remote.git', 'git@example:second.git'],
@@ -367,6 +376,7 @@ describe('seeding a cloud world from its local checkout', () => {
     const { root, source, env } = await makeRepoPair('karmax-provision-origin-');
     const writer = path.join(root, 'writer');
     await gitOrThrow(root, ['clone', '-q', path.join(root, 'remote.git'), writer]);
+    await quiet(writer);
     await ensureIdentity(writer);
     fs.writeFileSync(path.join(writer, 'remote-only.txt'), 'new target state\n');
     await gitOrThrow(writer, ['add', '-A']);

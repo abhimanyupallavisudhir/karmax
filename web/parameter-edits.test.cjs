@@ -20,6 +20,7 @@ class Element {
   querySelectorAll() { return []; }
 }
 const sameJson = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+const SAVE_STATE_TEXT = vm.runInNewContext(`(${source.match(/const SAVE_STATE_TEXT = (\{[^}]*\});/)[1]})`);
 async function main() {
   // Choosing a preset with the mouse must notify the containing form too.
   const input = new Element(), menu = new Element(), caret = new Element();
@@ -36,7 +37,7 @@ async function main() {
   const record = { params: {} };
   let elements, complete, requests = [];
   const context = vm.createContext({
-    S: state, CSS: { escape: (x) => x }, sameJson, Object, structuredClone, AbortController,
+    S: state, CSS: { escape: (x) => x }, sameJson, Object, structuredClone, AbortController, SAVE_STATE_TEXT,
     document: { getElementById: (id) => elements[id] || null },
     wireAgentFields() {}, taskRecord: () => record,
     schemaFor: () => [{ name: 'target', label: 'Target', type: 'string', scopes: ['task'] }],
@@ -44,21 +45,25 @@ async function main() {
     toast() {}, setTimeout() {}, refreshTask() {}, refreshTasks() {},
     readModelField: () => ({ provider: 'claude', model: '', effort: '' }),
   });
-  vm.runInContext(['collectParamEdits', 'paramDirtyNames', 'setParamSaveState', 'wireParams', 'readMcpPicker', 'readAgentSpec', 'readAgentBlock',
+  vm.runInContext(['paintSaveState', 'collectParamEdits', 'paramDirtyNames', 'setParamSaveState', 'wireParams', 'readMcpPicker', 'readAgentSpec', 'readAgentBlock',
     'paramFields', 'agentParticipantLabel', 'taskAuthorityOf'].map(fn).join('\n'), context);
   const render = (value) => {
     const root = new Element(), button = new Element(), field = new Element(), bar = new Element();
     field.value = value;
     root.querySelector = (selector) => selector.startsWith('[data-field=') ? field : null;
     button.closest = () => bar;
-    elements = { 'tp-params': root, 'params-save': button, 'params-save-status': { lastElementChild: {} } };
+    const status = new Element();
+    elements = { 'tp-params': root, 'params-save': button, 'params-save-status': status };
     context.wireParams({ taskId: 'task', workflow: 'test', editableParams: ['target'] });
-    return { root, button, field };
+    return { root, button, field, status };
   };
   let form = render('main');
   assert.equal(form.button.disabled, true);
+  assert.equal(form.status.textContent, '', 'an untouched form says nothing');
   form.field.value = 'release'; await form.root.fire('input');
   assert.equal(form.button.disabled, false);
+  assert.equal(form.status.textContent, 'Unsaved changes');
+  assert.equal(form.status.dataset.state, 'dirty');
   const pending = form.button.fire('click');
   assert.equal(form.root.dataset.saveState, 'saving');
   form = render('release'); // WebSocket repaint while the request is pending
@@ -70,6 +75,8 @@ async function main() {
   assert.equal(state.paramEditDrafts.task.saved.target, 'release');
   const second = form.button.fire('click'); complete({}); await second;
   assert.equal(form.root.dataset.saveState, 'saved');
+  assert.equal(form.status.dataset.state, 'saved', 'a landed save says so');
+  assert.equal(form.status.textContent, 'Saved');
   assert.equal(state.paramEditDrafts.task, undefined);
   assert.equal(record.params.target, 'next');
   assert.deepEqual(requests, [{ params: { target: 'release' } }, { params: { target: 'next' } }]);
@@ -102,7 +109,7 @@ async function main() {
   let authElements, authChanged, pickVault, authComplete;
   const authRequests = [];
   const authContext = vm.createContext({
-    S: authState, sameJson, structuredClone, document: { getElementById: (id) => authElements[id] },
+    S: authState, sameJson, structuredClone, SAVE_STATE_TEXT, document: { getElementById: (id) => authElements[id] },
     taskRecord: () => authRecord,
     wireAuthorizationEditor: (_select, _projects, changed) => { authChanged = changed; },
     readAuthorizationEditor: (select) => structuredClone(select.selection),
@@ -114,7 +121,7 @@ async function main() {
       return new Promise((resolve) => { authComplete = resolve; });
     },
   });
-  vm.runInContext([fn('isAuthorizationGrantGap'), fn('saveTaskAuthorization'), fn('wireTaskAuthorization')].join('\n'), authContext);
+  vm.runInContext([fn('paintSaveState'), fn('isAuthorizationGrantGap'), fn('saveTaskAuthorization'), fn('wireTaskAuthorization')].join('\n'), authContext);
   const renderAuth = async (selection) => {
     const select = new Element(), button = new Element(), vault = new Element(), status = new Element(), bar = new Element();
     select.selection = selection; select.closest = () => null; button.closest = () => bar;
@@ -126,9 +133,10 @@ async function main() {
   let auth = await renderAuth(selection);
   assert.equal(auth.button.disabled, true);
   auth.select.selection = { ...selection, scope: 'organization' }; authChanged();
-  assert.equal(auth.status.textContent, 'Unsaved authorization changes');
+  assert.equal(auth.status.textContent, 'Unsaved changes');
   auth.select.selection = selection; authChanged();
   assert.equal(auth.button.disabled, true, 'reverting authorization clears the indicator');
+  assert.equal(auth.status.textContent, '', 'reverting authorization clears the indicator');
   await auth.vault.fire('click'); pickVault(['credential'], { credential: { reveal: 'deny' } });
   assert.equal(auth.button.disabled, false, 'vault modal changes enable authorization save');
   const authPending = auth.button.fire('click');
@@ -136,7 +144,7 @@ async function main() {
   assert.equal(auth.button.disabled, true, 'saving state survives a repaint');
   auth.select.selection = { ...selection, level: 'administrator' }; authChanged();
   authComplete({}); await authPending;
-  assert.equal(auth.status.textContent, 'Unsaved authorization changes');
+  assert.equal(auth.status.textContent, 'Unsaved changes');
   assert.equal(authState.authorizationEdits.task.values.authorization.level, 'administrator');
   assert.deepEqual(authRequests[0].credentialGrants, ['use-credential:item:credential']);
   assert.deepEqual(authRequests[0].credentialPolicies, { credential: { reveal: 'deny' } });

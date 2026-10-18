@@ -23,7 +23,7 @@ import { prepareConnections } from '../mcp/connections/runtime.js';
 import { checkoutBranches, expectedTaskRemoteHeads } from '../world/publication.js';
 import { applyConversationPatch, conversationPage, hasLiveWorldWork, watchesJobs, lifecycleEventPayload, transcriptOf, type PublishedView, type TurnConversationBase, type ViewConversation, type LifecyclePublication } from '../domain/view-publication.js';
 import { recordHumanConfirmation } from '../platform/review-confirmation.js';
-import { WorkflowNotFoundError, type Client } from '@temporalio/client';
+import { ServiceError, WorkflowNotFoundError, WorkflowUpdateFailedError, isGrpcServiceError, type Client } from '@temporalio/client';
 import { Context as activityContext } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
 import { AgentChannelLost, ProviderOutage, ProviderPolicyFailure, SandboxProviderFailure, confirmSandboxFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, isContextOverflow, type LimitClassification } from '../agent/limits.js';
@@ -63,6 +63,8 @@ import { CredentialBroker } from '../autonomy/broker.js';
 import { VaultItems, removeTurnKeys, turnKeyDirectory } from '../autonomy/vault-items.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
 import { applyAvatarProfile, avatarAuthorizationCapabilities, avatarForRole, avatarPrincipal } from '../platform/avatars.js';
+import { DELEGATED_PROFILE, delegatedFromParent } from '../platform/delegation.js';
+import { baseTaskAuthority, delegationReaching, taskAuthorityNow, tokenScopeOf } from '../platform/task-authority.js';
 import { GitProfiles, userGitScope } from '../autonomy/git-profiles.js';
 import { worldRepos, worldRepoSource, worldRepoTarget } from '../world/types.js';
 import { pullRequestHandle, pullRequestView, isPullRequestView, proposalCheckouts } from '../world/pr-view.js';
@@ -407,7 +409,21 @@ export interface CreateWorldArgs {
   gitProfile?: string;
 }
 
-async function acquireWorkflowAgentSlot(args: {
+/** Consecutive interrupted waits before admission gives up as an outage. */
+const QUEUE_RUN_INTERRUPTIONS = 5;
+
+/** The queue's workflow task or run ended under this Update rather than
+ * answering it: a rotation's task failed because a signal arrived meanwhile
+ * (the server then aborts the Updates it carried with FAILED_PRECONDITION), or
+ * the run closed. Its state rolled back or rode along, so asking again keeps
+ * this turn's place. */
+function queueRunInterrupted(error: unknown): boolean {
+  if (error instanceof WorkflowUpdateFailedError) return true;
+  const FAILED_PRECONDITION = 9;
+  return error instanceof ServiceError && isGrpcServiceError(error.cause) && error.cause.code === FAILED_PRECONDITION;
+}
+
+export async function acquireWorkflowAgentSlot(args: {
   client: Client;
   taskQueue: string;
   store: Store;
@@ -437,23 +453,37 @@ async function acquireWorkflowAgentSlot(args: {
   try {
     if (args.signal?.aborted)
       throw args.signal.reason instanceof Error ? args.signal.reason : new Error('agent queue wait cancelled');
-    // Keep the long-running activity lease alive while one durable Workflow
-    // Update waits for promotion. This creates O(waiters), not O(waiters × time),
+    // Keep the long-running activity lease alive while a durable Workflow Update
+    // (one per run of the queue) waits for promotion. This creates O(waiters), not O(waiters × time),
     // Temporal requests and cannot fill the consistent-query buffer.
     heartbeatTimer = setInterval(() => {
       try { args.heartbeat?.(); } catch { /* activity cancellation is handled below */ }
     }, 10_000);
     heartbeatTimer.unref?.();
-    const admission = args.client.workflow.getHandle(id).executeUpdate(UPD_WAIT_AGENT, {
-      args: [{
-        taskId: args.taskId,
-        turnId: args.turnId,
-        role: args.role,
-        provider: args.provider,
-        title: args.title,
-        projectId: args.projectId,
-      }],
-    }) as Promise<boolean>;
+    const item = {
+      taskId: args.taskId,
+      turnId: args.turnId,
+      role: args.role,
+      provider: args.provider,
+      title: args.title,
+      projectId: args.projectId,
+    };
+    // `null`: the queue answered before continuing as new. The item rode along
+    // in its state, so asking the next run again keeps this turn's place.
+    const admission = (async () => {
+      for (let interrupted = 0; ;) {
+        let granted: boolean | null;
+        try {
+          granted = await args.client.workflow.getHandle(id).executeUpdate(UPD_WAIT_AGENT, { args: [item] }) as boolean | null;
+        } catch (error) {
+          if (!queueRunInterrupted(error) || ++interrupted > QUEUE_RUN_INTERRUPTIONS) throw error;
+          await new Promise((resolve) => setTimeout(resolve, 250));
+          granted = null;
+        }
+        if (granted !== null) return granted;
+        if (args.signal?.aborted) return false;
+      }
+    })();
     let removeAbortListener = () => {};
     const granted = await (args.signal
       ? Promise.race([
@@ -1285,7 +1315,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     // An agent other than the main one acts with its own authority when it has
     // one (wiki features/collaboration-model); otherwise with the task's.
     const agentAuthorization = participantAuthorization(preparationTask?.params, participant);
-    const storedAuthorization = (agentAuthorization ?? preparationTask?.params?._authorization) as {
+    // A sub-task acts with its parent's authority as it is now (delegation.ts).
+    const delegated = !agentAuthorization && !avatar && delegatedFromParent(preparationTask)
+      ? await baseTaskAuthority(store, deps.authorization, preparationTask) : undefined;
+    const storedAuthorization = (agentAuthorization
+      ?? (delegated ? { ...preparationTask?.params?._authorization as object, ...delegated } : preparationTask?.params?._authorization)) as {
       capabilities?: string[];
       principal?: string;
       scope?: 'projects' | 'organization' | 'global';
@@ -1341,6 +1375,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         : (storedAuthorization?.delegationId ?? args.task.delegationId),
       externalIdentities: avatar?.githubAccountId ? { githubAccountId: avatar.githubAccountId } : undefined,
     };
+    if (delegated && deps.tokens) Object.assign(mintScope, await delegationReaching(store, deps.tokens, preparationTask!, mintScope));
     return { participant, preparationTask, orgVaultItems, grant, ceiling, effective, mintScope };
   }
 
@@ -1732,35 +1767,27 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       (await record(args.parentTaskId, 'subtask.created', { childTaskId: child.id, title: args.title, ...(args.pullRequest ? { pullRequest: true } : {}) }));
     }
     // Least-privilege grant (SPEC §8.2): the child's delegation caps are attenuated
-    // by the parent's own grant, and its merge cap is scoped to EXACTLY the parent's
-    // branch (which the parent owns and merges into). If no branch is known,
-    // the child gets no merge capability — never a broad fallback.
-    let currentGrant = [
-      ...((parent?.params?._authorization as { capabilities?: string[] } | undefined)?.capabilities ?? args.parentGrant ?? []),
-      ...await new PermissionRequests(store, currentProject?.organizationId ?? 'org_personal').extensionCaps(args.parentTaskId, 'do'),
-    ];
-    const authorizer = (parent?.params?._authorization as { principal?: string } | undefined)?.principal;
-    const parentAvatarId = (parent?.params?.['agent:do'] as { avatarId?: string } | undefined)?.avatarId
-      ?? (authorizer?.startsWith('avatar:') ? authorizer.slice(7) : undefined);
-    if (parentAvatarId) {
-      const avatar = await store.getAvatar(parentAvatarId);
-      currentGrant = attenuate(currentGrant, avatar
-        ? await avatarAuthorizationCapabilities(store, deps.authorization, avatar, args.projectId) : []);
-    }
+    // by the parent's authority now (task-authority.ts), and its merge cap is scoped
+    // to EXACTLY the parent's branch (which the parent owns and merges into). If no
+    // branch is known, the child gets no merge capability — never a broad fallback.
+    // This is the record it starts with; every turn it acts with its parent's
+    // authority as it is then (delegation.ts).
+    const parentNow = parent ? await taskAuthorityNow(store, deps.authorization, parent, { grant: args.parentGrant }) : undefined;
+    const currentGrant = parentNow?.capabilities ?? args.parentGrant ?? [];
     const delegation = attenuate(CHILD_TASK_CEILING, currentGrant);
     const mergeBack = args.parentBranch && allows(currentGrant, `merge-into:${args.parentBranch}`)
       ? [`merge-into:${args.parentBranch}`] : [];
     const grant = [...delegation, ...mergeBack];
     const parentAuthorization = parent?.params?._authorization as { delegationId?: string } | undefined;
-    const humanDelegation = parentAuthorization?.delegationId && deps.tokens
-      ? (await deps.tokens.deriveHumanDelegation(parentAuthorization.delegationId, {
-          taskId: child.id, projectId: args.projectId,
-          organizationId: (await store.getProject(args.projectId))?.organizationId,
-        }))
+    // The child's human delegation reaches as far as its tokens will: its parent's scope.
+    const humanDelegation = parent && parentAuthorization?.delegationId && deps.tokens
+      ? (await deps.tokens.deriveHumanDelegation(parentAuthorization.delegationId, { taskId: child.id,
+          ...tokenScopeOf(parentNow!, args.projectId,
+            (await store.getProject(args.projectId))?.organizationId) }))
       : undefined;
     (await store.updateTaskParams(child.id, {
       ...child.params,
-      _authorization: { profileId: 'inherited-child', principal: `task:${args.parentTaskId}`,
+      _authorization: { profileId: DELEGATED_PROFILE, principal: `task:${args.parentTaskId}`,
         capabilities: grant, attenuated: true, ...(humanDelegation ? { delegationId: humanDelegation.id } : {}) },
       ...(humanDelegation?.externalIdentities?.githubAccountId
         ? { _githubAccountId: humanDelegation.externalIdentities.githubAccountId } : {}),
@@ -1784,7 +1811,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       grant,
       grantPrincipal: `task:${args.parentTaskId}`,
       delegationId: humanDelegation?.id,
-      authorizationProfile: 'inherited-child',
+      authorizationProfile: DELEGATED_PROFILE,
     };
   }
 

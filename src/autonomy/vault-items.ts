@@ -1,5 +1,7 @@
 import type { World } from '../world/types.js';
 import { participantAuthorization } from '../platform/agent-authority.js';
+import { delegatingAncestors } from '../platform/delegation.js';
+import type { TaskRecord } from '../domain/types.js';
 import { decayVaultUsage, type VaultUsage, type VaultSelectionUsage } from '../util/vault-usage.js';
 import crypto from 'node:crypto';
 import os from 'node:os';
@@ -738,7 +740,13 @@ export class VaultItems {
       ? participantAuthorization((await tasks.getTask(taskId))?.params, this.participant) : undefined;
     const override = agent ? agent.credentialPolicies?.[item.id]
       : taskId ? (await this.taskPolicies(taskId))[item.id] : undefined;
-    return { ...item.policy, ...override };
+    if (override || agent || !taskId || !tasks.getTask) return { ...item.policy, ...override };
+    // A sub-task uses its parent's overrides (delegation.ts), the nearest one's first.
+    for (const ancestor of await delegatingAncestors(tasks as { getTask(id: string): Promise<TaskRecord | undefined> }, taskId)) {
+      const inherited = (await this.taskPolicies(ancestor.id))[item.id];
+      if (inherited) return { ...item.policy, ...inherited };
+    }
+    return { ...item.policy };
   }
 
   // ── access decision (§5/§7): capability coverage, then item policy ──

@@ -924,8 +924,7 @@ a.git-repo-name:hover { color:var(--accent); }
 .tf-head-inner { display: flex; align-items: center; gap: 10px; }
 .tf-head h2 { margin: 0; font-size: 17px; letter-spacing: -0.01em; white-space: nowrap; }
 .tf-crumb { color: var(--ink-3); font-size: 13px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.tf-savestate { margin-left: auto; color: var(--ink-3); font-size: 12px; flex: none; }
-.tf-savestate:not(:empty)::before { content: '✓ '; color: var(--merged); }
+.tf-savestate { margin-left: auto; flex: none; }
 /* Attempt switcher in the Edit draft bar: the task page's cards, minus the crown. */
 .tf-attempts { flex: 0 100 auto; margin-left: 4px; } /* scrolls before the crumb truncates */
 .tf-attempts .attempt-card { padding-right: 10px; }
@@ -1727,8 +1726,22 @@ a.ins-task-title:hover { color: var(--accent); }
 .task-row:focus-visible, .queue-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .kbd { margin-left: 7px; font-family: var(--font-mono); font-size: 10px; line-height: 1.5; color: var(--ink-3); border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; }
 .btn.primary .kbd, .btn.danger .kbd { color: inherit; border-color: currentColor; opacity: .7; }
-.help-row { display: flex; gap: 12px; padding: 4px 0; font-size: 13px; align-items: baseline; }
-.help-row .key { font-family: var(--font-mono); font-size: 11px; color: var(--ink-2); border: 1px solid var(--line); border-radius: 5px; padding: 1px 6px; min-width: 34px; text-align: center; white-space: nowrap; }
+/* "?" help: sections flow into two columns on a wide screen, one on a phone. */
+.help-panel { width: min(780px, 94vw); max-height: 80vh; display: flex; flex-direction: column; }
+.help-head { display: flex; align-items: center; gap: 6px; padding: 14px 16px; border-bottom: 1px solid var(--line); }
+.help-grid { overflow: auto; padding: 14px 18px 16px; columns: 2 300px; column-gap: 32px; }
+.help-section { break-inside: avoid; padding-bottom: 12px; }
+.help-section .section-h { margin: 0 0 4px; }
+.help-row { display: grid; grid-template-columns: 72px 1fr; gap: 12px; padding: 3px 0; font-size: 13px; align-items: baseline; }
+.help-row .key { justify-self: start; font-family: var(--font-mono); font-size: 11px; color: var(--ink-2); background: var(--surface-2); border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 5px; padding: 0 6px; min-width: 22px; text-align: center; white-space: nowrap; }
+/* Chord hints: after a prefix key (g, v, .) each control the next key reaches
+   wears that key at its top-right corner until the chord completes or lapses. */
+#chord-hints { position: fixed; inset: 0; pointer-events: none; z-index: 80; }
+.chord-hint { position: absolute; transform: translate(-35%, -55%); font-family: var(--font-mono); font-size: 11px; font-weight: 600; line-height: 1.45;
+  padding: 0 5px; min-width: 18px; text-align: center; border-radius: 5px; color: var(--accent-ink); background: var(--accent); box-shadow: 0 0 0 2px var(--surface), 0 1px 4px rgba(0,0,0,.25);
+  animation: chord-hint-in .12s ease-out; white-space: nowrap; }
+@keyframes chord-hint-in { from { opacity: 0; transform: translate(-35%, -25%); } }
+@media (prefers-reduced-motion: reduce) { .chord-hint { animation: none; } }
 
 /* ── public landing ─────────────────────────────────────────────────────────
    The landing is the console, at marketing size: the same Inter with its
@@ -2420,16 +2433,10 @@ html[data-theme="dark"] .github-signin-btn:active,
 }
 .params-save-bar {
   position: sticky; bottom: 0; z-index: 2; display: flex; align-items: center;
-  justify-content: space-between; gap: 16px; margin-top: 14px; padding: 12px 0 2px;
+  justify-content: flex-end; gap: 10px; margin-top: 14px; padding: 12px 0 2px;
   background: linear-gradient(180deg, transparent, var(--surface) 13px);
 }
-.params-save-status { display: inline-flex; align-items: center; gap: 8px; color: var(--ink-3); font-size: 12px; }
-.params-save-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--merged); }
-.params-save-bar[data-save-state="dirty"] .params-save-status { color: var(--working); font-weight: 650; }
-.params-save-bar[data-save-state="dirty"] .params-save-dot {
-  background: var(--working); box-shadow: 0 0 0 3px color-mix(in srgb, var(--working) 15%, transparent);
-}
-.params-save-bar[data-save-state="saving"] .params-save-dot { background: var(--accent); }
+.params-save-bar .save-state[data-state="saved"] { animation: save-state-fade 2.4s ease forwards; }
 .agent-profile-controls {
   display: grid; grid-template-columns: minmax(105px,.65fr) minmax(170px,1.6fr) minmax(115px,.75fr) 90px; gap: 8px;
 }
@@ -2652,7 +2659,7 @@ html[data-theme="dark"] .github-signin-btn:active,
 /* Chips are rendered tabindex="0", so they must show keyboard focus. */
 .view-chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .view-chip.active { background: var(--accent-weak); color: var(--accent); border-color: transparent; font-weight: 600; }
-.view-chip.add { color: var(--ink-3); border-style: dashed; }
+.view-chip.add { color: var(--ink-3); border-style: dashed; font-family: inherit; background: none; }
 .view-chip.builtin { border-style: dotted; }
 .view-chip.builtin.active { border-style: solid; }
 .view-x { opacity: 0; font-size: 10px; color: var(--ink-3); cursor: pointer; margin-left: -1px; transition: opacity .1s; }
@@ -2972,22 +2979,87 @@ html[data-theme="dark"] .github-signin-btn:active,
 .vault-grant-item-text { min-width: 0; display: flex; flex-direction: column; gap: 1px; font-size: 12px; }
 .vault-grant-meta { color: var(--ink-3); font-size: 11px; overflow-wrap: anywhere; }
 .vault-grant-policies { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
-.vault-grant-policies label, .vault-manager-item > label {
+.vault-grant-policies label {
   display: inline-flex; align-items: center; gap: 4px; color: var(--ink-2); font-size: 11px; white-space: nowrap;
 }
-.vault-grant-policies select, .vault-manager-item select { max-width: 120px; font-size: 11px; }
+.vault-grant-policies select { max-width: 120px; font-size: 11px; }
 .vault-grant-empty { display: block; padding: 18px 4px; color: var(--ink-3); font-size: 12px; text-align: center; }
 .vault-grant-actions { display: flex; gap: 8px; justify-content: flex-end; }
 .vault-manage-button {
-  width: 100%; justify-content: space-between; margin-bottom: 14px; padding: 10px 12px;
+  width: 100%; justify-content: flex-start; gap: 10px; margin-bottom: 14px; padding: 10px 12px;
 }
-.vault-manage-count { color: var(--ink-3); font-size: 11px; font-weight: 500; }
-.vault-manager-modal { width: min(900px, 94vw); max-height: min(720px, 88vh); display: flex; flex-direction: column; }
-.vault-manager-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
-.vault-manager-list { min-height: 90px; max-height: 62vh; overflow-y: auto; border: 1px solid var(--line); border-radius: 8px; }
-.vault-manager-item { margin: 0; border: 0; border-radius: 0; border-bottom: 1px solid var(--line); padding: 10px; flex-wrap: wrap; }
+.vault-manage-button > svg:first-child { color: var(--accent); }
+.vault-manage-button > span:first-of-type { flex: 1; text-align: left; }
+.vault-manage-count { color: var(--ink-3); font-size: 12px; font-weight: 500; }
+.vault-manage-button .vm-chevron { color: var(--ink-3); font-size: 16px; line-height: 1; }
+
+/* The vault manager: a table whose head is Select all + column names, and the
+   bulk bar once something is ticked. One grid template keeps head and rows in line. */
+.vault-manager-modal { width: min(960px, 94vw); max-height: min(760px, 88vh); min-height: min(420px, 80vh); display: flex; flex-direction: column; gap: 12px; padding: 18px 18px 14px; }
+.vault-manager-head { display: flex; align-items: center; gap: 8px; }
+.vm-title { margin: 0; font-size: 15px; font-weight: 650; }
+.vm-total { font-size: 11px; font-weight: 600; color: var(--ink-3); background: var(--surface-2); border: 1px solid var(--line); border-radius: 999px; padding: 0 7px; line-height: 18px; }
+.vm-total:empty { display: none; }
+.vm-spacer { flex: 1; }
+.vault-manager-head .icon-btn { margin: -6px -6px -6px 0; }
+.vm-toolbar { display: flex; flex-wrap: wrap; gap: 8px 10px; align-items: center; }
+.vm-toolbar .vault-search { flex: 1 1 260px; margin: 0; }
+.vm-types { display: flex; flex-wrap: wrap; gap: 4px; }
+.vm-types:empty { display: none; }
+.vm-type { font: inherit; font-size: 12px; padding: 4px 10px; border-radius: 999px; cursor: pointer; border: 1px solid var(--line); background: var(--surface); color: var(--ink-2); white-space: nowrap; }
+.vm-type span { color: var(--ink-3); font-variant-numeric: tabular-nums; margin-left: 2px; }
+.vm-type:hover { border-color: var(--line-strong); color: var(--ink); }
+.vm-type.active { background: var(--accent-weak); border-color: transparent; color: var(--accent); font-weight: 600; }
+.vm-type.active span { color: inherit; }
+.vm-table { flex: 0 1 auto; min-height: 0; display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.vm-row { display: grid; grid-template-columns: 18px 32px minmax(0, 1fr) 196px 98px; align-items: center; column-gap: 12px; padding: 9px 12px; }
+.vm-row > input[type="checkbox"] { margin: 0; }
+.vm-headrow { min-height: 42px; padding-top: 5px; padding-bottom: 5px; background: var(--surface-2); border-bottom: 1px solid var(--line); font-size: 12px; color: var(--ink-3); }
+.vm-headlabel { grid-column: 2 / 4; font-weight: 600; }
+.vm-headrow .vm-cols { grid-column: 4; padding-left: 2px; }
+.vm-headrow:has(.vm-bulk:not([hidden])) { grid-template-columns: 18px minmax(0, 1fr) auto; background: var(--accent-weak); color: var(--accent); }
+.vm-headrow:has(.vm-bulk:not([hidden])) .vm-headlabel { grid-column: 2; }
+.vm-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; align-items: center; }
+.vm-cols > span { display: inline-flex; align-items: center; gap: 3px; white-space: nowrap; }
+.vm-cols[hidden], .vm-bulk[hidden] { display: none !important; }
+.vm-cols select { width: 100%; font-size: 12px; padding: 4px 6px; }
+.vm-bulk { grid-column: 3; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.vm-bulk select { font-size: 12px; padding: 4px 6px; width: auto; }
+.vm-bulk .icon-btn { width: 28px; height: 28px; color: inherit; }
+.vault-manager-list { flex: 1; min-height: 90px; overflow-y: auto; }
+.vault-manager-item { margin: 0; border-bottom: 1px solid var(--line); }
 .vault-manager-item:last-of-type { border-bottom: 0; }
-.vault-manager-item.active { background: var(--accent-weak); }
+.vault-manager-item:hover { background: var(--surface-2); }
+.vault-manager-item.selected { background: color-mix(in srgb, var(--accent-weak) 55%, transparent); }
+.vault-manager-item.active { background: var(--accent-weak); scroll-margin: 6px 0; }
+.vm-icon { display: grid; place-items: center; width: 32px; height: 32px; border-radius: 8px; color: var(--ink-2); background: var(--surface-2); border: 1px solid var(--line); }
+.vault-manager-item[data-type="login"] .vm-icon { color: var(--accent); background: var(--accent-weak); border-color: transparent; }
+.vault-manager-item[data-type="api-key"] .vm-icon, .vault-manager-item[data-type="ssh-key"] .vm-icon { color: var(--working); background: var(--working-weak); border-color: transparent; }
+.vault-manager-item[data-type="session"] .vm-icon, .vault-manager-item[data-type="passkey"] .vm-icon { color: var(--merged); background: var(--merged-weak); border-color: transparent; }
+.vm-main { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.vm-label { display: flex; align-items: center; gap: 8px; min-width: 0; font-size: 13px; font-weight: 600; color: var(--ink); overflow-wrap: anywhere; }
+.vm-source { flex: none; font-size: 10px; font-weight: 600; letter-spacing: .02em; color: var(--ink-3); border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; line-height: 16px; }
+.vm-meta { font-size: 12px; color: var(--ink-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.vm-meta .mono { font-size: 11px; }
+.vm-actions { display: flex; align-items: center; justify-content: flex-end; gap: 2px; }
+.vm-act { width: 30px; height: 30px; }
+.vm-act:disabled { opacity: .35; cursor: default; }
+.vm-act:disabled:hover { background: transparent; border-color: transparent; }
+.vm-act.danger:hover:not(:disabled) { color: var(--danger); background: var(--danger-weak); border-color: transparent; }
+.vm-act[aria-expanded="true"] { color: var(--accent); background: var(--accent-weak); }
+.vm-exclusive { display: inline-flex; align-items: center; gap: 4px; margin-left: 6px; font-size: 11px; color: var(--ink-2); white-space: nowrap; cursor: pointer; vertical-align: middle; }
+.vm-exclusive input { margin: 0; }
+.vault-manager-item .vault-reveal-panel { grid-column: 3 / -1; margin-top: 8px; }
+@media (max-width: 760px) {
+  .vault-manager-modal { width: 100vw; height: 100dvh; max-width: none; border-radius: 0; padding: 14px 12px 10px; }
+  .vm-row { grid-template-columns: 18px 32px minmax(0, 1fr) auto; row-gap: 8px; }
+  .vault-manager-item .vm-cols { grid-column: 3 / -1; grid-row: 2; }
+  .vm-headrow, .vm-headrow:has(.vm-bulk:not([hidden])) { grid-template-columns: 18px minmax(0, 1fr); }
+  .vm-headlabel, .vm-headrow:has(.vm-bulk:not([hidden])) .vm-headlabel { grid-column: 2; }
+  .vm-headrow .vm-cols { display: none !important; }
+  .vm-bulk { grid-column: 1 / -1; justify-content: flex-start; }
+  .vm-meta { white-space: normal; }
+}
 .vault-reveal-panel { flex-basis: 100%; padding: 10px; border-radius: 7px; background: var(--surface-2); display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .vault-reveal-panel[hidden], .vault-reveal-value[hidden] { display: none !important; }
 .vault-reveal-value { flex-basis: 100%; min-width: 0; }
@@ -3482,6 +3554,11 @@ html[data-theme="dark"] .github-signin-btn:active,
 .task-defaults > .td-section:first-child { border-top: 0; padding-top: 2px; }
 .task-defaults .td-profile { margin-bottom: 8px; }
 .task-defaults .td-actions { display: flex; align-items: center; gap: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
+/* A long card keeps its Save in view while something is unsaved. */
+.task-defaults .td-actions:has(> .save-state[data-state="dirty"]) {
+  position: sticky; bottom: 0; z-index: 3; padding-bottom: 10px; margin-bottom: -10px; background: var(--surface);
+}
+.task-defaults .td-actions > .save-state + .btn { margin-left: 0; }
 .task-defaults .td-actions .resource-error { color: var(--danger); font-size: 12px; }
 .parameter-fields .agent-controls:has(.pf-maxturns) { grid-template-columns: minmax(105px,.65fr) minmax(170px,1.6fr) minmax(115px,.75fr) 90px; }
 .parameter-fields .agent-field .agent-controls .pf-maxturns { width: 100%; }
@@ -3766,3 +3843,35 @@ input.toggle:disabled { opacity:.45; cursor:not-allowed; }
 .store-recs .task-group-heading a { color: inherit; text-decoration: underline; text-decoration-color: var(--line-strong); text-underline-offset: 3px; }
 .store-recs #store-recs-dismiss { margin-left: auto; align-self: center; }
 .store-recs { margin-bottom: 24px; }
+
+/* ── Save state ─────────────────────────────────────────────────────────────
+   One note for every form whose edits wait to be saved: beside its Save
+   button (settings cards, task Parameters) and, quieter, in the task form
+   head. Amber only while something is unsaved; never a check mark then. */
+.save-state {
+  display: inline-flex; align-items: center; gap: 6px; vertical-align: middle;
+  font-size: 12px; line-height: 22px; color: var(--ink-3); white-space: nowrap;
+}
+.save-state:empty { display: none; }
+.save-state::before { content: ''; flex: none; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.save-state[data-state="dirty"] {
+  padding: 0 10px 0 9px; border-radius: 999px; font-weight: 600;
+  color: color-mix(in srgb, var(--working) 72%, var(--ink));
+  background: var(--working-weak);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--working) 32%, transparent);
+}
+.save-state[data-state="dirty"]::before {
+  background: var(--working); box-shadow: 0 0 0 3px color-mix(in srgb, var(--working) 22%, transparent);
+}
+.save-state.quiet[data-state="dirty"] { padding: 0; background: none; box-shadow: none; font-weight: 500; }
+.save-state[data-state="saving"]::before { background: var(--accent); animation: save-state-pulse 1s ease-in-out infinite; }
+.save-state[data-state="saved"]::before {
+  content: '✓'; width: auto; height: auto; border-radius: 0; background: none; color: var(--merged); font-weight: 700;
+}
+.save-state[data-state="error"] { color: var(--danger); }
+.save-state + [data-unsaved-save] { margin-left: 8px; }
+@keyframes save-state-pulse { 50% { opacity: .3; } }
+@keyframes save-state-fade { 0%, 70% { opacity: 1; } 100% { opacity: 0; } }
+@media (prefers-reduced-motion: reduce) {
+  .save-state::before, .params-save-bar .save-state { animation: none !important; }
+}
