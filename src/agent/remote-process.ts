@@ -297,6 +297,15 @@ function syncedCodexHistory(relative: string, history: Array<{ relative: string;
   return copies.every(copy => copy.id && synced.has(copy.id)) ? synced : undefined;
 }
 
+/** Shell function: `identity PID` prints which process PID is, as
+ * `<boot id>:<start tick>`. A pid alone names a process only within one boot:
+ * a parked VM world (Hetzner) boots again on every wake and hands out the same
+ * pids, so the pidfile the last boot wrote named the new launcher itself, which
+ * stopped its own process group (pramana#90, exit 143). Exec keeps both parts,
+ * so the agent the launcher becomes has the identity the launcher recorded. */
+const PROCESS_IDENTITY = `identity() { s=$(cat "/proc/$1/stat" 2>/dev/null) || return 1; s=\${s##*) }; set -- $s; `
+  + `[ -n "\${20:-}" ] && printf '%s:%s' "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" "\${20}"; }`;
+
 /** The launcher's status when the agent's CLI still does not run after
  * {@link REMOTE_CLI_INSTALLS} fresh installs (sysexits' EX_UNAVAILABLE). */
 export const REMOTE_CLI_UNAVAILABLE = 69;
@@ -1004,10 +1013,13 @@ export function spawnRemoteAgentProcess(opts: {
     'stty raw -echo',
     `(umask 077; ${trace('shell-started')})`,
     `pidfile=${quote(pidFile)}`,
+    PROCESS_IDENTITY,
     trace('previous-process-check'),
-    `if [ -s "$pidfile" ]; then old=$(cut -d ' ' -f 1 < "$pidfile" 2>/dev/null); cmd=$(tr '\\0' ' ' < "/proc/$old/cmdline" 2>/dev/null || true); case "$cmd" in *${opts.provider}*) kill -TERM -- "-$old" 2>/dev/null || kill -TERM "$old" 2>/dev/null || true; i=0; while kill -0 "$old" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i+1)); done; kill -KILL -- "-$old" 2>/dev/null || kill -KILL "$old" 2>/dev/null || true;; esac; rm -f "$pidfile"; fi`,
+    // Only the very process a previous launcher recorded: a pidfile without an
+    // identity (from an older release) or from another boot names no process.
+    `if [ -s "$pidfile" ]; then read -r old launched id < "$pidfile"; case "$old" in ''|*[!0-9]*) ;; *) if [ -n "\${id:-}" ] && [ "$(identity "$old")" = "$id" ]; then kill -TERM -- "-$old" 2>/dev/null || kill -TERM "$old" 2>/dev/null || true; i=0; while kill -0 "$old" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i+1)); done; kill -KILL -- "-$old" 2>/dev/null || kill -KILL "$old" 2>/dev/null || true; fi;; esac; rm -f "$pidfile"; fi`,
     // With the host's launch time: a bootstrap requested before it never stops it.
-    `printf '%s %s\\n' "$$" ${Date.now()} > "$pidfile"`,
+    `printf '%s %s %s\\n' "$$" ${Date.now()} "$(identity $$)" > "$pidfile"`,
     trace('previous-process-stopped'),
     // The seed uploads config and credentials with the sandbox's default modes
     // into a home the bootstrap made private: close them too before the agent runs.
@@ -1438,16 +1450,16 @@ async function quiesceRemoteCodexHome(world: World, absolute: string): Promise<v
 function quiesceCommand(absolute: string, issued: number): string {
   return `pidfile=${quote(path.posix.join(absolute, 'karmax-agent.pid'))};
 if [ -s "$pidfile" ]; then
-  read -r old launched < "$pidfile" || [ -n "$old" ]; case "$old" in ''|*[!0-9]*) exit 1;; esac
+  read -r old launched id < "$pidfile" || [ -n "$old" ]; case "$old" in ''|*[!0-9]*) exit 1;; esac
   case "$launched" in ''|*[!0-9]*) ;; *) [ "$launched" -ge ${issued} ] && exit 0;; esac
-  cmd=$(tr '\\0' ' ' < "/proc/$old/cmdline" 2>/dev/null || true)
-  case "$cmd" in *codex*)
+  ${PROCESS_IDENTITY}
+  if [ -n "\${id:-}" ] && [ "$(identity "$old")" = "$id" ]; then
     kill -TERM -- "-$old" 2>/dev/null || kill -TERM "$old" 2>/dev/null || true
     i=0; while kill -0 "$old" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i+1)); done
     if kill -0 "$old" 2>/dev/null; then kill -KILL -- "-$old" 2>/dev/null || kill -KILL "$old" 2>/dev/null || true; fi
     i=0; while kill -0 "$old" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i+1)); done
-    if kill -0 "$old" 2>/dev/null; then echo 'previous Codex writer did not stop' >&2; exit 1; fi;;
-  esac
+    if kill -0 "$old" 2>/dev/null; then echo 'previous Codex writer did not stop' >&2; exit 1; fi
+  fi
   rm -f "$pidfile"
 fi`;
 }
