@@ -5880,7 +5880,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     (await this.require(token, 'list_templates', { projectId: args.projectId }));
     if (!template || template.organizationId !== organizationId || (template.projectId && template.projectId !== args.projectId))
       throw new NotFoundError(`no template ${templateId} in this project`);
-    const params: ValueMap = { ...templateParams(template.params), ...(args.params ?? {}) };
+    const params: ValueMap = { ...templateParams(template.params), ...args.params };
     for (const key of ['prompt', 'base', 'target', 'command', 'branch'] as const)
       if (args[key] !== undefined && args[key] !== '' && args.params?.[key] === undefined) params[key] = args[key];
     const authorization = template.authorization && (template.authorization.scope === 'projects' && !template.authorization.projectIds?.length

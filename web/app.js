@@ -9875,7 +9875,7 @@ function wireOrgEditor(rootEl, rec, opts) {
   box.querySelector('.org-priority')?.addEventListener('change', async (e) => {
     const priority = Number(e.target.value);
     // `local`: a template's form — kept in `rec`, saved with the form.
-    if (opts.local) { rec.params = { ...(rec.params || {}), priority }; e.target.classList.toggle('unset', !priority); afterChange(); return; }
+    if (opts.local) { rec.params = { ...rec.params, priority }; e.target.classList.toggle('unset', !priority); afterChange(); return; }
     try {
       const id = await ensureId(); if (!id) return;
       rec.id = id;
