@@ -567,8 +567,10 @@ function parseRoute(url) {
   const taskFile = taskKey && seg[4] === 'file' ? fileRouteTarget(query) : null;
   const wikiView = tab === 'wiki' ? wikiViewFromQuery(query) : '';
   const avatarId = tab === 'avatars' && seg[3] ? seg[3] : null;
+  // A Task store entry, opened to read before running or installing it.
+  const storeKey = seg[2] === 'store' && seg[3] ? seg[3] : null;
   return { name: 'project', org, slug: seg[1], tab, taskKey, taskTab, q, ...(taskFile ? { taskFile } : {}),
-    ...(wikiView ? { wikiView } : {}), ...(avatarId ? { avatarId } : {}) };
+    ...(wikiView ? { wikiView } : {}), ...(avatarId ? { avatarId } : {}), ...(storeKey ? { storeKey } : {}) };
 }
 
 // Which branch the project wiki shows is part of the page, so it lives in the
@@ -716,6 +718,7 @@ async function applyRoute() {
   const routePath = location.pathname;
   const routeIsCurrent = () => S.routeEpoch === routeEpoch && location.pathname === routePath;
   const r = parseRoute(currentPath());
+  S.storeOpen = r.storeKey || null;
   const renamed = renamedOrganizationPath(r);
   if (renamed) return go(renamed, { replace: true });
   if (r.name === 'home') {
@@ -847,7 +850,7 @@ async function applyRoute() {
   }
   const incomingListQuery = r.q ?? DEFAULT_LIST_QUERY;
   const projectOrganizationLoaded = sameProject && S.orgProjectId === pid;
-  const canPaintCachedProject = !r.taskKey && projectOrganizationLoaded;
+  const canPaintCachedProject = !r.taskKey && !r.storeKey && projectOrganizationLoaded;
   // A project with nothing in memory to paint reads everything its page needs
   // together: tasks, avatars, tags/views and the list's search (RQ-9).
   const reads = [];
@@ -860,7 +863,7 @@ async function applyRoute() {
   let organizationRead = null, listSearch = null;
   if (!projectOrganizationLoaded) {
     organizationRead = loadOrg().catch(() => false);
-    if (!r.taskKey && tab === 'tasks') {
+    if (!r.taskKey && !r.storeKey && tab === 'tasks') {
       S.search = incomingListQuery;
       listSearch = runSearch().catch(() => {});
     }
@@ -894,8 +897,9 @@ async function applyRoute() {
   // is loaded re-reads none of it, so opening or j/k-walking tasks costs only the
   // task's own reads (UI-6); the list refreshes it when shown again. First visits
   // and cross-project routes wait so they never render foreign tags.
-  if (!r.taskKey || !projectOrganizationLoaded) await (organizationRead || loadOrg().catch(() => false));
+  if (!(r.taskKey || r.storeKey) || !projectOrganizationLoaded) await (organizationRead || loadOrg().catch(() => false));
   if (!routeIsCurrent()) return;
+  if (r.storeKey) return applyStoreTaskRoute(pid, r.storeKey, routeIsCurrent);
   // Resolve the open task from the URL BEFORE painting, so a permalink paints once
   // (its task page), not the list with a page swapped in a beat later.
   let taskId = null;
@@ -995,7 +999,8 @@ function plainClick(fn) {
 // previous task). Generalises the old goToTask logic to any SPA link.
 function spaNavigate(href) {
   const to = parseRoute(href);
-  if (to && to.taskKey && !parseRoute(currentPath()).taskKey) S.returnRoute = currentPath();
+  const from = parseRoute(currentPath());
+  if (to && (to.taskKey || to.storeKey) && !from.taskKey && !from.storeKey) S.returnRoute = currentPath();
   return go(href);
 }
 
@@ -6029,6 +6034,7 @@ function renderMain() {
     if (S.view) renderTaskPage();
     return;
   }
+  if (S.storeOpen && S.tab === 'tasks') return renderStoreTaskPage();
   // An open wiki editor likewise manages its own renders: a background refresh
   // must not clobber in-progress edits (only the focused field would survive
   // the async rehydrate). Navigation still repaints — it changes S.tab or
@@ -6391,7 +6397,7 @@ function tasksView() {
       </div>
       <div class="organizer-row">${viewsBar()}${queryToolbarHtml(S.search || '', 'q', trailing)}</div>
     </div>
-    ${notices}${storeRecsHtml()}${store ? body : body || empty}`;
+    ${notices}${store ? body : body || empty}${storeRecsHtml()}`;
 }
 
 // The organization home's project filter: a `project:` clause in the query, so
@@ -6438,22 +6444,100 @@ async function loadTaskStore(projectId, { force = false } = {}) {
 }
 
 const STORE_NEEDS = { github: ['Needs GitHub', 'Connect a GitHub repository to this project first'], chat: ['Needs a chat bot', 'Connect a chat bot to this project first'] };
-function storeRowHtml(item) {
-  const installed = item.repeatable && item.installed?.length;
-  const need = !installed && item.missing?.length ? STORE_NEEDS[item.missing[0]] : null;
+// What the project lacks for it, unless it already has it.
+function storeNeed(item) {
+  return !(item.repeatable && item.installed?.length) && item.missing?.length ? STORE_NEEDS[item.missing[0]] : null;
+}
+// Run, Install, or Open the series it installed.
+// A row's is small; on its page the one thing to do is primary.
+function storeActionHtml(item, projectId, onPage = false) {
+  const need = storeNeed(item);
   const disabled = need ? ` disabled title="${esc(need[1])}"` : '';
-  const action = installed
-    ? `<a class="btn sm" data-spa href="${esc(taskUrl(item.installed[0], { projectId: storeProjectId() }))}">Open</a>`
-    : item.repeatable
-      ? `<button class="btn sm" data-store-run="${esc(item.id)}"${disabled}>Install</button>`
-      : `<button class="btn sm primary" data-store-run="${esc(item.id)}"${disabled}>Run</button>`;
-  return `<div class="task-row store-row" data-store-task="${esc(item.id)}">
+  const cls = onPage ? 'btn primary' : 'btn sm';
+  if (item.repeatable && item.installed?.length) return `<a class="${onPage ? 'btn' : cls}" data-spa href="${esc(taskUrl(item.installed[0], taskRecord(item.installed[0]) || { projectId }))}">Open</a>`;
+  return item.repeatable
+    ? `<button class="${cls}" data-store-run="${esc(item.id)}"${disabled}>Install</button>`
+    : `<button class="${onPage ? cls : 'btn sm primary'}" data-store-run="${esc(item.id)}"${disabled}>Run</button>`;
+}
+// A store task's own page: /<org>/<project>/store/<id>.
+function storeTaskRoute(projectId, id) { return `${projectBase(projectId)}/store/${encodeURIComponent(id)}`; }
+function storeRowHtml(item) {
+  const projectId = storeProjectId();
+  const installed = item.repeatable && item.installed?.length;
+  const need = storeNeed(item);
+  return `<div class="task-row store-row has-row-link" data-store-task="${esc(item.id)}" tabindex="0" role="group" aria-label="${esc(item.name)}">
       <div class="task-main">
         <div class="task-title">${esc(item.name)} ${item.summary ? policyTip(item.summary) : ''}</div>
         <div class="task-sub">${item.repeatable ? `<span class="chip">${installed ? 'installed' : 'repeatable'}</span>` : ''}${need ? `<span>${esc(need[0])}</span>` : ''}</div>
       </div>
-      <div class="task-right">${action}</div>
+      <div class="task-right">${storeActionHtml(item, projectId)}</div>
+      <a class="row-link" data-spa href="${esc(storeTaskRoute(projectId, item.id))}" draggable="false" tabindex="-1" aria-hidden="true"></a>
     </div>`;
+}
+// Reading one changes nothing: the page shows what it would do, and the same
+// Run / Install as its row.
+async function applyStoreTaskRoute(projectId, id, routeIsCurrent) {
+  S.tab = 'tasks';
+  closeTaskDom();
+  renderRail();
+  if (S.taskStore?.[projectId]) renderMain();
+  else renderRouteLoadingPage('Task store');
+  await loadTaskStore(projectId, { force: true });
+  if (!routeIsCurrent()) return;
+  if (!S.taskStore?.[projectId]?.some((item) => item.id === id)) {
+    toast('Not in the Task store', true);
+    return go(listRoute(projectBase(projectId), STORE_VIEW_QUERY), { replace: true });
+  }
+  renderMain();
+}
+function storeBackRoute() { return S.returnRoute || listRoute(projectBase(S.projectId), STORE_VIEW_QUERY); }
+function closeStoreTask() {
+  const back = storeBackRoute();
+  S.returnRoute = null;
+  return go(back);
+}
+// Its triggers, conditions included (a series page's summary says less).
+function storeTriggerSummary(triggers) {
+  return (triggers || []).map((trigger) => {
+    const where = Object.entries(trigger.kind === 'event' ? trigger.where || {} : {}).map(([path, expected]) => {
+      const [op, value] = eventConditionParts(expected);
+      return `${path} ${EVENT_OPS.find(([v]) => v === op)[1]} ${value}`;
+    });
+    return [triggerSummary([trigger]), ...where].join(' · ');
+  }).join('  ·  ');
+}
+function renderStoreTaskPage() {
+  const main = $('#main');
+  const projectId = S.projectId;
+  const item = (S.taskStore?.[projectId] || []).find((candidate) => candidate.id === S.storeOpen);
+  if (!main || !item) return;
+  const installed = item.repeatable && item.installed?.length;
+  const need = storeNeed(item);
+  const md = markdownEnabled() ? ' md' : '';
+  const when = storeTriggerSummary(item.task?.params?.triggers);
+  main.innerHTML = `
+    <div class="task-page store-page" data-store-page="${esc(item.id)}">
+      <div class="tp-head">
+        <div class="row1">
+          <a class="icon-btn" id="tp-back" href="${esc(storeBackRoute())}" data-shortcut="nav.close" title="Back (Esc)">←</a>
+          <h2>${esc(item.name)}</h2>
+          ${item.repeatable ? `<span class="chip">${installed ? 'installed' : 'repeatable'}</span>` : ''}
+        </div>
+        ${when ? `<div class="meta"><span>${esc(when)}</span></div>` : ''}
+      </div>
+      <div class="tp-body" id="tp-body" tabindex="-1"><div class="tp-content">
+        ${item.summary ? `<p class="store-summary">${esc(item.summary)}</p>` : ''}
+        <div class="section-h">Prompt</div>
+        <div class="store-prompt msg-text${md}">${renderMessageBody(item.task?.prompt || '')}</div>
+      </div></div>
+      <div class="tp-foot" id="tp-foot"><div class="tp-foot-inner">
+        ${need ? `<span class="store-need">${esc(need[0])}</span>` : ''}
+        <span style="flex:1"></span>
+        ${storeActionHtml(item, projectId, true)}
+      </div></div>
+    </div>`;
+  $('#tp-back').addEventListener('click', plainClick(closeStoreTask));
+  wireTaskStore();
 }
 // The store's rows the query's words match (name or summary).
 function storeViewHtml() {
@@ -17670,7 +17754,9 @@ function openForkRepositoryDialog(proj, opener, githubApp = {}) {
   source.focus();
 }
 
-function openNewGithubRepositoryDialog(proj, gitConnections, opener) {
+// Creates a GitHub repository in one of the organization's accounts, then hands
+// it to `created` (which attaches it wherever it was asked for).
+function openNewGithubRepositoryDialog(organizationId, gitConnections, opener, created) {
   const host = document.createElement('div');
   host.innerHTML = `<div class="modal-overlay"><form class="modal-card new-repository-dialog" role="dialog" aria-modal="true" aria-labelledby="new-repository-title">
     <div class="new-repository-head"><b id="new-repository-title">New GitHub repository</b><button class="icon-btn new-repository-close" type="button" aria-label="Close">×</button></div>
@@ -17695,14 +17781,14 @@ function openNewGithubRepositoryDialog(proj, gitConnections, opener) {
     if (!name) return toast('Repository name is required', true);
     if (button) { button.disabled = true; button.textContent = 'Creating…'; }
     try {
-      const repository = await api(`/api/organizations/${proj.organizationId}/repositories/create`, { method: 'POST', body: JSON.stringify({
+      const repository = await api(`/api/organizations/${organizationId}/repositories/create`, { method: 'POST', body: JSON.stringify({
         gitConnectionId: host.querySelector('#project-new-repo-connection').value,
         name,
         description: host.querySelector('#project-new-repo-description').value,
         private: host.querySelector('#project-new-repo-private').checked,
       }) });
-      await api(`/api/projects/${proj.id}/repositories`, { method: 'POST', body: JSON.stringify({ repositoryId: repository.id }) });
-      close(); toast('Repository created and attached'); await loadProjects(); await hydrateProjectAccess(projectById(proj.id) || proj);
+      await created(repository);
+      close();
     } catch (error) {
       toast(error.message, true);
       if (button) { button.disabled = false; button.textContent = 'Create and attach'; }
@@ -17721,42 +17807,77 @@ function repositorySourceView(source) {
 const folderIcon = () => '<svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M1.5 3.5A1.5 1.5 0 0 1 3 2h3.2l1.5 1.5H13A1.5 1.5 0 0 1 14.5 5v7.5A1.5 1.5 0 0 1 13 14H3a1.5 1.5 0 0 1-1.5-1.5v-9ZM3 3.5v9h10V5H7.1L5.6 3.5H3Z"/></svg>';
 const gitIcon = () => '<svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M5 2.5a1.5 1.5 0 0 0-.75 2.8v5.4a1.5 1.5 0 1 0 1.5 0V8.6c.4.25.9.4 1.5.4h2.1a1.5 1.5 0 1 0 0-1.5H7.25c-.83 0-1.5-.67-1.5-1.5v-.7A1.5 1.5 0 0 0 5 2.5Z"/></svg>';
 
+// One repository of a project's list, as Git & GitHub shows it.
+function gitRepoRow(source, repositories) {
+  const view = repositorySourceView(source);
+  const name = view.kind === 'github'
+    ? `<a class="git-repo-name" href="https://github.com/${esc(view.owner)}/${esc(view.name)}" target="_blank" rel="noopener noreferrer" title="${esc(source)}"><span>${esc(view.owner)}/</span>${esc(view.name)}</a>`
+    : `<span class="git-repo-name mono" title="${esc(source)}">${esc(source)}</span>`;
+  // A fork's pull requests go to the repository it was forked from.
+  const upstream = view.kind === 'github'
+    && repositories.find((repository) => `${repository.owner}/${repository.name}`.toLowerCase() === view.key)?.upstream;
+  const proposes = upstream ? `<span class="setting-muted git-repo-upstream" title="Pull requests go to ${esc(upstream.owner)}/${esc(upstream.name)} after Review">→ ${esc(upstream.owner)}/${esc(upstream.name)}</span>` : '';
+  return `<div class="git-repo" data-source="${esc(source)}"><span class="git-repo-icon">${view.kind === 'github' ? githubMark() : view.kind === 'local' ? folderIcon() : gitIcon()}</span>${name}${proposes}<button class="icon-btn git-repo-remove" type="button" title="Remove" aria-label="Remove ${esc(view.kind === 'github' ? `${view.owner}/${view.name}` : source)}">×</button></div>`;
+}
+// What the add-a-repository field accepts. Hosted projects may only use
+// repositories the organization's GitHub reaches.
+function repositoryInput(repositories) {
+  const pickOnly = !!S.meta?.hosted;
+  const canAdd = !pickOnly || repositories.length > 0;
+  const placeholder = !canAdd ? 'Connect GitHub to add repositories'
+    : [repositories.length ? 'owner/repository' : '', pickOnly ? '' : 'Git URL', hostLocal() ? 'local path' : '']
+      .filter(Boolean).join(', ').replace(/, ([^,]*)$/, ' or $1');
+  return { pickOnly, canAdd, placeholder };
+}
+// The source a typed repository names: the organization's GitHub repository it
+// matches (owner/name or URL), else what was typed. Null when a hosted project
+// may not use it.
+function repositorySourceFor(typed, repositories) {
+  const known = repositories.find((repository) => `${repository.owner}/${repository.name}`.toLowerCase() === typed.toLowerCase()
+    || repository.sshUrl === typed) || repositories.find((repository) => repositorySourceView(repository.sshUrl).key === repositorySourceView(typed).key);
+  if (repositoryInput(repositories).pickOnly && !known) return null;
+  return known?.sshUrl || typed;
+}
+// The GitHub row's value and actions: the organization's connected accounts,
+// or the step that connects them. `ids` name its buttons.
+function githubAccessView({ githubApp, gitConnections, githubLoadError }, organizationId, ids) {
+  const organizationLink = `${globalRoute('organization', organizationById(organizationId))}#settings-code`;
+  const needsUpdate = gitConnections.some((connection) => connection.permissionStatus && !connection.permissionStatus.ready);
+  return githubLoadError ? { value: `<span id="${ids.error}"></span>`, actions: '' }
+    : !githubApp.configured ? { value: `<span class="setting-muted">Not set up</span>${S.installationAccess ? '' : policyTip('Your administrator needs to set up GitHub first.')}`,
+      actions: S.installationAccess ? `<a class="btn sm primary" data-spa href="${installationRoute()}#installation-github">Set up</a>` : '' }
+    : !gitConnections.length ? { value: '<span class="setting-muted">Not connected</span>', actions: `<button class="btn sm primary" id="${ids.connect}" type="button">Connect GitHub</button>` }
+    : { value: `${gitConnections.map((connection) => `<b>${esc(connection.accountLogin)}</b>`).join('<span class="setting-sep">·</span>')}${needsUpdate ? '<span class="chip setting-warn" title="Approve GitHub’s updated access in organization settings">needs update</span>' : ''}`,
+      actions: `<button class="icon-btn" id="${ids.refresh}" type="button" title="Refresh repository list" aria-label="Refresh repository list">↻</button><a class="btn sm" data-spa href="${organizationLink}">Manage</a>` };
+}
+// An organization's GitHub as Git & GitHub reads it. Unreadable GitHub state
+// is reported (offering Retry); read as "not connected" it would send an
+// organization that is connected into setup.
+async function loadOrganizationGithub(organizationId) {
+  let githubLoadError = null;
+  const id = encodeURIComponent(organizationId);
+  const [repositories, gitConnections, githubApp] = await Promise.all([
+    api(`/api/organizations/${id}/repositories`),
+    api(`/api/organizations/${id}/git-connections`).catch((error) => { githubLoadError = error; return []; }),
+    api(`/api/organizations/${id}/github/app`).catch((error) => { githubLoadError = error; return { configured: false }; }),
+  ]);
+  return { repositories, gitConnections, githubApp, githubLoadError };
+}
+
 // Settings → Project → Git & GitHub: the project's repositories (each add or
 // remove saves at once), then who gives access and who commits.
 function renderProjectRepositories(box, proj, { repositories, gitConnections, githubApp, githubLoadError, githubLogin }) {
   const sources = proj.config.repos || [];
   const attached = new Set(sources.map((source) => repositorySourceView(source).key));
   const choices = repositories.filter((repository) => !attached.has(`${repository.owner}/${repository.name}`.toLowerCase()));
-  // Hosted projects may only use repositories the organization's GitHub reaches.
-  const pickOnly = !!S.meta?.hosted;
-  const canAdd = !pickOnly || repositories.length > 0;
-  const placeholder = !canAdd ? 'Connect GitHub to add repositories'
-    : [repositories.length ? 'owner/repository' : '', pickOnly ? '' : 'Git URL', hostLocal() ? 'local path' : '']
-      .filter(Boolean).join(', ').replace(/, ([^,]*)$/, ' or $1');
+  const { canAdd, placeholder } = repositoryInput(repositories);
   const canCreate = githubApp.configured && gitConnections.length && githubApp.userAuthorized;
-  const row = (source) => {
-    const view = repositorySourceView(source);
-    const name = view.kind === 'github'
-      ? `<a class="git-repo-name" href="https://github.com/${esc(view.owner)}/${esc(view.name)}" target="_blank" rel="noopener noreferrer" title="${esc(source)}"><span>${esc(view.owner)}/</span>${esc(view.name)}</a>`
-      : `<span class="git-repo-name mono" title="${esc(source)}">${esc(source)}</span>`;
-    // A fork's pull requests go to the repository it was forked from.
-    const upstream = view.kind === 'github'
-      && repositories.find((repository) => `${repository.owner}/${repository.name}`.toLowerCase() === view.key)?.upstream;
-    const proposes = upstream ? `<span class="setting-muted git-repo-upstream" title="Pull requests go to ${esc(upstream.owner)}/${esc(upstream.name)} after Review">→ ${esc(upstream.owner)}/${esc(upstream.name)}</span>` : '';
-    return `<div class="git-repo" data-source="${esc(source)}"><span class="git-repo-icon">${view.kind === 'github' ? githubMark() : view.kind === 'local' ? folderIcon() : gitIcon()}</span>${name}${proposes}<button class="icon-btn git-repo-remove" type="button" title="Remove" aria-label="Remove ${esc(view.kind === 'github' ? `${view.owner}/${view.name}` : source)}">×</button></div>`;
-  };
-  const organizationLink = `${globalRoute('organization', organizationById(proj.organizationId))}#settings-code`;
-  const needsUpdate = gitConnections.some((connection) => connection.permissionStatus && !connection.permissionStatus.ready);
-  const access = githubLoadError ? { value: '<span id="project-github-error"></span>', actions: '' }
-    : !githubApp.configured ? { value: `<span class="setting-muted">Not set up</span>${S.installationAccess ? '' : policyTip('Your administrator needs to set up GitHub first.')}`,
-      actions: S.installationAccess ? `<a class="btn sm primary" data-spa href="${installationRoute()}#installation-github">Set up</a>` : '' }
-    : !gitConnections.length ? { value: '<span class="setting-muted">Not connected</span>', actions: '<button class="btn sm primary" id="project-connect-github" type="button">Connect GitHub</button>' }
-    : { value: `${gitConnections.map((connection) => `<b>${esc(connection.accountLogin)}</b>`).join('<span class="setting-sep">·</span>')}${needsUpdate ? '<span class="chip setting-warn" title="Approve GitHub’s updated access in organization settings">needs update</span>' : ''}`,
-      actions: `<button class="icon-btn" id="project-refresh-github" type="button" title="Refresh repository list" aria-label="Refresh repository list">↻</button><a class="btn sm" data-spa href="${organizationLink}">Manage</a>` };
+  const access = githubAccessView({ githubApp, gitConnections, githubLoadError }, proj.organizationId,
+    { error: 'project-github-error', connect: 'project-connect-github', refresh: 'project-refresh-github' });
   const identity = `<b>You</b>${githubLogin && githubApp.userAuthorized ? `<span class="setting-sep">·</span><span class="setting-muted">${esc(githubLogin)}</span>` : ''}`;
   box.innerHTML = `<div class="section-h">Repositories</div>
     <div class="git-repos">
-      <div id="project-repository-fields">${sources.map(row).join('')}</div>
+      <div id="project-repository-fields">${sources.map((source) => gitRepoRow(source, repositories)).join('')}</div>
       <form class="git-repo-add" id="project-repository-add-form">
         <input id="project-repository-input" list="project-repository-options" autocomplete="off" spellcheck="false" aria-label="Add a repository" placeholder="${esc(placeholder)}" ${canAdd ? '' : 'disabled'}>
         <button class="btn sm" type="submit" id="project-repository-add" ${canAdd ? '' : 'disabled'}>Add</button>
@@ -17792,14 +17913,15 @@ function renderProjectRepositories(box, proj, { repositories, gitConnections, gi
     const input = $('#project-repository-input');
     const typed = input.value.trim();
     if (!typed) return input.focus();
-    const known = repositories.find((repository) => `${repository.owner}/${repository.name}`.toLowerCase() === typed.toLowerCase()
-      || repository.sshUrl === typed) || repositories.find((repository) => repositorySourceView(repository.sshUrl).key === repositorySourceView(typed).key);
-    if (pickOnly && !known) return toast('Choose one of the organization’s GitHub repositories', true);
-    const source = known?.sshUrl || typed;
+    const source = repositorySourceFor(typed, repositories);
+    if (!source) return toast('Choose one of the organization’s GitHub repositories', true);
     if (attached.has(repositorySourceView(source).key)) { input.value = ''; return toast('Already added'); }
     if (await save([...sources, source])) $('#project-repository-input')?.focus();
   });
-  $('#project-new-repo-open')?.addEventListener('click', (event) => openNewGithubRepositoryDialog(proj, gitConnections, event.currentTarget));
+  $('#project-new-repo-open')?.addEventListener('click', (event) => openNewGithubRepositoryDialog(proj.organizationId, gitConnections, event.currentTarget, async (repository) => {
+    await api(`/api/projects/${proj.id}/repositories`, { method: 'POST', body: JSON.stringify({ repositoryId: repository.id }) });
+    toast('Repository created and attached'); await loadProjects(); await hydrateProjectAccess(projectById(proj.id) || proj);
+  }));
   $('#project-fork-open')?.addEventListener('click', (event) => openForkRepositoryDialog(proj, event.currentTarget, githubApp));
   $('#project-connect-github')?.addEventListener('click', async () => { try { await connectOrganizationGithub(proj.organizationId, rerender); } catch (error) { toast(error.message, true); } });
   $('#project-authorize-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/authorize`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (error) { toast(error.message, true); } });
@@ -17817,14 +17939,9 @@ async function hydrateProjectAccess(proj) {
   const repositoriesAreCurrent = beginAsyncElementRender(repositoryBox);
   const renderIsCurrent = () => accessIsCurrent() && repositoriesAreCurrent();
   try {
-    // Unreadable GitHub state offers Retry; read as "not connected" it would send
-    // an organization that is connected into setup.
-    let githubLoadError = null;
-    const [repositories, members, gitConnections, githubApp, userGithub] = await Promise.all([
-      api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/repositories`),
+    const [{ repositories, gitConnections, githubApp, githubLoadError }, members, userGithub] = await Promise.all([
+      loadOrganizationGithub(proj.organizationId),
       api(`/api/projects/${encodeURIComponent(proj.id)}/members`),
-      api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/git-connections`).catch((error) => { githubLoadError = error; return []; }),
-      api(`/api/organizations/${encodeURIComponent(proj.organizationId)}/github/app`).catch((error) => { githubLoadError = error; return { configured: false }; }),
       api('/api/user/github-accounts').catch(() => null),
     ]);
     if (!renderIsCurrent()) return;
@@ -22813,63 +22930,167 @@ function setTheme(next) {
 })();
 
 // ── projects ─────────────────────────────────────────────────────────────────
+// The folder a world checks a repository source out into (its basename), which
+// names its install commands — src/domain/world-location.ts remoteName.
+function repositoryCheckoutName(source) {
+  const raw = source.replace(/\/$/, '').split(/[/:]/).pop()?.replace(/\.git$/, '') || 'repo';
+  const safe = raw.replace(/[^a-zA-Z0-9._-]/g, '-');
+  return !safe || /^\.+$/.test(safe) ? 'repo' : safe;
+}
+const commandLines = (text) => text.split('\n').map((line) => line.trim()).filter(Boolean);
+
+// New project: the name, the project's Git & GitHub, and folded Secrets and
+// Environment — what Project settings holds that a project needs to start.
+// Everything goes with Create, which opens the project's task list.
 // `folder` (from a folder row's "+") pre-fills the path so the new project
 // lands in that folder; the person can still retype it into any other place.
 function newProject(options) {
   const folder = options?.folder || '';
   const opener = document.activeElement;
+  const organizationId = S.organizationId;
   const host = document.createElement('div');
   host.innerHTML = `<div class="modal-overlay"><form class="modal-card new-project-dialog" role="dialog" aria-modal="true" aria-labelledby="new-project-title">
-    <div class="new-project-head"><div><b id="new-project-title">New project</b><span>Use slashes to organize it into folders.</span></div><button class="icon-btn new-project-close" type="button" aria-label="Close">×</button></div>
-    <label class="form-row"><span>Project name</span><input id="new-project-name" placeholder="e.g. Work/Clients/Website" required autocomplete="off" spellcheck="false" value="${esc(folder ? `${folder}/` : '')}"></label>
-    <div class="new-project-preview" aria-live="polite">The final segment is the project name; everything before it becomes its sidebar folder.</div>
+    <div class="new-project-head"><b id="new-project-title">New project</b><button class="icon-btn new-project-close" type="button" aria-label="Close">×</button></div>
+    <label class="form-row"><span>Project name ${policyTip('Use / to put it in folders, e.g. Clients/Website.')}</span><input id="new-project-name" aria-label="Project name" placeholder="e.g. Work/Clients/Website" required autocomplete="off" spellcheck="false" value="${esc(folder ? `${folder}/` : '')}"></label>
+    <div class="np-section"><div class="np-h">Git &amp; GitHub</div><div class="np-git"><div class="np-loading">Loading…</div></div></div>
+    <details class="np-fold"><summary>Secrets</summary>
+      <textarea class="np-secrets" aria-label="Secrets" rows="3" spellcheck="false" autocomplete="off" placeholder="KEY=value, one per line, or paste a .env"></textarea>
+    </details>
+    <details class="np-fold"><summary>Environment</summary><div class="np-env">
+      <label class="form-row"><span>Setup ${policyTip('Runs once on each new computer, before repositories are checked out.')}</span><textarea class="np-setup" aria-label="Setup" rows="2" spellcheck="false" placeholder="sudo apt-get install -y postgresql-client"></textarea></label>
+      <div class="np-install"></div>
+      <label class="form-row"><span>Boot ${policyTip('Runs as each task starts.')}</span><textarea class="np-boot" aria-label="Boot" rows="2" spellcheck="false" placeholder="npm run db:migrate"></textarea></label>
+    </div></details>
     <div class="form-error new-project-error" role="alert" hidden></div>
     <div class="new-project-actions"><button class="btn new-project-cancel" type="button">Cancel</button><button class="btn primary" type="submit">Create project</button></div>
   </form></div>`;
+  const $in = (selector) => host.querySelector(selector);
+  const repos = [];
+  let github = { repositories: [], gitConnections: [], githubApp: { configured: false }, githubLoadError: null };
+
+  // Install commands are per repository, so their fields follow the list.
+  const renderInstall = () => {
+    const typed = Object.fromEntries([...host.querySelectorAll('[data-install]')].map((field) => [field.dataset.install, field.value]));
+    const names = [...new Set(repos.map(repositoryCheckoutName))];
+    $in('.np-install').innerHTML = names.map((name) => `<label class="form-row"><span>Install in ${esc(name)}</span><textarea data-install="${esc(name)}" aria-label="Install in ${esc(name)}" rows="2" spellcheck="false" placeholder="npm ci">${esc(typed[name] || '')}</textarea></label>`).join('');
+  };
+  const renderGit = () => {
+    const box = $in('.np-git');
+    const typed = $in('#np-repo-input')?.value || '';
+    const { repositories, gitConnections, githubApp } = github;
+    const attached = new Set(repos.map((source) => repositorySourceView(source).key));
+    const { canAdd, placeholder } = repositoryInput(repositories);
+    const canCreate = githubApp.configured && gitConnections.length && githubApp.userAuthorized;
+    const access = organizationId ? githubAccessView(github, organizationId, { error: 'np-github-error', connect: 'np-connect-github', refresh: 'np-refresh-github' }) : null;
+    box.innerHTML = `<div class="git-repos">${repos.map((source) => gitRepoRow(source, repositories)).join('')}
+        <div class="git-repo-add"><input id="np-repo-input" list="np-repo-options" autocomplete="off" spellcheck="false" aria-label="Add a repository" placeholder="${esc(placeholder)}" ${canAdd ? '' : 'disabled'}>
+          <button class="btn sm" type="button" id="np-repo-add" ${canAdd ? '' : 'disabled'}>Add</button>
+          ${canCreate ? '<button class="btn sm" type="button" id="np-repo-new" aria-haspopup="dialog">New repository</button>' : ''}</div></div>
+      <datalist id="np-repo-options">${repositories.filter((repository) => !attached.has(`${repository.owner}/${repository.name}`.toLowerCase())).map((repository) => `<option value="${esc(repository.owner)}/${esc(repository.name)}"></option>`).join('')}</datalist>
+      ${access ? `<div class="setting-rows np-github"><div class="setting-row"><span class="setting-label">GitHub ${policyTip('The GitHub accounts this organization connected. Their repositories can be added above.')}</span><span class="setting-value">${access.value}</span><span class="setting-actions">${access.actions}</span></div></div>` : ''}`;
+    const input = $in('#np-repo-input');
+    input.value = typed;
+    if (github.githubLoadError) paneError($in('#np-github-error'), github.githubLoadError, loadGithub);
+    box.querySelectorAll('.git-repo').forEach((row) => row.querySelector('.git-repo-remove').addEventListener('click', () => {
+      repos.splice(repos.indexOf(row.dataset.source), 1);
+      renderGit(); renderInstall();
+    }));
+    const add = () => {
+      const value = input.value.trim();
+      if (!value) return input.focus();
+      const source = repositorySourceFor(value, repositories);
+      if (!source) return toast('Choose one of the organization’s GitHub repositories', true);
+      input.value = '';
+      if (!attached.has(repositorySourceView(source).key)) { repos.push(source); renderGit(); renderInstall(); }
+      $in('#np-repo-input').focus();
+    };
+    $in('#np-repo-add').addEventListener('click', add);
+    // Enter adds the repository; it does not create the project.
+    input.addEventListener('keydown', (event) => { if (event.key === 'Enter' && !event.isComposing) { event.preventDefault(); add(); } });
+    $in('#np-repo-new')?.addEventListener('click', (event) => openNewGithubRepositoryDialog(organizationId, gitConnections, event.currentTarget, async (repository) => {
+      github = { ...github, repositories: [...github.repositories, repository] };
+      repos.push(repository.sshUrl);
+      renderGit(); renderInstall();
+    }));
+    $in('#np-connect-github')?.addEventListener('click', async () => { try { await connectOrganizationGithub(organizationId, loadGithub); } catch (error) { toast(error.message, true); } });
+    $in('#np-refresh-github')?.addEventListener('click', async (event) => {
+      const button = event.currentTarget; button.disabled = true;
+      try { const result = await api(`/api/organizations/${organizationId}/github/refresh`, { method: 'POST', body: '{}' }); toast(`Found ${result.count} ${result.count === 1 ? 'repository' : 'repositories'}`); await loadGithub(); }
+      catch (error) { toast(error.message, true); button.disabled = false; }
+    });
+  };
+  const loadGithub = async () => {
+    if (organizationId) {
+      try { github = await loadOrganizationGithub(organizationId); }
+      catch (error) { github = { ...github, githubLoadError: error }; }
+    }
+    if (!closed) renderGit();
+  };
+
   const controller = new AbortController();
-  let closed = false;
+  let closed = false, creating = false;
   const close = () => {
-    if (closed) return;
+    if (closed || creating) return;
     closed = true;
     controller.abort();
     document.removeEventListener('keydown', keydown);
     host.remove();
     opener?.focus?.();
   };
-  const keydown = (event) => { if (event.key === 'Escape') close(); };
-  host.querySelector('.modal-overlay').addEventListener('mousedown', (event) => { if (event.target === event.currentTarget) close(); });
-  host.querySelector('.new-project-close').addEventListener('click', close);
-  host.querySelector('.new-project-cancel').addEventListener('click', close);
-  host.querySelector('form').addEventListener('submit', async (event) => {
+  // A dialog opened from this one (New repository, Connect GitHub) closes first.
+  const onTop = () => !host.nextElementSibling && !document.querySelector('dialog[open]');
+  const keydown = (event) => { if (event.key === 'Escape' && onTop()) close(); };
+  $in('.modal-overlay').addEventListener('mousedown', (event) => { if (event.target === event.currentTarget) close(); });
+  $in('.new-project-close').addEventListener('click', close);
+  $in('.new-project-cancel').addEventListener('click', close);
+  $in('form').addEventListener('submit', async (event) => {
     event.preventDefault();
-    const name = host.querySelector('#new-project-name').value.trim();
-    const error = host.querySelector('.new-project-error');
-    const button = event.submitter;
-    if (!name) return;
+    const name = $in('#new-project-name').value.trim();
+    const error = $in('.new-project-error');
+    const button = $in('button[type="submit"]');
+    if (!name || creating) return;
     error.hidden = true;
-    if (button) { button.disabled = true; button.textContent = 'Creating…'; }
+    button.disabled = true; button.textContent = 'Creating…';
+    let project;
     try {
       // Create with an EMPTY config so every field inherits from global settings.
-      const endpoint = S.organizationId ? `/api/organizations/${encodeURIComponent(S.organizationId)}/projects` : '/api/projects';
-      const project = await api(endpoint, { method: 'POST', body: JSON.stringify({ name, config: {} }), signal: controller.signal });
-      if (closed) return;
-      document.removeEventListener('keydown', keydown);
-      host.remove();
-      closed = true;
-      await loadProjects();
-      // A fresh project has no tasks, so Project settings remains the useful landing.
-      await go(projectRoute(project.id, 'settings'));
+      const endpoint = organizationId ? `/api/organizations/${encodeURIComponent(organizationId)}/projects` : '/api/projects';
+      project = await api(endpoint, { method: 'POST', body: JSON.stringify({ name, config: {}, ...(repos.length ? { repos: [...repos] } : {}) }), signal: controller.signal });
     } catch (cause) {
       if (closed || cause?.name === 'AbortError') return;
       error.textContent = cause.message;
       error.hidden = false;
-      if (button) { button.disabled = false; button.textContent = 'Create project'; }
-      host.querySelector('#new-project-name').focus();
+      button.disabled = false; button.textContent = 'Create project';
+      $in('#new-project-name').focus();
+      return;
     }
+    if (closed) return;
+    // The project exists now: what remains is saved before leaving, and a
+    // failure is named with a way to its settings rather than undoing it.
+    creating = true;
+    const base = `/api/projects/${encodeURIComponent(project.id)}`;
+    const secrets = $in('.np-secrets').value.trim();
+    const install = Object.fromEntries([...host.querySelectorAll('[data-install]')]
+      .map((field) => [field.dataset.install, commandLines(field.value)]).filter(([, commands]) => commands.length));
+    const environment = { setup: commandLines($in('.np-setup').value), install, boot: commandLines($in('.np-boot').value) };
+    const saves = [
+      secrets && ['secrets', api(`${base}/secrets`, { method: 'POST', body: JSON.stringify({ env: secrets }) })],
+      (environment.setup.length || environment.boot.length || Object.keys(install).length)
+        && ['environment', api(`${base}/environment`, { method: 'PUT', body: JSON.stringify(environment) })],
+    ].filter(Boolean);
+    const failed = (await Promise.allSettled(saves.map(([, save]) => save)))
+      .map((result, index) => result.status === 'rejected' ? `${saves[index][0]}: ${result.reason?.message}` : null).filter(Boolean);
+    document.removeEventListener('keydown', keydown);
+    host.remove();
+    closed = true;
+    await loadProjects();
+    await go(projectRoute(project.id));
+    if (failed.length) toast(`Project created, but couldn’t save ${failed.join('; ')}`, true, { label: 'Settings', href: projectRoute(project.id, 'settings') });
   });
   $('#modal-root').appendChild(host);
   document.addEventListener('keydown', keydown);
-  const input = host.querySelector('#new-project-name');
+  loadGithub();
+  const input = $in('#new-project-name');
   input.focus();
   input.setSelectionRange(input.value.length, input.value.length); // type the name right after the folder path
 }
@@ -23145,7 +23366,7 @@ function focusFollowup() {
 function cursorRows() {
   return [...document.querySelectorAll('#main .task-row, #main .queue-item')];
 }
-function rowKey(r) { return r.dataset.id || r.dataset.draft || r.dataset.inbox; }
+function rowKey(r) { return r.dataset.id || r.dataset.draft || r.dataset.inbox || r.dataset.storeTask; }
 function applyCursor() {
   cursorRows().forEach((r) => r.classList.toggle('cursor', rowKey(r) === S.cursorId));
 }
@@ -23227,6 +23448,7 @@ function closeTopOverlay() {
     return ($('#overlay-root').innerHTML = '');
   }
   if (S.selected) return closeTask();
+  if (S.storeOpen) return closeStoreTask();
 }
 
 // -- the shortcut echo: what you just did, as keys ---------------------------
