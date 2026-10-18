@@ -3912,10 +3912,16 @@ input.toggle:disabled { opacity:.45; cursor:not-allowed; }
 .tf-head .tf-template-name { flex: 1; min-width: 0; max-width: 360px; padding: 6px 9px; border: 1px solid var(--line); border-radius: 7px;
   background: var(--surface-2); color: var(--ink); font: inherit; font-weight: 550; }
 .tf-head .tf-template-name:focus { outline: none; border-color: var(--accent); }
-.tf-template-chip { flex: none; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The form's template button reads as the workflow select's twin, beside it. */
+.tf-head .tf-template { flex: 0 1 auto; min-width: 0; max-width: 220px; display: inline-flex; align-items: center; gap: 6px;
+  border: 1px solid var(--line); background: var(--surface-2); border-radius: 7px; padding: 6px 9px;
+  color: var(--ink-2); font: inherit; font-weight: 550; cursor: pointer; }
+.tf-head .tf-template:hover { color: var(--ink); border-color: var(--ink-3); }
+.tf-head .tf-template svg { flex: none; }
+.tf-template-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
 .template-save .tpl-scope { display: flex; align-items: center; gap: 8px; margin: 2px 0 16px; }
 .tf-foot #tf-save-template { gap: 6px; white-space: nowrap; }
 @media (max-width: 560px) {
-  .tf-foot .tf-save-template-label, .tf-template-chip { display: none; }
+  .tf-foot .tf-save-template-label, .tf-template-label { display: none; }
 }
 .template-save .tpl-scope-label { font-size: 13px; color: var(--ink-2); }
