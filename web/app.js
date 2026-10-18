@@ -12298,8 +12298,11 @@ function conversationOutline(entries, options) {
     const m = entry.message || {};
     const origin = messageOrigin(m);
     if (origin === 'person') return 'person';
-    // Waking after a pause, or a nudge to keep going, is the same work.
-    if (origin === 'platform') return m.role === 'system' || /^(wait|jobs|sa|sh|kg)-/.test(m.id || '') ? 'work' : 'prompt';
+    // A system note records what happened (who stopped an agent, a decision):
+    // one quiet line already, never folded. Waking after a pause, or a nudge
+    // to keep going, is the same work, not a new prompt.
+    if (m.role === 'system') return 'spine';
+    if (origin === 'platform') return /^(wait|jobs|sa|sh|kg)-/.test(m.id || '') ? 'work' : 'prompt';
     return (m.to || []).some((selector) => !selector.startsWith('agent:')) ? 'spine' : 'said';
   });
   const spine = kinds.map((kind) => kind === 'person' || kind === 'spine');

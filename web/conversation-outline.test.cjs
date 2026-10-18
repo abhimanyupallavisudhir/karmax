@@ -112,6 +112,15 @@ outline = conversationOutline([
 ], { asking: true });
 ok(keys(outline) === 'm0 a1 [merge-revise-2 2] a3', `the open question stays in view: ${keys(outline)}`);
 
+// A system note records something that happened (who stopped an agent, a
+// reviewer's decision): already one quiet line, it is never folded away.
+outline = conversationOutline([
+  msg('m0', 'user', 'Go'), act(1), act(2), msg('a3', 'agent', 'Done.'),
+  msg('u4', 'user', 'Take your time.', { author: 'user:me' }), act(5), act(6),
+  msg('stop-7', 'system', 'Ann Author stopped Agent 1.'),
+]);
+ok(keys(outline) === 'm0 [1 2] a3 u4 [5 6] stop-7', `system notes stay in view: ${keys(outline)}`);
+
 // Explanations travel with the message they explain.
 outline = conversationOutline([
   msg('m0', 'user', 'Go'), act(1), act(2), msg('a3', 'agent', 'Done.'),
