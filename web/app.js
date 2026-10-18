@@ -567,8 +567,10 @@ function parseRoute(url) {
   const taskFile = taskKey && seg[4] === 'file' ? fileRouteTarget(query) : null;
   const wikiView = tab === 'wiki' ? wikiViewFromQuery(query) : '';
   const avatarId = tab === 'avatars' && seg[3] ? seg[3] : null;
+  // A Task store entry, opened to read before running or installing it.
+  const storeKey = seg[2] === 'store' && seg[3] ? seg[3] : null;
   return { name: 'project', org, slug: seg[1], tab, taskKey, taskTab, q, ...(taskFile ? { taskFile } : {}),
-    ...(wikiView ? { wikiView } : {}), ...(avatarId ? { avatarId } : {}) };
+    ...(wikiView ? { wikiView } : {}), ...(avatarId ? { avatarId } : {}), ...(storeKey ? { storeKey } : {}) };
 }
 
 // Which branch the project wiki shows is part of the page, so it lives in the
@@ -716,6 +718,7 @@ async function applyRoute() {
   const routePath = location.pathname;
   const routeIsCurrent = () => S.routeEpoch === routeEpoch && location.pathname === routePath;
   const r = parseRoute(currentPath());
+  S.storeOpen = r.storeKey || null;
   const renamed = renamedOrganizationPath(r);
   if (renamed) return go(renamed, { replace: true });
   if (r.name === 'home') {
@@ -847,7 +850,7 @@ async function applyRoute() {
   }
   const incomingListQuery = r.q ?? DEFAULT_LIST_QUERY;
   const projectOrganizationLoaded = sameProject && S.orgProjectId === pid;
-  const canPaintCachedProject = !r.taskKey && projectOrganizationLoaded;
+  const canPaintCachedProject = !r.taskKey && !r.storeKey && projectOrganizationLoaded;
   // A project with nothing in memory to paint reads everything its page needs
   // together: tasks, avatars, tags/views and the list's search (RQ-9).
   const reads = [];
@@ -860,7 +863,7 @@ async function applyRoute() {
   let organizationRead = null, listSearch = null;
   if (!projectOrganizationLoaded) {
     organizationRead = loadOrg().catch(() => false);
-    if (!r.taskKey && tab === 'tasks') {
+    if (!r.taskKey && !r.storeKey && tab === 'tasks') {
       S.search = incomingListQuery;
       listSearch = runSearch().catch(() => {});
     }
@@ -894,8 +897,9 @@ async function applyRoute() {
   // is loaded re-reads none of it, so opening or j/k-walking tasks costs only the
   // task's own reads (UI-6); the list refreshes it when shown again. First visits
   // and cross-project routes wait so they never render foreign tags.
-  if (!r.taskKey || !projectOrganizationLoaded) await (organizationRead || loadOrg().catch(() => false));
+  if (!(r.taskKey || r.storeKey) || !projectOrganizationLoaded) await (organizationRead || loadOrg().catch(() => false));
   if (!routeIsCurrent()) return;
+  if (r.storeKey) return applyStoreTaskRoute(pid, r.storeKey, routeIsCurrent);
   // Resolve the open task from the URL BEFORE painting, so a permalink paints once
   // (its task page), not the list with a page swapped in a beat later.
   let taskId = null;
@@ -995,7 +999,8 @@ function plainClick(fn) {
 // previous task). Generalises the old goToTask logic to any SPA link.
 function spaNavigate(href) {
   const to = parseRoute(href);
-  if (to && to.taskKey && !parseRoute(currentPath()).taskKey) S.returnRoute = currentPath();
+  const from = parseRoute(currentPath());
+  if (to && (to.taskKey || to.storeKey) && !from.taskKey && !from.storeKey) S.returnRoute = currentPath();
   return go(href);
 }
 
@@ -6018,6 +6023,7 @@ function renderMain() {
     if (S.view) renderTaskPage();
     return;
   }
+  if (S.storeOpen && S.tab === 'tasks') return renderStoreTaskPage();
   // An open wiki editor likewise manages its own renders: a background refresh
   // must not clobber in-progress edits (only the focused field would survive
   // the async rehydrate). Navigation still repaints — it changes S.tab or
@@ -6427,22 +6433,100 @@ async function loadTaskStore(projectId, { force = false } = {}) {
 }
 
 const STORE_NEEDS = { github: ['Needs GitHub', 'Connect a GitHub repository to this project first'], chat: ['Needs a chat bot', 'Connect a chat bot to this project first'] };
-function storeRowHtml(item) {
-  const installed = item.repeatable && item.installed?.length;
-  const need = !installed && item.missing?.length ? STORE_NEEDS[item.missing[0]] : null;
+// What the project lacks for it, unless it already has it.
+function storeNeed(item) {
+  return !(item.repeatable && item.installed?.length) && item.missing?.length ? STORE_NEEDS[item.missing[0]] : null;
+}
+// Run, Install, or Open the series it installed.
+// A row's is small; on its page the one thing to do is primary.
+function storeActionHtml(item, projectId, onPage = false) {
+  const need = storeNeed(item);
   const disabled = need ? ` disabled title="${esc(need[1])}"` : '';
-  const action = installed
-    ? `<a class="btn sm" data-spa href="${esc(taskUrl(item.installed[0], { projectId: storeProjectId() }))}">Open</a>`
-    : item.repeatable
-      ? `<button class="btn sm" data-store-run="${esc(item.id)}"${disabled}>Install</button>`
-      : `<button class="btn sm primary" data-store-run="${esc(item.id)}"${disabled}>Run</button>`;
-  return `<div class="task-row store-row" data-store-task="${esc(item.id)}">
+  const cls = onPage ? 'btn primary' : 'btn sm';
+  if (item.repeatable && item.installed?.length) return `<a class="${onPage ? 'btn' : cls}" data-spa href="${esc(taskUrl(item.installed[0], taskRecord(item.installed[0]) || { projectId }))}">Open</a>`;
+  return item.repeatable
+    ? `<button class="${cls}" data-store-run="${esc(item.id)}"${disabled}>Install</button>`
+    : `<button class="${onPage ? cls : 'btn sm primary'}" data-store-run="${esc(item.id)}"${disabled}>Run</button>`;
+}
+// A store task's own page: /<org>/<project>/store/<id>.
+function storeTaskRoute(projectId, id) { return `${projectBase(projectId)}/store/${encodeURIComponent(id)}`; }
+function storeRowHtml(item) {
+  const projectId = storeProjectId();
+  const installed = item.repeatable && item.installed?.length;
+  const need = storeNeed(item);
+  return `<div class="task-row store-row has-row-link" data-store-task="${esc(item.id)}" tabindex="0" role="group" aria-label="${esc(item.name)}">
       <div class="task-main">
         <div class="task-title">${esc(item.name)} ${item.summary ? policyTip(item.summary) : ''}</div>
         <div class="task-sub">${item.repeatable ? `<span class="chip">${installed ? 'installed' : 'repeatable'}</span>` : ''}${need ? `<span>${esc(need[0])}</span>` : ''}</div>
       </div>
-      <div class="task-right">${action}</div>
+      <div class="task-right">${storeActionHtml(item, projectId)}</div>
+      <a class="row-link" data-spa href="${esc(storeTaskRoute(projectId, item.id))}" draggable="false" tabindex="-1" aria-hidden="true"></a>
     </div>`;
+}
+// Reading one changes nothing: the page shows what it would do, and the same
+// Run / Install as its row.
+async function applyStoreTaskRoute(projectId, id, routeIsCurrent) {
+  S.tab = 'tasks';
+  closeTaskDom();
+  renderRail();
+  if (S.taskStore?.[projectId]) renderMain();
+  else renderRouteLoadingPage('Task store');
+  await loadTaskStore(projectId, { force: true });
+  if (!routeIsCurrent()) return;
+  if (!S.taskStore?.[projectId]?.some((item) => item.id === id)) {
+    toast('Not in the Task store', true);
+    return go(listRoute(projectBase(projectId), STORE_VIEW_QUERY), { replace: true });
+  }
+  renderMain();
+}
+function storeBackRoute() { return S.returnRoute || listRoute(projectBase(S.projectId), STORE_VIEW_QUERY); }
+function closeStoreTask() {
+  const back = storeBackRoute();
+  S.returnRoute = null;
+  return go(back);
+}
+// Its triggers, conditions included (a series page's summary says less).
+function storeTriggerSummary(triggers) {
+  return (triggers || []).map((trigger) => {
+    const where = Object.entries(trigger.kind === 'event' ? trigger.where || {} : {}).map(([path, expected]) => {
+      const [op, value] = eventConditionParts(expected);
+      return `${path} ${EVENT_OPS.find(([v]) => v === op)[1]} ${value}`;
+    });
+    return [triggerSummary([trigger]), ...where].join(' · ');
+  }).join('  ·  ');
+}
+function renderStoreTaskPage() {
+  const main = $('#main');
+  const projectId = S.projectId;
+  const item = (S.taskStore?.[projectId] || []).find((candidate) => candidate.id === S.storeOpen);
+  if (!main || !item) return;
+  const installed = item.repeatable && item.installed?.length;
+  const need = storeNeed(item);
+  const md = markdownEnabled() ? ' md' : '';
+  const when = storeTriggerSummary(item.task?.params?.triggers);
+  main.innerHTML = `
+    <div class="task-page store-page" data-store-page="${esc(item.id)}">
+      <div class="tp-head">
+        <div class="row1">
+          <a class="icon-btn" id="tp-back" href="${esc(storeBackRoute())}" data-shortcut="nav.close" title="Back (Esc)">←</a>
+          <h2>${esc(item.name)}</h2>
+          ${item.repeatable ? `<span class="chip">${installed ? 'installed' : 'repeatable'}</span>` : ''}
+        </div>
+        ${when ? `<div class="meta"><span>${esc(when)}</span></div>` : ''}
+      </div>
+      <div class="tp-body" id="tp-body" tabindex="-1"><div class="tp-content">
+        ${item.summary ? `<p class="store-summary">${esc(item.summary)}</p>` : ''}
+        <div class="section-h">Prompt</div>
+        <div class="store-prompt msg-text${md}">${renderMessageBody(item.task?.prompt || '')}</div>
+      </div></div>
+      <div class="tp-foot" id="tp-foot"><div class="tp-foot-inner">
+        ${need ? `<span class="store-need">${esc(need[0])}</span>` : ''}
+        <span style="flex:1"></span>
+        ${storeActionHtml(item, projectId, true)}
+      </div></div>
+    </div>`;
+  $('#tp-back').addEventListener('click', plainClick(closeStoreTask));
+  wireTaskStore();
 }
 // The store's rows the query's words match (name or summary).
 function storeViewHtml() {
@@ -23077,7 +23161,7 @@ function focusFollowup() {
 function cursorRows() {
   return [...document.querySelectorAll('#main .task-row, #main .queue-item')];
 }
-function rowKey(r) { return r.dataset.id || r.dataset.draft || r.dataset.inbox; }
+function rowKey(r) { return r.dataset.id || r.dataset.draft || r.dataset.inbox || r.dataset.storeTask; }
 function applyCursor() {
   cursorRows().forEach((r) => r.classList.toggle('cursor', rowKey(r) === S.cursorId));
 }
@@ -23159,6 +23243,7 @@ function closeTopOverlay() {
     return ($('#overlay-root').innerHTML = '');
   }
   if (S.selected) return closeTask();
+  if (S.storeOpen) return closeStoreTask();
 }
 
 // -- the shortcut echo: what you just did, as keys ---------------------------

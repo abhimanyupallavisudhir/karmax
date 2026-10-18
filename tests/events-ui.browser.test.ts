@@ -148,6 +148,45 @@ describe('events in the console', () => {
     expect(elsewhere.errors).toEqual([]);
   });
 
+  it('opens a store task to read it without running or installing it', async () => {
+    const before = (await store.listTasks(project.id)).length;
+    const { page, errors } = await open('/personal/factory?q=is%3Astore');
+    const row = page.locator('.store-row[data-store-task="build-planned-issues"]');
+    await row.waitFor();
+    await row.click({ position: { x: 40, y: 12 } });
+    await expect.poll(() => page.url()).toMatch(/\/personal\/factory\/store\/build-planned-issues$/);
+    const storePage = page.locator('[data-store-page="build-planned-issues"]');
+    await storePage.waitFor();
+    expect(await storePage.locator('h2').textContent()).toBe('Build planned issues');
+    expect(await storePage.locator('.tp-head .meta').textContent()).toBe('on github.issues.labeled · label.name is planned');
+    expect(await storePage.locator('.store-summary').textContent()).toContain('Label a GitHub issue');
+    expect(await storePage.locator('.store-prompt').textContent()).toContain('Build what the GitHub issue below asks for');
+    expect(await storePage.locator('.tp-foot').textContent()).toContain('Needs GitHub');
+    expect(await storePage.locator('[data-store-run]').isDisabled()).toBe(true);
+    if (process.env.KARMAX_SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.KARMAX_SCREENSHOT_DIR, 'store-task-page.png') });
+    // Esc goes back to the store it was opened from; nothing was taken.
+    await page.keyboard.press('Escape');
+    await expect.poll(() => page.url()).toMatch(/\/personal\/factory\?q=is(:|%3A)store$/);
+    await row.waitFor();
+    expect((await store.listTasks(project.id)).length).toBe(before);
+
+    // The keyboard opens it too, and a permalink paints the page by itself.
+    await page.locator('.store-row[data-store-task="project-wiki"]').focus();
+    await page.keyboard.press('o');
+    await expect.poll(() => page.url()).toMatch(/\/store\/project-wiki$/);
+    const fresh = await open('/personal/factory/store/project-wiki');
+    await fresh.page.locator('[data-store-page="project-wiki"] .store-prompt').waitFor();
+    expect(await fresh.page.locator('.store-prompt').textContent()).toContain('Set up this project');
+    expect(await fresh.page.locator('[data-store-run]').textContent()).toBe('Run');
+    expect(await fresh.page.locator('.tp-head .meta').count()).toBe(0);
+    // An entry the store does not have lands on the store.
+    const missing = await open('/personal/factory/store/no-such-task');
+    await expect.poll(() => missing.page.url()).toMatch(/\/personal\/factory\?q=is(:|%3A)store$/);
+    await missing.page.locator('.store-row').first().waitFor();
+    expect((await store.listTasks(project.id)).length).toBe(before);
+    expect([...errors, ...fresh.errors, ...missing.errors]).toEqual([]);
+  });
+
   it('runs and installs from the Task store view; a deleted series is on offer again', async () => {
     const { page, errors } = await open('/personal/factory');
     await page.locator('.view-chip[data-view="__store__"]').click();
@@ -190,6 +229,13 @@ describe('events in the console', () => {
     // The rest of the query filters the store by its words.
     await page.locator('#task-search').fill('is:store planned');
     await expect.poll(async () => page.locator('.store-row').count()).toBe(1);
+    // Its page installs it as well, and then opens what it installed.
+    await row('build-planned-issues').click({ position: { x: 40, y: 12 } });
+    const storePage = page.locator('[data-store-page="build-planned-issues"]');
+    await storePage.locator('[data-store-run]:not([disabled])').click();
+    await expect.poll(async () => storePage.locator('.tp-head .chip').textContent()).toBe('installed');
+    await storePage.locator('.tp-foot a', { hasText: 'Open' }).click();
+    await page.locator('#sd-delete').waitFor();
 
     // Settings no longer carries a gallery.
     await page.goto(`${base}/personal/factory/settings#project-events`);
