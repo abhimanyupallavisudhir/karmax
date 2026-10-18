@@ -10,7 +10,7 @@ import { worldRelativePath, worldWorkingDirectory, WorldCheckoutSpec } from './t
 import { addCheckoutViaExec } from './checkout.js';
 import { boundedResponseBody } from './http.js';
 import { serviceHomeLabel } from './services.js';
-import type { ResolvedWorldProviderConnection } from './connections.js';
+import { connectionScope, fundingRef, type ResolvedWorldProviderConnection } from './connections.js';
 import { provisionGitCredentials, provisionGitRepos, runOrThrow as provisionRun, type ProvisionTarget } from './provision-git.js';
 import { taskBranch } from '../domain/brand.js';
 import { DEFAULT_MACHINE, machineShape } from '../domain/computer.js';
@@ -218,8 +218,9 @@ export class DaytonaWorldProvider implements WorldProvider {
         target: provisioned.repos[0]?.target ?? spec.target,
         repo: provisioned.repos[0]?.repo, repos: provisioned.repos,
         ...(provisioned.workdir ? { workdir: provisioned.workdir } : {}),
-        sealedProviderRef: this.seal({ sandboxId: sandbox.id, ...(spec.organizationId ? { organizationId: spec.organizationId } : {}) }),
-        meta: { releaseOnCompletion: true, environmentFlavor: flavor,
+        sealedProviderRef: this.seal({ sandboxId: sandbox.id, ...(spec.organizationId ? { organizationId: spec.organizationId } : {}),
+          ...fundingRef(connection) }),
+        meta: { releaseOnCompletion: true, environmentFlavor: flavor, ...fundingRef(connection),
           ...(provisioned.ephemeralPaths.length ? { ephemeralPaths: provisioned.ephemeralPaths } : {}),
           ...((selectedSnapshot ?? selectedImage) ? { environmentArtifact: selectedSnapshot ?? selectedImage } : {}) },
         ...([...provisioned.warnings, ...resourceWarnings].length ? { warnings: [...provisioned.warnings, ...resourceWarnings] } : {}),
@@ -329,7 +330,7 @@ export class DaytonaWorldProvider implements WorldProvider {
     if (handle.sealedProviderRef?.startsWith('KWR2.') && this.referenceKeys) {
       const value = this.referenceKeys.open(handle.sealedProviderRef);
       if (!value.sandboxId) throw new Error('invalid Daytona world handle');
-      return { sandboxId: value.sandboxId, organizationId: value.organizationId };
+      return { sandboxId: value.sandboxId, organizationId: connectionScope(value) };
     }
     if (handle.sealedProviderRef) {
       const blob = Buffer.from(handle.sealedProviderRef, 'base64url');
@@ -338,7 +339,8 @@ export class DaytonaWorldProvider implements WorldProvider {
       decipher.setAuthTag(blob.subarray(16, 32));
       const value = JSON.parse(Buffer.concat([decipher.update(blob.subarray(32)), decipher.final()]).toString('utf8'));
       if (typeof value.sandboxId === 'string') return { sandboxId: value.sandboxId,
-        organizationId: typeof value.organizationId === 'string' ? value.organizationId : undefined };
+        organizationId: connectionScope({ organizationId: typeof value.organizationId === 'string' ? value.organizationId : undefined,
+          funding: value.funding }) };
     }
     throw new Error('invalid Daytona world handle');
   }

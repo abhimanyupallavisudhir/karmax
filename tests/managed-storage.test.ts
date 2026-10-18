@@ -359,15 +359,41 @@ describe.each(BACKENDS)('%s', (name) => {
       (await f.worldCheckpoint(done.id, Date.now()));
 
       const view = (await f.service.contents(f.organizationId));
-      expect(view.projects).toEqual([expect.objectContaining({ projectId: f.project.id, name: 'Data', bytes: 600,
-        resources: [{ id: data.id, name: 'data', currentBytes: 200, olderVersions: 1, olderBytes: 300, taskCopies: 0, taskCopyBytes: 0 }],
+      const stored = (await f.store.resourceStoredBytes(data.id));
+      expect(stored).toBeGreaterThan(500);
+      expect(view.projects).toEqual([expect.objectContaining({ projectId: f.project.id, name: 'Data', bytes: stored + 100,
+        resources: [{ id: data.id, name: 'data', bytes: stored, currentBytes: 200, olderVersions: 1, taskCopies: 0 }],
         checkpoints: { count: 1, bytes: 100, finishedCount: 1, finishedBytes: 100 } })]);
       expect(view.policy).toEqual({ finishedTaskCheckpointDays: 30, overQuotaDeletionDays: 365 });
+      // The parts add up to what the quota counts.
+      expect(view.projects[0]!.bytes + view.otherBytes).toBe(view.retainedBytes);
 
-      expect((await f.service.deleteOlderVersions(data.id))).toEqual({ deleted: 1, bytes: 300 });
+      const deleted = (await f.service.deleteOlderVersions(data.id));
+      expect(deleted.deleted).toBe(1);
+      expect(deleted.bytes).toBe(stored - (await f.store.resourceStoredBytes(data.id)));
+      expect(deleted.bytes).toBeGreaterThanOrEqual(300);
       expect((await f.service.deleteFinishedWorkspaces(f.organizationId, f.project.id))).toEqual({ queued: 1 });
       const after = (await f.service.contents(f.organizationId));
-      expect(after.projects[0]).toMatchObject({ bytes: 200, checkpoints: { count: 0 } });
+      expect(after.projects[0]).toMatchObject({ bytes: (await f.store.resourceStoredBytes(data.id)), checkpoints: { count: 0 } });
+    });
+
+    // pramana's storage page said 1.22 TB for a project while the organization
+    // stored 56 GB: every version's full size was added up, although versions
+    // share their unchanged files.
+    it('counts versions that share most of their files once, as the quota does', async () => {
+      const f = (await fixture());
+      const data = (await f.attachment('data'));
+      const big = crypto.randomBytes(40_000);
+      for (let version = 0; version < 6; version++)
+        (await f.resources.importFiles(data.id, [{ path: 'big.bin', data: big }, { path: 'small.txt', data: Buffer.from(`v${version}`) }]));
+      const view = (await f.service.contents(f.organizationId));
+      const resource = view.projects[0]!.resources[0]!;
+      expect(resource.olderVersions).toBe(5);
+      expect(resource.currentBytes).toBeGreaterThanOrEqual(40_000);
+      // Six logical copies would be 240 kB; stored once it is about 40 kB.
+      expect(resource.bytes).toBeLessThan(2 * 40_000);
+      expect(view.projects[0]!.bytes).toBeLessThanOrEqual(view.retainedBytes);
+      expect(view.projects[0]!.bytes + view.otherBytes).toBe(view.retainedBytes);
     });
   });
 });

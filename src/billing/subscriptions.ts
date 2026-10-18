@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { rememberSubscriptionCatalog } from './catalog.js';
 import type { Store } from '../store/db.js';
-import { HOSTED_PLANS, STORAGE_PACK, hostedMonthlyPriceCents, hostedStorageQuotaBytes, isHostedPlanId,
+import { COMPUTE_PACK, HOSTED_PLANS, STORAGE_PACK, hostedMonthlyPriceCents, hostedStorageQuotaBytes, isHostedPlanId,
   type HostedPlanId } from '../domain/entitlements.js';
 import { managedStorageLocationId } from '../store/storage-locations.js';
 import type { SubscriptionRuntimeConfig } from '../launch/settings.js';
@@ -29,6 +29,9 @@ export interface SubscriptionCatalogConfig {
   /** Optional: storage packs are offered only once their price exists. */
   storagePackPriceId?: string;
   storagePackProductId?: string;
+  /** Optional: compute packs are offered only once their price exists. */
+  computePackPriceId?: string;
+  computePackProductId?: string;
 }
 
 /** Authoritative commercial snapshot returned by the canonical checkout service.
@@ -71,6 +74,8 @@ export interface BillingAccount {
   seats: number;
   /** Verified storage packs billed on the subscription. */
   storagePacks: number;
+  /** Verified compute packs billed on the subscription. */
+  computePacks: number;
   items: Record<string, string>;
   currentPeriodEnd?: number;
   cancelAtPeriodEnd: boolean;
@@ -103,6 +108,8 @@ export interface SubscriptionProvider {
     idempotencyKey: string }): Promise<{ id: string }>;
   /** Sets the subscription's total storage packs, keeping every other item. */
   updateStoragePacks(input: { subscriptionId: string; storagePacks: number; idempotencyKey: string }): Promise<{ id: string }>;
+  /** Sets the subscription's total compute packs, keeping every other item. */
+  updateComputePacks(input: { subscriptionId: string; computePacks: number; idempotencyKey: string }): Promise<{ id: string }>;
   verifyWebhook(raw: Buffer, signature?: string): BillingEvent | Promise<BillingEvent>;
 }
 
@@ -115,12 +122,13 @@ export interface BillingEvent {
 }
 
 export interface BillingRequestIntent {
-  kind: 'checkout' | 'change' | 'cancel' | 'seats' | 'storage' | 'abandon';
+  kind: 'checkout' | 'change' | 'cancel' | 'seats' | 'storage' | 'compute' | 'abandon';
   subscriptionId?: string;
   checkoutId?: string;
   plan?: PaidHostedPlanId;
   seats?: number;
   storagePacks?: number;
+  computePacks?: number;
   successUrl?: string;
   checkoutResult?: Omit<SubscriptionCheckoutResult, 'checkoutSessionReference' | 'url'>;
 }
@@ -245,6 +253,10 @@ export class StripeSubscriptionProvider implements SubscriptionProvider {
     throw new BillingRequestRejected('storage packs are billed only through Paddle');
   }
 
+  async updateComputePacks(): Promise<{ id: string }> {
+    throw new BillingRequestRejected('compute packs are billed only through Paddle');
+  }
+
   async verifyWebhook(raw: Buffer, signature?: string): Promise<BillingEvent> {
     const secret = (await this.webhookSecret());
     if (!secret || !signature) throw new Error('subscription webhook signing is not configured');
@@ -349,10 +361,14 @@ export class SubscriptionBillingService {
         : status === 'none' || status === 'canceled' ? 'free' : 'restricted';
     const pendingRequest = Boolean(await this.store.db.prepare('SELECT requestKey FROM subscription_billing_locks WHERE organizationId=?').get(organizationId));
     const pendingCheckout = Boolean(await this.store.db.prepare("SELECT checkoutId FROM subscription_billing_checkouts WHERE organizationId=? AND state='pending'").get(organizationId));
-    const storagePack = { ...STORAGE_PACK, available: Boolean((await provider.catalog())?.storagePackPriceId) };
+    const catalog = await provider.catalog();
+    const storagePack = { ...STORAGE_PACK, available: Boolean(catalog?.storagePackPriceId) };
     const storagePackGift = await this.store.storagePackGift(organizationId);
+    const computePack = { ...COMPUTE_PACK, available: Boolean(catalog?.computePackPriceId) };
+    const computePackGift = await this.store.computePackGift(organizationId);
     return { managed: true, providerConfigured: (await provider.configured()), plan, billedPlan, status, seats, gift, pendingRequest, pendingCheckout,
       storagePacks: account?.storagePacks ?? 0, storagePack, storagePackGift, giftedStoragePacks: storagePackGift?.packs ?? 0,
+      computePacks: account?.computePacks ?? 0, computePack, computePackGift, giftedComputePacks: computePackGift?.packs ?? 0,
       activeUsers: members, seatDeficit: gift?.plan === 'team' ? 0 : plan === 'team' ? Math.max(0, members - seats)
         : Math.max(0, members - HOSTED_PLANS[plan].includedActiveUsers),
       access, cancelAtPeriodEnd: account?.cancelAtPeriodEnd ?? false,
@@ -395,6 +411,22 @@ export class SubscriptionBillingService {
       if (!(await this.store.getOrganization(organizationId))) throw new Error('organization not found');
       return this.idempotent(organizationId, `gift-storage:${packs}`, key, async () => {
         await this.store.setStoragePackGift(organizationId, packs, grantedBy);
+        return this.current(organizationId);
+      });
+    });
+  }
+
+  /** Complimentary compute packs, like gifted storage packs: counted on any
+   * plan (the operator's way to offer a trial), kept until removed (0 removes). */
+  async giftComputePacks(organizationId: string, packs: unknown, grantedBy: string, key: string) {
+    if (!this.hosted) throw new Error('compute pack gifts are only available on hosted installations');
+    this.requireKey(key);
+    if (typeof packs !== 'number' || !Number.isSafeInteger(packs) || packs < 0 || packs > 1000)
+      throw new Error('gifted compute packs must be a whole number from 0 to 1000');
+    return this.store.transaction(async () => {
+      if (!(await this.store.getOrganization(organizationId))) throw new Error('organization not found');
+      return this.idempotent(organizationId, `gift-compute:${packs}`, key, async () => {
+        await this.store.setComputePackGift(organizationId, packs, grantedBy);
         return this.current(organizationId);
       });
     });
@@ -532,6 +564,26 @@ export class SubscriptionBillingService {
     return this.idempotent(organizationId, `storage:${packs}`, key, () => provider.updateStoragePacks({
       subscriptionId: account.subscriptionId!, storagePacks: packs, idempotencyKey: `${key}:storage`,
     }), provider, { kind: 'storage', subscriptionId: account.subscriptionId, storagePacks: packs });
+  }
+
+  /** Sets the total compute packs billed on the subscription, granted only
+   * from the verified state that follows. Removing packs needs no check: the
+   * month's compute already used stays used, and new managed computers wait
+   * once the smaller allowance is spent. */
+  async computePacks(organizationId: string, packs: unknown, key: string) {
+    this.requireKey(key);
+    if (typeof packs !== 'number' || !Number.isSafeInteger(packs) || packs < 0 || packs > 1000)
+      throw new Error('compute packs must be a whole number from 0 to 1000');
+    const account = await this.account(organizationId);
+    const provider = await this.requireHosted(account?.provider);
+    if (!account?.subscriptionId || account.plan === 'free' || !['active', 'trialing', 'past_due'].includes(account.status))
+      throw new Error('compute packs need an active paid subscription');
+    if (!(await provider.catalog())?.computePackPriceId) throw new Error('compute packs are not available yet');
+    if (packs > account.computePacks && account.status === 'past_due')
+      throw new Error('update the payment method before adding compute packs');
+    return this.idempotent(organizationId, `compute:${packs}`, key, () => provider.updateComputePacks({
+      subscriptionId: account.subscriptionId!, computePacks: packs, idempotencyKey: `${key}:compute`,
+    }), provider, { kind: 'compute', subscriptionId: account.subscriptionId, computePacks: packs });
   }
 
   /** Removing packs must not leave the organization's managed storage over quota. */
@@ -703,10 +755,10 @@ export class SubscriptionBillingService {
       if (event.type === 'customer.subscription.deleted') {
         const rank = billingEventRank(event.type, 'canceled');
         const next = { status: 'canceled' as const, plan: account.plan,
-          seats: HOSTED_PLANS[account.plan].includedActiveUsers, storagePacks: 0, cancelAtPeriodEnd: false };
+          seats: HOSTED_PLANS[account.plan].includedActiveUsers, storagePacks: 0, computePacks: 0, cancelAtPeriodEnd: false };
         if (!shouldApplyBillingTransition(account, eventAt, rank, next)) return;
         const updated = (await this.patchAccount(account.organizationId, { subscriptionId, status: 'canceled',
-          seats: HOSTED_PLANS[account.plan].includedActiveUsers, storagePacks: 0,
+          seats: HOSTED_PLANS[account.plan].includedActiveUsers, storagePacks: 0, computePacks: 0,
           items: {}, cancelAtPeriodEnd: false, currentPeriodEnd: subscriptionPeriodEnd(object),
           lastEventAt: eventAt, lastEventRank: rank, verifiedAt: Date.now(), pastDueAt: undefined }));
         (await this.reconcileAccount(updated));
@@ -717,7 +769,8 @@ export class SubscriptionBillingService {
       const rank = billingEventRank(event.type, status);
       const cancelAtPeriodEnd = Boolean(object.cancel_at_period_end);
       if (!shouldApplyBillingTransition(account, eventAt, rank,
-        { status, plan: mapped.plan, seats: mapped.seats, storagePacks: mapped.storagePacks, cancelAtPeriodEnd })) return;
+        { status, plan: mapped.plan, seats: mapped.seats, storagePacks: mapped.storagePacks, computePacks: mapped.computePacks,
+          cancelAtPeriodEnd })) return;
       const updated = (await this.patchAccount(account.organizationId, { subscriptionId: String(object.id), ...mapped,
         status, cancelAtPeriodEnd,
         currentPeriodEnd: subscriptionPeriodEnd(object), lastEventAt: eventAt, lastEventRank: rank,
@@ -731,7 +784,7 @@ export class SubscriptionBillingService {
       const rank = billingEventRank(event.type, 'past_due');
       if (!shouldApplyBillingTransition(account, eventAt, rank,
         { status: 'past_due', plan: account.plan, seats: account.seats, storagePacks: account.storagePacks,
-          cancelAtPeriodEnd: account.cancelAtPeriodEnd })) return;
+          computePacks: account.computePacks, cancelAtPeriodEnd: account.cancelAtPeriodEnd })) return;
       const updated = (await this.patchAccount(account.organizationId, { status: 'past_due',
         pastDueAt: account.pastDueAt ?? Date.now(), lastError: 'The latest subscription payment failed.',
         lastEventAt: eventAt, lastEventRank: rank, verifiedAt: Date.now() }));
@@ -741,7 +794,7 @@ export class SubscriptionBillingService {
       const rank = billingEventRank(event.type, 'active');
       if (!shouldApplyBillingTransition(account, eventAt, rank,
         { status: 'active', plan: account.plan, seats: account.seats, storagePacks: account.storagePacks,
-          cancelAtPeriodEnd: account.cancelAtPeriodEnd })) return;
+          computePacks: account.computePacks, cancelAtPeriodEnd: account.cancelAtPeriodEnd })) return;
       const updated = (await this.patchAccount(account.organizationId, { status: 'active', pastDueAt: undefined,
         lastError: undefined, lastEventAt: eventAt, lastEventRank: rank, verifiedAt: Date.now() }));
       (await this.reconcileAccount(updated));
@@ -772,15 +825,18 @@ export class SubscriptionBillingService {
         : paidPlan === 'individual' || gift?.plan === 'individual' ? 'individual' : 'free';
       // Packs ride on paid access alone: a gift never grants them.
       const storagePacks = account && paidPlan !== 'free' ? account.storagePacks : 0;
+      const computePacks = account && paidPlan !== 'free' ? account.computePacks : 0;
       const organization = await this.store.getOrganization(organizationId);
       if (organization?.plan !== plan) await this.store.setOrganizationPlan(organizationId, plan);
       if ((organization?.storagePacks ?? 0) !== storagePacks)
         await this.store.setOrganizationStoragePacks(organizationId, storagePacks);
+      if ((organization?.computePacks ?? 0) !== computePacks)
+        await this.store.setOrganizationComputePacks(organizationId, computePacks);
     });
   }
 
   private async mapSubscription(object: any, provider: SubscriptionProvider): Promise<{ plan: HostedPlanId; seats: number;
-    storagePacks: number; items: Record<string, string> }> {
+    storagePacks: number; computePacks: number; items: Record<string, string> }> {
     const currentCatalog = await provider.catalog();
     if (!currentCatalog) throw new Error('subscription catalog is not configured');
     const catalogs = await rememberSubscriptionCatalog(this.store, provider.name, currentCatalog);
@@ -788,11 +844,12 @@ export class SubscriptionBillingService {
     let plan: HostedPlanId | undefined;
     let seats = HOSTED_PLANS.team.includedActiveUsers;
     let storagePacks = 0;
+    let computePacks = 0;
     for (const item of object.items?.data ?? []) {
       const price = stringId(item.price);
       const product = stringId(item.price?.product);
       const catalog = catalogs.find((entry) => [entry.individualPriceId, entry.teamBasePriceId, entry.teamSeatPriceId,
-        entry.storagePackPriceId].includes(price ?? '')) ?? currentCatalog;
+        entry.storagePackPriceId, entry.computePackPriceId].includes(price ?? '')) ?? currentCatalog;
       if (price === catalog.individualPriceId) {
         if (provider.customerMode === 'checkout' && item.quantity !== 1) throw new Error('base plan quantity must be one');
         if (plan) throw new Error('subscription contains multiple configured base plan prices');
@@ -819,12 +876,19 @@ export class SubscriptionBillingService {
         const quantity = Number(item.quantity);
         if (!Number.isSafeInteger(quantity) || quantity < 0) throw new Error('storage pack quantity is invalid');
         storagePacks = quantity; items.storagePack = String(item.id);
+      } else if (catalog.computePackPriceId && price === catalog.computePackPriceId) {
+        if (items.computePack) throw new Error('subscription contains duplicate compute pack prices');
+        if (catalog.computePackProductId && product !== catalog.computePackProductId)
+          throw new Error('Compute pack price belongs to an unexpected product');
+        const quantity = Number(item.quantity);
+        if (!Number.isSafeInteger(quantity) || quantity < 0) throw new Error('compute pack quantity is invalid');
+        computePacks = quantity; items.computePack = String(item.id);
       } else if (provider.customerMode === 'checkout') throw new Error('Paddle subscription contains an unexpected price');
     }
     if (!plan) throw new Error(`subscription contains no configured ${BRAND} plan price`);
     if (provider.customerMode === 'checkout' && plan === 'individual' && items.teamSeat)
       throw new Error('Individual subscription contains Team seats');
-    return { plan, seats: plan === 'team' ? seats : HOSTED_PLANS.individual.includedActiveUsers, storagePacks, items };
+    return { plan, seats: plan === 'team' ? seats : HOSTED_PLANS.individual.includedActiveUsers, storagePacks, computePacks, items };
   }
 
   private async account(organizationId: string): Promise<BillingAccount | undefined> {
@@ -856,10 +920,10 @@ export class SubscriptionBillingService {
     const current = (await this.account(organizationId));
     if (!current) throw new Error('billing account not found');
     (await this.store.db.prepare(`UPDATE subscription_billing_accounts SET subscriptionId=?, plan=?, status=?, seats=?, storagePacks=?,
-      itemsJson=?, currentPeriodEnd=?, cancelAtPeriodEnd=?, lastEventAt=?, lastEventRank=?, verifiedAt=?, pastDueAt=?, lastError=?, updatedAt=?
+      computePacks=?, itemsJson=?, currentPeriodEnd=?, cancelAtPeriodEnd=?, lastEventAt=?, lastEventRank=?, verifiedAt=?, pastDueAt=?, lastError=?, updatedAt=?
       WHERE organizationId=?`).run(patch.subscriptionId ?? current.subscriptionId ?? null,
       patch.plan ?? current.plan, patch.status ?? current.status, patch.seats ?? current.seats,
-      patch.storagePacks ?? current.storagePacks, JSON.stringify(patch.items ?? current.items), patch.currentPeriodEnd ?? current.currentPeriodEnd ?? null,
+      patch.storagePacks ?? current.storagePacks, patch.computePacks ?? current.computePacks, JSON.stringify(patch.items ?? current.items), patch.currentPeriodEnd ?? current.currentPeriodEnd ?? null,
       (patch.cancelAtPeriodEnd ?? current.cancelAtPeriodEnd) ? 1 : 0, patch.lastEventAt ?? current.lastEventAt,
       patch.lastEventRank ?? current.lastEventRank,
       patch.verifiedAt ?? current.verifiedAt ?? null,
@@ -938,7 +1002,7 @@ export class FakeSubscriptionProvider implements SubscriptionProvider {
   readonly calls: Array<{ method: string; input: any }> = [];
   constructor(private config: SubscriptionCatalogConfig = {
     individualPriceId: 'price_individual', teamBasePriceId: 'price_team_base', teamSeatPriceId: 'price_team_seat',
-    storagePackPriceId: 'price_storage_pack',
+    storagePackPriceId: 'price_storage_pack', computePackPriceId: 'price_compute_pack',
   }) {}
   configured() { return true; }
   catalog() { return this.config; }
@@ -949,6 +1013,7 @@ export class FakeSubscriptionProvider implements SubscriptionProvider {
   async cancelAtPeriodEnd(input: any) { this.calls.push({ method: 'cancelAtPeriodEnd', input }); return { id: input.subscriptionId }; }
   async updateSeats(input: any) { this.calls.push({ method: 'updateSeats', input }); return { id: input.subscriptionId }; }
   async updateStoragePacks(input: any) { this.calls.push({ method: 'updateStoragePacks', input }); return { id: input.subscriptionId }; }
+  async updateComputePacks(input: any) { this.calls.push({ method: 'updateComputePacks', input }); return { id: input.subscriptionId }; }
   verifyWebhook(raw: Buffer): BillingEvent { return JSON.parse(raw.toString('utf8')); }
 }
 
@@ -958,6 +1023,7 @@ function rowAccount(row: any): BillingAccount | undefined {
   return { organizationId: row.organizationId, provider: row.provider, customerId: row.customerId ?? undefined,
     subscriptionId: row.subscriptionId ?? undefined, plan: row.plan, status: normalizeStatus(row.status), seats: Number(row.seats),
     storagePacks: Number(row.storagePacks ?? 0) || 0,
+    computePacks: Number(row.computePacks ?? 0) || 0,
     items: JSON.parse(row.itemsJson || '{}'), currentPeriodEnd: row.currentPeriodEnd ?? undefined,
     cancelAtPeriodEnd: Boolean(row.cancelAtPeriodEnd), lastEventAt: Number(row.lastEventAt),
     lastEventRank: Number(row.lastEventRank || 0),
@@ -996,7 +1062,8 @@ function normalizeStatus(value: any): SubscriptionStatus {
  * subscription snapshots outrank invoice summaries, terminal states are
  * sticky, and a paid invoice outranks a failed invoice. Equal snapshot ranks
  * deterministically prefer the lower-entitlement plan, cancellation intent,
- * the larger billed seat quantity, then fewer storage packs. A strictly newer
+ * the larger billed seat quantity, then fewer storage packs, then fewer
+ * compute packs. A strictly newer
  * event always wins. */
 function billingEventRank(type: string, status: SubscriptionStatus): number {
   if (type === 'customer.subscription.deleted') return 700;
@@ -1010,13 +1077,13 @@ function billingEventRank(type: string, status: SubscriptionStatus): number {
 }
 
 function shouldApplyBillingTransition(current: BillingAccount, eventAt: number, eventRank: number,
-  next: Pick<BillingAccount, 'status' | 'plan' | 'seats' | 'storagePacks' | 'cancelAtPeriodEnd'>): boolean {
+  next: Pick<BillingAccount, 'status' | 'plan' | 'seats' | 'storagePacks' | 'computePacks' | 'cancelAtPeriodEnd'>): boolean {
   if (eventAt > current.lastEventAt) return true;
   if (eventAt < current.lastEventAt) return false;
   if (eventRank !== current.lastEventRank) return eventRank > current.lastEventRank;
   const planRestriction = (plan: HostedPlanId) => plan === 'free' ? 3 : plan === 'individual' ? 2 : 1;
-  const before = [planRestriction(current.plan), current.cancelAtPeriodEnd ? 1 : 0, current.seats, -current.storagePacks];
-  const after = [planRestriction(next.plan), next.cancelAtPeriodEnd ? 1 : 0, next.seats, -next.storagePacks];
+  const before = [planRestriction(current.plan), current.cancelAtPeriodEnd ? 1 : 0, current.seats, -current.storagePacks, -current.computePacks];
+  const after = [planRestriction(next.plan), next.cancelAtPeriodEnd ? 1 : 0, next.seats, -next.storagePacks, -next.computePacks];
   for (let index = 0; index < before.length; index++) {
     if (after[index] !== before[index]) return after[index]! > before[index]!;
   }

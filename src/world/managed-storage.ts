@@ -51,13 +51,18 @@ export interface StorageContentsView {
   projects: Array<{
     projectId: string;
     name: string;
-    /** Logical bytes: versions share unchanged data. */
+    /** Stored bytes, as the quota counts them: the projects add up to
+     * `retainedBytes` less `otherBytes`. */
     bytes: number;
-    resources: Array<{ id: string; name: string; currentBytes: number; olderVersions: number; olderBytes: number;
-      taskCopies: number; taskCopyBytes: number }>;
+    /** `bytes`: everything the resource keeps, every version deduplicated;
+     * `currentBytes`: the size of its current version alone. */
+    resources: Array<{ id: string; name: string; bytes: number; currentBytes: number; olderVersions: number; taskCopies: number }>;
     artifacts: { count: number; bytes: number; nextExpiry?: number };
     checkpoints: { count: number; bytes: number; finishedCount: number; finishedBytes: number };
   }>;
+  /** Stored bytes no project accounts for (data saved before resources had
+   * their own repositories), so the parts always add up to the total. */
+  otherBytes: number;
 }
 
 /** Retention, the over-quota policy and the customer's view of what managed
@@ -180,17 +185,21 @@ export class ManagedStorageService {
     };
     const byAttachment = new Map<string, typeof contents.revisions>();
     for (const revision of contents.revisions) byAttachment.set(revision.attachmentId, [...(byAttachment.get(revision.attachmentId) ?? []), revision]);
+    // Revision sizes are logical (each counts every file it holds), so they
+    // are never summed: twelve versions of a 9 GB dataset that differ by a few
+    // files are about 9 GB stored, not 108 GB. What a resource stores is its
+    // repository's deduplicated size, which is what the quota counts.
     for (const attachment of contents.attachments) {
+      const bytes = contents.repositoryBytes.get(attachment.id) ?? 0;
+      if (!bytes) continue;
       const revisions = byAttachment.get(attachment.id) ?? [];
-      if (!revisions.length) continue;
       const currentBytes = revisions.find((revision) => revision.id === attachment.currentRevisionId)?.bytes ?? 0;
-      const older = revisions.filter((revision) => revision.id !== attachment.currentRevisionId && !revision.checkpoint);
-      const copies = revisions.filter((revision) => revision.id !== attachment.currentRevisionId && revision.checkpoint);
-      const sum = (list: typeof revisions) => list.reduce((total, revision) => total + revision.bytes, 0);
+      const others = revisions.filter((revision) => revision.id !== attachment.currentRevisionId);
       const entry = project(attachment.projectId);
-      entry.resources.push({ id: attachment.id, name: attachment.name, currentBytes, olderVersions: older.length,
-        olderBytes: sum(older), taskCopies: copies.length, taskCopyBytes: sum(copies) });
-      entry.bytes += currentBytes + sum(older) + sum(copies);
+      entry.resources.push({ id: attachment.id, name: attachment.name, bytes, currentBytes,
+        olderVersions: others.filter((revision) => !revision.checkpoint).length,
+        taskCopies: others.filter((revision) => revision.checkpoint).length });
+      entry.bytes += bytes;
     }
     for (const artifact of contents.artifacts) {
       const entry = project(artifact.projectId);
@@ -205,10 +214,14 @@ export class ManagedStorageService {
         entry.checkpoints.finishedCount++; entry.checkpoints.finishedBytes += checkpoint.bytes;
       }
     }
+    for (const entry of projects.values()) entry.resources.sort((a, b) => b.bytes - a.bytes);
     const reconciled = await this.deps.reconciler?.report().catch(() => undefined);
     const held = reconciled?.organizations[organizationId];
+    const retainedBytes = usage?.retainedBytes ?? 0;
+    const counted = [...projects.values()].reduce((total, entry) => total + entry.bytes, 0);
     return {
-      retainedBytes: usage?.retainedBytes ?? 0,
+      retainedBytes,
+      otherBytes: Math.max(0, retainedBytes - counted),
       ...(usage?.quotaBytes != null ? { quotaBytes: usage.quotaBytes } : {}),
       ...(held?.pendingDelete ? { pendingDeletion: { bytes: held.pendingDelete,
         ...(held.pendingDeleteUntil ? { until: held.pendingDeleteUntil } : {}), measuredAt: reconciled!.at } } : {}),
@@ -225,13 +238,15 @@ export class ManagedStorageService {
   async deleteOlderVersions(attachmentId: string): Promise<{ deleted: number; bytes: number }> {
     const attachment = (await this.deps.store.getResourceAttachment(attachmentId));
     if (!attachment) throw new Error('resource attachment not found');
-    let deleted = 0; let bytes = 0;
+    const before = (await this.deps.store.resourceStoredBytes(attachmentId));
+    let deleted = 0;
     for (const revision of (await this.deps.store.listResourceRevisions(attachmentId))) {
       if (revision.id === attachment.currentRevisionId) continue;
-      if ((await this.deps.resources.deleteRevision(revision.id))) { deleted++; bytes += revision.bytes; }
+      if ((await this.deps.resources.deleteRevision(revision.id))) deleted++;
     }
     await this.deps.resources.pruneRepositories();
-    return { deleted, bytes };
+    // What was freed: only data no remaining version shares.
+    return { deleted, bytes: Math.max(0, before - (await this.deps.store.resourceStoredBytes(attachmentId))) };
   }
 
   /** Delete the saved workspaces of a project's done and cancelled tasks now,

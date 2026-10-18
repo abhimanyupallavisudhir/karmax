@@ -12,6 +12,15 @@ import { expireConversationExports } from '../store/conversation-exports.js';
 import { DeferredDeleteObjectStore } from '../store/deferred-delete.js';
 import { taskEnded } from './task-ended.js';
 import { taskProvider } from './task-provider.js';
+import { assertComputeCredit, assertManagedRoom } from './managed-compute.js';
+import { MANAGED_COMPUTE } from './connections.js';
+
+/** What the runner service needs to know about managed compute
+ * (WorldProviderConnectionService). */
+export interface ManagedComputeAccounts {
+  funding(organizationId: string | undefined, provider: string): Promise<'managed' | 'own' | undefined>;
+  managedConnections(): Promise<Array<{ provider: string; config: { maxRunning?: number } }>>;
+}
 
 // Private/explicit pools retain physical resource totals. Hosted customer-owned
 // pools ignore these totals and derive active worlds from plan concurrency.
@@ -24,7 +33,7 @@ const PROVIDER_METERED = new Set(['e2b', 'fly', 'hetzner']);
 /** Durable admission and cost attribution for execution-plane capacity. The DB
  * queue is the source of truth, so a waiting activity can restart on any worker. */
 export class RunnerPoolService {
-  constructor(private store: Store) {}
+  constructor(private store: Store, private managed?: ManagedComputeAccounts) {}
 
   async ensureDefaultPool(project: Project, provider: string): Promise<RunnerPool> {
     const organizationId = project.organizationId!;
@@ -39,6 +48,17 @@ export class RunnerPoolService {
     const hostedActiveWorlds = remote && this.store.hosted
       ? (await this.store.getOrganizationUsagePolicy(organizationId)).maxActiveWorlds
       : undefined;
+    // Managed compute (the installation's account) has a pool of its own, so
+    // its leases are told apart from the organization's own account's: they
+    // count toward the installation's concurrency and bill as managed.
+    if (remote && await this.managed?.funding(organizationId, provider) === 'managed') {
+      const managedId = `${organizationId}:tavya-${provider}`;
+      const pool = await this.store.getRunnerPool(managedId);
+      const capacity = { ...DEFAULT_CAPACITY, ...(hostedActiveWorlds == null ? {} : { activeWorlds: hostedActiveWorlds }) };
+      if (pool && pool.capacity.activeWorlds === capacity.activeWorlds) return pool;
+      return this.store.createRunnerPool({ ...(pool ?? {}), id: managedId, organizationId, name: `${provider.toUpperCase()} · managed`,
+        provider, mode: 'managed', capacity, enabled: true });
+    }
     const id = `${organizationId}:${remote ? `managed-${provider}` : 'local'}`;
     const existing = (await this.store.getRunnerPool(id));
     if (existing) {
@@ -62,12 +82,21 @@ export class RunnerPoolService {
   async acquire(input: { project: Project; taskId: string; worldId: string; provider: string; priority?: number;
     /** The task's own machine size, when its Computer differs from the project's. */
     resources?: Project['config']['resources'];
+    /** New work (a task's first machine): refused once the organization's
+     * managed compute credit is spent. Waking a world to save or publish its
+     * work is not. */
+    work?: boolean;
     heartbeat?: () => void; signal?: AbortSignal; pollMs?: number }): Promise<{ leaseId: string; runnerPoolId: string }> {
     if (input.signal?.aborted)
       throw input.signal.reason ?? new Error('runner lease cancelled');
     const projectConfig = (await this.store.effectiveProjectConfig(input.project));
     const config = input.resources ? { ...projectConfig, resources: input.resources } : projectConfig;
     const pool = (await this.ensureDefaultPool(input.project, input.provider));
+    if (pool.mode === 'managed') {
+      if (input.work) await assertComputeCredit(this.store, input.project.organizationId!, input.provider);
+      const account = (await this.managed?.managedConnections())?.find((value) => value.provider === input.provider);
+      await assertManagedRoom(this.store, input.provider, account?.config.maxRunning);
+    }
     const month = monthWindow(Date.now());
     const organizationPolicy = (await this.store.getOrganizationExecutionPolicy(input.project.organizationId!));
     const organizationSpent = (await this.store.usageSummary(input.project.organizationId!, month.from, month.to)).costMicros;
@@ -535,12 +564,17 @@ export class WorldLifecycleManager {
     const organizations = (await this.store.listOrganizations());
     const organizationIds = new Set(organizations.map((organization) => organization.id));
     for (const provider of this.worlds.metered()) {
-      for (const organization of organizations) {
+      // The installation's managed compute account first: its feed reports
+      // every organization's managed machines, booked as managed (charged to
+      // their compute credit). Should an organization connect the very same
+      // account as its own, the rows are already booked when its feed repeats them.
+      for (const organization of [{ id: MANAGED_COMPUTE }, ...organizations]) {
         // Each tenant key sees its own E2B project feed. Environment credentials
         // are imported into org_personal on boot, so an absent connection means
         // this organization must not be polled through another tenant's fallback.
         const connection = (await this.store.getWorldProviderConnection(organization.id, provider.kind));
         if (!connection?.enabled) continue;
+        const fundingSource = organization.id === MANAGED_COMPUTE ? 'managed' : 'byok';
         const syncKey = `usage-sync:${organization.id}:${provider.kind}`;
         let previous: Record<string, unknown> = {};
         try { previous = JSON.parse((await this.store.kvGet(syncKey)) ?? '{}'); } catch {}
@@ -588,7 +622,7 @@ export class WorldLifecycleManager {
                 organizationId: owner,
                 ...attributed,
                 provider: provider.kind, kind: disk ? 'world.disk' : 'world.active', quantity: seconds, unit: 'second',
-                fundingSource: 'byok',
+                fundingSource,
                 // The provider's own price when it reports one (Fly, Hetzner); karmax's rates otherwise.
                 costMicros: event.costMicros ?? Math.round(seconds * costMicrosPerSecond(provider.kind,
                   event.cpu, event.memoryMb, event.gpu ?? 0)),
@@ -652,7 +686,8 @@ export class WorldLifecycleManager {
       // have no ambient fallback key at all, so an unscoped list silently sees
       // nothing. Query every enabled tenant connection; retain one unscoped pass
       // only for legacy/custom providers that have no durable connection row.
-      const organizationIds = (await __asyncCollections.filter((await this.store.listOrganizations()), async (organization) => (await this.store.getWorldProviderConnection(organization.id, provider.kind))?.enabled))
+      const organizationIds = (await __asyncCollections.filter([{ id: MANAGED_COMPUTE }, ...(await this.store.listOrganizations())],
+        async (organization) => (await this.store.getWorldProviderConnection(organization.id, provider.kind))?.enabled))
         .map((organization) => organization.id);
       const scopes: Array<string | undefined> = organizationIds.length ? organizationIds : [undefined];
       const seen = new Set<string>();
@@ -688,7 +723,7 @@ export class WorldLifecycleManager {
   /** Each provider's own periodic upkeep, once per connected organization. */
   private async housekeepProviders(): Promise<void> {
     for (const provider of this.worlds.housekept()) {
-      for (const organization of await this.store.listOrganizations()) {
+      for (const organization of [{ id: MANAGED_COMPUTE }, ...(await this.store.listOrganizations())]) {
         if (!(await this.store.getWorldProviderConnection(organization.id, provider.kind))?.enabled) continue;
         await this.step(`upkeep ${provider.kind} ${organization.id}`, () => provider.housekeep!(organization.id));
       }

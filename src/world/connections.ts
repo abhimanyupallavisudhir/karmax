@@ -1,5 +1,5 @@
 import type { CredentialBroker } from '../autonomy/broker.js';
-import { organizationScope } from '../autonomy/vault-keys.js';
+import { INSTALLATION_SCOPE, organizationScope } from '../autonomy/vault-keys.js';
 import type { MachineShape } from '../domain/computer.js';
 import { assertComputerFits, computerLimits, providerFeatures, type ComputerFeatures, type ComputerLimits, type EffectiveComputerLimits } from '../domain/computer-limits.js';
 import type { WorldProviderConnection } from '../domain/types.js';
@@ -7,14 +7,35 @@ import type { Store } from '../store/db.js';
 import { probeDaytonaLimits, probeE2BLimits } from './provider-limits.js';
 
 import { CLOUD_WORLD_PROVIDERS } from '../domain/computer.js';
+import { BRAND } from '../domain/brand.js';
 
 export { CLOUD_WORLD_PROVIDERS };
+
+/** The owner of managed compute connections: the installation's own provider
+ * accounts, which every organization without its own account uses and is
+ * charged for (wiki features/managed-compute). Passed where an organization id
+ * goes, it names those accounts. */
+export const MANAGED_COMPUTE = 'installation';
+
+/** The account a world's sealed reference names: a world made on managed
+ * compute stays on the installation's account, whatever its organization
+ * connects later. */
+export function connectionScope(reference: { organizationId?: string; funding?: string }): string | undefined {
+  return reference.funding === 'managed' ? MANAGED_COMPUTE : reference.organizationId;
+}
+
+/** What a sealed reference records about the account a world was made on. */
+export function fundingRef(connection: { managed?: boolean } | undefined): { funding?: 'managed' } {
+  return connection?.managed ? { funding: 'managed' } : {};
+}
 /** Self-hosted fallback keys, imported into the installation owner's connection at boot. */
 const ENVIRONMENT_KEYS: Record<string, string> = { e2b: 'E2B_API_KEY', daytona: 'DAYTONA_API_KEY', fly: 'FLY_API_TOKEN', hetzner: 'HCLOUD_TOKEN' };
 
 export interface ResolvedWorldProviderConnection {
   organizationId?: string;
   provider: string;
+  /** The installation's account (managed compute), not the organization's own. */
+  managed?: boolean;
   apiKey: string;
   config: WorldProviderConnection['config'];
   /** What a computer on this account may be (wiki features/computers). */
@@ -26,7 +47,10 @@ export interface ResolvedWorldProviderConnection {
 /** A connection as the API shows it: the key stays write-only, and `limits`
  * is what a computer on this account may be. */
 export type WorldProviderConnectionView = Omit<WorldProviderConnection, 'measuredLimits'>
-  & { credentialConfigured: boolean; limits: EffectiveComputerLimits; features: ComputerFeatures };
+  & { credentialConfigured: boolean; limits: EffectiveComputerLimits; features: ComputerFeatures;
+    /** Managed compute: the installation's account, offered to an organization
+     * without its own (never editable from the organization). */
+    managed?: boolean };
 
 /** How a connection reaches its provider; tests replace these. */
 export interface ProviderProbes {
@@ -59,8 +83,18 @@ export class WorldProviderConnectionService {
   }
 
   /** Every connection, with its limits. One never asked is asked now (briefly
-   * waited for), so the Computer form's maximum is the account's own. */
+   * waited for), so the Computer form's maximum is the account's own. An
+   * organization's list also offers managed compute for every provider it
+   * has not connected itself (`managed: true`). */
   async list(organizationId: string): Promise<WorldProviderConnectionView[]> {
+    const own = await this.listOwn(organizationId);
+    if (organizationId === MANAGED_COMPUTE) return own;
+    const mine = new Set(own.map((value) => value.provider));
+    const managed = (await this.managedConnections()).filter((value) => !mine.has(value.provider));
+    return [...own, ...managed.map((value) => managedView(value))];
+  }
+
+  private async listOwn(organizationId: string): Promise<WorldProviderConnectionView[]> {
     const values = await this.store.listWorldProviderConnections(organizationId);
     const configured = await Promise.all(values.map((value) => this.broker.hasHandle(value.credentialHandle)));
     const unknown = values.filter((value, index) => !value.measuredLimits && value.enabled && configured[index]);
@@ -72,6 +106,22 @@ export class WorldProviderConnectionService {
     return Promise.all(values.map((value) => this.view(value)));
   }
 
+  /** The installation's enabled managed compute accounts that have a key. */
+  async managedConnections(): Promise<WorldProviderConnectionView[]> {
+    const values = (await this.store.listWorldProviderConnections(MANAGED_COMPUTE)).filter((value) => value.enabled);
+    const usable = await Promise.all(values.map(async (value) => await this.broker.hasHandle(value.credentialHandle)));
+    return Promise.all(values.filter((_, index) => usable[index]).map((value) => this.view(value)));
+  }
+
+  /** Whether `provider` computers for this organization run on managed
+   * compute: it has no connection of its own and the installation offers one. */
+  async funding(organizationId: string | undefined, provider: string): Promise<'managed' | 'own' | undefined> {
+    if (!organizationId) return undefined;
+    const own = await this.store.getWorldProviderConnection(organizationId, provider);
+    if (own) return 'own';
+    return (await this.managedConnections()).some((value) => value.provider === provider) ? 'managed' : undefined;
+  }
+
   async get(organizationId: string, provider: string): Promise<WorldProviderConnectionView | undefined> {
     const value = (await this.store.getWorldProviderConnection(organizationId, provider));
     return value ? await this.view(value) : undefined;
@@ -80,7 +130,9 @@ export class WorldProviderConnectionService {
   /** What a computer on `provider` may be for this organization. Self-hosted
    * computers have none; an unconnected provider has its documented ones. */
   async limits(organizationId: string | undefined, provider: string): Promise<EffectiveComputerLimits> {
-    const value = organizationId ? await this.store.getWorldProviderConnection(organizationId, provider) : undefined;
+    let value = organizationId ? await this.store.getWorldProviderConnection(organizationId, provider) : undefined;
+    if (!value && organizationId && await this.funding(organizationId, provider) === 'managed')
+      value = await this.store.getWorldProviderConnection(MANAGED_COMPUTE, provider);
     return computerLimits(provider, value?.measuredLimits, value?.config.limits);
   }
 
@@ -129,7 +181,8 @@ export class WorldProviderConnectionService {
     // endpoint must leave the previous working credential/config untouched.
     const config = cleanConfig({ ...(existing?.config ?? {}), ...(input.config ?? {}) }, this.store.hosted);
     const key = input.apiKey?.trim();
-    if (key) (await this.broker.registerHandle(handle, key, organizationScope(input.organizationId)));
+    if (key) (await this.broker.registerHandle(handle, key, input.organizationId === MANAGED_COMPUTE
+      ? INSTALLATION_SCOPE : organizationScope(input.organizationId)));
     if (!key && !await this.broker.hasHandle(handle)) throw new Error(`${providerName(input.provider)} API key is required`);
     (await this.store.upsertWorldProviderConnection({
       organizationId: input.organizationId,
@@ -147,23 +200,38 @@ export class WorldProviderConnectionService {
     return (await this.get(input.organizationId, input.provider))!;
   }
 
+  /** The account a computer runs on: the organization's own connection;
+   * else, when it has none, the installation's managed compute account (the
+   * world records that, so `MANAGED_COMPUTE` resolves it ever after); else,
+   * self-hosted only, an environment key. */
   async resolve(organizationId: string | undefined, provider: string): Promise<ResolvedWorldProviderConnection> {
     const value = organizationId ? (await this.store.getWorldProviderConnection(organizationId, provider)) : undefined;
     if (value?.enabled && await this.broker.hasHandle(value.credentialHandle)) {
       return {
         organizationId,
         provider,
+        ...(organizationId === MANAGED_COMPUTE ? { managed: true } : {}),
         apiKey: await this.broker.resolve(value.credentialHandle, { caps: [`use-credential:${value.credentialHandle}`] }),
         config: cleanConfig(value.config, this.store.hosted),
         limits: computerLimits(provider, value.measuredLimits, value.config.limits),
         recordLimits: (limits) => this.recordLimits(organizationId!, provider, limits),
       };
     }
+    if (organizationId === MANAGED_COMPUTE)
+      throw new Error(`${BRAND}'s ${providerName(provider)} computers are not available`);
     if (value && !value.enabled) throw new Error(`${providerName(provider)} is disabled for this organization`);
-    // Hosted launches must never turn an installation credential into a
-    // centrally resold organization rail. importEnvironment() migrates a
-    // bootstrap key into the installation owner's explicit connection; every
-    // other hosted organization must connect its own account.
+    // An organization without its own account uses the installation's managed
+    // compute account when there is one; usage there is charged to the
+    // organization's compute allowance (src/world/managed-compute.ts).
+    if (!value && organizationId) {
+      const managed = await this.store.getWorldProviderConnection(MANAGED_COMPUTE, provider);
+      if (managed?.enabled && await this.broker.hasHandle(managed.credentialHandle))
+        return { ...(await this.resolve(MANAGED_COMPUTE, provider)), organizationId, managed: true,
+          recordLimits: (limits) => this.recordLimits(MANAGED_COMPUTE, provider, limits) };
+    }
+    // Hosted organizations otherwise connect their own account: a bootstrap
+    // environment key is never a centrally funded rail (importEnvironment()
+    // moves it into the installation owner's explicit connection).
     if (this.store.hosted)
       throw new Error(`${providerName(provider)} is not connected for this organization`);
     // Environment credentials remain a self-hosted compatibility fallback.
@@ -245,6 +313,15 @@ const defaultProbes: ProviderProbes = {
   },
 };
 
+/** Managed compute as an organization sees it: the provider, its limits and
+ * features; never the installation's key, templates or capacity. */
+function managedView(value: WorldProviderConnectionView): WorldProviderConnectionView {
+  return { id: `managed:${value.provider}`, organizationId: MANAGED_COMPUTE, provider: value.provider, name: providerName(value.provider),
+    credentialHandle: '', config: value.config.region ? { region: value.config.region } : {}, enabled: true,
+    status: value.status === 'error' ? 'error' : 'ready', createdAt: value.createdAt, updatedAt: value.updatedAt,
+    credentialConfigured: true, limits: value.limits, features: value.features, managed: true } as WorldProviderConnectionView;
+}
+
 function cleanLimits(value: unknown): WorldProviderConnection['config']['limits'] {
   if (!value || typeof value !== 'object') return undefined;
   const raw = value as Record<string, unknown>;
@@ -278,7 +355,13 @@ function cleanConfig(value: WorldProviderConnection['config'], hosted = false): 
     ...(slug(value.region, 'region') ? { region: slug(value.region, 'region') } : {}),
     ...(slug(value.organization, 'organization') ? { organization: slug(value.organization, 'organization') } : {}),
     ...(limits ? { limits } : {}),
+    ...(maxRunning(value.maxRunning) ? { maxRunning: maxRunning(value.maxRunning) } : {}),
   };
+}
+
+function maxRunning(value: unknown): number | undefined {
+  const number = Number(value);
+  return Number.isInteger(number) && number > 0 && number <= 100_000 ? number : undefined;
 }
 
 /** A Fly region or Hetzner location (`fra`, `fsn1`), a Fly organization slug. */

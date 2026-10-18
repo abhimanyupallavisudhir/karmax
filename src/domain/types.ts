@@ -52,6 +52,8 @@ export interface Organization {
   plan: HostedPlanId;
   /** Paid storage packs billing has verified; ignored on Free. */
   storagePacks?: number;
+  /** Paid compute packs billing has verified; ignored on Free. */
+  computePacks?: number;
   createdAt: number;
 }
 
@@ -363,6 +365,11 @@ export interface WorldProviderConnection {
     /** Per-machine limits entered in Advanced, for what the provider's API
      * cannot tell (wiki features/computers). Disk is total GB. */
     limits?: { cpu?: number; memoryMb?: number; diskGb?: number };
+    /** Managed compute (the installation's own account): how many of its
+     * machines may run at once across every organization, the account's
+     * concurrency limit (E2B Hobby: 20). Above it, new ones wait for a
+     * machine instead of failing at the provider. */
+    maxRunning?: number;
   };
   /** What the provider account itself said it allows, from a probe or a
    * refused build (src/world/provider-limits.ts). */

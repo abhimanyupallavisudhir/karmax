@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import type { Duplex } from 'node:stream';
 import type { WorldReferenceKeys } from '../reference-keys.js';
-import type { ResolvedWorldProviderConnection } from '../connections.js';
+import { connectionScope, fundingRef, type ResolvedWorldProviderConnection } from '../connections.js';
 import type { MachineShape } from '../../domain/computer.js';
 import { providerFeatures } from '../../domain/computer-limits.js';
 import type { ProviderSandboxRef, ProviderUsagePage, ProviderUsageEvent, World, WorldDiagnosis, WorldHandle,
@@ -140,7 +140,7 @@ export class VmWorldProvider implements WorldProvider {
     const keys: VmBootKeys = { hostPrivateKey: host.privateKey, authorizedKey: client.publicKey };
     const allocation = await timed(`${this.kind}.allocate`, () => this.driver.allocate(connection, { labels, shape, keys, signal: spec.signal }));
     const sealed = { ...allocation.ref, generation: labels.karmaxGeneration, sshKey: client.privateKey, clientKey: client.publicKey, hostKey: host.publicKey,
-      hostPrivateKey: host.privateKey, ...(spec.organizationId ? { organizationId: spec.organizationId } : {}) };
+      hostPrivateKey: host.privateKey, ...(spec.organizationId ? { organizationId: spec.organizationId } : {}), ...fundingRef(connection) };
     try {
       const transport = this.transportFor(spec.taskId, connection, sealed);
       await timed(`${this.kind}.reachable`, () => waitReachable(transport, this.options.reachableMs ?? REACHABLE_MS, spec.signal));
@@ -165,7 +165,7 @@ export class VmWorldProvider implements WorldProvider {
         target: provisioned.repos[0]?.target ?? spec.target, repo: provisioned.repos[0]?.repo, repos: provisioned.repos,
         ...(provisioned.workdir ? { workdir: provisioned.workdir } : {}),
         sealedProviderRef: this.seal(sealed),
-        meta: { releaseOnCompletion: true, environmentFlavor: 'headless', machine: shape,
+        meta: { releaseOnCompletion: true, environmentFlavor: 'headless', machine: shape, ...fundingRef(connection),
           ...(provisioned.ephemeralPaths.length ? { ephemeralPaths: provisioned.ephemeralPaths } : {}) },
         ...([...(allocation.warnings ?? []), ...provisioned.warnings].length
           ? { warnings: [...(allocation.warnings ?? []), ...provisioned.warnings] } : {}),
@@ -181,7 +181,7 @@ export class VmWorldProvider implements WorldProvider {
 
   async open(handle: WorldHandle): Promise<World> {
     const sealed = this.reference(handle);
-    const connection = await this.connection(sealed.organizationId);
+    const connection = await this.connection(connectionScope(sealed));
     let transport = this.transports.get(handle.id);
     if (!transport || this.states.get(handle.id) === 'parked') {
       const state = await this.driver.state(connection, sealed);
@@ -228,7 +228,7 @@ export class VmWorldProvider implements WorldProvider {
   async park(handle: WorldHandle): Promise<WorldHandle> {
     const sealed = this.reference(handle);
     if (this.states.get(handle.id) === 'parked') return handle;
-    const connection = await this.connection(sealed.organizationId);
+    const connection = await this.connection(connectionScope(sealed));
     this.dropTransport(handle.id);
     await timed(`${this.kind}.stop`, () => this.driver.stop(connection, sealed));
     this.states.set(handle.id, 'parked');
@@ -237,7 +237,7 @@ export class VmWorldProvider implements WorldProvider {
 
   async destroy(handle: WorldHandle): Promise<void> {
     const sealed = this.reference(handle);
-    const connection = await this.connection(sealed.organizationId);
+    const connection = await this.connection(connectionScope(sealed));
     this.dropTransport(handle.id);
     await this.driver.destroy(connection, sealed);
     this.states.delete(handle.id);
@@ -252,7 +252,7 @@ export class VmWorldProvider implements WorldProvider {
 
   async probe(handle: WorldHandle): Promise<WorldLifecycleState | undefined> {
     const sealed = this.reference(handle);
-    try { return await this.driver.state(await this.connection(sealed.organizationId), sealed); }
+    try { return await this.driver.state(await this.connection(connectionScope(sealed)), sealed); }
     catch { return undefined; }
   }
 
@@ -263,7 +263,7 @@ export class VmWorldProvider implements WorldProvider {
    */
   async resize(handle: WorldHandle, to: MachineShape): Promise<{ disk: 'grown' | 'unchanged'; restart: boolean; machine: VmShape }> {
     const sealed = this.reference(handle);
-    const connection = await this.connection(sealed.organizationId);
+    const connection = await this.connection(connectionScope(sealed));
     const made = (handle.meta?.machine as VmShape | undefined) ?? await this.driver.shape(handle.meta?.computer as MachineShape | undefined, connection);
     const next = await this.driver.shape({ cpu: to.cpu ?? made.cpu, memoryMb: to.memoryMb ?? made.memoryMb, diskGb: Math.max(to.diskGb ?? 0, made.diskGb) }, connection);
     // The volume's own size decides: an earlier resize may already have grown it.

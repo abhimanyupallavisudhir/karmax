@@ -2479,7 +2479,9 @@ async function softwareDevImpl(
             attempt--; // waiting for room is not a resolve attempt
             const resume = { status, waitingFor };
             status = 'waiting';
-            waitingFor = { kind: 'retry', summary: 'Waiting for a machine', detail: innermostMessage(err), until: Date.now() + wait };
+            const detail = innermostMessage(err);
+            // Spent managed compute credit waits the same way (src/world/managed-compute.ts).
+            waitingFor = { kind: 'retry', summary: /^Out of compute\b/.test(detail) ? 'Out of compute' : 'Waiting for a machine', detail, until: Date.now() + wait };
             retryRequested = false;
             await publish();
             await condition(() => cancelled || retryRequested || halted(), wait);

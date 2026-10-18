@@ -26,6 +26,7 @@ import { recordHumanConfirmation } from '../platform/review-confirmation.js';
 import { ServiceError, WorkflowNotFoundError, WorkflowUpdateFailedError, isGrpcServiceError, type Client } from '@temporalio/client';
 import { Context as activityContext } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
+import { assertComputeCredit } from '../world/managed-compute.js';
 import { AgentChannelLost, ProviderCapacityFull, ProviderOutage, ProviderPolicyFailure, SandboxProviderFailure, confirmSandboxFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, isContextOverflow, type LimitClassification } from '../agent/limits.js';
 import { probeClaudeUsage, probeCodexUsage, type UsageResult } from '../agent/usage.js';
 import { markCheckpointStale } from '../world/checkpoint-staleness.js';
@@ -2143,12 +2144,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       if (remote && project && deps.runners) {
         try {
           acquired = await timed('world.runner.wait', async () => deps.runners!.acquire({ project, taskId: args.taskId, worldId: args.taskId, provider: args.kind,
-            resources: executionConfig?.resources,
+            resources: executionConfig?.resources, work: true,
             priority: Number((await store.getTask(args.taskId))?.params.priority ?? 0), signal: activitySignal,
             heartbeat }));
         } catch (error) {
           stopCancellationHeartbeat();
-          throw error;
+          // Managed compute that is spent or fully in use waits like a full provider limit.
+          throw capacityFailure(error) ?? error;
         }
       }
       // Keep provisioning and durable registration in the same transition as
@@ -2493,6 +2495,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         profile = { ...profile, modelProvider: leasedCredentialProvider };
       }
       const organizationId = (await store.getProject(args.task.projectId))?.organizationId ?? 'org_personal';
+      // A turn on managed compute is new work: once this month's compute credit
+      // is spent it waits, parked, for more (wiki features/managed-compute).
+      const turnWorld = ((await store.currentWorld(args.worldHandle.id)) ?? args.worldHandle) as WorldHandle;
+      if (turnWorld.meta?.funding === 'managed') {
+        try { await assertComputeCredit(store, organizationId, turnWorld.kind); }
+        catch (error) { throw capacityFailure(error) ?? error; }
+      }
       let world: World;
       try {
         world = await timed('world.open', () => openWorld(args.worldHandle, args.taskId));
@@ -4475,10 +4484,21 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           }, Number(process.env.KARMAX_DISK_WATCH_MS) || 60_000);
           diskWatch.unref?.();
         }
+        const managedCompute = ((await store.currentWorld(handle.id)) ?? handle as WorldHandle).meta?.funding === 'managed';
+        const projectOrganization = async () => (await store.getProject(String((handle as WorldHandle).meta?.projectId
+          ?? (await store.taskProjectIdAsync(handle.id)) ?? '')))?.organizationId;
         for (;;) {
           signal.throwIfAborted();
           ctx.heartbeat();
           const running = (await jobStatuses(world, jobs)).filter((job) => job.state === 'running').map((job) => job.id);
+          // A job on managed compute stops being waited for once the month's
+          // credit is spent: the agent's next turn then waits for credit, and
+          // the world parks meanwhile.
+          if (managedCompute && running.length) {
+            const organizationId = await projectOrganization();
+            const spent = organizationId ? await assertComputeCredit(store, organizationId, handle.kind).then(() => undefined, (error: Error) => error.message) : undefined;
+            if (spent) return { finished: false, summary: `${spent}\n\n${describeJobs(await jobStatuses(world, jobs, { tailLines: 30 }))}` };
+          }
           if (diskAlert && running.length)
             return { finished: false, disk: true, summary: `${diskAlert}\n\n${describeJobs(await jobStatuses(world, jobs, { tailLines: 30 }))}` };
           if (!running.length || Date.now() >= untilMs) {

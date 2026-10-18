@@ -36,7 +36,7 @@ describe('plan storage entitlements', () => {
 
   it('ignores packs on Free, so a lapsed subscription falls back to the Free quota', () => {
     expect(hostedStorageQuotaBytes('free', 1, 5)).toBe(5 * GIB);
-    expect(organizationEntitlements('free', true, 1, 5)).toMatchObject({ storageQuotaBytes: 5 * GIB, storagePacks: 0 });
+    expect(organizationEntitlements('free', true, 1, { storagePacks: 5 })).toMatchObject({ storageQuotaBytes: 5 * GIB, storagePacks: 0 });
   });
 
   it('bills each pack monthly on a paid plan and never on Free', () => {
@@ -47,7 +47,7 @@ describe('plan storage entitlements', () => {
   });
 
   it('leaves private installations unmetered', () => {
-    expect(organizationEntitlements('team', false, 4, 3)).toMatchObject({ storageQuotaBytes: null });
+    expect(organizationEntitlements('team', false, 4, { storagePacks: 3 })).toMatchObject({ storageQuotaBytes: null });
   });
 });
 
