@@ -461,6 +461,108 @@ describe('combining files both sides changed', () => {
   }, 240_000);
 });
 
+// pramana: generated and binary files (compressed staged records, caches,
+// SQLite side files) were merged line by line and conflicted on nearly every
+// sub-task; the same conflict came back with each finished sub-task; and the
+// merge folder was sometimes gone or replaced before the agent looked at it.
+describe('files that need no merge, and conflicts told once', () => {
+  const lines = (...values: string[]) => values.map((value) => `${value}\n`).join('');
+  const setTime = (world: World, file: string, seconds: number) =>
+    fs.utimesSync(path.join(world.handle.root, 'resources/raw_data', file), seconds, seconds);
+
+  it('settles files its .tavyamerge names: theirs, mine, newest, and never saves skipped ones', async () => {
+    const f = await fixture({ 'staged/a.zst': 'v1', 'notes.md': lines('v1'), 'cache/old.bin': 'v1', 'cache/new.bin': 'v1',
+      '.tavyamerge': ['# generated', 'staged/*.zst theirs', 'notes.md mine', 'cache/ newest', '*.sqlite-shm skip'].join('\n') });
+    const one = await f.task('One');
+    const two = await f.task('Two');
+    await f.write(one.world, 'staged/a.zst', '\u0000one');
+    await f.write(one.world, 'notes.md', lines('one'));
+    await f.write(one.world, 'cache/old.bin', 'one, older'); setTime(one.world, 'cache/old.bin', 1_000);
+    await f.write(one.world, 'cache/new.bin', 'one, newer'); setTime(one.world, 'cache/new.bin', 3_000);
+    await f.write(one.world, 'db.sqlite-shm', 'one');
+    // Seconds apart, as real edits are: one kernel clock tick and one size
+    // is the same file to a save (backupArgs).
+    setTime(one.world, 'staged/a.zst', 1_000);
+    await f.write(two.world, 'staged/a.zst', '\u0000two'); setTime(two.world, 'staged/a.zst', 2_000);
+    await f.write(two.world, 'notes.md', lines('two'));
+    await f.write(two.world, 'cache/old.bin', 'two, newer'); setTime(two.world, 'cache/old.bin', 2_000);
+    await f.write(two.world, 'cache/new.bin', 'two, older'); setTime(two.world, 'cache/new.bin', 2_000);
+    await f.write(two.world, 'db.sqlite-shm', 'two');
+    await f.publish(one.task.id, 'one');
+    await f.publish(two.task.id, 'two');
+    const published = await f.published();
+    expect(published).toMatchObject({ 'staged/a.zst': '\u0000one', 'notes.md': lines('two'), 'cache/old.bin': 'two, newer', 'cache/new.bin': 'one, newer' });
+    expect(published['db.sqlite-shm']).toBeUndefined();
+    // Two's own side file stays in its world, as it was.
+    expect(f.inWorld(two.world)['db.sqlite-shm']).toBe('two');
+  }, 240_000);
+
+  // A sub-task's data reached its parent only at its Confirm, so the parent
+  // could not test the merged work with it first (A2's and K5's tests failed).
+  it('brings a sub-task\'s data into its parent before Confirm, and Confirm then brings only what changed since', async () => {
+    const f = await fixture({ 'index.txt': 'v1' });
+    const parent = await f.task('Integrator');
+    const child = await f.subTask('A2', parent);
+    await f.write(child.world, 'a2/records.txt', 'first pass');
+    const early = await f.resources.deliverNow(child.task.id);
+    expect(early).toMatchObject([{ added: 1, modified: 0, deleted: 0 }]);
+    expect(f.inWorld(parent.world)).toEqual({ 'index.txt': 'v1', 'a2/records.txt': 'first pass' });
+    // The parent tests and builds on it; the sub-task goes on and is confirmed.
+    await f.write(parent.world, 'a2/records.txt', 'first pass, checked by the parent');
+    await f.write(child.world, 'a2/more.txt', 'second pass');
+    await f.publish(child.task.id, 'a2');
+    const [taken] = await f.resources.takeDeliveries(parent.task.id);
+    expect(taken).toMatchObject({ added: 1, modified: 0, deleted: 0 });
+    expect(taken!.conflicts).toBeUndefined();
+    expect(f.inWorld(parent.world)).toEqual({ 'index.txt': 'v1', 'a2/records.txt': 'first pass, checked by the parent', 'a2/more.txt': 'second pass' });
+  }, 240_000);
+
+  it('keeps one conflict\'s folder while a second sub-task waits, tells each conflict once, and resolves in one step', async () => {
+    const f = await fixture({ 'index.bin': '\u0000v1' });
+    const parent = await f.task('Integrator');
+    const first = await f.subTask('A2', parent);
+    const second = await f.subTask('A3', parent);
+    await f.write(first.world, 'index.bin', '\u0000first');
+    await f.write(second.world, 'index.bin', '\u0000second');
+    await f.write(parent.world, 'index.bin', '\u0000parent');
+    await f.publish(first.task.id, 'a2');
+    await f.publish(second.task.id, 'a3');
+
+    const taken = await f.resources.takeDeliveries(parent.task.id);
+    // The first conflicts; the second waits behind it rather than replacing its folder.
+    expect(taken).toHaveLength(1);
+    expect(taken[0]).toMatchObject({ conflicts: ['index.bin'] });
+    expect(taken[0]!.again).toBeUndefined();
+    expect(taken[0]!.guide).toContain('/resolve theirs [file…]');
+    expect(taken[0]!.guide).toContain('.tavyamerge');
+    const folder = f.mergeFolder(parent.world);
+    const theirs = fs.readFileSync(path.join(folder, 'other/index.bin'), 'utf8');
+    expect(['\u0000first', '\u0000second']).toContain(theirs);
+    // Nothing changed: the next pass says nothing new.
+    const again = await f.resources.takeDeliveries(parent.task.id);
+    expect(again).toHaveLength(1);
+    expect(again[0]).toMatchObject({ again: true, conflicts: ['index.bin'] });
+    expect(fs.readFileSync(path.join(folder, 'other/index.bin'), 'utf8')).toBe(theirs);
+
+    // One step: take the sub-task's version.
+    const run = await new Promise<{ code: number | null; out: string }>((resolve) => {
+      const child = spawn(path.join(folder, 'resolve'), ['theirs']);
+      let out = '';
+      child.stdout.on('data', (chunk) => { out += chunk; });
+      child.stderr.on('data', (chunk) => { out += chunk; });
+      child.on('close', (code) => resolve({ code, out }));
+    });
+    expect(run.code, run.out).toBe(0);
+    expect(run.out).toContain('index.bin: theirs');
+    expect(f.inWorld(parent.world)['index.bin']).toBe(theirs);
+    // That delivery comes in; the other then conflicts with it, and is told.
+    const next = await f.resources.takeDeliveries(parent.task.id);
+    expect(next[0]!.conflicts).toBeUndefined();
+    expect(next[1]).toMatchObject({ conflicts: ['index.bin'] });
+    expect(next[1]!.again).toBeUndefined();
+  }, 300_000);
+});
+
 // The same merge before Review, as a branch takes in its target before its
 // pull request: Review then shows the copy as it would be published.
 describe('merging newer published versions in before Review', () => {

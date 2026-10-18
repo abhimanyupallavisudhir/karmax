@@ -43,6 +43,10 @@ export interface GitBrokerPublishResult {
   /** Every skipped repository failed because the world could not be reached
    * (a connection that stayed lost): infrastructure, not the task's. */
   unreachable?: true;
+  /** Repositories whose remote task branch had moved on (a sub-task's pull
+   * request merged into it on GitHub) and was merged into the world's branch
+   * before publishing (`integrateRemote`). */
+  integrated?: Array<{ repo: string; branch: string; commits: number }>;
 }
 
 export interface GitBrokerEnrollmentSpec {
@@ -249,9 +253,10 @@ function recordedBaseViolation(repo: WorldRepo): string {
  */
 export async function brokerPublishBranch(
   world: World, auth: GitBrokerAuth, expectedRemoteHeads: Record<string, string> = {},
-  onPublished?: OriginPublicationRecorder, options: { omitUnchangedBase?: boolean } = {},
+  onPublished?: OriginPublicationRecorder, options: { omitUnchangedBase?: boolean; integrateRemote?: boolean } = {},
 ): Promise<GitBrokerPublishResult> {
-  return publishRepositories(worldRepos(world.handle), async repo => {
+  const integrated: NonNullable<GitBrokerPublishResult['integrated']> = [];
+  const result = await publishRepositories(worldRepos(world.handle), async repo => {
     // Idle capture can restore the provisioned commit from the base without
     // creating a task ref. Explicit publication still transports every branch.
     if (options.omitUnchangedBase && repo.baseSha && !expectedRemoteHeads[repo.name]) {
@@ -271,8 +276,13 @@ export async function brokerPublishBranch(
     const local = await localAuthority(repo, shared);
     if (local && shared) await verifySharedWorktreeBranch(world, repo, local);
     else if (local) await importBranchToLocal(world, repo, local);
-    else await pushBranchToOrigin(world, repo, auth, expectedRemoteHeads[repo.name], onPublished);
+    else {
+      const merged = await pushBranchToOrigin(world, repo, auth, expectedRemoteHeads[repo.name], onPublished,
+        options.integrateRemote ?? false);
+      if (merged) integrated.push({ repo: repo.name, branch: repo.branch, commits: merged.commits });
+    }
   });
+  return integrated.length ? { ...result, integrated } : result;
 }
 
 /** The host-local repository this repo is authoritative to, if any. A recorded
@@ -319,15 +329,17 @@ async function pushBranchToOrigin(
   auth: GitBrokerAuth,
   expectedRemoteHead?: string,
   onPublished?: OriginPublicationRecorder,
-): Promise<void> {
+  integrateRemote = false,
+): Promise<{ commits: number } | undefined> {
   // Repeated waiting-world checkpoints usually have no new commits. Only use
   // this shortcut for a tip already transported and recorded by this broker,
   // and verify the authoritative remote on every call (never trust cached refs).
   if (expectedRemoteHead && await timed('git-broker.verify-published', () =>
     verifyPublishedBranch(world, repo, auth, expectedRemoteHead))) {
     await onPublished?.(repo, expectedRemoteHead);
-    return;
+    return undefined;
   }
+  let merged: { commits: number } | undefined;
   await withTransferredRepo(world, repo, auth, async (clone, env) => {
     const ref = `refs/heads/${repo.branch}`;
     const tip = await git(clone, ['rev-parse', '--verify', ref]);
@@ -352,16 +364,24 @@ async function pushBranchToOrigin(
     // lost: mirror that strict fast-forward back into the world. Genuine
     // divergence still falls through to the diagnostic below.
     if (result.code !== 0 && NON_FAST_FORWARD.test(result.stderr || result.stdout)) {
-      const reconciled = await fastForwardWorldFromOrigin(world, repo, clone, env);
-      if (reconciled) {
+      const reconciled = await fastForwardWorldFromOrigin(world, repo, clone, env, integrateRemote);
+      if (reconciled === 'fast-forward') {
         // This path adopted another writer's advance; it is not authority to
         // overwrite that writer's commit with a later amended proposal.
+        return;
+      }
+      if (reconciled && typeof reconciled === 'object') {
+        // The world now holds both: publish that merge, an ordinary fast-forward of origin.
+        merged = reconciled;
         return;
       }
     }
     if (result.code !== 0) throw new Error(describeGitPushError(repo, result.stderr || result.stdout || 'push failed'));
     await onPublished?.(repo, tip.stdout.trim());
   });
+  if (!merged) return undefined;
+  await pushBranchToOrigin(world, repo, auth, undefined, onPublished, false);
+  return merged;
 }
 
 async function verifyPublishedBranch(world: World, repo: WorldRepo, auth: GitBrokerAuth,
@@ -385,13 +405,20 @@ async function verifyPublishedBranch(world: World, repo: WorldRepo, auth: GitBro
 
 /** Mirror a remote-ahead task branch into its sandbox without exposing the
  * broker credential there. The remote must contain the exact world tip; an
- * unrelated or rewritten remote branch is never integrated automatically. */
+ * unrelated or rewritten remote branch is never integrated automatically.
+ * With `merge`, a remote that has moved on while the world committed too (a
+ * sub-task's pull request merged into this branch on GitHub, then the parent
+ * worked on) is merged into the world's branch, in the world, with its own Git
+ * identity — only when Git merges it cleanly and the merge touches no file the
+ * world has uncommitted changes in; otherwise nothing changes and the
+ * rejection stands, naming the conflicting files. */
 async function fastForwardWorldFromOrigin(
   world: World,
   repo: WorldRepo,
   clone: string,
   env: Record<string, string>,
-): Promise<boolean> {
+  merge = false,
+): Promise<false | 'fast-forward' | { commits: number }> {
   const branchRef = `refs/heads/${repo.branch}`;
   const trackingRef = `refs/remotes/origin/${repo.branch}`;
   const fetched = await git(clone, [
@@ -401,7 +428,10 @@ async function fastForwardWorldFromOrigin(
     throw new Error(`could not inspect the advanced remote task branch: ${fetched.stderr || fetched.stdout}`);
 
   const contained = await git(clone, ['merge-base', '--is-ancestor', branchRef, trackingRef]);
-  if (contained.code !== 0) return false;
+  if (contained.code !== 0 && !merge) return false;
+  // A remote rewritten without the world's base would be no task's work to merge.
+  if (contained.code !== 0 && repo.baseSha
+    && (await git(clone, ['merge-base', '--is-ancestor', repo.baseSha, trackingRef])).code !== 0) return false;
 
   const transferRef = `refs/karmax/remote-ahead/${cryptoSafeName(repo.branch)}`;
   const incomingRef = 'refs/karmax/remote-ahead';
@@ -426,7 +456,7 @@ async function fastForwardWorldFromOrigin(
     const stillContained = await world.exec('git', [
       'merge-base', '--is-ancestor', branchRef, incomingRef,
     ], { cwd: repo.root });
-    if (stillContained.code !== 0) return false;
+    if (stillContained.code !== 0) return merge ? await mergeIncoming(world, repo, incomingRef) : false;
 
     const current = await world.exec('git', ['symbolic-ref', '--quiet', 'HEAD'], { cwd: repo.root });
     const advanced = current.code === 0 && current.stdout.trim() === branchRef
@@ -436,13 +466,38 @@ async function fastForwardWorldFromOrigin(
         ], { cwd: repo.root });
     if (advanced.code !== 0)
       throw new Error(`could not fast-forward cloud task branch "${repo.branch}": ${advanced.stderr || advanced.stdout}`);
-    return true;
+    return 'fast-forward';
   } finally {
     await git(clone, ['update-ref', '-d', transferRef]).catch(() => undefined);
     await world.exec('git', ['update-ref', '-d', incomingRef], { cwd: repo.root }).catch(() => undefined);
     await world.exec('rm', ['-f', bundleName], { cwd: repo.root }).catch(() => undefined);
     fs.rmSync(bundlePath, { force: true });
   }
+}
+
+/** Merge the remote's advance into the world's checked-out task branch (see
+ * fastForwardWorldFromOrigin). A merge Git cannot finish by itself is undone. */
+async function mergeIncoming(world: World, repo: WorldRepo, incomingRef: string): Promise<false | { commits: number }> {
+  const branchRef = `refs/heads/${repo.branch}`;
+  const current = await world.exec('git', ['symbolic-ref', '--quiet', 'HEAD'], { cwd: repo.root });
+  // Only the branch the world works on is merged into; anything else is the agent's.
+  if (current.code !== 0 || current.stdout.trim() !== branchRef) return false;
+  const busy = await world.exec('git', ['rev-parse', '--verify', '--quiet', 'MERGE_HEAD'], { cwd: repo.root });
+  if (busy.code === 0) return false;
+  const counted = await world.exec('git', ['rev-list', '--count', `${branchRef}..${incomingRef}`], { cwd: repo.root });
+  const commits = Number(counted.stdout.trim()) || 0;
+  const merged = await world.exec('git', ['merge', '--no-edit', '--no-verify', '-m',
+    `Merge origin/${repo.branch} (work merged into this branch on GitHub)`, incomingRef], { cwd: repo.root, timeoutMs: 10 * 60_000 });
+  if (merged.code === 0) return { commits };
+  const conflicts = await world.exec('git', ['diff', '--name-only', '--diff-filter=U'], { cwd: repo.root });
+  const inMerge = await world.exec('git', ['rev-parse', '--verify', '--quiet', 'MERGE_HEAD'], { cwd: repo.root });
+  if (inMerge.code === 0) await world.exec('git', ['merge', '--abort'], { cwd: repo.root });
+  const files = conflicts.stdout.split('\n').map((line) => line.trim()).filter(Boolean);
+  const detail = files.length ? `they conflict in ${files.slice(0, 10).join(', ')}${files.length > 10 ? ', …' : ''}`
+    : (merged.stderr || merged.stdout).trim().replace(/\s+/g, ' ').slice(0, 300);
+  throw new Error(`remote task branch non-fast-forward for "${repo.branch}": origin has ${commits} commit${commits === 1 ? '' : 's'} `
+    + `this world lacks (usually a sub-task's pull request merged into it on GitHub), and ${BRAND} could not merge them by itself: ${detail}. `
+    + `Run \`git fetch origin ${repo.branch} && git merge origin/${repo.branch}\` in ${repo.name}, resolve, commit, and try again.`);
 }
 
 /** Import the world's task branch into its authoritative local checkout. The
@@ -706,7 +761,7 @@ export async function brokerPushBranches(
   expectedRemoteHeads: Record<string, string> = {},
   onPublished?: OriginPublicationRecorder,
 ): Promise<GitBrokerPublishResult> {
-  return publishRepositories(repos, repo => pushBranchToOrigin(world, repo, auth, expectedRemoteHeads[repo.name], onPublished));
+  return publishRepositories(repos, async repo => { await pushBranchToOrigin(world, repo, auth, expectedRemoteHeads[repo.name], onPublished); });
 }
 
 /** Publish each repository, at most three repositories at once; checkouts of

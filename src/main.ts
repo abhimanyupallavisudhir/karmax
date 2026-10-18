@@ -349,6 +349,7 @@ async function main() {
     paymentRegistry,
     configHomes,
     resources,
+    providerConnections,
     objects: objectStore,
     contentDir: p.content,
     hostLocal: deployment.hostLocal,
@@ -357,7 +358,7 @@ async function main() {
   const api = new KarmaxApi({ store, client, taskQueue: TASK_QUEUE, tokens, contentDir: p.content, workflows,
     authorization, defaultAgentProvider: provider, hosted: deployment.hosted, hostLocal: deployment.hostLocal,
     providerConnections, worlds,
-    worldAccess, runners, resources, broker, githubApp, bus,
+    worldAccess, runners, worldLifecycle, resources, broker, githubApp, bus,
     refreshCredentialHealth: async (task, credentialProvider, options) => {
       if (!credentialProvider) return;
       const { retryCredentials } = await import('./agent/credential-health.js');

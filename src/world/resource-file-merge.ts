@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { ResourceConflictError } from './resource-conflict.js';
+import { POLICY_FILE } from './resource-policy.js';
 import type { Repository, ResticPlace, ResticResources, ResticRunOptions } from './restic-engine.js';
 import type { World } from './types.js';
 
@@ -14,6 +15,8 @@ import type { World } from './types.js';
 //   unresolved        the files left to combine, one per line
 //   conflict.json     which incoming version these are for
 //   fetch             fetches the copies the disk had no room for
+//   resolve           `resolve mine|theirs [file…]`: keep this task's copy, or
+//                     take the other one, of the files named (default: all left)
 // The agent makes its copy of each file what it should be and removes the
 // file's line from `unresolved`; the next merge with the same incoming
 // version then keeps its copy of that file as it is.
@@ -139,6 +142,7 @@ export async function mergeFiles(restic: ResticResources, place: ResticPlace, re
     .filter((plan) => plan.files.length);
   if (unplaced.length) await writeFetch(restic, world, repository, absolute, unplaced);
   const where = place.file ? place.path : place.path.replace(/\/+$/, '');
+  await writeResolve(world, absolute, where, !!place.file, left.filter((file) => file.kind === 'deleted there').map((file) => file.path));
   throw new ResourceConflictError(options.label, left.map((file) => file.path), options.source,
     guide(options.label, options.source ?? 'a newer published version', where, absolute, left, !!place.file));
 }
@@ -161,9 +165,21 @@ export async function applyMerged(place: ResticPlace, merge: FileMerge): Promise
   }
 }
 
-/** Remove what a merge left for the agent, once nothing conflicts. */
-export async function clearMerge(world: World, attachmentId: string): Promise<void> {
-  await world.exec('rm', ['-rf', '--', mergeDirectory(attachmentId)], { cwd: world.handle.root }).catch(() => undefined);
+/** Remove what a merge left for the agent, once nothing conflicts. With
+ * `theirsId`, only a folder about that incoming version (or about none): a
+ * merge of another version, with nothing to bring in, must not take away the
+ * files of a conflict the agent is still combining. */
+export async function clearMerge(world: World, attachmentId: string, theirsId?: string): Promise<void> {
+  const directory = mergeDirectory(attachmentId);
+  if (theirsId !== undefined) {
+    const read = await world.exec('bash', ['-c', '[ -f "$1/conflict.json" ] && cat -- "$1/conflict.json" || true', 'read', directory],
+      { cwd: world.handle.root }).catch(() => undefined);
+    try {
+      const about = read?.stdout.trim() ? (JSON.parse(read.stdout) as { theirs?: string | null }).theirs ?? undefined : undefined;
+      if (about !== undefined && about !== theirsId) return;
+    } catch { /* unreadable: nothing to keep */ }
+  }
+  await world.exec('rm', ['-rf', '--', directory], { cwd: world.handle.root }).catch(() => undefined);
 }
 
 /** The files the agent has combined for the incoming version `theirsId`:
@@ -211,6 +227,38 @@ async function writeFetch(restic: ResticResources, world: World, repository: Rep
   await world.exec('chmod', ['700', '--', `${absolute}/fetch`], { cwd: world.handle.root });
 }
 
+/** `resolve mine|theirs [file…]`: settle files left in `unresolved` at once —
+ * this task's copy as it is, or the other version put in its place (deleted,
+ * where the other side deleted it) — and take them off the list. */
+async function writeResolve(world: World, absolute: string, where: string, single: boolean, deletedThere: string[]): Promise<void> {
+  await world.writeFile(`${path.posix.relative(world.handle.root, absolute)}/.deleted-there`, deletedThere.map((file) => `${file}\n`).join(''));
+  await world.writeFile(`${path.posix.relative(world.handle.root, absolute)}/resolve`, `#!/usr/bin/env bash
+# resolve mine|theirs [file…] — settle files left in unresolved: mine keeps this
+# task's copy as it is, theirs puts the other version in its place. Without
+# files, every file left.
+set -euo pipefail
+d=${shellQuote(absolute)}; t=${shellQuote(where)}; single=${single ? 1 : 0}
+side=\${1:-}; [ $# -gt 0 ] && shift
+case "$side" in mine|theirs) ;; *) echo "usage: $0 mine|theirs [file…]" >&2; exit 2 ;; esac
+[ -s "$d/unresolved" ] || { echo "nothing left to resolve"; exit 0; }
+if [ $# -eq 0 ]; then mapfile -t files < "$d/unresolved"; else files=("$@"); fi
+for f in "\${files[@]}"; do
+  [ -n "$f" ] || continue
+  grep -qxF -- "$f" "$d/unresolved" || { echo "$f is not left to resolve" >&2; exit 1; }
+  if [ "$side" = theirs ]; then
+    if [ "$single" = 1 ]; then dest=$t; else dest=$t/$f; fi
+    if grep -qxF -- "$f" "$d/.deleted-there"; then rm -f -- "$dest"
+    elif [ -f "$d/other/$f" ]; then mkdir -p -- "$(dirname -- "$dest")"; cat -- "$d/other/$f" > "$dest"
+    else echo "no copy of $f here: run $d/fetch first" >&2; exit 1; fi
+  fi
+  grep -vxF -- "$f" "$d/unresolved" > "$d/.unresolved" || true
+  mv -- "$d/.unresolved" "$d/unresolved"
+  echo "$f: $side"
+done
+`);
+  await world.exec('chmod', ['700', '--', `${absolute}/resolve`], { cwd: world.handle.root });
+}
+
 function guide(label: string, source: string, where: string, directory: string,
   files: Array<{ path: string; kind: ConflictKind; placed: boolean; bytes: number; lines: boolean }>, single: boolean): string {
   const what: Record<ConflictKind, string> = {
@@ -228,7 +276,8 @@ function guide(label: string, source: string, where: string, directory: string,
     ...listed,
     `${single ? 'This task\'s copy is' : 'This task\'s copies are in'} ${where}. In ${directory}: base/ holds each file as both started, other/ the other version, conflicts/ a line merge with conflict markers.`,
     'Make each file what it should be with both changes. If this task changed it only as a side effect, use the other version; rebuild a derived file (a database, an index) from the merged inputs. '
-      + `Then remove its line from ${directory}/unresolved.`,
+      + `Then remove its line from ${directory}/unresolved. To keep one side as it is: \`${directory}/resolve theirs [file…]\` takes the other version, \`${directory}/resolve mine [file…]\` keeps this task's (no file: all of them).`,
+    ...(single ? [] : [`Files that are generated, binary or caches need no merge: name them in ${where}/${POLICY_FILE} as \`<pattern> newest\` (the copy modified last wins), \`theirs\`, \`mine\`, or \`skip\` (never saved or shared), one per line like .gitignore patterns, and they settle by themselves from then on.`]),
   ].join('\n');
 }
 

@@ -974,6 +974,20 @@ describe('resource publication by sub-tasks', () => {
     expect(wf.activities.settleResourceReview.mock.calls).toEqual([['child'], ['child'], ['child'], ['child'], ['child', { keepOwn: true }]]);
   });
 
+  // pramana#59: several sub-tasks' deliveries conflicted in turn, and three
+  // rounds in all ran out while the agent was resolving them one by one.
+  it('gives each conflict that comes up in turn its own rounds, within an overall bound', async () => {
+    reviewAndConfirm();
+    const another = Object.assign(new Error('Activity task failed'), { cause: Object.assign(new Error(conflict),
+      { type: 'resource-conflict', details: [{ guide: guide.replace('index.txt', 'figures.jsonl.gz') }] }) });
+    wf.activities.settleResourceReview = vi.fn().mockRejectedValueOnce(combinable()).mockRejectedValueOnce(combinable())
+      .mockRejectedValueOnce(another).mockRejectedValueOnce(another).mockRejectedValueOnce(another).mockResolvedValue(undefined);
+    wf.activities.runAgentTurn.mockImplementation(async () => ({ openPrRequested: true, completed: true }));
+    expect((await softwareDevV1_27(child)).stage).toBe('done');
+    expect(wf.activities.settleResourceReview).toHaveBeenCalledTimes(6);
+    expect(wf.childSignal).not.toHaveBeenCalledWith('raiseFromChild', expect.objectContaining({ type: 'blocked' }));
+  });
+
   it('keeps histories recorded before the agent rounds escalating at once', async () => {
     reviewAndConfirm();
     wf.absentPatches = new Set(['resource-conflict-agent-v1']);

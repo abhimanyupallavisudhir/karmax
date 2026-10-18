@@ -274,15 +274,20 @@ export class WorldCheckpointService {
 
   /** Tell the agent something about its world on its next turn, once. */
   async addNotice(taskId: string, notice: string): Promise<void> {
-    const existing = await this.store.kvGet(noticeKey(taskId));
-    await this.store.kvSet(noticeKey(taskId), existing ? `${existing}\n\n${notice}` : notice);
+    // Kept apart from the checkpoint's own notice, which each checkpoint
+    // replaces: a later checkpoint must not drop what happened before it.
+    const existing = await this.store.kvGet(taskNoticeKey(taskId));
+    await this.store.kvSet(taskNoticeKey(taskId), existing ? `${existing}\n\n${notice}` : notice);
   }
 
   /** What the agent should know about its last checkpoint, once. */
   async takeNotice(taskId: string): Promise<string | undefined> {
-    const notice = await this.store.kvGet(noticeKey(taskId));
-    if (notice) await this.store.kvDelete(noticeKey(taskId));
-    return notice;
+    const notices = [];
+    for (const key of [taskNoticeKey(taskId), noticeKey(taskId)]) {
+      const notice = await this.store.kvGet(key);
+      if (notice) { notices.push(notice); await this.store.kvDelete(key); }
+    }
+    return notices.length ? notices.join('\n\n') : undefined;
   }
 
   async restore(checkpointId: string, provider?: WorldKind, options?: RestoreOptions): Promise<WorldHandle> {
@@ -565,6 +570,7 @@ export class WorldCheckpointService {
 interface RestoredFile { repo: string; path: string; deleted?: true; link?: string; executable?: true; content?: () => AsyncIterable<Buffer> }
 
 const noticeKey = (taskId: string) => `checkpoint-notice:${taskId}`;
+const taskNoticeKey = (taskId: string) => `task-notice:${taskId}`;
 
 function refusalNotice(error: CheckpointRefusedError): string {
   const files = error.files.map(file => `- ${file.path}${file.bytes !== undefined ? ` (${formatBytes(file.bytes)})` : ''}${file.reason ? ` — ${file.reason}` : ''}`);

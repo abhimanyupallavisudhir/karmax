@@ -37,9 +37,10 @@ import { CHUNK_BYTES, chunkObjectKey, openCompressed, openDeterministic, openRan
   organizationKey, organizationKeyHandle, sha256 } from './chunk-store.js';
 import { REPOSITORY_ROUTE, RepositoryTokens, ResourceRepositoryServer, parseRepositoryName } from './resource-repository.js';
 import { RESTIC_ENGINE, ROOT_PART, ResticResources, isParted, isPartsCapture, partsTotals, resticRef, storedRef, type Parts, type PartsCapture,
-  type Repository, type ResticCapture, type ResticPlace } from './restic-engine.js';
+  type ChangeSet, type Repository, type ResticCapture, type ResticPlace } from './restic-engine.js';
 import { ResourceConflictError } from './resource-conflict.js';
 import { applyMerged, clearMerge, conflictKind, mergeFiles, type FileMerge } from './resource-file-merge.js';
+import { policyFor, readPolicies, type PolicyRule } from './resource-policy.js';
 import { installTool, mergeParts, partChanges, readFetched, readGrant, readManifest, removeGrants, saveParts, topLevel,
   writeFetched, writeGrant, writeManifest } from './resource-on-demand.js';
 
@@ -98,7 +99,8 @@ const PUBLISH_ATTEMPTS = 3;
 interface ChangeCount { added: number; modified: number; deleted: number }
 /** What a sub-task's delivery brought into its parent's world, or the files that conflict. */
 export interface ResourceRefresh extends ChangeCount { attachmentId: string; name: string; path: string; revisionId: string; conflicts?: string[];
-  /** How the agent combines the conflicting files. */ guide?: string }
+  /** How the agent combines the conflicting files. */ guide?: string;
+  /** The same conflict as the agent was last told of: nothing new to say. */ again?: true }
 
 /** A sub-task's output waiting for its parent's world (kv `resource-delivery:<parent>:<attachment>:<sub-task>`):
  * its changes to a fork, relative to `baseRevisionId`, or a proposed output. */
@@ -1524,6 +1526,31 @@ export class ProjectResourceService {
     if (conflicts.length) throw ResourceConflictError.combine(conflicts);
   }
 
+  /**
+   * A sub-task's data for its parent before Confirm (POST /api/tasks/:id/deliver-data),
+   * so the parent can test its merged work with it: its changes to each
+   * writable resource the parent forked are delivered as at Confirm — whose
+   * delivery then builds on this one — and taken into the parent's world now.
+   * Returns what the parent's world took in, conflicts included.
+   */
+  async deliverNow(taskId: string, work: { checkContinue?: () => Promise<void> } = {}): Promise<ResourceRefresh[]> {
+    const parent = await this.parentWorld(taskId);
+    if (!parent) throw new Error('this task has no parent world to bring its data into');
+    const world = await this.store.currentWorld(taskId) as WorldHandle | undefined;
+    if (!world) throw new Error('this task has no world yet');
+    for (const lease of await this.store.listResourceLeases(world.id, world.generation ?? 1)) {
+      if (lease.state !== 'active' || !parent.forks.has(lease.attachmentId)) continue;
+      const resource = await this.store.getResourceAttachment(lease.attachmentId);
+      if (!resource || resource.access !== 'write' || resource.isolation !== 'fork' || resource.target.kind !== 'path') continue;
+      await work.checkContinue?.();
+      const inspection = await this.inspect(taskId, resource.id, work);
+      const { summary } = inspection;
+      if (summary.added + summary.modified + summary.deleted > 0) await this.deliver(taskId, resource, inspection, parent.taskId);
+      else await this.discardCapture(inspection.repository, inspection.capture);
+    }
+    return this.takeDeliveries(parent.taskId, work);
+  }
+
   /** The parent of a sub-task whose world is still to receive output, and
    * the writable resources it forked (any generation). */
   private async parentWorld(taskId: string): Promise<{ taskId: string; handle: WorldHandle; forks: Set<string> } | undefined> {
@@ -1576,11 +1603,16 @@ export class ProjectResourceService {
     const handle = (await this.store.currentWorld(taskId)) as WorldHandle | undefined;
     if (!entries.length || !handle) return [];
     const taken: ResourceRefresh[] = [];
+    // A resource whose delivery conflicts takes no other in this pass: its merge
+    // folder holds that conflict, and a later delivery would replace or clear it.
+    const conflicted = new Set<string>();
     for (const entry of entries) {
       await work.checkContinue?.();
       const delivery = parseDelivery(entry.value);
       const attachment = delivery && await this.store.getResourceAttachment(delivery.attachmentId);
       if (!delivery || !attachment) { await this.store.kvDelete(entry.key); continue; }
+      if (delivery.kind !== 'candidate' && conflicted.has(attachment.id)) continue;
+      const told = `resource-conflict-told:${taskId}:${attachment.id}`;
       const report = { attachmentId: attachment.id, name: attachment.name, added: 0, modified: 0, deleted: 0 };
       try {
         if (delivery.kind === 'candidate') {
@@ -1614,6 +1646,7 @@ export class ProjectResourceService {
             await this.recordWorld(world, handle, lease, attachment, { ...mine,
               capture: merged.merged && merged.merged !== 'none' ? merged.merged : mine.capture, fetched: merged.fetched });
             await this.store.kvDelete(entry.key);
+            await this.store.kvDelete(told);
             (await this.store.appendAudit({ principalId: `task:${taskId}`, action: 'resource:take-delivery',
               scopeKey: `project:${attachment.projectId}`, detail: { ...report, from: delivery.fromTaskId } }));
             taken.push(report as ResourceRefresh);
@@ -1632,12 +1665,19 @@ export class ProjectResourceService {
           taken.push(report as ResourceRefresh);
         }
         await this.store.kvDelete(entry.key);
+        if (delivery.kind !== 'candidate') await this.store.kvDelete(told);
         (await this.store.appendAudit({ principalId: `task:${taskId}`, action: 'resource:take-delivery',
           scopeKey: `project:${attachment.projectId}`, detail: { ...report, from: delivery.fromTaskId } }));
       } catch (error) {
         if (!(error instanceof ResourceConflictError)) throw error;
+        const revisionId = (report as Partial<ResourceRefresh>).revisionId ?? '';
+        if (delivery.kind !== 'candidate') conflicted.add(attachment.id);
+        // Each finished sub-task retries what waits; the agent hears of a conflict once.
+        const signature = JSON.stringify({ revisionId, paths: [...error.paths].sort() });
+        const again = (await this.store.kvGet(told)) === signature;
+        if (!again) await this.store.kvSet(told, signature);
         taken.push({ ...report, path: (report as Partial<ResourceRefresh>).path ?? attachment.name,
-          revisionId: (report as Partial<ResourceRefresh>).revisionId ?? '', conflicts: error.paths, ...(error.guide ? { guide: error.guide } : {}) });
+          revisionId, conflicts: error.paths, ...(error.guide ? { guide: error.guide } : {}), ...(again ? { again: true as const } : {}) });
       }
     }
     return taken;
@@ -2147,11 +2187,21 @@ export class ProjectResourceService {
     const [theirs, ours] = await Promise.all([restic.changeSet(repository, baseSnapshot, currentSnapshot),
       restic.changeSet(repository, baseSnapshot, mine)]);
     if (options.ownChangesOnly && !ours.files.size) return 'none';
+    // This copy's .tavyamerge: files never synced, and how both-sides changes settle.
+    const policies = await readPolicies(place.world, place);
+    const skipped = (file: string) => policyFor(policies, file) === 'skip';
+    for (const file of theirs.files.keys()) if (skipped(file)) theirs.files.delete(file);
     const both = [...theirs.files.keys()].filter((file) => ours.files.has(file));
     let fileMerge: FileMerge | undefined;
+    /** Files both changed that the incoming version settles (`theirs`, or `newest` when it is newer). */
+    const takeTheirs = new Set<string>();
     if (both.length) {
       const differing = (await restic.changeSet(repository, currentSnapshot, mine)).files;
-      const conflicts = both.filter((file) => differing.has(file));
+      let conflicts = both.filter((file) => differing.has(file));
+      const settled = await this.settleByPolicy(repository, policies, conflicts, currentSnapshot, mine, theirs, ours);
+      for (const file of settled.theirs) takeTheirs.add(file);
+      for (const file of settled.mine) options.kept?.add(file);
+      conflicts = conflicts.filter((file) => !settled.theirs.has(file) && !settled.mine.has(file));
       if (conflicts.length && !options.keepOwn) {
         // Merged line by line, else combined by the agent (whose copy is then kept).
         fileMerge = await mergeFiles(restic, place, repository, [{ base: baseSnapshot, theirs: currentSnapshot, mine,
@@ -2163,18 +2213,21 @@ export class ProjectResourceService {
     }
     const paths: string[] = []; const deletions: string[] = [];
     for (const [file, change] of theirs.files) {
-      if (ours.files.has(file)) continue; // the same change is already here, or merged
+      // The same change is already here, or merged — unless its policy takes the incoming one.
+      if (ours.files.has(file) && !takeTheirs.has(file)) continue;
       (change === '-' ? deletions : paths).push(file);
       if (options.applied) options.applied[change === '+' ? 'added' : change === 'M' ? 'modified' : 'deleted']++;
     }
     if (!paths.length && !deletions.length && !fileMerge?.merged.size) {
-      await clearMerge(place.world, repository.attachment.id);
+      await clearMerge(place.world, repository.attachment.id, currentId ?? '');
       return undefined;
     }
     await options.checkContinue?.();
+    // What this copy changed, less what the incoming version settles.
+    const own = takeTheirs.size ? { ...ours, files: new Map([...ours.files].filter(([file]) => !takeTheirs.has(file))) } : ours;
     if (place.file && (paths.length || deletions.length)) await restic.restore(place, repository, currentSnapshot, options);
     else if (paths.length || deletions.length) await restic.applyPaths(place, repository, currentSnapshot,
-      { paths, deletions, removedDirectories: theirs.removedDirectories, addedDirectories: theirs.addedDirectories, own: ours }, options);
+      { paths, deletions, removedDirectories: theirs.removedDirectories, addedDirectories: theirs.addedDirectories, own }, options);
     if (fileMerge) {
       await applyMerged(place, fileMerge);
       for (const file of fileMerge.merged.keys()) options.merged?.add(file);
@@ -2183,10 +2236,38 @@ export class ProjectResourceService {
     // The merge is right only if it differs from the published version
     // exactly where this world's own changes are.
     const stray = [...(await restic.changeSet(repository, currentSnapshot, merged.snapshot)).files.keys()]
-      .filter((file) => !ours.files.has(file));
+      .filter((file) => !ours.files.has(file) && !skipped(file));
     if (stray.length) throw new Error(`${label} changed while newer published changes were merged into it (${stray.slice(0, 3).join(', ')}); try again`);
-    await clearMerge(place.world, repository.attachment.id);
+    await clearMerge(place.world, repository.attachment.id, currentId ?? '');
     return merged;
+  }
+
+  /** Files both sides changed that this copy's `.tavyamerge` settles without
+   * a merge: `mine` keeps this copy's, `theirs` takes the incoming one,
+   * `newest` whichever was modified last (the incoming one on a tie). */
+  private async settleByPolicy(repository: Repository, policies: PolicyRule[], conflicts: string[], theirsSnapshot: string, mine: string,
+    theirs: ChangeSet, ours: ChangeSet): Promise<{ mine: Set<string>; theirs: Set<string> }> {
+    const settled = { mine: new Set<string>(), theirs: new Set<string>() };
+    if (!policies.length) return settled;
+    const newest: string[] = [];
+    for (const file of conflicts) {
+      const policy = policyFor(policies, file);
+      if (policy === 'mine') settled.mine.add(file);
+      else if (policy === 'theirs') settled.theirs.add(file);
+      else if (policy === 'newest') newest.push(file);
+    }
+    if (newest.length) {
+      // A deleted side has no time: the side that kept the file is the newer write.
+      const present = newest.filter((file) => theirs.files.get(file) !== '-' && ours.files.get(file) !== '-');
+      const [incoming, here] = await Promise.all([this.restic.mtimes(repository, theirsSnapshot, present), this.restic.mtimes(repository, mine, present)]);
+      for (const file of newest) {
+        if (theirs.files.get(file) === '-') settled.mine.add(file);
+        else if (ours.files.get(file) === '-') settled.theirs.add(file);
+        else if ((here.get(file) ?? 0) > (incoming.get(file) ?? 0)) settled.mine.add(file);
+        else settled.theirs.add(file);
+      }
+    }
+    return settled;
   }
 
   /** The published version a world's copy descends from: a copy restored

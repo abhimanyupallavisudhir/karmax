@@ -39,7 +39,7 @@ import {
   participantLabel, participantRole, reviewerKey, selectorAgent,
 } from '../domain/participants.js';
 import { resetAtFromHint } from '../agent/limits.js';
-import { isInfraFailure, limitFailureClassification, INFRA_BACKOFF_MS, WORLD_WAIT_MS, WORLD_WAIT_LIMIT_MS } from './failures.js';
+import { isCapacityFailure, isInfraFailure, limitFailureClassification, CAPACITY_WAIT_MS, CAPACITY_WAIT_LIMIT_MS, INFRA_BACKOFF_MS, WORLD_WAIT_MS, WORLD_WAIT_LIMIT_MS } from './failures.js';
 import {
   TaskInput,
   TaskView,
@@ -72,7 +72,7 @@ import {
 } from './contract.js';
 import { mergeQueueDomains, releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider,
   landingAuthorityOf, samePosition, MERGE_POLL, reviewCheckouts, approveAll, worldRepos, landedNote } from './contract.js';
-import type { CheckoutApprovals } from './contract.js';
+import type { AgentWait, CheckoutApprovals } from './contract.js';
 import { SIG, SIG_AGENT_TURN_STATE } from './names.js';
 import { agentTurnId } from './turn-id.js';
 import { taskBranch } from '../domain/brand.js';
@@ -319,6 +319,10 @@ const MAX_MERGE_ATTEMPTS = 3;
 /** Rounds the agent gets to combine resource files that conflict at
  * publication (pramana#56), before a person is asked. */
 const MAX_RESOURCE_MERGE_ROUNDS = 3;
+/** However many sub-tasks' deliveries conflict in turn, at most this many rounds. */
+const MAX_RESOURCE_MERGE_ROUNDS_TOTAL = 10;
+/** pramana#59: one conflicting delivery at a time, each with its own rounds. */
+const MERGE_ROUNDS_PER_CONFLICT = 'resource-merge-rounds-per-conflict-v1';
 /** Times in a row a conflict found before Review sends the task back to the
  * agent; then Review goes ahead and publication merges again. */
 const MAX_INTEGRATION_BOUNCES = 2;
@@ -348,6 +352,10 @@ const OPEN_PR_WAITS_FOR_WORLD = 'software-dev-open-pr-waits-for-world-v1';
 /** Saving and publishing resources wait for a machine the provider cannot
  * start yet instead of escalating (pramana#79). */
 const RESOURCES_WAIT_FOR_WORLD = 'resources-wait-for-world-v1';
+/** A stage whose provider limit is full waits for room for a day (failures.ts CAPACITY_WAIT_MS). */
+const STAGES_WAIT_FOR_CAPACITY = 'stages-wait-for-capacity-v1';
+/** A pause a message interrupted goes on after the turn that answered it. */
+const PAUSE_GOES_ON = 'pause-goes-on-after-interruption-v1';
 /** A task whose branches all landed as their own pull requests still reviews
  * the data it changed, instead of finishing and losing it with its world. */
 const SEVERAL_BRANCHES_DATA_REVIEW = 'several-branches-data-review-v1';
@@ -848,6 +856,8 @@ async function softwareDevImpl(
   /** Messages an Open PR answered: they wake nothing, but the agent still
    * reads them on its next turn (`seen` is what it has been given). */
   let heardThrough = continued?.heardThrough ?? 0;
+  /** A pause that was interrupted, to go on after the turn that answers (PAUSE_GOES_ON). */
+  let interruptedPause: { wait: AgentWait; until: number } | undefined;
   // v1.29: Do runs the task's own command instead of the agent — once per run
   // of the task; a revise, or a failure handed to the agent, continues with it.
   const taskCommand = minor >= 29 ? input.command?.trim() || undefined : undefined;
@@ -1589,6 +1599,10 @@ async function softwareDevImpl(
   async function applyReviewedResources(stageFirst = true, followUpReturnsToDo = false): Promise<'applied' | 'cancelled' | 'do'> {
     if (stageFirst && await stageResources() && cancelled) return 'cancelled';
     let mergeRounds = 0;
+    // MERGE_ROUNDS_PER_CONFLICT: rounds count per unchanged conflict, so each
+    // sub-task's delivery that conflicts in turn gets its own; bounded overall.
+    let lastGuide: string | undefined;
+    let totalMergeRounds = 0;
     for (;;) {
       applyingResources = true;
       status = 'active';
@@ -1607,8 +1621,13 @@ async function softwareDevImpl(
         resourceConflict = failureType(err) === 'resource-conflict';
         guide = resourceConflict ? conflictGuide(err) : undefined;
       } finally { applyingResources = false; keepOwnRequested = false; }
-      if (guide && world && mergeRounds < MAX_RESOURCE_MERGE_ROUNDS && patched('resource-conflict-agent-v1')) {
-        mergeRounds++;
+      const perConflict = !!guide && !!world && patched(MERGE_ROUNDS_PER_CONFLICT);
+      const roundsLeft = perConflict
+        ? (guide === lastGuide ? mergeRounds : 0) < MAX_RESOURCE_MERGE_ROUNDS && totalMergeRounds < MAX_RESOURCE_MERGE_ROUNDS_TOTAL
+        : mergeRounds < MAX_RESOURCE_MERGE_ROUNDS;
+      if (guide && world && roundsLeft && patched('resource-conflict-agent-v1')) {
+        if (perConflict) { mergeRounds = guide === lastGuide ? mergeRounds + 1 : 1; lastGuide = guide; totalMergeRounds++; }
+        else mergeRounds++;
         resourceConflict = false;
         msgs.push({ id: `resource-merge-${msgs.length}`, role: 'user', ts: Date.now(),
           text: `This task is confirmed, but publishing its resources needs you first.\n${guide}\nDo only that, then end your turn: publishing resumes after it.` });
@@ -1696,6 +1715,8 @@ async function softwareDevImpl(
     } finally { refreshingResources = false; }
     refreshRetries = 1;
     for (const r of refreshed) {
+      // A conflict the agent was already told of, still the same: nothing new.
+      if (r.again) continue;
       const text = r.conflicts && r.guide
         ? `${r.path} was not updated with a sub-task's data.\n${r.guide}\nIt comes in when the next sub-task finishes, or when this task is confirmed.`
         : r.conflicts
@@ -2354,6 +2375,8 @@ async function softwareDevImpl(
     for (;;) {
       let attempt = 0;
       let infraRetries = 0;
+      let capacityWaited = 0;
+      let capacityRounds = 0;
       let freshContext = false;
       for (; attempt <= MAX_RESOLVE_ATTEMPTS; attempt++) {
         limitReportedToCoordinator = false;
@@ -2425,6 +2448,24 @@ async function softwareDevImpl(
           // outage that outlived those retries: park with backoff and re-run the
           // stage. Doesn't consume resolve attempts. A human Retry or a cancel
           // wakes the park early.
+          // A provider limit that is full frees only as other tasks' machines
+          // stop: wait for room, trying again every few minutes, for a day.
+          if (isCapacityFailure(err) && capacityWaited < CAPACITY_WAIT_LIMIT_MS && patched(STAGES_WAIT_FOR_CAPACITY)) {
+            const wait = CAPACITY_WAIT_MS[Math.min(capacityRounds++, CAPACITY_WAIT_MS.length - 1)]!;
+            capacityWaited += wait;
+            attempt--; // waiting for room is not a resolve attempt
+            const resume = { status, waitingFor };
+            status = 'waiting';
+            waitingFor = { kind: 'retry', summary: 'Waiting for a machine', detail: innermostMessage(err), until: Date.now() + wait };
+            retryRequested = false;
+            await publish();
+            await condition(() => cancelled || retryRequested || halted(), wait);
+            ({ status, waitingFor } = resume);
+            if (cancelled || halted()) throw new Cancelled();
+            retryRequested = false;
+            await publish();
+            continue;
+          }
           if (isInfraFailure(err)) {
             if (infraRetries < INFRA_BACKOFF_MS.length) {
               const wait = INFRA_BACKOFF_MS[infraRetries++]!;
@@ -4620,14 +4661,29 @@ Inspect the complete current diff and specifically compare its delta from the re
     await runCalledAgents();
     if (cancelled) return await abort();
 
+    // A pause a message (or a sub-task) interrupted goes on after the turn
+    // that answered it, to its own deadline, unless that turn chose otherwise:
+    // its own pause, open_pr, a raise, sub-tasks, waiting for them. Every
+    // interruption used to need another pause call, and left a note behind.
+    let pauseWait = turn.wait;
+    if (interruptedPause && patched(PAUSE_GOES_ON)) {
+      const left = interruptedPause.until - Date.now();
+      // Before the explicit Open PR cycle, ending a turn was finishing it.
+      const decided = !explicitPrCycle || (modeSwitching && goalMode && !!turn.completed)
+        || !!(turn.wait || turn.openPrRequested || turn.raise || turn.waitForSubtasks || turn.subTasks?.length
+        || turn.shipped?.length || prRequested);
+      if (!decided && left > 0 && !halted() && !cancelled)
+        pauseWait = { ...interruptedPause.wait, minutes: left / (input.waitMinuteMs ?? 60_000) };
+      interruptedPause = undefined;
+    }
     // The agent asked to be resumed later (`pause`): park here and resume it with
     // the outcome. A message, a child's event, or a cancellation ends it early.
-    if (turn.wait && patched('agent-wait-v1')) {
+    if (pauseWait && patched('agent-wait-v1')) {
       // `needs_input`: ask the task's ordinary input route unless the agent
       // named people — a sub-task's parent, else a configured response agent,
       // which answers at once as it does for a question ending an ordinary
       // turn; people get a Needs input hold.
-      const needsInput = turn.wait.needsInput;
+      const needsInput = pauseWait.needsInput;
       if (!needsInput) await replyUnasked();
       const question = needsInput?.message ?? (turn.output?.trim() || 'The agent paused for your input.');
       const routed = !!needsInput && !needsInput.audience?.length;
@@ -4657,8 +4713,10 @@ Inspect the complete current diff and specifically compare its delta from the re
       pendingReroute = undefined;
       // A paused agent can be stopped too: its pause ends without resuming it.
       if (multiAgent) turnOwners.push(MAIN_AGENT);
-      const note = await waitForAgent(turn.wait, {
+      const note = await waitForAgent(pauseWait, {
         world,
+        // A pause that is not an ask goes on after an interruption (PAUSE_GOES_ON).
+        ...(!needsInput && patched(PAUSE_GOES_ON) ? { goesOn: (until: number) => { interruptedPause = { wait: pauseWait!, until }; } } : {}),
         ...(input.waitMinuteMs ? { minuteMs: input.waitMinuteMs } : {}),
         ...(askedParent ? { ask: { kind: 'parent' as const, detail: question } }
           : needsInput ? { ask: {
@@ -6414,7 +6472,7 @@ function innermostMessage(err: any): string {
     if (e.message) message = e.message;
     // A world the provider cannot start says so in people's words; what is
     // under it is the provider's raw answer (pramana#79: Hetzner's JSON).
-    if (e.type === 'world-infra') break;
+    if (e.type === 'world-infra' || e.type === 'world-capacity') break;
     e = e.cause;
   }
   return message || String(err);

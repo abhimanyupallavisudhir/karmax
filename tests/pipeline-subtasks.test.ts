@@ -514,6 +514,33 @@ describe('software-dev pipeline: sub-tasks and in-harness sub-agents (real Tempo
     expect((await git(repo, ['show', 'main:early.txt'])).stdout).toContain('woke');
   }, 90_000);
 
+  // Every message during a pause used to end it: the agent answered, then had
+  // to pause again, and the task meanwhile read as a question to people.
+  it('a pause goes on after the turn that answers a message, to its own deadline', async () => {
+    const repo = await h.makeRepo('app-pause-goes-on');
+    const taskId = newId('task');
+    // The current version: ending a turn is not finishing it.
+    const handle = await h.client.workflow.start('softwareDev@1.30.0', {
+      taskQueue: TASK_QUEUE, workflowId: taskId,
+      args: [input({ taskId, repo, title: 'Pause', prompt: '@pause 600' })],
+    });
+    await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 20_000 }).toBe('timer');
+    const until = (await view(handle)).waitingFor.until;
+    await handle.signal('followUp', { id: 'ask', role: 'user', text: 'How is it going?\n@write status.txt :: fine\n@incomplete', ts: 0 });
+    await expect.poll(async () => (await view(handle)).messages.some((m: any) => m.role === 'agent' && m.text?.includes('status.txt')),
+      { timeout: 30_000 }).toBe(true);
+    await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 20_000 }).toBe('timer');
+    const waiting = await view(handle);
+    expect(waiting.status).toBe('waiting');
+    expect(Math.abs(waiting.waitingFor.until - until)).toBeLessThan(2_000);
+    expect(waiting.messages.some((m: any) => /interrupted|pause is over/.test(m.text ?? ''))).toBe(false);
+    // A turn that decides otherwise (here: open_pr) ends it.
+    await handle.signal('followUp', { id: 'done', role: 'user', text: '@write done.txt :: done', ts: 0 });
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    await handle.signal('cancel');
+    await handle.result();
+  }, 90_000);
+
   // An agent that needed an answer but paused (to carry on if none came) read
   // "Paused" and notified nobody. needs_input parks the same pause as an ask.
   it('a needs-input pause asks for an answer, and carries on without one when the time is up', async () => {

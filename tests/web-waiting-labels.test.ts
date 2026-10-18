@@ -219,6 +219,9 @@ describe('waiting labels in task summaries', () => {
     const retry = { kind: 'retry', detail: 'Retry 5 of 5', until };
     expect(waitingText(retry)).toBe(`Retrying at ${waitDeadline(until)}`);
     expect(waitingText({ kind: 'retry' })).toBe('Retrying');
+    // A full provider limit says what it waits for.
+    expect(waitingText({ kind: 'retry', summary: 'Waiting for a machine', detail: 'Hetzner refused…', until }))
+      .toBe(`Waiting for a machine, trying at ${waitDeadline(until)}`);
     for (const stage of ['setup', 'do', 'review', 'merge'])
       expect(stageLabel({ stage, status: 'waiting', state: {}, waitingFor: retry })).toBe(waitingText(retry));
     context.S.tasks = [{ id: 'task-1', lastView: { stage: 'do', status: 'active' } }];

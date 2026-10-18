@@ -13,6 +13,7 @@ import {
   PLATFORM_REQUEST_BODY_SCHEMA, PRIORITY_NAMES, AGENT_ROLE_NAMES, CREATE_TASK_GRANTS, REQUEST_FOR_TASK, PERMISSION_ROUTING,
   QUEUE_TASK_DESCRIPTION, queuedTaskReply,
   compactSearch, compactOrganizationSearch, compactTags, normalizeRequestBody, platformRequestPathError,
+  FIELDS_PARAMETER, agentPlatformResponse, agentTaskView,
 } from '../platform/platform-request.js';
 import { SUB_TASK_ACTIONS, URGENCY_LEVELS, type AgentWait, type SubTaskAction, type Urgency } from '../domain/types.js';
 import { BRAND } from '../domain/brand.js';
@@ -138,14 +139,14 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     name: 'create_sub_task',
     description:
       'Delegate to a child task. It branches off your current work and merges back into YOUR branch (not main), and YOU are its confirmer: when it reaches Review or gets stuck it will raise to you (surfaced as a message) and you answer with respond_to_sub_task. It starts when your current turn ends, and first saves this task\'s writable project data for it to start from: stop anything writing into it (a server, a job, an open SQLite database) before you call it, or the save fails and no sub-task is created. You manage your children to completion before you finish. '
-      + 'It runs your agent unless `params` choose another: create_task\'s task-form fields, e.g. {"agent:do": {"provider": "codex", "model": "gpt-5.5", "effort": "high"}} or {"agent:do": {"avatarId": "…"}}. Only the agent fields can be set; the branch and project stay yours. It acts with your authority, including whatever you are granted later, so there is nothing to grant it. An invalid or unavailable choice is refused and nothing is created. '
+      + 'It runs your agent on a computer like yours (your own Computer: provider and size) unless `params` choose others: create_task\'s task-form fields, e.g. {"agent:do": {"provider": "codex", "model": "gpt-5.5", "effort": "high"}}, {"agent:do": {"avatarId": "…"}} or {"computer": {"cpu": 2, "memoryMb": 4096, "diskGb": 30}} (the sizes it names, over yours). Only the agent fields and the computer can be set; the branch and project stay yours. It acts with your authority, including whatever you are granted later, so there is nothing to grant it. An invalid or unavailable choice is refused and nothing is created. '
       + 'With `draft: true` it is saved now and not started, and its task id returned: start it later with queue_task (people can also start it from your Sub-tasks). It then branches off your work as it is at that moment. Plan many sub-tasks as drafts and start them in batches when they should not all run at once (e.g. a cloud provider\'s machine limits).',
     parameters: {
       type: 'object',
       properties: {
         title: { type: 'string' },
         prompt: { type: 'string' },
-        params: { type: 'object', description: 'Task-form agent fields for the child (e.g. "agent:do"), as in create_task; omit to run your agent.' },
+        params: { type: 'object', description: 'Task-form agent fields (e.g. "agent:do") and "computer" for the child, as in create_task; omit to run your agent on a computer like yours.' },
         draft: { type: 'boolean', description: 'Save it without starting it; start it later with queue_task.' },
       },
       required: ['title', 'prompt'],
@@ -207,7 +208,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     name: 'pause',
     description:
       'End your turn to wait for durable jobs or a real-world event (CI, a deploy, a set time), and be resumed when every listed job has finished, when a message arrives, or after `minutes`, whichever comes first. Without jobs it is a timed pause; list every job that is still running, or the paused world could freeze it. You are resumed with each job\'s exit code and last output. ' +
-      'It is not for asking: if you need an answer to continue, end your turn with the question (or call escalate_to_human for what only a person can give). Set needs_input only when you are waiting anyway and someone may answer meanwhile, and you will carry on without the answer once `minutes` pass: the task then shows Needs input and notifies them. After calling it, end your turn.',
+      'It is not for asking: if you need an answer to continue, end your turn with the question (or call escalate_to_human for what only a person can give). Set needs_input only when you are waiting anyway and someone may answer meanwhile, and you will carry on without the answer once `minutes` pass: the task then shows Needs input and notifies them. A message or a sub-task\'s news that wakes you mid-pause does not end it: if you end that turn without another pause, open_pr or an ask (needs_input, escalate_to_human), the pause goes on to its deadline. After calling it, end your turn.',
     parameters: {
       type: 'object',
       properties: {
@@ -613,8 +614,8 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   },
   {
     name: 'get_task',
-    description: "Get a task's current view-model.",
-    parameters: { type: 'object', properties: { task_id: { type: 'string' } }, required: ['task_id'] },
+    description: "Get a task's current view-model, without its conversation (its message count and last message instead). Pass fields to get only those (dotted paths, e.g. [\"stage\", \"status\", \"waitingFor\", \"subTasks\"]; [\"messages\"] for the conversation).",
+    parameters: { type: 'object', properties: { task_id: { type: 'string' }, fields: FIELDS_PARAMETER }, required: ['task_id'] },
   },
   {
     name: 'list_tasks',
@@ -939,7 +940,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   },
   {
     name: 'import_task_branch',
-    description: 'Fetch another task’s published branch into a namespaced local ref for inspection, testing, cherry-picking, or merging.',
+    description: 'Fetch another task’s published branch into a namespaced local ref for inspection, testing, cherry-picking, or merging. A sub-task\'s project data comes into your world before you confirm it with platform_request(POST, "/api/tasks/<its id>/deliver-data").',
     parameters: { type: 'object', properties: { source_task_id: { type: 'string' } }, required: ['source_task_id'] },
   },
   {
@@ -1017,6 +1018,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
         method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] },
         path: { type: 'string' },
         body: PLATFORM_REQUEST_BODY_SCHEMA,
+        fields: FIELDS_PARAMETER,
       },
       required: ['method', 'path'],
     },
@@ -1509,7 +1511,7 @@ export function platformToolHandlers(
       return JSON.stringify({ unfollowed: follows.map((follow) => follow.id) });
     },
     async get_task(args) {
-      return JSON.stringify(await platformRequest('GET', `/api/tasks/${encodeURIComponent(String(args?.task_id ?? ''))}`));
+      return agentTaskView(await platformRequest('GET', `/api/tasks/${encodeURIComponent(String(args?.task_id ?? ''))}`), args?.fields);
     },
     async list_tasks(args) {
       const listed = await platformRequest('GET', `/api/projects/${encodeURIComponent(String(args?.project_id ?? ''))}/tasks`) as any[];
@@ -1758,7 +1760,7 @@ export function platformToolHandlers(
       // Auth route — an agent could mint itself a human login with no user:write.
       const rejected = platformRequestPathError(requestPath);
       if (rejected) return `error: ${rejected}`;
-      return JSON.stringify(await platformRequest(method, requestPath, normalizeRequestBody(args?.body)));
+      return agentPlatformResponse(await platformRequest(method, requestPath, normalizeRequestBody(args?.body)), args?.fields);
     },
     async signal_completion(args) {
       await ctx.signalCompletion(args?.summary ? String(args.summary) : undefined);

@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { readPolicies, skipExcludes } from './resource-policy.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import type { ResourceAttachment, ResourceChangeSummary, ResourceRevision } from '../domain/types.js';
 import type { Store } from '../store/db.js';
@@ -162,9 +163,15 @@ const CONNECTIONS = 8;
 const EDGE_CONNECTIONS = 32;
 const RESTORE_CONNECTIONS = 16;
 /** A save that finds files changed under it saves again, this many times. */
-const SETTLE_ROUNDS = 3;
-/** And waits this long before saving again. */
+const SETTLE_ROUNDS = 5;
+/** And waits this long before saving again, doubled each round (2, 4, 8, 16 s:
+ * a build or a job finishing its output gets half a minute). */
 const SETTLE_PAUSE_MS = 2_000;
+/** The first pause; `KARMAX_RESOURCE_SETTLE_PAUSE_MS` shortens it (tests). */
+function settlePauseMs(): number {
+  const configured = Number(process.env.KARMAX_RESOURCE_SETTLE_PAUSE_MS);
+  return Number.isFinite(configured) && configured >= 0 ? configured : SETTLE_PAUSE_MS;
+}
 const VERIFY_MAX_BYTES = 256 * 1024 * 1024;
 /** restic tests every node of a snapshot against every restore pattern, so a
  * merge's pattern count multiplies the resource's size. Past this many, a merge
@@ -229,14 +236,16 @@ export class ResticResources {
     await this.ensureRepository(attachment);
     const superseded: string[] = [];
     let parent = options.parent;
+    // Files its `.tavyamerge` says to skip are never saved (resource-policy.ts).
+    const exclude = place.entries ? [] : skipExcludes(await readPolicies(place.world, place), place.path);
     for (let round = 0; round < SETTLE_ROUNDS; round++) {
-      const summary = await this.backupOnce(place, attachment, { ...options, parent, key: `${options.key}:${round}` })
+      const summary = await this.backupOnce(place, attachment, { ...options, parent, exclude, key: `${options.key}:${round}` })
         .catch(async (error) => {
           // What it uploaded before failing is in no index: the next prune deletes it.
           await this.deps.store.kvSet(`restic-prune:${attachment.name}`, String(Date.now()));
           throw error;
         });
-      const settled = await this.backupOnce(place, attachment, { ...options, parent: summary.snapshot, dryRun: true, key: `${options.key}:${round}:check` });
+      const settled = await this.backupOnce(place, attachment, { ...options, parent: summary.snapshot, exclude, dryRun: true, key: `${options.key}:${round}:check` });
       if (!settled.changed) {
         if (superseded.length) await this.discard(attachment, superseded);
         // The finished figures, also for a save shorter than restic's progress interval.
@@ -245,9 +254,10 @@ export class ResticResources {
       }
       superseded.push(summary.snapshot);
       parent = summary.snapshot;
-      // A writer that is finishing (a job flushing its output) gets a moment;
-      // one that keeps running (a server, an open database) will not settle.
-      if (round + 1 < SETTLE_ROUNDS) await new Promise((resolve) => setTimeout(resolve, SETTLE_PAUSE_MS));
+      // A writer that is finishing (a job flushing its output) gets a while,
+      // longer each time; one that keeps running (a server, an open database)
+      // will not settle.
+      if (round + 1 < SETTLE_ROUNDS) await new Promise((resolve) => setTimeout(resolve, settlePauseMs() * 2 ** round));
     }
     // What changed from each save to the next is what something kept writing.
     const changing = await this.changedBetween(attachment, superseded).catch(() => ({ paths: [], total: 0 }));
@@ -550,6 +560,16 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
 
   /** The sizes of `paths` (relative to the snapshot's root) that `snapshot` holds. */
   async sizes(attachment: Repository, snapshot: string, paths: string[]): Promise<Map<string, number>> {
+    return this.fileFacts(attachment, snapshot, paths, (node) => Number(node.size ?? 0));
+  }
+
+  /** When each of `paths` was last modified in `snapshot` (epoch ms). */
+  async mtimes(attachment: Repository, snapshot: string, paths: string[]): Promise<Map<string, number>> {
+    return this.fileFacts(attachment, snapshot, paths, (node) => Date.parse(String(node.mtime ?? '')) || 0);
+  }
+
+  private async fileFacts(attachment: Repository, snapshot: string, paths: string[], fact: (node: Record<string, unknown>) => number)
+    : Promise<Map<string, number>> {
     const wanted = new Set(paths);
     const sizes = new Map<string, number>();
     if (!wanted.size) return sizes;
@@ -562,7 +582,7 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
         if (!line.startsWith('{')) continue;
         const node = JSON.parse(line);
         const relative = String(node.path ?? '').replace(/^\/+/, '');
-        if (node.type === 'file' && wanted.has(relative)) sizes.set(relative, Number(node.size ?? 0));
+        if (node.type === 'file' && wanted.has(relative)) sizes.set(relative, fact(node));
       }
     }
     return sizes;
@@ -813,7 +833,7 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
   }
 
   private async backupOnce(place: ResticPlace, attachment: Repository, options: ResticRunOptions & { parent?: string;
-    quota: boolean; dryRun?: boolean }): Promise<ResticCapture & { changed: boolean }> {
+    quota: boolean; dryRun?: boolean; exclude?: string[] }): Promise<ResticCapture & { changed: boolean }> {
     // A one-file resource is its content: a link is saved as what it points to.
     const file = place.file ? await this.realPath(place) : undefined;
     const directory = file ? path.posix.dirname(file) : place.path;
@@ -828,6 +848,7 @@ mkdir -p -- ${quote(path.posix.dirname(place.path))}; rm -rf -- ${quote(place.pa
       await place.world.writeFile(list, place.entries.map((entry) => `${entry}\n`).join(''));
     }
     const args = [...backupArgs(options.parent, connections), ...(options.dryRun ? ['--dry-run'] : []),
+      ...(options.exclude ?? []).flatMap((pattern) => ['--exclude', pattern]),
       ...(list ? ['--files-from-verbatim', path.posix.join(place.world.handle.root, list)] : [file ? path.posix.basename(file) : '.'])];
     const progress = options.dryRun ? {} : { onProgress: options.onProgress };
     const save = () => remote

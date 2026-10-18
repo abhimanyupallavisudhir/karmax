@@ -60,7 +60,16 @@ async function parentWithData() {
   return { store, project, task, worlds, resources, attachment, handle, data, writer };
 }
 
+// Saves wait 2, 4, 8 and 16 s for a writer to finish; here it never does.
+const settlePause = process.env.KARMAX_RESOURCE_SETTLE_PAUSE_MS;
+const shortSettle = () => { process.env.KARMAX_RESOURCE_SETTLE_PAUSE_MS = '50'; };
+afterEach(() => {
+  if (settlePause === undefined) delete process.env.KARMAX_RESOURCE_SETTLE_PAUSE_MS;
+  else process.env.KARMAX_RESOURCE_SETTLE_PAUSE_MS = settlePause;
+});
+
 it('names what kept changing during the save, and points at an open SQLite database', async () => {
+  shortSettle();
   const f = await parentWithData();
   fs.writeFileSync(path.join(f.data, 'corpus.sqlite'), 'db');
   const stop = f.writer(['corpus.sqlite-wal', 'corpus.sqlite-shm']);
@@ -79,6 +88,7 @@ it('names what kept changing during the save, and points at an open SQLite datab
 });
 
 it('says a server or job is writing when the changing files are not a database\'s', async () => {
+  shortSettle();
   const f = await parentWithData();
   const stop = f.writer(['logs.txt', ...Array.from({ length: 7 }, (_, i) => `out-${i}.jsonl`)]);
   const error = await f.resources.snapshotForks(f.handle).then(() => undefined, (e) => e);

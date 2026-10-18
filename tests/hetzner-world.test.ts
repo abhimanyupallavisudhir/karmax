@@ -230,9 +230,10 @@ describe.skipIf(!sshdAvailable)('Hetzner worlds (fake Cloud API, real sshd)', ()
     expect(refused).toBeInstanceOf(ProviderCapacityFull);
     // Setup waits it out like an outage (world-infra) instead of asking a person at once.
     expect(isTransportError(refused)).toBe(true);
-    expect((refused as Error).message).toBe('Hetzner refused a 4-CPU server: this Hetzner project\'s limit on shared CPUs is full, '
-      + 'with 2 in use by 1 other server. tavya waits until enough are free; to start sooner, give this task fewer CPUs, '
-      + 'stop another task, or ask Hetzner to raise the limit (Hetzner Console → Limits).');
+    // It names the task holding them, and that the memory decides the server too (pramana#88).
+    expect((refused as Error).message).toBe('Hetzner refused a 4-CPU, 8 GB server: this Hetzner project\'s limit on shared CPUs is full, '
+      + 'with 2 in use by 1 other server (task task_busy). tavya waits until enough are free; to start sooner, give this task fewer CPUs '
+      + 'and less memory (Hetzner\'s servers with 8 GB have 4 CPUs), stop another task, or ask Hetzner to raise the limit (Hetzner Console → Limits).');
     // Nothing of the refused world is left behind.
     expect([hetzner.servers.size, hetzner.volumes.size]).toEqual([1, 1]);
   });

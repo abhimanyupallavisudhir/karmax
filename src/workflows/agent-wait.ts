@@ -52,6 +52,9 @@ export interface AgentWaitHooks {
    * view; the wait then carries on unless that work interrupted it. */
   serveable?(): boolean;
   serve?(): Promise<void>;
+  /** The pause goes on after an interruption: told its deadline, and the
+   * agent gets no note (the turn answering the interruption resumes it). */
+  goesOn?(untilMs: number): void;
 }
 
 /**
@@ -81,7 +84,7 @@ export async function waitForAgent(wait: AgentWait, hooks: AgentWaitHooks): Prom
       if (!interrupted || hooks.interrupted() || !serveable()) break;
       await hooks.serve!();
     }
-    if (interrupted) return undefined;
+    if (interrupted) { hooks.goesOn?.(untilMs); return undefined; }
     return hooks.ask
       ? `(Resumed: nobody answered within your ${wait.minutes}-minute limit. Carry on without the answer, or pause again to keep waiting.)`
       : `(Resumed: your ${wait.minutes}-minute pause is over.)`;
@@ -105,6 +108,7 @@ export async function waitForAgent(wait: AgentWait, hooks: AgentWaitHooks): Prom
   if (!settled) {
     scope.cancel();
     await watching;
+    if (hooks.goesOn) { hooks.goesOn(untilMs); return undefined; }
     return `(Your wait for ${list} was interrupted by the message above; ${jobs.length > 1 ? 'they may still be running' : 'it may still be running'}. Call pause again to keep waiting.)`;
   }
   if (!outcome) {

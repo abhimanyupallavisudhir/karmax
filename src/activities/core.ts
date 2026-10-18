@@ -26,7 +26,7 @@ import { recordHumanConfirmation } from '../platform/review-confirmation.js';
 import { ServiceError, WorkflowNotFoundError, WorkflowUpdateFailedError, isGrpcServiceError, type Client } from '@temporalio/client';
 import { Context as activityContext } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
-import { AgentChannelLost, ProviderOutage, ProviderPolicyFailure, SandboxProviderFailure, confirmSandboxFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, isContextOverflow, type LimitClassification } from '../agent/limits.js';
+import { AgentChannelLost, ProviderCapacityFull, ProviderOutage, ProviderPolicyFailure, SandboxProviderFailure, confirmSandboxFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, isContextOverflow, type LimitClassification } from '../agent/limits.js';
 import { probeClaudeUsage, probeCodexUsage, type UsageResult } from '../agent/usage.js';
 import { markCheckpointStale } from '../world/checkpoint-staleness.js';
 import { usageAdmissionId as admissionIdFor } from '../domain/turn-admission.js';
@@ -124,7 +124,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { manifest, roleCeiling } from '../contrib/manifests.js';
 import { assembleTaskInput } from '../platform/params.js';
-import { subTaskParams } from '../platform/agent-params.js';
+import { childComputer, subTaskParams } from '../platform/agent-params.js';
 import { allows, attenuate, CHILD_TASK_CEILING } from '../platform/capabilities.js';
 import { Provider, Message, TaskInput, TaskView, AgentRole, remotePolicyOf, landingAuthorityOf, type Repository, type TaskPullRequest,
   type GitHubMergeAuthorization, type GithubLandingParticipant, type LandingAuthority, type UpstreamProposal, type SubTaskRequest, type SubTaskResponse, type TaskRecord, type WorldHandleRef } from '../domain/types.js';
@@ -182,7 +182,22 @@ const DEFAULT_GRANT = [
  * (pramana#79: a full Hetzner IP limit escalated a publication). */
 function providerUnavailable(error: unknown): unknown {
   if (!(error instanceof ProviderOutage)) return error;
-  return ApplicationFailure.create({ message: error.message, type: 'world-infra', nonRetryable: false, cause: error });
+  return capacityFailure(error) ?? ApplicationFailure.create({ message: error.message, type: 'world-infra', nonRetryable: false, cause: error });
+}
+
+/** A provider account's limit that is full (ProviderCapacityFull, anywhere in
+ * the cause chain) as `world-capacity`: only other tasks' machines stopping
+ * frees it, so the workflow waits for room on its own schedule, for hours,
+ * instead of the activity retrying at once and then a person being asked
+ * after twenty minutes (failures.ts CAPACITY_WAIT_LIMIT_MS). */
+function capacityFailure(error: unknown): ApplicationFailure | undefined {
+  for (let cause = error, depth = 0; cause && depth < 8; cause = (cause as { cause?: unknown }).cause, depth++) {
+    if (cause instanceof ProviderCapacityFull || (cause as { name?: string }).name === 'ProviderCapacityFull') {
+      const message = (cause as Error).message;
+      return ApplicationFailure.create({ message, type: 'world-capacity', nonRetryable: true, cause: cause instanceof Error ? cause : undefined });
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -192,6 +207,8 @@ function providerUnavailable(error: unknown): unknown {
  * rides in ApplicationFailure.details for account rotation and auto-resolve.
  */
 function classifyTurnError(err: unknown, provider?: Provider, sandbox?: { diagnosis?: WorldDiagnosis }): Error {
+  const full = capacityFailure(err);
+  if (full) return full;
   const msg = err instanceof Error ? err.message : String(err);
   const cause = err instanceof Error ? err : undefined;
   // Admission happens before a provider process exists. Temporal coordinator
@@ -310,6 +327,8 @@ export interface CoreActivityDeps {
   paymentRegistry?: PaymentRegistry;
   configHomes?: import('../autonomy/config-homes.js').ConfigHomeManager;
   resources?: import('../world/resources.js').ProjectResourceService;
+  /** The organization's provider accounts, which judge a sub-task's Computer. */
+  providerConnections?: import('../platform/agent-params.js').ComputerChecks;
   objects?: ObjectStore;
   contentDir?: string;
   /** Snapshot of whether this console is running on the user's own machine. */
@@ -1123,9 +1142,23 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     };
   }
 
-  async function publishTaskBranch(world: World, taskId: string, idleCheckpoint = false) {
-    return brokerPublishBranch(world, (await brokerAuthFor(world.handle, taskId)),
-      (await expectedTaskRemoteHeads(store, taskId, checkoutBranches(worldRepos(world.handle)))), recordOriginPublication(taskId), { omitUnchangedBase: idleCheckpoint });
+  /** Publish the task's branches. `integrate` is for a world the workflow
+   * holds idle (parking, preparing a sub-task, suspending): a remote branch
+   * that moved on meanwhile — a sub-task's pull request merged into it on
+   * GitHub — is merged into the world first, and the agent hears so on its next
+   * turn, instead of the publication failing as non-fast-forward. */
+  async function publishTaskBranch(world: World, taskId: string, idleCheckpoint = false, integrate = false) {
+    const result = await brokerPublishBranch(world, (await brokerAuthFor(world.handle, taskId)),
+      (await expectedTaskRemoteHeads(store, taskId, checkoutBranches(worldRepos(world.handle)))), recordOriginPublication(taskId),
+      { omitUnchangedBase: idleCheckpoint, integrateRemote: integrate });
+    if (result.integrated?.length) {
+      (await record(taskId, 'push.integrated', { repos: result.integrated }));
+      const merged = result.integrated.map(({ repo, branch, commits }) =>
+        `${commits} commit${commits === 1 ? '' : 's'} of origin/${branch} into ${repo}`).join('; ');
+      await deps.checkpoints?.addNotice(taskId, `${BRAND} merged ${merged}: they were merged into your branch on GitHub `
+        + `(usually your sub-tasks' pull requests) while you had committed too. Your branch now has both.`).catch(() => undefined);
+    }
+    return result;
   }
 
   async function pushTaskBranches(
@@ -1433,6 +1466,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
    * limit reached the workflow as a plain error and failed the task). */
   function worldUnreachable(handle: WorldHandle, error: unknown): unknown {
     if (error instanceof ApplicationFailure || !isRemote(handle.kind) || !isTransportError(error)) return error;
+    const full = capacityFailure(error);
+    if (full) return full;
     return ApplicationFailure.create({ message: error instanceof Error ? error.message : String(error), type: 'world-infra',
       nonRetryable: false, cause: error instanceof Error ? error : undefined });
   }
@@ -1628,7 +1663,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               if ((await store.listProjectRepositories(projectId)).length) {
                 await parkingTrace.measure('lifecycle.enroll-repositories', () => enrollLiveProjectRepositories(remoteWorld, taskId));
                 if (!(await valid())) return;
-                const pushed = await parkingTrace.measure('lifecycle.publish-branch', () => withTiming(parkingTrace, () => publishTaskBranch(remoteWorld, taskId, true)));
+                const pushed = await parkingTrace.measure('lifecycle.publish-branch', () => withTiming(parkingTrace, () => publishTaskBranch(remoteWorld, taskId, true, true)));
                 if (pushed.skipped.length) throw new Error(`could not persist branch for ${describePublishFailures(pushed)}`);
                 (await record(taskId, 'push.branch', { branch: remoteWorld.handle.branch, repos: pushed.pushed, reason: 'checkpoint' }));
               }
@@ -1699,11 +1734,19 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     const draft = args.draftTaskId ? (await queuedDraft(args.draftTaskId, args.parentTaskId)) : undefined;
     if (draft) {
       const { prompt, ...fields } = draft.params;
-      const agentFields = Object.fromEntries(Object.entries(fields).filter(([name]) => name.startsWith('agent:')));
+      const ownFields = Object.fromEntries(Object.entries(fields).filter(([name]) => name.startsWith('agent:') || name === 'computer'));
       args = { ...args, title: draft.title, prompt: String(prompt ?? ''),
-        ...(Object.keys(agentFields).length ? { params: agentFields as SubTaskRequest['params'] } : {}) };
+        ...(Object.keys(ownFields).length ? { params: ownFields as SubTaskRequest['params'] } : {}) };
     }
     const parent = (await store.getTask(args.parentTaskId));
+    // It runs on its parent's own Computer unless it chose another: a parent
+    // that sized itself for the work gives its sub-tasks the same machine, not
+    // the project's defaults (one sub-task each took 8 CPUs of a shared 16).
+    const computer = childComputer(parent?.params, args.params?.computer);
+    if (computer || args.params?.computer) {
+      const { computer: _own, ...rest } = args.params ?? {};
+      args = { ...args, params: { ...rest, ...(computer ? { computer } : {}) } as SubTaskRequest['params'] };
+    }
     const currentProject = (await store.getProject(args.projectId));
     const project = currentProject ? (await store.effectiveProjectConfig(currentProject)) : args.project;
     const parentHandle = (await store.currentWorld(args.parentTaskId)) as WorldHandle | undefined;
@@ -1717,7 +1760,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // A project without repositories has no branch to seed: its child starts
       // from an empty world like its parent (upgrade rehearsal, #421).
       if (worldRepos(parentWorld.handle).length) {
-        const persisted = await publishTaskBranch(parentWorld, args.parentTaskId);
+        const persisted = await publishTaskBranch(parentWorld, args.parentTaskId, false, true);
         if (!persisted.pushed.length || persisted.skipped.length) {
           const message = `could not seed the parent branch for the child task${persisted.skipped.length ? `: ${describePublishFailures(persisted)}` : ''}`;
           if (persisted.unreachable) throw ApplicationFailure.create({ message, type: 'world-infra', nonRetryable: false });
@@ -1801,7 +1844,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       base: args.base,
       target: args.target,
       parentTaskId: args.parentTaskId,
-      project,
+      // Its world is made from this: where it runs and how big that machine is.
+      project: computer && project ? applyComputer(project, computer) : project,
       profiles: args.profiles,
       // Each agent field overrides the inherited profile for its role, as the
       // same field does for create_task.
@@ -2142,6 +2186,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           if (acquired) (await deps.runners?.release(acquired.leaseId, args.kind));
           stopCancellationHeartbeat();
           if (remote && isTransportError(error)) {
+            const full = capacityFailure(error);
+            if (full) throw full;
             const message = error instanceof Error ? error.message : String(error);
             throw ApplicationFailure.create({
               message,
@@ -2458,6 +2504,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // power-on "Unknown Error" blocked the task as an agent error): it waits
         // out as infrastructure, then reaches a person, never Resolve.
         // A turn classifies what the provider said, not openWorld's wrapper.
+        const full = capacityFailure(error);
+        if (full) throw full;
         const cause = error instanceof ApplicationFailure && error.type === 'world-infra' && error.cause ? error.cause : error;
         const failure = classifyTurnError(cause, profile.provider);
         if (failure instanceof ApplicationFailure && failure.type === 'agent-error')
@@ -3070,6 +3118,13 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
       } catch { /* the World section then names the machine as the workflow knows it */ }
       const turnDisk = await turnDiskReady;
+      // A sub-task's siblings at work, which it may message directly.
+      const siblings = args.role === 'do' && promptTask.parentTaskId
+        ? (await store.childTasks(promptTask.parentTaskId).catch(() => [] as TaskRecord[]))
+          .filter((sibling) => sibling.id !== args.taskId && !sibling.params?.draft
+            && !['done', 'cancelled', 'failed'].includes(sibling.lastView?.status ?? ''))
+          .map((sibling) => ({ id: sibling.id, title: sibling.title, ...(sibling.num ? { num: sibling.num } : {}) }))
+        : [];
       const systemPrompt = assemblePrompt({
         profile,
         role: args.role,
@@ -3080,6 +3135,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         ...(otherProviders.length ? { providers: otherProviders } : {}),
         ...(moveTo ? { moveTo } : {}),
         ...(turnDisk?.limits ? { limits: turnDisk.limits } : {}),
+        ...(siblings.length ? { siblings } : {}),
         globalInstructions: (globalInstructions ?? '') + forkContext + agentForkContext + attemptContext + paymentContext,
         projectInstructions,
         bindings,
@@ -3485,7 +3541,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             const event = { type: 'agent.output', taskId: args.taskId, ts: Date.now(), payload };
             deps.bus?.emit({ ...event, seq: (await store.appendLiveOutput(event)) });
           },
-          subTaskParams: (params: unknown) => subTaskParams(store, { projectId: args.task.projectId, parentTaskId: args.taskId, params }),
+          subTaskParams: (params: unknown) => subTaskParams(store, { projectId: args.task.projectId, parentTaskId: args.taskId, params,
+            ...(deps.providerConnections ? { computers: deps.providerConnections } : {}) }),
           onReviewInfo: async (info, supplied) => {
             signal?.throwIfAborted();
             if (deps.objects) await preserveReviewArtifacts(store, deps.objects, world, args.taskId, supplied);
@@ -4346,7 +4403,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             if (remote && worldRepos(current).length) {
               const projectId = String(current.meta?.projectId ?? '');
               if ((await store.listProjectRepositories(projectId)).length) {
-                const pushed = await publishTaskBranch(remote, current.id);
+                const pushed = await publishTaskBranch(remote, current.id, false, true);
                 if (pushed.skipped.length)
                   throw new Error(`could not persist branch for ${describePublishFailures(pushed)}`);
               }

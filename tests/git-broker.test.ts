@@ -325,6 +325,73 @@ describe('cloud Git broker', () => {
     expect((await git(remote, ['rev-parse', `refs/heads/${world.handle.branch}`])).stdout.trim()).toBe(mergedHead);
   });
 
+  /** A parent world that committed after a child's pull request merged into
+   * its branch on GitHub: the histories diverge, which used to fail every
+   * sub-task creation as non-fast-forward until the agent merged by hand. */
+  async function divergedParent(prefix: string, childFile: string, parentFile: string) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+    cleanups.push(root);
+    const source = path.join(root, 'source');
+    const remote = path.join(root, 'remote.git');
+    const child = path.join(root, 'child');
+    fs.mkdirSync(source);
+    await gitOrThrow(source, ['init', '-q', '-b', 'main']);
+    await ensureIdentity(source);
+    fs.writeFileSync(path.join(source, 'README.md'), '# base\n');
+    await gitOrThrow(source, ['add', '-A']);
+    await gitOrThrow(source, ['commit', '-q', '-m', 'base']);
+    await gitOrThrow(root, ['clone', '-q', '--bare', source, remote]);
+    const world = await new WorktreeProvider(path.join(root, 'worlds')).create({ taskId: `${prefix}parent`, repo: source, base: 'main' });
+    const sshRemote = 'git@example:remote.git';
+    world.handle.repo = sshRemote;
+    world.handle.repos![0]!.repo = sshRemote;
+    const env = { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: `url.file://${root}/.insteadOf`, GIT_CONFIG_VALUE_0: 'git@example:' };
+    expect(await brokerPublishBranch(world, env)).toEqual({ pushed: ['source'], skipped: [] });
+    const published = (await git(world.handle.root, ['rev-parse', 'HEAD'])).stdout.trim();
+    await gitOrThrow(root, ['clone', '-q', remote, child]);
+    await ensureIdentity(child);
+    await gitOrThrow(child, ['switch', '-q', '-c', world.handle.branch, `origin/${world.handle.branch}`]);
+    fs.writeFileSync(path.join(child, childFile), 'child work\n');
+    await gitOrThrow(child, ['add', '-A']);
+    await gitOrThrow(child, ['commit', '-q', '-m', 'child work']);
+    await gitOrThrow(child, ['push', '-q', 'origin', world.handle.branch]);
+    const childHead = (await git(child, ['rev-parse', 'HEAD'])).stdout.trim();
+    await world.writeFile(parentFile, 'parent work\n');
+    await gitOrThrow(world.handle.root, ['add', '-A']);
+    await gitOrThrow(world.handle.root, ['commit', '-q', '-m', 'parent work']);
+    return { world, env, remote, published, childHead };
+  }
+
+  it('merges a remote branch that moved on into an idle world before publishing, when asked to integrate', async () => {
+    const { world, env, remote, published, childHead } = await divergedParent('karmax-broker-integrate-', 'child.txt', 'parent.txt');
+    // An ordinary publication still refuses: nothing merges behind an agent's back.
+    const refused = await brokerPublishBranch(world, env, { source: published });
+    expect(refused.skipped).toEqual(['source']);
+    expect(refused.errors?.source).toMatch(/non-fast-forward/);
+
+    const result = await brokerPublishBranch(world, env, { source: published }, undefined, { integrateRemote: true });
+    expect(result).toEqual({ pushed: ['source'], skipped: [], integrated: [{ repo: 'source', branch: world.handle.branch, commits: 1 }] });
+    const head = (await git(world.handle.root, ['rev-parse', 'HEAD'])).stdout.trim();
+    // The world's branch holds both, as a merge of origin's work; origin is that merge.
+    expect((await git(world.handle.root, ['merge-base', '--is-ancestor', childHead, head])).code).toBe(0);
+    expect(fs.readFileSync(path.join(world.handle.root, 'child.txt'), 'utf8')).toBe('child work\n');
+    expect(fs.readFileSync(path.join(world.handle.root, 'parent.txt'), 'utf8')).toBe('parent work\n');
+    expect((await git(remote, ['rev-parse', `refs/heads/${world.handle.branch}`])).stdout.trim()).toBe(head);
+    expect((await git(world.handle.root, ['log', '-1', '--format=%s'])).stdout).toMatch(/Merge origin\/.* on GitHub/);
+  });
+
+  it('leaves the world untouched and names the files when the remote work conflicts with it', async () => {
+    const { world, env, published } = await divergedParent('karmax-broker-integrate-conflict-', 'README.md', 'README.md');
+    const before = (await git(world.handle.root, ['rev-parse', 'HEAD'])).stdout.trim();
+    const result = await brokerPublishBranch(world, env, { source: published }, undefined, { integrateRemote: true });
+    expect(result.skipped).toEqual(['source']);
+    expect(result.errors?.source).toMatch(/could not merge them by itself: they conflict in README.md/);
+    expect(result.errors?.source).toMatch(/git merge origin\//);
+    expect((await git(world.handle.root, ['rev-parse', 'HEAD'])).stdout.trim()).toBe(before);
+    expect((await git(world.handle.root, ['rev-parse', '--verify', '--quiet', 'MERGE_HEAD'])).code).not.toBe(0);
+    expect((await git(world.handle.root, ['status', '--porcelain'])).stdout.trim()).toBe('');
+  });
+
   it('replaces a rebased task branch only when its recorded remote-head lease still matches', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-broker-lease-'));
     cleanups.push(root);

@@ -7688,6 +7688,25 @@ export class Store {
     });
   }
 
+  /** The worlds that hold a machine or disk at their provider (running,
+   * parked or lost), with their tasks, in these projects: what each task holds. */
+  async heldWorlds(projectIds: string[]): Promise<Array<{ handle: WorldHandleRef; state: string; updatedAt: number;
+    task: { id: string; num?: number; title: string; projectId: string; status?: string } }>> {
+    if (!projectIds.length) return [];
+    const rows = (await this.db.prepare(`SELECT w.handle, w.state, w.updatedAt, t.id, t.num, t.title, t.projectId, t.lastView
+      FROM world_instances w JOIN tasks t ON t.id = w.worldId
+      WHERE w.state IN ('ready', 'parked', 'degraded') AND t.projectId IN (${projectIds.map(() => '?').join(', ')})
+      ORDER BY w.updatedAt DESC`).all(...projectIds)) as Array<{ handle: string; state: string; updatedAt: number; id: string;
+      num: number | null; title: string; projectId: string; lastView: string | null }>;
+    return rows.map((row) => {
+      let status: string | undefined;
+      try { status = row.lastView ? (JSON.parse(row.lastView) as TaskView).status : undefined; } catch { status = undefined; }
+      return { handle: JSON.parse(row.handle), state: row.state, updatedAt: Number(row.updatedAt),
+        task: { id: row.id, ...(row.num != null ? { num: Number(row.num) } : {}), title: row.title, projectId: row.projectId,
+          ...(status ? { status } : {}) } };
+    });
+  }
+
   async listWorldInstances(state: string, updatedBefore = Number.MAX_SAFE_INTEGER): Promise<Array<{ handle: WorldHandleRef; state: string; updatedAt: number }>> {
     return ((await this.db.prepare('SELECT handle, state, updatedAt FROM world_instances WHERE state=? AND updatedAt<=? ORDER BY updatedAt')
       .all(state, updatedBefore)) as any[]).map((r) => ({ handle: JSON.parse(r.handle), state: r.state, updatedAt: r.updatedAt }));

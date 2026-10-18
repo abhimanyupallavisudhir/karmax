@@ -425,7 +425,7 @@ describe('separate waiting-world maintenance', () => {
     vi.spyOn(Context, 'current').mockReturnValue({ heartbeat() {}, cancellationSignal: new AbortController().signal } as any);
     const failed = await f.core.checkProposal(f.handle).then(() => undefined, (error) => error);
     expect(failed).toBeInstanceOf(ApplicationFailure);
-    expect(failed).toMatchObject({ type: 'world-infra', nonRetryable: false });
+    expect(failed).toMatchObject({ type: 'world-capacity', nonRetryable: true });
     expect(failed.message).toContain('shared CPUs is full');
     expect(await f.store.worldState(f.handle.id)).toBe('parked');
   });
@@ -456,7 +456,7 @@ describe('resource work on a world the provider cannot start', () => {
       () => core.integratePublishedResources('task'), () => core.stageResourceCandidates('task')]) {
       const failed = await run().then(() => undefined, (error: unknown) => error);
       expect(failed).toBeInstanceOf(ApplicationFailure);
-      expect(failed).toMatchObject({ type: 'world-infra', nonRetryable: false });
+      expect(failed).toMatchObject({ type: 'world-capacity', nonRetryable: true });
       expect((failed as Error).message).toContain('limit on public IP addresses is full');
     }
     await store.close();

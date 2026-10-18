@@ -374,9 +374,15 @@ export class HetznerDriver implements VmDriver {
     if (cores) {
       const holding = servers.filter((server) => server.server_type.cpu_type === cores);
       const inUse = holding.reduce((sum, server) => sum + server.server_type.cores, 0);
-      return new ProviderCapacityFull(`Hetzner refused a ${type.cores}-CPU server: this Hetzner project's limit on ${cores} CPUs is full, `
-        + `with ${inUse} in use by ${holding.length} other server${holding.length === 1 ? '' : 's'}. tavya waits until enough are free; `
-        + `to start sooner, give this task fewer CPUs, stop another task, ${raise}`, { cause });
+      // Which tasks hold them (pramana#88: "1 other server" named nothing).
+      const tasks = [...new Set(holding.map((server) => server.labels?.karmaxTaskId).filter(Boolean))];
+      const whose = tasks.length ? ` (task${tasks.length === 1 ? '' : 's'} ${tasks.slice(0, 3).join(', ')}${tasks.length > 3 ? ', …' : ''})` : '';
+      // A server's memory comes with its CPUs: fewer CPUs alone still asked
+      // for the same server when the memory did not change (pramana#88).
+      const memory = `${Math.round(type.memory)} GB`;
+      return new ProviderCapacityFull(`Hetzner refused a ${type.cores}-CPU, ${memory} server: this Hetzner project's limit on ${cores} CPUs is full, `
+        + `with ${inUse} in use by ${holding.length} other server${holding.length === 1 ? '' : 's'}${whose}. tavya waits until enough are free; `
+        + `to start sooner, give this task fewer CPUs and less memory (Hetzner's servers with ${memory} have ${type.cores} CPUs), stop another task, ${raise}`, { cause });
     }
     const counted = `${servers.length} server${servers.length === 1 ? '' : 's'}`;
     const what = limit === 'primary_ip_limit' ? `limit on public IP addresses is full, with ${counted} using them`

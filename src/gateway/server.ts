@@ -43,7 +43,7 @@ import { KarmaxBus } from '../contrib/bus.js';
 import { TokenAuthority, type ScopedToken } from '../platform/tokens.js';
 import { resolveAuthorizationSummary } from '../platform/authorization-summary.js';
 import { participantAuthorization } from '../platform/agent-authority.js';
-import { platformRequestPathError } from '../platform/platform-request.js';
+import { compactTaskView, platformRequestPathError } from '../platform/platform-request.js';
 import { ContributionRegistry } from '../contrib/registry.js';
 import { Overlays } from '../store/overlays.js';
 import { manifest } from '../contrib/manifests.js';
@@ -234,6 +234,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/organizations\/[^/]+\/projects/.test(p)) return read ? 'project:read' : 'project:create';
   if (/^\/api\/organizations\/[^/]+\/runner-pools/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/organizations\/[^/]+\/world-providers/.test(p)) return read ? 'organization:read' : 'organization:edit';
+  // Each project is authorized in listComputers (task:read), as search's are.
+  if (/^\/api\/organizations\/[^/]+\/computers$/.test(p) && read) return 'none';
   if (/^\/api\/organizations\/[^/]+\/usage-policy/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/organizations\/[^/]+\/usage/.test(p)) return 'payment:read';
   // Insights are every member's view of the organization's work; money inside
@@ -3481,6 +3483,14 @@ export class Gateway {
           catch (error) { return this.json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
         }
       }
+      const heldComputers = p.match(/^\/api\/organizations\/([^/]+)\/computers$/);
+      if (heldComputers && method === 'GET') {
+        try { return this.json(res, 200, await api.listComputers(token, heldComputers[1]!)); }
+        catch (e) {
+          const status = (e as { status?: number })?.status;
+          return this.json(res, status === 403 || status === 404 ? status : 400, { error: e instanceof Error ? e.message : String(e) });
+        }
+      }
       const worldProviders = p.match(/^\/api\/organizations\/([^/]+)\/world-providers$/);
       if (worldProviders && method === 'GET') {
         return this.json(res, 200, (await this.deps.providerConnections?.list(worldProviders[1]!)) ?? []);
@@ -5466,6 +5476,22 @@ export class Gateway {
             && (await this.deps.tokens.check(token, 'payment:write', { projectId: task.projectId })).ok,
           spent: (await store.paymentSpent(task.id, false, policy.currency)), released });
       }
+      const deliverData = p.match(/^\/api\/tasks\/([^/]+)\/deliver-data$/);
+      if (deliverData && method === 'POST') {
+        try { return this.json(res, 200, await api.deliverSubTaskData(token, deliverData[1]!)); }
+        catch (e) {
+          const status = (e as { status?: number })?.status;
+          return this.json(res, status === 403 || status === 404 ? status : 400, { error: e instanceof Error ? e.message : String(e) });
+        }
+      }
+      const releaseComputer = p.match(/^\/api\/tasks\/([^/]+)\/release-computer$/);
+      if (releaseComputer && method === 'POST') {
+        try { return this.json(res, 200, await api.releaseComputer(token, releaseComputer[1]!)); }
+        catch (e) {
+          const status = (e as { status?: number })?.status;
+          return this.json(res, status === 403 || status === 404 ? status : 400, { error: e instanceof Error ? e.message : String(e) });
+        }
+      }
       const biggerDisk = p.match(/^\/api\/tasks\/([^/]+)\/bigger-disk$/);
       if (biggerDisk && method === 'POST') {
         const b = await this.body(req);
@@ -5520,7 +5546,8 @@ export class Gateway {
           const applied = await api.updateParams(token, id, b.params ?? {}, { acceptAttenuation: attenuation.acceptAttenuation });
           // Authoritative read: reflect the just-applied update, not a snapshot that
           // may pre-date the workflow's next publish.
-          return this.json(res, 200, { ...applied, view: await api.getTaskView(token, id, { live: true }) });
+          // Without its conversation (compactTaskView): every reply carried it whole, 100k+ characters.
+          return this.json(res, 200, { ...applied, view: compactTaskView(await api.getTaskView(token, id, { live: true }) as Record<string, unknown> | undefined) });
         } catch (e) {
           return this.json(res, grantRefusal(e).code ? 403 : 409, { error: e instanceof Error ? e.message : String(e), ...grantRefusal(e) });
         }
