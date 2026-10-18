@@ -40,3 +40,4 @@ When the agent finishes, the task moves to **Review**. Read the changes, open th
 - [tavya CLI](/docs/cli): work on a project or a task from your own machine.
 - Connect another agent (Claude Code, Codex, Cursor…) to tavya over MCP: `{{origin}}/mcp`.
 - **Ctrl+K** (**⌘K**) opens the command palette; **?** lists keyboard shortcuts.
+- **N** starts a new task; **n** starts one from a template, by its number. Save any task as a template with **Save as template**; manage them in **Task defaults**.

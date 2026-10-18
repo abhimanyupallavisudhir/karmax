@@ -309,6 +309,7 @@ export class ProjectTransfers {
     // Object keys are immutable, project-scoped managed artifacts. Their access
     // follows the project; billing and execution provenance stay in the source.
     (await s.db.prepare('UPDATE promoted_artifacts SET organizationId=? WHERE projectId=?').run(destination, id));
+    (await s.moveProjectTaskTemplates(id, destination));
     for (const org of [plan.project.organizationId!, destination]) (await s.appendAudit({ principalId: this.actor.principal,
       action: 'project.transferred', scopeKey: `organization:${org}`, detail: { projectId: id,
         sourceOrganizationId: plan.project.organizationId, destinationOrganizationId: destination } }));

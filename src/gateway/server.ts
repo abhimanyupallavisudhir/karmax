@@ -229,6 +229,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/organizations\/[^/]+\/search$/.test(p) && read) return 'none';
   // The organization home's saved views are task-list queries, like a project's.
   if (/^\/api\/organizations\/[^/]+\/views$/.test(p)) return read ? 'task:read' : 'task:edit';
+  // Templates are saved task forms: whoever may create tasks may save one.
+  if (/^\/api\/organizations\/[^/]+\/templates$/.test(p)) return read ? 'task:read' : 'task:create';
   if (/^\/api\/organizations\/[^/]+\/projects/.test(p)) return read ? 'project:read' : 'project:create';
   if (/^\/api\/organizations\/[^/]+\/runner-pools/.test(p)) return read ? 'organization:read' : 'organization:edit';
   if (/^\/api\/organizations\/[^/]+\/world-providers/.test(p)) return read ? 'organization:read' : 'organization:edit';
@@ -383,6 +385,9 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/projects\/[^/]+\/search$/.test(p)) return 'task:read';
   if (/^\/api\/projects\/[^/]+\/(tags|views)$/.test(p)) return read ? 'task:read' : 'task:edit';
   if (/^\/api\/(tags|views)\//.test(p)) return read ? 'task:read' : 'task:edit';
+  if (/^\/api\/projects\/[^/]+\/templates$/.test(p) || /^\/api\/templates\/[^/]+$/.test(p)) return read ? 'task:read' : 'task:create';
+  // Reading the task is what the gateway checks; saving where it is asked to, the API.
+  if (/^\/api\/tasks\/[^/]+\/template$/.test(p)) return 'task:read';
   if (/^\/api\/projects\/[^/]+\/workflow-pins$/.test(p)) return read ? 'workflow:read' : 'workflow:edit';
   if (/^\/api\/projects\/[^/]+\/propose-workflow-edit$/.test(p)) return 'workflow:edit';
   if (/\/(events|timing)$/.test(p) || p === '/api/activity') return 'task:event:read';
@@ -5274,6 +5279,33 @@ export class Gateway {
           return this.json(res, 200, { ok: true });
         }
       }
+      // Task templates — saved task forms, a project's and its organization's.
+      const projectTemplatesMatch = p.match(/^\/api\/projects\/([^/]+)\/templates$/);
+      if (projectTemplatesMatch) {
+        const projectId = decodeURIComponent(projectTemplatesMatch[1]!);
+        if (method === 'GET') return this.json(res, 200, await api.listProjectTemplates(token, projectId));
+        if (method === 'POST') return this.json(res, 200, await api.createTemplate(token, { ...(await this.body(req)), organizationId: undefined, projectId }));
+      }
+      const organizationTemplatesMatch = p.match(/^\/api\/organizations\/([^/]+)\/templates$/);
+      if (organizationTemplatesMatch) {
+        const organizationId = decodeURIComponent(organizationTemplatesMatch[1]!);
+        if (method === 'GET') return this.json(res, 200, await api.listOrganizationTemplates(token, organizationId));
+        if (method === 'POST') return this.json(res, 200, await api.createTemplate(token, { ...(await this.body(req)), projectId: undefined, organizationId }));
+      }
+      const templateMatch = p.match(/^\/api\/templates\/([^/]+)$/);
+      if (templateMatch) {
+        const id = decodeURIComponent(templateMatch[1]!);
+        if (method === 'PATCH') return this.json(res, 200, await api.updateTemplate(token, id, await this.body(req)));
+        if (method === 'DELETE') {
+          await api.deleteTemplate(token, id);
+          return this.json(res, 200, { ok: true });
+        }
+      }
+      const taskTemplateMatch = p.match(/^\/api\/tasks\/([^/]+)\/template$/);
+      if (taskTemplateMatch && method === 'POST') {
+        const b = await this.body(req);
+        return this.json(res, 200, await api.createTemplateFromTask(token, decodeURIComponent(taskTemplateMatch[1]!), { name: b.name, scope: b.scope }));
+      }
       const viewReorderMatch = p.match(/^\/api\/views\/([^/]+)\/reorder$/);
       if (viewReorderMatch && method === 'POST') {
         const b = await this.body(req);
@@ -10054,6 +10086,7 @@ export class Gateway {
     // view, because the check had no project to compare its scope against.
     const tagId = pathname.match(/^\/api\/tags\/([^/]+)/)?.[1];
     const viewId = pathname.match(/^\/api\/views\/([^/]+)/)?.[1];
+    const templateId = pathname.match(/^\/api\/templates\/([^/]+)/)?.[1];
     const pathProject = pathname.match(/^\/api\/projects\/([^/]+)/)?.[1]
       ?? pathname.match(/^\/api\/defaults\/([^/]+)/)?.[1]
       ?? pathname.match(/^\/api\/settings\/project\/([^/]+)/)?.[1];
@@ -10069,8 +10102,10 @@ export class Gateway {
     // act on another tenant's task by naming a project of its own. Every
     // identifier that names a scope must agree, or the request is refused.
     const viewRecord = viewId ? (await this.deps.store.getView(viewId)) : undefined;
+    const templateRecord = templateId ? (await this.deps.store.getTaskTemplate(decodeURIComponent(templateId))) : undefined;
     const recordProject = (tagId ? (await this.deps.store.getTag(tagId))?.projectId : undefined)
       ?? (viewRecord?.projectId || undefined)
+      ?? (templateRecord?.projectId || undefined)
       ?? (taskId ? await this.deps.store.taskProjectIdAsync(taskId) : undefined);
     const queryProject = url.searchParams.get('projectId') ?? undefined;
     const projects = [recordProject, pathProject, queryProject].filter((value): value is string => Boolean(value));
@@ -10078,7 +10113,7 @@ export class Gateway {
     const resolvedProjectId = projects[0];
     const projectOrganization = resolvedProjectId ? await this.deps.store.projectOrganizationAsync(resolvedProjectId) : undefined;
     const organizations = [pathname.match(/^\/api\/organizations\/([^/]+)/)?.[1], url.searchParams.get('organizationId') ?? undefined,
-      projectOrganization, viewRecord?.organizationId].filter((value): value is string => Boolean(value));
+      projectOrganization, viewRecord?.organizationId, templateRecord?.organizationId].filter((value): value is string => Boolean(value));
     if (new Set(organizations).size > 1) return { conflict: 'organizationId does not match the addressed record' };
     return { projectId: resolvedProjectId, organizationId: organizations[0], ...(taskId ? { taskId } : {}) };
   }

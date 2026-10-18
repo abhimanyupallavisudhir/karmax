@@ -112,3 +112,29 @@ it('imports a local checkout: links the repository, its .env as secrets, secret 
   const env = await f.tavya(path.join(f.laptop, 'fresh'), ['env', '--json']);
   expect(JSON.parse(env.stdout)).toEqual({ API_KEY: 's3cret' });
 });
+
+it('starts a task from a template, by its number or its name', async () => {
+  const f = await cliFixture(cleanups);
+  const organizationId = f.project.organizationId!;
+  await f.store.createTaskTemplate({ organizationId, name: 'Bug triage', workflow: 'software-dev', params: { prompt: 'Triage the newest bug' } });
+  await f.store.createTaskTemplate({ organizationId, projectId: f.project.id, name: 'Release notes', workflow: 'software-dev',
+    params: { prompt: 'Write the release notes' }, priority: 2 });
+  const listed = await f.tavya(f.laptop, ['task', 'templates', '--project', f.project.id]);
+  expect(listed.code, listed.stderr).toBe(0);
+  expect(listed.stdout.split('\n').map((line) => line.trim().split(/\s{2,}/))).toEqual(expect.arrayContaining([
+    ['0', 'Default'], ['1', 'Bug triage', 'organization'], ['2', 'Release notes']]));
+
+  // By number: the template's prompt and priority, the title given.
+  const byNumber = await f.tavya(f.laptop, ['task', 'new', 'Notes for 2.0', '--template', '2', '--draft', '--project', f.project.id, '--json']);
+  expect(byNumber.code, byNumber.stderr).toBe(0);
+  const notes = (await f.store.getTask(JSON.parse(byNumber.stdout).id))!;
+  expect(notes.title).toBe('Notes for 2.0');
+  expect(notes.params).toMatchObject({ prompt: 'Write the release notes', priority: 2, draft: true });
+  // By name, with a prompt of its own.
+  const byName = await f.tavya(f.laptop, ['task', 'new', 'Triage', '--template', 'bug', '--prompt', 'Triage #42', '--draft', '--project', f.project.id, '--json']);
+  expect(byName.code, byName.stderr).toBe(0);
+  expect((await f.store.getTask(JSON.parse(byName.stdout).id))!.params.prompt).toBe('Triage #42');
+  const missing = await f.tavya(f.laptop, ['task', 'new', 'Nothing', '--template', '7', '--project', f.project.id]);
+  expect(missing.code).toBe(5);
+  expect(missing.stderr).toContain('no template "7"');
+});
