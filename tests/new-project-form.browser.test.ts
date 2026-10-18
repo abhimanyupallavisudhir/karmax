@@ -43,7 +43,7 @@ describe('New project form', () => {
     await dialog.locator('.np-github').getByText('acme').waitFor();
     const folds = dialog.locator('details');
     expect(await folds.locator('> summary').allTextContents()).toEqual(['Secrets', 'Environment']);
-    expect(await folds.evaluateAll((all) => all.map((d) => (d as HTMLDetailsElement).open))).toEqual([false, false]);
+    expect(await folds.evaluateAll((all) => all.map((d) => (d as unknown as { open: boolean }).open))).toEqual([false, false]);
     expect(ui.errors).toEqual([]);
     await ui.close();
   });

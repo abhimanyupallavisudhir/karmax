@@ -54,7 +54,7 @@ describe('creating a project with its repositories', () => {
     const f = await setup();
     const response = await f.create({ name: 'Clients/Site', config: {}, repos: ['git@github.com:acme/site.git'] });
     expect(response.status, await response.clone().text()).toBe(200);
-    const project = await response.json();
+    const project = await response.json() as { id: string; config: { repos?: string[] } };
     expect(project.config.repos).toEqual(['git@github.com:acme/site.git']);
     expect((await f.store.listProjectRepositories(project.id)).map(({ repository }) => repository.id)).toEqual([f.repository.id]);
   });
@@ -63,7 +63,7 @@ describe('creating a project with its repositories', () => {
     const f = await setup();
     const response = await f.create({ name: 'Elsewhere', config: {}, repos: ['git@github.com:someone/else.git'] });
     expect(response.status).toBe(400);
-    expect((await response.json()).error).toMatch(/organization GitHub connection/);
+    expect((await response.json() as { error: string }).error).toMatch(/organization GitHub connection/);
     expect((await f.store.listProjects()).filter((project) => project.organizationId === f.org.id)).toEqual([]);
   });
 });
