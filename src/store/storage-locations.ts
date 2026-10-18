@@ -176,9 +176,11 @@ export class StorageLocationService {
 class PrefixedObjectStore implements ObjectStore {
   readonly presign?: ObjectStore['presign'];
   readonly head?: ObjectStore['head'];
+  readonly getStream?: ObjectStore['getStream'];
   constructor(private inner: ObjectStore, private prefix: string) {
     if (inner.presign) this.presign = (method, key, seconds, options) => inner.presign!(method, this.key(key), seconds, options);
     if (inner.head) this.head = (key, options) => inner.head!(this.key(key), options);
+    if (inner.getStream) this.getStream = (key, range) => inner.getStream!(this.key(key), range);
   }
   put(key: string, data: Buffer, contentType?: string): Promise<void> { return this.inner.put(this.key(key), data, contentType); }
   get(key: string): Promise<Buffer> { return this.inner.get(this.key(key)); }

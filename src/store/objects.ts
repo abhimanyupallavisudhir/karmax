@@ -5,6 +5,10 @@ import path from 'node:path';
 export interface ObjectStore {
   put(key: string, data: Buffer, contentType?: string): Promise<void>;
   get(key: string): Promise<Buffer>;
+  /** The object's bytes as they arrive, only `range`'s when given, with the
+   * object's whole size — so a large object is served without holding it in
+   * memory. Stopping the iteration early ends the read. */
+  getStream?(key: string, range?: ByteRange): Promise<ObjectStream>;
   delete(key: string, options?: ObjectRequestOptions): Promise<void>;
   /** A URL that lets whoever holds it PUT or GET exactly this object for
    * `seconds`, so a sandbox can move bytes without them passing through
@@ -50,6 +54,11 @@ export async function verifiesChecksums(objects: ObjectStore, fetcher: typeof fe
   } catch { return false; }
 }
 
+/** Inclusive byte offsets, as in an HTTP `Range` header. */
+export interface ByteRange { start: number; end: number }
+/** `bytes` is the size of the whole object, also for a range. */
+export interface ObjectStream { bytes: number; body: AsyncIterable<Buffer> }
+
 /** What `head` and `list` report: the stored size and the ETag without quotes. */
 export interface ObjectInfo { bytes: number; etag: string }
 /** A listed object; `modifiedAt` (ms) is when it was last written. */
@@ -67,6 +76,11 @@ export class LocalObjectStore implements ObjectStore {
   }
 
   async get(key: string): Promise<Buffer> { return fs.promises.readFile(this.file(key)); }
+  async getStream(key: string, range?: ByteRange): Promise<ObjectStream> {
+    const file = this.file(key);
+    const { size } = await fs.promises.stat(file);
+    return { bytes: size, body: fs.createReadStream(file, range ? { start: range.start, end: range.end } : {}) };
+  }
   async delete(key: string): Promise<void> { await fs.promises.rm(this.file(key), { force: true }); }
 
   /** Every file under the root, keyed by its path; an unfinished write
@@ -123,6 +137,22 @@ export class S3ObjectStore implements ObjectStore {
     const response = await this.request('GET', key);
     return Buffer.from(await response.arrayBuffer());
   }
+  async getStream(key: string, range?: ByteRange): Promise<ObjectStream> {
+    const response = await this.request('GET', key, range ? { range: `bytes=${range.start}-${range.end}` } : {});
+    const total = /\/(\d+)$/.exec(response.headers.get('content-range') ?? '')?.[1] ?? response.headers.get('content-length');
+    if (total == null) { await response.body?.cancel(); throw new Error(`object store GET returned no size for ${key}`); }
+    const body = response.body ?? new Blob([]).stream();
+    return { bytes: Number(total), body: (async function* () {
+      const reader = body.getReader();
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) return;
+          yield Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+        }
+      } finally { await reader.cancel().catch(() => undefined); }
+    })() };
+  }
   async delete(key: string, options: ObjectRequestOptions = {}): Promise<void> {
     await this.request('DELETE', key, options);
   }
@@ -178,7 +208,7 @@ export class S3ObjectStore implements ObjectStore {
   }
 
   private async request(method: string, key: string, options: ObjectRequestOptions & { body?: Buffer; contentType?: string;
-    query?: Record<string, string>; allowMissing?: boolean } = {}): Promise<Response> {
+    query?: Record<string, string>; allowMissing?: boolean; range?: string } = {}): Promise<Response> {
     // An empty key addresses the bucket itself (a listing), never an object.
     if (key.includes('..') || (!key && !options.query)) throw new Error('invalid object key');
     const body = options.body ?? Buffer.alloc(0);
@@ -211,7 +241,9 @@ export class S3ObjectStore implements ObjectStore {
     const signingKey = hmac(serviceKey, 'aws4_request');
     const signature = hmac(signingKey, stringToSign).toString('hex');
     headers.authorization = `AWS4-HMAC-SHA256 Credential=${this.options.accessKeyId}/${scope}, SignedHeaders=${names.join(';')}, Signature=${signature}`;
-    const response = await this.fetcher(base, { method, headers, ...(method === 'PUT' ? { body: body as any } : {}),
+    // Sent unsigned: SigV4 does not require it, and the store honours it either way.
+    const sent = options.range ? { ...headers, range: options.range } : headers;
+    const response = await this.fetcher(base, { method, headers: sent, ...(method === 'PUT' ? { body: body as any } : {}),
       ...(options.timeoutMs ? { signal: AbortSignal.timeout(options.timeoutMs) } : {}) });
     if (options.allowMissing && response.status === 404) return response;
     if (!response.ok) throw new Error(`object store ${method} failed (${response.status}): ${(await response.text()).slice(0, 300)}`);

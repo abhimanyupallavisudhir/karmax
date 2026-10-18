@@ -161,6 +161,12 @@ describe.skipIf(!sshdAvailable)('VM world over SSH', () => {
     let streamed = 0;
     for await (const chunk of world.readFileStream!('big.bin')) streamed += chunk.length;
     expect(streamed).toBe(big.length);
+    // A Review artifact's size and one byte range, as the gateway serves them.
+    expect(await world.fileSize!('big.bin')).toBe(big.length);
+    await expect(world.fileSize!('a/b')).rejects.toThrow('not a regular file');
+    let ranged = 0;
+    for await (const chunk of world.readFileStream!('big.bin', { start: 100, end: 1_099 })) ranged += chunk.length;
+    expect(ranged).toBe(1_000);
     expect(await world.listFiles()).toEqual(expect.arrayContaining(['a/b/c.txt', 'big.bin']));
     // A missing file is a file error, never a missing VM (isMissingSandbox).
     const missing = await world.readFile('nope.txt').catch((error) => error);

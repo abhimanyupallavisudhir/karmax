@@ -88,6 +88,7 @@ export class DeferredDeleteObjectStore implements ObjectStore {
       return inner.presign!(method, key, seconds, options);
     };
     if (inner.head) this.head = (key, request) => inner.head!(key, request);
+    if (inner.getStream) this.getStream = (key, range) => inner.getStream!(key, range);
     if (inner.list) this.list = (prefix) => inner.list!(prefix);
   }
 
@@ -107,6 +108,7 @@ export class DeferredDeleteObjectStore implements ObjectStore {
   get(key: string): Promise<Buffer> { return this.inner.get(key); }
   readonly presign?: ObjectStore['presign'];
   readonly head?: ObjectStore['head'];
+  readonly getStream?: ObjectStore['getStream'];
   readonly list?: ObjectStore['list'];
 
   async delete(key: string, options?: ObjectRequestOptions): Promise<void> {

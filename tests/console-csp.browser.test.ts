@@ -82,7 +82,7 @@ it('walks the console under its policy without a violation, and agent HTML still
       if (!fs.existsSync(file)) return route.fulfill({ status: 404, body: '' });
       return route.fulfill({ headers: staticAssetHeaders(file, 'console.test'), body: fs.readFileSync(file) });
     }
-    if (p === '/api/tasks/t/review-info.html' || p === '/api/tasks/t/review-artifact')
+    if (p === '/api/tasks/t/review-info.html' || p.startsWith('/api/artifact-content/'))
       return route.fulfill({ headers: untrustedContentHeaders('text/html; charset=utf-8', 'report.html'), body: AGENT_HTML });
     let data: unknown = [];
     if (p === '/api/meta') data = { siteName: 'Fixture', hostLocal: true, consoleRevision: 'one', agent: { provider: 'mock' }, worldProviders: [] };
@@ -97,7 +97,8 @@ it('walks the console under its policy without a violation, and agent HTML still
     else if (p === '/api/projects/p/search') data = { tasks: [task], total: 1 };
     else if (p === '/api/tasks/t') data = view;
     else if (p === '/api/tasks/t/attempts') data = { principalAttemptId: 't', attempts: [task] };
-    else if (p === '/api/tasks/t/review-action') data = { kind: 'open', url: '/api/tasks/t/review-artifact' };
+    else if (p === '/api/tasks/t/review-action') data = { kind: 'open', external: false, url: '/api/artifact-content/signed/report.html',
+      name: 'report.html', mediaType: 'text/html; charset=utf-8' };
     else if (p === '/api/organizations/o/roles') data = { canCreate: true, profiles: [], capabilityGroups: [], creatableCapabilities: [] };
     else if (p.endsWith('/execution-policy')) data = { worldProvider: 'worktree', resources: { cpu: 2, memoryMb: 2048 }, network: { unrestricted: true } };
     else if (p.endsWith('/github/app')) data = { configured: false };
@@ -149,14 +150,14 @@ it('walks the console under its policy without a violation, and agent HTML still
   await go('/org/workspace/tasks/1/overview');
   // The agent's review HTML is its own sandboxed document, so its script runs.
   await expect.poll(() => page.frameLocator('#review-info-frame').locator('#state').textContent()).toBe('ran');
-  // An HTML artifact opens as its own document under the gateway's sandbox policy.
-  const opened = context.waitForEvent('page');
+  // An HTML artifact opens in the page's viewer, in a sandboxed frame of its
+  // own URL (served under the gateway's sandbox policy), and its script runs.
   await page.locator('.review-action[data-kind="open"]').click();
-  const artifact = await opened;
-  await artifact.waitForLoadState();
-  expect(new URL(artifact.url()).pathname).toBe('/api/tasks/t/review-artifact');
-  await expect.poll(() => artifact.locator('#state').textContent()).toBe('ran');
-  await artifact.close();
+  const frame = page.locator('dialog.artifact-reader iframe');
+  expect(await frame.getAttribute('src')).toBe('/api/artifact-content/signed/report.html');
+  expect(await frame.getAttribute('sandbox')).toContain('allow-scripts');
+  await expect.poll(() => page.frameLocator('dialog.artifact-reader iframe').locator('#state').textContent()).toBe('ran');
+  await page.locator('dialog.artifact-reader [data-close]').click();
   await go('/org/settings');
   await page.locator('#org-members').waitFor({ state: 'attached' });
   await go('/org/workspace/queue');

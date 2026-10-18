@@ -75,7 +75,12 @@ describe('durable Review attachments', () => {
     expect(await response.text()).toBe('# Saved report');
     const other = (await f.store.createTask({ projectId: f.project.id, title: 'Other', workflow: 'just-do',
       workflowVersion: '1.0.0', params: { prompt: 'other' } }));
-    expect((await f.request(url.replace(f.task.id, other.id))).status).not.toBe(200);
+    expect((await f.request(`/api/tasks/${other.id}/artifact?path=report.md`)).status).not.toBe(200);
+    // The signed link names its task inside its signature: it cannot be pointed at another.
+    const [, , , token] = url.split('/');
+    const [body, signature] = token!.split('.');
+    const moved = Buffer.from(JSON.stringify({ ...JSON.parse(Buffer.from(body!, 'base64url').toString()), t: other.id })).toString('base64url');
+    expect((await f.request(`/api/artifact-content/${moved}.${signature}/report.md`)).status).toBe(403);
   });
 
   it('preserves attachments before acknowledging the tool even if the turn then escalates', async () => {

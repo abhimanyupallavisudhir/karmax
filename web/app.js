@@ -10976,6 +10976,9 @@ function reviewActionBtn(a, i) {
   const icon = isPayment ? (a.operation === 'deny' ? '✕' : '✓') : isRun ? (a.server ? '▶' : '⚡') : '↗';
   const label = `${icon} ${esc(a.label || (isPayment ? 'Resolve spend' : isRun ? 'Run' : 'Open'))}`;
   const title = isPayment ? `Payment request ${esc(a.requestId || '')}` : isRun ? esc(a.command || '') : esc(a.target || '');
+  // A web page is a plain link: the click itself opens it, so no popup blocker can.
+  if (a.kind === 'open' && /^https?:\/\//i.test(a.target || ''))
+    return `<a class="btn sm" href="${esc(safeHref(a.target))}" target="_blank" rel="noopener" title="${title}">${label}</a>`;
   return `<button class="btn sm review-action" data-idx="${i}" data-kind="${esc(a.kind)}" title="${title}">${label}</button>`;
 }
 
@@ -11027,28 +11030,81 @@ function artifactTextKind(contentType, target) {
   return null;
 }
 
-function showArtifactReader(text, kind, name, blob) {
+// How the in-page viewer shows a served type; null means download it.
+function artifactView(mediaType, name) {
+  const text = artifactTextKind(mediaType || '', name || '');
+  if (text) return text;
+  const type = String(mediaType || '').split(';')[0].trim().toLowerCase();
+  if (/^(?:image|video|audio)\//.test(type)) return type.split('/')[0];
+  if (type === 'application/pdf') return 'pdf';
+  if (type === 'text/html' || type === 'application/xhtml+xml') return 'page';
+  return null;
+}
+// Larger text is downloaded rather than laid out in the page.
+const ARTIFACT_TEXT_PREVIEW_BYTES = 10 * 1024 * 1024;
+
+// One in-page viewer for every Review artifact. Media plays straight from its
+// signed URL (the gateway streams it in byte ranges, so a video starts at once
+// and seeks), never through a popup the browser could block after an await.
+// The URL is served under a `sandbox` policy, so an HTML page in the frame
+// runs with an opaque origin, as it would in its own tab.
+function showArtifactViewer({ name, url, view, text, refresh }) {
   const previousFocus = document.activeElement;
   const dialog = document.createElement('dialog');
-  dialog.className = 'modal-card artifact-reader';
+  dialog.className = `modal-card artifact-reader artifact-${view}`;
   dialog.setAttribute('aria-labelledby', 'artifact-reader-title');
+  const newTab = view === 'pdf' || view === 'page'
+    ? `<a class="btn sm" data-new-tab target="_blank" rel="noopener" title="Open in a new tab">↗</a>` : '';
   dialog.innerHTML = `<header class="artifact-reader-header"><h2 id="artifact-reader-title">${esc(name)}</h2>
-    ${kind === 'markdown' ? texToggleHtml() : ''}<a class="btn sm" data-download>Download</a><button class="btn sm" data-close>Close</button></header>
+    ${view === 'markdown' ? texToggleHtml() : ''}${newTab}<a class="btn sm" data-download>Download</a><button class="btn sm" data-close>Close</button></header>
     <div class="artifact-reader-content" tabindex="0"></div>`;
   const content = dialog.querySelector('.artifact-reader-content');
-  if (kind === 'markdown') {
+  const links = () => dialog.querySelectorAll('[data-download], [data-new-tab]');
+  const point = (href) => links().forEach((link) => { link.href = href; });
+  point(url);
+  dialog.querySelector('[data-download]').download = name;
+  let media = null;
+  if (view === 'markdown') {
     content.classList.add('msg-text', 'md');
     mountMarkdownSurface(content, (math) => renderMarkdown(text, { math }));
     wireTexToggles(dialog);
-  } else {
+  } else if (view === 'text') {
     const pre = document.createElement('pre');
     pre.textContent = text;
     content.appendChild(pre);
+  } else if (view === 'pdf' || view === 'page') {
+    const frame = document.createElement('iframe');
+    frame.title = name;
+    if (view === 'page') frame.setAttribute('sandbox', 'allow-scripts allow-forms allow-popups allow-modals allow-downloads');
+    frame.src = url;
+    content.appendChild(frame);
+  } else {
+    media = document.createElement(view === 'image' ? 'img' : view);
+    if (view === 'image') media.alt = name;
+    else { media.controls = true; media.autoplay = true; media.playsInline = true; media.preload = 'auto'; }
+    media.src = url;
+    content.appendChild(media);
   }
-  const objectUrl = URL.createObjectURL(blob);
-  const download = dialog.querySelector('[data-download]');
-  download.href = objectUrl;
-  download.download = name;
+  // A signed URL lasts an hour: a long viewing (or a restart) gets a fresh one
+  // and carries on from where it was; anything else is said, never swallowed.
+  let refreshedAt = 0;
+  media?.addEventListener('error', async () => {
+    if (!dialog.open) return;
+    const at = media.currentTime || 0;
+    // A fresh URL that fails at once is not an expiry: say so instead of looping.
+    if (refresh && Date.now() - refreshedAt > 60_000) {
+      refreshedAt = Date.now();
+      try {
+        const next = await refresh();
+        point(next.url);
+        media.src = next.url;
+        if (at) media.currentTime = at;
+        return;
+      } catch { /* reported below */ }
+    }
+    content.innerHTML = `<p class="artifact-error" role="alert">Couldn’t ${view === 'image' ? 'show' : 'play'} this file here. Download it instead.</p>`;
+    toast(`Could not open ${name}`, true);
+  });
   dialog.querySelector('[data-close]').addEventListener('click', () => dialog.close());
   // Consume Escape before the shell dispatcher can also close the task behind us.
   dialog.addEventListener('keydown', (event) => {
@@ -11058,54 +11114,48 @@ function showArtifactReader(text, kind, name, blob) {
     dialog.close();
   });
   dialog.addEventListener('close', () => {
-    URL.revokeObjectURL(objectUrl);
+    // Stop the stream: a closed viewer must not keep downloading or playing.
+    if (media) { media.removeAttribute('src'); media.load?.(); }
     dialog.remove();
     if (previousFocus?.isConnected) previousFocus.focus();
   }, { once: true });
   document.body.appendChild(dialog);
   dialog.showModal();
   dialog.querySelector('[data-close]').focus();
+  return dialog;
 }
 
-// Types a browser renders without running anything: opened straight from a
-// `blob:` URL. Active documents (HTML, SVG) open by their own URL instead: the
-// gateway serves them under a `sandbox` policy that gives them an opaque origin,
-// while a `blob:` URL would carry THIS page's origin and policy. Everything
-// else is downloaded.
-const RENDERABLE_ARTIFACT = /^(?:image\/(?:png|jpeg|gif|webp)|application\/pdf|video\/|text\/(?:plain|csv)|application\/json)/i;
-const ACTIVE_ARTIFACT = /^(?:text\/html|image\/svg\+xml|application\/xhtml\+xml)/i;
 function safeHref(href) {
   return /^(?:https?:|mailto:|\/|#)/i.test(String(href || '')) ? String(href) : '#';
 }
-async function openArtifact(url, external, target = '') {
-  if (external) { if (safeHref(url) !== '#') window.open(url, '_blank', 'noopener'); return; }
-  // Artifact endpoints need the auth header, so fetch as a blob then open it.
-  try {
-    const res = await feedbackFetch(url, { headers: S.token ? { authorization: `Bearer ${S.token}` } : {} });
-    if (!res.ok) { toast('could not open artifact', true); return; }
-    const blob = await res.blob();
-    const name = target.replace(/\\/g, '/').split('/').pop()
-      || /filename="([^"]+)"/i.exec(res.headers.get('content-disposition') || '')?.[1] || 'Attachment';
-    // Readable text (markdown, plain text, CSV, JSON) opens in the in-page reader.
-    const kind = artifactTextKind(res.headers.get('content-type') || '', name);
-    if (kind) {
-      showArtifactReader(await blob.text(), kind, name, blob);
-      return;
-    }
-    if (ACTIVE_ARTIFACT.test(blob.type)) {
-      // `noopener` would hide whether a popup blocker stopped the window.
-      const opened = window.open(url, '_blank');
-      if (opened) { opened.opener = null; return; }
-    }
-    const obj = URL.createObjectURL(blob);
-    if (RENDERABLE_ARTIFACT.test(blob.type)) window.open(obj, '_blank', 'noopener');
-    else {
-      const a = document.createElement('a');
-      a.href = obj; a.download = name; a.rel = 'noopener';
-      document.body.appendChild(a); a.click(); a.remove();
-    }
-    setTimeout(() => URL.revokeObjectURL(obj), 60_000);
-  } catch (e) { toast(e.message, true); }
+
+// A type the viewer cannot show downloads natively from its signed URL: the
+// browser's own download shows progress and needs no copy in this page. A HEAD
+// first turns a missing or expired file into a toast instead of a failed
+// entry in the browser's downloads.
+async function downloadArtifact({ url, name }) {
+  const head = await fetch(url, { method: 'HEAD' }).catch(() => null);
+  if (!head?.ok) throw new Error(`Could not download ${name}`);
+  const anchor = document.createElement('a');
+  anchor.href = url; anchor.download = name; anchor.rel = 'noopener';
+  document.body.appendChild(anchor); anchor.click(); anchor.remove();
+}
+
+// Open what `POST /review-action` resolved: `{ url, name, mediaType, bytes? }`,
+// a signed URL that needs no header. Failures throw, for the caller's toast.
+async function openArtifact(resolved, refresh) {
+  const name = resolved.name || 'Attachment';
+  const view = artifactView(resolved.mediaType, name);
+  if (!view || ((view === 'markdown' || view === 'text') && resolved.bytes > ARTIFACT_TEXT_PREVIEW_BYTES))
+    return downloadArtifact({ url: resolved.url, name });
+  if (view !== 'markdown' && view !== 'text') return showArtifactViewer({ name, url: resolved.url, view, refresh });
+  const res = await feedbackFetch(resolved.url);
+  if (!res.ok) throw new Error(`Could not open ${name}`);
+  if (Number(res.headers.get('content-length')) > ARTIFACT_TEXT_PREVIEW_BYTES) {
+    res.body?.cancel().catch(() => {});
+    return downloadArtifact({ url: resolved.url, name });
+  }
+  return showArtifactViewer({ name, url: resolved.url, view, text: await res.text() });
 }
 // Approve ONE branch of a multi-PR task. It records that this branch has been
 // reviewed at the commit it is on now; `confirm` still passes the gate.
@@ -11155,8 +11205,9 @@ function wireReviewActions(v) {
       const kind = btn.getAttribute('data-kind');
       btn.disabled = true;
       try {
-        const r = await api(`/api/tasks/${v.taskId}/review-action`, { method: 'POST', body: JSON.stringify({ index: idx }) });
-        if (kind === 'open') { await openArtifact(r.url, r.external, v.reviewInfo?.actions?.[idx]?.target); return; }
+        const resolve = () => api(`/api/tasks/${v.taskId}/review-action`, { method: 'POST', body: JSON.stringify({ index: idx }) });
+        const r = await resolve();
+        if (kind === 'open') { await openArtifact(r, resolve); return; }
         if (kind === 'payment') {
           toast(r.result?.status === 'granted' ? `Spend approved${r.resumed ? ' — task continuing' : ''}` : r.result?.reason || 'Spend request updated',
             r.result?.status === 'denied');

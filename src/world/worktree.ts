@@ -14,7 +14,7 @@ import { expandPath } from '../util/expand.js';
 import { openLocalPty, startLocalProcess, runLocalCommand } from './local-execution.js';
 import { addCheckoutWith } from './checkout.js';
 import { materializeGitCredential } from './git-credential.js';
-import { readRegularFilePrefix } from './file-prefix.js';
+import { readRegularFilePrefix, regularFileSize } from './file-prefix.js';
 import { taskBranch } from '../domain/brand.js';
 
 const pexec = promisify(execFile);
@@ -474,9 +474,11 @@ class WorktreeWorld implements World {
     return readRegularFilePrefix(this.filePath(relPath), maxBytes);
   }
 
-  async *readFileStream(relPath: string): AsyncGenerator<Buffer> {
-    for await (const chunk of fs.createReadStream(this.filePath(relPath))) yield chunk as Buffer;
+  async *readFileStream(relPath: string, range?: { start: number; end: number }): AsyncGenerator<Buffer> {
+    for await (const chunk of fs.createReadStream(this.filePath(relPath), range ?? {})) yield chunk as Buffer;
   }
+
+  fileSize(relPath: string): Promise<number> { return regularFileSize(this.filePath(relPath)); }
 
   async writeFile(relPath: string, content: string): Promise<void> {
     const abs = this.filePath(relPath);
