@@ -10215,17 +10215,18 @@ function landOnLatestAnswer(thread) {
   const above = answer.getBoundingClientRect().top - thread.getBoundingClientRect().top;
   if (above < 0) thread.scrollTop += above - 12;
 }
-// Which folds of a conversation a person opened or closed, for this session.
-function wireConversationFolds(thread) {
-  if (!thread || thread.foldsWired) return;
-  thread.foldsWired = true;
-  thread.addEventListener('toggle', (event) => {
-    const fold = event.target;
-    if (!fold.matches?.('details[data-fold]')) return;
-    const key = `${thread.dataset.taskId}/${thread.dataset.role}`;
+// Which folds of a conversation a person opened or closed, for this session:
+// read from the page just before it is drawn again (a fold differing from how
+// it was drawn was toggled), never from toggle events, which a refresh can
+// outrun by replacing the fold first.
+function rememberConversationFolds(thread) {
+  if (!thread) return;
+  const key = `${thread.dataset.taskId}/${thread.dataset.role}`;
+  for (const fold of thread.querySelectorAll('details[data-fold]')) {
+    if (fold.open === (fold.dataset.drawnOpen === '1')) continue;
     S.conversationFolds = S.conversationFolds || {};
     S.conversationFolds[key] = { ...(S.conversationFolds[key] || {}), [fold.dataset.fold]: fold.open };
-  }, true);
+  }
 }
 function restoreConversationScroll(thread, state) {
   if (!state || state.atBottom) { thread.scrollTop = thread.scrollHeight; return; }
@@ -10388,6 +10389,7 @@ function renderTaskPage() {
   // A conversation pins to the bottom (latest message) — keep it pinned across
   // re-renders unless the user has scrolled up to read history.
   const threadScroll = captureConversationScroll(prevThread);
+  rememberConversationFolds(prevThread);
   // Changed messages may replace selected nodes; preserve the selection even
   // when the selected message cannot be retained.
   // Snapshot the selection as character offsets and re-apply it after the swap —
@@ -10467,7 +10469,6 @@ function renderTaskPage() {
   if (thread) restoreConversationScroll(thread, retainedThread ? threadScroll : null);
   if (thread && !retainedThread) landOnLatestAnswer(thread);
   if (thread) {
-    wireConversationFolds(thread);
     restoreThreadSelection(thread, threadSel);
     wireMessageCopies(thread);
     typesetMath(thread);
@@ -12003,7 +12004,7 @@ function conversationPane(v, t) {
   const land = !working && last && (last.reply || last.entry.type === 'input-request') ? last : null;
   const opened = S.conversationFolds?.[`${v.taskId}/${t.role}`] || {};
   const msgs = historyStatus + (outline.map((item) => item.fold
-    ? `<details class="conv-fold${item.automatic ? ' automatic' : ''}" data-conversation-key="${esc(item.key)}" data-fold="${esc(item.key)}"${opened[item.key] ?? item.live ? ' open' : ''}>${conversationFoldHead(item)}<div class="fold-body">${item.entries.map((entry) => row(entry)).join('')}</div></details>`
+    ? `<details class="conv-fold${item.automatic ? ' automatic' : ''}" data-conversation-key="${esc(item.key)}" data-fold="${esc(item.key)}" data-drawn-open="${opened[item.key] ?? item.live ? '1' : '0'}"${opened[item.key] ?? item.live ? ' open' : ''}>${conversationFoldHead(item)}<div class="fold-body">${item.entries.map((entry) => row(entry)).join('')}</div></details>`
     : row(item.entry, item === land ? ' data-land' : '')).join('')
     || (historyStatus ? '' : '<div class="msg system">No messages yet</div>'));
   const draft = (S.followupDrafts || {})[`${v.taskId}/${t.role}`] || '';

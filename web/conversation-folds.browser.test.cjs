@@ -62,6 +62,9 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     assert.equal(await thread.getByText('Moving to a larger machine.').isVisible(), false, 'progress notes are folded away');
 
     // Opened, tavya's prompt is labelled as tavya's, not as yours.
+    // What the reader opened must not depend on when the browser delivers the
+    // toggle event: a refresh can replace the fold before it arrives (CI #2141).
+    await page.evaluate(() => window.addEventListener('toggle', (event) => event.stopImmediatePropagation(), true));
     await repairs.locator('summary').click();
     const prompt = repairs.locator('.msg.platform', { hasText: 'conflicts with the latest target' });
     await prompt.waitFor();
