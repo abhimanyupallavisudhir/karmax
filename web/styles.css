@@ -3835,6 +3835,15 @@ input.toggle:disabled { opacity:.45; cursor:not-allowed; }
 .pe-new input.toggle { flex:none; min-width:0; }
 .triggers-block label[for="ev-type"] { align-self:start; padding-top:8px; }
 
+/* Task store rows (the Task store view and the default view's recommendations):
+   ready-made tasks, not tasks of the project, so a row is not a link. */
+.store-row { cursor: default; }
+.store-row:active { transform: none; }
+.store-recs .task-group-heading { margin-top: 8px; font-size: 15px; }
+.store-recs .task-group-heading a { color: inherit; text-decoration: underline; text-decoration-color: var(--line-strong); text-underline-offset: 3px; }
+.store-recs #store-recs-dismiss { margin-left: auto; align-self: center; }
+.store-recs { margin-bottom: 24px; }
+
 /* ── Save state ─────────────────────────────────────────────────────────────
    One note for every form whose edits wait to be saved: beside its Save
    button (settings cards, task Parameters) and, quieter, in the task form

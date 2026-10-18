@@ -156,6 +156,7 @@ const S = {
   fields: [], // searchable-field registry (drives the filter/sort/group menus)
   searchResult: null, // { tasks, groups, total } from the last server evaluation
   searchFailed: false, // last evaluation errored — distinct from "nothing matched"
+  searchRefusal: '', // …because the server refused it (4xx), in the server's words
   searchPending: false, // a new query is being evaluated; the list labels its interim local preview
   wsOnline: true, // live socket up; false shows the topbar "Reconnecting" pill
   orgProjectId: null, // which project S.tags/S.views were loaded for (staleness guard)
@@ -4250,6 +4251,8 @@ async function boot() {
   const session = await sessionRead;
   // Account email (confirmation, password reset) only when the installation can send it.
   S.emailDelivery = session.emailDelivery === true;
+  // Preferences that follow the person to every device (GET|PATCH /api/user/preferences).
+  if (session.preferences) S.preferences = session.preferences;
   S.sso = session.sso || null;
   S.google = session.google || false;
   S.github = session.github || false;
@@ -4671,6 +4674,8 @@ async function runSearch() {
   const scopeOf = () => (S.tab === 'inbox' ? 'all' : S.tab === 'home' ? `org:${S.organizationId}` : S.projectId);
   const scope = scopeOf();
   if (S.tab === 'home' ? !organizationId : S.tab !== 'inbox' && !projectId) return false;
+  const store = taskStoreForQuery();
+  if (store) { S.searchPending = false; S.searchFailed = false; return store; }
   const isCurrent = () => scopeOf() === scope;
   const q = effectiveQuery(S.search); // adds the default -is:run -is:subtask unless overridden
   const epoch = S.searchEpoch = (S.searchEpoch || 0) + 1;
@@ -4696,13 +4701,15 @@ async function runSearch() {
     S.searchFailed = false;
     S.searchPending = false;
     return true;
-  } catch {
+  } catch (error) {
     // Distinguish "the server couldn't evaluate this" from "nothing matched".
     // Without the flag the view falls back to a client-side filter and shows
     // "No matching tasks", so a server outage reads as a bad query and the user
-    // edits a perfectly good one.
+    // edits a perfectly good one. A refusal (4xx) is the server's answer, not an
+    // outage: it is shown in the server's words, with no retry.
     if (S.searchEpoch === epoch && isCurrent()) {
       S.searchResult = null; S.searchFailed = true; S.searchPending = false;
+      S.searchRefusal = error?.status >= 400 && error.status < 500 ? String(error.message || `HTTP ${error.status}`) : '';
     }
     return false;
   }
@@ -6119,9 +6126,15 @@ const BUILTIN_VIEWS = [
 const ACTIVE_VIEW_QUERY = '-is:archived';
 const ACTIVE_VIEW = '__active__'; // the chip for every task that isn't archived
 const FOR_ME_VIEW = '__for_me__'; // the default chip: what waits on you
+// The task store lists ready-made tasks, not the project's: the console answers
+// `is:store` itself (the rest of the query filters the store by its words).
+const STORE_VIEW = '__store__';
+const STORE_VIEW_QUERY = 'is:store';
+function isStoreQuery(q) { return /(^|\s)is:store(\s|$)/i.test(q || ''); }
 function viewIdForQuery(q) {
   const s = normalizeQuery(q);
   if (!s) return null;
+  if (isStoreQuery(s)) return STORE_VIEW;
   if (s === normalizeQuery(ACTIVE_VIEW_QUERY)) return ACTIVE_VIEW;
   if (s === normalizeQuery(DEFAULT_LIST_QUERY)) return FOR_ME_VIEW;
   return BUILTIN_VIEWS.find((v) => normalizeQuery(v.query) === s)?.id
@@ -6144,13 +6157,14 @@ async function loadOrgViews(organizationId = S.organizationId) {
   S.orgViewsFor = organizationId;
 }
 
-// Every view chip of the list in its order — For me, Active, the built-ins, then
-// the saved ones. Their position is their number: `v 1` … `v 9`.
+// Every view chip of the list in its order — For me, Active, the built-ins, the
+// Task store, then the saved ones. Their position is their number: `v 1` … `v 9`.
 function listViewChips(tab = S.tab) {
   return [
     { id: FOR_ME_VIEW, name: 'For me', query: DEFAULT_LIST_QUERY },
     { id: ACTIVE_VIEW, name: 'Active', query: ACTIVE_VIEW_QUERY },
     ...BUILTIN_VIEWS,
+    ...(tab === 'inbox' ? [] : [{ id: STORE_VIEW, name: 'Task store', query: STORE_VIEW_QUERY }]),
     ...savedViews(tab).map((v) => ({ id: v.id, name: v.name, icon: v.icon, query: stringifyQuery(v.query || {}), saved: true })),
   ];
 }
@@ -6163,11 +6177,12 @@ function listViewChips(tab = S.tab) {
 // Its number (`v 1`…`v 9`) shows on it while `v` is held down as a chord prefix.
 function viewsBar() {
   const active = viewIdForQuery(S.search);
-  const title = { [FOR_ME_VIEW]: 'Waiting on you: reviews, questions, approvals, mentions — and your drafts' };
+  const title = { [FOR_ME_VIEW]: 'Waiting on you: reviews, questions, approvals, mentions — and your drafts',
+    [STORE_VIEW]: 'Ready-made tasks: run one now, or install one that runs itself' };
   const chips = listViewChips().map((v, i) => {
     const label = `${v.icon ? esc(v.icon) + ' ' : ''}${esc(v.name)}${v.saved ? `<span class="view-x" data-delview="${esc(v.id)}" title="Delete view">✕</span>` : ''}`;
     const tip = title[v.id] || (v.saved ? '' : v.query);
-    return `<a class="view-chip${BUILTIN_VIEWS.includes(v) ? ' builtin' : ''}${active === v.id ? ' active' : ''}" data-view="${esc(v.id)}" href="${esc(listQueryRoute(v.query))}"${tip ? ` title="${esc(tip)}"` : ''}${i < 9 ? ` data-shortcut="view.${i + 1}"` : ''}>${label}</a>`;
+    return `<a class="view-chip${BUILTIN_VIEWS.includes(v) || v.id === STORE_VIEW ? ' builtin' : ''}${active === v.id ? ' active' : ''}" data-view="${esc(v.id)}" href="${esc(listQueryRoute(v.query))}"${tip ? ` title="${esc(tip)}"` : ''}${i < 9 ? ` data-shortcut="view.${i + 1}"` : ''}>${label}</a>`;
   }).join('');
   // Saving is offered once the query is not already a view.
   const save = canSaveViews() && S.search.trim() && !active
@@ -6178,6 +6193,7 @@ function viewsBar() {
 // The query a view chip stands for ('' for an unknown id).
 function viewQuery(id) {
   if (id === ACTIVE_VIEW) return ACTIVE_VIEW_QUERY;
+  if (id === STORE_VIEW) return STORE_VIEW_QUERY;
   if (id === FOR_ME_VIEW) return DEFAULT_LIST_QUERY;
   const builtin = BUILTIN_VIEWS.find((x) => x.id === id);
   if (builtin) return builtin.query;
@@ -6312,8 +6328,11 @@ function tasksView() {
   const groups = r && r.groups ? r.groups : null;
   const count = flat.length;
   const notices = inboxNoticesHtml();
+  const store = isStoreQuery(S.search);
   let body;
-  if (groups) {
+  if (store) {
+    body = storeViewHtml();
+  } else if (groups) {
     body = r.hierarchical
       ? [
         ...(groups.find((g) => g.key === '__untagged__')?.tasks || []).filter(topLevel).map((t) => row(t, { showTags: false })),
@@ -6327,7 +6346,9 @@ function tasksView() {
     body = flat.map((t) => row(t)).join('');
   }
   const empty = S.searchFailed
-    ? `<div class="empty"><div class="big">Search didn’t run</div>Couldn’t reach the server. <button class="btn sm" id="retry-search">Try again</button></div>`
+    ? `<div class="empty"><div class="big">Search didn’t run</div>${S.searchRefusal
+      ? esc(S.searchRefusal.replace(/[.!]?$/, '.'))
+      : 'Couldn’t reach the server. <button class="btn sm" id="retry-search">Try again</button>'}</div>`
     : !r && S.searchPending ? ''
     : viewIdForQuery(S.search) === FOR_ME_VIEW
       ? (notices ? '' : `<div class="empty for-me-empty"><div class="big">All clear</div>Nothing is waiting on you.</div>`)
@@ -6353,13 +6374,13 @@ function tasksView() {
         <span class="search-ic">⌕</span>
         <input id="task-search" class="task-search" data-shortcut="nav.search" spellcheck="false" autocomplete="off" value="${esc(S.search)}"
           placeholder="Search tasks" aria-label="Search and filter tasks" />
-        ${S.searchPending ? '<span class="search-pending" role="status">Searching…</span>' : `<span class="search-count">${count} task${count === 1 ? '' : 's'}</span>`}
+        ${S.searchPending ? '<span class="search-pending" role="status">Searching…</span>' : store ? '' : `<span class="search-count">${count} task${count === 1 ? '' : 's'}</span>`}
         ${policyTip('Type words to search, or filters: status:active  -tag:bug  priority:>=2  group:stage  sort:updated-desc')}
         ${S.search ? `<button class="search-x" id="q-clear" title="Clear (Esc)">✕</button>` : ''}
       </div>
       <div class="organizer-row">${viewsBar()}${queryToolbarHtml(S.search || '', 'q', trailing)}</div>
     </div>
-    ${notices}${body || empty}`;
+    ${notices}${storeRecsHtml()}${store ? body : body || empty}`;
 }
 
 // The organization home's project filter: a `project:` clause in the query, so
@@ -6381,6 +6402,112 @@ function queryProjectSlug(q) {
 function setProjectClause(q, slug) {
   const rest = (q || '').replace(/(?:^|\s)project:("[^"]*"|\S+)/g, '').replace(/\s+/g, ' ').trim();
   return slug ? addClause(rest, 'project', slug) : rest;
+}
+
+// ── Task store: ready-made tasks (src/domain/task-store.ts) ──────────────────
+// An ordinary one runs at once; a repeatable one installs as a series, and is on
+// offer again once that series is deleted. On the organization home they go to
+// the project a new task would.
+function storeProjectId() {
+  return S.tab === 'home' ? newTaskProjectId() : S.tab === 'inbox' ? null : S.projectId;
+}
+// Fetches a project's store (at most one request at a time); resolves whether it changed.
+async function loadTaskStore(projectId, { force = false } = {}) {
+  if (!projectId) return false;
+  S.taskStore ||= {};
+  S.taskStoreLoading ||= {};
+  if (S.taskStore[projectId] && !force) return false;
+  if (S.taskStoreLoading[projectId] && !force) return S.taskStoreLoading[projectId];
+  const loading = api(`/api/projects/${encodeURIComponent(projectId)}/task-store`)
+    .then(({ tasks }) => { S.taskStore[projectId] = tasks || []; return true; })
+    .catch(() => false)
+    .finally(() => { if (S.taskStoreLoading[projectId] === loading) delete S.taskStoreLoading[projectId]; });
+  S.taskStoreLoading[projectId] = loading;
+  return loading;
+}
+
+const STORE_NEEDS = { github: ['Needs GitHub', 'Connect a GitHub repository to this project first'], chat: ['Needs a chat bot', 'Connect a chat bot to this project first'] };
+function storeRowHtml(item) {
+  const installed = item.repeatable && item.installed?.length;
+  const need = !installed && item.missing?.length ? STORE_NEEDS[item.missing[0]] : null;
+  const disabled = need ? ` disabled title="${esc(need[1])}"` : '';
+  const action = installed
+    ? `<a class="btn sm" data-spa href="${esc(taskUrl(item.installed[0], { projectId: storeProjectId() }))}">Open</a>`
+    : item.repeatable
+      ? `<button class="btn sm" data-store-run="${esc(item.id)}"${disabled}>Install</button>`
+      : `<button class="btn sm primary" data-store-run="${esc(item.id)}"${disabled}>Run</button>`;
+  return `<div class="task-row store-row" data-store-task="${esc(item.id)}">
+      <div class="task-main">
+        <div class="task-title">${esc(item.name)} ${item.summary ? policyTip(item.summary) : ''}</div>
+        <div class="task-sub">${item.repeatable ? `<span class="chip">${installed ? 'installed' : 'repeatable'}</span>` : ''}${need ? `<span>${esc(need[0])}</span>` : ''}</div>
+      </div>
+      <div class="task-right">${action}</div>
+    </div>`;
+}
+// The store's rows the query's words match (name or summary).
+function storeViewHtml() {
+  const projectId = storeProjectId();
+  const items = S.taskStore?.[projectId];
+  if (!projectId) return '<div class="empty"><div class="big">No project yet</div>Create a project to run tasks from the store.</div>';
+  if (!items) return '';
+  const words = (S.search || '').replace(/(^|\s)-?[\w.#-]+:\S*/g, ' ').toLowerCase().split(/\s+/).filter(Boolean);
+  const shown = items.filter((item) => words.every((word) => `${item.name} ${item.summary}`.toLowerCase().includes(word)));
+  return shown.length ? shown.map(storeRowHtml).join('') : `<div class="empty"><div class="big">Nothing matches</div>No ready-made task matches <code>${esc(S.search)}</code>.</div>`;
+}
+// The Task store view is not a search of tasks: it loads the store (a promise
+// in place of the search). The default view loads it alongside, to recommend from.
+function taskStoreForQuery() {
+  if (isStoreQuery(S.search)) return loadTaskStore(storeProjectId(), { force: true });
+  if (viewIdForQuery(S.search) === FOR_ME_VIEW && !storeRecsDismissed(storeProjectId()))
+    Promise.all([loadTaskStore(storeProjectId()), loadPreferences()])
+      .then((changed) => { if (changed.some(Boolean) && isTaskListTab() && !S.selected) bgRenderMain(); });
+  return null;
+}
+// The default view recommends what the project has not taken from the store yet,
+// until the person dismisses it there; the dismissal is theirs on every device.
+// Preferences come with the session; a session without them reads them once.
+async function loadPreferences() {
+  if (S.preferences) return false;
+  S.preferences = await api('/api/user/preferences').catch(() => null);
+  return !!S.preferences;
+}
+const storeRecsKey = (projectId) => `task-store:${projectId}`;
+function storeRecsDismissed(projectId) {
+  return !!S.preferences?.dismissed?.includes(storeRecsKey(projectId));
+}
+async function dismissStoreRecs(projectId) {
+  const before = S.preferences;
+  S.preferences = { ...before, dismissed: [...(before?.dismissed || []), storeRecsKey(projectId)] };
+  renderMain();
+  try { S.preferences = await api('/api/user/preferences', { method: 'PATCH', body: JSON.stringify({ dismiss: [storeRecsKey(projectId)] }) }); }
+  catch (e) { S.preferences = before; toast(e.message, true); renderMain(); }
+}
+function storeRecsHtml() {
+  const projectId = storeProjectId();
+  if (S.tab === 'inbox' || viewIdForQuery(S.search) !== FOR_ME_VIEW || !projectId || !S.preferences || storeRecsDismissed(projectId)) return '';
+  const items = (S.taskStore?.[projectId] || []).filter((item) => !item.installed?.length);
+  if (!items.length) return '';
+  return `<section class="store-recs">
+      <h2 class="task-group-heading"><span>Recommended from the <a href="${esc(listQueryRoute(STORE_VIEW_QUERY))}" data-store-view>Task store</a></span><button class="btn sm ghost" id="store-recs-dismiss">Dismiss</button></h2>
+      ${items.map(storeRowHtml).join('')}
+    </section>`;
+}
+function wireTaskStore() {
+  const main = $('#main');
+  const projectId = storeProjectId();
+  main.querySelectorAll('a[data-store-view]').forEach((a) => a.addEventListener('click', plainClick(() => setQuery(STORE_VIEW_QUERY))));
+  $('#store-recs-dismiss')?.addEventListener('click', () => dismissStoreRecs(projectId));
+  main.querySelectorAll('[data-store-run]').forEach((button) => button.addEventListener('click', async () => {
+    const item = (S.taskStore?.[projectId] || []).find((candidate) => candidate.id === button.dataset.storeRun);
+    button.disabled = true;
+    try {
+      const task = await api(`/api/projects/${encodeURIComponent(projectId)}/task-store/${encodeURIComponent(button.dataset.storeRun)}`, { method: 'POST', body: '{}' });
+      await loadTaskStore(projectId, { force: true });
+      refreshTasks();
+      if (item?.repeatable) { toast('Installed'); renderMain(); }
+      else go(taskUrl(task.id, task));
+    } catch (e) { button.disabled = false; showTaskError(e, projectId); }
+  }));
 }
 
 // Why a row is in a `for:` list, from the inbox kind of the ask, most pressing first.
@@ -7276,6 +7403,7 @@ function openTagsManager(initialEditId = null) {
 
 function wireTasksView() {
   wireOrgControls();
+  wireTaskStore();
   scrollToHashedTagSection();
   $('#main').querySelectorAll('[data-edit-tag]').forEach((button) =>
     button.addEventListener('click', (ev) => {
@@ -7330,7 +7458,7 @@ function wireTasksView() {
     b.addEventListener('click', (ev) => { ev.stopPropagation(); S.expandedSeries ||= new Set(); const id = b.dataset.expand; S.expandedSeries.has(id) ? S.expandedSeries.delete(id) : S.expandedSeries.add(id); renderMain(); }),
   );
   $('#main').querySelectorAll('[data-delseries]').forEach((b) =>
-    b.addEventListener('click', async (ev) => { ev.stopPropagation(); if (!confirm('Delete this repeatable task? Its past runs are kept.')) return; try { await api(`/api/tasks/${b.dataset.delseries}`, { method: 'DELETE' }); toast('Repeatable task deleted'); refreshTasks(); } catch (e) { toast(e.message, true); } }),
+    b.addEventListener('click', async (ev) => { ev.stopPropagation(); if (await deleteSeries(b.dataset.delseries)) refreshTasks(); }),
   );
   $('#main').querySelectorAll('[data-series]').forEach((e) => wireTaskNav(e, () => e.dataset.series));
   const setArchived = async (id, archived) => {
@@ -7590,8 +7718,19 @@ function consumingField(fields) {
   );
 }
 
+// A series never ran a workflow of its own, so it is deleted like a draft; its
+// runs stay as ordinary tasks, and the task store offers it again.
+async function deleteSeries(id) {
+  if (!confirm('Delete this repeatable task? Its past runs are kept.')) return false;
+  const projectId = taskRecord(id)?.projectId;
+  if (!(await deleteDraft(id))) return false;
+  if (projectId) delete S.taskStore?.[projectId];
+  toast('Repeatable task deleted');
+  return true;
+}
+
 async function deleteDraft(id) {
-  // Drafts never started a workflow, so the record is hard-deleted server-side.
+  // A draft (or series) never started a workflow, so the record is hard-deleted server-side.
   // A 404 means it's already gone (e.g. a racing double-delete) — treat that as
   // success rather than surfacing a confusing "no such task" error.
   // Returns whether the draft is gone, so the caller doesn't announce success
@@ -9167,8 +9306,8 @@ async function renderSeriesPage(rec) {
       </div></div>
       <div class="tp-foot" id="tp-foot"><div class="tp-foot-inner">
         <button class="btn" id="sd-runagain">Run again</button>
-        ${rec.params?.triggers?.length ? `<button class="btn ghost" id="sd-save-automation" title="Let every project in this organization add it from its automations">Save as automation</button>` : ''}
         <span style="flex:1"></span>
+        <button class="btn danger" id="sd-delete">Delete</button>
         <button class="btn primary" id="sd-save">Save changes</button>
       </div></div>
     </div>`;
@@ -9180,13 +9319,7 @@ async function renderSeriesPage(rec) {
   wireScheduleBuilder(values);
   wireEventTrigger(rec.projectId);
   $('#tp-body').querySelectorAll('[data-runopen]').forEach((el) => wireTaskNav(el, () => el.dataset.runopen));
-  $('#sd-save-automation')?.addEventListener('click', async () => {
-    const name = prompt('Name it', rec.title.replace(/\{\{[^}]*\}\}/g, '').trim() || 'Automation');
-    if (!name) return;
-    const organizationId = projectById(rec.projectId)?.organizationId || 'org_personal';
-    try { await api(`/api/organizations/${encodeURIComponent(organizationId)}/automations`, { method: 'POST', body: JSON.stringify({ taskId: rec.id, name }) }); toast('Saved to the gallery'); }
-    catch (e) { toast(e.message, true); }
-  });
+  $('#sd-delete').addEventListener('click', async () => { if (await deleteSeries(rec.id)) { closeTask(); refreshTasks(); } });
   $('#sd-runagain').addEventListener('click', async () => {
     try { await api(`/api/tasks/${rec.id}/run-again`, { method: 'POST', body: '{}' }); toast('New run started'); closeTask(); refreshTasks(); }
     catch (e) { toast(e.message, true); }
@@ -16883,25 +17016,7 @@ function eventSourceLabel(source, hooks) {
   return esc(source);
 }
 
-const AUTOMATION_NEEDS = { github: ['Needs GitHub', 'Connect a GitHub repository to this project first'], chat: ['Needs a chat bot', 'Connect a chat bot below first'] };
-
-// Ready-made repeatable tasks: adding one creates an ordinary task you can edit.
-function automationsHtml(automations) {
-  const row = (a) => {
-    const need = a.missing?.length && !a.installed.length ? AUTOMATION_NEEDS[a.missing[0]] : null;
-    const action = a.installed.length
-      ? `<a class="btn sm ghost" data-pe-task="${esc(a.installed[0])}" data-spa href="${esc(taskUrl(a.installed[0]))}">Open</a>`
-      : `<button class="btn sm" data-auto-install="${esc(a.id)}"${need ? ` disabled title="${esc(need[1])}"` : ''}>Add</button>`;
-    return `<div class="setting-row" data-automation="${esc(a.id)}">
-    <span class="setting-label">${esc(a.name)} ${policyTip(a.summary || '')}</span>
-    <span class="setting-value setting-muted">${a.installed.length ? 'On' : need ? esc(need[0]) : ''}</span>
-    <span class="setting-actions">${action}${a.builtIn ? '' : `<button class="btn sm ghost" data-auto-delete title="Remove from the gallery">✕</button>`}</span></div>`;
-  };
-  return `<div class="section-h">Automations ${policyTip('Ready-made tasks that start themselves. Adding one creates a repeatable task you can change like any other. Save your own from a repeatable task’s page.')}</div>
-    <div class="setting-rows">${automations.map(row).join('')}</div>`;
-}
-
-function projectEventsHtml(projectId, list, events, automations = []) {
+function projectEventsHtml(projectId, list, events) {
   const hooks = list.webhooks || [];
   const health = (h) => h.lastError && (!h.lastDeliveryAt || h.lastError.at > h.lastDeliveryAt)
     ? `<span class="warn" title="${esc(h.lastError.message)}">Refused one ${fmtAgo(h.lastError.at)}</span>`
@@ -16915,7 +17030,7 @@ function projectEventsHtml(projectId, list, events, automations = []) {
     <span class="setting-value">${eventSourceLabel(e.source, hooks)}${e.subject ? ` · ${/^https?:/.test(e.subject) ? `<a href="${esc(e.subject)}" target="_blank" rel="noopener">${esc(e.subject.replace(/^https?:\/\/(www\.)?/, '').slice(0, 60))}</a>` : esc(e.subject.slice(0, 60))}` : ''}<span class="setting-sep">·</span>${eventOutcome(e)}</span>
     <span class="setting-actions setting-muted">${fmtAgo(e.receivedAt)}</span></summary>
     <pre class="pe-payload">${esc(JSON.stringify(e.payload, null, 2))}</pre></details>`;
-  return `${automationsHtml(automations)}<div class="section-h section-h-action"><span>Sources</span><span class="pe-add">
+  return `<div class="section-h section-h-action"><span>Sources</span><span class="pe-add">
       <button class="btn sm ghost" data-pe-new="webhook">＋ Webhook</button><button class="btn sm ghost" data-pe-new="chat">＋ Chat bot</button></span></div>
     <div id="pe-form"></div>
     <div class="setting-rows">${hooks.map(sourceRow).join('')}
@@ -16951,22 +17066,11 @@ async function hydrateProjectEvents(proj) {
   if (!box) return;
   const base = `/api/projects/${encodeURIComponent(proj.id)}`;
   const load = async () => {
-    let list, events, automations;
+    let list, events;
     try {
-      [list, events, { automations }] = await Promise.all([api(`${base}/webhooks`), api(`${base}/events?limit=25`), api(`${base}/automations`)]);
+      [list, events] = await Promise.all([api(`${base}/webhooks`), api(`${base}/events?limit=25`)]);
     } catch (e) { return paneError(box, e, load); }
-    box.innerHTML = projectEventsHtml(proj.id, list, events, automations);
-    box.querySelectorAll('[data-auto-install]').forEach((b) => b.addEventListener('click', async () => {
-      b.disabled = true;
-      try { await api(`${base}/automations/${encodeURIComponent(b.dataset.autoInstall)}`, { method: 'POST', body: '{}' }); toast('Added'); refreshTasks(); load(); }
-      catch (e) { toast(e.message, true); b.disabled = false; }
-    }));
-    box.querySelectorAll('[data-auto-delete]').forEach((b) => b.addEventListener('click', async () => {
-      const row = b.closest('[data-automation]');
-      if (!confirm(`Remove “${row.querySelector('.setting-label').textContent.trim()}” from the gallery? Tasks already made from it stay.`)) return;
-      try { await api(`/api/organizations/${encodeURIComponent(proj.organizationId || 'org_personal')}/automations/${encodeURIComponent(row.dataset.automation)}`, { method: 'DELETE' }); load(); }
-      catch (e) { toast(e.message, true); }
-    }));
+    box.innerHTML = projectEventsHtml(proj.id, list, events);
     const form = $('#pe-form');
     const copy = async (value) => { await copyToClipboard(value); toast('Copied'); };
     box.querySelectorAll('[data-hook-copy]').forEach((b) => b.addEventListener('click', () => copy(b.dataset.hookCopy)));
@@ -16998,9 +17102,11 @@ async function hydrateProjectEvents(proj) {
         button.disabled = true;
         try {
           const created = await api(`${base}/webhooks`, { method: 'POST', body: JSON.stringify({ name: `${CHAT_PLATFORM_LABELS[kind]} bot`, kind, credentials }) });
-          // The gallery's chat automation; a project that already has it keeps it.
-          if ($('#pe-starts')?.checked && !automations.find((a) => a.id === 'chat-requests')?.installed.length)
-            await api(`${base}/automations/chat-requests`, { method: 'POST', body: '{}' });
+          // The task store's chat automation; a project that already has it keeps it.
+          if ($('#pe-starts')?.checked && !(await api(`${base}/task-store`)).tasks.find((t) => t.id === 'chat-requests')?.installed.length) {
+            await api(`${base}/task-store/chat-requests`, { method: 'POST', body: '{}' });
+            delete S.taskStore?.[proj.id];
+          }
           if (created.verifyToken) { form.innerHTML = revealHtml([['Callback URL', created.url], ['Verify token', created.verifyToken]]); wireForm(); }
           else { toast(`${CHAT_PLATFORM_LABELS[kind]} bot connected`); load(); }
         } catch (err) { toast(err.message, true); button.disabled = false; }

@@ -23,6 +23,7 @@ const { fakeConsole, launch, reply } = require('../tests/helpers/fake-console.cj
       }
       if (p === '/api/projects/p/search') {
         if (searchDelay) await new Promise(resolve => setTimeout(resolve, searchDelay));
+        if (failSearch === 403) return reply(403, { error: 'You are not a member of this organization' });
         if (failSearch) return reply(503, { error: 'Search temporarily unavailable' });
       }
     } });
@@ -63,6 +64,13 @@ const { fakeConsole, launch, reply } = require('../tests/helpers/fake-console.cj
     failSearch = true;
     await page.locator('#task-search').fill('failure');
     await page.getByText(/Search didn.t run/).first().waitFor();
+    await page.getByText(/Couldn.t reach the server/).first().waitFor();
+    // A refusal is the server's answer, not an outage: say why, offer no retry.
+    failSearch = 403;
+    await page.locator('#task-search').fill('refused');
+    await page.getByText('You are not a member of this organization.').first().waitFor();
+    assert.equal(await page.getByText(/Couldn.t reach the server/).count(), 0, 'a refusal is not reported as unreachable');
+    assert.equal(await page.locator('#retry-search').count(), 0, 'retrying a refusal cannot help');
     failSearch = false;
     await page.getByRole('button', { name: 'New task…', exact: true }).click();
     const draft = '世界 <img src=x onerror=alert(1)> ' + 'long draft '.repeat(200);

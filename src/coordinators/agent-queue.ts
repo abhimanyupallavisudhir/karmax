@@ -5,6 +5,7 @@ import {
   defineSignal,
   defineUpdate,
   getExternalWorkflowHandle,
+  patched,
   proxyActivities,
   setHandler,
   workflowInfo,
@@ -57,7 +58,9 @@ export const cancelAgentSignal = defineSignal<[{ taskId: string; turnId: string 
 export const releaseAgentSignal = defineSignal<[{ taskId: string; turnId: string }]>(SIG_RELEASE_AGENT);
 export const reorderAgentSignal = defineSignal<[{ turnId: string; beforeTurnId?: string }]>(SIG_REORDER);
 export const setAgentCapacitySignal = defineSignal<[{ capacity: number }]>(SIG_SET_AGENT_CAPACITY);
-export const waitAgentUpdate = defineUpdate<boolean, [AgentQueueItem]>(UPD_WAIT_AGENT);
+/** `true` granted, `false` cancelled, `null` the queue is continuing as new:
+ *  ask again, the place in the queue is kept. */
+export const waitAgentUpdate = defineUpdate<boolean | null, [AgentQueueItem]>(UPD_WAIT_AGENT);
 export const requestAgentUpdate = defineUpdate<
   { granted: boolean; position: number; capacity: number },
   [AgentQueueItem]
@@ -69,6 +72,10 @@ export const agentQueueId = aqId;
 const LEGACY_CONTINUE_AS_NEW_AFTER = 500;
 const CONTINUE_AS_NEW_AFTER = 50;
 const LEASE_TIMEOUT = '5 minutes';
+/** Runs that record this marker answer parked waiters before continuing as new
+ *  instead of waiting for a moment with none parked. A run started before it
+ *  replays without the marker and keeps the old rule until it rotates. */
+export const AGENT_QUEUE_DRAIN_PATCH = 'agent-queue-drain-waiters-v1';
 const act = proxyActivities<{ isTaskAlive(taskId: string): Promise<boolean> }>({ startToCloseTimeout: '20s' });
 
 /**
@@ -85,6 +92,8 @@ export async function agentQueue(input: { capacity?: number; state?: AgentQueueS
   let processed = input.state?.processed ?? 0;
   let modern = input.state?.modern ?? false;
   let legacyWaiters = 0;
+  const drainsWaiters = patched(AGENT_QUEUE_DRAIN_PATCH);
+  let draining = false;
 
   setHandler(leaseAgentSignal, (item) => {
     if (!current.some((x) => x.turnId === item.turnId) && !queue.some((x) => x.turnId === item.turnId)) queue.push(item);
@@ -116,6 +125,9 @@ export async function agentQueue(input: { capacity?: number; state?: AgentQueueS
   // the Update's idempotent enqueue closes their cross-request ordering race.
   // One accepted Update replaces the former 10Hz consistent-query loop in every
   // waiting activity. Cancellation removes the item and resolves `false`.
+  // A parked handler would fail if the run continued as new under it, so before
+  // rotating the queue answers every one still waiting with `null`; the caller
+  // asks again and finds its item where it was, carried in `queue`.
   setHandler(waitAgentUpdate, async (item) => {
     legacyWaiters++;
     const matches = (candidate: AgentQueueItem) =>
@@ -129,14 +141,16 @@ export async function agentQueue(input: { capacity?: number; state?: AgentQueueS
       await condition(() =>
         current.some(matches)
         || !queue.some(matches)
-        || (current.length < capacity && !!queue[0] && matches(queue[0])),
+        || (current.length < capacity && !!queue[0] && matches(queue[0]))
+        || draining,
       );
       if (!current.some(matches) && queue.some(matches) && current.length < capacity) {
         queue = queue.filter((candidate) => !matches(candidate));
         current.push(item);
         processed++;
       }
-      return current.some(matches);
+      if (current.some(matches)) return true;
+      return draining && queue.some(matches) ? null : false;
     } finally {
       legacyWaiters--;
     }
@@ -166,14 +180,15 @@ export async function agentQueue(input: { capacity?: number; state?: AgentQueueS
   }));
 
   for (;;) {
-    const shouldRotate = () =>
-      modern
-      && legacyWaiters === 0
-      && (processed >= CONTINUE_AS_NEW_AFTER || workflowInfo().continueAsNewSuggested);
-    const ready = () =>
-      (queue.length > 0 && current.length < capacity)
-      || shouldRotate()
-      || (!modern && processed >= LEGACY_CONTINUE_AS_NEW_AFTER && current.length === 0);
+    const rotationDue = () => processed >= CONTINUE_AS_NEW_AFTER || workflowInfo().continueAsNewSuggested;
+    // Before the drain, a run rotated only with no Update parked, which never
+    // happens while turns keep queueing: its history then grew until replays
+    // outlasted the workflow-task timeout and admission stalled.
+    const shouldRotate = () => drainsWaiters
+      ? rotationDue()
+      : (modern && legacyWaiters === 0 && rotationDue())
+        || (!modern && processed >= LEGACY_CONTINUE_AS_NEW_AFTER && current.length === 0);
+    const ready = () => (queue.length > 0 && current.length < capacity) || shouldRotate();
     const changed = current.length ? await condition(ready, LEASE_TIMEOUT) : (await condition(ready), true);
     if (!changed && current.length) {
       // Signals land during the probe (a release shrinks `current`, a grant grows
@@ -184,7 +199,11 @@ export async function agentQueue(input: { capacity?: number; state?: AgentQueueS
       if (dead.size) current = current.filter((item) => !dead.has(item.turnId));
       continue;
     }
-    if (shouldRotate() || (!modern && processed >= LEGACY_CONTINUE_AS_NEW_AFTER && current.length === 0)) {
+    if (shouldRotate()) {
+      if (drainsWaiters) {
+        draining = true;
+        await condition(() => legacyWaiters === 0);
+      }
       await continueAsNew<typeof agentQueue>({
         capacity,
         state: { capacity, queue, current, processed: 0, modern },

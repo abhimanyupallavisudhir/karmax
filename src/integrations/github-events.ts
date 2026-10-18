@@ -1,7 +1,7 @@
 import type { Store } from '../store/db.js';
 import type { KarmaxApi } from '../platform/api.js';
 import type { TokenAuthority } from '../platform/tokens.js';
-import { RECOVERY_PROMPT, RECOVERY_TITLE, RECOVERY_TRIGGER, REPAIR_TEMPLATE_ID } from '../domain/automations.js';
+import { RECOVERY_PROMPT, RECOVERY_TITLE, RECOVERY_TRIGGER, REPAIR_TEMPLATE_ID } from '../domain/task-store.js';
 import { normalizeTriggers } from '../domain/triggers.js';
 import { eventTypeMatches } from '../domain/project-events.js';
 import type { GithubProjectWebhookEvent, GithubWebhookResult } from './github-app.js';
@@ -22,8 +22,8 @@ import type { GithubProjectWebhookEvent, GithubWebhookResult } from './github-ap
 /** The marker that a project has (or had, and deleted) its recovery task. */
 export const recoverySeriesKey = (projectId: string) => `github:recovery-series:${projectId}`;
 
-// The repair task is the gallery's first automation (src/domain/automations.ts).
-export { RECOVERY_PROMPT, RECOVERY_TITLE, RECOVERY_TRIGGER } from '../domain/automations.js';
+// The repair task is one of the task store's automations (src/domain/task-store.ts).
+export { RECOVERY_PROMPT, RECOVERY_TITLE, RECOVERY_TRIGGER } from '../domain/task-store.js';
 
 export class GithubEvents {
   constructor(private deps: { api: Pick<KarmaxApi, 'ingestProjectEvent' | 'createTask'>; store: Store; tokens: TokenAuthority }) {}
