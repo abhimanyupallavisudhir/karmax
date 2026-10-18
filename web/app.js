@@ -6380,7 +6380,7 @@ function tasksView() {
       </div>
       <div class="organizer-row">${viewsBar()}${queryToolbarHtml(S.search || '', 'q', trailing)}</div>
     </div>
-    ${notices}${storeRecsHtml()}${store ? body : body || empty}`;
+    ${notices}${store ? body : body || empty}${storeRecsHtml()}`;
 }
 
 // The organization home's project filter: a `project:` clause in the query, so
