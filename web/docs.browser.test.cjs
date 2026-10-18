@@ -16,13 +16,15 @@ const { fakeConsole, launch } = require('../tests/helpers/fake-console.cjs');
       { slug: 'terms', title: 'Terms of Service', summary: 'The agreement.', version: '1' },
       { slug: 'privacy', title: 'Privacy Policy', summary: 'What we process.', version: '1' },
     ];
-    const launchInfo = { policyVersion: '1', draftNotice: 'Draft.', policies, pricingCatalog: [
-      { id: 'free', name: 'Free', monthlyBasePriceCents: 0, currency: 'usd', maxMembers: 1, maxActiveAgentRuns: 1, storageBytes: 1e9 }] };
-    const open = async (viewport = { width: 1280, height: 800 }) => {
+    // The server omits draftNotice once the operator approves the current policy version.
+    const open = async (viewport = { width: 1280, height: 800 }, { approved = false } = {}) => {
+      const draft = approved ? {} : { draftNotice: 'Draft.' };
+      const launchInfo = { policyVersion: '1', ...draft, policies, pricingCatalog: [
+        { id: 'free', name: 'Free', monthlyBasePriceCents: 0, currency: 'usd', maxMembers: 1, maxActiveAgentRuns: 1, storageBytes: 1e9 }] };
       const context = await browser.newContext({ serviceWorkers: 'block', viewport });
       const { requests } = await fakeConsole(context, { project: { id: 'p', organizationId: 'o', name: 'Website', config: {} }, async api(p) {
         if (p === '/api/launch') return launchInfo;
-        if (p === '/api/legal/terms') return { ...policies[0], effectiveDate: 'Today', draftNotice: 'Draft.',
+        if (p === '/api/legal/terms') return { ...policies[0], effectiveDate: 'Today', ...draft,
           sections: [{ heading: 'Agreement', paragraphs: ['You agree.'] }] };
       } });
       context.setDefaultTimeout(8000);
@@ -71,9 +73,11 @@ const { fakeConsole, launch } = require('../tests/helpers/fake-console.cjs');
     await page.locator('.docs-nav a', { hasText: 'Terms of Service' }).click();
     await page.locator('.legal-document h1', { hasText: 'Terms of Service' }).waitFor();
     assert.equal(await current(), 'Terms of Service');
+    assert.equal(await page.locator('.legal-draft').count(), 1, 'an unapproved policy is marked as a draft');
     await page.locator('.docs-nav a', { hasText: 'Policies' }).click();
     await page.locator('.legal-grid').waitFor();
     assert.equal(await current(), 'Policies');
+    assert.equal(await page.locator('.legal-draft').count(), 1, 'an unapproved policy set is marked as a draft');
 
     // Back returns to the previous page.
     await page.goBack();
@@ -112,6 +116,17 @@ const { fakeConsole, launch } = require('../tests/helpers/fake-console.cjs');
     assert.equal(await page.evaluate(() => location.pathname), '/docs');
     assert.deepEqual(errors, []);
     await context.close();
+
+    // Once the operator approves the current version, no page calls the policies a draft.
+    const approved = await open(undefined, { approved: true });
+    for (const route of ['/legal', '/legal/terms']) {
+      await approved.page.goto(`http://console.test${route}`);
+      await approved.page.locator('.legal-grid, .legal-document h1').first().waitFor();
+      assert.equal(await approved.page.locator('.legal-draft').count(), 0, `${route} has no draft notice once approved`);
+      assert.doesNotMatch(await approved.page.locator('main').innerText(), /Launch draft|undefined/);
+    }
+    assert.deepEqual(approved.errors, []);
+    await approved.context.close();
 
     // A phone: no sideways scrolling; the sidebar becomes a strip above the page.
     const phone = await open({ width: 390, height: 780 });

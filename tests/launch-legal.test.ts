@@ -27,6 +27,16 @@ describe('paid-launch policies', () => {
     expect(policyDocument('invented')).toBeUndefined();
   });
 
+  it('drops the draft notice once the operator approves the current version, and only that version', () => {
+    const approved = { founderReviewedPolicyVersion: POLICY_VERSION };
+    expect(publicLaunchInfo({}, approved).draftNotice).toBeUndefined();
+    for (const slug of POLICY_SLUGS) expect(policyDocument(slug, {}, approved)?.draftNotice).toBeUndefined();
+    expect(publicLaunchInfo({ KARMAX_FOUNDER_REVIEWED_POLICY_VERSION: POLICY_VERSION }).draftNotice).toBeUndefined();
+    const stale = { founderReviewedPolicyVersion: 'an-earlier-version' };
+    expect(publicLaunchInfo({}, stale).draftNotice).toMatch(/pending final operator approval/);
+    expect(policyDocument('terms', {}, stale)?.draftNotice).toMatch(/pending final operator approval/);
+  });
+
   it('requires an affirmative click on every current applicable version and appends evidence', async () => {
     expect(ACCEPTANCE_POLICIES.signup).toEqual(['terms', 'acceptable-use', 'privacy']);
     expect(ACCEPTANCE_POLICIES.checkout).toEqual(['terms', 'privacy', 'billing']);

@@ -265,6 +265,8 @@ export interface LaunchConfig {
   governingLaw?: string;
   legalNoticeAddress?: string;
   contacts: { legal?: string; privacy?: string; security?: string; incident?: string; dpa?: string; billing?: string };
+  /** The operator approved this exact policy version, so the policies are no longer drafts. */
+  policyApproved: boolean;
   missing: string[];
   ready: boolean;
 }
@@ -306,8 +308,9 @@ export function launchConfig(env: NodeJS.ProcessEnv = process.env, stored?: Stor
     security: email('KARMAX_SECURITY_EMAIL'), incident: email('KARMAX_INCIDENT_EMAIL'),
     dpa: email('KARMAX_DPA_EMAIL'), billing: email('KARMAX_BILLING_EMAIL'),
   };
+  const policyApproved = value('KARMAX_FOUNDER_REVIEWED_POLICY_VERSION') === POLICY_VERSION;
   const required: Array<[string, unknown]> = [
-    ['KARMAX_FOUNDER_REVIEWED_POLICY_VERSION', value('KARMAX_FOUNDER_REVIEWED_POLICY_VERSION') === POLICY_VERSION ? POLICY_VERSION : undefined],
+    ['KARMAX_FOUNDER_REVIEWED_POLICY_VERSION', policyApproved ? POLICY_VERSION : undefined],
     ['KARMAX_LEGAL_ENTITY_NAME', value('KARMAX_LEGAL_ENTITY_NAME')],
     ['KARMAX_LEGAL_ENTITY_COUNTRY', value('KARMAX_LEGAL_ENTITY_COUNTRY')],
     ['KARMAX_GOVERNING_LAW', value('KARMAX_GOVERNING_LAW')],
@@ -321,7 +324,7 @@ export function launchConfig(env: NodeJS.ProcessEnv = process.env, stored?: Stor
     paidLaunch: stored?.paidLaunch ?? value('KARMAX_PAID_LAUNCH') === '1',
     operatorName: value('KARMAX_LEGAL_ENTITY_NAME'), operatorCountry: value('KARMAX_LEGAL_ENTITY_COUNTRY'),
     governingLaw: value('KARMAX_GOVERNING_LAW'), legalNoticeAddress: value('KARMAX_LEGAL_NOTICE_ADDRESS'), contacts,
-    missing, ready: missing.length === 0,
+    policyApproved, missing, ready: missing.length === 0,
   };
 }
 
@@ -329,7 +332,9 @@ export function publicLaunchInfo(env: NodeJS.ProcessEnv = process.env, stored?: 
   siteName = DEFAULT_SITE_NAME) {
   const config = launchConfig(env, stored);
   return {
-    policyVersion: POLICY_VERSION, effectiveDate: POLICY_EFFECTIVE_DATE, draftNotice: POLICY_DRAFT_NOTICE,
+    policyVersion: POLICY_VERSION, effectiveDate: POLICY_EFFECTIVE_DATE,
+    // Only until the operator approves this exact version; a new version is a draft again.
+    draftNotice: config.policyApproved ? undefined : POLICY_DRAFT_NOTICE,
     policies: POLICY_SLUGS.map((slug) => ({ slug, title: docs[slug].title,
       summary: withSiteName(docs[slug].summary, siteName), version: POLICY_VERSION })),
     acceptance: { signup: policyVersions('signup'), checkout: policyVersions('checkout') },
@@ -353,9 +358,9 @@ export function assertPaidLaunchReady(env: NodeJS.ProcessEnv = process.env, stor
 }
 
 export function policyDocument(slug: string, env: NodeJS.ProcessEnv = process.env, stored?: StoredLaunchConfig,
-  siteName = DEFAULT_SITE_NAME): (PolicyDocument & { draftNotice: string; operator: ReturnType<typeof publicLaunchInfo>['operator']; contacts: LaunchConfig['contacts'] }) | undefined {
+  siteName = DEFAULT_SITE_NAME): (PolicyDocument & { draftNotice?: string; operator: ReturnType<typeof publicLaunchInfo>['operator']; contacts: LaunchConfig['contacts'] }) | undefined {
   if (!POLICY_SLUGS.includes(slug as PolicySlug)) return undefined;
   const info = publicLaunchInfo(env, stored, siteName);
   return { ...namedPolicy(docs[slug as PolicySlug], siteName), version: POLICY_VERSION, effectiveDate: POLICY_EFFECTIVE_DATE,
-    draftNotice: POLICY_DRAFT_NOTICE, operator: info.operator, contacts: info.contacts };
+    draftNotice: info.draftNotice, operator: info.operator, contacts: info.contacts };
 }
