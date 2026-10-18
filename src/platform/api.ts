@@ -49,6 +49,7 @@ import { taskProvider } from '../world/task-provider.js';
 import { applyComputer, assertInFlightComputerEdit, computerOf, computerResizable, describeMachine, machineShape, normalizeComputer, sameMachine,
   type ComputerSpec, type MachineShape } from '../domain/computer.js';
 import { resolveParamsLayers, assembleTaskInput, projectSettingsFor, globalSettingsFor, effectiveRepos, ValueMap } from './params.js';
+import { splitSharedSettings } from '../domain/shared-settings.js';
 import { REPOSITORY_BRANCHES_RESOLVED_PARAM, applyRepoBranches, normalizeRepoBranches, repositoryBranchDefaults } from './branch-defaults.js';
 import { withTimeout } from '../util/timeout.js';
 import path from 'node:path';
@@ -6273,7 +6274,10 @@ Act according to your Avatar instructions. When ready, call platform_request POS
     if (confirmsProposal && scopedTask && (chosenOtherAttempts === 'keep' || chosenOtherAttempts === 'cancel')) {
       (await this.deps.store.kvSet(`attempt-choice:${taskId}`, chosenOtherAttempts));
       if (attemptChoice?.saveOtherAttemptsDefault) {
-        const defaults = (await this.deps.store.getSettings(scopedTask.projectId, '__common__')) ?? {};
+        // A project's first settings row must keep what it inherited from its config.
+        const project = (await this.deps.store.getProject(scopedTask.projectId));
+        const defaults = (await this.deps.store.getSettings(scopedTask.projectId, '__common__'))
+          ?? (project ? splitSharedSettings('software-dev', (await projectSettingsFor(async (scope, workflow) => (await this.deps.store.getSettings(scope, workflow)), project, 'software-dev'))).shared : {});
         (await this.deps.store.setSettings(scopedTask.projectId, '__common__', { ...defaults, otherAttempts: chosenOtherAttempts }));
       }
     }

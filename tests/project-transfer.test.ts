@@ -44,6 +44,18 @@ describe('project transfer', () => {
     expect((await store.auditSince()).filter(r => r.scopeKey === 'organization:' + source.id).some(r => r.action === 'project.transferred')).toBe(true);
   });
 
+  // Branch policy travels with the project as it is now — not as an old copy in
+  // its config, which Task defaults stopped updating.
+  it('keeps the project\'s current branch policy, not a stale config copy', async () => {
+    const { store, destination, project, transfers } = (await fixture());
+    (await store.updateProjectConfig(project.id, { defaultBase: 'stale', remote: 'push', multiPr: false }));
+    (await store.setSettings(project.id, '__common__', { base: 'develop', landingAuthority: 'external', otherAttempts: 'cancel' }));
+    const preview = (await transfers.preview(project.id, destination.id));
+    await transfers.move(project.id, destination.id, preview.id);
+    expect(JSON.parse(JSON.stringify((await store.getProject(project.id))?.config))).toEqual({ defaultBase: 'develop', landingAuthority: 'external' });
+    expect((await store.getSettings(project.id, '__common__'))).toEqual({ base: 'develop', landingAuthority: 'external' });
+  });
+
   it('rejects a stale preview without changing ownership or access', async () => {
     const { store, destination, project, transfers } = (await fixture());
     const preview = (await transfers.preview(project.id, destination.id));
