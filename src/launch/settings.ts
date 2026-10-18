@@ -196,8 +196,7 @@ export class PaidLaunchSettingsService {
         checkoutUrl: `${publicUrl.replace(/\/$/, '')}/billing/checkout`, webhookEvents: PADDLE_WEBHOOK_EVENTS },
       missing: launch.missing.map((name) => legalLabels[name] ?? name),
       policyVersion: POLICY_VERSION,
-      founderReviewed: stored.founderReviewedPolicyVersion === POLICY_VERSION
-        || (!stored.founderReviewedPolicyVersion && this.env.KARMAX_FOUNDER_REVIEWED_POLICY_VERSION === POLICY_VERSION),
+      founderReviewed: launch.policyApproved,
       stripe: {
         individualPriceId: stripe.individualPriceId, teamBasePriceId: stripe.teamBasePriceId,
         teamSeatPriceId: stripe.teamSeatPriceId, individualProductId: stripe.individualProductId,

@@ -24017,7 +24017,7 @@ async function renderLegalPage(slug) {
     .map(([kind, email]) => `<a href="mailto:${esc(email)}">${esc(kind)}: ${esc(email)}</a>`).join('');
   renderPublicShell(`/legal/${policy.slug}`, `<main class="legal-document"><div class="legal-kicker">Version ${esc(policy.version)} · Effective ${esc(policy.effectiveDate)}</div>
     <h1>${esc(policy.title)}</h1><p class="legal-summary">${esc(policy.summary)}</p>
-    <div class="legal-draft" role="note"><b>Launch draft</b><span>${esc(policy.draftNotice)}</span></div>
+    ${policy.draftNotice ? `<div class="legal-draft" role="note"><b>Launch draft</b><span>${esc(policy.draftNotice)}</span></div>` : ''}
     ${policy.operator ? `<p class="legal-operator"><b>Configured operator:</b> ${esc(policy.operator.name)}${policy.operator.country ? ` · ${esc(policy.operator.country)}` : ''}${policy.operator.governingLaw ? `<br><b>Governing law:</b> ${esc(policy.operator.governingLaw)}` : ''}${policy.operator.legalNoticeAddress ? `<br><b>Legal notices:</b> ${esc(policy.operator.legalNoticeAddress)}` : ''}</p>`
       : '<p class="legal-unresolved"><b>Launch configuration incomplete:</b> the contracting entity and jurisdiction fields are intentionally not represented.</p>'}
     ${policy.sections.map((section) => `<section><h2>${esc(section.heading)}</h2>${section.paragraphs.map((text) => `<p>${esc(text)}</p>`).join('')}
@@ -24030,7 +24030,7 @@ function renderLegalIndex() {
   document.title = `Policies · ${siteName()}`;
   renderPublicShell('/legal', `<main class="legal-index"><div class="legal-kicker">Launch policy set · v${esc(S.launch?.policyVersion)}</div><h1>Policies &amp; trust</h1>
     <p class="legal-summary">Versioned product, billing, privacy, and operational disclosures for the initial paid launch.</p>
-    <div class="legal-draft" role="note"><b>Launch draft</b><span>${esc(S.launch?.draftNotice)}</span></div>
+    ${S.launch?.draftNotice ? `<div class="legal-draft" role="note"><b>Launch draft</b><span>${esc(S.launch.draftNotice)}</span></div>` : ''}
     <div class="legal-grid">${(S.launch?.policies || []).map((policy) => `<a href="/legal/${policy.slug}" data-public><span>${esc(policy.title)}</span><small>${esc(policy.summary)}</small><i>v${esc(policy.version)} →</i></a>`).join('')}</div>
     </main>`);
 }
