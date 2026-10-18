@@ -8656,6 +8656,10 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   // stale snapshot reverts it. That is the "saved draft contents disappear" bug: only a
   // real change in THIS form (its signature diverging from the seed) now triggers a write.
   let lastSaved = initialTaskFormSavedSignature(draft, seedText, stateSig(formState()));
+  // A template's form is saved only by its button; this is what it opened with.
+  const templateExtras = () => JSON.stringify([$('#tf-template-name')?.value.trim() ?? '', orgRec.params.priority || 0, orgRec.tags]);
+  const openedExtras = templateExtras();
+  const templateDirty = () => stateSig(formState()) !== lastSaved || templateExtras() !== openedExtras;
   // Saves are SERIALIZED through this chain. Overlapping writes otherwise race:
   // if a debounced create is still in flight when the user types more or closes the
   // form (which flushes), `draftId` is still null, so the next save POSTs a *second*
@@ -8776,9 +8780,6 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     authorization: templateAuthorizationFor(st.authorization, projectId),
     credentialGrants: st.credentialGrants, credentialPolicies: st.credentialPolicies,
     tags: orgRec.tags.map(tagPathStr), priority: orgRec.params.priority || 0 });
-  const templateExtras = () => JSON.stringify([$('#tf-template-name')?.value.trim() ?? '', orgRec.params.priority || 0, orgRec.tags]);
-  const openedExtras = templateExtras();
-  const templateDirty = () => stateSig(formState()) !== lastSaved || templateExtras() !== openedExtras;
   if (templateEdit) {
     $('#tf-template-name')?.addEventListener('input', autoSaveSoon);
     if (!$('#tf-template-name')?.value) setTimeout(() => $('#tf-template-name')?.focus(), 0);
