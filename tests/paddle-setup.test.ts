@@ -79,7 +79,7 @@ describe('Paddle automated setup', () => {
     expect(records.products).toHaveLength(4);
     expect(records.prices).toHaveLength(5);
     // And one from before any pack.
-    for (const _ of [1, 2]) { records.products.pop(); records.prices.pop(); }
+    records.products.splice(-2); records.prices.splice(-2);
     for (const key of ['storagePackProductId', 'storagePackPriceId', 'computePackProductId', 'computePackPriceId'] as const) delete config[key];
     fetcher.mockClear();
     await provisionPaddle(config, 'https://tavya.test', 'Tavya', save, fetcher);
