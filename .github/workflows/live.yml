@@ -162,7 +162,7 @@ jobs:
           echo "d33ff2d14475178d2012c2c56beba87389ac5ded27649519f198a7d3134a99db  $RUNNER_TEMP/cloudflared" | sha256sum -c -
           sudo install "$RUNNER_TEMP/cloudflared" /usr/local/bin/cloudflared
       # The smoke checks, then a whole task: pause at Review, resume, teardown.
-      - run: npx vitest run tests/cloud-live.test.ts tests/e2b-workflow-live.test.ts tests/e2b-computer-live.test.ts tests/resource-on-demand-live.test.ts
+      - run: npx vitest run tests/cloud-live.test.ts tests/e2b-workflow-live.test.ts tests/e2b-computer-live.test.ts tests/resource-on-demand-live.test.ts tests/subtask-computer-live.test.ts
         env:
           KARMAX_RUN_LIVE: '1'
           KARMAX_LIVE_DATA_GB: '1'
@@ -217,6 +217,12 @@ jobs:
         env:
           KARMAX_RUN_LIVE: '1'
           FLY_API_TOKEN: ${{ secrets.LIVE_FLY_API_TOKEN }}
+          HCLOUD_TOKEN: ${{ secrets.LIVE_HETZNER_API_TOKEN }}
+      # A full Hetzner limit: the task waits for a machine, starts on Retry once
+      # it fits, and Free computer deletes its server and volume.
+      - run: npx vitest run tests/vm-capacity-live.test.ts
+        env:
+          KARMAX_RUN_LIVE: '1'
           HCLOUD_TOKEN: ${{ secrets.LIVE_HETZNER_API_TOKEN }}
 
   move:

@@ -91,7 +91,8 @@ describe('WorktreeProvider (real git)', () => {
     try {
       const failure = await core.createWorld({ taskId: 'limit-full', base: 'main',
         target: 'main', kind: 'fake-remote' as any }).catch((error) => error);
-      expect(failure).toMatchObject({ type: 'world-infra', nonRetryable: false, message: full });
+      // Waited for as room, not retried at once: only other machines stopping frees it.
+      expect(failure).toMatchObject({ type: 'world-capacity', nonRetryable: true, message: full });
     } finally {
       (await store.close());
     }
