@@ -7,7 +7,7 @@ import { URGENCY_LEVELS, type AgentSpec, type AuthorizationSelection, type Provi
 import {
   AGENT_ROLE_NAMES, PLATFORM_REQUEST_BODY_SCHEMA, PLATFORM_REQUEST_EXCLUDED_PATHS,
   PRIORITY_NAMES, compactSearch, compactOrganizationSearch, compactTags, normalizePlatformPath, normalizeRequestBody,
-  platformRequestPathError, CREATE_TASK_GRANTS, REQUEST_FOR_TASK, PERMISSION_ROUTING, QUEUE_TASK_DESCRIPTION, queuedTaskReply,
+  platformRequestPathError, FIELDS_PARAMETER, agentPlatformResponse, agentTaskView, CREATE_TASK_GRANTS, REQUEST_FOR_TASK, PERMISSION_ROUTING, QUEUE_TASK_DESCRIPTION, queuedTaskReply,
   type CompactTask,
 } from './platform-request.js';
 import { BRAND } from '../domain/brand.js';
@@ -870,6 +870,7 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
         method: z.enum(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']),
         path: z.string().startsWith('/api/'),
         body: z.union([z.record(z.string(), z.unknown()), z.array(z.unknown()), z.string()]).optional(),
+        fields: z.array(z.string()).optional().describe(FIELDS_PARAMETER.description),
       },
     },
     async (a) => wrap(async () => {
@@ -877,10 +878,12 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
       // is identical whichever ops implementation is wired underneath.
       const rejected = platformRequestPathError(a.path);
       if (rejected) throw new Error(rejected);
-      return (await ops.platformRequest(a.method, a.path, normalizeRequestBody(a.body)));
+      return agentPlatformResponse(await ops.platformRequest(a.method, a.path, normalizeRequestBody(a.body)), a.fields);
     }),
   );
-  server.registerTool('get_task', { description: "Get a task's current view-model.", inputSchema: { taskId: z.string() } }, async (a) => wrap(async () => (await ops.getTask(a.taskId))));
+  server.registerTool('get_task', { description: "Get a task's current view-model, without its conversation (its message count and last message instead). Pass fields to get only those (dotted paths; [\"messages\"] for the conversation).",
+    inputSchema: { taskId: z.string(), fields: z.array(z.string()).optional().describe(FIELDS_PARAMETER.description) } },
+  async (a) => wrap(async () => agentTaskView(await ops.getTask(a.taskId), a.fields)));
   // Kept for compatibility, but strictly dominated by search_tasks (which returns
   // status/stage/priority/tags and accepts a query). Point callers there.
   server.registerTool('list_tasks', { description: 'List every task in a project as bare {id, title, workflow}. Prefer search_tasks — it takes a query, and its result carries num/status/stage/priority/tags. Pass an empty query for the same "everything" listing.', inputSchema: { projectId: z.string() } }, async (a) => wrap(() => ops.listTasks(a.projectId)));

@@ -43,7 +43,7 @@ import { KarmaxBus } from '../contrib/bus.js';
 import { TokenAuthority, type ScopedToken } from '../platform/tokens.js';
 import { resolveAuthorizationSummary } from '../platform/authorization-summary.js';
 import { participantAuthorization } from '../platform/agent-authority.js';
-import { platformRequestPathError } from '../platform/platform-request.js';
+import { compactTaskView, platformRequestPathError } from '../platform/platform-request.js';
 import { ContributionRegistry } from '../contrib/registry.js';
 import { Overlays } from '../store/overlays.js';
 import { activationTaskPrompt, manifest } from '../contrib/manifests.js';
@@ -5498,7 +5498,8 @@ export class Gateway {
           const applied = await api.updateParams(token, id, b.params ?? {}, { acceptAttenuation: attenuation.acceptAttenuation });
           // Authoritative read: reflect the just-applied update, not a snapshot that
           // may pre-date the workflow's next publish.
-          return this.json(res, 200, { ...applied, view: await api.getTaskView(token, id, { live: true }) });
+          // Without its conversation (compactTaskView): every reply carried it whole, 100k+ characters.
+          return this.json(res, 200, { ...applied, view: compactTaskView(await api.getTaskView(token, id, { live: true }) as any) });
         } catch (e) {
           return this.json(res, grantRefusal(e).code ? 403 : 409, { error: e instanceof Error ? e.message : String(e), ...grantRefusal(e) });
         }

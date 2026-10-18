@@ -90,6 +90,14 @@ export const PLATFORM_REQUEST_BODY_SCHEMA = {
   anyOf: [{ type: 'object' }, { type: 'array' }, { type: 'string' }],
 } as const;
 
+/** `fields`: the parts of a response to return, as dotted paths. */
+export const FIELDS_PARAMETER = {
+  type: 'array',
+  items: { type: 'string' },
+  description: 'Only these parts of the response, as dotted paths (e.g. ["stage", "waitingFor.detail"]); an array keeps them of each item. '
+    + 'A response over 60000 characters is otherwise described (each field\'s size) rather than returned.',
+} as const;
+
 /**
  * Routes the gateway answers **before** its session/capability gate. They are
  * unauthenticated by construction — the sign-in/sign-up surface, webhooks that
@@ -244,4 +252,91 @@ export function compactTags(tags: any[]): { path: string; kind?: string; descrip
   return (tags ?? [])
     .map((t) => ({ path: tagPathOf(t.id, byId), kind: t.kind, description: t.description }))
     .sort((a, b) => a.path.localeCompare(b.path));
+}
+
+// ─── response size: compact by default, chosen fields on request ───────────────
+// A task's full view repeats its conversation (messages, and each transcript),
+// so get_task, a PATCH reply or a search through platform_request ran to
+// 100–350k characters and overflowed an agent's context. Agents get compact
+// projections, and may name the fields they want.
+
+/** Above this, a response is described rather than returned (pass `fields`). */
+export const RESPONSE_CHARACTER_LIMIT = 60_000;
+
+/** Keep only `fields` of a value: dotted paths into an object ("waitingFor.detail");
+ * an array keeps them of each of its items. Unknown paths are left out. */
+export function selectFields(value: unknown, fields: string[]): unknown {
+  if (Array.isArray(value)) return value.map((item) => selectFields(item, fields));
+  if (!value || typeof value !== 'object') return value;
+  const groups = new Map<string, string[]>();
+  for (const field of fields) {
+    const [head, ...rest] = String(field).split('.');
+    if (!head) continue;
+    const group = groups.get(head) ?? [];
+    if (rest.length) group.push(rest.join('.')); else group.push('');
+    groups.set(head, group);
+  }
+  const out: Record<string, unknown> = {};
+  for (const [head, rests] of groups) {
+    if (!Object.prototype.hasOwnProperty.call(value, head)) continue;
+    const inner = (value as Record<string, unknown>)[head];
+    out[head] = rests.includes('') ? inner : selectFields(inner, rests);
+  }
+  return out;
+}
+
+/** JSON of a response, or — over `limit` characters — what it holds and how to
+ * ask for part of it: each top-level field's size, or an array's length and
+ * its items' fields. */
+export function boundedJson(value: unknown, limit = RESPONSE_CHARACTER_LIMIT): string {
+  const text = JSON.stringify(value) ?? 'null';
+  if (text.length <= limit) return text;
+  const sizes = (object: Record<string, unknown>) => Object.fromEntries(Object.entries(object)
+    .map(([key, field]) => [key, (JSON.stringify(field) ?? '').length]));
+  const items = Array.isArray(value) ? value : undefined;
+  const shape = items
+    ? { items: items.length, itemFields: items[0] && typeof items[0] === 'object' ? sizes(items[0] as Record<string, unknown>) : undefined }
+    : value && typeof value === 'object' ? { fieldSizes: sizes(value as Record<string, unknown>) } : undefined;
+  return JSON.stringify({
+    truncated: true, characters: text.length,
+    note: `This response is ${text.length} characters, more than ${limit}. Ask again with fields: the dotted paths you need`
+      + ` (e.g. ["stage", "status", "waitingFor"]; an array keeps them of each item).`,
+    ...shape,
+  });
+}
+
+/** A task view without its conversation: how many messages there are and the
+ * last one (shortened), and every other field as it is. get_task returns this
+ * unless asked for fields; ask for "messages" to get the conversation. */
+export function compactTaskView<T extends Record<string, unknown> | undefined>(view: T): T {
+  if (!view) return view;
+  const { messages, transcripts, reviewInfo, ...rest } = view as Record<string, unknown>;
+  const list = Array.isArray(messages) ? messages as Array<Record<string, unknown>> : [];
+  const last = list.at(-1);
+  const text = typeof last?.text === 'string' ? last.text : '';
+  const info = reviewInfo && typeof reviewInfo === 'object' ? (() => {
+    const { html: _html, ...kept } = reviewInfo as Record<string, unknown>;
+    return kept;
+  })() : reviewInfo;
+  return {
+    ...rest,
+    ...(info !== undefined ? { reviewInfo: info } : {}),
+    messageCount: list.length,
+    ...(last ? { lastMessage: { role: last.role, ...(last.author ? { author: last.author } : {}),
+      text: text.length > 2_000 ? `${text.slice(0, 2_000)}… (${text.length} characters; fields: ["messages"] for all)` : text, ts: last.ts } } : {}),
+    ...(Array.isArray(transcripts) && transcripts.length ? { transcriptRoles: transcripts.map((transcript: any) => transcript?.role) } : {}),
+  } as unknown as T;
+}
+
+/** What an agent's get_task returns: the compact view, or the fields it named. */
+export function agentTaskView(view: unknown, fields?: unknown): string {
+  const wanted = Array.isArray(fields) ? fields.map(String).filter(Boolean)
+    : typeof fields === 'string' && fields.trim() ? fields.split(',').map((field) => field.trim()).filter(Boolean) : [];
+  return boundedJson(wanted.length ? selectFields(view, wanted) : compactTaskView(view as Record<string, unknown> | undefined));
+}
+
+/** What an agent's platform_request returns: the fields it named, if any, within the size limit. */
+export function agentPlatformResponse(value: unknown, fields?: unknown): string {
+  const wanted = Array.isArray(fields) ? fields.map(String).filter(Boolean) : [];
+  return boundedJson(wanted.length ? selectFields(value, wanted) : value);
 }

@@ -13,6 +13,7 @@ import {
   PLATFORM_REQUEST_BODY_SCHEMA, PRIORITY_NAMES, AGENT_ROLE_NAMES, CREATE_TASK_GRANTS, REQUEST_FOR_TASK, PERMISSION_ROUTING,
   QUEUE_TASK_DESCRIPTION, queuedTaskReply,
   compactSearch, compactOrganizationSearch, compactTags, normalizeRequestBody, platformRequestPathError,
+  FIELDS_PARAMETER, agentPlatformResponse, agentTaskView,
 } from '../platform/platform-request.js';
 import { SUB_TASK_ACTIONS, URGENCY_LEVELS, type AgentWait, type SubTaskAction, type Urgency } from '../domain/types.js';
 import { BRAND } from '../domain/brand.js';
@@ -613,8 +614,8 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   },
   {
     name: 'get_task',
-    description: "Get a task's current view-model.",
-    parameters: { type: 'object', properties: { task_id: { type: 'string' } }, required: ['task_id'] },
+    description: "Get a task's current view-model, without its conversation (its message count and last message instead). Pass fields to get only those (dotted paths, e.g. [\"stage\", \"status\", \"waitingFor\", \"subTasks\"]; [\"messages\"] for the conversation).",
+    parameters: { type: 'object', properties: { task_id: { type: 'string' }, fields: FIELDS_PARAMETER }, required: ['task_id'] },
   },
   {
     name: 'list_tasks',
@@ -1017,6 +1018,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
         method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] },
         path: { type: 'string' },
         body: PLATFORM_REQUEST_BODY_SCHEMA,
+        fields: FIELDS_PARAMETER,
       },
       required: ['method', 'path'],
     },
@@ -1509,7 +1511,7 @@ export function platformToolHandlers(
       return JSON.stringify({ unfollowed: follows.map((follow) => follow.id) });
     },
     async get_task(args) {
-      return JSON.stringify(await platformRequest('GET', `/api/tasks/${encodeURIComponent(String(args?.task_id ?? ''))}`));
+      return agentTaskView(await platformRequest('GET', `/api/tasks/${encodeURIComponent(String(args?.task_id ?? ''))}`), args?.fields);
     },
     async list_tasks(args) {
       const listed = await platformRequest('GET', `/api/projects/${encodeURIComponent(String(args?.project_id ?? ''))}/tasks`) as any[];
@@ -1758,7 +1760,7 @@ export function platformToolHandlers(
       // Auth route — an agent could mint itself a human login with no user:write.
       const rejected = platformRequestPathError(requestPath);
       if (rejected) return `error: ${rejected}`;
-      return JSON.stringify(await platformRequest(method, requestPath, normalizeRequestBody(args?.body)));
+      return agentPlatformResponse(await platformRequest(method, requestPath, normalizeRequestBody(args?.body)), args?.fields);
     },
     async signal_completion(args) {
       await ctx.signalCompletion(args?.summary ? String(args.summary) : undefined);

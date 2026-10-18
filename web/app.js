@@ -13347,7 +13347,11 @@ function wireParams(v) {
       if (currentRecord) currentRecord.params = { ...currentRecord.params, ...patch };
       const confirmer = fields.find((field) => field.type === 'confirmer' && names.includes(field.name));
       if (confirmer && S.selected === v.taskId && S.attemptGroup) S.attemptGroup.confirmer = patch[confirmer.name];
-      if (updated?.view && S.selected === v.taskId) S.view = updated.view;
+      // The reply's view leaves out the conversation: keep the one shown.
+      if (updated?.view && S.selected === v.taskId && S.view?.taskId === v.taskId) {
+        const { messageCount: _count, lastMessage: _last, transcriptRoles: _roles, reviewInfo: _info, ...fresh } = updated.view;
+        S.view = { ...S.view, ...fresh };
+      }
       toast('Parameter changes saved');
       draft.saving = false;
       draft.sync(); // use the current form, even when a refresh replaced the submitting DOM
