@@ -34,7 +34,7 @@ function setup(api) {
   const inventory = panel();
   const context = vm.createContext({ api, resourceReviewCache: new Map(), resourceInventoryCache: new Map(), resourceChoiceWrites: new Map(), asyncElementRenderEpoch: new WeakMap(),
     document: { getElementById: (id) => id === 'review-resource-inventory' ? inventory : wrap }, esc: String, formatBytes: String, confirm: () => true, toast: () => {},
-    S: {}, ICON: {}, siteNameMarkup: () => 'Karmax', markdownEnabled: () => false, mathjaxEnabled: () => true, renderAgentMessageBody: String, renderWaitDetail: String, explainMessageAffordance: () => '',
+    S: {}, ICON: {}, siteNameMarkup: () => 'Karmax', siteName: () => 'Karmax', markdownEnabled: () => false, mathjaxEnabled: () => true, renderAgentMessageBody: String, renderWaitDetail: String, explainMessageAffordance: () => '',
     waitingText: () => 'Waiting', liveRoleFor: () => 'do', conversationPresence: () => ({ tone: 'waiting', label: 'Waiting' }),
     conversationEntries: () => [], subTasksSection: () => '', forkSourcesSection: () => '', agentForksSection: () => '',
     checkoutsSection: () => '', renderWidgetGroups: () => '', notesSection: () => '',
@@ -42,7 +42,7 @@ function setup(api) {
     parametersTab: () => 'parameters', timingTab: () => 'timing',
   });
   vm.runInContext(`${freshness}\n${tabs}\n${wire}`, context);
-  for (const name of ['humanWaitDetail', 'conversationTextKey', 'conversationInputRequest', 'safeHref', 'contentKey', 'conversationError', 'reviewActionBtn', 'conversationReviewInfo', 'conversationFullscreenButton', 'conversationPane', 'liveOutputFor', 'renderConversationEntry', 'presenceDetail', 'conversationWaitNotice']) {
+  for (const name of ['humanWaitDetail', 'conversationTextKey', 'conversationInputRequest', 'safeHref', 'contentKey', 'conversationError', 'reviewActionBtn', 'conversationReviewInfo', 'conversationFullscreenButton', 'conversationPane', 'messageOrigin', 'conversationOutline', 'foldDuration', 'foldPreview', 'conversationFoldHead', 'liveOutputFor', 'renderConversationEntry', 'presenceDetail', 'conversationWaitNotice']) {
     vm.runInContext(extract(name), context);
   }
   context.checkinTab = (v) => context.conversationPane(v, { role: 'do' });

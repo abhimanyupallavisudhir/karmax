@@ -1179,7 +1179,7 @@ function effortLevelsFor(provider, model) {
   if (provider === 'codex') {
     if (/^gpt-(?:[6-9]|\d{2,})(?:[.-]|$)/.test(m)) return EFFORT_ORDER;
     // gpt-5.x (5.5, 5.4-mini) accept up to xhigh; older reasoning models top out at high.
-    if (/^gpt-5/.test(m)) return ['low', 'medium', 'high', 'xhigh'];
+    if (m.startsWith('gpt-5')) return ['low', 'medium', 'high', 'xhigh'];
     if (/^(o1|o3|o4|codex)/.test(m) || m.includes('reasoning')) return ['low', 'medium', 'high'];
     return [];
   }
@@ -10206,6 +10206,27 @@ function captureConversationScroll(thread) {
   return { top: thread.scrollTop, atBottom: thread.scrollHeight - thread.scrollTop - thread.clientHeight <= 2,
     key: anchor?.dataset.conversationKey, offset: anchor ? anchor.getBoundingClientRect().top - top : 0 };
 }
+// A conversation opens at its end, but a long answer is read from its start:
+// when the latest thing said to people (data-land) begins above the view,
+// show its first line instead of its last.
+function landOnLatestAnswer(thread) {
+  const answer = thread.querySelector('[data-land]');
+  if (!answer) return;
+  const above = answer.getBoundingClientRect().top - thread.getBoundingClientRect().top;
+  if (above < 0) thread.scrollTop += above - 12;
+}
+// Which folds of a conversation a person opened or closed, for this session.
+function wireConversationFolds(thread) {
+  if (!thread || thread.foldsWired) return;
+  thread.foldsWired = true;
+  thread.addEventListener('toggle', (event) => {
+    const fold = event.target;
+    if (!fold.matches?.('details[data-fold]')) return;
+    const key = `${thread.dataset.taskId}/${thread.dataset.role}`;
+    S.conversationFolds = S.conversationFolds || {};
+    S.conversationFolds[key] = { ...(S.conversationFolds[key] || {}), [fold.dataset.fold]: fold.open };
+  }, true);
+}
 function restoreConversationScroll(thread, state) {
   if (!state || state.atBottom) { thread.scrollTop = thread.scrollHeight; return; }
   const anchor = [...thread.querySelectorAll('[data-conversation-key]')]
@@ -10444,7 +10465,9 @@ function renderTaskPage() {
   if (newBody && prevScroll != null) newBody.scrollTop = prevScroll;
   const thread = document.getElementById('ck-thread');
   if (thread) restoreConversationScroll(thread, retainedThread ? threadScroll : null);
+  if (thread && !retainedThread) landOnLatestAnswer(thread);
   if (thread) {
+    wireConversationFolds(thread);
     restoreThreadSelection(thread, threadSel);
     wireMessageCopies(thread);
     typesetMath(thread);
@@ -11970,9 +11993,18 @@ function conversationPane(v, t) {
   }
   const resourceRequestIndex = v.stage === 'review' && requestedInput
     ? entries.findLastIndex((entry) => entry.type === 'input-request' && entry.request.text === requestedInput) : -1;
-  const msgs = historyStatus + (entries.map((entry, index) => renderConversationEntry(
-    index === resourceRequestIndex ? { ...entry, resourceReview: true } : entry, v)
-    .replace(' ', ` data-conversation-key="${esc(entry.type === 'activity' ? `activity:${entry.activityRef}` : entry.sourceKey || `explanation:${entry.order}`)}" `)).join('')
+  const row = (entry, attrs = '') => renderConversationEntry(
+    entry === entries[resourceRequestIndex] ? { ...entry, resourceReview: true } : entry, v)
+    .replace(' ', ` data-conversation-key="${esc(entry.type === 'activity' ? `activity:${entry.activityRef}` : entry.sourceKey || `explanation:${entry.order}`)}"${attrs} `);
+  const working = t.shared ? v.participants.some((p) => p.state === 'running') : v.agentTurn?.role === t.role;
+  const outline = conversationOutline(entries, { live: working, asking: !!humanWaitDetail(v) });
+  // Opening the task lands on the latest thing said to people (renderTaskPage).
+  const last = outline.findLast((item) => !item.fold);
+  const land = !working && last && (last.reply || last.entry.type === 'input-request') ? last : null;
+  const opened = S.conversationFolds?.[`${v.taskId}/${t.role}`] || {};
+  const msgs = historyStatus + (outline.map((item) => item.fold
+    ? `<details class="conv-fold${item.automatic ? ' automatic' : ''}" data-conversation-key="${esc(item.key)}" data-fold="${esc(item.key)}"${opened[item.key] ?? item.live ? ' open' : ''}>${conversationFoldHead(item)}<div class="fold-body">${item.entries.map((entry) => row(entry)).join('')}</div></details>`
+    : row(item.entry, item === land ? ' data-land' : '')).join('')
     || (historyStatus ? '' : '<div class="msg system">No messages yet</div>'));
   const draft = (S.followupDrafts || {})[`${v.taskId}/${t.role}`] || '';
   const fu = canFollowUp
@@ -12234,6 +12266,109 @@ function conversationEntries(t) {
   return out;
 }
 
+// Who wrote a message: a person (or a task speaking for one), the task's
+// agents, or tavya itself. tavya's prompts (a check failed, a conflict, a job
+// finished, sub-task news) are role 'user' because the model must read them,
+// but nobody typed them: the workflow numbers them `<kind>-<n>` and the
+// gateway's notices are `n<uuid>`. Anything else unsigned — the opening prompt,
+// an answer relayed from above, a follow-up from before 1.27 signed them — is
+// a person's: never mistake someone's words for tavya's and fold them away.
+function messageOrigin(m) {
+  if (m.role === 'agent') return 'agent';
+  if (m.role === 'system') return 'platform';
+  if (m.author) return 'person';
+  return /^n[0-9a-f]{8}-|^(wait|jobs|sa|sh|kg|prn|repos|st|review-ci|cv|prd|pr|pru|mode|r-in|m-in|c-in|command-fix|integration|integration-wait|ir|restore-refused|pr-refused|pr-conflict|landing-retry|merge-revise|resource-merge|resource-integrate)-?\d+$/.test(m.id || '')
+    ? 'platform' : 'person';
+}
+
+// The conversation as people read it: what they said and the agent's answers
+// to them (its last message before tavya first sends it back to work — a
+// failed check, a conflict, sub-task news — or the message they replied to,
+// or one addressed to a person) stay in view. Everything between — tool steps,
+// progress notes, tavya's prompts and the agent's replies to those — folds
+// into one line. Resuming after a pause is the same work, not a new prompt. `live`: the agent is working, so the latest work is not yet
+// answered and stays open; `asking`: the task waits on a person's answer to
+// its latest message.
+function conversationOutline(entries, options) {
+  const live = !!options?.live, asking = !!options?.asking;
+  const kinds = entries.map((entry) => {
+    if (entry.type === 'input-request') return 'spine';
+    if (entry.type === 'explanation') return 'note';
+    if (entry.type === 'activity') return entry.activity?.kind === 'message' ? 'said' : 'work';
+    const m = entry.message || {};
+    const origin = messageOrigin(m);
+    if (origin === 'person') return 'person';
+    // Waking after a pause, or a nudge to keep going, is the same work.
+    if (origin === 'platform') return m.role === 'system' || /^(wait|jobs|sa|sh|kg)-/.test(m.id || '') ? 'work' : 'prompt';
+    return (m.to || []).some((selector) => !selector.startsWith('agent:')) ? 'spine' : 'said';
+  });
+  const spine = kinds.map((kind) => kind === 'person' || kind === 'spine');
+  const reply = new Set();
+  const keep = (i) => { if (i >= 0) spine[i] = true; };
+  const lastSaid = (from, to) => { for (let i = to - 1; i >= from; i--) if (kinds[i] === 'said') return i; return -1; };
+  const starts = [0, ...kinds.flatMap((kind, i) => kind === 'person' && i > 0 ? [i] : [])];
+  starts.forEach((start, r) => {
+    const end = starts[r + 1] ?? entries.length;
+    let prompt = kinds[start] === 'person' ? start + 1 : start;
+    while (prompt < end && kinds[prompt] !== 'prompt') prompt++;
+    // The person's message is answered by the last thing the agent said before
+    // tavya first prompted it — unless it is still working on that answer.
+    if (!(live && prompt === end && end === entries.length)) reply.add(lastSaid(start, prompt));
+    if (end < entries.length) keep(lastSaid(start, end)); // what they answered
+  });
+  if (asking) keep(lastSaid(0, entries.length));
+  reply.delete(-1);
+  reply.forEach(keep);
+  for (let i = 1; i < entries.length; i++) if (kinds[i] === 'note') spine[i] = spine[i - 1];
+  const items = [];
+  for (let i = 0; i < entries.length;) {
+    if (spine[i]) { items.push({ entry: entries[i], reply: reply.has(i) }); i++; continue; }
+    let end = i;
+    while (end < entries.length && !spine[end]) end++;
+    const run = entries.slice(i, end);
+    if (run.length === 1 && kinds[i] !== 'prompt') items.push({ entry: run[0] });
+    else {
+      const latest = run.findLast((entry, k) => kinds[i + k] === 'said');
+      items.push({ fold: true, entries: run, key: `fold:${run[0].sourceKey || run[0].activityRef || i}`,
+        automatic: run.filter((entry, k) => kinds[i + k] === 'prompt').length,
+        latest: latest || run.find((entry, k) => kinds[i + k] === 'prompt'),
+        live: live && end === entries.length });
+    }
+    i = end;
+  }
+  return items;
+}
+
+// "45 s", "12 min", "1 h 20 min": how long a stretch of work took.
+function foldDuration(from, to) {
+  const seconds = Math.max(0, Math.round((Number(to) - Number(from)) / 1000));
+  if (seconds < 60) return `${seconds} s`;
+  const minutes = Math.round(seconds / 60);
+  return minutes < 60 ? `${minutes} min` : `${Math.floor(minutes / 60)} h${minutes % 60 ? ` ${minutes % 60} min` : ''}`;
+}
+
+// One line of a message, without its Markdown, to say where things stand.
+function foldPreview(text) {
+  const line = String(text ?? '').split('\n').map((l) => l.trim()).find(Boolean) || '';
+  return line.replace(/^#+\s+|^[-*>]\s+/, '').replace(/\*\*|__|`/g, '').replace(/\[([^\]]+)\]\([^)]*\)/g, '$1');
+}
+
+// A fold's one line: how long the agent worked, or how many follow-ups tavya
+// sent it on its own and where things stand now.
+function conversationFoldHead(fold) {
+  const real = fold.entries.map((entry) => Number(entry.message?.ts ?? entry.ts)).filter((ts) => ts > 100000000000);
+  const span = real.length > 1 ? foldDuration(real[0], real.at(-1)) : '';
+  const steps = fold.entries.length;
+  const latest = fold.latest?.message?.text ?? fold.latest?.activity?.title;
+  const label = fold.automatic
+    ? `${fold.automatic} automatic follow-up${fold.automatic === 1 ? '' : 's'}`
+    : fold.live ? 'Working' : span ? `Worked ${span}` : 'Work';
+  const tip = fold.automatic
+    ? `${siteName()} sent the agent these on its own — checks, conflicts, sub-task news — and the agent handled them`
+    : 'What the agent did on the way: commands, edits and progress notes';
+  return `<summary class="fold-head" title="${esc(tip)}"><span class="fold-icon" aria-hidden="true">${fold.automatic ? '↻' : '⋯'}</span><span class="fold-label">${esc(label)}</span>${fold.automatic && latest ? `<span class="fold-preview">${esc(foldPreview(latest))}</span>` : '<span class="fold-gap"></span>'}<span class="fold-count">${steps} step${steps === 1 ? '' : 's'}${fold.automatic && span ? ` · ${esc(span)}` : ''}</span></summary>`;
+}
+
 function conversationTime(ts) {
   if (Number(ts) < 100000000000) return '';
   const date = new Date(Number(ts));
@@ -12420,10 +12555,11 @@ function renderConversationEntry(entry, v = S.view) {
   if (entry.type === 'message') {
     const m = entry.message;
     const shared = sharedConversation(v);
-    const role = shared ? messageSpeaker(m, v) : m.role === 'user' ? 'You' : m.role === 'agent' ? 'Agent' : 'System';
+    const role = shared ? messageSpeaker(m, v) : m.role === 'user' ? (messageOrigin(m) === 'platform' ? siteName() : 'You') : m.role === 'agent' ? 'Agent' : 'System';
     const body = m.role === 'agent' ? renderAgentMessageBody(m.text, v, math) : renderMessageBody(m.text, math);
     const otherAgent = shared && m.role === 'agent' && m.author && m.author !== 'do' ? ' other-agent' : '';
-    return `<div class="msg ${m.role}${otherAgent}"><div class="msg-meta"><span class="role">${esc(role)}</span>${shared ? recipientsHtml(m, v) : ''}${conversationTimeHtml(m.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(m.text)}</div><div class="msg-text${md}">${body}</div>${renderMessageImages(m.images)}${renderMessageFiles(m.files)}${m.role === 'agent' ? explainMessageAffordance(entry, v) : ''}</div>`;
+    const platform = m.role === 'user' && messageOrigin(m) === 'platform' ? ' platform' : '';
+    return `<div class="msg ${m.role}${otherAgent}${platform}"><div class="msg-meta"><span class="role">${esc(role)}</span>${shared ? recipientsHtml(m, v) : ''}${conversationTimeHtml(m.ts)}<span class="msg-meta-gap"></span>${messageCopyButton(m.text)}</div><div class="msg-text${md}">${body}</div>${renderMessageImages(m.images)}${renderMessageFiles(m.files)}${m.role === 'agent' ? explainMessageAffordance(entry, v) : ''}</div>`;
   }
   if (entry.type === 'explanation') {
     const e = entry.explanation;
@@ -14231,6 +14367,7 @@ function participantLabelOf(key, v = S.view) {
 function messageSpeaker(m, v) {
   if (m.role === 'agent') return participantLabelOf(m.author || 'do', v);
   if (m.role === 'system') return 'System';
+  if (messageOrigin(m) === 'platform') return siteName();
   if (!m.author || (S.user?.id && m.author === `user:${S.user.id}`)) return 'You';
   if (m.authorLabel) return m.authorLabel;
   if (m.author.startsWith('user:')) return principalLabel({ kind: 'user', userId: m.author.slice(5) });
