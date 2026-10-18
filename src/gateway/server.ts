@@ -8579,13 +8579,21 @@ export class Gateway {
         const repoDefaults = repos.length > 1
           ? await Promise.all(repos.map((source) => repositoryBranchDefaults(store, project!, source).catch(() => undefined)))
           : [];
-        const enrich = async (vals: Record<string, unknown>, lower: Record<string, unknown>) => {
+        // A scope inherits from the layers below it only — never from its own
+        // value, or a saved branch would match what it "inherits" and the next
+        // save would drop it. Unset below, a task uses the repository's branch;
+        // with no repository to name (organization settings), say nothing.
+        const unset = (value: unknown) => value === undefined || value === null || value === '';
+        const enrich = async (vals: Record<string, unknown>, below: Record<string, unknown>) => {
           const out = (await this.enrichAgentDefaults(m, vals, projectId, organizationId ?? undefined));
-          const detectBase = lower.base === undefined && globalVals.base === undefined && projectVals.base === undefined;
-          const detectTarget = lower.target === undefined && globalVals.target === undefined && projectVals.target === undefined;
+          const detectBase = unset(below.base);
+          const detectTarget = unset(below.target);
           if (branches) {
             if (detectBase) out.base = branches.base;
             if (detectTarget) out.target = branches.target;
+          } else if (!project) {
+            if (detectBase) delete out.base;
+            if (detectTarget) delete out.target;
           }
           if (repos.length > 1) out._repositoryBranches = repos.map((source, index) => ({ source,
             base: (detectBase && repoDefaults[index]?.base) || out.base,
@@ -8598,9 +8606,9 @@ export class Gateway {
           return hasComputer ? { ...rest, computer: value } : rest;
         };
         return this.json(res, 200, {
-          task: { own: {}, inherited: withComputer((await enrich(resolveParams(m, { project: projectVals, global: globalVals }), {})), computer.task.inherited) },
-          project: { own: withComputer(projectVals, computer.project.own), inherited: withComputer((await enrich(resolveParams(m, { global: globalVals }), projectVals)), computer.project.inherited) },
-          global: { own: withComputer(globalVals, computer.global.own), inherited: withComputer((await enrich(resolveParams(m, {}), { ...projectVals, ...globalVals })), computer.global.inherited) },
+          task: { own: {}, inherited: withComputer((await enrich(resolveParams(m, { project: projectVals, global: globalVals }), { ...globalVals, ...projectVals })), computer.task.inherited) },
+          project: { own: withComputer(projectVals, computer.project.own), inherited: withComputer((await enrich(resolveParams(m, { global: globalVals }), globalVals)), computer.project.inherited) },
+          global: { own: withComputer(globalVals, computer.global.own), inherited: withComputer((await enrich(resolveParams(m, {}), {})), computer.global.inherited) },
         });
       }
 

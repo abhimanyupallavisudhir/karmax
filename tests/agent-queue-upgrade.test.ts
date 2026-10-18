@@ -44,7 +44,10 @@ it('a queue run recorded before the drain keeps its rule, then rotates into one 
       taskQueue, workflowId: agentQueueId(),
       args: [{ state: { capacity: 1, queue: [], current: [{ taskId: 'holder', turnId: 'holder' }], processed: 49, modern: true } }],
     });
-    const waiting = [wait('a'), wait('b')];
+    // One at a time: two Updates sent together may be admitted in either order.
+    const waiting = [wait('a')];
+    await expect.poll(async () => (await view()).queue.map((x) => x.turnId), { timeout: 20_000 }).toEqual(['a']);
+    waiting.push(wait('b'));
     await expect.poll(async () => (await view()).queue.map((x) => x.turnId), { timeout: 20_000 }).toEqual(['a', 'b']);
     await expect.poll(async () => (await queue.describe()).raw.pendingWorkflowTask, { timeout: 20_000 }).toBeFalsy();
     await running.stop();

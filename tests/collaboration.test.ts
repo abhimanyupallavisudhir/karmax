@@ -184,7 +184,8 @@ describe.each(storeBackends)('organization and collaboration domain ($name)', ({
     (await store.setSettings(project.id, 'software-dev', { repos: ['/stale/local/path'], remote: 'none' }));
     (await store.attachProjectRepository({ projectId: project.id, repositoryId: repository.id, baseBranch: 'main', targetBranch: 'main' }));
     expect((await store.getProject(project.id))?.config.repos).toEqual(['git@github.com:acme/product.git']);
-    expect((await store.getSettings(project.id, 'software-dev'))).toMatchObject({ repos: ['git@github.com:acme/product.git'], remote: 'none' });
+    expect((await store.getSettings(project.id, 'software-dev'))).toMatchObject({ repos: ['git@github.com:acme/product.git'] });
+    expect((await store.getSettings(project.id, '__common__'))).toMatchObject({ remote: 'none' });
     await expect((async () => (await store.attachProjectRepository({ projectId: project.id, repositoryId:
       (await store.upsertRepository({ organizationId: other.id, provider: 'github', owner: 'other', name: 'secret',
         sshUrl: 'git@github.com:other/secret.git', defaultBranch: 'main', private: true })).id })))()).rejects.toThrow(/same organization/);
@@ -203,7 +204,8 @@ describe.each(storeBackends)('organization and collaboration domain ($name)', ({
     (await store.setProjectRepositorySources(project.id, ['/work/app', '/work/app', ' git@github.com:acme/api.git ']));
     const expected = ['/work/app', 'git@github.com:acme/api.git'];
     expect((await store.getProject(project.id))?.config.repos).toEqual(expected);
-    expect((await store.getSettings(project.id, 'software-dev'))).toMatchObject({ repos: expected, remote: 'none' });
+    expect((await store.getSettings(project.id, 'software-dev'))).toMatchObject({ repos: expected });
+    expect((await store.getSettings(project.id, '__common__'))).toMatchObject({ remote: 'none' });
     expect((await store.getSettings(project.id, 'just-do'))).toMatchObject({ repos: expected });
     expect((await store.getSettings(`quick:${project.id}`, 'software-dev'))).toMatchObject({ repos: expected });
   });
@@ -358,7 +360,7 @@ describe.each(storeBackends)('organization and collaboration domain ($name)', ({
     (await store.createOrganizationInvitation({ organizationId: organization.id, email: 'new@example.com', invitedBy: 'owner' }));
     (await store.setOrganizationIdentityPolicy({ organizationId: organization.id, oidcProviderId: 'enterprise' }));
     (await store.setOrganizationExecutionPolicy(organization.id, { worldProvider: 'e2b', network: { unrestricted: true } }));
-    (await store.setSettings(`organization:${organization.id}`, 'software-dev', { confirm: { mode: 'auto' } }));
+    (await store.setSettings(`organization:${organization.id}`, '__common__', { confirm: { mode: 'auto' } }));
     (await store.rotateScimToken(organization.id));
     (await store.registerWorld({ version: 2, id: task.id, kind: 'memory', provider: 'memory', generation: 1,
       runnerPoolId: 'local', environmentDigest: 'test', root: '/opaque', branch: 'task/test', base: 'main', meta: {} }, project.id));

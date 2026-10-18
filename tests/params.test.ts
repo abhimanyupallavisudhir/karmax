@@ -219,13 +219,24 @@ describe('projectSettingsFor (lazy back-compat from ProjectConfig)', () => {
   it('uses the stored settings row when present', async () => {
     const stored = { base: 'develop', repos: ['/other'] };
     const s = (await projectSettingsFor(() => stored, project, 'software-dev'));
-    expect(s).toBe(stored);
+    expect(s).toEqual(stored);
   });
 
-  it('merges shared defaults beneath workflow-specific settings', async () => {
+  it('merges workflow-specific settings over shared defaults', async () => {
     const get = (_scope: string, workflow: string) => workflow === '__common__'
-      ? { base: 'shared', target: 'main' } : workflow === 'software-dev' ? { base: 'workflow' } : undefined;
-    expect((await projectSettingsFor(get, project, 'software-dev'))).toMatchObject({ base: 'workflow', target: 'main' });
+      ? { base: 'shared', target: 'main' } : workflow === 'software-dev' ? { onCommandFailure: 'continue' } : undefined;
+    expect((await projectSettingsFor(get, project, 'software-dev'))).toEqual({ base: 'shared', target: 'main', onCommandFailure: 'continue' });
+  });
+
+  // Task defaults save shared fields only in `__common__`, deleting a field that
+  // matches what it inherits. A stale copy in a workflow row (from before the
+  // field moved to Task defaults) must not win, or the toggle reverts on reload.
+  it('reads shared fields only from the shared row, never a stale workflow row', async () => {
+    const rows: Record<string, Record<string, unknown>> = { '__common__': { otherAttempts: 'cancel' }, 'software-dev': { multiPr: false, remote: 'none', onCommandFailure: 'continue' } };
+    const get = (_scope: string, workflow: string) => rows[workflow];
+    expect((await projectSettingsFor(get, project, 'software-dev'))).toEqual({ otherAttempts: 'cancel', onCommandFailure: 'continue' });
+    expect((await globalSettingsFor(get, 'software-dev', 'org_team'))).toEqual({ otherAttempts: 'cancel', onCommandFailure: 'continue' });
+    expect(resolveParams(sd, { project: await projectSettingsFor(get, project, 'software-dev') }).multiPr).toBe(true);
   });
 
   it('globalSettingsFor returns {} when absent', async () => {

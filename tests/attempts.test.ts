@@ -193,6 +193,14 @@ describe('multiple task attempts', () => {
     (await f.store.close());
   });
 
+  it('keeps what a project without settings inherited from its config when saving the choice', async () => {
+    const f = (await choiceFixture());
+    (await f.store.updateProjectConfig(f.project.id, { defaultBase: 'develop', remote: 'push' }));
+    await f.api.signalTask(f.maintainer, f.first.id, 'confirm', undefined, undefined, undefined, undefined, { otherAttempts: 'keep', saveOtherAttemptsDefault: true });
+    expect((await f.store.getSettings(f.project.id, '__common__'))).toMatchObject({ base: 'develop', remote: 'push', otherAttempts: 'keep' });
+    (await f.store.close());
+  });
+
   it('snapshots an inherited choice at confirmation and permits kept drafts to queue', async () => {
     const f = (await choiceFixture());
     (await f.store.setSettings(f.project.id, '__common__', { otherAttempts: 'keep' }));
