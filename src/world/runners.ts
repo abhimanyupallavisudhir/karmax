@@ -56,7 +56,7 @@ export class RunnerPoolService {
       const pool = await this.store.getRunnerPool(managedId);
       const capacity = { ...DEFAULT_CAPACITY, ...(hostedActiveWorlds == null ? {} : { activeWorlds: hostedActiveWorlds }) };
       if (pool && pool.capacity.activeWorlds === capacity.activeWorlds) return pool;
-      return this.store.createRunnerPool({ ...(pool ?? {}), id: managedId, organizationId, name: `${provider.toUpperCase()} · managed`,
+      return this.store.createRunnerPool({ ...pool, id: managedId, organizationId, name: `${provider.toUpperCase()} · managed`,
         provider, mode: 'managed', capacity, enabled: true });
     }
     const id = `${organizationId}:${remote ? `managed-${provider}` : 'local'}`;

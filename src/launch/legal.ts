@@ -5,11 +5,11 @@
  * the version beside the text: acceptance evidence is useful only when it can be
  * tied to the exact disclosure a person saw.
  */
-import { HOSTED_PLANS } from '../domain/entitlements.js';
+import { COMPUTE_PACK, COMPUTE_PRICE_MULTIPLIER, HOSTED_PLANS, STORAGE_PACK } from '../domain/entitlements.js';
 import { DEFAULT_SITE_NAME } from '../domain/brand.js';
 
-export const POLICY_VERSION = '2026-10-12.1';
-export const POLICY_EFFECTIVE_DATE = 'October 12, 2026';
+export const POLICY_VERSION = '2026-10-18.1';
+export const POLICY_EFFECTIVE_DATE = 'October 18, 2026';
 export const POLICY_DRAFT_NOTICE = 'Launch draft pending final operator approval — not legal advice or a statement of completed legal review.';
 
 export type PolicySlug = 'terms' | 'acceptable-use' | 'privacy' | 'billing' | 'subprocessors' | 'security' | 'data' | 'dpa';
@@ -120,6 +120,10 @@ const docs: Record<PolicySlug, Omit<PolicyDocument, 'version' | 'effectiveDate'>
         'An organization owner can cancel online at any time from Organization settings → Plan & billing, without requiring email or a support call. The billing portal is also available online. Cancellation normally takes effect at the end of the current paid period and prevents the next renewal.',
         'Deleting an account does not silently replace subscription cancellation. The account-deletion flow directs customers to cancel first and support must resolve any active billing relationship as part of deletion.',
       ] },
+      { heading: 'Packs and managed compute', paragraphs: [
+        'A paid plan includes managed storage and, where tavya offers it, a monthly amount of managed compute: cloud computers tavya runs for tasks of an organization that has not connected its own provider account. Storage packs and compute packs add to them, billed monthly with the subscription and prorated on the next bill when added or removed. Packs end with the subscription.',
+        'Managed compute is charged against the month’s amount at twice the provider’s list price for the computer’s size and running time (and, where the provider charges for it, its disk), as shown in Organization settings. Unused compute does not carry over to the next month and is not refunded. When the month’s amount is used up, new agent work on managed computers waits, and their computers pause, until more is added or the next month begins; work already in an agent turn may finish that turn. Computers on an organization’s own provider account are billed by that provider, not by tavya.',
+      ] },
       { heading: 'Refunds and downgrades', paragraphs: [
         'Request refunds or report duplicate or erroneous charges through the configured billing contact or the payment provider. Paddle purchases are subject to Paddle’s buyer terms and refund decisions. Statutory consumer rights are not excluded. Approved Paddle refunds are processed through Paddle, not by a separate direct payment from tavya.',
         'Plan and active-user changes take effect after confirmation by the payment provider. Prorated adjustments are added to the next bill. A downgrade can reduce feature or usage limits when confirmed; cancellation at period end is a separate action.',
@@ -133,7 +137,7 @@ const docs: Record<PolicySlug, Omit<PolicyDocument, 'version' | 'effectiveDate'>
         'Paddle — merchant-of-record checkout, customer sales taxes, receipts, subscriptions, refunds, and related billing identifiers when Paddle is selected. Paddle also acts as an independent controller for its own payment and legal obligations; it does not receive repository/workspace content for subscription billing.',
         'Stripe — legacy subscription billing where configured, and the separate agent-card integration when selected; receives the account and payment information required for those functions, not repository/workspace content for subscription billing.',
         'OpenAI and Anthropic — prompts, selected repository/workspace context, attachments, and outputs when their model or connected subscription is selected. BYOK uses the customer’s provider account; managed usage uses the operator’s account.',
-        'E2B, Daytona, Fly.io or Hetzner Cloud — isolated compute (on Fly.io and Hetzner, a virtual machine and its disk volume in the region the organization chose), repository checkout, workspace files, environment variables made available to the world, command traffic, and resulting artifacts when that cloud world provider is selected.',
+        'E2B, Daytona, Fly.io or Hetzner Cloud — isolated compute (on Fly.io and Hetzner, a virtual machine and its disk volume in the region the organization or operator chose), repository checkout, workspace files, environment variables made available to the world, command traffic, and resulting artifacts when that cloud world provider is selected. An organization’s own provider account is used when it connects one; otherwise tasks run on the operator’s account (managed compute), where available.',
         'one.com — VPS hosting and server backups where used by the operator. This can include application databases and encrypted vault material, plus, until it is removed in November 2026, the copy of stored objects made before they moved to Cloudflare R2. A core-hosting location is not a location guarantee for model calls, sandboxes or integrations.',
         'Cloudflare (R2, Email Routing) — managed object storage in R2’s EU jurisdiction, which keeps stored objects in EU data centres: world checkpoints and project resource data (encrypted by tavya before upload), review attachments and conversation exports; and, in a separate bucket, encrypted backups of tavya’s databases (encrypted before upload; kept 31 days); and, for agent mailboxes, inbound email routing that delivers messages to tavya without storing them. Deleted objects are kept up to 30 days so backups stay restorable. Data an organization places in a storage bucket it connects itself goes to that bucket instead.',
         'Cloudflare (Workers) — carries resource saves and reads between task sandboxes and the organization’s storage (managed R2, or a bucket it connects), so they need not pass through tavya’s servers. The data is encrypted before it leaves the sandbox, passes through the Cloudflare location nearest the sandbox (which may be outside the EU), and is not stored there.',
@@ -340,6 +344,7 @@ export function publicLaunchInfo(env: NodeJS.ProcessEnv = process.env, stored?: 
     acceptance: { signup: policyVersions('signup'), checkout: policyVersions('checkout') },
     pricingCatalog: Object.values(HOSTED_PLANS).map((plan) => ({ ...plan, currency: 'usd' as const,
       billingInterval: 'month' as const })),
+    packs: { storage: STORAGE_PACK, compute: COMPUTE_PACK, computePriceMultiplier: COMPUTE_PRICE_MULTIPLIER },
     checkoutDisclosures: CHECKOUT_DISCLOSURES,
     // These are deliberately public operator fields, not private KYC details.
     // Publishing them must not depend on opening checkout or approving drafts.
