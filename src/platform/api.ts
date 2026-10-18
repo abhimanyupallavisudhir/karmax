@@ -5879,10 +5879,18 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       if (args[key] !== undefined && args[key] !== '' && args.params?.[key] === undefined) params[key] = args[key];
     const authorization = template.authorization && (template.authorization.scope === 'projects' && !template.authorization.projectIds?.length
       ? { ...template.authorization, projectIds: [args.projectId] } : template.authorization);
+    // A template's tags are names: they apply where this project has them.
+    let tags = template.tags;
+    if (tags?.length && args.tags === undefined) {
+      const known = (await this.deps.store.listTags(args.projectId));
+      const byId = new Map(known.map((tag) => [tag.id, tag]));
+      const names = new Set(known.flatMap((tag) => [tag.name.toLowerCase(), tagPath(tag, byId).toLowerCase()]));
+      tags = tags.filter((name) => names.has(name.toLowerCase()));
+    }
     const pick = <K extends string>(key: K, fallback: unknown) => (args[key] !== undefined ? {} : fallback !== undefined ? { [key]: fallback } : {});
     return { ...args, params, ...pick('workflow', template.workflow), ...pick('notes', template.notes),
       ...pick('authorization', authorization), ...pick('credentialGrants', template.credentialGrants),
-      ...pick('credentialPolicies', template.credentialPolicies), ...pick('tags', template.tags), ...pick('priority', template.priority) };
+      ...pick('credentialPolicies', template.credentialPolicies), ...pick('tags', tags), ...pick('priority', template.priority) };
   }
 
   /** Restart a terminally failed software-dev execution without running Setup.

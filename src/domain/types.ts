@@ -1324,7 +1324,7 @@ export interface TaskTemplate {
   authorization?: AuthorizationSelection;
   credentialGrants?: string[];
   credentialPolicies?: Record<string, unknown>;
-  /** Tag names (a project's tags are matched, or created, by name). */
+  /** Tag names: a task started from it gets the project's tags of these names. */
   tags?: string[];
   priority?: number;
   createdBy?: string;

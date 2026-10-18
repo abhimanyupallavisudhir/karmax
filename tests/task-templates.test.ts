@@ -111,15 +111,18 @@ describe('task templates', () => {
 
   it('starts a task from a template, the caller’s values over the template’s', async () => {
     const template = await call('POST', `/api/projects/${website}/templates`, { name: 'Upgrade', workflow: 'software-dev',
-      params: { prompt: 'Upgrade the dependencies', target: 'release' }, notes: 'monthly chore', tags: ['chore'], priority: 2,
+      params: { prompt: 'Upgrade the dependencies', target: 'release' }, notes: 'monthly chore', tags: ['chore', 'nowhere'], priority: 2,
       authorization: { level: 'developer', scope: 'projects', projectIds: [website] } });
+    await store.createTag({ projectId: website, name: 'chore' });
     const task = await call('POST', `/api/projects/${website}/tasks`, { templateId: template.body.id, draft: true });
     expect(task.status, JSON.stringify(task.body)).toBe(200);
     const stored = (await store.getTask(task.body.id))!;
     expect(stored.params).toMatchObject({ prompt: 'Upgrade the dependencies', target: 'release', priority: 2, draft: true });
     expect(stored.notes).toBe('monthly chore');
     expect((stored.params._authorization as any).projectIds).toEqual([website]);
+    // Its tags where the project has them; no new ones.
     const tags = await store.listTags(website);
+    expect(tags.map((tag) => tag.name)).toEqual(['chore']);
     expect((await store.tagsFor(stored.id)).map((id) => tags.find((tag) => tag.id === id)?.name)).toEqual(['chore']);
 
     const overridden = await call('POST', `/api/projects/${website}/tasks`, { templateId: template.body.id, draft: true,
