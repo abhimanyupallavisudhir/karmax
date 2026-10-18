@@ -360,7 +360,8 @@ export const PLATFORM_API_CATALOG = {
   cloud: [
     'GET|PUT /api/organizations/:organizationId/execution-policy',
     'GET|PUT /api/projects/:projectId/execution-policy',
-    'GET /api/organizations/:organizationId/world-providers (the organization\'s own provider accounts, plus managed: true entries for providers it has not connected that the installation offers — managed compute, charged to its monthly compute credit)',
+    'GET /api/organizations/:organizationId/world-providers',
+    'Managed compute: the world-providers list also has managed: true entries — providers the organization has not connected that the installation runs for it, charged to its monthly compute credit (GET /api/organizations/:organizationId/entitlements → compute); connecting its own account replaces one',
     'GET /api/organizations/:organizationId/computers (what each task holds at its cloud provider, in the projects you can read: {computers: [{taskId, num, title, projectName, taskStatus, provider, state: ready (running) | parked (stopped, disk kept) | degraded (lost), since, machine {cpu, memoryMb, diskGb}, releasable}]}; a provider limit that is full is freed with POST /api/tasks/:taskId/release-computer)',
     'PUT|DELETE /api/organizations/:organizationId/world-providers/:provider',
     'POST /api/organizations/:organizationId/world-providers/:provider/test',

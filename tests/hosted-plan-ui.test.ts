@@ -19,7 +19,6 @@ const esc = (value: unknown) => String(value ?? '').replace(/[&<>"]/g, (c) => ({
 const markup = Function('esc', 'S', 'location', `
   const policyTip = (text) => '<i title="' + esc(text) + '">ⓘ</i>';
   const siteName = () => 'tavya';
-  const policyLinks = () => 'Billing terms';
   const policyAcceptanceMarkup = () => '<label class="policy-acceptance"></label>';
   const COMPUTER_PROVIDERS = { e2b: { name: 'E2B' }, hetzner: { name: 'Hetzner' } };
   ${extractFunction('formatBytes')}
@@ -48,7 +47,8 @@ const text = (html: string) => html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' '
 describe('Plan & billing', () => {
   it('shows each limit against its use, and plan choices on Free', () => {
     const html = markup(entitlements({ activeAgentRuns: 1, queuedAgentRuns: 2 }), status());
-    expect(text(html)).toContain('Free Free');
+    expect(text(html)).toMatch(/^\s*Free\s+People/);
+    expect(text(html)).toContain('100 GB storage (+10 GB/person)');
     expect(text(html)).toMatch(/People 1 of 1/);
     expect(text(html)).toMatch(/5 at once 1 working, 2 waiting/);
     expect(text(html)).toMatch(/2 GB of 5 GB/);

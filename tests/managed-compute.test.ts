@@ -207,3 +207,26 @@ describe('managed compute usage', () => {
     expect((await computeCredit(f.store, f.organization.id, Date.UTC(2026, 9, 15))).usedMicros).toBe(266_400);
   });
 });
+
+describe('out-of-compute notices', () => {
+  it('tells the owners once a month while the credit is spent, and withdraws it when there is credit again', async () => {
+    const { notifyComputeCredit } = await import('../src/world/compute-notices.js');
+    const f = await fixture();
+    await f.store.setOrganizationPlan(f.organization.id, 'individual');
+    const sent: Array<{ to: string; subject: string; text: string }> = [];
+    const deps = { store: f.store, email: { configured: async () => true, send: async (message: any) => { sent.push(message); } },
+      userEmail: async (userId: string) => `${userId}@example.test`, publicUrl: 'https://tavya.test', siteName: async () => 'tavya' };
+    expect(await notifyComputeCredit(deps)).toBe(0);
+    await f.usage('spent', 2_500_000);
+    expect(await notifyComputeCredit(deps)).toBe(1);
+    expect(await notifyComputeCredit(deps)).toBe(0);
+    const inbox = await f.store.listInbox('owner', f.organization.id);
+    expect(inbox).toHaveLength(1);
+    expect(inbox[0]!.subject).toMatchObject({ kind: 'compute', usedMicros: 5_000_000, creditMicros: 5_000_000 });
+    expect(sent).toEqual([expect.objectContaining({ to: 'owner@example.test', subject: 'Acme has used this month\'s tavya compute' })]);
+    expect(sent[0]!.text).toMatch(/\$5\.00 of its \$5\.00[\s\S]*add a compute pack[\s\S]*https:\/\/tavya\.test\/settings/);
+    await f.store.setComputePackGift(f.organization.id, 1, 'operator');
+    await notifyComputeCredit(deps);
+    expect(await f.store.listInbox('owner', f.organization.id)).toHaveLength(0);
+  });
+});

@@ -20931,6 +20931,7 @@ function inboxRowLabel(item) {
   if (item.subject?.kind === 'avatar-authorization') return 'Avatar authorization approval';
   if (item.subject?.kind === 'service-limit') return item.subject.level === 'failed' ? `Can’t read ${item.subject.serviceName} usage`
     : `${item.subject.serviceName} at ${Math.floor((item.subject.used / item.subject.limit) * 100)}% of its limit${item.subject.level === 95 ? ' — upgrade now' : ''}`;
+  if (item.subject?.kind === 'compute') return `Out of compute — renews ${new Date(item.subject.renewsAt).toLocaleDateString()}`;
   if (item.subject?.kind === 'storage') return item.subject.stage === 'deleted'
     ? 'Stored data deleted to fit the limit'
     : `Over the storage limit — free space by ${new Date(item.subject.deleteAt).toLocaleDateString()}`;
@@ -20945,6 +20946,7 @@ function inboxRowLabel(item) {
 function inboxTitle(item, fallback = item.kind) {
   if (item.subject?.kind === 'credential') return `${item.subject.provider}:${item.subject.account}`;
   if (item.subject?.kind === 'storage') return `Storage · ${formatBytes(item.subject.retainedBytes)} of ${formatBytes(item.subject.quotaBytes)}`;
+  if (item.subject?.kind === 'compute') return `Compute · $${(item.subject.usedMicros / 1e6).toFixed(2)} of $${(item.subject.creditMicros / 1e6).toFixed(2)}`;
   if (item.subject?.kind === 'service-limit') return item.subject.level === 'failed' ? `${item.subject.serviceName} · ${item.subject.error}`
     : `${item.subject.serviceName} · ${item.subject.label} ${limitAmount(item.subject.used, item.subject.unit)} of ${limitAmount(item.subject.limit, item.subject.unit, true)}`;
   return item.task?.title || item.resource?.name || fallback;
@@ -21172,6 +21174,7 @@ function markInboxItemRead(item) {
 function inboxItemRoute(item) {
   if (item?.subject?.kind === 'credential') return `${globalRoute('organization', organizationById(item.organizationId))}#settings-agents`;
   if (item?.subject?.kind === 'storage') return `${globalRoute('organization', organizationById(item.organizationId))}#settings-storage`;
+  if (item?.subject?.kind === 'compute') return `${globalRoute('organization', organizationById(item.organizationId))}#settings-plan`;
   if (item?.subject?.kind === 'service-limit') return `${installationRoute()}#installation-limits`;
   if (item?.subject?.kind === 'avatar-authorization') {
     const project = projectById(item.subject.projectId);
@@ -22125,7 +22128,7 @@ function managedComputeMarkup(view) {
   const money = (micros) => `$${(Number(micros || 0) / 1e6).toFixed(2)}`;
   const rows = Object.entries(COMPUTER_PROVIDERS).map(([id, info]) => {
     const account = (view.providers || []).find((candidate) => candidate.provider === id);
-    const state = !account ? null : !account.enabled ? ['off', ''] : account.status === 'error' ? ['failing', 'failed'] : ['on', 'done'];
+    const state = !account ? null : !account.enabled ? ['Off', ''] : account.status === 'error' ? ['Failing', 'failed'] : ['On', 'done'];
     const hours = account ? Math.round(account.seconds / 360) / 10 : 0;
     return `<div class="computer-provider" data-provider="${id}"><b>${esc(info.name)}</b>
       ${state ? `<span class="chip ${state[1]}"${account.lastError ? ` title="${esc(account.lastError)}"` : ''}>${state[0]}</span>` : ''}
@@ -22202,7 +22205,7 @@ function planBillingMarkup(e, state) {
   const statusChip = state?.gift && !subscribed ? 'Gifted'
     : state?.cancelAtPeriodEnd && state.currentPeriodEnd ? `Ends ${day(state.currentPeriodEnd)}`
     : ({ past_due: 'Payment failed', unpaid: 'Unpaid', paused: 'Paused', incomplete: 'Checkout incomplete', trialing: 'Trial' })[state?.status] || '';
-  const price = state?.gift && !subscribed ? '' : e.plan === 'free' ? 'Free' : `${planMoney(e.currentMonthlyPriceCents)}/month`;
+  const price = (state?.gift && !subscribed) || e.plan === 'free' ? '' : `${planMoney(e.currentMonthlyPriceCents)}/month`;
   const renews = paying && !state.cancelAtPeriodEnd && state.currentPeriodEnd ? ` · renews ${day(state.currentPeriodEnd)}` : '';
   const change = paying && billed === 'individual' ? `<button class="btn sm billing-change" data-plan="team" ${disabled}>Upgrade to Team</button>`
     : paying && billed === 'team' ? `<button class="btn sm billing-change" data-plan="individual" ${disabled || (e.activeUsers > 1 ? 'disabled title="Remove other members first"' : '')}>Switch to Individual</button>` : '';
@@ -22212,7 +22215,7 @@ function planBillingMarkup(e, state) {
     ${paying && !state.cancelAtPeriodEnd ? `<button class="btn sm ghost billing-cancel" ${owner ? '' : disabled}>Cancel plan</button>` : ''}</div>`;
   // People.
   const members = Number(e.currentMemberCount ?? e.activeUsers ?? 0);
-  const people = e.maxMembers != null ? `${members} of ${e.maxMembers}` : plural(members, 'person');
+  const people = e.maxMembers != null ? `${members} of ${e.maxMembers}` : `${members} ${members === 1 ? 'person' : 'people'}`;
   const seatTip = e.plan === 'team' ? `First person included, then ${planMoney(e.monthlyAdditionalActiveUserPriceCents)}/month each.` : '';
   const seatsPending = state?.seatDeficit && billed === 'team'
     ? `<span class="warn">${plural(state.seatDeficit, 'seat')} not yet billed</span>` : '';
@@ -22266,11 +22269,12 @@ function planBillingMarkup(e, state) {
     const card = (plan) => {
       if (!plan) return '';
       const team = plan.id === 'team';
-      const per = (base, extra, fmt) => team && extra ? `${fmt(base)} + ${fmt(extra)}/person` : fmt(base);
+      const per = (text, extra) => (team && extra ? `${text} (+${extra}/person)` : text);
+      const dollars = (micros) => planDollars(micros).replace('.00', '');
       const items = [team ? 'Any number of people' : '1 person',
-        `${per(plan.maxActiveAgentRuns, plan.additionalActiveUserAgentRuns, (n) => n)} agents at once`,
-        `${per(plan.storageBytes, plan.additionalActiveUserStorageBytes, formatBytes)} storage`,
-        ...(e.compute ? [`${per(plan.computeCreditMicros, plan.additionalActiveUserComputeCreditMicros, (m) => planDollars(m).replace('.00', ''))} compute a month`] : [])];
+        per(`${plan.maxActiveAgentRuns} agents at once`, plan.additionalActiveUserAgentRuns),
+        per(`${formatBytes(plan.storageBytes)} storage`, plan.additionalActiveUserStorageBytes && formatBytes(plan.additionalActiveUserStorageBytes)),
+        ...(e.compute ? [per(`${dollars(plan.computeCreditMicros)} compute a month`, plan.additionalActiveUserComputeCreditMicros && dollars(plan.additionalActiveUserComputeCreditMicros))] : [])];
       return `<div class="plan-choice" data-plan="${esc(plan.id)}"><div class="plan-choice-head"><b>${esc(plan.name)}</b><span>${esc(planMoney(plan.monthlyBasePriceCents))}<small>/month${team ? ` + ${planMoney(plan.monthlyAdditionalActiveUserPriceCents)}/person` : ''}</small></span></div>
         <ul>${items.map((item) => `<li>${esc(item)}</li>`).join('')}</ul>
         <button class="btn sm primary billing-checkout" data-plan="${esc(plan.id)}" ${ready && owner ? '' : `disabled title="${esc(!owner ? 'Only an organization owner can choose a plan' : 'Checkout isn’t open yet')}"`}>Choose ${esc(plan.name)}</button></div>`;
@@ -22294,7 +22298,7 @@ function planBillingMarkup(e, state) {
       <span class="setting-actions"><button class="btn sm billing-gift-packs" data-kind="compute">Save</button></span></div>
   </div></details>` : '';
   return `${head}${noteHtml}<div class="setting-rows ruled plan-limits">${peopleRow}${agentsRow}${storageRow}${computeRow}</div>${choices}${gifts}
-    ${state?.managed ? `<p class="plan-foot setting-muted">Separate from the cards agents pay with. ${policyLinks(['billing'])}</p>` : ''}`;
+    ${subscribed ? `<p class="plan-foot setting-muted">Separate from the cards agents pay with. <a href="/legal/billing" data-public>Billing terms</a></p>` : ''}`;
 }
 
 async function hydratePlanAndBilling(organizationId) {
@@ -22304,7 +22308,9 @@ async function hydratePlanAndBilling(organizationId) {
   const [entitlements, state] = await Promise.all([api(`${base}/entitlements`).catch(() => null),
     api(`${base}/subscription/status`).catch(() => null)]);
   if (!$('#org-plan') || S.organizationId !== organizationId) return;
+  const giftsOpen = box.querySelector('.plan-operator')?.open;
   box.innerHTML = planBillingMarkup(entitlements, state?.managed ? state : null);
+  if (giftsOpen && box.querySelector('.plan-operator')) box.querySelector('.plan-operator').open = true;
   const reload = () => hydratePlanAndBilling(organizationId);
   const post = (path, body) => api(`${base}/subscription/${path}`, { method: 'POST', headers: { 'idempotency-key': billingRequestKey() },
     ...(body ? { body: JSON.stringify(body) } : {}) });

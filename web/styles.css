@@ -1572,7 +1572,7 @@ a.ins-task-title:hover { color: var(--accent); }
 .plan-meter.over > i { background:var(--danger); }
 .pack-stepper { display:inline-flex; align-items:center; gap:2px; font-variant-numeric:tabular-nums; }
 .pack-stepper > b { min-width:20px; text-align:center; }
-.pack-stepper .setting-muted { margin-left:4px; font-size:12.5px; }
+.pack-stepper .setting-muted { min-width:38px; margin-left:4px; font-size:12.5px; }
 .plan-note { display:flex; align-items:center; flex-wrap:wrap; gap:8px; margin:6px 0; font-size:13px; color:var(--ink-2); }
 .plan-note.danger { color:var(--danger); }
 .plan-note.warn { color:var(--working); }

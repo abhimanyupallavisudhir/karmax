@@ -27,6 +27,7 @@ import { ServiceError, WorkflowNotFoundError, WorkflowUpdateFailedError, isGrpcS
 import { Context as activityContext } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
 import { assertComputeCredit } from '../world/managed-compute.js';
+import { MANAGED_COMPUTE } from '../world/connections.js';
 import { AgentChannelLost, ProviderCapacityFull, ProviderOutage, ProviderPolicyFailure, SandboxProviderFailure, confirmSandboxFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, isContextOverflow, type LimitClassification } from '../agent/limits.js';
 import { probeClaudeUsage, probeCodexUsage, type UsageResult } from '../agent/usage.js';
 import { markCheckpointStale } from '../world/checkpoint-staleness.js';
@@ -720,8 +721,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
   }
 
   /** What a computer on this organization's provider account may be. */
+  /** The organization's own account's limits, else (managed compute) the installation's. */
   async function accountLimits(organizationId: string, kind: string) {
-    const connection = await store.getWorldProviderConnection(organizationId, kind).catch(() => undefined);
+    const connection = await store.getWorldProviderConnection(organizationId, kind).catch(() => undefined)
+      ?? await store.getWorldProviderConnection(MANAGED_COMPUTE, kind).catch(() => undefined);
     return computerLimits(kind, connection?.measuredLimits, connection?.config.limits);
   }
 
@@ -3118,7 +3121,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (project?.organizationId) {
           const own = normalizeComputer(preparationTask?.params.computer)?.provider;
           if (own && own !== promptWorld.kind) moveTo = own;
-          const connections = await store.listWorldProviderConnections(project.organizationId);
+          const ownConnections = await store.listWorldProviderConnections(project.organizationId);
+          // Managed compute offers the providers the organization has not connected itself.
+          const connections = [...ownConnections, ...(await store.listWorldProviderConnections(MANAGED_COMPUTE))
+            .filter((managed) => !ownConnections.some((connection) => connection.provider === managed.provider))];
           otherProviders = await Promise.all(connections
             .filter((connection) => connection.enabled && connection.provider !== promptWorld.kind
               && (() => { try { return isRemote(connection.provider as WorldKind); } catch { return false; } })())

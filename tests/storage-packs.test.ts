@@ -410,3 +410,56 @@ describe('Paddle storage pack items', () => {
       .rejects.toThrow(new BillingRequestRejected('storage packs are billed only through Paddle'));
   });
 });
+
+describe('Paddle compute pack items', () => {
+  const compute = { computePackPriceId: 'pri_compute', computePackProductId: 'pro_compute' };
+  const computeItem = (quantity: number) => item('pri_compute', quantity, 'pro_compute');
+
+  it('sets compute packs beside storage packs, keeping each other\'s line through every rewrite', async () => {
+    const api = paddle([item('pri_team', 1), item('pri_seat', 1), item('pri_pack', 2)], compute);
+    await api.provider.updateComputePacks({ subscriptionId: 'sub_1', computePacks: 3, idempotencyKey: 'k' });
+    expect(api.writes.at(-1).items).toEqual([{ price_id: 'pri_team', quantity: 1 }, { price_id: 'pri_seat', quantity: 1 },
+      { price_id: 'pri_pack', quantity: 2 }, { price_id: 'pri_compute', quantity: 3 }]);
+    await api.provider.updateStoragePacks({ subscriptionId: 'sub_1', storagePacks: 0, idempotencyKey: 'k' });
+    expect(api.writes.at(-1).items).toEqual([{ price_id: 'pri_team', quantity: 1 }, { price_id: 'pri_seat', quantity: 1 },
+      { price_id: 'pri_compute', quantity: 3 }]);
+    await api.provider.changePlan({ subscriptionId: 'sub_1', plan: 'individual', seats: 1, items: {}, idempotencyKey: 'k' });
+    expect(api.writes.at(-1).items).toEqual([{ price_id: 'pri_individual', quantity: 1 }, { price_id: 'pri_compute', quantity: 3 }]);
+    await expect(paddle([item('pri_team', 1)]).provider.updateComputePacks({ subscriptionId: 'sub_1', computePacks: 1, idempotencyKey: 'k' }))
+      .rejects.toThrow(new BillingRequestRejected('compute packs are not configured'));
+    const reconcile = (intent: any) => api.provider.reconcileRequest(intent, 'ref', Date.now());
+    expect(await reconcile({ kind: 'compute', subscriptionId: 'sub_1', computePacks: 3 })).toEqual({ id: 'sub_1' });
+    expect(await reconcile({ kind: 'compute', subscriptionId: 'sub_1', computePacks: 1 })).toEqual({ absent: true });
+    expect(await reconcile({ kind: 'change', subscriptionId: 'sub_1', plan: 'individual', seats: 1 })).toEqual({ id: 'sub_1' });
+  });
+
+  it('grants compute packs only from the signed subscription, and none on a lapsed one', async () => {
+    const store = await Store.create(':memory:', { hosted: true });
+    const organization = await store.createOrganization({ name: 'Paddle compute', ownerUserId: 'owner' });
+    const api = paddle([item('pri_individual', 1)], compute);
+    const billing = new SubscriptionBillingService(store, api.provider, true);
+    await billing.checkout(organization.id, 'individual', urls, 'paddle-compute-checkout');
+    const snapshot = (id: string, at: string, items: any[], status = 'active') => signed({ event_id: id,
+      event_type: id === 'evt_created' ? 'subscription.created' : 'subscription.updated', occurred_at: at,
+      data: { id: 'sub_1', customer_id: 'ctm_1', transaction_id: 'txn_packs', status, items, scheduled_change: null } });
+    let delivery = snapshot('evt_created', '2026-10-01T00:00:00Z', [item('pri_individual', 1)]);
+    await billing.handleWebhook(delivery.raw, delivery.signature);
+    expect(await billing.computePacks(organization.id, 2, 'compute-packs-1')).toMatchObject({ id: 'sub_1' });
+    expect((await store.organizationEntitlements(organization.id)).computePacks).toBe(0);
+    delivery = snapshot('evt_packs', '2026-10-01T00:01:00Z', [item('pri_individual', 1), computeItem(2)]);
+    await billing.handleWebhook(delivery.raw, delivery.signature);
+    expect(await billing.current(organization.id)).toMatchObject({ computePacks: 2, computePack: { available: true } });
+    expect(await store.organizationEntitlements(organization.id)).toMatchObject({ computePacks: 2, computeCreditMicros: 25_000_000 });
+    delivery = snapshot('evt_lapsed', '2026-10-01T00:02:00Z', [item('pri_individual', 1), computeItem(2)], 'paused');
+    await billing.handleWebhook(delivery.raw, delivery.signature);
+    expect(await store.organizationEntitlements(organization.id)).toMatchObject({ plan: 'free', computePacks: 0, computeCreditMicros: 0 });
+    await expect(billing.computePacks(organization.id, 1, 'compute-packs-2')).rejects.toThrow(/active paid subscription/);
+    await store.close();
+  });
+
+  it('is refused by the legacy Stripe adapter', async () => {
+    const stripe: SubscriptionProvider = new StripeSubscriptionProvider({}, vi.fn() as any);
+    await expect(stripe.updateComputePacks({ subscriptionId: 'sub_1', computePacks: 1, idempotencyKey: 'k' }))
+      .rejects.toThrow(new BillingRequestRejected('compute packs are billed only through Paddle'));
+  });
+});

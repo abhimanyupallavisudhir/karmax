@@ -5346,6 +5346,43 @@ export class Store {
   /** The organization owners' storage notice (one current stage at a time),
    * or none once the organization is back within its quota. Email is sent by
    * the notifier itself, so only browser and Slack delivery are queued here. */
+  /** An organization's owners' "out of compute" inbox item: one per owner and
+   * month while the month's managed compute credit is spent, withdrawn once
+   * there is credit again or the month ends. Returns how many owners were
+   * newly told (they are emailed too). */
+  async syncComputeInbox(organizationId: string, userIds: string[],
+    notice: { month: string; usedMicros: number; creditMicros: number; renewsAt: number } | undefined, createdAt = Date.now()): Promise<number> {
+    return this.db.transaction(async () => {
+      (await this.lockOrganization(organizationId));
+      const ids = new Map<string, string>();
+      if (notice) for (const userId of new Set(userIds)) ids.set(`inbox_compute_${crypto.createHash('sha256')
+        .update(JSON.stringify([organizationId, userId, notice.month])).digest('hex').slice(0, 24)}`, userId);
+      const stale = ((await this.db.prepare(`SELECT id FROM inbox WHERE organizationId=? AND json_extract(subject, '$.kind')='compute'`)
+        .all(organizationId)) as Array<{ id: string }>).map((row) => String(row.id)).filter((id) => !ids.has(id));
+      if (stale.length) {
+        (await deleteRows(this.db, 'delivery_outbox', 'inboxId', stale));
+        (await deleteRows(this.db, 'inbox', 'id', stale));
+      }
+      if (!notice) return 0;
+      let told = 0;
+      for (const [id, userId] of ids) {
+        const inserted = (await this.db.prepare(`INSERT OR IGNORE INTO inbox
+          (id, organizationId, userId, eventSeq, taskId, kind, urgency, unread, actionable, createdAt, subject)
+          VALUES (?, ?, ?, ?, ?, 'escalated', ?, 1, 1, ?, ?)`).run(
+          id, organizationId, userId, createdAt * 1000, `compute:${organizationId}`, urgencyRank('high'), createdAt,
+          JSON.stringify({ kind: 'compute', ...notice })));
+        if (!Number(inserted.changes)) continue;
+        told++;
+        const preferences = (await this.getDeliveryPreferences(userId, organizationId));
+        for (const channel of [preferences.browser && 'browser', preferences.slack && 'slack'].filter(Boolean) as string[])
+          (await this.db.prepare(`INSERT OR IGNORE INTO delivery_outbox
+            (id, inboxId, channel, state, attempts, nextAt, createdAt) VALUES (?, ?, ?, 'pending', 0, ?, ?)`)
+            .run(newId('delivery'), id, channel, createdAt, createdAt));
+      }
+      return told;
+    });
+  }
+
   async syncStorageInbox(organizationId: string, userIds: string[],
     notice: { stage: string; retainedBytes: number; quotaBytes: number; deleteAt: number } | undefined, createdAt = Date.now()): Promise<void> {
     return this.db.transaction(async () => {

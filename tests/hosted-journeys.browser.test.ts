@@ -190,11 +190,11 @@ describe('hosted console journeys (real gateway, stubbed paid providers)', () =>
     try {
       await signIn(context, g.url, owner.email, PASSWORD);
       await step('open Plan & billing', () => page.goto(`${g.url}/${organization.slug}/settings#settings-plan`));
-      await page.locator('#org-plan .section-h').filter({ hasText: 'Free' }).waitFor();
+      await page.locator('#org-plan .plan-name').filter({ hasText: 'Free' }).waitFor();
       await page.locator('#checkout-policy-acceptance').check();
       await page.locator('button.billing-checkout[data-plan="individual"]').click();
       await step('Paddle checkout returns to settings', () => page.waitForURL(/billing=success/));
-      await page.getByText('Checkout completed').waitFor();
+      await page.getByText('Payment received.', { exact: false }).waitFor();
       const [transaction] = [...paddle.transactions.values()];
       expect(transaction.items).toEqual([{ price: { id: PADDLE.individualPriceId }, quantity: 1 }]);
       expect((await g.store.getOrganization(organization.id))?.plan ?? 'free').toBe('free');
@@ -204,8 +204,8 @@ describe('hosted console journeys (real gateway, stubbed paid providers)', () =>
         headers: { 'paddle-signature': notification.signature } });
       expect(delivered.status).toBe(200);
       await page.reload();
-      await step('the plan is active', () => page.locator('#org-plan .section-h').filter({ hasText: 'Individual' }).waitFor());
-      expect(await page.locator('#org-subscription').innerText()).toMatch(/individual\s+active/i);
+      await step('the plan is active', () => page.locator('#org-plan .plan-name').filter({ hasText: 'Individual' }).waitFor());
+      expect(await page.locator('#org-plan .plan-head').innerText()).toMatch(/Individual\s+\$9\/month · renews/);
       expect(errors).toEqual([]);
     } finally { await context.close(); }
   }, 90_000);

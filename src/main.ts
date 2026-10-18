@@ -502,6 +502,13 @@ async function main() {
   }, 3600_000);
   managedStorageTimer.unref();
   startupJobs.push(() => managedStorageTimer.run());
+  // Managed compute: tell owners once a month when the compute credit is spent.
+  const { notifyComputeCredit } = await import('./world/compute-notices.js');
+  const computeNoticeTimer = new AsyncInterval(async () => { await notifyComputeCredit({ store, email: emailService,
+    publicUrl: process.env.KARMAX_PUBLIC_URL, userEmail: async (userId) => (await identity.userById(userId))?.email ?? undefined,
+    siteName: async () => siteNameOf((await store.getSettings('global', 'appearance'))) }); }, 3600_000);
+  computeNoticeTimer.unref();
+  startupJobs.push(() => computeNoticeTimer.run());
   // Service limits: sample the operator's accounts every 15 minutes, so a
   // daily allowance is caught well before it runs out.
   const serviceLimitsTimer = new AsyncInterval(() => serviceLimits.run(), 15 * 60_000);
