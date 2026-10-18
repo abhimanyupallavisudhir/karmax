@@ -1749,8 +1749,8 @@ export class ProjectResourceService {
     // sub-task's: its parent's copy), also once restored from a park's capture.
     // Or from the newest version merged into it before Review.
     // Or from what this task published itself since (a pull request carries its data): Review shows only what is new.
-    const forkedId = await this.mergeBase(taskId, attachment.currentRevisionId,
-      await this.integratedBase(taskId, handle, lease, attachmentId) ?? await this.ownForkPoint(taskId, lease.revisionId));
+    const forkPointId = await this.integratedBase(taskId, handle, lease, attachmentId) ?? await this.ownForkPoint(taskId, lease.revisionId);
+    const forkedId = await this.mergeBase(taskId, attachment.currentRevisionId, forkPointId);
     const started = forkedId ? await this.store.getResourceRevision(forkedId) : undefined;
     const restoredFrom = lease.revisionId && lease.revisionId !== forkedId ? await this.store.getResourceRevision(lease.revisionId) : started;
     const label = attachment.target.kind === 'path' ? locationLabel(attachment.target) : attachment.name;
@@ -1771,6 +1771,8 @@ export class ProjectResourceService {
     }
     const summary: ResourceChangeSummary = { attachmentId: attachment.id, baseRevisionId: forkedId,
       ...await this.changes(repository, started, capture) };
+    // Measured from its own publication: nothing new means it is all published.
+    if (forkedId !== forkPointId && summary.added + summary.modified + summary.deleted === 0) summary.promoted = true;
     // Keep the lease's original baseline (and its publication CAS fence), but
     // stop asking for a decision on bytes this task has already published.
     let publishedId = attachment.currentRevisionId;
@@ -2150,6 +2152,13 @@ export class ProjectResourceService {
     const integrated = await this.integratedBase(taskId, handle, lease, attachmentId);
     const forkedId = integrated ?? await this.ownForkPoint(taskId, lease.revisionId);
     const started = forkedId ? await this.store.getResourceRevision(forkedId) : undefined;
+    // Nothing of its own since its last publication: publishing changes nothing
+    // (neither reverting what others published since, nor taking it in).
+    if (summary.baseRevisionId !== forkedId && summary.added + summary.modified + summary.deleted === 0) {
+      await this.discardCapture(repository, capture);
+      const now = await this.requiredAttachment(attachmentId);
+      return { attachment: now, revision: (await this.store.getResourceRevision(now.currentRevisionId!))!, summary };
+    }
     // Identical to what the world started from: there is nothing to publish.
     if (started?.attachmentId === attachment.id && summary.added + summary.modified + summary.deleted === 0) {
       await this.discardCapture(repository, capture);
