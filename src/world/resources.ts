@@ -1437,6 +1437,28 @@ export class ProjectResourceService {
   /** Output the task proposed that has no snapshot yet and was not excluded:
    * completing now would lose it with the task's world. Its path, and why the
    * last save failed. */
+  /** Does this task have data a Review would publish: a proposed candidate, or a
+   * writable resource whose copy in its world differs from the version it forked?
+   * A copy that cannot be inspected counts as changed: losing it with the world
+   * is worse than one Review too many. */
+  async hasChangesToReview(taskId: string): Promise<boolean> {
+    if ((await this.store.listResourceCandidates(taskId)).some((candidate) => candidate.state === 'pending')) return true;
+    const task = await this.store.getTask(taskId);
+    const world = await this.store.currentWorld(taskId) as WorldHandle | undefined;
+    if (!task || !world) return false;
+    const leased = new Set((await this.store.listResourceLeases(world.id, world.generation ?? 1))
+      .filter((lease) => lease.state === 'active').map((lease) => lease.attachmentId));
+    for (const resource of await this.store.listResourceAttachments(task.projectId)) {
+      if (resource.access !== 'write' || resource.publish !== 'review' || resource.isolation !== 'fork'
+        || resource.target.kind !== 'path' || !leased.has(resource.id)) continue;
+      try {
+        const summary = await this.summarize(taskId, resource.id);
+        if (!summary.promoted && summary.added + summary.modified + summary.deleted > 0) return true;
+      } catch { return true; }
+    }
+    return false;
+  }
+
   async unsavedCandidates(taskId: string): Promise<Array<{ path: string; error?: string }>> {
     const excluded = new Set((await this.store.resourceReview(taskId)).excluded);
     const unsaved: Array<{ path: string; error?: string }> = [];
