@@ -8352,7 +8352,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       </div>
       <div class="tf-foot">
         <div class="tf-foot-inner">
-          ${templateEdit ? '<span class="tf-hint"></span>' : `<button class="btn ghost" id="tf-save-template" title="Save this form as a template, to start new tasks from">Save as template</button>
+          ${templateEdit ? '<span class="tf-hint"></span>' : `<button class="btn ghost" id="tf-save-template" title="Save this form as a template, to start new tasks from" aria-label="Save as template">${ICON.template}<span class="tf-save-template-label">Save as template</span></button>
           <span class="tf-hint"></span>
           <button class="btn" id="tf-draft">Save draft</button>`}
           <button class="btn primary" id="tf-queue">${templateEdit ? 'Save template' : editInPlace ? 'Save' : 'Run task'}<span class="kbd">${esc(fmtKeys('meta+Enter'))}</span></button>

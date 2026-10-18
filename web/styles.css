@@ -3888,4 +3888,8 @@ input.toggle:disabled { opacity:.45; cursor:not-allowed; }
 .tf-head .tf-template-name:focus { outline: none; border-color: var(--accent); }
 .tf-template-chip { flex: none; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .template-save .tpl-scope { display: flex; align-items: center; gap: 8px; margin: 2px 0 16px; }
+.tf-foot #tf-save-template { gap: 6px; white-space: nowrap; }
+@media (max-width: 560px) {
+  .tf-foot .tf-save-template-label, .tf-template-chip { display: none; }
+}
 .template-save .tpl-scope-label { font-size: 13px; color: var(--ink-2); }
