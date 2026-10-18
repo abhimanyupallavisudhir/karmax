@@ -7516,7 +7516,8 @@ export class Store {
     const rows = (await this.db.prepare(`SELECT w.handle, w.state, w.updatedAt, t.id, t.num, t.title, t.projectId, t.lastView
       FROM world_instances w JOIN tasks t ON t.id = w.worldId
       WHERE w.state IN ('ready', 'parked', 'degraded') AND t.projectId IN (${projectIds.map(() => '?').join(', ')})
-      ORDER BY w.updatedAt DESC`).all(...projectIds)) as any[];
+      ORDER BY w.updatedAt DESC`).all(...projectIds)) as Array<{ handle: string; state: string; updatedAt: number; id: string;
+      num: number | null; title: string; projectId: string; lastView: string | null }>;
     return rows.map((row) => {
       let status: string | undefined;
       try { status = row.lastView ? (JSON.parse(row.lastView) as TaskView).status : undefined; } catch { status = undefined; }

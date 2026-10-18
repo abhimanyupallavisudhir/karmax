@@ -5507,7 +5507,7 @@ export class Gateway {
           // Authoritative read: reflect the just-applied update, not a snapshot that
           // may pre-date the workflow's next publish.
           // Without its conversation (compactTaskView): every reply carried it whole, 100k+ characters.
-          return this.json(res, 200, { ...applied, view: compactTaskView(await api.getTaskView(token, id, { live: true }) as any) });
+          return this.json(res, 200, { ...applied, view: compactTaskView(await api.getTaskView(token, id, { live: true }) as Record<string, unknown> | undefined) });
         } catch (e) {
           return this.json(res, grantRefusal(e).code ? 403 : 409, { error: e instanceof Error ? e.message : String(e), ...grantRefusal(e) });
         }

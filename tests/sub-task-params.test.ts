@@ -180,7 +180,7 @@ it('a sub-task runs on its parent\'s own Computer unless its params choose anoth
     // Its world is made from its input's project: provider and size.
     expect(smaller!.project).toMatchObject({ worldProvider: 'memory', resources: { cpu: 2, memoryMb: 4096, diskGb: 40 } });
     // What a turn records for the end of the turn is the child's own value.
-    expect(f.toolResults.every((result) => /^sub-task queued/.test(result))).toBe(true);
+    expect(f.toolResults.every((result) => result.startsWith('sub-task queued'))).toBe(true);
   } finally { await f.close(); }
 });
 

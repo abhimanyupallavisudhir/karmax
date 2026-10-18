@@ -2168,7 +2168,7 @@ export class ProjectResourceService {
     // This copy's .tavyamerge: files never synced, and how both-sides changes settle.
     const policies = await readPolicies(place.world, place);
     const skipped = (file: string) => policyFor(policies, file) === 'skip';
-    for (const file of [...theirs.files.keys()]) if (skipped(file)) theirs.files.delete(file);
+    for (const file of theirs.files.keys()) if (skipped(file)) theirs.files.delete(file);
     const both = [...theirs.files.keys()].filter((file) => ours.files.has(file));
     let fileMerge: FileMerge | undefined;
     /** Files both changed that the incoming version settles (`theirs`, or `newest` when it is newer). */

@@ -416,7 +416,8 @@ export class WorldLifecycleManager {
       throw new Error('this task holds no computer');
     const lost = async () => {
       // Already lost at its provider; whatever is left is deleted.
-      await this.worlds.get(handle.kind as any).destroy?.(handle as any).catch(() => undefined);
+      const world = handle as WorldHandle;
+      await this.worlds.get(world.kind).destroy?.(world).catch(() => undefined);
       await this.store.setWorldState(handle, 'released');
       await this.recordLifecycle(handle, 'world.destroyed', { reason: 'released' });
       return { state: 'released' as const };
@@ -462,7 +463,7 @@ export class WorldLifecycleManager {
       if (!resize && !move && await finishedNormally(this.store, candidate.handle.id)) {
         try { if (!(await this.destroyAtProvider(candidate.handle, eligible))) return false; }
         catch (error) {
-          if (await this.worlds.probe(candidate.handle as any).catch(() => undefined) !== 'missing' || !(await eligible())) {
+          if (await this.worlds.probe(candidate.handle as WorldHandle).catch(() => undefined) !== 'missing' || !(await eligible())) {
             await options.onFailure?.(error);
             return false;
           }
@@ -504,7 +505,7 @@ export class WorldLifecycleManager {
       } catch (error) {
         // A sandbox its provider already deleted cannot be checkpointed, ever:
         // it is lost, not failing (degraded worlds of ended tasks are released).
-        if (await this.worlds.probe(candidate.handle as any).catch(() => undefined) === 'missing' && await eligible()) {
+        if (await this.worlds.probe(candidate.handle as WorldHandle).catch(() => undefined) === 'missing' && await eligible()) {
           await this.store.setWorldState(candidate.handle, 'degraded');
           await this.recordLifecycle(candidate.handle, 'world.providerLost', {});
           return false;
@@ -517,12 +518,13 @@ export class WorldLifecycleManager {
 
   /** Delete a world at its provider, through the world itself when the
    * provider has no direct delete. */
-  private async destroyAtProvider(handle: WorldHandleRef, eligible: () => Promise<boolean>): Promise<boolean> {
-    const provider = this.worlds.get(handle.kind as any);
-    if (provider.destroy) await provider.destroy(handle as any);
+  private async destroyAtProvider(ref: WorldHandleRef, eligible: () => Promise<boolean>): Promise<boolean> {
+    const handle = ref as WorldHandle;
+    const provider = this.worlds.get(handle.kind);
+    if (provider.destroy) await provider.destroy(handle);
     else {
       // Opening may restore another generation: then nothing is destroyed.
-      const world = await this.worlds.open(handle as any);
+      const world = await this.worlds.open(handle);
       if (!(await eligible())) return false;
       await world.destroy();
     }
