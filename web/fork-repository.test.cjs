@@ -11,7 +11,7 @@ const context = vm.createContext({});
 vm.runInContext(helpers, context);
 
 test('a fork in the repository list names the repository its pull requests go to', () => {
-  const panel = src.slice(src.indexOf('function renderProjectRepositories('), src.indexOf('async function hydrateProjectAccess('));
+  const panel = src.slice(src.indexOf('function gitRepoRow('), src.indexOf('async function hydrateProjectAccess('));
   assert.match(panel, /git-repo-upstream" title="Pull requests go to \$\{esc\(upstream\.owner\)\}\/\$\{esc\(upstream\.name\)\} after Review">→ /);
   assert.match(panel, /id="project-fork-open"/);
 });

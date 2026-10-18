@@ -3419,8 +3419,11 @@ export class Gateway {
           const b = await this.body(req);
           let project;
           try {
+            // `repos` attach as in Git & GitHub settings, checked before anything is created.
+            const repos = await this.requestedRepositorySources(b.repos, organizationId);
             project = (await store.createProject(String(b.name ?? 'New project'),
               normalizeConfig(b.config, false, this.deps.hosted === true), organizationId));
+            if (repos.length) project = await store.setProjectRepositorySources(project.id, repos);
           } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
           if (callerIdentity.humanSubject) (await store.setProjectMembership(project.id,
             { kind: 'user', userId: callerIdentity.humanSubject.userId }, 'owner'));
@@ -4091,8 +4094,10 @@ export class Gateway {
         const b = await this.body(req);
         let project;
         try {
+          const repos = await this.requestedRepositorySources(b.repos, 'org_personal');
           project = (await store.createProject(b.name ?? 'New project',
             normalizeConfig(b.config, true, false)));
+          if (repos.length) project = await store.setProjectRepositorySources(project.id, repos);
         } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
         // The legacy unhosted collection route creates inside the personal
         // organization. Keep its creator discoverable through the same durable
@@ -5047,12 +5052,7 @@ export class Gateway {
         if (method === 'PUT') {
           const b = await this.body(req);
           try {
-            const repos = Array.isArray(b.repos) ? b.repos.map(String) : [];
-            if (this.deps.hosted) {
-              const known = (await store.listRepositories(project.organizationId!)).map((repository) => repository.sshUrl);
-              const unknown = repos.filter((repo: string) => !known.some((candidate) => sameRepository(candidate, repo)));
-              if (unknown.length) throw new Error('Hosted projects must select repositories available through the organization GitHub connection');
-            }
+            const repos = await this.requestedRepositorySources(b.repos, project.organizationId!);
             const saved = (await store.setProjectRepositorySources(project.id, repos));
             await this.ensureProjectWiki(saved, callerIdentity.humanSubject?.userId);
             return this.json(res, 200, saved); }
@@ -8729,6 +8729,18 @@ export class Gateway {
         ...(code ? { code: String(code) } : {}), ...(e instanceof AuthorizationGrantError ? e.gap : {}) });
       throw e;
     }
+  }
+
+  /** A project's requested repository sources. Hosted projects may only use
+   * repositories the organization's GitHub connection reaches. */
+  private async requestedRepositorySources(value: unknown, organizationId: string): Promise<string[]> {
+    const repos = Array.isArray(value) ? value.map(String) : [];
+    if (this.deps.hosted && repos.length) {
+      const known = (await this.deps.store.listRepositories(organizationId)).map((repository) => repository.sshUrl);
+      const unknown = repos.filter((repo) => !known.some((candidate) => sameRepository(candidate, repo)));
+      if (unknown.length) throw new Error('Hosted projects must select repositories available through the organization GitHub connection');
+    }
+    return repos;
   }
 
   /** Initialize the local canonical wiki immediately. When GitHub is fully
