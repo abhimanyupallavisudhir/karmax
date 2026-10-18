@@ -208,7 +208,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     name: 'pause',
     description:
       'End your turn to wait for durable jobs or a real-world event (CI, a deploy, a set time), and be resumed when every listed job has finished, when a message arrives, or after `minutes`, whichever comes first. Without jobs it is a timed pause; list every job that is still running, or the paused world could freeze it. You are resumed with each job\'s exit code and last output. ' +
-      'It is not for asking: if you need an answer to continue, end your turn with the question (or call escalate_to_human for what only a person can give). Set needs_input only when you are waiting anyway and someone may answer meanwhile, and you will carry on without the answer once `minutes` pass: the task then shows Needs input and notifies them. After calling it, end your turn.',
+      'It is not for asking: if you need an answer to continue, end your turn with the question (or call escalate_to_human for what only a person can give). Set needs_input only when you are waiting anyway and someone may answer meanwhile, and you will carry on without the answer once `minutes` pass: the task then shows Needs input and notifies them. A message or a sub-task\'s news that wakes you mid-pause does not end it: if you end that turn without another pause, open_pr or an ask (needs_input, escalate_to_human), the pause goes on to its deadline. After calling it, end your turn.',
     parameters: {
       type: 'object',
       properties: {

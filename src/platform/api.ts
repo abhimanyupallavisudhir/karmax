@@ -6896,6 +6896,7 @@ Act according to your Avatar instructions. When ready, call platform_request POS
     const editable = new Map<string, boolean>();
     const computers: HeldComputer[] = [];
     for (const held of await this.deps.store.heldWorlds(readable.map((project) => project.id))) {
+      if (!isRemoteWorldKind(held.handle.kind)) continue; // a host's own worktree holds nothing at a provider
       if (!editable.has(held.task.projectId))
         editable.set(held.task.projectId, (await this.deps.tokens.check(token, 'task:edit', { projectId: held.task.projectId, taskId: held.task.id })).ok);
       const machine = held.handle.meta?.computer as MachineShape | undefined;

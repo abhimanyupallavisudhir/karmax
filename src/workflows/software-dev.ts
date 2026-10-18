@@ -72,7 +72,7 @@ import {
 } from './contract.js';
 import { mergeQueueDomains, releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider,
   landingAuthorityOf, samePosition, MERGE_POLL, reviewCheckouts, approveAll, worldRepos, landedNote } from './contract.js';
-import type { CheckoutApprovals } from './contract.js';
+import type { AgentWait, CheckoutApprovals } from './contract.js';
 import { SIG, SIG_AGENT_TURN_STATE } from './names.js';
 import { agentTurnId } from './turn-id.js';
 import { taskBranch } from '../domain/brand.js';
@@ -350,6 +350,8 @@ const OPEN_PR_WAITS_FOR_WORLD = 'software-dev-open-pr-waits-for-world-v1';
 const RESOURCES_WAIT_FOR_WORLD = 'resources-wait-for-world-v1';
 /** A stage whose provider limit is full waits for room for a day (failures.ts CAPACITY_WAIT_MS). */
 const STAGES_WAIT_FOR_CAPACITY = 'stages-wait-for-capacity-v1';
+/** A pause a message interrupted goes on after the turn that answered it. */
+const PAUSE_GOES_ON = 'pause-goes-on-after-interruption-v1';
 /** A sub-task whose parent world cannot be reached is waited out, then a
  * person's, never the asking agent's (pramana#39/#43). */
 const SUBTASK_PREPARE_WAITS_FOR_WORLD = 'software-dev-subtask-prepare-waits-for-world-v1';
@@ -847,6 +849,8 @@ async function softwareDevImpl(
   /** Messages an Open PR answered: they wake nothing, but the agent still
    * reads them on its next turn (`seen` is what it has been given). */
   let heardThrough = continued?.heardThrough ?? 0;
+  /** A pause that was interrupted, to go on after the turn that answers (PAUSE_GOES_ON). */
+  let interruptedPause: { wait: AgentWait; until: number } | undefined;
   // v1.29: Do runs the task's own command instead of the agent — once per run
   // of the task; a revise, or a failure handed to the agent, continues with it.
   const taskCommand = minor >= 29 ? input.command?.trim() || undefined : undefined;
@@ -1695,6 +1699,8 @@ async function softwareDevImpl(
     } finally { refreshingResources = false; }
     refreshRetries = 1;
     for (const r of refreshed) {
+      // A conflict the agent was already told of, still the same: nothing new.
+      if (r.again) continue;
       const text = r.conflicts && r.guide
         ? `${r.path} was not updated with a sub-task's data.\n${r.guide}\nIt comes in when the next sub-task finishes, or when this task is confirmed.`
         : r.conflicts
@@ -4639,14 +4645,29 @@ Inspect the complete current diff and specifically compare its delta from the re
     await runCalledAgents();
     if (cancelled) return await abort();
 
+    // A pause a message (or a sub-task) interrupted goes on after the turn
+    // that answered it, to its own deadline, unless that turn chose otherwise:
+    // its own pause, open_pr, a raise, sub-tasks, waiting for them. Every
+    // interruption used to need another pause call, and left a note behind.
+    let pauseWait = turn.wait;
+    if (interruptedPause && patched(PAUSE_GOES_ON)) {
+      const left = interruptedPause.until - Date.now();
+      // Before the explicit Open PR cycle, ending a turn was finishing it.
+      const decided = !explicitPrCycle || (modeSwitching && goalMode && !!turn.completed)
+        || !!(turn.wait || turn.openPrRequested || turn.raise || turn.waitForSubtasks || turn.subTasks?.length
+        || turn.shipped?.length || prRequested);
+      if (!decided && left > 0 && !halted() && !cancelled)
+        pauseWait = { ...interruptedPause.wait, minutes: left / (input.waitMinuteMs ?? 60_000) };
+      interruptedPause = undefined;
+    }
     // The agent asked to be resumed later (`pause`): park here and resume it with
     // the outcome. A message, a child's event, or a cancellation ends it early.
-    if (turn.wait && patched('agent-wait-v1')) {
+    if (pauseWait && patched('agent-wait-v1')) {
       // `needs_input`: ask the task's ordinary input route unless the agent
       // named people — a sub-task's parent, else a configured response agent,
       // which answers at once as it does for a question ending an ordinary
       // turn; people get a Needs input hold.
-      const needsInput = turn.wait.needsInput;
+      const needsInput = pauseWait.needsInput;
       if (!needsInput) await replyUnasked();
       const question = needsInput?.message ?? (turn.output?.trim() || 'The agent paused for your input.');
       const routed = !!needsInput && !needsInput.audience?.length;
@@ -4676,8 +4697,10 @@ Inspect the complete current diff and specifically compare its delta from the re
       pendingReroute = undefined;
       // A paused agent can be stopped too: its pause ends without resuming it.
       if (multiAgent) turnOwners.push(MAIN_AGENT);
-      const note = await waitForAgent(turn.wait, {
+      const note = await waitForAgent(pauseWait, {
         world,
+        // A pause that is not an ask goes on after an interruption (PAUSE_GOES_ON).
+        ...(!needsInput && patched(PAUSE_GOES_ON) ? { goesOn: (until: number) => { interruptedPause = { wait: pauseWait!, until }; } } : {}),
         ...(input.waitMinuteMs ? { minuteMs: input.waitMinuteMs } : {}),
         ...(askedParent ? { ask: { kind: 'parent' as const, detail: question } }
           : needsInput ? { ask: {
