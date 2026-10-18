@@ -413,6 +413,18 @@ export class SshTransport {
     }
   }
 
+  /** A path's size and whether it is a regular file (following links). */
+  async stat(remotePath: string): Promise<{ size: number; isFile: boolean }> {
+    return this.reconnecting(async () => {
+      const session = this.sftp();
+      const sftp = await session;
+      return new Promise<{ size: number; isFile: boolean }>((resolve, reject) => sftp.stat(remotePath, (error, stats) => {
+        if (error) reject(sftpError(error, remotePath));
+        else resolve({ size: stats.size, isFile: stats.isFile() });
+      })).catch((error) => { if (error instanceof VmTransportError) this.forgetSftp(session); throw error; });
+    });
+  }
+
   /** Write a whole file; a dropped connection sends all of it again. */
   async writeFile(remotePath: string, content: Buffer, mode = 0o644): Promise<void> {
     await this.reconnecting(async () => {

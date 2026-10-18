@@ -23,6 +23,26 @@ export async function readRegularFilePrefix(file: string, maxBytes: number): Pro
   }
 }
 
+/** The size of a regular host file; anything else is refused. */
+export async function regularFileSize(file: string): Promise<number> {
+  const stat = await fs.promises.stat(file);
+  if (!stat.isFile()) throw new Error('not a regular file');
+  return stat.size;
+}
+
+/** Only bytes `start`..`end` (inclusive) of a stream, which stops being read
+ * once they have passed: for a provider whose reads have no offset. */
+export async function* sliceStream(chunks: AsyncIterable<Buffer>, range: { start: number; end: number }): AsyncGenerator<Buffer> {
+  let position = 0;
+  for await (const chunk of chunks) {
+    const from = Math.max(0, range.start - position);
+    const to = Math.min(chunk.length, range.end + 1 - position);
+    position += chunk.length;
+    if (to > from) yield chunk.subarray(from, to);
+    if (position > range.end) return;
+  }
+}
+
 /** At most `maxBytes` from the start of a world file, through the provider's
  * bounded read, so a huge or endless sandbox file never reaches this process
  * whole. A world without one (a test double) is read whole. */

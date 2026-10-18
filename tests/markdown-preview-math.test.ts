@@ -18,7 +18,7 @@ describe('Markdown preview math', () => {
         wireExplainMessages(v);
       };
       renderTaskPage();
-      showArtifactReader(${JSON.stringify(SOURCE)}, 'markdown', 'report.md', new Blob(['x']));
+      showArtifactViewer({ text: ${JSON.stringify(SOURCE)}, view: 'markdown', name: 'report.md', url: '/api/artifact-content/t/report.md' });
     `);
     const reader = ui.page.locator('.artifact-reader');
     const toggle = reader.getByRole('button', { name: 'Typeset math' });
@@ -46,7 +46,7 @@ describe('Markdown preview math', () => {
   it('typesets inline math that wraps onto the next line', async () => {
     const ui = await consolePage();
     const wrapped = 'If $Y\\sim\np$, then\n$\\mathbb E[\\sum_{v\\in H}\\log p_\\theta(v|\\mathrm{pa}_v)+\\tau\\sum_{v\\in Y}\\log\np_\\theta(v|\\mathrm{pa}_v)]$ holds.';
-    await ui.run(`showArtifactReader(${JSON.stringify(wrapped)}, 'markdown', 'note.md', new Blob(['x']))`);
+    await ui.run(`showArtifactViewer({ text: ${JSON.stringify(wrapped)}, view: 'markdown', name: 'note.md', url: '/api/artifact-content/t/note.md' })`);
     const content = ui.page.locator('.artifact-reader-content');
     await content.locator('mjx-container').nth(1).waitFor();
     expect(await content.locator('mjx-container').count()).toBe(2);
@@ -58,7 +58,7 @@ describe('Markdown preview math', () => {
 
   it('keeps plain-text previews free of a TeX button', async () => {
     const ui = await consolePage();
-    await ui.run(`showArtifactReader('$x$', 'text', 'notes.txt', new Blob(['x']))`);
+    await ui.run(`showArtifactViewer({ text: '$x$', view: 'text', name: 'notes.txt', url: '/api/artifact-content/t/notes.txt' })`);
     await ui.page.locator('.artifact-reader').waitFor();
     expect(await ui.page.locator('.artifact-reader .tex-toggle').count()).toBe(0);
     await ui.close();

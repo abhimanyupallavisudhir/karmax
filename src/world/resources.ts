@@ -2578,9 +2578,11 @@ class EnvironmentWorld implements World {
   readonly addCheckout?: World['addCheckout'];
   readonly readFilePrefix?: World['readFilePrefix'];
   readonly readFileStream?: World['readFileStream'];
+  readonly fileSize?: World['fileSize'];
   constructor(private inner: World, private env: Record<string, string>) {
     if (inner.readFilePrefix) this.readFilePrefix = (path, maxBytes) => inner.readFilePrefix!(path, maxBytes);
-    if (inner.readFileStream) this.readFileStream = (path) => inner.readFileStream!(path);
+    if (inner.readFileStream) this.readFileStream = (path, range) => inner.readFileStream!(path, range);
+    if (inner.fileSize) this.fileSize = (path) => inner.fileSize!(path);
     if (inner.addCheckout) this.addCheckout = spec => inner.addCheckout!(spec);
     if (inner.diagnose) this.diagnose = (window) => inner.diagnose!(window);
   }

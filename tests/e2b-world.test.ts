@@ -479,6 +479,31 @@ describe('E2B cloud world provider', () => {
     expect(JSON.stringify(world.handle)).not.toContain('PRIVATE CLONE KEY');
   });
 
+  // A Review video served from an unsaved sandbox file: its size from envd's
+  // stat, and a byte range cut from the stream (envd reads have no offset),
+  // which stops reading once past the range.
+  it('reports a file size and streams a byte range', async () => {
+    const sandbox = fakeSandbox(() => undefined) as E2BSandboxLike & Record<string, unknown>;
+    const world = await new E2BWorldProvider({ create: async () => sandbox, connect: async () => sandbox })
+      .create({ taskId: 'ranges', base: 'main' });
+    const data = Buffer.from('0123456789abcdefghij');
+    let pulled = 0;
+    sandbox.files.getInfo = async (file: string) => file.endsWith('dir') ? { type: 'dir', size: 4096 } : { type: 'file', size: data.length };
+    sandbox.files.read = async () => new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (pulled >= data.length) return controller.close();
+        controller.enqueue(new Uint8Array(data.subarray(pulled, pulled + 4)));
+        pulled += 4;
+      },
+    }) as any;
+    expect(await world.fileSize!('out/video.mp4')).toBe(20);
+    await expect(world.fileSize!('out/dir')).rejects.toThrow('not a regular file');
+    const parts: Buffer[] = [];
+    for await (const part of world.readFileStream!('out/video.mp4', { start: 6, end: 9 })) parts.push(part);
+    expect(Buffer.concat(parts).toString()).toBe('6789');
+    expect(pulled).toBeLessThan(data.length);
+  });
+
   // legibench3#18 (2026-10-01): the SDK carries every file transfer to a sandbox
   // on one process-wide HTTP/2 session. Once E2B's edge resets that session's
   // streams (NGHTTP2_ENHANCE_YOUR_CALM, after a large upload), every later

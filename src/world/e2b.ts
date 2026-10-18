@@ -32,6 +32,7 @@ import { withTimeout } from '../util/timeout.js';
 import { worldRelativePath, worldWorkingDirectory, WorldCheckoutSpec } from './types.js';
 import { addCheckoutViaExec } from './checkout.js';
 import { boundedResponseBody } from './http.js';
+import { sliceStream } from './file-prefix.js';
 import { serviceHomeLabel } from './services.js';
 import type { ResolvedWorldProviderConnection } from './connections.js';
 import { provisionGitCredentials, provisionGitRepos, runOrThrow as provisionRun, type ProvisionTarget } from './provision-git.js';
@@ -73,6 +74,7 @@ export interface E2BSandboxLike {
     read(path: string, options?: Record<string, unknown>): Promise<string | Uint8Array | ArrayBuffer>;
     write(path: string, data: string | Uint8Array): Promise<unknown>;
     list?(path: string, options?: Record<string, unknown>): Promise<Array<{ path?: string; name?: string; type?: string }>>;
+    getInfo?(path: string): Promise<{ type?: string; size?: number }>;
   };
   pty: {
     create(options: Record<string, unknown>): Promise<any>;
@@ -575,7 +577,27 @@ class E2BWorld implements World {
     });
   }
 
-  async *readFileStream(relPath: string): AsyncGenerator<Buffer> {
+  /** envd's file reads have no offset, so a range is cut from the stream
+   * (which stops once past its end): bounded memory, and only a seek far into
+   * a large file reads more than it sends. */
+  readFileStream(relPath: string, range?: { start: number; end: number }): AsyncIterable<Buffer> {
+    return range ? sliceStream(this.readWholeStream(relPath), range) : this.readWholeStream(relPath);
+  }
+
+  async fileSize(relPath: string): Promise<number> {
+    const file = this.filePath(relPath);
+    if (this.sandbox.files.getInfo) {
+      const info = await this.sandbox.files.getInfo(file);
+      if (info.type !== 'file' || typeof info.size !== 'number') throw new Error('not a regular file');
+      return info.size;
+    }
+    const stat = await this.exec('stat', ['-L', '-c', '%F|%s', '--', file]);
+    const [type, size] = stat.stdout.trim().split('|');
+    if (stat.code !== 0 || type !== 'regular file' && type !== 'regular empty file') throw new Error(stat.stderr.trim() || 'not a regular file');
+    return Number(size);
+  }
+
+  private async *readWholeStream(relPath: string): AsyncGenerator<Buffer> {
     const file = this.filePath(relPath);
     const abort = new AbortController();
     const stream = await this.transfer(async () => await this.sandbox.files.read(file,

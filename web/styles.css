@@ -3216,6 +3216,18 @@ html[data-theme="dark"] .github-signin-btn:active,
 .artifact-reader-header h2 { flex: 1; min-width: 0; margin: 0; font-size: 16px; overflow-wrap: anywhere; }
 .artifact-reader-content { padding: 20px; max-height: calc(100dvh - 150px); overflow: auto; }
 .artifact-reader-content > pre { margin: 0; font-family: var(--font-mono); font-size: 13px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
+/* Media fills the viewer without scrolling: a video or image is shown whole. */
+.artifact-image, .artifact-video { width: fit-content; min-width: min(480px, calc(100vw - 32px)); max-width: calc(100vw - 32px); }
+.artifact-pdf, .artifact-page { width: min(1200px, calc(100vw - 32px)); }
+.artifact-image .artifact-reader-content, .artifact-video .artifact-reader-content,
+.artifact-audio .artifact-reader-content { display: grid; place-items: center; padding: 0; overflow: hidden; }
+.artifact-video .artifact-reader-content { background: #000; }
+.artifact-reader-content > img, .artifact-reader-content > video { display: block; max-width: 100%; max-height: calc(100dvh - 120px); }
+.artifact-audio .artifact-reader-content { padding: 20px; }
+.artifact-reader-content > audio { width: 100%; }
+.artifact-pdf .artifact-reader-content, .artifact-page .artifact-reader-content { padding: 0; overflow: hidden; }
+.artifact-reader-content > iframe { display: block; width: 100%; height: calc(100dvh - 120px); border: 0; background: #fff; }
+.artifact-reader-content > .artifact-error { margin: 0; padding: 20px; color: var(--ink); }
 
 .authz-editor .authz-description { margin: 0; line-height: 1.45; }
 .authz-warning { display: flex; align-items: center; gap: 6px; margin: 6px 0 0; padding: 6px 10px; border-radius: 8px;

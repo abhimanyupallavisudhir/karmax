@@ -13,6 +13,8 @@ import { assetExists, MATHJAX_SCRIPT_SOURCE, serveStaticAsset, staticAssetRevisi
 import { SwrCache } from '../util/swr-cache.js';
 import { MAX_REVIEW_ARTIFACT_BYTES, savedReviewArtifact } from '../store/review-artifacts.js';
 import { readWorldFilePrefix } from '../world/file-prefix.js';
+import { ArtifactUrls } from './artifact-urls.js';
+import { bufferSource, sendArtifact, type ArtifactSource } from './artifact-response.js';
 import { TimingDelivery } from '../timing/delivery.js';
 import { timingEnabled, installationTiming, withTiming, toolFailed } from '../timing/index.js';
 import { probeConnection } from '../mcp/connections/probe.js';
@@ -728,6 +730,8 @@ export class Gateway {
   private terminalTickets = new Map<string, { taskId: string; session: Session; expiresAt: number }>();
   private personDecisions = new Map<string, { caps: Promise<Capability[] | undefined>; until: number; seq: number; subject: AuthoritySubject }>();
   private requestLimits = new ClientRequestLimits();
+  private artifactUrlSigner?: ArtifactUrls;
+  private get artifactUrls(): ArtifactUrls { return this.artifactUrlSigner ??= new ArtifactUrls(this.deps.broker); }
   /** Failed sign-ins per client address and per account. Better Auth's own
    *  limiter only sees `auth.handler` traffic; `/api/login` calls the API
    *  directly, so without this a password could be guessed online. */
@@ -2333,6 +2337,16 @@ export class Gateway {
         'x-content-type-options': 'nosniff',
       });
       return void res.end(got.buf);
+    }
+
+    // A Review artifact through the signed URL `POST /review-action` minted: its
+    // own credential, since a <video>/<img>/<iframe> cannot send a header and a
+    // media element asks for each byte range anew. The trailing name is cosmetic.
+    const signedArtifact = p.match(/^\/api\/artifact-content\/([^/]+)(?:\/[^/]*)?$/);
+    if (signedArtifact && (method === 'GET' || method === 'HEAD')) {
+      const grant = await this.artifactUrls.verify(signedArtifact[1]!);
+      if (!grant) return this.json(res, 403, { error: 'this link has expired; open the artifact again' });
+      return this.serveArtifact(req, res, grant.taskId, grant.path);
     }
 
     // ── authenticated endpoints ──
@@ -6160,8 +6174,16 @@ export class Gateway {
           const target = String(action.target ?? '');
           if (/^https?:\/\//i.test(target)) return this.json(res, 200, { kind: 'open', url: target, external: true });
           if (!target) return this.json(res, 400, { error: 'open action has no target' });
-          const url2 = `/api/tasks/${encodeURIComponent(taskId)}/artifact?path=${encodeURIComponent(target)}`;
-          return this.json(res, 200, { kind: 'open', url: url2, external: false });
+          // A signed URL, so the viewer can play, show or download it with
+          // no header (and nothing is fetched here); the type it will be served
+          // as decides how the viewer presents it.
+          const saved = await savedReviewArtifact(store, taskId, target);
+          const name = saved?.name ?? (path.posix.basename(target.replace(/\\/g, '/')) || 'artifact');
+          const mediaType = untrustedContentHeaders(saved?.mediaType
+            ?? ARTIFACT_MIME[path.extname(name).toLowerCase()] ?? 'application/octet-stream', name)['content-type']!;
+          const signed = `/api/artifact-content/${await this.artifactUrls.mint({ taskId, path: target })}/${encodeURIComponent(name)}`;
+          return this.json(res, 200, { kind: 'open', url: signed, external: false, name, mediaType,
+            ...(saved ? { bytes: saved.bytes } : {}) });
         }
         // kind: 'run'
         if (!action.command) return this.json(res, 400, { error: 'run action has no command' });
@@ -6190,8 +6212,8 @@ export class Gateway {
         return this.json(res, st ? 200 : 404, st ?? { error: 'no such action process' });
       }
       const artifactMatch = p.match(/^\/api\/tasks\/([^/]+)\/artifact$/);
-      if (artifactMatch && method === 'GET') {
-        return this.serveArtifact(res, artifactMatch[1]!, url.searchParams.get('path') ?? '');
+      if (artifactMatch && (method === 'GET' || method === 'HEAD')) {
+        return this.serveArtifact(req, res, artifactMatch[1]!, url.searchParams.get('path') ?? '');
       }
       const artifactList = p.match(/^\/api\/tasks\/([^/]+)\/artifacts$/);
       if (artifactList && method === 'GET') return this.json(res, 200, (await store.listPromotedArtifacts(artifactList[1]!)));
@@ -6244,15 +6266,7 @@ export class Gateway {
       if (promotedArtifact) {
         const artifact = (await store.getPromotedArtifact(promotedArtifact[1]!));
         if (!artifact || (artifact.expiresAt != null && artifact.expiresAt <= Date.now())) return this.json(res, 404, { error: 'artifact not found' });
-        if (method === 'GET') {
-          if (!this.deps.objects) return this.json(res, 503, { error: 'artifact storage is unavailable' });
-          const data = await this.deps.objects.get(artifact.objectKey);
-          if (crypto.createHash('sha256').update(data).digest('hex') !== artifact.sha256)
-            return this.json(res, 502, { error: 'artifact integrity check failed' });
-          res.writeHead(200, { ...untrustedContentHeaders(artifact.mediaType, artifact.name),
-            'content-length': String(data.length), 'cache-control': 'private, no-store' });
-          return void res.end(data);
-        }
+        if (method === 'GET' || method === 'HEAD') return this.serveSavedArtifact(req, res, artifact);
         if (method === 'DELETE') {
           (await store.deletePromotedArtifact(artifact.id));
           await this.deps.objects?.delete(artifact.objectKey);
@@ -6312,8 +6326,8 @@ export class Gateway {
       // is readable. They use the same world confinement as review artifacts,
       // but unknown extensions default to inline text for a useful source view.
       const fileMatch = p.match(/^\/api\/tasks\/([^/]+)\/file$/);
-      if (fileMatch && method === 'GET') {
-        return this.serveArtifact(res, fileMatch[1]!, url.searchParams.get('path') ?? '', true);
+      if (fileMatch && (method === 'GET' || method === 'HEAD')) {
+        return this.serveArtifact(req, res, fileMatch[1]!, url.searchParams.get('path') ?? '', true);
       }
       const timingMatch = p.match(/^\/api\/tasks\/([^/]+)\/timing$/);
       if (timingMatch && method === 'GET') return this.json(res, 200, await api.taskTiming(token, timingMatch[1]!));
@@ -9143,26 +9157,17 @@ export class Gateway {
     }
   }
 
-  /** Serve an artifact through its world provider. The browser never receives a
+  /** Serve an artifact: the copy saved for Review if there is one, else the
+   * file in its world, through the provider. The browser never receives a
    * host/sandbox path and remote worlds need no public filesystem endpoint.
-   * `sourceFile` (conversation file links) defaults unknown extensions to an
-   * inline text view instead of a download, for a useful source view. */
-  private async serveArtifact(res: http.ServerResponse, taskId: string, relPath: string, sourceFile = false) {
+   * Both stream, with byte ranges, so a video plays and seeks at once and the
+   * gateway never holds a whole file. `sourceFile` (conversation file links)
+   * defaults unknown extensions to an inline text view instead of a download,
+   * for a useful source view. */
+  private async serveArtifact(req: http.IncomingMessage, res: http.ServerResponse, taskId: string, relPath: string, sourceFile = false) {
     const task = (await this.deps.store.getTask(taskId));
     const saved = !sourceFile && task ? (await savedReviewArtifact(this.deps.store, taskId, relPath)) : undefined;
-    if (saved) {
-      if (!this.deps.objects) return this.json(res, 503, { error: 'artifact storage is unavailable' });
-      try {
-        const data = await this.deps.objects.get(saved.objectKey);
-        if (crypto.createHash('sha256').update(data).digest('hex') !== saved.sha256)
-          return this.json(res, 502, { error: 'artifact integrity check failed' });
-        res.writeHead(200, { ...untrustedContentHeaders(saved.mediaType, saved.name),
-          'content-length': String(data.length), 'cache-control': 'private, no-store' });
-        return void res.end(data);
-      } catch {
-        return this.json(res, 503, { error: 'saved artifact is unavailable' });
-      }
-    }
+    if (saved) return this.serveSavedArtifact(req, res, saved);
     const handle = worldHandleForView(task?.lastView, taskId, task ? (await this.deps.store.effectiveProjectConfig(task.projectId)) : undefined);
     if (!handle) return this.json(res, 404, { error: 'no world for this task' });
     if (!relPath) return this.json(res, 400, { error: 'missing path' });
@@ -9192,24 +9197,71 @@ export class Gateway {
         const real = await fs.promises.realpath(hostPath);
         const realBase = await fs.promises.realpath(hostBase).catch(() => hostBase);
         if (real !== realBase && !real.startsWith(realBase + path.sep)) return this.json(res, 400, { error: 'path escapes world' });
-        if ((await fs.promises.stat(real)).size > MAX_REVIEW_ARTIFACT_BYTES) return this.json(res, 413, { error: 'file exceeds 100 MiB' });
       }
-      // One byte past the cap tells a larger file apart without loading it whole.
-      const data = await readWorldFilePrefix(world, relPath, MAX_REVIEW_ARTIFACT_BYTES + 1);
-      if (data.length > MAX_REVIEW_ARTIFACT_BYTES) return this.json(res, 413, { error: 'file exceeds 100 MiB' });
+      let source: ArtifactSource;
+      let head: Buffer;
+      if (world.readFileStream && world.fileSize) {
+        const size = await world.fileSize(relPath);
+        const stream = world.readFileStream.bind(world);
+        source = { bytes: size, read: (range) => stream(relPath, range) };
+        head = sourceFile && !ARTIFACT_MIME[path.extname(relPath).toLowerCase()] ? await readWorldFilePrefix(world, relPath, 8192) : Buffer.alloc(0);
+      } else {
+        // A provider that cannot stream (Daytona, a container) is read whole,
+        // so the cap keeps that bounded; one byte past it tells a larger file
+        // apart without loading it all (AD-1).
+        const data = await readWorldFilePrefix(world, relPath, MAX_REVIEW_ARTIFACT_BYTES + 1);
+        if (data.length > MAX_REVIEW_ARTIFACT_BYTES) return this.json(res, 413, { error: 'file exceeds 100 MiB' });
+        source = bufferSource(data);
+        head = data.subarray(0, 8192);
+      }
       const inferredType = ARTIFACT_MIME[path.extname(relPath).toLowerCase()];
-      const looksTextual = !data.subarray(0, 8192).includes(0);
-      res.writeHead(200, {
+      const looksTextual = !head.includes(0);
+      await sendArtifact(req, res, source, {
         ...untrustedContentHeaders(inferredType ?? (sourceFile && looksTextual ? 'text/plain; charset=utf-8' : 'application/octet-stream'),
           path.basename(relPath)),
-        'content-length': String(data.length),
-        'cache-control': 'no-store',
+        'cache-control': 'private, no-store',
       });
-      res.end(data);
     } catch (error) {
+      if (res.headersSent) return void res.destroy();
       const message = String((error as Error)?.message ?? error);
       this.json(res, /escape|relative/i.test(message) ? 400 : 404, { error: /escape|relative/i.test(message) ? message : 'artifact not found' });
     } finally { await access?.release(); }
+  }
+
+  /** A saved Review artifact, streamed from the object store. Its bytes were
+   * hashed when saved (and the store checked Content-MD5 on upload), so a read
+   * checks the stored size before sending anything and hashes a whole-object
+   * response as it passes, cutting it if the bytes differ (sendArtifact); a
+   * partial response is checked by size alone. Re-hashing every range would
+   * mean reading the whole object for each seek. */
+  private async serveSavedArtifact(req: http.IncomingMessage, res: http.ServerResponse,
+    artifact: { objectKey: string; sha256: string; bytes: number; mediaType: string; name: string }) {
+    const objects = this.deps.objects;
+    if (!objects) return this.json(res, 503, { error: 'artifact storage is unavailable' });
+    const integrity = new Error('artifact integrity check failed');
+    const source: ArtifactSource = { bytes: artifact.bytes, sha256: artifact.sha256, read: async (range) => {
+      if (!objects.getStream) {
+        const data = await objects.get(artifact.objectKey);
+        if (crypto.createHash('sha256').update(data).digest('hex') !== artifact.sha256) throw integrity;
+        return bufferSource(data).read(range);
+      }
+      const stream = await objects.getStream(artifact.objectKey, range);
+      if (stream.bytes !== artifact.bytes) {
+        // Started and stopped, so its finally ends the read.
+        const reading = stream.body[Symbol.asyncIterator]();
+        await reading.next().then(() => reading.return?.(), () => undefined);
+        throw integrity;
+      }
+      return stream.body;
+    } };
+    try {
+      await sendArtifact(req, res, source, { ...untrustedContentHeaders(artifact.mediaType, artifact.name),
+        'cache-control': 'private, no-store' });
+    } catch (error) {
+      if (res.headersSent) return void res.destroy();
+      return error === integrity ? this.json(res, 502, { error: integrity.message })
+        : this.json(res, 503, { error: 'saved artifact is unavailable' });
+    }
   }
 
   /** Reverse proxy for services inside a remote world. Provider traffic tokens
@@ -10473,7 +10525,7 @@ function isWorldGone(error: unknown): boolean {
  *  that gives the document an opaque origin: scripts run (so an HTML report
  *  works), but the page cannot read the console's cookies or storage, nor make
  *  a credentialed request to it. Everything else is a download. */
-const INERT_MEDIA = /^(?:image\/(?:png|jpeg|gif|webp)|application\/pdf|video\/(?:mp4|webm|quicktime)|text\/(?:plain|csv)|application\/json)(?:;|$)/i;
+const INERT_MEDIA = /^(?:image\/(?:png|jpeg|gif|webp|avif)|application\/pdf|video\/(?:mp4|webm|quicktime)|audio\/(?:mpeg|mp4|wav|ogg|flac)|text\/(?:plain|csv)|application\/json)(?:;|$)/i;
 const ACTIVE_DOCUMENT_MEDIA = /^(?:text\/html|image\/svg\+xml|application\/xhtml\+xml)(?:;|$)/i;
 export function untrustedContentHeaders(mediaType: string, filename: string): Record<string, string> {
   const name = filename.replace(/["\\\r\n]/g, '_');

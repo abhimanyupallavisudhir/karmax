@@ -58,7 +58,14 @@ export class VmWorld implements World {
     for await (const chunk of this.transport.readStream(this.file(relPath), { start: 0, end: maxBytes - 1 })) chunks.push(chunk);
     return Buffer.concat(chunks).subarray(0, maxBytes);
   }
-  readFileStream(relPath: string): AsyncIterable<Buffer> { return this.transport.readStream(this.file(relPath)); }
+  readFileStream(relPath: string, range?: { start: number; end: number }): AsyncIterable<Buffer> {
+    return this.transport.readStream(this.file(relPath), range);
+  }
+  async fileSize(relPath: string): Promise<number> {
+    const stat = await this.transport.stat(this.file(relPath));
+    if (!stat.isFile) throw new Error('not a regular file');
+    return stat.size;
+  }
   async writeFile(relPath: string, content: string): Promise<void> { await this.writeFileBuffer(relPath, Buffer.from(content)); }
   async writeFileBuffer(relPath: string, content: Buffer): Promise<void> {
     const target = this.file(relPath);
