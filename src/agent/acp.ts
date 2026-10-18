@@ -798,6 +798,7 @@ export class AcpAdapter implements AgentAdapter {
       // A dropped sandbox stream is the cause, not the closed ACP connection
       // it produced; the retry resumes the session (task 348).
       if (remoteProcess?.lost) throw remoteProcess.lost;
+      if (remoteProcess?.unavailable) throw remoteProcess.unavailable;
       const detail = stderr.trim();
       const message = error instanceof Error ? error.message : String(error);
       if (error instanceof ProviderStreamError) {
