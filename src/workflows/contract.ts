@@ -47,6 +47,7 @@ export type {
   TaskShipment,
   ShipBranchRequest,
   ShipBranchOutcome,
+  PullRequestData,
   WorldHandleRef,
 } from '../domain/types.js';
 

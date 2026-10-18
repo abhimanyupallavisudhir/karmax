@@ -12,7 +12,7 @@ import type { Client } from '@temporalio/client';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import { organizationScope } from '../autonomy/vault-keys.js';
 import type { IgnoredResourceInventory, Project, ResourceAttachment, ResourceAccess, ResourceCandidate,
-  ResourceChangeSummary, ResourcePublishPolicy, ResourceRevision, ResourceTarget, WorldLocation } from '../domain/types.js';
+  PullRequestData, ResourceChangeSummary, ResourcePublishPolicy, ResourceRevision, ResourceTarget, WorldLocation } from '../domain/types.js';
 import type { ObjectStore } from '../store/objects.js';
 import type { StorageLocationService } from '../store/storage-locations.js';
 import type { Store } from '../store/db.js';
@@ -1436,6 +1436,87 @@ export class ProjectResourceService {
 
   /** Runs once all confirmation layers approve, inside a retriable workflow activity.
    * Freeze all choices together; individual publication CAS fences remain authoritative. */
+  /** A pull request of a task with several branches carries the task's data
+   * (SPEC §11.1): what was published since is merged into the task's copies
+   * first, then each copy that changed is saved. Published when the pull
+   * request is approved, on top of exactly that version; kept until then under
+   * kv `resource-pull-request:<key>`. A conflict is the agent's to combine. */
+  async snapshotForPullRequest(taskId: string, key: string, work: { checkContinue?: () => Promise<void> } = {}): Promise<PullRequestData[]> {
+    const conflicts = (await this.integratePublished(taskId, work)).filter((report) => report.conflicts?.length);
+    if (conflicts.length) throw ResourceConflictError.combine(conflicts.map((report) =>
+      new ResourceConflictError(report.path, report.conflicts!, undefined, report.guide)));
+    const world = await this.store.currentWorld(taskId) as WorldHandle | undefined;
+    const parent = await this.parentWorld(taskId);
+    const proposed = new Set((await this.store.listResourceCandidates(taskId)).map((candidate) => candidate.attachmentId));
+    const data: PullRequestData[] = [];
+    for (const lease of world ? await this.store.listResourceLeases(world.id, world.generation ?? 1) : []) {
+      if (lease.state !== 'active' || proposed.has(lease.attachmentId) || parent?.forks.has(lease.attachmentId)) continue;
+      const resource = await this.store.getResourceAttachment(lease.attachmentId);
+      if (!resource || resource.publish !== 'review' || resource.access !== 'write' || resource.isolation !== 'fork' || resource.target.kind !== 'path') continue;
+      await work.checkContinue?.();
+      const inspection = await this.inspect(taskId, resource.id, work);
+      const { summary } = inspection;
+      if (summary.promoted || summary.added + summary.modified + summary.deleted === 0) {
+        await this.discardCapture(inspection.repository, inspection.capture);
+        continue;
+      }
+      const label = locationLabel(resource.target);
+      const current = (await this.requiredAttachment(resource.id)).currentRevisionId;
+      // Published over a version the copy does not hold, it would undo that version's changes.
+      if (summary.baseRevisionId !== current)
+        throw new Error(`${label} has a newer version this task could not take in yet; try again`);
+      const snapshot = await this.store.saveResourceRevision({ attachmentId: resource.id, parentRevisionId: current,
+        ...this.restic.revisionFields(inspection.capture, inspection.repository),
+        metadata: { checkpoint: true, pullRequest: key, summary }, createdByTaskId: taskId });
+      data.push({ attachmentId: resource.id, name: resource.name, path: label, revisionId: snapshot.id,
+        ...(current ? { baseRevisionId: current } : {}), summary });
+    }
+    await this.store.kvSet(`resource-pull-request:${key}`, JSON.stringify(data));
+    return data;
+  }
+
+  /** Publish the data a pull request carries, as reviewed: each snapshot on top
+   * of the version it was taken against, or not at all (a newer version means
+   * the agent takes it in and opens the pull request again). */
+  async publishPullRequestData(taskId: string, key: string): Promise<void> {
+    let data: PullRequestData[] = [];
+    try { data = JSON.parse((await this.store.kvGet(`resource-pull-request:${key}`)) ?? '[]'); } catch {}
+    const ready: Array<{ item: PullRequestData; attachment: ResourceAttachment; snapshot: ResourceRevision }> = [];
+    for (const item of data) {
+      const attachment = await this.requiredAttachment(item.attachmentId);
+      const current = attachment.currentRevisionId ? await this.store.getResourceRevision(attachment.currentRevisionId) : undefined;
+      if (current?.metadata?.pullRequestSnapshot === item.revisionId) continue; // published already (a retry)
+      const snapshot = await this.store.getResourceRevision(item.revisionId);
+      if (!snapshot) throw new Error(`the snapshot of ${item.path} is gone; open the pull request again`);
+      if (attachment.currentRevisionId !== item.baseRevisionId)
+        throw new Error(`${item.path} has a newer version than the one this pull request's data was taken against; open the pull request again to take it in`);
+      ready.push({ item, attachment, snapshot });
+    }
+    for (const { item, attachment, snapshot } of ready) {
+      const { engine, storageLocationId, sealedRef, rootDigest, bytes, files } = snapshot;
+      const revision = await this.store.saveResourceRevision({ attachmentId: attachment.id, parentRevisionId: item.baseRevisionId,
+        engine, ...(storageLocationId ? { storageLocationId } : {}), sealedRef, rootDigest, bytes, ...(files !== undefined ? { files } : {}),
+        metadata: { summary: item.summary, pullRequestSnapshot: item.revisionId }, createdByTaskId: taskId });
+      try {
+        await this.serializePublish(attachment.id, taskId, async () => {
+          await this.store.promoteResourceRevision(attachment.id, revision.id, item.baseRevisionId);
+          await this.store.appendAudit({ principalId: `task:${taskId}`, action: 'resource:promote', scopeKey: `project:${attachment.projectId}`,
+            detail: { attachmentId: attachment.id, from: item.baseRevisionId, to: revision.id, summary: item.summary, pullRequest: key } });
+        });
+      } catch (error) {
+        await this.store.deleteResourceRevisionIfUnreferenced(revision.id).catch(() => undefined);
+        if (/baseline changed/.test(String((error as Error)?.message)))
+          throw new Error(`${item.path} has a newer version than the one this pull request's data was taken against; open the pull request again to take it in`);
+        throw error;
+      }
+    }
+  }
+
+  /** The pull request settled: its snapshots are no longer kept for it. */
+  async releasePullRequestData(key: string): Promise<void> {
+    await this.store.kvDelete(`resource-pull-request:${key}`);
+  }
+
   /** Output the task proposed that has no snapshot yet and was not excluded:
    * completing now would lose it with the task's world. Its path, and why the
    * last save failed. */
@@ -1707,7 +1788,9 @@ export class ProjectResourceService {
     // What changed is relative to the version the copy forked from (a
     // sub-task's: its parent's copy), also once restored from a park's capture.
     // Or from the newest version merged into it before Review.
-    const forkedId = await this.integratedBase(taskId, handle, lease, attachmentId) ?? await this.ownForkPoint(taskId, lease.revisionId);
+    // Or from what this task published itself since (a pull request carries its data): Review shows only what is new.
+    const forkPointId = await this.integratedBase(taskId, handle, lease, attachmentId) ?? await this.ownForkPoint(taskId, lease.revisionId);
+    const forkedId = await this.mergeBase(taskId, attachment.currentRevisionId, forkPointId);
     const started = forkedId ? await this.store.getResourceRevision(forkedId) : undefined;
     const restoredFrom = lease.revisionId && lease.revisionId !== forkedId ? await this.store.getResourceRevision(lease.revisionId) : started;
     const label = attachment.target.kind === 'path' ? locationLabel(attachment.target) : attachment.name;
@@ -1728,6 +1811,8 @@ export class ProjectResourceService {
     }
     const summary: ResourceChangeSummary = { attachmentId: attachment.id, baseRevisionId: forkedId,
       ...await this.changes(repository, started, capture) };
+    // Measured from its own publication: nothing new means it is all published.
+    if (forkedId !== forkPointId && summary.added + summary.modified + summary.deleted === 0) summary.promoted = true;
     // Keep the lease's original baseline (and its publication CAS fence), but
     // stop asking for a decision on bytes this task has already published.
     let publishedId = attachment.currentRevisionId;
@@ -2107,6 +2192,13 @@ export class ProjectResourceService {
     const integrated = await this.integratedBase(taskId, handle, lease, attachmentId);
     const forkedId = integrated ?? await this.ownForkPoint(taskId, lease.revisionId);
     const started = forkedId ? await this.store.getResourceRevision(forkedId) : undefined;
+    // Nothing of its own since its last publication: publishing changes nothing
+    // (neither reverting what others published since, nor taking it in).
+    if (summary.baseRevisionId !== forkedId && summary.added + summary.modified + summary.deleted === 0) {
+      await this.discardCapture(repository, capture);
+      const now = await this.requiredAttachment(attachmentId);
+      return { attachment: now, revision: (await this.store.getResourceRevision(now.currentRevisionId!))!, summary };
+    }
     // Identical to what the world started from: there is nothing to publish.
     if (started?.attachmentId === attachment.id && summary.added + summary.modified + summary.deleted === 0) {
       await this.discardCapture(repository, capture);
