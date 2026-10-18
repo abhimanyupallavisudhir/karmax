@@ -5981,12 +5981,12 @@ export class Store {
   async listTaskTemplates(organizationId: string, projectId?: string): Promise<TaskTemplate[]> {
     const rows = (projectId
       ? await this.db.prepare("SELECT * FROM task_templates WHERE organizationId = ? AND (projectId = '' OR projectId = ?) ORDER BY createdAt, id").all(organizationId, projectId)
-      : await this.db.prepare("SELECT * FROM task_templates WHERE organizationId = ? AND projectId = '' ORDER BY createdAt, id").all(organizationId)) as any[];
+      : await this.db.prepare("SELECT * FROM task_templates WHERE organizationId = ? AND projectId = '' ORDER BY createdAt, id").all(organizationId)) as TaskTemplateRow[];
     return rows.map(rowToTaskTemplate);
   }
 
   async getTaskTemplate(id: string): Promise<TaskTemplate | undefined> {
-    const row = (await this.db.prepare('SELECT * FROM task_templates WHERE id = ?').get(id)) as any;
+    const row = (await this.db.prepare('SELECT * FROM task_templates WHERE id = ?').get(id)) as TaskTemplateRow | undefined;
     return row ? rowToTaskTemplate(row) : undefined;
   }
 
@@ -10495,7 +10495,9 @@ function taskTemplateContentOf(template: TaskTemplate): Omit<TaskTemplateContent
   const { params, notes, authorization, credentialGrants, credentialPolicies, tags, priority } = template;
   return { params, notes, authorization, credentialGrants, credentialPolicies, tags, priority };
 }
-function rowToTaskTemplate(r: any): TaskTemplate {
+interface TaskTemplateRow { id: string; organizationId: string; projectId: string | null; name: string; workflow: string;
+  content: string; createdBy: string | null; createdAt: number | string; updatedAt: number | string }
+function rowToTaskTemplate(r: TaskTemplateRow): TaskTemplate {
   const content = JSON.parse(r.content) as Omit<TaskTemplateContent, 'workflow'>;
   return {
     id: r.id, organizationId: r.organizationId, projectId: r.projectId ?? '', name: r.name, workflow: r.workflow,
