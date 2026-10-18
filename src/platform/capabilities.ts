@@ -52,6 +52,9 @@ export const ORGANIZATION_WIKI_WRITE_DENIED =
 export const DEVELOPER_WORKSPACE_CAPABILITIES: Capability[] = [
   'project:read', 'project:settings:read', 'project:secret:use',
   'task:read', 'task:create', 'task:conversation:read', 'task:conversation:fork',
+  // Any task of the project: agreeing an interface or handing over a finding
+  // is ordinary teamwork. Its settings and lifecycle stay its owner's.
+  'task:conversation:message',
   'task:event:read', 'task:git:import', 'task:escalate', 'task:manage-own',
   'diagnostic:read', 'process:read',
   'queue:read', 'workflow:read', 'profile:read',
@@ -142,7 +145,7 @@ export const CAPABILITY_GROUPS: CapabilityGroup[] = [
       ['task:conversation:read', 'Read agent conversations', 'Discover attached agents and read their conversation history.'],
       ['task:conversation:share', 'Share conversations publicly', 'Create and revoke public conversation snapshots when organization and project policy allows.'],
       ['task:conversation:fork', 'Fork agent conversations', 'Create a new task from an existing agent conversation.'],
-      ['task:conversation:message', 'Message forked agents', 'Continue a forked conversation with additional messages.'],
+      ['task:conversation:message', 'Message agents', 'Message any task’s agents; a running agent reads it at once, an idle one wakes.'],
       ['task:review:write', 'Write review information', 'Publish structured review summaries and evidence.'],
       ['review:approve', 'Approve Review gates and route reviews', 'Confirm a task at its Review gate and change who reviews or answers it — the decisions a human reviewer makes. Held by maintainers and above; not by the default developer profile.'],
       ['task:review:execute', 'Execute review actions', 'Run and stop workflow-declared review actions.'],

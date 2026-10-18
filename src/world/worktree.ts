@@ -564,7 +564,11 @@ class WorktreeWorld implements World {
   }
 
   async destroy(): Promise<void> {
-    const repos = worldRepos(this.handle);
+    // A checkout enrolled from its origin while the task ran is a standalone
+    // clone, not a worktree of a host repository: removing the root removes it.
+    // Its `repo` is a URL, which as a path would resolve against the process's
+    // working directory (and the worktree lock would create it there).
+    const repos = worldRepos(this.handle).filter((r) => path.isAbsolute(r.repo));
     for (const r of repos) {
       await withWorktreeLock(r.repo, async () => {
         await git(r.repo, ['worktree', 'remove', '--force', r.root]);

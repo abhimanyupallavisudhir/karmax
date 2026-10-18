@@ -21,6 +21,10 @@ export function forkWorldSource(task: TaskRecord, handle?: WorldHandle): ForkWor
   const view = task.lastView;
   const landed = view?.status === 'done';
   const target = forkLandingBranch(task, handle);
+  // A finished task without repositories landed nothing: its work is its final
+  // checkpoint, which the fork starts from.
+  if (landed && handle?.checkpointId && !worldRepos(handle).length)
+    return { taskId: task.id, base: target || handle.base || 'main', unpublished: true, repos: [] };
   const base = landed ? target : handle?.branch ?? view?.branch;
   if (!base) return undefined;
   return { taskId: task.id, base, unpublished: !landed,

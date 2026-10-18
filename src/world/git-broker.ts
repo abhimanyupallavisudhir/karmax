@@ -91,10 +91,16 @@ export async function brokerEnrollRepository(
   }
   if (!world.writeFileBuffer) throw new Error('this world provider cannot receive brokered Git bundles; retry the task after attaching the repository');
 
-  const name = uniqueEnrollmentName(worldRepos(world.handle), spec.name ?? repositoryName(spec.source));
+  // A path the agent already made (a task that began without repositories
+  // may have a directory named after the repository) is never overwritten:
+  // the checkout goes beside it.
+  const taken = worldRepos(world.handle).map((repo) => repo.name);
+  let name = uniqueEnrollmentName(taken, spec.name ?? repositoryName(spec.source));
+  while ((await world.exec('test', ['-e', path.posix.join(world.handle.root, name)], { cwd: world.handle.root })).code === 0) {
+    taken.push(name);
+    name = uniqueEnrollmentName(taken, spec.name ?? repositoryName(spec.source));
+  }
   const root = path.posix.join(world.handle.root, name);
-  const exists = await world.exec('test', ['-e', root], { cwd: world.handle.root });
-  if (exists.code === 0) throw new Error(`checkout path "${name}" already exists but is not enrolled; move it aside or retry the task`);
 
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-git-enroll-'));
   let createdWorldPath = false;
@@ -187,8 +193,8 @@ function repositoryName(remote: string): string {
   return safe && !/^\.+$/.test(safe) ? safe : 'repo';
 }
 
-function uniqueEnrollmentName(repos: WorldRepo[], preferred: string): string {
-  const used = new Set(repos.map((repo) => repo.name));
+function uniqueEnrollmentName(names: string[], preferred: string): string {
+  const used = new Set(names);
   if (!used.has(preferred)) return preferred;
   for (let suffix = 2; ; suffix++) if (!used.has(`${preferred}-${suffix}`)) return `${preferred}-${suffix}`;
 }

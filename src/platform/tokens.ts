@@ -442,9 +442,7 @@ export class TokenAuthority {
     const record = (await this.verify(token));
     if (!record) return { ok: false, reason: 'invalid or expired token' };
     if (!allows(record.caps, capability) && !(OWN_TASK_CAPABILITIES.has(capability)
-      && allows(record.caps, 'task:manage-own') && scope?.taskId
-      && (await this.ownsTask(record, scope.taskId)
-        || capability === 'task:conversation:message' && await this.sameFamily(record, scope.taskId))))
+      && allows(record.caps, 'task:manage-own') && scope?.taskId && await this.ownsTask(record, scope.taskId)))
       return { ok: false, record, missing: capability, reason: `missing capability ${capability} ${(await this.describeScope(record, scope))}` };
     // Resolve the tenant from durable ownership, including callers that pass
     // only a project/task ID. A transfer must immediately fence old org tokens.
@@ -507,26 +505,6 @@ export class TokenAuthority {
       if (actor.kind === 'autonomous' && creator?.kind === 'avatar' && actor.principal === `avatar:${creator.avatarId}`) return true;
       if (originTaskId && creator?.kind === 'task-agent' && creator.taskId === originTaskId) return true;
       id = task.parentTaskId;
-    }
-    return false;
-  }
-
-  /** Whether a task agent and `taskId` belong to one tree of sub-tasks (they
-   * share an ancestor): sub-tasks of one parent act with its authority and
-   * may talk to each other — agree a design, hand over a finding — without
-   * relaying everything through the parent. Only messages: what else a task
-   * may do to another stays with whoever owns it. */
-  private async sameFamily(record: ScopedToken, taskId: string): Promise<boolean> {
-    const actor = record.actor;
-    if (actor?.kind !== 'task-agent') return false;
-    const ancestors = new Set<string>();
-    for (let id: string | undefined = (await this.store?.taskMetadataAsync(actor.taskId))?.parentTaskId; id && !ancestors.has(id);)
-      { ancestors.add(id); id = (await this.store?.taskMetadataAsync(id))?.parentTaskId; }
-    if (!ancestors.size) return false;
-    for (let id: string | undefined = taskId, seen = new Set<string>(); id && !seen.has(id);) {
-      if (ancestors.has(id)) return true;
-      seen.add(id);
-      id = (await this.store?.taskMetadataAsync(id))?.parentTaskId;
     }
     return false;
   }

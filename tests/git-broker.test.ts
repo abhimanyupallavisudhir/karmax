@@ -97,6 +97,25 @@ describe('cloud Git broker', () => {
     expect(auth).toHaveBeenCalled();
   });
 
+  it('enrolls into a world without repositories beside a same-named directory of the agent\'s, never into it', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-broker-adopt-')); cleanups.push(root);
+    const source = path.join(root, 'site');
+    fs.mkdirSync(source);
+    await gitOrThrow(source, ['init', '-q', '-b', 'main']); await ensureIdentity(source);
+    fs.writeFileSync(path.join(source, 'README.md'), '# site\n');
+    await gitOrThrow(source, ['add', '-A']); await gitOrThrow(source, ['commit', '-q', '-m', 'base']);
+    await gitOrThrow(root, ['clone', '-q', '--bare', source, path.join(root, 'site.git')]);
+    const env = { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: `url.file://${root}/.insteadOf`, GIT_CONFIG_VALUE_0: 'git@example:' };
+    const world = await new WorktreeProvider(path.join(root, 'worlds')).create({ taskId: 'adopt', base: 'main' });
+    await world.writeFile('site/draft.html', 'the agent\'s own draft');
+    const enrolled = await brokerEnrollRepository(world, {
+      source: 'git@example:site.git', name: 'site', branch: world.handle.branch, base: 'main', target: 'main' }, env);
+    expect(enrolled.name).toBe('site-2');
+    expect(fs.readFileSync(path.join(world.handle.root, 'site/draft.html'), 'utf8')).toBe('the agent\'s own draft');
+    expect(fs.readFileSync(path.join(enrolled.root, 'README.md'), 'utf8')).toBe('# site\n');
+    expect(world.handle.repos?.map((repo) => repo.name)).toEqual(['site-2']);
+  });
+
   it('enrolls an attached empty private repo, publishes the parent, and bootstraps a child checkout/import without leaking credentials', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-broker-enrollment-'));
     cleanups.push(root);

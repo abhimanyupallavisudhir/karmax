@@ -107,7 +107,9 @@ describe('autonomous role defaults', () => {
           for (const token of [human.token, agent.token, legacy.token]) expect((await tokens.check(token, cap, { taskId: ids[id] })).ok, `${cap} ${id}`).toBe(true);
         }
         expect((await tokens.check(agent.token, cap, { taskId: ids.created })).ok).toBe(true);
-        for (const token of [human.token, agent.token]) expect((await tokens.check(token, cap, { taskId: ids.other })).ok).toBe(false);
+        // Messaging is not management: a Developer may message any task of the project.
+        for (const token of [human.token, agent.token])
+          expect((await tokens.check(token, cap, { taskId: ids.other })).ok, `${cap} other`).toBe(cap === 'task:conversation:message');
       }
       expect((await tokens.check(agent.token, 'task:edit', { taskId: ids.sibling })).ok).toBe(false);
       expect((await tokens.check(human.token, 'task:edit', { taskId: ids.sibling })).ok).toBe(true);

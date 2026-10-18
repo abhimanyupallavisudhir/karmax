@@ -140,7 +140,7 @@ export const DEFAULT_AUTHORIZATION_PROFILES: AuthorizationProfile[] = [
   },
   {
     id: 'developer', name: 'Developer', builtin: true,
-    description: 'Read diagnostics and work on your own tasks and descendants inside assigned projects.',
+    description: 'Message any task, read diagnostics, and work on your own tasks and descendants inside assigned projects.',
     capabilities: developer,
   },
   {

@@ -191,7 +191,11 @@ it('enforces Developer ownership through HTTP and records the agent as creator',
   expect(await proposal.text()).toContain('project resources are unavailable');
   const request = await call(agent.token, 'POST', '/api/agent/collaboration/request',
     { taskId: sibling.id, action: 'publish_branch' });
-  expect(request.status).toBe(403);
+  // Asking another task's agent is a message to it, which a Developer may send
+  // to any task of the project: it reaches the domain check (a draft has no world).
+  const refusal = await request.text();
+  expect(request.status, refusal).toBe(409);
+  expect(refusal).not.toMatch(/capability/);
 
   expect((await call(agent.token, 'PUT', `/api/settings/project/${project.id}/__common__`, { values: {} })).status).toBe(403);
 });

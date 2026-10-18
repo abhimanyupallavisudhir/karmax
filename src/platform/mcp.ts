@@ -509,7 +509,7 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
   );
   server.registerTool(
     'message_agent',
-    { description: `Send a follow-up into an attached agent conversation (${AGENT_ROLE_NAMES.join(', ')}). This works for original or forked tasks and is delivered live when that agent is running.`, inputSchema: { taskId: z.string(), role: z.enum(AGENT_ROLE_NAMES).default('do'), message: z.string() } },
+    { description: `Message another task's agent (${AGENT_ROLE_NAMES.join(', ')}) — any task of your project, original or forked (find_task resolves a #number). It reads it as from your task ("Task #N"): at once if working, else it wakes.`, inputSchema: { taskId: z.string(), role: z.enum(AGENT_ROLE_NAMES).default('do'), message: z.string() } },
     async (a) => wrap(async () => ops.messageAgent(a.taskId, a.message, a.role)),
   );
   server.registerTool(

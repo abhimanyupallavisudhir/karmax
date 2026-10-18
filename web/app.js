@@ -1887,7 +1887,7 @@ function renderField(f, own, inherited, withChips, alt, agentOpts) {
       // seeded elsewhere with the default [[proj:tag:default]] / [[org:tag:default]] so
       // the user sees (and can backspace away) what's inlined by default.
       return `<div class="form-row" data-row="${esc(f.name)}">${label}<div class="prompt-field">${ta}<div class="img-chips attachment-chips" id="tf-chips" style="display:none"></div>
-        <div class="prompt-attach-row"><label class="attach-file-button" tabindex="0">Attach files<input id="tf-files" type="file" multiple hidden></label><span>25 MB each · 50 MB per prompt</span></div>
+        <div class="prompt-attach-row"><label class="attach-file-button" tabindex="0">Attach files<input id="tf-files" type="file" multiple hidden></label><span title="25 MB each · 50 MB per prompt">25 MB each · 50 MB per prompt</span></div>
         <div class="prompt-context-row"><span class="pc-prefix" title="Wiki pages, labels ([[…:tag:…]]), or folders ([[…/*]]) inlined into this task's context. Type [[ to add; backspace to remove.">context</span><textarea id="tf-context" class="prompt-context" rows="1" spellcheck="false" placeholder="type [[ to attach a wiki page, label, or folder"></textarea></div></div></div>`;
     return `<div class="form-row" data-row="${esc(f.name)}">${label}${ta}</div>`;
   }
@@ -11962,7 +11962,7 @@ function conversationPane(v, t) {
           <textarea class="followup-input" placeholder="${t.shared ? `${defaultRecipientFor(v) === 'agent:do' ? 'Message the agent' : `Reply to ${participantLabelOf(defaultRecipientFor(v).slice(6), v)}`} · @ to call an agent or person · [[ for wiki` : `Send a follow-up to ${agentName} (drop files here, type [[ for wiki context)`}" ${followUp.enabled ? '' : 'disabled'}>${esc(draft)}</textarea>
           ${t.shared ? newAgentFormsHtml(v, `${v.taskId}/${t.role}`) : ''}
           <div class="img-chips attachment-chips followup-chips" style="display:none"></div>
-          <div class="prompt-attach-row"><label class="attach-file-button" tabindex="0">Attach files<input class="followup-files" type="file" multiple hidden></label><span>25 MB each · 50 MB per prompt</span></div>
+          <div class="prompt-attach-row"><label class="attach-file-button" tabindex="0">Attach files<input class="followup-files" type="file" multiple hidden></label><span title="25 MB each · 50 MB per prompt">25 MB each · 50 MB per prompt</span></div>
         </div>
         ${t.shared && stoppableAgent(v) ? stopAgentButton(stoppableAgent(v), 'btn followup-stop') : ''}
         <button class="btn primary followup-send" data-keys="meta+Enter" ${followUp.enabled ? '' : 'disabled'}${continues ? ' title="The approved PR lands as it is. The agent carries on in a new task."' : ''}>${continues ? 'Continue' : 'Send'}</button>
@@ -24560,6 +24560,28 @@ function renderSetup() {
   $('#setup-pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
 }
 
+// Browsers that ignore the viewport's interactive-widget (iOS Safari) keep the
+// page full height under the on-screen keyboard and pan to the caret, hiding
+// what sits below it — the conversation's Send. Fit the console to the part of
+// the screen the keyboard leaves instead (#app reads --visible-height).
+function fitToVisualViewport() {
+  const viewport = window.visualViewport;
+  if (!viewport) return;
+  const fit = () => {
+    const root = document.documentElement;
+    // Pinch zoom shrinks the visual viewport too; a keyboard leaves the scale at 1.
+    if (viewport.scale > 1.01 || window.innerHeight - viewport.height <= 1) { root.style.removeProperty('--visible-height'); return; }
+    root.style.setProperty('--visible-height', `${viewport.height}px`);
+    // The console now fits above the keyboard: undo the pan. Pages that scroll keep theirs.
+    const app = document.getElementById('app');
+    if ((viewport.offsetTop || window.scrollY) && app && app.getBoundingClientRect().height <= viewport.height + 1) window.scrollTo(0, 0);
+  };
+  viewport.addEventListener('resize', fit);
+  viewport.addEventListener('scroll', fit);
+  fit();
+}
+
+fitToVisualViewport();
 boot().catch((e) => { console.error(e); document.getElementById('app').innerHTML = `<div class="empty"><div class="big">Failed to load</div>${esc(e.message)}</div>`; });
 
 // MCP choices belong to the agent, independent of the model login.

@@ -158,8 +158,9 @@ describe('durable authorization policy', () => {
     const store = (await Store.create(':memory:'));
     try {
       const current = DEFAULT_AUTHORIZATION_PROFILES.find((p) => p.id === 'maintainer')!;
-      // The release before organization:wiki:write also predates project:secret:use.
-      const previous = current.capabilities.filter((cap) => cap !== 'organization:wiki:write' && cap !== 'project:secret:use');
+      // The release before organization:wiki:write also predates project:secret:use
+      // and Developers (whose list Maintainer extends) messaging any task.
+      const previous = current.capabilities.filter((cap) => !['organization:wiki:write', 'project:secret:use', 'task:conversation:message'].includes(cap));
       (await store.setAuthorizationProfile('global', { ...current, capabilities: previous }));
       (await AuthorizationService.create(store));
       expect((await store.getAuthorizationProfile('global', 'maintainer')).capabilities).toContain('organization:wiki:write');

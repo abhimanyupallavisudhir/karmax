@@ -70,6 +70,8 @@ import {
   ShipBranchRequest,
   ShipBranchOutcome,
   PullRequestData,
+  AdoptedRepositories,
+  KeptWorkspace,
 } from './contract.js';
 import { mergeQueueDomains, releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider,
   landingAuthorityOf, samePosition, MERGE_POLL, reviewCheckouts, approveAll, worldRepos, landedNote } from './contract.js';
@@ -79,6 +81,7 @@ import { agentTurnId } from './turn-id.js';
 import { taskBranch } from '../domain/brand.js';
 import { conversationPublisher, type TurnConversationBase } from '../domain/view-publication.js';
 import { unattendedJobsReminder, waitForAgent } from './agent-wait.js';
+import { ADOPT_ATTACHED_REPOSITORIES, KEEP_FINAL_WORKSPACE, adoptedProjectConfig, adoptedRepositoriesNote, keptWorkspaceNote } from '../domain/adopted-repositories.js';
 
 const coreChild = proxyActivities<childActivities>({ startToCloseTimeout: '20 seconds' });
 const resourceActivities = proxyActivities<coreActivities>({
@@ -119,6 +122,12 @@ const cancellationAwareCore = proxyActivities<coreActivities>({
 const long = proxyActivities<coreActivities>({
   startToCloseTimeout: '45 minutes',
   retry: { maximumAttempts: 1 },
+});
+// Adopting a repository attached mid-task clones it into the world (each clone
+// is bounded at 10 minutes); a failure is recorded and tried again next turn.
+const enrollment = proxyActivities<coreActivities>({
+  startToCloseTimeout: '30 minutes',
+  retry: { maximumAttempts: 2 },
 });
 // An agent turn has no wall-clock limit: long investigations and builds are
 // normal work. The 2-minute heartbeat timeout is what detects a dead worker or
@@ -822,6 +831,11 @@ async function softwareDevImpl(
   // Continuing as new restores a run from the recovery checkpoint, whose Do
   // entry is complete from v1.22 (restoresStagePrerequisites).
   const continuesAsNew = minor >= 22;
+  // A repository attached to the project while this top-level task runs without
+  // one joins its world, and the task continues as new as a task with
+  // repositories (ADOPT_ATTACHED_REPOSITORIES): every repository-dependent
+  // behavior above is fixed for the life of a run.
+  const adoptsAttachedRepositories = repositoryless && continuesAsNew && !input.parentTaskId && !input.shippedFrom;
   const taskId = input.taskId;
   const recovery = input.recovery;
   // A continued run starts from what its predecessor carried: signals and
@@ -4297,11 +4311,21 @@ Inspect the complete current diff and specifically compare its delta from the re
   const retryContinuationLater = () => {
     continueRetryAt = workflowInfo().historyLength + CONTINUE_RETRY_EVENTS;
   };
+  /** The repositories this run's world adopted: the next run is a task with them. */
+  let adoption: AdoptedRepositories | undefined;
+  let adoptionNoted = false;
 
   function continuationInput(conversation: string, runPinned: boolean): SoftwareDevInput {
     const { recovery: _previous, ...next } = liveInput;
-    return { ...next, base, goalMode, responder: liveResponder, recovery: {
-      resumeStage: 'do', messages: [], world: world as TaskRecoveryCheckpoint['world'], session, sessionHome, seen, target,
+    // A repository-less choice of base and target meant nothing; the adopted
+    // repositories' do. An Open PR asked for before cannot open their PR unseen.
+    const adopted = adoption ? {
+      project: adoptedProjectConfig(next.project, adoption),
+      base: adoption.project.defaultBase ?? base,
+      target: adoption.project.defaultTarget ?? adoption.project.defaultBase ?? target,
+    } : undefined;
+    return { ...next, ...(adopted ? { project: adopted.project } : {}), base: adopted?.base ?? base, goalMode, responder: liveResponder, recovery: {
+      resumeStage: 'do', messages: [], world: world as TaskRecoveryCheckpoint['world'], session, sessionHome, seen, target: adopted?.target ?? target,
       prs, reviewInfo, checkoutApprovals, landing, repairValidationPending,
       continued: {
         conversation,
@@ -4317,12 +4341,12 @@ Inspect the complete current diff and specifically compare its delta from the re
         checkoutHeads,
         accountPool,
         flags: { targetLocked, pointOfNoReturnPassed, branchPreparedForPr, forceHumanRepairReview, providerQueueAccepted,
-          prRequested, confirmed, retryRequested, manualEscalationRequested, resourcesApplied,
+          prRequested: adoption ? false : prRequested, confirmed, retryRequested, manualEscalationRequested, resourcesApplied,
           ...(taskCommand ? { commandRan, commandUnchanged } : {}),
           ...(pullRequestsOpened ? { pullRequestsOpened } : {}) },
         ...(manualPrConfirmer ? { manualPrConfirmer } : {}),
         ...(escalationAction ? { escalationAction } : {}),
-        ...(openPrAskedAt !== undefined ? { openPrAskedAt } : {}),
+        ...(openPrAskedAt !== undefined && !adoption ? { openPrAskedAt } : {}),
         ...(heardThrough ? { heardThrough } : {}),
         ...(error ? { error } : {}),
         counters: { responderRounds, subtaskNags, subagentNudges, shellNudges, landingWatchSequence, resourceReviewSequence },
@@ -4656,6 +4680,21 @@ Inspect the complete current diff and specifically compare its delta from the re
     // review that returned here) speaks before the main agent's next turn.
     await runCalledAgents();
     if (cancelled) return await abort();
+    // Learned from the world (the store's handle), never the creation-time snapshot.
+    if (adoptsAttachedRepositories && world && patched(ADOPT_ATTACHED_REPOSITORIES)) {
+      const adopted: AdoptedRepositories | undefined = await enrollment.adoptAttachedRepositories(world as WorldHandle, taskId);
+      if (adopted) {
+        world = adopted.world;
+        adoption = adopted;
+        if (!adoptionNoted) {
+          adoptionNoted = true;
+          msgs.push({ id: `repos-${msgs.length}`, role: 'user', text: adoptedRepositoriesNote(adopted), ts: Date.now() });
+        }
+        // Children or a passing refusal postpone it to a later turn.
+        await continueRun();
+        if (cancelled) return await abort();
+      }
+    }
     if (continuesAsNew && historyGrown() && patched('software-dev-continue-as-new-v1')) {
       await continueRun();
       if (cancelled) return await abort();
@@ -5445,15 +5484,25 @@ Inspect the complete current diff and specifically compare its delta from the re
     && patched('automatic-resource-review-restored-v1') && (await applyReviewedResources()) !== 'applied') return await abort();
 
   if (repositoryless) {
+    // Its world is its work: Confirm keeps it (a final checkpoint) before the
+    // world goes, never discarding what the agent made without saying so.
+    let kept: KeptWorkspace | undefined;
+    if (world && patched(KEEP_FINAL_WORKSPACE)) {
+      status = 'active';
+      await publish();
+      kept = await withResolve('review', () => long.keepFinalWorkspace(world as WorldHandle));
+    }
     stage = 'done';
     status = 'done';
+    const completed = `Completed; no repository merge required.${keptWorkspaceNote(kept)}`;
     reviewInfo = {
       ...reviewInfo,
       summary: reviewInfo?.summary
-        ? `${reviewInfo.summary}\n\nCompleted; no repository merge required.`
-        : 'Completed; no repository merge required.',
+        ? `${reviewInfo.summary}\n\n${completed}`
+        : completed,
     };
     await publish();
+    if (kept && !kept.destroy) return { stage };
     const remoteWorld = world ? releaseWorldOnCompletion(world) : false;
     await core.destroyWorld(world as any);
     if (remoteWorld) {

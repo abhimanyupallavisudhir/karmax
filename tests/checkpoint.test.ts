@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import { execFile } from 'node:child_process';
@@ -15,6 +16,7 @@ import { WorldCheckpointService } from '../src/world/checkpoint.js';
 import { CHECKPOINT_LIMITS } from '../src/world/checkpoint-chunks.js';
 import type { WorldCheckpoint } from '../src/domain/types.js';
 import { git, gitOrThrow, ensureIdentity } from '../src/world/git.js';
+import { brokerEnrollRepository } from '../src/world/git-broker.js';
 import { ProjectEnvironment } from '../src/store/project-environment.js';
 import { ProjectServices } from '../src/store/project-services.js';
 import { ObjectSnapshotEngine, ProjectResourceService } from '../src/world/resources.js';
@@ -810,6 +812,160 @@ describe('symbolic links (WD-33)', () => {
       expect(fs.readFileSync(path.join(restored.root, 'out/report.txt'), 'utf8')).toBe('report');
       await (await worlds.open(restored)).destroy();
     } finally { await store.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe('files outside every checkout', () => {
+  const setup = async (prefix: string) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+    const makeRepo = async (name: string) => {
+      const repo = path.join(dir, name);
+      fs.mkdirSync(repo);
+      await gitOrThrow(repo, ['init', '-q', '-b', 'main']);
+      await ensureIdentity(repo);
+      fs.writeFileSync(path.join(repo, 'tracked.txt'), `${name}\n`);
+      await gitOrThrow(repo, ['add', '-A']);
+      await gitOrThrow(repo, ['commit', '-q', '-m', 'init']);
+      return repo;
+    };
+    const store = await Store.create(':memory:');
+    const worlds = new WorldRegistry();
+    worlds.register(new WorktreeProvider(path.join(dir, 'worlds')));
+    const objects = new LocalObjectStore(path.join(dir, 'objects'));
+    const service = new WorldCheckpointService(store, worlds, objects, new CredentialBroker(new Vault(path.join(dir, 'vault'))));
+    const cleanup = async () => { await store.close(); fs.rmSync(dir, { recursive: true, force: true }); };
+    return { dir, makeRepo, store, worlds, service, cleanup };
+  };
+
+  it('keeps work beside the checkouts of a multi-repository world through restore and fork', async () => {
+    const { makeRepo, store, worlds, service, cleanup } = await setup('checkpoint-outside-');
+    try {
+      const repos = [await makeRepo('front'), await makeRepo('back')];
+      const project = await store.createProject('Outside', { repos, defaultBase: 'main', worldProvider: 'worktree' });
+      const task = await store.createTask({ projectId: project.id, title: 'Outside', workflow: 'software-dev',
+        workflowVersion: '1.0.0', params: { prompt: 'test' } });
+      const world = await worlds.create('worktree', { taskId: task.id, repos, base: 'main' });
+      world.handle.meta = { projectId: project.id };
+      world.handle = await store.registerWorld(world.handle, project.id) as typeof world.handle;
+      await world.writeFile('notes/plan.md', 'plan beside the checkouts\n');
+      await world.writeFile('front/tracked.txt', 'front edit\n');
+      await world.writeFile('.env', 'SECRET=never\n');
+      await world.writeFile('.karmax-injection/agent/session.json', '{}');
+      const checkpoint = await service.checkpoint(world.handle);
+      expect(checkpoint.filesystemDelta).toMatchObject({ files: 2 });
+      await world.destroy();
+
+      const restored = await service.restore(checkpoint.id, 'worktree');
+      expect(fs.readFileSync(path.join(restored.root, 'notes/plan.md'), 'utf8')).toBe('plan beside the checkouts\n');
+      expect(fs.readFileSync(path.join(restored.root, 'front/tracked.txt'), 'utf8')).toBe('front edit\n');
+      expect(fs.existsSync(path.join(restored.root, 'front/notes/plan.md'))).toBe(false);
+      expect(fs.existsSync(path.join(restored.root, '.env'))).toBe(false);
+
+      const forkTask = await store.createTask({ projectId: project.id, title: 'Fork', workflow: 'software-dev',
+        workflowVersion: '1.0.0', params: { prompt: 'test' } });
+      const fork = await worlds.create('worktree', { taskId: forkTask.id, repos, base: 'main' });
+      await service.applyFork(checkpoint.id, fork, project.id);
+      expect(fs.readFileSync(path.join(fork.handle.root, 'notes/plan.md'), 'utf8')).toBe('plan beside the checkouts\n');
+      expect(fs.readFileSync(path.join(fork.handle.root, 'front/tracked.txt'), 'utf8')).toBe('front edit\n');
+      await fork.destroy();
+      await (await worlds.open(restored)).destroy();
+    } finally { await cleanup(); }
+  });
+
+  it('keeps every file it kept before when a repository is attached mid-task (andhbhakt #1: renders beside the checkout)', async () => {
+    const { dir, makeRepo, store, worlds, service, cleanup } = await setup('checkpoint-no-shrink-');
+    try {
+      const origin = await makeRepo('explainers');
+      await gitOrThrow(dir, ['clone', '-q', '--bare', origin, path.join(dir, 'explainers.git')]);
+      const project = await store.createProject('No shrink', { worldProvider: 'worktree' });
+      const task = await store.createTask({ projectId: project.id, title: 'Render', workflow: 'software-dev',
+        workflowVersion: '1.30.0', params: { prompt: 'render' } });
+      const world = await worlds.create('worktree', { taskId: task.id, base: 'main' });
+      world.handle.meta = { projectId: project.id };
+      world.handle = await store.registerWorld(world.handle, project.id) as typeof world.handle;
+      // A render large enough to be stored in content-addressed chunks, and small outputs packed together.
+      const video = crypto.randomBytes(3 * 1024 * 1024);
+      await world.writeFileBuffer!('renders/scene-1.mp4', video);
+      await world.writeFile('renders/scene-1.srt', 'subtitles\n');
+      await world.writeFile('script.md', '# script\n');
+      const paths = async (checkpoint: WorldCheckpoint) => {
+        const organizationId = (await store.getProject(checkpoint.projectId))!.organizationId!;
+        const kept: string[] = [];
+        for await (const entry of (service as any).chunks.entries(checkpoint, organizationId))
+          kept.push(`${entry.repo}:${entry.path}`);
+        return kept.sort();
+      };
+      const before = await service.checkpoint(world.handle);
+      expect(await paths(before)).toEqual([':renders/scene-1.mp4', ':renders/scene-1.srt', ':script.md']);
+
+      const env = { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: `url.file://${dir}/.insteadOf`, GIT_CONFIG_VALUE_0: 'git@example:' };
+      await brokerEnrollRepository(world, { source: 'git@example:explainers.git', name: 'explainers',
+        branch: world.handle.branch, base: 'main', target: 'main' }, env);
+      const adopted = await store.updateWorldCheckouts(world.handle, world.handle.repos!) as typeof world.handle;
+      await world.writeFile('explainers/notes.md', 'moved one file\n');
+      const after = await service.checkpoint(adopted);
+      // Nothing it kept before is lost: the checkout's change is added beside it.
+      expect(await paths(after)).toEqual([':renders/scene-1.mp4', ':renders/scene-1.srt', ':script.md', 'explainers:notes.md']);
+      expect(after.filesystemDelta!.contentBytes).toBeGreaterThanOrEqual(before.filesystemDelta!.contentBytes!);
+
+      // And they come back on a restore, beside the restored checkout.
+      await gitOrThrow(path.join(adopted.root, 'explainers'), ['push', '-q', 'origin', adopted.branch], { env });
+      await world.destroy();
+      const globalConfig = path.join(dir, 'gitconfig');
+      fs.writeFileSync(globalConfig, `[url "file://${dir}/"]\n\tinsteadOf = git@example:\n`);
+      process.env.GIT_CONFIG_GLOBAL = globalConfig;
+      const restored = await service.restore(after.id, 'worktree');
+      const sha = (data: Buffer) => crypto.createHash('sha256').update(data).digest('hex');
+      expect(sha(fs.readFileSync(path.join(restored.root, 'renders/scene-1.mp4')))).toBe(sha(video));
+      expect(fs.readFileSync(path.join(restored.root, 'script.md'), 'utf8')).toBe('# script\n');
+      expect(fs.readFileSync(path.join(restored.root, 'explainers/notes.md'), 'utf8')).toBe('moved one file\n');
+      await (await worlds.open(restored)).destroy();
+    } finally {
+      delete process.env.GIT_CONFIG_GLOBAL;
+      await cleanup();
+    }
+  });
+
+  it('restores a world that began without repositories, with its files and new checkout, from its root', async () => {
+    const { dir, makeRepo, store, worlds, service, cleanup } = await setup('checkpoint-adopted-');
+    try {
+      const origin = await makeRepo('site');
+      const project = await store.createProject('Adopted', { worldProvider: 'worktree' });
+      const task = await store.createTask({ projectId: project.id, title: 'Adopted', workflow: 'software-dev',
+        workflowVersion: '1.0.0', params: { prompt: 'test' } });
+      const world = await worlds.create('worktree', { taskId: task.id, base: 'main' });
+      world.handle.meta = { projectId: project.id };
+      world.handle = await store.registerWorld(world.handle, project.id) as typeof world.handle;
+      await world.writeFile('render/video.txt', 'rendered before the repository existed\n');
+      // The repository attached mid-task joins as a checkout beside the files.
+      const bare = path.join(dir, 'site.git');
+      await gitOrThrow(dir, ['clone', '-q', '--bare', origin, bare]);
+      const env = { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: `url.file://${dir}/.insteadOf`, GIT_CONFIG_VALUE_0: 'git@example:' };
+      // Restore clones the repository again, as the host would over SSH.
+      const globalConfig = path.join(dir, 'gitconfig');
+      fs.writeFileSync(globalConfig, `[url "file://${dir}/"]\n\tinsteadOf = git@example:\n`);
+      process.env.GIT_CONFIG_GLOBAL = globalConfig;
+      await brokerEnrollRepository(world, { source: 'git@example:site.git', name: 'site', branch: world.handle.branch,
+        base: 'main', target: 'main' }, env);
+      const durable = await store.updateWorldCheckouts(world.handle, world.handle.repos!);
+      // Adding a checkout never moves the agent: its working directory stays the root.
+      expect(durable.workdir).toBe(world.handle.root);
+      await world.writeFile('site/index.html', '<h1>moved</h1>\n');
+      // Parking publishes the branch first: it is the checkpoint's committed layer.
+      await gitOrThrow(path.join(world.handle.root, 'site'), ['push', '-q', 'origin', world.handle.branch]);
+      const checkpoint = await service.checkpoint(durable as typeof world.handle);
+      await world.destroy();
+
+      const restored = await service.restore(checkpoint.id, 'worktree');
+      expect(restored.workdir).toBe(restored.root);
+      expect(restored.repos?.map((repo) => repo.name)).toEqual(['site']);
+      expect(fs.readFileSync(path.join(restored.root, 'render/video.txt'), 'utf8')).toBe('rendered before the repository existed\n');
+      expect(fs.readFileSync(path.join(restored.root, 'site/index.html'), 'utf8')).toBe('<h1>moved</h1>\n');
+      await (await worlds.open(restored)).destroy();
+    } finally {
+      delete process.env.GIT_CONFIG_GLOBAL;
+      await cleanup();
+    }
   });
 });
 
