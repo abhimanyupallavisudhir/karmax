@@ -118,7 +118,7 @@ const attempt = (n, extra = {}) => ({
     await shot('task-checkin-toolbar.png', '.task-page .ck-pane-head');
     const tools = await page.evaluate(() => [...document.querySelectorAll('.ck-tools .btn')]
       .map((el) => Math.round(el.getBoundingClientRect().height)));
-    assert.ok(tools.length === 4 && tools.every((h) => h === 28), `toolbar actions share one size (${tools})`);
+    assert.ok(tools.length === 5 && tools.every((h) => h === 28), `toolbar actions share one size (${tools})`);
     assert.deepEqual(await page.locator('.ck-tools .btn').allInnerTexts().then((t) => t.slice(0, 3).map((x) => x.trim())), ['Share', 'Fork', 'Work locally'], 'Work locally sits beside Share and Fork');
 
     // The crown still selects the principal attempt and the note is a tooltip.

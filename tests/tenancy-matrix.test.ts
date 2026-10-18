@@ -72,8 +72,10 @@ describe.each(storeBackends)('every catalog route refuses another organization\'
     await store.addTaskTag(task.id, tag.id);
     const view = await store.createView({ projectId: project.id, name: `${SECRET} view`, query: {} as any });
     const team = await store.createTeam({ organizationId: other.id, name: `${SECRET} team` });
+    const template = await store.createTaskTemplate({ organizationId: other.id, projectId: project.id, name: `${SECRET} template`,
+      workflow: 'just-do', params: { prompt: `${SECRET} template prompt` } });
     foreign = { organizationId: other.id, projectId: project.id, taskId: task.id, tagId: tag.id, viewId: view.id,
-      teamId: team.id, userId: 'bob' };
+      templateId: template.id, teamId: team.id, userId: 'bob' };
 
     const client = {
       workflow: {
@@ -131,6 +133,7 @@ describe.each(storeBackends)('every catalog route refuses another organization\'
     if (param !== 'id') return undefined;
     if (route.startsWith('/api/tags/')) return foreign.tagId;
     if (route.startsWith('/api/views/')) return foreign.viewId;
+    if (route.startsWith('/api/templates/')) return foreign.templateId;
     if (route.startsWith('/api/users/')) return foreign.userId;
     return undefined;
   }

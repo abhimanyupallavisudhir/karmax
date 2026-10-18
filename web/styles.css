@@ -3866,3 +3866,26 @@ input.toggle:disabled { opacity:.45; cursor:not-allowed; }
 @media (prefers-reduced-motion: reduce) {
   .save-state::before, .params-save-bar .save-state { animation: none !important; }
 }
+
+/* ── Task templates ─────────────────────────────────────────────────────────
+   The `n` picker (a .palette), a template's number wherever it is listed, the
+   Templates card in Task defaults, and the template form's head. */
+.tpl-picker { width: min(440px, 92vw); }
+.tpl-picker #tpl-list { max-height: 50vh; overflow: auto; padding: 4px 0; }
+.tpl-picker .opt { padding: 8px 16px; }
+.tpl-num { flex: none; min-width: 20px; padding: 1px 5px; border: 1px solid var(--line); border-radius: 5px;
+  font-family: var(--font-mono); font-size: 11px; text-align: center; color: var(--ink-2); background: var(--surface-2); }
+.tpl-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tpl-manage { display: block; padding: 8px 16px; border-top: 1px solid var(--line); font-size: 12px; color: var(--ink-3); text-decoration: none; }
+.tpl-manage:hover { color: var(--ink); background: var(--surface-2); }
+.tpl-row .tpl-name { flex: 1; font-size: 13px; }
+.tpl-row .tpl-where { font-size: 12px; text-decoration: none; }
+.tpl-foot { justify-content: space-between; }
+.tpl-foot a { font-size: 12px; text-decoration: none; }
+.task-templates { margin-bottom: 12px; }
+.tf-head .tf-template-name { flex: 1; min-width: 0; max-width: 360px; padding: 6px 9px; border: 1px solid var(--line); border-radius: 7px;
+  background: var(--surface-2); color: var(--ink); font: inherit; font-weight: 550; }
+.tf-head .tf-template-name:focus { outline: none; border-color: var(--accent); }
+.tf-template-chip { flex: none; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.template-save .tpl-scope { display: flex; align-items: center; gap: 8px; margin: 2px 0 16px; }
+.template-save .tpl-scope-label { font-size: 13px; color: var(--ink-2); }

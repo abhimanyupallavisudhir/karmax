@@ -6010,7 +6010,7 @@ export class Store {
       if (!current) return undefined;
       const base = { id: current.id, organizationId: current.organizationId, projectId: current.projectId, name: patch.name ?? current.name,
         ...(current.createdBy ? { createdBy: current.createdBy } : {}), createdAt: current.createdAt, updatedAt: Date.now() };
-      const next: TaskTemplate = { ...base, ...(patch.content ?? taskTemplateContentOf(current)) };
+      const next: TaskTemplate = { ...base, ...(patch.content ?? { workflow: current.workflow, ...taskTemplateContentOf(current) }) };
       (await this.db.prepare('UPDATE task_templates SET name = ?, workflow = ?, content = ?, updatedAt = ? WHERE id = ?')
         .run(next.name, next.workflow, JSON.stringify(taskTemplateContentOf(next)), next.updatedAt, id));
       return next;
