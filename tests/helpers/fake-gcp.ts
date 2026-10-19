@@ -255,14 +255,15 @@ function diskView(disk: FakeDisk) {
   return { ...rest, sizeGb: String(disk.sizeGb), zone: `https://x/zones/${disk.zone}`, status: 'READY' };
 }
 
-/** Compute Engine's filter: `labels.a=b AND labels.c=d`, `labels.a:*`. */
+/** Compute Engine's filter, as karmax writes it: `(labels.a = "b") AND (labels.c:*)`. */
 function matches(labels: Labels, filter: string | null): boolean {
   if (!filter) return true;
   return filter.split(' AND ').every((term) => {
-    const exists = term.match(/^labels\.([\w-]+):\*$/);
+    const exists = term.match(/^\(labels\.([\w-]+):\*\)$/);
     if (exists) return exists[1]! in labels;
-    const equal = term.match(/^labels\.([\w-]+)=(.*)$/);
-    return equal ? labels[equal[1]!] === equal[2] : true;
+    const equal = term.match(/^\(labels\.([\w-]+) = "(.*)"\)$/);
+    if (!equal) throw new Error(`the fake does not understand the filter ${term}`);
+    return labels[equal[1]!] === equal[2];
   });
 }
 

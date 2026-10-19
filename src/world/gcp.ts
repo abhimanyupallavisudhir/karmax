@@ -83,6 +83,10 @@ export function gcpLabels(labels: Record<string, string>): Record<string, string
     [LABELS[key] ?? key.toLowerCase().replace(/[^a-z0-9_-]/g, '-').slice(0, 63), value.toLowerCase().replace(/[^a-z0-9_-]/g, '-').slice(0, 63)]));
 }
 function label(labels: Record<string, string> | undefined, key: keyof typeof LABELS): string | undefined { return labels?.[LABELS[key]!]; }
+/** A Compute Engine list filter on labels: every `key = value` (a value of `*`: the label exists). */
+export function labelFilter(terms: Partial<Record<keyof typeof LABELS, string>>): string {
+  return Object.entries(terms).map(([key, value]) => value === '*' ? `(labels.${LABELS[key]}:*)` : `(labels.${LABELS[key]} = "${value}")`).join(' AND ');
+}
 
 interface Instance { name: string; zone: string; status: string; machineType: string; labels?: Record<string, string>; labelFingerprint?: string;
   creationTimestamp: string; lastStartTimestamp?: string; lastStopTimestamp?: string;
@@ -221,7 +225,7 @@ export class GcpDriver implements VmDriver {
   }
 
   async list(connection: ResolvedWorldProviderConnection, home: string): Promise<VmListing[]> {
-    const disks = await this.aggregated<Disk>(connection, 'disks', `labels.${LABELS.karmaxHome}=${home} AND labels.${LABELS.karmaxRole}=home`);
+    const disks = await this.aggregated<Disk>(connection, 'disks', labelFilter({ karmaxHome: home, karmaxRole: 'home' }));
     return disks.map((disk) => {
       const zone = disk.zone.split('/').pop()!;
       const ref = { disk: disk.name, zone, project: this.project(connection), world: label(disk.labels, 'karmaxWorld') ?? disk.name };
@@ -243,7 +247,7 @@ export class GcpDriver implements VmDriver {
     const from = Math.max(since !== undefined ? since - 2 * 3_600_000 : 0, now - 7 * 86_400_000);
     const prices = await this.prices(connection);
     const events: ProviderUsageEvent[] = [];
-    for (const instance of await this.aggregated<Instance>(connection, 'instances', `labels.${LABELS.karmaxHome}=${home}`)) {
+    for (const instance of await this.aggregated<Instance>(connection, 'instances', labelFilter({ karmaxHome: home }))) {
       const taskId = label(instance.labels, 'karmaxTaskId');
       if (!taskId) continue;
       const machine = instance.machineType.match(/e2-custom-(\d+)-(\d+)$/);
@@ -260,7 +264,7 @@ export class GcpDriver implements VmDriver {
           ...organization(instance.labels), startedAt: slice.start, endedAt: slice.end, activeMs: slice.end - slice.start, cpu, memoryMb,
           costMicros: Math.round(hourly * (slice.end - slice.start) / 3_600_000 * 1e6) });
     }
-    for (const disk of await this.aggregated<Disk>(connection, 'disks', `labels.${LABELS.karmaxHome}=${home}`)) {
+    for (const disk of await this.aggregated<Disk>(connection, 'disks', labelFilter({ karmaxHome: home }))) {
       const taskId = label(disk.labels, 'karmaxTaskId');
       const created = Date.parse(disk.creationTimestamp);
       for (const hour of diskHours(created, now, from))
@@ -274,7 +278,7 @@ export class GcpDriver implements VmDriver {
   /** Builders that died mid-build, and images of provisioning versions no longer made. */
   async housekeep(connection: ResolvedWorldProviderConnection): Promise<void> {
     const now = Date.now();
-    for (const builder of await this.aggregated<Instance>(connection, 'instances', `labels.${LABELS.karmaxImageBuilder}:*`)) {
+    for (const builder of await this.aggregated<Instance>(connection, 'instances', labelFilter({ karmaxImageBuilder: '*' }))) {
       if (now - Date.parse(builder.creationTimestamp) < BUILDER_STALE_MS
         || this.building.has(`${this.key(connection)}:${label(builder.labels, 'karmaxImageBuilder')}`)) continue;
       await this.call(connection, 'DELETE', `/zones/${builder.zone.split('/').pop()}/instances/${builder.name}`).catch(() => undefined);
@@ -372,7 +376,7 @@ export class GcpDriver implements VmDriver {
   private async image(connection: ResolvedWorldProviderConnection): Promise<{ source: string; karmax: boolean }> {
     if (connection.config.image) return { source: connection.config.image, karmax: true };
     const ready = (await this.pages<{ name: string; status: string }>(connection,
-      `/global/images?filter=${encodeURIComponent(`labels.${LABELS.karmaxImage}=${vmProvisionVersion()}`)}`))
+      `/global/images?filter=${encodeURIComponent(labelFilter({ karmaxImage: vmProvisionVersion() }))}`))
       .find((image) => image.status === 'READY');
     return ready ? { source: `projects/${this.project(connection)}/global/images/${ready.name}`, karmax: true } : { source: DEBIAN_IMAGE, karmax: false };
   }
@@ -404,7 +408,7 @@ export class GcpDriver implements VmDriver {
       const image = await this.image(connection);
       if (image.karmax) return image.source;
       // Another process may be building it: wait for its image.
-      if ((await this.aggregated<Instance>(connection, 'instances', `labels.${LABELS.karmaxImageBuilder}=${vmProvisionVersion()}`)).length) await this.sleep(15);
+      if ((await this.aggregated<Instance>(connection, 'instances', labelFilter({ karmaxImageBuilder: vmProvisionVersion() }))).length) await this.sleep(15);
       else await this.build(connection);
       if (Date.now() > until) throw new Error('the karmax VM image was not ready within an hour');
     }
@@ -413,7 +417,7 @@ export class GcpDriver implements VmDriver {
   /** Delete karmax's images that `keep` does not keep. */
   async removeImages(connection: ResolvedWorldProviderConnection, keep: (image: { version: string; created: number }) => boolean): Promise<void> {
     const images = await this.pages<{ name: string; labels?: Record<string, string>; creationTimestamp: string }>(connection,
-      `/global/images?filter=${encodeURIComponent(`labels.${LABELS.karmaxImage}:*`)}`);
+      `/global/images?filter=${encodeURIComponent(labelFilter({ karmaxImage: '*' }))}`);
     for (const image of images) {
       if (keep({ version: label(image.labels, 'karmaxImage') ?? '', created: Date.parse(image.creationTimestamp) })) continue;
       await this.operation(connection, await this.call(connection, 'DELETE', `/global/images/${image.name}`)).catch(() => undefined);
@@ -421,7 +425,7 @@ export class GcpDriver implements VmDriver {
   }
 
   private async runBuild(connection: ResolvedWorldProviderConnection, version: string): Promise<void> {
-    const builders = await this.aggregated<Instance>(connection, 'instances', `labels.${LABELS.karmaxImageBuilder}=${version}`);
+    const builders = await this.aggregated<Instance>(connection, 'instances', labelFilter({ karmaxImageBuilder: version }));
     if (builders.length) return; // another process builds it
     await this.firewall(connection);
     const host = generateSshKeyPair('karmax-builder-host');
