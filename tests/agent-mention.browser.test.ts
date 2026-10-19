@@ -72,17 +72,20 @@ it('calls a new agent into a task from the follow-up box with @+', async () => {
   await box.fill('');
   await box.type('@');
   await menu.locator('.am-opt').filter({ hasText: 'People' }).dispatchEvent('mousedown');
+  // A view update can rebuild the box while the menu is open; the menu moves to
+  // the new box, so read its place once it has settled rather than mid-move.
+  const menuRect = () => menu.evaluate((el) => { const r = el.getBoundingClientRect(); return r.height ? { y: r.y, bottom: r.bottom } : null; }).catch(() => null);
   await step('People stays inside the window', async () => {
     await menu.getByText('@maintainers').waitFor();
-    const r = (await menu.boundingBox())!;
-    expect(r.y).toBeGreaterThanOrEqual(0);
-    expect(r.y + r.height).toBeLessThanOrEqual(420);
+    await expect.poll(async () => { const r = await menuRect(); return !!r && r.y >= 0 && r.bottom <= 420; }).toBe(true);
   });
   if (shots) await page.screenshot({ path: path.join(shots, 'mention-people.png') });
   await step('the last person is reachable by keyboard', async () => {
     for (let i = (await menu.locator('.am-opt').count()) - 1; i > 0; i--) await box.press('ArrowDown');
-    const active = (await menu.locator('.am-opt.active').boundingBox())!, r = (await menu.boundingBox())!;
-    expect(active.y + active.height).toBeLessThanOrEqual(r.y + r.height + 1);
+    await expect.poll(() => menu.evaluate((el) => {
+      const active = el.querySelector('.am-opt.active')?.getBoundingClientRect(), r = el.getBoundingClientRect();
+      return !!active && !!r.height && active.bottom <= r.bottom + 1;
+    }).catch(() => false)).toBe(true);
   });
   // The box is a transparent textarea over a painted copy of its text: a pick
   // must repaint that copy, or the picked name is invisible until the next key.
