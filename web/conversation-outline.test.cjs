@@ -20,7 +20,7 @@ function extractFn(name) {
 global.esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 global.S = { user: { id: 'me' }, meta: {}, conversationFolds: {} };
 global.siteName = () => 'tavya';
-for (const fn of ['messageOrigin', 'conversationOutline', 'foldDuration', 'foldPreview', 'conversationFoldHead', 'sharedConversation', 'participantLabelOf', 'messageSpeaker']) eval(extractFn(fn));
+for (const fn of ['messageOrigin', 'returnsWork', 'conversationOutline', 'foldDuration', 'foldPreview', 'conversationFoldHead', 'sharedConversation', 'participantLabelOf', 'messageSpeaker']) eval(extractFn(fn));
 
 let pass = 0;
 let fail = 0;
@@ -111,6 +111,33 @@ outline = conversationOutline([
   msg('merge-revise-2', 'user', 'Conflicts.'), act(2), msg('a3', 'agent', 'Which side of the conflict should win?'),
 ], { asking: true });
 ok(keys(outline) === 'm0 a1 [merge-revise-2 2] a3', `the open question stays in view: ${keys(outline)}`);
+
+// Task #704 (production, 2026-10-19): the agent's own work goes on through its
+// sub-task's news, a job waking it and a credential being granted; none of
+// that is the work coming back to it. Its report (a17) is what it said when it
+// stopped, not what it said before its sub-task first reported (a11).
+outline = conversationOutline([
+  msg('m0', 'user', 'Switch on managed compute'), act(1), msg('a2', 'agent', 'Paused until the release is live.'),
+  msg('u3', 'user', 'I added the Hetzner key.', { author: 'user:me' }), act(4),
+  msg('n05f0e0d0-1111-2222-3333-444455556666', 'user', '[tavya credential decision] approved'),
+  msg('a6', 'agent', 'Steps 1–4 are done; step 5 runs as a sub-task.'), act(7),
+  msg('st-8', 'user', 'Sub-task "probe" needs you.'), msg('a9', 'agent', 'The probe ran; cancelling it.'),
+  msg('st-10', 'user', 'Sub-task finished: cancelled.'), msg('a11', 'agent', 'Waiting for its server to be removed.'),
+  msg('wait-12', 'user', '(Resumed: your 40-minute pause is over.)'), act(13),
+  msg('a14', 'agent', 'Managed compute is now on in production.'),
+]);
+ok(keys(outline) === 'm0 1 a2 u3 [4 n05f0e0d0-1111-2222-3333-444455556666 a6 7 st-8 a9 st-10 a11 wait-12 13] a14',
+  `the report is what the agent said when its own work ended: ${keys(outline)}`);
+ok(outline[4].automatic === 0, 'news from its own sub-task and a job is its own work, not an automatic follow-up');
+ok(outline[5].reply === true, 'the report answers the person');
+
+// Decisions recorded before notices were signed (u…) are still tavya's.
+ok(messageOrigin({ id: 'uec4c6ea3-6fad-4e7b-929a-7472ca1dc4ad', role: 'user', text: '[tavya permission decision]\n\nApproved for this task' }) === 'platform',
+  'a legacy permission decision is tavya\'s');
+ok(messageOrigin({ id: 'u42ab6a9c-2049-4e6e-9d36-5cb287a56bb7', role: 'user', text: '[Acme credential decision]\n\nAccess approved' }) === 'platform',
+  'a legacy credential decision is tavya\'s, whatever the site is called');
+ok(messageOrigin({ id: 'u42ab6a9c-2049-4e6e-9d36-5cb287a56bb7', role: 'user', text: '[my note] please look' }) === 'person',
+  'a person may still start a message with brackets');
 
 // A system note records something that happened (who stopped an agent, a
 // reviewer's decision): already one quiet line, it is never folded away.
