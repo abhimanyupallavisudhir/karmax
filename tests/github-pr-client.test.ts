@@ -219,16 +219,19 @@ describe('GitHub PR client', () => {
     let reads = 0;
     const moving = github(on('PUT', '/repos/acme/app/pulls/3/update-branch', () => json(202, { message: 'Updating pull request branch.' })),
       on('GET', '/repos/acme/app/pulls/3', () => json(200, pr(3, { head: { ref: 'b', sha: ++reads < 3 ? 'old' : 'new' } }))));
+    // Bounded, not runAllTimersAsync: a timer that reschedules itself (another
+    // file's TriggerScheduler inbox sweep, firing into the faked setTimeout)
+    // would otherwise run forever. The polling under test lasts 20 × 250 ms.
     vi.useFakeTimers({ toFake: ['setTimeout'] });
     const updating = moving.api.updateBranch(SLUG, 3, 'old');
-    await vi.runAllTimersAsync();
+    await vi.advanceTimersByTimeAsync(6_000);
     expect(await updating).toEqual({ requested: true, headSha: 'new', message: 'Updating pull request branch.' });
     expect(moving.calls.at(0)).toMatchObject({ body: { expected_head_sha: 'old' } });
 
     const stuck = github(on('PUT', /update-branch/, () => json(202, {})),
       on('GET', '/repos/acme/app/pulls/3', () => json(200, pr(3, { head: { ref: 'b', sha: 'old' } }))));
     const waiting = stuck.api.updateBranch(SLUG, 3, 'old');
-    await vi.runAllTimersAsync();
+    await vi.advanceTimersByTimeAsync(6_000);
     expect(await waiting).toEqual({ requested: true, message: 'GitHub accepted the pull-request branch update' });
     expect(stuck.calls.filter((call) => call.method === 'GET')).toHaveLength(20);
 
