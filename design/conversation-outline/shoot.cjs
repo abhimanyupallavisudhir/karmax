@@ -16,7 +16,8 @@ const APP = process.env.APP || 'http://127.0.0.1:48950';
 const STATE = process.env.STATE || '/tmp/shots/state.json';
 const OUT = process.env.OUT || 'design/conversation-outline/after';
 const SEED = JSON.parse(fs.readFileSync(process.env.SEED || '/tmp/shots/seed.json', 'utf8'));
-const SOURCES = { ci: 'task_mvdbbw30733cf14c3b', conflicts: 'task_mvd1dtz20c826867de' };
+// #704: follow-ups after the report, the agent's own sub-task and pauses.
+const SOURCES = { ci: 'task_mvdbbw30733cf14c3b', conflicts: 'task_mvd1dtz20c826867de', followups: 'task_mvecea9z3ebf47582e' };
 
 const remote = async (p) => {
   const response = await fetch(`${process.env.KARMAX_GATEWAY_URL}${p}`, { headers: { authorization: `Bearer ${process.env.KARMAX_TOKEN}` } });
@@ -93,6 +94,16 @@ const remote = async (p) => {
 
   page = await open(desktop, 'ci', fixingCi);
   await shot(page, '5-agent-working');
+  await page.context().close();
+
+  // #704 as it is: the latest follow-up answered. Opening it shows that answer.
+  const asIs = (view, events) => ({ view: { ...view, participants: idle(view) }, events });
+  page = await open(desktop, 'followups', asIs);
+  await shot(page, '7-followup-answered');
+  // Earlier rounds: each question, the work folded, then its answer.
+  await page.locator('#ck-thread .msg.user', { hasText: 'No need to do daytona' }).evaluate((row) => row.scrollIntoView({ block: 'start' }));
+  await page.waitForTimeout(400);
+  await shot(page, '8-followup-rounds');
   await page.context().close();
 
   page = await open({ width: 390, height: 844 }, 'ci', atReview);

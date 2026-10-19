@@ -10240,14 +10240,33 @@ function captureConversationScroll(thread) {
   return { top: thread.scrollTop, atBottom: thread.scrollHeight - thread.scrollTop - thread.clientHeight <= 2,
     key: anchor?.dataset.conversationKey, offset: anchor ? anchor.getBoundingClientRect().top - top : 0 };
 }
-// A conversation opens at its end, but a long answer is read from its start:
-// when the latest thing said to people (data-land) begins above the view,
-// show its first line instead of its last.
-function landOnLatestAnswer(thread) {
+// Where the conversation shows, as a reader would want it: opening it, or a
+// new answer landing while they follow along (at the end, or still where the
+// page last put them), shows the latest answer from its first line, with the
+// question it answers above it when both fit; sending a message shows the end,
+// where the work it starts appears. A reader who scrolled elsewhere stays put.
+// `before`: where the reader was before this render (none on a fresh one).
+function settleConversation(thread, fresh, before) {
+  const key = `${thread.dataset.taskId}/${thread.dataset.role}`;
+  const landings = S.conversationLandings || (S.conversationLandings = {});
+  const last = landings[key];
+  if (S.conversationSent === key) {
+    delete S.conversationSent;
+    thread.scrollTop = thread.scrollHeight;
+    landings[key] = { key: last?.key, top: thread.scrollTop };
+    return;
+  }
   const answer = thread.querySelector('[data-land]');
   if (!answer) return;
-  const above = answer.getBoundingClientRect().top - thread.getBoundingClientRect().top;
-  if (above < 0) thread.scrollTop += above - 12;
+  const target = answer.dataset.conversationKey;
+  const untouched = !!last && !!before && Math.abs(before.top - last.top) < 2;
+  if (!fresh && (target === last?.key || !(before?.atBottom || untouched))) return;
+  const question = thread.querySelector('[data-land-question]');
+  const edge = thread.getBoundingClientRect().top + 12;
+  const both = question && answer.getBoundingClientRect().bottom - question.getBoundingClientRect().top <= thread.clientHeight - 24;
+  const start = (both ? question : answer).getBoundingClientRect().top - edge;
+  thread.scrollTop = Math.max(0, Math.min(thread.scrollHeight - thread.clientHeight, thread.scrollTop + start));
+  landings[key] = { key: target, top: thread.scrollTop };
 }
 // Which folds of a conversation a person opened or closed, for this session:
 // read from the page just before it is drawn again (a fold differing from how
@@ -10501,7 +10520,7 @@ function renderTaskPage() {
   if (newBody && prevScroll != null) newBody.scrollTop = prevScroll;
   const thread = document.getElementById('ck-thread');
   if (thread) restoreConversationScroll(thread, retainedThread ? threadScroll : null);
-  if (thread && !retainedThread) landOnLatestAnswer(thread);
+  if (thread) settleConversation(thread, !retainedThread, retainedThread ? threadScroll : null);
   if (thread) {
     restoreThreadSelection(thread, threadSel);
     wireMessageCopies(thread);
@@ -12036,10 +12055,13 @@ function conversationPane(v, t) {
   // Opening the task lands on the latest thing said to people (renderTaskPage).
   const last = outline.findLast((item) => !item.fold);
   const land = !working && last && (last.reply || last.entry.type === 'input-request') ? last : null;
+  // The question it answers: the person's message before it, past any work.
+  const before = land && outline.slice(0, outline.indexOf(land)).findLast((item) => !item.fold);
+  const question = before?.entry.type === 'message' && messageOrigin(before.entry.message) === 'person' ? before : null;
   const opened = S.conversationFolds?.[`${v.taskId}/${t.role}`] || {};
   const msgs = historyStatus + (outline.map((item) => item.fold
     ? `<details class="conv-fold${item.automatic ? ' automatic' : ''}" data-conversation-key="${esc(item.key)}" data-fold="${esc(item.key)}" data-drawn-open="${opened[item.key] ?? item.live ? '1' : '0'}"${opened[item.key] ?? item.live ? ' open' : ''}>${conversationFoldHead(item)}<div class="fold-body">${item.entries.map((entry) => row(entry)).join('')}</div></details>`
-    : row(item.entry, item === land ? ' data-land' : '')).join('')
+    : row(item.entry, item === land ? ' data-land' : item === question ? ' data-land-question' : '')).join('')
     || (historyStatus ? '' : '<div class="msg system">No messages yet</div>'));
   const draft = (S.followupDrafts || {})[`${v.taskId}/${t.role}`] || '';
   const fu = canFollowUp
@@ -12305,23 +12327,34 @@ function conversationEntries(t) {
 // agents, or tavya itself. tavya's prompts (a check failed, a conflict, a job
 // finished, sub-task news) are role 'user' because the model must read them,
 // but nobody typed them: the workflow numbers them `<kind>-<n>` and the
-// gateway's notices are `n<uuid>`. Anything else unsigned — the opening prompt,
-// an answer relayed from above, a follow-up from before 1.27 signed them — is
-// a person's: never mistake someone's words for tavya's and fold them away.
+// gateway's notices are `n<uuid>` (before 2026-10-19 they were `u<uuid>`, like
+// a follow-up, and only their "[… decision]" heading tells them apart).
+// Anything else unsigned — the opening prompt, an answer relayed from above, a
+// follow-up from before 1.27 signed them — is a person's: never mistake
+// someone's words for tavya's and fold them away.
 function messageOrigin(m) {
   if (m.role === 'agent') return 'agent';
   if (m.role === 'system') return 'platform';
   if (m.author) return 'person';
+  if (/^u[0-9a-f]{8}-/.test(m.id || '') && /^\[[^\]\n]+ (credential|permission) decision\]/.test(m.text || '')) return 'platform';
   return /^n[0-9a-f]{8}-|^(wait|jobs|sa|sh|kg|prn|repos|st|review-ci|cv|prd|pr|pru|mode|r-in|m-in|c-in|command-fix|integration|integration-wait|ir|restore-refused|pr-refused|pr-conflict|landing-retry|merge-revise|resource-merge|resource-integrate)-?\d+$/.test(m.id || '')
     ? 'platform' : 'person';
 }
 
+// tavya's prompts that hand finished work back to the agent: the proposal came
+// back from checks, a reviewer or landing. Every other prompt of tavya's (a job
+// or pause ending, its own sub-task's news, a grant it waited for, a nudge)
+// carries on the work it was doing.
+function returnsWork(m) {
+  return /^(review-ci|cv|pr-conflict|pr-refused|merge-revise|landing-retry|integration|integration-wait|ir|restore-refused|resource-merge|resource-integrate)-?\d+$/.test(m.id || '');
+}
+
 // The conversation as people read it: what they said and the agent's answers
-// to them (its last message before tavya first sends it back to work — a
-// failed check, a conflict, sub-task news — or the message they replied to,
-// or one addressed to a person) stay in view. Everything between — tool steps,
+// to them (its last message before the work came back to it — a failed check,
+// a conflict, a reviewer's revision — or the message they replied to, or one
+// addressed to a person) stay in view. Everything between — tool steps,
 // progress notes, tavya's prompts and the agent's replies to those — folds
-// into one line. Resuming after a pause is the same work, not a new prompt. `live`: the agent is working, so the latest work is not yet
+// into one line. `live`: the agent is working, so the latest work is not yet
 // answered and stays open; `asking`: the task waits on a person's answer to
 // its latest message.
 function conversationOutline(entries, options) {
@@ -12334,10 +12367,10 @@ function conversationOutline(entries, options) {
     const origin = messageOrigin(m);
     if (origin === 'person') return 'person';
     // A system note records what happened (who stopped an agent, a decision):
-    // one quiet line already, never folded. Waking after a pause, or a nudge
-    // to keep going, is the same work, not a new prompt.
+    // one quiet line already, never folded. Of tavya's prompts, only those that
+    // bring finished work back start a new round; the rest are the same work.
     if (m.role === 'system') return 'spine';
-    if (origin === 'platform') return /^(wait|jobs|sa|sh|kg)-/.test(m.id || '') ? 'work' : 'prompt';
+    if (origin === 'platform') return returnsWork(m) ? 'prompt' : 'work';
     return (m.to || []).some((selector) => !selector.startsWith('agent:')) ? 'spine' : 'said';
   });
   const spine = kinds.map((kind) => kind === 'person' || kind === 'spine');
@@ -12350,7 +12383,7 @@ function conversationOutline(entries, options) {
     let prompt = kinds[start] === 'person' ? start + 1 : start;
     while (prompt < end && kinds[prompt] !== 'prompt') prompt++;
     // The person's message is answered by the last thing the agent said before
-    // tavya first prompted it — unless it is still working on that answer.
+    // the work first came back to it — unless it is still working on that answer.
     if (!(live && prompt === end && end === entries.length)) reply.add(lastSaid(start, prompt));
     if (end < entries.length) keep(lastSaid(start, end)); // what they answered
   });
@@ -12364,7 +12397,10 @@ function conversationOutline(entries, options) {
     let end = i;
     while (end < entries.length && !spine[end]) end++;
     const run = entries.slice(i, end);
-    if (run.length === 1 && kinds[i] !== 'prompt') items.push({ entry: run[0] });
+    // One tool step stays a line of its own; a prompt of tavya's, long words
+    // meant for the agent, folds even alone.
+    const tavyas = run[0].type === 'message' && run[0].message?.role === 'user';
+    if (run.length === 1 && !tavyas) items.push({ entry: run[0] });
     else {
       const latest = run.findLast((entry, k) => kinds[i + k] === 'said');
       items.push({ fold: true, entries: run, key: `fold:${run[0].sourceKey || run[0].activityRef || i}`,
@@ -12398,12 +12434,19 @@ function conversationFoldHead(fold) {
   const span = real.length > 1 ? foldDuration(real[0], real.at(-1)) : '';
   const steps = fold.entries.length;
   const latest = fold.latest?.message?.text ?? fold.latest?.activity?.title;
+  // Only tavya's notes (a grant, a pause ending): say what the first one is.
+  const notes = fold.entries.every((entry) => entry.type === 'message' && entry.message?.role === 'user');
+  const note = notes && foldPreview(fold.entries[0].message.text).replace(/^\[(.+)\]$/, '$1')
+    .replace(new RegExp(`^${siteName().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+`, 'i'), '').replace(/^\((.+)\)$/, '$1');
+  if (note && !fold.automatic) {
+    return `<summary class="fold-head" title="${esc(`${siteName()}’s note to the agent`)}"><span class="fold-icon" aria-hidden="true">·</span><span class="fold-preview">${esc(note.charAt(0).toUpperCase() + note.slice(1))}</span>${steps > 1 ? `<span class="fold-count">${steps} notes</span>` : ''}</summary>`;
+  }
   const label = fold.automatic
     ? `${fold.automatic} automatic follow-up${fold.automatic === 1 ? '' : 's'}`
     : fold.live ? 'Working' : span ? `Worked ${span}` : 'Work';
   const tip = fold.automatic
-    ? `${siteName()} sent the agent these on its own — checks, conflicts, sub-task news — and the agent handled them`
-    : 'What the agent did on the way: commands, edits and progress notes';
+    ? `${siteName()} sent the agent these on its own — checks, conflicts, a reviewer's changes — and the agent handled them`
+    : 'What the agent did on the way: commands, edits, progress notes';
   return `<summary class="fold-head" title="${esc(tip)}"><span class="fold-icon" aria-hidden="true">${fold.automatic ? '↻' : '⋯'}</span><span class="fold-label">${esc(label)}</span>${fold.automatic && latest ? `<span class="fold-preview">${esc(foldPreview(latest))}</span>` : '<span class="fold-gap"></span>'}<span class="fold-count">${steps} step${steps === 1 ? '' : 's'}${fold.automatic && span ? ` · ${esc(span)}` : ''}</span></summary>`;
 }
 
@@ -14826,6 +14869,7 @@ function wireFollowups(v) {
         if (active?.closest?.('.followup-box')?.dataset.role === role) active.blur();
         toast(shared && to && (to.length > 1 || to[0] !== 'agent:do')
           ? `Sent to ${to.map((selector) => recipientLabel(selector, v)).join(', ')}` : 'Follow-up sent');
+        S.conversationSent = `${v.taskId}/${role}`;
         renderTaskPage();
         setTimeout(refreshTask, 250);
         setTimeout(refreshTasks, 400);
