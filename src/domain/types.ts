@@ -1455,7 +1455,8 @@ export interface Message {
    * Agent messages carry the participant key (`do`, `responder`, `confirm`,
    * `agent-3`; absent ⇒ `do`). Human messages carry the sender's principal
    * (`user:<id>`, `avatar:<id>`, `task:<parentId>`; absent ⇒ the task's
-   * creator or the platform). Each agent receives the others' messages as input
+   * creator — the opening prompt `m0`, or an unsigned pre-1.27 follow-up `u…` —
+   * or the platform: its prompts and `n…` notices). Each agent receives the others' messages as input
    * labelled with their speaker (`participants.ts`), never as templates.
    */
   author?: string;

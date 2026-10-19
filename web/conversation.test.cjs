@@ -26,6 +26,7 @@ global.mathjaxEnabled = () => mathPreference;
 global.renderMessageBody = (t) => global.esc(t);
 global.messageCopyButton = () => '';
 global.hostLocal = () => true;
+global.siteName = () => 'tavya';
 global.ICON = { more: '<svg></svg>', form: '<svg data-icon="file"></svg>' };
 global.taskRecord = () => ({ projectId: 'project-1' });
 global.projectById = () => ({ id: 'project-1', organizationId: 'org-1' });
@@ -57,7 +58,7 @@ global.S = {
 };
 
 global.DEFAULT_EXPLANATION_SETTINGS = { model: 'google/gemini-3.6-flash' };
-for (const fn of ['safeHref', 'attachmentUrl', 'formatAttachmentBytes', 'renderMessageFiles', 'conversationTextKey', 'conversationEntries', 'conversationTime', 'conversationTimeHtml', 'worldFileTarget', 'fileTargetQuery', 'worldFileHref', 'worldWikiHref', 'worldFileAnchor', 'wikiRoute', 'decodeMarkdownAttribute', 'renderConversationText', 'annotateWorldFileLinks', 'renderAgentMessageBody', 'renderWaitDetail', 'explanationModelLabel', 'explanationsEnabled', 'texToggleHtml', 'explainMessageAffordance', 'sharedConversation', 'participantLabelOf', 'messageSpeaker', 'recipientLabel', 'recipientsHtml', 'renderConversationEntry']) eval(extractFn(fn));
+for (const fn of ['safeHref', 'attachmentUrl', 'formatAttachmentBytes', 'renderMessageFiles', 'conversationTextKey', 'conversationEntries', 'conversationTime', 'conversationTimeHtml', 'worldFileTarget', 'fileTargetQuery', 'worldFileHref', 'worldWikiHref', 'worldFileAnchor', 'wikiRoute', 'decodeMarkdownAttribute', 'renderConversationText', 'annotateWorldFileLinks', 'renderAgentMessageBody', 'renderWaitDetail', 'explanationModelLabel', 'explanationsEnabled', 'texToggleHtml', 'explainMessageAffordance', 'sharedConversation', 'participantLabelOf', 'messageOrigin', 'messageSpeaker', 'recipientLabel', 'recipientsHtml', 'renderConversationEntry']) eval(extractFn(fn));
 
 let pass = 0;
 let fail = 0;
@@ -243,6 +244,7 @@ eval(extractFn('conversationWaitNotice'));
 eval(extractFn('contentKey'));
 eval(extractFn('conversationFullscreenButton'));
 eval(extractFn('conversationPane'));
+for (const fn of ['humanWaitDetail', 'conversationOutline', 'foldDuration', 'foldPreview', 'conversationFoldHead']) eval(extractFn(fn));
 eval(extractFn('liveOutputFor'));
 eval(extractFn('forkBranchDefaults'));
 eval(extractFn('taskRecord'));

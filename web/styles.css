@@ -1248,6 +1248,25 @@ a.git-repo-name:hover { color:var(--accent); }
 .activity-detail { margin-top: 3px; }
 .activity-detail summary { width: max-content; color: var(--ink-3); cursor: pointer; font-size: 11px; }
 .activity-detail pre { max-height: 260px; overflow: auto; margin: 5px 0 0; padding: 8px 10px; border-radius: var(--r-sm); border: 1px solid var(--line); background: var(--surface-2); color: var(--ink-2); white-space: pre-wrap; word-break: break-word; font: 11px/1.45 var(--font-mono); }
+/* The conversation's outline: the work between what people said and the
+   agent's answers to them folds into one line (web/app.js conversationOutline). */
+.conv-fold { align-self: stretch; margin: -3px 0; }
+.fold-head { display: flex; align-items: center; gap: 8px; width: min(92%, 760px); padding: 5px 10px; border-radius: 8px; color: var(--ink-3); font-size: 12px; cursor: pointer; list-style: none; user-select: none; }
+.fold-head::-webkit-details-marker { display: none; }
+.fold-head::after { content: "›"; flex: none; font-size: 14px; line-height: 1; transition: transform .15s; }
+.conv-fold[open] > .fold-head::after { transform: rotate(90deg); }
+.fold-head:hover { background: var(--surface-2); color: var(--ink-2); }
+.fold-head:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.fold-icon { width: 20px; flex: none; text-align: center; font: 12px/1 var(--font-mono); }
+.conv-fold.automatic .fold-icon { color: var(--working); }
+.fold-label { flex: none; font-weight: 600; color: var(--ink-2); white-space: nowrap; }
+.fold-preview { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fold-gap { flex: 1; }
+.fold-count { flex: none; font: 10.5px/1.2 var(--font-mono); white-space: nowrap; opacity: .85; }
+.fold-body { display: flex; flex-direction: column; gap: 10px; margin: 6px 0 4px 19px; padding-left: 12px; border-left: 2px solid var(--line); }
+/* tavya's own prompts to the agent: part of the record, not someone speaking. */
+.msg.user.platform { align-self: flex-start; background: transparent; color: var(--ink-2); border: 1px dashed var(--line); border-bottom-left-radius: 3px; border-bottom-right-radius: 10px; font-size: 12.5px; }
+.msg.user.platform .role { color: var(--ink-3); }
 .conversation-presence { display: inline-flex; align-items: center; gap: 6px; padding: 2px 7px; border-radius: 999px; color: var(--ink-2); background: var(--surface-2); font-size: 11px; }
 .presence-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ink-3); }
 .conversation-presence.working .presence-dot { background: var(--accent); animation: pulse 1.4s ease-in-out infinite; }
