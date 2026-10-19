@@ -587,7 +587,7 @@ export class GcpDriver implements VmDriver {
       if (retried && !last) { await this.sleep(Math.min(30, 2 ** attempt + Math.random())); continue; }
       if (QUOTA.has(reason ?? '')) throw quotaFull(message);
       if (retried) throw new GcpOutage(message);
-      if (reason === 'accessNotConfigured' || /has not been used in project|is disabled/i.test(failure?.message ?? ''))
+      if (new URL(url).host === 'compute.googleapis.com' && (reason === 'accessNotConfigured' || /has not been used in project|is disabled/i.test(failure?.message ?? '')))
         throw new GcpError(`${message}. Enable the Compute Engine API for project ${this.project(connection)} (APIs & Services → Library).`, response.status, reason);
       throw new GcpError(message, response.status, reason);
     }

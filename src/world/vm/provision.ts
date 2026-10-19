@@ -55,10 +55,10 @@ mkdir -p ${VM_HOME}
 if [ -s "$K/volume-device" ]; then
   device=$(cat "$K/volume-device")
   for i in $(seq 1 360); do [ -e "$device" ] && break; sleep 0.5; done
-  [ -e "$device" ] || { echo "karmax: the world's volume $device never appeared" >&2; exit 1; }
+  [ -e "$device" ] || { echo "the world's volume $device never appeared" >&2; exit 1; }
   blkid -p "$device" > /dev/null 2>&1; [ $? = 2 ] && mkfs.ext4 -q -m 0 "$device"
   grep -q " ${VM_HOME} " /etc/fstab || printf '%s ${VM_HOME} ext4 discard,nofail,defaults 0 2\\n' "$device" >> /etc/fstab
-  mountpoint -q ${VM_HOME} || mount ${VM_HOME} || { echo "karmax: could not mount the world's volume $device" >&2; exit 1; }
+  mountpoint -q ${VM_HOME} || mount ${VM_HOME} || { echo "could not mount the world's volume $device" >&2; exit 1; }
 fi
 # A volume grown while the machine was off grows its filesystem now.
 source=$(findmnt -no SOURCE ${VM_HOME} 2> /dev/null) && [ -n "$source" ] && resize2fs "$source" > /dev/null 2>&1
