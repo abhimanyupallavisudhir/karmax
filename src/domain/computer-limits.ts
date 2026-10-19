@@ -78,6 +78,13 @@ const PROVIDERS: Record<string, ProviderFacts> = {
   // the location offers (the connection test asks), else the shared CPX51.
   // A default computer gets the cheapest type covering it (CPX11, 2 CPU / 2 GB, 2026-10-10).
   hetzner: { label: 'Hetzner', defaults: { cpu: 2, memoryMb: 2048, diskGb: 20 }, limits: { cpu: 16, memoryMb: 32_768, diskGb: 10_240 }, features: VM_FEATURES },
+  // AWS: an EBS gp3 volume holds 16 TiB; the largest machine is the largest
+  // instance of karmax's families in the region (the connection test asks).
+  // A default computer is the cheapest covering it (c7i-flex.large, 2 CPU / 4 GB).
+  aws: { label: 'AWS', defaults: { cpu: 2, memoryMb: 2048, diskGb: 20 }, limits: { cpu: 64, memoryMb: 262_144, diskGb: 16_384 }, features: VM_FEATURES },
+  // Google Cloud: E2 custom machines of exactly the size asked (2–32 CPUs, up
+  // to 128 GB), within the region's CPU quota; a pd-balanced disk holds 64 TB.
+  gcp: { label: 'Google Cloud', defaults: { cpu: 2, memoryMb: 2048, diskGb: 20 }, limits: { cpu: 32, memoryMb: 131_072, diskGb: 65_536 }, features: VM_FEATURES },
 };
 
 export function providerLabel(provider: string): string {

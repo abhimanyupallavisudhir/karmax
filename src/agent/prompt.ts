@@ -1,4 +1,4 @@
-import { describeMachine, sameMachine, type MachineShape } from '../domain/computer.js';
+import { describeMachine, isVmWorldProvider, sameMachine, type MachineShape } from '../domain/computer.js';
 import { computerLimits, providerFeatures as computerFeatures, providerLabel, type ComputerLimits, type EffectiveComputerLimits } from '../domain/computer-limits.js';
 import type { DiskSpace } from '../world/disk.js';
 import { AgentProfile, AgentRole, TaskInput } from '../domain/types.js';
@@ -239,7 +239,7 @@ function describeMachineAndRoom(world: WorldHandle, taskId: string, requested?: 
     return `Computer: ${current}.${allows} This task is moving to ${providerLabel(moveTo)}: you move when the task parks, so end your turn `
       + 'with pause(3) without jobs. A pause that waits on jobs keeps this machine, so first let them finish or stop them (stop_job). '
       + moveFacts(world, moveTo);
-  if (world.kind === 'fly' || world.kind === 'hetzner') return describeVmComputer(world, taskId, shape, requested, { current, allows, totalGb, limits });
+  if (isVmWorldProvider(world.kind)) return describeVmComputer(world, taskId, shape, requested, { current, allows, totalGb, limits });
   // A world moves to a new size only once it parks; a pause on jobs keeps it awake.
   const move = 'end your turn with pause(3) without jobs. A pause that waits on jobs keeps this machine, so first let them finish or stop them (stop_job). '
     + 'You resume on the new machine with every tracked file and uncommitted change, but Git-ignored files (dependencies, build output) '
@@ -260,7 +260,7 @@ function describeMachineAndRoom(world: WorldHandle, taskId: string, requested?: 
     + `(build outputs, caches, old copies) or move large data out of the world.${moreMemory}`;
 }
 
-/** A VM world (Fly.io, Hetzner): its disk is a volume that keeps everything and grows in place. */
+/** A VM world (Fly.io, Hetzner, AWS, Google Cloud): its disk is a volume that keeps everything and grows in place. */
 function describeVmComputer(world: WorldHandle, taskId: string, shape: MachineShape, requested: MachineShape | undefined,
   known: { current: string; allows: string; totalGb?: number; limits: ComputerLimits }): string {
   const machine = (world.meta?.machine as MachineShape | undefined) ?? shape;

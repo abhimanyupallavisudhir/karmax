@@ -43,7 +43,7 @@ const { fakeConsole, launch } = require('../tests/helpers/fake-console.cjs');
     assert.equal(await page.locator('.docs-page h1').textContent(), 'Getting started');
     assert.ok(!requests.includes('GET /api/session'), 'a public page does not read (and so provision) a session');
     assert.deepEqual(await nav(), [
-      ['Getting started', '/docs'], ['How it works', '/docs/how-it-works'], ['tavya CLI', '/docs/cli'],
+      ['Getting started', '/docs'], ['How it works', '/docs/how-it-works'], ['Cloud computers', '/docs/computers'], ['tavya CLI', '/docs/cli'],
       ['Pricing', '/pricing'],
       ['Policies', '/legal'], ['Terms of Service', '/legal/terms'], ['Privacy Policy', '/legal/privacy'],
     ], 'one sidebar: the docs, then pricing, then every policy');
@@ -94,13 +94,21 @@ const { fakeConsole, launch } = require('../tests/helpers/fake-console.cjs');
     if (shots) await page.screenshot({ path: path.join(shots, 'docs-how-it-works.png'), fullPage: true });
 
     // Every in-docs link goes somewhere real.
-    for (const slug of ['', 'how-it-works', 'cli']) {
+    // The console's "Get a key" links land on each provider's section.
+    await page.goto('http://console.test/docs/computers#aws');
+    await page.locator('.docs-page h1', { hasText: 'Cloud computers' }).waitFor();
+    const computers = await page.locator('.docs-page h2').evaluateAll((hs) => hs.map((h) => h.id));
+    for (const id of ['aws', 'google-cloud']) assert.ok(computers.includes(id), `Cloud computers has #${id}`);
+    assert.match(await page.locator('.docs-page').innerText(), /aws:RequestTag\/karmaxHome/, 'the AWS policy is on the page');
+    if (shots) await page.screenshot({ path: path.join(shots, 'docs-computers.png'), fullPage: true });
+
+    for (const slug of ['', 'how-it-works', 'computers', 'cli']) {
       await page.goto(`http://console.test/docs${slug ? `/${slug}` : ''}`);
       await page.locator('.docs-page h1').waitFor();
       const links = await page.locator('.docs-page a[href^="/"]').evaluateAll((as) => as.map((a) => a.getAttribute('href')));
       for (const href of links) {
         const [route, hash] = href.split('#');
-        const known = ['/docs', '/docs/how-it-works', '/docs/cli', '/pricing', '/legal', '/signup', '/login'].includes(route) || /^\/legal\/[a-z-]+$/.test(route);
+        const known = ['/docs', '/docs/how-it-works', '/docs/computers', '/docs/cli', '/pricing', '/legal', '/signup', '/login'].includes(route) || /^\/legal\/[a-z-]+$/.test(route);
         assert.ok(known, `docs link ${href} goes to a page`);
         if (hash && route.startsWith('/docs')) {
           const md = fs.readFileSync(path.join(__dirname, 'docs', `${route.replace(/^\/docs\/?/, '') || 'getting-started'}.md`), 'utf8');
