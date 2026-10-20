@@ -2105,7 +2105,7 @@ function agentBlockHtml(prefix, spec, opts) {
     <div class="af-resume-panel" ${resumeEnabled ? '' : 'hidden'}>
       <button type="button" class="btn sm af-resume-pick">⌕ Search tasks to fork from…</button>
       <div class="af-resume-chosen" data-resume="${esc(JSON.stringify(spec?.resumeFrom?.taskId ? { taskId: spec.resumeFrom.taskId, role: spec.resumeFrom.role } : null))}">${spec?.resumeFrom?.taskId ? resumeChosenInner(spec.resumeFrom) : ''}</div>
-      <input class="af-resume-session" placeholder="${hostLocal() ? '...or paste a share link or provider conversation ID' : '...or paste a share link'}" title="ChatGPT, Claude, Gemini or ${siteNameMarkup()}" value="${esc(spec?.resumeFrom?.sessionId || spec?.resumeFrom?.upload?.share || '')}" />
+      <input class="af-resume-session" placeholder="${hostLocal() ? '...or paste a share link or provider conversation ID' : '...or paste a share link'}" title="ChatGPT, Claude, Gemini, Grok, Perplexity, DeepSeek, Le Chat, Poe, Kimi, Qwen or ${siteNameMarkup()}" value="${esc(spec?.resumeFrom?.sessionId || spec?.resumeFrom?.upload?.share || '')}" />
       ${resumeCheckHtml(spec?.resumeFrom?.upload?.share ? { ok: spec.resumeFrom.upload } : undefined)}
       <div class="af-resume-import-row">
         <label class="btn sm af-resume-upload">Upload conversation<input type="file" accept=".json,.jsonl,application/json,application/x-ndjson" hidden></label>
@@ -2468,7 +2468,7 @@ function wireResumeReauthorization(root, host) {
 // An uploaded file, named by what was read in it (its file name in the tooltip).
 function resumeUploadInner(upload) {
   const name = upload.name || 'Conversation';
-  const count = upload.messages ? `${upload.messages} message${upload.messages === 1 ? '' : 's'}` : '';
+  const count = upload.messages ? resumeMessageCount(upload) : '';
   const label = [upload.title || name, count].filter(Boolean).join(' · ');
   return `<span class="af-resume-upload-name" title="${esc(name)}">${esc(label)}</span><button type="button" class="af-resume-upload-clear" title="Clear">✕</button>`;
 }
@@ -2482,10 +2482,16 @@ function resumeCheckHtml(state) {
     const reason = String(state.error).replace(/^./, (first) => first.toUpperCase());
     return `<div class="af-resume-check err" title="${esc(reason)}">${esc(reason)}</div>`;
   }
-  const { title, messages, share } = state.ok;
+  const { title, messages, share, partial } = state.ok;
   if (!messages) return '<div class="af-resume-check" hidden></div>';
-  const count = `${messages} message${messages === 1 ? '' : 's'}`;
-  return `<div class="af-resume-check ok" title="${share ? 'Read now: the agent starts from this copy' : 'Checked: the agent starts from this file'}">${esc(title ? `${title} · ${count}` : count)}</div>`;
+  const count = resumeMessageCount(state.ok);
+  const tip = partial ? 'The site shows only these first messages to anyone with the link'
+    : share ? 'Read now: the agent starts from this copy' : 'Checked: the agent starts from this file';
+  return `<div class="af-resume-check ok" title="${tip}">${esc(title ? `${title} · ${count}` : count)}</div>`;
+}
+
+function resumeMessageCount(read) {
+  return `${read.messages}${read.partial ? '+' : ''} message${read.messages === 1 && !read.partial ? '' : 's'}`;
 }
 
 async function checkConversationShare(url) {

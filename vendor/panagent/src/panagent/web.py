@@ -12,6 +12,7 @@ from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_ope
 from . import __version__
 from .detect import url_format
 from .errors import AcquisitionError, BrowserRequired, FormatError
+from .shares import SITE_READERS, share_site
 from .model import message, new_conversation, normalize_timestamp, text_block, validate_conversation, warning
 
 USER_AGENT = f"panagent/{__version__} (+https://github.com/abhimanyupallavisudhir/panagent)"
@@ -123,8 +124,11 @@ def _clean_dom_text(text: str) -> str:
 
 
 def fetch_share(url: str, *, timeout: float = 30.0) -> str:
-    if _require_share_url(url) == "gemini-share":
+    found = _require_share_url(url)
+    if found == "gemini-share":
         return fetch_gemini_share(url, timeout=timeout)
+    if found in SITE_READERS:
+        return fetch_site_share(url, timeout=timeout)
     request = Request(
         url,
         headers={
@@ -921,5 +925,31 @@ def fetch_gemini_share(url: str, *, timeout: float = 30.0) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+def fetch_site_share(url: str, *, timeout: float = 30.0) -> str:
+    """A share of one of panagent.shares' sites: the request its page makes."""
+    found = share_site(urlparse(url))
+    if found is None:
+        raise AcquisitionError("only HTTPS public share URLs are supported")
+    site, share_id = found
+    target, body, headers = site.request(share_id)
+    opener = build_opener(HTTPSHandler(context=ssl.create_default_context()))
+    try:
+        with opener.open(Request(target, data=body, headers={"User-Agent": USER_AGENT, **headers}), timeout=timeout) as response:
+            data = response.read(MAX_DOWNLOAD_BYTES + 1)
+            charset = response.headers.get_content_charset() or "utf-8"
+    except HTTPError as exc:
+        if exc.code in {404, 410}:
+            raise AcquisitionError(f"share not found; it may have been deleted or unshared: {url}", status=exc.code) from exc
+        if exc.headers.get("cf-mitigated") == "challenge":
+            raise BrowserRequired(f"{site.name} asked for a browser check; try again, or save {target} from your browser "
+                                  "and convert that file") from exc
+        raise AcquisitionError(f"{site.name} returned HTTP {exc.code} for {url}", status=exc.code) from exc
+    except URLError as exc:
+        raise AcquisitionError(f"could not reach {site.name}: {exc.reason}") from exc
+    if len(data) > MAX_DOWNLOAD_BYTES:
+        raise AcquisitionError("share response exceeded the 20 MiB safety limit")
+    return data.decode(charset, errors="replace")
+
+
 WEB_READERS = {"chatgpt-share": read_chatgpt_share, "claude-share": read_claude_share, "tavya-share": read_tavya_share,
-               "gemini-share": read_gemini_share}
+               "gemini-share": read_gemini_share, **SITE_READERS}

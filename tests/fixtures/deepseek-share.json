@@ -1,0 +1,48 @@
+{
+ "code": 0,
+ "msg": "",
+ "data": {
+  "biz_code": 0,
+  "biz_msg": "",
+  "biz_data": {
+   "title": "Shared Conversation",
+   "model_type": "default",
+   "messages": [
+    {
+     "message_id": 1,
+     "parent_id": null,
+     "model": "",
+     "role": "USER",
+     "inserted_at": 1792400000.5,
+     "fragments": [
+      {
+       "id": 1,
+       "type": "REQUEST",
+       "content": "What is the capital of France?"
+      }
+     ]
+    },
+    {
+     "message_id": 2,
+     "parent_id": 1,
+     "model": "",
+     "role": "ASSISTANT",
+     "inserted_at": 1792400004.0,
+     "fragments": [
+      {
+       "id": 1,
+       "type": "THINK",
+       "content": "France's capital is well known.",
+       "elapsed_secs": 1.2
+      },
+      {
+       "id": 2,
+       "type": "RESPONSE",
+       "content": "The capital of France is **Paris**."
+      }
+     ]
+    }
+   ]
+  }
+ }
+}

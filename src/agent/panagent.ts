@@ -9,7 +9,7 @@ import type { Message, Provider } from '../domain/types.js';
 import { claudeCwdSlug, findProviderSession } from './fork.js';
 import { codexHistoryMetadata, codexRolloutFilename, prepareCodexHistory, CodexHistoryError } from './codex-history.js';
 import { installLocalCodexSnapshot, localCodexCopies, readLocalCodexHistory } from './codex-history-files.js';
-import { ShareLinkError, fetchShare, publicConversationShare, type ShareFormat } from './conversation-shares.js';
+import { SHARE_APPS, ShareLinkError, fetchShare, publicConversationShare, type ShareFormat } from './conversation-shares.js';
 import { BRAND } from '../domain/brand.js';
 
 const pexec = promisify(execFile);
@@ -145,7 +145,7 @@ export async function importWithPanagent(opts: PanagentImportOptions): Promise<P
     const format: string[] = [];
     if ('url' in opts.source) {
       const share = publicConversationShare(opts.source.url);
-      if (!share) throw new PanagentError(`Use a public HTTPS ChatGPT, Claude, Gemini or ${BRAND} share URL`);
+      if (!share) throw new PanagentError(`Use a public HTTPS share link of ${SHARE_APPS}`);
       const fetched = await fetchShare(share).catch((error) => {
         throw error instanceof ShareLinkError ? new PanagentError(error.message) : error;
       });
@@ -230,7 +230,7 @@ export async function importWithPanagent(opts: PanagentImportOptions): Promise<P
  * converts exactly as an agent's first turn will, so a source that passes here
  * imports there. */
 export async function summarizeConversation(data: Buffer, name: string, format?: ShareFormat):
-  Promise<{ title?: string; messages: number }> {
+  Promise<{ title?: string; messages: number; format: string; partial?: true }> {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-panagent-check-'));
   try {
     const source = path.join(temporary, safeSourceName(name));
@@ -241,7 +241,10 @@ export async function summarizeConversation(data: Buffer, name: string, format?:
     const ir = JSON.parse(fs.readFileSync(output, 'utf8'));
     const messages = Array.isArray(ir.messages) ? ir.messages.length : 0;
     if (!messages) throw new PanagentError('This conversation has no messages');
-    return { ...(typeof ir.title === 'string' && ir.title.trim() ? { title: ir.title.trim().slice(0, 200) } : {}), messages };
+    // A share the site shows only in part (Poe's later pages, a long Perplexity thread).
+    const partial = Array.isArray(ir.warnings) && ir.warnings.some((warning: { code?: string }) => warning?.code === 'share_partial');
+    return { ...(typeof ir.title === 'string' && ir.title.trim() ? { title: ir.title.trim().slice(0, 200) } : {}), messages,
+      format: String(ir.source?.format ?? ''), ...(partial ? { partial: true as const } : {}) };
   } finally {
     fs.rmSync(temporary, { recursive: true, force: true });
   }

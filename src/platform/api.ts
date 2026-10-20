@@ -64,6 +64,7 @@ import { commitProjectWiki, ensureProjectWikiRepository, mutateAndPublishProject
 import { applyAgentSpec, defaultModel, defaultEffort, ProfileResolver, profileVisibleTo, roleDefaultProfile } from '../agent/profiles.js';
 import { looksLikeConversationUrl, PanagentError, publicConversationShare } from '../agent/panagent.js';
 import { importConversationShare } from '../agent/conversation-sources.js';
+import { SHARE_APPS } from '../agent/conversation-shares.js';
 import { hostLocal as deploymentHostLocal } from '../config/deployment.js';
 import { AuthorizationGrantError, LEVEL_AUDIENCES, type AuthorizationGap, type AuthorizationService } from './authorization.js';
 import { PermissionRequests, exactCapability, type PermissionRequest } from './permission-requests.js';
@@ -1041,10 +1042,10 @@ export class KarmaxApi {
       const sessionId = (resumeFrom as Record<string, unknown>).sessionId;
       if (sessionId !== undefined && (typeof sessionId !== 'string' || !sessionId.trim()
         || (looksLikeConversationUrl(sessionId) && !publicConversationShare(sessionId))))
-        throw new ValidationError(`use a public HTTPS ChatGPT, Claude, Gemini or ${BRAND} share link or upload a conversation file`);
+        throw new ValidationError(`use a public HTTPS share link of ${SHARE_APPS} or upload a conversation file`);
       if (typeof sessionId === 'string' && !publicConversationShare(sessionId)
         && !(this.deps.hostLocal ?? deploymentHostLocal()))
-        throw new ValidationError(`provider conversation IDs are available only on a host-local ${BRAND}; upload the Codex/Claude conversation file or use a public HTTPS ChatGPT, Claude, Gemini or ${BRAND} share link`);
+        throw new ValidationError(`provider conversation IDs are available only on a host-local ${BRAND}; upload the Codex/Claude conversation file or use a public HTTPS share link of ${SHARE_APPS}`);
       // A share link is read now, as the task form reads one, and replaced by
       // what was read: an unreadable link never reaches a turn (lvpm#4), and the
       // turn starts from this copy instead of fetching it again.

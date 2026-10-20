@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 from .errors import FormatError
 from .model import SCHEMA
 from .readers import jsonl_records
+from .shares import SITES, share_site
 
 FORMAT_ALIASES = {
     "ir": "ir",
@@ -27,6 +28,8 @@ FORMAT_ALIASES = {
     "tavya-share": "tavya-share",
     "karmax": "tavya-share",
     "karmax-share": "tavya-share",
+    **{site.format: site.format for site in SITES},
+    **{site.format.removesuffix("-share"): site.format for site in SITES},
     "markdown": "markdown",
     "md": "markdown",
 }
@@ -80,7 +83,11 @@ def url_format(value: str) -> str | None:
         return "gemini-share"
     if TAVYA_SHARE_PATH.fullmatch(parsed.path):
         return "tavya-share"
-    raise FormatError("only public ChatGPT, Claude, Gemini and tavya share URLs are supported")
+    found = share_site(parsed)
+    if found:
+        return found[0].format
+    names = ", ".join(["ChatGPT", "Claude", "Gemini", *(site.name for site in SITES)])
+    raise FormatError(f"only public share URLs of {names} and tavya are supported")
 
 
 def detect_text(text: str, path: Path | None = None) -> str:
@@ -143,6 +150,9 @@ def _json_format(value: Any) -> str | None:
             return "ir"
         if isinstance(item.get("mapping"), dict):
             return "chatgpt-share"
+        for site in SITES:
+            if site.detect(item):
+                return site.format
         if isinstance(item.get("chat_messages"), list) or isinstance(item.get("conversation"), dict):
             return "claude-share"
     return None
@@ -153,6 +163,9 @@ def _html_format(html: str) -> str:
     lowered = html.lower()
     if "data-share-message" in lowered:
         return "tavya-share"
+    for site in SITES:
+        if site.detect(html):
+            return site.format
     if "streamcontroller.enqueue" in lowered or "__reactroutercontext" in lowered or "client-bootstrap" in lowered:
         return "chatgpt-share"
     if "claude" in lowered or "anthropic" in lowered or "challenge-platform" in lowered:

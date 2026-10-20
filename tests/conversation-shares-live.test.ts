@@ -13,11 +13,13 @@ import { liveEnabled } from './helpers/live-gate.js';
  * Real share links through tavya's real network path: each provider decides
  * what a server may read (Cloudflare in front of claude.ai, Gemini's RPC), and
  * no fake can tell when that changes. Needs `KARMAX_RUN_LIVE=1` and a public
- * link per provider: `KARMAX_LIVE_CLAUDE_SHARE`, `KARMAX_LIVE_CHATGPT_SHARE`,
- * `KARMAX_LIVE_GEMINI_SHARE` (any form, e.g. a share.gemini.google short link).
+ * link per provider: `KARMAX_LIVE_<PROVIDER>_SHARE` for each of `providers` below
+ * (e.g. `KARMAX_LIVE_GEMINI_SHARE`, any form: a share.gemini.google short link too).
+ * Perplexity asks for a browser check about half the time; that case is reported
+ * and the test is retried by hand, never answered.
  */
-const links = { claude: process.env.KARMAX_LIVE_CLAUDE_SHARE, chatgpt: process.env.KARMAX_LIVE_CHATGPT_SHARE,
-  gemini: process.env.KARMAX_LIVE_GEMINI_SHARE };
+const providers = ['claude', 'chatgpt', 'gemini', 'deepseek', 'grok', 'perplexity', 'poe', 'mistral', 'kimi', 'qwen'];
+const links = Object.fromEntries(providers.map((name) => [name, process.env[`KARMAX_LIVE_${name.toUpperCase()}_SHARE`]]));
 describe.skipIf(!liveEnabled())('conversation share links, live', () => {
   for (const [provider, link] of Object.entries(links)) {
     it.skipIf(!link)(`reads a ${provider} share as the task form does, and the agent starts from that copy`, async () => {

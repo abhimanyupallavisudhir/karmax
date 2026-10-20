@@ -1680,7 +1680,7 @@ export interface AgentSpec {
     taskId?: string;
     role?: string;
     /** A native provider id when the Karmax console is host-local. A public
-     * ChatGPT, Claude, Gemini or tavya share URL given here is read when the task
+     * share URL (src/agent/conversation-shares.ts) given here is read when the task
      * is saved and replaced by `upload` (src/agent/conversation-sources.ts). */
     sessionId?: string;
     upload?: import('../store/conversation-imports.js').ConversationImportRef;

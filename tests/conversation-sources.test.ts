@@ -76,7 +76,7 @@ describe('checking a conversation to fork from', () => {
       () => new Response('<title>Just a moment...</title>', { status: 403, headers: { 'content-type': 'text/html' } }),
       /claude\.ai refused to send this share to tavya \(HTTP 403\)\. Open https:\/\/claude\.ai\/api\/chat_snapshots\//],
     ['a deleted ChatGPT share', 'https://chatgpt.com/share/gone', () => new Response('', { status: 404 }), /Share link not found/],
-    ['a link to something else', 'https://example.com/share/x', () => new Response(''), /Use a public HTTPS ChatGPT, Claude, Gemini or tavya share link/],
+    ['a link to something else', 'https://example.com/share/x', () => new Response(''), /Use a public HTTPS share link of ChatGPT, Claude/],
   ])('says what to do with %s, keeping nothing', async (_name, link, answer, error) => {
     vi.mocked(network.publicShareFetch).mockImplementation(async () => answer());
     await expect(importConversationShare({ store, objects }, 'proj_a', link)).rejects.toThrow(error);
@@ -184,4 +184,78 @@ describe('the first turn of a task forked from a checked share', () => {
     expect((await store.eventsOfType(task.id, 'session.imported')).map((event: any) => event.payload))
       .toEqual([expect.objectContaining({ source: 'share', format: 'gemini-share' })]);
   });
+});
+
+// Sites whose request panagent knows (`panagent share-request`), made through the
+// guarded fetch; fixtures have the shape of their real answers (panagent tests).
+describe('share links of the sites panagent reads by request', () => {
+  const sites: Array<[string, string, string, string, string | undefined]> = [
+    ['https://chat.deepseek.com/share/ewfxrfhb7obmide29x', 'deepseek-share.json', 'GET',
+      'https://chat.deepseek.com/api/v0/share/content?share_id=ewfxrfhb7obmide29x', undefined],
+    ['https://grok.com/share/c2hhcmQtMg%3D%3D_ddbace62-c299-4b7b-921c-c5188e9cac50', 'grok-share.json', 'GET',
+      'https://grok.com/rest/app-chat/share_links_data/c2hhcmQtMg%3D%3D_ddbace62-c299-4b7b-921c-c5188e9cac50', 'Capitals fixture'],
+    ['https://www.perplexity.ai/search/capitals-fixture-AbC', 'perplexity-share.json', 'GET',
+      'https://www.perplexity.ai/rest/thread/capitals-fixture-AbC?with_parent_info=true', 'Capitals fixture'],
+    ['https://poe.com/s/Qu62LtlV2yKGZXlXTTS1', 'poe-share.html', 'GET', 'https://poe.com/s/Qu62LtlV2yKGZXlXTTS1', 'Capitals fixture'],
+    ['https://chat.mistral.ai/chat/11111111-2222-4333-8444-555555555555', 'mistral-share.html', 'GET',
+      'https://chat.mistral.ai/chat/11111111-2222-4333-8444-555555555555', 'Capitals fixture'],
+    ['https://www.kimi.com/share/en/d2fvbevhq49s4blc862g', 'kimi-share.json', 'POST',
+      'https://www.kimi.com/apiv2/kimi.gateway.chat.v1.ChatService/GetChatShare', 'Capitals fixture'],
+    ['https://chat.qwen.ai/s/b6bb9ca0-8565-4040-8c58-9c45a538be47', 'qwen-share.json', 'GET',
+      'https://chat.qwen.ai/api/v2/chats/share/b6bb9ca0-8565-4040-8c58-9c45a538be47', 'Capitals fixture'],
+  ];
+  it.each(sites)('reads %s', async (link, file, method, request, title) => {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    vi.mocked(network.publicShareFetch).mockImplementation(async (input, init) => {
+      calls.push({ url: String(input), init });
+      return new Response(fixture(file), { headers: { 'content-type': file.endsWith('.json') ? 'application/json' : 'text/html' } });
+    });
+    const ref = await importConversationShare({ store, objects }, 'proj_a', link);
+    expect(ref).toMatchObject({ format: file.replace(/\.\w+$/, ''), share: link, messages: expect.any(Number) });
+    expect(ref.messages).toBeGreaterThanOrEqual(2);
+    expect(ref.title).toBe(title);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.url.startsWith(request)).toBe(true);
+    expect(calls[0]!.init).toMatchObject({ method, headers: expect.objectContaining({ 'user-agent': 'tavya' }) });
+    if (method === 'POST') expect(calls[0]!.init!.body).toBe('{"share_id": "d2fvbevhq49s4blc862g"}');
+  });
+
+  it('says how to get past a browser check without answering it, and takes the saved file instead', async () => {
+    vi.mocked(network.publicShareFetch).mockImplementation(async () => new Response('<title>Just a moment...</title>',
+      { status: 403, headers: { 'content-type': 'text/html', 'cf-mitigated': 'challenge' } }));
+    await expect(importConversationShare({ store, objects }, 'proj_a', 'https://www.perplexity.ai/search/capitals-fixture-AbC'))
+      .rejects.toThrow(/^Perplexity asked for a browser check; paste the link again, or open https:\/\/www\.perplexity\.ai\/rest\/thread\/capitals-fixture-AbC\?.* in your browser, save it/);
+    const upload = await importConversationUpload(objects, 'proj_a', fixture('perplexity-share.json'), 'thread.json');
+    expect(upload).toMatchObject({ format: 'perplexity-share', title: 'Capitals fixture', messages: 4 });
+    expect(upload.share).toBeUndefined();
+  });
+
+  it('names a share the site no longer has', async () => {
+    vi.mocked(network.publicShareFetch).mockImplementation(async () => new Response('{"code":5,"message":"Cannot find conversation."}',
+      { status: 404, headers: { 'content-type': 'application/json' } }));
+    await expect(importConversationShare({ store, objects }, 'proj_a', 'https://grok.com/share/bGVnYWN5_00000000-0000-4000-8000-000000000000'))
+      .rejects.toThrow('Share link not found; it may have been deleted or unshared');
+    vi.mocked(network.publicShareFetch).mockImplementation(async () => new Response('{"success":false,"data":{"code":"Not_Found"}}',
+      { headers: { 'content-type': 'application/json' } }));
+    await expect(importConversationShare({ store, objects }, 'proj_a', 'https://chat.qwen.ai/s/00000000-0000-4000-8000-000000000000'))
+      .rejects.toThrow('this Qwen share is unavailable; it may have been deleted or unshared');
+  });
+
+  it('leaves links that are not shares alone', async () => {
+    const { publicConversationShare } = await import('../src/agent/conversation-shares.js');
+    for (const link of ['https://chat.mistral.ai/chat', 'https://poe.com/chat/abc', 'https://grok.com/chat/abc',
+      'https://copilot.microsoft.com/shares/YKk2dXqouRpqSwiAkuvtW', 'https://www.meta.ai/@someone/prompt/abc'])
+      expect(publicConversationShare(link), link).toBeUndefined();
+  });
+});
+
+it('says when a site shows only the first messages of a share', async () => {
+  vi.spyOn(network, 'publicShareFetch').mockImplementation(async () => new Response(fixture('poe-share.html'),
+    { headers: { 'content-type': 'text/html' } }));
+  const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'conversation-partial-'));
+  const store2 = await Store.create(':memory:');
+  try {
+    const ref = await importConversationShare({ store: store2, objects: new LocalObjectStore(dir2) }, 'proj_a', 'https://poe.com/s/FixturE');
+    expect(ref).toMatchObject({ format: 'poe-share', messages: 2, partial: true });
+  } finally { await store2.close(); fs.rmSync(dir2, { recursive: true, force: true }); }
 });

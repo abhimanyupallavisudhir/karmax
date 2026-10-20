@@ -6,7 +6,7 @@ export const MAX_CONVERSATION_IMPORT_BYTES = 20 * 1024 * 1024;
 
 /** An uploaded file's format, or the share format of a link read when it was given. */
 export type ConversationImportFormat = 'codex' | 'claude-code' | 'claude-export' | 'panagent'
-  | 'chatgpt-share' | 'claude-share' | 'gemini-share' | 'tavya-share';
+  | import('../agent/conversation-shares.js').ShareFormat;
 
 export interface ConversationImportRef {
   id: string;
@@ -20,6 +20,8 @@ export interface ConversationImportRef {
   /** What panagent read in it when it was checked. */
   title?: string;
   messages?: number;
+  /** The site showed only the first messages to anyone with the link. */
+  partial?: true;
 }
 
 const CLAUDE_TRANSCRIPT_TYPES = new Set([
@@ -100,7 +102,7 @@ export async function putConversationImport(
   projectId: string,
   data: Buffer,
   filename?: string,
-  read: Pick<ConversationImportRef, 'share' | 'title' | 'messages'> & { format?: ConversationImportFormat } = {},
+  read: Pick<ConversationImportRef, 'share' | 'title' | 'messages' | 'partial'> & { format?: ConversationImportFormat } = {},
 ): Promise<ConversationImportRef> {
   const { format = detectConversationImport(data), ...summary } = read;
   const id = crypto.createHash('sha256').update(data).digest('hex');

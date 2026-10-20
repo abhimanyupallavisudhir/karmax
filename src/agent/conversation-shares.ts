@@ -1,3 +1,6 @@
+import { execFile } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import { publicShareFetch, publicUrl } from '../mcp/connections/http.js';
 import { BRAND } from '../domain/brand.js';
 
@@ -12,7 +15,12 @@ export class ShareLinkError extends Error {}
  * human-verification check. A provider is listed only once verified against a
  * real link (wiki features/conversation-imports).
  */
-export type ShareFormat = 'chatgpt-share' | 'claude-share' | 'gemini-share' | 'tavya-share';
+export type ShareFormat = 'chatgpt-share' | 'claude-share' | 'gemini-share' | 'tavya-share' | SiteFormat;
+/** Sites whose request panagent knows (vendor/panagent shares.py `SITES`). */
+type SiteFormat = 'deepseek-share' | 'grok-share' | 'perplexity-share' | 'poe-share' | 'mistral-share' | 'kimi-share' | 'qwen-share';
+
+/** The apps whose share links tavya reads, for messages and the link field's tooltip. */
+export const SHARE_APPS = 'ChatGPT, Claude, Gemini, Grok, Perplexity, DeepSeek, Le Chat, Poe, Kimi, Qwen or ' + BRAND;
 export interface ConversationShareLink { url: string; format: ShareFormat; /** A tavya share's id. */ id?: string }
 export interface SharedConversation { data: Buffer; name: string }
 
@@ -73,6 +81,48 @@ async function geminiShareId(link: string): Promise<string> {
   throw new ShareLinkError('This Gemini link did not lead to a gemini.google.com/share/ conversation');
 }
 
+const VENDORED_PANAGENT = fileURLToPath(new URL('../../vendor/panagent/src', import.meta.url));
+
+/** The request that returns a share's conversation, as panagent knows it
+ * (`panagent share-request`), so each site's recipe lives in one place. */
+async function panagentShareRequest(link: string): Promise<{ site: string; method: string; url: string;
+  headers: Record<string, string>; body: string | null }> {
+  const { stdout } = await promisify(execFile)(process.env.KARMAX_PANAGENT_PYTHON || 'python3',
+    ['-m', 'panagent', 'share-request', link], { env: { PATH: process.env.PATH, PYTHONPATH: VENDORED_PANAGENT }, timeout: 30_000 });
+  return JSON.parse(stdout);
+}
+
+/** A share of a panagent site: its request, made through the guarded fetch. An
+ * error answer the site gives as data (Grok's, Kimi's, Perplexity's JSON) is
+ * the reader's to name; a human-verification check is never answered. */
+async function siteShare(share: ConversationShareLink): Promise<SharedConversation> {
+  const request = await panagentShareRequest(share.url);
+  const response = await publicShareFetch(request.url, { method: request.method, body: request.body ?? undefined,
+    headers: { 'user-agent': BRAND, ...request.headers } });
+  if (response.status === 404 || response.status === 410) throw notFound();
+  if (response.headers.get('cf-mitigated') === 'challenge')
+    throw new ShareLinkError(`${request.site} asked for a browser check; paste the link again, or open ${request.url} `
+      + 'in your browser, save it (Ctrl+S or ⌘S) and upload that file under Fork a previous agent → Upload conversation');
+  const json = /json/i.test(response.headers.get('content-type') ?? '');
+  if (!response.ok && !(json && response.status < 500))
+    throw new ShareLinkError(`${request.site} returned HTTP ${response.status} for this share`);
+  return { data: Buffer.from(await response.arrayBuffer()), name: json ? 'share.json' : 'share.html' };
+}
+
+/** A path on one of these hosts (the links panagent's sites match). */
+const at = (hosts: string[], path: RegExp) => (url: URL) => hosts.includes(url.hostname) && path.test(url.pathname) ? {} : undefined;
+const UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
+const SITES: Array<[SiteFormat, ShareProvider['matches']]> = [
+  ['deepseek-share', at(['chat.deepseek.com'], /^\/share\/[A-Za-z0-9]+\/?$/)],
+  ['grok-share', at(['grok.com', 'www.grok.com'], /^\/share\/[^/]+\/?$/)],
+  ['perplexity-share', at(['perplexity.ai', 'www.perplexity.ai'], /^\/search\/[A-Za-z0-9._-]+\/?$/)],
+  ['poe-share', at(['poe.com', 'www.poe.com'], /^\/s\/[A-Za-z0-9]+\/?$/)],
+  // A Le Chat chat is shared by making it public; its link is the chat's own.
+  ['mistral-share', at(['chat.mistral.ai'], new RegExp(`^/chat/${UUID}/?$`))],
+  ['kimi-share', at(['kimi.com', 'www.kimi.com'], /^\/share\/(?:[a-z]{2}(?:-[A-Za-z]{2})?\/)?[a-z0-9]+\/?$/)],
+  ['qwen-share', at(['chat.qwen.ai'], new RegExp(`^/s/${UUID}/?$`))],
+];
+
 const PROVIDERS: ShareProvider[] = [
   {
     format: 'tavya-share',
@@ -116,7 +166,12 @@ const PROVIDERS: ShareProvider[] = [
       return { data: Buffer.from(await response.arrayBuffer()), name: 'share.txt' };
     },
   },
+  ...SITES.map(([format, matches]): ShareProvider => ({ format, matches, fetch: siteShare })),
 ];
+
+export function isShareFormat(value: string): value is ShareFormat {
+  return PROVIDERS.some((provider) => provider.format === value);
+}
 
 /** A public HTTPS share link of a provider tavya can import. */
 export function publicConversationShare(value: string): ConversationShareLink | undefined {

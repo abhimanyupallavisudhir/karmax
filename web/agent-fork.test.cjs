@@ -43,6 +43,7 @@ eval(extractFn('taskRecord'));
 eval(extractFn('resumeChosenInner'));
 eval(extractFn('resumeUploadInner'));
 eval(extractFn('resumeCheckHtml'));
+eval(extractFn('resumeMessageCount'));
 eval(extractFn('mcpPickerHtml'));
 eval(extractFn('renderAgentField'));
 eval(extractFn('agentBlockHtml'));
@@ -101,7 +102,7 @@ const closed = renderAgentField({ role: 'do', name: 'agent:do' }, undefined, { p
 ok(closed.includes('type="checkbox" class="af-resume-enabled"'), 'fork disclosure is a checkbox');
 ok(closed.includes('class="af-resume-panel" hidden'), 'unchecked fork panel starts collapsed');
 ok(!closed.includes('<details class="af-resume') && closed.includes('af-resume-enabled'), 'fork choice uses its explicit toggle');
-ok(closed.includes('paste a share link or provider conversation ID') && closed.includes('title="ChatGPT, Claude, Gemini or tavya"'), 'a local console advertises provider ids and share links, naming the apps in the tooltip');
+ok(closed.includes('paste a share link or provider conversation ID') && closed.includes('title="ChatGPT, Claude, Gemini, Grok, Perplexity, DeepSeek, Le Chat, Poe, Kimi, Qwen or tavya"'), 'a local console advertises provider ids and share links, naming the apps in the tooltip');
 ok(closed.includes('Upload conversation'), 'conversation upload is offered without another panel');
 
 S.meta.hostLocal = false;
@@ -246,6 +247,8 @@ ok(readResume(box)?.upload?.format === 'codex', 'an uploaded conversation is col
   ok(readResume(box) === undefined || !readResume(box)?.upload, 'a cleared link does not keep what it read');
   ok(resumeCheckHtml({ ok: read }).includes('>Self-location · 8 messages<'), 'what was read is one line: title · messages');
   ok(resumeCheckHtml({ ok: { messages: 1 } }).includes('>1 message<'), 'one message, singular');
+  const partial = resumeCheckHtml({ ok: { title: 'FOOM', messages: 20, partial: true, share: 'https://poe.com/s/x' } });
+  ok(partial.includes('>FOOM · 20+ messages<') && partial.includes('title="The site shows only these first messages'), 'a share shown only in part says so');
   const failed = resumeCheckHtml({ error: 'this Gemini share is unavailable; it may have been deleted or unshared' });
   ok(failed.includes('class="af-resume-check err"') && failed.includes('title="This Gemini share is unavailable'), 'an unreadable source says why, as a sentence, in full in its tooltip');
   ok(resumeCheckHtml().includes('hidden'), 'nothing to say, nothing shown');

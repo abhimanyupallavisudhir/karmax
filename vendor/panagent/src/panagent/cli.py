@@ -7,6 +7,7 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Sequence
+from urllib.parse import urlparse
 from uuid import UUID
 
 from . import __version__
@@ -14,6 +15,7 @@ from .api import NATIVE_TARGETS, install, load, parse, render
 from .detect import FORMAT_ALIASES, canonical_format, detect_text
 from .errors import PanagentError
 from .readers import READERS, read_file
+from .shares import share_site
 from .web import WEB_READERS, list_conversations
 from .writers import WRITERS, Rendered
 
@@ -91,7 +93,23 @@ def parser() -> argparse.ArgumentParser:
     listing.add_argument("source", help="conversations.json, or '-' for stdin")
     listing.add_argument("--from", dest="source_format", choices=INPUTS, help="source format (default: detect)")
     listing.set_defaults(handler=_list)
+
+    request = subparsers.add_parser(
+        "share-request", help="print, as JSON, the HTTP request that returns a share link's conversation (to make it yourself)")
+    request.add_argument("url", help="a public share URL of a site that needs no browser")
+    request.set_defaults(handler=_share_request)
     return result
+
+
+def _share_request(args: argparse.Namespace) -> int:
+    found = share_site(urlparse(args.url)) if args.url.startswith("https://") else None
+    if found is None:
+        raise PanagentError("not a share link of a site panagent reads by request; convert reads the others")
+    site, share_id = found
+    url, body, headers = site.request(share_id)
+    print(json.dumps({"format": site.format, "site": site.name, "method": "POST" if body is not None else "GET", "url": url,
+                      "headers": headers, "body": body.decode() if body is not None else None}))
+    return 0
 
 
 def _read_source(source: str) -> str:

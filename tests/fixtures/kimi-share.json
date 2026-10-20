@@ -1,0 +1,48 @@
+{
+ "share": {
+  "id": "fixtureid0",
+  "chat": {
+   "id": "c0",
+   "name": "Capitals fixture"
+  },
+  "url": "https://www.kimi.com/share/fixtureid0",
+  "messages": [
+   {
+    "id": "k2",
+    "parentId": "k1",
+    "role": "assistant",
+    "blocks": [
+     {
+      "id": "0",
+      "text": {
+       "content": "The capital of France is **Paris**."
+      }
+     }
+    ],
+    "createTime": "2026-10-19T08:53:25Z"
+   },
+   {
+    "id": "k1",
+    "childrenMessageIds": [
+     "k2"
+    ],
+    "role": "user",
+    "blocks": [
+     {
+      "id": "0",
+      "text": {
+       "content": "What is the capital of France?"
+      }
+     },
+     {
+      "id": "1",
+      "file": {
+       "name": "notes.pdf"
+      }
+     }
+    ],
+    "createTime": "2026-10-19T08:53:20Z"
+   }
+  ]
+ }
+}
