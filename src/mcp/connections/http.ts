@@ -91,5 +91,7 @@ function guardedFetch(stream: boolean, timeoutMs = stream ? 65_000 : 15_000): ty
 }; }
 export const publicFetch = guardedFetch(false);
 export const publicStreamFetch = guardedFetch(true);
+/** The Official MCP Registry's own search, which takes up to ~30 s. */
+export const publicSlowFetch = guardedFetch(false, 60_000);
 /** The same guard for a single model completion, which can take a minute. */
 export const publicModelFetch = guardedFetch(false, 90_000);
