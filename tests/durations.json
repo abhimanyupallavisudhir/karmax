@@ -545,6 +545,7 @@
   "tests/task-command-workflow.test.ts": 16.9,
   "tests/task-defaults-order.browser.test.ts": 3.6,
   "tests/task-form-agents.browser.test.ts": 4.7,
+  "tests/task-form-head.browser.test.ts": 4.6,
   "tests/task-messages.test.ts": 39.4,
   "tests/task-parameters-ui.test.ts": 0,
   "tests/task-picker-ui.test.ts": 4.4,

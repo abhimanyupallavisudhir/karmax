@@ -8581,9 +8581,11 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
           ${formAttemptGroup?.attempts?.length > 1 ? `<nav class="attempts-list tf-attempts" aria-label="Choose an attempt">
             ${formAttemptGroup.attempts.map((a) => attemptCard(a, formAttemptGroup, { taskId: draft.id }, { form: true })).join('')}
           </nav>` : ''}
-          <span class="tf-savestate save-state quiet" id="tf-savestate" role="status"></span>
-          ${templatePickable ? `<button type="button" class="tf-template" id="tf-template" title="Start from a template" aria-label="Template${opts?.template ? `: ${esc(opts.template.name)}` : ''}">${ICON.template}${opts?.template ? `<span class="tf-template-label">${esc(opts.template.name)}</span>` : ''}</button>` : ''}
-          <select id="tf-wf" title="${workflowEditable ? 'Workflow' : 'Workflow is locked after the task is queued'}" ${workflowEditable ? '' : 'disabled'}>${taskFormWorkflows(wf, draft).map((w) => `<option value="${esc(w.id)}" ${w.id === wf ? 'selected' : ''}>${esc(w.label)}</option>`).join('')}</select>
+          <div class="tf-head-end">
+            <span class="tf-savestate save-state quiet" id="tf-savestate" role="status"></span>
+            ${templatePickable ? `<button type="button" class="tf-template" id="tf-template" title="Start from a template" aria-label="Template${opts?.template ? `: ${esc(opts.template.name)}` : ''}">${ICON.template}${opts?.template ? `<span class="tf-template-label">${esc(opts.template.name)}</span>` : ''}</button>` : ''}
+            <select id="tf-wf" title="${workflowEditable ? 'Workflow' : 'Workflow is locked after the task is queued'}" ${workflowEditable ? '' : 'disabled'}>${taskFormWorkflows(wf, draft).map((w) => `<option value="${esc(w.id)}" ${w.id === wf ? 'selected' : ''}>${esc(w.label)}</option>`).join('')}</select>
+          </div>
         </div>
       </div>
       <div class="tf-scroll">
