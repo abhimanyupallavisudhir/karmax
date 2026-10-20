@@ -131,7 +131,7 @@ it('scans multiple async pages without recounting and preserves full/compact lis
   expect((await api.searchTasks(token, project.id, 'says:searchable -is:archived')).tasks.map(t => t.id))
     .toEqual([records[204]!.id]);
   expect(reads.mock.calls.some(([sql]) => /COUNT\(\*\).*tasks/i.test(sql))).toBe(false);
-  const pages = reads.mock.calls.filter(([sql]) => sql.includes('JOIN task_intents') && !sql.startsWith('SELECT i.id'));
+  const pages = reads.mock.calls.filter(([sql]) => sql.includes('JOIN task_intents') && !/^SELECT [it]\.id FROM/.test(sql));
   expect(pages.length).toBeGreaterThanOrEqual(8);
   expect(pages.every(([sql]) => sql.includes('LIMIT ? OFFSET ?'))).toBe(true);
   await expect(api.listTasks(token, other.id)).rejects.toThrow();

@@ -5647,7 +5647,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     const tags: Tag[] = [];
     for (const project of projects) {
       for await (const page of this.deps.store.taskReadPages(project.id, {
-        includeArchived: !activeOnly, includeConversation: needsConversation,
+        includeArchived: !activeOnly, includeConversation: needsConversation, attempts: true,
         ...(candidates ? { candidateIds: [...candidates] } : {}),
       })) tasks.push(...page);
       tags.push(...(await this.deps.store.listTagsAsync(project.id)));

@@ -234,6 +234,30 @@ describe('multiple task attempts', () => {
     (await f.store.close());
   });
 
+  it('finds a logical task through the only attempt that matches the search', async () => {
+    const f = (await choiceFixture());
+    const ids = async (query: string) => (await f.api.searchTasks(f.maintainer, f.project.id, query)).tasks
+      .map((task) => [task.id, !!task.otherAttempt]);
+    (await f.store.claimAttempt(f.first.id));
+    (await f.store.saveView(f.second.id, { ...f.mergeView(f.second.id), stage: 'do', status: 'active' }));
+    (await f.store.saveView(f.first.id, { ...f.mergeView(f.first.id), stage: 'done', status: 'done' }));
+    // Done auto-archives the committed principal; its kept alternative still works.
+    expect((await f.store.attemptGroup(f.first.id))).toMatchObject({ principalAttemptId: f.first.id, committedAttemptId: f.first.id });
+    expect((await ids('-is:archived'))).toEqual([[f.second.id, true]]);
+    expect((await ids('is:active'))).toEqual([[f.second.id, true]]);
+    expect((await ids('is:archived'))).toEqual([[f.first.id, false]]);
+    // One row per logical task: the principal whenever it matches.
+    expect((await ids(''))).toEqual([[f.first.id, false]]);
+    expect((await ids('is:done'))).toEqual([[f.first.id, false]]);
+    expect((await ids('-is:archived is:done'))).toEqual([]);
+    // Ordinary lists still project only the principal.
+    expect((await f.store.listTasks(f.project.id)).map((task) => task.id)).toEqual([f.first.id]);
+    // Archiving the row hides the whole logical task.
+    (await f.store.setTaskArchived(f.second.id, true));
+    expect((await ids('-is:archived'))).toEqual([]);
+    (await f.store.close());
+  });
+
   it('applies cancellation to drafts but leaves finished attempts alone', async () => {
     const f = (await choiceFixture());
     (await f.store.updateTaskParams(f.second.id, { prompt: 'b', draft: true }));

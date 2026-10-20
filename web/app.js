@@ -1005,7 +1005,8 @@ async function applyListRoute(tab, scope, r, routeIsCurrent) {
 function taskUrl(id, record) {
   const rec = record || taskRecord(id);
   const p = projectById(rec?.projectId || S.projectId);
-  const keyPart = S.viewingAttempt !== id && rec && rec.num != null ? String(rec.num) : id;
+  // A search row standing in through another attempt opens that attempt, not the principal.
+  const keyPart = S.viewingAttempt !== id && rec && rec.num != null && !rec.otherAttempt ? String(rec.num) : id;
   return p ? `${projectBase(p.id)}/tasks/${keyPart}` : currentPath();
 }
 
@@ -5018,7 +5019,7 @@ function patchTaskListFromEvent(ev) {
 const HOME_REFRESH_MS = 800;
 let homeRefreshTimer = null;
 function homeEventChangesList(ev) {
-  if (!ev.taskId || ev.siblingAttempt || liveOnlyEvent(ev.type)) return false;
+  if (!ev.taskId || liveOnlyEvent(ev.type)) return false;
   if (!(ev.type === 'view.updated' || ev.type === 'task.stage' || ev.type === 'task.mentioned'
     || ev.type === 'task.created' || ev.type === 'task.deleted' || LIST_RELOAD_EVENTS.has(ev.type))) return false;
   const project = projectById(ev.projectId || ev.payload?.projectId);
@@ -5122,7 +5123,11 @@ function connectWs() {
       // membership, but they do not require the expensive all-tasks endpoint.
       if (S.tab === 'tasks' && !S.selected) scheduleSearch(true);
       if (S.tab === 'queue' && !S.selected) bgRenderMain();
-    } else if (currentProject && !siblingAttempt && (LIST_RELOAD_EVENTS.has(ev.type)
+    } else if (currentProject && siblingAttempt) {
+      // Any attempt can stand in for its task in a search, so its lifecycle can
+      // change the results — though never the principals-only task index.
+      if (S.tab === 'tasks' && !S.selected && (ev.type === 'view.updated' || ev.type === 'task.stage')) scheduleSearch(true);
+    } else if (currentProject && (LIST_RELOAD_EVENTS.has(ev.type)
       || (ev.type === 'view.updated' && ev.taskId && !S.tasks.some((t) => t.id === ev.taskId)
         ))) {
       // True membership/metadata changes are rare and do require a durable reload.

@@ -4129,7 +4129,11 @@ export class Store {
    * histories are opt-in; ordinary task lists/search retain compact projection. */
   async *taskReadPages(projectId: string, options: { includeArchived?: boolean; includeConversation?: boolean;
     /** Read only these tasks (an attempt or logical id) and drafts — a `for:` search's candidates. */
-    candidateIds?: string[] } = {}): AsyncGenerator<TaskRecord[], void> {
+    candidateIds?: string[];
+    /** Every attempt that passes the archive and candidate filters, not only
+     *  principals (the others marked `otherAttempt`): a search shows a task
+     *  through any of its attempts that matches. */
+    attempts?: boolean } = {}): AsyncGenerator<TaskRecord[], void> {
     // Freeze membership/order using only logical IDs. OFFSET against a changing
     // list can duplicate/skip tasks; slicing this small ID index also avoids
     // rescanning earlier rows on every page. Resolve the current principal when
@@ -4140,16 +4144,21 @@ export class Store {
     const narrowed = candidates ? candidates.length
       ? ` AND (${draft} OR t.id IN (${candidates.map(() => '?').join(',')}) OR i.id IN (${candidates.map(() => '?').join(',')}))`
       : ` AND ${draft}` : '';
-    const identities = await this.readRows<{ id: string }>(`SELECT i.id FROM tasks t
-      JOIN task_intents i ON i.id=t.intentId AND i.principalAttemptId=t.id
-      JOIN tasks root ON root.id=i.id WHERE t.projectId=? AND ${notPullRequestSql(this.db.dialect)}${this.taskArchivePredicate(options.includeArchived ?? true)}${narrowed}
-      ORDER BY root.ord, root.createdAt, root.id`, [projectId, ...(candidates ?? []), ...(candidates ?? [])]);
+    const archive = this.taskArchivePredicate(options.includeArchived ?? true);
+    // With `attempts` the index lists attempts rather than logical tasks, in the
+    // same order with each task's attempts in creation order.
+    const identities = await this.readRows<{ id: string }>(`SELECT ${options.attempts ? 't.id' : 'i.id'} FROM tasks t
+      JOIN task_intents i ON i.id=t.intentId${options.attempts ? '' : ' AND i.principalAttemptId=t.id'}
+      JOIN tasks root ON root.id=i.id WHERE t.projectId=? AND ${notPullRequestSql(this.db.dialect)}${archive}${narrowed}
+      ORDER BY root.ord, root.createdAt, root.id${options.attempts ? ', t.attemptNumber, t.id' : ''}`,
+    [projectId, ...(candidates ?? []), ...(candidates ?? [])]);
     for (let offset = 0; offset < identities.length; offset += 200) {
       const ids = identities.slice(offset, offset + 200).map(row => row.id);
       const page = await this.readTaskPage(projectId, { includeArchived: true },
-        options.includeConversation ?? false, false, ids);
+        options.includeConversation ?? false, false, ids, options.attempts);
       const positions = new Map(ids.map((id, index) => [id, index]));
-      page.tasks.sort((a, b) => positions.get(a.intentId!)! - positions.get(b.intentId!)!);
+      const key = (task: TaskRecord) => options.attempts ? task.id : task.intentId!;
+      page.tasks.sort((a, b) => positions.get(key(a))! - positions.get(key(b))!);
       if (page.tasks.length) yield page.tasks;
     }
   }
@@ -4166,23 +4175,26 @@ export class Store {
       : " AND COALESCE(json_extract(t.params, '$.archived'), 0)=0";
   }
 
+  /** A page of logical tasks, each read as its principal; or with `attempts`,
+   *  the attempts `ids` names, each other than its task's principal marked
+   *  `otherAttempt`. */
   private async readTaskPage(projectId: string,
     options: { includeArchived?: boolean; limit?: number; offset?: number },
-    includeConversation: boolean, includeTotal: boolean, intentIds?: string[]) {
+    includeConversation: boolean, includeTotal: boolean, ids?: string[], attempts = false) {
     const limit = options.limit ?? 200, offset = options.offset ?? 0;
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200 || !Number.isSafeInteger(offset) || offset < 0)
       throw new Error('limit must be 1–200 and offset must be a non-negative integer');
-    const selection = intentIds ? ` AND i.id IN (${intentIds.map(() => '?').join(',')})` : '';
-    const from = `FROM tasks t JOIN task_intents i ON i.id=t.intentId AND i.principalAttemptId=t.id
+    const selection = ids ? ` AND ${attempts ? 't' : 'i'}.id IN (${ids.map(() => '?').join(',')})` : '';
+    const from = `FROM tasks t JOIN task_intents i ON i.id=t.intentId${attempts ? '' : ' AND i.principalAttemptId=t.id'}
       JOIN tasks root ON root.id=i.id WHERE t.projectId=? AND ${notPullRequestSql(this.db.dialect)}${this.taskArchivePredicate(options.includeArchived)}${selection}`;
-    const params = [projectId, ...(intentIds ?? [])];
+    const params = [projectId, ...(ids ?? [])];
     const projection = includeConversation ? 't.*' : `t.id, t.num, t.projectId, t.listId, t.title, t.workflow,
       t.executionWorkflow, t.workflowVersion, t.params, t.createdAt, t.statusChangedAt, t.ord, t.parentTaskId,
       t.createdBy, t.assignee, t.delegate, t.confirmationPolicy, t.intentId, t.attemptNumber, t.notes,
       json_remove(t.lastView, '$.messages', '$.transcripts', '$.reviewInfo') AS lastView`;
     const rows = await this.readRows<any>(`SELECT ${projection},
-      COALESCE(t.num, root.num) AS resolvedNum ${from}
-      ORDER BY root.ord, root.createdAt, root.id LIMIT ? OFFSET ?`, [...params, limit, offset]);
+      COALESCE(t.num, root.num) AS resolvedNum${attempts ? ', CASE WHEN i.principalAttemptId=t.id THEN 0 ELSE 1 END AS otherAttempt' : ''} ${from}
+      ORDER BY root.ord, root.createdAt, root.id${attempts ? ', t.attemptNumber, t.id' : ''} LIMIT ? OFFSET ?`, [...params, limit, offset]);
     const [count] = includeTotal
       ? await this.readRows<{ total: number }>(`SELECT COUNT(*) AS total ${from}`, params) : [];
     const tasks = rows.map(rowToTask);
@@ -10805,6 +10817,7 @@ function rowToTask(r: any): TaskRecord {
     subscribers: [],
     notes: r.notes ?? undefined,
     lastView: rowToTaskView(r),
+    ...(Number(r.otherAttempt) ? { otherAttempt: true } : {}),
   };
 }
 
