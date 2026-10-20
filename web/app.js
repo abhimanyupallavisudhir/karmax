@@ -1645,10 +1645,12 @@ const localWorldPath = (v) => (hostLocal() && v.worldPath) || '';
 // Parameters tab. The value is sparse ({provider, cpu, memoryMb, diskGb, flavor,
 // hibernateAfterDays, network}); the block shows the effective machine and a
 // form stores only what differs from what it inherits.
-const COMPUTER_PROVIDER_LABELS = { e2b: 'E2B', daytona: 'Daytona', fly: 'Fly.io', hetzner: 'Hetzner', worktree: 'This machine', container: 'Docker container' };
+const COMPUTER_PROVIDER_LABELS = { e2b: 'E2B', daytona: 'Daytona', fly: 'Fly.io', hetzner: 'Hetzner', aws: 'AWS', gcp: 'Google Cloud',
+  worktree: 'This machine', container: 'Docker container' };
 // What a machine gets when the Computer asks for nothing more (disk is total GB).
 const COMPUTER_DEFAULTS = { e2b: { cpu: 2, memoryMb: 2048, diskGb: 22 }, daytona: { cpu: 2, memoryMb: 4096, diskGb: 8 },
-  fly: { cpu: 2, memoryMb: 2048, diskGb: 20 }, hetzner: { cpu: 2, memoryMb: 2048, diskGb: 20 } };
+  fly: { cpu: 2, memoryMb: 2048, diskGb: 20 }, hetzner: { cpu: 2, memoryMb: 2048, diskGb: 20 }, aws: { cpu: 2, memoryMb: 2048, diskGb: 20 },
+  gcp: { cpu: 2, memoryMb: 2048, diskGb: 20 } };
 // What a computer on the organization's provider account may be: the
 // connection's limits, learned from the provider (src/domain/computer-limits.ts).
 const computerLimitsFor = (provider) => (S.worldProviderConnections || []).find((c) => c.provider === provider)?.limits || null;
@@ -5422,7 +5424,7 @@ function renderOnboarding() {
     <ol class="onboarding-list">
       ${onboardingStep(1, 'github', 'Connect GitHub', `Import repositories and let ${siteNameMarkup()} work through reviewed pull requests.`, `<a class="btn sm" data-spa href="${settings}#settings-code">${state.steps.github.complete ? 'Manage GitHub' : 'Connect GitHub'}</a>`)}
       ${onboardingStep(2, 'agentLogin', 'Add agent logins', 'Connect at least one usable Codex, Claude, or API-key account.', `<a class="btn sm" data-spa href="${settings}#settings-agents">${state.steps.agentLogin.complete ? 'Manage agent logins' : 'Add agent login'}</a>`)}
-      ${onboardingStep(3, 'e2b', 'Connect a cloud computer', 'Add an E2B, Daytona, Fly.io or Hetzner key: your agents work on its computers.', `<a class="btn sm" data-spa href="${settings}#settings-computers">${state.steps.e2b.complete ? 'Manage computers' : 'Connect a computer'}</a>`)}
+      ${onboardingStep(3, 'e2b', 'Connect a cloud computer', 'Add an E2B, Daytona, Fly.io, Hetzner, AWS or Google Cloud key: your agents work on its computers.', `<a class="btn sm" data-spa href="${settings}#settings-computers">${state.steps.e2b.complete ? 'Manage computers' : 'Connect a computer'}</a>`)}
       ${onboardingStep(4, 'optional', 'Connect apps and payment cards', 'Connect services and give agents approved access to passwords and purchases. This never blocks setup.', `<a class="btn sm" data-spa href="${settings}#settings-payments">${optional.vault || optional.card ? 'Manage apps &amp; cards' : 'Set up apps &amp; cards'}</a>`)}
       ${onboardingStep(5, 'paidPlan', 'Buy paid plan', 'Choose a paid subscription for this workspace, or keep using Free. This never blocks setup.', `<a class="btn sm" data-spa href="${settings}#settings-plan">${state.steps.paidPlan?.complete ? 'Manage paid plan' : 'View plans &amp; billing'}</a>`)}
       ${onboardingStep(6, 'project', 'Create your first project', 'Start a real task list and connect the code your agents will work on.', `<button class="btn sm ${state.steps.project.complete ? '' : 'primary'}" id="onboarding-new-project" type="button">${state.steps.project.complete ? 'Create another project' : 'Create project'}</button>`)}
@@ -22652,7 +22654,35 @@ const COMPUTER_PROVIDERS = {
   hetzner: { name: 'Hetzner', keys: 'https://console.hetzner.cloud/projects',
     tip: 'The cheapest: disks up to 10 TB that grow in place and survive pauses, in EU data centres. Use a Read & Write project token.',
     advanced: [['region', 'Location', 'fsn1'], ['image', 'Image', 'karmax snapshot, else debian-12']] },
+  // A key in two parts, joined as ID:SECRET (src/world/aws.ts reads it).
+  aws: { name: 'AWS', keys: '/docs/computers#aws', keyParts: [['Access key ID', 'text'], ['Secret access key', 'password']],
+    tip: 'Paid by the second while it works; a paused computer costs only its disk. Disks up to 16 TB that grow in place. Use an IAM user’s access key (Get a key shows its policy).',
+    advanced: [['region', 'Region', 'eu-central-1'], ['image', 'Image (AMI)', 'karmax image, else Debian 12']] },
+  gcp: { name: 'Google Cloud', keys: '/docs/computers#google-cloud', keyLabel: 'Service account key', keyFile: true,
+    tip: 'Paid by the second while it works; a paused computer costs only its disk. Machines of exactly the size you choose, disks up to 64 TB that grow in place.',
+    advanced: [['region', 'Zone', 'europe-west3-a'], ['image', 'Image', 'karmax image, else Debian 12']] },
 };
+/** The dialog's key fields: one secret, a key in parts (AWS), or a key file (Google Cloud). */
+function computerKeyMarkup(info, connection) {
+  const placeholder = connection ? 'Blank to leave unchanged' : 'Required';
+  const link = `<a class="computer-key-link" href="${esc(info.keys)}" target="_blank" rel="noopener noreferrer">Get a key</a>`;
+  if (info.keyParts) return info.keyParts.map(([label, type], index) => `<label class="form-row"><span>${esc(label)}${index ? '' : ` ${link}`}</span>
+      <input class="computer-key-part" type="${type}" autocomplete="${type === 'password' ? 'new-password' : 'off'}" spellcheck="false" placeholder="${placeholder}"></label>`).join('');
+  if (info.keyFile) return `<label class="form-row"><span>${esc(info.keyLabel)} ${link}</span>
+      <textarea class="computer-key computer-key-file" rows="3" spellcheck="false" autocomplete="off" placeholder="${connection ? 'Blank to leave unchanged' : 'Paste or drop the JSON key file'}"></textarea></label>`;
+  return `<label class="form-row"><span>API key ${link}</span>
+      <input class="computer-key" type="password" autocomplete="new-password" placeholder="${placeholder}"></label>`;
+}
+/** What the key fields hold: undefined when left blank; an error when a part is missing. */
+function computerKeyValue(overlay) {
+  const parts = [...overlay.querySelectorAll('.computer-key-part')].map((input) => input.value.trim());
+  if (parts.length) {
+    if (parts.every((part) => !part)) return undefined;
+    if (parts.some((part) => !part)) throw new Error('Enter both the access key ID and the secret access key');
+    return parts.join(':');
+  }
+  return overlay.querySelector('.computer-key').value.trim() || undefined;
+}
 function computerConnectionState(connection) {
   if (!connection) return { label: 'not connected', tone: '' };
   if (connection.managed) return { label: 'included', tone: 'done' };
@@ -22755,8 +22785,7 @@ function openComputerDialog(provider, connection, organizationId, onSaved, { man
   const overlay = document.createElement('div'); overlay.className = 'modal-overlay';
   overlay.innerHTML = `<div class="modal-card computer-dialog" role="dialog" aria-modal="true" aria-label="${esc(info.name)}">
     <div class="modal-head"><b>${esc(info.name)}</b>${info.tip ? policyTip(info.tip) : ''}<span class="label-row-fill"></span><button class="icon-btn computer-close" type="button" aria-label="Close">×</button></div>
-    <label class="form-row"><span>API key <a class="computer-key-link" href="${esc(info.keys)}" target="_blank" rel="noopener noreferrer">Get a key</a></span>
-      <input class="computer-key" type="password" autocomplete="new-password" placeholder="${connection ? 'Blank to leave unchanged' : 'Required'}"></label>
+    ${computerKeyMarkup(info, connection)}
     ${managed ? `<div class="settings-grid"><label class="form-row"><span>Machines at once ${policyTip(`The account’s concurrency limit (E2B Hobby: 20). Beyond it, tasks wait for a machine instead of being refused by ${info.name}. Blank: no limit.`)}</span>
       <input class="computer-max-running" type="number" min="1" step="1" inputmode="numeric" value="${esc(config.maxRunning ?? '')}" placeholder="No limit"></label>
       <label class="switch computer-enabled-row"><input class="toggle computer-enabled" type="checkbox" ${connection?.enabled === false ? '' : 'checked'}>Offer to organizations</label></div>` : ''}
@@ -22785,7 +22814,10 @@ function openComputerDialog(provider, connection, organizationId, onSaved, { man
       .filter((input) => input.value.trim() !== '' && Number(input.value) > 0)
       .map((input) => [input.dataset.limit, input.dataset.limit === 'memoryMb' ? Math.round(Number(input.value) * 1024) : Math.round(Number(input.value))]));
     const maxRunning = Number(overlay.querySelector('.computer-max-running')?.value);
-    const body = { apiKey: overlay.querySelector('.computer-key').value.trim() || undefined,
+    let apiKey;
+    try { apiKey = computerKeyValue(overlay); }
+    catch (error) { toast(error.message, true); button.disabled = false; return; }
+    const body = { apiKey,
       ...(managed ? { enabled: overlay.querySelector('.computer-enabled').checked } : {}),
       config: { ...Object.fromEntries([...overlay.querySelectorAll('[data-config]')].map((input) => [input.dataset.config, input.value.trim()])), limits,
         ...(managed && maxRunning > 0 ? { maxRunning: Math.round(maxRunning) } : {}) } };
@@ -22804,7 +22836,14 @@ function openComputerDialog(provider, connection, organizationId, onSaved, { man
     catch (error) { toast(error.message, true); }
   });
   document.body.appendChild(overlay); document.addEventListener('keydown', keydown);
-  overlay.querySelector('.computer-key').focus();
+  // A dropped key file is read into the field.
+  overlay.querySelector('.computer-key-file')?.addEventListener('drop', async (event) => {
+    const file = event.dataTransfer?.files?.[0];
+    if (!file) return;
+    event.preventDefault();
+    event.currentTarget.value = (await file.text()).trim();
+  });
+  overlay.querySelector('.computer-key, .computer-key-part').focus();
 }
 
 function organizationView() {
@@ -24214,6 +24253,7 @@ function legalFooter() {
 const DOC_PAGES = [
   { slug: 'getting-started', path: '/docs', title: 'Getting started' },
   { slug: 'how-it-works', path: '/docs/how-it-works', title: 'How it works' },
+  { slug: 'computers', path: '/docs/computers', title: 'Cloud computers' },
   { slug: 'cli', path: '/docs/cli', title: 'tavya CLI' },
 ];
 
@@ -24363,7 +24403,7 @@ function renderPricing() {
       <span>${esc(formatBytes(packs.storage.bytes))} more storage · ${esc(money(packs.storage.monthlyPriceCents))}/month</span>
       ${compute ? `<span>${esc(credit(packs.compute.creditMicros))} more compute · ${esc(money(packs.compute.monthlyPriceCents))}/month</span>` : ''}
       <small>On Individual and Team, as many as you like.</small></div>` : '';
-  const computeTerms = compute && packs ? `<p>Compute is the cloud computers agents work on. ${esc(siteName())} runs them for you at ${packs.computePriceMultiplier}× the provider’s list price (a 2 CPU · 2 GB E2B computer is about $0.27 an hour) and stops starting new work when the month’s compute is used up. Computers on your own E2B, Daytona, Fly.io or Hetzner account cost nothing extra and aren’t counted.</p>` : '';
+  const computeTerms = compute && packs ? `<p>Compute is the cloud computers agents work on. ${esc(siteName())} runs them for you at ${packs.computePriceMultiplier}× the provider’s list price (a 2 CPU · 2 GB E2B computer is about $0.27 an hour) and stops starting new work when the month’s compute is used up. Computers on your own E2B, Daytona, Fly.io, Hetzner, AWS or Google Cloud account cost nothing extra and aren’t counted.</p>` : '';
   renderPublicShell('/pricing', `<main class="pricing-page"><div class="legal-kicker">Hosted plans</div><h1>Free, Individual, and Team</h1>
       <p class="legal-summary">Every plan has unlimited projects. “Agents at once” is how many can work at the same time; more wait in line.</p>
       <div class="pricing-grid">${cards}</div>${addOns}

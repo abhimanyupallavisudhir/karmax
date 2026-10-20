@@ -10694,6 +10694,8 @@ function providerDisplayName(provider: string): string {
   if (provider === 'daytona') return 'Daytona';
   if (provider === 'fly') return 'Fly.io';
   if (provider === 'hetzner') return 'Hetzner Cloud';
+  if (provider === 'aws') return 'AWS';
+  if (provider === 'gcp') return 'Google Cloud';
   return provider.charAt(0).toUpperCase() + provider.slice(1);
 }
 

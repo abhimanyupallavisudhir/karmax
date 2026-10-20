@@ -3711,6 +3711,7 @@ html[data-theme="dark"] .github-signin-btn:active,
 .computer-dialog .form-row { margin: 0; }
 .computer-dialog .form-row > span { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; color: var(--ink-2); font-size: 12px; font-weight: 600; }
 .computer-key-link { font-weight: 400; font-size: 12px; }
+.computer-key-file { font-family: var(--mono, ui-monospace, monospace); font-size: 12px; resize: vertical; min-height: 4.5em; }
 .computer-advanced > summary { cursor: pointer; font-size: 12px; font-weight: 600; color: var(--ink-2); }
 .computer-advanced .settings-grid { margin-top: 10px; }
 .computer-dialog .modal-actions { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }

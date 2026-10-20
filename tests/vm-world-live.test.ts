@@ -5,8 +5,11 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { AcpAdapter } from '../src/agent/acp.js';
 import { prewarmRemoteAgentHome } from '../src/agent/remote-process.js';
 import { apiKeyEnv } from '../src/agent/provider-registry.js';
+import { AwsDriver } from '../src/world/aws.js';
 import { FlyDriver } from '../src/world/fly.js';
+import { GcpDriver } from '../src/world/gcp.js';
 import { HetznerDriver } from '../src/world/hetzner.js';
+import { vmProvisionVersion } from '../src/world/vm/provision.js';
 import { VmWorldProvider, type VmDriver } from '../src/world/vm/provider.js';
 import type { ResolvedWorldProviderConnection } from '../src/world/connections.js';
 import type { World, WorldHandle } from '../src/world/types.js';
@@ -14,12 +17,13 @@ import { cleanHetzner, hetznerInventory } from './helpers/hetzner-live.js';
 import { liveEnabled } from './helpers/live-gate.js';
 
 /**
- * VM worlds on the real Fly.io and Hetzner control planes (wiki
+ * VM worlds on the real Fly.io, Hetzner, AWS and Google Cloud control planes (wiki
  * features/vm-worlds). One 100 GB world per provider: a real OpenCode turn
  * writes a tracked file and a Git-ignored one, the world parks (no compute
  * billed) and wakes with both, grows to 150 GB while running with nothing
  * lost, then parks into the provider's slow path (Fly: stopped; Hetzner: the
- * server deleted) and wakes again. Every step's latency and the provider's
+ * server deleted; AWS and Google Cloud: a new instance on the same disk) and
+ * wakes again. Every step's latency and the provider's
  * own usage are printed as one `VM-LIVE` JSON line for the wiki.
  *
  * A Fly organization needs a payment method: on Fly's free trial flyd stops
@@ -30,6 +34,14 @@ import { liveEnabled } from './helpers/live-gate.js';
  * KARMAX_HETZNER_LOCATION, KARMAX_LIVE_VM_REPORT (a file the report line is appended to). Everything the suite creates is deleted at the end
  * (Hetzner's provisioned snapshot, firewall and key too, unless they existed
  * before it ran). About $0.10 of compute and disk per provider.
+ *
+ * AWS: KARMAX_AWS_KEY (`<access key ID>:<secret>`), KARMAX_AWS_REGION; Google
+ * Cloud: KARMAX_GCP_KEY (the service account key file's JSON) or
+ * KARMAX_GCP_KEY_FILE, KARMAX_GCP_ZONE. Both build the provisioned image first
+ * (as a first world would, in the background) unless KARMAX_LIVE_VM_STOCK=1,
+ * which makes the world from stock Debian; an image this run built is deleted
+ * at the end unless KARMAX_LIVE_KEEP_SNAPSHOT=1. Their security group / firewall
+ * rule (free, shared by every world) stays.
  */
 const model = process.env.KARMAX_LIVE_OPENCODE_MODEL ?? 'openai/gpt-5-mini';
 const modelKey = process.env[apiKeyEnv(model.split('/')[0]!)];
@@ -41,13 +53,22 @@ const hetzner: ResolvedWorldProviderConnection = { provider: 'hetzner', apiKey: 
 // refuses volumes over 20 GB in total: KARMAX_LIVE_VM_DISK_GB=10 KARMAX_LIVE_VM_GROW_GB=20.
 const diskGb = Number(process.env.KARMAX_LIVE_VM_DISK_GB ?? 100);
 const growGb = Number(process.env.KARMAX_LIVE_VM_GROW_GB ?? 150);
+const aws: ResolvedWorldProviderConnection = { provider: 'aws', apiKey: process.env.KARMAX_AWS_KEY ?? '',
+  config: { region: process.env.KARMAX_AWS_REGION } };
+const gcp: ResolvedWorldProviderConnection = { provider: 'gcp', apiKey: process.env.KARMAX_GCP_KEY
+  ?? (process.env.KARMAX_GCP_KEY_FILE ? fs.readFileSync(process.env.KARMAX_GCP_KEY_FILE, 'utf8') : ''), config: { region: process.env.KARMAX_GCP_ZONE } };
 const providers = [
   { name: 'Fly.io', connection: fly, driver: () => new FlyDriver() as VmDriver },
   { name: 'Hetzner', connection: hetzner, driver: () => new HetznerDriver() as VmDriver },
+  { name: 'AWS', connection: aws, driver: () => new AwsDriver() as VmDriver },
+  { name: 'Google Cloud', connection: gcp, driver: () => new GcpDriver() as VmDriver },
 ];
+const only = process.env.KARMAX_LIVE_VM_ONLY?.split(',').map((name) => name.trim().toLowerCase());
 
 describe.each(providers)('a live $name VM world', ({ name, connection, driver: makeDriver }) => {
-  const live = liveEnabled() && !!connection.apiKey && !!modelKey;
+  const live = liveEnabled() && !!connection.apiKey && !!modelKey && (!only || only.includes(connection.provider));
+  const cloud = isCloud(connection.provider);
+  let imageExisted = false;
   const driver = makeDriver();
   const provider = new VmWorldProvider(driver, async () => connection);
   const report: Record<string, unknown> = { provider: name, region: connection.config.region ?? 'default', diskGb, growGb };
@@ -91,6 +112,15 @@ describe.each(providers)('a live $name VM world', ({ name, connection, driver: m
       // What a project's first world triggers, done in the open: provision a stock server and snapshot it.
       report.snapshot = await timed('snapshotBuildS', () => driver.ensureSnapshot(connection));
     }
+    if (driver instanceof AwsDriver || driver instanceof GcpDriver) {
+      process.env.KARMAX_AWS_IMAGES = '0'; // built explicitly below, never left running in the background
+      process.env.KARMAX_GCP_IMAGES = '0';
+      if (process.env.KARMAX_LIVE_VM_STOCK !== '1') {
+        const started = Date.now();
+        report.image = await timed('imageBuildS', () => driver.ensureImage(connection));
+        imageExisted = Date.now() - started < 60_000;
+      }
+    }
     handle = undefined as unknown as WorldHandle;
     world = await timed('createS', () => provider.create({ taskId: `live-vm-${Date.now().toString(36)}`, base: 'main', generation: 1,
       organizationId: 'org_live', resources: { cpu: 2, memoryMb: 2048, diskGb } }));
@@ -105,12 +135,16 @@ describe.each(providers)('a live $name VM world', ({ name, connection, driver: m
       // Anything else this run's home label owns (a failed create's leftovers).
       for (const leftover of await provider.listSandboxes().catch(() => [])) await leftover.destroy().catch(() => undefined);
       if (driver instanceof HetznerDriver) await cleanHetzner(connection, before, { builtSnapshot: true });
+      if ((driver instanceof AwsDriver || driver instanceof GcpDriver) && report.image && !imageExisted && process.env.KARMAX_LIVE_KEEP_SNAPSHOT !== '1')
+        await driver.removeImages(connection, (image) => image.version !== vmProvisionVersion()).catch((error) => { report.imageCleanupError = String(error); });
       report.leftovers = (await provider.listSandboxes().catch(() => [])).length;
       console.log(`VM-LIVE ${JSON.stringify(report)}`);
       if (process.env.KARMAX_LIVE_VM_REPORT) fs.appendFileSync(process.env.KARMAX_LIVE_VM_REPORT, `${JSON.stringify({ at: new Date().toISOString(), ...report })}\n`);
     } finally {
       if (previousHome === undefined) delete process.env.KARMAX_HOME; else process.env.KARMAX_HOME = previousHome;
       delete process.env.KARMAX_HETZNER_SNAPSHOTS;
+      delete process.env.KARMAX_AWS_IMAGES;
+      delete process.env.KARMAX_GCP_IMAGES;
       fs.rmSync(home, { recursive: true, force: true });
     }
   }, 30 * 60_000);
@@ -158,10 +192,13 @@ describe.each(providers)('a live $name VM world', ({ name, connection, driver: m
     expect((await world.readFile('node_modules/.cache/kept.txt')).trim()).toBe(`ignored-${marker}`);
   }, 30 * 60_000);
 
-  it.skipIf(!live)('wakes from the slow park too (Hetzner: a new server on the same volume)', async () => {
+  it.skipIf(!live)('wakes from the slow park too (Hetzner: a new server on the same volume; AWS, Google Cloud: a new instance on it)', async () => {
     if (driver instanceof HetznerDriver) process.env.KARMAX_HETZNER_PARK_GRACE = '0';
     try {
       await timed('coldParkS', () => provider.park(handle));
+      // AWS and Google Cloud keep a parked instance; what replaces a broken one is the slow path.
+      if (cloud) await timed('replaceS', () => driver.replace!(connection, sealedRef(handle), handle.meta!.machine as never,
+        { hostPrivateKey: sealedRef(handle).hostPrivateKey!, authorizedKey: sealedRef(handle).clientKey! }));
       world = await timed('coldWakeS', () => provider.open(handle));
     } finally { delete process.env.KARMAX_HETZNER_PARK_GRACE; }
     expect((await world.readFile('notes/agent.txt')).trim()).toBe(marker);
@@ -179,4 +216,11 @@ function summarize(events: Array<{ kind?: string; activeMs: number; costMicros?:
     diskHours: Math.round(sum('disk').reduce((total, event) => total + event.activeMs, 0) / 36_000) / 100,
     diskUsd: sum('disk').reduce((total, event) => total + (event.costMicros ?? 0), 0) / 1e6,
   };
+}
+
+function isCloud(provider: string): boolean { return provider === 'aws' || provider === 'gcp'; }
+
+/** The world's reference (tests seal without a key: `KVMT.` + base64url JSON). */
+function sealedRef(handle: WorldHandle): Record<string, string> {
+  return JSON.parse(Buffer.from(handle.sealedProviderRef!.slice(5), 'base64url').toString());
 }

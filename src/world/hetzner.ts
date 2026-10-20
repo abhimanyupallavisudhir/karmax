@@ -4,9 +4,11 @@ import type { ComputerLimits } from '../domain/computer-limits.js';
 import type { ResolvedWorldProviderConnection } from './connections.js';
 import type { ProviderUsageEvent, WorldLifecycleState } from './types.js';
 import { runDetached, type VmAllocation, type VmBootKeys, type VmDriver, type VmListing, type VmShape } from './vm/provider.js';
-import { VM_ETC, VM_SSH_PORT, VM_USER, vmBootScript, vmProvisionScript, vmProvisionStamp, vmProvisionVersion } from './vm/provision.js';
+import { cloudInit, VM_ETC, VM_SSH_PORT, VM_USER, vmProvisionScript, vmProvisionStamp, vmProvisionVersion } from './vm/provision.js';
 import { generateSshKeyPair, quote, SshTransport } from './vm/ssh.js';
 import { ProviderCapacityFull, ProviderOutage } from '../agent/limits.js';
+
+export { cloudInit };
 
 /**
  * Hetzner Cloud servers as VM worlds (`vm/provider.ts`). The world's files
@@ -734,18 +736,6 @@ function projectLimit(error: unknown): string | undefined {
     if (refusal.error?.code !== 'resource_limit_exceeded') return undefined;
     return refusal.error.details?.limits?.[0]?.name ?? 'resource limit';
   } catch { return undefined; }
-}
-
-/** cloud-init for every server: the boot script (run at every boot), its keys and the volume's device. */
-export function cloudInit(keys: VmBootKeys, device?: string): string {
-  const file = (path: string, content: string, permissions: string) =>
-    `  - path: ${path}\n    permissions: '${permissions}'\n    encoding: b64\n    content: ${Buffer.from(content).toString('base64')}\n`;
-  return `#cloud-config\nwrite_files:\n${[
-    file(`${VM_ETC}/ssh_host_ed25519_key`, keys.hostPrivateKey, '0600'),
-    file(`${VM_ETC}/authorized_keys`, `${keys.authorizedKey}\n`, '0644'),
-    ...(device ? [file(`${VM_ETC}/volume-device`, device, '0644')] : []),
-    file('/var/lib/cloud/scripts/per-boot/karmax-boot.sh', vmBootScript({ foreground: false }), '0755'),
-  ].join('')}`;
 }
 
 /** Milliseconds left of the server's current paid hour (hours count from its creation). */

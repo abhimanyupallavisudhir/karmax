@@ -15,7 +15,7 @@ import { TokenAuthority } from '../platform/tokens.js';
 import { CLOUD_WORLD_PROVIDERS, WorldProviderConnectionService } from '../world/connections.js';
 import { E2BWorldProvider } from '../world/e2b.js';
 import { DaytonaWorldProvider } from '../world/daytona.js';
-import { flyWorldProvider, hetznerWorldProvider } from '../world/vm/providers.js';
+import { awsWorldProvider, flyWorldProvider, gcpWorldProvider, hetznerWorldProvider } from '../world/vm/providers.js';
 import { LocalObjectStore, S3ObjectStore, managedS3Options } from '../store/objects.js';
 import { DeferredDeleteObjectStore, objectDeleteDelayMs } from '../store/deferred-delete.js';
 import { StorageLocationService } from '../store/storage-locations.js';
@@ -57,6 +57,8 @@ export async function createExecutionServices(input: {
     async (organizationId, kind) => (await providerConnections.resolve(organizationId, kind)), undefined, undefined, referenceKeys));
   worlds.register(flyWorldProvider(async (organizationId, kind) => (await providerConnections.resolve(organizationId, kind)), referenceKeys));
   worlds.register(hetznerWorldProvider(async (organizationId, kind) => (await providerConnections.resolve(organizationId, kind)), referenceKeys));
+  worlds.register(awsWorldProvider(async (organizationId, kind) => (await providerConnections.resolve(organizationId, kind)), referenceKeys));
+  worlds.register(gcpWorldProvider(async (organizationId, kind) => (await providerConnections.resolve(organizationId, kind)), referenceKeys));
   if (bootstrap) {
     const unreadable: (string | undefined)[] = [];
     for (const state of ['ready', 'parked', 'hibernated', 'degraded'] as const) {

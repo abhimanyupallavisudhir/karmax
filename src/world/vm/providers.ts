@@ -1,7 +1,10 @@
 import type { ResolvedWorldProviderConnection } from '../connections.js';
 import type { WorldReferenceKeys } from '../reference-keys.js';
+import { AwsDriver } from '../aws.js';
 import { FlyDriver } from '../fly.js';
+import { GcpDriver } from '../gcp.js';
 import { HetznerDriver } from '../hetzner.js';
+import { providerName } from '../connections.js';
 import { VmWorldProvider } from './provider.js';
 
 type Resolver = (organizationId: string | undefined, provider: string) => ResolvedWorldProviderConnection | Promise<ResolvedWorldProviderConnection>;
@@ -10,7 +13,7 @@ type Resolver = (organizationId: string | undefined, provider: string) => Resolv
 function environmentResolver(variable: string, config: () => ResolvedWorldProviderConnection['config']): Resolver {
   return (organizationId, provider) => {
     const apiKey = process.env[variable];
-    if (!apiKey) throw new Error(`${provider === 'fly' ? 'Fly.io' : 'Hetzner Cloud'} is not connected for this organization`);
+    if (!apiKey) throw new Error(`${providerName(provider)} is not connected for this organization`);
     return { organizationId, provider, apiKey, config: config() };
   };
 }
@@ -23,4 +26,14 @@ export function flyWorldProvider(resolve?: Resolver, referenceKeys?: WorldRefere
 export function hetznerWorldProvider(resolve?: Resolver, referenceKeys?: WorldReferenceKeys): VmWorldProvider {
   return new VmWorldProvider(new HetznerDriver(), resolve ?? environmentResolver('HCLOUD_TOKEN', () => ({
     region: process.env.KARMAX_HETZNER_LOCATION, image: process.env.KARMAX_HETZNER_IMAGE })), referenceKeys);
+}
+
+export function awsWorldProvider(resolve?: Resolver, referenceKeys?: WorldReferenceKeys): VmWorldProvider {
+  return new VmWorldProvider(new AwsDriver(), resolve ?? environmentResolver('KARMAX_AWS_KEY', () => ({
+    region: process.env.KARMAX_AWS_REGION, image: process.env.KARMAX_AWS_IMAGE })), referenceKeys);
+}
+
+export function gcpWorldProvider(resolve?: Resolver, referenceKeys?: WorldReferenceKeys): VmWorldProvider {
+  return new VmWorldProvider(new GcpDriver(), resolve ?? environmentResolver('KARMAX_GCP_KEY', () => ({
+    region: process.env.KARMAX_GCP_ZONE, image: process.env.KARMAX_GCP_IMAGE })), referenceKeys);
 }
