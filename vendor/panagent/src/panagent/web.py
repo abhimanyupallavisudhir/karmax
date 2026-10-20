@@ -6,6 +6,7 @@ import ssl
 from html.parser import HTMLParser
 from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
 from . import __version__
@@ -408,6 +409,19 @@ def _chatgpt_content(value: Any, conv: dict[str, Any], index: int) -> list[dict[
     return []
 
 
+_CLAUDE_SHARE_PATH = re.compile(r"^/share/([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})/?$")
+
+
+def claude_snapshot_url(share_url: str) -> str | None:
+    """The JSON a claude.ai share page loads its conversation from. claude.ai serves
+    it only once Cloudflare has checked for a person, so a person saves it."""
+    parsed = urlparse(share_url)
+    match = _CLAUDE_SHARE_PATH.match(parsed.path)
+    if parsed.scheme != "https" or (parsed.hostname or "").lower() not in {"claude.ai", "www.claude.ai"} or not match:
+        return None
+    return f"https://claude.ai/api/chat_snapshots/{match.group(1)}?rendering_mode=messages&render_all_tools=true"
+
+
 def read_claude_share(
     text: str, *, source_uri: str | None = None, conversation: str | None = None, **_: Any
 ) -> dict[str, Any]:
@@ -442,9 +456,11 @@ def read_claude_share(
                 "complete the challenge, then use the browser/export fallback at https://github.com/abhimanyupallavisudhir/panagent/blob/master/docs/browser-export.md"
             )
         if data is None:
+            snapshot = claude_snapshot_url(source_uri) if source_uri else None
+            saved = f"open {snapshot} in your browser, save it and convert that file, " if snapshot else ""
             raise BrowserRequired(
                 "Claude share HTML contained no conversation; it renders only in a browser. Retry with "
-                "--browser headed or --cdp-url, or use the browser/export fallback at https://github.com/abhimanyupallavisudhir/panagent/blob/master/docs/browser-export.md"
+                f"--browser headed or --cdp-url, {saved}or use the browser/export fallback at https://github.com/abhimanyupallavisudhir/panagent/blob/master/docs/browser-export.md"
             )
     account_export = isinstance(data, list)
     if account_export:
@@ -467,7 +483,7 @@ def read_claude_share(
         kind=kind,
         source_uri=source_url,
         conversation_id=str(conversation_id) if conversation_id else None,
-        title=selected.get("name") or selected.get("title"),
+        title=selected.get("name") or selected.get("title") or selected.get("snapshot_name"),
     )
     pending: list[str] = []
     items = selected.get("chat_messages") or selected.get("messages") or []

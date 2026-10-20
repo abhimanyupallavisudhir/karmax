@@ -2104,6 +2104,7 @@ function agentBlockHtml(prefix, spec, opts) {
       <button type="button" class="btn sm af-resume-pick">⌕ Search tasks to fork from…</button>
       <div class="af-resume-chosen" data-resume="${esc(JSON.stringify(spec?.resumeFrom?.taskId ? { taskId: spec.resumeFrom.taskId, role: spec.resumeFrom.role } : null))}">${spec?.resumeFrom?.taskId ? resumeChosenInner(spec.resumeFrom) : ''}</div>
       <input class="af-resume-session" placeholder="${hostLocal() ? '...or paste a provider conversation ID or a ChatGPT, Claude or ' : '...or paste a ChatGPT, Claude or '}${siteNameMarkup()} share link" value="${esc(spec?.resumeFrom?.sessionId || '')}" />
+      <div class="af-resume-hint">${resumeHintInner(spec?.resumeFrom?.sessionId)}</div>
       <div class="af-resume-import-row">
         <label class="btn sm af-resume-upload">Upload conversation<input type="file" accept=".json,.jsonl,application/json,application/x-ndjson" hidden></label>
         <div class="af-resume-uploaded" data-upload="${esc(JSON.stringify(spec?.resumeFrom?.upload || null))}">${spec?.resumeFrom?.upload ? resumeUploadInner(spec.resumeFrom.upload) : ''}</div>
@@ -2464,6 +2465,22 @@ function wireResumeReauthorization(root, host) {
 
 function resumeUploadInner(upload) {
   return `${esc(upload.name || 'Conversation')}<button type="button" class="af-resume-upload-clear" title="Clear">✕</button>`;
+}
+
+// claude.ai shows a share only to a person in a browser (the server gets an
+// empty page; src/agent/panagent.ts claudeShareSnapshotUrl), so a pasted Claude
+// link says where to get the file to upload instead.
+function claudeShareSnapshotUrl(value) {
+  let url;
+  try { url = new URL(String(value || '').trim()); } catch { return ''; }
+  const id = url.pathname.match(/^\/share\/([^/]+)\/?$/)?.[1];
+  if (url.protocol !== 'https:' || !['claude.ai', 'www.claude.ai'].includes(url.hostname.toLowerCase()) || !id) return '';
+  return `https://claude.ai/api/chat_snapshots/${encodeURIComponent(decodeURIComponent(id))}?rendering_mode=messages&render_all_tools=true`;
+}
+
+function resumeHintInner(sessionId) {
+  const snapshot = claudeShareSnapshotUrl(sessionId);
+  return snapshot ? `Claude shows shares only in your browser: <a href="${esc(snapshot)}" target="_blank" rel="noopener noreferrer">open this one</a>, save it, then upload the file.` : '';
 }
 
 // Read an agent box's fork/resume choice back out: the picker's {taskId, role},
@@ -3487,10 +3504,14 @@ function wireAgentBox(box) {
     uploaded.dataset.upload = 'null';
     uploaded.innerHTML = '';
   };
+  const clearSession = () => {
+    if (sessionInput) sessionInput.value = '';
+    box.querySelector('.af-resume-hint')?.replaceChildren();
+  };
   const setResume = (rf, task, session) => {
     if (!chosen) return;
     if (rf) {
-      if (sessionInput) sessionInput.value = '';
+      clearSession();
       clearUpload();
     }
     withdrawReauthorize();
@@ -3532,6 +3553,8 @@ function wireAgentBox(box) {
     }),
   );
   sessionInput?.addEventListener('input', () => {
+    const hint = box.querySelector('.af-resume-hint');
+    if (hint) hint.innerHTML = resumeHintInner(sessionInput.value);
     if (!sessionInput.value.trim()) return;
     clearTask();
     clearUpload();
@@ -3548,7 +3571,7 @@ function wireAgentBox(box) {
     try {
       const upload = await uploadConversationFile(file);
       clearTask();
-      if (sessionInput) sessionInput.value = '';
+      clearSession();
       if (uploaded) {
         uploaded.dataset.upload = JSON.stringify(upload);
         uploaded.innerHTML = resumeUploadInner(upload);

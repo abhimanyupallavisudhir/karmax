@@ -131,6 +131,24 @@ export function publicConversationShare(value: string): ConversationShareLink | 
   return undefined;
 }
 
+/** claude.ai serves a share as an empty app shell that loads the conversation
+ * from this JSON, and serves the JSON only once Cloudflare has checked for a
+ * person (from tavya.io's host and from sandboxes alike, 2026-10-19), so no
+ * server can read a Claude share. The person can: they save this file and
+ * upload it, which also keeps the tool calls the rendered page drops. */
+export function claudeShareSnapshotUrl(share: ConversationShareLink): string | undefined {
+  if (share.format !== 'claude-share') return undefined;
+  const id = new URL(share.url).pathname.slice('/share/'.length).replace(/\/$/, '');
+  return `https://claude.ai/api/chat_snapshots/${encodeURIComponent(id)}?rendering_mode=messages&render_all_tools=true`;
+}
+
+/** Why a share link cannot be imported, and what to upload instead; undefined when it can. */
+export function unreadableShareReason(share: ConversationShareLink): string | undefined {
+  const snapshot = claudeShareSnapshotUrl(share);
+  return snapshot && `claude.ai shows shared chats only in a browser, so ${BRAND} cannot read this link. `
+    + `Open ${snapshot} in your browser, save it (Ctrl+S or ⌘S) and upload that file as the conversation instead.`;
+}
+
 export function looksLikeConversationUrl(value: string): boolean {
   try {
     const url = new URL(value);
@@ -163,6 +181,8 @@ export async function importWithPanagent(opts: PanagentImportOptions): Promise<P
     if ('url' in opts.source) {
       const share = publicConversationShare(opts.source.url);
       if (!share) throw new PanagentError(`Use a public HTTPS ChatGPT, Claude or ${BRAND} share URL`);
+      const unreadable = unreadableShareReason(share);
+      if (unreadable) throw new PanagentError(unreadable);
       const response = await publicFetch(share.url);
       if (response.status === 404 || response.status === 410)
         throw new PanagentError('Share link not found; it may have been deleted or unshared');

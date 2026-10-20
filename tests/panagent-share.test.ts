@@ -25,7 +25,17 @@ describe('Karmax conversation share acquisition', () => {
     await expect(importShare('https://chatgpt.com/share/abc')).rejects.toThrow(/redirects/);
     expect(network.publicFetch).toHaveBeenCalledOnce();
   });
-  it.each(['chatgpt.com', 'claude.ai'])('converts guarded %s HTML locally into context and native history', async host => {
+  // claude.ai serves a share as an empty app shell, and the snapshot JSON the
+  // shell loads only after Cloudflare has checked for a person (verified from
+  // tavya.io's host, 2026-10-19): no server can read one.
+  it('refuses a Claude share link without fetching it, naming the file to upload instead', async () => {
+    const id = 'e510a898-8e59-4423-b613-12c7c5ac37a5';
+    const error = await importShare(`https://claude.ai/share/${id}`).catch((caught) => caught);
+    expect(error.message).toContain(`https://claude.ai/api/chat_snapshots/${id}?rendering_mode=messages&render_all_tools=true`);
+    expect(error.message).toMatch(/only in a browser.*upload/i);
+    expect(network.publicFetch).not.toHaveBeenCalled();
+  });
+  it.each(['chatgpt.com'])('converts guarded %s HTML locally into context and native history', async host => {
     vi.mocked(network.publicFetch).mockImplementation(async () => new Response('<html><div data-message-author-role="user">Guarded share message</div></html>'));
     const result = await importShare(`https://${host}/share/abc`);
     expect(result.kind).toBe('context');
@@ -95,6 +105,36 @@ describe('Karmax conversation share acquisition', () => {
       await revokeShare(store, source.id, 'do');
       await expect(run()).rejects.toThrow(/Unexpected share request/);
       expect(network.publicFetch).toHaveBeenCalledOnce();
+    } finally { await store.close(); }
+  });
+
+  it('fails a task resuming from a Claude share at once, saying how to upload it instead', async () => {
+    const store = await Store.create(':memory:');
+    const { makeCoreActivities } = await import('../src/activities/core.js');
+    const { WorldRegistry } = await import('../src/world/registry.js');
+    const { ProfileResolver } = await import('../src/agent/profiles.js');
+    try {
+      await store.claimPersonalOrganization('owner');
+      const project = await store.createProject('Shares');
+      const task = await store.createTask({ projectId: project.id, title: 'Fork', workflow: 'software-dev',
+        workflowVersion: '1.26.0', params: { prompt: 'x' } });
+      const adapters = new Map([['mock', { provider: 'mock', async runTurn() {
+        throw new Error('the agent must not run');
+      } }]]) as any;
+      const worlds = new WorldRegistry();
+      const core = makeCoreActivities({ store, worlds, adapters, profiles: new ProfileResolver(store, 'mock') } as any);
+      const world = await worlds.create('memory', { taskId: task.id, base: 'main' });
+      try {
+        const error = await core.runAgentTurn({ taskId: task.id, role: 'do', agentTurnId: `${task.id}#0`, agentSlotGranted: true,
+          worldHandle: world.handle, messages: [{ id: 'm1', role: 'user', text: 'continue', ts: 0 }],
+          task: { taskId: task.id, projectId: project.id, title: task.title, prompt: 'x', project: {}, workflow: 'software-dev',
+            agents: { do: { provider: 'mock', resumeFrom: { sessionId: 'https://claude.ai/share/e510a898-8e59-4423-b613-12c7c5ac37a5' } } } },
+        } as any).catch((caught) => caught);
+        expect(error.nonRetryable).toBe(true);
+        expect(error.message).toContain('https://claude.ai/api/chat_snapshots/e510a898-8e59-4423-b613-12c7c5ac37a5?');
+        expect(error.message).toMatch(/back to Draft.*Upload conversation/);
+      } finally { await world.destroy(); }
+      expect(network.publicFetch).not.toHaveBeenCalled();
     } finally { await store.close(); }
   });
 });

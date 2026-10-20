@@ -62,7 +62,7 @@ import { WikiScope, wikiRoot, listWiki, readWikiPage, writeWikiPage, deleteWikiP
 import { copyRemoteWiki, RemoteWikiSnapshots } from '../wiki/remote-snapshot.js';
 import { commitProjectWiki, ensureProjectWikiRepository, mutateAndPublishProjectWiki, projectWikiBranches, projectWikiBranchView, removeProjectWikiRepository, PROJECT_WIKI_BRANCH } from '../wiki/repository.js';
 import { applyAgentSpec, defaultModel, defaultEffort, ProfileResolver, profileVisibleTo, roleDefaultProfile } from '../agent/profiles.js';
-import { looksLikeConversationUrl, publicConversationShare } from '../agent/panagent.js';
+import { looksLikeConversationUrl, publicConversationShare, unreadableShareReason } from '../agent/panagent.js';
 import { hostLocal as deploymentHostLocal } from '../config/deployment.js';
 import { AuthorizationGrantError, LEVEL_AUDIENCES, type AuthorizationGap, type AuthorizationService } from './authorization.js';
 import { PermissionRequests, exactCapability, type PermissionRequest } from './permission-requests.js';
@@ -1041,6 +1041,9 @@ export class KarmaxApi {
       if (typeof sessionId === 'string' && !publicConversationShare(sessionId)
         && !(this.deps.hostLocal ?? deploymentHostLocal()))
         throw new ValidationError(`provider conversation IDs are available only on a host-local ${BRAND}; upload the Codex/Claude conversation file or use a public HTTPS ChatGPT, Claude or ${BRAND} share link`);
+      const share = typeof sessionId === 'string' ? publicConversationShare(sessionId) : undefined;
+      const unreadable = share && unreadableShareReason(share);
+      if (unreadable) throw new ValidationError(unreadable);
       const sourceId = (resumeFrom as Record<string, unknown>).taskId;
       if (typeof sourceId !== 'string' || !sourceId) continue;
       const source = (await this.deps.store.getTask(sourceId));

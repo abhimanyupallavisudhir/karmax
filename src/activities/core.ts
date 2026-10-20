@@ -106,7 +106,7 @@ import { localTaskBrowserUrl, WORLD_CDP_URL } from '../autonomy/task-browser.js'
 import { tokenToInject } from '../autonomy/config-homes.js';
 import { findProviderSession, materializeFork } from '../agent/fork.js';
 import { CodexHistoryError } from '../agent/codex-history.js';
-import { importWithPanagent, reuseNativeImport, stableImportSessionId, looksLikeConversationUrl, publicConversationShare, type PanagentSource } from '../agent/panagent.js';
+import { importWithPanagent, reuseNativeImport, stableImportSessionId, looksLikeConversationUrl, publicConversationShare, unreadableShareReason, type PanagentSource } from '../agent/panagent.js';
 import { publicShare, publicConversationHtml } from '../gateway/conversation-sharing.js';
 import { isRemoteAgentWorld, materializeRemoteSession, prewarmRemoteAgentHome, readRemoteImport, RemoteAgentCliUnavailable } from '../agent/remote-process.js';
 import { checkWorldDisk, diskNotice, diskRatio, diskWasFull, DISK_REARM_RATIO, DISK_WARN_RATIO, isDiskFullMessage, largestWorldPaths,
@@ -2834,6 +2834,15 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (spec.resumeFrom.sessionId && !share && looksLikeConversationUrl(spec.resumeFrom.sessionId)) {
           throw ApplicationFailure.create({
             message: `Use a public HTTPS ChatGPT, Claude or ${BRAND} share link, or upload a conversation file.`,
+            type: 'agent-error',
+            nonRetryable: true,
+          });
+        }
+        // A task created before Claude links were refused at creation says where the file goes.
+        const unreadable = share && unreadableShareReason(share);
+        if (unreadable) {
+          throw ApplicationFailure.create({
+            message: `${unreadable} To use it here, move this task back to Draft and upload it under Fork a previous agent → Upload conversation.`,
             type: 'agent-error',
             nonRetryable: true,
           });
