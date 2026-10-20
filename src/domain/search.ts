@@ -626,6 +626,9 @@ export interface EvalResult {
   /** For a query with a positive `for:` clause: task id → why it needs the people
    *  named (inbox kinds, or `draft`), so a list can say why each row is there. */
   reasons?: Record<string, string[]>;
+  /** Of those, the ones only a task's pull requests make (task id → which and
+   *  what), so a list says it is a pull request asking, not the task. */
+  pullRequestAsks?: Record<string, Array<{ checkout: string; kind: string }>>;
   /** For the same queries: task id → when it last changed for those people
    *  (`updated`'s sort key), which a task's own `statusChangedAt` cannot say. */
   updated?: Record<string, number>;
@@ -676,6 +679,7 @@ export function evaluateQuery(tasks: SearchTask[], query: TaskQuery, ctx: EvalCo
 
   const asked = positiveForUsers(query, ctx);
   let reasons: Record<string, string[]> | undefined;
+  let pullRequestAsks: Record<string, Array<{ checkout: string; kind: string }>> | undefined;
   let updated: Record<string, number> | undefined;
   if (asked.length) {
     reasons = {};
@@ -684,9 +688,13 @@ export function evaluateQuery(tasks: SearchTask[], query: TaskQuery, ctx: EvalCo
       const why = [...new Set(asked.flatMap((u) => attentionReasons(t, u, ctx)))];
       if (why.length) reasons[t.id] = why;
       updated[t.id] = updatedFor(t, ectx);
+      const byPullRequest = asked.flatMap((u) => ctx.attention?.get(u)?.get(t.id)?.pullRequests ?? []);
+      if (byPullRequest.length) (pullRequestAsks ??= {})[t.id] = byPullRequest
+        .filter((ask, i) => byPullRequest.findIndex((other) => other.checkout === ask.checkout && other.kind === ask.kind) === i);
     }
   }
-  return { tasks: out, groups, ...(groupField?.type === 'tag' ? { hierarchical: true } : {}), ...(reasons ? { reasons, updated } : {}), total: out.length };
+  return { tasks: out, groups, ...(groupField?.type === 'tag' ? { hierarchical: true } : {}), ...(reasons ? { reasons, updated } : {}),
+    ...(pullRequestAsks ? { pullRequestAsks } : {}), total: out.length };
 }
 
 /** Every value of every `for:` clause (negated ones too) — what the API resolves. */

@@ -43,6 +43,7 @@ import { newId } from '../util/id.js';
 import { IncomingWebhooks, WebhookConfigError, webhookDeliveryKey, type IncomingWebhook } from '../integrations/incoming-webhooks.js';
 import { isChatPlatform, type ChatPlatform } from '../integrations/chat-platforms.js';
 import { chatThreadKey } from '../integrations/chat-replies.js';
+import { pullRequestOf } from '../domain/pull-requests.js';
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult, EvalContext, TaskGroup, forClauseValues, attentionCandidates } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
 import { providerLabel } from '../domain/computer-limits.js';
@@ -3490,7 +3491,9 @@ export class KarmaxApi {
         ...(subTaskSummaries.length ? { subTaskSummaries } : {}),
         ...(forkSummaries.length ? { forkSummaries } : {}),
         ...(forkSourceSummaries.length ? { forkSourceSummaries } : {}),
-        ...(parent ? { parentTask: { id: parent.id, ...(parent.num != null ? { num: parent.num } : {}), title: parent.title } } : {}),
+        ...(parent ? { parentTask: { id: parent.id, ...(parent.num != null ? { num: parent.num } : {}), title: parent.title,
+          // A pull request of its task (SPEC §11.1) is part of it, not a sub-task.
+          ...(task && pullRequestOf(task) ? { pullRequest: pullRequestOf(task)!.checkout } : {}) } } : {}),
         notes: task?.notes,
         ...(agents ? { agents } : {}),
         ...(task ? { stageTransitions: (await this.availableStageTransitions(task, view, group)) } : {}),
@@ -3946,6 +3949,10 @@ export class KarmaxApi {
       // A saved checkpoint predates the current human hold. Prefer the live PR
       // refs so a recovered Review/Merge can authorize the exact opened heads.
       prs: (view.prs ?? source.prs)?.map((pr) => ({ ...pr })),
+      // The task's own pull requests (v1.30): without them the replacement
+      // would take them for sub-tasks (pramana#102).
+      ...((view.shipments ?? source.shipments)?.length
+        ? { shipments: (view.shipments ?? source.shipments)!.map((shipment) => ({ ...shipment })) } : {}),
       ...(view.landing ? { landing: { ...view.landing, authorizedHeads: { ...(view.landing.authorizedHeads ?? {}) } } } : {}),
       ...(view.pointOfNoReturnPassed ? { pointOfNoReturnPassed: true } : {}),
       resumeStage,
@@ -5618,6 +5625,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       ...result, tasks, total: result.total, offset, limit,
       ...(result.groups ? { groups: prune(result.groups) } : {}),
       ...(result.reasons ? { reasons: Object.fromEntries(Object.entries(result.reasons).filter(([id]) => ids.has(id))) } : {}),
+      ...(result.pullRequestAsks ? { pullRequestAsks: Object.fromEntries(Object.entries(result.pullRequestAsks).filter(([id]) => ids.has(id))) } : {}),
       ...(result.updated ? { updated: Object.fromEntries(Object.entries(result.updated).filter(([id]) => ids.has(id))) } : {}),
       projects: projects.map((project) => ({ id: project.id, name: project.name, slug: slugify(project.name), organizationId: project.organizationId ?? 'org_personal' })),
       tags,
