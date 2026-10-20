@@ -77,11 +77,12 @@ async function open(link: string) {
     const page = await context.newPage();
     const response = await page.goto(link);
     await page.waitForLoadState('load');
-    await page.waitForFunction(() => document.body.dataset.socket, undefined, { timeout: 5_000 }).catch(() => {});
+    // Run in the page (strings: this file is not compiled with the DOM's types).
+    await page.waitForFunction('document.body.dataset.socket', undefined, { timeout: 5_000 }).catch(() => {});
     return { status: response?.status(), url: page.url(),
-      background: await page.evaluate(() => getComputedStyle(document.body).backgroundColor),
-      ran: await page.evaluate(() => document.body.dataset.ran ?? ''),
-      socket: await page.evaluate(() => document.body.dataset.socket ?? '') };
+      background: await page.evaluate<string>('getComputedStyle(document.body).backgroundColor'),
+      ran: await page.evaluate<string>('document.body.dataset.ran ?? ""'),
+      socket: await page.evaluate<string>('document.body.dataset.socket ?? ""') };
   } finally { await context.close(); }
 }
 
