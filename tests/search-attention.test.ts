@@ -109,6 +109,13 @@ describe('for: — order', () => {
     expect(order('for:me')).toEqual(['mentioned-just-now', 'input-recently', 'my-draft', 'reviewed-long-ago']);
   });
 
+  it('says when each row came to them, so a list can show it', () => {
+    expect(evaluateQuery(listed, parseQuery('for:me'), { ...ctx, attention: asks }).updated).toEqual({
+      'mentioned-just-now': NOW - 60e3, 'input-recently': NOW - HOUR, 'my-draft': NOW - 2 * HOUR, 'reviewed-long-ago': NOW - 5 * HOUR,
+    });
+    expect(evaluateQuery(listed, parseQuery(''), { ...ctx, attention: asks }).updated).toBeUndefined();
+  });
+
   it('leaves other lists ordered by status change alone', () => {
     expect(order('')).toEqual(['unrelated-newer', 'input-recently', 'my-draft', 'reviewed-long-ago', 'mentioned-just-now']);
   });

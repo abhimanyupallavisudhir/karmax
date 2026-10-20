@@ -89,6 +89,24 @@ describe.each(storeBackends)('attention asks ($name)', ({ open }) => {
       .toEqual(['review-requested']);
   });
 
+  /** A second reply made the row unread again but kept the first reply's time,
+   * so it stayed below asks that came in between (For me and the bell). */
+  it('a later reply arrives when it is sent, not when the first one was', async () => {
+    const store = await open();
+    const organization = await store.createOrganization({ name: 'Team', ownerUserId: 'owner' });
+    const project = await store.createProject('App', {}, organization.id);
+    const task = await store.createTask({ projectId: project.id, title: 'Replies', workflow: 'software-dev',
+      workflowVersion: '1.0.0', params: { prompt: 'r' }, createdBy: { kind: 'user', userId: 'owner' } });
+    const reply = (ts: number, text: string) => store.appendEvent({ taskId: task.id, type: 'task.mentioned', ts,
+      payload: { recipients: ['user:owner'], by: 'agent:do', text, ask: false } });
+    await reply(1_000, 'First.');
+    for (const item of await store.listInbox('owner', organization.id)) await store.markInbox('owner', item.id, false);
+    await reply(9_000, 'Second.');
+    expect((await store.attentionAsks('owner', organization.id)).get(task.id)!.at).toBe(9_000);
+    const [row] = (await store.listInbox('owner', organization.id)).filter((item) => item.taskId === task.id);
+    expect(row).toMatchObject({ kind: 'mentioned', unread: true, createdAt: 9_000 });
+  });
+
   it('narrows a task read to the candidates and every draft', async () => {
     const store = await open();
     const organization = await store.createOrganization({ name: 'Team', ownerUserId: 'owner' });

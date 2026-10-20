@@ -4708,6 +4708,39 @@ function markTaskCancelling(taskId) {
 function byLastUpdate(a, b) {
   return (b.statusChangedAt || b.createdAt || 0) - (a.statusChangedAt || a.createdAt || 0);
 }
+// Where a task stands for people — stage, and working / needs a person /
+// stalled / finished; a change of it is what `statusChangedAt` records. Mirrors
+// src/domain/list-state.ts: a turn queuing for a slot or paused on its job is
+// still working, or the busiest task would always lead the list.
+function listState(v) {
+  const kind = v.waitingFor?.kind;
+  const phase = v.status === 'active' ? 'working'
+    : v.status !== 'waiting' ? v.status
+    : kind === 'human' ? 'person'
+    : kind === 'account' || kind === 'retry' ? 'stalled' : 'working';
+  return `${v.stage}|${phase}`;
+}
+// When a list row last changed: on For me, when it last came to you (the
+// server's sort key); elsewhere, its last status change.
+function rowTime(t) {
+  return S.searchResult?.updated?.[t.id] ?? t.statusChangedAt ?? t.createdAt;
+}
+// "now", "5m", "3h", "4d", then the date: short enough for every row.
+function fmtWhen(epoch, now = Date.now()) {
+  const m = Math.floor((now - epoch) / 60_000);
+  if (m < 1) return 'now';
+  if (m < 60) return `${m}m`;
+  if (m < 1440) return `${Math.floor(m / 60)}h`;
+  if (m < 7 * 1440) return `${Math.floor(m / 1440)}d`;
+  const date = new Date(epoch);
+  return date.toLocaleDateString([], { month: 'short', day: 'numeric', ...(date.getFullYear() !== new Date(now).getFullYear() ? { year: 'numeric' } : {}) });
+}
+function rowWhen(t) {
+  const at = rowTime(t);
+  if (!at) return '';
+  const full = new Date(at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  return `<time class="row-when" datetime="${new Date(at).toISOString()}" title="Updated ${esc(full)}">${esc(fmtWhen(at))}</time>`;
+}
 
 // Evaluate the working query on the server and stash the result. The default list
 // (empty query) is just an evaluation too. We overlay each result's freshest live
@@ -4943,8 +4976,7 @@ function patchLifecycleView(record, ev) {
     agentTurn,
   }, ev.taskId);
   record.lastView = next;
-  if (previous.stage !== next.stage || previous.status !== next.status || previous.waitingFor?.kind !== next.waitingFor?.kind)
-    record.statusChangedAt = ev.ts || Date.now();
+  if (listState(previous) !== listState(next)) record.statusChangedAt = ev.ts || Date.now();
   // A retrying or accidentally hot-looping workflow can publish an identical
   // compact view many times per second. Updating the in-memory record is cheap;
   // replacing the entire list DOM is not, and can remove a row between pointer
@@ -6904,6 +6936,7 @@ function taskRow(t, { showTags = true, project = false } = {}) {
         <div class="task-sub">${where}<span class="chip">draft</span>${priorityFlag(t)}${showTags ? tagChips(t) : ''}</div>
       </div>
       <div class="task-right">
+        ${rowWhen(t)}
         <button class="btn sm" data-queue="${t.id}">Run task</button>
         <button class="btn sm danger" data-deldraft="${t.id}">Delete</button>
       </div>
@@ -6931,7 +6964,7 @@ function taskRow(t, { showTags = true, project = false } = {}) {
           ${priorityFlag(t)}${showTags ? tagChips(t) : ''}
         </div>
       </div>
-      <div class="task-right">${pipeline(v)}${archiveBtn}</div>
+      <div class="task-right">${rowWhen(t)}${pipeline(v)}${archiveBtn}</div>
     </div>`;
 }
 

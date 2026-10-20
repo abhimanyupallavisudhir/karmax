@@ -99,6 +99,7 @@ import { previewHostname } from '../gateway/previews.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
 import { withPullRequestStates } from '../integrations/github-pr.js';
 import { lifecycleEventPayload } from '../domain/view-publication.js';
+import { listState } from '../domain/list-state.js';
 import { taskForkSourceIds } from '../domain/forks.js';
 
 /** How many dismissals a person's preferences keep (the newest). */
@@ -4734,7 +4735,7 @@ export class Store {
         .run(JSON.stringify(status), JSON.stringify({ messages, transcripts }), taskId));
       (await this.db.prepare('DELETE FROM kv WHERE k=?').run(`retention:view:${taskId}`));
     }
-    if (!prev?.lastView || statusOf(prev.lastView) !== statusOf(view))
+    if (!prev?.lastView || listState(prev.lastView) !== listState(view))
       (await this.db.prepare('UPDATE tasks SET statusChangedAt=? WHERE id=?').run(Date.now(), taskId));
     if (view.stage === 'review' && view.status === 'waiting'
       && (prev?.lastView?.stage !== 'review' || prev.lastView.status !== 'waiting') && prev?.confirmationPolicy) {
@@ -5674,9 +5675,10 @@ export class Store {
       const existing = (await this.db.prepare('SELECT id FROM inbox WHERE userId=? AND taskId=? AND kind=?')
         .get(userId, task.id, kind)) as any;
       if (existing && kind === 'mentioned') {
-        // Another message to them: unread again, and still an ask if either was.
-        (await this.db.prepare(`UPDATE inbox SET eventSeq=?, actionable=CASE WHEN ?=1 THEN 1 ELSE actionable END, unread=1, readAt=NULL${requested ? ', urgency=?' : ''} WHERE id=?`)
-          .run(eventSeq, actionable ? 1 : 0, ...(requested ? [urgencyRank(requested)] : []), existing.id));
+        // Another message to them: unread again, still an ask if either was, and
+        // new — it arrives now, so For me and the bell put it with today's.
+        (await this.db.prepare(`UPDATE inbox SET eventSeq=?, actionable=CASE WHEN ?=1 THEN 1 ELSE actionable END, unread=1, readAt=NULL, createdAt=?${requested ? ', urgency=?' : ''} WHERE id=?`)
+          .run(eventSeq, actionable ? 1 : 0, ev.ts, ...(requested ? [urgencyRank(requested)] : []), existing.id));
         continue;
       }
       if (existing) {
@@ -10775,12 +10777,6 @@ function rowToList(r: any): TaskList {
 }
 function rowToTaskView(row: { lastView?: string; conversation?: string }): TaskView | undefined {
   return row.lastView ? { ...(row.conversation ? JSON.parse(row.conversation) : {}), ...JSON.parse(row.lastView) } : undefined;
-}
-
-/** What a task list shows of where a task is: its stage, status and what it
- *  waits for (not an agent turn coming and going, nor a wait's detail). */
-function statusOf(view: Pick<TaskView, 'stage' | 'status' | 'waitingFor'>): string {
-  return [view.stage, view.status, view.waitingFor?.kind ?? ''].join('|');
 }
 
 function rowToTask(r: any): TaskRecord {

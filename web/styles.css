@@ -433,6 +433,7 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .task-sub .wf { font-family: var(--font-mono); color: var(--ink-2); }
 .task-sub .branch { font-family: var(--font-mono); }
 .task-right { display: flex; align-items: center; gap: 12px; }
+.row-when { color: var(--ink-3); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 
 /* ── real-link rows ─────────────────────────────────────────────
    Rows that open a task (task list, run history, merge/agent queues) are real
