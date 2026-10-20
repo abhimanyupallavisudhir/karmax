@@ -27,6 +27,24 @@ const DRAW_PNG = `(() => {
   return canvas.toDataURL('image/png').split(',')[1];
 })()`;
 
+// The Node tsconfig has no DOM lib: code that needs the DOM runs as a string.
+/** Run in the page: count changes under #main into `globalThis.renders`. */
+const COUNT_RENDERS = `(() => {
+  globalThis.renders = 0;
+  new MutationObserver(() => globalThis.renders++).observe(document.querySelector('#main'), { childList: true, subtree: true });
+})()`;
+
+/** Run in the page: every frame's open viewer size, into `globalThis.viewerSizes`. */
+const RECORD_VIEWER_SIZES = `(() => {
+  const sizes = globalThis.viewerSizes = [];
+  const frame = () => {
+    const dialog = document.querySelector('dialog.artifact-reader');
+    if (dialog?.open) { const r = dialog.getBoundingClientRect(); sizes.push(Math.round(r.width) + 'x' + Math.round(r.height)); }
+    requestAnimationFrame(frame);
+  };
+  requestAnimationFrame(frame);
+})()`;
+
 /**
  * 2026-10-20: a Review image opened once per re-render of the task page — the
  * conversation keeps its unchanged rows, and every render wired the kept
@@ -80,7 +98,7 @@ it('a Review image opens one viewer however often the page re-rendered, and Esca
     // Live events repaint the task page; the conversation keeps the unchanged
     // review row, buttons and all.
     await button.evaluate((el) => { (el as any).marker = true; });
-    await page.evaluate(() => { (globalThis as any).renders = 0; new MutationObserver(() => (globalThis as any).renders++).observe(document.querySelector('#main')!, { childList: true, subtree: true }); });
+    await page.evaluate(COUNT_RENDERS);
     for (let i = 0; i < 6; i++) {
       await store.appendEvent({ type: 'pr.pushed', taskId: task.id, ts: Date.now(), payload: {} });
       await page.waitForTimeout(400);
@@ -91,20 +109,12 @@ it('a Review image opens one viewer however often the page re-rendered, and Esca
     const viewers = page.locator('dialog.artifact-reader');
     const image = page.locator('dialog.artifact-reader img');
     // Every frame's viewer size, from the moment it shows.
-    await page.evaluate(() => {
-      const sizes: string[] = (globalThis as any).viewerSizes = [];
-      const frame = () => {
-        const dialog = document.querySelector('dialog.artifact-reader') as HTMLDialogElement | null;
-        if (dialog?.open) { const r = dialog.getBoundingClientRect(); sizes.push(`${Math.round(r.width)}x${Math.round(r.height)}`); }
-        requestAnimationFrame(frame);
-      };
-      requestAnimationFrame(frame);
-    });
+    await page.evaluate(RECORD_VIEWER_SIZES);
     const open = async () => {
       await page.evaluate(() => { (globalThis as any).viewerSizes.length = 0; });
       await button.click();
       await image.waitFor();
-      await expect.poll(() => image.evaluate((img) => (img as HTMLImageElement).complete && (img as HTMLImageElement).naturalWidth)).toBe(1600);
+      await expect.poll(() => image.evaluate((img: any) => img.complete && img.naturalWidth)).toBe(1600);
     };
 
     await open();
