@@ -70,7 +70,7 @@ function constant(name) {
       constant('URGENCY_LEVELS'), 'const systemNotifications = new Map();',
       ...['updateBell', 'syncNotificationAlerts', 'urgencyRank', 'inboxUnreadCount', 'taskHasUnreadAsk', 'inboxRowLabel', 'inboxTitle', 'urgencyChip',
         'inboxNotices', 'inboxNoticesHtml', 'wireInboxNotices', 'isNewTabClick', 'wireRowLink', 'markInboxItemRead', 'slugify', 'projectSlug', 'projectPath', 'orgSlug', 'projectLabel',
-        'rowKey', 'cursorRows', 'applyCursor', 'moveCursor', 'openListRow', 'isSeries', 'taskRow'].map(fn),
+        'rowKey', 'cursorRows', 'applyCursor', 'moveCursor', 'openListRow', 'isSeries', 'rowTime', 'fmtWhen', 'rowWhen', 'taskRow'].map(fn),
       'renderMain();',
     ].join('\n') });
     await page.evaluate(() => document.fonts.ready);

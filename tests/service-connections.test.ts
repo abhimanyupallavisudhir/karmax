@@ -280,11 +280,15 @@ describe('native MCP connections', () => {
         registration_endpoint: 'https://auth.example/register', response_types_supported: ['code'], code_challenge_methods_supported: ['S256'] });
       if (req.url.endsWith('/register')) return json({ ...JSON.parse(body), client_id: 'client' });
       if (req.url.endsWith('/token')) return json({ access_token: 'access-secret', token_type: 'Bearer', refresh_token: 'refresh-secret', expires_in: 3600 });
-      if (req.url.startsWith('https://registry.modelcontextprotocol.io/')) return json({ servers: [
+      const registry = [
         { server: { name: 'com.example/keyed', version: '1.0.0', remotes: [{ type: 'streamable-http', url: 'https://keyed.example/mcp', headers: [{ name: 'Authorization', isRequired: true, isSecret: true }] }] }, _meta: { 'io.modelcontextprotocol.registry/official': { status: 'active' } } },
         { server: { name: 'com.example/local', version: '1.0.0', packages: [{ registryType: 'npm', identifier: 'local-mcp', version: '1.0.0', transport: { type: 'stdio' } }] }, _meta: { 'io.modelcontextprotocol.registry/official': { status: 'active' } } },
         { server: { name: 'com.example/gmail', title: 'Example Gmail', version: '2.0.0', remotes: [{ type: 'streamable-http', url: 'https://mail.example/mcp' }] }, _meta: { 'io.modelcontextprotocol.registry/official': { status: 'active' } } },
-      ] });
+      ];
+      // As the Official Registry answers: an exact name, or 404; else a page.
+      const exact = req.url.match(/^https:\/\/registry\.modelcontextprotocol\.io\/v0\.1\/servers\/([^/]+)\/versions\/latest$/);
+      if (exact) { const found = registry.find((item) => item.server.name === decodeURIComponent(exact[1]!)); return found ? json(found) : new Response('{}', { status: 404 }); }
+      if (req.url.startsWith('https://registry.modelcontextprotocol.io/')) return json({ servers: registry });
       throw new Error(`Unexpected request ${req.url}`);
     });
   });

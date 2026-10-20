@@ -28,7 +28,7 @@ const DEFAULT_CAPACITY = { activeWorlds: 20, cpu: 40, memoryMb: 81_920, gpu: 0 }
 const STALE_PARKED_LEASE_MS = 2 * 60_000;
 /** Providers whose own control plane reports billable time (`listUsageEvents`):
  * a runner lease there only reserves capacity, and billing it too would charge twice. */
-const PROVIDER_METERED = new Set(['e2b', 'fly', 'hetzner']);
+const PROVIDER_METERED = new Set(['e2b', 'fly', 'hetzner', 'aws', 'gcp']);
 
 /** Durable admission and cost attribution for execution-plane capacity. The DB
  * queue is the source of truth, so a waiting activity can restart on any worker. */

@@ -433,6 +433,7 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .task-sub .wf { font-family: var(--font-mono); color: var(--ink-2); }
 .task-sub .branch { font-family: var(--font-mono); }
 .task-right { display: flex; align-items: center; gap: 12px; }
+.row-when { color: var(--ink-3); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 
 /* ── real-link rows ─────────────────────────────────────────────
    Rows that open a task (task list, run history, merge/agent queues) are real
@@ -941,7 +942,10 @@ a.git-repo-name:hover { color:var(--accent); }
 .tf-head-inner { display: flex; align-items: center; gap: 10px; }
 .tf-head h2 { margin: 0; font-size: 17px; letter-spacing: -0.01em; white-space: nowrap; }
 .tf-crumb { color: var(--ink-3); font-size: 13px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.tf-savestate { margin-left: auto; flex: none; }
+/* The save note, template and workflow sit at the end; the group (not the
+   note, which is hidden while empty) holds them there, so they stay put. */
+.tf-head-end { margin-left: auto; flex: 0 1 auto; min-width: 0; display: flex; align-items: center; gap: 10px; }
+.tf-savestate { flex: none; }
 /* Attempt switcher in the Edit draft bar: the task page's cards, minus the crown. */
 .tf-attempts { flex: 0 100 auto; margin-left: 4px; } /* scrolls before the crumb truncates */
 .tf-attempts .attempt-card { padding-right: 10px; }
@@ -3708,6 +3712,7 @@ html[data-theme="dark"] .github-signin-btn:active,
 .computer-dialog .form-row { margin: 0; }
 .computer-dialog .form-row > span { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; color: var(--ink-2); font-size: 12px; font-weight: 600; }
 .computer-key-link { font-weight: 400; font-size: 12px; }
+.computer-key-file { font-family: var(--mono, ui-monospace, monospace); font-size: 12px; resize: vertical; min-height: 4.5em; }
 .computer-advanced > summary { cursor: pointer; font-size: 12px; font-weight: 600; color: var(--ink-2); }
 .computer-advanced .settings-grid { margin-top: 10px; }
 .computer-dialog .modal-actions { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }

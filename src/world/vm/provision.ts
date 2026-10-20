@@ -45,14 +45,20 @@ if ! id ${VM_USER} > /dev/null 2>&1; then
   useradd -M -d ${VM_HOME} -s /bin/bash -u 1000 ${VM_USER} 2> /dev/null || useradd -M -d ${VM_HOME} -s /bin/bash ${VM_USER}
 fi
 printf '%s\\n' '${VM_USER} ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/karmax-user && chmod 440 /etc/sudoers.d/karmax-user
-# The world's volume is the user's home. Fly mounts it itself; a Hetzner
-# volume is named by the device file cloud-init writes.
+# The world's volume is the user's home. Fly mounts it itself; a Hetzner,
+# AWS or Google Cloud volume is named by the device file the boot delivers.
+# AWS and Google Cloud attach a new volume unformatted: it gets a filesystem
+# once (\`blkid -p\` exits 2 only when the device holds no signature at all).
+# Without its volume the machine never starts sshd, so it reads as broken and
+# is replaced: a world must never run on the root disk instead.
 mkdir -p ${VM_HOME}
 if [ -s "$K/volume-device" ]; then
   device=$(cat "$K/volume-device")
-  for i in $(seq 1 120); do [ -e "$device" ] && break; sleep 0.5; done
+  for i in $(seq 1 360); do [ -e "$device" ] && break; sleep 0.5; done
+  [ -e "$device" ] || { echo "the world's volume $device never appeared" >&2; exit 1; }
+  blkid -p "$device" > /dev/null 2>&1; [ $? = 2 ] && mkfs.ext4 -q -m 0 "$device"
   grep -q " ${VM_HOME} " /etc/fstab || printf '%s ${VM_HOME} ext4 discard,nofail,defaults 0 2\\n' "$device" >> /etc/fstab
-  mountpoint -q ${VM_HOME} || mount ${VM_HOME}
+  mountpoint -q ${VM_HOME} || mount ${VM_HOME} || { echo "could not mount the world's volume $device" >&2; exit 1; }
 fi
 # A volume grown while the machine was off grows its filesystem now.
 source=$(findmnt -no SOURCE ${VM_HOME} 2> /dev/null) && [ -n "$source" ] && resize2fs "$source" > /dev/null 2>&1
@@ -84,6 +90,33 @@ ${options.foreground
     ? "trap 'kill $sshd 2> /dev/null; exit 0' TERM INT\nwhile :; do /usr/sbin/sshd -D -e & sshd=$!; wait $sshd; sleep 1; done"
     : '(systemctl restart ssh || systemctl restart sshd || /usr/sbin/sshd) > /dev/null 2>&1'}
 `;
+}
+
+/** What every boot needs on the machine: its keys, its volume's device, and
+ * the boot script. */
+function bootFiles(keys: { hostPrivateKey: string; authorizedKey: string }, device?: string): Array<[string, string, string]> {
+  return [
+    [`${VM_ETC}/ssh_host_ed25519_key`, keys.hostPrivateKey, '0600'],
+    [`${VM_ETC}/authorized_keys`, `${keys.authorizedKey}\n`, '0644'],
+    ...(device ? [[`${VM_ETC}/volume-device`, device, '0644'] as [string, string, string]] : []),
+    ['/var/lib/cloud/scripts/per-boot/karmax-boot.sh', vmBootScript({ foreground: false }), '0755'],
+  ];
+}
+
+/** cloud-init user data (Hetzner, AWS): the boot files; cloud-init runs the
+ * boot script at every boot from its per-boot directory. */
+export function cloudInit(keys: { hostPrivateKey: string; authorizedKey: string }, device?: string): string {
+  const file = ([path, content, permissions]: [string, string, string]) =>
+    `  - path: ${path}\n    permissions: '${permissions}'\n    encoding: b64\n    content: ${Buffer.from(content).toString('base64')}\n`;
+  return `#cloud-config\nwrite_files:\n${bootFiles(keys, device).map(file).join('')}`;
+}
+
+/** A startup script (Google Cloud, whose Debian images run one at every boot
+ * instead of cloud-init): it writes the boot files, then runs the boot script. */
+export function startupScript(keys: { hostPrivateKey: string; authorizedKey: string }, device?: string): string {
+  const files = bootFiles(keys, device).map(([path, content, permissions]) =>
+    `mkdir -p ${quote(path.replace(/\/[^/]+$/, ''))} && printf %s ${quote(Buffer.from(content).toString('base64'))} | base64 -d > ${quote(path)} && chmod ${permissions} ${quote(path)}`);
+  return `#!/bin/sh\n# karmax VM boot files (src/world/vm/provision.ts)\nset -e\n${files.join('\n')}\nexec /var/lib/cloud/scripts/per-boot/karmax-boot.sh\n`;
 }
 
 /** The render smoke test of `environments/browser`, read when a script is made:

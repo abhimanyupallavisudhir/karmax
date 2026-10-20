@@ -51,7 +51,7 @@ global.attentionChip = () => '';
 global.projectLabel = () => '';
 global.taskHasUnreadAsk = () => false;
 global.markTaskAsksRead = () => {};
-eval(extractFn('taskRow'));
+for (const name of ['rowTime', 'fmtWhen', 'rowWhen', 'taskRow']) eval(extractFn(name));
 
 let pass = 0, fail = 0;
 const ok = (condition, message) => {

@@ -64,7 +64,7 @@ describe('deployment profiles', () => {
     [{ KARMAX_TEMPORAL_ADDRESS: '' }, 'KARMAX_TEMPORAL_ADDRESS must point at a durable Temporal service'],
     [{ KARMAX_S3_BUCKET: undefined }, 'KARMAX_S3_BUCKET is required when KARMAX_OBJECT_STORE=s3'],
     [{ KARMAX_S3_SECRET_ACCESS_KEY: '' }, 'KARMAX_S3_SECRET_ACCESS_KEY is required when KARMAX_OBJECT_STORE=s3'],
-    [{ KARMAX_CLOUD_WORLD_PROVIDER: 'worktree' }, 'KARMAX_CLOUD_WORLD_PROVIDER must be e2b, daytona, fly or hetzner'],
+    [{ KARMAX_CLOUD_WORLD_PROVIDER: 'worktree' }, 'KARMAX_CLOUD_WORLD_PROVIDER must be e2b, daytona, fly, hetzner, aws or gcp'],
     [{ KARMAX_SINGLE_NODE: '1', KARMAX_OBJECT_STORE: 'memory' }, 'single-node KARMAX_OBJECT_STORE must be local or s3'],
   ])('refuses a managed cell with %j', (change, failure) => {
     expect(() => validateDeployment({ ...managedCell(), ...change })).toThrow(`hosted deployment is unsafe:\n- ${failure}`);

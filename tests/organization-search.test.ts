@@ -84,6 +84,9 @@ describe('organization task list', () => {
       expect(titles(body)).toEqual(['ana draft', 'review the app']);
       expect(body.reasons[f.t2.id]).toEqual(['mentioned']);
       expect(body.reasons[f.t4.id]).toEqual(['draft']);
+      // When each row came to her: what the list shows beside it.
+      expect(Object.keys(body.updated).sort()).toEqual([f.t2.id, f.t4.id].sort());
+      expect(Object.values(body.updated).every((at) => typeof at === 'number' && at > 0)).toBe(true);
       // A person by name or email; an unknown name matches nobody.
       expect(titles((await f.call(f.ana, f.org.id, 'q=for:"ana lima"')).body)).toEqual(['ana draft', 'review the app']);
       expect(titles((await f.call(f.ana, f.org.id, 'q=for:ANA@example.com')).body)).toEqual(['ana draft', 'review the app']);

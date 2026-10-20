@@ -281,7 +281,8 @@ function attentionReasons(t: SearchTask, userId: string, ctx?: EvalContext): str
   return [...new Set(out)];
 }
 const projectOf = (t: SearchTask, ctx?: EvalContext) => ctx?.projects?.get(t.projectId);
-/** When the task last changed stage, status or what it waits for. */
+/** When the task last changed stage, or between working, waiting on a person,
+ *  stalled and finished (`listState`). */
 const statusChangedAt = (t: SearchTask) => t.statusChangedAt ?? t.createdAt;
 /** When `t` last changed for the people the query is for: a status change, or
  *  an ask reaching them — so a task that has just come to them leads the list. */
@@ -625,6 +626,9 @@ export interface EvalResult {
   /** For a query with a positive `for:` clause: task id → why it needs the people
    *  named (inbox kinds, or `draft`), so a list can say why each row is there. */
   reasons?: Record<string, string[]>;
+  /** For the same queries: task id → when it last changed for those people
+   *  (`updated`'s sort key), which a task's own `statusChangedAt` cannot say. */
+  updated?: Record<string, number>;
   total: number;
 }
 
@@ -672,14 +676,17 @@ export function evaluateQuery(tasks: SearchTask[], query: TaskQuery, ctx: EvalCo
 
   const asked = positiveForUsers(query, ctx);
   let reasons: Record<string, string[]> | undefined;
+  let updated: Record<string, number> | undefined;
   if (asked.length) {
     reasons = {};
+    updated = {};
     for (const t of out) {
       const why = [...new Set(asked.flatMap((u) => attentionReasons(t, u, ctx)))];
       if (why.length) reasons[t.id] = why;
+      updated[t.id] = updatedFor(t, ectx);
     }
   }
-  return { tasks: out, groups, ...(groupField?.type === 'tag' ? { hierarchical: true } : {}), ...(reasons ? { reasons } : {}), total: out.length };
+  return { tasks: out, groups, ...(groupField?.type === 'tag' ? { hierarchical: true } : {}), ...(reasons ? { reasons, updated } : {}), total: out.length };
 }
 
 /** Every value of every `for:` clause (negated ones too) — what the API resolves. */
