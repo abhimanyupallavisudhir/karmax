@@ -766,6 +766,14 @@ export class VaultItems {
 
   // ── access decision (§5/§7): capability coverage, then item policy ──
 
+  /** The grants for the items `taskId` created: it holds them (see covered), so
+   * it may pass them on to a task it creates. A person's per-task approval
+   * (an extension) is not included — it was given for that task alone. */
+  async createdCaps(taskId: string): Promise<Capability[]> {
+    return (await this.list()).filter((item) => item.provenance.taskId === taskId)
+      .map((item) => `use-credential:item:${item.id}`);
+  }
+
   async covered(caps: Capability[], taskId: string | undefined, item: VaultItem): Promise<boolean> {
     // A task owns credentials it creates. This is deliberately only grant
     // coverage: the item's use/reveal policy still applies, so a same-task

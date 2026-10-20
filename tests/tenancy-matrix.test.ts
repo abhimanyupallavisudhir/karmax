@@ -15,6 +15,11 @@ import { ContributionRegistry } from '../src/contrib/registry.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { findFreePortFrom } from '../src/util/ports.js';
 
+// The public MCP Registry is the same for every tenant and lives on the
+// internet: a slow answer from it timed this matrix out (CI #2182, #2198).
+vi.mock('../src/mcp/connections/registry.js', async (original) => ({ ...(await original<any>()),
+  registrySearch: vi.fn(async () => ({ servers: [] })) }));
+
 /**
  * Every documented route × a caller with full authority in one organization,
  * aimed at another organization's objects (CI-38q). The per-route tenant tests

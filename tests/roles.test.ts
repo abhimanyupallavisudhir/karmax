@@ -318,9 +318,9 @@ describe('prompt preamble (SPEC §5.4)', () => {
     expect(normalizeTriggers({ triggers: [{ kind: 'dependency', tasks: ['task_a'] }] })).toEqual([{ kind: 'dependency', tasks: ['task_a'] }]);
   });
 
-  it('tells agents to grant tasks they create what they need, and to ask for what they cannot grant', () => {
+  it('tells agents to grant tasks they create what they need, and to create them anyway when they cannot (task #716)', () => {
     expect(GLOBAL_INSTRUCTIONS).toContain("If you create a task yourself, don't forget to grant it any authorizations or credentials it needs");
-    expect(GLOBAL_INSTRUCTIONS).toContain('request_permission with its task_id');
+    expect(GLOBAL_INSTRUCTIONS).toContain('create it anyway: it waits while the request goes to someone who can grant them, and starts once they approve');
   });
 });
 

@@ -34,6 +34,7 @@ function harness({ tasks, groups, attempts, agents, failure, mode = 'agent' }) {
     esc: v => String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'),
     viewIdForQuery: () => 'active', queryToolbarHtml: () => '', wireQueryToolbar() {},
     effectiveQuery: q => q, stageLabel: () => 'Done', workflowLabel: () => 'Software',
+    awaitingApproval: t => !!t?.params?.draft && !!t.params._awaitingApproval,
     priorityFlag: () => '', tagChips: () => '', agentRoleLabel: role => role,
     projectById: () => undefined, projectSlug: () => '', projectLabel: () => '',
     setTimeout, clearTimeout, toast: message => errors.push(message),

@@ -45,8 +45,9 @@ export interface PlatformOps {
     /** Level and scope its agent gets, and vault credentials (`use-credential:…`) it may use. */
     authorization?: AuthorizationSelection;
     credentialGrants?: string[];
-    /** Keep what the caller cannot grant as a held draft rather than refusing it. */
-    holdForAuthorization?: boolean }): Promise<{ id: string; authorizationGap?: { next: string } }>;
+    /** Hold what the caller cannot grant for approval (routed at once) rather than refusing it. */
+    holdForAuthorization?: boolean; authorizationAudience?: string[]; authorizationReason?: string }):
+    Promise<{ id: string; authorizationGap?: { next: string }; authorizationRequest?: { id: string; audience: string[] } }>;
   /** Record a project event; armed tasks whose event trigger matches start runs. */
   emitEvent(a: { projectId: string; type: string; key?: string; subject?: string; payload?: Record<string, unknown> }): Promise<unknown>;
   /** Follow project events: each match reaches the task's conversation as a message. */
@@ -372,13 +373,16 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
         authorization: z.object({ level: z.string(), scope: z.enum(['projects', 'organization', 'global']),
           projectIds: z.array(z.string()).optional() }).optional(),
         credentialGrants: z.array(z.string()).optional(),
+        authorizationAudience: z.array(z.string()).optional().describe('Whom to ask for what you cannot grant (default: the lowest level that can).'),
+        authorizationReason: z.string().optional().describe('Why the task needs what you cannot grant, for whoever approves it.'),
         templateId: z.string().optional().describe('Start from this task template (GET /api/projects/:projectId/templates); everything else given overrides it.'),
       },
     },
     async (a) => wrap(async () => {
       const task = await ops.createTask({ ...a, priority: a.priority ? PRIORITY_NAMES.indexOf(a.priority) : undefined,
         holdForAuthorization: true });
-      return task.authorizationGap ? { id: task.id, draft: true, authorizationGap: task.authorizationGap } : task.id;
+      return task.authorizationRequest ? { id: task.id, waitingForApproval: task.authorizationRequest, authorizationGap: task.authorizationGap }
+        : task.authorizationGap ? { id: task.id, draft: true, authorizationGap: task.authorizationGap } : task.id;
     }),
   );
   server.registerTool(

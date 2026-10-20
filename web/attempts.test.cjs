@@ -51,7 +51,8 @@ global.attentionChip = () => '';
 global.projectLabel = () => '';
 global.taskHasUnreadAsk = () => false;
 global.markTaskAsksRead = () => {};
-for (const name of ['rowTime', 'fmtWhen', 'rowWhen', 'taskRow']) eval(extractFn(name));
+for (const name of ['rowTime', 'fmtWhen', 'rowWhen', 'awaitingApproval', 'taskRow', 'taskFormTitle']) eval(extractFn(name));
+global.awaitingApprovalChip = eval(src.match(/const awaitingApprovalChip = ('[^\n]*');/)[1]);
 
 let pass = 0, fail = 0;
 const ok = (condition, message) => {
@@ -100,6 +101,16 @@ ok(archivedDraftRow.includes('data-id="attempt-2"') && !archivedDraftRow.include
   'an archived draft principal opens the logical task page instead of the standalone draft form');
 ok(archivedDraftRow.includes('data-unarchive="attempt-2"') && archivedDraftRow.includes('archived</span>'),
   'an archived draft principal exposes its archived state and Unarchive control');
+
+// Asked to run, held for an approval (task #716): numbered and waiting, not a draft to run.
+const waitingRow = taskRow({ id: 'held', title: 'Deploy', workflow: 'software-dev', num: 15,
+  params: { draft: true, _awaitingApproval: 'areq_1' } });
+ok(waitingRow.includes('waiting for approval') && !waitingRow.includes('>draft<') && !waitingRow.includes('data-queue='),
+  'a task waiting for approval says so and offers no Run task');
+ok(taskFormTitle({ title: 'Deploy', num: 15, params: { draft: true, _awaitingApproval: 'areq_1' } }).includes('#15'),
+  'its page names it by number with what it waits for');
+ok(taskRow({ id: 'd', title: 'Draft', workflow: 'software-dev', params: { draft: true } }).includes('data-queue="d"'),
+  'a plain draft still offers Run task');
 
 // Native links own keyboard and modified-click navigation. The creation action
 // must stay single-flight across rerenders and never pull users back after leaving.

@@ -111,7 +111,10 @@ export interface FieldDef {
  */
 const isArmed = (t: SearchTask): boolean =>
   normalizeTriggers(t.params).length > 0 && t.params?.triggerState !== 'fired' && !t.lastView;
-const status = (t: SearchTask) => t.lastView?.status ?? (isArmed(t) ? 'armed' : 'active');
+/** Asked to run, held until someone approves the authorization its creator could not grant. */
+export const awaitingApproval = (t: { params?: Record<string, unknown> }): boolean =>
+  !!t.params?.draft && !!t.params?._awaitingApproval;
+const status = (t: SearchTask) => t.lastView?.status ?? (awaitingApproval(t) ? 'waiting' : isArmed(t) ? 'armed' : 'active');
 /** The armed-aware status of a task (exported so compact projections agree with search). */
 export function taskStatus(t: SearchTask): string {
   return status(t);
@@ -137,6 +140,7 @@ const PRIORITY_OPTIONS: FieldOption[] = PRIORITIES.map((p, i) => ({ value: Strin
  */
 export const FACET_OPTIONS: FieldOption[] = [
   { value: 'draft', label: 'Draft' },
+  { value: 'awaiting-approval', label: 'Waiting for approval' },
   { value: 'archived', label: 'Archived' },
   { value: 'active', label: 'Running' },
   { value: 'waiting', label: 'Waiting' },
@@ -166,7 +170,8 @@ export const FACET_OPTIONS: FieldOption[] = [
 function facetsOf(t: SearchTask, ctx?: FieldContext): string[] {
   const f: string[] = [];
   const st = status(t);
-  if (t.params?.draft) f.push('draft');
+  if (awaitingApproval(t)) f.push('awaiting-approval');
+  else if (t.params?.draft) f.push('draft');
   if (t.params?.archived) f.push('archived');
   f.push(st);
   if (!['done', 'failed', 'cancelled'].includes(st)) f.push('open');
@@ -271,7 +276,7 @@ function personFor(value: string, ctx?: EvalContext): string | undefined {
   return ctx?.people?.get(v.toLowerCase());
 }
 const ownDraft = (t: SearchTask, userId: string): boolean =>
-  !!t.params?.draft && t.createdBy?.kind === 'user' && t.createdBy.userId === userId;
+  !!t.params?.draft && !awaitingApproval(t) && t.createdBy?.kind === 'user' && t.createdBy.userId === userId;
 /** Why `t` needs `userId`: the kinds of the live asks routed to them (matched on
  *  the attempt or its logical task), plus `draft` for their own draft. */
 function attentionReasons(t: SearchTask, userId: string, ctx?: EvalContext): string[] {

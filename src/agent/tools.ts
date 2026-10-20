@@ -570,6 +570,8 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
           required: ['level', 'scope'],
         },
         credential_grants: { type: 'array', items: { type: 'string' } },
+        authorization_audience: { type: 'array', items: { type: 'string' }, description: 'Whom to ask for what you cannot grant (default: the lowest level that can).' },
+        authorization_reason: { type: 'string', description: 'Why the task needs what you cannot grant, for whoever approves it.' },
       },
       required: ['project_id', 'title', 'prompt'],
     },
@@ -1492,6 +1494,7 @@ export function platformToolHandlers(
         title: args?.title, prompt: args?.prompt, workflow: args?.workflow,
         wikiContext: args?.wiki_context, draft: args?.draft, params: args?.params,
         authorization: args?.authorization, credentialGrants: args?.credential_grants, holdForAuthorization: true,
+        authorizationAudience: args?.authorization_audience, authorizationReason: args?.authorization_reason,
         ...(priority !== undefined ? { priority } : {}), ...(tags ? { tags } : {}),
       });
       return JSON.stringify(created);
