@@ -246,8 +246,8 @@ ok(readResume(box)?.upload?.format === 'codex', 'an uploaded conversation is col
   ok(readResume(box) === undefined || !readResume(box)?.upload, 'a cleared link does not keep what it read');
   ok(resumeCheckHtml({ ok: read }).includes('>Self-location · 8 messages<'), 'what was read is one line: title · messages');
   ok(resumeCheckHtml({ ok: { messages: 1 } }).includes('>1 message<'), 'one message, singular');
-  const failed = resumeCheckHtml({ error: 'Share link not found; it may have been deleted or unshared' });
-  ok(failed.includes('class="af-resume-check err"') && failed.includes('title="Share link not found'), 'an unreadable source says why, in full in its tooltip');
+  const failed = resumeCheckHtml({ error: 'this Gemini share is unavailable; it may have been deleted or unshared' });
+  ok(failed.includes('class="af-resume-check err"') && failed.includes('title="This Gemini share is unavailable'), 'an unreadable source says why, as a sentence, in full in its tooltip');
   ok(resumeCheckHtml().includes('hidden'), 'nothing to say, nothing shown');
   uploaded.dataset.upload = JSON.stringify({ id: 'a'.repeat(64), name: 'session.jsonl', bytes: 42, format: 'codex', projectId: 'project' });
 }

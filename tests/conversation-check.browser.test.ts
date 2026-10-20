@@ -125,7 +125,7 @@ it('reads a pasted share link, refuses an unreadable one, and the queued agent s
     await expect.poll(() => page.locator('#tf-savestate').textContent(), { timeout: 10_000 }).toBe('Draft saved');
     await agent.locator('.af-resume-upload input').setInputFiles({ name: 'notes.json', mimeType: 'application/json',
       buffer: Buffer.from('{"hello": "world"}') });
-    await expect.poll(() => chip.locator('.af-resume-check.err').textContent()).toBe('file is not a recognized Codex or Claude conversation');
+    await expect.poll(() => chip.locator('.af-resume-check.err').textContent()).toBe('File is not a recognized Codex or Claude conversation');
     expect(await chip.getAttribute('data-upload')).toBe('null');
     expect(errors).toEqual([]);
   } finally {

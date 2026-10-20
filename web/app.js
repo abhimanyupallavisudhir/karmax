@@ -2478,7 +2478,10 @@ function resumeUploadInner(upload) {
 function resumeCheckHtml(state) {
   if (!state) return '<div class="af-resume-check" hidden></div>';
   if (state.checking) return '<div class="af-resume-check">Checking…</div>';
-  if (state.error) return `<div class="af-resume-check err" title="${esc(state.error)}">${esc(state.error)}</div>`;
+  if (state.error) {
+    const reason = String(state.error).replace(/^./, (first) => first.toUpperCase());
+    return `<div class="af-resume-check err" title="${esc(reason)}">${esc(reason)}</div>`;
+  }
   const { title, messages, share } = state.ok;
   if (!messages) return '<div class="af-resume-check" hidden></div>';
   const count = `${messages} message${messages === 1 ? '' : 's'}`;
