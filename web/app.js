@@ -2469,8 +2469,8 @@ function wireResumeReauthorization(root, host) {
 function resumeUploadInner(upload) {
   const name = upload.name || 'Conversation';
   const count = upload.messages ? resumeMessageCount(upload) : '';
-  const label = [upload.title || name, count].filter(Boolean).join(' · ');
-  return `<span class="af-resume-upload-name" title="${esc(name)}">${esc(label)}</span><button type="button" class="af-resume-upload-clear" title="Clear">✕</button>`;
+  const label = count ? resumeReadLabel(upload.title || name, count) : `<span class="af-resume-title">${esc(name)}</span>`;
+  return `<span class="af-resume-upload-name" title="${esc(name)}">${label}</span><button type="button" class="af-resume-upload-clear" title="Clear">✕</button>`;
 }
 
 // What was read in a pasted link or an uploaded file (POST /api/conversation-imports…),
@@ -2487,7 +2487,13 @@ function resumeCheckHtml(state) {
   const count = resumeMessageCount(state.ok);
   const tip = partial ? 'The site shows only these first messages to anyone with the link'
     : share ? 'Read now: the agent starts from this copy' : 'Checked: the agent starts from this file';
-  return `<div class="af-resume-check ok" title="${tip}">${esc(title ? `${title} · ${count}` : count)}</div>`;
+  return `<div class="af-resume-check ok" title="${tip}">${resumeReadLabel(title, count)}</div>`;
+}
+
+// A long title gives way; the count stays readable.
+function resumeReadLabel(title, count) {
+  return title ? `<span class="af-resume-title">${esc(title)}</span><span class="af-resume-count"> · ${esc(count)}</span>`
+    : `<span class="af-resume-count">${esc(count)}</span>`;
 }
 
 function resumeMessageCount(read) {

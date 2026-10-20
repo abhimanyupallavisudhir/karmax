@@ -2461,7 +2461,9 @@ html[data-theme="dark"] .github-signin-btn:active,
 .af-resume-panel[hidden] { display: none !important; }
 .af-resume-session { width: 100%; margin-top: 6px; padding: 7px 10px; }
 .af-resume-uploaded .af-resume-check { margin-top: 0; min-width: 0; }
-.af-resume-upload-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.af-resume-upload-name, .af-resume-check.ok { display: flex; min-width: 0; }
+.af-resume-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.af-resume-count { flex: none; white-space: pre; }
 .af-resume-check { margin-top: 6px; overflow: hidden; color: var(--ink-3); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .af-resume-check[hidden] { display: none; }
 .af-resume-check.err { color: var(--danger); }
