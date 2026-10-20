@@ -109,6 +109,13 @@ describe.skipIf(!sshdAvailable)('Google Cloud worlds (fake Compute Engine, real 
     expect(await woken.readFile('cache/kept.txt')).toBe('kept');
   });
 
+  it('parks only once Google says the machine is stopping (it says RUNNING for a moment after the stop)', async () => {
+    const world = await provider.create({ taskId: 'task_lag', base: 'main', generation: 1, organizationId: 'org_g' });
+    gcp.stopLag = 3;
+    await provider.park(world.handle as WorldHandle);
+    expect(await provider.probe(world.handle as WorldHandle)).toBe('parked');
+  });
+
   it('makes a world in the region’s next zone when the first has no capacity, and waits when none has', async () => {
     gcp.noCapacity.add('e2-custom-2-2048@europe-west3-a');
     await provider.create({ taskId: 'task_zone', base: 'main', generation: 1, organizationId: 'org_g' });

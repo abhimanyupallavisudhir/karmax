@@ -11,7 +11,9 @@ type Labels = Record<string, string>;
 interface FakeInstance { name: string; zone: string; status: string; machineType: string; labels: Labels; labelFingerprint: string;
   creationTimestamp: string; lastStartTimestamp?: string; lastStopTimestamp?: string; ip: string; body: any; startup: string;
   serviceAccounts?: unknown; sshd?: LocalSshd; starts: number }
-interface FakeDisk { name: string; zone: string; sizeGb: number; creationTimestamp: string; labels: Labels; users: string[]; type: string; dir: string; image?: string }
+interface FakeDisk { name: string; zone: string; sizeGb: number; creationTimestamp: string; labels: Labels; users: string[]; type: string; dir: string; image?: string;
+  /** Still being created: Google refuses an instance that names it until its operation is done. */
+  creating?: boolean }
 
 /**
  * Google Compute Engine's API (and its OAuth token endpoint and the Cloud
@@ -33,6 +35,9 @@ export class FakeGcp {
   cpuQuota?: number;
   defaultNetwork = true;
   billingDown = false;
+  /** How many reads after a stop still say RUNNING (Google takes a moment to say STOPPING). */
+  stopLag = 0;
+  private stopping = new Map<FakeInstance, number>();
   tokensIssued = 0;
   private ids = 100;
   readonly root = fs.mkdtempSync(path.join(os.tmpdir(), 'fake-gcp-'));
@@ -87,9 +92,15 @@ export class FakeGcp {
 
   private async route(method: string, parts: string[], query: URLSearchParams, body: any): Promise<Response> {
     const notFound = () => json(404, { error: { code: 404, message: `The resource '${parts.join('/')}' was not found`, errors: [{ reason: 'notFound' }] } });
-    if (parts[0] === 'global' && parts[1] === 'operations') return this.operations.has(parts[2]!) ? json(200, this.operations.get(parts[2]!)) : notFound();
+    if (parts[0] === 'global' && parts[1] === 'operations') {
+      const operation = this.operations.get(parts[2]!);
+      if (!operation) return notFound();
+      // A disk is ready once its insert is seen done.
+      for (const disk of this.disks.values()) if (operation.targetLink.endsWith(`/disks/${disk.name}`)) disk.creating = false;
+      return json(200, operation);
+    }
     if (parts[0] === 'regions') return json(200, { name: parts[1], zones: ['a', 'b', 'c'].map((letter) => `https://x/zones/${parts[1]}-${letter}`),
-      quotas: this.cpuQuota !== undefined ? [{ metric: 'CPUS', limit: this.cpuQuota, usage: 0 }] : [] });
+      quotas: this.cpuQuota !== undefined ? [{ metric: 'CPUS', limit: 200, usage: 0 }, { metric: 'E2_CPUS', limit: this.cpuQuota, usage: 0 }] : [] });
     if (parts[0] === 'global' && parts[1] === 'networks') return this.defaultNetwork && parts[2] === 'default' ? json(200, { name: 'default' }) : notFound();
     if (parts[0] === 'global' && parts[1] === 'firewalls') {
       if (method === 'POST') { this.firewalls.push(body); return this.op(`global/firewalls/${body.name}`); }
@@ -118,7 +129,7 @@ export class FakeGcp {
     if (parts[2] === 'disks') {
       if (method === 'POST' && parts.length === 3) {
         const disk: FakeDisk = { name: body.name, zone, sizeGb: Number(body.sizeGb), creationTimestamp: new Date().toISOString(), labels: body.labels ?? {},
-          users: [], type: body.type, dir: path.join(this.root, `disk_${++this.ids}`) };
+          users: [], type: body.type, dir: path.join(this.root, `disk_${++this.ids}`), creating: true };
         fs.mkdirSync(disk.dir);
         this.disks.set(`${zone}/${disk.name}`, disk);
         return this.op(`zones/${zone}/disks/${disk.name}`);
@@ -150,7 +161,9 @@ export class FakeGcp {
         return this.op(target);
       }
       switch (parts[4]) {
-        case 'stop': await this.halt(instance); return this.op(target);
+        case 'stop':
+          if (this.stopLag > 0) { this.stopping.set(instance, this.stopLag); return this.op(target); }
+          await this.halt(instance); return this.op(target);
         case 'start':
           if (this.noCapacity.has(`${instance.machineType.split('/').pop()}@${zone}`))
             return this.op(target, { code: 'ZONE_RESOURCE_POOL_EXHAUSTED', message: `The zone '${zone}' does not have enough resources available to fulfill the request.` });
@@ -161,6 +174,11 @@ export class FakeGcp {
         case 'setLabels':
           if (body.labelFingerprint !== instance.labelFingerprint) return json(412, { error: { code: 412, message: 'Labels fingerprint either invalid or resource labels have changed', errors: [{ reason: 'conditionNotMet' }] } });
           instance.labels = body.labels; instance.labelFingerprint = String(++this.ids); return this.op(target);
+      }
+      const lag = this.stopping.get(instance);
+      if (lag !== undefined) {
+        if (lag > 0) this.stopping.set(instance, lag - 1);
+        else { this.stopping.delete(instance); await this.halt(instance); }
       }
       return json(200, this.instanceView(instance));
     }
@@ -191,6 +209,7 @@ export class FakeGcp {
       } else {
         const home = this.disks.get(`${zone}/${disk.source.split('/').pop()}`);
         if (!home) return json(400, { error: { code: 400, message: `The resource '${disk.source}' was not found`, errors: [{ reason: 'notFound' }] } });
+        if (home.creating) return json(400, { error: { code: 400, message: `The resource 'projects/${this.project}/zones/${zone}/disks/${home.name}' is not ready`, errors: [{ reason: 'resourceNotReady' }] } });
         if (home.users.length) return json(400, { error: { code: 400, message: 'disk in use', errors: [{ reason: 'resourceInUseByAnotherResource' }] } });
         home.users.push(target);
       }

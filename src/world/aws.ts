@@ -282,10 +282,13 @@ export class AwsDriver implements VmDriver {
     await this.ec2(connection)('AttachVolume', { VolumeId: volume.volumeId, InstanceId: instance.instanceId, Device: HOME_DEVICE });
   }
 
+  /** Stop the instance. Returns once EC2 has begun (it says stopping): a
+   * park that returned while it still said running read as not parked. */
   async stop(connection: ResolvedWorldProviderConnection, ref: Record<string, string>): Promise<void> {
     const instance = await this.instanceOf(connection, ref);
-    if (instance && ['pending', 'running'].includes(instance.instanceState.name))
-      await this.ec2(connection)('StopInstances', { InstanceId: [instance.instanceId] });
+    if (!instance || !['pending', 'running'].includes(instance.instanceState.name)) return;
+    await this.ec2(connection)('StopInstances', { InstanceId: [instance.instanceId] });
+    await this.waitInstance(connection, instance.instanceId, ['stopping', 'stopped']);
   }
 
   async destroy(connection: ResolvedWorldProviderConnection, ref: Record<string, string>): Promise<void> {

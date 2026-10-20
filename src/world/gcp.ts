@@ -127,8 +127,9 @@ export class GcpDriver implements VmDriver {
       request.signal?.throwIfAborted();
       const ref = { disk: world, zone, project, world };
       try {
-        await this.call(connection, 'POST', `/zones/${zone}/disks`, { name: world, sizeGb: String(request.shape.diskGb),
-          type: `zones/${zone}/diskTypes/pd-balanced`, labels: { ...labels, [LABELS.karmaxRole!]: 'home' } });
+        // The disk must exist before an instance may name it ("resource … is not ready").
+        await this.operation(connection, await this.call(connection, 'POST', `/zones/${zone}/disks`, { name: world, sizeGb: String(request.shape.diskGb),
+          type: `zones/${zone}/diskTypes/pd-balanced`, labels: { ...labels, [LABELS.karmaxRole!]: 'home' } }));
         await this.insertInstance(connection, zone, world, image.source, request.shape, request.keys, labels);
         return { ref };
       } catch (error) {
@@ -187,10 +188,13 @@ export class GcpDriver implements VmDriver {
     }
   }
 
+  /** Stop the machine. Returns once Google has begun (it says STOPPING): a
+   * park that returned while it still said RUNNING read as not parked. */
   async stop(connection: ResolvedWorldProviderConnection, ref: Record<string, string>): Promise<void> {
     const instance = await this.instance(connection, ref);
-    if (instance && ['PROVISIONING', 'STAGING', 'RUNNING'].includes(instance.status))
-      await this.call(connection, 'POST', `/zones/${ref.zone}/instances/${ref.world}/stop`);
+    if (!instance || !['PROVISIONING', 'STAGING', 'RUNNING'].includes(instance.status)) return;
+    await this.call(connection, 'POST', `/zones/${ref.zone}/instances/${ref.world}/stop`);
+    await this.waitStatus(connection, ref, ['STOPPING', 'TERMINATED', 'SUSPENDING', 'SUSPENDED']);
   }
 
   async destroy(connection: ResolvedWorldProviderConnection, ref: Record<string, string>): Promise<void> {
@@ -289,7 +293,9 @@ export class GcpDriver implements VmDriver {
   /** E2's largest machine, within the region's CPU quota, and a 64 TB disk. */
   async limits(connection: ResolvedWorldProviderConnection): Promise<ComputerLimits> {
     const region = await this.call(connection, 'GET', `/regions/${this.region(connection)}`) as { quotas?: Array<{ metric: string; limit: number }> };
-    const quota = region.quotas?.find((entry) => entry.metric === 'E2_CPUS' || entry.metric === 'CPUS')?.limit;
+    // E2 machines count against both the region's E2 quota and its overall one (a new project: 24 and 200).
+    const quotas = (region.quotas ?? []).filter((entry) => entry.metric === 'E2_CPUS' || entry.metric === 'CPUS').map((entry) => entry.limit);
+    const quota = quotas.length ? Math.min(...quotas) : undefined;
     const cpu = Math.min(E2_MAX_CPU, quota !== undefined && quota >= 2 ? Math.floor(quota / 2) * 2 : E2_MAX_CPU);
     return { cpu, memoryMb: Math.min(E2_MAX_MEMORY_MB, cpu * 8192), diskGb: GCP_MAX_DISK_GB, checkedAt: Date.now() };
   }
