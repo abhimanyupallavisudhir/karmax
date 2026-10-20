@@ -97,7 +97,7 @@ import { DurableEventFanout, type FanoutAudience } from './fanout.js';
 import { affects, authorityChanged, authoritySeq, changedSince, onAuthorityChange, type AuthorityChange, type AuthoritySubject } from '../store/authorization-epoch.js';
 import { AGENT_MAIL_MAX_BYTES, MAIL_FROM_HEADER, MAIL_SIGNATURE_HEADER, MAIL_TO_HEADER, verifyMail } from '../edge/agent-mail-signature.js';
 import { configuredPreviewOrigin, hashPreviewToken, newPreviewToken, previewCookieHeader,
-  previewCookieValue, previewLeaseOrigin, previewLeaseUrl, previewOrigins, previewTokenMatches } from './previews.js';
+  previewCookieValue, previewLeaseUrl, previewOrigins, previewTokenMatches } from './previews.js';
 import type { RemoteAccessController } from '../remote/access.js';
 import { GithubEvents } from '../integrations/github-events.js';
 import { CHAT_CREDENTIALS } from '../integrations/chat-platforms.js';
@@ -1338,11 +1338,11 @@ export class Gateway {
   }
 
   private async upgradePrincipal(req: http.IncomingMessage, url: URL): Promise<string | undefined> {
-    if (url.pathname.startsWith('/preview/')) {
-      const id = url.pathname.match(/^\/preview\/([^/]+)/)?.[1];
-      const lease = id ? await this.deps.store.previewLease(id) : undefined;
+    const preview = await this.previewTarget(req, url);
+    if (preview) {
+      const lease = preview.lease;
       if (!lease || lease.revokedAt || lease.expiresAt <= Date.now()) return;
-      if (configuredPreviewOrigin() && String(req.headers.host ?? '').toLowerCase() !== new URL(previewLeaseOrigin(lease)).host.toLowerCase()) return;
+      if (!preview.ownHost && configuredPreviewOrigin()) return;
       const current = await this.deps.store.currentWorld(lease.worldId);
       if (!current || (current.generation ?? 1) !== lease.generation) return;
       if (lease.tokenHash) {
@@ -1398,8 +1398,8 @@ export class Gateway {
         const principal = await withTimeout(this.upgradePrincipal(req, url), 5000);
         if (!principal || socket.destroyed || this.closing || (socketCounts.get(principal) ?? 0) >= 32) { socket.destroy(); return; }
         const onPreviewOrigin = Boolean(configuredPreviewOrigin() && this.requestIsPreviewOrigin(req));
-        const wss = url.pathname.startsWith('/preview/') && (!configuredPreviewOrigin() || onPreviewOrigin) ? wssPreview
-          : onPreviewOrigin ? undefined : url.pathname === '/ws' ? wssEvents
+        const wss = onPreviewOrigin || (url.pathname.startsWith('/preview/') && !configuredPreviewOrigin()) ? wssPreview
+          : url.pathname === '/ws' ? wssEvents
           : url.pathname === '/ws/terminal' ? wssTerm : url.pathname === '/ws/review-action' ? wssAction : undefined;
         if (!wss) { socket.destroy(); return; }
         socketCounts.set(principal, (socketCounts.get(principal) ?? 0) + 1);
@@ -1729,14 +1729,15 @@ export class Gateway {
     // Repository applications are untrusted. In hosted mode they get an origin
     // that exposes only opaque preview leases, never Karmax API/static routes or
     // the reviewer's authenticated application cookies.
-    if (onPreviewOrigin && !p.startsWith('/preview/')) return this.json(res, 404, { error: 'not found' });
+    if (onPreviewOrigin) return this.serveLeasedPreview(req, res, url);
     if (p.startsWith('/api/') && p !== '/api/health/live' && this.deps.runtimeReady?.() === false)
       return this.json(res, 503, { ok: false, error: 'runtime is not ready', ts: Date.now() });
     if (previewOrigin && !onPreviewOrigin && p.startsWith('/preview/')) {
       const leaseId = p.match(/^\/preview\/([^/]+)/)?.[1];
       if (!leaseId) return this.json(res, 404, { error: 'not found' });
       const id = decodeURIComponent(leaseId);
-      res.writeHead(307, { location: `${previewLeaseOrigin((await this.deps.store.previewLease(id)) ?? id)}${p}${url.search}`, 'referrer-policy': 'no-referrer' });
+      const rest = p.slice(`/preview/${leaseId}`.length) || '/';
+      res.writeHead(307, { location: previewLeaseUrl((await this.deps.store.previewLease(id)) ?? id, `${rest}${url.search}`), 'referrer-policy': 'no-referrer' });
       return void res.end();
     }
     if (p.startsWith('/preview/')) return this.serveLeasedPreview(req, res, url);
@@ -9383,42 +9384,65 @@ export class Gateway {
     } finally { await access?.release(); }
   }
 
-  private async serveLeasedPreview(req: http.IncomingMessage, res: http.ServerResponse, url: URL) {
+  /** The lease a preview request is for, and the application path it asks
+   * for. On a preview origin the host names the lease and the application is
+   * at its root; a link from before that (/preview/<lease>/…) names it by path,
+   * as it does when previews share the console's origin. */
+  private async previewTarget(req: http.IncomingMessage, url: URL): Promise<{ lease?: import('../domain/types.js').PreviewLease; ownHost: boolean;
+    prefixed: boolean; appPath: string } | undefined> {
     const match = url.pathname.match(/^\/preview\/([^/]+)(\/.*)?$/);
-    const lease = match ? (await this.deps.store.previewLease(match[1]!)) : undefined;
-    if (!lease || lease.revokedAt || lease.expiresAt <= Date.now()) return this.previewStopped(req, res, 404, 'preview not found or expired');
-    if (configuredPreviewOrigin() && String(req.headers.host ?? '').toLowerCase() !== new URL(previewLeaseOrigin(lease)).host.toLowerCase())
-      return this.previewStopped(req, res, 404, 'preview not found or expired');
+    const id = (() => { try { return match ? decodeURIComponent(match[1]!) : undefined; } catch { return undefined; } })();
+    if (configuredPreviewOrigin() && this.requestIsPreviewOrigin(req)) {
+      const host = (() => { try { return new URL(`http://${String(req.headers.host ?? '').trim()}`).hostname; } catch { return ''; } })();
+      const lease = await this.deps.store.previewLeaseByHostname(host);
+      const prefixed = !!lease && id === lease.id;
+      return { lease, ownHost: true, prefixed, appPath: prefixed ? (match![2] ?? '/') : url.pathname };
+    }
+    if (!id) return undefined;
+    return { lease: await this.deps.store.previewLease(id), ownHost: false, prefixed: true, appPath: match![2] ?? '/' };
+  }
+
+  private async serveLeasedPreview(req: http.IncomingMessage, res: http.ServerResponse, url: URL) {
+    const target = await this.previewTarget(req, url);
+    const lease = target?.lease;
+    if (!target || !lease || lease.revokedAt || lease.expiresAt <= Date.now()) return this.previewStopped(req, res, 404, 'preview not found or expired');
+    // With a preview origin configured, a lease is served on its own host only.
+    if (!target.ownHost && configuredPreviewOrigin()) return this.previewStopped(req, res, 404, 'preview not found or expired');
     const current = (await this.deps.store.currentWorld(lease.worldId));
     if (!current || (current.generation ?? 1) !== lease.generation) return this.previewStopped(req, res, 410, 'preview world generation is no longer current');
+    const query = new URLSearchParams(url.searchParams);
+    query.delete('token');
+    const appPath = `${target.appPath}${query.size ? `?${query}` : ''}`;
+    const navigation = req.method === 'GET' || req.method === 'HEAD';
+    // On its own host, a link that still names the lease in its path lands at the root.
+    const moved = target.ownHost && target.prefixed;
     if (lease.tokenHash) {
       const queryToken = url.searchParams.get('token') ?? '';
       const cookieToken = previewCookieValue(typeof req.headers.cookie === 'string' ? req.headers.cookie : undefined, lease.id);
       const supplied = queryToken || cookieToken;
       if (!previewTokenMatches(lease.tokenHash, supplied))
         return this.json(res, 401, { error: 'invalid preview token' });
-      // Exchange the URL bearer for an HttpOnly, lease-path-scoped cookie. This
-      // makes relative CSS/JS and HMR sockets work without leaking the token via
-      // Referer, browser history, or application JavaScript.
-      if (queryToken && (req.method === 'GET' || req.method === 'HEAD')) {
-        const query = new URLSearchParams(url.searchParams);
-        query.delete('token');
-        res.writeHead(303, { location: `${url.pathname}${query.size ? `?${query}` : ''}`,
-          'set-cookie': previewCookieHeader(lease.id, queryToken, lease.expiresAt),
+      // Exchange the URL bearer for an HttpOnly cookie (host-only on the lease's
+      // own host). This makes root-relative CSS/JS and HMR sockets work without
+      // leaking the token via Referer, browser history, or application JavaScript.
+      if ((queryToken || moved) && navigation) {
+        res.writeHead(303, { location: moved ? appPath : `${url.pathname}${query.size ? `?${query}` : ''}`,
+          'set-cookie': previewCookieHeader(lease.id, supplied, lease.expiresAt, target.ownHost),
           'cache-control': 'no-store', 'referrer-policy': 'no-referrer' });
         return void res.end();
       }
-      if (queryToken) res.setHeader('set-cookie', previewCookieHeader(lease.id, queryToken, lease.expiresAt));
+      if (queryToken) res.setHeader('set-cookie', previewCookieHeader(lease.id, queryToken, lease.expiresAt, target.ownHost));
     } else {
       const session = await this.auth(req, lease.projectId, lease.organizationId);
       if (!session || !(await this.deps.tokens.check(session.apiToken, 'task:read', { projectId: lease.projectId, taskId: lease.taskId })).ok)
         return this.json(res, 401, { error: 'unauthorized' });
+      if (moved && navigation) {
+        res.writeHead(303, { location: appPath, 'cache-control': 'no-store', 'referrer-policy': 'no-referrer' });
+        return void res.end();
+      }
     }
-    const requestPath = `${match?.[2] ?? '/'}${url.searchParams.has('token')
-      ? (() => { const q = new URLSearchParams(url.searchParams); q.delete('token'); return q.size ? `?${q}` : ''; })()
-      : url.search}`;
-    return this.servePreview(req, res, lease.taskId, lease.port, requestPath,
-      `/preview/${encodeURIComponent(lease.id)}`);
+    return this.servePreview(req, res, lease.taskId, lease.port, appPath,
+      target.ownHost ? '' : `/preview/${encodeURIComponent(lease.id)}`);
   }
 
   /** Authenticated bidirectional proxy for HMR/live-reload sockets in a task
@@ -9433,7 +9457,9 @@ export class Gateway {
     /** The connect-time decision, made again while the socket stays open. */
     let stillAllowed: () => Promise<boolean>;
     let previewProjectId: string | undefined;
-    const taskMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/preview\/(\d+)(\/.*)?$/);
+    // On a preview origin every path belongs to the host's lease's application.
+    const onPreviewOrigin = Boolean(configuredPreviewOrigin() && this.requestIsPreviewOrigin(req));
+    const taskMatch = onPreviewOrigin ? null : url.pathname.match(/^\/api\/tasks\/([^/]+)\/preview\/(\d+)(\/.*)?$/);
     if (taskMatch) {
       if (configuredPreviewOrigin()) { browser.close(4403, 'use isolated preview origin'); return; }
       taskId = decodeURIComponent(taskMatch[1]!);
@@ -9451,8 +9477,8 @@ export class Gateway {
       const query = new URLSearchParams(url.searchParams); query.delete('token');
       requestPath = `${taskMatch[3] ?? '/'}${query.size ? `?${query}` : ''}`;
     } else {
-      const leaseMatch = url.pathname.match(/^\/preview\/([^/]+)(\/.*)?$/);
-      const lease = leaseMatch ? (await this.deps.store.previewLease(leaseMatch[1]!)) : undefined;
+      const preview = await this.previewTarget(req, url);
+      const lease = preview?.lease;
       stillAllowed = async () => {
         const current = await this.deps.store.previewLease(lease!.id);
         if (!current || current.revokedAt || current.expiresAt <= Date.now()) return false;
@@ -9463,9 +9489,7 @@ export class Gateway {
       };
       if (!lease || lease.revokedAt || lease.expiresAt <= Date.now()) { browser.close(4404, 'preview expired'); return; }
       previewProjectId = lease.projectId;
-      if (configuredPreviewOrigin() && String(req.headers.host ?? '').toLowerCase() !== new URL(previewLeaseOrigin(lease)).host.toLowerCase()) {
-        browser.close(4404, 'preview expired'); return;
-      }
+      if (!preview!.ownHost && configuredPreviewOrigin()) { browser.close(4404, 'preview expired'); return; }
       const current = (await this.deps.store.currentWorld(lease.worldId));
       if (!current || (current.generation ?? 1) !== lease.generation) { browser.close(4410, 'world changed'); return; }
       if (lease.tokenHash) {
@@ -9483,7 +9507,7 @@ export class Gateway {
       taskId = lease.taskId;
       port = lease.port;
       const query = new URLSearchParams(url.searchParams); query.delete('token');
-      requestPath = `${leaseMatch?.[2] ?? '/'}${query.size ? `?${query}` : ''}`;
+      requestPath = `${preview!.appPath}${query.size ? `?${query}` : ''}`;
     }
     const task = (await this.deps.store.getTask(taskId));
     const handle = worldHandleForView(task?.lastView, taskId, task ? (await this.deps.store.effectiveProjectConfig(task.projectId)) : undefined);

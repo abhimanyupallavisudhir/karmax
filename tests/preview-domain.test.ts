@@ -40,7 +40,7 @@ describe('preview origins across a move to a new preview domain', () => {
     expect(issued).toMatch(/\.preview\.tavya\.test$/);
     expect(previewLeaseOrigin({ id: 'lease-old', hostname: issued }, env)).toBe(`https://${issued}`);
     expect(previewLeaseUrl({ id: 'lease-old', hostname: issued }, '/app', 'tok', env))
-      .toMatch(/^https:\/\/p-[a-f0-9]{24}\.preview\.tavya\.test\/preview\/lease-old\/app\?token=tok$/);
+      .toMatch(/^https:\/\/p-[a-f0-9]{24}\.preview\.tavya\.test\/app\?token=tok$/);
   });
 
   it('refuses a legacy preview origin that is not https or is the console', () => {
@@ -137,11 +137,11 @@ describe('the gateway serves both preview domains', () => {
     }
   });
 
-  it('sends a console link to the lease\'s own host, without a referrer', async () => {
+  it('sends a console link to the root of the lease\'s own host, without a referrer', async () => {
     for (const lease of [legacyLease, currentLease]) {
       const response = await get(`/preview/${lease.id}/page?x=1`, new URL(url).host);
       expect(response.status).toBe(307);
-      expect(response.headers.location).toBe(`https://${lease.hostname}/preview/${lease.id}/page?x=1`);
+      expect(response.headers.location).toBe(`https://${lease.hostname}/page?x=1`);
       expect(response.headers['referrer-policy']).toBe('no-referrer');
     }
   });
