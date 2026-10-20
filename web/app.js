@@ -6908,6 +6908,10 @@ function runSubRow(r) {
     </div>`;
 }
 
+/** Asked to run, held until someone approves the authorization its creator could not grant. */
+function awaitingApproval(t) { return !!t?.params?.draft && !!t.params._awaitingApproval; }
+const awaitingApprovalChip = '<span class="chip waiting" title="Starts by itself once someone who can grant its authorization approves">waiting for approval</span>';
+
 function taskRow(t, { showTags = true, project = false } = {}) {
   const isDraft = t.params?.draft;
   const archived = t.params?.archived;
@@ -6931,15 +6935,16 @@ function taskRow(t, { showTags = true, project = false } = {}) {
   // so its history remains visible and the task can be unarchived; active special
   // rows retain their direct editing controls.
   if (isDraft && !archived) {
+    const awaiting = awaitingApproval(t);
     return `
     <div class="task-row" data-draft="${t.id}" tabindex="0" role="group" aria-label="${esc(t.title)}">
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</div>
-        <div class="task-sub">${where}<span class="chip">draft</span>${priorityFlag(t)}${showTags ? tagChips(t) : ''}</div>
+        <div class="task-sub">${where}${awaiting ? awaitingApprovalChip : '<span class="chip">draft</span>'}${priorityFlag(t)}${showTags ? tagChips(t) : ''}</div>
       </div>
       <div class="task-right">
         ${rowWhen(t)}
-        <button class="btn sm" data-queue="${t.id}">Run task</button>
+        ${awaiting ? '' : `<button class="btn sm" data-queue="${t.id}">Run task</button>`}
         <button class="btn sm danger" data-deldraft="${t.id}">Delete</button>
       </div>
     </div>`;
@@ -7307,8 +7312,8 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['run'], query 
 
   const rowHtml = (t) => {
     const v = t.lastView || {};
-    const status = v.status || (t.params?.draft ? 'cancelled' : t.params?.triggerState === 'armed' ? 'waiting' : 'active');
-    const chipLabel = t.params?.draft ? 'draft' : t.params?.triggerState === 'armed' ? 'waiting for trigger' : stageLabel(v);
+    const status = v.status || (awaitingApproval(t) || t.params?.triggerState === 'armed' ? 'waiting' : t.params?.draft ? 'cancelled' : 'active');
+    const chipLabel = awaitingApproval(t) ? 'waiting for approval' : t.params?.draft ? 'draft' : t.params?.triggerState === 'armed' ? 'waiting for trigger' : stageLabel(v);
     const open = expanded.has(t.id);
     return `<div class="pick-row" data-nav data-task="${t.id}">
       <div class="task-main">
@@ -8478,6 +8483,8 @@ function taskFormTitle(draft) {
   const p = draft?.params || {};
   if (p.triggerState === 'armed' && !isSeries(p) && draft.num != null)
     return `<span class="task-num">#${draft.num}</span> ${esc(draft.title)} <span class="chip waiting" title="Starts by itself when its trigger fires">${esc(triggerSummary(p.triggers) || 'waiting')}</span>`;
+  if (awaitingApproval(draft) && draft.num != null)
+    return `<span class="task-num">#${draft.num}</span> ${esc(draft.title)} ${awaitingApprovalChip}`;
   return !draft ? 'New task' : p.triggerState === 'armed' || isSeries(p) ? 'Edit task' : 'Edit draft';
 }
 
@@ -9339,7 +9346,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
           releaseFormKeys();
           root.innerHTML = '';
           leavePage(false);
-          toast('Authorization request sent — the task will queue when approved');
+          toast('Waiting for approval — it starts once approved');
           refreshTasks();
           succeeded = true;
           return true;

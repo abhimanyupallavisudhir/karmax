@@ -4943,6 +4943,12 @@ export class Store {
    * A previously queued task that was moved back to drafts keeps its permalink.
    */
   async clearDraft(taskId: string) {
+    return this.numberTask(taskId, true);
+  }
+
+  /** Mint the logical task's number without queueing it: a task asked to run
+   * that waits for someone to approve its authorization first. */
+  async numberTask(taskId: string, clearDraft = false) {
     return this.db.transaction(async () => {
 
     const projectId = await this.taskProjectIdAsync(taskId);
@@ -4957,7 +4963,8 @@ export class Store {
     (await this.db.prepare(`UPDATE tasks SET num = (
       SELECT COALESCE(MAX(num), 0) + 1 FROM tasks WHERE projectId = ?
     ) WHERE id = ? AND num IS NULL`).run(t.projectId, t.intentId ?? t.id));
-    (await this.patchTaskParams(taskId, { draft: false }));
+    // Queued by any route, it no longer waits for an approval to start it.
+    if (clearDraft) (await this.patchTaskParams(taskId, { draft: false, ...(t.params?._awaitingApproval ? { _awaitingApproval: null } : {}) }));
   
     });
   }

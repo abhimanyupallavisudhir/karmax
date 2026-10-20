@@ -1359,10 +1359,14 @@ export class KarmaxApi {
       /** `true` accepts the limited package for the task and every agent; a
        * list accepts it for those participants (`do` is the task's own). */
       acceptAttenuation?: boolean | string[];
-      /** Instead of refusing what the caller cannot grant, keep the task as a
-       * draft held for it and return the gap: the caller then asks someone who
-       * can grant it (`requestPermission` with `taskId`). How agents create tasks. */
+      /** Instead of refusing what the caller cannot grant, hold the task for it:
+       * the request goes to whoever can grant it and approval starts the task
+       * (a deliberate `draft` is only held, and says whom to ask). How agents create tasks. */
       holdForAuthorization?: boolean;
+      /** With holdForAuthorization: whom to ask for what the caller cannot grant
+       * (default: the lowest level that can grant it all), and why. */
+      authorizationAudience?: string[];
+      authorizationReason?: string;
       /** Per-task vault item grants (wiki plans/PLAN-passwords §6): `use-credential:item:…`
        *  / `:tag:…` / `:domain:…` caps layered onto the profile package. */
       credentialGrants?: string[];
@@ -1385,7 +1389,8 @@ export class KarmaxApi {
       templateId?: string;
     },
     receivedAt?: { monoMs: number; wallMs: number },
-  ): Promise<TaskRecord & { authorizationGap?: AuthorizationGap & { participant?: string } }> {
+  ): Promise<TaskRecord & { authorizationGap?: AuthorizationGap & { participant?: string };
+    authorizationRequest?: { id: string; audience: string[] } }> {
     if (args.templateId) {
       const { templateId, ...plain } = args;
       return this.createTask(token, await this.withTemplate(token, templateId, plain), receivedAt);
@@ -1398,10 +1403,28 @@ export class KarmaxApi {
         // Nothing is persisted before a grant is refused, so this is the same
         // task saved as a draft, as the console does before it summons someone.
         if (!(error instanceof AuthorizationGrantError) || !error.gap) throw error;
-        const held = await this.createTask(token, { ...plain, draft: true, allowAttenuation: true }, receivedAt);
+        const { authorizationAudience, authorizationReason, ...task } = plain;
+        const held = await this.createTask(token, { ...task, draft: true, allowAttenuation: true }, receivedAt);
         const { summary, summon } = error.gap;
         const participant = (error as { participant?: string }).participant;
-        return Object.assign(held, { authorizationGap: { ...error.gap, ...(participant ? { participant } : {}),
+        const gap = { ...error.gap, ...(participant ? { participant } : {}) };
+        // Asked to run, it runs: what its creator cannot grant is routed at once to
+        // whoever can, and approval starts it (task #716). A deliberate draft only says whom to ask.
+        if (!plain.draft && (summon || authorizationAudience?.length)) {
+          try {
+            const asked = await this.requestHeldAuthorization(token, held.id, { audience: authorizationAudience,
+              reason: authorizationReason?.trim() || `Grant ${summary} to this task.` });
+            return Object.assign((await this.deps.store.getTask(held.id))!, {
+              authorizationGap: { ...gap, next: `Waiting for approval from ${asked.audience.join(', ')}: `
+                + `you cannot grant ${summary}. Task ${held.id} starts once approved; nothing else to do.` },
+              authorizationRequest: { id: asked.requestId, audience: asked.audience } });
+          } catch (routing) {
+            return Object.assign(held, { authorizationGap: { ...gap, next: `Kept as draft ${held.id}: you cannot grant ${summary}, `
+              + `and asking for it failed (${routing instanceof Error ? routing.message : String(routing)}). `
+              + `Retry with request_permission and task_id "${held.id}".` } });
+          }
+        }
+        return Object.assign(held, { authorizationGap: { ...gap,
           next: summon
             ? `Kept as draft ${held.id}: you cannot grant ${summary}. Ask ${summon} (or an audience you name) to grant it with `
               + `request_permission and task_id "${held.id}"; it starts once approved.`
@@ -4935,6 +4958,12 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       requestedBy: caller.principal,
     }));
     if (input.target.kind === 'task') {
+      // Asked to run once approved: it is no longer a draft to anyone looking at
+      // it, but a numbered task waiting for approval (task #716).
+      if (input.target.queueAfterApproval && (await this.deps.store.getTask(input.target.taskId))?.params?.draft) {
+        (await this.deps.store.patchTaskParams(input.target.taskId, { _awaitingApproval: request.id }));
+        (await this.deps.store.numberTask(input.target.taskId));
+      }
       const event = { taskId: input.target.taskId, type: 'authorization.approval-requested', ts: Date.now(), payload: {
         requestId: request.id, recipients: request.recipients, audience: request.audience,
         authorization: request.authorization, missingCapabilities: request.missingCapabilities,
@@ -4977,6 +5006,14 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     return request;
   }
 
+  /** End a task's wait for this request (approved, denied or dismissed). */
+  private async releaseApprovalWait(request: AuthorizationRequest): Promise<void> {
+    if (request.target.kind !== 'task') return;
+    const task = (await this.deps.store.getTask(request.target.taskId));
+    if (task?.params?._awaitingApproval === request.id)
+      (await this.deps.store.patchTaskParams(task.id, { _awaitingApproval: null }));
+  }
+
   async listAuthorizationRequests(
     token: string,
     input: { organizationId: string; status?: AuthorizationRequest['status']; taskId?: string; avatarId?: string },
@@ -5005,6 +5042,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       throw new CapabilityError('this authorization request was not routed to you');
     if (input.action === 'dismiss') {
       const dismissed = (await service.dismiss(request.id, caller.principal));
+      (await this.releaseApprovalWait(request));
       (await this.deps.store.removeAuthorizationInbox(request.id));
       const event = { taskId: request.target.kind === 'task' ? request.target.taskId : `avatar:${request.target.avatarId}`,
         type: 'authorization.approval-dismissed', ts: Date.now(), payload: { requestId: request.id } };
@@ -5039,6 +5077,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
             { ...requested, authorization: request.authorization }, { acceptAttenuation: false });
         }
         if (request.target.queueAfterApproval) {
+          (await this.releaseApprovalWait(request));
           for (const attempt of attempts) if ((await this.deps.store.getTask(attempt.id))?.params?.draft)
             await this.queueTask(token, attempt.id);
           queued = true;
@@ -5055,6 +5094,8 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       }
     }
     const resolved = (await service.resolve(request.id, input.action, caller.principal, claimId));
+    // Denied: the task goes back to being a draft its creator can change or run with less.
+    if (input.action === 'deny') (await this.releaseApprovalWait(request));
     if (request.target.kind === 'task') {
       const event = { taskId: request.target.taskId, type: 'authorization.approval-resolved', ts: Date.now(), payload: {
         requestId: request.id, action: input.action, resolvedBy: caller.principal, queued,

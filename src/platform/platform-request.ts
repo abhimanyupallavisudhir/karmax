@@ -20,8 +20,9 @@ export const PRIORITY_NAMES = ['none', 'low', 'medium', 'high', 'urgent'] as con
 /** How an agent gives a task it creates what it needs (create_task, both tool surfaces). */
 export const CREATE_TASK_GRANTS = 'Grant it what it needs: `authorization` {level, scope, projectIds?} and vault credentials '
   + '(`use-credential:item:<id>` | `:tag:<tag>` | `:domain:<domain>`), up to what you hold yourself. '
-  + 'What you cannot grant is not refused: the task is kept as a draft and the result names who can grant it; '
-  + 'ask them with request_permission and its task id.';
+  + 'What you cannot grant is not refused: the task waits for approval, the request goes at once to the lowest level that can grant it '
+  + '(or `authorization_audience`, with your `authorization_reason`), and approval starts it — nothing else to do. '
+  + 'A `draft` is only held: ask with request_permission and its task id when it should run.';
 
 /** Whom request_permission asks (KarmaxApi.permissionGrantors), shared by both tool surfaces. */
 export const PERMISSION_ROUTING = 'Audience selectors: task:<id>, avatar:<id>, user:<id>, @team:<slug>, @creator, @maintainers, @admins, @superadmins, @owners, @project, or @all. '
@@ -43,8 +44,8 @@ export function queuedTaskReply(task: { id?: string; parentTaskId?: string; para
 }
 
 /** request_permission's other use: asking for what a task you created is held for. */
-export const REQUEST_FOR_TASK = 'Pass a task id instead to ask for the authorization and credentials a task you created '
-  + 'asked for but you could not grant; you keep working, and a draft starts once they are granted.';
+export const REQUEST_FOR_TASK = 'Pass a task id instead to ask for the authorization and credentials a draft you created '
+  + 'asked for but you could not grant; you keep working, and it starts once they are granted.';
 
 /**
  * The agent roles a task can carry a conversation for. One list so the three
