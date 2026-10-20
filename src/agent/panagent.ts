@@ -16,7 +16,8 @@ const pexec = promisify(execFile);
 const VENDORED_PANAGENT = fileURLToPath(new URL('../../vendor/panagent/src', import.meta.url));
 const MAX_PANAGENT_OUTPUT = 64 * 1024 * 1024;
 
-export type PanagentSource = { url: string } | { data: Buffer; name?: string } | { path: string };
+/** `format` names a share's panagent reader when the data came from a share link. */
+export type PanagentSource = { url: string } | { data: Buffer; name?: string; format?: ShareFormat } | { path: string };
 
 export interface PanagentImportOptions {
   source: PanagentSource;
@@ -111,13 +112,22 @@ export async function exportConversationWithPanagent(opts: {
   }
 }
 
-export type ShareFormat = 'chatgpt-share' | 'claude-share' | 'tavya-share';
+export type ShareFormat = 'chatgpt-share' | 'claude-share' | 'gemini-share' | 'tavya-share';
 export interface ConversationShareLink { url: string; format: ShareFormat; /** A tavya share's id. */ id?: string }
 
 /** tavya (any karmax install) serves shares at an unguessable id below this path. */
 const TAVYA_SHARE_PATH = /^\/share\/conversations\/([A-Za-z0-9_-]{43})$/;
 
-/** A public HTTPS ChatGPT, Claude or tavya share link panagent can import. */
+/** Where a Gemini share link may lead: its short links redirect to gemini.google.com/share/<id>. */
+const GEMINI_SHARE_HOSTS = new Set(['gemini.google.com', 'share.gemini.google', 'g.co']);
+function geminiShareLink(url: URL): boolean {
+  const host = url.hostname.toLowerCase();
+  return (host === 'gemini.google.com' && /^\/share\/[A-Za-z0-9_-]+\/?$/.test(url.pathname))
+    || (host === 'share.gemini.google' && /^\/[A-Za-z0-9_-]+\/?$/.test(url.pathname))
+    || (host === 'g.co' && /^\/gemini\/share\/[A-Za-z0-9_-]+\/?$/.test(url.pathname));
+}
+
+/** A public HTTPS ChatGPT, Claude, Gemini or tavya share link panagent can import. */
 export function publicConversationShare(value: string): ConversationShareLink | undefined {
   let url: URL;
   try { url = publicUrl(value); } catch { return undefined; }
@@ -125,6 +135,7 @@ export function publicConversationShare(value: string): ConversationShareLink | 
   const host = url.hostname.toLowerCase();
   const tavya = url.pathname.match(TAVYA_SHARE_PATH);
   if (tavya) return { url: url.toString(), format: 'tavya-share', id: tavya[1] };
+  if (geminiShareLink(url)) return { url: url.toString(), format: 'gemini-share' };
   if (!url.pathname.startsWith('/share/')) return undefined;
   if (host === 'chatgpt.com' || host === 'www.chatgpt.com') return { url: url.toString(), format: 'chatgpt-share' };
   if (host === 'claude.ai' || host === 'www.claude.ai') return { url: url.toString(), format: 'claude-share' };
@@ -145,7 +156,46 @@ export function claudeShareSnapshotUrl(share: ConversationShareLink): string | u
  * it must also offer ALPN, as guardedFetch does. A bare request is refused. */
 const CLAUDE_SNAPSHOT_HEADERS = { 'user-agent': BRAND, accept: 'application/json', 'sec-fetch-mode': 'navigate' };
 
-async function fetchShare(share: ConversationShareLink): Promise<{ data: Buffer; name: string }> {
+/** The gemini.google.com/share/<id> a Gemini link leads to, following at most
+ * three redirects by hand (publicShareFetch follows none) and only between
+ * Gemini's own hosts. */
+async function geminiShareId(link: string): Promise<string> {
+  let url = new URL(link);
+  for (let hop = 0; ; hop++) {
+    const id = url.hostname === 'gemini.google.com' ? url.pathname.match(/^\/share\/([A-Za-z0-9_-]+)\/?$/)?.[1] : undefined;
+    if (id) return id;
+    if (hop === 3) break;
+    const response = await publicShareFetch(url.toString(), { redirect: 'manual', headers: { 'user-agent': BRAND } });
+    if (response.status === 404 || response.status === 410)
+      throw new PanagentError('Share link not found; it may have been deleted or unshared');
+    const location = response.headers.get('location');
+    if (response.status < 300 || response.status >= 400 || !location) break;
+    url = new URL(location, url);
+    if (url.protocol !== 'https:' || !GEMINI_SHARE_HOSTS.has(url.hostname.toLowerCase()))
+      throw new PanagentError(`This Gemini link leads outside Gemini (${url.hostname})`);
+  }
+  throw new PanagentError('This Gemini link did not lead to a gemini.google.com/share/ conversation');
+}
+
+/** Gemini's share page carries no conversation; the page asks this RPC, which
+ * answers anyone (panagent vendor/web.py gemini_share_request, the same request). */
+async function fetchGeminiShare(share: ConversationShareLink): Promise<Response> {
+  const id = await geminiShareId(share.url);
+  const body = new URLSearchParams({ 'f.req': JSON.stringify([[['ujx1Bf', JSON.stringify([null, id, [4]]), null, 'generic']]]) });
+  return publicShareFetch(`https://gemini.google.com/_/BardChatUi/data/batchexecute?rpcids=ujx1Bf&source-path=%2Fshare%2F${id}&hl=en-US&rt=c`, {
+    method: 'POST', body,
+    headers: { 'user-agent': BRAND, 'content-type': 'application/x-www-form-urlencoded;charset=utf-8', 'x-same-domain': '1' },
+  });
+}
+
+/** A share link's conversation as panagent reads it: the page, or for Claude
+ * and Gemini the data their pages load. */
+export async function fetchShare(share: ConversationShareLink): Promise<{ data: Buffer; name: string }> {
+  if (share.format === 'gemini-share') {
+    const response = await fetchGeminiShare(share);
+    if (!response.ok) throw new PanagentError(`Gemini returned HTTP ${response.status} for this share`);
+    return { data: Buffer.from(await response.arrayBuffer()), name: 'share.txt' };
+  }
   const snapshot = claudeShareSnapshotUrl(share);
   const response = await (snapshot ? publicShareFetch(snapshot, { headers: CLAUDE_SNAPSHOT_HEADERS }) : publicShareFetch(share.url));
   if (response.status === 404 || response.status === 410)
@@ -189,14 +239,15 @@ export async function importWithPanagent(opts: PanagentImportOptions): Promise<P
     const format: string[] = [];
     if ('url' in opts.source) {
       const share = publicConversationShare(opts.source.url);
-      if (!share) throw new PanagentError(`Use a public HTTPS ChatGPT, Claude or ${BRAND} share URL`);
+      if (!share) throw new PanagentError(`Use a public HTTPS ChatGPT, Claude, Gemini or ${BRAND} share URL`);
       const fetched = await fetchShare(share);
       source = path.join(temporary, fetched.name);
       fs.writeFileSync(source, fetched.data, { mode: 0o600 });
       format.push('--from', share.format);
     }
     if ('data' in opts.source) fs.writeFileSync(source, opts.source.data, { mode: 0o600 });
-    if (!('url' in opts.source)) {
+    if ('data' in opts.source && opts.source.format) format.push('--from', opts.source.format);
+    else if (!('url' in opts.source)) {
       const raw = fs.readFileSync(source);
       const content = 'data' in opts.source && raw.subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf])) ? raw.subarray(3) : raw;
       if (opts.native && opts.provider === 'claude') {
@@ -262,6 +313,27 @@ export async function importWithPanagent(opts: PanagentImportOptions): Promise<P
         ].join('\n'),
       },
     };
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+}
+
+/** What panagent reads in a conversation: its title and how many messages. It
+ * converts exactly as an agent's first turn will, so a source that passes here
+ * imports there. */
+export async function summarizeConversation(data: Buffer, name: string, format?: ShareFormat):
+  Promise<{ title?: string; messages: number }> {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-panagent-check-'));
+  try {
+    const source = path.join(temporary, safeSourceName(name));
+    const output = path.join(temporary, 'conversation.agent.json');
+    fs.writeFileSync(source, data, { mode: 0o600 });
+    await runPanagent(['convert', source, ...(format ? ['--from', format] : []), '--to', 'ir', '--browser', 'never', '--quiet', '-o', output],
+      path.join(temporary, 'report.json'));
+    const ir = JSON.parse(fs.readFileSync(output, 'utf8'));
+    const messages = Array.isArray(ir.messages) ? ir.messages.length : 0;
+    if (!messages) throw new PanagentError('This conversation has no messages');
+    return { ...(typeof ir.title === 'string' && ir.title.trim() ? { title: ir.title.trim().slice(0, 200) } : {}), messages };
   } finally {
     fs.rmSync(temporary, { recursive: true, force: true });
   }

@@ -31,7 +31,7 @@ def _session_id(value: str) -> str:
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
         prog="panagent",
-        description="Move conversations between Claude Code, Codex, ChatGPT, Claude and tavya through a provenance-preserving neutral format.",
+        description="Move conversations between Claude Code, Codex, ChatGPT, Claude, Gemini and tavya through a provenance-preserving neutral format.",
     )
     result.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     subparsers = result.add_subparsers(dest="command", required=True)

@@ -42,6 +42,7 @@ eval(extractFn('agentRoleLabel'));
 eval(extractFn('taskRecord'));
 eval(extractFn('resumeChosenInner'));
 eval(extractFn('resumeUploadInner'));
+eval(extractFn('resumeCheckHtml'));
 eval(extractFn('mcpPickerHtml'));
 eval(extractFn('renderAgentField'));
 eval(extractFn('agentBlockHtml'));
@@ -100,12 +101,12 @@ const closed = renderAgentField({ role: 'do', name: 'agent:do' }, undefined, { p
 ok(closed.includes('type="checkbox" class="af-resume-enabled"'), 'fork disclosure is a checkbox');
 ok(closed.includes('class="af-resume-panel" hidden'), 'unchecked fork panel starts collapsed');
 ok(!closed.includes('<details class="af-resume') && closed.includes('af-resume-enabled'), 'fork choice uses its explicit toggle');
-ok(closed.includes('provider conversation ID or a ChatGPT, Claude or tavya share link'), 'a local console advertises provider ids and share links');
+ok(closed.includes('paste a share link or provider conversation ID') && closed.includes('title="ChatGPT, Claude, Gemini or tavya"'), 'a local console advertises provider ids and share links, naming the apps in the tooltip');
 ok(closed.includes('Upload conversation'), 'conversation upload is offered without another panel');
 
 S.meta.hostLocal = false;
 const hosted = renderAgentField({ role: 'do', name: 'agent:do' }, undefined, { provider: 'claude' });
-ok(hosted.includes('paste a ChatGPT, Claude or tavya share link'), 'a nonlocal console still advertises share links');
+ok(hosted.includes('paste a share link"'), 'a nonlocal console still advertises share links');
 ok(!hosted.includes('provider conversation ID'), 'a nonlocal console does not advertise inaccessible provider ids');
 S.meta.hostLocal = true;
 
@@ -233,6 +234,23 @@ ok(chosen.dataset.resume === 'null', 'typing an id or link clears the task sourc
 sessionInput.value = '';
 uploaded.dataset.upload = JSON.stringify({ id: 'a'.repeat(64), name: 'session.jsonl', bytes: 42, format: 'codex', projectId: 'project' });
 ok(readResume(box)?.upload?.format === 'codex', 'an uploaded conversation is collected as the sole source');
+{
+  const link = 'https://gemini.google.com/share/50a32fbbfd3c';
+  const read = { id: 'b'.repeat(64), name: 'share.txt', bytes: 9, format: 'gemini-share', projectId: 'project', share: link, title: 'Self-location', messages: 8 };
+  uploaded.dataset.upload = JSON.stringify(read);
+  sessionInput.value = link;
+  ok(readResume(box)?.upload?.share === link && !readResume(box).sessionId, 'a checked link is collected as what was read');
+  sessionInput.value = 'https://gemini.google.com/share/other';
+  ok(readResume(box)?.sessionId === 'https://gemini.google.com/share/other', 'an edited link is sent as typed, for the server to check');
+  sessionInput.value = '';
+  ok(readResume(box) === undefined || !readResume(box)?.upload, 'a cleared link does not keep what it read');
+  ok(resumeCheckHtml({ ok: read }).includes('>Self-location · 8 messages<'), 'what was read is one line: title · messages');
+  ok(resumeCheckHtml({ ok: { messages: 1 } }).includes('>1 message<'), 'one message, singular');
+  const failed = resumeCheckHtml({ error: 'Share link not found; it may have been deleted or unshared' });
+  ok(failed.includes('class="af-resume-check err"') && failed.includes('title="Share link not found'), 'an unreadable source says why, in full in its tooltip');
+  ok(resumeCheckHtml().includes('hidden'), 'nothing to say, nothing shown');
+  uploaded.dataset.upload = JSON.stringify({ id: 'a'.repeat(64), name: 'session.jsonl', bytes: 42, format: 'codex', projectId: 'project' });
+}
 enabled.checked = false;
 listeners.get('enabled:change')();
 ok(panel.hidden && !ref.disabled, 'unchecking collapses the panel and unlocks provider customization');

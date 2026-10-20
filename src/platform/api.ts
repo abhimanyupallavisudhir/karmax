@@ -62,7 +62,8 @@ import { WikiScope, wikiRoot, listWiki, readWikiPage, writeWikiPage, deleteWikiP
 import { copyRemoteWiki, RemoteWikiSnapshots } from '../wiki/remote-snapshot.js';
 import { commitProjectWiki, ensureProjectWikiRepository, mutateAndPublishProjectWiki, projectWikiBranches, projectWikiBranchView, removeProjectWikiRepository, PROJECT_WIKI_BRANCH } from '../wiki/repository.js';
 import { applyAgentSpec, defaultModel, defaultEffort, ProfileResolver, profileVisibleTo, roleDefaultProfile } from '../agent/profiles.js';
-import { looksLikeConversationUrl, publicConversationShare } from '../agent/panagent.js';
+import { looksLikeConversationUrl, PanagentError, publicConversationShare } from '../agent/panagent.js';
+import { importConversationShare } from '../agent/conversation-sources.js';
 import { hostLocal as deploymentHostLocal } from '../config/deployment.js';
 import { AuthorizationGrantError, LEVEL_AUDIENCES, type AuthorizationGap, type AuthorizationService } from './authorization.js';
 import { PermissionRequests, exactCapability, type PermissionRequest } from './permission-requests.js';
@@ -426,6 +427,8 @@ export interface KarmaxApiDeps {
   /** The world lifecycle sweep, which frees a task's computer on request. */
   worldLifecycle?: Pick<import('../world/runners.js').WorldLifecycleManager, 'release'>;
   resources?: ProjectResourceService;
+  /** Where checked conversation sources are kept (conversation imports). */
+  objects?: import('../store/objects.js').ObjectStore;
   broker?: CredentialBroker;
   githubApp?: import('../integrations/github-app.js').GitHubAppService;
   /** Wake live gateway subscribers when platform-side actions append events. The
@@ -1019,7 +1022,8 @@ export class KarmaxApi {
    * already models the intended check; this closes the same door on the raw
    * params path (POST /api/tasks, PATCH /api/tasks/:id/params).
    */
-  private async validateAndAuthorizeResumeSources(token: string, params: Record<string, unknown> | undefined): Promise<void> {
+  private async validateAndAuthorizeResumeSources(token: string, params: Record<string, unknown> | undefined,
+    projectId: string): Promise<void> {
     // Every agent spec can carry the pointer: the `agent:*` roles, each
     // Confirm-agent layer (and the legacy single-gate `{mode:'agent'}`), and
     // the Responder. Walk them by shape so a renamed field cannot slip past.
@@ -1037,10 +1041,26 @@ export class KarmaxApi {
       const sessionId = (resumeFrom as Record<string, unknown>).sessionId;
       if (sessionId !== undefined && (typeof sessionId !== 'string' || !sessionId.trim()
         || (looksLikeConversationUrl(sessionId) && !publicConversationShare(sessionId))))
-        throw new ValidationError(`use a public HTTPS ChatGPT, Claude or ${BRAND} share link or upload a conversation file`);
+        throw new ValidationError(`use a public HTTPS ChatGPT, Claude, Gemini or ${BRAND} share link or upload a conversation file`);
       if (typeof sessionId === 'string' && !publicConversationShare(sessionId)
         && !(this.deps.hostLocal ?? deploymentHostLocal()))
-        throw new ValidationError(`provider conversation IDs are available only on a host-local ${BRAND}; upload the Codex/Claude conversation file or use a public HTTPS ChatGPT, Claude or ${BRAND} share link`);
+        throw new ValidationError(`provider conversation IDs are available only on a host-local ${BRAND}; upload the Codex/Claude conversation file or use a public HTTPS ChatGPT, Claude, Gemini or ${BRAND} share link`);
+      // A share link is read now, as the task form reads one, and replaced by
+      // what was read: an unreadable link never reaches a turn (lvpm#4), and the
+      // turn starts from this copy instead of fetching it again.
+      if (typeof sessionId === 'string' && publicConversationShare(sessionId)) {
+        try {
+          const upload = await importConversationShare({ store: this.deps.store, objects: this.deps.objects }, projectId, sessionId);
+          delete (resumeFrom as Record<string, unknown>).sessionId;
+          (resumeFrom as Record<string, unknown>).upload = upload;
+        } catch (error) {
+          if (error instanceof PanagentError) throw new ValidationError(error.message);
+          throw error;
+        }
+      }
+      const upload = (resumeFrom as Record<string, unknown>).upload as { id?: unknown; projectId?: unknown } | undefined;
+      if (upload !== undefined && (!upload || typeof upload.id !== 'string' || upload.projectId !== projectId))
+        throw new ValidationError('that uploaded conversation belongs to another project; upload it here again');
       const sourceId = (resumeFrom as Record<string, unknown>).taskId;
       if (typeof sourceId !== 'string' || !sourceId) continue;
       const source = (await this.deps.store.getTask(sourceId));
@@ -1478,7 +1498,7 @@ export class KarmaxApi {
     (await this.normalizeTaskComputer(project, taskOverrides));
     // A `resumeFrom` pointer reads another task's conversation — authorize it
     // against that task's project before anything is created.
-    (await this.validateAndAuthorizeResumeSources(token, taskOverrides));
+    (await this.validateAndAuthorizeResumeSources(token, taskOverrides, args.projectId));
     (await this.authorizeDependencies(token, taskOverrides));
     (await this.prepareForkWorld(args.projectId, taskOverrides));
     const inheritedFiles = (await this.inheritedResumeFiles(taskOverrides));
@@ -3304,7 +3324,7 @@ export class KarmaxApi {
     // Editing params can introduce a `resumeFrom` pointer at another task, so
     // the same source-side conversation check as createTask applies here, and
     // edited triggers the same dependency check.
-    (await this.validateAndAuthorizeResumeSources(token, params));
+    (await this.validateAndAuthorizeResumeSources(token, params, task.projectId));
     (await this.authorizeDependencies(token, params));
     const inheritedFiles = (await this.inheritedResumeFiles(params));
     for (const file of inheritedFiles) (await this.deps.store.grantAttachment(file.id, task.projectId));
@@ -6846,7 +6866,7 @@ Act according to your Avatar instructions. When ready, call platform_request POS
     }
     // An in-flight edit can introduce a `resumeFrom` pointer at another task —
     // the same source-side conversation check as createTask/updateArmedParams.
-    (await this.validateAndAuthorizeResumeSources(token, patch));
+    (await this.validateAndAuthorizeResumeSources(token, patch, task.projectId));
     // Human routes are the fields whose validity the deterministic sandbox cannot
     // judge: "does @qa resolve to a human here?" is a store question. Assert them
     // up front so a re-route can never park a gate or input pause invisibly.

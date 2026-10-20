@@ -6,7 +6,7 @@ import ssl
 from html.parser import HTMLParser
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
 from . import __version__
@@ -123,7 +123,8 @@ def _clean_dom_text(text: str) -> str:
 
 
 def fetch_share(url: str, *, timeout: float = 30.0) -> str:
-    _require_share_url(url)
+    if _require_share_url(url) == "gemini-share":
+        return fetch_gemini_share(url, timeout=timeout)
     request = Request(
         url,
         headers={
@@ -787,4 +788,138 @@ def read_tavya_share(text: str, *, source_uri: str | None = None, **_: Any) -> d
     return validate_conversation(conv)
 
 
-WEB_READERS = {"chatgpt-share": read_chatgpt_share, "claude-share": read_claude_share, "tavya-share": read_tavya_share}
+# Gemini serves a share's page without the conversation; the page asks for it
+# with this Google RPC, which answers anyone (no cookies) with `)]}'` and then
+# length-prefixed JSON chunks.
+GEMINI_SHARE_RPC = "ujx1Bf"
+_GEMINI_SHARE_PATH = re.compile(r"^/share/([A-Za-z0-9_-]+)/?$")
+
+
+def gemini_share_id(url: str) -> str | None:
+    """The id of a gemini.google.com/share/<id> URL (short links must be resolved first)."""
+    parsed = urlparse(url)
+    match = _GEMINI_SHARE_PATH.match(parsed.path)
+    return match.group(1) if parsed.scheme == "https" and parsed.hostname == "gemini.google.com" and match else None
+
+
+def gemini_share_request(share_id: str) -> tuple[str, bytes, dict[str, str]]:
+    """The URL, body and headers of the RPC that returns a Gemini share."""
+    url = (f"https://gemini.google.com/_/BardChatUi/data/batchexecute?rpcids={GEMINI_SHARE_RPC}"
+           f"&source-path=%2Fshare%2F{share_id}&hl=en-US&rt=c")
+    payload = json.dumps([[[GEMINI_SHARE_RPC, json.dumps([None, share_id, [4]]), None, "generic"]]])
+    body = urlencode({"f.req": payload}).encode()
+    return url, body, {"Content-Type": "application/x-www-form-urlencoded;charset=utf-8", "X-Same-Domain": "1"}
+
+
+def _gemini_chunks(text: str) -> list[Any]:
+    body = text.lstrip("\ufeff")
+    if not body.startswith(")]}'"):
+        raise FormatError("not a Gemini share response (it should start with )]}')")
+    decoder = json.JSONDecoder()
+    chunks: list[Any] = []
+    index = 4
+    length = re.compile(r"\s*\d+\s*")
+    while True:
+        # Each chunk is preceded by its length; JSON decoding finds its end anyway,
+        # and the length counts UTF-16 units, not characters.
+        match = length.match(body, index)
+        if not match or match.end() >= len(body):
+            break
+        try:
+            value, index = decoder.raw_decode(body, match.end())
+        except json.JSONDecodeError as exc:
+            raise FormatError(f"invalid Gemini share response: {exc}") from exc
+        chunks.append(value)
+    return chunks
+
+
+def _at(value: Any, *path: int) -> Any:
+    for key in path:
+        if not isinstance(value, list) or len(value) <= key:
+            return None
+        value = value[key]
+    return value
+
+
+def _gemini_time(value: Any) -> str | None:
+    seconds = _at(value, 0)
+    return normalize_timestamp(seconds + (_at(value, 1) or 0) / 1e9) if isinstance(seconds, (int, float)) else None
+
+
+def read_gemini_share(text: str, *, source_uri: str | None = None, **_: Any) -> dict[str, Any]:
+    """A Gemini share: the response of its ujx1Bf RPC (see gemini_share_request)."""
+    root = None
+    for chunk in _gemini_chunks(text):
+        for item in chunk if isinstance(chunk, list) else []:
+            if isinstance(item, list) and item[:2] == ["wrb.fr", GEMINI_SHARE_RPC]:
+                if not isinstance(item[2], str):
+                    raise FormatError("this Gemini share is unavailable; it may have been deleted or unshared")
+                try:
+                    root = _at(json.loads(item[2]), 0)
+                except json.JSONDecodeError as exc:
+                    raise FormatError(f"invalid Gemini share payload: {exc}") from exc
+    turns = _at(root, 1)
+    if not isinstance(turns, list):
+        raise FormatError("Gemini share response contained no conversation")
+    share_id = _at(root, 2, 7, 1)
+    conv = new_conversation(
+        source_format="gemini-share",
+        provider="google",
+        kind="public-share-snapshot",
+        source_uri=source_uri,
+        conversation_id=str(share_id) if share_id else None,
+        title=_at(root, 2, 1) if isinstance(_at(root, 2, 1), str) else None,
+    )
+    model = _at(root, 2, 7, 2)
+    if isinstance(model, str):
+        conv["environment"]["model"] = model
+    conv["updated_at"] = _gemini_time(_at(root, 4))
+    for index, turn in enumerate(turns):
+        # turn[0] is [conversation id, response id]: one turn, a prompt and its answer.
+        response_id = _at(turn, 0, 1)
+        created = _gemini_time(_at(turn, 4))
+        for role, text_value in (("user", _at(turn, 2, 0, 0)), ("assistant", _at(turn, 3, 0, 0, 1, 0))):
+            if not isinstance(text_value, str) or not text_value.strip():
+                warning(conv, "gemini_turn_not_represented", f"A Gemini {role} message had no text.", path=f"turns[{index}]")
+                continue
+            conv["messages"].append(message(role=role, content=[text_block(text_value)], source_format="gemini-share",
+                                            source_id=str(response_id) if response_id else None, source_index=index,
+                                            message_id=f"{response_id}:{role}" if response_id else None,
+                                            created_at=created))
+    if not conv["messages"]:
+        raise FormatError("Gemini share contained no messages")
+    conv["created_at"] = conv["messages"][0]["created_at"]
+    _add_snapshot_warnings(conv, "Gemini")
+    return validate_conversation(conv)
+
+
+def fetch_gemini_share(url: str, *, timeout: float = 30.0) -> str:
+    """Resolve a short link (share.gemini.google, g.co/gemini/share) to its share, then ask the RPC."""
+    share_id = gemini_share_id(url)
+    if share_id is None:
+        opener = build_opener(_ShareRedirectHandler(), HTTPSHandler(context=ssl.create_default_context()))
+        try:
+            with opener.open(Request(url, headers={"User-Agent": USER_AGENT}), timeout=timeout) as response:
+                share_id = gemini_share_id(response.geturl())
+        except HTTPError as exc:
+            raise AcquisitionError(f"share request returned HTTP {exc.code}: {url}", status=exc.code) from exc
+        except URLError as exc:
+            raise AcquisitionError(f"could not fetch share URL: {exc.reason}") from exc
+        if share_id is None:
+            raise AcquisitionError(f"{url} did not lead to a gemini.google.com/share/ link")
+    rpc, body, headers = gemini_share_request(share_id)
+    opener = build_opener(HTTPSHandler(context=ssl.create_default_context()))
+    try:
+        with opener.open(Request(rpc, data=body, headers={"User-Agent": USER_AGENT, **headers}), timeout=timeout) as response:
+            data = response.read(MAX_DOWNLOAD_BYTES + 1)
+    except HTTPError as exc:
+        raise AcquisitionError(f"Gemini returned HTTP {exc.code} for {url}", status=exc.code) from exc
+    except URLError as exc:
+        raise AcquisitionError(f"could not reach Gemini: {exc.reason}") from exc
+    if len(data) > MAX_DOWNLOAD_BYTES:
+        raise AcquisitionError("share response exceeded the 20 MiB safety limit")
+    return data.decode("utf-8", errors="replace")
+
+
+WEB_READERS = {"chatgpt-share": read_chatgpt_share, "claude-share": read_claude_share, "tavya-share": read_tavya_share,
+               "gemini-share": read_gemini_share}

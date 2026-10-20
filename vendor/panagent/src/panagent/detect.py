@@ -21,6 +21,8 @@ FORMAT_ALIASES = {
     "chatgpt-export": "chatgpt-share",
     "claude-share": "claude-share",
     "claude-export": "claude-share",
+    "gemini": "gemini-share",
+    "gemini-share": "gemini-share",
     "tavya": "tavya-share",
     "tavya-share": "tavya-share",
     "karmax": "tavya-share",
@@ -72,15 +74,21 @@ def url_format(value: str) -> str | None:
         return "chatgpt-share"
     if host in {"claude.ai", "www.claude.ai"} and parsed.path.startswith("/share/"):
         return "claude-share"
+    if (host == "gemini.google.com" and parsed.path.startswith("/share/")
+            or host == "share.gemini.google" and len(parsed.path) > 1
+            or host == "g.co" and parsed.path.startswith("/gemini/share/")):
+        return "gemini-share"
     if TAVYA_SHARE_PATH.fullmatch(parsed.path):
         return "tavya-share"
-    raise FormatError("only public ChatGPT, Claude and tavya share URLs are supported")
+    raise FormatError("only public ChatGPT, Claude, Gemini and tavya share URLs are supported")
 
 
 def detect_text(text: str, path: Path | None = None) -> str:
     stripped = text.lstrip("\ufeff\n\r\t ")
     if not stripped:
         raise FormatError("input is empty")
+    if stripped.startswith(")]}'"):
+        return "gemini-share"
     if stripped.startswith(("{", "[")):
         try:
             value = json.loads(stripped)

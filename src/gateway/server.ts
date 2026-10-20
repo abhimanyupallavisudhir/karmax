@@ -40,7 +40,8 @@ import { BRAND_FILES, brandIconOf, isBrandIcon, siteNameError, siteNameOf, BRAND
 import { Store } from '../store/db.js';
 import { ProjectTransfers, ProjectTransferError } from '../platform/project-transfer.js';
 import { AttachmentStore, AttachmentError, MAX_FILE_BYTES, MAX_IMAGE_BYTES } from '../store/attachments.js';
-import { ConversationImportError, MAX_CONVERSATION_IMPORT_BYTES, putConversationImport } from '../store/conversation-imports.js';
+import { ConversationImportError, MAX_CONVERSATION_IMPORT_BYTES } from '../store/conversation-imports.js';
+import { importConversationShare, importConversationUpload } from '../agent/conversation-sources.js';
 import { KarmaxBus } from '../contrib/bus.js';
 import { TokenAuthority, type ScopedToken } from '../platform/tokens.js';
 import { resolveAuthorizationSummary } from '../platform/authorization-summary.js';
@@ -55,7 +56,7 @@ import { defaultProvider } from '../agent/adapters.js';
 import { findProviderSession } from '../agent/fork.js';
 import { localCodexFiles } from '../agent/codex-history-files.js';
 import { validCodexSessionId } from '../agent/codex-history.js';
-import { conversionWarningsHeader, exportConversationWithPanagent, type PanagentWarning } from '../agent/panagent.js';
+import { conversionWarningsHeader, exportConversationWithPanagent, PanagentError, type PanagentWarning } from '../agent/panagent.js';
 import { DEFAULT_MCP_CONNECTIONS, defaultModel, defaultEffort, organizationProfileId, projectProfileId, roleDefaultProfile } from '../agent/profiles.js';
 import { repositoryBranchDefaults } from '../platform/branch-defaults.js';
 import { sameRepository } from '../world/repository-identity.js';
@@ -342,7 +343,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p === '/api/search' && read) return 'none'; // each project is authorized in searchEverywhere
   if (p === '/api/search/fields') return 'task:read';
   if (p === '/api/attachments' || p === '/api/files') return 'task:create';
-  if (p === '/api/conversation-imports') return 'task:create';
+  if (p === '/api/conversation-imports' || p === '/api/conversation-imports/share') return 'task:create';
   // Reading one back is a read of the task content it belongs to. The exact match
   // above does not cover `/api/attachments/:id`, which therefore fell through to the
   // conservative fallback — an implicit binding for a route that serves task bytes.
@@ -3917,18 +3918,24 @@ export class Gateway {
 
       // Uploaded Codex/Claude histories are stored out of workflow params; the
       // task carries only this project-scoped content-addressed reference.
-      if (p === '/api/conversation-imports' && method === 'POST') {
+      // A share link is read now, and kept the same way (a snapshot). Both answer
+      // what panagent read (title, messages), or 400 saying what to do.
+      if ((p === '/api/conversation-imports' || p === '/api/conversation-imports/share') && method === 'POST') {
         if (!requestedScope.projectId) return this.json(res, 400, { error: 'projectId is required' });
         if (!(await store.getProject(requestedScope.projectId))) return this.json(res, 404, { error: 'project not found' });
         if (!this.deps.objects) return this.json(res, 503, { error: 'conversation import storage is unavailable' });
         try {
+          if (p === '/api/conversation-imports/share') {
+            const { url: link } = (await this.body(req)) as { url?: unknown };
+            if (typeof link !== 'string' || !link.trim()) return this.json(res, 400, { error: 'url is required' });
+            return this.json(res, 200, await importConversationShare({ store, objects: this.deps.objects }, requestedScope.projectId, link.trim()));
+          }
           const data = await this.rawBody(req, MAX_CONVERSATION_IMPORT_BYTES);
           let name = 'conversation.jsonl';
           try { name = decodeURIComponent(String(req.headers['x-file-name'] || name)); } catch { /* use default */ }
-          const ref = await putConversationImport(this.deps.objects, requestedScope.projectId, data, name);
-          return this.json(res, 200, ref);
+          return this.json(res, 200, await importConversationUpload(this.deps.objects, requestedScope.projectId, data, name));
         } catch (error) {
-          if (error instanceof ConversationImportError || error instanceof AttachmentError)
+          if (error instanceof ConversationImportError || error instanceof AttachmentError || error instanceof PanagentError)
             return this.json(res, 400, { error: error.message });
           throw error;
         }

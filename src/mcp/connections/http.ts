@@ -65,6 +65,13 @@ function guardedFetch(stream: boolean, timeoutMs = stream ? 65_000 : 15_000, max
     }, (res) => {
       const status = res.statusCode ?? 502;
       if (status < 200 || status > 599) { res.destroy(); reject(new Error('Endpoint returned an unsupported HTTP status')); return; }
+      // `redirect: 'manual'` hands the caller the 3xx itself (Location included), never following it.
+      if (status >= 300 && status < 400 && request.redirect === 'manual') {
+        res.destroy();
+        resolve(new Response(null, { status, headers: Object.fromEntries(Object.entries(res.headers).filter(([, v]) => v !== undefined)
+          .map(([k, v]) => [k, Array.isArray(v) ? v.join(', ') : v!])) }));
+        return;
+      }
       if (status >= 300 && status < 400) { res.destroy(); reject(new Error('Endpoint redirects are not allowed; use its final HTTPS URL')); return; }
       const headers = Object.fromEntries(Object.entries(res.headers).filter(([, v]) => v !== undefined).map(([k, v]) => [k, Array.isArray(v) ? v.join(', ') : v!]));
       if (stream) {

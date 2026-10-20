@@ -1,0 +1,6 @@
+)]}'
+
+782
+[["wrb.fr", "ujx1Bf", "[[null, [[[\"c_fixture0000000001\", \"r_fixture000000001\"], null, [[\"What is the self-location problem?\"], 2, null, 1, \"fixture\"], [[[\"rc_fixture00000001\", [\"It is the problem of **centered** information.\"], [], null, null, null, true]]], [1792400000, 500000000]], [[\"c_fixture0000000001\", \"r_fixture000000002\"], null, [[\"And Updateless Decision Theory?\"], 2, null, 1, \"fixture\"], [[[\"rc_fixture00000002\", [\"UDT chooses a policy before observing.\"], [], null, null, null, true]]], [1792400060, 500000000]]], [true, \"Self-location fixture\", null, null, null, [\"\", \"\", \"\"], null, [2, \"fixture0000000001\", \"3.6 Flash\", 19], true], null, [1792400100, 0]]]", null, null, null, "generic"], ["di", 120], ["af.httprm", 119, "-1", 7]]
+28
+[["e", 4, null, null, 781]]

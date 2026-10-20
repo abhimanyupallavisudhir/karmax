@@ -4,7 +4,9 @@ import type { ObjectStore } from './objects.js';
 
 export const MAX_CONVERSATION_IMPORT_BYTES = 20 * 1024 * 1024;
 
-export type ConversationImportFormat = 'codex' | 'claude-code' | 'claude-export' | 'panagent';
+/** An uploaded file's format, or the share format of a link read when it was given. */
+export type ConversationImportFormat = 'codex' | 'claude-code' | 'claude-export' | 'panagent'
+  | 'chatgpt-share' | 'claude-share' | 'gemini-share' | 'tavya-share';
 
 export interface ConversationImportRef {
   id: string;
@@ -12,6 +14,12 @@ export interface ConversationImportRef {
   bytes: number;
   format: ConversationImportFormat;
   projectId: string;
+  /** The share link this conversation was read from (a snapshot: the agent
+   * starts from this copy, imported as guarded context, never re-fetched). */
+  share?: string;
+  /** What panagent read in it when it was checked. */
+  title?: string;
+  messages?: number;
 }
 
 const CLAUDE_TRANSCRIPT_TYPES = new Set([
@@ -88,17 +96,19 @@ export function conversationImportObjectKey(projectId: string, id: string): stri
 }
 
 export async function putConversationImport(
-  objects: ObjectStore,
+  objects: ObjectStore | undefined,
   projectId: string,
   data: Buffer,
   filename?: string,
+  read: Pick<ConversationImportRef, 'share' | 'title' | 'messages'> & { format?: ConversationImportFormat } = {},
 ): Promise<ConversationImportRef> {
-  const format = detectConversationImport(data);
+  const { format = detectConversationImport(data), ...summary } = read;
   const id = crypto.createHash('sha256').update(data).digest('hex');
   const rawName = path.basename(filename || 'conversation.jsonl').replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 180);
   const name = rawName || 'conversation.jsonl';
-  await objects.put(conversationImportObjectKey(projectId, id), data, 'application/x-ndjson');
-  return { id, name, bytes: data.length, format, projectId };
+  // Without a store (small test harnesses) the check still runs; nothing is kept.
+  if (objects) await objects.put(conversationImportObjectKey(projectId, id), data, 'application/x-ndjson');
+  return { id, name, bytes: data.length, format, projectId, ...summary };
 }
 
 export class ConversationImportError extends Error {}
