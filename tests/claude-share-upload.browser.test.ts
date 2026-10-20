@@ -86,7 +86,7 @@ it('a pasted Claude share link leads to uploading its saved conversation, which 
       await core.runAgentTurn({ taskId: task.id, role: 'do', agentTurnId: `${task.id}#0`, agentSlotGranted: true,
         worldHandle: world.handle, messages: [{ id: 'm1', role: 'user', text: 'Build the testbed', ts: 0 }],
         task: { taskId: task.id, projectId: project.id, title: task.title, prompt: 'Build the testbed', project: {},
-          workflow: 'software-dev', agents: { do: { provider: 'mock', resumeFrom: task.params['agent:do'].resumeFrom } } },
+          workflow: 'software-dev', agents: { do: { provider: 'mock', resumeFrom: (task.params['agent:do'] as any).resumeFrom } } },
       } as any);
     } finally { await world.destroy(); }
     expect(seen.at(-1)).toContain('Plan the oversight experiments.');
