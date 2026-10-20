@@ -62,3 +62,30 @@ test('a row whose pull request asks says so, and the task keeps its own status',
   assert.equal(ctx.rowAsk({ id: 'a' }).pullRequest, 'pramana');
   assert.equal(ctx.rowAsk({ id: 'b' }).pullRequest, undefined);
 });
+
+test('a row shows when it last changed: on For me, when it came to you', () => {
+  const NOW = Date.UTC(2026, 9, 19, 23, 0);
+  const ctx = vm.createContext({ esc: (value) => String(value), S: { searchResult: { updated: { a: NOW - 80 * 60e3 } } } });
+  vm.runInContext(['rowTime', 'fmtWhen', 'rowWhen'].map(fn).join('\n'), ctx);
+  assert.equal(ctx.fmtWhen(NOW - 20e3, NOW), 'now');
+  assert.equal(ctx.fmtWhen(NOW - 5 * 60e3, NOW), '5m');
+  assert.equal(ctx.fmtWhen(NOW - 3 * 3600e3, NOW), '3h');
+  assert.equal(ctx.fmtWhen(NOW - 4 * 86400e3, NOW), '4d');
+  assert.match(ctx.fmtWhen(NOW - 20 * 86400e3, NOW), /Sep|29/, 'older rows show their date');
+  assert.equal(ctx.rowTime({ id: 'a', statusChangedAt: NOW - 86400e3, createdAt: 1 }), NOW - 80 * 60e3, 'the server says when it came to you');
+  assert.equal(ctx.rowTime({ id: 'b', statusChangedAt: NOW - 86400e3, createdAt: 1 }), NOW - 86400e3);
+  assert.equal(ctx.rowTime({ id: 'c', createdAt: 7 }), 7, 'a draft: when it was created');
+  assert.match(ctx.rowWhen({ id: 'a' }), /<time class="row-when" datetime="[^"]+" title="Updated [^"]+">\d+[mh]<\/time>/);
+});
+
+test('waits nobody takes part in do not move a task up the list', () => {
+  const ctx = vm.createContext({});
+  vm.runInContext(fn('listState'), ctx);
+  const at = (status, kind, stage = 'do') => ctx.listState({ stage, status, ...(kind ? { waitingFor: { kind } } : {}) });
+  for (const kind of ['agentSlot', 'job', 'timer', 'subtask', 'confirm', 'mergeSlot'])
+    assert.equal(at('waiting', kind), at('active'), kind);
+  assert.notEqual(at('waiting', 'human'), at('active'), 'needs a person');
+  assert.notEqual(at('waiting', 'account'), at('active'), 'stalled on a login or quota');
+  assert.notEqual(at('done'), at('active'));
+  assert.notEqual(at('waiting', 'human', 'review'), at('waiting', 'human'), 'a new stage');
+});

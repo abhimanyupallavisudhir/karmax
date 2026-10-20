@@ -26,8 +26,15 @@ export interface ComputerSpec {
 }
 
 /** Cloud providers an organization can connect for task worlds (BYOK). */
-export const CLOUD_WORLD_PROVIDERS = ['e2b', 'daytona', 'fly', 'hetzner'] as const;
+export const CLOUD_WORLD_PROVIDERS = ['e2b', 'daytona', 'fly', 'hetzner', 'aws', 'gcp'] as const;
 export type CloudWorldProvider = (typeof CLOUD_WORLD_PROVIDERS)[number];
+
+/** The cloud providers whose worlds are VMs reached over SSH (src/world/vm/):
+ * the disk is a volume that keeps everything and grows in place. */
+export const VM_WORLD_PROVIDERS = ['fly', 'hetzner', 'aws', 'gcp'] as const;
+export function isVmWorldProvider(provider: string | undefined): boolean {
+  return (VM_WORLD_PROVIDERS as readonly string[]).includes(provider ?? '');
+}
 
 /** What a task may still change once its world exists: the machine's size and
  * how long it sleeps. A different provider, experience or network policy is a

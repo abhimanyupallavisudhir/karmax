@@ -5602,6 +5602,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       ...(result.groups ? { groups: prune(result.groups) } : {}),
       ...(result.reasons ? { reasons: Object.fromEntries(Object.entries(result.reasons).filter(([id]) => ids.has(id))) } : {}),
       ...(result.pullRequestAsks ? { pullRequestAsks: Object.fromEntries(Object.entries(result.pullRequestAsks).filter(([id]) => ids.has(id))) } : {}),
+      ...(result.updated ? { updated: Object.fromEntries(Object.entries(result.updated).filter(([id]) => ids.has(id))) } : {}),
       projects: projects.map((project) => ({ id: project.id, name: project.name, slug: slugify(project.name), organizationId: project.organizationId ?? 'org_personal' })),
       tags,
     };

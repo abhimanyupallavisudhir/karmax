@@ -51,9 +51,9 @@ describe.skipIf(!target)('MCP real deployment boundary', () => {
 describe.skipIf(process.env.KARMAX_MCP_LIVE_NETWORK !== '1')('Live Official Registry and public MCP', () => {
   it('imports Microsoft Learn and calls its real documentation tool through the task relay', async () => {
     const result = await registrySearch('microsoft-learn');
-    const entry = result.servers.find((s: any) => s.name === 'com.microsoft/microsoft-learn-mcp');
+    const entry = result.servers.find((s: any) => s.name === 'com.microsoft/microsoft-learn-mcp')!;
     expect(entry).toBeDefined();
-    const option = entry.options.find((o: any) => o.transport.type === 'http' && o.transport.url === 'https://learn.microsoft.com/api/mcp');
+    const option = entry.options.find((o: any) => o.transport.type === 'http' && o.transport.url === 'https://learn.microsoft.com/api/mcp')!;
     expect(option).toBeDefined();
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-network-')); const store = (await Store.create(':memory:')); let cleanup: (() => Promise<void>) | undefined;
     try {

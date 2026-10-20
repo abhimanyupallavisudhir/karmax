@@ -5,7 +5,9 @@ import { describe, expect, it } from 'vitest';
 import { bootHarness } from './helpers/harness.js';
 import { liveEnabled } from './helpers/live-gate.js';
 import { MockAdapter } from '../src/agent/mock.js';
+import { AwsDriver } from '../src/world/aws.js';
 import { FlyDriver } from '../src/world/fly.js';
+import { GcpDriver } from '../src/world/gcp.js';
 import { HetznerDriver } from '../src/world/hetzner.js';
 import { VmWorldProvider, type VmDriver } from '../src/world/vm/provider.js';
 import { ProjectEnvironment } from '../src/store/project-environment.js';
@@ -13,7 +15,7 @@ import type { ResolvedWorldProviderConnection } from '../src/world/connections.j
 import type { World, WorldHandle } from '../src/world/types.js';
 
 /**
- * A whole task on a Fly.io or Hetzner computer, as tavya.io runs one (the VM
+ * A whole task on a Fly.io, Hetzner, AWS or Google Cloud computer, as tavya.io runs one (the VM
  * twin of e2b-workflow-live). pramana#39, the first production Hetzner task,
  * never got a world: provisioning stock Debian failed. This drives a task
  * through the hosted lifecycle on the real control plane with setup commands
@@ -25,7 +27,8 @@ import type { World, WorldHandle } from '../src/world/types.js';
  * server on the same volume, whose root disk lacks setup's packages until it
  * replays), and Done deletes everything.
  *
- * Opt in with KARMAX_RUN_LIVE=1 and HCLOUD_TOKEN and/or FLY_API_TOKEN (a Fly
+ * Opt in with KARMAX_RUN_LIVE=1 and HCLOUD_TOKEN, FLY_API_TOKEN, KARMAX_AWS_KEY
+ * and/or KARMAX_GCP_KEY (or KARMAX_GCP_KEY_FILE) (a Fly
  * organization with a payment method: its free trial stops machines at 300 s).
  * A deterministic model; real Temporal; about $0.05 of compute per provider.
  * Hetzner boots its provisioned snapshot if the project has one, else
@@ -37,7 +40,13 @@ const providers = [
     config: { region: process.env.KARMAX_HETZNER_LOCATION, image: process.env.KARMAX_HETZNER_IMAGE } },
   { kind: 'fly', name: 'Fly.io', apiKey: process.env.FLY_API_TOKEN, driver: (): VmDriver => new FlyDriver(),
     config: { region: process.env.KARMAX_FLY_REGION, organization: process.env.KARMAX_FLY_ORG } },
-];
+  // A wake restarts the same instance with its root disk, so setup never replays (as on Fly).
+  { kind: 'aws', name: 'AWS', apiKey: process.env.KARMAX_AWS_KEY, driver: (): VmDriver => new AwsDriver(),
+    config: { region: process.env.KARMAX_AWS_REGION } },
+  { kind: 'gcp', name: 'Google Cloud', apiKey: process.env.KARMAX_GCP_KEY
+    ?? (process.env.KARMAX_GCP_KEY_FILE ? fs.readFileSync(process.env.KARMAX_GCP_KEY_FILE, 'utf8') : undefined), driver: (): VmDriver => new GcpDriver(),
+    config: { region: process.env.KARMAX_GCP_ZONE } },
+].filter((entry) => !process.env.KARMAX_LIVE_VM_ONLY || process.env.KARMAX_LIVE_VM_ONLY.split(',').includes(entry.kind));
 const SETUP = [
   // pramana's own first two setup commands, the package installed from PyPI instead of its checkout.
   'S=$(command -v sudo >/dev/null 2>&1 && echo sudo); $S apt-get update -qq && $S apt-get install -y -qq tesseract-ocr poppler-utils',
@@ -115,6 +124,8 @@ describe.each(providers)('a live $name task end to end', ({ kind, name, apiKey, 
       at.done = Math.round((Date.now() - started) / 1000);
       await expect.poll(() => provider.probe(worlds[0]!.handle as WorldHandle), { timeout: 5 * 60_000, interval: 5000 }).toBe('missing');
       expect(JSON.stringify(await handle.fetchHistory())).not.toContain(apiKey);
+      // AWS's secret alone, too (the key is ID:SECRET).
+      if (kind === 'aws') expect(JSON.stringify(await handle.fetchHistory())).not.toContain(apiKey!.split(':')[1]);
       console.log(`VM-WORKFLOW-LIVE ${JSON.stringify({ provider: name, secondsSinceStart: at })}`);
     } finally {
       delete process.env.KARMAX_HETZNER_PARK_GRACE;

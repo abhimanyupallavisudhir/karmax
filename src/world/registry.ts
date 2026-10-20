@@ -7,7 +7,7 @@ import { MemoryWorldProvider } from './memory.js';
 import { ContainerWorldProvider } from './container.js';
 import { E2BWorldProvider } from './e2b.js';
 import { DaytonaWorldProvider } from './daytona.js';
-import { flyWorldProvider, hetznerWorldProvider } from './vm/providers.js';
+import { awsWorldProvider, flyWorldProvider, gcpWorldProvider, hetznerWorldProvider } from './vm/providers.js';
 
 /**
  * Selects a world provider by kind. `createWorld` dispatches to the configured
@@ -33,6 +33,8 @@ export class WorldRegistry {
     this.register(new DaytonaWorldProvider());
     this.register(flyWorldProvider());
     this.register(hetznerWorldProvider());
+    this.register(awsWorldProvider());
+    this.register(gcpWorldProvider());
   }
 
   register(p: WorldProvider) {

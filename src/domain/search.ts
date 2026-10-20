@@ -281,7 +281,8 @@ function attentionReasons(t: SearchTask, userId: string, ctx?: EvalContext): str
   return [...new Set(out)];
 }
 const projectOf = (t: SearchTask, ctx?: EvalContext) => ctx?.projects?.get(t.projectId);
-/** When the task last changed stage, status or what it waits for. */
+/** When the task last changed stage, or between working, waiting on a person,
+ *  stalled and finished (`listState`). */
 const statusChangedAt = (t: SearchTask) => t.statusChangedAt ?? t.createdAt;
 /** When `t` last changed for the people the query is for: a status change, or
  *  an ask reaching them — so a task that has just come to them leads the list. */
@@ -628,6 +629,9 @@ export interface EvalResult {
   /** Of those, the ones only a task's pull requests make (task id → which and
    *  what), so a list says it is a pull request asking, not the task. */
   pullRequestAsks?: Record<string, Array<{ checkout: string; kind: string }>>;
+  /** For the same queries: task id → when it last changed for those people
+   *  (`updated`'s sort key), which a task's own `statusChangedAt` cannot say. */
+  updated?: Record<string, number>;
   total: number;
 }
 
@@ -676,17 +680,20 @@ export function evaluateQuery(tasks: SearchTask[], query: TaskQuery, ctx: EvalCo
   const asked = positiveForUsers(query, ctx);
   let reasons: Record<string, string[]> | undefined;
   let pullRequestAsks: Record<string, Array<{ checkout: string; kind: string }>> | undefined;
+  let updated: Record<string, number> | undefined;
   if (asked.length) {
     reasons = {};
+    updated = {};
     for (const t of out) {
       const why = [...new Set(asked.flatMap((u) => attentionReasons(t, u, ctx)))];
       if (why.length) reasons[t.id] = why;
+      updated[t.id] = updatedFor(t, ectx);
       const byPullRequest = asked.flatMap((u) => ctx.attention?.get(u)?.get(t.id)?.pullRequests ?? []);
       if (byPullRequest.length) (pullRequestAsks ??= {})[t.id] = byPullRequest
         .filter((ask, i) => byPullRequest.findIndex((other) => other.checkout === ask.checkout && other.kind === ask.kind) === i);
     }
   }
-  return { tasks: out, groups, ...(groupField?.type === 'tag' ? { hierarchical: true } : {}), ...(reasons ? { reasons } : {}),
+  return { tasks: out, groups, ...(groupField?.type === 'tag' ? { hierarchical: true } : {}), ...(reasons ? { reasons, updated } : {}),
     ...(pullRequestAsks ? { pullRequestAsks } : {}), total: out.length };
 }
 

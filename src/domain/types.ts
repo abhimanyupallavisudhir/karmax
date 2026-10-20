@@ -1162,8 +1162,9 @@ export interface TaskRecord {
   workflowVersion: string; // pinned at creation (SPEC §4.4)
   params: TaskParams;
   createdAt: number;
-  /** When the task last changed stage, status or what it waits for — what
-   *  task lists are ordered by. Absent until its first view. */
+  /** When the task's `listState` last changed (stage; working, waiting on a
+   *  person, stalled or finished) — what task lists are ordered by. Absent
+   *  until its first view. */
   statusChangedAt?: number;
   order: number;
   parentTaskId?: string;

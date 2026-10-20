@@ -31,6 +31,7 @@ global.S = {
   cancelling: new Set(),
 };
 eval(extractFn('pendingCancellationView'));
+eval(extractFn('listState'));
 eval(extractFn('patchLifecycleView'));
 eval(extractFn('patchTaskListFromEvent'));
 ok(

@@ -13,6 +13,9 @@ import { Overlays } from '../src/store/overlays.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { findFreePortFrom } from '../src/util/ports.js';
 
+vi.mock('../src/mcp/connections/registry.js', async (original) => ({ ...(await original<any>()),
+  registrySearch: vi.fn(async (search: string) => ({ servers: [{ name: 'com.example/match', version: '1', title: search, description: '', options: [] }] })) }));
+
 describe('MCP HTTP authorization boundary', () => {
   let dir: string, store: Store, tokens: TokenAuthority, base: string, close: () => Promise<void>;
   let org: string, project: string, otherOrg: string, otherProject: string;
@@ -37,6 +40,12 @@ describe('MCP HTTP authorization boundary', () => {
       vi.stubEnv('KARMAX_PUBLIC_URL', '');
       expect((await fetch(base + '/api/mcp-client-metadata')).status).toBe(404);
     } finally { vi.unstubAllEnvs(); }
+  });
+  it('searches the public registry for any signed-in caller, without an organization or project', async () => {
+    const response = await request('GET', '/api/mcp/registry?search=google%20cloud', (await token(['profile:read'], undefined)));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ servers: [{ name: 'com.example/match', title: 'google cloud' }] });
+    expect((await fetch(base + '/api/mcp/registry?search=x')).status).toBe(401);
   });
   it('accepts preregistered OAuth clients only for administrators and excludes client secrets from responses', async () => {
     const route = `/api/mcp?projectId=${project}`;

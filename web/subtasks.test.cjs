@@ -37,7 +37,7 @@ global.taskUrl = (id, rec) => `/acme/web/tasks/${rec?.num ?? id}`;
 
 // The real stage vocabulary, not a stub: a child must read exactly as it does in
 // the task list and on its own page.
-for (const name of ['taskRecord', 'numLabel', 'parentTaskContext', 'stageLabel', 'waitingLabel', 'waitingText', 'subTaskState', 'subTaskStateHtml', 'subTasksSection', 'pullRequestLanes', 'patchLifecycleView', 'pendingCancellationView', 'patchSubTaskSummaryFromEvent', 'subTaskSummaryEventNeedsRefresh']) eval(extractFn(name));
+for (const name of ['taskRecord', 'numLabel', 'parentTaskContext', 'stageLabel', 'waitingLabel', 'waitingText', 'subTaskState', 'subTaskStateHtml', 'subTasksSection', 'pullRequestLanes', 'listState', 'patchLifecycleView', 'pendingCancellationView', 'patchSubTaskSummaryFromEvent', 'subTaskSummaryEventNeedsRefresh']) eval(extractFn(name));
 
 let pass = 0, fail = 0;
 const ok = (condition, message) => {

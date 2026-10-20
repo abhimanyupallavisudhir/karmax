@@ -29,7 +29,8 @@ describe('organization Computers and usage UI', () => {
       ? connected : method === 'POST' && path.endsWith('/test') ? {} : undefined);
     const rows = ui.page.locator('#org-computers .computer-provider');
     expect(await rows.evaluateAll((elements) => elements.map((row) => [row.querySelector('b')!.textContent, row.querySelector('.chip')!.textContent])))
-      .toEqual([['E2B', 'connected'], ['Daytona', 'failing'], ['Fly.io', 'not connected'], ['Hetzner', 'not connected']]);
+      .toEqual([['E2B', 'connected'], ['Daytona', 'failing'], ['Fly.io', 'not connected'], ['Hetzner', 'not connected'],
+        ['AWS', 'not connected'], ['Google Cloud', 'not connected']]);
     expect(await rows.nth(1).locator('.chip').getAttribute('title')).toBe('Daytona connection failed: 401');
     await rows.nth(0).getByRole('button', { name: 'Test' }).click();
     await expect.poll(() => ui.calls.some((call) => call.method === 'POST' && call.path === '/api/organizations/o/world-providers/e2b/test')).toBe(true);
@@ -74,6 +75,33 @@ describe('organization Computers and usage UI', () => {
     await expect.poll(() => ui.calls.filter((call) => call.path.startsWith('/api/organizations/o/world-providers/fly')).map((call) => call.method))
       .toEqual(['PUT', 'POST']);
     expect(ui.calls.find((call) => call.method === 'PUT')!.body).toMatchObject({ apiKey: 'FlyV1 fm2_key', config: { region: 'ams' } });
+    await ui.close();
+  });
+
+  it('connects AWS with its access key in two parts, and Google Cloud with a key file', async () => {
+    const ui = await organization('#org-computers .computer-provider', ({ method }) => method === 'PUT' || method === 'POST' ? {} : undefined);
+    await ui.page.locator('#org-computers [data-provider="aws"] .computer-connect').click();
+    let dialog = ui.page.locator('.computer-dialog');
+    expect(await dialog.locator('.computer-key-link').getAttribute('href')).toBe('/docs/computers#aws');
+    const parts = dialog.locator('.computer-key-part');
+    expect(await parts.evaluateAll((inputs) => inputs.map((input) => input.getAttribute('type')))).toEqual(['text', 'password']);
+    // Half a key is refused in the dialog, with nothing sent.
+    await parts.nth(0).fill('AKIAABCDEFGHIJKLMNOP');
+    await dialog.getByRole('button', { name: 'Connect' }).click();
+    await expect.poll(() => ui.toasts()).toContain('Enter both the access key ID and the secret access key');
+    expect(ui.calls.some((call) => call.method === 'PUT')).toBe(false);
+    await parts.nth(1).fill('abc/def+ghi');
+    await dialog.locator('.computer-advanced > summary').click();
+    await dialog.locator('[data-config="region"]').fill('us-east-1');
+    await dialog.getByRole('button', { name: 'Connect' }).click();
+    await expect.poll(() => ui.calls.find((call) => call.method === 'PUT' && call.path.endsWith('/aws'))?.body)
+      .toMatchObject({ apiKey: 'AKIAABCDEFGHIJKLMNOP:abc/def+ghi', config: { region: 'us-east-1' } });
+    await ui.page.locator('#org-computers [data-provider="gcp"] .computer-connect').click();
+    dialog = ui.page.locator('.computer-dialog');
+    expect(await dialog.locator('textarea.computer-key').getAttribute('placeholder')).toBe('Paste or drop the JSON key file');
+    await dialog.locator('.computer-key').fill('{"type": "service_account"}\n');
+    await dialog.getByRole('button', { name: 'Connect' }).click();
+    await expect.poll(() => ui.calls.find((call) => call.method === 'PUT' && call.path.endsWith('/gcp'))?.body?.apiKey).toBe('{"type": "service_account"}');
     await ui.close();
   });
 

@@ -1645,10 +1645,12 @@ const localWorldPath = (v) => (hostLocal() && v.worldPath) || '';
 // Parameters tab. The value is sparse ({provider, cpu, memoryMb, diskGb, flavor,
 // hibernateAfterDays, network}); the block shows the effective machine and a
 // form stores only what differs from what it inherits.
-const COMPUTER_PROVIDER_LABELS = { e2b: 'E2B', daytona: 'Daytona', fly: 'Fly.io', hetzner: 'Hetzner', worktree: 'This machine', container: 'Docker container' };
+const COMPUTER_PROVIDER_LABELS = { e2b: 'E2B', daytona: 'Daytona', fly: 'Fly.io', hetzner: 'Hetzner', aws: 'AWS', gcp: 'Google Cloud',
+  worktree: 'This machine', container: 'Docker container' };
 // What a machine gets when the Computer asks for nothing more (disk is total GB).
 const COMPUTER_DEFAULTS = { e2b: { cpu: 2, memoryMb: 2048, diskGb: 22 }, daytona: { cpu: 2, memoryMb: 4096, diskGb: 8 },
-  fly: { cpu: 2, memoryMb: 2048, diskGb: 20 }, hetzner: { cpu: 2, memoryMb: 2048, diskGb: 20 } };
+  fly: { cpu: 2, memoryMb: 2048, diskGb: 20 }, hetzner: { cpu: 2, memoryMb: 2048, diskGb: 20 }, aws: { cpu: 2, memoryMb: 2048, diskGb: 20 },
+  gcp: { cpu: 2, memoryMb: 2048, diskGb: 20 } };
 // What a computer on the organization's provider account may be: the
 // connection's limits, learned from the provider (src/domain/computer-limits.ts).
 const computerLimitsFor = (provider) => (S.worldProviderConnections || []).find((c) => c.provider === provider)?.limits || null;
@@ -4708,6 +4710,39 @@ function markTaskCancelling(taskId) {
 function byLastUpdate(a, b) {
   return (b.statusChangedAt || b.createdAt || 0) - (a.statusChangedAt || a.createdAt || 0);
 }
+// Where a task stands for people — stage, and working / needs a person /
+// stalled / finished; a change of it is what `statusChangedAt` records. Mirrors
+// src/domain/list-state.ts: a turn queuing for a slot or paused on its job is
+// still working, or the busiest task would always lead the list.
+function listState(v) {
+  const kind = v.waitingFor?.kind;
+  const phase = v.status === 'active' ? 'working'
+    : v.status !== 'waiting' ? v.status
+    : kind === 'human' ? 'person'
+    : kind === 'account' || kind === 'retry' ? 'stalled' : 'working';
+  return `${v.stage}|${phase}`;
+}
+// When a list row last changed: on For me, when it last came to you (the
+// server's sort key); elsewhere, its last status change.
+function rowTime(t) {
+  return S.searchResult?.updated?.[t.id] ?? t.statusChangedAt ?? t.createdAt;
+}
+// "now", "5m", "3h", "4d", then the date: short enough for every row.
+function fmtWhen(epoch, now = Date.now()) {
+  const m = Math.floor((now - epoch) / 60_000);
+  if (m < 1) return 'now';
+  if (m < 60) return `${m}m`;
+  if (m < 1440) return `${Math.floor(m / 60)}h`;
+  if (m < 7 * 1440) return `${Math.floor(m / 1440)}d`;
+  const date = new Date(epoch);
+  return date.toLocaleDateString([], { month: 'short', day: 'numeric', ...(date.getFullYear() !== new Date(now).getFullYear() ? { year: 'numeric' } : {}) });
+}
+function rowWhen(t) {
+  const at = rowTime(t);
+  if (!at) return '';
+  const full = new Date(at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  return `<time class="row-when" datetime="${new Date(at).toISOString()}" title="Updated ${esc(full)}">${esc(fmtWhen(at))}</time>`;
+}
 
 // Evaluate the working query on the server and stash the result. The default list
 // (empty query) is just an evaluation too. We overlay each result's freshest live
@@ -4943,8 +4978,7 @@ function patchLifecycleView(record, ev) {
     agentTurn,
   }, ev.taskId);
   record.lastView = next;
-  if (previous.stage !== next.stage || previous.status !== next.status || previous.waitingFor?.kind !== next.waitingFor?.kind)
-    record.statusChangedAt = ev.ts || Date.now();
+  if (listState(previous) !== listState(next)) record.statusChangedAt = ev.ts || Date.now();
   // A retrying or accidentally hot-looping workflow can publish an identical
   // compact view many times per second. Updating the in-memory record is cheap;
   // replacing the entire list DOM is not, and can remove a row between pointer
@@ -5422,7 +5456,7 @@ function renderOnboarding() {
     <ol class="onboarding-list">
       ${onboardingStep(1, 'github', 'Connect GitHub', `Import repositories and let ${siteNameMarkup()} work through reviewed pull requests.`, `<a class="btn sm" data-spa href="${settings}#settings-code">${state.steps.github.complete ? 'Manage GitHub' : 'Connect GitHub'}</a>`)}
       ${onboardingStep(2, 'agentLogin', 'Add agent logins', 'Connect at least one usable Codex, Claude, or API-key account.', `<a class="btn sm" data-spa href="${settings}#settings-agents">${state.steps.agentLogin.complete ? 'Manage agent logins' : 'Add agent login'}</a>`)}
-      ${onboardingStep(3, 'e2b', 'Connect a cloud computer', 'Add an E2B, Daytona, Fly.io or Hetzner key: your agents work on its computers.', `<a class="btn sm" data-spa href="${settings}#settings-computers">${state.steps.e2b.complete ? 'Manage computers' : 'Connect a computer'}</a>`)}
+      ${onboardingStep(3, 'e2b', 'Connect a cloud computer', 'Add an E2B, Daytona, Fly.io, Hetzner, AWS or Google Cloud key: your agents work on its computers.', `<a class="btn sm" data-spa href="${settings}#settings-computers">${state.steps.e2b.complete ? 'Manage computers' : 'Connect a computer'}</a>`)}
       ${onboardingStep(4, 'optional', 'Connect apps and payment cards', 'Connect services and give agents approved access to passwords and purchases. This never blocks setup.', `<a class="btn sm" data-spa href="${settings}#settings-payments">${optional.vault || optional.card ? 'Manage apps &amp; cards' : 'Set up apps &amp; cards'}</a>`)}
       ${onboardingStep(5, 'paidPlan', 'Buy paid plan', 'Choose a paid subscription for this workspace, or keep using Free. This never blocks setup.', `<a class="btn sm" data-spa href="${settings}#settings-plan">${state.steps.paidPlan?.complete ? 'Manage paid plan' : 'View plans &amp; billing'}</a>`)}
       ${onboardingStep(6, 'project', 'Create your first project', 'Start a real task list and connect the code your agents will work on.', `<button class="btn sm ${state.steps.project.complete ? '' : 'primary'}" id="onboarding-new-project" type="button">${state.steps.project.complete ? 'Create another project' : 'Create project'}</button>`)}
@@ -6923,6 +6957,7 @@ function taskRow(t, { showTags = true, project = false } = {}) {
         <div class="task-sub">${where}<span class="chip">draft</span>${priorityFlag(t)}${showTags ? tagChips(t) : ''}</div>
       </div>
       <div class="task-right">
+        ${rowWhen(t)}
         <button class="btn sm" data-queue="${t.id}">Run task</button>
         <button class="btn sm danger" data-deldraft="${t.id}">Delete</button>
       </div>
@@ -6952,7 +6987,7 @@ function taskRow(t, { showTags = true, project = false } = {}) {
           ${priorityFlag(t)}${showTags ? tagChips(t) : ''}
         </div>
       </div>
-      <div class="task-right">${pipeline(v)}${archiveBtn}</div>
+      <div class="task-right">${rowWhen(t)}${pipeline(v)}${archiveBtn}</div>
     </div>`;
 }
 
@@ -8602,9 +8637,11 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
           ${formAttemptGroup?.attempts?.length > 1 ? `<nav class="attempts-list tf-attempts" aria-label="Choose an attempt">
             ${formAttemptGroup.attempts.map((a) => attemptCard(a, formAttemptGroup, { taskId: draft.id }, { form: true })).join('')}
           </nav>` : ''}
-          <span class="tf-savestate save-state quiet" id="tf-savestate" role="status"></span>
-          ${templatePickable ? `<button type="button" class="tf-template" id="tf-template" title="Start from a template" aria-label="Template${opts?.template ? `: ${esc(opts.template.name)}` : ''}">${ICON.template}${opts?.template ? `<span class="tf-template-label">${esc(opts.template.name)}</span>` : ''}</button>` : ''}
-          <select id="tf-wf" title="${workflowEditable ? 'Workflow' : 'Workflow is locked after the task is queued'}" ${workflowEditable ? '' : 'disabled'}>${taskFormWorkflows(wf, draft).map((w) => `<option value="${esc(w.id)}" ${w.id === wf ? 'selected' : ''}>${esc(w.label)}</option>`).join('')}</select>
+          <div class="tf-head-end">
+            <span class="tf-savestate save-state quiet" id="tf-savestate" role="status"></span>
+            ${templatePickable ? `<button type="button" class="tf-template" id="tf-template" title="Start from a template" aria-label="Template${opts?.template ? `: ${esc(opts.template.name)}` : ''}">${ICON.template}${opts?.template ? `<span class="tf-template-label">${esc(opts.template.name)}</span>` : ''}</button>` : ''}
+            <select id="tf-wf" title="${workflowEditable ? 'Workflow' : 'Workflow is locked after the task is queued'}" ${workflowEditable ? '' : 'disabled'}>${taskFormWorkflows(wf, draft).map((w) => `<option value="${esc(w.id)}" ${w.id === wf ? 'selected' : ''}>${esc(w.label)}</option>`).join('')}</select>
+          </div>
         </div>
       </div>
       <div class="tf-scroll">
@@ -11144,7 +11181,7 @@ const ARTIFACT_TEXT_PREVIEW_BYTES = 10 * 1024 * 1024;
 // and seeks), never through a popup the browser could block after an await.
 // The URL is served under a `sandbox` policy, so an HTML page in the frame
 // runs with an opaque origin, as it would in its own tab.
-function showArtifactViewer({ name, url, view, text, refresh }) {
+async function showArtifactViewer({ name, url, view, text, refresh }) {
   const previousFocus = document.activeElement;
   const dialog = document.createElement('dialog');
   dialog.className = `modal-card artifact-reader artifact-${view}`;
@@ -11183,9 +11220,9 @@ function showArtifactViewer({ name, url, view, text, refresh }) {
   }
   // A signed URL lasts an hour: a long viewing (or a restart) gets a fresh one
   // and carries on from where it was; anything else is said, never swallowed.
-  let refreshedAt = 0;
+  let refreshedAt = 0, closed = false;
   media?.addEventListener('error', async () => {
-    if (!dialog.open) return;
+    if (closed) return;
     const at = media.currentTime || 0;
     // A fresh URL that fails at once is not an expiry: say so instead of looping.
     if (refresh && Date.now() - refreshedAt > 60_000) {
@@ -11202,6 +11239,8 @@ function showArtifactViewer({ name, url, view, text, refresh }) {
     toast(`Could not open ${name}`, true);
   });
   dialog.querySelector('[data-close]').addEventListener('click', () => dialog.close());
+  // A click outside the card lands on the dialog itself (its backdrop).
+  dialog.addEventListener('click', (event) => { if (event.target === dialog) dialog.close(); });
   // Consume Escape before the shell dispatcher can also close the task behind us.
   dialog.addEventListener('keydown', (event) => {
     if (event.key !== 'Escape') return;
@@ -11210,11 +11249,15 @@ function showArtifactViewer({ name, url, view, text, refresh }) {
     dialog.close();
   });
   dialog.addEventListener('close', () => {
+    closed = true;
     // Stop the stream: a closed viewer must not keep downloading or playing.
     if (media) { media.removeAttribute('src'); media.load?.(); }
     dialog.remove();
     if (previousFocus?.isConnected) previousFocus.focus();
   }, { once: true });
+  // An image sizes the card: show it decoded rather than as a strip that then
+  // grows; one slow to arrive shows the card first, so the click still answers.
+  if (view === 'image') await Promise.race([media.decode().catch(() => {}), new Promise((resolve) => setTimeout(resolve, 1000))]);
   document.body.appendChild(dialog);
   dialog.showModal();
   dialog.querySelector('[data-close]').focus();
@@ -11296,6 +11339,10 @@ function wireReviewActions(v) {
   if (!wrap) return;
   const out = document.getElementById('review-action-out');
   wrap.querySelectorAll('.review-action').forEach((btn) => {
+    // The conversation keeps an unchanged review row across renders: wire its
+    // buttons once, or one click opens a viewer per render.
+    if (btn.reviewWired) return;
+    btn.reviewWired = true;
     btn.addEventListener('click', async () => {
       const idx = Number(btn.getAttribute('data-idx'));
       const kind = btn.getAttribute('data-kind');
@@ -22694,7 +22741,35 @@ const COMPUTER_PROVIDERS = {
   hetzner: { name: 'Hetzner', keys: 'https://console.hetzner.cloud/projects',
     tip: 'The cheapest: disks up to 10 TB that grow in place and survive pauses, in EU data centres. Use a Read & Write project token.',
     advanced: [['region', 'Location', 'fsn1'], ['image', 'Image', 'karmax snapshot, else debian-12']] },
+  // A key in two parts, joined as ID:SECRET (src/world/aws.ts reads it).
+  aws: { name: 'AWS', keys: '/docs/computers#aws', keyParts: [['Access key ID', 'text'], ['Secret access key', 'password']],
+    tip: 'Paid by the second while it works; a paused computer costs only its disk. Disks up to 16 TB that grow in place. Use an IAM user’s access key (Get a key shows its policy).',
+    advanced: [['region', 'Region', 'eu-central-1'], ['image', 'Image (AMI)', 'karmax image, else Debian 12']] },
+  gcp: { name: 'Google Cloud', keys: '/docs/computers#google-cloud', keyLabel: 'Service account key', keyFile: true,
+    tip: 'Paid by the second while it works; a paused computer costs only its disk. Machines of exactly the size you choose, disks up to 64 TB that grow in place.',
+    advanced: [['region', 'Zone', 'europe-west3-a'], ['image', 'Image', 'karmax image, else Debian 12']] },
 };
+/** The dialog's key fields: one secret, a key in parts (AWS), or a key file (Google Cloud). */
+function computerKeyMarkup(info, connection) {
+  const placeholder = connection ? 'Blank to leave unchanged' : 'Required';
+  const link = `<a class="computer-key-link" href="${esc(info.keys)}" target="_blank" rel="noopener noreferrer">Get a key</a>`;
+  if (info.keyParts) return info.keyParts.map(([label, type], index) => `<label class="form-row"><span>${esc(label)}${index ? '' : ` ${link}`}</span>
+      <input class="computer-key-part" type="${type}" autocomplete="${type === 'password' ? 'new-password' : 'off'}" spellcheck="false" placeholder="${placeholder}"></label>`).join('');
+  if (info.keyFile) return `<label class="form-row"><span>${esc(info.keyLabel)} ${link}</span>
+      <textarea class="computer-key computer-key-file" rows="3" spellcheck="false" autocomplete="off" placeholder="${connection ? 'Blank to leave unchanged' : 'Paste or drop the JSON key file'}"></textarea></label>`;
+  return `<label class="form-row"><span>API key ${link}</span>
+      <input class="computer-key" type="password" autocomplete="new-password" placeholder="${placeholder}"></label>`;
+}
+/** What the key fields hold: undefined when left blank; an error when a part is missing. */
+function computerKeyValue(overlay) {
+  const parts = [...overlay.querySelectorAll('.computer-key-part')].map((input) => input.value.trim());
+  if (parts.length) {
+    if (parts.every((part) => !part)) return undefined;
+    if (parts.some((part) => !part)) throw new Error('Enter both the access key ID and the secret access key');
+    return parts.join(':');
+  }
+  return overlay.querySelector('.computer-key').value.trim() || undefined;
+}
 function computerConnectionState(connection) {
   if (!connection) return { label: 'not connected', tone: '' };
   if (connection.managed) return { label: 'included', tone: 'done' };
@@ -22797,8 +22872,7 @@ function openComputerDialog(provider, connection, organizationId, onSaved, { man
   const overlay = document.createElement('div'); overlay.className = 'modal-overlay';
   overlay.innerHTML = `<div class="modal-card computer-dialog" role="dialog" aria-modal="true" aria-label="${esc(info.name)}">
     <div class="modal-head"><b>${esc(info.name)}</b>${info.tip ? policyTip(info.tip) : ''}<span class="label-row-fill"></span><button class="icon-btn computer-close" type="button" aria-label="Close">×</button></div>
-    <label class="form-row"><span>API key <a class="computer-key-link" href="${esc(info.keys)}" target="_blank" rel="noopener noreferrer">Get a key</a></span>
-      <input class="computer-key" type="password" autocomplete="new-password" placeholder="${connection ? 'Blank to leave unchanged' : 'Required'}"></label>
+    ${computerKeyMarkup(info, connection)}
     ${managed ? `<div class="settings-grid"><label class="form-row"><span>Machines at once ${policyTip(`The account’s concurrency limit (E2B Hobby: 20). Beyond it, tasks wait for a machine instead of being refused by ${info.name}. Blank: no limit.`)}</span>
       <input class="computer-max-running" type="number" min="1" step="1" inputmode="numeric" value="${esc(config.maxRunning ?? '')}" placeholder="No limit"></label>
       <label class="switch computer-enabled-row"><input class="toggle computer-enabled" type="checkbox" ${connection?.enabled === false ? '' : 'checked'}>Offer to organizations</label></div>` : ''}
@@ -22827,7 +22901,10 @@ function openComputerDialog(provider, connection, organizationId, onSaved, { man
       .filter((input) => input.value.trim() !== '' && Number(input.value) > 0)
       .map((input) => [input.dataset.limit, input.dataset.limit === 'memoryMb' ? Math.round(Number(input.value) * 1024) : Math.round(Number(input.value))]));
     const maxRunning = Number(overlay.querySelector('.computer-max-running')?.value);
-    const body = { apiKey: overlay.querySelector('.computer-key').value.trim() || undefined,
+    let apiKey;
+    try { apiKey = computerKeyValue(overlay); }
+    catch (error) { toast(error.message, true); button.disabled = false; return; }
+    const body = { apiKey,
       ...(managed ? { enabled: overlay.querySelector('.computer-enabled').checked } : {}),
       config: { ...Object.fromEntries([...overlay.querySelectorAll('[data-config]')].map((input) => [input.dataset.config, input.value.trim()])), limits,
         ...(managed && maxRunning > 0 ? { maxRunning: Math.round(maxRunning) } : {}) } };
@@ -22846,7 +22923,14 @@ function openComputerDialog(provider, connection, organizationId, onSaved, { man
     catch (error) { toast(error.message, true); }
   });
   document.body.appendChild(overlay); document.addEventListener('keydown', keydown);
-  overlay.querySelector('.computer-key').focus();
+  // A dropped key file is read into the field.
+  overlay.querySelector('.computer-key-file')?.addEventListener('drop', async (event) => {
+    const file = event.dataTransfer?.files?.[0];
+    if (!file) return;
+    event.preventDefault();
+    event.currentTarget.value = (await file.text()).trim();
+  });
+  overlay.querySelector('.computer-key, .computer-key-part').focus();
 }
 
 function organizationView() {
@@ -24256,6 +24340,7 @@ function legalFooter() {
 const DOC_PAGES = [
   { slug: 'getting-started', path: '/docs', title: 'Getting started' },
   { slug: 'how-it-works', path: '/docs/how-it-works', title: 'How it works' },
+  { slug: 'computers', path: '/docs/computers', title: 'Cloud computers' },
   { slug: 'cli', path: '/docs/cli', title: 'tavya CLI' },
 ];
 
@@ -24405,7 +24490,7 @@ function renderPricing() {
       <span>${esc(formatBytes(packs.storage.bytes))} more storage · ${esc(money(packs.storage.monthlyPriceCents))}/month</span>
       ${compute ? `<span>${esc(credit(packs.compute.creditMicros))} more compute · ${esc(money(packs.compute.monthlyPriceCents))}/month</span>` : ''}
       <small>On Individual and Team, as many as you like.</small></div>` : '';
-  const computeTerms = compute && packs ? `<p>Compute is the cloud computers agents work on. ${esc(siteName())} runs them for you at ${packs.computePriceMultiplier}× the provider’s list price (a 2 CPU · 2 GB E2B computer is about $0.27 an hour) and stops starting new work when the month’s compute is used up. Computers on your own E2B, Daytona, Fly.io or Hetzner account cost nothing extra and aren’t counted.</p>` : '';
+  const computeTerms = compute && packs ? `<p>Compute is the cloud computers agents work on. ${esc(siteName())} runs them for you at ${packs.computePriceMultiplier}× the provider’s list price (a 2 CPU · 2 GB E2B computer is about $0.27 an hour) and stops starting new work when the month’s compute is used up. Computers on your own E2B, Daytona, Fly.io, Hetzner, AWS or Google Cloud account cost nothing extra and aren’t counted.</p>` : '';
   renderPublicShell('/pricing', `<main class="pricing-page"><div class="legal-kicker">Hosted plans</div><h1>Free, Individual, and Team</h1>
       <p class="legal-summary">Every plan has unlimited projects. “Agents at once” is how many can work at the same time; more wait in line.</p>
       <div class="pricing-grid">${cards}</div>${addOns}

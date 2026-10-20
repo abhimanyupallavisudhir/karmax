@@ -17,6 +17,7 @@ import {
 } from '../platform/platform-request.js';
 import { SUB_TASK_ACTIONS, URGENCY_LEVELS, type AgentWait, type SubTaskAction, type Urgency } from '../domain/types.js';
 import { BRAND } from '../domain/brand.js';
+import { CLOUD_WORLD_PROVIDERS } from '../domain/computer.js';
 
 /** The longest a single wait may last: a week, after which a parked world may hibernate. */
 export const MAX_WAIT_MINUTES = 7 * 24 * 60;
@@ -708,12 +709,13 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     parameters: {
       type: 'object',
       properties: {
-        organization_id: { type: 'string' }, provider: { type: 'string', enum: ['e2b', 'daytona', 'fly', 'hetzner'] },
-        api_key: { type: 'string' }, name: { type: 'string' },
+        organization_id: { type: 'string' }, provider: { type: 'string', enum: [...CLOUD_WORLD_PROVIDERS] },
+        api_key: { type: 'string', description: 'The provider\'s API key. AWS: "<access key ID>:<secret access key>". Google Cloud: the service account key file (JSON).' },
+        name: { type: 'string' },
         template: { type: 'string' }, snapshot: { type: 'string' }, image: { type: 'string' },
         desktop_template: { type: 'string' }, desktop_snapshot: { type: 'string' }, desktop_image: { type: 'string' },
         api_url: { type: 'string' }, target: { type: 'string' },
-        region: { type: 'string', description: 'Fly.io region (fra) or Hetzner location (fsn1).' },
+        region: { type: 'string', description: 'Fly.io region (fra), Hetzner location (fsn1), AWS region (eu-central-1) or Google Cloud zone (europe-west3-a).' },
         organization: { type: 'string', description: 'Fly.io organization slug (default personal).' },
       },
       required: ['organization_id', 'provider'],
@@ -724,7 +726,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     description: 'Verify an organization cloud provider credential without creating a billable task world.',
     parameters: {
       type: 'object',
-      properties: { organization_id: { type: 'string' }, provider: { type: 'string', enum: ['e2b', 'daytona', 'fly', 'hetzner'] } },
+      properties: { organization_id: { type: 'string' }, provider: { type: 'string', enum: [...CLOUD_WORLD_PROVIDERS] } },
       required: ['organization_id', 'provider'],
     },
   },
@@ -733,7 +735,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     description: 'Remove an organization cloud provider credential after all worlds using it are gone.',
     parameters: {
       type: 'object',
-      properties: { organization_id: { type: 'string' }, provider: { type: 'string', enum: ['e2b', 'daytona', 'fly', 'hetzner'] } },
+      properties: { organization_id: { type: 'string' }, provider: { type: 'string', enum: [...CLOUD_WORLD_PROVIDERS] } },
       required: ['organization_id', 'provider'],
     },
   },

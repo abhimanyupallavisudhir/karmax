@@ -29,7 +29,8 @@ export function fundingRef(connection: { managed?: boolean } | undefined): { fun
   return connection?.managed ? { funding: 'managed' } : {};
 }
 /** Self-hosted fallback keys, imported into the installation owner's connection at boot. */
-const ENVIRONMENT_KEYS: Record<string, string> = { e2b: 'E2B_API_KEY', daytona: 'DAYTONA_API_KEY', fly: 'FLY_API_TOKEN', hetzner: 'HCLOUD_TOKEN' };
+const ENVIRONMENT_KEYS: Record<string, string> = { e2b: 'E2B_API_KEY', daytona: 'DAYTONA_API_KEY', fly: 'FLY_API_TOKEN', hetzner: 'HCLOUD_TOKEN',
+  aws: 'KARMAX_AWS_KEY', gcp: 'KARMAX_GCP_KEY' };
 
 export interface ResolvedWorldProviderConnection {
   organizationId?: string;
@@ -181,6 +182,9 @@ export class WorldProviderConnectionService {
     // endpoint must leave the previous working credential/config untouched.
     const config = cleanConfig({ ...(existing?.config ?? {}), ...(input.config ?? {}) }, this.store.hosted);
     const key = input.apiKey?.trim();
+    // A key in the wrong form is refused here, not at the first machine.
+    if (key && input.provider === 'aws') (await import('./aws.js')).awsCredentials(key);
+    if (key && input.provider === 'gcp') (await import('./gcp.js')).gcpServiceAccount(key);
     if (key) (await this.broker.registerHandle(handle, key, input.organizationId === MANAGED_COMPUTE
       ? INSTALLATION_SCOPE : organizationScope(input.organizationId)));
     if (!key && !await this.broker.hasHandle(handle)) throw new Error(`${providerName(input.provider)} API key is required`);
@@ -293,6 +297,12 @@ const defaultProbes: ProviderProbes = {
     } else if (provider === 'hetzner') {
       const { HetznerDriver } = await import('./hetzner.js');
       await new HetznerDriver().test(connection);
+    } else if (provider === 'aws') {
+      const { AwsDriver } = await import('./aws.js');
+      await new AwsDriver().test(connection);
+    } else if (provider === 'gcp') {
+      const { GcpDriver } = await import('./gcp.js');
+      await new GcpDriver().test(connection);
     } else {
       const { Daytona } = await import('@daytona/sdk');
       const client = new Daytona({ apiKey: connection.apiKey, apiUrl: connection.config.apiUrl, target: connection.config.target });
@@ -308,6 +318,16 @@ const defaultProbes: ProviderProbes = {
     if (provider === 'hetzner') {
       const { HetznerDriver } = await import('./hetzner.js');
       return new HetznerDriver().limits(connection);
+    }
+    // AWS: the largest instance of karmax's families in the region; Google
+    // Cloud: E2's largest machine within the region's CPU quota.
+    if (provider === 'aws') {
+      const { AwsDriver } = await import('./aws.js');
+      return new AwsDriver().limits(connection);
+    }
+    if (provider === 'gcp') {
+      const { GcpDriver } = await import('./gcp.js');
+      return new GcpDriver().limits(connection);
     }
     return {};
   },
@@ -364,7 +384,8 @@ function maxRunning(value: unknown): number | undefined {
   return Number.isInteger(number) && number > 0 && number <= 100_000 ? number : undefined;
 }
 
-/** A Fly region or Hetzner location (`fra`, `fsn1`), a Fly organization slug. */
+/** A Fly region, Hetzner location, AWS region or Google Cloud zone (`fra`,
+ * `fsn1`, `eu-central-1`, `europe-west3-a`), a Fly organization slug. */
 function slug(input: unknown, label: string): string | undefined {
   if (typeof input !== 'string' || !input.trim()) return undefined;
   const value = input.trim().toLowerCase();
@@ -376,6 +397,8 @@ function environmentConfig(provider: string): WorldProviderConnection['config'] 
   if (provider === 'fly') return { region: process.env.KARMAX_FLY_REGION, organization: process.env.KARMAX_FLY_ORG,
     image: process.env.KARMAX_FLY_IMAGE };
   if (provider === 'hetzner') return { region: process.env.KARMAX_HETZNER_LOCATION, image: process.env.KARMAX_HETZNER_IMAGE };
+  if (provider === 'aws') return { region: process.env.KARMAX_AWS_REGION, image: process.env.KARMAX_AWS_IMAGE };
+  if (provider === 'gcp') return { region: process.env.KARMAX_GCP_ZONE, image: process.env.KARMAX_GCP_IMAGE };
   return provider === 'e2b'
     ? { template: process.env.KARMAX_E2B_TEMPLATE,
         desktopTemplate: process.env.KARMAX_E2B_DESKTOP_TEMPLATE }
@@ -386,5 +409,5 @@ function environmentConfig(provider: string): WorldProviderConnection['config'] 
 }
 
 export function providerName(provider: string): string {
-  return ({ e2b: 'E2B', daytona: 'Daytona', fly: 'Fly.io', hetzner: 'Hetzner Cloud' } as Record<string, string>)[provider] ?? provider;
+  return ({ e2b: 'E2B', daytona: 'Daytona', fly: 'Fly.io', hetzner: 'Hetzner Cloud', aws: 'AWS', gcp: 'Google Cloud' } as Record<string, string>)[provider] ?? provider;
 }

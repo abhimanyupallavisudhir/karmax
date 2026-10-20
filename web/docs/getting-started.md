@@ -12,7 +12,7 @@ In the organization's **Settings**:
 
 - **Projects**: connect GitHub, so agents can work on your repositories and open pull requests.
 - **Agents**: sign in with a Claude or ChatGPT subscription, or add an API key.
-- **Computers**: add an E2B, Daytona, Fly.io or Hetzner API key. Every task runs on a computer from that account.
+- **Computers**: tasks run on tavya's computers, charged to your plan, or on your own E2B, Daytona, Fly.io, Hetzner, AWS or Google Cloud account ([Cloud computers](/docs/computers)).
 
 ## 3. Create a project
 
@@ -37,6 +37,7 @@ When the agent finishes, the task moves to **Review**. Read the changes, open th
 ## Next
 
 - [How it works](/docs/how-it-works): tasks, computers, data, the wiki, and what agents may do.
+- [Cloud computers](/docs/computers): the providers compared, and how to connect your own account.
 - [tavya CLI](/docs/cli): work on a project or a task from your own machine.
 - Connect another agent (Claude Code, Codex, Cursor…) to tavya over MCP: `{{origin}}/mcp`.
 - **Ctrl+K** (**⌘K**) opens the command palette; **?** lists keyboard shortcuts.

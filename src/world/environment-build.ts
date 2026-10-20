@@ -6,7 +6,7 @@ import { promisify } from 'node:util';
 import type { ProjectEnvironmentSpec } from '../domain/types.js';
 import { environmentArtifactName } from '../util/environment-artifact.js';
 import { buildSizedTemplate, e2bTemplate, e2bWorldTemplate } from './e2b-template.js';
-import { machineShape, type MachineShape } from '../domain/computer.js';
+import { isVmWorldProvider, machineShape, type MachineShape } from '../domain/computer.js';
 import { daytonaSize } from './daytona.js';
 export { environmentArtifactName } from '../util/environment-artifact.js';
 
@@ -57,9 +57,9 @@ export async function buildEnvironment(input: EnvironmentBuildInput): Promise<En
   if (input.provider === 'container') return buildContainer(input);
   if (input.provider === 'e2b') return buildE2b(input);
   if (input.provider === 'daytona') return buildDaytona(input);
-  // A VM world keeps its machine across parks (Fly) or boots from karmax's own
-  // snapshot (Hetzner): project setup runs live in the world, as when unbuilt.
-  if (input.provider === 'fly' || input.provider === 'hetzner') return { ref: 'host' };
+  // A VM world keeps its machine across parks (Fly, AWS, Google Cloud) or boots
+  // from karmax's own snapshot (Hetzner): project setup runs live in the world, as when unbuilt.
+  if (isVmWorldProvider(input.provider)) return { ref: 'host' };
   throw new Error(`environment builds are not supported for provider "${input.provider}"`);
 }
 
