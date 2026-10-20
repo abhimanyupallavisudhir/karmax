@@ -9,7 +9,7 @@ import type { Message, Provider } from '../domain/types.js';
 import { claudeCwdSlug, findProviderSession } from './fork.js';
 import { codexHistoryMetadata, codexRolloutFilename, prepareCodexHistory, CodexHistoryError } from './codex-history.js';
 import { installLocalCodexSnapshot, localCodexCopies, readLocalCodexHistory } from './codex-history-files.js';
-import { publicFetch, publicUrl } from '../mcp/connections/http.js';
+import { publicShareFetch, publicUrl } from '../mcp/connections/http.js';
 import { BRAND } from '../domain/brand.js';
 
 const pexec = promisify(execFile);
@@ -131,6 +131,33 @@ export function publicConversationShare(value: string): ConversationShareLink | 
   return undefined;
 }
 
+/** claude.ai serves a share as an app shell that loads the conversation from
+ * this JSON, which keeps tool calls and titles the rendered page drops. */
+export function claudeShareSnapshotUrl(share: ConversationShareLink): string | undefined {
+  if (share.format !== 'claude-share') return undefined;
+  const id = new URL(share.url).pathname.slice('/share/'.length).replace(/\/$/, '');
+  return `https://claude.ai/api/chat_snapshots/${encodeURIComponent(id)}?rendering_mode=messages&render_all_tools=true`;
+}
+
+/** Cloudflare in front of claude.ai answers a request that looks scripted with
+ * a "Verify you are human" page (403). Checked 2026-10-20: from tavya.io's host a
+ * request is served once it names itself and says it is a navigation; from E2B
+ * it must also offer ALPN, as guardedFetch does. A bare request is refused. */
+const CLAUDE_SNAPSHOT_HEADERS = { 'user-agent': BRAND, accept: 'application/json', 'sec-fetch-mode': 'navigate' };
+
+async function fetchShare(share: ConversationShareLink): Promise<{ data: Buffer; name: string }> {
+  const snapshot = claudeShareSnapshotUrl(share);
+  const response = await (snapshot ? publicShareFetch(snapshot, { headers: CLAUDE_SNAPSHOT_HEADERS }) : publicShareFetch(share.url));
+  if (response.status === 404 || response.status === 410)
+    throw new PanagentError('Share link not found; it may have been deleted or unshared');
+  if (snapshot && (!response.ok || !/json/i.test(response.headers.get('content-type') ?? '')))
+    throw new PanagentError(`claude.ai refused to send this share to ${BRAND} (HTTP ${response.status}). Open ${snapshot} `
+      + 'in your browser, save it (Ctrl+S or ⌘S) and upload that file under Fork a previous agent → Upload conversation '
+      + '(move a started task back to Draft first).');
+  if (!response.ok) throw new PanagentError(`Share request returned HTTP ${response.status}`);
+  return { data: Buffer.from(await response.arrayBuffer()), name: snapshot ? 'share.json' : 'share.html' };
+}
+
 export function looksLikeConversationUrl(value: string): boolean {
   try {
     const url = new URL(value);
@@ -163,12 +190,9 @@ export async function importWithPanagent(opts: PanagentImportOptions): Promise<P
     if ('url' in opts.source) {
       const share = publicConversationShare(opts.source.url);
       if (!share) throw new PanagentError(`Use a public HTTPS ChatGPT, Claude or ${BRAND} share URL`);
-      const response = await publicFetch(share.url);
-      if (response.status === 404 || response.status === 410)
-        throw new PanagentError('Share link not found; it may have been deleted or unshared');
-      if (!response.ok) throw new PanagentError(`Share request returned HTTP ${response.status}`);
-      source = path.join(temporary, 'share.html');
-      fs.writeFileSync(source, Buffer.from(await response.arrayBuffer()), { mode: 0o600 });
+      const fetched = await fetchShare(share);
+      source = path.join(temporary, fetched.name);
+      fs.writeFileSync(source, fetched.data, { mode: 0o600 });
       format.push('--from', share.format);
     }
     if ('data' in opts.source) fs.writeFileSync(source, opts.source.data, { mode: 0o600 });

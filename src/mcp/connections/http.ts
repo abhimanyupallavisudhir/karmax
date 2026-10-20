@@ -1,5 +1,6 @@
 import https from 'node:https';
 import dns from 'node:dns/promises';
+import type tls from 'node:tls';
 import { isIP } from 'node:net';
 import { Readable } from 'node:stream';
 
@@ -43,7 +44,7 @@ async function publicLookup(host: string) {
 
 /** Shared-host requests are bounded, never follow redirects, and never inherit
  * cookies, proxy settings or platform authorization. Also used for OAuth URLs. */
-function guardedFetch(stream: boolean, timeoutMs = stream ? 65_000 : 15_000): typeof fetch { return async (input, init) => {
+function guardedFetch(stream: boolean, timeoutMs = stream ? 65_000 : 15_000, maxBytes = 2 * 1024 * 1024): typeof fetch { return async (input, init) => {
   const request = new Request(input, init);
   const url = publicUrl(request.url);
   const host = url.hostname.replace(/^\[|\]$/g, '');
@@ -55,6 +56,9 @@ function guardedFetch(stream: boolean, timeoutMs = stream ? 65_000 : 15_000): ty
   return await new Promise<Response>((resolve, reject) => {
     const req = https.request(url, {
       method: request.method, headers: Object.fromEntries(request.headers),
+      // Offered by every current client; Cloudflare refuses some sites (claude.ai) to a TLS hello without it.
+      // Node hands it to tls.connect, though https.RequestOptions does not declare it.
+      ...({ ALPNProtocols: ['http/1.1'] } satisfies tls.ConnectionOptions),
       lookup: ((_host: string, options: any, cb: any) => options.all
         ? cb(null, [selected]) : cb(null, selected.address, selected.family)) as any,
       signal: request.signal,
@@ -72,7 +76,7 @@ function guardedFetch(stream: boolean, timeoutMs = stream ? 65_000 : 15_000): ty
       const chunks: Buffer[] = []; let bytes = 0;
       res.on('data', (chunk: Buffer) => {
         bytes += chunk.length;
-        if (bytes > 2 * 1024 * 1024) req.destroy(new Error('Endpoint response is too large'));
+        if (bytes > maxBytes) req.destroy(new Error('Endpoint response is too large'));
         else chunks.push(chunk);
       });
       res.on('error', reject);
@@ -95,3 +99,5 @@ export const publicStreamFetch = guardedFetch(true);
 export const publicSlowFetch = guardedFetch(false, 60_000);
 /** The same guard for a single model completion, which can take a minute. */
 export const publicModelFetch = guardedFetch(false, 90_000);
+/** A public conversation share: as large as an uploaded conversation (MAX_CONVERSATION_IMPORT_BYTES). */
+export const publicShareFetch = guardedFetch(false, 30_000, 20 * 1024 * 1024);

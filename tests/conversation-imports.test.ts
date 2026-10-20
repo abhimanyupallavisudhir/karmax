@@ -343,6 +343,31 @@ describe('Krmax panagent bridge', () => {
     }
   });
 
+  // What a person saves from https://claude.ai/api/chat_snapshots/<id> (the
+  // route tavya's guidance for a Claude share link names; fixture modelled on it).
+  it('imports a Claude share saved from the browser as an uploaded conversation', async () => {
+    const data = fs.readFileSync(new URL('./fixtures/claude-chat-snapshot.json', import.meta.url));
+    expect(detectConversationImport(data)).toBe('claude-export');
+    const home = temporary('karmax-panagent-snapshot-');
+    try {
+      const result = await importWithPanagent({ source: { data, name: 'e510a898-8e59-4423-b613-12c7c5ac37a5.json' },
+        provider: 'claude', forkHome: home, worldPath: '/tmp/snapshot-world', mode: 'transcript', native: true });
+      expect(result.kind).toBe('native');
+      if (result.kind !== 'native') return;
+      const records = fs.readFileSync(path.join(home, 'projects', '-tmp-snapshot-world', `${result.sessionId}.jsonl`), 'utf8')
+        .trim().split('\n').map((line) => JSON.parse(line));
+      const text = JSON.stringify(records);
+      expect(text).toContain('Plan the oversight experiments.');
+      expect(text).toContain('Build the testbed first, then the evaluations.');
+      expect(text).toContain('Debate, consultancy and market designs.');
+    } finally { fs.rmSync(home, { recursive: true, force: true }); }
+    const ir = spawnSync('python3', ['-m', 'panagent', 'convert', '-', '--to', 'ir', '--quiet'],
+      { input: data, encoding: 'utf8', env: { PATH: process.env.PATH, PYTHONPATH: VENDORED_PANAGENT } });
+    expect(ir.status, ir.stderr).toBe(0);
+    expect(JSON.parse(ir.stdout)).toMatchObject({ title: 'Latent variable experiments',
+      source: { conversation_id: 'e510a898-8e59-4423-b613-12c7c5ac37a5' } });
+  });
+
   it('accepts only public ChatGPT, Claude and tavya share URLs', () => {
     const tavya = `https://tavya.io/share/conversations/${'A'.repeat(43)}`;
     expect(publicConversationShare('https://chatgpt.com/share/abc')).toEqual({ url: 'https://chatgpt.com/share/abc', format: 'chatgpt-share' });
