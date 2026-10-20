@@ -34,6 +34,7 @@ const context = vm.createContext({
 });
 vm.runInContext(
   [
+    extractFunction('listState'),
     extractFunction('patchLifecycleView'),
     extractFunction('patchTaskListFromEvent'),
     extractFunction('pendingCancellationView'),
