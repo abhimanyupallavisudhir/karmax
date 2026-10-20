@@ -21,12 +21,12 @@ it('keeps the template and workflow controls in place when the save note appears
     await signIn(context, g.url, 'ada@example.test', PASSWORD);
     await consoleRequest(context, g.url, 'POST', `/api/organizations/${organization.id}/projects`, { name: 'Website' });
     const note = page.locator('#tf-savestate');
-    const controls = () => page.evaluate(() => {
-      const box = (selector: string) => document.querySelector(selector)!.getBoundingClientRect();
-      const bar = document.querySelector('.tf-head-inner')!;
+    const controls = () => page.evaluate<{ template: number; workflow: number; endGap: number }>(`(() => {
+      const box = (selector) => document.querySelector(selector).getBoundingClientRect();
+      const bar = document.querySelector('.tf-head-inner');
       const inner = bar.getBoundingClientRect().right - parseFloat(getComputedStyle(bar).paddingRight);
       return { template: Math.round(box('#tf-template').left), workflow: Math.round(box('#tf-wf').left), endGap: Math.round(inner - box('#tf-wf').right) };
-    });
+    })()`);
 
     let before: Awaited<ReturnType<typeof controls>>;
     await step('the new task form opens with the controls at the end of the bar', async () => {
