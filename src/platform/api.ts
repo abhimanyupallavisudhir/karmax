@@ -1432,7 +1432,7 @@ export class KarmaxApi {
     const projectVault = (await this.deps.store.getSettings(project.id, 'vault')) ?? {};
     const vaultDefaults = Object.hasOwn(projectVault, 'credentialGrants') ? projectVault : orgVault;
     const grants = args.credentialGrants ?? vaultDefaults.credentialGrants as string[] | undefined;
-    const ungranted = this.applyCredentialGrants(authorization, grants, caller.caps);
+    const ungranted = (await this.applyCredentialGrants(authorization, grants, caller, project.organizationId ?? 'org_personal'));
     // Credentials named explicitly are a gap like an explicit level; inherited
     // defaults are narrowed to the creator, as the default level is.
     const missingCredentialGrants = args.credentialGrants === undefined ? [] : ungranted;
@@ -2344,12 +2344,18 @@ export class KarmaxApi {
    * the grants it left out (marking the package attenuated); the caller
    * decides whether that is a gap to refuse or a default to narrow.
    */
-  private applyCredentialGrants(
+  private async applyCredentialGrants(
     authorization: { capabilities: Capability[]; attenuated: boolean },
     requested: string[] | undefined,
-    callerCaps: Capability[],
-  ): Capability[] {
+    caller: ScopedToken,
+    organizationId: string,
+  ): Promise<Capability[]> {
     const ungranted: Capability[] = [];
+    // A task's agent also passes on the vault items its task created (task #716:
+    // an agent stored a key, then had to ask a person to let its follow-up use it).
+    const callerCaps = requested?.length && caller.taskId && caller.taskId !== '*'
+      ? [...caller.caps, ...(await new VaultItems(this.deps.store, undefined, undefined, organizationId).createdCaps(caller.taskId))]
+      : caller.caps;
     for (const raw of requested ?? []) {
       const cap = String(raw);
       if (!cap.startsWith('use-credential:')) throw new Error(`credentialGrants entries must be use-credential:… capabilities (got ${cap})`);
@@ -2449,7 +2455,7 @@ export class KarmaxApi {
       ? (await this.deps.authorization.taskGrant(caller.principal, task.projectId, requested, grantorCaps))
       : { profileId: typeof requested === 'string' ? requested : requested.level, capabilities: caller.caps, attenuated: false };
     const profileAttenuated = authorization.attenuated;
-    const missingCredentialGrants = this.applyCredentialGrants(authorization, credentialGrants, caller.caps);
+    const missingCredentialGrants = (await this.applyCredentialGrants(authorization, credentialGrants, caller, organizationId));
     const priorAuthorization = task.params?._authorization as {
       credentialPolicies?: VaultTaskPolicyOverrides; delegationId?: string; principal?: string;
       attenuationAccepted?: boolean; level?: string; scope?: string; projectIds?: string[]; capabilities?: string[];
@@ -2733,7 +2739,8 @@ export class KarmaxApi {
       ? (await this.deps.authorization.taskGrant(caller.principal, task.projectId, selection, grantorCaps))
       : { ...selection, profileId: selection.level, capabilities: [...caller.caps], attenuated: false };
     const profileAttenuated = authorization.attenuated;
-    const ungranted = this.applyCredentialGrants(authorization, requested.credentialGrants ?? inherited.credentialGrants, caller.caps);
+    const ungranted = (await this.applyCredentialGrants(authorization, requested.credentialGrants ?? inherited.credentialGrants,
+      caller, organizationId));
     const missingCredentialGrants = requested.credentialGrants === undefined ? [] : ungranted;
     const limited = profileAttenuated || missingCredentialGrants.length > 0;
     const credentialPolicies = (await this.credentialPolicyOverrides(organizationId,

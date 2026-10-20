@@ -42,14 +42,15 @@ async function fixture() {
   /** The Do agent of a developer's task: only its own token, no human subject. */
   const parent = await store.createTask({ projectId: project.id, title: 'Parent', workflow: 'software-dev',
     workflowVersion: '1.4.0', createdBy: { kind: 'user', userId: 'dev' }, params: { prompt: 'work' } });
-  const agent = async (extra: string[] = []) => {
+  const agentOf = async (taskId: string, extra: string[] = []) => {
     const held = [...await authorization.capabilities('user:dev', project.id, organization.id), ...extra];
-    return (await tokens.mint({ taskId: parent.id, profileId: 'do', role: 'do', principal: `task-agent:${parent.id}:do`,
+    return (await tokens.mint({ taskId, profileId: 'do', role: 'do', principal: `task-agent:${taskId}:do`,
       projectId: project.id, organizationId: organization.id, ceiling: held, grantorCaps: held })).token;
   };
+  const agent = (extra: string[] = []) => agentOf(parent.id, extra);
   const developer: AuthorizationSelection = { level: 'developer', scope: 'projects', projectIds: [project.id] };
   const maintainer: AuthorizationSelection = { level: 'maintainer', scope: 'projects', projectIds: [project.id] };
-  return { store, organization, project, api, human, agent, cap, developer, maintainer, started, parent };
+  return { store, organization, project, api, human, agent, agentOf, cap, developer, maintainer, started, parent };
 }
 
 const credentialsOf = (task: { params: Record<string, unknown> }) =>
@@ -64,6 +65,59 @@ describe('an agent creating a task', () => {
     expect(task.authorizationGap).toBeUndefined();
     expect(task.params._authorization).toMatchObject({ level: 'developer', profileAttenuated: false });
     expect(credentialsOf(task)).toEqual([f.cap]);
+  });
+
+  it('passes on a credential its own task stored, without asking anyone (task #716)', async () => {
+    const f = await fixture();
+    const vault = new VaultItems(f.store, undefined, undefined, f.organization.id);
+    const stored = await vault.save({ type: 'api-key', label: 'AWS key it created',
+      provenance: { source: `task:${f.parent.id}`, taskId: f.parent.id } });
+    const storedCap = `use-credential:item:${stored.id}`;
+    const task = await f.api.createTask(await f.agent(), { projectId: f.project.id, workflow: 'just-do', prompt: 'use it',
+      authorization: f.developer, credentialGrants: [storedCap], holdForAuthorization: true });
+    expect(task.params.draft).toBe(false);
+    expect(task.authorizationGap).toBeUndefined();
+    expect(credentialsOf(task)).toEqual([storedCap]);
+    // Another task's agent did not create it, so it still has to ask.
+    const other = await f.store.createTask({ projectId: f.project.id, title: 'Other', workflow: 'software-dev',
+      workflowVersion: '1.4.0', createdBy: { kind: 'user', userId: 'dev' }, params: { prompt: 'work' } });
+    const refused = await f.api.createTask(await f.agentOf(other.id), { projectId: f.project.id, workflow: 'just-do', prompt: 'use it',
+      authorization: f.developer, credentialGrants: [storedCap], holdForAuthorization: true });
+    expect(refused.params.draft).toBe(true);
+    expect(refused.authorizationGap).toMatchObject({ missingCapabilities: [storedCap] });
+  });
+
+  it('asks a person only for what it cannot grant itself, keeping its own credential', async () => {
+    const f = await fixture();
+    const vault = new VaultItems(f.store, undefined, undefined, f.organization.id);
+    const stored = await vault.save({ type: 'api-key', label: 'its own key',
+      provenance: { source: `task:${f.parent.id}`, taskId: f.parent.id } });
+    const storedCap = `use-credential:item:${stored.id}`;
+    const agent = await f.agent();
+    const held = await f.api.createTask(agent, { projectId: f.project.id, workflow: 'just-do', prompt: 'deploy',
+      authorization: f.maintainer, credentialGrants: [storedCap, f.cap], holdForAuthorization: true });
+    expect(held.params.draft).toBe(true);
+    expect(held.authorizationGap!.missingCapabilities).toContain(f.cap);
+    expect(held.authorizationGap!.missingCapabilities).not.toContain(storedCap);
+    const asked = await f.api.requestPermission(agent, { taskId: held.id, reason: 'Deploys.' });
+    await f.api.resolveAuthorizationRequest(await f.human('admin'), {
+      organizationId: f.organization.id, requestId: asked.requestId!, action: 'approve' });
+    const task = (await f.store.getTask(held.id))!;
+    expect(task.params.draft).toBe(false);
+    expect(credentialsOf(task).sort()).toEqual([storedCap, f.cap].sort());
+  });
+
+  it('lets a task grant its own stored credential to a draft it created later', async () => {
+    const f = await fixture();
+    const agent = await f.agent();
+    const draft = await f.api.createTask(agent, { projectId: f.project.id, workflow: 'just-do', prompt: 'later',
+      authorization: f.developer, draft: true, holdForAuthorization: true });
+    const vault = new VaultItems(f.store, undefined, undefined, f.organization.id);
+    const stored = await vault.save({ type: 'api-key', label: 'made after the draft',
+      provenance: { source: `task:${f.parent.id}`, taskId: f.parent.id } });
+    const storedCap = `use-credential:item:${stored.id}`;
+    await f.api.setTaskAuthorization(agent, draft.id, f.developer, [storedCap]);
+    expect(credentialsOf((await f.store.getTask(draft.id))!)).toEqual([storedCap]);
   });
 
   it('keeps a task it cannot fully grant as a draft and says whom to ask', async () => {
