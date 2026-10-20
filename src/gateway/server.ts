@@ -6801,6 +6801,11 @@ export class Gateway {
 
       // Agent-role defaults resolve project → organization → bundled/legacy.
       // Unscoped access is reserved for the operator-owned fallback records.
+      // The public registry is the same for every organization: no scope needed.
+      if (p === '/api/mcp/registry' && method === 'GET') {
+        try { return this.json(res, 200, await registrySearch(url.searchParams.get('search') ?? '', url.searchParams.get('cursor') ?? '')); }
+        catch (e) { return this.json(res, e instanceof RangeError ? 400 : 502, { error: e instanceof Error ? e.message : String(e) }); }
+      }
       if (p === '/api/mcp' || p.startsWith('/api/mcp/')) {
         const organizationId = requestedScope.organizationId;
         const projectId = requestedScope.projectId;
@@ -6815,8 +6820,6 @@ export class Gateway {
             return this.json(res, 200, { redirectUri: origin ? new URL('/mcp-callback', origin).href : undefined,
               clientMetadataUrl: mcpClientMetadata()?.client_id });
           }
-          if (p === '/api/mcp/registry' && method === 'GET')
-            return this.json(res, 200, await registrySearch(url.searchParams.get('search') ?? '', url.searchParams.get('cursor') ?? ''));
           if (p === '/api/mcp' && method === 'GET') return this.json(res, 200, await Promise.all((await connections.list(projectId)).map(async (c) => ({ ...c,
             connected: c.auth === 'none' || (c.auth === 'secrets' ? c.secretNames.length > 0 : !!(await connections.secret(c)).tokens?.access_token) }))));
           if (p === '/api/mcp' && method === 'POST') {

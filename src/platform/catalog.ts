@@ -61,7 +61,7 @@ export const PLATFORM_API_CATALOG = {
     'GET /api/mcp/oauth-info?projectId= (or organizationId; callback URL and automatic registration identity)',
     'POST /api/mcp accepts optional oauthClient {clientId,tokenEndpointAuthMethod,clientSecret?} for preregistration; null restores automatic registration; secrets are write-only',
     'GET|POST /api/mcp?projectId= (or organizationId; POST creates/updates {id?, label, transport, auth, enabled?, secrets?}; secrets are write-only)',
-    'GET /api/mcp/registry?projectId=&search=&cursor= (Official MCP Registry discovery; listings are untrusted metadata)',
+    'GET /api/mcp/registry?search=&cursor= (Official MCP Registry discovery by words of name, title and description; any signed-in caller; listings are untrusted metadata)',
     'DELETE /api/mcp/:id?projectId= (or organizationId; owning scope required)',
     'POST /api/mcp/:id/test?projectId= (or organizationId; probes remote HTTPS, never executes custom processes on the host)',
     'POST /api/mcp/:id/authorize?projectId= (or organizationId; starts actor-bound OAuth)',
