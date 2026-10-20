@@ -941,7 +941,10 @@ a.git-repo-name:hover { color:var(--accent); }
 .tf-head-inner { display: flex; align-items: center; gap: 10px; }
 .tf-head h2 { margin: 0; font-size: 17px; letter-spacing: -0.01em; white-space: nowrap; }
 .tf-crumb { color: var(--ink-3); font-size: 13px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.tf-savestate { margin-left: auto; flex: none; }
+/* The save note, template and workflow sit at the end; the group (not the
+   note, which is hidden while empty) holds them there, so they stay put. */
+.tf-head-end { margin-left: auto; flex: 0 1 auto; min-width: 0; display: flex; align-items: center; gap: 10px; }
+.tf-savestate { flex: none; }
 /* Attempt switcher in the Edit draft bar: the task page's cards, minus the crown. */
 .tf-attempts { flex: 0 100 auto; margin-left: 4px; } /* scrolls before the crumb truncates */
 .tf-attempts .attempt-card { padding-right: 10px; }
