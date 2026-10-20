@@ -11125,7 +11125,7 @@ const ARTIFACT_TEXT_PREVIEW_BYTES = 10 * 1024 * 1024;
 // and seeks), never through a popup the browser could block after an await.
 // The URL is served under a `sandbox` policy, so an HTML page in the frame
 // runs with an opaque origin, as it would in its own tab.
-function showArtifactViewer({ name, url, view, text, refresh }) {
+async function showArtifactViewer({ name, url, view, text, refresh }) {
   const previousFocus = document.activeElement;
   const dialog = document.createElement('dialog');
   dialog.className = `modal-card artifact-reader artifact-${view}`;
@@ -11164,9 +11164,9 @@ function showArtifactViewer({ name, url, view, text, refresh }) {
   }
   // A signed URL lasts an hour: a long viewing (or a restart) gets a fresh one
   // and carries on from where it was; anything else is said, never swallowed.
-  let refreshedAt = 0;
+  let refreshedAt = 0, closed = false;
   media?.addEventListener('error', async () => {
-    if (!dialog.open) return;
+    if (closed) return;
     const at = media.currentTime || 0;
     // A fresh URL that fails at once is not an expiry: say so instead of looping.
     if (refresh && Date.now() - refreshedAt > 60_000) {
@@ -11183,6 +11183,8 @@ function showArtifactViewer({ name, url, view, text, refresh }) {
     toast(`Could not open ${name}`, true);
   });
   dialog.querySelector('[data-close]').addEventListener('click', () => dialog.close());
+  // A click outside the card lands on the dialog itself (its backdrop).
+  dialog.addEventListener('click', (event) => { if (event.target === dialog) dialog.close(); });
   // Consume Escape before the shell dispatcher can also close the task behind us.
   dialog.addEventListener('keydown', (event) => {
     if (event.key !== 'Escape') return;
@@ -11191,11 +11193,15 @@ function showArtifactViewer({ name, url, view, text, refresh }) {
     dialog.close();
   });
   dialog.addEventListener('close', () => {
+    closed = true;
     // Stop the stream: a closed viewer must not keep downloading or playing.
     if (media) { media.removeAttribute('src'); media.load?.(); }
     dialog.remove();
     if (previousFocus?.isConnected) previousFocus.focus();
   }, { once: true });
+  // An image sizes the card: show it decoded rather than as a strip that then
+  // grows; one slow to arrive shows the card first, so the click still answers.
+  if (view === 'image') await Promise.race([media.decode().catch(() => {}), new Promise((resolve) => setTimeout(resolve, 1000))]);
   document.body.appendChild(dialog);
   dialog.showModal();
   dialog.querySelector('[data-close]').focus();
@@ -11277,6 +11283,10 @@ function wireReviewActions(v) {
   if (!wrap) return;
   const out = document.getElementById('review-action-out');
   wrap.querySelectorAll('.review-action').forEach((btn) => {
+    // The conversation keeps an unchanged review row across renders: wire its
+    // buttons once, or one click opens a viewer per render.
+    if (btn.reviewWired) return;
+    btn.reviewWired = true;
     btn.addEventListener('click', async () => {
       const idx = Number(btn.getAttribute('data-idx'));
       const kind = btn.getAttribute('data-kind');
