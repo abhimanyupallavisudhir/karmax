@@ -5007,6 +5007,20 @@ function subTaskSummaryEventNeedsRefresh(ev) {
   return (S.view?.subTaskSummaries || []).some((summary) => summary.id === ev.taskId);
 }
 
+// A non-principal attempt can stand in for its task in a search (otherAttempt),
+// so its lifecycle can change the results: when the row it shows changes, or,
+// if the list does not show it, when its stage or status does (an attempt not
+// seen before may have just changed). Agent-turn churn alone changes neither.
+const attemptListStates = new Map();
+function siblingAttemptChangesSearch(ev) {
+  if (ev.type !== 'view.updated' || !ev.taskId) return false;
+  const state = `${ev.payload?.stage}\u0000${ev.payload?.status}`;
+  const before = attemptListStates.get(ev.taskId);
+  attemptListStates.set(ev.taskId, state);
+  const row = (S.searchResult?.tasks || []).find((task) => task.id === ev.taskId);
+  return row ? patchLifecycleView({ ...row }, ev) : before !== state;
+}
+
 function patchTaskListFromEvent(ev) {
   if (ev.type !== 'view.updated' || !ev.taskId) return false;
   const task = S.tasks.find((candidate) => candidate.id === ev.taskId);
@@ -5124,9 +5138,8 @@ function connectWs() {
       if (S.tab === 'tasks' && !S.selected) scheduleSearch(true);
       if (S.tab === 'queue' && !S.selected) bgRenderMain();
     } else if (currentProject && siblingAttempt) {
-      // Any attempt can stand in for its task in a search, so its lifecycle can
-      // change the results — though never the principals-only task index.
-      if (S.tab === 'tasks' && !S.selected && (ev.type === 'view.updated' || ev.type === 'task.stage')) scheduleSearch(true);
+      // Never the principals-only task index, but perhaps the search results.
+      if (S.tab === 'tasks' && !S.selected && siblingAttemptChangesSearch(ev)) scheduleSearch(true);
     } else if (currentProject && (LIST_RELOAD_EVENTS.has(ev.type)
       || (ev.type === 'view.updated' && ev.taskId && !S.tasks.some((t) => t.id === ev.taskId)
         ))) {

@@ -126,7 +126,7 @@ const report = process.env.REQUEST_BUDGET_REPORT === '1';
     await page.evaluate(() => { history.pushState({ kx: 1 }, '', '/org/workspace'); dispatchEvent(new PopStateEvent('popstate')); });
     await page.locator('[data-id="t1"]').waitFor();
     await settle();
-    // A non-principal attempt, a foreign project, other tasks' output: none is a list change.
+    // A non-principal attempt's agent turns, a foreign project, other tasks' output: none is a list change.
     record(await measure('busy event stream (list)', async () => {
       for (let i = 0; i < 20; i++) {
         if (i % 4 === 0) await page.waitForTimeout(400);
@@ -202,7 +202,10 @@ const report = process.env.REQUEST_BUDGET_REPORT === '1';
         assert.equal(results[name].counts['GET /api/inbox'], undefined, `${name}: the inbox spans organizations and is not reloaded`);
       assert.ok(!Object.keys(results['boot (other organization)'].counts).some(key => key.includes('/organizations/o/')),
         'a deep link loads only its own organization');
-      budget('busy event stream (list)', 0);
+      // One: the first event of a non-principal attempt the list does not show
+      // may have brought it to match (it can stand in for its task); its agent
+      // turns churning after that change nothing.
+      budget('busy event stream (list)', 1);
       budget('task open', 8, 1);
       assert.equal(walkedTo, '/org/workspace/tasks/5', 'every j/k press counts, even before the last task loaded');
       budget('j/k walk (5 keys)', 8, 1);
