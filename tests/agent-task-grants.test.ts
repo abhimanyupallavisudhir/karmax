@@ -30,9 +30,11 @@ async function fixture() {
   await authorization.grant('system:test', { principalId: 'user:dev', scopeKey: projectScope(project.id), profileId: 'developer' });
   const tokens = new TokenAuthority(store);
   const started: string[] = [];
+  const signals: Array<{ workflowId: string; name: string; args: unknown[] }> = [];
   const client = { workflow: {
-    getHandle: () => ({ executeUpdate: async () => undefined, query: async () => { throw new Error('no live query'); },
-      describe: async () => ({ runId: 'run', status: { name: 'RUNNING' } }), signal: async () => undefined }),
+    getHandle: (workflowId: string) => ({ executeUpdate: async () => undefined, query: async () => { throw new Error('no live query'); },
+      describe: async () => ({ runId: 'run', status: { name: 'RUNNING' } }),
+      signal: async (name: string, ...args: unknown[]) => { signals.push({ workflowId, name, args }); } }),
     start: async (_type: unknown, options: { workflowId: string }) => { started.push(options.workflowId); return {}; },
   } } as any;
   const api = new KarmaxApi({ store, client, taskQueue: 'test', tokens, authorization });
@@ -52,7 +54,7 @@ async function fixture() {
   const agent = (extra: string[] = []) => agentOf(parent.id, extra);
   const developer: AuthorizationSelection = { level: 'developer', scope: 'projects', projectIds: [project.id] };
   const maintainer: AuthorizationSelection = { level: 'maintainer', scope: 'projects', projectIds: [project.id] };
-  return { store, organization, project, api, human, agent, agentOf, cap, developer, maintainer, started, parent };
+  return { store, organization, project, api, human, agent, agentOf, cap, signals, developer, maintainer, started, parent };
 }
 
 const credentialsOf = (task: { params: Record<string, unknown> }) =>
@@ -176,11 +178,38 @@ describe('an agent creating a task', () => {
     expect((await f.store.getTask(waiting.id))!.params).toMatchObject({ draft: false, triggerState: 'armed' });
     expect(f.started).not.toContain(waiting.id);
 
-    const denied = await f.api.createTask(await f.agent(), { projectId: f.project.id, workflow: 'just-do', prompt: 'deploy',
-      authorization: f.maintainer, holdForAuthorization: true });
+    const denied = await f.api.createTask(await f.agent(), { projectId: f.project.id, workflow: 'just-do', title: 'Deploy the site',
+      prompt: 'deploy', authorization: f.maintainer, holdForAuthorization: true });
+    // Ignoring the request only hides it: the task still waits on it.
+    await f.api.resolveAuthorizationRequest(await f.human('admin'), {
+      organizationId: f.organization.id, requestId: denied.authorizationRequest!.id, action: 'dismiss' });
+    expect((await f.store.getTask(denied.id))!.params._awaitingApproval).toBe(denied.authorizationRequest!.id);
+    expect(f.signals).toEqual([]);
     await f.api.resolveAuthorizationRequest(await f.human('admin'), {
       organizationId: f.organization.id, requestId: denied.authorizationRequest!.id, action: 'deny' });
     expect((await f.store.getTask(denied.id))!.params).toMatchObject({ draft: true, _awaitingApproval: null });
+    // The agent that created it hears so at once, from that task.
+    expect(f.signals).toHaveLength(1);
+    const [told] = f.signals;
+    expect(told).toMatchObject({ workflowId: f.parent.id, name: 'followUp', args: [expect.objectContaining({
+      author: `task:${denied.id}`, authorLabel: `Task #${denied.num}` }), 'do'] });
+    expect((told!.args[0] as { text: string }).text).toMatch(/denied the maintainer authorization .*"Deploy the site".* did not start/);
+    expect((told!.args[0] as { text: string }).text).toContain(`PATCH /api/tasks/${denied.id}/authorization`);
+  });
+
+  it('tells no one when the creating task has finished, nor when a person created it', async () => {
+    const f = await fixture();
+    const byPerson = await f.api.createTask(await f.human('dev'), { projectId: f.project.id, workflow: 'just-do', prompt: 'deploy',
+      authorization: f.maintainer, holdForAuthorization: true });
+    await f.api.resolveAuthorizationRequest(await f.human('admin'), {
+      organizationId: f.organization.id, requestId: byPerson.authorizationRequest!.id, action: 'deny' });
+    const byAgent = await f.api.createTask(await f.agent(), { projectId: f.project.id, workflow: 'just-do', prompt: 'deploy',
+      authorization: f.maintainer, holdForAuthorization: true });
+    await f.store.saveView(f.parent.id, { stage: 'done', status: 'done' } as any);
+    await f.api.resolveAuthorizationRequest(await f.human('admin'), {
+      organizationId: f.organization.id, requestId: byAgent.authorizationRequest!.id, action: 'deny' });
+    expect(f.signals).toEqual([]);
+    expect((await f.store.getTask(byAgent.id))!.params.draft).toBe(true);
   });
 
   it('only keeps a deliberate draft, which its creator asks for when it should run', async () => {
