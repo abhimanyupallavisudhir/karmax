@@ -241,8 +241,11 @@ export class S3ObjectStore implements ObjectStore {
     const signingKey = hmac(serviceKey, 'aws4_request');
     const signature = hmac(signingKey, stringToSign).toString('hex');
     headers.authorization = `AWS4-HMAC-SHA256 Credential=${this.options.accessKeyId}/${scope}, SignedHeaders=${names.join(';')}, Signature=${signature}`;
-    // Sent unsigned: SigV4 does not require it, and the store honours it either way.
-    const sent = options.range ? { ...headers, range: options.range } : headers;
+    // Sent unsigned: SigV4 does not require them, and the store honours them either way.
+    // The stored bytes as they are: fetch asks for gzip by default, and R2 then
+    // compresses a text type on the fly and drops its Content-Length, so a size
+    // (a whole getStream, a HEAD) would be unknown and the bytes re-encoded.
+    const sent = { ...headers, 'accept-encoding': 'identity', ...(options.range ? { range: options.range } : {}) };
     const response = await this.fetcher(base, { method, headers: sent, ...(method === 'PUT' ? { body: body as any } : {}),
       ...(options.timeoutMs ? { signal: AbortSignal.timeout(options.timeoutMs) } : {}) });
     if (options.allowMissing && response.status === 404) return response;
