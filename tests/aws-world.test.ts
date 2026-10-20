@@ -5,7 +5,7 @@ import path from 'node:path';
 import { AwsDriver, awsCredentials, ec2Query, homeDevice, parseXml, signAws, stoppedAt } from '../src/world/aws.js';
 import { ProviderCapacityFull } from '../src/agent/limits.js';
 import { VmWorldProvider } from '../src/world/vm/provider.js';
-import { runSlices } from '../src/world/vm/runs.js';
+import { diskHours, runSlices } from '../src/world/vm/runs.js';
 import { vmProvisionVersion } from '../src/world/vm/provision.js';
 import type { ResolvedWorldProviderConnection } from '../src/world/connections.js';
 import type { WorldHandle } from '../src/world/types.js';
@@ -75,6 +75,20 @@ describe('AWS signing, XML and keys', () => {
     // Only what ends after `from`.
     expect(runSlices([{ start, end: start + 12 * minute }], start + 30 * minute, start + 6 * minute)).toHaveLength(2);
   });
+
+  it('books a disk by its whole hours, and once it is deleted the part-hour it lived last', () => {
+    const start = Date.UTC(2026, 9, 20, 9);
+    const hours = (slices: Array<{ start: number; end: number }>) => slices.map((slice) => (slice.end - slice.start) / 60_000);
+    // 36 minutes old: nothing yet; deleted at 36 minutes: those 36.
+    expect(diskHours(start, start + 36 * 60_000, 0)).toEqual([]);
+    expect(hours(diskHours(start, start + 36 * 60_000, 0, start + 36 * 60_000))).toEqual([36]);
+    // 2 h 10 min: two whole hours, then the last ten minutes with the id the next whole hour would have had.
+    expect(diskHours(start, start + 130 * 60_000, 0, start + 130 * 60_000).map((slice) => [slice.id, (slice.end - slice.start) / 60_000]))
+      .toEqual([['0', 60], ['1', 60], ['2', 10]]);
+    expect(diskHours(start, start + 130 * 60_000, 0).map((slice) => slice.id)).toEqual(['0', '1']);
+    // Deleted on the hour: nothing more.
+    expect(hours(diskHours(start, start + 120 * 60_000, 0, start + 120 * 60_000))).toEqual([60, 60]);
+  });
 });
 
 describe.skipIf(!sshdAvailable)('AWS worlds (fake EC2, real sshd)', () => {
@@ -82,6 +96,7 @@ describe.skipIf(!sshdAvailable)('AWS worlds (fake EC2, real sshd)', () => {
   let provider: VmWorldProvider;
   let driver: AwsDriver;
   let stamp: string;
+  let ledger: Map<string, string>;
   const images = process.env.KARMAX_AWS_IMAGES;
 
   beforeEach(() => {
@@ -90,9 +105,15 @@ describe.skipIf(!sshdAvailable)('AWS worlds (fake EC2, real sshd)', () => {
     aws = new FakeAws();
     driver = new AwsDriver(aws.fetch, 1);
     stamp = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'vm-stamp-')), 'provisioned');
+    ledger = new Map();
     provider = new VmWorldProvider(driver, async () => connection(aws.key), undefined, {
       socket: aws.socket, user: os.userInfo().username, home: aws.home,
       provision: { stamp, script: `echo provisioned > ${stamp}`, sudo: false },
+      ledger: {
+        kvEntries: async (prefix) => [...ledger].filter(([key]) => key.startsWith(prefix)).map(([key, value]) => ({ key, value })),
+        kvSet: (key, value) => { ledger.set(key, value); },
+        kvDelete: (key) => { ledger.delete(key); },
+      },
     });
   });
   afterEach(async () => {
@@ -248,6 +269,36 @@ describe.skipIf(!sshdAvailable)('AWS worlds (fake EC2, real sshd)', () => {
     // Booked twice, the ids are the same.
     expect((await driver.usage(connection(aws.key), [...aws.volumes.values()][0]!.tags.karmaxHome!)).map((event) => event.id))
       .toEqual(events.map((event) => event.id));
+  });
+
+  it('books a deleted world’s last part-hour of both disks, and a run still going, through the feed', async () => {
+    const world = await provider.create({ taskId: 'task_gone', base: 'main', generation: 1, organizationId: 'org_a', resources: { diskGb: 50 } });
+    const [instance] = [...aws.instances.values()];
+    // Made 2 h 17 min ago and running since: deleted without a park.
+    const start = Math.floor(Date.now() / 1000) * 1000 - 137 * 60_000;
+    instance!.launchTime = new Date(start).toISOString();
+    for (const volume of aws.volumes.values()) volume.createTime = new Date(start).toISOString();
+    const home = [...aws.volumes.values()][0]!.tags.karmaxHome!;
+    const before = new Set((await provider.listUsageEvents('org_a')).events.map((event) => event.id));
+    await provider.destroy(world.handle as WorldHandle);
+    await waitFor(() => aws.volumes.size === 0);
+    expect((await driver.usage(connection(aws.key), home)).filter((event) => event.kind === 'disk')).toEqual([]);
+    const events = (await provider.listUsageEvents('org_a')).events;
+    const last = events.filter((event) => event.kind === 'disk' && !before.has(event.id));
+    expect(last.map((event) => [event.diskGb, Math.round(event.activeMs / 60_000)]).sort()).toEqual([[20, 17], [50, 17]]);
+    expect(last.find((event) => event.diskGb === 50)).toMatchObject({ taskId: 'task_gone', organizationId: 'org_a',
+      costMicros: Math.round(50 * 0.0952 / 730 * last.find((event) => event.diskGb === 50)!.activeMs / 3_600_000 * 1e6) });
+    // The run, cut where the world was deleted: 28 slices, the last one two minutes.
+    const compute = events.filter((event) => event.kind !== 'disk');
+    expect(compute).toHaveLength(28);
+    expect(compute.reduce((total, event) => total + event.activeMs, 0)).toBeGreaterThanOrEqual(137 * 60_000);
+    // Whole hours the feed already saw keep their ids, so nothing is booked twice.
+    expect(events.filter((event) => before.has(event.id)).map((event) => event.id).sort()).toEqual([...before].sort());
+    // Kept for three days, then dropped.
+    const [key] = [...ledger.keys()];
+    ledger.set(key!, JSON.stringify({ ...JSON.parse(ledger.get(key!)!), at: Date.now() - 4 * 86_400_000 }));
+    expect((await provider.listUsageEvents('org_a')).events.filter((event) => event.kind === 'disk')).toEqual([]);
+    expect(ledger.size).toBe(0);
   });
 
   it('prices from karmax’s own table when the Price List API is closed to the key', async () => {
