@@ -4401,7 +4401,16 @@ export class Store {
       // Children spawned in one turn share a millisecond and ids end in random
       // bytes; `ord` is the list position allocated at insert on both databases.
       'SELECT id, num, title, workflow, lastView, params FROM tasks WHERE parentTaskId = ? ORDER BY createdAt, ord, rowid', [parentTaskId]);
-    return rows.map((row) => taskSummary(row, row.params));
+    return rows.map((row) => {
+      const summary = taskSummary(row, row.params);
+      // A pull request of the parent (SPEC §11.1) is part of it, not a sub-task:
+      // said by its own record, so the page shows it under Branches whatever
+      // the parent's run remembers (pramana#102).
+      const of = pullRequestOf({ parentTaskId, params: JSON.parse(row.params) });
+      if (!of) return summary;
+      const target = row.lastView ? (JSON.parse(row.lastView) as TaskView).targetBranch : undefined;
+      return { ...summary, pullRequest: { checkout: of.checkout, ...(target ? { target } : {}) } };
+    });
   }
 
   /** Every task forked from this one's agents, forks of forks included, archived
@@ -5195,11 +5204,22 @@ export class Store {
     // A pull request's ask is its task's (SPEC §11.1): it is the task that waits on them.
     const headers = await this.taskHeaders(rows.map((row) => String(row.taskId)));
     const out = new Map<string, AttentionAsk>();
+    const own = new Map<string, Set<string>>();
     for (const row of rows) {
-      const taskId = headers.get(String(row.taskId))?.id ?? String(row.taskId);
+      const header = headers.get(String(row.taskId));
+      const taskId = header?.id ?? String(row.taskId);
+      const kind = String(row.kind);
       const ask = out.get(taskId) ?? out.set(taskId, { kinds: [], at: 0 }).get(taskId)!;
-      ask.kinds.push(String(row.kind));
+      ask.kinds.push(kind);
       ask.at = Math.max(ask.at, Number(row.createdAt));
+      if (header?.pullRequest) (ask.pullRequests ??= []).push({ checkout: header.pullRequest.checkout, kind });
+      else (own.get(taskId) ?? own.set(taskId, new Set()).get(taskId)!).add(kind);
+    }
+    // Which asks only a pull request makes: the task itself is not waiting on them.
+    for (const [taskId, ask] of out) {
+      if (!ask.pullRequests) continue;
+      ask.pullRequests = ask.pullRequests.filter((pr) => !own.get(taskId)?.has(pr.kind));
+      if (!ask.pullRequests.length) delete ask.pullRequests;
     }
     return out;
   }

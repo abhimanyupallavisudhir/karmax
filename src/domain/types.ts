@@ -967,9 +967,9 @@ export type ShipBranchOutcome =
 export interface TaskShipment {
   /** The checkout it is a snapshot of. */
   checkout: string;
-  /** The sub-task that owns its pull request. */
+  /** The record its pull request lands through (part of the task, not a sub-task of it). */
   childTaskId: string;
-  /** Its branch (the sub-task's own: `tavya/<childTaskId>`). */
+  /** Its branch (the record's own: `tavya/<childTaskId>`). */
   branch: string;
   /** The checkout's own branch in this task's world, which a sibling may be stacked on. */
   fromBranch: string;
@@ -1126,7 +1126,12 @@ export interface TaskList {
 }
 
 /** The live asks a person has on one task: their inbox kinds, and when the newest arrived. */
-export interface AttentionAsk { kinds: string[]; at: number }
+export interface AttentionAsk {
+  kinds: string[];
+  at: number;
+  /** Asks only the task's pull requests make (SPEC §11.1): the task itself is not waiting on them. */
+  pullRequests?: Array<{ checkout: string; kind: string }>;
+}
 
 /** The persisted index record for a task. The live view comes from the workflow query. */
 export interface TaskRecord {
@@ -1783,6 +1788,8 @@ export interface ChildTaskSummary {
   /** `approvalRequests` is the gateway's projection, as on a task-list row. */
   /** A draft sub-task that never ran reads `state.draft` (`queued` once queued, until its parent starts it). */
   lastView?: Pick<TaskView, 'stage' | 'status' | 'waitingFor' | 'pointOfNoReturnPassed' | 'approvalRequests'> & { state?: { draft?: boolean; queued?: boolean } };
+  /** It is the parent's pull request of this checkout (SPEC §11.1), not a sub-task; `target` is where it lands. */
+  pullRequest?: { checkout: string; target?: string };
 }
 
 /** A task in a fork lineage, as the Agent forks and Forked from panels show it;
@@ -1881,7 +1888,8 @@ export interface TaskView {
   forkSourceSummaries?: ForkTaskSummary[];
   parentTaskId?: string;
   /** The parent's list identity, which outlives the parent in the live task list. */
-  parentTask?: { id: string; num?: number; title: string };
+  /** `pullRequest`: this is that task's pull request of this checkout (SPEC §11.1), not its sub-task. */
+  parentTask?: { id: string; num?: number; title: string; pullRequest?: string };
   error?: string;
   /**
    * What the task is currently parked on, if anything (SPEC §6.2). Surfaced so the
@@ -2057,6 +2065,9 @@ export interface TaskRecoveryCheckpoint {
   reviewInfo?: ReviewInfo;
   /** Pull requests already opened for the preserved proposal. */
   prs?: TaskPullRequest[];
+  /** The pull requests the task opened branch by branch (v1.30), so the
+   *  replacement still knows them as its own (pramana#102). */
+  shipments?: TaskShipment[];
   session?: string;
   sessionHome?: string;
   seen?: number;

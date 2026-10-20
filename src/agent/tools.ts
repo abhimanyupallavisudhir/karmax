@@ -1773,8 +1773,8 @@ export function platformToolHandlers(
         const name = String(args.branch).trim();
         const shipped = await ctx.shipBranch({ name, ...(args?.title ? { title: String(args.title) } : {}), ...(typeof args?.data === 'boolean' ? { data: args.data } : {}) });
         return shipped.updated
-          ? `The pull request for "${name}" (sub-task ${shipped.childTaskId}) now has your latest commit of it and goes through Review again. Keep working.`
-          : `The pull request for "${name}" is open as sub-task ${shipped.childTaskId} (branch ${shipped.branch}): it is reviewed and lands on its own, as committed now. `
+          ? `The pull request for "${name}" now has your latest commit of it and goes through Review again. Keep working.`
+          : `The pull request for "${name}" is open (branch ${shipped.branch}): it is reviewed and lands on its own, as committed now. It is part of this task, not a sub-task. `
             + `Keep working. If it needs a change you will be told: make it in "${name}", commit, and call open_pr with branch "${name}" again. Call open_pr without a branch when you are finished.`;
       }
       await ctx.openPr();

@@ -14,7 +14,7 @@ import { MERGE_QUEUE_WORKFLOW, SIG_ENQUEUE, SIG_RELEASE, mergeQueueId } from '..
  * per branch, and every branch landing as its own pull request on its own
  * timing. `open_pr({branch})` opens (or updates) one branch's pull request
  * while the agent keeps working; `open_pr` alone means it is finished. Each pull
- * request is a sub-task that reviews and lands a snapshot of the branch from a
+ * request is part of its task and reviews and lands a snapshot of the branch from a
  * worktree in the task's world — no second sandbox, no second agent: changes a
  * pull request needs come back to the one agent. The task is done once its
  * agent has finished and every pull request has settled.
@@ -39,7 +39,7 @@ describe('software-dev: every branch of a task lands as its own pull request', (
       workflowId: task.id,
       args: [{ taskId: task.id, projectId: project.id, title: task.title, prompt, base: 'main', target: 'main', project: config }],
     });
-    return { taskId: task.id, handle };
+    return { taskId: task.id, handle, input: { taskId: task.id, projectId: project.id, title: task.title, prompt, base: 'main', target: 'main', project: config } };
   };
   /** The task's `n`th pull request, once it waits for a person's Review. */
   const pullRequest = async (handle: any, n: number) => {
@@ -333,7 +333,7 @@ describe('software-dev: every branch of a task lands as its own pull request', (
   it('a pull request closed without landing leaves the world, and its branch is not proposed again unchanged', async () => {
     const repo = await h.makeRepo('ship-cancelled');
     const { taskId, handle } = await start(repo, ['@branch docs', docsCommit, '@ship docs', '@incomplete'].join('\n'));
-    const { childId, child } = await pullRequest(handle, 1);
+    const { child } = await pullRequest(handle, 1);
     const snapshot = (await view(child)).world.repos[0].root as string;
     expect(fs.existsSync(snapshot)).toBe(true);
     await child.signal('cancel');
@@ -343,7 +343,7 @@ describe('software-dev: every branch of a task lands as its own pull request', (
     expect(await h.store.eventsOfType(taskId, 'pull-request.cleanup-failed')).toEqual([]);
     // The agent is told; when it finishes, the unchanged branch is not reopened.
     await expect.poll(async () => (await view(handle)).messages.some((m: any) => m.role === 'user'
-      && m.text.includes(`(sub-task ${childId}) closed without landing`)), { timeout: 30_000 }).toBe(true);
+      && m.text === 'The pull request for "docs" closed without landing (cancelled).'), { timeout: 30_000 }).toBe(true);
     expect((await handle.result()).stage).toBe('done');
     expect((await view(handle)).subTasks).toHaveLength(1);
     expect((await git(repo, ['show', 'main:docs/guide.md'])).code).not.toBe(0);
@@ -504,6 +504,38 @@ describe('software-dev: every branch of a task lands as its own pull request', (
       await handle.signal('cancel').catch(() => undefined);
     }
   }, 180_000);
+
+  // pramana#102: a hold for a person, a stage move or an escalation replaces
+  // the task's run, which starts again from a checkpoint of its view. Its pull
+  // requests must come through: still the task's (under Branches, not
+  // Sub-tasks), and their landing told as a pull request's — also for a run
+  // whose checkpoint had already lost them, which rebuilds them from the records.
+  it.each([['kept by the checkpoint', false], ['lost by an earlier replacement', true]] as const)(
+    'a replaced run keeps its pull requests (%s)', async (_how, lost) => {
+      const repo = await h.makeRepo(`ship-replaced-${lost ? 'lost' : 'kept'}`);
+      const { taskId, handle, input } = await start(repo, ['@branch docs', docsCommit, '@ship docs', '@incomplete'].join('\n'));
+      const { childId, child } = await pullRequest(handle, 1);
+      await expect.poll(async () => (await view(handle)).shipments?.length ?? 0, { timeout: 30_000 }).toBe(1);
+      const head = (await view(handle)).shipments[0].head as string;
+      await handle.signal('prepareLifecycleReplacement');
+      await handle.result();
+      const last = (await h.store.getTask(taskId))!.lastView!;
+      const recovery = await (h.api as any).transitionCheckpoint(lost ? { ...last, shipments: undefined } : last, 'do', true);
+      const next = await h.client.workflow.start('softwareDev@1.30.0', { taskQueue: TASK_QUEUE, workflowId: taskId, args: [{ ...input, recovery }] });
+      try {
+        await expect.poll(async () => (await view(next)).shipments, { timeout: 30_000 })
+          .toEqual([expect.objectContaining({ checkout: 'docs', childTaskId: childId, branch: `tavya/${childId}`, head, target: 'main', state: 'open' })]);
+        await child.signal('confirm');
+        expect((await child.result()).stage).toBe('done');
+        const told = async (): Promise<string[]> => (await view(next)).messages.filter((m: any) => m.role === 'user').map((m: any) => m.text);
+        await expect.poll(async () => (await told()).some((text) => text.startsWith('The pull request for "docs" landed on main')),
+          { timeout: 30_000 }).toBe(true);
+        expect((await told()).some((text) => text.includes(`Sub-task ${childId}`))).toBe(false);
+        expect((await view(next)).shipments).toEqual([expect.objectContaining({ childTaskId: childId, state: 'landed' })]);
+      } finally {
+        await next.terminate('test cleanup').catch(() => undefined);
+      }
+    }, 150_000);
 
   it('refuses what cannot open, and tells the agent why', async () => {
     const repo = await h.makeRepo('ship-refusals');

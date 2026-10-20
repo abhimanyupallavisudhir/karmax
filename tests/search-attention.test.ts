@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { parseQuery, stringifyQuery } from '../src/domain/query-language.js';
+import type { AttentionAsk } from '../src/domain/types.js';
 import { evaluateQuery, fieldCatalogue, forClauseValues, attentionCandidates, SearchTask } from '../src/domain/search.js';
 
 // `for:<person>` is the "what needs this person" view: the tasks with a live ask
@@ -111,6 +112,20 @@ describe('for: — order', () => {
 
   it('leaves other lists ordered by status change alone', () => {
     expect(order('')).toEqual(['unrelated-newer', 'input-recently', 'my-draft', 'reviewed-long-ago', 'mentioned-just-now']);
+  });
+});
+
+describe('for: — asks a task\'s pull requests make', () => {
+  // pramana#102: a task in Do, paused, whose pull request waits for review is
+  // listed for its reviewer, and the list knows it is the pull request asking.
+  it('says which pull request asks, apart from what the task itself asks', () => {
+    const asks = new Map([[alice, new Map<string, AttentionAsk>([
+      ['agent-busy', { kinds: ['review-requested'], at: NOW, pullRequests: [{ checkout: 'docs', kind: 'review-requested' }] }],
+      ['review-me', ask('review-requested')],
+    ])]]);
+    const result = evaluateQuery(tasks, parseQuery('for:me'), { ...ctx, attention: asks });
+    expect(result.reasons?.['agent-busy']).toEqual(['review-requested']);
+    expect(result.pullRequestAsks).toEqual({ 'agent-busy': [{ checkout: 'docs', kind: 'review-requested' }] });
   });
 });
 

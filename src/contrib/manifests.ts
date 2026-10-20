@@ -122,8 +122,8 @@ const landingAuthorityField = (): FieldSpec => ({
 // world nests its checkouts from Setup, which is the only structural difference
 // and is why this is a task-scoped field rather than something inferred later.
 // From software-dev 1.30 the agent may also open a branch's pull request while
-// it keeps working (`open_pr` with `branch`): that branch becomes a sub-task
-// with its own Review and landing, and the task is done once all have landed.
+// it keeps working (`open_pr` with `branch`): that branch's pull request has
+// its own Review and landing, and the task is done once all have landed.
 const multiPrField = (): FieldSpec => ({
   name: 'multiPr',
   type: 'boolean',
