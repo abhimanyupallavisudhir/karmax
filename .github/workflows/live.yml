@@ -142,6 +142,11 @@ jobs:
         env:
           KARMAX_RUN_LIVE: '1'
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.LIVE_CLAUDE_CODE_OAUTH_TOKEN }}
+      # A public claude.ai share, read the way tavya reads one (skips without the variable).
+      - run: npx vitest run tests/claude-share-live.test.ts
+        env:
+          KARMAX_RUN_LIVE: '1'
+          KARMAX_LIVE_CLAUDE_SHARE: ${{ vars.LIVE_CLAUDE_SHARE }}
 
   e2b:
     name: E2B sandboxes
