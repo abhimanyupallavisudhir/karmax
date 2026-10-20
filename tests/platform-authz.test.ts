@@ -151,17 +151,6 @@ describe('KarmaxApi cross-project / cross-tenant scope', () => {
       params: { 'agent:do': { resumeFrom: { taskId: 'task_missing' } } } })).rejects.toBeInstanceOf(NotFoundError);
   });
 
-  // No server can read a claude.ai share (see tests/panagent-share.test.ts), so
-  // the task is refused when it is created rather than failing once it runs.
-  it('refuses a Claude share link as a resume source, naming the file to upload instead', async () => {
-    const link = 'https://claude.ai/share/e510a898-8e59-4423-b613-12c7c5ac37a5';
-    const error = await api.createTask(token, { projectId: mine, title: 'Resume', prompt: 'go',
-      params: { 'agent:do': { resumeFrom: { sessionId: link } } } }).catch((caught) => caught);
-    expect(error).toBeInstanceOf(ValidationError);
-    expect(error.message).toContain('https://claude.ai/api/chat_snapshots/e510a898-8e59-4423-b613-12c7c5ac37a5?');
-    expect(await store.listTasks(mine)).toEqual([]);
-  });
-
   /**
    * PL-2: `_`-prefixed params are platform metadata — the task's authorization,
    * its pinned GitHub account, its Temporal run, one-shot start flags. createTask

@@ -2456,9 +2456,6 @@ html[data-theme="dark"] .github-signin-btn:active,
 .af-resume-panel { margin: 6px 0 0 22px; }
 .af-resume-panel[hidden] { display: none !important; }
 .af-resume-session { width: 100%; margin-top: 6px; padding: 7px 10px; }
-.af-resume-hint { margin-top: 4px; color: var(--ink-3); font-size: 12px; }
-.af-resume-hint:empty { display: none; }
-.af-resume-hint a { color: var(--accent); }
 .af-resume-chosen { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 12px; color: var(--accent); margin-top: 6px; }
 .af-resume-chosen:empty { display: none; }
 .af-resume-label { min-width: 0; }

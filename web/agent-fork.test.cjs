@@ -42,8 +42,6 @@ eval(extractFn('agentRoleLabel'));
 eval(extractFn('taskRecord'));
 eval(extractFn('resumeChosenInner'));
 eval(extractFn('resumeUploadInner'));
-eval(extractFn('claudeShareSnapshotUrl'));
-eval(extractFn('resumeHintInner'));
 eval(extractFn('mcpPickerHtml'));
 eval(extractFn('renderAgentField'));
 eval(extractFn('agentBlockHtml'));
@@ -176,7 +174,6 @@ const pick = element({ key: 'pick' });
 const sessionInput = element({ key: 'session', value: '' });
 const uploadInput = element({ key: 'upload-input', files: [] });
 const uploaded = element({ key: 'uploaded', dataset: { upload: 'null' } });
-const hint = element({ key: 'hint', replaceChildren() { this.innerHTML = ''; } });
 const classes = new Set();
 // The hosting form (task form / task page): claims the option and applies grants.
 const hostListeners = new Map();
@@ -194,7 +191,7 @@ const box = {
     return {
       '.agent-controls': controls, '.af-resume-enabled': enabled, '.af-resume-panel': panel,
       '.af-resume-chosen': chosen, '.af-resume-pick': pick, '.af-resume-session': sessionInput,
-      '.af-resume-upload input': uploadInput, '.af-resume-uploaded': uploaded, '.af-resume-hint': hint,
+      '.af-resume-upload input': uploadInput, '.af-resume-uploaded': uploaded,
     }[selector];
   },
   closest: (sel) => sel === '[data-reauthorize-host]' && hostAttached ? hostRoot : null,
@@ -233,15 +230,7 @@ sessionInput.value = 'https://chatgpt.com/share/example';
 listeners.get('session:input')();
 ok(readResume(box)?.sessionId === 'https://chatgpt.com/share/example', 'share links use the provider conversation input');
 ok(chosen.dataset.resume === 'null', 'typing an id or link clears the task source');
-ok(hint.innerHTML === '', 'a share tavya can read needs no hint');
-sessionInput.value = 'https://claude.ai/share/e510a898-8e59-4423-b613-12c7c5ac37a5';
-listeners.get('session:input')();
-ok(hint.innerHTML.includes('href="https://claude.ai/api/chat_snapshots/e510a898-8e59-4423-b613-12c7c5ac37a5?rendering_mode=messages&amp;render_all_tools=true"'),
-  'a Claude share link links the file to save and upload instead');
-ok(resumeHintInner('https://claude.ai/chat/e510a898') === '' && resumeHintInner('http://claude.ai/share/x') === '', 'only a Claude share link gets the hint');
 sessionInput.value = '';
-listeners.get('session:input')();
-ok(hint.innerHTML === '', 'clearing the link clears the hint');
 uploaded.dataset.upload = JSON.stringify({ id: 'a'.repeat(64), name: 'session.jsonl', bytes: 42, format: 'codex', projectId: 'project' });
 ok(readResume(box)?.upload?.format === 'codex', 'an uploaded conversation is collected as the sole source');
 enabled.checked = false;
