@@ -413,8 +413,8 @@ _CLAUDE_SHARE_PATH = re.compile(r"^/share/([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-
 
 
 def claude_snapshot_url(share_url: str) -> str | None:
-    """The JSON a claude.ai share page loads its conversation from. claude.ai serves
-    it only once Cloudflare has checked for a person, so a person saves it."""
+    """The JSON a claude.ai share page loads its conversation from. Cloudflare refuses
+    it to urllib's requests, so a person saves it from a browser."""
     parsed = urlparse(share_url)
     match = _CLAUDE_SHARE_PATH.match(parsed.path)
     if parsed.scheme != "https" or (parsed.hostname or "").lower() not in {"claude.ai", "www.claude.ai"} or not match:
