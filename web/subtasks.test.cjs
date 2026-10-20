@@ -37,7 +37,7 @@ global.taskUrl = (id, rec) => `/acme/web/tasks/${rec?.num ?? id}`;
 
 // The real stage vocabulary, not a stub: a child must read exactly as it does in
 // the task list and on its own page.
-for (const name of ['taskRecord', 'numLabel', 'parentTaskContext', 'stageLabel', 'waitingLabel', 'waitingText', 'subTaskState', 'subTaskStateHtml', 'subTasksSection', 'listState', 'patchLifecycleView', 'pendingCancellationView', 'patchSubTaskSummaryFromEvent', 'subTaskSummaryEventNeedsRefresh']) eval(extractFn(name));
+for (const name of ['taskRecord', 'numLabel', 'parentTaskContext', 'stageLabel', 'waitingLabel', 'waitingText', 'subTaskState', 'subTaskStateHtml', 'subTasksSection', 'pullRequestLanes', 'listState', 'patchLifecycleView', 'pendingCancellationView', 'patchSubTaskSummaryFromEvent', 'subTaskSummaryEventNeedsRefresh']) eval(extractFn(name));
 
 let pass = 0, fail = 0;
 const ok = (condition, message) => {
@@ -52,6 +52,10 @@ ok(parentTaskContext({ taskId: 'parent' }) === '', 'top-level tasks do not rende
 // A finished parent is archived out of the live list; the view still names it.
 const archivedParent = parentTaskContext({ taskId: 'orphan', parentTaskId: 'gone', parentTask: { id: 'gone', num: 7, title: 'Finished parent' } });
 ok(archivedParent.includes('#7 Finished parent') && archivedParent.includes('data-open="gone"'), 'an archived parent keeps its number and title');
+// A pull request's page names the task it is part of, not a "parent task" (pramana#102).
+const prCrumb = parentTaskContext({ taskId: 'pr-docs', parentTaskId: 'parent', parentTask: { id: 'parent', num: 10, title: 'Ship the new workspace', pullRequest: 'docs' } });
+ok(prCrumb.includes('pull request “docs”') && !prCrumb.includes('Parent task') && prCrumb.includes('data-open="parent"'),
+  "a pull request's page names its task and which pull request of it this is");
 
 ok(subTaskState(S.tasks[1]).label === 'working', 'active work reads as it does in the task list');
 ok(subTaskState(S.tasks[2]).complete === true, 'done work contributes to completion');
@@ -132,6 +136,19 @@ const approval = subTasksSection({ taskId: 'parent', workflow: 'software-dev', s
     lastView: { stage: 'do', status: 'waiting', waitingFor: { kind: 'timer', until: 1 }, approvalRequests: 2 } },
 ] });
 ok(approval.includes('Waiting until 4:00 PM') && approval.includes('approval needed'), 'a child waiting on an approval shows it in the parent');
+
+// pramana#102: a pull request of the task is part of it (shown under Branches),
+// never a sub-task — even when the task's run no longer lists it among its own.
+const withPullRequest = subTasksSection({ taskId: 'parent', workflow: 'software-dev', subTasks: ['child-a', 'pr-docs'], subTaskSummaries: [
+  { id: 'child-a', num: 11, title: 'Polish navigation', workflow: 'software-dev', lastView: { stage: 'do', status: 'active' } },
+  { id: 'pr-docs', title: 'Breadcrumbs fix', workflow: 'software-dev', pullRequest: { checkout: 'docs', target: 'main' },
+    lastView: { stage: 'review', status: 'waiting', waitingFor: { kind: 'human' } } },
+] });
+ok(withPullRequest.includes('Polish navigation') && !withPullRequest.includes('Breadcrumbs fix') && withPullRequest.includes('of 1 complete'),
+  "a pull request of the task is not listed (or counted) as a sub-task");
+ok(subTasksSection({ taskId: 'parent', workflow: 'software-dev', subTasks: ['pr-docs'], subTaskSummaries: [
+  { id: 'pr-docs', title: 'Breadcrumbs fix', workflow: 'software-dev', pullRequest: { checkout: 'docs' }, lastView: { stage: 'review', status: 'waiting' } },
+] }) === '', 'a task whose only children are its pull requests has no Sub-tasks section');
 
 S.view = summaries;
 ok(patchSubTaskSummaryFromEvent({ type: 'view.updated', taskId: 'child-a', payload: { stage: 'review', status: 'waiting', waitingFor: 'parent' } }) === true,

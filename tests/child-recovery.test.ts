@@ -63,3 +63,40 @@ it('reports which outstanding children settled, excluding lifecycle replacement'
     expect(await makeChildActivities(store).settledChildTasks(parent.id, [])).toEqual([]);
   } finally { await store.close(); }
 });
+
+// pramana#102: a pull request of a task is restored as the task's own, with
+// what its record and the task's snapshots say about it — a landed one too, so
+// a replacement does not propose what already landed.
+it('restores the task\'s pull requests from their records, landed ones included', async () => {
+  const { Store } = await import('../src/store/db.js');
+  const store = await Store.create(':memory:');
+  try {
+    const project = await store.createProject('Pull requests');
+    const parent = await store.createTask({ projectId: project.id, title: 'Parent', workflow: 'software-dev',
+      workflowVersion: '1.30.0', params: { prompt: 'p' } });
+    const child = async (title: string, status: string, shippedFrom?: string) => {
+      const task = await store.createTask({ projectId: project.id, title, workflow: 'software-dev', workflowVersion: '1.30.0',
+        params: { prompt: title, ...(shippedFrom ? { _shippedFrom: { taskId: parent.id, checkout: shippedFrom } } : {}) },
+        parentTaskId: parent.id });
+      await store.saveView(task.id, { taskId: task.id, title, workflow: 'software-dev', stage: status === 'waiting' ? 'review' : status,
+        status, branch: `tavya/${task.id}`, targetBranch: 'main', messages: [], actions: [], updatedAt: 1 } as any);
+      return task.id;
+    };
+    const open = await child('docs', 'waiting', 'docs');
+    const landed = await child('api', 'done', 'api');
+    const finished = await child('Finished sub-task', 'done');
+    const snapshot = (childTaskId: string, head: string) => store.appendEvent({ taskId: parent.id, type: 'pull-request.snapshot',
+      ts: 1, payload: { checkout: 'x', childTaskId, branch: `tavya/${childTaskId}`, head } });
+    await snapshot(open, 'h1');
+    await snapshot(open, 'h2');
+    await snapshot(landed, 'h3');
+    const restored = await makeChildActivities(store).restoreChildTasks(parent.id);
+    expect(restored.map((c) => c.taskId)).not.toContain(finished);
+    expect(restored).toEqual([
+      expect.objectContaining({ taskId: open,
+        pullRequest: { checkout: 'docs', branch: `tavya/${open}`, head: 'h2', target: 'main', status: 'open' } }),
+      expect.objectContaining({ taskId: landed,
+        pullRequest: { checkout: 'api', branch: `tavya/${landed}`, head: 'h3', target: 'main', status: 'done' } }),
+    ]);
+  } finally { await store.close(); }
+});

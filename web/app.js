@@ -6686,12 +6686,31 @@ const HOLD_REASONS = {
   authorization: ['Access', 'Needs an authorization you can grant'],
   merge: ['Merge', 'Waiting for you to merge'],
 };
-function attentionChip(t) {
+// What a task's pull request asks (SPEC §11.1): the task itself is not waiting on it.
+const PULL_REQUEST_REASONS = {
+  'approval-requested': ['PR approval', 'waits for your approval'],
+  'review-requested': ['PR review', 'waits for your review'],
+  escalated: ['PR input', 'waits for your answer'],
+  assigned: ['Assigned', 'is assigned to you'],
+  mentioned: ['Mentioned', 'mentions you'],
+};
+// The strongest ask that puts a row in a `for:` list, and the task's pull
+// request making it when the task itself does not (pramana#102).
+function rowAsk(t) {
   const reasons = S.searchResult?.reasons?.[t.id] || [];
   // An ask outranks a mention; the order of ATTENTION_REASONS is the rank.
   const kind = Object.keys(ATTENTION_REASONS).find((reason) => reasons.includes(reason));
-  if (!kind) return '';
-  const [label, title] = (kind === 'escalated' && HOLD_REASONS[t.lastView?.waitingFor?.reason]) || ATTENTION_REASONS[kind];
+  if (!kind) return undefined;
+  const pullRequest = (S.searchResult?.pullRequestAsks?.[t.id] || []).find((ask) => ask.kind === kind)?.checkout;
+  return { kind, ...(pullRequest ? { pullRequest } : {}) };
+}
+function attentionChip(t) {
+  const ask = rowAsk(t);
+  if (!ask) return '';
+  const { kind, pullRequest } = ask;
+  const [label, title] = pullRequest
+    ? [PULL_REQUEST_REASONS[kind][0], `The pull request for "${pullRequest}" ${PULL_REQUEST_REASONS[kind][1]}`]
+    : (kind === 'escalated' && HOLD_REASONS[t.lastView?.waitingFor?.reason]) || ATTENTION_REASONS[kind];
   return `<span class="chip attention ${esc(kind)}" title="${esc(title)}">${esc(label)}</span>`;
 }
 // A row's project as a slug — `project` within an organization, `org/project`
@@ -6947,8 +6966,10 @@ function taskRow(t, { showTags = true, project = false } = {}) {
   const v = t.lastView || {};
   const status = v.status || 'active';
   // In a for: list the reason says what the task waits for; a waiting stage
-  // chip ("Needs input") would only repeat it.
+  // chip ("Needs input") would only repeat it. Not when the ask is its pull
+  // request's: the task itself may be waiting on something else entirely.
   const why = attentionChip(t);
+  const ownAsk = !!why && !rowAsk(t)?.pullRequest;
   // Any task can be archived/un-archived — archiving only hides it from the list,
   // it never affects a running task's execution.
   const archiveBtn = archived
@@ -6961,7 +6982,7 @@ function taskRow(t, { showTags = true, project = false } = {}) {
         <div class="task-sub">
           ${where}${why}
           ${customBranch(v, t.id) ? `<span class="branch">${esc(v.branch)}</span>` : ''}
-          ${why && status === 'waiting' ? '' : `<span class="chip ${status}">${esc(stageLabel(v))}</span>`}
+          ${ownAsk && status === 'waiting' ? '' : `<span class="chip ${status}">${esc(stageLabel(v))}</span>`}
           ${v.approvalRequests && !why ? '<span class="chip approval-needed">approval needed</span>' : ''}
           ${priorityFlag(t)}${showTags ? tagChips(t) : ''}
         </div>
@@ -11581,7 +11602,11 @@ function parentTaskContext(v) {
   const label = parent
     ? `${parent.num != null ? `#${parent.num} ` : ''}${parent.title}`
     : numLabel(parentId);
-  return `<a class="tp-crumb tp-parent" data-open="${esc(parentId)}" data-spa href="${esc(taskUrl(parentId, parent))}" title="Parent task" aria-label="Open parent task ${esc(label)}">${esc(label)}</a>`;
+  // A pull request of its task (SPEC §11.1) is part of it, not a sub-task.
+  const pullRequest = v.parentTask?.id === parentId ? v.parentTask.pullRequest : undefined;
+  const role = pullRequest ? `Task this pull request (“${pullRequest}”) is part of` : 'Parent task';
+  return `<a class="tp-crumb tp-parent" data-open="${esc(parentId)}" data-spa href="${esc(taskUrl(parentId, parent))}" title="${esc(role)}" aria-label="Open ${esc(pullRequest ? 'the task of this pull request' : 'parent task')} ${esc(label)}">${esc(label)}</a>`
+    + (pullRequest ? `<span class="tp-crumb-sep" aria-hidden="true">›</span><span class="tp-crumb tp-pr">pull request “${esc(pullRequest)}”</span>` : '');
 }
 
 // A child reads exactly as it does in the task list and on its own page: the
@@ -11611,7 +11636,7 @@ function subTasksSection(v) {
   // any other copy of the child the console happens to hold.
   const summaries = new Map((v.subTaskSummaries || []).map((summary) => [summary.id, summary]));
   // A pull request of this task (software-dev ≥1.30) is part of it, shown under Branches.
-  const pullRequests = new Set((v.shipments || []).map((shipment) => shipment.childTaskId));
+  const pullRequests = new Set(pullRequestLanes(v).all.map((lane) => lane.childTaskId));
   const ids = [...new Set([...summaries.keys(), ...(v.subTasks || [])])].filter((id) => !pullRequests.has(id));
   if (!ids.length) return '';
   const children = ids.map((id) => {
@@ -11777,14 +11802,33 @@ function branchPullRequestState(view, lane) {
   return ['Opening', 'active', false];
 }
 
+// A task's pull requests (software-dev ≥1.30): its run's record of them, and
+// what each pull request's own record says — so one stays the task's, never a
+// sub-task, even when a replaced run lost it (pramana#102). `latest`: each
+// checkout's newest pull request.
+function pullRequestLanes(v) {
+  const lanes = new Map();
+  for (const summary of v.subTaskSummaries || []) {
+    if (!summary.pullRequest) continue;
+    const status = summary.lastView?.status;
+    lanes.set(summary.id, { checkout: summary.pullRequest.checkout, childTaskId: summary.id,
+      target: summary.pullRequest.target || v.targetBranch,
+      state: status === 'done' ? 'landed' : status === 'cancelled' || status === 'failed' ? 'cancelled' : 'open' });
+  }
+  for (const shipment of v.shipments || []) lanes.set(shipment.childTaskId, shipment);
+  const all = [...lanes.values()];
+  return { all, latest: new Map(all.map((lane) => [lane.checkout, lane])) };
+}
+
 function checkoutsSection(v) {
   const checkouts = v.checkouts || [];
-  if (checkouts.length < 2) return '';                      // one branch: `branch`/`prs` already say it all
-  const atReview = v.stage === 'review' && (v.actions || []).some((a) => a.name === 'confirm');
-  // software-dev ≥1.30: each branch's pull request is its own sub-task, opened
+  // software-dev ≥1.30: each branch's pull request is part of the task, opened
   // whenever the agent is ready. Its row says where that pull request is, links
   // to it, and approves it right here while it waits for a reviewer.
-  const shipped = new Map((v.shipments || []).map((s) => [s.checkout, s]));
+  const shipped = pullRequestLanes(v).latest;
+  // One branch without a pull request of its own: `branch`/`prs` already say it all.
+  if (!checkouts.length || (checkouts.length < 2 && !shipped.size)) return '';
+  const atReview = v.stage === 'review' && (v.actions || []).some((a) => a.name === 'confirm');
   const summaries = new Map((v.subTaskSummaries || []).map((summary) => [summary.id, summary]));
   const rows = checkouts.map((c) => {
     const lane = shipped.get(c.name);

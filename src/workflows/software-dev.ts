@@ -987,7 +987,9 @@ async function softwareDevImpl(
   const outstanding = new Set<string>(continued?.subTasks.outstanding);
   // Branches shipped as their own pull requests (v1.30), and how many ships
   // are being made right now (an update runs alongside the agent's turn).
-  const shipments: TaskShipment[] = (continued?.subTasks.shipments ?? []).map((shipment) => ({ ...shipment }));
+  // A replacement run takes them from its checkpoint (pramana#102), or below
+  // rebuilds them from their records when an earlier replacement lost them.
+  const shipments: TaskShipment[] = (continued?.subTasks.shipments ?? recovery?.shipments ?? []).map((shipment) => ({ ...shipment }));
   let shipping = 0;
   /** A person chose Finish: the task ends done, closing what has not landed. */
   let finishing = false;
@@ -2304,7 +2306,7 @@ async function softwareDevImpl(
       if (kind === 'needs-work') void getExternalWorkflowHandle(childTaskId).signal(closePullRequestSignal).catch(() => undefined);
       return;
     }
-    const name = `the pull request for "${shipment.checkout}" (sub-task ${childTaskId})`;
+    const name = `the pull request for "${shipment.checkout}"`;
     const said = kind === 'needs-work'
       ? `Changes are needed in ${name}:\n\n${text}\n\nMake them in "${shipment.checkout}", commit, and call open_pr with branch "${shipment.checkout}" to update it.`
       : `Your latest commits for "${shipment.checkout}" are not in ${name}, which was already approved and lands as reviewed: ${text}\nOnce it has landed, bring "${shipment.checkout}" up to date with ${shipment.target} and open its pull request again.`;
@@ -3908,7 +3910,7 @@ Inspect the complete current diff and specifically compare its delta from the re
     }
   }
 
-  /** A pull request's sub-task settled. Its landing is quiet news for the
+  /** A pull request of this task settled. Its landing is quiet news for the
    * agent's next turn, unless a branch still waits on it (stacked); anything
    * else is the agent's to act on. */
   function noteShipmentSettled(childTaskId: string, childStage: string): void {
@@ -3917,7 +3919,7 @@ Inspect the complete current diff and specifically compare its delta from the re
     outstanding.delete(childTaskId);
     shipment.state = childStage === 'done' ? 'landed' : childStage === 'cancelled' ? 'cancelled' : 'failed';
     const stacked = world ? worldRepos(world as WorldHandle).filter((repo) => repo.base === shipment.fromBranch).map((repo) => `"${repo.name}"`) : [];
-    const name = `The pull request for "${shipment.checkout}" (sub-task ${childTaskId})`;
+    const name = `The pull request for "${shipment.checkout}"`;
     const text = shipment.state === 'landed'
       ? `${name} landed on ${shipment.target}.${stacked.length ? ` ${stacked.join(', ')} can open now: bring it up to date with ${shipment.target}, then open_pr with its branch.` : ''}`
       : `${name} closed without landing (${childStage}).${stacked.length ? ` ${stacked.join(', ')} builds on it.` : ''}`;
@@ -3928,7 +3930,7 @@ Inspect the complete current diff and specifically compare its delta from the re
   const openShipments = () => shipments.filter((shipment) => shipment.state === 'open');
 
   /**
-   * Open (or update) one checkout's pull request (SPEC §11.1): a sub-task that
+   * Open (or update) one checkout's pull request (SPEC §11.1): a record of its own that
    * reviews and lands a snapshot of it from a worktree in this world, with this
    * task's Review route; changes it needs come back to this task's agent. Runs
    * as an update beside the agent's turn, or when the agent finishes. `empty`:
@@ -3945,7 +3947,7 @@ Inspect the complete current diff and specifically compare its delta from the re
     const open = mine.find((shipment) => shipment.state === 'open');
     const last = mine.at(-1);
     const base = [...shipments].reverse().find((shipment) => shipment.fromBranch === named.base);
-    if (base?.state === 'open') return { ok: false, reason: `"${named.name}" builds on "${base.checkout}", whose pull request (sub-task ${base.childTaskId}) has not landed yet; you will be told when it has` };
+    if (base?.state === 'open') return { ok: false, reason: `"${named.name}" builds on "${base.checkout}", whose pull request has not landed yet; you will be told when it has` };
     const check = await core.checkShipment(request.handle as WorldHandle, { checkout: named.name, target,
       current: !open && mine.length > 0, ...(base ? { stackedOn: base.checkout } : {}) });
     if (!check.ok) return check.empty ? { ok: false, empty: true, reason: check.reason } : check;
@@ -4471,6 +4473,21 @@ Inspect the complete current diff and specifically compare its delta from the re
   else if (recovery && patched('software-dev-preserve-replacement-children-v1')) {
     const children = await coreChild.restoreChildTasks(taskId);
     for (const child of children) {
+      // One of this task's pull requests is its own, not a sub-task (pramana#102).
+      const pr = child.pullRequest;
+      if (pr && shipsBranches) {
+        const known = shipments.find((shipment) => shipment.childTaskId === child.taskId);
+        if (!known && pr.head) shipments.push({ checkout: pr.checkout, childTaskId: child.taskId, branch: pr.branch,
+          fromBranch: (world ? worldRepos(world as WorldHandle).find((repo) => repo.name === pr.checkout)?.branch : undefined) ?? pr.checkout,
+          head: pr.head, target: pr.target ?? target, requestId: '',
+          state: pr.status === 'open' ? 'open' : pr.status === 'done' ? 'landed' : pr.status === 'cancelled' ? 'cancelled' : 'failed' });
+        subTaskIds.push(child.taskId);
+        if (pr.status === 'open') outstanding.add(child.taskId);
+        // It settled between the runs: told as it would have been.
+        else if (known?.state === 'open') noteShipmentSettled(child.taskId, pr.status);
+        continue;
+      }
+      if (pr && pr.status !== 'open') continue;
       subTaskIds.push(child.taskId);
       outstanding.add(child.taskId);
       if (child.waiting) {

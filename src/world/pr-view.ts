@@ -5,7 +5,7 @@ import { type World, type WorldHandle, type WorldRepo, worldRepoTarget } from '.
 /**
  * One pull request of a task with several branches (SPEC §11.1), seen as a
  * world. A task's agent works in its one world, one checkout per branch; when
- * it opens a branch's pull request on its own, that pull request is a sub-task
+ * it opens a branch's pull request on its own, that pull request lands through a record of its own
  * which reviews and lands a snapshot of the branch from a worktree in the SAME
  * world: `<root>/.karmax-injection/pull-requests/<sub-task>`, on the sub-task's
  * branch. No second sandbox and no second agent: changes Review asks for are

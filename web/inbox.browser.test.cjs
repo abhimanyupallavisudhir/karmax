@@ -61,6 +61,7 @@ function constant(name) {
       window.priorityFlag = () => '';
       window.pipeline = () => '';
       window.attentionChip = () => '<span class="chip attention escalated">Input</span>';
+      window.rowAsk = () => ({ kind: 'escalated' });
       window.renderMain = () => {
         $('#main').innerHTML = `<div class="task-list">${inboxNoticesHtml()}${taskRow({ id: 'reference', projectId: 'karmax', num: 284, title: 'Restore the deployment after a failed health check', lastView: { status: 'waiting', stage: 'review' } }, { showTags: false, project: true })}</div>`;
         wireInboxNotices();
