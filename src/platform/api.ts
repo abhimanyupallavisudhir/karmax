@@ -1051,8 +1051,11 @@ export class KarmaxApi {
       if (typeof sessionId === 'string' && publicConversationShare(sessionId)) {
         try {
           const upload = await importConversationShare({ store: this.deps.store, objects: this.deps.objects }, projectId, sessionId);
-          delete (resumeFrom as Record<string, unknown>).sessionId;
-          (resumeFrom as Record<string, unknown>).upload = upload;
+          // Without a store to keep it in (small harnesses), the link stays a link.
+          if (this.deps.objects) {
+            delete (resumeFrom as Record<string, unknown>).sessionId;
+            (resumeFrom as Record<string, unknown>).upload = upload;
+          }
         } catch (error) {
           if (error instanceof PanagentError) throw new ValidationError(error.message);
           throw error;
