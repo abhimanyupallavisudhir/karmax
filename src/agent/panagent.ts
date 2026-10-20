@@ -9,7 +9,7 @@ import type { Message, Provider } from '../domain/types.js';
 import { claudeCwdSlug, findProviderSession } from './fork.js';
 import { codexHistoryMetadata, codexRolloutFilename, prepareCodexHistory, CodexHistoryError } from './codex-history.js';
 import { installLocalCodexSnapshot, localCodexCopies, readLocalCodexHistory } from './codex-history-files.js';
-import { publicShareFetch, publicUrl } from '../mcp/connections/http.js';
+import { ShareLinkError, fetchShare, publicConversationShare, type ShareFormat } from './conversation-shares.js';
 import { BRAND } from '../domain/brand.js';
 
 const pexec = promisify(execFile);
@@ -112,101 +112,7 @@ export async function exportConversationWithPanagent(opts: {
   }
 }
 
-export type ShareFormat = 'chatgpt-share' | 'claude-share' | 'gemini-share' | 'tavya-share';
-export interface ConversationShareLink { url: string; format: ShareFormat; /** A tavya share's id. */ id?: string }
-
-/** tavya (any karmax install) serves shares at an unguessable id below this path. */
-const TAVYA_SHARE_PATH = /^\/share\/conversations\/([A-Za-z0-9_-]{43})$/;
-
-/** Where a Gemini share link may lead: its short links redirect to gemini.google.com/share/<id>. */
-const GEMINI_SHARE_HOSTS = new Set(['gemini.google.com', 'share.gemini.google', 'g.co']);
-function geminiShareLink(url: URL): boolean {
-  const host = url.hostname.toLowerCase();
-  return (host === 'gemini.google.com' && /^\/share\/[A-Za-z0-9_-]+\/?$/.test(url.pathname))
-    || (host === 'share.gemini.google' && /^\/[A-Za-z0-9_-]+\/?$/.test(url.pathname))
-    || (host === 'g.co' && /^\/gemini\/share\/[A-Za-z0-9_-]+\/?$/.test(url.pathname));
-}
-
-/** A public HTTPS ChatGPT, Claude, Gemini or tavya share link panagent can import. */
-export function publicConversationShare(value: string): ConversationShareLink | undefined {
-  let url: URL;
-  try { url = publicUrl(value); } catch { return undefined; }
-  if (url.protocol !== 'https:') return undefined;
-  const host = url.hostname.toLowerCase();
-  const tavya = url.pathname.match(TAVYA_SHARE_PATH);
-  if (tavya) return { url: url.toString(), format: 'tavya-share', id: tavya[1] };
-  if (geminiShareLink(url)) return { url: url.toString(), format: 'gemini-share' };
-  if (!url.pathname.startsWith('/share/')) return undefined;
-  if (host === 'chatgpt.com' || host === 'www.chatgpt.com') return { url: url.toString(), format: 'chatgpt-share' };
-  if (host === 'claude.ai' || host === 'www.claude.ai') return { url: url.toString(), format: 'claude-share' };
-  return undefined;
-}
-
-/** claude.ai serves a share as an app shell that loads the conversation from
- * this JSON, which keeps tool calls and titles the rendered page drops. */
-export function claudeShareSnapshotUrl(share: ConversationShareLink): string | undefined {
-  if (share.format !== 'claude-share') return undefined;
-  const id = new URL(share.url).pathname.slice('/share/'.length).replace(/\/$/, '');
-  return `https://claude.ai/api/chat_snapshots/${encodeURIComponent(id)}?rendering_mode=messages&render_all_tools=true`;
-}
-
-/** Cloudflare in front of claude.ai answers a request that looks scripted with
- * a "Verify you are human" page (403). Checked 2026-10-20: from tavya.io's host a
- * request is served once it names itself and says it is a navigation; from E2B
- * it must also offer ALPN, as guardedFetch does. A bare request is refused. */
-const CLAUDE_SNAPSHOT_HEADERS = { 'user-agent': BRAND, accept: 'application/json', 'sec-fetch-mode': 'navigate' };
-
-/** The gemini.google.com/share/<id> a Gemini link leads to, following at most
- * three redirects by hand (publicShareFetch follows none) and only between
- * Gemini's own hosts. */
-async function geminiShareId(link: string): Promise<string> {
-  let url = new URL(link);
-  for (let hop = 0; ; hop++) {
-    const id = url.hostname === 'gemini.google.com' ? url.pathname.match(/^\/share\/([A-Za-z0-9_-]+)\/?$/)?.[1] : undefined;
-    if (id) return id;
-    if (hop === 3) break;
-    const response = await publicShareFetch(url.toString(), { redirect: 'manual', headers: { 'user-agent': BRAND } });
-    if (response.status === 404 || response.status === 410)
-      throw new PanagentError('Share link not found; it may have been deleted or unshared');
-    const location = response.headers.get('location');
-    if (response.status < 300 || response.status >= 400 || !location) break;
-    url = new URL(location, url);
-    if (url.protocol !== 'https:' || !GEMINI_SHARE_HOSTS.has(url.hostname.toLowerCase()))
-      throw new PanagentError(`This Gemini link leads outside Gemini (${url.hostname})`);
-  }
-  throw new PanagentError('This Gemini link did not lead to a gemini.google.com/share/ conversation');
-}
-
-/** Gemini's share page carries no conversation; the page asks this RPC, which
- * answers anyone (panagent vendor/web.py gemini_share_request, the same request). */
-async function fetchGeminiShare(share: ConversationShareLink): Promise<Response> {
-  const id = await geminiShareId(share.url);
-  const body = new URLSearchParams({ 'f.req': JSON.stringify([[['ujx1Bf', JSON.stringify([null, id, [4]]), null, 'generic']]]) });
-  return publicShareFetch(`https://gemini.google.com/_/BardChatUi/data/batchexecute?rpcids=ujx1Bf&source-path=%2Fshare%2F${id}&hl=en-US&rt=c`, {
-    method: 'POST', body,
-    headers: { 'user-agent': BRAND, 'content-type': 'application/x-www-form-urlencoded;charset=utf-8', 'x-same-domain': '1' },
-  });
-}
-
-/** A share link's conversation as panagent reads it: the page, or for Claude
- * and Gemini the data their pages load. */
-export async function fetchShare(share: ConversationShareLink): Promise<{ data: Buffer; name: string }> {
-  if (share.format === 'gemini-share') {
-    const response = await fetchGeminiShare(share);
-    if (!response.ok) throw new PanagentError(`Gemini returned HTTP ${response.status} for this share`);
-    return { data: Buffer.from(await response.arrayBuffer()), name: 'share.txt' };
-  }
-  const snapshot = claudeShareSnapshotUrl(share);
-  const response = await (snapshot ? publicShareFetch(snapshot, { headers: CLAUDE_SNAPSHOT_HEADERS }) : publicShareFetch(share.url));
-  if (response.status === 404 || response.status === 410)
-    throw new PanagentError('Share link not found; it may have been deleted or unshared');
-  if (snapshot && (!response.ok || !/json/i.test(response.headers.get('content-type') ?? '')))
-    throw new PanagentError(`claude.ai refused to send this share to ${BRAND} (HTTP ${response.status}). Open ${snapshot} `
-      + 'in your browser, save it (Ctrl+S or ⌘S) and upload that file under Fork a previous agent → Upload conversation '
-      + '(move a started task back to Draft first).');
-  if (!response.ok) throw new PanagentError(`Share request returned HTTP ${response.status}`);
-  return { data: Buffer.from(await response.arrayBuffer()), name: snapshot ? 'share.json' : 'share.html' };
-}
+export { claudeShareSnapshotUrl, fetchShare, publicConversationShare, type ConversationShareLink, type ShareFormat } from './conversation-shares.js';
 
 export function looksLikeConversationUrl(value: string): boolean {
   try {
@@ -240,7 +146,9 @@ export async function importWithPanagent(opts: PanagentImportOptions): Promise<P
     if ('url' in opts.source) {
       const share = publicConversationShare(opts.source.url);
       if (!share) throw new PanagentError(`Use a public HTTPS ChatGPT, Claude, Gemini or ${BRAND} share URL`);
-      const fetched = await fetchShare(share);
+      const fetched = await fetchShare(share).catch((error) => {
+        throw error instanceof ShareLinkError ? new PanagentError(error.message) : error;
+      });
       source = path.join(temporary, fetched.name);
       fs.writeFileSync(source, fetched.data, { mode: 0o600 });
       format.push('--from', share.format);

@@ -3,7 +3,8 @@ import type { ObjectStore } from '../store/objects.js';
 import { BRAND } from '../domain/brand.js';
 import { publicConversationHtml, publicShare } from '../gateway/conversation-sharing.js';
 import { detectConversationImport, MAX_CONVERSATION_IMPORT_BYTES, putConversationImport, type ConversationImportRef } from '../store/conversation-imports.js';
-import { fetchShare, PanagentError, publicConversationShare, summarizeConversation } from './panagent.js';
+import { PanagentError, summarizeConversation } from './panagent.js';
+import { fetchShare, publicConversationShare, ShareLinkError } from './conversation-shares.js';
 
 /**
  * A conversation to fork from, checked when it is given (pasted in the task
@@ -18,7 +19,9 @@ export async function importConversationShare(deps: { store: Store; objects?: Ob
   if (!share) throw new PanagentError(`Use a public HTTPS ChatGPT, Claude, Gemini or ${BRAND} share link, or upload a conversation file`);
   // A share of this installation is read from the store, as its page shows it.
   const local = share.id ? await publicShare(deps.store, share.id) : undefined;
-  const source = local ? { data: Buffer.from(publicConversationHtml(local)), name: 'share.html' } : await fetchShare(share);
+  const source = local ? { data: Buffer.from(publicConversationHtml(local)), name: 'share.html' } : await fetchShare(share).catch((error) => {
+    throw error instanceof ShareLinkError ? new PanagentError(error.message) : error;
+  });
   if (source.data.length > MAX_CONVERSATION_IMPORT_BYTES) throw new PanagentError('This conversation is larger than 20 MiB');
   const summary = await summarizeConversation(source.data, source.name, share.format);
   return putConversationImport(deps.objects, projectId, source.data, source.name, { format: share.format, share: share.url, ...summary });
