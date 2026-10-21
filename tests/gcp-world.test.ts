@@ -51,6 +51,7 @@ describe.skipIf(!sshdAvailable)('Google Cloud worlds (fake Compute Engine, real 
   let provider: VmWorldProvider;
   let driver: GcpDriver;
   let stamp: string;
+  let ledger: Map<string, string>;
   const images = process.env.KARMAX_GCP_IMAGES;
 
   beforeEach(() => {
@@ -60,9 +61,15 @@ describe.skipIf(!sshdAvailable)('Google Cloud worlds (fake Compute Engine, real 
     // A wait is 300 polls: at 1 ms a cold sshd boot on a busy runner can outlast it (CI #2182).
     driver = new GcpDriver(gcp.fetch, 10);
     stamp = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'vm-stamp-')), 'provisioned');
+    ledger = new Map();
     provider = new VmWorldProvider(driver, async () => connection(gcp.key), undefined, {
       socket: gcp.socket, user: os.userInfo().username, home: gcp.home,
       provision: { stamp, script: `echo provisioned > ${stamp}`, sudo: false },
+      ledger: {
+        kvEntries: async (prefix) => [...ledger].filter(([key]) => key.startsWith(prefix)).map(([key, value]) => ({ key, value })),
+        kvSet: (key, value) => { ledger.set(key, value); },
+        kvDelete: (key) => { ledger.delete(key); },
+      },
     });
   });
   afterEach(async () => {
@@ -186,6 +193,24 @@ describe.skipIf(!sshdAvailable)('Google Cloud worlds (fake Compute Engine, real 
     expect(disks.filter((event) => event.diskGb === 50)).toHaveLength(3);
     expect(disks.filter((event) => event.diskGb === 20)).toHaveLength(3);
     expect(disks.find((event) => event.diskGb === 50)!.costMicros).toBe(Math.round(50 * 0.13 / 730 * 1e6));
+  });
+
+  it('books a deleted world’s last run and the last part-hour of both disks, which Google stops listing at once', async () => {
+    const world = await provider.create({ taskId: 'task_gone', base: 'main', generation: 1, organizationId: 'org_g', resources: { diskGb: 50 } });
+    await provider.park(world.handle as WorldHandle);
+    const [instance] = [...gcp.instances.values()];
+    // Made 1 h 23 min ago; ran its last 7 minutes and was stopped a minute ago.
+    const start = Date.now() - 83 * 60_000;
+    instance!.lastStartTimestamp = new Date(Date.now() - 8 * 60_000).toISOString();
+    instance!.lastStopTimestamp = new Date(Date.now() - 60_000).toISOString();
+    for (const disk of gcp.disks.values()) disk.creationTimestamp = new Date(start).toISOString();
+    await provider.destroy(world.handle as WorldHandle);
+    expect([gcp.instances.size, gcp.disks.size]).toEqual([0, 0]);
+    const events = (await provider.listUsageEvents('org_g')).events;
+    expect(events.filter((event) => event.kind !== 'disk').map((event) => event.activeMs / 60_000)).toEqual([5, 2]);
+    const disks = events.filter((event) => event.kind === 'disk');
+    expect(disks.map((event) => [event.diskGb, Math.round(event.activeMs / 60_000)]).sort()).toEqual([[20, 23], [20, 60], [50, 23], [50, 60]]);
+    expect(disks[0]).toMatchObject({ taskId: 'task_gone', organizationId: 'org_g' });
   });
 
   it('prices at us-central1’s list when the Cloud Billing catalog is closed', async () => {

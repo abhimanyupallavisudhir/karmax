@@ -6,6 +6,7 @@ import type { ProviderUsageEvent, WorldLifecycleState } from './types.js';
 import { runDetached, type VmAllocation, type VmBootKeys, type VmDriver, type VmListing, type VmShape } from './vm/provider.js';
 import { cloudInit, VM_ETC, VM_SSH_PORT, VM_USER, vmProvisionScript, vmProvisionStamp, vmProvisionVersion } from './vm/provision.js';
 import { generateSshKeyPair, quote, SshTransport } from './vm/ssh.js';
+import { FINAL_USAGE_WINDOW_MS, type FinalUsage } from './vm/runs.js';
 import { ProviderCapacityFull, ProviderOutage } from '../agent/limits.js';
 
 export { cloudInit };
@@ -243,14 +244,17 @@ export class HetznerDriver implements VmDriver {
   /**
    * Hetzner's bill, hour by hour: each started hour of each server at its
    * type's hourly price (plus its IPv4 address) — booked as soon as the hour
-   * starts, since it is then owed in full — and each volume hour at its size.
+   * starts, since it is then owed in full — and each volume hour at its size,
+   * once it has passed; `final` (just before a world is deleted) also books
+   * the volume's hour under way, which Hetzner bills in full too.
    */
-  async usage(connection: ResolvedWorldProviderConnection, home: string, since?: number): Promise<ProviderUsageEvent[]> {
-    const now = Date.now();
-    const from = Math.max(since !== undefined ? since - 2 * 3_600_000 : 0, now - 7 * 86_400_000);
+  async usage(connection: ResolvedWorldProviderConnection, home: string, since?: number, final?: FinalUsage): Promise<ProviderUsageEvent[]> {
+    const now = final?.at ?? Date.now();
+    const from = final ? now - FINAL_USAGE_WINDOW_MS : Math.max(since !== undefined ? since - 2 * 3_600_000 : 0, now - 7 * 86_400_000);
+    const selector = `karmaxHome=${home}${final ? `,karmaxWorld=${final.ref.world}` : ''}`;
     const pricing = await this.pricing(connection);
     const events: ProviderUsageEvent[] = [];
-    for (const server of await this.servers(connection, `karmaxHome=${home}`)) {
+    for (const server of await this.servers(connection, selector)) {
       if (!server.labels.karmaxTaskId) continue;
       const created = Date.parse(server.created);
       const location = server.datacenter?.location?.name ?? connection.config.region ?? HETZNER_DEFAULT_LOCATION;
@@ -263,10 +267,10 @@ export class HetznerDriver implements VmDriver {
           costMicros: Math.round(hourly * usdPerEur() * 1e6) });
       }
     }
-    for (const volume of await this.pages<Volume>(connection, '/volumes', 'volumes', `karmaxHome=${home}`)) {
+    for (const volume of await this.pages<Volume>(connection, '/volumes', 'volumes', selector)) {
       const created = Date.parse(volume.created);
       const first = Math.max(0, Math.ceil((from - created) / 3_600_000));
-      for (let hour = first; created + (hour + 1) * 3_600_000 <= now; hour++) {
+      for (let hour = first; final ? created + hour * 3_600_000 < now : created + (hour + 1) * 3_600_000 <= now; hour++) {
         const startedAt = created + hour * 3_600_000;
         events.push({ id: `volume-${volume.id}:${hour}`, sandboxId: volume.name, ...owner(volume.labels), kind: 'disk', startedAt,
           endedAt: startedAt + 3_600_000, activeMs: 3_600_000, cpu: 0, memoryMb: 0, diskGb: volume.size,

@@ -13,6 +13,8 @@ Every task runs on its own cloud computer. tavya can run it on its own accounts 
 
 On Fly.io, Hetzner, AWS and Google Cloud a computer's disk keeps everything, including files Git ignores, and grows while the task runs. They have no desktop and no outbound allowlist.
 
+On tavya's own accounts each computer has a size limit, shown as each field's maximum in the Computer form. For bigger machines, connect your own account.
+
 ## AWS
 
 tavya makes each computer in the region's default VPC: an instance with a public address (only SSH on port 2222 is open), and a gp3 volume for its files. A paused computer is a stopped instance, so you pay only for its disks.
