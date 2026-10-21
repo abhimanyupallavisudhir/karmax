@@ -124,6 +124,50 @@ export class PaddleSubscriptionProvider implements SubscriptionProvider {
   async updateComputePacks(input: Parameters<SubscriptionProvider['updateComputePacks']>[0]) {
     return this.updatePacks('compute', input.subscriptionId, input.computePacks);
   }
+  /** A one-time charge on the subscription, billed now to its saved payment
+   * method: a non-catalog price of the compute pack product carrying the
+   * top-up's id, so its transaction can be found again (findComputeTopUp).
+   * A declined payment changes nothing (`prevent_change`). */
+  async chargeComputeTopUp(input: { subscriptionId: string; topUpId: string; amountCents: number }) {
+    const catalog = await this.catalog();
+    if (!catalog?.computePackProductId) throw new BillingRequestRejected('the Paddle compute pack product is not configured');
+    if (!Number.isSafeInteger(input.amountCents) || input.amountCents < 100) throw new BillingRequestRejected('invalid top-up amount');
+    return this.request(`/subscriptions/${encodeURIComponent(input.subscriptionId)}/charge`, 'POST', {
+      effective_from: 'immediately', on_payment_failure: 'prevent_change',
+      items: [{ quantity: 1, price: { product_id: catalog.computePackProductId, name: 'Compute top-up',
+        description: `Compute top-up ${input.topUpId}`, tax_mode: 'account_setting',
+        unit_price: { amount: String(input.amountCents), currency_code: 'USD' }, custom_data: { karmax_topup: input.topUpId } } }],
+    });
+  }
+  /** The subscription's one-time charge carrying `topUpId`, read from its
+   * transactions since the top-up was asked for. */
+  async findComputeTopUp(input: { subscriptionId: string; topUpId: string; since: number }) {
+    const config = await this.source();
+    const base = config.environment === 'sandbox' ? 'https://sandbox-api.paddle.com' : 'https://api.paddle.com';
+    let next: string | null = `/transactions?subscription_id=${encodeURIComponent(input.subscriptionId)}&origin=subscription_charge`
+      + `&per_page=50&created_at[GTE]=${encodeURIComponent(new Date(input.since - 60_000).toISOString())}`;
+    const matches: any[] = [];
+    for (let page = 0; next && page < 10; page++) {
+      const result = await this.request(next, 'GET', undefined, true);
+      if (!Array.isArray(result.data)) throw new Error('Paddle returned invalid transactions');
+      matches.push(...result.data.filter((transaction: any) => (transaction.items ?? []).some((item: any) =>
+        item.price?.custom_data?.karmax_topup === input.topUpId || item.price?.description === `Compute top-up ${input.topUpId}`)));
+      next = result.meta?.pagination?.has_more ? result.meta.pagination.next : null;
+      if (next) {
+        const url = new URL(next, base);
+        if (url.origin !== base) throw new Error('invalid Paddle pagination URL');
+        next = url.pathname + url.search;
+      }
+    }
+    if (next || matches.length > 1) return null;
+    if (!matches.length) return { absent: true } as const;
+    const transaction = matches[0];
+    // A past-due charge is declined for now, but Paddle may still collect it:
+    // it stays open, so its credit is given should it be paid after all.
+    const state = ['completed', 'paid'].includes(transaction.status) ? 'paid' as const
+      : transaction.status === 'canceled' ? 'failed' as const : transaction.status === 'past_due' ? 'declined' as const : 'pending' as const;
+    return { state, transactionId: String(transaction.id) };
+  }
   /** Sets one kind of pack's quantity, keeping every other item as it is. */
   private async updatePacks(kind: 'storage' | 'compute', subscriptionId: string, packs: number) {
     const catalog = await this.catalog();

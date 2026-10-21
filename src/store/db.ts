@@ -5409,12 +5409,17 @@ export class Store {
    * there is credit again or the month ends. Returns how many owners were
    * newly told (they are emailed too). */
   async syncComputeInbox(organizationId: string, userIds: string[],
-    notice: { month: string; usedMicros: number; creditMicros: number; renewsAt: number } | undefined, createdAt = Date.now()): Promise<number> {
+    notice: { month: string; usedMicros: number; creditMicros: number; renewsAt: number;
+      /** What happened (src/world/compute-notices.ts); a new stage is a new item. */
+      stage?: 'spent' | 'reminder' | 'hibernated'; hibernateAt?: number; computers?: number } | undefined,
+    createdAt = Date.now()): Promise<number> {
     return this.db.transaction(async () => {
       (await this.lockOrganization(organizationId));
       const ids = new Map<string, string>();
+      // The first stage keeps the id items had before stages, so none is sent twice.
+      const stage = notice?.stage && notice.stage !== 'spent' ? [notice.stage, notice.hibernateAt ?? null] : [];
       if (notice) for (const userId of new Set(userIds)) ids.set(`inbox_compute_${crypto.createHash('sha256')
-        .update(JSON.stringify([organizationId, userId, notice.month])).digest('hex').slice(0, 24)}`, userId);
+        .update(JSON.stringify([organizationId, userId, notice.month, ...stage])).digest('hex').slice(0, 24)}`, userId);
       const stale = ((await this.db.prepare(`SELECT id FROM inbox WHERE organizationId=? AND json_extract(subject, '$.kind')='compute'`)
         .all(organizationId)) as Array<{ id: string }>).map((row) => String(row.id)).filter((id) => !ids.has(id));
       if (stale.length) {
@@ -5427,7 +5432,8 @@ export class Store {
         const inserted = (await this.db.prepare(`INSERT OR IGNORE INTO inbox
           (id, organizationId, userId, eventSeq, taskId, kind, urgency, unread, actionable, createdAt, subject)
           VALUES (?, ?, ?, ?, ?, 'escalated', ?, 1, 1, ?, ?)`).run(
-          id, organizationId, userId, createdAt * 1000, `compute:${organizationId}`, urgencyRank('high'), createdAt,
+          id, organizationId, userId, createdAt * 1000, `compute:${organizationId}`,
+          urgencyRank(notice.stage === 'reminder' || notice.stage === 'hibernated' ? 'critical' : 'high'), createdAt,
           JSON.stringify({ kind: 'compute', ...notice })));
         if (!Number(inserted.changes)) continue;
         told++;

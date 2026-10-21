@@ -462,6 +462,28 @@ export class WorldLifecycleManager {
     return { state: (await this.store.worldState(taskId)) === 'released' ? 'released' : 'hibernated' };
   }
 
+  /**
+   * Hibernate parked managed computers of an organization whose compute
+   * credit is spent (src/world/compute-notices.ts): each is checkpointed and
+   * its machine and disk deleted, so its disk stops costing what the credit
+   * no longer covers. Its task restores the checkpoint when it next runs,
+   * without Git-ignored files, and its agent is told so. Returns how many
+   * were freed.
+   */
+  async hibernateForCompute(worlds: Array<{ handle: WorldHandleRef; updatedAt: number }>): Promise<number> {
+    let freed = 0;
+    for (const candidate of worlds) {
+      const done = await this.hibernate(candidate, { reason: 'compute-spent', onFailure: (error) =>
+        this.recordLifecycle(candidate.handle, 'world.hibernate_failed', { error: error instanceof Error ? error.message : String(error), reason: 'compute-spent' }),
+      }).catch(() => false);
+      if (!done) continue;
+      freed++;
+      if ((await this.store.worldState(candidate.handle.id)) === 'hibernated')
+        await this.checkpoints.addNotice?.(candidate.handle.id, COMPUTE_HIBERNATED_NOTICE);
+    }
+    return freed;
+  }
+
   /** Checkpoint a parked (or idle ready) world and delete it at its provider;
    * a world whose task finished normally is deleted without a checkpoint.
    * True when it was freed. Selection is only a hint: a gateway or activity
@@ -471,6 +493,8 @@ export class WorldLifecycleManager {
   private async hibernate(candidate: { handle: WorldHandleRef; updatedAt: number }, options: {
     expect?: 'ready' | 'parked'; resize?: { from: MachineShape; to: MachineShape }; move?: { from: string; to: string };
     released?: boolean; onFailure?: (error: unknown) => Promise<unknown>;
+    /** Why, when not the sweep's own reasons (a spent compute credit). */
+    reason?: string;
   } = {}): Promise<boolean> {
     const { resize, move } = options;
     const expected = options.expect ?? 'parked';
@@ -488,7 +512,8 @@ export class WorldLifecycleManager {
           && !(await holdsUnsavedOutput(this.store, candidate.handle.id));
       };
       if (!(await eligible(true))) return false;
-      const reason = options.released ? { reason: 'released' } : (await taskEnded(this.store, candidate.handle.id)) ? { reason: 'task-ended' } : {};
+      const reason = options.released ? { reason: 'released' } : (await taskEnded(this.store, candidate.handle.id)) ? { reason: 'task-ended' }
+        : options.reason ? { reason: options.reason } : {};
       // Its work landed: nothing in the world is needed again.
       if (!resize && !move && await finishedNormally(this.store, candidate.handle.id)) {
         try { if (!(await this.destroyAtProvider(candidate.handle, eligible))) return false; }
@@ -753,6 +778,12 @@ function inPlaceResizeNotice(shape: MachineShape): string {
     + 'including Git-ignored ones (dependencies, build output, caches). Only running processes did not carry over.';
 }
 
+/** What the agent hears when its task next runs after its parked computer
+ * was hibernated because the organization's compute credit was spent. */
+export const COMPUTE_HIBERNATED_NOTICE = 'While this task waited, the organization ran out of compute credit, so its parked computer '
+  + 'was hibernated: it was saved and its machine and disk deleted. You are on a new machine with the same files your repositories '
+  + 'track, and the same uncommitted changes. Git-ignored files (installed dependencies, build output, caches) and running processes '
+  + 'did not carry over: reinstall or restart what you need.';
 const HIBERNATE_RETRY_MS = 5 * 60_000;
 /** How long the world of a task that ended (done, cancelled, failed) is kept
  * before its machine and disk are freed: long enough for an accidental cancel
