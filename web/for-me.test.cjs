@@ -65,7 +65,9 @@ test('a row whose pull request asks says so, and the task keeps its own status',
 
 test('a row shows when it last changed: on For me, when it came to you', () => {
   const NOW = Date.UTC(2026, 9, 19, 23, 0);
-  const ctx = vm.createContext({ esc: (value) => String(value), S: { searchResult: { updated: { a: NOW - 80 * 60e3 } } } });
+  // The row reads the clock: fix it at NOW, or the assertion ages with the calendar.
+  const Clock = class extends Date { static now() { return NOW; } };
+  const ctx = vm.createContext({ esc: (value) => String(value), Date: Clock, S: { searchResult: { updated: { a: NOW - 80 * 60e3 } } } });
   vm.runInContext(['rowTime', 'fmtWhen', 'rowWhen'].map(fn).join('\n'), ctx);
   assert.equal(ctx.fmtWhen(NOW - 20e3, NOW), 'now');
   assert.equal(ctx.fmtWhen(NOW - 5 * 60e3, NOW), '5m');
