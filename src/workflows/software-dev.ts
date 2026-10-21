@@ -203,9 +203,9 @@ export const confirmSignal = defineSignal('confirm');
 /** Explicit transition into PR preparation. Only the platform supplies a human
  * identity; historical and agent signals have no deferred confirmation. */
 export const openPrSignal = defineSignal<[{ userId: string }?]>('openPr');
-/** Approve ONE branch of a multi-PR task at the head it has right now (SPEC §11.1).
- *  Lets a human confirm the finished branches and send a follow-up about the rest;
- *  the approval lapses by itself if the Do agent moves that branch afterwards. */
+/** Marks one branch of a multi-PR task reviewed at its current head. The API no
+ *  longer sends it (Confirm PR approves every branch, pramana#102); kept for
+ *  executions whose history carries it. */
 export const approveCheckoutSignal = defineSignal<[{ name: string }]>('approveCheckout');
 export const cancelSignal = defineSignal('cancel');
 /** v1.30, a task with several branches once one of its pull requests has

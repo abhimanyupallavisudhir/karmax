@@ -144,9 +144,8 @@ export const SIG = {
   providerChanged: 'providerChanged',
   confirm: 'confirm',
   openPr: 'openPr',
-  /** Approve ONE branch of a multi-PR task (SPEC §11.1). Records what has been
-   *  reviewed so an untouched branch is not re-reviewed after a loop back to Do;
-   *  `confirm` remains the only signal that passes the Review gate. */
+  /** Historical: marked one branch of a multi-PR task reviewed. The API refuses
+   *  it since pramana#102; workflows still handle it for replay. */
   approveCheckout: 'approveCheckout',
   cancel: 'cancel',
   retry: 'retry',
