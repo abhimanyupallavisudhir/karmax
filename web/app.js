@@ -1005,7 +1005,8 @@ async function applyListRoute(tab, scope, r, routeIsCurrent) {
 function taskUrl(id, record) {
   const rec = record || taskRecord(id);
   const p = projectById(rec?.projectId || S.projectId);
-  const keyPart = S.viewingAttempt !== id && rec && rec.num != null ? String(rec.num) : id;
+  // A search row standing in through another attempt opens that attempt, not the principal.
+  const keyPart = S.viewingAttempt !== id && rec && rec.num != null && !rec.otherAttempt ? String(rec.num) : id;
   return p ? `${projectBase(p.id)}/tasks/${keyPart}` : currentPath();
 }
 
@@ -5006,6 +5007,20 @@ function subTaskSummaryEventNeedsRefresh(ev) {
   return (S.view?.subTaskSummaries || []).some((summary) => summary.id === ev.taskId);
 }
 
+// A non-principal attempt can stand in for its task in a search (otherAttempt),
+// so its lifecycle can change the results: when the row it shows changes, or,
+// if the list does not show it, when its stage or status does (an attempt not
+// seen before may have just changed). Agent-turn churn alone changes neither.
+const attemptListStates = new Map();
+function siblingAttemptChangesSearch(ev) {
+  if (ev.type !== 'view.updated' || !ev.taskId) return false;
+  const state = `${ev.payload?.stage}\u0000${ev.payload?.status}`;
+  const before = attemptListStates.get(ev.taskId);
+  attemptListStates.set(ev.taskId, state);
+  const row = (S.searchResult?.tasks || []).find((task) => task.id === ev.taskId);
+  return row ? patchLifecycleView({ ...row }, ev) : before !== state;
+}
+
 function patchTaskListFromEvent(ev) {
   if (ev.type !== 'view.updated' || !ev.taskId) return false;
   const task = S.tasks.find((candidate) => candidate.id === ev.taskId);
@@ -5018,7 +5033,7 @@ function patchTaskListFromEvent(ev) {
 const HOME_REFRESH_MS = 800;
 let homeRefreshTimer = null;
 function homeEventChangesList(ev) {
-  if (!ev.taskId || ev.siblingAttempt || liveOnlyEvent(ev.type)) return false;
+  if (!ev.taskId || liveOnlyEvent(ev.type)) return false;
   if (!(ev.type === 'view.updated' || ev.type === 'task.stage' || ev.type === 'task.mentioned'
     || ev.type === 'task.created' || ev.type === 'task.deleted' || LIST_RELOAD_EVENTS.has(ev.type))) return false;
   const project = projectById(ev.projectId || ev.payload?.projectId);
@@ -5122,7 +5137,10 @@ function connectWs() {
       // membership, but they do not require the expensive all-tasks endpoint.
       if (S.tab === 'tasks' && !S.selected) scheduleSearch(true);
       if (S.tab === 'queue' && !S.selected) bgRenderMain();
-    } else if (currentProject && !siblingAttempt && (LIST_RELOAD_EVENTS.has(ev.type)
+    } else if (currentProject && siblingAttempt) {
+      // Never the principals-only task index, but perhaps the search results.
+      if (S.tab === 'tasks' && !S.selected && siblingAttemptChangesSearch(ev)) scheduleSearch(true);
+    } else if (currentProject && (LIST_RELOAD_EVENTS.has(ev.type)
       || (ev.type === 'view.updated' && ev.taskId && !S.tasks.some((t) => t.id === ev.taskId)
         ))) {
       // True membership/metadata changes are rare and do require a durable reload.

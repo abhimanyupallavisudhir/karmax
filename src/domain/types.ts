@@ -1140,6 +1140,9 @@ export interface TaskRecord {
   intentId?: string;
   /** One-based creation order within the intent. */
   attemptNumber?: number;
+  /** Search results only: this row is an attempt other than its logical task's
+   *  principal, standing in for the task because the principal did not match. */
+  otherAttempt?: boolean;
   /**
    * Simple, human-facing sequential id, numbered PER PROJECT (SPEC §10.6): each
    * project's queued tasks run #1, #2, …, assigned when first queued. Drafts that

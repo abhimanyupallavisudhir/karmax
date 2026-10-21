@@ -670,10 +670,26 @@ function enrichContext(tasks: SearchTask[], ctx: EvalContext, query: TaskQuery):
   return { ...ctx, idToNum, blockedBy, nextRun, askedOf, series };
 }
 
+/**
+ * `tasks` holds each logical task's principal and optionally its other attempts
+ * (`otherAttempt`). Each logical task yields at most one row: its principal when
+ * that matches, else the first of its other attempts that does.
+ * Relations (dependencies, numbers, series) are between logical tasks, so they
+ * are read from the principals alone.
+ */
 export function evaluateQuery(tasks: SearchTask[], query: TaskQuery, ctx: EvalContext): EvalResult {
-  const ectx = enrichContext(tasks, ctx, query);
+  const ectx = enrichContext(tasks.filter((t) => !t.otherAttempt), ctx, query);
   const filters = query.filters ?? [];
-  let out = tasks.filter((t) => matchText(t, query.text ?? '') && filters.every((c) => matchClause(t, c, ectx)));
+  const matched = tasks.filter((t) => matchText(t, query.text ?? '') && filters.every((c) => matchClause(t, c, ectx)));
+  const logical = (t: SearchTask) => t.intentId ?? t.id;
+  const principalMatched = new Set(matched.filter((t) => !t.otherAttempt).map(logical));
+  const shown = new Set<string>();
+  let out = matched.filter((t) => {
+    const key = logical(t);
+    if (shown.has(key) || (t.otherAttempt && principalMatched.has(key))) return false;
+    shown.add(key);
+    return true;
+  });
 
   const sort = query.sort?.length ? query.sort : DEFAULT_SORT;
   out = sortTasks(out, sort, ectx);

@@ -8,18 +8,28 @@ test('RQ-3/UI-7: foreign projects and known sibling attempts do not reload the c
   let reloads = 0;
   const ctx = vm.createContext({ S: { projectId: 'p', selected: null, tab: 'tasks', tasks: [], taskEvents: [], activity: [], meta: {}, attemptGroup: { principalAttemptId: 'a', attempts: [{ id: 'a' }, { id: 'b' }] } },
     location: { protocol: 'http:', host: 'test' }, WebSocket: function () {}, document: { hidden: false },
-    patchTaskListFromEvent: () => false, patchSubTaskSummaryFromEvent: () => false, LIST_RELOAD_EVENTS: new Set(['subtask.created']), inboxEventChanges: () => false, scheduleTaskListReload: () => reloads++ });
+    patchTaskListFromEvent: () => false, patchSubTaskSummaryFromEvent: () => false, LIST_RELOAD_EVENTS: new Set(['subtask.created']), inboxEventChanges: () => false, scheduleTaskListReload: () => reloads++, siblingAttemptChangesSearch: () => false });
   vm.runInContext(`${fn('connectWs')}\n${fn('isCrossProjectList')}`, ctx); ctx.connectWs();
   for (const event of [{ taskId: 'foreign', projectId: 'other', type: 'view.updated' }, { taskId: 'foreign', projectId: 'other', type: 'subtask.created' }, { taskId: 'b', projectId: 'p', type: 'view.updated' }]) ctx.S.ws.onmessage({ data: JSON.stringify(event) });
   assert.equal(reloads, 0);
 });
-test('RQ-3: a non-principal attempt the list never shows does not reload it', () => {
-  let reloads = 0;
-  const ctx = vm.createContext({ S: { projectId: 'p', selected: null, tab: 'tasks', tasks: [{ id: 'a' }], taskEvents: [], activity: [], meta: {}, attemptGroup: null },
+test('RQ-3: a non-principal attempt re-runs the search when it may change it, and never reloads the task index', () => {
+  let reloads = 0, searches = 0;
+  const ctx = vm.createContext({ S: { projectId: 'p', selected: null, tab: 'tasks', tasks: [{ id: 'a' }], taskEvents: [], activity: [], meta: {}, attemptGroup: null,
+    searchResult: { tasks: [{ id: 'shown', otherAttempt: true, lastView: { stage: 'do', status: 'active' } }] } },
     location: { protocol: 'http:', host: 'test' }, WebSocket: function () {}, document: { hidden: false },
-    patchTaskListFromEvent: () => false, patchSubTaskSummaryFromEvent: () => false, LIST_RELOAD_EVENTS: new Set(), inboxEventChanges: () => false, scheduleTaskListReload: () => reloads++ });
-  vm.runInContext(`${fn('connectWs')}\n${fn('isCrossProjectList')}`, ctx); ctx.connectWs();
-  ctx.S.ws.onmessage({ data: JSON.stringify({ taskId: 'b', projectId: 'p', type: 'view.updated', siblingAttempt: true, payload: { status: 'active' } }) });
+    patchTaskListFromEvent: () => false, patchSubTaskSummaryFromEvent: () => false, LIST_RELOAD_EVENTS: new Set(), inboxEventChanges: () => false,
+    scheduleTaskListReload: () => reloads++, scheduleSearch: () => searches++, pendingCancellationView: (view) => view, listState: () => '' });
+  vm.runInContext(`${fn('connectWs')}\n${fn('isCrossProjectList')}\n${fn('patchLifecycleView')}\nconst attemptListStates = new Map();\n${fn('siblingAttemptChangesSearch')}`, ctx); ctx.connectWs();
+  const send = (taskId, payload) => ctx.S.ws.onmessage({ data: JSON.stringify({ taskId, projectId: 'p', type: 'view.updated', siblingAttempt: true, payload }) });
+  send('b', { stage: 'do', status: 'active' });
+  assert.equal(searches, 1, 'an attempt not seen before may have just come to match');
+  send('b', { stage: 'do', status: 'active', agentTurn: 'running' });
+  assert.equal(searches, 1, 'agent-turn churn of an unshown attempt changes no result');
+  send('b', { stage: 'review', status: 'waiting' });
+  assert.equal(searches, 2, 'its stage or status changing may');
+  send('shown', { stage: 'do', status: 'active', agentTurn: 'running' });
+  assert.equal(searches, 3, 'the attempt a row shows repaints like a principal');
   assert.equal(reloads, 0);
   ctx.S.ws.onmessage({ data: JSON.stringify({ taskId: 'c', projectId: 'p', type: 'view.updated', payload: { status: 'active' } }) });
   assert.equal(reloads, 1, 'an unseen principal task still reloads the list');
@@ -52,4 +62,11 @@ test('RQ-8: inbox reloads only for potential actionable or outcome changes', () 
 test('RQ-15: task list refreshes do not rebuild the project rail', () => {
   assert.doesNotMatch(fn('connectWs'), /renderRail\(\)/);
   assert.doesNotMatch(fn('refreshTasks'), /renderRail\(\)/);
+});
+test('the organization home re-runs its search when a non-principal attempt changes', () => {
+  const ctx = vm.createContext({ S: { tab: 'home', organizationId: 'o' }, projectById: () => ({ organizationId: 'o' }),
+    LIST_RELOAD_EVENTS: new Set(), liveOnlyEvent: (type) => type === 'agent.output' });
+  vm.runInContext(fn('homeEventChangesList'), ctx);
+  assert.equal(ctx.homeEventChangesList({ taskId: 'b', projectId: 'p', type: 'view.updated', siblingAttempt: true }), true);
+  assert.equal(ctx.homeEventChangesList({ taskId: 'b', projectId: 'p', type: 'agent.output', siblingAttempt: true }), false);
 });
