@@ -1658,7 +1658,7 @@ const computerReach = () => (S.worldProviderConnections || [])
 function computerReachText(reach = computerReach()) {
   const names = [...reach].sort((a, b) => Number(!!a.managed) - Number(!!b.managed))
     .map((c) => `${COMPUTER_PROVIDER_LABELS[c.provider] || c.provider}${c.managed ? '' : ' (yours)'}`);
-  return names.length ? names.join(', ') : 'nothing yet: connect a computer in Settings → Computers';
+  return names.length ? names.join(', ') : 'nothing yet: connect a computer in Settings → Resources';
 }
 const ANY_TIP = 'Runs on the first that fits and has room: your own accounts first, then the cheapest. A full one gives way to the next.';
 // What a machine gets when the Computer asks for nothing more (disk is total GB).
