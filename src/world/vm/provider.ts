@@ -15,6 +15,7 @@ import { ProviderOutage } from '../../agent/limits.js';
 import { generateSshKeyPair, quote, SshTransport, VmTransportError, type SshEndpoint } from './ssh.js';
 import { VmWorld } from './world.js';
 import { VM_HOME, VM_USER, vmProvisionFailure, vmProvisionScript, vmProvisionStamp } from './provision.js';
+import type { FinalUsage } from './runs.js';
 
 /** What a VM world's machine is: CPU, memory, and the size of its volume. */
 export interface VmShape { cpu: number; memoryMb: number; diskGb: number }
@@ -74,7 +75,10 @@ export interface VmDriver {
   list(connection: ResolvedWorldProviderConnection, home: string): Promise<VmListing[]>;
   /** Whether two references name the same world (its volume). */
   same(a: Record<string, string>, b: Record<string, string>): boolean;
-  usage?(connection: ResolvedWorldProviderConnection, home: string, since?: number): Promise<ProviderUsageEvent[]>;
+  /** What the cloud bills, as rows the feed books once each (stable ids).
+   * `final`: only that world, about to be deleted, with what it still does
+   * ending at `final.at` (a deleted disk or machine is never listed again). */
+  usage?(connection: ResolvedWorldProviderConnection, home: string, since?: number, final?: FinalUsage): Promise<ProviderUsageEvent[]>;
   /** Periodic upkeep (deferred deletes, stale builders), once per sweep. */
   housekeep?(connection: ResolvedWorldProviderConnection, home: string): Promise<void>;
   diagnose?(connection: ResolvedWorldProviderConnection, ref: Record<string, string>, window: { since: number; now: number }): Promise<WorldDiagnosis | undefined>;
@@ -83,6 +87,17 @@ export interface VmDriver {
 }
 
 type Resolver = (organizationId: string | undefined, provider: string) => ResolvedWorldProviderConnection | Promise<ResolvedWorldProviderConnection>;
+
+/** Where a deleted world's last usage waits for the feed (the store's kv). */
+export interface VmUsageLedger {
+  kvEntries(prefix: string): Promise<Array<{ key: string; value: string }>>;
+  kvSet(key: string, value: string): void | Promise<void>;
+  kvDelete(key: string): void | Promise<void>;
+}
+
+/** How long a deleted world's last usage is offered to the feed: every sweep
+ * books it (by id, once) well within this, even after a provider outage. */
+const FINAL_USAGE_KEPT_MS = 3 * 86_400_000;
 
 /** How long a new or woken machine may take to answer SSH (a stock image installs sshd first). */
 const REACHABLE_MS = 6 * 60_000;
@@ -115,6 +130,8 @@ export class VmWorldProvider implements WorldProvider {
       user?: string;
       home?: string;
       provision?: { stamp: string; script: string; sudo: boolean };
+      /** Keeps what a world used last, read just before it is deleted, until the usage feed books it. */
+      ledger?: VmUsageLedger;
     } = {}) {
     this.kind = driver.kind;
   }
@@ -237,11 +254,36 @@ export class VmWorldProvider implements WorldProvider {
 
   async destroy(handle: WorldHandle): Promise<void> {
     const sealed = this.reference(handle);
-    const connection = await this.connection(connectionScope(sealed));
+    const scope = connectionScope(sealed);
+    const connection = await this.connection(scope);
     this.dropTransport(handle.id);
-    await this.driver.destroy(connection, sealed);
+    await this.destroyBooked(connection, scope, sealed, () => this.driver.destroy(connection, sealed));
     this.states.delete(handle.id);
     this.destroyed.add(handle);
+  }
+
+  /**
+   * Delete a world without losing what it used last. The feed books a disk
+   * hour, or a run's slice, once it is over and only while the cloud still
+   * lists it; a deleted disk is never listed again, so the part-hour it lived
+   * last (and on some clouds the last run) would never be booked. Read them
+   * just before deleting, and keep them for the feed (`listUsageEvents`).
+   */
+  private async destroyBooked(connection: ResolvedWorldProviderConnection, scope: string | undefined,
+    ref: Record<string, string>, destroy: () => Promise<void>): Promise<void> {
+    const ledger = this.options.ledger;
+    const at = Date.now();
+    const name = ref.world ?? ref.app;
+    const final = ledger && this.driver.usage && name !== undefined
+      ? await this.driver.usage(connection, serviceHomeLabel(), undefined, { ref, at }).catch((error) => {
+        console.warn(`[${this.kind}] could not read the last usage of ${name} before deleting it: ${(error as Error).message}`);
+        return [];
+      })
+      : [];
+    await destroy();
+    if (!final.length) return;
+    try { await ledger!.kvSet(`${finalUsageKey(this.kind, scope)}${name}`, JSON.stringify({ at, events: final })); }
+    catch (error) { console.warn(`[${this.kind}] could not keep the last usage of ${name}: ${(error as Error).message}`); }
   }
 
   async status(handle: WorldHandle): Promise<WorldLifecycleState> {
@@ -284,13 +326,27 @@ export class VmWorldProvider implements WorldProvider {
         try { return handle.kind === this.kind && this.driver.same(this.reference(handle as WorldHandle), listing.ref); }
         catch { return undefined; }
       },
-      destroy: async () => { await listing.destroy(); if (listing.taskId) this.dropTransport(listing.taskId); },
+      destroy: async () => {
+        await this.destroyBooked(connection, organizationId, listing.ref, () => listing.destroy());
+        if (listing.taskId) this.dropTransport(listing.taskId);
+      },
     }));
   }
 
   async listUsageEvents(organizationId: string, since?: number): Promise<ProviderUsagePage> {
     if (!this.driver.usage) return { events: [] };
-    return { events: await this.driver.usage(await this.connection(organizationId), serviceHomeLabel(), since) };
+    const events = await this.driver.usage(await this.connection(organizationId), serviceHomeLabel(), since);
+    const ledger = this.options.ledger;
+    if (!ledger) return { events };
+    // Deleted worlds' last usage: the feed books each row once, by its id.
+    const seen = new Set(events.map((event) => event.id));
+    for (const { key, value } of await ledger.kvEntries(finalUsageKey(this.kind, organizationId))) {
+      let entry: { at?: number; events?: ProviderUsageEvent[] } = {};
+      try { entry = JSON.parse(value); } catch {}
+      if (!(Number(entry.at) > Date.now() - FINAL_USAGE_KEPT_MS)) { await ledger.kvDelete(key); continue; }
+      for (const event of entry.events ?? []) if (!seen.has(event.id)) { seen.add(event.id); events.push(event); }
+    }
+    return { events };
   }
 
   async housekeep(organizationId?: string): Promise<void> {
@@ -478,4 +534,9 @@ function provisionTarget(transport: SshTransport, signal?: AbortSignal): Provisi
       await transport.writeFile(remotePath, Buffer.isBuffer(content) ? content : Buffer.from(content), 0o600);
     },
   };
+}
+
+/** The ledger keys of a provider account's deleted worlds (`…:<world>`). */
+function finalUsageKey(kind: string, scope: string | undefined): string {
+  return `vm-final-usage:${kind}:${scope ?? '-'}:`;
 }

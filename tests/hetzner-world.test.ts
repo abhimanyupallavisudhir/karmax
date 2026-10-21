@@ -61,6 +61,7 @@ describe.skipIf(!sshdAvailable)('Hetzner worlds (fake Cloud API, real sshd)', ()
   let provider: VmWorldProvider;
   let driver: HetznerDriver;
   let stamp: string;
+  let ledger: Map<string, string>;
   const snapshots = process.env.KARMAX_HETZNER_SNAPSHOTS;
 
   beforeEach(() => {
@@ -69,9 +70,15 @@ describe.skipIf(!sshdAvailable)('Hetzner worlds (fake Cloud API, real sshd)', ()
     hetzner = new FakeHetzner();
     driver = new HetznerDriver(hetzner.fetch, 1);
     stamp = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'vm-stamp-')), 'provisioned');
+    ledger = new Map();
     provider = new VmWorldProvider(driver, async () => connection(hetzner.token), undefined, {
       socket: hetzner.socket, user: os.userInfo().username, home: hetzner.home,
       provision: { stamp, script: `echo provisioned > ${stamp}`, sudo: false },
+      ledger: {
+        kvEntries: async (prefix) => [...ledger].filter(([key]) => key.startsWith(prefix)).map(([key, value]) => ({ key, value })),
+        kvSet: (key, value) => { ledger.set(key, value); },
+        kvDelete: (key) => { ledger.delete(key); },
+      },
     });
   });
   afterEach(async () => {
@@ -190,6 +197,17 @@ describe.skipIf(!sshdAvailable)('Hetzner worlds (fake Cloud API, real sshd)', ()
     const disk = events.filter((event) => event.kind === 'disk');
     expect(disk).toHaveLength(2); // volume hours count once they pass
     expect(disk[0]).toMatchObject({ diskGb: 100, costMicros: Math.round(100 * 0.044 / 730 * 1.17 * 1e6) });
+  });
+
+  it('books a deleted volume’s hour under way, which Hetzner bills in full, also when the orphan reaper deletes it', async () => {
+    await provider.create({ taskId: 'task_hgone', base: 'main', generation: 1, organizationId: 'org_h', resources: { diskGb: 100 } });
+    [...hetzner.volumes.values()][0]!.created = new Date(Date.now() - 90 * 60_000).toISOString();
+    expect((await provider.listUsageEvents('org_h')).events.filter((event) => event.kind === 'disk')).toHaveLength(1);
+    await (await provider.listSandboxes('org_h'))[0]!.destroy();
+    expect(hetzner.volumes.size).toBe(0);
+    const disk = (await provider.listUsageEvents('org_h')).events.filter((event) => event.kind === 'disk');
+    expect(disk.map((event) => event.id.split(':')[1])).toEqual(['0', '1']);
+    expect(disk[1]).toMatchObject({ taskId: 'task_hgone', diskGb: 100, activeMs: 3_600_000, costMicros: Math.round(100 * 0.044 / 730 * 1.17 * 1e6) });
   });
 
   it('lists worlds for the orphan reaper and destroys the server and the volume', async () => {

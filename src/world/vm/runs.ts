@@ -35,14 +35,29 @@ export function runSlices(runs: MachineRun[], now: number, from: number, sliceMs
   return slices;
 }
 
-/** The whole hours a disk has existed, since `from`. */
-export function diskHours(created: number, now: number, from: number): RunSlice[] {
+/** The whole hours a disk has existed, since `from`; for a disk being
+ * deleted at `deletedAt`, also the part of an hour it lived last (clouds bill
+ * a disk by the second, and a deleted disk is never listed again). */
+export function diskHours(created: number, now: number, from: number, deletedAt?: number): RunSlice[] {
   const slices: RunSlice[] = [];
+  const until = deletedAt === undefined ? now : Math.min(now, deletedAt);
   const first = Math.max(0, Math.ceil((from - created) / DISK_SLICE_MS));
-  for (let hour = first; created + (hour + 1) * DISK_SLICE_MS <= now; hour++)
-    slices.push({ id: String(hour), start: created + hour * DISK_SLICE_MS, end: created + (hour + 1) * DISK_SLICE_MS });
+  for (let hour = first; created + hour * DISK_SLICE_MS < until; hour++) {
+    const start = created + hour * DISK_SLICE_MS;
+    const end = Math.min(start + DISK_SLICE_MS, until);
+    if (end < start + DISK_SLICE_MS && deletedAt === undefined) break;
+    slices.push({ id: String(hour), start, end });
+  }
   return slices;
 }
+
+/** How far back a world's final usage reaches: the feed books everything
+ * older while the world still exists. */
+export const FINAL_USAGE_WINDOW_MS = 24 * 3_600_000;
+
+/** A driver's `usage` asked for one world about to be deleted: its machines
+ * and disks only, everything they still do ending at `at`. */
+export interface FinalUsage { ref: Record<string, string>; at: number }
 
 /** `<start>-<end>`: a run kept in a tag or label until the feed has booked it. */
 export function encodeRun(run: { start: number; end: number }): string { return `${run.start}-${run.end}`; }

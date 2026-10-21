@@ -5,6 +5,7 @@ import type { ProviderUsageEvent, WorldDiagnosis, WorldLifecycleState } from './
 import type { VmAllocation, VmBootKeys, VmDriver, VmListing, VmShape } from './vm/provider.js';
 import { VM_ETC, VM_HOME, VM_SSH_PORT, vmBootScript } from './vm/provision.js';
 import { PublishedVmImage } from './vm/image.js';
+import { diskHours, FINAL_USAGE_WINDOW_MS, type FinalUsage } from './vm/runs.js';
 
 /**
  * Fly.io Machines as VM worlds (`vm/provider.ts`). One Fly app per world: the
@@ -186,13 +187,16 @@ export class FlyDriver implements VmDriver {
    * Billable time, from Fly's own records: each machine's start→stop runs
    * (its event log) at its guest's price, and each volume's whole hours at
    * its size. A run is reported once it ends; volume hours once they pass.
+   * `final` (just before the app is deleted, taking everything with it) ends
+   * a run still going and the volume's last part-hour then.
    */
-  async usage(connection: ResolvedWorldProviderConnection, home: string, since?: number): Promise<ProviderUsageEvent[]> {
+  async usage(connection: ResolvedWorldProviderConnection, home: string, since?: number, final?: FinalUsage): Promise<ProviderUsageEvent[]> {
     const api = this.api(connection);
-    const apps = (await api('GET', `/apps?org_slug=${encodeURIComponent(organization(connection))}`) as { apps?: Array<{ name: string }> }).apps ?? [];
+    const apps = final ? [{ name: final.ref.app! }]
+      : (await api('GET', `/apps?org_slug=${encodeURIComponent(organization(connection))}`) as { apps?: Array<{ name: string }> }).apps ?? [];
     const events: ProviderUsageEvent[] = [];
-    const now = Date.now();
-    const from = Math.max(since !== undefined ? since - 2 * 3_600_000 : 0, now - 7 * 86_400_000);
+    const now = final?.at ?? Date.now();
+    const from = final ? now - FINAL_USAGE_WINDOW_MS : Math.max(since !== undefined ? since - 2 * 3_600_000 : 0, now - 7 * 86_400_000);
     for (const app of apps.filter((candidate) => candidate.name.startsWith(appPrefix(home)))) {
       const machines = await api('GET', `/apps/${app.name}/machines`).catch(() => []) as FlyMachine[];
       const labels = machines.find((machine) => machine.config?.metadata?.karmaxHome === home)?.config?.metadata;
@@ -202,7 +206,7 @@ export class FlyDriver implements VmDriver {
       for (const machine of machines) {
         const guest = machine.config?.guest;
         if (!guest) continue;
-        for (const run of machineRuns(machine.events ?? [])) {
+        for (const run of machineRuns(machine.events ?? [], final?.at)) {
           if (run.endedAt < from) continue;
           const seconds = (run.endedAt - run.startedAt) / 1000;
           events.push({ id: `${machine.id}:${run.startedAt}`, sandboxId: app.name, ...owner, startedAt: run.startedAt,
@@ -214,10 +218,10 @@ export class FlyDriver implements VmDriver {
       for (const volume of volumes) {
         const created = Date.parse(volume.created_at ?? '');
         if (!Number.isFinite(created) || volume.state === 'destroyed') continue;
-        for (let start = created + Math.max(0, Math.ceil((from - created) / 3_600_000)) * 3_600_000; start + 3_600_000 <= now; start += 3_600_000)
-          events.push({ id: `${volume.id}:${start}`, sandboxId: app.name, ...owner, kind: 'disk', startedAt: start,
-            endedAt: start + 3_600_000, activeMs: 3_600_000, cpu: 0, memoryMb: 0, diskGb: volume.size_gb,
-            costMicros: Math.round(3_600 * flyVolumeDollarsPerSecond(volume.size_gb) * 1e6) });
+        for (const hour of diskHours(created, now, from, final?.at))
+          events.push({ id: `${volume.id}:${hour.start}`, sandboxId: app.name, ...owner, kind: 'disk', startedAt: hour.start,
+            endedAt: hour.end, activeMs: hour.end - hour.start, cpu: 0, memoryMb: 0, diskGb: volume.size_gb,
+            costMicros: Math.round((hour.end - hour.start) / 1000 * flyVolumeDollarsPerSecond(volume.size_gb) * 1e6) });
       }
     }
     return events;
@@ -349,7 +353,7 @@ interface FlyEvent { type: string; status: string; timestamp: number; request?: 
 interface FlyVolume { id: string; size_gb: number; created_at?: string; state?: string }
 
 /** Completed start→stop intervals in a machine's event log. */
-export function machineRuns(events: FlyEvent[]): Array<{ startedAt: number; endedAt: number }> {
+export function machineRuns(events: FlyEvent[], endAt?: number): Array<{ startedAt: number; endedAt: number }> {
   const runs: Array<{ startedAt: number; endedAt: number }> = [];
   let started: number | undefined;
   for (const event of [...events].sort((a, b) => a.timestamp - b.timestamp)) {
@@ -359,6 +363,8 @@ export function machineRuns(events: FlyEvent[]): Array<{ startedAt: number; ende
       started = undefined;
     }
   }
+  // A run still going when the machine is deleted ends then.
+  if (started !== undefined && endAt !== undefined && endAt > started) runs.push({ startedAt: started, endedAt: endAt });
   return runs;
 }
 

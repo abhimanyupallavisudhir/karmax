@@ -5,7 +5,7 @@ import type { ResolvedWorldProviderConnection } from './connections.js';
 import type { ProviderUsageEvent, WorldLifecycleState } from './types.js';
 import { runDetached, type VmAllocation, type VmBootKeys, type VmDriver, type VmListing, type VmShape } from './vm/provider.js';
 import { startupScript, VM_ETC, VM_SSH_PORT, VM_USER, vmProvisionScript, vmProvisionStamp, vmProvisionVersion } from './vm/provision.js';
-import { decodeRun, diskHours, encodeRun, runSlices, type MachineRun } from './vm/runs.js';
+import { decodeRun, diskHours, encodeRun, FINAL_USAGE_WINDOW_MS, runSlices, type FinalUsage, type MachineRun } from './vm/runs.js';
 import { generateSshKeyPair, quote, SshTransport } from './vm/ssh.js';
 import { ProviderCapacityFull, ProviderOutage } from '../agent/limits.js';
 
@@ -246,12 +246,13 @@ export class GcpDriver implements VmDriver {
    * and memory plus its external IPv4 address) in five-minute slices, and
    * each disk, boot and home, by the hour whatever the instance does.
    */
-  async usage(connection: ResolvedWorldProviderConnection, home: string, since?: number): Promise<ProviderUsageEvent[]> {
-    const now = Date.now();
-    const from = Math.max(since !== undefined ? since - 2 * 3_600_000 : 0, now - 7 * 86_400_000);
+  async usage(connection: ResolvedWorldProviderConnection, home: string, since?: number, final?: FinalUsage): Promise<ProviderUsageEvent[]> {
+    const now = final?.at ?? Date.now();
+    const from = final ? now - FINAL_USAGE_WINDOW_MS : Math.max(since !== undefined ? since - 2 * 3_600_000 : 0, now - 7 * 86_400_000);
+    const filter = labelFilter({ karmaxHome: home, ...(final ? { karmaxWorld: gcpLabels({ karmaxWorld: final.ref.world! })['karmax-world']! } : {}) });
     const prices = await this.prices(connection);
     const events: ProviderUsageEvent[] = [];
-    for (const instance of await this.aggregated<Instance>(connection, 'instances', labelFilter({ karmaxHome: home }))) {
+    for (const instance of await this.aggregated<Instance>(connection, 'instances', filter)) {
       const taskId = label(instance.labels, 'karmaxTaskId');
       if (!taskId) continue;
       const machine = instance.machineType.match(/e2-custom-(\d+)-(\d+)$/);
@@ -260,7 +261,7 @@ export class GcpDriver implements VmDriver {
       const hourly = cpu * prices.core + memoryMb / 1024 * prices.ramGb + IPV4_HOURLY;
       const runs: MachineRun[] = [];
       const current = runOf(instance);
-      if (current) runs.push(current);
+      if (current) runs.push(final && current.end === undefined ? { ...current, end: final.at } : current);
       const previous = decodeRun(label(instance.labels, 'karmaxLastRun'));
       if (previous) runs.push(previous);
       for (const slice of runSlices(runs, now, from))
@@ -268,13 +269,13 @@ export class GcpDriver implements VmDriver {
           ...organization(instance.labels), startedAt: slice.start, endedAt: slice.end, activeMs: slice.end - slice.start, cpu, memoryMb,
           costMicros: Math.round(hourly * (slice.end - slice.start) / 3_600_000 * 1e6) });
     }
-    for (const disk of await this.aggregated<Disk>(connection, 'disks', labelFilter({ karmaxHome: home }))) {
+    for (const disk of await this.aggregated<Disk>(connection, 'disks', filter)) {
       const taskId = label(disk.labels, 'karmaxTaskId');
       const created = Date.parse(disk.creationTimestamp);
-      for (const hour of diskHours(created, now, from))
+      for (const hour of diskHours(created, now, from, final?.at))
         events.push({ id: `disk-${disk.name}-${created}:${hour.id}`, sandboxId: disk.name, ...(taskId ? { taskId } : {}), ...organization(disk.labels),
           kind: 'disk', startedAt: hour.start, endedAt: hour.end, activeMs: hour.end - hour.start, cpu: 0, memoryMb: 0, diskGb: Number(disk.sizeGb),
-          costMicros: Math.round(Number(disk.sizeGb) * prices.diskGbMonth / 730 * 1e6) });
+          costMicros: Math.round(Number(disk.sizeGb) * prices.diskGbMonth / 730 * (hour.end - hour.start) / 3_600_000 * 1e6) });
     }
     return events;
   }

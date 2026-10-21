@@ -5,7 +5,7 @@ import type { ResolvedWorldProviderConnection } from './connections.js';
 import type { ProviderUsageEvent, WorldLifecycleState } from './types.js';
 import { runDetached, type VmAllocation, type VmBootKeys, type VmDriver, type VmListing, type VmShape } from './vm/provider.js';
 import { cloudInit, VM_ETC, VM_SSH_PORT, VM_USER, vmProvisionScript, vmProvisionStamp, vmProvisionVersion } from './vm/provision.js';
-import { decodeRun, diskHours, encodeRun, runSlices, type MachineRun } from './vm/runs.js';
+import { decodeRun, diskHours, encodeRun, FINAL_USAGE_WINDOW_MS, runSlices, type FinalUsage, type MachineRun } from './vm/runs.js';
 import { generateSshKeyPair, quote, SshTransport } from './vm/ssh.js';
 import { ProviderCapacityFull, ProviderOutage } from '../agent/limits.js';
 
@@ -352,19 +352,22 @@ export class AwsDriver implements VmDriver {
    * What EC2 bills: each instance's runs (per second, at its type's price plus
    * its public IPv4 address) in five-minute slices, and each volume, root and
    * home, by the hour whatever the instance does. A terminated instance stays
-   * listed for about an hour, long enough for its last run to be booked.
+   * listed for about an hour, long enough for its last run to be booked; a
+   * deleted volume is not, so `final` (just before a world is deleted) also
+   * reports its disks' last part-hours, and a run still going as ending then.
    */
-  async usage(connection: ResolvedWorldProviderConnection, home: string, since?: number): Promise<ProviderUsageEvent[]> {
-    const now = Date.now();
-    const from = Math.max(since !== undefined ? since - 2 * 3_600_000 : 0, now - 7 * 86_400_000);
+  async usage(connection: ResolvedWorldProviderConnection, home: string, since?: number, final?: FinalUsage): Promise<ProviderUsageEvent[]> {
+    const now = final?.at ?? Date.now();
+    const from = final ? now - FINAL_USAGE_WINDOW_MS : Math.max(since !== undefined ? since - 2 * 3_600_000 : 0, now - 7 * 86_400_000);
+    const filters = { 'tag:karmaxHome': home, ...(final ? { 'tag:karmaxWorld': final.ref.world! } : {}) };
     const events: ProviderUsageEvent[] = [];
-    for (const instance of await this.instances(connection, { 'tag:karmaxHome': home })) {
+    for (const instance of await this.instances(connection, filters)) {
       const tags = tagsOf(instance.tagSet);
       if (!tags.karmaxTaskId) continue;
       const runs: MachineRun[] = [];
       const start = Date.parse(instance.launchTime);
       const running = ['pending', 'running'].includes(instance.instanceState.name);
-      const ended = running ? undefined : stoppedAt(instance);
+      const ended = running ? final?.at : stoppedAt(instance);
       // A stopped instance whose stop time EC2 does not say is not counted on (never forever).
       if (running || ended) runs.push({ start, ...(ended ? { end: ended } : {}) });
       const previous = decodeRun(tags.karmaxLastRun);
@@ -377,12 +380,12 @@ export class AwsDriver implements VmDriver {
           costMicros: Math.round(hourly * (slice.end - slice.start) / 3_600_000 * 1e6) });
     }
     const gbMonth = await this.gp3Price(connection);
-    for (const volume of await this.volumes(connection, { 'tag:karmaxHome': home })) {
+    for (const volume of await this.volumes(connection, filters)) {
       const tags = tagsOf(volume.tagSet);
-      for (const hour of diskHours(Date.parse(volume.createTime), now, from))
+      for (const hour of diskHours(Date.parse(volume.createTime), now, from, final?.at))
         events.push({ id: `volume-${volume.volumeId}:${hour.id}`, sandboxId: volume.volumeId, ...owner(tags), kind: 'disk',
           startedAt: hour.start, endedAt: hour.end, activeMs: hour.end - hour.start, cpu: 0, memoryMb: 0, diskGb: Number(volume.size),
-          costMicros: Math.round(Number(volume.size) * gbMonth / 730 * 1e6) });
+          costMicros: Math.round(Number(volume.size) * gbMonth / 730 * (hour.end - hour.start) / 3_600_000 * 1e6) });
     }
     return events;
   }
