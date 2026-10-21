@@ -110,6 +110,13 @@ export interface SubscriptionProvider {
   updateStoragePacks(input: { subscriptionId: string; storagePacks: number; idempotencyKey: string }): Promise<{ id: string }>;
   /** Sets the subscription's total compute packs, keeping every other item. */
   updateComputePacks(input: { subscriptionId: string; computePacks: number; idempotencyKey: string }): Promise<{ id: string }>;
+  /** Charges a compute top-up once, now, to the subscription's saved payment
+   * method (wiki features/managed-compute § Auto top-up). */
+  chargeComputeTopUp?(input: { subscriptionId: string; topUpId: string; amountCents: number }): Promise<{ id: string }>;
+  /** Where a top-up charge stands, from the provider's records; `absent` when
+   * a complete read finds no charge, null when the reads prove nothing. */
+  findComputeTopUp?(input: { subscriptionId: string; topUpId: string; since: number }): Promise<
+    { state: 'paid' | 'pending' | 'declined' | 'failed'; transactionId?: string } | { absent: true } | null>;
   verifyWebhook(raw: Buffer, signature?: string): BillingEvent | Promise<BillingEvent>;
 }
 
@@ -584,6 +591,20 @@ export class SubscriptionBillingService {
     return this.idempotent(organizationId, `compute:${packs}`, key, () => provider.updateComputePacks({
       subscriptionId: account.subscriptionId!, computePacks: packs, idempotencyKey: `${key}:compute`,
     }), provider, { kind: 'compute', subscriptionId: account.subscriptionId, computePacks: packs });
+  }
+
+  /** The subscription an automatic compute top-up would charge, or why there
+   * is none: it needs an active paid subscription with a saved payment method
+   * (not past due) and a provider that charges one-time top-ups. */
+  async computeTopUpTarget(organizationId: string): Promise<{ subscriptionId: string; provider: SubscriptionProvider } | { reason: string }> {
+    if (!this.hosted) return { reason: 'self-hosted installations have no compute billing' };
+    const account = await this.account(organizationId);
+    if (!account?.subscriptionId || account.plan === 'free' || !['active', 'trialing'].includes(account.status))
+      return { reason: account?.status === 'past_due' ? 'the subscription is past due' : 'auto top-up needs an active paid subscription' };
+    const provider = await this.provider(account.provider);
+    if (!provider.chargeComputeTopUp || !provider.findComputeTopUp || !(await provider.configured())
+      || !(await provider.catalog())?.computePackProductId) return { reason: 'compute top-ups are not available yet' };
+    return { subscriptionId: account.subscriptionId, provider };
   }
 
   /** Removing packs must not leave the organization's managed storage over quota. */

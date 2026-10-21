@@ -248,7 +248,21 @@ export interface InboxItem {
   /** Resource-backed asks use the inbox without manufacturing a task merely to
    * carry a notification. */
   subject?: { kind: 'avatar-authorization'; avatarId: string; projectId: string; requestId: string }
-    | CredentialNotice;
+    | CredentialNotice | ComputeNotice;
+}
+
+/** An organization's managed compute credit is spent (src/world/compute-notices.ts). */
+export interface ComputeNotice {
+  kind: 'compute';
+  month: string;
+  /** spent: told it is spent; reminder: its parked computers hibernate in a day; hibernated: they were. */
+  stage?: 'spent' | 'reminder' | 'hibernated';
+  usedMicros: number;
+  creditMicros: number;
+  renewsAt: number;
+  /** When its parked managed computers are hibernated, and how many. */
+  hibernateAt?: number;
+  computers?: number;
 }
 
 /** A login only a person can restore: its sign-in lapses soon, or already did. */

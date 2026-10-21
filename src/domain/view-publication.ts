@@ -235,8 +235,16 @@ export function watchesJobs(view: Pick<TaskView, 'waitingFor'>): boolean {
 }
 
 /** These waits still own live work or are about to enter a turn (a retry after
- * an infrastructure failure is seconds to minutes away). */
+ * an infrastructure failure is seconds to minutes away). Waiting for compute
+ * credit is not: only a person (a pack, auto top-up, the next month) ends it,
+ * and the world must not run up the very bill it waits on, so it parks. */
 export function hasLiveWorldWork(view: Pick<TaskView, 'waitingFor'>): boolean {
+  return hadLiveWorldWork(view) && !(view.waitingFor?.kind === 'retry' && view.waitingFor.summary === 'Out of compute');
+}
+
+/** hasLiveWorldWork before out-of-compute waits parked (workflow histories
+ * without the `out-of-compute-parks-v1` marker). */
+export function hadLiveWorldWork(view: Pick<TaskView, 'waitingFor'>): boolean {
   return view.waitingFor?.kind === 'agentSlot' || view.waitingFor?.kind === 'subagent'
     || view.waitingFor?.kind === 'shell' || view.waitingFor?.kind === 'retry';
 }

@@ -118,7 +118,7 @@ describe('compute credit', () => {
     const spent = await assertComputeCredit(f.store, f.organization.id, 'e2b').catch((error) => error);
     expect(spent).toBeInstanceOf(ComputeCreditExhausted);
     expect(spent).toBeInstanceOf(ProviderCapacityFull);
-    expect(spent.message).toMatch(/^Out of compute: this month's \$5\.00 of compute is used up\. Add a compute pack in Plan & billing, or connect your own E2B account/);
+    expect(spent.message).toMatch(/^Out of compute: this month's \$5\.00 of compute is used up\. Add a compute pack or turn on auto top-up in Plan & billing, or connect your own E2B account/);
 
     // A gifted pack makes room again.
     await f.store.setComputePackGift(f.organization.id, 1, 'operator');
@@ -218,15 +218,17 @@ describe('out-of-compute notices', () => {
       userEmail: async (userId: string) => `${userId}@example.test`, publicUrl: 'https://tavya.test', siteName: async () => 'tavya' };
     expect(await notifyComputeCredit(deps)).toBe(0);
     await f.usage('spent', 2_500_000);
-    expect(await notifyComputeCredit(deps)).toBe(1);
+    // Told once it has stayed spent ten minutes (an auto top-up may be on its way).
     expect(await notifyComputeCredit(deps)).toBe(0);
+    expect(await notifyComputeCredit(deps, Date.now() + 10 * 60_000)).toBe(1);
+    expect(await notifyComputeCredit(deps, Date.now() + 20 * 60_000)).toBe(0);
     const inbox = await f.store.listInbox('owner', f.organization.id);
     expect(inbox).toHaveLength(1);
     expect(inbox[0]!.subject).toMatchObject({ kind: 'compute', usedMicros: 5_000_000, creditMicros: 5_000_000 });
     expect(sent).toEqual([expect.objectContaining({ to: 'owner@example.test', subject: 'Acme has used this month\'s tavya compute' })]);
-    expect(sent[0]!.text).toMatch(/\$5\.00 of its \$5\.00[\s\S]*add a compute pack[\s\S]*https:\/\/tavya\.test\/settings/);
+    expect(sent[0]!.text).toMatch(/\$5\.00 of its \$5\.00[\s\S]*add a compute pack, turn on auto top-up[\s\S]*https:\/\/tavya\.test\/settings/);
     await f.store.setComputePackGift(f.organization.id, 1, 'operator');
-    await notifyComputeCredit(deps);
+    await notifyComputeCredit(deps, Date.now() + 30 * 60_000);
     expect(await f.store.listInbox('owner', f.organization.id)).toHaveLength(0);
   });
 });

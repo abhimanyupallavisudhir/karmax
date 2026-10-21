@@ -313,6 +313,18 @@ async function main() {
     if (selected === 'stripe-billing') return new StripeSubscriptionProvider(() => paidLaunchSettings.subscriptionConfig());
     throw new Error(`unsupported subscription provider ${selected}`);
   }, deployment.hosted);
+  // Auto top-up of managed compute, offered once the approved billing terms describe it.
+  const { ComputeTopUps } = await import('./billing/compute-topups.js');
+  const computeTopUps = new ComputeTopUps(store, subscriptionBilling, {
+    offered: async () => (await paidLaunchSettings.launchConfig()).policyApproved,
+    tell: async (organizationId, message) => {
+      if (!(await emailService.configured())) return;
+      for (const membership of (await store.listOrganizationMemberships(organizationId)).filter((value) => value.role === 'owner')) {
+        const to = (await identity.userById(membership.userId))?.email;
+        if (to) await emailService.send({ to, ...message }).catch(() => undefined);
+      }
+    },
+  });
   const { LoginManager } = await import('./autonomy/login.js');
   const login = new LoginManager(configHomes);
   // A managed worker so newly-installed workflow packages can be picked up by
@@ -414,6 +426,7 @@ async function main() {
     resources,
     checkpoints,
     subscriptions: subscriptionBilling,
+    computeTopUps,
     paidLaunchSettings,
     serviceLimits,
     storageReconciler: reconciler,
@@ -502,13 +515,23 @@ async function main() {
   }, 3600_000);
   managedStorageTimer.unref();
   startupJobs.push(() => managedStorageTimer.run());
-  // Managed compute: tell owners once a month when the compute credit is spent.
+  // Managed compute: tell owners when the compute credit is spent, hibernate
+  // parked disks after their grace (wiki features/managed-compute § Spent credit),
+  // close settled months of top-up credit and prune old holds.
   const { notifyComputeCredit } = await import('./world/compute-notices.js');
+  const { closeComputeMonths } = await import('./world/managed-compute.js');
+  // Every ten minutes: the grace of a huge parked disk can be a few hours.
   const computeNoticeTimer = new AsyncInterval(async () => { await notifyComputeCredit({ store, email: emailService,
     publicUrl: process.env.KARMAX_PUBLIC_URL, userEmail: async (userId) => (await identity.userById(userId))?.email ?? undefined,
-    siteName: async () => siteNameOf((await store.getSettings('global', 'appearance'))) }); }, 3600_000);
+    siteName: async () => siteNameOf((await store.getSettings('global', 'appearance'))),
+    hibernate: (worlds) => worldLifecycle.hibernateForCompute(worlds) });
+    await closeComputeMonths(store); await store.pruneComputeHolds(); }, 10 * 60_000);
   computeNoticeTimer.unref();
   startupJobs.push(() => computeNoticeTimer.run());
+  // Auto top-up: settle top-ups under way and buy one where credit runs low.
+  const computeTopUpTimer = new AsyncInterval(async () => { await computeTopUps.run(); }, 60_000);
+  computeTopUpTimer.unref();
+  startupJobs.push(() => computeTopUpTimer.run());
   // Service limits: sample the operator's accounts every 15 minutes, so a
   // daily allowance is caught well before it runs out.
   const serviceLimitsTimer = new AsyncInterval(() => serviceLimits.run(), 15 * 60_000);

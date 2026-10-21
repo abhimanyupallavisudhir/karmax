@@ -21353,7 +21353,12 @@ function inboxRowLabel(item) {
   if (item.subject?.kind === 'avatar-authorization') return 'Avatar authorization approval';
   if (item.subject?.kind === 'service-limit') return item.subject.level === 'failed' ? `Can’t read ${item.subject.serviceName} usage`
     : `${item.subject.serviceName} at ${Math.floor((item.subject.used / item.subject.limit) * 100)}% of its limit${item.subject.level === 95 ? ' — upgrade now' : ''}`;
-  if (item.subject?.kind === 'compute') return `Out of compute — renews ${new Date(item.subject.renewsAt).toLocaleDateString()}`;
+  if (item.subject?.kind === 'compute') {
+    const n = Number(item.subject.computers || 0), computers = `${n} parked computer${n === 1 ? '' : 's'}`;
+    if (item.subject.stage === 'hibernated') return `Out of compute — ${computers} hibernated`;
+    if (item.subject.hibernateAt) return `Out of compute — ${computers} hibernate ${new Date(item.subject.hibernateAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}`;
+    return `Out of compute — renews ${new Date(item.subject.renewsAt).toLocaleDateString()}`;
+  }
   if (item.subject?.kind === 'storage') return item.subject.stage === 'deleted'
     ? 'Stored data deleted to fit the limit'
     : `Over the storage limit — free space by ${new Date(item.subject.deleteAt).toLocaleDateString()}`;
@@ -22658,20 +22663,35 @@ function planBillingMarkup(e, state) {
     <span class="setting-value">${planMeter(e.storageUsedBytes, e.storageQuotaBytes)}<span><b>${esc(formatBytes(e.storageUsedBytes ?? 0))}</b> <span class="setting-muted">of ${esc(formatBytes(e.storageQuotaBytes))}</span></span></span>
     ${canStorage ? `<span class="setting-actions">${planStepper('storage', Number(state.storagePacks || 0), `Each pack adds ${formatBytes(storagePack.bytes)} for ${planMoney(storagePack.monthlyPriceCents)}/month`)}</span>` : ''}</div>`;
   // Compute: only where the installation runs computers itself.
-  let computeRow = '';
+  let computeRow = '', topUpRow = '';
   if (e.compute) {
-    const credit = Number(e.computeCreditMicros || 0);
+    // Top-up credit lasts until used; holds are what computers running now have reserved.
+    const topUp = Number(e.compute.topUpMicros || 0), held = Number(e.compute.heldMicros || 0);
+    const credit = Number(e.computeCreditMicros || 0) + topUp;
     const pack = state?.computePack || { creditMicros: e.computePackCreditMicros, monthlyPriceCents: 1000 };
     const providers = (e.compute.providers || []).map((id) => COMPUTER_PROVIDERS[id]?.name || id).join(', ');
     const parts = [`${planDollars(e.includedComputeCreditMicros)} with ${e.planName}`,
       e.computePacks ? `${planDollars(e.computePacks * e.computePackCreditMicros)} in ${plural(e.computePacks, 'pack')}` : '',
-      e.giftedComputePacks ? `${planDollars(e.giftedComputePacks * e.computePackCreditMicros)} gifted` : ''].filter(Boolean).join(' + ');
-    const tip = `Cloud computers ${siteName()} runs for you (${providers}), at twice the provider’s price: a 2 CPU · 2 GB E2B computer is about $0.27 an hour. Resets ${day(e.compute.to)}. Computers on your own provider accounts aren’t counted. ${credit ? `${parts}.` : ''}`;
+      e.giftedComputePacks ? `${planDollars(e.giftedComputePacks * e.computePackCreditMicros)} gifted` : '',
+      topUp ? `${planDollars(topUp)} topped up, kept until used` : ''].filter(Boolean).join(' + ');
+    const tip = `Cloud computers ${siteName()} runs for you (${providers}), at twice the provider’s price: a 2 CPU · 2 GB E2B computer is about $0.27 an hour. Resets ${day(e.compute.to)}. Computers on your own provider accounts aren’t counted. ${credit ? `${parts}.` : ''}${held ? ` ${planDollars(held)} is held for computers running now.` : ''}`;
     const canCompute = paying && owner && state?.computePack?.available;
     computeRow = `<div class="setting-row plan-limit" data-limit="compute"><span class="setting-label">Compute ${policyTip(tip.trim())}</span>
-      <span class="setting-value">${credit ? `${planMeter(e.compute.usedMicros, credit)}<span><b>${esc(planDollars(e.compute.usedMicros))}</b> <span class="setting-muted">of ${esc(planDollars(credit))} this month</span></span>`
+      <span class="setting-value">${credit ? `${planMeter(Number(e.compute.usedMicros || 0) + held, credit)}<span><b>${esc(planDollars(e.compute.usedMicros))}</b> <span class="setting-muted">of ${esc(planDollars(credit))} this month</span></span>`
         : '<span class="setting-muted">With a paid plan</span>'}</span>
       ${canCompute ? `<span class="setting-actions">${planStepper('compute', Number(state.computePacks || 0), `Each pack adds ${planDollars(pack.creditMicros)} of compute a month for ${planMoney(pack.monthlyPriceCents)}/month`)}</span>` : ''}</div>`;
+    // Auto top-up: once offered (its billing terms approved), or while on.
+    const auto = state?.autoTopUp;
+    if (auto && (auto.offered || auto.enabled)) {
+      const editable = owner && auto.offered;
+      const amount = planMoney(auto.amountCents);
+      const cap = Math.round(Number(auto.capCents || 0) / 100);
+      const paused = auto.enabled && auto.pausedUntil > Date.now()
+        ? `<span class="warn" title="${esc(auto.lastError || '')}">Card declined · retries ${esc(day(auto.pausedUntil))}</span>` : '';
+      topUpRow = `<div class="setting-row" data-limit="auto-top-up"><span class="setting-label">Auto top-up ${policyTip(`When compute runs low, buy ${amount} more at once on the saved card, up to this much a month. Top-ups last until used.`)}</span>
+        <span class="setting-value"><input class="toggle billing-auto-topup" type="checkbox" aria-label="Auto top-up" ${auto.enabled ? 'checked' : ''} ${editable ? '' : disabled || 'disabled'}>
+          <span class="setting-muted">up to $</span><input id="billing-auto-cap" class="plan-gift-count" type="number" min="${Math.ceil(auto.amountCents / 100)}" max="10000" step="${Math.ceil(auto.amountCents / 100)}" value="${esc(cap)}" aria-label="Monthly limit in dollars" ${editable ? '' : 'disabled'}><span class="setting-muted">/month${auto.spentCents ? ` · ${esc(planMoney(auto.spentCents))} this month` : ''}</span>${paused}</span></div>`;
+    }
   }
   // One-line notices, only when something needs attention.
   const notes = [];
@@ -22719,7 +22739,7 @@ function planBillingMarkup(e, state) {
       <input id="billing-gift-compute" type="number" min="0" max="1000" step="1" value="${esc(state.giftedComputePacks || 0)}" class="plan-gift-count" aria-label="Gifted compute packs"></span>
       <span class="setting-actions"><button class="btn sm billing-gift-packs" data-kind="compute">Save</button></span></div>
   </div></details>` : '';
-  return `${head}${noteHtml}<div class="setting-rows ruled plan-limits">${peopleRow}${agentsRow}${storageRow}${computeRow}</div>${choices}${gifts}
+  return `${head}${noteHtml}<div class="setting-rows ruled plan-limits">${peopleRow}${agentsRow}${storageRow}${computeRow}${topUpRow}</div>${choices}${gifts}
     ${subscribed ? `<p class="plan-foot setting-muted">Separate from the cards agents pay with. <a href="/legal/billing" data-public>Billing terms</a></p>` : ''}`;
 }
 
@@ -22774,6 +22794,22 @@ async function hydratePlanAndBilling(organizationId) {
     const what = kind === 'compute' ? `${planDollars(pack.creditMicros)} of compute a month` : formatBytes(pack.bytes);
     if (!confirm(next > current ? `Add ${what} for ${planMoney(pack.monthlyPriceCents)}/month?` : `Remove ${what} (${planMoney(pack.monthlyPriceCents)}/month)?`)) return;
     await post(`${kind}-packs`, { packs: next }); toast('Sent. It applies once payment is confirmed.');
+  });
+  const autoTopUp = async (body) => {
+    try { await post('auto-top-up', body); } catch (error) { toast(error.message, true); }
+    if (box.isConnected) await reload();
+  };
+  box.querySelector('.billing-auto-topup')?.addEventListener('change', async (event) => {
+    const auto = state.autoTopUp;
+    if (event.target.checked && !confirm(`Charge ${planMoney(auto.amountCents)} to the saved card each time compute runs low, up to ${planMoney(auto.capCents)} a month?`)) {
+      event.target.checked = false; return;
+    }
+    await autoTopUp({ enabled: event.target.checked });
+  });
+  box.querySelector('#billing-auto-cap')?.addEventListener('change', async (event) => {
+    const dollars = Number(event.target.value);
+    if (!Number.isFinite(dollars) || dollars <= 0) { toast('Enter a monthly limit in dollars', true); return; }
+    await autoTopUp({ capCents: Math.round(dollars * 100) });
   });
   act('.billing-gift', async () => {
     const plan = $('#billing-gift-plan').value;
@@ -24585,7 +24621,7 @@ function renderPricing() {
       <span>${esc(formatBytes(packs.storage.bytes))} more storage · ${esc(money(packs.storage.monthlyPriceCents))}/month</span>
       ${compute ? `<span>${esc(credit(packs.compute.creditMicros))} more compute · ${esc(money(packs.compute.monthlyPriceCents))}/month</span>` : ''}
       <small>On Individual and Team, as many as you like.</small></div>` : '';
-  const computeTerms = compute && packs ? `<p>Compute is the cloud computers agents work on. ${esc(siteName())} runs them for you at ${packs.computePriceMultiplier}× the provider’s list price (a 2 CPU · 2 GB E2B computer is about $0.27 an hour) and stops starting new work when the month’s compute is used up. Computers on your own E2B, Daytona, Fly.io, Hetzner, AWS or Google Cloud account cost nothing extra and aren’t counted.</p>` : '';
+  const computeTerms = compute && packs ? `<p>Compute is the cloud computers agents work on. ${esc(siteName())} runs them for you at ${packs.computePriceMultiplier}× the provider’s list price (a 2 CPU · 2 GB E2B computer is about $0.27 an hour) and pauses work when the month’s compute is used up, unless you turn on auto top-up (${esc(money(packs.computeTopUpCents ?? 1000))} at a time, up to a monthly limit you set). Computers on your own E2B, Daytona, Fly.io, Hetzner, AWS or Google Cloud account cost nothing extra and aren’t counted.</p>` : '';
   renderPublicShell('/pricing', `<main class="pricing-page"><div class="legal-kicker">Hosted plans</div><h1>Free, Individual, and Team</h1>
       <p class="legal-summary">Every plan has unlimited projects. “Agents at once” is how many can work at the same time; more wait in line.</p>
       <div class="pricing-grid">${cards}</div>${addOns}

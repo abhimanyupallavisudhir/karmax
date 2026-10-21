@@ -171,6 +171,8 @@ export interface GatewayDeps {
   /** Releases chunked task checkpoints when their project is deleted. */
   checkpoints?: import('../world/checkpoint.js').WorldCheckpointService;
   subscriptions?: import('../billing/subscriptions.js').SubscriptionBillingService;
+  /** Auto top-up of managed compute (wiki features/managed-compute § Auto top-up). */
+  computeTopUps?: import('../billing/compute-topups.js').ComputeTopUps;
   paidLaunchSettings?: import('../launch/settings.js').PaidLaunchSettingsService;
   /** Installation → Service limits (operator accounts and this host against their plans). */
   serviceLimits?: import('../ops/service-limits.js').ServiceLimitsService;
@@ -249,7 +251,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (/^\/api\/organizations\/[^/]+\/entitlements$/.test(p)) return 'organization:read';
   if (/^\/api\/organizations\/[^/]+\/subscription\/status$/.test(p)) return 'organization:read';
   if (/^\/api\/organizations\/[^/]+\/subscription\/(?:gift|gift-storage|gift-compute)$/.test(p)) return 'subscription:gift';
-  if (/^\/api\/organizations\/[^/]+\/subscription\/(?:checkout|portal|change|cancel|sync-seats|storage-packs|compute-packs|reconcile)$/.test(p))
+  if (/^\/api\/organizations\/[^/]+\/subscription\/(?:checkout|portal|change|cancel|sync-seats|storage-packs|compute-packs|auto-top-up|reconcile)$/.test(p))
     return 'payment:write';
   if (/^\/api\/organizations\/[^/]+\/payments\/stripe\/platform$/.test(p)) return read ? 'settings:read' : 'settings:write';
   if (/^\/api\/organizations\/[^/]+\/payments(?:\/|$)/.test(p)) return read ? 'payment:read' : 'payment:write';
@@ -2929,7 +2931,7 @@ export class Gateway {
           queuedAgentRuns,
         });
       }
-      const subscription = p.match(/^\/api\/organizations\/([^/]+)\/subscription\/(status|checkout|portal|change|cancel|sync-seats|storage-packs|compute-packs|reconcile|gift|gift-storage|gift-compute)$/);
+      const subscription = p.match(/^\/api\/organizations\/([^/]+)\/subscription\/(status|checkout|portal|change|cancel|sync-seats|storage-packs|compute-packs|auto-top-up|reconcile|gift|gift-storage|gift-compute)$/);
       if (subscription) {
         const organizationId = subscription[1]!;
         const action = subscription[2]!;
@@ -2943,7 +2945,8 @@ export class Gateway {
             && (await this.deps.tokens.check(token, 'payment:write', { organizationId })).ok
             && (await store.organizationMembership(organizationId, billingUserId))?.role === 'owner');
           const canGift = (await this.deps.tokens.check(token, 'subscription:gift', { organizationId })).ok;
-          return this.json(res, 200, { ...(await billing.current(organizationId)), canManage, canGift });
+          const autoTopUp = (await this.deps.computeTopUps?.status(organizationId)) ?? null;
+          return this.json(res, 200, { ...(await billing.current(organizationId)), autoTopUp, canManage, canGift });
         }
         if (method !== 'POST') return this.json(res, 405, { error: 'method not allowed' });
         if (action === 'gift-storage' || action === 'gift-compute') {
@@ -3015,6 +3018,15 @@ export class Gateway {
             return this.json(res, 202, await billing.storagePacks(organizationId, (await this.body(req)).packs, idempotencyKey));
           if (action === 'compute-packs')
             return this.json(res, 202, await billing.computePacks(organizationId, (await this.body(req)).packs, idempotencyKey));
+          if (action === 'auto-top-up') {
+            if (!this.deps.computeTopUps) return this.json(res, 503, { error: 'auto top-up is unavailable' });
+            const body = await this.body(req);
+            const result = await this.deps.computeTopUps.configure(organizationId, { enabled: body.enabled, capCents: body.capCents },
+              billingSubject.userId);
+            await this.deps.authorization?.audit(actorPrincipal(callerIdentity.actor), 'subscription.auto-top-up', `organization:${organizationId}`,
+              { enabled: result.enabled, capCents: result.capCents, ...identityAuditDetail(callerIdentity) });
+            return this.json(res, 200, result);
+          }
           if (action === 'reconcile') return this.json(res, 200, await billing.reconcilePending(organizationId));
           await billing.syncSeats(organizationId);
           return this.json(res, 202, { syncing: true });
