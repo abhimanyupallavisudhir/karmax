@@ -776,6 +776,74 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       await handle.result();
     }, 120_000);
 
+  // Task #725: GitHub push protection refused a branch whose tests held a
+  // realistic fake key. The refusal parked the task for a person with a
+  // misleading "advanced remote" error; only the agent can rewrite its commits.
+  it('returns a push-protection refusal to the Do agent as a branch repair', async () => {
+    const repo = await repoWithOrigin('push-protection');
+    const origin = remoteBySlug.get(SLUG)!;
+    fs.writeFileSync(path.join(origin, 'hooks', 'pre-receive'), [
+      '#!/bin/sh',
+      'while read old new ref; do',
+      '  if git ls-tree -r --name-only "$new" | grep -qx leak.txt; then',
+      '    echo "error: GH013: Repository rule violations found for $ref." >&2',
+      '    echo "- GITHUB PUSH PROTECTION" >&2',
+      '    echo "    - Push cannot contain secrets" >&2',
+      '    echo "      —— Stripe API Key ——————————————" >&2',
+      '    echo "       locations:" >&2',
+      '    echo "         - commit: $new" >&2',
+      '    echo "           path: leak.txt:1" >&2',
+      '    exit 1',
+      '  fi',
+      'done',
+    ].join('\n') + '\n', { mode: 0o755 });
+    const project = (await h.store.createProject('Push protection', { repos: [repo], remote: 'pr' }));
+    const connection = (await h.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: '42', accountLogin: 'acme', accountType: 'Organization' }));
+    const enrolled = (await h.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github', providerId: '77',
+      owner: 'acme', name: 'pipeline', sshUrl: REMOTE, defaultBranch: 'main', private: true, gitConnectionId: connection.id }));
+    (await h.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+    const task = (await h.store.createTask({ projectId: project.id, title: 'Push protection', workflow: 'software-dev',
+      workflowVersion: '1.13.0', params: { prompt: 'x', _githubAccountId: 'a-github' },
+      createdBy: { kind: 'user', userId: 'a' } }));
+    const repairs: string[] = [];
+    publicationTurn = async (input, ctx) => {
+      const cwd = worldRepos(input.world.handle)[0]!.root;
+      if (!repairs.length && !/branch repair/.test(input.messages.at(-1)?.text ?? '')) {
+        fs.writeFileSync(path.join(cwd, 'leak.txt'), 'a realistic fake key\n');
+        await gitOrThrow(cwd, ['add', '-A']);
+        await gitOrThrow(cwd, ['commit', '-qm', 'proposal']);
+      } else {
+        repairs.push(input.messages.at(-1)!.text);
+        await gitOrThrow(cwd, ['rm', '-q', 'leak.txt']);
+        fs.writeFileSync(path.join(cwd, 'clean.txt'), 'assembled at runtime\n');
+        await gitOrThrow(cwd, ['add', '-A']);
+        await gitOrThrow(cwd, ['commit', '--amend', '--no-edit', '-q']);
+      }
+      ctx.openPr();
+      return { termination: { kind: 'success' as const, status: 'completed' }, output: 'Ready for review' };
+    };
+    const handle = await h.client.workflow.start('softwareDev@1.13.0', {
+      taskQueue: TASK_QUEUE, workflowId: task.id,
+      args: [{ taskId: task.id, projectId: project.id, title: task.title, prompt: 'Propose',
+        base: 'main', target: 'main', project: { repos: [repo], defaultBase: 'main', defaultTarget: 'main', remote: 'pr' } }],
+    });
+    await expect.poll(async () => {
+      const current = await view(handle);
+      return `${current.stage}/${current.status}/${current.prs?.length ?? 0}`;
+    }, { timeout: 30_000 }).toBe('review/waiting/1');
+    expect(repairs).toHaveLength(1);
+    expect(repairs[0]).toMatch(/Open PR needs a branch repair/);
+    expect(repairs[0]).toMatch(/GitHub push protection refused .*Stripe API Key \(leak\.txt:1 in [0-9a-f]{12}\)/);
+    expect(repairs[0]).not.toMatch(/non-fast-forward|advanced remote/i);
+    expect((await h.store.eventsOfType(task.id, 'resolve.auto'))).toHaveLength(0);
+    const head = (await git(origin, ['rev-parse', `tavya/${task.id}`])).stdout.trim();
+    expect((await git(origin, ['ls-tree', '-r', '--name-only', head])).stdout.split('\n')).toContain('clean.txt');
+    expect((await git(origin, ['ls-tree', '-r', '--name-only', head])).stdout.split('\n')).not.toContain('leak.txt');
+    await handle.signal('cancel');
+    await handle.result();
+  }, 120_000);
+
   it('v1.22 restores a cancelled Review by reopening the same exact PR before Review', async () => {
     const repo = await repoWithOrigin('cancelled-review-restore');
     const project = (await h.store.createProject('Cancelled Review restore', { repos: [repo], remote: 'pr' }));
