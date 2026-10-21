@@ -26,7 +26,7 @@ import { recordHumanConfirmation } from '../platform/review-confirmation.js';
 import { ServiceError, WorkflowNotFoundError, WorkflowUpdateFailedError, isGrpcServiceError, type Client } from '@temporalio/client';
 import { Context as activityContext } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
-import { assertComputeCredit } from '../world/managed-compute.js';
+import { COMPUTE_HOLD, holdManagedCompute, outOfCompute, type ComputeHoldRequest } from '../world/managed-compute.js';
 import { MANAGED_COMPUTE } from '../world/connections.js';
 import { AgentChannelLost, ProviderCapacityFull, ProviderOutage, ProviderPolicyFailure, SandboxProviderFailure, confirmSandboxFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, isContextOverflow, type LimitClassification } from '../agent/limits.js';
 import { probeClaudeUsage, probeCodexUsage, type UsageResult } from '../agent/usage.js';
@@ -261,6 +261,14 @@ function classifyTurnError(err: unknown, provider?: Provider, sandbox?: { diagno
   if (isResourceKill(msg)) return ApplicationFailure.create({ message: signalKillMessage(msg), type: 'agent-infra', nonRetryable: false, cause });
   if (isTransportError(err)) return ApplicationFailure.create({ message: msg, type: 'agent-infra', nonRetryable: false, cause });
   return ApplicationFailure.create({ message: msg, type: 'agent-error', nonRetryable: true, cause });
+}
+
+/** The machine a world runs on, as holds price it: what the provider made
+ * (VM worlds), else what its Computer asked for. */
+function worldShape(handle: WorldHandle): { cpu?: number; memoryMb?: number; diskGb?: number } | undefined {
+  const meta = handle.meta as { machine?: { cpu?: number; memoryMb?: number; diskGb?: number };
+    computer?: { cpu?: number; memoryMb?: number; diskGb?: number } } | undefined;
+  return meta?.machine ?? meta?.computer;
 }
 
 function parseInterruption(value: string | undefined): WorldDiagnosis | undefined {
@@ -797,6 +805,47 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     }, intervalMs);
     timer.unref?.();
     return () => { stopped = true; clearInterval(timer); };
+  }
+
+  /** While a turn runs on a managed computer, renew its compute hold before
+   * it ends (wiki features/managed-compute § Holds). When the credit cannot
+   * renew it, tell a Do agent when it will be stopped (through the
+   * conversation, so people see it too), then stop the turn there: the
+   * workflow waits as Out of compute and parks the world, and the next turn
+   * continues the stopped session once there is credit. */
+  function watchComputeHold(request: ComputeHoldRequest, endsAt: number, options: {
+    taskId: string; tell: boolean; stop: (reason: Error) => void }): () => void {
+    let stopped = false, warned = false;
+    let timer: NodeJS.Timeout | undefined;
+    const schedule = (ms: number) => {
+      if (stopped) return;
+      timer = setTimeout(() => void tick().catch(() => schedule(60_000)), Math.max(1_000, Math.min(60_000, ms)));
+      timer.unref?.();
+    };
+    const tick = async () => {
+      if (stopped) return;
+      if (endsAt - Date.now() <= COMPUTE_HOLD.renewBeforeMs) endsAt = await holdManagedCompute(store, request).catch(() => endsAt);
+      const left = endsAt - Date.now();
+      if (left <= 0) {
+        stopped = true;
+        options.stop(await outOfCompute(store, request.organizationId, request.provider));
+        return;
+      }
+      if (left > COMPUTE_HOLD.renewBeforeMs) warned = false;
+      else if (!warned && options.tell) {
+        warned = true;
+        const at = new Date(endsAt).toISOString().slice(11, 16);
+        const message: Message = { id: `compute-${Date.now()}`, role: 'user', ts: Date.now(),
+          text: `(The compute credit for this computer runs out at ${at} UTC, in about ${Math.max(1, Math.round(left / 60_000))} min. `
+            + 'This turn is stopped then and the computer parked until there is more; it continues by itself once credit is added. '
+            + 'Commit what you have now.)' };
+        await deps.client?.workflow.getHandle(options.taskId).signal('followUp', message, 'do');
+        (await record(options.taskId, 'conversation.message', { role: 'do', message }));
+      }
+      schedule(left > COMPUTE_HOLD.renewBeforeMs ? left - COMPUTE_HOLD.renewBeforeMs : left);
+    };
+    schedule(endsAt - Date.now() - COMPUTE_HOLD.renewBeforeMs);
+    return () => { stopped = true; if (timer) clearTimeout(timer); };
   }
 
   /** The task's pin when it names a run of the task that is no longer running
@@ -2454,6 +2503,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let hbSession: string | undefined;
       let workflowRunId: string | undefined;
       let scheduleToStartWallEstimateMs: number | undefined;
+      let computeHoldId: string | undefined;
       try {
         const activity = activityContext.current();
         timingAttempt = activity.info.attempt;
@@ -2502,11 +2552,20 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const organizationId = (await store.getProject(args.task.projectId))?.organizationId ?? 'org_personal';
       // A turn on managed compute is new work: once this month's compute credit
       // is spent it waits, parked, for more (wiki features/managed-compute).
+      // It reserves its machine's next minutes first (compute holds) and keeps
+      // renewing them while it runs (watchComputeHold below).
       const turnWorld = ((await store.currentWorld(args.worldHandle.id)) ?? args.worldHandle) as WorldHandle;
-      if (turnWorld.meta?.funding === 'managed') {
-        try { await assertComputeCredit(store, organizationId, turnWorld.kind); }
+      const computeHold: ComputeHoldRequest | undefined = turnWorld.meta?.funding === 'managed' ? {
+        id: `turn:${timingTurnId ?? `${args.taskId}:${args.participant ?? args.role}:${attemptStarted}`}`, organizationId, taskId: args.taskId,
+        worldId: turnWorld.id, provider: turnWorld.kind, purpose: 'turn', shape: worldShape(turnWorld) } : undefined;
+      let computeHoldEndsAt = Infinity;
+      if (computeHold) {
+        try { computeHoldEndsAt = await holdManagedCompute(store, computeHold); }
         catch (error) { throw capacityFailure(error) ?? error; }
+        computeHoldId = computeHold.id;
       }
+      const computeStop = new AbortController();
+      let stopComputeWatch: (() => void) | undefined;
       let world: World;
       try {
         world = await timed('world.open', () => openWorld(args.worldHandle, args.taskId));
@@ -2639,6 +2698,30 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }
       } catch {
         /* not running inside a Temporal activity (e.g. a direct unit test) */
+      }
+      // A turn stopped when its compute hold ran out (watchComputeHold) is
+      // started again by the workflow's Out of compute wait, from the session it
+      // had started from. Continue the stopped session instead, with what it
+      // recorded; follow-ups it never read stay undelivered for the next turn.
+      let computeResumed: { seen: number } | undefined;
+      if (!resumedActivityAttempt) {
+        const stoppedKey = `compute-stopped:${args.taskId}:${speaker}`;
+        let stopped: { role?: string; session?: string; baseSession?: string | null; journalKey?: string; seen?: number; at?: number } | undefined;
+        try { stopped = JSON.parse((await store.kvGet(stoppedKey)) ?? 'null') ?? undefined; } catch { stopped = undefined; }
+        if (stopped) (await store.kvDelete(stoppedKey));
+        if (stopped?.session && stopped.role === args.role && (stopped.baseSession ?? null) === (args.session ?? null)
+          && Date.now() - Number(stopped.at) < 7 * 24 * 60 * 60_000) {
+          try { restoredJournal = stopped.journalKey ? JSON.parse((await store.kvGet(stopped.journalKey)) ?? 'null') ?? undefined : undefined; }
+          catch { restoredJournal = undefined; }
+          session = stopped.session;
+          hbSession = stopped.session;
+          liveChannel = false;
+          deliveredMessages = 0;
+          computeResumed = { seen: Math.max(Number(stopped.seen) || 0, restoredJournal?.delivered ?? 0) };
+          messages = [{ id: `compute-resumed-${Date.now()}`, role: 'user', ts: Date.now(),
+            text: `(This turn was stopped because the organization's compute credit ran out, and the computer was parked; there is credit again. ${INTERRUPTED_COMMANDS} ${INTERRUPTED_REPLY})` }];
+          (await record(args.taskId, 'turn.resumed', { role: args.role, reason: 'compute' }));
+        }
       }
 
       // The workflow mints the agent's scoped credential (SPEC §8.3).
@@ -3503,6 +3586,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }));
         (await taskSecrets.refresh());
         if (remoteWorld && args.role === 'do' && deps.client) stopDiskWatch = watchTurnDisk(world, args.taskId, organizationId);
+        if (computeHold) stopComputeWatch = watchComputeHold(computeHold, computeHoldEndsAt, { taskId: args.taskId,
+          tell: args.role === 'do' && !!deps.client, stop: (reason) => computeStop.abort(reason) });
         result = await runRuntimeTurn({ version: KARMAX_RUNTIME_PROTOCOL, input: {
           profile,
           world,
@@ -3526,7 +3611,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             providerInvoked = true;
           },
           onProviderResult: turn => { providerUsage = turn.usage; },
-          signal,
+          signal: computeHold ? AbortSignal.any([...(signal ? [signal] : []), computeStop.signal]) : signal,
           heartbeat,
           pullFollowUps,
           // `open_pr` with `branch` (SPEC §11.1): the workflow ships it while this
@@ -3722,6 +3807,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (resumedActivityAttempt && (args.role !== 'confirm' || sharedConversation)) {
           result.delivered = Math.max(restoredJournal?.delivered ?? 0, args.messages.length);
         }
+        if (computeResumed && (args.role !== 'confirm' || sharedConversation)) result.delivered = computeResumed.seen;
         if (args.role === 'confirm' && result.confirmDecision?.action === 'confirm' && result.confirmDecision.otherAttempts) {
           (await store.kvSet(`attempt-choice:${args.taskId}`, result.confirmDecision.otherAttempts));
         }
@@ -3741,6 +3827,16 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (token) (await deps.tokens?.revoke(token));
         // A provider error can quote the agent's output; it reaches workflow history.
         if (err instanceof Error) err.message = secrets.scrub(err.message);
+        // Its compute hold ran out (watchComputeHold): keep the stopped session,
+        // so the turn the Out of compute wait starts once there is credit
+        // continues it rather than starting this one over.
+        if (computeStop.signal.aborted && !signal?.aborted) {
+          (await store.kvSet(`compute-stopped:${args.taskId}:${speaker}`, JSON.stringify({ role: args.role,
+            session: hbSession ?? session, baseSession: args.session ?? null,
+            journalKey: turnSessionKey ? `${turnSessionKey}:journal` : undefined,
+            seen: Math.max(computeResumed?.seen ?? args.messages.length, restoredJournal?.delivered ?? 0), at: Date.now() })));
+          throw capacityFailure(computeStop.signal.reason) ?? computeStop.signal.reason;
+        }
         // Providers often surface their own generic AbortError after the activity
         // cancellation signal fires. Throw Temporal's cancellation reason instead
         // so WAIT_CANCELLATION_COMPLETED records an acknowledged cancellation,
@@ -3787,6 +3883,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         throw classifyTurnError(turnError, profile.provider, { diagnosis });
       } finally {
         stopDiskWatch?.();
+        stopComputeWatch?.();
         try {
           if (usageAdmissionId && !usageAdmissionFinished) {
             if (providerInvoked || result) await finishUsage(false);
@@ -3879,6 +3976,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         throw classifyTurnError(error);
       } finally {
         if (keepAlive) clearInterval(keepAlive);
+        if (computeHoldId) (await store.closeComputeHold(computeHoldId).catch(() => undefined));
       }
     },
 
@@ -4549,6 +4647,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const signal = ctx.cancellationSignal;
       const beat = setInterval(() => ctx.heartbeat(), 5_000);
       let diskWatch: ReturnType<typeof setInterval> | undefined;
+      let holdId: string | undefined;
       try {
         const world = await openWorld(handle as WorldHandle);
         // A job can fill the disk while its agent waits (pramana#3's rebuild):
@@ -4578,19 +4677,30 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           diskWatch.unref?.();
         }
         const managedCompute = ((await store.currentWorld(handle.id)) ?? handle as WorldHandle).meta?.funding === 'managed';
+        holdId = `jobs:${handle.id}:${ctx.info.workflowExecution?.runId ?? ''}:${ctx.info.activityId}`;
+        let holdEndsAt = Infinity;
         const projectOrganization = async () => (await store.getProject(String((handle as WorldHandle).meta?.projectId
           ?? (await store.taskProjectIdAsync(handle.id)) ?? '')))?.organizationId;
         for (;;) {
           signal.throwIfAborted();
           ctx.heartbeat();
           const running = (await jobStatuses(world, jobs)).filter((job) => job.state === 'running').map((job) => job.id);
-          // A job on managed compute stops being waited for once the month's
-          // credit is spent: the agent's next turn then waits for credit, and
-          // the world parks meanwhile.
+          // A job on managed compute runs on a compute hold like a turn, renewed
+          // each pass; once the credit cannot renew it, the job stops being
+          // waited for: the agent's next turn waits for credit, and the world
+          // parks meanwhile.
           if (managedCompute && running.length) {
             const organizationId = await projectOrganization();
-            const spent = organizationId ? await assertComputeCredit(store, organizationId, handle.kind).then(() => undefined, (error: Error) => error.message) : undefined;
-            if (spent) return { finished: false, summary: `${spent}\n\n${describeJobs(await jobStatuses(world, jobs, { tailLines: 30 }))}` };
+            if (organizationId) {
+              const now = Date.now();
+              holdEndsAt = await holdManagedCompute(store, { id: holdId!, organizationId, taskId: handle.id, worldId: handle.id,
+                provider: handle.kind, purpose: 'jobs', shape: worldShape(handle as WorldHandle) }, now)
+                .catch((error: Error) => error.name === 'ComputeCreditExhausted' ? now : holdEndsAt);
+              if (holdEndsAt <= now) {
+                const spent = (await outOfCompute(store, organizationId, handle.kind)).message;
+                return { finished: false, summary: `${spent}\n\n${describeJobs(await jobStatuses(world, jobs, { tailLines: 30 }))}` };
+              }
+            }
           }
           if (diskAlert && running.length)
             return { finished: false, disk: true, summary: `${diskAlert}\n\n${describeJobs(await jobStatuses(world, jobs, { tailLines: 30 }))}` };
@@ -4598,7 +4708,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             return { finished: !running.length, summary: describeJobs(await jobStatuses(world, jobs, { tailLines: 30 })) };
           }
           // Re-check at least every ten minutes even if the waiter never reports.
-          const waiter = await startJobWaiter(world, running, Math.min(600, Math.ceil((untilMs - Date.now()) / 1000)));
+          // And before the hold must be renewed.
+          const renewIn = holdEndsAt - Date.now() > COMPUTE_HOLD.renewBeforeMs ? holdEndsAt - Date.now() - COMPUTE_HOLD.renewBeforeMs : holdEndsAt - Date.now();
+          const waiter = await startJobWaiter(world, running, Math.max(1, Math.min(600, Math.ceil((untilMs - Date.now()) / 1000),
+            Math.ceil(renewIn / 1000))));
           let abort = () => {};
           await new Promise<void>((resolve) => {
             abort = resolve;
@@ -4610,7 +4723,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           signal.removeEventListener('abort', abort);
           if (signal.aborted || diskAlert) await Promise.resolve(waiter.kill()).catch(() => undefined);
         }
-      } finally { clearInterval(beat); if (diskWatch) clearInterval(diskWatch); }
+      } finally {
+        clearInterval(beat); if (diskWatch) clearInterval(diskWatch);
+        if (holdId) (await store.closeComputeHold(holdId).catch(() => undefined));
+      }
     },
 
     /**

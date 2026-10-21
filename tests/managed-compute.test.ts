@@ -118,7 +118,7 @@ describe('compute credit', () => {
     const spent = await assertComputeCredit(f.store, f.organization.id, 'e2b').catch((error) => error);
     expect(spent).toBeInstanceOf(ComputeCreditExhausted);
     expect(spent).toBeInstanceOf(ProviderCapacityFull);
-    expect(spent.message).toMatch(/^Out of compute: this month's \$5\.00 of compute is used up\. Add a compute pack in Plan & billing, or connect your own E2B account/);
+    expect(spent.message).toMatch(/^Out of compute: this month's \$5\.00 of compute is used up\. Add a compute pack or turn on auto top-up in Plan & billing, or connect your own E2B account/);
 
     // A gifted pack makes room again.
     await f.store.setComputePackGift(f.organization.id, 1, 'operator');

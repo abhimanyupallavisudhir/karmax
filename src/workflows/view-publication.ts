@@ -1,7 +1,7 @@
 import { patched, proxyActivities, isCancellation } from '@temporalio/workflow';
 import { ActivityCancellationType } from '@temporalio/common';
 import type { coreActivities } from '../activities/core.js';
-import { hasLiveWorldWork, lifecyclePublication, type PublishedView } from '../domain/view-publication.js';
+import { hadLiveWorldWork, hasLiveWorldWork, lifecyclePublication, type PublishedView } from '../domain/view-publication.js';
 
 const lifecycle = proxyActivities<Pick<coreActivities, 'parkWaitingWorld'>>({
   startToCloseTimeout: '30 minutes', heartbeatTimeout: '30 seconds',
@@ -21,7 +21,8 @@ export async function publishTaskView(
     return;
   }
   const fence = await core.publishView(taskId, view, reference, { separateLifecycle: true });
-  const startingAgent = patched('non-idle-world-waits-v1') ? hasLiveWorldWork(view)
+  const startingAgent = patched('non-idle-world-waits-v1')
+    ? (patched('out-of-compute-parks-v1') ? hasLiveWorldWork(view) : hadLiveWorldWork(view))
     : view.waitingFor?.kind === 'agentSlot' && view.waitingFor.detail === 'Starting agent';
   if (!fence || startingAgent || (view.status !== 'waiting' && view.status !== 'blocked')
     || !(view.world ?? view.state?.recoveryWorld)) return;

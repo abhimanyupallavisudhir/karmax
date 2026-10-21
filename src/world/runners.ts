@@ -93,7 +93,8 @@ export class RunnerPoolService {
     const config = input.resources ? { ...projectConfig, resources: input.resources } : projectConfig;
     const pool = (await this.ensureDefaultPool(input.project, input.provider));
     if (pool.mode === 'managed') {
-      if (input.work) await assertComputeCredit(this.store, input.project.organizationId!, input.provider);
+      if (input.work) await assertComputeCredit(this.store, input.project.organizationId!, input.provider, Date.now(),
+        { shape: config.resources, taskId: input.taskId });
       const account = (await this.managed?.managedConnections())?.find((value) => value.provider === input.provider);
       await assertManagedRoom(this.store, input.provider, account?.config.maxRunning);
     }
