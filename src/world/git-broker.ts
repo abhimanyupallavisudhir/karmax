@@ -218,7 +218,14 @@ export function describePublishFailures(result: GitBrokerPublishResult): string 
     .join('; ');
 }
 
-const NON_FAST_FORWARD = /non-fast-forward|fetch first|stale info|\brejected\b/i;
+/** Git's own refusal to move a branch it does not contain. A bare "rejected"
+ * is not one: `! [remote rejected]` is the server refusing the push itself
+ * (push protection, a ruleset, workflow permission), whatever the branch's
+ * history, and treating it as a race sent task #725's new branch looking for
+ * an "advanced" remote that did not exist. */
+const NON_FAST_FORWARD = /non-fast-forward|fetch first|stale info/i;
+const REMOTE_REJECTED = /\[remote rejected\][^\n(]*\(([^\n]+)\)/;
+const PUSH_PROTECTION = /\bGH0(?:09|13)\b[\s\S]*(?:push protection|secrets detected)|GitHub push protection refused/i;
 const GIT_AUTHORIZATION = /authentication failed|permission denied|could not read from remote repository|repository not found|http basic: access denied|403\b|401\b/i;
 
 /** Turn Git's provider prose into errors that identify the failing safety layer.
@@ -227,6 +234,13 @@ const GIT_AUTHORIZATION = /authentication failed|permission denied|could not rea
  * credentials at all. */
 export function describeGitPushError(repo: WorldRepo, detail: string): string {
   const compact = detail.trim().replace(/\s+/g, ' ').slice(0, 500);
+  if (PUSH_PROTECTION.test(detail)) return describePushProtection(repo, detail);
+  const refused = REMOTE_REJECTED.exec(detail);
+  if (refused) {
+    const said = remoteLines(detail).filter(line => /^error:/i.test(line))
+      .map(line => line.replace(/^error:\s*/i, '')).join(' ').slice(0, 500);
+    return `GitHub refused the push of "${repo.branch}" (${refused[1]!.trim()}).${said ? ` GitHub said: ${said}` : ''}`;
+  }
   if (NON_FAST_FORWARD.test(detail)) {
     return `remote task branch non-fast-forward for "${repo.branch}": origin advanced or diverged, so ${BRAND} did not overwrite it. `
       + `Fetch origin/${repo.branch} and integrate the remote work, or retry a ${BRAND}-owned rebase only after its exact prior PR head is recorded. `
@@ -237,6 +251,47 @@ export function describeGitPushError(repo: WorldRepo, detail: string): string {
       + `Reconnect or re-authorize the repository's GitHub App installation, then retry.${compact ? ` Git said: ${compact}` : ''}`;
   }
   return compact || 'git push failed';
+}
+
+/** True when Git's push output is a non-fast-forward refusal (see NON_FAST_FORWARD). */
+export function isNonFastForwardPush(detail: string): boolean {
+  return NON_FAST_FORWARD.test(detail) && !REMOTE_REJECTED.test(detail) && !PUSH_PROTECTION.test(detail);
+}
+
+/** True for GitHub secret-scanning push protection, in Git's output or in
+ * describeGitPushError's account of it. Only rewriting the branch fixes it. */
+export function isGithubPushProtectionRejection(detail: string): boolean {
+  return PUSH_PROTECTION.test(detail);
+}
+
+function remoteLines(detail: string): string[] {
+  return detail.split('\n').filter(line => line.startsWith('remote:'))
+    .map(line => line.slice('remote:'.length).trim()).filter(Boolean);
+}
+
+/** GitHub lists each secret as "—— <type> ——" followed by its commit/path
+ * locations and the URL where a person may allow it. */
+function describePushProtection(repo: WorldRepo, detail: string): string {
+  const secrets: Array<{ type: string; paths: string[]; commits: Set<string>; allow?: string }> = [];
+  for (const line of remoteLines(detail)) {
+    const heading = /^[—–-]{2,}\s*(.+?)\s*[—–-]{2,}$/.exec(line);
+    if (heading) { secrets.push({ type: heading[1]!, paths: [], commits: new Set() }); continue; }
+    const current = secrets.at(-1);
+    if (!current) continue;
+    const at = /^(?:-\s*)?(commit|path|blob_id):\s*(\S+)/.exec(line);
+    if (at?.[1] === 'commit') current.commits.add(at[2]!.slice(0, 12));
+    else if (at?.[1] === 'path') current.paths.push(at[2]!);
+    const allow = /https:\/\/\S+\/unblock-secret\/\S+/.exec(line);
+    if (allow) current.allow = allow[0];
+  }
+  const found = secrets.map(({ type, paths, commits }) => `${type}${paths.length
+    ? ` (${paths.join(', ')}${commits.size ? ` in ${[...commits].join(', ')}` : ''})` : ''}`).join('; ');
+  const allow = secrets.flatMap(({ allow: url }) => url ? [url] : []);
+  return `GitHub push protection refused "${repo.branch}": it contains ${found ? `secrets: ${found}` : 'a secret'}. `
+    + 'Remove each from every commit that adds it (amend or rebase the task branch), then publish again; '
+    + 'a fake value in a test or example can be assembled at runtime so no literal looks like a real secret. '
+    + `${allow.length ? `If it is not a real secret, a person with access can allow it: ${allow.join(' ')}. ` : ''}`
+    + 'Reconnect GitHub will not fix this.';
 }
 
 function recordedBaseViolation(repo: WorldRepo): string {

@@ -72,7 +72,8 @@ import { GitProfiles, userGitScope } from '../autonomy/git-profiles.js';
 import { worldRepos, worldRepoSource, worldRepoTarget } from '../world/types.js';
 import { pullRequestHandle, pullRequestView, isPullRequestView, proposalCheckouts } from '../world/pr-view.js';
 import { git as hostGit, isolatedGitEnvironment } from '../world/git.js';
-import { brokerFinalizeMerge, brokerPublishBranch, brokerPushBranches, describePublishFailures, type GitBrokerAuth } from '../world/git-broker.js';
+import { brokerFinalizeMerge, brokerPublishBranch, brokerPushBranches, describeGitPushError, describePublishFailures,
+  isGithubPushProtectionRejection, isNonFastForwardPush, type GitBrokerAuth } from '../world/git-broker.js';
 import { enrollWorldRepositories } from '../world/repository-enrollment.js';
 import { materializeGitCredential } from '../world/git-credential.js';
 import {
@@ -1244,7 +1245,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         : await world.exec('git', ['push', 'origin', refspec],
           { cwd: repo.root, env: { GIT_TERMINAL_PROMPT: '0', ...env } });
       const expected = expectedRemoteHeads[repo.name];
-      if (push.code !== 0 && expected && /non-fast-forward|fetch first|rejected/i.test(push.stderr || push.stdout)) {
+      if (push.code !== 0 && expected && isNonFastForwardPush(push.stderr || push.stdout)) {
         const lease = `--force-with-lease=refs/heads/${repo.branch}:${expected}`;
         push = repository?.gitConnectionId && deps.githubApp
           ? await hostGitWithRepositoryCredential(repository, repo.root, ['push', lease, 'origin', refspec], env)
@@ -1257,7 +1258,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       }
       else {
         skipped.push(repo.name);
-        errors[repo.name] = (push.stderr || push.stdout).slice(0, 300);
+        errors[repo.name] = describeGitPushError(repo, push.stderr || push.stdout || 'push failed');
       }
     }
     return { pushed, skipped, ...(skipped.length ? { errors } : {}) };
@@ -5062,7 +5063,16 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               nonRetryable: true,
             });
           }
-          if (/non-fast-forward|fetch first|stale info/i.test(pushError)) {
+          // Push protection found a secret in the branch's history: only the
+          // agent's rewrite of its commits can publish it, as for a conflict.
+          if (isGithubPushProtectionRejection(pushError)) {
+            throw ApplicationFailure.create({
+              message: `Could not publish ${repo.name}/${repo.branch}: ${pushError}`,
+              type: 'task-branch-conflict',
+              nonRetryable: true,
+            });
+          }
+          if (isNonFastForwardPush(pushError)) {
             throw ApplicationFailure.create({
               message: `Could not publish ${repo.name}/${repo.branch}: ${pushError}\n`
                 + `Use refresh_upstream with branch "${repo.branch}", inspect and integrate origin/${repo.branch} `

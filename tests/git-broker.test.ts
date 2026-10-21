@@ -4,7 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { WorktreeProvider } from '../src/world/worktree.js';
-import { brokerEnrollRepository, brokerFinalizeMerge, brokerImportTaskBranch, brokerPublishBranch, brokerPushBranches, brokerRefreshUpstream } from '../src/world/git-broker.js';
+import { brokerEnrollRepository, brokerFinalizeMerge, brokerImportTaskBranch, brokerPublishBranch, brokerPushBranches, brokerRefreshUpstream,
+  isGithubPushProtectionRejection } from '../src/world/git-broker.js';
 import { ensureIdentity, git, gitOrThrow } from '../src/world/git.js';
 import { acquireFileLock } from '../src/util/file-lock.js';
 import { mirroredClone } from '../src/world/git-mirror.js';
@@ -409,6 +410,106 @@ describe('cloud Git broker', () => {
     expect((await git(world.handle.root, ['rev-parse', 'HEAD'])).stdout.trim()).toBe(before);
     expect((await git(world.handle.root, ['rev-parse', '--verify', '--quiet', 'MERGE_HEAD'])).code).not.toBe(0);
     expect((await git(world.handle.root, ['status', '--porcelain'])).stdout.trim()).toBe('');
+  });
+
+  /** GitHub refuses pushes server-side ("! [remote rejected]"): push
+   * protection, rulesets, workflow permission. Task #725 was told its new
+   * branch had "advanced" and then that origin had no such branch, because a
+   * secret-scanning refusal was read as a non-fast-forward. A pre-receive hook
+   * reproduces GitHub's refusal with its GH013 text. */
+  describe('server-side push refusals', () => {
+    const GH013 = [
+      'error: GH013: Repository rule violations found for refs/heads/tavya/refused.',
+      '',
+      '- GITHUB PUSH PROTECTION',
+      '  —————————————————————————————————————————',
+      '    Resolve the following violations before pushing again',
+      '',
+      '    - Push cannot contain secrets',
+      '',
+      '     (?) Learn how to resolve a blocked push',
+      '     https://docs.github.com/code-security/secret-scanning/working-with-secret-scanning-and-push-protection/working-with-push-protection-from-the-command-line#resolving-a-blocked-push',
+      '',
+      '      —— Stripe API Key ————————————————————————————————————',
+      '       locations:',
+      '         - commit: 18ea51815fb2a4d1c0f3e1c3b2b0f9d8e7a6c5b4',
+      '           path: tests/task-secrets.test.ts:175',
+      '         - commit: 18ea51815fb2a4d1c0f3e1c3b2b0f9d8e7a6c5b4',
+      '           path: tests/task-secrets.test.ts:180',
+      '',
+      '       (?) To push, remove secret from commit(s) or follow this URL to allow the secret.',
+      '       https://github.com/acme/app/security/secret-scanning/unblock-secret/2rXq3StripeExample',
+      '',
+    ].join('\n');
+    const GH006 = [
+      'error: GH006: Protected branch update failed for refs/heads/tavya/refused.',
+      'error: Changes must be made through a pull request.',
+    ].join('\n');
+
+    async function refusingRemote(prefix: string) {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+      cleanups.push(root);
+      const source = path.join(root, 'source');
+      const remote = path.join(root, 'remote.git');
+      fs.mkdirSync(source);
+      await gitOrThrow(source, ['init', '-q', '-b', 'main']);
+      await ensureIdentity(source);
+      fs.writeFileSync(path.join(source, 'README.md'), '# base\n');
+      await gitOrThrow(source, ['add', '-A']);
+      await gitOrThrow(source, ['commit', '-q', '-m', 'base']);
+      await gitOrThrow(root, ['clone', '-q', '--bare', source, remote]);
+      const world = await new WorktreeProvider(path.join(root, 'worlds')).create({ taskId: 'refused', repo: source, base: 'main' });
+      world.handle.repo = 'git@example:remote.git';
+      world.handle.repos![0]!.repo = 'git@example:remote.git';
+      const env = { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: `url.file://${root}/.insteadOf`, GIT_CONFIG_VALUE_0: 'git@example:' };
+      const commit = async (file: string) => {
+        await world.writeFile(file, `${file}\n`);
+        await gitOrThrow(world.handle.root, ['add', '-A']);
+        await gitOrThrow(world.handle.root, ['commit', '-q', '-m', file]);
+        return (await git(world.handle.root, ['rev-parse', 'HEAD'])).stdout.trim();
+      };
+      const refuse = (message: string) => {
+        const hook = path.join(remote, 'hooks', 'pre-receive');
+        fs.writeFileSync(hook, `#!/bin/sh\ncat >/dev/null\ncat >&2 <<'GITHUB'\n${message}\nGITHUB\nexit 1\n`);
+        fs.chmodSync(hook, 0o755);
+      };
+      const remoteTip = async () => (await git(remote, ['rev-parse', '--verify', '--quiet', `refs/heads/${world.handle.branch}`])).stdout.trim();
+      return { world, env, commit, refuse, remoteTip };
+    }
+
+    it('names the secrets push protection found in a new branch instead of a remote race', async () => {
+      const { world, env, commit, refuse, remoteTip } = await refusingRemote('karmax-broker-push-protection-');
+      await commit('fixture.txt');
+      refuse(GH013);
+      const result = await brokerPublishBranch(world, env);
+      expect(result).toMatchObject({ pushed: [], skipped: ['source'] });
+      const error = result.errors!.source!;
+      expect(error).toMatch(/GitHub push protection refused "tavya\/refused"/);
+      expect(error).toContain('Stripe API Key (tests/task-secrets.test.ts:175, tests/task-secrets.test.ts:180 in 18ea51815fb2)');
+      expect(error).toContain('https://github.com/acme/app/security/secret-scanning/unblock-secret/2rXq3StripeExample');
+      expect(error).not.toMatch(/non-fast-forward|could not inspect|advanced/i);
+      expect(isGithubPushProtectionRejection(error)).toBe(true);
+      expect(await remoteTip()).toBe('');
+    });
+
+    it('never leases over, or merges with, a published branch whose next push GitHub refuses', async () => {
+      const { world, env, commit, refuse, remoteTip } = await refusingRemote('karmax-broker-remote-rejected-');
+      const published = await commit('first.txt');
+      const observed: Record<string, string> = {};
+      expect(await brokerPublishBranch(world, env, observed, (repo, head) => { observed[repo.name] = head; }))
+        .toEqual({ pushed: ['source'], skipped: [] });
+      const next = await commit('second.txt');
+      refuse(GH006);
+      for (const result of [await brokerPushBranches(world, env, undefined, observed),
+        await brokerPublishBranch(world, env, observed, undefined, { integrateRemote: true })]) {
+        expect(result.skipped).toEqual(['source']);
+        expect(result.errors!.source).toMatch(/GitHub refused the push of "tavya\/refused" \(pre-receive hook declined\)/);
+        expect(result.errors!.source).toContain('Changes must be made through a pull request.');
+        expect(result.errors!.source).not.toMatch(/non-fast-forward|could not inspect|push protection/i);
+      }
+      expect(await remoteTip()).toBe(published);
+      expect((await git(world.handle.root, ['rev-parse', 'HEAD'])).stdout.trim()).toBe(next);
+    });
   });
 
   it('replaces a rebased task branch only when its recorded remote-head lease still matches', async () => {
