@@ -52,7 +52,7 @@ function paddle() {
     return Response.json({ error: { code: 'not_found' } }, { status: 404 });
   });
   return { provider: new PaddleSubscriptionProvider(() => config, fetcher as any), charges, transactions,
-    then: (mode: typeof next) => { next = mode; } };
+    chargeNext: (mode: typeof next) => { next = mode; } };
 }
 
 async function fixture(options: { offered?: boolean; plan?: boolean } = {}) {
@@ -137,7 +137,7 @@ describe('auto top-up', () => {
     await f.topUps.configure(f.organization.id, { enabled: true }, 'owner');
     await f.use('most', 4_500_000);
     await f.short();
-    f.api.then('lost');
+    f.api.chargeNext('lost');
     expect(await f.topUps.run()).toBe(1);
     expect((await f.store.computeTopUps(f.organization.id))[0]).toMatchObject({ state: 'uncertain' });
     // Nothing more is bought while it is uncertain; the next pass reads Paddle's records.
@@ -152,7 +152,7 @@ describe('auto top-up', () => {
     await f.topUps.configure(f.organization.id, { enabled: true }, 'owner');
     await f.use('most', 4_500_000);
     await f.short();
-    f.api.then('declined');
+    f.api.chargeNext('declined');
     expect(await f.topUps.run()).toBe(0);
     expect((await f.store.computeTopUps(f.organization.id))[0]).toMatchObject({ state: 'failed' });
     expect(f.told).toEqual([expect.objectContaining({ subject: 'Compute top-up for Acme was declined' })]);
@@ -162,7 +162,7 @@ describe('auto top-up', () => {
     // Turning it off and on again tries at once.
     await f.topUps.configure(f.organization.id, { enabled: false }, 'owner');
     await f.topUps.configure(f.organization.id, { enabled: true }, 'owner');
-    f.api.then('past_due');
+    f.api.chargeNext('past_due');
     expect(await f.topUps.run()).toBe(1);
     expect((await f.store.computeTopUps(f.organization.id))[0]).toMatchObject({ state: 'pending', error: 'declined' });
     expect(f.told).toHaveLength(2);

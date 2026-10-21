@@ -8790,7 +8790,7 @@ export class Store {
   async computeHeldCostMicros(organizationId: string, now = Date.now(), exceptId?: string): Promise<number> {
     const holds = (await this.db.prepare(`SELECT * FROM compute_holds WHERE organizationId=?
       AND COALESCE(closedAt, endsAt)>?${exceptId ? ' AND id<>?' : ''}`)
-      .all(...[organizationId, now - COMPUTE_HOLD_SETTLE_MS, ...(exceptId ? [exceptId] : [])])) as Array<Record<string, unknown>>;
+      .all(organizationId, now - COMPUTE_HOLD_SETTLE_MS, ...(exceptId ? [exceptId] : []))) as Array<Record<string, unknown>>;
     if (!holds.length) return 0;
     const booked = (await this.computeBookedUntil(organizationId, [...new Set(holds.map((hold) => String(hold.taskId ?? '')))]));
     return Math.round(holds.reduce((total, hold) => total + heldCost(hold, booked.get(String(hold.taskId ?? ''))), 0));
