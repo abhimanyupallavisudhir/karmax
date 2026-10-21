@@ -1,6 +1,6 @@
 import type { CredentialBroker } from '../autonomy/broker.js';
 import { INSTALLATION_SCOPE, organizationScope } from '../autonomy/vault-keys.js';
-import type { MachineShape } from '../domain/computer.js';
+import { isAnyProvider, type MachineShape } from '../domain/computer.js';
 import { assertComputerFits, computerLimits, providerFeatures, type ComputerFeatures, type ComputerLimits, type EffectiveComputerLimits } from '../domain/computer-limits.js';
 import type { WorldProviderConnection } from '../domain/types.js';
 import type { Store } from '../store/db.js';
@@ -22,6 +22,16 @@ export const MANAGED_COMPUTE = 'installation';
  * connects later. */
 export function connectionScope(reference: { organizationId?: string; funding?: string }): string | undefined {
   return reference.funding === 'managed' ? MANAGED_COMPUTE : reference.organizationId;
+}
+
+/** What the account a world runs on allows a machine to be: the one it was
+ * made on (`meta.funding`), whatever the organization connected since. */
+export async function worldAccountLimits(store: Store, world: { kind: string; meta?: Record<string, unknown> },
+  organizationId: string): Promise<EffectiveComputerLimits> {
+  const scope = world.meta?.funding === 'managed' ? MANAGED_COMPUTE : organizationId;
+  const connection = await store.getWorldProviderConnection(scope, world.kind)
+    ?? (scope === organizationId ? await store.getWorldProviderConnection(MANAGED_COMPUTE, world.kind) : undefined);
+  return computerLimits(world.kind, connection?.measuredLimits, connection?.config.limits);
 }
 
 /** What a sealed reference records about the account a world was made on. */
@@ -128,9 +138,18 @@ export class WorldProviderConnectionService {
     return value ? await this.view(value) : undefined;
   }
 
+  /** The cloud accounts this organization can run a computer on: its own
+   * connections and the managed compute it may use ("Any" chooses among them). */
+  async reachable(organizationId: string): Promise<WorldProviderConnectionView[]> {
+    return (await this.list(organizationId)).filter((view) => view.enabled && view.credentialConfigured
+      && (CLOUD_WORLD_PROVIDERS as readonly string[]).includes(view.provider));
+  }
+
   /** What a computer on `provider` may be for this organization. Self-hosted
-   * computers have none; an unconnected provider has its documented ones. */
+   * computers have none; an unconnected provider has its documented ones.
+   * For "Any", each size is the largest some reachable account allows. */
   async limits(organizationId: string | undefined, provider: string): Promise<EffectiveComputerLimits> {
+    if (isAnyProvider(provider)) return organizationId ? anyLimits(await this.reachable(organizationId)) : { source: {} };
     let value = organizationId ? await this.store.getWorldProviderConnection(organizationId, provider) : undefined;
     if (!value && organizationId && await this.funding(organizationId, provider) === 'managed')
       value = await this.store.getWorldProviderConnection(MANAGED_COMPUTE, provider);
@@ -140,6 +159,7 @@ export class WorldProviderConnectionService {
   /** Refuse a size this organization's account cannot give, before any machine is made. */
   async assertFits(organizationId: string | undefined, provider: string | undefined, spec: MachineShape): Promise<void> {
     if (!provider) return;
+    if (isAnyProvider(provider)) return assertSomeFits(spec, organizationId ? await this.reachable(organizationId) : []);
     assertComputerFits(spec, await this.limits(organizationId, provider), provider);
   }
 
@@ -245,6 +265,8 @@ export class WorldProviderConnectionService {
   }
 
   async available(organizationId: string | undefined, provider: string): Promise<boolean> {
+    // "Any" is always a valid choice: it uses whatever the organization can reach.
+    if (isAnyProvider(provider)) return true;
     try { (await this.resolve(organizationId, provider)); return true; }
     catch { return false; }
   }
@@ -332,6 +354,35 @@ const defaultProbes: ProviderProbes = {
     return {};
   },
 };
+
+/** Each size, the largest any reachable account allows ("Any"'s ceiling). */
+export function anyLimits(views: Array<{ limits: ComputerLimits }>): EffectiveComputerLimits {
+  const out: EffectiveComputerLimits = { source: {} };
+  for (const key of ['cpu', 'memoryMb', 'diskGb'] as const) {
+    const values = views.map((view) => view.limits[key]).filter((value): value is number => value != null);
+    if (values.length === views.length && values.length) { out[key] = Math.max(...values); out.source[key] = 'provider'; }
+  }
+  return out;
+}
+
+/** Refuse a size no single reachable account can give. Nothing reachable: nothing to judge. */
+function assertSomeFits(spec: MachineShape, views: Array<{ provider: string; limits: ComputerLimits }>): void {
+  if (!views.length) return;
+  const failures: string[] = [];
+  for (const view of views) {
+    try { assertComputerFits(spec, view.limits, view.provider); return; }
+    catch (error) { failures.push(error instanceof Error ? error.message : String(error)); }
+  }
+  const most = anyLimits(views);
+  const gb = (mb: number) => (Number.isInteger(mb / 1024) ? String(mb / 1024) : (mb / 1024).toFixed(1));
+  if (spec.diskGb != null && most.diskGb != null && spec.diskGb > most.diskGb)
+    throw new Error(`Disk can be at most ${most.diskGb} GB on the computers this organization can use`);
+  if (spec.memoryMb != null && most.memoryMb != null && spec.memoryMb > most.memoryMb)
+    throw new Error(`Memory can be at most ${gb(most.memoryMb)} GB on the computers this organization can use`);
+  if (spec.cpu != null && most.cpu != null && spec.cpu > most.cpu)
+    throw new Error(`CPU can be at most ${most.cpu} on the computers this organization can use`);
+  throw new Error(`No one computer this organization can use is that big: ${failures.join('; ')}`);
+}
 
 /** Managed compute as an organization sees it: the provider, its limits and
  * features; never the installation's key, templates or capacity. */

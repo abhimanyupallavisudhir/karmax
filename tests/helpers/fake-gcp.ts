@@ -33,6 +33,8 @@ export class FakeGcp {
   /** `machineType@zone` with no capacity just now. */
   noCapacity = new Set<string>();
   cpuQuota?: number;
+  /** The project's CPUS_ALL_REGIONS quota. */
+  globalCpuQuota?: number;
   defaultNetwork = true;
   billingDown = false;
   /** How many reads after a stop still say RUNNING (Google takes a moment to say STOPPING). */
@@ -58,6 +60,8 @@ export class FakeGcp {
     if (new Headers(init.headers).get('authorization') !== 'Bearer fake-token') return json(401, { error: { code: 401, message: 'Request had invalid authentication credentials.', status: 'UNAUTHENTICATED' } });
     if (url.host === 'cloudbilling.googleapis.com') return this.billing();
     const body = init.body ? JSON.parse(String(init.body)) : undefined;
+    if (url.pathname === `/compute/v1/projects/${this.project}`)
+      return json(200, { name: this.project, quotas: this.globalCpuQuota !== undefined ? [{ metric: 'CPUS_ALL_REGIONS', limit: this.globalCpuQuota, usage: 0 }] : [] });
     const rest = url.pathname.replace(`/compute/v1/projects/${this.project}/`, '');
     this.requests.push({ method, path: rest + url.search, body });
     return this.route(method, rest.split('/'), url.searchParams, body);

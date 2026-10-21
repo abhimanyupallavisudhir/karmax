@@ -2,7 +2,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { parseEnv } from 'node:util';
 import { launchConfig } from '../launch/legal.js';
-import { CLOUD_WORLD_PROVIDERS } from '../domain/computer.js';
+import { ANY_PROVIDER, CLOUD_WORLD_PROVIDERS } from '../domain/computer.js';
 
 export interface DeploymentConfig {
   hosted: boolean;
@@ -107,7 +107,7 @@ export function deploymentConfig(env: NodeJS.ProcessEnv = process.env): Deployme
   const singleNode = hosted && env.KARMAX_SINGLE_NODE === '1';
   return { hosted, singleNode, cellId: env.KARMAX_CELL_ID?.trim() || (hosted ? 'cell-1' : 'local'),
     hostLocal: hostLocal(env),
-    ...(hosted ? { cloudWorldProvider: env.KARMAX_CLOUD_WORLD_PROVIDER?.trim() || 'e2b' } : {}) };
+    ...(hosted ? { cloudWorldProvider: env.KARMAX_CLOUD_WORLD_PROVIDER?.trim() || ANY_PROVIDER } : {}) };
 }
 
 export function validateDeployment(env: NodeJS.ProcessEnv = process.env): DeploymentConfig {
@@ -145,8 +145,8 @@ export function validateDeployment(env: NodeJS.ProcessEnv = process.env): Deploy
     for (const name of ['KARMAX_S3_ENDPOINT', 'KARMAX_S3_BUCKET', 'KARMAX_S3_ACCESS_KEY_ID', 'KARMAX_S3_SECRET_ACCESS_KEY'])
       if (!env[name]) failures.push(`${name} is required when KARMAX_OBJECT_STORE=s3`);
   }
-  if (!(CLOUD_WORLD_PROVIDERS as readonly string[]).includes(config.cloudWorldProvider!))
-    failures.push(`KARMAX_CLOUD_WORLD_PROVIDER must be ${CLOUD_WORLD_PROVIDERS.join(', ').replace(/, (?=[^,]*$)/, ' or ')}`);
+  if (![ANY_PROVIDER, ...CLOUD_WORLD_PROVIDERS].includes(config.cloudWorldProvider!))
+    failures.push(`KARMAX_CLOUD_WORLD_PROVIDER must be ${[ANY_PROVIDER, ...CLOUD_WORLD_PROVIDERS].join(', ').replace(/, (?=[^,]*$)/, ' or ')}`);
   const launch = launchConfig(env);
   if (launch.paidLaunch && !launch.ready)
     failures.push(`KARMAX_PAID_LAUNCH=1 requires the explicit launch checklist: ${launch.missing.join(', ')}`);

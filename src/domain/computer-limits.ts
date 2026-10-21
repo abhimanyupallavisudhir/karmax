@@ -1,4 +1,4 @@
-import { describeMachine, type MachineShape } from './computer.js';
+import { describeMachine, type ComputeRegion, type MachineShape } from './computer.js';
 
 /**
  * What one provider account lets a Computer be (wiki features/computers).
@@ -45,6 +45,15 @@ interface ProviderFacts {
   limits: ComputerLimits;
   /** What else a Computer may ask of it; the form shows only these. */
   features: ComputerFeatures;
+  /** List price in USD, for ranking where "Any" runs a task (compute-router.ts):
+   * per vCPU-hour, per GB of memory per hour, per GB of disk per month, and
+   * per running hour whatever the size (a public IPv4 address). */
+  price: { cpuHour: number; gbHour: number; diskGbMonth: number; hour?: number };
+  /** Typical seconds from a parked world to a working one (measured, wiki
+   * features/vm-worlds); breaks a tie in price. */
+  wakeSeconds: number;
+  /** Where its machines run, from the account's region setting. */
+  region(config: { region?: string; target?: string }): ComputeRegion | undefined;
 }
 
 /** Options beyond size that a provider may or may not offer. */
@@ -63,29 +72,81 @@ const VM_FEATURES: ComputerFeatures = { desktop: false, allowlist: false, enviro
 
 /** One entry per cloud provider. A new provider (Fly.io, Hetzner…) adds its
  * documented facts here and, if its API can tell, a probe in provider-limits.ts. */
+// Prices are the providers' public list prices (2026-10, USD; EUR at 1.17),
+// reduced to a line per resource so any size can be compared. They rank
+// candidates only: usage is billed from each provider's own records.
 const PROVIDERS: Record<string, ProviderFacts> = {
   // Measured 2026-10-10: the default template has 22 GB of disk. Until the
-  // account is asked, offer only what every account has.
-  e2b: { label: 'E2B', defaults: { cpu: 2, memoryMb: 2048, diskGb: 22 }, limits: { cpu: 8, memoryMb: 8192, diskGb: 22 }, features: ALL_FEATURES },
+  // account is asked, offer only what every account has. E2B's cloud runs in
+  // the US; its disk costs nothing extra.
+  e2b: { label: 'E2B', defaults: { cpu: 2, memoryMb: 2048, diskGb: 22 }, limits: { cpu: 8, memoryMb: 8192, diskGb: 22 }, features: ALL_FEATURES,
+    price: { cpuHour: 0.0504, gbHour: 0.0162, diskGbMonth: 0 }, wakeSeconds: 2, region: () => 'us' },
   // Daytona's documented per-sandbox maximum (raised by its support); karmax
   // starts a default computer on `daytona-medium` (2 vCPU / 4 GiB / 8 GB).
-  daytona: { label: 'Daytona', defaults: { cpu: 2, memoryMb: 4096, diskGb: 8 }, limits: { cpu: 4, memoryMb: 8192, diskGb: 10 }, features: ALL_FEATURES },
+  daytona: { label: 'Daytona', defaults: { cpu: 2, memoryMb: 4096, diskGb: 8 }, limits: { cpu: 4, memoryMb: 8192, diskGb: 10 }, features: ALL_FEATURES,
+    price: { cpuHour: 0.0504, gbHour: 0.0162, diskGbMonth: 0.08 }, wakeSeconds: 3,
+    region: (config) => (config.target === 'eu' ? 'eu' : 'us') },
   // VM worlds (wiki features/vm-worlds): disk is the volume mounted as the
   // home, the size `df ~` shows. Fly: a volume holds at most 500 GB, the
   // largest machine is performance-16x with 128 GB; no account API says more.
-  fly: { label: 'Fly.io', defaults: { cpu: 2, memoryMb: 2048, diskGb: 20 }, limits: { cpu: 16, memoryMb: 131_072, diskGb: 500 }, features: VM_FEATURES },
+  fly: { label: 'Fly.io', defaults: { cpu: 2, memoryMb: 2048, diskGb: 20 }, limits: { cpu: 16, memoryMb: 131_072, diskGb: 500 }, features: VM_FEATURES,
+    price: { cpuHour: 0.0037, gbHour: 0.01, diskGbMonth: 0.15 }, wakeSeconds: 5, region: (config) => flyRegion(config.region ?? 'fra') },
   // Hetzner: volumes up to 10 TB; the largest machine is whatever server type
   // the location offers (the connection test asks), else the shared CPX51.
   // A default computer gets the cheapest type covering it (CPX11, 2 CPU / 2 GB, 2026-10-10).
-  hetzner: { label: 'Hetzner', defaults: { cpu: 2, memoryMb: 2048, diskGb: 20 }, limits: { cpu: 16, memoryMb: 32_768, diskGb: 10_240 }, features: VM_FEATURES },
+  hetzner: { label: 'Hetzner', defaults: { cpu: 2, memoryMb: 2048, diskGb: 20 }, limits: { cpu: 16, memoryMb: 32_768, diskGb: 10_240 }, features: VM_FEATURES,
+    price: { cpuHour: 0.0035, gbHour: 0.0012, diskGbMonth: 0.09, hour: 0.0012 }, wakeSeconds: 35,
+    region: (config) => (/^(?:ash|hil)/.test(config.region ?? '') ? 'us' : /^(?:fsn|nbg|hel)/.test(config.region ?? 'fsn1') ? 'eu' : undefined) },
   // AWS: an EBS gp3 volume holds 16 TiB; the largest machine is the largest
   // instance of karmax's families in the region (the connection test asks).
   // A default computer is the cheapest covering it (c7i-flex.large, 2 CPU / 4 GB).
-  aws: { label: 'AWS', defaults: { cpu: 2, memoryMb: 2048, diskGb: 20 }, limits: { cpu: 64, memoryMb: 262_144, diskGb: 16_384 }, features: VM_FEATURES },
+  aws: { label: 'AWS', defaults: { cpu: 2, memoryMb: 2048, diskGb: 20 }, limits: { cpu: 64, memoryMb: 262_144, diskGb: 16_384 }, features: VM_FEATURES,
+    price: { cpuHour: 0.0336, gbHour: 0.0045, diskGbMonth: 0.08, hour: 0.005 }, wakeSeconds: 30,
+    region: (config) => cloudRegion(config.region ?? 'eu-central-1', 'eu-', 'us-') },
   // Google Cloud: E2 custom machines of exactly the size asked (2–32 CPUs, up
   // to 128 GB), within the region's CPU quota; a pd-balanced disk holds 64 TB.
-  gcp: { label: 'Google Cloud', defaults: { cpu: 2, memoryMb: 2048, diskGb: 20 }, limits: { cpu: 32, memoryMb: 131_072, diskGb: 65_536 }, features: VM_FEATURES },
+  gcp: { label: 'Google Cloud', defaults: { cpu: 2, memoryMb: 2048, diskGb: 20 }, limits: { cpu: 32, memoryMb: 131_072, diskGb: 65_536 }, features: VM_FEATURES,
+    price: { cpuHour: 0.0218, gbHour: 0.0029, diskGbMonth: 0.1, hour: 0.005 }, wakeSeconds: 50,
+    region: (config) => cloudRegion(config.region ?? 'europe-west3-a', 'europe-', 'us-') },
 };
+
+function cloudRegion(code: string, eu: string, us: string): ComputeRegion | undefined {
+  return code.startsWith(eu) ? 'eu' : code.startsWith(us) ? 'us' : undefined;
+}
+
+const FLY_EU = new Set(['ams', 'arn', 'cdg', 'fra', 'lhr', 'mad', 'otp', 'waw']);
+const FLY_US = new Set(['atl', 'bos', 'den', 'dfw', 'ewr', 'iad', 'lax', 'mia', 'ord', 'phx', 'sea', 'sjc']);
+function flyRegion(code: string): ComputeRegion | undefined {
+  return FLY_EU.has(code) ? 'eu' : FLY_US.has(code) ? 'us' : undefined;
+}
+
+/** Every provider with an account record, in a fixed order. */
+export function cloudProviders(): string[] {
+  return Object.keys(PROVIDERS);
+}
+
+/** What a machine of `shape` costs per hour on `provider` at list price, in USD
+ * micros; undefined for a provider without a record (this machine). A size it
+ * leaves out is the provider's default. */
+export function listPriceMicrosPerHour(provider: string, shape: MachineShape): number | undefined {
+  const facts = PROVIDERS[provider];
+  if (!facts) return undefined;
+  const cpu = shape.cpu ?? facts.defaults.cpu;
+  const gb = (shape.memoryMb ?? facts.defaults.memoryMb) / 1024;
+  const disk = shape.diskGb ?? facts.defaults.diskGb;
+  const { price } = facts;
+  return Math.round((cpu * price.cpuHour + gb * price.gbHour + disk * price.diskGbMonth / 730 + (price.hour ?? 0)) * 1e6);
+}
+
+/** Typical wake time, in seconds. */
+export function providerWakeSeconds(provider: string): number {
+  return PROVIDERS[provider]?.wakeSeconds ?? 0;
+}
+
+/** Where an account's machines run (EU or US), when known. */
+export function providerRegion(provider: string, config: { region?: string; target?: string } = {}): ComputeRegion | undefined {
+  return PROVIDERS[provider]?.region(config);
+}
 
 export function providerLabel(provider: string): string {
   return PROVIDERS[provider]?.label ?? provider;

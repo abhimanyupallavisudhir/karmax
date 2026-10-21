@@ -44,6 +44,8 @@ Workspaces (a project or task, assembled as its cloud world is)
 Tasks
   task new <title> [--prompt <text>]     Start a task (in the workspace's project, or --project)
            [--template <number|name>]    … from a template, as numbered by 'task templates'
+           [--computer any|<provider>]   … on a computer: any (tavya picks one with room) or e.g. aws,
+           [--cpu N] [--memory GB] [--disk GB] [--region eu|us]   and at least this size
   task list|templates|show|open|logs [-f]|say   Follow and steer tasks; list the templates
   task confirm|cancel|retry [<task>]
   emit <type> [-d <json>|@file|@-]       Record a project event; tasks waiting on it start runs
@@ -77,6 +79,7 @@ const OPTIONS = {
   cwd: { type: 'string' }, 'git-via-tavya': { type: 'boolean' }, secret: { type: 'string', multiple: true },
   skip: { type: 'string', multiple: true }, github: { type: 'string' }, 'dry-run': { type: 'boolean' }, repository: { type: 'string' },
   key: { type: 'string' }, subject: { type: 'string' }, template: { type: 'string' },
+  computer: { type: 'string' }, cpu: { type: 'string' }, memory: { type: 'string' }, disk: { type: 'string' }, region: { type: 'string' },
 } as const;
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {

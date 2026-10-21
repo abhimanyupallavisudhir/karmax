@@ -4524,7 +4524,16 @@ export class Gateway {
             if (!spec) return this.json(res, 400, { error: 'accept or configure an environment proposal first' });
             const body = await this.body(req);
             const executionConfig = (await store.effectiveProjectConfig(project));
-            const provider = String(body.provider ?? executionConfig.worldProvider ?? 'worktree');
+            let provider = String(body.provider ?? executionConfig.worldProvider ?? 'worktree');
+            // "Any": build for the computer it tries first among those that
+            // bake environments (E2B, Daytona); a VM world runs setup live.
+            if (provider === 'any') {
+              const reach = (await this.deps.providerConnections?.reachable(project.organizationId ?? 'org_personal')) ?? [];
+              const ordered = [...reach].sort((a, b) => Number(!!a.managed) - Number(!!b.managed));
+              const chosen = ordered.find((view) => view.features.environmentBuilds) ?? ordered[0];
+              if (!chosen) return this.json(res, 400, { error: 'connect a computer in Settings → Computers first' });
+              provider = chosen.provider;
+            }
             const digest = environments.digest(spec);
             const connection = ['e2b', 'daytona'].includes(provider)
               ? (await this.deps.providerConnections?.resolve(project.organizationId, provider)) : undefined;
@@ -10681,7 +10690,7 @@ function normalizeConfig(
       throw new ValidationError('Hosted GitHub projects cannot use remote policy "none"; use "pr" or the advanced direct-push policy.');
     if (config.remote === undefined) config = { ...config, remote: 'pr' };
     const worldProvider = config.worldProvider ?? (defaultHostedProvider
-      ? process.env.KARMAX_CLOUD_WORLD_PROVIDER ?? 'e2b'
+      ? process.env.KARMAX_CLOUD_WORLD_PROVIDER?.trim() || 'any'
       : undefined);
     if (worldProvider && ['worktree', 'container', 'memory'].includes(worldProvider))
       throw new Error('hosted projects require a remote world provider');
@@ -10699,7 +10708,7 @@ function hostedSettingsValues(values: Record<string, unknown>, hosted: boolean):
   return values;
 }
 
-const EXECUTION_CONFIG_KEYS = ['worldProvider', 'runnerPoolId', 'resources', 'network', 'environment', 'monthlyBudgetMicros', 'hibernateAfterMs'] as const;
+const EXECUTION_CONFIG_KEYS = ['worldProvider', 'runnerPoolId', 'resources', 'network', 'environment', 'monthlyBudgetMicros', 'hibernateAfterMs', 'region'] as const;
 
 function pickExecutionConfig(config: ProjectConfig): Partial<ProjectConfig> {
   return Object.fromEntries(EXECUTION_CONFIG_KEYS.filter((key) => config[key] !== undefined).map((key) => [key, config[key]])) as Partial<ProjectConfig>;

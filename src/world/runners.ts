@@ -4,7 +4,8 @@ import { setImmediate as yieldToEventLoop } from 'node:timers/promises';
 import type { Store } from '../store/db.js';
 import type { Project, RunnerPool, WorldHandleRef } from '../domain/types.js';
 import type { ProviderSandboxRef, WorldHandle } from './types.js';
-import { describeMachine, machineShape, sameMachine, type MachineShape } from '../domain/computer.js';
+import { ANY_PROVIDER, describeMachine, isAnyProvider, machineShape, sameMachine, type MachineShape } from '../domain/computer.js';
+import { assertComputerFits, type ComputerLimits } from '../domain/computer-limits.js';
 import type { WorldRegistry } from './registry.js';
 import type { WorldCheckpointService } from './checkpoint.js';
 import type { ObjectStore } from '../store/objects.js';
@@ -13,7 +14,11 @@ import { DeferredDeleteObjectStore } from '../store/deferred-delete.js';
 import { taskEnded } from './task-ended.js';
 import { taskProvider } from './task-provider.js';
 import { assertComputeCredit, assertManagedRoom } from './managed-compute.js';
-import { MANAGED_COMPUTE } from './connections.js';
+import { MANAGED_COMPUTE, worldAccountLimits } from './connections.js';
+
+const fits = (shape: MachineShape, limits: ComputerLimits): boolean => {
+  try { assertComputerFits(shape, limits, ''); return true; } catch { return false; }
+};
 
 /** What the runner service needs to know about managed compute
  * (WorldProviderConnectionService). */
@@ -404,7 +409,12 @@ export class WorldLifecycleManager {
       // (checkpoint.ts restoreWhereTaskRuns). An organization default never moves
       // a running task; only the task's own choice does.
       const target = await taskProvider(this.store, candidate.handle.id);
-      const move = target && target !== candidate.handle.kind ? { from: candidate.handle.kind, to: target } : undefined;
+      let move = target && target !== candidate.handle.kind ? { from: candidate.handle.kind, to: target } : undefined;
+      // "Any" leaves a world where it is until its new size is more than that
+      // account allows; then the wake routes it to one that fits (compute-router.ts).
+      if (!move && !target && resize && project && isAnyProvider(config?.worldProvider)
+        && !fits(resize.to, await worldAccountLimits(this.store, candidate.handle, project.organizationId ?? 'org_personal')))
+        move = { from: candidate.handle.kind, to: ANY_PROVIDER };
       if (!project || (!resize && !move && candidate.updatedAt > now - after)) continue;
       // A VM world keeps its disk across any size: grow it in place, never
       // hibernate it for a new size (which would drop its ignored files).

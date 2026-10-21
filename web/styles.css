@@ -3682,11 +3682,11 @@ html[data-theme="dark"] .github-signin-btn:active,
 /* ── The Computer block (task form, Task defaults, Parameters) ── */
 .parameter-fields .computer-field { padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); display: grid; gap: 8px; }
 .computer-controls { display: grid; grid-template-columns: minmax(120px, 1.1fr) repeat(3, minmax(92px, .8fr)); gap: 8px; }
-.computer-controls > select, .computer-size input, .computer-more input, .computer-more select {
+.computer-pick > select, .computer-size input, .computer-more input, .computer-more select {
   width: 100%; min-width: 0; height: 40px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px;
   background: var(--surface); outline: none; font-size: 13px;
 }
-.computer-controls > select:focus, .computer-size input:focus, .computer-more input:focus, .computer-more select:focus { border-color: var(--accent); }
+.computer-pick > select:focus, .computer-size input:focus, .computer-more input:focus, .computer-more select:focus { border-color: var(--accent); }
 .computer-size { position: relative; display: block; min-width: 0; margin: 0; }
 .computer-size input { padding-right: 58px; font-variant-numeric: tabular-nums; }
 .computer-size input::-webkit-inner-spin-button { opacity: .5; }
@@ -3711,6 +3711,13 @@ html[data-theme="dark"] .github-signin-btn:active,
 .computer-providers { display: grid; gap: 8px; }
 .computer-provider { display: flex; align-items: center; gap: 10px; min-height: 48px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); }
 .computer-provider > b { min-width: 72px; }
+/* What provider "Any" can choose among: a summary row above the accounts. */
+.computer-any { display: flex; align-items: center; gap: 10px; min-height: 40px; padding: 6px 10px; border: 1px dashed var(--line); border-radius: 10px; }
+.computer-any .computer-reach { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The provider and, for Any, what it can reach (ⓘ inside the select, before its arrow). */
+.computer-pick { position: relative; display: block; min-width: 0; }
+.computer-pick > .cf-reach { position: absolute; right: 26px; top: 50%; transform: translateY(-50%); display: inline-flex; }
+.computer-pick > .cf-reach[hidden] { display: none; }
 .computer-provider .chip[title] { cursor: help; }
 .computer-provider .computer-held-toggle { font: inherit; cursor: pointer; }
 .computer-held { display: grid; gap: 4px; margin: -4px 0 4px 18px; }
@@ -3732,6 +3739,8 @@ html[data-theme="dark"] .github-signin-btn:active,
 .disk-meter { font: inherit; color: var(--ink-3); cursor: help; padding: 1px 8px; border: 1px solid var(--line); border-radius: 999px;
   background: linear-gradient(90deg, var(--surface-2) var(--used, 0%), transparent var(--used, 0%)); font-variant-numeric: tabular-nums; }
 .free-computer { font: inherit; cursor: pointer; }
+/* Task header: where the computer is (provider · size); why, on hover. */
+.runs-on { color: var(--ink-3); cursor: help; padding: 1px 8px; border: 1px solid var(--line); border-radius: 999px; font-variant-numeric: tabular-nums; }
 .disk-meter.warn { color: var(--danger); border-color: var(--danger); background: linear-gradient(90deg, var(--danger-weak) var(--used, 0%), transparent var(--used, 0%)); }
 .computer-size input::-webkit-inner-spin-button, .computer-size input::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
 

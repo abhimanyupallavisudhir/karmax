@@ -1,4 +1,4 @@
-import { applyComputer, machineShape, normalizeComputer } from '../domain/computer.js';
+import { applyComputer, isAnyProvider, machineShape, normalizeComputer } from '../domain/computer.js';
 import { taskEnded } from '../world/task-ended.js';
 import { CheckpointRefusedError } from '../world/checkpoint-chunks.js';
 import { conversationFor, participantLabel, workDigest } from '../domain/participants.js';
@@ -28,6 +28,7 @@ import { Context as activityContext } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
 import { COMPUTE_HOLD, holdManagedCompute, outOfCompute, type ComputeHoldRequest } from '../world/managed-compute.js';
 import { MANAGED_COMPUTE } from '../world/connections.js';
+import { ComputeRouter, type RouterConnections } from '../world/compute-router.js';
 import { AgentChannelLost, ProviderCapacityFull, ProviderOutage, ProviderPolicyFailure, SandboxProviderFailure, confirmSandboxFailure, isProviderPolicyRejection, classifyProviderTurnError, isTransportError, isResourceKill, isContextOverflow, type LimitClassification } from '../agent/limits.js';
 import { probeClaudeUsage, probeCodexUsage, type UsageResult } from '../agent/usage.js';
 import { markCheckpointStale } from '../world/checkpoint-staleness.js';
@@ -340,7 +341,7 @@ export interface CoreActivityDeps {
   configHomes?: import('../autonomy/config-homes.js').ConfigHomeManager;
   resources?: import('../world/resources.js').ProjectResourceService;
   /** The organization's provider accounts, which judge a sub-task's Computer. */
-  providerConnections?: import('../platform/agent-params.js').ComputerChecks;
+  providerConnections?: import('../platform/agent-params.js').ComputerChecks & Partial<RouterConnections>;
   objects?: ObjectStore;
   contentDir?: string;
   /** Snapshot of whether this console is running on the user's own machine. */
@@ -1919,22 +1920,25 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let activitySignal: AbortSignal | undefined;
       let heartbeat: (() => void) | undefined;
       let cancellationHeartbeat: NodeJS.Timeout | undefined;
-      {
-        try {
-          const ctx = activityContext.current();
-          activitySignal = ctx.cancellationSignal;
-          heartbeat = () => ctx.heartbeat({ waitingFor: 'world-capacity' });
-          // Temporal delivers activity cancellation at heartbeat boundaries.
-          // Keep that boundary live after admission while the provider allocates
-          // and provisions the sandbox.
-          cancellationHeartbeat = setInterval(() => {
-            try { ctx.heartbeat({ provisioning: args.kind }); } catch { /* cancellation is checked by provisioning */ }
-          }, 1_000);
-          cancellationHeartbeat.unref();
-        } catch {
-          // Direct activity unit tests have no ambient Temporal context.
-        }
+      let ctx: ReturnType<typeof activityContext.current> | undefined;
+      try {
+        ctx = activityContext.current();
+        activitySignal = ctx.cancellationSignal;
+        heartbeat = () => ctx!.heartbeat({ waitingFor: 'world-capacity' });
+      } catch {
+        // Direct activity unit tests have no ambient Temporal context.
       }
+      // Temporal delivers activity cancellation at heartbeat boundaries. Keep
+      // that boundary live while a provider allocates and provisions the
+      // sandbox (again for each provider "Any" tries).
+      const startCancellationHeartbeat = (kind: string) => {
+        if (!ctx || cancellationHeartbeat) return;
+        cancellationHeartbeat = setInterval(() => {
+          try { ctx!.heartbeat({ provisioning: kind }); } catch { /* cancellation is checked by provisioning */ }
+        }, 1_000);
+        cancellationHeartbeat.unref();
+      };
+      startCancellationHeartbeat(args.kind);
       const stopCancellationHeartbeat = () => {
         if (cancellationHeartbeat) clearInterval(cancellationHeartbeat);
         cancellationHeartbeat = undefined;
@@ -1943,7 +1947,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const trace = (await installationTiming(store, { taskId: args.taskId }, async row => (await record(args.taskId, 'timing', { ...row }))));
       try { trace.signal = activityContext.current().cancellationSignal; } catch { /* direct fixture */ }
       return (await withTiming(trace, () => trace.measure('world.prepare', async () => {
-      const remote = isRemote(args.kind);
+      // Provider "Any": the router picks the provider below (compute-router.ts).
+      const routed = isAnyProvider(args.kind);
+      const remote = routed || isRemote(args.kind);
       if (store.hosted && !remote)
         throw new Error(`hosted deployments cannot run task code in the control plane (${args.kind}); select a remote runner`);
       (await record(args.taskId, 'world.provisioning', { provider: args.kind }));
@@ -2191,175 +2197,194 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // trusted provisioning and are removed before the agent starts.
         if (Object.keys(httpsTokens).length) gitCredentials = { ...gitCredentials, httpsTokens };
       }
-      const environmentSelection = projectId
-        ? (await selectProjectEnvironment(store, projectId, args.kind, executionConfig?.environment, forkCheckpoint?.environment, executionConfig?.resources))
-        : { built: false, environment: executionConfig?.environment };
-      let acquired: { leaseId: string; runnerPoolId: string } | undefined;
-      if (remote && project && deps.runners) {
-        try {
-          acquired = await timed('world.runner.wait', async () => deps.runners!.acquire({ project, taskId: args.taskId, worldId: args.taskId, provider: args.kind,
-            resources: executionConfig?.resources, work: true,
-            priority: Number((await store.getTask(args.taskId))?.params.priority ?? 0), signal: activitySignal,
-            heartbeat }));
-        } catch (error) {
-          stopCancellationHeartbeat();
-          // Managed compute that is spent or fully in use waits like a full provider limit.
-          throw capacityFailure(error) ?? error;
+      const provisionOn = async (kind: WorldKind, routedReason?: string): Promise<WorldHandle> => {
+        startCancellationHeartbeat(kind);
+        const environmentSelection = projectId
+          ? (await selectProjectEnvironment(store, projectId, kind, executionConfig?.environment, forkCheckpoint?.environment, executionConfig?.resources))
+          : { built: false, environment: executionConfig?.environment };
+        let acquired: { leaseId: string; runnerPoolId: string } | undefined;
+        if (remote && project && deps.runners) {
+          try {
+            acquired = await timed('world.runner.wait', async () => deps.runners!.acquire({ project, taskId: args.taskId, worldId: args.taskId, provider: kind,
+              resources: executionConfig?.resources, work: true,
+              priority: Number((await store.getTask(args.taskId))?.params.priority ?? 0), signal: activitySignal,
+              heartbeat }));
+          } catch (error) {
+            stopCancellationHeartbeat();
+            // Managed compute that is spent or fully in use waits like a full provider limit.
+            throw capacityFailure(error) ?? error;
+          }
         }
-      }
-      // Keep provisioning and durable registration in the same transition as
-      // allocation. The orphan reaper must not mistake an in-flight replacement
-      // for a duplicate of the previously registered sandbox.
-      const provision = async () => {
-        let world: World;
-        const generation = (((await store.currentWorld(args.taskId))?.generation ?? 0) + 1);
-        try {
-          world = await worlds.create(args.kind, {
-            taskId: args.taskId,
-            signal: activitySignal,
-            generation,
-            organizationId: project?.organizationId,
-            repo: worldSources.length === 1 ? worldSources[0] : undefined,
-            repos: worldSources.length > 1 ? worldSources : undefined,
-            scratch: developmentSources.length === 0,
-            ...(args.multiPr ? { layout: 'nested' as const } : {}),
-            base: args.base,
-            target: args.target,
-            branch: args.branch,
-            resetBranch: args.resetBranch,
-            copyGlobs: args.copyGlobs,
-            ...(remote ? { copySources: sourceResolutions.map((source) => source.localPath) } : {}),
-            gitIdentity,
-            gitCredentials,
-            ...(Object.keys(repositoryBranches).length ? { repositoryBranches } : {}),
-            ...(Object.keys(repositoryAuthorities).length ? { repositoryAuthorities } : {}),
-            ...(Object.keys(repositoryOrigins).length ? { repositoryOrigins } : {}),
-            network: executionConfig?.network,
-            environment: environmentSelection.environment,
-            resources: executionConfig?.resources,
-          });
-        } catch (error) {
-          if (acquired) (await deps.runners?.release(acquired.leaseId, args.kind));
-          stopCancellationHeartbeat();
-          if (remote && isTransportError(error)) {
-            const full = capacityFailure(error);
-            if (full) throw full;
-            const message = error instanceof Error ? error.message : String(error);
-            throw ApplicationFailure.create({
-              message,
-              type: 'world-infra',
-              nonRetryable: false,
-              cause: error instanceof Error ? error : undefined,
+        // Keep provisioning and durable registration in the same transition as
+        // allocation. The orphan reaper must not mistake an in-flight replacement
+        // for a duplicate of the previously registered sandbox.
+        const provision = async () => {
+          let world: World;
+          const generation = (((await store.currentWorld(args.taskId))?.generation ?? 0) + 1);
+          try {
+            world = await worlds.create(kind, {
+              taskId: args.taskId,
+              signal: activitySignal,
+              generation,
+              organizationId: project?.organizationId,
+              repo: worldSources.length === 1 ? worldSources[0] : undefined,
+              repos: worldSources.length > 1 ? worldSources : undefined,
+              scratch: developmentSources.length === 0,
+              ...(args.multiPr ? { layout: 'nested' as const } : {}),
+              base: args.base,
+              target: args.target,
+              branch: args.branch,
+              resetBranch: args.resetBranch,
+              copyGlobs: args.copyGlobs,
+              ...(remote ? { copySources: sourceResolutions.map((source) => source.localPath) } : {}),
+              gitIdentity,
+              gitCredentials,
+              ...(Object.keys(repositoryBranches).length ? { repositoryBranches } : {}),
+              ...(Object.keys(repositoryAuthorities).length ? { repositoryAuthorities } : {}),
+              ...(Object.keys(repositoryOrigins).length ? { repositoryOrigins } : {}),
+              network: executionConfig?.network,
+              environment: environmentSelection.environment,
+              resources: executionConfig?.resources,
             });
-          }
-          throw error;
-        }
-        try {
-          if (wikiRoot && requestedSources.includes(wikiRoot) && world.handle.repos?.length) {
-            const wikiSource = remote ? worldSources[worldSources.length - 1] : wikiRoot;
-            const wiki = wikiSource && world.handle.repos.find((repo) => sameRepository(worldRepoSource(repo), wikiSource)
-              || sameRepository(repo.repo, wikiSource));
-            if (wiki) wiki.role = 'project-wiki';
-          }
-          // A platform-owned companion must not unexpectedly move agents out of
-          // the project's only development repository. Keep `root` as the world
-          // boundary so the wiki remains accessible, and select that development
-          // checkout as the default cwd. Genuine multi-development-repo projects
-          // retain the encompassing root as their working directory.
-          const developmentRepos = worldRepos(world.handle).filter((repo) => repo.role !== 'project-wiki');
-          if (developmentRepos.length === 1) world.handle.workdir = developmentRepos[0]!.root;
-          // Provisioning may have replaced a missing base with an actual named
-          // branch. Persist that fact, so views, retries and new attempts do not
-          // reintroduce the missing name. Never let a companion wiki set task policy.
-          const adjustment = developmentRepos[0]?.branchAdjustment;
-          if (adjustment) {
-            const patch: Record<string, string> = {};
-            if (adjustment.requestedBase === args.base) {
-              world.handle.base = adjustment.base;
-              patch.base = adjustment.base;
+          } catch (error) {
+            if (acquired) (await deps.runners?.release(acquired.leaseId, kind));
+            stopCancellationHeartbeat();
+            if (remote && isTransportError(error)) {
+              const full = capacityFailure(error);
+              if (full) throw full;
+              const message = error instanceof Error ? error.message : String(error);
+              throw ApplicationFailure.create({
+                message,
+                type: 'world-infra',
+                nonRetryable: false,
+                cause: error instanceof Error ? error : undefined,
+              });
             }
-            if ((adjustment.requestedTarget ?? adjustment.requestedBase) === (args.target ?? args.base)) {
-              world.handle.target = adjustment.target;
-              patch.target = adjustment.target;
-              // Other checkouts may legitimately retain the old common target.
-              for (const repo of developmentRepos) {
-                if (repo.target && repo.target !== adjustment.target) repo.targetPinned = true;
+            throw error;
+          }
+          try {
+            if (wikiRoot && requestedSources.includes(wikiRoot) && world.handle.repos?.length) {
+              const wikiSource = remote ? worldSources[worldSources.length - 1] : wikiRoot;
+              const wiki = wikiSource && world.handle.repos.find((repo) => sameRepository(worldRepoSource(repo), wikiSource)
+                || sameRepository(repo.repo, wikiSource));
+              if (wiki) wiki.role = 'project-wiki';
+            }
+            // A platform-owned companion must not unexpectedly move agents out of
+            // the project's only development repository. Keep `root` as the world
+            // boundary so the wiki remains accessible, and select that development
+            // checkout as the default cwd. Genuine multi-development-repo projects
+            // retain the encompassing root as their working directory.
+            const developmentRepos = worldRepos(world.handle).filter((repo) => repo.role !== 'project-wiki');
+            if (developmentRepos.length === 1) world.handle.workdir = developmentRepos[0]!.root;
+            // Provisioning may have replaced a missing base with an actual named
+            // branch. Persist that fact, so views, retries and new attempts do not
+            // reintroduce the missing name. Never let a companion wiki set task policy.
+            const adjustment = developmentRepos[0]?.branchAdjustment;
+            if (adjustment) {
+              const patch: Record<string, string> = {};
+              if (adjustment.requestedBase === args.base) {
+                world.handle.base = adjustment.base;
+                patch.base = adjustment.base;
+              }
+              if ((adjustment.requestedTarget ?? adjustment.requestedBase) === (args.target ?? args.base)) {
+                world.handle.target = adjustment.target;
+                patch.target = adjustment.target;
+                // Other checkouts may legitimately retain the old common target.
+                for (const repo of developmentRepos) {
+                  if (repo.target && repo.target !== adjustment.target) repo.targetPinned = true;
+                }
+              }
+              if (taskRecord && Object.keys(patch).length) {
+                const current = await store.getTask(args.taskId);
+                // A target edit may have arrived while the clone was running.
+                if (current?.params.target && current.params.target !== args.target) delete patch.target;
+                await store.patchTaskParams(args.taskId, patch);
               }
             }
-            if (taskRecord && Object.keys(patch).length) {
-              const current = await store.getTask(args.taskId);
-              // A target edit may have arrived while the clone was running.
-              if (current?.params.target && current.params.target !== args.target) delete patch.target;
-              await store.patchTaskParams(args.taskId, patch);
-            }
-          }
 
-          if (forkCheckpoint) {
+            if (forkCheckpoint) {
+              activitySignal?.throwIfAborted();
+              await timed('world.fork-restore', () => deps.checkpoints!.applyFork(forkCheckpoint.id, world, projectId!, { signal: activitySignal }));
+              if (forkCheckpoint.ignored?.entries.length || forkCheckpoint.ignored?.truncated)
+                world.handle.warnings = [...(world.handle.warnings ?? []),
+                  'The source checkpoint excludes unmanaged Git-ignored files. Recreate caches or attach required data as a project resource.'];
+            }
+            if (projectId && deps.resources) {
+              // A sub-task starts from its parent's copy of each writable resource,
+              // saved when it was created (prepareChildTask), as it starts from its branch.
+              const revisions = { ...await parentResourceRevisions(projectId, args.taskId),
+                ...Object.fromEntries((forkCheckpoint?.resources ?? [])
+                  .map((resource) => [resource.attachmentId, resource.revisionId])) };
+              activitySignal?.throwIfAborted();
+              world.handle = await timed('world.resources', () => deps.resources!.materialize(projectId, args.taskId, world, generation, revisions,
+                { signal: activitySignal }));
+            }
+            if (projectId) {
+              activitySignal?.throwIfAborted();
+              const runtime = await activateProjectRuntime({ world, store, projectId, taskId: args.taskId,
+                selection: environmentSelection, resources: deps.resources, services: forkCheckpoint?.services, runSetupIfUnbuilt: true });
+              world.handle = runtime.handle;
+              for (const warning of runtime.warnings) (await record(args.taskId, 'world.warning', { warning }));
+            }
+            if (profile) world.handle.meta = { ...world.handle.meta,
+              gitProfile: profile.name, gitProfileScope: gitBinding.scope };
+            if (projectId) world.handle.meta = { ...world.handle.meta, projectId,
+              repositoryIds: [...linkedRepositories.map((candidate) => candidate.repository.id),
+                ...(wikiRepository ? [wikiRepository.id] : [])] };
+            if (acquired) world.handle.meta = { ...world.handle.meta, worldLeaseId: acquired.leaseId };
+            // The machine this world was made as: the lifecycle sweep resizes it
+            // when the task's Computer later asks for another (src/world/runners.ts).
+            if (remote && executionConfig) world.handle.meta = { ...world.handle.meta, computer: machineShape(executionConfig) };
+            // Where "Any" put it and why: the task page and the World prompt say so.
+            if (routedReason) world.handle.meta = { ...world.handle.meta, routed: routedReason };
+            // The ballast a full disk gives up so the agent can still start, and the first reading.
+            if (remote) (await measureWorldDisk(world, args.taskId));
             activitySignal?.throwIfAborted();
-            await timed('world.fork-restore', () => deps.checkpoints!.applyFork(forkCheckpoint.id, world, projectId!, { signal: activitySignal }));
-            if (forkCheckpoint.ignored?.entries.length || forkCheckpoint.ignored?.truncated)
-              world.handle.warnings = [...(world.handle.warnings ?? []),
-                'The source checkpoint excludes unmanaged Git-ignored files. Recreate caches or attach required data as a project resource.'];
-          }
-          if (projectId && deps.resources) {
-            // A sub-task starts from its parent's copy of each writable resource,
-            // saved when it was created (prepareChildTask), as it starts from its branch.
-            const revisions = { ...await parentResourceRevisions(projectId, args.taskId),
-              ...Object.fromEntries((forkCheckpoint?.resources ?? [])
-                .map((resource) => [resource.attachmentId, resource.revisionId])) };
+            if (projectId) {
+              world.handle = (await store.registerWorld(world.handle, projectId, {
+                runnerPoolId: acquired?.runnerPoolId ?? (remote ? `managed-${kind}` : 'local'),
+                environmentDigest: environmentSelection.digest
+                  ?? (remote ? String(world.handle.meta?.environmentArtifact
+                    ?? `${kind}:${executionConfig?.environment?.flavor ?? 'headless'}`) : 'karmax-local'),
+              })) as WorldHandle;
+            }
             activitySignal?.throwIfAborted();
-            world.handle = await timed('world.resources', () => deps.resources!.materialize(projectId, args.taskId, world, generation, revisions,
-              { signal: activitySignal }));
+            (await record(args.taskId, 'world.created', { handle: world.handle }));
+            if (forkPlan) (await record(args.taskId, 'world.forked', { sourceTaskId: forkPlan.taskId,
+              base: args.base, checkpointId: forkCheckpoint?.id, unpublished: Boolean(forkCheckpoint) }));
+            (await record(args.taskId, 'world.ready', { provider: world.handle.kind, generation: world.handle.generation ?? 1 }));
+            for (const warning of world.handle.warnings ?? []) (await record(args.taskId, 'world.warning', { warning }));
+          } catch (error) {
+            // `world` is still live on this path — pass it, or teardown addresses the
+            // HOST daemon while the containers live inside the world (a silent no-op).
+            await deps.resources?.release(world.handle, world).catch(() => undefined);
+            await destroyWorldServices(args.taskId, world).catch(() => undefined);
+            await world.destroy().catch(() => undefined);
+            if (acquired) (await deps.runners?.release(acquired.leaseId, kind));
+            stopCancellationHeartbeat();
+            throw error;
           }
-          if (projectId) {
-            activitySignal?.throwIfAborted();
-            const runtime = await activateProjectRuntime({ world, store, projectId, taskId: args.taskId,
-              selection: environmentSelection, resources: deps.resources, services: forkCheckpoint?.services, runSetupIfUnbuilt: true });
-            world.handle = runtime.handle;
-            for (const warning of runtime.warnings) (await record(args.taskId, 'world.warning', { warning }));
-          }
-          if (profile) world.handle.meta = { ...world.handle.meta,
-            gitProfile: profile.name, gitProfileScope: gitBinding.scope };
-          if (projectId) world.handle.meta = { ...world.handle.meta, projectId,
-            repositoryIds: [...linkedRepositories.map((candidate) => candidate.repository.id),
-              ...(wikiRepository ? [wikiRepository.id] : [])] };
-          if (acquired) world.handle.meta = { ...world.handle.meta, worldLeaseId: acquired.leaseId };
-          // The machine this world was made as: the lifecycle sweep resizes it
-          // when the task's Computer later asks for another (src/world/runners.ts).
-          if (remote && executionConfig) world.handle.meta = { ...world.handle.meta, computer: machineShape(executionConfig) };
-          // The ballast a full disk gives up so the agent can still start, and the first reading.
-          if (remote) (await measureWorldDisk(world, args.taskId));
-          activitySignal?.throwIfAborted();
-          if (projectId) {
-            world.handle = (await store.registerWorld(world.handle, projectId, {
-              runnerPoolId: acquired?.runnerPoolId ?? (remote ? `managed-${args.kind}` : 'local'),
-              environmentDigest: environmentSelection.digest
-                ?? (remote ? String(world.handle.meta?.environmentArtifact
-                  ?? `${args.kind}:${executionConfig?.environment?.flavor ?? 'headless'}`) : 'karmax-local'),
-            })) as WorldHandle;
-          }
-          activitySignal?.throwIfAborted();
-          (await record(args.taskId, 'world.created', { handle: world.handle }));
-          if (forkPlan) (await record(args.taskId, 'world.forked', { sourceTaskId: forkPlan.taskId,
-            base: args.base, checkpointId: forkCheckpoint?.id, unpublished: Boolean(forkCheckpoint) }));
-          (await record(args.taskId, 'world.ready', { provider: world.handle.kind, generation: world.handle.generation ?? 1 }));
-          for (const warning of world.handle.warnings ?? []) (await record(args.taskId, 'world.warning', { warning }));
-        } catch (error) {
-          // `world` is still live on this path — pass it, or teardown addresses the
-          // HOST daemon while the containers live inside the world (a silent no-op).
-          await deps.resources?.release(world.handle, world).catch(() => undefined);
-          await destroyWorldServices(args.taskId, world).catch(() => undefined);
-          await world.destroy().catch(() => undefined);
-          if (acquired) (await deps.runners?.release(acquired.leaseId, args.kind));
           stopCancellationHeartbeat();
-          throw error;
-        }
-        stopCancellationHeartbeat();
-        return world.handle;
+          return world.handle;
+        };
+        try {
+          return await (worlds.withOperation ? worlds.withOperation(args.taskId, provision) : provision());
+        } finally { stopCancellationHeartbeat(); }
       };
+      if (!routed) return provisionOn(args.kind);
+      // "Any": the first candidate with room takes it; a full one gives way to
+      // the next, and the task waits only when every one is full.
+      const router = deps.providerConnections?.list && deps.providerConnections.managedConnections
+        ? new ComputeRouter(store, deps.providerConnections as RouterConnections) : undefined;
+      if (!router || !project) throw new Error('provider "Any" needs a project and connected computers');
+      const route = await router.route(organizationId, executionConfig, undefined);
       try {
-        return await (worlds.withOperation ? worlds.withOperation(args.taskId, provision) : provision());
-      } finally { stopCancellationHeartbeat(); }
+        return (await router.run(organizationId, route, (candidate, reason) => provisionOn(candidate.provider as WorldKind, reason),
+          async (decision) => { await record(args.taskId, 'world.routed', { ...decision }); })).value;
+      } catch (error) {
+        stopCancellationHeartbeat();
+        throw capacityFailure(error) ?? error;
+      }
       })));
       } finally { stopCancellationHeartbeat(); }
     },
@@ -3202,17 +3227,20 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // the task's own Computer now names if its world still runs elsewhere.
       let otherProviders: Array<{ provider: string; diskGb?: number }> = [];
       let moveTo: string | undefined;
+      let anyProvider = false;
       try {
         const stored = (await store.currentWorld(args.taskId)) as WorldHandle | undefined;
         if (stored?.meta?.computer && (stored.generation ?? 1) === (args.worldHandle.generation ?? 1))
-          promptWorld = { ...args.worldHandle, meta: { ...args.worldHandle.meta, computer: stored.meta.computer } };
+          promptWorld = { ...args.worldHandle, meta: { ...args.worldHandle.meta, computer: stored.meta.computer,
+            ...(stored.meta.routed ? { routed: stored.meta.routed } : {}) } };
         // Only a cloud world has a machine to name; the task was read once above (RT-14).
         const project = promptWorld.meta?.computer ? (await store.getProject(args.task.projectId)) : undefined;
-        if (project) requestedComputer = machineShape(applyComputer(await store.effectiveProjectConfig(project),
-          normalizeComputer(preparationTask?.params.computer)));
+        const effective = project ? applyComputer(await store.effectiveProjectConfig(project), normalizeComputer(preparationTask?.params.computer)) : undefined;
+        if (effective) requestedComputer = machineShape(effective);
+        anyProvider = isAnyProvider(effective?.worldProvider);
         if (project?.organizationId) {
           const own = normalizeComputer(preparationTask?.params.computer)?.provider;
-          if (own && own !== promptWorld.kind) moveTo = own;
+          if (own && own !== promptWorld.kind && !isAnyProvider(own)) moveTo = own;
           const ownConnections = await store.listWorldProviderConnections(project.organizationId);
           // Managed compute offers the providers the organization has not connected itself.
           const connections = [...ownConnections, ...(await store.listWorldProviderConnections(MANAGED_COMPUTE))
@@ -3241,6 +3269,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         ...(turnDisk?.check ? { disk: turnDisk.check.disk } : {}),
         ...(otherProviders.length ? { providers: otherProviders } : {}),
         ...(moveTo ? { moveTo } : {}),
+        ...(anyProvider ? { anyProvider } : {}),
         ...(turnDisk?.limits ? { limits: turnDisk.limits } : {}),
         ...(siblings.length ? { siblings } : {}),
         globalInstructions: (globalInstructions ?? '') + forkContext + agentForkContext + attemptContext + paymentContext,

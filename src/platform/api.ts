@@ -46,9 +46,10 @@ import { chatThreadKey } from '../integrations/chat-replies.js';
 import { pullRequestOf } from '../domain/pull-requests.js';
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult, EvalContext, TaskGroup, forClauseValues, attentionCandidates } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
-import { providerLabel } from '../domain/computer-limits.js';
+import { assertComputerFits, providerLabel } from '../domain/computer-limits.js';
+import { MANAGED_COMPUTE } from '../world/connections.js';
 import { taskProvider } from '../world/task-provider.js';
-import { applyComputer, assertInFlightComputerEdit, computerOf, computerResizable, describeMachine, machineShape, normalizeComputer, sameMachine,
+import { ANY_PROVIDER, applyComputer, assertInFlightComputerEdit, computerOf, computerResizable, describeMachine, isAnyProvider, machineShape, normalizeComputer, sameMachine,
   type ComputerSpec, type MachineShape } from '../domain/computer.js';
 import { resolveParamsLayers, assembleTaskInput, projectSettingsFor, globalSettingsFor, effectiveRepos, ValueMap } from './params.js';
 import { splitSharedSettings } from '../domain/shared-settings.js';
@@ -3475,12 +3476,18 @@ export class KarmaxApi {
       // allows: the usage meter and the Out of disk action (wiki features/computers).
       const usage = await this.computerUsage(taskId, view.outOfDisk).catch(() => undefined);
       if (usage) view = { ...view, usage };
-      // A cloud machine or disk held while the task does not work: Free computer.
-      if (view.status !== 'active' && rec && !rec.params?.draft) {
+      // Where its computer is, and a cloud machine or disk held while the
+      // task does not work (Free computer).
+      if (rec && !rec.params?.draft) {
         const held = await this.deps.store.worldStateSnapshot(taskId).catch(() => undefined);
         const world = held && ['ready', 'parked', 'degraded'].includes(held.state) ? await this.deps.store.currentWorld(taskId) : undefined;
-        if (world && held && isRemoteWorldKind(world.kind))
-          view = { ...view, heldComputer: { provider: world.kind, state: held.state as 'ready' | 'parked' | 'degraded' } };
+        if (world && held && isRemoteWorldKind(world.kind)) {
+          const machine = (world.meta?.machine ?? world.meta?.computer) as MachineShape | undefined;
+          view = { ...view, runsOn: { provider: world.kind, ...(world.meta?.funding === 'managed' ? { managed: true } : {}),
+            ...(machine ? { machine } : {}), ...(typeof world.meta?.routed === 'string' ? { routed: world.meta.routed } : {}) } };
+          if (view.status !== 'active')
+            view = { ...view, heldComputer: { provider: world.kind, state: held.state as 'ready' | 'parked' | 'degraded' } };
+        }
       }
       if (await this.deps.store.kvGet(`project-transfer-history:${taskId}`)) {
         const { world, worldPath, worldAvailable, worldDesktop, worldProvider, ...history } = view;
@@ -7042,6 +7049,13 @@ Act according to your Avatar instructions. When ready, call platform_request POS
     }
   }
 
+  /** What the account a world runs on allows: the one it was made on
+   * (`meta.funding`), whatever the organization connected since. */
+  private async worldLimits(world: { kind: string; meta?: Record<string, unknown> }, organizationId: string) {
+    const scope = world.meta?.funding === 'managed' ? MANAGED_COMPUTE : organizationId;
+    return (await this.deps.providerConnections?.limits?.(scope, world.kind)) ?? ({} as import('../domain/computer-limits.js').ComputerLimits);
+  }
+
   /** Grow a running VM world's disk now (its CPU and memory follow at the next
    * start), recording what changed; undefined for providers that cannot. */
   private async resizeInPlace(taskId: string): Promise<{ inPlace: boolean;
@@ -7050,6 +7064,8 @@ Act according to your Avatar instructions. When ready, call platform_request POS
     const provider = world && this.deps.worlds ? (() => { try { return this.deps.worlds!.get(world.kind); } catch { return undefined; } })() : undefined;
     if (!world || !provider?.resize) return { inPlace: false };
     const change = await this.computerChange(taskId);
+    // Another provider: the world moves at its next park instead.
+    if (change?.provider) return { inPlace: false };
     if ((await this.deps.store.worldState(taskId)) !== 'ready' || !change?.to.diskGb || change.to.diskGb <= (change.from.diskGb ?? 0))
       return { inPlace: true };
     return { inPlace: true, grown: await this.deps.worlds!.withOperation(taskId, async () => {
@@ -7069,10 +7085,20 @@ Act according to your Avatar instructions. When ready, call platform_request POS
     // The task's metadata, not its conversation: a task view is read often.
     const task = await this.deps.store.taskMetadataAsync(taskId);
     const project = task && (await this.deps.store.getProject(task.projectId));
-    let own: ComputerSpec | undefined;
-    try { own = normalizeComputer(task?.params?.computer); } catch { own = undefined; }
-    const provider = project ? own?.provider ?? (await this.deps.store.effectiveProjectConfig(project)).worldProvider : undefined;
-    const maxDiskGb = provider ? (await this.deps.providerConnections?.limits?.(project!.organizationId ?? 'org_personal', provider))?.diskGb : undefined;
+    // Where it runs now, on the account it was made on; before it has a
+    // world, the provider its Computer names.
+    const world = await this.deps.store.currentWorld(taskId);
+    let provider: string | undefined;
+    let maxDiskGb: number | undefined;
+    if (project && world && isRemoteWorldKind(world.kind)) {
+      provider = world.kind;
+      maxDiskGb = (await this.worldLimits(world, project.organizationId ?? 'org_personal')).diskGb;
+    } else if (project) {
+      let own: ComputerSpec | undefined;
+      try { own = normalizeComputer(task?.params?.computer); } catch { own = undefined; }
+      provider = own?.provider ?? (await this.deps.store.effectiveProjectConfig(project)).worldProvider;
+      maxDiskGb = provider ? (await this.deps.providerConnections?.limits?.(project.organizationId ?? 'org_personal', provider))?.diskGb : undefined;
+    }
     return { at: reading?.at ?? 0, ...(provider ? { provider } : {}), ...(reading?.disk ? { disk: reading.disk } : {}),
       ...(reading?.memory ? { memory: reading.memory } : {}), ...(maxDiskGb != null ? { maxDiskGb } : {}) };
   }
@@ -7090,8 +7116,13 @@ Act according to your Avatar instructions. When ready, call platform_request POS
     const project = (await this.deps.store.getProject(task.projectId));
     if (!project) throw new NotFoundError(`no project ${task.projectId}`);
     const config = await this.deps.store.effectiveTaskConfig(project, taskId);
-    const provider = config.worldProvider ?? 'worktree';
-    const maxDiskGb = (await this.deps.providerConnections?.limits?.(project.organizationId ?? 'org_personal', provider))?.diskGb;
+    // The disk grows where the task runs (a world on "Any" stays put; more
+    // than its account allows is a move, made from Parameters).
+    const world = await this.deps.store.currentWorld(taskId);
+    const provider = world && isRemoteWorldKind(world.kind) ? world.kind : config.worldProvider ?? 'worktree';
+    const maxDiskGb = world && isRemoteWorldKind(world.kind)
+      ? (await this.worldLimits(world, project.organizationId ?? 'org_personal')).diskGb
+      : (await this.deps.providerConnections?.limits?.(project.organizationId ?? 'org_personal', provider))?.diskGb;
     if (maxDiskGb == null) throw new ValidationError('this task\'s computer has no provider disk to grow');
     const usage = await this.computerUsage(taskId, true).catch(() => undefined);
     const current = usage?.disk ? Math.round(usage.disk.totalMb / 1024) : config.resources?.diskGb;
@@ -7189,10 +7220,17 @@ Act according to your Avatar instructions. When ready, call platform_request POS
     const task = world && (await this.deps.store.getTask(taskId));
     const project = task && (await this.deps.store.getProject(task.projectId));
     if (!world || !project) return undefined;
-    const to = machineShape(await this.deps.store.effectiveTaskConfig(project, taskId));
+    const config = await this.deps.store.effectiveTaskConfig(project, taskId);
+    const to = machineShape(config);
     const from = (world.meta?.computer as MachineShape | undefined) ?? to;
     const target = await taskProvider(this.deps.store, taskId);
-    const provider = target && target !== world.kind ? { from: world.kind, to: target } : undefined;
+    let provider = target && target !== world.kind ? { from: world.kind, to: target } : undefined;
+    // "Any" keeps a world where it runs until it asks for more than that
+    // account allows: then it moves to whatever fits (compute-router.ts).
+    if (!provider && !target && isAnyProvider(config.worldProvider) && isRemoteWorldKind(world.kind)) {
+      try { assertComputerFits(to, await this.worldLimits(world, project.organizationId ?? 'org_personal'), world.kind); }
+      catch { provider = { from: world.kind, to: ANY_PROVIDER }; }
+    }
     return sameMachine(from, to) && !provider ? undefined : { from, to, ...(provider ? { provider } : {}) };
   }
 
@@ -8128,7 +8166,7 @@ function uniqueFileRefs(files: FileRef[]): FileRef[] {
   });
 }
 
-const EXECUTION_POLICY_KEYS = ['worldProvider', 'runnerPoolId', 'resources', 'network', 'monthlyBudgetMicros', 'hibernateAfterMs'] as const;
+const EXECUTION_POLICY_KEYS = ['worldProvider', 'runnerPoolId', 'resources', 'network', 'monthlyBudgetMicros', 'hibernateAfterMs', 'region'] as const;
 function executionConfigOf(config: import('../domain/types.js').ProjectConfig): Partial<OrganizationExecutionPolicy> {
   return Object.fromEntries(EXECUTION_POLICY_KEYS.filter((key) => config[key] !== undefined).map((key) => [key, config[key]]));
 }
@@ -8157,7 +8195,8 @@ type ComputerChange = { from: MachineShape; to: MachineShape; provider?: { from:
 /** What an agent is told when its task's Computer changes under it. */
 function computerChangeNotice(change: ComputerChange, inPlace = false): string {
   if (change.provider) inPlace = false; // a move always goes through the checkpoint
-  const where = (provider: string | undefined) => (provider ? ` on ${providerLabel(provider)}` : '');
+  const where = (provider: string | undefined) => (!provider ? '' : isAnyProvider(provider)
+    ? ' on whichever provider fits it (this one does not)' : ` on ${providerLabel(provider)}`);
   return `[${BRAND} computer change]\n\nThis task's computer is now ${describeMachine(change.to)}${where(change.provider?.to)}; `
     + `you are still on ${describeMachine(change.from)}${where(change.provider?.from)}. `
     + 'You move to it when this task parks: end your turn with pause(3) without jobs. A pause that waits on jobs keeps this machine, '

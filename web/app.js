@@ -1646,25 +1646,60 @@ const localWorldPath = (v) => (hostLocal() && v.worldPath) || '';
 // Parameters tab. The value is sparse ({provider, cpu, memoryMb, diskGb, flavor,
 // hibernateAfterDays, network}); the block shows the effective machine and a
 // form stores only what differs from what it inherits.
-const COMPUTER_PROVIDER_LABELS = { e2b: 'E2B', daytona: 'Daytona', fly: 'Fly.io', hetzner: 'Hetzner', aws: 'AWS', gcp: 'Google Cloud',
+const COMPUTER_PROVIDER_LABELS = { any: 'Any', e2b: 'E2B', daytona: 'Daytona', fly: 'Fly.io', hetzner: 'Hetzner', aws: 'AWS', gcp: 'Google Cloud',
   worktree: 'This machine', container: 'Docker container' };
+const CLOUD_COMPUTERS = ['e2b', 'daytona', 'fly', 'hetzner', 'aws', 'gcp'];
+const COMPUTER_REGION_LABELS = { eu: 'EU', us: 'US' };
+// Provider "Any" (wiki features/compute-routing): the cloud accounts it can
+// choose among — the organization's own, and the managed compute it may use.
+const computerReach = () => (S.worldProviderConnections || [])
+  .filter((c) => c.enabled && c.credentialConfigured && CLOUD_COMPUTERS.includes(c.provider));
+// "E2B (yours), Hetzner, AWS": what Any can reach, own accounts first.
+function computerReachText(reach = computerReach()) {
+  const names = [...reach].sort((a, b) => Number(!!a.managed) - Number(!!b.managed))
+    .map((c) => `${COMPUTER_PROVIDER_LABELS[c.provider] || c.provider}${c.managed ? '' : ' (yours)'}`);
+  return names.length ? names.join(', ') : 'nothing yet: connect a computer in Settings → Resources';
+}
+const ANY_TIP = 'Runs on the first that fits and has room: your own accounts first, then the cheapest. A full one gives way to the next.';
 // What a machine gets when the Computer asks for nothing more (disk is total GB).
 const COMPUTER_DEFAULTS = { e2b: { cpu: 2, memoryMb: 2048, diskGb: 22 }, daytona: { cpu: 2, memoryMb: 4096, diskGb: 8 },
   fly: { cpu: 2, memoryMb: 2048, diskGb: 20 }, hetzner: { cpu: 2, memoryMb: 2048, diskGb: 20 }, aws: { cpu: 2, memoryMb: 2048, diskGb: 20 },
   gcp: { cpu: 2, memoryMb: 2048, diskGb: 20 } };
 // What a computer on the organization's provider account may be: the
 // connection's limits, learned from the provider (src/domain/computer-limits.ts).
-const computerLimitsFor = (provider) => (S.worldProviderConnections || []).find((c) => c.provider === provider)?.limits || null;
+// For "Any", each size is the largest some reachable account allows.
+function computerLimitsFor(provider) {
+  if (provider !== 'any') return (S.worldProviderConnections || []).find((c) => c.provider === provider)?.limits || null;
+  const reach = computerReach();
+  if (!reach.length) return null;
+  const out = { source: {} };
+  for (const key of ['cpu', 'memoryMb', 'diskGb']) {
+    const values = reach.map((c) => c.limits?.[key]);
+    if (values.every((value) => value != null)) { out[key] = Math.max(...values); out.source[key] = 'provider'; }
+  }
+  return out;
+}
 // What else the chosen provider offers (desktop, outbound allowlist); a
-// provider the page knows nothing about (this machine) offers everything.
-const computerFeaturesFor = (provider) => ({ desktop: true, allowlist: true,
-  ...((S.worldProviderConnections || []).find((c) => c.provider === provider)?.features) });
+// provider the page knows nothing about (this machine) offers everything,
+// and "Any" whatever one of its accounts offers.
+function computerFeaturesFor(provider) {
+  if (provider === 'any') {
+    const reach = computerReach();
+    return reach.length ? { desktop: reach.some((c) => c.features?.desktop !== false), allowlist: reach.some((c) => c.features?.allowlist !== false) }
+      : { desktop: true, allowlist: true };
+  }
+  return { desktop: true, allowlist: true, ...((S.worldProviderConnections || []).find((c) => c.provider === provider)?.features) };
+}
 // "This E2B account allows up to 29 GB" — the hover text of each size.
 function computerLimitTip(provider, limits, key) {
   const value = limits?.[key];
   if (value == null) return '';
   const label = COMPUTER_PROVIDER_LABELS[provider] || provider;
   const amount = key === 'cpu' ? `${value} CPU` : `${key === 'memoryMb' ? gbOf(value) : value} GB`;
+  if (provider === 'any') {
+    const where = computerReach().filter((c) => c.limits?.[key] === value).map((c) => COMPUTER_PROVIDER_LABELS[c.provider] || c.provider);
+    return `Up to ${amount}${where.length ? ` (${where.join(', ')})` : ''}`;
+  }
   return limits.source?.[key] === 'default' ? `${label} allows up to ${amount} unless its support raised the limit`
     : `This ${label} account allows up to ${amount}`;
 }
@@ -1686,7 +1721,9 @@ function computerProviderOptions(current, inFlight = false) {
   const connected = (S.worldProviderConnections || [])
     .filter((c) => c.enabled && c.credentialConfigured)
     .map((c) => c.provider);
-  return [...new Set([...connected, ...local, ...(current ? [current] : [])])];
+  // "Any" first: tavya chooses among the cloud computers (hosted's default).
+  const any = S.meta?.hosted || connected.some((provider) => CLOUD_COMPUTERS.includes(provider)) || current === 'any' ? ['any'] : [];
+  return [...new Set([...any, ...connected, ...local, ...(current ? [current] : [])])];
 }
 const gbOf = (mb) => (mb == null ? '' : String(Math.round((mb / 1024) * 100) / 100));
 function computerBlockHtml(name, value, inherited, opts = {}) {
@@ -1702,7 +1739,8 @@ function computerBlockHtml(name, value, inherited, opts = {}) {
   const sizeAttrs = (key) => `max="${esc(size[key].max)}" placeholder="${esc(size[key].placeholder)}"`;
   const tip = (key) => (size[key].title ? ` title="${esc(size[key].title)}"` : '');
   const body = `<div class="computer-controls">
-      <select class="cf-provider" aria-label="Provider">${computerProviderOptions(provider, opts.inFlight).map((p) => `<option value="${esc(p)}" ${p === provider ? 'selected' : ''}>${esc(COMPUTER_PROVIDER_LABELS[p] || p)}</option>`).join('')}</select>
+      <span class="computer-pick"><select class="cf-provider" aria-label="Provider">${computerProviderOptions(provider, opts.inFlight).map((p) => `<option value="${esc(p)}" ${p === provider ? 'selected' : ''}>${esc(COMPUTER_PROVIDER_LABELS[p] || p)}</option>`).join('')}</select>
+      <span class="cf-reach"${provider === 'any' ? '' : ' hidden'}>${policyTip(`Any: ${computerReachText()}. ${ANY_TIP}`)}</span></span>
       <label class="computer-size"${tip('cpu')}><input class="cf-cpu" type="number" min="1" ${sizeAttrs('cpu')} step="1" inputmode="numeric" value="${esc(v.cpu ?? '')}" aria-label="CPU"><span>CPU</span></label>
       <label class="computer-size"${tip('memory')}><input class="cf-memory" type="number" min="0.5" ${sizeAttrs('memory')} step="0.5" inputmode="decimal" value="${esc(gbOf(v.memoryMb))}" aria-label="Memory in GB"><span>GB RAM</span></label>
       <label class="computer-size"${tip('disk')}><input class="cf-disk" type="number" min="1" ${sizeAttrs('disk')} step="1" inputmode="numeric" value="${esc(v.diskGb ?? '')}" aria-label="Disk in GB"><span>GB disk</span></label>
@@ -1710,6 +1748,8 @@ function computerBlockHtml(name, value, inherited, opts = {}) {
     <details class="computer-more"${opts.open ? ' open' : ''}><summary>More</summary><div class="computer-more-grid">
       <label class="form-row"${features.desktop ? '' : ' hidden'}><span>Experience ${policyTip('Desktop adds a screen you can watch and take over.')}</span><select class="cf-flavor" ${fixed}>
         <option value="headless" ${v.flavor !== 'desktop' ? 'selected' : ''}>Headless</option><option value="desktop" ${v.flavor === 'desktop' ? 'selected' : ''}>Desktop</option></select></label>
+      <label class="form-row"${provider === 'any' ? '' : ' hidden'}><span>Region ${policyTip('Where Any may put the computer, for data that must stay there.')}</span><select class="cf-region">
+        <option value="" ${v.region ? '' : 'selected'}>Anywhere</option>${Object.entries(COMPUTER_REGION_LABELS).map(([key, label]) => `<option value="${key}" ${v.region === key ? 'selected' : ''}>${label}</option>`).join('')}</select></label>
       <label class="form-row"><span>Hibernate after (days) ${policyTip('How long a paused task keeps its computer before packing it away. Waking it afterwards takes a little longer.')}</span>
         <input class="cf-hibernate" type="number" min="0" max="365" step="1" value="${esc(v.hibernateAfterDays ?? '')}" placeholder="7"></label>
       <label class="form-row"${features.allowlist ? '' : ' hidden'}><span>Outbound network ${policyTip('Agents normally need package registries, documentation, search and APIs. Allowlist only is for organizations that maintain an egress policy.')}</span><select class="cf-network" ${fixed}>
@@ -1726,7 +1766,7 @@ function computerBlockHtml(name, value, inherited, opts = {}) {
 // when the task pauses with nothing running (wiki features/computers).
 function computerPendingChip(change) {
   if (!change) return '';
-  const on = (provider) => (provider ? ` on ${COMPUTER_PROVIDER_LABELS[provider] || provider}` : '');
+  const on = (provider) => (!provider ? '' : provider === 'any' ? ' on another provider that fits' : ` on ${COMPUTER_PROVIDER_LABELS[provider] || provider}`);
   const tip = `Still ${describeMachineShape(change.from)}${on(change.provider?.from)}. Moves to ${describeMachineShape(change.to)}${on(change.provider?.to)} when the task next pauses with nothing running.`;
   return `<button type="button" class="chip computer-pending" title="${esc(tip)}" aria-label="${esc(tip)}">Moves at next pause</button>`;
 }
@@ -1745,6 +1785,16 @@ function diskMeter(v) {
   ].join(' · ') + (usage.maxDiskGb != null && label ? `. This ${label} account allows up to ${usage.maxDiskGb} GB of disk.` : '.');
   const ratio = disk.usedMb / disk.totalMb;
   return `<button type="button" class="disk-meter${ratio >= 0.9 ? ' warn' : ''}" title="${esc(tip)}" aria-label="${esc(tip)}" style="--used:${Math.min(100, Math.round(ratio * 100))}%">Disk ${Math.round(disk.usedMb / 1024)}/${Math.round(disk.totalMb / 1024)} GB</button>`;
+}
+// "AWS · 2 CPU · 4 GB · 100 GB disk": where the task's computer is; for
+// provider "Any", why it went there (wiki features/compute-routing).
+function runsOnChip(v) {
+  const at = v?.runsOn;
+  if (!at) return '';
+  const label = COMPUTER_PROVIDER_LABELS[at.provider] || at.provider;
+  const tip = [`Runs on ${at.managed ? `${siteName()}’s ${label}, from this organization’s compute` : `your ${label} account`}.`,
+    at.routed ? `Chosen by Any: ${at.routed}.` : ''].filter(Boolean).join(' ');
+  return `<span class="runs-on" title="${esc(tip)}" aria-label="${esc(tip)}">${esc([label, ...(at.machine ? [describeMachineShape(at.machine)] : [])].join(' · '))}</span>`;
 }
 // Free computer: a task that is not working gives back the machine and disk
 // it holds at its provider, which count against that account's limits.
@@ -1782,6 +1832,8 @@ function readComputerBlock(box) {
   const features = computerFeaturesFor(value('.cf-provider'));
   const out = {
     provider: value('.cf-provider') || undefined,
+    // A region is what "Any" may choose among; a named provider runs where its account is.
+    region: value('.cf-provider') === 'any' ? value('.cf-region') || undefined : undefined,
     cpu: number('.cf-cpu'),
     memoryMb: memory === undefined ? undefined : Math.round(memory * 1024),
     diskGb: number('.cf-disk'),
@@ -1809,6 +1861,7 @@ function resetComputerBlock(box, attr = 'data-inherit') {
   set('.cf-cpu', inh.cpu); set('.cf-memory', gbOf(inh.memoryMb)); set('.cf-disk', inh.diskGb);
   set('.cf-flavor', inh.flavor || 'headless'); set('.cf-hibernate', inh.hibernateAfterDays);
   set('.cf-network', inh.network?.unrestricted === false ? 'restricted' : 'unrestricted');
+  set('.cf-region', inh.region);
   set('.cf-domains', (inh.network?.allowDomains || []).join(', ')); set('.cf-cidrs', (inh.network?.allowCidrs || []).join(', '));
   syncComputerBlock(box);
   box.dispatchEvent(new Event('change', { bubbles: true }));
@@ -1825,6 +1878,9 @@ function syncComputerBlock(box) {
   }
   const features = computerFeaturesFor(provider);
   const row = (selector) => box.querySelector(selector)?.closest('label');
+  if (row('.cf-region')) row('.cf-region').hidden = provider !== 'any';
+  const reach = box.querySelector('.cf-reach');
+  if (reach) reach.hidden = provider !== 'any';
   if (row('.cf-flavor')) row('.cf-flavor').hidden = !features.desktop;
   if (row('.cf-network')) row('.cf-network').hidden = !features.allowlist;
   const allowlist = box.querySelector('.cf-allowlist');
@@ -1839,7 +1895,8 @@ document.addEventListener('change', (event) => {
 function computerSummary(value) {
   const v = value || {};
   return [COMPUTER_PROVIDER_LABELS[v.provider] || v.provider, v.cpu != null ? `${v.cpu} CPU` : '', v.memoryMb != null ? `${gbOf(v.memoryMb)} GB` : '',
-    v.diskGb != null ? `${v.diskGb} GB disk` : '', v.flavor === 'desktop' ? 'desktop' : ''].filter(Boolean).join(' · ') || '(default)';
+    v.diskGb != null ? `${v.diskGb} GB disk` : '', v.flavor === 'desktop' ? 'desktop' : '', v.region ? COMPUTER_REGION_LABELS[v.region] : '']
+    .filter(Boolean).join(' · ') || '(default)';
 }
 
 function schemaFor(workflow) {
@@ -11979,6 +12036,7 @@ function taskRail(v, rec = taskRecord(v.taskId)) {
     mergeQueueBadge(v),
     v.landing?.provider && v.landing.provider !== 'none'
       ? `<span title="${esc(v.landing.detail || 'Provider landing state')}">landing: ${esc(v.landing.provider)}</span>` : '',
+    runsOnChip(v),
     diskMeter(v),
     freeComputerButton(v),
   ].filter(Boolean).join('');
@@ -22935,8 +22993,22 @@ function heldComputerRow(held) {
     ${held.releasable ? '<button class="btn sm computer-free" type="button" title="Delete its machine and disk now. Its files are saved and come back if it runs again; installed packages and running programs do not.">Free</button>' : ''}
   </div>`;
 }
+// The first row: what provider "Any" (the default) can choose among.
+function computerAnyRow(connections) {
+  const reach = connections.filter((c) => c.enabled && c.credentialConfigured && CLOUD_COMPUTERS.includes(c.provider));
+  const most = {};
+  for (const key of ['cpu', 'memoryMb', 'diskGb']) {
+    const values = reach.map((c) => c.limits?.[key]);
+    if (reach.length && values.every((value) => value != null)) most[key] = Math.max(...values);
+  }
+  const size = [most.cpu != null ? `${most.cpu} CPU` : '', most.memoryMb != null ? `${gbOf(most.memoryMb)} GB` : '',
+    most.diskGb != null ? `${most.diskGb} GB disk` : ''].filter(Boolean).join(' · ');
+  return `<div class="computer-any"><b>Any</b>${policyTip(`Tasks whose provider is Any. ${ANY_TIP}`)}
+    <span class="setting-muted computer-reach">${esc(computerReachText(reach))}</span>
+    ${size ? `<span class="setting-muted computer-limits" title="The most one computer may have on any of them">≤ ${esc(size)}</span>` : ''}</div>`;
+}
 function computersMarkup(connections, held = []) {
-  return `<div class="computer-providers">${Object.entries(COMPUTER_PROVIDERS).map(([id, info]) => {
+  return `<div class="computer-providers">${computerAnyRow(connections)}${Object.entries(COMPUTER_PROVIDERS).map(([id, info]) => {
     const connection = connections.find((candidate) => candidate.provider === id);
     const state = computerConnectionState(connection);
     const mine = held.filter((computer) => computer.provider === id);

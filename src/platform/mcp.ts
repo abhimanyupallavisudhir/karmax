@@ -432,7 +432,7 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
     { description: 'Set organization execution defaults or sparse project overrides. Null project values restore organization inheritance.', inputSchema: {
       organizationId: z.string(), projectId: z.string().optional(),
       worldProvider: z.string().nullish(), runnerPoolId: z.string().nullish(),
-      environmentFlavor: z.enum(['headless', 'desktop']).optional(),
+      environmentFlavor: z.enum(['headless', 'desktop']).optional(), region: z.enum(['eu', 'us']).nullish(),
       cpu: z.number().positive().optional(), memoryMb: z.number().int().min(128).optional(), diskGb: z.number().int().min(1).optional(), gpu: z.number().nonnegative().optional(),
       unrestrictedInternet: z.boolean().optional(), allowDomains: z.array(z.string()).optional(), allowCidrs: z.array(z.string()).optional(),
       monthlyBudgetUsd: z.number().nonnegative().nullish(), hibernateAfterDays: z.number().nonnegative().nullish(),
@@ -442,6 +442,7 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
       if (a.worldProvider !== undefined) policy.worldProvider = a.worldProvider;
       if (a.runnerPoolId !== undefined) policy.runnerPoolId = a.runnerPoolId;
       if (a.environmentFlavor !== undefined) policy.environment = { flavor: a.environmentFlavor };
+      if (a.region !== undefined) policy.region = a.region;
       if (a.monthlyBudgetUsd !== undefined) policy.monthlyBudgetMicros = a.monthlyBudgetUsd == null ? null : Math.round(a.monthlyBudgetUsd * 1e6);
       if (a.hibernateAfterDays !== undefined) policy.hibernateAfterMs = a.hibernateAfterDays == null ? null : Math.round(a.hibernateAfterDays * 86_400_000);
 

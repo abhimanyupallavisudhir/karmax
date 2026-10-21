@@ -213,7 +213,12 @@ configure() {
   old_password=$(env_value POSTGRES_PASSWORD)
   password=${old_password:-$(random_hex 32)}
   old_provider=$(env_value KARMAX_CLOUD_WORLD_PROVIDER)
-  provider=${old_provider:-e2b}
+  # "any" lets tavya choose among the connected and managed computers
+  # (wiki features/compute-routing). e2b was written here only because
+  # nothing else could be the default before; organizations that chose E2B
+  # keep it in their own Computer settings.
+  provider=${old_provider:-any}
+  [ "$provider" != e2b ] || provider=any
   old_temporal=$(env_value TEMPORAL_VERSION)
   temporal=${old_temporal:-1.31.0}
   old_postgres=$(env_value POSTGRES_VERSION)

@@ -140,7 +140,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     name: 'create_sub_task',
     description:
       'Delegate to a child task. It branches off your current work and merges back into YOUR branch (not main), and YOU are its confirmer: when it reaches Review or gets stuck it will raise to you (surfaced as a message) and you answer with respond_to_sub_task. It starts when your current turn ends, and first saves this task\'s writable project data for it to start from: stop anything writing into it (a server, a job, an open SQLite database) before you call it, or the save fails and no sub-task is created. You manage your children to completion before you finish. '
-      + 'It runs your agent on a computer like yours (your own Computer: provider and size) unless `params` choose others: create_task\'s task-form fields, e.g. {"agent:do": {"provider": "codex", "model": "gpt-5.5", "effort": "high"}}, {"agent:do": {"avatarId": "…"}} or {"computer": {"cpu": 2, "memoryMb": 4096, "diskGb": 30}} (the sizes it names, over yours). Only the agent fields and the computer can be set; the branch and project stay yours. It acts with your authority, including whatever you are granted later, so there is nothing to grant it. An invalid or unavailable choice is refused and nothing is created. '
+      + 'It runs your agent on a computer like yours (your own Computer: provider and size) unless `params` choose others: create_task\'s task-form fields, e.g. {"agent:do": {"provider": "codex", "model": "gpt-5.5", "effort": "high"}}, {"agent:do": {"avatarId": "…"}} or {"computer": {"cpu": 2, "memoryMb": 4096, "diskGb": 30}} (the sizes it names, over yours; "provider": "any" lets the platform pick whichever connected or managed computer fits and has room, a named provider such as "aws" pins it). Only the agent fields and the computer can be set; the branch and project stay yours. It acts with your authority, including whatever you are granted later, so there is nothing to grant it. An invalid or unavailable choice is refused and nothing is created. '
       + 'With `draft: true` it is saved now and not started, and its task id returned: start it later with queue_task (people can also start it from your Sub-tasks). It then branches off your work as it is at that moment. Plan many sub-tasks as drafts and start them in batches when they should not all run at once (e.g. a cloud provider\'s machine limits).',
     parameters: {
       type: 'object',
@@ -559,7 +559,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
         draft: { type: 'boolean' },
         priority: { type: 'string', enum: [...PRIORITY_NAMES] },
         tags: { type: 'array', items: { type: 'string' } },
-        params: { type: 'object', description: 'Full task-form field values for the workflow.' },
+        params: { type: 'object', description: 'Full task-form field values for the workflow. Its "computer" is {provider?, cpu?, memoryMb?, diskGb?, region?: "eu"|"us", flavor?, network?}: provider "any" (the usual default) picks a computer that fits and has room; a named provider pins it.' },
         authorization: {
           type: 'object',
           properties: {
@@ -757,8 +757,10 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
       type: 'object',
       properties: {
         organization_id: { type: 'string' }, project_id: { type: 'string' },
-        world_provider: { type: 'string' }, runner_pool_id: { type: 'string' },
+        world_provider: { type: 'string', description: '"any" (the platform picks a computer that fits and has room) or a provider such as "aws"' },
+        runner_pool_id: { type: 'string' },
         environment_flavor: { type: 'string', enum: ['headless', 'desktop'] },
+        region: { type: 'string', enum: ['eu', 'us'], description: 'Where "any" may put computers' },
         cpu: { type: 'number' }, memory_mb: { type: 'number' }, disk_gb: { type: 'number', description: 'Free disk for task files, in GB' }, gpu: { type: 'number' },
         unrestricted_internet: { type: 'boolean' },
         allow_domains: { type: 'array', items: { type: 'string' } },
@@ -1603,6 +1605,7 @@ export function platformToolHandlers(
       if (args?.world_provider !== undefined) policy.worldProvider = args.world_provider;
       if (args?.runner_pool_id !== undefined) policy.runnerPoolId = args.runner_pool_id;
       if (args?.environment_flavor !== undefined) policy.environment = { flavor: args.environment_flavor };
+      if (args?.region !== undefined) policy.region = args.region;
       if (args?.monthly_budget_usd !== undefined)
         policy.monthlyBudgetMicros = args.monthly_budget_usd == null ? null : Math.round(Number(args.monthly_budget_usd) * 1e6);
       if (args?.hibernate_after_days !== undefined)

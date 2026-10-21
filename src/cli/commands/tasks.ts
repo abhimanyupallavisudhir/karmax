@@ -80,21 +80,41 @@ const describeStatus = (view: TaskView) => {
   return [live.stage, live.status, live.waitingFor?.kind ? `waiting for ${live.waitingFor.kind}` : ''].filter(Boolean).join(' · ');
 };
 
+/** The Computer `task new` asks for: --computer any|<provider> (any: tavya
+ * picks a computer that fits and has room), --cpu, --memory and --disk in GB,
+ * --region eu|us. The server validates it like the task form. */
+export function computerFlags(flags: Record<string, any>): Record<string, unknown> | undefined {
+  const number = (name: string, value: unknown): number | undefined => {
+    if (value === undefined) return undefined;
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed <= 0) throw new CliError(`--${name} must be a positive number`, EXIT.usage);
+    return parsed;
+  };
+  const memory = number('memory', flags.memory);
+  const computer = Object.fromEntries(Object.entries({
+    provider: flags.computer, cpu: number('cpu', flags.cpu), memoryMb: memory === undefined ? undefined : Math.round(memory * 1024),
+    diskGb: number('disk', flags.disk), region: flags.region,
+  }).filter(([, value]) => value !== undefined));
+  return Object.keys(computer).length ? computer : undefined;
+}
+
 export async function task(api: Api, args: string[], out: Output, flags: Record<string, any>, workspace?: Workspace): Promise<number> {
   const [action, ...rest] = args;
   switch (action) {
     case 'new': case 'create': {
       const title = rest.join(' ').trim();
-      if (!title) throw new CliError('usage: tavya task new <title> [--template <number|name>] [--prompt <text> | --prompt-file <file> | stdin]', EXIT.usage);
+      if (!title) throw new CliError('usage: tavya task new <title> [--template <number|name>] [--prompt <text> | --prompt-file <file> | stdin] [--computer any|<provider>] [--cpu N] [--memory GB] [--disk GB] [--region eu|us]', EXIT.usage);
       const target = await resolveProject(api, flags.project, workspace);
       // A template's own prompt stands unless one is given; without one, the title is the prompt.
       const template = flags.template ? await resolveTemplate(api, target.project.id, flags.template) : undefined;
       const fallback = template ? undefined : title;
       const prompt = flags.prompt ?? (flags['prompt-file'] ? fs.readFileSync(flags['prompt-file'], 'utf8')
         : process.stdin.isTTY ? fallback : (await readStdin()).trim() || fallback);
+      const computer = computerFlags(flags);
       const created = await api.post<{ id: string; num?: number }>(`/api/projects/${encodeURIComponent(target.project.id)}/tasks`,
         { title, ...(prompt !== undefined ? { prompt } : {}), ...(template ? { templateId: template.id } : {}),
-          ...(flags.workflow ? { workflow: flags.workflow } : {}), ...(flags.draft ? { draft: true } : {}) });
+          ...(flags.workflow ? { workflow: flags.workflow } : {}), ...(flags.draft ? { draft: true } : {}),
+          ...(computer ? { params: { computer } } : {}) });
       const url = taskUrl(api.server, { ...target, taskId: created.id, ...(created.num != null ? { taskNumber: created.num } : {}) }, workspace?.manifest.organization);
       out.result({ ...created, url }, `${created.num != null ? `#${created.num} ` : ''}${title}\n${url}`);
       return 0;
