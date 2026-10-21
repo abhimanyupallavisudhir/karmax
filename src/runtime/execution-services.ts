@@ -21,6 +21,7 @@ import { DeferredDeleteObjectStore, objectDeleteDelayMs } from '../store/deferre
 import { StorageLocationService } from '../store/storage-locations.js';
 import { backfillConversationExports } from '../store/conversation-exports.js';
 import { WorldCheckpointService } from '../world/checkpoint.js';
+import { ComputeRouter } from '../world/compute-router.js';
 import { RunnerPoolService } from '../world/runners.js';
 import { WorldAccessService } from '../world/access.js';
 import { ObjectSnapshotEngine, ProjectResourceService } from '../world/resources.js';
@@ -94,8 +95,11 @@ export async function createExecutionServices(input: {
     { client, taskQueue: TASK_QUEUE }, storageLocations, { objects: objectStore, cacheDir: path.join(p.home, 'cache', 'restic'),
       world: () => process.env.KARMAX_PUBLIC_URL?.trim() || undefined,
       edge: () => process.env.KARMAX_RESOURCE_EDGE_URL?.trim() || undefined });
-  const checkpoints = new WorldCheckpointService(store, worlds, objectStore, broker, githubApp, resources);
+  // One runner service for every allocation, so a restore on managed compute
+  // is admitted and pooled like a new world (credit, concurrency).
   const runners = new RunnerPoolService(store, providerConnections);
+  const checkpoints = new WorldCheckpointService(store, worlds, objectStore, broker, githubApp, resources, runners,
+    new ComputeRouter(store, providerConnections));
   const worldAccess = new WorldAccessService(store, worlds, runners, resources);
   worlds.setHandleResolver(async (handle) => (await store.currentWorld(handle.id)) as import('../world/types.js').WorldHandle | undefined);
   // Rebuild a world from its last checkpoint ONLY when the provider has genuinely

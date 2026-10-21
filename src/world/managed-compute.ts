@@ -72,12 +72,16 @@ export async function assertComputeCredit(store: Store, organizationId: string, 
   if (!store.hosted) return;
   const credit = await computeCredit(store, organizationId, now);
   if (credit.creditMicros == null || credit.usedMicros < credit.creditMicros) return;
-  const own = `connect your own ${providerName(provider)} account in Settings → Computers`;
-  if (!credit.creditMicros) throw new ComputeCreditExhausted(
-    `Out of compute: ${BRAND}'s computers come with a paid plan. Choose one in Plan & billing, or ${own}.`);
+  throw new ComputeCreditExhausted(creditExhaustedMessage(credit, `${providerName(provider)} account`));
+}
+
+/** "Out of compute: …", naming what else would run the task. */
+export function creditExhaustedMessage(credit: Pick<ComputeCredit, 'creditMicros' | 'to'>, own = 'account'): string {
+  const connect = `connect your own ${own} in Settings → Computers`;
+  if (!credit.creditMicros) return `Out of compute: ${BRAND}'s computers come with a paid plan. Choose one in Plan & billing, or ${connect}.`;
   const renews = new Date(credit.to).toISOString().slice(0, 10);
-  throw new ComputeCreditExhausted(`Out of compute: this month's ${dollars(credit.creditMicros)} of compute is used up. `
-    + `Add a compute pack in Plan & billing, or ${own}. It renews on ${renews}.`);
+  return `Out of compute: this month's ${dollars(credit.creditMicros)} of compute is used up. `
+    + `Add a compute pack in Plan & billing, or ${connect}. It renews on ${renews}.`;
 }
 
 /** Refuse a new machine on the installation's account while it runs as many

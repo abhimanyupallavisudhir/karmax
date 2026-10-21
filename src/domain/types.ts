@@ -649,6 +649,8 @@ export interface ProjectConfig {
   monthlyBudgetMicros?: number;
   /** Parked-world retention before portable hibernation (default seven days). */
   hibernateAfterMs?: number;
+  /** Where provider "Any" may place the task's computer (wiki features/compute-routing). */
+  region?: 'eu' | 'us';
 }
 
 // ─── Project resources (SPEC §11.4) ────────────────────────────────────────
@@ -864,6 +866,7 @@ export interface OrganizationExecutionPolicy {
   environment?: ProjectConfig['environment'];
   monthlyBudgetMicros?: number;
   hibernateAfterMs?: number;
+  region?: ProjectConfig['region'];
 }
 
 /** Trusted admission policy for hosted, organization-attributed work. Empty
@@ -1939,6 +1942,10 @@ export interface TaskView {
    * not work (parked, or left running), which Free computer releases
    * (POST /api/tasks/:id/release-computer); added by the API. */
   heldComputer?: { provider: string; state: 'ready' | 'parked' | 'degraded' };
+  /** Where the task's computer is (its current cloud world): the provider,
+   * whether it is the installation's managed account, the machine's size, and
+   * why provider "Any" chose it (wiki features/compute-routing); added by the API. */
+  runsOn?: { provider: string; managed?: boolean; machine?: { cpu?: number; memoryMb?: number; diskGb?: number }; routed?: string };
   updatedAt: number;
 }
 

@@ -138,3 +138,15 @@ it('starts a task from a template, by its number or its name', async () => {
   expect(missing.code).toBe(5);
   expect(missing.stderr).toContain('no template "7"');
 });
+
+it('starts a task on a computer: any (tavya picks) or a named provider, at least this size', async () => {
+  const f = await cliFixture(cleanups);
+  const made = await f.tavya(f.laptop, ['task', 'new', 'Big build', '--computer', 'any', '--cpu', '4', '--memory', '8', '--disk', '50',
+    '--region', 'eu', '--draft', '--project', f.project.id, '--json']);
+  expect(made.code, made.stderr).toBe(0);
+  expect((await f.store.getTask(JSON.parse(made.stdout).id))!.params.computer)
+    .toEqual({ provider: 'any', cpu: 4, memoryMb: 8192, diskGb: 50, region: 'eu' });
+  const bad = await f.tavya(f.laptop, ['task', 'new', 'Tiny', '--cpu', 'lots', '--project', f.project.id]);
+  expect(bad.code).toBe(2);
+  expect(bad.stderr).toContain('--cpu must be a positive number');
+});

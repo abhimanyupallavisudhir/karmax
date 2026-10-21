@@ -55,7 +55,7 @@ services:
       # to the app, signed (`deploy/karmax deploy-agent-mail-edge`). Empty:
       # placeholder @agent.local addresses that receive nothing.
       KARMAX_AGENT_MAIL_DOMAIN: ${KARMAX_AGENT_MAIL_DOMAIN:-}
-      KARMAX_CLOUD_WORLD_PROVIDER: ${KARMAX_CLOUD_WORLD_PROVIDER:-e2b}
+      KARMAX_CLOUD_WORLD_PROVIDER: ${KARMAX_CLOUD_WORLD_PROVIDER:-any}
       # Optional sign-in providers — see the note in compose.turnkey.yml: this
       # block is a whitelist, so anything absent here silently never arrives.
       KARMAX_GOOGLE_CLIENT_ID: ${KARMAX_GOOGLE_CLIENT_ID:-}

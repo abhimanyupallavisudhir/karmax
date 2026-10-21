@@ -1,5 +1,6 @@
-import { machineShape, normalizeComputer } from '../domain/computer.js';
+import { isAnyProvider, machineShape, normalizeComputer } from '../domain/computer.js';
 import { providerLabel } from '../domain/computer-limits.js';
+import { BRAND } from '../domain/brand.js';
 import { taskProvider } from './task-provider.js';
 import * as __asyncCollections from '../util/async-collections.js';
 import crypto from 'node:crypto';
@@ -19,6 +20,7 @@ import { newId } from '../util/id.js';
 import { activateProjectRuntime, selectProjectEnvironment, snapshotProjectRuntime } from './project-runtime.js';
 import { destroyWorldServices } from './services.js';
 import { RunnerPoolService } from './runners.js';
+import type { ComputeRouter } from './compute-router.js';
 import { sameRepository } from './repository-identity.js';
 import { clearCheckpointStale } from './checkpoint-staleness.js';
 import { ChunkedCheckpointStore, CheckpointRefusedError, formatBytes, type CaptureEntry } from './checkpoint-chunks.js';
@@ -33,7 +35,9 @@ export const CHECKPOINT_KEY_HANDLE = 'checkpoint:encryption-key';
 
 
 /** How a restoring activity keeps its runner-lease wait alive and cancellable. */
-export interface RestoreOptions { signal?: AbortSignal; heartbeat?: () => void }
+export interface RestoreOptions { signal?: AbortSignal; heartbeat?: () => void;
+  /** Why "Any" chose this provider, recorded on the restored world. */
+  routed?: string }
 
 /**
  * `restore` is only ever reached from inside an activity (the openWorld recovery
@@ -73,7 +77,9 @@ export class WorldCheckpointService {
 
   constructor(private store: Store, private worlds: WorldRegistry, private objects: ObjectStore,
     private broker: CredentialBroker, private githubApp?: import('../integrations/github-app.js').GitHubAppService,
-    private resources?: import('./resources.js').ProjectResourceService, runners?: RunnerPoolService) {
+    private resources?: import('./resources.js').ProjectResourceService, runners?: RunnerPoolService,
+    /** Where a world whose task says provider "Any" comes back (compute-router.ts). */
+    private router?: ComputeRouter) {
     this.runners = runners ?? new RunnerPoolService(store);
     this.chunks = new ChunkedCheckpointStore(store, broker, objects, resources?.storageLocationService?.());
   }
@@ -253,6 +259,10 @@ export class WorldCheckpointService {
    */
   async restoreWhereTaskRuns(checkpointId: string, handle: WorldHandle): Promise<WorldHandle> {
     const target = await taskProvider(this.store, handle.id);
+    if (!target && this.router) {
+      const routed = await this.restoreRouted(checkpointId, handle);
+      if (routed) return routed;
+    }
     if (!target || target === handle.kind) return this.restore(checkpointId, handle.kind);
     const event = (type: string, payload: Record<string, unknown>) => this.store.appendEvent({ taskId: handle.id, type, ts: Date.now(),
       payload: { from: handle.kind, to: target, checkpointId, ...payload } });
@@ -274,6 +284,34 @@ export class WorldCheckpointService {
         + `${providerLabel(handle.kind)}, restored from its last checkpoint. Its Computer is set back to ${providerLabel(handle.kind)}.`);
       return this.restore(checkpointId, handle.kind);
     }
+  }
+
+  /**
+   * A task whose Computer says "Any" comes back where it ran when that
+   * provider still fits and has room, else on the next candidate
+   * (compute-router.ts). Undefined when the task names a provider.
+   */
+  private async restoreRouted(checkpointId: string, handle: WorldHandle): Promise<WorldHandle | undefined> {
+    const checkpoint = await this.store.getWorldCheckpoint(checkpointId);
+    const project = checkpoint ? await this.store.getProject(checkpoint.projectId) : undefined;
+    if (!project?.organizationId) return undefined;
+    const config = await this.store.effectiveTaskConfig(project, handle.id);
+    if (!isAnyProvider(config.worldProvider)) return undefined;
+    const organizationId = project.organizationId;
+    const route = await this.router!.route(organizationId, config, handle.kind);
+    const { value: restored } = await this.router!.run(organizationId, route,
+      (candidate, reason) => this.restore(checkpointId, candidate.provider as WorldKind, { ...ambientActivityHooks(), routed: reason }),
+      (decision) => this.store.appendEvent({ taskId: handle.id, type: 'world.routed', ts: Date.now(),
+        payload: { ...decision, restore: true, from: handle.kind, checkpointId } }).then(() => undefined));
+    if (restored.kind !== handle.kind) {
+      await this.store.appendEvent({ taskId: handle.id, type: 'world.moved', ts: Date.now(),
+        payload: { from: handle.kind, to: restored.kind, checkpointId, generation: restored.generation, routed: true } });
+      await this.addNotice(handle.id, `This task now runs on ${providerLabel(restored.kind)} (its Computer lets ${BRAND} choose, and `
+        + `${providerLabel(handle.kind)} ${route.candidates.some((candidate) => candidate.provider === handle.kind) ? 'had no room' : 'no longer fits it'}). `
+        + 'You are on a new machine with the same files your repositories track, the same uncommitted changes and the same project data. '
+        + 'Git-ignored files (installed dependencies, build output, caches) and running processes did not carry over: reinstall or restart what you need.');
+    }
+    return restored;
   }
 
   /** Tell the agent something about its world on its next turn, once. */
@@ -456,6 +494,7 @@ export class WorldCheckpointService {
       // release and the world's cost is attributed to the right pool.
       if (acquired) world.handle.meta = { ...world.handle.meta, worldLeaseId: acquired.leaseId };
       if (remote) world.handle.meta = { ...world.handle.meta, computer: machineShape(executionConfig) };
+      if (options?.routed) world.handle.meta = { ...world.handle.meta, routed: options.routed };
       const registered = (await this.store.registerWorld({ ...world.handle, checkpointId }, checkpoint.projectId,
         { runnerPoolId: acquired?.runnerPoolId ?? checkpoint.runnerPoolId,
           environmentDigest: environment.digest ?? checkpoint.environmentDigest })) as WorldHandle;

@@ -54,6 +54,7 @@ export async function saveOrganizationComputer(store: Store, organizationId: str
     environment: { ...current.environment, flavor: spec.flavor ?? fallback.environment?.flavor },
     network: chosen.network ?? fallback.network,
     hibernateAfterMs: chosen.hibernateAfterMs ?? fallback.hibernateAfterMs,
+    region: chosen.region,
   });
 }
 
@@ -77,6 +78,7 @@ export async function saveProjectComputer(store: Store, project: Project, raw: u
     environment: Object.keys(environment).length ? environment : null,
     network: chosen.network ?? null,
     hibernateAfterMs: chosen.hibernateAfterMs ?? null,
+    region: chosen.region ?? null,
   });
 }
 

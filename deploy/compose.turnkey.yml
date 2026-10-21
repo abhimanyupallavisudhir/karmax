@@ -208,7 +208,7 @@ services:
       # to the app, signed (`deploy/karmax deploy-agent-mail-edge`). Empty:
       # placeholder @agent.local addresses that receive nothing.
       KARMAX_AGENT_MAIL_DOMAIN: ${KARMAX_AGENT_MAIL_DOMAIN:-}
-      KARMAX_CLOUD_WORLD_PROVIDER: ${KARMAX_CLOUD_WORLD_PROVIDER:-e2b}
+      KARMAX_CLOUD_WORLD_PROVIDER: ${KARMAX_CLOUD_WORLD_PROVIDER:-any}
       # Optional sign-in providers, empty unless set in .turnkey.env. This block
       # is a whitelist, so a variable missing from it never reaches the app —
       # the operator configures an OAuth client, restarts, and nothing happens.

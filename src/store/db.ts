@@ -4,7 +4,7 @@ import { notPullRequestSql, pullRequestOf, type PullRequestOf } from '../domain/
 export interface TaskHeader { id: string; num?: number; title: string; projectId: string; status?: string; stage?: string;
   /** Set when the row is a pull request of its task (SPEC §11.1): the header is its task's. */
   pullRequest?: { taskId: string; checkout: string } }
-import { applyComputer, normalizeComputer, type ComputerSpec } from '../domain/computer.js';
+import { ANY_PROVIDER, applyComputer, normalizeComputer, type ComputerSpec } from '../domain/computer.js';
 import { AdmissionBackpressureError } from '../domain/admission-error.js';
 import { utf8Tail } from '../util/utf8-tail.js';
 import * as __asyncCollections from '../util/async-collections.js';
@@ -1785,8 +1785,10 @@ export class Store {
   /** The execution policy an organization has before it changes anything. */
   defaultOrganizationExecutionPolicy(): OrganizationExecutionPolicy {
     return {
+      // Hosted: "Any" — tavya picks whichever connected or managed computer
+      // fits and has room (src/world/compute-router.ts).
       worldProvider: process.env.KARMAX_DEPLOYMENT === 'hosted'
-        ? process.env.KARMAX_CLOUD_WORLD_PROVIDER ?? 'e2b'
+        ? process.env.KARMAX_CLOUD_WORLD_PROVIDER?.trim() || ANY_PROVIDER
         : 'worktree',
       resources: { cpu: 2, memoryMb: 2048, gpu: 0 },
       // General-purpose coding agents need package registries, documentation,
@@ -1973,7 +1975,7 @@ export class Store {
     const existing = (await this.lockedProject(id));
     if (!existing) throw new Error(`no project ${id}`);
     const config: Record<string, unknown> = { ...existing.config };
-    for (const key of ['worldProvider', 'runnerPoolId', 'resources', 'network', 'environment', 'monthlyBudgetMicros', 'hibernateAfterMs'] as const) {
+    for (const key of ['worldProvider', 'runnerPoolId', 'resources', 'network', 'environment', 'monthlyBudgetMicros', 'hibernateAfterMs', 'region'] as const) {
       if (!Object.prototype.hasOwnProperty.call(override, key)) continue;
       const value = override[key];
       if (value == null) delete config[key];
@@ -10556,6 +10558,7 @@ function validateProjectExecutionConfig(config: ProjectConfig): void {
   positive(raw.monthlyBudgetMicros, 'monthly budget', 0);
   if (raw.environment?.flavor != null && !['headless', 'desktop'].includes(raw.environment.flavor))
     throw new Error('environment flavor must be headless or desktop');
+  if (raw.region != null && !['eu', 'us'].includes(raw.region)) throw new Error('region must be eu or us');
   // Zero is the explicit "hibernate on the next lifecycle sweep" value. It is
   // useful under hard budget pressure and in deterministic lifecycle tests;
   // positive intervals below one minute are almost certainly configuration

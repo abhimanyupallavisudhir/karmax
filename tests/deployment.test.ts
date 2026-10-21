@@ -64,7 +64,7 @@ describe('deployment profiles', () => {
     [{ KARMAX_TEMPORAL_ADDRESS: '' }, 'KARMAX_TEMPORAL_ADDRESS must point at a durable Temporal service'],
     [{ KARMAX_S3_BUCKET: undefined }, 'KARMAX_S3_BUCKET is required when KARMAX_OBJECT_STORE=s3'],
     [{ KARMAX_S3_SECRET_ACCESS_KEY: '' }, 'KARMAX_S3_SECRET_ACCESS_KEY is required when KARMAX_OBJECT_STORE=s3'],
-    [{ KARMAX_CLOUD_WORLD_PROVIDER: 'worktree' }, 'KARMAX_CLOUD_WORLD_PROVIDER must be e2b, daytona, fly, hetzner, aws or gcp'],
+    [{ KARMAX_CLOUD_WORLD_PROVIDER: 'worktree' }, 'KARMAX_CLOUD_WORLD_PROVIDER must be any, e2b, daytona, fly, hetzner, aws or gcp'],
     [{ KARMAX_SINGLE_NODE: '1', KARMAX_OBJECT_STORE: 'memory' }, 'single-node KARMAX_OBJECT_STORE must be local or s3'],
   ])('refuses a managed cell with %j', (change, failure) => {
     expect(() => validateDeployment({ ...managedCell(), ...change })).toThrow(`hosted deployment is unsafe:\n- ${failure}`);
@@ -73,9 +73,10 @@ describe('deployment profiles', () => {
     }
   });
 
-  it('accepts postgresql:// URLs, a single-node cell on S3, and defaults the world provider to E2B', () => {
+  it('accepts postgresql:// URLs, a single-node cell on S3, and defaults the world provider to Any', () => {
     expect(validateDeployment({ ...managedCell(), KARMAX_DATABASE_URL: 'PostgreSQL://db/karmax', KARMAX_CLOUD_WORLD_PROVIDER: ' ' }))
-      .toMatchObject({ hosted: true, cloudWorldProvider: 'e2b' });
+      .toMatchObject({ hosted: true, cloudWorldProvider: 'any' });
+    expect(validateDeployment({ ...managedCell(), KARMAX_CLOUD_WORLD_PROVIDER: 'e2b' })).toMatchObject({ cloudWorldProvider: 'e2b' });
     expect(validateDeployment({ ...managedCell(), KARMAX_SINGLE_NODE: '1' })).toMatchObject({ singleNode: true });
     // KARMAX_SINGLE_NODE means nothing to a local install.
     expect(deploymentConfig({ KARMAX_SINGLE_NODE: '1', KARMAX_CELL_ID: '  lab  ' })).toEqual({ hosted: false, singleNode: false,

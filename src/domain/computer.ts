@@ -13,7 +13,9 @@ import { providerFeatures, providerLabel } from './computer-limits.js';
  * resolves the same computer.
  */
 export interface ComputerSpec {
-  /** World backend: e2b | daytona (remote), worktree | container (self-hosted). */
+  /** World backend: `any` (tavya chooses: src/world/compute-router.ts), a
+   * cloud provider (e2b, daytona, fly, hetzner, aws, gcp) or, self-hosted,
+   * worktree | container. */
   provider?: string;
   cpu?: number;
   memoryMb?: number;
@@ -23,7 +25,19 @@ export interface ComputerSpec {
   /** How long a parked world keeps its sandbox before portable hibernation. */
   hibernateAfterDays?: number;
   network?: NonNullable<ProjectConfig['network']>;
+  /** Where "Any" may run it; a named provider runs where its account is. */
+  region?: ComputeRegion;
 }
+
+/** The provider value that asks tavya to choose (wiki features/compute-routing). */
+export const ANY_PROVIDER = 'any';
+export function isAnyProvider(provider: string | undefined): boolean {
+  return provider === ANY_PROVIDER;
+}
+
+/** Where a computer runs, as people ask for it (data residency). */
+export const COMPUTE_REGIONS = ['eu', 'us'] as const;
+export type ComputeRegion = (typeof COMPUTE_REGIONS)[number];
 
 /** Cloud providers an organization can connect for task worlds (BYOK). */
 export const CLOUD_WORLD_PROVIDERS = ['e2b', 'daytona', 'fly', 'hetzner', 'aws', 'gcp'] as const;
@@ -85,6 +99,10 @@ export function normalizeComputer(raw: unknown): ComputerSpec | undefined {
       ? { unrestricted: false, allowDomains: list(network.allowDomains), allowCidrs: list(network.allowCidrs) }
       : { unrestricted: true };
   }
+  if (value.region != null && value.region !== '') {
+    if (!(COMPUTE_REGIONS as readonly unknown[]).includes(value.region)) throw new Error(`region must be ${COMPUTE_REGIONS.join(' or ')}`);
+    out.region = value.region as ComputeRegion;
+  }
   return Object.keys(out).length ? out : undefined;
 }
 
@@ -99,6 +117,7 @@ export function computerOf(config: Partial<ProjectConfig> | undefined): Computer
   if (config.environment?.flavor) out.flavor = config.environment.flavor;
   if (config.hibernateAfterMs != null) out.hibernateAfterDays = config.hibernateAfterMs / DAY_MS;
   if (config.network) out.network = { ...config.network };
+  if (config.region) out.region = config.region;
   return out;
 }
 
@@ -117,6 +136,7 @@ export function computerConfig(spec: ComputerSpec | undefined): Partial<ProjectC
   if (spec.flavor) out.environment = { flavor: spec.flavor };
   if (spec.hibernateAfterDays != null) out.hibernateAfterMs = Math.round(spec.hibernateAfterDays * DAY_MS);
   if (spec.network) out.network = { ...spec.network };
+  if (spec.region) out.region = spec.region;
   return out;
 }
 
@@ -172,7 +192,8 @@ export function assertInFlightComputerEdit(current: ComputerSpec, next: Computer
     throw new Error('a running task\'s experience can\'t change — only its provider, CPU, memory, disk and hibernation');
   if (next.network !== undefined && JSON.stringify(next.network) !== JSON.stringify(current.network ?? { unrestricted: true }))
     throw new Error('a running task\'s outbound network can\'t change — only its provider, CPU, memory, disk and hibernation');
-  if (next.provider === undefined || next.provider === current.provider) return;
+  // "Any" never moves a world that exists: it routes the next new one.
+  if (next.provider === undefined || next.provider === current.provider || isAnyProvider(next.provider)) return;
   if (LOCAL_PROVIDERS.has(next.provider) || (current.provider && LOCAL_PROVIDERS.has(current.provider)))
     throw new Error('a running task moves only between cloud providers');
   const features = providerFeatures(next.provider);
