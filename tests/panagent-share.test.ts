@@ -17,7 +17,7 @@ describe('Karmax conversation share acquisition', () => {
   it.each(['https://user:pass@chatgpt.com/share/abc', 'https://claude.ai:8443/share/abc',
     'https://claude.ai/share/abc#secret', 'file:///etc/passwd', 'https://127.0.0.1/share/abc'])('rejects %s at validation and acquisition', async url => {
     expect(publicConversationShare(url)).toBeUndefined();
-    await expect(importShare(url)).rejects.toThrow(/public HTTPS ChatGPT, Claude or tavya share/);
+    await expect(importShare(url)).rejects.toThrow(/public HTTPS share link of ChatGPT, Claude, Gemini, Grok, Perplexity, DeepSeek, Le Chat, Poe, Kimi, Qwen or tavya/);
     expect(network.publicShareFetch).not.toHaveBeenCalled();
   });
   it('stops at the guarded fetch when DNS or redirect validation fails', async () => {

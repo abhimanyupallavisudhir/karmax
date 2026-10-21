@@ -1,0 +1,27 @@
+{
+ "conversation": {
+  "conversationId": "0000-grok",
+  "title": "Capitals fixture",
+  "createTime": "2026-10-19T08:53:20.000Z",
+  "modifyTime": "2026-10-19T08:54:00.000Z"
+ },
+ "responses": [
+  {
+   "responseId": "r1",
+   "message": "What is the capital of France?",
+   "sender": "human",
+   "createTime": "2026-10-19T08:53:20.000Z",
+   "model": "grok-4-auto"
+  },
+  {
+   "responseId": "r2",
+   "message": "The capital of France is **Paris**.",
+   "sender": "ASSISTANT",
+   "createTime": "2026-10-19T08:53:25.000Z",
+   "parentResponseId": "r1",
+   "model": "grok-4"
+  }
+ ],
+ "isPublic": true,
+ "allowIndexing": false
+}

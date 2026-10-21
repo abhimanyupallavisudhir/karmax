@@ -208,7 +208,8 @@ export const PLATFORM_API_CATALOG = {
     'GET|PUT /api/organizations/:organizationId/conversation-sharing',
     'GET /api/tasks/:taskId/conversation.jsonl?role= (native provider history download)',
     'POST /api/tasks/:taskId/fork-agent', 'GET /api/tasks/:taskId/sessions',
-    'POST /api/conversation-imports?projectId= (raw Codex/Claude JSONL upload)',
+    'POST /api/conversation-imports?projectId= (raw Codex/Claude JSONL upload, converted now; returns the ref to put in agent:<role>.resumeFrom.upload, with title and messages, or 400 saying why it cannot be read)',
+    'POST /api/conversation-imports/share?projectId= (body {url}: a public share link of ChatGPT, Claude, Gemini, Grok, Perplexity, DeepSeek, Le Chat, Poe, Kimi, Qwen or tavya, read now and kept as that ref with share = the link; a task given resumeFrom.sessionId = a link gets the same done when it is saved)',
     'GET /api/tasks/:taskId/events?since=',
     'GET /api/tasks/:taskId/timing (correlated response timing, counts/median/p95, missing data, spans and content-free observations; task:event:read)', 'POST /api/tasks/:taskId/signal (followUp + role messages an agent; task:signal)', 'POST /api/tasks/:taskId/agents/:agent/stop (stop one agent, like Ctrl+C: its turn ends now — working, or waiting for a credential, capacity, a retry or people — or, if queued, it does not run; the task goes on; agent is do | responder | confirm | confirm-<n> | agent-<n>; task:signal)', 'POST /api/tasks/:taskId/messages (body {text, role} messages one agent; or {text, to: [agent:do | agent:responder | agent:confirm | agent:agent-<n> | person/team/Avatar selectors], agents?: {"agent-<n>": agent spec}, images?, files?} says it in the shared conversation, calls the agents in order and notifies the people; task:conversation:message, task:edit to add agents)',
     EXPLANATIONS_ENABLED ? 'GET|POST /api/tasks/:taskId/explanations (durable annotations; POST body {role, sourceKey, settings?})'

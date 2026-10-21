@@ -1,0 +1,39 @@
+{
+ "status": "success",
+ "has_next_page": false,
+ "thread_metadata": {
+  "title": "Capitals fixture",
+  "uuid": "t1",
+  "updated_at": "2026-10-19T08:54:00Z"
+ },
+ "entries": [
+  {
+   "uuid": "e1",
+   "thread_url_slug": "capitals-fixture-AbC",
+   "query_str": "What is the capital of France?",
+   "entry_created_datetime": "2026-10-19T08:53:20+00:00",
+   "display_model": "pplx_pro",
+   "blocks": [
+    {
+     "intended_usage": "web_results",
+     "web_result_block": {
+      "web_results": []
+     }
+    },
+    {
+     "intended_usage": "ask_text",
+     "markdown_block": {
+      "answer": "The capital of France is **Paris**."
+     }
+    }
+   ]
+  },
+  {
+   "uuid": "e2",
+   "query_str": "And of Italy?",
+   "entry_created_datetime": "2026-10-19T08:53:40+00:00",
+   "display_model": "pplx_pro",
+   "text": "{\"answer\": \"Rome.\"}"
+  }
+ ]
+}

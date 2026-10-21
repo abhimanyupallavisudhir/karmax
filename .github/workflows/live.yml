@@ -142,11 +142,20 @@ jobs:
         env:
           KARMAX_RUN_LIVE: '1'
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.LIVE_CLAUDE_CODE_OAUTH_TOKEN }}
-      # A public claude.ai share, read the way tavya reads one (skips without the variable).
-      - run: npx vitest run tests/claude-share-live.test.ts
+      # Public share links, read the way tavya reads them (each skips without its variable).
+      - run: npx vitest run tests/conversation-shares-live.test.ts
         env:
           KARMAX_RUN_LIVE: '1'
           KARMAX_LIVE_CLAUDE_SHARE: ${{ vars.LIVE_CLAUDE_SHARE }}
+          KARMAX_LIVE_CHATGPT_SHARE: ${{ vars.LIVE_CHATGPT_SHARE }}
+          KARMAX_LIVE_GEMINI_SHARE: ${{ vars.LIVE_GEMINI_SHARE }}
+          KARMAX_LIVE_DEEPSEEK_SHARE: ${{ vars.LIVE_DEEPSEEK_SHARE }}
+          KARMAX_LIVE_GROK_SHARE: ${{ vars.LIVE_GROK_SHARE }}
+          KARMAX_LIVE_PERPLEXITY_SHARE: ${{ vars.LIVE_PERPLEXITY_SHARE }}
+          KARMAX_LIVE_POE_SHARE: ${{ vars.LIVE_POE_SHARE }}
+          KARMAX_LIVE_MISTRAL_SHARE: ${{ vars.LIVE_MISTRAL_SHARE }}
+          KARMAX_LIVE_KIMI_SHARE: ${{ vars.LIVE_KIMI_SHARE }}
+          KARMAX_LIVE_QWEN_SHARE: ${{ vars.LIVE_QWEN_SHARE }}
 
   e2b:
     name: E2B sandboxes

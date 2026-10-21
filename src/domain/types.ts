@@ -1687,16 +1687,11 @@ export interface AgentSpec {
   resumeFrom?: {
     taskId?: string;
     role?: string;
-    /** A public chatgpt.com/share, claude.ai/share or tavya share URL, or a native provider id
-     * when the Karmax console is host-local. */
+    /** A native provider id when the Karmax console is host-local. A public
+     * share URL (src/agent/conversation-shares.ts) given here is read when the task
+     * is saved and replaced by `upload` (src/agent/conversation-sources.ts). */
     sessionId?: string;
-    upload?: {
-      id: string;
-      name: string;
-      bytes: number;
-      format: 'codex' | 'claude-code' | 'claude-export' | 'panagent';
-      projectId: string;
-    };
+    upload?: import('../store/conversation-imports.js').ConversationImportRef;
   };
 }
 

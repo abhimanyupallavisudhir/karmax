@@ -2106,10 +2106,11 @@ function agentBlockHtml(prefix, spec, opts) {
     <div class="af-resume-panel" ${resumeEnabled ? '' : 'hidden'}>
       <button type="button" class="btn sm af-resume-pick">⌕ Search tasks to fork from…</button>
       <div class="af-resume-chosen" data-resume="${esc(JSON.stringify(spec?.resumeFrom?.taskId ? { taskId: spec.resumeFrom.taskId, role: spec.resumeFrom.role } : null))}">${spec?.resumeFrom?.taskId ? resumeChosenInner(spec.resumeFrom) : ''}</div>
-      <input class="af-resume-session" placeholder="${hostLocal() ? '...or paste a provider conversation ID or a ChatGPT, Claude or ' : '...or paste a ChatGPT, Claude or '}${siteNameMarkup()} share link" value="${esc(spec?.resumeFrom?.sessionId || '')}" />
+      <input class="af-resume-session" placeholder="${hostLocal() ? '...or paste a share link or provider conversation ID' : '...or paste a share link'}" title="ChatGPT, Claude, Gemini, Grok, Perplexity, DeepSeek, Le Chat, Poe, Kimi, Qwen or ${siteNameMarkup()}" value="${esc(spec?.resumeFrom?.sessionId || spec?.resumeFrom?.upload?.share || '')}" />
+      ${resumeCheckHtml(spec?.resumeFrom?.upload?.share ? { ok: spec.resumeFrom.upload } : undefined)}
       <div class="af-resume-import-row">
         <label class="btn sm af-resume-upload">Upload conversation<input type="file" accept=".json,.jsonl,application/json,application/x-ndjson" hidden></label>
-        <div class="af-resume-uploaded" data-upload="${esc(JSON.stringify(spec?.resumeFrom?.upload || null))}">${spec?.resumeFrom?.upload ? resumeUploadInner(spec.resumeFrom.upload) : ''}</div>
+        <div class="af-resume-uploaded" data-upload="${esc(JSON.stringify(spec?.resumeFrom?.upload || null))}">${spec?.resumeFrom?.upload && !spec.resumeFrom.upload.share ? resumeUploadInner(spec.resumeFrom.upload) : ''}</div>
       </div>
     </div>`}
     ${hostAuthority ? '' : agentAuthorityHtml(prefix, spec, opts.authority)}`;
@@ -2465,20 +2466,61 @@ function wireResumeReauthorization(root, host) {
   }, { signal: wiring.signal });
 }
 
+// An uploaded file, named by what was read in it (its file name in the tooltip).
 function resumeUploadInner(upload) {
-  return `${esc(upload.name || 'Conversation')}<button type="button" class="af-resume-upload-clear" title="Clear">✕</button>`;
+  const name = upload.name || 'Conversation';
+  const count = upload.messages ? resumeMessageCount(upload) : '';
+  const label = count ? resumeReadLabel(upload.title || name, count) : `<span class="af-resume-title">${esc(name)}</span>`;
+  return `<span class="af-resume-upload-name" title="${esc(name)}">${label}</span><button type="button" class="af-resume-upload-clear" title="Clear">✕</button>`;
+}
+
+// What was read in a pasted link or an uploaded file (POST /api/conversation-imports…),
+// or why it can't be: one line, the full reason in its tooltip.
+function resumeCheckHtml(state) {
+  if (!state) return '<div class="af-resume-check" hidden></div>';
+  if (state.checking) return '<div class="af-resume-check">Checking…</div>';
+  if (state.error) {
+    const reason = String(state.error).replace(/^./, (first) => first.toUpperCase());
+    return `<div class="af-resume-check err" title="${esc(reason)}">${esc(reason)}</div>`;
+  }
+  const { title, messages, share, partial } = state.ok;
+  if (!messages) return '<div class="af-resume-check" hidden></div>';
+  const count = resumeMessageCount(state.ok);
+  const tip = partial ? 'The site shows only these first messages to anyone with the link'
+    : share ? 'Read now: the agent starts from this copy' : 'Checked: the agent starts from this file';
+  return `<div class="af-resume-check ok" title="${tip}">${resumeReadLabel(title, count)}</div>`;
+}
+
+// A long title gives way; the count stays readable.
+function resumeReadLabel(title, count) {
+  return title ? `<span class="af-resume-title">${esc(title)}</span><span class="af-resume-count"> · ${esc(count)}</span>`
+    : `<span class="af-resume-count">${esc(count)}</span>`;
+}
+
+function resumeMessageCount(read) {
+  return `${read.messages}${read.partial ? '+' : ''} message${read.messages === 1 && !read.partial ? '' : 's'}`;
+}
+
+async function checkConversationShare(url) {
+  const res = await feedbackFetch(`/api/conversation-imports/share?projectId=${encodeURIComponent(S.projectId)}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...(S.token ? { authorization: `Bearer ${S.token}` } : {}) },
+    body: JSON.stringify({ url }),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body?.error || `couldn't read this link (HTTP ${res.status})`);
+  return body;
 }
 
 // Read an agent box's fork/resume choice back out: the picker's {taskId, role},
-// a public share link, or one uploaded file.
+// a share link (as read when it was pasted, once that answered), or one uploaded file.
 function readResume(box) {
   if (!box.querySelector('.af-resume-enabled')?.checked) return undefined;
   const sessionId = box.querySelector('.af-resume-session')?.value.trim();
-  if (sessionId) return { sessionId };
-  try {
-    const upload = JSON.parse(box.querySelector('.af-resume-uploaded')?.dataset.upload || 'null');
-    if (upload) return { upload };
-  } catch {}
+  let upload = null;
+  try { upload = JSON.parse(box.querySelector('.af-resume-uploaded')?.dataset.upload || 'null'); } catch {}
+  if (sessionId) return upload?.share === sessionId ? { upload } : { sessionId };
+  if (upload && !upload.share) return { upload };
   try { return JSON.parse(box.querySelector('.af-resume-chosen')?.dataset.resume || 'null') || undefined; } catch {}
   return undefined;
 }
@@ -3486,6 +3528,8 @@ function wireAgentBox(box) {
     chosen.innerHTML = '';
   };
   const clearUpload = () => {
+    const line = box.querySelector('.af-resume-check');
+    if (line) line.outerHTML = resumeCheckHtml();
     if (!uploaded) return;
     uploaded.dataset.upload = 'null';
     uploaded.innerHTML = '';
@@ -3534,10 +3578,32 @@ function wireAgentBox(box) {
       onPick: ({ task, role, session }) => setResume({ taskId: task.id, role }, task, session),
     }),
   );
+  // A pasted link is read at once (debounced), exactly as the agent will read it.
+  const setCheck = (state) => { const line = box.querySelector('.af-resume-check'); if (line) line.outerHTML = resumeCheckHtml(state); };
+  let checking = 0;
+  let checkTimer;
+  const checkLink = async (link) => {
+    const mine = ++checking;
+    setCheck({ checking: true });
+    try {
+      const upload = await checkConversationShare(link);
+      if (mine !== checking || sessionInput.value.trim() !== link) return;
+      if (uploaded) { uploaded.dataset.upload = JSON.stringify(upload); uploaded.innerHTML = ''; }
+      setCheck({ ok: upload });
+      box.dispatchEvent(new Event('change', { bubbles: true }));
+    } catch (error) {
+      if (mine === checking) setCheck({ error: error.message });
+    }
+  };
   sessionInput?.addEventListener('input', () => {
-    if (!sessionInput.value.trim()) return;
+    clearTimeout(checkTimer);
+    checking++;
+    const link = sessionInput.value.trim();
+    setCheck(undefined);
+    if (!link) return;
     clearTask();
     clearUpload();
+    if (/^https?:\/\//i.test(link)) checkTimer = setTimeout(() => checkLink(link), 400);
   });
   uploaded?.addEventListener('click', (e) => {
     if (!e.target.closest('.af-resume-upload-clear')) return;
@@ -3548,18 +3614,22 @@ function wireAgentBox(box) {
     const file = uploadInput.files?.[0];
     uploadInput.value = '';
     if (!file) return;
+    checking++;
+    clearTask();
+    if (sessionInput) sessionInput.value = '';
+    clearUpload();
+    if (uploaded) uploaded.innerHTML = resumeCheckHtml({ checking: true });
     try {
       const upload = await uploadConversationFile(file);
-      clearTask();
-      if (sessionInput) sessionInput.value = '';
       if (uploaded) {
         uploaded.dataset.upload = JSON.stringify(upload);
         uploaded.innerHTML = resumeUploadInner(upload);
       }
-      box.dispatchEvent(new Event('change', { bubbles: true }));
     } catch (error) {
-      toast(error.message, true);
+      // The file replaces the source even when it can't be read: never keep the old one silently.
+      if (uploaded) uploaded.innerHTML = resumeCheckHtml({ error: error.message });
     }
+    box.dispatchEvent(new Event('change', { bubbles: true }));
   });
   // The Fork button picks its source the way the picker does.
   box._pickResume = setResume;
