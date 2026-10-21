@@ -5037,7 +5037,30 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     return request;
   }
 
-  /** End a task's wait for this request (approved, denied or dismissed). */
+  /** An agent that created a task waiting for approval learns of a denial at
+   * once, from that task, as from any other task's agent: else it would only
+   * find a draft where it expected work. A person sees it among their drafts. */
+  private async tellCreatorDenied(request: AuthorizationRequest, deniedBy: string): Promise<void> {
+    if (request.target.kind !== 'task' || !request.target.queueAfterApproval) return;
+    const task = (await this.deps.store.getTask(request.target.taskId));
+    const creator = task?.createdBy?.kind === 'task-agent' ? task.createdBy : undefined;
+    const creatorTask = creator && (await this.deps.store.getTask(creator.taskId));
+    if (!task || !creator || !creatorTask || ['done', 'cancelled', 'failed'].includes(creatorTask.lastView?.status ?? '')) return;
+    const by = deniedBy.startsWith('user:') ? (await this.deps.store.userDisplayName(deniedBy.slice(5))) ?? 'Someone' : 'Someone';
+    const asked = [`${request.authorization.level} authorization`,
+      ...(request.credentialGrants?.length ? [`${request.credentialGrants.length} vault credential${request.credentialGrants.length > 1 ? 's' : ''}`] : [])];
+    const message: Message = { id: `u${randomUUID()}`, role: 'user', author: `task:${task.id}`,
+      authorLabel: `Task #${task.num ?? task.id}`, ts: Date.now(),
+      text: `${by} denied the ${asked.join(' and ')} that task ${task.id} ("${task.title}") waited for, so it did not start. `
+        + 'It is a draft again: ask for less, or run it with only what you can grant '
+        + `(PATCH /api/tasks/${task.id}/authorization with acceptAttenuation: true, then queue_task), or delete it.` };
+    try {
+      await (await this.workflowHandle(creatorTask.id)).signal(SIG.followUp, message, creator.role ?? MAIN_AGENT);
+      (await this.publishConversationMessage(creatorTask.id, creator.role ?? MAIN_AGENT, message));
+    } catch { /* the creating task is gone: nobody is left to tell */ }
+  }
+
+  /** End a task's wait for this request (approved or denied). */
   private async releaseApprovalWait(request: AuthorizationRequest): Promise<void> {
     if (request.target.kind !== 'task') return;
     const task = (await this.deps.store.getTask(request.target.taskId));
@@ -5073,7 +5096,6 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       throw new CapabilityError('this authorization request was not routed to you');
     if (input.action === 'dismiss') {
       const dismissed = (await service.dismiss(request.id, caller.principal));
-      (await this.releaseApprovalWait(request));
       (await this.deps.store.removeAuthorizationInbox(request.id));
       const event = { taskId: request.target.kind === 'task' ? request.target.taskId : `avatar:${request.target.avatarId}`,
         type: 'authorization.approval-dismissed', ts: Date.now(), payload: { requestId: request.id } };
@@ -5125,8 +5147,12 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       }
     }
     const resolved = (await service.resolve(request.id, input.action, caller.principal, claimId));
-    // Denied: the task goes back to being a draft its creator can change or run with less.
-    if (input.action === 'deny') (await this.releaseApprovalWait(request));
+    // Denied: the task goes back to being a draft its creator can change or run
+    // with less, and an agent that created it is told so.
+    if (input.action === 'deny') {
+      (await this.releaseApprovalWait(request));
+      (await this.tellCreatorDenied(request, caller.principal));
+    }
     if (request.target.kind === 'task') {
       const event = { taskId: request.target.taskId, type: 'authorization.approval-resolved', ts: Date.now(), payload: {
         requestId: request.id, action: input.action, resolvedBy: caller.principal, queued,
