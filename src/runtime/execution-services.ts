@@ -56,10 +56,10 @@ export async function createExecutionServices(input: {
     async (organizationId, kind) => (await providerConnections.resolve(organizationId, kind)), undefined, referenceKeys));
   worlds.register(new DaytonaWorldProvider(undefined, undefined, undefined, undefined,
     async (organizationId, kind) => (await providerConnections.resolve(organizationId, kind)), undefined, undefined, referenceKeys));
-  worlds.register(flyWorldProvider(async (organizationId, kind) => (await providerConnections.resolve(organizationId, kind)), referenceKeys));
-  worlds.register(hetznerWorldProvider(async (organizationId, kind) => (await providerConnections.resolve(organizationId, kind)), referenceKeys));
-  worlds.register(awsWorldProvider(async (organizationId, kind) => (await providerConnections.resolve(organizationId, kind)), referenceKeys));
-  worlds.register(gcpWorldProvider(async (organizationId, kind) => (await providerConnections.resolve(organizationId, kind)), referenceKeys));
+  worlds.register(flyWorldProvider(async (organizationId, kind) => (await providerConnections.resolve(organizationId, kind)), referenceKeys, store));
+  worlds.register(hetznerWorldProvider(async (organizationId, kind) => (await providerConnections.resolve(organizationId, kind)), referenceKeys, store));
+  worlds.register(awsWorldProvider(async (organizationId, kind) => (await providerConnections.resolve(organizationId, kind)), referenceKeys, store));
+  worlds.register(gcpWorldProvider(async (organizationId, kind) => (await providerConnections.resolve(organizationId, kind)), referenceKeys, store));
   if (bootstrap) {
     const unreadable: (string | undefined)[] = [];
     for (const state of ['ready', 'parked', 'hibernated', 'degraded'] as const) {

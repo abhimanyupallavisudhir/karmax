@@ -34,6 +34,12 @@ describe('Fly.io sizes and prices', () => {
       { type: 'exit', status: 'stopped', timestamp: 70 },
       { type: 'start', status: 'started', timestamp: 100 },
     ])).toEqual([{ startedAt: 10, endedAt: 70 }]);
+    // Deleted while running: that run ends then.
+    expect(machineRuns([
+      { type: 'start', status: 'started', timestamp: 10 },
+      { type: 'exit', status: 'stopped', timestamp: 70 },
+      { type: 'start', status: 'started', timestamp: 100 },
+    ], 130)).toEqual([{ startedAt: 10, endedAt: 70 }, { startedAt: 100, endedAt: 130 }]);
   });
 
   it('refuses a disk larger than a Fly volume can be', () => {
