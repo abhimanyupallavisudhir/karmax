@@ -1,4 +1,7 @@
 import crypto from 'node:crypto';
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
+import zlib from 'node:zlib';
 import { describe, expect, it } from 'vitest';
 import { S3ObjectStore, checksumHeader, managedS3Options, verifiesChecksums } from '../src/store/objects.js';
 
@@ -198,6 +201,35 @@ ${keys.map(([key, size]) => `<Contents><Key>${key}</Key><LastModified>2026-10-01
       init.signal!.addEventListener('abort', () => reject(init.signal!.reason));
     })) as typeof globalThis.fetch;
     await expect(r2(fetch).delete('k', { timeoutMs: 20 })).rejects.toThrow(/timeout|abort/i);
+  });
+
+  // R2 gzips a compressible type (text/html, text/markdown, …) on the fly for a
+  // client that accepts it, and then sends no Content-Length, on GET and HEAD.
+  // Node's fetch asks for gzip by default, so a saved HTML report could not be
+  // served whole (no size) and HEAD reported 0 bytes (tavya.io, 2026-10-20).
+  it('reads the stored bytes and their size from a store that compresses for clients that accept it', async () => {
+    const html = Buffer.from(`<!doctype html><title>report</title>${'<p>evidence</p>'.repeat(4096)}`);
+    const server = http.createServer((req, res) => {
+      const headers: Record<string, string> = { 'content-type': 'text/html; charset=utf-8', etag: '"e"' };
+      if (/\bgzip\b/.test(String(req.headers['accept-encoding'] ?? '')) && !req.headers.range) {
+        res.writeHead(200, { ...headers, 'content-encoding': 'gzip' });
+        return void res.end(req.method === 'HEAD' ? undefined : zlib.gzipSync(html));
+      }
+      res.writeHead(200, { ...headers, 'content-length': String(html.length) });
+      res.end(req.method === 'HEAD' ? undefined : html);
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const store = new S3ObjectStore({ endpoint: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+        bucket: 'tavya-objects', region: 'auto', accessKeyId: 'AKIDEXAMPLE', secretAccessKey: SECRET });
+      const whole = await store.getStream('artifacts/report/index.html');
+      expect(whole.bytes).toBe(html.length);
+      const chunks: Buffer[] = [];
+      for await (const chunk of whole.body) chunks.push(chunk);
+      expect(Buffer.concat(chunks).equals(html)).toBe(true);
+      expect((await store.get('artifacts/report/index.html')).equals(html)).toBe(true);
+      expect(await store.head('artifacts/report/index.html')).toEqual({ bytes: html.length, etag: 'e' });
+    } finally { server.close(); }
   });
 });
 

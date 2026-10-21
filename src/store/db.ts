@@ -9159,6 +9159,13 @@ export class Store {
     return row ? rowToPreviewLease(row) : undefined;
   }
 
+  /** The lease a preview host belongs to (each lease has its own). */
+  async previewLeaseByHostname(hostname: string): Promise<PreviewLease | undefined> {
+    if (!hostname) return undefined;
+    const row = await this.db.prepare('SELECT * FROM preview_leases WHERE hostname=?').get(hostname.toLowerCase());
+    return row ? rowToPreviewLease(row) : undefined;
+  }
+
   async listPreviewLeases(taskId: string): Promise<PreviewLease[]> {
     return ((await this.db.prepare('SELECT * FROM preview_leases WHERE taskId=? ORDER BY createdAt DESC').all(taskId)) as any[])
       .map(rowToPreviewLease);
