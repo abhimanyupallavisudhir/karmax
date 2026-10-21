@@ -11448,11 +11448,9 @@ async function openArtifact(resolved, refresh) {
   }
   return showArtifactViewer({ name, url: resolved.url, view, text: await res.text() });
 }
-// Approve ONE branch of a multi-PR task. It records that this branch has been
-// reviewed at the commit it is on now; `confirm` still passes the gate.
-function wireCheckoutApprovals(v) {
-  // A branch's pull request (software-dev ≥1.30) is approved on its own task:
-  // the same Confirm its page offers, from here.
+// A branch's pull request (software-dev ≥1.30) is approved on its own task:
+// the same Confirm its page offers, from its row under Branches.
+function wirePullRequestApprovals() {
   document.querySelectorAll('[data-approve-pr]').forEach((btn) =>
     btn.addEventListener('click', async () => {
       btn.disabled = true;
@@ -11465,22 +11463,6 @@ function wireCheckoutApprovals(v) {
       } catch (e) {
         btn.disabled = false;
         toast(e?.message || 'Could not approve that pull request', true);
-      }
-    }),
-  );
-  document.querySelectorAll('[data-approve-checkout]').forEach((btn) =>
-    btn.addEventListener('click', async () => {
-      const name = btn.getAttribute('data-approve-checkout');
-      btn.disabled = true;
-      try {
-        await api(`/api/tasks/${v.taskId}/signal`, {
-          method: 'POST',
-          body: JSON.stringify({ signal: 'approveCheckout', text: name }),
-        });
-        toast(`Approved ${name}`);
-      } catch (e) {
-        btn.disabled = false;
-        toast(e?.message || 'Could not approve that branch', true);
       }
     }),
   );
@@ -11931,14 +11913,10 @@ function forkSourcesSection(v) {
   </section>`;
 }
 
-// The branches a multi-PR task is opening pull requests for (SPEC §11.1). Each is
-// its own reviewable unit, so each gets a row: where it lands, what it stacks on,
-// its pull request, and — at Review — an Approve button.
-//
-// Approving marks a branch as reviewed AT ITS CURRENT HEAD. That is what makes the
-// loop-back cheap: send a follow-up about one branch, and when the task comes back
-// from Do the ones the agent did not touch are still approved, so only the changed
-// work needs another look. Confirm PR remains the single act that passes Review.
+// The branches a multi-PR task is opening pull requests for (SPEC §11.1). Each
+// row says where its branch's newest pull request is and links to it; a pull
+// request of its own (software-dev ≥1.30) is approved right in its row. The
+// task's own proposal has one approval for all its branches: Confirm PR.
 // Where a branch's pull request (its sub-task, software-dev ≥1.30) is:
 // [label, chip tone, approvable here].
 function branchPullRequestState(view, lane) {
@@ -11980,14 +11958,15 @@ function checkoutsSection(v) {
   const shipped = pullRequestLanes(v).latest;
   // One branch without a pull request of its own: `branch`/`prs` already say it all.
   if (!checkouts.length || (checkouts.length < 2 && !shipped.size)) return '';
-  const atReview = v.stage === 'review' && (v.actions || []).some((a) => a.name === 'confirm');
   const summaries = new Map((v.subTaskSummaries || []).map((summary) => [summary.id, summary]));
   const rows = checkouts.map((c) => {
     const lane = shipped.get(c.name);
-    if (lane) {
+    // The task's own proposal of a branch comes after every pull request of
+    // its own settled, so a pull request there is the newest (pramana#102).
+    if (lane && (lane.state === 'open' || !c.pr)) {
       const rec = summaries.get(lane.childTaskId) || taskRecord(lane.childTaskId);
       const [label, tone, approvable] = branchPullRequestState(rec?.lastView, lane);
-      return `<div class="checkout-row ${lane.state === 'landed' ? 'approved' : ''}" data-branch-state="${esc(label)}">
+      return `<div class="checkout-row ${lane.state === 'landed' ? 'landed' : ''}" data-branch-state="${esc(label)}">
       <span class="checkout-mark">${lane.state === 'landed' ? '✓' : ''}</span>
       <b>${esc(c.name)}</b>
       <span class="mono" style="color:var(--ink-3)">⎇ ${esc(c.branch)}</span>
@@ -12003,25 +11982,29 @@ function checkoutsSection(v) {
       ? `<a class="pr-link ${c.pr.merged ? 'merged' : c.pr.state === 'closed' ? 'closed' : 'open'}"
            href="${esc(safeHref(c.pr.url))}" target="_blank" rel="noopener">⇱ #${c.pr.number}</a>`
       : '';
-    return `<div class="checkout-row ${c.approved ? 'approved' : ''}">
-      ${atReview || c.approved ? `<span class="checkout-mark" title="${c.approved ? 'Approved at this commit' : 'Not yet approved'}">${c.approved ? '✓' : '○'}</span>` : '<span class="checkout-mark"></span>'}
+    const [label, tone] = proposalState(v, c);
+    return `<div class="checkout-row ${label === 'Landed' ? 'landed' : ''}"${label ? ` data-branch-state="${esc(label)}"` : ''}>
+      <span class="checkout-mark">${label === 'Landed' ? '✓' : ''}</span>
       <b>${esc(c.name)}</b>
       <span class="mono" style="color:var(--ink-3)">⎇ ${esc(c.branch)}</span>
       <span style="color:var(--ink-3)">${esc(dest)}</span>
-      ${c.head ? `<span class="mono" style="color:var(--ink-3)">${esc(c.head.slice(0, 7))}</span>` : ''}
-      ${pr}
       <span style="flex:1"></span>
-      ${atReview && !c.approved ? `<button class="btn sm" data-approve-checkout="${esc(c.name)}">Approve</button>` : ''}
+      ${label ? `<span class="chip ${esc(tone)}">${esc(label)}</span>` : ''}
+      ${pr}
     </div>`;
   }).join('');
-  const pending = checkouts.filter((c) => !c.approved).length;
   return `<div class="section-h">Branches</div>
-    <div class="card checkout-list">
-      ${rows}
-      ${atReview ? `<div class="task-sub" style="margin-top:6px">${pending
-        ? `${pending} of ${checkouts.length} still to review ${policyTip('Approving one keeps it approved when the task comes back from Do, as long as the agent does not touch it. Confirm PR approves the rest and passes Review.')}`
-        : 'Every branch approved. Confirm PR to pass Review.'}</div>` : ''}
-    </div>`;
+    <div class="card checkout-list">${rows}</div>`;
+}
+
+// Where a branch of the task's own proposal is, from its pull request and the
+// task's stage: [label, chip tone], or [] while there is nothing to say.
+function proposalState(v, c) {
+  if (c.pr?.merged) return ['Landed', 'done'];
+  if (c.pr?.state === 'closed') return ['Closed', 'cancelled'];
+  if (v.stage === 'review' && (v.actions || []).some((a) => a.name === 'confirm')) return ['In review', 'waiting'];
+  if (v.stage === 'merge') return ['Landing', 'active'];
+  return [];
 }
 
 // The details rail: everything about the task that is not the conversation,
@@ -12117,7 +12100,7 @@ function wireTaskRail(v) {
   });
   wireTaskOrg(v);
   wireNotes(v);
-  wireCheckoutApprovals(v);
+  wirePullRequestApprovals();
   $('#tp-rail [data-open-terminal]')?.addEventListener('click', () => {
     S.taskRailOverlay = false; // the shell shows in place of the floating rail
     toggleTaskTerminal(v);

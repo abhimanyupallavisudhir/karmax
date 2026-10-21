@@ -21,7 +21,7 @@ const context = vm.createContext({
   esc: (s) => String(s ?? ''), policyTip: (text) => `<tip>${text}</tip>`, safeHref: String,
   taskRecord: () => undefined, numLabel: (id) => id, taskUrl: (id, rec) => `/acme/web/tasks/${rec?.num ?? id}`,
 });
-vm.runInContext(['branchPullRequestState', 'pullRequestLanes', 'checkoutsSection'].map(extract).join('\n'), context);
+vm.runInContext(['branchPullRequestState', 'pullRequestLanes', 'proposalState', 'checkoutsSection'].map(extract).join('\n'), context);
 const row = (html, name) => html.split('<div class="checkout-row').find((part) => part.includes(`<b>${name}</b>`)) ?? '';
 const lane = (checkout, childTaskId, state = 'open') =>
   ({ checkout, childTaskId, branch: `tavya/${childTaskId}`, fromBranch: `tavya/t-${checkout}`, head: 'h', target: 'main', state, requestId: 'r' });
@@ -49,15 +49,50 @@ test('each branch shows where its pull request is, with Approve while it waits f
   for (const name of ['api', 'web', 'cli', 'old']) assert.doesNotMatch(row(html, name), /data-approve/);
 });
 
-test('before 1.30, Approve shows only at the task-wide Review', () => {
+// The task's own proposal is approved by Confirm PR, all of it at once: its
+// rows say where each pull request is, without an Approve of their own.
+test('at the task\'s own Review, its branches are in review, approved by Confirm PR alone', () => {
   const checkouts = [
-    { name: 'app', branch: 'tavya/t', base: 'main', head: 'a1', approved: false },
-    { name: 'docs', branch: 'tavya/t-docs', base: 'main', head: 'd1', approved: false },
+    { name: 'app', branch: 'tavya/t', base: 'main', head: 'a1', approved: false,
+      pr: { repo: 'app', number: 7, url: 'https://github.com/o/app/pull/7', state: 'open' } },
+    { name: 'docs', branch: 'tavya/t-docs', base: 'main', head: 'd1', approved: false,
+      pr: { repo: 'docs', number: 8, url: 'https://github.com/o/docs/pull/8', state: 'open' } },
   ];
-  assert.doesNotMatch(context.checkoutsSection({ stage: 'do', actions: [], checkouts }), /data-approve/);
-  const review = context.checkoutsSection({ stage: 'review', actions: [{ name: 'confirm' }], checkouts });
-  assert.match(review, /data-approve-checkout="docs"/);
-  assert.match(review, /2 of 2 still to review/);
+  const doing = context.checkoutsSection({ stage: 'do', actions: [], checkouts });
+  assert.doesNotMatch(doing, /data-approve|In review/);
+  const review = context.checkoutsSection({ stage: 'review', status: 'waiting', actions: [{ name: 'confirm' }], checkouts });
+  assert.doesNotMatch(review, /data-approve|still to review|○/, 'Confirm PR is the one approval');
+  assert.match(row(review, 'docs'), /In review/);
+  assert.match(row(review, 'docs'), /#8/);
+  const landing = context.checkoutsSection({ stage: 'merge', status: 'active', actions: [],
+    checkouts: [{ ...checkouts[0], pr: { ...checkouts[0].pr, merged: true } }, checkouts[1]] });
+  assert.match(row(landing, 'app'), /Landed/);
+  assert.match(row(landing, 'app'), /class="checkout-mark">✓/);
+  assert.match(row(landing, 'docs'), /Landing/);
+});
+
+// pramana#102: "pramana" landed one pull request mid-work, then went out again
+// with the wiki in the task's own proposal. Its row is that proposal's pull
+// request, not the one that landed before.
+test('a branch proposed again by the task shows its newest pull request', () => {
+  const html = context.checkoutsSection({
+    stage: 'review', status: 'waiting', targetBranch: 'master', actions: [{ name: 'confirm' }],
+    checkouts: [
+      { name: 'pramana', branch: 'tavya/t', base: 'master', target: 'master',
+        pr: { repo: 'pramana', number: 91, url: 'https://github.com/o/pramana/pull/91', state: 'open' } },
+      { name: 'pramana-wiki', branch: 'tavya/t', base: 'main', target: 'main',
+        pr: { repo: 'pramana-wiki', number: 86, url: 'https://github.com/o/pramana-wiki/pull/86', state: 'open' } },
+    ],
+    shipments: [{ ...lane('pramana', 'pr-76', 'landed'), target: 'master' }],
+    subTaskSummaries: [{ id: 'pr-76', title: 'x', workflow: 'software-dev', pullRequest: { checkout: 'pramana', target: 'master' },
+      lastView: { stage: 'done', status: 'done' } }],
+  });
+  assert.match(row(html, 'pramana'), /#91/);
+  assert.match(row(html, 'pramana'), /In review/);
+  assert.doesNotMatch(row(html, 'pramana'), /Landed|data-open="pr-76"/);
+  assert.match(row(html, 'pramana-wiki'), /#86/);
+  assert.match(row(html, 'pramana-wiki'), /In review/);
+  assert.doesNotMatch(html, /data-approve/);
 });
 
 // pramana#102: a run replaced before the fix forgot its pull requests; each

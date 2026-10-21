@@ -720,7 +720,7 @@ a.git-repo-name:hover { color:var(--accent); }
 }
 .checkout-row:last-of-type { border-bottom: 0; }
 .checkout-mark { color: var(--ink-3); width: 12px; text-align: center; }
-.checkout-row.approved .checkout-mark { color: var(--merged, var(--accent)); }
+.checkout-row.landed .checkout-mark { color: var(--merged, var(--accent)); }
 
 /* ── buttons ────────────────────────────────────────────────── */
 .btn {

@@ -3,7 +3,7 @@ import vm from 'node:vm';
 import { describe, expect, it, vi } from 'vitest';
 
 const app = fs.readFileSync('web/app.js', 'utf8');
-const source = app.slice(app.indexOf('function artifactTextKind('), app.indexOf('// Approve ONE branch'));
+const source = app.slice(app.indexOf('function artifactTextKind('), app.indexOf('function wirePullRequestApprovals('));
 const wire = app.slice(app.indexOf('function wireReviewActions('), app.indexOf('const resourceReviewCache'));
 const button = app.slice(app.indexOf('function reviewActionBtn('), app.indexOf('function promptText('));
 
