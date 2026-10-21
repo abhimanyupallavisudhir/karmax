@@ -5409,9 +5409,8 @@ export class Store {
    * there is credit again or the month ends. Returns how many owners were
    * newly told (they are emailed too). */
   async syncComputeInbox(organizationId: string, userIds: string[],
-    notice: { month: string; usedMicros: number; creditMicros: number; renewsAt: number;
-      /** What happened (src/world/compute-notices.ts); a new stage is a new item. */
-      stage?: 'spent' | 'reminder' | 'hibernated'; hibernateAt?: number; computers?: number } | undefined,
+    /** A new stage is a new item (src/world/compute-notices.ts). */
+    notice: Omit<import('../domain/types.js').ComputeNotice, 'kind'> | undefined,
     createdAt = Date.now()): Promise<number> {
     return this.db.transaction(async () => {
       (await this.lockOrganization(organizationId));

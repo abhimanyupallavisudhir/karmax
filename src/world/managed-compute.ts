@@ -1,6 +1,6 @@
 import { ProviderCapacityFull } from '../agent/limits.js';
 import { BRAND } from '../domain/brand.js';
-import { computeChargeMicros } from '../domain/entitlements.js';
+import { COMPUTE_TERMS, computeChargeMicros } from '../domain/entitlements.js';
 import { providerDefaults } from '../domain/computer-limits.js';
 import { flyComputeDollarsPerSecond, flyGuest, flyVolumeDollarsPerSecond } from './fly.js';
 import { costMicrosPerSecond } from './runners.js';
@@ -169,7 +169,8 @@ export async function assertComputeCredit(store: Store, organizationId: string, 
  * renews it `renewBeforeMs` before the hold ends; it starts only if
  * `minStartMs` of it fits. A hold that cannot be renewed ends the work there:
  * a turn is stopped and its computer parked, a wait on jobs returns. */
-export const COMPUTE_HOLD = { windowMs: 15 * 60_000, renewBeforeMs: 5 * 60_000, minStartMs: 5 * 60_000 };
+export const COMPUTE_HOLD = { windowMs: COMPUTE_TERMS.holdMinutes * 60_000, renewBeforeMs: 5 * 60_000,
+  minStartMs: COMPUTE_TERMS.minStartMinutes * 60_000 };
 
 /** Below this much credit left, auto top-up buys more. */
 export const COMPUTE_LOW_MICROS = 2_000_000;

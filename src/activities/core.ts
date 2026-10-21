@@ -3586,7 +3586,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         }));
         (await taskSecrets.refresh());
         if (remoteWorld && args.role === 'do' && deps.client) stopDiskWatch = watchTurnDisk(world, args.taskId, organizationId);
-        if (computeHold) stopComputeWatch = watchComputeHold(computeHold, computeHoldEndsAt, { taskId: args.taskId,
+        if (computeHold && Number.isFinite(computeHoldEndsAt)) stopComputeWatch = watchComputeHold(computeHold, computeHoldEndsAt, { taskId: args.taskId,
           tell: args.role === 'do' && !!deps.client, stop: (reason) => computeStop.abort(reason) });
         result = await runRuntimeTurn({ version: KARMAX_RUNTIME_PROTOCOL, input: {
           profile,

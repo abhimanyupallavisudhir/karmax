@@ -34,6 +34,25 @@ export const STORAGE_PACK = Object.freeze({ bytes: 100 * GIB, monthlyPriceCents:
  * a dollar paid buys a dollar of compute at tavya's prices. */
 export const COMPUTE_PACK = Object.freeze({ creditMicros: 10_000_000, monthlyPriceCents: 1_000 });
 
+/** Managed compute's rules that the billing terms state (src/launch/legal.ts;
+ * wiki features/managed-compute): holds, auto top-up, and the grace before a
+ * spent organization's parked disks are hibernated. The code takes its
+ * numbers from here, so the terms and the behaviour cannot drift apart. */
+export const COMPUTE_TERMS = Object.freeze({
+  /** Work on a managed computer sets aside its next minutes… */
+  holdMinutes: 15,
+  /** …and starts only if this many fit. */
+  minStartMinutes: 5,
+  /** One auto top-up: this much credit for this much money. */
+  topUpCents: 1_000,
+  /** Days a spent organization's parked disks are kept… */
+  graceDays: 3,
+  /** …unless they would cost this much compute (at tavya's prices) past the credit first… */
+  overrunCapMicros: 10_000_000,
+  /** …but never less than this many hours. */
+  minGraceHours: 1,
+});
+
 /** Managed compute is charged at the provider's own list price times this:
  * it covers the payment provider's fee, idle capacity and abuse, and is the
  * one number behind every compute price tavya shows. */

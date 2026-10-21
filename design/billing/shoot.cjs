@@ -39,6 +39,12 @@ const screens = {
     computeCreditMicros: 15e6, includedComputeCreditMicros: 5e6, computePacks: 1, compute: compute(12.4e6, 15e6) },
   { managed: true, providerConfigured: true, plan: 'individual', billedPlan: 'individual', status: 'active', catalog, canManage: true, ...packs,
     storagePacks: 1, computePacks: 1, currentPeriodEnd: Date.UTC(2026, 10, 3) }],
+  // Auto top-up on: $10 bought this month and kept until used, $0.85 held by computers running now.
+  'plan-auto-top-up': [{ ...base, plan: 'individual', planName: 'Individual', currentMonthlyPriceCents: 900, maxMembers: 1, maxActiveAgentRuns: 10,
+    activeAgentRuns: 2, storageQuotaBytes: 50 * GB, includedStorageBytes: 50 * GB, storageUsedBytes: 21 * GB,
+    computeCreditMicros: 5e6, includedComputeCreditMicros: 5e6, compute: { ...compute(9.2e6, 5e6), topUpMicros: 10e6, heldMicros: 0.85e6 } },
+  { managed: true, providerConfigured: true, plan: 'individual', billedPlan: 'individual', status: 'active', catalog, canManage: true, ...packs,
+    currentPeriodEnd: Date.UTC(2026, 10, 3), autoTopUp: { enabled: true, offered: true, capCents: 5000, amountCents: 1000, spentCents: 1000 } }],
   'plan-gifted-operator': [{ ...base, plan: 'team', planName: 'Team', currentMemberCount: 4, maxMembers: null, maxActiveAgentRuns: 35, monthlyAdditionalActiveUserPriceCents: 500,
     storageQuotaBytes: 330 * GB, includedStorageBytes: 130 * GB, giftedStoragePacks: 2, storageUsedBytes: 41 * GB,
     computeCreditMicros: 29e6, includedComputeCreditMicros: 19e6, giftedComputePacks: 1, compute: compute(2.1e6, 29e6) },

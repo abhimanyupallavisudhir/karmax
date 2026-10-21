@@ -89,7 +89,7 @@ describe('spent compute credit', () => {
     await f.spend();
     await notifyComputeCredit(f.deps, T);
     await notifyComputeCredit(f.deps, T + 10 * 60_000);
-    expect((await f.store.listInbox('owner', f.organization.id))[0]!.subject.hibernateAt).toBe(hibernateAt(T, perHour));
+    expect((await f.store.listInbox('owner', f.organization.id))[0]!.subject).toMatchObject({ hibernateAt: hibernateAt(T, perHour) });
     // No reminder for a grace shorter than a day; hibernated when it ends.
     expect(await notifyComputeCredit(f.deps, T + 2 * HOUR)).toBe(0);
     expect(await notifyComputeCredit(f.deps, T + 2.4 * HOUR)).toBe(1);

@@ -168,14 +168,28 @@ describe('paid-launch policies', () => {
       + 'unless a task still uses them; data in a storage bucket an organization connects itself keeps every version.');
   });
 
-  it('states how packs and managed compute are billed, as a new policy version (2026-10-18.1)', () => {
+  it('states how packs and managed compute are billed (2026-10-18.1)', () => {
     const billing = policyDocument('billing')!.sections.find((section) => section.heading === 'Packs and managed compute')!.paragraphs.join(' ');
     expect(billing).toContain('twice the provider’s list price');
-    expect(billing).toContain('Unused compute does not carry over to the next month and is not refunded.');
-    expect(billing).toContain('new agent work on managed computers waits');
+    expect(billing).toContain('Unused compute of the month’s amount does not carry over to the next month and is not refunded.');
+  });
+
+  it('states compute holds, auto top-up and hibernation after spent compute, as a new policy version (2026-10-22.1)', () => {
+    const billing = policyDocument('billing')!.sections.find((section) => section.heading === 'Packs and managed compute')!.paragraphs.join(' ');
+    expect(billing).toContain('tavya sets aside the cost of its next 15 minutes from the compute left');
+    expect(billing).toContain('What is set aside is not a charge');
+    expect(billing).toContain('Work starts only if at least 5 minutes of its computer fit.');
+    expect(billing).toContain('its turn is stopped and its computer paused with its files kept');
+    expect(billing).toContain('Auto top-up is off unless an organization owner turns it on in Plan & billing');
+    expect(billing).toContain('$10 of managed compute for $10, a one-time charge made at once to the payment method saved for the subscription');
+    expect(billing).toContain('never more in a calendar month than the monthly limit the owner set');
+    expect(billing).toContain('carries over from month to month until used');
+    expect(billing).toContain('If it is still used up 3 days later');
+    expect(billing).toContain('files Git ignores (such as installed dependencies, build output and caches) and running processes are deleted and not restored');
+    expect(JSON.stringify(policyDocument('billing'))).toContain('compute top-ups are charged when bought');
     // A changed disclosure is a new version: acceptance evidence names the text a person saw.
-    expect(policyDocument('billing')!.version).toBe('2026-10-18.1');
-    expect(policyDocument('billing')!.effectiveDate).toBe('October 18, 2026');
+    expect(policyDocument('billing')!.version).toBe('2026-10-22.1');
+    expect(policyDocument('billing')!.effectiveDate).toBe('October 22, 2026');
   });
 
   it('incorporates a scoped processing addendum without claiming execution or launch approval', () => {

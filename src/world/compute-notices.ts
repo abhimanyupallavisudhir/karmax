@@ -1,6 +1,6 @@
 import type { Store } from '../store/db.js';
 import type { WorldHandleRef } from '../domain/types.js';
-import { computeChargeMicros } from '../domain/entitlements.js';
+import { COMPUTE_TERMS, computeChargeMicros } from '../domain/entitlements.js';
 import { isVmWorldProvider } from '../domain/computer.js';
 import { computeCredit, machineRate } from './managed-compute.js';
 
@@ -17,10 +17,10 @@ const when = (ms: number) => `${new Date(ms).toISOString().slice(0, 16).replace(
  * spent `confirmMs`, so an auto top-up under way is not reported), a day
  * before, and once it is done. */
 export const COMPUTE_SPENT = {
-  graceMs: 3 * 24 * 60 * 60_000,
+  graceMs: COMPUTE_TERMS.graceDays * 24 * 60 * 60_000,
   reminderBeforeMs: 24 * 60 * 60_000,
-  overrunCapMicros: 10_000_000,
-  minGraceMs: 60 * 60_000,
+  overrunCapMicros: COMPUTE_TERMS.overrunCapMicros,
+  minGraceMs: COMPUTE_TERMS.minGraceHours * 60 * 60_000,
   confirmMs: 10 * 60_000,
 };
 

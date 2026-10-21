@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import type { ComputeTopUp, Store } from '../store/db.js';
 import { ABSENT_WRITE_SETTLE_MS, type SubscriptionBillingService } from './subscriptions.js';
 import { BillingRequestRejected } from './paddle.js';
+import { COMPUTE_TERMS } from '../domain/entitlements.js';
 import { COMPUTE_LOW_MICROS, computeCredit, computeMonth } from '../world/managed-compute.js';
 
 /** Auto top-up (wiki features/managed-compute § Auto top-up): an organization
@@ -11,8 +12,9 @@ import { COMPUTE_LOW_MICROS, computeCredit, computeMonth } from '../world/manage
  * until used. Off by default; offered only once the billing terms that
  * describe it are approved (`offered`). */
 export const COMPUTE_TOP_UP = {
-  amountCents: 1_000,
-  creditMicros: 10_000_000,
+  amountCents: COMPUTE_TERMS.topUpCents,
+  /** A dollar paid buys a dollar of compute at tavya's prices, as packs do. */
+  creditMicros: COMPUTE_TERMS.topUpCents * 10_000,
   defaultCapCents: 5_000,
   /** A declined card stops top-ups this long, and the owners are told. */
   declinedPauseMs: 24 * 60 * 60_000,
