@@ -9,6 +9,7 @@ import {
   githubRequiredCheckKey,
   reconcileGithubActionsRuns,
   renderGithubActionsFailure,
+  summarizeGithubActionsFailure,
   type GithubActionsFailureInspection,
 } from '../src/integrations/github-actions.js';
 
@@ -381,6 +382,45 @@ describe('GitHub Actions API', () => {
     expect(error).toBeInstanceOf(GithubActionsApiError);
     expect(error.status).toBe(403);
     expect(actionLogExcerpt('noise\nbefore\nError: broken\nafter\n')).toContain('before\nError: broken\nafter');
+  });
+
+  // Task #735 (CI #2250): GitHub locked the account over a declined bill, so
+  // every job ended in 2 s with no steps and no log (404). The only evidence
+  // was each check run's annotation, and the person was told nothing but
+  // "Inspect the startup diagnostics".
+  it('reports why GitHub never started a job, without treating it as ownership evidence', async () => {
+    const billing = 'The job was not started because your account is locked due to a billing issue.';
+    const paths: string[] = [];
+    const api = new GithubActionsApi('token', { apiBase: 'https://api.github.test', fetch: (async (input) => {
+      const url = new URL(String(input)); paths.push(url.pathname);
+      const job = (id: number, name: string, steps: unknown[] = []) => ({ id, name, status: 'completed', conclusion: 'failure',
+        steps, check_run_url: `https://api.github.test/repos/acme/app/check-runs/${id + 1000}` });
+      if (url.pathname.endsWith('/runs/42')) return Response.json(run({ run_attempt: 1 }));
+      if (url.pathname.endsWith('/runs/42/jobs')) return Response.json({ jobs: [job(98, 'tests 1/2'), job(99, 'tests 2/2'),
+        job(97, 'lint', [{ number: 2, name: 'Lint', status: 'completed', conclusion: 'failure' }])] });
+      if (url.pathname.endsWith('/runs/42/artifacts')) return Response.json({ artifacts: [] });
+      if (/\/check-runs\/\d+\/annotations$/.test(url.pathname)) return Response.json([
+        { path: '.github', start_line: 1, end_line: 1, annotation_level: 'failure', message: billing },
+        { path: '.github', start_line: 1, end_line: 1, annotation_level: 'notice', message: 'The ubuntu-latest label will migrate' },
+      ]);
+      return new Response('not found', { status: 404 });
+    }) as typeof fetch });
+    const inspected = await api.inspectFailure('acme/app', 42);
+    expect(inspected.failedJobs.map((job) => job.startupErrors)).toEqual([[billing], [billing], undefined]);
+    // A job that ran steps can annotate anything; only never-started jobs are asked.
+    expect(paths).not.toContain('/repos/acme/app/check-runs/1097/annotations');
+    expect(inspected.notices).toEqual(['Could not read logs for lint: GitHub job log download failed (404)']);
+
+    const decision = classifyGithubActionsFailure({ ...inspected, failedJobs: inspected.failedJobs.slice(0, 2),
+      jobs: inspected.jobs.slice(0, 2), notices: [] });
+    expect(decision.disposition).toBe('human');
+    const summary = summarizeGithubActionsFailure(decision);
+    expect(summary).toContain(`GitHub did not start the failed jobs: ${billing}`);
+    expect(summarizeGithubActionsFailure({ ...decision, inspection: { ...inspected } }))
+      .toContain(`GitHub did not start tests 1/2, tests 2/2: ${billing}`);
+    expect(summary.split(billing)).toHaveLength(2);
+    expect(summary).not.toContain('Could not read logs');
+    expect(renderGithubActionsFailure(decision)).toContain(`GitHub did not start this job: ${billing}`);
   });
 
   it('rejects private signed-log redirects before making an unauthenticated SSRF request', async () => {
