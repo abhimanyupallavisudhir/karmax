@@ -2137,10 +2137,9 @@ async function softwareDevImpl(
     if (responsiveHumanHold && humanPauseActive)
       humanPauseWake = { kind: 'openPr' };
   });
-  // Approving one branch is the same decision as Confirm, taken for one pull
-  // request instead of all of them — so a human can approve what is finished and
-  // send a follow-up about the rest. It is recorded against that branch's CURRENT
-  // head, which is what makes it lapse by itself if the Do agent moves it.
+  // A mark that one branch was reviewed at its current head. Nothing sends it
+  // any more (Confirm PR approves every branch; a branch's own pull request is
+  // approved on it); kept for executions whose history carries it.
   setHandler(approveCheckoutSignal, ({ name }) => {
     const head = checkoutHeads[name];
     if (head) checkoutApprovals = { ...checkoutApprovals, [name]: head };

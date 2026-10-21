@@ -106,7 +106,16 @@ describe('task stage transitions', () => {
     } finally { await f.store.close(); }
   });
 
-  it.each(['openPr', 'confirm', 'retry', 'approveCheckout'])('journals accepted %s to supersede idle parking', async signal => {
+  // One Review, one approval: Confirm PR approves every branch of the task's
+  // own proposal, so a per-branch mark is not something a task takes.
+  it('refuses approveCheckout', async () => {
+    const f = await fixture();
+    try {
+      await expect(f.api.signalTask(f.token, f.task.id, 'approveCheckout', 'docs')).rejects.toThrow('cannot be sent to a task');
+    } finally { await f.store.close(); }
+  });
+
+  it.each(['openPr', 'confirm', 'retry'])('journals accepted %s to supersede idle parking', async signal => {
     const f = await fixture();
     try {
       await f.api.signalTask(f.token, f.task.id, signal);

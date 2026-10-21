@@ -44,7 +44,7 @@ async function run({ exitFirst }) {
   global.setStopBtn = () => {};
   global.stripAnsi = (value) => value;
   global.toast = () => {};
-  global.wireCheckoutApprovals = () => {};
+  global.wirePullRequestApprovals = () => {};
   global.api = async () => ({ kind: 'run', procId: 'execution-1', server: true,
     openUrls: ['https://p-1.preview.tavya.test/preview/preview-1/?token=t'] });
   eval(`${extractFn('wireReviewActions')}; global.wireReviewActions = wireReviewActions;`);

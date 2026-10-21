@@ -99,13 +99,6 @@ describe('software-dev pipeline: follow-ups, confirmation modes and recovery (re
     expect(review.checkouts.every((c: any) => c.head)).toBe(true);
     expect(review.checkouts.some((c: any) => c.approved)).toBe(false);
 
-    // Approving ONE branch marks it without passing the gate — only confirm does
-    // that, so the authorization/quorum rules around confirm cannot be routed past.
-    await handle.signal('approveCheckout', { name: 'docs' });
-    await expect.poll(async () => (await view(handle)).checkouts.find((c: any) => c.name === 'docs')?.approved,
-      { timeout: 5_000 }).toBe(true);
-    expect((await view(handle)).stage).toBe('review');
-
     await handle.signal('confirm');
     const result = await handle.result();
     expect(result.stage).toBe('done');
