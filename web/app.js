@@ -4808,11 +4808,11 @@ function fmtWhen(epoch, now = Date.now()) {
   const date = new Date(epoch);
   return date.toLocaleDateString([], { month: 'short', day: 'numeric', ...(date.getFullYear() !== new Date(now).getFullYear() ? { year: 'numeric' } : {}) });
 }
-function rowWhen(t) {
+function rowWhen(t, now = Date.now()) {
   const at = rowTime(t);
   if (!at) return '';
   const full = new Date(at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-  return `<time class="row-when" datetime="${new Date(at).toISOString()}" title="Updated ${esc(full)}">${esc(fmtWhen(at))}</time>`;
+  return `<time class="row-when" datetime="${new Date(at).toISOString()}" title="Updated ${esc(full)}">${esc(fmtWhen(at, now))}</time>`;
 }
 
 // Evaluate the working query on the server and stash the result. The default list
