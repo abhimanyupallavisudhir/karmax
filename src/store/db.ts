@@ -84,6 +84,7 @@ import {
 } from '../domain/types.js';
 import { resourceDriver } from '../domain/resource-drivers.js';
 import {
+  computeChargeMicros,
   EntitlementError,
   isHostedPlanId,
   organizationEntitlements,
@@ -892,6 +893,20 @@ export class Store {
         kind TEXT NOT NULL, provider TEXT NOT NULL, model TEXT, fundingSource TEXT NOT NULL,
         state TEXT NOT NULL, reservedCostMicros INTEGER NOT NULL DEFAULT 0, createdAt INTEGER NOT NULL, releasedAt INTEGER
       );
+      CREATE TABLE IF NOT EXISTS compute_holds (
+        id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, taskId TEXT, worldId TEXT, provider TEXT NOT NULL,
+        purpose TEXT NOT NULL, activeMicrosPerHour INTEGER NOT NULL, diskMicrosPerHour INTEGER NOT NULL,
+        startedAt INTEGER NOT NULL, endsAt INTEGER NOT NULL, closedAt INTEGER
+      );
+      CREATE TABLE IF NOT EXISTS compute_topups (
+        id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, state TEXT NOT NULL, creditMicros INTEGER NOT NULL,
+        amountCents INTEGER NOT NULL, subscriptionId TEXT, transactionId TEXT, error TEXT,
+        requestedAt INTEGER NOT NULL, settledAt INTEGER
+      );
+      CREATE TABLE IF NOT EXISTS compute_credit_months (
+        organizationId TEXT NOT NULL, month TEXT NOT NULL, allowanceMicros INTEGER NOT NULL, drawnMicros INTEGER,
+        PRIMARY KEY (organizationId, month)
+      );
       CREATE TABLE IF NOT EXISTS promoted_artifacts (
         id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, projectId TEXT NOT NULL,
         taskId TEXT NOT NULL, objectKey TEXT NOT NULL, sha256 TEXT NOT NULL,
@@ -1196,6 +1211,9 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_world_leases_pool ON world_leases(runnerPoolId, state, priority DESC, createdAt);
       CREATE INDEX IF NOT EXISTS idx_usage_org_time ON usage_events(organizationId, startedAt);
       CREATE INDEX IF NOT EXISTS idx_usage_admissions_org ON usage_admissions(organizationId, kind, state, createdAt);
+      CREATE INDEX IF NOT EXISTS idx_compute_holds_org ON compute_holds(organizationId, endsAt);
+      CREATE INDEX IF NOT EXISTS idx_compute_topups_org ON compute_topups(organizationId, state, requestedAt);
+      CREATE INDEX IF NOT EXISTS idx_usage_managed_task ON usage_events(taskId, fundingSource, kind, endedAt);
       CREATE INDEX IF NOT EXISTS idx_artifacts_task ON promoted_artifacts(taskId, createdAt);
       CREATE INDEX IF NOT EXISTS idx_conversation_exports_used ON conversation_exports(usedAt);
       CREATE INDEX IF NOT EXISTS idx_conversation_exports_project ON conversation_exports(projectId);
@@ -5393,12 +5411,16 @@ export class Store {
    * there is credit again or the month ends. Returns how many owners were
    * newly told (they are emailed too). */
   async syncComputeInbox(organizationId: string, userIds: string[],
-    notice: { month: string; usedMicros: number; creditMicros: number; renewsAt: number } | undefined, createdAt = Date.now()): Promise<number> {
+    /** A new stage is a new item (src/world/compute-notices.ts). */
+    notice: Omit<import('../domain/types.js').ComputeNotice, 'kind'> | undefined,
+    createdAt = Date.now()): Promise<number> {
     return this.db.transaction(async () => {
       (await this.lockOrganization(organizationId));
       const ids = new Map<string, string>();
+      // The first stage keeps the id items had before stages, so none is sent twice.
+      const stage = notice?.stage && notice.stage !== 'spent' ? [notice.stage, notice.hibernateAt ?? null] : [];
       if (notice) for (const userId of new Set(userIds)) ids.set(`inbox_compute_${crypto.createHash('sha256')
-        .update(JSON.stringify([organizationId, userId, notice.month])).digest('hex').slice(0, 24)}`, userId);
+        .update(JSON.stringify([organizationId, userId, notice.month, ...stage])).digest('hex').slice(0, 24)}`, userId);
       const stale = ((await this.db.prepare(`SELECT id FROM inbox WHERE organizationId=? AND json_extract(subject, '$.kind')='compute'`)
         .all(organizationId)) as Array<{ id: string }>).map((row) => String(row.id)).filter((id) => !ids.has(id));
       if (stale.length) {
@@ -5411,7 +5433,8 @@ export class Store {
         const inserted = (await this.db.prepare(`INSERT OR IGNORE INTO inbox
           (id, organizationId, userId, eventSeq, taskId, kind, urgency, unread, actionable, createdAt, subject)
           VALUES (?, ?, ?, ?, ?, 'escalated', ?, 1, 1, ?, ?)`).run(
-          id, organizationId, userId, createdAt * 1000, `compute:${organizationId}`, urgencyRank('high'), createdAt,
+          id, organizationId, userId, createdAt * 1000, `compute:${organizationId}`,
+          urgencyRank(notice.stage === 'reminder' || notice.stage === 'hibernated' ? 'critical' : 'high'), createdAt,
           JSON.stringify({ kind: 'compute', ...notice })));
         if (!Number(inserted.changes)) continue;
         told++;
@@ -8759,6 +8782,161 @@ export class Store {
     return [...totals.values()].map((entry) => ({ ...entry, costMicros: Math.round(entry.costMicros), seconds: Math.round(entry.seconds) }));
   }
 
+  /** Compute holds (wiki features/managed-compute § Holds): what managed
+   * work about to run reserves against the organization's credit, beside
+   * `usage_events` and never billed. A hold reserves its machine's provider
+   * cost from `startedAt` to `endsAt` (or `closedAt`, when the work ended
+   * sooner), less what the provider has since booked for that task: so it is
+   * released as actual usage arrives, and stops counting `COMPUTE_HOLD_SETTLE_MS`
+   * after it ends whatever the provider reported. In provider cost micros. */
+  async computeHeldCostMicros(organizationId: string, now = Date.now(), exceptId?: string): Promise<number> {
+    const holds = (await this.db.prepare(`SELECT * FROM compute_holds WHERE organizationId=?
+      AND COALESCE(closedAt, endsAt)>?${exceptId ? ' AND id<>?' : ''}`)
+      .all(organizationId, now - COMPUTE_HOLD_SETTLE_MS, ...(exceptId ? [exceptId] : []))) as Array<Record<string, unknown>>;
+    if (!holds.length) return 0;
+    const booked = (await this.computeBookedUntil(organizationId, [...new Set(holds.map((hold) => String(hold.taskId ?? '')))]));
+    return Math.round(holds.reduce((total, hold) => total + heldCost(hold, booked.get(String(hold.taskId ?? ''))), 0));
+  }
+
+  /** When the provider's booked managed usage of each task ends, per kind. */
+  private async computeBookedUntil(organizationId: string, taskIds: string[]): Promise<Map<string, { active: number; disk: number }>> {
+    const out = new Map<string, { active: number; disk: number }>();
+    const ids = taskIds.filter(Boolean);
+    for (let offset = 0; offset < ids.length; offset += 200) {
+      const batch = ids.slice(offset, offset + 200);
+      const rows = (await this.db.prepare(`SELECT taskId, kind, MAX(endedAt) endedAt FROM usage_events
+        WHERE organizationId=? AND fundingSource='managed' AND kind IN ('world.active','world.disk')
+          AND taskId IN (${batch.map(() => '?').join(',')}) GROUP BY taskId, kind`).all(organizationId, ...batch)) as Array<Record<string, unknown>>;
+      for (const row of rows) {
+        const entry = out.get(String(row.taskId)) ?? { active: 0, disk: 0 };
+        entry[row.kind === 'world.disk' ? 'disk' : 'active'] = Number(row.endedAt);
+        out.set(String(row.taskId), entry);
+      }
+    }
+    return out;
+  }
+
+  /** Reserve (or extend) a compute hold until `until`, or as far as the
+   * organization's credit allows. Under the organization's usage lock, so two
+   * turns of one organization never both take its last dollars. Refused
+   * (undefined, nothing changed) when not even `minUntil` fits. `creditMicros`
+   * is the month's whole credit at tavya's prices (allowance and top-ups). */
+  async holdCompute(input: ComputeHoldInput, creditMicros: number, now = Date.now()): Promise<{ endsAt: number; startedAt: number } | undefined> {
+    return this.db.transaction(async () => {
+      (await this.db.lock(`usage:${input.organizationId}`));
+      const existing = (await this.db.prepare('SELECT * FROM compute_holds WHERE id=?').get(input.id)) as Record<string, unknown> | undefined;
+      if (existing && existing.organizationId !== input.organizationId) throw new Error('compute hold belongs to another organization');
+      const month = monthWindow(now);
+      const used = (await this.managedComputeCosts(month.from, month.to, input.organizationId)).reduce((total, row) => total + row.costMicros, 0);
+      const held = (await this.computeHeldCostMicros(input.organizationId, now, input.id));
+      const startedAt = existing ? Number(existing.startedAt) : now;
+      const row = { ...existing, ...input, startedAt, endsAt: now, closedAt: null };
+      const booked = (await this.computeBookedUntil(input.organizationId, [input.taskId ?? ''])).get(input.taskId ?? '');
+      // What this work has run since its last booked usage is owed whatever happens next.
+      const owed = heldCost(row, booked);
+      const free = creditMicros - computeChargeMicros(used + held + owed);
+      const perMs = computeChargeMicros(input.activeMicrosPerHour + input.diskMicrosPerHour) / 3_600_000;
+      const fits = perMs > 0 ? now + Math.max(0, free) / perMs : Infinity;
+      const endsAt = Math.floor(Math.min(input.until, fits));
+      if (free <= 0 || endsAt < input.minUntil) return undefined;
+      const keep = Math.max(endsAt, existing ? Number(existing.endsAt) : 0);
+      (await this.db.prepare(`INSERT INTO compute_holds (id, organizationId, taskId, worldId, provider, purpose,
+        activeMicrosPerHour, diskMicrosPerHour, startedAt, endsAt, closedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+        ON CONFLICT(id) DO UPDATE SET activeMicrosPerHour=excluded.activeMicrosPerHour, diskMicrosPerHour=excluded.diskMicrosPerHour,
+          endsAt=excluded.endsAt, closedAt=NULL`)
+        .run(input.id, input.organizationId, input.taskId ?? null, input.worldId ?? null, input.provider, input.purpose,
+          Math.round(input.activeMicrosPerHour), Math.round(input.diskMicrosPerHour), startedAt, keep));
+      return { endsAt: keep, startedAt };
+    });
+  }
+
+  /** The work a hold covered ended at `at`: what it reserved past then is free. */
+  async closeComputeHold(id: string, at = Date.now()): Promise<void> {
+    (await this.db.prepare('UPDATE compute_holds SET closedAt=? WHERE id=? AND closedAt IS NULL')
+      .run(at, id));
+  }
+
+  async computeHold(id: string): Promise<{ id: string; organizationId: string; taskId?: string; provider: string;
+    purpose: string; startedAt: number; endsAt: number; closedAt?: number } | undefined> {
+    const row = (await this.db.prepare('SELECT * FROM compute_holds WHERE id=?').get(id)) as Record<string, unknown> | undefined;
+    if (!row) return undefined;
+    return { id: String(row.id), organizationId: String(row.organizationId), ...(row.taskId ? { taskId: String(row.taskId) } : {}),
+      provider: String(row.provider), purpose: String(row.purpose), startedAt: Number(row.startedAt), endsAt: Number(row.endsAt),
+      ...(row.closedAt != null ? { closedAt: Number(row.closedAt) } : {}) };
+  }
+
+  /** Holds long past counting, kept a week for diagnosis. */
+  async pruneComputeHolds(now = Date.now()): Promise<number> {
+    return Number((await this.db.prepare('DELETE FROM compute_holds WHERE COALESCE(closedAt, endsAt)<?')
+      .run(now - 7 * 24 * 60 * 60_000)).changes ?? 0);
+  }
+
+  /** The task's latest booked managed usage on `provider`, per kind, within
+   * `since`: what its machine actually costs, for holds. */
+  async latestManagedUsage(organizationId: string, taskId: string, provider: string, since: number): Promise<{
+    active?: { costMicros: number; seconds: number; metadata: Record<string, unknown> };
+    disk?: { costMicros: number; seconds: number; metadata: Record<string, unknown> } }> {
+    const out: Awaited<ReturnType<Store['latestManagedUsage']>> = {};
+    for (const kind of ['world.active', 'world.disk'] as const) {
+      const row = (await this.db.prepare(`SELECT costMicros, quantity, metadata FROM usage_events WHERE taskId=? AND organizationId=?
+        AND fundingSource='managed' AND provider=? AND kind=? AND endedAt>=? AND quantity>0 ORDER BY endedAt DESC LIMIT 1`)
+        .get(taskId, organizationId, provider, kind, since)) as Record<string, unknown> | undefined;
+      if (!row) continue;
+      let metadata: Record<string, unknown> = {};
+      try { metadata = JSON.parse(String(row.metadata ?? '{}')) ?? {}; } catch { /* unreadable metadata */ }
+      out[kind === 'world.disk' ? 'disk' : 'active'] = { costMicros: Number(row.costMicros), seconds: Number(row.quantity), metadata };
+    }
+    return out;
+  }
+
+  /** Compute top-ups (wiki features/managed-compute § Auto top-up): one-time
+   * charges for credit that lasts until used. A row is written before the
+   * provider is asked (`charging`), so an uncertain charge is reconciled from
+   * the provider's records and never sent twice. */
+  async createComputeTopUp(input: { id: string; organizationId: string; creditMicros: number; amountCents: number;
+    subscriptionId: string; requestedAt: number }): Promise<void> {
+    (await this.db.prepare(`INSERT INTO compute_topups (id, organizationId, state, creditMicros, amountCents, subscriptionId, requestedAt)
+      VALUES (?, ?, 'charging', ?, ?, ?, ?)`).run(input.id, input.organizationId, input.creditMicros, input.amountCents,
+      input.subscriptionId, input.requestedAt));
+  }
+
+  async updateComputeTopUp(id: string, patch: { state: ComputeTopUp['state']; transactionId?: string; error?: string; settledAt?: number }): Promise<void> {
+    (await this.db.prepare(`UPDATE compute_topups SET state=?, transactionId=COALESCE(?, transactionId), error=?, settledAt=COALESCE(?, settledAt)
+      WHERE id=?`).run(patch.state, patch.transactionId ?? null, patch.error ?? null, patch.settledAt ?? null, id));
+  }
+
+  /** An organization's top-ups, newest first; `organizationId` omitted lists every organization's unsettled ones. */
+  async computeTopUps(organizationId?: string, since = 0): Promise<ComputeTopUp[]> {
+    const rows = (await (organizationId
+      ? this.db.prepare('SELECT * FROM compute_topups WHERE organizationId=? AND requestedAt>=? ORDER BY requestedAt DESC').all(organizationId, since)
+      : this.db.prepare(`SELECT * FROM compute_topups WHERE state IN ('charging','uncertain','pending') ORDER BY requestedAt`).all())) as Array<Record<string, unknown>>;
+    return rows.map((row) => ({ id: String(row.id), organizationId: String(row.organizationId), state: String(row.state) as ComputeTopUp['state'],
+      creditMicros: Number(row.creditMicros), amountCents: Number(row.amountCents), subscriptionId: row.subscriptionId ? String(row.subscriptionId) : undefined,
+      transactionId: row.transactionId ? String(row.transactionId) : undefined, error: row.error ? String(row.error) : undefined,
+      requestedAt: Number(row.requestedAt), settledAt: row.settledAt != null ? Number(row.settledAt) : undefined }));
+  }
+
+  /** Organizations with paid top-ups: their credit carries a balance across months. */
+  async organizationsWithComputeTopUps(): Promise<string[]> {
+    return ((await this.db.prepare(`SELECT DISTINCT organizationId FROM compute_topups WHERE state='paid'`).all()) as Array<{ organizationId: string }>)
+      .map((row) => String(row.organizationId));
+  }
+
+  /** Per month: the included credit it had (recorded while it runs) and, once
+   * closed, how much of the top-up balance its usage drew. */
+  async computeCreditMonths(organizationId: string): Promise<Array<{ month: string; allowanceMicros: number; drawnMicros?: number }>> {
+    return ((await this.db.prepare('SELECT * FROM compute_credit_months WHERE organizationId=? ORDER BY month').all(organizationId)) as Array<Record<string, unknown>>)
+      .map((row) => ({ month: String(row.month), allowanceMicros: Number(row.allowanceMicros),
+        ...(row.drawnMicros != null ? { drawnMicros: Number(row.drawnMicros) } : {}) }));
+  }
+
+  async setComputeCreditMonth(organizationId: string, month: string, value: { allowanceMicros: number; drawnMicros?: number }): Promise<void> {
+    (await this.db.prepare(`INSERT INTO compute_credit_months (organizationId, month, allowanceMicros, drawnMicros) VALUES (?, ?, ?, ?)
+      ON CONFLICT(organizationId, month) DO UPDATE SET allowanceMicros=excluded.allowanceMicros,
+        drawnMicros=COALESCE(compute_credit_months.drawnMicros, excluded.drawnMicros)`)
+      .run(organizationId, month, value.allowanceMicros, value.drawnMicros ?? null));
+  }
+
   /** Machines of the installation's `provider` account running now, across
    * every organization: active leases in managed runner pools. */
   /** CPUs the running worlds on one provider account hold: the installation's
@@ -10593,6 +10771,41 @@ function validateProjectExecutionConfig(config: ProjectConfig): void {
 /** The runner pool of an organization's managed compute (RunnerPoolService.ensureDefaultPool). */
 export function isManagedComputePool(pool: { id: string; organizationId: string; provider: string; mode: string }): boolean {
   return pool.mode === 'managed' && pool.id === `${pool.organizationId}:tavya-${pool.provider}`;
+}
+
+export interface ComputeTopUp {
+  id: string; organizationId: string;
+  /** charging: written, the provider not yet answered; uncertain: the answer
+   * was lost; pending: charged, waiting for the payment; paid: credit given. */
+  state: 'charging' | 'uncertain' | 'pending' | 'paid' | 'failed';
+  creditMicros: number; amountCents: number; subscriptionId?: string; transactionId?: string; error?: string;
+  requestedAt: number; settledAt?: number;
+}
+
+/** How long after its end a compute hold still counts when the provider has
+ * not booked the usage it covered: every feed books within an hour (E2B at a
+ * pause, VMs each sweep). */
+export const COMPUTE_HOLD_SETTLE_MS = 2 * 60 * 60_000;
+
+export interface ComputeHoldInput {
+  id: string; organizationId: string; taskId?: string; worldId?: string; provider: string;
+  /** What the hold is for: an agent turn, a wait on jobs, a new machine. */
+  purpose: 'turn' | 'jobs' | 'machine';
+  /** The machine's provider cost an hour, running, and of its disk. */
+  activeMicrosPerHour: number; diskMicrosPerHour: number;
+  /** Hold until then, if the credit allows… */
+  until: number;
+  /** …and refuse unless at least until this. */
+  minUntil: number;
+}
+
+/** What a hold row still reserves at `now`: its stretch past what the
+ * provider has booked for its task, per kind, at its rates. */
+function heldCost(hold: Record<string, unknown>, booked: { active: number; disk: number } | undefined): number {
+  const end = hold.closedAt != null ? Number(hold.closedAt) : Number(hold.endsAt);
+  const start = Number(hold.startedAt);
+  const span = (bookedUntil = 0) => Math.max(0, end - Math.max(start, bookedUntil)) / 3_600_000;
+  return Number(hold.activeMicrosPerHour) * span(booked?.active) + Number(hold.diskMicrosPerHour) * span(booked?.disk);
 }
 
 function monthWindow(now: number): { from: number; to: number } {

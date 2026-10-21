@@ -83,6 +83,30 @@ describe('Plan & billing', () => {
     expect(html).not.toContain('data-plan="team" disabled');
   });
 
+  it('adds top-up credit to the month\'s, counts what running computers hold, and offers auto top-up in one row', () => {
+    const paid = { plan: 'individual', planName: 'Individual', currentMonthlyPriceCents: 900, computeCreditMicros: 5_000_000,
+      includedComputeCreditMicros: 5_000_000, compute: { usedMicros: 4_000_000, heldMicros: 1_500_000, topUpMicros: 10_000_000,
+        creditMicros: 5_000_000, from: Date.UTC(2026, 9, 1), to: Date.UTC(2026, 10, 1), providers: ['e2b'] } };
+    const auto = { enabled: false, offered: true, capCents: 5_000, amountCents: 1_000, spentCents: 0 };
+    const html = markup(entitlements(paid), status({ plan: 'individual', billedPlan: 'individual', status: 'active', autoTopUp: auto }));
+    expect(text(html)).toMatch(/\$4\.00 of \$15\.00 this month/);
+    expect(html).toContain('$10.00 topped up, kept until used');
+    expect(html).toContain('$1.50 is held for computers running now');
+    expect(html).toMatch(/aria-valuenow="5500000"/);
+    const row = html.slice(html.indexOf('data-limit="auto-top-up"'));
+    expect(row).toMatch(/class="toggle billing-auto-topup" type="checkbox" aria-label="Auto top-up"\s+>/);
+    expect(row).toMatch(/id="billing-auto-cap"[^>]*value="50"/);
+    expect(row).toContain('When compute runs low, buy $10 more at once on the saved card, up to this much a month. Top-ups last until used.');
+    // On, declined: says so; a member sees it but cannot change it.
+    const declined = markup(entitlements(paid), status({ plan: 'individual', billedPlan: 'individual', status: 'active', canManage: false,
+      autoTopUp: { ...auto, enabled: true, spentCents: 1_000, pausedUntil: Date.now() + 86_400_000, lastError: 'the payment was declined' } }));
+    expect(text(declined)).toMatch(/\/month · \$10 this month\s*Card declined · retries/);
+    expect(declined).toMatch(/billing-auto-topup"[^>]*checked disabled/);
+    // Not offered (its billing terms not approved yet) and off: no row at all.
+    expect(markup(entitlements(paid), status({ plan: 'individual', billedPlan: 'individual', status: 'active',
+      autoTopUp: { ...auto, offered: false } }))).not.toContain('auto-top-up');
+  });
+
   it('says Free has no managed compute, and that an over-limit organization\'s agents are paused', () => {
     const html = markup(entitlements({ currentMemberCount: 3, overMemberLimit: true,
       compute: { usedMicros: 0, creditMicros: 0, from: 0, to: Date.UTC(2026, 10, 1), providers: ['hetzner'] } }), status());

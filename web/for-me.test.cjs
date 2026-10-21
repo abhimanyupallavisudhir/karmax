@@ -77,7 +77,7 @@ test('a row shows when it last changed: on For me, when it came to you', () => {
   assert.equal(ctx.rowTime({ id: 'a', statusChangedAt: NOW - 86400e3, createdAt: 1 }), NOW - 80 * 60e3, 'the server says when it came to you');
   assert.equal(ctx.rowTime({ id: 'b', statusChangedAt: NOW - 86400e3, createdAt: 1 }), NOW - 86400e3);
   assert.equal(ctx.rowTime({ id: 'c', createdAt: 7 }), 7, 'a draft: when it was created');
-  assert.match(ctx.rowWhen({ id: 'a' }), /<time class="row-when" datetime="[^"]+" title="Updated [^"]+">\d+[mh]<\/time>/);
+  assert.match(ctx.rowWhen({ id: 'a' }, NOW), /<time class="row-when" datetime="[^"]+" title="Updated [^"]+">1h<\/time>/);
 });
 
 test('waits nobody takes part in do not move a task up the list', () => {

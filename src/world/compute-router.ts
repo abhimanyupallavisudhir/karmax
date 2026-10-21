@@ -6,7 +6,7 @@ import { cloudProviders, listPriceMicrosPerHour, providerDefaults, providerLabel
 import type { ProjectConfig } from '../domain/types.js';
 import type { Store } from '../store/db.js';
 import { MANAGED_COMPUTE } from './connections.js';
-import { ComputeCreditExhausted, computeCredit, creditExhaustedMessage, ManagedComputeBusy } from './managed-compute.js';
+import { assertComputeCredit, ComputeCreditExhausted, ManagedComputeBusy } from './managed-compute.js';
 
 /**
  * Compute routing (wiki features/compute-routing): the machine a task gets
@@ -194,15 +194,17 @@ export class ComputeRouter {
       .filter((view) => cloudProviders().includes(view.provider) && view.enabled && view.credentialConfigured);
     const managed = views.some((view) => view.managed);
     const accounts = managed ? await this.connections.managedConnections() : [];
-    const credit = managed && this.store.hosted ? await computeCredit(this.store, organizationId, this.now()) : undefined;
-    const spent = credit?.creditMicros != null && credit.usedMicros >= credit.creditMicros;
     return Promise.all(views.map(async (view): Promise<ComputeOption> => {
       const funding: ComputeFunding = view.managed ? 'managed' : 'own';
       const region = providerRegion(view.provider, view.config);
       const option: ComputeOption = { provider: view.provider, funding, limits: view.limits, features: view.features,
         ...(region ? { region } : {}) };
       if (funding === 'managed') {
-        if (spent) return { ...option, busy: 'out of compute this month', outOfCredit: creditExhaustedMessage(credit!) };
+        // Room in the credit for this machine's first minutes, as admission
+        // will judge it (holds, top-ups: managed-compute.ts).
+        const short = await assertComputeCredit(this.store, organizationId, view.provider, this.now(), { shape: needs })
+          .then(() => undefined, (error: unknown) => { if (error instanceof ComputeCreditExhausted) return error; throw error; });
+        if (short) return { ...option, busy: 'out of compute this month', outOfCredit: short.message };
         const maxRunning = accounts.find((account) => account.provider === view.provider)?.config.maxRunning;
         if (maxRunning && await this.store.runningManagedWorlds(view.provider) >= maxRunning)
           return { ...option, busy: `all ${maxRunning} in use` };

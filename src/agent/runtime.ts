@@ -505,7 +505,10 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     // which resumes the turn): that is not a failure.
     const reason = deps.signal?.aborted ? deps.signal.reason : undefined;
     const stopped = reason instanceof Error && reason.message === 'CANCELLED';
-    await observe(() => deps.onActivity?.(stopped ? { id: 'turn', kind: 'turn', phase: 'stopped', title: 'Agent stopped' } : {
+    // Its compute hold ran out (wiki features/managed-compute § Holds).
+    const outOfCompute = reason instanceof Error && reason.name === 'ComputeCreditExhausted';
+    await observe(() => deps.onActivity?.(stopped ? { id: 'turn', kind: 'turn', phase: 'stopped', title: 'Agent stopped' }
+      : outOfCompute ? { id: 'turn', kind: 'turn', phase: 'stopped', title: 'Out of compute', detail: (reason as Error).message.slice(0, 1200) } : {
       id: 'turn',
       kind: 'turn',
       phase: 'failed',
