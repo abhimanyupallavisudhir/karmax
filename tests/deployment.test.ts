@@ -85,7 +85,7 @@ describe('deployment profiles', () => {
 
   it('will not take payments before the launch checklist is complete', () => {
     expect(() => validateDeployment({ ...managedCell(), KARMAX_PAID_LAUNCH: '1', KARMAX_LEGAL_ENTITY_NAME: 'Tavya Ltd' }))
-      .toThrow(/KARMAX_PAID_LAUNCH=1 requires the explicit launch checklist: KARMAX_FOUNDER_REVIEWED_POLICY_VERSION, KARMAX_LEGAL_ENTITY_COUNTRY,/);
+      .toThrow(/KARMAX_PAID_LAUNCH=1 requires the explicit launch checklist: KARMAX_LEGAL_ENTITY_COUNTRY,/);
     expect(validateDeployment({ ...managedCell(), KARMAX_PAID_LAUNCH: '0' }).hosted).toBe(true);
   });
 

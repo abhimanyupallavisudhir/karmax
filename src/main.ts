@@ -313,10 +313,10 @@ async function main() {
     if (selected === 'stripe-billing') return new StripeSubscriptionProvider(() => paidLaunchSettings.subscriptionConfig());
     throw new Error(`unsupported subscription provider ${selected}`);
   }, deployment.hosted);
-  // Auto top-up of managed compute, offered once the approved billing terms describe it.
+  // Auto top-up of managed compute, offered while paid checkout is open.
   const { ComputeTopUps } = await import('./billing/compute-topups.js');
   const computeTopUps = new ComputeTopUps(store, subscriptionBilling, {
-    offered: async () => (await paidLaunchSettings.launchConfig()).policyApproved,
+    offered: async () => (await paidLaunchSettings.launchConfig()).paidLaunch,
     tell: async (organizationId, message) => {
       if (!(await emailService.configured())) return;
       for (const membership of (await store.listOrganizationMemberships(organizationId)).filter((value) => value.role === 'owner')) {

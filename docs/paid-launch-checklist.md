@@ -24,12 +24,15 @@ The server refuses to enable checkout until all of these hold (`canEnable` in
 - Every legal/contact value: legal name, country of establishment, governing law
   and courts, legal notice address, and legal, privacy, security, incident, DPA
   and billing emails.
-- Founder approval of the **current** policy version. A policy change deliberately
-  voids the previous approval; setup never ticks it on the founder's behalf.
 - The selected provider's billing configuration. Paddle: API key, webhook signing
   secret, client-side token, and the Individual, Team base and Team seat price IDs,
   in the **live** environment. Stripe: secret key, webhook secret and the same
   three price IDs.
+
+Enabling checkout is the operator adopting the policies: until then each policy
+page carries a "Launch draft" note, and afterwards a new policy version takes
+effect when it deploys, with no further approval. Review policy changes when
+their pull request is reviewed.
 
 `/pricing` withholds the operator identity until the public operator details are
 configured, and the billing service validates provider configuration independently.

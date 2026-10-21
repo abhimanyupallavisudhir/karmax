@@ -79,8 +79,8 @@ async function subscribe() {
     // Paddle renames its test ids now and then: show the ones the checkout has.
     const shot = path.join(os.tmpdir(), 'paddle-sandbox-checkout.png');
     await page.screenshot({ path: shot }).catch(() => undefined);
-    const ids = await page.frame({ name: 'paddle_frame' })?.evaluate(() =>
-      [...document.querySelectorAll('[data-testid]')].map((element) => element.getAttribute('data-testid')).join(' ')).catch(() => '');
+    const ids = await page.frame({ name: 'paddle_frame' })?.locator('[data-testid]')
+      .evaluateAll((elements) => elements.map((element) => element.getAttribute('data-testid')).join(' ')).catch(() => '');
     console.error(`checkout stuck (screenshot ${shot}); test ids on the page: ${ids}`);
     throw error;
   } finally { await browser.close(); }
