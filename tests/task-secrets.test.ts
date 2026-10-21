@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -87,10 +88,108 @@ describe('the scrubber', () => {
     expect(secretValues(JSON.stringify({ tokens: { access_token: 'mcp-access-0123456789', refresh_token: 'mcp-refresh-0123456789' } })))
       .toEqual(expect.arrayContaining(['mcp-access-0123456789', 'mcp-refresh-0123456789']));
     expect(secretValues('export API_KEY="sk-env-0123456789"\nDB=postgres://u:pw-0123456789@h/db\n'))
-      .toEqual(expect.arrayContaining(['sk-env-0123456789', 'postgres://u:pw-0123456789@h/db']));
+      .toEqual(expect.arrayContaining(['sk-env-0123456789', 'postgres://u:pw-0123456789@h/db', 'pw-0123456789']));
     const key = '-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQ\n-----END OPENSSH PRIVATE KEY-----\n';
     expect(secretValues(key)).toContain('b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQ');
     expect(secretValues('Use this account for billing\nAsk Sam first')).not.toContain('Use this account for billing');
+  });
+
+  // The rule (wiki features/secret-scrubbing): a part of a secret is scrubbed
+  // when it is secret by its name or by its shape; its public metadata is not.
+  const scrubberFor = (plaintext: string) => { const scrubber = new SecretScrubber(); scrubber.add(...secretValues(plaintext)); return scrubber; };
+
+  it('scrubs a Google service-account key, not its project, e-mail, client id or googleapis.com URLs', () => {
+    const { privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+    const pem = privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
+    const email = 'tavya-agent@tavya-prod-472915.iam.gserviceaccount.com';
+    const serviceAccount = {
+      type: 'service_account', project_id: 'tavya-prod-472915',
+      private_key_id: '3f1c9a7e0b2d4c6e8a1f3b5d7c9e0a2b4d6f8a1c', private_key: pem,
+      client_email: email, client_id: '108215374620193847562',
+      auth_uri: 'https://accounts.google.com/o/oauth2/auth', token_uri: 'https://oauth2.googleapis.com/token',
+      auth_provider_x509_cert_url: 'https://www.googleapis.com/oauth2/v1/certs',
+      client_x509_cert_url: `https://www.googleapis.com/robot/v1/metadata/x509/${encodeURIComponent(email)}`,
+      universe_domain: 'googleapis.com',
+    };
+    const scrubber = scrubberFor(JSON.stringify(serviceAccount, null, 2));
+    const advice = [
+      'gcloud services enable cloudquotas.googleapis.com --project tavya-prod-472915',
+      `gcloud projects add-iam-policy-binding tavya-prod-472915 --member serviceAccount:${email} --role roles/owner`,
+      `client ${serviceAccount.client_id}, type service_account, token from ${serviceAccount.token_uri}`,
+      `${serviceAccount.auth_uri} ${serviceAccount.auth_provider_x509_cert_url} ${serviceAccount.client_x509_cert_url}`,
+    ].join('\n');
+    expect(scrubber.scrub(advice)).toBe(advice);
+    // What is secret still is: the key, its id, any one line of it, the file.
+    const body = pem.split('\n')[5]!;
+    expect(scrubber.scrub(`private_key_id ${serviceAccount.private_key_id}; ${body}`)).toBe('private_key_id [redacted]; [redacted]');
+    expect(scrubber.scrub(JSON.stringify({ text: pem }))).not.toContain(body);
+    expect(scrubber.scrub(`cat key.json\n${JSON.stringify(serviceAccount, null, 2)}`)).toBe('cat key.json\n[redacted]');
+  });
+
+  it('scrubs the secret half of an AWS ID:SECRET key, but not the key id', () => {
+    const scrubber = scrubberFor('AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY');
+    expect(scrubber.scrub('aws configure set aws_secret_access_key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'))
+      .toBe('aws configure set aws_secret_access_key [redacted]');
+    expect(scrubber.scrub('using key AKIAIOSFODNN7EXAMPLE')).toBe('using key AKIAIOSFODNN7EXAMPLE');
+    expect(scrubber.scrub('AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY')).toBe('[redacted]');
+    // The same key as JSON (an IAM CreateAccessKey response), and as a credentials file.
+    const json = scrubberFor(JSON.stringify({ AccessKey: { UserName: 'deploy-bot', AccessKeyId: 'AKIAIOSFODNN7EXAMPLE', Status: 'Active',
+      SecretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY', CreateDate: '2026-10-20T12:00:00Z' } }));
+    expect(json.scrub('deploy-bot Active 2026-10-20T12:00:00Z wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'))
+      .toBe('deploy-bot Active 2026-10-20T12:00:00Z [redacted]');
+    const file = scrubberFor('[default]\naws_access_key_id = AKIAIOSFODNN7EXAMPLE\naws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\nregion = europe-west1\n');
+    expect(file.scrub('[default] europe-west1 wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY')).toBe('[default] europe-west1 [redacted]');
+  });
+
+  it('scrubs an MCP connection\'s tokens and client secret, not its endpoints, scopes or expiry', () => {
+    const accessToken = 'eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ0YXZ5YSIsImV4cCI6MTc5MjAwMDAwMH0.c2lnbmF0dXJlLWJ5dGVzLWhlcmU';
+    const connection = {
+      client: { client_id: 'tavya-mcp-client', client_secret: 'cs_live_hunter2hunter2', client_name: 'tavya',
+        redirect_uris: ['https://tavya.io/api/mcp/oauth/callback'], token_endpoint_auth_method: 'client_secret_basic' },
+      tokens: { access_token: accessToken, token_type: 'Bearer', expires_in: 3600, refresh_token: 'rt-notion-0123456789', scope: 'read:content write:content' },
+      expiresAt: 1792000000000,
+      discovery: { authorizationServerMetadata: { issuer: 'https://mcp.notion.com', token_endpoint: 'https://mcp.notion.com/token',
+        token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post'], code_challenge_methods_supported: ['S256'] } },
+      pending: { verifier: 'vrf-0123456789-abcdefghij' },
+    };
+    const scrubber = scrubberFor(JSON.stringify(connection));
+    const publicText = 'POST https://mcp.notion.com/token with client_secret_basic for tavya-mcp-client, scope read:content write:content, '
+      + 'redirect https://tavya.io/api/mcp/oauth/callback at 1792000000000';
+    expect(scrubber.scrub(publicText)).toBe(publicText);
+    expect(scrubber.scrub(`Bearer ${accessToken} rt-notion-0123456789 cs_live_hunter2hunter2 vrf-0123456789-abcdefghij`))
+      .toBe('Bearer [redacted] [redacted] [redacted] [redacted]');
+  });
+
+  it('scrubs a card\'s number, not its brand, holder or expiry', () => {
+    const scrubber = scrubberFor(JSON.stringify({ brand: 'mastercard', number: '5555 5555 5555 4444', exp_month: 12, exp_year: 2029,
+      cvc: '123', name: 'Abhimanyu Cardholder', billing_address: { line1: '1 Market Street', city: 'San Francisco' } }));
+    expect(scrubber.scrub('mastercard 12/2029 Abhimanyu Cardholder, 1 Market Street, San Francisco'))
+      .toBe('mastercard 12/2029 Abhimanyu Cardholder, 1 Market Street, San Francisco');
+    expect(scrubber.scrub('card 5555 5555 5555 4444')).toBe('card [redacted]');
+    expect(scrubberFor(JSON.stringify({ number: 5555555555554444 })).scrub('5555555555554444')).toBe('[redacted]');
+  });
+
+  it('scrubs a .env bag\'s secrets, not its configuration', () => {
+    // Assembled, so the file holds nothing GitHub push protection takes for a live Stripe key.
+    const stripeKey = 'sk_' + 'live_51Hx0123456789abcdefABCDEF';
+    const scrubber = scrubberFor([
+      'NODE_ENV=production', 'AWS_REGION=us-east-1', 'GOOGLE_CLOUD_PROJECT=tavya-prod-472915', 'SMTP_USER=agent@tavya.io',
+      `STRIPE_SECRET_KEY=${stripeKey}`, 'DB_PASSWORD=correcthorsebattery', 'GITHUB_PAT=ghp_aBcD1234567890EfGhIjKlMnOpQrStUvWx',
+      'SENTRY_DSN=https://3f1c9a7e0b2d4c6e8a1f3b5d7c9e0a2b@o1.ingest.sentry.io/42', 'SESSION_SIGNING=Zx8kQ2mN5pR7tV9wY1bC3dF6gH',
+    ].join('\n') + '\n');
+    const config = 'NODE_ENV=production gcloud --project tavya-prod-472915 aws --region us-east-1 mail agent@tavya.io';
+    expect(scrubber.scrub(config)).toBe(config);
+    for (const secret of [stripeKey, 'correcthorsebattery', 'ghp_aBcD1234567890EfGhIjKlMnOpQrStUvWx',
+      '3f1c9a7e0b2d4c6e8a1f3b5d7c9e0a2b', 'Zx8kQ2mN5pR7tV9wY1bC3dF6gH']) expect(scrubber.scrub(`x ${secret} x`)).toBe('x [redacted] x');
+  });
+
+  it('scrubs a saved browser session\'s cookie values and storage, not cookie names or domains', () => {
+    const scrubber = scrubberFor(JSON.stringify({ version: 1, capturedAt: 1792000000000,
+      cookies: [{ name: '__Secure-session', value: 'opaque-session-cookie', domain: '.console.cloud.google.com', path: '/', httpOnly: true, secure: true }],
+      storage: [{ origin: 'https://console.cloud.google.com', localStorage: [['last-project', 'tavya-prod-472915-recent']] }] }));
+    expect(scrubber.scrub('__Secure-session on .console.cloud.google.com, https://console.cloud.google.com'))
+      .toBe('__Secure-session on .console.cloud.google.com, https://console.cloud.google.com');
+    expect(scrubber.scrub('opaque-session-cookie tavya-prod-472915-recent')).toBe('[redacted] [redacted]');
   });
 });
 
