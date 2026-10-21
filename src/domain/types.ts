@@ -1804,8 +1804,9 @@ export interface ChildTaskSummary {
   /** `approvalRequests` is the gateway's projection, as on a task-list row. */
   /** A draft sub-task that never ran reads `state.draft` (`queued` once queued, until its parent starts it). */
   lastView?: Pick<TaskView, 'stage' | 'status' | 'waitingFor' | 'pointOfNoReturnPassed' | 'approvalRequests'> & { state?: { draft?: boolean; queued?: boolean } };
-  /** It is the parent's pull request of this checkout (SPEC §11.1), not a sub-task; `target` is where it lands. */
-  pullRequest?: { checkout: string; target?: string };
+  /** It is the parent's pull request of this checkout (SPEC §11.1), not a sub-task; `target` is where it lands,
+   *  `pr` the provider's pull request it opened. */
+  pullRequest?: { checkout: string; target?: string; pr?: Pick<TaskPullRequest, 'number' | 'url'> & Partial<Pick<TaskPullRequest, 'merged' | 'state'>> };
 }
 
 /** A task in a fork lineage, as the Agent forks and Forked from panels show it;

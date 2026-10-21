@@ -658,6 +658,10 @@ a.git-repo-name:hover { color:var(--accent); }
 .chip.blocked, .chip.failed { background: var(--danger-weak); color: var(--danger); border-color: transparent; }
 .chip.done { background: var(--merged-weak); color: var(--merged); border-color: transparent; }
 .chip.approval-needed { background: var(--working-weak); color: var(--working); border-color: transparent; }
+/* A step under way (a pull request approved, landing): a pulsing dot says it is moving. */
+.chip.live::before { content: ''; display: inline-block; width: 6px; height: 6px; margin-right: 5px; vertical-align: 1px;
+  border-radius: 50%; background: currentColor; animation: pulse 1.4s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) { .chip.live::before { animation: none; } }
 /* Why a row is in "For me": the ask waiting on you. */
 .chip.attention { background: var(--accent-weak); color: var(--accent); border-color: transparent; font-weight: 600; }
 .chip.attention.escalated { background: var(--working-weak); color: var(--working); }
@@ -721,6 +725,11 @@ a.git-repo-name:hover { color:var(--accent); }
 .checkout-row:last-of-type { border-bottom: 0; }
 .checkout-mark { color: var(--ink-3); width: 12px; text-align: center; }
 .checkout-row.landed .checkout-mark { color: var(--merged, var(--accent)); }
+/* Pull requests to approve, as small boxes at the end of the conversation. */
+.pr-asks { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
+.pr-ask { display: inline-flex; align-items: center; gap: 8px; padding: 5px 6px 5px 12px; font-size: 13px;
+  border: 1px solid var(--line); border-radius: var(--r); background: var(--surface); box-shadow: var(--shadow); }
+.pr-ask-target { color: var(--ink-3); }
 
 /* ── buttons ────────────────────────────────────────────────── */
 .btn {
