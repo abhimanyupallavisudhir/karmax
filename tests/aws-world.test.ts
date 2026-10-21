@@ -103,7 +103,8 @@ describe.skipIf(!sshdAvailable)('AWS worlds (fake EC2, real sshd)', () => {
     // The image builder provisions a real machine as root: never on this one.
     process.env.KARMAX_AWS_IMAGES = '0';
     aws = new FakeAws();
-    driver = new AwsDriver(aws.fetch, 1);
+    // A wait is 300 polls: at 1 ms a cold sshd boot on a busy runner outlasted it (CI #2182).
+    driver = new AwsDriver(aws.fetch, 10);
     stamp = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'vm-stamp-')), 'provisioned');
     ledger = new Map();
     provider = new VmWorldProvider(driver, async () => connection(aws.key), undefined, {

@@ -29,9 +29,13 @@ export function previewHostname(leaseId: string, env: NodeJS.ProcessEnv = proces
 
 type LeaseRef = string | { id: string; hostname?: string };
 
+/** A lease's page. On its own host the application is at the root, as on any
+ * site, so its root-relative links (`/assets/style.css`) resolve; sharing the
+ * console's origin, it lives under /preview/<lease>. */
 export function previewLeaseUrl(lease: LeaseRef, requestPath = '/', token?: string, env: NodeJS.ProcessEnv = process.env): string {
   const id = typeof lease === 'string' ? lease : lease.id;
-  const base = `${previewLeaseOrigin(lease, env)}/preview/${encodeURIComponent(id)}`;
+  const origin = previewLeaseOrigin(lease, env);
+  const base = origin || `/preview/${encodeURIComponent(id)}`;
   const suffix = requestPath.startsWith('/') ? requestPath : `/${requestPath}`;
   if (!token) return `${base}${suffix}`;
   return `${base}${suffix}${suffix.includes('?') ? '&' : '?'}token=${encodeURIComponent(token)}`;
@@ -78,8 +82,11 @@ export function previewCookieValue(header: string | undefined, leaseId: string):
   return '';
 }
 
-export function previewCookieHeader(leaseId: string, token: string, expiresAt: number): string {
+/** The lease's capability as an HttpOnly cookie: host-only on the lease's own
+ * host (the whole host is the application), else scoped to its path. */
+export function previewCookieHeader(leaseId: string, token: string, expiresAt: number, ownHost = false): string {
   const maxAge = Math.max(0, Math.ceil((expiresAt - Date.now()) / 1000));
   const secure = configuredPreviewOrigin()?.startsWith('https:') ? '; Secure' : '';
-  return `${previewCookieName(leaseId)}=${encodeURIComponent(token)}; Path=/preview/${encodeURIComponent(leaseId)}/; Max-Age=${maxAge}; HttpOnly${secure}; SameSite=Lax`;
+  const scope = ownHost ? '/' : `/preview/${encodeURIComponent(leaseId)}/`;
+  return `${previewCookieName(leaseId)}=${encodeURIComponent(token)}; Path=${scope}; Max-Age=${maxAge}; HttpOnly${secure}; SameSite=Lax`;
 }

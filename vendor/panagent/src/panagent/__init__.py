@@ -1,4 +1,4 @@
-"""Move agent conversations between Claude Code, Codex, ChatGPT, Claude and tavya.
+"""Move agent conversations between Claude Code, Codex, ChatGPT, Claude, Gemini and tavya.
 
     import panagent
     conversation = panagent.load("https://chatgpt.com/share/...")

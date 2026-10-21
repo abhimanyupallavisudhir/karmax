@@ -111,7 +111,10 @@ export interface FieldDef {
  */
 const isArmed = (t: SearchTask): boolean =>
   normalizeTriggers(t.params).length > 0 && t.params?.triggerState !== 'fired' && !t.lastView;
-const status = (t: SearchTask) => t.lastView?.status ?? (isArmed(t) ? 'armed' : 'active');
+/** Asked to run, held until someone approves the authorization its creator could not grant. */
+export const awaitingApproval = (t: { params?: Record<string, unknown> }): boolean =>
+  !!t.params?.draft && !!t.params?._awaitingApproval;
+const status = (t: SearchTask) => t.lastView?.status ?? (awaitingApproval(t) ? 'waiting' : isArmed(t) ? 'armed' : 'active');
 /** The armed-aware status of a task (exported so compact projections agree with search). */
 export function taskStatus(t: SearchTask): string {
   return status(t);
@@ -137,6 +140,7 @@ const PRIORITY_OPTIONS: FieldOption[] = PRIORITIES.map((p, i) => ({ value: Strin
  */
 export const FACET_OPTIONS: FieldOption[] = [
   { value: 'draft', label: 'Draft' },
+  { value: 'awaiting-approval', label: 'Waiting for approval' },
   { value: 'archived', label: 'Archived' },
   { value: 'active', label: 'Running' },
   { value: 'waiting', label: 'Waiting' },
@@ -166,7 +170,8 @@ export const FACET_OPTIONS: FieldOption[] = [
 function facetsOf(t: SearchTask, ctx?: FieldContext): string[] {
   const f: string[] = [];
   const st = status(t);
-  if (t.params?.draft) f.push('draft');
+  if (awaitingApproval(t)) f.push('awaiting-approval');
+  else if (t.params?.draft) f.push('draft');
   if (t.params?.archived) f.push('archived');
   f.push(st);
   if (!['done', 'failed', 'cancelled'].includes(st)) f.push('open');
@@ -271,7 +276,7 @@ function personFor(value: string, ctx?: EvalContext): string | undefined {
   return ctx?.people?.get(v.toLowerCase());
 }
 const ownDraft = (t: SearchTask, userId: string): boolean =>
-  !!t.params?.draft && t.createdBy?.kind === 'user' && t.createdBy.userId === userId;
+  !!t.params?.draft && !awaitingApproval(t) && t.createdBy?.kind === 'user' && t.createdBy.userId === userId;
 /** Why `t` needs `userId`: the kinds of the live asks routed to them (matched on
  *  the attempt or its logical task), plus `draft` for their own draft. */
 function attentionReasons(t: SearchTask, userId: string, ctx?: EvalContext): string[] {
@@ -626,6 +631,9 @@ export interface EvalResult {
   /** For a query with a positive `for:` clause: task id → why it needs the people
    *  named (inbox kinds, or `draft`), so a list can say why each row is there. */
   reasons?: Record<string, string[]>;
+  /** Of those, the ones only a task's pull requests make (task id → which and
+   *  what), so a list says it is a pull request asking, not the task. */
+  pullRequestAsks?: Record<string, Array<{ checkout: string; kind: string }>>;
   /** For the same queries: task id → when it last changed for those people
    *  (`updated`'s sort key), which a task's own `statusChangedAt` cannot say. */
   updated?: Record<string, number>;
@@ -662,10 +670,26 @@ function enrichContext(tasks: SearchTask[], ctx: EvalContext, query: TaskQuery):
   return { ...ctx, idToNum, blockedBy, nextRun, askedOf, series };
 }
 
+/**
+ * `tasks` holds each logical task's principal and optionally its other attempts
+ * (`otherAttempt`). Each logical task yields at most one row: its principal when
+ * that matches, else the first of its other attempts that does.
+ * Relations (dependencies, numbers, series) are between logical tasks, so they
+ * are read from the principals alone.
+ */
 export function evaluateQuery(tasks: SearchTask[], query: TaskQuery, ctx: EvalContext): EvalResult {
-  const ectx = enrichContext(tasks, ctx, query);
+  const ectx = enrichContext(tasks.filter((t) => !t.otherAttempt), ctx, query);
   const filters = query.filters ?? [];
-  let out = tasks.filter((t) => matchText(t, query.text ?? '') && filters.every((c) => matchClause(t, c, ectx)));
+  const matched = tasks.filter((t) => matchText(t, query.text ?? '') && filters.every((c) => matchClause(t, c, ectx)));
+  const logical = (t: SearchTask) => t.intentId ?? t.id;
+  const principalMatched = new Set(matched.filter((t) => !t.otherAttempt).map(logical));
+  const shown = new Set<string>();
+  let out = matched.filter((t) => {
+    const key = logical(t);
+    if (shown.has(key) || (t.otherAttempt && principalMatched.has(key))) return false;
+    shown.add(key);
+    return true;
+  });
 
   const sort = query.sort?.length ? query.sort : DEFAULT_SORT;
   out = sortTasks(out, sort, ectx);
@@ -676,6 +700,7 @@ export function evaluateQuery(tasks: SearchTask[], query: TaskQuery, ctx: EvalCo
 
   const asked = positiveForUsers(query, ctx);
   let reasons: Record<string, string[]> | undefined;
+  let pullRequestAsks: Record<string, Array<{ checkout: string; kind: string }>> | undefined;
   let updated: Record<string, number> | undefined;
   if (asked.length) {
     reasons = {};
@@ -684,9 +709,13 @@ export function evaluateQuery(tasks: SearchTask[], query: TaskQuery, ctx: EvalCo
       const why = [...new Set(asked.flatMap((u) => attentionReasons(t, u, ctx)))];
       if (why.length) reasons[t.id] = why;
       updated[t.id] = updatedFor(t, ectx);
+      const byPullRequest = asked.flatMap((u) => ctx.attention?.get(u)?.get(t.id)?.pullRequests ?? []);
+      if (byPullRequest.length) (pullRequestAsks ??= {})[t.id] = byPullRequest
+        .filter((ask, i) => byPullRequest.findIndex((other) => other.checkout === ask.checkout && other.kind === ask.kind) === i);
     }
   }
-  return { tasks: out, groups, ...(groupField?.type === 'tag' ? { hierarchical: true } : {}), ...(reasons ? { reasons, updated } : {}), total: out.length };
+  return { tasks: out, groups, ...(groupField?.type === 'tag' ? { hierarchical: true } : {}), ...(reasons ? { reasons, updated } : {}),
+    ...(pullRequestAsks ? { pullRequestAsks } : {}), total: out.length };
 }
 
 /** Every value of every `for:` clause (negated ones too) — what the API resolves. */

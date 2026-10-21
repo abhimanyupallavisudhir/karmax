@@ -1005,7 +1005,8 @@ async function applyListRoute(tab, scope, r, routeIsCurrent) {
 function taskUrl(id, record) {
   const rec = record || taskRecord(id);
   const p = projectById(rec?.projectId || S.projectId);
-  const keyPart = S.viewingAttempt !== id && rec && rec.num != null ? String(rec.num) : id;
+  // A search row standing in through another attempt opens that attempt, not the principal.
+  const keyPart = S.viewingAttempt !== id && rec && rec.num != null && !rec.otherAttempt ? String(rec.num) : id;
   return p ? `${projectBase(p.id)}/tasks/${keyPart}` : currentPath();
 }
 
@@ -2105,10 +2106,11 @@ function agentBlockHtml(prefix, spec, opts) {
     <div class="af-resume-panel" ${resumeEnabled ? '' : 'hidden'}>
       <button type="button" class="btn sm af-resume-pick">⌕ Search tasks to fork from…</button>
       <div class="af-resume-chosen" data-resume="${esc(JSON.stringify(spec?.resumeFrom?.taskId ? { taskId: spec.resumeFrom.taskId, role: spec.resumeFrom.role } : null))}">${spec?.resumeFrom?.taskId ? resumeChosenInner(spec.resumeFrom) : ''}</div>
-      <input class="af-resume-session" placeholder="${hostLocal() ? '...or paste a provider conversation ID or a ChatGPT, Claude or ' : '...or paste a ChatGPT, Claude or '}${siteNameMarkup()} share link" value="${esc(spec?.resumeFrom?.sessionId || '')}" />
+      <input class="af-resume-session" placeholder="${hostLocal() ? '...or paste a share link or provider conversation ID' : '...or paste a share link'}" title="ChatGPT, Claude, Gemini, Grok, Perplexity, DeepSeek, Le Chat, Poe, Kimi, Qwen or ${siteNameMarkup()}" value="${esc(spec?.resumeFrom?.sessionId || spec?.resumeFrom?.upload?.share || '')}" />
+      ${resumeCheckHtml(spec?.resumeFrom?.upload?.share ? { ok: spec.resumeFrom.upload } : undefined)}
       <div class="af-resume-import-row">
         <label class="btn sm af-resume-upload">Upload conversation<input type="file" accept=".json,.jsonl,application/json,application/x-ndjson" hidden></label>
-        <div class="af-resume-uploaded" data-upload="${esc(JSON.stringify(spec?.resumeFrom?.upload || null))}">${spec?.resumeFrom?.upload ? resumeUploadInner(spec.resumeFrom.upload) : ''}</div>
+        <div class="af-resume-uploaded" data-upload="${esc(JSON.stringify(spec?.resumeFrom?.upload || null))}">${spec?.resumeFrom?.upload && !spec.resumeFrom.upload.share ? resumeUploadInner(spec.resumeFrom.upload) : ''}</div>
       </div>
     </div>`}
     ${hostAuthority ? '' : agentAuthorityHtml(prefix, spec, opts.authority)}`;
@@ -2464,20 +2466,61 @@ function wireResumeReauthorization(root, host) {
   }, { signal: wiring.signal });
 }
 
+// An uploaded file, named by what was read in it (its file name in the tooltip).
 function resumeUploadInner(upload) {
-  return `${esc(upload.name || 'Conversation')}<button type="button" class="af-resume-upload-clear" title="Clear">✕</button>`;
+  const name = upload.name || 'Conversation';
+  const count = upload.messages ? resumeMessageCount(upload) : '';
+  const label = count ? resumeReadLabel(upload.title || name, count) : `<span class="af-resume-title">${esc(name)}</span>`;
+  return `<span class="af-resume-upload-name" title="${esc(name)}">${label}</span><button type="button" class="af-resume-upload-clear" title="Clear">✕</button>`;
+}
+
+// What was read in a pasted link or an uploaded file (POST /api/conversation-imports…),
+// or why it can't be: one line, the full reason in its tooltip.
+function resumeCheckHtml(state) {
+  if (!state) return '<div class="af-resume-check" hidden></div>';
+  if (state.checking) return '<div class="af-resume-check">Checking…</div>';
+  if (state.error) {
+    const reason = String(state.error).replace(/^./, (first) => first.toUpperCase());
+    return `<div class="af-resume-check err" title="${esc(reason)}">${esc(reason)}</div>`;
+  }
+  const { title, messages, share, partial } = state.ok;
+  if (!messages) return '<div class="af-resume-check" hidden></div>';
+  const count = resumeMessageCount(state.ok);
+  const tip = partial ? 'The site shows only these first messages to anyone with the link'
+    : share ? 'Read now: the agent starts from this copy' : 'Checked: the agent starts from this file';
+  return `<div class="af-resume-check ok" title="${tip}">${resumeReadLabel(title, count)}</div>`;
+}
+
+// A long title gives way; the count stays readable.
+function resumeReadLabel(title, count) {
+  return title ? `<span class="af-resume-title">${esc(title)}</span><span class="af-resume-count"> · ${esc(count)}</span>`
+    : `<span class="af-resume-count">${esc(count)}</span>`;
+}
+
+function resumeMessageCount(read) {
+  return `${read.messages}${read.partial ? '+' : ''} message${read.messages === 1 && !read.partial ? '' : 's'}`;
+}
+
+async function checkConversationShare(url) {
+  const res = await feedbackFetch(`/api/conversation-imports/share?projectId=${encodeURIComponent(S.projectId)}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...(S.token ? { authorization: `Bearer ${S.token}` } : {}) },
+    body: JSON.stringify({ url }),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body?.error || `couldn't read this link (HTTP ${res.status})`);
+  return body;
 }
 
 // Read an agent box's fork/resume choice back out: the picker's {taskId, role},
-// a public share link, or one uploaded file.
+// a share link (as read when it was pasted, once that answered), or one uploaded file.
 function readResume(box) {
   if (!box.querySelector('.af-resume-enabled')?.checked) return undefined;
   const sessionId = box.querySelector('.af-resume-session')?.value.trim();
-  if (sessionId) return { sessionId };
-  try {
-    const upload = JSON.parse(box.querySelector('.af-resume-uploaded')?.dataset.upload || 'null');
-    if (upload) return { upload };
-  } catch {}
+  let upload = null;
+  try { upload = JSON.parse(box.querySelector('.af-resume-uploaded')?.dataset.upload || 'null'); } catch {}
+  if (sessionId) return upload?.share === sessionId ? { upload } : { sessionId };
+  if (upload && !upload.share) return { upload };
   try { return JSON.parse(box.querySelector('.af-resume-chosen')?.dataset.resume || 'null') || undefined; } catch {}
   return undefined;
 }
@@ -3485,6 +3528,8 @@ function wireAgentBox(box) {
     chosen.innerHTML = '';
   };
   const clearUpload = () => {
+    const line = box.querySelector('.af-resume-check');
+    if (line) line.outerHTML = resumeCheckHtml();
     if (!uploaded) return;
     uploaded.dataset.upload = 'null';
     uploaded.innerHTML = '';
@@ -3533,10 +3578,32 @@ function wireAgentBox(box) {
       onPick: ({ task, role, session }) => setResume({ taskId: task.id, role }, task, session),
     }),
   );
+  // A pasted link is read at once (debounced), exactly as the agent will read it.
+  const setCheck = (state) => { const line = box.querySelector('.af-resume-check'); if (line) line.outerHTML = resumeCheckHtml(state); };
+  let checking = 0;
+  let checkTimer;
+  const checkLink = async (link) => {
+    const mine = ++checking;
+    setCheck({ checking: true });
+    try {
+      const upload = await checkConversationShare(link);
+      if (mine !== checking || sessionInput.value.trim() !== link) return;
+      if (uploaded) { uploaded.dataset.upload = JSON.stringify(upload); uploaded.innerHTML = ''; }
+      setCheck({ ok: upload });
+      box.dispatchEvent(new Event('change', { bubbles: true }));
+    } catch (error) {
+      if (mine === checking) setCheck({ error: error.message });
+    }
+  };
   sessionInput?.addEventListener('input', () => {
-    if (!sessionInput.value.trim()) return;
+    clearTimeout(checkTimer);
+    checking++;
+    const link = sessionInput.value.trim();
+    setCheck(undefined);
+    if (!link) return;
     clearTask();
     clearUpload();
+    if (/^https?:\/\//i.test(link)) checkTimer = setTimeout(() => checkLink(link), 400);
   });
   uploaded?.addEventListener('click', (e) => {
     if (!e.target.closest('.af-resume-upload-clear')) return;
@@ -3547,18 +3614,22 @@ function wireAgentBox(box) {
     const file = uploadInput.files?.[0];
     uploadInput.value = '';
     if (!file) return;
+    checking++;
+    clearTask();
+    if (sessionInput) sessionInput.value = '';
+    clearUpload();
+    if (uploaded) uploaded.innerHTML = resumeCheckHtml({ checking: true });
     try {
       const upload = await uploadConversationFile(file);
-      clearTask();
-      if (sessionInput) sessionInput.value = '';
       if (uploaded) {
         uploaded.dataset.upload = JSON.stringify(upload);
         uploaded.innerHTML = resumeUploadInner(upload);
       }
-      box.dispatchEvent(new Event('change', { bubbles: true }));
     } catch (error) {
-      toast(error.message, true);
+      // The file replaces the source even when it can't be read: never keep the old one silently.
+      if (uploaded) uploaded.innerHTML = resumeCheckHtml({ error: error.message });
     }
+    box.dispatchEvent(new Event('change', { bubbles: true }));
   });
   // The Fork button picks its source the way the picker does.
   box._pickResume = setResume;
@@ -5006,6 +5077,20 @@ function subTaskSummaryEventNeedsRefresh(ev) {
   return (S.view?.subTaskSummaries || []).some((summary) => summary.id === ev.taskId);
 }
 
+// A non-principal attempt can stand in for its task in a search (otherAttempt),
+// so its lifecycle can change the results: when the row it shows changes, or,
+// if the list does not show it, when its stage or status does (an attempt not
+// seen before may have just changed). Agent-turn churn alone changes neither.
+const attemptListStates = new Map();
+function siblingAttemptChangesSearch(ev) {
+  if (ev.type !== 'view.updated' || !ev.taskId) return false;
+  const state = `${ev.payload?.stage}\u0000${ev.payload?.status}`;
+  const before = attemptListStates.get(ev.taskId);
+  attemptListStates.set(ev.taskId, state);
+  const row = (S.searchResult?.tasks || []).find((task) => task.id === ev.taskId);
+  return row ? patchLifecycleView({ ...row }, ev) : before !== state;
+}
+
 function patchTaskListFromEvent(ev) {
   if (ev.type !== 'view.updated' || !ev.taskId) return false;
   const task = S.tasks.find((candidate) => candidate.id === ev.taskId);
@@ -5018,7 +5103,7 @@ function patchTaskListFromEvent(ev) {
 const HOME_REFRESH_MS = 800;
 let homeRefreshTimer = null;
 function homeEventChangesList(ev) {
-  if (!ev.taskId || ev.siblingAttempt || liveOnlyEvent(ev.type)) return false;
+  if (!ev.taskId || liveOnlyEvent(ev.type)) return false;
   if (!(ev.type === 'view.updated' || ev.type === 'task.stage' || ev.type === 'task.mentioned'
     || ev.type === 'task.created' || ev.type === 'task.deleted' || LIST_RELOAD_EVENTS.has(ev.type))) return false;
   const project = projectById(ev.projectId || ev.payload?.projectId);
@@ -5122,7 +5207,10 @@ function connectWs() {
       // membership, but they do not require the expensive all-tasks endpoint.
       if (S.tab === 'tasks' && !S.selected) scheduleSearch(true);
       if (S.tab === 'queue' && !S.selected) bgRenderMain();
-    } else if (currentProject && !siblingAttempt && (LIST_RELOAD_EVENTS.has(ev.type)
+    } else if (currentProject && siblingAttempt) {
+      // Never the principals-only task index, but perhaps the search results.
+      if (S.tab === 'tasks' && !S.selected && siblingAttemptChangesSearch(ev)) scheduleSearch(true);
+    } else if (currentProject && (LIST_RELOAD_EVENTS.has(ev.type)
       || (ev.type === 'view.updated' && ev.taskId && !S.tasks.some((t) => t.id === ev.taskId)
         ))) {
       // True membership/metadata changes are rare and do require a durable reload.
@@ -6686,12 +6774,31 @@ const HOLD_REASONS = {
   authorization: ['Access', 'Needs an authorization you can grant'],
   merge: ['Merge', 'Waiting for you to merge'],
 };
-function attentionChip(t) {
+// What a task's pull request asks (SPEC §11.1): the task itself is not waiting on it.
+const PULL_REQUEST_REASONS = {
+  'approval-requested': ['PR approval', 'waits for your approval'],
+  'review-requested': ['PR review', 'waits for your review'],
+  escalated: ['PR input', 'waits for your answer'],
+  assigned: ['Assigned', 'is assigned to you'],
+  mentioned: ['Mentioned', 'mentions you'],
+};
+// The strongest ask that puts a row in a `for:` list, and the task's pull
+// request making it when the task itself does not (pramana#102).
+function rowAsk(t) {
   const reasons = S.searchResult?.reasons?.[t.id] || [];
   // An ask outranks a mention; the order of ATTENTION_REASONS is the rank.
   const kind = Object.keys(ATTENTION_REASONS).find((reason) => reasons.includes(reason));
-  if (!kind) return '';
-  const [label, title] = (kind === 'escalated' && HOLD_REASONS[t.lastView?.waitingFor?.reason]) || ATTENTION_REASONS[kind];
+  if (!kind) return undefined;
+  const pullRequest = (S.searchResult?.pullRequestAsks?.[t.id] || []).find((ask) => ask.kind === kind)?.checkout;
+  return { kind, ...(pullRequest ? { pullRequest } : {}) };
+}
+function attentionChip(t) {
+  const ask = rowAsk(t);
+  if (!ask) return '';
+  const { kind, pullRequest } = ask;
+  const [label, title] = pullRequest
+    ? [PULL_REQUEST_REASONS[kind][0], `The pull request for "${pullRequest}" ${PULL_REQUEST_REASONS[kind][1]}`]
+    : (kind === 'escalated' && HOLD_REASONS[t.lastView?.waitingFor?.reason]) || ATTENTION_REASONS[kind];
   return `<span class="chip attention ${esc(kind)}" title="${esc(title)}">${esc(label)}</span>`;
 }
 // A row's project as a slug — `project` within an organization, `org/project`
@@ -6908,6 +7015,10 @@ function runSubRow(r) {
     </div>`;
 }
 
+/** Asked to run, held until someone approves the authorization its creator could not grant. */
+function awaitingApproval(t) { return !!t?.params?.draft && !!t.params._awaitingApproval; }
+const awaitingApprovalChip = '<span class="chip waiting" title="Starts by itself once someone who can grant its authorization approves">waiting for approval</span>';
+
 function taskRow(t, { showTags = true, project = false } = {}) {
   const isDraft = t.params?.draft;
   const archived = t.params?.archived;
@@ -6931,15 +7042,16 @@ function taskRow(t, { showTags = true, project = false } = {}) {
   // so its history remains visible and the task can be unarchived; active special
   // rows retain their direct editing controls.
   if (isDraft && !archived) {
+    const awaiting = awaitingApproval(t);
     return `
     <div class="task-row" data-draft="${t.id}" tabindex="0" role="group" aria-label="${esc(t.title)}">
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</div>
-        <div class="task-sub">${where}<span class="chip">draft</span>${priorityFlag(t)}${showTags ? tagChips(t) : ''}</div>
+        <div class="task-sub">${where}${awaiting ? awaitingApprovalChip : '<span class="chip">draft</span>'}${priorityFlag(t)}${showTags ? tagChips(t) : ''}</div>
       </div>
       <div class="task-right">
         ${rowWhen(t)}
-        <button class="btn sm" data-queue="${t.id}">Run task</button>
+        ${awaiting ? '' : `<button class="btn sm" data-queue="${t.id}">Run task</button>`}
         <button class="btn sm danger" data-deldraft="${t.id}">Delete</button>
       </div>
     </div>`;
@@ -6947,8 +7059,10 @@ function taskRow(t, { showTags = true, project = false } = {}) {
   const v = t.lastView || {};
   const status = v.status || 'active';
   // In a for: list the reason says what the task waits for; a waiting stage
-  // chip ("Needs input") would only repeat it.
+  // chip ("Needs input") would only repeat it. Not when the ask is its pull
+  // request's: the task itself may be waiting on something else entirely.
   const why = attentionChip(t);
+  const ownAsk = !!why && !rowAsk(t)?.pullRequest;
   // Any task can be archived/un-archived — archiving only hides it from the list,
   // it never affects a running task's execution.
   const archiveBtn = archived
@@ -6961,7 +7075,7 @@ function taskRow(t, { showTags = true, project = false } = {}) {
         <div class="task-sub">
           ${where}${why}
           ${customBranch(v, t.id) ? `<span class="branch">${esc(v.branch)}</span>` : ''}
-          ${why && status === 'waiting' ? '' : `<span class="chip ${status}">${esc(stageLabel(v))}</span>`}
+          ${ownAsk && status === 'waiting' ? '' : `<span class="chip ${status}">${esc(stageLabel(v))}</span>`}
           ${v.approvalRequests && !why ? '<span class="chip approval-needed">approval needed</span>' : ''}
           ${priorityFlag(t)}${showTags ? tagChips(t) : ''}
         </div>
@@ -7307,8 +7421,8 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['run'], query 
 
   const rowHtml = (t) => {
     const v = t.lastView || {};
-    const status = v.status || (t.params?.draft ? 'cancelled' : t.params?.triggerState === 'armed' ? 'waiting' : 'active');
-    const chipLabel = t.params?.draft ? 'draft' : t.params?.triggerState === 'armed' ? 'waiting for trigger' : stageLabel(v);
+    const status = v.status || (awaitingApproval(t) || t.params?.triggerState === 'armed' ? 'waiting' : t.params?.draft ? 'cancelled' : 'active');
+    const chipLabel = awaitingApproval(t) ? 'waiting for approval' : t.params?.draft ? 'draft' : t.params?.triggerState === 'armed' ? 'waiting for trigger' : stageLabel(v);
     const open = expanded.has(t.id);
     return `<div class="pick-row" data-nav data-task="${t.id}">
       <div class="task-main">
@@ -8478,6 +8592,8 @@ function taskFormTitle(draft) {
   const p = draft?.params || {};
   if (p.triggerState === 'armed' && !isSeries(p) && draft.num != null)
     return `<span class="task-num">#${draft.num}</span> ${esc(draft.title)} <span class="chip waiting" title="Starts by itself when its trigger fires">${esc(triggerSummary(p.triggers) || 'waiting')}</span>`;
+  if (awaitingApproval(draft) && draft.num != null)
+    return `<span class="task-num">#${draft.num}</span> ${esc(draft.title)} ${awaitingApprovalChip}`;
   return !draft ? 'New task' : p.triggerState === 'armed' || isSeries(p) ? 'Edit task' : 'Edit draft';
 }
 
@@ -9339,7 +9455,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
           releaseFormKeys();
           root.innerHTML = '';
           leavePage(false);
-          toast('Authorization request sent — the task will queue when approved');
+          toast('Waiting for approval — it starts once approved');
           refreshTasks();
           succeeded = true;
           return true;
@@ -11581,7 +11697,11 @@ function parentTaskContext(v) {
   const label = parent
     ? `${parent.num != null ? `#${parent.num} ` : ''}${parent.title}`
     : numLabel(parentId);
-  return `<a class="tp-crumb tp-parent" data-open="${esc(parentId)}" data-spa href="${esc(taskUrl(parentId, parent))}" title="Parent task" aria-label="Open parent task ${esc(label)}">${esc(label)}</a>`;
+  // A pull request of its task (SPEC §11.1) is part of it, not a sub-task.
+  const pullRequest = v.parentTask?.id === parentId ? v.parentTask.pullRequest : undefined;
+  const role = pullRequest ? `Task this pull request (“${pullRequest}”) is part of` : 'Parent task';
+  return `<a class="tp-crumb tp-parent" data-open="${esc(parentId)}" data-spa href="${esc(taskUrl(parentId, parent))}" title="${esc(role)}" aria-label="Open ${esc(pullRequest ? 'the task of this pull request' : 'parent task')} ${esc(label)}">${esc(label)}</a>`
+    + (pullRequest ? `<span class="tp-crumb-sep" aria-hidden="true">›</span><span class="tp-crumb tp-pr">pull request “${esc(pullRequest)}”</span>` : '');
 }
 
 // A child reads exactly as it does in the task list and on its own page: the
@@ -11611,7 +11731,7 @@ function subTasksSection(v) {
   // any other copy of the child the console happens to hold.
   const summaries = new Map((v.subTaskSummaries || []).map((summary) => [summary.id, summary]));
   // A pull request of this task (software-dev ≥1.30) is part of it, shown under Branches.
-  const pullRequests = new Set((v.shipments || []).map((shipment) => shipment.childTaskId));
+  const pullRequests = new Set(pullRequestLanes(v).all.map((lane) => lane.childTaskId));
   const ids = [...new Set([...summaries.keys(), ...(v.subTasks || [])])].filter((id) => !pullRequests.has(id));
   if (!ids.length) return '';
   const children = ids.map((id) => {
@@ -11777,14 +11897,33 @@ function branchPullRequestState(view, lane) {
   return ['Opening', 'active', false];
 }
 
+// A task's pull requests (software-dev ≥1.30): its run's record of them, and
+// what each pull request's own record says — so one stays the task's, never a
+// sub-task, even when a replaced run lost it (pramana#102). `latest`: each
+// checkout's newest pull request.
+function pullRequestLanes(v) {
+  const lanes = new Map();
+  for (const summary of v.subTaskSummaries || []) {
+    if (!summary.pullRequest) continue;
+    const status = summary.lastView?.status;
+    lanes.set(summary.id, { checkout: summary.pullRequest.checkout, childTaskId: summary.id,
+      target: summary.pullRequest.target || v.targetBranch,
+      state: status === 'done' ? 'landed' : status === 'cancelled' || status === 'failed' ? 'cancelled' : 'open' });
+  }
+  for (const shipment of v.shipments || []) lanes.set(shipment.childTaskId, shipment);
+  const all = [...lanes.values()];
+  return { all, latest: new Map(all.map((lane) => [lane.checkout, lane])) };
+}
+
 function checkoutsSection(v) {
   const checkouts = v.checkouts || [];
-  if (checkouts.length < 2) return '';                      // one branch: `branch`/`prs` already say it all
-  const atReview = v.stage === 'review' && (v.actions || []).some((a) => a.name === 'confirm');
-  // software-dev ≥1.30: each branch's pull request is its own sub-task, opened
+  // software-dev ≥1.30: each branch's pull request is part of the task, opened
   // whenever the agent is ready. Its row says where that pull request is, links
   // to it, and approves it right here while it waits for a reviewer.
-  const shipped = new Map((v.shipments || []).map((s) => [s.checkout, s]));
+  const shipped = pullRequestLanes(v).latest;
+  // One branch without a pull request of its own: `branch`/`prs` already say it all.
+  if (!checkouts.length || (checkouts.length < 2 && !shipped.size)) return '';
+  const atReview = v.stage === 'review' && (v.actions || []).some((a) => a.name === 'confirm');
   const summaries = new Map((v.subTaskSummaries || []).map((summary) => [summary.id, summary]));
   const rows = checkouts.map((c) => {
     const lane = shipped.get(c.name);

@@ -4,7 +4,7 @@ import https from 'node:https';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { spawnSync } from 'node:child_process';
-import { publicFetch } from '../src/mcp/connections/http.js';
+import { publicFetch, publicShareFetch } from '../src/mcp/connections/http.js';
 
 afterEach(() => vi.restoreAllMocks());
 describe('MCP public network boundary', () => {
@@ -66,5 +66,17 @@ describe('MCP public network boundary', () => {
   it('rejects oversized responses', async () => {
     endpoint(200, 'x'.repeat(2 * 1024 * 1024 + 1));
     await expect(publicFetch('https://tools.example/mcp')).rejects.toThrow(/too large/);
+  });
+  // claude.ai's Cloudflare refuses a TLS hello that offers no ALPN (2026-10-20).
+  it('offers ALPN like any current client', async () => {
+    const socket = endpoint(200);
+    await publicFetch('https://tools.example/mcp');
+    expect((socket.mock.calls[0]![1] as any).ALPNProtocols).toEqual(['http/1.1']);
+  });
+  it('reads a conversation share as large as an uploaded conversation', async () => {
+    endpoint(200, 'x'.repeat(3 * 1024 * 1024));
+    expect((await (await publicShareFetch('https://claude.ai/api/chat_snapshots/x')).text()).length).toBe(3 * 1024 * 1024);
+    endpoint(200, 'x'.repeat(20 * 1024 * 1024 + 1));
+    await expect(publicShareFetch('https://claude.ai/api/chat_snapshots/x')).rejects.toThrow(/too large/);
   });
 });

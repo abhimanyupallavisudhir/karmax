@@ -58,7 +58,8 @@ describe.skipIf(!sshdAvailable)('Google Cloud worlds (fake Compute Engine, real 
     // The image builder provisions a real machine as root: never on this one.
     process.env.KARMAX_GCP_IMAGES = '0';
     gcp = new FakeGcp();
-    driver = new GcpDriver(gcp.fetch, 1);
+    // A wait is 300 polls: at 1 ms a cold sshd boot on a busy runner can outlast it (CI #2182).
+    driver = new GcpDriver(gcp.fetch, 10);
     stamp = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'vm-stamp-')), 'provisioned');
     ledger = new Map();
     provider = new VmWorldProvider(driver, async () => connection(gcp.key), undefined, {

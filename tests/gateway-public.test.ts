@@ -102,6 +102,8 @@ describe('public gateway payloads', () => {
     const cookie = previewCookieHeader('lease/1', token, Date.now() + 60_000);
     expect(cookie).toContain('HttpOnly');
     expect(cookie).toContain('Path=/preview/lease%2F1/');
+    // On the lease's own host the whole host is the application.
+    expect(previewCookieHeader('lease/1', token, Date.now() + 60_000, true)).toContain('Path=/;');
     expect(previewCookieValue(cookie, 'lease/1')).toBe(token);
     const env = { KARMAX_PREVIEW_ORIGIN: 'https://preview.example.com' } as NodeJS.ProcessEnv;
     expect(previewLeaseOrigin('lease-a', env)).toMatch(/^https:\/\/p-[a-f0-9]{24}\.preview\.example\.com$/);

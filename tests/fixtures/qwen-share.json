@@ -1,0 +1,48 @@
+{
+ "success": true,
+ "request_id": "x",
+ "data": {
+  "id": "q0",
+  "title": "Capitals fixture",
+  "created_at": 1792400000,
+  "updated_at": 1792400100,
+  "currentId": "q2",
+  "chat": {
+   "history": {
+    "messages": {
+     "q1": {
+      "id": "q1",
+      "role": "user",
+      "content": "What is the capital of France?",
+      "parentId": null,
+      "childrenIds": [
+       "q2"
+      ],
+      "timestamp": 1792400000
+     },
+     "q2": {
+      "id": "q2",
+      "role": "assistant",
+      "content": "",
+      "parentId": "q1",
+      "model": "qwen3.5-plus",
+      "modelName": "Qwen3.5-Plus",
+      "timestamp": 1792400005,
+      "content_list": [
+       {
+        "phase": "thinking_summary",
+        "content": "Recall the capital."
+       },
+       {
+        "phase": "answer",
+        "content": "The capital of France is **Paris**."
+       }
+      ]
+     }
+    },
+    "currentId": "q2"
+   },
+   "messages": []
+  }
+ }
+}

@@ -107,6 +107,7 @@ import { tokenToInject } from '../autonomy/config-homes.js';
 import { findProviderSession, materializeFork } from '../agent/fork.js';
 import { CodexHistoryError } from '../agent/codex-history.js';
 import { importWithPanagent, reuseNativeImport, stableImportSessionId, looksLikeConversationUrl, publicConversationShare, type PanagentSource } from '../agent/panagent.js';
+import { SHARE_APPS } from '../agent/conversation-shares.js';
 import { publicShare, publicConversationHtml } from '../gateway/conversation-sharing.js';
 import { isRemoteAgentWorld, materializeRemoteSession, prewarmRemoteAgentHome, readRemoteImport, RemoteAgentCliUnavailable } from '../agent/remote-process.js';
 import { checkWorldDisk, diskNotice, diskRatio, diskWasFull, DISK_REARM_RATIO, DISK_WARN_RATIO, isDiskFullMessage, largestWorldPaths,
@@ -2833,14 +2834,14 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const allowProviderId = deps.hostLocal ?? deploymentHostLocal();
         if (spec.resumeFrom.sessionId && !share && looksLikeConversationUrl(spec.resumeFrom.sessionId)) {
           throw ApplicationFailure.create({
-            message: `Use a public HTTPS ChatGPT, Claude or ${BRAND} share link, or upload a conversation file.`,
+            message: `Use a public HTTPS share link of ${SHARE_APPS}, or upload a conversation file.`,
             type: 'agent-error',
             nonRetryable: true,
           });
         }
         if (spec.resumeFrom.sessionId && !share && !allowProviderId) {
           throw ApplicationFailure.create({
-            message: `Provider conversation IDs are available only on a host-local ${BRAND}. Upload the Codex/Claude conversation file or use a public HTTPS ChatGPT, Claude or ${BRAND} share link.`,
+            message: `Provider conversation IDs are available only on a host-local ${BRAND}. Upload the Codex/Claude conversation file or use a public HTTPS share link of ${SHARE_APPS}.`,
             type: 'agent-error',
             nonRetryable: true,
           });
@@ -2850,8 +2851,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             throw new Error('uploaded conversation belongs to a different project');
           if (!deps.objects) throw new Error('conversation import storage is unavailable');
           const data = await deps.objects.get(conversationImportObjectKey(args.task.projectId, upload.id));
-          const kind = await applyPanagent({ data, name: upload.name }, 'transcript', `upload:${upload.id}`);
-          (await record(args.taskId, 'session.imported', { source: 'upload', format: upload.format, provider: profile.provider, kind }));
+          // A share read when it was given keeps a share's guarded context mode.
+          const share = upload.share ? publicConversationShare(upload.share) : undefined;
+          const kind = share
+            ? await applyPanagent({ data, name: upload.name, format: share.format }, 'context', `share:${share.url}`)
+            : await applyPanagent({ data, name: upload.name }, 'transcript', `upload:${upload.id}`);
+          (await record(args.taskId, 'session.imported', { source: share ? 'share' : 'upload', format: upload.format, provider: profile.provider, kind }));
         } else if (share) {
           // A share of this installation is read from the store (exactly what
           // its public page shows) rather than fetched back over the internet.

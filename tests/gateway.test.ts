@@ -372,7 +372,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
       expect(JSON.parse((await stopped('application/json')).body)).toEqual({ error: 'preview not found or expired' });
       const redirected = await fetch(`${base}/preview/lease-1/`, { redirect: 'manual' });
       expect(redirected.status).toBe(307);
-      expect(redirected.headers.get('location')).toMatch(/^http:\/\/p-[a-f0-9]{24}\.preview\.invalid\/preview\/lease-1\/$/);
+      expect(redirected.headers.get('location')).toMatch(/^http:\/\/p-[a-f0-9]{24}\.preview\.invalid\/$/);
     } finally {
       if (previous === undefined) delete process.env.KARMAX_PREVIEW_ORIGIN;
       else process.env.KARMAX_PREVIEW_ORIGIN = previous;

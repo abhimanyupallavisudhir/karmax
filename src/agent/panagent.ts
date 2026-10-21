@@ -9,14 +9,15 @@ import type { Message, Provider } from '../domain/types.js';
 import { claudeCwdSlug, findProviderSession } from './fork.js';
 import { codexHistoryMetadata, codexRolloutFilename, prepareCodexHistory, CodexHistoryError } from './codex-history.js';
 import { installLocalCodexSnapshot, localCodexCopies, readLocalCodexHistory } from './codex-history-files.js';
-import { publicFetch, publicUrl } from '../mcp/connections/http.js';
+import { SHARE_APPS, ShareLinkError, fetchShare, publicConversationShare, type ShareFormat } from './conversation-shares.js';
 import { BRAND } from '../domain/brand.js';
 
 const pexec = promisify(execFile);
 const VENDORED_PANAGENT = fileURLToPath(new URL('../../vendor/panagent/src', import.meta.url));
 const MAX_PANAGENT_OUTPUT = 64 * 1024 * 1024;
 
-export type PanagentSource = { url: string } | { data: Buffer; name?: string } | { path: string };
+/** `format` names a share's panagent reader when the data came from a share link. */
+export type PanagentSource = { url: string } | { data: Buffer; name?: string; format?: ShareFormat } | { path: string };
 
 export interface PanagentImportOptions {
   source: PanagentSource;
@@ -111,25 +112,7 @@ export async function exportConversationWithPanagent(opts: {
   }
 }
 
-export type ShareFormat = 'chatgpt-share' | 'claude-share' | 'tavya-share';
-export interface ConversationShareLink { url: string; format: ShareFormat; /** A tavya share's id. */ id?: string }
-
-/** tavya (any karmax install) serves shares at an unguessable id below this path. */
-const TAVYA_SHARE_PATH = /^\/share\/conversations\/([A-Za-z0-9_-]{43})$/;
-
-/** A public HTTPS ChatGPT, Claude or tavya share link panagent can import. */
-export function publicConversationShare(value: string): ConversationShareLink | undefined {
-  let url: URL;
-  try { url = publicUrl(value); } catch { return undefined; }
-  if (url.protocol !== 'https:') return undefined;
-  const host = url.hostname.toLowerCase();
-  const tavya = url.pathname.match(TAVYA_SHARE_PATH);
-  if (tavya) return { url: url.toString(), format: 'tavya-share', id: tavya[1] };
-  if (!url.pathname.startsWith('/share/')) return undefined;
-  if (host === 'chatgpt.com' || host === 'www.chatgpt.com') return { url: url.toString(), format: 'chatgpt-share' };
-  if (host === 'claude.ai' || host === 'www.claude.ai') return { url: url.toString(), format: 'claude-share' };
-  return undefined;
-}
+export { claudeShareSnapshotUrl, fetchShare, publicConversationShare, type ConversationShareLink, type ShareFormat } from './conversation-shares.js';
 
 export function looksLikeConversationUrl(value: string): boolean {
   try {
@@ -162,17 +145,17 @@ export async function importWithPanagent(opts: PanagentImportOptions): Promise<P
     const format: string[] = [];
     if ('url' in opts.source) {
       const share = publicConversationShare(opts.source.url);
-      if (!share) throw new PanagentError(`Use a public HTTPS ChatGPT, Claude or ${BRAND} share URL`);
-      const response = await publicFetch(share.url);
-      if (response.status === 404 || response.status === 410)
-        throw new PanagentError('Share link not found; it may have been deleted or unshared');
-      if (!response.ok) throw new PanagentError(`Share request returned HTTP ${response.status}`);
-      source = path.join(temporary, 'share.html');
-      fs.writeFileSync(source, Buffer.from(await response.arrayBuffer()), { mode: 0o600 });
+      if (!share) throw new PanagentError(`Use a public HTTPS share link of ${SHARE_APPS}`);
+      const fetched = await fetchShare(share).catch((error) => {
+        throw error instanceof ShareLinkError ? new PanagentError(error.message) : error;
+      });
+      source = path.join(temporary, fetched.name);
+      fs.writeFileSync(source, fetched.data, { mode: 0o600 });
       format.push('--from', share.format);
     }
     if ('data' in opts.source) fs.writeFileSync(source, opts.source.data, { mode: 0o600 });
-    if (!('url' in opts.source)) {
+    if ('data' in opts.source && opts.source.format) format.push('--from', opts.source.format);
+    else if (!('url' in opts.source)) {
       const raw = fs.readFileSync(source);
       const content = 'data' in opts.source && raw.subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf])) ? raw.subarray(3) : raw;
       if (opts.native && opts.provider === 'claude') {
@@ -238,6 +221,30 @@ export async function importWithPanagent(opts: PanagentImportOptions): Promise<P
         ].join('\n'),
       },
     };
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+}
+
+/** What panagent reads in a conversation: its title and how many messages. It
+ * converts exactly as an agent's first turn will, so a source that passes here
+ * imports there. */
+export async function summarizeConversation(data: Buffer, name: string, format?: ShareFormat):
+  Promise<{ title?: string; messages: number; format: string; partial?: true }> {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-panagent-check-'));
+  try {
+    const source = path.join(temporary, safeSourceName(name));
+    const output = path.join(temporary, 'conversation.agent.json');
+    fs.writeFileSync(source, data, { mode: 0o600 });
+    await runPanagent(['convert', source, ...(format ? ['--from', format] : []), '--to', 'ir', '--browser', 'never', '--quiet', '-o', output],
+      path.join(temporary, 'report.json'));
+    const ir = JSON.parse(fs.readFileSync(output, 'utf8'));
+    const messages = Array.isArray(ir.messages) ? ir.messages.length : 0;
+    if (!messages) throw new PanagentError('This conversation has no messages');
+    // A share the site shows only in part (Poe's later pages, a long Perplexity thread).
+    const partial = Array.isArray(ir.warnings) && ir.warnings.some((warning: { code?: string }) => warning?.code === 'share_partial');
+    return { ...(typeof ir.title === 'string' && ir.title.trim() ? { title: ir.title.trim().slice(0, 200) } : {}), messages,
+      format: String(ir.source?.format ?? ''), ...(partial ? { partial: true as const } : {}) };
   } finally {
     fs.rmSync(temporary, { recursive: true, force: true });
   }

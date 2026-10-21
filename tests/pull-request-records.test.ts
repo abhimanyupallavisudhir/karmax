@@ -34,6 +34,10 @@ describe.each(storeBackends)('pull requests of a task ($name)', ({ open }) => {
     expect(ids((await store.taskSummaryPage(project.id, { includeArchived: true })).tasks)).toEqual(listed);
     // Its task still finds it, for its Branches.
     expect((await store.childTaskSummaries(parent.id)).map((summary) => summary.id)).toContain(pr.id);
+    // Each says whether it is a pull request of its task, whatever the task's run remembers (pramana#102).
+    const summaries = new Map((await store.childTaskSummaries(parent.id)).map((summary) => [summary.id, summary]));
+    expect(summaries.get(pr.id)?.pullRequest).toEqual({ checkout: 'docs' });
+    expect(summaries.get(child.id)?.pullRequest).toBeUndefined();
 
     // Named as its task wherever it asks something.
     const headers = await store.taskHeaders([pr.id, child.id]);
@@ -50,5 +54,8 @@ describe.each(storeBackends)('pull requests of a task ($name)', ({ open }) => {
     const asks = await store.attentionAsks('owner', organization.id);
     expect([...asks.keys()]).toEqual([parent.id]);
     expect(asks.get(parent.id)?.kinds).toEqual(['review-requested']);
+    // …and says which of its pull requests asks it, so a list can tell that
+    // apart from the task itself waiting for Review (pramana#102).
+    expect(asks.get(parent.id)?.pullRequests).toEqual([{ checkout: 'docs', kind: 'review-requested' }]);
   });
 });

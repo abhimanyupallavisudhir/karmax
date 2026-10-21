@@ -43,6 +43,7 @@ import { newId } from '../util/id.js';
 import { IncomingWebhooks, WebhookConfigError, webhookDeliveryKey, type IncomingWebhook } from '../integrations/incoming-webhooks.js';
 import { isChatPlatform, type ChatPlatform } from '../integrations/chat-platforms.js';
 import { chatThreadKey } from '../integrations/chat-replies.js';
+import { pullRequestOf } from '../domain/pull-requests.js';
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult, EvalContext, TaskGroup, forClauseValues, attentionCandidates } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
 import { providerLabel } from '../domain/computer-limits.js';
@@ -62,7 +63,9 @@ import { WikiScope, wikiRoot, listWiki, readWikiPage, writeWikiPage, deleteWikiP
 import { copyRemoteWiki, RemoteWikiSnapshots } from '../wiki/remote-snapshot.js';
 import { commitProjectWiki, ensureProjectWikiRepository, mutateAndPublishProjectWiki, projectWikiBranches, projectWikiBranchView, removeProjectWikiRepository, PROJECT_WIKI_BRANCH } from '../wiki/repository.js';
 import { applyAgentSpec, defaultModel, defaultEffort, ProfileResolver, profileVisibleTo, roleDefaultProfile } from '../agent/profiles.js';
-import { looksLikeConversationUrl, publicConversationShare } from '../agent/panagent.js';
+import { looksLikeConversationUrl, PanagentError, publicConversationShare } from '../agent/panagent.js';
+import { importConversationShare } from '../agent/conversation-sources.js';
+import { SHARE_APPS } from '../agent/conversation-shares.js';
 import { hostLocal as deploymentHostLocal } from '../config/deployment.js';
 import { AuthorizationGrantError, LEVEL_AUDIENCES, type AuthorizationGap, type AuthorizationService } from './authorization.js';
 import { PermissionRequests, exactCapability, type PermissionRequest } from './permission-requests.js';
@@ -426,6 +429,8 @@ export interface KarmaxApiDeps {
   /** The world lifecycle sweep, which frees a task's computer on request. */
   worldLifecycle?: Pick<import('../world/runners.js').WorldLifecycleManager, 'release'>;
   resources?: ProjectResourceService;
+  /** Where checked conversation sources are kept (conversation imports). */
+  objects?: import('../store/objects.js').ObjectStore;
   broker?: CredentialBroker;
   githubApp?: import('../integrations/github-app.js').GitHubAppService;
   /** Wake live gateway subscribers when platform-side actions append events. The
@@ -1019,7 +1024,8 @@ export class KarmaxApi {
    * already models the intended check; this closes the same door on the raw
    * params path (POST /api/tasks, PATCH /api/tasks/:id/params).
    */
-  private async validateAndAuthorizeResumeSources(token: string, params: Record<string, unknown> | undefined): Promise<void> {
+  private async validateAndAuthorizeResumeSources(token: string, params: Record<string, unknown> | undefined,
+    projectId: string): Promise<void> {
     // Every agent spec can carry the pointer: the `agent:*` roles, each
     // Confirm-agent layer (and the legacy single-gate `{mode:'agent'}`), and
     // the Responder. Walk them by shape so a renamed field cannot slip past.
@@ -1037,10 +1043,29 @@ export class KarmaxApi {
       const sessionId = (resumeFrom as Record<string, unknown>).sessionId;
       if (sessionId !== undefined && (typeof sessionId !== 'string' || !sessionId.trim()
         || (looksLikeConversationUrl(sessionId) && !publicConversationShare(sessionId))))
-        throw new ValidationError(`use a public HTTPS ChatGPT, Claude or ${BRAND} share link or upload a conversation file`);
+        throw new ValidationError(`use a public HTTPS share link of ${SHARE_APPS} or upload a conversation file`);
       if (typeof sessionId === 'string' && !publicConversationShare(sessionId)
         && !(this.deps.hostLocal ?? deploymentHostLocal()))
-        throw new ValidationError(`provider conversation IDs are available only on a host-local ${BRAND}; upload the Codex/Claude conversation file or use a public HTTPS ChatGPT, Claude or ${BRAND} share link`);
+        throw new ValidationError(`provider conversation IDs are available only on a host-local ${BRAND}; upload the Codex/Claude conversation file or use a public HTTPS share link of ${SHARE_APPS}`);
+      // A share link is read now, as the task form reads one, and replaced by
+      // what was read: an unreadable link never reaches a turn (lvpm#4), and the
+      // turn starts from this copy instead of fetching it again.
+      if (typeof sessionId === 'string' && publicConversationShare(sessionId)) {
+        try {
+          const upload = await importConversationShare({ store: this.deps.store, objects: this.deps.objects }, projectId, sessionId);
+          // Without a store to keep it in (small harnesses), the link stays a link.
+          if (this.deps.objects) {
+            delete (resumeFrom as Record<string, unknown>).sessionId;
+            (resumeFrom as Record<string, unknown>).upload = upload;
+          }
+        } catch (error) {
+          if (error instanceof PanagentError) throw new ValidationError(error.message);
+          throw error;
+        }
+      }
+      const upload = (resumeFrom as Record<string, unknown>).upload as { id?: unknown; projectId?: unknown } | undefined;
+      if (upload !== undefined && (!upload || typeof upload.id !== 'string' || upload.projectId !== projectId))
+        throw new ValidationError('that uploaded conversation belongs to another project; upload it here again');
       const sourceId = (resumeFrom as Record<string, unknown>).taskId;
       if (typeof sourceId !== 'string' || !sourceId) continue;
       const source = (await this.deps.store.getTask(sourceId));
@@ -1359,10 +1384,14 @@ export class KarmaxApi {
       /** `true` accepts the limited package for the task and every agent; a
        * list accepts it for those participants (`do` is the task's own). */
       acceptAttenuation?: boolean | string[];
-      /** Instead of refusing what the caller cannot grant, keep the task as a
-       * draft held for it and return the gap: the caller then asks someone who
-       * can grant it (`requestPermission` with `taskId`). How agents create tasks. */
+      /** Instead of refusing what the caller cannot grant, hold the task for it:
+       * the request goes to whoever can grant it and approval starts the task
+       * (a deliberate `draft` is only held, and says whom to ask). How agents create tasks. */
       holdForAuthorization?: boolean;
+      /** With holdForAuthorization: whom to ask for what the caller cannot grant
+       * (default: the lowest level that can grant it all), and why. */
+      authorizationAudience?: string[];
+      authorizationReason?: string;
       /** Per-task vault item grants (wiki plans/PLAN-passwords §6): `use-credential:item:…`
        *  / `:tag:…` / `:domain:…` caps layered onto the profile package. */
       credentialGrants?: string[];
@@ -1385,7 +1414,8 @@ export class KarmaxApi {
       templateId?: string;
     },
     receivedAt?: { monoMs: number; wallMs: number },
-  ): Promise<TaskRecord & { authorizationGap?: AuthorizationGap & { participant?: string } }> {
+  ): Promise<TaskRecord & { authorizationGap?: AuthorizationGap & { participant?: string };
+    authorizationRequest?: { id: string; audience: string[] } }> {
     if (args.templateId) {
       const { templateId, ...plain } = args;
       return this.createTask(token, await this.withTemplate(token, templateId, plain), receivedAt);
@@ -1398,10 +1428,28 @@ export class KarmaxApi {
         // Nothing is persisted before a grant is refused, so this is the same
         // task saved as a draft, as the console does before it summons someone.
         if (!(error instanceof AuthorizationGrantError) || !error.gap) throw error;
-        const held = await this.createTask(token, { ...plain, draft: true, allowAttenuation: true }, receivedAt);
+        const { authorizationAudience, authorizationReason, ...task } = plain;
+        const held = await this.createTask(token, { ...task, draft: true, allowAttenuation: true }, receivedAt);
         const { summary, summon } = error.gap;
         const participant = (error as { participant?: string }).participant;
-        return Object.assign(held, { authorizationGap: { ...error.gap, ...(participant ? { participant } : {}),
+        const gap = { ...error.gap, ...(participant ? { participant } : {}) };
+        // Asked to run, it runs: what its creator cannot grant is routed at once to
+        // whoever can, and approval starts it (task #716). A deliberate draft only says whom to ask.
+        if (!plain.draft && (summon || authorizationAudience?.length)) {
+          try {
+            const asked = await this.requestHeldAuthorization(token, held.id, { audience: authorizationAudience,
+              reason: authorizationReason?.trim() || `Grant ${summary} to this task.` });
+            return Object.assign((await this.deps.store.getTask(held.id))!, {
+              authorizationGap: { ...gap, next: `Waiting for approval from ${asked.audience.join(', ')}: `
+                + `you cannot grant ${summary}. Task ${held.id} starts once approved; nothing else to do.` },
+              authorizationRequest: { id: asked.requestId, audience: asked.audience } });
+          } catch (routing) {
+            return Object.assign(held, { authorizationGap: { ...gap, next: `Kept as draft ${held.id}: you cannot grant ${summary}, `
+              + `and asking for it failed (${routing instanceof Error ? routing.message : String(routing)}). `
+              + `Retry with request_permission and task_id "${held.id}".` } });
+          }
+        }
+        return Object.assign(held, { authorizationGap: { ...gap,
           next: summon
             ? `Kept as draft ${held.id}: you cannot grant ${summary}. Ask ${summon} (or an audience you name) to grant it with `
               + `request_permission and task_id "${held.id}"; it starts once approved.`
@@ -1432,7 +1480,7 @@ export class KarmaxApi {
     const projectVault = (await this.deps.store.getSettings(project.id, 'vault')) ?? {};
     const vaultDefaults = Object.hasOwn(projectVault, 'credentialGrants') ? projectVault : orgVault;
     const grants = args.credentialGrants ?? vaultDefaults.credentialGrants as string[] | undefined;
-    const ungranted = this.applyCredentialGrants(authorization, grants, caller.caps);
+    const ungranted = (await this.applyCredentialGrants(authorization, grants, caller, project.organizationId ?? 'org_personal'));
     // Credentials named explicitly are a gap like an explicit level; inherited
     // defaults are narrowed to the creator, as the default level is.
     const missingCredentialGrants = args.credentialGrants === undefined ? [] : ungranted;
@@ -1478,7 +1526,7 @@ export class KarmaxApi {
     (await this.normalizeTaskComputer(project, taskOverrides));
     // A `resumeFrom` pointer reads another task's conversation — authorize it
     // against that task's project before anything is created.
-    (await this.validateAndAuthorizeResumeSources(token, taskOverrides));
+    (await this.validateAndAuthorizeResumeSources(token, taskOverrides, args.projectId));
     (await this.authorizeDependencies(token, taskOverrides));
     (await this.prepareForkWorld(args.projectId, taskOverrides));
     const inheritedFiles = (await this.inheritedResumeFiles(taskOverrides));
@@ -2344,12 +2392,18 @@ export class KarmaxApi {
    * the grants it left out (marking the package attenuated); the caller
    * decides whether that is a gap to refuse or a default to narrow.
    */
-  private applyCredentialGrants(
+  private async applyCredentialGrants(
     authorization: { capabilities: Capability[]; attenuated: boolean },
     requested: string[] | undefined,
-    callerCaps: Capability[],
-  ): Capability[] {
+    caller: ScopedToken,
+    organizationId: string,
+  ): Promise<Capability[]> {
     const ungranted: Capability[] = [];
+    // A task's agent also passes on the vault items its task created (task #716:
+    // an agent stored a key, then had to ask a person to let its follow-up use it).
+    const callerCaps = requested?.length && caller.taskId && caller.taskId !== '*'
+      ? [...caller.caps, ...(await new VaultItems(this.deps.store, undefined, undefined, organizationId).createdCaps(caller.taskId))]
+      : caller.caps;
     for (const raw of requested ?? []) {
       const cap = String(raw);
       if (!cap.startsWith('use-credential:')) throw new Error(`credentialGrants entries must be use-credential:… capabilities (got ${cap})`);
@@ -2449,7 +2503,7 @@ export class KarmaxApi {
       ? (await this.deps.authorization.taskGrant(caller.principal, task.projectId, requested, grantorCaps))
       : { profileId: typeof requested === 'string' ? requested : requested.level, capabilities: caller.caps, attenuated: false };
     const profileAttenuated = authorization.attenuated;
-    const missingCredentialGrants = this.applyCredentialGrants(authorization, credentialGrants, caller.caps);
+    const missingCredentialGrants = (await this.applyCredentialGrants(authorization, credentialGrants, caller, organizationId));
     const priorAuthorization = task.params?._authorization as {
       credentialPolicies?: VaultTaskPolicyOverrides; delegationId?: string; principal?: string;
       attenuationAccepted?: boolean; level?: string; scope?: string; projectIds?: string[]; capabilities?: string[];
@@ -2733,7 +2787,8 @@ export class KarmaxApi {
       ? (await this.deps.authorization.taskGrant(caller.principal, task.projectId, selection, grantorCaps))
       : { ...selection, profileId: selection.level, capabilities: [...caller.caps], attenuated: false };
     const profileAttenuated = authorization.attenuated;
-    const ungranted = this.applyCredentialGrants(authorization, requested.credentialGrants ?? inherited.credentialGrants, caller.caps);
+    const ungranted = (await this.applyCredentialGrants(authorization, requested.credentialGrants ?? inherited.credentialGrants,
+      caller, organizationId));
     const missingCredentialGrants = requested.credentialGrants === undefined ? [] : ungranted;
     const limited = profileAttenuated || missingCredentialGrants.length > 0;
     const credentialPolicies = (await this.credentialPolicyOverrides(organizationId,
@@ -3304,7 +3359,7 @@ export class KarmaxApi {
     // Editing params can introduce a `resumeFrom` pointer at another task, so
     // the same source-side conversation check as createTask applies here, and
     // edited triggers the same dependency check.
-    (await this.validateAndAuthorizeResumeSources(token, params));
+    (await this.validateAndAuthorizeResumeSources(token, params, task.projectId));
     (await this.authorizeDependencies(token, params));
     const inheritedFiles = (await this.inheritedResumeFiles(params));
     for (const file of inheritedFiles) (await this.deps.store.grantAttachment(file.id, task.projectId));
@@ -3466,7 +3521,9 @@ export class KarmaxApi {
         ...(subTaskSummaries.length ? { subTaskSummaries } : {}),
         ...(forkSummaries.length ? { forkSummaries } : {}),
         ...(forkSourceSummaries.length ? { forkSourceSummaries } : {}),
-        ...(parent ? { parentTask: { id: parent.id, ...(parent.num != null ? { num: parent.num } : {}), title: parent.title } } : {}),
+        ...(parent ? { parentTask: { id: parent.id, ...(parent.num != null ? { num: parent.num } : {}), title: parent.title,
+          // A pull request of its task (SPEC §11.1) is part of it, not a sub-task.
+          ...(task && pullRequestOf(task) ? { pullRequest: pullRequestOf(task)!.checkout } : {}) } } : {}),
         notes: task?.notes,
         ...(agents ? { agents } : {}),
         ...(task ? { stageTransitions: (await this.availableStageTransitions(task, view, group)) } : {}),
@@ -3922,6 +3979,10 @@ export class KarmaxApi {
       // A saved checkpoint predates the current human hold. Prefer the live PR
       // refs so a recovered Review/Merge can authorize the exact opened heads.
       prs: (view.prs ?? source.prs)?.map((pr) => ({ ...pr })),
+      // The task's own pull requests (v1.30): without them the replacement
+      // would take them for sub-tasks (pramana#102).
+      ...((view.shipments ?? source.shipments)?.length
+        ? { shipments: (view.shipments ?? source.shipments)!.map((shipment) => ({ ...shipment })) } : {}),
       ...(view.landing ? { landing: { ...view.landing, authorizedHeads: { ...(view.landing.authorizedHeads ?? {}) } } } : {}),
       ...(view.pointOfNoReturnPassed ? { pointOfNoReturnPassed: true } : {}),
       resumeStage,
@@ -4928,6 +4989,12 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       requestedBy: caller.principal,
     }));
     if (input.target.kind === 'task') {
+      // Asked to run once approved: it is no longer a draft to anyone looking at
+      // it, but a numbered task waiting for approval (task #716).
+      if (input.target.queueAfterApproval && (await this.deps.store.getTask(input.target.taskId))?.params?.draft) {
+        (await this.deps.store.patchTaskParams(input.target.taskId, { _awaitingApproval: request.id }));
+        (await this.deps.store.numberTask(input.target.taskId));
+      }
       const event = { taskId: input.target.taskId, type: 'authorization.approval-requested', ts: Date.now(), payload: {
         requestId: request.id, recipients: request.recipients, audience: request.audience,
         authorization: request.authorization, missingCapabilities: request.missingCapabilities,
@@ -4968,6 +5035,37 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       }
     }
     return request;
+  }
+
+  /** An agent that created a task waiting for approval learns of a denial at
+   * once, from that task, as from any other task's agent: else it would only
+   * find a draft where it expected work. A person sees it among their drafts. */
+  private async tellCreatorDenied(request: AuthorizationRequest, deniedBy: string): Promise<void> {
+    if (request.target.kind !== 'task' || !request.target.queueAfterApproval) return;
+    const task = (await this.deps.store.getTask(request.target.taskId));
+    const creator = task?.createdBy?.kind === 'task-agent' ? task.createdBy : undefined;
+    const creatorTask = creator && (await this.deps.store.getTask(creator.taskId));
+    if (!task || !creator || !creatorTask || ['done', 'cancelled', 'failed'].includes(creatorTask.lastView?.status ?? '')) return;
+    const by = deniedBy.startsWith('user:') ? (await this.deps.store.userDisplayName(deniedBy.slice(5))) ?? 'Someone' : 'Someone';
+    const asked = [`${request.authorization.level} authorization`,
+      ...(request.credentialGrants?.length ? [`${request.credentialGrants.length} vault credential${request.credentialGrants.length > 1 ? 's' : ''}`] : [])];
+    const message: Message = { id: `u${randomUUID()}`, role: 'user', author: `task:${task.id}`,
+      authorLabel: `Task #${task.num ?? task.id}`, ts: Date.now(),
+      text: `${by} denied the ${asked.join(' and ')} that task ${task.id} ("${task.title}") waited for, so it did not start. `
+        + 'It is a draft again: ask for less, or run it with only what you can grant '
+        + `(PATCH /api/tasks/${task.id}/authorization with acceptAttenuation: true, then queue_task), or delete it.` };
+    try {
+      await (await this.workflowHandle(creatorTask.id)).signal(SIG.followUp, message, creator.role ?? MAIN_AGENT);
+      (await this.publishConversationMessage(creatorTask.id, creator.role ?? MAIN_AGENT, message));
+    } catch { /* the creating task is gone: nobody is left to tell */ }
+  }
+
+  /** End a task's wait for this request (approved or denied). */
+  private async releaseApprovalWait(request: AuthorizationRequest): Promise<void> {
+    if (request.target.kind !== 'task') return;
+    const task = (await this.deps.store.getTask(request.target.taskId));
+    if (task?.params?._awaitingApproval === request.id)
+      (await this.deps.store.patchTaskParams(task.id, { _awaitingApproval: null }));
   }
 
   async listAuthorizationRequests(
@@ -5032,6 +5130,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
             { ...requested, authorization: request.authorization }, { acceptAttenuation: false });
         }
         if (request.target.queueAfterApproval) {
+          (await this.releaseApprovalWait(request));
           for (const attempt of attempts) if ((await this.deps.store.getTask(attempt.id))?.params?.draft)
             await this.queueTask(token, attempt.id);
           queued = true;
@@ -5048,6 +5147,12 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       }
     }
     const resolved = (await service.resolve(request.id, input.action, caller.principal, claimId));
+    // Denied: the task goes back to being a draft its creator can change or run
+    // with less, and an agent that created it is told so.
+    if (input.action === 'deny') {
+      (await this.releaseApprovalWait(request));
+      (await this.tellCreatorDenied(request, caller.principal));
+    }
     if (request.target.kind === 'task') {
       const event = { taskId: request.target.taskId, type: 'authorization.approval-resolved', ts: Date.now(), payload: {
         requestId: request.id, action: input.action, resolvedBy: caller.principal, queued,
@@ -5594,6 +5699,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       ...result, tasks, total: result.total, offset, limit,
       ...(result.groups ? { groups: prune(result.groups) } : {}),
       ...(result.reasons ? { reasons: Object.fromEntries(Object.entries(result.reasons).filter(([id]) => ids.has(id))) } : {}),
+      ...(result.pullRequestAsks ? { pullRequestAsks: Object.fromEntries(Object.entries(result.pullRequestAsks).filter(([id]) => ids.has(id))) } : {}),
       ...(result.updated ? { updated: Object.fromEntries(Object.entries(result.updated).filter(([id]) => ids.has(id))) } : {}),
       projects: projects.map((project) => ({ id: project.id, name: project.name, slug: slugify(project.name), organizationId: project.organizationId ?? 'org_personal' })),
       tags,
@@ -5647,7 +5753,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     const tags: Tag[] = [];
     for (const project of projects) {
       for await (const page of this.deps.store.taskReadPages(project.id, {
-        includeArchived: !activeOnly, includeConversation: needsConversation,
+        includeArchived: !activeOnly, includeConversation: needsConversation, attempts: true,
         ...(candidates ? { candidateIds: [...candidates] } : {}),
       })) tasks.push(...page);
       tags.push(...(await this.deps.store.listTagsAsync(project.id)));
@@ -6846,7 +6952,7 @@ Act according to your Avatar instructions. When ready, call platform_request POS
     }
     // An in-flight edit can introduce a `resumeFrom` pointer at another task —
     // the same source-side conversation check as createTask/updateArmedParams.
-    (await this.validateAndAuthorizeResumeSources(token, patch));
+    (await this.validateAndAuthorizeResumeSources(token, patch, task.projectId));
     // Human routes are the fields whose validity the deterministic sandbox cannot
     // judge: "does @qa resolve to a human here?" is a store question. Assert them
     // up front so a re-route can never park a gate or input pause invisibly.

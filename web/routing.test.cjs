@@ -101,6 +101,8 @@ eq(projectRoute('P2'), '/globex/mobile-app', 'project route uses the project’s
 eq(firstProjectForOrganization('org_globex')?.id, 'P2', 'project fallback skips an earlier project from another organization');
 eq(firstProjectForOrganization('org_missing'), undefined, 'project fallback does not borrow a project from another organization');
 eq(taskUrl('T9'), '/acme/website-redesign/tasks/42', 'task permalink nests under /<org>/<project>/tasks/:num');
+eq(taskUrl('A2', { id: 'A2', projectId: 'P1', num: 42, otherAttempt: true }), '/acme/website-redesign/tasks/A2',
+  'a search row standing in through another attempt opens that attempt, not the principal behind #42');
 eq(globalRoute('insights'), '/acme/insights', 'insights route is org-prefixed');
 eq(globalRoute('organization'), '/acme/settings', 'internal tab "organization" → URL segment "settings"');
 eq(installationRoute(), '/installation', 'installation route is global, not org-prefixed');

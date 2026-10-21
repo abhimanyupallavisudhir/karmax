@@ -518,6 +518,28 @@ integration('PostgreSQL cutover', () => {
     } finally { (await store.close()); }
   });
 
+  it('reads every unarchived attempt for search, principal first, marking the others', async () => {
+    const store = (await Store.create(url!));
+    try {
+      const project = (await store.createProject('Attempts'));
+      const first = (await store.createTask({ projectId: project.id, title: 'Done', workflow: 'just-do',
+        workflowVersion: '1', params: { prompt: 'work', archived: true } }));
+      const second = (await store.createTask({ projectId: project.id, title: 'Working', workflow: 'just-do',
+        workflowVersion: '1', intentId: first.intentId, params: { prompt: 'work' } }));
+      const solo = (await store.createTask({ projectId: project.id, title: 'Solo', workflow: 'just-do',
+        workflowVersion: '1', params: { prompt: 'work', archived: true } }));
+      const read = async (includeArchived: boolean) => {
+        const rows: [string, boolean][] = [];
+        for await (const page of store.taskReadPages(project.id, { includeArchived, attempts: true }))
+          rows.push(...page.map((task): [string, boolean] => [task.id, !!task.otherAttempt]));
+        return rows;
+      };
+      expect(await read(false)).toEqual([[second.id, true]]);
+      expect(await read(true)).toEqual([[first.id, false], [second.id, true], [solo.id, false]]);
+      expect((await store.listTasks(project.id)).map((task) => task.id)).toEqual([first.id, solo.id]);
+    } finally { (await store.close()); }
+  });
+
   it('uses native asynchronous pagination with compact views and archive filtering', async () => {
     const store = (await Store.create(url!));
     try {

@@ -826,6 +826,7 @@ a.git-repo-name:hover { color:var(--accent); }
 .tp-crumb:hover { color: var(--accent); }
 .tp-crumb:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
 .tp-crumb-sep { flex: none; color: var(--ink-3); }
+.tp-crumb.tp-pr, .tp-crumb.tp-pr:hover { flex: none; cursor: default; color: var(--ink-3); font-weight: 400; }
 .tp-head .meta { display: flex; gap: 10px; align-items: center; margin-top: 6px; font-size: 12px; color: var(--ink-3); font-family: var(--font-mono); flex-wrap: wrap; }
 .tp-body { flex: 1; overflow-y: auto; }
 /* Focused programmatically for keyboard scrolling — it's the whole active surface, not a control, so no outline. */
@@ -2460,6 +2461,13 @@ html[data-theme="dark"] .github-signin-btn:active,
 .af-resume-panel { margin: 6px 0 0 22px; }
 .af-resume-panel[hidden] { display: none !important; }
 .af-resume-session { width: 100%; margin-top: 6px; padding: 7px 10px; }
+.af-resume-uploaded .af-resume-check { margin-top: 0; min-width: 0; }
+.af-resume-upload-name, .af-resume-check.ok { display: flex; min-width: 0; }
+.af-resume-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.af-resume-count { flex: none; white-space: pre; }
+.af-resume-check { margin-top: 6px; overflow: hidden; color: var(--ink-3); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.af-resume-check[hidden] { display: none; }
+.af-resume-check.err { color: var(--danger); }
 .af-resume-chosen { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 12px; color: var(--accent); margin-top: 6px; }
 .af-resume-chosen:empty { display: none; }
 .af-resume-label { min-width: 0; }
