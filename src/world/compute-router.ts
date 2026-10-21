@@ -1,7 +1,7 @@
 import { ProviderCapacityFull, ProviderOutage } from '../agent/limits.js';
 import { BRAND } from '../domain/brand.js';
 import { machineShape, type ComputeRegion, type MachineShape } from '../domain/computer.js';
-import { cloudProviders, listPriceMicrosPerHour, providerLabel, providerRegion, providerWakeSeconds,
+import { cloudProviders, listPriceMicrosPerHour, providerDefaults, providerLabel, providerRegion, providerWakeSeconds,
   type ComputerFeatures, type ComputerLimits } from '../domain/computer-limits.js';
 import type { ProjectConfig } from '../domain/types.js';
 import type { Store } from '../store/db.js';
@@ -187,8 +187,9 @@ export interface RouteDecision {
 export class ComputeRouter {
   constructor(private store: Store, private connections: RouterConnections, private now: () => number = Date.now) {}
 
-  /** Every cloud account the organization can reach, with what is known about its room. */
-  async options(organizationId: string): Promise<ComputeOption[]> {
+  /** Every cloud account the organization can reach, with what is known about
+   * its room for a machine of `needs`. */
+  async options(organizationId: string, needs: ComputeNeeds = {}): Promise<ComputeOption[]> {
     const views = (await this.connections.list(organizationId))
       .filter((view) => cloudProviders().includes(view.provider) && view.enabled && view.credentialConfigured);
     const managed = views.some((view) => view.managed);
@@ -206,6 +207,16 @@ export class ComputeRouter {
         if (maxRunning && await this.store.runningManagedWorlds(view.provider) >= maxRunning)
           return { ...option, busy: `all ${maxRunning} in use` };
       } else if (view.status === 'error') option.doubt = 'its last connection test failed';
+      // A CPU quota all of the account's machines share (Google Cloud: the
+      // lowest of E2_CPUS, CPUS and CPUS_ALL_REGIONS; Daytona's tier): room is
+      // what the worlds running on it leave. Machines outside tavya on the same
+      // account are not counted; the provider's own refusal still falls over.
+      const pool = view.limits.pool?.cpu;
+      if (pool) {
+        const used = await this.store.runningWorldCpus(view.provider, funding === 'managed' ? null : organizationId);
+        const cpu = needs.cpu ?? providerDefaults(view.provider)?.cpu ?? 2;
+        if (used + cpu > pool) return { ...option, busy: `${used} of its ${pool} CPUs in use` };
+      }
       const full = await this.recentFull(funding === 'managed' ? MANAGED_COMPUTE : organizationId, view.provider);
       if (full) option.doubt = full;
       return option;
@@ -213,7 +224,8 @@ export class ComputeRouter {
   }
 
   async route(organizationId: string, config: Partial<ProjectConfig> | undefined, prefer?: string): Promise<ComputeRoute> {
-    return rankComputeOptions(computeNeeds(config), await this.options(organizationId), prefer);
+    const needs = computeNeeds(config);
+    return rankComputeOptions(needs, await this.options(organizationId, needs), prefer);
   }
 
   /** Remember that an account refused for capacity, so the next routing tries it last. */

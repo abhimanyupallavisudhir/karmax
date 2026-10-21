@@ -151,6 +151,32 @@ describe('the accounts Any can reach', () => {
   });
 });
 
+describe('a CPU quota shared by an account\'s machines', () => {
+  it('counts the CPUs already running on it, across organizations for managed compute', async () => {
+    const f = await fixture({ plan: 'team' });
+    await f.connections.save({ organizationId: MANAGED_COMPUTE, provider: 'gcp', apiKey: JSON.stringify(fakeServiceAccount()),
+      config: { maxRunning: 10, limits: { cpu: 8, memoryMb: 32_768, diskGb: 1024 } } });
+    // What the account said: the lowest of E2_CPUS 24, CPUS 200 and CPUS_ALL_REGIONS 100.
+    await f.store.setWorldProviderConnectionLimits(MANAGED_COMPUTE, 'gcp', { cpu: 24, pool: { cpu: 24 }, checkedAt: Date.now() });
+    const other = await f.store.createOrganization({ name: 'Other', ownerUserId: 'other' });
+    await f.store.setOrganizationPlan(other.id, 'team');
+    const project = await f.store.createProject('Theirs', { worldProvider: 'any' }, other.id);
+    const task = await f.store.createTask({ projectId: project.id, title: 'Big', workflow: 'just-do', workflowVersion: '1.0.0', params: { prompt: 'x' } as any });
+    const runners = new RunnerPoolService(f.store, f.connections);
+    const lease = await runners.acquire({ project, taskId: task.id, worldId: task.id, provider: 'gcp', resources: { cpu: 22, memoryMb: 4096 } });
+    expect(await f.store.runningWorldCpus('gcp', null)).toBe(22);
+    expect(await f.store.runningWorldCpus('gcp', other.id)).toBe(0);
+
+    const gcp = async (cpu: number) => (await f.router.options(f.organization.id, { cpu })).find((value) => value.provider === 'gcp');
+    expect((await gcp(2))?.busy).toBeUndefined();
+    expect(await gcp(4)).toMatchObject({ busy: '22 of its 24 CPUs in use' });
+    expect((await f.router.route(f.organization.id, { worldProvider: 'any', resources: { cpu: 4 } })).rejected)
+      .toEqual([{ provider: 'gcp', funding: 'managed', reason: '22 of its 24 CPUs in use', busy: true }]);
+    await runners.release(lease.leaseId, 'gcp');
+    expect((await gcp(4))?.busy).toBeUndefined();
+  });
+});
+
 describe('falling over', () => {
   const route = () => rankComputeOptions({}, [option('hetzner', 'managed'), option('gcp', 'managed'), option('aws', 'managed')]);
 

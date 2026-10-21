@@ -293,12 +293,23 @@ export class GcpDriver implements VmDriver {
 
   /** E2's largest machine, within the region's CPU quota, and a 64 TB disk. */
   async limits(connection: ResolvedWorldProviderConnection): Promise<ComputerLimits> {
-    const region = await this.call(connection, 'GET', `/regions/${this.region(connection)}`) as { quotas?: Array<{ metric: string; limit: number }> };
-    // E2 machines count against both the region's E2 quota and its overall one (a new project: 24 and 200).
-    const quotas = (region.quotas ?? []).filter((entry) => entry.metric === 'E2_CPUS' || entry.metric === 'CPUS').map((entry) => entry.limit);
+    type Quotas = { quotas?: Array<{ metric: string; limit: number }> };
+    const [region, project] = await Promise.all([
+      this.call(connection, 'GET', `/regions/${this.region(connection)}`) as Promise<Quotas>,
+      // The project's quotas: CPUS_ALL_REGIONS caps every region together (a new project: 32).
+      (this.call(connection, 'GET', '') as Promise<Quotas>).catch(() => ({} as Quotas)),
+    ]);
+    // An E2 machine counts against the region's E2 quota, its overall one and the
+    // project's across regions (a new project: 24, 200 and 32); the lowest binds.
+    const quotas = [...(region.quotas ?? []).filter((entry) => entry.metric === 'E2_CPUS' || entry.metric === 'CPUS'),
+      ...(project.quotas ?? []).filter((entry) => entry.metric === 'CPUS_ALL_REGIONS')]
+      .map((entry) => entry.limit).filter((limit) => Number.isFinite(limit) && limit >= 0);
     const quota = quotas.length ? Math.min(...quotas) : undefined;
     const cpu = Math.min(E2_MAX_CPU, quota !== undefined && quota >= 2 ? Math.floor(quota / 2) * 2 : E2_MAX_CPU);
-    return { cpu, memoryMb: Math.min(E2_MAX_MEMORY_MB, cpu * 8192), diskGb: GCP_MAX_DISK_GB, checkedAt: Date.now() };
+    // The quota is shared by every machine running at once: the account's pool,
+    // which the router weighs against the CPUs already running (compute-router.ts).
+    return { cpu, memoryMb: Math.min(E2_MAX_MEMORY_MB, cpu * 8192), diskGb: GCP_MAX_DISK_GB,
+      ...(quota !== undefined ? { pool: { cpu: quota } } : {}), checkedAt: Date.now() };
   }
 
   /** The key works, Compute Engine is on, and the project has the default network worlds use. */

@@ -227,7 +227,13 @@ describe.skipIf(!sshdAvailable)('Google Cloud worlds (fake Compute Engine, real 
   it('tells the limits record E2’s largest machine within the region’s CPU quota', async () => {
     expect(await driver.limits(connection(gcp.key))).toMatchObject({ cpu: 32, memoryMb: 131_072, diskGb: 65_536 });
     gcp.cpuQuota = 8;
-    expect(await new GcpDriver(gcp.fetch, 1).limits(connection(gcp.key))).toMatchObject({ cpu: 8, memoryMb: 65_536 });
+    expect(await new GcpDriver(gcp.fetch, 1).limits(connection(gcp.key))).toMatchObject({ cpu: 8, memoryMb: 65_536, pool: { cpu: 8 } });
+    // The project's quota across regions binds when it is the lowest (managed today: E2 24, CPUS 200, all regions 100).
+    gcp.cpuQuota = 24;
+    gcp.globalCpuQuota = 6;
+    expect(await new GcpDriver(gcp.fetch, 1).limits(connection(gcp.key))).toMatchObject({ cpu: 6, memoryMb: 49_152, pool: { cpu: 6 } });
+    gcp.globalCpuQuota = 100;
+    expect(await new GcpDriver(gcp.fetch, 1).limits(connection(gcp.key))).toMatchObject({ cpu: 24, pool: { cpu: 24 } });
   });
 
   it('refuses a project without the default network at the connection test, and a bad key at the token', async () => {

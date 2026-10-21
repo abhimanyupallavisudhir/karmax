@@ -8761,6 +8761,19 @@ export class Store {
 
   /** Machines of the installation's `provider` account running now, across
    * every organization: active leases in managed runner pools. */
+  /** CPUs the running worlds on one provider account hold: the installation's
+   * managed account (`organizationId` null, across every organization) or an
+   * organization's own. A quota shared by all of an account's machines (Google
+   * Cloud's CPUS, CPUS_ALL_REGIONS) is weighed against it (compute-router.ts). */
+  async runningWorldCpus(provider: string, organizationId: string | null): Promise<number> {
+    const row = organizationId === null
+      ? await this.db.prepare(`SELECT COALESCE(SUM(l.cpu), 0) n FROM world_leases l JOIN runner_pools p ON p.id=l.runnerPoolId
+          WHERE l.state='active' AND p.mode='managed' AND p.provider=? AND p.id=p.organizationId || ':tavya-' || p.provider`).get(provider)
+      : await this.db.prepare(`SELECT COALESCE(SUM(l.cpu), 0) n FROM world_leases l JOIN runner_pools p ON p.id=l.runnerPoolId
+          WHERE l.state='active' AND p.provider=? AND p.organizationId=? AND p.id<>p.organizationId || ':tavya-' || p.provider`).get(provider, organizationId);
+    return Number((row as { n?: number } | undefined)?.n ?? 0);
+  }
+
   async runningManagedWorlds(provider: string): Promise<number> {
     return Number(((await this.db.prepare(`SELECT COUNT(*) n FROM world_leases l JOIN runner_pools p ON p.id=l.runnerPoolId
       WHERE l.state='active' AND p.mode='managed' AND p.provider=? AND p.id=p.organizationId || ':tavya-' || p.provider`).get(provider)) as { n?: number } | undefined)?.n ?? 0);
