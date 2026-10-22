@@ -7037,8 +7037,8 @@ function triggerSummary(triggers) {
 
 // A repeatable series (Model A): one row that owns its runs. Shows a repeatable
 // badge, the schedule/next-trigger summary, the run count + latest status, and
-// expands to list the individual runs.
-function seriesRow(t) {
+// expands to list the individual runs. `where` is its project label (taskRow's).
+function seriesRow(t, where = '') {
   const runs = (S._runsBySeries?.[t.id] || []).slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
   const expanded = S.expandedSeries?.has(t.id);
   const bits = [];
@@ -7049,8 +7049,8 @@ function seriesRow(t) {
     <div class="task-row series-row" data-series="${t.id}">
       <button class="icon-btn series-caret" data-expand="${t.id}" title="Show runs">${expanded ? '▾' : '▸'}</button>
       <div class="task-main">
-        <div class="task-title">${esc(t.title)} <span class="chip">repeatable</span></div>
-        <div class="task-sub"><span style="color:var(--ink-3)">${esc(bits.join('  ·  '))}</span></div>
+        <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)} <span class="chip">repeatable</span></div>
+        <div class="task-sub">${where}<span style="color:var(--ink-3)">${esc(bits.join('  ·  '))}</span></div>
       </div>
       <div class="task-right">
         <button class="btn sm" data-runagain="${t.id}">Run again</button>
@@ -7080,13 +7080,13 @@ function taskRow(t, { showTags = true, project = false } = {}) {
   const isDraft = t.params?.draft;
   const archived = t.params?.archived;
   const where = project ? projectLabel(t) : '';
-  if (isSeries(t.params) && !archived) return seriesRow(t);
+  if (isSeries(t.params) && !archived) return seriesRow(t, where);
   if (t.params?.triggerState === 'armed' && !archived) {
     return `
     <div class="task-row" data-armed="${t.id}">
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</div>
-        <div class="task-sub"><span class="chip">waiting for trigger</span><span style="color:var(--ink-3)">${esc(triggerSummary(t.params.triggers))}</span></div>
+        <div class="task-sub">${where}<span class="chip">waiting for trigger</span><span style="color:var(--ink-3)">${esc(triggerSummary(t.params.triggers))}</span></div>
       </div>
       <div class="task-right">
         <button class="btn sm" data-runnow="${t.id}">Run now</button>
