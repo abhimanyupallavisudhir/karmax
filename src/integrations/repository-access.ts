@@ -31,7 +31,7 @@ export interface RepositoryAccessRequest {
   /** The repository's GitHub admins among the organization's members. */
   approvers: Array<{ userId: string; login: string }>;
   recipients: string[];
-  status: 'pending' | 'granted' | 'denied';
+  status: 'pending' | 'granted' | 'denied' | 'withdrawn';
   resolution?: { action: 'approve' | 'deny'; by: string; at: number };
   createdAt: number;
   /** Projected for display, never persisted. */
@@ -45,6 +45,34 @@ const prefix = (organizationId: string, taskId?: string) =>
   `repository-access:request:${organizationId}:${taskId === undefined ? '' : `${taskId}:`}`;
 const keyOf = (request: Pick<RepositoryAccessRequest, 'organizationId' | 'taskId' | 'id'>) =>
   `${prefix(request.organizationId, request.taskId)}${request.id}`;
+
+/** A task's pending requests, withdrawn once it is done or cancelled: no decision could reach it. */
+export async function withdrawRepositoryAccessRequests(store: Pick<Store, 'transaction' | 'lock' | 'kvGet' | 'kvSet' | 'kvEntries'>,
+  organizationId: string, taskId: string): Promise<RepositoryAccessRequest[]> {
+  const withdrawn: RepositoryAccessRequest[] = [];
+  for (const { key } of await store.kvEntries(prefix(organizationId, taskId))) {
+    const request = await store.transaction(async () => {
+      await store.lock(`kv:${key}`);
+      const current = JSON.parse((await store.kvGet(key)) ?? 'null') as RepositoryAccessRequest | null;
+      if (current?.status !== 'pending') return undefined;
+      const next: RepositoryAccessRequest = { ...current, status: 'withdrawn' };
+      await store.kvSet(key, JSON.stringify(next));
+      return next;
+    });
+    if (request) withdrawn.push(request);
+  }
+  return withdrawn;
+}
+
+/** Tasks a pending request still asks someone about, in one organization. */
+export async function tasksWithPendingRepositoryAccess(store: Pick<Store, 'kvEntries'>, organizationId: string): Promise<string[]> {
+  return (await store.kvEntries(prefix(organizationId))).flatMap(({ value }) => {
+    try {
+      const request = JSON.parse(value) as RepositoryAccessRequest;
+      return request.status === 'pending' ? [request.taskId] : [];
+    } catch { return []; }
+  });
+}
 
 export class RepositoryAccessRequests {
   constructor(private deps: {

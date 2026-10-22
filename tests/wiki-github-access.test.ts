@@ -12,6 +12,7 @@ import { GitHubAppService, GITHUB_APP_CLIENT_SECRET_HANDLE, GITHUB_APP_PRIVATE_K
   type GitHubRepositoryRole } from '../src/integrations/github-app.js';
 import { WikiGithubAccess } from '../src/wiki/github-access.js';
 import { RepositoryAccessRequests } from '../src/integrations/repository-access.js';
+import { settleTaskRequests, tasksWithOpenRequests } from '../src/platform/settled-requests.js';
 
 /**
  * A project wiki repository lives in the account of whoever installed the App
@@ -339,6 +340,17 @@ describe('Asking a repository\'s GitHub admins for access', () => {
       .resolves.toMatchObject({ status: 'denied', retried: false });
     expect(github.calls.filter((call) => call.startsWith('PUT'))).toEqual([]);
     expect(retried).toEqual([]);
+  });
+
+  it('withdraws the request when its task is done or cancelled', async () => {
+    const request = (await ask())!;
+    expect(await tasksWithOpenRequests(store)).toContain(taskId);
+    await settleTaskRequests(store, organizationId, taskId, 'cancelled');
+    expect((await requests.requests(organizationId, { taskId }))[0]).toMatchObject({ id: request.id, status: 'withdrawn' });
+    expect(await tasksWithOpenRequests(store)).not.toContain(taskId);
+    expect((await store.listInbox('owner', organizationId)).filter((item) => item.kind === 'approval-requested')).toEqual([]);
+    await expect(requests.resolve({ organizationId, requestId: request.id, userId: 'owner', action: 'approve' }))
+      .rejects.toMatchObject({ status: 409 });
   });
 
   it('asks nobody when no admin of the repository is in the organization', async () => {

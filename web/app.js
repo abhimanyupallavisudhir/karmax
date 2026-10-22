@@ -20001,7 +20001,7 @@ function repositoryAccessRequestRows(requests, { historyLimit = 20 } = {}) {
   </div>`;
   }).join('');
   const history = recent.length ? `<div class="approval-history"><div class="section-h">Recent GitHub access decisions</div>${recent.map((request) =>
-    `<div class="approval-history-row"><span class="chip ${request.status === 'denied' ? 'failed' : 'done'}">${esc(request.status)}</span>
+    `<div class="approval-history-row"><span class="chip ${request.status === 'denied' ? 'failed' : request.status === 'withdrawn' ? '' : 'done'}">${esc(request.status)}</span>
       <span class="mono">${esc(request.login)} → ${esc(request.slug)}</span></div>`).join('')}</div>` : '';
   return pendingHtml + history;
 }
