@@ -328,7 +328,7 @@ export function mcpServerMap(spec: McpBaseline): Record<string, McpServerSpec> {
       // Codex passes an MCP server only the variables it is told to.
       forwardEnv: [CUSTODY_ENV],
     };
-  } else if (spec.browser === 'playwright') out['playwright'] = { command: 'npx', args: ['-y', `@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}`] };
+  } else if (spec.browser === 'playwright') out['playwright'] = { command: 'npx', args: ['--yes', '--no-audit', '--no-fund', `@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}`] };
   if (spec.platform) out['karmax'] = spec.platform;
   return out;
 }

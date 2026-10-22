@@ -85,3 +85,21 @@ it('falls back to npm for missing or mismatched baked runtimes', () => {
     expect(run.stdout).toContain('npm@10.9.2');
   }
 });
+
+// CI #2267 (2026-10-22): with the registry's audit endpoint down, installing
+// node@<v> hung. Its preinstall runs a nested `npm install`, which is handed
+// `--no-audit` as an empty npm_config_audit (read as "unset", so it audits),
+// but reads its global config from <prefix>/etc/npmrc.
+it('turns the audit off for the npm the node package runs itself', () => {
+  const { runtime, system } = fixture();
+  // Like the nested npm: audit (here, stall) unless <prefix>/etc/npmrc says not to.
+  fs.writeFileSync(path.join(system, 'npm'), [
+    '#!/bin/sh', 'while [ "$1" != --prefix ]; do shift; done',
+    'grep -qx audit=false "$2/etc/npmrc" 2>/dev/null || { echo audited; exit 7; }', 'echo installed',
+  ].join('\n'), { mode: 0o755 });
+  const run = spawnSync('bash', ['-c', installRemoteNodeCommand(runtime, process.versions.node, '10.9.2', `${runtime}/none`)], {
+    encoding: 'utf8', env: { ...process.env, PATH: `${system}:/usr/bin:/bin` },
+  });
+  expect(run.stdout.trim(), run.stderr).toBe('installed');
+  expect(fs.readFileSync(path.join(runtime, 'etc/npmrc'), 'utf8')).toContain('fund=false');
+});

@@ -372,7 +372,7 @@ async function runBootstrap(world: World, request: Omit<BootstrapRequest, 'key'>
     ...(request.acpSession ? [`if [ -r ${quote(acpSessionDigestFile(request.acpSession.home, request.acpSession.session))} ]; then printf '\\n%s%s\\n' ${quote(ACP_SESSION_MARKER)} "$(head -c 64 ${quote(acpSessionDigestFile(request.acpSession.home, request.acpSession.session))})"; fi`] : []),
     // Never fails the bootstrap: the launcher resolves the package again and reports.
     ...(request.warm ? [`if ! ${quote(`/opt/karmax/bin/${request.warm.bin}`)} --version 2>/dev/null | grep -Fq -- ${quote(request.warm.version)}; then `
-      + `( export PATH=${quote(runtime.bin)}:"$PATH"; npx --yes --package=${quote(request.warm.spec)} -c true ) >/dev/null 2>&1 || true; fi`] : []),
+      + `( export PATH=${quote(runtime.bin)}:"$PATH"; npx ${NPX_INSTALL} --package=${quote(request.warm.spec)} -c true ) >/dev/null 2>&1 || true; fi`] : []),
     'exit 0',
   ].join('\n');
   const result = await world.exec('bash', ['-lc', command], { timeoutMs: 5 * 60_000 });
@@ -889,6 +889,10 @@ export function remoteAgentEnv(provider: Provider, home: string, source: Record<
 
 /** Translate the host SDK's bundled executable into the matching published CLI
  * package. npx caches it in the sandbox after the first turn. */
+/** How tavya's own `npx` calls install a pinned tool: never prompting, and
+ * never waiting on the registry's audit or funding endpoints. */
+export const NPX_INSTALL = '--yes --no-audit --no-fund';
+
 export function remoteAgentCommand(provider: Provider, command: string, args: string[]): { command: string; args: string[] } {
   if (provider === 'claude') {
     const sdkArgs = path.basename(command).startsWith('node') && /(?:^|\/)cli\.js$/.test(args[0] ?? '') ? args.slice(1) : args;
@@ -987,7 +991,9 @@ export function spawnRemoteAgentProcess(opts: {
   };
   // Resolve the paired CLI through npx's cache, then exec it directly: running
   // it *under* npx kept a ~150 MB npm process alive for the whole session.
-  const resolved = `npx --yes --package=${quote(packageSpec)} -c ${quote(`command -v ${opts.provider}`)}`;
+  // No audit: a pinned CLI gains nothing from it, and when the registry's
+  // audit endpoint hangs, npx hangs with it (CI #2262–#2264, 2026-10-22).
+  const resolved = `npx ${NPX_INSTALL} --package=${quote(packageSpec)} -c ${quote(`command -v ${opts.provider}`)}`;
   // Claude Code, Codex and OpenCode ship their native binary as an optional
   // dependency, and npm still exits 0 when it fails to download one: npx's
   // cache then holds a CLI that only says "native binary not installed", and

@@ -256,7 +256,7 @@ export async function resume(api: Api, target: { taskId: string }, cwd: string, 
     const dir = path.join(home, 'sessions', 'tavya');
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, (session.filename ?? `codex-${sessionId}.jsonl`).replace(/[^a-zA-Z0-9_.-]/g, '_')), history);
-    command = 'npx'; args = ['--yes', `@openai/codex@${session.requiredCodexVersion ?? 'latest'}`, options.fork ? 'fork' : 'resume', sessionId];
+    command = 'npx'; args = ['--yes', '--no-audit', '--no-fund', `@openai/codex@${session.requiredCodexVersion ?? 'latest'}`, options.fork ? 'fork' : 'resume', sessionId];
     env = { ...process.env, CODEX_HOME: home };
   }
   if (options.print) { out.result({ provider: session.provider, role, sessionId, command: [command, ...args], cwd: real }, `cd ${real} && ${[command, ...args].join(' ')}`); return 0; }
