@@ -102,6 +102,9 @@ export interface GithubActionsFailureInspection {
   jobs: GithubActionsJob[];
   failedJobs: Array<GithubActionsJob & {
     log?: { excerpt: string; downloadedBytes: number; truncated: boolean };
+    /** GitHub's failure annotations on a job that ran no step and left no
+     * log, e.g. an account locked over billing. Shown, never classified. */
+    startupErrors?: string[];
   }>;
   artifacts: GithubActionsArtifact[];
   notices: string[];
@@ -327,8 +330,10 @@ export class GithubActionsApi {
         const log = await this.jobLog(slug, job.id);
         failedJobs.push({ ...job, ...(log.excerpt ? { log } : {}) });
       } catch (error) {
-        failedJobs.push(job);
-        notices.push(`Could not read logs for ${job.name}: ${error instanceof Error ? error.message : String(error)}`);
+        const startupErrors = job.steps.length ? [] : await this.startupErrors(slug, job);
+        failedJobs.push({ ...job, ...(startupErrors.length ? { startupErrors } : {}) });
+        if (!startupErrors.length)
+          notices.push(`Could not read logs for ${job.name}: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
     if (failures.length > this.maxJobLogs)
@@ -380,6 +385,19 @@ export class GithubActionsApi {
       if (batch.length < 100) break;
     }
     return jobs;
+  }
+
+  /** A job that never started has no log; GitHub says why in its check
+   * run's annotations. Before any step runs, the repository cannot write
+   * them, so they are asked for only then. */
+  private async startupErrors(slug: string, job: GithubActionsJob): Promise<string[]> {
+    if (!job.checkRunId) return [];
+    const raw = await this.request<any[]>(`/repos/${slug}/check-runs/${job.checkRunId}/annotations?per_page=10`)
+      .catch(() => []);
+    return [...new Set((Array.isArray(raw) ? raw : [])
+      .filter((annotation) => annotation?.annotation_level === 'failure' && annotation.message)
+      .map((annotation) => redactActionsText(String(annotation.message)).trim().slice(0, 500))
+      .filter(Boolean))];
   }
 
   private async jobLog(slug: string, jobId: number, selection?: { tailLines: number; maxChars: number; offsetLines: number }) {
@@ -581,6 +599,7 @@ export function renderGithubActionsFailure(
     const failedSteps = job.steps.filter((step) => FAILURE_CONCLUSIONS.has(String(step.conclusion ?? '').toLowerCase()));
     if (failedSteps.length) lines.push(`Failed steps: ${failedSteps.map((step) => step.name).join(', ')}`);
     if (job.log?.excerpt) lines.push(job.log.excerpt, ...(job.log.truncated ? ['[GitHub log output was truncated; use the targeted log view to inspect tail completeness and limits.]'] : []));
+    else if (job.startupErrors?.length) lines.push(...job.startupErrors.map((error) => `GitHub did not start this job: ${error}`));
     else lines.push('[No job log was available.]');
   }
   if (notices.length) lines.push('', 'Inspection notices:', ...notices.map((notice) => `- ${notice}`));
@@ -597,9 +616,15 @@ export function summarizeGithubActionsFailure(decision: GithubActionsFailureDeci
     const steps = job.steps.filter((step) => FAILURE_CONCLUSIONS.has(String(step.conclusion ?? '').toLowerCase()));
     return `- ${job.name}${steps.length ? `: ${steps.map((step) => step.name).join(', ')}` : ''}`;
   });
+  // Inspection reads at most maxJobLogs jobs, so name them instead of counting.
+  const notStarted = new Map<string, string[]>();
+  for (const job of failedJobs) for (const error of job.startupErrors ?? [])
+    notStarted.set(error, [...(notStarted.get(error) ?? []), job.name]);
   return [
     `GitHub Actions run ${run.name} #${run.runNumber} (attempt ${run.attempt}) concluded ${run.conclusion ?? run.status}.`,
     ...(run.url ? [`Run: ${run.url}`] : []),
+    ...[...notStarted].map(([error, jobs]) => `GitHub did not start ${jobs.length === failedJobs.length
+      ? 'the failed jobs' : jobs.slice(0, 3).join(', ') + (jobs.length > 3 ? ` and ${jobs.length - 3} more` : '')}: ${error}`),
     ...(failed.length ? ['Failed:', ...failed] : []),
     ...notices.slice(0, 3).map((notice) => `Note: ${notice.slice(0, 200)}`),
   ].join('\n');

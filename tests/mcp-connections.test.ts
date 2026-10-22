@@ -137,7 +137,7 @@ describe('MCP connections', () => {
   it('imports pinned official package metadata without accepting registry or command injection', () => {
     const raw = { name: 'io.example/tool', version: '1', packages: [{ registryType: 'npm', identifier: '@example/tool', version: '1.2.3', transport: { type: 'stdio' }, environmentVariables: [{ name: 'KEY', isSecret: true }] }] };
     const imported = registryEntry(raw);
-    expect(imported.options[0]?.transport).toEqual({ type: 'stdio', command: 'npx', args: ['--yes', '--registry=https://registry.npmjs.org', '@example/tool@1.2.3'] });
+    expect(imported.options[0]?.transport).toEqual({ type: 'stdio', command: 'npx', args: ['--yes', '--no-audit', '--no-fund', '--registry=https://registry.npmjs.org', '@example/tool@1.2.3'] });
     for (const patch of [{ identifier: '--eval=malicious' }, { version: 'latest' }, { registryBaseUrl: 'https://attacker.example' }, { runtimeArguments: [{ value: '--eval=bad' }] }]) expect(registryEntry({ ...raw, packages: [{ ...raw.packages[0], ...patch }] }).options).toEqual([]);
   });
   it('wraps container connections in docker exec and revokes credential projections after edits', async () => {
