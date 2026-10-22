@@ -1096,6 +1096,116 @@ describe('GitHub-authoritative merge activity', () => {
     });
   });
 
+  // Task #735: GitHub locked the account, so every job failed unstarted and
+  // the failure was held for a person. The owner replaced the card and
+  // confirmed twice, but each Confirm re-read the same failed attempt.
+  it('reruns a held failure once per Confirm given after the hold', async () => {
+    let attempt = 1;
+    let refuse = false;
+    const fetcher = (async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      const body = init.body ? JSON.parse(String(init.body)) : {};
+      if ((init.method ?? 'GET') === 'GET' && url.pathname.endsWith('/pulls/114')) return Response.json({
+        number: 114, node_id: 'PR_locked', html_url: 'https://github.test/acme/widgets/pull/114', state: 'open',
+        merged: false, head: { ref: 'tavya/task_locked', sha: 'pr-head' }, base: { ref: 'main' },
+      });
+      if (url.pathname === '/graphql' && String(body.query).includes('PullRequestReadiness'))
+        return Response.json({ data: { repository: { pullRequest: {
+          id: 'PR_locked', url: 'https://github.test/acme/widgets/pull/114', state: 'OPEN', isDraft: false,
+          merged: false, headRefOid: 'pr-head', baseRefOid: 'base-head', viewerCanEnableAutoMerge: false,
+          viewerCanMergeAsAdmin: false, mergeable: 'MERGEABLE', mergeStateStatus: 'UNSTABLE',
+          statusCheckRollup: { state: 'FAILURE', contexts: { nodes: [{
+            __typename: 'CheckRun', databaseId: 601, name: 'tests', status: 'COMPLETED', conclusion: 'FAILURE',
+            detailsUrl: `https://github.com/${SLUG}/actions/runs/39673410455/job/601`,
+          }] } },
+        } } } });
+      if ((init.method ?? 'GET') === 'GET' && url.pathname.endsWith('/check-runs/601'))
+        return Response.json({ output: { title: '', summary: '' } });
+      return Response.json({ message: `unexpected ${init.method ?? 'GET'} ${url.pathname}` }, { status: 500 });
+    }) as typeof fetch;
+    const reruns: number[] = [];
+    const failedRun = () => ({
+      id: 39673410455, name: 'CI', workflowId: 9, runNumber: 2250, attempt,
+      event: 'pull_request', status: 'completed', conclusion: 'failure', branch: 'tavya/task_locked',
+      headSha: 'pr-head', url: 'https://github.test/run/39673410455',
+      createdAt: '2026-10-21T20:47:56Z', updatedAt: '2026-10-21T20:48:03Z',
+      pullRequests: [{ number: 114, headSha: 'pr-head' }],
+    });
+    const actions = {
+      inspectFailure: async () => ({
+        run: failedRun(),
+        // Never started: no step ran, so nothing names the revision.
+        jobs: [], failedJobs: [{ id: 601, name: 'tests', status: 'completed', conclusion: 'failure', url: '', steps: [],
+          startupErrors: ['The job was not started because your account is locked due to a billing issue.'] }],
+        artifacts: [], notices: [],
+      }),
+      listRuns: async () => ({ total: 1, page: 1, perPage: 100, runs: [failedRun()] }),
+      rerun: async () => {
+        if (refuse) throw new GithubActionsApiError(403, 'GitHub Actions API request failed (403): account locked');
+        reruns.push(attempt);
+        return { accepted: true as const, action: 'rerun-failed' as const };
+      },
+    };
+    const app = {
+      activeUserAccountId: () => 'owner-account',
+      repositoryPermission: async () => ({ slug: SLUG, permission: 'write', canMerge: true }),
+      userAccessToken: async () => 'owner-token',
+      installationToken: async () => 'installation-token',
+      actions: () => actions,
+    };
+    const core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app);
+    (await core.store.claimPersonalOrganization('owner'));
+    const project = (await core.store.createProject('Locked CI', { landingAuthority: 'auto' }));
+    const connection = (await core.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: 'locked', accountLogin: 'acme', accountType: 'Organization' }));
+    const repository = (await core.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+      providerId: 'locked-repo', owner: 'acme', name: 'widgets', sshUrl: REMOTE, defaultBranch: 'main',
+      private: true, gitConnectionId: connection.id }));
+    (await core.store.attachProjectRepository({ projectId: project.id, repositoryId: repository.id }));
+    const task = (await core.store.createTask({ projectId: project.id, title: 'Locked', workflow: 'software-dev',
+      workflowVersion: '1.21.0', params: { prompt: 'x', _githubAccountId: 'owner-account' },
+      createdBy: { kind: 'user', userId: 'owner' } }));
+    const confirm = async () => (await core.store.appendEvent({ taskId: task.id, type: 'task.confirmation-voted',
+      ts: Date.now(), payload: { userId: 'owner', satisfied: true, githubMergeAuthorized: true,
+        githubMergeIntentAuthorized: true, githubPrHeads: [{ slug: SLUG, number: 114, headSha: 'pr-head' }] } }));
+    (await confirm());
+    const handle = { id: task.id, kind: 'worktree', branch: 'tavya/task_locked', base: 'main', repo: tmp, root: tmp } as any;
+    const refs: TaskPullRequest[] = [{ repo: 'widgets', slug: SLUG, number: 114, nodeId: 'PR_locked',
+      url: 'https://github.test/acme/widgets/pull/114', state: 'open', headSha: 'pr-head' }];
+    const land = () => core.mergeGithubPrs(handle, refs, { mode: 'preflight', authority: 'auto' });
+    const held = { status: 'needs-human', waitReason: 'GitHub Actions failure needs inspection',
+      detail: expect.stringMatching(/account is locked due to a billing issue.*Confirm reruns the failed jobs/s) };
+
+    // The Confirm that started landing came before the hold: it cannot have resolved it.
+    await expect(land()).resolves.toMatchObject(held);
+    await expect(land()).resolves.toMatchObject(held);
+    expect(reruns).toEqual([]);
+
+    (await confirm());
+    await expect(land()).resolves.toMatchObject({ status: 'waiting', detail: 'Rerunning CI' });
+    // GitHub still shows the old attempt for a moment: no second rerun.
+    await expect(land()).resolves.toMatchObject({ status: 'waiting', detail: 'Rerunning CI' });
+    expect(reruns).toEqual([1]);
+
+    // The rerun failed the same way: held again until the next Confirm.
+    attempt = 2;
+    await expect(land()).resolves.toMatchObject(held);
+    expect(reruns).toEqual([1]);
+    (await confirm());
+    await expect(land()).resolves.toMatchObject({ status: 'waiting', detail: 'Rerunning CI' });
+    expect(reruns).toEqual([1, 2]);
+
+    // A rerun GitHub refuses goes back to the person, with GitHub's answer.
+    attempt = 3;
+    refuse = true;
+    await land();
+    (await confirm());
+    await expect(land()).resolves.toMatchObject({ status: 'needs-human',
+      detail: expect.stringMatching(/GitHub rejected the automatic rerun.*account locked/s) });
+    expect(reruns).toEqual([1, 2]);
+    (await core.store.close());
+  });
+
   it('recognizes a recorded legacy conflict wait without mistaking pending GitHub work for a repair', async () => {
     const { githubWaitNeedsProposalRevision, landingRepairProgress, landingRepairExhaustionDetail } =
       await import('../src/workflows/software-dev.js');

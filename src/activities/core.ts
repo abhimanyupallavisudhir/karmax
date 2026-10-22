@@ -5739,12 +5739,31 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           };
         };
         const human = decisions.find(({ decision }) => decision.disposition === 'human');
-        if (human) return {
-          status: 'needs-human', prs: current, actorUserId,
-          detail: `${brief}\n\n${human.decision.reason}`,
-          waitReason: human.decision.waitReason,
-          eligibleUserIds: [actorUserId],
-        };
+        if (human) {
+          // The hold asks a person to resolve what GitHub reports. Their
+          // Confirm after it says they did, but this attempt stays failed
+          // until it runs again (task #735: a billing lock lifted, yet each
+          // Confirm re-read the same unstarted jobs). One rerun per Confirm.
+          const { id, attempt } = human.decision.inspection.run;
+          const heldAt = events.find((event) => event.type === 'github.ci.terminal-observed'
+            && event.payload?.key === human.key && Number(event.payload?.runId) === id
+            && Number(event.payload?.attempt) === attempt)?.seq;
+          const confirmedSince = heldAt !== undefined && events.some((event) => event.seq > heldAt
+            && event.type === 'task.confirmation-voted' && event.payload?.satisfied !== false);
+          const reruns = events.filter((event) => event.type === 'github.ci.rerun-requested'
+            && event.payload?.key === human.key && event.payload?.reason === 'confirmed-after-hold');
+          if (reruns.some((event) => Number(event.payload?.runId) === id && Number(event.payload?.observedAttempt) === attempt))
+            return { status: 'waiting', prs: current, actorUserId, detail: 'Rerunning CI' };
+          if (confirmedSince && inspection.actions)
+            return (await rerun(human, reruns.length + 1, 'confirmed-after-hold'))
+              ?? { status: 'waiting', prs: current, actorUserId, detail: 'Rerunning CI' };
+          return {
+            status: 'needs-human', prs: current, actorUserId,
+            detail: `${brief}\n\n${human.decision.reason}\n\nOnce it is resolved, Confirm reruns the failed jobs.`,
+            waitReason: human.decision.waitReason,
+            eligibleUserIds: [actorUserId],
+          };
+        }
         const revision = decisions.find(({ decision }) => decision.disposition === 'revision');
         if (revision) {
           const shared = await targetRed(revision);
