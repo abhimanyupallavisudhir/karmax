@@ -217,9 +217,9 @@ const WITHDRAW_REQUESTS_STATUS = new Set<string>(['done', 'cancelled']);
  * them (a person ignored the ask; the task still waits on it). As SQL lists. */
 const sqlList = (types: string[]) => types.map((type) => `'${type}'`).join(', ');
 const APPROVAL_ASKS = sqlList(['credential.approval-requested', 'permission.approval-requested',
-  'authorization.approval-requested', 'connection.requested']);
+  'authorization.approval-requested', 'connection.requested', 'repository-access.approval-requested']);
 const APPROVAL_DECISION_TYPES = ['credential.approval-resolved', 'connection.resolved',
-  'permission.approval-resolved', 'authorization.approval-resolved'];
+  'permission.approval-resolved', 'authorization.approval-resolved', 'repository-access.approval-resolved'];
 const APPROVAL_DISMISSAL_TYPES = ['credential.approval-dismissed', 'permission.approval-dismissed',
   'authorization.approval-dismissed', 'connection.dismissed'];
 const APPROVAL_DECISIONS = sqlList(APPROVAL_DECISION_TYPES);
@@ -373,6 +373,7 @@ export class Store {
   private userNames?: () => Array<{ id: string; name: string; email?: string }> | Promise<Array<{ id: string; name: string; email?: string }>>;
   private organizationEntitlementListeners = new Set<(organizationId: string) => unknown>();
   private recordedEventListeners = new Set<(event: KarmaxEvent & { seq: number }) => unknown>();
+  private accessListeners = new Set<(scopeKey: string) => unknown>();
 
   constructor(private readonly dbPath = ':memory:', options: { hosted?: boolean } = {}) {
   }
@@ -2172,6 +2173,22 @@ export class Store {
     return () => this.recordedEventListeners.delete(listener);
   }
 
+  /**
+   * Observe committed changes to who may do what in an organization or project
+   * (`organization:<id>` / `project:<id>`): memberships, teams, grants, role
+   * profiles, and a project's wiki repository. Things kept in step with tavya's
+   * access outside it, such as GitHub collaborators on project wikis, follow this.
+   */
+  onAccessChanged(listener: (scopeKey: string) => unknown): () => void {
+    this.accessListeners.add(listener);
+    return () => this.accessListeners.delete(listener);
+  }
+
+  private notifyAccessChanged(scopeKey: string): void {
+    if (!/^(?:organization|project):/.test(scopeKey)) return;
+    for (const listener of this.accessListeners) this.db.afterCommit(() => listener(scopeKey));
+  }
+
   private notifyOrganizationEntitlementsChanged(organizationId: string): void {
     // Notifications must observe committed state and must not inherit a closed
     // transaction context. Rollbacks discard the pending notifications.
@@ -3082,6 +3099,7 @@ export class Store {
     const joinedAt = Date.now();
     (await this.db.prepare(`INSERT INTO organization_memberships (organizationId, userId, role, joinedAt)
       VALUES (?, ?, ?, ?) ON CONFLICT(organizationId, userId) DO UPDATE SET role=excluded.role`).run(organizationId, userId, role, joinedAt));
+    this.notifyAccessChanged(`organization:${organizationId}`);
     if (!existing) {
       (await this.reconcileHostedUsageCapacity(organizationId));
       this.notifyOrganizationEntitlementsChanged(organizationId);
@@ -3112,6 +3130,7 @@ export class Store {
     (await this.db.prepare('DELETE FROM organization_memberships WHERE organizationId=? AND userId=?').run(organizationId, userId));
     (await this.db.prepare('UPDATE user_preferences SET defaultOrganizationId=NULL WHERE userId=? AND defaultOrganizationId=?').run(userId, organizationId));
     if (membership) {
+      this.notifyAccessChanged(`organization:${organizationId}`);
       (await this.reconcileHostedUsageCapacity(organizationId));
       this.notifyOrganizationEntitlementsChanged(organizationId);
     }
@@ -3422,6 +3441,7 @@ export class Store {
     const joinedAt = Date.now();
     (await this.db.prepare(`INSERT INTO team_memberships (teamId, userId, role, joinedAt) VALUES (?, ?, ?, ?)
       ON CONFLICT(teamId, userId) DO UPDATE SET role=excluded.role`).run(teamId, userId, 'member', joinedAt));
+    this.notifyAccessChanged(`organization:${team.organizationId}`);
     return { teamId, userId, role: 'member', joinedAt };
   
     });
@@ -3434,7 +3454,9 @@ export class Store {
   async removeTeamMembership(teamId: string, userId: string): Promise<void> {
     return this.db.transaction(async () => {
 
+    const team = (await this.db.prepare('SELECT organizationId FROM teams WHERE id=?').get(teamId)) as { organizationId?: string } | undefined;
     (await this.db.prepare('DELETE FROM team_memberships WHERE teamId=? AND userId=?').run(teamId, userId));
+    if (team?.organizationId) this.notifyAccessChanged(`organization:${team.organizationId}`);
   
     });
   }
@@ -3456,6 +3478,7 @@ export class Store {
     (await this.db.prepare(`INSERT INTO project_memberships (projectId, principalKey, principal, role, joinedAt)
       VALUES (?, ?, ?, ?, ?) ON CONFLICT(projectId, principalKey) DO UPDATE SET role=excluded.role`)
       .run(projectId, key, JSON.stringify(principal), role, joinedAt));
+    this.notifyAccessChanged(`project:${projectId}`);
     return { projectId, principal, role, joinedAt };
   
     });
@@ -3479,6 +3502,7 @@ export class Store {
       if (owners <= 1) throw new Error('a project must retain at least one owner');
     }
     (await this.db.prepare('DELETE FROM project_memberships WHERE projectId=? AND principalKey=?').run(projectId, key));
+    this.notifyAccessChanged(`project:${projectId}`);
   
     });
   }
@@ -3764,6 +3788,7 @@ export class Store {
       VALUES (?, ?, ?, ?) ON CONFLICT(projectId) DO UPDATE SET
       repositoryId=excluded.repositoryId, updatedAt=excluded.updatedAt`)
       .run(projectId, repositoryId ?? null, now, now));
+    if (repositoryId) this.notifyAccessChanged(`project:${projectId}`);
   
     });
   }
@@ -5699,7 +5724,8 @@ export class Store {
       // remain a deterministic resolver for automated/delegated tasks.
       for (const member of (await this.listOrganizationMemberships(project.organizationId)))
         if (member.role === 'owner') users.push(member.userId);
-    } else if (ev.type === 'permission.approval-requested' || ev.type === 'authorization.approval-requested') {
+    } else if (ev.type === 'permission.approval-requested' || ev.type === 'authorization.approval-requested'
+      || ev.type === 'repository-access.approval-requested') {
       kind = 'approval-requested'; actionable = true;
       users = Array.isArray(ev.payload.recipients) ? ev.payload.recipients.map(String) : [];
     } else if (isReviewRequestEvent(ev.type)) {
@@ -6453,6 +6479,7 @@ export class Store {
     (await this.db.prepare(
       'INSERT INTO authorization_profiles (scopeKey, id, json) VALUES (?, ?, ?) ON CONFLICT(scopeKey, id) DO UPDATE SET json = excluded.json',
     ).run(scopeKey, profile.id, JSON.stringify(json)));
+    this.notifyAccessChanged(scopeKey);
   
     });
   }
@@ -6461,6 +6488,7 @@ export class Store {
     return this.db.transaction(async () => {
 
     (await this.db.prepare('DELETE FROM authorization_profiles WHERE scopeKey = ? AND id = ?').run(scopeKey, id));
+    this.notifyAccessChanged(scopeKey);
   
     });
   }
@@ -6486,6 +6514,7 @@ export class Store {
     (await this.db.prepare(
       'INSERT INTO principal_grants (principalId, scopeKey, json) VALUES (?, ?, ?) ON CONFLICT(principalId, scopeKey) DO UPDATE SET json = excluded.json',
     ).run(principalId, scopeKey, JSON.stringify(json)));
+    this.notifyAccessChanged(scopeKey);
   
     });
   }
@@ -6494,6 +6523,7 @@ export class Store {
     return this.db.transaction(async () => {
 
     (await this.db.prepare('DELETE FROM principal_grants WHERE principalId = ? AND scopeKey = ?').run(principalId, scopeKey));
+    this.notifyAccessChanged(scopeKey);
   
     });
   }

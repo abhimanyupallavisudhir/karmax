@@ -81,6 +81,7 @@ import {
   GithubPrApi,
   githubSlug,
   upstreamPullRequestUrl,
+  type GithubPrActor,
   type GithubPrApiOptions,
   type GithubPullRequest,
   type GithubPullRequestReadiness,
@@ -125,6 +126,8 @@ import { hostLocal as deploymentHostLocal } from '../config/deployment.js';
 import type { ObjectStore } from '../store/objects.js';
 import { conversationImportObjectKey } from '../store/conversation-imports.js';
 import { ensureProjectWikiRepositoryAsync, PROJECT_WIKI_BRANCH, setProjectWikiRemote } from '../wiki/repository.js';
+import { WikiGithubAccess } from '../wiki/github-access.js';
+import { RepositoryAccessRequests } from '../integrations/repository-access.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { manifest, roleCeiling } from '../contrib/manifests.js';
@@ -181,6 +184,21 @@ const DEFAULT_GRANT = [
   'github:actions:read',
 ];
 
+
+/** GitHub's 404 to a person who cannot see a repository, as what they can do
+ * about it. Retrying cannot help until someone changes access on GitHub. */
+function repositoryAccessFailure(actor: GithubPrActor, slug: string, askedAdmins: string[] = []): ApplicationFailure {
+  const asked = askedAdmins.length > 1 ? `${askedAdmins.slice(0, -1).join(', ')} or ${askedAdmins.at(-1)}` : askedAdmins[0];
+  return ApplicationFailure.create({
+    message: actor.invitationUrl
+      ? `${actor.login} was invited to ${slug} but hasn't accepted yet. Accept at ${actor.invitationUrl}, then Retry.`
+      : asked
+      ? `GitHub account ${actor.login} can't see ${slug}. Asked ${asked} to give ${actor.login} access; the task continues once they approve.`
+      : `GitHub account ${actor.login} can't see ${slug}. Ask an admin of ${slug} to add ${actor.login} as a collaborator, then Retry.`,
+    type: 'github-repository-access',
+    nonRetryable: true,
+  });
+}
 
 /** A provider that cannot start or reach a world right now (an outage, a
  * full account limit) is infrastructure wherever resource work meets it:
@@ -1086,6 +1104,35 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     } catch { return undefined; }
   }
 
+  async function acceptPendingInvitation(actor: GithubPrActor, slug: string): Promise<boolean> {
+    if (typeof deps.githubApp?.acceptPendingRepositoryInvitation !== 'function') return false;
+    return deps.githubApp.acceptPendingRepositoryInvitation(actor.userId, actor.accountId, slug).catch((error) => {
+      console.warn(`[karmax] could not accept ${actor.login}'s invitation to ${slug}:`, error instanceof Error ? error.message : error);
+      return false;
+    });
+  }
+
+  /** Ask the repository's GitHub admins to let `actor` see it; who was asked. */
+  async function requestRepositoryAccess(handle: WorldHandle, actor: GithubPrActor, slug: string): Promise<string[]> {
+    const projectId = typeof handle.meta?.projectId === 'string' ? handle.meta.projectId : (await store.getTask(handle.id))?.projectId;
+    const repository = await enrolledGithubRepository(projectId, slug);
+    if (!repository?.gitConnectionId || typeof deps.githubApp?.repositoryCollaborators !== 'function') return [];
+    const request = await new RepositoryAccessRequests({ store, githubApp: deps.githubApp })
+      .request({ taskId: handle.id, repository, userId: actor.userId, ...(actor.accountId ? { accountId: actor.accountId } : {}), login: actor.login })
+      .catch((error) => {
+        console.warn(`[karmax] could not ask for ${actor.login}'s access to ${slug}:`, error instanceof Error ? error.message : error);
+        return undefined;
+      });
+    return request?.approvers.map((approver) => approver.login) ?? [];
+  }
+
+  let wikiAccess: WikiGithubAccess | undefined;
+  function wikiGithubAccess(): WikiGithubAccess {
+    wikiAccess ??= new WikiGithubAccess({ store, githubApp: deps.githubApp!, authorization: deps.authorization,
+      log: (line) => console.warn(`[karmax] ${line}`) });
+    return wikiAccess;
+  }
+
   async function prApiFor(
     handle: WorldHandle,
     slug: string,
@@ -1107,9 +1154,24 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     // per-user OAuth grant makes the PR attributable to the task creator.
     const githubStatus = userId ? (await deps.githubApp?.status(userId)) : undefined;
     if (userId && repository?.gitConnectionId && githubStatus?.userAuthorized) {
+      const accounts = typeof deps.githubApp!.listUserAccounts === 'function'
+        ? await deps.githubApp!.listUserAccounts(userId).catch(() => []) : [];
+      const login = (accounts.find((account) => account.id === accountId) ?? accounts.find((account) => account.active))?.login;
+      // tavya made the project wiki's repository, in the App owner's account: the
+      // creator may not have been given it yet, so grant it before acting as them.
+      let invitationUrl: string | undefined;
+      if (projectId && (await store.projectWiki(projectId))?.repository?.id === repository.id) {
+        const outcomes = await wikiGithubAccess().syncProject(projectId, userId).catch((error) => {
+          console.warn(`[karmax] could not give ${login ?? userId} access to ${slug}:`, error instanceof Error ? error.message : error);
+          return [];
+        });
+        if (outcomes.some((outcome) => outcome.login.toLowerCase() === login?.toLowerCase() && outcome.state === 'invited'))
+          invitationUrl = `https://github.com/${slug}/invitations`;
+      }
       return new GithubPrApi(
         (options) => deps.githubApp!.userAccessToken(userId, { ...options, ...(accountId ? { accountId } : {}) }),
-        deps.githubPr ?? {},
+        { ...deps.githubPr, ...(login ? { actor: { userId, ...(accountId ? { accountId } : {}), login,
+          ...(invitationUrl ? { invitationUrl } : {}) } } : {}) },
       );
     }
     const token = await githubTokenFor(handle, slug, repository);
@@ -5102,18 +5164,28 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           opened.push(ref);
           continue;
         }
+        const propose = async () => api.openOrUpdate(slug, {
+          head: repo.branch, base,
+          // With several branches in flight the task title alone names none of
+          // them; say which pull request this one is.
+          title: changed.length > 1
+            ? `${details.title?.trim() || BRAND} (${repo.name})`
+            : details.title?.trim() || `${BRAND}: ${repo.branch}`,
+          body: prBody(handle, details, (await store.getTask(handle.id))?.num, changed.length > 1 ? repo.name : undefined),
+        });
         let opening: Awaited<ReturnType<typeof api.openOrUpdate>>;
         try {
-          opening = await api.openOrUpdate(slug, {
-            head: repo.branch, base,
-            // With several branches in flight the task title alone names none of
-            // them; say which pull request this one is.
-            title: changed.length > 1
-              ? `${details.title?.trim() || BRAND} (${repo.name})`
-              : details.title?.trim() || `${BRAND}: ${repo.branch}`,
-            body: prBody(handle, details, (await store.getTask(handle.id))?.num, changed.length > 1 ? repo.name : undefined),
+          opening = await propose().catch(async (error) => {
+            // Invited, but never clicked GitHub's e-mail: accept as them, then once more.
+            if (error instanceof GithubApiError && error.status === 404 && api.actor
+              && await acceptPendingInvitation(api.actor, slug)) return propose();
+            throw error;
           });
         } catch (error) {
+          // GitHub answers a person who cannot see a private repository with 404.
+          if (error instanceof GithubApiError && error.status === 404 && api.actor)
+            throw repositoryAccessFailure(api.actor, slug,
+              api.actor.invitationUrl ? [] : await requestRepositoryAccess(handle, api.actor, slug));
           // GitHub decides what the PR would contain. The local count can only
           // overstate it (a fetch older than GitHub's target), never hide work,
           // so its refusal of an empty proposal is a skip, not a failure.

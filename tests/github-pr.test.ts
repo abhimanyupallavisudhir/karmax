@@ -2680,3 +2680,115 @@ describe('PR webhooks → karmax events', () => {
     }
   });
 });
+
+/** Pull requests are opened as the task's creator. GitHub answers a person who
+ *  cannot see a private repository with 404 (andhbhakt.com #8, video-explainers
+ *  #4: `GitHub API 404 … list-pull-requests`). */
+describe('Pull requests opened as a person who cannot see the repository', () => {
+  const WIKI_SLUG = 'srajma/project-wiki';
+
+  async function setup(options: { acceptable?: boolean; invitedTo?: string; adminInOrganization?: boolean } = {}) {
+    const gh = fakeGithub();
+    const visible = new Set<string>([SLUG]);
+    const fetcher = (async (url: string, init: RequestInit = {}) => {
+      const slug = new URL(String(url)).pathname.match(/^\/repos\/([^/]+\/[^/]+)/)?.[1];
+      if (slug && !visible.has(slug)) return Response.json({ message: 'Not Found' }, { status: 404 });
+      return gh.fetcher(url, init);
+    }) as typeof fetch;
+    const accepted: unknown[][] = [];
+    const app = {
+      status: () => ({ userAuthorized: true, oauthConfigured: true }),
+      activeUserAccountId: () => 'member-account',
+      listUserAccounts: async (userId: string) => userId === 'member' ? [{ id: 'member-account', login: 'octo-member', active: true }]
+        : userId === 'owner' && options.adminInOrganization ? [{ id: 'owner-account', login: 'srajma', active: true }] : [],
+      userAccessToken: async () => 'member-token',
+      brokerCredentials: async () => ({ env: {} }),
+      repositoryCollaborators: async (repository: { name: string }) => repository.name !== 'project-wiki' ? [{ login: 'srajma', role: 'admin' }]
+        : [...visible].includes(WIKI_SLUG) ? [{ login: 'octo-member', role: 'push' }] : [],
+      repositoryInvitations: async () => [],
+      addRepositoryCollaborator: async () => ({ invitationId: 5 }),
+      acceptRepositoryInvitation: async (...args: unknown[]) => {
+        accepted.push(args);
+        if (options.acceptable === false) throw new Error('GitHub API 404: invitation not found');
+        visible.add(WIKI_SLUG);
+      },
+      removeRepositoryCollaborator: async () => undefined,
+      acceptPendingRepositoryInvitation: async (...args: unknown[]) => {
+        accepted.push(args);
+        if (args[2] !== options.invitedTo) return false;
+        visible.add(String(args[2]));
+        return true;
+      },
+    };
+    const core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app);
+    (await core.store.claimPersonalOrganization('owner'));
+    const project = (await core.store.createProject('Wiki access'));
+    (await core.store.setOrganizationMembership(project.organizationId!, 'member', 'member'));
+    const connection = (await core.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+      installationId: '42', accountLogin: 'srajma', accountType: 'User' }));
+    const enroll = async (slug: string, providerId: string) => core.store.upsertRepository({
+      organizationId: project.organizationId!, provider: 'github', providerId, owner: slug.split('/')[0]!,
+      name: slug.split('/')[1]!, sshUrl: `git@github.com:${slug}.git`, defaultBranch: 'main', private: true,
+      gitConnectionId: connection.id });
+    (await core.store.attachProjectRepository({ projectId: project.id, repositoryId: (await enroll(SLUG, '1')).id }));
+    (await core.store.setProjectWikiRepository(project.id, (await enroll(WIKI_SLUG, '2')).id));
+    const task = (await core.store.createTask({ projectId: project.id, title: 'Member task', workflow: 'software-dev',
+      workflowVersion: '1.21.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'member' } }));
+    const branch = `tavya/${task.id}`;
+    const checkout = async (name: string, slug: string, role?: string) => {
+      const repo = await repoWithGithubOrigin(name, slug);
+      await gitOrThrow(repo, ['checkout', '-q', '-b', branch]);
+      fs.writeFileSync(path.join(repo, 'change.md'), `${name}\n`);
+      await gitOrThrow(repo, ['add', '-A']);
+      await gitOrThrow(repo, ['commit', '-q', '-m', 'change']);
+      return { name, repo, root: repo, branch, base: 'main', target: 'main', localPath: repo, sourceAuthority: 'origin',
+        ...(role ? { role } : {}) };
+    };
+    const repos = [await checkout('widgets', SLUG), await checkout('project-wiki', WIKI_SLUG, 'project-wiki')];
+    const handle = { id: task.id, kind: 'worktree', root: repos[0]!.root, workdir: repos[0]!.root, branch, base: 'main',
+      repo: repos[0]!.repo, meta: { projectId: project.id }, repos } as any;
+    return { core, gh, visible, accepted, handle, task };
+  }
+
+  it('gives the task\'s creator access to the project wiki, then opens its pull request', async () => {
+    const { core, gh, accepted, handle } = await setup();
+    const opened = await core.openPr(handle, 'main', { title: 'Member task' });
+    expect(opened.map((pr: TaskPullRequest) => pr.slug)).toEqual([SLUG, WIKI_SLUG]);
+    expect(accepted).toEqual([['member', 'member-account', 5]]);
+    expect(gh.prs.map((pr) => pr.repo)).toEqual([SLUG, WIKI_SLUG]);
+  });
+
+  it('accepts the invitation a creator has not accepted yet, then opens the pull request', async () => {
+    const { core, gh, visible, accepted, handle } = await setup({ invitedTo: SLUG });
+    visible.delete(SLUG);
+    const opened = await core.openPr(handle, 'main', { title: 'Member task' });
+    expect(opened.map((pr: TaskPullRequest) => pr.slug)).toEqual([SLUG, WIKI_SLUG]);
+    expect(accepted).toContainEqual(['member', 'member-account', SLUG]);
+    expect(gh.prs.map((pr) => pr.repo)).toEqual([SLUG, WIKI_SLUG]);
+  });
+
+  it('names the account and what to do when it cannot see a repository', async () => {
+    const { core, visible, handle } = await setup({ acceptable: false });
+    await expect(core.openPr(handle, 'main', { title: 'Member task' })).rejects.toMatchObject({
+      type: 'github-repository-access', nonRetryable: true,
+      message: `octo-member was invited to ${WIKI_SLUG} but hasn't accepted yet. Accept at https://github.com/${WIKI_SLUG}/invitations, then Retry.`,
+    });
+
+    visible.delete(SLUG);
+    await expect(core.openPr(handle, 'main', { title: 'Member task' })).rejects.toMatchObject({
+      type: 'github-repository-access', nonRetryable: true,
+      message: `GitHub account octo-member can't see ${SLUG}. Ask an admin of ${SLUG} to add octo-member as a collaborator, then Retry.`,
+    });
+  });
+
+  it('asks the repository\'s GitHub admin in the organization to give access', async () => {
+    const { core, visible, handle, task } = await setup({ adminInOrganization: true });
+    visible.delete(SLUG);
+    await expect(core.openPr(handle, 'main', { title: 'Member task' })).rejects.toMatchObject({
+      type: 'github-repository-access', nonRetryable: true,
+      message: `GitHub account octo-member can't see ${SLUG}. Asked srajma to give octo-member access; the task continues once they approve.`,
+    });
+    const events = (await core.store.eventsSince(task.id, 0)).filter((event: any) => event.type === 'repository-access.approval-requested');
+    expect(events.map((event: any) => event.payload)).toEqual([expect.objectContaining({ slug: SLUG, login: 'octo-member', recipients: ['owner'] })]);
+  });
+});

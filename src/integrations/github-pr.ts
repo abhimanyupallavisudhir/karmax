@@ -193,6 +193,17 @@ export interface GithubAutoMergeResult {
 export interface GithubPrApiOptions {
   apiBase?: string;
   fetch?: typeof fetch;
+  /** The person's GitHub account the requests act as, when not the App's. */
+  actor?: GithubPrActor;
+}
+
+/** Who a pull request is opened as: what a 404 from GitHub is explained with. */
+export interface GithubPrActor {
+  userId: string;
+  accountId?: string;
+  login: string;
+  /** Where to accept an invitation tavya could not accept for them. */
+  invitationUrl?: string;
 }
 
 /** Preserve GitHub's HTTP classification across the integration boundary so
@@ -250,10 +261,12 @@ function normalize(raw: any): GithubPullRequest {
 export class GithubPrApi {
   private fetcher: typeof fetch;
   private apiBase: string;
+  readonly actor?: GithubPrActor;
 
   constructor(private token: string | GithubTokenProvider, options: GithubPrApiOptions = {}) {
     this.fetcher = options.fetch ?? fetch;
     this.apiBase = (options.apiBase ?? 'https://api.github.com').replace(/\/$/, '');
+    if (options.actor) this.actor = options.actor;
   }
 
   async get(slug: string, number: number): Promise<GithubPullRequest> {

@@ -595,6 +595,14 @@ async function main() {
   });
   (await entitlementQueues.start());
 
+  // tavya creates project wiki repositories in the App owner's GitHub account:
+  // keep their collaborators in step with who may use each wiki in tavya.
+  const { WikiGithubAccess } = await import('./wiki/github-access.js');
+  const wikiGithubAccess = new WikiGithubAccess({ store, githubApp, authorization,
+    log: (message) => console.warn(`  • ${message}`) });
+  wikiGithubAccess.watch(githubApp);
+  startupJobs.push(async () => { if (await githubApp.configured()) await wikiGithubAccess.sweep(); });
+
   // Reconcile the task index against live workflows (settle anything lost on restart).
   const { reconcileTasks } = await import('./platform/reconcile.js');
   startupJobs.push(async () => {
@@ -795,6 +803,7 @@ async function main() {
       triggerScheduler.stop(), mailPoller.stop(), worldLifecycle.stop(), delivery.stop(),
     ]);
     await step(entitlementQueues.stop());
+    wikiGithubAccess.stop();
     await step(closeGateway());
     await step(workerManager.stop());
     await eventRelay?.stop();
