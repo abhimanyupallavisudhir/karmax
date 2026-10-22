@@ -25,7 +25,15 @@ export function installRemoteNodeCommand(root: string, nodeVersion: string, npmV
     + `&& test -x ${quote(bakedNode)} && ${quote(bakedNode)} -e ${quote(check)}; then `
     + `mkdir -p ${quote(`${root}/node_modules`)} && `
     + ['node', 'npm'].map(name => `ln -sfnT ${quote(`${bakedRoot}/node_modules/${name}`)} ${quote(`${root}/node_modules/${name}`)}`).join(' && ') + `; else `
-    + `npm install --prefix ${quote(root)} --no-audit --no-fund --omit=dev ${quote(`node@${nodeVersion}`)} ${quote(`npm@${npmVersion}`)}; fi; fi`;
+    + `${noAuditNpmrcCommand(root)} && npm install --prefix ${quote(root)} --no-audit --no-fund --omit=dev ${quote(`node@${nodeVersion}`)} ${quote(`npm@${npmVersion}`)}; fi; fi`;
+}
+
+/** The node package's preinstall runs a nested `npm install`, handed
+ * `--no-audit` as an empty npm_config_audit, which it reads as unset, so it
+ * audits; with the registry's audit endpoint down that install hangs (CI
+ * #2267). It does read <prefix>/etc/npmrc as its global config. */
+export function noAuditNpmrcCommand(root: string): string {
+  return `mkdir -p ${quote(`${root}/etc`)} && printf 'audit=false\nfund=false\n' > ${quote(`${root}/etc/npmrc`)}`;
 }
 
 function quote(value: string): string { return `'${value.replace(/'/g, `'\\''`)}'`; }

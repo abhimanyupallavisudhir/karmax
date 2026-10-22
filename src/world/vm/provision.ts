@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { CODEX_VERSION } from '../../agent/codex-history.js';
 import { OPENCODE_PACKAGE } from '../../agent/acp-packages.js';
 import { installedClaudeCodeVersion } from '../../agent/remote-process.js';
-import { PINNED_REMOTE_NODE_VERSION, PINNED_REMOTE_NPM_VERSION } from '../../agent/remote-node.js';
+import { PINNED_REMOTE_NODE_VERSION, PINNED_REMOTE_NPM_VERSION, noAuditNpmrcCommand } from '../../agent/remote-node.js';
 import { CHROME_DEVTOOLS_MCP_VERSION, PLAYWRIGHT_MCP_VERSION, PLAYWRIGHT_VERSION } from '../../autonomy/config-homes.js';
 import { quote } from './ssh.js';
 
@@ -196,6 +196,7 @@ if ! node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 22 ? 0
   retry sh -c "curl -fsSL https://nodejs.org/dist/v${node}/node-v${node}-linux-$arch.tar.xz | tar -xJ -C /usr/local --strip-components=1"
 fi
 mkdir -p ${quote(`${root}/bin`)} /opt/karmax/browser /opt/karmax/bin /opt/karmax/agents /opt/karmax/browsers
+${noAuditNpmrcCommand(root)}
 retry npm install --prefix ${quote(root)} --no-audit --no-fund --omit=dev ${quote(`node@${node}`)} ${quote(`npm@${PINNED_REMOTE_NPM_VERSION}`)}
 ${[['node', '../node_modules/node/bin/node'], ['npm', '../node_modules/npm/bin/npm-cli.js'], ['npx', '../node_modules/npm/bin/npx-cli.js']]
     .map(([name, target]) => `ln -sfn ${quote(target!)} ${quote(`${root}/bin/${name}`)}`).join('\n')}
