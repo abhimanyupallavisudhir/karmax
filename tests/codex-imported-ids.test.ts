@@ -20,9 +20,12 @@ import { publishLocalCodexHistory, readLocalCodexHistory } from '../src/agent/co
 import { ensureLocalCodexSessionTools } from '../src/agent/codex.js';
 import { spawnSync } from 'node:child_process';
 import type { World } from '../src/world/types.js';
+import { linkHostNodeRuntime, offlineNpmRegistry } from './helpers/offline-npm.js';
 import { openLocalPty } from '../src/world/local-execution.js';
 import { ensureRemoteCodexSessionTools, readRemoteImport, remoteAgentHomeRelative, seedRemoteAgentHome } from '../src/agent/remote-process.js';
 import { reuseNativeImport } from '../src/agent/panagent.js';
+
+offlineNpmRegistry();
 
 const imported = '0199aaaa-0000-7000-8000-000000000001';
 const INVENTED = 'msg_0bc8f1e848af4d6dba49e5cb0f5f0fa3';
@@ -148,6 +151,7 @@ it('resumes a Codex fork of an imported conversation without sending invented id
 /** A world on this host, reached only through the World interface. */
 function diskWorld(root: string): World {
   fs.mkdirSync(path.join(root, 'system-bin'), { recursive: true });
+  linkHostNodeRuntime(root);
   const write = async (file: string, content: string | Buffer) => {
     fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
     fs.writeFileSync(path.join(root, file), content);

@@ -8,6 +8,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
 import type { World } from '../src/world/types.js';
+import { linkHostNodeRuntime, offlineNpmRegistry } from './helpers/offline-npm.js';
 import { CodexAppServerClient } from '../src/agent/codex-app-server-client.js';
 import { localProviderCli } from '../src/agent/provider-cli.js';
 import { codexDynamicTools } from '../src/agent/codex.js';
@@ -15,11 +16,14 @@ import { materializeRemoteSession, seedRemoteAgentHome, syncRemoteAgentHome,
   ensureRemoteCodexSessionTools, remoteAgentHomeRelative } from '../src/agent/remote-process.js';
 import { ConfigHomeManager } from '../src/autonomy/config-homes.js';
 
+offlineNpmRegistry();
+
 // Real files, shell commands, and the pinned Codex app-server. Only the model's
 // HTTP Responses endpoint is simulated: no credentials or paid inference.
 function diskWorld(root: string): World {
   fs.mkdirSync(root, { recursive: true });
   fs.mkdirSync(path.join(root, 'system-bin'));
+  linkHostNodeRuntime(root);
   const write = async (file: string, content: string | Buffer) => {
     const dest = path.join(root, file);
     fs.mkdirSync(path.dirname(dest), { recursive: true });
