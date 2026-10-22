@@ -5212,14 +5212,15 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
 
   /** A repository's GitHub admin decides; approval gives access and retries the task. */
   async resolveRepositoryAccessRequest(token: string,
-    input: { organizationId: string; requestId: string; action: 'approve' | 'deny' }): Promise<RepositoryAccessRequest & { retried: boolean }> {
+    input: { organizationId: string; requestId: string; action: 'approve' | 'deny' | 'dismiss' }): Promise<RepositoryAccessRequest & { retried?: boolean }> {
     const request = (await this.repositoryAccess().requests(input.organizationId)).find((candidate) => candidate.id === input.requestId);
     if (!request) throw new NotFoundError(`no GitHub access request ${input.requestId}`);
     const caller = (await this.require(token, 'task:read', { taskId: request.taskId, projectId: request.projectId, organizationId: input.organizationId }));
     const userId = caller.humanSubject?.userId;
     if (!userId) throw new CapabilityError('a person who is an admin of the repository on GitHub decides this request');
     try {
-      return await this.repositoryAccess().resolve({ ...input, userId });
+      if (input.action === 'dismiss') return await this.repositoryAccess().dismiss({ ...input, userId });
+      return await this.repositoryAccess().resolve({ ...input, action: input.action, userId });
     } catch (error) {
       if (!(error instanceof AccessRequestError)) throw error;
       if (error.status === 403) throw new CapabilityError(error.message);

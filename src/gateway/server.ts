@@ -1130,7 +1130,7 @@ export class Gateway {
     for (const connection of (await this.connections()?.all()) ?? [])
       if (['requested', 'connecting'].includes(connection.status)) add(connection.taskId, !!connection.dismissed);
     if (this.deps.githubApp) for (const request of (await new RepositoryAccessRequests({ store: this.deps.store, githubApp: this.deps.githubApp })
-      .requests(organizationId, { status: 'pending' }))) add(request.taskId);
+      .requests(organizationId, { status: 'pending' }))) add(request.taskId, !!request.dismissed);
     return counts;
   }
 
@@ -6168,7 +6168,8 @@ export class Gateway {
         const organizationId = String(url.searchParams.get('organizationId') ?? '');
         const action = String((await this.body(req)).action ?? '');
         if (!organizationId) return this.json(res, 400, { error: 'organizationId is required' });
-        if (action !== 'approve' && action !== 'deny') return this.json(res, 400, { error: 'action must be approve | deny' });
+        if (action !== 'approve' && action !== 'deny' && action !== 'dismiss')
+          return this.json(res, 400, { error: 'action must be approve | deny | dismiss' });
         try {
           return this.json(res, 200, await api.resolveRepositoryAccessRequest(token,
             { organizationId, requestId: repositoryAccessResolution[1]!, action }));

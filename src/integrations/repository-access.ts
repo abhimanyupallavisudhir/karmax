@@ -32,6 +32,8 @@ export interface RepositoryAccessRequest {
   approvers: Array<{ userId: string; login: string }>;
   recipients: string[];
   status: 'pending' | 'granted' | 'denied' | 'withdrawn';
+  /** Ignored: it notifies nobody, and stays decidable from the task's Approval requests. */
+  dismissed?: { by: string; at: number };
   resolution?: { action: 'approve' | 'deny'; by: string; at: number };
   createdAt: number;
   /** Projected for display, never persisted. */
@@ -69,7 +71,7 @@ export async function tasksWithPendingRepositoryAccess(store: Pick<Store, 'kvEnt
   return (await store.kvEntries(prefix(organizationId))).flatMap(({ value }) => {
     try {
       const request = JSON.parse(value) as RepositoryAccessRequest;
-      return request.status === 'pending' ? [request.taskId] : [];
+      return request.status === 'pending' && !request.dismissed ? [request.taskId] : [];
     } catch { return []; }
   });
 }
@@ -128,6 +130,25 @@ export class RepositoryAccessRequests {
       requestId: request.id, slug: request.slug, login: request.login, recipients: request.recipients, urgency: 'high',
     });
     return request;
+  }
+
+  /** Ignore a request: no more notifications; it can still be decided. */
+  async dismiss(input: { organizationId: string; requestId: string; userId: string }): Promise<RepositoryAccessRequest> {
+    const found = (await this.requests(input.organizationId)).find((request) => request.id === input.requestId);
+    if (!found) throw new AccessRequestError(404, `no GitHub access request ${input.requestId}`);
+    if (!found.recipients.includes(input.userId)) throw new AccessRequestError(403, 'this GitHub access request was not routed to you');
+    const key = keyOf(found);
+    const dismissed = await this.deps.store.transaction(async () => {
+      await this.deps.store.lock(`kv:${key}`);
+      const current = JSON.parse((await this.deps.store.kvGet(key)) ?? 'null') as RepositoryAccessRequest | null;
+      if (!current || current.status !== 'pending') return undefined;
+      const next: RepositoryAccessRequest = { ...current, dismissed: current.dismissed ?? { by: `user:${input.userId}`, at: Date.now() } };
+      await this.deps.store.kvSet(key, JSON.stringify(next));
+      return next;
+    });
+    if (!dismissed) throw new AccessRequestError(409, `GitHub access request ${found.id} is already ${found.status}`);
+    await this.record(dismissed.taskId, 'repository-access.approval-dismissed', { requestId: dismissed.id });
+    return dismissed;
   }
 
   /** An approver's decision. Approval gives access at once and retries the task. */

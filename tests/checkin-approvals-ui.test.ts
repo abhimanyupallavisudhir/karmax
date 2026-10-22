@@ -9,10 +9,10 @@ function fn(name: string) {
   return app.slice(start, app.indexOf('\n}', start) + 2);
 }
 function setup() {
-  const S = { approvalRequests: [], permissionRequests: [], authorizationRequests: [], connections: [], approvalItems: [], user: { id: 'user' }, projects: [] };
+  const S = { approvalRequests: [], permissionRequests: [], authorizationRequests: [], repositoryAccessRequests: [], connections: [], approvalItems: [], user: { id: 'user' }, projects: [] };
   const context = vm.createContext({ S, esc: String, credentialRequestTaskLink: () => '',
     authorizationSummary: () => 'Developer', policyTip: () => '', sortVaultItems: (v: any) => v });
-  for (const name of ['credentialRequestRows', 'permissionRequestRows', 'authorizationRequestRows', 'connectionAccountNames', 'connectionRows', 'ignoredChip', 'ignoreRequestButton', 'conversationApprovalRequests', 'resourceReviewNeedsAction']) {
+  for (const name of ['credentialRequestRows', 'permissionRequestRows', 'authorizationRequestRows', 'repositoryAccessRequestRows', 'connectionAccountNames', 'connectionRows', 'ignoredChip', 'ignoreRequestButton', 'conversationApprovalRequests', 'resourceReviewNeedsAction']) {
     vm.runInContext(fn(name), context);
   }
   return context;
@@ -24,13 +24,15 @@ describe('check-in pending decisions', () => {
     c.S.permissionRequests = [{ id: 'permission', status: 'pending', capabilities: [], audience: [] }];
     c.S.authorizationRequests = [{ id: 'authorization', status: 'pending', recipients: ['user'], target: { kind: 'task' }, audience: [] }];
     c.S.connections = [{ id: 'connection', status: 'requested' }];
+    c.S.repositoryAccessRequests = [{ id: 'access', status: 'pending', recipients: ['user'], approvers: [], login: 'member', slug: 'owner/repo' }];
     const html = c.conversationApprovalRequests();
-    for (const attr of ['data-vreq', 'data-preq', 'data-areq', 'data-connection']) expect(html).toContain(attr);
+    for (const attr of ['data-vreq', 'data-preq', 'data-areq', 'data-connection', 'data-raccess']) expect(html).toContain(attr);
     expect(html).not.toContain('Recent decisions');
     c.S.approvalRequests[0].status = 'approved';
     c.S.permissionRequests[0].status = 'denied';
     c.S.authorizationRequests[0].status = 'approved';
     c.S.connections[0].status = 'active';
+    c.S.repositoryAccessRequests[0].status = 'granted';
     expect(c.conversationApprovalRequests()).toBe('');
   });
   it('leaves ignored requests to Approval requests and keeps reconnects visible', () => {

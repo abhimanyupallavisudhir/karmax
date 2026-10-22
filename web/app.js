@@ -19988,14 +19988,15 @@ function repositoryAccessRequestRows(requests, { historyLimit = 20 } = {}) {
   const asked = (request) => request.approvers.map((approver) => esc(approver.login)).join(', ');
   const pendingHtml = pending.map((request) => {
     const canResolve = signedInUserId && request.recipients.includes(signedInUserId);
-    return `<div class="approval-request" data-raccess="${esc(request.id)}">
+    return `<div class="approval-request${request.dismissed ? ' approval-request-dismissed' : ''}" data-raccess="${esc(request.id)}">
     <div class="approval-request-main">
-      <div class="approval-request-title">GitHub access <span class="chip approval-needed">approval needed</span></div>
+      <div class="approval-request-title">GitHub access ${request.dismissed ? ignoredChip() : '<span class="chip approval-needed">approval needed</span>'}</div>
       <div class="task-sub"><span class="mono">${esc(request.login)}</span> can't see <span class="mono">${esc(request.slug)}</span>.</div>
     </div>
     <div class="approval-request-actions">
       ${canResolve ? `<button class="btn sm primary" data-raccess-act="approve" title="${esc(`Adds ${request.login} to ${request.slug} on GitHub with write access, then continues the task`)}">Give access</button>
-        <button class="btn sm" data-raccess-act="deny">Deny</button>`
+        <button class="btn sm" data-raccess-act="deny">Deny</button>
+        ${request.dismissed ? '' : ignoreRequestButton('data-raccess-act')}`
         : `<span class="task-sub">Asked ${asked(request)}</span>`}
     </div>
   </div>`;
@@ -20015,7 +20016,8 @@ function wireRepositoryAccessRequestActions(root, organizationId, onResolved) {
         const result = await api(`/api/repository-access-requests/${row.dataset.raccess}/resolve?organizationId=${encodeURIComponent(organizationId || '')}`, {
           method: 'POST', body: JSON.stringify({ action: button.dataset.raccessAct }),
         });
-        toast(button.dataset.raccessAct === 'deny' ? 'Denied' : result.retried ? 'Access given — task continuing' : 'Access given');
+        const act = button.dataset.raccessAct;
+        toast(act === 'dismiss' ? 'Request ignored' : act === 'deny' ? 'Denied' : result.retried ? 'Access given — task continuing' : 'Access given');
         await onResolved?.(result);
       } catch (error) { button.disabled = false; toast(error.message, true); }
     })));

@@ -215,7 +215,7 @@ const APPROVAL_ASKS = sqlList(['credential.approval-requested', 'permission.appr
 const APPROVAL_DECISION_TYPES = ['credential.approval-resolved', 'connection.resolved',
   'permission.approval-resolved', 'authorization.approval-resolved', 'repository-access.approval-resolved'];
 const APPROVAL_DISMISSAL_TYPES = ['credential.approval-dismissed', 'permission.approval-dismissed',
-  'authorization.approval-dismissed', 'connection.dismissed'];
+  'authorization.approval-dismissed', 'connection.dismissed', 'repository-access.approval-dismissed'];
 const APPROVAL_DECISIONS = sqlList(APPROVAL_DECISION_TYPES);
 const APPROVAL_SILENCERS = sqlList([...APPROVAL_DECISION_TYPES, ...APPROVAL_DISMISSAL_TYPES]);
 

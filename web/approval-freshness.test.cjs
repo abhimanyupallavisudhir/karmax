@@ -77,12 +77,14 @@ test('a slower superseded reload never overwrites a newer one', async () => {
 // the repository's GitHub admins the request was routed to may decide it.
 test('a GitHub access request offers its decision only to the admins it was routed to', () => {
   const ctx = vm.createContext({ S: { user: 'owner' }, esc: (value) => String(value) });
-  vm.runInContext(fn('repositoryAccessRequestRows'), ctx);
+  vm.runInContext(['repositoryAccessRequestRows', 'ignoredChip', 'ignoreRequestButton'].map(fn).join('\n'), ctx);
   const request = { id: 'r1', status: 'pending', login: 'dharmaarthamaxxer-damx', slug: 'srajma/dam-videos',
     recipients: ['owner'], approvers: [{ userId: 'owner', login: 'srajma' }] };
   const admin = ctx.repositoryAccessRequestRows([request]);
   assert.match(admin, /dharmaarthamaxxer-damx<\/span> can't see <span class="mono">srajma\/dam-videos/);
   assert.match(admin, /data-raccess-act="approve"[^>]*>Give access</);
+  assert.match(admin, /data-raccess-act="dismiss"/);
+  assert.doesNotMatch(ctx.repositoryAccessRequestRows([{ ...request, dismissed: { by: 'user:owner', at: 1 } }]), /data-raccess-act="dismiss"/);
   ctx.S.user = 'member';
   const creator = ctx.repositoryAccessRequestRows([request]);
   assert.doesNotMatch(creator, /data-raccess-act/);

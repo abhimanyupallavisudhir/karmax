@@ -342,6 +342,18 @@ describe('Asking a repository\'s GitHub admins for access', () => {
     expect(retried).toEqual([]);
   });
 
+  it('ignores a request: nobody is notified, and it can still be decided', async () => {
+    const request = (await ask())!;
+    await expect(requests.dismiss({ organizationId, requestId: request.id, userId: 'maintainer' })).rejects.toMatchObject({ status: 403 });
+    await expect(requests.dismiss({ organizationId, requestId: request.id, userId: 'owner' }))
+      .resolves.toMatchObject({ status: 'pending', dismissed: { by: 'user:owner' } });
+    expect((await store.listInbox('owner', organizationId)).filter((item) => item.kind === 'approval-requested')).toEqual([]);
+    expect(await tasksWithOpenRequests(store)).not.toContain(taskId);
+    await expect(requests.resolve({ organizationId, requestId: request.id, userId: 'owner', action: 'approve' }))
+      .resolves.toMatchObject({ status: 'granted' });
+    expect(github.collaborators.get('dharmaarthamaxxer-damx')).toBe('push');
+  });
+
   it('withdraws the request when its task is done or cancelled', async () => {
     const request = (await ask())!;
     expect(await tasksWithOpenRequests(store)).toContain(taskId);
