@@ -19289,14 +19289,13 @@ async function wirePaidLaunchCard() {
       <label class="form-row">DPA email<input class="paid-email-dpa" type="email" value="${esc(contacts.dpa || '')}" /></label>
       <label class="form-row">Billing email<input class="paid-email-billing" type="email" value="${esc(contacts.billing || '')}" /></label>
     </div>
-    <label class="card" style="display:flex;gap:10px;padding:12px;margin-top:14px"><input type="checkbox" class="paid-founder-reviewed" ${state.founderReviewed ? 'checked' : ''} /><span><b>I reviewed and approved policy version ${esc(state.policyVersion)}</b><span class="task-sub" style="display:block">This records founder approval; it is not a substitute for legal advice.</span></span></label>
 
     <div class="section-h" style="margin-top:22px">Real-world founder checklist</div>
     <p class="task-sub">These items happen outside ${siteNameMarkup()}. Check them off here to keep one durable launch record; the checkboxes are guidance and do not falsely claim that ${siteNameMarkup()} verified the work.</p>
     ${taskMarkup}
 
     <div class="card" style="margin-top:18px;padding:14px;border-color:${state.paidLaunch ? 'var(--ok,#4ec9a3)' : 'var(--line)'}">
-      <label style="display:flex;gap:10px;align-items:flex-start"><input type="checkbox" class="paid-launch-enabled" ${state.paidLaunch ? 'checked' : ''} ${state.canEnable || state.paidLaunch ? '' : 'disabled'} /><span><b>Enable real paid checkout</b><span class="task-sub" style="display:block">Requires completed legal and live billing setup. Disabling closes new checkout without deleting existing subscriptions.</span></span></label>
+      <label style="display:flex;gap:10px;align-items:flex-start"><input type="checkbox" class="paid-launch-enabled" ${state.paidLaunch ? 'checked' : ''} ${state.canEnable || state.paidLaunch ? '' : 'disabled'} /><span><b>Enable real paid checkout</b><span class="task-sub" style="display:block">Requires completed legal and live billing setup, and publishes the policies as yours: each later version takes effect when it deploys. Disabling closes new checkout without deleting existing subscriptions.</span></span></label>
     </div>
     <button class="btn primary paid-launch-save" style="margin-top:14px" ${state.canManage ? '' : 'disabled'} data-unsaved-save>Save paid-launch setup</button>
     ${state.source === 'environment-bootstrap' ? '<p class="task-sub">Legacy environment values may currently be supplying some fields. Saving this form moves the editable configuration into Installation settings; saved values take precedence.</p>' : ''}`;
@@ -19315,7 +19314,6 @@ async function wirePaidLaunchCard() {
           storagePackPriceId: box.querySelector('.paid-paddle-storage-pack-price').value,
         },
         paidLaunch: box.querySelector('.paid-launch-enabled').checked,
-        founderReviewed: box.querySelector('.paid-founder-reviewed').checked,
         operatorName: box.querySelector('.paid-operator-name').value,
         operatorCountry: box.querySelector('.paid-operator-country').value,
         governingLaw: box.querySelector('.paid-governing-law').value,
