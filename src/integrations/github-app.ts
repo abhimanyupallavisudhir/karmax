@@ -196,7 +196,8 @@ export const GITHUB_REPOSITORY_ROLES = ['pull', 'triage', 'push', 'maintain', 'a
 export type GitHubRepositoryRole = typeof GITHUB_REPOSITORY_ROLES[number];
 
 export interface GitHubRepositoryCollaborator { login: string; role: GitHubRepositoryRole }
-export interface GitHubRepositoryInvitation { id: number; login: string; role: GitHubRepositoryRole }
+/** `expired`: GitHub lets an invitation lapse after seven days; only the repository's admins can renew it. */
+export interface GitHubRepositoryInvitation { id: number; login: string; role: GitHubRepositoryRole; expired?: boolean }
 
 /** Invitations name roles as GitHub's UI does; the collaborator API as REST does. */
 const INVITATION_ROLES: Record<string, GitHubRepositoryRole> = {
@@ -1519,12 +1520,12 @@ export class GitHubAppService {
     const token = await this.repositoryAdminToken(repository);
     const found: GitHubRepositoryInvitation[] = [];
     for (let page = 1; page <= 20; page++) {
-      const batch = await this.request<Array<{ id?: number; invitee?: { login?: string } | null; permissions?: string }>>(
+      const batch = await this.request<Array<{ id?: number; invitee?: { login?: string } | null; permissions?: string; expired?: boolean }>>(
         `${repositoryPath(repository)}/invitations?per_page=100&page=${page}`, token);
       for (const item of batch ?? []) {
         const role = INVITATION_ROLES[String(item.permissions)];
         if (Number.isSafeInteger(item.id) && item.invitee?.login && role)
-          found.push({ id: item.id!, login: item.invitee.login, role });
+          found.push({ id: item.id!, login: item.invitee.login, role, ...(item.expired ? { expired: true } : {}) });
       }
       if ((batch ?? []).length < 100) break;
     }
@@ -1543,28 +1544,26 @@ export class GitHubAppService {
 
   /** Accept a repository invitation as the invited person, through the GitHub
    * account they linked, so they need not find GitHub's e-mail first. */
-  async acceptRepositoryInvitation(userId: string, accountId: string, invitationId: number): Promise<void> {
+  async acceptRepositoryInvitation(userId: string, accountId: string | undefined, invitationId: number): Promise<void> {
     if (!Number.isSafeInteger(invitationId) || invitationId <= 0) throw new Error('invalid GitHub invitation');
     await this.userRequest(userId, `/user/repository_invitations/${invitationId}`, { method: 'PATCH' }, accountId);
   }
 
-  /** Accept the person's pending invitation to `slug`, if GitHub holds one:
+  /** Accept `login`'s pending invitation to `repository`, if GitHub holds one:
    * someone added them as a collaborator and they never clicked the e-mail.
-   * True when there was one to accept. */
-  async acceptPendingRepositoryInvitation(userId: string, accountId: string | undefined, slug: string): Promise<boolean> {
-    for (let page = 1; page <= 10; page++) {
-      const batch = await this.userRequest<Array<{ id?: number; expired?: boolean; repository?: { full_name?: string } }>>(userId,
-        `/user/repository_invitations?per_page=100&page=${page}`, {}, accountId);
-      // GitHub lets an invitation lapse after seven days; only its admins can renew it.
-      const invitation = (batch ?? []).find((item) => !item.expired
-        && item.repository?.full_name?.toLowerCase() === slug.toLowerCase());
-      if (invitation?.id !== undefined) {
-        await this.userRequest(userId, `/user/repository_invitations/${Number(invitation.id)}`, { method: 'PATCH' }, accountId);
-        return true;
-      }
-      if ((batch ?? []).length < 100) break;
-    }
-    return false;
+   * True when there was one to accept.
+   *
+   * The invitation is found through the installation, not the person: GitHub
+   * lists an App user token only invitations to repositories it can already see,
+   * which a pending one's never is (video-explainers #4: `/user/repository_invitations`
+   * answered [] while `srajma/dam-videos` held theirs). Accepting it by id as them works. */
+  async acceptPendingRepositoryInvitation(userId: string, accountId: string | undefined, repository: Repository,
+    login: string): Promise<boolean> {
+    const invitation = (await this.repositoryInvitations(repository))
+      .find((item) => !item.expired && item.login.toLowerCase() === login.toLowerCase());
+    if (!invitation) return false;
+    await this.acceptRepositoryInvitation(userId, accountId, invitation.id);
+    return true;
   }
 
   /** Remove a collaborator, or withdraw the invitation they have not accepted. */

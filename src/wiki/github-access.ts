@@ -2,7 +2,7 @@ import type { Project, Repository } from '../domain/types.js';
 import type { Store } from '../store/db.js';
 import type { AuthorizationService } from '../platform/authorization.js';
 import { allows } from '../platform/capabilities.js';
-import { GITHUB_REPOSITORY_ROLES, type GitHubAppService, type GitHubRepositoryRole } from '../integrations/github-app.js';
+import { GITHUB_REPOSITORY_ROLES, type GitHubAppService, type GitHubRepositoryInvitation, type GitHubRepositoryRole } from '../integrations/github-app.js';
 
 /**
  * GitHub access to project wiki repositories follows access in tavya.
@@ -15,7 +15,10 @@ import { GITHUB_REPOSITORY_ROLES, type GitHubAppService, type GitHubRepositoryRo
  *
  * Whoever may edit the wiki in tavya (`skill:write`) is a collaborator with
  * push, whoever may only read it (`project:read`) with pull, through every
- * GitHub account they linked. The invitation is accepted as them at once. Only
+ * GitHub account they linked. A personal account's repository has only one
+ * collaborator role, write (GitHub refuses read: `Cannot assign … permission of
+ * read`), so there read-only members read the wiki in tavya alone: tavya never
+ * gives more on GitHub than in tavya. The invitation is accepted as them at once. Only
  * access tavya gave is ever taken back: the owner and people added by hand keep
  * theirs, and a role tavya raised returns to what it was.
  */
@@ -88,10 +91,11 @@ export class WikiGithubAccess {
         member.principal.kind === 'user' ? [member.principal.userId] : []),
       ...Object.values(granted).map((grant) => grant.userId),
     ])];
+    const personal = (await store.getGitConnection(repository.gitConnectionId))?.accountType === 'User';
     const wanted = new Map<string, Omit<WikiAccessGrant, 'previousRole'>>();
     for (const userId of userIds) {
       const role = await this.roleFor(userId, project);
-      if (!role) continue;
+      if (!role || (personal && role !== 'push')) continue;
       for (const account of await githubApp.listUserAccounts(userId).catch(() => []))
         wanted.set(account.login.toLowerCase(), { userId, accountId: account.id, login: account.login, role });
     }
@@ -126,7 +130,7 @@ export class WikiGithubAccess {
   }
 
   private async grant(repository: Repository, want: Omit<WikiAccessGrant, 'previousRole'>,
-    have: GitHubRepositoryRole | undefined, invitation: { id: number; role: GitHubRepositoryRole } | undefined,
+    have: GitHubRepositoryRole | undefined, invitation: GitHubRepositoryInvitation | undefined,
     mine: WikiAccessGrant | undefined): Promise<WikiAccessOutcome> {
     const { githubApp } = this.deps;
     const member = { userId: want.userId, login: want.login };
@@ -137,7 +141,7 @@ export class WikiGithubAccess {
         await this.record(repository.id, want.login, { ...mine, ...want });
       return { ...member, state: 'member' };
     }
-    let invitationId = !have && invitation?.role === want.role ? invitation.id : undefined;
+    let invitationId = !have && !invitation?.expired && invitation?.role === want.role ? invitation.id : undefined;
     // Record before asking GitHub, so access tavya gave is always found again to take back.
     await this.record(repository.id, want.login, { ...want,
       ...(mine?.previousRole ? { previousRole: mine.previousRole } : have && !mine ? { previousRole: have } : {}) });

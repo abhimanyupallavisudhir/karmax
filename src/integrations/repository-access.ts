@@ -48,15 +48,16 @@ const prefix = (organizationId: string, taskId?: string) =>
 const keyOf = (request: Pick<RepositoryAccessRequest, 'organizationId' | 'taskId' | 'id'>) =>
   `${prefix(request.organizationId, request.taskId)}${request.id}`;
 
-/** A task's pending requests, withdrawn once it is done or cancelled: no decision could reach it. */
+/** A task's pending requests (to one repository), withdrawn once no decision
+ * could matter: the task is done or cancelled, or the access arrived without one. */
 export async function withdrawRepositoryAccessRequests(store: Pick<Store, 'transaction' | 'lock' | 'kvGet' | 'kvSet' | 'kvEntries'>,
-  organizationId: string, taskId: string): Promise<RepositoryAccessRequest[]> {
+  organizationId: string, taskId: string, repositoryId?: string): Promise<RepositoryAccessRequest[]> {
   const withdrawn: RepositoryAccessRequest[] = [];
   for (const { key } of await store.kvEntries(prefix(organizationId, taskId))) {
     const request = await store.transaction(async () => {
       await store.lock(`kv:${key}`);
       const current = JSON.parse((await store.kvGet(key)) ?? 'null') as RepositoryAccessRequest | null;
-      if (current?.status !== 'pending') return undefined;
+      if (current?.status !== 'pending' || (repositoryId && current.repositoryId !== repositoryId)) return undefined;
       const next: RepositoryAccessRequest = { ...current, status: 'withdrawn' };
       await store.kvSet(key, JSON.stringify(next));
       return next;

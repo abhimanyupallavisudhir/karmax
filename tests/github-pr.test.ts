@@ -2823,10 +2823,11 @@ describe('Pull requests opened as a person who cannot see the repository', () =>
         visible.add(WIKI_SLUG);
       },
       removeRepositoryCollaborator: async () => undefined,
-      acceptPendingRepositoryInvitation: async (...args: unknown[]) => {
-        accepted.push(args);
-        if (args[2] !== options.invitedTo) return false;
-        visible.add(String(args[2]));
+      acceptPendingRepositoryInvitation: async (userId: string, accountId: string, repository: { owner: string; name: string }, login: string) => {
+        const slug = `${repository.owner}/${repository.name}`;
+        accepted.push([userId, accountId, slug, login]);
+        if (slug !== options.invitedTo) return false;
+        visible.add(slug);
         return true;
       },
     };
@@ -2873,7 +2874,7 @@ describe('Pull requests opened as a person who cannot see the repository', () =>
     visible.delete(SLUG);
     const opened = await core.openPr(handle, 'main', { title: 'Member task' });
     expect(opened.map((pr: TaskPullRequest) => pr.slug)).toEqual([SLUG, WIKI_SLUG]);
-    expect(accepted).toContainEqual(['member', 'member-account', SLUG]);
+    expect(accepted).toContainEqual(['member', 'member-account', SLUG, 'octo-member']);
     expect(gh.prs.map((pr) => pr.repo)).toEqual([SLUG, WIKI_SLUG]);
   });
 
@@ -2900,5 +2901,22 @@ describe('Pull requests opened as a person who cannot see the repository', () =>
     });
     const events = (await core.store.eventsSince(task.id, 0)).filter((event: any) => event.type === 'repository-access.approval-requested');
     expect(events.map((event: any) => event.payload)).toEqual([expect.objectContaining({ slug: SLUG, login: 'octo-member', recipients: ['owner'] })]);
+  });
+
+  it('withdraws what it asked the admins once the creator can see the repository', async () => {
+    const { core, visible, handle, task } = await setup({ adminInOrganization: true });
+    visible.delete(SLUG);
+    await expect(core.openPr(handle, 'main', { title: 'Member task' })).rejects.toMatchObject({ type: 'github-repository-access' });
+    expect((await core.store.listInbox('owner', (await core.store.getProject(task.projectId))!.organizationId!))
+      .filter((item: any) => item.actionable)).toHaveLength(1);
+
+    // Their invitation accepted, or access given on GitHub by hand: Retry opens the PR.
+    visible.add(SLUG);
+    const opened = await core.openPr(handle, 'main', { title: 'Member task' });
+    expect(opened.map((pr: TaskPullRequest) => pr.slug)).toEqual([SLUG, WIKI_SLUG]);
+    const resolved = (await core.store.eventsSince(task.id, 0)).filter((event: any) => event.type === 'repository-access.approval-resolved');
+    expect(resolved.map((event: any) => event.payload)).toEqual([expect.objectContaining({ action: 'withdraw', reason: `octo-member can see ${SLUG} now` })]);
+    expect((await core.store.listInbox('owner', (await core.store.getProject(task.projectId))!.organizationId!))
+      .filter((item: any) => item.actionable)).toEqual([]);
   });
 });

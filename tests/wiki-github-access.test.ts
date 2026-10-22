@@ -24,8 +24,10 @@ import { settleTaskRequests, tasksWithOpenRequests } from '../src/platform/settl
 const OWNER = 'srajma';
 const WIKI = 'andhbhakt.org-wiki-97aac911';
 
-/** GitHub's collaborator and invitation API for one personal repository. */
+/** GitHub's collaborator and invitation API for one repository, personal
+ * unless `personal` is turned off. Modelled on what tavya.io's GitHub answered. */
 function fakeGithub(name = WIKI) {
+  const state = { personal: true };
   const collaborators = new Map<string, GitHubRepositoryRole>([[OWNER, 'admin']]);
   const invitations = new Map<number, { login: string; role: GitHubRepositoryRole; expired?: boolean }>();
   const calls: string[] = [];
@@ -57,12 +59,15 @@ function fakeGithub(name = WIKI) {
           [name, index <= ['pull', 'triage', 'push', 'maintain', 'admin'].indexOf(role)])) })) : []);
     if (url.pathname === `${repo}/invitations` && method === 'GET')
       return Response.json(url.searchParams.get('page') === '1' ? [...invitations].map(([id, invitation]) =>
-        ({ id, invitee: { login: invitation.login }, permissions: invitationName[invitation.role] })) : []);
+        ({ id, invitee: { login: invitation.login }, permissions: invitationName[invitation.role], expired: !!invitation.expired })) : []);
     const collaborator = url.pathname.match(new RegExp(`^${repo}/collaborators/([^/]+)$`));
     if (collaborator && method === 'PUT') {
       const login = decodeURIComponent(collaborator[1]!);
       const role = JSON.parse(String(init.body)).permission as GitHubRepositoryRole;
       if (login === OWNER) return Response.json({ message: 'Repository owner cannot be a collaborator' }, { status: 422 });
+      // A personal account's repository has one collaborator role, write.
+      if (state.personal && role !== 'push')
+        return Response.json({ message: 'Validation Failed', errors: `Cannot assign ${login} permission of ${invitationName[role]}` }, { status: 422 });
       if (collaborators.has(login)) { collaborators.set(login, role); return new Response(null, { status: 204 }); }
       const id = nextInvitation++;
       invitations.set(id, { login, role });
@@ -77,10 +82,9 @@ function fakeGithub(name = WIKI) {
       invitations.delete(Number(invitation[1]));
       return new Response(null, { status: 204 });
     }
-    if (url.pathname === '/user/repository_invitations' && method === 'GET')
-      return Response.json(url.searchParams.get('page') === '1' ? [...invitations]
-        .filter(([, pending]) => pending.login === tokenUsers[auth])
-        .map(([id, pending]) => ({ id, expired: !!pending.expired, repository: { full_name: `${OWNER}/${name}` } })) : []);
+    // An App user token is listed no invitation to a repository it cannot see
+    // yet, which is every pending one (video-explainers #4); accepting by id works.
+    if (url.pathname === '/user/repository_invitations' && method === 'GET') return Response.json([]);
     const accept = url.pathname.match(/^\/user\/repository_invitations\/(\d+)$/);
     if (accept && method === 'PATCH') {
       const pending = invitations.get(Number(accept[1]));
@@ -93,7 +97,7 @@ function fakeGithub(name = WIKI) {
     }
     return Response.json({ message: 'Not Found' }, { status: 404 });
   }) as typeof fetch;
-  return { fetcher, collaborators, invitations, calls, refuseAccept };
+  return { fetcher, collaborators, invitations, calls, refuseAccept, state };
 }
 
 describe('GitHub access to project wiki repositories follows access in tavya', () => {
@@ -161,7 +165,14 @@ describe('GitHub access to project wiki repositories follows access in tavya', (
     expect(github.calls.slice(before).filter((call) => !call.startsWith('GET'))).toEqual([]);
   });
 
+  /** An organization's repository has every role; a personal account's has only write. */
+  async function ownedByOrganization() {
+    github.state.personal = false;
+    await store.upsertGitConnection({ organizationId, provider: 'github', installationId: '42', accountLogin: OWNER, accountType: 'Organization' });
+  }
+
   it('gives read-only members pull, and changes the role when theirs changes in tavya', async () => {
+    await ownedByOrganization();
     await join('reader', 'quiet-reader', 'viewer');
     await access.syncProject(projectId);
     expect(github.collaborators.get('quiet-reader')).toBe('pull');
@@ -192,7 +203,28 @@ describe('GitHub access to project wiki repositories follows access in tavya', (
     expect(await access.grants('missing')).toEqual({});
   });
 
+  it('gives read-only members nothing on a personal account\'s repository, which has no read role', async () => {
+    const lines: string[] = [];
+    access = new WikiGithubAccess({ store, githubApp: app, authorization, debounceMs: 0, log: (line) => lines.push(line) });
+    await join('reader', 'radnyees', 'viewer');
+    // What tavya.io recorded before GitHub refused: a grant that never took.
+    await store.kvSet(`wiki-github-access:${(await store.projectWiki(projectId))!.repository!.id}`,
+      JSON.stringify({ radnyees: { userId: 'reader', accountId: '1008', login: 'radnyees', role: 'pull' } }));
+
+    expect(await access.syncProject(projectId)).not.toContainEqual(expect.objectContaining({ login: 'radnyees' }));
+    expect(lines).toEqual([]);
+    expect(github.calls.filter((call) => !call.startsWith('GET') && call.includes('/repos/'))).toEqual([]);
+    expect(github.collaborators.has('radnyees')).toBe(false);
+    expect(await access.grants((await store.projectWiki(projectId))!.repository!.id)).toEqual({});
+
+    // Once they may edit the wiki, they get write like everyone else.
+    await authorization.replacePrincipalAuthorization('user:owner', 'user:reader', organizationId, { level: 'developer', scope: 'organization' });
+    await access.syncProject(projectId);
+    expect(github.collaborators.get('radnyees')).toBe('push');
+  });
+
   it('restores the role it raised instead of removing someone added by hand', async () => {
+    await ownedByOrganization();
     github.collaborators.set('helper', 'pull');
     await join('helper', 'helper', 'developer');
     await access.syncProject(projectId);
@@ -218,17 +250,20 @@ describe('GitHub access to project wiki repositories follows access in tavya', (
     stop();
   });
 
-  it('accepts a pending invitation to a repository as the invited person', async () => {
+  it('accepts a pending invitation to a repository as the invited person, found through the installation', async () => {
     await join('member', 'dharmaarthamaxxer-damx', 'developer');
-    // Invited on GitHub by hand (video-explainers #4), never accepted.
-    github.invitations.set(77, { login: 'dharmaarthamaxxer-damx', role: 'push' });
+    // Invited on GitHub by hand (video-explainers #4), never accepted. Their
+    // own token is listed no such invitation: GitHub only shows the installation.
+    github.invitations.set(77, { login: 'someone-else', role: 'push' });
     const account = (await app.listUserAccounts('member'))[0]!;
+    const repository = (await store.projectWiki(projectId))!.repository!;
 
-    await expect(app.acceptPendingRepositoryInvitation('member', account.id, `${OWNER}/elsewhere`)).resolves.toBe(false);
+    await expect(app.acceptPendingRepositoryInvitation('member', account.id, repository, account.login)).resolves.toBe(false);
     github.invitations.set(77, { login: 'dharmaarthamaxxer-damx', role: 'push', expired: true });
-    await expect(app.acceptPendingRepositoryInvitation('member', account.id, `${OWNER}/${WIKI}`)).resolves.toBe(false);
+    await expect(app.acceptPendingRepositoryInvitation('member', account.id, repository, account.login)).resolves.toBe(false);
     github.invitations.set(77, { login: 'dharmaarthamaxxer-damx', role: 'push' });
-    await expect(app.acceptPendingRepositoryInvitation('member', account.id, `${OWNER}/${WIKI.toUpperCase()}`)).resolves.toBe(true);
+    await expect(app.acceptPendingRepositoryInvitation('member', account.id, repository, 'DharmaArthaMaxxer-DAMX')).resolves.toBe(true);
+    expect(github.calls).toContain('PATCH /user/repository_invitations/77');
     expect(github.collaborators.get('dharmaarthamaxxer-damx')).toBe('push');
     expect(github.invitations.size).toBe(0);
   });

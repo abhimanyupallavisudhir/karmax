@@ -127,7 +127,7 @@ import type { ObjectStore } from '../store/objects.js';
 import { conversationImportObjectKey } from '../store/conversation-imports.js';
 import { ensureProjectWikiRepositoryAsync, PROJECT_WIKI_BRANCH, setProjectWikiRemote } from '../wiki/repository.js';
 import { WikiGithubAccess } from '../wiki/github-access.js';
-import { RepositoryAccessRequests } from '../integrations/repository-access.js';
+import { RepositoryAccessRequests, withdrawRepositoryAccessRequests } from '../integrations/repository-access.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { manifest, roleCeiling } from '../contrib/manifests.js';
@@ -1104,12 +1104,26 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     } catch { return undefined; }
   }
 
-  async function acceptPendingInvitation(actor: GithubPrActor, slug: string): Promise<boolean> {
+  async function acceptPendingInvitation(handle: WorldHandle, actor: GithubPrActor, slug: string): Promise<boolean> {
     if (typeof deps.githubApp?.acceptPendingRepositoryInvitation !== 'function') return false;
-    return deps.githubApp.acceptPendingRepositoryInvitation(actor.userId, actor.accountId, slug).catch((error) => {
+    const projectId = typeof handle.meta?.projectId === 'string' ? handle.meta.projectId : (await store.getTask(handle.id))?.projectId;
+    const repository = await enrolledGithubRepository(projectId, slug);
+    if (!repository?.gitConnectionId) return false;
+    return deps.githubApp.acceptPendingRepositoryInvitation(actor.userId, actor.accountId, repository, actor.login).catch((error) => {
       console.warn(`[karmax] could not accept ${actor.login}'s invitation to ${slug}:`, error instanceof Error ? error.message : error);
       return false;
     });
+  }
+
+  /** `actor` reaches `slug` now (an invitation accepted, or access given on
+   * GitHub): what this task still asks its admins for is moot. */
+  async function withdrawRepositoryAccess(handle: WorldHandle, actor: GithubPrActor, slug: string): Promise<void> {
+    const projectId = typeof handle.meta?.projectId === 'string' ? handle.meta.projectId : (await store.getTask(handle.id))?.projectId;
+    const repository = await enrolledGithubRepository(projectId, slug);
+    if (!repository) return;
+    for (const request of await withdrawRepositoryAccessRequests(store, repository.organizationId, handle.id, repository.id))
+      (await record(handle.id, 'repository-access.approval-resolved', {
+        requestId: request.id, action: 'withdraw', reason: `${actor.login} can see ${slug} now` }));
   }
 
   /** Ask the repository's GitHub admins to let `actor` see it; who was asked. */
@@ -5178,7 +5192,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           opening = await propose().catch(async (error) => {
             // Invited, but never clicked GitHub's e-mail: accept as them, then once more.
             if (error instanceof GithubApiError && error.status === 404 && api.actor
-              && await acceptPendingInvitation(api.actor, slug)) return propose();
+              && await acceptPendingInvitation(handle, api.actor, slug)) return propose();
             throw error;
           });
         } catch (error) {
@@ -5195,6 +5209,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           continue;
         }
         const { pr, created } = opening;
+        if (api.actor) await withdrawRepositoryAccess(handle, api.actor, slug).catch((error) => {
+          console.warn(`[karmax] could not withdraw the GitHub access requests for ${slug}:`, error instanceof Error ? error.message : error);
+        });
         const ref: TaskPullRequest = {
           repo: repo.name, slug, number: pr.number, url: pr.url, state: pr.state, merged: pr.merged,
           ...(pr.headSha ? { headSha: pr.headSha } : {}),
