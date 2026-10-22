@@ -13,8 +13,11 @@ import { findProviderSession, materializeFork } from '../src/agent/fork.js';
 import { ensureRemoteCodexSessionTools, materializeRemoteSession, remoteAgentHomeRelative,
   seedRemoteAgentHome, syncRemoteAgentHome } from '../src/agent/remote-process.js';
 import type { World } from '../src/world/types.js';
+import { linkHostNodeRuntime, offlineNpmRegistry } from './helpers/offline-npm.js';
 import { readLocalCodexHistory, publishLocalCodexHistory } from '../src/agent/codex-history-files.js';
 import { publishRemoteCodexHistory } from '../src/agent/codex-history-remote.js';
+
+offlineNpmRegistry();
 
 const roots: string[] = [];
 const stops: Array<() => Promise<void>> = [];
@@ -27,6 +30,7 @@ afterEach(async () => {
 // Real files and processes behind the same World methods used by cloud transfers.
 function diskWorld(root: string): World {
   fs.mkdirSync(path.join(root, 'system-bin'), { recursive: true });
+  linkHostNodeRuntime(root);
   return {
     openPty: (spec: any) => openLocalPty(root, spec),
     handle: { root, kind: 'worktree' },

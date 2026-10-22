@@ -15,6 +15,7 @@ import { OPENCODE_REMOTE_REFRESH_SENTINEL, isControlPlaneAuth, prewarmRemoteAgen
 import { PINNED_REMOTE_NODE_VERSION } from '../src/agent/remote-node.js';
 import { ProviderStreamError, SandboxProviderFailure } from '../src/agent/limits.js';
 import type { World, WorldPty } from '../src/world/types.js';
+import { linkHostNodeRuntime, offlineNpmRegistry } from './helpers/offline-npm.js';
 
 /**
  * Remote OpenCode end to end, without a cloud: a world shaped like an E2B
@@ -137,13 +138,7 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
 
 /** A world shaped like an E2B sandbox whose sandbox is `root` on this host. */
 function sandboxWorld(root: string): World & { ptys: number; bootstraps: string[] } {
-  const runtimeBin = path.join(root, `.karmax-injection/agent/tools/node-${PINNED_REMOTE_NODE_VERSION}/bin`);
-  fs.mkdirSync(runtimeBin, { recursive: true });
-  const nodeBin = path.dirname(process.execPath);
-  for (const name of ['node', 'npm', 'npx']) {
-    const target = name === 'node' ? process.execPath : path.join(nodeBin, name);
-    if (!fs.existsSync(path.join(runtimeBin, name))) fs.symlinkSync(fs.existsSync(target) ? target : name, path.join(runtimeBin, name));
-  }
+  linkHostNodeRuntime(root);
   const live = new Set<ChildProcess>();
   const world: World & { ptys: number; bootstraps: string[] } = {
     ptys: 0,
@@ -200,6 +195,8 @@ function records(root: string): any[] {
   const file = path.join(root, '.stub-records.jsonl');
   return fs.existsSync(file) ? fs.readFileSync(file, 'utf8').trim().split('\n').map((line) => JSON.parse(line)) : [];
 }
+
+offlineNpmRegistry();
 
 describe('remote OpenCode (ACP in a cloud sandbox)', () => {
   let dir: string;
