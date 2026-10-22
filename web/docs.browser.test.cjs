@@ -16,7 +16,7 @@ const { fakeConsole, launch } = require('../tests/helpers/fake-console.cjs');
       { slug: 'terms', title: 'Terms of Service', summary: 'The agreement.', version: '1' },
       { slug: 'privacy', title: 'Privacy Policy', summary: 'What we process.', version: '1' },
     ];
-    // The server omits draftNotice once the operator approves the current policy version.
+    // The server omits draftNotice once the operator opens paid checkout.
     const open = async (viewport = { width: 1280, height: 800 }, { approved = false } = {}) => {
       const draft = approved ? {} : { draftNotice: 'Draft.' };
       const launchInfo = { policyVersion: '1', ...draft, policies, pricingCatalog: [

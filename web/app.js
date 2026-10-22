@@ -7037,8 +7037,8 @@ function triggerSummary(triggers) {
 
 // A repeatable series (Model A): one row that owns its runs. Shows a repeatable
 // badge, the schedule/next-trigger summary, the run count + latest status, and
-// expands to list the individual runs.
-function seriesRow(t) {
+// expands to list the individual runs. `where` is its project label (taskRow's).
+function seriesRow(t, where = '') {
   const runs = (S._runsBySeries?.[t.id] || []).slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
   const expanded = S.expandedSeries?.has(t.id);
   const bits = [];
@@ -7049,8 +7049,8 @@ function seriesRow(t) {
     <div class="task-row series-row" data-series="${t.id}">
       <button class="icon-btn series-caret" data-expand="${t.id}" title="Show runs">${expanded ? '▾' : '▸'}</button>
       <div class="task-main">
-        <div class="task-title">${esc(t.title)} <span class="chip">repeatable</span></div>
-        <div class="task-sub"><span style="color:var(--ink-3)">${esc(bits.join('  ·  '))}</span></div>
+        <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)} <span class="chip">repeatable</span></div>
+        <div class="task-sub">${where}<span style="color:var(--ink-3)">${esc(bits.join('  ·  '))}</span></div>
       </div>
       <div class="task-right">
         <button class="btn sm" data-runagain="${t.id}">Run again</button>
@@ -7080,13 +7080,13 @@ function taskRow(t, { showTags = true, project = false } = {}) {
   const isDraft = t.params?.draft;
   const archived = t.params?.archived;
   const where = project ? projectLabel(t) : '';
-  if (isSeries(t.params) && !archived) return seriesRow(t);
+  if (isSeries(t.params) && !archived) return seriesRow(t, where);
   if (t.params?.triggerState === 'armed' && !archived) {
     return `
     <div class="task-row" data-armed="${t.id}">
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</div>
-        <div class="task-sub"><span class="chip">waiting for trigger</span><span style="color:var(--ink-3)">${esc(triggerSummary(t.params.triggers))}</span></div>
+        <div class="task-sub">${where}<span class="chip">waiting for trigger</span><span style="color:var(--ink-3)">${esc(triggerSummary(t.params.triggers))}</span></div>
       </div>
       <div class="task-right">
         <button class="btn sm" data-runnow="${t.id}">Run now</button>
@@ -11453,15 +11453,19 @@ async function openArtifact(resolved, refresh) {
 function wirePullRequestApprovals() {
   document.querySelectorAll('[data-approve-pr]').forEach((btn) =>
     btn.addEventListener('click', async () => {
-      btn.disabled = true;
+      const id = btn.dataset.approvePr;
+      // Shown approved at once (rail row and conversation box); the record's
+      // own updates take over as it lands.
+      (S.prApprovals ||= {})[id] = Date.now();
+      scheduleTaskPageRender();
       try {
-        await api(`/api/tasks/${encodeURIComponent(btn.dataset.approvePr)}/signal`, {
+        await api(`/api/tasks/${encodeURIComponent(id)}/signal`, {
           method: 'POST',
           body: JSON.stringify({ signal: 'confirm' }),
         });
-        toast(`Approved ${btn.dataset.branch}`);
       } catch (e) {
-        btn.disabled = false;
+        delete S.prApprovals[id];
+        scheduleTaskPageRender();
         toast(e?.message || 'Could not approve that pull request', true);
       }
     }),
@@ -11913,23 +11917,22 @@ function forkSourcesSection(v) {
   </section>`;
 }
 
-// The branches a multi-PR task is opening pull requests for (SPEC §11.1). Each
-// row says where its branch's newest pull request is and links to it; a pull
-// request of its own (software-dev ≥1.30) is approved right in its row. The
-// task's own proposal has one approval for all its branches: Confirm PR.
-// Where a branch's pull request (its sub-task, software-dev ≥1.30) is:
-// [label, chip tone, approvable here].
-function branchPullRequestState(view, lane) {
+// Where a branch's pull request (its own record, software-dev ≥1.30) is:
+// [label, chip tone, approvable here]. A tone with `live` is a step under way,
+// shown moving until it lands. `approved`: this page just approved it, before
+// the record says so.
+function branchPullRequestState(view, lane, approved) {
   if (lane.state === 'landed') return ['Landed', 'done', false];
   if (lane.state !== 'open') return ['Closed', 'cancelled', false];
-  if (!view) return ['Opening', 'active', false];
+  if (!view) return ['Opening', 'active live', false];
   if (view.status === 'done' || view.stage === 'done') return ['Landed', 'done', false];
   if (view.status === 'cancelled' || view.status === 'failed') return ['Closed', 'cancelled', false];
-  if (view.stage === 'review' && view.waitingFor?.kind === 'human') return ['In review', 'waiting', true];
+  if (view.stage === 'merge' || view.stage === 'resolve') return ['Landing', 'active live', false];
+  if (view.stage === 'review' && approved) return ['Approved', 'active live', false];
+  if (view.stage === 'review') return ['In review', 'waiting', view.waitingFor?.kind === 'human'];
   if (view.waitingFor?.kind === 'parent') return ['Changes requested', 'waiting', false];
-  if (view.stage === 'merge') return ['Landing', 'active', false];
   if (view.stage === 'escalated' || view.status === 'blocked') return ['Needs attention', 'blocked', false];
-  return ['Opening', 'active', false];
+  return ['Opening', 'active live', false];
 }
 
 // A task's pull requests (software-dev ≥1.30): its run's record of them, and
@@ -11950,38 +11953,62 @@ function pullRequestLanes(v) {
   return { all, latest: new Map(all.map((lane) => [lane.checkout, lane])) };
 }
 
+// Each branch's newest pull request of its own (software-dev ≥1.30), with
+// where it is. The task's own proposal of a branch comes after every pull
+// request of its own settled, so one there is the newest (pramana#102).
+function pullRequestRows(v) {
+  const shipped = pullRequestLanes(v).latest;
+  const summaries = new Map((v.subTaskSummaries || []).map((summary) => [summary.id, summary]));
+  const prOf = (checkout) => (v.checkouts || []).find((c) => c.name === checkout)?.pr;
+  return [...shipped.values()].filter((lane) => lane.state === 'open' || !prOf(lane.checkout)).map((lane) => {
+    const rec = summaries.get(lane.childTaskId) || taskRecord(lane.childTaskId);
+    const view = rec?.lastView;
+    // This page's approval holds until the record has moved on from Review.
+    if (view && view.stage !== 'review') delete S.prApprovals?.[lane.childTaskId];
+    const [label, tone, approvable] = branchPullRequestState(view, lane, !!S.prApprovals?.[lane.childTaskId]);
+    const detail = view?.waitingFor?.summary || view?.waitingFor?.detail || '';
+    return { lane, rec, label, tone, approvable, detail, pr: summaries.get(lane.childTaskId)?.pullRequest?.pr };
+  });
+}
+
+// A pull request's link to the provider, and its state chip.
+function pullRequestLink(pr) {
+  return pr ? `<a class="pr-link ${pr.merged ? 'merged' : pr.state === 'closed' ? 'closed' : 'open'}"
+    href="${esc(safeHref(pr.url))}" target="_blank" rel="noopener">⇱ #${pr.number}</a>` : '';
+}
+function pullRequestChip(row) {
+  return `<span class="chip ${esc(row.tone)}"${row.detail ? ` title="${esc(row.detail)}"` : ''}>${esc(row.label)}</span>`;
+}
+function approvePullRequestButton(row, cls = 'btn sm') {
+  return `<button type="button" class="${cls}" data-approve-pr="${esc(row.lane.childTaskId)}" data-branch="${esc(row.lane.checkout)}">Approve</button>`;
+}
+
+// The branches of a task with several (SPEC §11.1), first in its rail: where
+// each one's newest pull request is, linked, approved right in its row when it
+// is a pull request of its own. The task's own proposal has one approval for
+// all its branches: Confirm PR.
 function checkoutsSection(v) {
   const checkouts = v.checkouts || [];
-  // software-dev ≥1.30: each branch's pull request is part of the task, opened
-  // whenever the agent is ready. Its row says where that pull request is, links
-  // to it, and approves it right here while it waits for a reviewer.
-  const shipped = pullRequestLanes(v).latest;
+  const own = new Map(pullRequestRows(v).map((row) => [row.lane.checkout, row]));
   // One branch without a pull request of its own: `branch`/`prs` already say it all.
-  if (!checkouts.length || (checkouts.length < 2 && !shipped.size)) return '';
-  const summaries = new Map((v.subTaskSummaries || []).map((summary) => [summary.id, summary]));
+  if (!checkouts.length || (checkouts.length < 2 && !own.size)) return '';
   const rows = checkouts.map((c) => {
-    const lane = shipped.get(c.name);
-    // The task's own proposal of a branch comes after every pull request of
-    // its own settled, so a pull request there is the newest (pramana#102).
-    if (lane && (lane.state === 'open' || !c.pr)) {
-      const rec = summaries.get(lane.childTaskId) || taskRecord(lane.childTaskId);
-      const [label, tone, approvable] = branchPullRequestState(rec?.lastView, lane);
-      return `<div class="checkout-row ${lane.state === 'landed' ? 'landed' : ''}" data-branch-state="${esc(label)}">
-      <span class="checkout-mark">${lane.state === 'landed' ? '✓' : ''}</span>
+    const row = own.get(c.name);
+    if (row) {
+      const landed = row.label === 'Landed';
+      return `<div class="checkout-row ${landed ? 'landed' : ''}" data-branch-state="${esc(row.label)}">
+      <span class="checkout-mark">${landed ? '✓' : ''}</span>
       <b>${esc(c.name)}</b>
       <span class="mono" style="color:var(--ink-3)">⎇ ${esc(c.branch)}</span>
-      <span style="color:var(--ink-3)">→ ${esc(lane.target)}</span>
+      <span style="color:var(--ink-3)">→ ${esc(row.lane.target)}</span>
       <span style="flex:1"></span>
-      <span class="chip ${esc(tone)}">${esc(label)}</span>
-      <a class="btn sm ghost" data-open="${esc(lane.childTaskId)}" data-spa href="${esc(taskUrl(lane.childTaskId, rec))}" title="Its Review and landing">Open</a>
-      ${approvable ? `<button type="button" class="btn sm" data-approve-pr="${esc(lane.childTaskId)}" data-branch="${esc(c.name)}">Approve</button>` : ''}
+      ${pullRequestChip(row)}
+      ${pullRequestLink(row.pr)}
+      <a class="btn sm ghost" data-open="${esc(row.lane.childTaskId)}" data-spa href="${esc(taskUrl(row.lane.childTaskId, row.rec))}" title="Its Review and landing">Open</a>
+      ${row.approvable ? approvePullRequestButton(row) : ''}
     </div>`;
     }
     const dest = c.stackedOn ? `on ${c.stackedOn}` : `→ ${c.target || v.targetBranch || 'target'}`;
-    const pr = c.pr
-      ? `<a class="pr-link ${c.pr.merged ? 'merged' : c.pr.state === 'closed' ? 'closed' : 'open'}"
-           href="${esc(safeHref(c.pr.url))}" target="_blank" rel="noopener">⇱ #${c.pr.number}</a>`
-      : '';
     const [label, tone] = proposalState(v, c);
     return `<div class="checkout-row ${label === 'Landed' ? 'landed' : ''}"${label ? ` data-branch-state="${esc(label)}"` : ''}>
       <span class="checkout-mark">${label === 'Landed' ? '✓' : ''}</span>
@@ -11990,11 +12017,30 @@ function checkoutsSection(v) {
       <span style="color:var(--ink-3)">${esc(dest)}</span>
       <span style="flex:1"></span>
       ${label ? `<span class="chip ${esc(tone)}">${esc(label)}</span>` : ''}
-      ${pr}
+      ${pullRequestLink(c.pr)}
     </div>`;
   }).join('');
   return `<div class="section-h">Branches</div>
     <div class="card checkout-list">${rows}</div>`;
+}
+
+// Pull requests that want a person now, or were just approved and are on
+// their way: what the conversation shows as boxes to act on.
+function pullRequestAsks(v) {
+  return pullRequestRows(v).filter((row) => row.approvable || row.label === 'Approved' || row.label === 'Landing');
+}
+
+// Each pull request of its own waiting to be approved, as a small box at the
+// end of the conversation; approved, it stays to show it landing, then goes.
+function conversationPullRequestAsks(v) {
+  const asks = pullRequestAsks(v);
+  return asks.length ? `<div class="pr-asks" id="task-pr-asks">${asks.map((row) => `<div class="pr-ask" data-branch-state="${esc(row.label)}">
+      <b>${esc(row.lane.checkout)}</b>
+      <span class="pr-ask-target">→ ${esc(row.lane.target)}</span>
+      ${pullRequestLink(row.pr)}
+      <a class="btn sm ghost" data-open="${esc(row.lane.childTaskId)}" data-spa href="${esc(taskUrl(row.lane.childTaskId, row.rec))}" title="Its Review: what it changes">Open</a>
+      ${row.approvable ? approvePullRequestButton(row, 'btn sm primary') : pullRequestChip(row)}
+    </div>`).join('')}</div>` : '';
 }
 
 // Where a branch of the task's own proposal is, from its pull request and the
@@ -12025,9 +12071,9 @@ function taskRail(v, rec = taskRecord(v.taskId)) {
   ].filter(Boolean).join('');
   const attempts = S.attemptGroup?.attempts?.length || 0;
   return `<div class="rail-inner">
+    ${checkoutsSection(v)}
     ${attempts > 1 ? section('Attempts', taskAttempts(v)) : attempts === 1 ? `<div class="rail-sec rail-new-attempt">${addAttemptButton('rail-link')}</div>` : ''}
     ${subTasksSection(v)}
-    ${checkoutsSection(v)}
     ${forkSourcesSection(v)}
     ${agentForksSection(v)}
     ${section('', `${meta ? `<div class="rail-meta">${meta}</div>` : ''}${rec ? orgEditorHtml(rec) : ''}`)}
@@ -12317,7 +12363,7 @@ function conversationPane(v, t) {
         ${conversationFullscreenButton()}
       </div>
     </div>
-    <div class="ck-thread" id="ck-thread" data-task-id="${esc(v.taskId)}" data-role="${esc(t.role)}" tabindex="-1"><div class="thread">${msgs}${live}${conversationWaitNotice(v)}${conversationError(v)}${conversationApprovalRequests()}${conversationReviewInfo(v, resourceRequestIndex >= 0)}</div></div>
+    <div class="ck-thread" id="ck-thread" data-task-id="${esc(v.taskId)}" data-role="${esc(t.role)}" tabindex="-1"><div class="thread">${msgs}${live}${conversationWaitNotice(v)}${conversationError(v)}${conversationApprovalRequests()}${conversationPullRequestAsks(v)}${conversationReviewInfo(v, resourceRequestIndex >= 0)}</div></div>
     ${fu}`;
 }
 
@@ -19289,14 +19335,13 @@ async function wirePaidLaunchCard() {
       <label class="form-row">DPA email<input class="paid-email-dpa" type="email" value="${esc(contacts.dpa || '')}" /></label>
       <label class="form-row">Billing email<input class="paid-email-billing" type="email" value="${esc(contacts.billing || '')}" /></label>
     </div>
-    <label class="card" style="display:flex;gap:10px;padding:12px;margin-top:14px"><input type="checkbox" class="paid-founder-reviewed" ${state.founderReviewed ? 'checked' : ''} /><span><b>I reviewed and approved policy version ${esc(state.policyVersion)}</b><span class="task-sub" style="display:block">This records founder approval; it is not a substitute for legal advice.</span></span></label>
 
     <div class="section-h" style="margin-top:22px">Real-world founder checklist</div>
     <p class="task-sub">These items happen outside ${siteNameMarkup()}. Check them off here to keep one durable launch record; the checkboxes are guidance and do not falsely claim that ${siteNameMarkup()} verified the work.</p>
     ${taskMarkup}
 
     <div class="card" style="margin-top:18px;padding:14px;border-color:${state.paidLaunch ? 'var(--ok,#4ec9a3)' : 'var(--line)'}">
-      <label style="display:flex;gap:10px;align-items:flex-start"><input type="checkbox" class="paid-launch-enabled" ${state.paidLaunch ? 'checked' : ''} ${state.canEnable || state.paidLaunch ? '' : 'disabled'} /><span><b>Enable real paid checkout</b><span class="task-sub" style="display:block">Requires completed legal and live billing setup. Disabling closes new checkout without deleting existing subscriptions.</span></span></label>
+      <label style="display:flex;gap:10px;align-items:flex-start"><input type="checkbox" class="paid-launch-enabled" ${state.paidLaunch ? 'checked' : ''} ${state.canEnable || state.paidLaunch ? '' : 'disabled'} /><span><b>Enable real paid checkout</b><span class="task-sub" style="display:block">Requires completed legal and live billing setup, and publishes the policies as yours: each later version takes effect when it deploys. Disabling closes new checkout without deleting existing subscriptions.</span></span></label>
     </div>
     <button class="btn primary paid-launch-save" style="margin-top:14px" ${state.canManage ? '' : 'disabled'} data-unsaved-save>Save paid-launch setup</button>
     ${state.source === 'environment-bootstrap' ? '<p class="task-sub">Legacy environment values may currently be supplying some fields. Saving this form moves the editable configuration into Installation settings; saved values take precedence.</p>' : ''}`;
@@ -19315,7 +19360,6 @@ async function wirePaidLaunchCard() {
           storagePackPriceId: box.querySelector('.paid-paddle-storage-pack-price').value,
         },
         paidLaunch: box.querySelector('.paid-launch-enabled').checked,
-        founderReviewed: box.querySelector('.paid-founder-reviewed').checked,
         operatorName: box.querySelector('.paid-operator-name').value,
         operatorCountry: box.querySelector('.paid-operator-country').value,
         governingLaw: box.querySelector('.paid-governing-law').value,

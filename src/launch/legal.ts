@@ -1,16 +1,16 @@
 /**
  * Launch-policy source of truth.
  *
- * This copy is a launch draft pending operator approval, not legal advice. Keep
- * the version beside the text: acceptance evidence is useful only when it can be
+ * This copy is a draft until the operator opens paid checkout, and is not legal
+ * advice. Keep the version beside the text: acceptance evidence is useful only when it can be
  * tied to the exact disclosure a person saw.
  */
 import { COMPUTE_PACK, COMPUTE_PRICE_MULTIPLIER, COMPUTE_TERMS, HOSTED_PLANS, STORAGE_PACK } from '../domain/entitlements.js';
 import { DEFAULT_SITE_NAME } from '../domain/brand.js';
 
-export const POLICY_VERSION = '2026-10-22.1';
+export const POLICY_VERSION = '2026-10-22.2';
 export const POLICY_EFFECTIVE_DATE = 'October 22, 2026';
-export const POLICY_DRAFT_NOTICE = 'Launch draft pending final operator approval — not legal advice or a statement of completed legal review.';
+export const POLICY_DRAFT_NOTICE = 'Launch draft: these terms take effect when the operator opens paid checkout. Not legal advice or a statement of completed legal review.';
 
 export type PolicySlug = 'terms' | 'acceptable-use' | 'privacy' | 'billing' | 'subprocessors' | 'security' | 'data' | 'dpa';
 export type AcceptanceContext = 'signup' | 'checkout';
@@ -52,7 +52,7 @@ const docs: Record<PolicySlug, Omit<PolicyDocument, 'version' | 'effectiveDate'>
       { heading: 'Disclaimers and unresolved legal terms', paragraphs: [
         'To the extent permitted by the law selected in the completed launch configuration, the service is provided as available and without promises not expressly made here. No compliance certification is claimed by this draft.',
         'Nothing in these Terms excludes mandatory consumer rights, liability for fraud or fraudulent misrepresentation, or liability for death or personal injury caused by negligence where that liability cannot lawfully be excluded. Any choice of governing law or courts is subject to the protections and courts available to consumers under mandatory applicable law.',
-        'The launch checklist fails closed on the contracting entity, governing law, legal-notice address, contacts, and founder review of this exact version. Billing provider configuration is validated separately by the canonical organization subscription service. This draft does not invent a liability cap or dispute forum; qualified counsel should decide whether the final terms require those or other additions, which must ship as a new version.',
+        'The launch checklist fails closed on the contracting entity, governing law, legal-notice address and contacts. Billing provider configuration is validated separately by the canonical organization subscription service. This draft does not invent a liability cap or dispute forum; qualified counsel should decide whether the final terms require those or other additions, which must ship as a new version.',
       ] },
     ],
   },
@@ -223,7 +223,7 @@ const docs: Record<PolicySlug, Omit<PolicyDocument, 'version' | 'effectiveDate'>
       ] },
       { heading: 'Evidence, audits and contact', paragraphs: [
         'The operator will make available information necessary to demonstrate compliance with these processing obligations and allow and contribute to audits and inspections by the customer or its appointed auditor. The parties will coordinate proportionate arrangements that protect other customers’ confidentiality and service security, without excluding mandatory audit rights.',
-        'Use the DPA contact on this page for deployment details, processing instructions, objections and audit arrangements. A separately negotiated processing agreement may supplement or replace this Addendum when expressly agreed. This launch draft remains subject to the operator-approval gate; its publication does not claim that every operational prerequisite has been verified.',
+        'Use the DPA contact on this page for deployment details, processing instructions, objections and audit arrangements. A separately negotiated processing agreement may supplement or replace this Addendum when expressly agreed. Its publication does not claim that every operational prerequisite has been verified.',
       ] },
     ],
   },
@@ -276,15 +276,12 @@ export interface LaunchConfig {
   governingLaw?: string;
   legalNoticeAddress?: string;
   contacts: { legal?: string; privacy?: string; security?: string; incident?: string; dpa?: string; billing?: string };
-  /** The operator approved this exact policy version, so the policies are no longer drafts. */
-  policyApproved: boolean;
   missing: string[];
   ready: boolean;
 }
 
 export interface StoredLaunchConfig {
   paidLaunch?: boolean;
-  founderReviewedPolicyVersion?: string;
   operatorName?: string;
   operatorCountry?: string;
   governingLaw?: string;
@@ -297,7 +294,6 @@ export interface StoredLaunchConfig {
  * normal hosted setup is persisted and editable in Installation settings. */
 export function launchConfig(env: NodeJS.ProcessEnv = process.env, stored?: StoredLaunchConfig): LaunchConfig {
   const storedValues: Record<string, string | undefined> = {
-    KARMAX_FOUNDER_REVIEWED_POLICY_VERSION: stored?.founderReviewedPolicyVersion,
     KARMAX_LEGAL_ENTITY_NAME: stored?.operatorName,
     KARMAX_LEGAL_ENTITY_COUNTRY: stored?.operatorCountry,
     KARMAX_GOVERNING_LAW: stored?.governingLaw,
@@ -319,9 +315,7 @@ export function launchConfig(env: NodeJS.ProcessEnv = process.env, stored?: Stor
     security: email('KARMAX_SECURITY_EMAIL'), incident: email('KARMAX_INCIDENT_EMAIL'),
     dpa: email('KARMAX_DPA_EMAIL'), billing: email('KARMAX_BILLING_EMAIL'),
   };
-  const policyApproved = value('KARMAX_FOUNDER_REVIEWED_POLICY_VERSION') === POLICY_VERSION;
   const required: Array<[string, unknown]> = [
-    ['KARMAX_FOUNDER_REVIEWED_POLICY_VERSION', policyApproved ? POLICY_VERSION : undefined],
     ['KARMAX_LEGAL_ENTITY_NAME', value('KARMAX_LEGAL_ENTITY_NAME')],
     ['KARMAX_LEGAL_ENTITY_COUNTRY', value('KARMAX_LEGAL_ENTITY_COUNTRY')],
     ['KARMAX_GOVERNING_LAW', value('KARMAX_GOVERNING_LAW')],
@@ -335,7 +329,7 @@ export function launchConfig(env: NodeJS.ProcessEnv = process.env, stored?: Stor
     paidLaunch: stored?.paidLaunch ?? value('KARMAX_PAID_LAUNCH') === '1',
     operatorName: value('KARMAX_LEGAL_ENTITY_NAME'), operatorCountry: value('KARMAX_LEGAL_ENTITY_COUNTRY'),
     governingLaw: value('KARMAX_GOVERNING_LAW'), legalNoticeAddress: value('KARMAX_LEGAL_NOTICE_ADDRESS'), contacts,
-    policyApproved, missing, ready: missing.length === 0,
+    missing, ready: missing.length === 0,
   };
 }
 
@@ -344,8 +338,9 @@ export function publicLaunchInfo(env: NodeJS.ProcessEnv = process.env, stored?: 
   const config = launchConfig(env, stored);
   return {
     policyVersion: POLICY_VERSION, effectiveDate: POLICY_EFFECTIVE_DATE,
-    // Only until the operator approves this exact version; a new version is a draft again.
-    draftNotice: config.policyApproved ? undefined : POLICY_DRAFT_NOTICE,
+    // Opening paid checkout is the operator adopting the policies, once: a new
+    // version takes effect on its deploy, with no further approval.
+    draftNotice: config.paidLaunch ? undefined : POLICY_DRAFT_NOTICE,
     policies: POLICY_SLUGS.map((slug) => ({ slug, title: docs[slug].title,
       summary: withSiteName(docs[slug].summary, siteName), version: POLICY_VERSION })),
     acceptance: { signup: policyVersions('signup'), checkout: policyVersions('checkout') },

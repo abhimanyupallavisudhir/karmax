@@ -4,7 +4,6 @@ import type { Browser, Page } from 'playwright';
 import { hostedGateway, launchChromium, openConsole, signIn, type HostedGateway } from './helpers/browser.js';
 import { WorldProviderConnectionService } from '../src/world/connections.js';
 import { PaidLaunchSettingsService } from '../src/launch/settings.js';
-import { POLICY_VERSION } from '../src/launch/legal.js';
 import { PaddleSubscriptionProvider } from '../src/billing/paddle.js';
 import { SubscriptionBillingService } from '../src/billing/subscriptions.js';
 
@@ -14,7 +13,7 @@ const PADDLE = { environment: 'live', apiKey: 'pdl_live_apikey_journey', webhook
   teamSeatPriceId: `pri_${'s'.repeat(26)}`, storagePackPriceId: `pri_${'p'.repeat(26)}` } as const;
 // An operator ready for paid launch: reviewed policies and published contacts.
 const LAUNCH_ENV = {
-  KARMAX_FOUNDER_REVIEWED_POLICY_VERSION: POLICY_VERSION, KARMAX_LEGAL_ENTITY_NAME: 'Journey Operator Ltd',
+  KARMAX_LEGAL_ENTITY_NAME: 'Journey Operator Ltd',
   KARMAX_LEGAL_ENTITY_COUNTRY: 'United Kingdom', KARMAX_GOVERNING_LAW: 'England and Wales',
   KARMAX_LEGAL_NOTICE_ADDRESS: '1 Journey Street, London',
   ...Object.fromEntries(['LEGAL', 'PRIVACY', 'SECURITY', 'INCIDENT', 'DPA', 'BILLING']

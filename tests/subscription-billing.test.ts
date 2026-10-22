@@ -17,7 +17,7 @@ import { ContributionRegistry } from '../src/contrib/registry.js';
 import { Overlays } from '../src/store/overlays.js';
 import { WorldRegistry } from '../src/world/registry.js';
 import { findFreePortFrom } from '../src/util/ports.js';
-import { POLICY_VERSION, policyVersions } from '../src/launch/legal.js';
+import { policyVersions } from '../src/launch/legal.js';
 
 const event = (id: string, type: string, object: any, created = 100) =>
   Buffer.from(JSON.stringify({ id, type, created, data: { object } }));
@@ -495,7 +495,7 @@ describe('subscription administration HTTP authorization', () => {
     provider = new FakeSubscriptionProvider();
     billing = new SubscriptionBillingService(store, provider, true);
     const launchEnv = {
-      KARMAX_PAID_LAUNCH: '1', KARMAX_FOUNDER_REVIEWED_POLICY_VERSION: POLICY_VERSION,
+      KARMAX_PAID_LAUNCH: '1',
       KARMAX_LEGAL_ENTITY_NAME: 'Configured Operator', KARMAX_LEGAL_ENTITY_COUNTRY: 'Configured Country',
       KARMAX_GOVERNING_LAW: 'Configured Law', KARMAX_LEGAL_NOTICE_ADDRESS: 'Configured Notice Address',
       KARMAX_LEGAL_EMAIL: 'legal@example.test', KARMAX_PRIVACY_EMAIL: 'privacy@example.test',

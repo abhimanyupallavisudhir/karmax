@@ -6,7 +6,6 @@ import { CredentialBroker } from '../src/autonomy/broker.js';
 import { Vault } from '../src/autonomy/vault.js';
 import { StripeSubscriptionProvider } from '../src/billing/subscriptions.js';
 import { STRIPE_BILLING_API_VERSION, STRIPE_BILLING_WEBHOOK_EVENTS } from '../src/billing/stripe-contract.js';
-import { POLICY_VERSION } from '../src/launch/legal.js';
 import { FOUNDER_TASKS, PAID_LAUNCH_SETTINGS_KEY, PaidLaunchSettingsService,
   SUBSCRIPTION_STRIPE_SECRET_HANDLE, SUBSCRIPTION_STRIPE_WEBHOOK_HANDLE } from '../src/launch/settings.js';
 import { Store } from '../src/store/db.js';
@@ -23,7 +22,7 @@ const harness = async () => {
 afterEach(() => { for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
 
 const complete = (enabled = true) => ({
-  paidLaunch: enabled, founderReviewed: true,
+  paidLaunch: enabled,
   operatorName: 'Krmax Labs Ltd', operatorCountry: 'United Kingdom',
   governingLaw: 'Laws of England and Wales; courts of England and Wales',
   legalNoticeAddress: '1 Example Street, London',
@@ -41,13 +40,12 @@ describe('installation paid-launch settings', () => {
     try {
       await service.configure(complete(), 'https://krmax.test');
       await service.configure({ contacts: { billing: 'new@krmax.test' }, stripe: { teamSeatPriceId: 'price_new' } }, 'https://krmax.test');
-      expect(await service.stored()).toMatchObject({ paidLaunch: true, founderReviewedPolicyVersion: POLICY_VERSION,
+      expect(await service.stored()).toMatchObject({ paidLaunch: true,
         operatorName: 'Krmax Labs Ltd', contacts: { billing: 'new@krmax.test', legal: 'legal@krmax.test' },
         stripe: { individualPriceId: 'price_individual', teamSeatPriceId: 'price_new' } });
-      await service.configure({ paidLaunch: false, founderReviewed: false, operatorName: '' }, 'https://krmax.test');
+      await service.configure({ paidLaunch: false, operatorName: '' }, 'https://krmax.test');
       expect(await service.stored()).toMatchObject({ paidLaunch: false });
       expect((await service.stored()).operatorName).toBeUndefined();
-      expect((await service.stored()).founderReviewedPolicyVersion).toBeUndefined();
     } finally { await store.close(); }
   });
 
@@ -111,7 +109,7 @@ describe('installation paid-launch settings', () => {
     const { store, broker, service } = (await harness());
     const result = (await service.configure(complete(), 'https://krmax.test'));
     expect(result).toMatchObject({ paidLaunch: true, ready: true, canEnable: true,
-      founderReviewed: true, completedTasks: ['business-structure', 'stripe-account'],
+      completedTasks: ['business-structure', 'stripe-account'],
       stripe: { configured: true, secretKeyConfigured: true, webhookSecretConfigured: true,
         webhookUrl: 'https://krmax.test/api/subscriptions/webhook', apiVersion: STRIPE_BILLING_API_VERSION,
         webhookEvents: STRIPE_BILLING_WEBHOOK_EVENTS } });
@@ -122,13 +120,26 @@ describe('installation paid-launch settings', () => {
     expect(await broker.hasHandle(SUBSCRIPTION_STRIPE_WEBHOOK_HANDLE)).toBe(true);
     expect((await service.publicLaunchInfo())).toMatchObject({ paidLaunch: true, ready: true,
       operator: { name: 'Krmax Labs Ltd', country: 'United Kingdom' } });
-    expect((await service.stored()).founderReviewedPolicyVersion).toBe(POLICY_VERSION);
+    expect(result).not.toHaveProperty('founderReviewed');
+    expect(result.missing).toEqual([]);
     (await store.close());
+  });
+
+  it('keeps checkout open across a policy version change: there is no per-version approval', async () => {
+    const { store, service } = (await harness());
+    try {
+      // Settings saved by a release that still had approvals: an approval of an older version.
+      (await store.kvSet(PAID_LAUNCH_SETTINGS_KEY, JSON.stringify({ ...complete(false), stripe: undefined, founderReviewedPolicyVersion: '2026-01-01.1' })));
+      const status = (await service.configure(complete(), 'https://krmax.test'));
+      expect(status).toMatchObject({ paidLaunch: true, ready: true, canEnable: true, missing: [] });
+      expect((await service.publicLaunchInfo()).draftNotice).toBeUndefined();
+      expect((await service.stored())).not.toHaveProperty('founderReviewedPolicyVersion');
+    } finally { (await store.close()); }
   });
 
   it('saves an incomplete draft but refuses to enable checkout', async () => {
     const { store, service } = (await harness());
-    await expect((async () => (await service.configure({ paidLaunch: true, operatorName: 'Draft' }, 'https://krmax.test')))()).rejects.toThrow(/cannot be enabled.*Founder approval.*Stripe secret key/i);
+    await expect((async () => (await service.configure({ paidLaunch: true, operatorName: 'Draft' }, 'https://krmax.test')))()).rejects.toThrow(/cannot be enabled yet: Country of establishment.*Stripe secret key/i);
     expect((await service.status('https://krmax.test'))).toMatchObject({ paidLaunch: false, canEnable: false,
       operatorName: 'Draft' });
     (await store.close());

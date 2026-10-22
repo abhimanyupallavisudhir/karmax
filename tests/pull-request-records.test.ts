@@ -57,5 +57,13 @@ describe.each(storeBackends)('pull requests of a task ($name)', ({ open }) => {
     // …and says which of its pull requests asks it, so a list can tell that
     // apart from the task itself waiting for Review (pramana#102).
     expect(asks.get(parent.id)?.pullRequests).toEqual([{ checkout: 'docs', kind: 'review-requested' }]);
+
+    // Its task's page links the pull request it opened and lands where it says.
+    await store.saveView(pr.id, { ...next, targetBranch: 'main',
+      prs: [{ repo: 'docs', number: 86, url: 'https://github.com/o/docs/pull/86', state: 'open' }] },
+    undefined, undefined, undefined, { lifecycleEvent: false });
+    const opened = (await store.childTaskSummaries(parent.id)).find((summary) => summary.id === pr.id);
+    expect(opened?.pullRequest).toEqual({ checkout: 'docs', target: 'main',
+      pr: { number: 86, url: 'https://github.com/o/docs/pull/86', state: 'open' } });
   });
 });

@@ -38,7 +38,7 @@ function setup(api) {
     waitingText: () => 'Waiting', liveRoleFor: () => 'do', conversationPresence: () => ({ tone: 'waiting', label: 'Waiting' }),
     conversationEntries: () => [], subTasksSection: () => '', forkSourcesSection: () => '', agentForksSection: () => '',
     checkoutsSection: () => '', renderWidgetGroups: () => '', notesSection: () => '',
-    conversationApprovalRequests: () => '', taskTranscripts: () => [{ role: 'do' }],
+    conversationApprovalRequests: () => '', conversationPullRequestAsks: () => '', taskTranscripts: () => [{ role: 'do' }],
     parametersTab: () => 'parameters', timingTab: () => 'timing',
   });
   vm.runInContext(`${freshness}\n${tabs}\n${wire}`, context);

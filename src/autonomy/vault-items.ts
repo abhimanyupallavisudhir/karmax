@@ -1044,6 +1044,22 @@ export class VaultItems {
     });
   }
 
+  /** Ignore every request of a task still asking, as `dismiss` does one: the
+   *  task settled, so no decision can reach it. Returns those it ignored. */
+  async ignoreTaskRequests(taskId: string, by: string): Promise<CredentialAccessRequest[]> {
+    return this.store.transaction(async () => {
+      await this.lockVault();
+      const all = (await this.requests());
+      const ignored = all.filter((r) => r.taskId === taskId && r.status === 'pending' && !r.dismissed);
+      if (!ignored.length) return [];
+      for (const req of ignored) req.dismissed = { by, at: Date.now() };
+      (await this.saveRequests(all));
+      for (const req of ignored)
+        (await this.store.appendAudit({ principalId: by, action: 'vault.request.dismissed', detail: { requestId: req.id, taskId } }));
+      return ignored;
+    });
+  }
+
   /** Write a key to a 0600 file for this turn and return its path. */
   private async materializeKey(item: VaultItem, ctx: { taskId?: string }, keys?: World | string): Promise<string> {
     if (!keys) throw new Error('no turn directory for key files');

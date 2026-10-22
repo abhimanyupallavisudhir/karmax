@@ -6,6 +6,7 @@ import type { Store } from '../store/db.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import { INSTALLATION_SCOPE, organizationScope } from '../autonomy/vault-keys.js';
 import { newId } from '../util/id.js';
+import { CONNECTION_PREFIX as PREFIX, OPEN_CONNECTION as OPEN } from './connection-requests.js';
 import { delegatingAncestors } from '../platform/delegation.js';
 import { beginOAuth, finishOAuth, connectionHeaders, leasedOAuthRefresh, type OAuthVault, type OAuthTarget } from '../mcp/connections/oauth.js';
 import { RefreshLeases } from '../autonomy/refresh-lease.js';
@@ -13,12 +14,9 @@ import { authorizesWithGitHub, openRemoteMcp, remoteMcpAuth, type RemoteMcpTrans
 import { registryServer } from '../mcp/connections/registry.js';
 import { validateTransport } from '../mcp/connections/store.js';
 
-const PREFIX = 'service-connection:';
 const MCP_CREDENTIALS = 'service-connection-mcp:';
 const KEY = 'service-connections:composio:api-key';
 const TTL = 30 * 60_000;
-/** A request still waiting on a person: before sign-in, or during it. */
-const OPEN: ServiceConnection['status'][] = ['requested', 'connecting'];
 export interface ServiceConnection {
   id: string;
   organizationId: string;
