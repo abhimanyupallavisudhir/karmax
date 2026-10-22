@@ -3,6 +3,7 @@ import { PermissionRequests } from './permission-requests.js';
 import { AuthorizationRequests } from './authorization-requests.js';
 import { VaultItems } from '../autonomy/vault-items.js';
 import { CONNECTION_PREFIX, OPEN_CONNECTION, ignoreTaskConnectionRequests } from '../integrations/connection-requests.js';
+import { tasksWithPendingRepositoryAccess, withdrawRepositoryAccessRequests } from '../integrations/repository-access.js';
 
 /** Who ignored a request whose task settled. */
 export const TASK_SETTLED = 'system:task-settled';
@@ -26,6 +27,9 @@ export async function settleTaskRequests(store: Store, organizationId: string, t
   for (const request of (await new PermissionRequests(store, organizationId).withdrawForTask(taskId, reason)))
     (await store.appendEvent({ taskId, type: 'permission.approval-resolved', ts: Date.now(),
       payload: { requestId: request.id, action: 'withdraw', reason } }));
+  for (const request of (await withdrawRepositoryAccessRequests(store, organizationId, taskId)))
+    (await store.appendEvent({ taskId, type: 'repository-access.approval-resolved', ts: Date.now(),
+      payload: { requestId: request.id, action: 'withdraw', reason } }));
   for (const request of (await new VaultItems(store, undefined, undefined, organizationId).ignoreTaskRequests(taskId, TASK_SETTLED)))
     (await store.appendEvent({ taskId, type: 'credential.approval-dismissed', ts: Date.now(), payload: { requestId: request.id } }));
   for (const request of (await new AuthorizationRequests(store, organizationId).ignoreTaskRequests(taskId, TASK_SETTLED))) {
@@ -45,6 +49,7 @@ export async function tasksWithOpenRequests(store: Store): Promise<Set<string>> 
       if (!request.dismissed) tasks.add(request.taskId);
     for (const request of (await new AuthorizationRequests(store, organizationId).requests({ status: 'pending' })))
       if (!request.dismissed && request.target.kind === 'task') tasks.add(request.target.taskId);
+    for (const taskId of (await tasksWithPendingRepositoryAccess(store, organizationId))) tasks.add(taskId);
   }
   for (const { value } of (await store.kvEntries(CONNECTION_PREFIX))) {
     try {

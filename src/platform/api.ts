@@ -70,6 +70,7 @@ import { SHARE_APPS } from '../agent/conversation-shares.js';
 import { hostLocal as deploymentHostLocal } from '../config/deployment.js';
 import { AuthorizationGrantError, LEVEL_AUDIENCES, type AuthorizationGap, type AuthorizationService } from './authorization.js';
 import { PermissionRequests, exactCapability, type PermissionRequest } from './permission-requests.js';
+import { AccessRequestError, RepositoryAccessRequests, type RepositoryAccessRequest } from '../integrations/repository-access.js';
 import { AuthorizationRequests, type AuthorizationRequest } from './authorization-requests.js';
 import { RESOLVE_AGENT_ENABLED } from '../config/features.js';
 import { confirmLayersOf } from '../domain/confirm.js';
@@ -5196,6 +5197,43 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
           .filter((record): record is TaskRecord => !!record);
         return { ...request, task: summary(task), ...(grantors.length ? { grantorTasks: grantors.map(summary) } : {}) };
       });
+  }
+
+  /** A task's requests for GitHub access to a repository its creator cannot see. */
+  async listRepositoryAccessRequests(token: string, input: { organizationId: string; taskId: string }): Promise<RepositoryAccessRequest[]> {
+    const task = (await this.deps.store.getTask(input.taskId));
+    const project = task && (await this.deps.store.getProject(task.projectId));
+    (await this.require(token, 'task:read', { taskId: input.taskId, projectId: task?.projectId, organizationId: input.organizationId }));
+    if (!task || project?.organizationId !== input.organizationId || !this.deps.githubApp) return [];
+    const summary = { id: task.id, ...(task.num != null ? { num: task.num } : {}), title: task.title, projectId: task.projectId };
+    return (await this.repositoryAccess().requests(input.organizationId, { taskId: task.id }))
+      .map((request) => ({ ...request, task: summary }));
+  }
+
+  /** A repository's GitHub admin decides; approval gives access and retries the task. */
+  async resolveRepositoryAccessRequest(token: string,
+    input: { organizationId: string; requestId: string; action: 'approve' | 'deny' | 'dismiss' }): Promise<RepositoryAccessRequest & { retried?: boolean }> {
+    const request = (await this.repositoryAccess().requests(input.organizationId)).find((candidate) => candidate.id === input.requestId);
+    if (!request) throw new NotFoundError(`no GitHub access request ${input.requestId}`);
+    const caller = (await this.require(token, 'task:read', { taskId: request.taskId, projectId: request.projectId, organizationId: input.organizationId }));
+    const userId = caller.humanSubject?.userId;
+    if (!userId) throw new CapabilityError('a person who is an admin of the repository on GitHub decides this request');
+    try {
+      if (input.action === 'dismiss') return await this.repositoryAccess().dismiss({ ...input, userId });
+      return await this.repositoryAccess().resolve({ ...input, action: input.action, userId });
+    } catch (error) {
+      if (!(error instanceof AccessRequestError)) throw error;
+      if (error.status === 403) throw new CapabilityError(error.message);
+      if (error.status === 404) throw new NotFoundError(error.message);
+      throw new ValidationError(error.message);
+    }
+  }
+
+  private repositoryAccess(): RepositoryAccessRequests {
+    if (!this.deps.githubApp) throw new ValidationError('Connect GitHub in organization settings, then try again.');
+    return new RepositoryAccessRequests({ store: this.deps.store, githubApp: this.deps.githubApp,
+      emit: (event) => this.deps.bus?.emit(event),
+      retry: async (taskId) => (await this.workflowHandle(taskId)).signal(SIG.retry) });
   }
 
   async resolvePermissionRequest(

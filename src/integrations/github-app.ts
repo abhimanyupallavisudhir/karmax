@@ -191,6 +191,27 @@ export interface GitHubUserAccount extends GitHubUserIdentity {
   active: boolean;
 }
 
+/** A repository role GitHub's collaborator API accepts, weakest first. */
+export const GITHUB_REPOSITORY_ROLES = ['pull', 'triage', 'push', 'maintain', 'admin'] as const;
+export type GitHubRepositoryRole = typeof GITHUB_REPOSITORY_ROLES[number];
+
+export interface GitHubRepositoryCollaborator { login: string; role: GitHubRepositoryRole }
+export interface GitHubRepositoryInvitation { id: number; login: string; role: GitHubRepositoryRole }
+
+/** Invitations name roles as GitHub's UI does; the collaborator API as REST does. */
+const INVITATION_ROLES: Record<string, GitHubRepositoryRole> = {
+  read: 'pull', triage: 'triage', write: 'push', maintain: 'maintain', admin: 'admin',
+};
+
+function repositoryPath(repository: Repository): string {
+  return `/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.name)}`;
+}
+
+function githubLogin(login: string): string {
+  if (!/^[A-Za-z0-9-]+$/.test(login)) throw new Error('invalid GitHub login');
+  return login;
+}
+
 export type GitHubUserAuthorizationFailureCode =
   | 'refresh_token_missing'
   | 'refresh_token_expired'
@@ -374,6 +395,8 @@ export class GitHubAppService {
   /** Bounds refreshes while an installation owner is still approving a newly
    * requested permission; without this, every landing poll would mint a token. */
   private tokenInvalidatedAt = new Map<string, number>();
+
+  private accountListeners = new Set<(userId: string) => unknown>();
 
   /** User tokens refresh one at a time across processes (GitHub's refresh tokens are single-use). */
   private leases: RefreshLeases;
@@ -591,6 +614,19 @@ export class GitHubAppService {
     (await this.saveUserAccounts(userId, next));
     if (makeActive || !(await this.activeUserAccountId(userId)))
       (await this.store.kvSet(githubUserActiveAccountKey(userId), identity.id));
+    this.accountsChanged(userId);
+  }
+
+  /** Observe a person linking or removing a GitHub account. */
+  onUserAccountsChanged(listener: (userId: string) => unknown): () => void {
+    this.accountListeners.add(listener);
+    return () => this.accountListeners.delete(listener);
+  }
+
+  private accountsChanged(userId: string): void {
+    for (const listener of this.accountListeners) {
+      try { void Promise.resolve(listener(userId)).catch(() => undefined); } catch { /* a listener never fails the link */ }
+    }
   }
 
   /** Public account data needed for the commit byline. A stable GitHub noreply
@@ -751,6 +787,7 @@ export class GitHubAppService {
     (await this.saveUserAccounts(userId, remaining));
     const active = (await this.activeUserAccountId(userId)) ?? remaining[0]!.id;
     (await this.store.kvSet(githubUserActiveAccountKey(userId), active));
+    this.accountsChanged(userId);
     return active;
   }
 
@@ -1459,6 +1496,93 @@ export class GitHubAppService {
     } catch (error) {
       return { synced: false, detail: error instanceof Error ? error.message : String(error) };
     }
+  }
+
+  /** Who can reach a repository directly and how: its owner, collaborators and
+   * (for an organization's repository) members through their teams or base role. */
+  async repositoryCollaborators(repository: Repository): Promise<GitHubRepositoryCollaborator[]> {
+    const token = await this.repositoryAdminToken(repository);
+    const found: GitHubRepositoryCollaborator[] = [];
+    for (let page = 1; page <= 20; page++) {
+      const batch = await this.request<Array<{ login?: string; permissions?: Record<string, boolean> }>>(
+        `${repositoryPath(repository)}/collaborators?affiliation=all&per_page=100&page=${page}`, token);
+      for (const item of batch ?? []) {
+        const role = [...GITHUB_REPOSITORY_ROLES].reverse().find((candidate) => item.permissions?.[candidate]);
+        if (item.login && role) found.push({ login: item.login, role });
+      }
+      if ((batch ?? []).length < 100) break;
+    }
+    return found;
+  }
+
+  async repositoryInvitations(repository: Repository): Promise<GitHubRepositoryInvitation[]> {
+    const token = await this.repositoryAdminToken(repository);
+    const found: GitHubRepositoryInvitation[] = [];
+    for (let page = 1; page <= 20; page++) {
+      const batch = await this.request<Array<{ id?: number; invitee?: { login?: string } | null; permissions?: string }>>(
+        `${repositoryPath(repository)}/invitations?per_page=100&page=${page}`, token);
+      for (const item of batch ?? []) {
+        const role = INVITATION_ROLES[String(item.permissions)];
+        if (Number.isSafeInteger(item.id) && item.invitee?.login && role)
+          found.push({ id: item.id!, login: item.invitee.login, role });
+      }
+      if ((batch ?? []).length < 100) break;
+    }
+    return found;
+  }
+
+  /** Add (or change the role of) a collaborator through the installation, which
+   * needs the App's Repository administration permission. GitHub answers a new
+   * collaborator with an invitation; an existing one is changed in place. */
+  async addRepositoryCollaborator(repository: Repository, login: string, role: GitHubRepositoryRole): Promise<{ invitationId?: number }> {
+    const created = await this.request<{ id?: number } | undefined>(
+      `${repositoryPath(repository)}/collaborators/${encodeURIComponent(githubLogin(login))}`,
+      await this.repositoryAdminToken(repository), { method: 'PUT', body: JSON.stringify({ permission: role }) });
+    return Number.isSafeInteger(created?.id) ? { invitationId: created!.id } : {};
+  }
+
+  /** Accept a repository invitation as the invited person, through the GitHub
+   * account they linked, so they need not find GitHub's e-mail first. */
+  async acceptRepositoryInvitation(userId: string, accountId: string, invitationId: number): Promise<void> {
+    if (!Number.isSafeInteger(invitationId) || invitationId <= 0) throw new Error('invalid GitHub invitation');
+    await this.userRequest(userId, `/user/repository_invitations/${invitationId}`, { method: 'PATCH' }, accountId);
+  }
+
+  /** Accept the person's pending invitation to `slug`, if GitHub holds one:
+   * someone added them as a collaborator and they never clicked the e-mail.
+   * True when there was one to accept. */
+  async acceptPendingRepositoryInvitation(userId: string, accountId: string | undefined, slug: string): Promise<boolean> {
+    for (let page = 1; page <= 10; page++) {
+      const batch = await this.userRequest<Array<{ id?: number; expired?: boolean; repository?: { full_name?: string } }>>(userId,
+        `/user/repository_invitations?per_page=100&page=${page}`, {}, accountId);
+      // GitHub lets an invitation lapse after seven days; only its admins can renew it.
+      const invitation = (batch ?? []).find((item) => !item.expired
+        && item.repository?.full_name?.toLowerCase() === slug.toLowerCase());
+      if (invitation?.id !== undefined) {
+        await this.userRequest(userId, `/user/repository_invitations/${Number(invitation.id)}`, { method: 'PATCH' }, accountId);
+        return true;
+      }
+      if ((batch ?? []).length < 100) break;
+    }
+    return false;
+  }
+
+  /** Remove a collaborator, or withdraw the invitation they have not accepted. */
+  async removeRepositoryCollaborator(repository: Repository, login: string, invitationId?: number): Promise<void> {
+    const token = await this.repositoryAdminToken(repository);
+    if (invitationId !== undefined) {
+      await this.request(`${repositoryPath(repository)}/invitations/${invitationId}`, token, { method: 'DELETE' });
+      return;
+    }
+    await this.request(`${repositoryPath(repository)}/collaborators/${encodeURIComponent(githubLogin(login))}`,
+      token, { method: 'DELETE' });
+  }
+
+  private async repositoryAdminToken(repository: Repository): Promise<string> {
+    if (!repository.gitConnectionId) throw new Error('repository has no GitHub App connection');
+    const connection = (await this.store.getGitConnection(repository.gitConnectionId));
+    if (!connection || connection.organizationId !== repository.organizationId) throw new Error('repository GitHub App connection is missing');
+    return this.installationToken(connection, [repository.providerId ?? '']);
   }
 
   /**

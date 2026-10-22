@@ -118,6 +118,7 @@ import type { CredentialAccessRequest } from '../autonomy/vault-items.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
 import { SETTLES_REQUESTS } from '../platform/settled-requests.js';
 import { AuthorizationRequests } from '../platform/authorization-requests.js';
+import { RepositoryAccessRequests } from '../integrations/repository-access.js';
 import { inheritPersonalGithubProfile } from '../autonomy/git-profiles.js';
 import { actorPrincipal, identityAuditDetail, requireHumanSubject,
   resolveCallerIdentity } from '../platform/identity.js';
@@ -410,6 +411,7 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   if (p === '/api/agent/escalate' || p === '/api/agent/escalation-targets'
     || p === '/api/agent/permission-requests') return 'task:escalate';
   if (p === '/api/permission-requests' || /^\/api\/permission-requests\/[^/]+\/resolve$/.test(p)) return 'task:read';
+  if (p === '/api/repository-access-requests' || /^\/api\/repository-access-requests\/[^/]+\/resolve$/.test(p)) return 'task:read';
   if (p === '/api/agent/notify') return 'task:conversation:message';
   if (p === '/api/agent/collaboration/request'
     || /^\/api\/agent\/collaboration\/[^/]+\/cancel$/.test(p)) return 'task:conversation:message';
@@ -1127,6 +1129,8 @@ export class Gateway {
       if (request.target.kind === 'task') add(request.target.taskId, !!request.dismissed);
     for (const connection of (await this.connections()?.all()) ?? [])
       if (['requested', 'connecting'].includes(connection.status)) add(connection.taskId, !!connection.dismissed);
+    if (this.deps.githubApp) for (const request of (await new RepositoryAccessRequests({ store: this.deps.store, githubApp: this.deps.githubApp })
+      .requests(organizationId, { status: 'pending' }))) add(request.taskId, !!request.dismissed);
     return counts;
   }
 
@@ -6151,6 +6155,25 @@ export class Gateway {
           return this.json(res, error instanceof CapabilityError ? 403 : 400,
             { error: error instanceof Error ? error.message : String(error) });
         }
+      }
+      if (p === '/api/repository-access-requests' && method === 'GET') {
+        const organizationId = String(url.searchParams.get('organizationId') ?? '');
+        const taskId = String(url.searchParams.get('taskId') ?? '');
+        if (!organizationId || !taskId) return this.json(res, 400, { error: 'organizationId and taskId are required' });
+        try { return this.json(res, 200, await api.listRepositoryAccessRequests(token, { organizationId, taskId })); }
+        catch (error) { return this.badRequest(res, error); }
+      }
+      const repositoryAccessResolution = p.match(/^\/api\/repository-access-requests\/([^/]+)\/resolve$/);
+      if (repositoryAccessResolution && method === 'POST') {
+        const organizationId = String(url.searchParams.get('organizationId') ?? '');
+        const action = String((await this.body(req)).action ?? '');
+        if (!organizationId) return this.json(res, 400, { error: 'organizationId is required' });
+        if (action !== 'approve' && action !== 'deny' && action !== 'dismiss')
+          return this.json(res, 400, { error: 'action must be approve | deny | dismiss' });
+        try {
+          return this.json(res, 200, await api.resolveRepositoryAccessRequest(token,
+            { organizationId, requestId: repositoryAccessResolution[1]!, action }));
+        } catch (error) { return this.badRequest(res, error); }
       }
       const permissionResolution = p.match(/^\/api\/permission-requests\/([^/]+)\/resolve$/);
       if (permissionResolution && method === 'POST') {

@@ -4660,7 +4660,8 @@ function inboxEventChanges(ev) {
     || ['task.responsibility-changed', 'task.assigned', 'task.mentioned',
       'credential.approval-requested', 'credential.approval-resolved', 'credential.approval-dismissed',
       'connection.requested', 'connection.resolved', 'connection.dismissed', 'permission.approval-requested', 'permission.approval-resolved', 'permission.approval-dismissed',
-      'authorization.approval-requested', 'authorization.approval-resolved', 'authorization.approval-dismissed'].includes(ev.type);
+      'authorization.approval-requested', 'authorization.approval-resolved', 'authorization.approval-dismissed',
+      'repository-access.approval-requested', 'repository-access.approval-resolved'].includes(ev.type);
 }
 let inboxRefreshTimer;
 function scheduleInboxReload() {
@@ -5061,6 +5062,8 @@ const LIST_RELOAD_EVENTS = new Set([
   'authorization.approval-requested',
   'authorization.approval-resolved',
   'authorization.approval-dismissed',
+  'repository-access.approval-requested',
+  'repository-access.approval-resolved',
 ]);
 
 // view.updated already contains the compact fields shown by list rows. Apply that
@@ -9931,16 +9934,17 @@ function ensureTaskApprovals(taskId, { force = false } = {}) {
   // What the server counted when this read began; refreshTask reloads on any other count.
   const count = S.view?.pendingDecisions || 0;
   const promise = (async () => {
-    const [approvalRequests, permissionRequests, authorizationRequests, connections] = await Promise.all([
+    const [approvalRequests, permissionRequests, authorizationRequests, connections, repositoryAccessRequests] = await Promise.all([
       draft ? [] : api(`/api/vault/requests?${query}`).catch(() => []),
       draft ? [] : api(`/api/permission-requests?${query}`).catch(() => []),
       api(`/api/authorization-requests?${query}`).catch(() => []),
       force ? api(`/api/connections?${query}`).catch(() => undefined) : undefined,
+      draft ? [] : api(`/api/repository-access-requests?${query}`).catch(() => []),
     ]);
     const approvalItems = approvalRequests.length
       ? await api(`/api/vault/items?organizationId=${encodeURIComponent(organizationId || '')}`).catch(() => []) : [];
     if (S.selected !== taskId || S.taskOpenEpoch !== epoch || ensureTaskApprovals.pending?.promise !== promise) return;
-    Object.assign(S, { approvalRequests, permissionRequests, authorizationRequests, approvalItems,
+    Object.assign(S, { approvalRequests, permissionRequests, authorizationRequests, repositoryAccessRequests, approvalItems,
       ...(connections ? { connections } : {}), taskApprovalsFor: taskId, taskApprovalsCount: count });
     scheduleTaskPageRender();
   })().finally(() => { if (ensureTaskApprovals.pending?.promise === promise) ensureTaskApprovals.pending = null; });
@@ -10028,6 +10032,7 @@ async function openTask(taskId, wantTab, explicitAttempt = false) {
   S.connections = [];
   S.permissionRequests = [];
   S.authorizationRequests = [];
+  S.repositoryAccessRequests = [];
   S.approvalItems = [];
   S.taskApprovalsFor = null;
   try {
@@ -10878,9 +10883,11 @@ function approvalHistoryHtml() {
     ${connectionRows(S.connections || [], true)}
     ${permissionRequestRows(S.permissionRequests)}
     ${authorizationRequestRows(S.authorizationRequests || [])}
+    ${repositoryAccessRequestRows(S.repositoryAccessRequests || [])}
     ${credentialRequestRows(S.approvalRequests, S.approvalItems, {
       historyLimit: 20,
-      showEmpty: !S.permissionRequests.length && !(S.authorizationRequests || []).length && !(S.connections || []).length,
+      showEmpty: !S.permissionRequests.length && !(S.authorizationRequests || []).length && !(S.connections || []).length
+        && !(S.repositoryAccessRequests || []).length,
     })}
   </div>`;
 }
@@ -10930,6 +10937,7 @@ function conversationApprovalRequests() {
   const rows = connectionRows(connections, true)
     + permissionRequestRows(pending(S.permissionRequests))
     + authorizationRequestRows(pending(S.authorizationRequests))
+    + repositoryAccessRequestRows(pending(S.repositoryAccessRequests))
     + credentialRequestRows(pending(S.approvalRequests), S.approvalItems, { showEmpty: false });
   return rows ? `<div class="msg agent" id="task-approval-requests"><div class="role">Approval requests</div><div class="approval-list">${rows}</div></div>` : '';
 }
@@ -10945,6 +10953,7 @@ function wireTaskApprovalRequests(v, id = 'task-approval-requests') {
   wireCredentialRequestActions(root, organizationId, refreshAll);
   wirePermissionRequestActions(root, organizationId, refreshAll);
   wireAuthorizationRequestActions(root, organizationId, refreshAll);
+  wireRepositoryAccessRequestActions(root, organizationId, refreshAll);
 }
 
 // Whether renderTaskPage should hand keyboard focus to the scrollable page body.
@@ -19969,6 +19978,49 @@ function authorizationRequestRows(requests, { historyLimit = 20 } = {}) {
       <span>${esc(authorizationSummary(request.authorization, S.projects))}</span>
       <span class="task-sub">${esc(request.resolution?.action || '')}</span></div>`).join('')}</div>` : '';
   return pendingHtml + history;
+}
+
+// A task's creator cannot see a repository on GitHub; its GitHub admins decide.
+function repositoryAccessRequestRows(requests, { historyLimit = 20 } = {}) {
+  const signedInUserId = typeof S.user === 'string' ? S.user : S.user?.id;
+  const pending = requests.filter((request) => request.status === 'pending');
+  const recent = requests.filter((request) => request.status !== 'pending').slice(-historyLimit).reverse();
+  const asked = (request) => request.approvers.map((approver) => esc(approver.login)).join(', ');
+  const pendingHtml = pending.map((request) => {
+    const canResolve = signedInUserId && request.recipients.includes(signedInUserId);
+    return `<div class="approval-request${request.dismissed ? ' approval-request-dismissed' : ''}" data-raccess="${esc(request.id)}">
+    <div class="approval-request-main">
+      <div class="approval-request-title">GitHub access ${request.dismissed ? ignoredChip() : '<span class="chip approval-needed">approval needed</span>'}</div>
+      <div class="task-sub"><span class="mono">${esc(request.login)}</span> can't see <span class="mono">${esc(request.slug)}</span>.</div>
+    </div>
+    <div class="approval-request-actions">
+      ${canResolve ? `<button class="btn sm primary" data-raccess-act="approve" title="${esc(`Adds ${request.login} to ${request.slug} on GitHub with write access, then continues the task`)}">Give access</button>
+        <button class="btn sm" data-raccess-act="deny">Deny</button>
+        ${request.dismissed ? '' : ignoreRequestButton('data-raccess-act')}`
+        : `<span class="task-sub">Asked ${asked(request)}</span>`}
+    </div>
+  </div>`;
+  }).join('');
+  const history = recent.length ? `<div class="approval-history"><div class="section-h">Recent GitHub access decisions</div>${recent.map((request) =>
+    `<div class="approval-history-row"><span class="chip ${request.status === 'denied' ? 'failed' : request.status === 'withdrawn' ? '' : 'done'}">${esc(request.status)}</span>
+      <span class="mono">${esc(request.login)} → ${esc(request.slug)}</span></div>`).join('')}</div>` : '';
+  return pendingHtml + history;
+}
+
+function wireRepositoryAccessRequestActions(root, organizationId, onResolved) {
+  if (!root) return;
+  root.querySelectorAll('[data-raccess]').forEach((row) => row.querySelectorAll('[data-raccess-act]').forEach((button) =>
+    button.addEventListener('click', async () => {
+      button.disabled = true;
+      try {
+        const result = await api(`/api/repository-access-requests/${row.dataset.raccess}/resolve?organizationId=${encodeURIComponent(organizationId || '')}`, {
+          method: 'POST', body: JSON.stringify({ action: button.dataset.raccessAct }),
+        });
+        const act = button.dataset.raccessAct;
+        toast(act === 'dismiss' ? 'Request ignored' : act === 'deny' ? 'Denied' : result.retried ? 'Access given — task continuing' : 'Access given');
+        await onResolved?.(result);
+      } catch (error) { button.disabled = false; toast(error.message, true); }
+    })));
 }
 
 function wireAuthorizationRequestActions(root, organizationId, onResolved) {
