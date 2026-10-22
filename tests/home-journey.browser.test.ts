@@ -93,11 +93,19 @@ it('lands on the organization home, For me across projects, Active one click awa
     expect(forMe.tasks.map((task: any) => task.id).sort()).toEqual(listed);
     expect(forMe.reasons[review.id]).toContain('review-requested');
 
+    // A repeatable task and one waiting for its trigger name their project like any other row.
+    const event = (recurring: boolean) => [{ kind: 'event', type: 'custom.digest', ...(recurring ? { recurring: true } : {}) }];
+    const series = await consoleRequest(context, app.url, 'POST', `/api/projects/${mobile.id}/tasks`,
+      { title: 'Weekly reading digest', workflow: 'software-dev', params: { prompt: 'later', repeatable: true, triggers: event(true) } });
+    const armed = await consoleRequest(context, app.url, 'POST', `/api/projects/${mobile.id}/tasks`,
+      { title: 'Sync once the digest lands', workflow: 'software-dev', params: { prompt: 'later', triggers: event(false) } });
     await step('Active shows the agent\'s own work too', async () => {
       await page.locator('.view-chip[data-view="__active__"]').click();
       await page.waitForURL(/\/personal\?q=-is:archived$/);
       await page.locator(`[data-id="${paused.id}"]`).waitFor();
     });
+    expect(await page.locator(`[data-series="${series.id}"] .task-project`).innerText()).toBe('mobile-app');
+    expect(await page.locator(`[data-armed="${armed.id}"] .task-project`).innerText()).toBe('mobile-app');
     if (process.env.HOME_SCREENSHOTS) await page.screenshot({ path: path.join(process.env.HOME_SCREENSHOTS, 'app-home-all.png') });
     await step('the project filter narrows to one project', async () => {
       await page.locator('#q-project').selectOption('mobile-app');
@@ -141,6 +149,13 @@ it('lands on the organization home, For me across projects, Active one click awa
     expect(await page.locator(`[data-id="${review.id}"] .task-project`).innerText()).toBe('personal/website');
     expect(await page.locator(`[data-draft="${elsewhere.id}"] .task-project`).innerText()).toBe(`${side.slug}/landing`);
     expect(await page.locator('#topbar-search').count()).toBe(0);
+    await step('the bell\'s page names a repeatable task\'s organization and project too', async () => {
+      await page.goto(`${app!.url}/inbox?q=-is:archived`);
+      await page.locator(`[data-series="${series.id}"]`).waitFor();
+    });
+    expect(await page.locator(`[data-series="${series.id}"] .task-project`).innerText()).toBe('personal/mobile-app');
+    expect(await page.locator(`[data-armed="${armed.id}"] .task-project`).innerText()).toBe('personal/mobile-app');
+    if (process.env.HOME_SCREENSHOTS) await page.screenshot({ path: path.join(process.env.HOME_SCREENSHOTS, 'app-inbox-all.png') });
     if (process.env.HOME_SCREENSHOTS) await page.screenshot({ path: path.join(process.env.HOME_SCREENSHOTS, 'app-for-you.png') });
     // The same list for an API caller.
     const everywhere = await consoleRequest(context, app.url, 'GET', `/api/search?q=${encodeURIComponent('for:me -is:archived')}`);

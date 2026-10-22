@@ -97,7 +97,7 @@ import { EVENT_RETENTION_MS as PROJECT_EVENT_RETENTION_MS, type EventFollow, typ
   type ProjectEventClaimState } from '../domain/project-events.js';
 import { paymentMerchantMatches } from '../util/payment-merchant.js';
 import { previewHostname } from '../gateway/previews.js';
-import { PermissionRequests } from '../platform/permission-requests.js';
+import { SETTLES_REQUESTS, settleTaskRequests, tasksWithOpenRequests } from '../platform/settled-requests.js';
 import { withPullRequestStates } from '../integrations/github-pr.js';
 import { lifecycleEventPayload } from '../domain/view-publication.js';
 import { listState } from '../domain/list-state.js';
@@ -206,12 +206,6 @@ const AUTO_ARCHIVE_STATUS = new Set<string>(['done', 'cancelled']);
  */
 const PRUNE_OUTPUT_STATUS = new Set<string>(['done', 'cancelled']);
 
-/**
- * Statuses that withdraw a task's pending permission requests (PL-10). Not
- * `failed`, for the reason above: reconcile fails every task a crash stopped, and
- * recovery resumes them still waiting on their requests.
- */
-const WITHDRAW_REQUESTS_STATUS = new Set<string>(['done', 'cancelled']);
 
 /** Approval asks, the events that decide them, and the events that only silence
  * them (a person ignored the ask; the task still waits on it). As SQL lists. */
@@ -4466,8 +4460,14 @@ export class Store {
       // the parent's run remembers (pramana#102).
       const of = pullRequestOf({ parentTaskId, params: JSON.parse(row.params) });
       if (!of) return summary;
-      const target = row.lastView ? (JSON.parse(row.lastView) as TaskView).targetBranch : undefined;
-      return { ...summary, pullRequest: { checkout: of.checkout, ...(target ? { target } : {}) } };
+      const view = row.lastView ? JSON.parse(row.lastView) as TaskView : undefined;
+      const target = view?.targetBranch;
+      // The provider's pull request it opened, so the page can link it.
+      const opened = view?.prs?.[0] ?? view?.pr;
+      const pr = opened?.number != null && opened.url
+        ? { number: opened.number, url: opened.url, ...(opened.merged ? { merged: true } : {}), ...(opened.state ? { state: opened.state } : {}) }
+        : undefined;
+      return { ...summary, pullRequest: { checkout: of.checkout, ...(target ? { target } : {}), ...(pr ? { pr } : {}) } };
     });
   }
 
@@ -4711,14 +4711,11 @@ export class Store {
     }
   }
 
-  /** PL-10: a finished task's pending permission requests are withdrawn, and
-   * their withdrawal discharges the recipients' inbox like a decision would. */
-  private async withdrawPermissionRequests(projectId: string, taskId: string, status: string): Promise<void> {
+  /** PL-10: a finished task asks nobody anything (`settleTaskRequests`); each
+   * withdrawal or Ignore discharges the recipients' inbox like a decision would. */
+  private async settleRequests(projectId: string, taskId: string, status: string): Promise<void> {
     const organizationId = (await this.getProject(projectId))?.organizationId ?? 'org_personal';
-    const reason = `task ${status}`;
-    for (const request of (await new PermissionRequests(this, organizationId).withdrawForTask(taskId, reason)))
-      (await this.appendEvent({ taskId, type: 'permission.approval-resolved', ts: Date.now(),
-        payload: { requestId: request.id, action: 'withdraw', reason } }));
+    (await settleTaskRequests(this, organizationId, taskId, status));
   }
 
   /** Does the task's stored conversation make `reference`'s snapshot unnecessary
@@ -4824,8 +4821,8 @@ export class Store {
     const settledNow = PRUNE_OUTPUT_STATUS.has(view.status) && !PRUNE_OUTPUT_STATUS.has(prev?.lastView?.status ?? '');
     if (settledNow) (await this.pruneAgentOutput(taskId));
     if (['done', 'cancelled', 'failed'].includes(view.status)) (await this.retireTaskSpendRequests(taskId, view.status));
-    if (prev && WITHDRAW_REQUESTS_STATUS.has(view.status) && !WITHDRAW_REQUESTS_STATUS.has(prev.lastView?.status ?? ''))
-      (await this.withdrawPermissionRequests(prev.projectId, taskId, view.status));
+    if (prev && SETTLES_REQUESTS.has(view.status) && !SETTLES_REQUESTS.has(prev.lastView?.status ?? ''))
+      (await this.settleRequests(prev.projectId, taskId, view.status));
     // `retentionSweep` measures its window from here: a workflow's `updatedAt`
     // is its history length, not a time. Resuming the task restarts the clock.
     if (['done', 'cancelled', 'failed'].includes(view.status))
@@ -5686,7 +5683,7 @@ export class Store {
       return;
     }
     // A failed task keeps its approval asks: its requests stay pending, since
-    // recovery resumes it still waiting on them (WITHDRAW_REQUESTS_STATUS).
+    // recovery resumes it still waiting on them (SETTLES_REQUESTS).
     if (finished) (await this.deleteInbox(status === 'failed'
       ? "taskId=? AND actionable=1 AND kind<>'approval-requested'" : 'taskId=? AND actionable=1', [task.id]));
     else if (ev.type === 'view.updated') {
@@ -10335,20 +10332,19 @@ export class Store {
     // Decided permission requests outlive their decision events by nothing: both
     // go after the event window. Pending ones stay until decided or withdrawn.
     let permissionRequests = 0;
-    const pendingTasks = new Map<string, string>();
     for (const { key, value } of (await this.kvEntries('permission:request:'))) {
       let request: { status?: string; taskId?: string; projectId?: string; createdAt?: number; resolution?: { at?: number }; withdrawn?: { at?: number } };
       try { request = JSON.parse(value); } catch { continue; }
-      if (request.status === 'pending' && request.taskId && request.projectId) pendingTasks.set(request.taskId, request.projectId);
       const decidedAt = request.resolution?.at ?? request.withdrawn?.at ?? request.createdAt;
       if (request.status === 'pending' || !(Number(decidedAt) < now - 90 * 86400_000)) continue;
       (await this.db.prepare('DELETE FROM kv WHERE k=?').run(key));
       permissionRequests++;
     }
-    // Tasks that finished before finishing withdrew their requests (#400).
-    for (const [taskId, projectId] of pendingTasks) {
-      const row = (await this.db.prepare("SELECT json_extract(lastView, '$.status') status FROM tasks WHERE id=?").get(taskId)) as { status?: string } | undefined;
-      if (WITHDRAW_REQUESTS_STATUS.has(row?.status ?? '')) (await this.withdrawPermissionRequests(projectId, taskId, String(row!.status)));
+    // Tasks that finished before finishing settled their requests (#400, and
+    // credential, authorization and connection requests before pramana#102).
+    for (const taskId of (await tasksWithOpenRequests(this))) {
+      const row = (await this.db.prepare("SELECT projectId, json_extract(lastView, '$.status') status FROM tasks WHERE id=?").get(taskId)) as { projectId?: string; status?: string } | undefined;
+      if (row?.projectId && SETTLES_REQUESTS.has(row.status ?? '')) (await this.settleRequests(row.projectId, taskId, String(row.status)));
     }
 
     return {

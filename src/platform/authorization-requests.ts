@@ -147,6 +147,24 @@ export class AuthorizationRequests {
     });
   }
 
+  /** Ignore every request for a task still asking, as `dismiss` does one: the
+   *  task settled, so no decision can reach it. One being decided is left to finish. */
+  async ignoreTaskRequests(taskId: string, by: string): Promise<AuthorizationRequest[]> {
+    return this.store.transaction(async () => {
+      await this.locked();
+      const all = (await this.requests());
+      const ignored = all.filter((request) => request.status === 'pending' && !request.dismissed && !request.claim
+        && request.target.kind === 'task' && request.target.taskId === taskId);
+      if (!ignored.length) return [];
+      for (const request of ignored) request.dismissed = { by, at: Date.now() };
+      (await this.save(all));
+      for (const request of ignored)
+        (await this.store.appendAudit({ principalId: by, action: 'authorization.request.dismissed',
+          scopeKey: `project:${request.projectId}`, detail: { requestId: request.id } }));
+      return ignored;
+    });
+  }
+
   private async save(requests: AuthorizationRequest[]): Promise<void> {
     (await this.store.kvSet(key(this.organizationId), JSON.stringify(requests)));
   }

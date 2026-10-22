@@ -6256,7 +6256,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       const people = (to ?? []).filter((selector) => !selector.startsWith(AGENT_SELECTOR) && !selector.startsWith('avatar:'));
       if (people.length) {
         const event = { taskId: next.id, type: 'task.mentioned', ts: Date.now(), payload: {
-          recipients: people, by: caller.humanSubject?.userId ? `user:${caller.humanSubject.userId}` : caller.principal,
+          recipients: people, by: (await this.speaker(caller)).author ?? caller.principal,
           text: text.slice(0, 500), urgency: normalizeUrgency(input.urgency, DEFAULT_URGENCY.mentioned) } };
         this.deps.bus?.emit({ ...event, seq: (await this.deps.store.appendEvent(event)) });
       }
@@ -6266,7 +6266,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     // for), a person, or another task's agent.
     const ownAgent = caller.kind === 'agent' && caller.taskId === taskId;
     const speakerKey = ownAgent ? (caller.participant ?? (caller.role && isParticipantKey(caller.role) ? caller.role : MAIN_AGENT)) : undefined;
-    const userId = caller.humanSubject?.userId;
+    const userId = speakingUser(caller);
     const authorFields: Partial<Message> = ownAgent && shared ? { role: 'agent', author: speakerKey } : await this.speaker(caller);
     const callsAgents = to === undefined || to.some((selector) => selector.startsWith(AGENT_SELECTOR));
     let message: Message | undefined;
@@ -6379,7 +6379,7 @@ Act according to your Avatar instructions. When ready, call platform_request POS
   /** Who says a message from outside a task's own agents: a person by name, or
    * another task's agent as "Task #N", so whoever reads it knows who to answer. */
   private async speaker(caller: { kind: string; taskId?: string; humanSubject?: { userId?: string } }): Promise<Partial<Message>> {
-    const userId = caller.humanSubject?.userId;
+    const userId = speakingUser(caller);
     if (userId) {
       const name = await this.deps.store.userDisplayName(userId);
       return { author: `user:${userId}`, ...(name ? { authorLabel: name } : {}) };
@@ -6393,7 +6393,7 @@ Act according to your Avatar instructions. When ready, call platform_request POS
    * work in a new task: a person's, or another task's agent's — never the
    * task's own agents, and never an event the platform delivers. */
   private continues(caller: { kind: string; taskId?: string; humanSubject?: { userId?: string } }, task: TaskRecord): boolean {
-    const speaks = !!caller.humanSubject?.userId || (caller.kind === 'agent' && caller.taskId !== task.id);
+    const speaks = !!speakingUser(caller) || (caller.kind === 'agent' && caller.taskId !== task.id);
     return speaks && continuesInNewTask(task, task.lastView);
   }
 
@@ -6446,11 +6446,10 @@ Act according to your Avatar instructions. When ready, call platform_request POS
     const participant = task.lastView?.participants?.find((candidate) => candidate.key === key);
     if (!participant) throw new ValidationError(`${key} is not an agent on this task`);
     if (participant.state === 'idle') throw new ValidationError(`${participantLabel(key)} is not working`);
-    const userId = caller.humanSubject?.userId;
     const ownAgent = caller.kind === 'agent' && caller.taskId === taskId ? (caller.participant ?? MAIN_AGENT) : undefined;
-    const by = userId ? `user:${userId}` : ownAgent ? `agent:${ownAgent}` : caller.principal;
-    const byLabel = userId ? ((await this.deps.store.userDisplayName(userId)) ?? undefined)
-      : ownAgent ? participantLabel(ownAgent) : undefined;
+    const from = ownAgent ? { author: `agent:${ownAgent}`, authorLabel: participantLabel(ownAgent) } : await this.speaker(caller);
+    const by = from.author ?? caller.principal;
+    const byLabel = from.authorLabel;
     await (await this.workflowHandle(taskId, task)).signal('stopAgent', { key, by, ...(byLabel ? { byLabel } : {}) });
     (await this.deps.store.appendEvent({ taskId, type: 'task.agent-stopped', ts: Date.now(), payload: { participant: key, state: participant.state, by } }));
     return { stopped: key };
@@ -8283,4 +8282,12 @@ export interface HeldComputer {
   machine?: MachineShape;
   /** Whether the caller can free it now (POST /api/tasks/:taskId/release-computer). */
   releasable: boolean;
+}
+
+/** The person a caller speaks as in a conversation. An agent's token names the
+ * person it acts for (its delegation), but what the agent says is its own: as
+ * "Task #N", never as that person — else the reply goes back to them as a
+ * mention, and their own mentions read as answered (pramana#113). */
+function speakingUser(caller: { kind: string; humanSubject?: { userId?: string } }): string | undefined {
+  return caller.kind === 'agent' ? undefined : caller.humanSubject?.userId;
 }

@@ -176,7 +176,6 @@ export class PaidLaunchSettingsService {
     ].filter(([, value]) => !value).map(([label]) => label);
     const billingMissing = billingProvider === 'paddle' ? paddleMissing : stripeMissing;
     const legalLabels: Record<string, string> = {
-      KARMAX_FOUNDER_REVIEWED_POLICY_VERSION: `Founder approval of policy version ${POLICY_VERSION}`,
       KARMAX_LEGAL_ENTITY_NAME: 'Legal entity name', KARMAX_LEGAL_ENTITY_COUNTRY: 'Country of establishment',
       KARMAX_GOVERNING_LAW: 'Governing law and courts', KARMAX_LEGAL_NOTICE_ADDRESS: 'Legal notice address',
       KARMAX_LEGAL_EMAIL: 'Legal email', KARMAX_PRIVACY_EMAIL: 'Privacy email',
@@ -199,7 +198,6 @@ export class PaidLaunchSettingsService {
         checkoutUrl: `${publicUrl.replace(/\/$/, '')}/billing/checkout`, webhookEvents: PADDLE_WEBHOOK_EVENTS },
       missing: launch.missing.map((name) => legalLabels[name] ?? name),
       policyVersion: POLICY_VERSION,
-      founderReviewed: launch.policyApproved,
       stripe: {
         individualPriceId: stripe.individualPriceId, teamBasePriceId: stripe.teamBasePriceId,
         teamSeatPriceId: stripe.teamSeatPriceId, individualProductId: stripe.individualProductId,
@@ -278,8 +276,6 @@ export class PaidLaunchSettingsService {
       billingProvider: (input.billingProvider as 'stripe' | 'paddle' | undefined) ?? current.billingProvider,
       paddle,
       paidLaunch: input.paidLaunch === undefined ? current.paidLaunch : input.paidLaunch === true,
-      founderReviewedPolicyVersion: input.founderReviewed === undefined ? current.founderReviewedPolicyVersion
-        : input.founderReviewed === true ? POLICY_VERSION : undefined,
       operatorName: input.operatorName === undefined ? current.operatorName : clean(input.operatorName), operatorCountry: input.operatorCountry === undefined ? current.operatorCountry : clean(input.operatorCountry),
       governingLaw: input.governingLaw === undefined ? current.governingLaw : clean(input.governingLaw), legalNoticeAddress: input.legalNoticeAddress === undefined ? current.legalNoticeAddress : clean(input.legalNoticeAddress),
       contacts: {
