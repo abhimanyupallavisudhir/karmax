@@ -20,8 +20,10 @@ function extract(name) {
 const context = vm.createContext({
   esc: (s) => String(s ?? ''), policyTip: (text) => `<tip>${text}</tip>`, safeHref: String,
   taskRecord: () => undefined, numLabel: (id) => id, taskUrl: (id, rec) => `/acme/web/tasks/${rec?.num ?? id}`,
+  S: { prApprovals: {} },
 });
-vm.runInContext(['branchPullRequestState', 'pullRequestLanes', 'proposalState', 'checkoutsSection'].map(extract).join('\n'), context);
+vm.runInContext(['branchPullRequestState', 'pullRequestLanes', 'pullRequestRows', 'proposalState', 'checkoutsSection',
+  'pullRequestLink', 'pullRequestChip', 'approvePullRequestButton', 'pullRequestAsks', 'conversationPullRequestAsks'].map(extract).join('\n'), context);
 const row = (html, name) => html.split('<div class="checkout-row').find((part) => part.includes(`<b>${name}</b>`)) ?? '';
 const lane = (checkout, childTaskId, state = 'open') =>
   ({ checkout, childTaskId, branch: `tavya/${childTaskId}`, fromBranch: `tavya/t-${checkout}`, head: 'h', target: 'main', state, requestId: 'r' });
@@ -124,4 +126,58 @@ test('a task with one branch still shows that branch\'s pull request', () => {
       lastView: { stage: 'review', status: 'waiting', waitingFor: { kind: 'human' } } }] });
   assert.match(row(html, 'app'), /In review/);
   assert.match(row(html, 'app'), /data-approve-pr="pr-app"/);
+});
+
+// Approving a pull request shows at once, and every step after it looks alive
+// until it lands: Approved, then Landing (with what it waits for), then Landed.
+const reviewing = { stage: 'review', status: 'waiting', waitingFor: { kind: 'human' } };
+const pending = (lastView, pr) => ({
+  stage: 'do', status: 'active', targetBranch: 'main', actions: [],
+  checkouts: ['app', 'docs'].map((name) => ({ name, branch: `tavya/t-${name}`, base: 'main', target: 'main' })),
+  shipments: [lane('docs', 'pr-docs')],
+  subTaskSummaries: [{ id: 'pr-docs', title: 'docs: x', workflow: 'software-dev', lastView,
+    pullRequest: { checkout: 'docs', target: 'main', ...(pr ? { pr } : {}) } }],
+});
+
+test('Approve shows at once, and its pull request stays visibly alive until it lands', () => {
+  context.S.prApprovals = {};
+  const github = { number: 86, url: 'https://github.com/o/docs/pull/86', state: 'open' };
+  assert.match(row(context.checkoutsSection(pending(reviewing, github)), 'docs'), /href="https:\/\/github.com\/o\/docs\/pull\/86"[^>]*>⇱ #86</);
+  context.S.prApprovals = { 'pr-docs': Date.now() };
+  const clicked = row(context.checkoutsSection(pending(reviewing)), 'docs');
+  assert.match(clicked, /Approved/);
+  assert.match(clicked, /chip [^"]*live/, 'a step in progress pulses');
+  assert.doesNotMatch(clicked, /data-approve-pr/);
+  // Approved and on its way, the record has no person to wait for: not "Opening".
+  const approved = row(context.checkoutsSection(pending({ stage: 'review', status: 'active' })), 'docs');
+  assert.match(approved, /Approved/);
+  context.S.prApprovals = {};
+  const landing = row(context.checkoutsSection(pending({ stage: 'merge', status: 'waiting',
+    waitingFor: { kind: 'merge', detail: 'Waiting for CI' } })), 'docs');
+  assert.match(landing, /Landing/);
+  assert.match(landing, /chip [^"]*live/);
+  assert.match(landing, /title="Waiting for CI"/);
+  assert.doesNotMatch(row(context.checkoutsSection(pending({ stage: 'done', status: 'done' })), 'docs'), /live/);
+});
+
+test('a pull request waiting for its approval is a small box in the conversation', () => {
+  context.S.prApprovals = {};
+  assert.equal(context.conversationPullRequestAsks(pending({ stage: 'do', status: 'active' })), '', 'nothing to approve, nothing shown');
+  const box = context.conversationPullRequestAsks(pending(reviewing, { number: 86, url: 'u86', state: 'open' }));
+  assert.match(box, /class="pr-ask"/);
+  assert.match(box, /<b>docs<\/b>/);
+  assert.match(box, /#86/);
+  assert.match(box, /data-approve-pr="pr-docs"/);
+  // Approved, it stays to show it landing, then goes.
+  context.S.prApprovals = { 'pr-docs': Date.now() };
+  assert.match(context.conversationPullRequestAsks(pending(reviewing)), /Approved/);
+  context.S.prApprovals = {};
+  assert.match(context.conversationPullRequestAsks(pending({ stage: 'merge', status: 'active' })), /Landing/);
+  assert.equal(context.conversationPullRequestAsks(pending({ stage: 'done', status: 'done' })), '');
+});
+
+test('Branches comes first in the details rail', () => {
+  const rail = extract('taskRail');
+  assert.ok(rail.indexOf('checkoutsSection(v)') < rail.indexOf("section('Attempts'"), 'above Attempts');
+  assert.ok(rail.indexOf('checkoutsSection(v)') < rail.indexOf('subTasksSection(v)'), 'above Sub-tasks');
 });

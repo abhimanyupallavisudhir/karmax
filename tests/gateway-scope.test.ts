@@ -397,6 +397,14 @@ describe('gateway request scope for bare-id routes', () => {
     expect(after).not.toHaveProperty('approvalRequests');
     expect(after).toMatchObject({ pendingDecisions: 1 });
     expect((await store.eventsOfType(task.id, 'credential.approval-dismissed'))).toHaveLength(1);
+
+    // Done, it waits on nobody: nothing about it asks for approval any more.
+    (await store.saveView(task.id, { taskId: task.id, title: task.title, workflow: task.workflow, stage: 'done',
+      status: 'done', messages: [], actions: [], state: {}, updatedAt: Date.now() }));
+    liveView = (await store.getTask(task.id))!.lastView;
+    const done = await (await fetch(viewUrl, { headers })).json();
+    expect(done).not.toHaveProperty('approvalRequests');
+    expect(done).not.toHaveProperty('pendingDecisions');
   });
 
   // A child paused on an approval request read "Paused until …" in its parent's

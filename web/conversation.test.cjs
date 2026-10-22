@@ -252,6 +252,7 @@ eval(`async ${extractFn('loadTaskRecord')}`);
 eval(extractFn('wireCheckinSidebar'));
 eval(extractFn('wireStopAgents'));
 global.conversationApprovalRequests = () => '<div>Pending approvals</div>';
+global.conversationPullRequestAsks = () => '';
 global.liveRoleFor = () => 'do';
 global.taskTranscripts = () => [{ role: 'do' }];
 global.localWorldPath = () => false;

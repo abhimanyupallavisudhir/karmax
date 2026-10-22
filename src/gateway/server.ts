@@ -116,6 +116,7 @@ import { ITEM_FIELDS, VaultItems, itemHandle, relatedVaultItems, searchVaultItem
 import { INSTALLATION_SCOPE, organizationScope } from '../autonomy/vault-keys.js';
 import type { CredentialAccessRequest } from '../autonomy/vault-items.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
+import { SETTLES_REQUESTS } from '../platform/settled-requests.js';
 import { AuthorizationRequests } from '../platform/authorization-requests.js';
 import { inheritPersonalGithubProfile } from '../autonomy/git-profiles.js';
 import { actorPrincipal, identityAuditDetail, requireHumanSubject,
@@ -1136,10 +1137,13 @@ export class Gateway {
       const organizationId = (await this.deps.store.taskAttribution(taskId))?.organizationId;
       counts = organizationId ? (await this.approvalCounts(organizationId)) : new Map();
     }
-    const count = counts.get(taskId);
+    // A task that is done or cancelled waits on nobody (settleTaskRequests):
+    // whatever it asked for is no longer an approval anyone owes it.
+    const asking = (status?: string) => !SETTLES_REQUESTS.has(status ?? '');
+    const count = asking(view.status) ? counts.get(taskId) : undefined;
     // Sub-task and fork lineage panels flag a task's approval exactly as its list row does.
     const flag = <T extends ChildTaskSummary>(summary: T): T => {
-      const approvalRequests = counts.get(summary.id)?.notify;
+      const approvalRequests = asking(summary.lastView?.status) ? counts.get(summary.id)?.notify : undefined;
       return approvalRequests && summary.lastView ? { ...summary, lastView: { ...summary.lastView, approvalRequests } } : summary;
     };
     const subTaskSummaries = view.subTaskSummaries?.map(flag);
