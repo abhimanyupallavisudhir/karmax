@@ -211,7 +211,7 @@ export function registryEntry(server: any) {
     let command: string, args: string[];
     if (pkg.registryType === 'npm' && /^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.+_-]+)?$/.test(pkg.version) && /^(?:@[a-z0-9._-]+\/)?[a-z0-9][a-z0-9._-]*$/.test(pkg.identifier)
       && (!pkg.registryBaseUrl || /^https:\/\/registry.npmjs.org\/?$/.test(pkg.registryBaseUrl))) {
-      command = 'npx'; args = ['--yes', '--registry=https://registry.npmjs.org', `${pkg.identifier}@${pkg.version}`];
+      command = 'npx'; args = ['--yes', '--no-audit', '--no-fund', '--registry=https://registry.npmjs.org', `${pkg.identifier}@${pkg.version}`];
     } else if (pkg.registryType === 'pypi' && /^\d/.test(pkg.version) && (!pkg.runtimeHint || /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(pkg.runtimeHint)) && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(pkg.identifier)
       && (!pkg.registryBaseUrl || /^https:\/\/pypi.org\/?$/.test(pkg.registryBaseUrl))) {
       command = 'uvx'; args = ['--index-url', 'https://pypi.org/simple', '--from', `${pkg.identifier}==${pkg.version}`, pkg.runtimeHint || pkg.identifier];

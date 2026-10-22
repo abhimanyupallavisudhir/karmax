@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import http from 'node:http';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { PassThrough } from 'node:stream';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -347,7 +348,7 @@ describe('remote OpenCode (ACP in a cloud sandbox)', () => {
     prewarmRemoteAgentHome(world, 'opencode', undefined, undefined);
     await turn(world);
     expect(world.bootstraps).toHaveLength(1);
-    expect(world.bootstraps[0]).toContain(`npx --yes --package='${process.env.KARMAX_REMOTE_OPENCODE_PACKAGE}' -c true`);
+    expect(world.bootstraps[0]).toContain(`npx --yes --no-audit --no-fund --package='${process.env.KARMAX_REMOTE_OPENCODE_PACKAGE}' -c true`);
     expect(world.bootstraps[0]).toContain(`'${world.handle.root}/.karmax-injection/agent/opencode/api'`);
   }, 60_000);
 
@@ -358,6 +359,28 @@ describe('remote OpenCode (ACP in a cloud sandbox)', () => {
     expect(failure.failure).toBeInstanceOf(ProviderStreamError);
     expect(failure.message).toContain('workspace API usage limits');
   }, 60_000);
+
+  // CI #2262–#2264 (2026-10-22): the npm registry's audit endpoint stopped
+  // answering, and npx waited on it before handing over the CLI, so every
+  // remote turn hung at "cli-resolve". Installing a pinned CLI needs no audit.
+  it('starts the agent while the registry never answers an audit request', async () => {
+    setup();
+    const audits: string[] = [];
+    const registry = http.createServer((request, response) => {
+      if (request.url?.includes('/security/')) { audits.push(request.url); return; } // never answers
+      response.writeHead(404).end();
+    });
+    await new Promise<void>((resolve) => registry.listen(0, '127.0.0.1', resolve));
+    process.env.npm_config_registry = `http://127.0.0.1:${(registry.address() as any).port}/`;
+    try {
+      const { output } = await turn(sandbox('audit-down'));
+      expect(output.join('')).toContain('remote done');
+      expect(audits).toEqual([]);
+    } finally {
+      registry.closeAllConnections();
+      registry.close();
+    }
+  }, 30_000);
 
   it('refuses ACP harnesses without a remote implementation instead of running them on the host', async () => {
     setup();

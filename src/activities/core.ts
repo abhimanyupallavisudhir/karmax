@@ -4783,7 +4783,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       const gitEnv = isRemote(args.worldHandle.kind) && organizationId === 'org_personal' ? {} : (await gitEnvFor(args.worldHandle, args.taskId));
       const vaultEnv = screenEnvironment((await orgVaultItems.envFor(args.taskId, effective, world, skippedEnv)), () => 'a credential', skippedEnv);
       // Paths as the world sees them (a container maps its root elsewhere).
-      const shim = '#!/bin/sh\n# The tavya CLI, signed in by KARMAX_GATEWAY_URL and KARMAX_TOKEN.\nexec npx -y @tavya/cli@latest "$@"\n';
+      const shim = '#!/bin/sh\n# The tavya CLI, signed in by KARMAX_GATEWAY_URL and KARMAX_TOKEN.\nexec npx --yes --no-audit --no-fund @tavya/cli@latest "$@"\n';
       const installed = await world.exec('bash', ['-c', 'mkdir -p .karmax-injection/bin && printf "%s" "$1" > .karmax-injection/bin/tavya'
         + ' && chmod 755 .karmax-injection/bin/tavya && cd .karmax-injection && pwd', 'karmax-command', shim], { cwd: args.worldHandle.root, timeoutMs: 30_000 });
       const injection = installed.stdout.trim().split('\n').at(-1) ?? '';
