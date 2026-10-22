@@ -67,3 +67,41 @@ it('an untouched stored Developer profile gains messaging; a customized one is k
   await store.setAuthorizationProfile('global', { ...previous, capabilities: custom, builtin: true } as any);
   expect((await (await AuthorizationService.create(store)).profile('developer'))!.capabilities).toEqual(custom);
 });
+
+// pramana#113: every agent of a person's task tree acts under that person's
+// delegation, so its token names them as its human subject. A parent's agent
+// messaging its sub-task was therefore said as the person ("Abhimanyu: …"),
+// which made the person a speaker the sub-task's reply then mentioned, and
+// answered the person's own mentions there as though they had spoken.
+it("an agent acting for a person speaks as its task, never as the person", async () => {
+  const store = await Store.create(':memory:');
+  onTestFinished(async () => store.close());
+  const authz = await AuthorizationService.create(store);
+  const project = await store.createProject('Shared');
+  await authz.grant('root', { principalId: 'user:owner', scopeKey: projectScope(project.id), profileId: 'developer' });
+  const create = (title: string) => store.createTask({ projectId: project.id, title,
+    workflow: 'software-dev', workflowVersion: '1.30.0', params: { prompt: title } as any });
+  const parent = await create('Parent');
+  const child = await create('Child');
+  await store.saveView(child.id, { title: 'Child', workflow: 'software-dev', stage: 'do', status: 'active',
+    messages: [], actions: [], state: {}, updatedAt: 1, taskId: child.id } as any);
+  const tokens = new TokenAuthority(store);
+  const person = (await tokens.mintPrincipal('user:owner', await authz.capabilities('user:owner', project.id), project.id)).token;
+  // How a task the person queued mints its agent's token.
+  const delegation = (await tokens.delegateHuman(person, { taskId: parent.id, projectId: project.id }))!;
+  const agent = (await tokens.mint({ taskId: parent.id, profileId: 'do', role: 'do', principal: 'user:owner',
+    projectId: project.id, ceiling: ['task:*', 'project:*'], grantorCaps: await authz.capabilities('user:owner', project.id),
+    delegationId: delegation.id })).token;
+  const signal = vi.fn(async () => undefined);
+  const api = new KarmaxApi({ store, client: { workflow: { getHandle: () => ({ signal }) } } as any, taskQueue: 'test', tokens });
+  const discharge = vi.spyOn(store, 'dischargeMentions');
+
+  const asTask = { author: `task:${parent.id}`, authorLabel: `Task #${parent.num}` };
+  expect((await api.messageAgent(agent, child.id, 'Rebase on my branch')).message).toMatchObject(asTask);
+  expect((await api.postTaskMessage(agent, child.id, { text: 'Use the new schema', to: ['agent:do'] })).message).toMatchObject(asTask);
+  expect(discharge).not.toHaveBeenCalled();
+  // The person, speaking themselves, is still the person.
+  expect((await api.postTaskMessage(person, child.id, { text: 'Ship it', to: ['agent:do'] })).message)
+    .toMatchObject({ author: 'user:owner' });
+  expect(discharge).toHaveBeenCalledWith(child.id, 'owner');
+});
