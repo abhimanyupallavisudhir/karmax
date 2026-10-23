@@ -275,10 +275,19 @@ describe.skipIf(!postgres)('a restored karmax database starts as the app role', 
     await client.connect();
     try { await client.query(roleSql); } finally { await client.end(); }
   };
-  const run = (command: string, args: string[]) => {
-    const result = spawnSync(command, args, { encoding: 'utf8' });
+  // deploy/karmax dumps and restores with the server's own tools (in its
+  // container); here they are the host's. A newer client than the server
+  // writes settings the server does not know (pg_dump 17+: `SET
+  // transaction_timeout`, CI #2285 on Ubuntu 26 against postgres:16), so the
+  // server's major version is used when installed, and that one known skew
+  // is the only error tolerated otherwise.
+  const run = (command: string, args: string[], serverMajor: number) => {
+    const own = `/usr/lib/postgresql/${serverMajor}/bin/${command}`;
+    const result = spawnSync(fs.existsSync(own) ? own : command, args, { encoding: 'utf8' });
     if (result.error) throw new Error(`${command} is needed to rehearse a restore (PostgreSQL's client tools): ${result.error.message}`);
-    expect(result.status, result.stderr).toBe(0);
+    const errors = result.stderr.split('\n').filter((line) => /\berror:/.test(line));
+    const skew = errors.length > 0 && errors.every((line) => /unrecognized configuration parameter "transaction_timeout"/.test(line));
+    if (!skew) expect(result.status, result.stderr).toBe(0);
   };
   const boot = { resolveScopes: async () => new Map(), audit: async () => undefined };
   const restoreFlags = '--no-owner --no-privileges';
@@ -308,10 +317,11 @@ describe.skipIf(!postgres)('a restored karmax database starts as the app role', 
       await before.appendAudit({ principalId: 'system:test', action: 'before.backup' });
     } finally { await before.close(); }
 
+    const serverMajor = Math.floor(Number((await admin.query('SHOW server_version_num')).rows[0].server_version_num) / 10_000);
     const dump = path.join(home, 'karmax.dump');
-    run('pg_dump', ['-Fc', '-f', dump, `--dbname=${url(source)}`]);
+    run('pg_dump', ['-Fc', '-f', dump, `--dbname=${url(source)}`], serverMajor);
     await admin.query(`CREATE DATABASE ${restored}`);
-    run('pg_restore', [...restoreFlags.split(' '), `--dbname=${url(restored)}`, dump]);
+    run('pg_restore', [...restoreFlags.split(' '), `--dbname=${url(restored)}`, dump], serverMajor);
     await roleJob(restored);
 
     const after = await Store.create(asApp(restored), { hosted: true });
