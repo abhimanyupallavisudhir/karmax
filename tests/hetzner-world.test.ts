@@ -7,7 +7,9 @@ import { isTransportError, ProviderCapacityFull, ProviderOutage } from '../src/a
 import { VmWorldProvider } from '../src/world/vm/provider.js';
 import type { ResolvedWorldProviderConnection } from '../src/world/connections.js';
 import type { WorldHandle } from '../src/world/types.js';
-import { FakeHetzner } from './helpers/fake-hetzner.js';
+import type { SshTransport } from '../src/world/vm/ssh.js';
+import { vmProvisionVersion } from '../src/world/vm/provision.js';
+import { FakeHetzner, HETZNER_TYPES } from './helpers/fake-hetzner.js';
 import { sshdAvailable } from './helpers/local-sshd.js';
 
 const connection = (token: string): ResolvedWorldProviderConnection => ({ organizationId: 'org_h', provider: 'hetzner', apiKey: token,
@@ -71,7 +73,10 @@ describe.skipIf(!sshdAvailable)('Hetzner worlds (fake Cloud API, real sshd)', ()
     driver = new HetznerDriver(hetzner.fetch, 1);
     stamp = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'vm-stamp-')), 'provisioned');
     ledger = new Map();
-    provider = new VmWorldProvider(driver, async () => connection(hetzner.token), undefined, {
+    provider = vmProvider(driver);
+  });
+  const vmProvider = (driver: HetznerDriver) =>
+    new VmWorldProvider(driver, async () => connection(hetzner.token), undefined, {
       socket: hetzner.socket, user: os.userInfo().username, home: hetzner.home,
       provision: { stamp, script: `echo provisioned > ${stamp}`, sudo: false },
       ledger: {
@@ -80,7 +85,6 @@ describe.skipIf(!sshdAvailable)('Hetzner worlds (fake Cloud API, real sshd)', ()
         kvDelete: (key) => { ledger.delete(key); },
       },
     });
-  });
   afterEach(async () => {
     await hetzner.close();
     if (snapshots === undefined) delete process.env.KARMAX_HETZNER_SNAPSHOTS; else process.env.KARMAX_HETZNER_SNAPSHOTS = snapshots;
@@ -412,9 +416,50 @@ describe.skipIf(!sshdAvailable)('Hetzner worlds (fake Cloud API, real sshd)', ()
   });
 
   it('boots new servers from the provisioned snapshot once one exists', async () => {
-    const { vmProvisionVersion } = await import('../src/world/vm/provision.js');
-    hetzner.images.push({ id: 4242, status: 'available', labels: { karmaxImage: vmProvisionVersion() } });
+    hetzner.images.push({ id: 4242, status: 'available', labels: { karmaxImage: vmProvisionVersion() }, disk_size: 40 });
     await provider.create({ taskId: 'task_snap', base: 'main', generation: 1, organizationId: 'org_h' });
     expect(hetzner.requests.find((request) => request.method === 'POST' && request.path === '/v1/servers')!.body.image).toBe('4242');
+  });
+
+  /** A builder whose provisioning succeeds at once: the real one runs as root. */
+  const provisioned = () => new HetznerDriver(hetzner.fetch, 1, () => ({ exec: async () => ({ code: 0, stdout: Buffer.from('0'), stderr: Buffer.alloc(0) }),
+    writeFile: async () => undefined, reset: () => undefined, close: () => undefined }) as unknown as SshTransport);
+  const serversMade = () => hetzner.requests.filter((request) => request.method === 'POST' && request.path === '/v1/servers').map((request) => request.body);
+
+  it('boots a server only from a snapshot its disk holds, and builds one that fits (pramana#111)', async () => {
+    delete process.env.KARMAX_HETZNER_SNAPSHOTS;
+    // Taken on an 80 GB server while the 40 GB ones were sold out: Hetzner refuses it for a cx22.
+    hetzner.images.push({ id: 4242, status: 'available', labels: { karmaxImage: vmProvisionVersion() }, disk_size: 80 });
+    const provider = vmProvider(provisioned());
+    const world = await provider.create({ taskId: 'task_big', base: 'main', generation: 1, organizationId: 'org_h' });
+    expect((await world.exec('sh', ['-c', 'echo ok'])).stdout).toBe('ok\n');
+    expect(serversMade()[0]).toMatchObject({ server_type: 'cx22', image: 'debian-12' });
+    // Meanwhile a snapshot on the smallest disk is built, and its builder deleted.
+    for (let waited = 0; !hetzner.images.some((image) => image.disk_size === 40); waited += 100) {
+      expect(waited).toBeLessThan(20_000);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    const small = hetzner.images.find((image) => image.disk_size === 40)!;
+    expect(serversMade().filter((server) => server.labels.karmaxImageBuilder).map((server) => server.server_type)).toEqual(['cx22']);
+    expect(small.description).toMatch(/\(40 GB\)$/);
+    expect([...hetzner.servers.values()].some((server) => server.labels.karmaxImageBuilder)).toBe(false);
+    // Every type boots from it now, and nothing is built again.
+    await provider.create({ taskId: 'task_small', base: 'main', generation: 1, organizationId: 'org_h' });
+    await provider.create({ taskId: 'task_wide', base: 'main', generation: 1, organizationId: 'org_h', resources: { cpu: 4, memoryMb: 8192 } });
+    expect(serversMade().slice(-2)).toMatchObject([{ server_type: 'cx22', image: String(small.id) }, { server_type: 'cpx31', image: String(small.id) }]);
+    expect(serversMade().filter((server) => server.labels.karmaxImageBuilder)).toHaveLength(1);
+  });
+
+  it('builds the snapshot on the smallest disk on offer, not the cheapest server', async () => {
+    // The 160 GB cpx31 is the cheapest server covering 2 CPUs here: worlds get it, the builder a 40 GB cx22.
+    const types = HETZNER_TYPES.map((type) => type.name === 'cx22' ? { ...type, prices: [{ location: 'fsn1', price_hourly: { net: '0.0300', gross: '0.0357' } }] } : type);
+    hetzner.faults.push((request) => request.path.startsWith('/v1/server_types')
+      ? new Response(JSON.stringify({ server_types: types, meta: { pagination: { next_page: null } } }), { status: 200 }) : undefined);
+    const driver = provisioned();
+    const id = await driver.ensureSnapshot(connection(hetzner.token));
+    expect(serversMade().map((server) => server.server_type)).toEqual(['cx22']);
+    expect(hetzner.images).toEqual([expect.objectContaining({ id: Number(id), disk_size: 40 })]);
+    await vmProvider(driver).create({ taskId: 'task_cheap', base: 'main', generation: 1, organizationId: 'org_h' });
+    expect(serversMade()[1]).toMatchObject({ server_type: 'cpx31', image: id });
   });
 });

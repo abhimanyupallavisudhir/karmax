@@ -226,18 +226,21 @@ describe.skipIf(!sshdAvailable)('VM world over SSH', () => {
   });
 
   it('previews a port bound to the VM loopback, over HTTP and as a socket upstream', async () => {
-    const port = 20_000 + Math.floor(Math.random() * 20_000);
-    const server = await world.startProcess({ command: `exec node -e "require('http').createServer((q,s)=>s.end('hi '+q.url)).listen(${port},'127.0.0.1'); require('net').createServer(c=>c.pipe(c)).listen(${port + 1},'127.0.0.1')"` });
+    // Ports the OS chose, which the servers report once they listen: a random
+    // one could be taken under CI's load, and the wait is for the report (CI #2041, #2283).
+    const ports = `/tmp/vm-preview-ports-${process.pid}-${Date.now()}`;
+    const server = await world.startProcess({ command: `exec node -e "const fs=require('fs'); const h=require('http').createServer((q,s)=>s.end('hi '+q.url)).listen(0,'127.0.0.1',()=>{ const e=require('net').createServer(c=>c.pipe(c)).listen(0,'127.0.0.1',()=>{ fs.writeFileSync('${ports}.new',h.address().port+' '+e.address().port); fs.renameSync('${ports}.new','${ports}'); }); })"` });
     try {
-      let response;
-      for (let attempt = 0; attempt < 50; attempt++) {
-        response = await world.fetchPort!(port, '/path?q=1').catch(() => undefined);
-        if (response) break;
-        await new Promise((resolve) => setTimeout(resolve, 100));
+      let listening = '';
+      for (let waited = 0; !listening && waited < 20_000; waited += 100) {
+        listening = (await world.exec('sh', ['-c', `cat ${ports} 2>/dev/null || true`])).stdout.trim();
+        if (!listening) await new Promise((resolve) => setTimeout(resolve, 100));
       }
+      const [port, echo] = listening.split(' ').map(Number) as [number, number];
+      const response = await world.fetchPort!(port, '/path?q=1');
       expect(response?.status).toBe(200);
       expect(response?.body.toString()).toBe('hi /path?q=1');
-      const target = await world.previewSocketTarget!(port + 1, '/ws');
+      const target = await world.previewSocketTarget!(echo, '/ws');
       const url = new URL(target.url);
       expect(url.hostname).toBe('127.0.0.1');
       const echoed = await new Promise<string>((resolve, reject) => {
@@ -248,6 +251,7 @@ describe.skipIf(!sshdAvailable)('VM world over SSH', () => {
       expect(echoed).toBe('ping');
     } finally {
       await server.kill('SIGKILL');
+      await world.exec('rm', ['-f', ports]).catch(() => undefined);
     }
   });
 

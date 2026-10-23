@@ -87,7 +87,7 @@ describe('duration-balanced test shards', () => {
       .toBeLessThanOrEqual(count);
     const longest = Math.max(...Object.values(durations));
     const loads = load(planShards(Object.keys(durations), durations, count), durations);
-    expect(Math.max(...loads) + longest).toBeLessThan(ci.jobs.test['timeout-minutes'] * 60);
+    expect(Math.max(...loads) + longest).toBeLessThan(testMinutes(ci) * 60);
   });
 
   // Runners vary up to twice in speed, so a shard must fit its timeout twice
@@ -98,9 +98,24 @@ describe('duration-balanced test shards', () => {
     const ci = parse(fs.readFileSync(path.join(repoRoot, '.github', 'workflows', 'ci.yml'), 'utf8'));
     const count: number = ci.jobs.test.strategy.matrix.shard.length;
     const loads = load(planShards(Object.keys(durations), durations, count), durations);
-    expect(Math.max(...loads)).toBeLessThan(ci.jobs.test['timeout-minutes'] * 60 / 2);
+    expect(Math.max(...loads)).toBeLessThan(testMinutes(ci) * 60 / 2);
+  });
+
+  // The limit is the tests' own: a slow apt mirror spent 10-11 min of a job
+  // limit that also covered setup and cancelled shards whose tests were on
+  // time (CI #2283, #2287). The job's limit only has to stop a stuck setup.
+  it('limits the test step itself, and leaves the job room for setup', () => {
+    const ci = parse(fs.readFileSync(path.join(repoRoot, '.github', 'workflows', 'ci.yml'), 'utf8'));
+    expect(testMinutes(ci)).toBeGreaterThan(0);
+    expect(ci.jobs.test['timeout-minutes']).toBeGreaterThanOrEqual(testMinutes(ci) + 15);
   });
 });
+
+/** Minutes the npm test step of a shard may run (its own timeout-minutes). */
+function testMinutes(ci: any): number {
+  const step = ci.jobs.test.steps.find((entry: { run?: string }) => entry.run?.startsWith('npm test'));
+  return Number(step?.['timeout-minutes']);
+}
 
 describe('recorded test durations', () => {
   it('reads per-file durations from Vitest reporter output in a CI log', () => {
