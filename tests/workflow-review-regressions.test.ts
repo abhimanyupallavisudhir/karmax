@@ -51,7 +51,7 @@ vi.mock('@temporalio/workflow', async (importOriginal) => ({
 }));
 import { justDoV1_7 } from '../src/workflows/just-do.js';
 import { mergeOnlyV1_7 } from '../src/workflows/merge-only.js';
-import { softwareDevV1_20, softwareDevV1_26, softwareDevV1_27, softwareDevV1_28, softwareDevV1_29, subtaskRaiseText } from '../src/workflows/software-dev.js';
+import { softwareDevV1_20, softwareDevV1_26, softwareDevV1_27, softwareDevV1_28, softwareDevV1_29, softwareDevV1_30, subtaskRaiseText } from '../src/workflows/software-dev.js';
 import { ActivityFailure, ApplicationFailure, RetryState } from '@temporalio/common';
 import { createAgentTurnLeaser } from '../src/workflows/agent-turn-lease.js';
 import { makeTurnPreparationActivities } from '../src/activities/turn-preparation.js';
@@ -1421,5 +1421,59 @@ describe('Return to Review while the world cannot wake (pramana#56)', () => {
     wf.absentPatches = new Set(['software-dev-open-pr-waits-for-world-v1']);
     drive(vi.fn(async () => { throw wakeFailure(); }));
     await expect(softwareDevV1_29(withRepo)).rejects.toThrow('Activity task failed');
+  });
+});
+
+// legibench3 #20 (2026-10-22): a message sent while Review was still setting
+// up showed "Waiting for you" and started nothing until the world had parked;
+// the same message sent again started the agent at once.
+describe('a message sent while Review sets up', () => {
+  const reviewed = { ...input, confirm: { layers: [{ kind: 'human', audience: ['@creator'] }] } };
+  const message = { id: 'u-setup', role: 'user', text: 'Which dataset was it?', ts: 1, to: ['agent:do'] };
+
+  const drive = () => {
+    wf.activities.accountPoolSize.mockResolvedValue(0);
+    wf.activities.pendingResourceCandidates = vi.fn(async () => 0);
+    // Publications, and the parks they ask for, in order.
+    const log: [string, any][] = [];
+    wf.activities.publishView.mockImplementation(async (_id: string, view: any) => { log.push(['publish', view]); return 'fence'; });
+    wf.activities.parkWaitingWorld = vi.fn(async (_id: string, view: any) => { log.push(['park', view]); });
+    let turns = 0;
+    wf.activities.runAgentTurn.mockImplementation(async () => {
+      turns++;
+      return turns === 1 ? { openPrRequested: true, completed: true, output: 'Done.' } : { output: 'It was three.', providerCompleted: true };
+    });
+    // The message arrives during Review's setup, while it merges published data in.
+    let sent = false;
+    wf.activities.integratePublishedResources = vi.fn(async () => {
+      if (!sent) { sent = true; wf.handlers.get('followUp')!(message); }
+      return [];
+    });
+    // Once the agent has answered, whatever it waits on next ends the test.
+    wf.wait = () => { if (turns === 2) wf.handlers.get('cancel')!(); };
+    return { log, turns: () => turns };
+  };
+
+  it('goes straight back to the agent, without waiting for a person or parking first', async () => {
+    const { log, turns } = drive();
+    expect(await softwareDevV1_30(reviewed)).toEqual({ stage: 'cancelled' });
+    expect(turns()).toBe(2);
+    // The first Review, up to the agent being called back for the message.
+    const from = log.findIndex(([, view]) => view.stage === 'review');
+    const to = log.findIndex(([, view], i) => i > from && view.stage === 'do');
+    const review = log.slice(from, to);
+    expect(from).toBeGreaterThan(-1);
+    expect(to).toBeGreaterThan(from);
+    // Setup works in the world, so it is not a wait that parks it.
+    expect(review.every(([kind, view]) => kind === 'publish' && view.status === 'active')).toBe(true);
+    expect(review.some(([, view]) => view.waitingFor?.kind === 'human')).toBe(false);
+  });
+
+  it('keeps histories recorded before it as they were', async () => {
+    wf.absentPatches = new Set(['software-dev-review-setup-follow-up-v1']);
+    const { log, turns } = drive();
+    expect(await softwareDevV1_30(reviewed)).toEqual({ stage: 'cancelled' });
+    expect(turns()).toBe(2);
+    expect(log.some(([kind, view]) => kind === 'park' && view.stage === 'review' && view.waitingFor?.kind === 'human')).toBe(true);
   });
 });

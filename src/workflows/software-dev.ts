@@ -374,6 +374,10 @@ const SEVERAL_BRANCHES_DATA_REVIEW = 'several-branches-data-review-v1';
 /** A sub-task whose parent world cannot be reached is waited out, then a
  * person's, never the asking agent's (pramana#39/#43). */
 const SUBTASK_PREPARE_WAITS_FOR_WORLD = 'software-dev-subtask-prepare-waits-for-world-v1';
+/** A message that comes while Review sets up returns to the agent before
+ * Review waits on anyone. Setup used to publish a wait, which parked the world
+ * first, and its message started nothing until the park ended (legibench3 #20). */
+const REVIEW_SETUP_FOLLOW_UP = 'software-dev-review-setup-follow-up-v1';
 const quietNotice = (m: Message): boolean => m.id.startsWith(QUIET_NOTICE);
 const clip = (text: string, max: number) => text.length > max ? `${text.slice(0, max)}…` : text;
 /** A turn can return while the agent's own in-harness sub-agents (Claude Agent SDK
@@ -1705,6 +1709,9 @@ async function softwareDevImpl(
   async function integratePublishedResources(): Promise<'do' | undefined> {
     let reports: Awaited<ReturnType<coreActivities['integratePublishedResources']>>;
     integratingResources = true;
+    // Merging works in the world: not yet a wait, which would park it.
+    const priorStatus = status;
+    if (patched(REVIEW_SETUP_FOLLOW_UP)) status = 'active';
     await publish();
     try { reports = (await resourceStaging.integratePublishedResources(taskId)) ?? []; }
     catch (err) {
@@ -1712,7 +1719,7 @@ async function softwareDevImpl(
       // Publication merges again at Confirm; Review need not wait for this.
       log.warn('merging newer published resources before Review failed', { err: String(err) });
       return undefined;
-    } finally { integratingResources = false; }
+    } finally { integratingResources = false; status = priorStatus; }
     const conflicted = reports.filter((report) => report.conflicts?.length);
     if (!conflicted.length || integrationBounces >= MAX_INTEGRATION_BOUNCES) { integrationBounces = 0; return undefined; }
     integrationBounces++;
@@ -1841,8 +1848,13 @@ async function softwareDevImpl(
       msgs.push({ id: `review-ci-${msgs.length}`, role: 'user', text, ts: Date.now() });
       return 'do';
     };
+    // A message the agent has not read ends Review before it waits on anyone:
+    // a wait parks the world, and only then would the message be seen.
+    const answerFirst = (): boolean => !confirmed && !cancelled && mainUnreadSince(options.messagesSeen)
+      && patched(REVIEW_SETUP_FOLLOW_UP);
 
     if (managedByParent) {
+      if (answerFirst()) return 'do';
       waitingFor = { kind: 'parent' };
       await notifyParent(options.raise?.type ?? 'needs_confirmation', reviewInfo?.summary);
       await publish();
@@ -1872,6 +1884,7 @@ async function softwareDevImpl(
         const epoch = confirmEpoch;
         const gates = gatesNow();
         if (layerIndex >= gates.length) break;
+        if (answerFirst()) return 'do';
         const layer = gates[layerIndex]!;
         const gateDetail = gates.length > 1 ? `confirm layer ${layerIndex + 1}/${gates.length}` : undefined;
         const reviewer = reviewerKey(gates.slice(0, layerIndex).filter((candidate) => candidate.kind === 'agent').length);
