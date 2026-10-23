@@ -12,19 +12,19 @@ interface FakeServer { id: number; name: string; status: string; created: string
 interface FakeVolume { id: number; name: string; size: number; created: string; server: number | null; labels: Labels;
   location: { name: string }; linux_device: string; dir: string }
 
-const TYPES: any[] = [
-  { id: 1, name: 'cx11', cores: 1, memory: 2, cpu_type: 'shared', architecture: 'x86', deprecation: { announced: '2024-01-01' },
+export const HETZNER_TYPES: any[] = [
+  { id: 1, name: 'cx11', cores: 1, memory: 2, disk: 20, cpu_type: 'shared', architecture: 'x86', deprecation: { announced: '2024-01-01' },
     prices: [{ location: 'fsn1', price_hourly: { net: '0.0050', gross: '0.0060' } }] },
-  { id: 2, name: 'cx22', cores: 2, memory: 4, cpu_type: 'shared', architecture: 'x86', deprecation: null,
+  { id: 2, name: 'cx22', cores: 2, memory: 4, disk: 40, cpu_type: 'shared', architecture: 'x86', deprecation: null,
     prices: [{ location: 'fsn1', price_hourly: { net: '0.0060', gross: '0.0071' } }] },
-  { id: 3, name: 'cax11', cores: 2, memory: 4, cpu_type: 'shared', architecture: 'arm', deprecation: null,
+  { id: 3, name: 'cax11', cores: 2, memory: 4, disk: 40, cpu_type: 'shared', architecture: 'arm', deprecation: null,
     prices: [{ location: 'fsn1', price_hourly: { net: '0.0050', gross: '0.0060' } }] },
-  { id: 4, name: 'cpx31', cores: 4, memory: 8, cpu_type: 'shared', architecture: 'x86', deprecation: null,
+  { id: 4, name: 'cpx31', cores: 4, memory: 8, disk: 160, cpu_type: 'shared', architecture: 'x86', deprecation: null,
     prices: [{ location: 'fsn1', price_hourly: { net: '0.0208', gross: '0.0248' } }] },
-  { id: 5, name: 'ccx13', cores: 2, memory: 8, cpu_type: 'dedicated', architecture: 'x86', deprecation: null,
+  { id: 5, name: 'ccx13', cores: 2, memory: 8, disk: 80, cpu_type: 'dedicated', architecture: 'x86', deprecation: null,
     prices: [{ location: 'fsn1', price_hourly: { net: '0.0230', gross: '0.0274' } }] },
   // Priced at fsn1 but no longer orderable there (as CPX11 was, 2026-10).
-  { id: 6, name: 'cpx11', cores: 2, memory: 2, cpu_type: 'shared', architecture: 'x86', deprecation: null,
+  { id: 6, name: 'cpx11', cores: 2, memory: 2, disk: 40, cpu_type: 'shared', architecture: 'x86', deprecation: null,
     prices: [{ location: 'fsn1', price_hourly: { net: '0.0040', gross: '0.0048' } }],
     locations: [{ name: 'fsn1', available: false, deprecation: { announced: '2025-10-16T06:00:00Z' } }] },
 ];
@@ -41,7 +41,8 @@ export class FakeHetzner {
   volumes = new Map<number, FakeVolume>();
   firewalls: Array<{ id: number; labels: Labels }> = [];
   sshKeys: Array<{ id: number; labels: Labels }> = [];
-  images: Array<{ id: number; status: string; labels: Labels }> = [];
+  /** Snapshots; `disk_size` is the disk of the server each was taken of. */
+  images: Array<{ id: number; status: string; labels: Labels; disk_size: number; description?: string }> = [];
   requests: Array<{ method: string; path: string; body?: any }> = [];
   /** The project's limit on shared vCPU across all its servers, on or off
    * (Hetzner Console → Limits); no API reads it. */
@@ -112,7 +113,7 @@ export class FakeHetzner {
     switch (kind) {
       case 'actions': return this.actions.has(id) ? json(200, { action: this.actions.get(id) })
         : json(404, { error: { code: 'not_found', message: 'action not found' } });
-      case 'server_types': return json(200, { server_types: TYPES, meta: { pagination: { next_page: null } } });
+      case 'server_types': return json(200, { server_types: HETZNER_TYPES, meta: { pagination: { next_page: null } } });
       case 'pricing': return json(200, { pricing: { currency: 'EUR', volume: { price_per_gb_month: { net: '0.0440' } },
         primary_ips: [{ type: 'ipv4', prices: [{ location: 'fsn1', price_hourly: { net: '0.0008' } }] }] } });
       case 'firewalls':
@@ -156,12 +157,15 @@ export class FakeHetzner {
       }
       case 'servers': {
         if (method === 'POST' && !idText) {
-          if (!TYPES.some((type) => type.name === body.server_type)) return json(422, { error: { code: 'invalid_input', message: 'unknown server type' } });
-          const where = TYPES.find((type) => type.name === body.server_type).locations?.find((entry: any) => entry.name === body.location);
+          if (!HETZNER_TYPES.some((type) => type.name === body.server_type)) return json(422, { error: { code: 'invalid_input', message: 'unknown server type' } });
+          const where = HETZNER_TYPES.find((type) => type.name === body.server_type).locations?.find((entry: any) => entry.name === body.location);
           if (where && where.available === false) return json(422, { error: { code: 'invalid_input', message: 'unsupported location for server type' } });
-          const type = TYPES.find((entry) => entry.name === body.server_type);
+          const type = HETZNER_TYPES.find((entry) => entry.name === body.server_type);
           if (this.soldOut.has(type.name))
             return json(412, { error: { code: 'resource_unavailable', message: 'error during placement', details: {} } });
+          // Hetzner's answer, verbatim from pramana#111 (2026-10-23).
+          if ((this.images.find((image) => String(image.id) === String(body.image))?.disk_size ?? 0) > type.disk)
+            return json(422, { error: { code: 'service_error', message: 'image disk is bigger than server type disk', details: {} } });
           const sharedInUse = [...this.servers.values()].filter((entry) => entry.server_type.cpu_type === 'shared')
             .reduce((sum, entry) => sum + entry.server_type.cores, 0);
           // Hetzner's answer, verbatim from pramana#58 (2026-10-15).
@@ -175,7 +179,7 @@ export class FakeHetzner {
             return json(403, { error: { code: 'resource_limit_exceeded', message: 'Primary IP limit exceeded',
               details: { limits: [{ name: 'primary_ip_limit' }] } } });
           const server: FakeServer = { id: ++this.ids, name: body.name, status: 'initializing', created: new Date().toISOString(),
-            labels: body.labels ?? {}, server_type: TYPES.find((type) => type.name === body.server_type), volumes: body.volumes ?? [],
+            labels: body.labels ?? {}, server_type: HETZNER_TYPES.find((type) => type.name === body.server_type), volumes: body.volumes ?? [],
             ip: `10.0.0.${this.ids % 250}`, ipv6: wantsIpv6, userData: body.user_data, datacenter: { location: { name: body.location } } };
           for (const volumeId of server.volumes) {
             const volume = this.volumes.get(volumeId)!;
@@ -200,7 +204,8 @@ export class FakeHetzner {
           if (this.fails(verb!)) return json(201, { action: this.action(verb, true) });
           if (verb === 'shutdown' || verb === 'poweroff') await this.halt(server);
           else if (verb === 'poweron') await this.boot(server);
-          else if (verb === 'create_image') this.images.push({ id: ++this.ids, status: 'available', labels: body.labels ?? {} });
+          else if (verb === 'create_image') this.images.push({ id: ++this.ids, status: 'available', labels: body.labels ?? {},
+            disk_size: server.server_type.disk, description: body.description });
           return json(201, { action: this.action(verb) });
         }
         return json(200, { server: this.view(server) });

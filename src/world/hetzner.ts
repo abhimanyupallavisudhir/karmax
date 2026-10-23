@@ -26,9 +26,11 @@ export { cloudInit };
  * New servers boot from a snapshot of a provisioned machine, built once per
  * Hetzner project and provisioning version (a few minutes, in the background,
  * the first time a world is made); until it exists, a server provisions itself
- * from stock Debian. A project firewall admits only karmax's SSH port, and a
- * project SSH key whose private half was never kept stops Hetzner generating
- * (and mailing) a root password.
+ * from stock Debian. A snapshot boots only servers whose disk holds the one it
+ * was taken of, so it is taken on the smallest disk on offer (pramana#111).
+ * A project firewall admits only karmax's SSH port, and a project SSH key
+ * whose private half was never kept stops Hetzner generating (and mailing) a
+ * root password.
  *
  * Hetzner's failures are ordinary (pramana#59: a power-on failed "Unknown
  * Error" and the same request a second later worked), so nothing here trusts
@@ -69,7 +71,7 @@ const usdPerEur = () => Number(process.env.KARMAX_USD_PER_EUR ?? 1.17);
 type Fetch = typeof fetch;
 
 interface ServerType {
-  id: number; name: string; cores: number; memory: number; cpu_type: string; architecture: string;
+  id: number; name: string; cores: number; memory: number; disk: number; cpu_type: string; architecture: string;
   deprecation?: unknown; deprecated?: boolean;
   prices: Array<{ location: string; price_hourly: { net: string; gross: string } }>;
   /** Where the type can be ordered now (a price alone is not enough: CPX11
@@ -90,6 +92,8 @@ interface Server {
   server_type: ServerType; volumes?: number[]; datacenter?: { location?: { name?: string } };
   public_net?: { ipv4?: { ip?: string } | null; ipv6?: { ip?: string } | null };
 }
+/** A provisioned snapshot; `disk_size` (GB) is the disk of the server it was taken of. */
+interface Snapshot { id: number; status: string; disk_size: number }
 interface Volume { id: number; name: string; size: number; created: string; server: number | null; labels: Record<string, string>;
   location: { name: string }; linux_device?: string; status?: string }
 
@@ -314,13 +318,19 @@ export class HetznerDriver implements VmDriver {
    * while Hetzner has none of it left at the location, the next ones. */
   private async createServer(connection: ResolvedWorldProviderConnection, ref: Record<string, string>, volume: Volume,
     shape: VmShape, keys: VmBootKeys, labels: Record<string, string>): Promise<Server> {
-    const snapshot = await this.snapshot(connection);
-    if (!snapshot) this.buildSnapshot(connection);
+    const snapshots = connection.config.image ? undefined : await this.snapshots(connection); // an explicit image is the operator's choice
     const [firewall, sshKey] = await Promise.all([this.firewall(connection), this.rootKey(connection)]);
     const types = (await this.serverTypes(connection, shape)).slice(0, TYPE_FALLBACKS);
+    // Hetzner refuses a snapshot bigger than the server's disk ("image disk is
+    // bigger than server type disk", pramana#111: one taken on an 80 GB CPX22
+    // while the 40 GB CX23 was sold out). Such a server provisions from stock
+    // Debian, and a snapshot that fits is built for the next.
+    const image = (type: ServerType) => connection.config.image
+      ?? (snapshots?.[0] && snapshots[0].disk_size <= type.disk ? String(snapshots[0].id) : HETZNER_DEFAULT_IMAGE);
+    if (snapshots && image(types[0]!) === HETZNER_DEFAULT_IMAGE) this.buildSnapshot(connection);
     let soldOut: unknown;
     for (const type of types) {
-      try { return await this.createServerOf(connection, ref, volume, type, { snapshot, firewall, sshKey }, keys, labels); }
+      try { return await this.createServerOf(connection, ref, volume, type, { image: image(type), firewall, sshKey }, keys, labels); }
       catch (error) {
         if (!isSoldOut(error)) throw error;
         soldOut = error;
@@ -332,11 +342,11 @@ export class HetznerDriver implements VmDriver {
   }
 
   private async createServerOf(connection: ResolvedWorldProviderConnection, ref: Record<string, string>, volume: Volume, type: ServerType,
-    project: { snapshot?: string; firewall: number; sshKey: number }, keys: VmBootKeys, labels: Record<string, string>): Promise<Server> {
+    project: { image: string; firewall: number; sshKey: number }, keys: VmBootKeys, labels: Record<string, string>): Promise<Server> {
     const api = this.api(connection);
-    const { snapshot, firewall, sshKey } = project;
+    const { image, firewall, sshKey } = project;
     const create = () => api('POST', '/servers', {
-      name: ref.world, server_type: type.name, location: ref.location, image: snapshot ?? connection.config.image ?? HETZNER_DEFAULT_IMAGE,
+      name: ref.world, server_type: type.name, location: ref.location, image,
       labels: withoutParked(labels), volumes: [volume.id], automount: false, start_after_create: true,
       firewalls: [{ firewall: firewall }], ssh_keys: [sshKey], public_net: PUBLIC_NET,
       user_data: cloudInit(keys, volume.linux_device ?? `/dev/disk/by-id/scsi-0HC_Volume_${volume.id}`),
@@ -476,20 +486,18 @@ export class HetznerDriver implements VmDriver {
     if (deleted?.action) await this.waitAction(connection, deleted.action.id);
   }
 
-  /** The snapshot of a machine that ran this provisioning version, if built. */
-  private async snapshot(connection: ResolvedWorldProviderConnection): Promise<string | undefined> {
-    if (connection.config.image) return undefined; // an explicit image is the operator's choice
-    const images = await this.pages<{ id: number; status: string }>(connection, '/images', 'images', `karmaxImage=${vmProvisionVersion()}`, 'type=snapshot');
-    const ready = images.find((image) => image.status === 'available');
-    return ready ? String(ready.id) : undefined;
+  /** The snapshots of machines that ran this provisioning version, smallest disk first. */
+  private async snapshots(connection: ResolvedWorldProviderConnection): Promise<Snapshot[]> {
+    const images = await this.pages<Snapshot>(connection, '/images', 'images', `karmaxImage=${vmProvisionVersion()}`, 'type=snapshot');
+    return images.filter((image) => image.status === 'available').sort((a, b) => a.disk_size - b.disk_size);
   }
 
   /** The provisioned snapshot, built now if there is none (several minutes). */
   async ensureSnapshot(connection: ResolvedWorldProviderConnection): Promise<string> {
     const until = Date.now() + 45 * 60_000;
     for (;;) {
-      const ready = await this.snapshot(connection);
-      if (ready) return ready;
+      const [ready] = await this.snapshots(connection);
+      if (ready) return String(ready.id);
       const key = `${this.key(connection)}:${vmProvisionVersion()}`;
       const building = this.building.get(key);
       if (building) await building;
@@ -514,9 +522,13 @@ export class HetznerDriver implements VmDriver {
   private async runBuild(connection: ResolvedWorldProviderConnection, version: string): Promise<void> {
     const api = this.api(connection);
     if ((await this.servers(connection, `karmaxImageBuilder=${version}`)).length) return; // another process builds it
+    // The smallest disk on offer that can provision, so the snapshot fits every
+    // server type; built again only when a smaller one than any built is on offer.
+    const type = (await this.serverTypes(connection, { cpu: 2, memoryMb: 2048 })).sort((a, b) => a.disk - b.disk)[0]!;
+    const [built] = await this.snapshots(connection);
+    if (built && built.disk_size <= type.disk) return;
     const host = generateSshKeyPair('karmax-builder-host');
     const client = generateSshKeyPair('karmax-builder');
-    const type = await this.serverType(connection, { cpu: 2, memoryMb: 2048 });
     const [firewall, sshKey] = await Promise.all([this.firewall(connection), this.rootKey(connection)]);
     const created = await api('POST', '/servers', {
       name: `karmax-image-${version}`, server_type: type.name, location: connection.config.region ?? HETZNER_DEFAULT_LOCATION,
@@ -547,7 +559,7 @@ export class HetznerDriver implements VmDriver {
       }
       await this.halt(connection, server.id, 120);
       const image = await api('POST', `/servers/${server.id}/actions/create_image`, {
-        type: 'snapshot', description: `karmax VM ${version}`, labels: { karmaxImage: version } }) as { action: { id: number } };
+        type: 'snapshot', description: `karmax VM ${version} (${type.disk} GB)`, labels: { karmaxImage: version } }) as { action: { id: number } };
       await this.waitAction(connection, image.action.id, 30 * 60_000);
     } finally {
       await this.deleteServer(connection, created.server).catch(() => undefined);
