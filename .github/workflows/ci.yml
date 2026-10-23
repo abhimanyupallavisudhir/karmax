@@ -94,10 +94,11 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
-    # At least twice a shard's normal runtime: slow runners have taken twice
-    # as long, while a genuine hang still fails reasonably soon. When the
-    # suite grows past half of it, add a shard (tests/duration-sequencer.test.ts).
-    timeout-minutes: 25
+    # The tests have their own limit (the npm test step); this one only stops
+    # a stuck setup. Installing Chromium's libraries took 10-11 min from a slow
+    # Ubuntu mirror (30 kB/s, CI #2283, #2287) and cancelled shards whose tests
+    # were on time.
+    timeout-minutes: 45
     env:
       # Paid live suites remain opt-in. These shards run the Docker suites too.
       KARMAX_TEST_PASS_INTEROP: '1'
@@ -166,7 +167,11 @@ jobs:
 
       # Includes the standalone UI and browser regressions: tests/web-regressions.test.ts
       # runs every web/*.test.cjs.
+      # At least twice a shard's normal runtime: slow runners have taken twice
+      # as long, while a genuine hang still fails reasonably soon. When the
+      # suite grows past half of it, add a shard (tests/duration-sequencer.test.ts).
       - run: npm test -- --shard=${{ matrix.shard }}/${{ strategy.job-total }}
+        timeout-minutes: 25
 
   # Reports the @tavya/cli version merging this pull request would publish
   # (cli-release.yml computes it on master; pull requests never bump it), and
