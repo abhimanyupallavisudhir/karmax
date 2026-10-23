@@ -18,13 +18,13 @@ describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
   const get = (p: string) => fetch(`${base}${p}`, { headers: auth() }).then(J);
   const post = (p: string, body: any) => fetch(`${base}${p}`, { method: 'POST', headers: auth(), body: JSON.stringify(body) }).then(J);
   const put = (p: string, body: any) => fetch(`${base}${p}`, { method: 'PUT', headers: auth(), body: JSON.stringify(body) }).then(J);
-  const poll = async (id: string, stage: string) => {
+  const poll = async (id: string, stage: string, status?: string) => {
     for (let i = 0; i < 60; i++) {
       const v = await get(`/api/tasks/${id}`);
-      if (v?.stage === stage) return v;
+      if (v?.stage === stage && (!status || v.status === status)) return v;
       await new Promise((r) => setTimeout(r, 250));
     }
-    throw new Error(`task ${id} never reached ${stage}`);
+    throw new Error(`task ${id} never reached ${stage}${status ? ` (${status})` : ''}`);
   };
 
   beforeAll(async () => {
@@ -218,7 +218,8 @@ describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
       workflow: 'software-dev',
       params: { prompt: '@write arch.txt :: x\n@review ready' },
     });
-    const atReview = await poll(task.id, 'review'); // awaiting review → status waiting
+    // Review is briefly active while it brings in newer published data, then waits.
+    const atReview = await poll(task.id, 'review', 'waiting');
     expect(atReview.status).toBe('waiting');
     // Add a sibling Draft and archive through that non-principal attempt. Archive
     // belongs to the logical task: the projected principal and every sibling must

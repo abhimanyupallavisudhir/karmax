@@ -518,7 +518,8 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('do');
     const changed = await handle.executeUpdate('changeWorkflow', { args: ['software-dev'] }) as any;
     expect(changed.workflow).toBe('software-dev');
-    await expect.poll(async () => (await view(handle)).stage, { timeout: 15_000 }).toBe('review');
+    // Review is briefly active while it brings in newer published data, then waits.
+    await expect.poll(async () => { const v = await view(handle); return `${v.stage}/${v.status}`; }, { timeout: 15_000 }).toBe('review/waiting');
     const atReview = await view(handle);
     expect(atReview.workflow).toBe('software-dev');
     expect(atReview.status).toBe('waiting');
