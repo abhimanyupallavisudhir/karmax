@@ -66,6 +66,9 @@ const ok = (condition, message) => condition ? pass++ : (fail++, console.error('
 ok(forkBranchDefaults({ lastView: { status: 'cancelled', branch: 'tavya/source', targetBranch: 'main' } }).base === 'tavya/source', 'cancelled forks default to the source branch');
 ok(forkBranchDefaults({ status: 'done', branch: 'tavya/source', targetBranch: 'release' }).base === 'release', 'landed forks default to their merge destination');
 ok(!forkBranchDefaults({}).base, 'a conversation without a branch keeps ordinary defaults');
+ok(forkBranchDefaults({ lastView: { status: 'waiting', branch: 'tavya/source', targetBranch: 'main' } }).target === 'main', 'a fork lands where its source lands');
+ok(forkBranchDefaults({ status: 'done', branch: 'tavya/source', targetBranch: 'main' }).target === 'main', 'a landed fork lands where its source landed');
+ok(!('target' in forkBranchDefaults({ lastView: { status: 'waiting', branch: 'tavya/source' } })), 'a source with no known target keeps the default target');
 global.CSS = { escape: (value) => value };
 global.sameJson = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 const baseInput = { value: 'main', getAttribute: () => '"main"' };
@@ -75,7 +78,17 @@ baseInput.value = '';
 ok(collectForm(branchForm, [{ name: 'base', type: 'branch' }]).base === 'main', 'clearing a fork base uses the inherited branch without reselecting the source branch');
 let branchChanges = 0;
 const forkBranchInput = { value: 'main', dispatchEvent: () => branchChanges++ };
-const forkForm = { querySelector: (selector) => selector === '[data-field="base"]' ? forkBranchInput : {} };
+const forkForm = { querySelector: (selector) => selector === '[data-field="base"]' ? forkBranchInput
+  : selector === '[data-field="target"]' ? null : {} };
+const forkTargetInput = { value: 'master', dispatchEvent: () => branchChanges++ };
+const forkPairForm = { querySelector: (selector) => selector === '[data-field="base"]' ? forkBranchInput
+  : selector === '[data-field="target"]' ? forkTargetInput : {} };
+forkBranchInput.value = 'master';
+branchChanges = 0;
+prefillForkBranch({ dataset: { agent: 'do' }, closest: () => forkPairForm }, { lastView: { status: 'done', branch: 'tavya/source', targetBranch: 'main' } });
+ok(forkBranchInput.value === 'main' && forkTargetInput.value === 'main' && branchChanges === 2, 'picking a source fills both base and target, not a default the repository may lack');
+forkBranchInput.value = 'main';
+branchChanges = 0;
 prefillForkBranch({ dataset: { agent: 'do' }, closest: () => forkForm }, { lastView: { status: 'waiting', branch: 'tavya/source' } });
 ok(forkBranchInput.value === 'tavya/source' && branchChanges === 1, 'picking a source fills the branch field and announces the change');
 global.document.querySelectorAll = (selector) => selector === '#dep-chips [data-depid]' ? [{ dataset: { depid: 'task_source' } }] : [];

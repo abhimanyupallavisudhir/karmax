@@ -80,6 +80,34 @@ describe('fork_agent reauthorize', () => {
     (await f.store.close());
   });
 
+  it('lands a fork where its source lands, not on an inherited default the repository may lack', async () => {
+    const f = (await fixture());
+    const token = (await f.tokenFor('owner'));
+    // The organization defaults to master; the source ran on a main-only repository.
+    (await f.store.setSettings('organization:org_personal', '__common__', { base: 'master', target: 'master' }));
+    (await f.store.saveView(f.source.id, { taskId: f.source.id, status: 'done',
+      branch: 'tavya/source', targetBranch: 'main', messages: [], state: {} } as any));
+    const fork = (params: Record<string, unknown> = {}) => f.api.createTask(token, { projectId: f.project.id, draft: true,
+      params: { prompt: 'follow up', ...params, 'agent:do': { resumeFrom: { taskId: f.source.id } } } });
+    // The task form sends the prefilled base; an API caller may send nothing.
+    for (const created of [await fork({ base: 'main' }), await fork()]) {
+      expect(created.params.base).toBe('main');
+      expect(created.params.target).toBe('main');
+    }
+    // An unlanded source: the fork continues its branch and still lands where it would.
+    (await f.store.saveView(f.source.id, { taskId: f.source.id, status: 'waiting',
+      branch: 'tavya/source', targetBranch: 'main', messages: [], state: {} } as any));
+    const unlanded = await f.api.forkTaskAgent(token, { taskId: f.source.id, message: 'continue' });
+    expect(unlanded.params).toMatchObject({ base: 'tavya/source', target: 'main' });
+    // A target the task names itself always wins.
+    expect((await fork({ target: 'release' })).params.target).toBe('release');
+    // Queueing persists the resolved pair the world is provisioned with.
+    const queued = await f.api.createTask(token, { projectId: f.project.id,
+      params: { prompt: 'queued', 'agent:do': { resumeFrom: { taskId: f.source.id } } } });
+    expect(queued.params).toMatchObject({ base: 'tavya/source', target: 'main' });
+    (await f.store.close());
+  });
+
   it('starts a fork that waits for its source to succeed from where the source lands', async () => {
     const f = (await fixture());
     const token = (await f.tokenFor('owner'));

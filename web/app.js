@@ -2368,21 +2368,28 @@ function readAgentBlock(root) {
 
 // Where a fork starts: the source's unpublished branch, or where the source
 // lands once it has landed — or will have, because the fork waits for it
-// (`awaited`, mirroring prepareForkWorld in src/platform/api.ts).
+// (`awaited`). Either way it lands where the source lands, never on a default
+// the repository may lack (mirroring prepareForkWorld in src/platform/api.ts).
 function forkBranchDefaults(task, awaited = false) {
   const view = task?.lastView || task;
-  const base = view?.status === 'done' || awaited ? view?.targetBranch || task?.params?.target : view?.branch;
-  return base ? { base } : {};
+  const target = view?.targetBranch || task?.params?.target;
+  const base = view?.status === 'done' || awaited ? target : view?.branch;
+  return { ...(base ? { base } : {}), ...(target ? { target } : {}) };
 }
 
 function prefillForkBranch(box, task) {
   if (!['do', 'unified'].includes(box.dataset.agent)) return;
   const root = box.closest('#tf-body');
   const input = root?.querySelector('[data-field="base"]');
-  const base = forkBranchDefaults(task, selectedDepIds().includes(task.id)).base;
+  const { base, target } = forkBranchDefaults(task, selectedDepIds().includes(task.id));
   if (!input || !base || (task.projectId && task.projectId !== (root.dataset.projectId || S.projectId))) return;
   input.value = base;
   input.dispatchEvent(new Event('change', { bubbles: true }));
+  const targetInput = root.querySelector('[data-field="target"]');
+  if (targetInput && target) {
+    targetInput.value = target;
+    targetInput.dispatchEvent(new Event('change', { bubbles: true }));
+  }
   showForkWorldHelp(root);
 }
 

@@ -81,5 +81,10 @@
     "playwright": "1.63.0",
     "typescript": "^5.7.2",
     "vitest": "^4.1.11"
+  },
+  "overrides": {
+    "e2b": {
+      "undici8": "npm:undici@8.12.3"
+    }
   }
 }
