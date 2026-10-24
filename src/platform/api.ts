@@ -1271,11 +1271,15 @@ export class KarmaxApi {
     const start = retained?.taskId === sourceId ? retained : forkWorldSource(source, handle);
     if (!start) return;
     params._forkWorld = start;
-    if (previous || params.base !== undefined) return;
+    if (previous) return;
+    // A fork lands where its source lands unless it names its own target: an
+    // inherited default (master) may not exist in the source's repository (main).
+    const landing = forkLandingBranch(source, handle);
+    if (params.target === undefined && landing) params.target = landing;
+    if (params.base !== undefined) return;
     // A fork that waits for its source to succeed starts after the source has
     // landed, so it starts where the source lands rather than from its branch.
     if (awaitsSuccessOf(normalizeTriggers(params), sourceId)) {
-      const landing = forkLandingBranch(source, handle);
       if (landing) params.base = landing;
     } else params.base = start.base;
   }
