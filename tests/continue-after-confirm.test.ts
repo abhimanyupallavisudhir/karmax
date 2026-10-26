@@ -125,6 +125,30 @@ describe('continue after Confirm', () => {
     await f.store.close();
   });
 
+  // A task keeps the payment defaults it started with. Once the defaults
+  // move (a card added, a budget edited), the copied policy is an override,
+  // and Continue asked an Administrator, who cannot move money, for
+  // payment:write (the same refusal as funding-analysis#1, whose cause was
+  // key order: tests/payment-policy-currency.test.ts).
+  it('a continuation spends under the project’s current payment defaults, unless a payments manager continues it', async () => {
+    const f = await fixture();
+    await f.store.updateTaskParams(f.source.id, { ...f.source.params, paymentPolicy: { cardIds: [], budget: 0, currency: 'usd' } });
+    await f.store.saveView(f.source.id, f.landed);
+    await f.store.createCard({ id: 'card-1', provider: 'test', scope: 'organization', scopeId: 'org_personal',
+      label: 'Card', cap: 10_000, available: 10_000, currency: 'usd', createdAt: Date.now() });
+    const defaults = { cardIds: ['card-1'], budget: 0, currency: 'usd' };
+
+    const member = await f.tokenFor('user:owner');
+    const continued = await f.api.postTaskMessage(member, f.source.id, { text: 'Now the next piece' });
+    expect((await f.store.getTask(continued.continuedIn!.id))?.params.paymentPolicy).toEqual(defaults);
+
+    // Someone who may set budgets keeps the one the source ran under.
+    const manager = await f.tokenFor('user:owner', ['use-credential:item:cred_safe', 'payment:write']);
+    const kept = await f.api.postTaskMessage(manager, f.source.id, { text: 'And the one after' });
+    expect((await f.store.getTask(kept.continuedIn!.id))?.params.paymentPolicy).toEqual({ cardIds: [], budget: 0, currency: 'usd' });
+    await f.store.close();
+  });
+
   it('while the approved proposal lands, the continuation starts from its unlanded branch', async () => {
     const f = await fixture();
     await f.store.saveView(f.source.id, { ...f.landed, stage: 'merge', status: 'waiting', waitingFor: { kind: 'github', detail: 'CI' } });

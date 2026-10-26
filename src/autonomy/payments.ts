@@ -1433,6 +1433,16 @@ export function withPolicyCurrency(value: unknown, currency: string): unknown {
   return { ...p, currency: typeof p.currency === 'string' ? p.currency.toLowerCase() : currency };
 }
 
+/** Whether two policies grant the same: the same cards, budget and currency.
+ * Not their JSON text: PostgreSQL's jsonb stores a task's keys reordered. */
+export function samePaymentPolicy(a: unknown, b: unknown): boolean {
+  const key = (value: unknown) => {
+    const p = (value ?? {}) as Partial<PaymentPolicy>;
+    return JSON.stringify([Array.isArray(p.cardIds) ? [...new Set(p.cardIds)].sort() : p.cardIds ?? null, p.budget ?? null, p.currency ?? null]);
+  };
+  return key(a) === key(b);
+}
+
 export async function validatePaymentPolicy(store: Store, projectId: string | undefined, organizationId: string, value: unknown): Promise<void> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid payment policy');
   const p = value as PaymentPolicy;

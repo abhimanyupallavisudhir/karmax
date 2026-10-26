@@ -1,5 +1,5 @@
 import * as __asyncCollections from '../util/async-collections.js';
-import { resolvePaymentPolicy, validatePaymentPolicy, withPolicyCurrency } from '../autonomy/payments.js';
+import { resolvePaymentPolicy, samePaymentPolicy, validatePaymentPolicy, withPolicyCurrency } from '../autonomy/payments.js';
 import { randomUUID } from 'node:crypto';
 import { timingEnabled, installationTiming, timingReport } from '../timing/index.js';
 import { checkoutBranches, expectedTaskRemoteHeads, recordTaskPublication } from '../world/publication.js';
@@ -1524,7 +1524,7 @@ export class KarmaxApi {
     if (taskOverrides.paymentPolicy !== undefined) {
       taskOverrides.paymentPolicy = withPolicyCurrency(taskOverrides.paymentPolicy, paymentDefaults.currency);
       (await validatePaymentPolicy(this.deps.store, project.id, project.organizationId ?? 'org_personal', taskOverrides.paymentPolicy));
-      if (JSON.stringify(taskOverrides.paymentPolicy) !== JSON.stringify(paymentDefaults))
+      if (!samePaymentPolicy(taskOverrides.paymentPolicy, paymentDefaults))
         (await this.require(token, 'manage_payments', { projectId: project.id }));
     }
     taskOverrides.paymentPolicy ??= paymentDefaults;
@@ -3350,7 +3350,7 @@ export class KarmaxApi {
     const keepArmed = opts.keepArmed !== false && !task.params?.draft;
     if (params.paymentPolicy !== undefined)
       params = { ...params, paymentPolicy: withPolicyCurrency(params.paymentPolicy, (await resolvePaymentPolicy(this.deps.store, task.projectId, taskId)).currency) };
-    if (params.paymentPolicy !== undefined && JSON.stringify(params.paymentPolicy) !== JSON.stringify((task.params as any).paymentPolicy)) {
+    if (params.paymentPolicy !== undefined && !samePaymentPolicy(params.paymentPolicy, (task.params as any).paymentPolicy)) {
       (await this.require(token, 'manage_payments', { projectId: task.projectId, taskId }));
       (await validatePaymentPolicy(this.deps.store, task.projectId, (await this.deps.store.getProject(task.projectId))!.organizationId ?? 'org_personal', params.paymentPolicy));
     }
@@ -6419,6 +6419,11 @@ Act according to your Avatar instructions. When ready, call platform_request POS
     const params: ValueMap = stripPlatformMetadata(cloneParamsWithoutTriggers({ ...source.params } as ValueMap));
     for (const name of ['prompt', 'images', 'files', 'base', 'branch', 'attempts']) delete params[name];
     for (const name of Object.keys(params)) if (CALLED_AGENT_FIELD.test(name)) delete params[name];
+    // A budget is money for the task it is set on: the source's (often just the
+    // defaults it started with) carries on only for someone who may set one.
+    // Anyone else's continuation spends under today's defaults, and asks above them.
+    if (!(await this.deps.tokens.check(token, 'payment:write', { projectId: source.projectId, taskId })).ok)
+      delete params.paymentPolicy;
     const field = params['agent:do'] === undefined && params['agent:unified'] !== undefined ? 'agent:unified' : 'agent:do';
     const { resumeFrom: _previous, ...agent } = (params[field] ?? {}) as Partial<AgentSpec>;
     params[field] = { ...agent, resumeFrom: { taskId, role: MAIN_AGENT } };
