@@ -125,6 +125,29 @@ describe('continue after Confirm', () => {
     await f.store.close();
   });
 
+  // dharma-artha-maxxer, funding-analysis#1 (2026-10-26): a task keeps the
+  // payment defaults it started with. A card was added to the organization
+  // since, so the copied policy no longer matched the defaults, and Continue
+  // asked an Administrator, who cannot move money, for payment:write.
+  it('a continuation spends under the project’s current payment defaults, unless a payments manager continues it', async () => {
+    const f = await fixture();
+    await f.store.updateTaskParams(f.source.id, { ...f.source.params, paymentPolicy: { cardIds: [], budget: 0, currency: 'usd' } });
+    await f.store.saveView(f.source.id, f.landed);
+    await f.store.createCard({ id: 'card-1', provider: 'test', scope: 'organization', scopeId: 'org_personal',
+      label: 'Card', cap: 10_000, available: 10_000, currency: 'usd', createdAt: Date.now() });
+    const defaults = { cardIds: ['card-1'], budget: 0, currency: 'usd' };
+
+    const member = await f.tokenFor('user:owner');
+    const continued = await f.api.postTaskMessage(member, f.source.id, { text: 'Now the next piece' });
+    expect((await f.store.getTask(continued.continuedIn!.id))?.params.paymentPolicy).toEqual(defaults);
+
+    // Someone who may set budgets keeps the one the source ran under.
+    const manager = await f.tokenFor('user:owner', ['use-credential:item:cred_safe', 'payment:write']);
+    const kept = await f.api.postTaskMessage(manager, f.source.id, { text: 'And the one after' });
+    expect((await f.store.getTask(kept.continuedIn!.id))?.params.paymentPolicy).toEqual({ cardIds: [], budget: 0, currency: 'usd' });
+    await f.store.close();
+  });
+
   it('while the approved proposal lands, the continuation starts from its unlanded branch', async () => {
     const f = await fixture();
     await f.store.saveView(f.source.id, { ...f.landed, stage: 'merge', status: 'waiting', waitingFor: { kind: 'github', detail: 'CI' } });

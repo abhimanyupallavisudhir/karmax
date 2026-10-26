@@ -6419,6 +6419,11 @@ Act according to your Avatar instructions. When ready, call platform_request POS
     const params: ValueMap = stripPlatformMetadata(cloneParamsWithoutTriggers({ ...source.params } as ValueMap));
     for (const name of ['prompt', 'images', 'files', 'base', 'branch', 'attempts']) delete params[name];
     for (const name of Object.keys(params)) if (CALLED_AGENT_FIELD.test(name)) delete params[name];
+    // A budget is money for the task it is set on: the source's (often just the
+    // defaults it started with) carries on only for someone who may set one.
+    // Anyone else's continuation spends under today's defaults, and asks above them.
+    if (!(await this.deps.tokens.check(token, 'payment:write', { projectId: source.projectId, taskId })).ok)
+      delete params.paymentPolicy;
     const field = params['agent:do'] === undefined && params['agent:unified'] !== undefined ? 'agent:unified' : 'agent:do';
     const { resumeFrom: _previous, ...agent } = (params[field] ?? {}) as Partial<AgentSpec>;
     params[field] = { ...agent, resumeFrom: { taskId, role: MAIN_AGENT } };
