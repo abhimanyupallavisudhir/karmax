@@ -42,6 +42,30 @@ describe('payment policy currency through the API', () => {
     } finally { (await store.close()); }
   });
 
+  // funding-analysis#1 (2026-10-26): PostgreSQL's jsonb rewrites a task's
+  // params with its keys reordered (budget, cardIds, currency), so a task's
+  // unchanged default no longer matched its JSON text, and continuing it or
+  // editing its draft asked an Administrator for payment:write.
+  it('recognizes an unchanged policy whatever the order of its keys and cards', async () => {
+    const { store, project, card, mint, api } = (await setup());
+    try {
+      const second = await new MockPaymentProvider(store).provisionCard({ scope: 'project', scopeId: project.id, label: 'Euro 2', cap: 1000, currency: 'EUR' } as any);
+      (await store.setSettings(project.id, 'payments', { cardIds: [card.id, second.id], budget: 500, currency: 'eur' }));
+      const member = (await mint(['task:*']));
+      const task = await api.createTask(member, { projectId: project.id, title: 'Buy', workflow: 'just-do',
+        params: { prompt: 'buy', draft: true, paymentPolicy: { budget: 500, cardIds: [second.id, card.id], currency: 'eur' } } } as any);
+      const edited = await api.updateArmedParams(member, task.id, { prompt: 'buy more', draft: true,
+        paymentPolicy: { currency: 'eur', cardIds: [second.id, card.id], budget: 500 } }, { replace: true });
+      expect(edited.params.prompt).toBe('buy more');
+      // A change is still one.
+      await expect(api.createTask(member, { projectId: project.id, title: 'Buy', workflow: 'just-do',
+        params: { prompt: 'buy', paymentPolicy: { budget: 501, cardIds: [card.id, second.id], currency: 'eur' } } } as any))
+        .rejects.toThrow(/payment:write/);
+      await expect(api.updateArmedParams(member, task.id, { prompt: 'buy', draft: true,
+        paymentPolicy: { cardIds: [card.id], budget: 500, currency: 'eur' } }, { replace: true })).rejects.toThrow(/payment:write/);
+    } finally { (await store.close()); }
+  });
+
   // #367 review item 14: before AU-36 a budget was a bare number counted
   // against whatever cards the task used. Read as USD, a budget over euro
   // cards would turn every auto-approved payment into an approval.

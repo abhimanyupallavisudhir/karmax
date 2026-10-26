@@ -125,10 +125,11 @@ describe('continue after Confirm', () => {
     await f.store.close();
   });
 
-  // dharma-artha-maxxer, funding-analysis#1 (2026-10-26): a task keeps the
-  // payment defaults it started with. A card was added to the organization
-  // since, so the copied policy no longer matched the defaults, and Continue
-  // asked an Administrator, who cannot move money, for payment:write.
+  // A task keeps the payment defaults it started with. Once the defaults
+  // move (a card added, a budget edited), the copied policy is an override,
+  // and Continue asked an Administrator, who cannot move money, for
+  // payment:write (the same refusal as funding-analysis#1, whose cause was
+  // key order: tests/payment-policy-currency.test.ts).
   it('a continuation spends under the project’s current payment defaults, unless a payments manager continues it', async () => {
     const f = await fixture();
     await f.store.updateTaskParams(f.source.id, { ...f.source.params, paymentPolicy: { cardIds: [], budget: 0, currency: 'usd' } });
