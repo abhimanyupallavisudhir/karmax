@@ -126,7 +126,7 @@ import { hostLocal as deploymentHostLocal } from '../config/deployment.js';
 import type { ObjectStore } from '../store/objects.js';
 import { conversationImportObjectKey } from '../store/conversation-imports.js';
 import { ensureProjectWikiRepositoryAsync, PROJECT_WIKI_BRANCH, setProjectWikiRemote } from '../wiki/repository.js';
-import { WikiGithubAccess } from '../wiki/github-access.js';
+import { ProjectGithubAccess } from '../integrations/project-github-access.js';
 import { RepositoryAccessRequests, withdrawRepositoryAccessRequests } from '../integrations/repository-access.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -380,10 +380,15 @@ export interface OpenPrDetails {
 /** The PR description: the task's own summary, plus the provenance line that
  *  correlates the pull request back to the karmax task (also what the webhook
  *  dispatcher's branch matching relies on being true). */
-function prBody(handle: WorldHandle, details: OpenPrDetails, num?: number, repoName?: string): string {
+function prBody(handle: WorldHandle, details: OpenPrDetails, num?: number, repoName?: string, requestedBy?: string): string {
   const summary = details.summary?.trim() || '_No review summary was recorded for this task._';
   const task = num != null ? `${BRAND} task #${num} (\`${handle.id}\`)` : `${BRAND} task \`${handle.id}\``;
-  const provenance = `\n\n---\n${task} · branch \`${handle.branch}\`${repoName ? ` · repo \`${repoName}\`` : ''}`;
+  // Opened as the App for someone with no GitHub account: never silently.
+  const requester = requestedBy
+    ? `\n\nRequested in ${BRAND} by ${requestedBy.replace(/\s+/g, ' ').slice(0, 200)}, who has no GitHub account linked; `
+      + `the ${BRAND} GitHub App opened this pull request for them.`
+    : '';
+  const provenance = `${requester}\n\n---\n${task} · branch \`${handle.branch}\`${repoName ? ` · repo \`${repoName}\`` : ''}`;
   const suffix = '\n… (summary truncated)';
   const budget = Math.max(0, 65_536 - Buffer.byteLength(provenance + suffix));
   let bounded = summary;
@@ -1085,9 +1090,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       : (await store.getTask(handle.id))?.projectId;
     const env = (await gitEnvFor(handle, handle.id));
     if (env.GH_TOKEN) return env.GH_TOKEN;
-    // A human task must never silently open its PR as the organization App.
+    // A human task must never *silently* open its PR as the organization App.
     // Transport may use the installation, but authorship is the person's App
-    // authorization (handled above), a manual profile fallback, or a setup error.
+    // authorization (prApiFor), a manual profile fallback, or — only for a
+    // creator who never linked a GitHub account — the App, with the PR body
+    // naming who asked and a `pr.opened-by-app` task event (prApiFor decides).
     if ((await gitBindingFromHandle(handle, handle.id)).scope.startsWith('user:')) return undefined;
     if (projectId && deps.githubApp) {
       const repository = authorizedRepository ?? (await enrolledGithubRepository(projectId, slug));
@@ -1140,11 +1147,22 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     return request?.approvers.map((approver) => approver.login) ?? [];
   }
 
-  let wikiAccess: WikiGithubAccess | undefined;
-  function wikiGithubAccess(): WikiGithubAccess {
-    wikiAccess ??= new WikiGithubAccess({ store, githubApp: deps.githubApp!, authorization: deps.authorization,
+  let repositoryAccess: ProjectGithubAccess | undefined;
+  function projectGithubAccess(): ProjectGithubAccess {
+    repositoryAccess ??= new ProjectGithubAccess({ store, githubApp: deps.githubApp!, authorization: deps.authorization,
       log: (line) => console.warn(`[karmax] ${line}`) });
-    return wikiAccess;
+    return repositoryAccess;
+  }
+
+  /** Pull-request clients that act as the GitHub App for a creator who has no
+   * GitHub account (see prApiFor): who asked for the work, and why the App acts. */
+  const openedByApp = new WeakMap<GithubPrApi, { userId: string; requestedBy: string; reason: string }>();
+
+  /** How a pull request names the person who asked for it: their name, else their e-mail. */
+  async function requesterName(userId: string, projectId: string | undefined): Promise<string> {
+    const organizationId = projectId ? (await store.getProject(projectId))?.organizationId : undefined;
+    const person = organizationId ? (await store.organizationPeople(organizationId)).find((candidate) => candidate.id === userId) : undefined;
+    return person?.name?.trim() || person?.email?.trim() || (await store.userDisplayName(userId)) || userId;
   }
 
   async function prApiFor(
@@ -1167,15 +1185,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     // capacities: its installation owns repository transport, while this
     // per-user OAuth grant makes the PR attributable to the task creator.
     const githubStatus = userId ? (await deps.githubApp?.status(userId)) : undefined;
+    const accounts = userId && repository?.gitConnectionId && typeof deps.githubApp?.listUserAccounts === 'function'
+      ? await deps.githubApp.listUserAccounts(userId).catch(() => []) : [];
     if (userId && repository?.gitConnectionId && githubStatus?.userAuthorized) {
-      const accounts = typeof deps.githubApp!.listUserAccounts === 'function'
-        ? await deps.githubApp!.listUserAccounts(userId).catch(() => []) : [];
       const login = (accounts.find((account) => account.id === accountId) ?? accounts.find((account) => account.active))?.login;
-      // tavya made the project wiki's repository, in the App owner's account: the
-      // creator may not have been given it yet, so grant it before acting as them.
+      // Everyone with access to the project is a collaborator on its repositories
+      // (ProjectGithubAccess), but the debounced sync may not have run yet for a
+      // new member or a just-attached repository: grant the creator first, so the
+      // pull request opened as them is not answered with 404.
       let invitationUrl: string | undefined;
-      if (projectId && (await store.projectWiki(projectId))?.repository?.id === repository.id) {
-        const outcomes = await wikiGithubAccess().syncProject(projectId, userId).catch((error) => {
+      if (typeof deps.githubApp!.repositoryCollaborators === 'function') {
+        const outcomes = await projectGithubAccess().syncRepository(repository.id, userId).catch((error) => {
           console.warn(`[karmax] could not give ${login ?? userId} access to ${slug}:`, error instanceof Error ? error.message : error);
           return [];
         });
@@ -1190,12 +1210,32 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     }
     const token = await githubTokenFor(handle, slug, repository);
     if (!token) {
+      // A person who never linked GitHub (most people who are not developers)
+      // still gets their pull request: the App opens it, and says who asked.
+      // This is safe: the App's installation already pushed the task branch; a
+      // tavya role (`task:create`) decided who may create the task at all; and
+      // merging still needs a person with GitHub merge rights (mergeGithubPrs
+      // never merges as the App). Someone who linked GitHub but whose
+      // authorization broke is asked to reconnect instead, so their pull
+      // requests keep a human author.
+      if (userId && repository?.gitConnectionId && deps.githubApp && !githubStatus?.userAuthorized && !accounts.length
+        && !githubStatus?.lastAuthorizationFailure
+        && !(typeof deps.githubApp.hasLinkedUserAccount === 'function' && await deps.githubApp.hasLinkedUserAccount(userId))) {
+        const connection = await store.getGitConnection(repository.gitConnectionId);
+        if (connection && typeof deps.githubApp.installationToken === 'function') {
+          const api = new GithubPrApi(await deps.githubApp.installationToken(connection, [repository.providerId ?? '']), deps.githubPr ?? {});
+          openedByApp.set(api, { userId, requestedBy: await requesterName(userId, projectId),
+            reason: `the task's creator has no GitHub account linked to ${BRAND}` });
+          return api;
+        }
+      }
       if (userId && repository?.gitConnectionId && githubStatus?.oauthConfigured) {
         const failure = githubStatus.lastAuthorizationFailure;
         const diagnostic = failure
-          ? ` Last recorded authorization failure: ${failure.summary} [${failure.code}, ${new Date(failure.occurredAt).toISOString()}]`
+          ? ` Technical detail: GitHub's last answer was "${failure.summary}" [${failure.code}, ${new Date(failure.occurredAt).toISOString()}].`
           : '';
-        throw new Error(`GitHub PR identity is not connected for ${slug}. Connect GitHub on your profile so the pull request has a human author, then retry.${diagnostic} Repository transport authorization is already separate; this is not a non-fast-forward or local ancestry error.`);
+        throw new Error('Your GitHub connection needs to be renewed. Open your profile and reconnect GitHub, then press Retry.'
+          + `${diagnostic} The pull request for ${slug} is opened as you; this is not a branch-history conflict.`);
       }
       throw new Error(`GitHub identity/authorization is missing for ${slug}. Grant the acting account access to this repository, then connect or re-authorize GitHub on your profile. This is not a branch-history conflict.`);
     }
@@ -5185,7 +5225,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           title: changed.length > 1
             ? `${details.title?.trim() || BRAND} (${repo.name})`
             : details.title?.trim() || `${BRAND}: ${repo.branch}`,
-          body: prBody(handle, details, (await store.getTask(handle.id))?.num, changed.length > 1 ? repo.name : undefined),
+          body: prBody(handle, details, (await store.getTask(handle.id))?.num, changed.length > 1 ? repo.name : undefined,
+            openedByApp.get(api)?.requestedBy),
         });
         let opening: Awaited<ReturnType<typeof api.openOrUpdate>>;
         try {
@@ -5218,6 +5259,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           ...(pr.nodeId ? { nodeId: pr.nodeId } : {}),
         };
         (await record(handle.id, created ? 'pr.opened' : 'pr.updated', { ...ref, base, branch: repo.branch }));
+        const byApp = openedByApp.get(api);
+        if (byApp) (await record(handle.id, 'pr.opened-by-app', { repo: repo.name, slug, number: pr.number, url: pr.url,
+          created, userId: byApp.userId, requestedBy: byApp.requestedBy, reason: byApp.reason }));
         opened.push(ref);
       }
       return opened;

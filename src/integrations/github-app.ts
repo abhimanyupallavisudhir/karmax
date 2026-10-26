@@ -729,6 +729,13 @@ export class GitHubAppService {
       .map((account) => ({ ...account, active: account.id === active }));
   }
 
+  /** Whether the person ever linked a GitHub account that is still listed,
+   * including one whose authorization GitHub has since revoked or let expire
+   * (its token is gone, so `listUserAccounts` no longer shows it). */
+  async hasLinkedUserAccount(userId: string): Promise<boolean> {
+    return (await this.userAccounts(userId)).length > 0 || await this.broker.hasHandle(legacyGithubUserTokenHandle(userId));
+  }
+
   /** Revalidate a token-authority-pinned account against the delegated user's
    * connected OAuth accounts before any external write. */
   async assertUserAccount(userId: string, accountId: string): Promise<GitHubUserAccount> {

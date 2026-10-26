@@ -209,6 +209,7 @@ const S = {
   modelCatalog: null, // provider-native model metadata loaded from the gateway
   worldProviderConnections: [], // org's connected cloud computers → the Computer block's provider choices
   inviteNotice: null,
+  inviteWelcome: null, // the organization an invitation was just accepted into
   installationAccess: false, // proven by an installation-scoped endpoint, never inferred from an org role
   installationInfo: null,
   onboarding: null, // hosted-only, server-derived setup progress for the selected organization
@@ -2960,10 +2961,10 @@ function normalizeComboOption(option) {
 
 function authorizationLevels() {
   return [
-    { id: 'viewer', description: 'Read projects, tasks, conversations, and settings in the selected scope.', name: 'Viewer', scope: 'selectable' },
-    { id: 'developer', description: 'Read diagnostics, create tasks, and manage your own work and its descendants.', name: 'Developer', scope: 'selectable' },
-    { id: 'maintainer', description: 'Manage all tasks, reviews, settings, and automation in the selected projects.', name: 'Project maintainer', scope: 'selectable' },
-    { id: 'administrator', description: 'Manage this organization: projects, members, settings, and credentials within their policies.', name: 'Administrator', scope: 'organization' },
+    { id: 'viewer', description: 'Can see projects and tasks, but not change them.', name: 'Viewer', scope: 'selectable' },
+    { id: 'developer', description: 'Can start tasks and talk to agents.', name: 'Developer', scope: 'selectable' },
+    { id: 'maintainer', description: 'Can also approve anyone’s tasks and change project settings.', name: 'Project maintainer', scope: 'selectable' },
+    { id: 'administrator', description: 'Can manage the whole organization: projects, people, settings, and passwords.', name: 'Administrator', scope: 'organization' },
     { id: 'superadmin', description: 'Everything an Administrator can do, plus the vault, payments, and deleting the organization.', name: 'Super-administrator', scope: 'organization',
       warning: 'Super-administrator authorization will give agents full read access to your vault.',
       warningDetail: 'Agents can read every secret regardless of its policy, approve credential requests and spending, manage payment cards, and delete the organization.' },
@@ -4283,11 +4284,84 @@ function typesetMath(root) {
   });
 }
 
+// ─── Plain-language errors ──────────────────────────────────────────────────
+// Server and workflow errors are written for whoever debugs them. People see
+// what happened and what to do; the exact text stays one hover (toasts) or one
+// click (task errors) away. Unknown messages pass through, minus API plumbing.
+const CAPABILITY_ACTIONS = [
+  [/^task:create$/, 'start tasks here'], [/^task:(?:write|\*)$/, 'change tasks here'], [/^task:read$/, 'see these tasks'],
+  [/^review:/, 'approve work here'], [/^(?:confirm|resolve)-decision$/, 'answer this'], [/^merge-into:/, 'land changes on this branch'],
+  [/^project:create$/, 'create projects'], [/^project:(?:edit|write|delete)$/, 'change this project'], [/^project:read$/, 'open this project'],
+  [/^repository:/, 'change this project’s repositories'], [/^skill:/, 'edit the wiki'], [/^organization:wiki/, 'edit the organization wiki'],
+  [/^organization:/, 'change this organization'], [/^(?:member|team|people)/, 'manage people'], [/^payment:/, 'manage payments'],
+  [/^credential:/, 'use these passwords and keys'], [/^vault:/, 'use these passwords and keys'], [/^installation:/, 'change installation settings'],
+];
+function permissionSentence(text) {
+  const capability = /missing capability ([\w:*.@-]+)/.exec(text)?.[1] || /denied: ([\w:*.@-]+)/.exec(text)?.[1];
+  const action = CAPABILITY_ACTIONS.find(([pattern]) => pattern.test(capability || ''))?.[1] || 'do this';
+  const needed = /; (\w[\w ]*?) and above have it/.exec(text)?.[1];
+  return `You don’t have permission to ${action}.${needed ? ` Ask an admin to make you ${/^[aeiou]/i.test(needed) ? 'an' : 'a'} ${needed}.` : ' Ask an admin for access.'}`;
+}
+function plainError(error) {
+  const raw = String(error?.message ?? error ?? '').trim();
+  const text = raw.replace(/^(?:Activity task failed → )+/, '');
+  if (!text) return 'Something went wrong. Try again.';
+  if (/^(?:Failed to fetch|NetworkError when attempting to fetch resource\.?|Load failed|network ?error)$/i.test(text))
+    return 'Can’t reach tavya. Check your internet connection and try again.';
+  if (/^unauthorized$/i.test(text) || /invalid or expired token/i.test(text)) return 'You were signed out. Sign in again to continue.';
+  if (/^HTTP 50[234]$/.test(text) || /runtime is not ready/i.test(text)) return 'tavya is busy or restarting. Try again in a moment.';
+  if (/^HTTP 5\d\d$|^Internal Server Error$/i.test(text)) return 'Something went wrong on our side. Try again in a moment.';
+  if (/^HTTP 404$/.test(text)) return 'This no longer exists, or you can’t see it.';
+  if (/missing capability |^denied: [\w:*.-]+$|capability_denied/.test(text) || error?.code === 'capability_denied') return permissionSentence(text);
+  if (/too many requests/i.test(text)) return 'Too many requests at once. Wait a few seconds and try again.';
+  const tooLarge = /upload too large \(> (\d+) bytes\)/i.exec(text);
+  if (tooLarge) return `That file is too big. The limit is ${Math.round(Number(tooLarge[1]) / 1048576)} MB.`;
+  if (/^message too large/i.test(text)) return 'That message is too long. Shorten it, or attach the text as a file.';
+  if (/^Workflow Update failed$/i.test(text)) return 'This task couldn’t take that change just now. Refresh the page and try again.';
+  if (/^invalid JSON body$/i.test(text)) return 'That didn’t send correctly. Refresh the page and try again.';
+  if (/name already exists on this account/i.test(text))
+    return 'A GitHub repository with that name already exists. Choose another name, or add the existing one from the list.';
+  if (/Bad credentials|token (?:has )?expired|refresh token/i.test(text) && /github/i.test(text))
+    return 'Your GitHub connection has expired. Reconnect GitHub on your profile.';
+  // What stays is meant for people; drop what is meant for agents and logs.
+  return text
+    .replace(/\s*Ask for it with request_permission \(capabilities: [^)]*\)\.?/g, '')
+    .replace(/ \((?:proj|org|task|repo|user|vi)_[a-z0-9]+\)/g, '');
+}
+// A task's failure for the people following it: a plain summary, and the
+// exact text when the summary is not it (shown folded as Details).
+function plainTaskError(text) {
+  const raw = String(text || '').trim();
+  const body = raw.replace(/^infrastructure: /, '').replace(/^(?:Activity task failed → )+/, '');
+  const retry = /— retrying (\w+) in (\d+\s*\w+) \((\d+)\/(\d+)\)\s*$/.exec(body);
+  const retrying = retry ? ` tavya will try again in ${retry[2]} (attempt ${retry[3]} of ${retry[4]}).` : '';
+  const summary = /context window|prompt is too long|maximum context length/i.test(body)
+    ? 'The conversation grew too long for the AI model. Send a shorter message, or start a new task.'
+    : /safety rejection|content policy|flagged/i.test(body) ? 'The AI provider declined this request. Rephrase it and try again.'
+    : /No usable \S+ credential|has no usable .* credential/i.test(body) ? 'No AI account is available to run this task. Ask an admin to connect one in organization settings.'
+    : /usage limit|rate.?limit|insufficient_quota|credit balance|billing/i.test(body) ? 'The AI account reached its usage limit. tavya continues when it resets, or an admin can add another account.'
+    : /SIGKILL|out of memory|OOM killer|more memory than it has/i.test(body) ? 'The task’s computer ran out of memory. Retry, or choose a bigger computer in Parameters.'
+    : /^Out of disk/i.test(body) ? body.replace(/\s*\(POST \/api\/[^)]*\)/g, '').replace(/\s*Last error:[\s\S]*$/, '')
+    : /Sandbox is probably not running|envd|exited with code -1|sandbox (?:was )?(?:restarted|stopped|not found)/i.test(body) ? 'The task’s computer stopped responding. Retry usually fixes this.'
+    : /stream ended unexpectedly|transport interruption|turn interrupted|ECONNRESET|socket hang up|ETIMEDOUT/i.test(body) ? 'The connection to the AI model dropped. Retry usually fixes this.'
+    : /GitHub PR identity is not connected|reconnect GitHub on your profile|Connect GitHub on your profile/i.test(body) ? 'Connect GitHub on your profile, then press Retry.'
+    : /^merge failed: conflict/i.test(body) ? 'These changes conflict with newer work on the same branch. Ask the agent to resolve the conflict.'
+    : /^merge failed/i.test(body) ? 'The changes couldn’t be landed. Ask the agent to look into it, or Retry.'
+    : plainError(body.replace(/\s*— retrying \w+ in .*$/, ''));
+  const plain = /[.!?]$/.test(summary) || !summary ? summary : `${summary}.`;
+  return { summary: plain + retrying, detail: plain + retrying === raw ? '' : raw };
+}
+function taskErrorHtml(text) {
+  const { summary, detail } = plainTaskError(text);
+  return `<div class="msg-text">${esc(summary)}</div>${detail ? `<details class="error-details"><summary>Details</summary><pre>${esc(detail)}</pre></details>` : ''}`;
+}
+
 function toast(msg, err = false, action) {
   const t = document.createElement('div');
   t.className = 'toast' + (err ? ' err' : '');
   const span = document.createElement('span');
-  span.textContent = msg;
+  span.textContent = err ? plainError(msg) : msg;
+  if (span.textContent !== String(msg)) span.title = String(msg); // the exact text, for whoever reports it
   t.appendChild(span);
   // An optional action (e.g. Undo) — gives the toast a clickable button and more
   // dwell time. Backward-compatible: existing toast(msg[, err]) calls are unchanged.
@@ -4471,8 +4545,9 @@ async function boot() {
     if (invitationToken) {
       try {
         const membership = await api('/api/invitations/accept', { method: 'POST', body: JSON.stringify({ token: invitationToken }) });
+        // A newcomer lands where the team works, not in its settings.
         S.organizationId = membership.organizationId;
-        S.inviteNotice = 'Invitation accepted. A project administrator can now add you to a project.';
+        S.inviteWelcome = membership.organizationId;
         history.replaceState({ kx: 1 }, '', '/organization');
       } catch (error) {
         S.inviteNotice = error.message;
@@ -4513,6 +4588,7 @@ async function boot() {
   // replace the neutral home route (never an invitation or another deep link).
   if (session.gitOnboarding && parseRoute(currentPath()).name === 'home')
     history.replaceState({ kx: 1 }, '', profileRoute());
+  if (S.inviteWelcome && organizationById(S.inviteWelcome)) history.replaceState({ kx: 1 }, '', homeRoute(organizationById(S.inviteWelcome)));
   const projectScope = S.projectId
     ? `?projectId=${encodeURIComponent(S.projectId)}`
     : S.organizationId ? `?organizationId=${encodeURIComponent(S.organizationId)}` : '';
@@ -4538,6 +4614,7 @@ async function boot() {
   if (S.justVerified) { toast('✓ Email confirmed', false); S.justVerified = false; }
   installShellListeners();
   await applyRoute(); // honor the initial URL (deep link / bookmark)
+  if (S.inviteWelcome) { toast(`Welcome to ${organizationById(S.inviteWelcome)?.name || 'the team'}`); S.inviteWelcome = null; }
 }
 
 function installShellListeners() {
@@ -12003,6 +12080,10 @@ function approvePullRequestButton(row, cls = 'btn sm') {
 // each one's newest pull request is, linked, approved right in its row when it
 // is a pull request of its own. The task's own proposal has one approval for
 // all its branches: Confirm PR.
+// A checkout as people name it: the project wiki's is "Wiki", whatever its folder.
+function checkoutLabel(v, name) {
+  return name && name === v?.worldWiki ? `<b title="${esc(name)}">Wiki</b>` : `<b>${esc(name)}</b>`;
+}
 function checkoutsSection(v) {
   const checkouts = v.checkouts || [];
   const own = new Map(pullRequestRows(v).map((row) => [row.lane.checkout, row]));
@@ -12014,7 +12095,7 @@ function checkoutsSection(v) {
       const landed = row.label === 'Landed';
       return `<div class="checkout-row ${landed ? 'landed' : ''}" data-branch-state="${esc(row.label)}">
       <span class="checkout-mark">${landed ? '✓' : ''}</span>
-      <b>${esc(c.name)}</b>
+      ${checkoutLabel(v, c.name)}
       <span class="mono" style="color:var(--ink-3)">⎇ ${esc(c.branch)}</span>
       <span style="color:var(--ink-3)">→ ${esc(row.lane.target)}</span>
       <span style="flex:1"></span>
@@ -12028,7 +12109,7 @@ function checkoutsSection(v) {
     const [label, tone] = proposalState(v, c);
     return `<div class="checkout-row ${label === 'Landed' ? 'landed' : ''}"${label ? ` data-branch-state="${esc(label)}"` : ''}>
       <span class="checkout-mark">${label === 'Landed' ? '✓' : ''}</span>
-      <b>${esc(c.name)}</b>
+      ${checkoutLabel(v, c.name)}
       <span class="mono" style="color:var(--ink-3)">⎇ ${esc(c.branch)}</span>
       <span style="color:var(--ink-3)">${esc(dest)}</span>
       <span style="flex:1"></span>
@@ -12051,7 +12132,7 @@ function pullRequestAsks(v) {
 function conversationPullRequestAsks(v) {
   const asks = pullRequestAsks(v);
   return asks.length ? `<div class="pr-asks" id="task-pr-asks">${asks.map((row) => `<div class="pr-ask" data-branch-state="${esc(row.label)}">
-      <b>${esc(row.lane.checkout)}</b>
+      ${checkoutLabel(v, row.lane.checkout)}
       <span class="pr-ask-target">→ ${esc(row.lane.target)}</span>
       ${pullRequestLink(row.pr)}
       <a class="btn sm ghost" data-open="${esc(row.lane.childTaskId)}" data-spa href="${esc(taskUrl(row.lane.childTaskId, row.rec))}" title="Its Review: what it changes">Open</a>
@@ -12269,7 +12350,7 @@ function conversationReviewInfo(v, resourcesShown = false) {
 
 // A failure the workflow recorded, in the conversation where the work happened.
 function conversationError(v) {
-  return v.error ? `<div class="msg system error" role="alert"><div class="role">Error</div><div class="msg-text">${esc(v.error)}</div></div>` : '';
+  return v.error ? `<div class="msg system error" role="alert"><div class="role">Something went wrong</div>${taskErrorHtml(v.error)}</div>` : '';
 }
 
 // Expand in place so live messages, scroll position and unsent attachments survive.
@@ -12892,6 +12973,10 @@ function explanationModelLabel(model = S.explanationSettings?.model) {
 /** Whether "Explain this" is offered (a server feature flag; off for now). */
 function explanationsEnabled() { return S.meta?.explanationsEnabled === true; }
 
+// Whether a message has math for the TeX button to typeset ($…$, $$…$$, \(…\), \[…\]).
+function hasMath(text) {
+  return /\$\$[\s\S]+?\$\$|(?<![\\$\w])\$(?=\S)[^$\n]+?(?<=\S)\$(?![\w$])|\\\([\s\S]+?\\\)|\\\[[\s\S]+?\\\]/.test(String(text || ''));
+}
 function explainMessageAffordance(entry, v) {
   if (!entry.sourceKey) return '';
   const pending = !!S.explanationPending?.[entry.sourceKey];
@@ -12905,9 +12990,12 @@ function explainMessageAffordance(entry, v) {
     : `<div class="explain-error">${esc(failure.message || 'Could not explain this message.')}</div>`;
   const explain = !explanationsEnabled() ? '' : `<button class="explain-run" ${pending ? 'disabled' : ''}>${pending ? 'Explaining…' : `Explain this with ${esc(explanationModelLabel())}`}</button>
     <button class="explain-more" ${pending ? 'disabled' : ''} aria-label="Change explanation model and prompt" title="Change explanation model and prompt">${ICON.more}</button>`;
+  // The TeX button only where there is math to typeset: on every message it is noise.
+  const tex = hasMath(entry.message?.text ?? entry.activity?.title ?? entry.request?.text) ? texToggleHtml(!markdownEnabled()) : '';
+  if (!explain && !tex && !error) return '';
   return `<div class="explain-tools" data-source-key="${key}" data-role="${role}">
     ${explain}
-    ${texToggleHtml(!markdownEnabled())}
+    ${tex}
     ${error}
   </div>`;
 }
@@ -12918,7 +13006,7 @@ function renderConversationEntry(entry, v = S.view) {
   if (entry.type === 'input-request') {
     const escalate = v.waitingFor?.kind === 'human' || v.waitingFor?.kind === 'parent'
       ? `<button class="btn sm ghost escalate-request" title="Pass this to someone who can answer">Escalate…</button>` : '';
-    return `<div class="msg agent input-request"><div class="msg-meta"><span class="role">${v.waitingFor?.reason === 'error' ? 'Needs attention' : 'Input requested'}</span><span class="msg-meta-gap"></span>${escalate}</div><div class="msg-text${md}">${renderWaitDetail(entry.request.text, v, math)}</div>${entry.resourceReview ? resourceReviewPlaceholder() : ''}${explainMessageAffordance(entry, v)}</div>`;
+    return `<div class="msg agent input-request"><div class="msg-meta"><span class="role">${v.waitingFor?.reason === 'error' ? 'Needs attention' : 'Input requested'}</span><span class="msg-meta-gap"></span>${escalate}</div>${v.waitingFor?.reason === 'error' ? taskErrorHtml(entry.request.text) : `<div class="msg-text${md}">${renderWaitDetail(entry.request.text, v, math)}</div>`}${entry.resourceReview ? resourceReviewPlaceholder() : ''}${explainMessageAffordance(entry, v)}</div>`;
   }
   if (entry.type === 'message') {
     const m = entry.message;
@@ -13038,7 +13126,9 @@ function conversationPresence(v, t) {
 function presenceDetail(v) {
   const w = v.waitingFor;
   if (!w) return '';
-  const detail = (['account', 'agentSlot'].includes(w.kind) || (w.kind === 'retry' && w.summary)) && typeof w.detail === 'string' ? w.detail.trim() : '';
+  const raw = (['account', 'agentSlot'].includes(w.kind) || (w.kind === 'retry' && w.summary)) && typeof w.detail === 'string' ? w.detail.trim() : '';
+  // A retry waits out an error: say it the way the task's error box does.
+  const detail = raw && w.kind === 'retry' ? plainTaskError(raw).summary : raw;
   return [detail, w.earliestResetAt ? `Earliest ${fmtReset(w.earliestResetAt)}` : ''].filter(Boolean).join(' · ');
 }
 
@@ -14511,6 +14601,17 @@ function taskActionLabel(v, action) {
   return action.label || action.name;
 }
 
+// What a task's main buttons do, in a sentence, for whoever has not pressed them before.
+function taskActionTip(v, action) {
+  const target = v?.targetBranch || 'main';
+  if (action.name === 'confirm' && v?.stage === 'review') return `Approve this work. tavya then adds it to ${target}.`;
+  if (action.name === 'confirm' && v?.stage === 'merge' && v.waitingFor?.reason !== 'merge') return 'Let tavya merge this on GitHub as you.';
+  if (action.name === 'openPr') return 'Send the agent’s work so far to Review now.';
+  if (action.name === 'cancel') return 'Stop this task. Nothing more is added to the project.';
+  if (action.name === 'retry') return 'Try the last step again.';
+  return '';
+}
+
 // the generic auto-render floor (SPEC §10.2 tier 1): render declared actions.
 // This is the footer bar that stays visible on every task-page tab, so the
 // proposal / confirmation / cancellation controls are always one click away.
@@ -14545,7 +14646,8 @@ function taskActions(v) {
     // INSIDE the button: reading `textContent` yields "Confirm1", which fails
     // actionToast's standard-verb match and produced "Confirm1 — done" instead
     // of "Confirmed" on the most-used control in the app.
-    html += `<button class="btn ${cls}" data-act="${esc(a.name)}" data-label="${esc(label)}" ${a.enabled ? '' : 'disabled'}>${esc(label)}${kbd}</button>`;
+    const tip = taskActionTip(v, a);
+    html += `<button class="btn ${cls}" data-act="${esc(a.name)}" data-label="${esc(label)}"${tip ? ` title="${esc(tip)}"` : ''} ${a.enabled ? '' : 'disabled'}>${esc(label)}${kbd}</button>`;
   }
   // Target-branch editing lives in the Parameters tab (paramsSection), which
   // renders it editable/frozen per the workflow's window — no separate input here.
@@ -18275,7 +18377,7 @@ function githubRepositorySlug(text) {
 
 // Work on someone else's repository: fork it on GitHub (where the App can reach
 // it), then attach the fork. Its pull requests open on the original.
-function openForkRepositoryDialog(proj, opener, githubApp = {}) {
+function openForkRepositoryDialog(proj, opener, githubApp = {}, preset = '') {
   const host = document.createElement('div');
   host.innerHTML = `<div class="modal-overlay"><form class="modal-card new-repository-dialog" role="dialog" aria-modal="true" aria-labelledby="fork-repository-title">
     <div class="new-repository-head"><b id="fork-repository-title">Fork a repository</b><button class="icon-btn new-repository-close" type="button" aria-label="Close">×</button></div>
@@ -18295,6 +18397,7 @@ function openForkRepositoryDialog(proj, opener, githubApp = {}) {
   const note = host.querySelector('.fork-private-note');
   let privateAcknowledged = '';
   source.addEventListener('input', () => { sync(); note.hidden = true; privateAcknowledged = ''; });
+  if (preset) { source.value = preset; sync(); }
   host.querySelector('.modal-overlay').addEventListener('mousedown', (event) => { if (event.target === event.currentTarget) close(); });
   host.querySelector('.new-repository-close').addEventListener('click', close);
   host.querySelector('.new-repository-cancel').addEventListener('click', close);
@@ -18341,14 +18444,14 @@ function openForkRepositoryDialog(proj, opener, githubApp = {}) {
 
 // Creates a GitHub repository in one of the organization's accounts, then hands
 // it to `created` (which attaches it wherever it was asked for).
-function openNewGithubRepositoryDialog(organizationId, gitConnections, opener, created) {
+function openNewGithubRepositoryDialog(organizationId, gitConnections, opener, created, preset = {}) {
   const host = document.createElement('div');
   host.innerHTML = `<div class="modal-overlay"><form class="modal-card new-repository-dialog" role="dialog" aria-modal="true" aria-labelledby="new-repository-title">
     <div class="new-repository-head"><b id="new-repository-title">New GitHub repository</b><button class="icon-btn new-repository-close" type="button" aria-label="Close">×</button></div>
     <div class="new-repository-identity">
-      <label class="form-row"><span>GitHub account</span><select id="project-new-repo-connection">${gitConnections.map((connection) => `<option value="${esc(connection.id)}">${esc(connection.accountLogin)}</option>`).join('')}</select></label>
+      <label class="form-row"><span>GitHub account</span><select id="project-new-repo-connection">${gitConnections.map((connection) => `<option value="${esc(connection.id)}" ${connection.id === preset.connectionId ? 'selected' : ''}>${esc(connection.accountLogin)}</option>`).join('')}</select></label>
       <span class="new-repository-slash" aria-hidden="true">/</span>
-      <label class="form-row"><span>Repository name</span><input id="project-new-repo-name" placeholder="new-repository" required autocomplete="off"></label>
+      <label class="form-row"><span>Repository name</span><input id="project-new-repo-name" placeholder="new-repository" required autocomplete="off" value="${esc(preset.name || '')}"></label>
     </div>
     <label class="form-row"><span>Description <span class="task-sub">optional</span></span><input id="project-new-repo-description"></label>
     <label class="switch new-repository-private"><input id="project-new-repo-private" type="checkbox" checked><span>Private repository</span></label>
@@ -18423,6 +18526,164 @@ function repositorySourceFor(typed, repositories) {
   if (repositoryInput(repositories).pickOnly && !known) return null;
   return known?.sshUrl || typed;
 }
+// A name GitHub accepts for a new repository, made from what people type:
+// "Clients/Fresh Ideas" → "fresh-ideas" (the last folder of a project name).
+function githubRepositoryName(text) {
+  return String(text || '').split('/').pop().normalize('NFKD').replace(/[̀-ͯ]/g, '').toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-').replace(/^[-.]+|[-.]+$/g, '').replace(/-{2,}/g, '-').slice(0, 100);
+}
+// The organization's GitHub account new repositories go to by default: the
+// person's own when the organization connected it, else the first one.
+function defaultGitConnection(gitConnections, githubLogin) {
+  return gitConnections.find((connection) => githubLogin && connection.accountLogin?.toLowerCase() === githubLogin.toLowerCase())
+    || gitConnections[0];
+}
+function repositoryPickerHtml(id, { placeholder, disabled }) {
+  return `<div class="combo repo-combo" id="${esc(id)}-combo">
+    <input id="${esc(id)}" role="combobox" aria-label="Add a repository" aria-autocomplete="list" aria-expanded="false" aria-controls="${esc(id)}-options" autocomplete="off" spellcheck="false" placeholder="${esc(placeholder)}" ${disabled ? 'disabled' : ''}>
+    <div class="combo-menu repo-combo-menu" id="${esc(id)}-options" role="listbox" aria-label="Repositories" hidden></div>
+  </div>`;
+}
+// The add-a-repository combobox of Git & GitHub (New project and Project
+// settings). Typing filters the organization's repositories; a name that
+// matches none offers "+ New repo" (which opens the New repository dialog
+// with it), and off hosted the typed URL or path itself. ↑/↓ move, Enter
+// chooses, Esc closes. `attachedKeys()` names what is already in the list.
+function wireRepositoryPicker(input, { repositories, gitConnections = [], githubLogin, canCreate, attachedKeys, add, create, fork }) {
+  if (!input) return;
+  const root = input.closest('.repo-combo');
+  const menu = root.querySelector('[role="listbox"]');
+  const { pickOnly } = repositoryInput(repositories);
+  let options = [];
+  let active = -1;
+  const slugOf = (repository) => `${repository.owner}/${repository.name}`;
+  const ownAccount = (owner) => gitConnections.find((connection) => connection.accountLogin?.toLowerCase() === owner.toLowerCase());
+  const build = () => {
+    const typed = input.value.trim();
+    const needle = typed.toLowerCase();
+    const typedKey = repositorySourceView(typed).key.toLowerCase();
+    const attached = attachedKeys();
+    const next = repositories
+      .filter((repository) => !attached.has(slugOf(repository).toLowerCase()))
+      .filter((repository) => !needle || slugOf(repository).toLowerCase().includes(needle) || slugOf(repository).toLowerCase() === typedKey)
+      .sort((a, b) => Number(b.name.toLowerCase() === needle) - Number(a.name.toLowerCase() === needle)
+        || Number(b.name.toLowerCase().startsWith(needle)) - Number(a.name.toLowerCase().startsWith(needle)))
+      .map((repository) => ({ kind: 'repository', repository }));
+    const known = typed && repositorySourceFor(typed, repositories);
+    const knownKey = known && repositorySourceView(known).key.toLowerCase();
+    const exists = (slug) => repositories.some((repository) => slugOf(repository).toLowerCase() === slug.toLowerCase());
+    // "+ New repo": a bare name goes to the default account; owner/name to that
+    // account when the organization connected it.
+    if (canCreate) {
+      const [owner, name] = typed.includes('/') ? typed.split('/') : [defaultGitConnection(gitConnections, githubLogin)?.accountLogin, typed];
+      const connection = owner && ownAccount(owner);
+      const valid = /^[A-Za-z0-9._-]+$/.test(name || '') && connection && !/^\.+$/.test(name);
+      if (!typed) next.push({ kind: 'create', name: '', label: 'New repo…' });
+      else if (valid && !exists(`${connection.accountLogin}/${name}`))
+        next.push({ kind: 'create', name, connectionId: connection.id, label: `New repo ${connection.accountLogin}/${name}` });
+    }
+    const slug = githubRepositorySlug(typed);
+    if (typed && !pickOnly && !knownKey && /[/:~]|^\./.test(typed) && !(slug && ownAccount(slug.split('/')[0])))
+      next.push({ kind: 'source', source: typed, label: `Add ${typed}` });
+    if (fork && slug && !exists(slug) && !ownAccount(slug.split('/')[0]))
+      next.push({ kind: 'fork', slug, label: `Fork ${slug}…` });
+    else if (fork && !typed) next.push({ kind: 'fork', slug: '', label: 'Fork a repository…' });
+    return next;
+  };
+  const place = () => {
+    const rect = input.getBoundingClientRect();
+    menu.style.width = `${rect.width}px`;
+    menu.style.left = `${rect.left}px`;
+    const below = window.innerHeight - rect.bottom - 8;
+    const upwards = below < Math.min(240, menu.scrollHeight) && rect.top - 8 > below;
+    menu.style.maxHeight = `${Math.max(0, Math.min(240, upwards ? rect.top - 8 : below))}px`;
+    menu.style.top = `${upwards ? rect.top - menu.getBoundingClientRect().height - 3 : rect.bottom + 3}px`;
+  };
+  const paint = () => {
+    menu.querySelectorAll('[role="option"]').forEach((option, index) => {
+      option.classList.toggle('active', index === active);
+      option.setAttribute('aria-selected', String(index === active));
+    });
+    const current = menu.querySelector(`[data-index="${active}"]`);
+    if (current) { input.setAttribute('aria-activedescendant', current.id); current.scrollIntoView({ block: 'nearest' }); }
+    else input.removeAttribute('aria-activedescendant');
+  };
+  const draw = () => {
+    options = build();
+    // The first choice is the one Enter takes once something is typed.
+    active = input.value.trim() && options.length ? 0 : -1;
+    menu.innerHTML = options.map((option, index) => {
+      const body = option.kind === 'repository'
+        ? `<span class="repo-opt-icon">${githubMark()}</span><span class="repo-opt-name"><span>${esc(option.repository.owner)}/</span>${esc(option.repository.name)}</span>${option.repository.upstream ? `<span class="repo-opt-note">→ ${esc(option.repository.upstream.owner)}/${esc(option.repository.upstream.name)}</span>` : ''}`
+        : `<span class="repo-opt-icon repo-opt-mark" aria-hidden="true"></span><span class="repo-opt-name">${esc(option.label)}</span>`;
+      return `<div class="combo-opt repo-opt repo-opt-${option.kind}" role="option" id="${esc(input.id)}-option-${index}" data-index="${index}" aria-selected="false">${body}</div>`;
+    }).join('');
+    const open = options.length > 0 && document.activeElement === input;
+    // Open, the menu lives on <body>: a dialog's transform or scrolling would
+    // otherwise move or clip a fixed menu.
+    if (open && menu.parentElement !== document.body) { document.body.appendChild(menu); document.addEventListener('scroll', follow, true); }
+    menu.hidden = !open;
+    input.setAttribute('aria-expanded', String(open));
+    if (open) place(); else close();
+    paint();
+  };
+  // A scroll moves the field; the menu follows it, and goes with it.
+  const follow = () => { if (input.isConnected) place(); else { menu.remove(); document.removeEventListener('scroll', follow, true); } };
+  const close = () => {
+    menu.hidden = true; root.appendChild(menu); document.removeEventListener('scroll', follow, true);
+    input.setAttribute('aria-expanded', 'false'); input.removeAttribute('aria-activedescendant'); active = -1;
+  };
+  const choose = async (option) => {
+    close();
+    if (option.kind === 'create') return create?.({ name: option.name, connectionId: option.connectionId }, input);
+    if (option.kind === 'fork') return fork?.(option.slug, input);
+    const source = option.kind === 'repository' ? option.repository.sshUrl : option.source;
+    input.value = '';
+    await add(source);
+  };
+  // Enter with nothing to choose: what was typed, if it may be added.
+  const submitTyped = async () => {
+    const typed = input.value.trim();
+    if (!typed) return;
+    const source = repositorySourceFor(typed, repositories);
+    if (!source) return toast('Choose one of the organization’s GitHub repositories', true);
+    if (attachedKeys().has(repositorySourceView(source).key)) { input.value = ''; return toast('Already added'); }
+    input.value = '';
+    await add(source);
+  };
+  input.addEventListener('focus', draw);
+  input.addEventListener('click', () => { if (menu.hidden) draw(); });
+  input.addEventListener('input', draw);
+  input.addEventListener('blur', () => setTimeout(() => { if (document.activeElement !== input) close(); }, 0));
+  input.addEventListener('keydown', (event) => {
+    if (event.isComposing) return;
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      if (menu.hidden) return draw();
+      if (!options.length) return;
+      active = event.key === 'ArrowDown' ? (active + 1) % options.length : (active <= 0 ? options.length - 1 : active - 1);
+      paint();
+    } else if (event.key === 'Enter') {
+      // Enter adds a repository; it never submits the surrounding form.
+      event.preventDefault();
+      const option = !menu.hidden && options[active];
+      if (option) choose(option); else submitTyped();
+    } else if (event.key === 'Escape' && !menu.hidden) {
+      event.preventDefault(); event.stopPropagation(); close();
+    } else if (event.key === 'Tab') close();
+  });
+  // mousedown, not click: the input keeps focus, so the menu does not close first.
+  menu.addEventListener('mousedown', (event) => {
+    const option = event.target.closest('[role="option"]');
+    if (!option) return;
+    event.preventDefault();
+    choose(options[Number(option.dataset.index)]);
+  });
+  menu.addEventListener('mousemove', (event) => {
+    const option = event.target.closest('[role="option"]');
+    if (option && Number(option.dataset.index) !== active) { active = Number(option.dataset.index); paint(); }
+  });
+}
 // The GitHub row's value and actions: the organization's connected accounts,
 // or the step that connects them. `ids` name its buttons.
 function githubAccessView({ githubApp, gitConnections, githubLoadError }, organizationId, ids) {
@@ -18454,30 +18715,23 @@ async function loadOrganizationGithub(organizationId) {
 function renderProjectRepositories(box, proj, { repositories, gitConnections, githubApp, githubLoadError, githubLogin }) {
   const sources = proj.config.repos || [];
   const attached = new Set(sources.map((source) => repositorySourceView(source).key));
-  const choices = repositories.filter((repository) => !attached.has(`${repository.owner}/${repository.name}`.toLowerCase()));
   const { canAdd, placeholder } = repositoryInput(repositories);
   const canCreate = githubApp.configured && gitConnections.length && githubApp.userAuthorized;
   const access = githubAccessView({ githubApp, gitConnections, githubLoadError }, proj.organizationId,
     { error: 'project-github-error', connect: 'project-connect-github', refresh: 'project-refresh-github' });
   const identity = `<b>You</b>${githubLogin && githubApp.userAuthorized ? `<span class="setting-sep">·</span><span class="setting-muted">${esc(githubLogin)}</span>` : ''}`;
-  box.innerHTML = `<div class="section-h">Repositories</div>
+  box.innerHTML = `<div class="section-h">Repositories ${policyTip('Everyone in this project gets access to these on GitHub automatically.')}</div>
     <div class="git-repos">
       <div id="project-repository-fields">${sources.map((source) => gitRepoRow(source, repositories)).join('')}</div>
-      <form class="git-repo-add" id="project-repository-add-form">
-        <input id="project-repository-input" list="project-repository-options" autocomplete="off" spellcheck="false" aria-label="Add a repository" placeholder="${esc(placeholder)}" ${canAdd ? '' : 'disabled'}>
-        <button class="btn sm" type="submit" id="project-repository-add" ${canAdd ? '' : 'disabled'}>Add</button>
-        ${canCreate ? '<button class="btn sm" id="project-new-repo-open" type="button" aria-haspopup="dialog">New repository</button>' : ''}
-        ${githubApp.configured && gitConnections.length ? '<button class="btn sm" id="project-fork-open" type="button" aria-haspopup="dialog" title="Work on a repository you don\'t own. Pull requests go to it after Review.">Fork a repository</button>' : ''}
-      </form>
+      <div class="git-repo-add" id="project-repository-add-form">${repositoryPickerHtml('project-repository-input', { placeholder: canCreate ? 'Find or create a repository' : placeholder, disabled: !canAdd && !canCreate })}</div>
     </div>
-    <datalist id="project-repository-options">${choices.map((repository) => `<option value="${esc(repository.owner)}/${esc(repository.name)}">${repository.upstream ? `→ ${esc(repository.upstream.owner)}/${esc(repository.upstream.name)}` : ''}</option>`).join('')}</datalist>
     <div class="setting-rows ruled git-facts">
       <div class="setting-row" id="project-github-access"><span class="setting-label">GitHub ${policyTip('The GitHub accounts this organization connected. Their repositories can be added above.')}</span><span class="setting-value">${access.value}</span><span class="setting-actions">${access.actions}</span></div>
-      <div class="setting-row" id="project-github-identity"><span class="setting-label">Commits as ${policyTip('Each task commits and opens pull requests as the person who created it.')}</span><span class="setting-value">${identity}</span><span class="setting-actions">${githubAuthorizeButton(githubApp, 'project-authorize-github')}<a class="btn sm" data-spa href="${profileRoute()}">Manage</a></span></div>
+      <div class="setting-row" id="project-github-identity"><span class="setting-label">Commits as ${policyTip('Each task commits and opens pull requests as the person who created it, or as tavya for someone without GitHub.')}</span><span class="setting-value">${identity}</span><span class="setting-actions">${githubAuthorizeButton(githubApp, 'project-authorize-github')}<a class="btn sm" data-spa href="${profileRoute()}">Manage</a></span></div>
     </div>`;
   const rerender = () => hydrateProjectAccess(projectById(proj.id) || proj);
   if (githubLoadError) paneError($('#project-github-error'), githubLoadError, rerender);
-  const controls = () => box.querySelectorAll('#project-repository-add-form input, #project-repository-add-form button, .git-repo-remove');
+  const controls = () => box.querySelectorAll('#project-repository-input, .git-repo-remove');
   const save = async (repos) => {
     controls().forEach((control) => { control.disabled = true; });
     try {
@@ -18493,21 +18747,16 @@ function renderProjectRepositories(box, proj, { repositories, gitConnections, gi
   };
   box.querySelectorAll('.git-repo').forEach((item) => item.querySelector('.git-repo-remove').addEventListener('click', () =>
     save(sources.filter((source) => source !== item.dataset.source))));
-  $('#project-repository-add-form').addEventListener('submit', async (event) => {
-    event.preventDefault();
-    const input = $('#project-repository-input');
-    const typed = input.value.trim();
-    if (!typed) return input.focus();
-    const source = repositorySourceFor(typed, repositories);
-    if (!source) return toast('Choose one of the organization’s GitHub repositories', true);
-    if (attached.has(repositorySourceView(source).key)) { input.value = ''; return toast('Already added'); }
-    if (await save([...sources, source])) $('#project-repository-input')?.focus();
+  wireRepositoryPicker($('#project-repository-input'), {
+    repositories, gitConnections, githubLogin, canCreate,
+    attachedKeys: () => attached,
+    add: async (source) => { if (await save([...sources, source])) $('#project-repository-input')?.focus(); },
+    create: canCreate ? ({ name, connectionId }, opener) => openNewGithubRepositoryDialog(proj.organizationId, gitConnections, opener, async (repository) => {
+      await api(`/api/projects/${proj.id}/repositories`, { method: 'POST', body: JSON.stringify({ repositoryId: repository.id }) });
+      toast('Repository created and attached'); await loadProjects(); await rerender();
+    }, { name, connectionId }) : null,
+    fork: githubApp.configured && gitConnections.length ? (slug, opener) => openForkRepositoryDialog(proj, opener, githubApp, slug) : null,
   });
-  $('#project-new-repo-open')?.addEventListener('click', (event) => openNewGithubRepositoryDialog(proj.organizationId, gitConnections, event.currentTarget, async (repository) => {
-    await api(`/api/projects/${proj.id}/repositories`, { method: 'POST', body: JSON.stringify({ repositoryId: repository.id }) });
-    toast('Repository created and attached'); await loadProjects(); await hydrateProjectAccess(projectById(proj.id) || proj);
-  }));
-  $('#project-fork-open')?.addEventListener('click', (event) => openForkRepositoryDialog(proj, event.currentTarget, githubApp));
   $('#project-connect-github')?.addEventListener('click', async () => { try { await connectOrganizationGithub(proj.organizationId, rerender); } catch (error) { toast(error.message, true); } });
   $('#project-authorize-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/authorize`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (error) { toast(error.message, true); } });
   $('#project-refresh-github')?.addEventListener('click', async (event) => {
@@ -21986,7 +22235,7 @@ function profileView() {
           </form>
         </div>
         <div class="setting-row profile-github-row">
-          <span class="setting-label">GitHub ${policyTip('Tasks you create commit and open pull requests as your active GitHub account.')}</span>
+          <span class="setting-label">GitHub ${policyTip('Optional. Connected, the pull requests of tasks you create are opened as you on GitHub; otherwise tavya opens them for you.')}</span>
           ${profileGithubFields()}
         </div>
       </div>
@@ -23648,8 +23897,10 @@ function repositoryCheckoutName(source) {
 }
 const commandLines = (text) => text.split('\n').map((line) => line.trim()).filter(Boolean);
 
-// New project: the name, the project's Git & GitHub, and folded Secrets and
-// Environment — what Project settings holds that a project needs to start.
+// New project: the name, the project's GitHub repository, and folded Secrets
+// and Environment — what Project settings holds that a project needs to start.
+// With GitHub connected, the project works on the repository named after it
+// (made when it does not exist yet); unticking that shows the repository list.
 // Everything goes with Create, which opens the project's task list.
 // `folder` (from a folder row's "+") pre-fills the path so the new project
 // lands in that folder; the person can still retype it into any other place.
@@ -23661,7 +23912,8 @@ function newProject(options) {
   host.innerHTML = `<div class="modal-overlay"><form class="modal-card new-project-dialog" role="dialog" aria-modal="true" aria-labelledby="new-project-title">
     <div class="new-project-head"><b id="new-project-title">New project</b><button class="icon-btn new-project-close" type="button" aria-label="Close">×</button></div>
     <label class="form-row"><span>Project name ${policyTip('Use / to put it in folders, e.g. Clients/Website.')}</span><input id="new-project-name" aria-label="Project name" placeholder="e.g. Work/Clients/Website" required autocomplete="off" spellcheck="false" value="${esc(folder ? `${folder}/` : '')}"></label>
-    <div class="np-section"><div class="np-h">Git &amp; GitHub</div><div class="np-git"><div class="np-loading">Loading…</div></div></div>
+    <div class="np-default" hidden></div>
+    <div class="np-section np-repos"><div class="np-h">Git &amp; GitHub</div><div class="np-git"><div class="np-loading">Loading…</div></div></div>
     <details class="np-fold"><summary>Secrets</summary>
       <textarea class="np-secrets" aria-label="Secrets" rows="3" spellcheck="false" autocomplete="off" placeholder="KEY=value, one per line, or paste a .env"></textarea>
     </details>
@@ -23675,52 +23927,81 @@ function newProject(options) {
   </form></div>`;
   const $in = (selector) => host.querySelector(selector);
   const repos = [];
-  let github = { repositories: [], gitConnections: [], githubApp: { configured: false }, githubLoadError: null };
+  let github = { repositories: [], gitConnections: [], githubApp: { configured: false }, githubLoadError: null, githubLogin: undefined };
+  let useDefault = true;
+
+  // The repository named after the project: the organization's existing one,
+  // else one to create in its default account (when the person may create).
+  const defaultRepository = () => {
+    const { repositories, gitConnections, githubApp, githubLoadError, githubLogin } = github;
+    if (!organizationId || githubLoadError || !githubApp.configured || !gitConnections.length) return null;
+    const name = githubRepositoryName($in('#new-project-name').value);
+    const connection = defaultGitConnection(gitConnections, githubLogin);
+    const owned = (repository) => gitConnections.some((each) => each.accountLogin?.toLowerCase() === repository.owner.toLowerCase());
+    const existing = name ? (repositories.find((repository) => repository.name.toLowerCase() === name && repository.owner.toLowerCase() === connection.accountLogin.toLowerCase())
+      || repositories.find((repository) => repository.name.toLowerCase() === name && owned(repository))) : null;
+    if (existing) return { existing, slug: `${existing.owner}/${existing.name}` };
+    if (!githubApp.userAuthorized) return null;
+    return { create: { connectionId: connection.id, name }, owner: connection.accountLogin, slug: `${connection.accountLogin}/${name}` };
+  };
+  const usingDefault = () => useDefault && !!defaultRepository();
+  const projectRepositories = () => {
+    if (!usingDefault()) return [...repos];
+    const chosen = defaultRepository();
+    return chosen.existing ? [chosen.existing.sshUrl] : chosen.create.name ? [`git@github.com:${chosen.slug}.git`] : [];
+  };
+  const renderDefault = () => {
+    const row = $in('.np-default');
+    const chosen = defaultRepository();
+    row.hidden = !chosen;
+    $in('.np-repos').hidden = !!chosen && useDefault;
+    if (!chosen) return renderInstall();
+    const label = chosen.existing ? 'Work on existing GitHub repo' : 'Create new GitHub repo';
+    const slug = chosen.existing || chosen.create.name ? esc(chosen.slug) : `${esc(chosen.owner)}/<span class="np-default-blank">project-name</span>`;
+    const box = row.querySelector('input');
+    if (box) { row.querySelector('.np-default-label').innerHTML = `${label} <code>${slug}</code>`; }
+    else {
+      row.innerHTML = `<label class="np-default-row"><input type="checkbox" id="np-default-repo" ${useDefault ? 'checked' : ''}><span class="np-default-label">${label} <code>${slug}</code></span></label>`;
+      row.querySelector('input').addEventListener('change', (event) => {
+        useDefault = event.currentTarget.checked;
+        renderDefault();
+        if (!useDefault) $in('#np-repo-input')?.focus();
+      });
+    }
+    renderInstall();
+  };
 
   // Install commands are per repository, so their fields follow the list.
   const renderInstall = () => {
     const typed = Object.fromEntries([...host.querySelectorAll('[data-install]')].map((field) => [field.dataset.install, field.value]));
-    const names = [...new Set(repos.map(repositoryCheckoutName))];
+    const names = [...new Set(projectRepositories().map(repositoryCheckoutName))];
     $in('.np-install').innerHTML = names.map((name) => `<label class="form-row"><span>Install in ${esc(name)}</span><textarea data-install="${esc(name)}" aria-label="Install in ${esc(name)}" rows="2" spellcheck="false" placeholder="npm ci">${esc(typed[name] || '')}</textarea></label>`).join('');
   };
   const renderGit = () => {
     const box = $in('.np-git');
-    const typed = $in('#np-repo-input')?.value || '';
-    const { repositories, gitConnections, githubApp } = github;
-    const attached = new Set(repos.map((source) => repositorySourceView(source).key));
+    const { repositories, gitConnections, githubApp, githubLogin } = github;
     const { canAdd, placeholder } = repositoryInput(repositories);
-    const canCreate = githubApp.configured && gitConnections.length && githubApp.userAuthorized;
+    const canCreate = !!(githubApp.configured && gitConnections.length && githubApp.userAuthorized);
     const access = organizationId ? githubAccessView(github, organizationId, { error: 'np-github-error', connect: 'np-connect-github', refresh: 'np-refresh-github' }) : null;
     box.innerHTML = `<div class="git-repos">${repos.map((source) => gitRepoRow(source, repositories)).join('')}
-        <div class="git-repo-add"><input id="np-repo-input" list="np-repo-options" autocomplete="off" spellcheck="false" aria-label="Add a repository" placeholder="${esc(placeholder)}" ${canAdd ? '' : 'disabled'}>
-          <button class="btn sm" type="button" id="np-repo-add" ${canAdd ? '' : 'disabled'}>Add</button>
-          ${canCreate ? '<button class="btn sm" type="button" id="np-repo-new" aria-haspopup="dialog">New repository</button>' : ''}</div></div>
-      <datalist id="np-repo-options">${repositories.filter((repository) => !attached.has(`${repository.owner}/${repository.name}`.toLowerCase())).map((repository) => `<option value="${esc(repository.owner)}/${esc(repository.name)}"></option>`).join('')}</datalist>
+        <div class="git-repo-add">${repositoryPickerHtml('np-repo-input', { placeholder: canCreate ? 'Find or create a repository' : placeholder, disabled: !canAdd && !canCreate })}</div></div>
       ${access ? `<div class="setting-rows np-github"><div class="setting-row"><span class="setting-label">GitHub ${policyTip('The GitHub accounts this organization connected. Their repositories can be added above.')}</span><span class="setting-value">${access.value}</span><span class="setting-actions">${access.actions}</span></div></div>` : ''}`;
-    const input = $in('#np-repo-input');
-    input.value = typed;
     if (github.githubLoadError) paneError($in('#np-github-error'), github.githubLoadError, loadGithub);
     box.querySelectorAll('.git-repo').forEach((row) => row.querySelector('.git-repo-remove').addEventListener('click', () => {
       repos.splice(repos.indexOf(row.dataset.source), 1);
       renderGit(); renderInstall();
+      $in('#np-repo-input')?.focus();
     }));
-    const add = () => {
-      const value = input.value.trim();
-      if (!value) return input.focus();
-      const source = repositorySourceFor(value, repositories);
-      if (!source) return toast('Choose one of the organization’s GitHub repositories', true);
-      input.value = '';
-      if (!attached.has(repositorySourceView(source).key)) { repos.push(source); renderGit(); renderInstall(); }
-      $in('#np-repo-input').focus();
-    };
-    $in('#np-repo-add').addEventListener('click', add);
-    // Enter adds the repository; it does not create the project.
-    input.addEventListener('keydown', (event) => { if (event.key === 'Enter' && !event.isComposing) { event.preventDefault(); add(); } });
-    $in('#np-repo-new')?.addEventListener('click', (event) => openNewGithubRepositoryDialog(organizationId, gitConnections, event.currentTarget, async (repository) => {
-      github = { ...github, repositories: [...github.repositories, repository] };
-      repos.push(repository.sshUrl);
-      renderGit(); renderInstall();
-    }));
+    wireRepositoryPicker($in('#np-repo-input'), {
+      repositories, gitConnections, githubLogin, canCreate,
+      attachedKeys: () => new Set(repos.map((source) => repositorySourceView(source).key)),
+      add: (source) => { repos.push(source); renderGit(); renderInstall(); $in('#np-repo-input').focus(); },
+      create: canCreate ? ({ name, connectionId }, opener) => openNewGithubRepositoryDialog(organizationId, gitConnections, opener, async (repository) => {
+        github = { ...github, repositories: [...github.repositories, repository] };
+        repos.push(repository.sshUrl);
+        renderGit(); renderInstall();
+      }, { name, connectionId }) : null,
+    });
     $in('#np-connect-github')?.addEventListener('click', async () => { try { await connectOrganizationGithub(organizationId, loadGithub); } catch (error) { toast(error.message, true); } });
     $in('#np-refresh-github')?.addEventListener('click', async (event) => {
       const button = event.currentTarget; button.disabled = true;
@@ -23730,11 +24011,15 @@ function newProject(options) {
   };
   const loadGithub = async () => {
     if (organizationId) {
-      try { github = await loadOrganizationGithub(organizationId); }
-      catch (error) { github = { ...github, githubLoadError: error }; }
+      try {
+        const [loaded, accounts] = await Promise.all([loadOrganizationGithub(organizationId), api('/api/user/github-accounts').catch(() => null)]);
+        github = { ...loaded, githubLogin: (accounts?.accounts || []).find((account) => account.active)?.login };
+      } catch (error) { github = { ...github, githubLoadError: error }; }
     }
-    if (!closed) renderGit();
+    if (closed) return;
+    renderGit(); renderDefault();
   };
+  $in('#new-project-name').addEventListener('input', () => { if (github.githubApp.configured) renderDefault(); });
 
   const controller = new AbortController();
   let closed = false, creating = false;
@@ -23762,12 +24047,23 @@ function newProject(options) {
     button.disabled = true; button.textContent = 'Creating…';
     let project;
     try {
+      let sources = projectRepositories();
+      // The repository named after the project is made first: a name GitHub
+      // refuses stops here, before any project exists.
+      const chosen = usingDefault() ? defaultRepository() : null;
+      if (chosen?.create) {
+        const repository = await api(`/api/organizations/${encodeURIComponent(organizationId)}/repositories/create`, { method: 'POST',
+          body: JSON.stringify({ gitConnectionId: chosen.create.connectionId, name: chosen.create.name, private: true }), signal: controller.signal });
+        github = { ...github, repositories: [...github.repositories, repository] };
+        sources = [repository.sshUrl];
+      }
       // Create with an EMPTY config so every field inherits from global settings.
       const endpoint = organizationId ? `/api/organizations/${encodeURIComponent(organizationId)}/projects` : '/api/projects';
-      project = await api(endpoint, { method: 'POST', body: JSON.stringify({ name, config: {}, ...(repos.length ? { repos: [...repos] } : {}) }), signal: controller.signal });
+      project = await api(endpoint, { method: 'POST', body: JSON.stringify({ name, config: {}, ...(sources.length ? { repos: sources } : {}) }), signal: controller.signal });
     } catch (cause) {
       if (closed || cause?.name === 'AbortError') return;
-      error.textContent = cause.message;
+      if (usingDefault()) renderDefault(); // a repository made before the failure now reads "existing"
+      error.textContent = plainError(cause);
       error.hidden = false;
       button.disabled = false; button.textContent = 'Create project';
       $in('#new-project-name').focus();

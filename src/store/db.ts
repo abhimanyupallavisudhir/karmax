@@ -2170,8 +2170,9 @@ export class Store {
   /**
    * Observe committed changes to who may do what in an organization or project
    * (`organization:<id>` / `project:<id>`): memberships, teams, grants, role
-   * profiles, and a project's wiki repository. Things kept in step with tavya's
-   * access outside it, such as GitHub collaborators on project wikis, follow this.
+   * profiles, and the repositories a project uses (its wiki and code
+   * repositories). Things kept in step with tavya's access outside it, such as
+   * GitHub collaborators on a project's repositories, follow this.
    */
   onAccessChanged(listener: (scopeKey: string) => unknown): () => void {
     this.accessListeners.add(listener);
@@ -3743,6 +3744,8 @@ export class Store {
       baseBranch=excluded.baseBranch, targetBranch=excluded.targetBranch, ord=excluded.ord`)
       .run(input.projectId, input.repositoryId, baseBranch ?? null, targetBranch ?? null, order));
     (await this.syncProjectRepositoryConfig(input.projectId));
+    // Its members reach the repository on GitHub as they reach the project.
+    this.notifyAccessChanged(`project:${input.projectId}`);
     return { ...input, baseBranch, targetBranch, order };
   
     });
@@ -3766,6 +3769,12 @@ export class Store {
       createdAt: Number(row.createdAt),
       updatedAt: Number(row.updatedAt),
     };
+  }
+
+  /** The projects whose wiki lives in this repository. */
+  async projectIdsForWikiRepository(repositoryId: string): Promise<string[]> {
+    return ((await this.db.prepare('SELECT projectId FROM project_wikis WHERE repositoryId=? ORDER BY projectId')
+      .all(repositoryId)) as Array<{ projectId: string }>).map((row) => String(row.projectId));
   }
 
   async repositoryIsProjectWiki(repositoryId: string): Promise<boolean> {
@@ -3853,6 +3862,7 @@ export class Store {
 
     (await this.db.prepare('DELETE FROM project_repositories WHERE projectId=? AND repositoryId=?').run(projectId, repositoryId));
     (await this.syncProjectRepositoryConfig(projectId));
+    this.notifyAccessChanged(`project:${projectId}`);
   
     });
   }
@@ -3883,6 +3893,7 @@ export class Store {
       ON CONFLICT(projectId, repositoryId) DO UPDATE SET ord=excluded.ord`).run(projectId, repository.id, order++));
     const project = (await this.updateProjectConfig(projectId, { repos: sources }));
     (await this.syncProjectRepositorySettings(projectId, sources));
+    this.notifyAccessChanged(`project:${projectId}`);
     return project;
   
     });

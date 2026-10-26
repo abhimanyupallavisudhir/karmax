@@ -2280,7 +2280,7 @@ describe('PR stage (remote policy "pr")', () => {
     await git(handle.root, ['commit', '-q', '-m', 'change']);
 
     await expect(core.openPr(handle, 'main', {})).rejects.toThrow(
-      /GitHub PR identity is not connected.*Last recorded authorization failure:.*bad_refresh_token.*2026-08-17T06:30:00\.000Z.*not a non-fast-forward or local ancestry error/i,
+      /^Your GitHub connection needs to be renewed\. Open your profile and reconnect GitHub, then press Retry\. .*bad_refresh_token.*2026-08-17T06:30:00\.000Z.*not a branch-history conflict/i,
     );
     expect(transport).not.toHaveBeenCalled();
     await core.destroyWorld(handle);
@@ -2797,30 +2797,49 @@ describe('PR webhooks → karmax events', () => {
 describe('Pull requests opened as a person who cannot see the repository', () => {
   const WIKI_SLUG = 'srajma/project-wiki';
 
-  async function setup(options: { acceptable?: boolean; invitedTo?: string; adminInOrganization?: boolean } = {}) {
+  /** `manage`: the App may add collaborators to the code repository too (it
+   * always may on the wiki). `github`: what the creator linked on GitHub. */
+  async function setup(options: { acceptable?: boolean; invitedTo?: string; adminInOrganization?: boolean; manage?: boolean;
+    github?: 'linked' | 'none' | 'broken' } = {}) {
     const gh = fakeGithub();
     const visible = new Set<string>([SLUG]);
     const fetcher = (async (url: string, init: RequestInit = {}) => {
       const slug = new URL(String(url)).pathname.match(/^\/repos\/([^/]+\/[^/]+)/)?.[1];
-      if (slug && !visible.has(slug)) return Response.json({ message: 'Not Found' }, { status: 404 });
+      // The App's installation sees every repository it is installed on.
+      const app = new Headers(init.headers).get('authorization') === 'Bearer installation-token';
+      if (slug && !app && !visible.has(slug)) return Response.json({ message: 'Not Found' }, { status: 404 });
       return gh.fetcher(url, init);
     }) as typeof fetch;
     const accepted: unknown[][] = [];
+    const linked = (options.github ?? 'linked') === 'linked';
     const app = {
-      status: () => ({ userAuthorized: true, oauthConfigured: true }),
-      activeUserAccountId: () => 'member-account',
-      listUserAccounts: async (userId: string) => userId === 'member' ? [{ id: 'member-account', login: 'octo-member', active: true }]
+      status: () => ({ userAuthorized: linked, oauthConfigured: true,
+        ...(options.github === 'broken' ? { lastAuthorizationFailure: { code: 'refresh_rejected',
+          summary: 'GitHub rejected the refresh token (bad_refresh_token). Reconnect GitHub.',
+          occurredAt: Date.parse('2026-08-17T06:30:00.000Z'), disconnected: true, providerError: 'bad_refresh_token' } } : {}) }),
+      activeUserAccountId: () => linked ? 'member-account' : undefined,
+      hasLinkedUserAccount: async (userId: string) => userId === 'member' ? options.github !== 'none' : true,
+      listUserAccounts: async (userId: string) => userId === 'member' ? linked ? [{ id: 'member-account', login: 'octo-member', active: true }] : []
         : userId === 'owner' && options.adminInOrganization ? [{ id: 'owner-account', login: 'srajma', active: true }] : [],
-      userAccessToken: async () => 'member-token',
+      userAccessToken: async () => {
+        if (!linked) throw new Error('GitHub is not connected');
+        return 'member-token';
+      },
+      installationToken: async () => 'installation-token',
       brokerCredentials: async () => ({ env: {} }),
-      repositoryCollaborators: async (repository: { name: string }) => repository.name !== 'project-wiki' ? [{ login: 'srajma', role: 'admin' }]
+      repositoryCollaborators: async (repository: { name: string }) => repository.name !== 'project-wiki'
+        ? [{ login: 'srajma', role: 'admin' }, ...(options.manage && visible.has(SLUG) ? [{ login: 'octo-member', role: 'push' }] : [])]
         : [...visible].includes(WIKI_SLUG) ? [{ login: 'octo-member', role: 'push' }] : [],
       repositoryInvitations: async () => [],
-      addRepositoryCollaborator: async () => ({ invitationId: 5 }),
+      addRepositoryCollaborator: async (repository: { name: string }) => {
+        if (repository.name === 'project-wiki') return { invitationId: 5 };
+        if (!options.manage) throw new Error('GitHub API 403: Resource not accessible by integration');
+        return { invitationId: 6 };
+      },
       acceptRepositoryInvitation: async (...args: unknown[]) => {
         accepted.push(args);
         if (options.acceptable === false) throw new Error('GitHub API 404: invitation not found');
-        visible.add(WIKI_SLUG);
+        visible.add(args[2] === 6 ? SLUG : WIKI_SLUG);
       },
       removeRepositoryCollaborator: async () => undefined,
       acceptPendingRepositoryInvitation: async (userId: string, accountId: string, repository: { owner: string; name: string }, login: string) => {
@@ -2867,6 +2886,50 @@ describe('Pull requests opened as a person who cannot see the repository', () =>
     expect(opened.map((pr: TaskPullRequest) => pr.slug)).toEqual([SLUG, WIKI_SLUG]);
     expect(accepted).toEqual([['member', 'member-account', 5]]);
     expect(gh.prs.map((pr) => pr.repo)).toEqual([SLUG, WIKI_SLUG]);
+  });
+
+  it('gives the task\'s creator access to the project\'s code repository before acting as them', async () => {
+    const { core, gh, visible, accepted, handle } = await setup({ manage: true });
+    // Never invited by hand: GitHub would answer the pull request with 404.
+    visible.delete(SLUG);
+    const opened = await core.openPr(handle, 'main', { title: 'Member task' });
+    expect(opened.map((pr: TaskPullRequest) => pr.slug)).toEqual([SLUG, WIKI_SLUG]);
+    expect(accepted).toEqual([['member', 'member-account', 6], ['member', 'member-account', 5]]);
+    expect(gh.prs.map((pr) => pr.repo)).toEqual([SLUG, WIKI_SLUG]);
+    expect(gh.tokens.filter((token) => token === 'Bearer installation-token')).toEqual([]);
+  });
+
+  it('opens the pull request as the App for a creator with no GitHub account, naming them', async () => {
+    const { core, gh, handle, task } = await setup({ github: 'none' });
+    core.store.connectUserNames(() => [{ id: 'member', name: 'Mira Member', email: 'mira@example.com' }]);
+    const opened = await core.openPr(handle, 'main', { title: 'Member task', summary: 'Changed the intro.' });
+    expect(opened.map((pr: TaskPullRequest) => pr.slug)).toEqual([SLUG, WIKI_SLUG]);
+    expect(gh.prs.map((pr) => pr.body)).toEqual([
+      expect.stringContaining('Requested in tavya by Mira Member'),
+      expect.stringContaining('Requested in tavya by Mira Member'),
+    ]);
+    expect(gh.prs[0].body).toMatch(/^Changed the intro\./);
+    expect(gh.tokens).toContain('Bearer installation-token');
+    expect(gh.tokens).not.toContain('Bearer member-token');
+    const events = (await core.store.eventsSince(task.id, 0)).filter((event: any) => event.type === 'pr.opened-by-app');
+    expect(events.map((event: any) => event.payload)).toEqual([
+      expect.objectContaining({ slug: SLUG, requestedBy: 'Mira Member', reason: expect.stringMatching(/no GitHub account/) }),
+      expect.objectContaining({ slug: WIKI_SLUG, requestedBy: 'Mira Member' }),
+    ]);
+  });
+
+  it('names a creator without a display name by e-mail when the App opens their pull request', async () => {
+    const { core, gh, handle } = await setup({ github: 'none' });
+    core.store.connectUserNames(() => [{ id: 'member', name: '', email: 'mira@example.com' }]);
+    await core.openPr(handle, 'main', { title: 'Member task' });
+    expect(gh.prs[0].body).toContain('Requested in tavya by mira@example.com');
+  });
+
+  it('asks a creator whose GitHub connection broke to reconnect, in plain words', async () => {
+    const { core, gh, handle } = await setup({ github: 'broken' });
+    await expect(core.openPr(handle, 'main', { title: 'Member task' })).rejects.toThrow(
+      /^Your GitHub connection needs to be renewed\. Open your profile and reconnect GitHub, then press Retry\./);
+    expect(gh.prs).toEqual([]);
   });
 
   it('accepts the invitation a creator has not accepted yet, then opens the pull request', async () => {

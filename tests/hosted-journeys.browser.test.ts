@@ -164,8 +164,9 @@ describe('hosted console journeys (real gateway, stubbed paid providers)', () =>
       await page.locator('#signup-open').click();
       await page.getByText('Accepting an invitation').waitFor();
       await signUp(page, 'Ivan Invitee', 'ivan@example.test');
-      await step('the invitation is accepted', () => page.getByText('Invitation accepted.').waitFor());
-      expect(new URL(page.url()).pathname).toBe(`/${organization.slug}/settings`);
+      // A newcomer lands where the team works, welcomed, not in its settings.
+      await step('the invitation is accepted', () => page.getByText('Welcome to Olive Team').waitFor());
+      expect(new URL(page.url()).pathname).toBe(`/${organization.slug}`);
       const [ivan] = (await g.identity.listUsers()).filter((candidate) => candidate.email === 'ivan@example.test');
       expect(await g.store.organizationMembership(organization.id, ivan!.id)).toBeTruthy();
 

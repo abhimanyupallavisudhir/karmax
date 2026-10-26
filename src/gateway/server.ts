@@ -2874,6 +2874,11 @@ export class Gateway {
           const membership = (await store.acceptOrganizationInvitation(invitationToken, subject.userId, subjectEmail));
           (await this.deps.authorization?.replacePrincipalAuthorization('system:invitation', `user:${subject.userId}`,
             membership.organizationId, membership.authorization ?? legacyAuthorizationSelection(membership.profileId), ['*']));
+          // Someone who joins through an invitation came for that team: it becomes
+          // where they land, unless their own workspace already holds projects.
+          const home = (await store.defaultOrganization(subject.userId));
+          if (!home || (home.kind === 'personal' && !(await store.listOrganizationProjects(home.id)).length))
+            (await store.setDefaultOrganization(subject.userId, membership.organizationId));
           void this.deps.subscriptions?.syncSeats(membership.organizationId).catch((error) =>
             console.error('[subscription] seat sync failed:', error instanceof Error ? error.message : String(error)));
           return this.json(res, 200, membership);

@@ -16,7 +16,7 @@ In the organization's **Settings**:
 
 ## 3. Create a project
 
-Press **+** next to **Projects** in the sidebar and choose the repositories it works on, or none. A project is one task list with its own settings, data and wiki.
+Press **+** next to **Projects** in the sidebar and name it. With GitHub connected, the project works on the GitHub repository of the same name, and tavya creates it if it doesn't exist yet. Untick that to choose other repositories, or none. A project is one task list with its own settings, data and wiki.
 
 ## 4. Create a task
 
@@ -33,6 +33,10 @@ When an agent needs something (a decision, a password, a permission, a payment),
 ## 6. Review
 
 When the agent finishes, the task moves to **Review**. Read the changes, open the live preview or any outputs, then **Confirm** to merge, or reply with what to change. Reviews can also be assigned to another person or to an agent.
+
+## 7. Bring your team
+
+Invite people from **Settings → People & authorization**. Everyone in a project can see its GitHub repositories automatically, with no invitation to accept. Teammates without a GitHub account can still run tasks: tavya opens their pull requests for them, and someone with GitHub merge rights confirms the merge.
 
 ## Next
 
