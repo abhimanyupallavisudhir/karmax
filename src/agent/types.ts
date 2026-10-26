@@ -92,6 +92,9 @@ export interface PlatformToolContext {
   signal?: AbortSignal;
   /** Called between tool iterations so Temporal delivers a pending cancellation. */
   heartbeat?: () => void;
+  /** What the turn has spent so far, reported even when it then fails (a usage
+   *  limit), so its tokens are metered like a completed turn's. */
+  reportUsage?: (usage: AdapterTurn['usage']) => void;
   /** Pull follow-up messages that landed in the workflow AT OR AFTER `fromIndex`
    *  (a `msgs`-array index), so a streaming-capable adapter can inject them into the
    *  LIVE agent session mid-turn instead of waiting for the next turn (SPEC §5.6).
@@ -173,7 +176,9 @@ export interface AdapterTurn {
     inputTokensIncludeCacheRead?: boolean;
     /** Provider-normalized total; avoids double-counting APIs where cached input
      * is included in inputTokens while retaining cache details for reporting. */
-    totalTokens?: number };
+    totalTokens?: number;
+    /** The same counters per model, when the adapter knows them (a sub-agent may run on another model). */
+    models?: Record<string, { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number }> };
   /** How many leading `input.messages` this turn actually delivered to the agent —
    *  the initial delta PLUS any follow-ups injected in-flight (streaming adapters).
    *  Absolute index into the `msgs` conversation, so the workflow can position the

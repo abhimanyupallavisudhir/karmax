@@ -3514,7 +3514,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               startedAt: Date.now(), endedAt: Date.now(), metadata: { ...usageMetadata,
                 metering: 'provider-reported', inputTokens: usage.inputTokens, outputTokens: usage.outputTokens,
                 cacheReadTokens: usage.cacheReadTokens ?? 0, cacheWriteTokens: usage.cacheWriteTokens ?? 0,
-                inputTokensIncludeCacheRead: usage.inputTokensIncludeCacheRead ?? false } });
+                inputTokensIncludeCacheRead: usage.inputTokensIncludeCacheRead ?? false,
+                ...(usage.models ? { models: usage.models } : {}) } });
           }
           if (fundingSource === 'managed') {
             const actualized = managedModelActualCost(modelProvider, profile.model, usage, managedReservationMicros!);
@@ -3717,6 +3718,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             providerInvoked = true;
           },
           onProviderResult: turn => { providerUsage = turn.usage; },
+          // A turn the usage limit ends spent tokens too: meter them (funding-analysis#2).
+          onProviderUsage: usage => { if (usage) providerUsage = usage; },
           signal: computeHold ? AbortSignal.any([...(signal ? [signal] : []), computeStop.signal]) : signal,
           heartbeat,
           pullFollowUps,
@@ -7274,16 +7277,18 @@ function managedModelCostCeiling(provider: string, model?: string): number | und
   return Number.isSafeInteger(amount) && amount > 0 ? amount : undefined;
 }
 
-type PriceableUsage = {
+type TokenCounters = {
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens?: number;
   cacheWriteTokens?: number;
   inputTokensIncludeCacheRead?: boolean;
-} | undefined;
+};
+type PriceableUsage = (TokenCounters & { models?: Record<string, TokenCounters> }) | undefined;
 
-/** Actualize an active managed reservation from provider token counters. If the
- * installation has no complete price for the counters returned, retain the
+/** Actualize an active managed reservation from provider token counters, each
+ * model a turn used (a sub-agent may run on a cheaper one) at its own price. If
+ * the installation has no complete price for the counters returned, retain the
  * admission ceiling as an explicitly estimated charge so completed requests
  * can never bypass the monthly hard cap. */
 function managedModelActualCost(provider: string, model: string | undefined, usage: PriceableUsage,
@@ -7291,15 +7296,16 @@ function managedModelActualCost(provider: string, model: string | undefined, usa
   const raw = process.env.KARMAX_MANAGED_MODEL_PRICING;
   let values: Record<string, unknown> = {};
   try { values = raw ? JSON.parse(raw) as Record<string, unknown> : {}; } catch { /* estimate below */ }
-  const keys = [`${provider}/${model ?? '*'}`, `${provider}/*`, provider];
-  const pricingKey = keys.find((key) => values[key] && typeof values[key] === 'object');
-  const pricing = pricingKey ? values[pricingKey] as Record<string, unknown> : undefined;
-  if (usage && pricing) {
-    const cacheReadTokens = Math.max(0, Number(usage.cacheReadTokens ?? 0));
-    const cacheWriteTokens = Math.max(0, Number(usage.cacheWriteTokens ?? 0));
-    const inputTokens = Math.max(0, Number(usage.inputTokens ?? 0));
-    const outputTokens = Math.max(0, Number(usage.outputTokens ?? 0));
-    const uncachedInputTokens = usage.inputTokensIncludeCacheRead
+  const price = (model: string | undefined, counters: TokenCounters) => {
+    const keys = [`${provider}/${model ?? '*'}`, `${provider}/*`, provider];
+    const pricingKey = keys.find((key) => values[key] && typeof values[key] === 'object');
+    const pricing = pricingKey ? values[pricingKey] as Record<string, unknown> : undefined;
+    if (!pricing) return undefined;
+    const cacheReadTokens = Math.max(0, Number(counters.cacheReadTokens ?? 0));
+    const cacheWriteTokens = Math.max(0, Number(counters.cacheWriteTokens ?? 0));
+    const inputTokens = Math.max(0, Number(counters.inputTokens ?? 0));
+    const outputTokens = Math.max(0, Number(counters.outputTokens ?? 0));
+    const uncachedInputTokens = usage?.inputTokensIncludeCacheRead
       ? Math.max(0, inputTokens - cacheReadTokens) : inputTokens;
     const rate = (name: string, tokens: number): number | undefined => {
       if (!tokens) return 0;
@@ -7310,13 +7316,25 @@ function managedModelActualCost(provider: string, model: string | undefined, usa
     const outputRate = rate('outputMicrosPerMillionTokens', outputTokens);
     const cacheReadRate = rate('cacheReadMicrosPerMillionTokens', cacheReadTokens);
     const cacheWriteRate = rate('cacheWriteMicrosPerMillionTokens', cacheWriteTokens);
-    if ([inputRate, outputRate, cacheReadRate, cacheWriteRate].every((value) => value != null)) {
-      const costMicros = Math.ceil((uncachedInputTokens * inputRate! + outputTokens * outputRate!
-        + cacheReadTokens * cacheReadRate! + cacheWriteTokens * cacheWriteRate!) / 1_000_000);
+    if (![inputRate, outputRate, cacheReadRate, cacheWriteRate].every((value) => value != null)) return undefined;
+    const costMicros = Math.ceil((uncachedInputTokens * inputRate! + outputTokens * outputRate!
+      + cacheReadTokens * cacheReadRate! + cacheWriteTokens * cacheWriteRate!) / 1_000_000);
+    return Number.isSafeInteger(costMicros)
+      ? { costMicros, pricingKey, uncachedInputTokens, outputTokens, cacheReadTokens, cacheWriteTokens } : undefined;
+  };
+  if (usage) {
+    const models = Object.entries(usage.models ?? {});
+    const priced = models.length ? models.map(([name, counters]) => [name, price(name, counters)] as const) : undefined;
+    if (priced?.every(([, cost]) => cost)) {
+      const costMicros = priced.reduce((sum, [, cost]) => sum + cost!.costMicros, 0);
       if (Number.isSafeInteger(costMicros)) return { costMicros, classification: 'incurred', metadata: {
-        costBasis: 'configured-provider-token-pricing', pricingKey, uncachedInputTokens, outputTokens,
-        cacheReadTokens, cacheWriteTokens,
-      } };
+        costBasis: 'configured-provider-token-pricing', models: Object.fromEntries(priced) } };
+    } else if (!priced) {
+      const cost = price(model, usage);
+      if (cost) {
+        const { costMicros, ...counted } = cost;
+        return { costMicros, classification: 'incurred', metadata: { costBasis: 'configured-provider-token-pricing', ...counted } };
+      }
     }
   }
   return { costMicros: reservationMicros, classification: 'estimated', metadata: {
