@@ -5307,7 +5307,10 @@ export class Gateway {
           const tasks = await api.listTaskStore(token, storeMatch[1]!);
           return this.json(res, 200, p.endsWith('/automations') ? { automations: tasks } : { tasks });
         }
-        if (storeMatch[2] && method === 'POST') return this.json(res, 201, await api.runStoreTask(token, storeMatch[1]!, storeMatch[2]));
+        if (storeMatch[2] && method === 'POST') {
+          const { projectId: _project, templateId: _template, ...overrides } = await this.body(req);
+          return this.json(res, 201, await api.runStoreTask(token, storeMatch[1]!, storeMatch[2], overrides));
+        }
       }
       const followsMatch = p.match(/^\/api\/tasks\/([^/]+)\/follows(?:\/([^/]+))?$/);
       if (followsMatch) {

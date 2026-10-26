@@ -1279,6 +1279,10 @@ export interface TaskParams {
   repeatable?: boolean;
   /** Set on a run: the id of the series (repeatable template) it was spawned from. */
   runOf?: string;
+  /** The task store entry it was taken from (src/domain/task-store.ts). Kept
+   *  when the form replaces the params: the store counts the project's series
+   *  and runs by it. */
+  template?: string;
   /**
    * Human-assigned importance for organization/sorting (task search & views). A small
    * ordinal, 0=none … 4=urgent (see PRIORITIES). Purely organizational — never sent to

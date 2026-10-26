@@ -113,6 +113,15 @@ export function storeTaskRepeatable(template: Pick<StoreTask, 'task'>): boolean 
   return template.task.params.repeatable === true;
 }
 
+/** Whether a task is one the project took from store task `template`: a
+ *  repeatable one's armed series, an ordinary one's runs. A draft is not taken
+ *  yet, and a series' runs belong to their series. */
+export function takenFromStore(task: { params?: Record<string, unknown> }, template: Pick<StoreTask, 'id' | 'task'>): boolean {
+  const params = task.params ?? {};
+  if (params.template !== template.id || params.runOf || params.draft) return false;
+  return !storeTaskRepeatable(template) || params.repeatable === true;
+}
+
 /** What a store task needs, so the store can say what is missing. */
 export function storeTaskNeeds(template: Pick<StoreTask, 'task' | 'needs'>): StoreNeed[] {
   if (template.needs) return template.needs;

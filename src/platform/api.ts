@@ -36,7 +36,7 @@ import {
 import { templateContent, templateName, templateParams, templateAuthorization } from '../domain/task-templates.js';
 import { TaskRecord, TaskView, AttentionAsk, Message, Project, TaskInput, ImageRef, FileRef, Tag, SavedView, TaskTemplate, TaskQuery, AgentRole, AgentSpec, AgentAuthority, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency, remotePolicyOf, ResourceAccess, ResourceTarget } from '../domain/types.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable, awaitsSuccessOf, isSeries } from '../domain/triggers.js';
-import { STORE_TASKS, storeTaskNeeds, storeTaskRepeatable, type StoreNeed, type StoreTask } from '../domain/task-store.js';
+import { STORE_TASKS, storeTaskNeeds, storeTaskRepeatable, takenFromStore, type StoreNeed, type StoreTask } from '../domain/task-store.js';
 import { applyTriggerContext, normalizeEventInput, validateFollow, type EventFilter, type EventFollow, type ProjectEvent, type ProjectEventClaim,
   type ProjectEventInput, type ProjectEventOrigin, type TriggerContext } from '../domain/project-events.js';
 import { newId } from '../util/id.js';
@@ -1559,6 +1559,8 @@ export class KarmaxApi {
     if (!args.draft) (await this.assertRepositoriesValid(manifest, project, resolved));
 
     const title = args.title ?? firstLine(String(resolved.prompt ?? resolved.command ?? 'Task'));
+    if (!args.draft) (await this.assertStoreTaskFree({ projectId: args.projectId, params: { ...taskOverrides,
+      ...(forcesRepeatable(normalizeTriggers(taskOverrides)) ? { repeatable: true } : {}) } }));
     const createdBy = await this.taskCreator(caller, project.id);
     // Pin the connected account when the task is created. Switching the user's
     // active account later must not silently change an existing task's commit or
@@ -2315,6 +2317,7 @@ export class KarmaxApi {
     }
     // A draft sub-task is started by its parent, under the parent's grant.
     if (task.parentTaskId && task.params?.draft) return this.queueSubTaskDraft(caller, task);
+    (await this.assertStoreTaskFree(task));
     (await this.assertStoredGrantQueueable(token, caller, task));
     (await this.refreshAgentAuthorizationsForQueue(token, caller, task));
     const group = (await this.deps.store.attemptGroup(taskId));
@@ -3134,7 +3137,7 @@ export class KarmaxApi {
     };
     return STORE_TASKS.map(({ task: { hostedPrompt, ...task }, ...template }) => ({ ...template, task: { ...task, prompt: this.storePrompt({ task: { ...task, hostedPrompt } }) },
       repeatable: storeTaskRepeatable({ task }),
-      installed: tasks.filter((candidate) => candidate.params?.template === template.id && !candidate.params?.runOf)
+      installed: tasks.filter((candidate) => takenFromStore(candidate, { id: template.id, task }))
         .sort((a, b) => b.createdAt - a.createdAt).map((candidate) => candidate.id),
       missing: storeTaskNeeds({ task, needs: template.needs }).filter((need) => !has[need]) }));
   }
@@ -3144,18 +3147,27 @@ export class KarmaxApi {
   }
 
   /** Take a task from the store: an ordinary one starts now (as often as
-   *  asked); a repeatable one becomes the project's armed series, once. */
-  async runStoreTask(token: string, projectId: string, templateId: string): Promise<TaskRecord> {
+   *  asked); a repeatable one becomes the project's armed series, once.
+   *  `overrides` customize it as createTask's arguments do, `params` field by
+   *  field (what the task form sends when it is opened from the store). */
+  async runStoreTask(token: string, projectId: string, templateId: string,
+    overrides: Omit<Parameters<KarmaxApi['createTask']>[1], 'projectId' | 'templateId'> = {}): Promise<TaskRecord> {
     (await this.require(token, 'create_task', { projectId }));
     if (!(await this.deps.store.getProject(projectId))) throw new NotFoundError(`no project ${projectId}`);
     const template = STORE_TASKS.find((candidate) => candidate.id === templateId);
     if (!template) throw new NotFoundError(`no store task ${templateId}`);
-    if (storeTaskRepeatable(template)) {
-      const existing = (await this.deps.store.listTasks(projectId)).find((task) => task.params?.template === templateId && !task.params?.runOf);
-      if (existing) throw new ValidationError(`this project already has it: ${existing.id}`);
-    }
-    return this.createTask(token, { projectId, title: template.task.title, prompt: this.storePrompt(template), ...(template.task.workflow ? { workflow: template.task.workflow } : {}),
-      params: { ...template.task.params, template: template.id } });
+    const { params, ...rest } = overrides;
+    return this.createTask(token, { projectId, title: template.task.title, ...(template.task.workflow ? { workflow: template.task.workflow } : {}), ...rest,
+      params: { ...template.task.params, prompt: this.storePrompt(template), ...params, template: template.id } });
+  }
+
+  /** A repeatable store task is installed once per project: another series
+   *  from it would answer every event twice. Deleting the series frees it. */
+  private async assertStoreTaskFree(task: { id?: string; projectId: string; params?: Record<string, unknown> }): Promise<void> {
+    const template = STORE_TASKS.find((candidate) => candidate.id === task.params?.template);
+    if (!template || !storeTaskRepeatable(template) || !takenFromStore({ params: { ...task.params, draft: false } }, template)) return;
+    const existing = (await this.deps.store.listTasks(task.projectId)).find((other) => other.id !== task.id && takenFromStore(other, template));
+    if (existing) throw new ValidationError(`this project already has “${template.name}”: ${existing.id}`);
   }
 
   /** A run started by an event follows what the event is about: the issue's
@@ -3377,10 +3389,11 @@ export class KarmaxApi {
       (await this.validatePromptFiles(task.projectId, promptFiles));
       params.files = promptFiles;
     }
-    const { archived, profiles, priority, _authorization, _agentAuthorization, _githubAccountId } = task.params;
+    const { archived, profiles, priority, template, _authorization, _agentAuthorization, _githubAccountId } = task.params;
     const meta = {
       paymentPolicy: (task.params as any).paymentPolicy,
       ...(archived !== undefined ? { archived } : {}),
+      ...(template !== undefined ? { template } : {}),
       ...(profiles !== undefined ? { profiles } : {}),
       ...(priority !== undefined ? { priority } : {}),
       ...(_authorization !== undefined ? { _authorization } : {}),
@@ -3435,9 +3448,11 @@ export class KarmaxApi {
         mayAttenuate: staysDraft && opts.allowAttenuation === true, accept: opts.acceptAttenuation, fromDefaults,
       }));
     }
-    // Keep the display title tracking the (edited) prompt — the title was derived
-    // from the prompt at creation, so an edit should carry through (SPEC §10).
-    if (typeof base.prompt === 'string' && base.prompt.trim()) (await this.deps.store.setTaskTitle(taskId, firstLine(String(base.prompt))));
+    // Keep the display title tracking the (edited) prompt when it was derived
+    // from the prompt (SPEC §10). A title given at creation stays: a store
+    // automation's `#{{issue.number}} {{issue.title}}` names each of its runs.
+    if (typeof base.prompt === 'string' && base.prompt.trim() && task.title === firstLine(String(task.params?.prompt ?? task.params?.command ?? 'Task')))
+      (await this.deps.store.setTaskTitle(taskId, firstLine(String(base.prompt))));
     // A cron/recurring trigger forces the series flag on (mirrors createTask).
     if (forcesRepeatable(normalizeTriggers(base))) base.repeatable = true;
     // A repeatable series stays a series when saved: persist, then arm it if it
