@@ -41,7 +41,7 @@ export class PaddleSubscriptionProvider implements SubscriptionProvider {
     throw new Error('Paddle collects customer details during checkout');
   }
   async createCheckout(input: Parameters<SubscriptionProvider['createCheckout']>[0]) {
-    const items = await this.items(input.plan, input.seats);
+    const items = await this.checkoutItems(input);
     const checkout = checkoutUrl(input.successUrl);
     const transaction = await this.request('/transactions', 'POST', { items, collection_mode: 'automatic',
       custom_data: { karmax_request: input.idempotencyKey },
@@ -57,7 +57,7 @@ export class PaddleSubscriptionProvider implements SubscriptionProvider {
     if (transaction.status === 'canceled') return null;
     if (!['draft', 'ready'].includes(transaction.status))
       throw new BillingRequestRejected('Paddle is processing the existing checkout; wait for payment confirmation');
-    const items = await this.items(input.plan, input.seats);
+    const items = await this.checkoutItems(input);
     // Do not change a previously accepted checkout's commercial terms in place.
     // Invalidate its old link before creating a replacement at the new price.
     if (!sameItems(transaction.items, items)) {
@@ -93,9 +93,12 @@ export class PaddleSubscriptionProvider implements SubscriptionProvider {
   async changePlan(input: Parameters<SubscriptionProvider['changePlan']>[0]) {
     const plan = await this.items(input.plan, input.seats);
     const current = await this.request(`/subscriptions/${encodeURIComponent(input.subscriptionId)}`, 'GET');
-    const items = [...plan, ...packItems(await this.catalog(), current.items)];
+    const catalog = await this.catalog();
+    const items = [...plan, ...packItems(catalog, current.items)];
     if (sameItems(current.items, items)) return { id: input.subscriptionId };
+    // A plan added to packs that were ending keeps the subscription.
     return this.request(`/subscriptions/${encodeURIComponent(input.subscriptionId)}`, 'PATCH', {
+      ...(packsEnding(catalog, current) ? { scheduled_change: null } : {}),
       items, proration_billing_mode: 'prorated_next_billing_period',
     });
   }
@@ -176,16 +179,23 @@ export class PaddleSubscriptionProvider implements SubscriptionProvider {
     if (!pack) throw new BillingRequestRejected(`${kind} packs are not configured`);
     if (!Number.isSafeInteger(packs) || packs < 0) throw new BillingRequestRejected(`invalid ${kind} pack count`);
     const subscription = await this.request(`/subscriptions/${encodeURIComponent(subscriptionId)}`, 'GET');
-    const plans = [catalog.individualPriceId, catalog.teamBasePriceId];
-    if (!Array.isArray(subscription.items) || !subscription.items.some((item: any) => plans.includes(item.price?.id)))
+    const plans = planPrices(catalog);
+    // A plan's subscription, or one of packs alone beside a gifted plan.
+    if (!Array.isArray(subscription.items) || !subscription.items.some((item: any) => [...plans, ...packPrices(catalog)].includes(item.price?.id)))
       throw new BillingRequestRejected(`cannot add ${kind} packs to a Paddle subscription without a plan`);
     if (subscription.items.some((item: any) => ![...plans, catalog.teamSeatPriceId, ...packPrices(catalog)].includes(item.price?.id)))
       throw new BillingRequestRejected(`Paddle subscription has unexpected items; reconcile before changing ${kind} packs`);
     const items = [...subscription.items.filter((item: any) => item.price.id !== pack)
       .map((item: any) => ({ price_id: item.price.id as string, quantity: Number(item.quantity) })),
     ...(packs ? [{ price_id: pack, quantity: packs }] : [])];
-    if (sameItems(subscription.items, items)) return { id: subscriptionId };
+    const ending = packsEnding(catalog, subscription);
+    // Packs alone end with the last one, when the period paid for ends (as
+    // Cancel does: Paddle has no empty subscription); adding one back keeps it.
+    if (!items.length) return ending ? { id: subscriptionId }
+      : this.request(`/subscriptions/${encodeURIComponent(subscriptionId)}/cancel`, 'POST', { effective_from: 'next_billing_period' });
+    if (sameItems(subscription.items, items) && !ending) return { id: subscriptionId };
     return this.request(`/subscriptions/${encodeURIComponent(subscriptionId)}`, 'PATCH', {
+      ...(ending ? { scheduled_change: null } : {}),
       items, proration_billing_mode: 'prorated_next_billing_period',
     });
   }
@@ -242,17 +252,18 @@ export class PaddleSubscriptionProvider implements SubscriptionProvider {
       if (intent.kind === 'cancel') return subscription.status === 'canceled' || subscription.scheduled_change?.action === 'cancel'
         ? { id: intent.subscriptionId } : absent;
       if (!Array.isArray(subscription.items)) return null;
-      // Each write is settled by the part of the item list it changed.
-      if (intent.kind === 'storage') return packCount(catalog!.storagePackPriceId!, subscription.items) === intent.storagePacks
+      // Each write is settled by the part of the item list it changed. Packs
+      // alone that are ending hold none from then on.
+      const packs = (price: string) => packsEnding(catalog, subscription) ? 0 : packCount(price, subscription.items);
+      if (intent.kind === 'storage') return packs(catalog!.storagePackPriceId!) === intent.storagePacks
         ? { id: intent.subscriptionId } : absent;
-      if (intent.kind === 'compute') return packCount(catalog!.computePackPriceId!, subscription.items) === intent.computePacks
+      if (intent.kind === 'compute') return packs(catalog!.computePackPriceId!) === intent.computePacks
         ? { id: intent.subscriptionId } : absent;
       if (!intent.plan || !intent.seats) return null;
-      const packs = packPrices(catalog);
-      const planItems = subscription.items.filter((item: any) => !packs.includes(item.price?.id));
+      const planItems = subscription.items.filter((item: any) => !packPrices(catalog).includes(item.price?.id));
       return sameItems(planItems, await this.items(intent.plan, intent.seats)) ? { id: intent.subscriptionId } : absent;
     }
-    if (!intent.plan || !intent.seats || !intent.successUrl) return null;
+    if (!(intent.plan ? intent.seats : intent.storagePacks || intent.computePacks) || !intent.successUrl) return null;
     let found: any;
     if (intent.checkoutId) {
       found = await this.request(`/transactions/${encodeURIComponent(intent.checkoutId)}`, 'GET');
@@ -287,10 +298,25 @@ export class PaddleSubscriptionProvider implements SubscriptionProvider {
       found = matches[0];
     }
     if (found.collection_mode !== 'automatic' || !/^txn_[a-z0-9]+$/.test(found.id)
-      || found.status === 'canceled' || !sameItems(found.items, await this.items(intent.plan, intent.seats))) return null;
+      || found.status === 'canceled' || !sameItems(found.items, await this.checkoutItems({ seats: 0, ...intent }))) return null;
     const url = checkoutUrl(intent.successUrl);
     url.searchParams.set('_ptxn', found.id);
     return { id: found.id, url: url.toString() };
+  }
+  /** A checkout's items: a plan and its seats, then any packs. */
+  private async checkoutItems(order: { plan?: 'individual' | 'team'; seats: number; storagePacks?: number; computePacks?: number }) {
+    const catalog = await this.catalog();
+    if (!catalog) throw new BillingRequestRejected('Paddle prices are not configured');
+    const items = order.plan ? await this.items(order.plan, order.seats) : [];
+    for (const [kind, packs, price] of [['storage', order.storagePacks, catalog.storagePackPriceId],
+      ['compute', order.computePacks, catalog.computePackPriceId]] as const) {
+      if (!packs) continue;
+      if (!price) throw new BillingRequestRejected(`${kind} packs are not configured`);
+      if (!Number.isSafeInteger(packs) || packs < 0) throw new BillingRequestRejected(`invalid ${kind} pack count`);
+      items.push({ price_id: price, quantity: packs });
+    }
+    if (!items.length) throw new BillingRequestRejected('a checkout needs a plan or a pack');
+    return items;
   }
   private async items(plan: 'individual' | 'team', seats: number) {
     const catalog = await this.catalog();
@@ -327,6 +353,16 @@ export class PaddleSubscriptionProvider implements SubscriptionProvider {
 
 function packCount(pack: string, items: any[]): number {
   return items.filter((item) => item.price?.id === pack).reduce((sum, item) => sum + Number(item.quantity), 0);
+}
+
+function planPrices(catalog: SubscriptionCatalogConfig | undefined): string[] {
+  return [catalog?.individualPriceId, catalog?.teamBasePriceId].filter((id): id is string => Boolean(id));
+}
+
+/** A subscription of packs alone (no plan) that its last pack's removal set to end. */
+function packsEnding(catalog: SubscriptionCatalogConfig | undefined, subscription: any): boolean {
+  return subscription?.scheduled_change?.action === 'cancel' && Array.isArray(subscription.items)
+    && !subscription.items.some((item: any) => planPrices(catalog).includes(item.price?.id));
 }
 
 /** The prices of every kind of pack the catalog offers. */

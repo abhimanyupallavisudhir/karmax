@@ -20,6 +20,7 @@ const markup = Function('esc', 'S', 'location', `
   const policyTip = (text) => '<i title="' + esc(text) + '">ⓘ</i>';
   const siteName = () => 'tavya';
   const policyAcceptanceMarkup = () => '<label class="policy-acceptance"></label>';
+  const checkoutTermsTip = () => policyTip('Plans renew monthly until canceled.');
   const COMPUTER_PROVIDERS = { e2b: { name: 'E2B' }, hetzner: { name: 'Hetzner' } };
   ${extractFunction('formatBytes')}
   const PLAN_ACTIVE = ['active', 'trialing', 'past_due'];
@@ -124,6 +125,53 @@ describe('Plan & billing', () => {
     expect(operator).toMatch(/value="2" class="plan-gift-count" aria-label="Gifted compute packs"/);
     // A gifted plan is not for sale.
     expect(operator).not.toContain('billing-checkout');
+  });
+
+  it('lets a gifted plan buy packs at checkout, and a gifted Individual buy Team', () => {
+    const giftedTeam = markup(entitlements({ plan: 'team', planName: 'Team', currentMonthlyPriceCents: 1_900, maxMembers: null,
+      storageQuotaBytes: 100 * GB, includedStorageBytes: 100 * GB,
+      compute: { usedMicros: 0, creditMicros: 10_000_000, from: 0, to: Date.UTC(2026, 10, 1), providers: ['e2b'] } }),
+    status({ plan: 'team', gift: { plan: 'team' } }));
+    expect(text(giftedTeam)).toMatch(/^\s*Team Gifted\s+People/);
+    // The first pack opens checkout; there is nothing to remove yet.
+    expect(giftedTeam).toMatch(/billing-buy" data-kind="storage" data-packs="1" data-add aria-label="Add a storage pack"/);
+    expect(giftedTeam).toMatch(/billing-buy" data-kind="compute" data-packs="1" data-add/);
+    expect(giftedTeam).toMatch(/billing-packs" data-kind="storage" data-packs="-1" aria-label="Remove a storage pack" disabled/);
+    // Team seats come with the gift: nothing to buy, no plan choices, no cancel.
+    expect(giftedTeam).not.toContain('Upgrade to Team');
+    expect(giftedTeam).not.toContain('billing-checkout');
+    expect(giftedTeam).not.toContain('billing-cancel');
+
+    const giftedIndividual = markup(entitlements({ plan: 'individual', planName: 'Individual' }), status({ plan: 'individual', gift: { plan: 'individual' } }));
+    expect(giftedIndividual).toMatch(/class="btn sm billing-buy" data-plan="team"\s*>Upgrade to Team/);
+    // A member sees no controls; neither does anyone while checkout is closed.
+    expect(markup(entitlements({ plan: 'individual', planName: 'Individual' }), status({ plan: 'individual', gift: { plan: 'individual' }, canManage: false })))
+      .not.toMatch(/billing-buy" data-kind/);
+    expect(markup(entitlements({ plan: 'individual', planName: 'Individual' }), status({ plan: 'individual', gift: { plan: 'individual' }, providerConfigured: false })))
+      .not.toContain('billing-buy');
+  });
+
+  it('changes the packs bought beside a gift on their own subscription, and shows what it bills', () => {
+    const packs = status({ plan: 'individual', gift: { plan: 'individual' }, billedPlan: 'free', status: 'active', storagePacks: 2,
+      billedMonthlyPriceCents: 800, currentPeriodEnd: Date.UTC(2026, 10, 3) });
+    const html = markup(entitlements({ plan: 'individual', planName: 'Individual', storagePacks: 2, storageQuotaBytes: 250 * GB }), packs);
+    expect(text(html)).toMatch(/Individual Gifted Packs \$8\/month · renews/);
+    expect(html).toMatch(/billing-packs" data-kind="storage" data-packs="3" data-add/);
+    expect(html).toMatch(/billing-packs" data-kind="storage" data-packs="1" aria-label="Remove/);
+    expect(html).not.toContain('billing-buy');
+    // Team goes onto the same subscription; the payment method is managed in Billing.
+    expect(html).toMatch(/billing-change" data-plan="team"/);
+    expect(html).toContain('billing-portal');
+    expect(html).not.toContain('billing-cancel');
+    // The last pack removed: the subscription ends with its period, and the steppers show none.
+    const ending = markup(entitlements({ plan: 'individual', planName: 'Individual', storagePacks: 2 }), { ...packs, cancelAtPeriodEnd: true });
+    expect(text(ending)).toMatch(/Packs \$8\/month · end/);
+    expect(ending).toMatch(/data-kind="storage" data-packs="1" data-add/);
+    // Packs left after the gift was removed take a plan onto their subscription.
+    const ungifted = markup(entitlements({ storagePacks: 2 }), { ...packs, plan: 'free', gift: null });
+    expect(ungifted).toMatch(/billing-change" data-plan="individual"/);
+    expect(ungifted).not.toContain('billing-checkout');
+    expect(ungifted).not.toContain('policy-acceptance');
   });
 
   it('makes private-install behavior explicit instead of showing hosted limits', () => {

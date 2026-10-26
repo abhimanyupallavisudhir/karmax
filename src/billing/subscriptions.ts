@@ -37,20 +37,23 @@ export interface SubscriptionCatalogConfig {
 /** Authoritative commercial snapshot returned by the canonical checkout service.
  * Policy acceptance is intentionally outside this billing-owned structure. */
 export interface SubscriptionCommercialTerms {
-  planId: PaidHostedPlanId;
-  planName: string;
+  /** Null for packs alone, bought beside a gifted plan (checkoutPacks). */
+  planId: PaidHostedPlanId | null;
+  planName: string | null;
   currency: 'usd';
   billingInterval: 'month';
   monthlyBasePriceCents: number;
   includedActiveUsers: number;
   monthlyAdditionalActiveUserPriceCents: number;
   activeUsers: number;
+  storagePacks?: number;
+  computePacks?: number;
   monthlyTotalPriceCents: number;
 }
 
 export interface SubscriptionCheckoutResult {
   organizationId: string;
-  plan: PaidHostedPlanId;
+  plan: PaidHostedPlanId | null;
   commercialTerms: SubscriptionCommercialTerms;
   checkoutRequestReference: string;
   checkoutSessionReference: string;
@@ -93,8 +96,10 @@ export interface SubscriptionProvider {
   configured(): boolean | Promise<boolean>;
   catalog(): SubscriptionCatalogConfig | undefined | Promise<SubscriptionCatalogConfig | undefined>;
   createCustomer(input: { organizationId: string; name: string; idempotencyKey: string }): Promise<{ id: string }>;
-  createCheckout(input: { organizationId: string; customerId: string; plan: PaidHostedPlanId;
-    seats: number; successUrl: string; cancelUrl: string; idempotencyKey: string }): Promise<{ id: string; url: string }>;
+  /** A subscription of a plan and its seats, or of packs alone (no plan). */
+  createCheckout(input: { organizationId: string; customerId: string; plan?: PaidHostedPlanId;
+    seats: number; storagePacks?: number; computePacks?: number;
+    successUrl: string; cancelUrl: string; idempotencyKey: string }): Promise<{ id: string; url: string }>;
   resumeCheckout?(input: Parameters<SubscriptionProvider['createCheckout']>[0] & { checkoutId: string }): Promise<{ id: string; url: string } | null>;
   cancelCheckout?(checkoutId: string): Promise<{ id: string }>;
   /** The recovered result, `{ absent: true }` when a complete read shows the
@@ -183,8 +188,8 @@ export class StripeSubscriptionProvider implements SubscriptionProvider {
     }, input.idempotencyKey);
   }
 
-  async createCheckout(input: { organizationId: string; customerId: string; plan: PaidHostedPlanId;
-    seats: number; successUrl: string; cancelUrl: string; idempotencyKey: string }) {
+  async createCheckout(input: Parameters<SubscriptionProvider['createCheckout']>[0]) {
+    if (!input.plan || input.storagePacks || input.computePacks) throw new BillingRequestRejected('packs are billed only through Paddle');
     const catalog = (await this.requireCatalog());
     const additionalTeamUsers = Math.max(0, input.seats - HOSTED_PLANS.team.includedActiveUsers);
     const params: Record<string, string | number | boolean> = {
@@ -326,18 +331,18 @@ export class SubscriptionBillingService {
       JOIN subscription_billing_accounts a ON a.organizationId=c.organizationId
         AND a.provider=c.provider AND a.subscriptionId=c.subscriptionId
       WHERE p.userId=? AND p.context='checkout' AND c.state='associated'
-        AND a.verifiedAt IS NOT NULL AND a.plan!='free'
+        AND a.verifiedAt IS NOT NULL
         AND a.status IN ('active','trialing','past_due','unpaid','paused','canceled')
         AND NOT EXISTS (SELECT 1 FROM policy_acceptances earlier
           WHERE earlier.organizationId=p.organizationId AND earlier.context='checkout'
             AND earlier.checkoutSessionReference=p.checkoutSessionReference
             AND (earlier.acceptedAt<p.acceptedAt OR (earlier.acceptedAt=p.acceptedAt AND earlier.id<p.id)))
       ORDER BY a.organizationId`).all(userId) as Array<{
-        organizationId: string; plan: PaidHostedPlanId; status: SubscriptionStatus;
+        organizationId: string; plan: HostedPlanId; status: SubscriptionStatus;
         cancelAtPeriodEnd: number; currentPeriodEnd: number | null;
       }>;
     return rows.map(row => ({ organizationId: row.organizationId, plan: row.plan,
-      planName: HOSTED_PLANS[row.plan].name, status: row.status,
+      planName: row.plan === 'free' ? 'Packs' : HOSTED_PLANS[row.plan].name, status: row.status,
       cancelAtPeriodEnd: Boolean(row.cancelAtPeriodEnd), currentPeriodEnd: row.currentPeriodEnd }));
   }
 
@@ -373,7 +378,11 @@ export class SubscriptionBillingService {
     const storagePackGift = await this.store.storagePackGift(organizationId);
     const computePack = { ...COMPUTE_PACK, available: Boolean(catalog?.computePackPriceId) };
     const computePackGift = await this.store.computePackGift(organizationId);
+    // What the subscription bills each month: its plan and seats, and its packs.
+    const billedMonthlyPriceCents = account?.subscriptionId && ['active', 'trialing', 'past_due'].includes(status)
+      ? hostedMonthlyPriceCents(billedPlan, seats, account.storagePacks, account.computePacks) : null;
     return { managed: true, providerConfigured: (await provider.configured()), plan, billedPlan, status, seats, gift, pendingRequest, pendingCheckout,
+      billedMonthlyPriceCents,
       storagePacks: account?.storagePacks ?? 0, storagePack, storagePackGift, giftedStoragePacks: storagePackGift?.packs ?? 0,
       computePacks: account?.computePacks ?? 0, computePack, computePackGift, giftedComputePacks: computePackGift?.packs ?? 0,
       activeUsers: members, seatDeficit: gift?.plan === 'team' ? 0 : plan === 'team' ? Math.max(0, members - seats)
@@ -461,30 +470,68 @@ export class SubscriptionBillingService {
   async checkout(organizationId: string, plan: unknown, urls: { success: string; cancel: string }, key: string): Promise<SubscriptionCheckoutResult> {
     const provider = await this.requireHosted(); this.requireKey(key);
     if (!isPaidHostedPlanId(plan)) throw new Error('choose Individual or Team');
-    const current = (await this.account(organizationId));
-    if (current && current.provider !== provider.name)
-      throw new Error('this organization has a billing account with another provider; reconcile it before switching');
-    if (current?.subscriptionId && !['none', 'canceled', 'incomplete_expired'].includes(current.status))
-      throw new Error('use Change plan for an existing subscription');
-    if (!(await this.store.getOrganization(organizationId))) throw new Error('organization not found');
+    await this.assertNoSubscription(organizationId, provider, 'use Change plan for an existing subscription');
     const activeUsers = (await this.store.listOrganizationMemberships(organizationId)).length;
     const definition = HOSTED_PLANS[plan];
     if (definition.maxMembers != null && activeUsers > definition.maxMembers)
       throw new Error(`remove additional active users before choosing ${definition.name}`);
     const seats = Math.max(definition.includedActiveUsers, activeUsers);
-    const checkoutResult = { organizationId, plan, commercialTerms: {
-      planId: plan, planName: definition.name, currency: 'usd' as const, billingInterval: 'month' as const,
+    return this.startCheckout(organizationId, { plan, seats }, {
+      planId: plan, planName: definition.name, currency: 'usd', billingInterval: 'month',
       monthlyBasePriceCents: definition.monthlyBasePriceCents, includedActiveUsers: definition.includedActiveUsers,
       monthlyAdditionalActiveUserPriceCents: definition.monthlyAdditionalActiveUserPriceCents, activeUsers,
       monthlyTotalPriceCents: hostedMonthlyPriceCents(plan, activeUsers),
-    }, checkoutRequestReference: key, checkoutProvider: provider.name };
-    const intent: BillingRequestIntent = { kind: 'checkout', plan, seats, successUrl: urls.success, checkoutResult };
-    return this.idempotent(organizationId, `checkout:${plan}`, key, async (reference) => {
+    }, `checkout:${plan}`, urls, key, provider);
+  }
+
+  /** Packs for an organization whose plan is gifted: a gift has no
+   * subscription to carry them, so the first ones start a subscription of
+   * packs alone, and later ones change it like a paid plan's. A Free
+   * organization chooses a plan instead. */
+  async checkoutPacks(organizationId: string, order: { storagePacks?: unknown; computePacks?: unknown },
+    urls: { success: string; cancel: string }, key: string): Promise<SubscriptionCheckoutResult> {
+    const provider = await this.requireHosted(); this.requireKey(key);
+    const count = (kind: string, packs: unknown = 0): number => {
+      if (typeof packs !== 'number' || !Number.isSafeInteger(packs) || packs < 0 || packs > 1000)
+        throw new Error(`${kind} packs must be a whole number from 0 to 1000`);
+      return packs;
+    };
+    const storagePacks = count('storage', order.storagePacks), computePacks = count('compute', order.computePacks);
+    if (!storagePacks && !computePacks) throw new Error('choose at least one pack');
+    const catalog = await provider.catalog();
+    if (storagePacks && !catalog?.storagePackPriceId) throw new Error('storage packs are not available yet');
+    if (computePacks && !catalog?.computePackPriceId) throw new Error('compute packs are not available yet');
+    await this.assertNoSubscription(organizationId, provider, 'add packs to the existing subscription');
+    if (!(await this.currentGift(organizationId))) throw new Error('packs need a plan: choose Individual or Team first');
+    const activeUsers = (await this.store.listOrganizationMemberships(organizationId)).length;
+    return this.startCheckout(organizationId, { seats: 0, storagePacks, computePacks }, {
+      planId: null, planName: null, currency: 'usd', billingInterval: 'month',
+      monthlyBasePriceCents: 0, includedActiveUsers: 0, monthlyAdditionalActiveUserPriceCents: 0, activeUsers,
+      storagePacks, computePacks, monthlyTotalPriceCents: hostedMonthlyPriceCents('free', activeUsers, storagePacks, computePacks),
+    }, `checkout:packs:${storagePacks}:${computePacks}`, urls, key, provider);
+  }
+
+  private async assertNoSubscription(organizationId: string, provider: SubscriptionProvider, existing: string): Promise<void> {
+    const current = (await this.account(organizationId));
+    if (current && current.provider !== provider.name)
+      throw new Error('this organization has a billing account with another provider; reconcile it before switching');
+    if (current?.subscriptionId && !['none', 'canceled', 'incomplete_expired'].includes(current.status)) throw new Error(existing);
+    if (!(await this.store.getOrganization(organizationId))) throw new Error('organization not found');
+  }
+
+  private async startCheckout(organizationId: string,
+    order: { plan?: PaidHostedPlanId; seats: number; storagePacks?: number; computePacks?: number },
+    commercialTerms: SubscriptionCommercialTerms, operation: string, urls: { success: string; cancel: string }, key: string,
+    provider: SubscriptionProvider): Promise<SubscriptionCheckoutResult> {
+    const checkoutResult = { organizationId, plan: order.plan ?? null, commercialTerms,
+      checkoutRequestReference: key, checkoutProvider: provider.name };
+    const intent: BillingRequestIntent = { kind: 'checkout', ...order, successUrl: urls.success, checkoutResult };
+    return this.idempotent(organizationId, operation, key, async (reference) => {
       const latest = await this.account(organizationId);
       if (latest && (latest.provider !== provider.name || latest.subscriptionId && !['none', 'canceled', 'incomplete_expired'].includes(latest.status)))
         throw new BillingRequestRejected('billing state changed; refresh before starting checkout');
       const customerId = await this.ensureCustomer(organizationId, `${key}:customer`, provider);
-      const input = { organizationId, customerId, plan, seats,
+      const input = { organizationId, customerId, ...order,
         successUrl: urls.success, cancelUrl: urls.cancel, idempotencyKey: `${provider.supportsIdempotency === false ? reference : key}:checkout` };
       const pending = provider.resumeCheckout ? await this.store.db.prepare(`SELECT checkoutId FROM subscription_billing_checkouts
         WHERE provider=? AND organizationId=? AND state='pending' ORDER BY createdAt DESC LIMIT 1`)
@@ -554,16 +601,17 @@ export class SubscriptionBillingService {
     }), provider, { kind: 'cancel', subscriptionId: account.subscriptionId });
   }
 
-  /** Sets the total storage packs billed on the subscription. Like seats, the
-   * packs are granted only from the verified state that follows. */
+  /** Sets the total storage packs billed on the subscription: a paid plan's,
+   * or one of packs alone (checkoutPacks). Like seats, the packs are granted
+   * only from the verified state that follows. */
   async storagePacks(organizationId: string, packs: unknown, key: string) {
     this.requireKey(key);
     if (typeof packs !== 'number' || !Number.isSafeInteger(packs) || packs < 0)
       throw new Error('storage packs must be a whole number of 0 or more');
     const account = await this.account(organizationId);
     const provider = await this.requireHosted(account?.provider);
-    if (!account?.subscriptionId || account.plan === 'free' || !['active', 'trialing', 'past_due'].includes(account.status))
-      throw new Error('storage packs need an active paid subscription');
+    if (!account?.subscriptionId || !['active', 'trialing', 'past_due'].includes(account.status))
+      throw new Error(await this.currentGift(organizationId) ? 'buy the first storage packs at checkout' : 'storage packs need a paid plan');
     if (!(await provider.catalog())?.storagePackPriceId) throw new Error('storage packs are not available yet');
     if (packs > account.storagePacks && account.status === 'past_due')
       throw new Error('update the payment method before adding storage packs');
@@ -583,8 +631,8 @@ export class SubscriptionBillingService {
       throw new Error('compute packs must be a whole number from 0 to 1000');
     const account = await this.account(organizationId);
     const provider = await this.requireHosted(account?.provider);
-    if (!account?.subscriptionId || account.plan === 'free' || !['active', 'trialing', 'past_due'].includes(account.status))
-      throw new Error('compute packs need an active paid subscription');
+    if (!account?.subscriptionId || !['active', 'trialing', 'past_due'].includes(account.status))
+      throw new Error(await this.currentGift(organizationId) ? 'buy the first compute packs at checkout' : 'compute packs need a paid plan');
     if (!(await provider.catalog())?.computePackPriceId) throw new Error('compute packs are not available yet');
     if (packs > account.computePacks && account.status === 'past_due')
       throw new Error('update the payment method before adding compute packs');
@@ -594,12 +642,12 @@ export class SubscriptionBillingService {
   }
 
   /** The subscription an automatic compute top-up would charge, or why there
-   * is none: it needs an active paid subscription with a saved payment method
+   * is none: it needs an active paid subscription (a plan's or packs') with a saved payment method
    * (not past due) and a provider that charges one-time top-ups. */
   async computeTopUpTarget(organizationId: string): Promise<{ subscriptionId: string; provider: SubscriptionProvider } | { reason: string }> {
     if (!this.hosted) return { reason: 'self-hosted installations have no compute billing' };
     const account = await this.account(organizationId);
-    if (!account?.subscriptionId || account.plan === 'free' || !['active', 'trialing'].includes(account.status))
+    if (!account?.subscriptionId || !['active', 'trialing'].includes(account.status))
       return { reason: account?.status === 'past_due' ? 'the subscription is past due' : 'auto top-up needs an active paid subscription' };
     const provider = await this.provider(account.provider);
     if (!provider.chargeComputeTopUp || !provider.findComputeTopUp || !(await provider.configured())
@@ -822,12 +870,12 @@ export class SubscriptionBillingService {
     }
   }
 
-  private effectivePlan(account: BillingAccount, now: number): HostedPlanId {
-    if (!account.verifiedAt) return 'free';
-    if (account.status === 'active' || account.status === 'trialing') return account.plan;
-    if (account.status === 'past_due' && account.pastDueAt
-      && now < account.pastDueAt + this.pastDueGraceMs) return account.plan;
-    return 'free';
+  /** Whether the verified subscription is paid for now: active, trialing, or
+   * past due within its grace. */
+  private paidFor(account: BillingAccount, now: number): boolean {
+    if (!account.verifiedAt) return false;
+    if (account.status === 'active' || account.status === 'trialing') return true;
+    return account.status === 'past_due' && Boolean(account.pastDueAt) && now < account.pastDueAt! + this.pastDueGraceMs;
   }
 
   private async reconcileAccount(account: BillingAccount, now = Date.now()): Promise<void> {
@@ -841,12 +889,14 @@ export class SubscriptionBillingService {
       await this.store.lock(`org:${organizationId}`);
       const account = await this.account(organizationId);
       const gift = await this.currentGift(organizationId);
-      const paidPlan = account ? this.effectivePlan(account, now) : 'free';
+      const paid = account ? this.paidFor(account, now) : false;
+      const paidPlan = paid ? account!.plan : 'free';
       const plan = paidPlan === 'team' || gift?.plan === 'team' ? 'team'
         : paidPlan === 'individual' || gift?.plan === 'individual' ? 'individual' : 'free';
-      // Packs ride on paid access alone: a gift never grants them.
-      const storagePacks = account && paidPlan !== 'free' ? account.storagePacks : 0;
-      const computePacks = account && paidPlan !== 'free' ? account.computePacks : 0;
+      // Paid packs count while their subscription is paid for, whatever the
+      // plan: a gift never grants them, nor does removing it take them away.
+      const storagePacks = paid ? account!.storagePacks : 0;
+      const computePacks = paid ? account!.computePacks : 0;
       const organization = await this.store.getOrganization(organizationId);
       if (organization?.plan !== plan) await this.store.setOrganizationPlan(organizationId, plan);
       if ((organization?.storagePacks ?? 0) !== storagePacks)
@@ -906,6 +956,8 @@ export class SubscriptionBillingService {
         computePacks = quantity; items.computePack = String(item.id);
       } else if (provider.customerMode === 'checkout') throw new Error('Paddle subscription contains an unexpected price');
     }
+    // Packs alone carry a gifted plan's packs (checkoutPacks); they bill no plan.
+    if (!plan && !items.teamSeat && (storagePacks || computePacks)) plan = 'free';
     if (!plan) throw new Error(`subscription contains no configured ${BRAND} plan price`);
     if (provider.customerMode === 'checkout' && plan === 'individual' && items.teamSeat)
       throw new Error('Individual subscription contains Team seats');

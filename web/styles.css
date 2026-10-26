@@ -1633,6 +1633,11 @@ a.ins-task-title:hover { color: var(--accent); }
 .plan-choice ul { margin:0; padding:0; list-style:none; font-size:12.5px; color:var(--ink-2); display:grid; gap:3px; }
 .plan-choice .btn { align-self:flex-start; margin-top:auto; }
 .plan-terms { display:flex; align-items:center; gap:6px; margin-top:10px; font-size:12.5px; }
+.plan-checkout-dialog { width: min(400px, calc(100vw - 28px)); display: grid; gap: 12px; }
+.plan-checkout-dialog .modal-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.plan-checkout-dialog .plan-checkout-price { margin: 0; }
+.plan-checkout-dialog .plan-terms { margin-top: 0; }
+.plan-checkout-dialog .modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
 .plan-operator { margin-top:12px; font-size:13px; }
 .plan-operator > summary { cursor:pointer; color:var(--ink-3); }
 .plan-gift-count { width:6em; }
