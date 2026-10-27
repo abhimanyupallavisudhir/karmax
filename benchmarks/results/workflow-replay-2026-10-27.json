@@ -1,0 +1,145 @@
+{
+  "kind": "workflow-replay",
+  "task": "task_mvr646g43cfae8c964",
+  "collectedAt": "2026-10-27",
+  "machine": "4-CPU task sandbox, Node 22.16; production replayed the same run in ~31 s per attempt",
+  "method": "node --import tsx benchmarks/workflow-replay.ts --history H --replays N (Worker.runReplayHistory, softwareDev@1.30.0 bundle)",
+  "histories": {
+    "production": {
+      "description": "pramana#111, run 6a6ec1ee (exported read-only 2026-10-27; not committed: it holds the conversation)",
+      "events": 4041,
+      "bytes": 6320027,
+      "bytesByKind": {
+        "scheduled:publishView": {
+          "count": 241,
+          "bytes": 3662780
+        },
+        "EVENT_TYPE_ACTIVITY_TASK_COMPLETED": {
+          "count": 552,
+          "bytes": 470017
+        },
+        "scheduled:parkWaitingWorld": {
+          "count": 47,
+          "bytes": 438803
+        },
+        "scheduled:runAgentTurn": {
+          "count": 42,
+          "bytes": 409344
+        },
+        "scheduled:agentUsesHostCapacity": {
+          "count": 42,
+          "bytes": 395138
+        },
+        "scheduled:prepareAgentTurn": {
+          "count": 42,
+          "bytes": 203508
+        },
+        "EVENT_TYPE_WORKFLOW_TASK_STARTED": {
+          "count": 695,
+          "bytes": 129984
+        },
+        "EVENT_TYPE_WORKFLOW_TASK_COMPLETED": {
+          "count": 692,
+          "bytes": 102907
+        }
+      },
+      "publishView": {
+        "count": 241,
+        "fullConversation": 0,
+        "delta": 85,
+        "statusOnly": 156,
+        "avgBytes": 15198,
+        "avgFieldBytes": {
+          "world": 4437,
+          "state.recoveryWorld": 4437,
+          "reviewInfo": 1749,
+          "shipments": 1395,
+          "conversationPatch": 444,
+          "actions": 392
+        }
+      },
+      "replayMs": {
+        "before_e0b033ee": [
+          28800,
+          29167
+        ],
+        "after": [
+          2779,
+          2801
+        ]
+      },
+      "profileBefore": {
+        "totalMs": 31540,
+        "fingerprintSelfMs": 27472,
+        "printOfSelfMs": 717
+      }
+    },
+    "fixture": {
+      "description": "tests/fixtures/history-long-v1_30-prechange.json.gz (stub activities, 2 KB replies)",
+      "events": 3961,
+      "bytes": 3070251,
+      "replayMs": {
+        "before_e0b033ee": [
+          11587
+        ],
+        "after": [
+          2231,
+          2154,
+          2090
+        ]
+      },
+      "quarterVsFullRatio": {
+        "before": 10.6,
+        "after": 4.5
+      }
+    },
+    "synthetic4000": {
+      "events": 4037,
+      "bytes": 3122977,
+      "replayMs": {
+        "before": [
+          13165,
+          13914
+        ],
+        "after": [
+          2641,
+          2702
+        ]
+      },
+      "profileBefore": {
+        "totalMs": 13841,
+        "fingerprintSelfMs": 10430
+      }
+    },
+    "synthetic1000": {
+      "events": 1070,
+      "bytes": 798005,
+      "replayMs": {
+        "before": [
+          1381,
+          1326
+        ],
+        "after": [
+          746,
+          636
+        ]
+      }
+    }
+  },
+  "continueAsNew": {
+    "before": {
+      "events": 4000,
+      "bytes": 8388608
+    },
+    "after": {
+      "events": 2000,
+      "bytes": 4194304
+    },
+    "historyBoundsAtProductionThreshold": {
+      "turns": 90,
+      "runs": 3,
+      "maxRunEvents": 2065,
+      "maxRunBytes": 1497317
+    }
+  }
+}

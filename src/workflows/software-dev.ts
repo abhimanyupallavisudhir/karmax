@@ -19,7 +19,7 @@ import {
   ParentClosePolicy,
   log,
   patched,
-  continueAsNew,
+  makeContinueAsNewFunc,
   allHandlersFinished,
   type ChildWorkflowHandle,
 } from '@temporalio/workflow';
@@ -76,7 +76,7 @@ import {
 import { mergeQueueDomains, releaseWorldOnCompletion, remotePolicyOf, remoteWorldProvider,
   landingAuthorityOf, samePosition, MERGE_POLL, reviewCheckouts, approveAll, worldRepos, landedNote } from './contract.js';
 import type { AgentWait, CheckoutApprovals } from './contract.js';
-import { SIG, SIG_AGENT_TURN_STATE } from './names.js';
+import { SIG, SIG_AGENT_TURN_STATE, TASK_WORKFLOW_TASK_TIMEOUT } from './names.js';
 import { agentTurnId } from './turn-id.js';
 import { taskBranch } from '../domain/brand.js';
 import { conversationPublisher, type TurnConversationBase } from '../domain/view-publication.js';
@@ -421,9 +421,18 @@ const MAX_AUTOMATED_LANDING_REPAIRS = 5;
  * - a GitHub wait in a state the watcher cannot serve, and every GitHub wait
  *   before v1.21, backing off to ten minutes: a v1.20 landing pass records
  *   about 51 events, about 7,300 a day, so the limit in about seven days;
- * - a merge-queue wait before v1.9, every 5 s. */
-const CONTINUE_AFTER_EVENTS = 4_000;
-const CONTINUE_AFTER_BYTES = 8 * 1024 * 1024;
+ * - a merge-queue wait before v1.9, every 5 s.
+ *
+ * The limits also bound what a worker replays when a run's next workflow task
+ * finds it evicted from the cache, and that replay must finish inside the
+ * workflow-task timeout (TASK_WORKFLOW_TASK_TIMEOUT). A run that started before
+ * CONTINUE_SOONER kept growing to 4,000 events / 8 MB (pramana#111: 3,964 events,
+ * 6.1 MB, a 31 s replay retried three times after every eviction). */
+const CONTINUE_AFTER_EVENTS = 2_000;
+const CONTINUE_AFTER_BYTES = 4 * 1024 * 1024;
+const CONTINUE_AFTER_EVENTS_BEFORE = 4_000;
+const CONTINUE_AFTER_BYTES_BEFORE = 8 * 1024 * 1024;
+const CONTINUE_SOONER = 'software-dev-continue-sooner-v1';
 /** A continuation input is recorded by value: stay well inside the 2 MB payload limit. */
 const MAX_CONTINUATION_BYTES = 1024 * 1024;
 const CONTINUE_RETRY_EVENTS = 500;
@@ -4020,7 +4029,7 @@ Inspect the complete current diff and specifically compare its delta from the re
       ...(taken.data?.length ? { data: taken.data } : {}),
     };
     const child = await startChild<typeof softwareDev>(childWorkflowType(behaviorVersion), {
-      workflowId: childInput.taskId,
+      workflowId: childInput.taskId, workflowTaskTimeout: TASK_WORKFLOW_TASK_TIMEOUT,
       args: [{
         ...childInput,
         project: { ...childInput.project, multiPr: false },
@@ -4142,7 +4151,7 @@ Inspect the complete current diff and specifically compare its delta from the re
       const child = await startChild<typeof softwareDev>(
         childWorkflowType(behaviorVersion),
         {
-          workflowId: childInput.taskId,
+          workflowId: childInput.taskId, workflowTaskTimeout: TASK_WORKFLOW_TASK_TIMEOUT,
           args: [childInput as SoftwareDevInput],
           // A sub-task is a durable task in its own right. On parent cancellation
           // we signal it explicitly below and briefly wait for its cleanup, but a
@@ -4324,9 +4333,13 @@ Inspect the complete current diff and specifically compare its delta from the re
   // A continuation refused for a passing reason (the pin briefly foreign, a
   // republish racing new messages) is retried after this many more events.
   let continueRetryAt = 0;
-  const historyGrown = () => workflowInfo().historyLength >= continueRetryAt
-    && (workflowInfo().historyLength - runStart.events >= (input.continueAfterEvents ?? CONTINUE_AFTER_EVENTS)
-      || workflowInfo().historySize - runStart.bytes >= CONTINUE_AFTER_BYTES);
+  const historyGrown = () => {
+    if (workflowInfo().historyLength < continueRetryAt) return false;
+    const sooner = patched(CONTINUE_SOONER);
+    return workflowInfo().historyLength - runStart.events
+        >= (input.continueAfterEvents ?? (sooner ? CONTINUE_AFTER_EVENTS : CONTINUE_AFTER_EVENTS_BEFORE))
+      || workflowInfo().historySize - runStart.bytes >= (sooner ? CONTINUE_AFTER_BYTES : CONTINUE_AFTER_BYTES_BEFORE);
+  };
   const retryContinuationLater = () => {
     continueRetryAt = workflowInfo().historyLength + CONTINUE_RETRY_EVENTS;
   };
@@ -4389,7 +4402,9 @@ Inspect the complete current diff and specifically compare its delta from the re
       // A cancel or replacement ends this run instead.
       if (cancelled) break;
       const conversation = publishConversation.acknowledges(buildView());
-      if (conversation) return continueAsNew<typeof softwareDev>(continuationInput(conversation, pin === 'released'));
+      // The timeout is given again so a run started before it was set gains it.
+      if (conversation) return makeContinueAsNewFunc<typeof softwareDev>({ workflowTaskTimeout: TASK_WORKFLOW_TASK_TIMEOUT })(
+        continuationInput(conversation, pin === 'released'));
       await publish();
     }
     if (!cancelled) retryContinuationLater();

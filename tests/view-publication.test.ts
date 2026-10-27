@@ -590,6 +590,34 @@ describe('durable conversation publication', () => {
     expect(writes.at(-1)!.conversationPatch?.base).toBe('run:0');
   });
 
+  // pramana#111: fingerprints are reused while a message is unchanged, and a
+  // reply is addressed (`to`) only after it was first published.
+  it('notices a published message changed in place, however it changed', async () => {
+    const writes: PublishedView[] = [];
+    const publish = conversationPublisher('run', async (view) => { writes.push(view); }, { patches: () => true });
+    const messages: TaskView['messages'] = [{ id: 'm0', role: 'user', text: 'Start', ts: 0 },
+      { id: 'a1', role: 'agent', text: 'Done. '.repeat(1_000), ts: 1 }];
+    const view = { taskId: 't', title: 'T', workflow: 'software-dev', stage: 'do', status: 'active', messages,
+      actions: [], state: {}, updatedAt: 1 } as unknown as TaskView;
+    const appended = () => writes.at(-1)!.conversationPatch!.messages;
+    await publish(view);
+    await publish({ ...view, updatedAt: 2 });
+    expect(writes.at(-1)!.conversationPatch).toBeUndefined();
+    messages[1]!.to = ['user:a'];
+    await publish({ ...view, updatedAt: 3 });
+    expect(appended()).toEqual({ keep: 1, append: [messages[1]] });
+    messages[1]!.to!.push('agent:responder');
+    await publish({ ...view, updatedAt: 4 });
+    expect(appended()).toEqual({ keep: 1, append: [messages[1]] });
+    messages[1]!.text += ' And tested.';
+    await publish({ ...view, updatedAt: 5 });
+    expect(appended()).toEqual({ keep: 1, append: [messages[1]] });
+    messages[0] = { ...messages[0]! };
+    await publish({ ...view, updatedAt: 6 });
+    expect(writes.at(-1)!.conversationPatch).toBeUndefined();
+    expect(publish.turnBase(messages, 'do')).toMatchObject({ base: { count: 2 }, messages: [] });
+  });
+
   it('does not reference an unacknowledged write', async () => {
     let fail = true;
     const publications: PublishedView[] = [];

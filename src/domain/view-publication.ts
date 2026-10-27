@@ -74,14 +74,9 @@ export type ConversationPublisher = ((view: TaskView) => Promise<void>) & {
   seed(reference: string, conversation: ViewConversation): void;
 };
 
-/** A message's identity for change detection: the length of its JSON and two
- * independent 32-bit hashes of it (FNV-1a and a Murmur-style mix). Deciding
- * which messages a snapshot already has needs only this, so a publisher keeps
- * these instead of a copy of the conversation (RT-35). Treating a changed
- * message as unchanged takes a 64-bit collision between two versions of the
- * message at the same position, and would only stale that task's own view. */
-function fingerprint(message: Message): string {
-  const json = JSON.stringify(message);
+/** The length of `json` and two independent 32-bit hashes of it (FNV-1a and a
+ * Murmur-style mix). */
+function hash(json: string): string {
   let a = 0x811c9dc5, b = 0x9747b28c;
   for (let i = 0; i < json.length; i++) {
     const c = json.charCodeAt(i);
@@ -90,6 +85,35 @@ function fingerprint(message: Message): string {
     b ^= b >>> 15;
   }
   return `${json.length.toString(36)}.${(a >>> 0).toString(36)}.${(b >>> 0).toString(36)}`;
+}
+
+/** Each message's last fingerprint and what it was computed from. A text is
+ * kept by reference (the message holds it anyway); strings are immutable, so
+ * the check costs nothing while the message keeps it. */
+const fingerprints = new WeakMap<Message, { text: string; rest: string; textHash: string; print: string }>();
+
+/** A message's identity for change detection: a hash of its JSON with the text
+ * left out and a hash of its text. Deciding which messages a snapshot already
+ * has needs only this, so a publisher keeps these instead of a copy of the
+ * conversation (RT-35). Treating a changed message as unchanged takes a 64-bit
+ * collision between two versions of the message at the same position, and
+ * would only stale that task's own view.
+ *
+ * Every publication and turn fingerprints the whole conversation, so hashing
+ * every message each time made a long run's replay quadratic: 27 s of the
+ * 29 s pramana#111's 4,041-event run took to replay. A message's fingerprint is
+ * reused while its text and the rest of it (author, `to`, attachments: small,
+ * compared as JSON since `to` is assigned after a reply is published) are
+ * unchanged. Fingerprints never reach history: only the patches they decide. */
+function fingerprint(message: Message): string {
+  const { text } = message;
+  const rest = JSON.stringify({ ...message, text: 0 });
+  const cached = fingerprints.get(message);
+  if (cached?.text === text && cached.rest === rest) return cached.print;
+  const textHash = cached?.text === text ? cached.textHash : hash(text ?? '');
+  const print = `${hash(rest)}:${textHash}`;
+  fingerprints.set(message, { text, rest, textHash, print });
+  return print;
 }
 
 /** The fingerprints of a conversation, shaped like it. */

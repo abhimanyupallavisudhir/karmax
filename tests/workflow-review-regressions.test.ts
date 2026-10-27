@@ -32,6 +32,9 @@ vi.mock('@temporalio/workflow', async (importOriginal) => ({
   workflowInfo: () => wf.info,
   allHandlersFinished: () => true,
   continueAsNew: async (next: unknown) => { throw Object.assign(new Error('continued as new'), { next }); },
+  makeContinueAsNewFunc: (options: unknown) => async (next: unknown) => {
+    throw Object.assign(new Error('continued as new'), { next, options });
+  },
   patched: (id: string) => wf.patches && !wf.absentPatches.has(id),
   isCancellation: () => false,
   log: { warn: vi.fn() },
@@ -55,6 +58,7 @@ import { softwareDevV1_20, softwareDevV1_26, softwareDevV1_27, softwareDevV1_28,
 import { ActivityFailure, ApplicationFailure, RetryState } from '@temporalio/common';
 import { createAgentTurnLeaser } from '../src/workflows/agent-turn-lease.js';
 import { makeTurnPreparationActivities } from '../src/activities/turn-preparation.js';
+import { TASK_WORKFLOW_TASK_TIMEOUT } from '../src/workflows/names.js';
 
 const input = { taskId: 'task', projectId: 'project', title: 'T', prompt: 'work',
   project: { repos: [] }, confirm: { layers: [] } } as any;
@@ -453,6 +457,8 @@ it('WF-3/WF-4: a long run continues as new with its in-flight state', async () =
   const first = await softwareDevV1_26({ ...input, project: { repos: ['/tmp/repo'] }, paramWindows: { target: 'untilUsed' } })
     .catch((error) => error);
   const next = first.next;
+  // pramana#111: the next run gets the longer workflow-task timeout.
+  expect(first.options).toEqual({ workflowTaskTimeout: TASK_WORKFLOW_TASK_TIMEOUT });
   expect(next?.recovery).toMatchObject({ resumeStage: 'do', messages: [], target: 'release', seen: 2,
     continued: { runPinned: false, goalMode: true, subTasks: { ids: ['child-1'], outstanding: ['child-1'], awaitingResponse: ['child-1'] },
       collaborations: { pending: ['request-1'] } } });

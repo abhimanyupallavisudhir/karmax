@@ -78,3 +78,14 @@ kept fingerprints instead of copies. 64 KB conversations (40 tasks × 8 turns ×
 (20 tasks × 6 turns × 32 KB): [before](workflow-memory-large-before-2026-10-08.json.gz)
 4.48 MB, [after](workflow-memory-large-after-2026-10-08.json.gz) 1.23 MB. Read in
 the wiki's `ops/performance-history`, "Control-plane memory".
+
+## Workflow replay (pramana#111, 2026-10-27)
+
+`benchmarks/workflow-replay.ts` replays a software-dev history with
+`Worker.runReplayHistory` (and records one over stub activities when given no
+`--history`). [Results](workflow-replay-2026-10-27.json): pramana#111's run
+(4,041 events, 6.3 MB) replayed in 29 s at e0b033ee, 87% of it fingerprinting
+the conversation on every publication, and in 2.8 s after the fix. The committed
+fixture `tests/fixtures/history-long-v1_30-prechange.json.gz` (3,961 events)
+went from 11.6 s to 2.1 s; `tests/replay-time.test.ts` bounds it. Read in the
+wiki's `ops/performance-history`, "Replay time".
