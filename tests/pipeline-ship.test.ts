@@ -458,7 +458,21 @@ describe('software-dev: every branch of a task lands as its own pull request', (
     expect((await view(handle)).shipments ?? []).toHaveLength(0);
   }, 120_000);
 
-  it('a sub-task\'s wiki pages land on its parent\'s wiki branch, and reach wiki main only through the parent\'s wiki pull request (pramana#39)', async () => {
+  it('a sub-task\'s wiki pages land on its parent\'s wiki branch, and reach wiki main only through the parent\'s wiki pull request (pramana#39)', async ({ onTestFailed }) => {
+    // On slow CI runners this test has run past its budget four times (wiki ops/ci),
+    // while it takes ~16 s locally: record each change of stage the polls see, and
+    // print it if the test fails or times out, so the next one says what stalled.
+    const started = Date.now(), seen: string[] = [];
+    let last = '';
+    const trace = async (phase: string, ...handles: any[]) => {
+      const states = await Promise.all(handles.map(async (x) => {
+        const v = await view(x).catch(() => undefined);
+        return v ? `${v.stage}/${v.waitingFor?.kind ?? '-'}` : '?';
+      }));
+      const now = `${phase}: ${states.join(' ')}`;
+      if (now !== last) seen.push(`${((Date.now() - started) / 1000).toFixed(1)}s ${(last = now)}`);
+    };
+    onTestFailed(() => { console.error(`pipeline-ship sub-task wiki timeline:\n${seen.join('\n')}`); });
     const repo = await h.makeRepo('ship-subtask-wiki');
     // Commit a page in this world's project-wiki checkout (a sibling of the code checkout).
     const note = (name: string) => `@run for d in ../*/; do case "$(git -C "$d" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" in */wiki/project/*) mkdir -p "$d/memories/${name}" && printf 'from ${name}' > "$d/memories/${name}/MEMORY.md" && git -C "$d" add -A && git -C "$d" commit -qm ${name};; esac; done`;
@@ -467,10 +481,12 @@ describe('software-dev: every branch of a task lands as its own pull request', (
     const parentBranch = `tavya/${taskId}`;
     try {
       // The sub-task (not a pull request of the parent) stacks its wiki on the parent's branch…
-      await expect.poll(async () => (await view(handle)).subTasks?.length ?? 0, { timeout: 30_000 }).toBeGreaterThanOrEqual(1);
+      await expect.poll(async () => { await trace('sub-task', handle); return (await view(handle)).subTasks?.length ?? 0; },
+        { timeout: 30_000 }).toBeGreaterThanOrEqual(1);
       const childId = (await view(handle)).subTasks[0] as string;
       const child = h.client.workflow.getHandle(childId);
       await expect.poll(async () => {
+        await trace('child wiki base', handle, child);
         const checkout = ((await view(child)).state?.recoveryWorld?.repos ?? []).find((r: any) => r.role === 'project-wiki');
         return checkout && [checkout.base, worldRepoTarget(checkout, '')];
       }, { timeout: 30_000 }).toEqual([parentBranch, parentBranch]);
@@ -478,6 +494,7 @@ describe('software-dev: every branch of a task lands as its own pull request', (
       for (let n = 0; n < 20 && (await view(child)).stage !== 'done'; n++) {
         const v = await view(child);
         const open = v.subTasks?.length ? v.subTasks.map((id: string) => h.client.workflow.getHandle(id)) : [child];
+        await trace('child landing', handle, child, ...open);
         for (const pr of open) {
           const pv = await view(pr).catch(() => undefined);
           if (pv?.stage === 'review' && pv.waitingFor?.kind === 'human') await pr.signal('confirm');
@@ -493,7 +510,7 @@ describe('software-dev: every branch of a task lands as its own pull request', (
       // The parent finishes: its wiki goes to main through the parent's own
       // Review, carrying both pages — not as a pull request of its own.
       await handle.signal('followUp', { id: 'done', role: 'user', text: '@openpr', ts: 0 });
-      await expect.poll(async () => { const v = await view(handle); return `${v.stage}/${v.waitingFor?.kind}`; },
+      await expect.poll(async () => { await trace('parent review', handle); const v = await view(handle); return `${v.stage}/${v.waitingFor?.kind}`; },
         { timeout: 60_000 }).toBe('review/human');
       await handle.signal('confirm');
       expect((await handle.result()).stage).toBe('done');
