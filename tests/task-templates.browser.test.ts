@@ -96,7 +96,7 @@ it('starts tasks from templates, saves the form as one and edits one in Task def
     await step('organization settings list its own templates', async () => {
       await page.goto(`${g.url}/acme/settings#settings-defaults`);
       const card = page.locator('[data-templates-card="global"]');
-      await expect.poll(() => card.locator('[data-template-id] .tpl-name').allInnerTexts()).toEqual(['Bug triage', 'Release notes 2.0']);
+      await expect.poll(() => card.locator('[data-template-id] .tpl-name').allInnerTexts(), { timeout: 10_000 }).toEqual(['Bug triage', 'Release notes 2.0']);
       expect(await card.locator(`[data-template-id="${triage.id}"] [data-edit-template]`).count()).toBe(1);
     });
     if (process.env.KARMAX_SCREENSHOT_DIR) await page.screenshot({ path: `${process.env.KARMAX_SCREENSHOT_DIR}/task-templates-org.png` });

@@ -95,6 +95,9 @@ export interface PlatformToolContext {
   /** What the turn has spent so far, reported even when it then fails (a usage
    *  limit), so its tokens are metered like a completed turn's. */
   reportUsage?: (usage: AdapterTurn['usage']) => void;
+  /** A live reading of the login's usage window (share used, 0..1), for the quota
+   *  scheduler (wiki features/quota-scheduling). */
+  reportQuota?: (reading: { window: 'session' | 'week'; utilization: number; resetsAt?: number }) => void;
   /** Pull follow-up messages that landed in the workflow AT OR AFTER `fromIndex`
    *  (a `msgs`-array index), so a streaming-capable adapter can inject them into the
    *  LIVE agent session mid-turn instead of waiting for the next turn (SPEC §5.6).

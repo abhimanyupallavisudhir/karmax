@@ -929,7 +929,7 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
   );
   server.registerTool(
     'set_task_priority',
-    { description: 'Set a task\'s organizational priority (none/low/medium/high/urgent) — for search/sorting only, never sent to any agent.', inputSchema: { taskId: z.string(), priority: z.enum(PRIORITY_NAMES) } },
+    { description: 'Set a task\'s priority (none/low/medium/high/urgent). Higher priority gets model quota first, and quota is kept back for it; sub-tasks share their task\'s priority; none counts as medium. Never sent to any agent.', inputSchema: { taskId: z.string(), priority: z.enum(PRIORITY_NAMES) } },
     async (a) => wrap(async () => { await ops.setTaskPriority(a.taskId, PRIORITY_NAMES.indexOf(a.priority)); return `priority set to ${a.priority}`; }),
   );
   server.registerTool(

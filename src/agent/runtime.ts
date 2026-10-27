@@ -89,6 +89,8 @@ export interface RunTurnDeps {
   onProviderResult?: (turn: AdapterTurn) => void;
   /** What a turn spent so far, also when it then fails (the adapter reports it). */
   onProviderUsage?: (usage: AdapterTurn['usage']) => void;
+  /** A live usage-window reading from the provider (quota scheduler). */
+  onQuotaReading?: (reading: { window: 'session' | 'week'; utilization: number; resetsAt?: number }) => void;
   onProviderStart?: () => Promise<void>;
   /** Pull follow-up messages queued in the workflow at/after `fromIndex` so a
    *  streaming adapter can inject them into the live session mid-turn (SPEC §5.6). */
@@ -452,6 +454,7 @@ export async function runTurn(input: TurnInput, deps: RunTurnDeps): Promise<Turn
     }); },
     onSession: deps.onSession ? session => observe(() => deps.onSession!(session)) : undefined,
     reportUsage: deps.onProviderUsage,
+    reportQuota: deps.onQuotaReading,
     signal: deps.signal,
     heartbeat: deps.heartbeat,
     ...(liveSecretEnv ? { onSecretEnvChange(listener: () => void | Promise<void>) {

@@ -977,6 +977,15 @@ export class ClaudeAdapter implements AgentAdapter {
           }
         } else if (message.type === 'rate_limit_event') {
           const info = (message as any).rate_limit_info;
+          {
+            // The scheduler learns each login's quota from these readings (wiki features/quota-scheduling).
+            const type = String(info?.rateLimitType ?? 'five_hour');
+            const window = type === 'five_hour' ? 'session' : type === 'seven_day' ? 'week' : undefined;
+            const used = info?.status === 'rejected' && !(Number(info?.utilization) >= 0) ? 1 : Number(info?.utilization);
+            const resets = Number(info?.resetsAt);
+            if (window && Number.isFinite(used)) ctx.reportQuota?.({ window, utilization: Math.max(0, used),
+              ...(Number.isFinite(resets) && resets > 0 ? { resetsAt: resets < 10_000_000_000 ? resets * 1000 : resets } : {}) });
+          }
           // `overageStatus: rejected` only says that paid overage is unavailable;
           // it is commonly paired with `status: allowed` while subscription quota
           // remains. Treating that informational field as a turn rejection parked
