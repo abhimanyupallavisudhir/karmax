@@ -54,21 +54,22 @@ export interface ForecastState {
   firstDay: number;
 }
 
+/** Pseudo-hours of no arrivals a priority's mean rate is shrunk toward. */
+const PRIOR_RATE_HOURS = 24;
+
 /**
  * Root tasks arriving, by priority and hour of the day (UTC), learned online:
  * exponentially decayed counts (half-life `halfLifeDays`), each hour shrunk
  * toward the priority's mean rate by `priorHours` hours of pseudo-exposure, and
- * that mean toward PRIOR_RATE by a day of it, so a new organization (or one hour
- * of history) never reads as thousands of tasks an hour.
+ * that mean toward no arrivals by a day of it: a new organization has shown no
+ * demand to keep quota for, and a few minutes of history never read as
+ * thousands of tasks an hour.
  * Sub-tasks are part of their tree, not new demand. Tasks come in batches
  * (`batch` on average, filed together) and some days are busier than others:
  * the day-to-day swing is the variance of daily counts beyond what batching
  * explains, so sampled futures are as uncertain as the past was.
  * Times are minutes since the epoch.
  */
-/** Root tasks per hour expected before an organization has history (tavya.io: ~0.5 an hour). */
-export const PRIOR_RATE: Record<Priority, number> = { low: 0.05, medium: 0.375, high: 0.06, urgent: 0.015 };
-const PRIOR_RATE_HOURS = 24;
 
 export class ArrivalForecast {
   private readonly counts = new Map<Priority, Float64Array>();
@@ -135,7 +136,7 @@ export class ArrivalForecast {
     const row = this.counts.get(priority)!;
     let all = 0, seen = 0;
     for (let h = 0; h < 24; h++) { all += row[h]!; seen += this.exposure[h]!; }
-    const mean = (all + PRIOR_RATE_HOURS * PRIOR_RATE[priority]) / (seen + PRIOR_RATE_HOURS);
+    const mean = all / (seen + PRIOR_RATE_HOURS);
     let total = 0;
     for (let t = from; t < to; t += 60) {
       const h = Math.floor(t / 60) % 24;

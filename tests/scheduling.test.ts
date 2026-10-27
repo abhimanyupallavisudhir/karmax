@@ -61,15 +61,16 @@ describe('arrival forecast', () => {
   });
 });
 
-describe('arrival forecast with no history', () => {
-  it('expects a modest installation rate, not thousands an hour, from a few minutes of history', () => {
+describe('arrival forecast with little history', () => {
+  it('expects nothing of a new organization, and one task in a day of history, not thousands an hour, after a few minutes', () => {
+    expect(new ArrivalForecast().expected('urgent', 1_000_000, 1_000_000 + DAY)).toBe(0);
     const f = new ArrivalForecast();
     f.observe(1_000_000, 'medium');
     f.advanceTo(1_000_000.001);
-    const total = ['low', 'medium', 'high', 'urgent'].reduce((n, p) => n + f.expected(p as any, 1_000_000, 1_000_060), 0);
-    expect(total).toBeGreaterThan(0.1);
-    expect(total).toBeLessThan(5);
-    expect(f.sample(1_000_000, 1_000_000 + 7 * DAY, seeded(1)).length).toBeLessThan(1000);
+    const total = ['low', 'medium', 'high', 'urgent'].reduce((n, p) => n + f.expected(p as any, 1_000_000, 1_000_000 + DAY), 0);
+    expect(total).toBeGreaterThan(0.5);
+    expect(total).toBeLessThan(2);
+    expect(f.sample(1_000_000, 1_000_000 + 7 * DAY, seeded(1)).length).toBeLessThan(100);
   });
 });
 
