@@ -5175,7 +5175,9 @@ export class Gateway {
         if (webhookMatch[2] && method === 'POST') return this.json(res, 200, await api.rotateIncomingWebhook(token, hookId));
         if (!webhookMatch[2] && method === 'PATCH') {
           const b = await this.body(req);
-          return this.json(res, 200, await api.updateIncomingWebhook(token, hookId, { ...(b.name !== undefined ? { name: String(b.name) } : {}), ...(b.type !== undefined ? { type: String(b.type) } : {}) }));
+          return this.json(res, 200, await api.updateIncomingWebhook(token, hookId, { ...(b.name !== undefined ? { name: String(b.name) } : {}), ...(b.type !== undefined ? { type: String(b.type) } : {}),
+            ...(b.allowed !== undefined ? { allowed: b.allowed } : {}), ...(b.anyone !== undefined ? { anyone: b.anyone === true } : {}),
+            ...(Array.isArray(b.dismiss) ? { dismiss: b.dismiss.map(String) } : {}) }));
         }
         if (!webhookMatch[2] && method === 'DELETE') return this.json(res, 200, await api.deleteIncomingWebhook(token, hookId));
       }
