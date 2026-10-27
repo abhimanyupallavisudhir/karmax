@@ -1291,9 +1291,10 @@ export interface TaskParams {
    *  and runs by it. */
   template?: string;
   /**
-   * Human-assigned importance for organization/sorting (task search & views). A small
-   * ordinal, 0=none … 4=urgent (see PRIORITIES). Purely organizational — never sent to
-   * any agent. Stored on params (not a dedicated column) so the schema stays stable and
+   * Human-assigned importance (task search & views, and the quota scheduler: higher
+   * priority gets model quota first, sub-tasks share their root's, none counts as
+   * medium; wiki features/quota-scheduling). A small ordinal, 0=none … 4=urgent (see
+   * PRIORITIES). Never sent to any agent. Stored on params (not a dedicated column) so the schema stays stable and
    * it re-resolves at queue time like every other param.
    */
   priority?: number;

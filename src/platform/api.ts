@@ -30,6 +30,8 @@ import {
   QRY_AGENT_QUEUE,
   QRY_ACCOUNT_TASK_LEASES,
   QRY_ACCOUNT_LEASE,
+  QRY_ACCOUNT_QUEUE,
+  SIG_REPLAN_ACCOUNTS,
   MERGE_QUEUE_WORKFLOW,
   AGENT_QUEUE_WORKFLOW,
 } from '../coordinators/names.js';
@@ -93,6 +95,8 @@ import { itemHandle, loosensPolicy } from '../autonomy/vault-items.js';
 import { avatarAllows, avatarAuthorizationCapabilities, avatarCallableBy, avatarEnabled, avatarPrincipal, avatarRoleOf, forkedAvatar,
   normalizeAvatarSetting, AVATAR_ROLE_LABELS, type AvatarRole } from './avatars.js';
 import { CapabilityError, NotFoundError, ValidationError } from './errors.js';
+import type { AccountQueueView } from '../coordinators/account.js';
+import type { SchedulingQueueTask, SchedulingQueueView } from '../scheduling/view.js';
 import { assertAgentSpec, childComputer, subTaskParams } from './agent-params.js';
 import { CALLED_AGENT_FIELD, agentSpecsByParticipant, authorityKey, normalizeAgentAuthority, type StoredAgentAuthorization } from './agent-authority.js';
 import { continuesInNewTask } from '../domain/forks.js';
@@ -3649,18 +3653,20 @@ export class KarmaxApi {
         const { world, worldPath, worldAvailable, worldDesktop, worldProvider, ...history } = view;
         view = history;
       }
-      // Existing parked executions recorded only "account". Read the small
-      // coordinator projection to explain that wait without replaying the task
-      // or restarting its agent. New lease results already carry this detail.
-      if (view.waitingFor?.kind === 'account' && !view.waitingFor.detail) {
+      // Why a turn waits for a credential changes after it asked (the quota
+      // scheduler may hold it back), so read the coordinator's current answer.
+      // Existing parked executions recorded only "account" and get it this way too.
+      if (view.waitingFor?.kind === 'account') {
         try {
           const lease = await withTimeout(this.deps.client.workflow.getHandle(accountCoordinatorId())
             .query(QRY_ACCOUNT_LEASE, { taskId }) as Promise<{
-              waiting: boolean; earliestResetAt?: number; detail?: string;
+              waiting: boolean; earliestResetAt?: number; detail?: string; heldUntil?: number;
             }>, 500);
-          if (lease.waiting && lease.detail) view = { ...view, waitingFor: {
+          if (lease.waiting && lease.detail && (!view.waitingFor.detail || lease.heldUntil !== undefined
+            || lease.detail.startsWith('Held'))) view = { ...view, waitingFor: {
             ...view.waitingFor, detail: lease.detail,
             ...(lease.earliestResetAt !== undefined ? { earliestResetAt: lease.earliestResetAt } : {}),
+            ...(lease.heldUntil !== undefined ? { until: lease.heldUntil } : {}),
           } };
         } catch { /* A coordinator outage must not block reading the task. */ }
       }
@@ -5990,7 +5996,16 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     // no-ops instead of reporting that the id was wrong.
     if (!task) throw new NotFoundError(`no such task ${taskId}`);
     (await this.require(token, 'set_task_priority', { projectId: task.projectId, taskId }));
+    const tree = await this.deps.store.taskTree(taskId);
+    // The scheduler forecasts what arrives: a root bumped after waiting keeps the priority it arrived with there.
+    if (tree?.root === taskId && Date.now() - tree.createdAt > (await import('../scheduling/state.js')).ARRIVAL_GRACE_MS) {
+      const { kvUpdate, treeKey } = await import('../scheduling/state.js');
+      await kvUpdate<import('../scheduling/state.js').TreeLedger>(this.deps.store, treeKey(taskId), (prev) =>
+        prev?.arrivalPriority !== undefined ? prev : { ...prev, spent: prev?.spent ?? 0, arrivalPriority: tree.priority }).catch(() => undefined);
+    }
     (await this.deps.store.setTaskPriority(taskId, priority));
+    // A new priority replaces any place someone dragged the task to (wiki features/quota-scheduling).
+    if (tree) await this.clearOrders(tree.organizationId, taskId).catch(() => undefined);
   }
 
   // ─── Saved views (a view is a saved query) ───────────────────────────────────
@@ -7560,6 +7575,169 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
       (await this.require(token, 'reorder_queue', { organizationId }));
     await this.deps.client.workflow.getHandle(agentQueueId(this.deps.store.hosted ? organizationId : undefined))
       .signal(SIG_REORDER, { turnId, beforeTurnId });
+  }
+
+  // ─── Quota scheduling (wiki features/quota-scheduling) ──────────────────────
+  /** The organization a queue request is about, after checking the caller may use `capability` there. */
+  private async queueOrganization(token: string, capability: 'queue:read' | 'reorder_queue', requested?: string): Promise<string> {
+    const caller = (await this.require(token, capability, requested ? { organizationId: requested } : undefined));
+    const organizationId = requested ?? caller.organizationId
+      ?? (caller.projectId ? (await this.deps.store.getProject(caller.projectId))?.organizationId : undefined) ?? 'org_personal';
+    if (!requested) (await this.require(token, capability, { organizationId }));
+    return organizationId;
+  }
+
+  /**
+   * Agent work in the order it gets model quota: running turns, then waiting
+   * ones by the scheduler's rank (people's orders applied), each with why it
+   * waits and until when. Only tasks the caller can read.
+   */
+  async schedulingQueue(token: string, requestedOrganizationId?: string): Promise<SchedulingQueueView> {
+    const organizationId = await this.queueOrganization(token, 'queue:read', requestedOrganizationId);
+    const { queueKey, orderKey, kvJson } = await import('../scheduling/state.js');
+    const snapshot = await kvJson<import('../scheduling/planner.js').QueueSnapshot>(this.deps.store, queueKey(organizationId));
+    const order = (await kvJson<import('../scheduling/order.js').OrderConstraint[]>(this.deps.store, orderKey(organizationId))) ?? [];
+    const runNow = new Set(((await kvJson<import('../scheduling/state.js').RunNow[]>(this.deps.store,
+      (await import('../scheduling/state.js')).runNowKey(organizationId))) ?? []).map((m) => m.root));
+    let live: AccountQueueView | undefined;
+    try {
+      live = await withTimeout(this.deps.client.workflow.getHandle(accountCoordinatorId()).query(QRY_ACCOUNT_QUEUE) as Promise<AccountQueueView>, 1500);
+    } catch { live = undefined; }
+    const queued = live?.queue ?? snapshot?.waiting ?? [];
+    const granted = live?.granted ?? snapshot?.running ?? [];
+    const holds = new Map((live?.holds ?? []).map((h) => [`${h.taskId}:${h.turnId}`, h]));
+    const planned = new Map((snapshot?.waiting ?? []).map((w, i) => [`${w.taskId}:${w.turnId}`, { ...w, index: i }]));
+    const rows = new Map<string, SchedulingQueueTask | null>();
+    const describe = async (taskId: string): Promise<SchedulingQueueTask | null> => {
+      if (rows.has(taskId)) return rows.get(taskId)!;
+      const tree = await this.deps.store.taskTree(taskId);
+      const task = tree && tree.organizationId === organizationId ? await this.deps.store.taskMetadataAsync(taskId) : undefined;
+      let row: SchedulingQueueTask | null = null;
+      if (tree && task && (await this.deps.tokens.check(token, 'queue:read', { projectId: task.projectId, taskId, organizationId })).ok) {
+        const root = tree.root === taskId ? task : await this.deps.store.taskMetadataAsync(tree.root);
+        row = { taskId, root: tree.root, projectId: task.projectId, title: task.title, ...(task.num != null ? { num: task.num } : {}),
+          ...(root && tree.root !== taskId ? { rootTitle: root.title, ...(root.num != null ? { rootNum: root.num } : {}) } : {}),
+          priority: (await import('../scheduling/model.js')).schedulingPriority(tree.priority) };
+      }
+      rows.set(taskId, row);
+      return row;
+    };
+    const pinsOf = (taskId: string, root: string) => order.filter((c) => c.above === taskId || c.below === taskId
+      || (root === taskId && (c.above === root || c.below === root)));
+    const running: SchedulingQueueView['running'] = [];
+    for (const g of granted) {
+      const row = await describe(g.taskId);
+      if (row) running.push({ ...row, turnId: g.turnId, accountId: g.accountId, ...(g.grantedAt ? { since: g.grantedAt } : {}),
+        ...(runNow.has(row.root) ? { runNow: true } : {}) });
+    }
+    const waiting: (SchedulingQueueView['waiting'][number] & { index: number })[] = [];
+    for (const q of queued) {
+      const row = await describe(q.taskId);
+      if (!row) continue;
+      const key = `${q.taskId}:${q.turnId}`;
+      const plan = planned.get(key), hold = holds.get(key);
+      const status = hold?.status ?? plan?.status ?? 'next';
+      const until = hold?.until ?? plan?.until;
+      const pins = pinsOf(q.taskId, row.root).map((c) => ({ above: c.above, below: c.below, ...(c.by ? { by: c.by } : {}) }));
+      waiting.push({ ...row, turnId: q.turnId, status: status === 'admit' ? 'next' : status, ...(until !== undefined ? { until } : {}),
+        ...(pins.length ? { pins } : {}), ...(runNow.has(row.root) ? { runNow: true } : {}), index: plan?.index ?? Number.MAX_SAFE_INTEGER });
+    }
+    waiting.sort((a, b) => a.index - b.index);
+    return { organizationId, ...(snapshot ? { plannedAt: snapshot.at } : {}), running,
+      waiting: waiting.map(({ index: _index, ...w }) => w) };
+  }
+
+  /**
+   * Places a task between two rows of the queue ("after this one, before that
+   * one"). Roots order among roots; a sub-task only among its own tree's tasks.
+   * The scheduler then moves its own ranks as little as possible to keep every
+   * such order (order.ts). An order lasts until either task is gone.
+   */
+  async placeInQueue(token: string, input: { taskId: string; above?: string; below?: string; organizationId?: string }): Promise<void> {
+    const organizationId = await this.queueOrganization(token, 'reorder_queue', input.organizationId);
+    const tree = await this.deps.store.taskTree(input.taskId);
+    if (!tree || tree.organizationId !== organizationId) throw new NotFoundError(`no such task ${input.taskId}`);
+    const task = await this.deps.store.taskMetadataAsync(input.taskId);
+    (await this.require(token, 'reorder_queue', { projectId: task!.projectId, taskId: input.taskId, organizationId }));
+    const isRoot = tree.root === input.taskId;
+    for (const neighbour of [input.above, input.below]) {
+      if (!neighbour) continue;
+      const other = await this.deps.store.taskTree(neighbour);
+      if (!other || other.organizationId !== organizationId) throw new NotFoundError(`no such task ${neighbour}`);
+      if (isRoot ? other.root !== neighbour : other.root !== tree.root || neighbour === tree.root)
+        throw new ValidationError(isRoot ? 'a task can only be placed among other tasks, not among sub-tasks'
+          : 'a sub-task can only be placed among its own task\'s sub-tasks');
+      const meta = await this.deps.store.taskMetadataAsync(neighbour);
+      (await this.require(token, 'queue:read', { projectId: meta!.projectId, taskId: neighbour, organizationId }));
+    }
+    const { placeItem } = await import('../scheduling/order.js');
+    const { kvUpdate, orderKey } = await import('../scheduling/state.js');
+    const by = (await this.deps.tokens.verify(token))?.principal;
+    await kvUpdate<import('../scheduling/order.js').OrderConstraint[]>(this.deps.store, orderKey(organizationId), (prev) =>
+      placeItem(prev ?? [], input.taskId, { ...(input.above ? { above: input.above } : {}), ...(input.below ? { below: input.below } : {}) },
+        Date.now(), by));
+    await this.replanQuota();
+  }
+
+  /** Returns a task to the scheduler's own order. */
+  async clearQueuePlacement(token: string, taskId: string, requestedOrganizationId?: string): Promise<void> {
+    const organizationId = await this.queueOrganization(token, 'reorder_queue', requestedOrganizationId);
+    const tree = await this.deps.store.taskTree(taskId);
+    if (!tree || tree.organizationId !== organizationId) throw new NotFoundError(`no such task ${taskId}`);
+    const task = await this.deps.store.taskMetadataAsync(taskId);
+    (await this.require(token, 'reorder_queue', { projectId: task!.projectId, taskId, organizationId }));
+    await this.clearOrders(organizationId, taskId);
+  }
+
+  private async clearOrders(organizationId: string, taskId: string): Promise<void> {
+    const { clearItem } = await import('../scheduling/order.js');
+    const { kvUpdate, orderKey } = await import('../scheduling/state.js');
+    await kvUpdate<import('../scheduling/order.js').OrderConstraint[]>(this.deps.store, orderKey(organizationId), (prev) => {
+      const next = clearItem(prev ?? [], taskId);
+      return next.length ? next : undefined;
+    });
+    await this.replanQuota();
+  }
+
+  /**
+   * Runs a task now: its tree's turns are no longer held back for
+   * higher-priority work expected later (they still wait for a free slot and
+   * never run past a limit). Lasts until the task is done or this is undone;
+   * its priority is unchanged, so the forecast does not learn a false rush.
+   */
+  async runNow(token: string, taskId: string, requestedOrganizationId?: string): Promise<void> {
+    const { organizationId, root } = await this.schedulingTask(token, taskId, requestedOrganizationId);
+    const { kvUpdate, runNowKey } = await import('../scheduling/state.js');
+    const by = (await this.deps.tokens.verify(token))?.principal;
+    await kvUpdate<import('../scheduling/state.js').RunNow[]>(this.deps.store, runNowKey(organizationId), (prev) =>
+      [...(prev ?? []).filter((m) => m.root !== root), { root, at: Date.now(), ...(by ? { by } : {}) }]);
+    await this.replanQuota();
+  }
+
+  /** Lets the scheduler hold a task back again. */
+  async cancelRunNow(token: string, taskId: string, requestedOrganizationId?: string): Promise<void> {
+    const { organizationId, root } = await this.schedulingTask(token, taskId, requestedOrganizationId);
+    const { kvUpdate, runNowKey } = await import('../scheduling/state.js');
+    await kvUpdate<import('../scheduling/state.js').RunNow[]>(this.deps.store, runNowKey(organizationId), (prev) => {
+      const next = (prev ?? []).filter((m) => m.root !== root);
+      return next.length ? next : undefined;
+    });
+    await this.replanQuota();
+  }
+
+  /** A task of the queue the caller may change, and its tree's root. */
+  private async schedulingTask(token: string, taskId: string, requestedOrganizationId?: string): Promise<{ organizationId: string; root: string }> {
+    const organizationId = await this.queueOrganization(token, 'reorder_queue', requestedOrganizationId);
+    const tree = await this.deps.store.taskTree(taskId);
+    if (!tree || tree.organizationId !== organizationId) throw new NotFoundError(`no such task ${taskId}`);
+    const task = await this.deps.store.taskMetadataAsync(taskId);
+    (await this.require(token, 'reorder_queue', { projectId: task!.projectId, taskId, organizationId }));
+    return { organizationId, root: tree.root };
+  }
+
+  /** Asks the account coordinator to plan again now (best effort: it also replans on its own). */
+  private async replanQuota(): Promise<void> {
+    await this.deps.client.workflow.getHandle(accountCoordinatorId()).signal(SIG_REPLAN_ACCOUNTS).catch(() => undefined);
   }
 
   /** Host-wide concurrent agent turns. Installation configuration, so it takes

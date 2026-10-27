@@ -85,7 +85,7 @@ export interface CoordinatorActivityDeps {
       overMemberLimit: boolean;
       agentRunAdmissionAllowed: boolean;
     }>;
-  };
+  } & Partial<import('../scheduling/planner.js').PlannerStore> & { kvClaim?(k: string, v: string): Promise<boolean> };
 }
 
 async function agentQueueTarget(deps: CoordinatorActivityDeps,
@@ -218,6 +218,23 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
         return { position: -1, total: 0, unreachable: true };
       }
     },
+    /** The quota scheduler's step for the account coordinator (wiki features/quota-scheduling). */
+    async planAccountGrants(input: import('../scheduling/planner.js').PlanInput): Promise<import('../scheduling/planner.js').PlanOutput> {
+      const store = deps.store;
+      if (!store?.taskTree || !store.kvEntries || !store.rootTaskArrivals || !store.taskCompletions || !store.endedTasks || !store.kvGet || !store.kvSet
+        || !store.kvCompareAndSet) throw new Error('quota scheduler needs the store');
+      const { planGrants } = await import('../scheduling/planner.js');
+      const plan = await planGrants(store as import('../scheduling/planner.js').PlannerStore, input);
+      // Ask each yielding turn once, as a platform notice in its conversation.
+      for (const turn of plan.yields ?? []) {
+        if (store.kvClaim && !(await store.kvClaim(`scheduling:yielded:${turn.taskId}:${turn.turnId}`, String(Date.now())))) continue;
+        await client.workflow.getHandle(turn.taskId).signal('followUp', { id: `n-yield-${turn.turnId}`, role: 'user', ts: Date.now(),
+          text: 'Higher-priority work is waiting for the model quota this turn uses. Finish the step you are on, '
+            + 'make sure your progress is saved, then pause for about 30 minutes (pause); you resume automatically.' })
+          .catch(() => undefined);
+      }
+      return { grants: plan.grants, holds: plan.holds, recheckMs: plan.recheckMs };
+    },
     /** Crash-safety check: is the grantee workflow still running? */
     async isTaskAlive(taskId: string): Promise<boolean> {
       try {
@@ -331,15 +348,20 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
         signalArgs: [{ taskId, turnId, provider, allowed }],
       });
       // A query may still be served by the closing run during continue-as-new.
-      // Retry that acknowledgement without issuing another lease request.
-      for (let attempt = 0; attempt < 10; attempt++) {
+      // Retry that acknowledgement without issuing another lease request. While
+      // the quota scheduler is deciding (a credential has room), wait for its
+      // answer briefly, so a turn granted at once is acknowledged as granted.
+      let planning: { waiting: boolean } | undefined;
+      for (let attempt = 0; attempt < 12; attempt++) {
         const acknowledgement = await client.workflow.getHandle(accountCoordinatorId()).query(
           QRY_ACCOUNT_LEASE,
           { taskId, turnId },
-        ) as { waiting: boolean; earliestResetAt?: number; detail?: string; continuingAsNew?: true };
-        if (!acknowledgement.continuingAsNew) return acknowledgement;
+        ) as { waiting: boolean; earliestResetAt?: number; detail?: string; continuingAsNew?: true; planning?: true; heldUntil?: number };
+        if (acknowledgement.planning) planning = { waiting: true };
+        else if (!acknowledgement.continuingAsNew) return acknowledgement;
         await new Promise((resolve) => setTimeout(resolve, Math.min(100 * 2 ** attempt, 1000)));
       }
+      if (planning) return planning;
       throw new Error('Account coordinator is still continuing as new; retry lease acknowledgement');
     },
     /** Remove a not-yet-granted account request when its task/turn is cancelled. */

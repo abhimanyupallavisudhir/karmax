@@ -375,6 +375,11 @@ export const PLATFORM_API_CATALOG = {
     'GET /api/processes', 'POST /api/processes/kill',
     'GET /api/queue?domain=&projectId=', 'POST /api/queue/prioritize|move?projectId=',
     'GET /api/agent-queue (host concurrent-agent-turn queue)', 'POST /api/agent-queue/move (body {turnId, beforeTurnId?})',
+    'GET /api/scheduling/queue?organizationId= (agent work in the order it gets model quota: running, then waiting with status next|held|quota and until)',
+    'POST /api/scheduling/order?organizationId= (body {taskId, above?, below?}: keep the task after `above` and before `below`; tasks among tasks, sub-tasks within their task)',
+    'DELETE /api/scheduling/order/:taskId (back to the scheduler\'s own order)',
+    'PUT /api/scheduling/run-now/:taskId?organizationId= (run the task now: never hold it back for higher-priority work; it still waits for a free slot and a limit. Lasts until it is done)',
+    'DELETE /api/scheduling/run-now/:taskId (let the scheduler hold it back again)',
     'GET /api/metrics', 'GET|POST /api/remote-access (host-local only; body {action: setup|enable|disable})',
     // The inbox is per-USER by construction, so these three are the human surface:
     // a scoped agent token has no session.userId and gets a 400, whatever its

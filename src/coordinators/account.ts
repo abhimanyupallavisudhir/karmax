@@ -27,8 +27,11 @@ import {
   QRY_ACCOUNTS,
   QRY_ACCOUNT_LEASE,
   QRY_ACCOUNT_TASK_LEASES,
+  QRY_ACCOUNT_QUEUE,
+  SIG_REPLAN_ACCOUNTS,
   CREDENTIAL_POLICY_UNAVAILABLE,
 } from './names.js';
+import type { PlanHold, PlanInput, PlanOutput } from '../scheduling/planner.js';
 
 /**
  * The token / account coordinator (SPEC §6.2). Same lease pattern as the merge
@@ -180,6 +183,7 @@ export const returnAccountSignal =
   defineSignal<[{ accountId: string; taskId?: string; turnId?: string }]>(SIG_RETURN_ACCOUNT);
 export const registerAccountsSignal = defineSignal<[{ accounts: RegisteredAccount[] }]>(SIG_REGISTER_ACCOUNTS);
 export const relistAccountLeasesSignal = defineSignal<[]>(SIG_RELIST_ACCOUNT_LEASES);
+export const replanAccountsSignal = defineSignal<[]>(SIG_REPLAN_ACCOUNTS);
 /** Ground-truth exhaustion feed (from the reportAccountExhausted activity). */
 export const reportExhaustedSignal = defineSignal<[{ accountId: string; window: LimitWindow; resetAt: number; note?: string; transition?: AccountTransition }]>(SIG_REPORT_EXHAUSTED);
 /** Manual availability override (UI/MCP). `resetAt` sets a new reset instant. */
@@ -188,10 +192,16 @@ export const reportExhaustedUpdate = defineUpdate<void, [{ accountId: string; wi
 export const setAccountAvailabilityUpdate = defineUpdate<void, [{ accountId: string; status: AccountStatus; resetAt?: number; onlyIfStatus?: AccountStatus; transition?: AccountTransition }]>(UPD_SET_ACCOUNT_AVAILABILITY);
 export const accountsQuery = defineQuery<AccountsView>(QRY_ACCOUNTS);
 export const accountLeaseQuery = defineQuery<
-  { waiting: boolean; earliestResetAt?: number; detail?: string; continuingAsNew?: true },
+  { waiting: boolean; earliestResetAt?: number; detail?: string; continuingAsNew?: true; heldUntil?: number; planning?: true },
   [{ taskId: string; turnId?: string }]
 >(QRY_ACCOUNT_LEASE);
 export const accountTaskLeasesQuery = defineQuery<string[], [string]>(QRY_ACCOUNT_TASK_LEASES);
+export interface AccountQueueView {
+  queue: { taskId: string; turnId: string; provider?: string }[];
+  granted: { taskId: string; turnId: string; accountId: string; grantedAt?: number }[];
+  holds: PlanHold[];
+}
+export const accountQueueQuery = defineQuery<AccountQueueView>(QRY_ACCOUNT_QUEUE);
 
 // A long backstop poll so the park loop periodically re-checks even absent a
 // signal; refresh timing itself is driven by each account's `resetAt`.
@@ -202,6 +212,10 @@ const CONTINUE_AFTER = 1000;
 const LEASE_TIMEOUT_MS = 5 * 60 * 1000;
 
 const act = proxyActivities<{ isTaskAlive(taskId: string): Promise<boolean> }>({ startToCloseTimeout: '20s' });
+/** The quota scheduler (wiki features/quota-scheduling): which queued turns get which login now. */
+const scheduler = proxyActivities<{ planAccountGrants(input: PlanInput): Promise<PlanOutput> }>({
+  startToCloseTimeout: '60s', retry: { maximumAttempts: 2 },
+});
 
 export async function accountCoordinator(input: { state?: AccountCoordinatorState }): Promise<void> {
   const boundedHistory = input.state?.historyPolicyVersion === 2;
@@ -233,6 +247,13 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
   // Set when credentials changed under parked requests (a credential sync or a
   // policy edit); the loop then asks each parked owner to request again.
   let relistRequested = input.state?.relistRequested === true;
+  // The quota scheduler plans when a credential has room; a turn it holds back
+  // waits until something changes (`version`) or the plan's recheck time.
+  // Gated like the markers above, on bounded-history runs only.
+  let scheduling = boundedHistory && patched('account-quota-scheduler-v1');
+  let version = 0;
+  /** Why the scheduler is holding each queued turn back (query-only). */
+  let holds = new Map<string, PlanHold>();
   /**
    * Parked allow-lists were resolved against the credentials of their day. A
    * sync is the only notice the coordinator gets that they changed, and only
@@ -345,13 +366,21 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
     // still in-use; a later sync prunes them when their turn finishes.
     const live = new Set(incoming.map((a) => a.id));
     accounts = accounts.filter((a) => live.has(a.id) || a.inUse > 0);
+    version++;
     requestRelist();
   });
-  setHandler(relistAccountLeasesSignal, requestRelist);
+  setHandler(relistAccountLeasesSignal, () => { version++; requestRelist(); });
+  setHandler(replanAccountsSignal, () => { version++; });
+  setHandler(accountQueueQuery, (): AccountQueueView => ({
+    queue: queue.map((q) => ({ taskId: q.taskId, turnId: q.turnId, ...(q.provider ? { provider: q.provider } : {}) })),
+    granted: granted.map((g) => ({ taskId: g.taskId, turnId: g.turnId, accountId: g.accountId, ...(g.grantedAt ? { grantedAt: g.grantedAt } : {}) })),
+    holds: [...holds.values()],
+  }));
   setHandler(leaseAccountSignal, (req) => {
     if (boundedHistory && granted.some((g) => g.taskId === req.taskId && g.turnId === req.turnId)) return;
     if (!queue.find((q) => q.taskId === req.taskId && q.turnId === req.turnId)) {
       queue.push({ taskId: req.taskId, turnId: req.turnId, provider: req.provider, allowed: req.allowed });
+      version++;
     }
   });
   /** Give a granted lease's capacity back to its credential. */
@@ -361,6 +390,7 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
   };
   setHandler(cancelAccountSignal, ({ taskId, turnId }) => {
     queue = queue.filter((q) => q.taskId !== taskId || q.turnId !== turnId);
+    version++;
     // Withdraw an already-GRANTED lease too, not just a queued request. This is the
     // path `stopTaskActivity` uses after terminating the task workflow, and a
     // terminated workflow never runs the `finally` that calls returnAccount.
@@ -371,6 +401,7 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
     }
   });
   setHandler(returnAccountSignal, ({ accountId, taskId, turnId }) => {
+    version++;
     // Find the granted-lease record this return retires — and drop the RIGHT one.
     // Records for one credential are NOT interchangeable, because `sweepDeadLeases`
     // keys off `lease.taskId`: with maxConcurrent >= 2, if task A grants first and
@@ -417,6 +448,7 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
   }) => {
     const a = accounts.find((x) => x.id === accountId);
     if (!a) return;
+    version++;
     a.status = 'exhausted';
     a.window = window;
     a.resetAt = resetAt;
@@ -439,6 +471,7 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
     // never race with and override a user's manual disable (or another newer
     // state transition). The guard is evaluated atomically in this workflow.
     if (onlyIfStatus !== undefined && a.status !== onlyIfStatus) return;
+    version++;
     a.status = status;
     if (status !== 'available' && transition) {
       a.lastTransition = transition;
@@ -484,6 +517,10 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
       return { waiting: true, detail: 'Couldn\'t read this task\'s credential policy — Retry reads it again' };
     const compatible = accounts.filter((a) => req.allowed !== undefined
       ? req.allowed.includes(a.id) : a.provider === req.provider);
+    const hold = holds.get(`${req.taskId}:${req.turnId}`);
+    // A credential has room and the scheduler is about to decide: the answer is a moment away.
+    if (scheduling && !hold && serveable(req) && !(req.allowed?.length === 0)) return { waiting: true, planning: true as const };
+    if (hold?.status === 'held') return { waiting: true, detail: 'Held for higher-priority work', ...(hold.until ? { heldUntil: hold.until } : {}) };
     if (compatible.some((a) => a.status === 'available'))
       return { waiting: true, detail: 'Waiting for a free slot on an allowed account' };
     const resets = compatible.filter((a) => a.status === 'exhausted' && a.resetAt != null)
@@ -524,6 +561,7 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
     refreshDue();
     identifiedReturnsRelease = patched('account-coordinator-return-identity-v1');
     waitForCredentials = patched('account-coordinator-credential-wait-v1');
+    scheduling = boundedHistory && patched('account-quota-scheduler-v1');
     // Keep the legacy branch byte-for-byte for histories created before this fix.
     // `patched` is deliberately evaluated on every loop: it remains false while
     // replaying marker-less history, then flips true at the live edge. That lets a
@@ -556,6 +594,34 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
     while (queue.length > 0) {
       await rotateIfNeeded();
       refreshDue();
+      // The quota scheduler decides which turns a credential with room goes to,
+      // and keeps quota back for higher-priority work. A passthrough (no login to
+      // spend) needs no decision; a failed plan falls back to arrival order.
+      if (scheduling && !queue.some((q) => serveable(q) && !pickFor(q)) && queue.some((q) => serveable(q))) {
+        const plan = await planGrants();
+        if (plan) {
+          let given = 0;
+          for (const grant of plan.grants) {
+            const i = queue.findIndex((q) => q.taskId === grant.taskId && q.turnId === grant.turnId);
+            const account = accounts.find((a) => a.id === grant.accountId);
+            if (i < 0 || !account || !available(account)) continue;
+            const req = queue[i]!;
+            if (req.allowed !== undefined ? !req.allowed.includes(account.id) : account.provider !== req.provider) continue;
+            queue.splice(i, 1);
+            holds.delete(`${req.taskId}:${req.turnId}`);
+            await grant_(req, account);
+            given++;
+          }
+          holds = new Map(plan.holds.filter((h) => queue.some((q) => q.taskId === h.taskId && q.turnId === h.turnId))
+            .map((h) => [`${h.taskId}:${h.turnId}`, h]));
+          if (!given && queue.length) {
+            const seen = version;
+            const woke = await condition(() => version !== seen || queue.length === 0 || historyFull(), plan.recheckMs);
+            if (!woke && granted.length && patched('account-coordinator-lease-sweep-v1')) await sweepDeadLeases();
+          }
+          continue;
+        }
+      }
       // Serve the first request whose credential allow-list has capacity (avoids
       // head-of-line blocking: each request carries its own ordered list).
       const idx = queue.findIndex((q) => serveable(q));
@@ -625,31 +691,52 @@ export async function accountCoordinator(input: { state?: AccountCoordinatorStat
       const req = queue.splice(idx, 1)[0]!;
       // First available credential from the request's ordered allow-list; passthrough
       // (profile default) when the list is empty.
-      const free = pickFor(req);
+      await grant_(req, pickFor(req));
+    }
+  }
+
+  /** Grants `req` the credential `free` (none: passthrough) and tells its task. */
+  async function grant_(req: (typeof queue)[number], free: AccountState | undefined): Promise<void> {
+    if (free) {
+      free.inUse++;
+      // Remember who holds it, so the lease can be reclaimed if its owner is
+      // terminated (no finally) or dies (liveness sweep above).
+      granted.push({ taskId: req.taskId, turnId: req.turnId, accountId: free.id, grantedAt: Date.now() });
+    }
+    processed++;
+    try {
+      await getExternalWorkflowHandle(req.taskId).signal(SIG_ACCOUNT_GRANTED, {
+        turnId: req.turnId,
+        accountId: free?.id ?? '(passthrough)',
+        configHome: free?.configHome,
+        ...(free?.apiKeyHandle ? { apiKeyHandle: free.apiKeyHandle } : {}),
+        ...(free?.kind ? { credentialKind: free.kind } : {}),
+        ...(free?.credentialProvider ? { credentialProvider: free.credentialProvider } : {}),
+      });
+    } catch (e) {
+      log.warn(`account grant signal to ${req.taskId} failed; freeing`, { e: String(e) });
       if (free) {
-        free.inUse++;
-        // Remember who holds it, so the lease can be reclaimed if its owner is
-        // terminated (no finally) or dies (liveness sweep above).
-        granted.push({ taskId: req.taskId, turnId: req.turnId, accountId: free.id, grantedAt: Date.now() });
+        const i = granted.findIndex((g) => g.taskId === req.taskId && g.turnId === req.turnId);
+        if (!boundedHistory || i >= 0) free.inUse--;
+        if (i >= 0) granted.splice(i, 1);
       }
-      processed++;
-      try {
-        await getExternalWorkflowHandle(req.taskId).signal(SIG_ACCOUNT_GRANTED, {
-          turnId: req.turnId,
-          accountId: free?.id ?? '(passthrough)',
-          configHome: free?.configHome,
-          ...(free?.apiKeyHandle ? { apiKeyHandle: free.apiKeyHandle } : {}),
-          ...(free?.kind ? { credentialKind: free.kind } : {}),
-          ...(free?.credentialProvider ? { credentialProvider: free.credentialProvider } : {}),
-        });
-      } catch (e) {
-        log.warn(`account grant signal to ${req.taskId} failed; freeing`, { e: String(e) });
-        if (free) {
-          const i = granted.findIndex((g) => g.taskId === req.taskId && g.turnId === req.turnId);
-          if (!boundedHistory || i >= 0) free.inUse--;
-          if (i >= 0) granted.splice(i, 1);
-        }
-      }
+    }
+  }
+
+  /** Asks the quota scheduler for a plan; undefined if it failed (arrival order then). */
+  async function planGrants(): Promise<PlanOutput | undefined> {
+    const serveableNow = queue.filter((q) => serveable(q));
+    try {
+      return await scheduler.planAccountGrants({
+        accounts: accounts.map((a) => ({ id: a.id, provider: a.provider, ...(a.kind ? { kind: a.kind } : {}), status: a.status,
+          inUse: a.inUse, maxConcurrent: a.maxConcurrent, ...(a.resetAt != null ? { resetAt: a.resetAt } : {}) })),
+        queue: serveableNow.map((q) => ({ taskId: q.taskId, turnId: q.turnId, ...(q.provider ? { provider: q.provider } : {}),
+          ...(q.allowed !== undefined ? { allowed: q.allowed } : {}) })),
+        granted: granted.map((g) => ({ taskId: g.taskId, turnId: g.turnId, accountId: g.accountId, ...(g.grantedAt ? { grantedAt: g.grantedAt } : {}) })),
+      });
+    } catch (e) {
+      log.warn('quota scheduler failed; serving in arrival order', { e: String(e) });
+      return undefined;
     }
   }
 

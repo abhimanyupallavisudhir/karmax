@@ -1056,6 +1056,26 @@ function installInfoDotTips() {
   });
 }
 
+// Run now (wiki features/quota-scheduling): a held task stops being kept back
+// for higher-priority work; undo lets the scheduler hold it again. Delegated:
+// the button sits on the task page and on the Queues page, both re-rendered often.
+const RUN_NOW_TIP = 'Start as soon as a login has room, using quota kept for higher-priority work. Lasts until the task is done';
+function installRunNow() {
+  document.addEventListener('click', async (ev) => {
+    const b = ev.target.closest('[data-run-now], [data-run-now-undo]');
+    if (!b) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    const undo = b.hasAttribute('data-run-now-undo');
+    b.disabled = true;
+    try {
+      await api(schedulingApi(`/run-now/${encodeURIComponent(undo ? b.dataset.runNowUndo : b.dataset.runNow)}`), { method: undo ? 'DELETE' : 'PUT' });
+      toast(undo ? 'It may be held back again' : 'Starting as soon as a login has room');
+    } catch (err) { toast(err.message, true); b.disabled = false; }
+    if (S.tab === 'queue') setTimeout(seedQueue, 300);
+  });
+}
+
 // Tag chips are navigation everywhere they appear: links to their section, so a
 // modified click opens it in a new tab. Capture before row/form click handlers so
 // a chip never opens a task or mutates its tags as a side effect.
@@ -4608,6 +4628,7 @@ function installShellListeners() {
   installLinkRouter();
   installTagRouter();
   installInfoDotTips();
+  installRunNow();
   // A background repaint deferred to protect an open menu / text-selection gets
   // flushed once that interaction releases (setTimeout lets focus + selection
   // settle first). selectionchange fires constantly, so it only pokes the flush
@@ -10395,7 +10416,7 @@ function orgEditorHtml(rec) {
   }).join('');
   const prioOpts = PRIORITY_NAMES.map((n, i) => `<option value="${i}" ${i === prio ? 'selected' : ''}>${i ? `▲ ${n[0].toUpperCase() + n.slice(1)}` : 'No priority'}</option>`).join('');
   return `<div class="org-editor">
-    <select class="q-sel org-priority${prio ? '' : ' unset'}" aria-label="Priority" title="Priority">${prioOpts}</select>
+    <select class="q-sel org-priority${prio ? '' : ' unset'}" aria-label="Priority" title="Higher priority gets model quota first, and quota is kept back for it. No priority runs as Medium.">${prioOpts}</select>
     <div class="org-tags">${tags}
       <button type="button" class="org-add-tag" title="Add a tag">＋ tag</button>
     </div>
@@ -13787,6 +13808,9 @@ function waitingText(w) {
   if (w?.kind === 'retry' && typeof w.summary === 'string' && w.summary.trim())
     return `${w.summary.trim().slice(0, 48)}${Number.isFinite(w.until) ? `, trying at ${waitDeadline(w.until)}` : ''}`;
   if (w?.kind === 'retry') return Number.isFinite(w.until) ? `Retrying at ${waitDeadline(w.until)}` : 'Retrying';
+  // The quota scheduler keeps this login's quota for higher-priority work until then.
+  if (w?.kind === 'account' && typeof w.detail === 'string' && w.detail.startsWith('Held'))
+    return Number.isFinite(w.until) ? `Held for higher-priority work until ${waitDeadline(w.until)}` : 'Held for higher-priority work';
   // A job is shown by the name its agent gave it. The deadline is when the
   // agent resumes even if the job never finishes.
   if (w?.kind === 'job') {
@@ -13811,6 +13835,9 @@ function waitDeadline(until) {
 // account limit, or admission blocked by the plan (e.g. a member mismatch).
 // The generic header label alone would hide that diagnosis.
 function conversationWaitNotice(v) {
+  const w = v.waitingFor;
+  if (w?.kind === 'account' && typeof w.detail === 'string' && w.detail.startsWith('Held'))
+    return `<div class="msg system wait-notice" role="status">${esc(waitingText(w))} <button type="button" class="btn sm ghost" data-run-now="${esc(v.taskId)}" title="${esc(RUN_NOW_TIP)}">Run now</button></div>`;
   const detail = presenceDetail(v);
   return detail ? `<div class="msg system wait-notice" role="status">${esc(waitingText(v.waitingFor))} · ${esc(detail)}</div>` : '';
 }
@@ -15413,6 +15440,12 @@ function agentQueueApi(path = '') {
   return `/api/agent-queue${path}${organizationId ? `?organizationId=${encodeURIComponent(organizationId)}` : ''}`;
 }
 
+// Agent work in the order it gets model quota (wiki features/quota-scheduling).
+function schedulingApi(path = '') {
+  const organizationId = projectById(S.projectId)?.organizationId || S.organizationId;
+  return `/api/scheduling${path}${organizationId ? `?organizationId=${encodeURIComponent(organizationId)}` : ''}`;
+}
+
 async function seedQueue() {
   const projectId = S.projectId;
   const epoch = S.queueLoadEpoch = (S.queueLoadEpoch || 0) + 1;
@@ -15429,10 +15462,18 @@ async function seedQueue() {
   );
   let agentQueue = S.agentQueue;
   try { agentQueue = await api(agentQueueApi()); } catch {}
+  let agentWork;
+  try { agentWork = await api(schedulingApi('/queue')); } catch {}
   if (S.queueLoadEpoch !== epoch || S.projectId !== projectId) return;
   S.queueOrders = orders;
   S.agentQueue = agentQueue;
-  if (S.tab === 'queue') renderMain();
+  S.agentWork = agentWork;
+  // Waiting work moves as the scheduler replans: refresh while the page is open, never mid-drag.
+  clearTimeout(S.queueRefresh);
+  if (S.tab === 'queue') {
+    S.queueRefresh = setTimeout(() => { if (S.tab === 'queue') seedQueue(); }, 20_000);
+    if (!document.querySelector('#main .dragging')) renderMain();
+  }
 }
 
 // The merge-queue badge for a task header. A coordinator that cannot be queried
@@ -15559,16 +15600,175 @@ function agentQueuePanel() {
     : `<div class="card queue-empty">No agents running</div>`;
 }
 
+const WORK_PRIORITY = { low: 1, medium: 2, high: 3, urgent: 4 };
+const WORK_STATUS = {
+  running: ['Running', 'Using a login now'],
+  next: ['Next', 'Starts when a login has room'],
+  held: ['Held', 'Its quota is kept for higher-priority work expected before then'],
+  quota: ['Quota used up', 'Every login it may use has run out until it resets'],
+};
+function workStatusText(status, until) {
+  if (status === 'held' && Number.isFinite(until)) return `Held until ${waitDeadline(until)}`;
+  if (status === 'quota' && Number.isFinite(until)) return `Quota resets ${waitDeadline(until)}`;
+  return WORK_STATUS[status]?.[0] || status;
+}
+
+/** Task trees in quota order: running first, then waiting, each with its tasks. */
+function agentWorkGroups(view) {
+  const groups = new Map();
+  const group = (row) => {
+    if (!groups.has(row.root)) groups.set(row.root, { root: row.root, num: row.taskId === row.root ? row.num : row.rootNum,
+      title: row.taskId === row.root ? row.title : (row.rootTitle || row.title), priority: row.priority, tasks: new Map(), running: 0, waiting: [] });
+    const g = groups.get(row.root);
+    if (row.taskId === row.root) { g.num = row.num; g.title = row.title; }
+    if (!g.tasks.has(row.taskId)) g.tasks.set(row.taskId, { taskId: row.taskId, num: row.num, title: row.title, running: 0, waiting: [], pins: row.pins });
+    return g;
+  };
+  for (const r of view?.running || []) { const g = group(r); g.running++; g.tasks.get(r.taskId).running++; if (r.runNow) g.runNow = true; }
+  for (const w of view?.waiting || []) { const g = group(w); if (w.runNow) g.runNow = true; g.waiting.push(w); g.tasks.get(w.taskId).waiting.push(w); if (w.pins) g.tasks.get(w.taskId).pins = w.pins; }
+  const rank = { next: 0, held: 1, quota: 2 };
+  for (const g of groups.values()) {
+    const best = g.waiting.slice().sort((a, b) => rank[a.status] - rank[b.status])[0];
+    g.status = best ? best.status : 'running';
+    g.until = best?.until;
+  }
+  return [...groups.values()];
+}
+
+function workPinTitle(pins, numOf) {
+  const parts = (pins || []).map((p) => p.below && numOf(p.below) && p.above && numOf(p.above)
+    ? `#${numOf(p.above)} before #${numOf(p.below)}` : '').filter(Boolean);
+  return `${parts.length ? `You placed it: ${parts.join(', ')}. ` : 'You placed it here. '}Click to return it to automatic order`;
+}
+
+function agentWorkPanel() {
+  const view = S.agentWork;
+  const groups = agentWorkGroups(view);
+  if (!groups.length) return `<div class="card queue-empty">No agents running or waiting</div>`;
+  const nums = new Map();
+  for (const g of groups) { nums.set(g.root, g.num); for (const t of g.tasks.values()) nums.set(t.taskId, t.num); }
+  const numOf = (id) => nums.get(id);
+  let divided = false, position = 0;
+  const rows = groups.map((g) => {
+    const waiting = g.waiting.length > 0;
+    let divider = '';
+    if (waiting && !divided && g.status !== 'next') {
+      divided = true;
+      divider = `<div class="work-divider" title="Below here, quota is kept back for higher-priority work, or has run out">Held back</div>`;
+    }
+    if (waiting) position++;
+    const p = WORK_PRIORITY[g.priority] || 0;
+    const prio = p && p !== 2 ? `<span class="prio p${p}" title="Priority: ${esc(g.priority)}">▲ ${esc(g.priority[0].toUpperCase() + g.priority.slice(1))}</span>` : '';
+    const rootTask = g.tasks.get(g.root);
+    const pinned = rootTask?.pins?.length;
+    const runNow = g.runNow
+      ? `<button type="button" class="work-pin" data-run-now-undo="${esc(g.root)}" title="Running now: never held back for higher-priority work. Click to undo" aria-label="Undo run now">⏩</button>`
+      : g.status === 'held' ? `<button type="button" class="btn sm ghost" data-run-now="${esc(g.root)}" title="${esc(RUN_NOW_TIP)}">Run now</button>` : '';
+    const subs = [...g.tasks.values()].filter((t) => t.taskId !== g.root);
+    const subRows = subs.length ? `<div class="work-subs" data-root="${esc(g.root)}">${subs.map((t) => {
+      const w = t.waiting[0];
+      const status = w ? w.status : 'running';
+      return `<div class="work-sub" data-task="${esc(t.taskId)}" ${w ? 'draggable="true"' : ''} title="${esc(WORK_STATUS[status]?.[1] || '')}">
+        ${w ? '<span class="drag-handle" title="Drag to reorder within this task">⠿</span>' : '<span class="drag-handle placeholder"></span>'}
+        <span class="work-sub-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</span>
+        <span class="chip">${esc(w ? workStatusText(w.status, w.until) : 'Running')}</span>
+        ${t.pins?.length ? `<button type="button" class="work-pin" data-unpin="${esc(t.taskId)}" title="${esc(workPinTitle(t.pins, numOf))}" aria-label="Return to automatic order">📌</button>` : ''}
+      </div>`;
+    }).join('')}</div>` : '';
+    return `${divider}<div class="queue-item work-tree ${waiting ? '' : 'current'}" data-id="${esc(g.root)}" data-root="${esc(g.root)}" tabindex="0" role="group" aria-label="${esc(queueRowLabel({ num: g.num, title: g.title }, workStatusText(g.status, g.until), waiting ? position : null))}" ${waiting ? 'draggable="true"' : ''}>
+      ${waiting ? '<span class="drag-handle" title="Drag to reorder">⠿</span>' : '<span class="drag-handle placeholder"></span>'}
+      <span class="pos">${waiting ? position : '▶'}</span>
+      <div style="flex:1;min-width:0"><div class="task-title">${g.num != null ? `<span class="task-num">#${g.num}</span> ` : ''}${esc(g.title)} ${prio}</div>
+        <div class="task-sub" title="${esc(WORK_STATUS[g.status]?.[1] || '')}">${esc(workStatusText(g.status, g.until))}${g.running && waiting ? ` · ${g.running} running` : g.running > 1 ? ` · ${g.running}` : ''}</div>
+        ${subRows}</div>
+      ${runNow}${pinned ? `<button type="button" class="work-pin" data-unpin="${esc(g.root)}" title="${esc(workPinTitle(rootTask.pins, numOf))}" aria-label="Return to automatic order">📌</button>` : ''}
+    </div>`;
+  }).join('');
+  return `<div class="queue-list work-list">${rows}</div>`;
+}
+
+/** Places a dragged row between its new neighbours; the scheduler keeps that order (wiki features/quota-scheduling). */
+async function placeWork(taskId, above, below) {
+  try {
+    await api(schedulingApi('/order'), { method: 'POST', body: JSON.stringify({ taskId, ...(above ? { above } : {}), ...(below ? { below } : {}) }) });
+  } catch (err) { toast(err.message, true); }
+  setTimeout(seedQueue, 300);
+}
+
+function wireAgentWork(list) {
+  if (!list) return;
+  // Every row opens its task, sub-task rows their own.
+  const records = new Map([...(S.agentWork?.running || []), ...(S.agentWork?.waiting || [])].map((r) => [r.taskId, { id: r.taskId, projectId: r.projectId, num: r.num }]));
+  list.querySelectorAll('.work-tree').forEach((row) => { if (!row.classList.contains('has-row-link')) wireRowLink(row, taskUrl(row.dataset.root, records.get(row.dataset.root))); });
+  list.querySelectorAll('.work-sub').forEach((row) => wireRowLink(row, taskUrl(row.dataset.task, records.get(row.dataset.task))));
+  // Trees among trees.
+  let dragging = null;
+  const trees = () => [...list.querySelectorAll('.work-tree[draggable="true"]')];
+  trees().forEach((row) => {
+    row.addEventListener('dragstart', (e) => { if (e.target !== row) return; dragging = row; row.classList.add('dragging'); e.dataTransfer.effectAllowed = 'move'; });
+    row.addEventListener('dragend', () => { row.classList.remove('dragging'); dragging = null; });
+  });
+  list.addEventListener('dragover', (e) => {
+    if (!dragging) return;
+    e.preventDefault();
+    const before = trees().find((row) => row !== dragging && e.clientY < row.getBoundingClientRect().top + row.getBoundingClientRect().height / 2);
+    if (before) list.insertBefore(dragging, before.previousElementSibling?.classList.contains('work-divider') ? before.previousElementSibling : before);
+    else list.appendChild(dragging);
+  });
+  list.addEventListener('drop', (e) => {
+    if (!dragging) return;
+    e.preventDefault();
+    const rows = trees(), at = rows.indexOf(dragging);
+    placeWork(dragging.dataset.root, rows[at - 1]?.dataset.root, rows[at + 1]?.dataset.root);
+  });
+  // Sub-tasks among their own tree's.
+  list.querySelectorAll('.work-subs').forEach((box) => {
+    let sub = null;
+    const subs = () => [...box.querySelectorAll('.work-sub[draggable="true"]')];
+    subs().forEach((row) => {
+      row.addEventListener('dragstart', (e) => { e.stopPropagation(); sub = row; row.classList.add('dragging'); e.dataTransfer.effectAllowed = 'move'; });
+      row.addEventListener('dragend', (e) => { e.stopPropagation(); row.classList.remove('dragging'); sub = null; });
+    });
+    box.addEventListener('dragover', (e) => {
+      if (!sub) return;
+      e.preventDefault(); e.stopPropagation();
+      const before = subs().find((row) => row !== sub && e.clientY < row.getBoundingClientRect().top + row.getBoundingClientRect().height / 2);
+      if (before) box.insertBefore(sub, before);
+      else box.appendChild(sub);
+    });
+    box.addEventListener('drop', (e) => {
+      if (!sub) return;
+      e.preventDefault(); e.stopPropagation();
+      const rows = subs(), at = rows.indexOf(sub);
+      placeWork(sub.dataset.task, rows[at - 1]?.dataset.task, rows[at + 1]?.dataset.task);
+    });
+  });
+  list.querySelectorAll('[data-unpin]').forEach((b) => b.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    try {
+      const org = projectById(S.projectId)?.organizationId || S.organizationId;
+      await api(`/api/scheduling/order/${encodeURIComponent(b.dataset.unpin)}${org ? `?organizationId=${encodeURIComponent(org)}` : ''}`, { method: 'DELETE' });
+      toast('Back to automatic order');
+    } catch (err) { toast(err.message, true); }
+    setTimeout(seedQueue, 300);
+  }));
+}
+
 function queuesView() {
   const contributions = (S.contributions?.slots || []).filter((x) => ['queue-panel', 'merge-queue-panel'].includes(x.contribution?.slot));
-  const renderers = { 'merge-queue': mergeQueuePanel, 'agent-queue': agentQueuePanel };
+  // Agent work replaces the agent queue whenever the scheduler answers.
+  const renderers = { 'merge-queue': mergeQueuePanel, 'agent-queue': S.agentWork ? agentWorkPanel : agentQueuePanel };
   return contributions.map((x) => {
     const component = x.contribution?.component;
     const render = renderers[component];
     if (!render) return '';
-    const suffix = component === 'agent-queue' ? ` <span class="pill">${(S.agentQueue?.current || []).length}/${S.agentQueue?.capacity ?? 3}</span>` : '';
-    const tip = { 'merge-queue': 'Tasks ready to land, in the order they merge. Drag to reorder.', 'agent-queue': 'Agents working now, then those waiting for a free slot.' }[component];
-    return `<div class="section-h">${esc(x.contribution.title || x.workflow)}${suffix}${tip ? ` ${policyTip(tip)}` : ''}</div>${render()}`;
+    const work = component === 'agent-queue' && S.agentWork;
+    const suffix = component === 'agent-queue' && !work ? ` <span class="pill">${(S.agentQueue?.current || []).length}/${S.agentQueue?.capacity ?? 3}</span>` : '';
+    const tip = work
+      ? 'Agents running now, then waiting work in the order it gets model quota: higher priority first, and work that has used less. Quota is kept back for higher-priority work that usually arrives before a login resets. Drag to change the order.'
+      : { 'merge-queue': 'Tasks ready to land, in the order they merge. Drag to reorder.', 'agent-queue': 'Agents working now, then those waiting for a free slot.' }[component];
+    const title = work ? 'Agent work' : (x.contribution.title || x.workflow);
+    return `<div class="section-h">${esc(title)}${suffix}${tip ? ` ${policyTip(tip)}` : ''}</div>${render()}`;
   }).join('') || `<div class="empty">No workflows contribute a queue.</div>`;
 }
 
@@ -15627,8 +15827,9 @@ function wireQueueView() {
       } catch (e) { toast(e.message, true); seedQueue(); }
     }),
   );
-  $('#main').querySelectorAll('.queue-list:not(.agent-queue-list)').forEach(wireQueueDrag);
+  $('#main').querySelectorAll('.queue-list:not(.agent-queue-list):not(.work-list)').forEach(wireQueueDrag);
   wireAgentQueueDrag($('#main').querySelector('.agent-queue-list'));
+  wireAgentWork($('#main').querySelector('.work-list'));
   applyCursor();
   $('#main').querySelectorAll('.queue-item').forEach((r) => r.addEventListener('focus', () => { S.cursorId = rowKey(r); applyCursor(); }));
 }

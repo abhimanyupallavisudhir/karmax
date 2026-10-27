@@ -45,7 +45,7 @@ import { localProviderCli } from './provider-cli.js';
 import { withTimeout } from '../util/timeout.js';
 import { utf8Tail } from '../util/utf8-tail.js';
 import { stripAnsi } from '../util/ansi.js';
-import { ensureCodexLoginFresh, refreshCodexLogin } from './usage.js';
+import { ensureCodexLoginFresh, parseCodexRateLimits, refreshCodexLogin } from './usage.js';
 import { BRAND } from '../domain/brand.js';
 
 /**
@@ -648,6 +648,9 @@ export class CodexAdapter implements AgentAdapter {
           if (currentTurnId) ownTurns.add(currentTurnId);
           turnActive = true;
           break;
+        case 'account/rateLimits/updated':
+          reportCodexQuota(ctx, params);
+          break;
         case 'thread/tokenUsage/updated': {
           const threadTotal = params?.tokenUsage?.total?.totalTokens;
           if (!ownTurns.has(params?.turnId) || threadTotal === countedThreadTotal) break;
@@ -817,7 +820,7 @@ export class CodexAdapter implements AgentAdapter {
       (await startupEnd?.());
       // The account read and MCP startup are independent: wait for them together (LT-1).
       const accountHealth = timed('provider.account-health', () => withTimeout(client.request('account/rateLimits/read', {}), 5_000))
-        .then(() => { modelCredentialHealthy = true; }, () => {
+        .then((limits) => { modelCredentialHealthy = true; reportCodexQuota(ctx, limits); }, () => {
           // Older app-servers may not expose this endpoint. They retain the
           // explicit MCP-name correlation above, but do not get the stronger
           // generic-error correlation without positive account proof.
@@ -1262,4 +1265,17 @@ export class CodexAdapter implements AgentAdapter {
       usage: reportedUsage.total(),
     };
   }
+}
+
+/** Codex's usage windows, for the quota scheduler (wiki features/quota-scheduling). */
+function reportCodexQuota(ctx: PlatformToolContext, payload: unknown): void {
+  if (!ctx.reportQuota || !payload) return;
+  try {
+    const snapshot = parseCodexRateLimits(payload, Date.now());
+    if (!snapshot.ok) return;
+    for (const window of ['session', 'week'] as const) {
+      const w = snapshot[window];
+      if (w) ctx.reportQuota({ window, utilization: w.pct / 100, ...(w.resetAt ? { resetsAt: w.resetAt } : {}) });
+    }
+  } catch { /* a reading is advisory */ }
 }
