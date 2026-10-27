@@ -39,20 +39,7 @@ describe.each(storeBackends)('organization and collaboration domain ($name)', ({
     } finally { await store.close(); }
   });
 
-  it('delivers simultaneous authorization asks even when request hashes collide', async () => {
-    const store = await open();
-    try {
-      const org = await store.createOrganization({ name: 'Approvals', ownerUserId: 'owner' });
-      const project = await store.createProject('App', {}, org.id);
-      for (const [avatarId, requestId] of [['avatar-a', 'Aa'], ['avatar-b', 'BB']] as const)
-        await store.addAuthorizationInbox(org.id, ['owner'],
-          { kind: 'avatar-authorization', avatarId, projectId: project.id, requestId }, 1000);
-      const inbox = await store.listInbox('owner', org.id);
-      expect(inbox.map((row) => row.subject?.kind === 'avatar-authorization' ? row.subject.requestId : undefined).sort()).toEqual(['Aa', 'BB']);
-    } finally { await store.close(); }
-  });
-
-  it('routes email by urgency for task and resource asks, retaining legacy defaults', async () => {
+  it('routes email by urgency, retaining legacy defaults', async () => {
     const store = (await open());
     const org = (await store.createOrganization({ name: 'Email', ownerUserId: 'owner' }));
     const project = (await store.createProject('App', {}, org.id));
@@ -65,7 +52,6 @@ describe.each(storeBackends)('organization and collaboration domain ($name)', ({
       (await store.appendEvent({ taskId: task.id, type: 'credential.approval-requested', ts: Date.now(),
         payload: { urgency } }));
     }
-    (await store.addAuthorizationInbox(org.id, ['owner'], { kind: 'avatar-authorization', avatarId: 'avatar', projectId: project.id, requestId: 'first' }));
     const delivered: string[] = [];
     const dispatcher = new DeliveryDispatcher(store, { browser: new BrowserDeliveryAdapter(),
       email: { deliver: async ({ inbox }) => { delivered.push(inbox.urgency); } } });
@@ -73,7 +59,9 @@ describe.each(storeBackends)('organization and collaboration domain ($name)', ({
     expect(delivered).toEqual(['critical']);
     (await store.setDeliveryPreferences({ userId: 'owner', organizationId: org.id,
       browser: true, email: true, slack: false, routine: true }));
-    (await store.addAuthorizationInbox(org.id, ['owner'], { kind: 'avatar-authorization', avatarId: 'avatar', projectId: project.id, requestId: 'second' }));
+    const later = (await store.createTask({ projectId: project.id, title: 'later', workflow: 'just-do',
+      workflowVersion: '1', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'owner' } }));
+    (await store.appendEvent({ taskId: later.id, type: 'credential.approval-requested', ts: Date.now(), payload: { urgency: 'high' } }));
     await dispatcher.drain();
     expect(delivered).toEqual(['critical', 'high']);
     (await store.close());

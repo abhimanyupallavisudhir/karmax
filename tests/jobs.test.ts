@@ -305,7 +305,7 @@ exec /bin/cat "$@"
       expect(await t.pause!({ minutes: 5, needs_input: true, audience: ['user:nobody'] }))
         .toBe('error: no such route: user:nobody. Valid routes: user:ana, @team:ops, @creator');
       expect(await t.pause!({ minutes: 5, needs_input: true, audience: ['avatar:a1'] }))
-        .toBe('error: avatar:a1: ask an Avatar with escalate_to_human');
+        .toBe('error: avatar:a1: ask an Avatār with escalate_to_human');
       expect(await t.pause!({ minutes: 5, needs_input: true, message: '  ' })).toBe('error: message must not be empty');
       expect(ctx.waits).toEqual([]);
 

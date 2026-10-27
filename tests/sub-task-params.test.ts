@@ -121,7 +121,7 @@ it('PL-11: an invalid or unavailable agent, or a field a sub-task cannot set, is
       [{ 'agent:do': { provider: 'gemini' } }, /unknown agent provider "gemini"/],
       [{ 'agent:do': { provider: 'codex', effort: 'extreme' } }, /invalid reasoning effort "extreme"/],
       [{ 'agent:do': { provider: 'codex', model: 'o3' } }, /model o3 is not allowed by the organization/],
-      [{ 'agent:do': { avatarId: 'avatar_missing' } }, /the selected Avatar is not available in this project/],
+      [{ 'agent:do': { avatarId: 'avatar_missing' } }, /"avatarId" cannot be set on a sub-task/],
       [{ 'agent:do': { provider: 'codex', resumeFrom: { taskId: f.parent.id } } }, /"resumeFrom" cannot be set on a sub-task/],
       [{ 'agent:do': 'codex' }, /"agent:do" must be an agent spec/],
       [{ agent: { provider: 'codex' } }, /unknown field "agent"/],

@@ -68,7 +68,7 @@ import { SIG as WORKFLOW_SIG } from '../workflows/names.js';
 import { findFreePortFrom } from '../util/ports.js';
 import { expandPath } from '../util/expand.js';
 import { withTimeout } from '../util/timeout.js';
-import { AgentAuthority, AgentSpec, AuthorizationSelection, Avatar, Provider, Project, ProjectConfig, PrincipalRef, ProjectPrincipalRef, ResourceAttachment, ResourceRevision, ResourceTarget, WorldLocation, normalizeUrgency } from '../domain/types.js';
+import { AgentAuthority, AgentSpec, AuthorizationSelection, Provider, Project, ProjectConfig, PrincipalRef, ProjectPrincipalRef, ResourceAttachment, ResourceRevision, ResourceTarget, WorldLocation, normalizeUrgency } from '../domain/types.js';
 import { dotenvFile, dotenvSecretName, parseDotenv } from '../domain/dotenv.js';
 import { CLOUD_WORLD_PROVIDERS } from '../domain/computer.js';
 import { confirmLayersOf } from '../domain/confirm.js';
@@ -124,7 +124,7 @@ import { actorPrincipal, identityAuditDetail, requireHumanSubject,
   resolveCallerIdentity } from '../platform/identity.js';
 import { DEFAULT_EXPLANATION_SETTINGS, explanationProvider, knownProviderEndpoint, normalizeExplanationSettings,
   requestExplanation, type ExplanationSettings } from '../agent/explanation.js';
-import { avatarCallableBy, avatarEnabled } from '../platform/avatars.js';
+import { avatarCallableBy } from '../platform/avatars.js';
 import { AccountErasureService, ErasureError } from '../privacy/account-erasure.js';
 import { hostedOnboardingKey, hostedOnboardingStatus, parseHostedOnboardingRecord,
   parseHostedOnboardingDisplay } from './hosted-onboarding.js';
@@ -2874,6 +2874,11 @@ export class Gateway {
           const membership = (await store.acceptOrganizationInvitation(invitationToken, subject.userId, subjectEmail));
           (await this.deps.authorization?.replacePrincipalAuthorization('system:invitation', `user:${subject.userId}`,
             membership.organizationId, membership.authorization ?? legacyAuthorizationSelection(membership.profileId), ['*']));
+          // Someone who joins through an invitation came for that team: it becomes
+          // where they land, unless their own workspace already holds projects.
+          const home = (await store.defaultOrganization(subject.userId));
+          if (!home || (home.kind === 'personal' && !(await store.listOrganizationProjects(home.id)).length))
+            (await store.setDefaultOrganization(subject.userId, membership.organizationId));
           void this.deps.subscriptions?.syncSeats(membership.organizationId).catch((error) =>
             console.error('[subscription] seat sync failed:', error instanceof Error ? error.message : String(error)));
           return this.json(res, 200, membership);
@@ -3688,10 +3693,7 @@ export class Gateway {
           { unreadOnly: url.searchParams.get('unread') === '1', limit: Number(url.searchParams.get('limit') ?? 200) }));
         const headers = await store.taskHeaders(items.map((item) => item.taskId));
         return this.json(res, 200, (await __asyncCollections.map(items, async (item) => {
-          const avatar = item.subject?.kind === 'avatar-authorization'
-            ? (await store.getAvatar(item.subject.avatarId)) : undefined;
-          return { ...item, task: headers.get(item.taskId),
-            ...(avatar ? { resource: { kind: 'avatar', id: avatar.id, name: avatar.name, projectId: avatar.projectId } } : {}) };
+          return { ...item, task: headers.get(item.taskId) };
         })));
       }
       if (p === '/api/inbox' && method === 'PATCH') {
@@ -3964,16 +3966,14 @@ export class Gateway {
         }
       }
 
-      // Avatars are durable autonomous principals owned by one user. Their
-      // prompt/runtime/authority are edited together so a caller never observes
-      // a half-updated identity. Organization defaults and project overrides are separate
-      // policy and therefore do not rewrite the Avatar itself.
+      // Whether Avatars (tasks whose forks act with their authorization) may be
+      // called: on unless the organization or the project turns them off.
       const organizationAvatarSettings = p.match(/^\/api\/organizations\/([^/]+)\/avatar-settings$/);
       if (organizationAvatarSettings) {
         const organizationId = organizationAvatarSettings[1]!;
         if (!(await store.getOrganization(organizationId))) return this.json(res, 404, { error: 'organization not found' });
         if (method === 'GET') return this.json(res, 200, {
-          enabled: (await store.kvGet(`avatars:organization:${organizationId}`)) === 'enabled',
+          enabled: (await store.kvGet(`avatars:organization:${organizationId}`)) !== 'disabled',
         });
         if (method === 'PUT') {
           const b = await this.body(req);
@@ -4001,196 +4001,22 @@ export class Gateway {
           return this.json(res, 200, (await store.avatarAvailability(projectId)));
         }
       }
-      const avatarsMatch = p.match(/^\/api\/projects\/([^/]+)\/avatars(?:\/([^/]+))?$/);
-      if (avatarsMatch) {
+      // A project's Avatars: its tasks marked Avatar (src/platform/avatars.ts),
+      // each with whether the caller may call it. They are made and edited as tasks.
+      const avatarsMatch = p.match(/^\/api\/projects\/([^/]+)\/avatars$/);
+      if (avatarsMatch && method === 'GET') {
         const projectId = avatarsMatch[1]!;
-        const avatarId = avatarsMatch[2];
         const project = (await store.getProject(projectId));
         if (!project) return this.json(res, 404, { error: 'project not found' });
-        const organizationId = project.organizationId ?? 'org_personal';
-        const availability = (await store.avatarAvailability(projectId));
+        if (!(await this.deps.tokens.check(token, 'task:read', { projectId, organizationId: project.organizationId ?? 'org_personal' })).ok)
+          return this.json(res, 403, { error: 'you cannot see this project\'s tasks' });
         const subjectId = callerIdentity.humanSubject?.userId;
-        const canAdmin = (await this.deps.tokens.check(token, 'project:edit', { projectId, organizationId })).ok;
-        const view = async (avatar: Avatar) => ({
-          ...avatar,
-          effectiveEnabled: (await avatarEnabled(store, avatar)),
+        const avatars = await __asyncCollections.map((await store.listAvatars(projectId)), async (avatar) => ({
+          id: avatar.id, ...(avatar.num != null ? { num: avatar.num } : {}), name: avatar.name,
+          ownerUserId: avatar.ownerUserId, callableBy: avatar.callableBy, forksMayBeAvatars: avatar.forksMayBeAvatars,
           callable: Boolean(subjectId && (await avatarCallableBy(store, avatar, subjectId))),
-          canEdit: avatar.ownerUserId === subjectId,
-          canDisable: avatar.ownerUserId === subjectId || canAdmin,
-        });
-        if (method === 'GET') {
-          if (avatarId) {
-            const avatar = (await store.getAvatar(avatarId));
-            return avatar?.projectId === projectId
-              ? this.json(res, 200, (await view(avatar)))
-              : this.json(res, 404, { error: 'avatar not found' });
-          }
-          return this.json(res, 200, { availability, avatars: (await Promise.all((await store.listAvatars(projectId)).map(view))) });
-        }
-
-        const subject = requireHumanSubject(callerIdentity);
-        const existing = avatarId ? (await store.getAvatar(avatarId)) : undefined;
-        if (avatarId && !existing) return this.json(res, 404, { error: 'avatar not found' });
-        if (existing && existing.projectId !== projectId) return this.json(res, 404, { error: 'avatar not found' });
-        if (method === 'DELETE') {
-          if (existing!.ownerUserId !== subject.userId && !canAdmin)
-            return this.json(res, 403, { error: 'only the owner or a project administrator can remove this Avatar' });
-          const removed = (await store.deleteAvatar(existing!.id))!;
-          (await store.appendAudit({ principalId: `user:${subject.userId}`, action: 'avatar.removed',
-            scopeKey: `project:${projectId}`, detail: { avatarId: removed.id, ownerUserId: removed.ownerUserId } }));
-          return this.json(res, 200, { removed: true, id: removed.id });
-        }
-        if (method !== 'POST' && method !== 'PUT') return this.json(res, 405, { error: 'method not allowed' });
-        const b = await this.body(req);
-        if (existing && existing.ownerUserId !== subject.userId) {
-          // Administrators get a kill switch, never the ability to rewrite the
-          // owner's trusted prompt or delegation package.
-          if (!canAdmin || Object.keys(b).some((key) => key !== 'enabled'))
-            return this.json(res, 403, { error: 'only the Avatar owner can edit it; administrators may only enable or disable it' });
-          const updated = (await store.upsertAvatar({ ...existing, enabled: b.enabled !== false, updatedAt: Date.now() }));
-          (await store.appendAudit({ principalId: `user:${subject.userId}`, action: 'avatar.enabled.changed',
-            scopeKey: `project:${projectId}`, detail: { avatarId: updated.id, enabled: updated.enabled } }));
-          return this.json(res, 200, (await view(updated)));
-        }
-        if (!existing && !availability.effective)
-          return this.json(res, 409, { error: 'Avatars are disabled for this project' });
-
-        try {
-          const name = String(b.name ?? existing?.name ?? '').trim();
-          const purpose = String(b.purpose ?? existing?.purpose ?? '').trim();
-          const prompt = String(b.prompt ?? existing?.prompt ?? '').trim();
-          if (!name) throw new Error('name is required');
-          if ([...name].length > 80) throw new Error('name must be at most 80 characters');
-          if ([...purpose].length > 240) throw new Error('purpose must be at most 240 characters');
-          if (!prompt) throw new Error('instructions are required');
-          if ([...prompt].length > 100_000) throw new Error('instructions must be at most 100,000 characters');
-          if ((await store.listAvatars(projectId)).some((candidate) => candidate.id !== existing?.id
-            && candidate.name.toLowerCase() === name.toLowerCase())) throw new Error(`an Avatar named "${name}" already exists`);
-
-          const runtimeInput = b.runtime && typeof b.runtime === 'object' ? b.runtime : existing?.runtime;
-          const fallback = (await roleDefaultProfile(store, 'do', projectId));
-          const provider = String(runtimeInput?.provider ?? fallback?.provider ?? this.deps.agentInfo.provider) as Provider;
-          if (!isAgentProvider(provider)) throw new Error(`unknown agent provider "${provider}"`);
-          const runtime: Avatar['runtime'] = {
-            provider,
-            ...(runtimeInput?.model ? { model: String(runtimeInput.model) } : fallback?.model ? { model: fallback.model } : {}),
-            ...(runtimeInput?.effort ? { effort: String(runtimeInput.effort) as Avatar['runtime']['effort'] }
-              : fallback?.effort ? { effort: fallback.effort } : {}),
-          };
-          if (runtime.effort && !['low', 'medium', 'high', 'xhigh', 'max'].includes(runtime.effort))
-            throw new Error('invalid reasoning effort');
-
-          const callableInput: string[] = (Array.isArray(b.callableBy)
-            ? b.callableBy.map((value: unknown) => String(value))
-            : existing?.callableBy ?? [`user:${subject.userId}`]);
-          const callableBy = [...new Set(callableInput.map((value: string) => value.trim()).filter(Boolean))];
-          if (!callableBy.length) callableBy.push(`user:${subject.userId}`);
-          for (const selector of callableBy) {
-            if (selector === '@project') continue;
-            if (selector.startsWith('user:')) {
-              if (!(await store.organizationMembership(organizationId, selector.slice(5)))) throw new Error(`unknown organization user ${selector}`);
-              continue;
-            }
-            const team = selector.startsWith('@team:')
-              ? (await store.listTeams(organizationId, projectId)).find((candidate) => candidate.slug === selector.slice(6))
-              : selector.startsWith('team:') ? (await store.getTeam(selector.slice(5))) : undefined;
-            if (!team || team.organizationId !== organizationId) throw new Error(`unknown Avatar caller ${selector}`);
-          }
-          const roleInput: string[] = Array.isArray(b.roles)
-            ? b.roles.map((value: unknown) => String(value)) : existing?.roles ?? [];
-          const roles = [...new Set(roleInput.filter(Boolean))];
-          const { allRoles } = await import('../contrib/manifests.js');
-          const knownRoles = new Set([...allRoles().map((role) => role.name), 'authorize', 'respond']);
-          if (roles.some((role) => !knownRoles.has(role))) throw new Error(`unknown Avatar role ${roles.find((role) => !knownRoles.has(role))}`);
-
-          const ownerPrincipal = `user:${subject.userId}`;
-          const ownerCaps = (await this.deps.authorization?.capabilities(ownerPrincipal, projectId, organizationId))
-            ?? authRecord?.caps ?? [];
-          const authorityMode: Avatar['authorityMode'] = b.authorityMode === 'restricted' ? 'restricted'
-            : b.authorityMode === 'full' ? 'full' : existing?.authorityMode ?? 'full';
-          let authorization: Avatar['authorization'];
-          if (authorityMode === 'full') {
-            authorization = { level: 'full', profileId: 'full', scope: 'projects', projectIds: [projectId],
-              organizationId, capabilities: [...ownerCaps], principal: ownerPrincipal };
-          } else {
-            const selection = authorizationSelectionFromBody(b.authorization)
-              ?? (existing?.authorityMode === 'restricted' ? existing.authorization : { level: 'developer', scope: 'projects', projectIds: [projectId] });
-            const keepsApprovedSelection = existing?.authorityMode === 'restricted'
-              && existing.authorization.principal && existing.authorization.principal !== ownerPrincipal
-              && selection.level === existing.authorization.level
-              && selection.scope === existing.authorization.scope
-              && JSON.stringify(selection.projectIds ?? []) === JSON.stringify(existing.authorization.projectIds ?? []);
-            if (keepsApprovedSelection) authorization = { ...existing.authorization };
-            else {
-              const effective = (await this.deps.authorization?.taskGrant(ownerPrincipal, projectId, selection, ownerCaps))
-                ?? { ...selection, profileId: selection.level, capabilities: ownerCaps, attenuated: false };
-              if (effective.attenuated && b.limitAuthorization !== true)
-                throw await api.authorizationGap(token, projectId, selection, { kind: 'avatar', ...(existing ? { avatarId: existing.id } : {}) });
-              authorization = { ...effective, principal: ownerPrincipal };
-            }
-          }
-          const retainedCredentialIds = existing?.authorization.capabilities
-            .filter((capability) => capability.startsWith('use-credential:item:'))
-            .map((capability) => capability.slice('use-credential:item:'.length)) ?? [];
-          const credentialInput: string[] = Array.isArray(b.credentialIds)
-            ? b.credentialIds.map((value: unknown) => String(value)) : retainedCredentialIds;
-          const credentialIds = [...new Set(credentialInput.filter(Boolean))];
-          if (credentialIds.length) {
-            const vault = new VaultItems(store, this.deps.broker, undefined, organizationId);
-            for (const id of credentialIds) {
-              if (!(await vault.get(id))) throw new Error(`unknown vault credential ${id}`);
-              const capability = `use-credential:item:${id}`;
-              if (!allows(ownerCaps, capability)) throw new Error(`you cannot delegate vault credential ${id}`);
-              authorization.capabilities.push(capability);
-            }
-          }
-          authorization.capabilities = [...new Set(authorization.capabilities)];
-          // No caller may delegate beyond its grant, including when editing an
-          // Avatar previously authorized by someone else.
-          if (authorization.scope === 'organization'
-            && (authRecord.organizationId && authRecord.organizationId !== organizationId || authRecord.projectId || authRecord.projectIds?.length)
-            || authorization.scope === 'global'
-            && (authRecord.organizationId || authRecord.projectId || authRecord.projectIds?.length))
-            throw new AuthorizationGrantError('this token cannot delegate the selected scope');
-          for (const selectedProject of authorization.projectIds?.length ? authorization.projectIds : [projectId]) {
-            for (const capability of authorization.capabilities) {
-              if (!(await this.deps.tokens.check(token, capability, { projectId: selectedProject, organizationId })).ok)
-                throw new AuthorizationGrantError(`you cannot delegate ${capability} in project ${selectedProject}`);
-            }
-          }
-
-          const githubAccountId = b.githubAccountId === null ? undefined
-            : b.githubAccountId ? String(b.githubAccountId) : existing?.githubAccountId;
-          if (githubAccountId && authRecord.externalIdentities?.githubAccountId
-            && githubAccountId !== authRecord.externalIdentities.githubAccountId)
-            throw new AuthorizationGrantError('the selected GitHub account is outside this caller’s account scope');
-          if (githubAccountId && (await this.deps.githubApp?.activeUserAccountId(subject.userId)) !== githubAccountId)
-            throw new Error('the selected GitHub account is not your active connected account');
-
-          const now = Date.now();
-          const avatar: Avatar = {
-            id: existing?.id ?? newId('avatar'), organizationId, projectId,
-            ownerUserId: subject.userId, name, ...(purpose ? { purpose } : {}), prompt,
-            promptVersion: existing ? existing.promptVersion + (prompt === existing.prompt ? 0 : 1) : 1,
-            enabled: b.enabled === undefined ? existing?.enabled ?? true : b.enabled !== false,
-            authorityMode, authorization,
-            ...(b.credentialPolicies && typeof b.credentialPolicies === 'object'
-              ? { credentialPolicies: b.credentialPolicies } : existing?.credentialPolicies ? { credentialPolicies: existing.credentialPolicies } : {}),
-            ...(githubAccountId ? { githubAccountId } : {}), callableBy, roles, runtime,
-            createdAt: existing?.createdAt ?? now, updatedAt: now,
-          };
-          (await store.upsertAvatar(avatar));
-          (await store.appendAudit({ principalId: ownerPrincipal, action: existing ? 'avatar.updated' : 'avatar.created',
-            scopeKey: `project:${projectId}`, detail: { avatarId: avatar.id, promptVersion: avatar.promptVersion,
-              authorityMode, roles, callableBy, capabilities: authorization.capabilities } }));
-          return this.json(res, existing ? 200 : 201, (await view(avatar)));
-        } catch (error) {
-          return this.json(res, Number((error as any)?.status ?? 400), {
-            error: error instanceof Error ? error.message : String(error),
-            ...((error as any)?.code ? { code: (error as any).code } : {}),
-            ...(error instanceof AuthorizationGrantError ? error.gap : {}),
-          });
-        }
+        }));
+        return this.json(res, 200, { availability: (await store.avatarAvailability(projectId)), avatars });
       }
 
       // projects
@@ -5586,19 +5412,28 @@ export class Gateway {
           await api.setTaskPaymentPolicy(token, task.id, body);
           if (this.deps.paymentRegistry || this.deps.payments) {
             const service = new BudgetService(store, this.deps.paymentRegistry ?? this.deps.payments!);
-            const results = await service.reconcileTask({ projectId: task.projectId, taskId: task.id });
-            released = results.filter(r => r.status === 'granted').map(r => r.requestId!);
-            if (released.length) await api.signalTask(token, task.id, 'followUp',
-              `Payment requests ${released.join(', ')} now fit the task budget and are ready. Continue using the same requests.`).catch(() => undefined);
+            // The budget may be a pool (an Avatār's, shared by its forks): what
+            // now fits anywhere in it is released, each task told of its own.
+            const family = (await store.paymentBudgetFamily(task.id)).taskIds;
+            for (const memberId of [task.id, ...family.filter((id) => id !== task.id)]) {
+              const member = memberId === task.id ? task : (await store.getTask(memberId));
+              if (!member) continue;
+              const results = await service.reconcileTask({ projectId: member.projectId, taskId: member.id });
+              const granted = results.filter(r => r.status === 'granted').map(r => r.requestId!);
+              if (member.id === task.id) released = granted;
+              if (granted.length) await api.signalTask(token, member.id, 'followUp',
+                `Payment requests ${granted.join(', ')} now fit the task budget and are ready. Continue using the same requests.`).catch(() => undefined);
+            }
           }
         }
         const policy = (await resolvePaymentPolicy(store, task.projectId, task.id));
         const cards = (await store.listCards(task.projectId)).filter(card => policy.cardIds.includes(card.id))
           .map(({ id, label, last4, status, currency }) => ({ id, label, last4, status, currency }));
         return this.json(res, 200, { ...policy, cards,
-          canEdit: !['done', 'cancelled', 'failed'].includes(task.lastView?.status ?? '')
+          canEdit: (!!task.params?.avatar || !['done', 'cancelled', 'failed'].includes(task.lastView?.status ?? ''))
             && (await this.deps.tokens.check(token, 'payment:write', { projectId: task.projectId })).ok,
-          spent: (await store.paymentSpent(task.id, false, policy.currency)), released });
+          // An Avatār's budget is shared by its forks: what all of them spent.
+          spent: (await store.paymentSpent(task.id, !!task.params?.avatar, policy.currency)), released });
       }
       const deliverData = p.match(/^\/api\/tasks\/([^/]+)\/deliver-data$/);
       if (deliverData && method === 'POST') {
@@ -6111,7 +5946,6 @@ export class Gateway {
               organizationId,
               status: (url.searchParams.get('status') || undefined) as any,
               taskId: url.searchParams.get('taskId') || undefined,
-              avatarId: url.searchParams.get('avatarId') || undefined,
             })));
           } catch (error) {
             return this.json(res, Number((error as any)?.status ?? 400), { error: error instanceof Error ? error.message : String(error) });

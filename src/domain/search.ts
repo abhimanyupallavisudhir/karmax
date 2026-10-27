@@ -114,12 +114,17 @@ const isArmed = (t: SearchTask): boolean =>
 /** Asked to run, held until someone approves the authorization its creator could not grant. */
 export const awaitingApproval = (t: { params?: Record<string, unknown> }): boolean =>
   !!t.params?.draft && !!t.params?._awaitingApproval;
-const status = (t: SearchTask) => t.lastView?.status ?? (awaitingApproval(t) ? 'waiting' : isArmed(t) ? 'armed' : 'active');
+/** Saved as an Avatar without running (wiki features/avatars): it rests in the
+ * Avatar stage, finished as far as lists go, and stays editable like a draft. */
+export const restingAvatar = (t: { params?: Record<string, unknown>; lastView?: unknown }): boolean =>
+  !!t.params?.avatar && !!t.params?.draft && !t.lastView;
+const status = (t: SearchTask) => t.lastView?.status
+  ?? (restingAvatar(t) ? 'done' : awaitingApproval(t) ? 'waiting' : isArmed(t) ? 'armed' : 'active');
 /** The armed-aware status of a task (exported so compact projections agree with search). */
 export function taskStatus(t: SearchTask): string {
   return status(t);
 }
-const stage = (t: SearchTask) => t.lastView?.stage ?? 'setup';
+const stage = (t: SearchTask) => t.lastView?.stage ?? (restingAvatar(t) ? 'avatar' : 'setup');
 const lc = (s: unknown) => String(s ?? '').toLowerCase();
 
 const STATUS_OPTIONS: FieldOption[] = [
@@ -131,7 +136,7 @@ const STATUS_OPTIONS: FieldOption[] = [
   { value: 'failed', label: 'Failed' },
   { value: 'cancelled', label: 'Cancelled' },
 ];
-const STAGE_OPTIONS: FieldOption[] = ['setup', 'do', 'review', 'pr', 'merge', 'done', ...(RESOLVE_AGENT_ENABLED ? ['resolve'] : []), 'escalated', 'cancelled', 'failed'].map((s) => ({ value: s, label: s[0]!.toUpperCase() + s.slice(1) }));
+const STAGE_OPTIONS: FieldOption[] = ['setup', 'do', 'review', 'pr', 'merge', 'done', ...(RESOLVE_AGENT_ENABLED ? ['resolve'] : []), 'escalated', 'cancelled', 'failed', 'avatar'].map((s) => ({ value: s, label: s[0]!.toUpperCase() + s.slice(1) }));
 const PRIORITY_OPTIONS: FieldOption[] = PRIORITIES.map((p, i) => ({ value: String(i), label: p[0]!.toUpperCase() + p.slice(1) }));
 
 /**
@@ -140,6 +145,7 @@ const PRIORITY_OPTIONS: FieldOption[] = PRIORITIES.map((p, i) => ({ value: Strin
  */
 export const FACET_OPTIONS: FieldOption[] = [
   { value: 'draft', label: 'Draft' },
+  { value: 'avatar', label: 'Avatār (forks act with its authorization)' },
   { value: 'awaiting-approval', label: 'Waiting for approval' },
   { value: 'archived', label: 'Archived' },
   { value: 'active', label: 'Running' },
@@ -171,7 +177,8 @@ function facetsOf(t: SearchTask, ctx?: FieldContext): string[] {
   const f: string[] = [];
   const st = status(t);
   if (awaitingApproval(t)) f.push('awaiting-approval');
-  else if (t.params?.draft) f.push('draft');
+  else if (t.params?.draft && !restingAvatar(t)) f.push('draft');
+  if (t.params?.avatar) f.push('avatar');
   if (t.params?.archived) f.push('archived');
   f.push(st);
   if (!['done', 'failed', 'cancelled'].includes(st)) f.push('open');
@@ -276,7 +283,7 @@ function personFor(value: string, ctx?: EvalContext): string | undefined {
   return ctx?.people?.get(v.toLowerCase());
 }
 const ownDraft = (t: SearchTask, userId: string): boolean =>
-  !!t.params?.draft && !awaitingApproval(t) && t.createdBy?.kind === 'user' && t.createdBy.userId === userId;
+  !!t.params?.draft && !awaitingApproval(t) && !restingAvatar(t) && t.createdBy?.kind === 'user' && t.createdBy.userId === userId;
 /** Why `t` needs `userId`: the kinds of the live asks routed to them (matched on
  *  the attempt or its logical task), plus `draft` for their own draft. */
 function attentionReasons(t: SearchTask, userId: string, ctx?: EvalContext): string[] {

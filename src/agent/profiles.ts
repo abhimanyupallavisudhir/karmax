@@ -146,7 +146,7 @@ export async function seedProfiles(store: Store, provider: Provider) {
   (await repairMockProfiles(store, provider));
 }
 
-/** Move every stored profile and Avatar that names the mock agent onto the
+/** Move every stored profile that names the mock agent onto the
  * installation's default agent, unless the mock is enabled here. An earlier
  * release seeded the mock as every role's default on a host that had no agent
  * credential at first boot (tavya.io), and every organization without defaults
@@ -161,14 +161,6 @@ export async function repairMockProfiles(store: Store, provider: Provider): Prom
     const { model: _model, ...rest } = profile;
     (await store.upsertProfile({ ...rest, provider, ...(model ? { model } : {}) }));
     changed++;
-  }
-  for (const avatar of await store.listAvatars()) {
-    if (avatar.runtime.provider !== 'mock') continue;
-    const { model: _model, ...runtime } = avatar.runtime;
-    try {
-      (await store.upsertAvatar({ ...avatar, runtime: { ...runtime, provider, ...(model ? { model } : {}) } }));
-      changed++;
-    } catch { /* its owner's account is closed: it can no longer run */ }
   }
   if (changed) console.warn(`  • Moved ${changed} agent profile(s) off the mock agent onto ${provider}${model ? `:${model}` : ''}`);
   return changed;

@@ -82,13 +82,13 @@ const notice = (id, extra) => ({ id, kind: 'approval-requested', unread: true, a
 S.inbox = [
   item('1', 'review-requested', true),
   notice('cred', { subject: { kind: 'credential', provider: 'claude', account: 'ops', reason: 'signed-out' } }),
-  notice('avatar', { urgency: 'critical', subject: { kind: 'avatar-authorization', projectId: 'project_1' }, resource: { name: 'Design <helper>', projectId: 'project_1' } }),
+  notice('avatar', { urgency: 'critical', subject: { kind: 'credential', provider: 'claude', account: 'Design <helper>', reason: 'signed-out', projectId: 'project_1' } }),
   notice('old', { actionable: false, subject: { kind: 'credential', provider: 'x', account: 'y', reason: 'signed-out' } }),
 ];
 ok(inboxNotices().map((x) => x.id).join(',') === 'avatar,cred', `only live asks without a task, urgency first (got ${inboxNotices().map((x) => x.id)})`);
 const html = inboxNoticesHtml();
 ok(/class="task-row inbox-row unread" data-inbox="avatar" tabindex="0"/.test(html), 'a notice is a focusable task row');
-ok(html.includes('Avatar authorization approval') && html.includes('Design &lt;helper&gt;'), 'it says what is asked, escaped');
+ok(html.includes('Design &lt;helper&gt;') && !html.includes('Design <helper>'), 'it says what is asked, escaped');
 ok(html.includes('<span class="task-project-org">acme/</span>karmax-tools'), 'it names organization and project as a slug');
 ok(/<span class="task-project" title="Acme &amp; Co"><span class="task-project-org">acme<\/span><\/span>/.test(html), 'an organization-wide ask names just its organization');
 ok(html.indexOf('data-inbox="avatar"') < html.indexOf('data-inbox="cred"'), 'the critical notice comes first');

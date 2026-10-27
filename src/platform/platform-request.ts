@@ -25,7 +25,7 @@ export const CREATE_TASK_GRANTS = 'Grant it what it needs: `authorization` {leve
   + 'A `draft` is only held: ask with request_permission and its task id when it should run.';
 
 /** Whom request_permission asks (KarmaxApi.permissionGrantors), shared by both tool surfaces. */
-export const PERMISSION_ROUTING = 'Audience selectors: task:<id>, avatar:<id>, user:<id>, @team:<slug>, @creator, @maintainers, @admins, @superadmins, @owners, @project, or @all. '
+export const PERMISSION_ROUTING = 'Audience selectors: task:<id>, avatar:<task id>, user:<id>, @team:<slug>, @creator, @maintainers, @admins, @superadmins, @owners, @project, or @all. '
   + 'Omit audience to ask the nearest who can grant it: a task you act for that holds it (your parent, or the task whose agent created yours; its agent decides), '
   + 'else the lowest of @maintainers, @admins and @superadmins that can. platform_request(GET, "/api/agent/escalation-targets?capabilities=<a,b>") lists '
   + 'everyone who can, nearest first; the result names them too (canGrant). A sub-task already holds everything its parent does. ';

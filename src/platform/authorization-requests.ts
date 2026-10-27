@@ -4,10 +4,9 @@ import { newId } from '../util/id.js';
 import type { Capability } from './capabilities.js';
 
 export type AuthorizationRequestTarget =
-  | { kind: 'task'; taskId: string; /** One of the task's agents other than the
+  { kind: 'task'; taskId: string; /** One of the task's agents other than the
        * main one (`responder`, `confirm-2`, `agent-3`); absent ⇒ the task's own. */
-      participant?: string; queueAfterApproval?: boolean }
-  | { kind: 'avatar'; avatarId: string; enableAfterApproval?: boolean };
+      participant?: string; queueAfterApproval?: boolean };
 
 export interface AuthorizationRequest {
   id: string;
@@ -38,7 +37,7 @@ const key = (organizationId: string) => `authorization:requests:${organizationId
 
 /** Durable approval requests for delegating a job-shaped authorization package.
  * Unlike agent permission requests these never elevate the requester: approval
- * is applied directly to the named task or Avatar. */
+ * is applied directly to the named task. */
 export class AuthorizationRequests {
   constructor(private store: Pick<Store, 'transaction' | 'kvGet' | 'kvSet' | 'appendAudit'> & Partial<Pick<Store, 'lock'>>,
     private organizationId: string) {}
@@ -46,15 +45,14 @@ export class AuthorizationRequests {
   /** The organization's requests are one kv value, rewritten under its lock. */
   private async locked(): Promise<void> { await this.store.lock?.(`kv:${key(this.organizationId)}`); }
 
-  async requests(filter: { status?: AuthorizationRequest['status']; taskId?: string; avatarId?: string } = {}): Promise<AuthorizationRequest[]> {
+  async requests(filter: { status?: AuthorizationRequest['status']; taskId?: string } = {}): Promise<AuthorizationRequest[]> {
     let all: AuthorizationRequest[] = [];
     try {
       const raw = (await this.store.kvGet(key(this.organizationId)));
       all = raw ? JSON.parse(raw) : [];
     } catch { all = []; }
     return all.filter((request) => (!filter.status || request.status === filter.status)
-      && (!filter.taskId || request.target.kind === 'task' && request.target.taskId === filter.taskId)
-      && (!filter.avatarId || request.target.kind === 'avatar' && request.target.avatarId === filter.avatarId));
+      && (!filter.taskId || request.target.taskId === filter.taskId));
   }
 
   async request(input: Omit<AuthorizationRequest, 'id' | 'type' | 'organizationId' | 'status' | 'createdAt' | 'claim'>): Promise<AuthorizationRequest> {
@@ -66,8 +64,7 @@ export class AuthorizationRequests {
     if (!audience.length || (!recipients.length && !avatarRecipients.length))
       throw new Error('choose at least one eligible person, team, or Avatar');
     const all = (await this.requests());
-    const keyOf = (target: AuthorizationRequestTarget) => target.kind === 'task'
-      ? `task:${target.taskId}${target.participant ? `#${target.participant}` : ''}` : `avatar:${target.avatarId}`;
+    const keyOf = (target: AuthorizationRequestTarget) => `task:${target.taskId}${target.participant ? `#${target.participant}` : ''}`;
     const existing = all.find((request) => request.status === 'pending' && keyOf(request.target) === keyOf(input.target));
     if (existing) return existing;
     const request: AuthorizationRequest = {
