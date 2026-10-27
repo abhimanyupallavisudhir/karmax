@@ -1,9 +1,9 @@
-import type { TaskRecord } from '../domain/types.js';
+import type { AgentSpec, TaskRecord } from '../domain/types.js';
 import type { Store } from '../store/db.js';
 import { VaultItems } from '../autonomy/vault-items.js';
 import { allows, attenuate, CHILD_TASK_CEILING, type Capability } from './capabilities.js';
 import { PermissionRequests } from './permission-requests.js';
-import { avatarAuthorizationCapabilities } from './avatars.js';
+import { authorizingAvatar, avatarAuthorizationCapabilities, avatarForRole } from './avatars.js';
 import type { AuthorizationService } from './authorization.js';
 import type { TokenAuthority } from './tokens.js';
 import { delegatedFromParent } from './delegation.js';
@@ -57,16 +57,17 @@ export async function taskAuthorityNow(store: Store, authorization: Authorizatio
     { ...options, seen: new Set([...options.seen ?? [], task.id]) });
   const organizationId = (await store.getProject(task.projectId))?.organizationId ?? 'org_personal';
   const authorizer = (task.params?._authorization as StoredAuthorization | undefined)?.principal;
-  const runsAs = (task.params?.['agent:do'] as { avatarId?: string } | undefined)?.avatarId;
-  const avatarId = runsAs ?? (authorizer?.startsWith('avatar:') ? authorizer.slice(7) : undefined);
+  const runsAs = (await avatarForRole(store, { taskId: task.id, projectId: task.projectId,
+    agents: { do: task.params?.['agent:do'] as Partial<AgentSpec> | undefined } }, 'do'));
+  const backed = !runsAs && authorizer?.startsWith('avatar:');
   let capabilities = [...new Set([
     ...base.capabilities,
     ...await new PermissionRequests(store, organizationId).extensionCaps(task.id, 'do'),
     // An Avatar's turn uses its own vault authority, never the task's approvals.
     ...(runsAs ? [] : await new VaultItems(store, undefined, undefined, organizationId).extensionCaps(task.id)),
   ])];
-  if (avatarId) {
-    const avatar = await store.getAvatar(avatarId);
+  if (runsAs || backed) {
+    const avatar = runsAs ?? await authorizingAvatar(store, task, authorizer);
     capabilities = attenuate(capabilities, avatar ? await avatarAuthorizationCapabilities(store, authorization, avatar, task.projectId) : []);
   }
   return { ...base, capabilities };

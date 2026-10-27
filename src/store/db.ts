@@ -98,6 +98,7 @@ import { EVENT_RETENTION_MS as PROJECT_EVENT_RETENTION_MS, type EventFollow, typ
 import { paymentMerchantMatches } from '../util/payment-merchant.js';
 import { previewHostname } from '../gateway/previews.js';
 import { SETTLES_REQUESTS, settleTaskRequests, tasksWithOpenRequests } from '../platform/settled-requests.js';
+import { avatarOfTask } from '../platform/avatars.js';
 import { withPullRequestStates } from '../integrations/github-pr.js';
 import { lifecycleEventPayload } from '../domain/view-publication.js';
 import { listState } from '../domain/list-state.js';
@@ -981,13 +982,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS profiles (
         id TEXT PRIMARY KEY, json TEXT NOT NULL
       );
-      CREATE TABLE IF NOT EXISTS avatars (
-        id TEXT PRIMARY KEY, organizationId TEXT NOT NULL, projectId TEXT NOT NULL,
-        ownerUserId TEXT NOT NULL, json TEXT NOT NULL, createdAt INTEGER NOT NULL,
-        updatedAt INTEGER NOT NULL, deletedAt INTEGER
-      );
-      CREATE INDEX IF NOT EXISTS idx_avatars_project ON avatars(projectId, deletedAt);
-      CREATE INDEX IF NOT EXISTS idx_avatars_owner ON avatars(ownerUserId, deletedAt);
+      DROP TABLE IF EXISTS avatars;
       CREATE TABLE IF NOT EXISTS events (
         seq INTEGER PRIMARY KEY AUTOINCREMENT, taskId TEXT NOT NULL,
         type TEXT NOT NULL, ts INTEGER NOT NULL, payload TEXT NOT NULL, origin TEXT
@@ -2048,8 +2043,6 @@ export class Store {
     const intentIds = tasks.map((row) => String(row.intentId)).filter(Boolean);
     const executionIds = ((await this.db.prepare('SELECT id FROM executions WHERE projectId=?').all(id)) as any[])
       .map((row) => String(row.id));
-    const avatarIds = ((await this.db.prepare('SELECT id FROM avatars WHERE projectId=?').all(id)) as any[])
-      .map((row) => String(row.id));
     const authorizationInboxIds = ((await this.db.prepare("SELECT id FROM inbox WHERE json_extract(subject, '$.projectId')=?").all(id)) as any[])
       .map((row) => String(row.id));
     const inboxIds = [...(await rowsFor(this.db, 'inbox', 'taskId', taskIds)).map((row) => String(row.id)), ...authorizationInboxIds];
@@ -2072,7 +2065,6 @@ export class Store {
       (await deleteRows(this.db, 'collaboration_requests', 'requesterTaskId', taskIds));
       (await deleteRows(this.db, 'collaboration_requests', 'targetTaskId', taskIds));
       (await deleteRows(this.db, 'events', 'taskId', taskIds));
-      (await deleteRows(this.db, 'events', 'taskId', avatarIds.map((avatarId) => `avatar:${avatarId}`)));
       (await deleteRows(this.db, 'world_instances', 'worldId', taskIds));
       (await deleteRows(this.db, 'task_intents', 'id', intentIds));
       (await this.db.prepare('DELETE FROM inbox WHERE taskId IN (SELECT id FROM tasks WHERE projectId=?)').run(id));
@@ -2103,9 +2095,7 @@ export class Store {
       (await deleteRows(this.db, 'resource_revisions', 'attachmentId', resourceIds));
       (await this.db.prepare('DELETE FROM resource_candidates WHERE projectId=?').run(id));
       (await this.db.prepare('DELETE FROM resource_attachments WHERE projectId=?').run(id));
-      (await this.db.prepare('DELETE FROM avatars WHERE projectId=?').run(id));
       (await this.deletePermissionRequestKv(project.organizationId, taskIds));
-      (await this.deleteAuthorizationRequestKv(project.organizationId, { kind: 'avatar', ids: avatarIds }));
       (await this.deleteProjectKv([id], taskIds));
       for (const table of ['project_memberships', 'project_repositories', 'project_wikis', 'task_lists', 'tags', 'saved_views', 'task_templates', 'world_checkpoints'] as const)
         (await this.db.prepare(`DELETE FROM ${table} WHERE projectId=?`).run(id));
@@ -2591,7 +2581,6 @@ export class Store {
       team_aliases: (await rowsFor(this.db, 'team_aliases', 'teamId', teamIds)),
       organization_aliases: (await selectRows(this.db, 'organization_aliases', 'organizationId=?', [organizationId])),
       projects: (await rowsFor(this.db, 'projects', 'id', projectIds)),
-      avatars: (await rowsFor(this.db, 'avatars', 'projectId', projectIds)),
       resource_attachments: (await rowsFor(this.db, 'resource_attachments', 'projectId', projectIds))
         .map(({ credentialHandles: _handles, ...row }) => ({ ...row, credentialHandles: '[]' })),
       resource_revisions: (await rowsFor(this.db, 'resource_revisions', 'attachmentId',
@@ -2710,7 +2699,6 @@ export class Store {
     const wikiEdits = (await selectRows(this.db, 'organization_wiki_versions', 'principal IN (?,?)', [userId, principalId]));
     const previewLeases = (await selectRows(this.db, 'preview_leases', 'createdBy IN (?,?)', [userId, principalId]))
       .map(({ tokenHash: _tokenHash, ...row }) => row);
-    const ownedAvatars = (await selectRows(this.db, 'avatars', 'ownerUserId=?', [userId]));
     const spendRequests = (await selectRows(this.db, 'payment_spend_requests', 'resolvedBy IN (?,?)', [userId, principalId]));
     const subscribedTaskIds = (await selectRows(this.db, 'task_subscribers', 'principalKey=?', [principalId]))
       .map((row) => String(row.taskId));
@@ -2730,7 +2718,6 @@ export class Store {
     const projectIds = [...new Set([
       ...tasks.map((task) => task.projectId),
       ...projectMemberships.map((row) => String(row.projectId)),
-      ...ownedAvatars.map((row) => String(row.projectId)),
     ])];
     const projects = (await rowsFor(this.db, 'projects', 'id', projectIds));
     const projectById = new Map(projects.map((project) => [String(project.id), rowToProject(project)]));
@@ -2743,7 +2730,6 @@ export class Store {
       ...wikiEdits.map((row) => String(row.organizationId)),
       ...previewLeases.map((row) => String(row.organizationId)),
       ...spendRequests.map((row) => String(row.organizationId)),
-      ...ownedAvatars.map((row) => String(row.organizationId)),
     ])];
     const organizations = (await __asyncCollections.map(organizationIds, async (organizationId) => {
       const organization = (await this.getOrganization(organizationId));
@@ -2773,7 +2759,6 @@ export class Store {
             joinedAt: membership.joinedAt,
           } }];
         }),
-        avatars: ownedAvatars.filter((avatar) => avatar.organizationId === organizationId),
         tasks: (await __asyncCollections.map(tasks.filter((task) => organizationProjectIds.has(task.projectId))
           .sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id)), async (task) => ({
             project: projectById.get(task.projectId),
@@ -2882,7 +2867,6 @@ export class Store {
     const teamIds = ((await this.db.prepare('SELECT id FROM teams WHERE organizationId=?').all(organizationId)) as any[]).map((r) => String(r.id));
     const repositoryIds = ((await this.db.prepare('SELECT id FROM repositories WHERE organizationId=?').all(organizationId)) as any[]).map((r) => String(r.id));
     const executionIds = ((await this.db.prepare('SELECT id FROM executions WHERE organizationId=?').all(organizationId)) as any[]).map((r) => String(r.id));
-    const avatarIds = ((await this.db.prepare('SELECT id FROM avatars WHERE organizationId=?').all(organizationId)) as any[]).map((r) => String(r.id));
     const inboxIds = ((await this.db.prepare('SELECT id FROM inbox WHERE organizationId=?').all(organizationId)) as any[]).map((r) => String(r.id));
     const scopeKeys = [`organization:${organizationId}`, ...projectIds.map((id) => `project:${id}`)];
     const projectSettingKeys = [
@@ -2907,7 +2891,6 @@ export class Store {
       (await deleteRows(this.db, 'collaboration_requests', 'requesterTaskId', taskIds));
       (await deleteRows(this.db, 'collaboration_requests', 'targetTaskId', taskIds));
       (await deleteRows(this.db, 'events', 'taskId', taskIds));
-      (await deleteRows(this.db, 'events', 'taskId', avatarIds.map((avatarId) => `avatar:${avatarId}`)));
       (await deleteRows(this.db, 'world_instances', 'worldId', taskIds));
       (await deleteRows(this.db, 'task_intents', 'id', intentIds));
       (await deleteRows(this.db, 'settings', 'scopeKey', projectSettingKeys));
@@ -2956,7 +2939,6 @@ export class Store {
       (await this.db.prepare('DELETE FROM delivery_preferences WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM inbox WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM organization_identity_policy WHERE organizationId=?').run(organizationId));
-      (await this.db.prepare('DELETE FROM avatars WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM organization_invitations WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM organization_memberships WHERE organizationId=?').run(organizationId));
       (await this.db.prepare('DELETE FROM organization_wiki_versions WHERE organizationId=?').run(organizationId));
@@ -5344,46 +5326,6 @@ export class Store {
     });
   }
 
-  /** Deliver a resource-backed approval ask through the same inbox/outbox as
-   * task events. The synthetic task key is namespaced and the structured subject
-   * gives clients the real destination. */
-  async addAuthorizationInbox(
-    organizationId: string,
-    userIds: string[],
-    subject: Extract<NonNullable<InboxItem['subject']>, { kind: 'avatar-authorization' }>,
-    createdAt = Date.now(),
-  ): Promise<void> {
-    return this.db.transaction(async () => {
-
-    // Synthetic inbox events use negative, transaction-allocated sequence
-    // numbers; real event sequences are positive. Hashing request ids can
-    // collide for different simultaneous asks to the same user.
-    const eventSeq = Number(await this.kvGetForUpdate('inbox:next-synthetic-seq') ?? '0') - 1;
-    await this.kvSet('inbox:next-synthetic-seq', String(eventSeq));
-    for (const userId of new Set(userIds)) {
-      (await this.deleteInbox("userId=? AND taskId=? AND kind='approval-requested'", [userId, `avatar:${subject.avatarId}`]));
-      const item: InboxItem = {
-        id: newId('inbox'), organizationId, userId, eventSeq,
-        taskId: `avatar:${subject.avatarId}`, kind: 'approval-requested', urgency: 'high',
-        unread: true, actionable: true, createdAt, subject,
-      };
-      const inserted = (await this.db.prepare(`INSERT OR IGNORE INTO inbox
-        (id, organizationId, userId, eventSeq, taskId, kind, urgency, unread, actionable, createdAt, subject)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?)`).run(
-        item.id, organizationId, userId, eventSeq, item.taskId, item.kind,
-        urgencyRank(item.urgency), createdAt, JSON.stringify(subject)));
-      if (!Number(inserted.changes)) continue;
-      const preferences = (await this.getDeliveryPreferences(userId, organizationId));
-      const channels = [preferences.browser && 'browser', (preferences.emailUrgencies?.[item.urgency] ?? preferences.email) && 'email', preferences.slack && 'slack']
-        .filter(Boolean) as string[];
-      for (const channel of channels) (await this.db.prepare(`INSERT OR IGNORE INTO delivery_outbox
-        (id, inboxId, channel, state, attempts, nextAt, createdAt) VALUES (?, ?, ?, 'pending', 0, ?, ?)`)
-        .run(newId('delivery'), item.id, channel, createdAt, createdAt));
-    }
-  
-    });
-  }
-
   /** Reconcile an organization's credential notices: each owner gets one critical,
    * actionable item per notice (a repeat sweep never re-notifies), and notices that
    * no longer apply — the login was renewed or removed — are withdrawn. */
@@ -5536,10 +5478,6 @@ export class Store {
     });
   }
 
-  async removeAuthorizationInbox(requestId: string): Promise<void> {
-    (await this.deleteInbox("kind='approval-requested' AND json_extract(subject, '$.requestId')=?", [requestId]));
-  }
-
   async getDeliveryPreferences(userId: string, organizationId: string): Promise<DeliveryPreferences> {
     const r = (await this.db.prepare('SELECT json FROM delivery_preferences WHERE userId=? AND organizationId=?').get(userId, organizationId)) as any;
     return r ? JSON.parse(r.json) : { userId, organizationId, browser: true, email: false, slack: false, routine: true };
@@ -5570,7 +5508,10 @@ export class Store {
     while (task && !visited.has(task.id)) {
       visited.add(task.id);
       if (task.createdBy?.kind === 'user') return task.createdBy.userId;
-      if (task.createdBy?.kind === 'avatar') return (await this.getAvatar(task.createdBy.avatarId))?.ownerUserId;
+      if (task.createdBy?.kind === 'avatar') {
+        task = (await this.getTaskShallow(task.createdBy.avatarId));
+        continue;
+      }
       if (task.createdBy?.kind !== 'task-agent') return undefined;
       task = (await this.getTaskShallow(task.createdBy.taskId));
     }
@@ -6317,59 +6258,29 @@ export class Store {
     });
   }
 
-  // ─── Avatars ───
+  // ─── Avatars: tasks marked Avatar (src/platform/avatars.ts) ───
 
-  async upsertAvatar(avatar: Avatar): Promise<Avatar> {
-    return this.db.transaction(async () => {
-
-    // Account closure deletes avatars under the same lock.
-    (await this.db.lock(`account:${avatar.ownerUserId}`));
-    if (await this.kvGet(`account-closed:${avatar.ownerUserId}`)) throw new Error('account is closed');
-    (await this.db.prepare(`INSERT INTO avatars
-      (id, organizationId, projectId, ownerUserId, json, createdAt, updatedAt, deletedAt)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET organizationId=excluded.organizationId,
-      projectId=excluded.projectId, ownerUserId=excluded.ownerUserId,
-      json=excluded.json, updatedAt=excluded.updatedAt, deletedAt=excluded.deletedAt`)
-      .run(avatar.id, avatar.organizationId, avatar.projectId, avatar.ownerUserId,
-        JSON.stringify(avatar), avatar.createdAt, avatar.updatedAt, avatar.deletedAt ?? null));
-    return avatar;
-  
-    });
+  async getAvatar(id: string): Promise<Avatar | undefined> {
+    const task = (await this.getTask(id));
+    return task ? avatarOfTask(this, task) : undefined;
   }
 
-  async getAvatar(id: string, includeDeleted = false): Promise<Avatar | undefined> {
-    const row = (await this.db.prepare(`SELECT json FROM avatars WHERE id=?${includeDeleted ? '' : ' AND deletedAt IS NULL'}`).get(id)) as any;
-    return row ? JSON.parse(row.json) as Avatar : undefined;
-  }
-
-  async listAvatars(projectId?: string, includeDeleted = false): Promise<Avatar[]> {
-    const where = [projectId ? 'projectId=?' : '', includeDeleted ? '' : 'deletedAt IS NULL'].filter(Boolean).join(' AND ');
-    const rows = (await this.db.prepare(`SELECT json FROM avatars${where ? ` WHERE ${where}` : ''} ORDER BY createdAt`)
-      .all(...(projectId ? [projectId] : []))) as any[];
-    return rows.map((row) => JSON.parse(row.json) as Avatar)
-      .sort((left, right) => left.name.localeCompare(right.name) || left.createdAt - right.createdAt);
-  }
-
-  async deleteAvatar(id: string, at = Date.now()): Promise<Avatar | undefined> {
-    return this.db.transaction(async () => {
-
-    const avatar = (await this.getAvatar(id));
-    if (!avatar) return undefined;
-    const removed = { ...avatar, enabled: false, deletedAt: at, updatedAt: at };
-    (await this.upsertAvatar(removed));
-    (await this.deleteAuthorizationRequestKv(avatar.organizationId, { kind: 'avatar', ids: [id] }));
-    (await this.deleteInbox("json_extract(subject, '$.avatarId')=?", [id]));
-    return removed;
-  
-    });
+  async listAvatars(projectId: string): Promise<Avatar[]> {
+    const rows = (await this.db.prepare(`SELECT id FROM tasks WHERE projectId=? AND json_extract(params, '$.avatar') IS NOT NULL
+      ORDER BY createdAt`).all(projectId)) as Array<{ id: string }>;
+    const avatars: Avatar[] = [];
+    for (const row of rows) {
+      const avatar = (await this.getAvatar(row.id));
+      if (avatar) avatars.push(avatar);
+    }
+    return avatars.sort((left, right) => left.name.localeCompare(right.name));
   }
 
   async avatarAvailability(projectId: string): Promise<AvatarAvailability> {
     const project = (await this.getProject(projectId));
     if (!project) throw new Error(`no project ${projectId}`);
     const organizationId = project.organizationId ?? 'org_personal';
-    const organization = (await this.kvGet(`avatars:organization:${organizationId}`)) === 'enabled';
+    const organization = (await this.kvGet(`avatars:organization:${organizationId}`)) !== 'disabled';
     const raw = (await this.kvGet(`avatars:project:${projectId}`));
     const projectSetting: AvatarAvailability['project'] = raw === 'enabled' || raw === 'disabled' ? raw : 'inherit';
     return { organization, project: projectSetting,
@@ -6705,7 +6616,7 @@ export class Store {
 
   private async deleteAuthorizationRequestKv(
     organizationId: string | undefined,
-    target: { kind: 'task' | 'avatar'; ids: string[] },
+    target: { kind: 'task'; ids: string[] },
   ): Promise<void> {
     return this.db.transaction(async () => {
 
@@ -6719,8 +6630,7 @@ export class Store {
       if (!Array.isArray(requests)) return;
       const remaining = requests.filter((request) => {
         if (request?.target?.kind !== target.kind) return true;
-        const id = target.kind === 'task' ? request.target.taskId : request.target.avatarId;
-        return !removed.has(String(id ?? ''));
+        return !removed.has(String(request.target.taskId ?? ''));
       });
       if (remaining.length) (await this.kvSet(key, JSON.stringify(remaining)));
       else (await this.db.prepare('DELETE FROM kv WHERE k=?').run(key));

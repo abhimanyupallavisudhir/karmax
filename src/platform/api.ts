@@ -34,7 +34,7 @@ import {
   AGENT_QUEUE_WORKFLOW,
 } from '../coordinators/names.js';
 import { templateContent, templateName, templateParams, templateAuthorization } from '../domain/task-templates.js';
-import { TaskRecord, TaskView, AttentionAsk, Message, Project, TaskInput, ImageRef, FileRef, Tag, SavedView, TaskTemplate, TaskQuery, AgentRole, AgentSpec, AgentAuthority, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency, remotePolicyOf, ResourceAccess, ResourceTarget } from '../domain/types.js';
+import { TaskRecord, TaskView, AttentionAsk, Message, Project, TaskInput, ImageRef, FileRef, Tag, SavedView, TaskTemplate, TaskQuery, AgentRole, AgentSpec, AgentAuthority, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency, remotePolicyOf, ResourceAccess, ResourceTarget, type Avatar } from '../domain/types.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable, awaitsSuccessOf, isSeries } from '../domain/triggers.js';
 import { STORE_TASKS, storeTaskNeeds, storeTaskRepeatable, type StoreNeed, type StoreTask } from '../domain/task-store.js';
 import { applyTriggerContext, normalizeEventInput, validateFollow, type EventFilter, type EventFollow, type ProjectEvent, type ProjectEventClaim,
@@ -90,7 +90,7 @@ import type { WorldAccessService } from '../world/access.js';
 import type { RunnerPoolService } from '../world/runners.js';
 import { VaultItems, type VaultItemPolicy, type VaultTaskPolicyOverrides } from '../autonomy/vault-items.js';
 import { itemHandle, loosensPolicy } from '../autonomy/vault-items.js';
-import { applyAvatarProfile, avatarAuthorizationCapabilities, avatarCallableBy, avatarEnabled } from './avatars.js';
+import { avatarAuthorizationCapabilities, avatarCallableBy, avatarEnabled, avatarPrincipal, forkedAvatar, normalizeAvatarSetting } from './avatars.js';
 import { CapabilityError, NotFoundError, ValidationError } from './errors.js';
 import { assertAgentSpec, childComputer, subTaskParams } from './agent-params.js';
 import { CALLED_AGENT_FIELD, agentSpecsByParticipant, authorityKey, normalizeAgentAuthority, type StoredAgentAuthorization } from './agent-authority.js';
@@ -124,7 +124,7 @@ export interface EscalationTargets {
   users: Array<{ id: string; selector: string; name?: string }>;
   teams: Array<{ id: string; name: string; slug: string; selector: string }>;
   special: Array<{ selector: string; description: string }>;
-  avatars: Array<{ id: string; name: string; purpose?: string; selector: string; roles: string[] }>;
+  avatars: Array<{ id: string; name: string; selector: string }>;
 }
 
 /** Who can grant a task agent's permission request, nearest first (`permissionGrantors`). */
@@ -1220,15 +1220,37 @@ export class KarmaxApi {
     }
   }
 
-  /** Validate the task's agent fields (shared with create_sub_task) and resolve
-   * every Avatar they and the Review-agent layers reference. Invocation is
-   * checked against the human who initiated the calling chain. */
-  private async validateTaskAgents(caller: ScopedToken, project: Project, manifest: WorkflowManifest, resolved: ValueMap, taskId?: string) {
-    // A system caller (the trigger dispatcher) starts a task for the human who
-    // created it; that human must still be allowed to call the Avatar.
-    const callerUserId = caller.humanSubject?.userId
-      ?? (caller.taskId !== '*' ? (await this.deps.store.taskCreatorUserId(caller.taskId)) : undefined)
+  /** The human a caller acts for: a person, the human behind a task's agent,
+   * or — for a system caller (the trigger dispatcher) starting a stored task —
+   * the human who created that task. Calling an Avatar is judged against them. */
+  private async humanBehind(caller: ScopedToken, taskId?: string): Promise<string | undefined> {
+    return caller.humanSubject?.userId
+      ?? (caller.taskId && caller.taskId !== '*' ? (await this.deps.store.taskCreatorUserId(caller.taskId)) : undefined)
       ?? (caller.kind === 'system' && taskId ? (await this.deps.store.taskCreatorUserId(taskId)) : undefined);
+  }
+
+  /** Validate a task's Avatar setting (`params.avatar`), normalized in place,
+   * and return the Avatar its main agent forks and acts for, if any. Refused
+   * where Avatars are disabled, or for a fork of an Avatar that does not let
+   * its forks be Avatars. */
+  private async assertAvatarSetting(caller: ScopedToken, project: Project, params: Record<string, unknown>,
+    taskId?: string): Promise<Avatar | undefined> {
+    const setting = normalizeAvatarSetting(params.avatar);
+    if (setting) params.avatar = setting;
+    else delete params.avatar;
+    const mainAvatar = (await forkedAvatar(this.deps.store, project.id, params['agent:do'], (await this.humanBehind(caller, taskId))));
+    if (setting && !(await this.deps.store.avatarAvailability(project.id)).effective)
+      throw new ValidationError('Avatars are disabled for this project');
+    if (setting && mainAvatar && !mainAvatar.forksMayBeAvatars)
+      throw new ValidationError(`Forks of Avatar ${JSON.stringify(mainAvatar.name)} can't be Avatars themselves`);
+    return mainAvatar;
+  }
+
+  /** Validate the task's agent fields (shared with create_sub_task) and resolve
+   * every Avatar they and the Review-agent layers fork and act for. Calling one
+   * is checked against the human who initiated the calling chain. */
+  private async validateTaskAgents(caller: ScopedToken, project: Project, manifest: WorkflowManifest, resolved: ValueMap, taskId?: string) {
+    const callerUserId = (await this.humanBehind(caller, taskId));
     const selected: Array<{ avatar: import('../domain/types.js').Avatar; role: string }> = [];
     for (const field of manifest.params) {
       if (field.type === 'agent') {
@@ -1304,7 +1326,7 @@ export class KarmaxApi {
       const reference = source.num != null ? `#${source.num}` : JSON.stringify(source.title);
       if ((sourceProject?.organizationId ?? 'org_personal') !== organizationId)
         throw new ValidationError(`${reference} is in another organization; an agent can only fork from this organization`);
-      const avatar = spec?.avatarId ? (await this.deps.store.getAvatar(spec.avatarId)) : undefined;
+      const avatar = (await forkedAvatar(this.deps.store, task.projectId, spec, (await this.deps.store.taskCreatorUserId(task.id))));
       const own = participant === MAIN_AGENT ? undefined : this.storedAgentAuthorizations(task)[participant];
       const held: Partial<AuthorizationSelection> | undefined = avatar ? avatar.authorization
         : own ?? task.params._authorization as Partial<AuthorizationSelection> | undefined;
@@ -1472,20 +1494,28 @@ export class KarmaxApi {
     const start = this.resolveStart(workflow, (await this.workflowPinFor(args.projectId, workflow)), project.organizationId);
     if (!start) throw new Error(`unknown workflow "${workflow}"`);
     const { manifest, startType } = start;
-    const requestedAuthorization = args.authorization ?? args.authorizationProfile ?? (await this.authorizationDefault(project));
-    const grantorCaps = (await this.authorizationGrantorCaps(token, caller, requestedAuthorization, project.organizationId ?? 'org_personal')
+    // A fork of an Avatar its creator may call acts with the Avatar's
+    // authorization, credentials and GitHub account: nobody grants it again
+    // (src/platform/avatars.ts). Everything else is granted by the caller.
+    const mainAvatar = (await this.assertAvatarSetting(caller, project, args.params ?? {}));
+    const requestedAuthorization = mainAvatar ? avatarSelection(mainAvatar)
+      : args.authorization ?? args.authorizationProfile ?? (await this.authorizationDefault(project));
+    const grantorCaps = mainAvatar ? undefined : (await this.authorizationGrantorCaps(token, caller, requestedAuthorization, project.organizationId ?? 'org_personal')
       .catch(async (error) => { throw error instanceof CapabilityError && args.authorization
         ? await this.authorizationGap(token, args.projectId, args.authorization, { kind: 'new-task' }, { canLimit: false }) : error; }));
     const acceptsTaskAttenuation = args.acceptAttenuation === true
       || Array.isArray(args.acceptAttenuation) && args.acceptAttenuation.includes(MAIN_AGENT);
-    const authorization = this.deps.authorization
-      ? (await this.deps.authorization.taskGrant(caller.principal, args.projectId, requestedAuthorization, grantorCaps))
-      : { profileId: args.authorizationProfile ?? 'caller', capabilities: caller.caps, attenuated: false };
+    const authorization = mainAvatar
+      ? { ...avatarSelection(mainAvatar), profileId: mainAvatar.authorization.profileId,
+        capabilities: [...mainAvatar.authorization.capabilities], attenuated: false }
+      : this.deps.authorization
+        ? (await this.deps.authorization.taskGrant(caller.principal, args.projectId, requestedAuthorization, grantorCaps))
+        : { profileId: args.authorizationProfile ?? 'caller', capabilities: caller.caps, attenuated: false };
     const profileAttenuated = authorization.attenuated;
     const orgVault = (await this.deps.store.getSettings(`organization:${project.organizationId ?? 'org_personal'}`, 'vault')) ?? {};
     const projectVault = (await this.deps.store.getSettings(project.id, 'vault')) ?? {};
     const vaultDefaults = Object.hasOwn(projectVault, 'credentialGrants') ? projectVault : orgVault;
-    const grants = args.credentialGrants ?? vaultDefaults.credentialGrants as string[] | undefined;
+    const grants = mainAvatar ? [] : args.credentialGrants ?? vaultDefaults.credentialGrants as string[] | undefined;
     const ungranted = (await this.applyCredentialGrants(authorization, grants, caller, project.organizationId ?? 'org_personal'));
     // Credentials named explicitly are a gap like an explicit level; inherited
     // defaults are narrowed to the creator, as the default level is.
@@ -1495,7 +1525,7 @@ export class KarmaxApi {
       && !(args.draft && args.allowAttenuation) && !acceptsTaskAttenuation)
       throw await this.authorizationGap(token, args.projectId, args.authorization ?? selectionOf(authorization, args.projectId),
         { kind: 'new-task' }, { credentialGrants: missingCredentialGrants });
-    const credentialPolicies = await this.credentialPolicyOverrides(
+    const credentialPolicies = mainAvatar ? { ...mainAvatar.credentialPolicies } : await this.credentialPolicyOverrides(
       project.organizationId ?? 'org_personal', args.credentialPolicies ?? (args.credentialGrants === undefined ? vaultDefaults.credentialPolicies as VaultTaskPolicyOverrides | undefined : undefined), caller.caps, authorization,
     );
 
@@ -1606,7 +1636,7 @@ export class KarmaxApi {
           [REPOSITORY_BRANCHES_RESOLVED_PARAM]: true,
           profiles: args.profiles,
           draft: !!args.draft,
-          _authorization: { ...authorization, profileAttenuated, principal: caller.principal, credentialPolicies,
+          _authorization: { ...authorization, profileAttenuated, principal: mainAvatar ? avatarPrincipal(mainAvatar.id) : caller.principal, credentialPolicies,
             ...(missingCredentialGrants.length ? { missingCredentialGrants } : {}),
             ...(limited ? { attenuationAccepted: acceptsTaskAttenuation } : {}) },
           ...(githubAccountId ? { _githubAccountId: githubAccountId } : {}),
@@ -1624,7 +1654,8 @@ export class KarmaxApi {
       const authorizationScope = authorization as typeof authorization & {
         scope?: 'projects' | 'organization' | 'global'; projectIds?: string[]; organizationId?: string;
       };
-      const delegation = (await this.delegateTaskHuman(token, caller, {
+      // A fork acting for an Avatar acts as the Avatar, not as its forker.
+      const delegation = mainAvatar ? undefined : (await this.delegateTaskHuman(token, caller, {
         taskId: task.id,
         projectId: authorizationScope.scope ? undefined : task.projectId,
         projectIds: authorizationScope.scope === 'projects' ? authorizationScope.projectIds : undefined,
@@ -1805,7 +1836,7 @@ export class KarmaxApi {
     input.createdAt = task.createdAt;
     input.workflow = workflow;
     input.grant = authorization.capabilities;
-    input.grantPrincipal = caller.principal;
+    input.grantPrincipal = mainAvatar ? avatarPrincipal(mainAvatar.id) : caller.principal;
     input.delegationId = delegation?.id;
     input.authorizationProfile = authorization.profileId;
     input.resolveAgentEnabled = RESOLVE_AGENT_ENABLED;
@@ -1950,16 +1981,13 @@ export class KarmaxApi {
       const role = field.role as AgentRole;
       const selected = input.agents?.[role];
       const base = (await resolver.resolve(role, input.profiles, undefined, input.projectId));
-      const avatar = selected?.avatarId ? (await this.deps.store.getAvatar(selected.avatarId)) : undefined;
-      const profile = applyAvatarProfile(base, selected, avatar);
+      const profile = applyAgentSpec(base, selected);
       out[role] = {
         provider: profile.provider,
         ...(profile.model ? { model: profile.model } : {}),
         ...(profile.effort ? { effort: profile.effort } : {}),
         ...(profile.mcpConnections !== undefined ? { mcpConnections: profile.mcpConnections } : {}),
         ...(selected?.resumeFrom ? { resumeFrom: selected.resumeFrom } : {}),
-        ...(selected?.avatarId ? { avatarId: selected.avatarId } : {}),
-        ...(selected?.avatarPurpose ? { avatarPurpose: selected.avatarPurpose } : {}),
       };
     }
     return out;
@@ -2015,9 +2043,6 @@ export class KarmaxApi {
         ...(effort ? { effort } : {}),
         ...(!providerChanged && current.resumeFrom ? { resumeFrom: current.resumeFrom } : {}),
         ...(incoming.resumeFrom ? { resumeFrom: incoming.resumeFrom } : {}),
-        ...(incoming.avatarId ?? current.avatarId ? { avatarId: incoming.avatarId ?? current.avatarId } : {}),
-        ...(incoming.avatarPurpose ?? current.avatarPurpose
-          ? { avatarPurpose: incoming.avatarPurpose ?? current.avatarPurpose } : {}),
       };
       changed = true;
     }
@@ -2212,6 +2237,9 @@ export class KarmaxApi {
     if (!this.deps.authorization || caller.kind === 'system') return;
     const stored = task.params?._authorization as { principal?: string; capabilities?: string[] } | undefined;
     if (!stored?.capabilities?.length || stored.principal === caller.principal) return;
+    // A fork of an Avatar the starter may call acts with the Avatar's authorization.
+    if (stored.principal?.startsWith('avatar:') && (await forkedAvatar(this.deps.store, task.projectId,
+      task.params?.['agent:do'], (await this.humanBehind(caller, task.id))))?.id === stored.principal.slice(7)) return;
     const { authorization: selection } = previousTaskGrants(task);
     if (!selection) return;
     const organizationId = (await this.deps.store.getProject(task.projectId))?.organizationId ?? 'org_personal';
@@ -2502,6 +2530,15 @@ export class KarmaxApi {
     const editInPlace = !!task.params?.draft || task.params?.triggerState === 'armed' || !!task.params?.repeatable;
     const caller = (await this.require(token, 'create_task', { projectId: task.projectId, taskId }));
     const organizationId = (await this.deps.store.getProject(task.projectId))?.organizationId ?? 'org_personal';
+    // A fork of an Avatar it may call acts with the Avatar's authorization,
+    // whatever is asked for here (src/platform/avatars.ts).
+    const mainAvatar = editInPlace ? (await forkedAvatar(this.deps.store, task.projectId, task.params?.['agent:do'],
+      (await this.humanBehind(caller, taskId)))) : undefined;
+    if (mainAvatar) {
+      (await this.deps.store.patchTaskParams(taskId, { _authorization: avatarAuthorization(mainAvatar),
+        ...(mainAvatar.githubAccountId ? { _githubAccountId: mainAvatar.githubAccountId } : {}) }));
+      return (await this.deps.store.getTask(taskId))!;
+    }
     const grantorCaps = (await this.authorizationGrantorCaps(token, caller, requested, organizationId)
       .catch(async (error) => { throw error instanceof CapabilityError && typeof requested !== 'string'
         ? await this.authorizationGap(token, task.projectId, requested, { kind: 'task', taskId }, { canLimit: false }) : error; }));
@@ -2637,7 +2674,7 @@ export class KarmaxApi {
     token: string,
     projectId: string,
     authorization: AuthorizationSelection,
-    target: { kind: 'new-task' } | { kind: 'task'; taskId: string; queue?: boolean; participant?: string } | { kind: 'avatar'; avatarId?: string },
+    target: { kind: 'new-task' } | { kind: 'task'; taskId: string; queue?: boolean; participant?: string },
     options: { canLimit?: boolean; credentialGrants?: Capability[] } = {},
   ): Promise<AuthorizationGrantError> {
     const credentialGrants = options.credentialGrants?.length ? options.credentialGrants : undefined;
@@ -2647,26 +2684,21 @@ export class KarmaxApi {
     const credentialNames = (targets?.credentials ?? []).map((credential) => credential.label);
     const summary = await this.authorizationSummary(projectId, authorization)
       + (credentialNames.length ? ` with ${credentialNames.join(', ')}` : '');
-    const request = (taskOrAvatar: string) => `POST /api/authorization-requests?projectId=${projectId} with `
-      + `{"target":${taskOrAvatar},"authorization":${JSON.stringify(authorization)},`
+    const request = (taskTarget: string) => `POST /api/authorization-requests?projectId=${projectId} with `
+      + `{"target":${taskTarget},"authorization":${JSON.stringify(authorization)},`
       + `${credentialGrants ? `"credentialGrants":${JSON.stringify(credentialGrants)},` : ''}"audience":["${summon}"]}`;
     const limit = options.canLimit === false ? undefined
-      : target.kind === 'avatar' ? 'save it with limitAuthorization: true'
-        : target.kind === 'task' && target.participant ? `retry with acceptAttenuation: ["${target.participant}"]`
+      : target.kind === 'task' && target.participant ? `retry with acceptAttenuation: ["${target.participant}"]`
         : target.kind === 'task' ? `PATCH /api/tasks/${target.taskId}/authorization with acceptAttenuation: true`
           : 'retry with acceptAttenuation: true';
     const ask = !summon ? 'nobody in this organization can grant all of it'
       : target.kind === 'new-task'
         ? `summon ${summon}: create it with draft: true and allowAttenuation: true, then ${request('{"kind":"task","taskId":"<its id>","queueAfterApproval":true}')}; it starts once approved`
-        : target.kind === 'task'
-          ? `summon ${summon}: ${request(`{"kind":"task","taskId":"${target.taskId}"${target.participant ? `,"participant":"${target.participant}"` : ''}${target.queue ? ',"queueAfterApproval":true' : ''}}`)}`
-          : target.avatarId ? `summon ${summon}: ${request(`{"kind":"avatar","avatarId":"${target.avatarId}"}`)}`
-            : `summon ${summon}: save it with limitAuthorization: true and enabled: false, then `
-              + `${request('{"kind":"avatar","avatarId":"<its id>","enableAfterApproval":true}')}`;
+        : `summon ${summon}: ${request(`{"kind":"task","taskId":"${target.taskId}"${target.participant ? `,"participant":"${target.participant}"` : ''}${target.queue ? ',"queueAfterApproval":true' : ''}}`)}`;
     const next = limit ? `To proceed, ${limit} to use only your own authorization, or ${ask}.` : `To proceed, ${ask}.`;
     const shown = missingCapabilities.slice(0, 4).join(', ') + (missingCapabilities.length > 4 ? ` and ${missingCapabilities.length - 4} more` : '');
     return new AuthorizationGrantError(
-      `you cannot grant the ${target.kind === 'avatar' ? 'Avatar' : target.kind === 'task' && target.participant ? participantLabel(target.participant) : 'agent'} more authorization than you have: `
+      `you cannot grant the ${target.kind === 'task' && target.participant ? participantLabel(target.participant) : 'agent'} more authorization than you have: `
       + `${summary}${shown ? ` needs ${shown}` : ''}. ${next}`,
       { summary, missingCapabilities, ...(summon ? { summon } : {}), next, ...(credentialGrants ? { credentialGrants } : {}) });
   }
@@ -2760,7 +2792,9 @@ export class KarmaxApi {
     for (const key of keys) {
       delete next[key];
       const spec = specs.get(key);
-      const requested = spec && !spec.avatarId ? normalizeAgentAuthority(spec.authority, participantLabel(key)) : undefined;
+      // An agent that forks an Avatar it may call acts with that Avatar's authority.
+      const actsForAvatar = !!(await forkedAvatar(this.deps.store, task.projectId, spec, (await this.deps.store.taskCreatorUserId(task.id))));
+      const requested = spec && !actsForAvatar ? normalizeAgentAuthority(spec.authority, participantLabel(key)) : undefined;
       if (!requested) continue;
       const kept = prior[key];
       const accepted = options.accept === true || (Array.isArray(options.accept) && options.accept.includes(key));
@@ -3389,6 +3423,7 @@ export class KarmaxApi {
       ...(_githubAccountId !== undefined ? { _githubAccountId } : {}),
     };
     const base: Record<string, unknown> = opts.replace ? { ...meta, ...params } : { ...task.params, ...params };
+    if (project) (await this.assertAvatarSetting(caller, project, base, taskId));
     // Validate the edited triggers before anything is written: a rejected edit
     // (a cycle, a dangling or self dependency) must leave the task as it was,
     // still armed. Saving first left it un-armed with the bad triggers stored,
@@ -4431,14 +4466,7 @@ export class KarmaxApi {
     const initiatingUserId = (await this.deps.store.taskCreatorUserId(task.id));
     for (const selector of audience) {
       if (selector.startsWith('avatar:')) {
-        const avatar = (await this.deps.store.getAvatar(selector.slice(7)));
-        if (!avatar || avatar.projectId !== task.projectId || !(await avatarEnabled(this.deps.store, avatar)))
-          throw new Error(`Avatar route ${selector} is not available in this project`);
-        if (avatar.roles.length && !avatar.roles.includes('respond'))
-          throw new Error(`Avatar "${avatar.name}" is not configured to respond to tasks`);
-        if (!initiatingUserId || !(await avatarCallableBy(this.deps.store, avatar, initiatingUserId)))
-          throw new CapabilityError(`the task creator is not allowed to call Avatar "${avatar.name}"`);
-        avatarRecipients.push(avatar);
+        avatarRecipients.push((await this.routedAvatar(task, selector, initiatingUserId)));
         continue;
       }
       if (!(await this.deps.store.humanAudience(task.id, [selector])).length)
@@ -4478,34 +4506,43 @@ export class KarmaxApi {
     this.deps.bus?.emit({ ...event, seq });
     if (task.parentTaskId && caller.taskId === taskId) await this.noteInParent(task, audience, detail);
     for (const avatar of avatarRecipients) {
-      try {
-        await this.createTask(token, {
-          projectId: task.projectId,
-          workflow: 'just-do',
-          title: `${avatar.name}: respond to task #${task.num ?? task.id}`,
-          prompt: `The agent working on task #${task.num ?? task.id} (${JSON.stringify(task.title)}) asked for your intervention:
+      await this.callAvatar(token, avatar, `${avatar.name}: respond to task #${task.num ?? task.id}`,
+        `The agent working on task #${task.num ?? task.id} (${JSON.stringify(task.title)}) asked for your intervention:
 
 ${untrustedBlock('request from the agent', detail)}
 
-Act according to your Avatar instructions. When ready, call signal_task for task id ${task.id} with signal "followUp" and the concrete guidance or decision in text. Address role "${caller.role ?? 'do'}" when relevant. Then briefly report what you sent.`,
-          params: {
-            'agent:do': {
-              avatarId: avatar.id,
-              avatarPurpose: 'respond',
-              provider: avatar.runtime.provider,
-              ...(avatar.runtime.model ? { model: avatar.runtime.model } : {}),
-              ...(avatar.runtime.effort ? { effort: avatar.runtime.effort } : {}),
-            },
-          },
-        });
-      } catch (error) {
-        const failed = { taskId: task.id, type: 'avatar.response-dispatch-failed', ts: Date.now(),
-          payload: { avatarId: avatar.id, error: error instanceof Error ? error.message : String(error) } };
-        const failedSeq = (await this.deps.store.appendEvent(failed));
-        this.deps.bus?.emit({ ...failed, seq: failedSeq });
-      }
+When ready, call signal_task for task id ${task.id} with signal "followUp" and the concrete guidance or decision in text. Address role "${caller.role ?? 'do'}" when relevant. Then briefly report what you sent.`,
+        { taskId: task.id, type: 'avatar.response-dispatch-failed', payload: { avatarId: avatar.id } });
     }
     return held;
+  }
+
+  /** The Avatar an `avatar:<task id>` route names, refused unless the human
+   * behind `task` may call it here. */
+  private async routedAvatar(task: TaskRecord, selector: string, initiatingUserId: string | undefined): Promise<Avatar> {
+    const avatar = (await this.deps.store.getAvatar(selector.slice(7)));
+    if (!avatar || avatar.projectId !== task.projectId || !(await avatarEnabled(this.deps.store, avatar)))
+      throw new ValidationError(`Avatar route ${selector} is not available in this project`);
+    if (!initiatingUserId || !(await avatarCallableBy(this.deps.store, avatar, initiatingUserId)))
+      throw new CapabilityError(`the task creator is not allowed to call Avatar "${avatar.name}"`);
+    return avatar;
+  }
+
+  /** Call an Avatar in: a task whose agent forks it (and so acts with its
+   * authority) to do `prompt`. A failure is recorded on `failure.taskId`. */
+  private async callAvatar(token: string, avatar: Avatar, title: string, prompt: string,
+    failure: { taskId: string; type: string; payload: Record<string, unknown> }): Promise<void> {
+    try {
+      await this.createTask(token, {
+        projectId: avatar.projectId, workflow: 'just-do', title, prompt,
+        params: { 'agent:do': { ...avatar.runtime, resumeFrom: { taskId: avatar.id, role: MAIN_AGENT } } },
+      });
+    } catch (error) {
+      const failed = { taskId: failure.taskId, type: failure.type, ts: Date.now(),
+        payload: { ...failure.payload, error: error instanceof Error ? error.message : String(error) } };
+      const seq = (await this.deps.store.appendEvent(failed));
+      this.deps.bus?.emit({ ...failed, seq });
+    }
   }
 
   /** Ask selected people, teams, or owner-configured Avatars to add exact
@@ -4566,14 +4603,7 @@ Act according to your Avatar instructions. When ready, call signal_task for task
         continue;
       }
       if (selector.startsWith('avatar:')) {
-        const avatar = (await this.deps.store.getAvatar(selector.slice(7)));
-        if (!avatar || avatar.projectId !== task.projectId || !(await avatarEnabled(this.deps.store, avatar)))
-          throw new Error(`Avatar route ${selector} is not available in this project`);
-        if (avatar.roles.length && !avatar.roles.includes('authorize'))
-          throw new Error(`Avatar "${avatar.name}" is not configured to decide authorizations`);
-        if (!initiatingUserId || !(await avatarCallableBy(this.deps.store, avatar, initiatingUserId)))
-          throw new CapabilityError(`the task creator is not allowed to call Avatar "${avatar.name}"`);
-        avatarRecipients.add(avatar.id);
+        avatarRecipients.add((await this.routedAvatar(task, selector, initiatingUserId)).id);
         continue;
       }
       const resolved = (await this.deps.store.humanAudience(task.id, [selector]));
@@ -4635,33 +4665,14 @@ Act according to your Avatar instructions. When ready, call signal_task for task
       for (const grantorId of taskRecipients) await this.askTaskToGrant(grantorId, task, request, project.organizationId);
       for (const avatarId of avatarRecipients) {
         const avatar = (await this.deps.store.getAvatar(avatarId))!;
-        try {
-          await this.createTask(token, {
-            projectId: task.projectId,
-            workflow: 'just-do',
-            title: `${avatar.name}: decide permission request`,
-            prompt: `Decide whether to approve or deny permission request ${request.id} for task #${task.num ?? task.id}.
+        await this.callAvatar(token, avatar, `${avatar.name}: decide permission request`,
+          `Decide whether to approve or deny permission request ${request.id} for task #${task.num ?? task.id}.
 
 Requested capabilities: ${request.capabilities.join(', ')}
 ${request.projectIds?.length ? `Add projects to the task's ${request.baseAuthorization?.level} authorization (existing permissions apply there too): ${request.projectIds.join(', ')}\n` : ''}${untrustedBlock('reason from the requesting agent', request.reason)}
 
-Act according to your Avatar instructions. Resolve the request exactly once by calling platform_request with POST /api/permission-requests/${request.id}/resolve?organizationId=${project.organizationId} and body {"action":"approve"} or {"action":"deny"}. Then briefly report the decision.`,
-            params: {
-              'agent:do': {
-                avatarId: avatar.id,
-                avatarPurpose: 'authorize',
-                provider: avatar.runtime.provider,
-                ...(avatar.runtime.model ? { model: avatar.runtime.model } : {}),
-                ...(avatar.runtime.effort ? { effort: avatar.runtime.effort } : {}),
-              },
-            },
-          });
-        } catch (error) {
-          const failed = { taskId: task.id, type: 'avatar.authorization-dispatch-failed', ts: Date.now(),
-            payload: { requestId: request.id, avatarId, error: error instanceof Error ? error.message : String(error) } };
-          const failedSeq = (await this.deps.store.appendEvent(failed));
-          this.deps.bus?.emit({ ...failed, seq: failedSeq });
-        }
+Resolve the request exactly once by calling platform_request with POST /api/permission-requests/${request.id}/resolve?organizationId=${project.organizationId} and body {"action":"approve"} or {"action":"deny"}. Then briefly report the decision.`,
+          { taskId: task.id, type: 'avatar.authorization-dispatch-failed', payload: { requestId: request.id, avatarId } });
       }
     }
     return {
@@ -4767,7 +4778,6 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     const creatorUserId = (await this.deps.store.taskCreatorUserId(task.id));
     const avatars = !creatorUserId ? [] : (await __asyncCollections.filter((await this.deps.store.listAvatars(task.projectId)), async (avatar) =>
       (await avatarEnabled(this.deps.store, avatar))
-        && (!avatar.roles.length || avatar.roles.includes('authorize'))
         && (await avatarCallableBy(this.deps.store, avatar, creatorUserId))
         && (await holdsAll((projectId) => avatarAuthorizationCapabilities(this.deps.store, authorization, avatar, projectId)))))
       .map((avatar) => ({ id: avatar.id, name: avatar.name, selector: `avatar:${avatar.id}` }));
@@ -4789,7 +4799,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     users: Array<{ id: string; selector: string }>;
     teams: Array<{ id: string; name: string; slug: string; selector: string; eligibleUserIds: string[] }>;
     special: Array<{ selector: string; eligibleUserIds: string[] }>;
-    avatars: Array<{ id: string; name: string; purpose?: string; selector: string }>;
+    avatars: Array<{ id: string; name: string; selector: string }>;
     /** Whom "Alert" asks: the lowest level audience that can grant it all. */
     summon?: string;
   }> {
@@ -4826,14 +4836,12 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     const initiatingUserId = caller.humanSubject?.userId
       ?? (caller.taskId && caller.taskId !== '*' ? (await this.deps.store.taskCreatorUserId(caller.taskId)) : undefined);
     const avatars = !initiatingUserId ? [] : (await __asyncCollections.filter((await __asyncCollections.filter((await this.deps.store.listAvatars(input.projectId)), async (avatar) => (await avatarEnabled(this.deps.store, avatar))
-        && (!avatar.roles.length || avatar.roles.includes('authorize'))
         && (await avatarCallableBy(this.deps.store, avatar, initiatingUserId)))), async (avatar) => {
         const effective = (await avatarAuthorizationCapabilities(this.deps.store, authorization, avatar, input.projectId));
         return allows(effective, 'task:create') && canGrantAll(effective)
           && levelCapabilities.every((capability) => allows(effective, capability));
       }))
-      .map((avatar) => ({ id: avatar.id, name: avatar.name,
-        ...(avatar.purpose ? { purpose: avatar.purpose } : {}), selector: `avatar:${avatar.id}` }));
+      .map((avatar) => ({ id: avatar.id, name: avatar.name, selector: `avatar:${avatar.id}` }));
     const { special, summon } = await this.summonable(project.id, project.organizationId, eligibleUserIds);
     // Names only for a caller who may see the vault's item list.
     const vault = allows(caller.caps, 'credential:read') ? new VaultItems(this.deps.store, undefined, undefined, project.organizationId) : undefined;
@@ -4909,10 +4917,9 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     token: string,
     input: {
       projectId: string;
-      target: { kind: 'task'; taskId: string; participant?: string; queueAfterApproval?: boolean }
-        | { kind: 'avatar'; avatarId: string; enableAfterApproval?: boolean };
+      target: { kind: 'task'; taskId: string; participant?: string; queueAfterApproval?: boolean };
       authorization: AuthorizationSelection;
-      /** Vault credentials to add on approval (a task target only). */
+      /** Vault credentials to add on approval. */
       credentialGrants?: Capability[];
       audience: string[];
       reason?: string;
@@ -4926,27 +4933,19 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
     const caller = (await this.require(token, 'create_task', { projectId: input.projectId }));
     const project = (await this.deps.store.getProject(input.projectId));
     if (!project?.organizationId) throw new NotFoundError('project organization not found');
-    // Whoever created the task (or owns the Avatar) routes its request, human or
-    // agent alike: an agent for a task it created, a person — or an agent acting
-    // for that person — for the person's own.
+    // Whoever created the task routes its request, human or agent alike: an
+    // agent for a task it created, a person — or an agent acting for that
+    // person — for the person's own.
+    if ((input.target as { kind?: string }).kind !== 'task') throw new ValidationError('target.kind must be task');
     const requesterId = caller.humanSubject?.userId;
-    if (input.target.kind === 'task') {
-      const task = (await this.deps.store.getTask(input.target.taskId));
-      if (!task || task.projectId !== input.projectId) throw new NotFoundError('task not found in this project');
-      if (['done', 'cancelled'].includes(task.lastView?.status ?? ''))
-        throw new ValidationError('this task has finished');
-      const createdIt = caller.taskId !== '*' && task.createdBy?.kind === 'task-agent' && task.createdBy.taskId === caller.taskId;
-      if (!createdIt && !(requesterId && (await this.deps.store.taskCreatorUserId(task.id)) === requesterId))
-        throw new CapabilityError('only the task creator can route its authorization request');
-    } else {
-      const avatar = (await this.deps.store.getAvatar(input.target.avatarId));
-      if (!avatar || avatar.projectId !== input.projectId) throw new NotFoundError('Avatar not found in this project');
-      if (!requesterId || avatar.ownerUserId !== requesterId)
-        throw new CapabilityError('only the Avatar owner can route its authorization request');
-    }
+    const targetTask = (await this.deps.store.getTask(input.target.taskId));
+    if (!targetTask || targetTask.projectId !== input.projectId) throw new NotFoundError('task not found in this project');
+    if (['done', 'cancelled'].includes(targetTask.lastView?.status ?? ''))
+      throw new ValidationError('this task has finished');
+    const createdIt = caller.taskId !== '*' && targetTask.createdBy?.kind === 'task-agent' && targetTask.createdBy.taskId === caller.taskId;
+    if (!createdIt && !(requesterId && (await this.deps.store.taskCreatorUserId(targetTask.id)) === requesterId))
+      throw new CapabilityError('only the task creator can route its authorization request');
     const credentialGrants = input.credentialGrants?.length ? [...new Set(input.credentialGrants.map(String))] : undefined;
-    if (credentialGrants && input.target.kind !== 'task')
-      throw new ValidationError('an Avatar’s credentials are chosen with the Avatar, not requested');
     const targets = (await this.authorizationEscalationTargets(token, {
       projectId: input.projectId, authorization: input.authorization, credentialGrants,
     }));
@@ -4967,7 +4966,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         recipients.add(id);
       } else if (selector.startsWith('avatar:')) {
         const id = selector.slice(7);
-        if (input.target.kind === 'avatar' && input.target.avatarId === id)
+        if (input.target.taskId === id)
           throw new CapabilityError('an Avatar cannot grant authorization to itself');
         if (!eligibleAvatars.has(id)) throw new CapabilityError(`${selector} cannot grant the complete requested authorization`);
         avatarRecipients.add(id);
@@ -4982,11 +4981,9 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       }
     }
     const service = new AuthorizationRequests(this.deps.store, project.organizationId);
-    const participant = input.target.kind === 'task' ? input.target.participant : undefined;
-    const existing = input.target.kind === 'task'
-      ? (await service.requests({ status: 'pending', taskId: input.target.taskId }))
-        .find((request) => request.target.kind === 'task' && request.target.participant === participant)
-      : (await service.requests({ status: 'pending', avatarId: input.target.avatarId }))[0];
+    const participant = input.target.participant;
+    const existing = (await service.requests({ status: 'pending', taskId: input.target.taskId }))
+      .find((request) => request.target.participant === participant);
     // A repeated click must not fan out duplicate Avatar decision tasks or route
     // a second audience that is not recorded on the durable request.
     if (existing) return existing;
@@ -4997,54 +4994,27 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       capabilities: targets.requestedCapabilities, missingCapabilities: targets.missingCapabilities,
       audience, recipients: [...recipients], avatarRecipients: [...avatarRecipients],
       reason: String(input.reason ?? '').trim() || `Grant ${input.authorization.level} authorization`
-        + `${credentialNames.length ? ` with ${credentialNames.join(', ')}` : ''} to this ${input.target.kind}.`,
+        + `${credentialNames.length ? ` with ${credentialNames.join(', ')}` : ''} to this task.`,
       requestedBy: caller.principal,
     }));
-    if (input.target.kind === 'task') {
-      // Asked to run once approved: it is no longer a draft to anyone looking at
-      // it, but a numbered task waiting for approval (task #716).
-      if (input.target.queueAfterApproval && (await this.deps.store.getTask(input.target.taskId))?.params?.draft) {
-        (await this.deps.store.patchTaskParams(input.target.taskId, { _awaitingApproval: request.id }));
-        (await this.deps.store.numberTask(input.target.taskId));
-      }
-      const event = { taskId: input.target.taskId, type: 'authorization.approval-requested', ts: Date.now(), payload: {
-        requestId: request.id, recipients: request.recipients, audience: request.audience,
-        authorization: request.authorization, missingCapabilities: request.missingCapabilities,
-        urgency: normalizeUrgency(undefined, DEFAULT_URGENCY['approval-requested']),
-      } };
-      const seq = (await this.deps.store.appendEvent(event));
-      this.deps.bus?.emit({ ...event, seq });
-    } else {
-      (await this.deps.store.addAuthorizationInbox(project.organizationId, request.recipients, {
-        kind: 'avatar-authorization', avatarId: input.target.avatarId,
-        projectId: input.projectId, requestId: request.id,
-      }, request.createdAt));
-      const event = { taskId: `avatar:${input.target.avatarId}`, type: 'authorization.approval-requested',
-        ts: request.createdAt, payload: { requestId: request.id, recipients: request.recipients,
-          audience: request.audience, authorization: request.authorization } };
-      const seq = (await this.deps.store.appendEvent(event));
-      this.deps.bus?.emit({ ...event, seq });
+    // Asked to run once approved: it is no longer a draft to anyone looking at
+    // it, but a numbered task waiting for approval (task #716).
+    if (input.target.queueAfterApproval && (await this.deps.store.getTask(input.target.taskId))?.params?.draft) {
+      (await this.deps.store.patchTaskParams(input.target.taskId, { _awaitingApproval: request.id }));
+      (await this.deps.store.numberTask(input.target.taskId));
     }
+    const event = { taskId: input.target.taskId, type: 'authorization.approval-requested', ts: Date.now(), payload: {
+      requestId: request.id, recipients: request.recipients, audience: request.audience,
+      authorization: request.authorization, missingCapabilities: request.missingCapabilities,
+      urgency: normalizeUrgency(undefined, DEFAULT_URGENCY['approval-requested']),
+    } };
+    const seq = (await this.deps.store.appendEvent(event));
+    this.deps.bus?.emit({ ...event, seq });
     for (const avatarId of avatarRecipients) {
       const avatar = (await this.deps.store.getAvatar(avatarId))!;
-      try {
-        await this.createTask(token, {
-          projectId: input.projectId, workflow: 'just-do',
-          title: `${avatar.name}: decide authorization request`,
-          prompt: `Decide whether to approve or deny authorization request ${request.id}.\n\nTarget: ${input.target.kind} ${input.target.kind === 'task' ? input.target.taskId : input.target.avatarId}\nRequested authorization: ${input.authorization.level} (${input.authorization.scope})${credentialNames.length ? ` with vault credentials ${credentialNames.join(', ')}` : ''}\nMissing capabilities: ${request.missingCapabilities.join(', ')}\n${untrustedBlock('reason from the requester', request.reason)}\n\nAct according to your Avatar instructions. Resolve the request exactly once by calling platform_request with POST /api/authorization-requests/${request.id}/resolve?organizationId=${project.organizationId} and body {"action":"approve"} or {"action":"deny"}. Then briefly report the decision.`,
-          params: { 'agent:do': { avatarId: avatar.id, avatarPurpose: 'authorize', provider: avatar.runtime.provider,
-            ...(avatar.runtime.model ? { model: avatar.runtime.model } : {}),
-            ...(avatar.runtime.effort ? { effort: avatar.runtime.effort } : {}) } },
-        });
-      } catch (error) {
-        const failed = { taskId: input.target.kind === 'task' ? input.target.taskId : `avatar:${input.target.avatarId}`,
-          type: 'avatar.authorization-dispatch-failed', ts: Date.now(),
-          payload: { requestId: request.id, avatarId, error: error instanceof Error ? error.message : String(error) } };
-        if (input.target.kind === 'task') {
-          const seq = (await this.deps.store.appendEvent(failed));
-          this.deps.bus?.emit({ ...failed, seq });
-        }
-      }
+      await this.callAvatar(token, avatar, `${avatar.name}: decide authorization request`,
+        `Decide whether to approve or deny authorization request ${request.id}.\n\nTarget: task ${input.target.taskId}\nRequested authorization: ${input.authorization.level} (${input.authorization.scope})${credentialNames.length ? ` with vault credentials ${credentialNames.join(', ')}` : ''}\nMissing capabilities: ${request.missingCapabilities.join(', ')}\n${untrustedBlock('reason from the requester', request.reason)}\n\nResolve the request exactly once by calling platform_request with POST /api/authorization-requests/${request.id}/resolve?organizationId=${project.organizationId} and body {"action":"approve"} or {"action":"deny"}. Then briefly report the decision.`,
+        { taskId: input.target.taskId, type: 'avatar.authorization-dispatch-failed', payload: { requestId: request.id, avatarId } });
     }
     return request;
   }
@@ -5082,11 +5052,10 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
 
   async listAuthorizationRequests(
     token: string,
-    input: { organizationId: string; status?: AuthorizationRequest['status']; taskId?: string; avatarId?: string },
+    input: { organizationId: string; status?: AuthorizationRequest['status']; taskId?: string },
   ): Promise<AuthorizationRequest[]> {
-    const projectId = input.taskId ? (await this.deps.store.getTask(input.taskId))?.projectId
-      : input.avatarId ? (await this.deps.store.getAvatar(input.avatarId))?.projectId : undefined;
-    if (!projectId) throw new ValidationError('taskId or avatarId is required');
+    const projectId = input.taskId ? (await this.deps.store.getTask(input.taskId))?.projectId : undefined;
+    if (!projectId) throw new ValidationError('taskId is required');
     (await this.require(token, 'task:read', { projectId, organizationId: input.organizationId,
       ...(input.taskId ? { taskId: input.taskId } : {}) }));
     return (await new AuthorizationRequests(this.deps.store, input.organizationId).requests(input));
@@ -5108,8 +5077,7 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       throw new CapabilityError('this authorization request was not routed to you');
     if (input.action === 'dismiss') {
       const dismissed = (await service.dismiss(request.id, caller.principal));
-      (await this.deps.store.removeAuthorizationInbox(request.id));
-      const event = { taskId: request.target.kind === 'task' ? request.target.taskId : `avatar:${request.target.avatarId}`,
+      const event = { taskId: request.target.taskId,
         type: 'authorization.approval-dismissed', ts: Date.now(), payload: { requestId: request.id } };
       const seq = (await this.deps.store.appendEvent(event));
       this.deps.bus?.emit({ ...event, seq });
@@ -5124,38 +5092,27 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
         || (request.credentialGrants ?? []).some((grant) => !canGrantCredential(caller.caps, grant)))
         throw new CapabilityError('you can no longer grant the complete requested authorization');
       claimId = await service.claim(request.id, input.action, caller.principal);
-      if (request.target.kind === 'task') {
-        const group = (await this.deps.store.attemptGroup(request.target.taskId));
-        const attempts = group?.attempts?.length ? group.attempts : [(await this.deps.store.getTask(request.target.taskId))!];
-        const participant = request.target.participant;
-        for (const attempt of attempts) {
-          if (!participant) {
-            await this.setTaskAuthorization(token, attempt.id, request.authorization, request.credentialGrants, undefined,
-              { acceptAttenuation: false, preserveCredentialGrants: true });
-            continue;
-          }
-          // One agent's own authority: the approver grants exactly the requested
-          // level; the rest of that agent's request (vault, payments) is kept.
-          const current = (await this.deps.store.getTask(attempt.id))!;
-          const requested = this.storedAgentAuthorizations(current)[participant]?.requested ?? {};
-          await this.applyAgentAuthority(token, caller, current, participant,
-            { ...requested, authorization: request.authorization }, { acceptAttenuation: false });
+      const group = (await this.deps.store.attemptGroup(request.target.taskId));
+      const attempts = group?.attempts?.length ? group.attempts : [(await this.deps.store.getTask(request.target.taskId))!];
+      const participant = request.target.participant;
+      for (const attempt of attempts) {
+        if (!participant) {
+          await this.setTaskAuthorization(token, attempt.id, request.authorization, request.credentialGrants, undefined,
+            { acceptAttenuation: false, preserveCredentialGrants: true });
+          continue;
         }
-        if (request.target.queueAfterApproval) {
-          (await this.releaseApprovalWait(request));
-          for (const attempt of attempts) if ((await this.deps.store.getTask(attempt.id))?.params?.draft)
-            await this.queueTask(token, attempt.id);
-          queued = true;
-        }
-      } else {
-        const avatar = (await this.deps.store.getAvatar(request.target.avatarId));
-        if (!avatar || avatar.projectId !== request.projectId) throw new NotFoundError('Avatar no longer exists');
-        for (const capability of avatar.authorization.capabilities) {
-          if (capability.startsWith('use-credential:') && !authorization.capabilities.includes(capability))
-            authorization.capabilities.push(capability);
-        }
-        (await this.deps.store.upsertAvatar({ ...avatar, enabled: request.target.enableAfterApproval ? true : avatar.enabled,
-          authorization: { ...authorization, principal: caller.principal }, updatedAt: Date.now() }));
+        // One agent's own authority: the approver grants exactly the requested
+        // level; the rest of that agent's request (vault, payments) is kept.
+        const current = (await this.deps.store.getTask(attempt.id))!;
+        const requested = this.storedAgentAuthorizations(current)[participant]?.requested ?? {};
+        await this.applyAgentAuthority(token, caller, current, participant,
+          { ...requested, authorization: request.authorization }, { acceptAttenuation: false });
+      }
+      if (request.target.queueAfterApproval) {
+        (await this.releaseApprovalWait(request));
+        for (const attempt of attempts) if ((await this.deps.store.getTask(attempt.id))?.params?.draft)
+          await this.queueTask(token, attempt.id);
+        queued = true;
       }
     }
     const resolved = (await service.resolve(request.id, input.action, caller.principal, claimId));
@@ -5165,19 +5122,11 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       (await this.releaseApprovalWait(request));
       (await this.tellCreatorDenied(request, caller.principal));
     }
-    if (request.target.kind === 'task') {
-      const event = { taskId: request.target.taskId, type: 'authorization.approval-resolved', ts: Date.now(), payload: {
-        requestId: request.id, action: input.action, resolvedBy: caller.principal, queued,
-      } };
-      const seq = (await this.deps.store.appendEvent(event));
-      this.deps.bus?.emit({ ...event, seq });
-    } else {
-      (await this.deps.store.removeAuthorizationInbox(request.id));
-      const event = { taskId: `avatar:${request.target.avatarId}`, type: 'authorization.approval-resolved',
-        ts: Date.now(), payload: { requestId: request.id, action: input.action, resolvedBy: caller.principal } };
-      const seq = (await this.deps.store.appendEvent(event));
-      this.deps.bus?.emit({ ...event, seq });
-    }
+    const event = { taskId: request.target.taskId, type: 'authorization.approval-resolved', ts: Date.now(), payload: {
+      requestId: request.id, action: input.action, resolvedBy: caller.principal, queued,
+    } };
+    const seq = (await this.deps.store.appendEvent(event));
+    this.deps.bus?.emit({ ...event, seq });
     return { ...resolved, ...(queued ? { queued } : {}) };
   }
 
@@ -5473,10 +5422,8 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
       .map(([selector, description]) => ({ selector, description }));
     const creatorUserId = (await this.deps.store.taskCreatorUserId(task.id));
     const avatars = (await __asyncCollections.filter((await this.deps.store.listAvatars(task.projectId)), async (avatar) => (await avatarEnabled(this.deps.store, avatar))
-        && (!avatar.roles.length || avatar.roles.includes('authorize') || avatar.roles.includes('respond'))
         && Boolean(creatorUserId && (await avatarCallableBy(this.deps.store, avatar, creatorUserId)))))
-      .map((avatar) => ({ id: avatar.id, name: avatar.name, ...(avatar.purpose ? { purpose: avatar.purpose } : {}),
-        selector: `avatar:${avatar.id}`, roles: avatar.roles }));
+      .map((avatar) => ({ id: avatar.id, name: avatar.name, selector: `avatar:${avatar.id}` }));
     return { taskId: task.id, users, teams, special, avatars };
   }
 
@@ -6331,40 +6278,15 @@ Act according to your Avatar instructions. Resolve the request exactly once by c
    * answers through the same follow-up API a person uses. */
   private async dispatchAvatarResponders(token: string, task: TaskRecord, selectors: string[], detail: string, role: string): Promise<void> {
     const initiatingUserId = (await this.deps.store.taskCreatorUserId(task.id));
-    for (const selector of selectors) {
-      const avatar = (await this.deps.store.getAvatar(selector.slice(7)));
-      if (!avatar || avatar.projectId !== task.projectId || !(await avatarEnabled(this.deps.store, avatar)))
-        throw new ValidationError(`Avatar route ${selector} is not available in this project`);
-      if (avatar.roles.length && !avatar.roles.includes('respond'))
-        throw new ValidationError(`Avatar "${avatar.name}" is not configured to respond to tasks`);
-      if (!initiatingUserId || !(await avatarCallableBy(this.deps.store, avatar, initiatingUserId)))
-        throw new CapabilityError(`the task creator is not allowed to call Avatar "${avatar.name}"`);
-      try {
-        await this.createTask(token, {
-          projectId: task.projectId,
-          workflow: 'just-do',
-          title: `${avatar.name}: respond to task #${task.num ?? task.id}`,
-          prompt: `You were asked to respond in task #${task.num ?? task.id} (${JSON.stringify(task.title)}):
+    const avatars = await __asyncCollections.map(selectors, (selector) => this.routedAvatar(task, selector, initiatingUserId));
+    for (const avatar of avatars) {
+      await this.callAvatar(token, avatar, `${avatar.name}: respond to task #${task.num ?? task.id}`,
+        `You were asked to respond in task #${task.num ?? task.id} (${JSON.stringify(task.title)}):
 
 ${untrustedBlock('the request', detail)}
 
-Act according to your Avatar instructions. When ready, call platform_request POST /api/tasks/${task.id}/messages with {"text": "<your concrete guidance or decision>", "to": ["agent:${role}"]}. Then briefly report what you sent.`,
-          params: {
-            'agent:do': {
-              avatarId: avatar.id,
-              avatarPurpose: 'respond',
-              provider: avatar.runtime.provider,
-              ...(avatar.runtime.model ? { model: avatar.runtime.model } : {}),
-              ...(avatar.runtime.effort ? { effort: avatar.runtime.effort } : {}),
-            },
-          },
-        });
-      } catch (error) {
-        const failed = { taskId: task.id, type: 'avatar.response-dispatch-failed', ts: Date.now(),
-          payload: { avatarId: avatar.id, error: error instanceof Error ? error.message : String(error) } };
-        const failedSeq = (await this.deps.store.appendEvent(failed));
-        this.deps.bus?.emit({ ...failed, seq: failedSeq });
-      }
+When ready, call platform_request POST /api/tasks/${task.id}/messages with {"text": "<your concrete guidance or decision>", "to": ["agent:${role}"]}. Then briefly report what you sent.`,
+        { taskId: task.id, type: 'avatar.response-dispatch-failed', payload: { avatarId: avatar.id } });
     }
   }
 
@@ -8154,6 +8076,19 @@ Act according to your Avatar instructions. When ready, call platform_request POS
  * cover it, or it administers credentials (wiki plans/PLAN-passwords §6). */
 function canGrantCredential(caps: Capability[], grant: Capability): boolean {
   return allows(caps, grant) || allows(caps, 'credential:write');
+}
+
+/** The level and scope an Avatar grants its forks. */
+function avatarSelection(avatar: Avatar): AuthorizationSelection {
+  return selectionOf(avatar.authorization, avatar.projectId);
+}
+
+/** The stored authorization of a fork acting for `avatar`: the Avatar's
+ * package, backed by the Avatar itself so it is attenuated live. */
+function avatarAuthorization(avatar: Avatar): Record<string, unknown> {
+  return { ...avatarSelection(avatar), profileId: avatar.authorization.profileId,
+    capabilities: [...avatar.authorization.capabilities], attenuated: false, profileAttenuated: false,
+    principal: avatarPrincipal(avatar.id), credentialPolicies: { ...avatar.credentialPolicies } };
 }
 
 /** The level and scope an effective package was minted from. */

@@ -524,7 +524,7 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
         'Ask named people, teams, or Avatars for what only a person can give: an approval, a secret, an action in the real world, a personal decision. ' +
         'For anything an agent could answer, end your turn with the question instead; it goes to your task\'s usual input route (a sub-task\'s parent, else its Responder). ' +
         'This pauses your task at its exact stage and ends your turn. A reply resumes you, and the answer or question you end that turn with reaches them too. ' +
-        'Audience selectors: avatar:<id>, user:<id>, @team:<slug>, @creator, @maintainers, @admins, @superadmins, @owners, @project, or @all. ' +
+        'Audience selectors: avatar:<task id>, user:<id>, @team:<slug>, @creator, @maintainers, @admins, @superadmins, @owners, @project, or @all. ' +
         'Discover valid choices with platform_request GET /api/agent/escalation-targets. ' +
         'urgency orders the human\'s inbox and decides whether their device alerts them: use high only when the ' +
         'person is genuinely blocking progress, and critical only for something that goes wrong if it waits.',
@@ -543,7 +543,7 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
       description:
         'Tell or call people and agents of this task without ending your turn. ' +
         'Notify a person only when you need them to do something; never for updates on your work. People (user:<id>, @team:<slug>, ' +
-        '@creator, @owners, @project, @maintainers, @admins, @all) and Avatars (avatar:<id>) are notified now and keep ' +
+        '@creator, @owners, @project, @maintainers, @admins, @all) and Avatars (avatar:<task id>) are notified now and keep ' +
         'their own pace; agents of this task (agent:do for the main agent, agent:responder, agent:confirm, ' +
         'agent:agent-<n>) are called when your turn ends, in order. The message is said in the task conversation. ' +
         '`agents` calls new agents in, after `to`; each becomes the next agent:agent-<n> (the returned message\'s `to` names them).',

@@ -249,6 +249,7 @@ eval(extractFn('liveOutputFor'));
 eval(extractFn('forkBranchDefaults'));
 eval(extractFn('taskRecord'));
 eval(`async ${extractFn('loadTaskRecord')}`);
+eval(`async ${extractFn('forkTaskAgent')}`);
 eval(extractFn('wireCheckinSidebar'));
 eval(extractFn('wireStopAgents'));
 global.conversationApprovalRequests = () => '<div>Pending approvals</div>';

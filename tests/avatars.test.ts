@@ -1,89 +1,183 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { Store } from '../src/store/db.js';
-import type { Avatar } from '../src/domain/types.js';
-import { applyAvatarProfile, avatarCallableBy, avatarEnabled, avatarForRole } from '../src/platform/avatars.js';
-import { PermissionRequests } from '../src/platform/permission-requests.js';
+import { AuthorizationGrantError, AuthorizationService, projectScope } from '../src/platform/authorization.js';
+import { KarmaxApi } from '../src/platform/api.js';
+import { TokenAuthority } from '../src/platform/tokens.js';
+import { avatarForRole, normalizeAvatarSetting } from '../src/platform/avatars.js';
+import { taskAuthorityNow } from '../src/platform/task-authority.js';
+import { evaluateQuery } from '../src/domain/search.js';
+import { parseQuery } from '../src/domain/query-language.js';
+import type { AuthorizationSelection, TaskRecord } from '../src/domain/types.js';
 
-describe('Avatars', () => {
-  let store: Store;
-  let projectId: string;
-  let avatar: Avatar;
+/**
+ * An Avatar is a task marked Avatar (wiki features/avatars): its forks — a
+ * task's main agent, a Responder, a Reviewer — act with its authorization
+ * without anyone granting it again, while whoever made the fork may call it.
+ */
+async function fixture() {
+  const store = await Store.create(':memory:');
+  await store.claimPersonalOrganization('owner');
+  await store.setOrganizationMembership('org_personal', 'dev', 'member');
+  await store.setOrganizationMembership('org_personal', 'guest', 'member');
+  const project = await store.createProject('Avatars');
+  await store.setProjectMembership(project.id, { kind: 'user', userId: 'dev' }, 'member');
+  const authorization = await AuthorizationService.create(store);
+  await authorization.grant('system:test', { principalId: 'user:owner', scopeKey: projectScope(project.id), profileId: 'maintainer' });
+  await authorization.grant('system:test', { principalId: 'user:dev', scopeKey: projectScope(project.id), profileId: 'developer' });
+  await authorization.grant('system:test', { principalId: 'user:guest', scopeKey: projectScope(project.id), profileId: 'developer' });
+  const tokens = new TokenAuthority(store);
+  const tokenFor = async (userId: string) => (await tokens.mintPrincipal(
+    `user:${userId}`, await authorization.capabilities(`user:${userId}`, project.id, 'org_personal'),
+    project.id, undefined, 'org_personal',
+  )).token;
+  const client = { workflow: {
+    getHandle: () => ({ executeUpdate: async (_name: string, opts: { args: unknown[] }) => ({ applied: Object.keys(opts.args[0] as object) }),
+      query: async () => [], signal: async () => undefined }),
+    start: async () => ({}),
+  } } as any;
+  const api = new KarmaxApi({ store, client, taskQueue: 'test', tokens, authorization });
+  const maintainer: AuthorizationSelection = { level: 'maintainer', scope: 'projects', projectIds: [project.id] };
+  const owner = await tokenFor('owner');
+  // Saved as an Avatar without running: a draft carrying the Avatar setting.
+  const saveAvatar = (avatar: unknown = {}) => api.createTask(owner, { projectId: project.id, draft: true,
+    prompt: 'You are Atlas, the owner’s release delegate.', authorization: maintainer, params: { avatar } });
+  const fork = (token: string, avatarId: string, extra: Record<string, unknown> = {}) => api.createTask(token, {
+    projectId: project.id, draft: true, prompt: 'Ship it',
+    params: { 'agent:do': { provider: 'mock', resumeFrom: { taskId: avatarId, role: 'do' } }, ...extra } });
+  return { store, project, authorization, tokens, tokenFor, api, maintainer, owner, saveAvatar, fork };
+}
 
-  beforeEach(async () => {
-    store = (await Store.create(':memory:'));
-    const project = (await store.createProject('Avatar project'));
-    projectId = project.id;
-    (await store.setOrganizationMembership(project.organizationId!, 'owner', 'owner'));
-    (await store.setOrganizationMembership(project.organizationId!, 'caller', 'member'));
-    (await store.setProjectMembership(projectId, { kind: 'user', userId: 'caller' }, 'member'));
-    const now = Date.now();
-    avatar = {
-      id: 'avatar_atlas', organizationId: project.organizationId!, projectId,
-      ownerUserId: 'owner', name: 'Atlas', purpose: 'Trusted delegate',
-      prompt: 'Exercise the owner’s judgment.', promptVersion: 1, enabled: true,
-      authorityMode: 'full', authorization: {
-        level: 'full', profileId: 'full', scope: 'projects', projectIds: [projectId],
-        organizationId: project.organizationId, capabilities: ['*'],
-      },
-      callableBy: ['@project'], roles: [], runtime: { provider: 'codex', model: 'gpt-5' },
-      createdAt: now, updatedAt: now,
-    };
-    (await store.upsertAvatar(avatar));
+const stored = (task: TaskRecord) => task.params._authorization as { principal?: string; level?: string; capabilities?: string[] };
+
+describe('Avatars are tasks', () => {
+  it('normalizes the setting: callable by the project unless it says otherwise', () => {
+    expect(normalizeAvatarSetting({})).toEqual({ callableBy: ['@project'] });
+    expect(normalizeAvatarSetting(true)).toEqual({ callableBy: ['@project'] });
+    expect(normalizeAvatarSetting({ callableBy: ['@maintainers', 'user:dev', '@team:ops'], forksMayBeAvatars: true }))
+      .toEqual({ callableBy: ['@maintainers', 'user:dev', '@team:ops'], forksMayBeAvatars: true });
+    expect(normalizeAvatarSetting(false)).toBeNull();
+    expect(() => normalizeAvatarSetting({ callableBy: ['everyone'] })).toThrow('not a person, team or group selector');
   });
 
-  it.each([undefined, 'enabled', 'disabled'] as const)('resolves all project overrides with organization %s', async (organization) => {
-    if (organization) (await store.kvSet(`avatars:organization:${avatar.organizationId}`, organization));
-    for (const project of ['inherit', 'enabled', 'disabled'] as const) {
-      (await store.kvSet(`avatars:project:${projectId}`, project));
-      const effective = project === 'inherit' ? organization === 'enabled' : project === 'enabled';
-      expect((await store.avatarAvailability(projectId))).toEqual({ organization: organization === 'enabled', project, effective });
-      expect((await avatarEnabled(store, avatar))).toBe(effective);
-      const task = { projectId, agents: { do: { avatarId: avatar.id, provider: 'mock' as const } } };
-      if (effective) expect((await avatarForRole(store, task, 'do'))).toMatchObject({ id: avatar.id });
-      else await expect((async () => (await avatarForRole(store, task, 'do')))()).rejects.toThrow('disabled');
-      expect((await store.getAvatar(avatar.id))).toMatchObject({ name: 'Atlas', enabled: true });
-    }
+  it('lists a task saved as Avatar, which rests in the Avatar stage and matches is:avatar, not is:draft', async () => {
+    const f = await fixture();
+    const avatar = await f.saveAvatar();
+    expect(avatar.params.avatar).toEqual({ callableBy: ['@project'] });
+    expect((await f.store.listAvatars(f.project.id)).map((a) => [a.id, a.name, a.ownerUserId]))
+      .toEqual([[avatar.id, avatar.title, 'owner']]);
+    const ordinary = await f.api.createTask(f.owner, { projectId: f.project.id, draft: true, prompt: 'Plain draft' });
+    const ids = (q: string) => evaluateQuery([avatar, ordinary], parseQuery(q), { now: 0 }).tasks.map((t) => t.id);
+    expect(ids('is:avatar')).toEqual([avatar.id]);
+    expect(ids('is:draft')).toEqual([ordinary.id]);
+    expect(ids('stage:avatar')).toEqual([avatar.id]);
+    expect(ids('status:done')).toEqual([avatar.id]);
   });
 
-  it('defaults off without changing stored identities', async () => {
-    expect((await store.avatarAvailability(projectId))).toEqual({ organization: false, project: 'inherit', effective: false });
-    expect((await avatarEnabled(store, avatar))).toBe(false);
-    expect((await avatarCallableBy(store, avatar, 'caller'))).toBe(true);
-    expect((await store.getAvatar(avatar.id))).toMatchObject({ enabled: true });
+  it('is on by default; a project that turns Avatars off refuses one', async () => {
+    const f = await fixture();
+    expect(await f.store.avatarAvailability(f.project.id)).toEqual({ organization: true, project: 'inherit', effective: true });
+    await f.store.kvSet(`avatars:project:${f.project.id}`, 'disabled');
+    await expect(f.saveAvatar()).rejects.toThrow('Avatars are disabled for this project');
   });
 
-  it('uses an Avatar prompt and runtime for a selected workflow role', async () => {
-    (await store.kvSet(`avatars:project:${projectId}`, 'enabled'));
-    const selected = (await avatarForRole(store, { projectId, agents: {
-      do: { avatarId: avatar.id, provider: 'claude' },
-    } }, 'do'));
-    const profile = applyAvatarProfile({
-      id: 'do-default', name: 'Do', role: 'do', provider: 'claude',
-      promptTemplate: 'Workflow contract', capabilities: [],
-    }, { avatarId: avatar.id, provider: 'claude' }, selected);
-    expect(profile).toMatchObject({ id: `avatar:${avatar.id}:do`, name: 'Atlas', provider: 'codex', model: 'gpt-5' });
-    expect(profile.promptTemplate).toContain('# Task');
-    expect(profile.promptTemplate).toContain('Exercise the owner’s judgment.');
+  it('gives a fork by someone who may call it the Avatar’s authorization without a grant', async () => {
+    const f = await fixture();
+    const avatar = await f.saveAvatar();
+    const dev = await f.tokenFor('dev');
+    // A developer could never grant maintainer authority themselves…
+    await expect(f.api.createTask(dev, { projectId: f.project.id, prompt: 'x', authorization: f.maintainer }))
+      .rejects.toBeInstanceOf(AuthorizationGrantError);
+    // …but a fork of the owner's maintainer Avatar acts with it.
+    const forked = await f.fork(dev, avatar.id);
+    expect(stored(forked)).toMatchObject({ principal: `avatar:${avatar.id}`, level: 'maintainer' });
+    expect(stored(forked).capabilities).toEqual(stored(avatar).capabilities);
+    const now = await taskAuthorityNow(f.store, f.authorization, forked);
+    expect(now.capabilities).toContain('review:approve');
   });
 
-  it('supports an Avatar-only permission route without inventing a human recipient', async () => {
-    const service = new PermissionRequests(store, avatar.organizationId);
-    const request = (await service.request({
-      taskId: 'task_1', projectId, role: 'do', capabilities: ['task:edit'],
-      audience: [`avatar:${avatar.id}`], recipients: [], avatarRecipients: [avatar.id],
-      reason: 'The task needs its trusted delegate.', requestedBy: 'task-agent:task_1:do',
-    }));
-    expect(request.recipients).toEqual([]);
-    expect(request.avatarRecipients).toEqual([avatar.id]);
-    expect((await service.resolve(request.id, { action: 'approve', by: `avatar:${avatar.id}` })).status).toBe('granted');
-    expect((await service.extensionCaps('task_1', 'do'))).toContain('task:edit');
+  it('lends its forks its creator’s GitHub account', async () => {
+    const f = await fixture();
+    const avatar = await f.saveAvatar();
+    await f.store.patchTaskParams(avatar.id, { _githubAccountId: 'gh_owner' });
+    expect((await f.store.getAvatar(avatar.id))?.githubAccountId).toBe('gh_owner');
+    const forked = await f.fork(await f.tokenFor('dev'), avatar.id);
+    expect(forked.params._githubAccountId).toBe('gh_owner');
   });
 
-  it('preserves Avatar provenance while routing creator responsibilities to its owner', async () => {
-    const task = (await store.createTask({ projectId, title: 'Delegated task', workflow: 'just-do', workflowVersion: '1',
-      params: { prompt: 'Do the delegated work.' }, createdBy: { kind: 'avatar', avatarId: avatar.id } }));
-    expect(task.createdBy).toEqual({ kind: 'avatar', avatarId: avatar.id });
-    expect((await store.taskCreatorUserId(task.id))).toBe('owner');
-    expect((await store.humanAudience(task.id, ['@creator']))).toEqual(['owner']);
+  it('keeps a fork on the Avatar’s authorization through the form’s saves, and starts it', async () => {
+    const f = await fixture();
+    const avatar = await f.saveAvatar();
+    const dev = await f.tokenFor('dev');
+    const forked = await f.fork(dev, avatar.id);
+    // The form re-sends its Authorization editor on every save; a fork ignores it.
+    await f.api.setTaskAuthorization(dev, forked.id, { level: 'developer', scope: 'projects', projectIds: [f.project.id] });
+    expect(stored((await f.store.getTask(forked.id))!)).toMatchObject({ principal: `avatar:${avatar.id}`, level: 'maintainer' });
+    // Editing the draft keeps the rule: it cannot become an Avatar itself.
+    await expect(f.api.updateArmedParams(dev, forked.id, { avatar: {} })).rejects.toThrow('can\'t be Avatars themselves');
+    // And the developer may start it.
+    await expect(f.api.queueTask(dev, forked.id)).resolves.toMatchObject({ id: forked.id });
+  });
+
+  it('treats a fork by someone who may not call it as an ordinary fork', async () => {
+    const f = await fixture();
+    const avatar = await f.saveAvatar({ callableBy: ['user:owner'] });
+    const dev = await f.tokenFor('dev');
+    const forked = await f.fork(dev, avatar.id);
+    expect(stored(forked)).toMatchObject({ principal: 'user:dev', level: 'developer' });
+    await expect(f.api.createTask(dev, { projectId: f.project.id, prompt: 'x', authorization: f.maintainer,
+      params: { 'agent:do': { provider: 'mock', resumeFrom: { taskId: avatar.id, role: 'do' } } } }))
+      .rejects.toBeInstanceOf(AuthorizationGrantError);
+  });
+
+  it('takes callers as groups, resolved live', async () => {
+    const f = await fixture();
+    const avatar = await f.saveAvatar({ callableBy: ['@project'] });
+    const guest = await f.tokenFor('guest'); // a developer, but not a member of the project
+    expect(stored(await f.fork(guest, avatar.id)).principal).toBe('user:guest');
+    await f.store.setProjectMembership(f.project.id, { kind: 'user', userId: 'guest' }, 'member');
+    expect(stored(await f.fork(guest, avatar.id)).principal).toBe(`avatar:${avatar.id}`);
+  });
+
+  it('withdraws the authority at once when calling it is withdrawn', async () => {
+    const f = await fixture();
+    const avatar = await f.saveAvatar();
+    const forked = await f.fork(await f.tokenFor('dev'), avatar.id);
+    const agents = { do: forked.params['agent:do'] as any };
+    expect(await avatarForRole(f.store, { taskId: forked.id, projectId: f.project.id, agents }, 'do')).toMatchObject({ id: avatar.id });
+    await f.store.patchTaskParams(avatar.id, { avatar: { callableBy: ['user:owner'] } });
+    expect(await avatarForRole(f.store, { taskId: forked.id, projectId: f.project.id, agents }, 'do')).toBeUndefined();
+    expect((await taskAuthorityNow(f.store, f.authorization, forked)).capabilities).toEqual([]);
+    // Unmarking it, or turning Avatars off, withdraws it too.
+    await f.store.patchTaskParams(avatar.id, { avatar: { callableBy: ['@project'] } });
+    expect((await taskAuthorityNow(f.store, f.authorization, forked)).capabilities).not.toEqual([]);
+    await f.store.kvSet(`avatars:project:${f.project.id}`, 'disabled');
+    expect((await taskAuthorityNow(f.store, f.authorization, forked)).capabilities).toEqual([]);
+  });
+
+  it('lets a fork be an Avatar itself only when the Avatar allows it', async () => {
+    const f = await fixture();
+    const closed = await f.saveAvatar();
+    const dev = await f.tokenFor('dev');
+    await expect(f.fork(dev, closed.id, { avatar: {} })).rejects.toThrow('can\'t be Avatars themselves');
+    const open = await f.saveAvatar({ forksMayBeAvatars: true });
+    const child = await f.fork(dev, open.id, { avatar: { callableBy: ['user:dev'] } });
+    // The child Avatar is backed by its parent, so its own forks still reach the owner's grant.
+    const grandchild = await f.fork(dev, child.id);
+    expect(stored(grandchild).principal).toBe(`avatar:${child.id}`);
+    expect((await taskAuthorityNow(f.store, f.authorization, grandchild)).capabilities).toContain('review:approve');
+    // A parent that stops allowing it cuts the chain.
+    await f.store.patchTaskParams(open.id, { avatar: { callableBy: ['@project'] } });
+    expect((await taskAuthorityNow(f.store, f.authorization, grandchild)).capabilities).toEqual([]);
+  });
+
+  it('gives a Responder that forks it the Avatar’s authority instead of its own', async () => {
+    const f = await fixture();
+    const avatar = await f.saveAvatar();
+    const task = await f.api.createTask(await f.tokenFor('dev'), { projectId: f.project.id, draft: true, prompt: 'x',
+      params: { responder: { kind: 'agent', provider: 'mock', resumeFrom: { taskId: avatar.id, role: 'do' },
+        authority: { authorization: f.maintainer } } } });
+    expect((task.params._agentAuthorization ?? {}) as object).not.toHaveProperty('responder');
+    expect(await avatarForRole(f.store, { taskId: task.id, projectId: f.project.id,
+      agents: { responder: (task.params.responder as any) } }, 'responder')).toMatchObject({ id: avatar.id });
   });
 });

@@ -40,6 +40,7 @@ eval(extractFn('previousGrantsSummary'));
 eval(extractFn('wireResumeReauthorization'));
 eval(extractFn('agentRoleLabel'));
 eval(extractFn('taskRecord'));
+eval(extractFn('forkedAvatar'));
 eval(extractFn('resumeChosenInner'));
 eval(extractFn('resumeUploadInner'));
 eval(extractFn('resumeCheckHtml'));

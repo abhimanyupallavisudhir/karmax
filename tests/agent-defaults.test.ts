@@ -10,7 +10,6 @@ import {
 import { assertRunnableProvider, isAgentProvider, mockAgentEnabled } from '../src/agent/provider-registry.js';
 import { runTurn } from '../src/agent/runtime.js';
 import { Store } from '../src/store/db.js';
-import type { Avatar } from '../src/domain/types.js';
 
 // tavya.io once ran a new organization's automatic task on the mock agent: with
 // no credentials on the host at first boot, `defaultProvider()` picked the mock,
@@ -88,28 +87,17 @@ describe('the mock agent outside tests', () => {
 });
 
 describe('profiles left on the mock by an earlier boot', () => {
-  const avatar = (provider: 'mock' | 'codex'): Avatar => ({
-    id: `avatar-${provider}`, organizationId: 'org_x', projectId: 'p1', ownerUserId: 'u1', name: provider,
-    purpose: '', prompt: 'p', promptVersion: 1, roles: [], callableBy: ['user:u1'], authorityMode: 'full',
-    runtime: { provider, ...(provider === 'codex' ? { model: 'gpt-5.5' } : {}), effort: 'high' },
-    createdAt: 1, updatedAt: 1,
-  } as unknown as Avatar);
-
   it('are moved onto the default agent, keeping everything else', async () => {
     const store = await Store.create(':memory:');
     await store.upsertProfile({ id: 'do-default', name: 'Do', provider: 'mock', role: 'do', effort: 'high', mcpConnections: [] });
     await store.upsertProfile({ id: organizationProfileId('org_x', 'merge'), name: 'Merge', provider: 'mock', role: 'merge' });
     await store.upsertProfile({ id: projectProfileId('p1', 'do'), name: 'Do', provider: 'codex', model: 'gpt-5.5', role: 'do' });
-    await store.upsertAvatar(avatar('mock'));
-    await store.upsertAvatar(avatar('codex'));
 
-    expect(await repairMockProfiles(store, 'claude')).toBe(3);
+    expect(await repairMockProfiles(store, 'claude')).toBe(2);
     expect(await store.getProfile('do-default')).toEqual({ id: 'do-default', name: 'Do', provider: 'claude',
       model: 'claude-opus-5-5', role: 'do', effort: 'high', mcpConnections: [] });
     expect(await store.getProfile(organizationProfileId('org_x', 'merge'))).toMatchObject({ provider: 'claude', model: 'claude-opus-5-5' });
     expect(await store.getProfile(projectProfileId('p1', 'do'))).toMatchObject({ provider: 'codex', model: 'gpt-5.5' });
-    expect((await store.getAvatar('avatar-mock'))?.runtime).toEqual({ provider: 'claude', model: 'claude-opus-5-5', effort: 'high' });
-    expect((await store.getAvatar('avatar-codex'))?.runtime).toEqual({ provider: 'codex', model: 'gpt-5.5', effort: 'high' });
     // Idempotent.
     expect(await repairMockProfiles(store, 'claude')).toBe(0);
   });
