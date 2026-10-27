@@ -295,9 +295,12 @@ function paddle(items: any[], overrides: Partial<PaddleRuntimeConfig> = {}) {
     if (path !== '/subscriptions/sub_1') return Response.json({ error: { code: 'not_found' } }, { status: 404 });
     if (init.method === 'PATCH') {
       const body = JSON.parse(init.body);
+      // As Paddle: a scheduled change is removed only on its own.
+      if ('scheduled_change' in body && Object.keys(body).length > 1)
+        return Response.json({ error: { code: 'bad_request', detail: 'you cannot combine updating schedule_change with other fields' } }, { status: 400 });
       writes.push(body);
       if ('scheduled_change' in body) subscription.scheduled_change = body.scheduled_change;
-      subscription.items = body.items.map((i: any) => item(i.price_id, i.quantity));
+      else subscription.items = body.items.map((i: any) => item(i.price_id, i.quantity));
       if (lose) throw new Error('connection reset');
     }
     return Response.json({ data: subscription });
@@ -605,11 +608,15 @@ describe('Paddle subscriptions of packs alone', () => {
     expect(await reconcile({ kind: 'compute', subscriptionId: 'sub_1', computePacks: 0 })).toEqual({ id: 'sub_1' });
     await api.provider.updateComputePacks({ subscriptionId: 'sub_1', computePacks: 0, idempotencyKey: 'k' });
     expect(api.writes).toHaveLength(3);
-    // Adding one back keeps the subscription, even at the quantity it already bills.
+    // Adding one back keeps the subscription, even at the quantity it already bills (no item write then).
     await api.provider.updateComputePacks({ subscriptionId: 'sub_1', computePacks: 2, idempotencyKey: 'k' });
-    expect(api.writes.at(-1)).toEqual({ scheduled_change: null, items: [{ price_id: 'pri_compute', quantity: 2 }],
-      proration_billing_mode: 'prorated_next_billing_period' });
+    expect(api.writes.slice(3)).toEqual([{ scheduled_change: null }]);
     expect(api.subscription.scheduled_change).toBeNull();
+    await api.provider.updateComputePacks({ subscriptionId: 'sub_1', computePacks: 0, idempotencyKey: 'k' });
+    await api.provider.updateComputePacks({ subscriptionId: 'sub_1', computePacks: 3, idempotencyKey: 'k' });
+    expect(api.writes.slice(-2)).toEqual([{ scheduled_change: null },
+      { items: [{ price_id: 'pri_compute', quantity: 3 }], proration_billing_mode: 'prorated_next_billing_period' }]);
+    await api.provider.updateComputePacks({ subscriptionId: 'sub_1', computePacks: 2, idempotencyKey: 'k' });
     expect(await reconcile({ kind: 'compute', subscriptionId: 'sub_1', computePacks: 2 })).toEqual({ id: 'sub_1' });
   });
 
@@ -617,8 +624,9 @@ describe('Paddle subscriptions of packs alone', () => {
     const api = paddle([item('pri_pack', 1)]);
     await api.provider.updateStoragePacks({ subscriptionId: 'sub_1', storagePacks: 0, idempotencyKey: 'k' });
     await api.provider.changePlan({ subscriptionId: 'sub_1', plan: 'team', seats: 1, items: {}, idempotencyKey: 'k' });
-    expect(api.writes.at(-1)).toEqual({ scheduled_change: null, items: [{ price_id: 'pri_team', quantity: 1 }, { price_id: 'pri_pack', quantity: 1 }],
-      proration_billing_mode: 'prorated_next_billing_period' });
+    expect(api.writes.slice(-2)).toEqual([{ scheduled_change: null },
+      { items: [{ price_id: 'pri_team', quantity: 1 }, { price_id: 'pri_pack', quantity: 1 }], proration_billing_mode: 'prorated_next_billing_period' }]);
+    expect(api.subscription.scheduled_change).toBeNull();
 
     const planned = paddle([item('pri_individual', 1), item('pri_pack', 2)]);
     planned.subscription.scheduled_change = { action: 'cancel' };

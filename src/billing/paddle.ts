@@ -97,8 +97,8 @@ export class PaddleSubscriptionProvider implements SubscriptionProvider {
     const items = [...plan, ...packItems(catalog, current.items)];
     if (sameItems(current.items, items)) return { id: input.subscriptionId };
     // A plan added to packs that were ending keeps the subscription.
+    if (packsEnding(catalog, current)) await this.keep(input.subscriptionId);
     return this.request(`/subscriptions/${encodeURIComponent(input.subscriptionId)}`, 'PATCH', {
-      ...(packsEnding(catalog, current) ? { scheduled_change: null } : {}),
       items, proration_billing_mode: 'prorated_next_billing_period',
     });
   }
@@ -193,11 +193,17 @@ export class PaddleSubscriptionProvider implements SubscriptionProvider {
     // Cancel does: Paddle has no empty subscription); adding one back keeps it.
     if (!items.length) return ending ? { id: subscriptionId }
       : this.request(`/subscriptions/${encodeURIComponent(subscriptionId)}/cancel`, 'POST', { effective_from: 'next_billing_period' });
-    if (sameItems(subscription.items, items) && !ending) return { id: subscriptionId };
+    if (ending) await this.keep(subscriptionId);
+    if (sameItems(subscription.items, items)) return { id: subscriptionId };
     return this.request(`/subscriptions/${encodeURIComponent(subscriptionId)}`, 'PATCH', {
-      ...(ending ? { scheduled_change: null } : {}),
       items, proration_billing_mode: 'prorated_next_billing_period',
     });
+  }
+  /** Removes the end that removing the last pack scheduled. Paddle takes that
+   * change only on its own ("cannot combine updating scheduled_change with
+   * other fields"), so items follow in a second write. */
+  private async keep(subscriptionId: string) {
+    await this.request(`/subscriptions/${encodeURIComponent(subscriptionId)}`, 'PATCH', { scheduled_change: null });
   }
   async verifyWebhook(raw: Buffer, signature?: string): Promise<BillingEvent> {
     const c = await this.source();
