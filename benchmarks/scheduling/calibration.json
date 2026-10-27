@@ -1,5 +1,5 @@
 {
-  "_source": "tavya.io, 993 task trees and 4,040 metered turns, 2026-08-09..2026-10-27 (task_mvpsonuk2587aa902d). Aggregates only. Dollar figures are API-equivalent; metering before that task's fix missed sub-agents and turns ended by a limit, so tree sizes, burn rate and login capacities are scaled up by assumption (see wiki planned/quota-scheduling).",
+  "_source": "tavya.io, 993 task trees and 4,040 metered turns, 2026-08-09..2026-10-27 (task_mvpsonuk2587aa902d). Aggregates only. Dollar figures are API-equivalent; metering before that task's fix missed sub-agents and turns ended by a limit, so tree sizes, burn rate and login capacities are scaled up by assumption (see wiki features/quota-scheduling).",
   "treeMeanUsd": 36,
   "_treeMeanUsd": "metered mean $17.85 (median $4.5, p99 $346) x2 for unmetered sub-agents and failed turns",
   "treeSigma": 1.53,

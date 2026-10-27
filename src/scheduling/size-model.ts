@@ -102,6 +102,32 @@ export class SizeModel {
     return this.rankAt(a);
   }
 
+  /** A total size drawn given that it exceeds `a` (`u` uniform in [0, 1)). */
+  sampleBeyond(a: number, u: number): number {
+    const p = Math.min(1 - 1e-12, this.cdf(a) + u * (1 - this.cdf(a)));
+    return Math.max(a, Math.exp(this.law.mu + this.law.sigma * normalQuantile(p)));
+  }
+
+  /**
+   * The spend a tree makes from `a` to `a + amount`, cut where its rank changes,
+   * each piece at the lowest rank on the way there (times `weight`): a tree must
+   * win quota at that rank before it reaches a later, higher one, so counting
+   * its later spend at that higher rank would overstate its claim.
+   */
+  pieces(a: number, amount: number, weight: number, out: (rank: number, quota: number) => void): void {
+    const table = this.ranks, end = a + amount;
+    let at = a, lowest = this.rank(a);
+    for (const point of table) {
+      if (point.a <= at) continue;
+      if (at >= end) return;
+      const next = Math.min(end, point.a);
+      out(weight * lowest, next - at);
+      at = next;
+      lowest = Math.min(lowest, point.rank);
+    }
+    if (at < end) out(weight * Math.min(lowest, this.rankAt(end)), end - at);
+  }
+
   private rankAt(a: number): number {
     const median = Math.exp(this.law.mu);
     const alive = this.survival(a);

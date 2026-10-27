@@ -12,7 +12,7 @@ test('UI-35: focusable task rows have a role and escaped accessible name', () =>
 });
 test('UI-35: focusable queue rows name the task and its place in the queue', () => {
   const rows = src.split('\n').filter(line => line.includes('class="queue-item') && line.includes('tabindex="0"'));
-  assert.equal(rows.length, 3, 'merge queue, provider landing and agent queue rows');
+  assert.equal(rows.length, 4, 'merge queue, provider landing, agent queue and agent work rows');
   for (const row of rows) {
     assert.ok(row.includes('role="group"'), row);
     assert.ok(row.includes('aria-label="${esc(queueRowLabel('), row);

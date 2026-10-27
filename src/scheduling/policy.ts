@@ -1,67 +1,77 @@
-import { normalCdf, normalQuantile, type SizeModel } from './size-model.js';
+import { ArrivalForecast, seeded, type Random } from './forecast.js';
+import { adjustRanks, type OrderConstraint } from './order.js';
+import { SampledDemand } from './pricing.js';
+import type { SizeModel } from './size-model.js';
 
 /**
  * Which waiting agent turn gets which model login, and when (wiki
- * planned/quota-scheduling). Two decisions:
+ * features/quota-scheduling).
  *
- * - Whom: the highest rank `w_k · g(a)`, where `w_k` is the priority's delay
- *   cost (an hour of waiting at High costs as much as `w_high / w_low` hours at
- *   Low) and `g(a)` the Gittins rank of the task tree after spending `a`
- *   (sub-tasks count in their root's tree). Ranking by it minimises the total
- *   priority-weighted waiting; since `g` falls as a tree spends, no tree can hog.
- * - When: quota is perishable (a window's remainder is lost at its reset) and
- *   better work may still arrive before then. Admitting a turn of rank `I` must
- *   leave the quota that higher-ranked demand is expected to need until the
- *   window resets: the Littlewood protection level `y` with
- *   `P(D_{>I}(τ) > y) = I / Ī_{>I}` (both lose the same wait, until the next
- *   capacity, if the unit is missing, so the ranks are the fares). As the reset
- *   nears, `D(τ) → 0` and everything left is used.
+ * Objective: least priority-weighted waiting, Σ w_k(tree) · (finish − arrival).
+ * A priority is a delay cost per hour; a task and its sub-tasks are one tree.
  *
- * Units are the caller's (production: API-equivalent dollars, each login's
- * window capacity converted with its learned quota-per-dollar rate). Pure and
- * deterministic, so a workflow activity or the simulator can run it.
+ * - Whom: rank I = w_k · g(a), the Gittins rank of the tree after spending `a`
+ *   (completions per dollar). Trees that spend a lot are ever less likely to be
+ *   about to finish, so g falls and no tree hogs. Orders people set by dragging
+ *   adjust ranks minimally (order.ts).
+ * - When: a login's next unit of quota is worth E[V_(c)] if kept: the rank of the
+ *   c-th unit of demand that would want it before it resets, over sampled
+ *   futures (pricing.ts). A 5-hour window is priced at E[max(V_(c), weekly
+ *   price)]: a unit left in it keeps its weekly unit. A turn starts only on a
+ *   login whose price its rank meets; near a reset the price falls to zero and
+ *   what is left gets used.
+ * - Where: the login whose quota is cheapest (least needed), then the one that
+ *   served the tree last (its prompt cache is warm there), then the soonest reset.
+ *
+ * Times are minutes since the epoch; quota is in API-equivalent dollars (each
+ * window's capacity converted with the login's learned quota-per-dollar rate).
+ * Pure: an activity and the simulator both run it.
  */
 
 export type Priority = 'low' | 'medium' | 'high' | 'urgent';
 
 export interface SchedulingParams {
-  /** Delay cost per hour of waiting, by priority. Urgent is also never held back. */
+  /** Delay cost per hour of waiting, by priority (unset tasks are medium). */
   weights: Record<Priority, number>;
   /** Turns a login may run at once: a safety bound, not the scheduler. */
   maxConcurrent: number;
-  /**
-   * Scale of the protection levels: 1 is Littlewood's rule, 0 never holds quota back.
-   * Littlewood assumes demand turned away is lost; here it only waits and later
-   * takes what higher-ranked work left, so less than 1 is better. The best value
-   * depends on load (simulated: 0.75 at 0.7× capacity and under a 20-sub-task
-   * burst, 0.5 at 1–1.3×); 0.75 is never more than 26% from the best. Tune per
-   * organization with benchmarks/scheduling.ts on its fitted model.
-   */
-  reserve: number;
+  /** Sampled futures per 5-hour window price and per weekly price. */
+  scenarios: number;
+  weekScenarios: number;
+  /** false: never keep quota back (rank order only). */
+  holdBack?: boolean;
 }
 
 export const DEFAULT_SCHEDULING: SchedulingParams = {
-  weights: { low: 1, medium: 3, high: 10, urgent: 100 },
+  weights: { low: 1, medium: 3, high: 10, urgent: 30 },
   maxConcurrent: 10,
-  reserve: 0.75,
+  scenarios: 24,
+  weekScenarios: 12,
 };
 
 export interface QuotaWindow {
   kind: 'session' | 'week';
+  /** Capacity in dollars. */
   capacity: number;
   used: number;
-  /** When it resets; undefined for a session window that starts at its first use. */
+  /** When it resets (minutes); undefined for a session window that starts at its first use. */
   resetAt?: number;
+  /** Its length (minutes). */
   length: number;
 }
 
 export interface LoginState {
   id: string;
   provider: string;
+  /** No windows: quota is not limited (an API key), so it is never held back. */
   windows: QuotaWindow[];
   running: number;
   /** Expected remaining spend of the turns it runs now. */
   committed: number;
+  /** Exhausted until (minutes), as reported by a turn that hit its limit. */
+  blockedUntil?: number;
+  /** A concurrency bound of its own (the login's setting), else `maxConcurrent`. */
+  maxConcurrent?: number;
 }
 
 export interface TreeState {
@@ -76,176 +86,266 @@ export interface TreeState {
   running: number;
   /** Expected remaining spend of its running turns (part of its logins' `committed`). */
   committed: number;
+  /** Turns it can run at once (its sub-tasks). */
+  lanes?: number;
+  /** The login it last ran on. */
+  lastLogin?: string;
 }
 
 export interface TurnRequest {
   id: string;
   treeId: string;
+  /** The task asking (a root or a sub-task), for orders within a tree. */
+  taskId?: string;
   requestedAt: number;
   /** Logins it may use, in its credential order. */
   logins: string[];
 }
 
-export interface DemandForecast {
-  /** Expected new task trees in [from, to) (minutes; time-of-week profile in production). */
-  arrivals(from: number, to: number): number;
-  /** Negative-binomial dispersion of those counts (Infinity: Poisson). */
-  dispersion: number;
-  mix: Record<Priority, number>;
+export interface Forecast {
+  arrivals: Pick<ArrivalForecast, 'sample'>;
   size: SizeModel;
-  /** Typical spend per minute of a new tree's turn. */
+  /** Spend per minute of one turn of a new tree, and the turns a new tree runs at once. */
   burnRate: number;
+  lanes: number;
+}
+
+export type QueueStatus =
+  /** Starts now. */
+  | 'admit'
+  /** Its rank clears a login's price, but that login is running all it may. */
+  | 'next'
+  /** Kept back: its quota is worth more to work expected before the reset. */
+  | 'held'
+  /** Every login it may use has run out. */
+  | 'quota';
+
+export interface QueueEntry {
+  requestId: string;
+  treeId: string;
+  rank: number;
+  status: QueueStatus;
+  loginId?: string;
+  /** When it should start, at the latest (minutes): a price falling, or a reset. */
+  until?: number;
+  /** Its rank was moved by a person's order. */
+  placed?: boolean;
 }
 
 export interface Admission { requestId: string; loginId: string }
+
+export interface ScheduleInput {
+  now: number;
+  logins: LoginState[];
+  trees: TreeState[];
+  requests: TurnRequest[];
+  forecast: Forecast;
+  params?: SchedulingParams;
+  /** Orders between trees (by tree id) and between a tree's tasks (by task id). */
+  order?: OrderConstraint[];
+  seed?: number;
+}
+
+export interface ScheduleResult {
+  admissions: Admission[];
+  /** Every waiting request, in the order it will be served. */
+  queue: QueueEntry[];
+  /** Each login's current price per dollar of its 5-hour window, and of its week. */
+  prices: Record<string, { session: number; week: number }>;
+  /** Every tree's rank, people's orders applied. */
+  ranks: Record<string, number>;
+}
+
+/** Sampled demand for a login's windows, reusable across calls while fresh (the simulator). */
+export interface DemandCache {
+  entries: Map<string, { builtAt: number; demand: SampledDemand }>;
+  /** Minutes a sample stays good for: 5-hour windows, and weeks. */
+  sessionTtl: number;
+  weekTtl: number;
+}
 
 export function treeRank(tree: Pick<TreeState, 'priority' | 'attained'>, size: SizeModel, params: SchedulingParams): number {
   return params.weights[tree.priority] * size.rank(tree.attained);
 }
 
-const remaining = (w: QuotaWindow) => Math.max(0, w.capacity - (w.resetAt === undefined ? 0 : w.used));
+const left = (w: QuotaWindow) => Math.max(0, w.capacity - (w.resetAt === undefined ? 0 : w.used));
+const expiry = (w: QuotaWindow, now: number) => w.resetAt ?? now + w.length;
+const windowOf = (login: LoginState, kind: QuotaWindow['kind']) => login.windows.find((w) => w.kind === kind);
 
-/** Room for another turn, and quota left in every window (a sliver would only cut the turn short). */
-export function usable(login: LoginState, params: SchedulingParams): boolean {
-  return login.running < params.maxConcurrent && login.windows.every((w) => remaining(w) > w.capacity * 1e-3);
+/** Quota left in every window, and not reported exhausted. */
+export function hasQuota(login: LoginState, now: number): boolean {
+  if (login.blockedUntil !== undefined && login.blockedUntil > now) return false;
+  return login.windows.every((w) => left(w) > w.capacity * 1e-3);
 }
 
-interface Spend { mean: number; variance: number; rank: number }
-
 /**
- * Spend expected from work ranked above a given rank before a horizon `tau`
- * (minutes): trees not here yet (a negative-binomial number of arrivals, each
- * spending min(S, burn × time left)) and the further spend of trees already
- * working. Memoised per horizon within one scheduling pass.
+ * Adds a tree's demand before `horizon` to a scenario: its further size drawn
+ * given what it has spent, cut into pieces at the lowest rank on the way, each
+ * wanted when its turns would reach it at their burn rate.
  */
-class Demand {
-  private readonly fresh = new Map<number, { priority: Priority; rank: number; mean: number; variance: number }[]>();
-  private readonly working = new Map<number, { rank: number; mean: number; variance: number }[]>();
+function treeDemand(piece: (rank: number, quota: number, at: number) => void, size: SizeModel, u: Random,
+  spent: number, weight: number, rate: number, start: number, horizon: number): void {
+  if (start >= horizon || rate <= 0) return;
+  const total = size.sampleBeyond(spent, u());
+  const amount = Math.min(total - spent, rate * (horizon - start));
+  let cumulative = 0;
+  size.pieces(spent, amount, weight, (rank, quota) => {
+    cumulative += quota;
+    piece(rank, quota, start + cumulative / rate);
+  });
+}
 
-  constructor(private readonly now: number, private readonly trees: TreeState[],
-    private readonly forecast: DemandForecast, private readonly params: SchedulingParams) {}
+export function schedule(input: ScheduleInput, cache?: DemandCache): ScheduleResult {
+  const { now, forecast } = input;
+  const params = input.params ?? DEFAULT_SCHEDULING;
+  const trees = new Map(input.trees.map((t) => [t.id, { ...t }]));
+  const logins = input.logins.map((l) => ({ ...l, windows: l.windows.map((w) => ({ ...w })) }));
+  const byLogin = new Map(logins.map((l) => [l.id, l]));
+  const order = input.order ?? [];
 
-  /** Trees changed (a turn was admitted): their further spend must be recomputed. */
-  invalidate(): void { this.working.clear(); }
+  // Ranks, moved as little as possible to respect people's orders between trees.
+  const base = new Map([...trees.values()].map((t) => [t.id, treeRank(t, forecast.size, params)]));
+  const ranks = adjustRanks(base, order);
+  const factor = (id: string) => ranks.get(id)! / base.get(id)!;
 
-  above(tau: number, rank: number): Spend {
-    let mean = 0, variance = 0, weighted = 0;
-    for (const x of this.freshAt(tau)) if (x.rank > rank) { mean += x.mean; variance += x.variance; weighted += x.rank * x.mean; }
-    for (const x of this.workingAt(tau)) if (x.rank > rank) { mean += x.mean; variance += x.variance; weighted += x.rank * x.mean; }
-    return { mean, variance, rank: mean > 0 ? weighted / mean : 0 };
-  }
-
-  private freshAt(tau: number) {
-    const key = Math.round(tau);
-    let rows = this.fresh.get(key);
-    if (rows) return rows;
-    const { forecast, params } = this;
-    const expected = forecast.arrivals(this.now, this.now + tau);
-    const nodes = [1, 3, 5, 7].map((i) => tau * i / 8); // time left after a uniform arrival
-    const m1 = nodes.reduce((s, t) => s + forecast.size.expectedMin(forecast.burnRate * t), 0) / nodes.length;
-    const m2 = nodes.reduce((s, t) => s + forecast.size.expectedMinSquared(forecast.burnRate * t), 0) / nodes.length;
-    rows = (Object.keys(forecast.mix) as Priority[]).map((priority) => {
-      const n = expected * forecast.mix[priority];
-      const dispersion = Number.isFinite(forecast.dispersion) ? n * n * m1 * m1 / forecast.dispersion : 0;
-      return { priority, rank: treeRank({ priority, attained: 0 }, forecast.size, params), mean: n * m1, variance: n * m2 + dispersion };
+  // Sampled demand before each login's resets (the same for logins resetting together).
+  const local = new Map<string, SampledDemand>();
+  const demandFor = (login: LoginState, kind: QuotaWindow['kind']): SampledDemand | undefined => {
+    const w = windowOf(login, kind);
+    if (!w) return undefined;
+    const horizon = expiry(w, now) - now;
+    // A window not started yet always has its full length ahead: one key for all of them.
+    const key = `${login.provider}:${kind}:${w.resetAt === undefined ? 'fresh' : Math.round(w.resetAt)}`;
+    const memo = local.get(key);
+    if (memo) return memo;
+    const ttl = kind === 'session' ? cache?.sessionTtl : cache?.weekTtl;
+    const hit = cache?.entries.get(key);
+    if (hit && ttl !== undefined && now - hit.builtAt < ttl) { local.set(key, hit.demand); return hit.demand; }
+    const demand = new SampledDemand(Math.max(1, horizon));
+    const u = seeded(((input.seed ?? 0) * 1_000_003 + Math.round(now) * 31 + (kind === 'week' ? 7 : 0)) >>> 0);
+    const runs = kind === 'session' ? params.scenarios : params.weekScenarios;
+    for (let s = 0; s < runs; s++) demand.add((piece) => {
+      for (const t of trees.values()) {
+        const lanes = Math.max(1, t.running, t.lanes ?? 1);
+        treeDemand(piece, forecast.size, u, t.attained + t.committed, params.weights[t.priority] * factor(t.id),
+          lanes * t.burnRate, 0, horizon);
+      }
+      for (const arrival of forecast.arrivals.sample(now, now + horizon, u)) {
+        treeDemand(piece, forecast.size, u, 0, params.weights[arrival.priority], forecast.lanes * forecast.burnRate,
+          arrival.at - now, horizon);
+      }
     });
-    this.fresh.set(key, rows);
-    return rows;
+    if (cache && ttl !== undefined) {
+      for (const [k, v] of cache.entries) if (now - v.builtAt >= Math.max(cache.sessionTtl, cache.weekTtl)) cache.entries.delete(k);
+      cache.entries.set(key, { builtAt: now, demand });
+    }
+    local.set(key, demand);
+    return demand;
+  };
+
+  // c for a login: the quota of its provider's logins that comes before its own runs out.
+  /**
+   * The c in E[V^{>r}_(c)] for a login's window: every unit of the provider's
+   * logins that work wanting quota before that window resets could use instead
+   * (demand past one login spills to the next, and waits only past all of them),
+   * less what running turns will still spend. Only quota that exists by then
+   * counts: before a 5-hour reset, the quota there is now; within a week, also
+   * the 5-hour windows that open meanwhile, but not another login's next week.
+   */
+  const ahead = (login: LoginState, kind: QuotaWindow['kind']): number => {
+    const horizon = expiry(windowOf(login, kind)!, now);
+    let total = 0;
+    for (const other of logins) {
+      if (other.provider !== login.provider) continue;
+      const session = windowOf(other, 'session'), week = windowOf(other, 'week');
+      const open = hasQuota(other, now);
+      const sessionTotal = session ? (open ? left(session) : 0)
+        + (kind === 'week' ? Math.max(0, Math.ceil((horizon - expiry(session, now)) / session.length)) * session.capacity : 0) : Infinity;
+      const usable = Math.min(sessionTotal, week ? (open ? left(week) : 0) : Infinity);
+      if (Number.isFinite(usable)) total += usable - other.committed;
+    }
+    return Math.max(0, total);
+  };
+
+  // What a login's next unit is worth, kept, to work ranked above `rank`; memoised until a grant changes the quota ahead.
+  let granted = 0;
+  const memo = new Map<string, { session: number; week: number }>();
+  const priceOf = (login: LoginState, rank: number): { session: number; week: number } => {
+    if (params.holdBack === false) return { session: 0, week: 0 };
+    const key = `${login.id}|${rank}|${granted}`;
+    const hit = memo.get(key);
+    if (hit) return hit;
+    const week = windowOf(login, 'week') ? demandFor(login, 'week')!.price(ahead(login, 'week'), 0, 0, rank) : 0;
+    const session = windowOf(login, 'session') ? demandFor(login, 'session')!.price(ahead(login, 'session'), week, 0, rank) : week;
+    const price = { session, week };
+    memo.set(key, price);
+    return price;
+  };
+
+  // Within a tree, people's orders between its tasks, else first asked first.
+  const within = new Map<string, number>();
+  for (const [treeId] of trees) {
+    const own = input.requests.filter((r) => r.treeId === treeId).sort((a, b) => a.requestedAt - b.requestedAt);
+    const local = new Map(own.map((r, i) => [r.taskId ?? r.id, Math.exp(-i * 1e-3)]));
+    const adjusted = adjustRanks(local, order);
+    for (const r of own) within.set(r.id, adjusted.get(r.taskId ?? r.id) ?? 1);
   }
+  const requests = input.requests.filter((r) => trees.has(r.treeId)).sort((a, b) =>
+    ranks.get(b.treeId)! - ranks.get(a.treeId)! || (a.treeId === b.treeId ? within.get(b.id)! - within.get(a.id)! : 0)
+    || a.requestedAt - b.requestedAt);
 
-  private workingAt(tau: number) {
-    const key = Math.round(tau);
-    let rows = this.working.get(key);
-    if (rows) return rows;
-    rows = this.trees.filter((t) => t.running > 0).map((tree) => {
-      const next = this.forecast.size.residual(tree.attained, tree.burnRate * tree.running * tau);
-      return { rank: treeRank(tree, this.forecast.size, this.params), mean: Math.max(0, next.mean - tree.committed), variance: next.variance };
-    });
-    this.working.set(key, rows);
-    return rows;
+  const admissions: Admission[] = [];
+  const queue: QueueEntry[] = [];
+  const placed = new Set(order.flatMap((c) => [c.above, c.below]));
+  for (const request of requests) {
+    const tree = trees.get(request.treeId)!;
+    const rank = ranks.get(tree.id)!;
+    const allowed = request.logins.map((id) => byLogin.get(id)).filter((l): l is LoginState => !!l);
+    const withQuota = allowed.filter((l) => hasQuota(l, now));
+    const entry: QueueEntry = { requestId: request.id, treeId: tree.id, rank, status: 'quota',
+      ...(placed.has(tree.id) || placed.has(request.taskId ?? '') ? { placed: true } : {}) };
+    if (!withQuota.length) {
+      const resets = allowed.map((l) => Math.max(l.blockedUntil ?? 0,
+        ...l.windows.filter((w) => left(w) <= w.capacity * 1e-3).map((w) => expiry(w, now))));
+      if (resets.length) entry.until = Math.min(...resets);
+      queue.push(entry);
+      continue;
+    }
+    const affordable = withQuota.filter((l) => rank >= priceOf(l, rank).session);
+    const open = affordable.filter((l) => l.running < (l.maxConcurrent ?? params.maxConcurrent));
+    if (open.length) {
+      const sessionEnd = (l: LoginState) => { const w = windowOf(l, 'session'); return w ? expiry(w, now) : Infinity; };
+      // The quota least needed by better work first (rounded: tiny differences are noise), then a warm cache, then the soonest reset.
+      const cost = (l: LoginState) => Math.round(priceOf(l, rank).session / Math.max(rank, 1e-12) * 100);
+      open.sort((a, b) => cost(a) - cost(b)
+        || Number(b.id === tree.lastLogin) - Number(a.id === tree.lastLogin)
+        || sessionEnd(a) - sessionEnd(b));
+      const login = open[0]!;
+      admissions.push({ requestId: request.id, loginId: login.id });
+      queue.push({ ...entry, status: 'admit', loginId: login.id });
+      login.running += 1;
+      login.committed += tree.turnCost;
+      for (const w of login.windows) if (w.resetAt === undefined && w.kind === 'session') w.resetAt = now + w.length;
+      tree.running += 1;
+      tree.committed += tree.turnCost;
+      tree.lastLogin = login.id;
+      granted++;
+      continue;
+    }
+    if (affordable.length) { queue.push({ ...entry, status: 'next' }); continue; }
+    // Held: when will some login's price have fallen to its rank?
+    let until = Infinity;
+    for (const login of withQuota) {
+      const { week } = priceOf(login, rank);
+      // Held by the week: until the weekly price falls; else until the window's does.
+      const release = week > rank
+        ? demandFor(login, 'week')!.releaseIn(rank, ahead(login, 'week'))
+        : demandFor(login, 'session')?.releaseIn(rank, ahead(login, 'session'), week) ?? 0;
+      until = Math.min(until, now + release);
+    }
+    queue.push({ ...entry, status: 'held', ...(Number.isFinite(until) ? { until } : {}) });
   }
-}
-
-const until = (now: number, window: QuotaWindow) => (window.resetAt ?? now + window.length) - now;
-
-/**
- * Quota that work ranked above `rank` is expected to need before `window`
- * resets: Littlewood's protection level y with P(D > y) = rank / Ī, for D the
- * higher-ranked demand and Ī its demand-weighted mean rank.
- */
-function protectionLevel(now: number, window: QuotaWindow, rank: number, demand: Demand, params: SchedulingParams): number {
-  const tau = until(now, window);
-  if (params.reserve <= 0 || tau <= 0) return 0;
-  const d = demand.above(tau, rank);
-  if (d.mean <= 0 || rank >= d.rank) return 0;
-  return params.reserve * Math.max(0, d.mean + normalQuantile(1 - rank / d.rank) * Math.sqrt(d.variance));
-}
-
-/** Quota of this provider's logins available before `window` of `login` resets (refills included). */
-function poolQuota(now: number, login: LoginState, window: QuotaWindow, logins: LoginState[]): number {
-  const horizon = now + until(now, window);
-  let total = 0;
-  for (const other of logins) {
-    if (other.provider !== login.provider) continue;
-    const w = other.windows.find((x) => x.kind === window.kind);
-    if (!w) continue;
-    total += remaining(w) - other.committed;
-    if (w.resetAt !== undefined && w.resetAt < horizon) total += w.capacity;
-  }
-  return total;
-}
-
-/**
- * How likely the quota a turn would spend on `login` is to be missed before it
- * comes back: the chance, per window, that all expected work outruns the pool's
- * quota before that window resets. A login whose week resets soon costs almost
- * nothing to drain; spreading work over every login would instead run all their
- * weeks out together, and nothing could run for days.
- */
-function scarcity(now: number, login: LoginState, logins: LoginState[], demand: Demand): number {
-  let worst = 0;
-  for (const w of login.windows) {
-    const d = demand.above(until(now, w), -Infinity);
-    if (d.mean <= 0) continue;
-    const z = (d.mean - poolQuota(now, login, w, logins)) / Math.max(1e-9, Math.sqrt(d.variance));
-    worst = Math.max(worst, normalCdf(z));
-  }
-  return worst;
-}
-
-/** Earliest-resetting session first among equally scarce logins: its remainder is the first to be lost. */
-const sessionReset = (login: LoginState) => login.windows.find((w) => w.kind === 'session')?.resetAt ?? Infinity;
-
-export function schedule(now: number, logins: LoginState[], trees: TreeState[], requests: TurnRequest[],
-  forecast: DemandForecast, params: SchedulingParams = DEFAULT_SCHEDULING): Admission[] {
-  const working = trees.map((t) => ({ ...t }));
-  const byId = new Map(working.map((t) => [t.id, t]));
-  const state = logins.map((l) => ({ ...l, windows: l.windows.map((w) => ({ ...w })) }));
-  const loginById = new Map(state.map((l) => [l.id, l]));
-  const demand = new Demand(now, working, forecast, params);
-  const ranked = requests
-    .map((request) => ({ request, tree: byId.get(request.treeId)! }))
-    .filter((x) => x.tree)
-    .map((x) => ({ ...x, rank: treeRank(x.tree, forecast.size, params) }))
-    .sort((a, b) => b.rank - a.rank || a.request.requestedAt - b.request.requestedAt);
-  const admitted: Admission[] = [];
-  for (const { request, tree, rank } of ranked) {
-    const candidates = request.logins.map((id) => loginById.get(id)).filter((l): l is LoginState => !!l && usable(l, params))
-      .map((l) => ({ l, scarce: Math.round(100 * scarcity(now, l, state, demand)) })) // within 1%: equally scarce
-      .sort((a, b) => a.scarce - b.scarce || sessionReset(a.l) - sessionReset(b.l)).map((x) => x.l);
-    // Littlewood: protection binds only when higher-ranked demand is expected; otherwise any quota left is used.
-    const login = candidates.find((l) => tree.priority === 'urgent' || l.windows.every((w) => {
-      const protect = protectionLevel(now, w, rank, demand, params);
-      return protect <= 0 || poolQuota(now, l, w, state) - tree.turnCost >= protect;
-    }));
-    if (!login) continue;
-    admitted.push({ requestId: request.id, loginId: login.id });
-    login.running += 1;
-    login.committed += tree.turnCost;
-    tree.running += 1;
-    tree.committed += tree.turnCost;
-    demand.invalidate();
-    for (const w of login.windows) if (w.resetAt === undefined && w.kind === 'session') w.resetAt = now + w.length;
-  }
-  return admitted;
+  // For people: what each login's next unit is worth to the lowest-ranked work.
+  const prices: ScheduleResult['prices'] = Object.fromEntries(logins.map((l) => [l.id, priceOf(l, 0)]));
+  return { admissions, queue, prices, ranks: Object.fromEntries(ranks) };
 }

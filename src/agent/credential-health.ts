@@ -89,6 +89,15 @@ export async function refreshCredentialHealth(
         : probeClaudeUsage({ configHome }))
         .then(async (snapshot) => {
           (await deps.store.kvSet(`usage:${credential.key}`, JSON.stringify(snapshot)));
+          // The quota scheduler reads windows from readings it can line up with spend.
+          if (snapshot.ok && 'kvCompareAndSet' in deps.store) {
+            const { recordQuotaReading } = await import('../scheduling/state.js');
+            for (const window of ['session', 'week'] as const) {
+              const w = snapshot[window];
+              if (w) await recordQuotaReading(deps.store as Parameters<typeof recordQuotaReading>[0], credential.key, window,
+                { utilization: w.pct / 100, ...(w.resetAt ? { resetsAt: w.resetAt } : {}), at: snapshot.at }).catch(() => undefined);
+            }
+          }
           if (usageProvesAvailable(snapshot)) {
             // Clear only an automatic quarantine. The compare guard runs inside
             // the coordinator, so a racing user disable cannot be overwritten.

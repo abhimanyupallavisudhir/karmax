@@ -657,7 +657,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   },
   {
     name: 'set_task_priority',
-    description: 'Set a task\'s organizational priority — for search/sorting only, never sent to any agent.',
+    description: 'Set a task\'s priority. Higher priority gets model quota first, and quota is kept back for it; a task\'s sub-tasks share its priority. Unset counts as medium. Never sent to any agent.',
     parameters: {
       type: 'object',
       properties: { task_id: { type: 'string' }, priority: { type: 'string', enum: [...PRIORITY_NAMES] } },

@@ -8524,6 +8524,46 @@ export class Store {
     return Number(row?.priority ?? 0);
   }
 
+  /**
+   * The task tree a task belongs to (wiki features/quota-scheduling): its root,
+   * the root's priority (sub-tasks share it) and organization, without loading
+   * any transcript.
+   */
+  async taskTree(taskId: string): Promise<{ root: string; priority: number; projectId: string; organizationId: string; createdAt: number } | undefined> {
+    let id = taskId;
+    for (let hops = 0; hops < 64; hops++) {
+      const [row] = await this.readRows<{ parentTaskId: string | null; projectId: string; priority: unknown; createdAt: number;
+        organizationId: string | null }>(`SELECT t.parentTaskId, t.projectId, json_extract(t.params, '$.priority') AS priority, t.createdAt,
+        p.organizationId FROM tasks t LEFT JOIN projects p ON p.id=t.projectId WHERE t.id=?`, [id]);
+      if (!row) return undefined;
+      if (!row.parentTaskId) return { root: id, priority: Number(row.priority ?? 0), projectId: row.projectId,
+        organizationId: row.organizationId ?? 'org_personal', createdAt: Number(row.createdAt) };
+      id = row.parentTaskId;
+    }
+    return undefined;
+  }
+
+  /** Root tasks of an organization created since `since` (ms), oldest first, with their priority (the scheduler's arrival forecast). */
+  async rootTaskArrivals(organizationId: string, since: number): Promise<{ id: string; createdAt: number; priority: number }[]> {
+    const rows = await this.readRows<{ id: string; createdAt: number; priority: unknown }>(`SELECT t.id, t.createdAt,
+      json_extract(t.params, '$.priority') AS priority FROM tasks t JOIN projects p ON p.id=t.projectId
+      WHERE COALESCE(p.organizationId, 'org_personal')=? AND t.parentTaskId IS NULL AND t.createdAt>=? ORDER BY t.createdAt`,
+    [organizationId, since]);
+    return rows.map((r) => ({ id: r.id, createdAt: Number(r.createdAt), priority: Number(r.priority ?? 0) }));
+  }
+
+  /** When each of these tasks finished, for those that have. */
+  async taskCompletions(ids: string[]): Promise<Map<string, number>> {
+    const out = new Map<string, number>();
+    for (let i = 0; i < ids.length; i += 500) {
+      const chunk = ids.slice(i, i + 500);
+      const rows = await this.readRows<{ id: string; completedAt: number | null }>(
+        `SELECT id, completedAt FROM tasks WHERE completedAt IS NOT NULL AND id IN (${chunk.map(() => '?').join(',')})`, chunk);
+      for (const r of rows) if (r.completedAt != null) out.set(r.id, Number(r.completedAt));
+    }
+    return out;
+  }
+
   /** An attempt group's size and commitment, without hydrating its attempts (RT-14). */
   async attemptSummary(taskOrIntentId: string): Promise<{ attempts: number; committedAttemptId?: string; otherAttempts?: 'keep' | 'cancel' } | undefined> {
     const [row] = await this.readRows<{ id: string; committedAttemptId: string | null; attempts: number }>(`SELECT i.id, i.committedAttemptId,
