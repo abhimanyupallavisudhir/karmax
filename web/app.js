@@ -22755,9 +22755,40 @@ function planMeter(used, limit) {
   const pct = Math.min(100, (Number(used) || 0) / limit * 100);
   return `<span class="plan-meter${pct >= 100 ? ' over' : pct >= 80 ? ' near' : ''}" role="meter" aria-valuemin="0" aria-valuemax="${esc(limit)}" aria-valuenow="${esc(Math.min(Number(used) || 0, limit))}"><i style="width:${pct.toFixed(1)}%"></i></span>`;
 }
-function planStepper(kind, count, title) {
+// `checkout`: the first pack beside a gifted plan, bought at checkout.
+function planStepper(kind, count, title, checkout = false) {
   return `<span class="pack-stepper" title="${esc(title)}"><button class="icon-btn billing-packs" data-kind="${kind}" data-packs="${count - 1}" aria-label="Remove a ${kind} pack" ${count > 0 ? '' : 'disabled'}>−</button>`
-    + `<b>${count}</b><button class="icon-btn billing-packs" data-kind="${kind}" data-packs="${count + 1}" aria-label="Add a ${kind} pack">+</button><span class="setting-muted">pack${count === 1 ? '' : 's'}</span></span>`;
+    + `<b>${count}</b><button class="icon-btn ${checkout ? 'billing-buy' : 'billing-packs'}" data-kind="${kind}" data-packs="${count + 1}" data-add aria-label="Add a ${kind} pack">+</button><span class="setting-muted">pack${count === 1 ? '' : 's'}</span></span>`;
+}
+function checkoutTermsTip() {
+  const d = S.launch?.checkoutDisclosures || {};
+  return policyTip([d.renewalDisclosure || 'Plans renew monthly until canceled.', d.cancellationDisclosure || 'Cancel online here before renewal.',
+    d.refundDisclosure || 'Payments are non-refundable except where the law requires.'].join(' '));
+}
+// A first purchase beside a gifted plan: what it costs, the policies, then checkout.
+function openPlanCheckoutDialog(title, price, order, post) {
+  const overlay = document.createElement('div'); overlay.className = 'modal-overlay';
+  overlay.innerHTML = `<div class="modal-card plan-checkout-dialog" role="dialog" aria-modal="true" aria-label="${esc(title)}">
+    <div class="modal-head"><b>${esc(title)}</b><button class="icon-btn plan-checkout-close" type="button" aria-label="Close">×</button></div>
+    <p class="plan-checkout-price">${esc(price)}</p>
+    <div class="plan-terms">${policyAcceptanceMarkup('checkout', 'checkout-policy-acceptance')} ${checkoutTermsTip()}</div>
+    <div class="modal-actions"><button class="btn plan-checkout-cancel" type="button">Cancel</button><button class="btn primary plan-checkout-go" type="button">Checkout</button></div>
+  </div>`;
+  const close = () => { document.removeEventListener('keydown', keydown); overlay.remove(); };
+  const keydown = (event) => { if (event.key === 'Escape') close(); };
+  overlay.addEventListener('click', (event) => { if (event.target === overlay) close(); });
+  overlay.querySelector('.plan-checkout-close').addEventListener('click', close);
+  overlay.querySelector('.plan-checkout-cancel').addEventListener('click', close);
+  overlay.querySelector('.plan-checkout-go').addEventListener('click', async (event) => {
+    const button = event.currentTarget; button.disabled = true;
+    try {
+      const acceptance = readPolicyAcceptance('checkout');
+      const result = await post('checkout', { ...order, acceptedPolicies: acceptance.accepted, policyVersions: acceptance.versions });
+      location.assign(result.url);
+    } catch (error) { toast(error.message, true); button.disabled = false; }
+  });
+  document.body.appendChild(overlay); document.addEventListener('keydown', keydown);
+  overlay.querySelector('#checkout-policy-acceptance').focus();
 }
 function planBillingMarkup(e, state) {
   if (!e) return '<span class="task-sub">Plan information is temporarily unavailable.</span>';
@@ -22769,20 +22800,32 @@ function planBillingMarkup(e, state) {
   const billed = state?.billedPlan || e.plan;
   const subscribed = Boolean(state) && billed !== 'free' && !['none', 'canceled', 'incomplete_expired'].includes(state.status);
   const paying = subscribed && PLAN_ACTIVE.includes(state.status);
+  // A subscription of packs alone, bought beside a gifted plan.
+  const packsOnly = Boolean(state) && billed === 'free' && PLAN_ACTIVE.includes(state.status);
+  const ending = packsOnly && state.cancelAtPeriodEnd;
   const owner = Boolean(state?.canManage);
   const busy = state?.pendingRequest;
   const disabled = !owner ? 'disabled title="Only an organization owner can change the plan"' : busy ? 'disabled title="Wait for the pending billing request"' : '';
+  // A gifted plan without a subscription buys its first packs (or Team) at checkout.
+  const checkoutOpen = Boolean(state?.providerConfigured && S.launch?.paidLaunch && S.launch?.ready);
+  const giftCheckout = Boolean(state?.gift) && !subscribed && !packsOnly && checkoutOpen;
+  const canPacks = owner && (paying || packsOnly || giftCheckout);
   // Header: the plan, its state when it isn't plainly active, and its price.
   const statusChip = state?.gift && !subscribed ? 'Gifted'
     : state?.cancelAtPeriodEnd && state.currentPeriodEnd ? `Ends ${day(state.currentPeriodEnd)}`
     : ({ past_due: 'Payment failed', unpaid: 'Unpaid', paused: 'Paused', incomplete: 'Checkout incomplete', trialing: 'Trial' })[state?.status] || '';
-  const price = (state?.gift && !subscribed) || e.plan === 'free' ? '' : `${planMoney(e.currentMonthlyPriceCents)}/month`;
-  const renews = paying && !state.cancelAtPeriodEnd && state.currentPeriodEnd ? ` · renews ${day(state.currentPeriodEnd)}` : '';
-  const change = paying && billed === 'individual' ? `<button class="btn sm billing-change" data-plan="team" ${disabled}>Upgrade to Team</button>`
+  const price = packsOnly ? `Packs ${planMoney(state.billedMonthlyPriceCents)}/month`
+    : (state?.gift && !subscribed) || e.plan === 'free' ? '' : `${planMoney(e.currentMonthlyPriceCents)}/month`;
+  const renews = (paying || packsOnly) && state.currentPeriodEnd
+    ? ending ? ` · end ${day(state.currentPeriodEnd)}` : !state.cancelAtPeriodEnd ? ` · renews ${day(state.currentPeriodEnd)}` : '' : '';
+  // More people need Team: a paid Individual changes plan, a gifted one buys Team.
+  const change = (paying && billed === 'individual') || (packsOnly && state.gift?.plan === 'individual')
+    ? `<button class="btn sm billing-change" data-plan="team" ${disabled}>Upgrade to Team</button>`
+    : giftCheckout && state.gift.plan === 'individual' ? `<button class="btn sm billing-buy" data-plan="team" ${disabled}>Upgrade to Team</button>`
     : paying && billed === 'team' ? `<button class="btn sm billing-change" data-plan="individual" ${disabled || (e.activeUsers > 1 ? 'disabled title="Remove other members first"' : '')}>Switch to Individual</button>` : '';
   const head = `<div class="plan-head"><span class="plan-name">${esc(e.planName)}</span>${statusChip ? `<span class="chip${state?.status === 'past_due' || state?.status === 'unpaid' ? ' failed' : ''}">${esc(statusChip)}</span>` : ''}
     <span class="setting-muted plan-price">${esc(price + renews)}</span><span class="label-row-fill"></span>
-    ${change}${subscribed ? `<button class="btn sm billing-portal" ${owner ? '' : disabled} title="Payment method and invoices">Billing</button>` : ''}
+    ${change}${subscribed || packsOnly ? `<button class="btn sm billing-portal" ${owner ? '' : disabled} title="Payment method and invoices">Billing</button>` : ''}
     ${paying && !state.cancelAtPeriodEnd ? `<button class="btn sm ghost billing-cancel" ${owner ? '' : disabled}>Cancel plan</button>` : ''}</div>`;
   // People.
   const members = Number(e.currentMemberCount ?? e.activeUsers ?? 0);
@@ -22802,10 +22845,10 @@ function planBillingMarkup(e, state) {
   const storageParts = [`${formatBytes(e.includedStorageBytes)} with ${e.planName}`,
     e.storagePacks ? `${formatBytes(e.storagePacks * e.storagePackBytes)} in ${plural(e.storagePacks, 'pack')}` : '',
     e.giftedStoragePacks ? `${formatBytes(e.giftedStoragePacks * e.storagePackBytes)} gifted` : ''].filter(Boolean).join(' + ');
-  const canStorage = paying && owner && state?.storagePack?.available;
+  const canStorage = canPacks && state?.storagePack?.available;
   const storageRow = `<div class="setting-row plan-limit" data-limit="storage"><span class="setting-label">Storage ${policyTip(`Project data, saved task workspaces and review files. ${storageParts}.`)}</span>
     <span class="setting-value">${planMeter(e.storageUsedBytes, e.storageQuotaBytes)}<span><b>${esc(formatBytes(e.storageUsedBytes ?? 0))}</b> <span class="setting-muted">of ${esc(formatBytes(e.storageQuotaBytes))}</span></span></span>
-    ${canStorage ? `<span class="setting-actions">${planStepper('storage', Number(state.storagePacks || 0), `Each pack adds ${formatBytes(storagePack.bytes)} for ${planMoney(storagePack.monthlyPriceCents)}/month`)}</span>` : ''}</div>`;
+    ${canStorage ? `<span class="setting-actions">${planStepper('storage', ending ? 0 : Number(state.storagePacks || 0), `Each pack adds ${formatBytes(storagePack.bytes)} for ${planMoney(storagePack.monthlyPriceCents)}/month`, giftCheckout)}</span>` : ''}</div>`;
   // Compute: only where the installation runs computers itself.
   let computeRow = '', topUpRow = '';
   if (e.compute) {
@@ -22819,11 +22862,11 @@ function planBillingMarkup(e, state) {
       e.giftedComputePacks ? `${planDollars(e.giftedComputePacks * e.computePackCreditMicros)} gifted` : '',
       topUp ? `${planDollars(topUp)} topped up, kept until used` : ''].filter(Boolean).join(' + ');
     const tip = `Cloud computers ${siteName()} runs for you (${providers}), at twice the provider’s price: a 2 CPU · 2 GB E2B computer is about $0.27 an hour. Resets ${day(e.compute.to)}. Computers on your own provider accounts aren’t counted. ${credit ? `${parts}.` : ''}${held ? ` ${planDollars(held)} is held for computers running now.` : ''}`;
-    const canCompute = paying && owner && state?.computePack?.available;
+    const canCompute = canPacks && state?.computePack?.available;
     computeRow = `<div class="setting-row plan-limit" data-limit="compute"><span class="setting-label">Compute ${policyTip(tip.trim())}</span>
       <span class="setting-value">${credit ? `${planMeter(Number(e.compute.usedMicros || 0) + held, credit)}<span><b>${esc(planDollars(e.compute.usedMicros))}</b> <span class="setting-muted">of ${esc(planDollars(credit))} this month</span></span>`
         : '<span class="setting-muted">With a paid plan</span>'}</span>
-      ${canCompute ? `<span class="setting-actions">${planStepper('compute', Number(state.computePacks || 0), `Each pack adds ${planDollars(pack.creditMicros)} of compute a month for ${planMoney(pack.monthlyPriceCents)}/month`)}</span>` : ''}</div>`;
+      ${canCompute ? `<span class="setting-actions">${planStepper('compute', ending ? 0 : Number(state.computePacks || 0), `Each pack adds ${planDollars(pack.creditMicros)} of compute a month for ${planMoney(pack.monthlyPriceCents)}/month`, giftCheckout)}</span>` : ''}</div>`;
     // Auto top-up: once offered (its billing terms approved), or while on.
     const auto = state?.autoTopUp;
     if (auto && (auto.offered || auto.enabled)) {
@@ -22840,18 +22883,18 @@ function planBillingMarkup(e, state) {
   // One-line notices, only when something needs attention.
   const notes = [];
   const returned = new URLSearchParams(location.search).get('billing');
-  if (returned === 'success' && !subscribed) notes.push(['ok', 'Payment received. The plan changes as soon as the payment provider confirms it.']);
+  if (returned === 'success' && !subscribed && !packsOnly) notes.push(['ok', 'Payment received. It applies as soon as the payment provider confirms it.']);
   if (['past_due', 'unpaid', 'paused', 'incomplete'].includes(state?.status)) {
     const grace = state.access === 'grace' && state.graceEndsAt ? ` The plan continues until ${day(state.graceEndsAt)}.` : '';
     notes.push(['danger', `${state.lastError || 'Update the payment method in Billing.'}${grace}`]);
   }
   if (busy) notes.push(['warn', `A billing change is waiting for confirmation. <button class="btn sm billing-reconcile" ${owner ? '' : 'disabled'}>Check</button>`]);
-  if (state?.pendingCheckout && !subscribed) notes.push(['', `A checkout is still open. <button class="btn sm billing-cancel-checkout" ${owner ? '' : 'disabled'}>Cancel it</button>`]);
+  if (state?.pendingCheckout && !subscribed && !packsOnly) notes.push(['', `A checkout is still open. <button class="btn sm billing-cancel-checkout" ${owner ? '' : 'disabled'}>Cancel it</button>`]);
   const noteHtml = notes.map(([tone, html]) => `<p class="plan-note ${tone}">${tone === 'warn' || tone === '' ? html : esc(html)}</p>`).join('');
   // Choosing a plan (Free, nothing gifted).
   let choices = '';
   if (state?.managed && !subscribed && !state.gift) {
-    const ready = state.providerConfigured && S.launch?.paidLaunch && S.launch?.ready;
+    const ready = checkoutOpen;
     const card = (plan) => {
       if (!plan) return '';
       const team = plan.id === 'team';
@@ -22863,13 +22906,12 @@ function planBillingMarkup(e, state) {
         ...(e.compute ? [per(`${dollars(plan.computeCreditMicros)} compute a month`, plan.additionalActiveUserComputeCreditMicros && dollars(plan.additionalActiveUserComputeCreditMicros))] : [])];
       return `<div class="plan-choice" data-plan="${esc(plan.id)}"><div class="plan-choice-head"><b>${esc(plan.name)}</b><span>${esc(planMoney(plan.monthlyBasePriceCents))}<small>/month${team ? ` + ${planMoney(plan.monthlyAdditionalActiveUserPriceCents)}/person` : ''}</small></span></div>
         <ul>${items.map((item) => `<li>${esc(item)}</li>`).join('')}</ul>
-        <button class="btn sm primary billing-checkout" data-plan="${esc(plan.id)}" ${ready && owner ? '' : `disabled title="${esc(!owner ? 'Only an organization owner can choose a plan' : 'Checkout isn’t open yet')}"`}>Choose ${esc(plan.name)}</button></div>`;
+        ${packsOnly ? `<button class="btn sm primary billing-change" data-plan="${esc(plan.id)}" ${disabled}>Choose ${esc(plan.name)}</button>`
+          : `<button class="btn sm primary billing-checkout" data-plan="${esc(plan.id)}" ${ready && owner ? '' : `disabled title="${esc(!owner ? 'Only an organization owner can choose a plan' : 'Checkout isn’t open yet')}"`}>Choose ${esc(plan.name)}</button>`}</div>`;
     };
-    const d = S.launch?.checkoutDisclosures || {};
-    const terms = [d.renewalDisclosure || 'Plans renew monthly until canceled.', d.cancellationDisclosure || 'Cancel online here before renewal.',
-      d.refundDisclosure || 'Payments are non-refundable except where the law requires.'].join(' ');
+    // Packs alone (a gift since removed) take a plan onto their subscription.
     choices = `<div class="plan-choices">${card(catalog.individual)}${card(catalog.team)}</div>
-      <div class="plan-terms">${policyAcceptanceMarkup('checkout', 'checkout-policy-acceptance')} ${policyTip(terms)}</div>`;
+      ${packsOnly ? '' : `<div class="plan-terms">${policyAcceptanceMarkup('checkout', 'checkout-policy-acceptance')} ${checkoutTermsTip()}</div>`}`;
   }
   // The operator's complimentary plan and packs.
   const gifts = state?.canGift ? `<details class="plan-operator"><summary>Gifts</summary><div class="setting-rows">
@@ -22884,7 +22926,7 @@ function planBillingMarkup(e, state) {
       <span class="setting-actions"><button class="btn sm billing-gift-packs" data-kind="compute">Save</button></span></div>
   </div></details>` : '';
   return `${head}${noteHtml}<div class="setting-rows ruled plan-limits">${peopleRow}${agentsRow}${storageRow}${computeRow}${topUpRow}</div>${choices}${gifts}
-    ${subscribed ? `<p class="plan-foot setting-muted">Separate from the cards agents pay with. <a href="/legal/billing" data-public>Billing terms</a></p>` : ''}`;
+    ${subscribed || packsOnly ? `<p class="plan-foot setting-muted">Separate from the cards agents pay with. <a href="/legal/billing" data-public>Billing terms</a></p>` : ''}`;
 }
 
 async function hydratePlanAndBilling(organizationId) {
@@ -22930,15 +22972,29 @@ async function hydratePlanAndBilling(organizationId) {
     toast(!result.reconciled ? 'Still unconfirmed. Nothing has been charged twice; contact billing support if it stays this way.'
       : result.applied === false ? 'Nothing was changed or charged. You can try again.' : 'Confirmed.', !result.reconciled);
   });
+  const packOffer = (kind) => {
+    const pack = kind === 'compute' ? state.computePack : state.storagePack;
+    return { pack, what: kind === 'compute' ? `${planDollars(pack.creditMicros)} of compute a month` : formatBytes(pack.bytes) };
+  };
   act('.billing-packs', async (button) => {
     const kind = button.dataset.kind;
     const next = Number(button.dataset.packs);
-    const current = Number(kind === 'compute' ? state.computePacks : state.storagePacks) || 0;
-    const pack = kind === 'compute' ? state.computePack : state.storagePack;
-    const what = kind === 'compute' ? `${planDollars(pack.creditMicros)} of compute a month` : formatBytes(pack.bytes);
-    if (!confirm(next > current ? `Add ${what} for ${planMoney(pack.monthlyPriceCents)}/month?` : `Remove ${what} (${planMoney(pack.monthlyPriceCents)}/month)?`)) return;
+    const { pack, what } = packOffer(kind);
+    if (!confirm('add' in button.dataset ? `Add ${what} for ${planMoney(pack.monthlyPriceCents)}/month?` : `Remove ${what} (${planMoney(pack.monthlyPriceCents)}/month)?`)) return;
     await post(`${kind}-packs`, { packs: next }); toast('Sent. It applies once payment is confirmed.');
   });
+  box.querySelectorAll('.billing-buy').forEach((button) => button.addEventListener('click', () => {
+    if (button.dataset.plan) {
+      const team = state.catalog.find((plan) => plan.id === button.dataset.plan);
+      openPlanCheckoutDialog(`Upgrade to ${team.name}`,
+        `${planMoney(team.monthlyBasePriceCents)}/month + ${planMoney(team.monthlyAdditionalActiveUserPriceCents)} per extra person`, { plan: team.id }, post);
+      return;
+    }
+    const kind = button.dataset.kind;
+    const { pack, what } = packOffer(kind);
+    openPlanCheckoutDialog(`Add a ${kind} pack`, `${what[0].toUpperCase()}${what.slice(1)} for ${planMoney(pack.monthlyPriceCents)}/month`,
+      { [`${kind}Packs`]: 1 }, post);
+  }));
   const autoTopUp = async (body) => {
     try { await post('auto-top-up', body); } catch (error) { toast(error.message, true); }
     if (box.isConnected) await reload();

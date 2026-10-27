@@ -2995,13 +2995,15 @@ export class Gateway {
         try {
           if (action === 'checkout') {
             const body = await this.body(req);
-            const plan = String(body.plan ?? '');
             if (this.deps.paidLaunchSettings) (await this.deps.paidLaunchSettings.assertReady());
             else assertPaidLaunchReady();
             const versions = assertPolicyAcceptance('checkout', body.acceptedPolicies, body.policyVersions);
-            const result = await billing.checkout(organizationId, plan,
-              { success: `${settingsBase}?billing=success#settings-billing`,
-                cancel: `${settingsBase}?billing=canceled#settings-billing` }, idempotencyKey);
+            const urls = { success: `${settingsBase}?billing=success#settings-billing`,
+              cancel: `${settingsBase}?billing=canceled#settings-billing` };
+            // {plan}, or {storagePacks, computePacks} beside a gifted plan.
+            const result = body.plan === undefined && (body.storagePacks !== undefined || body.computePacks !== undefined)
+              ? await billing.checkoutPacks(organizationId, body, urls, idempotencyKey)
+              : await billing.checkout(organizationId, String(body.plan ?? ''), urls, idempotencyKey);
             (await store.recordPolicyAcceptance({
               userId: billingSubject.userId,
               email: (await this.deps.identity?.listUsers())?.find((user) => user.id === billingSubject.userId)?.email ?? session.email,
