@@ -1842,6 +1842,10 @@ export interface TaskView {
   /** Every pending decision, including those dismissed from the inbox: dismissal
    * silences the notification, but the agent still waits on the decision. */
   pendingDecisions?: number;
+  /** A Confirm, Open PR or Retry the workflow accepted and has not yet acted
+   * on: projected by the gateway until the workflow publishes its next view,
+   * so the button it answered does not come back meanwhile (pramana#111). */
+  acceptedAction?: { name: string; at: number };
   /**
    * Free-form human notes (cosmetic, UI-only — never sent to any agent). Mirrored
    * onto the view from the task record so the UI can show/edit them at any stage,

@@ -1401,6 +1401,37 @@ describe('task stage transitions', () => {
     expect(confirm.starts.at(-1)!.options.args[0].recovery).toMatchObject({ resumeStage: 'pr' });
   });
 
+  it('shows an accepted Confirm as under way until the workflow acts on it, and a repeat sends nothing (pramana#111)', async () => {
+    const f = (await fixture());
+    const review = { ...f.view, stage: 'review' as const, status: 'waiting' as const, updatedAt: 3821,
+      waitingFor: { kind: 'human' as const, audience: ['@creator'] },
+      actions: [{ name: 'confirm', kind: 'signal' as const, label: 'Confirm PR', enabled: true },
+        { name: 'cancel', kind: 'signal' as const, label: 'Cancel', enabled: true, danger: true }] };
+    (await f.store.saveView(f.task.id, review));
+    await f.api.signalTask(f.token, f.task.id, 'confirm');
+    expect(f.signalled.filter((s) => s.signal === 'confirm')).toHaveLength(1);
+    // The workflow has not published since (its replay takes minutes): the page,
+    // reloaded or not, says the decision is under way instead of asking again.
+    const accepted = (await f.api.getTaskView(f.token, f.task.id))!;
+    expect(accepted).toMatchObject({ stage: 'review', status: 'active', acceptedAction: { name: 'confirm' } });
+    expect(accepted.waitingFor).toBeUndefined();
+    expect(accepted.actions.map((action) => action.name)).toEqual(['cancel']);
+    await f.api.signalTask(f.token, f.task.id, 'confirm');
+    expect(f.signalled.filter((s) => s.signal === 'confirm')).toHaveLength(1);
+    expect((await f.store.eventsSince(f.task.id, 0)).filter((e) => e.type === 'task.transition-requested')).toHaveLength(1);
+    // Its next publication is the workflow's own account.
+    (await f.store.saveView(f.task.id, { ...review, stage: 'merge', status: 'active', waitingFor: undefined, updatedAt: 3870,
+      actions: [{ name: 'cancel', kind: 'signal', label: 'Cancel', enabled: true, danger: true }] }));
+    const merging = (await f.api.getTaskView(f.token, f.task.id))!;
+    expect(merging.acceptedAction).toBeUndefined();
+    expect(merging.stage).toBe('merge');
+    // A later gate offering Confirm again is a new decision.
+    (await f.store.saveView(f.task.id, { ...review, stage: 'merge', updatedAt: 3900 }));
+    expect((await f.api.getTaskView(f.token, f.task.id))!.actions.map((action) => action.name)).toContain('confirm');
+    await f.api.signalTask(f.token, f.task.id, 'confirm');
+    expect(f.signalled.filter((s) => s.signal === 'confirm')).toHaveLength(2);
+  });
+
   it('lets an agent confirm a Review gate only with review:approve (maintainer and above)', async () => {
     const f = (await fixture());
     (await f.store.saveView(f.task.id, {
