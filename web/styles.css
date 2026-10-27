@@ -49,6 +49,10 @@
   --viz-2: #eb6834;
   --viz-3: #1baf7a;
   --viz-other: #b8bfcc;
+  /* Conversation tints, mixed from the theme so light and dark follow. */
+  --bubble: color-mix(in srgb, var(--accent) 9%, var(--surface));
+  --tint: color-mix(in srgb, var(--ink) 5%, var(--surface));
+  --read-width: 608px;
   --r: 9px;
   --r-sm: 6px;
   --font-ui: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
@@ -889,6 +893,8 @@ a.git-repo-name:hover { color:var(--accent); }
 .tp-col .tp-foot-inner { max-width: 900px; padding: 0 20px; }
 /* Under the conversation the actions join the composer's dock. */
 .tp-body[data-tab="checkin"] + .tp-foot { border-top: 0; padding: 0 0 12px; background: var(--surface); }
+/* Under the conversation the actions line up with its reading column. */
+.tp-body[data-tab="checkin"] + .tp-foot > .tp-foot-inner { max-width: calc(var(--read-width) + 40px); }
 .tp-foot:has(.tp-foot-inner:empty) { display: none; }
 
 .tp-rail { width: 296px; flex: none; overflow-y: auto; border-left: 1px solid var(--line); background: var(--surface); }
@@ -1055,9 +1061,9 @@ a.git-repo-name:hover { color:var(--accent); }
 /* min-height:0 lets the thread SHRINK below its content (a flex item's default
    min-height is the content size) — without it a long conversation grows the
    pane instead of scrolling, pushing the compose box off-screen. */
-.ck-thread { flex: 1; min-height: 0; overflow-y: auto; padding: 16px 20px; }
+.ck-thread { flex: 1; min-height: 0; overflow-y: auto; padding: 28px 24px 36px; background: var(--surface); }
 .ck-thread:focus, .ck-thread:focus-visible { outline: none; }
-.ck-thread > .thread { max-width: 860px; margin: 0 auto; }
+.ck-thread > .thread { max-width: var(--read-width); margin: 0 auto; }
 /* A long draft takes at most half the pane: the message box yields its height
    (it scrolls inside), so Send and the latest messages stay on screen however
    short the pane gets — a phone with its keyboard open, or turned sideways. A
@@ -1066,10 +1072,10 @@ a.git-repo-name:hover { color:var(--accent); }
   flex: 0 1 auto; display: grid; grid-template: minmax(0, 1fr) / minmax(0, 1fr); min-height: 0; max-height: 50%;
   border-top: 1px solid var(--line); padding: 10px 20px; background: var(--surface);
 }
-.ck-compose .followup-box { min-height: 0; width: 100%; margin-top: 0; max-width: 860px; margin-left: auto; margin-right: auto; }
+.ck-compose .followup-box { min-height: 0; width: 100%; margin-top: 0; max-width: var(--read-width); margin-left: auto; margin-right: auto; }
 .ck-compose .followup-box > .prompt-field { align-self: stretch; min-height: 0; }
 .ck-compose .prompt-field > .wiki-ref-editor { display: flex; flex-direction: column; flex: 0 1 auto; min-height: 38px; }
-.ck-compose .followup-input { flex: 0 1 auto; }
+.ck-compose .followup-input { flex: 0 1 auto; font-size: 16px; line-height: 1.5; }
 .ck-term { flex: 1; display: flex; flex-direction: column; gap: 8px; padding: 12px 20px 16px; min-height: 0; }
 .ck-term .term-screen { flex: 1; height: auto; max-height: none; outline: none; }
 .ck-term .empty { margin: auto; }
@@ -1181,29 +1187,46 @@ a.git-repo-name:hover { color:var(--accent); }
   .subtasks-head { align-items: center; }
 }
 
-/* thread */
+/* thread — a reading surface (Gemini-like): the agent's answers are prose on
+   the page, unboxed, at body size; a person's turn is a soft tinted bubble on
+   the right. One measure (--read-width, ~80 characters of Inter at 16px) for the thread
+   and the composer under it. Cards remain only for what asks for action
+   (input requests, review, approvals) or is set apart (explanations). */
 .thread { display: flex; flex-direction: column; gap: 10px; }
 .msg { padding: 10px 13px; border-radius: 10px; max-width: 92%; word-break: break-word; }
-.msg.user { align-self: flex-end; background: var(--accent); color: var(--accent-ink); border-bottom-right-radius: 3px; }
-.msg.agent { align-self: flex-start; background: var(--surface-2); border: 1px solid var(--line); border-bottom-left-radius: 3px; }
-.msg.explanation { align-self: flex-start; margin: -5px 0 2px 18px; background: color-mix(in srgb, var(--accent-weak) 55%, var(--surface)); border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--line)); border-top-left-radius: 3px; }
-.msg.explanation .role { color: var(--accent); opacity: 1; }
+.msg.user { align-self: flex-end; background: var(--bubble); color: var(--ink); border-radius: 20px; padding: 10px 18px; }
+.msg.agent { align-self: flex-start; background: var(--surface-2); border: 1px solid var(--line); }
+.msg.explanation { align-self: flex-start; margin: -5px 0 2px 18px; background: color-mix(in srgb, var(--accent-weak) 55%, var(--surface)); border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--line)); border-radius: 12px; padding: 12px 16px; }
+.msg.explanation .role { color: var(--accent); }
 .explanation-model { color: var(--ink-3); font: 10px/1.2 var(--font-mono); }
-.msg.system { align-self: center; background: transparent; color: var(--ink-3); font-size: 12px; font-style: italic; }
+.msg.system { align-self: center; background: transparent; color: var(--ink-3); font-size: 13px; font-style: italic; }
 .msg-text { white-space: pre-wrap; }
-.msg-meta { display: flex; align-items: center; gap: 9px; margin-bottom: 3px; }
+.msg-meta { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
 .msg-meta-gap { flex: 1; }
-.msg .role { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; opacity: .7; font-family: var(--font-mono); }
+.msg .role { font-size: 12.5px; font-weight: 600; color: var(--ink-2); }
+.msg.user .role { color: var(--ink-3); font-weight: 500; }
 .msg.input-request { background: var(--accent-weak); border-color: color-mix(in srgb, var(--accent) 30%, var(--line)); border-inline-start: 3px solid var(--accent); }
 .msg.input-request .msg-meta { margin-bottom: 7px; }
-.msg.input-request .role { color: var(--accent); font-weight: 600; opacity: 1; }
+.msg.input-request .role { color: var(--accent); }
+/* The conversation pane and the public shared page read at body size. */
+.ck-thread > .thread, .shared-thread { gap: 22px; font-size: 16px; line-height: 1.6; }
+.ck-thread .msg.agent:not(.input-request, .review-info, #task-approval-requests), .shared-thread .msg.agent { align-self: stretch; max-width: none; padding: 0; border: 0; border-radius: 0; background: transparent; }
+.ck-thread .msg.user, .shared-thread .msg.user { max-width: min(85%, 600px); }
+.ck-thread .msg.input-request, .ck-thread .msg.agent.review-info, .ck-thread #task-approval-requests { align-self: stretch; max-width: none; padding: 14px 18px; border-radius: 12px; }
+.ck-thread .msg.system { font-size: 13.5px; }
+.ck-thread .msg.agent:not(.input-request) > .explain-tools, .shared-thread .explain-tools { margin-top: 4px; padding-top: 0; border-top: 0; }
+/* Another agent speaking in a shared conversation: a quiet rule, not a box. */
+.ck-thread .msg.agent.other-agent:not(.input-request) { padding-left: 16px; border-left: 2px solid color-mix(in srgb, var(--accent) 45%, var(--line)); }
 .msg.review-info { padding: 7px 10px; font-size: 12px; }
+.ck-thread .msg.review-info, .ck-thread #task-approval-requests { font-size: 14px; line-height: 1.5; }
+@media (max-width: 700px) { .ck-thread { padding: 20px 16px 28px; } .ck-thread .msg.user { max-width: 88%; } }
 .review-info-line { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 9px; }
 .review-info-line .role { flex-shrink: 0; }
 .review-info-caption { white-space: pre-wrap; }
 .review-info .review-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin-top: 5px; }
 .review-info #review-action-out { max-height: 180px; overflow: auto; margin: 5px 0 0; }
-.msg time, .agent-activity time { color: currentColor; opacity: .58; font: 10px/1.2 var(--font-mono); white-space: nowrap; }
+.msg time { color: var(--ink-3); font-size: 12px; line-height: 1.2; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.agent-activity time { color: currentColor; opacity: .58; font: 10px/1.2 var(--font-mono); white-space: nowrap; }
 
 /* A little copy control per message — faint until the bubble is hovered. */
 .msg-copy { display: inline-flex; align-items: center; justify-content: center; padding: 2px; border: 0; background: transparent; color: currentColor; opacity: 0; cursor: pointer; border-radius: 5px; transition: opacity .12s, background .12s; }
@@ -1234,38 +1257,43 @@ a.git-repo-name:hover { color:var(--accent); }
 .explanation-form textarea, .explanation-settings textarea { width: 100%; box-sizing: border-box; resize: vertical; }
 .explanation-form-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
 
-/* Rendered Markdown inside a message bubble: drop the raw pre-wrap and give the
-   common block elements sane, compact spacing. */
+/* Rendered Markdown (messages, wiki pages). Spacing is in em so it follows
+   the surface's size; the rhythm is one paragraph gap between blocks, more
+   above a heading than below it so it binds to its own section. */
 .msg-text.md { white-space: normal; }
 .msg-text.md > :first-child { margin-top: 0; }
 .msg-text.md > :last-child { margin-bottom: 0; }
-.msg-text.md .md-p { margin: 0 0 8px; }
-.msg-text.md .md-h { margin: 10px 0 6px; line-height: 1.25; font-weight: 650; }
-.msg-text.md h1.md-h { font-size: 1.3em; }
-.msg-text.md h2.md-h { font-size: 1.18em; }
-.msg-text.md h3.md-h { font-size: 1.06em; }
+.msg-text.md .md-p { margin: 0 0 .75em; text-wrap: pretty; }
+.msg-text.md .md-h { margin: 1.25em 0 .45em; line-height: 1.3; font-weight: 650; letter-spacing: -.01em; text-wrap: balance; }
+.msg-text.md h1.md-h { font-size: 1.4em; }
+.msg-text.md h2.md-h { font-size: 1.25em; }
+.msg-text.md h3.md-h { font-size: 1.1em; }
 .msg-text.md h4.md-h, .msg-text.md h5.md-h, .msg-text.md h6.md-h { font-size: 1em; }
-.msg-text.md .md-list { margin: 0 0 8px; padding-left: 1.5em; }
+.msg-text.md .md-list { margin: 0 0 .75em; padding-left: 1.5em; }
 .msg-text.md ol.md-list { list-style: decimal; }
 .msg-text.md ul.md-list { list-style: disc; }
-.msg-text.md .md-list li { margin: 2px 0; }
+.msg-text.md .md-list li { margin: .25em 0; }
+.msg-text.md .md-list li::marker { color: var(--ink-3); }
 /* Nested lists hug their parent item; only the outermost list carries margin. */
-.msg-text.md .md-list .md-list { margin: 2px 0 0; }
+.msg-text.md .md-list .md-list { margin: .25em 0 0; }
 /* Loose lists (blank lines between items) breathe a little more. */
-.msg-text.md .md-loose > li { margin: 6px 0; }
+.msg-text.md .md-loose > li { margin: .5em 0; }
 /* A paragraph that is the sole/last child of a list item shouldn't add a gap. */
 .msg-text.md .md-list li > .md-p:last-child { margin-bottom: 0; }
-.msg-text.md .md-quote { margin: 0 0 8px; padding: 2px 0 2px 10px; border-left: 3px solid var(--line); opacity: .9; }
-.msg-text.md .md-hr { border: 0; border-top: 1px solid var(--line); margin: 10px 0; }
-.msg-text.md a { color: inherit; text-decoration: underline; text-underline-offset: 2px; }
-.msg-text.md .md-inline { font-family: var(--font-mono); font-size: .9em; padding: 1px 4px; border-radius: 4px; background: rgba(127, 127, 127, .16); }
-.msg-text.md .md-code { margin: 0 0 8px; padding: 9px 11px; border-radius: 8px; overflow-x: auto; background: rgba(127, 127, 127, .14); }
-.msg-text.md .md-code code { font-family: var(--font-mono); font-size: 12px; line-height: 1.5; white-space: pre; }
+.msg-text.md .md-quote { margin: 0 0 .75em; padding: 0 0 0 1em; border-left: 3px solid var(--line-strong); color: var(--ink-2); }
+.msg-text.md .md-hr { border: 0; border-top: 1px solid var(--line); margin: 1.25em 0; }
+.msg-text.md a { color: inherit; text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: .2em; }
+.msg.agent .msg-text.md a, .msg.user:not(.platform) .msg-text.md a, .wiki-md a { color: var(--accent); }
+.msg-text.md .md-inline { font-family: var(--font-mono); font-size: .875em; padding: .1em .35em; border-radius: 5px; background: var(--tint); }
+.msg-text.md .md-code { margin: .25em 0 1em; padding: 12px 16px; border-radius: 12px; overflow-x: auto; background: var(--tint); }
+.msg-text.md .md-code code { font-family: var(--font-mono); font-size: max(12px, .82em); line-height: 1.6; white-space: pre; }
+.msg.user .msg-text.md .md-code, .msg.user .msg-text.md .md-inline { background: color-mix(in srgb, var(--ink) 6%, transparent); }
 .msg-text.md .md-math { white-space: normal; }
-.msg-text.md .md-table { border-collapse: collapse; margin: 0 0 8px; display: block; overflow-x: auto; max-width: 100%; font-size: .95em; }
-.msg-text.md .md-table th, .msg-text.md .md-table td { border: 1px solid var(--line); padding: 5px 10px; text-align: left; vertical-align: top; }
-.msg-text.md .md-table th { background: rgba(127, 127, 127, .12); font-weight: 600; }
-.msg-text.md .md-table tr:nth-child(even) td { background: rgba(127, 127, 127, .05); }
+/* Tables: horizontal rules only — the columns align the eye on their own. */
+.msg-text.md .md-table { border-collapse: collapse; margin: .25em 0 1em; display: block; overflow-x: auto; max-width: 100%; font-size: .9375em; line-height: 1.5; }
+.msg-text.md .md-table th, .msg-text.md .md-table td { border: 0; border-bottom: 1px solid var(--line); padding: .5em 1.25em .5em 0; text-align: left; vertical-align: top; }
+.msg-text.md .md-table th { border-bottom-color: var(--line-strong); font-weight: 600; }
+.msg-text.md .md-table tr:last-child td { border-bottom: 0; }
 
 /* Provider-native work items. Commands, file edits, tools, reasoning and turn
    lifecycle live inline with the messages, but stay visually quieter than chat. */
@@ -1286,7 +1314,7 @@ a.git-repo-name:hover { color:var(--accent); }
 /* The conversation's outline: the work between what people said and the
    agent's answers to them folds into one line (web/app.js conversationOutline). */
 .conv-fold { align-self: stretch; margin: -3px 0; }
-.fold-head { display: flex; align-items: center; gap: 8px; width: min(92%, 760px); padding: 5px 10px; border-radius: 8px; color: var(--ink-3); font-size: 12px; cursor: pointer; list-style: none; user-select: none; }
+.fold-head { display: flex; align-items: center; gap: 8px; width: min(92%, 760px); padding: 5px 10px; border-radius: 8px; color: var(--ink-3); font-size: 13px; cursor: pointer; list-style: none; user-select: none; }
 .fold-head::-webkit-details-marker { display: none; }
 .fold-head::after { content: "›"; flex: none; font-size: 14px; line-height: 1; transition: transform .15s; }
 .conv-fold[open] > .fold-head::after { transform: rotate(90deg); }
@@ -1299,8 +1327,10 @@ a.git-repo-name:hover { color:var(--accent); }
 .fold-gap { flex: 1; }
 .fold-count { flex: none; font: 10.5px/1.2 var(--font-mono); white-space: nowrap; opacity: .85; }
 .fold-body { display: flex; flex-direction: column; gap: 10px; margin: 6px 0 4px 19px; padding-left: 12px; border-left: 2px solid var(--line); }
+/* The work between answers reads a step down from them. */
+.ck-thread .fold-body { font-size: 14px; line-height: 1.55; }
 /* tavya's own prompts to the agent: part of the record, not someone speaking. */
-.msg.user.platform { align-self: flex-start; background: transparent; color: var(--ink-2); border: 1px dashed var(--line); border-bottom-left-radius: 3px; border-bottom-right-radius: 10px; font-size: 12.5px; }
+.msg.user.platform { align-self: flex-start; background: transparent; color: var(--ink-2); border: 1px dashed var(--line-strong); border-radius: 12px; padding: 10px 14px; font-size: 14px; line-height: 1.5; }
 .msg.user.platform .role { color: var(--ink-3); }
 .conversation-presence { display: inline-flex; align-items: center; gap: 6px; padding: 2px 7px; border-radius: 999px; color: var(--ink-2); background: var(--surface-2); font-size: 11px; }
 .presence-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ink-3); }
@@ -3555,7 +3585,6 @@ html[data-theme="dark"] .github-signin-btn:active,
 .app-token-once > .btn { justify-self: start; }
 
 /* ── One conversation, several agents (software-dev ≥1.27) ───────────────── */
-.msg.agent.other-agent { background: color-mix(in srgb, var(--accent) 6%, var(--surface-2)); border-color: color-mix(in srgb, var(--accent) 22%, var(--line)); }
 .msg-to { font-size: 11px; color: currentColor; opacity: .72; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 40ch; }
 .activity-speaker { flex: none; font: 10px/1.6 var(--font-mono); text-transform: uppercase; letter-spacing: .04em; color: var(--accent); margin-right: 6px; }
 .ck-stop { flex: none; width: 24px; height: 24px; display: grid; place-items: center; border: 0; border-radius: 6px; background: transparent; color: var(--ink-3); cursor: pointer; }

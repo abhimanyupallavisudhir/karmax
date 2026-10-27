@@ -53,7 +53,8 @@ for (const fullscreen of [false, true]) {
       await input.fill('Words that wrap naturally across the message box. '.repeat(12));
       const wideHeight = await height();
       expect(wideHeight).toBeGreaterThan(initial);
-      await page.setViewportSize({ width: 800, height: 900 });
+      // Narrower than the conversation's reading column, so the box itself narrows.
+      await page.setViewportSize({ width: 520, height: 900 });
       await expect.poll(height).toBeGreaterThan(wideHeight);
       await page.setViewportSize({ width: 1200, height: 900 });
       await expect.poll(height).toBeCloseTo(wideHeight, 0);
