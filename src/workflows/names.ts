@@ -132,6 +132,19 @@ export function pinnedType(type: WorkflowName, version: string): string {
   return q;
 }
 
+/** Every task workflow's workflow-task timeout (Temporal's default is 10 s).
+ * A workflow task includes replaying the whole run when the worker no longer
+ * caches it, and a replay that outlasts the timeout is discarded and repeated
+ * from scratch, each attempt a full replay of CPU, until one fits
+ * (pramana#111: three 31 s replays, 2 min 5 s before a Confirm took effect).
+ * After a restart every cached run replays at once, queued for the worker's one
+ * workflow thread, so a replay that alone takes seconds can still take tens.
+ * The cost is in one case only: a worker that dies holding a started workflow
+ * task leaves it unretried until the timeout, here a minute. An idle worker's
+ * death moves its sticky queue's tasks after the sticky schedule-to-start
+ * timeout (the worker's `stickyQueueScheduleToStartTimeout`), not this one. */
+export const TASK_WORKFLOW_TASK_TIMEOUT = '60s';
+
 export const SIG = {
   followUp: 'followUp',
   /** A sub-task's request was passed on to people: it no longer waits on its parent. */

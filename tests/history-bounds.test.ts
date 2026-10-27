@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import { Context } from '@temporalio/activity';
 import { Worker } from '@temporalio/worker';
 import { startStubTaskWorker, historyChain } from './helpers/stub-task-worker.js';
+import { TASK_WORKFLOW_TASK_TIMEOUT } from '../src/workflows/names.js';
 import { applyConversationPatch, conversationPage, transcriptOf, type ViewConversation } from '../src/domain/view-publication.js';
 
 const world = { id: 'history-fixture', kind: 'memory', root: '/fixture', branch: 'task', base: 'main' };
@@ -91,6 +92,11 @@ it(`bounds the history of a ${TURNS}-turn task`, async () => {
       // A run stops at the first Do turn past the threshold.
       expect(report.maxRunEvents).toBeLessThan(CONTINUE_AFTER + 200);
       expect(pin).toBe(runs.at(-1)!.runId);
+      // A continued run keeps (or, started before it was set, gains) the
+      // longer workflow-task timeout, so a slow replay is not retried.
+      for (const run of runs.slice(1))
+        expect(Number(run.history.events[0].workflowExecutionStartedEventAttributes.workflowTaskTimeout.seconds))
+          .toBe(Number.parseInt(TASK_WORKFLOW_TASK_TIMEOUT));
       // Every continued run replays deterministically, conversation load included.
       for (const run of runs) await Worker.runReplayHistory({ workflowBundle: env.workflowBundle }, run.history, run.runId);
     }

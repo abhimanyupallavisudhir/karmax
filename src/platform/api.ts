@@ -11,7 +11,7 @@ import { Store, slugify, type CollaborationRequest } from '../store/db.js';
 import { TokenAuthority, type HumanDelegationArgs, type ScopedToken } from './tokens.js';
 import { TOOL_CAPABILITY, Capability, ORGANIZATION_WIKI_WRITE_DENIED, allows } from './capabilities.js';
 import { AppGrants, sessionCapabilities } from '../auth/app-grants.js';
-import { WORKFLOW_TYPE, SIG, pinnedType } from '../workflows/names.js';
+import { WORKFLOW_TYPE, SIG, pinnedType, TASK_WORKFLOW_TASK_TIMEOUT } from '../workflows/names.js';
 import { bundledStart, StartResolution } from './resolve-start.js';
 import { MANIFESTS, WorkflowManifest, eventCatalog } from '../contrib/manifests.js';
 import { organizationSkillsDir, projectSkillsDir } from '../resolve/skills.js';
@@ -1928,7 +1928,7 @@ export class KarmaxApi {
     // "setup", and surface a real error instead of hanging.
     try {
       await withTimeout(
-        this.deps.client.workflow.start(startType, { taskQueue: this.deps.taskQueue, workflowId: task.id, args: [input] }),
+        this.deps.client.workflow.start(startType, { taskQueue: this.deps.taskQueue, workflowId: task.id, workflowTaskTimeout: TASK_WORKFLOW_TASK_TIMEOUT, args: [input] }),
         START_TIMEOUT_MS,
       );
     } catch (e) {
@@ -2452,6 +2452,7 @@ export class KarmaxApi {
         this.deps.client.workflow.start(startType, {
           taskQueue: this.deps.taskQueue,
           workflowId: task.id,
+          workflowTaskTimeout: TASK_WORKFLOW_TASK_TIMEOUT,
           // Queueing is idempotent. In particular, never create a second run if
           // the first one finished before a lost start acknowledgement is retried.
           workflowIdReusePolicy: input.discardProgress
@@ -3109,7 +3110,7 @@ export class KarmaxApi {
     const { startType, input } = await this.buildStart(run, false, caller);
     try {
       await withTimeout(
-        this.deps.client.workflow.start(startType, { taskQueue: this.deps.taskQueue, workflowId: run.id, args: [input] }),
+        this.deps.client.workflow.start(startType, { taskQueue: this.deps.taskQueue, workflowId: run.id, workflowTaskTimeout: TASK_WORKFLOW_TASK_TIMEOUT, args: [input] }),
         START_TIMEOUT_MS,
       );
     } catch (e) {
@@ -3150,7 +3151,7 @@ export class KarmaxApi {
     try {
       const { startType, input } = await this.buildStart({ ...task, ...(shaped ? { title: shaped.title } : {}), params: fired as TaskRecord['params'] }, false, caller);
       await withTimeout(
-        this.deps.client.workflow.start(startType, { taskQueue: this.deps.taskQueue, workflowId: task.id, args: [input] }),
+        this.deps.client.workflow.start(startType, { taskQueue: this.deps.taskQueue, workflowId: task.id, workflowTaskTimeout: TASK_WORKFLOW_TASK_TIMEOUT, args: [input] }),
         START_TIMEOUT_MS,
       );
       const started = this.resolveStart(task.workflow, task.workflowVersion,
@@ -4355,6 +4356,7 @@ export class KarmaxApi {
     const started = await withTimeout(this.deps.client.workflow.start(startType, {
       taskQueue: this.deps.taskQueue,
       workflowId: task.id,
+      workflowTaskTimeout: TASK_WORKFLOW_TASK_TIMEOUT,
       workflowIdReusePolicy: WorkflowIdReusePolicy.ALLOW_DUPLICATE,
       args: [input],
     }), START_TIMEOUT_MS);
@@ -6197,6 +6199,7 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
       this.deps.client.workflow.start(startType, {
         taskQueue: this.deps.taskQueue,
         workflowId: taskId,
+        workflowTaskTimeout: TASK_WORKFLOW_TASK_TIMEOUT,
         workflowIdReusePolicy: WorkflowIdReusePolicy.ALLOW_DUPLICATE_FAILED_ONLY,
         args: [input],
       }),
@@ -8109,6 +8112,7 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
         this.deps.client.workflow.start(pinnedType(WORKFLOW_TYPE['merge-only']!, mergeOnlyVersion), {
           taskQueue: this.deps.taskQueue,
           workflowId: task.id,
+          workflowTaskTimeout: TASK_WORKFLOW_TASK_TIMEOUT,
           args: [input],
         }),
         START_TIMEOUT_MS,
