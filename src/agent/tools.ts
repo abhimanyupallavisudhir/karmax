@@ -1321,7 +1321,8 @@ export function platformToolHandlers(
         return `Asking ${who}. End your turn now${needsInput.message ? '' : ' with the question as your final response'}; you will be resumed with their answer, ${jobs.length ? `when ${jobs.join(', ')} ${jobs.length > 1 ? 'finish' : 'finishes'}, ` : ''}or after ${Math.round(minutes)} min to carry on without it.`;
       }
       // pramana#22: an agent paused, then ended its turn with two questions that showed nobody Needs input.
-      const asking = 'This shows no Needs input: if your final response asks something, call pause again with needs_input: true.';
+      // krmax#752: the reply itself mentions nobody; whether someone must see it is the agent's call.
+      const asking = 'Your final response alerts nobody: if it asks something, call pause again with needs_input: true; if someone must act on it, notify them.';
       return jobs.length
         ? `Waiting for ${jobNames.length === jobs.length ? jobNames.join(', ') : jobs.join(', ')} (at most ${Math.round(minutes)} min). End your turn now, answering in your final response anything you were just asked; you will be resumed when ${jobs.length > 1 ? 'they finish' : 'it finishes'}, a message arrives, or the time is up. ${asking}`
         : `Pausing for ${Math.round(minutes)} min. End your turn now, answering in your final response anything you were just asked; you will be resumed then, or sooner if a message arrives. ${asking}`;

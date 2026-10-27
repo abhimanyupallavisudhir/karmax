@@ -248,6 +248,9 @@ const REPLY_TO_SPEAKERS = 'software-dev-reply-to-speakers-v1';
 const UNASKED_REPLY_TO_SPEAKERS = 'software-dev-unasked-reply-to-speakers-v1';
 /** A sub-task's reply to people is an ask only when its turn ends waiting for an answer. */
 const SUBTASK_UNASKED_REPLY = 'software-dev-subtask-unasked-reply-v1';
+/** A top-level reply that no human wait carries mentions nobody: the agent
+ * notifies whoever must act on it (krmax#752). */
+const AGENT_DECIDES_MENTIONS = 'software-dev-agent-decides-mentions-v1';
 export const raiseFromChildSignal = defineSignal<[ChildRaise]>('raiseFromChild');
 export const subtaskRedirectedSignal = defineSignal<[{ childTaskId: string }]>(SIG.subtaskRedirected);
 /** A draft sub-task of this task was queued (POST /api/tasks/:id/queue): the
@@ -4429,14 +4432,17 @@ Inspect the complete current diff and specifically compare its delta from the re
     return speakers.length && !managedByParent && patched(UNASKED_REPLY_TO_SPEAKERS) ? askOf(route) : route;
   }
 
-  /** A top-level reply to people goes to them as a mention when the task then
-   * waits on something else (a pause, its sub-tasks): no human wait would
-   * carry it, and they would never hear it (pramana#22). It is not an ask: the
-   * task waits on that something else, not on them (#613). */
+  /** A top-level reply to people when the task then waits on something else
+   * (a pause, its sub-tasks). From pramana#22 it went to them as a mention, an
+   * ask until #613, then news. Since krmax#752 it mentions nobody: "waiting on
+   * the tests, then I'll open the PR" landed in For me as "Mentioned". It is
+   * in the conversation; the agent notifies whoever must act on it, and asks
+   * with a needs_input pause. */
   async function replyUnasked(): Promise<void> {
     const reply = speakersReply;
     speakersReply = undefined;
-    if (reply && !managedByParent && patched(UNASKED_REPLY_TO_SPEAKERS)) await deliverReply(reply, speakers, false);
+    if (reply && !managedByParent && patched(UNASKED_REPLY_TO_SPEAKERS) && !patched(AGENT_DECIDES_MENTIONS))
+      await deliverReply(reply, speakers, false);
   }
 
   /** The task goes on with its own work after this turn — a pause that is not

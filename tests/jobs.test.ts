@@ -226,7 +226,7 @@ exec /bin/cat "$@"
       expect(ctx.waits).toEqual([]);
 
       // indike.org#2: "End your turn now" alone made agents drop a question they were just asked.
-      expect(await t.pause!({ minutes: 10 })).toBe('Pausing for 10 min. End your turn now, answering in your final response anything you were just asked; you will be resumed then, or sooner if a message arrives. This shows no Needs input: if your final response asks something, call pause again with needs_input: true.');
+      expect(await t.pause!({ minutes: 10 })).toBe('Pausing for 10 min. End your turn now, answering in your final response anything you were just asked; you will be resumed then, or sooner if a message arrives. Your final response alerts nobody: if it asks something, call pause again with needs_input: true; if someone must act on it, notify them.');
       const running = await startJob(world, { command: 'sleep 30' });
       const waiting = await t.pause!({ minutes: 90, jobs: [running.id, done.id] });
       expect(waiting).toContain(`Waiting for ${running.id} (at most 90 min)`);
