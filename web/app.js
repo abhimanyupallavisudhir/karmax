@@ -1056,6 +1056,26 @@ function installInfoDotTips() {
   });
 }
 
+// Run now (wiki features/quota-scheduling): a held task stops being kept back
+// for higher-priority work; undo lets the scheduler hold it again. Delegated:
+// the button sits on the task page and on the Queues page, both re-rendered often.
+const RUN_NOW_TIP = 'Start as soon as a login has room, using quota kept for higher-priority work. Lasts until the task is done';
+function installRunNow() {
+  document.addEventListener('click', async (ev) => {
+    const b = ev.target.closest('[data-run-now], [data-run-now-undo]');
+    if (!b) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    const undo = b.hasAttribute('data-run-now-undo');
+    b.disabled = true;
+    try {
+      await api(schedulingApi(`/run-now/${encodeURIComponent(undo ? b.dataset.runNowUndo : b.dataset.runNow)}`), { method: undo ? 'DELETE' : 'PUT' });
+      toast(undo ? 'It may be held back again' : 'Starting as soon as a login has room');
+    } catch (err) { toast(err.message, true); b.disabled = false; }
+    if (S.tab === 'queue') setTimeout(seedQueue, 300);
+  });
+}
+
 // Tag chips are navigation everywhere they appear: links to their section, so a
 // modified click opens it in a new tab. Capture before row/form click handlers so
 // a chip never opens a task or mutates its tags as a side effect.
@@ -4608,6 +4628,7 @@ function installShellListeners() {
   installLinkRouter();
   installTagRouter();
   installInfoDotTips();
+  installRunNow();
   // A background repaint deferred to protect an open menu / text-selection gets
   // flushed once that interaction releases (setTimeout lets focus + selection
   // settle first). selectionchange fires constantly, so it only pokes the flush
@@ -13806,6 +13827,9 @@ function waitDeadline(until) {
 // account limit, or admission blocked by the plan (e.g. a member mismatch).
 // The generic header label alone would hide that diagnosis.
 function conversationWaitNotice(v) {
+  const w = v.waitingFor;
+  if (w?.kind === 'account' && typeof w.detail === 'string' && w.detail.startsWith('Held'))
+    return `<div class="msg system wait-notice" role="status">${esc(waitingText(w))} <button type="button" class="btn sm ghost" data-run-now="${esc(v.taskId)}" title="${esc(RUN_NOW_TIP)}">Run now</button></div>`;
   const detail = presenceDetail(v);
   return detail ? `<div class="msg system wait-notice" role="status">${esc(waitingText(v.waitingFor))} · ${esc(detail)}</div>` : '';
 }
@@ -15587,8 +15611,8 @@ function agentWorkGroups(view) {
     if (!g.tasks.has(row.taskId)) g.tasks.set(row.taskId, { taskId: row.taskId, num: row.num, title: row.title, running: 0, waiting: [], pins: row.pins });
     return g;
   };
-  for (const r of view?.running || []) { const g = group(r); g.running++; g.tasks.get(r.taskId).running++; }
-  for (const w of view?.waiting || []) { const g = group(w); g.waiting.push(w); g.tasks.get(w.taskId).waiting.push(w); if (w.pins) g.tasks.get(w.taskId).pins = w.pins; }
+  for (const r of view?.running || []) { const g = group(r); g.running++; g.tasks.get(r.taskId).running++; if (r.runNow) g.runNow = true; }
+  for (const w of view?.waiting || []) { const g = group(w); if (w.runNow) g.runNow = true; g.waiting.push(w); g.tasks.get(w.taskId).waiting.push(w); if (w.pins) g.tasks.get(w.taskId).pins = w.pins; }
   const rank = { next: 0, held: 1, quota: 2 };
   for (const g of groups.values()) {
     const best = g.waiting.slice().sort((a, b) => rank[a.status] - rank[b.status])[0];
@@ -15624,6 +15648,9 @@ function agentWorkPanel() {
     const prio = p && p !== 2 ? `<span class="prio p${p}" title="Priority: ${esc(g.priority)}">▲ ${esc(g.priority[0].toUpperCase() + g.priority.slice(1))}</span>` : '';
     const rootTask = g.tasks.get(g.root);
     const pinned = rootTask?.pins?.length;
+    const runNow = g.runNow
+      ? `<button type="button" class="work-pin" data-run-now-undo="${esc(g.root)}" title="Running now: never held back for higher-priority work. Click to undo" aria-label="Undo run now">⏩</button>`
+      : g.status === 'held' ? `<button type="button" class="btn sm ghost" data-run-now="${esc(g.root)}" title="${esc(RUN_NOW_TIP)}">Run now</button>` : '';
     const subs = [...g.tasks.values()].filter((t) => t.taskId !== g.root);
     const subRows = subs.length ? `<div class="work-subs" data-root="${esc(g.root)}">${subs.map((t) => {
       const w = t.waiting[0];
@@ -15641,7 +15668,7 @@ function agentWorkPanel() {
       <div style="flex:1;min-width:0"><div class="task-title">${g.num != null ? `<span class="task-num">#${g.num}</span> ` : ''}${esc(g.title)} ${prio}</div>
         <div class="task-sub" title="${esc(WORK_STATUS[g.status]?.[1] || '')}">${esc(workStatusText(g.status, g.until))}${g.running && waiting ? ` · ${g.running} running` : g.running > 1 ? ` · ${g.running}` : ''}</div>
         ${subRows}</div>
-      ${pinned ? `<button type="button" class="work-pin" data-unpin="${esc(g.root)}" title="${esc(workPinTitle(rootTask.pins, numOf))}" aria-label="Return to automatic order">📌</button>` : ''}
+      ${runNow}${pinned ? `<button type="button" class="work-pin" data-unpin="${esc(g.root)}" title="${esc(workPinTitle(rootTask.pins, numOf))}" aria-label="Return to automatic order">📌</button>` : ''}
     </div>`;
   }).join('');
   return `<div class="queue-list work-list">${rows}</div>`;

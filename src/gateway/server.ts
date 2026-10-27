@@ -6625,6 +6625,12 @@ export class Gateway {
         await api.clearQueuePlacement(token, decodeURIComponent(placement[1]!), url.searchParams.get('organizationId') ?? undefined);
         return this.json(res, 200, { ok: true });
       }
+      const runNow = p.match(/^\/api\/scheduling\/run-now\/([^/]+)$/);
+      if (runNow && (method === 'PUT' || method === 'DELETE')) {
+        const id = decodeURIComponent(runNow[1]!), org = url.searchParams.get('organizationId') ?? undefined;
+        await (method === 'PUT' ? api.runNow(token, id, org) : api.cancelRunNow(token, id, org));
+        return this.json(res, 200, { ok: true });
+      }
       // Wiki — org/project skills, memories, and general prompts. One route
       // family per scope; KarmaxApi enforces read/write capabilities and path
       // safety, so the wiki works identically for humans (UI) and agents

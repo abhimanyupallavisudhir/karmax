@@ -5,7 +5,7 @@
  * calibrated to tavya.io (calibration.json).
  *
  *   npx tsx benchmarks/scheduling/simulate.ts [--days 35] [--seeds 8] [--load 0.7,1,1.3] [--burst 1500]
- *     [--policies today,index,littlewood,littlewood-learned,scheduler] [--json out.json]
+ *     [--policies today,index,littlewood,littlewood-learned,scheduler] [--mix low:.1,medium:.75,high:.12,urgent:.03] [--json out.json]
  *
  * Logins work like Claude Max: a 5-hour window that starts at first use and a
  * weekly limit, staggered. Turns run their measured lengths and are not
@@ -102,6 +102,8 @@ export function simulate(config: Config) {
   const turns: Turn[] = [];
   const waiting: { tree: Tree; at: number; id: string }[] = [];
   const m = { weekExpired: 0, weekResets: 0, interrupted: 0, coldStarts: 0, spent: 0 };
+  /** Minutes each tree had a turn waiting while a login had room and quota: kept back, not out of quota. */
+  const heldMinutes = new Map<Tree, number>();
   let seq = 0;
   const request = (tree: Tree, now: number) => waiting.push({ tree, at: now, id: `q${seq++}` });
 
@@ -224,6 +226,7 @@ export function simulate(config: Config) {
     for (const turn of turns.slice()) if (turn.end <= now + 1) stop(turn, now + 1, false);
     for (const [i] of logins.entries()) if (exhausted(i)) for (const t of turns.filter((x) => x.login === i)) stop(t, now + 1, true);
     if (now % 5 === 0 || turns.length < logins.length * 10) decide(now + 1);
+    if (logins.some((l, i) => l.running < 10 && !exhausted(i))) for (const w of waiting) heldMinutes.set(w.tree, (heldMinutes.get(w.tree) ?? 0) + 1);
   }
 
   const burst = trees.find((t) => t.id === 'burst');
@@ -234,7 +237,9 @@ export function simulate(config: Config) {
   const byClass = Object.fromEntries(PRIORITIES.map((p) => {
     const ts = measured.filter((t) => t.priority === p);
     const delays = ts.map(startDelay).sort((a, b) => a - b);
-    return [p, { n: ts.length, flowHours: ts.length ? ts.reduce((s, t) => s + flow(t), 0) / ts.length : 0,
+    const held = ts.filter((t) => (heldMinutes.get(t) ?? 0) > 5);
+    return [p, { n: ts.length, heldShare: ts.length ? held.length / ts.length : 0,
+      heldHours: ts.length ? ts.reduce((s, t) => s + (heldMinutes.get(t) ?? 0), 0) / ts.length / 60 : 0, flowHours: ts.length ? ts.reduce((s, t) => s + flow(t), 0) / ts.length : 0,
       startP95Minutes: delays.length ? delays[Math.min(delays.length - 1, Math.floor(0.95 * delays.length))]! : 0 }];
   }));
   return {
@@ -254,20 +259,25 @@ if (process.argv[1]?.endsWith('simulate.ts')) {
   const loads = arg('load', '0.7,1,1.3').split(',').map(Number);
   const burst = arg('burst', '') ? { day: 6, usd: Number(arg('burst', '1500')), lanes: 20 } : undefined;
   const policies = arg('policies', 'today,index,littlewood-learned,scheduler').split(',') as Policy[];
+  const mix = arg('mix', '') ? { low: 0, medium: 0, high: 0, urgent: 0, ...Object.fromEntries(arg('mix', '').split(',')
+    .map((x) => x.split(':')).map(([p, v]) => [p, Number(v ?? 1)])) } as Record<Priority, number> : calibration.mix;
   const out: any[] = [];
   for (const load of loads) for (const policy of policies) {
     const runs = Array.from({ length: seeds }, (_, s) => simulate({ policy, load, days, warmup: 3, seed: 1000 + s,
-      logins: 3, session: calibration.sessionUsd, week: calibration.weekUsd, mix: calibration.mix, ...(burst ? { burst } : {}) }));
+      logins: 3, session: calibration.sessionUsd, week: calibration.weekUsd, mix, ...(burst ? { burst } : {}) }));
     const mean = (f: (x: any) => number) => runs.reduce((s, x) => s + f(x), 0) / runs.length;
     const row = { load, policy, weightedFlowHours: mean((x) => x.weightedFlowHours), done: mean((x) => x.done), lostWeek: mean((x) => x.lostWeek),
       flowHours: Object.fromEntries(PRIORITIES.map((p) => [p, mean((x) => x.byClass[p].flowHours)])),
       startP95Minutes: Object.fromEntries(PRIORITIES.map((p) => [p, mean((x) => x.byClass[p].startP95Minutes)])),
+      heldShare: Object.fromEntries(PRIORITIES.map((p) => [p, mean((x) => x.byClass[p].heldShare)])),
+      heldHours: Object.fromEntries(PRIORITIES.map((p) => [p, mean((x) => x.byClass[p].heldHours)])),
       interruptedPerDay: mean((x) => x.interruptedPerDay), coldStartsPerDay: mean((x) => x.coldStartsPerDay),
       ...(burst ? { burstHours: mean((x) => x.burstHours), othersFlowDuringBurstHours: mean((x) => x.othersFlowDuringBurstHours) } : {}) };
     out.push(row);
     const f = (v: number | undefined, d = 1) => (v ?? 0).toFixed(d).padStart(7);
     console.log(`load ${load} ${policy.padEnd(11)} wflow ${f(row.weightedFlowHours)}h | flow L/M/H/U ${PRIORITIES.map((p) => f(row.flowHours[p])).join(' ')}h`
       + ` | start p95 M/H/U ${f(row.startP95Minutes.medium, 0)} ${f(row.startP95Minutes.high, 0)} ${f(row.startP95Minutes.urgent, 0)}m`
+      + ` | held (>5 min with quota free) M/H ${f(100 * row.heldShare.medium!, 0)} ${f(100 * row.heldShare.high!, 0)}%, ${f(row.heldHours.medium!, 2)} ${f(row.heldHours.high!, 2)}h/tree`
       + ` | done ${f(100 * row.done, 0)}% | week lost ${f(100 * row.lostWeek, 1)}% | cut ${f(row.interruptedPerDay)} cold ${f(row.coldStartsPerDay)} /d`
       + ('burstHours' in row ? ` | burst ${f(row.burstHours)}h, others meanwhile ${f(row.othersFlowDuringBurstHours)}h` : ''));
   }

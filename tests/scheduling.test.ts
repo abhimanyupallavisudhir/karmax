@@ -179,6 +179,16 @@ describe('quota scheduling policy', () => {
     expect(schedule({ now: 0, logins: late, trees: [hog], requests: [ask('hog')], forecast: evening }).admissions).toHaveLength(1);
   });
 
+  it('runs a tree someone said to run now even when its quota is kept for better work, but never past a limit', () => {
+    const hog = { ...tree('hog', 'low', 300), runNow: true };
+    const evening = forecast({ high: 2 }, 5);
+    const early = [login('a', { used: 120, resetAt: 4 * HOUR }, week(100, 5 * DAY))];
+    expect(schedule({ now: 0, logins: early, trees: [hog], requests: [ask('hog', 0, ['a'])], forecast: evening }).admissions).toHaveLength(1);
+    const spent = [login('a', { used: 150, resetAt: 4 * HOUR }, week(100, 5 * DAY))];
+    expect(schedule({ now: 0, logins: spent, trees: [hog], requests: [ask('hog', 0, ['a'])], forecast: evening }).queue[0])
+      .toMatchObject({ status: 'quota' });
+  });
+
   it('never holds work back for work ranked no higher than it', () => {
     // Plenty of medium work expected, little quota left: a fresh medium tree still starts.
     const tight = [login('a', { used: 145, resetAt: 4 * HOUR }, week(100, 5 * DAY))];

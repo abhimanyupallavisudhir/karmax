@@ -20,9 +20,11 @@ export interface SchedulingQueueView {
   /** When the scheduler last planned (ms). */
   plannedAt?: number;
   /** Turns holding a login now. */
-  running: (SchedulingQueueTask & { turnId: string; accountId: string; since?: number })[];
+  running: (SchedulingQueueTask & { turnId: string; accountId: string; since?: number; runNow?: boolean })[];
   /** Turns waiting, in the order they will get quota. */
   waiting: (SchedulingQueueTask & { turnId: string; status: Exclude<QueueStatus, 'admit'>; until?: number;
     /** Orders someone set for this task by dragging. */
-    pins?: { above: string; below: string; by?: string }[] })[];
+    pins?: { above: string; below: string; by?: string }[];
+    /** Someone said to run its task now: never held back for better work. */
+    runNow?: boolean })[];
 }

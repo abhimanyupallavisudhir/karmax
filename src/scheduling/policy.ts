@@ -90,6 +90,8 @@ export interface TreeState {
   lanes?: number;
   /** The login it last ran on. */
   lastLogin?: string;
+  /** Someone said to run it now: its quota is never kept back for better work (it still waits for a slot and a limit). */
+  runNow?: boolean;
 }
 
 export interface TurnRequest {
@@ -311,7 +313,7 @@ export function schedule(input: ScheduleInput, cache?: DemandCache): ScheduleRes
       queue.push(entry);
       continue;
     }
-    const affordable = withQuota.filter((l) => rank >= priceOf(l, rank).session);
+    const affordable = tree.runNow ? withQuota : withQuota.filter((l) => rank >= priceOf(l, rank).session);
     const open = affordable.filter((l) => l.running < (l.maxConcurrent ?? params.maxConcurrent));
     if (open.length) {
       const sessionEnd = (l: LoginState) => { const w = windowOf(l, 'session'); return w ? expiry(w, now) : Infinity; };

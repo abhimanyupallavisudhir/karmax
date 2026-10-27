@@ -67,12 +67,15 @@ const REFIT_MS = 60 * 60_000;
 export async function fitModel(store: ModelSource, organizationId: string, nowMs: number): Promise<SchedulingModel> {
   const since = nowMs - HISTORY_DAYS * 86_400_000;
   const arrivals = await store.rootTaskArrivals(organizationId, since);
-  const forecast = new ArrivalForecast();
-  for (const a of arrivals) forecast.observe(a.createdAt / 60_000, schedulingPriority(a.priority));
-  forecast.advanceTo(nowMs / 60_000);
-  const ledgers = (await store.kvEntries('scheduling:tree:'))
+  const all = (await store.kvEntries('scheduling:tree:'))
     .map(({ key, value }) => { try { return { root: key.slice('scheduling:tree:'.length), ledger: JSON.parse(value) as TreeLedger }; } catch { return undefined; } })
-    .filter((x): x is { root: string; ledger: TreeLedger } => !!x && x.ledger.organizationId === organizationId);
+    .filter((x): x is { root: string; ledger: TreeLedger } => !!x);
+  // A priority changed after the task had waited a while counts as what it arrived with.
+  const arrivedAs = new Map(all.filter((x) => x.ledger.arrivalPriority !== undefined).map((x) => [x.root, x.ledger.arrivalPriority!]));
+  const forecast = new ArrivalForecast();
+  for (const a of arrivals) forecast.observe(a.createdAt / 60_000, schedulingPriority(arrivedAs.get(a.id) ?? a.priority));
+  forecast.advanceTo(nowMs / 60_000);
+  const ledgers = all.filter((x) => x.ledger.organizationId === organizationId);
   const done = await store.taskCompletions(ledgers.map((l) => l.root));
   const finished = ledgers.filter((l) => done.has(l.root));
   const burns = ledgers.map((l) => l.ledger.burn).filter((b): b is number => typeof b === 'number' && b > 0).sort((a, b) => a - b);

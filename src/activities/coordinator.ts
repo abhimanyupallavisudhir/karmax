@@ -221,7 +221,7 @@ export function makeCoordinatorActivities(deps: CoordinatorActivityDeps) {
     /** The quota scheduler's step for the account coordinator (wiki features/quota-scheduling). */
     async planAccountGrants(input: import('../scheduling/planner.js').PlanInput): Promise<import('../scheduling/planner.js').PlanOutput> {
       const store = deps.store;
-      if (!store?.taskTree || !store.kvEntries || !store.rootTaskArrivals || !store.taskCompletions || !store.kvGet || !store.kvSet
+      if (!store?.taskTree || !store.kvEntries || !store.rootTaskArrivals || !store.taskCompletions || !store.endedTasks || !store.kvGet || !store.kvSet
         || !store.kvCompareAndSet) throw new Error('quota scheduler needs the store');
       const { planGrants } = await import('../scheduling/planner.js');
       const plan = await planGrants(store as import('../scheduling/planner.js').PlannerStore, input);

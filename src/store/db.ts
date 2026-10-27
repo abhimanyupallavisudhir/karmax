@@ -8564,6 +8564,22 @@ export class Store {
     return out;
   }
 
+  /** Those of these tasks that are gone: deleted, done or cancelled (people's queue orders on them lapse). */
+  async endedTasks(ids: string[]): Promise<Set<string>> {
+    const live = new Set<string>();
+    for (let i = 0; i < ids.length; i += 500) {
+      const chunk = ids.slice(i, i + 500);
+      const rows = await this.readRows<{ id: string; completedAt: number | null; lastView: string | null }>(
+        `SELECT id, completedAt, lastView FROM tasks WHERE id IN (${chunk.map(() => '?').join(',')})`, chunk);
+      for (const r of rows) {
+        let status = '';
+        try { status = String(JSON.parse(r.lastView ?? '{}').status ?? ''); } catch {}
+        if (r.completedAt == null && status !== 'done' && status !== 'cancelled') live.add(r.id);
+      }
+    }
+    return new Set(ids.filter((id) => !live.has(id)));
+  }
+
   /** An attempt group's size and commitment, without hydrating its attempts (RT-14). */
   async attemptSummary(taskOrIntentId: string): Promise<{ attempts: number; committedAttemptId?: string; otherAttempts?: 'keep' | 'cancel' } | undefined> {
     const [row] = await this.readRows<{ id: string; committedAttemptId: string | null; attempts: number }>(`SELECT i.id, i.committedAttemptId,

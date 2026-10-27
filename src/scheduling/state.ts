@@ -9,6 +9,7 @@ import type { QuotaWindow } from './policy.js';
  *   quota:observed:<credential>   its latest usage readings per window, with the spend at that moment
  *   quota:capacity:<credential>   dollars per full window, learned from readings against spend
  *   scheduling:order:<org>        orders people set by dragging (order.ts)
+ *   scheduling:run-now:<org>      task trees people said to run now: never kept back for better work
  *   scheduling:queue:<org>        the last plan, for the Queues page
  *   scheduling:model:<org>        the fitted forecast, size law and burn rate (model.ts)
  */
@@ -47,7 +48,12 @@ export interface TreeLedger {
   lastTurnAt?: number;
   /** Turns it has run. */
   turns?: number;
+  /** The root's priority as it arrived, when changed later (the forecast counts arrivals, not bumps). */
+  arrivalPriority?: number;
 }
+
+/** Past this, a root's new priority re-ranks work already waiting rather than describing what arrived. */
+export const ARRIVAL_GRACE_MS = 15 * 60_000;
 
 export const treeKey = (root: string) => `scheduling:tree:${root}`;
 export const spentKey = (credential: string) => `quota:spent:${credential}`;
@@ -55,6 +61,9 @@ export const observedKey = (credential: string) => `quota:observed:${credential}
 export const capacityKey = (credential: string) => `quota:capacity:${credential}`;
 export const orderKey = (organization: string) => `scheduling:order:${organization}`;
 export const queueKey = (organization: string) => `scheduling:queue:${organization}`;
+export const runNowKey = (organization: string) => `scheduling:run-now:${organization}`;
+/** A tree someone said to run now (lapses when its root is gone). */
+export interface RunNow { root: string; at: number; by?: string }
 export const modelKey = (organization: string) => `scheduling:model:${organization}`;
 
 /** A finished turn: what it cost, how long it ran, where. */

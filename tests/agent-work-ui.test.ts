@@ -66,6 +66,37 @@ describe('Agent work on the Queues page', () => {
     await ui.close();
   });
 
+  it('runs a held task now from its row, and undoes that from the mark it leaves', async () => {
+    const ui = await consolePage({ api: () => ({ ok: true }) });
+    const marked = { ...queue, waiting: queue.waiting.map((w) => (w.taskId === 'held' ? { ...w, status: 'next', runNow: true } : w)) };
+    // boot() installs the delegated handler; the test page does not boot.
+    await ui.run(`
+      installRunNow();
+      S.tab = 'none';
+      S.agentWork = ${JSON.stringify(queue)};
+      $('#main').innerHTML = agentWorkPanel() + '<div id="marked">' + (S.agentWork = ${JSON.stringify(marked)}, agentWorkPanel()) + '</div>';
+    `);
+    // Only the held tree offers it.
+    expect(await ui.page.locator('#main > .work-list [data-run-now]').evaluateAll((bs) => bs.map((b) => b.getAttribute('data-run-now')))).toEqual(['held']);
+    await ui.page.locator('#main > .work-list [data-run-now="held"]').click();
+    await expect.poll(() => ui.calls.some((c) => c.method === 'PUT' && c.path.startsWith('/api/scheduling/run-now/held'))).toBe(true);
+    await ui.page.locator('#marked [data-run-now-undo="held"]').click();
+    await expect.poll(() => ui.calls.some((c) => c.method === 'DELETE' && c.path.startsWith('/api/scheduling/run-now/held'))).toBe(true);
+    expect(ui.errors).toEqual([]);
+    await ui.close();
+  });
+
+  it('offers Run now beside a held task\'s wait on its own page', async () => {
+    const ui = await consolePage({ api: () => ({ ok: true }) });
+    await ui.run(`installRunNow(); $('#main').innerHTML = conversationWaitNotice({ taskId: 't1',
+      waitingFor: { kind: 'account', detail: 'Held for higher-priority work', until: Date.UTC(2030, 0, 1, 14, 20) } })`);
+    expect(await ui.page.locator('.wait-notice').innerText()).toMatch(/^Held for higher-priority work until .*Run now$/);
+    await ui.page.locator('.wait-notice [data-run-now="t1"]').click();
+    await expect.poll(() => ui.calls.some((c) => c.method === 'PUT' && c.path.startsWith('/api/scheduling/run-now/t1'))).toBe(true);
+    expect(ui.errors).toEqual([]);
+    await ui.close();
+  });
+
   it('explains a held task\'s wait on its own page', async () => {
     const ui = await consolePage();
     const text = await ui.run<string>(`waitingText({ kind: 'account', detail: 'Held for higher-priority work', until: Date.UTC(2030, 0, 1, 14, 20) })`);

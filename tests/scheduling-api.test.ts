@@ -2,8 +2,10 @@ import { describe, expect, it } from 'vitest';
 import { KarmaxApi } from '../src/platform/api.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 import { Store } from '../src/store/db.js';
-import { orderKey, queueKey } from '../src/scheduling/state.js';
-import { planGrants } from '../src/scheduling/planner.js';
+import { modelKey, observedKey, orderKey, queueKey, runNowKey } from '../src/scheduling/state.js';
+import { ArrivalForecast } from '../src/scheduling/forecast.js';
+import { PRIOR, fitModel } from '../src/scheduling/model.js';
+import { planGrants, type PlanInput } from '../src/scheduling/planner.js';
 
 /**
  * Agent work in quota order, and the orders people (or agents) set by dragging
@@ -66,6 +68,26 @@ describe('scheduling queue API', () => {
     (await store.close());
   });
 
+  it('forecasts from the priority a task arrived with, not one it was bumped to after waiting', async () => {
+    const { store, project, token, task, api } = await setup();
+    const org = project.organizationId ?? 'org_personal';
+    const filed = await task('Filed urgent');
+    await api.setTaskPriority(token, filed.id, 4);
+    const bumped = await task('Bumped later');
+    // Filed 20 minutes ago, bumped now.
+    await (store as any).db.prepare('UPDATE tasks SET createdAt=? WHERE id=?').run(Date.now() - 20 * 60_000, bumped.id);
+    await api.setTaskPriority(token, bumped.id, 4);
+    const model = await fitModel(store as any, org, Date.now());
+    const { ArrivalForecast: F } = await import('../src/scheduling/forecast.js');
+    const f = F.from(model.forecast), now = Date.now() / 60_000;
+    const day = (p: 'medium' | 'urgent') => f.expected(p, now, now + 24 * 60);
+    // One urgent arrival (set as it was filed) and one medium (bumped after 20 minutes).
+    expect(day('urgent')).toBeGreaterThan(0);
+    expect(day('medium') / day('urgent')).toBeGreaterThan(0.8);
+    expect(day('medium') / day('urgent')).toBeLessThan(1.25);
+    (await store.close());
+  });
+
   it('refuses a caller without queue write access', async () => {
     const { store, token, task, api } = await setup(['task:read', 'queue:read']);
     const a = await task('A'), b = await task('B');
@@ -92,6 +114,45 @@ describe('planner', () => {
     expect(plan.recheckMs).toBeGreaterThanOrEqual(60_000);
     const saved = JSON.parse((await store.kvGet(queueKey(org)))!);
     expect(saved.waiting.map((w: any) => [w.taskId, w.status, w.priority])).toEqual([[urgent.id, 'admit', 'urgent'], [low.id, 'next', 'low']]);
+    (await store.close());
+  });
+
+  it('runs a held task when someone says to run it now, shows that, and forgets it once the task is done', async () => {
+    const { store, project, token, task, signals, setLive, api } = await setup();
+    const low = await task('Low', { params: { prompt: 'l', priority: 1 } });
+    const org = project.organizationId ?? 'org_personal';
+    const now = Date.UTC(2030, 0, 1, 12);
+    // A busy organization (urgent work every hour) and a login whose 5-hour window is nearly spent.
+    const forecast = new ArrivalForecast();
+    for (let h = 0; h < 14 * 24; h++) for (let k = 0; k < 3; k++) forecast.observe(now / 60_000 - (14 * 24 - h) * 60 + k, 'urgent');
+    forecast.advanceTo(now / 60_000);
+    await store.kvSet(modelKey(org), JSON.stringify({ fittedAt: now, forecast: forecast.toJSON(), size: PRIOR.size, burn: PRIOR.burn, lanes: 1, trees: 0 }));
+    await store.kvSet(observedKey('login:a'), JSON.stringify({ session: { utilization: 0.9, resetsAt: now + 4 * 3_600_000, at: now, spentAt: 0 },
+      week: { utilization: 0.2, resetsAt: now + 5 * 86_400_000, at: now, spentAt: 0 } }));
+    const input: PlanInput = { accounts: [{ id: 'login:a', provider: 'claude', kind: 'login', status: 'available', inUse: 0, maxConcurrent: 10 }],
+      queue: [{ taskId: low.id, turnId: 'l', provider: 'claude', allowed: ['login:a'] }], granted: [] };
+    const held = await planGrants(store, input, now);
+    expect(held.grants).toEqual([]);
+    expect(held.holds).toEqual([expect.objectContaining({ taskId: low.id, status: 'held' })]);
+
+    await api.runNow(token, low.id);
+    expect(signals).toContain('replanAccounts');
+    const run = await planGrants(store, input, now);
+    expect(run.grants).toEqual([{ taskId: low.id, turnId: 'l', accountId: 'login:a' }]);
+    expect(JSON.parse((await store.kvGet(queueKey(org)))!).waiting[0]).toMatchObject({ taskId: low.id, runNow: true });
+    setLive({ queue: [{ taskId: low.id, turnId: 'l' }], granted: [], holds: [] });
+    expect((await api.schedulingQueue(token)).waiting[0]).toMatchObject({ taskId: low.id, runNow: true });
+
+    // Undone, it is held again; done, its mark (and any drag placement on it) lapses.
+    await api.cancelRunNow(token, low.id);
+    expect((await planGrants(store, input, now)).grants).toEqual([]);
+    await api.runNow(token, low.id);
+    const other = await task('Other');
+    await api.placeInQueue(token, { taskId: other.id, above: low.id });
+    await store.appendEvent({ taskId: low.id, type: 'view.updated', ts: now, payload: { status: 'done' } } as any);
+    await planGrants(store, { ...input, queue: [{ taskId: other.id, turnId: 'o', provider: 'claude', allowed: ['login:a'] }] }, now);
+    expect(await store.kvGet(runNowKey(org))).toBeUndefined();
+    expect(await store.kvGet(orderKey(org))).toBeUndefined();
     (await store.close());
   });
 

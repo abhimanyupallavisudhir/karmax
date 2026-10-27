@@ -1,9 +1,9 @@
 import { ArrivalForecast } from './forecast.js';
 import { loadModel, schedulingPriority, type ModelSource, type SchedulingModel } from './model.js';
-import type { OrderConstraint } from './order.js';
+import { pruneOrders, type OrderConstraint } from './order.js';
 import { DEFAULT_SCHEDULING, schedule, type LoginState, type QueueStatus, type TreeState, type TurnRequest } from './policy.js';
 import { SizeModel } from './size-model.js';
-import { kvJson, loginWindows, orderKey, queueKey, treeKey, type TreeLedger } from './state.js';
+import { kvJson, kvUpdate, loginWindows, orderKey, queueKey, runNowKey, treeKey, type RunNow, type TreeLedger } from './state.js';
 
 /**
  * The account coordinator's scheduling step (wiki features/quota-scheduling):
@@ -48,12 +48,27 @@ export interface QueueSnapshot {
   at: number;
   running: { taskId: string; turnId: string; root: string; accountId: string; grantedAt?: number }[];
   waiting: { taskId: string; turnId: string; root: string; status: QueueStatus; until?: number; accountId?: string; placed?: boolean;
-    priority: string }[];
+    runNow?: boolean; priority: string }[];
   prices: Record<string, { session: number; week: number }>;
 }
 
 export interface PlannerStore extends ModelSource {
   taskTree(taskId: string): Promise<{ root: string; priority: number; organizationId: string; createdAt: number } | undefined>;
+  endedTasks(ids: string[]): Promise<Set<string>>;
+}
+
+/** People's orders and run-now marks, less those on tasks that are gone (deleted, done, cancelled). */
+async function manualChoices(store: PlannerStore, org: string): Promise<{ order: OrderConstraint[]; runNow: Set<string> }> {
+  const order = (await kvJson<OrderConstraint[]>(store, orderKey(org))) ?? [];
+  const marks = (await kvJson<RunNow[]>(store, runNowKey(org))) ?? [];
+  const ids = [...new Set([...order.flatMap((c) => [c.above, c.below]), ...marks.map((m) => m.root)])];
+  const ended = ids.length ? await store.endedTasks(ids) : new Set<string>();
+  const live = (id: string) => !ended.has(id);
+  if (ended.size) {
+    await kvUpdate<OrderConstraint[]>(store, orderKey(org), (prev) => { const next = pruneOrders(prev ?? [], live); return next.length ? next : undefined; });
+    await kvUpdate<RunNow[]>(store, runNowKey(org), (prev) => { const next = (prev ?? []).filter((m) => live(m.root)); return next.length ? next : undefined; });
+  }
+  return { order: pruneOrders(order, live), runNow: new Set(marks.map((m) => m.root).filter(live)) };
 }
 
 // Turn lengths on tavya.io: log-normal, median 1.9 min, p99 48 min (calibration.json).
@@ -136,7 +151,8 @@ async function planOrganization(store: PlannerStore, org: string, part: { queue:
 
   const requests: TurnRequest[] = part.queue.map((q, i) => ({ id: `${q.taskId}\u0000${q.turnId}`, treeId: root(q.taskId), taskId: q.taskId,
     requestedAt: now - (part.queue.length - i) * 1e-6, logins: allowedFor(q) }));
-  const order = (await kvJson<OrderConstraint[]>(store, orderKey(org))) ?? [];
+  const { order, runNow } = await manualChoices(store, org);
+  for (const tree of trees) if (runNow.has(tree.id)) tree.runNow = true;
   const forecast = { arrivals: model ? ArrivalForecast.from(model.forecast) : new ArrivalForecast(), size, burnRate: defaultBurn,
     lanes: model?.lanes ?? 1.3 };
   const result = schedule({ now, logins, trees, requests, forecast, order, params: DEFAULT_SCHEDULING, seed: Math.floor(nowMs / 60_000) });
@@ -168,7 +184,7 @@ async function planOrganization(store: PlannerStore, org: string, part: { queue:
     waiting: result.queue.map((e) => ({ ...split(e.requestId), root: e.treeId, status: e.status,
       priority: trees.find((t) => t.id === e.treeId)!.priority,
       ...(e.until !== undefined ? { until: Math.round(e.until * 60_000) } : {}), ...(e.loginId ? { accountId: e.loginId } : {}),
-      ...(e.placed ? { placed: true } : {}) })),
+      ...(e.placed ? { placed: true } : {}), ...(runNow.has(e.treeId) ? { runNow: true } : {}) })),
     prices: result.prices,
   };
   await store.kvSet(queueKey(org), JSON.stringify(snapshot));
