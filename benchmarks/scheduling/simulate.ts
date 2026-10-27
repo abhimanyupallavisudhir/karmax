@@ -5,7 +5,7 @@
  * calibrated to tavya.io (calibration.json).
  *
  *   npx tsx benchmarks/scheduling/simulate.ts [--days 35] [--seeds 8] [--load 0.7,1,1.3] [--burst 1500]
- * *     [--policies today,index,littlewood,littlewood-learned,scheduler] [--json out.json]
+ *     [--policies today,index,littlewood,littlewood-learned,scheduler] [--json out.json]
  *
  * Logins work like Claude Max: a 5-hour window that starts at first use and a
  * weekly limit, staggered. Turns run their measured lengths and are not
