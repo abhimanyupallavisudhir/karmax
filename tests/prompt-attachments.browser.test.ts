@@ -204,6 +204,21 @@ describe('prompt attachments', () => {
     await context.close();
   });
 
+  it('keeps a picture still uploading when the form is closed', async () => {
+    const { context, page, errors, uploads, prompt } = await openForm();
+    await prompt.fill('Closed while uploading');
+    await paste(prompt, await makePng(page, 6));
+    await expect.poll(() => uploads.sent.length).toBe(1);
+    await page.locator('#tf-close').click();
+    await expect.poll(async () => !!(await draftWith('Closed while uploading')), { timeout: 15_000 }).toBe(true);
+    expect((await draftWith('Closed while uploading'))?.params?.images).toBeUndefined();
+    uploads.release();
+    await expect.poll(async () => (await draftWith('Closed while uploading'))?.params?.images, { timeout: 15_000 })
+      .toEqual([expect.objectContaining({ mediaType: 'image/webp' })]);
+    expect(errors).toEqual([]);
+    await context.close();
+  });
+
   it('sends a follow-up once its pasted picture has uploaded', async () => {
     const signals: any[] = [];
     const ui = await consolePage({ api: ({ method, path: route, body }) => {

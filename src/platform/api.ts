@@ -265,6 +265,10 @@ const TERMINAL_CLEANUP_TIMEOUT_MS = 10_000;
  */
 const RECOVERABLE_WORKFLOWS = new Set(['software-dev', 'goal']);
 
+/** Decisions a task page shows as under way once accepted (`acceptedAction`). */
+const ACCEPTED_ACTIONS = new Set<string>([SIG.confirm, SIG.openPr, SIG.retry]);
+const acceptedActionKey = (taskId: string) => `accepted-action:${taskId}`;
+
 /** `_`-prefixed task params are platform metadata — the task's authorization
  * and delegation, its pinned GitHub account, fork provenance, the Temporal run
  * id, one-shot start flags. Only the platform writes them; remove any a caller
@@ -3512,17 +3516,18 @@ export class KarmaxApi {
       (await this.validatePromptFiles(task.projectId, promptFiles));
       params.files = promptFiles;
     }
-    const { archived, profiles, priority, template, _authorization, _agentAuthorization, _githubAccountId } = task.params;
+    const { archived, profiles, priority, template, _authorization } = task.params;
     const meta = {
       paymentPolicy: (task.params as any).paymentPolicy,
       ...(archived !== undefined ? { archived } : {}),
       ...(template !== undefined ? { template } : {}),
       ...(profiles !== undefined ? { profiles } : {}),
       ...(priority !== undefined ? { priority } : {}),
-      ...(_authorization !== undefined ? { _authorization } : {}),
-      ...(_agentAuthorization !== undefined ? { _agentAuthorization } : {}),
-      // The form cannot resupply the account the task was pinned to at creation.
-      ...(_githubAccountId !== undefined ? { _githubAccountId } : {}),
+      // Platform metadata is never form content, so a full-form save keeps all
+      // of it: the pinned GitHub account, provenance, and a pending approval
+      // (`_awaitingApproval`), whose loss turned a task waiting for approval
+      // back into a draft when its form was merely opened (pramana#132).
+      ...Object.fromEntries(Object.entries(task.params).filter(([key]) => key.startsWith('_'))),
     };
     const base: Record<string, unknown> = opts.replace ? { ...meta, ...params } : { ...task.params, ...params };
     if (project) (await this.assertAvatarSetting(caller, project, base, taskId));
@@ -3669,6 +3674,7 @@ export class KarmaxApi {
       const subTaskSummaries = await this.deps.store.childTaskSummaries(taskId);
       const forkSummaries = await this.deps.store.forkTaskSummaries(taskId);
       const forkSourceSummaries = await this.deps.store.forkSourceTaskSummaries(taskId);
+      const accepted = (await this.acceptedAction(taskId, view));
       const parentTaskId = view.parentTaskId ?? task?.parentTaskId;
       let parent = parentTaskId ? await this.deps.store.taskMetadataAsync(parentTaskId) : undefined;
       // A parent elsewhere is named only to a caller who may read it.
@@ -3690,6 +3696,8 @@ export class KarmaxApi {
           : { actions: this.lifecycleActions(view, task) }),
         ...((await this.deps.store.kvGet(`project-transfer-history:${taskId}`))
           ? { actions: [], stageTransitions: [] } : {}),
+        ...(accepted ? { acceptedAction: accepted, status: 'active' as const, waitingFor: undefined,
+          actions: this.lifecycleActions(view, task).filter((action) => !ACCEPTED_ACTIONS.has(action.name)) } : {}),
       };
     };
     // Snapshot-first (the default). The workflow persists `lastView` to the store on
@@ -6501,6 +6509,24 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
     return { stopped: key };
   }
 
+  /**
+   * A decision the workflow accepted but has not acted on yet. Temporal accepts
+   * a signal at once; the workflow acts on it at its next workflow task, which
+   * for a long history evicted from the worker's cache waits on a replay
+   * (pramana#111: 31 s per attempt, two minutes in all). Until the workflow
+   * publishes its next view, the stored one still offers the button.
+   */
+  private async acceptedAction(taskId: string, view: TaskView | undefined): Promise<TaskView['acceptedAction']> {
+    if (!view) return undefined;
+    const raw = (await this.deps.store.kvGet(acceptedActionKey(taskId)));
+    if (!raw) return undefined;
+    try {
+      const accepted = JSON.parse(raw) as { name?: unknown; at?: unknown; view?: unknown };
+      if (accepted.view !== view.updatedAt || typeof accepted.name !== 'string' || typeof accepted.at !== 'number') return undefined;
+      return view.actions?.some((action) => action.name === accepted.name) ? { name: accepted.name, at: accepted.at } : undefined;
+    } catch { return undefined; }
+  }
+
   private async deliverSignal(tool: 'signal_task' | 'message_agent', token: string, taskId: string, signal: string, text?: string, role?: string, images?: ImageRef[], files?: FileRef[], attemptChoice?: { otherAttempts?: 'keep' | 'cancel'; saveOtherAttemptsDefault?: boolean }, receivedAt?: { monoMs: number; wallMs: number },
     /** Shared-conversation fields of a follow-up: who says it and to whom. */
     addressed?: Partial<Pick<Message, 'role' | 'author' | 'authorLabel' | 'to'>>): Promise<Message | undefined> {
@@ -6526,6 +6552,9 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
       if (!attemptChoice.otherAttempts) throw new ValidationError('choose keep or cancel before saving a default');
     }
     const heldView = scopedTask?.lastView;
+    // The same decision again, before the workflow has acted on the first one
+    // (a reload still showed its button): it is already decided.
+    if ((await this.acceptedAction(taskId, heldView))?.name === signal) return undefined;
     if (signal === SIG.retry && scopedTask && heldView?.status === 'waiting'
       && heldView.waitingFor?.kind === 'account' && heldView.waitingFor.provider) {
       // The coordinator grants the parked turn as soon as a credential is usable
@@ -6838,8 +6867,12 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
         if (signal === SIG.cancel) await this.deps.store.appendEvent({ taskId,
           type: 'task.cancel-requested', ts: Date.now(), payload: {} });
       }
-      if ([SIG.openPr, SIG.confirm, SIG.retry].includes(signal as any))
+      if (ACCEPTED_ACTIONS.has(signal)) {
         await this.deps.store.appendEvent({ taskId, type: 'task.transition-requested', ts: Date.now(), payload: { signal } });
+        // Against the view it answered: any later publication supersedes it.
+        if (heldView) (await this.deps.store.kvSet(acceptedActionKey(taskId),
+          JSON.stringify({ name: signal, at: Date.now(), view: heldView.updatedAt })));
+      }
     } catch (e) {
       // Cancellation is idempotent at the task API boundary. The drawer can be
       // acting on a view published immediately before the workflow closes, in

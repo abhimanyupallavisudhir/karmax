@@ -9446,7 +9446,15 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
 
   // Debounced auto-save while typing.
   let saveTimer = null;
+  // Closing writes only what someone edited. Comparing signatures alone is not
+  // enough: fields that fill in after the form opens (the agent, the computer,
+  // PostgreSQL's reordering of stored JSON) differ from the stored params
+  // without any edit, so merely opening and closing a task rewrote it
+  // (pramana#132). Every edit reaches autoSaveSoon; a quick-composer seed has
+  // never been saved, so it counts as one.
+  let edited = lastSaved === null;
   function autoSaveSoon() {
+    edited = true;
     if (templateEdit) return paintSaveState($('#tf-savestate'), templateDirty() ? 'dirty' : '');
     paintSaveState($('#tf-savestate'), 'dirty');
     clearTimeout(saveTimer);
@@ -9503,8 +9511,8 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   // Flush any pending edits when the form is dismissed, so closing without
   // clicking a button still keeps the draft.
   closeForm = () => {
-    clearTimeout(saveTimer); const st = formState(); const navigating = navigatingAway(); releaseFormKeys(); root.innerHTML = ''; persistDraft(st);
-    // An attachment still uploading joins the draft once it lands.
+    clearTimeout(saveTimer); const st = formState(); const navigating = navigatingAway(); releaseFormKeys(); root.innerHTML = ''; if (edited) persistDraft(st);
+    // An attachment still uploading (attaching is an edit) joins the draft once it lands.
     if (pendingAttachments(formImages).length) attachmentsSettled(formImages).then(() => persistDraft({ ...st, body: { ...st.body,
       ...(formImages.length ? { images: [...formImages] } : {}), ...(formFiles.length ? { files: [...formFiles] } : {}) } }));
     leavePage(navigating);
@@ -14813,6 +14821,9 @@ function taskActions(v) {
     return `<div class="actions" role="status" aria-live="polite"><button class="btn primary action-pending" disabled aria-busy="true" title="Another task changed some of the same files. The agent is combining them; publishing resumes after it.">Combining resources…</button></div>`;
   if (v.state?.finalizing) return `<div class="actions" role="status" aria-live="polite"><button class="btn primary action-pending" disabled aria-busy="true">Finishing…</button><span>Saving task output</span></div>`;
   const acts = v.actions || [];
+  // Accepted; the task acts on it shortly. Its button must not come back meanwhile.
+  const accepted = v.acceptedAction
+    ? `<button class="btn primary action-pending" disabled aria-busy="true" title="Accepted. The task is acting on it.">${esc(ACCEPTED_ACTION_LABELS[v.acceptedAction.name] || 'Working…')}</button>` : '';
   const simple = acts.filter((a) => !a.args || a.args.length === 0);
   // Sub-tasks' files arriving before the agent's next turn: a message sent now waits for them.
   const refreshing = v.state?.refreshingResources && v.status === 'active'
@@ -14823,7 +14834,7 @@ function taskActions(v) {
     // A sub-task starts from this task's data, saved first: gigabytes take minutes.
     : v.state?.preparingSubTask && v.status === 'active'
       ? `<button class="btn primary action-pending" disabled aria-busy="true" title="A sub-task starts from this task’s data, so it is saved first.">${esc(stagingProgress()?.text || 'Saving data for a sub-task…')}</button>` : '';
-  let html = `<div class="actions"${refreshing ? ' role="status" aria-live="polite"' : ''}>${refreshing}${biggerDiskButton(v)}`;
+  let html = `<div class="actions"${refreshing || accepted ? ' role="status" aria-live="polite"' : ''}>${accepted}${refreshing}${biggerDiskButton(v)}`;
   let slot = 0; // digits 1–9 press the Nth ENABLED button (see the command registry)
   for (const a of simple) {
     const cls = a.name === 'confirm' || a.name === 'openPr' ? 'primary' : a.danger ? 'danger' : '';
@@ -14841,9 +14852,10 @@ function taskActions(v) {
   // The follow-up box lives inside each agent's conversation on the Check-in tab,
   // so a human can address any agent (SPEC §5.6).
   html += `</div>`;
-  if (!acts.length && !refreshing && !biggerDiskButton(v)) html = ''; // nothing to act on: the bar folds away
+  if (!acts.length && !refreshing && !accepted && !biggerDiskButton(v)) html = ''; // nothing to act on: the bar folds away
   return html;
 }
+const ACCEPTED_ACTION_LABELS = { confirm: 'Confirming…', openPr: 'Opening PR…', retry: 'Retrying…' };
 
 /**
  * One phrasing for "that action went through", used by the task footer, the command
@@ -14860,6 +14872,7 @@ function actionToast(signal, label) {
   const done = { confirm: 'Confirmed', openPr: 'Opening PR and requesting confirmation', cancel: 'Cancelled', finish: 'Finishing', retry: 'Retrying', resume: 'Resumed', followUp: 'Sent' };
   const text = String(label || signal).trim();
   if (signal === 'openPr' && text.toLowerCase() === 'return to review & confirm') return 'Returning to Review';
+  if (signal === 'confirm' && text.toLowerCase() === 'confirm pr') return 'Confirmed';
   return text.toLowerCase() === standard[signal] ? done[signal] : `${text} — done`;
 }
 

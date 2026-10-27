@@ -197,6 +197,25 @@ describe('an agent creating a task', () => {
     expect((told!.args[0] as { text: string }).text).toContain(`PATCH /api/tasks/${denied.id}/authorization`);
   });
 
+  it('still waits for approval after its form is saved, and arms when approved (pramana#132)', async () => {
+    const f = await fixture();
+    const dependency = await f.api.createTask(await f.human('dev'), { projectId: f.project.id, workflow: 'just-do', prompt: 'first' });
+    const triggers = [{ kind: 'dependency', tasks: [dependency.id] }];
+    const waiting = await f.api.createTask(await f.agent(), { projectId: f.project.id, workflow: 'just-do', prompt: 'then',
+      params: { triggers }, authorization: f.maintainer, credentialGrants: [f.cap], holdForAuthorization: true });
+    const requestId = waiting.authorizationRequest!.id;
+    // Opening it in the console and closing it saves the whole form: params
+    // replaced (the form never carries platform metadata), then authorization.
+    const owner = await f.human('owner');
+    await f.api.updateArmedParams(owner, waiting.id, { prompt: 'then', triggers }, { replace: true, keepArmed: false, allowAttenuation: true });
+    const saved = (await f.store.getTask(waiting.id))!;
+    expect(saved.params).toMatchObject({ draft: true, _awaitingApproval: requestId, triggers });
+    expect(saved.params._githubAccountId).toBe(waiting.params._githubAccountId);
+    expect(taskStatus(saved)).toBe('waiting');
+    await f.api.resolveAuthorizationRequest(await f.human('admin'), { organizationId: f.organization.id, requestId, action: 'approve' });
+    expect((await f.store.getTask(waiting.id))!.params).toMatchObject({ draft: false, triggerState: 'armed', _awaitingApproval: null });
+  });
+
   it('tells no one when the creating task has finished, nor when a person created it', async () => {
     const f = await fixture();
     const byPerson = await f.api.createTask(await f.human('dev'), { projectId: f.project.id, workflow: 'just-do', prompt: 'deploy',
