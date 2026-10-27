@@ -109,7 +109,7 @@ const EMPTY = { ...fixture(), totals: { ...fixture().totals, shipped: 0, created
       };
     }, { data: fixture(), empty: EMPTY });
     await page.addScriptTag({ content: [
-      ...['beginAsyncElementRender', 'fmtAgo', 'fmtCountdown', 'usageResetLabel', 'autoRecheckUsage'].map(fn),
+      ...['beginAsyncElementRender', 'fmtAgo', 'fmtCountdown', 'usageResetLabel', 'autoRecheckUsage', 'accountShortName'].map(fn),
       'const asyncElementRenderEpoch = new WeakMap();',
       fn('safeHref'), insights,
       'window.renderPage = () => { $("#main").innerHTML = insightsView(); wireInsights(); return renderInsights(); };',

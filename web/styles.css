@@ -1662,7 +1662,6 @@ a.ins-task-title:hover { color: var(--accent); }
   .ins-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .ins-table .ins-spark-col { display: none; }
 }
-.account-status { padding: 10px 0; border-top: 1px solid var(--line); }
 .form-row { display: flex; flex-direction: column; gap: 5px; margin-bottom: 14px; }
 .form-row-head { display: flex; align-items: center; gap: 4px; }
 .form-row label, .form-row-head { font-size: 12px; font-weight: 600; color: var(--ink-2); }
@@ -2487,6 +2486,71 @@ html[data-theme="dark"] .github-signin-btn:active,
 .cred-rename, .cred-del, .cred-key-edit, .cred-key-del { cursor: pointer; color: var(--ink-3); font-size: 11px; }
 .cred-rename:hover, .cred-del:hover, .cred-key-edit:hover, .cred-key-del:hover { color: var(--accent); }
 .api-key-edit-form { width: min(440px, calc(100vw - 32px)); }
+
+/* Settings → Agents: the same rows as a list, one account per row (columns shared
+   through subgrid so names, states and meters line up), details folded under. */
+.cred-list.acct-list {
+  display: grid; gap: 0; align-items: stretch;
+  grid-template-columns: auto auto minmax(0, 1fr) auto auto auto;
+  border-top: 1px solid var(--line);
+}
+.cred-row.acct {
+  grid-column: 1 / -1; display: grid; grid-template-columns: subgrid; align-items: center;
+  column-gap: 12px; padding: 0 2px; min-height: 46px;
+  border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: none;
+  font-size: 13px; line-height: 1.4;
+}
+.cred-row.acct.off { opacity: 1; }
+.cred-row.acct.off :is(.cred-label, .acct-state, .acct-meter) { opacity: .45; }
+.cred-row.acct .cred-drag { font-size: 13px; padding: 4px 0; }
+.cred-row.acct .cred-label { overflow: hidden; text-overflow: ellipsis; display: flex; align-items: center; gap: 6px; }
+.acct-state { display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; color: var(--ink-2); font-size: 12.5px; }
+.acct-state.warn { color: var(--working); }
+.acct-state.bad { color: var(--danger); }
+.acct-state.off { color: var(--ink-3); }
+.acct-state .status-dot.off { background: var(--ink-3); }
+.acct-meter { display: inline-grid; grid-template-columns: 64px 34px auto; align-items: center; gap: 6px; font-size: 11px; color: var(--ink-3); }
+.acct-meter b { font-family: var(--font-mono); font-weight: 600; color: var(--ink); text-align: right; }
+.ins-quota-bar.crit i { background: var(--danger); }
+.acct-expand { width: 26px; height: 26px; font-size: 17px; line-height: 1; color: var(--ink-3); transition: transform .15s; }
+.cred-row.acct.open .acct-expand { transform: rotate(90deg); }
+.cred-row.acct > .acct-detail { grid-column: 1 / -1; display: none; margin: 0 0 12px 30px; padding: 0 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); }
+.cred-row.acct.open > .acct-detail { display: flex; }
+.acct-detail.setting-rows.ruled { border-top: 1px solid var(--line); }
+.acct-detail .setting-label { width: 128px; }
+.acct-detail .setting-row { min-height: 40px; }
+.acct-usage { display: grid; gap: 2px; width: 100%; max-width: 440px; padding: 4px 0; }
+.acct-usage .ins-quota-row { grid-template-columns: 54px 120px 36px minmax(0, 1fr); font-size: 12px; }
+.acct-reset-at { color: var(--ink-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.acct-checked { font-size: 11px; color: var(--ink-3); }
+.acct-conc { width: 88px; }
+.acct-incident { display: grid; gap: 2px; font-size: 12.5px; min-width: 0; width: 100%; overflow: hidden; }
+.acct-incident > div:first-child::first-letter { text-transform: uppercase; }
+.acct-incident-source a { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acct-actions { display: flex; flex-wrap: wrap; gap: 4px; padding: 8px 0; margin-left: -10px; }
+.acct-actions .btn { color: var(--ink-2); }
+.acct-actions .btn.danger { color: var(--danger); border-color: transparent; }
+.acct-until { width: 220px; }
+.acct-detail .cred-login-flow { padding-bottom: 10px; margin-top: 0; }
+.acct-detail .cred-login-flow[hidden] { display: none; }
+.cred-row.acct .cred-signin:not(.btn) { width: 16px; height: 16px; }
+.acct-list + .cred-save { margin-top: 10px; }
+#accounts-card .usage-recheck-all[hidden] { display: none; }
+@media (max-width: 640px) {
+  .cred-list.acct-list { grid-template-columns: auto auto minmax(0, 1fr) auto; }
+  .cred-row.acct { row-gap: 2px; padding: 8px 2px; }
+  .cred-row.acct .cred-label { grid-column: 3; }
+  .cred-row.acct .acct-state { grid-column: 3; grid-row: 2; }
+  .cred-row.acct .acct-meter { grid-column: 3; grid-row: 3; }
+  .cred-row.acct .acct-meter:empty, .cred-row.acct > span:empty { display: none; }
+  .cred-row.acct .acct-expand { grid-column: 4; grid-row: 1; }
+  .acct-detail { margin-left: 0; }
+  .acct-detail .setting-row { flex-wrap: wrap; gap: 4px 12px; padding: 8px 0; }
+  .acct-detail .setting-label { width: 100%; }
+  .acct-detail .setting-value { flex-basis: 100%; }
+  .acct-usage .ins-quota-row { grid-template-columns: 54px minmax(0, 1fr) 36px; }
+  .acct-usage .acct-reset-at { grid-column: 2 / -1; margin-bottom: 4px; }
+}
 
 /* ── Trigger dependency chip-input (task form) ────────────────────────────── */
 .chip-input {
@@ -3968,10 +4032,6 @@ input.toggle:disabled { opacity:.45; cursor:not-allowed; }
 .authz-invite-row { padding-top:12px; border-top:1px solid var(--line); }
 .team-create { margin-top:8px; }
 /* Agent accounts */
-.account-status-head { display:flex; align-items:center; gap:8px; flex-wrap:wrap; font-size:13px; }
-.account-status-actions { margin-left:auto; display:flex; align-items:center; gap:6px; }
-.account-conc { display:inline-flex; align-items:center; gap:5px; color:var(--ink-3); font-size:12px; }
-.account-conc input { width:48px; padding:4px 6px !important; text-align:center; }
 .status-dot { width:8px; height:8px; border-radius:50%; background:var(--ink-3); flex:none; }
 .status-dot.ok { background:var(--ok, #4ec9a3); }
 .status-dot.warn { background:var(--warn, #e0b15a); }
@@ -3980,11 +4040,9 @@ input.toggle:disabled { opacity:.45; cursor:not-allowed; }
 .account-add .account-provider { width:120px; }
 .account-add-note { font-size:12px; color:var(--ink-3); }
 .account-add-note:empty { display:none; }
-#account-status:empty { display:none; }
 .workflow-line .setting-value { flex-wrap:nowrap; }
 .workflow-description { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--ink-3); font-size:12px; }
 .workflow-line .setting-value > b { flex:none; white-space:nowrap; }
-#cred-editor-global + #account-status { margin-top:14px; }
 #accounts-card .section-h + .account-add { margin-top:0; }
 /* Inline disclosures share one chevron instead of the browser triangle. */
 :is(.payment-add-card, .pay-stripe, .pay-cardholder, .payment-restrictions, .vault-custom, .authorization-role) > summary { display:flex; align-items:center; gap:8px; list-style:none; cursor:pointer; font-weight:600; padding:6px 0; }
