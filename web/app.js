@@ -4000,30 +4000,62 @@ async function fetchApi(path, opts = {}) {
 // Bytes are uploaded to the content-addressed store immediately, so task and
 // follow-up payloads carry only lightweight references. Images are provider-
 // native and previewable; ordinary files are materialized into the task world.
-async function uploadImage(file, projectId = S.projectId) {
-  const res = await feedbackFetch(`/api/attachments?projectId=${encodeURIComponent(projectId)}`, {
-    method: 'POST',
-    headers: { 'content-type': file.type || 'application/octet-stream', ...(S.token ? { authorization: `Bearer ${S.token}` } : {}) },
-    body: file,
+// An upload shows as a chip at once (a preview with its progress); a message
+// sent meanwhile waits for it. XHR, not fetch: only XHR reports upload progress.
+function postAttachment(kind, body, projectId, upload) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    upload.abort = () => xhr.abort();
+    xhr.open('POST', `/api/${kind}?projectId=${encodeURIComponent(projectId)}`);
+    xhr.setRequestHeader('content-type', body.type || 'application/octet-stream');
+    if (kind === 'files') xhr.setRequestHeader('x-file-name', encodeURIComponent(body.name || 'attachment'));
+    if (S.token) xhr.setRequestHeader('authorization', `Bearer ${S.token}`);
+    xhr.upload.onprogress = (event) => { if (event.lengthComputable) paintUploadProgress(upload, event.loaded / event.total); };
+    xhr.onload = () => {
+      let out = {};
+      try { out = JSON.parse(xhr.responseText); } catch {}
+      if (xhr.status >= 200 && xhr.status < 300) resolve(out); // ImageRef | FileRef
+      else reject(new Error(out?.error || `upload failed (HTTP ${xhr.status})`));
+    };
+    xhr.onerror = () => reject(new Error(`Couldn’t upload ${body.name || 'the attachment'} — check your connection`));
+    xhr.onabort = () => reject(Object.assign(new Error('cancelled'), { cancelled: true }));
+    xhr.send(body);
   });
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(body?.error || `upload failed (HTTP ${res.status})`);
-  return body; // ImageRef
 }
 
-async function uploadPromptFile(file, projectId = S.projectId) {
-  const res = await feedbackFetch(`/api/files?projectId=${encodeURIComponent(projectId)}`, {
-    method: 'POST',
-    headers: {
-      'content-type': file.type || 'application/octet-stream',
-      'x-file-name': encodeURIComponent(file.name || 'attachment'),
-      ...(S.token ? { authorization: `Bearer ${S.token}` } : {}),
-    },
-    body: file,
-  });
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(body?.error || `upload failed (HTTP ${res.status})`);
-  return body; // FileRef
+// A copied picture reaches the clipboard as a bitmap, which the browser hands
+// over as PNG: a 0.5 MB photo or scan becomes 4 MB, a minute's upload on a slow
+// line. Such an image goes as WebP (JPEG where the browser can't write WebP and
+// the image is opaque) when that at least halves it; a screenshot is already
+// small, and stays a lossless PNG. A chosen or dropped file keeps its own
+// bytes unless it is over the image limit, which would refuse it.
+const IMAGE_LIMIT_BYTES = 5 * 1024 * 1024; // MAX_IMAGE_BYTES, src/store/attachments.ts
+const COMPACT_PASTES_OVER_BYTES = 1024 * 1024;
+async function compactImage(file, fromClipboard) {
+  const over = file.size > IMAGE_LIMIT_BYTES;
+  if (file.type === 'image/gif' || !(over || (fromClipboard && file.size > COMPACT_PASTES_OVER_BYTES))) return file;
+  try {
+    const bitmap = await createImageBitmap(file);
+    const canvas = document.createElement('canvas');
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    const context = canvas.getContext('2d');
+    context.drawImage(bitmap, 0, 0);
+    bitmap.close?.();
+    const encode = (type) => new Promise((resolve) => canvas.toBlob(resolve, type, 0.9));
+    let blob = await encode('image/webp');
+    if (blob?.type !== 'image/webp') {
+      const { data } = context.getImageData(0, 0, canvas.width, canvas.height);
+      let opaque = true;
+      for (let i = 3; i < data.length && opaque; i += 4) opaque = data[i] === 255;
+      blob = opaque ? await encode('image/jpeg') : null;
+    }
+    if (!blob || blob.size > (over ? IMAGE_LIMIT_BYTES : file.size / 2)) return file;
+    const name = `${(file.name || 'image').replace(/\.[^.]*$/, '')}.${blob.type === 'image/webp' ? 'webp' : 'jpg'}`;
+    return new File([blob], name, { type: blob.type });
+  } catch {
+    return file; // undecodable here: the server judges the original
+  }
 }
 
 async function uploadConversationFile(file) {
@@ -4061,31 +4093,116 @@ function assertCanAttachFile(file, current) {
     throw new Error('Attached files would exceed the 50 MB prompt limit');
 }
 
+// Uploads in flight, per attachment list (a form's `images`, or a follow-up
+// box's), so their chips outlive the page's re-renders and a send can wait.
+const attachmentUploads = new WeakMap();
+const pendingAttachments = (images) => attachmentUploads.get(images) || [];
+// Resolves once every upload now in flight for `images` has ended, however it ended.
+const attachmentsSettled = (images) => Promise.all(pendingAttachments(images).map((upload) => upload.done));
+// What this browser uploaded, so a finished chip shows it without fetching it back.
+const attachmentPreviews = new Map();
+let attachmentUploadSeq = 0;
+
+function paintUploadProgress(upload, fraction) {
+  upload.progress = fraction;
+  document.querySelectorAll(`[data-upload="${upload.key}"]`).forEach((chip) => {
+    chip.dataset.state = 'uploading';
+    chip.style.setProperty('--progress', String(fraction));
+    chip.querySelector('[role="progressbar"]')?.setAttribute('aria-valuenow', String(Math.round(fraction * 100)));
+  });
+}
+
+function pendingAttachmentChip(upload) {
+  const attrs = `data-upload="${upload.key}" data-state="${upload.progress == null ? 'preparing' : 'uploading'}" style="--progress:${upload.progress ?? 0}"`;
+  const ring = `<span class="upload-ring" role="progressbar" aria-label="Uploading ${esc(upload.name)}" aria-valuemin="0" aria-valuemax="100"${
+    upload.progress == null ? '' : ` aria-valuenow="${Math.round(upload.progress * 100)}"`}></span>`;
+  const cancel = (cls) => `<button class="${cls}" data-cancel="${upload.key}" title="Cancel upload">✕</button>`;
+  return upload.image
+    ? `<span class="img-chip" ${attrs}><img src="${esc(upload.preview)}" alt=""/>${ring}${cancel('img-chip-x')}</span>`
+    : `<span class="file-chip" ${attrs}>${ring}<span class="file-chip-name">${esc(upload.name)}</span><span class="file-chip-size">${formatAttachmentBytes(upload.bytes)}</span>${cancel('file-chip-x')}</span>`;
+}
+
 function renderAttachmentChips(container, images = [], files = [], onChange, projectId = S.projectId) {
   if (!container) return;
+  const pending = pendingAttachments(images);
   container.innerHTML = images
     .map(
       (ref, i) =>
-        `<span class="img-chip" title="${esc(ref.mediaType)} · ${Math.round((ref.bytes || 0) / 1024)} KB"><img src="${attachmentUrl(ref.id, undefined, projectId)}" alt="attachment"/><button class="img-chip-x" data-i="${i}" title="Remove">✕</button></span>`,
+        `<span class="img-chip" title="${esc(ref.mediaType)} · ${formatAttachmentBytes(ref.bytes)}"><img src="${esc(attachmentPreviews.get(ref.id) || attachmentUrl(ref.id, undefined, projectId))}" alt="attachment"/><button class="img-chip-x" data-i="${i}" title="Remove">✕</button></span>`,
     )
     .join('') + files.map((ref, i) =>
       `<span class="file-chip" title="${esc(ref.mediaType)} · ${formatAttachmentBytes(ref.bytes)}"><span class="file-chip-icon" aria-hidden="true">${ICON.form}</span><span class="file-chip-name">${esc(ref.name)}</span><span class="file-chip-size">${formatAttachmentBytes(ref.bytes)}</span><button class="file-chip-x" data-file-i="${i}" title="Remove ${esc(ref.name)}">✕</button></span>`,
-    ).join('');
-  container.style.display = images.length || files.length ? 'flex' : 'none';
-  container.querySelectorAll('.img-chip-x').forEach((b) =>
+    ).join('') + pending.map(pendingAttachmentChip).join('');
+  container.style.display = images.length || files.length || pending.length ? 'flex' : 'none';
+  container.querySelectorAll('.img-chip-x[data-i]').forEach((b) =>
     b.addEventListener('click', () => {
       images.splice(Number(b.dataset.i), 1);
       renderAttachmentChips(container, images, files, onChange, projectId);
       if (onChange) onChange();
     }),
   );
-  container.querySelectorAll('.file-chip-x').forEach((b) =>
+  container.querySelectorAll('.file-chip-x[data-file-i]').forEach((b) =>
     b.addEventListener('click', () => {
       files.splice(Number(b.dataset.fileI), 1);
       renderAttachmentChips(container, images, files, onChange, projectId);
       if (onChange) onChange();
     }),
   );
+  container.querySelectorAll('[data-cancel]').forEach((b) =>
+    b.addEventListener('click', () => {
+      const list = pendingAttachments(images);
+      const upload = list.find((entry) => entry.key === b.dataset.cancel);
+      if (upload) {
+        upload.cancelled = true;
+        upload.abort?.();
+        list.splice(list.indexOf(upload), 1);
+      }
+      renderAttachmentChips(container, images, files, onChange, projectId);
+    }),
+  );
+}
+
+// Starts uploading one file into a prompt's attachment lists; its chip shows
+// at once, through `onChange`, which repaints the chips. Uploads of one prompt
+// go one at a time, so they arrive in the order given.
+function attachToPrompt(file, { images, files, onChange, projectId, fromClipboard }) {
+  const image = !!file.type?.startsWith('image/');
+  try {
+    if (!image) assertCanAttachFile(file, [...files, ...pendingAttachments(images).filter((upload) => !upload.image)]);
+  } catch (error) {
+    toast(error.message, true);
+    return;
+  }
+  const list = attachmentUploads.get(images) || [];
+  attachmentUploads.set(images, list);
+  const upload = { key: `upload-${++attachmentUploadSeq}`, image, name: file.name || (image ? 'image' : 'attachment'),
+    bytes: file.size, progress: null, preview: image ? URL.createObjectURL(file) : null };
+  const previous = list.at(-1)?.done ?? Promise.resolve();
+  upload.done = previous.then(async () => {
+    let kept = null;
+    try {
+      if (upload.cancelled) return;
+      const body = image ? await compactImage(file, fromClipboard) : file;
+      if (upload.cancelled) return;
+      upload.bytes = body.size;
+      paintUploadProgress(upload, 0);
+      const ref = await postAttachment(image ? 'attachments' : 'files', body, projectId, upload);
+      if (upload.cancelled) return;
+      if (image) {
+        kept = body === file ? upload.preview : URL.createObjectURL(body);
+        attachmentPreviews.set(ref.id, kept);
+      }
+      (image ? images : files).push(ref);
+    } catch (error) {
+      if (!upload.cancelled) toast(error.message, true);
+    } finally {
+      if (list.includes(upload)) list.splice(list.indexOf(upload), 1);
+      if (!upload.cancelled) onChange();
+      if (upload.preview && upload.preview !== kept) URL.revokeObjectURL(upload.preview);
+    }
+  });
+  list.push(upload);
+  onChange();
 }
 
 // Paste and drop accept both images and ordinary files. Images retain their
@@ -4094,29 +4211,16 @@ function renderAttachmentChips(container, images = [], files = [], onChange, pro
 function wirePromptAttachments(inputEl, getImages, getFiles, onChange, projectOf = () => S.projectId) {
   if (!inputEl || inputEl._imgWired) return;
   inputEl._imgWired = true;
-  const ingest = async (files) => {
-    const selected = [...files].filter(Boolean);
-    if (!selected.length) return false;
-    for (const file of selected) {
-      try {
-        if (file.type?.startsWith('image/')) getImages().push(await uploadImage(file, projectOf()));
-        else {
-          assertCanAttachFile(file, getFiles());
-          getFiles().push(await uploadPromptFile(file, projectOf()));
-        }
-        onChange();
-      } catch (e) {
-        toast(e.message, true);
-      }
-    }
-    return true;
+  const ingest = (files, fromClipboard) => {
+    for (const file of files.filter(Boolean))
+      attachToPrompt(file, { images: getImages(), files: getFiles(), onChange, projectId: projectOf(), fromClipboard });
   };
   inputEl.addEventListener('paste', (e) => {
     const items = [...(e.clipboardData?.items || [])];
     const files = items.filter((i) => i.kind === 'file').map((i) => i.getAsFile());
     if (!files.length) return; // let normal text paste through
     e.preventDefault();
-    ingest(files);
+    ingest(files, true);
   });
   inputEl.addEventListener('dragover', (e) => {
     if ([...(e.dataTransfer?.items || [])].some((i) => i.kind === 'file')) e.preventDefault();
@@ -4125,7 +4229,7 @@ function wirePromptAttachments(inputEl, getImages, getFiles, onChange, projectOf
     const files = [...(e.dataTransfer?.files || [])];
     if (files.length) {
       e.preventDefault();
-      ingest(files);
+      ingest(files, false);
     }
   });
 }
@@ -4138,19 +4242,11 @@ function wireAttachmentPicker(input, getImages, getFiles, onChange, projectOf = 
     event.preventDefault();
     input.click();
   });
-  input.addEventListener('change', async () => {
+  input.addEventListener('change', () => {
     const selected = [...(input.files || [])];
     input.value = '';
-    for (const file of selected) {
-      try {
-        if (file.type?.startsWith('image/')) getImages().push(await uploadImage(file, projectOf()));
-        else {
-          assertCanAttachFile(file, getFiles());
-          getFiles().push(await uploadPromptFile(file, projectOf()));
-        }
-        onChange();
-      } catch (error) { toast(error.message, true); }
-    }
+    for (const file of selected)
+      attachToPrompt(file, { images: getImages(), files: getFiles(), onChange, projectId: projectOf(), fromClipboard: false });
   });
 }
 
@@ -9435,7 +9531,13 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
 
   // Flush any pending edits when the form is dismissed, so closing without
   // clicking a button still keeps the draft.
-  closeForm = () => { clearTimeout(saveTimer); const st = formState(); const navigating = navigatingAway(); releaseFormKeys(); root.innerHTML = ''; if (edited) persistDraft(st); leavePage(navigating); };
+  closeForm = () => {
+    clearTimeout(saveTimer); const st = formState(); const navigating = navigatingAway(); releaseFormKeys(); root.innerHTML = ''; if (edited) persistDraft(st);
+    // An attachment still uploading (attaching is an edit) joins the draft once it lands.
+    if (pendingAttachments(formImages).length) attachmentsSettled(formImages).then(() => persistDraft({ ...st, body: { ...st.body,
+      ...(formImages.length ? { images: [...formImages] } : {}), ...(formFiles.length ? { files: [...formFiles] } : {}) } }));
+    leavePage(navigating);
+  };
 
   // ── Templates: this form as a template (Save as template), or a template's own form ──
   const templateBody = (st = formState()) => ({ workflow: wf, params: st.body, notes: st.notes,
@@ -9509,6 +9611,8 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     }
     let succeeded = false;
     clearTimeout(saveTimer);
+    // An attachment still uploading belongs to what is being saved: wait for it.
+    if (pendingAttachments(formImages).length) await attachmentsSettled(formImages);
     const st = formState();
     // Drain any in-flight auto-save first: it may still be creating the draft (setting
     // draftId) or PATCHing older text. Waiting lets the branches below see the right
@@ -15301,7 +15405,10 @@ function wireFollowups(v) {
     const files = (S.followupFiles[key] ||= []);
     ta.addEventListener('input', () => { S.followupDrafts[key] = ta.value; });
     const chips = box.querySelector('.followup-chips');
-    const paint = () => renderAttachmentChips(chips, images, files);
+    // An upload outlives this render: paint whichever box is on the page when it lands.
+    const roleSelector = window.CSS && CSS.escape ? CSS.escape(role) : role;
+    const paint = () => renderAttachmentChips(chips.isConnected ? chips
+      : $('#main').querySelector(`.followup-box[data-role="${roleSelector}"] .followup-chips`), images, files);
     wirePromptAttachments(ta, () => images, () => files, paint);
     wireAttachmentPicker(box.querySelector('.followup-files'), () => images, () => files, paint);
     // Wiki references in follow-ups use the same picker and backend scanner as
@@ -15316,11 +15423,17 @@ function wireFollowups(v) {
     paint();
     const send = async () => {
       const text = ta.value.trim();
-      if (!text && !images.length && !files.length) return;
+      const uploading = pendingAttachments(images).length > 0;
+      if (!text && !images.length && !files.length && !uploading) return;
       if (btn.disabled) return;
       btn.disabled = true;
       box.setAttribute('aria-busy', 'true');
+      // Attachments still uploading go with this message: Send shows it is waiting for them.
+      const waiting = uploading ? beginActionFeedback(btn) : null;
+      let sent = false;
       try {
+        if (uploading) await attachmentsSettled(images);
+        if (!text && !images.length && !files.length) return;
         // A shared conversation addresses whoever was mentioned, in order;
         // new agents travel with the message that calls them.
         const picked = shared ? locateMentions(text, followupMentions(key)) : [];
@@ -15337,6 +15450,7 @@ function wireFollowups(v) {
           body: JSON.stringify({ signal: 'followUp', text, role,
             ...(images.length ? { images: [...images] } : {}), ...(files.length ? { files: [...files] } : {}) }),
         });
+        sent = true;
         if (shared) {
           countMentions(to);
           delete S.followupMentions[key];
@@ -15387,6 +15501,7 @@ function wireFollowups(v) {
         setTimeout(refreshTasks, 400);
       } catch (e) { toast(e.message, true); }
       finally {
+        if (waiting) finishActionFeedback(waiting, sent);
         if (btn.isConnected) btn.disabled = false;
         if (box.isConnected) box.removeAttribute('aria-busy');
       }
