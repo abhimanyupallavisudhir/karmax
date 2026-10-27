@@ -3,7 +3,8 @@ import { slugify } from '../store/db.js';
 import type { CredentialBroker } from '../autonomy/broker.js';
 import type { KarmaxEvent, TaskRecord } from '../domain/types.js';
 import type { ProjectEvent } from '../domain/project-events.js';
-import { IncomingWebhooks } from './incoming-webhooks.js';
+import { IncomingWebhooks, type IncomingWebhook } from './incoming-webhooks.js';
+import type { ChatMention } from './chat-platforms.js';
 
 /**
  * A chat bot answers where it was asked (wiki features/events-and-automations):
@@ -58,6 +59,20 @@ export class ChatReplies {
       `${task.id}:${moment}:${moment === 'input' || moment === 'review' ? event.ts : ''}`);
   }
 
+  /** What a person the bot does not take requests from is told: once per
+   *  person, with where the project lets them in. `reply` false: the caller
+   *  answers in the delivery itself (Discord's command answer), so nothing is posted. */
+  async decline(hook: IncomingWebhook, mention: ChatMention, reply: boolean): Promise<string | undefined> {
+    if (!(await this.deps.store.kvClaim(`chat-declined:${hook.id}:${mention.author.id}`, '1'))) return undefined;
+    const settings = await this.projectUrl(hook.projectId, 'settings#project-events');
+    const text = `Only people this project allows can ask me. Someone on it can let you in${settings ? ` here: ${settings}` : '.'}`;
+    if (reply) {
+      void this.hooks.reply(hook, { channel: mention.channel.id, ...(mention.thread ? { thread: mention.thread } : {}) }, text, this.deps.fetcher ?? fetch)
+        .catch((error) => this.deps.log?.(`chat reply on ${hook.kind} failed: ${error instanceof Error ? error.message : String(error)}`));
+    }
+    return text;
+  }
+
   private async say(conversation: Conversation, text: string, once: string): Promise<void> {
     if (!(await this.deps.store.kvClaim(`chat-said:${once}`, '1'))) return;
     const hook = await this.hooks.get(conversation.hookId);
@@ -73,13 +88,17 @@ export class ChatReplies {
   }
 
   private async link(taskId: string, known?: TaskRecord): Promise<string | undefined> {
-    const base = this.deps.publicUrl()?.replace(/\/+$/, '');
     const task = known ?? await this.deps.store.getTask(taskId);
-    const project = task ? await this.deps.store.getProject(task.projectId) : undefined;
-    if (!base || !task || !project) return undefined;
+    return task ? this.projectUrl(task.projectId, `tasks/${task.num ?? task.id}`) : undefined;
+  }
+
+  private async projectUrl(projectId: string, rest: string): Promise<string | undefined> {
+    const base = this.deps.publicUrl()?.replace(/\/+$/, '');
+    const project = await this.deps.store.getProject(projectId);
+    if (!base || !project) return undefined;
     const organization = project.organizationId ? await this.deps.store.getOrganization(project.organizationId) : undefined;
     const path = organization ? `${organization.slug ?? slugify(organization.name)}/${slugify(project.name)}` : `projects/${slugify(project.name)}`;
-    return `${base}/${path}/tasks/${task.num ?? task.id}`;
+    return `${base}/${path}/${rest}`;
   }
 }
 

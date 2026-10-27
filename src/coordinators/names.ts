@@ -47,6 +47,8 @@ export const SIG_ACCOUNT_GRANTED = 'accountGranted';
 export const RELIST_ACCOUNT_GRANT = '(relist)';
 /** A credential policy changed: every parked request re-resolves its allow-list. */
 export const SIG_RELIST_ACCOUNT_LEASES = 'relistAccountLeases';
+/** Plan again now: an order or a priority changed (wiki features/quota-scheduling). */
+export const SIG_REPLAN_ACCOUNTS = 'replanAccounts';
 export const SIG_REGISTER_ACCOUNTS = 'registerAccounts';
 /** Ground-truth exhaustion feed from auto-resolve: mark a login unavailable +
  *  arm a refresh timer (SPEC §6.2). */
@@ -62,6 +64,8 @@ export const QRY_ACCOUNTS = 'accounts';
 export const QRY_ACCOUNT_LEASE = 'accountLease';
 /** Finds every parked credential request owned by a task for out-of-band stop/drain. */
 export const QRY_ACCOUNT_TASK_LEASES = 'accountTaskLeases';
+/** Queued requests, granted leases and holds, for the Queues page. */
+export const QRY_ACCOUNT_QUEUE = 'accountQueue';
 
 export function mergeQueueId(domain: string): string {
   return `merge-queue:${domain}`;

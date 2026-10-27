@@ -314,8 +314,11 @@ describe('software-dev 1.27: one conversation, several agents (real Temporal + g
     await handle.result();
   });
 
-  /** pramana#22: the Agent answered the owner, then paused; nothing told them. */
-  it('a reply to a person reaches them when the Agent then pauses', async () => {
+  /** krmax#752: the Agent said "waiting on the tests, then I'll open the PR"
+   * and paused on its job; tavya put that in its owner's For me as "Mentioned".
+   * Whether a reply needs anyone's attention is the agent's call: notify, or a
+   * needs_input pause. Otherwise it is in the conversation and alerts nobody. */
+  it('a reply to a person does not mention them when the Agent then pauses', async () => {
     const repo = await h.makeRepo('pause-reply');
     const taskId = newId('task');
     const handle = await start(taskId, { ...input({ taskId, repo, title: 'PauseReply', prompt: 'Start.\n@incomplete' }), waitMinuteMs: 60_000 });
@@ -323,15 +326,15 @@ describe('software-dev 1.27: one conversation, several agents (real Temporal + g
     await handle.signal('followUp', { id: 'u-bea', role: 'user', author: 'user:bea', authorLabel: 'Bea', ts: Date.now(),
       text: 'Why is pigeon missing?\n@pause 30' });
     await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 20_000 }).toBe('timer');
-    expect((await view(handle)).messages.at(-1)).toMatchObject({ role: 'agent', to: ['user:bea'] });
-    // A reply, not an ask (#613): the task waits on its timer, not on Bea.
-    expect((await h.store.eventsOfType(taskId, ['task.mentioned'])).map((e: any) => e.payload))
-      .toEqual([expect.objectContaining({ recipients: ['user:bea'], ask: false })]);
+    const reply = (await view(handle)).messages.at(-1);
+    expect(reply).toMatchObject({ role: 'agent', text: expect.stringContaining('Pausing for 30 min') });
+    expect(reply.to).toBeUndefined();
+    expect(await h.store.eventsOfType(taskId, ['task.mentioned'])).toEqual([]);
     await handle.signal('cancel');
     await handle.result();
   });
 
-  it('a reply to a person reaches them when the Agent then waits on its sub-tasks', async () => {
+  it('a reply to a person does not mention them when the Agent then waits on its sub-tasks', async () => {
     const repo = await h.makeRepo('subtasks-reply');
     const taskId = newId('task');
     const handle = await start(taskId, input({ taskId, repo, title: 'SubtasksReply', prompt: 'Start.\n@incomplete' }));
@@ -339,9 +342,8 @@ describe('software-dev 1.27: one conversation, several agents (real Temporal + g
     await handle.signal('followUp', { id: 'u-bea', role: 'user', author: 'user:bea', authorLabel: 'Bea', ts: Date.now(),
       text: 'Split it up.\n@subtask Child :: Work.\\n@sleep 60000\n@wait' });
     await expect.poll(async () => (await view(handle)).waitingFor?.kind, { timeout: 30_000 }).toBe('subtask');
-    expect((await view(handle)).messages.findLast((m: any) => m.role === 'agent')).toMatchObject({ to: ['user:bea'] });
-    expect((await h.store.eventsOfType(taskId, ['task.mentioned'])).map((e: any) => e.payload))
-      .toEqual([expect.objectContaining({ recipients: ['user:bea'], ask: false })]);
+    expect((await view(handle)).messages.findLast((m: any) => m.role === 'agent').to).toBeUndefined();
+    expect(await h.store.eventsOfType(taskId, ['task.mentioned'])).toEqual([]);
     await handle.signal('cancel');
     await handle.result();
   }, 60_000);

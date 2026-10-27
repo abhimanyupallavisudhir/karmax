@@ -1056,6 +1056,26 @@ function installInfoDotTips() {
   });
 }
 
+// Run now (wiki features/quota-scheduling): a held task stops being kept back
+// for higher-priority work; undo lets the scheduler hold it again. Delegated:
+// the button sits on the task page and on the Queues page, both re-rendered often.
+const RUN_NOW_TIP = 'Start as soon as a login has room, using quota kept for higher-priority work. Lasts until the task is done';
+function installRunNow() {
+  document.addEventListener('click', async (ev) => {
+    const b = ev.target.closest('[data-run-now], [data-run-now-undo]');
+    if (!b) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    const undo = b.hasAttribute('data-run-now-undo');
+    b.disabled = true;
+    try {
+      await api(schedulingApi(`/run-now/${encodeURIComponent(undo ? b.dataset.runNowUndo : b.dataset.runNow)}`), { method: undo ? 'DELETE' : 'PUT' });
+      toast(undo ? 'It may be held back again' : 'Starting as soon as a login has room');
+    } catch (err) { toast(err.message, true); b.disabled = false; }
+    if (S.tab === 'queue') setTimeout(seedQueue, 300);
+  });
+}
+
 // Tag chips are navigation everywhere they appear: links to their section, so a
 // modified click opens it in a new tab. Capture before row/form click handlers so
 // a chip never opens a task or mutates its tags as a side effect.
@@ -4608,6 +4628,7 @@ function installShellListeners() {
   installLinkRouter();
   installTagRouter();
   installInfoDotTips();
+  installRunNow();
   // A background repaint deferred to protect an open menu / text-selection gets
   // flushed once that interaction releases (setTimeout lets focus + selection
   // settle first). selectionchange fires constantly, so it only pokes the flush
@@ -9350,7 +9371,15 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
 
   // Debounced auto-save while typing.
   let saveTimer = null;
+  // Closing writes only what someone edited. Comparing signatures alone is not
+  // enough: fields that fill in after the form opens (the agent, the computer,
+  // PostgreSQL's reordering of stored JSON) differ from the stored params
+  // without any edit, so merely opening and closing a task rewrote it
+  // (pramana#132). Every edit reaches autoSaveSoon; a quick-composer seed has
+  // never been saved, so it counts as one.
+  let edited = lastSaved === null;
   function autoSaveSoon() {
+    edited = true;
     if (templateEdit) return paintSaveState($('#tf-savestate'), templateDirty() ? 'dirty' : '');
     paintSaveState($('#tf-savestate'), 'dirty');
     clearTimeout(saveTimer);
@@ -9406,7 +9435,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
 
   // Flush any pending edits when the form is dismissed, so closing without
   // clicking a button still keeps the draft.
-  closeForm = () => { clearTimeout(saveTimer); const st = formState(); const navigating = navigatingAway(); releaseFormKeys(); root.innerHTML = ''; persistDraft(st); leavePage(navigating); };
+  closeForm = () => { clearTimeout(saveTimer); const st = formState(); const navigating = navigatingAway(); releaseFormKeys(); root.innerHTML = ''; if (edited) persistDraft(st); leavePage(navigating); };
 
   // ── Templates: this form as a template (Save as template), or a template's own form ──
   const templateBody = (st = formState()) => ({ workflow: wf, params: st.body, notes: st.notes,
@@ -10387,7 +10416,7 @@ function orgEditorHtml(rec) {
   }).join('');
   const prioOpts = PRIORITY_NAMES.map((n, i) => `<option value="${i}" ${i === prio ? 'selected' : ''}>${i ? `▲ ${n[0].toUpperCase() + n.slice(1)}` : 'No priority'}</option>`).join('');
   return `<div class="org-editor">
-    <select class="q-sel org-priority${prio ? '' : ' unset'}" aria-label="Priority" title="Priority">${prioOpts}</select>
+    <select class="q-sel org-priority${prio ? '' : ' unset'}" aria-label="Priority" title="Higher priority gets model quota first, and quota is kept back for it. No priority runs as Medium.">${prioOpts}</select>
     <div class="org-tags">${tags}
       <button type="button" class="org-add-tag" title="Add a tag">＋ tag</button>
     </div>
@@ -13779,6 +13808,9 @@ function waitingText(w) {
   if (w?.kind === 'retry' && typeof w.summary === 'string' && w.summary.trim())
     return `${w.summary.trim().slice(0, 48)}${Number.isFinite(w.until) ? `, trying at ${waitDeadline(w.until)}` : ''}`;
   if (w?.kind === 'retry') return Number.isFinite(w.until) ? `Retrying at ${waitDeadline(w.until)}` : 'Retrying';
+  // The quota scheduler keeps this login's quota for higher-priority work until then.
+  if (w?.kind === 'account' && typeof w.detail === 'string' && w.detail.startsWith('Held'))
+    return Number.isFinite(w.until) ? `Held for higher-priority work until ${waitDeadline(w.until)}` : 'Held for higher-priority work';
   // A job is shown by the name its agent gave it. The deadline is when the
   // agent resumes even if the job never finishes.
   if (w?.kind === 'job') {
@@ -13803,6 +13835,9 @@ function waitDeadline(until) {
 // account limit, or admission blocked by the plan (e.g. a member mismatch).
 // The generic header label alone would hide that diagnosis.
 function conversationWaitNotice(v) {
+  const w = v.waitingFor;
+  if (w?.kind === 'account' && typeof w.detail === 'string' && w.detail.startsWith('Held'))
+    return `<div class="msg system wait-notice" role="status">${esc(waitingText(w))} <button type="button" class="btn sm ghost" data-run-now="${esc(v.taskId)}" title="${esc(RUN_NOW_TIP)}">Run now</button></div>`;
   const detail = presenceDetail(v);
   return detail ? `<div class="msg system wait-notice" role="status">${esc(waitingText(v.waitingFor))} · ${esc(detail)}</div>` : '';
 }
@@ -14709,6 +14744,9 @@ function taskActions(v) {
     return `<div class="actions" role="status" aria-live="polite"><button class="btn primary action-pending" disabled aria-busy="true" title="Another task changed some of the same files. The agent is combining them; publishing resumes after it.">Combining resources…</button></div>`;
   if (v.state?.finalizing) return `<div class="actions" role="status" aria-live="polite"><button class="btn primary action-pending" disabled aria-busy="true">Finishing…</button><span>Saving task output</span></div>`;
   const acts = v.actions || [];
+  // Accepted; the task acts on it shortly. Its button must not come back meanwhile.
+  const accepted = v.acceptedAction
+    ? `<button class="btn primary action-pending" disabled aria-busy="true" title="Accepted. The task is acting on it.">${esc(ACCEPTED_ACTION_LABELS[v.acceptedAction.name] || 'Working…')}</button>` : '';
   const simple = acts.filter((a) => !a.args || a.args.length === 0);
   // Sub-tasks' files arriving before the agent's next turn: a message sent now waits for them.
   const refreshing = v.state?.refreshingResources && v.status === 'active'
@@ -14719,7 +14757,7 @@ function taskActions(v) {
     // A sub-task starts from this task's data, saved first: gigabytes take minutes.
     : v.state?.preparingSubTask && v.status === 'active'
       ? `<button class="btn primary action-pending" disabled aria-busy="true" title="A sub-task starts from this task’s data, so it is saved first.">${esc(stagingProgress()?.text || 'Saving data for a sub-task…')}</button>` : '';
-  let html = `<div class="actions"${refreshing ? ' role="status" aria-live="polite"' : ''}>${refreshing}${biggerDiskButton(v)}`;
+  let html = `<div class="actions"${refreshing || accepted ? ' role="status" aria-live="polite"' : ''}>${accepted}${refreshing}${biggerDiskButton(v)}`;
   let slot = 0; // digits 1–9 press the Nth ENABLED button (see the command registry)
   for (const a of simple) {
     const cls = a.name === 'confirm' || a.name === 'openPr' ? 'primary' : a.danger ? 'danger' : '';
@@ -14737,9 +14775,10 @@ function taskActions(v) {
   // The follow-up box lives inside each agent's conversation on the Check-in tab,
   // so a human can address any agent (SPEC §5.6).
   html += `</div>`;
-  if (!acts.length && !refreshing && !biggerDiskButton(v)) html = ''; // nothing to act on: the bar folds away
+  if (!acts.length && !refreshing && !accepted && !biggerDiskButton(v)) html = ''; // nothing to act on: the bar folds away
   return html;
 }
+const ACCEPTED_ACTION_LABELS = { confirm: 'Confirming…', openPr: 'Opening PR…', retry: 'Retrying…' };
 
 /**
  * One phrasing for "that action went through", used by the task footer, the command
@@ -14756,6 +14795,7 @@ function actionToast(signal, label) {
   const done = { confirm: 'Confirmed', openPr: 'Opening PR and requesting confirmation', cancel: 'Cancelled', finish: 'Finishing', retry: 'Retrying', resume: 'Resumed', followUp: 'Sent' };
   const text = String(label || signal).trim();
   if (signal === 'openPr' && text.toLowerCase() === 'return to review & confirm') return 'Returning to Review';
+  if (signal === 'confirm' && text.toLowerCase() === 'confirm pr') return 'Confirmed';
   return text.toLowerCase() === standard[signal] ? done[signal] : `${text} — done`;
 }
 
@@ -15400,6 +15440,12 @@ function agentQueueApi(path = '') {
   return `/api/agent-queue${path}${organizationId ? `?organizationId=${encodeURIComponent(organizationId)}` : ''}`;
 }
 
+// Agent work in the order it gets model quota (wiki features/quota-scheduling).
+function schedulingApi(path = '') {
+  const organizationId = projectById(S.projectId)?.organizationId || S.organizationId;
+  return `/api/scheduling${path}${organizationId ? `?organizationId=${encodeURIComponent(organizationId)}` : ''}`;
+}
+
 async function seedQueue() {
   const projectId = S.projectId;
   const epoch = S.queueLoadEpoch = (S.queueLoadEpoch || 0) + 1;
@@ -15416,10 +15462,18 @@ async function seedQueue() {
   );
   let agentQueue = S.agentQueue;
   try { agentQueue = await api(agentQueueApi()); } catch {}
+  let agentWork;
+  try { agentWork = await api(schedulingApi('/queue')); } catch {}
   if (S.queueLoadEpoch !== epoch || S.projectId !== projectId) return;
   S.queueOrders = orders;
   S.agentQueue = agentQueue;
-  if (S.tab === 'queue') renderMain();
+  S.agentWork = agentWork;
+  // Waiting work moves as the scheduler replans: refresh while the page is open, never mid-drag.
+  clearTimeout(S.queueRefresh);
+  if (S.tab === 'queue') {
+    S.queueRefresh = setTimeout(() => { if (S.tab === 'queue') seedQueue(); }, 20_000);
+    if (!document.querySelector('#main .dragging')) renderMain();
+  }
 }
 
 // The merge-queue badge for a task header. A coordinator that cannot be queried
@@ -15546,16 +15600,175 @@ function agentQueuePanel() {
     : `<div class="card queue-empty">No agents running</div>`;
 }
 
+const WORK_PRIORITY = { low: 1, medium: 2, high: 3, urgent: 4 };
+const WORK_STATUS = {
+  running: ['Running', 'Using a login now'],
+  next: ['Next', 'Starts when a login has room'],
+  held: ['Held', 'Its quota is kept for higher-priority work expected before then'],
+  quota: ['Quota used up', 'Every login it may use has run out until it resets'],
+};
+function workStatusText(status, until) {
+  if (status === 'held' && Number.isFinite(until)) return `Held until ${waitDeadline(until)}`;
+  if (status === 'quota' && Number.isFinite(until)) return `Quota resets ${waitDeadline(until)}`;
+  return WORK_STATUS[status]?.[0] || status;
+}
+
+/** Task trees in quota order: running first, then waiting, each with its tasks. */
+function agentWorkGroups(view) {
+  const groups = new Map();
+  const group = (row) => {
+    if (!groups.has(row.root)) groups.set(row.root, { root: row.root, num: row.taskId === row.root ? row.num : row.rootNum,
+      title: row.taskId === row.root ? row.title : (row.rootTitle || row.title), priority: row.priority, tasks: new Map(), running: 0, waiting: [] });
+    const g = groups.get(row.root);
+    if (row.taskId === row.root) { g.num = row.num; g.title = row.title; }
+    if (!g.tasks.has(row.taskId)) g.tasks.set(row.taskId, { taskId: row.taskId, num: row.num, title: row.title, running: 0, waiting: [], pins: row.pins });
+    return g;
+  };
+  for (const r of view?.running || []) { const g = group(r); g.running++; g.tasks.get(r.taskId).running++; if (r.runNow) g.runNow = true; }
+  for (const w of view?.waiting || []) { const g = group(w); if (w.runNow) g.runNow = true; g.waiting.push(w); g.tasks.get(w.taskId).waiting.push(w); if (w.pins) g.tasks.get(w.taskId).pins = w.pins; }
+  const rank = { next: 0, held: 1, quota: 2 };
+  for (const g of groups.values()) {
+    const best = g.waiting.slice().sort((a, b) => rank[a.status] - rank[b.status])[0];
+    g.status = best ? best.status : 'running';
+    g.until = best?.until;
+  }
+  return [...groups.values()];
+}
+
+function workPinTitle(pins, numOf) {
+  const parts = (pins || []).map((p) => p.below && numOf(p.below) && p.above && numOf(p.above)
+    ? `#${numOf(p.above)} before #${numOf(p.below)}` : '').filter(Boolean);
+  return `${parts.length ? `You placed it: ${parts.join(', ')}. ` : 'You placed it here. '}Click to return it to automatic order`;
+}
+
+function agentWorkPanel() {
+  const view = S.agentWork;
+  const groups = agentWorkGroups(view);
+  if (!groups.length) return `<div class="card queue-empty">No agents running or waiting</div>`;
+  const nums = new Map();
+  for (const g of groups) { nums.set(g.root, g.num); for (const t of g.tasks.values()) nums.set(t.taskId, t.num); }
+  const numOf = (id) => nums.get(id);
+  let divided = false, position = 0;
+  const rows = groups.map((g) => {
+    const waiting = g.waiting.length > 0;
+    let divider = '';
+    if (waiting && !divided && g.status !== 'next') {
+      divided = true;
+      divider = `<div class="work-divider" title="Below here, quota is kept back for higher-priority work, or has run out">Held back</div>`;
+    }
+    if (waiting) position++;
+    const p = WORK_PRIORITY[g.priority] || 0;
+    const prio = p && p !== 2 ? `<span class="prio p${p}" title="Priority: ${esc(g.priority)}">▲ ${esc(g.priority[0].toUpperCase() + g.priority.slice(1))}</span>` : '';
+    const rootTask = g.tasks.get(g.root);
+    const pinned = rootTask?.pins?.length;
+    const runNow = g.runNow
+      ? `<button type="button" class="work-pin" data-run-now-undo="${esc(g.root)}" title="Running now: never held back for higher-priority work. Click to undo" aria-label="Undo run now">⏩</button>`
+      : g.status === 'held' ? `<button type="button" class="btn sm ghost" data-run-now="${esc(g.root)}" title="${esc(RUN_NOW_TIP)}">Run now</button>` : '';
+    const subs = [...g.tasks.values()].filter((t) => t.taskId !== g.root);
+    const subRows = subs.length ? `<div class="work-subs" data-root="${esc(g.root)}">${subs.map((t) => {
+      const w = t.waiting[0];
+      const status = w ? w.status : 'running';
+      return `<div class="work-sub" data-task="${esc(t.taskId)}" ${w ? 'draggable="true"' : ''} title="${esc(WORK_STATUS[status]?.[1] || '')}">
+        ${w ? '<span class="drag-handle" title="Drag to reorder within this task">⠿</span>' : '<span class="drag-handle placeholder"></span>'}
+        <span class="work-sub-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</span>
+        <span class="chip">${esc(w ? workStatusText(w.status, w.until) : 'Running')}</span>
+        ${t.pins?.length ? `<button type="button" class="work-pin" data-unpin="${esc(t.taskId)}" title="${esc(workPinTitle(t.pins, numOf))}" aria-label="Return to automatic order">📌</button>` : ''}
+      </div>`;
+    }).join('')}</div>` : '';
+    return `${divider}<div class="queue-item work-tree ${waiting ? '' : 'current'}" data-id="${esc(g.root)}" data-root="${esc(g.root)}" tabindex="0" role="group" aria-label="${esc(queueRowLabel({ num: g.num, title: g.title }, workStatusText(g.status, g.until), waiting ? position : null))}" ${waiting ? 'draggable="true"' : ''}>
+      ${waiting ? '<span class="drag-handle" title="Drag to reorder">⠿</span>' : '<span class="drag-handle placeholder"></span>'}
+      <span class="pos">${waiting ? position : '▶'}</span>
+      <div style="flex:1;min-width:0"><div class="task-title">${g.num != null ? `<span class="task-num">#${g.num}</span> ` : ''}${esc(g.title)} ${prio}</div>
+        <div class="task-sub" title="${esc(WORK_STATUS[g.status]?.[1] || '')}">${esc(workStatusText(g.status, g.until))}${g.running && waiting ? ` · ${g.running} running` : g.running > 1 ? ` · ${g.running}` : ''}</div>
+        ${subRows}</div>
+      ${runNow}${pinned ? `<button type="button" class="work-pin" data-unpin="${esc(g.root)}" title="${esc(workPinTitle(rootTask.pins, numOf))}" aria-label="Return to automatic order">📌</button>` : ''}
+    </div>`;
+  }).join('');
+  return `<div class="queue-list work-list">${rows}</div>`;
+}
+
+/** Places a dragged row between its new neighbours; the scheduler keeps that order (wiki features/quota-scheduling). */
+async function placeWork(taskId, above, below) {
+  try {
+    await api(schedulingApi('/order'), { method: 'POST', body: JSON.stringify({ taskId, ...(above ? { above } : {}), ...(below ? { below } : {}) }) });
+  } catch (err) { toast(err.message, true); }
+  setTimeout(seedQueue, 300);
+}
+
+function wireAgentWork(list) {
+  if (!list) return;
+  // Every row opens its task, sub-task rows their own.
+  const records = new Map([...(S.agentWork?.running || []), ...(S.agentWork?.waiting || [])].map((r) => [r.taskId, { id: r.taskId, projectId: r.projectId, num: r.num }]));
+  list.querySelectorAll('.work-tree').forEach((row) => { if (!row.classList.contains('has-row-link')) wireRowLink(row, taskUrl(row.dataset.root, records.get(row.dataset.root))); });
+  list.querySelectorAll('.work-sub').forEach((row) => wireRowLink(row, taskUrl(row.dataset.task, records.get(row.dataset.task))));
+  // Trees among trees.
+  let dragging = null;
+  const trees = () => [...list.querySelectorAll('.work-tree[draggable="true"]')];
+  trees().forEach((row) => {
+    row.addEventListener('dragstart', (e) => { if (e.target !== row) return; dragging = row; row.classList.add('dragging'); e.dataTransfer.effectAllowed = 'move'; });
+    row.addEventListener('dragend', () => { row.classList.remove('dragging'); dragging = null; });
+  });
+  list.addEventListener('dragover', (e) => {
+    if (!dragging) return;
+    e.preventDefault();
+    const before = trees().find((row) => row !== dragging && e.clientY < row.getBoundingClientRect().top + row.getBoundingClientRect().height / 2);
+    if (before) list.insertBefore(dragging, before.previousElementSibling?.classList.contains('work-divider') ? before.previousElementSibling : before);
+    else list.appendChild(dragging);
+  });
+  list.addEventListener('drop', (e) => {
+    if (!dragging) return;
+    e.preventDefault();
+    const rows = trees(), at = rows.indexOf(dragging);
+    placeWork(dragging.dataset.root, rows[at - 1]?.dataset.root, rows[at + 1]?.dataset.root);
+  });
+  // Sub-tasks among their own tree's.
+  list.querySelectorAll('.work-subs').forEach((box) => {
+    let sub = null;
+    const subs = () => [...box.querySelectorAll('.work-sub[draggable="true"]')];
+    subs().forEach((row) => {
+      row.addEventListener('dragstart', (e) => { e.stopPropagation(); sub = row; row.classList.add('dragging'); e.dataTransfer.effectAllowed = 'move'; });
+      row.addEventListener('dragend', (e) => { e.stopPropagation(); row.classList.remove('dragging'); sub = null; });
+    });
+    box.addEventListener('dragover', (e) => {
+      if (!sub) return;
+      e.preventDefault(); e.stopPropagation();
+      const before = subs().find((row) => row !== sub && e.clientY < row.getBoundingClientRect().top + row.getBoundingClientRect().height / 2);
+      if (before) box.insertBefore(sub, before);
+      else box.appendChild(sub);
+    });
+    box.addEventListener('drop', (e) => {
+      if (!sub) return;
+      e.preventDefault(); e.stopPropagation();
+      const rows = subs(), at = rows.indexOf(sub);
+      placeWork(sub.dataset.task, rows[at - 1]?.dataset.task, rows[at + 1]?.dataset.task);
+    });
+  });
+  list.querySelectorAll('[data-unpin]').forEach((b) => b.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    try {
+      const org = projectById(S.projectId)?.organizationId || S.organizationId;
+      await api(`/api/scheduling/order/${encodeURIComponent(b.dataset.unpin)}${org ? `?organizationId=${encodeURIComponent(org)}` : ''}`, { method: 'DELETE' });
+      toast('Back to automatic order');
+    } catch (err) { toast(err.message, true); }
+    setTimeout(seedQueue, 300);
+  }));
+}
+
 function queuesView() {
   const contributions = (S.contributions?.slots || []).filter((x) => ['queue-panel', 'merge-queue-panel'].includes(x.contribution?.slot));
-  const renderers = { 'merge-queue': mergeQueuePanel, 'agent-queue': agentQueuePanel };
+  // Agent work replaces the agent queue whenever the scheduler answers.
+  const renderers = { 'merge-queue': mergeQueuePanel, 'agent-queue': S.agentWork ? agentWorkPanel : agentQueuePanel };
   return contributions.map((x) => {
     const component = x.contribution?.component;
     const render = renderers[component];
     if (!render) return '';
-    const suffix = component === 'agent-queue' ? ` <span class="pill">${(S.agentQueue?.current || []).length}/${S.agentQueue?.capacity ?? 3}</span>` : '';
-    const tip = { 'merge-queue': 'Tasks ready to land, in the order they merge. Drag to reorder.', 'agent-queue': 'Agents working now, then those waiting for a free slot.' }[component];
-    return `<div class="section-h">${esc(x.contribution.title || x.workflow)}${suffix}${tip ? ` ${policyTip(tip)}` : ''}</div>${render()}`;
+    const work = component === 'agent-queue' && S.agentWork;
+    const suffix = component === 'agent-queue' && !work ? ` <span class="pill">${(S.agentQueue?.current || []).length}/${S.agentQueue?.capacity ?? 3}</span>` : '';
+    const tip = work
+      ? 'Agents running now, then waiting work in the order it gets model quota: higher priority first, and work that has used less. Quota is kept back for higher-priority work that usually arrives before a login resets. Drag to change the order.'
+      : { 'merge-queue': 'Tasks ready to land, in the order they merge. Drag to reorder.', 'agent-queue': 'Agents working now, then those waiting for a free slot.' }[component];
+    const title = work ? 'Agent work' : (x.contribution.title || x.workflow);
+    return `<div class="section-h">${esc(title)}${suffix}${tip ? ` ${policyTip(tip)}` : ''}</div>${render()}`;
   }).join('') || `<div class="empty">No workflows contribute a queue.</div>`;
 }
 
@@ -15614,8 +15827,9 @@ function wireQueueView() {
       } catch (e) { toast(e.message, true); seedQueue(); }
     }),
   );
-  $('#main').querySelectorAll('.queue-list:not(.agent-queue-list)').forEach(wireQueueDrag);
+  $('#main').querySelectorAll('.queue-list:not(.agent-queue-list):not(.work-list)').forEach(wireQueueDrag);
   wireAgentQueueDrag($('#main').querySelector('.agent-queue-list'));
+  wireAgentWork($('#main').querySelector('.work-list'));
   applyCursor();
   $('#main').querySelectorAll('.queue-item').forEach((r) => r.addEventListener('focus', () => { S.cursorId = rowKey(r); applyCursor(); }));
 }
@@ -17838,7 +18052,7 @@ function projectEventsHtml(projectId, list, events) {
   const sourceRow = (h) => `<div class="setting-row" data-hook="${esc(h.id)}">
     <span class="setting-label">${esc(h.name)}</span>
     <span class="setting-value"><span class="setting-muted">${h.kind ? `${CHAT_PLATFORM_LABELS[h.kind]}${h.bot?.username ? ` · ${esc(h.bot.username.startsWith('+') ? h.bot.username : '@' + h.bot.username)}` : ''}` : `<code>${esc(h.type)}</code>`}</span><span class="setting-sep">·</span><span class="setting-muted">${health(h)}</span></span>
-    <span class="setting-actions">${h.kind ? '' : `<button class="btn sm ghost" data-hook-copy="${esc(list.urlBase + h.id)}">Copy URL</button><button class="btn sm ghost" data-hook-rotate title="Replace the secret; the old one stops working">New secret</button>`}<button class="btn sm ghost" data-hook-delete title="Delete">✕</button></span></div>`;
+    <span class="setting-actions">${!h.kind || CHAT_URL_PASTED[h.kind] ? `<button class="btn sm ghost" data-hook-copy="${esc(list.urlBase + h.id)}"${h.kind ? ` title="${esc(chatUrlTip(h.kind))}"` : ''}>Copy URL</button>` : ''}${h.kind ? '' : `<button class="btn sm ghost" data-hook-rotate title="Replace the secret; the old one stops working">New secret</button>`}<button class="btn sm ghost" data-hook-delete title="Delete">✕</button></span></div>${h.kind ? chatPeopleHtml(h) : ''}`;
   const eventRow = (e) => `<details class="pe-event"><summary class="setting-row">
     <span class="setting-label"><code>${esc(e.type)}</code></span>
     <span class="setting-value">${eventSourceLabel(e.source, hooks)}${e.subject ? ` · ${/^https?:/.test(e.subject) ? `<a href="${esc(e.subject)}" target="_blank" rel="noopener">${esc(e.subject.replace(/^https?:\/\/(www\.)?/, '').slice(0, 60))}</a>` : esc(e.subject.slice(0, 60))}` : ''}<span class="setting-sep">·</span>${eventOutcome(e)}</span>
@@ -17853,6 +18067,27 @@ function projectEventsHtml(projectId, list, events) {
     <div class="setting-rows pe-events">${events.length ? events.map(eventRow).join('') : '<div class="setting-row setting-muted">Nothing yet</div>'}</div>`;
 }
 
+// Where a person pastes a chat bot's URL; tavya sets it itself on the others.
+const CHAT_URL_PASTED = {
+  slack: ['your Slack app', 'Event Subscriptions → Request URL, with bot events app_mention and message.im'],
+  whatsapp: ['your Meta app', 'WhatsApp → Configuration → Callback URL'],
+};
+const chatUrlTip = (kind) => `Paste into ${CHAT_URL_PASTED[kind][0]}: ${CHAT_URL_PASTED[kind][1]}`;
+
+// Who a chat bot takes requests from, and who asked without being allowed.
+function chatPeopleHtml(h) {
+  const who = (p) => esc(p.name || p.id);
+  const allowed = (h.allowed || []).map((p) => `<span class="chip pe-person" title="${esc(p.id)}">${who(p)}<button class="file-chip-x" data-people-remove="${esc(p.id)}" aria-label="Remove ${who(p)}" title="Remove">✕</button></span>`).join('');
+  const asking = (h.asking || []).map((p) => `<div class="setting-row pe-sub pe-asking" data-person="${esc(p.id)}">
+    <span class="setting-label" title="${esc(p.id)}">${who(p)}</span>
+    <span class="setting-value setting-muted">${p.text ? `“${esc(p.text.slice(0, 80))}”` : ''}${p.at ? `<span class="setting-sep">·</span>${fmtAgo(p.at)}` : ''}</span>
+    <span class="setting-actions"><button class="btn sm" data-people-allow>Allow</button><button class="btn sm ghost" data-people-dismiss aria-label="Dismiss" title="Dismiss">✕</button></span></div>`).join('');
+  return `<div class="setting-row pe-sub pe-people" data-people="${esc(h.id)}">
+    <span class="setting-label">Who can ask ${policyTip('Only their messages start tasks. Anyone else is told so and shows up here to allow.')}</span>
+    <span class="setting-value">${h.anyone ? '<span class="setting-muted">Anyone who can message the bot</span>' : allowed || '<span class="setting-muted">Nobody yet: message the bot, then allow yourself here</span>'}</span>
+    <span class="setting-actions"><label class="pe-starts">Anyone <input type="checkbox" class="toggle" data-people-anyone ${h.anyone ? 'checked' : ''}></label></span></div>${asking}`;
+}
+
 function webhookFormHtml() {
   return `<div class="inline-form pe-new"><input id="pe-name" placeholder="Name, e.g. Sentry" autocomplete="off">
     <input id="pe-type" placeholder="Event type (optional)" title="What its events are called, e.g. sentry.alert" autocomplete="off" spellcheck="false">
@@ -17865,12 +18100,12 @@ function chatFormHtml(platforms, kind) {
     <div class="segmented" role="group" aria-label="Platform">${Object.keys(platforms).map((k) => `<button type="button" data-pe-platform="${k}" aria-pressed="${k === kind}">${CHAT_PLATFORM_LABELS[k] || k}</button>`).join('')}</div>
     <div class="inline-form">${fields.map((f) => `<input data-pe-cred="${esc(f.name)}" placeholder="${esc(f.label)}" ${f.secret ? 'type="password"' : ''} autocomplete="off" spellcheck="false">`).join('')}</div>
     <label class="pe-starts"><input type="checkbox" class="toggle" id="pe-starts" checked> Start a task for each message ${policyTip('Adds a task that runs once per message to the bot. Replies in the same thread go to the run already working on it.')}</label>
-    <div class="inline-form"><button class="btn sm primary" id="pe-connect">Connect</button><button class="btn sm ghost" data-pe-cancel>Cancel</button></div></div>`;
+    <div class="inline-form"><button class="btn sm primary" id="pe-connect">Connect</button><button class="btn sm ghost" data-pe-cancel>Cancel</button><a class="btn sm ghost" href="/docs/chat-bots#connect-a-bot" target="_blank" rel="noopener">Guide</a></div></div>`;
 }
 
 // Shown once: what to paste where.
-function revealHtml(rows) {
-  return `<div class="pe-reveal"><div class="setting-muted">Copy these now; they won’t be shown again.</div>
+function revealHtml(rows, lead = 'Copy these now; they won’t be shown again.') {
+  return `<div class="pe-reveal"><div class="setting-muted">${lead}</div>
     ${rows.map(([label, value]) => `<div class="setting-row"><span class="setting-label">${esc(label)}</span><span class="setting-value"><code>${esc(value)}</code></span><span class="setting-actions"><button class="btn sm ghost" data-copy-value="${esc(value)}">Copy</button></span></div>`).join('')}
     <div class="inline-form"><button class="btn sm" data-pe-done>Done</button></div></div>`;
 }
@@ -17893,6 +18128,27 @@ async function hydrateProjectEvents(proj) {
       if (!confirm(`Delete “${row.querySelector('.setting-label').textContent}”? It stops receiving events.`)) return;
       try { await api(`/api/webhooks/${row.dataset.hook}`, { method: 'DELETE' }); load(); } catch (e) { toast(e.message, true); }
     }));
+    // A chat bot's people rows follow its "Who can ask" row.
+    const people = async (el, patch) => {
+      let row = el.closest('.setting-row');
+      while (row && !row.dataset.people) row = row.previousElementSibling;
+      const hook = (list.webhooks || []).find((h) => h.id === row?.dataset.people);
+      if (!hook) return;
+      try { await api(`/api/webhooks/${hook.id}`, { method: 'PATCH', body: JSON.stringify(patch(hook)) }); } catch (e) { toast(e.message, true); }
+      load();
+    };
+    box.querySelectorAll('[data-people-anyone]').forEach((t) => t.addEventListener('change', () => people(t, () => ({ anyone: t.checked }))));
+    box.querySelectorAll('[data-people-remove]').forEach((b) => b.addEventListener('click', () =>
+      people(b, (h) => ({ allowed: (h.allowed || []).filter((p) => p.id !== b.dataset.peopleRemove) }))));
+    box.querySelectorAll('[data-people-allow]').forEach((b) => b.addEventListener('click', () => {
+      const id = b.closest('[data-person]').dataset.person;
+      people(b, (h) => {
+        const asked = (h.asking || []).find((p) => p.id === id) || { id };
+        return { allowed: [...(h.allowed || []), { id, ...(asked.name ? { name: asked.name } : {}) }] };
+      });
+    }));
+    box.querySelectorAll('[data-people-dismiss]').forEach((b) => b.addEventListener('click', () =>
+      people(b, () => ({ dismiss: [b.closest('[data-person]').dataset.person] }))));
     box.querySelectorAll('[data-hook-rotate]').forEach((b) => b.addEventListener('click', async () => {
       const row = b.closest('[data-hook]');
       if (!confirm('Replace the secret? Senders using the old one are refused until they get the new one.')) return;
@@ -17922,6 +18178,7 @@ async function hydrateProjectEvents(proj) {
             delete S.taskStore?.[proj.id];
           }
           if (created.verifyToken) { form.innerHTML = revealHtml([['Callback URL', created.url], ['Verify token', created.verifyToken]]); wireForm(); }
+          else if (CHAT_URL_PASTED[kind]) { form.innerHTML = revealHtml([['Request URL', created.url]], `Paste into ${CHAT_URL_PASTED[kind][0]} ${policyTip(chatUrlTip(kind))}`); wireForm(); }
           else { toast(`${CHAT_PLATFORM_LABELS[kind]} bot connected`); load(); }
         } catch (err) { toast(err.message, true); button.disabled = false; }
       });
@@ -24991,6 +25248,7 @@ const DOC_PAGES = [
   { slug: 'getting-started', path: '/docs', title: 'Getting started' },
   { slug: 'how-it-works', path: '/docs/how-it-works', title: 'How it works' },
   { slug: 'computers', path: '/docs/computers', title: 'Cloud computers' },
+  { slug: 'chat-bots', path: '/docs/chat-bots', title: 'Chat bots' },
   { slug: 'cli', path: '/docs/cli', title: 'tavya CLI' },
 ];
 

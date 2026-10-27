@@ -240,7 +240,7 @@ export const PLATFORM_API_CATALOG = {
     'POST /api/projects/:projectId/webhooks with {name, kind: telegram|slack|discord|whatsapp, credentials} connects a chat bot instead (telegram {botToken}; slack {signingSecret, botToken}; discord {applicationId, publicKey, botToken}; whatsapp {phoneNumberId, appSecret, accessToken}, answering a verifyToken to enter in Meta\'s dashboard). Each message that mentions the bot becomes a chat.mention event {platform, text, author, channel, thread, url} from chat:<hookId>; the bot answers in the thread when a run starts, needs input, is ready for review, finishes or fails. The event\'s subject is its conversation (chat:<hookId>/<channel>/<thread>), so replies in a thread reach the run the first mention started.',
     'GET /api/projects/:projectId/task-store (ready-made tasks, as {tasks}: project-wiki (writes the project wiki for agents), repair-github-workflow, build-planned-issues, triage-issues, chat-requests; each says repeatable (an automation, installed once as a series) or not (runs as an ordinary task), lists installed: the project\'s series or runs made from it, and missing: github|chat; task:read)',
     'POST /api/projects/:projectId/task-store/:templateId (an ordinary one starts a task now; a repeatable one creates an armed series, as many as asked (the store lists them as installed; search store:<id> is:series); params.template = id; an optional body customizes it like POST /api/projects/:projectId/tasks — title, workflow, params field by field, authorization, draft, … — and creating a task with params.template = id is the same; task:create)',
-    'PATCH|DELETE /api/webhooks/:hookId (body {name?, type?})', 'POST /api/webhooks/:hookId/rotate (new secret, returned once)',
+    'PATCH|DELETE /api/webhooks/:hookId (body {name?, type?}; a chat bot also {allowed?: [{id, name?}] (platform user ids whose messages it takes; replaces the list), anyone?: boolean, dismiss?: [id] (off its asking list)}. A chat bot takes requests only from allowed people (none at first) or anyone; someone else gets one reply saying so and appears in the hook\'s asking [{id, name, text, at}])', 'POST /api/webhooks/:hookId/rotate (new secret, returned once)',
   ],
   automation: [
     'GET /api/organizations/:organizationId/workflows', 'POST /api/organizations/:organizationId/workflows/install',
@@ -375,6 +375,11 @@ export const PLATFORM_API_CATALOG = {
     'GET /api/processes', 'POST /api/processes/kill',
     'GET /api/queue?domain=&projectId=', 'POST /api/queue/prioritize|move?projectId=',
     'GET /api/agent-queue (host concurrent-agent-turn queue)', 'POST /api/agent-queue/move (body {turnId, beforeTurnId?})',
+    'GET /api/scheduling/queue?organizationId= (agent work in the order it gets model quota: running, then waiting with status next|held|quota and until)',
+    'POST /api/scheduling/order?organizationId= (body {taskId, above?, below?}: keep the task after `above` and before `below`; tasks among tasks, sub-tasks within their task)',
+    'DELETE /api/scheduling/order/:taskId (back to the scheduler\'s own order)',
+    'PUT /api/scheduling/run-now/:taskId?organizationId= (run the task now: never hold it back for higher-priority work; it still waits for a free slot and a limit. Lasts until it is done)',
+    'DELETE /api/scheduling/run-now/:taskId (let the scheduler hold it back again)',
     'GET /api/metrics', 'GET|POST /api/remote-access (host-local only; body {action: setup|enable|disable})',
     // The inbox is per-USER by construction, so these three are the human surface:
     // a scoped agent token has no session.userId and gets a 400, whatever its

@@ -657,7 +657,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   },
   {
     name: 'set_task_priority',
-    description: 'Set a task\'s organizational priority — for search/sorting only, never sent to any agent.',
+    description: 'Set a task\'s priority. Higher priority gets model quota first, and quota is kept back for it; a task\'s sub-tasks share its priority. Unset counts as medium. Never sent to any agent.',
     parameters: {
       type: 'object',
       properties: { task_id: { type: 'string' }, priority: { type: 'string', enum: [...PRIORITY_NAMES] } },
@@ -1033,11 +1033,11 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     name: 'open_pr',
     description:
       'Do agents ONLY. Open (or refresh) this task\'s pull request and send its exact committed proposal to Review. Call this only as your final action after the requested work is truly complete, all intended files are committed, unwanted files are ignored or removed, and relevant tests pass. Ending a turn or asking a human for input does not open a PR. '
-      + 'Tasks allowing several branches: every branch lands as its own pull request. Pass `branch` (committed) to open that branch\'s pull request now and keep working: it is reviewed and lands on its own, and you are told if it needs a change (make it in that branch, commit, open_pr with the same branch again). Without `branch`, you are finished: every branch with something new opens its pull request, and the task is done once they have all landed.',
+      + 'Tasks allowing several branches: pass `branch` (committed; a repository\'s checkout name counts) to open that branch\'s pull request now and keep working: it is reviewed and lands on its own, and you are told if it needs a change (make it in that branch, commit, open_pr with the same branch again). Without `branch`, you are finished: pull requests already open take your latest commits and settle first, then every other branch with new work goes through ONE Review together and lands at once. So when separate pull requests are wanted (e.g. one per repository), open each with `branch` before finishing.',
     parameters: {
       type: 'object',
       properties: {
-        branch: { type: 'string', description: 'Several-branch tasks: a branch (checkout) name, to open or update its pull request now while you keep working. Omit when you are finished.' },
+        branch: { type: 'string', description: 'Several-branch tasks: a branch (checkout) name — a repository\'s checkout counts — to open or update its own pull request now while you keep working. Omit when you are finished: what was not opened this way is reviewed and lands together.' },
         title: { type: 'string', description: 'With `branch`: a title for that pull request (default: the branch name and this task\'s title).' },
         data: { type: 'boolean', description: 'With `branch`: true makes the pull request also publish this task\'s data (its changes to writable project resources) as it is now, when approved and before its code lands; use it when that code needs the data. false removes it. Omit to keep what the pull request has; data not published this way publishes when you finish.' },
       },
@@ -1321,7 +1321,8 @@ export function platformToolHandlers(
         return `Asking ${who}. End your turn now${needsInput.message ? '' : ' with the question as your final response'}; you will be resumed with their answer, ${jobs.length ? `when ${jobs.join(', ')} ${jobs.length > 1 ? 'finish' : 'finishes'}, ` : ''}or after ${Math.round(minutes)} min to carry on without it.`;
       }
       // pramana#22: an agent paused, then ended its turn with two questions that showed nobody Needs input.
-      const asking = 'This shows no Needs input: if your final response asks something, call pause again with needs_input: true.';
+      // krmax#752: the reply itself mentions nobody; whether someone must see it is the agent's call.
+      const asking = 'Your final response alerts nobody: if it asks something, call pause again with needs_input: true; if someone must act on it, notify them.';
       return jobs.length
         ? `Waiting for ${jobNames.length === jobs.length ? jobNames.join(', ') : jobs.join(', ')} (at most ${Math.round(minutes)} min). End your turn now, answering in your final response anything you were just asked; you will be resumed when ${jobs.length > 1 ? 'they finish' : 'it finishes'}, a message arrives, or the time is up. ${asking}`
         : `Pausing for ${Math.round(minutes)} min. End your turn now, answering in your final response anything you were just asked; you will be resumed then, or sooner if a message arrives. ${asking}`;

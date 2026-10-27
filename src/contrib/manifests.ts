@@ -597,7 +597,7 @@ export const MANIFESTS: WorkflowManifest[] = [
     requires: [],
     capabilities: [],
     events: [],
-    ui: [{ slot: 'queue-panel', tier: 2, component: 'agent-queue', title: 'Agent queue' }],
+    ui: [{ slot: 'queue-panel', tier: 2, component: 'agent-queue', title: 'Agent work' }],
     commands: [],
     params: [
       {

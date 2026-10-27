@@ -358,6 +358,8 @@ export function routeCapability(method: string, p: string, url?: URL): string | 
   // `settings:write` at the gateway against `queue:write` in the service layer,
   // which 403'd a maintainer who legitimately holds `queue:*`.
   if (p.startsWith('/api/agent-queue')) return read ? 'queue:read' : 'queue:write';
+  // Agent work in quota order, and the places people drag it to (wiki features/quota-scheduling).
+  if (p.startsWith('/api/scheduling/')) return read ? 'queue:read' : 'queue:write';
   if (p.startsWith('/api/queue')) return read ? 'queue:read' : 'queue:write';
   if (p === '/api/projects') return read ? 'project:read' : 'project:create';
   if (/^\/api\/projects\/[^/]+$/.test(p)) return read ? 'project:read' : method === 'DELETE' ? 'project:delete' : 'project:edit';
@@ -5192,7 +5194,9 @@ export class Gateway {
         if (webhookMatch[2] && method === 'POST') return this.json(res, 200, await api.rotateIncomingWebhook(token, hookId));
         if (!webhookMatch[2] && method === 'PATCH') {
           const b = await this.body(req);
-          return this.json(res, 200, await api.updateIncomingWebhook(token, hookId, { ...(b.name !== undefined ? { name: String(b.name) } : {}), ...(b.type !== undefined ? { type: String(b.type) } : {}) }));
+          return this.json(res, 200, await api.updateIncomingWebhook(token, hookId, { ...(b.name !== undefined ? { name: String(b.name) } : {}), ...(b.type !== undefined ? { type: String(b.type) } : {}),
+            ...(b.allowed !== undefined ? { allowed: b.allowed } : {}), ...(b.anyone !== undefined ? { anyone: b.anyone === true } : {}),
+            ...(Array.isArray(b.dismiss) ? { dismiss: b.dismiss.map(String) } : {}) }));
         }
         if (!webhookMatch[2] && method === 'DELETE') return this.json(res, 200, await api.deleteIncomingWebhook(token, hookId));
       }
@@ -6621,6 +6625,27 @@ export class Gateway {
         const b = await this.body(req);
         await api.moveAgentQueueItem(token, String(b.turnId), b.beforeTurnId ? String(b.beforeTurnId) : undefined,
           url.searchParams.get('organizationId') ?? undefined);
+        return this.json(res, 200, { ok: true });
+      }
+      if (p === '/api/scheduling/queue' && method === 'GET') {
+        return this.json(res, 200, await api.schedulingQueue(token, url.searchParams.get('organizationId') ?? undefined));
+      }
+      if (p === '/api/scheduling/order' && method === 'POST') {
+        const b = await this.body(req);
+        await api.placeInQueue(token, { taskId: String(b.taskId),
+          ...(b.above ? { above: String(b.above) } : {}), ...(b.below ? { below: String(b.below) } : {}),
+          ...(url.searchParams.get('organizationId') ? { organizationId: url.searchParams.get('organizationId')! } : {}) });
+        return this.json(res, 200, { ok: true });
+      }
+      const placement = p.match(/^\/api\/scheduling\/order\/([^/]+)$/);
+      if (placement && method === 'DELETE') {
+        await api.clearQueuePlacement(token, decodeURIComponent(placement[1]!), url.searchParams.get('organizationId') ?? undefined);
+        return this.json(res, 200, { ok: true });
+      }
+      const runNow = p.match(/^\/api\/scheduling\/run-now\/([^/]+)$/);
+      if (runNow && (method === 'PUT' || method === 'DELETE')) {
+        const id = decodeURIComponent(runNow[1]!), org = url.searchParams.get('organizationId') ?? undefined;
+        await (method === 'PUT' ? api.runNow(token, id, org) : api.cancelRunNow(token, id, org));
         return this.json(res, 200, { ok: true });
       }
       // Wiki — org/project skills, memories, and general prompts. One route

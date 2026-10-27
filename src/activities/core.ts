@@ -2947,6 +2947,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       // JIT-resolve credentials via the broker (never journaled). Every current
       // turn receives its selection from the general Credentials policy.
       let resolvedAuth: { apiKey?: string; configHome?: string; oauthToken?: string } | undefined;
+      // The login this turn spends (its credential key), for the quota scheduler.
+      let schedulingAccount: string | undefined;
       // The coordinator's pool spans organizations; a leased home or key is used
       // only if it is one of THIS organization's credentials. (The mock agent
       // reads no credential; its pool entries exist only in tests.)
@@ -2954,6 +2956,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         const { gatherCredentialSources } = await import('../platform/credential-sources.js');
         const { enumerateCredentials } = await import('../platform/credentials.js');
         const own = enumerateCredentials(await gatherCredentialSources({ configHomes: deps.configHomes, broker: deps.broker, organizationId }));
+        schedulingAccount = own.find((c) => (args.accountConfigHome && c.configHome && path.resolve(c.configHome) === path.resolve(args.accountConfigHome))
+          || (args.accountApiKeyHandle && c.apiKeyHandle === args.accountApiKeyHandle))?.key;
         if ((args.accountConfigHome && !own.some((c) => c.configHome && path.resolve(c.configHome) === path.resolve(args.accountConfigHome!)))
           || (args.accountApiKeyHandle && !own.some((c) => c.apiKeyHandle === args.accountApiKeyHandle)))
           throw ApplicationFailure.create({
@@ -3583,6 +3587,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       resultCheckpointed = !!checkpoint;
       let providerInvoked = false;
       let providerUsage: AdapterTurn['usage'];
+      let providerStartedAt: number | undefined;
       let usageAdmissionId: string | undefined = checkpoint?.admissionId;
       let usageAdmissionFinished = false;
       const fundingSource: 'managed' | 'byok' | 'customer' = store.hosted
@@ -3606,7 +3611,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
                 metering: 'provider-reported', inputTokens: usage.inputTokens, outputTokens: usage.outputTokens,
                 cacheReadTokens: usage.cacheReadTokens ?? 0, cacheWriteTokens: usage.cacheWriteTokens ?? 0,
                 inputTokensIncludeCacheRead: usage.inputTokensIncludeCacheRead ?? false,
-                ...(usage.models ? { models: usage.models } : {}) } });
+                ...(usage.models ? { models: usage.models } : {}),
+                ...(schedulingAccount ? { account: schedulingAccount } : {}) } });
           }
           if (fundingSource === 'managed') {
             const actualized = managedModelActualCost(modelProvider, profile.model, usage, managedReservationMicros!);
@@ -3621,7 +3627,21 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           // no concurrent admission can observe the reservation released before
           // its durable replacement exists, and a duplicate retry sees completed.
           (await store.finishUsageAdmission(usageAdmissionId, completed, Date.now(), completedUsageEvents));
+          const firstFinish = !usageAdmissionFinished && completed !== undefined;
           usageAdmissionFinished = completed !== undefined;
+          // The quota scheduler's ledgers: what this tree and this login spent (wiki features/quota-scheduling).
+          if (firstFinish && usage) {
+            try {
+              const tree = await store.taskTree(args.taskId);
+              const { recordTurnSpend } = await import('../scheduling/state.js');
+              const { usageCostUsd } = await import('../scheduling/costs.js');
+              if (tree) await recordTurnSpend(store, { root: tree.root, organizationId: tree.organizationId,
+                ...(schedulingAccount ? { credential: schedulingAccount } : {}), usd: usageCostUsd(usage, profile.model),
+                minutes: providerStartedAt ? (Date.now() - providerStartedAt) / 60_000 : 0, at: Date.now() });
+            } catch (error) {
+              console.warn(`[karmax] could not record ${args.taskId}'s spend for the quota scheduler:`, error instanceof Error ? error.message : error);
+            }
+          }
         }
       };
       const admissionEnd = (await trace.start('admission.host'));
@@ -3807,6 +3827,15 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             // provider-reported result refines it; unknown usage stays estimated.
             if (fundingSource === 'managed') await finishUsage(undefined);
             providerInvoked = true;
+            providerStartedAt ??= Date.now();
+          },
+          onQuotaReading: (reading) => {
+            if (!schedulingAccount) return;
+            const credential = schedulingAccount;
+            void import('../scheduling/state.js').then(({ recordQuotaReading }) =>
+              recordQuotaReading(store, credential, reading.window, { utilization: reading.utilization,
+                ...(reading.resetsAt ? { resetsAt: reading.resetsAt } : {}), at: Date.now() }))
+              .catch(() => undefined);
           },
           onProviderResult: turn => { providerUsage = turn.usage; },
           // A turn the usage limit ends spent tokens too: meter them (funding-analysis#2).

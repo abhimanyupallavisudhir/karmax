@@ -129,9 +129,18 @@ it('a ~100 MB saved video starts playing in the Review viewer', async () => {
     await page.addInitScript(() => {
       (globalThis as any).opened = [];
       (globalThis as any).open = (...args: unknown[]) => { (globalThis as any).opened.push(args); return null; };
+      // What the player went through, for a failure to name (wiki ops/ci: this test flaked on CI without it).
+      (globalThis as any).mediaEvents = [];
+      for (const type of ['loadstart', 'loadedmetadata', 'canplay', 'play', 'playing', 'waiting', 'stalled', 'suspend', 'error', 'abort', 'emptied'])
+        (globalThis as any).document.addEventListener(type, () => (globalThis as any).mediaEvents.push(`${Math.round(performance.now())}ms ${type}`), true);
     });
     const statuses: number[] = [];
-    page.on('response', (response) => { if (response.url().includes('/api/artifact-content/')) statuses.push(response.status()); });
+    const responses: string[] = [];
+    page.on('response', (response) => {
+      if (!response.url().includes('/api/artifact-content/')) return;
+      statuses.push(response.status());
+      responses.push(`${response.status()} ${response.request().headers().range ?? 'whole'}`);
+    });
     let resolves = 0;
     page.on('request', (request) => { if (request.url().endsWith('/review-action')) resolves++; });
     // The first link answers as an expired one would: the viewer gets a fresh
@@ -143,7 +152,15 @@ it('a ~100 MB saved video starts playing in the Review viewer', async () => {
 
     const player = page.locator('dialog.artifact-reader video');
     await player.waitFor();
-    await expect.poll(() => player.evaluate((v) => (v as any).currentTime), { timeout: 20_000 }).toBeGreaterThan(0.5);
+    try {
+      await expect.poll(() => player.evaluate((v) => (v as any).currentTime), { timeout: 20_000 }).toBeGreaterThan(0.5);
+    } catch (error) {
+      const state = await player.evaluate((v: any) => ({ src: v.currentSrc, currentTime: v.currentTime, paused: v.paused, readyState: v.readyState,
+        networkState: v.networkState, error: v.error && `${v.error.code} ${v.error.message}`,
+        buffered: Array.from({ length: v.buffered.length }, (_, i) => [v.buffered.start(i), v.buffered.end(i)]),
+        events: (globalThis as any).mediaEvents })).catch((reason) => String(reason));
+      throw new Error(`${(error as Error).message}\nplayer: ${JSON.stringify(state)}\nartifact responses: ${responses.join(', ')}; ${delivered} bytes delivered`, { cause: error });
+    }
     const playingAt = Date.now();
     expect(await player.evaluate((v) => (v as any).paused)).toBe(false);
     // Played while most of the 100 MB was still unread (the store needs ~10 s for all of it).
