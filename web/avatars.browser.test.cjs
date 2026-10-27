@@ -39,9 +39,9 @@ const { fakeConsole, launch } = require('../tests/helpers/fake-console.cjs');
     // ── the list: a task saved as an Avatar rests as ✦ Avatar, with Fork ──
     const row = page.locator('.task-row[data-draft="av"]');
     await row.waitFor();
-    assert.match(await row.innerText(), /✦ Avatar/);
+    assert.match(await row.innerText(), /✦ Avatār/);
     assert.equal(await row.locator('[data-fork-avatar="av"]').count(), 1);
-    assert.equal(await row.locator('[data-queue]').count(), 0, 'an Avatar is forked, not run, from its row');
+    assert.equal(await row.locator('[data-queue]').count(), 0, 'an Avatār is forked, not run, from its row');
     if (shots) await row.screenshot({ path: `${shots}/avatar-row.png` });
 
     // ── the form: the Avatar row at the bottom ──
@@ -58,6 +58,13 @@ const { fakeConsole, launch } = require('../tests/helpers/fake-console.cjs');
     assert.equal(await page.locator('.tf-avatar-callers').inputValue(), '@project');
     assert.equal(await page.locator('#tf-save-avatar').isVisible(), true);
     await page.locator('#tf-avatar-forks').check();
+    // Forked as: every role until some are unticked; the last one cannot be.
+    const role = (value) => page.locator(`.tf-avatar-roles input[value="${value}"]`);
+    for (const value of ['do', 'responder', 'confirm', 'agent']) assert.equal(await role(value).isChecked(), true);
+    for (const value of ['do', 'responder', 'agent']) await role(value).uncheck();
+    await role('confirm').click();
+    assert.equal(await role('confirm').isChecked(), true, 'the last role stays');
+    await role('responder').check();
     // Auto-save never makes an Avatar on its own.
     await page.waitForTimeout(1200);
     assert.equal(avatarSaves().length, 0, 'auto-save keeps the setting until it is acknowledged');
@@ -68,7 +75,7 @@ const { fakeConsole, launch } = require('../tests/helpers/fake-console.cjs');
     await page.locator('#tf-save-avatar').click();
     const notice = page.locator('.avatar-notice');
     await notice.waitFor();
-    assert.match(await notice.innerText(), /Avatars automatically grant their authorizations to their future forks\./);
+    assert.match(await notice.innerText(), /Avatārs automatically grant their authorizations to their future forks\./);
     assert.match(await notice.innerText(), /prompt injection/);
     if (shots) await page.screenshot({ path: `${shots}/avatar-notice.png` });
     await notice.getByRole('button', { name: 'Cancel' }).click();
@@ -80,13 +87,13 @@ const { fakeConsole, launch } = require('../tests/helpers/fake-console.cjs');
     await page.locator('#tf-save-avatar').click();
     await notice.waitFor();
     await notice.getByLabel('Don’t show this again').check();
-    await notice.getByRole('button', { name: 'Make it an Avatar' }).click();
+    await notice.getByRole('button', { name: 'Make it an Avatār' }).click();
     await page.locator('#tf-page').waitFor({ state: 'detached' });
     const saved = avatarSaves().at(-1);
-    assert.deepEqual(saved.params.avatar, { callableBy: ['@project'], forksMayBeAvatars: true });
+    assert.deepEqual(saved.params.avatar, { callableBy: ['@project'], forksMayBeAvatars: true, roles: ['responder', 'confirm'] });
     assert.notEqual(saved.draft, false, 'saved without running');
     assert.equal(await page.evaluate(() => localStorage.getItem('tavya.avatarNoticeDismissed')), '1');
-    await page.locator('.toast', { hasText: 'Saved as Avatar' }).waitFor();
+    await page.locator('.toast', { hasText: 'Saved as Avatār' }).waitFor();
 
     // ── a second Avatar: no dialog any more ──
     await page.keyboard.press('Shift+N');

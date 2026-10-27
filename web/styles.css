@@ -3217,13 +3217,12 @@ html[data-theme="dark"] .github-signin-btn:active,
 .tf-avatar-options { display: grid; grid-template-columns: max-content minmax(0, 1fr); align-items: center; gap: 10px 14px; }
 .tf-avatar-options .tb-label { font-size: 12px; font-weight: 600; color: var(--ink-2); }
 .tf-avatar-options .audience-combo { max-width: 420px; }
+.tf-avatar-roles { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--ink-2); }
+.tf-avatar-roles label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
+.tf-avatar-roles input { width: auto; margin: 0; padding: 0; }
 .tf-avatar-forks { grid-column: 1 / -1; display: inline-flex; align-items: center; gap: 6px; width: max-content; font-size: 12px; font-weight: 600; color: var(--ink-2); cursor: pointer; }
 .tf-avatar-forks input { width: auto; margin: 0; padding: 0; }
 .avatar-chip { color: var(--accent); }
-/* A fork acting for an Avatar acts with its authorization: only its own
-   cards and budget remain the task's to choose. */
-.agent-authority.acts-for-avatar :is([data-row="__authorization"], [data-row="__vault"]) { display: none; }
-.agent-authority.acts-for-avatar[data-mode="agent"] .aa-body { display: none; }
 .avatar-notice-overlay { position: fixed; inset: 0; z-index: 90; display: grid; place-items: center; padding: 20px; background: rgb(0 0 0 / .35); }
 .avatar-notice { width: min(480px, calc(100vw - 28px)); display: flex; flex-direction: column; gap: 12px; padding: 18px; }
 .avatar-notice h2 { margin: 0; font-size: 15px; }

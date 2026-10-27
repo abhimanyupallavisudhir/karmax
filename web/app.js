@@ -2413,10 +2413,13 @@ function resumeChosenInner(rf, task) {
   const link = t && projectById(t.projectId)
     ? `<a class="af-resume-source" data-spa href="${esc(taskUrl(t.id, t))}" title="Open the source task">${esc(ref)}</a>`
     : esc(ref);
-  // A fork of an Avatar acts with its authorization: nothing to re-authorize.
-  const grants = t && !avatar ? previousGrantsSummary(t) : '';
-  return `<span class="af-resume-label">⑂ forking ${esc(source)} of ${link}${avatar ? ` <span class="chip avatar-chip" title="Acts with this Avatar’s authorization">✦ Avatar</span>` : ''}</span><button type="button" class="af-resume-clear" title="Clear">✕</button>${grants
-    ? `<label class="af-resume-reauth" hidden title="Start this fork with the grants the source task ended with — its authorization level and scope plus the vault credentials it was approved for — instead of the defaults. They land in the Authorization and Vault credentials controls, where you can still adjust them."><input type="checkbox" class="af-resume-reauthorize"> Re-authorize previous grants? <span class="af-resume-reauth-summary">${esc(grants)}</span></label>`
+  // A fork of an Avatār starts from its authorization, granted without
+  // approval; the form's controls can only lower it.
+  const grants = t ? previousGrantsSummary(t) : '';
+  return `<span class="af-resume-label">⑂ forking ${esc(source)} of ${link}${avatar ? ` <span class="chip avatar-chip" title="Its forks get up to its authorization without approval">✦ Avatār</span>` : ''}</span><button type="button" class="af-resume-clear" title="Clear">✕</button>${grants
+    ? avatar
+      ? `<label class="af-resume-reauth" hidden title="Granted from this Avatār without approval. Lower it in Authorization and Vault credentials to give the fork less."><input type="checkbox" class="af-resume-reauthorize"> Its authorization <span class="af-resume-reauth-summary">${esc(grants)}</span></label>`
+      : `<label class="af-resume-reauth" hidden title="Start this fork with the grants the source task ended with — its authorization level and scope plus the vault credentials it was approved for — instead of the defaults. They land in the Authorization and Vault credentials controls, where you can still adjust them."><input type="checkbox" class="af-resume-reauthorize"> Re-authorize previous grants? <span class="af-resume-reauth-summary">${esc(grants)}</span></label>`
     : ''}${t && (t.lastView?.status || t.status) !== 'done'
     ? `<label class="af-resume-dependency" hidden title="Wait for this source task to complete successfully before starting."><input type="checkbox" class="af-resume-add-dependency" data-task-id="${esc(rf.taskId)}"> Also add as dependency?</label>`
     : ''}<label class="af-resume-model" title="Copy this agent’s provider, model and reasoning effort."><input type="checkbox" class="af-resume-reuse-model"> Re-use same AI model</label>`;
@@ -2434,6 +2437,8 @@ function previousTaskGrants(task) {
     credentialGrantIds: (stored.capabilities || [])
       .filter((c) => c.startsWith('use-credential:item:')).map((c) => c.slice('use-credential:item:'.length)),
     credentialPolicies: JSON.parse(JSON.stringify(stored.credentialPolicies || {})),
+    // An Avatār's forks share its cards and budget (wiki features/avatars).
+    ...(task.params.avatar && task.params.paymentPolicy ? { paymentPolicy: JSON.parse(JSON.stringify(task.params.paymentPolicy)) } : {}),
   };
 }
 // A task's record, also when the task list does not hold it: the list has only
@@ -2498,15 +2503,17 @@ function wireResumeReauthorization(root, host) {
     host.changed?.();
   }, { signal: wiring.signal });
   root.addEventListener('af-reauthorize', (event) => {
-    const { enabled, authorization, credentialGrantIds, credentialPolicies } = event.detail;
+    const { enabled, authorization, credentialGrantIds, credentialPolicies, paymentPolicy } = event.detail;
     const editor = host.editor();
     if (enabled) {
-      stash = stash || { authorization: readAuthorizationEditor(editor), ...host.grants() };
+      stash = stash || { authorization: readAuthorizationEditor(editor), ...host.grants(), payments: host.payments?.() };
       editor?._setAuthorization?.(withProjects(normalizedAuthorization(authorization), [host.projectId, ...sources.values()].filter(Boolean)));
       host.setGrants(credentialGrantIds, credentialPolicies);
+      if (paymentPolicy) host.setPayments?.(paymentPolicy);
     } else if (stash) {
       editor?._setAuthorization?.(stash.authorization);
       host.setGrants(stash.ids, stash.policies);
+      if (stash.payments) host.setPayments?.(stash.payments);
       stash = null;
     } else return;
     host.changed?.();
@@ -3155,7 +3162,7 @@ async function chooseAuthorizationGrant(projectId, authorization, targetLabel = 
     ...targets.users.map((user) => ({ value: user.selector, label: user.name || user.email || user.id,
       detail: user.name && user.email ? user.email : '', kind: 'person' })),
     ...targets.teams.map((team) => ({ value: team.selector, label: team.name, detail: `Team · ${count(team.eligibleUserIds)}`, kind: 'team' })),
-    ...targets.avatars.map((avatar) => ({ value: avatar.selector, label: avatar.name, detail: 'Avatar', kind: 'avatar' })),
+    ...targets.avatars.map((avatar) => ({ value: avatar.selector, label: avatar.name, detail: 'Avatār', kind: 'avatar' })),
     ...targets.special.filter((item) => item.selector !== targets.summon).map((item) => ({ value: item.selector,
       label: SUMMON_GROUP_LABELS[item.selector] || item.selector, detail: `${item.selector} · ${count(item.eligibleUserIds)}`, kind: 'group' })),
   ];
@@ -3447,11 +3454,13 @@ function wireAgentBox(box) {
     const avatar = forkedAvatar({ resumeFrom: readResume(box) });
     details.classList.toggle('acts-for-avatar', !!avatar);
     const summary = details.querySelector('.aa-summary');
-    if (!summary) return;
+    // The main agent's row shows the task's own (lowerable) authorization; an
+    // agent that sets its own shows that.
+    if (!summary || details.dataset.mode !== 'agent' || details.dataset.explicit === '1') return;
     if (avatar) {
       if (summary.dataset.own === undefined) summary.dataset.own = summary.textContent;
       summary.textContent = `✦ ${avatar.name}’s`;
-      summary.title = `Acts with Avatar ${avatar.name}’s authorization`;
+      summary.title = `Acts with Avatār ${avatar.name}’s authorization unless you give it less`;
     } else if (summary.dataset.own !== undefined) {
       summary.textContent = summary.dataset.own;
       delete summary.dataset.own;
@@ -7058,7 +7067,7 @@ function awaitingApproval(t) { return !!t?.params?.draft && !!t.params._awaiting
 const awaitingApprovalChip = '<span class="chip waiting" title="Starts by itself once someone who can grant its authorization approves">waiting for approval</span>';
 /** Saved as an Avatar without running: it rests in the Avatar stage, editable like a draft. */
 function restingAvatar(t) { return !!t?.params?.avatar && !!t.params.draft && !t.lastView; }
-const avatarChip = '<span class="chip avatar-chip" title="Avatar: its forks act with its authorization">✦ Avatar</span>';
+const avatarChip = '<span class="chip avatar-chip" title="Avatār: its forks act with its authorization">✦ Avatār</span>';
 
 function taskRow(t, { showTags = true, project = false } = {}) {
   const isDraft = t.params?.draft;
@@ -7751,7 +7760,7 @@ function wireTasksView() {
       ev.stopPropagation();
       // Deleting a draft is a hard delete with no undo, so confirm first.
       const record = taskRecord(b.dataset.deldraft);
-      const kind = restingAvatar(record) ? 'Avatar' : 'draft';
+      const kind = restingAvatar(record) ? 'Avatār' : 'draft';
       if (!confirm(`Delete ${kind} "${record?.title || `this ${kind}`}"? This cannot be undone.`)) return;
       if (await deleteDraft(b.dataset.deldraft)) toast(`${kind[0].toUpperCase()}${kind.slice(1)} removed`);
     }),
@@ -8640,7 +8649,7 @@ function taskFormTitle(draft) {
     return `<span class="task-num">#${draft.num}</span> ${esc(draft.title)} <span class="chip waiting" title="Starts by itself when its trigger fires">${esc(triggerSummary(p.triggers) || 'waiting')}</span>`;
   if (awaitingApproval(draft) && draft.num != null)
     return `<span class="task-num">#${draft.num}</span> ${esc(draft.title)} ${awaitingApprovalChip}`;
-  return !draft ? 'New task' : p.triggerState === 'armed' || isSeries(p) ? 'Edit task' : restingAvatar(draft) ? 'Edit Avatar' : 'Edit draft';
+  return !draft ? 'New task' : p.triggerState === 'armed' || isSeries(p) ? 'Edit task' : restingAvatar(draft) ? 'Edit Avatār' : 'Edit draft';
 }
 
 function taskFormLoadingPage(project, draft, title) {
@@ -8824,7 +8833,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
         <div class="tf-foot-inner">
           ${templateEdit ? '<span class="tf-hint"></span>' : `<button class="btn ghost" id="tf-save-template" title="Save this form as a template, to start new tasks from" aria-label="Save as template">${ICON.template}<span class="tf-save-template-label">Save as template</span></button>
           <span class="tf-hint"></span>
-          <button class="btn" id="tf-save-avatar" ${values.avatar ? '' : 'hidden'}>Save as Avatar without running</button>
+          <button class="btn" id="tf-save-avatar" ${values.avatar ? '' : 'hidden'}>Save as Avatār without running</button>
           <button class="btn" id="tf-draft">Save draft</button>`}
           <button class="btn primary" id="tf-queue">${templateEdit ? 'Save template' : editInPlace ? 'Save' : 'Run task'}<span class="kbd">${esc(fmtKeys('meta+Enter'))}</span></button>
         </div>
@@ -9051,6 +9060,8 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       vaultCredentialPolicies = policies;
       refreshVaultCount();
     },
+    payments: () => readTaskPayments($('#tf-payments')),
+    setPayments: (policy) => mainPaymentsReady.then(() => $('#tf-payments')?._setPolicy?.(policy)),
     changed: () => { paintMainAuthority(); autoSaveSoon(); },
   });
   paintMainAuthority();
@@ -9465,7 +9476,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       // user could not tell whether they had just made a duplicate.
       toast(editInPlace
         ? (draftMode ? 'Moved to drafts' : 'Saved')
-        : draftMode ? (st.body.avatar ? 'Saved as Avatar' : 'Draft saved') : 'Task started');
+        : draftMode ? (st.body.avatar ? 'Saved as Avatār' : 'Draft saved') : 'Task started');
       refreshTasks();
     } catch (e) {
       if (!draftMode && isAuthorizationGrantGap(e)) {
@@ -9539,6 +9550,10 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     root.querySelector('.tf-avatar-options').hidden = !avatarBox.checked;
     const saveAvatar = $('#tf-save-avatar');
     if (saveAvatar) saveAvatar.hidden = !avatarBox.checked;
+  });
+  // A fork has to be able to play some role: the last one stays ticked.
+  root.querySelector('.tf-avatar-roles')?.addEventListener('change', (event) => {
+    if (!root.querySelector('.tf-avatar-roles input:checked')) event.target.checked = true;
   });
   const commitAvatar = async () => {
     if (!avatarBox?.checked || avatarCommitted) return true;
@@ -14985,7 +15000,7 @@ function wireAgentMention(ta, box, v, key) {
       if (item.kind === 'agent' || item.kind === 'new') sawAgent = true;
       const key = item.kind === 'agent' ? `[${item.index}]` : item.kind === 'new' ? '[+]' : '';
       const hint = item.kind === 'agent' ? (item.state === 'running' ? 'working' : item.state === 'queued' ? 'queued' : item.state === 'new' ? 'new' : '')
-        : item.kind === 'people' ? '›' : item.kind === 'avatar' ? 'Avatar' : '';
+        : item.kind === 'people' ? '›' : item.kind === 'avatar' ? 'Avatār' : '';
       const named = item.kind === 'group' || item.kind === 'team';
       return `${sep}<div class="wm-opt am-opt ${i === active ? 'active' : ''}" data-i="${i}" role="option">
         <span class="am-key">${key}</span><span class="wm-main"><span class="wm-ref">${esc(named ? item.token : item.label)}</span>${
@@ -16673,7 +16688,10 @@ async function hydrateSettingsForms(scope, projectId, organizationId) {
 
 // ── Avatars (wiki features/avatars) ─────────────────────
 // What making or enabling an Avatar risks, in the same words everywhere.
-const AVATAR_DISCLAIMER = 'Forks of an Avatar act with its authorization — its level, projects, vault credentials and its creator’s GitHub account — without anyone approving it again. Anyone it is callable by can fork it, as a task’s agent, Responder or Reviewer, and a prompt injection in anything a fork reads can steer it. Give an Avatar only what you would trust all of them with.';
+const AVATAR_DISCLAIMER = 'Forks of an Avatār act with its authorization — its level, projects, vault credentials and its creator’s GitHub account — without anyone approving it again. Anyone it is callable by can fork it, as a task’s agent, Responder or Reviewer, and a prompt injection in anything a fork reads can steer it. Give an Avatār only what you would trust all of them with.';
+
+// The roles a fork of an Avatār may play (`params.avatar.roles`; none listed: all).
+const AVATAR_ROLE_CHOICES = [['do', 'Agent'], ['responder', 'Responder'], ['confirm', 'Reviewer'], ['agent', 'Called in']];
 
 // The task form's Avatar row, at its bottom like Repeatable: the setting
 // (`params.avatar`), who may call it, and whether its forks may be Avatars.
@@ -16682,22 +16700,27 @@ function avatarSectionHtml(value) {
   const callers = (setting?.callableBy?.length ? setting.callableBy : ['@project']).join(', ');
   return `<div class="form-row" data-row="__avatar">
     <div class="tf-avatar-line">
-      <label class="tf-avatar-toggle"><input type="checkbox" id="tf-avatar" ${setting ? 'checked' : ''}> Avatar
+      <label class="tf-avatar-toggle"><input type="checkbox" id="tf-avatar" ${setting ? 'checked' : ''}> Avatār
         <span class="tf-avatar-hint">(automatically grants future forks the same authorizations)</span></label>
       <span class="risk-chip">! At your own risk</span>${policyTip(AVATAR_DISCLAIMER)}
     </div>
     <div class="tf-avatar-options" ${setting ? '' : 'hidden'}>
       <span class="tb-label">Callable by</span>${audienceComboHtml('tf-avatar-callers', callers, 'Callable by')}
-      <label class="tf-avatar-forks"><input type="checkbox" id="tf-avatar-forks" ${setting?.forksMayBeAvatars ? 'checked' : ''}> Forks can be Avatars
-        ${policyTip('A fork acting with this task’s authorization may itself be marked Avatar, handing that authorization on to whoever may call it.')}</label>
+      <span class="tb-label">Forked as</span><span class="tf-avatar-roles">${AVATAR_ROLE_CHOICES.map(([role, label]) =>
+        `<label><input type="checkbox" value="${role}" ${!setting?.roles?.length || setting.roles.includes(role) ? 'checked' : ''}> ${label}</label>`).join('')}</span>
+      <label class="tf-avatar-forks"><input type="checkbox" id="tf-avatar-forks" ${setting?.forksMayBeAvatars ? 'checked' : ''}> Forks can be Avatārs
+        ${policyTip('A fork acting with this task’s authorization may itself be marked Avatār, handing that authorization on to whoever may call it.')}</label>
     </div>
   </div>`;
 }
 function readAvatarSection(root) {
   if (!root?.querySelector('#tf-avatar')?.checked) return undefined;
   const callableBy = (root.querySelector('.tf-avatar-callers')?.value || '').split(',').map((value) => value.trim()).filter(Boolean);
+  const roles = [...(root.querySelectorAll?.('.tf-avatar-roles input:checked') || [])].map((input) => input.value);
   return { callableBy: callableBy.length ? callableBy : ['@project'],
-    ...(root.querySelector('#tf-avatar-forks')?.checked ? { forksMayBeAvatars: true } : {}) };
+    ...(root.querySelector('#tf-avatar-forks')?.checked ? { forksMayBeAvatars: true } : {}),
+    // Every role ticked is no restriction.
+    ...(roles.length < AVATAR_ROLE_CHOICES.length ? { roles } : {}) };
 }
 // Making a task an Avatar says what it risks, until "Don't show this again".
 const AVATAR_NOTICE_KEY = 'tavya.avatarNoticeDismissed';
@@ -16707,11 +16730,11 @@ function confirmAvatar() {
     const overlay = document.createElement('div');
     overlay.className = 'modal-overlay avatar-notice-overlay';
     overlay.innerHTML = `<div class="modal-card avatar-notice" role="dialog" aria-modal="true" aria-labelledby="avatar-notice-title">
-      <h2 id="avatar-notice-title">Avatars automatically grant their authorizations to their future forks.</h2>
+      <h2 id="avatar-notice-title">Avatārs automatically grant their authorizations to their future forks.</h2>
       <p>${esc(AVATAR_DISCLAIMER)}</p>
       <label class="avatar-notice-dismiss"><input type="checkbox"> Don’t show this again</label>
       <div class="avatar-notice-actions"><button type="button" class="btn avatar-notice-cancel">Cancel</button>
-        <button type="button" class="btn primary avatar-notice-ok">Make it an Avatar</button></div>
+        <button type="button" class="btn primary avatar-notice-ok">Make it an Avatār</button></div>
     </div>`;
     document.body.appendChild(overlay);
     const finish = (ok) => {
@@ -17807,16 +17830,16 @@ async function hydrateAvatarAvailability(scope, id) {
     const enabled = scope === 'organization' ? policy.enabled : policy.effective;
     const state = scope === 'organization' ? (enabled ? 'On' : 'Off')
       : `${enabled ? 'On' : 'Off'} · ${policy.project === 'inherit' ? 'organization default' : 'set for this project'}`;
-    box.innerHTML = `<div class="setting-row"><span class="setting-label">Avatars ${policyTip(`Tasks whose forks act with their authorization. ${AVATAR_DISCLAIMER} ${scope === 'organization' ? 'Projects can override this.' : ''} Off, Avatars stay tasks, but forks get no authorization from them.`)}</span>
+    box.innerHTML = `<div class="setting-row"><span class="setting-label">Avatārs ${policyTip(`Tasks whose forks act with their authorization. ${AVATAR_DISCLAIMER} ${scope === 'organization' ? 'Projects can override this.' : ''} Off, Avatārs stay tasks, but forks get no authorization from them.`)}</span>
       <span class="setting-value setting-muted">${state}</span>
-      <span class="setting-actions">${scope === 'project' && policy.project !== 'inherit' ? '<button type="button" class="btn sm ghost avatar-availability-inherit">Use organization default</button>' : ''}<button type="button" class="btn sm avatar-availability-toggle" aria-pressed="${enabled}">${enabled ? 'Disable' : 'Enable'} Avatars</button></span></div>`;
+      <span class="setting-actions">${scope === 'project' && policy.project !== 'inherit' ? '<button type="button" class="btn sm ghost avatar-availability-inherit">Use organization default</button>' : ''}<button type="button" class="btn sm avatar-availability-toggle" aria-pressed="${enabled}">${enabled ? 'Disable' : 'Enable'} Avatārs</button></span></div>`;
     const save = async (button, body) => {
       button.disabled = true;
       try {
         await api(url, { method: 'PUT', body: JSON.stringify(body) });
         await loadAvatars().catch(() => {});
         renderMain();
-        toast('Avatar availability saved');
+        toast('Avatār availability saved');
       } catch (error) { button.disabled = false; toast(error.message, true); }
     };
     box.querySelector('.avatar-availability-toggle').addEventListener('click', (event) => save(event.currentTarget,
@@ -25589,6 +25612,14 @@ async function wireTaskPayments(box, projectId, initial, taskId, organizationId)
       box.dispatchEvent(new Event('change', { bubbles: true }));
     }
     box._setCards = next => { cards = next.filter(c => c.status !== 'canceled' && c.status !== 'inactive'); paint(); };
+    // A host filling the whole policy in (forking an Avatār starts from its cards and budget).
+    box._setPolicy = (next) => {
+      selected = new Set(next.cardIds ?? cards.map(c => c.id));
+      if (next.currency && [...currency.options].some((option) => option.value === next.currency)) currency.value = next.currency;
+      step();
+      budget.value = next.budget == null ? '' : fromMinorUnits(next.budget, currency.value);
+      change();
+    };
     input.onfocus = () => expand(true);
     input.oninput = () => { paint(); expand(true); };
     box.querySelector('.payment-caret').onclick = () => { const open = menu.hidden; input.focus(); expand(open); };

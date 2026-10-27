@@ -521,7 +521,7 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
     'escalate_to_human',
     {
       description:
-        'Ask named people, teams, or Avatars for what only a person can give: an approval, a secret, an action in the real world, a personal decision. ' +
+        'Ask named people, teams, or Avatārs for what only a person can give: an approval, a secret, an action in the real world, a personal decision. ' +
         'For anything an agent could answer, end your turn with the question instead; it goes to your task\'s usual input route (a sub-task\'s parent, else its Responder). ' +
         'This pauses your task at its exact stage and ends your turn. A reply resumes you, and the answer or question you end that turn with reaches them too. ' +
         'Audience selectors: avatar:<task id>, user:<id>, @team:<slug>, @creator, @maintainers, @admins, @superadmins, @owners, @project, or @all. ' +
@@ -530,7 +530,7 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
         'person is genuinely blocking progress, and critical only for something that goes wrong if it waits.',
       inputSchema: {
         // Required, but checked by the platform, whose refusal lists who can be asked.
-        audience: z.array(z.string()).max(32).optional().describe('Required. Who to ask: person/team/Avatar selectors; any of them may answer.'),
+        audience: z.array(z.string()).max(32).optional().describe('Required. Who to ask: person/team/Avatār selectors; any of them may answer.'),
         message: z.string().trim().min(1).max(4_000),
         urgency: z.enum(URGENCY_LEVELS as [Urgency, ...Urgency[]]).optional(),
       },
@@ -543,7 +543,7 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
       description:
         'Tell or call people and agents of this task without ending your turn. ' +
         'Notify a person only when you need them to do something; never for updates on your work. People (user:<id>, @team:<slug>, ' +
-        '@creator, @owners, @project, @maintainers, @admins, @all) and Avatars (avatar:<task id>) are notified now and keep ' +
+        '@creator, @owners, @project, @maintainers, @admins, @all) and Avatārs (avatar:<task id>) are notified now and keep ' +
         'their own pace; agents of this task (agent:do for the main agent, agent:responder, agent:confirm, ' +
         'agent:agent-<n>) are called when your turn ends, in order. The message is said in the task conversation. ' +
         '`agents` calls new agents in, after `to`; each becomes the next agent:agent-<n> (the returned message\'s `to` names them).',
@@ -569,7 +569,7 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
       description:
         'Redirect a request you received but cannot answer yourself to people who can — the question you were asked ' +
         'as a Responder, or a request a sub-task routed to you (pass its task_id). The request waits for them instead; ' +
-        'your own work is not interrupted. Audience selectors as for notify (people, teams, Avatars).',
+        'your own work is not interrupted. Audience selectors as for notify (people, teams, Avatārs).',
       inputSchema: {
         to: z.array(z.string()).min(1).max(32),
         note: z.string().trim().min(1).max(4_000),
@@ -595,7 +595,7 @@ export function createPlatformMcpServer(ops: PlatformOps, options: { tools?: Rea
     {
       description:
         'Request exact capabilities and/or additional projectIds for this task. Project expansion retains existing projects and applies the task authorization in added projects. The request appears in the task Approval Requests tab ' +
-        'and is routed to the selected tasks, people, teams, or Avatars. ' + PERMISSION_ROUTING +
+        'and is routed to the selected tasks, people, teams, or Avatārs. ' + PERMISSION_ROUTING +
         'Only a selected principal that already holds the requested capabilities and can grant the full task authorization across the expanded scope can approve; approval resumes the task ' +
         'with a newly scoped token. Do not request wildcards. Approval requests are high urgency by default; ' +
         'pass urgency to raise or lower how loudly the human is alerted. ' + REQUEST_FOR_TASK,

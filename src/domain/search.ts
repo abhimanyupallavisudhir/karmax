@@ -145,7 +145,7 @@ const PRIORITY_OPTIONS: FieldOption[] = PRIORITIES.map((p, i) => ({ value: Strin
  */
 export const FACET_OPTIONS: FieldOption[] = [
   { value: 'draft', label: 'Draft' },
-  { value: 'avatar', label: 'Avatar (forks act with its authorization)' },
+  { value: 'avatar', label: 'Avatār (forks act with its authorization)' },
   { value: 'awaiting-approval', label: 'Waiting for approval' },
   { value: 'archived', label: 'Archived' },
   { value: 'active', label: 'Running' },

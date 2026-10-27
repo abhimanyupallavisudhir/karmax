@@ -47,7 +47,7 @@ const NEW_AGENTS_PARAMETER = {
   type: 'array',
   maxItems: 8,
   description: 'Agents to call in: {provider, model?, effort?, prompt? (its instructions), resumeFrom? ({taskId, role?}: ' +
-    'fork that task agent, role default do; forking an Avatar you may call gives the agent its authorization)}.',
+    'fork that task agent, role default do; forking an Avatār you may call gives the agent its authorization)}.',
   items: {
     type: 'object',
     properties: {
@@ -828,7 +828,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'escalate_to_human',
     description:
-      'Ask named people, teams, or Avatars for what only a person can give: an approval, a secret, an action in the real world, a personal decision. ' +
+      'Ask named people, teams, or Avatārs for what only a person can give: an approval, a secret, an action in the real world, a personal decision. ' +
       'For anything an agent could answer, end your turn with the question instead; it goes to your task\'s usual input route (a sub-task\'s parent, else its Responder). ' +
       'This pauses your task at its exact stage and ends your turn. A reply resumes you, and the answer or question you end that turn with reaches them too. ' +
       'Audience selectors: avatar:<task id>, user:<id>, @team:<slug>, @creator, @maintainers, @admins, @superadmins, @owners, @project, or @all. ' +
@@ -841,7 +841,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
           items: { type: 'string' },
           maxItems: 32,
           // Required, but checked by the platform, whose refusal lists who can be asked.
-          description: 'Required. Who to ask: person/team/Avatar selectors; any of them may answer.',
+          description: 'Required. Who to ask: person/team/Avatār selectors; any of them may answer.',
         },
         message: {
           type: 'string',
@@ -859,7 +859,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     description:
       'Tell or call people and agents of this task without ending your turn. ' +
       'Notify a person only when you need them to do something; never for updates on your work. People (user:<id>, @team:<slug>, @creator, ' +
-      '@owners, @project, @maintainers, @admins, @all) and Avatars (avatar:<task id>) are notified now; agents of this task ' +
+      '@owners, @project, @maintainers, @admins, @all) and Avatārs (avatar:<task id>) are notified now; agents of this task ' +
       '(agent:do for the main agent, agent:responder, agent:confirm, agent:agent-<n>) are called when your turn ends, in order. ' +
       'The message is said in the task conversation. `agents` calls new agents in, after `to`; each becomes the next ' +
       'agent:agent-<n> (the returned message\'s `to` names them).',
@@ -879,7 +879,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     description:
       'Redirect a request you received but cannot answer yourself to people who can — the question you were asked as a ' +
       'Responder, or a request a sub-task routed to you (pass its task_id). The request waits for them instead; your own ' +
-      'work is not interrupted. Audience selectors as for notify (people, teams, Avatars).',
+      'work is not interrupted. Audience selectors as for notify (people, teams, Avatārs).',
     parameters: {
       type: 'object',
       properties: {
@@ -905,7 +905,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     name: 'request_permission',
     description:
       `Request exact ${BRAND} capabilities and/or additional projectIds for this task. Project expansion retains existing projects and applies the task authorization in added projects. The request appears in Approval Requests and is routed ` +
-      'to the selected tasks, people, teams, or Avatars. ' + PERMISSION_ROUTING + 'Only a selected principal that already ' +
+      'to the selected tasks, people, teams, or Avatārs. ' + PERMISSION_ROUTING + 'Only a selected principal that already ' +
       'holds the requested capabilities and can grant the full task authorization across the expanded scope can approve. Do not request wildcards. An approval or denial resumes the task. '
       + REQUEST_FOR_TASK,
     parameters: {
@@ -926,7 +926,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
           items: { type: 'string' },
           minItems: 1,
           maxItems: 32,
-          description: 'Task/person/team/Avatar selectors; any selected capable principal may decide. Omit to ask the nearest who can grant it.',
+          description: 'Task/person/team/Avatār selectors; any selected capable principal may decide. Omit to ask the nearest who can grant it.',
         },
         reason: {
           type: 'string',
@@ -1147,7 +1147,7 @@ export function platformToolHandlers(
       if (!audience.length) throw new Error('audience must name at least one person or team');
       if (audience.length > 32) throw new Error('at most 32 audience selectors may be used');
       const avatars = audience.filter((selector) => selector.startsWith('avatar:'));
-      if (avatars.length) throw new Error(`${avatars.join(', ')}: ask an Avatar with escalate_to_human`);
+      if (avatars.length) throw new Error(`${avatars.join(', ')}: ask an Avatār with escalate_to_human`);
       if (ctx.platformRequest) {
         const targets = await platformRequest('GET', '/api/agent/escalation-targets') as {
           users?: Array<{ selector: string }>; teams?: Array<{ selector: string }>; special?: Array<{ selector: string }>;

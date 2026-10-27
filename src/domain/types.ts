@@ -75,10 +75,13 @@ export interface AuthorizationSelection {
  * anyone granting it again. `callableBy` takes the audience selectors of task
  * routing (`@project`, `@maintainers`, `user:<id>`, `@team:<slug>`…); the task's
  * creator may always call it. `forksMayBeAvatars` lets a fork acting with this
- * authority be marked Avatar itself. */
+ * authority be marked Avatar itself. A fork may ask for less than it holds. */
 export interface AvatarSetting {
   callableBy: string[];
   forksMayBeAvatars?: boolean;
+  /** The roles its forks may play (`do`, `responder`, `confirm`, `agent`);
+   * absent: any. */
+  roles?: string[];
 }
 
 /** An Avatar as routing and authority read it: a view of a task whose params
@@ -96,6 +99,8 @@ export interface Avatar {
   prompt: string;
   callableBy: string[];
   forksMayBeAvatars: boolean;
+  /** The roles its forks may play; empty: any. */
+  roles: string[];
   authorization: AuthorizationSelection & {
     profileId: string;
     capabilities: string[];

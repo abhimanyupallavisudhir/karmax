@@ -150,6 +150,12 @@ ok(!chip.includes('class="af-resume-reuse-model" checked'), 'model reuse starts 
 ok(resumeChosenInner({ taskId: 'missing' }).includes('af-resume-reuse-model'), 'saved forks can reuse a source outside the current task list');
 ok(chip.includes('class="af-resume-clear"'), 'the chip keeps its clear button');
 ok(chip.includes('class="af-resume-reauthorize"') && chip.includes('Re-authorize previous grants?'), 'a source with known grants offers to re-authorize them');
+// An Avatār one may call: its authorization, granted without approval, lowerable in the form.
+S.avatars = [{ id: 'task_source', name: 'Source', callable: true }];
+const avatarChip = resumeChosenInner({ taskId: 'task_source', role: 'do' }, source);
+ok(avatarChip.includes('✦ Avatār') && avatarChip.includes('Its authorization') && !avatarChip.includes('Re-authorize previous grants?'),
+  'an Avatār source starts the fork from its authorization');
+S.avatars = [];
 ok(chip.includes('class="af-resume-reauth" hidden'), 'the option starts hidden until a form with grant controls claims it');
 ok(chip.includes('Project maintainer · Website, Billing + 2 credentials'), 'the option summarizes the level, scope and vault item grants it would apply');
 ok(resumeChosenInner({ taskId: 'task_source', role: 'confirm' }, source).includes('forking confirm agent of'), 'non-do roles are named');

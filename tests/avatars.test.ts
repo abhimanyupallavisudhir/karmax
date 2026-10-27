@@ -77,7 +77,7 @@ describe('Avatars are tasks', () => {
     const f = await fixture();
     expect(await f.store.avatarAvailability(f.project.id)).toEqual({ organization: true, project: 'inherit', effective: true });
     await f.store.kvSet(`avatars:project:${f.project.id}`, 'disabled');
-    await expect(f.saveAvatar()).rejects.toThrow('Avatars are disabled for this project');
+    await expect(f.saveAvatar()).rejects.toThrow('Avatārs are disabled for this project');
   });
 
   it('gives a fork by someone who may call it the Avatar’s authorization without a grant', async () => {
@@ -109,13 +109,71 @@ describe('Avatars are tasks', () => {
     const avatar = await f.saveAvatar();
     const dev = await f.tokenFor('dev');
     const forked = await f.fork(dev, avatar.id);
-    // The form re-sends its Authorization editor on every save; a fork ignores it.
-    await f.api.setTaskAuthorization(dev, forked.id, { level: 'developer', scope: 'projects', projectIds: [f.project.id] });
+    // The form re-sends its Authorization on every save: still granted by the
+    // Avatār, whether it keeps all of it or takes less.
+    await f.api.setTaskAuthorization(dev, forked.id, f.maintainer);
     expect(stored((await f.store.getTask(forked.id))!)).toMatchObject({ principal: `avatar:${avatar.id}`, level: 'maintainer' });
+    await f.api.setTaskAuthorization(dev, forked.id, { level: 'developer', scope: 'projects', projectIds: [f.project.id] });
+    expect(stored((await f.store.getTask(forked.id))!)).toMatchObject({ principal: `avatar:${avatar.id}`, level: 'developer' });
     // Editing the draft keeps the rule: it cannot become an Avatar itself.
-    await expect(f.api.updateArmedParams(dev, forked.id, { avatar: {} })).rejects.toThrow('can\'t be Avatars themselves');
+    await expect(f.api.updateArmedParams(dev, forked.id, { avatar: {} })).rejects.toThrow('can\'t be Avatārs themselves');
     // And the developer may start it.
     await expect(f.api.queueTask(dev, forked.id)).resolves.toMatchObject({ id: forked.id });
+  });
+
+  it('lets a fork take less than the Avatār’s authorization, but not more', async () => {
+    const f = await fixture();
+    const avatar = await f.saveAvatar();
+    const dev = await f.tokenFor('dev');
+    const developer: AuthorizationSelection = { level: 'developer', scope: 'projects', projectIds: [f.project.id] };
+    const less = await f.api.createTask(dev, { projectId: f.project.id, draft: true, prompt: 'Less', authorization: developer,
+      params: { 'agent:do': { provider: 'mock', resumeFrom: { taskId: avatar.id, role: 'do' } } } });
+    expect(stored(less)).toMatchObject({ principal: `avatar:${avatar.id}`, level: 'developer' });
+    expect((await taskAuthorityNow(f.store, f.authorization, less)).capabilities).not.toContain('review:approve');
+    // A narrower Avatār cannot be forked into a wider authorization.
+    const narrow = await f.api.createTask(f.owner, { projectId: f.project.id, draft: true, prompt: 'Narrow',
+      authorization: developer, params: { avatar: {} } });
+    await expect(f.api.createTask(dev, { projectId: f.project.id, draft: true, prompt: 'More', authorization: f.maintainer,
+      params: { 'agent:do': { provider: 'mock', resumeFrom: { taskId: narrow.id, role: 'do' } } } }))
+      .rejects.toThrow(/a fork can take that or less/);
+    // A Responder forking it may take less too.
+    const responder = await f.api.createTask(dev, { projectId: f.project.id, draft: true, prompt: 'x',
+      params: { responder: { kind: 'agent', provider: 'mock', resumeFrom: { taskId: avatar.id, role: 'do' },
+        authority: { authorization: developer } } } });
+    expect((responder.params._agentAuthorization as any).responder).toMatchObject({ principal: `avatar:${avatar.id}`, level: 'developer' });
+  });
+
+  it('can be limited to some roles, judged when forked and on every turn', async () => {
+    const f = await fixture();
+    const avatar = await f.saveAvatar({ roles: ['responder', 'confirm'] });
+    expect(avatar.params.avatar).toEqual({ callableBy: ['@project'], roles: ['responder', 'confirm'] });
+    const dev = await f.tokenFor('dev');
+    await expect(f.fork(dev, avatar.id)).rejects.toThrow('can\'t be forked as a task’s agent');
+    const asResponder = await f.api.createTask(dev, { projectId: f.project.id, draft: true, prompt: 'x',
+      params: { responder: { kind: 'agent', provider: 'mock', resumeFrom: { taskId: avatar.id, role: 'do' } } } });
+    expect(asResponder.id).toBeTruthy();
+    // Every role named is no restriction at all.
+    expect((await f.saveAvatar({ roles: ['do', 'responder', 'confirm', 'agent'] })).params.avatar).toEqual({ callableBy: ['@project'] });
+    // Narrowing the roles later withdraws a fork's authority at its next turn.
+    const open = await f.saveAvatar();
+    const forked = await f.fork(dev, open.id);
+    expect((await taskAuthorityNow(f.store, f.authorization, forked)).capabilities).toContain('review:approve');
+    await f.store.patchTaskParams(open.id, { avatar: { callableBy: ['@project'], roles: ['responder'] } });
+    expect((await taskAuthorityNow(f.store, f.authorization, forked)).capabilities).toEqual([]);
+  });
+
+  it('puts a draft edited to fork it on its authorization and in its budget pool at once', async () => {
+    const f = await fixture();
+    const avatar = await f.saveAvatar();
+    const dev = await f.tokenFor('dev');
+    const draft = await f.api.createTask(dev, { projectId: f.project.id, draft: true, prompt: 'Plain' });
+    expect(stored(draft).principal).toBe('user:dev');
+    // A developer may set its cards and budget: within the pool they only narrow it.
+    await f.api.updateArmedParams(dev, draft.id, { 'agent:do': { provider: 'mock', resumeFrom: { taskId: avatar.id, role: 'do' } },
+      paymentPolicy: { cardIds: [], budget: 500, currency: 'usd' } });
+    const edited = (await f.store.getTask(draft.id))!;
+    expect(stored(edited)).toMatchObject({ principal: `avatar:${avatar.id}`, level: 'maintainer' });
+    expect((await f.store.paymentBudgetFamily(draft.id)).ancestorIds).toEqual([avatar.id]);
   });
 
   it('treats a fork by someone who may not call it as an ordinary fork', async () => {
@@ -158,7 +216,7 @@ describe('Avatars are tasks', () => {
     const f = await fixture();
     const closed = await f.saveAvatar();
     const dev = await f.tokenFor('dev');
-    await expect(f.fork(dev, closed.id, { avatar: {} })).rejects.toThrow('can\'t be Avatars themselves');
+    await expect(f.fork(dev, closed.id, { avatar: {} })).rejects.toThrow('can\'t be Avatārs themselves');
     const open = await f.saveAvatar({ forksMayBeAvatars: true });
     const child = await f.fork(dev, open.id, { avatar: { callableBy: ['user:dev'] } });
     // The child Avatar is backed by its parent, so its own forks still reach the owner's grant.
@@ -170,13 +228,13 @@ describe('Avatars are tasks', () => {
     expect((await taskAuthorityNow(f.store, f.authorization, grandchild)).capabilities).toEqual([]);
   });
 
-  it('gives a Responder that forks it the Avatar’s authority instead of its own', async () => {
+  it('gives a Responder that forks it the Avatar’s authority, granted by the Avatār', async () => {
     const f = await fixture();
     const avatar = await f.saveAvatar();
     const task = await f.api.createTask(await f.tokenFor('dev'), { projectId: f.project.id, draft: true, prompt: 'x',
       params: { responder: { kind: 'agent', provider: 'mock', resumeFrom: { taskId: avatar.id, role: 'do' },
         authority: { authorization: f.maintainer } } } });
-    expect((task.params._agentAuthorization ?? {}) as object).not.toHaveProperty('responder');
+    expect((task.params._agentAuthorization as any).responder).toMatchObject({ principal: `avatar:${avatar.id}`, level: 'maintainer' });
     expect(await avatarForRole(f.store, { taskId: task.id, projectId: f.project.id,
       agents: { responder: (task.params.responder as any) } }, 'responder')).toMatchObject({ id: avatar.id });
   });

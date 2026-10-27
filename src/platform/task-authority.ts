@@ -3,7 +3,7 @@ import type { Store } from '../store/db.js';
 import { VaultItems } from '../autonomy/vault-items.js';
 import { allows, attenuate, CHILD_TASK_CEILING, type Capability } from './capabilities.js';
 import { PermissionRequests } from './permission-requests.js';
-import { authorizingAvatar, avatarAuthorizationCapabilities, avatarForRole } from './avatars.js';
+import { authorizingAvatar, avatarAllows, avatarAuthorizationCapabilities, avatarForRole, avatarRoleFor } from './avatars.js';
 import type { AuthorizationService } from './authorization.js';
 import type { TokenAuthority } from './tokens.js';
 import { delegatedFromParent } from './delegation.js';
@@ -68,7 +68,8 @@ export async function taskAuthorityNow(store: Store, authorization: Authorizatio
   ])];
   if (runsAs || backed) {
     const avatar = runsAs ?? await authorizingAvatar(store, task, authorizer);
-    capabilities = attenuate(capabilities, avatar ? await avatarAuthorizationCapabilities(store, authorization, avatar, task.projectId) : []);
+    const allowed = !runsAs || avatarAllows(runsAs, (await avatarRoleFor(store, task.id, 'do')));
+    capabilities = attenuate(capabilities, avatar && allowed ? await avatarAuthorizationCapabilities(store, authorization, avatar, task.projectId) : []);
   }
   return { ...base, capabilities };
 }

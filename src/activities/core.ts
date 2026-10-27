@@ -65,7 +65,7 @@ import type { AuthorizationService } from '../platform/authorization.js';
 import { CredentialBroker } from '../autonomy/broker.js';
 import { VaultItems, removeTurnKeys, turnKeyDirectory } from '../autonomy/vault-items.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
-import { authorizingAvatar, avatarAuthorizationCapabilities, avatarForRole, avatarPrincipal } from '../platform/avatars.js';
+import { authorizingAvatar, avatarAllows, avatarAuthorizationCapabilities, avatarForRole, avatarPrincipal, avatarRoleFor } from '../platform/avatars.js';
 import { DELEGATED_PROFILE, delegatedFromParent } from '../platform/delegation.js';
 import { baseTaskAuthority, delegationReaching, taskAuthorityNow, tokenScopeOf } from '../platform/task-authority.js';
 import { GitProfiles, userGitScope } from '../autonomy/git-profiles.js';
@@ -1495,7 +1495,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       organizationId?: string;
       delegationId?: string;
     } | undefined;
-    const delegatedAuthorization = avatar?.authorization;
+    // A fork acting for an Avatar acts with what it chose of the Avatar's
+    // authorization (stored backed by it), else all of it — and with nothing
+    // when the Avatar no longer lets it play this role.
+    const chosen = avatar && storedAuthorization?.principal === avatarPrincipal(avatar.id) ? storedAuthorization : undefined;
+    const roleAllowed = !avatar || avatarAllows(avatar, (await avatarRoleFor(store, args.taskId, participant)));
+    const delegatedAuthorization = chosen ?? avatar?.authorization;
     // A task may have been authorized by a routed Avatar without itself using
     // that Avatar as its role profile. Re-evaluate that delegation on every
     // turn so disabling the authorizer, narrowing its authority, or revoking
@@ -1507,8 +1512,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     const authorizingAvatarBackingCaps = authorizer
       ? (await avatarAuthorizationCapabilities(store, deps.authorization, authorizer, args.task.projectId))
       : [];
+    const avatarGrant = avatar && roleAllowed
+      ? (await avatarAuthorizationCapabilities(store, deps.authorization, avatar, args.task.projectId)) : [];
     const principalGrant = avatar
-      ? (await avatarAuthorizationCapabilities(store, deps.authorization, avatar, args.task.projectId))
+      ? chosen ? attenuate(chosen.capabilities ?? [], avatarGrant) : avatarGrant
       : authorizingAvatarId
         ? attenuate(storedAuthorization?.capabilities ?? [], authorizingAvatarBackingCaps)
         : storedAuthorization?.capabilities ?? args.task.grant ?? DEFAULT_GRANT;

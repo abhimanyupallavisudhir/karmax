@@ -9595,11 +9595,15 @@ export class Store {
     const projectId = await this.taskProjectIdAsync(taskId);
     const organizationId = projectId ? await this.projectOrganizationAsync(projectId) : undefined;
     if (!organizationId) return { taskIds: [taskId], ancestorIds: [] };
-    const rows = await this.db.prepare(`SELECT t.id, t.parentTaskId, t.createdBy FROM tasks t
+    const rows = await this.db.prepare(`SELECT t.id, t.parentTaskId, t.createdBy,
+      json_extract(t.params, '$._authorization.principal') AS authorizer FROM tasks t
       JOIN projects p ON p.id=t.projectId WHERE p.organizationId=?`).all(organizationId) as any[];
+    // A fork acting for an Avatār spends from the Avatār's budget: the Avatār
+    // is its budget parent, so every fork of it shares one pool.
     const parents = new Map<string, string | undefined>(rows.map(row => {
       const creator = row.createdBy ? JSON.parse(row.createdBy) : undefined;
-      return [row.id, row.parentTaskId ?? (creator?.kind === 'task-agent' ? creator.taskId : undefined)];
+      const avatar = typeof row.authorizer === 'string' && row.authorizer.startsWith('avatar:') ? row.authorizer.slice(7) : undefined;
+      return [row.id, row.parentTaskId ?? avatar ?? (creator?.kind === 'task-agent' ? creator.taskId : undefined)];
     }));
     const ancestors = (id: string) => {
       const seen = new Set<string>([id]);

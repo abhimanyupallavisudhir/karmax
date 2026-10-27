@@ -26,15 +26,15 @@ function section(value) {
     policyTip: (text) => `<button class="info-dot" title="${text}">ⓘ</button>`,
     audienceComboHtml: (className, value) => `<input class="${className}" value="${value}">`,
   });
-  vm.runInContext(`${constant('AVATAR_DISCLAIMER')}\n${fn('avatarSectionHtml')}`, context);
+  vm.runInContext(`${constant('AVATAR_DISCLAIMER')}\n${constant('AVATAR_ROLE_CHOICES')}\n${fn('avatarSectionHtml')}`, context);
   return context.avatarSectionHtml(value);
 }
 
 test('the form’s Avatar row: the setting, its red risk label and full disclaimer, then its options', () => {
   const off = section(undefined);
-  assert.match(off, /<input type="checkbox" id="tf-avatar" > Avatar/);
+  assert.match(off, /<input type="checkbox" id="tf-avatar" > Avatār/);
   assert.match(off, /\(automatically grants future forks the same authorizations\)/);
-  assert.match(off, /<span class="risk-chip">! At your own risk<\/span><button class="info-dot" title="Forks of an Avatar act with its authorization/);
+  assert.match(off, /<span class="risk-chip">! At your own risk<\/span><button class="info-dot" title="Forks of an Avatār act with its authorization/);
   assert.match(off, /class="tf-avatar-options" hidden/);
   assert.match(off, /class="tf-avatar-callers" value="@project"/, 'callable by the project by default');
   const on = section({ callableBy: ['@maintainers', 'user:dev'], forksMayBeAvatars: true });
@@ -42,25 +42,32 @@ test('the form’s Avatar row: the setting, its red risk label and full disclaim
   assert.match(on, /class="tf-avatar-options" >/);
   assert.match(on, /value="@maintainers, user:dev"/);
   assert.match(on, /id="tf-avatar-forks" checked/);
+  // Forked as: every role, until some are unticked.
+  assert.equal((off.match(/value="(do|responder|confirm|agent)" checked/g) || []).length, 4);
+  const some = section({ callableBy: ['@project'], roles: ['responder'] });
+  assert.match(some, /value="responder" checked/);
+  assert.match(some, /value="do" >/);
 });
 
 test('reading the row: nothing unticked, the callers and the forks option ticked', () => {
   const context = vm.createContext({});
-  vm.runInContext(fn('readAvatarSection'), context);
-  const root = (checked, callers, forks) => ({ querySelector: (selector) => ({
-    '#tf-avatar': { checked }, '.tf-avatar-callers': { value: callers }, '#tf-avatar-forks': { checked: forks } })[selector] });
+  vm.runInContext(`${constant('AVATAR_ROLE_CHOICES')}\n${fn('readAvatarSection')}`, context);
+  const root = (checked, callers, forks, roles = ['do', 'responder', 'confirm', 'agent']) => ({ querySelector: (selector) => ({
+    '#tf-avatar': { checked }, '.tf-avatar-callers': { value: callers }, '#tf-avatar-forks': { checked: forks } })[selector],
+    querySelectorAll: () => roles.map((value) => ({ value })) });
   assert.equal(context.readAvatarSection(root(false, '@project', true)), undefined);
   const read = (...args) => JSON.parse(JSON.stringify(context.readAvatarSection(root(...args))));
   assert.deepEqual(read(true, ' @team:ops, user:dev ', false), { callableBy: ['@team:ops', 'user:dev'] });
   assert.deepEqual(read(true, '', true), { callableBy: ['@project'], forksMayBeAvatars: true });
+  assert.deepEqual(read(true, '@project', false, ['responder', 'confirm']), { callableBy: ['@project'], roles: ['responder', 'confirm'] });
 });
 
 test('the form saves an Avatar only once its risk is acknowledged, and offers saving one without running', () => {
   assert.match(app, /const avatar = avatarCommitted \? readAvatarSection\(\$\('#tf-body'\)\) : undefined;/);
-  assert.match(app, /<button class="btn" id="tf-save-avatar" \$\{values\.avatar \? '' : 'hidden'\}>Save as Avatar without running<\/button>/);
+  assert.match(app, /<button class="btn" id="tf-save-avatar" \$\{values\.avatar \? '' : 'hidden'\}>Save as Avatār without running<\/button>/);
   assert.match(app, /\$\('#tf-save-avatar'\)\?\.addEventListener\('click', \(\) => submitCommitted\(true\)\);/);
   assert.match(app, /\$\('#tf-queue'\)\.addEventListener\('click', \(\) => submitCommitted\(false\)\);/);
-  assert.match(fn('confirmAvatar'), /Avatars automatically grant their authorizations to their future forks\./);
+  assert.match(fn('confirmAvatar'), /Avatārs automatically grant their authorizations to their future forks\./);
   assert.match(fn('confirmAvatar'), /Don’t show this again/);
 });
 
@@ -122,15 +129,15 @@ for (const scope of ['organization', 'project']) {
         if (options) { writes.push({ url, body: JSON.parse(options.body) }); return {}; }
         return scope === 'organization' ? { enabled: true } : { organization: true, project: 'inherit', effective: true };
       },
-      AVATAR_DISCLAIMER: 'Forks of an Avatar act with its authorization.',
+      AVATAR_DISCLAIMER: 'Forks of an Avatār act with its authorization.',
       loadAvatars: async () => {}, renderMain: () => { renders++; }, toast: () => {},
       policyTip: (text) => `<button class="info-dot" title="${text}">ⓘ</button>`,
       paneError: (_, error) => { throw error; },
     });
     vm.runInContext(hydrateSource, context);
     await context.hydrateAvatarAvailability(scope, 'example');
-    assert.match(box.innerHTML, /Disable Avatars/);
-    assert.match(box.innerHTML, /Forks of an Avatar act with its authorization/);
+    assert.match(box.innerHTML, /Disable Avatārs/);
+    assert.match(box.innerHTML, /Forks of an Avatār act with its authorization/);
     await listeners['.avatar-availability-toggle']({ currentTarget: {} });
     assert.deepEqual(writes[0], { url: `/api/${scope === 'project' ? 'projects' : 'organizations'}/example/avatar-settings`, body: scope === 'project' ? { value: 'disabled' } : { enabled: false } });
     assert.equal(renders, 1);

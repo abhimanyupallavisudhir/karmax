@@ -5402,19 +5402,28 @@ export class Gateway {
           await api.setTaskPaymentPolicy(token, task.id, body);
           if (this.deps.paymentRegistry || this.deps.payments) {
             const service = new BudgetService(store, this.deps.paymentRegistry ?? this.deps.payments!);
-            const results = await service.reconcileTask({ projectId: task.projectId, taskId: task.id });
-            released = results.filter(r => r.status === 'granted').map(r => r.requestId!);
-            if (released.length) await api.signalTask(token, task.id, 'followUp',
-              `Payment requests ${released.join(', ')} now fit the task budget and are ready. Continue using the same requests.`).catch(() => undefined);
+            // The budget may be a pool (an Avatār's, shared by its forks): what
+            // now fits anywhere in it is released, each task told of its own.
+            const family = (await store.paymentBudgetFamily(task.id)).taskIds;
+            for (const memberId of [task.id, ...family.filter((id) => id !== task.id)]) {
+              const member = memberId === task.id ? task : (await store.getTask(memberId));
+              if (!member) continue;
+              const results = await service.reconcileTask({ projectId: member.projectId, taskId: member.id });
+              const granted = results.filter(r => r.status === 'granted').map(r => r.requestId!);
+              if (member.id === task.id) released = granted;
+              if (granted.length) await api.signalTask(token, member.id, 'followUp',
+                `Payment requests ${granted.join(', ')} now fit the task budget and are ready. Continue using the same requests.`).catch(() => undefined);
+            }
           }
         }
         const policy = (await resolvePaymentPolicy(store, task.projectId, task.id));
         const cards = (await store.listCards(task.projectId)).filter(card => policy.cardIds.includes(card.id))
           .map(({ id, label, last4, status, currency }) => ({ id, label, last4, status, currency }));
         return this.json(res, 200, { ...policy, cards,
-          canEdit: !['done', 'cancelled', 'failed'].includes(task.lastView?.status ?? '')
+          canEdit: (!!task.params?.avatar || !['done', 'cancelled', 'failed'].includes(task.lastView?.status ?? ''))
             && (await this.deps.tokens.check(token, 'payment:write', { projectId: task.projectId })).ok,
-          spent: (await store.paymentSpent(task.id, false, policy.currency)), released });
+          // An Avatār's budget is shared by its forks: what all of them spent.
+          spent: (await store.paymentSpent(task.id, !!task.params?.avatar, policy.currency)), released });
       }
       const deliverData = p.match(/^\/api\/tasks\/([^/]+)\/deliver-data$/);
       if (deliverData && method === 'POST') {
