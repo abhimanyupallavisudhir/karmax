@@ -205,43 +205,138 @@ describe('events in the console', () => {
     expect(elsewhere.errors).toEqual([]);
   });
 
-  it('opens a store task to read it without running or installing it', async () => {
+  it('opens a store task as the task form, every field editable, without taking it', async () => {
     const before = (await store.listTasks(project.id)).length;
     const { page, errors } = await open('/personal/factory?q=is%3Astore');
     const row = page.locator('.store-row[data-store-task="build-planned-issues"]');
     await row.waitFor();
     await row.click({ position: { x: 40, y: 12 } });
     await expect.poll(() => page.url()).toMatch(/\/personal\/factory\/store\/build-planned-issues$/);
-    const storePage = page.locator('[data-store-page="build-planned-issues"]');
-    await storePage.waitFor();
-    expect(await storePage.locator('h2').textContent()).toBe('Build planned issues');
-    expect(await storePage.locator('.tp-head .meta').textContent()).toBe('on github.issues.labeled · label.name is planned');
-    expect(await storePage.locator('.store-summary').textContent()).toContain('Label a GitHub issue');
-    expect(await storePage.locator('.store-prompt').textContent()).toContain('Build what the GitHub issue below asks for');
-    expect(await storePage.locator('.tp-foot').textContent()).toContain('Needs GitHub');
-    expect(await storePage.locator('[data-store-run]').isDisabled()).toBe(true);
-    if (process.env.KARMAX_SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.KARMAX_SCREENSHOT_DIR, 'store-task-page.png') });
+    const form = page.locator('#tf-page:not([aria-busy])');
+    await form.waitFor();
+    expect(await form.locator('.tf-head h2').textContent()).toBe('Build planned issues');
+    expect(await form.locator('[data-field="prompt"]').inputValue()).toContain('Build what the GitHub issue below asks for');
+    expect(await form.locator('#ev-type').inputValue()).toBe('github.issues.labeled');
+    expect(await form.locator('#ev-conds .ev-path').inputValue()).toBe('label.name');
+    expect(await form.locator('#ev-conds .ev-val').inputValue()).toBe('planned');
+    expect(await form.locator('#trig-repeatable').isChecked()).toBe(true);
+    expect(await form.locator('#tf-queue').textContent()).toMatch(/^Install/);
+    expect(await form.locator('.tf-foot .store-need').textContent()).toBe('Needs GitHub');
+    // Not a template picked from `n`: the store entry is what it starts from.
+    expect(await form.locator('#tf-template').count()).toBe(0);
+    if (process.env.KARMAX_SCREENSHOT_DIR) {
+      await page.waitForTimeout(600); // the page's entrance animation
+      await page.screenshot({ path: path.join(process.env.KARMAX_SCREENSHOT_DIR, 'store-task-form.png') });
+    }
+    // Unticked, it runs once instead of installing.
+    await form.locator('#trig-repeatable').uncheck();
+    expect(await form.locator('#tf-queue').textContent()).toMatch(/^Run task/);
+    await form.locator('#trig-repeatable').check();
     // Esc goes back to the store it was opened from; nothing was taken.
     await page.keyboard.press('Escape');
     await expect.poll(() => page.url()).toMatch(/\/personal\/factory\?q=is(:|%3A)store$/);
     await row.waitFor();
+    expect(await page.locator('#tf-page').count()).toBe(0);
     expect((await store.listTasks(project.id)).length).toBe(before);
 
-    // The keyboard opens it too, and a permalink paints the page by itself.
+    // The keyboard opens it too, and a permalink paints the form by itself.
     await page.locator('.store-row[data-store-task="project-wiki"]').focus();
     await page.keyboard.press('o');
     await expect.poll(() => page.url()).toMatch(/\/store\/project-wiki$/);
     const fresh = await open('/personal/factory/store/project-wiki');
-    await fresh.page.locator('[data-store-page="project-wiki"] .store-prompt').waitFor();
-    expect(await fresh.page.locator('.store-prompt').textContent()).toContain('Set up this project');
-    expect(await fresh.page.locator('[data-store-run]').textContent()).toBe('Run');
-    expect(await fresh.page.locator('.tp-head .meta').count()).toBe(0);
+    await fresh.page.locator('#tf-page:not([aria-busy]) [data-field="prompt"]').waitFor();
+    expect(await fresh.page.locator('[data-field="prompt"]').inputValue()).toContain('Set up this project');
+    expect(await fresh.page.locator('#tf-queue').textContent()).toMatch(/^Run task/);
+    expect(await fresh.page.locator('#trig-repeatable').isChecked()).toBe(false);
     // An entry the store does not have lands on the store.
     const missing = await open('/personal/factory/store/no-such-task');
     await expect.poll(() => missing.page.url()).toMatch(/\/personal\/factory\?q=is(:|%3A)store$/);
     await missing.page.locator('.store-row').first().waitFor();
     expect((await store.listTasks(project.id)).length).toBe(before);
     expect([...errors, ...fresh.errors, ...missing.errors]).toEqual([]);
+  });
+
+  it('runs and installs a store task as changed in its form', async () => {
+    const { page, errors } = await open('/personal/factory/store/project-wiki');
+    const form = page.locator('#tf-page:not([aria-busy])');
+    await form.locator('[data-field="prompt"]').fill('Write the wiki, but only for the API.');
+    await form.locator('#tf-queue').click();
+    await expect.poll(() => page.url()).toMatch(/\/personal\/factory\/tasks\/\d+$/);
+    const run = (await store.listTasks(project.id)).find((task) => task.params?.template === 'project-wiki')!;
+    expect(run.title).toBe('Auto-create project wiki (memories, skills, AGENTS.md)');
+    expect(run.params.prompt).toBe('Write the wiki, but only for the API.');
+    expect(run.params.draft).toBeFalsy();
+
+    // A changed automation keeps its run title and its place in the store.
+    await page.goto(`${base}/personal/factory/store/build-planned-issues`);
+    await form.locator('#ev-conds .ev-val').fill('ready');
+    await form.locator('[data-field="prompt"]').fill('Build the issue below; keep the change small.');
+    await form.locator('#tf-queue').click();
+    await expect.poll(() => page.url()).toMatch(/\/personal\/factory\?q=is(:|%3A)store$/);
+    const series = (await store.listTasks(project.id)).find((task) => task.params?.template === 'build-planned-issues')!;
+    expect(series.title).toBe('#{{issue.number}} {{issue.title}}');
+    expect(series.params).toMatchObject({ repeatable: true, triggerState: 'armed', prompt: 'Build the issue below; keep the change small.',
+      triggers: [{ type: 'github.issues.labeled', where: { 'label.name': 'ready' } }] });
+    const row = page.locator('.store-row[data-store-task="build-planned-issues"]');
+    await expect.poll(async () => row.textContent()).toMatch(/installed[\s\S]*Open/);
+    // Installed, its row still opens the form, to install another (say, for another label).
+    await row.click({ position: { x: 40, y: 12 } });
+    await form.locator('#ev-conds .ev-val').waitFor();
+    expect(await form.locator('.tf-foot .store-need').textContent()).toBe('Installed already');
+    await form.locator('#ev-conds .ev-val').fill('urgent');
+    await form.locator('#tf-queue').click();
+    await expect.poll(() => page.url()).toMatch(/\/personal\/factory\?q=is(:|%3A)store$/);
+    const both = (await store.listTasks(project.id)).filter((task) => task.params?.template === 'build-planned-issues');
+    expect(both.map((task) => (task.params.triggers as any)[0].where['label.name']).sort()).toEqual(['ready', 'urgent']);
+    await expect.poll(async () => row.locator('.chip').textContent()).toBe('2 installed');
+    // Open lists them both.
+    await row.locator('a', { hasText: 'Open' }).click();
+    await expect.poll(() => page.url()).toMatch(/q=store(:|%3A)build-planned-issues(\+|%20)is(:|%3A)series$/);
+    await expect.poll(async () => page.locator('#main .series-row').count()).toBe(2);
+    for (const task of [...both, run]) await store.deleteTask(task.id);
+    expect(errors).toEqual([]);
+  });
+
+  it('asks which project a store task is for on the organization home', async () => {
+    const other = await store.createProject('Website');
+    try {
+      const { page, errors } = await open('/personal?q=is%3Astore');
+      const row = page.locator('.store-row[data-store-task="triage-issues"]');
+      await row.waitFor();
+      // Nothing about a project nobody chose: no installed/needs state, no one-click run.
+      expect(await page.locator('.store-row [data-store-run]').count()).toBe(0);
+      expect(await row.locator('[data-store-choose]').first().textContent()).toBe('Install…');
+      expect(await row.textContent()).not.toContain('Needs GitHub');
+      await row.click({ position: { x: 40, y: 12 } });
+      const picker = page.locator('.store-project-picker');
+      await picker.waitFor();
+      expect(await picker.locator('.opt').count()).toBe(2);
+      await picker.locator('#sp-in').fill('webs');
+      await page.keyboard.press('Enter');
+      await expect.poll(() => page.url()).toMatch(/\/personal\/website\/store\/triage-issues$/);
+      const form = page.locator('#tf-page:not([aria-busy])');
+      await form.waitFor();
+      expect(await form.locator('#tf-project').textContent()).toContain('website');
+      // Another project from the form: the same store task there, with what you wrote.
+      await form.locator('[data-field="prompt"]').fill('Triage only bug reports.');
+      await form.locator('#tf-project').click();
+      await form.locator('.project-pick-opt', { hasText: 'factory' }).click();
+      await expect.poll(() => page.url()).toMatch(/\/personal\/factory\/store\/triage-issues$/);
+      await expect.poll(async () => page.locator('#tf-page:not([aria-busy]) [data-field="prompt"]').inputValue()).toBe('Triage only bug reports.');
+      expect(await page.locator('#tf-page .tf-head h2').textContent()).toBe('Triage issues daily');
+      expect(await page.locator('#trig-repeatable').isChecked()).toBe(true);
+      // Back returns to the home it was chosen on; nothing was taken anywhere.
+      await page.keyboard.press('Escape');
+      await expect.poll(() => page.url()).toMatch(/\/personal\?q=is(:|%3A)store$/);
+      expect((await store.listTasks(other.id)).length).toBe(0);
+      expect((await store.listTasks(project.id)).filter((task) => task.params?.template === 'triage-issues')).toEqual([]);
+      if (process.env.KARMAX_SCREENSHOT_DIR) {
+        await row.locator('[data-store-choose]').first().click();
+        await picker.waitFor();
+        await page.screenshot({ path: path.join(process.env.KARMAX_SCREENSHOT_DIR, 'store-choose-project.png') });
+      }
+      expect(errors).toEqual([]);
+    } finally { await store.deleteProject(other.id); }
   });
 
   it('runs and installs from the Task store view; a deleted series is on offer again', async () => {
@@ -286,14 +381,6 @@ describe('events in the console', () => {
     // The rest of the query filters the store by its words.
     await page.locator('#task-search').fill('is:store planned');
     await expect.poll(async () => page.locator('.store-row').count()).toBe(1);
-    // Its page installs it as well, and then opens what it installed.
-    await row('build-planned-issues').click({ position: { x: 40, y: 12 } });
-    const storePage = page.locator('[data-store-page="build-planned-issues"]');
-    await storePage.locator('[data-store-run]:not([disabled])').click();
-    await expect.poll(async () => storePage.locator('.tp-head .chip').textContent()).toBe('installed');
-    await storePage.locator('.tp-foot a', { hasText: 'Open' }).click();
-    await page.locator('#sd-delete').waitFor();
-
     // Settings no longer carries a gallery.
     await page.goto(`${base}/personal/factory/settings#project-events`);
     await page.locator('#project-events-box [data-pe-new="webhook"]').waitFor();

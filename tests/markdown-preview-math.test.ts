@@ -14,7 +14,7 @@ describe('Markdown preview math', () => {
       S.taskTab = 'checkin';
       const v = { taskId: 't1' };
       window.renderTaskPage = () => {
-        $('#main').innerHTML = explainMessageAffordance({ sourceKey: 'message:1', conversationRole: 'do' }, v);
+        $('#main').innerHTML = explainMessageAffordance({ sourceKey: 'message:1', conversationRole: 'do', message: { text: 'Area: $x^2$' } }, v);
         wireExplainMessages(v);
       };
       renderTaskPage();

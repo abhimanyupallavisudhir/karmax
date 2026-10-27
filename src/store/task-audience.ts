@@ -67,13 +67,9 @@ export function* humanAudience(taskOrId: AudienceTask | string, requested?: stri
         visited.add(candidate.id);
         const creator: TaskRecord['createdBy'] = candidate.createdBy;
         if (creator?.kind === 'user') { users.add(creator.userId); break; }
-        if (creator?.kind === 'avatar') {
-          const [avatar] = yield* rows('SELECT json FROM avatars WHERE id=? AND deletedAt IS NULL', [creator.avatarId]);
-          const ownerUserId = avatar ? JSON.parse(avatar.json).ownerUserId : undefined;
-          if (ownerUserId) users.add(ownerUserId);
-          break;
-        }
-        candidate = creator?.kind === 'task-agent' ? yield* taskMetadata(creator.taskId) : undefined;
+        // An Avatar is a task: its creator is the creator's creator.
+        candidate = creator?.kind === 'task-agent' ? yield* taskMetadata(creator.taskId)
+          : creator?.kind === 'avatar' ? yield* taskMetadata(creator.avatarId) : undefined;
       }
       if (users.size === before) for (const member of yield* organizationMembers(project.organizationId))
         if (member.role === 'owner') users.add(member.userId);

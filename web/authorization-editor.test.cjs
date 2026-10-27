@@ -87,10 +87,10 @@ ok(source.includes('api(`/api/authorization/escalation-targets?projectId=${encod
 // The gateway scopes a session to the project in the URL, never the body: a
 // body-only project made it check the owner's global grants and refuse them.
 ok(!/api\('\/api\/authorization-requests', \{ method: 'POST'/.test(source)
-  && (source.match(/api\(`\/api\/authorization-requests\?projectId=/g) || []).length === 3,
+  && (source.match(/api\(`\/api\/authorization-requests\?projectId=/g) || []).length === 2,
   'authorization requests name their project in the URL');
-ok(source.includes("target: { kind: 'task'") && source.includes("target: { kind: 'avatar'"),
-  'both task and Avatar creation can route approval to the target resource');
+ok(source.includes("target: { kind: 'task'") && !source.includes("target: { kind: 'avatar'"),
+  'approval is routed to the task it is for (an Avatar is a task)');
 ok(source.includes('Awaiting a routed approver') && source.includes('request.recipients.includes(signedInUserId)'),
   'only a routed human sees controls for deciding an authorization request');
 

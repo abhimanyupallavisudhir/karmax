@@ -22,7 +22,7 @@ const context = vm.createContext({
   taskRecord: () => undefined, numLabel: (id) => id, taskUrl: (id, rec) => `/acme/web/tasks/${rec?.num ?? id}`,
   S: { prApprovals: {} },
 });
-vm.runInContext(['branchPullRequestState', 'pullRequestLanes', 'pullRequestRows', 'proposalState', 'checkoutsSection',
+vm.runInContext(['branchPullRequestState', 'pullRequestLanes', 'pullRequestRows', 'proposalState', 'checkoutLabel', 'checkoutsSection',
   'pullRequestLink', 'pullRequestChip', 'approvePullRequestButton', 'pullRequestAsks', 'conversationPullRequestAsks'].map(extract).join('\n'), context);
 const row = (html, name) => html.split('<div class="checkout-row').find((part) => part.includes(`<b>${name}</b>`)) ?? '';
 const lane = (checkout, childTaskId, state = 'open') =>
@@ -180,4 +180,11 @@ test('Branches comes first in the details rail', () => {
   const rail = extract('taskRail');
   assert.ok(rail.indexOf('checkoutsSection(v)') < rail.indexOf("section('Attempts'"), 'above Attempts');
   assert.ok(rail.indexOf('checkoutsSection(v)') < rail.indexOf('subTasksSection(v)'), 'above Sub-tasks');
+});
+
+test('the project wiki checkout is named Wiki, its folder kept on hover', () => {
+  const html = context.checkoutsSection({ stage: 'do', status: 'active', targetBranch: 'main', actions: [], worldWiki: 'proj_abc',
+    checkouts: [{ name: 'web', branch: 'tavya/t', target: 'main' }, { name: 'proj_abc', branch: 'tavya/t', target: 'main' }] });
+  assert.match(html, /<b title="proj_abc">Wiki<\/b>/);
+  assert.doesNotMatch(html, /<b>proj_abc<\/b>/);
 });

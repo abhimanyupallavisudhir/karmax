@@ -114,6 +114,28 @@ describe('BudgetService over the mock rail', () => {
     expect((await budget.request({ projectId, taskId: parent.id , capabilities: ['use-card:*'] }, { amount: 70 })).status).toBe('needs_approval');
   });
 
+  it('pools an Avatār’s budget across its forks, and a top-up releases what now fits', async () => {
+    const card = await provider.provisionCard({ scope: 'project', scopeId: projectId, label: 'Pool', cap: 10000 });
+    await provider.fund(card.id, 10000);
+    const avatar = await store.createTask({ projectId, title: 'Atlas', workflow: 'software-dev', workflowVersion: '1',
+      params: { prompt: '', draft: true, avatar: { callableBy: ['@project'] }, paymentPolicy: { budget: 100, cardIds: [card.id] },
+        _authorization: { capabilities: ['use-card:*'] } } });
+    // Forks acting for it are backed by it (their own budget cannot widen the pool).
+    const fork = (title: string) => store.createTask({ projectId, title, workflow: 'software-dev', workflowVersion: '1',
+      params: { prompt: '', paymentPolicy: { budget: 1000, cardIds: [card.id] },
+        _authorization: { capabilities: ['use-card:*'], principal: `avatar:${avatar.id}` } } });
+    const a = await fork('Fork A'), b = await fork('Fork B');
+    expect((await store.paymentBudgetFamily(a.id)).ancestorIds).toEqual([avatar.id]);
+    expect((await budget.request({ projectId, taskId: a.id, capabilities: ['use-card:*'] }, { amount: 70 })).status).toBe('granted');
+    const waiting = await budget.request({ projectId, taskId: b.id, capabilities: ['use-card:*'] }, { amount: 70 });
+    expect(waiting.status).toBe('needs_approval');
+    expect(await store.paymentSpent(avatar.id, true, 'usd')).toBe(70);
+    // Topping up the Avatār lets the waiting fork's request through.
+    await store.patchTaskParams(avatar.id, { paymentPolicy: { budget: 200, cardIds: [card.id], currency: 'usd' } });
+    expect((await budget.reconcileTask({ projectId, taskId: b.id })).map((result) => result.status)).toEqual(['granted']);
+    expect(await store.paymentSpent(avatar.id, true, 'usd')).toBe(140);
+  });
+
   it('needs_funding when no card is configured', async () => {
     const r = await budget.request({ projectId, taskId: 't1' , capabilities: ['use-card:*'] }, { amount: 100 });
     expect(r.status).toBe('needs_funding');

@@ -50,6 +50,17 @@ const screens = {
     computeCreditMicros: 29e6, includedComputeCreditMicros: 19e6, giftedComputePacks: 1, compute: compute(2.1e6, 29e6) },
   { managed: true, providerConfigured: true, plan: 'team', billedPlan: 'free', status: 'none', catalog, canManage: true, canGift: true, gift: { plan: 'team' },
     giftedStoragePacks: 2, giftedComputePacks: 1, ...packs }],
+  // A gifted Individual as its owner sees it: packs and Team are bought at checkout.
+  'plan-gifted-individual': [{ ...base, plan: 'individual', planName: 'Individual', currentMonthlyPriceCents: 900, maxMembers: 1, maxActiveAgentRuns: 10,
+    storageQuotaBytes: 50 * GB, includedStorageBytes: 50 * GB, storageUsedBytes: 31 * GB,
+    computeCreditMicros: 5e6, includedComputeCreditMicros: 5e6, compute: compute(3.6e6, 5e6) },
+  { managed: true, providerConfigured: true, plan: 'individual', billedPlan: 'free', status: 'none', catalog, canManage: true, gift: { plan: 'individual' }, ...packs }],
+  // …and once it bought packs: a subscription of packs alone beside the gift.
+  'plan-gifted-with-packs': [{ ...base, plan: 'individual', planName: 'Individual', currentMonthlyPriceCents: 900, maxMembers: 1, maxActiveAgentRuns: 10,
+    storageQuotaBytes: 150 * GB, includedStorageBytes: 50 * GB, storagePacks: 1, storageUsedBytes: 31 * GB,
+    computeCreditMicros: 25e6, includedComputeCreditMicros: 5e6, computePacks: 2, compute: compute(3.6e6, 25e6) },
+  { managed: true, providerConfigured: true, plan: 'individual', billedPlan: 'free', status: 'active', catalog, canManage: true, gift: { plan: 'individual' }, ...packs,
+    storagePacks: 1, computePacks: 2, billedMonthlyPriceCents: 2400, currentPeriodEnd: Date.UTC(2026, 10, 3) }],
 };
 const managedCompute = { providers: [
   { provider: 'hetzner', enabled: true, status: 'ready', config: { maxRunning: 8, region: 'fsn1' }, running: 3, organizations: 4, costMicros: 6.1e6, chargedMicros: 12.2e6, seconds: 512 * 3600 },
@@ -72,7 +83,7 @@ const managedCompute = { providers: [
     const policyLinks = () => '<a href="#">Terms</a> and <a href="#">Billing terms</a>';
     ${constant('COMPUTER_PROVIDERS')}
     const PLAN_ACTIVE = ['active', 'trialing', 'past_due'];
-    ${['formatBytes', 'policyTip', 'policyAcceptanceMarkup', 'planMoney', 'planDollars', 'planMeter', 'planStepper', 'planBillingMarkup', 'managedComputeMarkup'].map(fn).join('\n')}` });
+    ${['formatBytes', 'policyTip', 'policyAcceptanceMarkup', 'planMoney', 'planDollars', 'planMeter', 'planStepper', 'checkoutTermsTip', 'planBillingMarkup', 'managedComputeMarkup'].map(fn).join('\n')}` });
   for (const [name, [e, state]] of Object.entries(screens)) {
     await page.evaluate(([e, state]) => { document.querySelector('#shot').innerHTML = planBillingMarkup(e, state); document.querySelector('.plan-operator')?.setAttribute('open', ''); }, [e, state]);
     await page.locator('.main-inner').screenshot({ path: path.join(out, `${name}.png`) });

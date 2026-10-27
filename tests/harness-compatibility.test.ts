@@ -9,6 +9,7 @@ import crypto from 'node:crypto';
 import { query, tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import { CLAUDE_EXTRA_ARGS, controlMcpServer } from '../src/agent/claude.js';
+import { ClaudeStreamUsage } from '../src/agent/claude-stream-usage.js';
 import { PLATFORM_TOOL_SCHEMAS } from '../src/agent/tools.js';
 
 it('Claude 2.1.281 preserves SDK tools, explicit effort, resume and fork', async () => {
@@ -190,7 +191,8 @@ it('Claude keeps SDK tools when resuming a session orphaned with a background sh
 const lastUser = (body: any) => JSON.stringify(body.messages.filter((m: any) => m.role === 'user').at(-1));
 
 /** A local Messages fixture whose model answers `reply(request)` as one streamed block. */
-async function messagesFixture(reply: (body: any) => any) {
+async function messagesFixture(reply: (body: any) => any,
+  usage: (n: number) => Record<string, number> = () => ({ input_tokens: 10, output_tokens: 5 })) {
   const requests: any[] = [];
   const server = http.createServer(async (req, res) => {
     let raw = '';
@@ -201,16 +203,18 @@ async function messagesFixture(reply: (body: any) => any) {
     requests.push(body);
     const block = reply(body);
     const stop = block.type === 'tool_use' ? 'tool_use' : 'end_turn';
+    const spent = usage(requests.length);
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     for (const event of [
+      // As the API streams: input and cache counts at the start, the output count at the end.
       { type: 'message_start', message: { id: `msg_${requests.length}`, type: 'message', role: 'assistant', model: body.model,
-        content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 5 } } },
+        content: [], stop_reason: null, stop_sequence: null, usage: { ...spent, output_tokens: 1 } } },
       { type: 'content_block_start', index: 0, content_block: block.type === 'tool_use' ? { ...block, input: {} } : { type: 'text', text: '' } },
       { type: 'content_block_delta', index: 0, delta: block.type === 'tool_use'
         ? { type: 'input_json_delta', partial_json: JSON.stringify(block.input) }
         : { type: 'text_delta', text: block.text } },
       { type: 'content_block_stop', index: 0 },
-      { type: 'message_delta', delta: { stop_reason: stop, stop_sequence: null }, usage: { output_tokens: 5 } },
+      { type: 'message_delta', delta: { stop_reason: stop, stop_sequence: null }, usage: { output_tokens: spent.output_tokens } },
       { type: 'message_stop' },
     ]) res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
     res.end();
@@ -227,6 +231,45 @@ async function messagesFixture(reply: (body: any) => any) {
     fs.rmSync(home, { recursive: true, force: true });
   } };
 }
+
+// funding-analysis#2: what a turn spent is counted from the CLI's frames, so a turn
+// the usage limit ends is metered too. The main loop streams its final output count
+// (`message_delta`); a sub-agent's frames carry only its exact input and cache counts.
+it('Claude 2.1.281 frames meter every request of a turn, sub-agents included', async () => {
+  const spent = (n: number) => ({ input_tokens: 1000 * n + 1, output_tokens: 50 + n,
+    cache_read_input_tokens: 100 * n + 2, cache_creation_input_tokens: 10 * n + 3 });
+  const fixture = await messagesFixture((body) => {
+    const first = JSON.stringify(body.messages[0]);
+    if (!first.includes('meter-marker')) return { type: 'text', text: 'sub-agent-done' };
+    return JSON.stringify(body.messages).includes('sub-agent-done') ? { type: 'text', text: 'main-done' }
+      : { type: 'tool_use', id: 'tool_agent', name: 'Agent',
+        input: { description: 'delegate', prompt: 'answer briefly', subagent_type: 'general-purpose' } };
+  }, spent);
+  const meter = new ClaudeStreamUsage();
+  const session = query({ prompt: 'meter-marker', options: {
+    cwd: fixture.home, model: 'claude-opus-5-5', includePartialMessages: true, tools: ['Agent'], strictMcpConfig: true,
+    settingSources: [], env: fixture.env,
+    canUseTool: async (_name: string, input: any) => ({ behavior: 'allow' as const, updatedInput: input }),
+  } as any });
+  const sub: number[] = [];
+  try {
+    for await (const message of session as AsyncIterable<any>) {
+      meter.observe(message);
+      if (message.type === 'assistant' && message.parent_tool_use_id) sub.push(Number(message.message.id.slice(4)));
+    }
+  } finally { session.close(); await fixture.close(); }
+  const n = fixture.requests.length;
+  expect(n).toBeGreaterThanOrEqual(3);
+  expect(sub.length).toBeGreaterThan(0);
+  const all = Array.from({ length: n }, (_, i) => spent(i + 1));
+  const sum = (key: string, rows = all) => rows.reduce((total, row: any) => total + row[key], 0);
+  const usage = meter.total()!;
+  expect(usage).toMatchObject({ inputTokens: sum('input_tokens'), cacheReadTokens: sum('cache_read_input_tokens'),
+    cacheWriteTokens: sum('cache_creation_input_tokens') });
+  const subs = new Set(sub);
+  const main = all.filter((_, i) => !subs.has(i + 1));
+  expect(usage.outputTokens).toBe(sum('output_tokens', main) + subs.size);
+}, 60_000);
 
 // Task #438: a message karmax sends while the agent works joins the running model
 // turn. The CLI never names it in `user_message_uuids`; only the replay the adapter

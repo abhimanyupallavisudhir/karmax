@@ -4,38 +4,19 @@ import { applyComputer, machineShape, normalizeComputer, type ComputerSpec, type
 import { manifest } from '../contrib/manifests.js';
 import { isAgentProvider } from '../agent/provider-registry.js';
 import { validateMcpSelection } from '../mcp/connections/store.js';
-import { avatarCallableBy, avatarEnabled } from './avatars.js';
-import { CapabilityError, ValidationError } from './errors.js';
+import { forkedAvatar } from './avatars.js';
+import { ValidationError } from './errors.js';
 import { normalizeAgentAuthority } from './agent-authority.js';
 
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 const set = (value: unknown) => value !== undefined && value !== null && value !== '';
 
-/** The Avatar an agent value selects, refused when this project, or the human
- * behind the calling chain, may not use it. Invocation is checked against that
- * human, not against an arbitrary task-agent id. */
-export async function selectableAvatar(store: Store, project: Project, spec: unknown, role: string,
-  callerUserId: string | undefined): Promise<Avatar | undefined> {
-  const record = spec && typeof spec === 'object' && !Array.isArray(spec)
-    ? spec as Record<string, unknown> : undefined;
-  const avatarId = record?.avatarId;
-  if (typeof avatarId !== 'string' || !avatarId) return undefined;
-  const avatar = (await store.getAvatar(avatarId));
-  if (!avatar || avatar.projectId !== project.id) throw new ValidationError('the selected Avatar is not available in this project');
-  if (!(await avatarEnabled(store, avatar))) throw new ValidationError(`Avatar "${avatar.name}" is disabled`);
-  const purpose = typeof record?.avatarPurpose === 'string' ? record.avatarPurpose : role;
-  if (avatar.roles.length && !avatar.roles.includes(purpose))
-    throw new ValidationError(`Avatar "${avatar.name}" cannot be used for the ${purpose} role`);
-  if (!callerUserId || !(await avatarCallableBy(store, avatar, callerUserId)))
-    throw new CapabilityError(`you are not allowed to call Avatar "${avatar.name}"`);
-  return avatar;
-}
-
 /**
  * Refuse a task-form agent value (SPEC §10.4) that no turn could run when the
  * task is created, not at its first turn: a provider karmax has no agent for,
  * an unknown reasoning effort or tool selection, a model the organization's
- * allowlist excludes, or an Avatar the project or caller can't use.
+ * allowlist excludes. Returns the Avatar it forks and acts for, when it forks
+ * one the human behind the calling chain may call (src/platform/avatars.ts).
  * create_task and create_sub_task both validate through here.
  */
 export async function assertAgentSpec(store: Store, project: Project, spec: unknown, role: string,
@@ -62,7 +43,7 @@ export async function assertAgentSpec(store: Store, project: Project, spec: unkn
     if (policy.allowedModels.length && !policy.allowedModels.includes(model))
       throw new ValidationError(`model ${model} is not allowed by the organization`);
   }
-  return selectableAvatar(store, project, spec, role, callerUserId);
+  return forkedAvatar(store, project.id, spec, callerUserId);
 }
 
 /** Why a sub-task can't set a task-form field that its parent fixes. */
@@ -73,7 +54,7 @@ const FIXED_BY_PARENT: Record<string, string> = {
   confirm: 'you review your sub-tasks',
   responder: 'you answer your sub-tasks',
 };
-const SUB_TASK_AGENT_KEYS = ['provider', 'model', 'effort', 'mcpConnections', 'avatarId'];
+const SUB_TASK_AGENT_KEYS = ['provider', 'model', 'effort', 'mcpConnections'];
 
 /** What judges a Computer against the organization's provider accounts (the
  * gateway's and the worker's WorldProviderConnectionService). */
@@ -134,11 +115,10 @@ export async function subTaskParams(store: Store, args: { projectId: string; par
     if (typeof value !== 'object' || Array.isArray(value)) throw new ValidationError(`"${name}" must be an agent spec`);
     for (const key of Object.keys(value)) if (!SUB_TASK_AGENT_KEYS.includes(key))
       throw new ValidationError(`"${key}" cannot be set on a sub-task's ${name}: it takes ${SUB_TASK_AGENT_KEYS.join(', ')}`);
-    const avatar = (await assertAgentSpec(store, project, value, field.role ?? name.replace(/^agent:/, ''), callerUserId));
+    (await assertAgentSpec(store, project, value, field.role ?? name.replace(/^agent:/, ''), callerUserId));
     const spec = Object.fromEntries(Object.entries(value).filter(([, v]) => set(v))) as Partial<AgentSpec>;
-    const provider = avatar?.runtime.provider ?? spec.provider;
-    if (!provider) throw new ValidationError(`"${name}" needs a provider or an Avatar`);
-    out[name as `agent:${string}`] = { ...spec, provider };
+    if (!spec.provider) throw new ValidationError(`"${name}" needs a provider`);
+    out[name as `agent:${string}`] = { ...spec, provider: spec.provider };
   }
   return Object.keys(out).length ? out : undefined;
 }

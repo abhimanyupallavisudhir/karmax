@@ -13,7 +13,8 @@ vm.runInContext(helpers, context);
 test('a fork in the repository list names the repository its pull requests go to', () => {
   const panel = src.slice(src.indexOf('function gitRepoRow('), src.indexOf('async function hydrateProjectAccess('));
   assert.match(panel, /git-repo-upstream" title="Pull requests go to \$\{esc\(upstream\.owner\)\}\/\$\{esc\(upstream\.name\)\} after Review">→ /);
-  assert.match(panel, /id="project-fork-open"/);
+  // Forking is offered from the repository combobox, beside the organization's own.
+  assert.match(panel, /fork: githubApp\.configured && gitConnections\.length \? \(slug, opener\) => openForkRepositoryDialog\(proj, opener, githubApp, slug\)/);
 });
 
 test('the fork dialog accepts a GitHub URL, SSH address or owner/name', () => {

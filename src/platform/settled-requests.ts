@@ -33,7 +33,6 @@ export async function settleTaskRequests(store: Store, organizationId: string, t
   for (const request of (await new VaultItems(store, undefined, undefined, organizationId).ignoreTaskRequests(taskId, TASK_SETTLED)))
     (await store.appendEvent({ taskId, type: 'credential.approval-dismissed', ts: Date.now(), payload: { requestId: request.id } }));
   for (const request of (await new AuthorizationRequests(store, organizationId).ignoreTaskRequests(taskId, TASK_SETTLED))) {
-    (await store.removeAuthorizationInbox(request.id));
     (await store.appendEvent({ taskId, type: 'authorization.approval-dismissed', ts: Date.now(), payload: { requestId: request.id } }));
   }
   (await ignoreTaskConnectionRequests(store, taskId, TASK_SETTLED));

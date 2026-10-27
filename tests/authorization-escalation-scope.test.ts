@@ -102,12 +102,11 @@ describe('asking for more authorization than you have', () => {
       missingCapabilities: expect.arrayContaining(['project:edit']) });
     expect(body.next).toMatch(/acceptAttenuation: true/);
 
-    // The same answer for an Avatar.
-    await store.kvSet(`avatars:project:${project.id}`, 'enabled');
-    const avatar = await post(`/api/projects/${project.id}/avatars`, { name: 'Atlas', prompt: 'Help.', authorityMode: 'restricted',
-      authorization: maintainer, runtime: { provider: 'mock' } });
+    // The same answer for an Avatar: it is a task, granted like one.
+    const avatar = await post(`/api/projects/${project.id}/tasks`, { workflow: 'just-do', draft: true,
+      params: { prompt: 'Atlas', avatar: {} }, authorization: maintainer });
     expect(avatar.status).toBe(403);
     expect(await avatar.json()).toMatchObject({ code: 'authorization_grant_denied', summon: '@maintainers',
-      next: expect.stringMatching(/limitAuthorization: true/) });
+      next: expect.stringMatching(/acceptAttenuation: true/) });
   });
 });

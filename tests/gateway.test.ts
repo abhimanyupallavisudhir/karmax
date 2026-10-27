@@ -1,6 +1,5 @@
 import * as __asyncCollections from '../src/util/async-collections.js';
 import { platformToolHandlers } from '../src/agent/tools.js';
-import { AuthorizationService } from '../src/platform/authorization.js';
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import crypto from 'node:crypto';
 import http from 'node:http';
@@ -1615,7 +1614,7 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     expect(await response.json()).toHaveProperty('organizationId');
   });
 
-  it('defaults Avatars off and allows projects to override the organization default', async () => {
+  it('defaults Avatars on and allows projects to override the organization default', async () => {
     const project = (await h.store.createProject('Experimental Avatars'));
     const orgUrl = `${base}/api/organizations/${project.organizationId}/avatar-settings`;
     const projectUrl = `${base}/api/projects/${project.id}/avatar-settings`;
@@ -1624,56 +1623,30 @@ describe('gateway HTTP API (real server end-to-end)', () => {
       expect(response.status).toBe(200);
       return response.json();
     };
-    expect(await (await fetch(orgUrl, { headers: auth() })).json()).toEqual({ enabled: false });
+    expect(await (await fetch(orgUrl, { headers: auth() })).json()).toEqual({ enabled: true });
     expect(await (await fetch(projectUrl, { headers: auth() })).json())
-      .toEqual({ organization: false, project: 'inherit', effective: false });
+      .toEqual({ organization: true, project: 'inherit', effective: true });
     expect((await fetch(orgUrl, { method: 'PUT', headers: auth(), body: '{}' })).status).toBe(400);
-    expect(await put(projectUrl, { value: 'enabled' })).toMatchObject({ effective: true, organization: false });
-    expect(await put(projectUrl, { value: 'inherit' })).toMatchObject({ effective: false });
-    await put(orgUrl, { enabled: true });
-    expect(await put(projectUrl, { value: 'inherit' })).toMatchObject({ effective: true });
     expect(await put(projectUrl, { value: 'disabled' })).toMatchObject({ effective: false, organization: true });
+    expect(await put(projectUrl, { value: 'inherit' })).toMatchObject({ effective: true });
     await put(orgUrl, { enabled: false });
+    expect(await put(projectUrl, { value: 'inherit' })).toMatchObject({ effective: false });
+    expect(await put(projectUrl, { value: 'enabled' })).toMatchObject({ effective: true, organization: false });
+    await put(orgUrl, { enabled: true });
   });
 
-  it('lists created Avatars with each caller-specific view', async () => {
+  it('lists a project’s Avatars — its tasks saved as Avatar — with whether the caller may call each', async () => {
     const project = (await h.store.createProject('Listed Avatars'));
-    (await h.store.kvSet(`avatars:project:${project.id}`, 'enabled'));
-    const url = `${base}/api/projects/${project.id}/avatars`;
-    const created = await fetch(url, { method: 'POST', headers: auth(),
-      body: JSON.stringify({ name: 'Atlas', prompt: 'Help with project work.', runtime: { provider: 'mock' } }) });
-    expect(created.status).toBe(201);
+    const created = await fetch(`${base}/api/projects/${project.id}/tasks`, { method: 'POST', headers: auth(),
+      body: JSON.stringify({ prompt: 'Atlas: help with project work.', draft: true, params: { avatar: { callableBy: ['@project'] } } }) });
+    expect(created.status).toBe(200);
     const { id } = await created.json() as { id: string };
-    const listed: any = await (await fetch(url, { headers: auth() })).json();
-    expect(listed.avatars).toEqual([expect.objectContaining({
-      id, name: 'Atlas', effectiveEnabled: true, callable: true, canEdit: true, canDisable: true,
-    })]);
-  });
-
-  it('allows delegated Avatar administration without widening the agent grant', async () => {
-    const project = (await h.store.createProject('Delegated Avatars'));
-    (await h.store.kvSet(`avatars:project:${project.id}`, 'enabled'));
-    (await h.store.setOrganizationMembership(project.organizationId!, 'avatar-owner', 'member'));
-    const authorization = (await AuthorizationService.create(h.store));
-    (await authorization.grant('system:test', { principalId: 'user:avatar-owner', scopeKey: `project:${project.id}`,
-      profileId: 'maintainer' }));
-    const ownerCaps = (await authorization.capabilities('user:avatar-owner', project.id, project.organizationId));
-    const human = (await h.tokens.mintPrincipal('user:avatar-owner', ownerCaps, project.id, undefined, project.organizationId));
-    const delegation = (await h.tokens.delegateHuman(human.token, { taskId: 'avatar-admin', projectId: project.id,
-      organizationId: project.organizationId }))!;
-    const mint = async (caps: string[]) => (await h.tokens.mint({ taskId: 'avatar-admin', profileId: 'do',
-      principal: 'task:avatar-admin', projectId: project.id, organizationId: project.organizationId,
-      ceiling: caps, grantorCaps: caps, delegationId: delegation.id }));
-    const create = async (caps: string[]) => fetch(`${base}/api/projects/${project.id}/avatars`, {
-      method: 'POST', headers: { authorization: `Bearer ${(await mint(caps)).token}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ name: 'Delegated helper', prompt: 'Help with project work.', runtime: { provider: 'mock' } }),
-    });
-    const limited = await create(['task:create']);
-    expect(limited.status).toBe(403);
-    expect((await h.store.listAvatars(project.id))).toHaveLength(0);
-    const permitted = await create(ownerCaps);
-    expect(permitted.status).toBe(201);
-    expect((await h.store.listAvatars(project.id))).toHaveLength(1);
+    const listed: any = await (await fetch(`${base}/api/projects/${project.id}/avatars`, { headers: auth() })).json();
+    expect(listed.availability).toMatchObject({ effective: true });
+    expect(listed.avatars).toEqual([expect.objectContaining({ id, name: 'Atlas: help with project work.', callable: true,
+      callableBy: ['@project'], forksMayBeAvatars: false })]);
+    // There is nothing else to make an Avatar with: it is a task.
+    expect((await fetch(`${base}/api/projects/${project.id}/avatars`, { method: 'POST', headers: auth(), body: '{}' })).status).not.toBe(201);
   });
 
   it('offers proposal-driven secrets, environment, and per-world services over typed resources', async () => {

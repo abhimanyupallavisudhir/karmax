@@ -45,10 +45,10 @@ describe('compute credit in the plan catalog', () => {
     // Team: $10 + $3 for each active user after the first.
     expect(hostedComputeCreditMicros('team', 3)).toBe(16_000_000);
     expect(hostedComputeCreditMicros('individual', 1, 2, 1)).toBe(35_000_000);
-    // Paid packs ride on a paid plan; gifted ones count on any.
-    expect(hostedComputeCreditMicros('free', 1, 4, 1)).toBe(10_000_000);
+    // Packs in force count on any plan, paid or gifted.
+    expect(hostedComputeCreditMicros('free', 1, 4, 1)).toBe(50_000_000);
     expect(hostedMonthlyPriceCents('individual', 1, 1, 2)).toBe(900 + 400 + 2_000);
-    expect(hostedMonthlyPriceCents('free', 1, 1, 2)).toBe(0);
+    expect(hostedMonthlyPriceCents('free', 1, 1, 2)).toBe(400 + 2_000);
     expect(organizationEntitlements('team', true, 2, { computePacks: 1, giftedComputePacks: 2 })).toMatchObject({
       computeCreditMicros: 13_000_000 + 3 * COMPUTE_PACK.creditMicros, includedComputeCreditMicros: 13_000_000,
       computePacks: 1, giftedComputePacks: 2, computePackCreditMicros: 10_000_000 });

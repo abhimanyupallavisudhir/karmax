@@ -43,7 +43,7 @@ test('applying resources shows the same progress, so a long publication never lo
 test('bringing in sub-tasks\' data says so beside the actions, so a follow-up sent meanwhile is not a mystery', () => {
   const S = { taskEvents: [] };
   const context = vm.createContext({ S });
-  vm.runInContext([esc, fn('formatBytes'), fn('liveOnlyEvent'), fn('stagingProgress'), fn('taskActionLabel'), fn('hasOpenPullRequest'), fn('biggerDiskButton'), fn('taskActions')].join('\n'), context);
+  vm.runInContext([esc, fn('formatBytes'), fn('liveOnlyEvent'), fn('stagingProgress'), fn('taskActionLabel'), fn('taskActionTip'), fn('hasOpenPullRequest'), fn('biggerDiskButton'), fn('taskActions')].join('\n'), context);
   const cancel = { name: 'cancel', label: 'Cancel', enabled: true, danger: true };
   const html = context.taskActions({ taskId: 'task', status: 'active', state: { refreshingResources: true }, actions: [cancel] });
   assert.match(html, /aria-busy="true"[^>]*>Bringing in sub-tasks’ data…<\/button>/);
@@ -56,7 +56,7 @@ test('bringing in sub-tasks\' data says so beside the actions, so a follow-up se
 test('saving the task\'s data for a sub-task shows how far it got, and Cancel stays', () => {
   const S = { taskEvents: [] };
   const context = vm.createContext({ S });
-  vm.runInContext([esc, fn('formatBytes'), fn('liveOnlyEvent'), fn('stagingProgress'), fn('taskActionLabel'), fn('hasOpenPullRequest'), fn('biggerDiskButton'), fn('taskActions')].join('\n'), context);
+  vm.runInContext([esc, fn('formatBytes'), fn('liveOnlyEvent'), fn('stagingProgress'), fn('taskActionLabel'), fn('taskActionTip'), fn('hasOpenPullRequest'), fn('biggerDiskButton'), fn('taskActions')].join('\n'), context);
   const cancel = { name: 'cancel', label: 'Cancel', enabled: true, danger: true };
   const view = { taskId: 'task', status: 'active', state: { preparingSubTask: true }, actions: [cancel] };
   assert.match(context.taskActions(view), /aria-busy="true"[^>]*>Saving data for a sub-task…<\/button>/);

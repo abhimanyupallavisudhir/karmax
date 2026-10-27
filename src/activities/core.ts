@@ -65,7 +65,7 @@ import type { AuthorizationService } from '../platform/authorization.js';
 import { CredentialBroker } from '../autonomy/broker.js';
 import { VaultItems, removeTurnKeys, turnKeyDirectory } from '../autonomy/vault-items.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
-import { applyAvatarProfile, avatarAuthorizationCapabilities, avatarForRole, avatarPrincipal } from '../platform/avatars.js';
+import { authorizingAvatar, avatarAllows, avatarAuthorizationCapabilities, avatarForRole, avatarPrincipal, avatarRoleFor } from '../platform/avatars.js';
 import { DELEGATED_PROFILE, delegatedFromParent } from '../platform/delegation.js';
 import { baseTaskAuthority, delegationReaching, taskAuthorityNow, tokenScopeOf } from '../platform/task-authority.js';
 import { GitProfiles, userGitScope } from '../autonomy/git-profiles.js';
@@ -126,7 +126,7 @@ import { hostLocal as deploymentHostLocal } from '../config/deployment.js';
 import type { ObjectStore } from '../store/objects.js';
 import { conversationImportObjectKey } from '../store/conversation-imports.js';
 import { ensureProjectWikiRepositoryAsync, PROJECT_WIKI_BRANCH, setProjectWikiRemote } from '../wiki/repository.js';
-import { WikiGithubAccess } from '../wiki/github-access.js';
+import { ProjectGithubAccess } from '../integrations/project-github-access.js';
 import { RepositoryAccessRequests, withdrawRepositoryAccessRequests } from '../integrations/repository-access.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -135,7 +135,7 @@ import { assembleTaskInput } from '../platform/params.js';
 import { childComputer, subTaskParams } from '../platform/agent-params.js';
 import { allows, attenuate, CHILD_TASK_CEILING } from '../platform/capabilities.js';
 import { Provider, Message, TaskInput, TaskView, AgentRole, remotePolicyOf, landingAuthorityOf, type Repository, type TaskPullRequest,
-  type GitHubMergeAuthorization, type GithubLandingParticipant, type LandingAuthority, type UpstreamProposal, type SubTaskRequest, type SubTaskResponse, type TaskRecord, type WorldHandleRef, type AdoptedRepositories, type KeptWorkspace } from '../domain/types.js';
+  type GitHubMergeAuthorization, type GithubLandingParticipant, type LandingAuthority, type UpstreamProposal, type SubTaskRequest, type SubTaskResponse, type TaskRecord, type WorldHandleRef, type AdoptedRepositories, type KeptWorkspace, type FileRef, type ImageRef } from '../domain/types.js';
 import { newId } from '../util/id.js';
 import { SIG_AGENT_TURN_STATE } from '../workflows/names.js';
 import { destroyWorldServices } from '../world/services.js';
@@ -380,10 +380,15 @@ export interface OpenPrDetails {
 /** The PR description: the task's own summary, plus the provenance line that
  *  correlates the pull request back to the karmax task (also what the webhook
  *  dispatcher's branch matching relies on being true). */
-function prBody(handle: WorldHandle, details: OpenPrDetails, num?: number, repoName?: string): string {
+function prBody(handle: WorldHandle, details: OpenPrDetails, num?: number, repoName?: string, requestedBy?: string): string {
   const summary = details.summary?.trim() || '_No review summary was recorded for this task._';
   const task = num != null ? `${BRAND} task #${num} (\`${handle.id}\`)` : `${BRAND} task \`${handle.id}\``;
-  const provenance = `\n\n---\n${task} · branch \`${handle.branch}\`${repoName ? ` · repo \`${repoName}\`` : ''}`;
+  // Opened as the App for someone with no GitHub account: never silently.
+  const requester = requestedBy
+    ? `\n\nRequested in ${BRAND} by ${requestedBy.replace(/\s+/g, ' ').slice(0, 200)}, who has no GitHub account linked; `
+      + `the ${BRAND} GitHub App opened this pull request for them.`
+    : '';
+  const provenance = `${requester}\n\n---\n${task} · branch \`${handle.branch}\`${repoName ? ` · repo \`${repoName}\`` : ''}`;
   const suffix = '\n… (summary truncated)';
   const budget = Math.max(0, 65_536 - Buffer.byteLength(provenance + suffix));
   let bounded = summary;
@@ -670,8 +675,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
   };
   const turnProfile = async (task: TaskInput, role: AgentRole, explicitProfileId?: string) => {
     const base = (await profiles.resolve(role, task.profiles, explicitProfileId, task.projectId));
+    // An agent that forks an Avatar its task's creator may call acts for it
+    // (src/platform/avatars.ts); its instructions are the forked conversation.
     const avatar = (await avatarForRole(store, task, role));
-    return { avatar, profile: applyAvatarProfile(base, task.agents?.[role], avatar) };
+    return { avatar, profile: applyAgentSpec(base, task.agents?.[role]) };
   };
 
   const organizationGitProfilesFor = async (projectId?: string) => new GitProfiles(
@@ -1085,9 +1092,11 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       : (await store.getTask(handle.id))?.projectId;
     const env = (await gitEnvFor(handle, handle.id));
     if (env.GH_TOKEN) return env.GH_TOKEN;
-    // A human task must never silently open its PR as the organization App.
+    // A human task must never *silently* open its PR as the organization App.
     // Transport may use the installation, but authorship is the person's App
-    // authorization (handled above), a manual profile fallback, or a setup error.
+    // authorization (prApiFor), a manual profile fallback, or — only for a
+    // creator who never linked a GitHub account — the App, with the PR body
+    // naming who asked and a `pr.opened-by-app` task event (prApiFor decides).
     if ((await gitBindingFromHandle(handle, handle.id)).scope.startsWith('user:')) return undefined;
     if (projectId && deps.githubApp) {
       const repository = authorizedRepository ?? (await enrolledGithubRepository(projectId, slug));
@@ -1140,11 +1149,22 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     return request?.approvers.map((approver) => approver.login) ?? [];
   }
 
-  let wikiAccess: WikiGithubAccess | undefined;
-  function wikiGithubAccess(): WikiGithubAccess {
-    wikiAccess ??= new WikiGithubAccess({ store, githubApp: deps.githubApp!, authorization: deps.authorization,
+  let repositoryAccess: ProjectGithubAccess | undefined;
+  function projectGithubAccess(): ProjectGithubAccess {
+    repositoryAccess ??= new ProjectGithubAccess({ store, githubApp: deps.githubApp!, authorization: deps.authorization,
       log: (line) => console.warn(`[karmax] ${line}`) });
-    return wikiAccess;
+    return repositoryAccess;
+  }
+
+  /** Pull-request clients that act as the GitHub App for a creator who has no
+   * GitHub account (see prApiFor): who asked for the work, and why the App acts. */
+  const openedByApp = new WeakMap<GithubPrApi, { userId: string; requestedBy: string; reason: string }>();
+
+  /** How a pull request names the person who asked for it: their name, else their e-mail. */
+  async function requesterName(userId: string, projectId: string | undefined): Promise<string> {
+    const organizationId = projectId ? (await store.getProject(projectId))?.organizationId : undefined;
+    const person = organizationId ? (await store.organizationPeople(organizationId)).find((candidate) => candidate.id === userId) : undefined;
+    return person?.name?.trim() || person?.email?.trim() || (await store.userDisplayName(userId)) || userId;
   }
 
   async function prApiFor(
@@ -1167,15 +1187,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     // capacities: its installation owns repository transport, while this
     // per-user OAuth grant makes the PR attributable to the task creator.
     const githubStatus = userId ? (await deps.githubApp?.status(userId)) : undefined;
+    const accounts = userId && repository?.gitConnectionId && typeof deps.githubApp?.listUserAccounts === 'function'
+      ? await deps.githubApp.listUserAccounts(userId).catch(() => []) : [];
     if (userId && repository?.gitConnectionId && githubStatus?.userAuthorized) {
-      const accounts = typeof deps.githubApp!.listUserAccounts === 'function'
-        ? await deps.githubApp!.listUserAccounts(userId).catch(() => []) : [];
       const login = (accounts.find((account) => account.id === accountId) ?? accounts.find((account) => account.active))?.login;
-      // tavya made the project wiki's repository, in the App owner's account: the
-      // creator may not have been given it yet, so grant it before acting as them.
+      // Everyone with access to the project is a collaborator on its repositories
+      // (ProjectGithubAccess), but the debounced sync may not have run yet for a
+      // new member or a just-attached repository: grant the creator first, so the
+      // pull request opened as them is not answered with 404.
       let invitationUrl: string | undefined;
-      if (projectId && (await store.projectWiki(projectId))?.repository?.id === repository.id) {
-        const outcomes = await wikiGithubAccess().syncProject(projectId, userId).catch((error) => {
+      if (typeof deps.githubApp!.repositoryCollaborators === 'function') {
+        const outcomes = await projectGithubAccess().syncRepository(repository.id, userId).catch((error) => {
           console.warn(`[karmax] could not give ${login ?? userId} access to ${slug}:`, error instanceof Error ? error.message : error);
           return [];
         });
@@ -1190,20 +1212,73 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     }
     const token = await githubTokenFor(handle, slug, repository);
     if (!token) {
+      // A person who never linked GitHub (most people who are not developers)
+      // still gets their pull request: the App opens it, and says who asked.
+      // This is safe: the App's installation already pushed the task branch; a
+      // tavya role (`task:create`) decided who may create the task at all; and
+      // merging still needs a person with GitHub merge rights (mergeGithubPrs
+      // never merges as the App). Someone who linked GitHub but whose
+      // authorization broke is asked to reconnect instead, so their pull
+      // requests keep a human author.
+      if (userId && repository?.gitConnectionId && deps.githubApp && !githubStatus?.userAuthorized && !accounts.length
+        && !githubStatus?.lastAuthorizationFailure
+        && !(typeof deps.githubApp.hasLinkedUserAccount === 'function' && await deps.githubApp.hasLinkedUserAccount(userId))) {
+        const connection = await store.getGitConnection(repository.gitConnectionId);
+        if (connection && typeof deps.githubApp.installationToken === 'function') {
+          const api = new GithubPrApi(await deps.githubApp.installationToken(connection, [repository.providerId ?? '']), deps.githubPr ?? {});
+          openedByApp.set(api, { userId, requestedBy: await requesterName(userId, projectId),
+            reason: `the task's creator has no GitHub account linked to ${BRAND}` });
+          return api;
+        }
+      }
       if (userId && repository?.gitConnectionId && githubStatus?.oauthConfigured) {
         const failure = githubStatus.lastAuthorizationFailure;
         const diagnostic = failure
-          ? ` Last recorded authorization failure: ${failure.summary} [${failure.code}, ${new Date(failure.occurredAt).toISOString()}]`
+          ? ` Technical detail: GitHub's last answer was "${failure.summary}" [${failure.code}, ${new Date(failure.occurredAt).toISOString()}].`
           : '';
-        throw new Error(`GitHub PR identity is not connected for ${slug}. Connect GitHub on your profile so the pull request has a human author, then retry.${diagnostic} Repository transport authorization is already separate; this is not a non-fast-forward or local ancestry error.`);
+        throw new Error('Your GitHub connection needs to be renewed. Open your profile and reconnect GitHub, then press Retry.'
+          + `${diagnostic} The pull request for ${slug} is opened as you; this is not a branch-history conflict.`);
       }
       throw new Error(`GitHub identity/authorization is missing for ${slug}. Grant the acting account access to this repository, then connect or re-authorize GitHub on your profile. This is not a branch-history conflict.`);
     }
     return new GithubPrApi(token, deps.githubPr ?? {});
   }
 
-  /** A merge is always attributed to the consenting human selected below. It
-   * never falls back to an installation token or an unrelated host credential. */
+  /** The App lands a task's pull requests for a consenting person who has no
+   * GitHub account (see mergeGithubPrs): the first of `candidates` who linked
+   * none and holds `merge-into:<target>` in the task's project. Only when every
+   * open pull request is in the task's own repositories under one installation. */
+  async function appLanding(task: TaskRecord, candidates: string[], prs: TaskPullRequest[]) {
+    const app = deps.githubApp;
+    if (!app || !deps.authorization || typeof app.installationToken !== 'function') return undefined;
+    const open = prs.filter((ref) => !ref.merged && !ref.headRepository);
+    if (!open.length) return undefined;
+    const repositories = await Promise.all(open.map((ref) => enrolledGithubRepository(task.projectId, ref.slug)));
+    const connectionIds = new Set(repositories.map((repository) => repository?.gitConnectionId));
+    if (repositories.some((repository) => !repository?.gitConnectionId) || connectionIds.size !== 1) return undefined;
+    const connection = await store.getGitConnection([...connectionIds][0]!);
+    if (!connection) return undefined;
+    const target = task.lastView?.targetBranch || (typeof task.params?.target === 'string' ? task.params.target : '')
+      || repositories[0]!.defaultBranch || 'main';
+    const organizationId = (await store.getProject(task.projectId))?.organizationId;
+    for (const userId of candidates) {
+      if ((await app.activeUserAccountId(userId).catch(() => undefined))
+        || (typeof app.hasLinkedUserAccount === 'function' && await app.hasLinkedUserAccount(userId))) continue;
+      const caps = await deps.authorization.capabilitiesAsync(`user:${userId}`, task.projectId, organizationId);
+      if (!allows(caps, `merge-into:${target}`)) continue;
+      const providerIds = repositories.map((repository) => repository!.providerId ?? '');
+      const api = new GithubPrApi(() => app.installationToken(connection, providerIds), deps.githubPr ?? {});
+      const permissions = new Map<string, GitHubRepositoryPermission>();
+      for (const ref of open)
+        permissions.set(ref.slug, { slug: ref.slug, permission: 'app', canMerge: true, mergeMethod: await api.mergeMethod(ref.slug) });
+      return { userId, api, permissions, requestedBy: await requesterName(userId, task.projectId) };
+    }
+    return undefined;
+  }
+
+  /** A merge is attributed to the consenting human selected below: as them on
+   * GitHub, or — for someone without a GitHub account whom tavya lets land the
+   * work (`appLanding`) — by the App on their behalf. Never an unrelated host credential. */
   function prApiForUser(userId: string, accountId?: string): GithubPrApi {
     if (!deps.githubApp) throw new Error('GitHub integration is unavailable');
     return new GithubPrApi(
@@ -1493,19 +1568,27 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       organizationId?: string;
       delegationId?: string;
     } | undefined;
-    const delegatedAuthorization = avatar?.authorization;
+    // A fork acting for an Avatar acts with what it chose of the Avatar's
+    // authorization (stored backed by it), else all of it — and with nothing
+    // when the Avatar no longer lets it play this role.
+    const chosen = avatar && storedAuthorization?.principal === avatarPrincipal(avatar.id) ? storedAuthorization : undefined;
+    const roleAllowed = !avatar || avatarAllows(avatar, (await avatarRoleFor(store, args.taskId, participant)));
+    const delegatedAuthorization = chosen ?? avatar?.authorization;
     // A task may have been authorized by a routed Avatar without itself using
     // that Avatar as its role profile. Re-evaluate that delegation on every
     // turn so disabling the authorizer, narrowing its authority, or revoking
     // its backing principal immediately attenuates the task as well.
     const authorizingAvatarId = !avatar && storedAuthorization?.principal?.startsWith('avatar:')
       ? storedAuthorization.principal.slice(7) : undefined;
-    const authorizingAvatar = authorizingAvatarId ? (await store.getAvatar(authorizingAvatarId)) : undefined;
-    const authorizingAvatarBackingCaps = authorizingAvatar
-      ? (await avatarAuthorizationCapabilities(store, deps.authorization, authorizingAvatar, args.task.projectId))
+    const authorizer = authorizingAvatarId
+      ? (await authorizingAvatar(store, { id: args.taskId, projectId: args.task.projectId }, storedAuthorization?.principal)) : undefined;
+    const authorizingAvatarBackingCaps = authorizer
+      ? (await avatarAuthorizationCapabilities(store, deps.authorization, authorizer, args.task.projectId))
       : [];
+    const avatarGrant = avatar && roleAllowed
+      ? (await avatarAuthorizationCapabilities(store, deps.authorization, avatar, args.task.projectId)) : [];
     const principalGrant = avatar
-      ? (await avatarAuthorizationCapabilities(store, deps.authorization, avatar, args.task.projectId))
+      ? chosen ? attenuate(chosen.capabilities ?? [], avatarGrant) : avatarGrant
       : authorizingAvatarId
         ? attenuate(storedAuthorization?.capabilities ?? [], authorizingAvatarBackingCaps)
         : storedAuthorization?.capabilities ?? args.task.grant ?? DEFAULT_GRANT;
@@ -2858,7 +2941,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         (await record(args.taskId, 'token.minted', { tokenId: minted.record.id, profile: profile.id, caps: effective,
           audience: minted.record.audience, executionId: minted.record.executionId, expiresAt: minted.record.expiresAt,
           participant,
-          ...(avatar ? { avatarId: avatar.id, avatarOwnerUserId: avatar.ownerUserId, promptVersion: avatar.promptVersion } : {}) }));
+          ...(avatar ? { avatarId: avatar.id, avatarOwnerUserId: avatar.ownerUserId } : {}) }));
       }
 
       // JIT-resolve credentials via the broker (never journaled). Every current
@@ -3186,9 +3269,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               srcView?.transcripts?.find((t) => t.role === srcRole)?.messages ??
               (srcRole === 'do' ? srcView?.messages : undefined) ??
               [];
-            if (srcMsgs.length) {
-              messages = [...srcMsgs, ...ownView];
-              (await record(args.taskId, 'session.forked', { from: spec.resumeFrom, replayed: srcMsgs.length, native: false }));
+            // A source that never ran (an Avatar saved without running) has
+            // no conversation yet: forking it starts from its prompt.
+            const source = srcMsgs.length || srcRole !== 'do' ? undefined : (await store.getTask(spec.resumeFrom.taskId));
+            const seed = source && !source.lastView && String(source.params.prompt ?? '').trim()
+              ? [{ id: `${source.id}:prompt`, role: 'user' as const, text: String(source.params.prompt), ts: source.createdAt,
+                ...((source.params.files as FileRef[] | undefined)?.length ? { files: source.params.files as FileRef[] } : {}),
+                ...((source.params.images as ImageRef[] | undefined)?.length ? { images: source.params.images as ImageRef[] } : {}) }]
+              : srcMsgs;
+            if (seed.length) {
+              messages = [...seed, ...ownView];
+              (await record(args.taskId, 'session.forked', { from: spec.resumeFrom, replayed: seed.length, native: false }));
             }
           }
         }
@@ -3514,7 +3605,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               startedAt: Date.now(), endedAt: Date.now(), metadata: { ...usageMetadata,
                 metering: 'provider-reported', inputTokens: usage.inputTokens, outputTokens: usage.outputTokens,
                 cacheReadTokens: usage.cacheReadTokens ?? 0, cacheWriteTokens: usage.cacheWriteTokens ?? 0,
-                inputTokensIncludeCacheRead: usage.inputTokensIncludeCacheRead ?? false } });
+                inputTokensIncludeCacheRead: usage.inputTokensIncludeCacheRead ?? false,
+                ...(usage.models ? { models: usage.models } : {}) } });
           }
           if (fundingSource === 'managed') {
             const actualized = managedModelActualCost(modelProvider, profile.model, usage, managedReservationMicros!);
@@ -3717,6 +3809,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             providerInvoked = true;
           },
           onProviderResult: turn => { providerUsage = turn.usage; },
+          // A turn the usage limit ends spent tokens too: meter them (funding-analysis#2).
+          onProviderUsage: usage => { if (usage) providerUsage = usage; },
           signal: computeHold ? AbortSignal.any([...(signal ? [signal] : []), computeStop.signal]) : signal,
           heartbeat,
           pullFollowUps,
@@ -5185,7 +5279,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           title: changed.length > 1
             ? `${details.title?.trim() || BRAND} (${repo.name})`
             : details.title?.trim() || `${BRAND}: ${repo.branch}`,
-          body: prBody(handle, details, (await store.getTask(handle.id))?.num, changed.length > 1 ? repo.name : undefined),
+          body: prBody(handle, details, (await store.getTask(handle.id))?.num, changed.length > 1 ? repo.name : undefined,
+            openedByApp.get(api)?.requestedBy),
         });
         let opening: Awaited<ReturnType<typeof api.openOrUpdate>>;
         try {
@@ -5218,6 +5313,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           ...(pr.nodeId ? { nodeId: pr.nodeId } : {}),
         };
         (await record(handle.id, created ? 'pr.opened' : 'pr.updated', { ...ref, base, branch: repo.branch }));
+        const byApp = openedByApp.get(api);
+        if (byApp) (await record(handle.id, 'pr.opened-by-app', { repo: repo.name, slug, number: pr.number, url: pr.url,
+          created, userId: byApp.userId, requestedBy: byApp.requestedBy, reason: byApp.reason }));
         opened.push(ref);
       }
       return opened;
@@ -5283,9 +5381,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
      * confirmed a human Review layer), then checks that person's repository
      * role live. Current tasks enter GitHub's native queue or atomically
      * fast-forward the target to the exact validated head; historical versions
-     * retain direct PR merge behavior. The App installation is intentionally
-     * not a candidate: it may transport task branches, but it must not bypass a
-     * person's merge rights.
+     * retain direct PR merge behavior. The App installation is not a candidate
+     * of its own: it lands work only for a consenting person who has no GitHub
+     * account and whom tavya lets merge into the target (`appLanding`), so it
+     * never bypasses the merge rights of anyone GitHub knows.
      */
     async mergeGithubPrs(handle: WorldHandle, prs: TaskPullRequest[], options?: {
       mode?: 'submit' | 'observe' | 'inspect-exact' | 'submit-exact' | 'preflight' | 'claim-provider' | 'submit-fallback' | 'review-ci';
@@ -5399,6 +5498,19 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (eligible) { actorUserId = userId; actorPermissions = permissions; break; }
       }
 
+      // Nobody with a GitHub account can merge: a consenting person without
+      // one, whom tavya lets land work on this branch (`merge-into:<target>`),
+      // has it landed by the App. tavya's roles are the only rights such a
+      // person has; anyone who linked GitHub is judged by GitHub's instead.
+      let landedByApp: Awaited<ReturnType<typeof appLanding>>;
+      if (!actorUserId) {
+        landedByApp = await appLanding(task, candidates, prs).catch((error) => {
+          console.warn(`[karmax] could not prepare an App merge for ${handle.id}:`, error instanceof Error ? error.message : error);
+          return undefined;
+        });
+        if (landedByApp) { actorUserId = landedByApp.userId; actorPermissions = landedByApp.permissions; }
+      }
+
       if (!actorUserId) {
         // This scan is advisory only (for the reviewer picker); it is the same
         // answer GET /api/tasks/:id/merge-eligibility gives. Revalidation above
@@ -5415,8 +5527,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         };
       }
 
-      const accountId = (await accountFor(actorUserId));
-      const api = prApiForUser(actorUserId, accountId);
+      const accountId = landedByApp ? undefined : (await accountFor(actorUserId));
+      const api = landedByApp?.api ?? prApiForUser(actorUserId, accountId);
+      if (landedByApp && !readyCheck && !observeOnly && !inspectExact && !participantPreflight && !claimProviderOnly && !reviewCi)
+        (await record(handle.id, 'github.merge.by-app', { userId: actorUserId, requestedBy: landedByApp.requestedBy,
+          repositories: prs.filter((ref) => !ref.merged).map((ref) => ref.slug),
+          reason: `${landedByApp.requestedBy} has no GitHub account linked; ${BRAND} lets them land work on this branch` }));
       // PR authorship, approval and landing remain attributable to the selected
       // human. Read-only policy/CI inspection belongs to the repository
       // installation instead: it has the exact repository-scoped Checks and
@@ -7274,16 +7390,18 @@ function managedModelCostCeiling(provider: string, model?: string): number | und
   return Number.isSafeInteger(amount) && amount > 0 ? amount : undefined;
 }
 
-type PriceableUsage = {
+type TokenCounters = {
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens?: number;
   cacheWriteTokens?: number;
   inputTokensIncludeCacheRead?: boolean;
-} | undefined;
+};
+type PriceableUsage = (TokenCounters & { models?: Record<string, TokenCounters> }) | undefined;
 
-/** Actualize an active managed reservation from provider token counters. If the
- * installation has no complete price for the counters returned, retain the
+/** Actualize an active managed reservation from provider token counters, each
+ * model a turn used (a sub-agent may run on a cheaper one) at its own price. If
+ * the installation has no complete price for the counters returned, retain the
  * admission ceiling as an explicitly estimated charge so completed requests
  * can never bypass the monthly hard cap. */
 function managedModelActualCost(provider: string, model: string | undefined, usage: PriceableUsage,
@@ -7291,15 +7409,16 @@ function managedModelActualCost(provider: string, model: string | undefined, usa
   const raw = process.env.KARMAX_MANAGED_MODEL_PRICING;
   let values: Record<string, unknown> = {};
   try { values = raw ? JSON.parse(raw) as Record<string, unknown> : {}; } catch { /* estimate below */ }
-  const keys = [`${provider}/${model ?? '*'}`, `${provider}/*`, provider];
-  const pricingKey = keys.find((key) => values[key] && typeof values[key] === 'object');
-  const pricing = pricingKey ? values[pricingKey] as Record<string, unknown> : undefined;
-  if (usage && pricing) {
-    const cacheReadTokens = Math.max(0, Number(usage.cacheReadTokens ?? 0));
-    const cacheWriteTokens = Math.max(0, Number(usage.cacheWriteTokens ?? 0));
-    const inputTokens = Math.max(0, Number(usage.inputTokens ?? 0));
-    const outputTokens = Math.max(0, Number(usage.outputTokens ?? 0));
-    const uncachedInputTokens = usage.inputTokensIncludeCacheRead
+  const price = (model: string | undefined, counters: TokenCounters) => {
+    const keys = [`${provider}/${model ?? '*'}`, `${provider}/*`, provider];
+    const pricingKey = keys.find((key) => values[key] && typeof values[key] === 'object');
+    const pricing = pricingKey ? values[pricingKey] as Record<string, unknown> : undefined;
+    if (!pricing) return undefined;
+    const cacheReadTokens = Math.max(0, Number(counters.cacheReadTokens ?? 0));
+    const cacheWriteTokens = Math.max(0, Number(counters.cacheWriteTokens ?? 0));
+    const inputTokens = Math.max(0, Number(counters.inputTokens ?? 0));
+    const outputTokens = Math.max(0, Number(counters.outputTokens ?? 0));
+    const uncachedInputTokens = usage?.inputTokensIncludeCacheRead
       ? Math.max(0, inputTokens - cacheReadTokens) : inputTokens;
     const rate = (name: string, tokens: number): number | undefined => {
       if (!tokens) return 0;
@@ -7310,13 +7429,25 @@ function managedModelActualCost(provider: string, model: string | undefined, usa
     const outputRate = rate('outputMicrosPerMillionTokens', outputTokens);
     const cacheReadRate = rate('cacheReadMicrosPerMillionTokens', cacheReadTokens);
     const cacheWriteRate = rate('cacheWriteMicrosPerMillionTokens', cacheWriteTokens);
-    if ([inputRate, outputRate, cacheReadRate, cacheWriteRate].every((value) => value != null)) {
-      const costMicros = Math.ceil((uncachedInputTokens * inputRate! + outputTokens * outputRate!
-        + cacheReadTokens * cacheReadRate! + cacheWriteTokens * cacheWriteRate!) / 1_000_000);
+    if (![inputRate, outputRate, cacheReadRate, cacheWriteRate].every((value) => value != null)) return undefined;
+    const costMicros = Math.ceil((uncachedInputTokens * inputRate! + outputTokens * outputRate!
+      + cacheReadTokens * cacheReadRate! + cacheWriteTokens * cacheWriteRate!) / 1_000_000);
+    return Number.isSafeInteger(costMicros)
+      ? { costMicros, pricingKey, uncachedInputTokens, outputTokens, cacheReadTokens, cacheWriteTokens } : undefined;
+  };
+  if (usage) {
+    const models = Object.entries(usage.models ?? {});
+    const priced = models.length ? models.map(([name, counters]) => [name, price(name, counters)] as const) : undefined;
+    if (priced?.every(([, cost]) => cost)) {
+      const costMicros = priced.reduce((sum, [, cost]) => sum + cost!.costMicros, 0);
       if (Number.isSafeInteger(costMicros)) return { costMicros, classification: 'incurred', metadata: {
-        costBasis: 'configured-provider-token-pricing', pricingKey, uncachedInputTokens, outputTokens,
-        cacheReadTokens, cacheWriteTokens,
-      } };
+        costBasis: 'configured-provider-token-pricing', models: Object.fromEntries(priced) } };
+    } else if (!priced) {
+      const cost = price(model, usage);
+      if (cost) {
+        const { costMicros, ...counted } = cost;
+        return { costMicros, classification: 'incurred', metadata: { costBasis: 'configured-provider-token-pricing', ...counted } };
+      }
     }
   }
   return { costMicros: reservationMicros, classification: 'estimated', metadata: {

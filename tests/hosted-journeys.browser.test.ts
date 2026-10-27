@@ -25,6 +25,8 @@ const LAUNCH_ENV = {
  *  can ever leave the process. */
 class PaddleStub {
   readonly transactions = new Map<string, any>();
+  readonly subscriptions = new Map<string, any>();
+  readonly patches: any[] = [];
   readonly fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     const url = new URL(String(input)), method = init?.method ?? 'GET';
     if (url.origin !== 'https://api.paddle.com') throw new Error(`unexpected request to ${url.origin}`);
@@ -36,6 +38,14 @@ class PaddleStub {
       this.transactions.set(id, transaction);
       return Response.json({ data: transaction }, { status: 201 });
     }
+    const subscription = this.subscriptions.get(url.pathname.match(/^\/subscriptions\/([^/]+)$/)?.[1] ?? '');
+    if (subscription && method === 'GET') return Response.json({ data: subscription });
+    if (subscription && method === 'PATCH') {
+      const body = JSON.parse(String(init!.body));
+      this.patches.push(body);
+      subscription.items = body.items.map((item: any) => ({ price: { id: item.price_id, product_id: 'pro_journey' }, quantity: item.quantity }));
+      return Response.json({ data: subscription });
+    }
     if (method === 'GET' && url.pathname === '/transactions')
       return Response.json({ data: [...this.transactions.values()], meta: { pagination: { has_more: false } } });
     const one = this.transactions.get(url.pathname.match(/^\/transactions\/([^/]+)$/)?.[1] ?? '');
@@ -44,11 +54,13 @@ class PaddleStub {
   }) as typeof fetch;
 
   /** The signed notification Paddle sends once the buyer has paid. */
-  subscriptionCreated(transactionId: string) {
+  subscriptionCreated(transactionId: string, subscriptionId = 'sub_journey') {
+    const subscription = { id: subscriptionId, customer_id: 'ctm_journey', transaction_id: transactionId, status: 'active',
+      current_billing_period: { ends_at: new Date(Date.now() + 30 * 86_400_000).toISOString() }, scheduled_change: null,
+      items: this.transactions.get(transactionId).items.map((item: any) => ({ ...item, price: { ...item.price, product_id: 'pro_journey' } })) };
+    this.subscriptions.set(subscriptionId, subscription);
     const raw = JSON.stringify({ event_id: `evt_${transactionId}`, event_type: 'subscription.created', occurred_at: new Date().toISOString(),
-      data: { id: 'sub_journey', customer_id: 'ctm_journey', transaction_id: transactionId, status: 'active',
-        current_billing_period: { ends_at: new Date(Date.now() + 30 * 86_400_000).toISOString() }, scheduled_change: null,
-        items: this.transactions.get(transactionId).items.map((item: any) => ({ ...item, price: { ...item.price, product_id: 'pro_journey' } })) } });
+      data: subscription });
     const timestamp = Math.floor(Date.now() / 1000);
     return { raw, signature: `ts=${timestamp};h1=${crypto.createHmac('sha256', PADDLE.webhookSecret).update(`${timestamp}:${raw}`).digest('hex')}` };
   }
@@ -71,6 +83,7 @@ async function signUp(page: Page, name: string, email: string) {
 describe('hosted console journeys (real gateway, stubbed paid providers)', () => {
   let g: HostedGateway;
   let browser: Browser;
+  let subscriptions: SubscriptionBillingService;
   const paddle = new PaddleStub();
 
   beforeAll(async () => {
@@ -82,8 +95,8 @@ describe('hosted console journeys (real gateway, stubbed paid providers)', () =>
       // needs the saved connection.
       providerConnections.test = async (organizationId, provider) =>
         (await providerConnections.list(organizationId)).find((connection) => connection.provider === provider)!;
-      return { paidLaunchSettings, providerConnections,
-        subscriptions: new SubscriptionBillingService(store, new PaddleSubscriptionProvider(() => paidLaunchSettings.paddleConfig(), paddle.fetch), true) };
+      subscriptions = new SubscriptionBillingService(store, new PaddleSubscriptionProvider(() => paidLaunchSettings.paddleConfig(), paddle.fetch), true);
+      return { paidLaunchSettings, providerConnections, subscriptions };
     });
     // The installation's first account, so sign-up is open to everyone else.
     await g.owner({ name: 'Operator', email: 'operator@example.test', password: PASSWORD, organization: 'Operator workspace' });
@@ -164,8 +177,9 @@ describe('hosted console journeys (real gateway, stubbed paid providers)', () =>
       await page.locator('#signup-open').click();
       await page.getByText('Accepting an invitation').waitFor();
       await signUp(page, 'Ivan Invitee', 'ivan@example.test');
-      await step('the invitation is accepted', () => page.getByText('Invitation accepted.').waitFor());
-      expect(new URL(page.url()).pathname).toBe(`/${organization.slug}/settings`);
+      // A newcomer lands where the team works, welcomed, not in its settings.
+      await step('the invitation is accepted', () => page.getByText('Welcome to Olive Team').waitFor());
+      expect(new URL(page.url()).pathname).toBe(`/${organization.slug}`);
       const [ivan] = (await g.identity.listUsers()).filter((candidate) => candidate.email === 'ivan@example.test');
       expect(await g.store.organizationMembership(organization.id, ivan!.id)).toBeTruthy();
 
@@ -205,6 +219,55 @@ describe('hosted console journeys (real gateway, stubbed paid providers)', () =>
       await page.reload();
       await step('the plan is active', () => page.locator('#org-plan .plan-name').filter({ hasText: 'Individual' }).waitFor());
       expect(await page.locator('#org-plan .plan-head').innerText()).toMatch(/Individual\s+\$9\/month · renews/);
+      expect(errors).toEqual([]);
+    } finally { await context.close(); }
+  }, 90_000);
+
+  it('buys storage packs beside a gifted plan: checkout first, then the same subscription', async () => {
+    const { user: owner, organization } = await g.owner({ name: 'Gita Gifted', email: 'gita@example.test', password: PASSWORD, organization: 'Gita Studio' });
+    await subscriptions.gift(organization.id, 'team', 'user:operator', 'journey-gift-team');
+    const { page, errors, step, context } = await openConsole(browser, { ip: '192.0.2.41' });
+    await context.route('https://cdn.paddle.com/**', (route) => route.fulfill({ contentType: 'application/javascript', body: `
+      window.Paddle = { Environment: { set() {} }, Checkout: { open() {} },
+        Initialize(options) { setTimeout(() => options.eventCallback({ name: 'checkout.completed' }), 50); } };` }));
+    try {
+      await signIn(context, g.url, owner.email, PASSWORD);
+      await step('open Plan & billing', () => page.goto(`${g.url}/${organization.slug}/settings#settings-plan`));
+      const plan = page.locator('#org-plan');
+      await plan.locator('.plan-head').getByText('Gifted').waitFor();
+      // Nothing to remove yet; the first pack is bought at checkout, with the policies accepted.
+      expect(await plan.getByRole('button', { name: 'Remove a storage pack' }).isDisabled()).toBe(true);
+      await plan.getByRole('button', { name: 'Add a storage pack' }).click();
+      const dialog = page.getByRole('dialog', { name: 'Add a storage pack' });
+      await step('the checkout dialog opens', () => dialog.waitFor());
+      expect(await dialog.innerText()).toContain('100 GB for $4/month');
+      if (process.env.KARMAX_REVIEW_SCREENSHOT_DIALOG) await page.screenshot({ path: process.env.KARMAX_REVIEW_SCREENSHOT_DIALOG });
+      await dialog.getByRole('button', { name: 'Checkout' }).click();
+      await step('checkout needs the policies', () => page.getByText('Accept the current policies to continue.').waitFor());
+      await dialog.locator('#checkout-policy-acceptance').check();
+      await dialog.getByRole('button', { name: 'Checkout' }).click();
+      await step('Paddle checkout returns to settings', () => page.waitForURL(/billing=success/));
+      const transaction = [...paddle.transactions.values()].at(-1);
+      expect(transaction.items).toEqual([{ price: { id: PADDLE.storagePackPriceId }, quantity: 1 }]);
+      const acceptances = await g.store.policyAcceptances(owner.id);
+      expect(acceptances.find((acceptance: any) => acceptance.checkoutSessionReference === transaction.id)?.commercialTerms)
+        .toMatchObject({ planId: null, storagePacks: 1, monthlyTotalPriceCents: 400 });
+
+      const notification = paddle.subscriptionCreated(transaction.id, 'sub_gifted_packs');
+      expect((await fetch(`${g.url}/api/subscriptions/paddle/webhook`, { method: 'POST', body: notification.raw,
+        headers: { 'paddle-signature': notification.signature } })).status).toBe(200);
+      await page.reload();
+      await step('the pack is billed beside the gift', () => plan.locator('.plan-head').getByText('Packs $4/month', { exact: false }).waitFor());
+      expect(await plan.locator('.plan-head').innerText()).toMatch(/Team\s+Gifted\s+Packs \$4\/month · renews/);
+      expect(await plan.locator('[data-limit="storage"]').innerText()).toMatch(/of 200 GB\s+−\s+1\s+\+\s+pack/);
+      if (process.env.KARMAX_REVIEW_SCREENSHOT) await page.locator('#settings-billing').screenshot({ path: process.env.KARMAX_REVIEW_SCREENSHOT });
+
+      // The next pack changes that subscription: no second checkout.
+      const checkouts = paddle.transactions.size;
+      await plan.getByRole('button', { name: 'Add a storage pack' }).click();
+      await step('the subscription is changed', () => expect.poll(() => paddle.patches.length).toBe(1));
+      expect(paddle.patches[0]).toEqual({ items: [{ price_id: PADDLE.storagePackPriceId, quantity: 2 }], proration_billing_mode: 'prorated_next_billing_period' });
+      expect(paddle.transactions.size).toBe(checkouts);
       expect(errors).toEqual([]);
     } finally { await context.close(); }
   }, 90_000);

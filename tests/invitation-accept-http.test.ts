@@ -80,6 +80,20 @@ describe.each(storeBackends)('invitation acceptance over HTTP ($name)', ({ open 
     expect((await store.listOrganizationInvitations(organization.id))[0]!.acceptedAt).toEqual(expect.any(Number));
   });
 
+  it('makes the team an invitee joined their home, unless their own workspace already holds projects', async () => {
+    const { store, organization, as, invite } = await boot(open);
+    const own = await store.createOrganization({ name: 'Invitee', ownerUserId: 'invitee', kind: 'personal' });
+    await store.setDefaultOrganization('invitee', own.id);
+    expect((await as('invitee')('/api/invitations/accept', { token: await invite('invitee@example.test') })).status).toBe(200);
+    expect((await store.defaultOrganization('invitee'))?.id).toBe(organization.id);
+
+    const busy = await store.createOrganization({ name: 'Stranger', ownerUserId: 'stranger', kind: 'personal' });
+    await store.createProject('Own work', {}, busy.id);
+    await store.setDefaultOrganization('stranger', busy.id);
+    expect((await as('stranger')('/api/invitations/accept', { token: await invite('stranger@example.test') })).status).toBe(200);
+    expect((await store.defaultOrganization('stranger'))?.id).toBe(busy.id);
+  });
+
   it('refuses a used, expired, forged or someone else\'s invitation as a 400 without granting access', async () => {
     const { store, authorization, organization, syncSeats, as, invite } = await boot(open);
     const accept = (userId: string, token: string) => as(userId)('/api/invitations/accept', { token });
