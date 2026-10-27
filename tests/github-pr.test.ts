@@ -110,7 +110,7 @@ async function repoWithGithubOrigin(name: string, slug = SLUG): Promise<string> 
 }
 
 async function coreFor(github: { options: { apiBase?: string; fetch?: typeof fetch } },
-  githubApp?: Record<string, unknown>, dbPath = ':memory:') {
+  githubApp?: Record<string, unknown>, dbPath = ':memory:', extra: { authorization?: (store: any) => Promise<unknown> } = {}) {
   const { Store } = await import('../src/store/db.js');
   const { WorldRegistry } = await import('../src/world/registry.js');
   const { ProfileResolver } = await import('../src/agent/profiles.js');
@@ -121,7 +121,8 @@ async function coreFor(github: { options: { apiBase?: string; fetch?: typeof fet
   const core = makeCoreActivities({ store, worlds, adapters: new Map(),
     profiles: new ProfileResolver(store, 'mock'), broker, githubPr: github.options,
     contentDir: path.join(tmp, 'content'),
-    ...(githubApp ? { githubApp: githubApp as any } : {}) });
+    ...(githubApp ? { githubApp: githubApp as any } : {}),
+    ...(extra.authorization ? { authorization: (await extra.authorization(store)) as any } : {}) });
   return Object.assign(core, { store });
 }
 
@@ -802,6 +803,77 @@ describe('GitHub-authoritative merge activity', () => {
       base: 'main', repo: tmp, root: tmp } as any, stale.prs)).resolves.toMatchObject({
         status: 'merged', actorUserId: 'reviewer',
       });
+  });
+
+  describe('a person without GitHub whom tavya lets land the work', () => {
+    async function landing(options: { linked?: boolean; level?: 'developer' | 'viewer' } = {}) {
+      const requests: Array<{ auth: string | null; method: string; path: string; body: any }> = [];
+      const fetcher = (async (input: string | URL | Request, init: RequestInit = {}) => {
+        const url = new URL(String(input));
+        const method = init.method ?? 'GET';
+        requests.push({ auth: new Headers(init.headers).get('authorization'), method, path: url.pathname, body: init.body ? JSON.parse(String(init.body)) : {} });
+        if (method === 'GET' && url.pathname === `/repos/${SLUG}`) return Response.json({ allow_merge_commit: false, allow_squash_merge: true });
+        if (method === 'GET') return Response.json({ number: 7, node_id: 'PR_node', html_url: 'https://github.test/acme/widgets/pull/7',
+          state: 'open', merged: false, head: { ref: 'tavya/task_app', sha: 'reviewed-head' }, base: { ref: 'main' } });
+        if (method === 'PUT' && url.pathname.endsWith('/merge')) return Response.json({ merged: true, sha: 'merge-sha', message: 'merged' });
+        return Response.json({ message: 'not found' }, { status: 404 });
+      }) as typeof fetch;
+      const app = {
+        activeUserAccountId: async () => undefined,
+        hasLinkedUserAccount: async () => options.linked ?? false,
+        repositoryPermission: async () => { throw new Error('no GitHub account'); },
+        userAccessToken: async () => { throw new Error('no GitHub account'); },
+        installationToken: async () => 'installation-token',
+      };
+      let authorization: any;
+      const core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app, ':memory:', {
+        authorization: async (store) => {
+          const { AuthorizationService } = await import('../src/platform/authorization.js');
+          return (authorization = await AuthorizationService.create(store));
+        },
+      });
+      (await core.store.claimPersonalOrganization('owner'));
+      const project = (await core.store.createProject('Merge without GitHub'));
+      (await core.store.setOrganizationMembership(project.organizationId!, 'pat', 'member'));
+      await authorization.replacePrincipalAuthorization('system:test', 'user:pat', project.organizationId!, { level: options.level ?? 'developer', scope: 'organization' }, ['*']);
+      const connection = (await core.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+        installationId: 'app-installation', accountLogin: 'acme', accountType: 'Organization' }));
+      const enrolled = (await core.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+        providerId: 'widgets-id', owner: 'acme', name: 'widgets', sshUrl: 'git@github.com:acme/widgets.git',
+        defaultBranch: 'main', private: true, gitConnectionId: connection.id }));
+      (await core.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+      const task = (await core.store.createTask({ projectId: project.id, title: 'Land me', workflow: 'software-dev',
+        workflowVersion: '1.12.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'pat' } }));
+      (await core.store.appendEvent({ taskId: task.id, type: 'task.confirmation-voted', ts: 1,
+        payload: { userId: 'pat', satisfied: true, githubMergeAuthorized: true,
+          githubPrHeads: [{ slug: SLUG, number: 7, headSha: 'reviewed-head' }] } }));
+      const result = await core.mergeGithubPrs({ id: task.id, kind: 'worktree', branch: 'tavya/task_app',
+        base: 'main', repo: tmp, root: tmp } as any, [{ repo: 'widgets', slug: SLUG, number: 7,
+        url: 'https://github.test/acme/widgets/pull/7', state: 'open', headSha: 'reviewed-head' }]);
+      return { core, task, result, requests };
+    }
+
+    it('has the App land it for them, in the repository’s merge method, and says so', async () => {
+      const { core, task, result, requests } = await landing();
+      expect(result).toMatchObject({ status: 'merged', actorUserId: 'pat', sha: 'merge-sha' });
+      expect(requests.find((request) => request.method === 'PUT')).toMatchObject({
+        auth: 'Bearer installation-token', body: { sha: 'reviewed-head', merge_method: 'squash' },
+      });
+      const [event] = (await core.store.eventsOfTypes(task.id, ['github.merge.by-app']));
+      expect(event?.payload).toMatchObject({ userId: 'pat', repositories: [SLUG] });
+    });
+
+    it('leaves someone who linked GitHub to GitHub’s own merge rights', async () => {
+      const { result, requests } = await landing({ linked: true });
+      expect(result).toMatchObject({ status: 'needs-authorizer' });
+      expect(requests.some((request) => request.method === 'PUT')).toBe(false);
+    });
+
+    it('needs a tavya role that may land the work', async () => {
+      const { result, requests } = await landing({ level: 'viewer' });
+      expect(result).toMatchObject({ status: 'needs-authorizer' });
+      expect(requests.some((request) => request.method === 'PUT')).toBe(false);
+    });
   });
 
   it('returns a conflicting current proposal to Do instead of attempting a GitHub merge', async () => {
@@ -2280,7 +2352,7 @@ describe('PR stage (remote policy "pr")', () => {
     await git(handle.root, ['commit', '-q', '-m', 'change']);
 
     await expect(core.openPr(handle, 'main', {})).rejects.toThrow(
-      /GitHub PR identity is not connected.*Last recorded authorization failure:.*bad_refresh_token.*2026-08-17T06:30:00\.000Z.*not a non-fast-forward or local ancestry error/i,
+      /^Your GitHub connection needs to be renewed\. Open your profile and reconnect GitHub, then press Retry\. .*bad_refresh_token.*2026-08-17T06:30:00\.000Z.*not a branch-history conflict/i,
     );
     expect(transport).not.toHaveBeenCalled();
     await core.destroyWorld(handle);
@@ -2797,30 +2869,49 @@ describe('PR webhooks → karmax events', () => {
 describe('Pull requests opened as a person who cannot see the repository', () => {
   const WIKI_SLUG = 'srajma/project-wiki';
 
-  async function setup(options: { acceptable?: boolean; invitedTo?: string; adminInOrganization?: boolean } = {}) {
+  /** `manage`: the App may add collaborators to the code repository too (it
+   * always may on the wiki). `github`: what the creator linked on GitHub. */
+  async function setup(options: { acceptable?: boolean; invitedTo?: string; adminInOrganization?: boolean; manage?: boolean;
+    github?: 'linked' | 'none' | 'broken' } = {}) {
     const gh = fakeGithub();
     const visible = new Set<string>([SLUG]);
     const fetcher = (async (url: string, init: RequestInit = {}) => {
       const slug = new URL(String(url)).pathname.match(/^\/repos\/([^/]+\/[^/]+)/)?.[1];
-      if (slug && !visible.has(slug)) return Response.json({ message: 'Not Found' }, { status: 404 });
+      // The App's installation sees every repository it is installed on.
+      const app = new Headers(init.headers).get('authorization') === 'Bearer installation-token';
+      if (slug && !app && !visible.has(slug)) return Response.json({ message: 'Not Found' }, { status: 404 });
       return gh.fetcher(url, init);
     }) as typeof fetch;
     const accepted: unknown[][] = [];
+    const linked = (options.github ?? 'linked') === 'linked';
     const app = {
-      status: () => ({ userAuthorized: true, oauthConfigured: true }),
-      activeUserAccountId: () => 'member-account',
-      listUserAccounts: async (userId: string) => userId === 'member' ? [{ id: 'member-account', login: 'octo-member', active: true }]
+      status: () => ({ userAuthorized: linked, oauthConfigured: true,
+        ...(options.github === 'broken' ? { lastAuthorizationFailure: { code: 'refresh_rejected',
+          summary: 'GitHub rejected the refresh token (bad_refresh_token). Reconnect GitHub.',
+          occurredAt: Date.parse('2026-08-17T06:30:00.000Z'), disconnected: true, providerError: 'bad_refresh_token' } } : {}) }),
+      activeUserAccountId: () => linked ? 'member-account' : undefined,
+      hasLinkedUserAccount: async (userId: string) => userId === 'member' ? options.github !== 'none' : true,
+      listUserAccounts: async (userId: string) => userId === 'member' ? linked ? [{ id: 'member-account', login: 'octo-member', active: true }] : []
         : userId === 'owner' && options.adminInOrganization ? [{ id: 'owner-account', login: 'srajma', active: true }] : [],
-      userAccessToken: async () => 'member-token',
+      userAccessToken: async () => {
+        if (!linked) throw new Error('GitHub is not connected');
+        return 'member-token';
+      },
+      installationToken: async () => 'installation-token',
       brokerCredentials: async () => ({ env: {} }),
-      repositoryCollaborators: async (repository: { name: string }) => repository.name !== 'project-wiki' ? [{ login: 'srajma', role: 'admin' }]
+      repositoryCollaborators: async (repository: { name: string }) => repository.name !== 'project-wiki'
+        ? [{ login: 'srajma', role: 'admin' }, ...(options.manage && visible.has(SLUG) ? [{ login: 'octo-member', role: 'push' }] : [])]
         : [...visible].includes(WIKI_SLUG) ? [{ login: 'octo-member', role: 'push' }] : [],
       repositoryInvitations: async () => [],
-      addRepositoryCollaborator: async () => ({ invitationId: 5 }),
+      addRepositoryCollaborator: async (repository: { name: string }) => {
+        if (repository.name === 'project-wiki') return { invitationId: 5 };
+        if (!options.manage) throw new Error('GitHub API 403: Resource not accessible by integration');
+        return { invitationId: 6 };
+      },
       acceptRepositoryInvitation: async (...args: unknown[]) => {
         accepted.push(args);
         if (options.acceptable === false) throw new Error('GitHub API 404: invitation not found');
-        visible.add(WIKI_SLUG);
+        visible.add(args[2] === 6 ? SLUG : WIKI_SLUG);
       },
       removeRepositoryCollaborator: async () => undefined,
       acceptPendingRepositoryInvitation: async (userId: string, accountId: string, repository: { owner: string; name: string }, login: string) => {
@@ -2867,6 +2958,50 @@ describe('Pull requests opened as a person who cannot see the repository', () =>
     expect(opened.map((pr: TaskPullRequest) => pr.slug)).toEqual([SLUG, WIKI_SLUG]);
     expect(accepted).toEqual([['member', 'member-account', 5]]);
     expect(gh.prs.map((pr) => pr.repo)).toEqual([SLUG, WIKI_SLUG]);
+  });
+
+  it('gives the task\'s creator access to the project\'s code repository before acting as them', async () => {
+    const { core, gh, visible, accepted, handle } = await setup({ manage: true });
+    // Never invited by hand: GitHub would answer the pull request with 404.
+    visible.delete(SLUG);
+    const opened = await core.openPr(handle, 'main', { title: 'Member task' });
+    expect(opened.map((pr: TaskPullRequest) => pr.slug)).toEqual([SLUG, WIKI_SLUG]);
+    expect(accepted).toEqual([['member', 'member-account', 6], ['member', 'member-account', 5]]);
+    expect(gh.prs.map((pr) => pr.repo)).toEqual([SLUG, WIKI_SLUG]);
+    expect(gh.tokens.filter((token) => token === 'Bearer installation-token')).toEqual([]);
+  });
+
+  it('opens the pull request as the App for a creator with no GitHub account, naming them', async () => {
+    const { core, gh, handle, task } = await setup({ github: 'none' });
+    core.store.connectUserNames(() => [{ id: 'member', name: 'Mira Member', email: 'mira@example.com' }]);
+    const opened = await core.openPr(handle, 'main', { title: 'Member task', summary: 'Changed the intro.' });
+    expect(opened.map((pr: TaskPullRequest) => pr.slug)).toEqual([SLUG, WIKI_SLUG]);
+    expect(gh.prs.map((pr) => pr.body)).toEqual([
+      expect.stringContaining('Requested in tavya by Mira Member'),
+      expect.stringContaining('Requested in tavya by Mira Member'),
+    ]);
+    expect(gh.prs[0].body).toMatch(/^Changed the intro\./);
+    expect(gh.tokens).toContain('Bearer installation-token');
+    expect(gh.tokens).not.toContain('Bearer member-token');
+    const events = (await core.store.eventsSince(task.id, 0)).filter((event: any) => event.type === 'pr.opened-by-app');
+    expect(events.map((event: any) => event.payload)).toEqual([
+      expect.objectContaining({ slug: SLUG, requestedBy: 'Mira Member', reason: expect.stringMatching(/no GitHub account/) }),
+      expect.objectContaining({ slug: WIKI_SLUG, requestedBy: 'Mira Member' }),
+    ]);
+  });
+
+  it('names a creator without a display name by e-mail when the App opens their pull request', async () => {
+    const { core, gh, handle } = await setup({ github: 'none' });
+    core.store.connectUserNames(() => [{ id: 'member', name: '', email: 'mira@example.com' }]);
+    await core.openPr(handle, 'main', { title: 'Member task' });
+    expect(gh.prs[0].body).toContain('Requested in tavya by mira@example.com');
+  });
+
+  it('asks a creator whose GitHub connection broke to reconnect, in plain words', async () => {
+    const { core, gh, handle } = await setup({ github: 'broken' });
+    await expect(core.openPr(handle, 'main', { title: 'Member task' })).rejects.toThrow(
+      /^Your GitHub connection needs to be renewed\. Open your profile and reconnect GitHub, then press Retry\./);
+    expect(gh.prs).toEqual([]);
   });
 
   it('accepts the invitation a creator has not accepted yet, then opens the pull request', async () => {

@@ -579,6 +579,21 @@ a.git-repo-name:hover { color:var(--accent); }
 .git-repo-add input:focus { border-color:var(--accent); }
 .git-repo-add input:disabled { background:transparent; }
 .git-facts { margin-top:14px; }
+/* The add-a-repository combobox: its menu is fixed, so .git-repos' rounded
+   clipping never cuts it off. */
+.repo-combo { flex:1; min-width:0; }
+.repo-combo > input { padding-right:10px !important; }
+.repo-combo-menu { position:fixed; right:auto; }
+.combo-opt.repo-opt { display:flex; align-items:center; gap:8px; }
+.repo-opt-icon { flex:none; display:grid; place-items:center; width:15px; color:var(--ink-3); }
+.repo-opt-icon svg { width:14px; height:14px; }
+.repo-opt-mark { color:var(--accent); font-weight:700; }
+.repo-opt-mark::before { content:'+'; }
+.repo-opt-fork .repo-opt-mark::before { content:'⑂'; font-weight:400; }
+.repo-opt-name { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:550; }
+.repo-opt-name > span { color:var(--ink-3); font-weight:400; }
+.repo-opt-create .repo-opt-name, .repo-opt-fork .repo-opt-name { color:var(--accent); }
+.repo-opt-note { flex:none; color:var(--ink-3); font-size:11px; }
 @media (max-width:560px) {
   .git-repo-add { flex-wrap:wrap; }
   .git-repo-add input { flex-basis:100%; }
@@ -601,6 +616,12 @@ a.git-repo-name:hover { color:var(--accent); }
 .new-project-dialog textarea { padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--surface-2); outline:none; resize:vertical; font:12px/1.5 var(--font-mono); }
 .new-project-dialog textarea:focus { border-color:var(--accent); }
 .np-h { margin-bottom:6px; }
+.np-default { display:grid; gap:6px; margin:-4px 0 14px; }
+.np-default-row { display:flex; align-items:center; gap:8px; cursor:pointer; color:var(--ink-2); font-size:13px; }
+.np-default-row input { flex:none; margin:0; accent-color:var(--accent); }
+.np-default-row code { padding:1px 6px; border-radius:5px; background:var(--surface-2); color:var(--ink); font:12px var(--font-mono); }
+.np-default-blank { color:var(--ink-3); }
+.np-repos[hidden], .np-default[hidden] { display:none; }
 .np-loading { padding:10px 0; color:var(--ink-3); font-size:12px; }
 .np-github .setting-row { min-height:40px; }
 .np-github .setting-label { width:auto; min-width:64px; }
@@ -923,7 +944,7 @@ a.git-repo-name:hover { color:var(--accent); }
 .review-info iframe { display: block; width: 100%; height: 360px; margin-top: 8px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
 .review-warn { margin-top: 5px; color: var(--warn, #c60); font-weight: 600; font-size: 12.5px; }
 .msg.system.error { align-self: stretch; max-width: none; padding: 9px 12px; border: 1px solid var(--danger); border-radius: 8px; background: var(--danger-weak); color: var(--ink); font-style: normal; font-size: 12.5px; }
-.msg.system.error .msg-text { white-space: pre-wrap; font-family: var(--font-mono); font-size: 12px; }
+.msg.system.error .msg-text { white-space: pre-wrap; font-size: 13px; line-height: 1.5; }
 .palette.ah-dialog { width: min(720px, 94vw); }
 .ah-dialog .ah-body { max-height: 70vh; overflow-y: auto; padding: 12px 16px 16px; }
 
@@ -1785,6 +1806,10 @@ a.ins-task-title:hover { color: var(--accent); }
 .toasts { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; gap: 8px; z-index: 100; }
 .toast { background: var(--ink); color: var(--paper); padding: 10px 16px; border-radius: 9px; box-shadow: var(--shadow); font-size: 13px; animation: rise .2s ease; display: flex; align-items: center; max-width: min(520px, calc(100vw - 32px)); }
 .toast.err { background: var(--danger); color: #fff; }
+/* A task error's exact text, folded under its plain summary. */
+.error-details { margin-top:6px; font-size:12px; color:var(--ink-3); }
+.error-details > summary { cursor:pointer; width:max-content; }
+.error-details pre { margin:6px 0 0; padding:8px 10px; border-radius:7px; background:var(--surface-2); color:var(--ink-2); white-space:pre-wrap; word-break:break-word; font:11px/1.5 var(--font-mono); max-height:240px; overflow:auto; }
 /* Errors linger, so they need a way out that isn't waiting. */
 .toast-dismiss { flex: none; margin: -4px -8px -4px 12px; padding: 0 6px; border: 0; background: none; color: inherit; opacity: .7; font-size: 16px; line-height: 1.4; cursor: pointer; border-radius: 5px; }
 .toast-dismiss:hover { opacity: 1; }

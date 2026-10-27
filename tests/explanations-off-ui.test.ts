@@ -4,14 +4,14 @@ import { closeConsoleBrowser, consolePage } from './helpers/console-page.js';
 afterAll(closeConsoleBrowser);
 
 // "Explain this" follows the server's feature flag: off hides the button and
-// the Explanation model settings, but keeps the TeX toggle beside each message.
+// the Explanation model settings, but keeps the TeX toggle beside each message with math.
 describe('Explain this, behind /api/meta explanationsEnabled', () => {
   for (const enabled of [false, true]) {
     it(`${enabled ? 'shows' : 'hides'} the button and the settings card when ${enabled ? 'on' : 'off'}`, async () => {
       const ui = await consolePage();
       const counts = await ui.run<{ run: number; more: number; tex: number; card: string }>(`
         S.meta = { ...S.meta, explanationsEnabled: ${enabled} };
-        $('#main').innerHTML = explainMessageAffordance({ sourceKey: 'message:1', conversationRole: 'do' }, { taskId: 't1' });
+        $('#main').innerHTML = explainMessageAffordance({ sourceKey: 'message:1', conversationRole: 'do', message: { text: 'Area: $x^2$' } }, { taskId: 't1' });
         ({ run: $('#main').querySelectorAll('.explain-run').length, more: $('#main').querySelectorAll('.explain-more').length,
            tex: $('#main').querySelectorAll('.tex-toggle').length, card: explanationSettingsCard('project') })
       `);
