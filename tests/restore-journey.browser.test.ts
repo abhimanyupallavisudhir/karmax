@@ -87,8 +87,11 @@ it('restores a backup over lost state, and the console carries the restored task
   const confirm = page.locator('#tp-foot [data-act="confirm"]:not([disabled])');
   await step('its restored workflow is still waiting in Review', () => confirm.waitFor({ timeout: 30_000 }));
   await confirm.click();
+  // Landing takes a few seconds here, but CI #2339 (2026-10-27) found the task
+  // still landing (status active after its transition was requested) after
+  // 30 s on a runner whose PostgreSQL took 256 s per checkpoint.
   await step('it lands on main', () => expect.poll(async () => (await git(repo, ['show', 'main:restored.txt'])).stdout,
-    { timeout: 30_000 }).toContain('survived the restore').catch(async (error) => {
+    { timeout: 90_000 }).toContain('survived the restore').catch(async (error) => {
     // Landing stalled once in CI (#1993) and rarely locally: say where the task was.
     const view = await consoleRequest(operator.context, app!.url, 'GET', `/api/tasks/${created.id}`);
     const events = await consoleRequest(operator.context, app!.url, 'GET', `/api/tasks/${created.id}/events?since=0&limit=300`);

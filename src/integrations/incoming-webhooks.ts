@@ -25,6 +25,11 @@ import { CHAT_ADAPTERS, CHAT_CREDENTIALS, ChatPlatformError, type ChatBotIdentit
  * hook: its URL is where the platform delivers, the platform's own credentials
  * are its vault secret, and each message that mentions the bot is one
  * `chat.mention` event (src/integrations/chat-platforms.ts).
+ *
+ * A bot takes requests only from the people its project allows (`allowed`, or
+ * `anyone`): a run started by a mention acts with the project's authority, and
+ * most bots can be messaged by anyone who finds them. Someone else is listed in
+ * `asking`, so the project can let them in with one click.
  */
 
 export interface IncomingWebhook {
@@ -44,7 +49,18 @@ export interface IncomingWebhook {
   kind?: ChatPlatform;
   /** The bot's own name and id on its platform. */
   bot?: ChatBotIdentity;
+  /** A chat bot's people whose messages it takes (platform user ids). */
+  allowed?: ChatPerson[];
+  /** Takes messages from anyone who can reach the bot. */
+  anyone?: boolean;
+  /** Recent senders it refused, newest first, for the project to allow. */
+  asking?: ChatPerson[];
 }
+
+/** A person on a chat platform. */
+export interface ChatPerson { id: string; name?: string; text?: string; at?: number }
+
+const MAX_ASKING = 20;
 
 const KEY_PREFIX = 'incoming-webhook:';
 export const INCOMING_WEBHOOK_SECRET_PREFIX = 'incoming-webhook:';
@@ -127,7 +143,7 @@ export class IncomingWebhooks {
     const hook: IncomingWebhook = {
       id: newId('hook'), organizationId: input.organizationId, projectId: input.projectId, name, type,
       createdAt: Date.now(), ...(input.createdBy ? { createdBy: input.createdBy } : {}), deliveries: 0,
-      ...(input.kind ? { kind: input.kind } : {}),
+      ...(input.kind ? { kind: input.kind, allowed: [], anyone: false } : {}),
     };
     if (!input.kind) {
       const secret = newSecret();
@@ -160,9 +176,25 @@ export class IncomingWebhooks {
     return { hook: saved, ...(connected.generated?.verifyToken ? { verifyToken: connected.generated.verifyToken } : {}) };
   }
 
-  async update(id: string, patch: { name?: string; type?: string }): Promise<IncomingWebhook> {
+  async update(id: string, patch: WebhookPatch): Promise<IncomingWebhook> {
     const hook = await this.require(id);
     const next = { ...hook };
+    if ((patch.allowed !== undefined || patch.anyone !== undefined || patch.dismiss !== undefined) && !hook.kind)
+      throw new WebhookConfigError('only a chat bot has people');
+    if (patch.allowed !== undefined) {
+      if (!Array.isArray(patch.allowed)) throw new WebhookConfigError('allowed is a list of {id, name?}');
+      const people = new Map<string, ChatPerson>();
+      for (const person of patch.allowed) {
+        const personId = String(person?.id ?? '').trim().slice(0, 100);
+        if (!personId) throw new WebhookConfigError('each allowed person needs an id');
+        const name = typeof person.name === 'string' && person.name.trim() ? person.name.trim().slice(0, 100) : undefined;
+        people.set(personId, { id: personId, ...(name ? { name } : {}) });
+      }
+      next.allowed = [...people.values()];
+    }
+    if (patch.anyone !== undefined) next.anyone = patch.anyone === true;
+    const gone = new Set([...(next.allowed ?? []).map((person) => person.id), ...(patch.dismiss ?? []).map(String)]);
+    if (hook.kind) next.asking = (next.asking ?? []).filter((person) => !gone.has(person.id));
     if (patch.name !== undefined) {
       next.name = patch.name.trim().slice(0, 100);
       if (!next.name) throw new WebhookConfigError('name the webhook');
@@ -188,6 +220,21 @@ export class IncomingWebhooks {
     if (!hook) return;
     await this.store.kvDelete(`${KEY_PREFIX}${id}`);
     if (await this.broker.hasHandle(secretHandle(hook))) await this.broker.deleteHandle(secretHandle(hook));
+  }
+
+  /** May this person ask the bot for something? */
+  admits(hook: IncomingWebhook, personId: string): boolean {
+    return hook.anyone === true || !!personId && (hook.allowed ?? []).some((person) => person.id === personId);
+  }
+
+  /** Someone the bot refused, listed for the project to allow. */
+  async noteAsking(id: string, person: ChatPerson): Promise<void> {
+    const hook = await this.get(id);
+    if (!hook) return;
+    const entry: ChatPerson = { id: person.id, ...(person.name ? { name: person.name.slice(0, 100) } : {}),
+      ...(person.text ? { text: person.text.slice(0, 200) } : {}), at: Date.now() };
+    const asking = [entry, ...(hook.asking ?? []).filter((other) => other.id !== person.id)].slice(0, MAX_ASKING);
+    await this.store.kvSet(`${KEY_PREFIX}${id}`, JSON.stringify({ ...hook, asking }));
   }
 
   /** A chat bot's delivery, read by its platform's adapter. */
@@ -236,6 +283,9 @@ export class IncomingWebhooks {
     return hook;
   }
 }
+
+/** A change to a hook; `allowed`, `anyone` and `dismiss` (ids off `asking`) are a chat bot's. */
+export interface WebhookPatch { name?: string; type?: string; allowed?: Array<{ id: string; name?: string }>; anyone?: boolean; dismiss?: string[] }
 
 export class WebhookConfigError extends Error {
   constructor(message: string, public status = 400) { super(message); }

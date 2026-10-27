@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { Store } from '../src/store/db.js';
 import { KarmaxApi, WebhookAuthError } from '../src/platform/api.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
@@ -57,6 +57,7 @@ describe('chat bots', () => {
     const setWebhook = calls.find((call) => call.url.endsWith('/bot123:abc/setWebhook'))!;
     expect(setWebhook.body).toMatchObject({ url: `https://tavya.example/api/hooks/${hook.id}`, allowed_updates: ['message'] });
     const secret = setWebhook.body.secret_token as string;
+    await api.updateIncomingWebhook(token, hook.id, { allowed: [{ id: '7' }] });
 
     const update = (id: number, text: string, extra: Record<string, unknown> = {}) => ({ update_id: id, message: { message_id: 500 + id, text,
       from: { id: 7, first_name: 'Ada', is_bot: false }, chat: { id: -100, type: 'supergroup', title: 'Team', username: 'team' }, ...extra } });
@@ -79,6 +80,7 @@ describe('chat bots', () => {
   it('Slack: answers the URL check and reads signed app mentions only', async () => {
     answers['auth.test'] = { ok: true, user_id: 'UBOT', user: 'tavya' };
     const { hook } = await connect('slack', { signingSecret: 'shh', botToken: 'xoxb-1' });
+    await api.updateIncomingWebhook(token, hook.id, { allowed: [{ id: 'U1' }] });
     const signed = (body: unknown, at = Math.floor(Date.now() / 1000)) => {
       const raw = JSON.stringify(body);
       return [body, { 'x-slack-request-timestamp': String(at),
@@ -98,6 +100,7 @@ describe('chat bots', () => {
     const raw32 = (publicKey.export({ format: 'jwk' }) as { x: string }).x;
     const { hook } = await connect('discord', { applicationId: 'app1', publicKey: Buffer.from(raw32, 'base64url').toString('hex'), botToken: 'bot-1' });
     expect(calls.find((call) => call.url.endsWith('/applications/app1/commands'))!.body[0]).toMatchObject({ name: 'tavya' });
+    await api.updateIncomingWebhook(token, hook.id, { anyone: true });
     expect(calls.find((call) => call.url.endsWith('/applications/@me'))!.body).toEqual({ interactions_endpoint_url: `https://tavya.example/api/hooks/${hook.id}` });
     const signed = (body: unknown) => {
       const raw = JSON.stringify(body);
@@ -119,6 +122,7 @@ describe('chat bots', () => {
     expect(created.verifyToken).toMatch(/^[0-9a-f]{32}$/);
     const challenge = await receive(created.hook.id, '', {}, 'GET', `hub.mode=subscribe&hub.verify_token=${created.verifyToken}&hub.challenge=42`);
     expect(challenge.answer).toEqual({ status: 200, body: '42', text: true });
+    await api.updateIncomingWebhook(token, created.hook.id, { allowed: [{ id: '4477', name: 'Lin' }] });
     await expect(receive(created.hook.id, '', {}, 'GET', 'hub.mode=subscribe&hub.verify_token=no&hub.challenge=42')).rejects.toBeInstanceOf(WebhookAuthError);
     const body = JSON.stringify({ entry: [{ changes: [{ value: { metadata: { phone_number_id: 'phone-1' }, contacts: [{ wa_id: '4477', profile: { name: 'Lin' } }],
       messages: [{ id: 'wamid.1', from: '4477', type: 'text', text: { body: 'restart the worker' } }] } }] }] });
@@ -138,6 +142,7 @@ describe('chat bots', () => {
     answers.sendMessage = { ok: true, result: { message_id: 777 } };
     const { hook } = await connect('telegram', { botToken: '123:abc' });
     const secret = calls.find((call) => call.url.endsWith('/setWebhook'))!.body.secret_token;
+    await api.updateIncomingWebhook(token, hook.id, { allowed: [{ id: '7' }] });
     const { events: [{ event }] } = await receive(hook.id, { update_id: 9, message: { message_id: 55, text: '@tavya_bot ship it',
       from: { id: 7, first_name: 'Ada' }, chat: { id: 3, type: 'group', title: 'Ops' } } }, { 'x-telegram-bot-api-secret-token': secret }) as any;
     const run = await store.createTask({ projectId, title: 'Ship', workflow: 'software-dev', workflowVersion: '1.28.0', params: { prompt: 'p' } });
@@ -158,5 +163,60 @@ describe('chat bots', () => {
     const finished = calls.filter((call) => call.url.endsWith('/sendMessage')).slice(1);
     expect(finished).toHaveLength(1);
     expect(finished[0]!.body.text).toMatch(/^Done\.\nShipped v2\.\nhttps:/);
+  });
+  it('takes requests only from allowed people; anyone else is told once and shown to the project', async () => {
+    answers.getMe = { ok: true, result: { id: 42, username: 'tavya_bot' } };
+    answers.sendMessage = { ok: true, result: { message_id: 800 } };
+    api.setChatReplies(new ChatReplies({ store, broker, publicUrl: () => 'https://tavya.example', fetcher }));
+    const { hook } = await connect('telegram', { botToken: '123:abc' });
+    expect(hook).toMatchObject({ allowed: [], anyone: false });
+    const secret = calls.find((call) => call.url.endsWith('/setWebhook'))!.body.secret_token;
+    const send = (id: number, from: { id: number; first_name: string }, text: string) => receive(hook.id,
+      { update_id: id, message: { message_id: 600 + id, text, from, chat: { id: from.id, type: 'private' } } }, { 'x-telegram-bot-api-secret-token': secret });
+    const eve = { id: 66, first_name: 'Eve' };
+    calls = [];
+
+    // A stranger starts nothing; they are told how to get in, once, and the project sees them asking.
+    expect((await send(1, eve, 'delete the production database')).events).toEqual([]);
+    expect((await send(2, eve, 'please?')).events).toEqual([]);
+    await vi.waitFor(() => expect(calls.filter((call) => call.url.endsWith('/sendMessage'))).toHaveLength(1));
+    const told = calls.find((call) => call.url.endsWith('/sendMessage'))!.body;
+    expect(told).toMatchObject({ chat_id: '66', reply_to_message_id: 601 });
+    expect(told.text).toMatch(/^Only people this project allows can ask me\. Someone on it can let you in here: https:\/\/tavya\.example\/[^/]+\/chat\/settings#project-events$/);
+    let [listed] = await api.listIncomingWebhooks(token, projectId);
+    expect(listed!.asking).toEqual([expect.objectContaining({ id: '66', name: 'Eve', text: 'please?' })]);
+
+    // Allowing them takes them off the asking list, and their next message starts a run.
+    listed = await api.updateIncomingWebhook(token, hook.id, { allowed: [{ id: '66', name: 'Eve' }] });
+    expect(listed).toMatchObject({ allowed: [{ id: '66', name: 'Eve' }], asking: [] });
+    expect((await send(3, eve, 'now fix the login page')).events).toHaveLength(1);
+
+    // Dismissing someone asking only clears the row; "anyone" lets everyone in.
+    const mal = { id: 77, first_name: 'Mal' };
+    await send(4, mal, 'hi');
+    expect((await api.updateIncomingWebhook(token, hook.id, { dismiss: ['77'] })).asking).toEqual([]);
+    expect((await send(5, mal, 'hi again')).events).toEqual([]);
+    await api.updateIncomingWebhook(token, hook.id, { anyone: true });
+    expect((await send(6, mal, 'and now?')).events).toHaveLength(1);
+    // Only someone who may change the project's settings changes who may ask.
+    const reader = (await new TokenAuthority(store).mintPrincipal('user:b', ['project:settings:read'], projectId)).token;
+    await expect(api.updateIncomingWebhook(reader, hook.id, { anyone: false })).rejects.toThrow();
+  });
+
+  it('Discord: tells a person not allowed in the command answer, privately', async () => {
+    const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
+    const raw32 = (publicKey.export({ format: 'jwk' }) as { x: string }).x;
+    api.setChatReplies(new ChatReplies({ store, broker, publicUrl: () => 'https://tavya.example', fetcher }));
+    const { hook } = await connect('discord', { applicationId: 'app1', publicKey: Buffer.from(raw32, 'base64url').toString('hex'), botToken: 'bot-1' });
+    const raw = JSON.stringify({ type: 2, id: 'i-9', channel_id: 'ch-1', member: { user: { id: 'u-9', username: 'mallory' } },
+      data: { name: 'tavya', options: [{ name: 'request', value: 'wipe it' }] } });
+    const at = String(Math.floor(Date.now() / 1000));
+    calls = [];
+    const result = await receive(hook.id, raw, { 'x-signature-timestamp': at, 'x-signature-ed25519': crypto.sign(null, Buffer.from(at + raw), privateKey).toString('hex') });
+    expect(result.events).toEqual([]);
+    expect(result.answer).toMatchObject({ status: 200, body: { type: 4, data: { flags: 64 } } });
+    expect((result.answer!.body as any).data.content).toMatch(/^Only people this project allows can ask me/);
+    expect(calls.filter((call) => call.url.includes('/channels/'))).toEqual([]);
+    expect((await api.listIncomingWebhooks(token, projectId))[0]!.asking).toEqual([expect.objectContaining({ id: 'u-9', name: 'mallory', text: 'wipe it' })]);
   });
 });
