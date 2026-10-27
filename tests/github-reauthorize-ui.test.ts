@@ -118,27 +118,16 @@ describe('GitHub merge authorization UX', () => {
     return ui;
   };
 
-  it('warns at task composition without blocking queueing', async () => {
+  // Merge rights follow tavya roles (GitHub access is mirrored from them, and
+  // the App lands work for people without GitHub), so composing a task says
+  // nothing about GitHub; a real blocker surfaces when someone confirms.
+  it('says nothing about GitHub merge rights while composing a task', async () => {
     const ui = await taskForm({ remotePolicy: 'pr', creatorCanMerge: false, eligibleUserIds: [], repositories: ['acme/app'] });
-    const warning = ui.page.locator('#tf-github-merge');
-    await expect.poll(() => warning.isVisible()).toBe(true);
-    const text = await warning.innerText();
-    expect(text).toContain('GitHub merge reviewer recommended');
-    expect(text).toContain('No connected project member currently has merge access');
-    expect(text).toContain('You can still queue the task');
-    expect(await ui.page.locator('#tf-queue').isEnabled()).toBe(true);
+    await ui.page.locator('#tf-queue').waitFor();
+    expect(await ui.page.locator('#tf-github-merge').count()).toBe(0);
+    expect(ui.calls.some((call) => call.path.endsWith('/github-merge-eligibility'))).toBe(false);
+    expect(await ui.page.locator('#tf-page').innerText()).not.toMatch(/merge access|request merges/i);
     await ui.close();
-  });
-
-  it('confirms an eligible creator, and stays out of the way when changes land without a PR', async () => {
-    const eligible = await taskForm({ remotePolicy: 'pr', creatorCanMerge: true, repositories: ['acme/app'] });
-    await expect.poll(() => eligible.page.locator('#tf-github-merge').innerText())
-      .toContain('✓ Your connected GitHub account can request merges for acme/app.');
-    await eligible.close();
-    const direct = await taskForm({ remotePolicy: 'push', creatorCanMerge: false });
-    await expect.poll(() => direct.calls.some((call) => call.path.endsWith('/github-merge-eligibility'))).toBe(true);
-    expect(await direct.page.locator('#tf-github-merge').isHidden()).toBe(true);
-    await direct.close();
   });
 
   it('separates PR review confirmation from later GitHub authorization', async () => {

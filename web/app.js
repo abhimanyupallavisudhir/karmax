@@ -3238,19 +3238,19 @@ async function confirmMergeRights(action, v) {
   const people = answer.people || [];
   const names = people.map((person) => person.name || person.email || person.id);
   const decision = await summonDialog({
-    title: `You can't merge ${prs.length === 1 ? `${prs[0].slug}#${prs[0].number}` : `${prs.length || 'these'} pull requests`} on GitHub`,
-    tip: 'Merging needs a connected GitHub account with merge access to every repository. Alert sends this Review to people who have it.',
+    title: `Someone else needs to merge ${prs.length === 1 ? `${prs[0].slug}#${prs[0].number}` : `${prs.length || 'these'} pull requests`}`,
+    tip: 'Your access doesn’t include merging into these repositories. Alert sends this Review to people who can.',
     summon: people.length ? { label: `Alert ${people.length === 1 ? names[0] : `${people.length} people`}`, audience: answer.audience, tip: names.join(', ') } : null,
     recipients: humanAudienceOptions().filter((option) => !(answer.audience || []).includes(option.value))
       .map((option) => ({ value: option.value, label: option.label.replace(/^(Person|Team) · /, ''),
         kind: option.value.startsWith('user:') ? 'person' : 'group' })),
-    limit: authorizingMerge ? null : { label: 'Confirm anyway', tip: 'Approve the Review now; the merge waits for someone with GitHub access' },
+    limit: authorizingMerge ? null : { label: 'Confirm anyway', tip: 'Approve now; the merge waits for someone who may merge' },
   });
   if (decision?.action === 'limit') return true;
   if (decision?.action === 'ask') {
     try {
       await api(`/api/tasks/${v.taskId}/escalate`, { method: 'POST', body: JSON.stringify({ audience: decision.audience,
-        message: "Please review and merge this — I can't merge it on GitHub." }) });
+        message: "Please review and merge this — I can't merge it myself." }) });
       toast(`Sent to ${decision.audience === answer.audience && names.length === 1 ? names[0] : 'them'}`);
       setTimeout(refreshTask, 250);
     } catch (error) { toast(error.message, true); }
@@ -9041,7 +9041,6 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
             <div class="form-row" data-row="__org">
               ${orgEditorHtml(orgRec)}
             </div>
-            ${['software-dev', 'goal'].includes(wf) ? `<div class="form-row" data-row="__github-merge" id="tf-github-merge" style="display:none"></div>` : ''}
             ${!draft && !templateEdit ? `<div class="form-row tf-inline" data-row="__attempts" title="Attempts created here are queued together. Attempts added later start as editable drafts.">
               <label for="tf-attempt-count">Attempts</label>
               <input id="tf-attempt-count" type="number" min="1" max="8" value="1">
@@ -9179,45 +9178,6 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       row.querySelectorAll('input,select,textarea,button').forEach((el) => { el.disabled = true; });
       row.insertAdjacentHTML('beforeend', '<span style="color:var(--ink-3);font-size:12px">Shared with every attempt — change it on the running attempt\'s page, which re-routes them all.</span>');
     }
-  }
-  // GitHub authorization is external, live policy—not a krmax capability.
-  // Warn without blocking: the workflow revalidates at Merge and can hand the
-  // task to an eligible human then, so a developer may deliberately queue now.
-  const githubMergeBox = $('#tf-github-merge');
-  if (githubMergeBox) {
-    let eligibility;
-    const selectedMergeReviewer = () => {
-      if (!eligibility) return false;
-      const eligible = new Set(eligibility.eligibleUserIds || []);
-      const confirmer = fields.find((f) => f.type === 'confirmer');
-      const box = confirmer && $('#tf-body')?.querySelector(`.confirmer-field[data-confirmer="${CSS.escape(confirmer.role || confirmer.name)}"]`);
-      const layers = box ? readConfirmerLayers(box) : [];
-      return layers.some((layer) => layer.kind === 'human' && (layer.audience || ['@creator']).some((selector) => {
-        if (selector === '@creator') return !!eligibility.creatorCanMerge;
-        if (selector === '@all' || selector === '@project') return eligible.size > 0;
-        if (selector === '@owners') return (S.organizationMembers || []).some((member) => member.role === 'owner' && eligible.has(member.userId));
-        if (selector.startsWith('user:')) return eligible.has(selector.slice(5));
-        return false;
-      }));
-    };
-    const paintEligibility = () => {
-      if (!eligibility) return;
-      if (eligibility.remotePolicy !== 'pr') { githubMergeBox.style.display = 'none'; return; }
-      const names = (eligibility.eligibleUserIds || []).map((userId) => principalLabel({ kind: 'user', userId }));
-      const routed = selectedMergeReviewer();
-      githubMergeBox.style.display = '';
-      githubMergeBox.innerHTML = eligibility.creatorCanMerge
-        ? `<div class="task-sub" style="color:var(--ok)">✓ Your connected GitHub account can request merges for ${esc((eligibility.repositories || []).join(', '))}. GitHub still enforces branch rules at Merge.</div>`
-        : routed
-          ? `<div class="task-sub" style="color:var(--ok)">✓ A selected human reviewer has live GitHub merge access (${esc(names.join(', '))}). Their confirmation can sponsor the merge.</div>`
-          : `<div class="card" style="padding:10px;border-color:var(--warn)"><b>GitHub merge reviewer recommended</b><div class="task-sub" style="margin-top:4px">Your connected GitHub account cannot merge every repository in this task. ${names.length ? `Add a <b>Human confirms</b> step for ${esc(names.join(', '))}.` : 'No connected project member currently has merge access; grant access on GitHub or connect an eligible account.'} You can still queue the task—${siteNameMarkup()} will stop at Merge and ask for an eligible human.</div></div>`;
-    };
-    api(`/api/projects/${encodeURIComponent(projectId)}/github-merge-eligibility`)
-      .then((value) => { eligibility = value; paintEligibility(); })
-      .catch(() => { githubMergeBox.style.display = 'none'; });
-    $('#tf-body').addEventListener('change', (event) => {
-      if (event.target.closest?.('.confirmer-field')) paintEligibility();
-    });
   }
   // Prompt attachments are form-local handles; their bytes are already durable.
   const formImages = Array.isArray(values.images) ? [...values.images] : [];
@@ -11007,6 +10967,7 @@ function renderTaskPage() {
   if (tab === 'checkin') {
     wireReviewActions(v);
     wireResourceInventory(v);
+    loadReviewThumbnails(v);
     wireTaskApprovalRequests(v);
     wireCheckinSidebar(v);
     wireFollowups(v);
@@ -11559,6 +11520,24 @@ function wireTerminal(taskId) {
 }
 
 // ── review actions: click-to-verify buttons (run in the world / open artifacts) ──
+// What an open action's target will look like, from its name: an image or a
+// video gets a real thumbnail; anything else a file tile with its type.
+function reviewTileKind(target) {
+  const ext = (String(target || '').split(/[?#]/)[0].match(/\.([a-z0-9]+)$/i)?.[1] || '').toLowerCase();
+  if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'avif', 'svg', 'bmp'].includes(ext)) return 'image';
+  if (['mp4', 'webm', 'mov', 'm4v', 'ogv'].includes(ext)) return 'video';
+  return ext || 'file';
+}
+
+// An open action (not a web page) as a tile in the Review gallery.
+function reviewTile(a, i) {
+  const kind = reviewTileKind(a.target);
+  const media = kind === 'image' || kind === 'video' ? `<span class="review-tile-media" data-thumb="${kind}" aria-hidden="true">${kind === 'video' ? '<span class="review-tile-play">▶</span>' : ''}</span>`
+    : `<span class="review-tile-media review-tile-file" aria-hidden="true">${esc(kind.slice(0, 4).toUpperCase())}</span>`;
+  return `<button type="button" class="review-tile review-action" data-idx="${i}" data-kind="open" data-tile="${esc(kind)}" title="${esc(a.target || '')}">
+    ${media}<span class="review-tile-label">${esc(a.label || 'Open')}</span></button>`;
+}
+
 function reviewActionBtn(a, i) {
   const isRun = a.kind === 'run';
   const isPayment = a.kind === 'payment';
@@ -11637,68 +11616,102 @@ const ARTIFACT_TEXT_PREVIEW_BYTES = 10 * 1024 * 1024;
 // and seeks), never through a popup the browser could block after an await.
 // The URL is served under a `sandbox` policy, so an HTML page in the frame
 // runs with an opaque origin, as it would in its own tab.
-async function showArtifactViewer({ name, url, view, text, refresh }) {
+async function showArtifactViewer({ name, url, view, text, refresh, gallery }) {
   const previousFocus = document.activeElement;
   const dialog = document.createElement('dialog');
-  dialog.className = `modal-card artifact-reader artifact-${view}`;
   dialog.setAttribute('aria-labelledby', 'artifact-reader-title');
-  const newTab = view === 'pdf' || view === 'page'
-    ? `<a class="btn sm" data-new-tab target="_blank" rel="noopener" title="Open in a new tab">↗</a>` : '';
-  dialog.innerHTML = `<header class="artifact-reader-header"><h2 id="artifact-reader-title">${esc(name)}</h2>
-    ${view === 'markdown' ? texToggleHtml() : ''}${newTab}<a class="btn sm" data-download>Download</a><button class="btn sm" data-close>Close</button></header>
+  const steps = gallery ? `<span class="artifact-reader-steps"><button type="button" class="btn sm icon" data-step="-1" aria-label="Previous" title="Previous (←)">‹</button><span class="artifact-reader-count"></span><button type="button" class="btn sm icon" data-step="1" aria-label="Next" title="Next (→)">›</button></span>` : '';
+  dialog.innerHTML = `<header class="artifact-reader-header"><h2 id="artifact-reader-title"></h2><span class="artifact-reader-tools"></span>
+    ${steps}<a class="btn sm" data-download>Download</a><button class="btn sm" data-close>Close</button></header>
     <div class="artifact-reader-content" tabindex="0"></div>`;
   const content = dialog.querySelector('.artifact-reader-content');
   const links = () => dialog.querySelectorAll('[data-download], [data-new-tab]');
+  let media = null, current = null, refreshedAt = 0, closed = false;
   const point = (href) => links().forEach((link) => { link.href = href; });
-  point(url);
-  dialog.querySelector('[data-download]').download = name;
-  let media = null;
-  if (view === 'markdown') {
-    content.classList.add('msg-text', 'md');
-    mountMarkdownSurface(content, (math) => renderMarkdown(text, { math }));
-    wireTexToggles(dialog);
-  } else if (view === 'text') {
-    const pre = document.createElement('pre');
-    pre.textContent = text;
-    content.appendChild(pre);
-  } else if (view === 'pdf' || view === 'page') {
-    const frame = document.createElement('iframe');
-    frame.title = name;
-    if (view === 'page') frame.setAttribute('sandbox', 'allow-scripts allow-forms allow-popups allow-modals allow-downloads');
-    frame.src = url;
-    content.appendChild(frame);
-  } else {
-    media = document.createElement(view === 'image' ? 'img' : view);
-    if (view === 'image') media.alt = name;
-    else { media.controls = true; media.autoplay = true; media.playsInline = true; media.preload = 'auto'; }
-    media.src = url;
-    content.appendChild(media);
-  }
-  // A signed URL lasts an hour: a long viewing (or a restart) gets a fresh one
-  // and carries on from where it was; anything else is said, never swallowed.
-  let refreshedAt = 0, closed = false;
-  media?.addEventListener('error', async () => {
-    if (closed) return;
-    const at = media.currentTime || 0;
-    // A fresh URL that fails at once is not an expiry: say so instead of looping.
-    if (refresh && Date.now() - refreshedAt > 60_000) {
-      refreshedAt = Date.now();
-      try {
-        const next = await refresh();
-        point(next.url);
-        media.src = next.url;
-        if (at) media.currentTime = at;
-        return;
-      } catch { /* reported below */ }
+  const stopMedia = () => { if (media) { media.removeAttribute('src'); media.load?.(); } media = null; };
+  // Show one file in the open card (the first, or the next one stepped to).
+  const mount = (item) => {
+    stopMedia();
+    current = item;
+    dialog.className = `modal-card artifact-reader artifact-${item.view || 'file'}${gallery ? ' artifact-gallery' : ''}`;
+    dialog.querySelector('#artifact-reader-title').textContent = item.name;
+    dialog.querySelector('.artifact-reader-tools').innerHTML = `${item.view === 'markdown' ? texToggleHtml() : ''}${item.view === 'pdf' || item.view === 'page'
+      ? '<a class="btn sm" data-new-tab target="_blank" rel="noopener" title="Open in a new tab">↗</a>' : ''}`;
+    point(item.url);
+    dialog.querySelector('[data-download]').download = item.name;
+    content.className = 'artifact-reader-content';
+    content.innerHTML = '';
+    if (!item.view) {
+      content.innerHTML = `<p class="artifact-error">This file can’t be shown here. Download it instead.</p>`;
+    } else if (item.view === 'markdown') {
+      content.classList.add('msg-text', 'md');
+      mountMarkdownSurface(content, (math) => renderMarkdown(item.text, { math }));
+      wireTexToggles(dialog);
+    } else if (item.view === 'text') {
+      const pre = document.createElement('pre');
+      pre.textContent = item.text;
+      content.appendChild(pre);
+    } else if (item.view === 'pdf' || item.view === 'page') {
+      const frame = document.createElement('iframe');
+      frame.title = item.name;
+      if (item.view === 'page') frame.setAttribute('sandbox', 'allow-scripts allow-forms allow-popups allow-modals allow-downloads');
+      frame.src = item.url;
+      content.appendChild(frame);
+    } else {
+      media = document.createElement(item.view === 'image' ? 'img' : item.view);
+      if (item.view === 'image') media.alt = item.name;
+      else { media.controls = true; media.autoplay = true; media.playsInline = true; media.preload = 'auto'; }
+      media.src = item.url;
+      content.appendChild(media);
+      // A signed URL lasts an hour: a long viewing (or a restart) gets a fresh
+      // one and carries on from where it was; anything else is said, never swallowed.
+      const shown = media;
+      media.addEventListener('error', async () => {
+        if (closed || media !== shown) return;
+        const at = shown.currentTime || 0;
+        // A fresh URL that fails at once is not an expiry: say so instead of looping.
+        if (item.refresh && Date.now() - refreshedAt > 60_000) {
+          refreshedAt = Date.now();
+          try {
+            const next = await item.refresh();
+            point(next.url);
+            shown.src = next.url;
+            if (at) shown.currentTime = at;
+            return;
+          } catch { /* reported below */ }
+        }
+        content.innerHTML = `<p class="artifact-error" role="alert">Couldn’t ${item.view === 'image' ? 'show' : 'play'} this file here. Download it instead.</p>`;
+        toast(`Could not open ${item.name}`, true);
+      });
     }
-    content.innerHTML = `<p class="artifact-error" role="alert">Couldn’t ${view === 'image' ? 'show' : 'play'} this file here. Download it instead.</p>`;
-    toast(`Could not open ${name}`, true);
-  });
+    if (gallery) dialog.querySelector('.artifact-reader-count').textContent = `${gallery.at + 1} / ${gallery.order.length}`;
+  };
+  let stepping = 0;
+  const step = async (delta) => {
+    if (!gallery) return;
+    const at = (gallery.at + delta + gallery.order.length) % gallery.order.length;
+    const ticket = ++stepping;
+    try {
+      const item = await gallery.load(gallery.order[at]);
+      if (closed || ticket !== stepping) return;
+      gallery.at = at;
+      mount(item);
+    } catch (error) { toast(error.message, true); }
+  };
+  mount({ name, url, view, text, refresh });
+  dialog.querySelectorAll('[data-step]').forEach((button) => button.addEventListener('click', () => step(Number(button.dataset.step))));
   dialog.querySelector('[data-close]').addEventListener('click', () => dialog.close());
   // A click outside the card lands on the dialog itself (its backdrop).
   dialog.addEventListener('click', (event) => { if (event.target === dialog) dialog.close(); });
   // Consume Escape before the shell dispatcher can also close the task behind us.
   dialog.addEventListener('keydown', (event) => {
+    if (gallery && (event.key === 'ArrowLeft' || event.key === 'ArrowRight')
+      && !event.target.closest?.('video, audio, input, textarea, select, iframe')) {
+      event.preventDefault();
+      event.stopPropagation();
+      step(event.key === 'ArrowLeft' ? -1 : 1);
+      return;
+    }
     if (event.key !== 'Escape') return;
     event.preventDefault();
     event.stopPropagation();
@@ -11707,13 +11720,13 @@ async function showArtifactViewer({ name, url, view, text, refresh }) {
   dialog.addEventListener('close', () => {
     closed = true;
     // Stop the stream: a closed viewer must not keep downloading or playing.
-    if (media) { media.removeAttribute('src'); media.load?.(); }
+    stopMedia();
     dialog.remove();
     if (previousFocus?.isConnected) previousFocus.focus();
   }, { once: true });
   // An image sizes the card: show it decoded rather than as a strip that then
   // grows; one slow to arrive shows the card first, so the click still answers.
-  if (view === 'image') await Promise.race([media.decode().catch(() => {}), new Promise((resolve) => setTimeout(resolve, 1000))]);
+  if (current.view === 'image' && media) await Promise.race([media.decode().catch(() => {}), new Promise((resolve) => setTimeout(resolve, 1000))]);
   document.body.appendChild(dialog);
   dialog.showModal();
   dialog.querySelector('[data-close]').focus();
@@ -11736,22 +11749,73 @@ async function downloadArtifact({ url, name }) {
   document.body.appendChild(anchor); anchor.click(); anchor.remove();
 }
 
-// Open what `POST /review-action` resolved: `{ url, name, mediaType, bytes? }`,
-// a signed URL that needs no header. Failures throw, for the caller's toast.
-async function openArtifact(resolved, refresh) {
+// What the viewer needs to show what `POST /review-action` resolved
+// (`{ url, name, mediaType, bytes? }`, a signed URL that needs no header):
+// `view: null` means it is downloaded instead. Failures throw, for a toast.
+async function artifactItem(resolved, refresh) {
   const name = resolved.name || 'Attachment';
   const view = artifactView(resolved.mediaType, name);
-  if (!view || ((view === 'markdown' || view === 'text') && resolved.bytes > ARTIFACT_TEXT_PREVIEW_BYTES))
-    return downloadArtifact({ url: resolved.url, name });
-  if (view !== 'markdown' && view !== 'text') return showArtifactViewer({ name, url: resolved.url, view, refresh });
+  const download = { name, url: resolved.url, view: null };
+  if (!view || ((view === 'markdown' || view === 'text') && resolved.bytes > ARTIFACT_TEXT_PREVIEW_BYTES)) return download;
+  if (view !== 'markdown' && view !== 'text') return { name, url: resolved.url, view, refresh };
   const res = await feedbackFetch(resolved.url);
   if (!res.ok) throw new Error(`Could not open ${name}`);
   if (Number(res.headers.get('content-length')) > ARTIFACT_TEXT_PREVIEW_BYTES) {
     res.body?.cancel().catch(() => {});
-    return downloadArtifact({ url: resolved.url, name });
+    return download;
   }
-  return showArtifactViewer({ name, url: resolved.url, view, text: await res.text() });
+  return { name, url: resolved.url, view, text: await res.text() };
 }
+
+async function openArtifact(resolved, refresh) {
+  const item = await artifactItem(resolved, refresh);
+  return item.view ? showArtifactViewer(item) : downloadArtifact(item);
+}
+// Files the Review gallery shows (web pages stay links).
+function isReviewTile(a) { return a.kind === 'open' && !/^https?:\/\//i.test(a.target || ''); }
+
+// Signed artifact URLs of a task's open actions, shared by the thumbnails and
+// the viewer: one resolve per action an hour (a signed URL lasts one).
+const reviewArtifactUrls = new Map();
+function resolveReviewArtifact(v, index, fresh = false) {
+  const action = v.reviewInfo?.actions?.[index];
+  const key = `${v.taskId}\n${index}\n${action?.target || ''}`;
+  const cached = reviewArtifactUrls.get(key);
+  if (!fresh && cached && Date.now() - cached.at < 50 * 60_000) return cached.promise;
+  const entry = { at: Date.now(), promise: api(`/api/tasks/${v.taskId}/review-action`, { method: 'POST', body: JSON.stringify({ index }) }) };
+  entry.promise.catch(() => { if (reviewArtifactUrls.get(key) === entry) reviewArtifactUrls.delete(key); });
+  reviewArtifactUrls.set(key, entry);
+  return entry.promise;
+}
+
+// Fill each image/video tile with the file itself. A tile that cannot load
+// (no access, a file gone) keeps its plain look.
+function loadReviewThumbnails(v) {
+  document.querySelectorAll('#review-actions .review-tile-media[data-thumb]:not([data-thumbed])').forEach((slot) => {
+    slot.dataset.thumbed = '1';
+    const index = Number(slot.closest('.review-tile')?.dataset.idx);
+    resolveReviewArtifact(v, index).then((r) => {
+      if (!slot.isConnected || !r?.url) return;
+      const media = document.createElement(slot.dataset.thumb === 'video' ? 'video' : 'img');
+      if (media.tagName === 'VIDEO') { media.muted = true; media.preload = 'metadata'; media.playsInline = true; media.src = `${r.url}#t=0.1`; }
+      else { media.alt = ''; media.loading = 'lazy'; media.decoding = 'async'; media.src = r.url; }
+      media.addEventListener('error', () => media.remove(), { once: true });
+      slot.prepend(media);
+    }, () => {});
+  });
+}
+
+// The viewer over the Review's files, from the one at `index`: ← and → (or the
+// arrow keys) step through every open action in order.
+async function openReviewGallery(v, index) {
+  const order = (v.reviewInfo?.actions || []).map((action, i) => (isReviewTile(action) ? i : -1)).filter((i) => i >= 0);
+  const load = async (i) => artifactItem(await resolveReviewArtifact(v, i), () => resolveReviewArtifact(v, i, true));
+  const first = await load(index);
+  // Only one file: what it can't show, the browser downloads.
+  if (!first.view && order.length < 2) return downloadArtifact(first);
+  return showArtifactViewer({ ...first, gallery: order.length > 1 ? { order, at: order.indexOf(index), load } : undefined });
+}
+
 // A branch's pull request (software-dev ≥1.30) is approved on its own task:
 // the same Confirm its page offers, from its row under Branches.
 function wirePullRequestApprovals() {
@@ -11790,9 +11854,9 @@ function wireReviewActions(v) {
       const kind = btn.getAttribute('data-kind');
       btn.disabled = true;
       try {
+        if (kind === 'open') { await openReviewGallery(v, idx); return; }
         const resolve = () => api(`/api/tasks/${v.taskId}/review-action`, { method: 'POST', body: JSON.stringify({ index: idx }) });
         const r = await resolve();
-        if (kind === 'open') { await openArtifact(r, resolve); return; }
         if (kind === 'payment') {
           toast(r.result?.status === 'granted' ? `Spend approved${r.resumed ? ' — task continuing' : ''}` : r.result?.reason || 'Spend request updated',
             r.result?.status === 'denied');
@@ -11868,9 +11932,11 @@ async function wireResourceInventory(v, force = false) {
   try {
     const inventory = await loadResourceReview(v, force, true);
     if (!isCurrent()) return;
-    wrap.innerHTML = inventory.entries?.length ? `<div class="card" style="border-color:var(--warn);margin-top:10px"><b>Ignored output not declared as a resource</b>
-      <div class="task-sub">These paths are not in the portable checkpoint. Only names and sizes were inspected; ${siteNameMarkup()} did not upload their contents.</div>
-      <div class="task-sub mono" style="margin-top:6px">${inventory.entries.slice(0, 20).map((entry) => `${esc(entry.path)} (${formatBytes(entry.bytes)})${entry.likelySecret ? ' · possible secret' : ''}`).join('<br>')}${inventory.truncated ? '<br>… inventory truncated' : ''}</div></div>` : '';
+    const entries = inventory.entries || [];
+    // Folded: a list of paths is rarely what a reviewer acts on.
+    wrap.innerHTML = entries.length ? `<details class="ignored-output">
+      <summary>${entries.length}${inventory.truncated ? '+' : ''} ignored ${entries.length === 1 ? 'path' : 'paths'} not saved ${policyTip(`Git-ignored output that is not a project resource is not in the checkpoint, so it is lost with the workspace. Only names and sizes were read; ${siteName()} uploaded nothing.`)}</summary>
+      <ul>${entries.slice(0, 20).map((entry) => `<li><span class="mono">${esc(entry.path)}</span><span class="task-sub">${formatBytes(entry.bytes)}</span>${entry.likelySecret ? '<span class="chip warn">possible secret</span>' : ''}</li>`).join('')}${inventory.truncated || entries.length > 20 ? '<li class="task-sub">…</li>' : ''}</ul></details>` : '';
   } catch (error) {
     if (!isCurrent()) return;
     wrap.innerHTML = `<div class="task-sub" title="${esc(error.message)}">Couldn’t inspect ignored output. <button class="btn sm" data-inventory-retry>Retry</button></div>`;
@@ -12553,7 +12619,9 @@ function conversationReviewInfo(v, resourcesShown = false) {
   return `<div class="msg agent review-info" data-conversation-key="review-info">
     <div class="review-info-line"><span class="role">${atReview ? 'Review' : 'Summary'}</span>${caption ? `<span class="review-info-caption">${esc(caption)}</span>` : ''}</div>
     ${stalled}
-    ${info.actions?.length || info.links?.length ? `<div class="review-actions" id="review-actions">${(info.actions || []).map((action, index) => reviewActionBtn(action, index)).join('')}${(info.links || []).map((link) => `<a class="btn sm" href="${esc(safeHref(link.url))}" target="_blank" rel="noopener">${esc(link.label)} ↗</a>`).join('')}</div><pre class="raw hidden" id="review-action-out"></pre>` : ''}
+    ${info.actions?.length || info.links?.length ? `<div class="review-actions" id="review-actions">${(info.actions || []).some(isReviewTile)
+      ? `<div class="review-gallery">${(info.actions || []).map((action, index) => isReviewTile(action) ? reviewTile(action, index) : '').join('')}</div>` : ''}${
+      (info.actions || []).map((action, index) => isReviewTile(action) ? '' : reviewActionBtn(action, index)).join('')}${(info.links || []).map((link) => `<a class="btn sm" href="${esc(safeHref(link.url))}" target="_blank" rel="noopener">${esc(link.label)} ↗</a>`).join('')}</div><pre class="raw hidden" id="review-action-out"></pre>` : ''}
     ${info.html ? `<iframe id="review-info-frame" data-live-key="${esc(v.taskId)}:${contentKey(info.html)}" sandbox="allow-scripts" src="/api/tasks/${encodeURIComponent(v.taskId)}/review-info.html" title="Review details"></iframe>` : ''}
     ${resources ? resourceReviewPlaceholder() : ''}${atReview ? '<div id="review-resource-inventory"></div>' : ''}
   </div>`;
@@ -14394,12 +14462,32 @@ function wireCopyButtons() {
 // ── the host widget library (SPEC §10.2 tier 2): draw server-resolved widget
 // descriptors. The host owns NO resolve logic — it just renders what's declared,
 // so any conforming workflow gets a richer-than-floor UI with no bespoke code.
+// Workflow widget groups in the rail, folded (a list of changed files is
+// reference, not something to read every time): the summary carries the count
+// of a group made of lists, and a group with nothing in it is left out. Open
+// folds stay open across re-renders (S.openWidgetGroups).
 function renderWidgetGroups(groups) {
   if (!Array.isArray(groups) || !groups.length) return '';
+  const open = (S.openWidgetGroups ||= new Set());
   return groups
-    .map((g) => `<section class="rail-sec rail-widgets"><div class="rail-h">${esc(g.title || g.workflow)}</div>${(g.widgets || []).map(renderWidget).join('')}</section>`)
+    .map((g) => {
+      const widgets = g.widgets || [];
+      const counted = widgets.length && widgets.every((w) => w.type === 'list' || w.type === 'table');
+      const count = counted ? widgets.reduce((n, w) => n + (w.type === 'table' ? w.data?.rows?.length || 0 : Array.isArray(w.data) ? w.data.length : 0), 0) : null;
+      if (count === 0) return '';
+      const key = String(g.title || g.workflow);
+      return `<details class="rail-sec rail-widgets" data-widget-group="${esc(key)}"${open.has(key) ? ' open' : ''}>
+        <summary class="rail-h">${esc(key)}${count != null ? `<span class="rail-count">${count}</span>` : ''}</summary>${widgets.map(renderWidget).join('')}</details>`;
+    })
     .join('');
 }
+// `toggle` does not bubble; one capturing listener remembers rail folds.
+globalThis.document?.addEventListener('toggle', (event) => {
+  const key = event.target?.dataset?.widgetGroup;
+  if (key === undefined) return;
+  const open = (S.openWidgetGroups ||= new Set());
+  event.target.open ? open.add(key) : open.delete(key);
+}, true);
 function renderWidget(w) {
   const empty = (s) => `<div class="task-sub" style="color:var(--ink-3)">${esc(s || '—')}</div>`;
   const head = w.title ? `<div class="wk-title" style="font-size:11px;color:var(--ink-3);margin:6px 0 2px">${esc(w.title)}</div>` : '';

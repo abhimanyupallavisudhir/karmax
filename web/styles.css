@@ -945,6 +945,12 @@ a.git-repo-name:hover { color:var(--accent); }
 .tp-rail .checkout-row { flex-wrap: wrap; font-size: 12px; }
 .tp-rail .checkout-row .mono { display: none; }
 .rail-widgets .task-sub { flex-wrap: wrap; font-size: 12px; }
+details.rail-widgets > summary { cursor: pointer; list-style: none; margin: 0; }
+details.rail-widgets > summary::-webkit-details-marker { display: none; }
+details.rail-widgets > summary::after { content: '›'; margin-left: auto; font-size: 15px; line-height: 1; letter-spacing: 0; transition: transform .15s; }
+details.rail-widgets[open] > summary { margin-bottom: 6px; }
+details.rail-widgets[open] > summary::after { transform: rotate(90deg); }
+.rail-count { font-weight: 600; color: var(--ink-2); letter-spacing: 0; }
 .rail-widgets .wk-title { margin-top: 4px !important; }
 
 .review-info iframe { display: block; width: 100%; height: 360px; margin-top: 8px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
@@ -1225,6 +1231,20 @@ a.git-repo-name:hover { color:var(--accent); }
 .review-info-caption { white-space: pre-wrap; }
 .review-info .review-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin-top: 5px; }
 .review-info #review-action-out { max-height: 180px; overflow: auto; margin: 5px 0 0; }
+/* Review files: a gallery of thumbnails (images, videos) and file tiles. */
+.review-gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(148px, 1fr)); gap: 10px; width: 100%; margin: 4px 0 6px; }
+.review-tile { display: flex; flex-direction: column; gap: 6px; min-width: 0; padding: 0; border: 0; background: none; color: var(--ink); font: inherit; text-align: left; cursor: pointer; }
+.review-tile-media { position: relative; display: grid; place-items: center; aspect-ratio: 16 / 10; overflow: hidden;
+  border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); transition: border-color .15s, box-shadow .15s; }
+.review-tile:hover .review-tile-media, .review-tile:focus-visible .review-tile-media { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak); }
+.review-tile:focus-visible { outline: none; }
+.review-tile-media > img, .review-tile-media > video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.review-tile-file { color: var(--ink-3); font: 700 13px/1 var(--font-mono); letter-spacing: .06em; }
+.review-tile-play { position: relative; z-index: 1; display: grid; place-items: center; width: 34px; height: 34px; padding-left: 3px; border-radius: 50%;
+  background: rgb(0 0 0 / .55); color: #fff; font-size: 13px; }
+.review-tile-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; color: var(--ink-2); }
+.review-tile:disabled { opacity: .6; cursor: progress; }
+@media (max-width: 640px) { .review-gallery { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .msg time { color: var(--ink-3); font-size: 12px; line-height: 1.2; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .agent-activity time { color: currentColor; opacity: .58; font: 10px/1.2 var(--font-mono); white-space: nowrap; }
 
@@ -3409,6 +3429,12 @@ html[data-theme="dark"] .github-signin-btn:active,
 .artifact-pdf .artifact-reader-content, .artifact-page .artifact-reader-content { padding: 0; overflow: hidden; }
 .artifact-reader-content > iframe { display: block; width: 100%; height: calc(100dvh - 120px); border: 0; background: #fff; }
 .artifact-reader-content > .artifact-error { margin: 0; padding: 20px; color: var(--ink); }
+.artifact-reader-tools:empty { display: none; }
+.artifact-reader-tools { display: contents; }
+.artifact-reader-steps { display: inline-flex; align-items: center; gap: 4px; }
+.artifact-reader-steps .btn.icon { width: 30px; padding: 4px 0; font-size: 17px; line-height: 1; }
+.artifact-reader-count { min-width: 44px; text-align: center; font-size: 12px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.artifact-gallery { width: min(1100px, calc(100vw - 32px)); }
 
 .authz-editor .authz-description { margin: 0; line-height: 1.45; }
 .authz-warning { display: flex; align-items: center; gap: 6px; margin: 6px 0 0; padding: 6px 10px; border-radius: 8px;

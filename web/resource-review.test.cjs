@@ -33,7 +33,7 @@ function setup(api) {
   let wrap = panel();
   const inventory = panel();
   const context = vm.createContext({ api, resourceReviewCache: new Map(), resourceInventoryCache: new Map(), resourceChoiceWrites: new Map(), asyncElementRenderEpoch: new WeakMap(),
-    document: { getElementById: (id) => id === 'review-resource-inventory' ? inventory : wrap }, esc: String, formatBytes: String, confirm: () => true, toast: () => {},
+    document: { getElementById: (id) => id === 'review-resource-inventory' ? inventory : wrap }, esc: String, formatBytes: String, policyTip: (text) => `<button class="info-dot" title="${text}">ⓘ</button>`, confirm: () => true, toast: () => {},
     S: {}, ICON: {}, siteNameMarkup: () => 'Karmax', siteName: () => 'Karmax', markdownEnabled: () => false, mathjaxEnabled: () => true, renderAgentMessageBody: String, renderWaitDetail: String, explainMessageAffordance: () => '',
     waitingText: () => 'Waiting', liveRoleFor: () => 'do', conversationPresence: () => ({ tone: 'waiting', label: 'Waiting' }),
     conversationEntries: () => [], subTasksSection: () => '', forkSourcesSection: () => '', agentForksSection: () => '',
@@ -83,6 +83,8 @@ test('first-open review shows candidate buttons while the ignored-file scan is s
   finishInventory({ entries: [{ path: 'ignored.log', bytes: 10 }] });
   await scan;
   assert.match(h.inventory.innerHTML, /ignored.log/);
+  assert.match(h.inventory.innerHTML, /^<details class="ignored-output">\s*<summary>1 ignored path not saved/, 'the ignored paths are folded by default');
+  assert.doesNotMatch(h.inventory.innerHTML, /<details[^>]* open/);
   assert.match(h.wrap.innerHTML, /Exclude/);
 });
 
