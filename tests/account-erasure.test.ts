@@ -54,7 +54,7 @@ it('previews without mutation, requires exact confirmation and rejects a stale i
   expect((await close()).state).toBe('closed');
 });
 
-it('blocks sole ownership, live linked work, owned avatars and dependent organization Git', async () => {
+it('blocks sole ownership, live linked work and dependent organization Git', async () => {
   const { store, service, broker, dir, close } = await fixture();
   const org = await store.createOrganization({ name: 'Private fixture', kind: 'personal', ownerUserId: 'u_1' });
   await expect(close()).rejects.toThrow('Transfer ownership');
@@ -70,9 +70,6 @@ it('blocks sole ownership, live linked work, owned avatars and dependent organiz
   await expect(close()).rejects.toThrow('Git profiles');
   await new GitProfiles(store, broker, dir, org.id).delete('main');
   expect((await service.preview('u_1')).blockers).toEqual([]);
-  await store.db.prepare('INSERT INTO avatars (id,organizationId,projectId,ownerUserId,json,createdAt,updatedAt) VALUES (?,?,?,?,?,?,?)')
-    .run('av', org.id, project.id, 'u_1', '{}', Date.now(), Date.now());
-  await expect(close()).rejects.toThrow('Avatars');
   expect(await store.kvGet(closedAccountKey('u_1'))).toBeUndefined();
 });
 

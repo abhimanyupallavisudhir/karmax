@@ -209,6 +209,7 @@ const S = {
   modelCatalog: null, // provider-native model metadata loaded from the gateway
   worldProviderConnections: [], // org's connected cloud computers → the Computer block's provider choices
   inviteNotice: null,
+  inviteWelcome: null, // the organization an invitation was just accepted into
   installationAccess: false, // proven by an installation-scoped endpoint, never inferred from an org role
   installationInfo: null,
   onboarding: null, // hosted-only, server-derived setup progress for the selected organization
@@ -544,7 +545,7 @@ function orgBase(org = currentOrg()) { return org ? `/${orgSlug(org)}` : ''; }
 /** Tabs that belong to the selected project (the router reads them from URLs,
  *  the rail highlights the project, the main pane shows its tab bar). One list
  *  so they never drift apart again. */
-const PROJECT_SCOPED_TABS = ['tasks', 'queue', 'activity', 'wiki', 'avatars', 'settings'];
+const PROJECT_SCOPED_TABS = ['tasks', 'queue', 'activity', 'wiki', 'settings'];
 const PROJECT_TAB_COMMANDS = { tasks: 'nav.tasks', queue: 'nav.queue', wiki: 'nav.wiki', settings: 'nav.settings' };
 // The query a task list opens with: what needs the signed-in person.
 const DEFAULT_LIST_QUERY = 'for:me -is:archived';
@@ -598,11 +599,10 @@ function parseRoute(url) {
   const taskTab = taskKey ? taskTabOf(seg[4]) : null;
   const taskFile = taskKey && seg[4] === 'file' ? fileRouteTarget(query) : null;
   const wikiView = tab === 'wiki' ? wikiViewFromQuery(query) : '';
-  const avatarId = tab === 'avatars' && seg[3] ? seg[3] : null;
   // A Task store entry, opened to read before running or installing it.
   const storeKey = seg[2] === 'store' && seg[3] ? seg[3] : null;
   return { name: 'project', org, slug: seg[1], tab, taskKey, taskTab, q, ...(taskFile ? { taskFile } : {}),
-    ...(wikiView ? { wikiView } : {}), ...(avatarId ? { avatarId } : {}), ...(storeKey ? { storeKey } : {}) };
+    ...(wikiView ? { wikiView } : {}), ...(storeKey ? { storeKey } : {}) };
 }
 
 // Which branch the project wiki shows is part of the page, so it lives in the
@@ -619,11 +619,6 @@ function wikiRoute(pid, view = '', entry = '') {
   const query = kind === 'task' && value ? `?task=${encodeURIComponent(value)}`
     : kind === 'branch' && value ? `?branch=${encodeURIComponent(value)}` : '';
   return `${projectRoute(pid, 'wiki')}${query}${entry ? `#${encodeURIComponent(entry)}` : ''}`;
-}
-
-// An open Avatar: /<org>/<project>/avatars/<id>; the list without an id.
-function avatarRoute(pid, avatarId) {
-  return `${projectRoute(pid, 'avatars')}${avatarId ? `/${encodeURIComponent(avatarId)}` : ''}`;
 }
 
 function fileRouteTarget(query) {
@@ -884,14 +879,10 @@ async function applyRoute() {
   const projectOrganizationLoaded = sameProject && S.orgProjectId === pid;
   const canPaintCachedProject = !r.taskKey && !r.storeKey && projectOrganizationLoaded;
   // A project with nothing in memory to paint reads everything its page needs
-  // together: tasks, avatars, tags/views and the list's search (RQ-9).
+  // together: tasks, Avatars, tags/views and the list's search (RQ-9).
   const reads = [];
   if (!sameProject || !S.tasks?.length) reads.push(loadTasks().catch(() => {}));
   if (!sameProject || !S.avatarAvailability || S.avatarProjectId !== pid) reads.push(loadAvatars().catch(() => {}));
-  // The URL owns the open Avatar, as it owns the open task.
-  S.avatarSelected = tab === 'avatars' ? r.avatarId || null : null;
-  S.avatarAuthorizationRequests = [];
-  if (S.avatarSelected) reads.push(loadAvatarAuthorizationRequests(S.avatarSelected));
   let organizationRead = null, listSearch = null;
   if (!projectOrganizationLoaded) {
     organizationRead = loadOrg().catch(() => false);
@@ -902,10 +893,6 @@ async function applyRoute() {
   }
   await Promise.all(reads);
   if (!routeIsCurrent()) return;
-  if (S.avatarSelected && !S.avatars.some((avatar) => avatar.id === S.avatarSelected)) {
-    toast('Avatar not found', true);
-    return go(avatarRoute(pid), { replace: true });
-  }
   // Same-project tabs are local navigation. Their complete last-painted inputs
   // are already in memory, so reveal the destination before refreshing tags,
   // views, fields, and (for the task list) the authoritative search result.
@@ -2107,7 +2094,8 @@ function renderAgentField(f, spec, inherited, opts) {
 //   agentBlockHtml(prefix, spec, opts) → HTML of one `.agent-field` block
 //     prefix  id prefix unique on the page ('tf-responder'); omitted ⇒ generated.
 //     spec    the AgentSpec shown: provider, model, effort, mcpConnections,
-//             resumeFrom, avatarId, authority, prompt (its instructions).
+//             resumeFrom, authority, prompt (its instructions). An agent that
+//             forks an Avatar it may call acts with the Avatar's authorization.
 //     opts    role          'do' | 'responder' | 'confirm' | 'agent' (data-agent)
 //             inherited     the AgentSpec it inherits (resets, tool inheritance)
 //             fork          show "Fork a previous agent" (default true)
@@ -2130,31 +2118,18 @@ function agentBlockHtml(prefix, spec, opts) {
   prefix ||= `agent-block-${agentBlockHtml.nextId = (agentBlockHtml.nextId || 0) + 1}`;
   const inh = opts.inherited || {};
   const role = opts.role || 'do';
-  const pendingAvatarId = role === 'do' ? S.pendingAvatarId : null;
-  const requestedAvatarId = spec?.avatarId || pendingAvatarId || inh.avatarId || '';
-  const selectedAvatar = (S.avatars || []).find((avatar) => avatar.id === requestedAvatarId);
-  const e = selectedAvatar
-    ? { ...selectedAvatar.runtime, avatarId: selectedAvatar.id, resumeFrom: spec?.resumeFrom }
-    : spec || inh; // prefill with the effective spec
+  const e = spec || inh; // prefill with the effective spec
   const providerVisible = !e.provider || AGENT_PROVIDERS.includes(e.provider);
   const provider = agentProviderChoice(e.provider);
   const model = providerVisible ? e.model : '';
   const effort = providerVisible ? e.effort : '';
   const resumeEnabled = !!(spec?.resumeFrom?.taskId || spec?.resumeFrom?.sessionId || spec?.resumeFrom?.upload);
-  const availableAvatars = (S.avatars || []).filter((avatar) => avatar.callable && avatar.effectiveEnabled
-    && (!avatar.roles?.length || avatar.roles.includes(role)));
-  if (selectedAvatar && !availableAvatars.some((avatar) => avatar.id === selectedAvatar.id)) availableAvatars.push(selectedAvatar);
   // Frozen (a running task's used parameter): the agent's controls are shown
   // disabled. A host-owned Authorization row (the main agent's) keeps its own state.
   const hostAuthority = opts.authority && opts.authority.html !== undefined;
   const body = `
     ${opts.instructions ? `<textarea class="ab-instructions" rows="2" aria-label="Instructions" placeholder="Instructions for this agent (optional)">${esc(agentInstructions(spec?.prompt))}</textarea>` : ''}
-    ${availableAvatars.length ? `<select class="af-avatar" aria-label="Agent identity">
-      <option value="">Project/default agent</option>
-      ${availableAvatars.map((avatar) => `<option value="${esc(avatar.id)}" ${avatar.id === selectedAvatar?.id ? 'selected' : ''}>${esc(avatar.name)} · Avatar</option>`).join('')}
-    </select>` : ''}
-    <div class="af-avatar-note" ${selectedAvatar ? '' : 'hidden'}>${selectedAvatar ? `${esc(selectedAvatar.purpose || 'Owner-controlled prompt and delegated authority')} · owned by ${esc(avatarOwnerName(selectedAvatar))}` : ''}</div>
-    <div class="agent-controls" ${selectedAvatar ? 'hidden' : ''}>
+    <div class="agent-controls">
       ${modelFieldHtml('af-ref', { provider, model, effort })}
       ${opts.extraControls || ''}
     </div>
@@ -2356,7 +2331,7 @@ function wireAgentAuthority(details, ctx) {
 function readAgentBlock(root) {
   const spec = readAgentSpec(root);
   const details = root.querySelector('.agent-authority[data-mode="agent"]');
-  if (details && !spec.avatarId) {
+  if (details && !forkedAvatar(spec)) {
     const authority = details._readAuthority ? details._readAuthority()
       : details.dataset.explicit === '1' ? JSON.parse(details.dataset.authority || 'null') : undefined;
     if (authority) spec.authority = authority;
@@ -2417,6 +2392,13 @@ function showForkWorldHelp(root) {
   }
 }
 
+// The Avatar an agent spec forks and may act for (wiki features/avatars): its
+// fork source, when that is an Avatar this person may call.
+function forkedAvatar(spec) {
+  const id = spec?.resumeFrom?.taskId;
+  return id ? (S.avatars || []).find((avatar) => avatar.id === id && avatar.callable) : undefined;
+}
+
 // The chosen fork source as a friendly chip (the {taskId, role} JSON rides in the
 // container's data-resume; collectForm/collectParamEdits read it via readResume).
 // The task reference is a real permalink to the source (Ctrl/⌘-click opens it
@@ -2426,14 +2408,19 @@ function showForkWorldHelp(root) {
 // credentials controls can honour it.
 function resumeChosenInner(rf, task) {
   const t = task || taskRecord(rf.taskId);
+  const avatar = forkedAvatar({ resumeFrom: rf });
   const source = agentRoleLabel(rf.role).toLowerCase();
   const ref = `${t?.num != null ? `#${t.num} ` : ''}${t ? t.title : rf.taskId}`;
   const link = t && projectById(t.projectId)
     ? `<a class="af-resume-source" data-spa href="${esc(taskUrl(t.id, t))}" title="Open the source task">${esc(ref)}</a>`
     : esc(ref);
+  // A fork of an Avatār starts from its authorization, granted without
+  // approval; the form's controls can only lower it.
   const grants = t ? previousGrantsSummary(t) : '';
-  return `<span class="af-resume-label">⑂ forking ${esc(source)} of ${link}</span><button type="button" class="af-resume-clear" title="Clear">✕</button>${grants
-    ? `<label class="af-resume-reauth" hidden title="Start this fork with the grants the source task ended with — its authorization level and scope plus the vault credentials it was approved for — instead of the defaults. They land in the Authorization and Vault credentials controls, where you can still adjust them."><input type="checkbox" class="af-resume-reauthorize"> Re-authorize previous grants? <span class="af-resume-reauth-summary">${esc(grants)}</span></label>`
+  return `<span class="af-resume-label">⑂ forking ${esc(source)} of ${link}${avatar ? ` <span class="chip avatar-chip" title="Its forks get up to its authorization without approval">✦ Avatār</span>` : ''}</span><button type="button" class="af-resume-clear" title="Clear">✕</button>${grants
+    ? avatar
+      ? `<label class="af-resume-reauth" hidden title="Granted from this Avatār without approval. Lower it in Authorization and Vault credentials to give the fork less."><input type="checkbox" class="af-resume-reauthorize"> Its authorization <span class="af-resume-reauth-summary">${esc(grants)}</span></label>`
+      : `<label class="af-resume-reauth" hidden title="Start this fork with the grants the source task ended with — its authorization level and scope plus the vault credentials it was approved for — instead of the defaults. They land in the Authorization and Vault credentials controls, where you can still adjust them."><input type="checkbox" class="af-resume-reauthorize"> Re-authorize previous grants? <span class="af-resume-reauth-summary">${esc(grants)}</span></label>`
     : ''}${t && (t.lastView?.status || t.status) !== 'done'
     ? `<label class="af-resume-dependency" hidden title="Wait for this source task to complete successfully before starting."><input type="checkbox" class="af-resume-add-dependency" data-task-id="${esc(rf.taskId)}"> Also add as dependency?</label>`
     : ''}<label class="af-resume-model" title="Copy this agent’s provider, model and reasoning effort."><input type="checkbox" class="af-resume-reuse-model"> Re-use same AI model</label>`;
@@ -2451,6 +2438,8 @@ function previousTaskGrants(task) {
     credentialGrantIds: (stored.capabilities || [])
       .filter((c) => c.startsWith('use-credential:item:')).map((c) => c.slice('use-credential:item:'.length)),
     credentialPolicies: JSON.parse(JSON.stringify(stored.credentialPolicies || {})),
+    // An Avatār's forks share its cards and budget (wiki features/avatars).
+    ...(task.params.avatar && task.params.paymentPolicy ? { paymentPolicy: JSON.parse(JSON.stringify(task.params.paymentPolicy)) } : {}),
   };
 }
 // A task's record, also when the task list does not hold it: the list has only
@@ -2515,15 +2504,17 @@ function wireResumeReauthorization(root, host) {
     host.changed?.();
   }, { signal: wiring.signal });
   root.addEventListener('af-reauthorize', (event) => {
-    const { enabled, authorization, credentialGrantIds, credentialPolicies } = event.detail;
+    const { enabled, authorization, credentialGrantIds, credentialPolicies, paymentPolicy } = event.detail;
     const editor = host.editor();
     if (enabled) {
-      stash = stash || { authorization: readAuthorizationEditor(editor), ...host.grants() };
+      stash = stash || { authorization: readAuthorizationEditor(editor), ...host.grants(), payments: host.payments?.() };
       editor?._setAuthorization?.(withProjects(normalizedAuthorization(authorization), [host.projectId, ...sources.values()].filter(Boolean)));
       host.setGrants(credentialGrantIds, credentialPolicies);
+      if (paymentPolicy) host.setPayments?.(paymentPolicy);
     } else if (stash) {
       editor?._setAuthorization?.(stash.authorization);
       host.setGrants(stash.ids, stash.policies);
+      if (stash.payments) host.setPayments?.(stash.payments);
       stash = null;
     } else return;
     host.changed?.();
@@ -2590,15 +2581,10 @@ function readResume(box) {
 }
 
 function readAgentSpec(box) {
-  const avatarId = box.querySelector('.af-avatar')?.value || '';
-  const avatar = (S.avatars || []).find((candidate) => candidate.id === avatarId);
   const chosen = readModelField(box.querySelector('.agent-controls'));
-  const spec = { provider: avatar?.runtime?.provider || chosen.provider };
-  if (avatarId) spec.avatarId = avatarId;
-  const model = avatar?.runtime?.model || chosen.model;
-  const effort = avatar?.runtime?.effort || chosen.effort;
-  if (model) spec.model = model;
-  if (effort) spec.effort = effort;
+  const spec = { provider: chosen.provider };
+  if (chosen.model) spec.model = chosen.model;
+  if (chosen.effort) spec.effort = chosen.effort;
   const mcpConnections = readMcpPicker(box);
   if (mcpConnections !== undefined) spec.mcpConnections = mcpConnections;
   const resumeFrom = readResume(box);
@@ -2675,7 +2661,7 @@ function renderConfirmerField(f, own, inherited, alt) {
 }
 
 const sameJson = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
-const normSpec = (s, inherited) => (s ? { avatarId: s.avatarId || '', provider: s.provider, model: s.model || '', effort: s.effort || '', mcpConnections: s.mcpConnections ?? inherited?.mcpConnections } : null);
+const normSpec = (s, inherited) => (s ? { provider: s.provider, model: s.model || '', effort: s.effort || '', mcpConnections: s.mcpConnections ?? inherited?.mcpConnections } : null);
 // Canonical shape of an agent's own authority, for changed-vs-inherited checks.
 function normAuthority(a) {
   if (!a) return null;
@@ -2693,7 +2679,7 @@ function normAuthority(a) {
 const normLayers = (ls) =>
   (ls || []).map((l) =>
     l.kind === 'agent'
-      ? { kind: 'agent', avatarId: l.avatarId || '', provider: l.provider || '', model: l.model || '', effort: l.effort || '', prompt: agentInstructions(l.prompt), resume: l.resumeFrom || null, mcpConnections: l.mcpConnections, authority: l.avatarId ? null : normAuthority(l.authority), maxRevisions: l.maxRevisions ?? null }
+      ? { kind: 'agent', provider: l.provider || '', model: l.model || '', effort: l.effort || '', prompt: agentInstructions(l.prompt), resume: l.resumeFrom || null, mcpConnections: l.mcpConnections, authority: normAuthority(l.authority), maxRevisions: l.maxRevisions ?? null }
       : { kind: 'human', audience: l.audience?.length ? [...l.audience] : ['@creator'] },
   );
 
@@ -2719,7 +2705,7 @@ function responderOf(v) {
 }
 function normResponder(route) {
   return route?.kind === 'agent'
-    ? { kind: 'agent', avatarId: route.avatarId || '', provider: route.provider || '', model: route.model || '', effort: route.effort || '', prompt: agentInstructions(route.prompt), resume: route.resumeFrom || null, mcpConnections: route.mcpConnections, authority: route.avatarId ? null : normAuthority(route.authority) }
+    ? { kind: 'agent', provider: route.provider || '', model: route.model || '', effort: route.effort || '', prompt: agentInstructions(route.prompt), resume: route.resumeFrom || null, mcpConnections: route.mcpConnections, authority: normAuthority(route.authority) }
     : { kind: 'human', audience: route?.audience?.length ? [...route.audience] : ['@creator'] };
 }
 function renderResponderField(f, own, inherited, alt) {
@@ -2742,9 +2728,7 @@ function readResponder(box) {
     const audience = (box.querySelector('.rf-audience')?.value || '').split(',').map((value) => value.trim()).filter(Boolean);
     return { kind: 'human', audience: audience.length ? audience : ['@creator'] };
   }
-  const route = { kind: 'agent', ...readAgentBlock(box.querySelector('.agent-field')) };
-  if (route.avatarId) return { kind: 'human', audience: [`avatar:${route.avatarId}`] };
-  return route;
+  return { kind: 'agent', ...readAgentBlock(box.querySelector('.agent-field')) };
 }
 
 // Read a form's values back out; only return fields CHANGED from inherited.
@@ -2960,10 +2944,10 @@ function normalizeComboOption(option) {
 
 function authorizationLevels() {
   return [
-    { id: 'viewer', description: 'Read projects, tasks, conversations, and settings in the selected scope.', name: 'Viewer', scope: 'selectable' },
-    { id: 'developer', description: 'Read diagnostics, create tasks, and manage your own work and its descendants.', name: 'Developer', scope: 'selectable' },
-    { id: 'maintainer', description: 'Manage all tasks, reviews, settings, and automation in the selected projects.', name: 'Project maintainer', scope: 'selectable' },
-    { id: 'administrator', description: 'Manage this organization: projects, members, settings, and credentials within their policies.', name: 'Administrator', scope: 'organization' },
+    { id: 'viewer', description: 'Can see projects and tasks, but not change them.', name: 'Viewer', scope: 'selectable' },
+    { id: 'developer', description: 'Can start tasks and talk to agents.', name: 'Developer', scope: 'selectable' },
+    { id: 'maintainer', description: 'Can also approve anyone’s tasks and change project settings.', name: 'Project maintainer', scope: 'selectable' },
+    { id: 'administrator', description: 'Can manage the whole organization: projects, people, settings, and passwords.', name: 'Administrator', scope: 'organization' },
     { id: 'superadmin', description: 'Everything an Administrator can do, plus the vault, payments, and deleting the organization.', name: 'Super-administrator', scope: 'organization',
       warning: 'Super-administrator authorization will give agents full read access to your vault.',
       warningDetail: 'Agents can read every secret regardless of its policy, approve credential requests and spending, manage payment cards, and delete the organization.' },
@@ -3179,7 +3163,7 @@ async function chooseAuthorizationGrant(projectId, authorization, targetLabel = 
     ...targets.users.map((user) => ({ value: user.selector, label: user.name || user.email || user.id,
       detail: user.name && user.email ? user.email : '', kind: 'person' })),
     ...targets.teams.map((team) => ({ value: team.selector, label: team.name, detail: `Team · ${count(team.eligibleUserIds)}`, kind: 'team' })),
-    ...targets.avatars.map((avatar) => ({ value: avatar.selector, label: avatar.name, detail: avatar.purpose || 'Avatar', kind: 'avatar' })),
+    ...targets.avatars.map((avatar) => ({ value: avatar.selector, label: avatar.name, detail: 'Avatār', kind: 'avatar' })),
     ...targets.special.filter((item) => item.selector !== targets.summon).map((item) => ({ value: item.selector,
       label: SUMMON_GROUP_LABELS[item.selector] || item.selector, detail: `${item.selector} · ${count(item.eligibleUserIds)}`, kind: 'group' })),
   ];
@@ -3463,24 +3447,27 @@ function wireAgentBox(box) {
   wireMcpPicker(box.querySelector('.mcp-picker'), box.closest?.('[data-mcp-scope]')?.dataset.mcpScope);
   const controls = box.querySelector('.agent-controls');
   wireModelField(controls?.querySelector('.model-field'));
-  const avatarSelect = box.querySelector('.af-avatar');
+  // An agent that forks an Avatar it may call acts with the Avatar's
+  // authorization (wiki features/avatars): its Authorization row says so.
   const syncAvatar = () => {
-    const avatar = (S.avatars || []).find((candidate) => candidate.id === avatarSelect?.value);
-    const note = box.querySelector('.af-avatar-note');
-    if (controls) controls.hidden = !!avatar;
-    // An Avatar acts with the authority its owner delegated to it.
-    const authority = box.querySelector('.agent-authority');
-    if (authority) authority.hidden = !!avatar;
-    if (note) {
-      note.hidden = !avatar;
-      note.textContent = avatar ? `${avatar.purpose || 'Owner-controlled prompt and delegated authority'} · owned by ${avatarOwnerName(avatar)}` : '';
+    const details = box.querySelector('.agent-authority');
+    if (!details) return;
+    const avatar = forkedAvatar({ resumeFrom: readResume(box) });
+    details.classList.toggle('acts-for-avatar', !!avatar);
+    const summary = details.querySelector('.aa-summary');
+    // The main agent's row shows the task's own (lowerable) authorization; an
+    // agent that sets its own shows that.
+    if (!summary || details.dataset.mode !== 'agent' || details.dataset.explicit === '1') return;
+    if (avatar) {
+      if (summary.dataset.own === undefined) summary.dataset.own = summary.textContent;
+      summary.textContent = `✦ ${avatar.name}’s`;
+      summary.title = `Acts with Avatār ${avatar.name}’s authorization unless you give it less`;
+    } else if (summary.dataset.own !== undefined) {
+      summary.textContent = summary.dataset.own;
+      delete summary.dataset.own;
+      summary.removeAttribute('title');
     }
-    if (avatar) setModelField(controls, avatar.runtime);
   };
-  avatarSelect?.addEventListener('change', () => {
-    syncAvatar();
-    box.dispatchEvent(new Event('change', { bubbles: true }));
-  });
   // Fork-from search: the full task-picker overlay in agent mode (archived tasks
   // included — the completed ones are the ones you most often fork from).
   const chosen = box.querySelector('.af-resume-chosen');
@@ -3519,11 +3506,9 @@ function wireAgentBox(box) {
   // only until the source is withdrawn or the user customizes these controls.
   let modelStash = null;
   let modelRequest = 0;
-  const modelSelection = () => ({ avatarId: avatarSelect?.value || '', ...readModelField(controls) });
+  const modelSelection = () => readModelField(controls);
   const applyModelSelection = (spec) => {
-    if (avatarSelect) avatarSelect.value = spec.avatarId || '';
     setModelField(controls, { provider: spec.provider, model: spec.model || '', effort: spec.effort || '' });
-    syncAvatar();
   };
   const withdrawModel = () => {
     modelRequest++;
@@ -3548,7 +3533,7 @@ function wireAgentBox(box) {
     }
   };
   const releaseModel = (event) => {
-    if (!event.target.matches('.af-ref, .af-avatar')) return;
+    if (!event.target.matches('.af-ref')) return;
     modelRequest++;
     modelStash = null;
     const option = chosen?.querySelector('.af-resume-reuse-model');
@@ -3590,6 +3575,7 @@ function wireAgentBox(box) {
     chosen._sourceSession = undefined;
     chosen.dataset.resume = 'null';
     chosen.innerHTML = '';
+    syncAvatar();
   };
   const clearUpload = () => {
     const line = box.querySelector('.af-resume-check');
@@ -3612,6 +3598,7 @@ function wireAgentBox(box) {
     chosen.innerHTML = rf ? resumeChosenInner(rf, task) : '';
     if (rf && task) prefillForkBranch(box, task);
     syncForkState();
+    syncAvatar();
     if (rf && task) applyForkDefaults(task);
     box.dispatchEvent(new Event('change', { bubbles: true })); // the form's auto-save listens for change
   };
@@ -3890,8 +3877,6 @@ function resetPlainField(el, f, attr = 'data-inherit') {
 
 function resetAgentField(box, attr = 'data-inherit') {
   const inh = JSON.parse(box.getAttribute(attr) || 'null') || {};
-  const avatar = box.querySelector('.af-avatar');
-  if (avatar) avatar.value = inh.avatarId || '';
   setModelField(box.querySelector('.agent-controls'), { provider: agentProviderChoice(inh.provider), model: inh.model || '', effort: inh.effort || '' });
   const picker = box.querySelector('.mcp-picker');
   if (picker) {
@@ -3901,7 +3886,6 @@ function resetAgentField(box, attr = 'data-inherit') {
   }
   const authority = box.querySelector('.agent-authority[data-mode="agent"]');
   if (authority?.dataset.explicit === '1') authority.querySelector('.aa-reset')?.click();
-  avatar?.dispatchEvent(new Event('change', { bubbles: true }));
   box.dispatchEvent(new Event('change', { bubbles: true }));
 }
 
@@ -4283,11 +4267,84 @@ function typesetMath(root) {
   });
 }
 
+// ─── Plain-language errors ──────────────────────────────────────────────────
+// Server and workflow errors are written for whoever debugs them. People see
+// what happened and what to do; the exact text stays one hover (toasts) or one
+// click (task errors) away. Unknown messages pass through, minus API plumbing.
+const CAPABILITY_ACTIONS = [
+  [/^task:create$/, 'start tasks here'], [/^task:(?:write|\*)$/, 'change tasks here'], [/^task:read$/, 'see these tasks'],
+  [/^review:/, 'approve work here'], [/^(?:confirm|resolve)-decision$/, 'answer this'], [/^merge-into:/, 'land changes on this branch'],
+  [/^project:create$/, 'create projects'], [/^project:(?:edit|write|delete)$/, 'change this project'], [/^project:read$/, 'open this project'],
+  [/^repository:/, 'change this project’s repositories'], [/^skill:/, 'edit the wiki'], [/^organization:wiki/, 'edit the organization wiki'],
+  [/^organization:/, 'change this organization'], [/^(?:member|team|people)/, 'manage people'], [/^payment:/, 'manage payments'],
+  [/^credential:/, 'use these passwords and keys'], [/^vault:/, 'use these passwords and keys'], [/^installation:/, 'change installation settings'],
+];
+function permissionSentence(text) {
+  const capability = /missing capability ([\w:*.@-]+)/.exec(text)?.[1] || /denied: ([\w:*.@-]+)/.exec(text)?.[1];
+  const action = CAPABILITY_ACTIONS.find(([pattern]) => pattern.test(capability || ''))?.[1] || 'do this';
+  const needed = /; (\w[\w ]*?) and above have it/.exec(text)?.[1];
+  return `You don’t have permission to ${action}.${needed ? ` Ask an admin to make you ${/^[aeiou]/i.test(needed) ? 'an' : 'a'} ${needed}.` : ' Ask an admin for access.'}`;
+}
+function plainError(error) {
+  const raw = String(error?.message ?? error ?? '').trim();
+  const text = raw.replace(/^(?:Activity task failed → )+/, '');
+  if (!text) return 'Something went wrong. Try again.';
+  if (/^(?:Failed to fetch|NetworkError when attempting to fetch resource\.?|Load failed|network ?error)$/i.test(text))
+    return 'Can’t reach tavya. Check your internet connection and try again.';
+  if (/^unauthorized$/i.test(text) || /invalid or expired token/i.test(text)) return 'You were signed out. Sign in again to continue.';
+  if (/^HTTP 50[234]$/.test(text) || /runtime is not ready/i.test(text)) return 'tavya is busy or restarting. Try again in a moment.';
+  if (/^HTTP 5\d\d$|^Internal Server Error$/i.test(text)) return 'Something went wrong on our side. Try again in a moment.';
+  if (/^HTTP 404$/.test(text)) return 'This no longer exists, or you can’t see it.';
+  if (/missing capability |^denied: [\w:*.-]+$|capability_denied/.test(text) || error?.code === 'capability_denied') return permissionSentence(text);
+  if (/too many requests/i.test(text)) return 'Too many requests at once. Wait a few seconds and try again.';
+  const tooLarge = /upload too large \(> (\d+) bytes\)/i.exec(text);
+  if (tooLarge) return `That file is too big. The limit is ${Math.round(Number(tooLarge[1]) / 1048576)} MB.`;
+  if (/^message too large/i.test(text)) return 'That message is too long. Shorten it, or attach the text as a file.';
+  if (/^Workflow Update failed$/i.test(text)) return 'This task couldn’t take that change just now. Refresh the page and try again.';
+  if (/^invalid JSON body$/i.test(text)) return 'That didn’t send correctly. Refresh the page and try again.';
+  if (/name already exists on this account/i.test(text))
+    return 'A GitHub repository with that name already exists. Choose another name, or add the existing one from the list.';
+  if (/Bad credentials|token (?:has )?expired|refresh token/i.test(text) && /github/i.test(text))
+    return 'Your GitHub connection has expired. Reconnect GitHub on your profile.';
+  // What stays is meant for people; drop what is meant for agents and logs.
+  return text
+    .replace(/\s*Ask for it with request_permission \(capabilities: [^)]*\)\.?/g, '')
+    .replace(/ \((?:proj|org|task|repo|user|vi)_[a-z0-9]+\)/g, '');
+}
+// A task's failure for the people following it: a plain summary, and the
+// exact text when the summary is not it (shown folded as Details).
+function plainTaskError(text) {
+  const raw = String(text || '').trim();
+  const body = raw.replace(/^infrastructure: /, '').replace(/^(?:Activity task failed → )+/, '');
+  const retry = /— retrying (\w+) in (\d+\s*\w+) \((\d+)\/(\d+)\)\s*$/.exec(body);
+  const retrying = retry ? ` tavya will try again in ${retry[2]} (attempt ${retry[3]} of ${retry[4]}).` : '';
+  const summary = /context window|prompt is too long|maximum context length/i.test(body)
+    ? 'The conversation grew too long for the AI model. Send a shorter message, or start a new task.'
+    : /safety rejection|content policy|flagged/i.test(body) ? 'The AI provider declined this request. Rephrase it and try again.'
+    : /No usable \S+ credential|has no usable .* credential/i.test(body) ? 'No AI account is available to run this task. Ask an admin to connect one in organization settings.'
+    : /usage limit|rate.?limit|insufficient_quota|credit balance|billing/i.test(body) ? 'The AI account reached its usage limit. tavya continues when it resets, or an admin can add another account.'
+    : /SIGKILL|out of memory|OOM killer|more memory than it has/i.test(body) ? 'The task’s computer ran out of memory. Retry, or choose a bigger computer in Parameters.'
+    : /^Out of disk/i.test(body) ? body.replace(/\s*\(POST \/api\/[^)]*\)/g, '').replace(/\s*Last error:[\s\S]*$/, '')
+    : /Sandbox is probably not running|envd|exited with code -1|sandbox (?:was )?(?:restarted|stopped|not found)/i.test(body) ? 'The task’s computer stopped responding. Retry usually fixes this.'
+    : /stream ended unexpectedly|transport interruption|turn interrupted|ECONNRESET|socket hang up|ETIMEDOUT/i.test(body) ? 'The connection to the AI model dropped. Retry usually fixes this.'
+    : /GitHub PR identity is not connected|reconnect GitHub on your profile|Connect GitHub on your profile/i.test(body) ? 'Connect GitHub on your profile, then press Retry.'
+    : /^merge failed: conflict/i.test(body) ? 'These changes conflict with newer work on the same branch. Ask the agent to resolve the conflict.'
+    : /^merge failed/i.test(body) ? 'The changes couldn’t be landed. Ask the agent to look into it, or Retry.'
+    : plainError(body.replace(/\s*— retrying \w+ in .*$/, ''));
+  const plain = /[.!?]$/.test(summary) || !summary ? summary : `${summary}.`;
+  return { summary: plain + retrying, detail: plain + retrying === raw ? '' : raw };
+}
+function taskErrorHtml(text) {
+  const { summary, detail } = plainTaskError(text);
+  return `<div class="msg-text">${esc(summary)}</div>${detail ? `<details class="error-details"><summary>Details</summary><pre>${esc(detail)}</pre></details>` : ''}`;
+}
+
 function toast(msg, err = false, action) {
   const t = document.createElement('div');
   t.className = 'toast' + (err ? ' err' : '');
   const span = document.createElement('span');
-  span.textContent = msg;
+  span.textContent = err ? plainError(msg) : msg;
+  if (span.textContent !== String(msg)) span.title = String(msg); // the exact text, for whoever reports it
   t.appendChild(span);
   // An optional action (e.g. Undo) — gives the toast a clickable button and more
   // dwell time. Backward-compatible: existing toast(msg[, err]) calls are unchanged.
@@ -4471,8 +4528,9 @@ async function boot() {
     if (invitationToken) {
       try {
         const membership = await api('/api/invitations/accept', { method: 'POST', body: JSON.stringify({ token: invitationToken }) });
+        // A newcomer lands where the team works, not in its settings.
         S.organizationId = membership.organizationId;
-        S.inviteNotice = 'Invitation accepted. A project administrator can now add you to a project.';
+        S.inviteWelcome = membership.organizationId;
         history.replaceState({ kx: 1 }, '', '/organization');
       } catch (error) {
         S.inviteNotice = error.message;
@@ -4513,6 +4571,7 @@ async function boot() {
   // replace the neutral home route (never an invitation or another deep link).
   if (session.gitOnboarding && parseRoute(currentPath()).name === 'home')
     history.replaceState({ kx: 1 }, '', profileRoute());
+  if (S.inviteWelcome && organizationById(S.inviteWelcome)) history.replaceState({ kx: 1 }, '', homeRoute(organizationById(S.inviteWelcome)));
   const projectScope = S.projectId
     ? `?projectId=${encodeURIComponent(S.projectId)}`
     : S.organizationId ? `?organizationId=${encodeURIComponent(S.organizationId)}` : '';
@@ -4538,6 +4597,7 @@ async function boot() {
   if (S.justVerified) { toast('✓ Email confirmed', false); S.justVerified = false; }
   installShellListeners();
   await applyRoute(); // honor the initial URL (deep link / bookmark)
+  if (S.inviteWelcome) { toast(`Welcome to ${organizationById(S.inviteWelcome)?.name || 'the team'}`); S.inviteWelcome = null; }
 }
 
 function installShellListeners() {
@@ -6255,7 +6315,8 @@ function renderMain() {
     if (S.view) renderTaskPage();
     return;
   }
-  if (S.storeOpen && S.tab === 'tasks') return renderStoreTaskPage();
+  // A store task's form covers #main (applyStoreTaskRoute).
+  if (S.storeOpen && S.tab === 'tasks') return;
   // An open wiki editor likewise manages its own renders: a background refresh
   // must not clobber in-progress edits (only the focused field would survive
   // the async rehydrate). Navigation still repaints — it changes S.tab or
@@ -6264,9 +6325,8 @@ function renderMain() {
   const proj = S.projects.find((p) => p.id === S.projectId);
   // Activity remains available by direct URL for debugging, but is deliberately
   // absent from user-facing navigation.
-  const tabs = ['tasks', 'queue', 'wiki', 'avatars', 'settings']
-    .filter((tab) => tab !== 'avatars' || S.avatarAvailability?.effective || S.avatars?.length);
-  const labels = { tasks: 'Tasks', queue: 'Queues', wiki: 'Wiki', avatars: 'Avatars', settings: 'Project settings' };
+  const tabs = ['tasks', 'queue', 'wiki', 'settings'];
+  const labels = { tasks: 'Tasks', queue: 'Queues', wiki: 'Wiki', settings: 'Project settings' };
   const projectScoped = PROJECT_SCOPED_TABS.includes(S.tab);
   const tabbar = projectScoped
     ? `<div class="tabs">${tabs
@@ -6282,7 +6342,6 @@ function renderMain() {
   else if (S.tab === 'organization') content = organizationView();
   else if (S.tab === 'installation') content = installationView();
   else if (S.tab === 'wiki') content = wikiView(proj);
-  else if (S.tab === 'avatars') content = avatarsView(proj);
   else if (S.tab === 'orgwiki') content = wikiView(null);
   else if (S.tab === 'profile') content = profileView();
   else if (S.tab === 'settings') content = settingsView(proj);
@@ -6299,7 +6358,6 @@ function renderMain() {
   if (isTaskListTab()) wireTasksView();
   if (S.tab === 'queue') wireQueueView();
   if (S.tab === 'wiki') wireWikiView(proj);
-  if (S.tab === 'avatars') wireAvatarsView(proj);
   if (S.tab === 'orgwiki') wireWikiView(null);
   if (S.tab === 'settings') wireSettingsView(proj);
   if (S.tab === 'global') wireGlobalSettings();
@@ -6669,47 +6727,65 @@ const STORE_NEEDS = { github: ['Needs GitHub', 'Connect a GitHub repository to t
 function storeNeed(item) {
   return !(item.repeatable && item.installed?.length) && item.missing?.length ? STORE_NEEDS[item.missing[0]] : null;
 }
-// Run, Install, or Open the series it installed.
-// A row's is small; on its page the one thing to do is primary.
-function storeActionHtml(item, projectId, onPage = false) {
+// Run, Install, or Open what it installed (one series, or the list of them),
+// in one click; the row opens the form, to change it first or install another.
+function storeInstalledRoute(item, projectId) {
+  return item.installed.length === 1 ? taskUrl(item.installed[0], taskRecord(item.installed[0]) || { projectId })
+    : listRoute(projectBase(projectId), `store:${item.id} is:series`);
+}
+function storeActionHtml(item, projectId) {
   const need = storeNeed(item);
   const disabled = need ? ` disabled title="${esc(need[1])}"` : '';
-  const cls = onPage ? 'btn primary' : 'btn sm';
-  if (item.repeatable && item.installed?.length) return `<a class="${onPage ? 'btn' : cls}" data-spa href="${esc(taskUrl(item.installed[0], taskRecord(item.installed[0]) || { projectId }))}">Open</a>`;
+  if (item.repeatable && item.installed?.length) return `<a class="btn sm" data-spa href="${esc(storeInstalledRoute(item, projectId))}">Open</a>`;
   return item.repeatable
-    ? `<button class="${cls}" data-store-run="${esc(item.id)}"${disabled}>Install</button>`
-    : `<button class="${onPage ? cls : 'btn sm primary'}" data-store-run="${esc(item.id)}"${disabled}>Run</button>`;
+    ? `<button class="btn sm" data-store-run="${esc(item.id)}"${disabled}>Install</button>`
+    : `<button class="btn sm primary" data-store-run="${esc(item.id)}"${disabled}>Run</button>`;
 }
-// A store task's own page: /<org>/<project>/store/<id>.
+// A store task's own form: /<org>/<project>/store/<id>.
 function storeTaskRoute(projectId, id) { return `${projectBase(projectId)}/store/${encodeURIComponent(id)}`; }
+// On the organization home a store task asks which project it is for: the
+// row's state and actions there would be about a project nobody chose.
 function storeRowHtml(item) {
+  const home = S.tab === 'home';
   const projectId = storeProjectId();
-  const installed = item.repeatable && item.installed?.length;
-  const need = storeNeed(item);
+  const installed = !home && item.repeatable ? item.installed?.length || 0 : 0;
+  const need = home ? null : storeNeed(item);
+  const action = home ? `<button class="btn sm${item.repeatable ? '' : ' primary'}" data-store-choose="${esc(item.id)}" title="Choose a project">${item.repeatable ? 'Install…' : 'Run…'}</button>`
+    : storeActionHtml(item, projectId);
+  const link = home ? `<a class="row-link" href="${esc(storeTaskRoute(projectId, item.id))}" data-store-choose="${esc(item.id)}" draggable="false" tabindex="-1" aria-hidden="true"></a>`
+    : `<a class="row-link" data-spa href="${esc(storeTaskRoute(projectId, item.id))}" draggable="false" tabindex="-1" aria-hidden="true"></a>`;
   return `<div class="task-row store-row has-row-link" data-store-task="${esc(item.id)}" tabindex="0" role="group" aria-label="${esc(item.name)}">
       <div class="task-main">
         <div class="task-title">${esc(item.name)} ${item.summary ? policyTip(item.summary) : ''}</div>
-        <div class="task-sub">${item.repeatable ? `<span class="chip">${installed ? 'installed' : 'repeatable'}</span>` : ''}${need ? `<span>${esc(need[0])}</span>` : ''}</div>
+        <div class="task-sub">${item.repeatable ? `<span class="chip">${installed > 1 ? `${installed} installed` : installed ? 'installed' : 'repeatable'}</span>` : ''}${need ? `<span>${esc(need[0])}</span>` : ''}</div>
       </div>
-      <div class="task-right">${storeActionHtml(item, projectId)}</div>
-      <a class="row-link" data-spa href="${esc(storeTaskRoute(projectId, item.id))}" draggable="false" tabindex="-1" aria-hidden="true"></a>
+      <div class="task-right">${action}</div>
+      ${link}
     </div>`;
 }
-// Reading one changes nothing: the page shows what it would do, and the same
-// Run / Install as its row.
+// The task form, filled in from the store task: every field can change before
+// it runs or installs (again: each install is a series of its own).
+// `carried`: the form's params when it moves to another project.
+let carriedStoreForm = null;
 async function applyStoreTaskRoute(projectId, id, routeIsCurrent) {
   S.tab = 'tasks';
   closeTaskDom();
   renderRail();
-  if (S.taskStore?.[projectId]) renderMain();
-  else renderRouteLoadingPage('Task store');
-  await loadTaskStore(projectId, { force: true });
-  if (!routeIsCurrent()) return;
-  if (!S.taskStore?.[projectId]?.some((item) => item.id === id)) {
+  const cached = S.taskStore?.[projectId]?.find((item) => item.id === id);
+  if (!cached) {
+    renderRouteLoadingPage('Task store');
+    await loadTaskStore(projectId, { force: true });
+    if (!routeIsCurrent()) return;
+  }
+  const item = cached || S.taskStore?.[projectId]?.find((candidate) => candidate.id === id);
+  if (!item) {
     toast('Not in the Task store', true);
     return go(listRoute(projectBase(projectId), STORE_VIEW_QUERY), { replace: true });
   }
-  renderMain();
+  const carried = carriedStoreForm?.projectId === projectId && carriedStoreForm.id === id ? carriedStoreForm.params : null;
+  carriedStoreForm = null;
+  openTaskForm(item.task.workflow || NEW_TASK_WORKFLOW, undefined, '',
+    carried || { ...item.task.params, prompt: item.task.prompt, template: item.id }, { projectId, store: item });
 }
 function storeBackRoute() { return S.returnRoute || listRoute(projectBase(S.projectId), STORE_VIEW_QUERY); }
 function closeStoreTask() {
@@ -6717,48 +6793,59 @@ function closeStoreTask() {
   S.returnRoute = null;
   return go(back);
 }
-// Its triggers, conditions included (a series page's summary says less).
-function storeTriggerSummary(triggers) {
-  return (triggers || []).map((trigger) => {
-    const where = Object.entries(trigger.kind === 'event' ? trigger.where || {} : {}).map(([path, expected]) => {
-      const [op, value] = eventConditionParts(expected);
-      return `${path} ${EVENT_OPS.find(([v]) => v === op)[1]} ${value}`;
-    });
-    return [triggerSummary([trigger]), ...where].join(' · ');
-  }).join('  ·  ');
-}
-function renderStoreTaskPage() {
-  const main = $('#main');
-  const projectId = S.projectId;
-  const item = (S.taskStore?.[projectId] || []).find((candidate) => candidate.id === S.storeOpen);
-  if (!main || !item) return;
-  const installed = item.repeatable && item.installed?.length;
+// What the store form's foot says: what the project lacks for it, or that it
+// is installed already (this adds another, which runs alongside it).
+function storeFormHint(item) {
   const need = storeNeed(item);
-  const md = markdownEnabled() ? ' md' : '';
-  const when = storeTriggerSummary(item.task?.params?.triggers);
-  main.innerHTML = `
-    <div class="task-page store-page" data-store-page="${esc(item.id)}">
-      <div class="tp-head">
-        <div class="row1">
-          <a class="icon-btn" id="tp-back" href="${esc(storeBackRoute())}" data-shortcut="nav.close" title="Back (Esc)">←</a>
-          <h2>${esc(item.name)}</h2>
-          ${item.repeatable ? `<span class="chip">${installed ? 'installed' : 'repeatable'}</span>` : ''}
-        </div>
-        ${when ? `<div class="meta"><span>${esc(when)}</span></div>` : ''}
-      </div>
-      <div class="tp-body" id="tp-body" tabindex="-1"><div class="tp-content">
-        ${item.summary ? `<p class="store-summary">${esc(item.summary)}</p>` : ''}
-        <div class="section-h">Prompt</div>
-        <div class="store-prompt msg-text${md}">${renderMessageBody(item.task?.prompt || '')}</div>
-      </div></div>
-      <div class="tp-foot" id="tp-foot"><div class="tp-foot-inner">
-        ${need ? `<span class="store-need">${esc(need[0])}</span>` : ''}
-        <span style="flex:1"></span>
-        ${storeActionHtml(item, projectId, true)}
-      </div></div>
-    </div>`;
-  $('#tp-back').addEventListener('click', plainClick(closeStoreTask));
-  wireTaskStore();
+  if (need) return `<span class="store-need" title="${esc(need[1])}">${esc(need[0])}</span>`;
+  return item.repeatable && item.installed?.length
+    ? `<span class="store-need" title="This installs another copy, which runs alongside it">Installed already</span>` : '';
+}
+// Which project a store task chosen on the organization home is for; its form
+// opens there. With one project there is nothing to ask.
+function chooseStoreProject(id) {
+  const projects = (S.projects || []).filter((project) => project.organizationId === S.organizationId);
+  const open = (projectId) => { rememberNewTaskProject(projectId); spaNavigate(storeTaskRoute(projectId, id)); };
+  if (projects.length === 1) return open(projects[0].id);
+  if (!projects.length) return;
+  const name = (S.taskStore?.[storeProjectId()] || []).find((item) => item.id === id)?.name || 'Task';
+  const previousFocus = document.activeElement;
+  const root = createTransientOverlay();
+  root.innerHTML = `<div class="palette-scrim" id="sp-scrim"><div class="palette store-project-picker" role="dialog" aria-label="${esc(name)}: choose a project">
+    <input id="sp-in" placeholder="${esc(name)} in…" autocomplete="off" aria-label="Project" />
+    <div id="sp-list" role="listbox"></div>
+  </div></div>`;
+  const input = root.querySelector('#sp-in'), list = root.querySelector('#sp-list');
+  const preferred = newTaskProjectId();
+  const all = [...projects].sort((a, b) => (b.id === preferred) - (a.id === preferred));
+  let shown = all, active = 0;
+  const close = () => root.remove();
+  const dismiss = () => { close(); previousFocus?.focus?.(); };
+  const choose = (project) => { if (!project) return; close(); open(project.id); };
+  const draw = () => {
+    list.innerHTML = shown.map((project, i) => `<div class="opt${i === active ? ' active' : ''}" role="option" aria-selected="${i === active}" data-i="${i}" title="${esc(projectPath(project))}">
+      <span class="task-project">${esc(projectSlug(project))}</span>${i === active ? '<span class="key">↵</span>' : ''}</div>`).join('')
+      || '<div class="pal-empty">No such project</div>';
+    list.querySelector('.opt.active')?.scrollIntoView({ block: 'nearest' });
+  };
+  input.addEventListener('input', () => {
+    const q = input.value.trim();
+    shown = q ? all.map((project) => ({ project, score: fuzzyScore(q, `${projectSlug(project)} ${project.name || ''}`) })).filter((x) => x.score >= 0)
+      .sort((a, b) => b.score - a.score).map((x) => x.project) : all;
+    active = 0;
+    draw();
+  });
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.stopPropagation(); dismiss(); }
+    else if (e.key === 'ArrowDown') { e.preventDefault(); active = Math.min(shown.length - 1, active + 1); draw(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); active = Math.max(0, active - 1); draw(); }
+    else if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); choose(shown[active]); }
+  });
+  list.addEventListener('click', (e) => { const o = e.target.closest('.opt'); if (o) choose(shown[Number(o.dataset.i)]); });
+  list.addEventListener('mousemove', (e) => { const o = e.target.closest('.opt'); if (o && Number(o.dataset.i) !== active) { active = Number(o.dataset.i); draw(); } });
+  root.querySelector('#sp-scrim').addEventListener('click', (e) => { if (e.target.id === 'sp-scrim') dismiss(); });
+  draw();
+  input.focus();
 }
 // The store's rows the query's words match (name or summary).
 function storeViewHtml() {
@@ -6813,6 +6900,7 @@ function wireTaskStore() {
   const projectId = storeProjectId();
   main.querySelectorAll('a[data-store-view]').forEach((a) => a.addEventListener('click', plainClick(() => setQuery(STORE_VIEW_QUERY))));
   $('#store-recs-dismiss')?.addEventListener('click', () => dismissStoreRecs(projectId));
+  main.querySelectorAll('[data-store-choose]').forEach((el) => el.addEventListener('click', plainClick(() => chooseStoreProject(el.dataset.storeChoose))));
   main.querySelectorAll('[data-store-run]').forEach((button) => button.addEventListener('click', async () => {
     const item = (S.taskStore?.[projectId] || []).find((candidate) => candidate.id === button.dataset.storeRun);
     button.disabled = true;
@@ -7085,6 +7173,9 @@ function runSubRow(r) {
 /** Asked to run, held until someone approves the authorization its creator could not grant. */
 function awaitingApproval(t) { return !!t?.params?.draft && !!t.params._awaitingApproval; }
 const awaitingApprovalChip = '<span class="chip waiting" title="Starts by itself once someone who can grant its authorization approves">waiting for approval</span>';
+/** Saved as an Avatar without running: it rests in the Avatar stage, editable like a draft. */
+function restingAvatar(t) { return !!t?.params?.avatar && !!t.params.draft && !t.lastView; }
+const avatarChip = '<span class="chip avatar-chip" title="Avatār: its forks act with its authorization">✦ Avatār</span>';
 
 function taskRow(t, { showTags = true, project = false } = {}) {
   const isDraft = t.params?.draft;
@@ -7110,15 +7201,17 @@ function taskRow(t, { showTags = true, project = false } = {}) {
   // rows retain their direct editing controls.
   if (isDraft && !archived) {
     const awaiting = awaitingApproval(t);
+    const avatar = restingAvatar(t);
     return `
     <div class="task-row" data-draft="${t.id}" tabindex="0" role="group" aria-label="${esc(t.title)}">
       <div class="task-main">
         <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}</div>
-        <div class="task-sub">${where}${awaiting ? awaitingApprovalChip : '<span class="chip">draft</span>'}${priorityFlag(t)}${showTags ? tagChips(t) : ''}</div>
+        <div class="task-sub">${where}${awaiting ? awaitingApprovalChip : avatar ? avatarChip : '<span class="chip">draft</span>'}${priorityFlag(t)}${showTags ? tagChips(t) : ''}</div>
       </div>
       <div class="task-right">
         ${rowWhen(t)}
-        ${awaiting ? '' : `<button class="btn sm" data-queue="${t.id}">Run task</button>`}
+        ${avatar ? `<button class="btn sm" data-fork-avatar="${t.id}">${ICON.fork}Fork</button>`
+          : awaiting ? '' : `<button class="btn sm" data-queue="${t.id}">Run task</button>`}
         <button class="btn sm danger" data-deldraft="${t.id}">Delete</button>
       </div>
     </div>`;
@@ -7493,7 +7586,7 @@ function openTaskPicker({ title, hint, mode = 'task', defaults = ['run'], query 
     const open = expanded.has(t.id);
     return `<div class="pick-row" data-nav data-task="${t.id}">
       <div class="task-main">
-        <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}${t.params?.archived ? ' <span class="chip">archived</span>' : ''}${t.params?.repeatable ? ' <span class="chip">repeatable</span>' : ''}</div>
+        <div class="task-title">${t.num != null ? `<span class="task-num">#${t.num}</span> ` : ''}${esc(t.title)}${t.params?.archived ? ' <span class="chip">archived</span>' : ''}${t.params?.repeatable ? ' <span class="chip">repeatable</span>' : ''}${t.params?.avatar ? ` ${avatarChip}` : ''}</div>
         <div class="task-sub">${organizationWide && t.projectId !== S.projectId ? projectLabel(t) : ''}<span class="wf">${esc(workflowLabel(t.workflow))}</span><span class="chip ${status}">${esc(chipLabel)}</span>${priorityFlag(t)}${tagChips(t, false)}</div>
       </div>
       ${mode === 'agent' ? `<span class="pk-caret">${open ? '▾' : '▸'}</span>` : ''}
@@ -7768,13 +7861,16 @@ function wireTasksView() {
   $('#main').querySelectorAll('[data-queue]').forEach((b) =>
     b.addEventListener('click', async (ev) => { ev.stopPropagation(); try { await api(`/api/tasks/${b.dataset.queue}/queue`, { method: 'POST', body: '{}' }); toast('Task started'); refreshTasks(); } catch (e) { showTaskError(e, taskRecord(b.dataset.queue)?.projectId); } }),
   );
+  $('#main').querySelectorAll('[data-fork-avatar]').forEach((b) =>
+    b.addEventListener('click', (ev) => { ev.stopPropagation(); forkTaskAgent(b.dataset.forkAvatar, 'do'); }));
   $('#main').querySelectorAll('[data-deldraft]').forEach((b) =>
     b.addEventListener('click', async (ev) => {
       ev.stopPropagation();
       // Deleting a draft is a hard delete with no undo, so confirm first.
-      const title = taskRecord(b.dataset.deldraft)?.title || 'this draft';
-      if (!confirm(`Delete draft "${title}"? This cannot be undone.`)) return;
-      if (await deleteDraft(b.dataset.deldraft)) toast('Draft removed');
+      const record = taskRecord(b.dataset.deldraft);
+      const kind = restingAvatar(record) ? 'Avatār' : 'draft';
+      if (!confirm(`Delete ${kind} "${record?.title || `this ${kind}`}"? This cannot be undone.`)) return;
+      if (await deleteDraft(b.dataset.deldraft)) toast(`${kind[0].toUpperCase()}${kind.slice(1)} removed`);
     }),
   );
   $('#main').querySelectorAll('[data-runnow]').forEach((b) =>
@@ -8661,7 +8757,7 @@ function taskFormTitle(draft) {
     return `<span class="task-num">#${draft.num}</span> ${esc(draft.title)} <span class="chip waiting" title="Starts by itself when its trigger fires">${esc(triggerSummary(p.triggers) || 'waiting')}</span>`;
   if (awaitingApproval(draft) && draft.num != null)
     return `<span class="task-num">#${draft.num}</span> ${esc(draft.title)} ${awaitingApprovalChip}`;
-  return !draft ? 'New task' : p.triggerState === 'armed' || isSeries(p) ? 'Edit task' : 'Edit draft';
+  return !draft ? 'New task' : p.triggerState === 'armed' || isSeries(p) ? 'Edit task' : restingAvatar(draft) ? 'Edit Avatār' : 'Edit draft';
 }
 
 function taskFormLoadingPage(project, draft, title) {
@@ -8684,6 +8780,7 @@ let activeTaskFormKeyController = null;
 // `page`: the form is a draft's own task page (see showDraftPage), so leaving it
 // leaves the task, and running the draft reveals its live task page.
 // `projectId`: the project a new task is created in (default: the open one).
+// `store`: a Task store entry the new task is taken from (its route is the form's).
 async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   const page = !!opts?.page;
   activeTaskFormKeyController?.abort();
@@ -8706,6 +8803,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   // a new task starts from one. Either way the template seeds what params cannot hold.
   const templateEdit = opts?.templateEdit || null;
   const seed = draft ? null : templateEdit?.template || opts?.template || null;
+  const store = draft ? null : opts?.store || null;
   // Priority and tags: a task's own once it has an id; until then a
   // template's (its tags where this project has them), applied on create.
   const orgRec = draft
@@ -8716,7 +8814,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   const editInPlace = armed || series; // neither has a running workflow — edit its stored params
   const workflowEditable = !draft || !!draft.params?.draft;
   // A new task can start over from another template (a fork keeps its own form).
-  const templatePickable = !draft && !templateEdit && !opts?.fork;
+  const templatePickable = !draft && !templateEdit && !opts?.fork && !store;
   // Carry over seed text (or whatever was typed before switching
   // workflows) into the field that consumes it, without clobbering a real value.
   if (seedText) {
@@ -8728,12 +8826,13 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   // currently slow. Usually the prefetched defaults below are already resolved
   // and this loading page never reaches a paint; otherwise it provides instant
   // feedback while keeping the not-yet-hydrated controls safely non-interactive.
-  const formTitle = templateEdit ? (templateEdit.template ? 'Edit template' : 'New template') : '';
+  const formTitle = templateEdit ? (templateEdit.template ? 'Edit template' : 'New template') : store?.name || '';
   root.innerHTML = taskFormLoadingPage(proj, draft, formTitle);
   // Closing a draft's own page returns to where the task was opened from —
   // unless a navigation is what closed it.
   const leavePage = (navigating) => {
     if (page && !navigating && S.selected === draft.id) closeTask();
+    if (store && !navigating && S.storeOpen === store.id) closeStoreTask();
   };
   $('#tf-close').addEventListener('click', () => {
     const navigating = !!root.querySelector('#tf-page')?.dataset.navigating;
@@ -8793,7 +8892,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       <div class="tf-head">
         <div class="tf-head-inner">
           <button class="icon-btn" id="tf-close" data-shortcut="nav.close" title="${editInPlace ? 'Back (Esc) — your changes are kept' : 'Back (Esc) — your work is kept as a draft'}">←</button>
-          <h2>${formTitle || taskFormTitle(draft)}</h2>
+          <h2>${formTitle ? esc(formTitle) : taskFormTitle(draft)}</h2>${store?.summary ? policyTip(store.summary) : ''}
           ${templateEdit ? `<input id="tf-template-name" class="tf-template-name" placeholder="Template name" aria-label="Template name" maxlength="120" value="${esc(templateEdit.name ?? templateEdit.template?.name ?? '')}">`
             : proj ? `<span class="tf-crumb">in</span>${projectPickerHtml('tf-project', projectId, !draft)}` : ''}
           ${formAttemptGroup?.attempts?.length > 1 ? `<nav class="attempts-list tf-attempts" aria-label="Choose an attempt">
@@ -8819,6 +8918,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
               <span style="color:var(--ink-3);font-size:12px">Drop files into a text field above, or choose up to 8 files (25 MB each, 50 MB total).</span>
             </div>`}
             <section class="tf-section tf-triggers">${triggersSection(values, draft?.id)}</section>
+            ${templateEdit ? '' : `<section class="tf-section tf-avatar">${avatarSectionHtml(values.avatar)}</section>`}
           </div>
           <aside class="tf-side">
             <div class="form-row" data-row="__org">
@@ -8843,9 +8943,10 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       <div class="tf-foot">
         <div class="tf-foot-inner">
           ${templateEdit ? '<span class="tf-hint"></span>' : `<button class="btn ghost" id="tf-save-template" title="Save this form as a template, to start new tasks from" aria-label="Save as template">${ICON.template}<span class="tf-save-template-label">Save as template</span></button>
-          <span class="tf-hint"></span>
+          <span class="tf-hint">${store ? storeFormHint(store) : ''}</span>
+          <button class="btn" id="tf-save-avatar" ${values.avatar ? '' : 'hidden'}>Save as Avatār without running</button>
           <button class="btn" id="tf-draft">Save draft</button>`}
-          <button class="btn primary" id="tf-queue">${templateEdit ? 'Save template' : editInPlace ? 'Save' : 'Run task'}<span class="kbd">${esc(fmtKeys('meta+Enter'))}</span></button>
+          <button class="btn primary" id="tf-queue">${templateEdit ? 'Save template' : editInPlace ? 'Save' : store?.repeatable && values.repeatable ? 'Install' : 'Run task'}<span class="kbd">${esc(fmtKeys('meta+Enter'))}</span></button>
         </div>
       </div>
     </div>`;
@@ -8893,6 +8994,10 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     const promptName = consumingField(fields)?.name;
     const carried = promptName ? $('#tf-body')?.querySelector(`[data-field="${CSS.escape(promptName)}"]`)?.value || '' : '';
     const hadAttachments = formImages.length + formFiles.length > 0;
+    // A store task keeps what it is (its triggers, title, store link) and your prompt.
+    const edited = store ? formState().body : {};
+    const storeParams = store ? { ...seedParams, triggers: edited.triggers, repeatable: edited.repeatable,
+      ...(promptName && carried.trim() ? { [promptName]: carried } : {}) } : null;
     clearTimeout(saveTimer);
     rememberNewTaskProject(nextProjectId);
     releaseFormKeys();
@@ -8905,6 +9010,12 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     }
     // Attachments are uploaded into a project; they cannot follow the task elsewhere.
     if (hadAttachments) toast('Attachments removed — attach them again for this project');
+    if (store) {
+      // Its route is that project's: whether it is installed there, and where Back goes.
+      root.innerHTML = '';
+      carriedStoreForm = { projectId: nextProjectId, id: store.id, params: storeParams };
+      return go(storeTaskRoute(nextProjectId, store.id), { replace: true });
+    }
     openTaskForm(wf, undefined, carried.trim(), undefined, { projectId: nextProjectId });
   });
   // Another template: the form starts over from it, keeping what you wrote
@@ -8941,8 +9052,6 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   });
   wireAgentFields($('#tf-body'), { projectId, organizationId: projectOrganizationId, projects: authorizationProjects,
     inheritedAuthority: mainAuthority });
-  // "Start with this Avatar" is a one-shot seed for the new task form.
-  S.pendingAvatarId = null;
   wireFieldResets($('#tf-body'), fields);
   const confirmerFrozen = !!draft?.id
     && !!formAttemptGroup?.attempts?.some((a) => !a.params?.draft);
@@ -9072,6 +9181,8 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       vaultCredentialPolicies = policies;
       refreshVaultCount();
     },
+    payments: () => readTaskPayments($('#tf-payments')),
+    setPayments: (policy) => mainPaymentsReady.then(() => $('#tf-payments')?._setPolicy?.(policy)),
     changed: () => { paintMainAuthority(); autoSaveSoon(); },
   });
   paintMainAuthority();
@@ -9112,11 +9223,14 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   // The id of the draft this form is editing. Starts as the passed-in draft; a
   // brand-new task gets one lazily the first time auto-save persists real content.
   let draftId = draft?.id || null;
-  const orgSeed = () => orgRec.id || templateEdit ? {} : { ...(orgRec.params.priority ? { priority: orgRec.params.priority } : {}),
-    ...(orgRec.tags.length ? { tags: orgRec.tags.map(tagPathStr) } : {}) };
+  // A store task's title rides the first create too: `#{{issue.number}} …` names each run of its series.
+  const orgSeed = () => ({ ...(store ? { title: store.task.title } : {}), ...(orgRec.id || templateEdit ? {} : { ...(orgRec.params.priority ? { priority: orgRec.params.priority } : {}),
+    ...(orgRec.tags.length ? { tags: orgRec.tags.map(tagPathStr) } : {}) }) });
   const hasPolicy = () => !!(taskCredPolicy.order?.length || taskCredPolicy.on?.length || taskCredPolicy.off?.length || taskCredPolicy.explainerOnly?.length);
   // Prompt attachments ride inside `params` (references only), so they flow
   // through auto-save, draft, and queue the same way the prompt text does.
+  // An Avatar the user has acknowledged (confirmAvatar) or that already was one.
+  let avatarCommitted = !!values.avatar;
   const formState = () => {
     const body = collectForm($('#tf-body'), fields);
     const paymentPolicy = readTaskPayments($('#tf-payments')) ?? values.paymentPolicy;
@@ -9131,6 +9245,11 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     const triggers = collectTriggers(values.triggers);
     if (triggers.length) body.triggers = triggers;
     if ($('#trig-repeatable')?.checked) body.repeatable = true;
+    // An Avatar only once its risk was acknowledged: auto-save never makes one.
+    const avatar = avatarCommitted ? readAvatarSection($('#tf-body')) : undefined;
+    if (avatar) body.avatar = avatar;
+    // Where it came from in the Task store, which counts what the project took.
+    if (values.template) body.template = values.template;
     // The wiki-context row. Always sent — even empty,
     // which is a deliberate opt-out of the default `default`-labelled pages — so
     // the replace:true auto-save preserves the user's choice.
@@ -9460,6 +9579,15 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
         goToTask(run.id);
         return true;
       }
+      // A store task's form leaves its route: for the task it started, else
+      // (installed, or kept as a draft) for the store it came from.
+      if (store && S.storeOpen === store.id) {
+        toast(draftMode ? 'Draft saved' : st.body.repeatable ? 'Installed' : 'Task started');
+        await refreshTasks();
+        if (!draftMode && !st.body.repeatable && primaryId) go(taskUrl(primaryId), { replace: true });
+        else closeStoreTask();
+        return true;
+      }
       if (page && S.selected === draft.id) {
         // A saved draft leaves its page like Back; a started one shows its live page.
         if (draftMode) closeTask();
@@ -9481,7 +9609,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       // user could not tell whether they had just made a duplicate.
       toast(editInPlace
         ? (draftMode ? 'Moved to drafts' : 'Saved')
-        : draftMode ? 'Draft saved' : 'Task started');
+        : draftMode ? (st.body.avatar ? 'Saved as Avatār' : 'Draft saved') : 'Task started');
       refreshTasks();
     } catch (e) {
       if (!draftMode && isAuthorizationGrantGap(e)) {
@@ -9545,8 +9673,35 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     }
     return succeeded;
   };
-  $('#tf-draft')?.addEventListener('click', () => submit(true));
-  $('#tf-queue').addEventListener('click', () => submit(false));
+  // The Avatar row (wiki features/avatars): ticking it offers its options and
+  // "Save as Avatar without running"; committing one (saving, running) first
+  // says what it risks (confirmAvatar).
+  const avatarBox = $('#tf-avatar');
+  const avatarCombo = root.querySelector('.tf-avatar .audience-combo');
+  if (avatarCombo) wireCombo(avatarCombo, humanAudienceOptions, null, { multiple: true });
+  avatarBox?.addEventListener('change', () => {
+    root.querySelector('.tf-avatar-options').hidden = !avatarBox.checked;
+    const saveAvatar = $('#tf-save-avatar');
+    if (saveAvatar) saveAvatar.hidden = !avatarBox.checked;
+  });
+  // A fork has to be able to play some role: the last one stays ticked.
+  root.querySelector('.tf-avatar-roles')?.addEventListener('change', (event) => {
+    if (!root.querySelector('.tf-avatar-roles input:checked')) event.target.checked = true;
+  });
+  const commitAvatar = async () => {
+    if (!avatarBox?.checked || avatarCommitted) return true;
+    if (!(await confirmAvatar())) return false;
+    avatarCommitted = true;
+    return true;
+  };
+  const submitCommitted = async (draftMode) => (await commitAvatar()) && submit(draftMode);
+  $('#tf-save-avatar')?.addEventListener('click', () => submitCommitted(true));
+  $('#tf-draft')?.addEventListener('click', () => submitCommitted(true));
+  $('#tf-queue').addEventListener('click', () => submitCommitted(false));
+  // A repeatable store task installs; unticked, it runs once.
+  if (store?.repeatable) $('#trig-repeatable')?.addEventListener('change', (event) => {
+    $('#tf-queue').firstChild.textContent = event.target.checked ? 'Install' : 'Run task';
+  });
   // Capture at the document boundary so this still works after an editor
   // re-renders its focused control and focus falls back to <body>. A secondary
   // modal (tag picker, vault picker, authorization prompt, …) owns its keys until
@@ -9572,7 +9727,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     if (!action) return;
     e.preventDefault();
     e.stopPropagation();
-    if (action === 'submit') submit(false);
+    if (action === 'submit') submitCommitted(false);
     else closeForm();
   };
   document.addEventListener('keydown', taskFormKeydown, { capture: true, signal: formKeyController.signal });
@@ -12003,6 +12158,10 @@ function approvePullRequestButton(row, cls = 'btn sm') {
 // each one's newest pull request is, linked, approved right in its row when it
 // is a pull request of its own. The task's own proposal has one approval for
 // all its branches: Confirm PR.
+// A checkout as people name it: the project wiki's is "Wiki", whatever its folder.
+function checkoutLabel(v, name) {
+  return name && name === v?.worldWiki ? `<b title="${esc(name)}">Wiki</b>` : `<b>${esc(name)}</b>`;
+}
 function checkoutsSection(v) {
   const checkouts = v.checkouts || [];
   const own = new Map(pullRequestRows(v).map((row) => [row.lane.checkout, row]));
@@ -12014,7 +12173,7 @@ function checkoutsSection(v) {
       const landed = row.label === 'Landed';
       return `<div class="checkout-row ${landed ? 'landed' : ''}" data-branch-state="${esc(row.label)}">
       <span class="checkout-mark">${landed ? '✓' : ''}</span>
-      <b>${esc(c.name)}</b>
+      ${checkoutLabel(v, c.name)}
       <span class="mono" style="color:var(--ink-3)">⎇ ${esc(c.branch)}</span>
       <span style="color:var(--ink-3)">→ ${esc(row.lane.target)}</span>
       <span style="flex:1"></span>
@@ -12028,7 +12187,7 @@ function checkoutsSection(v) {
     const [label, tone] = proposalState(v, c);
     return `<div class="checkout-row ${label === 'Landed' ? 'landed' : ''}"${label ? ` data-branch-state="${esc(label)}"` : ''}>
       <span class="checkout-mark">${label === 'Landed' ? '✓' : ''}</span>
-      <b>${esc(c.name)}</b>
+      ${checkoutLabel(v, c.name)}
       <span class="mono" style="color:var(--ink-3)">⎇ ${esc(c.branch)}</span>
       <span style="color:var(--ink-3)">${esc(dest)}</span>
       <span style="flex:1"></span>
@@ -12051,7 +12210,7 @@ function pullRequestAsks(v) {
 function conversationPullRequestAsks(v) {
   const asks = pullRequestAsks(v);
   return asks.length ? `<div class="pr-asks" id="task-pr-asks">${asks.map((row) => `<div class="pr-ask" data-branch-state="${esc(row.label)}">
-      <b>${esc(row.lane.checkout)}</b>
+      ${checkoutLabel(v, row.lane.checkout)}
       <span class="pr-ask-target">→ ${esc(row.lane.target)}</span>
       ${pullRequestLink(row.pr)}
       <a class="btn sm ghost" data-open="${esc(row.lane.childTaskId)}" data-spa href="${esc(taskUrl(row.lane.childTaskId, row.rec))}" title="Its Review: what it changes">Open</a>
@@ -12269,7 +12428,7 @@ function conversationReviewInfo(v, resourcesShown = false) {
 
 // A failure the workflow recorded, in the conversation where the work happened.
 function conversationError(v) {
-  return v.error ? `<div class="msg system error" role="alert"><div class="role">Error</div><div class="msg-text">${esc(v.error)}</div></div>` : '';
+  return v.error ? `<div class="msg system error" role="alert"><div class="role">Something went wrong</div>${taskErrorHtml(v.error)}</div>` : '';
 }
 
 // Expand in place so live messages, scroll position and unsent attachments survive.
@@ -12892,6 +13051,10 @@ function explanationModelLabel(model = S.explanationSettings?.model) {
 /** Whether "Explain this" is offered (a server feature flag; off for now). */
 function explanationsEnabled() { return S.meta?.explanationsEnabled === true; }
 
+// Whether a message has math for the TeX button to typeset ($…$, $$…$$, \(…\), \[…\]).
+function hasMath(text) {
+  return /\$\$[\s\S]+?\$\$|(?<![\\$\w])\$(?=\S)[^$\n]+?(?<=\S)\$(?![\w$])|\\\([\s\S]+?\\\)|\\\[[\s\S]+?\\\]/.test(String(text || ''));
+}
 function explainMessageAffordance(entry, v) {
   if (!entry.sourceKey) return '';
   const pending = !!S.explanationPending?.[entry.sourceKey];
@@ -12905,9 +13068,12 @@ function explainMessageAffordance(entry, v) {
     : `<div class="explain-error">${esc(failure.message || 'Could not explain this message.')}</div>`;
   const explain = !explanationsEnabled() ? '' : `<button class="explain-run" ${pending ? 'disabled' : ''}>${pending ? 'Explaining…' : `Explain this with ${esc(explanationModelLabel())}`}</button>
     <button class="explain-more" ${pending ? 'disabled' : ''} aria-label="Change explanation model and prompt" title="Change explanation model and prompt">${ICON.more}</button>`;
+  // The TeX button only where there is math to typeset: on every message it is noise.
+  const tex = hasMath(entry.message?.text ?? entry.activity?.title ?? entry.request?.text) ? texToggleHtml(!markdownEnabled()) : '';
+  if (!explain && !tex && !error) return '';
   return `<div class="explain-tools" data-source-key="${key}" data-role="${role}">
     ${explain}
-    ${texToggleHtml(!markdownEnabled())}
+    ${tex}
     ${error}
   </div>`;
 }
@@ -12918,7 +13084,7 @@ function renderConversationEntry(entry, v = S.view) {
   if (entry.type === 'input-request') {
     const escalate = v.waitingFor?.kind === 'human' || v.waitingFor?.kind === 'parent'
       ? `<button class="btn sm ghost escalate-request" title="Pass this to someone who can answer">Escalate…</button>` : '';
-    return `<div class="msg agent input-request"><div class="msg-meta"><span class="role">${v.waitingFor?.reason === 'error' ? 'Needs attention' : 'Input requested'}</span><span class="msg-meta-gap"></span>${escalate}</div><div class="msg-text${md}">${renderWaitDetail(entry.request.text, v, math)}</div>${entry.resourceReview ? resourceReviewPlaceholder() : ''}${explainMessageAffordance(entry, v)}</div>`;
+    return `<div class="msg agent input-request"><div class="msg-meta"><span class="role">${v.waitingFor?.reason === 'error' ? 'Needs attention' : 'Input requested'}</span><span class="msg-meta-gap"></span>${escalate}</div>${v.waitingFor?.reason === 'error' ? taskErrorHtml(entry.request.text) : `<div class="msg-text${md}">${renderWaitDetail(entry.request.text, v, math)}</div>`}${entry.resourceReview ? resourceReviewPlaceholder() : ''}${explainMessageAffordance(entry, v)}</div>`;
   }
   if (entry.type === 'message') {
     const m = entry.message;
@@ -13038,7 +13204,9 @@ function conversationPresence(v, t) {
 function presenceDetail(v) {
   const w = v.waitingFor;
   if (!w) return '';
-  const detail = (['account', 'agentSlot'].includes(w.kind) || (w.kind === 'retry' && w.summary)) && typeof w.detail === 'string' ? w.detail.trim() : '';
+  const raw = (['account', 'agentSlot'].includes(w.kind) || (w.kind === 'retry' && w.summary)) && typeof w.detail === 'string' ? w.detail.trim() : '';
+  // A retry waits out an error: say it the way the task's error box does.
+  const detail = raw && w.kind === 'retry' ? plainTaskError(raw).summary : raw;
   return [detail, w.earliestResetAt ? `Earliest ${fmtReset(w.earliestResetAt)}` : ''].filter(Boolean).join(' · ');
 }
 
@@ -13128,6 +13296,17 @@ async function openConversationShare(v, role) {
   } catch (error) { toast(error.message, true); }
 }
 
+/** Open a new task whose main agent forks `taskId`'s `role` agent (the Fork
+ * button; an Avatar's row). */
+async function forkTaskAgent(taskId, role, view) {
+  const resumeFrom = { taskId, role };
+  const task = await loadTaskRecord(taskId);
+  openTaskForm('software-dev', undefined, undefined, {
+    ...forkBranchDefaults(task || view || {}),
+    'agent:do': { resumeFrom },
+  }, task ? { fork: { resumeFrom, task, session: view ? S.sessions?.[role] : undefined } } : undefined);
+}
+
 function wireCheckinSidebar(v) {
   wireStopAgents(v);
   $('#ck-transcript')?.addEventListener('change', (event) => selectCheckinPane(v, event.target.value));
@@ -13137,14 +13316,8 @@ function wireCheckinSidebar(v) {
   $('#conversation-fullscreen')?.addEventListener('click', () => setConversationFullscreen(!S.conversationFullscreen));
   $('#share-task-conversation')?.addEventListener('click', event => openConversationShare(v, event.currentTarget.dataset.role));
   $('#save-task-template')?.addEventListener('click', () => saveTaskAsTemplate(v.taskId));
-  $('#fork-task-agent')?.addEventListener('click', async (event) => {
-    const resumeFrom = { taskId: v.taskId, role: event.currentTarget.dataset.role };
-    const task = await loadTaskRecord(v.taskId);
-    openTaskForm('software-dev', undefined, undefined, {
-      ...forkBranchDefaults(task || v),
-      'agent:do': { resumeFrom },
-    }, task ? { fork: { resumeFrom, task, session: S.sessions?.[resumeFrom.role] } } : undefined);
-  });
+  $('#fork-task-agent')?.addEventListener('click', (event) => forkTaskAgent(v.taskId, event.currentTarget.dataset.role, v));
+
   $('#terminal-native')?.addEventListener('click', () => copyNativeAttachCommand(v));
   $('#main').querySelectorAll('.fork-local').forEach((button) => button.addEventListener('click', () => forkCloudSessionLocally(v, button)));
   $('#desktop-open')?.addEventListener('click', async () => {
@@ -14511,6 +14684,17 @@ function taskActionLabel(v, action) {
   return action.label || action.name;
 }
 
+// What a task's main buttons do, in a sentence, for whoever has not pressed them before.
+function taskActionTip(v, action) {
+  const target = v?.targetBranch || 'main';
+  if (action.name === 'confirm' && v?.stage === 'review') return `Approve this work. tavya then adds it to ${target}.`;
+  if (action.name === 'confirm' && v?.stage === 'merge' && v.waitingFor?.reason !== 'merge') return 'Let tavya merge this on GitHub as you.';
+  if (action.name === 'openPr') return 'Send the agent’s work so far to Review now.';
+  if (action.name === 'cancel') return 'Stop this task. Nothing more is added to the project.';
+  if (action.name === 'retry') return 'Try the last step again.';
+  return '';
+}
+
 // the generic auto-render floor (SPEC §10.2 tier 1): render declared actions.
 // This is the footer bar that stays visible on every task-page tab, so the
 // proposal / confirmation / cancellation controls are always one click away.
@@ -14545,7 +14729,8 @@ function taskActions(v) {
     // INSIDE the button: reading `textContent` yields "Confirm1", which fails
     // actionToast's standard-verb match and produced "Confirm1 — done" instead
     // of "Confirmed" on the most-used control in the app.
-    html += `<button class="btn ${cls}" data-act="${esc(a.name)}" data-label="${esc(label)}" ${a.enabled ? '' : 'disabled'}>${esc(label)}${kbd}</button>`;
+    const tip = taskActionTip(v, a);
+    html += `<button class="btn ${cls}" data-act="${esc(a.name)}" data-label="${esc(label)}"${tip ? ` title="${esc(tip)}"` : ''} ${a.enabled ? '' : 'disabled'}>${esc(label)}${kbd}</button>`;
   }
   // Target-branch editing lives in the Parameters tab (paramsSection), which
   // renders it editable/frozen per the workflow's window — no separate input here.
@@ -14837,7 +15022,7 @@ function mentionPeople() {
       const kind = o.value.startsWith('user:') ? 'person' : o.value.startsWith('@team:') ? 'team' : 'group';
       return { selector: o.value, label, kind, token: kind === 'person' ? `@${label}` : o.value };
     }),
-    ...(S.avatars || []).filter((a) => a.enabled !== false).map((a) => ({ selector: `avatar:${a.id}`, label: a.name, kind: 'avatar', token: `@${a.name}` })),
+    ...(S.avatars || []).filter((a) => a.callable).map((a) => ({ selector: `avatar:${a.id}`, label: a.name, kind: 'avatar', token: `@${a.name}` })),
   ];
 }
 // Group and team selectors typed by hand address their people just as picking
@@ -14977,7 +15162,7 @@ function wireAgentMention(ta, box, v, key) {
       if (item.kind === 'agent' || item.kind === 'new') sawAgent = true;
       const key = item.kind === 'agent' ? `[${item.index}]` : item.kind === 'new' ? '[+]' : '';
       const hint = item.kind === 'agent' ? (item.state === 'running' ? 'working' : item.state === 'queued' ? 'queued' : item.state === 'new' ? 'new' : '')
-        : item.kind === 'people' ? '›' : item.kind === 'avatar' ? 'Avatar' : '';
+        : item.kind === 'people' ? '›' : item.kind === 'avatar' ? 'Avatār' : '';
       const named = item.kind === 'group' || item.kind === 'team';
       return `${sep}<div class="wm-opt am-opt ${i === active ? 'active' : ''}" data-i="${i}" role="option">
         <span class="am-key">${key}</span><span class="wm-main"><span class="wm-ref">${esc(named ? item.token : item.label)}</span>${
@@ -16663,144 +16848,72 @@ async function hydrateSettingsForms(scope, projectId, organizationId) {
   }
 }
 
-// ── Avatars ──────────────────────────────────────────────────────────────
-function avatarOwnerName(avatar) { return principalLabel({ kind: 'user', userId: avatar.ownerUserId }); }
-function avatarRoleSummary(avatar) {
-  if (!avatar.roles?.length) return 'Any role';
-  const labels = { do: 'Working', confirm: 'Review', respond: 'Response', resolve: 'Resolve', merge: 'Merge', authorize: 'Authorize' };
-  return avatar.roles.map((role) => labels[role] || role).join(', ');
-}
-function avatarCallerSummary(avatar) {
-  const callers = avatar.callableBy || [];
-  if (callers.includes('@project')) return 'Everyone in this project';
-  if (callers.length === 1 && callers[0] === `user:${avatar.ownerUserId}`) return 'Only the owner';
-  return callers.length === 1 ? callers[0].replace(/^@?/, '') : `${callers.length} people or teams`;
-}
-function avatarDetailView(avatar) {
-  return `<div class="avatars-page avatar-detail"><a class="avatar-back icon-btn" data-spa href="${esc(avatarRoute(S.projectId))}" aria-label="Back to Avatars">←</a>
-    <div class="avatar-detail-head"><div class="avatar-mark" aria-hidden="true">✦</div><div class="avatar-identity"><h1 class="page-title">${esc(avatar.name)}</h1><p>${esc(avatar.purpose || 'User-authored autonomous principal')}</p><span class="task-sub">Owned by ${esc(avatarOwnerName(avatar))} · Prompt version ${avatar.promptVersion}</span></div><span class="chip ${avatar.effectiveEnabled ? 'success' : ''}">${avatar.effectiveEnabled ? 'Enabled' : 'Disabled'}</span></div>
-    <div class="avatar-actions">${avatar.callable && avatar.effectiveEnabled ? '<button class="btn primary avatar-start" type="button">Create task with Avatar</button>' : ''}${avatar.canEdit ? '<button class="btn avatar-edit" type="button">Edit</button>' : ''}${avatar.canDisable ? `<button class="btn avatar-toggle" type="button">${avatar.enabled ? 'Disable' : 'Enable'}</button>` : ''}${avatar.canEdit || avatar.canDisable ? '<button class="icon-btn avatar-remove" type="button" aria-label="Remove Avatar">⋯</button>' : ''}</div>
-    ${(S.avatarAuthorizationRequests || []).length ? `<section class="card avatar-authorization-requests"><div class="section-h">Authorization request</div>${authorizationRequestRows(S.avatarAuthorizationRequests)}</section>` : ''}
-    <div class="avatar-detail-grid"><section class="card"><div class="section-h">Instructions</div><div class="avatar-prompt">${renderMarkdown(avatar.prompt)}</div></section><aside><div class="card avatar-summary"><div><span>Authority</span><b>${avatar.authorityMode === 'full' ? 'Full delegation' : esc(avatar.authorization?.level || 'Restricted')}</b></div><div><span>Callable by</span><b>${esc(avatarCallerSummary(avatar))}</b></div><div><span>Roles</span><b>${esc(avatarRoleSummary(avatar))}</b></div><div><span>Runtime</span><b>${esc(`${avatar.runtime.provider}${avatar.runtime.model ? ` · ${avatar.runtime.model}` : ''}`)}</b></div><div><span>Vault</span><b>${(avatar.authorization?.capabilities || []).includes('*') || (avatar.authorization?.capabilities || []).includes('use-credential:*') ? 'Full access' : `${(avatar.authorization?.capabilities || []).filter((cap) => cap.startsWith('use-credential:item:')).length} credentials`}</b></div><div><span>GitHub</span><b>${avatar.githubAccountId ? 'Owner account connected' : 'No delegated account'}</b></div></div></aside></div></div>`;
-}
-async function loadAvatarAuthorizationRequests(avatarId) {
-  const project = projectById(S.projectId);
-  const requests = avatarId && project?.organizationId
-    ? await api(`/api/authorization-requests?organizationId=${encodeURIComponent(project.organizationId)}&avatarId=${encodeURIComponent(avatarId)}`).catch(() => [])
-    : [];
-  if (S.avatarSelected === avatarId) S.avatarAuthorizationRequests = requests; // not a page left meanwhile
-}
-// Shown wherever Avatars are managed. An Avatar acts with a person's delegated
-// authority on whatever it reads, so anything it reads can steer it.
-const AVATAR_RISK_NOTE = '<div class="avatar-risk-note" role="note"><span class="avatar-risk-mark" aria-hidden="true">⚠</span><div>Avatars act with your authority, so a prompt injection in anything they read can steer them.</div></div>';
+// ── Avatars (wiki features/avatars) ─────────────────────
+// What making or enabling an Avatar risks, in the same words everywhere.
+const AVATAR_DISCLAIMER = 'Forks of an Avatār act with its authorization — its level, projects, vault credentials and its creator’s GitHub account — without anyone approving it again. Anyone it is callable by can fork it, as a task’s agent, Responder or Reviewer, and a prompt injection in anything a fork reads can steer it. Give an Avatār only what you would trust all of them with.';
 
-function avatarsView(proj) {
-  if (!proj) return '<div class="empty">Select a project.</div>';
-  const selected = S.avatars.find((avatar) => avatar.id === S.avatarSelected);
-  if (selected) return avatarDetailView(selected);
-  const disabled = S.avatarAvailability && !S.avatarAvailability.effective;
-  return `<div class="avatars-page"><div class="settings-header avatar-list-head"><h1 class="page-title">Avatars ${policyTip('Trusted agents with their own instructions and your delegated authority. Call one into a task with @.')}</h1>${disabled ? '' : '<button class="btn primary avatar-new" type="button">+ New avatar</button>'}</div>
-    ${AVATAR_RISK_NOTE}
-    ${disabled ? `<div class="avatar-disabled card"><div><b>Disabled for this project</b> ${policyTip('Existing Avatars and their history stay visible, but they cannot be called.')}</div><button class="btn avatar-project-enable" type="button">Enable for project</button></div>` : ''}
-    <div class="avatar-list">${S.avatars.map((avatar) => `<a class="avatar-row" data-spa href="${esc(avatarRoute(proj.id, avatar.id))}" data-avatar="${esc(avatar.id)}"><span class="avatar-mark" aria-hidden="true">✦</span><span class="avatar-row-main"><b>${esc(avatar.name)}</b><span>${esc(avatar.purpose || 'User-authored autonomous principal')}</span><small>Owned by ${esc(avatarOwnerName(avatar))} · ${avatar.authorityMode === 'full' ? 'Full delegation' : 'Restricted'} · ${esc(avatarCallerSummary(avatar))}</small></span><span class="chip ${avatar.effectiveEnabled ? 'success' : ''}">${avatar.effectiveEnabled ? 'Enabled' : 'Disabled'}</span><span class="avatar-chevron">›</span></a>`).join('') || (disabled ? '' : '<div class="empty avatar-empty"><span class="avatar-mark">✦</span><b>No Avatars yet</b><button class="btn primary avatar-new" type="button">Create an Avatar</button></div>')}</div></div>`;
-}
+// The roles a fork of an Avatār may play (`params.avatar.roles`; none listed: all).
+const AVATAR_ROLE_CHOICES = [['do', 'Agent'], ['responder', 'Responder'], ['confirm', 'Reviewer'], ['agent', 'Called in']];
 
-async function openAvatarEditor(proj, avatar) {
-  const overlay = document.createElement('div'); overlay.className = 'overlay avatar-editor-overlay';
-  overlay.innerHTML = '<div class="modal-card avatar-editor"><div class="loading">Loading…</div></div>'; document.body.appendChild(overlay);
-  const close = () => overlay.remove(); overlay.addEventListener('click', (event) => { if (event.target === overlay) close(); });
-  try { await fillAvatarEditor(overlay, close, proj, avatar); } catch (error) { close(); toast(error.message, true); }
+// The task form's Avatar row, at its bottom like Repeatable: the setting
+// (`params.avatar`), who may call it, and whether its forks may be Avatars.
+function avatarSectionHtml(value) {
+  const setting = value && typeof value === 'object' ? value : null;
+  const callers = (setting?.callableBy?.length ? setting.callableBy : ['@project']).join(', ');
+  return `<div class="form-row" data-row="__avatar">
+    <div class="tf-avatar-line">
+      <label class="tf-avatar-toggle"><input type="checkbox" id="tf-avatar" ${setting ? 'checked' : ''}> Avatār
+        <span class="tf-avatar-hint">(automatically grants future forks the same authorizations)</span></label>
+      <span class="risk-chip">! At your own risk</span>${policyTip(AVATAR_DISCLAIMER)}
+    </div>
+    <div class="tf-avatar-options" ${setting ? '' : 'hidden'}>
+      <span class="tb-label">Callable by</span>${audienceComboHtml('tf-avatar-callers', callers, 'Callable by')}
+      <span class="tb-label">Forked as</span><span class="tf-avatar-roles">${AVATAR_ROLE_CHOICES.map(([role, label]) =>
+        `<label><input type="checkbox" value="${role}" ${!setting?.roles?.length || setting.roles.includes(role) ? 'checked' : ''}> ${label}</label>`).join('')}</span>
+      <label class="tf-avatar-forks"><input type="checkbox" id="tf-avatar-forks" ${setting?.forksMayBeAvatars ? 'checked' : ''}> Forks can be Avatārs
+        ${policyTip('A fork acting with this task’s authorization may itself be marked Avatār, handing that authorization on to whoever may call it.')}</label>
+    </div>
+  </div>`;
 }
-
-async function fillAvatarEditor(overlay, close, proj, avatar) {
-  const [vaultItems, githubData] = await Promise.all([api(`/api/vault/items?organizationId=${encodeURIComponent(proj.organizationId)}`).catch(() => []), api('/api/user/github-accounts').catch(() => ({ accounts: [] }))]);
-  const githubAccounts = githubData.accounts || [], activeGithub = githubAccounts.find((account) => account.active);
-  const selectedCredentialIds = new Set((avatar?.authorization?.capabilities || []).filter((cap) => cap.startsWith('use-credential:item:')).map((cap) => cap.slice('use-credential:item:'.length)));
-  let credentialPolicies = JSON.parse(JSON.stringify(avatar?.credentialPolicies || {}));
-  const callMode = !avatar ? 'me' : avatar.callableBy?.includes('@project') ? 'project' : avatar.callableBy?.length === 1 && avatar.callableBy[0] === `user:${avatar.ownerUserId}` ? 'me' : 'specific';
-  const roles = new Set(avatar?.roles || []), selectedAuth = avatar?.authorityMode === 'restricted' ? avatar.authorization : { level: 'developer', scope: 'projects', projectIds: [proj.id] };
-  const runtime = avatar?.runtime || { provider: agentProviderChoice(), model: '', effort: '' };
-  overlay.querySelector('.avatar-editor').innerHTML = `<div class="avatar-editor-head"><div><h2>${avatar ? 'Edit Avatar' : 'New Avatar'}</h2><p>Create a named autonomous principal. Only you can edit its instructions.</p></div><button class="icon-btn avatar-editor-close" type="button" aria-label="Close">✕</button></div><div class="avatar-editor-scroll">
-    <label class="form-row"><span>Name</span><input id="avatar-name" maxlength="80" value="${esc(avatar?.name || '')}" placeholder="Atlas"></label><label class="form-row"><span>Purpose</span><input id="avatar-purpose" maxlength="240" value="${esc(avatar?.purpose || '')}" placeholder="Handles implementation and routine approvals"></label><label class="form-row"><span>Instructions</span><textarea id="avatar-prompt" rows="12" placeholder="You are my trusted engineering delegate…">${esc(avatar?.prompt || '')}</textarea></label>
-    <div class="avatar-defaults"><div><span>Authority</span><b id="avatar-authority-summary">${avatar?.authorityMode === 'restricted' ? esc(avatar.authorization.level) : 'Full delegation from you'}</b></div><div><span>Callable by</span><b>${callMode === 'me' ? 'Only you' : callMode === 'project' ? 'Everyone in this project' : 'Specific people and teams'}</b></div><div><span>Roles</span><b>${avatar ? esc(avatarRoleSummary(avatar)) : 'Any role'}</b></div><div><span>Runtime</span><b>${esc(formatModelRef(runtime))}</b></div></div>
-    <details class="settings-disclosure avatar-customize" ${avatar && (avatar.authorityMode === 'restricted' || callMode !== 'me' || roles.size) ? 'open' : ''}><summary><b>Customize…</b></summary><div class="avatar-custom-section"><div class="section-h">Authority</div>
-      <label class="choice-row"><input type="radio" name="avatar-authority" value="full" ${avatar?.authorityMode !== 'restricted' ? 'checked' : ''}><span><b>Full delegation</b><small>All ${siteNameMarkup()}, GitHub, and Vault authority you can delegate.</small></span></label><label class="choice-row"><input type="radio" name="avatar-authority" value="restricted" ${avatar?.authorityMode === 'restricted' ? 'checked' : ''}><span><b>Restricted delegation</b><small>Choose an authorization level and credentials.</small></span></label>
-      <div id="avatar-restricted" ${avatar?.authorityMode === 'restricted' ? '' : 'hidden'}>${authorizationEditorHtml('avatar-authorization', selectedAuth, S.projects.filter((item) => item.organizationId === proj.organizationId), proj.id)}<button class="btn tf-vault-button" id="avatar-vault" type="button"><span>Vault credentials</span><span id="avatar-vault-count">${selectedCredentialIds.size} selected</span></button></div>${activeGithub ? `<label class="choice-row compact"><input id="avatar-github" type="checkbox" ${avatar?.githubAccountId ? 'checked' : ''}><span><b>Use GitHub account ${esc(activeGithub.login)}</b><small>Delegate this connected account to the Avatar.</small></span></label>` : ''}</div>
-      <div class="avatar-custom-section"><div class="section-h">Callable by</div><select id="avatar-call-mode"><option value="me" ${callMode === 'me' ? 'selected' : ''}>Only me</option><option value="project" ${callMode === 'project' ? 'selected' : ''}>Everyone in this project</option><option value="specific" ${callMode === 'specific' ? 'selected' : ''}>Specific people and teams</option></select><input id="avatar-callers" value="${esc(callMode === 'specific' ? avatar.callableBy.join(', ') : '')}" placeholder="user:id, @team:engineering" ${callMode === 'specific' ? '' : 'hidden'}></div>
-      <div class="avatar-custom-section"><div class="section-h">Roles</div><label class="choice-row compact"><input id="avatar-any-role" type="checkbox" ${roles.size ? '' : 'checked'}><span><b>Any role</b></span></label><div class="avatar-role-grid" ${roles.size ? '' : 'hidden'}>${[['do','Working'],['confirm','Review'],['respond','Response'],['resolve','Resolve'],['merge','Merge'],['authorize','Authorize']].map(([id,label]) => `<label><input type="checkbox" value="${id}" ${roles.has(id) ? 'checked' : ''}> ${label}</label>`).join('')}</div></div>
-      <div class="avatar-custom-section"><div class="section-h">Runtime</div><div class="agent-controls" id="avatar-runtime">${modelFieldHtml('avatar-ref', runtime)}</div></div></details></div>
-    <div class="avatar-editor-actions"><button class="btn avatar-editor-cancel" type="button">Cancel</button><button class="btn primary avatar-editor-save" type="button">${avatar ? 'Save Avatar' : 'Create Avatar'}</button></div>`;
-  overlay.querySelector('.avatar-editor-close').addEventListener('click', close); overlay.querySelector('.avatar-editor-cancel').addEventListener('click', close);
-  wireModelField(overlay.querySelector('#avatar-runtime .model-field'));
-  const authorityInputs = [...overlay.querySelectorAll('[name="avatar-authority"]')];
-  const syncAuthority = () => { const mode = authorityInputs.find((input) => input.checked)?.value || 'full'; overlay.querySelector('#avatar-restricted').hidden = mode !== 'restricted'; overlay.querySelector('#avatar-authority-summary').textContent = mode === 'full' ? 'Full delegation from you' : 'Restricted delegation'; };
-  authorityInputs.forEach((input) => input.addEventListener('change', syncAuthority)); wireAuthorizationEditor(overlay.querySelector('#avatar-authorization'), S.projects.filter((item) => item.organizationId === proj.organizationId));
-  overlay.querySelector('#avatar-vault')?.addEventListener('click', () => openVaultGrantPicker(vaultItems, selectedCredentialIds, credentialPolicies, (ids, policies) => { selectedCredentialIds.clear(); ids.forEach((id) => selectedCredentialIds.add(id)); credentialPolicies = policies; overlay.querySelector('#avatar-vault-count').textContent = `${selectedCredentialIds.size} selected`; }));
-  const callModeEl = overlay.querySelector('#avatar-call-mode'); callModeEl.addEventListener('change', () => { overlay.querySelector('#avatar-callers').hidden = callModeEl.value !== 'specific'; });
-  const anyRole = overlay.querySelector('#avatar-any-role'), roleGrid = overlay.querySelector('.avatar-role-grid'); anyRole.addEventListener('change', () => { roleGrid.hidden = anyRole.checked; });
-  overlay.querySelector('.avatar-editor-save').addEventListener('click', async () => {
-    const button = overlay.querySelector('.avatar-editor-save'); button.disabled = true; const authorityMode = authorityInputs.find((input) => input.checked)?.value || 'full';
-    const callableBy = callModeEl.value === 'me' ? [`user:${typeof S.user === 'string' ? S.user : S.user?.id}`] : callModeEl.value === 'project' ? ['@project'] : overlay.querySelector('#avatar-callers').value.split(',').map((value) => value.trim()).filter(Boolean);
-    const requestedAuthorization = authorityMode === 'restricted'
-      ? readAuthorizationEditor(overlay.querySelector('#avatar-authorization')) : null;
-    const payload = { name: overlay.querySelector('#avatar-name').value, purpose: overlay.querySelector('#avatar-purpose').value,
-      prompt: overlay.querySelector('#avatar-prompt').value, authorityMode,
-      ...(requestedAuthorization ? { authorization: requestedAuthorization, credentialIds: [...selectedCredentialIds], credentialPolicies } : {}),
-      githubAccountId: overlay.querySelector('#avatar-github')?.checked ? activeGithub?.id : null, callableBy,
-      roles: anyRole.checked ? [] : [...roleGrid.querySelectorAll('input:checked')].map((input) => input.value),
-      runtime: (({ provider, model, effort }) => ({ provider, model: model || undefined, effort: effort || undefined }))(readModelField(overlay.querySelector('#avatar-runtime'))) };
-    const save = (body, current = avatar) => api(`/api/projects/${proj.id}/avatars${current ? `/${current.id}` : ''}`, {
-      method: current ? 'PUT' : 'POST', body: JSON.stringify(body),
-    });
-    try {
-      let saved;
-      try { saved = await save(payload); }
-      catch (error) {
-        if (!requestedAuthorization || !isAuthorizationGrantGap(error)) throw error;
-        const decision = await chooseAuthorizationGrant(proj.id, requestedAuthorization, 'Avatar');
-        if (!decision) { button.disabled = false; return; }
-        if (decision.action === 'limit') saved = await save({ ...payload, limitAuthorization: true });
-        else {
-          // Existing Avatars keep their current authority while approval is
-          // pending. A new one is saved disabled at the owner's safe ceiling.
-          saved = avatar
-            ? await save({ ...payload, authorization: normalizedAuthorization({
-              level: avatar.authorization.level || avatar.authorization.profileId,
-              scope: avatar.authorization.scope, projectIds: avatar.authorization.projectIds,
-            }, proj.id) })
-            : await save({ ...payload, limitAuthorization: true, enabled: false });
-          await api(`/api/authorization-requests?projectId=${encodeURIComponent(proj.id)}`, { method: 'POST', body: JSON.stringify({
-            projectId: proj.id,
-            target: { kind: 'avatar', avatarId: saved.id, enableAfterApproval: !avatar },
-            authorization: requestedAuthorization, audience: decision.audience, reason: decision.reason,
-          }) });
-          close(); await loadAvatars(); await go(avatarRoute(proj.id, saved.id));
-          toast('Authorization request sent'); return;
-        }
+function readAvatarSection(root) {
+  if (!root?.querySelector('#tf-avatar')?.checked) return undefined;
+  const callableBy = (root.querySelector('.tf-avatar-callers')?.value || '').split(',').map((value) => value.trim()).filter(Boolean);
+  const roles = [...(root.querySelectorAll?.('.tf-avatar-roles input:checked') || [])].map((input) => input.value);
+  return { callableBy: callableBy.length ? callableBy : ['@project'],
+    ...(root.querySelector('#tf-avatar-forks')?.checked ? { forksMayBeAvatars: true } : {}),
+    // Every role ticked is no restriction.
+    ...(roles.length < AVATAR_ROLE_CHOICES.length ? { roles } : {}) };
+}
+// Making a task an Avatar says what it risks, until "Don't show this again".
+const AVATAR_NOTICE_KEY = 'tavya.avatarNoticeDismissed';
+function confirmAvatar() {
+  try { if (localStorage.getItem(AVATAR_NOTICE_KEY) === '1') return Promise.resolve(true); } catch { /* private mode */ }
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay avatar-notice-overlay';
+    overlay.innerHTML = `<div class="modal-card avatar-notice" role="dialog" aria-modal="true" aria-labelledby="avatar-notice-title">
+      <h2 id="avatar-notice-title">Avatārs automatically grant their authorizations to their future forks.</h2>
+      <p>${esc(AVATAR_DISCLAIMER)}</p>
+      <label class="avatar-notice-dismiss"><input type="checkbox"> Don’t show this again</label>
+      <div class="avatar-notice-actions"><button type="button" class="btn avatar-notice-cancel">Cancel</button>
+        <button type="button" class="btn primary avatar-notice-ok">Make it an Avatār</button></div>
+    </div>`;
+    document.body.appendChild(overlay);
+    const finish = (ok) => {
+      if (ok && overlay.querySelector('.avatar-notice-dismiss input').checked) {
+        try { localStorage.setItem(AVATAR_NOTICE_KEY, '1'); } catch { /* private mode */ }
       }
-      close(); await loadAvatars(); await go(avatarRoute(proj.id, saved.id)); toast(avatar ? 'Avatar saved' : 'Avatar created');
-    } catch (error) { button.disabled = false; toast(error.message, true); }
-  }); overlay.querySelector('#avatar-name').focus();
-}
-
-function wireAvatarsView(proj) {
-  if (!proj) return; document.querySelectorAll('.avatar-new').forEach((button) => button.addEventListener('click', () => openAvatarEditor(proj)));
-  const avatar = S.avatars.find((item) => item.id === S.avatarSelected); document.querySelector('.avatar-edit')?.addEventListener('click', () => openAvatarEditor(proj, avatar)); document.querySelector('.avatar-start')?.addEventListener('click', () => { S.pendingAvatarId = avatar.id; openTaskForm('software-dev'); });
-  document.querySelector('.avatar-toggle')?.addEventListener('click', async () => { try { await api(`/api/projects/${proj.id}/avatars/${avatar.id}`, { method: 'PUT', body: JSON.stringify({ enabled: !avatar.enabled }) }); await loadAvatars(); renderMain(); } catch (error) { toast(error.message, true); } });
-  document.querySelector('.avatar-remove')?.addEventListener('click', async () => { if (!confirm(`Remove ${avatar.name}? Its audit history will be retained.`)) return; try { await api(`/api/projects/${proj.id}/avatars/${avatar.id}`, { method: 'DELETE' }); await loadAvatars(); await go(avatarRoute(proj.id), { replace: true }); } catch (error) { toast(error.message, true); } });
-  document.querySelector('.avatar-project-enable')?.addEventListener('click', async () => { try { await api(`/api/projects/${proj.id}/avatar-settings`, { method: 'PUT', body: JSON.stringify({ value: 'enabled' }) }); await loadAvatars(); renderMain(); } catch (error) { toast(error.message, true); } });
-  wireAuthorizationRequestActions(document.querySelector('.avatar-authorization-requests'), proj.organizationId, async () => {
-    await Promise.all([loadAvatars(), loadAvatarAuthorizationRequests(S.avatarSelected), loadCollaboration().catch(() => {}), loadInbox().catch(() => {})]);
-    renderMain();
+      overlay.remove();
+      resolve(ok);
+    };
+    overlay.querySelector('.avatar-notice-ok').addEventListener('click', () => finish(true));
+    overlay.querySelector('.avatar-notice-cancel').addEventListener('click', () => finish(false));
+    overlay.addEventListener('click', (event) => { if (event.target === overlay) finish(false); });
+    overlay.addEventListener('keydown', (event) => { if (event.key === 'Escape') { event.stopPropagation(); finish(false); } });
+    overlay.querySelector('.avatar-notice-ok').focus();
   });
 }
 
-// ── wiki (org/project skills, memories, and prompts — one content system) ─────
-// One view serves both scopes: /<org>/wiki (proj = null) and /<org>/<project>/wiki.
-// The left rail lists the wiki tree; the pane shows the Index (every `default`-
-// labelled entry rendered in full, plus the table of contents — exactly what
-// agents get with each prompt) or the selected entry. The open entry rides in
-// the URL hash so wiki pages deep-link like settings panes.
 function wikiScopeInfo(proj) {
   if (proj) return { scope: 'project', id: proj.id, title: proj.name, base: `/api/projects/${encodeURIComponent(proj.id)}/wiki`,
     view: S.wikiView || '' };
@@ -17879,16 +17992,16 @@ async function hydrateAvatarAvailability(scope, id) {
     const enabled = scope === 'organization' ? policy.enabled : policy.effective;
     const state = scope === 'organization' ? (enabled ? 'On' : 'Off')
       : `${enabled ? 'On' : 'Off'} · ${policy.project === 'inherit' ? 'organization default' : 'set for this project'}`;
-    box.innerHTML = `<div class="setting-row"><span class="setting-label">Avatars ${policyTip(`Trusted agents with delegated authority. Disabled by default. ${scope === 'organization' ? 'Projects can override this.' : ''} Turning them off keeps existing Avatars and their history.`)}</span>
+    box.innerHTML = `<div class="setting-row"><span class="setting-label">Avatārs ${policyTip(`Tasks whose forks act with their authorization. ${AVATAR_DISCLAIMER} ${scope === 'organization' ? 'Projects can override this.' : ''} Off, Avatārs stay tasks, but forks get no authorization from them.`)}</span>
       <span class="setting-value setting-muted">${state}</span>
-      <span class="setting-actions">${scope === 'project' && policy.project !== 'inherit' ? '<button type="button" class="btn sm ghost avatar-availability-inherit">Use organization default</button>' : ''}<button type="button" class="btn sm avatar-availability-toggle" aria-pressed="${enabled}">${enabled ? 'Disable' : 'Enable'} Avatars</button></span></div>`;
+      <span class="setting-actions">${scope === 'project' && policy.project !== 'inherit' ? '<button type="button" class="btn sm ghost avatar-availability-inherit">Use organization default</button>' : ''}<button type="button" class="btn sm avatar-availability-toggle" aria-pressed="${enabled}">${enabled ? 'Disable' : 'Enable'} Avatārs</button></span></div>`;
     const save = async (button, body) => {
       button.disabled = true;
       try {
         await api(url, { method: 'PUT', body: JSON.stringify(body) });
         await loadAvatars().catch(() => {});
         renderMain();
-        toast('Avatar availability saved');
+        toast('Avatār availability saved');
       } catch (error) { button.disabled = false; toast(error.message, true); }
     };
     box.querySelector('.avatar-availability-toggle').addEventListener('click', (event) => save(event.currentTarget,
@@ -18275,7 +18388,7 @@ function githubRepositorySlug(text) {
 
 // Work on someone else's repository: fork it on GitHub (where the App can reach
 // it), then attach the fork. Its pull requests open on the original.
-function openForkRepositoryDialog(proj, opener, githubApp = {}) {
+function openForkRepositoryDialog(proj, opener, githubApp = {}, preset = '') {
   const host = document.createElement('div');
   host.innerHTML = `<div class="modal-overlay"><form class="modal-card new-repository-dialog" role="dialog" aria-modal="true" aria-labelledby="fork-repository-title">
     <div class="new-repository-head"><b id="fork-repository-title">Fork a repository</b><button class="icon-btn new-repository-close" type="button" aria-label="Close">×</button></div>
@@ -18295,6 +18408,7 @@ function openForkRepositoryDialog(proj, opener, githubApp = {}) {
   const note = host.querySelector('.fork-private-note');
   let privateAcknowledged = '';
   source.addEventListener('input', () => { sync(); note.hidden = true; privateAcknowledged = ''; });
+  if (preset) { source.value = preset; sync(); }
   host.querySelector('.modal-overlay').addEventListener('mousedown', (event) => { if (event.target === event.currentTarget) close(); });
   host.querySelector('.new-repository-close').addEventListener('click', close);
   host.querySelector('.new-repository-cancel').addEventListener('click', close);
@@ -18341,14 +18455,14 @@ function openForkRepositoryDialog(proj, opener, githubApp = {}) {
 
 // Creates a GitHub repository in one of the organization's accounts, then hands
 // it to `created` (which attaches it wherever it was asked for).
-function openNewGithubRepositoryDialog(organizationId, gitConnections, opener, created) {
+function openNewGithubRepositoryDialog(organizationId, gitConnections, opener, created, preset = {}) {
   const host = document.createElement('div');
   host.innerHTML = `<div class="modal-overlay"><form class="modal-card new-repository-dialog" role="dialog" aria-modal="true" aria-labelledby="new-repository-title">
     <div class="new-repository-head"><b id="new-repository-title">New GitHub repository</b><button class="icon-btn new-repository-close" type="button" aria-label="Close">×</button></div>
     <div class="new-repository-identity">
-      <label class="form-row"><span>GitHub account</span><select id="project-new-repo-connection">${gitConnections.map((connection) => `<option value="${esc(connection.id)}">${esc(connection.accountLogin)}</option>`).join('')}</select></label>
+      <label class="form-row"><span>GitHub account</span><select id="project-new-repo-connection">${gitConnections.map((connection) => `<option value="${esc(connection.id)}" ${connection.id === preset.connectionId ? 'selected' : ''}>${esc(connection.accountLogin)}</option>`).join('')}</select></label>
       <span class="new-repository-slash" aria-hidden="true">/</span>
-      <label class="form-row"><span>Repository name</span><input id="project-new-repo-name" placeholder="new-repository" required autocomplete="off"></label>
+      <label class="form-row"><span>Repository name</span><input id="project-new-repo-name" placeholder="new-repository" required autocomplete="off" value="${esc(preset.name || '')}"></label>
     </div>
     <label class="form-row"><span>Description <span class="task-sub">optional</span></span><input id="project-new-repo-description"></label>
     <label class="switch new-repository-private"><input id="project-new-repo-private" type="checkbox" checked><span>Private repository</span></label>
@@ -18423,6 +18537,164 @@ function repositorySourceFor(typed, repositories) {
   if (repositoryInput(repositories).pickOnly && !known) return null;
   return known?.sshUrl || typed;
 }
+// A name GitHub accepts for a new repository, made from what people type:
+// "Clients/Fresh Ideas" → "fresh-ideas" (the last folder of a project name).
+function githubRepositoryName(text) {
+  return String(text || '').split('/').pop().normalize('NFKD').replace(/[̀-ͯ]/g, '').toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-').replace(/^[-.]+|[-.]+$/g, '').replace(/-{2,}/g, '-').slice(0, 100);
+}
+// The organization's GitHub account new repositories go to by default: the
+// person's own when the organization connected it, else the first one.
+function defaultGitConnection(gitConnections, githubLogin) {
+  return gitConnections.find((connection) => githubLogin && connection.accountLogin?.toLowerCase() === githubLogin.toLowerCase())
+    || gitConnections[0];
+}
+function repositoryPickerHtml(id, { placeholder, disabled }) {
+  return `<div class="combo repo-combo" id="${esc(id)}-combo">
+    <input id="${esc(id)}" role="combobox" aria-label="Add a repository" aria-autocomplete="list" aria-expanded="false" aria-controls="${esc(id)}-options" autocomplete="off" spellcheck="false" placeholder="${esc(placeholder)}" ${disabled ? 'disabled' : ''}>
+    <div class="combo-menu repo-combo-menu" id="${esc(id)}-options" role="listbox" aria-label="Repositories" hidden></div>
+  </div>`;
+}
+// The add-a-repository combobox of Git & GitHub (New project and Project
+// settings). Typing filters the organization's repositories; a name that
+// matches none offers "+ New repo" (which opens the New repository dialog
+// with it), and off hosted the typed URL or path itself. ↑/↓ move, Enter
+// chooses, Esc closes. `attachedKeys()` names what is already in the list.
+function wireRepositoryPicker(input, { repositories, gitConnections = [], githubLogin, canCreate, attachedKeys, add, create, fork }) {
+  if (!input) return;
+  const root = input.closest('.repo-combo');
+  const menu = root.querySelector('[role="listbox"]');
+  const { pickOnly } = repositoryInput(repositories);
+  let options = [];
+  let active = -1;
+  const slugOf = (repository) => `${repository.owner}/${repository.name}`;
+  const ownAccount = (owner) => gitConnections.find((connection) => connection.accountLogin?.toLowerCase() === owner.toLowerCase());
+  const build = () => {
+    const typed = input.value.trim();
+    const needle = typed.toLowerCase();
+    const typedKey = repositorySourceView(typed).key.toLowerCase();
+    const attached = attachedKeys();
+    const next = repositories
+      .filter((repository) => !attached.has(slugOf(repository).toLowerCase()))
+      .filter((repository) => !needle || slugOf(repository).toLowerCase().includes(needle) || slugOf(repository).toLowerCase() === typedKey)
+      .sort((a, b) => Number(b.name.toLowerCase() === needle) - Number(a.name.toLowerCase() === needle)
+        || Number(b.name.toLowerCase().startsWith(needle)) - Number(a.name.toLowerCase().startsWith(needle)))
+      .map((repository) => ({ kind: 'repository', repository }));
+    const known = typed && repositorySourceFor(typed, repositories);
+    const knownKey = known && repositorySourceView(known).key.toLowerCase();
+    const exists = (slug) => repositories.some((repository) => slugOf(repository).toLowerCase() === slug.toLowerCase());
+    // "+ New repo": a bare name goes to the default account; owner/name to that
+    // account when the organization connected it.
+    if (canCreate) {
+      const [owner, name] = typed.includes('/') ? typed.split('/') : [defaultGitConnection(gitConnections, githubLogin)?.accountLogin, typed];
+      const connection = owner && ownAccount(owner);
+      const valid = /^[A-Za-z0-9._-]+$/.test(name || '') && connection && !/^\.+$/.test(name);
+      if (!typed) next.push({ kind: 'create', name: '', label: 'New repo…' });
+      else if (valid && !exists(`${connection.accountLogin}/${name}`))
+        next.push({ kind: 'create', name, connectionId: connection.id, label: `New repo ${connection.accountLogin}/${name}` });
+    }
+    const slug = githubRepositorySlug(typed);
+    if (typed && !pickOnly && !knownKey && /[/:~]|^\./.test(typed) && !(slug && ownAccount(slug.split('/')[0])))
+      next.push({ kind: 'source', source: typed, label: `Add ${typed}` });
+    if (fork && slug && !exists(slug) && !ownAccount(slug.split('/')[0]))
+      next.push({ kind: 'fork', slug, label: `Fork ${slug}…` });
+    else if (fork && !typed) next.push({ kind: 'fork', slug: '', label: 'Fork a repository…' });
+    return next;
+  };
+  const place = () => {
+    const rect = input.getBoundingClientRect();
+    menu.style.width = `${rect.width}px`;
+    menu.style.left = `${rect.left}px`;
+    const below = window.innerHeight - rect.bottom - 8;
+    const upwards = below < Math.min(240, menu.scrollHeight) && rect.top - 8 > below;
+    menu.style.maxHeight = `${Math.max(0, Math.min(240, upwards ? rect.top - 8 : below))}px`;
+    menu.style.top = `${upwards ? rect.top - menu.getBoundingClientRect().height - 3 : rect.bottom + 3}px`;
+  };
+  const paint = () => {
+    menu.querySelectorAll('[role="option"]').forEach((option, index) => {
+      option.classList.toggle('active', index === active);
+      option.setAttribute('aria-selected', String(index === active));
+    });
+    const current = menu.querySelector(`[data-index="${active}"]`);
+    if (current) { input.setAttribute('aria-activedescendant', current.id); current.scrollIntoView({ block: 'nearest' }); }
+    else input.removeAttribute('aria-activedescendant');
+  };
+  const draw = () => {
+    options = build();
+    // The first choice is the one Enter takes once something is typed.
+    active = input.value.trim() && options.length ? 0 : -1;
+    menu.innerHTML = options.map((option, index) => {
+      const body = option.kind === 'repository'
+        ? `<span class="repo-opt-icon">${githubMark()}</span><span class="repo-opt-name"><span>${esc(option.repository.owner)}/</span>${esc(option.repository.name)}</span>${option.repository.upstream ? `<span class="repo-opt-note">→ ${esc(option.repository.upstream.owner)}/${esc(option.repository.upstream.name)}</span>` : ''}`
+        : `<span class="repo-opt-icon repo-opt-mark" aria-hidden="true"></span><span class="repo-opt-name">${esc(option.label)}</span>`;
+      return `<div class="combo-opt repo-opt repo-opt-${option.kind}" role="option" id="${esc(input.id)}-option-${index}" data-index="${index}" aria-selected="false">${body}</div>`;
+    }).join('');
+    const open = options.length > 0 && document.activeElement === input;
+    // Open, the menu lives on <body>: a dialog's transform or scrolling would
+    // otherwise move or clip a fixed menu.
+    if (open && menu.parentElement !== document.body) { document.body.appendChild(menu); document.addEventListener('scroll', follow, true); }
+    menu.hidden = !open;
+    input.setAttribute('aria-expanded', String(open));
+    if (open) place(); else close();
+    paint();
+  };
+  // A scroll moves the field; the menu follows it, and goes with it.
+  const follow = () => { if (input.isConnected) place(); else { menu.remove(); document.removeEventListener('scroll', follow, true); } };
+  const close = () => {
+    menu.hidden = true; root.appendChild(menu); document.removeEventListener('scroll', follow, true);
+    input.setAttribute('aria-expanded', 'false'); input.removeAttribute('aria-activedescendant'); active = -1;
+  };
+  const choose = async (option) => {
+    close();
+    if (option.kind === 'create') return create?.({ name: option.name, connectionId: option.connectionId }, input);
+    if (option.kind === 'fork') return fork?.(option.slug, input);
+    const source = option.kind === 'repository' ? option.repository.sshUrl : option.source;
+    input.value = '';
+    await add(source);
+  };
+  // Enter with nothing to choose: what was typed, if it may be added.
+  const submitTyped = async () => {
+    const typed = input.value.trim();
+    if (!typed) return;
+    const source = repositorySourceFor(typed, repositories);
+    if (!source) return toast('Choose one of the organization’s GitHub repositories', true);
+    if (attachedKeys().has(repositorySourceView(source).key)) { input.value = ''; return toast('Already added'); }
+    input.value = '';
+    await add(source);
+  };
+  input.addEventListener('focus', draw);
+  input.addEventListener('click', () => { if (menu.hidden) draw(); });
+  input.addEventListener('input', draw);
+  input.addEventListener('blur', () => setTimeout(() => { if (document.activeElement !== input) close(); }, 0));
+  input.addEventListener('keydown', (event) => {
+    if (event.isComposing) return;
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      if (menu.hidden) return draw();
+      if (!options.length) return;
+      active = event.key === 'ArrowDown' ? (active + 1) % options.length : (active <= 0 ? options.length - 1 : active - 1);
+      paint();
+    } else if (event.key === 'Enter') {
+      // Enter adds a repository; it never submits the surrounding form.
+      event.preventDefault();
+      const option = !menu.hidden && options[active];
+      if (option) choose(option); else submitTyped();
+    } else if (event.key === 'Escape' && !menu.hidden) {
+      event.preventDefault(); event.stopPropagation(); close();
+    } else if (event.key === 'Tab') close();
+  });
+  // mousedown, not click: the input keeps focus, so the menu does not close first.
+  menu.addEventListener('mousedown', (event) => {
+    const option = event.target.closest('[role="option"]');
+    if (!option) return;
+    event.preventDefault();
+    choose(options[Number(option.dataset.index)]);
+  });
+  menu.addEventListener('mousemove', (event) => {
+    const option = event.target.closest('[role="option"]');
+    if (option && Number(option.dataset.index) !== active) { active = Number(option.dataset.index); paint(); }
+  });
+}
 // The GitHub row's value and actions: the organization's connected accounts,
 // or the step that connects them. `ids` name its buttons.
 function githubAccessView({ githubApp, gitConnections, githubLoadError }, organizationId, ids) {
@@ -18454,30 +18726,23 @@ async function loadOrganizationGithub(organizationId) {
 function renderProjectRepositories(box, proj, { repositories, gitConnections, githubApp, githubLoadError, githubLogin }) {
   const sources = proj.config.repos || [];
   const attached = new Set(sources.map((source) => repositorySourceView(source).key));
-  const choices = repositories.filter((repository) => !attached.has(`${repository.owner}/${repository.name}`.toLowerCase()));
   const { canAdd, placeholder } = repositoryInput(repositories);
   const canCreate = githubApp.configured && gitConnections.length && githubApp.userAuthorized;
   const access = githubAccessView({ githubApp, gitConnections, githubLoadError }, proj.organizationId,
     { error: 'project-github-error', connect: 'project-connect-github', refresh: 'project-refresh-github' });
   const identity = `<b>You</b>${githubLogin && githubApp.userAuthorized ? `<span class="setting-sep">·</span><span class="setting-muted">${esc(githubLogin)}</span>` : ''}`;
-  box.innerHTML = `<div class="section-h">Repositories</div>
+  box.innerHTML = `<div class="section-h">Repositories ${policyTip('Everyone in this project gets access to these on GitHub automatically.')}</div>
     <div class="git-repos">
       <div id="project-repository-fields">${sources.map((source) => gitRepoRow(source, repositories)).join('')}</div>
-      <form class="git-repo-add" id="project-repository-add-form">
-        <input id="project-repository-input" list="project-repository-options" autocomplete="off" spellcheck="false" aria-label="Add a repository" placeholder="${esc(placeholder)}" ${canAdd ? '' : 'disabled'}>
-        <button class="btn sm" type="submit" id="project-repository-add" ${canAdd ? '' : 'disabled'}>Add</button>
-        ${canCreate ? '<button class="btn sm" id="project-new-repo-open" type="button" aria-haspopup="dialog">New repository</button>' : ''}
-        ${githubApp.configured && gitConnections.length ? '<button class="btn sm" id="project-fork-open" type="button" aria-haspopup="dialog" title="Work on a repository you don\'t own. Pull requests go to it after Review.">Fork a repository</button>' : ''}
-      </form>
+      <div class="git-repo-add" id="project-repository-add-form">${repositoryPickerHtml('project-repository-input', { placeholder: canCreate ? 'Find or create a repository' : placeholder, disabled: !canAdd && !canCreate })}</div>
     </div>
-    <datalist id="project-repository-options">${choices.map((repository) => `<option value="${esc(repository.owner)}/${esc(repository.name)}">${repository.upstream ? `→ ${esc(repository.upstream.owner)}/${esc(repository.upstream.name)}` : ''}</option>`).join('')}</datalist>
     <div class="setting-rows ruled git-facts">
       <div class="setting-row" id="project-github-access"><span class="setting-label">GitHub ${policyTip('The GitHub accounts this organization connected. Their repositories can be added above.')}</span><span class="setting-value">${access.value}</span><span class="setting-actions">${access.actions}</span></div>
-      <div class="setting-row" id="project-github-identity"><span class="setting-label">Commits as ${policyTip('Each task commits and opens pull requests as the person who created it.')}</span><span class="setting-value">${identity}</span><span class="setting-actions">${githubAuthorizeButton(githubApp, 'project-authorize-github')}<a class="btn sm" data-spa href="${profileRoute()}">Manage</a></span></div>
+      <div class="setting-row" id="project-github-identity"><span class="setting-label">Commits as ${policyTip('Each task commits and opens pull requests as the person who created it, or as tavya for someone without GitHub.')}</span><span class="setting-value">${identity}</span><span class="setting-actions">${githubAuthorizeButton(githubApp, 'project-authorize-github')}<a class="btn sm" data-spa href="${profileRoute()}">Manage</a></span></div>
     </div>`;
   const rerender = () => hydrateProjectAccess(projectById(proj.id) || proj);
   if (githubLoadError) paneError($('#project-github-error'), githubLoadError, rerender);
-  const controls = () => box.querySelectorAll('#project-repository-add-form input, #project-repository-add-form button, .git-repo-remove');
+  const controls = () => box.querySelectorAll('#project-repository-input, .git-repo-remove');
   const save = async (repos) => {
     controls().forEach((control) => { control.disabled = true; });
     try {
@@ -18493,21 +18758,16 @@ function renderProjectRepositories(box, proj, { repositories, gitConnections, gi
   };
   box.querySelectorAll('.git-repo').forEach((item) => item.querySelector('.git-repo-remove').addEventListener('click', () =>
     save(sources.filter((source) => source !== item.dataset.source))));
-  $('#project-repository-add-form').addEventListener('submit', async (event) => {
-    event.preventDefault();
-    const input = $('#project-repository-input');
-    const typed = input.value.trim();
-    if (!typed) return input.focus();
-    const source = repositorySourceFor(typed, repositories);
-    if (!source) return toast('Choose one of the organization’s GitHub repositories', true);
-    if (attached.has(repositorySourceView(source).key)) { input.value = ''; return toast('Already added'); }
-    if (await save([...sources, source])) $('#project-repository-input')?.focus();
+  wireRepositoryPicker($('#project-repository-input'), {
+    repositories, gitConnections, githubLogin, canCreate,
+    attachedKeys: () => attached,
+    add: async (source) => { if (await save([...sources, source])) $('#project-repository-input')?.focus(); },
+    create: canCreate ? ({ name, connectionId }, opener) => openNewGithubRepositoryDialog(proj.organizationId, gitConnections, opener, async (repository) => {
+      await api(`/api/projects/${proj.id}/repositories`, { method: 'POST', body: JSON.stringify({ repositoryId: repository.id }) });
+      toast('Repository created and attached'); await loadProjects(); await rerender();
+    }, { name, connectionId }) : null,
+    fork: githubApp.configured && gitConnections.length ? (slug, opener) => openForkRepositoryDialog(proj, opener, githubApp, slug) : null,
   });
-  $('#project-new-repo-open')?.addEventListener('click', (event) => openNewGithubRepositoryDialog(proj.organizationId, gitConnections, event.currentTarget, async (repository) => {
-    await api(`/api/projects/${proj.id}/repositories`, { method: 'POST', body: JSON.stringify({ repositoryId: repository.id }) });
-    toast('Repository created and attached'); await loadProjects(); await hydrateProjectAccess(projectById(proj.id) || proj);
-  }));
-  $('#project-fork-open')?.addEventListener('click', (event) => openForkRepositoryDialog(proj, event.currentTarget, githubApp));
   $('#project-connect-github')?.addEventListener('click', async () => { try { await connectOrganizationGithub(proj.organizationId, rerender); } catch (error) { toast(error.message, true); } });
   $('#project-authorize-github')?.addEventListener('click', async () => { try { const result = await api(`/api/organizations/${proj.organizationId}/github/authorize`, { method: 'POST', body: '{}' }); location.assign(result.url); } catch (error) { toast(error.message, true); } });
   $('#project-refresh-github')?.addEventListener('click', async (event) => {
@@ -19962,7 +20222,7 @@ function authorizationRequestRows(requests, { historyLimit = 20 } = {}) {
     const canResolve = signedInUserId && request.recipients.includes(signedInUserId);
     return `<div class="approval-request${request.dismissed ? ' approval-request-dismissed' : ''}" data-areq="${esc(request.id)}">
     <div class="approval-request-main">
-      <div class="approval-request-title">${request.target.kind === 'avatar' ? 'Avatar' : 'Task agent'} authorization
+      <div class="approval-request-title">Task agent authorization
         ${request.dismissed ? ignoredChip() : '<span class="chip approval-needed">approval needed</span>'}
       </div>
       <div class="approval-request-caps"><span class="chip">${esc(authorizationSummary(request.authorization,
@@ -21302,7 +21562,7 @@ async function hydrateProfiles(scope, projectId, organizationId) {
       const orig = profiles.find((p) => p.id === row.dataset.profile);
       const next = knobs(row.querySelector('.agent-field'));
       if (!orig || JSON.stringify(next) === saved.get(orig.id)) continue;
-      const { avatarId: _avatar, resumeFrom: _resume, ...values } = next;
+      const { resumeFrom: _resume, ...values } = next;
       await api(`/api/profiles${query}`, { method: 'PUT', body: JSON.stringify({
         role: orig.role, name: orig.name,
         projectId: scope === 'project' ? projectId : undefined,
@@ -21494,7 +21754,6 @@ function urgencyRank(urgency) {
 // What a row is about. An ask names itself ("review requested"); an update's
 // news is the outcome it is reporting, so it names the task's status instead.
 function inboxRowLabel(item) {
-  if (item.subject?.kind === 'avatar-authorization') return 'Avatar authorization approval';
   if (item.subject?.kind === 'service-limit') return item.subject.level === 'failed' ? `Can’t read ${item.subject.serviceName} usage`
     : `${item.subject.serviceName} at ${Math.floor((item.subject.used / item.subject.limit) * 100)}% of its limit${item.subject.level === 95 ? ' — upgrade now' : ''}`;
   if (item.subject?.kind === 'compute') {
@@ -21537,7 +21796,7 @@ function inboxNotices() {
 function inboxNoticesHtml() {
   if (S.tab !== 'inbox' || viewIdForQuery(S.search) !== FOR_ME_VIEW) return '';
   return inboxNotices().map((item) => {
-    const projectId = item.resource?.projectId || item.subject?.projectId;
+    const projectId = item.subject?.projectId;
     const organization = organizationById(item.organizationId);
     const where = (projectId && projectLabel({ projectId }))
       || (organization ? `<span class="task-project" title="${esc(organization.name)}"><span class="task-project-org">${esc(orgSlug(organization))}</span></span>` : '');
@@ -21747,10 +22006,6 @@ function inboxItemRoute(item) {
   if (item?.subject?.kind === 'storage') return `${globalRoute('organization', organizationById(item.organizationId))}#settings-storage`;
   if (item?.subject?.kind === 'compute') return `${globalRoute('organization', organizationById(item.organizationId))}#settings-plan`;
   if (item?.subject?.kind === 'service-limit') return `${installationRoute()}#installation-limits`;
-  if (item?.subject?.kind === 'avatar-authorization') {
-    const project = projectById(item.subject.projectId);
-    return project ? avatarRoute(project.id, item.subject.avatarId) : null;
-  }
   const project = item?.task && projectById(item.task.projectId);
   if (!project) return null;
   // A pending request waits in the task's conversation.
@@ -21986,7 +22241,7 @@ function profileView() {
           </form>
         </div>
         <div class="setting-row profile-github-row">
-          <span class="setting-label">GitHub ${policyTip('Tasks you create commit and open pull requests as your active GitHub account.')}</span>
+          <span class="setting-label">GitHub ${policyTip('Optional. Connected, the pull requests of tasks you create are opened as you on GitHub; otherwise tavya opens them for you.')}</span>
           ${profileGithubFields()}
         </div>
       </div>
@@ -22755,9 +23010,40 @@ function planMeter(used, limit) {
   const pct = Math.min(100, (Number(used) || 0) / limit * 100);
   return `<span class="plan-meter${pct >= 100 ? ' over' : pct >= 80 ? ' near' : ''}" role="meter" aria-valuemin="0" aria-valuemax="${esc(limit)}" aria-valuenow="${esc(Math.min(Number(used) || 0, limit))}"><i style="width:${pct.toFixed(1)}%"></i></span>`;
 }
-function planStepper(kind, count, title) {
+// `checkout`: the first pack beside a gifted plan, bought at checkout.
+function planStepper(kind, count, title, checkout = false) {
   return `<span class="pack-stepper" title="${esc(title)}"><button class="icon-btn billing-packs" data-kind="${kind}" data-packs="${count - 1}" aria-label="Remove a ${kind} pack" ${count > 0 ? '' : 'disabled'}>−</button>`
-    + `<b>${count}</b><button class="icon-btn billing-packs" data-kind="${kind}" data-packs="${count + 1}" aria-label="Add a ${kind} pack">+</button><span class="setting-muted">pack${count === 1 ? '' : 's'}</span></span>`;
+    + `<b>${count}</b><button class="icon-btn ${checkout ? 'billing-buy' : 'billing-packs'}" data-kind="${kind}" data-packs="${count + 1}" data-add aria-label="Add a ${kind} pack">+</button><span class="setting-muted">pack${count === 1 ? '' : 's'}</span></span>`;
+}
+function checkoutTermsTip() {
+  const d = S.launch?.checkoutDisclosures || {};
+  return policyTip([d.renewalDisclosure || 'Plans renew monthly until canceled.', d.cancellationDisclosure || 'Cancel online here before renewal.',
+    d.refundDisclosure || 'Payments are non-refundable except where the law requires.'].join(' '));
+}
+// A first purchase beside a gifted plan: what it costs, the policies, then checkout.
+function openPlanCheckoutDialog(title, price, order, post) {
+  const overlay = document.createElement('div'); overlay.className = 'modal-overlay';
+  overlay.innerHTML = `<div class="modal-card plan-checkout-dialog" role="dialog" aria-modal="true" aria-label="${esc(title)}">
+    <div class="modal-head"><b>${esc(title)}</b><button class="icon-btn plan-checkout-close" type="button" aria-label="Close">×</button></div>
+    <p class="plan-checkout-price">${esc(price)}</p>
+    <div class="plan-terms">${policyAcceptanceMarkup('checkout', 'checkout-policy-acceptance')} ${checkoutTermsTip()}</div>
+    <div class="modal-actions"><button class="btn plan-checkout-cancel" type="button">Cancel</button><button class="btn primary plan-checkout-go" type="button">Checkout</button></div>
+  </div>`;
+  const close = () => { document.removeEventListener('keydown', keydown); overlay.remove(); };
+  const keydown = (event) => { if (event.key === 'Escape') close(); };
+  overlay.addEventListener('click', (event) => { if (event.target === overlay) close(); });
+  overlay.querySelector('.plan-checkout-close').addEventListener('click', close);
+  overlay.querySelector('.plan-checkout-cancel').addEventListener('click', close);
+  overlay.querySelector('.plan-checkout-go').addEventListener('click', async (event) => {
+    const button = event.currentTarget; button.disabled = true;
+    try {
+      const acceptance = readPolicyAcceptance('checkout');
+      const result = await post('checkout', { ...order, acceptedPolicies: acceptance.accepted, policyVersions: acceptance.versions });
+      location.assign(result.url);
+    } catch (error) { toast(error.message, true); button.disabled = false; }
+  });
+  document.body.appendChild(overlay); document.addEventListener('keydown', keydown);
+  overlay.querySelector('#checkout-policy-acceptance').focus();
 }
 function planBillingMarkup(e, state) {
   if (!e) return '<span class="task-sub">Plan information is temporarily unavailable.</span>';
@@ -22769,20 +23055,32 @@ function planBillingMarkup(e, state) {
   const billed = state?.billedPlan || e.plan;
   const subscribed = Boolean(state) && billed !== 'free' && !['none', 'canceled', 'incomplete_expired'].includes(state.status);
   const paying = subscribed && PLAN_ACTIVE.includes(state.status);
+  // A subscription of packs alone, bought beside a gifted plan.
+  const packsOnly = Boolean(state) && billed === 'free' && PLAN_ACTIVE.includes(state.status);
+  const ending = packsOnly && state.cancelAtPeriodEnd;
   const owner = Boolean(state?.canManage);
   const busy = state?.pendingRequest;
   const disabled = !owner ? 'disabled title="Only an organization owner can change the plan"' : busy ? 'disabled title="Wait for the pending billing request"' : '';
+  // A gifted plan without a subscription buys its first packs (or Team) at checkout.
+  const checkoutOpen = Boolean(state?.providerConfigured && S.launch?.paidLaunch && S.launch?.ready);
+  const giftCheckout = Boolean(state?.gift) && !subscribed && !packsOnly && checkoutOpen;
+  const canPacks = owner && (paying || packsOnly || giftCheckout);
   // Header: the plan, its state when it isn't plainly active, and its price.
   const statusChip = state?.gift && !subscribed ? 'Gifted'
     : state?.cancelAtPeriodEnd && state.currentPeriodEnd ? `Ends ${day(state.currentPeriodEnd)}`
     : ({ past_due: 'Payment failed', unpaid: 'Unpaid', paused: 'Paused', incomplete: 'Checkout incomplete', trialing: 'Trial' })[state?.status] || '';
-  const price = (state?.gift && !subscribed) || e.plan === 'free' ? '' : `${planMoney(e.currentMonthlyPriceCents)}/month`;
-  const renews = paying && !state.cancelAtPeriodEnd && state.currentPeriodEnd ? ` · renews ${day(state.currentPeriodEnd)}` : '';
-  const change = paying && billed === 'individual' ? `<button class="btn sm billing-change" data-plan="team" ${disabled}>Upgrade to Team</button>`
+  const price = packsOnly ? `Packs ${planMoney(state.billedMonthlyPriceCents)}/month`
+    : (state?.gift && !subscribed) || e.plan === 'free' ? '' : `${planMoney(e.currentMonthlyPriceCents)}/month`;
+  const renews = (paying || packsOnly) && state.currentPeriodEnd
+    ? ending ? ` · end ${day(state.currentPeriodEnd)}` : !state.cancelAtPeriodEnd ? ` · renews ${day(state.currentPeriodEnd)}` : '' : '';
+  // More people need Team: a paid Individual changes plan, a gifted one buys Team.
+  const change = (paying && billed === 'individual') || (packsOnly && state.gift?.plan === 'individual')
+    ? `<button class="btn sm billing-change" data-plan="team" ${disabled}>Upgrade to Team</button>`
+    : giftCheckout && state.gift.plan === 'individual' ? `<button class="btn sm billing-buy" data-plan="team" ${disabled}>Upgrade to Team</button>`
     : paying && billed === 'team' ? `<button class="btn sm billing-change" data-plan="individual" ${disabled || (e.activeUsers > 1 ? 'disabled title="Remove other members first"' : '')}>Switch to Individual</button>` : '';
   const head = `<div class="plan-head"><span class="plan-name">${esc(e.planName)}</span>${statusChip ? `<span class="chip${state?.status === 'past_due' || state?.status === 'unpaid' ? ' failed' : ''}">${esc(statusChip)}</span>` : ''}
     <span class="setting-muted plan-price">${esc(price + renews)}</span><span class="label-row-fill"></span>
-    ${change}${subscribed ? `<button class="btn sm billing-portal" ${owner ? '' : disabled} title="Payment method and invoices">Billing</button>` : ''}
+    ${change}${subscribed || packsOnly ? `<button class="btn sm billing-portal" ${owner ? '' : disabled} title="Payment method and invoices">Billing</button>` : ''}
     ${paying && !state.cancelAtPeriodEnd ? `<button class="btn sm ghost billing-cancel" ${owner ? '' : disabled}>Cancel plan</button>` : ''}</div>`;
   // People.
   const members = Number(e.currentMemberCount ?? e.activeUsers ?? 0);
@@ -22802,10 +23100,10 @@ function planBillingMarkup(e, state) {
   const storageParts = [`${formatBytes(e.includedStorageBytes)} with ${e.planName}`,
     e.storagePacks ? `${formatBytes(e.storagePacks * e.storagePackBytes)} in ${plural(e.storagePacks, 'pack')}` : '',
     e.giftedStoragePacks ? `${formatBytes(e.giftedStoragePacks * e.storagePackBytes)} gifted` : ''].filter(Boolean).join(' + ');
-  const canStorage = paying && owner && state?.storagePack?.available;
+  const canStorage = canPacks && state?.storagePack?.available;
   const storageRow = `<div class="setting-row plan-limit" data-limit="storage"><span class="setting-label">Storage ${policyTip(`Project data, saved task workspaces and review files. ${storageParts}.`)}</span>
     <span class="setting-value">${planMeter(e.storageUsedBytes, e.storageQuotaBytes)}<span><b>${esc(formatBytes(e.storageUsedBytes ?? 0))}</b> <span class="setting-muted">of ${esc(formatBytes(e.storageQuotaBytes))}</span></span></span>
-    ${canStorage ? `<span class="setting-actions">${planStepper('storage', Number(state.storagePacks || 0), `Each pack adds ${formatBytes(storagePack.bytes)} for ${planMoney(storagePack.monthlyPriceCents)}/month`)}</span>` : ''}</div>`;
+    ${canStorage ? `<span class="setting-actions">${planStepper('storage', ending ? 0 : Number(state.storagePacks || 0), `Each pack adds ${formatBytes(storagePack.bytes)} for ${planMoney(storagePack.monthlyPriceCents)}/month`, giftCheckout)}</span>` : ''}</div>`;
   // Compute: only where the installation runs computers itself.
   let computeRow = '', topUpRow = '';
   if (e.compute) {
@@ -22819,11 +23117,11 @@ function planBillingMarkup(e, state) {
       e.giftedComputePacks ? `${planDollars(e.giftedComputePacks * e.computePackCreditMicros)} gifted` : '',
       topUp ? `${planDollars(topUp)} topped up, kept until used` : ''].filter(Boolean).join(' + ');
     const tip = `Cloud computers ${siteName()} runs for you (${providers}), at twice the provider’s price: a 2 CPU · 2 GB E2B computer is about $0.27 an hour. Resets ${day(e.compute.to)}. Computers on your own provider accounts aren’t counted. ${credit ? `${parts}.` : ''}${held ? ` ${planDollars(held)} is held for computers running now.` : ''}`;
-    const canCompute = paying && owner && state?.computePack?.available;
+    const canCompute = canPacks && state?.computePack?.available;
     computeRow = `<div class="setting-row plan-limit" data-limit="compute"><span class="setting-label">Compute ${policyTip(tip.trim())}</span>
       <span class="setting-value">${credit ? `${planMeter(Number(e.compute.usedMicros || 0) + held, credit)}<span><b>${esc(planDollars(e.compute.usedMicros))}</b> <span class="setting-muted">of ${esc(planDollars(credit))} this month</span></span>`
         : '<span class="setting-muted">With a paid plan</span>'}</span>
-      ${canCompute ? `<span class="setting-actions">${planStepper('compute', Number(state.computePacks || 0), `Each pack adds ${planDollars(pack.creditMicros)} of compute a month for ${planMoney(pack.monthlyPriceCents)}/month`)}</span>` : ''}</div>`;
+      ${canCompute ? `<span class="setting-actions">${planStepper('compute', ending ? 0 : Number(state.computePacks || 0), `Each pack adds ${planDollars(pack.creditMicros)} of compute a month for ${planMoney(pack.monthlyPriceCents)}/month`, giftCheckout)}</span>` : ''}</div>`;
     // Auto top-up: once offered (its billing terms approved), or while on.
     const auto = state?.autoTopUp;
     if (auto && (auto.offered || auto.enabled)) {
@@ -22840,18 +23138,18 @@ function planBillingMarkup(e, state) {
   // One-line notices, only when something needs attention.
   const notes = [];
   const returned = new URLSearchParams(location.search).get('billing');
-  if (returned === 'success' && !subscribed) notes.push(['ok', 'Payment received. The plan changes as soon as the payment provider confirms it.']);
+  if (returned === 'success' && !subscribed && !packsOnly) notes.push(['ok', 'Payment received. It applies as soon as the payment provider confirms it.']);
   if (['past_due', 'unpaid', 'paused', 'incomplete'].includes(state?.status)) {
     const grace = state.access === 'grace' && state.graceEndsAt ? ` The plan continues until ${day(state.graceEndsAt)}.` : '';
     notes.push(['danger', `${state.lastError || 'Update the payment method in Billing.'}${grace}`]);
   }
   if (busy) notes.push(['warn', `A billing change is waiting for confirmation. <button class="btn sm billing-reconcile" ${owner ? '' : 'disabled'}>Check</button>`]);
-  if (state?.pendingCheckout && !subscribed) notes.push(['', `A checkout is still open. <button class="btn sm billing-cancel-checkout" ${owner ? '' : 'disabled'}>Cancel it</button>`]);
+  if (state?.pendingCheckout && !subscribed && !packsOnly) notes.push(['', `A checkout is still open. <button class="btn sm billing-cancel-checkout" ${owner ? '' : 'disabled'}>Cancel it</button>`]);
   const noteHtml = notes.map(([tone, html]) => `<p class="plan-note ${tone}">${tone === 'warn' || tone === '' ? html : esc(html)}</p>`).join('');
   // Choosing a plan (Free, nothing gifted).
   let choices = '';
   if (state?.managed && !subscribed && !state.gift) {
-    const ready = state.providerConfigured && S.launch?.paidLaunch && S.launch?.ready;
+    const ready = checkoutOpen;
     const card = (plan) => {
       if (!plan) return '';
       const team = plan.id === 'team';
@@ -22863,13 +23161,12 @@ function planBillingMarkup(e, state) {
         ...(e.compute ? [per(`${dollars(plan.computeCreditMicros)} compute a month`, plan.additionalActiveUserComputeCreditMicros && dollars(plan.additionalActiveUserComputeCreditMicros))] : [])];
       return `<div class="plan-choice" data-plan="${esc(plan.id)}"><div class="plan-choice-head"><b>${esc(plan.name)}</b><span>${esc(planMoney(plan.monthlyBasePriceCents))}<small>/month${team ? ` + ${planMoney(plan.monthlyAdditionalActiveUserPriceCents)}/person` : ''}</small></span></div>
         <ul>${items.map((item) => `<li>${esc(item)}</li>`).join('')}</ul>
-        <button class="btn sm primary billing-checkout" data-plan="${esc(plan.id)}" ${ready && owner ? '' : `disabled title="${esc(!owner ? 'Only an organization owner can choose a plan' : 'Checkout isn’t open yet')}"`}>Choose ${esc(plan.name)}</button></div>`;
+        ${packsOnly ? `<button class="btn sm primary billing-change" data-plan="${esc(plan.id)}" ${disabled}>Choose ${esc(plan.name)}</button>`
+          : `<button class="btn sm primary billing-checkout" data-plan="${esc(plan.id)}" ${ready && owner ? '' : `disabled title="${esc(!owner ? 'Only an organization owner can choose a plan' : 'Checkout isn’t open yet')}"`}>Choose ${esc(plan.name)}</button>`}</div>`;
     };
-    const d = S.launch?.checkoutDisclosures || {};
-    const terms = [d.renewalDisclosure || 'Plans renew monthly until canceled.', d.cancellationDisclosure || 'Cancel online here before renewal.',
-      d.refundDisclosure || 'Payments are non-refundable except where the law requires.'].join(' ');
+    // Packs alone (a gift since removed) take a plan onto their subscription.
     choices = `<div class="plan-choices">${card(catalog.individual)}${card(catalog.team)}</div>
-      <div class="plan-terms">${policyAcceptanceMarkup('checkout', 'checkout-policy-acceptance')} ${policyTip(terms)}</div>`;
+      ${packsOnly ? '' : `<div class="plan-terms">${policyAcceptanceMarkup('checkout', 'checkout-policy-acceptance')} ${checkoutTermsTip()}</div>`}`;
   }
   // The operator's complimentary plan and packs.
   const gifts = state?.canGift ? `<details class="plan-operator"><summary>Gifts</summary><div class="setting-rows">
@@ -22884,7 +23181,7 @@ function planBillingMarkup(e, state) {
       <span class="setting-actions"><button class="btn sm billing-gift-packs" data-kind="compute">Save</button></span></div>
   </div></details>` : '';
   return `${head}${noteHtml}<div class="setting-rows ruled plan-limits">${peopleRow}${agentsRow}${storageRow}${computeRow}${topUpRow}</div>${choices}${gifts}
-    ${subscribed ? `<p class="plan-foot setting-muted">Separate from the cards agents pay with. <a href="/legal/billing" data-public>Billing terms</a></p>` : ''}`;
+    ${subscribed || packsOnly ? `<p class="plan-foot setting-muted">Separate from the cards agents pay with. <a href="/legal/billing" data-public>Billing terms</a></p>` : ''}`;
 }
 
 async function hydratePlanAndBilling(organizationId) {
@@ -22930,15 +23227,29 @@ async function hydratePlanAndBilling(organizationId) {
     toast(!result.reconciled ? 'Still unconfirmed. Nothing has been charged twice; contact billing support if it stays this way.'
       : result.applied === false ? 'Nothing was changed or charged. You can try again.' : 'Confirmed.', !result.reconciled);
   });
+  const packOffer = (kind) => {
+    const pack = kind === 'compute' ? state.computePack : state.storagePack;
+    return { pack, what: kind === 'compute' ? `${planDollars(pack.creditMicros)} of compute a month` : formatBytes(pack.bytes) };
+  };
   act('.billing-packs', async (button) => {
     const kind = button.dataset.kind;
     const next = Number(button.dataset.packs);
-    const current = Number(kind === 'compute' ? state.computePacks : state.storagePacks) || 0;
-    const pack = kind === 'compute' ? state.computePack : state.storagePack;
-    const what = kind === 'compute' ? `${planDollars(pack.creditMicros)} of compute a month` : formatBytes(pack.bytes);
-    if (!confirm(next > current ? `Add ${what} for ${planMoney(pack.monthlyPriceCents)}/month?` : `Remove ${what} (${planMoney(pack.monthlyPriceCents)}/month)?`)) return;
+    const { pack, what } = packOffer(kind);
+    if (!confirm('add' in button.dataset ? `Add ${what} for ${planMoney(pack.monthlyPriceCents)}/month?` : `Remove ${what} (${planMoney(pack.monthlyPriceCents)}/month)?`)) return;
     await post(`${kind}-packs`, { packs: next }); toast('Sent. It applies once payment is confirmed.');
   });
+  box.querySelectorAll('.billing-buy').forEach((button) => button.addEventListener('click', () => {
+    if (button.dataset.plan) {
+      const team = state.catalog.find((plan) => plan.id === button.dataset.plan);
+      openPlanCheckoutDialog(`Upgrade to ${team.name}`,
+        `${planMoney(team.monthlyBasePriceCents)}/month + ${planMoney(team.monthlyAdditionalActiveUserPriceCents)} per extra person`, { plan: team.id }, post);
+      return;
+    }
+    const kind = button.dataset.kind;
+    const { pack, what } = packOffer(kind);
+    openPlanCheckoutDialog(`Add a ${kind} pack`, `${what[0].toUpperCase()}${what.slice(1)} for ${planMoney(pack.monthlyPriceCents)}/month`,
+      { [`${kind}Packs`]: 1 }, post);
+  }));
   const autoTopUp = async (body) => {
     try { await post('auto-top-up', body); } catch (error) { toast(error.message, true); }
     if (box.isConnected) await reload();
@@ -23266,7 +23577,6 @@ function organizationView() {
     </div></div>
     <details class="card settings-disclosure" data-settings-access="organization" hidden><summary><b>Single sign-on &amp; directory sync</b><span>For companies with an identity provider</span></summary><p class="task-sub">OIDC signs employees in through your company; SCIM adds, removes and groups them. Use the values your identity administrator gives you.</p><div id="org-identity" data-unsaved>Loading…</div></details>
     <div class="settings-section-title" id="settings-experimental"><div>Experimental ${policyTip(`Optional features for this organization`)}</div></div>
-    ${AVATAR_RISK_NOTE}
     <div class="card"><div id="organization-avatar-settings">Loading…</div></div>
     <div id="org-misc-slot"></div>
     </div></div></div>`;
@@ -23648,8 +23958,10 @@ function repositoryCheckoutName(source) {
 }
 const commandLines = (text) => text.split('\n').map((line) => line.trim()).filter(Boolean);
 
-// New project: the name, the project's Git & GitHub, and folded Secrets and
-// Environment — what Project settings holds that a project needs to start.
+// New project: the name, the project's GitHub repository, and folded Secrets
+// and Environment — what Project settings holds that a project needs to start.
+// With GitHub connected, the project works on the repository named after it
+// (made when it does not exist yet), or on others chosen from the repository list.
 // Everything goes with Create, which opens the project's task list.
 // `folder` (from a folder row's "+") pre-fills the path so the new project
 // lands in that folder; the person can still retype it into any other place.
@@ -23661,7 +23973,8 @@ function newProject(options) {
   host.innerHTML = `<div class="modal-overlay"><form class="modal-card new-project-dialog" role="dialog" aria-modal="true" aria-labelledby="new-project-title">
     <div class="new-project-head"><b id="new-project-title">New project</b><button class="icon-btn new-project-close" type="button" aria-label="Close">×</button></div>
     <label class="form-row"><span>Project name ${policyTip('Use / to put it in folders, e.g. Clients/Website.')}</span><input id="new-project-name" aria-label="Project name" placeholder="e.g. Work/Clients/Website" required autocomplete="off" spellcheck="false" value="${esc(folder ? `${folder}/` : '')}"></label>
-    <div class="np-section"><div class="np-h">Git &amp; GitHub</div><div class="np-git"><div class="np-loading">Loading…</div></div></div>
+    <div class="np-default" hidden></div>
+    <div class="np-section np-repos"><div class="np-h">Git &amp; GitHub</div><div class="np-git"><div class="np-loading">Loading…</div></div></div>
     <details class="np-fold"><summary>Secrets</summary>
       <textarea class="np-secrets" aria-label="Secrets" rows="3" spellcheck="false" autocomplete="off" placeholder="KEY=value, one per line, or paste a .env"></textarea>
     </details>
@@ -23675,52 +23988,84 @@ function newProject(options) {
   </form></div>`;
   const $in = (selector) => host.querySelector(selector);
   const repos = [];
-  let github = { repositories: [], gitConnections: [], githubApp: { configured: false }, githubLoadError: null };
+  let github = { repositories: [], gitConnections: [], githubApp: { configured: false }, githubLoadError: null, githubLogin: undefined };
+  let useDefault = true;
+
+  // The repository named after the project: the organization's existing one,
+  // else one to create in its default account (when the person may create).
+  const defaultRepository = () => {
+    const { repositories, gitConnections, githubApp, githubLoadError, githubLogin } = github;
+    if (!organizationId || githubLoadError || !githubApp.configured || !gitConnections.length) return null;
+    const name = githubRepositoryName($in('#new-project-name').value);
+    const connection = defaultGitConnection(gitConnections, githubLogin);
+    const owned = (repository) => gitConnections.some((each) => each.accountLogin?.toLowerCase() === repository.owner.toLowerCase());
+    const existing = name ? (repositories.find((repository) => repository.name.toLowerCase() === name && repository.owner.toLowerCase() === connection.accountLogin.toLowerCase())
+      || repositories.find((repository) => repository.name.toLowerCase() === name && owned(repository))) : null;
+    if (existing) return { existing, slug: `${existing.owner}/${existing.name}` };
+    if (!githubApp.userAuthorized) return null;
+    return { create: { connectionId: connection.id, name }, owner: connection.accountLogin, slug: `${connection.accountLogin}/${name}` };
+  };
+  const usingDefault = () => useDefault && !!defaultRepository();
+  const projectRepositories = () => {
+    if (!usingDefault()) return [...repos];
+    const chosen = defaultRepository();
+    return chosen.existing ? [chosen.existing.sshUrl] : chosen.create.name ? [`git@github.com:${chosen.slug}.git`] : [];
+  };
+  const renderDefault = () => {
+    const row = $in('.np-default');
+    const chosen = defaultRepository();
+    row.hidden = !chosen;
+    $in('.np-repos').hidden = !!chosen && useDefault;
+    if (!chosen) return renderInstall();
+    const label = chosen.existing ? 'Work on existing GitHub repo' : 'Create new GitHub repo';
+    const slug = chosen.existing || chosen.create.name ? esc(chosen.slug) : `${esc(chosen.owner)}/<span class="np-default-blank">project-name</span>`;
+    if (row.querySelector('input')) { row.querySelector('.np-default-label').innerHTML = `${label} <code>${slug}</code>`; }
+    else {
+      // Two choices, one always picked: the repository named after the project, or others.
+      row.setAttribute('role', 'radiogroup');
+      row.setAttribute('aria-label', 'Repositories');
+      row.innerHTML = `<label class="np-default-row"><input type="radio" name="np-repo-mode" value="default" ${useDefault ? 'checked' : ''}><span class="np-default-label">${label} <code>${slug}</code></span></label>
+        <label class="np-default-row"><input type="radio" name="np-repo-mode" value="custom" ${useDefault ? '' : 'checked'}><span>Choose other repositories</span></label>`;
+      row.querySelectorAll('input').forEach((radio) => radio.addEventListener('change', () => {
+        useDefault = row.querySelector('input[value="default"]').checked;
+        renderDefault();
+        if (!useDefault) $in('#np-repo-input')?.focus();
+      }));
+    }
+    renderInstall();
+  };
 
   // Install commands are per repository, so their fields follow the list.
   const renderInstall = () => {
     const typed = Object.fromEntries([...host.querySelectorAll('[data-install]')].map((field) => [field.dataset.install, field.value]));
-    const names = [...new Set(repos.map(repositoryCheckoutName))];
+    const names = [...new Set(projectRepositories().map(repositoryCheckoutName))];
     $in('.np-install').innerHTML = names.map((name) => `<label class="form-row"><span>Install in ${esc(name)}</span><textarea data-install="${esc(name)}" aria-label="Install in ${esc(name)}" rows="2" spellcheck="false" placeholder="npm ci">${esc(typed[name] || '')}</textarea></label>`).join('');
   };
   const renderGit = () => {
     const box = $in('.np-git');
-    const typed = $in('#np-repo-input')?.value || '';
-    const { repositories, gitConnections, githubApp } = github;
-    const attached = new Set(repos.map((source) => repositorySourceView(source).key));
+    const { repositories, gitConnections, githubApp, githubLogin } = github;
     const { canAdd, placeholder } = repositoryInput(repositories);
-    const canCreate = githubApp.configured && gitConnections.length && githubApp.userAuthorized;
+    const canCreate = !!(githubApp.configured && gitConnections.length && githubApp.userAuthorized);
     const access = organizationId ? githubAccessView(github, organizationId, { error: 'np-github-error', connect: 'np-connect-github', refresh: 'np-refresh-github' }) : null;
     box.innerHTML = `<div class="git-repos">${repos.map((source) => gitRepoRow(source, repositories)).join('')}
-        <div class="git-repo-add"><input id="np-repo-input" list="np-repo-options" autocomplete="off" spellcheck="false" aria-label="Add a repository" placeholder="${esc(placeholder)}" ${canAdd ? '' : 'disabled'}>
-          <button class="btn sm" type="button" id="np-repo-add" ${canAdd ? '' : 'disabled'}>Add</button>
-          ${canCreate ? '<button class="btn sm" type="button" id="np-repo-new" aria-haspopup="dialog">New repository</button>' : ''}</div></div>
-      <datalist id="np-repo-options">${repositories.filter((repository) => !attached.has(`${repository.owner}/${repository.name}`.toLowerCase())).map((repository) => `<option value="${esc(repository.owner)}/${esc(repository.name)}"></option>`).join('')}</datalist>
+        <div class="git-repo-add">${repositoryPickerHtml('np-repo-input', { placeholder: canCreate ? 'Find or create a repository' : placeholder, disabled: !canAdd && !canCreate })}</div></div>
       ${access ? `<div class="setting-rows np-github"><div class="setting-row"><span class="setting-label">GitHub ${policyTip('The GitHub accounts this organization connected. Their repositories can be added above.')}</span><span class="setting-value">${access.value}</span><span class="setting-actions">${access.actions}</span></div></div>` : ''}`;
-    const input = $in('#np-repo-input');
-    input.value = typed;
     if (github.githubLoadError) paneError($in('#np-github-error'), github.githubLoadError, loadGithub);
     box.querySelectorAll('.git-repo').forEach((row) => row.querySelector('.git-repo-remove').addEventListener('click', () => {
       repos.splice(repos.indexOf(row.dataset.source), 1);
       renderGit(); renderInstall();
+      $in('#np-repo-input')?.focus();
     }));
-    const add = () => {
-      const value = input.value.trim();
-      if (!value) return input.focus();
-      const source = repositorySourceFor(value, repositories);
-      if (!source) return toast('Choose one of the organization’s GitHub repositories', true);
-      input.value = '';
-      if (!attached.has(repositorySourceView(source).key)) { repos.push(source); renderGit(); renderInstall(); }
-      $in('#np-repo-input').focus();
-    };
-    $in('#np-repo-add').addEventListener('click', add);
-    // Enter adds the repository; it does not create the project.
-    input.addEventListener('keydown', (event) => { if (event.key === 'Enter' && !event.isComposing) { event.preventDefault(); add(); } });
-    $in('#np-repo-new')?.addEventListener('click', (event) => openNewGithubRepositoryDialog(organizationId, gitConnections, event.currentTarget, async (repository) => {
-      github = { ...github, repositories: [...github.repositories, repository] };
-      repos.push(repository.sshUrl);
-      renderGit(); renderInstall();
-    }));
+    wireRepositoryPicker($in('#np-repo-input'), {
+      repositories, gitConnections, githubLogin, canCreate,
+      attachedKeys: () => new Set(repos.map((source) => repositorySourceView(source).key)),
+      add: (source) => { repos.push(source); renderGit(); renderInstall(); $in('#np-repo-input').focus(); },
+      create: canCreate ? ({ name, connectionId }, opener) => openNewGithubRepositoryDialog(organizationId, gitConnections, opener, async (repository) => {
+        github = { ...github, repositories: [...github.repositories, repository] };
+        repos.push(repository.sshUrl);
+        renderGit(); renderInstall();
+      }, { name, connectionId }) : null,
+    });
     $in('#np-connect-github')?.addEventListener('click', async () => { try { await connectOrganizationGithub(organizationId, loadGithub); } catch (error) { toast(error.message, true); } });
     $in('#np-refresh-github')?.addEventListener('click', async (event) => {
       const button = event.currentTarget; button.disabled = true;
@@ -23730,11 +24075,15 @@ function newProject(options) {
   };
   const loadGithub = async () => {
     if (organizationId) {
-      try { github = await loadOrganizationGithub(organizationId); }
-      catch (error) { github = { ...github, githubLoadError: error }; }
+      try {
+        const [loaded, accounts] = await Promise.all([loadOrganizationGithub(organizationId), api('/api/user/github-accounts').catch(() => null)]);
+        github = { ...loaded, githubLogin: (accounts?.accounts || []).find((account) => account.active)?.login };
+      } catch (error) { github = { ...github, githubLoadError: error }; }
     }
-    if (!closed) renderGit();
+    if (closed) return;
+    renderGit(); renderDefault();
   };
+  $in('#new-project-name').addEventListener('input', () => { if (github.githubApp.configured) renderDefault(); });
 
   const controller = new AbortController();
   let closed = false, creating = false;
@@ -23762,12 +24111,23 @@ function newProject(options) {
     button.disabled = true; button.textContent = 'Creating…';
     let project;
     try {
+      let sources = projectRepositories();
+      // The repository named after the project is made first: a name GitHub
+      // refuses stops here, before any project exists.
+      const chosen = usingDefault() ? defaultRepository() : null;
+      if (chosen?.create) {
+        const repository = await api(`/api/organizations/${encodeURIComponent(organizationId)}/repositories/create`, { method: 'POST',
+          body: JSON.stringify({ gitConnectionId: chosen.create.connectionId, name: chosen.create.name, private: true }), signal: controller.signal });
+        github = { ...github, repositories: [...github.repositories, repository] };
+        sources = [repository.sshUrl];
+      }
       // Create with an EMPTY config so every field inherits from global settings.
       const endpoint = organizationId ? `/api/organizations/${encodeURIComponent(organizationId)}/projects` : '/api/projects';
-      project = await api(endpoint, { method: 'POST', body: JSON.stringify({ name, config: {}, ...(repos.length ? { repos: [...repos] } : {}) }), signal: controller.signal });
+      project = await api(endpoint, { method: 'POST', body: JSON.stringify({ name, config: {}, ...(sources.length ? { repos: sources } : {}) }), signal: controller.signal });
     } catch (cause) {
       if (closed || cause?.name === 'AbortError') return;
-      error.textContent = cause.message;
+      if (usingDefault()) renderDefault(); // a repository made before the failure now reads "existing"
+      error.textContent = plainError(cause);
       error.hidden = false;
       button.disabled = false; button.textContent = 'Create project';
       $in('#new-project-name').focus();
@@ -25667,6 +26027,14 @@ async function wireTaskPayments(box, projectId, initial, taskId, organizationId)
       box.dispatchEvent(new Event('change', { bubbles: true }));
     }
     box._setCards = next => { cards = next.filter(c => c.status !== 'canceled' && c.status !== 'inactive'); paint(); };
+    // A host filling the whole policy in (forking an Avatār starts from its cards and budget).
+    box._setPolicy = (next) => {
+      selected = new Set(next.cardIds ?? cards.map(c => c.id));
+      if (next.currency && [...currency.options].some((option) => option.value === next.currency)) currency.value = next.currency;
+      step();
+      budget.value = next.budget == null ? '' : fromMinorUnits(next.budget, currency.value);
+      change();
+    };
     input.onfocus = () => expand(true);
     input.oninput = () => { paint(); expand(true); };
     box.querySelector('.payment-caret').onclick = () => { const open = menu.hidden; input.focus(); expand(open); };

@@ -252,23 +252,26 @@ describe('Project settings', () => {
     await ui.close();
   });
 
-  it('opens GitHub repository creation from a button beside Add', async () => {
+  it('offers “+ New repo” in the repository combobox, opening repository creation with the typed name', async () => {
     const ui = await settings({ api: ({ method, path: route }) => method !== 'GET' ? undefined
       : route.endsWith('/github/app') ? { configured: true, userAuthorized: true }
         : route.endsWith('/git-connections') ? [{ id: 'gc', provider: 'github', accountLogin: 'octo' }] : undefined });
-    const add = ui.page.getByRole('button', { name: 'Add', exact: true });
-    const create = ui.page.getByRole('button', { name: 'New repository' });
-    await create.waitFor();
-    expect(await add.evaluate((element, other) => element.parentElement === other!.parentElement
-      && !!(element.compareDocumentPosition(other!) & (globalThis as any).Node.DOCUMENT_POSITION_FOLLOWING), await create.elementHandle())).toBe(true);
-    await create.click();
+    const picker = ui.page.getByRole('combobox', { name: 'Add a repository' });
+    await picker.waitFor();
+    expect(await ui.page.getByRole('button', { name: 'New repository' }).count()).toBe(0);
+    expect(await picker.getAttribute('placeholder')).toBe('Find or create a repository');
+    await picker.fill('widgets');
+    const options = ui.page.getByRole('listbox', { name: 'Repositories' }).getByRole('option');
+    await expect.poll(() => options.allInnerTexts()).toEqual(['New repo octo/widgets']);
+    await picker.press('Enter');
     const dialog = ui.page.getByRole('dialog');
     expect(await dialog.getAttribute('aria-modal')).toBe('true');
     const text = await dialog.innerText();
     for (const label of ['GitHub account', 'Repository name', 'Description', 'Private repository']) expect(text).toContain(label);
+    expect(await dialog.getByRole('textbox', { name: 'Repository name' }).inputValue()).toBe('widgets');
     await ui.page.keyboard.press('Escape');
     await dialog.waitFor({ state: 'detached' });
-    expect(await create.evaluate((element) => element === (globalThis as any).document.activeElement)).toBe(true);
+    expect(await picker.evaluate((element) => element === (globalThis as any).document.activeElement)).toBe(true);
     await ui.close();
   });
 
@@ -280,12 +283,12 @@ describe('Project settings', () => {
         : method === 'GET' && route.endsWith('/repositories') ? [fork]
           : method === 'POST' && route.endsWith('/github/refresh') ? { repositories: [fork], count: 1 }
             : method === 'POST' && route.endsWith('/repositories') ? { ok: true } : undefined });
-    const open = ui.page.getByRole('button', { name: 'Fork a repository' });
-    await open.waitFor();
-    expect(await open.getAttribute('title')).toMatch(/repository you don't own/);
-    const option = ui.page.locator('#project-repository-options option').first();
-    expect([await option.getAttribute('value'), await option.textContent()]).toEqual(['octo/widgets', '→ acme/widgets']);
-    await open.click();
+    const picker = ui.page.getByRole('combobox', { name: 'Add a repository' });
+    await picker.focus();
+    const options = ui.page.getByRole('listbox', { name: 'Repositories' }).getByRole('option');
+    // The fork names where its pull requests go; forking another is the last choice.
+    await expect.poll(() => options.allTextContents()).toEqual(['octo/widgets→ acme/widgets', 'New repo…', 'Fork a repository…']);
+    await options.last().click();
     const dialog = ui.page.getByRole('dialog', { name: 'Fork a repository' });
     await dialog.getByLabel('Repository').fill('https://github.com/Acme/widgets');
     expect(await dialog.getByRole('link', { name: /Fork on GitHub/ }).getAttribute('href')).toBe('https://github.com/Acme/widgets/fork');
@@ -305,9 +308,11 @@ describe('Project settings', () => {
           : method === 'GET' && route.endsWith('/repositories') ? [fork]
             : method === 'POST' && route.endsWith('/github/refresh') ? { repositories: [fork], count: 1 }
               : method === 'POST' && route.endsWith('/repositories') ? { ok: true } : undefined });
-    await ui.page.getByRole('button', { name: 'Fork a repository' }).click();
+    // Typing someone else's repository offers to fork it, with its name filled in.
+    await ui.page.getByRole('combobox', { name: 'Add a repository' }).fill('acme/secret');
+    await ui.page.getByRole('option', { name: 'Fork acme/secret…' }).click();
     const dialog = ui.page.getByRole('dialog', { name: 'Fork a repository' });
-    await dialog.locator('#project-fork-source').fill('acme/secret');
+    expect(await dialog.locator('#project-fork-source').inputValue()).toBe('acme/secret');
     await dialog.getByRole('button', { name: 'Attach fork' }).click();
     const note = dialog.locator('.fork-private-note');
     await note.waitFor();
@@ -358,8 +363,9 @@ describe('Project settings', () => {
     expect(await rows.first().locator('a').getAttribute('href')).toBe('https://github.com/acme/web');
     expect(await rows.first().locator('a').getAttribute('title')).toBe('git@github.com:acme/web.git');
     // Only repositories not yet in the project are offered.
-    expect(await ui.page.locator('#project-repository-options option').evaluateAll((options) =>
-      options.map((option) => (option as any).value))).toEqual(['acme/api']);
+    await ui.page.locator('#project-repository-input').focus();
+    await expect.poll(() => ui.page.getByRole('listbox', { name: 'Repositories' }).getByRole('option').allInnerTexts())
+      .toEqual(['acme/api', 'New repo…', 'Fork a repository…']);
     expect(await ui.page.locator('#project-github-access').innerText()).toContain('acme');
     expect(await ui.page.locator('#project-github-identity').innerText()).toMatch(/You\s*·\s*octo/);
 
@@ -374,7 +380,7 @@ describe('Project settings', () => {
     ]);
     // A repository already in the project is not added twice.
     await ui.page.locator('#project-repository-input').fill('git@github.com:acme/web.git');
-    await ui.page.getByRole('button', { name: 'Add', exact: true }).click();
+    await ui.page.keyboard.press('Enter');
     await expect.poll(() => ui.toasts()).toContain('Already added');
     expect(ui.calls.filter((call) => call.method === 'PUT')).toHaveLength(2);
     await ui.close();

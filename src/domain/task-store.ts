@@ -5,9 +5,9 @@ import type { EventTrigger, TaskTrigger } from './triggers.js';
  * The task store (wiki features/events-and-automations): ready-made tasks.
  * There is no other noun: an ordinary one runs as a task of the project the
  * moment it is chosen; a repeatable one (an automation: a task plus its
- * trigger) installs as an ordinary series, which the task form edits and
- * deletes like any other. Either way `params.template` remembers where it came
- * from. They ship with the platform.
+ * trigger) installs as an ordinary series, as often as asked, which the task
+ * form edits and deletes like any other. Either way `params.template`
+ * remembers where it came from. They ship with the platform.
  */
 export interface StoreTask {
   id: string;
@@ -111,6 +111,15 @@ export const STORE_TASKS: readonly StoreTask[] = [
 /** Whether choosing it installs a series rather than running a task. */
 export function storeTaskRepeatable(template: Pick<StoreTask, 'task'>): boolean {
   return template.task.params.repeatable === true;
+}
+
+/** Whether a task is one the project took from store task `template`: a
+ *  repeatable one's armed series, an ordinary one's runs. A draft is not taken
+ *  yet, and a series' runs belong to their series. */
+export function takenFromStore(task: { params?: Record<string, unknown> }, template: Pick<StoreTask, 'id' | 'task'>): boolean {
+  const params = task.params ?? {};
+  if (params.template !== template.id || params.runOf || params.draft) return false;
+  return !storeTaskRepeatable(template) || params.repeatable === true;
 }
 
 /** What a store task needs, so the store can say what is missing. */

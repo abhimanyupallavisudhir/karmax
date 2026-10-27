@@ -84,17 +84,16 @@ async function main() {
   assert.equal(requests.length, 2, 'blank scalar must not silently save an empty patch');
   assert.equal(form.root.dataset.saveState, 'dirty');
 
-  // Two Avatars with the same runtime are still distinct parameter values.
-  context.readResume = () => undefined;
-  state.avatars = [{ id: 'one', runtime: { provider: 'codex', model: 'same' } }, { id: 'two', runtime: { provider: 'codex', model: 'same' } }];
-  const avatar = { value: 'one' };
-  const agent = { querySelector: (selector) => ({ '.af-avatar': avatar, '.agent-controls': {} })[selector] };
+  // Forking two Avatars with the same runtime are still distinct parameter values.
+  let source = 'one';
+  context.readResume = () => ({ taskId: source, role: 'do' });
+  const agent = { querySelector: (selector) => ({ '.agent-controls': {} })[selector] };
   const root = { querySelector: () => agent };
   const fields = [{ name: 'agent:do', role: 'do', type: 'agent' }];
   const before = context.collectParamEdits(root, fields);
-  avatar.value = 'two';
+  source = 'two';
   const after = context.collectParamEdits(root, fields);
-  assert.equal(after['agent:do'].avatarId, 'two');
+  assert.equal(after['agent:do'].resumeFrom.taskId, 'two');
   assert.equal(context.paramDirtyNames(before, after, fields).length, 1);
   const controls = { flag: { checked: false }, limit: { value: '2' }, lines: { value: 'one\ntwo' }, mode: { value: 'first' } };
   const plainFields = [{ name: 'flag', type: 'boolean' }, { name: 'limit', type: 'number' }, { name: 'lines', type: 'list' }, { name: 'mode', type: 'select' }];

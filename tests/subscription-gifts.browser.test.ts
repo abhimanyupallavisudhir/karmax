@@ -67,6 +67,8 @@ it('gifts, changes, and removes plans from the organization billing screen throu
     await expect.poll(async () => (await store.organizationEntitlements(recipient.id)).giftedComputePacks).toBe(1);
     expect((await store.organizationEntitlements(recipient.id)).computeCreditMicros).toBe(13_000_000 + 10_000_000);
     expect(provider.calls).toHaveLength(0);
+    // The card re-renders after each save; typing before that is thrown away.
+    await expect.poll(() => plan.locator('.billing-gift-packs[data-kind="compute"]').isEnabled()).toBe(true);
     if (process.env.KARMAX_REVIEW_SCREENSHOT) await page.locator('#org-plan').screenshot({ path: process.env.KARMAX_REVIEW_SCREENSHOT });
     await page.getByRole('spinbutton', { name: 'Gifted storage packs' }).fill('0');
     await plan.locator('.billing-gift-packs[data-kind="storage"]').click();

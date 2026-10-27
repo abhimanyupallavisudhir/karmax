@@ -94,20 +94,26 @@ const assert = require('node:assert/strict');
     await page.waitForFunction(() => !document.querySelector('.af-resume-reuse-model').checked);
     assert.deepEqual(await read(), { ...original, ...pointer('confirm') }, 'missing metadata leaves the selection intact');
     assert.match(await page.locator('.toast.err').last().innerText(), /unavailable/);
-    // An Avatar otherwise overrides manual model fields when serialized.
+    // Forking an Avatar one may call acts with its authorization: the agent's
+    // Authorization row says so, and stops saying so once the fork is cleared.
     await page.evaluate(({ original }) => {
       const t = window.forkTest;
-      t.S.avatars = [{ id: 'avatar', name: 'Writer', ownerUserId: 'owner', callable: true, effectiveEnabled: true, runtime: original }];
-      document.querySelector('#app').innerHTML = t.renderAgentField({ role: 'do' }, { ...original, avatarId: 'avatar' }, {});
+      t.S.avatars = [{ id: 'source', name: 'Writer', ownerUserId: 'owner', callable: true }];
+      document.querySelector('#app').innerHTML = t.renderAgentField({ role: 'responder' }, original, {},
+        { instructions: true, authority: { label: 'Agent' } });
       t.wireAgentBox(document.querySelector('.agent-field'));
     }, { original });
+    const authority = page.locator('.agent-authority');
+    assert.equal(await page.locator('.af-avatar').count(), 0, 'no separate Avatar selector');
     await page.locator('.af-resume-enabled').check();
     await pick();
-    await reuse.check();
-    assert.deepEqual(await read(), { ...copied, ...pointer('do') }, 'reuse takes precedence over a destination Avatar');
-    assert.equal(await page.locator('.agent-controls').isVisible(), true);
-    await reuse.uncheck();
-    assert.deepEqual(await read(), { ...original, avatarId: 'avatar', ...pointer('do') }, 'unchecking restores the Avatar');
+    assert.equal(await authority.evaluate((el) => el.classList.contains('acts-for-avatar')), true);
+    assert.match(await authority.locator('.aa-summary').innerText(), /Writer/);
+    assert.match(await page.locator('.af-resume-chosen').innerText(), /Avatār/);
+    assert.deepEqual(await read(), { ...original, ...pointer('do') });
+    await page.locator('.af-resume-clear').click();
+    assert.equal(await authority.evaluate((el) => el.classList.contains('acts-for-avatar')), false);
+    assert.match(await authority.locator('.aa-summary').innerText(), /Same as Agent/);
     assert.deepEqual(errors, []);
     console.log('PASS: model reuse copies and serializes exact role settings; undo, missing values, manual edits, and stale responses');
   } finally { await browser.close(); }
