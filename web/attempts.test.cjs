@@ -51,8 +51,9 @@ global.attentionChip = () => '';
 global.projectLabel = () => '';
 global.taskHasUnreadAsk = () => false;
 global.markTaskAsksRead = () => {};
-for (const name of ['rowTime', 'fmtWhen', 'rowWhen', 'awaitingApproval', 'taskRow', 'taskFormTitle']) eval(extractFn(name));
+for (const name of ['rowTime', 'fmtWhen', 'rowWhen', 'awaitingApproval', 'restingAvatar', 'taskRow', 'taskFormTitle']) eval(extractFn(name));
 global.awaitingApprovalChip = eval(src.match(/const awaitingApprovalChip = ('[^\n]*');/)[1]);
+global.avatarChip = eval(src.match(/const avatarChip = ('[^\n]*');/)[1]);
 
 let pass = 0, fail = 0;
 const ok = (condition, message) => {

@@ -70,41 +70,49 @@ export interface AuthorizationSelection {
   projectIds?: string[];
 }
 
-/** A durable, user-authored autonomous principal. Avatars are project-owned for
- * discovery/routing, while their authority is an explicit delegation captured
- * at creation or edit time. `roles=[]` means every workflow role; callableBy
- * uses the same stable user/team selectors as task routing plus `@project`. */
+/** A task's Avatar setting (`params.avatar`): its future forks act with its
+ * authorization (level, projects, vault credentials, GitHub account) without
+ * anyone granting it again. `callableBy` takes the audience selectors of task
+ * routing (`@project`, `@maintainers`, `user:<id>`, `@team:<slug>`…); the task's
+ * creator may always call it. `forksMayBeAvatars` lets a fork acting with this
+ * authority be marked Avatar itself. A fork may ask for less than it holds. */
+export interface AvatarSetting {
+  callableBy: string[];
+  forksMayBeAvatars?: boolean;
+  /** The roles its forks may play (`do`, `responder`, `confirm`, `agent`);
+   * absent: any. */
+  roles?: string[];
+}
+
+/** An Avatar as routing and authority read it: a view of a task whose params
+ * carry an `AvatarSetting` (src/platform/avatars.ts). Its id is the task's. */
 export interface Avatar {
   id: string;
+  num?: number;
   organizationId: string;
   projectId: string;
-  ownerUserId: string;
+  /** The human who created the task; their live grants back its authority. */
+  ownerUserId?: string;
+  /** The task's title. */
   name: string;
-  purpose?: string;
+  /** The task's prompt: what a fork of a never-run Avatar starts from. */
   prompt: string;
-  promptVersion: number;
-  enabled: boolean;
-  authorityMode: 'full' | 'restricted';
+  callableBy: string[];
+  forksMayBeAvatars: boolean;
+  /** The roles its forks may play; empty: any. */
+  roles: string[];
   authorization: AuthorizationSelection & {
     profileId: string;
     capabilities: string[];
     organizationId?: string;
-    /** Principal whose live grant backs this delegation. Legacy Avatars fall
-     * back to their owner so revocation behavior remains unchanged. */
+    /** Principal whose live grant backs this delegation: the creator, or the
+     * Avatar this one is itself a fork of (`avatar:<task id>`). */
     principal?: string;
   };
   credentialPolicies?: Record<string, { use?: 'auto' | 'ask' | 'never'; reveal?: 'auto' | 'ask' | 'never' }>;
   githubAccountId?: string;
-  callableBy: string[];
-  roles: string[];
-  runtime: {
-    provider: Provider;
-    model?: string;
-    effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
-  };
-  createdAt: number;
-  updatedAt: number;
-  deletedAt?: number;
+  /** The agent the task configures (its fork's default runtime). */
+  runtime?: { provider: Provider; model?: string; effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' };
 }
 
 export interface AvatarAvailability {
@@ -247,8 +255,7 @@ export interface InboxItem {
   readAt?: number;
   /** Resource-backed asks use the inbox without manufacturing a task merely to
    * carry a notification. */
-  subject?: { kind: 'avatar-authorization'; avatarId: string; projectId: string; requestId: string }
-    | CredentialNotice | ComputeNotice;
+  subject?: CredentialNotice | ComputeNotice;
 }
 
 /** An organization's managed compute credit is spent (src/world/compute-notices.ts). */
@@ -1279,6 +1286,10 @@ export interface TaskParams {
   repeatable?: boolean;
   /** Set on a run: the id of the series (repeatable template) it was spawned from. */
   runOf?: string;
+  /** The task store entry it was taken from (src/domain/task-store.ts). Kept
+   *  when the form replaces the params: the store counts the project's series
+   *  and runs by it. */
+  template?: string;
   /**
    * Human-assigned importance for organization/sorting (task search & views). A small
    * ordinal, 0=none … 4=urgent (see PRIORITIES). Purely organizational — never sent to
@@ -1680,13 +1691,6 @@ export interface AgentSpec {
   /** MCP IDs, browser IDs, or composio:conn_… account references. Omission inherits; [] clears the selection. */
   mcpConnections?: string[];
   provider: Provider;
-  /** Select a durable Avatar. Provider/model remain snapshotted for replay and
-   * display, but current turns resolve the owner-controlled prompt + authority
-   * from this id and refuse execution when it has been disabled. */
-  avatarId?: string;
-  /** Internal invocation purpose when an Avatar is answering an authorization
-   * or response request rather than filling the workflow role itself. */
-  avatarPurpose?: 'authorize' | 'respond';
   /** @deprecated Replay-only. Routing comes from the model id + Credentials policy. */
   modelProvider?: string;
   /**

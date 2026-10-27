@@ -58,7 +58,7 @@ global.S = {
 };
 
 global.DEFAULT_EXPLANATION_SETTINGS = { model: 'google/gemini-3.6-flash' };
-for (const fn of ['safeHref', 'attachmentUrl', 'formatAttachmentBytes', 'renderMessageFiles', 'conversationTextKey', 'conversationEntries', 'conversationTime', 'conversationTimeHtml', 'worldFileTarget', 'fileTargetQuery', 'worldFileHref', 'worldWikiHref', 'worldFileAnchor', 'wikiRoute', 'decodeMarkdownAttribute', 'renderConversationText', 'annotateWorldFileLinks', 'renderAgentMessageBody', 'renderWaitDetail', 'explanationModelLabel', 'explanationsEnabled', 'texToggleHtml', 'explainMessageAffordance', 'sharedConversation', 'participantLabelOf', 'messageOrigin', 'messageSpeaker', 'recipientLabel', 'recipientsHtml', 'renderConversationEntry']) eval(extractFn(fn));
+for (const fn of ['safeHref', 'attachmentUrl', 'formatAttachmentBytes', 'renderMessageFiles', 'conversationTextKey', 'conversationEntries', 'conversationTime', 'conversationTimeHtml', 'worldFileTarget', 'fileTargetQuery', 'worldFileHref', 'worldWikiHref', 'worldFileAnchor', 'wikiRoute', 'decodeMarkdownAttribute', 'renderConversationText', 'annotateWorldFileLinks', 'renderAgentMessageBody', 'renderWaitDetail', 'explanationModelLabel', 'explanationsEnabled', 'texToggleHtml', 'hasMath', 'plainError', 'permissionSentence', 'plainTaskError', 'taskErrorHtml', 'explainMessageAffordance', 'sharedConversation', 'participantLabelOf', 'messageOrigin', 'messageSpeaker', 'recipientLabel', 'recipientsHtml', 'renderConversationEntry']) eval(extractFn(fn));
 
 let pass = 0;
 let fail = 0;
@@ -86,7 +86,7 @@ ok((html.match(/All done/g) || []).length === 1, 'assistant final text is shown 
 ok(!html.includes('need not text-match'), 'the linked workflow transcript copy is suppressed by provider identity');
 ok(html.includes('Explain this with gemini-3.6-flash'), 'agent messages offer the effective explanation model');
 S.meta.explanationsEnabled = false;
-const unexplained = explainMessageAffordance({ sourceKey: 'activity:4', conversationRole: 'do' }, S.view);
+const unexplained = explainMessageAffordance({ sourceKey: 'activity:4', conversationRole: 'do', activity: { title: 'Area: $x^2$' } }, S.view);
 ok(!unexplained.includes('explain-run') && !unexplained.includes('explain-more') && unexplained.includes('tex-toggle'),
   'with explanations off, messages keep the TeX toggle but offer no Explain button');
 S.meta.explanationsEnabled = true;
@@ -249,6 +249,7 @@ eval(extractFn('liveOutputFor'));
 eval(extractFn('forkBranchDefaults'));
 eval(extractFn('taskRecord'));
 eval(`async ${extractFn('loadTaskRecord')}`);
+eval(`async ${extractFn('forkTaskAgent')}`);
 eval(extractFn('wireCheckinSidebar'));
 eval(extractFn('wireStopAgents'));
 global.conversationApprovalRequests = () => '<div>Pending approvals</div>';
@@ -370,7 +371,7 @@ ok(!conversationPane(requestView, { role: 'merge', messages: [] }).includes('inp
 
 // The control is present beside Explain and reflects the global preference.
 global.markdownEnabled = () => true;
-const mathEntry = { sourceKey: 'message:math', conversationRole: 'merge' };
+const mathEntry = { sourceKey: 'message:math', conversationRole: 'merge', message: { text: 'Area: $x^2$' } };
 ok(explainMessageAffordance(mathEntry, S.view).includes('aria-pressed="true"'), 'math toggle reflects enabled preference');
 mathPreference = false;
 ok(explainMessageAffordance(mathEntry, S.view).includes('aria-pressed="false"'), 'math toggle reflects disabled preference');

@@ -269,6 +269,12 @@ export class GithubPrApi {
     if (options.actor) this.actor = options.actor;
   }
 
+  /** The merge method closest to a merge commit that the repository allows. */
+  async mergeMethod(slug: string): Promise<'merge' | 'squash' | 'rebase'> {
+    const value = await this.request<any>(`/repos/${repositorySlug(slug)}`);
+    return value?.allow_merge_commit !== false ? 'merge' : value?.allow_squash_merge !== false ? 'squash' : 'rebase';
+  }
+
   async get(slug: string, number: number): Promise<GithubPullRequest> {
     return normalize(await this.request(`/repos/${repositorySlug(slug)}/pulls/${number}`));
   }

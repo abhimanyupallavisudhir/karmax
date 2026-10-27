@@ -1,28 +1,125 @@
-import * as __asyncCollections from '../util/async-collections.js';
-import type { AgentProfile, AgentRole, AgentSpec, Avatar } from '../domain/types.js';
+import type { AgentSpec, Avatar, AvatarSetting, TaskRecord } from '../domain/types.js';
 import type { Store } from '../store/db.js';
-import { agentRoleDef } from '../contrib/manifests.js';
-import { applyAgentSpec } from '../agent/profiles.js';
 import { attenuate, type Capability } from './capabilities.js';
 import type { AuthorizationService } from './authorization.js';
+import { ValidationError } from './errors.js';
 
-export class AvatarUnavailableError extends Error {
-  code = 'avatar_unavailable';
-  status = 409;
-}
+/**
+ * An Avatar is a task marked Avatar (`params.avatar`, wiki features/avatars):
+ * its future forks — a task's main agent, a Responder, a Reviewer, an agent
+ * called in with @ — act with its authorization without anyone granting it
+ * again, as long as whoever made the fork may call it. Nothing else about it
+ * differs from a task: its instructions are its conversation (or, never run,
+ * its prompt), and editing it edits the task.
+ */
 
 export function avatarPrincipal(id: string): string {
   return `avatar:${id}`;
 }
 
-export async function avatarEnabled(store: Store, avatar: Avatar): Promise<boolean> {
-  if (!avatar.enabled || avatar.deletedAt) return false;
-  const availability = (await store.avatarAvailability(avatar.projectId));
-  return availability.effective;
+/** Who may call an Avatar when its setting names nobody. */
+export const DEFAULT_AVATAR_CALLERS = ['@project'];
+
+/** The roles a fork can play: the main agent, a Responder (or an escalation
+ * answered), a Reviewer (or an approval decided), an agent called in with @. */
+export const AVATAR_ROLES = ['do', 'responder', 'confirm', 'agent'] as const;
+export type AvatarRole = typeof AVATAR_ROLES[number];
+
+/** How each role reads in a sentence ("can't be forked as a Reviewer"). */
+export const AVATAR_ROLE_LABELS: Record<AvatarRole, string> = {
+  do: 'a task’s agent', responder: 'a Responder', confirm: 'a Reviewer', agent: 'an agent called in with @',
+};
+
+/** The Avatar role a workflow role or participant key plays. */
+export function avatarRoleOf(role: string): AvatarRole {
+  if (role === 'responder') return 'responder';
+  if (role.startsWith('confirm')) return 'confirm';
+  if (role.startsWith('agent')) return 'agent';
+  return 'do';
 }
 
-/** Resolve an Avatar delegation through its live backing principal. Avatar-backed
- * approvals may form a short chain; cycles, deletion, or disablement fail closed. */
+/** Whether an Avatar may be forked to play `role` (none listed: any). */
+export function avatarAllows(avatar: Pick<Avatar, 'roles'>, role: string): boolean {
+  return !avatar.roles?.length || avatar.roles.includes(avatarRoleOf(role));
+}
+
+/** The Avatar setting stored on a task, or undefined for an ordinary task. */
+export function avatarSetting(params: Record<string, unknown> | undefined): AvatarSetting | undefined {
+  const raw = params?.avatar;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const record = raw as Record<string, unknown>;
+  const callableBy = Array.isArray(record.callableBy)
+    ? record.callableBy.map(String).map((value) => value.trim()).filter(Boolean) : [];
+  const roles = Array.isArray(record.roles)
+    ? AVATAR_ROLES.filter((role) => (record.roles as unknown[]).includes(role)) : [];
+  return { callableBy: callableBy.length ? [...new Set(callableBy)] : [...DEFAULT_AVATAR_CALLERS],
+    ...(record.forksMayBeAvatars === true ? { forksMayBeAvatars: true } : {}),
+    // Every role, or none named, is no restriction.
+    ...(roles.length && roles.length < AVATAR_ROLES.length ? { roles } : {}) };
+}
+
+const CALLER = /^(@project|@all|@owners|@creator|@maintainers|@admins|@superadmins|user:[^\s,]+|@team:[^\s,]+|team:[^\s,]+)$/;
+
+/** A task-form `avatar` value, normalized; `false`/`null` clears it. Throws on
+ * an unknown caller selector. */
+export function normalizeAvatarSetting(raw: unknown): AvatarSetting | null {
+  if (raw === undefined || raw === null || raw === false) return null;
+  if (raw === true) return { callableBy: [...DEFAULT_AVATAR_CALLERS] };
+  if (typeof raw !== 'object' || Array.isArray(raw)) throw new ValidationError('avatar must be { callableBy?, forksMayBeAvatars?, roles? }');
+  const record = raw as Record<string, unknown>;
+  if (record.callableBy !== undefined && !Array.isArray(record.callableBy))
+    throw new ValidationError('avatar.callableBy must be a list of audience selectors');
+  for (const selector of (record.callableBy as unknown[] | undefined) ?? []) {
+    if (typeof selector !== 'string' || !CALLER.test(selector.trim()))
+      throw new ValidationError(`avatar.callableBy: ${JSON.stringify(selector)} is not a person, team or group selector`);
+  }
+  if (record.roles !== undefined && (!Array.isArray(record.roles) || record.roles.some((role) => !AVATAR_ROLES.includes(role as AvatarRole))))
+    throw new ValidationError(`avatar.roles must list roles among ${AVATAR_ROLES.join(', ')}`);
+  return avatarSetting({ avatar: record })!;
+}
+
+/** The Avatar a task is, read off the task itself. */
+export async function avatarOfTask(store: Store, task: TaskRecord): Promise<Avatar | undefined> {
+  const setting = avatarSetting(task.params);
+  if (!setting) return undefined;
+  const organizationId = (await store.getProject(task.projectId))?.organizationId ?? 'org_personal';
+  const stored = (task.params._authorization ?? {}) as Partial<Avatar['authorization']> & { credentialPolicies?: Avatar['credentialPolicies'] };
+  const agent = task.params['agent:do'] as Partial<AgentSpec> | undefined;
+  return {
+    id: task.id,
+    ...(task.num != null ? { num: task.num } : {}),
+    organizationId,
+    projectId: task.projectId,
+    ownerUserId: (await store.taskCreatorUserId(task.id)),
+    name: task.title,
+    prompt: String(task.params.prompt ?? ''),
+    callableBy: setting.callableBy,
+    forksMayBeAvatars: !!setting.forksMayBeAvatars,
+    roles: setting.roles ?? [],
+    authorization: {
+      level: stored.level ?? stored.profileId ?? 'developer',
+      scope: stored.scope ?? 'projects',
+      ...((stored.scope ?? 'projects') === 'projects' ? { projectIds: stored.projectIds?.length ? stored.projectIds : [task.projectId] } : {}),
+      profileId: stored.profileId ?? stored.level ?? 'developer',
+      capabilities: stored.capabilities ?? [],
+      ...(stored.organizationId ? { organizationId: stored.organizationId } : {}),
+      ...(stored.principal ? { principal: stored.principal } : {}),
+    },
+    ...(stored.credentialPolicies ? { credentialPolicies: stored.credentialPolicies } : {}),
+    ...(typeof task.params._githubAccountId === 'string' ? { githubAccountId: task.params._githubAccountId } : {}),
+    ...(agent?.provider ? { runtime: { provider: agent.provider,
+      ...(agent.model ? { model: agent.model } : {}), ...(agent.effort ? { effort: agent.effort } : {}) } } : {}),
+  };
+}
+
+export async function avatarEnabled(store: Store, avatar: Avatar): Promise<boolean> {
+  return (await store.avatarAvailability(avatar.projectId)).effective;
+}
+
+/** Resolve an Avatar's authority through its live backing principal: its
+ * creator's grants, or — for an Avatar that is a fork of another — that one's,
+ * while it still lets its forks be Avatars. Cycles, removal or disablement
+ * fail closed. */
 export async function avatarAuthorizationCapabilities(
   store: Store,
   authorization: AuthorizationService | undefined,
@@ -32,11 +129,13 @@ export async function avatarAuthorizationCapabilities(
 ): Promise<Capability[]> {
   if (seen.has(avatar.id) || !(await avatarEnabled(store, avatar))) return [];
   seen.add(avatar.id);
-  const principal = avatar.authorization.principal ?? `user:${avatar.ownerUserId}`;
+  const principal = avatar.authorization.principal ?? (avatar.ownerUserId ? `user:${avatar.ownerUserId}` : undefined);
+  if (!principal) return [];
   let backing: Capability[];
   if (principal.startsWith('avatar:')) {
     const parent = (await store.getAvatar(principal.slice(7)));
-    backing = parent ? (await avatarAuthorizationCapabilities(store, authorization, parent, projectId, seen)) : [];
+    backing = parent?.forksMayBeAvatars
+      ? (await avatarAuthorizationCapabilities(store, authorization, parent, projectId, seen)) : [];
   } else {
     backing = authorization
       ? (await authorization.capabilities(principal, projectId, avatar.organizationId))
@@ -45,67 +144,56 @@ export async function avatarAuthorizationCapabilities(
   return attenuate(avatar.authorization.capabilities, backing);
 }
 
-/** Invocation is a delegation decision made by the owner. Team membership is
- * resolved live so adding/removing a person immediately changes who can call an
- * Avatar without rewriting it. */
+/** Calling an Avatar is its creator's delegation decision. Groups and teams are
+ * resolved live, so a change of membership changes who can call it at once. */
 export async function avatarCallableBy(store: Store, avatar: Avatar, userId: string): Promise<boolean> {
   if (avatar.ownerUserId === userId) return true;
-  for (const selector of avatar.callableBy) {
-    if (selector === '@project') {
-      if ((await __asyncCollections.some((await store.listProjectMemberships(avatar.projectId)), async (membership) => {
-        const principal = membership.principal;
-        if (principal.kind === 'user') return principal.userId === userId;
-        if (principal.kind === 'organization') return Boolean((await store.organizationMembership(principal.organizationId, userId)));
-        if (principal.kind === 'team') return (await store.listTeamMemberships(principal.teamId)).some((member) => member.userId === userId);
-        return false;
-      }))) return true;
-    } else if (selector.startsWith('user:') && selector.slice(5) === userId) return true;
-    else if (selector.startsWith('@team:')) {
-      const slug = selector.slice(6);
-      const team = (await store.listTeams(avatar.organizationId, avatar.projectId))
-        .find((candidate) => candidate.slug === slug);
-      if (team && (await store.listTeamMemberships(team.id)).some((member) => member.userId === userId)) return true;
-    } else if (selector.startsWith('team:')) {
-      const team = (await store.getTeam(selector.slice(5)));
-      if (team?.organizationId === avatar.organizationId
-        && (await store.listTeamMemberships(team.id)).some((member) => member.userId === userId)) return true;
-    }
-  }
-  return false;
+  if (!avatar.callableBy.length) return false;
+  return (await store.humanAudience(avatar.id, avatar.callableBy)).includes(userId);
 }
 
-export async function avatarForRole(store: Store, task: { projectId: string; agents?: Record<string, AgentSpec> }, role: AgentRole): Promise<Avatar | undefined> {
-  const spec = task.agents?.[role];
-  const id = spec?.avatarId;
-  if (!id) return undefined;
+/** The Avatar `id` names, when it is an Avatar of this project, Avatars are
+ * enabled there, and `userId` may call it. */
+export async function callableAvatar(store: Store, projectId: string, id: string | undefined,
+  userId: string | undefined): Promise<Avatar | undefined> {
+  if (!id || !userId) return undefined;
   const avatar = (await store.getAvatar(id));
-  if (!avatar || avatar.projectId !== task.projectId) throw new AvatarUnavailableError('the selected Avatar is no longer available in this project');
-  if (!(await avatarEnabled(store, avatar))) throw new AvatarUnavailableError(`Avatar "${avatar.name}" is disabled`);
-  const purpose = spec?.avatarPurpose ?? role;
-  if (avatar.roles.length && !avatar.roles.includes(purpose))
-    throw new AvatarUnavailableError(`Avatar "${avatar.name}" is not available for the ${purpose} role`);
-  return avatar;
+  if (!avatar || avatar.projectId !== projectId || !(await avatarEnabled(store, avatar))) return undefined;
+  return (await avatarCallableBy(store, avatar, userId)) ? avatar : undefined;
 }
 
-/** Apply the Avatar's owner-controlled runtime and prompt to a workflow role.
- * The role template remains the technical contract (task bindings + required
- * control tool); the Avatar prompt is the behavioral instruction appended to it. */
-export function applyAvatarProfile(base: AgentProfile, spec: AgentSpec | undefined, avatar?: Avatar): AgentProfile {
-  if (!avatar) return applyAgentSpec(base, spec);
-  const roleTemplate = agentRoleDef(base.role)?.promptTemplate ?? base.promptTemplate ?? '';
-  const avatarSpec: AgentSpec = {
-    provider: avatar.runtime.provider,
-    ...(avatar.runtime.model ? { model: avatar.runtime.model } : {}),
-    ...(avatar.runtime.effort ? { effort: avatar.runtime.effort } : {}),
-    ...(spec?.resumeFrom ? { resumeFrom: spec.resumeFrom } : {}),
-    ...(spec?.mcpConnections !== undefined ? { mcpConnections: spec.mcpConnections } : {}),
-    avatarId: avatar.id,
-    ...(spec?.avatarPurpose ? { avatarPurpose: spec.avatarPurpose } : {}),
-  };
-  return {
-    ...applyAgentSpec(base, avatarSpec),
-    id: `avatar:${avatar.id}:${base.role}`,
-    name: avatar.name,
-    promptTemplate: `${roleTemplate}\n\n# Avatar instructions\n${avatar.prompt}`,
-  };
+/** The Avatar an agent spec forks and may act for: the task it resumes from,
+ * when that is an Avatar `userId` (the human behind the forking task) may call. */
+export async function forkedAvatar(store: Store, projectId: string, spec: unknown,
+  userId: string | undefined): Promise<Avatar | undefined> {
+  const resumeFrom = spec && typeof spec === 'object' && !Array.isArray(spec)
+    ? (spec as Partial<AgentSpec>).resumeFrom : undefined;
+  return callableAvatar(store, projectId, resumeFrom?.taskId, userId);
+}
+
+/** The Avatar a task's role acts for this turn, judged live against the task's
+ * creator: calling it, the Avatar setting and its project's availability may
+ * all have changed since the task was made. */
+export async function avatarForRole(store: Store, task: { taskId: string; projectId: string; agents?: Record<string, Partial<AgentSpec> | undefined> },
+  role: string): Promise<Avatar | undefined> {
+  const spec = task.agents?.[role];
+  if (!spec?.resumeFrom?.taskId) return undefined;
+  return forkedAvatar(store, task.projectId, spec, (await store.taskCreatorUserId(task.taskId)));
+}
+
+/** The role a task's `role` agent plays for an Avatar: its own, except that
+ * the main agent of a task calling an Avatar in from a route (an escalation,
+ * an approval to decide) plays the role it was called for (`_avatarRole`). */
+export async function avatarRoleFor(store: Store, taskId: string, role: string): Promise<AvatarRole> {
+  const purpose = avatarRoleOf(role) === 'do' ? (await store.getTask(taskId))?.params?._avatarRole : undefined;
+  return AVATAR_ROLES.includes(purpose as AvatarRole) ? purpose as AvatarRole : avatarRoleOf(role);
+}
+
+/** The Avatar whose authority backs a task's stored authorization
+ * (`principal: avatar:<id>`), judged live like `avatarForRole`; undefined when
+ * it no longer may (the authority then fails closed). */
+export async function authorizingAvatar(store: Store, task: { id: string; projectId: string }, principal: string | undefined)
+  : Promise<Avatar | undefined> {
+  if (!principal?.startsWith('avatar:')) return undefined;
+  return callableAvatar(store, task.projectId, principal.slice(7), (await store.taskCreatorUserId(task.id)));
 }

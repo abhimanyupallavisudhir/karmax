@@ -8,7 +8,7 @@ import { AuthorizationRequests } from '../src/platform/authorization-requests.js
 import { KarmaxApi } from '../src/platform/api.js';
 import { TokenAuthority } from '../src/platform/tokens.js';
 import { avatarAuthorizationCapabilities } from '../src/platform/avatars.js';
-import type { Avatar, AuthorizationSelection } from '../src/domain/types.js';
+import type { AuthorizationSelection } from '../src/domain/types.js';
 
 async function fixture(dbPath = ':memory:') {
   const store = (await Store.create(dbPath));
@@ -81,7 +81,7 @@ describe('initial authorization delegation requests', () => {
       store = f.store;
       const service = new AuthorizationRequests(store, 'org_personal');
       const request = await service.request({ projectId: f.project.id,
-        target: { kind: 'avatar', avatarId: 'avatar_pending' }, authorization: f.requested,
+        target: { kind: 'task', taskId: 'task_pending' }, authorization: f.requested,
         capabilities: [], missingCapabilities: [], audience: ['user:approver'], recipients: ['approver'],
         reason: 'Access', requestedBy: 'user:requester' });
       const claim = await service.claim(request.id, 'approve', 'user:approver');
@@ -171,44 +171,6 @@ describe('initial authorization delegation requests', () => {
     expect((await f.store.listInbox('approver', 'org_personal'))).toEqual([]);
   });
 
-  it('applies an approved Avatar delegation without elevating its owner', async () => {
-    const f = (await fixture());
-    const now = Date.now();
-    const limited = (await f.authorization.taskGrant('user:requester', f.project.id, f.requested));
-    const avatar: Avatar = {
-      id: 'avatar_pending', organizationId: 'org_personal', projectId: f.project.id,
-      ownerUserId: 'requester', name: 'Atlas', prompt: 'Act carefully.', promptVersion: 1,
-      enabled: false, authorityMode: 'restricted',
-      authorization: { ...limited, capabilities: [...limited.capabilities, 'use-credential:item:cred_safe'],
-        principal: 'user:requester' }, callableBy: ['user:requester'],
-      roles: [], runtime: { provider: 'mock' }, createdAt: now, updatedAt: now,
-    };
-    (await f.store.upsertAvatar(avatar));
-    const request = await f.api.requestAuthorization((await f.tokenFor('requester')), {
-      projectId: f.project.id,
-      target: { kind: 'avatar', avatarId: avatar.id, enableAfterApproval: true },
-      authorization: f.requested,
-      audience: ['user:approver'],
-    });
-    expect((await f.store.listInbox('approver', 'org_personal'))[0]).toMatchObject({
-      subject: { kind: 'avatar-authorization', avatarId: avatar.id, requestId: request.id },
-    });
-    expect((await f.store.claimDelivery())?.inbox).toMatchObject({
-      subject: { kind: 'avatar-authorization', avatarId: avatar.id, requestId: request.id },
-    });
-
-    await f.api.resolveAuthorizationRequest((await f.tokenFor('approver')), {
-      organizationId: 'org_personal', requestId: request.id, action: 'approve',
-    });
-    expect((await f.store.getAvatar(avatar.id))).toMatchObject({
-      enabled: true,
-      authorization: { level: 'maintainer', attenuated: false, principal: 'user:approver',
-        capabilities: expect.arrayContaining(['use-credential:item:cred_safe']) },
-    });
-    expect((await f.authorization.capabilities('user:requester', f.project.id))).not.toContain('project:edit');
-    expect((await f.store.listInbox('approver', 'org_personal'))).toEqual([]);
-  });
-
   it('lets an authorizer Avatar approve a task without retaining the requester human delegation', async () => {
     const f = (await fixture());
     const task = await f.api.createTask((await f.tokenFor('requester')), {
@@ -225,16 +187,11 @@ describe('initial authorization delegation requests', () => {
     } }));
     await expect(f.api.queueTask((await f.tokenFor('requester')), task.id)).rejects.toThrow(/cannot grant/i);
     const avatarAuthorization = (await f.authorization.taskGrant('user:approver', f.project.id, f.requested));
-    const now = Date.now();
-    const authorizer: Avatar = {
-      id: 'avatar_authorizer', organizationId: 'org_personal', projectId: f.project.id,
-      ownerUserId: 'approver', name: 'Gatekeeper', prompt: 'Approve carefully.', promptVersion: 1,
-      enabled: true, authorityMode: 'restricted', roles: ['authorize'], callableBy: ['user:requester'],
-      authorization: { ...avatarAuthorization, principal: 'user:approver' },
-      runtime: { provider: 'mock' }, createdAt: now, updatedAt: now,
-    };
-    (await f.store.kvSet(`avatars:project:${f.project.id}`, 'enabled'));
-    (await f.store.upsertAvatar(authorizer));
+    // The approver's Avatar: a task saved as Avatar, callable by the requester.
+    const authorizerTask = await f.api.createTask((await f.tokenFor('approver')), { projectId: f.project.id, draft: true,
+      prompt: 'Approve carefully.', authorization: f.requested,
+      params: { avatar: { callableBy: ['user:requester'], forksMayBeAvatars: true } } });
+    const authorizer = (await f.store.getAvatar(authorizerTask.id))!;
     const request = await f.api.requestAuthorization((await f.tokenFor('requester')), {
       projectId: f.project.id, target: { kind: 'task', taskId: task.id },
       authorization: f.requested, audience: [`avatar:${authorizer.id}`],
@@ -254,14 +211,14 @@ describe('initial authorization delegation requests', () => {
     });
     expect(((await f.store.getTask(task.id))?.params._authorization as { delegationId?: string }).delegationId).toBeUndefined();
 
-    const delegatedAvatar: Avatar = {
-      ...authorizer, id: 'avatar_delegated', name: 'Delegate',
-      authorization: { ...avatarAuthorization, principal: `avatar:${authorizer.id}` },
-    };
-    (await f.store.upsertAvatar(delegatedAvatar));
+    // An Avatar backed by that one reaches its grant until it is unmarked.
+    const delegatedTask = await f.store.createTask({ projectId: f.project.id, title: 'Delegate', workflow: 'just-do',
+      workflowVersion: '1.0.0', createdBy: { kind: 'user', userId: 'approver' }, params: { prompt: 'Delegate', draft: true,
+        avatar: { callableBy: ['user:requester'] }, _authorization: { ...avatarAuthorization, principal: `avatar:${authorizer.id}` } } });
+    const delegatedAvatar = (await f.store.getAvatar(delegatedTask.id))!;
     expect((await avatarAuthorizationCapabilities(f.store, f.authorization, delegatedAvatar, f.project.id)))
       .toEqual(expect.arrayContaining(avatarAuthorization.capabilities));
-    (await f.store.upsertAvatar({ ...authorizer, enabled: false, updatedAt: Date.now() }));
+    (await f.store.patchTaskParams(authorizer.id, { avatar: null }));
     expect((await avatarAuthorizationCapabilities(f.store, f.authorization, delegatedAvatar, f.project.id))).toEqual([]);
   });
 
@@ -270,7 +227,7 @@ describe('initial authorization delegation requests', () => {
     const service = new AuthorizationRequests(f.store, 'org_personal');
     const input = {
       projectId: f.project.id,
-      target: { kind: 'avatar' as const, avatarId: 'avatar_1' },
+      target: { kind: 'task' as const, taskId: 'task_1' },
       authorization: f.requested,
       capabilities: ['project:read', 'project:edit'],
       missingCapabilities: ['project:edit'],

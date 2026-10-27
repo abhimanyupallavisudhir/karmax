@@ -67,14 +67,14 @@ describe('agent authority specs', () => {
     expect(() => normalizeAgentAuthority({ paymentPolicy: { budget: -1 } })).toThrow(/budget/);
   });
 
-  it('keeps authority and Avatar selection through task assembly', () => {
+  it('keeps authority and fork sources through task assembly', () => {
     const input = assembleTaskInput(manifest('software-dev')!, {
       prompt: 'x',
-      responder: { kind: 'agent', provider: 'mock', avatarId: 'av_1', authority: { authorization: { level: 'viewer', scope: 'organization' } } },
-      confirm: { layers: [{ kind: 'agent', provider: 'mock', avatarId: 'av_2', authority: { credentialGrants: ['use-credential:item:a'] } }] },
+      responder: { kind: 'agent', provider: 'mock', resumeFrom: { taskId: 'av_1', role: 'do' }, authority: { authorization: { level: 'viewer', scope: 'organization' } } },
+      confirm: { layers: [{ kind: 'agent', provider: 'mock', resumeFrom: { taskId: 'av_2', role: 'do' }, authority: { credentialGrants: ['use-credential:item:a'] } }] },
     }, { taskId: 't', projectId: 'p', title: 'x', project: {} });
-    expect(input.responder).toMatchObject({ avatarId: 'av_1', authority: { authorization: { level: 'viewer' } } });
-    expect(input.confirm?.layers?.[0]).toMatchObject({ avatarId: 'av_2', authority: { credentialGrants: ['use-credential:item:a'] } });
+    expect(input.responder).toMatchObject({ resumeFrom: { taskId: 'av_1' }, authority: { authorization: { level: 'viewer' } } });
+    expect(input.confirm?.layers?.[0]).toMatchObject({ resumeFrom: { taskId: 'av_2' }, authority: { credentialGrants: ['use-credential:item:a'] } });
   });
 });
 

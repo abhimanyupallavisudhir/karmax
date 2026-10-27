@@ -126,15 +126,15 @@ describe('events through an agent\'s task token', () => {
       expect(again.id).not.toBe(wiki.id);
       expect((await storeOf()).find((t: any) => t.id === 'project-wiki').installed.sort()).toEqual([again.id, wiki.id].sort());
 
-      // A repeatable one installs once; deleting it puts it back on offer.
+      // A repeatable one installs as often as asked; deleting its series takes it back.
       const installed = json(await dev.request('POST', `/api/projects/${projectId}/task-store/build-planned-issues`));
       const series = (await store.getTask(installed.id))!;
       expect(series).toMatchObject({ title: '#{{issue.number}} {{issue.title}}', params: { repeatable: true, template: 'build-planned-issues',
         triggerState: 'armed', triggers: [{ kind: 'event', type: 'github.issues.labeled', where: { 'label.name': 'planned' } }] } });
       expect(String(series.params.prompt)).toMatch(/comments on it reach you as messages/);
-      const twice = await dev.request('POST', `/api/projects/${projectId}/task-store/build-planned-issues`).catch((error: Error) => error.message);
-      expect(String(twice)).toMatch(/already has it/);
-      expect((await storeOf()).find((t: any) => t.id === 'build-planned-issues').installed).toEqual([installed.id]);
+      const twice = json(await dev.request('POST', `/api/projects/${projectId}/task-store/build-planned-issues`));
+      expect((await storeOf()).find((t: any) => t.id === 'build-planned-issues').installed.sort()).toEqual([installed.id, twice.id].sort());
+      expect(json(await dev.request('DELETE', `/api/tasks/${twice.id}`))).toEqual({ ok: true });
       expect(json(await dev.request('DELETE', `/api/tasks/${installed.id}`))).toEqual({ ok: true });
       expect(await store.getTask(installed.id)).toBeFalsy();
       expect((await storeOf()).find((t: any) => t.id === 'build-planned-issues').installed).toEqual([]);
@@ -147,6 +147,57 @@ describe('events through an agent\'s task token', () => {
       expect(String(published)).toMatch(/not found|missing capability/);
       expect(await storeOf()).toHaveLength(5);
     } finally { dev.restore(); maintainer.restore(); }
+  });
+
+  it('takes a store task as changed, by its endpoint or as an ordinary task, a series per install', async () => {
+    const dev = await agent('developer');
+    const storeOf = async () => json(await dev.request('GET', `/api/projects/${projectId}/task-store`)).tasks;
+    const installedOf = async (id: string) => (await storeOf()).find((t: any) => t.id === id).installed;
+    const created: string[] = [];
+    for (const id of await installedOf('build-planned-issues')) await store.deleteTask(id);
+    try {
+      // The endpoint takes createTask's fields; params override the store's field by field.
+      const triage = json(await dev.request('POST', `/api/projects/${projectId}/task-store/triage-issues`, {
+        params: { prompt: 'Triage only bug reports.', triggers: [{ kind: 'schedule', cron: '0 6 * * 1', recurring: true }] } }));
+      created.push(triage.id);
+      expect((await store.getTask(triage.id))!).toMatchObject({ title: 'Triage GitHub issues', params: { template: 'triage-issues', repeatable: true,
+        prompt: 'Triage only bug reports.', triggerState: 'armed', triggers: [{ kind: 'schedule', cron: '0 6 * * 1' }] } });
+
+      // The task form creates it as an ordinary task naming its store entry: a draft
+      // is not taken yet; running it installs it; another (say, for another label)
+      // is a series of its own.
+      const form = (draft: boolean) => dev.request('POST', `/api/projects/${projectId}/tasks`, { title: '#{{issue.number}} {{issue.title}}', draft,
+        params: { prompt: 'Build it small.', repeatable: true, template: 'build-planned-issues',
+          triggers: [{ kind: 'event', type: 'github.issues.labeled', where: { 'label.name': 'ready' }, recurring: true }] } });
+      const draft = json(await form(true));
+      created.push(draft.id);
+      expect(await installedOf('build-planned-issues')).toEqual([]);
+      // Editing the draft keeps its store entry and its run title.
+      json(await dev.request('PATCH', `/api/tasks/${draft.id}/params`, { replace: true,
+        params: { prompt: 'Build it smaller.', repeatable: true, triggers: [{ kind: 'event', type: 'github.issues.labeled', where: { 'label.name': 'ready' }, recurring: true }] } }));
+      expect((await store.getTask(draft.id))!).toMatchObject({ title: '#{{issue.number}} {{issue.title}}', params: { template: 'build-planned-issues', prompt: 'Build it smaller.' } });
+      const other = json(await form(true));
+      created.push(other.id);
+      json(await dev.request('POST', `/api/tasks/${draft.id}/queue`, {}));
+      expect(await installedOf('build-planned-issues')).toEqual([draft.id]);
+      json(await dev.request('POST', `/api/tasks/${other.id}/queue`, {}));
+      const third = json(await form(false));
+      created.push(third.id);
+      expect((await installedOf('build-planned-issues')).sort()).toEqual([draft.id, other.id, third.id].sort());
+      // The installed series edits like any other, still the store's.
+      json(await dev.request('PATCH', `/api/tasks/${draft.id}/params`, { replace: true,
+        params: { prompt: 'Build it.', repeatable: true, triggers: [{ kind: 'event', type: 'github.issues.labeled', where: { 'label.name': 'ready' }, recurring: true }] } }));
+      expect((await store.getTask(draft.id))!).toMatchObject({ title: '#{{issue.number}} {{issue.title}}', params: { template: 'build-planned-issues', triggerState: 'armed' } });
+      expect(await installedOf('build-planned-issues')).toContain(draft.id);
+      // A title derived from the prompt still follows it.
+      const plain = json(await dev.request('POST', `/api/projects/${projectId}/tasks`, { draft: true, params: { prompt: 'First words' } }));
+      created.push(plain.id);
+      json(await dev.request('PATCH', `/api/tasks/${plain.id}/params`, { replace: true, params: { prompt: 'Second words' } }));
+      expect((await store.getTask(plain.id))!.title).toBe('Second words');
+    } finally {
+      for (const id of created) await store.deleteTask(id);
+      dev.restore();
+    }
   });
 
   it('deletes what never started a workflow of its own, and nothing that did', async () => {

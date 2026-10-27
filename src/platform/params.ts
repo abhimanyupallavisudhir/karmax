@@ -236,14 +236,12 @@ export function assembleTaskInput(
   return input;
 }
 
-/** Who a Responder/Reviewer agent is and what it may do: its Avatar and its own
- * authority (wiki features/collaboration-model). The authority's effective,
- * attenuated form is `params._agentAuthorization`; the request rides along so the
- * workflow can show and re-route it. */
+/** What a Responder/Reviewer agent may do: its own authority (wiki
+ * features/collaboration-model). The authority's effective, attenuated form is
+ * `params._agentAuthorization`; the request rides along so the workflow can show
+ * and re-route it. */
 function agentIdentity(spec: Partial<AgentSpec>): Partial<AgentSpec> {
   return {
-    ...(spec.avatarId ? { avatarId: spec.avatarId } : {}),
-    ...(spec.avatarPurpose ? { avatarPurpose: spec.avatarPurpose } : {}),
     ...(spec.authority && typeof spec.authority === 'object' ? { authority: spec.authority } : {}),
   };
 }
