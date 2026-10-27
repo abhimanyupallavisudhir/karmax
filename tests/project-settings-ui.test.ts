@@ -120,14 +120,18 @@ describe('Project settings', () => {
     const sibling = { id: 's', organizationId: 'o', name: 'Sibling', config: {} };
     const afterDelete = async (remaining: Array<Record<string, unknown>>) => {
       let gone = false;
-      const ui = await settings({ projects: [foreign, deleted, ...remaining], organizations, api: ({ method, path: route }) => {
-        if (method === 'DELETE' && route === '/api/projects/p') { gone = true; return {}; }
+      const ui = await settings({ projects: [foreign, deleted, ...remaining], organizations, api: ({ method, path: route, body }) => {
+        if (method === 'DELETE' && route === '/api/projects/p') { expect(body).toEqual({ confirmName: 'Workspace' }); gone = true; return {}; }
         if (gone && method === 'GET' && route === '/api/projects') return [foreign, ...remaining];
         return undefined;
       } });
       await pane(ui, 'project-advanced');
       await expect.poll(() => visible(ui, '#delete-project')).toBe(true);
       await ui.page.locator('#delete-project').click();
+      // Deleting asks for the project's name; Enter alone does not delete it.
+      const prompt = ui.page.locator('dialog.text-prompt');
+      await prompt.locator('input').fill('Workspace');
+      await prompt.locator('button.primary').click();
       await expect.poll(() => ui.run<string>('location.pathname')).not.toBe('/org/workspace/settings');
       const landed = await ui.run<string>('location.pathname');
       await ui.close();

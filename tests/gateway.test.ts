@@ -913,7 +913,8 @@ describe('gateway HTTP API (real server end-to-end)', () => {
     (await h.store.registerWorld(world.handle, project.id));
     expect(fs.existsSync(world.handle.root)).toBe(true);
 
-    const deleted = await fetch(`${base}/api/projects/${project.id}`, { method: 'DELETE', headers: auth() });
+    const deleted = await fetch(`${base}/api/projects/${project.id}`, { method: 'DELETE', headers: auth(),
+      body: JSON.stringify({ confirmName: project.name }) });
     expect(deleted.status).toBe(200);
     expect(fs.existsSync(world.handle.root)).toBe(false);
     expect((await h.store.getProject(project.id))).toBeUndefined();
