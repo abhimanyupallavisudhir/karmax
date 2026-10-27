@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -24,6 +25,7 @@ import type { Project } from '../src/domain/types.js';
  */
 describe('events in the console', () => {
   let dir: string, store: Store, project: Project, browser: Browser, base: string, close: () => Promise<void>;
+  let api: KarmaxApi, tokens: TokenAuthority;
   let priorHome: string | undefined;
 
   beforeAll(async () => {
@@ -32,11 +34,11 @@ describe('events in the console', () => {
     process.env.KARMAX_HOME = dir;
     store = await Store.create(':memory:');
     await seedProfiles(store, 'mock');
-    const tokens = new TokenAuthority();
+    tokens = new TokenAuthority();
     const worlds = new WorldRegistry();
     const broker = new CredentialBroker(new Vault(path.join(dir, 'vault')));
     const client = { workflow: { getHandle: () => ({ query: async () => [] }), start: async () => ({}) } } as any;
-    const api = new KarmaxApi({ store, tokens, worlds, client, taskQueue: 'test', contentDir: dir, broker });
+    api = new KarmaxApi({ store, tokens, worlds, client, taskQueue: 'test', contentDir: dir, broker });
     project = await store.createProject('Factory');
     const gateway = await Gateway.create({ store, tokens, worlds, client, api, broker, bus: new KarmaxBus(),
       contributions: new ContributionRegistry(), overlays: new Overlays(), taskQueue: 'test', staticDir: path.resolve('web'),
@@ -121,6 +123,58 @@ describe('events in the console', () => {
     page.once('dialog', (dialog) => dialog.accept());
     await box.locator('[data-hook-delete]').click();
     await expect.poll(async () => box.locator('[data-hook]').count()).toBe(0);
+    expect(errors).toEqual([]);
+  });
+
+  it('shows a Slack bot where its URL goes, and lets the project choose who can ask it', async () => {
+    const token = (await tokens.mintPrincipal('user:test', ['*'], project.id)).token;
+    const fetcher = (async () => new Response(JSON.stringify({ ok: true, user_id: 'UBOT', user: 'tavya' }))) as unknown as typeof fetch;
+    const { hook } = await api.createIncomingWebhook(token, project.id, { name: 'Slack bot', kind: 'slack', credentials: { signingSecret: 'shh', botToken: 'xoxb-1' } },
+      { hookUrl: (id) => `${base}/api/hooks/${id}`, fetcher });
+    // Someone not allowed asks: nothing starts, and the project sees them asking.
+    const raw = JSON.stringify({ type: 'event_callback', event_id: 'Ev9', event: { type: 'app_mention', user: 'U9', text: '<@UBOT> drop the tables', channel: 'C1', ts: '2.0' } });
+    const at = String(Math.floor(Date.now() / 1000));
+    const delivered = await fetch(`${base}/api/hooks/${hook.id}`, { method: 'POST', body: raw, headers: { 'content-type': 'application/json',
+      'x-slack-request-timestamp': at, 'x-slack-signature': `v0=${crypto.createHmac('sha256', 'shh').update(`v0:${at}:${raw}`).digest('hex')}` } });
+    expect(delivered.status).toBe(202);
+    expect(((await delivered.json()) as { event?: string }).event).toBeUndefined();
+
+    const { page, errors } = await open('/personal/factory/settings#project-events');
+    const box = page.locator('#project-events-box');
+    const bot = box.locator(`[data-hook="${hook.id}"]`);
+    await bot.waitFor();
+    expect(await bot.locator('[data-hook-copy]').getAttribute('data-hook-copy')).toBe(`${base}/api/hooks/${hook.id}`);
+    expect(await bot.locator('[data-hook-copy]').getAttribute('title')).toContain('Request URL');
+    const people = box.locator(`[data-people="${hook.id}"]`);
+    expect(await people.textContent()).toContain('Nobody yet');
+    const asking = box.locator('[data-person="U9"]');
+    expect(await asking.textContent()).toContain('drop the tables');
+
+    await asking.locator('[data-people-allow]').click();
+    await expect.poll(async () => box.locator('[data-person="U9"]').count()).toBe(0);
+    await expect.poll(async () => people.locator('.pe-person').allTextContents()).toEqual(['U9✕']);
+    expect((await api.listIncomingWebhooks(token, project.id))[0]!.allowed).toEqual([{ id: 'U9' }]);
+    await people.locator('[data-people-remove="U9"]').click();
+    await expect.poll(async () => people.textContent()).toContain('Nobody yet');
+    await people.locator('[data-people-anyone]').check();
+    await expect.poll(async () => people.textContent()).toContain('Anyone who can message the bot');
+    expect((await api.listIncomingWebhooks(token, project.id))[0]).toMatchObject({ allowed: [], anyone: true });
+
+    // Connecting another Slack bot ends on the URL to paste into Slack (the platform itself is not called here).
+    await page.route('**/api/projects/*/webhooks', (route) => route.request().method() === 'POST'
+      ? route.fulfill({ status: 201, contentType: 'application/json', body: JSON.stringify({ hook: { id: 'hook_new', kind: 'slack' }, url: `${base}/api/hooks/hook_new` }) })
+      : route.fallback());
+    await box.locator('[data-pe-new="chat"]').click();
+    await box.locator('[data-pe-platform="slack"]').click();
+    await box.locator('[data-pe-cred="signingSecret"]').fill('s');
+    await box.locator('[data-pe-cred="botToken"]').fill('xoxb-2');
+    await box.locator('#pe-starts').uncheck();
+    await box.locator('#pe-connect').click();
+    const reveal = box.locator('.pe-reveal');
+    await reveal.waitFor();
+    expect(await reveal.textContent()).toMatch(/Paste into your Slack app[\s\S]*Request URL/);
+    expect(await reveal.locator('code').allTextContents()).toEqual([`${base}/api/hooks/hook_new`]);
+    await api.deleteIncomingWebhook(token, hook.id);
     expect(errors).toEqual([]);
   });
 

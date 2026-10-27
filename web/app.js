@@ -17725,7 +17725,7 @@ function projectEventsHtml(projectId, list, events) {
   const sourceRow = (h) => `<div class="setting-row" data-hook="${esc(h.id)}">
     <span class="setting-label">${esc(h.name)}</span>
     <span class="setting-value"><span class="setting-muted">${h.kind ? `${CHAT_PLATFORM_LABELS[h.kind]}${h.bot?.username ? ` · ${esc(h.bot.username.startsWith('+') ? h.bot.username : '@' + h.bot.username)}` : ''}` : `<code>${esc(h.type)}</code>`}</span><span class="setting-sep">·</span><span class="setting-muted">${health(h)}</span></span>
-    <span class="setting-actions">${h.kind ? '' : `<button class="btn sm ghost" data-hook-copy="${esc(list.urlBase + h.id)}">Copy URL</button><button class="btn sm ghost" data-hook-rotate title="Replace the secret; the old one stops working">New secret</button>`}<button class="btn sm ghost" data-hook-delete title="Delete">✕</button></span></div>`;
+    <span class="setting-actions">${!h.kind || CHAT_URL_PASTED[h.kind] ? `<button class="btn sm ghost" data-hook-copy="${esc(list.urlBase + h.id)}"${h.kind ? ` title="${esc(chatUrlTip(h.kind))}"` : ''}>Copy URL</button>` : ''}${h.kind ? '' : `<button class="btn sm ghost" data-hook-rotate title="Replace the secret; the old one stops working">New secret</button>`}<button class="btn sm ghost" data-hook-delete title="Delete">✕</button></span></div>${h.kind ? chatPeopleHtml(h) : ''}`;
   const eventRow = (e) => `<details class="pe-event"><summary class="setting-row">
     <span class="setting-label"><code>${esc(e.type)}</code></span>
     <span class="setting-value">${eventSourceLabel(e.source, hooks)}${e.subject ? ` · ${/^https?:/.test(e.subject) ? `<a href="${esc(e.subject)}" target="_blank" rel="noopener">${esc(e.subject.replace(/^https?:\/\/(www\.)?/, '').slice(0, 60))}</a>` : esc(e.subject.slice(0, 60))}` : ''}<span class="setting-sep">·</span>${eventOutcome(e)}</span>
@@ -17740,6 +17740,27 @@ function projectEventsHtml(projectId, list, events) {
     <div class="setting-rows pe-events">${events.length ? events.map(eventRow).join('') : '<div class="setting-row setting-muted">Nothing yet</div>'}</div>`;
 }
 
+// Where a person pastes a chat bot's URL; tavya sets it itself on the others.
+const CHAT_URL_PASTED = {
+  slack: ['your Slack app', 'Event Subscriptions → Request URL, with bot events app_mention and message.im'],
+  whatsapp: ['your Meta app', 'WhatsApp → Configuration → Callback URL'],
+};
+const chatUrlTip = (kind) => `Paste into ${CHAT_URL_PASTED[kind][0]}: ${CHAT_URL_PASTED[kind][1]}`;
+
+// Who a chat bot takes requests from, and who asked without being allowed.
+function chatPeopleHtml(h) {
+  const who = (p) => esc(p.name || p.id);
+  const allowed = (h.allowed || []).map((p) => `<span class="chip pe-person" title="${esc(p.id)}">${who(p)}<button class="file-chip-x" data-people-remove="${esc(p.id)}" aria-label="Remove ${who(p)}" title="Remove">✕</button></span>`).join('');
+  const asking = (h.asking || []).map((p) => `<div class="setting-row pe-sub pe-asking" data-person="${esc(p.id)}">
+    <span class="setting-label" title="${esc(p.id)}">${who(p)}</span>
+    <span class="setting-value setting-muted">${p.text ? `“${esc(p.text.slice(0, 80))}”` : ''}${p.at ? `<span class="setting-sep">·</span>${fmtAgo(p.at)}` : ''}</span>
+    <span class="setting-actions"><button class="btn sm" data-people-allow>Allow</button><button class="btn sm ghost" data-people-dismiss aria-label="Dismiss" title="Dismiss">✕</button></span></div>`).join('');
+  return `<div class="setting-row pe-sub pe-people" data-people="${esc(h.id)}">
+    <span class="setting-label">Who can ask ${policyTip('Only their messages start tasks. Anyone else is told so and shows up here to allow.')}</span>
+    <span class="setting-value">${h.anyone ? '<span class="setting-muted">Anyone who can message the bot</span>' : allowed || '<span class="setting-muted">Nobody yet: message the bot, then allow yourself here</span>'}</span>
+    <span class="setting-actions"><label class="pe-starts">Anyone <input type="checkbox" class="toggle" data-people-anyone ${h.anyone ? 'checked' : ''}></label></span></div>${asking}`;
+}
+
 function webhookFormHtml() {
   return `<div class="inline-form pe-new"><input id="pe-name" placeholder="Name, e.g. Sentry" autocomplete="off">
     <input id="pe-type" placeholder="Event type (optional)" title="What its events are called, e.g. sentry.alert" autocomplete="off" spellcheck="false">
@@ -17752,12 +17773,12 @@ function chatFormHtml(platforms, kind) {
     <div class="segmented" role="group" aria-label="Platform">${Object.keys(platforms).map((k) => `<button type="button" data-pe-platform="${k}" aria-pressed="${k === kind}">${CHAT_PLATFORM_LABELS[k] || k}</button>`).join('')}</div>
     <div class="inline-form">${fields.map((f) => `<input data-pe-cred="${esc(f.name)}" placeholder="${esc(f.label)}" ${f.secret ? 'type="password"' : ''} autocomplete="off" spellcheck="false">`).join('')}</div>
     <label class="pe-starts"><input type="checkbox" class="toggle" id="pe-starts" checked> Start a task for each message ${policyTip('Adds a task that runs once per message to the bot. Replies in the same thread go to the run already working on it.')}</label>
-    <div class="inline-form"><button class="btn sm primary" id="pe-connect">Connect</button><button class="btn sm ghost" data-pe-cancel>Cancel</button></div></div>`;
+    <div class="inline-form"><button class="btn sm primary" id="pe-connect">Connect</button><button class="btn sm ghost" data-pe-cancel>Cancel</button><a class="btn sm ghost" href="/docs/chat-bots#connect-a-bot" target="_blank" rel="noopener">Guide</a></div></div>`;
 }
 
 // Shown once: what to paste where.
-function revealHtml(rows) {
-  return `<div class="pe-reveal"><div class="setting-muted">Copy these now; they won’t be shown again.</div>
+function revealHtml(rows, lead = 'Copy these now; they won’t be shown again.') {
+  return `<div class="pe-reveal"><div class="setting-muted">${lead}</div>
     ${rows.map(([label, value]) => `<div class="setting-row"><span class="setting-label">${esc(label)}</span><span class="setting-value"><code>${esc(value)}</code></span><span class="setting-actions"><button class="btn sm ghost" data-copy-value="${esc(value)}">Copy</button></span></div>`).join('')}
     <div class="inline-form"><button class="btn sm" data-pe-done>Done</button></div></div>`;
 }
@@ -17780,6 +17801,27 @@ async function hydrateProjectEvents(proj) {
       if (!confirm(`Delete “${row.querySelector('.setting-label').textContent}”? It stops receiving events.`)) return;
       try { await api(`/api/webhooks/${row.dataset.hook}`, { method: 'DELETE' }); load(); } catch (e) { toast(e.message, true); }
     }));
+    // A chat bot's people rows follow its "Who can ask" row.
+    const people = async (el, patch) => {
+      let row = el.closest('.setting-row');
+      while (row && !row.dataset.people) row = row.previousElementSibling;
+      const hook = (list.webhooks || []).find((h) => h.id === row?.dataset.people);
+      if (!hook) return;
+      try { await api(`/api/webhooks/${hook.id}`, { method: 'PATCH', body: JSON.stringify(patch(hook)) }); } catch (e) { toast(e.message, true); }
+      load();
+    };
+    box.querySelectorAll('[data-people-anyone]').forEach((t) => t.addEventListener('change', () => people(t, () => ({ anyone: t.checked }))));
+    box.querySelectorAll('[data-people-remove]').forEach((b) => b.addEventListener('click', () =>
+      people(b, (h) => ({ allowed: (h.allowed || []).filter((p) => p.id !== b.dataset.peopleRemove) }))));
+    box.querySelectorAll('[data-people-allow]').forEach((b) => b.addEventListener('click', () => {
+      const id = b.closest('[data-person]').dataset.person;
+      people(b, (h) => {
+        const asked = (h.asking || []).find((p) => p.id === id) || { id };
+        return { allowed: [...(h.allowed || []), { id, ...(asked.name ? { name: asked.name } : {}) }] };
+      });
+    }));
+    box.querySelectorAll('[data-people-dismiss]').forEach((b) => b.addEventListener('click', () =>
+      people(b, () => ({ dismiss: [b.closest('[data-person]').dataset.person] }))));
     box.querySelectorAll('[data-hook-rotate]').forEach((b) => b.addEventListener('click', async () => {
       const row = b.closest('[data-hook]');
       if (!confirm('Replace the secret? Senders using the old one are refused until they get the new one.')) return;
@@ -17809,6 +17851,7 @@ async function hydrateProjectEvents(proj) {
             delete S.taskStore?.[proj.id];
           }
           if (created.verifyToken) { form.innerHTML = revealHtml([['Callback URL', created.url], ['Verify token', created.verifyToken]]); wireForm(); }
+          else if (CHAT_URL_PASTED[kind]) { form.innerHTML = revealHtml([['Request URL', created.url]], `Paste into ${CHAT_URL_PASTED[kind][0]} ${policyTip(chatUrlTip(kind))}`); wireForm(); }
           else { toast(`${CHAT_PLATFORM_LABELS[kind]} bot connected`); load(); }
         } catch (err) { toast(err.message, true); button.disabled = false; }
       });
@@ -24630,6 +24673,7 @@ const DOC_PAGES = [
   { slug: 'getting-started', path: '/docs', title: 'Getting started' },
   { slug: 'how-it-works', path: '/docs/how-it-works', title: 'How it works' },
   { slug: 'computers', path: '/docs/computers', title: 'Cloud computers' },
+  { slug: 'chat-bots', path: '/docs/chat-bots', title: 'Chat bots' },
   { slug: 'cli', path: '/docs/cli', title: 'tavya CLI' },
 ];
 

@@ -43,7 +43,7 @@ const { fakeConsole, launch } = require('../tests/helpers/fake-console.cjs');
     assert.equal(await page.locator('.docs-page h1').textContent(), 'Getting started');
     assert.ok(!requests.includes('GET /api/session'), 'a public page does not read (and so provision) a session');
     assert.deepEqual(await nav(), [
-      ['Getting started', '/docs'], ['How it works', '/docs/how-it-works'], ['Cloud computers', '/docs/computers'], ['tavya CLI', '/docs/cli'],
+      ['Getting started', '/docs'], ['How it works', '/docs/how-it-works'], ['Cloud computers', '/docs/computers'], ['Chat bots', '/docs/chat-bots'], ['tavya CLI', '/docs/cli'],
       ['Pricing', '/pricing'],
       ['Policies', '/legal'], ['Terms of Service', '/legal/terms'], ['Privacy Policy', '/legal/privacy'],
     ], 'one sidebar: the docs, then pricing, then every policy');
@@ -102,13 +102,13 @@ const { fakeConsole, launch } = require('../tests/helpers/fake-console.cjs');
     assert.match(await page.locator('.docs-page').innerText(), /aws:RequestTag\/karmaxHome/, 'the AWS policy is on the page');
     if (shots) await page.screenshot({ path: path.join(shots, 'docs-computers.png'), fullPage: true });
 
-    for (const slug of ['', 'how-it-works', 'computers', 'cli']) {
+    for (const slug of ['', 'how-it-works', 'computers', 'chat-bots', 'cli']) {
       await page.goto(`http://console.test/docs${slug ? `/${slug}` : ''}`);
       await page.locator('.docs-page h1').waitFor();
       const links = await page.locator('.docs-page a[href^="/"]').evaluateAll((as) => as.map((a) => a.getAttribute('href')));
       for (const href of links) {
         const [route, hash] = href.split('#');
-        const known = ['/docs', '/docs/how-it-works', '/docs/computers', '/docs/cli', '/pricing', '/legal', '/signup', '/login'].includes(route) || /^\/legal\/[a-z-]+$/.test(route);
+        const known = ['/docs', '/docs/how-it-works', '/docs/computers', '/docs/chat-bots', '/docs/cli', '/pricing', '/legal', '/signup', '/login'].includes(route) || /^\/legal\/[a-z-]+$/.test(route);
         assert.ok(known, `docs link ${href} goes to a page`);
         if (hash && route.startsWith('/docs')) {
           const md = fs.readFileSync(path.join(__dirname, 'docs', `${route.replace(/^\/docs\/?/, '') || 'getting-started'}.md`), 'utf8');

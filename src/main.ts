@@ -671,6 +671,7 @@ async function main() {
   const { ChatReplies } = await import('./integrations/chat-replies.js');
   const chatReplies = new ChatReplies({ store, broker, publicUrl: () => process.env.KARMAX_PUBLIC_URL ?? process.env.KARMAX_GATEWAY_URL,
     log: (m) => console.warn('  • ' + m) });
+  api.setChatReplies(chatReplies);
   bus.onAny((event) => { if (event.type === 'view.updated') void chatReplies.observe(event).catch((e) => console.warn('  • chat reply failed:', String(e))); });
   const triggerScheduler = new TriggerScheduler({
     store,

@@ -40,9 +40,9 @@ import { STORE_TASKS, storeTaskNeeds, storeTaskRepeatable, type StoreNeed, type 
 import { applyTriggerContext, normalizeEventInput, validateFollow, type EventFilter, type EventFollow, type ProjectEvent, type ProjectEventClaim,
   type ProjectEventInput, type ProjectEventOrigin, type TriggerContext } from '../domain/project-events.js';
 import { newId } from '../util/id.js';
-import { IncomingWebhooks, WebhookConfigError, webhookDeliveryKey, type IncomingWebhook } from '../integrations/incoming-webhooks.js';
+import { IncomingWebhooks, WebhookConfigError, webhookDeliveryKey, type IncomingWebhook, type WebhookPatch } from '../integrations/incoming-webhooks.js';
 import { isChatPlatform, type ChatPlatform } from '../integrations/chat-platforms.js';
-import { chatThreadKey } from '../integrations/chat-replies.js';
+import { chatThreadKey, type ChatReplies } from '../integrations/chat-replies.js';
 import { pullRequestOf } from '../domain/pull-requests.js';
 import { evaluateQuery, fieldCatalogue, tagPath, EvalResult, EvalContext, TaskGroup, forClauseValues, attentionCandidates } from '../domain/search.js';
 import { parseQuery } from '../domain/query-language.js';
@@ -492,6 +492,7 @@ export class KarmaxApi {
   }
 
   private armer?: TriggerArmer;
+  private chatReplies?: ChatReplies;
   private collaborationNotificationRetries = new Map<string, number>();
   constructor(private deps: KarmaxApiDeps) {
     deps.bus?.onAny((event) => {
@@ -510,6 +511,11 @@ export class KarmaxApi {
   /** Attach the trigger dispatcher after construction (resolves the ctor cycle). */
   setTriggerArmer(armer: TriggerArmer) {
     this.armer = armer;
+  }
+
+  /** Attach what answers in chat, so a bot can tell someone it does not take their requests. */
+  setChatReplies(replies: ChatReplies) {
+    this.chatReplies = replies;
   }
 
   private async collaborationTask(token: string, tool: 'publish_task_branch' | 'import_task_branch' | 'refresh_upstream') {
@@ -3255,7 +3261,7 @@ export class KarmaxApi {
     return hook;
   }
 
-  async updateIncomingWebhook(token: string, hookId: string, patch: { name?: string; type?: string }): Promise<IncomingWebhook> {
+  async updateIncomingWebhook(token: string, hookId: string, patch: WebhookPatch): Promise<IncomingWebhook> {
     (await this.ownedWebhook(token, hookId));
     return this.webhookCall(() => this.incomingWebhooks().update(hookId, patch));
   }
@@ -3297,6 +3303,13 @@ export class KarmaxApi {
           payload: parseWebhookBody(delivery.raw, delivery.contentType) }));
       } else {
         for (const mention of inbound.mentions) {
+          if (!hooks.admits(hook, mention.author.id)) {
+            await hooks.noteAsking(hook.id, { id: mention.author.id, ...(mention.author.name ? { name: mention.author.name } : {}), text: mention.text });
+            // Discord takes its answer in the delivery's response; the others are posted to.
+            const told = await this.chatReplies?.decline(hook, mention, hook.kind !== 'discord');
+            if (hook.kind === 'discord') inbound.answer = { status: 200, body: { type: 4, data: { content: told ?? 'Not allowed yet.', flags: 64 } } };
+            continue;
+          }
           // A reply to the bot's own message belongs to the thread that message answered.
           const thread = mention.thread ? (await this.deps.store.kvGet(chatThreadKey(hook.id, mention.thread))) ?? mention.thread : undefined;
           const { key, url, ...payload } = { ...mention, ...(thread ? { thread } : {}) };
