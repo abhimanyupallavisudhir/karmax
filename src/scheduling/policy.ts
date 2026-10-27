@@ -33,8 +33,8 @@ export interface SchedulingParams {
    * Scale of the protection levels: 1 is Littlewood's rule, 0 never holds quota back.
    * Littlewood assumes demand turned away is lost; here it only waits and later
    * takes what higher-ranked work left, so less than 1 is better. The best value
-   * depends on load (simulated: 0.75 at 0.7× capacity, 0.5 at 1–1.3×, 1 under a
-   * 20-sub-task burst); 0.75 has the least worst-case regret. Tune per
+   * depends on load (simulated: 0.75 at 0.7× capacity and under a 20-sub-task
+   * burst, 0.5 at 1–1.3×); 0.75 is never more than 26% from the best. Tune per
    * organization with benchmarks/scheduling.ts on its fitted model.
    */
   reserve: number;
