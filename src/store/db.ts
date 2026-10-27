@@ -2811,7 +2811,9 @@ export class Store {
     const taskIds = ((await this.db.prepare('SELECT id FROM tasks WHERE projectId=?').all(projectId)) as any[]).map((r) => String(r.id));
     const worlds: WorldHandleRef[] = [];
     for (const row of (await rowsFor(this.db, 'world_instances', 'worldId', taskIds))) {
-      if (row.state === 'released') continue;
+      // A hibernated world's machine and disk were deleted when it hibernated:
+      // only its checkpoint is left, which the checkpoints list below covers.
+      if (row.state === 'released' || row.state === 'hibernated') continue;
       try { worlds.push(JSON.parse(row.handle) as WorldHandleRef); } catch {}
     }
     const objectKeys = new Set<string>();

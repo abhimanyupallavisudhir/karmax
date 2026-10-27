@@ -18895,9 +18895,10 @@ function wireSettingsView(proj) {
   });
   $('#move-project')?.addEventListener('click', () => moveProject(proj));
   $('#delete-project')?.addEventListener('click', async () => {
-    if (!confirm(`Delete project "${proj.name}"? This permanently removes it and all of its tasks. This cannot be undone.`)) return;
+    const confirmName = await promptText(`Type ${proj.name} to permanently delete this project and all its tasks`);
+    if (confirmName === null) return;
     try {
-      await api(`/api/projects/${proj.id}`, { method: 'DELETE' });
+      await api(`/api/projects/${proj.id}`, { method: 'DELETE', body: JSON.stringify({ confirmName }) });
       toast(`Deleted project "${proj.name}"`);
       const wasCurrent = S.projectId === proj.id;
       await loadProjects();

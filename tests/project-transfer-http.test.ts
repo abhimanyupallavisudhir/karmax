@@ -391,7 +391,8 @@ describe('project transfer and deletion races', () => {
     const waiting = new Promise<void>(resolve => { release = resolve; });
     const started = new Promise<void>(resolve => { entered = resolve; });
     f.client.workflow.getHandle = () => ({ terminate: async () => { entered(); await waiting; } });
-    const deleting = fetch(`${f.server.url}/api/projects/${f.project.id}`, { method: 'DELETE', headers: { cookie: 'test=alice' } });
+    const deleting = fetch(`${f.server.url}/api/projects/${f.project.id}`, { method: 'DELETE', headers: { cookie: 'test=alice' },
+      body: JSON.stringify({ confirmName: f.project.name }) });
     await started;
     const attempt = await f.request(f.route, { destinationOrganizationId: f.destination.id, previewId: preview.id });
     expect(attempt.status).toBe(409);
@@ -411,7 +412,8 @@ describe('project transfer and deletion races', () => {
     f.client.workflow.getHandle = () => ({ describe: async () => { entered(); await waiting; return { status: { name: 'COMPLETED' } }; } });
     const moving = f.request(f.route, { destinationOrganizationId: f.destination.id, previewId: preview.id });
     await started;
-    const deleting = await fetch(`${f.server.url}/api/projects/${f.project.id}`, { method: 'DELETE', headers: { cookie: 'test=alice' } });
+    const deleting = await fetch(`${f.server.url}/api/projects/${f.project.id}`, { method: 'DELETE', headers: { cookie: 'test=alice' },
+      body: JSON.stringify({ confirmName: f.project.name }) });
     expect(deleting.status).toBe(403);
     release();
     expect((await moving).status).toBe(200);

@@ -94,7 +94,8 @@ it('deleting a project removes its wiki, branch views, skills and cached wiki co
   const kept = await projectContent(sibling.id);
   const organizationKept = organizationContent(organization.id);
 
-  const response = await fetch(`${server.url}/api/projects/${project.id}`, { method: 'DELETE', headers });
+  const response = await fetch(`${server.url}/api/projects/${project.id}`, { method: 'DELETE', headers,
+    body: JSON.stringify({ confirmName: project.name }) });
   expect(response.status).toBe(200);
 
   expect(exists(removed.paths)).toEqual(all(removed.paths, false));
@@ -200,7 +201,8 @@ it('deleting a project releases its chunked checkpoints and their chunks, and a 
     expect(fs.readdirSync(chunks)).toHaveLength(4); // two shared weight chunks, one pack each
 
     const response = await fetch(`${local.url}/api/projects/${removed.project.id}`, { method: 'DELETE',
-      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' } });
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ confirmName: removed.project.name }) });
     expect(response.status).toBe(200);
     expect(fs.existsSync(path.join(directory, 'objects', removed.checkpoint.filesystemDelta!.objectKey))).toBe(false);
     expect(fs.readdirSync(chunks)).toHaveLength(3);

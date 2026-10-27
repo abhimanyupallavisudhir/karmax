@@ -4147,7 +4147,12 @@ export class Gateway {
           } catch (error) { return this.json(res, 400, { error: error instanceof Error ? error.message : String(error) }); }
         }
         if (method === 'DELETE') {
-          if (!(await store.getProject(id))) return this.json(res, 404, { error: 'project not found' });
+          const project = await store.getProject(id);
+          if (!project) return this.json(res, 404, { error: 'project not found' });
+          // Named, as an organization's deletion is: one confirm() (that Enter
+          // accepts) once nearly deleted tavya's own project (#737, #747).
+          if (String((await this.body(req))?.confirmName ?? '') !== project.name)
+            return this.json(res, 400, { error: `type the project name (${project.name}) to confirm deletion` });
           return this.withDeletionFence([id], undefined, async () => {
             await this.requestGuards.get(req)?.();
             const resources = await this.removeProjectExternalResources(id, 'project deleted');
@@ -9680,13 +9685,24 @@ export class Gateway {
       if (this.deps.runners) (await this.deps.runners.release(lease.id, lease.provider));
       else (await this.deps.store.releaseWorldLease(lease.id));
     }
-    for (const handle of resources.worlds) {
+    for (const ref of resources.worlds) {
+      const handle = ref as import('../world/types.js').WorldHandle;
+      const provider = this.deps.worlds.get(handle.kind);
       try {
-        // Do not use registry recovery here: deletion must never restore a cold
-        // checkpoint merely to destroy the newly restored generation.
-        const world = await this.deps.worlds.get(handle.kind).open(handle as import('../world/types.js').WorldHandle);
-        await world.destroy();
-      } catch (error) { if (!isWorldGone(error)) throw error; }
+        // Delete at the provider, never through the world: opening wakes a
+        // parked VM (or resumes a sandbox) only to delete it, and fails for
+        // one whose machine is already gone. Not through the registry either:
+        // its recovery would restore a checkpoint just to destroy it.
+        if (provider.destroy) await provider.destroy(handle);
+        else await (await provider.open(handle)).destroy();
+      } catch (error) {
+        if (isWorldGone(error)) continue;
+        // The lifecycle sweep's orphan reaper deletes a sandbox whose task no
+        // longer exists, so one the provider can't delete now must not leave
+        // the project half-deleted with its tasks already stopped (#737, #747).
+        if (!provider.listSandboxes) throw error;
+        console.warn(`[project-delete] ${projectId}: ${handle.kind} world ${handle.id} is left to the orphan reaper: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
     await this.deps.resources?.deleteProject(projectId);
     if (this.deps.checkpoints) await this.deps.checkpoints.deleteProject(projectId);
@@ -10504,8 +10520,9 @@ function isWorkflowGone(error: unknown): boolean {
 }
 
 function isWorldGone(error: unknown): boolean {
-  const value = error as { message?: string };
-  return /(?:not found|does not exist|already (?:destroyed|removed)|no such sandbox|no world)/i.test(value?.message ?? '');
+  const value = error as { message?: string; status?: number };
+  return value?.status === 404
+    || /(?:not found|does not exist|no longer exists|already (?:destroyed|removed)|no such sandbox|no world)/i.test(value?.message ?? '');
 }
 
 /** Headers for agent- or repository-authored bytes served on the console origin.
