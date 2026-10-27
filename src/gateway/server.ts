@@ -1250,6 +1250,18 @@ export class Gateway {
   private clientAddress(req: http.IncomingMessage): string {
     return clientAddress(req);
   }
+
+  /** How a person's request was signed in, for its audit row: the browser
+   * session or app grant (CLI login, MCP client, personal token) by id, never
+   * its secret, and from where. Without it a CLI request and a click in the
+   * console were the same row (#737, #747). */
+  private requestOrigin(req: http.IncomingMessage, session: Session): Record<string, unknown> {
+    const grant = session.appGrant;
+    const via = grant ? { kind: grant.kind, grantId: grant.id, name: grant.name }
+      : session.identitySessionId ? { kind: 'browser', sessionId: session.identitySessionId } : undefined;
+    const userAgent = String(req.headers['user-agent'] ?? '').slice(0, 200);
+    return { ...(via ? { via } : {}), ip: this.clientAddress(req), ...(userAgent ? { userAgent } : {}) };
+  }
   private loginBlocked(keys: string[]): boolean {
     const now = Date.now();
     for (const [key, record] of this.loginFailures) if (record.until <= now) this.loginFailures.delete(key);
@@ -2412,7 +2424,7 @@ export class Gateway {
       if (!decision.allowed) {
         (await this.deps.authorization?.audit(principal, `http.denied.${required}`, auditScope,
           { path: p, method, reason: checked.reason ?? `missing capability ${required}`,
-            ...identityAuditDetail(auditedIdentity) }));
+            ...identityAuditDetail(auditedIdentity), ...this.requestOrigin(req, session) }));
         return this.json(res, 403, { error: await this.routeRefusal(decision, authRecord) });
       }
       if (checked.ok && checked.record) {
@@ -2421,7 +2433,7 @@ export class Gateway {
       }
       if (method !== 'GET' && method !== 'HEAD')
         (await this.deps.authorization?.audit(principal, `http.${method.toLowerCase()}.${required}`, auditScope,
-          { path: p, ...identityAuditDetail(auditedIdentity) }));
+          { path: p, ...identityAuditDetail(auditedIdentity), ...this.requestOrigin(req, session) }));
     }
 
     if (required && requestedScope.projectId && !['GET', 'HEAD'].includes(method)) {
