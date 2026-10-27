@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { Context } from '@temporalio/activity';
 import { makeCoreActivities } from '../src/activities/core.js';
 import { ProfileResolver } from '../src/agent/profiles.js';
+import { ProviderFailure } from '../src/agent/limits.js';
 import { Store } from '../src/store/db.js';
 import { WorldRegistry } from '../src/world/registry.js';
 
@@ -285,6 +286,72 @@ describe('agent turn admission', () => {
     const request = (await store.db.prepare("SELECT metadata FROM usage_events WHERE kind='agent.request'").get()) as any;
     expect(JSON.parse(request.metadata)).toMatchObject({ model: 'claude-opus-5-5', effort: 'xhigh' });
     await world.destroy();
+  });
+
+  // funding-analysis#2: turns the usage limit ended spent whole subscription windows
+  // and left no trace in Usage, so nobody could see where the quota went.
+  it('meters the tokens of a turn that a usage limit ended', async () => {
+    const store = (await Store.create(':memory:'));
+    const project = (await store.createProject('Usage', {}));
+    const task = (await store.createTask({ projectId: project.id, title: 'Limited', workflow: 'just-do',
+      workflowVersion: '1.0.0', params: { prompt: 'work' } as any }));
+    const worlds = new WorldRegistry();
+    const world = await worlds.create('memory', { taskId: task.id, base: 'main' });
+    const spent = { inputTokens: 18, outputTokens: 71, cacheReadTokens: 3_500, cacheWriteTokens: 240,
+      inputTokensIncludeCacheRead: false, totalTokens: 3_829,
+      models: { 'claude-opus-5-5': { inputTokens: 13, outputTokens: 70, cacheReadTokens: 3_000, cacheWriteTokens: 200 },
+        'claude-sonnet-5': { inputTokens: 5, outputTokens: 1, cacheReadTokens: 500, cacheWriteTokens: 40 } } };
+    const adapters = new Map([['claude', { provider: 'claude', async runTurn(_input: any, ctx: any) {
+      ctx.reportUsage(spent);
+      throw new ProviderFailure('Claude usage limit reached', { kind: 'quota', permanence: 'transient',
+        provider: 'claude', source: 'structured', window: '5h' });
+    } }]]) as any;
+    const core = makeCoreActivities({ store, worlds, adapters, profiles: new ProfileResolver(store, 'claude') });
+    try {
+      await expect(core.runAgentTurn({ taskId: task.id, role: 'do', agentTurnId: `${task.id}#0`,
+        agentSlotGranted: true, agentAdmissionManaged: true, worldHandle: world.handle,
+        messages: [{ id: 'm0', role: 'user', text: 'work', ts: 0 }],
+        task: { taskId: task.id, projectId: project.id, title: task.title, prompt: 'work', project: {}, workflow: 'just-do',
+          agents: { do: { provider: 'claude', model: 'claude-opus-5-5' } } },
+      } as any)).rejects.toThrow(/usage limit/);
+      const event = (await store.db.prepare("SELECT taskId, quantity, metadata FROM usage_events WHERE kind='agent.tokens'").get()) as any;
+      expect(event).toMatchObject({ taskId: task.id, quantity: 3_829 });
+      expect(JSON.parse(event.metadata)).toMatchObject({ inputTokens: 18, outputTokens: 71, cacheReadTokens: 3_500,
+        cacheWriteTokens: 240, models: spent.models });
+    } finally { await world.destroy(); await store.close(); }
+  });
+
+  it('prices each model a managed turn used at its own rate', async () => {
+    vi.stubEnv('ANTHROPIC_API_KEY', 'installation-managed-test-key');
+    vi.stubEnv('KARMAX_MANAGED_MODEL_REQUEST_CEILINGS', JSON.stringify({ 'anthropic/big': 500_000 }));
+    vi.stubEnv('KARMAX_MANAGED_MODEL_PRICING', JSON.stringify({
+      'anthropic/big': { inputMicrosPerMillionTokens: 4_000_000, outputMicrosPerMillionTokens: 20_000_000 },
+      'anthropic/small': { inputMicrosPerMillionTokens: 1_000_000, outputMicrosPerMillionTokens: 5_000_000 } }));
+    const store = (await Store.create(':memory:', { hosted: true }));
+    const organization = (await store.createOrganization({ name: 'Two models', ownerUserId: 'owner' }));
+    const project = (await store.createProject('Usage', {}, organization.id));
+    const task = (await store.createTask({ projectId: project.id, title: 'Delegate', workflow: 'just-do',
+      workflowVersion: '1.0.0', params: { prompt: 'work' } as any }));
+    (await store.setOrganizationUsagePolicy(organization.id, { managedSpendCapMicros: 1_000_000, managedModelProviders: ['anthropic'] }));
+    const worlds = new WorldRegistry();
+    const world = await worlds.create('memory', { taskId: task.id, base: 'main' });
+    const adapters = new Map([['claude', { provider: 'claude', async runTurn() {
+      return { termination: { kind: 'success', status: 'end_turn' }, output: 'done',
+        usage: { inputTokens: 2_000, outputTokens: 2_000, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 4_000,
+          models: { big: { inputTokens: 1_000, outputTokens: 1_000, cacheReadTokens: 0, cacheWriteTokens: 0 },
+            small: { inputTokens: 1_000, outputTokens: 1_000, cacheReadTokens: 0, cacheWriteTokens: 0 } } } };
+    } }]]) as any;
+    const core = makeCoreActivities({ store, worlds, adapters, profiles: new ProfileResolver(store, 'claude') });
+    try {
+      await core.runAgentTurn({ taskId: task.id, role: 'do', agentTurnId: `${task.id}#0`,
+        agentSlotGranted: true, agentAdmissionManaged: true, worldHandle: world.handle,
+        messages: [{ id: 'm0', role: 'user', text: 'work', ts: 0 }],
+        task: { taskId: task.id, projectId: project.id, title: task.title, prompt: 'work', project: {}, workflow: 'just-do',
+          agents: { do: { provider: 'claude', model: 'big' } } },
+      } as any);
+      // big: 1k × $4 + 1k × $20 = 24,000 µ$; small: 1k × $1 + 1k × $5 = 6,000 µ$ (not 24,000 at big's rate).
+      expect((await store.usageSummary(organization.id))).toMatchObject({ costMicros: 30_000, incurredCostMicros: 30_000 });
+    } finally { vi.unstubAllEnvs(); await world.destroy(); await store.close(); }
   });
 
   it('uses a blocking update and classifies coordinator failures as retryable infrastructure', async () => {
