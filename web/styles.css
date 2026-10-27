@@ -2767,6 +2767,23 @@ html[data-theme="dark"] .github-signin-btn:active,
 .file-chip-size { flex: none; color: var(--ink-3); font-size: 10px; }
 .file-chip-x { flex: none; border: 0; padding: 2px; background: transparent; color: var(--ink-3); cursor: pointer; }
 .file-chip-x:hover { color: var(--danger); }
+/* An upload in flight: a dimmed preview under a ring that fills as it goes
+   (spinning while a pasted picture is being made smaller). */
+@property --progress { syntax: '<number>'; inherits: true; initial-value: 0; }
+.img-chips [data-upload] { transition: --progress .25s linear; }
+.img-chip[data-upload] img { opacity: .4; }
+.upload-ring {
+  --ring: 22px; flex: none; width: var(--ring); height: var(--ring); border-radius: 50%;
+  background: conic-gradient(var(--accent) calc(var(--progress) * 1turn), color-mix(in srgb, var(--accent) 20%, transparent) 0);
+  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 2.5px));
+  mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 2.5px));
+}
+.img-chip .upload-ring { position: absolute; inset: 0; margin: auto; }
+.file-chip .upload-ring { --ring: 14px; }
+[data-state="preparing"] .upload-ring {
+  background: conic-gradient(var(--accent) .3turn, color-mix(in srgb, var(--accent) 20%, transparent) 0);
+  animation: action-spin .8s linear infinite;
+}
 .msg-images { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
 .msg-images img {
   max-width: 180px; max-height: 180px; object-fit: contain;
