@@ -54,7 +54,7 @@ const events = [
         const paragraph = agent.querySelector('.md-p');
         // Average characters per line of a long paragraph.
         const range = document.createRange(); range.selectNodeContents(paragraph);
-        const lines = [...new Set([...range.getClientRects()].map((rect) => Math.round(rect.top)))].length;
+        const lines = new Set([...range.getClientRects()].map((rect) => Math.round(rect.top))).size;
         const a = css(agent), u = css(user), p = css(paragraph);
         return {
           size: px(p.fontSize), leading: px(p.lineHeight) / px(p.fontSize),
