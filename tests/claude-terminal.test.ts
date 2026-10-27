@@ -446,6 +446,56 @@ describe('Claude Agent SDK terminal outcome contract', () => {
     },
   );
 
+  // funding-analysis#2: ten agents spent a whole subscription window in minutes and
+  // tavya metered none of it: a turn the limit ends has no result, and a result's
+  // `usage` is the main loop of its last run only.
+  const request = (id: string, usage: any, parent: string | null = null, model = 'claude-opus-5-5') => [
+    ...(parent ? [] : [{ type: 'stream_event', parent_tool_use_id: null, session_id: 's1',
+      event: { type: 'message_start', message: { id, model, usage: { ...usage, output_tokens: 1 } } } }]),
+    { type: 'assistant', parent_tool_use_id: parent, session_id: 's1',
+      message: { id, model, usage: { ...usage, output_tokens: 1 }, content: [{ type: 'text', text: 'working' }] } },
+    ...(parent ? [] : [{ type: 'stream_event', parent_tool_use_id: null, session_id: 's1',
+      event: { type: 'message_delta', usage: { output_tokens: usage.output_tokens } } }]),
+  ];
+  const opus = { inputTokens: 13, outputTokens: 70, cacheReadTokens: 3_000, cacheWriteTokens: 200 };
+  const sonnet = { inputTokens: 5, outputTokens: 1, cacheReadTokens: 500, cacheWriteTokens: 40 };
+  const frames = [
+    ...request('msg_1', { input_tokens: 10, output_tokens: 50, cache_read_input_tokens: 1_000, cache_creation_input_tokens: 200 }),
+    ...request('msg_2', { input_tokens: 5, output_tokens: 9, cache_read_input_tokens: 500, cache_creation_input_tokens: 40 }, 'toolu_sub', 'claude-sonnet-5'),
+    ...request('msg_3', { input_tokens: 3, output_tokens: 20, cache_read_input_tokens: 2_000, cache_creation_input_tokens: 0 }),
+  ];
+  const total = (...rows: (typeof opus)[]) => {
+    const sum = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+    for (const row of rows) for (const key of Object.keys(sum) as (keyof typeof sum)[]) sum[key] += row[key];
+    return { ...sum, totalTokens: sum.inputTokens + sum.outputTokens + sum.cacheReadTokens + sum.cacheWriteTokens };
+  };
+
+  it('reports what a turn spent before a usage limit ended it', async () => {
+    sdkState.messages = [...frames, { type: 'assistant', session_id: 's1', error: 'rate_limit',
+      message: { id: 'synthetic', model: '<synthetic>', usage: { input_tokens: 0, output_tokens: 0 },
+        content: [{ type: 'text', text: "You've hit your session limit · resets 2:20am (UTC)" }] } }];
+    const reported: any[] = [];
+    const failure = await new ClaudeAdapter().runTurn(input, { ...ctx, reportUsage: (usage: any) => reported.push(usage) }).catch((e) => e);
+    expect(failure).toBeInstanceOf(ProviderFailure);
+    expect(reported.at(-1)).toEqual({ ...total(opus, sonnet), inputTokensIncludeCacheRead: false,
+      models: { 'claude-opus-5-5': opus, 'claude-sonnet-5': sonnet } });
+  });
+
+  it('counts every request of a turn, its sub-agents and earlier results included', async () => {
+    // A follow-up folded in mid-turn: the harness keeps working past the first result.
+    const state = (value: string) => ({ type: 'system', subtype: 'session_state_changed', state: value, session_id: 's1' });
+    sdkState.messages = [state('running'), ...frames.slice(0, 3),
+      { type: 'result', subtype: 'success', is_error: false, session_id: 's1',
+        usage: { input_tokens: 10, output_tokens: 50, cache_read_input_tokens: 1_000, cache_creation_input_tokens: 200 } },
+      ...frames.slice(3),
+      { type: 'result', subtype: 'success', is_error: false, session_id: 's1', stop_reason: 'end_turn',
+        usage: { input_tokens: 3, output_tokens: 20, cache_read_input_tokens: 2_000, cache_creation_input_tokens: 0 } },
+      state('idle')];
+    const turn = await new ClaudeAdapter().runTurn(input, ctx);
+    expect(turn.usage).toEqual({ ...total(opus, sonnet), inputTokensIncludeCacheRead: false,
+      models: { 'claude-opus-5-5': opus, 'claude-sonnet-5': sonnet } });
+  });
+
   it('uses the structured assistant rate-limit signal even when the SDK result lies about success', async () => {
     sdkState.messages = [
       {

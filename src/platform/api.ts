@@ -36,7 +36,7 @@ import {
 import { templateContent, templateName, templateParams, templateAuthorization } from '../domain/task-templates.js';
 import { TaskRecord, TaskView, AttentionAsk, Message, Project, TaskInput, ImageRef, FileRef, Tag, SavedView, TaskTemplate, TaskQuery, AgentRole, AgentSpec, AgentAuthority, FieldSpec, Provider, PrincipalRef, ConfirmationPolicy, OrganizationExecutionPolicy, Stage, StageTransition, TaskRecoveryCheckpoint, AuthorizationSelection, mergeQueueDomains, Urgency, DEFAULT_URGENCY, normalizeUrgency, remotePolicyOf, ResourceAccess, ResourceTarget, type Avatar } from '../domain/types.js';
 import { hasActiveTriggers, cloneParamsWithoutTriggers, normalizeTriggers, validateTriggers, forcesRepeatable, awaitsSuccessOf, isSeries } from '../domain/triggers.js';
-import { STORE_TASKS, storeTaskNeeds, storeTaskRepeatable, type StoreNeed, type StoreTask } from '../domain/task-store.js';
+import { STORE_TASKS, storeTaskNeeds, storeTaskRepeatable, takenFromStore, type StoreNeed, type StoreTask } from '../domain/task-store.js';
 import { applyTriggerContext, normalizeEventInput, validateFollow, type EventFilter, type EventFollow, type ProjectEvent, type ProjectEventClaim,
   type ProjectEventInput, type ProjectEventOrigin, type TriggerContext } from '../domain/project-events.js';
 import { newId } from '../util/id.js';
@@ -3251,7 +3251,7 @@ export class KarmaxApi {
     };
     return STORE_TASKS.map(({ task: { hostedPrompt, ...task }, ...template }) => ({ ...template, task: { ...task, prompt: this.storePrompt({ task: { ...task, hostedPrompt } }) },
       repeatable: storeTaskRepeatable({ task }),
-      installed: tasks.filter((candidate) => candidate.params?.template === template.id && !candidate.params?.runOf)
+      installed: tasks.filter((candidate) => takenFromStore(candidate, { id: template.id, task }))
         .sort((a, b) => b.createdAt - a.createdAt).map((candidate) => candidate.id),
       missing: storeTaskNeeds({ task, needs: template.needs }).filter((need) => !has[need]) }));
   }
@@ -3260,19 +3260,20 @@ export class KarmaxApi {
     return this.deps.hosted ? template.task.hostedPrompt ?? template.task.prompt : template.task.prompt;
   }
 
-  /** Take a task from the store: an ordinary one starts now (as often as
-   *  asked); a repeatable one becomes the project's armed series, once. */
-  async runStoreTask(token: string, projectId: string, templateId: string): Promise<TaskRecord> {
+  /** Take a task from the store: an ordinary one starts now, a repeatable one
+   *  becomes an armed series of the project — as often as asked, each one
+   *  its own (say, one per label it builds).
+   *  `overrides` customize it as createTask's arguments do, `params` field by
+   *  field (what the task form sends when it is opened from the store). */
+  async runStoreTask(token: string, projectId: string, templateId: string,
+    overrides: Omit<Parameters<KarmaxApi['createTask']>[1], 'projectId' | 'templateId'> = {}): Promise<TaskRecord> {
     (await this.require(token, 'create_task', { projectId }));
     if (!(await this.deps.store.getProject(projectId))) throw new NotFoundError(`no project ${projectId}`);
     const template = STORE_TASKS.find((candidate) => candidate.id === templateId);
     if (!template) throw new NotFoundError(`no store task ${templateId}`);
-    if (storeTaskRepeatable(template)) {
-      const existing = (await this.deps.store.listTasks(projectId)).find((task) => task.params?.template === templateId && !task.params?.runOf);
-      if (existing) throw new ValidationError(`this project already has it: ${existing.id}`);
-    }
-    return this.createTask(token, { projectId, title: template.task.title, prompt: this.storePrompt(template), ...(template.task.workflow ? { workflow: template.task.workflow } : {}),
-      params: { ...template.task.params, template: template.id } });
+    const { params, ...rest } = overrides;
+    return this.createTask(token, { projectId, title: template.task.title, ...(template.task.workflow ? { workflow: template.task.workflow } : {}), ...rest,
+      params: { ...template.task.params, prompt: this.storePrompt(template), ...params, template: template.id } });
   }
 
   /** A run started by an event follows what the event is about: the issue's
@@ -3498,10 +3499,11 @@ export class KarmaxApi {
       (await this.validatePromptFiles(task.projectId, promptFiles));
       params.files = promptFiles;
     }
-    const { archived, profiles, priority, _authorization, _agentAuthorization, _githubAccountId } = task.params;
+    const { archived, profiles, priority, template, _authorization, _agentAuthorization, _githubAccountId } = task.params;
     const meta = {
       paymentPolicy: (task.params as any).paymentPolicy,
       ...(archived !== undefined ? { archived } : {}),
+      ...(template !== undefined ? { template } : {}),
       ...(profiles !== undefined ? { profiles } : {}),
       ...(priority !== undefined ? { priority } : {}),
       ...(_authorization !== undefined ? { _authorization } : {}),
@@ -3564,9 +3566,11 @@ export class KarmaxApi {
         mayAttenuate: staysDraft && opts.allowAttenuation === true, accept: opts.acceptAttenuation, fromDefaults,
       }));
     }
-    // Keep the display title tracking the (edited) prompt — the title was derived
-    // from the prompt at creation, so an edit should carry through (SPEC §10).
-    if (typeof base.prompt === 'string' && base.prompt.trim()) (await this.deps.store.setTaskTitle(taskId, firstLine(String(base.prompt))));
+    // Keep the display title tracking the (edited) prompt when it was derived
+    // from the prompt (SPEC §10). A title given at creation stays: a store
+    // automation's `#{{issue.number}} {{issue.title}}` names each of its runs.
+    if (typeof base.prompt === 'string' && base.prompt.trim() && task.title === firstLine(String(task.params?.prompt ?? task.params?.command ?? 'Task')))
+      (await this.deps.store.setTaskTitle(taskId, firstLine(String(base.prompt))));
     // A cron/recurring trigger forces the series flag on (mirrors createTask).
     if (forcesRepeatable(normalizeTriggers(base))) base.repeatable = true;
     // A repeatable series stays a series when saved: persist, then arm it if it

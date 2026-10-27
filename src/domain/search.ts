@@ -318,6 +318,8 @@ export const FIELDS: FieldDef[] = [
   { key: 'updated', label: 'Updated', type: 'date', get: statusChangedAt, sortable: true, sortKey: updatedFor },
   { key: 'notes', label: 'Notes', type: 'text', get: (t) => t.notes },
   { key: 'prompt', label: 'Prompt', type: 'text', get: (t) => (t.params?.prompt == null ? undefined : String(t.params.prompt)) },
+  // The Task store entry a task was taken from (`store:build-planned-issues is:series`).
+  { key: 'store', label: 'Task store entry', type: 'text', get: (t) => (typeof t.params?.template === 'string' ? t.params.template : undefined) },
   { key: 'conversation', label: 'Conversation', type: 'text', aliases: ['says'], get: conversationText },
   { key: 'branch', label: 'Branch', type: 'text', get: (t) => t.lastView?.branch },
   { key: 'target', label: 'Target', type: 'text', aliases: ['targetBranch'], get: (t) => t.lastView?.targetBranch },

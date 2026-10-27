@@ -8,6 +8,8 @@ import { PaddleSubscriptionProvider, type PaddleRuntimeConfig } from '../src/bil
 /** Paddle **sandbox** harness ([[ops/billing-paddle]] § Sandbox harness traps).
  *
  *   PADDLE_SANDBOX_KEY_FILE=… npx tsx scripts/paddle-sandbox.ts subscribe        # a test-card Individual subscription
+ *   PADDLE_SANDBOX_KEY_FILE=… npx tsx scripts/paddle-sandbox.ts subscribe packs  # a storage pack alone (beside a gifted plan)
+ *   PADDLE_SANDBOX_KEY_FILE=… npx tsx scripts/paddle-sandbox.ts packs <sub_…>    # packs alone: add, end with the last, resume
  *   PADDLE_SANDBOX_KEY_FILE=… npx tsx scripts/paddle-sandbox.ts top-up <sub_…>   # one compute top-up, then find it
  *   PADDLE_SANDBOX_KEY_FILE=… npx tsx scripts/paddle-sandbox.ts cancel <sub_…>   # cancel it now
  *
@@ -44,8 +46,9 @@ function guard(subscriptionId: string | undefined): string {
   return subscriptionId;
 }
 
-async function subscribe() {
-  const transaction = await paddle('/transactions', 'POST', { items: [{ price_id: SANDBOX.individualPriceId, quantity: 1 }],
+async function subscribe(packsAlone = false) {
+  const transaction = await paddle('/transactions', 'POST', {
+    items: [{ price_id: packsAlone ? SANDBOX.storagePackPriceId : SANDBOX.individualPriceId, quantity: 1 }],
     collection_mode: 'automatic', custom_data: { karmax_harness: crypto.randomUUID() },
     checkout: { url: 'https://tavya.io/billing/checkout' } });
   console.log('transaction', transaction.id, transaction.status);
@@ -123,13 +126,44 @@ async function topUp(subscriptionId: string) {
   throw new Error('the top-up never settled');
 }
 
+/** What the provider does to a subscription of packs alone: add one, remove
+ * them all (it ends with the period), add one back (it is kept). */
+async function packs(subscriptionId: string) {
+  const config: PaddleRuntimeConfig = { environment: 'sandbox', apiKey, webhookSecret: 'unused', ...SANDBOX };
+  const provider = new PaddleSubscriptionProvider(() => config);
+  const show = async (step: string) => {
+    const now = await paddle(`/subscriptions/${subscriptionId}`);
+    console.log(step.padEnd(28), now.status, 'items', now.items.map((item: any) => `${item.price.id}×${item.quantity}`).join(', '),
+      'scheduled', JSON.stringify(now.scheduled_change), 'next', now.next_billed_at);
+    return now;
+  };
+  const settled = async (storagePacks: number) => JSON.stringify(await provider.reconcileRequest({ kind: 'storage', subscriptionId, storagePacks }, 'ref', Date.now()));
+  await show('before');
+  await provider.updateStoragePacks({ subscriptionId, storagePacks: 2, idempotencyKey: 'sandbox' });
+  await show('2 packs');
+  console.log('reconcile 2 →', await settled(2));
+  await provider.updateStoragePacks({ subscriptionId, storagePacks: 0, idempotencyKey: 'sandbox' });
+  const ending = await show('0 packs (ends with period)');
+  if (ending.scheduled_change?.action !== 'cancel') throw new Error('the last pack did not schedule the end');
+  console.log('reconcile 0 →', await settled(0));
+  await provider.updateStoragePacks({ subscriptionId, storagePacks: 0, idempotencyKey: 'sandbox' });
+  await provider.updateStoragePacks({ subscriptionId, storagePacks: 2, idempotencyKey: 'sandbox' });
+  const kept = await show('2 again (kept)');
+  if (kept.scheduled_change) throw new Error('adding a pack back did not keep the subscription');
+  await provider.updateStoragePacks({ subscriptionId, storagePacks: 0, idempotencyKey: 'sandbox' });
+  await provider.changePlan({ subscriptionId, plan: 'individual', seats: 1, items: {}, idempotencyKey: 'sandbox' });
+  const planned = await show('ending, then a plan added');
+  if (planned.scheduled_change) throw new Error('adding a plan did not keep the subscription');
+}
+
 async function cancel(subscriptionId: string) {
   const result = await paddle(`/subscriptions/${subscriptionId}/cancel`, 'POST', { effective_from: 'immediately' });
   console.log('subscription', subscriptionId, result.status);
 }
 
 const [command, argument] = process.argv.slice(2);
-if (command === 'subscribe') await subscribe();
+if (command === 'subscribe') await subscribe(argument === 'packs');
+else if (command === 'packs') await packs(guard(argument));
 else if (command === 'top-up') await topUp(guard(argument));
 else if (command === 'cancel') await cancel(guard(argument));
-else throw new Error('usage: paddle-sandbox.ts subscribe | top-up <sub_…> | cancel <sub_…>');
+else throw new Error('usage: paddle-sandbox.ts subscribe [packs] | packs <sub_…> | top-up <sub_…> | cancel <sub_…>');

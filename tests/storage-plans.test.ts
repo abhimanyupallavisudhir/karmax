@@ -34,16 +34,18 @@ describe('plan storage entitlements', () => {
     expect(hostedStorageQuotaBytes('individual', 1, 1)).toBe(150 * GIB);
   });
 
-  it('ignores packs on Free, so a lapsed subscription falls back to the Free quota', () => {
-    expect(hostedStorageQuotaBytes('free', 1, 5)).toBe(5 * GIB);
-    expect(organizationEntitlements('free', true, 1, { storagePacks: 5 })).toMatchObject({ storageQuotaBytes: 5 * GIB, storagePacks: 0 });
+  it('counts the paid packs in force on any plan: billing clears a lapsed subscription\'s', () => {
+    expect(hostedStorageQuotaBytes('free', 1, 5)).toBe(505 * GIB);
+    expect(organizationEntitlements('free', true, 1, { storagePacks: 5 })).toMatchObject({ storageQuotaBytes: 505 * GIB, storagePacks: 5 });
+    expect(organizationEntitlements('free', true, 1)).toMatchObject({ storageQuotaBytes: 5 * GIB, storagePacks: 0 });
   });
 
-  it('bills each pack monthly on a paid plan and never on Free', () => {
+  it('bills each pack monthly, beside a plan or alone', () => {
     expect(hostedMonthlyPriceCents('team', 3, 2)).toBe(1_900 + 2 * 500 + 2 * 400);
     expect(hostedMonthlyPriceCents('individual', 1, 1)).toBe(900 + 400);
     expect(hostedMonthlyPriceCents('individual', 1)).toBe(900);
-    expect(hostedMonthlyPriceCents('free', 1, 3)).toBe(0);
+    expect(hostedMonthlyPriceCents('free', 1)).toBe(0);
+    expect(hostedMonthlyPriceCents('free', 1, 3)).toBe(3 * 400);
   });
 
   it('leaves private installations unmetered', () => {
@@ -63,7 +65,11 @@ describe('hosted managed storage quota', () => {
     expect(listed!.quotaBytes).toBe(300 * GIB);
     expect(listed!.usage).toMatchObject({ quotaBytes: 300 * GIB, availableBytes: 300 * GIB });
 
+    // Packs in force count on any plan (a gifted plan's are bought alone);
+    // billing clears them once their subscription lapses.
     (await f.store.setOrganizationPlan(f.organizationId, 'free'));
+    expect((await f.store.storageLocationUsage(f.managed.id)).quotaBytes).toBe(205 * GIB);
+    (await f.store.setOrganizationStoragePacks(f.organizationId, 0));
     expect((await f.store.storageLocationUsage(f.managed.id)).quotaBytes).toBe(5 * GIB);
   });
 

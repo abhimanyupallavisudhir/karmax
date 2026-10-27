@@ -1,5 +1,6 @@
 import { claudeWorkEnvironment, workEnvironment } from './work-environment.js';
 import { ReportedUsage } from '../timing/usage.js';
+import { ClaudeStreamUsage } from './claude-stream-usage.js';
 import { readAnthropicMessage, readStreamOnceMore } from './api-streams.js';
 import { currentTiming, timed } from '../timing/index.js';
 import { apiMcpTools } from '../mcp/connections/client.js';
@@ -96,6 +97,7 @@ export class ClaudeAdapter implements AgentAdapter {
     const model = input.profile.model ?? CLAUDE_DEFAULT_MODEL;
     (await (await currentTiming())?.mark('provider.selected', { provider: 'claude', model }));
     const mcp = await apiMcpTools(input.world, input.agentMcp, ctx.signal);
+    const reportedUsage = new ReportedUsage();
     try {
     const handlers = { ...platformToolHandlers(input.world, ctx, () => workEnvironment(input)), ...mcp.handlers };
     const tools = [...MESSAGES_API_TOOLS, ...mcp.tools.map((t) => ({ name: t.name, description: t.description, input_schema: t.parameters }))];
@@ -115,7 +117,6 @@ export class ClaudeAdapter implements AgentAdapter {
 
     const maxIters = input.maxTurns ?? input.profile.maxTurns ?? RUNAWAY_BACKSTOP;
     let finalText = '';
-    const reportedUsage = new ReportedUsage();
     let terminalStatus: string | undefined;
     let terminalReason: string | undefined;
     // How many `input.messages` this turn has consumed. This path rebuilds the full
@@ -254,22 +255,27 @@ export class ClaudeAdapter implements AgentAdapter {
       delivered: deliveredIndex,
       usage: reportedUsage.total(),
     };
-    } finally { try { await mcp.close(); } catch { /* cleanup must not replace the turn outcome */ } }
+    } finally {
+      ctx.reportUsage?.(reportedUsage.total());
+      try { await mcp.close(); } catch { /* cleanup must not replace the turn outcome */ }
+    }
   }
 
   // ─── Claude Agent SDK (ambient Claude Code login) ───────────────────────────
   private async runAgentSdk(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
-    try { return await this.runAgentSdkWithRecovery(input, ctx); }
+    // One meter for the turn, across a retried attempt: both spent the account's quota.
+    const meter = new ClaudeStreamUsage();
+    try { return await this.runAgentSdkWithRecovery(input, ctx, meter); }
     catch (error) {
       // A sandbox controls its PTY bytes. Preserve its turn failure, but shared
       // account health must come from a host-side check (confirmSandboxFailure).
       if (isRemoteAgentWorld(input.world) && error instanceof ProviderFailure)
         throw new SandboxProviderFailure(error);
       throw error;
-    }
+    } finally { ctx.reportUsage?.(meter.total()); }
   }
 
-  private async runAgentSdkWithRecovery(input: TurnInput, ctx: PlatformToolContext): Promise<AdapterTurn> {
+  private async runAgentSdkWithRecovery(input: TurnInput, ctx: PlatformToolContext, meter: ClaudeStreamUsage): Promise<AdapterTurn> {
     const configHome = input.resolvedAuth?.configHome
       ?? process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), '.claude');
     input = { ...input, resolvedAuth: { ...input.resolvedAuth, configHome } };
@@ -281,7 +287,7 @@ export class ClaudeAdapter implements AgentAdapter {
           title: 'Recovered imported Claude tool inputs; resuming a repaired copy' });
       }
     }
-    if (!hasClaudeNativeCredential(configHome)) return this.runAgentSdkAttempt(input, ctx);
+    if (!hasClaudeNativeCredential(configHome)) return this.runAgentSdkAttempt(input, ctx, meter);
     const recovery = { deliveredMessages: input.deliveredMessages ?? 0 };
     const messages = [...input.messages];
     let latestSession = input.session;
@@ -296,7 +302,7 @@ export class ClaudeAdapter implements AgentAdapter {
       onSession: (session) => { latestSession = session; fork = false; ctx.onSession?.(session); },
     };
     try {
-      return await this.runAgentSdkAttempt(input, retryCtx, recovery);
+      return await this.runAgentSdkAttempt(input, retryCtx, meter, recovery);
     } catch (error) {
       // Native local refresh normally handles expiry; remote projections have
       // no refresh authority. Recover a terminal expiry once, before the
@@ -319,14 +325,15 @@ export class ClaudeAdapter implements AgentAdapter {
       ctx.emitActivity({ id: 'claude-credential-recovery', kind: 'status', phase: 'completed',
         title: 'Refreshed Claude access token; resuming turn' });
       return this.runAgentSdkAttempt({ ...input, messages, deliveredMessages: recovery.deliveredMessages,
-        ...(latestSession ? { session: latestSession, fork } : {}) }, retryCtx, recovery);
+        ...(latestSession ? { session: latestSession, fork } : {}) }, retryCtx, meter, recovery);
     }
   }
 
-  private async runAgentSdkAttempt(input: TurnInput, ctx: PlatformToolContext, recovery?: { deliveredMessages: number }): Promise<AdapterTurn> {
+  private async runAgentSdkAttempt(input: TurnInput, ctx: PlatformToolContext, meter: ClaudeStreamUsage,
+    recovery?: { deliveredMessages: number }): Promise<AdapterTurn> {
     const work = await claudeWorkEnvironment(input, !!ctx.onSecretEnvChange);
     const unsubscribe = ctx.onSecretEnvChange?.(work.update);
-    try { return await this.runAgentSdkProcess(input, ctx, work.settings, recovery); }
+    try { return await this.runAgentSdkProcess(input, ctx, work.settings, meter, recovery); }
     finally {
       try { unsubscribe?.(); } catch { /* cleanup must not replace the turn outcome */ }
       try { await work.cleanup(); } catch { /* cleanup must not replace the turn outcome */ }
@@ -334,7 +341,8 @@ export class ClaudeAdapter implements AgentAdapter {
   }
 
   private async runAgentSdkProcess(input: TurnInput, ctx: PlatformToolContext,
-    workSettings: Awaited<ReturnType<typeof claudeWorkEnvironment>>['settings'], recovery?: { deliveredMessages: number }): Promise<AdapterTurn> {
+    workSettings: Awaited<ReturnType<typeof claudeWorkEnvironment>>['settings'], meter: ClaudeStreamUsage,
+    recovery?: { deliveredMessages: number }): Promise<AdapterTurn> {
     const runtimeWorld = input.world.withoutProjectEnvironment?.() ?? input.world;
     let sdk: any;
     try {
@@ -788,6 +796,7 @@ export class ClaudeAdapter implements AgentAdapter {
     };
     try {
       for await (const message of withClaudeStartupDeadline<any>(iterator, onAbort, () => diagnoseStartup('timeout'))) {
+        meter.observe(message);
         if (firstSdkEvent) {
           firstSdkEvent = false;
           remoteProcess?.startupComplete();
@@ -1109,11 +1118,7 @@ export class ClaudeAdapter implements AgentAdapter {
       session,
       output: finalText,
       delivered: deliveredIndex,
-      usage: (() => {
-        const reported = new ReportedUsage();
-        reported.add(successfulResult.usage, 'claude');
-        return reported.total();
-      })(),
+      usage: meter.total(),
       ...(pending ? { pendingSubagents: pending } : {}),
       ...(pendingShells ? { pendingBackgroundShells: pendingShells } : {}),
       ...(stoppedShells.length ? { stoppedBackgroundShells: stoppedShells } : {}),

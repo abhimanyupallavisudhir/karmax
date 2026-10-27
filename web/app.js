@@ -6238,7 +6238,8 @@ function renderMain() {
     if (S.view) renderTaskPage();
     return;
   }
-  if (S.storeOpen && S.tab === 'tasks') return renderStoreTaskPage();
+  // A store task's form covers #main (applyStoreTaskRoute).
+  if (S.storeOpen && S.tab === 'tasks') return;
   // An open wiki editor likewise manages its own renders: a background refresh
   // must not clobber in-progress edits (only the focused field would survive
   // the async rehydrate). Navigation still repaints — it changes S.tab or
@@ -6649,47 +6650,65 @@ const STORE_NEEDS = { github: ['Needs GitHub', 'Connect a GitHub repository to t
 function storeNeed(item) {
   return !(item.repeatable && item.installed?.length) && item.missing?.length ? STORE_NEEDS[item.missing[0]] : null;
 }
-// Run, Install, or Open the series it installed.
-// A row's is small; on its page the one thing to do is primary.
-function storeActionHtml(item, projectId, onPage = false) {
+// Run, Install, or Open what it installed (one series, or the list of them),
+// in one click; the row opens the form, to change it first or install another.
+function storeInstalledRoute(item, projectId) {
+  return item.installed.length === 1 ? taskUrl(item.installed[0], taskRecord(item.installed[0]) || { projectId })
+    : listRoute(projectBase(projectId), `store:${item.id} is:series`);
+}
+function storeActionHtml(item, projectId) {
   const need = storeNeed(item);
   const disabled = need ? ` disabled title="${esc(need[1])}"` : '';
-  const cls = onPage ? 'btn primary' : 'btn sm';
-  if (item.repeatable && item.installed?.length) return `<a class="${onPage ? 'btn' : cls}" data-spa href="${esc(taskUrl(item.installed[0], taskRecord(item.installed[0]) || { projectId }))}">Open</a>`;
+  if (item.repeatable && item.installed?.length) return `<a class="btn sm" data-spa href="${esc(storeInstalledRoute(item, projectId))}">Open</a>`;
   return item.repeatable
-    ? `<button class="${cls}" data-store-run="${esc(item.id)}"${disabled}>Install</button>`
-    : `<button class="${onPage ? cls : 'btn sm primary'}" data-store-run="${esc(item.id)}"${disabled}>Run</button>`;
+    ? `<button class="btn sm" data-store-run="${esc(item.id)}"${disabled}>Install</button>`
+    : `<button class="btn sm primary" data-store-run="${esc(item.id)}"${disabled}>Run</button>`;
 }
-// A store task's own page: /<org>/<project>/store/<id>.
+// A store task's own form: /<org>/<project>/store/<id>.
 function storeTaskRoute(projectId, id) { return `${projectBase(projectId)}/store/${encodeURIComponent(id)}`; }
+// On the organization home a store task asks which project it is for: the
+// row's state and actions there would be about a project nobody chose.
 function storeRowHtml(item) {
+  const home = S.tab === 'home';
   const projectId = storeProjectId();
-  const installed = item.repeatable && item.installed?.length;
-  const need = storeNeed(item);
+  const installed = !home && item.repeatable ? item.installed?.length || 0 : 0;
+  const need = home ? null : storeNeed(item);
+  const action = home ? `<button class="btn sm${item.repeatable ? '' : ' primary'}" data-store-choose="${esc(item.id)}" title="Choose a project">${item.repeatable ? 'Install…' : 'Run…'}</button>`
+    : storeActionHtml(item, projectId);
+  const link = home ? `<a class="row-link" href="${esc(storeTaskRoute(projectId, item.id))}" data-store-choose="${esc(item.id)}" draggable="false" tabindex="-1" aria-hidden="true"></a>`
+    : `<a class="row-link" data-spa href="${esc(storeTaskRoute(projectId, item.id))}" draggable="false" tabindex="-1" aria-hidden="true"></a>`;
   return `<div class="task-row store-row has-row-link" data-store-task="${esc(item.id)}" tabindex="0" role="group" aria-label="${esc(item.name)}">
       <div class="task-main">
         <div class="task-title">${esc(item.name)} ${item.summary ? policyTip(item.summary) : ''}</div>
-        <div class="task-sub">${item.repeatable ? `<span class="chip">${installed ? 'installed' : 'repeatable'}</span>` : ''}${need ? `<span>${esc(need[0])}</span>` : ''}</div>
+        <div class="task-sub">${item.repeatable ? `<span class="chip">${installed > 1 ? `${installed} installed` : installed ? 'installed' : 'repeatable'}</span>` : ''}${need ? `<span>${esc(need[0])}</span>` : ''}</div>
       </div>
-      <div class="task-right">${storeActionHtml(item, projectId)}</div>
-      <a class="row-link" data-spa href="${esc(storeTaskRoute(projectId, item.id))}" draggable="false" tabindex="-1" aria-hidden="true"></a>
+      <div class="task-right">${action}</div>
+      ${link}
     </div>`;
 }
-// Reading one changes nothing: the page shows what it would do, and the same
-// Run / Install as its row.
+// The task form, filled in from the store task: every field can change before
+// it runs or installs (again: each install is a series of its own).
+// `carried`: the form's params when it moves to another project.
+let carriedStoreForm = null;
 async function applyStoreTaskRoute(projectId, id, routeIsCurrent) {
   S.tab = 'tasks';
   closeTaskDom();
   renderRail();
-  if (S.taskStore?.[projectId]) renderMain();
-  else renderRouteLoadingPage('Task store');
-  await loadTaskStore(projectId, { force: true });
-  if (!routeIsCurrent()) return;
-  if (!S.taskStore?.[projectId]?.some((item) => item.id === id)) {
+  const cached = S.taskStore?.[projectId]?.find((item) => item.id === id);
+  if (!cached) {
+    renderRouteLoadingPage('Task store');
+    await loadTaskStore(projectId, { force: true });
+    if (!routeIsCurrent()) return;
+  }
+  const item = cached || S.taskStore?.[projectId]?.find((candidate) => candidate.id === id);
+  if (!item) {
     toast('Not in the Task store', true);
     return go(listRoute(projectBase(projectId), STORE_VIEW_QUERY), { replace: true });
   }
-  renderMain();
+  const carried = carriedStoreForm?.projectId === projectId && carriedStoreForm.id === id ? carriedStoreForm.params : null;
+  carriedStoreForm = null;
+  openTaskForm(item.task.workflow || NEW_TASK_WORKFLOW, undefined, '',
+    carried || { ...item.task.params, prompt: item.task.prompt, template: item.id }, { projectId, store: item });
 }
 function storeBackRoute() { return S.returnRoute || listRoute(projectBase(S.projectId), STORE_VIEW_QUERY); }
 function closeStoreTask() {
@@ -6697,48 +6716,59 @@ function closeStoreTask() {
   S.returnRoute = null;
   return go(back);
 }
-// Its triggers, conditions included (a series page's summary says less).
-function storeTriggerSummary(triggers) {
-  return (triggers || []).map((trigger) => {
-    const where = Object.entries(trigger.kind === 'event' ? trigger.where || {} : {}).map(([path, expected]) => {
-      const [op, value] = eventConditionParts(expected);
-      return `${path} ${EVENT_OPS.find(([v]) => v === op)[1]} ${value}`;
-    });
-    return [triggerSummary([trigger]), ...where].join(' · ');
-  }).join('  ·  ');
-}
-function renderStoreTaskPage() {
-  const main = $('#main');
-  const projectId = S.projectId;
-  const item = (S.taskStore?.[projectId] || []).find((candidate) => candidate.id === S.storeOpen);
-  if (!main || !item) return;
-  const installed = item.repeatable && item.installed?.length;
+// What the store form's foot says: what the project lacks for it, or that it
+// is installed already (this adds another, which runs alongside it).
+function storeFormHint(item) {
   const need = storeNeed(item);
-  const md = markdownEnabled() ? ' md' : '';
-  const when = storeTriggerSummary(item.task?.params?.triggers);
-  main.innerHTML = `
-    <div class="task-page store-page" data-store-page="${esc(item.id)}">
-      <div class="tp-head">
-        <div class="row1">
-          <a class="icon-btn" id="tp-back" href="${esc(storeBackRoute())}" data-shortcut="nav.close" title="Back (Esc)">←</a>
-          <h2>${esc(item.name)}</h2>
-          ${item.repeatable ? `<span class="chip">${installed ? 'installed' : 'repeatable'}</span>` : ''}
-        </div>
-        ${when ? `<div class="meta"><span>${esc(when)}</span></div>` : ''}
-      </div>
-      <div class="tp-body" id="tp-body" tabindex="-1"><div class="tp-content">
-        ${item.summary ? `<p class="store-summary">${esc(item.summary)}</p>` : ''}
-        <div class="section-h">Prompt</div>
-        <div class="store-prompt msg-text${md}">${renderMessageBody(item.task?.prompt || '')}</div>
-      </div></div>
-      <div class="tp-foot" id="tp-foot"><div class="tp-foot-inner">
-        ${need ? `<span class="store-need">${esc(need[0])}</span>` : ''}
-        <span style="flex:1"></span>
-        ${storeActionHtml(item, projectId, true)}
-      </div></div>
-    </div>`;
-  $('#tp-back').addEventListener('click', plainClick(closeStoreTask));
-  wireTaskStore();
+  if (need) return `<span class="store-need" title="${esc(need[1])}">${esc(need[0])}</span>`;
+  return item.repeatable && item.installed?.length
+    ? `<span class="store-need" title="This installs another copy, which runs alongside it">Installed already</span>` : '';
+}
+// Which project a store task chosen on the organization home is for; its form
+// opens there. With one project there is nothing to ask.
+function chooseStoreProject(id) {
+  const projects = (S.projects || []).filter((project) => project.organizationId === S.organizationId);
+  const open = (projectId) => { rememberNewTaskProject(projectId); spaNavigate(storeTaskRoute(projectId, id)); };
+  if (projects.length === 1) return open(projects[0].id);
+  if (!projects.length) return;
+  const name = (S.taskStore?.[storeProjectId()] || []).find((item) => item.id === id)?.name || 'Task';
+  const previousFocus = document.activeElement;
+  const root = createTransientOverlay();
+  root.innerHTML = `<div class="palette-scrim" id="sp-scrim"><div class="palette store-project-picker" role="dialog" aria-label="${esc(name)}: choose a project">
+    <input id="sp-in" placeholder="${esc(name)} in…" autocomplete="off" aria-label="Project" />
+    <div id="sp-list" role="listbox"></div>
+  </div></div>`;
+  const input = root.querySelector('#sp-in'), list = root.querySelector('#sp-list');
+  const preferred = newTaskProjectId();
+  const all = [...projects].sort((a, b) => (b.id === preferred) - (a.id === preferred));
+  let shown = all, active = 0;
+  const close = () => root.remove();
+  const dismiss = () => { close(); previousFocus?.focus?.(); };
+  const choose = (project) => { if (!project) return; close(); open(project.id); };
+  const draw = () => {
+    list.innerHTML = shown.map((project, i) => `<div class="opt${i === active ? ' active' : ''}" role="option" aria-selected="${i === active}" data-i="${i}" title="${esc(projectPath(project))}">
+      <span class="task-project">${esc(projectSlug(project))}</span>${i === active ? '<span class="key">↵</span>' : ''}</div>`).join('')
+      || '<div class="pal-empty">No such project</div>';
+    list.querySelector('.opt.active')?.scrollIntoView({ block: 'nearest' });
+  };
+  input.addEventListener('input', () => {
+    const q = input.value.trim();
+    shown = q ? all.map((project) => ({ project, score: fuzzyScore(q, `${projectSlug(project)} ${project.name || ''}`) })).filter((x) => x.score >= 0)
+      .sort((a, b) => b.score - a.score).map((x) => x.project) : all;
+    active = 0;
+    draw();
+  });
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.stopPropagation(); dismiss(); }
+    else if (e.key === 'ArrowDown') { e.preventDefault(); active = Math.min(shown.length - 1, active + 1); draw(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); active = Math.max(0, active - 1); draw(); }
+    else if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); choose(shown[active]); }
+  });
+  list.addEventListener('click', (e) => { const o = e.target.closest('.opt'); if (o) choose(shown[Number(o.dataset.i)]); });
+  list.addEventListener('mousemove', (e) => { const o = e.target.closest('.opt'); if (o && Number(o.dataset.i) !== active) { active = Number(o.dataset.i); draw(); } });
+  root.querySelector('#sp-scrim').addEventListener('click', (e) => { if (e.target.id === 'sp-scrim') dismiss(); });
+  draw();
+  input.focus();
 }
 // The store's rows the query's words match (name or summary).
 function storeViewHtml() {
@@ -6793,6 +6823,7 @@ function wireTaskStore() {
   const projectId = storeProjectId();
   main.querySelectorAll('a[data-store-view]').forEach((a) => a.addEventListener('click', plainClick(() => setQuery(STORE_VIEW_QUERY))));
   $('#store-recs-dismiss')?.addEventListener('click', () => dismissStoreRecs(projectId));
+  main.querySelectorAll('[data-store-choose]').forEach((el) => el.addEventListener('click', plainClick(() => chooseStoreProject(el.dataset.storeChoose))));
   main.querySelectorAll('[data-store-run]').forEach((button) => button.addEventListener('click', async () => {
     const item = (S.taskStore?.[projectId] || []).find((candidate) => candidate.id === button.dataset.storeRun);
     button.disabled = true;
@@ -8672,6 +8703,7 @@ let activeTaskFormKeyController = null;
 // `page`: the form is a draft's own task page (see showDraftPage), so leaving it
 // leaves the task, and running the draft reveals its live task page.
 // `projectId`: the project a new task is created in (default: the open one).
+// `store`: a Task store entry the new task is taken from (its route is the form's).
 async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   const page = !!opts?.page;
   activeTaskFormKeyController?.abort();
@@ -8694,6 +8726,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   // a new task starts from one. Either way the template seeds what params cannot hold.
   const templateEdit = opts?.templateEdit || null;
   const seed = draft ? null : templateEdit?.template || opts?.template || null;
+  const store = draft ? null : opts?.store || null;
   // Priority and tags: a task's own once it has an id; until then a
   // template's (its tags where this project has them), applied on create.
   const orgRec = draft
@@ -8704,7 +8737,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   const editInPlace = armed || series; // neither has a running workflow — edit its stored params
   const workflowEditable = !draft || !!draft.params?.draft;
   // A new task can start over from another template (a fork keeps its own form).
-  const templatePickable = !draft && !templateEdit && !opts?.fork;
+  const templatePickable = !draft && !templateEdit && !opts?.fork && !store;
   // Carry over seed text (or whatever was typed before switching
   // workflows) into the field that consumes it, without clobbering a real value.
   if (seedText) {
@@ -8716,12 +8749,13 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   // currently slow. Usually the prefetched defaults below are already resolved
   // and this loading page never reaches a paint; otherwise it provides instant
   // feedback while keeping the not-yet-hydrated controls safely non-interactive.
-  const formTitle = templateEdit ? (templateEdit.template ? 'Edit template' : 'New template') : '';
+  const formTitle = templateEdit ? (templateEdit.template ? 'Edit template' : 'New template') : store?.name || '';
   root.innerHTML = taskFormLoadingPage(proj, draft, formTitle);
   // Closing a draft's own page returns to where the task was opened from —
   // unless a navigation is what closed it.
   const leavePage = (navigating) => {
     if (page && !navigating && S.selected === draft.id) closeTask();
+    if (store && !navigating && S.storeOpen === store.id) closeStoreTask();
   };
   $('#tf-close').addEventListener('click', () => {
     const navigating = !!root.querySelector('#tf-page')?.dataset.navigating;
@@ -8781,7 +8815,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       <div class="tf-head">
         <div class="tf-head-inner">
           <button class="icon-btn" id="tf-close" data-shortcut="nav.close" title="${editInPlace ? 'Back (Esc) — your changes are kept' : 'Back (Esc) — your work is kept as a draft'}">←</button>
-          <h2>${formTitle || taskFormTitle(draft)}</h2>
+          <h2>${formTitle ? esc(formTitle) : taskFormTitle(draft)}</h2>${store?.summary ? policyTip(store.summary) : ''}
           ${templateEdit ? `<input id="tf-template-name" class="tf-template-name" placeholder="Template name" aria-label="Template name" maxlength="120" value="${esc(templateEdit.name ?? templateEdit.template?.name ?? '')}">`
             : proj ? `<span class="tf-crumb">in</span>${projectPickerHtml('tf-project', projectId, !draft)}` : ''}
           ${formAttemptGroup?.attempts?.length > 1 ? `<nav class="attempts-list tf-attempts" aria-label="Choose an attempt">
@@ -8832,10 +8866,10 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       <div class="tf-foot">
         <div class="tf-foot-inner">
           ${templateEdit ? '<span class="tf-hint"></span>' : `<button class="btn ghost" id="tf-save-template" title="Save this form as a template, to start new tasks from" aria-label="Save as template">${ICON.template}<span class="tf-save-template-label">Save as template</span></button>
-          <span class="tf-hint"></span>
+          <span class="tf-hint">${store ? storeFormHint(store) : ''}</span>
           <button class="btn" id="tf-save-avatar" ${values.avatar ? '' : 'hidden'}>Save as Avatār without running</button>
           <button class="btn" id="tf-draft">Save draft</button>`}
-          <button class="btn primary" id="tf-queue">${templateEdit ? 'Save template' : editInPlace ? 'Save' : 'Run task'}<span class="kbd">${esc(fmtKeys('meta+Enter'))}</span></button>
+          <button class="btn primary" id="tf-queue">${templateEdit ? 'Save template' : editInPlace ? 'Save' : store?.repeatable && values.repeatable ? 'Install' : 'Run task'}<span class="kbd">${esc(fmtKeys('meta+Enter'))}</span></button>
         </div>
       </div>
     </div>`;
@@ -8883,6 +8917,10 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     const promptName = consumingField(fields)?.name;
     const carried = promptName ? $('#tf-body')?.querySelector(`[data-field="${CSS.escape(promptName)}"]`)?.value || '' : '';
     const hadAttachments = formImages.length + formFiles.length > 0;
+    // A store task keeps what it is (its triggers, title, store link) and your prompt.
+    const edited = store ? formState().body : {};
+    const storeParams = store ? { ...seedParams, triggers: edited.triggers, repeatable: edited.repeatable,
+      ...(promptName && carried.trim() ? { [promptName]: carried } : {}) } : null;
     clearTimeout(saveTimer);
     rememberNewTaskProject(nextProjectId);
     releaseFormKeys();
@@ -8895,6 +8933,12 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     }
     // Attachments are uploaded into a project; they cannot follow the task elsewhere.
     if (hadAttachments) toast('Attachments removed — attach them again for this project');
+    if (store) {
+      // Its route is that project's: whether it is installed there, and where Back goes.
+      root.innerHTML = '';
+      carriedStoreForm = { projectId: nextProjectId, id: store.id, params: storeParams };
+      return go(storeTaskRoute(nextProjectId, store.id), { replace: true });
+    }
     openTaskForm(wf, undefined, carried.trim(), undefined, { projectId: nextProjectId });
   });
   // Another template: the form starts over from it, keeping what you wrote
@@ -9102,8 +9146,9 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   // The id of the draft this form is editing. Starts as the passed-in draft; a
   // brand-new task gets one lazily the first time auto-save persists real content.
   let draftId = draft?.id || null;
-  const orgSeed = () => orgRec.id || templateEdit ? {} : { ...(orgRec.params.priority ? { priority: orgRec.params.priority } : {}),
-    ...(orgRec.tags.length ? { tags: orgRec.tags.map(tagPathStr) } : {}) };
+  // A store task's title rides the first create too: `#{{issue.number}} …` names each run of its series.
+  const orgSeed = () => ({ ...(store ? { title: store.task.title } : {}), ...(orgRec.id || templateEdit ? {} : { ...(orgRec.params.priority ? { priority: orgRec.params.priority } : {}),
+    ...(orgRec.tags.length ? { tags: orgRec.tags.map(tagPathStr) } : {}) }) });
   const hasPolicy = () => !!(taskCredPolicy.order?.length || taskCredPolicy.on?.length || taskCredPolicy.off?.length || taskCredPolicy.explainerOnly?.length);
   // Prompt attachments ride inside `params` (references only), so they flow
   // through auto-save, draft, and queue the same way the prompt text does.
@@ -9126,6 +9171,8 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     // An Avatar only once its risk was acknowledged: auto-save never makes one.
     const avatar = avatarCommitted ? readAvatarSection($('#tf-body')) : undefined;
     if (avatar) body.avatar = avatar;
+    // Where it came from in the Task store, which counts what the project took.
+    if (values.template) body.template = values.template;
     // The wiki-context row. Always sent — even empty,
     // which is a deliberate opt-out of the default `default`-labelled pages — so
     // the replace:true auto-save preserves the user's choice.
@@ -9455,6 +9502,15 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
         goToTask(run.id);
         return true;
       }
+      // A store task's form leaves its route: for the task it started, else
+      // (installed, or kept as a draft) for the store it came from.
+      if (store && S.storeOpen === store.id) {
+        toast(draftMode ? 'Draft saved' : st.body.repeatable ? 'Installed' : 'Task started');
+        await refreshTasks();
+        if (!draftMode && !st.body.repeatable && primaryId) go(taskUrl(primaryId), { replace: true });
+        else closeStoreTask();
+        return true;
+      }
       if (page && S.selected === draft.id) {
         // A saved draft leaves its page like Back; a started one shows its live page.
         if (draftMode) closeTask();
@@ -9565,6 +9621,10 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   $('#tf-save-avatar')?.addEventListener('click', () => submitCommitted(true));
   $('#tf-draft')?.addEventListener('click', () => submitCommitted(true));
   $('#tf-queue').addEventListener('click', () => submitCommitted(false));
+  // A repeatable store task installs; unticked, it runs once.
+  if (store?.repeatable) $('#trig-repeatable')?.addEventListener('change', (event) => {
+    $('#tf-queue').firstChild.textContent = event.target.checked ? 'Install' : 'Run task';
+  });
   // Capture at the document boundary so this still works after an editor
   // re-renders its focused control and focus falls back to <body>. A secondary
   // modal (tag picker, vault picker, authorization prompt, …) owns its keys until
@@ -22701,9 +22761,40 @@ function planMeter(used, limit) {
   const pct = Math.min(100, (Number(used) || 0) / limit * 100);
   return `<span class="plan-meter${pct >= 100 ? ' over' : pct >= 80 ? ' near' : ''}" role="meter" aria-valuemin="0" aria-valuemax="${esc(limit)}" aria-valuenow="${esc(Math.min(Number(used) || 0, limit))}"><i style="width:${pct.toFixed(1)}%"></i></span>`;
 }
-function planStepper(kind, count, title) {
+// `checkout`: the first pack beside a gifted plan, bought at checkout.
+function planStepper(kind, count, title, checkout = false) {
   return `<span class="pack-stepper" title="${esc(title)}"><button class="icon-btn billing-packs" data-kind="${kind}" data-packs="${count - 1}" aria-label="Remove a ${kind} pack" ${count > 0 ? '' : 'disabled'}>−</button>`
-    + `<b>${count}</b><button class="icon-btn billing-packs" data-kind="${kind}" data-packs="${count + 1}" aria-label="Add a ${kind} pack">+</button><span class="setting-muted">pack${count === 1 ? '' : 's'}</span></span>`;
+    + `<b>${count}</b><button class="icon-btn ${checkout ? 'billing-buy' : 'billing-packs'}" data-kind="${kind}" data-packs="${count + 1}" data-add aria-label="Add a ${kind} pack">+</button><span class="setting-muted">pack${count === 1 ? '' : 's'}</span></span>`;
+}
+function checkoutTermsTip() {
+  const d = S.launch?.checkoutDisclosures || {};
+  return policyTip([d.renewalDisclosure || 'Plans renew monthly until canceled.', d.cancellationDisclosure || 'Cancel online here before renewal.',
+    d.refundDisclosure || 'Payments are non-refundable except where the law requires.'].join(' '));
+}
+// A first purchase beside a gifted plan: what it costs, the policies, then checkout.
+function openPlanCheckoutDialog(title, price, order, post) {
+  const overlay = document.createElement('div'); overlay.className = 'modal-overlay';
+  overlay.innerHTML = `<div class="modal-card plan-checkout-dialog" role="dialog" aria-modal="true" aria-label="${esc(title)}">
+    <div class="modal-head"><b>${esc(title)}</b><button class="icon-btn plan-checkout-close" type="button" aria-label="Close">×</button></div>
+    <p class="plan-checkout-price">${esc(price)}</p>
+    <div class="plan-terms">${policyAcceptanceMarkup('checkout', 'checkout-policy-acceptance')} ${checkoutTermsTip()}</div>
+    <div class="modal-actions"><button class="btn plan-checkout-cancel" type="button">Cancel</button><button class="btn primary plan-checkout-go" type="button">Checkout</button></div>
+  </div>`;
+  const close = () => { document.removeEventListener('keydown', keydown); overlay.remove(); };
+  const keydown = (event) => { if (event.key === 'Escape') close(); };
+  overlay.addEventListener('click', (event) => { if (event.target === overlay) close(); });
+  overlay.querySelector('.plan-checkout-close').addEventListener('click', close);
+  overlay.querySelector('.plan-checkout-cancel').addEventListener('click', close);
+  overlay.querySelector('.plan-checkout-go').addEventListener('click', async (event) => {
+    const button = event.currentTarget; button.disabled = true;
+    try {
+      const acceptance = readPolicyAcceptance('checkout');
+      const result = await post('checkout', { ...order, acceptedPolicies: acceptance.accepted, policyVersions: acceptance.versions });
+      location.assign(result.url);
+    } catch (error) { toast(error.message, true); button.disabled = false; }
+  });
+  document.body.appendChild(overlay); document.addEventListener('keydown', keydown);
+  overlay.querySelector('#checkout-policy-acceptance').focus();
 }
 function planBillingMarkup(e, state) {
   if (!e) return '<span class="task-sub">Plan information is temporarily unavailable.</span>';
@@ -22715,20 +22806,32 @@ function planBillingMarkup(e, state) {
   const billed = state?.billedPlan || e.plan;
   const subscribed = Boolean(state) && billed !== 'free' && !['none', 'canceled', 'incomplete_expired'].includes(state.status);
   const paying = subscribed && PLAN_ACTIVE.includes(state.status);
+  // A subscription of packs alone, bought beside a gifted plan.
+  const packsOnly = Boolean(state) && billed === 'free' && PLAN_ACTIVE.includes(state.status);
+  const ending = packsOnly && state.cancelAtPeriodEnd;
   const owner = Boolean(state?.canManage);
   const busy = state?.pendingRequest;
   const disabled = !owner ? 'disabled title="Only an organization owner can change the plan"' : busy ? 'disabled title="Wait for the pending billing request"' : '';
+  // A gifted plan without a subscription buys its first packs (or Team) at checkout.
+  const checkoutOpen = Boolean(state?.providerConfigured && S.launch?.paidLaunch && S.launch?.ready);
+  const giftCheckout = Boolean(state?.gift) && !subscribed && !packsOnly && checkoutOpen;
+  const canPacks = owner && (paying || packsOnly || giftCheckout);
   // Header: the plan, its state when it isn't plainly active, and its price.
   const statusChip = state?.gift && !subscribed ? 'Gifted'
     : state?.cancelAtPeriodEnd && state.currentPeriodEnd ? `Ends ${day(state.currentPeriodEnd)}`
     : ({ past_due: 'Payment failed', unpaid: 'Unpaid', paused: 'Paused', incomplete: 'Checkout incomplete', trialing: 'Trial' })[state?.status] || '';
-  const price = (state?.gift && !subscribed) || e.plan === 'free' ? '' : `${planMoney(e.currentMonthlyPriceCents)}/month`;
-  const renews = paying && !state.cancelAtPeriodEnd && state.currentPeriodEnd ? ` · renews ${day(state.currentPeriodEnd)}` : '';
-  const change = paying && billed === 'individual' ? `<button class="btn sm billing-change" data-plan="team" ${disabled}>Upgrade to Team</button>`
+  const price = packsOnly ? `Packs ${planMoney(state.billedMonthlyPriceCents)}/month`
+    : (state?.gift && !subscribed) || e.plan === 'free' ? '' : `${planMoney(e.currentMonthlyPriceCents)}/month`;
+  const renews = (paying || packsOnly) && state.currentPeriodEnd
+    ? ending ? ` · end ${day(state.currentPeriodEnd)}` : !state.cancelAtPeriodEnd ? ` · renews ${day(state.currentPeriodEnd)}` : '' : '';
+  // More people need Team: a paid Individual changes plan, a gifted one buys Team.
+  const change = (paying && billed === 'individual') || (packsOnly && state.gift?.plan === 'individual')
+    ? `<button class="btn sm billing-change" data-plan="team" ${disabled}>Upgrade to Team</button>`
+    : giftCheckout && state.gift.plan === 'individual' ? `<button class="btn sm billing-buy" data-plan="team" ${disabled}>Upgrade to Team</button>`
     : paying && billed === 'team' ? `<button class="btn sm billing-change" data-plan="individual" ${disabled || (e.activeUsers > 1 ? 'disabled title="Remove other members first"' : '')}>Switch to Individual</button>` : '';
   const head = `<div class="plan-head"><span class="plan-name">${esc(e.planName)}</span>${statusChip ? `<span class="chip${state?.status === 'past_due' || state?.status === 'unpaid' ? ' failed' : ''}">${esc(statusChip)}</span>` : ''}
     <span class="setting-muted plan-price">${esc(price + renews)}</span><span class="label-row-fill"></span>
-    ${change}${subscribed ? `<button class="btn sm billing-portal" ${owner ? '' : disabled} title="Payment method and invoices">Billing</button>` : ''}
+    ${change}${subscribed || packsOnly ? `<button class="btn sm billing-portal" ${owner ? '' : disabled} title="Payment method and invoices">Billing</button>` : ''}
     ${paying && !state.cancelAtPeriodEnd ? `<button class="btn sm ghost billing-cancel" ${owner ? '' : disabled}>Cancel plan</button>` : ''}</div>`;
   // People.
   const members = Number(e.currentMemberCount ?? e.activeUsers ?? 0);
@@ -22748,10 +22851,10 @@ function planBillingMarkup(e, state) {
   const storageParts = [`${formatBytes(e.includedStorageBytes)} with ${e.planName}`,
     e.storagePacks ? `${formatBytes(e.storagePacks * e.storagePackBytes)} in ${plural(e.storagePacks, 'pack')}` : '',
     e.giftedStoragePacks ? `${formatBytes(e.giftedStoragePacks * e.storagePackBytes)} gifted` : ''].filter(Boolean).join(' + ');
-  const canStorage = paying && owner && state?.storagePack?.available;
+  const canStorage = canPacks && state?.storagePack?.available;
   const storageRow = `<div class="setting-row plan-limit" data-limit="storage"><span class="setting-label">Storage ${policyTip(`Project data, saved task workspaces and review files. ${storageParts}.`)}</span>
     <span class="setting-value">${planMeter(e.storageUsedBytes, e.storageQuotaBytes)}<span><b>${esc(formatBytes(e.storageUsedBytes ?? 0))}</b> <span class="setting-muted">of ${esc(formatBytes(e.storageQuotaBytes))}</span></span></span>
-    ${canStorage ? `<span class="setting-actions">${planStepper('storage', Number(state.storagePacks || 0), `Each pack adds ${formatBytes(storagePack.bytes)} for ${planMoney(storagePack.monthlyPriceCents)}/month`)}</span>` : ''}</div>`;
+    ${canStorage ? `<span class="setting-actions">${planStepper('storage', ending ? 0 : Number(state.storagePacks || 0), `Each pack adds ${formatBytes(storagePack.bytes)} for ${planMoney(storagePack.monthlyPriceCents)}/month`, giftCheckout)}</span>` : ''}</div>`;
   // Compute: only where the installation runs computers itself.
   let computeRow = '', topUpRow = '';
   if (e.compute) {
@@ -22765,11 +22868,11 @@ function planBillingMarkup(e, state) {
       e.giftedComputePacks ? `${planDollars(e.giftedComputePacks * e.computePackCreditMicros)} gifted` : '',
       topUp ? `${planDollars(topUp)} topped up, kept until used` : ''].filter(Boolean).join(' + ');
     const tip = `Cloud computers ${siteName()} runs for you (${providers}), at twice the provider’s price: a 2 CPU · 2 GB E2B computer is about $0.27 an hour. Resets ${day(e.compute.to)}. Computers on your own provider accounts aren’t counted. ${credit ? `${parts}.` : ''}${held ? ` ${planDollars(held)} is held for computers running now.` : ''}`;
-    const canCompute = paying && owner && state?.computePack?.available;
+    const canCompute = canPacks && state?.computePack?.available;
     computeRow = `<div class="setting-row plan-limit" data-limit="compute"><span class="setting-label">Compute ${policyTip(tip.trim())}</span>
       <span class="setting-value">${credit ? `${planMeter(Number(e.compute.usedMicros || 0) + held, credit)}<span><b>${esc(planDollars(e.compute.usedMicros))}</b> <span class="setting-muted">of ${esc(planDollars(credit))} this month</span></span>`
         : '<span class="setting-muted">With a paid plan</span>'}</span>
-      ${canCompute ? `<span class="setting-actions">${planStepper('compute', Number(state.computePacks || 0), `Each pack adds ${planDollars(pack.creditMicros)} of compute a month for ${planMoney(pack.monthlyPriceCents)}/month`)}</span>` : ''}</div>`;
+      ${canCompute ? `<span class="setting-actions">${planStepper('compute', ending ? 0 : Number(state.computePacks || 0), `Each pack adds ${planDollars(pack.creditMicros)} of compute a month for ${planMoney(pack.monthlyPriceCents)}/month`, giftCheckout)}</span>` : ''}</div>`;
     // Auto top-up: once offered (its billing terms approved), or while on.
     const auto = state?.autoTopUp;
     if (auto && (auto.offered || auto.enabled)) {
@@ -22786,18 +22889,18 @@ function planBillingMarkup(e, state) {
   // One-line notices, only when something needs attention.
   const notes = [];
   const returned = new URLSearchParams(location.search).get('billing');
-  if (returned === 'success' && !subscribed) notes.push(['ok', 'Payment received. The plan changes as soon as the payment provider confirms it.']);
+  if (returned === 'success' && !subscribed && !packsOnly) notes.push(['ok', 'Payment received. It applies as soon as the payment provider confirms it.']);
   if (['past_due', 'unpaid', 'paused', 'incomplete'].includes(state?.status)) {
     const grace = state.access === 'grace' && state.graceEndsAt ? ` The plan continues until ${day(state.graceEndsAt)}.` : '';
     notes.push(['danger', `${state.lastError || 'Update the payment method in Billing.'}${grace}`]);
   }
   if (busy) notes.push(['warn', `A billing change is waiting for confirmation. <button class="btn sm billing-reconcile" ${owner ? '' : 'disabled'}>Check</button>`]);
-  if (state?.pendingCheckout && !subscribed) notes.push(['', `A checkout is still open. <button class="btn sm billing-cancel-checkout" ${owner ? '' : 'disabled'}>Cancel it</button>`]);
+  if (state?.pendingCheckout && !subscribed && !packsOnly) notes.push(['', `A checkout is still open. <button class="btn sm billing-cancel-checkout" ${owner ? '' : 'disabled'}>Cancel it</button>`]);
   const noteHtml = notes.map(([tone, html]) => `<p class="plan-note ${tone}">${tone === 'warn' || tone === '' ? html : esc(html)}</p>`).join('');
   // Choosing a plan (Free, nothing gifted).
   let choices = '';
   if (state?.managed && !subscribed && !state.gift) {
-    const ready = state.providerConfigured && S.launch?.paidLaunch && S.launch?.ready;
+    const ready = checkoutOpen;
     const card = (plan) => {
       if (!plan) return '';
       const team = plan.id === 'team';
@@ -22809,13 +22912,12 @@ function planBillingMarkup(e, state) {
         ...(e.compute ? [per(`${dollars(plan.computeCreditMicros)} compute a month`, plan.additionalActiveUserComputeCreditMicros && dollars(plan.additionalActiveUserComputeCreditMicros))] : [])];
       return `<div class="plan-choice" data-plan="${esc(plan.id)}"><div class="plan-choice-head"><b>${esc(plan.name)}</b><span>${esc(planMoney(plan.monthlyBasePriceCents))}<small>/month${team ? ` + ${planMoney(plan.monthlyAdditionalActiveUserPriceCents)}/person` : ''}</small></span></div>
         <ul>${items.map((item) => `<li>${esc(item)}</li>`).join('')}</ul>
-        <button class="btn sm primary billing-checkout" data-plan="${esc(plan.id)}" ${ready && owner ? '' : `disabled title="${esc(!owner ? 'Only an organization owner can choose a plan' : 'Checkout isn’t open yet')}"`}>Choose ${esc(plan.name)}</button></div>`;
+        ${packsOnly ? `<button class="btn sm primary billing-change" data-plan="${esc(plan.id)}" ${disabled}>Choose ${esc(plan.name)}</button>`
+          : `<button class="btn sm primary billing-checkout" data-plan="${esc(plan.id)}" ${ready && owner ? '' : `disabled title="${esc(!owner ? 'Only an organization owner can choose a plan' : 'Checkout isn’t open yet')}"`}>Choose ${esc(plan.name)}</button>`}</div>`;
     };
-    const d = S.launch?.checkoutDisclosures || {};
-    const terms = [d.renewalDisclosure || 'Plans renew monthly until canceled.', d.cancellationDisclosure || 'Cancel online here before renewal.',
-      d.refundDisclosure || 'Payments are non-refundable except where the law requires.'].join(' ');
+    // Packs alone (a gift since removed) take a plan onto their subscription.
     choices = `<div class="plan-choices">${card(catalog.individual)}${card(catalog.team)}</div>
-      <div class="plan-terms">${policyAcceptanceMarkup('checkout', 'checkout-policy-acceptance')} ${policyTip(terms)}</div>`;
+      ${packsOnly ? '' : `<div class="plan-terms">${policyAcceptanceMarkup('checkout', 'checkout-policy-acceptance')} ${checkoutTermsTip()}</div>`}`;
   }
   // The operator's complimentary plan and packs.
   const gifts = state?.canGift ? `<details class="plan-operator"><summary>Gifts</summary><div class="setting-rows">
@@ -22830,7 +22932,7 @@ function planBillingMarkup(e, state) {
       <span class="setting-actions"><button class="btn sm billing-gift-packs" data-kind="compute">Save</button></span></div>
   </div></details>` : '';
   return `${head}${noteHtml}<div class="setting-rows ruled plan-limits">${peopleRow}${agentsRow}${storageRow}${computeRow}${topUpRow}</div>${choices}${gifts}
-    ${subscribed ? `<p class="plan-foot setting-muted">Separate from the cards agents pay with. <a href="/legal/billing" data-public>Billing terms</a></p>` : ''}`;
+    ${subscribed || packsOnly ? `<p class="plan-foot setting-muted">Separate from the cards agents pay with. <a href="/legal/billing" data-public>Billing terms</a></p>` : ''}`;
 }
 
 async function hydratePlanAndBilling(organizationId) {
@@ -22876,15 +22978,29 @@ async function hydratePlanAndBilling(organizationId) {
     toast(!result.reconciled ? 'Still unconfirmed. Nothing has been charged twice; contact billing support if it stays this way.'
       : result.applied === false ? 'Nothing was changed or charged. You can try again.' : 'Confirmed.', !result.reconciled);
   });
+  const packOffer = (kind) => {
+    const pack = kind === 'compute' ? state.computePack : state.storagePack;
+    return { pack, what: kind === 'compute' ? `${planDollars(pack.creditMicros)} of compute a month` : formatBytes(pack.bytes) };
+  };
   act('.billing-packs', async (button) => {
     const kind = button.dataset.kind;
     const next = Number(button.dataset.packs);
-    const current = Number(kind === 'compute' ? state.computePacks : state.storagePacks) || 0;
-    const pack = kind === 'compute' ? state.computePack : state.storagePack;
-    const what = kind === 'compute' ? `${planDollars(pack.creditMicros)} of compute a month` : formatBytes(pack.bytes);
-    if (!confirm(next > current ? `Add ${what} for ${planMoney(pack.monthlyPriceCents)}/month?` : `Remove ${what} (${planMoney(pack.monthlyPriceCents)}/month)?`)) return;
+    const { pack, what } = packOffer(kind);
+    if (!confirm('add' in button.dataset ? `Add ${what} for ${planMoney(pack.monthlyPriceCents)}/month?` : `Remove ${what} (${planMoney(pack.monthlyPriceCents)}/month)?`)) return;
     await post(`${kind}-packs`, { packs: next }); toast('Sent. It applies once payment is confirmed.');
   });
+  box.querySelectorAll('.billing-buy').forEach((button) => button.addEventListener('click', () => {
+    if (button.dataset.plan) {
+      const team = state.catalog.find((plan) => plan.id === button.dataset.plan);
+      openPlanCheckoutDialog(`Upgrade to ${team.name}`,
+        `${planMoney(team.monthlyBasePriceCents)}/month + ${planMoney(team.monthlyAdditionalActiveUserPriceCents)} per extra person`, { plan: team.id }, post);
+      return;
+    }
+    const kind = button.dataset.kind;
+    const { pack, what } = packOffer(kind);
+    openPlanCheckoutDialog(`Add a ${kind} pack`, `${what[0].toUpperCase()}${what.slice(1)} for ${planMoney(pack.monthlyPriceCents)}/month`,
+      { [`${kind}Packs`]: 1 }, post);
+  }));
   const autoTopUp = async (body) => {
     try { await post('auto-top-up', body); } catch (error) { toast(error.message, true); }
     if (box.isConnected) await reload();

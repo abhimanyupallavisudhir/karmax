@@ -26,12 +26,13 @@ export interface HostedPlan {
 
 const GIB = 1024 ** 3;
 
-/** A storage pack adds managed storage to a paid plan, billed monthly per pack.
- * A Free organization cannot hold packs: they ride on a paid subscription. */
+/** A storage pack adds managed storage, billed monthly per pack on a
+ * subscription. Buying one needs a plan, paid or gifted: a Free organization
+ * chooses a plan first. */
 export const STORAGE_PACK = Object.freeze({ bytes: 100 * GIB, monthlyPriceCents: 400 });
 
-/** A compute pack adds managed compute credit each month to a paid plan:
- * a dollar paid buys a dollar of compute at tavya's prices. */
+/** A compute pack adds managed compute credit each month, bought like a
+ * storage pack: a dollar paid buys a dollar of compute at tavya's prices. */
 export const COMPUTE_PACK = Object.freeze({ creditMicros: 10_000_000, monthlyPriceCents: 1_000 });
 
 /** Managed compute's rules that the billing terms state (src/launch/legal.ts;
@@ -106,7 +107,7 @@ export interface OrganizationEntitlements {
   storageQuotaBytes: number | null;
   /** The plan's own storage for its active users, before any packs. */
   includedStorageBytes: number | null;
-  /** Paid packs in effect (billing-verified; none on Free). */
+  /** Paid packs in effect (billing-verified; none once their subscription lapses). */
   storagePacks: number;
   /** Operator-gifted packs, which apply on any plan until removed. */
   giftedStoragePacks: number;
@@ -117,7 +118,7 @@ export interface OrganizationEntitlements {
   computeCreditMicros: number | null;
   /** The plan's own compute credit for its active users, before any packs. */
   includedComputeCreditMicros: number | null;
-  /** Paid compute packs in effect (billing-verified; none on Free). */
+  /** Paid compute packs in effect (billing-verified; none once their subscription lapses). */
   computePacks: number;
   /** Operator-gifted compute packs, which apply on any plan until removed. */
   giftedComputePacks: number;
@@ -135,12 +136,12 @@ export function hostedPlan(plan: HostedPlanId): HostedPlan {
 }
 
 /** Billing calls this helper rather than duplicating per-seat pricing rules.
- * Storage packs are billed only on a paid plan, like their storage. */
+ * `plan` is the billed plan: 'free' for a subscription of packs alone. */
 export function hostedMonthlyPriceCents(plan: HostedPlanId, activeUsers: number, storagePacks = 0, computePacks = 0): number {
   const definition = hostedPlan(plan);
   const users = Math.max(0, Math.floor(Number(activeUsers) || 0));
   const additional = Math.max(0, users - definition.includedActiveUsers);
-  const count = (packs: number) => plan === 'free' ? 0 : Math.max(0, Math.floor(Number(packs) || 0));
+  const count = (packs: number) => Math.max(0, Math.floor(Number(packs) || 0));
   return definition.monthlyBasePriceCents
     + additional * definition.monthlyAdditionalActiveUserPriceCents
     + count(storagePacks) * STORAGE_PACK.monthlyPriceCents + count(computePacks) * COMPUTE_PACK.monthlyPriceCents;
@@ -162,11 +163,11 @@ export function hostedIncludedStorageBytes(plan: HostedPlanId, activeUsers: numb
   return definition.storageBytes + additional * definition.additionalActiveUserStorageBytes;
 }
 
-/** Managed storage for the plan, its active users and its storage packs. Paid
- * packs count only on a paid plan, so a lapsed subscription falls back to
- * Free's; packs the operator gifted count on any plan. */
+/** Managed storage for the plan, its active users and its storage packs.
+ * Paid packs are the ones in force: billing clears them once their
+ * subscription lapses. Packs the operator gifted count on any plan. */
 export function hostedStorageQuotaBytes(plan: HostedPlanId, activeUsers: number, storagePacks = 0, giftedStoragePacks = 0): number {
-  const packs = plan === 'free' ? 0 : Math.max(0, Math.floor(Number(storagePacks) || 0));
+  const packs = Math.max(0, Math.floor(Number(storagePacks) || 0));
   const gifted = Math.max(0, Math.floor(Number(giftedStoragePacks) || 0));
   return hostedIncludedStorageBytes(plan, activeUsers) + (packs + gifted) * STORAGE_PACK.bytes;
 }
@@ -179,10 +180,10 @@ export function hostedIncludedComputeCreditMicros(plan: HostedPlanId, activeUser
   return definition.computeCreditMicros + additional * definition.additionalActiveUserComputeCreditMicros;
 }
 
-/** Compute credit each month for the plan, its active users and its packs.
- * Like storage, paid packs count only on a paid plan; gifted ones on any. */
+/** Compute credit each month for the plan, its active users and its packs,
+ * counted like storage packs. */
 export function hostedComputeCreditMicros(plan: HostedPlanId, activeUsers: number, computePacks = 0, giftedComputePacks = 0): number {
-  const packs = plan === 'free' ? 0 : Math.max(0, Math.floor(Number(computePacks) || 0));
+  const packs = Math.max(0, Math.floor(Number(computePacks) || 0));
   const gifted = Math.max(0, Math.floor(Number(giftedComputePacks) || 0));
   return hostedIncludedComputeCreditMicros(plan, activeUsers) + (packs + gifted) * COMPUTE_PACK.creditMicros;
 }
@@ -230,12 +231,12 @@ export function organizationEntitlements(plan: HostedPlanId, hosted: boolean,
     maxActiveAgentRuns: hostedActiveAgentRuns(plan, members),
     storageQuotaBytes: hostedStorageQuotaBytes(plan, members, packs, gifted),
     includedStorageBytes: hostedIncludedStorageBytes(plan, members),
-    storagePacks: plan === 'free' ? 0 : packs,
+    storagePacks: packs,
     giftedStoragePacks: gifted,
     storagePackBytes: STORAGE_PACK.bytes,
     computeCreditMicros: hostedComputeCreditMicros(plan, members, computePacks, giftedCompute),
     includedComputeCreditMicros: hostedIncludedComputeCreditMicros(plan, members),
-    computePacks: plan === 'free' ? 0 : computePacks,
+    computePacks,
     giftedComputePacks: giftedCompute,
     computePackCreditMicros: COMPUTE_PACK.creditMicros,
     unlimitedProjects: true,

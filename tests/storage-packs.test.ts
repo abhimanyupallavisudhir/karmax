@@ -141,14 +141,14 @@ describe('changing storage packs', () => {
     const store = await Store.create(':memory:', { hosted: true });
     const organization = await store.createOrganization({ name: 'Free', ownerUserId: 'owner' });
     const billing = new SubscriptionBillingService(store, new FakeSubscriptionProvider(), true);
-    await expect(billing.storagePacks(organization.id, 1, 'free-packs')).rejects.toThrow(/paid subscription/);
+    await expect(billing.storagePacks(organization.id, 1, 'free-packs')).rejects.toThrow(/need a paid plan/);
     await billing.gift(organization.id, 'team', 'user:operator', 'gift-no-packs');
-    await expect(billing.storagePacks(organization.id, 1, 'gift-packs')).rejects.toThrow(/paid subscription/);
+    await expect(billing.storagePacks(organization.id, 1, 'gift-packs')).rejects.toThrow(/at checkout/);
     await store.close();
 
     const f = await subscribed('team');
     await f.update('canceled');
-    await expect(f.billing.storagePacks(f.organization.id, 1, 'canceled-packs')).rejects.toThrow(/paid subscription/);
+    await expect(f.billing.storagePacks(f.organization.id, 1, 'canceled-packs')).rejects.toThrow(/need a paid plan/);
     await f.store.close();
 
     const unpriced = await subscribed('team');
@@ -274,23 +274,39 @@ const signed = (value: unknown) => {
 
 /** A Paddle API holding one subscription; PATCH replaces its items, as Paddle does. */
 function paddle(items: any[], overrides: Partial<PaddleRuntimeConfig> = {}) {
-  const subscription = { id: 'sub_1', status: 'active', customer_id: 'ctm_1', items };
+  const subscription: any = { id: 'sub_1', status: 'active', customer_id: 'ctm_1', items, scheduled_change: null };
   const writes: any[] = [];
+  const transactions: any[] = [];
   let lose = false;
   const fetcher = vi.fn(async (url: any, init: any) => {
     const path = new URL(String(url)).pathname;
-    if (init.method === 'POST' && path === '/transactions') return Response.json({ data: { id: 'txn_packs' } });
+    if (init.method === 'POST' && path === '/transactions') {
+      transactions.push(JSON.parse(init.body));
+      return Response.json({ data: { id: 'txn_packs' } });
+    }
+    if (init.method === 'POST' && path === '/subscriptions/sub_1/cancel') {
+      writes.push({ cancel: JSON.parse(init.body) });
+      subscription.scheduled_change = { action: 'cancel', effective_at: '2026-11-01T00:00:00Z' };
+      return Response.json({ data: subscription });
+    }
+    if (init.method === 'GET' && path === '/transactions/txn_packs' && transactions.length) return Response.json({ data: {
+      id: 'txn_packs', status: 'ready', collection_mode: 'automatic',
+      items: transactions.at(-1).items.map((i: any) => ({ price: { id: i.price_id }, quantity: i.quantity })) } });
     if (path !== '/subscriptions/sub_1') return Response.json({ error: { code: 'not_found' } }, { status: 404 });
     if (init.method === 'PATCH') {
       const body = JSON.parse(init.body);
+      // As Paddle: a scheduled change is removed only on its own.
+      if ('scheduled_change' in body && Object.keys(body).length > 1)
+        return Response.json({ error: { code: 'bad_request', detail: 'you cannot combine updating schedule_change with other fields' } }, { status: 400 });
       writes.push(body);
-      subscription.items = body.items.map((i: any) => item(i.price_id, i.quantity));
+      if ('scheduled_change' in body) subscription.scheduled_change = body.scheduled_change;
+      else subscription.items = body.items.map((i: any) => item(i.price_id, i.quantity));
       if (lose) throw new Error('connection reset');
     }
     return Response.json({ data: subscription });
   });
   const provider = new PaddleSubscriptionProvider(() => ({ ...config, ...overrides }), fetcher as any);
-  return { provider, writes, subscription, fetcher, loseResponses: () => { lose = true; } };
+  return { provider, writes, transactions, subscription, fetcher, loseResponses: () => { lose = true; } };
 }
 
 describe('Paddle storage pack items', () => {
@@ -453,7 +469,7 @@ describe('Paddle compute pack items', () => {
     delivery = snapshot('evt_lapsed', '2026-10-01T00:02:00Z', [item('pri_individual', 1), computeItem(2)], 'paused');
     await billing.handleWebhook(delivery.raw, delivery.signature);
     expect(await store.organizationEntitlements(organization.id)).toMatchObject({ plan: 'free', computePacks: 0, computeCreditMicros: 0 });
-    await expect(billing.computePacks(organization.id, 1, 'compute-packs-2')).rejects.toThrow(/active paid subscription/);
+    await expect(billing.computePacks(organization.id, 1, 'compute-packs-2')).rejects.toThrow(/need a paid plan/);
     await store.close();
   });
 
@@ -461,5 +477,193 @@ describe('Paddle compute pack items', () => {
     const stripe: SubscriptionProvider = new StripeSubscriptionProvider({}, vi.fn() as any);
     await expect(stripe.updateComputePacks({ subscriptionId: 'sub_1', computePacks: 1, idempotencyKey: 'k' }))
       .rejects.toThrow(new BillingRequestRejected('compute packs are billed only through Paddle'));
+  });
+});
+
+describe('packs beside a gifted plan', () => {
+  /** An organization on a gifted plan with no subscription, whose first packs
+   * start a subscription of packs alone through the stub provider. */
+  async function gifted(plan: 'individual' | 'team' = 'individual') {
+    const store = await Store.create(':memory:', { hosted: true });
+    const organization = await store.createOrganization({ name: `Gifted ${crypto.randomUUID().slice(0, 8)}`, ownerUserId: 'owner' });
+    const provider = new FakeSubscriptionProvider();
+    const billing = new SubscriptionBillingService(store, provider, true);
+    await billing.gift(organization.id, plan, 'user:operator', `gift-${organization.id}`);
+    let clock = 100;
+    const snapshot = (status: string, storage: number, compute = 0, base?: 'individual' | 'team') => ({
+      id: 'sub_alone', customer: `cus_${organization.id}`, status, items: { data: [
+        ...(base ? [{ id: 'si_base', price: { id: base === 'team' ? 'price_team_base' : 'price_individual' }, quantity: 1 }] : []),
+        ...(storage ? [{ id: 'si_storage', price: { id: 'price_storage_pack' }, quantity: storage }] : []),
+        ...(compute ? [{ id: 'si_compute', price: { id: 'price_compute_pack' }, quantity: compute }] : []),
+      ] } });
+    const deliver = (type: string, object: any) => billing.handleWebhook(event(`evt_${++clock}`, type, object, clock));
+    const entitlements = () => store.organizationEntitlements(organization.id);
+    return { store, organization, provider, billing, snapshot, deliver, entitlements };
+  }
+
+  it('buys the first packs at checkout, as a subscription of packs alone', async () => {
+    const f = await gifted('individual');
+    const result = await f.billing.checkoutPacks(f.organization.id, { storagePacks: 1 }, urls, 'gift-first-pack');
+    expect(result).toMatchObject({ plan: null, url: 'https://checkout.test/session', commercialTerms: {
+      planId: null, storagePacks: 1, computePacks: 0, monthlyTotalPriceCents: STORAGE_PACK.monthlyPriceCents } });
+    expect(f.provider.calls.find((call) => call.method === 'createCheckout')?.input)
+      .toMatchObject({ seats: 0, storagePacks: 1, computePacks: 0 });
+    expect(f.provider.calls.find((call) => call.method === 'createCheckout')?.input.plan).toBeUndefined();
+    // Nothing is granted until the signed subscription arrives.
+    expect(await f.entitlements()).toMatchObject({ plan: 'individual', storagePacks: 0, storageQuotaBytes: 50 * GIB });
+
+    await f.deliver('customer.subscription.created', f.snapshot('active', 1, 2));
+    expect(await f.entitlements()).toMatchObject({ plan: 'individual', storagePacks: 1, computePacks: 2,
+      storageQuotaBytes: 150 * GIB, computeCreditMicros: 25_000_000 });
+    expect(await f.billing.current(f.organization.id)).toMatchObject({ plan: 'individual', billedPlan: 'free', status: 'active',
+      storagePacks: 1, computePacks: 2, billedMonthlyPriceCents: 400 + 2_000, gift: { plan: 'individual' } });
+
+    // Later packs change that subscription, never a second checkout.
+    await expect(f.billing.checkoutPacks(f.organization.id, { storagePacks: 1 }, urls, 'gift-second-checkout'))
+      .rejects.toThrow(/existing subscription/);
+    expect(await f.billing.storagePacks(f.organization.id, 3, 'gift-more-packs')).toEqual({ id: 'sub_alone' });
+    expect(f.provider.calls.at(-1)).toMatchObject({ method: 'updateStoragePacks', input: { subscriptionId: 'sub_alone', storagePacks: 3 } });
+    await f.billing.computePacks(f.organization.id, 0, 'gift-fewer-compute');
+    expect(f.provider.calls.at(-1)).toMatchObject({ method: 'updateComputePacks', input: { subscriptionId: 'sub_alone', computePacks: 0 } });
+    await f.store.close();
+  });
+
+  it('lets a gifted Individual take Team onto its packs, and keeps paid packs when the gift goes', async () => {
+    const f = await gifted('individual');
+    await f.billing.checkoutPacks(f.organization.id, { computePacks: 1 }, urls, 'gift-compute-pack');
+    await f.deliver('customer.subscription.created', f.snapshot('active', 0, 1));
+    await f.billing.changePlan(f.organization.id, 'team', 'gift-to-team');
+    expect(f.provider.calls.at(-1)).toMatchObject({ method: 'changePlan', input: { subscriptionId: 'sub_alone', plan: 'team', seats: 1 } });
+    await f.deliver('customer.subscription.updated', f.snapshot('active', 0, 1, 'team'));
+    expect(await f.billing.current(f.organization.id)).toMatchObject({ plan: 'team', billedPlan: 'team', computePacks: 1,
+      billedMonthlyPriceCents: 1_900 + 1_000 });
+
+    const alone = await gifted('team');
+    await alone.billing.checkoutPacks(alone.organization.id, { storagePacks: 2 }, urls, 'gift-team-packs');
+    await alone.deliver('customer.subscription.created', alone.snapshot('active', 2));
+    await alone.billing.gift(alone.organization.id, null, 'user:operator', 'gift-removed');
+    // Still paid for, so still counted: removing a gift never leaves a customer paying for nothing.
+    expect(await alone.entitlements()).toMatchObject({ plan: 'free', storagePacks: 2, storageQuotaBytes: 205 * GIB });
+    await alone.billing.storagePacks(alone.organization.id, 1, 'free-with-packs-removes');
+    expect(alone.provider.calls.at(-1)).toMatchObject({ method: 'updateStoragePacks', input: { storagePacks: 1 } });
+    await alone.deliver('customer.subscription.deleted', alone.snapshot('canceled', 2));
+    expect(await alone.entitlements()).toMatchObject({ plan: 'free', storagePacks: 0, storageQuotaBytes: 5 * GIB });
+    await f.store.close(); await alone.store.close();
+  });
+
+  it('needs a gifted plan, a whole pack count and a configured price', async () => {
+    const store = await Store.create(':memory:', { hosted: true });
+    const organization = await store.createOrganization({ name: 'Free packs', ownerUserId: 'owner' });
+    const provider = new FakeSubscriptionProvider();
+    const billing = new SubscriptionBillingService(store, provider, true);
+    await expect(billing.checkoutPacks(organization.id, { storagePacks: 1 }, urls, 'free-pack-checkout'))
+      .rejects.toThrow(/choose Individual or Team first/);
+    await store.close();
+
+    const f = await gifted('team');
+    for (const [index, storagePacks] of [-1, 1.5, '1', 1001].entries())
+      await expect(f.billing.checkoutPacks(f.organization.id, { storagePacks }, urls, `bad-pack-count-${index}`))
+        .rejects.toThrow(/whole number/);
+    await expect(f.billing.checkoutPacks(f.organization.id, {}, urls, 'no-packs')).rejects.toThrow(/at least one pack/);
+    await expect(f.billing.checkoutPacks(f.organization.id, { storagePacks: 1 }, urls, '')).rejects.toThrow(/Idempotency-Key/);
+    vi.spyOn(f.provider, 'catalog').mockReturnValue({ individualPriceId: 'price_individual',
+      teamBasePriceId: 'price_team_base', teamSeatPriceId: 'price_team_seat', storagePackPriceId: 'price_storage_pack' });
+    await expect(f.billing.checkoutPacks(f.organization.id, { computePacks: 1 }, urls, 'unpriced-compute')).rejects.toThrow(/not available/);
+    expect(f.provider.calls.filter((call) => call.method === 'createCheckout')).toHaveLength(0);
+    await f.store.close();
+  });
+});
+
+describe('Paddle subscriptions of packs alone', () => {
+  const compute = { computePackPriceId: 'pri_compute', computePackProductId: 'pro_compute' };
+
+  it('checks out packs alone, and plans with their seats as before', async () => {
+    const api = paddle([], compute);
+    await api.provider.createCheckout({ organizationId: 'org', customerId: '', seats: 0, storagePacks: 2, computePacks: 1,
+      successUrl: 'https://tavya.io/billing', cancelUrl: 'https://tavya.io/billing', idempotencyKey: 'k' });
+    expect(api.transactions.at(-1).items).toEqual([{ price_id: 'pri_pack', quantity: 2 }, { price_id: 'pri_compute', quantity: 1 }]);
+    await api.provider.createCheckout({ organizationId: 'org', customerId: '', plan: 'team', seats: 3,
+      successUrl: 'https://tavya.io/billing', cancelUrl: 'https://tavya.io/billing', idempotencyKey: 'k' });
+    expect(api.transactions.at(-1).items).toEqual([{ price_id: 'pri_team', quantity: 1 }, { price_id: 'pri_seat', quantity: 2 }]);
+    await expect(api.provider.createCheckout({ organizationId: 'org', customerId: '', seats: 0,
+      successUrl: 'https://tavya.io/billing', cancelUrl: 'https://tavya.io/billing', idempotencyKey: 'k' }))
+      .rejects.toThrow(new BillingRequestRejected('a checkout needs a plan or a pack'));
+    await expect(paddle([]).provider.createCheckout({ organizationId: 'org', customerId: '', seats: 0, computePacks: 1,
+      successUrl: 'https://tavya.io/billing', cancelUrl: 'https://tavya.io/billing', idempotencyKey: 'k' }))
+      .rejects.toThrow(new BillingRequestRejected('compute packs are not configured'));
+  });
+
+  it('changes packs alone, ends them with the last one at the period end, and keeps them when one is added back', async () => {
+    const api = paddle([item('pri_pack', 1)], compute);
+    await api.provider.updateComputePacks({ subscriptionId: 'sub_1', computePacks: 2, idempotencyKey: 'k' });
+    expect(api.writes.at(-1)).toEqual({ items: [{ price_id: 'pri_pack', quantity: 1 }, { price_id: 'pri_compute', quantity: 2 }],
+      proration_billing_mode: 'prorated_next_billing_period' });
+    await api.provider.updateStoragePacks({ subscriptionId: 'sub_1', storagePacks: 0, idempotencyKey: 'k' });
+    expect(api.writes.at(-1).items).toEqual([{ price_id: 'pri_compute', quantity: 2 }]);
+    // Paddle has no empty subscription: the last pack cancels it when the period paid for ends.
+    await api.provider.updateComputePacks({ subscriptionId: 'sub_1', computePacks: 0, idempotencyKey: 'k' });
+    expect(api.writes.at(-1)).toEqual({ cancel: { effective_from: 'next_billing_period' } });
+    expect(api.subscription.items).toEqual([item('pri_compute', 2, 'pro_plan')]);
+    const reconcile = (intent: any) => api.provider.reconcileRequest(intent, 'ref', Date.now());
+    expect(await reconcile({ kind: 'compute', subscriptionId: 'sub_1', computePacks: 0 })).toEqual({ id: 'sub_1' });
+    await api.provider.updateComputePacks({ subscriptionId: 'sub_1', computePacks: 0, idempotencyKey: 'k' });
+    expect(api.writes).toHaveLength(3);
+    // Adding one back keeps the subscription, even at the quantity it already bills (no item write then).
+    await api.provider.updateComputePacks({ subscriptionId: 'sub_1', computePacks: 2, idempotencyKey: 'k' });
+    expect(api.writes.slice(3)).toEqual([{ scheduled_change: null }]);
+    expect(api.subscription.scheduled_change).toBeNull();
+    await api.provider.updateComputePacks({ subscriptionId: 'sub_1', computePacks: 0, idempotencyKey: 'k' });
+    await api.provider.updateComputePacks({ subscriptionId: 'sub_1', computePacks: 3, idempotencyKey: 'k' });
+    expect(api.writes.slice(-2)).toEqual([{ scheduled_change: null },
+      { items: [{ price_id: 'pri_compute', quantity: 3 }], proration_billing_mode: 'prorated_next_billing_period' }]);
+    await api.provider.updateComputePacks({ subscriptionId: 'sub_1', computePacks: 2, idempotencyKey: 'k' });
+    expect(await reconcile({ kind: 'compute', subscriptionId: 'sub_1', computePacks: 2 })).toEqual({ id: 'sub_1' });
+  });
+
+  it('takes a plan onto ending packs and keeps the subscription; a plan\'s own cancellation stays', async () => {
+    const api = paddle([item('pri_pack', 1)]);
+    await api.provider.updateStoragePacks({ subscriptionId: 'sub_1', storagePacks: 0, idempotencyKey: 'k' });
+    await api.provider.changePlan({ subscriptionId: 'sub_1', plan: 'team', seats: 1, items: {}, idempotencyKey: 'k' });
+    expect(api.writes.slice(-2)).toEqual([{ scheduled_change: null },
+      { items: [{ price_id: 'pri_team', quantity: 1 }, { price_id: 'pri_pack', quantity: 1 }], proration_billing_mode: 'prorated_next_billing_period' }]);
+    expect(api.subscription.scheduled_change).toBeNull();
+
+    const planned = paddle([item('pri_individual', 1), item('pri_pack', 2)]);
+    planned.subscription.scheduled_change = { action: 'cancel' };
+    await planned.provider.updateStoragePacks({ subscriptionId: 'sub_1', storagePacks: 1, idempotencyKey: 'k' });
+    expect(planned.writes.at(-1)).not.toHaveProperty('scheduled_change');
+    await planned.provider.updateStoragePacks({ subscriptionId: 'sub_1', storagePacks: 0, idempotencyKey: 'k' });
+    expect(planned.writes.at(-1).items).toEqual([{ price_id: 'pri_individual', quantity: 1 }]);
+  });
+
+  it('grants packs alone from signed webhooks beside the gift, and settles a lost pack checkout by reading Paddle', async () => {
+    const store = await Store.create(':memory:', { hosted: true });
+    const organization = await store.createOrganization({ name: 'Paddle gifted', ownerUserId: 'owner' });
+    const api = paddle([]);
+    const billing = new SubscriptionBillingService(store, api.provider, true);
+    await billing.gift(organization.id, 'team', 'user:operator', 'paddle-gift');
+    await billing.checkoutPacks(organization.id, { storagePacks: 1 }, urls, 'paddle-gift-packs');
+    expect(api.transactions.at(-1).items).toEqual([{ price_id: 'pri_pack', quantity: 1 }]);
+    const created = signed({ event_id: 'evt_created', event_type: 'subscription.created', occurred_at: new Date().toISOString(),
+      data: { id: 'sub_1', customer_id: 'ctm_1', transaction_id: 'txn_packs', status: 'active', items: [item('pri_pack', 1)],
+        current_billing_period: { ends_at: '2026-11-01T00:00:00Z' }, scheduled_change: null } });
+    await billing.handleWebhook(created.raw, created.signature);
+    expect(await store.organizationEntitlements(organization.id)).toMatchObject({ plan: 'team', storagePacks: 1, storageQuotaBytes: 200 * GIB });
+    expect(await billing.current(organization.id)).toMatchObject({ billedPlan: 'free', billedMonthlyPriceCents: 400 });
+    const ending = signed({ event_id: 'evt_ending', event_type: 'subscription.updated', occurred_at: new Date(Date.now() + 1000).toISOString(),
+      data: { id: 'sub_1', customer_id: 'ctm_1', status: 'active', items: [item('pri_pack', 1)],
+        current_billing_period: { ends_at: '2026-11-01T00:00:00Z' }, scheduled_change: { action: 'cancel' } } });
+    await billing.handleWebhook(ending.raw, ending.signature);
+    // Ending packs still count until the period paid for is over.
+    expect(await billing.current(organization.id)).toMatchObject({ cancelAtPeriodEnd: true, storagePacks: 1 });
+    expect(await store.organizationEntitlements(organization.id)).toMatchObject({ storagePacks: 1 });
+
+    const reconcile = (intent: any) => api.provider.reconcileRequest(intent, 'paddle-gift-packs-ref', Date.now());
+    // A lost answer is recovered from the transaction holding exactly the packs asked for.
+    expect(await reconcile({ kind: 'checkout', seats: 0, storagePacks: 1, successUrl: 'https://tavya.io/b', checkoutId: 'txn_packs' }))
+      .toMatchObject({ id: 'txn_packs', url: expect.stringContaining('_ptxn=txn_packs') });
+    expect(await reconcile({ kind: 'checkout', seats: 0, storagePacks: 2, successUrl: 'https://tavya.io/b', checkoutId: 'txn_packs' })).toBeNull();
+    expect(await reconcile({ kind: 'checkout', seats: 0, successUrl: 'https://tavya.io/b', checkoutId: 'txn_packs' })).toBeNull();
+    await store.close();
   });
 });
