@@ -6255,7 +6255,8 @@ function renderMain() {
     if (S.view) renderTaskPage();
     return;
   }
-  if (S.storeOpen && S.tab === 'tasks') return renderStoreTaskPage();
+  // A store task's form covers #main (applyStoreTaskRoute).
+  if (S.storeOpen && S.tab === 'tasks') return;
   // An open wiki editor likewise manages its own renders: a background refresh
   // must not clobber in-progress edits (only the focused field would survive
   // the async rehydrate). Navigation still repaints — it changes S.tab or
@@ -6669,47 +6670,65 @@ const STORE_NEEDS = { github: ['Needs GitHub', 'Connect a GitHub repository to t
 function storeNeed(item) {
   return !(item.repeatable && item.installed?.length) && item.missing?.length ? STORE_NEEDS[item.missing[0]] : null;
 }
-// Run, Install, or Open the series it installed.
-// A row's is small; on its page the one thing to do is primary.
-function storeActionHtml(item, projectId, onPage = false) {
+// Run, Install, or Open what it installed (one series, or the list of them),
+// in one click; the row opens the form, to change it first or install another.
+function storeInstalledRoute(item, projectId) {
+  return item.installed.length === 1 ? taskUrl(item.installed[0], taskRecord(item.installed[0]) || { projectId })
+    : listRoute(projectBase(projectId), `store:${item.id} is:series`);
+}
+function storeActionHtml(item, projectId) {
   const need = storeNeed(item);
   const disabled = need ? ` disabled title="${esc(need[1])}"` : '';
-  const cls = onPage ? 'btn primary' : 'btn sm';
-  if (item.repeatable && item.installed?.length) return `<a class="${onPage ? 'btn' : cls}" data-spa href="${esc(taskUrl(item.installed[0], taskRecord(item.installed[0]) || { projectId }))}">Open</a>`;
+  if (item.repeatable && item.installed?.length) return `<a class="btn sm" data-spa href="${esc(storeInstalledRoute(item, projectId))}">Open</a>`;
   return item.repeatable
-    ? `<button class="${cls}" data-store-run="${esc(item.id)}"${disabled}>Install</button>`
-    : `<button class="${onPage ? cls : 'btn sm primary'}" data-store-run="${esc(item.id)}"${disabled}>Run</button>`;
+    ? `<button class="btn sm" data-store-run="${esc(item.id)}"${disabled}>Install</button>`
+    : `<button class="btn sm primary" data-store-run="${esc(item.id)}"${disabled}>Run</button>`;
 }
-// A store task's own page: /<org>/<project>/store/<id>.
+// A store task's own form: /<org>/<project>/store/<id>.
 function storeTaskRoute(projectId, id) { return `${projectBase(projectId)}/store/${encodeURIComponent(id)}`; }
+// On the organization home a store task asks which project it is for: the
+// row's state and actions there would be about a project nobody chose.
 function storeRowHtml(item) {
+  const home = S.tab === 'home';
   const projectId = storeProjectId();
-  const installed = item.repeatable && item.installed?.length;
-  const need = storeNeed(item);
+  const installed = !home && item.repeatable ? item.installed?.length || 0 : 0;
+  const need = home ? null : storeNeed(item);
+  const action = home ? `<button class="btn sm${item.repeatable ? '' : ' primary'}" data-store-choose="${esc(item.id)}" title="Choose a project">${item.repeatable ? 'Install…' : 'Run…'}</button>`
+    : storeActionHtml(item, projectId);
+  const link = home ? `<a class="row-link" href="${esc(storeTaskRoute(projectId, item.id))}" data-store-choose="${esc(item.id)}" draggable="false" tabindex="-1" aria-hidden="true"></a>`
+    : `<a class="row-link" data-spa href="${esc(storeTaskRoute(projectId, item.id))}" draggable="false" tabindex="-1" aria-hidden="true"></a>`;
   return `<div class="task-row store-row has-row-link" data-store-task="${esc(item.id)}" tabindex="0" role="group" aria-label="${esc(item.name)}">
       <div class="task-main">
         <div class="task-title">${esc(item.name)} ${item.summary ? policyTip(item.summary) : ''}</div>
-        <div class="task-sub">${item.repeatable ? `<span class="chip">${installed ? 'installed' : 'repeatable'}</span>` : ''}${need ? `<span>${esc(need[0])}</span>` : ''}</div>
+        <div class="task-sub">${item.repeatable ? `<span class="chip">${installed > 1 ? `${installed} installed` : installed ? 'installed' : 'repeatable'}</span>` : ''}${need ? `<span>${esc(need[0])}</span>` : ''}</div>
       </div>
-      <div class="task-right">${storeActionHtml(item, projectId)}</div>
-      <a class="row-link" data-spa href="${esc(storeTaskRoute(projectId, item.id))}" draggable="false" tabindex="-1" aria-hidden="true"></a>
+      <div class="task-right">${action}</div>
+      ${link}
     </div>`;
 }
-// Reading one changes nothing: the page shows what it would do, and the same
-// Run / Install as its row.
+// The task form, filled in from the store task: every field can change before
+// it runs or installs (again: each install is a series of its own).
+// `carried`: the form's params when it moves to another project.
+let carriedStoreForm = null;
 async function applyStoreTaskRoute(projectId, id, routeIsCurrent) {
   S.tab = 'tasks';
   closeTaskDom();
   renderRail();
-  if (S.taskStore?.[projectId]) renderMain();
-  else renderRouteLoadingPage('Task store');
-  await loadTaskStore(projectId, { force: true });
-  if (!routeIsCurrent()) return;
-  if (!S.taskStore?.[projectId]?.some((item) => item.id === id)) {
+  const cached = S.taskStore?.[projectId]?.find((item) => item.id === id);
+  if (!cached) {
+    renderRouteLoadingPage('Task store');
+    await loadTaskStore(projectId, { force: true });
+    if (!routeIsCurrent()) return;
+  }
+  const item = cached || S.taskStore?.[projectId]?.find((candidate) => candidate.id === id);
+  if (!item) {
     toast('Not in the Task store', true);
     return go(listRoute(projectBase(projectId), STORE_VIEW_QUERY), { replace: true });
   }
-  renderMain();
+  const carried = carriedStoreForm?.projectId === projectId && carriedStoreForm.id === id ? carriedStoreForm.params : null;
+  carriedStoreForm = null;
+  openTaskForm(item.task.workflow || NEW_TASK_WORKFLOW, undefined, '',
+    carried || { ...item.task.params, prompt: item.task.prompt, template: item.id }, { projectId, store: item });
 }
 function storeBackRoute() { return S.returnRoute || listRoute(projectBase(S.projectId), STORE_VIEW_QUERY); }
 function closeStoreTask() {
@@ -6717,48 +6736,59 @@ function closeStoreTask() {
   S.returnRoute = null;
   return go(back);
 }
-// Its triggers, conditions included (a series page's summary says less).
-function storeTriggerSummary(triggers) {
-  return (triggers || []).map((trigger) => {
-    const where = Object.entries(trigger.kind === 'event' ? trigger.where || {} : {}).map(([path, expected]) => {
-      const [op, value] = eventConditionParts(expected);
-      return `${path} ${EVENT_OPS.find(([v]) => v === op)[1]} ${value}`;
-    });
-    return [triggerSummary([trigger]), ...where].join(' · ');
-  }).join('  ·  ');
-}
-function renderStoreTaskPage() {
-  const main = $('#main');
-  const projectId = S.projectId;
-  const item = (S.taskStore?.[projectId] || []).find((candidate) => candidate.id === S.storeOpen);
-  if (!main || !item) return;
-  const installed = item.repeatable && item.installed?.length;
+// What the store form's foot says: what the project lacks for it, or that it
+// is installed already (this adds another, which runs alongside it).
+function storeFormHint(item) {
   const need = storeNeed(item);
-  const md = markdownEnabled() ? ' md' : '';
-  const when = storeTriggerSummary(item.task?.params?.triggers);
-  main.innerHTML = `
-    <div class="task-page store-page" data-store-page="${esc(item.id)}">
-      <div class="tp-head">
-        <div class="row1">
-          <a class="icon-btn" id="tp-back" href="${esc(storeBackRoute())}" data-shortcut="nav.close" title="Back (Esc)">←</a>
-          <h2>${esc(item.name)}</h2>
-          ${item.repeatable ? `<span class="chip">${installed ? 'installed' : 'repeatable'}</span>` : ''}
-        </div>
-        ${when ? `<div class="meta"><span>${esc(when)}</span></div>` : ''}
-      </div>
-      <div class="tp-body" id="tp-body" tabindex="-1"><div class="tp-content">
-        ${item.summary ? `<p class="store-summary">${esc(item.summary)}</p>` : ''}
-        <div class="section-h">Prompt</div>
-        <div class="store-prompt msg-text${md}">${renderMessageBody(item.task?.prompt || '')}</div>
-      </div></div>
-      <div class="tp-foot" id="tp-foot"><div class="tp-foot-inner">
-        ${need ? `<span class="store-need">${esc(need[0])}</span>` : ''}
-        <span style="flex:1"></span>
-        ${storeActionHtml(item, projectId, true)}
-      </div></div>
-    </div>`;
-  $('#tp-back').addEventListener('click', plainClick(closeStoreTask));
-  wireTaskStore();
+  if (need) return `<span class="store-need" title="${esc(need[1])}">${esc(need[0])}</span>`;
+  return item.repeatable && item.installed?.length
+    ? `<span class="store-need" title="This installs another copy, which runs alongside it">Installed already</span>` : '';
+}
+// Which project a store task chosen on the organization home is for; its form
+// opens there. With one project there is nothing to ask.
+function chooseStoreProject(id) {
+  const projects = (S.projects || []).filter((project) => project.organizationId === S.organizationId);
+  const open = (projectId) => { rememberNewTaskProject(projectId); spaNavigate(storeTaskRoute(projectId, id)); };
+  if (projects.length === 1) return open(projects[0].id);
+  if (!projects.length) return;
+  const name = (S.taskStore?.[storeProjectId()] || []).find((item) => item.id === id)?.name || 'Task';
+  const previousFocus = document.activeElement;
+  const root = createTransientOverlay();
+  root.innerHTML = `<div class="palette-scrim" id="sp-scrim"><div class="palette store-project-picker" role="dialog" aria-label="${esc(name)}: choose a project">
+    <input id="sp-in" placeholder="${esc(name)} in…" autocomplete="off" aria-label="Project" />
+    <div id="sp-list" role="listbox"></div>
+  </div></div>`;
+  const input = root.querySelector('#sp-in'), list = root.querySelector('#sp-list');
+  const preferred = newTaskProjectId();
+  const all = [...projects].sort((a, b) => (b.id === preferred) - (a.id === preferred));
+  let shown = all, active = 0;
+  const close = () => root.remove();
+  const dismiss = () => { close(); previousFocus?.focus?.(); };
+  const choose = (project) => { if (!project) return; close(); open(project.id); };
+  const draw = () => {
+    list.innerHTML = shown.map((project, i) => `<div class="opt${i === active ? ' active' : ''}" role="option" aria-selected="${i === active}" data-i="${i}" title="${esc(projectPath(project))}">
+      <span class="task-project">${esc(projectSlug(project))}</span>${i === active ? '<span class="key">↵</span>' : ''}</div>`).join('')
+      || '<div class="pal-empty">No such project</div>';
+    list.querySelector('.opt.active')?.scrollIntoView({ block: 'nearest' });
+  };
+  input.addEventListener('input', () => {
+    const q = input.value.trim();
+    shown = q ? all.map((project) => ({ project, score: fuzzyScore(q, `${projectSlug(project)} ${project.name || ''}`) })).filter((x) => x.score >= 0)
+      .sort((a, b) => b.score - a.score).map((x) => x.project) : all;
+    active = 0;
+    draw();
+  });
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.stopPropagation(); dismiss(); }
+    else if (e.key === 'ArrowDown') { e.preventDefault(); active = Math.min(shown.length - 1, active + 1); draw(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); active = Math.max(0, active - 1); draw(); }
+    else if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); choose(shown[active]); }
+  });
+  list.addEventListener('click', (e) => { const o = e.target.closest('.opt'); if (o) choose(shown[Number(o.dataset.i)]); });
+  list.addEventListener('mousemove', (e) => { const o = e.target.closest('.opt'); if (o && Number(o.dataset.i) !== active) { active = Number(o.dataset.i); draw(); } });
+  root.querySelector('#sp-scrim').addEventListener('click', (e) => { if (e.target.id === 'sp-scrim') dismiss(); });
+  draw();
+  input.focus();
 }
 // The store's rows the query's words match (name or summary).
 function storeViewHtml() {
@@ -6813,6 +6843,7 @@ function wireTaskStore() {
   const projectId = storeProjectId();
   main.querySelectorAll('a[data-store-view]').forEach((a) => a.addEventListener('click', plainClick(() => setQuery(STORE_VIEW_QUERY))));
   $('#store-recs-dismiss')?.addEventListener('click', () => dismissStoreRecs(projectId));
+  main.querySelectorAll('[data-store-choose]').forEach((el) => el.addEventListener('click', plainClick(() => chooseStoreProject(el.dataset.storeChoose))));
   main.querySelectorAll('[data-store-run]').forEach((button) => button.addEventListener('click', async () => {
     const item = (S.taskStore?.[projectId] || []).find((candidate) => candidate.id === button.dataset.storeRun);
     button.disabled = true;
@@ -8684,6 +8715,7 @@ let activeTaskFormKeyController = null;
 // `page`: the form is a draft's own task page (see showDraftPage), so leaving it
 // leaves the task, and running the draft reveals its live task page.
 // `projectId`: the project a new task is created in (default: the open one).
+// `store`: a Task store entry the new task is taken from (its route is the form's).
 async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   const page = !!opts?.page;
   activeTaskFormKeyController?.abort();
@@ -8706,6 +8738,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   // a new task starts from one. Either way the template seeds what params cannot hold.
   const templateEdit = opts?.templateEdit || null;
   const seed = draft ? null : templateEdit?.template || opts?.template || null;
+  const store = draft ? null : opts?.store || null;
   // Priority and tags: a task's own once it has an id; until then a
   // template's (its tags where this project has them), applied on create.
   const orgRec = draft
@@ -8716,7 +8749,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   const editInPlace = armed || series; // neither has a running workflow — edit its stored params
   const workflowEditable = !draft || !!draft.params?.draft;
   // A new task can start over from another template (a fork keeps its own form).
-  const templatePickable = !draft && !templateEdit && !opts?.fork;
+  const templatePickable = !draft && !templateEdit && !opts?.fork && !store;
   // Carry over seed text (or whatever was typed before switching
   // workflows) into the field that consumes it, without clobbering a real value.
   if (seedText) {
@@ -8728,12 +8761,13 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   // currently slow. Usually the prefetched defaults below are already resolved
   // and this loading page never reaches a paint; otherwise it provides instant
   // feedback while keeping the not-yet-hydrated controls safely non-interactive.
-  const formTitle = templateEdit ? (templateEdit.template ? 'Edit template' : 'New template') : '';
+  const formTitle = templateEdit ? (templateEdit.template ? 'Edit template' : 'New template') : store?.name || '';
   root.innerHTML = taskFormLoadingPage(proj, draft, formTitle);
   // Closing a draft's own page returns to where the task was opened from —
   // unless a navigation is what closed it.
   const leavePage = (navigating) => {
     if (page && !navigating && S.selected === draft.id) closeTask();
+    if (store && !navigating && S.storeOpen === store.id) closeStoreTask();
   };
   $('#tf-close').addEventListener('click', () => {
     const navigating = !!root.querySelector('#tf-page')?.dataset.navigating;
@@ -8793,7 +8827,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       <div class="tf-head">
         <div class="tf-head-inner">
           <button class="icon-btn" id="tf-close" data-shortcut="nav.close" title="${editInPlace ? 'Back (Esc) — your changes are kept' : 'Back (Esc) — your work is kept as a draft'}">←</button>
-          <h2>${formTitle || taskFormTitle(draft)}</h2>
+          <h2>${formTitle ? esc(formTitle) : taskFormTitle(draft)}</h2>${store?.summary ? policyTip(store.summary) : ''}
           ${templateEdit ? `<input id="tf-template-name" class="tf-template-name" placeholder="Template name" aria-label="Template name" maxlength="120" value="${esc(templateEdit.name ?? templateEdit.template?.name ?? '')}">`
             : proj ? `<span class="tf-crumb">in</span>${projectPickerHtml('tf-project', projectId, !draft)}` : ''}
           ${formAttemptGroup?.attempts?.length > 1 ? `<nav class="attempts-list tf-attempts" aria-label="Choose an attempt">
@@ -8843,9 +8877,9 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       <div class="tf-foot">
         <div class="tf-foot-inner">
           ${templateEdit ? '<span class="tf-hint"></span>' : `<button class="btn ghost" id="tf-save-template" title="Save this form as a template, to start new tasks from" aria-label="Save as template">${ICON.template}<span class="tf-save-template-label">Save as template</span></button>
-          <span class="tf-hint"></span>
+          <span class="tf-hint">${store ? storeFormHint(store) : ''}</span>
           <button class="btn" id="tf-draft">Save draft</button>`}
-          <button class="btn primary" id="tf-queue">${templateEdit ? 'Save template' : editInPlace ? 'Save' : 'Run task'}<span class="kbd">${esc(fmtKeys('meta+Enter'))}</span></button>
+          <button class="btn primary" id="tf-queue">${templateEdit ? 'Save template' : editInPlace ? 'Save' : store?.repeatable && values.repeatable ? 'Install' : 'Run task'}<span class="kbd">${esc(fmtKeys('meta+Enter'))}</span></button>
         </div>
       </div>
     </div>`;
@@ -8893,6 +8927,10 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     const promptName = consumingField(fields)?.name;
     const carried = promptName ? $('#tf-body')?.querySelector(`[data-field="${CSS.escape(promptName)}"]`)?.value || '' : '';
     const hadAttachments = formImages.length + formFiles.length > 0;
+    // A store task keeps what it is (its triggers, title, store link) and your prompt.
+    const edited = store ? formState().body : {};
+    const storeParams = store ? { ...seedParams, triggers: edited.triggers, repeatable: edited.repeatable,
+      ...(promptName && carried.trim() ? { [promptName]: carried } : {}) } : null;
     clearTimeout(saveTimer);
     rememberNewTaskProject(nextProjectId);
     releaseFormKeys();
@@ -8905,6 +8943,12 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     }
     // Attachments are uploaded into a project; they cannot follow the task elsewhere.
     if (hadAttachments) toast('Attachments removed — attach them again for this project');
+    if (store) {
+      // Its route is that project's: whether it is installed there, and where Back goes.
+      root.innerHTML = '';
+      carriedStoreForm = { projectId: nextProjectId, id: store.id, params: storeParams };
+      return go(storeTaskRoute(nextProjectId, store.id), { replace: true });
+    }
     openTaskForm(wf, undefined, carried.trim(), undefined, { projectId: nextProjectId });
   });
   // Another template: the form starts over from it, keeping what you wrote
@@ -9112,8 +9156,9 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   // The id of the draft this form is editing. Starts as the passed-in draft; a
   // brand-new task gets one lazily the first time auto-save persists real content.
   let draftId = draft?.id || null;
-  const orgSeed = () => orgRec.id || templateEdit ? {} : { ...(orgRec.params.priority ? { priority: orgRec.params.priority } : {}),
-    ...(orgRec.tags.length ? { tags: orgRec.tags.map(tagPathStr) } : {}) };
+  // A store task's title rides the first create too: `#{{issue.number}} …` names each run of its series.
+  const orgSeed = () => ({ ...(store ? { title: store.task.title } : {}), ...(orgRec.id || templateEdit ? {} : { ...(orgRec.params.priority ? { priority: orgRec.params.priority } : {}),
+    ...(orgRec.tags.length ? { tags: orgRec.tags.map(tagPathStr) } : {}) }) });
   const hasPolicy = () => !!(taskCredPolicy.order?.length || taskCredPolicy.on?.length || taskCredPolicy.off?.length || taskCredPolicy.explainerOnly?.length);
   // Prompt attachments ride inside `params` (references only), so they flow
   // through auto-save, draft, and queue the same way the prompt text does.
@@ -9131,6 +9176,8 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     const triggers = collectTriggers(values.triggers);
     if (triggers.length) body.triggers = triggers;
     if ($('#trig-repeatable')?.checked) body.repeatable = true;
+    // Where it came from in the Task store, which counts what the project took.
+    if (values.template) body.template = values.template;
     // The wiki-context row. Always sent — even empty,
     // which is a deliberate opt-out of the default `default`-labelled pages — so
     // the replace:true auto-save preserves the user's choice.
@@ -9460,6 +9507,15 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
         goToTask(run.id);
         return true;
       }
+      // A store task's form leaves its route: for the task it started, else
+      // (installed, or kept as a draft) for the store it came from.
+      if (store && S.storeOpen === store.id) {
+        toast(draftMode ? 'Draft saved' : st.body.repeatable ? 'Installed' : 'Task started');
+        await refreshTasks();
+        if (!draftMode && !st.body.repeatable && primaryId) go(taskUrl(primaryId), { replace: true });
+        else closeStoreTask();
+        return true;
+      }
       if (page && S.selected === draft.id) {
         // A saved draft leaves its page like Back; a started one shows its live page.
         if (draftMode) closeTask();
@@ -9547,6 +9603,10 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   };
   $('#tf-draft')?.addEventListener('click', () => submit(true));
   $('#tf-queue').addEventListener('click', () => submit(false));
+  // A repeatable store task installs; unticked, it runs once.
+  if (store?.repeatable) $('#trig-repeatable')?.addEventListener('change', (event) => {
+    $('#tf-queue').firstChild.textContent = event.target.checked ? 'Install' : 'Run task';
+  });
   // Capture at the document boundary so this still works after an editor
   // re-renders its focused control and focus falls back to <body>. A secondary
   // modal (tag picker, vault picker, authorization prompt, …) owns its keys until
