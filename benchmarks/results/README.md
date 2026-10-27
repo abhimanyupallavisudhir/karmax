@@ -78,3 +78,7 @@ kept fingerprints instead of copies. 64 KB conversations (40 tasks × 8 turns ×
 (20 tasks × 6 turns × 32 KB): [before](workflow-memory-large-before-2026-10-08.json.gz)
 4.48 MB, [after](workflow-memory-large-after-2026-10-08.json.gz) 1.23 MB. Read in
 the wiki's `ops/performance-history`, "Control-plane memory".
+
+## Quota scheduling simulation (benchmarks/scheduling)
+
+[scheduling-2026-10-27.txt](scheduling-2026-10-27.txt): `sim.ts --seeds 8 --weeks 5` at loads 0.7, 1, 1.3 and 2, the four policies of the wiki page `planned/quota-scheduling` (first come, strict priority, Gittins index, index with quota prices), with the JSON the table was made from. Calibrated to tavya.io's arrivals and tree sizes of 2026-09-22..10-27; the priority mix is assumed.
