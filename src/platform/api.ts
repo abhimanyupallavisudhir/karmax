@@ -1559,8 +1559,6 @@ export class KarmaxApi {
     if (!args.draft) (await this.assertRepositoriesValid(manifest, project, resolved));
 
     const title = args.title ?? firstLine(String(resolved.prompt ?? resolved.command ?? 'Task'));
-    if (!args.draft) (await this.assertStoreTaskFree({ projectId: args.projectId, params: { ...taskOverrides,
-      ...(forcesRepeatable(normalizeTriggers(taskOverrides)) ? { repeatable: true } : {}) } }));
     const createdBy = await this.taskCreator(caller, project.id);
     // Pin the connected account when the task is created. Switching the user's
     // active account later must not silently change an existing task's commit or
@@ -2317,7 +2315,6 @@ export class KarmaxApi {
     }
     // A draft sub-task is started by its parent, under the parent's grant.
     if (task.parentTaskId && task.params?.draft) return this.queueSubTaskDraft(caller, task);
-    (await this.assertStoreTaskFree(task));
     (await this.assertStoredGrantQueueable(token, caller, task));
     (await this.refreshAgentAuthorizationsForQueue(token, caller, task));
     const group = (await this.deps.store.attemptGroup(taskId));
@@ -3146,8 +3143,9 @@ export class KarmaxApi {
     return this.deps.hosted ? template.task.hostedPrompt ?? template.task.prompt : template.task.prompt;
   }
 
-  /** Take a task from the store: an ordinary one starts now (as often as
-   *  asked); a repeatable one becomes the project's armed series, once.
+  /** Take a task from the store: an ordinary one starts now, a repeatable one
+   *  becomes an armed series of the project — as often as asked, each one
+   *  its own (say, one per label it builds).
    *  `overrides` customize it as createTask's arguments do, `params` field by
    *  field (what the task form sends when it is opened from the store). */
   async runStoreTask(token: string, projectId: string, templateId: string,
@@ -3159,15 +3157,6 @@ export class KarmaxApi {
     const { params, ...rest } = overrides;
     return this.createTask(token, { projectId, title: template.task.title, ...(template.task.workflow ? { workflow: template.task.workflow } : {}), ...rest,
       params: { ...template.task.params, prompt: this.storePrompt(template), ...params, template: template.id } });
-  }
-
-  /** A repeatable store task is installed once per project: another series
-   *  from it would answer every event twice. Deleting the series frees it. */
-  private async assertStoreTaskFree(task: { id?: string; projectId: string; params?: Record<string, unknown> }): Promise<void> {
-    const template = STORE_TASKS.find((candidate) => candidate.id === task.params?.template);
-    if (!template || !storeTaskRepeatable(template) || !takenFromStore({ params: { ...task.params, draft: false } }, template)) return;
-    const existing = (await this.deps.store.listTasks(task.projectId)).find((other) => other.id !== task.id && takenFromStore(other, template));
-    if (existing) throw new ValidationError(`this project already has “${template.name}”: ${existing.id}`);
   }
 
   /** A run started by an event follows what the event is about: the issue's

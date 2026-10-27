@@ -5,9 +5,9 @@ import type { EventTrigger, TaskTrigger } from './triggers.js';
  * The task store (wiki features/events-and-automations): ready-made tasks.
  * There is no other noun: an ordinary one runs as a task of the project the
  * moment it is chosen; a repeatable one (an automation: a task plus its
- * trigger) installs as an ordinary series, which the task form edits and
- * deletes like any other. Either way `params.template` remembers where it came
- * from. They ship with the platform.
+ * trigger) installs as an ordinary series, as often as asked, which the task
+ * form edits and deletes like any other. Either way `params.template`
+ * remembers where it came from. They ship with the platform.
  */
 export interface StoreTask {
   id: string;

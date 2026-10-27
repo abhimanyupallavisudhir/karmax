@@ -225,15 +225,21 @@ describe('events in the console', () => {
       triggers: [{ type: 'github.issues.labeled', where: { 'label.name': 'ready' } }] });
     const row = page.locator('.store-row[data-store-task="build-planned-issues"]');
     await expect.poll(async () => row.textContent()).toMatch(/installed[\s\S]*Open/);
-    // Installed, its row opens the series, which edits it without losing either.
+    // Installed, its row still opens the form, to install another (say, for another label).
     await row.click({ position: { x: 40, y: 12 } });
-    await page.locator('#sd-delete').waitFor();
-    // …and its store route does too.
-    await page.goto(`${base}/personal/factory/store/build-planned-issues`);
-    await page.locator('#sd-delete').waitFor();
-    expect(page.url()).toContain('/tasks/');
-    await store.deleteTask(series.id);
-    await store.deleteTask(run.id);
+    await form.locator('#ev-conds .ev-val').waitFor();
+    expect(await form.locator('.tf-foot .store-need').textContent()).toBe('Installed already');
+    await form.locator('#ev-conds .ev-val').fill('urgent');
+    await form.locator('#tf-queue').click();
+    await expect.poll(() => page.url()).toMatch(/\/personal\/factory\?q=is(:|%3A)store$/);
+    const both = (await store.listTasks(project.id)).filter((task) => task.params?.template === 'build-planned-issues');
+    expect(both.map((task) => (task.params.triggers as any)[0].where['label.name']).sort()).toEqual(['ready', 'urgent']);
+    await expect.poll(async () => row.locator('.chip').textContent()).toBe('2 installed');
+    // Open lists them both.
+    await row.locator('a', { hasText: 'Open' }).click();
+    await expect.poll(() => page.url()).toMatch(/q=store(:|%3A)build-planned-issues(\+|%20)is(:|%3A)series$/);
+    await expect.poll(async () => page.locator('#main .series-row').count()).toBe(2);
+    for (const task of [...both, run]) await store.deleteTask(task.id);
     expect(errors).toEqual([]);
   });
 

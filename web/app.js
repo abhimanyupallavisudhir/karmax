@@ -6670,12 +6670,16 @@ const STORE_NEEDS = { github: ['Needs GitHub', 'Connect a GitHub repository to t
 function storeNeed(item) {
   return !(item.repeatable && item.installed?.length) && item.missing?.length ? STORE_NEEDS[item.missing[0]] : null;
 }
-// Run, Install, or Open the series it installed, in one click; the row itself
-// opens the form to change it first.
+// Run, Install, or Open what it installed (one series, or the list of them),
+// in one click; the row opens the form, to change it first or install another.
+function storeInstalledRoute(item, projectId) {
+  return item.installed.length === 1 ? taskUrl(item.installed[0], taskRecord(item.installed[0]) || { projectId })
+    : listRoute(projectBase(projectId), `store:${item.id} is:series`);
+}
 function storeActionHtml(item, projectId) {
   const need = storeNeed(item);
   const disabled = need ? ` disabled title="${esc(need[1])}"` : '';
-  if (item.repeatable && item.installed?.length) return `<a class="btn sm" data-spa href="${esc(taskUrl(item.installed[0], taskRecord(item.installed[0]) || { projectId }))}">Open</a>`;
+  if (item.repeatable && item.installed?.length) return `<a class="btn sm" data-spa href="${esc(storeInstalledRoute(item, projectId))}">Open</a>`;
   return item.repeatable
     ? `<button class="btn sm" data-store-run="${esc(item.id)}"${disabled}>Install</button>`
     : `<button class="btn sm primary" data-store-run="${esc(item.id)}"${disabled}>Run</button>`;
@@ -6687,23 +6691,23 @@ function storeTaskRoute(projectId, id) { return `${projectBase(projectId)}/store
 function storeRowHtml(item) {
   const home = S.tab === 'home';
   const projectId = storeProjectId();
-  const installed = !home && item.repeatable && item.installed?.length;
+  const installed = !home && item.repeatable ? item.installed?.length || 0 : 0;
   const need = home ? null : storeNeed(item);
   const action = home ? `<button class="btn sm${item.repeatable ? '' : ' primary'}" data-store-choose="${esc(item.id)}" title="Choose a project">${item.repeatable ? 'Install…' : 'Run…'}</button>`
     : storeActionHtml(item, projectId);
   const link = home ? `<a class="row-link" href="${esc(storeTaskRoute(projectId, item.id))}" data-store-choose="${esc(item.id)}" draggable="false" tabindex="-1" aria-hidden="true"></a>`
-    : `<a class="row-link" data-spa href="${esc(installed ? taskUrl(item.installed[0], taskRecord(item.installed[0]) || { projectId }) : storeTaskRoute(projectId, item.id))}" draggable="false" tabindex="-1" aria-hidden="true"></a>`;
+    : `<a class="row-link" data-spa href="${esc(storeTaskRoute(projectId, item.id))}" draggable="false" tabindex="-1" aria-hidden="true"></a>`;
   return `<div class="task-row store-row has-row-link" data-store-task="${esc(item.id)}" tabindex="0" role="group" aria-label="${esc(item.name)}">
       <div class="task-main">
         <div class="task-title">${esc(item.name)} ${item.summary ? policyTip(item.summary) : ''}</div>
-        <div class="task-sub">${item.repeatable ? `<span class="chip">${installed ? 'installed' : 'repeatable'}</span>` : ''}${need ? `<span>${esc(need[0])}</span>` : ''}</div>
+        <div class="task-sub">${item.repeatable ? `<span class="chip">${installed > 1 ? `${installed} installed` : installed ? 'installed' : 'repeatable'}</span>` : ''}${need ? `<span>${esc(need[0])}</span>` : ''}</div>
       </div>
       <div class="task-right">${action}</div>
       ${link}
     </div>`;
 }
 // The task form, filled in from the store task: every field can change before
-// it runs or installs. An installed one is changed on its series' own page.
+// it runs or installs (again: each install is a series of its own).
 // `carried`: the form's params when it moves to another project.
 let carriedStoreForm = null;
 async function applyStoreTaskRoute(projectId, id, routeIsCurrent) {
@@ -6721,7 +6725,6 @@ async function applyStoreTaskRoute(projectId, id, routeIsCurrent) {
     toast('Not in the Task store', true);
     return go(listRoute(projectBase(projectId), STORE_VIEW_QUERY), { replace: true });
   }
-  if (item.repeatable && item.installed?.length) return go(taskUrl(item.installed[0], taskRecord(item.installed[0]) || { projectId }), { replace: true });
   const carried = carriedStoreForm?.projectId === projectId && carriedStoreForm.id === id ? carriedStoreForm.params : null;
   carriedStoreForm = null;
   openTaskForm(item.task.workflow || NEW_TASK_WORKFLOW, undefined, '',
@@ -6732,6 +6735,14 @@ function closeStoreTask() {
   const back = storeBackRoute();
   S.returnRoute = null;
   return go(back);
+}
+// What the store form's foot says: what the project lacks for it, or that it
+// is installed already (this adds another, which runs alongside it).
+function storeFormHint(item) {
+  const need = storeNeed(item);
+  if (need) return `<span class="store-need" title="${esc(need[1])}">${esc(need[0])}</span>`;
+  return item.repeatable && item.installed?.length
+    ? `<span class="store-need" title="This installs another copy, which runs alongside it">Installed already</span>` : '';
 }
 // Which project a store task chosen on the organization home is for; its form
 // opens there. With one project there is nothing to ask.
@@ -8866,7 +8877,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       <div class="tf-foot">
         <div class="tf-foot-inner">
           ${templateEdit ? '<span class="tf-hint"></span>' : `<button class="btn ghost" id="tf-save-template" title="Save this form as a template, to start new tasks from" aria-label="Save as template">${ICON.template}<span class="tf-save-template-label">Save as template</span></button>
-          <span class="tf-hint">${store && storeNeed(store) ? `<span class="store-need" title="${esc(storeNeed(store)[1])}">${esc(storeNeed(store)[0])}</span>` : ''}</span>
+          <span class="tf-hint">${store ? storeFormHint(store) : ''}</span>
           <button class="btn" id="tf-draft">Save draft</button>`}
           <button class="btn primary" id="tf-queue">${templateEdit ? 'Save template' : editInPlace ? 'Save' : store?.repeatable && values.repeatable ? 'Install' : 'Run task'}<span class="kbd">${esc(fmtKeys('meta+Enter'))}</span></button>
         </div>
