@@ -30,7 +30,6 @@ describe('human and agent authorization-level parity', () => {
     const store = (await Store.create(':memory:'));
     (await store.claimPersonalOrganization('me'));
     const project = (await store.createProject('Parity'));
-    (await store.kvSet(`avatars:project:${project.id}`, 'enabled'));
     const siblingProject = await store.createProject('Sibling');
     const foreignOrg = await store.createOrganization({ name: 'Foreign' });
     const foreignProject = await store.createProject('Foreign', {}, foreignOrg.id);
@@ -105,11 +104,9 @@ describe('human and agent authorization-level parity', () => {
         [await call('PUT', '/api/settings/global/__common__', { values: { test: true } }), profile.id === 'god' ? 200 : 403],
         [await call('GET', '/api/users'), profile.id === 'god' ? 200 : 403],
         [await call('POST', '/api/users', { name: 'New account' }), profile.id === 'god' ? 400 : 403],
-        [await call('POST', `/api/projects/${project.id}/avatars`, { name: `Helper ${kind}`,
-          prompt: 'Help with project work.', runtime: { provider: 'mock' } }), profile.id === 'viewer' ? 403 : 201],
-        [await call('POST', `/api/projects/${project.id}/avatars`, { name: `Organization helper ${kind}`,
-          prompt: 'Help across the organization.', runtime: { provider: 'mock' }, authorityMode: 'restricted',
-          authorization: { level: profile.id, scope: 'organization' } }), orgAdmin ? 201 : 403],
+        // An Avatar is a task saved with the Avatar setting, granted like any task.
+        [await call('POST', `/api/projects/${project.id}/tasks`, { workflow: 'just-do', draft: true,
+          params: { prompt: `Helper ${kind}`, avatar: {} } }), profile.id === 'viewer' ? 403 : 200],
         [await call('GET', '/api/user/default-organization'), 200],
         [await call('GET', `/api/inbox?organizationId=${project.organizationId}`), 200],
       ];

@@ -79,9 +79,9 @@ describe('the Computer block', () => {
     const body = page.locator('#tf-body');
     const block = body.locator('.tf-computer .computer-field');
     await block.waitFor();
-    // The computer sits between the agents and the branches; triggers come last.
+    // The computer sits between the agents and the branches; triggers, then the Avatar setting, come last.
     expect(await body.locator('.tf-main > section').evaluateAll((sections) => sections.map((section) => section.className.replace('tf-section ', ''))))
-      .toEqual(['tf-agent', 'tf-responder', 'tf-confirmer', 'tf-computer', 'tf-where', 'tf-triggers']);
+      .toEqual(['tf-agent', 'tf-responder', 'tf-confirmer', 'tf-computer', 'tf-where', 'tf-triggers', 'tf-avatar']);
     expect(await values(block)).toEqual({ provider: 'e2b', cpu: '2', memory: '4', disk: '50', flavor: 'headless', hibernate: '7', network: 'unrestricted' });
     await body.locator('textarea[data-field="prompt"]').fill('Download the dataset');
     await block.locator('.cf-disk').fill('60');

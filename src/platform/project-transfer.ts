@@ -69,7 +69,6 @@ export class ProjectTransfers {
         && !(await s.db.prepare("SELECT 1 FROM world_instances WHERE worldId=? AND state='released'").get(t.id)))).some(Boolean));
     block('checkpoints', 'This project has retained world checkpoints that require a storage migration.', (await rows('world_checkpoints')).length);
     block('resources', 'This project has data, secret, or service attachments that require a separate migration.', (await rows('resource_attachments')).length);
-    block('avatars', 'Remove project Avatars before moving; their delegated authority belongs to the source organization.', (await rows('avatars')).some(r => !r.deletedAt));
     block('executions', 'Stop running terminals, previews, and other executions before moving.', (await rows('executions')).some(r => !r.endedAt));
     block('leases', 'Wait for compute and usage reservations to be released.',
       (await rows('world_leases')).some(r => r.state !== 'released') || (await rows('usage_admissions')).some(r => r.state === 'active'));

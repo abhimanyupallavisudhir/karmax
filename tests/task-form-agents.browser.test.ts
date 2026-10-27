@@ -59,8 +59,8 @@ it('composes a task whose Responder and Reviewer carry their own authority', asy
       el.matches('[data-row="prompt"]') ? 'prompt' : el.classList.contains('tf-agent') ? 'agent'
         : el.classList.contains('tf-responder') ? 'responder' : el.classList.contains('tf-confirmer') ? 'review'
           : el.classList.contains('tf-computer') ? 'computer' : el.classList.contains('tf-where') ? 'where'
-            : el.classList.contains('tf-triggers') ? 'triggers' : 'other'))).toEqual(
-      ['prompt', 'agent', 'responder', 'review', 'computer', 'where', 'triggers']);
+            : el.classList.contains('tf-triggers') ? 'triggers' : el.classList.contains('tf-avatar') ? 'avatar' : 'other'))).toEqual(
+      ['prompt', 'agent', 'responder', 'review', 'computer', 'where', 'triggers', 'avatar']);
     // Triggers is an open block like the others, with Repeatable inside it.
     const triggers = body.locator('.tf-triggers');
     expect(await triggers.locator('details').count()).toBe(0);

@@ -96,8 +96,6 @@ export class AccountErasureService {
     // Resolve/reassign linked live work explicitly before removing authority.
     const activeTasks = related.filter(row => !row.status || !['done', 'cancelled'].includes(row.status)).map(row => row.id);
     if (activeTasks.length) blockers.push(`Resolve linked nonterminal tasks before closure: ${activeTasks.join(', ')}`);
-    const avatars = await this.store.db.prepare('SELECT id FROM avatars WHERE ownerUserId=? AND deletedAt IS NULL ORDER BY id').all(userId) as Array<{ id: string }>;
-    if (avatars.length) blockers.push(`Transfer or remove owned Avatars: ${avatars.map(row => row.id).join(', ')}`);
     const linkedGit: Array<{ organizationId: string; profile: string }> = [];
     for (const org of await this.store.listOrganizations()) {
       for (const profile of await new GitProfiles(this.store, this.broker, this.gitHome, org.id).list()) {
@@ -113,7 +111,7 @@ export class AccountErasureService {
     }
     const profiles = await new GitProfiles(this.store, this.broker, this.gitHome, userGitScope(userId)).list();
     const inventory = { userId, identity: user ? { name: user.name, email: user.email } : null,
-      organizations, relatedTaskIds: related.map(row => row.id), activeTasks, ownedAvatarIds: avatars.map(row => row.id), linkedGit,
+      organizations, relatedTaskIds: related.map(row => row.id), activeTasks, linkedGit,
       gitProfiles: profiles.map(profile => profile.name).sort(), blockers };
     return { ...inventory, fingerprint: hash(inventory), case: current ?? null,
       automatic: ['Revoke account access and delegation', 'Remove authentication identity and sessions',

@@ -65,7 +65,7 @@ import type { AuthorizationService } from '../platform/authorization.js';
 import { CredentialBroker } from '../autonomy/broker.js';
 import { VaultItems, removeTurnKeys, turnKeyDirectory } from '../autonomy/vault-items.js';
 import { PermissionRequests } from '../platform/permission-requests.js';
-import { applyAvatarProfile, avatarAuthorizationCapabilities, avatarForRole, avatarPrincipal } from '../platform/avatars.js';
+import { authorizingAvatar, avatarAllows, avatarAuthorizationCapabilities, avatarForRole, avatarPrincipal, avatarRoleFor } from '../platform/avatars.js';
 import { DELEGATED_PROFILE, delegatedFromParent } from '../platform/delegation.js';
 import { baseTaskAuthority, delegationReaching, taskAuthorityNow, tokenScopeOf } from '../platform/task-authority.js';
 import { GitProfiles, userGitScope } from '../autonomy/git-profiles.js';
@@ -135,7 +135,7 @@ import { assembleTaskInput } from '../platform/params.js';
 import { childComputer, subTaskParams } from '../platform/agent-params.js';
 import { allows, attenuate, CHILD_TASK_CEILING } from '../platform/capabilities.js';
 import { Provider, Message, TaskInput, TaskView, AgentRole, remotePolicyOf, landingAuthorityOf, type Repository, type TaskPullRequest,
-  type GitHubMergeAuthorization, type GithubLandingParticipant, type LandingAuthority, type UpstreamProposal, type SubTaskRequest, type SubTaskResponse, type TaskRecord, type WorldHandleRef, type AdoptedRepositories, type KeptWorkspace } from '../domain/types.js';
+  type GitHubMergeAuthorization, type GithubLandingParticipant, type LandingAuthority, type UpstreamProposal, type SubTaskRequest, type SubTaskResponse, type TaskRecord, type WorldHandleRef, type AdoptedRepositories, type KeptWorkspace, type FileRef, type ImageRef } from '../domain/types.js';
 import { newId } from '../util/id.js';
 import { SIG_AGENT_TURN_STATE } from '../workflows/names.js';
 import { destroyWorldServices } from '../world/services.js';
@@ -670,8 +670,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
   };
   const turnProfile = async (task: TaskInput, role: AgentRole, explicitProfileId?: string) => {
     const base = (await profiles.resolve(role, task.profiles, explicitProfileId, task.projectId));
+    // An agent that forks an Avatar its task's creator may call acts for it
+    // (src/platform/avatars.ts); its instructions are the forked conversation.
     const avatar = (await avatarForRole(store, task, role));
-    return { avatar, profile: applyAvatarProfile(base, task.agents?.[role], avatar) };
+    return { avatar, profile: applyAgentSpec(base, task.agents?.[role]) };
   };
 
   const organizationGitProfilesFor = async (projectId?: string) => new GitProfiles(
@@ -1493,19 +1495,27 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       organizationId?: string;
       delegationId?: string;
     } | undefined;
-    const delegatedAuthorization = avatar?.authorization;
+    // A fork acting for an Avatar acts with what it chose of the Avatar's
+    // authorization (stored backed by it), else all of it — and with nothing
+    // when the Avatar no longer lets it play this role.
+    const chosen = avatar && storedAuthorization?.principal === avatarPrincipal(avatar.id) ? storedAuthorization : undefined;
+    const roleAllowed = !avatar || avatarAllows(avatar, (await avatarRoleFor(store, args.taskId, participant)));
+    const delegatedAuthorization = chosen ?? avatar?.authorization;
     // A task may have been authorized by a routed Avatar without itself using
     // that Avatar as its role profile. Re-evaluate that delegation on every
     // turn so disabling the authorizer, narrowing its authority, or revoking
     // its backing principal immediately attenuates the task as well.
     const authorizingAvatarId = !avatar && storedAuthorization?.principal?.startsWith('avatar:')
       ? storedAuthorization.principal.slice(7) : undefined;
-    const authorizingAvatar = authorizingAvatarId ? (await store.getAvatar(authorizingAvatarId)) : undefined;
-    const authorizingAvatarBackingCaps = authorizingAvatar
-      ? (await avatarAuthorizationCapabilities(store, deps.authorization, authorizingAvatar, args.task.projectId))
+    const authorizer = authorizingAvatarId
+      ? (await authorizingAvatar(store, { id: args.taskId, projectId: args.task.projectId }, storedAuthorization?.principal)) : undefined;
+    const authorizingAvatarBackingCaps = authorizer
+      ? (await avatarAuthorizationCapabilities(store, deps.authorization, authorizer, args.task.projectId))
       : [];
+    const avatarGrant = avatar && roleAllowed
+      ? (await avatarAuthorizationCapabilities(store, deps.authorization, avatar, args.task.projectId)) : [];
     const principalGrant = avatar
-      ? (await avatarAuthorizationCapabilities(store, deps.authorization, avatar, args.task.projectId))
+      ? chosen ? attenuate(chosen.capabilities ?? [], avatarGrant) : avatarGrant
       : authorizingAvatarId
         ? attenuate(storedAuthorization?.capabilities ?? [], authorizingAvatarBackingCaps)
         : storedAuthorization?.capabilities ?? args.task.grant ?? DEFAULT_GRANT;
@@ -2858,7 +2868,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         (await record(args.taskId, 'token.minted', { tokenId: minted.record.id, profile: profile.id, caps: effective,
           audience: minted.record.audience, executionId: minted.record.executionId, expiresAt: minted.record.expiresAt,
           participant,
-          ...(avatar ? { avatarId: avatar.id, avatarOwnerUserId: avatar.ownerUserId, promptVersion: avatar.promptVersion } : {}) }));
+          ...(avatar ? { avatarId: avatar.id, avatarOwnerUserId: avatar.ownerUserId } : {}) }));
       }
 
       // JIT-resolve credentials via the broker (never journaled). Every current
@@ -3186,9 +3196,17 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
               srcView?.transcripts?.find((t) => t.role === srcRole)?.messages ??
               (srcRole === 'do' ? srcView?.messages : undefined) ??
               [];
-            if (srcMsgs.length) {
-              messages = [...srcMsgs, ...ownView];
-              (await record(args.taskId, 'session.forked', { from: spec.resumeFrom, replayed: srcMsgs.length, native: false }));
+            // A source that never ran (an Avatar saved without running) has
+            // no conversation yet: forking it starts from its prompt.
+            const source = srcMsgs.length || srcRole !== 'do' ? undefined : (await store.getTask(spec.resumeFrom.taskId));
+            const seed = source && !source.lastView && String(source.params.prompt ?? '').trim()
+              ? [{ id: `${source.id}:prompt`, role: 'user' as const, text: String(source.params.prompt), ts: source.createdAt,
+                ...((source.params.files as FileRef[] | undefined)?.length ? { files: source.params.files as FileRef[] } : {}),
+                ...((source.params.images as ImageRef[] | undefined)?.length ? { images: source.params.images as ImageRef[] } : {}) }]
+              : srcMsgs;
+            if (seed.length) {
+              messages = [...seed, ...ownView];
+              (await record(args.taskId, 'session.forked', { from: spec.resumeFrom, replayed: seed.length, native: false }));
             }
           }
         }
