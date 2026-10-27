@@ -616,9 +616,9 @@ a.git-repo-name:hover { color:var(--accent); }
 .new-project-dialog textarea { padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--surface-2); outline:none; resize:vertical; font:12px/1.5 var(--font-mono); }
 .new-project-dialog textarea:focus { border-color:var(--accent); }
 .np-h { margin-bottom:6px; }
-.np-default { margin:-4px 0 14px; }
+.np-default { display:grid; gap:6px; margin:-4px 0 14px; }
 .np-default-row { display:flex; align-items:center; gap:8px; cursor:pointer; color:var(--ink-2); font-size:13px; }
-.np-default-row input { flex:none; margin:0; }
+.np-default-row input { flex:none; margin:0; accent-color:var(--accent); }
 .np-default-row code { padding:1px 6px; border-radius:5px; background:var(--surface-2); color:var(--ink); font:12px var(--font-mono); }
 .np-default-blank { color:var(--ink-3); }
 .np-repos[hidden], .np-default[hidden] { display:none; }

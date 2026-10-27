@@ -110,7 +110,7 @@ async function repoWithGithubOrigin(name: string, slug = SLUG): Promise<string> 
 }
 
 async function coreFor(github: { options: { apiBase?: string; fetch?: typeof fetch } },
-  githubApp?: Record<string, unknown>, dbPath = ':memory:') {
+  githubApp?: Record<string, unknown>, dbPath = ':memory:', extra: { authorization?: (store: any) => Promise<unknown> } = {}) {
   const { Store } = await import('../src/store/db.js');
   const { WorldRegistry } = await import('../src/world/registry.js');
   const { ProfileResolver } = await import('../src/agent/profiles.js');
@@ -121,7 +121,8 @@ async function coreFor(github: { options: { apiBase?: string; fetch?: typeof fet
   const core = makeCoreActivities({ store, worlds, adapters: new Map(),
     profiles: new ProfileResolver(store, 'mock'), broker, githubPr: github.options,
     contentDir: path.join(tmp, 'content'),
-    ...(githubApp ? { githubApp: githubApp as any } : {}) });
+    ...(githubApp ? { githubApp: githubApp as any } : {}),
+    ...(extra.authorization ? { authorization: (await extra.authorization(store)) as any } : {}) });
   return Object.assign(core, { store });
 }
 
@@ -802,6 +803,77 @@ describe('GitHub-authoritative merge activity', () => {
       base: 'main', repo: tmp, root: tmp } as any, stale.prs)).resolves.toMatchObject({
         status: 'merged', actorUserId: 'reviewer',
       });
+  });
+
+  describe('a person without GitHub whom tavya lets land the work', () => {
+    async function landing(options: { linked?: boolean; level?: 'developer' | 'viewer' } = {}) {
+      const requests: Array<{ auth: string | null; method: string; path: string; body: any }> = [];
+      const fetcher = (async (input: string | URL | Request, init: RequestInit = {}) => {
+        const url = new URL(String(input));
+        const method = init.method ?? 'GET';
+        requests.push({ auth: new Headers(init.headers).get('authorization'), method, path: url.pathname, body: init.body ? JSON.parse(String(init.body)) : {} });
+        if (method === 'GET' && url.pathname === `/repos/${SLUG}`) return Response.json({ allow_merge_commit: false, allow_squash_merge: true });
+        if (method === 'GET') return Response.json({ number: 7, node_id: 'PR_node', html_url: 'https://github.test/acme/widgets/pull/7',
+          state: 'open', merged: false, head: { ref: 'tavya/task_app', sha: 'reviewed-head' }, base: { ref: 'main' } });
+        if (method === 'PUT' && url.pathname.endsWith('/merge')) return Response.json({ merged: true, sha: 'merge-sha', message: 'merged' });
+        return Response.json({ message: 'not found' }, { status: 404 });
+      }) as typeof fetch;
+      const app = {
+        activeUserAccountId: async () => undefined,
+        hasLinkedUserAccount: async () => options.linked ?? false,
+        repositoryPermission: async () => { throw new Error('no GitHub account'); },
+        userAccessToken: async () => { throw new Error('no GitHub account'); },
+        installationToken: async () => 'installation-token',
+      };
+      let authorization: any;
+      const core = await coreFor({ options: { apiBase: 'https://api.github.test', fetch: fetcher } }, app, ':memory:', {
+        authorization: async (store) => {
+          const { AuthorizationService } = await import('../src/platform/authorization.js');
+          return (authorization = await AuthorizationService.create(store));
+        },
+      });
+      (await core.store.claimPersonalOrganization('owner'));
+      const project = (await core.store.createProject('Merge without GitHub'));
+      (await core.store.setOrganizationMembership(project.organizationId!, 'pat', 'member'));
+      await authorization.replacePrincipalAuthorization('system:test', 'user:pat', project.organizationId!, { level: options.level ?? 'developer', scope: 'organization' }, ['*']);
+      const connection = (await core.store.upsertGitConnection({ organizationId: project.organizationId!, provider: 'github',
+        installationId: 'app-installation', accountLogin: 'acme', accountType: 'Organization' }));
+      const enrolled = (await core.store.upsertRepository({ organizationId: project.organizationId!, provider: 'github',
+        providerId: 'widgets-id', owner: 'acme', name: 'widgets', sshUrl: 'git@github.com:acme/widgets.git',
+        defaultBranch: 'main', private: true, gitConnectionId: connection.id }));
+      (await core.store.attachProjectRepository({ projectId: project.id, repositoryId: enrolled.id }));
+      const task = (await core.store.createTask({ projectId: project.id, title: 'Land me', workflow: 'software-dev',
+        workflowVersion: '1.12.0', params: { prompt: 'x' }, createdBy: { kind: 'user', userId: 'pat' } }));
+      (await core.store.appendEvent({ taskId: task.id, type: 'task.confirmation-voted', ts: 1,
+        payload: { userId: 'pat', satisfied: true, githubMergeAuthorized: true,
+          githubPrHeads: [{ slug: SLUG, number: 7, headSha: 'reviewed-head' }] } }));
+      const result = await core.mergeGithubPrs({ id: task.id, kind: 'worktree', branch: 'tavya/task_app',
+        base: 'main', repo: tmp, root: tmp } as any, [{ repo: 'widgets', slug: SLUG, number: 7,
+        url: 'https://github.test/acme/widgets/pull/7', state: 'open', headSha: 'reviewed-head' }]);
+      return { core, task, result, requests };
+    }
+
+    it('has the App land it for them, in the repository’s merge method, and says so', async () => {
+      const { core, task, result, requests } = await landing();
+      expect(result).toMatchObject({ status: 'merged', actorUserId: 'pat', sha: 'merge-sha' });
+      expect(requests.find((request) => request.method === 'PUT')).toMatchObject({
+        auth: 'Bearer installation-token', body: { sha: 'reviewed-head', merge_method: 'squash' },
+      });
+      const [event] = (await core.store.eventsOfTypes(task.id, ['github.merge.by-app']));
+      expect(event?.payload).toMatchObject({ userId: 'pat', repositories: [SLUG] });
+    });
+
+    it('leaves someone who linked GitHub to GitHub’s own merge rights', async () => {
+      const { result, requests } = await landing({ linked: true });
+      expect(result).toMatchObject({ status: 'needs-authorizer' });
+      expect(requests.some((request) => request.method === 'PUT')).toBe(false);
+    });
+
+    it('needs a tavya role that may land the work', async () => {
+      const { result, requests } = await landing({ level: 'viewer' });
+      expect(result).toMatchObject({ status: 'needs-authorizer' });
+      expect(requests.some((request) => request.method === 'PUT')).toBe(false);
+    });
   });
 
   it('returns a conflicting current proposal to Do instead of attempting a GitHub merge', async () => {

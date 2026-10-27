@@ -4,7 +4,7 @@ import { closeConsoleBrowser, consolePage, signedIn, type ApiCall } from './help
 afterAll(closeConsoleBrowser);
 
 // The New project form: name, the GitHub repository named after the project
-// (the list when unticked), the rest folded away; Create sends everything with
+// (or other repositories, from the list), the rest folded away; Create sends everything with
 // the project and lands on its task list.
 
 const site = { id: 'r1', owner: 'acme', name: 'site', sshUrl: 'git@github.com:acme/site.git', defaultBranch: 'main' };
@@ -40,16 +40,17 @@ async function form(options: { github?: boolean; hosted?: boolean; refuseCreate?
 describe('New project form', () => {
   it('opens on the name and the GitHub repository named after it, with the rest collapsed', async () => {
     const { ui, dialog } = await form();
-    const choice = dialog.getByRole('checkbox', { name: /GitHub repo/ });
+    const choice = dialog.getByRole('radio', { name: /GitHub repo/ });
     await choice.waitFor();
     expect(await choice.isChecked()).toBe(true);
-    expect(await dialog.locator('.np-default').innerText()).toBe('Create new GitHub repo acme/project-name');
-    // The repository list stays out of the way until the box is unticked.
+    expect(await dialog.getByRole('radio', { name: 'Choose other repositories' }).isChecked()).toBe(false);
+    expect(await dialog.locator('.np-default-label').innerText()).toBe('Create new GitHub repo acme/project-name');
+    // The repository list stays out of the way until other repositories are chosen.
     expect(await dialog.getByRole('combobox', { name: 'Add a repository' }).isVisible()).toBe(false);
     await dialog.getByRole('textbox', { name: 'Project name' }).fill('Clients/Site');
-    await expect.poll(() => dialog.locator('.np-default').innerText()).toBe('Work on existing GitHub repo acme/site');
+    await expect.poll(() => dialog.locator('.np-default-label').innerText()).toBe('Work on existing GitHub repo acme/site');
     await dialog.getByRole('textbox', { name: 'Project name' }).fill('Clients/Fresh Ideas');
-    await expect.poll(() => dialog.locator('.np-default').innerText()).toBe('Create new GitHub repo acme/fresh-ideas');
+    await expect.poll(() => dialog.locator('.np-default-label').innerText()).toBe('Create new GitHub repo acme/fresh-ideas');
     const folds = dialog.locator('details');
     expect(await folds.locator('> summary').allTextContents()).toEqual(['Secrets', 'Environment']);
     expect(await folds.evaluateAll((all) => all.map((d) => (d as unknown as { open: boolean }).open))).toEqual([false, false]);
@@ -60,7 +61,7 @@ describe('New project form', () => {
   it('works on the existing repository named after the project, with its secrets and environment, then opens its tasks', async () => {
     const { ui, dialog } = await form();
     await dialog.getByRole('textbox', { name: 'Project name' }).fill('Clients/Site');
-    await expect.poll(() => dialog.locator('.np-default').innerText()).toContain('existing');
+    await expect.poll(() => dialog.locator('.np-default-label').innerText()).toContain('existing');
     await dialog.getByText('Secrets', { exact: true }).click();
     await dialog.getByRole('textbox', { name: 'Secrets' }).fill('API_KEY=abc');
     await dialog.getByText('Environment', { exact: true }).click();
@@ -83,7 +84,7 @@ describe('New project form', () => {
   it('creates the GitHub repository named after a new project first, then the project on it', async () => {
     const { ui, dialog } = await form();
     await dialog.getByRole('textbox', { name: 'Project name' }).fill('Clients/Fresh Ideas');
-    await expect.poll(() => dialog.locator('.np-default').innerText()).toContain('acme/fresh-ideas');
+    await expect.poll(() => dialog.locator('.np-default-label').innerText()).toContain('acme/fresh-ideas');
     await dialog.getByRole('textbox', { name: 'Project name' }).press('Enter');
     await expect.poll(() => ui.calls.filter((call) => call.method !== 'GET')).toEqual([
       { method: 'POST', path: '/api/organizations/o/repositories/create', body: { gitConnectionId: 'g1', name: 'fresh-ideas', private: true } },
@@ -103,10 +104,10 @@ describe('New project form', () => {
     await ui.close();
   });
 
-  it('unticked, shows the repository list, and sends only the name when nothing is added', async () => {
+  it('choosing other repositories shows the list, and sends only the name when nothing is added', async () => {
     const { ui, dialog } = await form();
     await dialog.getByRole('textbox', { name: 'Project name' }).fill('Site');
-    await dialog.getByRole('checkbox', { name: /GitHub repo/ }).uncheck();
+    await dialog.getByRole('radio', { name: 'Choose other repositories' }).check();
     const picker = dialog.getByRole('combobox', { name: 'Add a repository' });
     await expect.poll(() => picker.evaluate((element) => element === (globalThis as any).document.activeElement)).toBe(true);
     await dialog.getByRole('textbox', { name: 'Project name' }).press('Enter');
@@ -118,7 +119,7 @@ describe('New project form', () => {
   it('picks repositories from a combobox that filters as you type, by keyboard', async () => {
     const { ui, dialog } = await form({ repositories: [site, { ...site, id: 'r3', name: 'docs', sshUrl: 'git@github.com:acme/docs.git' }] });
     await dialog.getByRole('textbox', { name: 'Project name' }).fill('Site');
-    await dialog.getByRole('checkbox', { name: /GitHub repo/ }).uncheck();
+    await dialog.getByRole('radio', { name: 'Choose other repositories' }).check();
     const picker = dialog.getByRole('combobox', { name: 'Add a repository' });
     const options = ui.page.getByRole('listbox', { name: 'Repositories' }).getByRole('option');
     // Focused and empty: every repository, and a way to make a new one.
@@ -151,7 +152,7 @@ describe('New project form', () => {
   it('offers “+ New repo” for a name no repository has, opening its dialog with that name', async () => {
     const { ui, dialog } = await form();
     await dialog.getByRole('textbox', { name: 'Project name' }).fill('Fresh');
-    await dialog.getByRole('checkbox', { name: /GitHub repo/ }).uncheck();
+    await dialog.getByRole('radio', { name: 'Choose other repositories' }).check();
     const picker = dialog.getByRole('combobox', { name: 'Add a repository' });
     await picker.fill('brand-new');
     const options = ui.page.getByRole('listbox', { name: 'Repositories' }).getByRole('option');

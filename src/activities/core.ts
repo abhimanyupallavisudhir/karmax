@@ -1242,8 +1242,41 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
     return new GithubPrApi(token, deps.githubPr ?? {});
   }
 
-  /** A merge is always attributed to the consenting human selected below. It
-   * never falls back to an installation token or an unrelated host credential. */
+  /** The App lands a task's pull requests for a consenting person who has no
+   * GitHub account (see mergeGithubPrs): the first of `candidates` who linked
+   * none and holds `merge-into:<target>` in the task's project. Only when every
+   * open pull request is in the task's own repositories under one installation. */
+  async function appLanding(task: TaskRecord, candidates: string[], prs: TaskPullRequest[]) {
+    const app = deps.githubApp;
+    if (!app || !deps.authorization || typeof app.installationToken !== 'function') return undefined;
+    const open = prs.filter((ref) => !ref.merged && !ref.headRepository);
+    if (!open.length) return undefined;
+    const repositories = await Promise.all(open.map((ref) => enrolledGithubRepository(task.projectId, ref.slug)));
+    const connectionIds = new Set(repositories.map((repository) => repository?.gitConnectionId));
+    if (repositories.some((repository) => !repository?.gitConnectionId) || connectionIds.size !== 1) return undefined;
+    const connection = await store.getGitConnection([...connectionIds][0]!);
+    if (!connection) return undefined;
+    const target = task.lastView?.targetBranch || (typeof task.params?.target === 'string' ? task.params.target : '')
+      || repositories[0]!.defaultBranch || 'main';
+    const organizationId = (await store.getProject(task.projectId))?.organizationId;
+    for (const userId of candidates) {
+      if ((await app.activeUserAccountId(userId).catch(() => undefined))
+        || (typeof app.hasLinkedUserAccount === 'function' && await app.hasLinkedUserAccount(userId))) continue;
+      const caps = await deps.authorization.capabilitiesAsync(`user:${userId}`, task.projectId, organizationId);
+      if (!allows(caps, `merge-into:${target}`)) continue;
+      const providerIds = repositories.map((repository) => repository!.providerId ?? '');
+      const api = new GithubPrApi(() => app.installationToken(connection, providerIds), deps.githubPr ?? {});
+      const permissions = new Map<string, GitHubRepositoryPermission>();
+      for (const ref of open)
+        permissions.set(ref.slug, { slug: ref.slug, permission: 'app', canMerge: true, mergeMethod: await api.mergeMethod(ref.slug) });
+      return { userId, api, permissions, requestedBy: await requesterName(userId, task.projectId) };
+    }
+    return undefined;
+  }
+
+  /** A merge is attributed to the consenting human selected below: as them on
+   * GitHub, or — for someone without a GitHub account whom tavya lets land the
+   * work (`appLanding`) — by the App on their behalf. Never an unrelated host credential. */
   function prApiForUser(userId: string, accountId?: string): GithubPrApi {
     if (!deps.githubApp) throw new Error('GitHub integration is unavailable');
     return new GithubPrApi(
@@ -5327,9 +5360,10 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
      * confirmed a human Review layer), then checks that person's repository
      * role live. Current tasks enter GitHub's native queue or atomically
      * fast-forward the target to the exact validated head; historical versions
-     * retain direct PR merge behavior. The App installation is intentionally
-     * not a candidate: it may transport task branches, but it must not bypass a
-     * person's merge rights.
+     * retain direct PR merge behavior. The App installation is not a candidate
+     * of its own: it lands work only for a consenting person who has no GitHub
+     * account and whom tavya lets merge into the target (`appLanding`), so it
+     * never bypasses the merge rights of anyone GitHub knows.
      */
     async mergeGithubPrs(handle: WorldHandle, prs: TaskPullRequest[], options?: {
       mode?: 'submit' | 'observe' | 'inspect-exact' | 'submit-exact' | 'preflight' | 'claim-provider' | 'submit-fallback' | 'review-ci';
@@ -5443,6 +5477,19 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         if (eligible) { actorUserId = userId; actorPermissions = permissions; break; }
       }
 
+      // Nobody with a GitHub account can merge: a consenting person without
+      // one, whom tavya lets land work on this branch (`merge-into:<target>`),
+      // has it landed by the App. tavya's roles are the only rights such a
+      // person has; anyone who linked GitHub is judged by GitHub's instead.
+      let landedByApp: Awaited<ReturnType<typeof appLanding>>;
+      if (!actorUserId) {
+        landedByApp = await appLanding(task, candidates, prs).catch((error) => {
+          console.warn(`[karmax] could not prepare an App merge for ${handle.id}:`, error instanceof Error ? error.message : error);
+          return undefined;
+        });
+        if (landedByApp) { actorUserId = landedByApp.userId; actorPermissions = landedByApp.permissions; }
+      }
+
       if (!actorUserId) {
         // This scan is advisory only (for the reviewer picker); it is the same
         // answer GET /api/tasks/:id/merge-eligibility gives. Revalidation above
@@ -5459,8 +5506,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         };
       }
 
-      const accountId = (await accountFor(actorUserId));
-      const api = prApiForUser(actorUserId, accountId);
+      const accountId = landedByApp ? undefined : (await accountFor(actorUserId));
+      const api = landedByApp?.api ?? prApiForUser(actorUserId, accountId);
+      if (landedByApp && !readyCheck && !observeOnly && !inspectExact && !participantPreflight && !claimProviderOnly && !reviewCi)
+        (await record(handle.id, 'github.merge.by-app', { userId: actorUserId, requestedBy: landedByApp.requestedBy,
+          repositories: prs.filter((ref) => !ref.merged).map((ref) => ref.slug),
+          reason: `${landedByApp.requestedBy} has no GitHub account linked; ${BRAND} lets them land work on this branch` }));
       // PR authorship, approval and landing remain attributable to the selected
       // human. Read-only policy/CI inspection belongs to the repository
       // installation instead: it has the exact repository-scoped Checks and

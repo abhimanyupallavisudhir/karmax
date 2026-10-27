@@ -23900,7 +23900,7 @@ const commandLines = (text) => text.split('\n').map((line) => line.trim()).filte
 // New project: the name, the project's GitHub repository, and folded Secrets
 // and Environment — what Project settings holds that a project needs to start.
 // With GitHub connected, the project works on the repository named after it
-// (made when it does not exist yet); unticking that shows the repository list.
+// (made when it does not exist yet), or on others chosen from the repository list.
 // Everything goes with Create, which opens the project's task list.
 // `folder` (from a folder row's "+") pre-fills the path so the new project
 // lands in that folder; the person can still retype it into any other place.
@@ -23958,15 +23958,18 @@ function newProject(options) {
     if (!chosen) return renderInstall();
     const label = chosen.existing ? 'Work on existing GitHub repo' : 'Create new GitHub repo';
     const slug = chosen.existing || chosen.create.name ? esc(chosen.slug) : `${esc(chosen.owner)}/<span class="np-default-blank">project-name</span>`;
-    const box = row.querySelector('input');
-    if (box) { row.querySelector('.np-default-label').innerHTML = `${label} <code>${slug}</code>`; }
+    if (row.querySelector('input')) { row.querySelector('.np-default-label').innerHTML = `${label} <code>${slug}</code>`; }
     else {
-      row.innerHTML = `<label class="np-default-row"><input type="checkbox" id="np-default-repo" ${useDefault ? 'checked' : ''}><span class="np-default-label">${label} <code>${slug}</code></span></label>`;
-      row.querySelector('input').addEventListener('change', (event) => {
-        useDefault = event.currentTarget.checked;
+      // Two choices, one always picked: the repository named after the project, or others.
+      row.setAttribute('role', 'radiogroup');
+      row.setAttribute('aria-label', 'Repositories');
+      row.innerHTML = `<label class="np-default-row"><input type="radio" name="np-repo-mode" value="default" ${useDefault ? 'checked' : ''}><span class="np-default-label">${label} <code>${slug}</code></span></label>
+        <label class="np-default-row"><input type="radio" name="np-repo-mode" value="custom" ${useDefault ? '' : 'checked'}><span>Choose other repositories</span></label>`;
+      row.querySelectorAll('input').forEach((radio) => radio.addEventListener('change', () => {
+        useDefault = row.querySelector('input[value="default"]').checked;
         renderDefault();
         if (!useDefault) $in('#np-repo-input')?.focus();
-      });
+      }));
     }
     renderInstall();
   };

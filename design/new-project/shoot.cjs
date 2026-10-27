@@ -51,7 +51,7 @@ const REPOSITORIES = [repository('ann', 'website'), repository('ann', 'web-docs'
   await name.fill('Website');
   await page.waitForTimeout(300);
   await shot('2-new-project-existing-repo', dialogClip);
-  await dialog.getByRole('checkbox', { name: /GitHub repo/ }).uncheck();
+  await dialog.getByRole('radio', { name: 'Choose other repositories' }).check();
   await page.keyboard.type('we');
   await page.waitForTimeout(400);
   await shot('3-repository-picker', dialogClip);
