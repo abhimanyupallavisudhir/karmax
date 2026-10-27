@@ -13926,11 +13926,16 @@ async function renderCredentialEditor(el, scope, opts = {}) {
   const q = new URLSearchParams();
   if (opts.projectId) q.set('projectId', opts.projectId);
   if (opts.taskId) q.set('taskId', opts.taskId);
-  let data, accounts = { logins: [] };
+  // Accounts mode (the organization's Agents settings) adds each account's
+  // live state; members who may not read it simply get the plain rows.
+  const live = opts.accounts && scope === 'global';
+  let data, accounts = { logins: [] }, status = null, usageReply = { usage: {}, pollable: [] };
   try {
-    [data, accounts] = await Promise.all([
+    [data, accounts, status, usageReply] = await Promise.all([
       api(`${organizationBase}/credentials?${q.toString()}`),
       api(`${organizationBase}/accounts`).catch(() => ({ logins: [] })),
+      live ? api(`${organizationBase}/accounts/status`).catch(() => null) : null,
+      live ? api(`${organizationBase}/accounts/usage`).catch(() => usageReply) : usageReply,
     ]);
   } catch {
     if (renderIsCurrent())
@@ -13977,7 +13982,11 @@ async function renderCredentialEditor(el, scope, opts = {}) {
   const loginByKey = {};
   for (const l of accounts.logins || []) loginByKey[l.key || `login:${l.provider}:${l.account}`] = l;
   const canManage = scope === 'global'; // rename/delete a login only at the global scope
-  el.innerHTML = `<div class="cred-list">${ordered
+  const statusByKey = Object.fromEntries((status?.accounts || []).map((a) => [a.id, a]));
+  const usage = usageReply?.usage || {};
+  const pollable = new Set(usageReply?.pollable || []);
+  const openAccounts = (S.openAccounts ||= new Set());
+  el.innerHTML = `<div class="cred-list${live ? ' acct-list' : ''}">${ordered
     .map((key) => {
       const c = byKey[key];
       const isOn = enabled.has(key);
@@ -14005,6 +14014,28 @@ async function renderCredentialEditor(el, scope, opts = {}) {
           : `Sign-in expires ${renewInDays ? `in ${renewInDays} day${renewInDays === 1 ? '' : 's'}` : 'today'} — click to renew`;
       const alertButton = signInAlert
         ? `<button class="cred-signin" title="${esc(signInAlert)}" aria-label="${esc(signInAlert)}">!</button>` : '';
+      if (live) {
+        const summary = accountStatusSummary(statusByKey[key]);
+        const open = openAccounts.has(key);
+        const toggle = c.signedOut ? '<span></span>'
+          : c.kind === 'key' && explanationsEnabled()
+            ? `<select class="cred-mode ${esc(mode)}" aria-label="API key availability" title="Choose where this API key may be used">
+                <option value="on"${mode === 'on' ? ' selected' : ''}>On</option><option value="off"${mode === 'off' ? ' selected' : ''}>Off</option>
+                <option value="explainer-only"${mode === 'explainer-only' ? ' selected' : ''}>Explainer-only</option></select>`
+            : `<input type="checkbox" class="toggle cred-toggle" aria-label="Use ${esc(label)}"${mode === 'on' ? ' checked' : ''} />`;
+        const state = summary
+          ? `<span class="acct-state ${summary[0]}"${summary[2] ? ` title="${esc(summary[2])}"` : ''}><span class="status-dot ${summary[0]}" aria-hidden="true"></span>${esc(summary[1])}</span>`
+          : '<span></span>';
+        return `<div class="cred-row acct ${esc(c.signedOut ? 'signed-out' : mode)}${open ? ' open' : ''}" data-key="${esc(key)}">
+          <span class="cred-drag" draggable="true" title="Drag to reorder" aria-hidden="true">⠿</span>
+          ${toggle}
+          <span class="cred-label mono">${icon}${esc(label)}${c.signedOut ? '' : alertButton}</span>
+          ${c.signedOut ? `<span class="acct-state bad"><button type="button" class="btn sm cred-signin" title="${esc(signInAlert)}">Sign in</button></span>` : state}
+          ${accountMeterHtml(usage[key])}
+          <button type="button" class="icon-btn acct-expand" aria-expanded="${open}" aria-label="Details of ${esc(label)}" title="Details">›</button>
+          ${accountDetailHtml({ credential: c, account: statusByKey[key], snap: usage[key], pollable: pollable.has(key), manage: canManage })}
+        </div>`;
+      }
       const stateControl = c.signedOut ? ''
         : c.kind === 'key' && scope !== 'task'
         ? `<select class="cred-mode ${esc(mode)}" aria-label="API key availability" title="Choose where this API key may be used">
@@ -14058,14 +14089,16 @@ async function renderCredentialEditor(el, scope, opts = {}) {
     });
     const login = loginByKey[key];
     const credential = byKey[key];
-    row.querySelector('.cred-signin')?.addEventListener('click', () => {
-      const out = el.querySelector('.cred-login-flow');
+    row.querySelectorAll('.cred-signin, .cred-signin-again').forEach((button) => button.addEventListener('click', () => {
+      const out = row.querySelector('.cred-login-flow') || el.querySelector(':scope > .cred-login-flow');
       out.hidden = false;
+      if (live && !row.classList.contains('open')) row.querySelector('.acct-expand')?.click();
       runLoginFlow(out, {
         organizationId, provider: credential.provider, account: credential.account,
         onSignedIn: () => renderCredentialEditor(el, scope, opts),
       });
-    });
+    }));
+    if (live) wireAccountRow(row, { key, accountBase: organizationBase, rerender: () => renderCredentialEditor(el, scope, opts) });
     row.querySelector('.cred-rename')?.addEventListener('click', async () => {
       const to = await promptText(`Rename login ${login.account} to:`, login.account);
       if (!to || to === login.account) return;
@@ -14090,6 +14123,25 @@ async function renderCredentialEditor(el, scope, opts = {}) {
       } catch (e) { toast(e.message, true); }
     });
   });
+  if (live) {
+    // Check usage that is stale or was never read, then show it (unless the
+    // person is typing in the list).
+    const recheckAll = opts.recheckButton;
+    if (recheckAll) {
+      recheckAll.hidden = !pollable.size;
+      recheckAll.onclick = async () => {
+        recheckAll.classList.add('action-pending');
+        try { await api(`${organizationBase}/accounts/usage/recheck`, { method: 'POST', body: JSON.stringify({}) }); }
+        catch (e) { toast(e.message, true); }
+        recheckAll.classList.remove('action-pending');
+        renderCredentialEditor(el, scope, opts);
+      };
+    }
+    if (autoRecheckUsage(organizationBase, usage, pollable)) autoRecheckUsage.pending.then(() => {
+      const focused = document.activeElement;
+      if (el.isConnected && !(el.contains(focused) && /^(INPUT|TEXTAREA|SELECT)$/.test(focused?.tagName || ''))) renderCredentialEditor(el, scope, opts);
+    });
+  }
   // Drag-to-reorder → precedence order for this scope.
   wireCredDrag(el.querySelector('.cred-list'), (order) => {
     if (opts.local) return save({ ...own, order });
@@ -14136,12 +14188,18 @@ function wireCredDrag(list, onReorder) {
   if (!list) return;
   let dragging = null;
   list.querySelectorAll('.cred-row').forEach((row) => {
-    row.addEventListener('dragstart', (e) => { dragging = row; row.classList.add('dragging'); e.dataTransfer.effectAllowed = 'move'; try { e.dataTransfer.setData('text/plain', row.dataset.key); } catch {} });
+    row.addEventListener('dragstart', (e) => {
+      dragging = row; row.classList.add('dragging'); e.dataTransfer.effectAllowed = 'move';
+      try { e.dataTransfer.setData('text/plain', row.dataset.key); } catch {}
+      // A list row drags by its handle; show the whole row moving.
+      if (e.target !== row) try { e.dataTransfer.setDragImage(row, 12, 16); } catch {}
+    });
     row.addEventListener('dragend', () => {
       row.classList.remove('dragging'); dragging = null;
       onReorder([...list.querySelectorAll('.cred-row')].map((r) => r.dataset.key));
     });
   });
+  const vertical = list.classList.contains('acct-list');
   list.addEventListener('dragover', (e) => {
     e.preventDefault();
     if (!dragging) return;
@@ -14152,7 +14210,7 @@ function wireCredDrag(list, onReorder) {
       const b = el.getBoundingClientRect();
       const cx = b.left + b.width / 2, cy = b.top + b.height / 2;
       const sameRow = Math.abs(cy - e.clientY) <= b.height / 2;
-      const after = cy - e.clientY > b.height / 2 || (sameRow && cx > e.clientX);
+      const after = vertical ? cy > e.clientY : cy - e.clientY > b.height / 2 || (sameRow && cx > e.clientX);
       if (!after) continue;
       const d = Math.hypot(cx - e.clientX, cy - e.clientY);
       if (d < bestDist) { bestDist = d; best = el; }
@@ -15871,96 +15929,158 @@ async function refreshProcPanel(now = false) {
   if (S.tab === 'installation') { clearTimeout(S.procTimer); S.procTimer = setTimeout(refreshProcPanel, now ? 1200 : 5000); }
 }
 
-// ── agent account status (Settings → Codex/Claude) ──────────────────────────
-// Live leasing state of the organization's own logins and keys: availability,
-// quota windows, in-use/concurrency and the last credential incident, with the
-// manual overrides beside them.
-async function renderAccountStatus(organizationId = S.organizationId || 'org_personal') {
-  const box = $('#account-status');
-  if (!box) return;
-  const renderIsCurrent = beginAsyncElementRender(box);
-  const accountBase = `/api/organizations/${encodeURIComponent(organizationId)}`;
-  const [status, u] = await Promise.all([
-    api(`${accountBase}/accounts/status`).catch(() => null),
-    api(`${accountBase}/accounts/usage`).catch(() => ({ usage: {}, pollable: [] })),
-  ]);
-  if (!renderIsCurrent() || (S.organizationId || 'org_personal') !== organizationId) return;
-  const accounts = status?.accounts || [];
-  const usage = u.usage || {};
-  const pollable = new Set(u.pollable || []);
-  if (!accounts.length) { box.innerHTML = ''; return; }
-  box.innerHTML = `
-    <div class="section-h section-h-action">
-      <span>Availability</span>
-      ${pollable.size ? `<button class="btn sm ghost usage-recheck-all" title="Check usage with each provider now">↻ Re-check all</button>` : ''}
-    </div>
-    ${accounts.map((a) => {
-      const status = a.status || 'available';
-      const [tone, badge] = status === 'available'
-        ? ['ok', 'available']
-        : status === 'manual-off'
-          ? ['off', 'off (manual)']
-          : status === 'needs-attention'
-            ? ['bad', 'needs attention (funding or re-authentication)']
-            : ['warn', `${esc(a.window || 'quota exhausted')}${a.note ? ` (${esc(a.note)})` : ''}${a.resetAt ? ` · resets ${fmtReset(a.resetAt)}` : ''}`];
-      const weekly = a.weeklyResetAt ? `<span class="setting-muted">weekly resets ${fmtReset(a.weeklyResetAt)}</span>` : '';
-      return `<div class="account-status">
-        <div class="account-status-head">
-          <b class="mono">${esc(a.id)}</b>
-          <span class="status-dot ${tone}" aria-hidden="true"></span><span>${badge}</span>${weekly}
-          <span class="setting-muted" title="Agent turns running on this account now">${a.inUse}/${a.maxConcurrent >= 1000000 ? '∞' : a.maxConcurrent} in use</span>
-          <span class="account-status-actions">
-          <label class="account-conc" title="How many agent turns may run on this account at once; empty means unlimited">Max <input class="acct-conc" data-id="${esc(a.id)}" value="${a.maxConcurrent >= 1000000 ? '' : a.maxConcurrent}" placeholder="∞" aria-label="Max concurrent turns" /></label>
-          ${pollable.has(a.id) ? `<button class="icon-btn usage-recheck" data-id="${esc(a.id)}" title="Re-check usage" aria-label="Re-check usage">↻</button>` : ''}
-          <button class="btn sm ghost acct-reset" data-id="${esc(a.id)}" title="Set when this account’s quota resets">Reset time…</button>
-          ${status === 'available'
-            ? `<button class="btn sm acct-avail" data-id="${esc(a.id)}" data-status="manual-off" title="Stop using this account until you turn it back on">Pause</button>`
-            : `<button class="btn sm acct-avail" data-id="${esc(a.id)}" data-status="available">Mark available</button>`}
-          </span>
-        </div>
-        ${usageBlock(a.id, usage[a.id], pollable.has(a.id))}
-        ${accountIncidentHtml(a)}
-      </div>`;
-    }).join('')}`;
-  const recheck = async (btn, body) => {
-    const label = btn.textContent; btn.disabled = true; btn.textContent = 'checking…';
-    try { await api(`${accountBase}/accounts/usage/recheck`, { method: 'POST', body: JSON.stringify(body) }); }
-    catch (e) { toast(e.message, true); }
-    btn.textContent = label; renderAccountStatus(organizationId);
-  };
-  // Auto-refresh stale usage: a snapshot whose window has already reset (server
-  // marks it `stale`) or a pollable login never probed. Without this the % froze
-  // at whenever ↻ was last clicked and a week-old 15% read as current. Guarded to
-  // one attempt a minute so a failing probe can't loop the panel.
-  if (autoRecheckUsage(accountBase, usage, pollable)) autoRecheckUsage.pending.then(() => {
-    // Skip the re-render if the user is mid-edit in the panel (e.g. concurrency).
-    const el = document.activeElement;
-    if ($('#account-status') === box && !(box.contains(el) && /^(INPUT|TEXTAREA|SELECT)$/.test(el?.tagName || ''))) renderAccountStatus(organizationId);
+// ── agent account status (Settings → Agents) ──────────────────────────────
+// Each account is one row of the organization's credential list (see
+// renderCredentialEditor's `accounts` mode): on/off, name, one status phrase and
+// its tightest quota meter; the rest (every usage window, turns at once, a
+// manual unavailable-until, the last incident, rename/delete) folds under it.
+const ACCOUNT_UNLIMITED = 1_000_000;
+
+// The provider:account part of an account id (`login:org_…:claude:me` → `claude:me`).
+function accountShortName(id) {
+  return String(id).replace(/^login:(org_[^:]+:)?/, '');
+}
+
+// [tone, text, title] for an account's live state; '' when nothing is known.
+function accountStatusSummary(account) {
+  if (!account) return null;
+  const status = account.status || 'available';
+  if (status === 'available') {
+    const max = account.maxConcurrent >= ACCOUNT_UNLIMITED ? '' : ` of ${account.maxConcurrent}`;
+    return account.inUse
+      ? ['ok', `${account.inUse} running`, `${account.inUse}${max} agent turns running on this account`]
+      : ['ok', 'Available', ''];
+  }
+  if (status === 'manual-off') return ['off', 'Paused', 'Not used until marked available'];
+  if (status === 'needs-attention') return ['bad', 'Needs attention', 'Check its funding, or sign in again'];
+  const back = account.resetAt > Date.now() ? ` · back ${fmtCountdown(account.resetAt)}` : '';
+  const title = [account.window, account.note, account.resetAt ? `Back ${fmtReset(account.resetAt)}` : ''].filter(Boolean).join(' · ');
+  return ['warn', `Out of quota${back}`, title];
+}
+
+// Usage windows of a snapshot that still exist, as [label, window].
+function usageWindows(snap) {
+  if (!snap?.ok) return [];
+  return [snap.session && ['Session', snap.session], snap.week && ['Week', snap.week],
+    ...(snap.models || []).map((model) => [model.name || 'Model', model])].filter(Boolean);
+}
+
+function usageBar(win) {
+  const pct = Math.max(0, Math.min(100, Math.round(win.pct || 0)));
+  const tone = pct >= 90 ? ' crit' : pct >= 70 ? ' warn' : '';
+  return `<span class="ins-quota-bar${tone}"><i style="width:${pct}%"></i></span><b>${pct}%</b>`;
+}
+
+// The row's one meter: the fullest window still running, every window in its tip.
+function accountMeterHtml(snap) {
+  const live = usageWindows(snap).filter(([, win]) => !(win.resetAt && win.resetAt < Date.now()));
+  if (!live.length) return '<span></span>';
+  const [label, win] = live.reduce((a, b) => ((b[1].pct || 0) > (a[1].pct || 0) ? b : a));
+  const tip = live.map(([name, w]) => `${name} ${Math.round(w.pct || 0)}% · resets ${fmtUsageReset(w)}`).join('\n');
+  return `<span class="acct-meter" title="${esc(tip)}">${usageBar(win)}<span>${esc(label.toLowerCase())}</span></span>`;
+}
+
+// Every usage window, or why there are none. `snap` is a full snapshot, an
+// "unavailable" record, or undefined (never probed).
+function usageBlock(snap, isPollable) {
+  if (!snap) return isPollable ? '<span class="setting-muted">Checking…</span>' : '';
+  if (!snap.ok) {
+    const why = snap.reason === 'setup-token' ? 'Not reported for setup-token sign-ins'
+      : snap.reason === 'logged-out' ? 'Signed out'
+      : snap.reason === 'not-subscription' || snap.reason === 'no-rate-limits' ? 'No subscription limits'
+      : `Unavailable${snap.reason ? ` (${snap.reason})` : ''}`;
+    return `<span class="setting-muted">${esc(why)}</span>`;
+  }
+  const rows = usageWindows(snap).map(([label, win]) => usageRow(label, win)).join('');
+  const freshness = snap.stale ? `Re-checking (last ${fmtAgo(snap.at)})` : `Checked ${fmtAgo(snap.at)}`;
+  return `<div class="acct-usage">${rows}<span class="acct-checked">${esc(freshness)}</span></div>`;
+}
+
+function usageRow(label, win) {
+  // A window whose reset instant has passed no longer exists: its % is history.
+  const expired = win.resetAt && win.resetAt < Date.now();
+  const reset = expired ? 'from the previous window' : `resets ${fmtUsageReset(win)}`;
+  return `<div class="ins-quota-row${expired ? ' stale' : ''}"><span>${esc(label)}</span>${usageBar(win)}<span class="acct-reset-at">${esc(reset)}</span></div>`;
+}
+
+// The fold under an account row.
+function accountDetailHtml({ credential, account, snap, pollable, manage }) {
+  const row = (label, value, actions = '') => `<div class="setting-row"><span class="setting-label">${label}</span>
+    <div class="setting-value">${value}</div>${actions ? `<span class="setting-actions">${actions}</span>` : ''}</div>`;
+  const rows = [];
+  if (snap || pollable) rows.push(row('Usage', usageBlock(snap, pollable),
+    pollable ? `<button type="button" class="icon-btn usage-recheck" title="Check usage now" aria-label="Check usage now">↻</button>` : ''));
+  if (account) {
+    const unlimited = account.maxConcurrent >= ACCOUNT_UNLIMITED;
+    rows.push(row(`Turns at once ${policyTip('How many agent turns may use this account at the same time. Empty means no limit.')}`,
+      `<input class="acct-conc" inputmode="numeric" value="${unlimited ? '' : account.maxConcurrent}" placeholder="No limit" aria-label="Turns at once" />`));
+    const status = account.status || 'available';
+    const until = status === 'exhausted' && account.resetAt ? localDateTimeValue(account.resetAt) : '';
+    rows.push(row(`Unavailable until ${policyTip('Skip this account until then, e.g. when you know its quota is used up elsewhere. Detected automatically when a provider says so.')}`,
+      `${until ? `<input class="acct-until" type="datetime-local" value="${esc(until)}" aria-label="Unavailable until" />`
+        : '<button type="button" class="btn sm ghost acct-until-pick">Choose time…</button>'}${
+        status === 'manual-off' ? '<span class="setting-muted">Paused</span>' : status === 'needs-attention' ? '<span class="setting-muted">Needs attention</span>' : ''}`,
+      status !== 'available' ? '<button type="button" class="btn sm acct-avail">Mark available</button>' : ''));
+    const incident = accountIncidentHtml(account);
+    if (incident) rows.push(row('Last issue', incident));
+  }
+  const actions = credential.kind === 'login' && manage
+    ? `${credential.signedOut ? '' : '<button type="button" class="btn sm ghost cred-signin-again">Sign in again</button>'}
+       <button type="button" class="btn sm ghost cred-rename" title="Rename login">Rename</button>
+       <button type="button" class="btn sm ghost danger cred-del" title="Delete login">Delete</button>`
+    : credential.kind === 'key' && manage && credential.key.startsWith('key:handle:') && credential.account
+      ? `<button type="button" class="btn sm ghost cred-key-edit" title="Edit API key">Edit key</button>
+         <button type="button" class="btn sm ghost danger cred-key-del" title="Delete API key">Delete</button>` : '';
+  return `<div class="acct-detail setting-rows ruled">${rows.join('')}${actions ? `<div class="acct-actions">${actions}</div>` : ''}
+    <div class="cred-login-flow" hidden></div></div>`;
+}
+
+// `datetime-local` wants local wall-clock time without a zone.
+function localDateTimeValue(epoch) {
+  const d = new Date(epoch);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+// Live controls of an account row (accounts mode); every change re-renders.
+function wireAccountRow(row, { key, accountBase, rerender }) {
+  const post = (path, body) => api(`${accountBase}/accounts/${path}`, { method: 'POST', body: JSON.stringify({ accountId: key, ...body }) });
+  const run = async (promise) => { try { await promise; } catch (e) { toast(e.message, true); } rerender(); };
+  row.querySelector('.acct-expand')?.addEventListener('click', () => {
+    const open = (S.openAccounts ||= new Set());
+    open.has(key) ? open.delete(key) : open.add(key);
+    const expanded = open.has(key);
+    row.classList.toggle('open', expanded);
+    row.querySelector('.acct-expand').setAttribute('aria-expanded', String(expanded));
   });
-  box.querySelectorAll('.usage-recheck').forEach((b) => b.addEventListener('click', () => recheck(b, { accountId: b.dataset.id })));
-  box.querySelectorAll('.usage-recheck-all').forEach((b) => b.addEventListener('click', () => recheck(b, {})));
-  box.querySelectorAll('.acct-avail').forEach((b) => b.addEventListener('click', async () => {
-    await api(`${accountBase}/accounts/availability`, { method: 'POST', body: JSON.stringify({ accountId: b.dataset.id, status: b.dataset.status }) }).catch((e) => toast(e.message, true));
-    renderAccountStatus(organizationId);
-  }));
-  box.querySelectorAll('.acct-conc').forEach((inp) => {
-    inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); inp.blur(); } });
-    inp.addEventListener('change', async () => {
-      const v = inp.value.trim(); // empty = unlimited
-      await api(`${accountBase}/accounts/concurrency`, { method: 'POST', body: JSON.stringify({ accountId: inp.dataset.id, max: v === '' ? null : Number(v) }) })
-        .then(() => toast('Concurrency updated')).catch((e) => toast(e.message, true));
-      renderAccountStatus(organizationId);
-    });
+  row.querySelector('.usage-recheck')?.addEventListener('click', (event) => {
+    event.currentTarget.classList.add('action-pending');
+    run(api(`${accountBase}/accounts/usage/recheck`, { method: 'POST', body: JSON.stringify({ accountId: key }) }));
   });
-  box.querySelectorAll('.acct-reset').forEach((b) => b.addEventListener('click', async () => {
-    const ans = await promptText('Mark unavailable until — minutes from now (e.g. 300), or a date/time:');
-    if (!ans) return;
-    const mins = Number(ans);
-    const resetAt = isFinite(mins) && ans.trim() !== '' ? Date.now() + mins * 60_000 : Date.parse(ans);
-    if (!resetAt || isNaN(resetAt)) { toast('Could not parse a time', true); return; }
-    await api(`${accountBase}/accounts/availability`, { method: 'POST', body: JSON.stringify({ accountId: b.dataset.id, status: 'exhausted', resetAt }) }).catch((e) => toast(e.message, true));
-    renderAccountStatus(organizationId);
-  }));
+  const conc = row.querySelector('.acct-conc');
+  conc?.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); conc.blur(); } });
+  conc?.addEventListener('change', () => {
+    const v = conc.value.trim(); // empty = no limit
+    run(post('concurrency', { max: v === '' ? null : Number(v) }));
+  });
+  row.querySelector('.acct-avail')?.addEventListener('click', () => run(post('availability', { status: 'available' })));
+  row.querySelector('.acct-until-pick')?.addEventListener('click', (event) => {
+    const input = Object.assign(document.createElement('input'), { type: 'datetime-local', className: 'acct-until' });
+    input.setAttribute('aria-label', 'Unavailable until');
+    event.currentTarget.replaceWith(input);
+    wireUntil(input);
+    input.focus();
+    try { input.showPicker(); } catch {}
+  });
+  const wireUntil = (input) => input.addEventListener('change', (event) => {
+    const value = event.target.value;
+    if (!value) return run(post('availability', { status: 'available' }));
+    const resetAt = new Date(value).getTime();
+    if (!(resetAt > Date.now())) { toast('Pick a time in the future', true); return; }
+    run(post('availability', { status: 'exhausted', resetAt }));
+  });
+  const until = row.querySelector('.acct-until');
+  if (until) wireUntil(until);
 }
 
 // Re-probe provider usage when any pollable login has no snapshot or a stale one,
@@ -16296,7 +16416,7 @@ function insightQuotaHtml(quota) {
       ? `<span class="ins-quota-state">${login.status === 'manual-off' ? 'off' : login.status === 'needs-attention' ? 'needs attention' : 'exhausted'}${
         login.resetAt > Date.now() ? ` · back ${esc(fmtCountdown(login.resetAt))}` : ''}</span>` : '';
     const windows = snap?.ok ? [snap.session && bar('Session', snap.session), snap.week && bar('Week', snap.week)].filter(Boolean).join('') : '';
-    return `<div class="ins-quota"><div class="ins-quota-name"><span class="mono">${esc(login.id.replace(/^login:/, ''))}</span>${state}</div>${windows}</div>`;
+    return `<div class="ins-quota"><div class="ins-quota-name"><span class="mono">${esc(accountShortName(login.id))}</span>${state}</div>${windows}</div>`;
   }).join('');
   return `<section class="card ins-card"><div class="ins-card-h"><span>Quota</span>
     <a class="ins-more" data-spa href="${esc(globalRoute('organization'))}#settings-agents">Manage</a></div>${rows}</section>`;
@@ -16448,61 +16568,13 @@ function accountIncidentHtml(account) {
   ].filter(Boolean).map(esc).join(' · ');
   const sourceTask = incident.sourceTask;
   const source = sourceTask
-    ? `<a data-spa href="${esc(taskUrl(sourceTask.id))}">Task #${esc(sourceTask.num ?? sourceTask.id)} — ${esc(sourceTask.title || sourceTask.id)}</a>`
-    : incident.sourceTaskId ? `<span class="mono">${esc(incident.sourceTaskId)}</span>` : esc(incident.source || 'unknown source');
-  return `<div style="margin-top:8px;padding:8px 10px;border:1px solid var(--line);border-radius:6px;background:var(--bg-2)">
-    <div style="font-size:12px;font-weight:600">Credential incident</div>
-    ${facts ? `<div class="task-sub" style="margin-top:3px">${facts}</div>` : ''}
-    ${diagnostic.message ? `<div style="font-size:12px;margin-top:4px">${esc(diagnostic.message)}</div>` : ''}
-    <div class="task-sub" style="margin-top:4px;color:var(--ink-3)">Source: ${source}${incident.at ? ` · ${esc(new Date(incident.at).toLocaleString())}` : ''}</div>
-  </div>`;
-}
-
-// Real usage % + reset for a login (proactive quota, #6). `snap` is a full snapshot,
-// an "unavailable" record, or undefined (never probed). Non-pollable logins (API
-// keys / setup-token) render nothing here — their reactive status is shown above.
-function usageBlock(id, snap, isPollable) {
-  if (!snap) {
-    return isPollable
-      ? `<div class="task-sub" style="color:var(--ink-3);margin-top:4px">Usage not checked yet — checking…</div>`
-      : '';
-  }
-  if (!snap.ok) {
-    const why = snap.reason === 'setup-token'
-      ? 'Usage % needs a full login (this one uses a setup-token) — tracked reactively.'
-      : snap.reason === 'logged-out' ? 'Not logged in.'
-      : snap.reason === 'not-subscription' ? 'No subscription usage to report.'
-      : snap.reason === 'no-rate-limits' ? 'No subscription rate limits to report.'
-      : `Usage unavailable (${esc(snap.reason || '')}).`;
-    return `<div class="task-sub" style="color:var(--ink-3);margin-top:4px">${esc(why)}</div>`;
-  }
-  const rows = [];
-  if (snap.session) rows.push(usageRow('Session', snap.session));
-  if (snap.week) rows.push(usageRow('Week', snap.week));
-  for (const m of snap.models || []) rows.push(usageRow(m.name || 'model', m));
-  const freshness = snap.stale
-    ? `<span style="color:var(--warn,#f5a623)">stale — checked ${esc(fmtAgo(snap.at))}, re-checking…</span>`
-    : `checked ${esc(fmtAgo(snap.at))}`;
-  return `<div style="margin-top:6px">${rows.join('')}
-    <div class="task-sub" style="color:var(--ink-3);font-size:11px">${freshness}</div></div>`;
-}
-
-function usageRow(label, win) {
-  const pct = Math.max(0, Math.min(100, win.pct || 0));
-  // A window whose reset instant has passed no longer exists — its % is history,
-  // not the current window. Dim it and say so rather than showing "resets … · now".
-  const expired = win.resetAt && win.resetAt < Date.now();
-  const hue = expired ? 'var(--ink-3)' : pct >= 90 ? 'var(--bad,#e5484d)' : pct >= 70 ? 'var(--warn,#f5a623)' : 'var(--ok,#30a46c)';
-  const reset = expired
-    ? `window reset ${esc(usageResetLabel(win))}${win.tz ? ` (${esc(win.tz)})` : ''} — % is from the previous window`
-    : `resets ${esc(fmtUsageReset(win))}`;
-  return `<div style="display:flex;align-items:center;gap:8px;margin:3px 0;font-size:12px${expired ? ';opacity:.55' : ''}">
-    <span style="width:64px;color:var(--ink-2)">${esc(label)}</span>
-    <span style="flex:1;height:6px;background:var(--line);border-radius:3px;overflow:hidden;max-width:180px">
-      <span style="display:block;height:100%;width:${pct}%;background:${hue}"></span>
-    </span>
-    <span class="mono" style="width:38px;text-align:right">${pct}%</span>
-    <span style="color:var(--ink-3)">${reset}</span>
+    ? `<a data-spa href="${esc(taskUrl(sourceTask.id))}" title="${esc(sourceTask.title || '')}">Task #${esc(sourceTask.num ?? sourceTask.id)} — ${esc(sourceTask.title || sourceTask.id)}</a>`
+    : incident.sourceTaskId ? `<span class="mono">${esc(incident.sourceTaskId)}</span>` : esc(incident.source || '');
+  const at = incident.at ? new Date(incident.at) : null;
+  return `<div class="acct-incident">
+    <div>${facts}${at ? ` <span class="setting-muted" title="${esc(at.toLocaleString())}">· ${esc(fmtAgo(at.getTime()))}</span>` : ''}</div>
+    ${diagnostic.message ? `<div>${esc(diagnostic.message)}</div>` : ''}
+    ${source ? `<div class="acct-incident-source">${source}</div>` : ''}
   </div>`;
 }
 
@@ -19159,22 +19231,13 @@ async function wireAppearanceCard() {
     }));
 }
 
-function globalSettingsView(embedded = false) {
+// Settings → Agents: the organization's logins and API keys, one row each.
+function agentAccountsCard() {
   return `
-    ${embedded ? `<div class="settings-section-title" id="settings-defaults"><div>Task defaults ${policyTip('How new tasks begin, unless a project or task says otherwise')}</div></div>` : '<div class="page-title">Organization settings</div><p style="color:var(--ink-2);margin-top:-8px">How new tasks behave unless a project or task deliberately changes something.</p>'}
-    ${settingsForms('global')}
-    <div class="settings-section-title" id="settings-payments"><div>Passwords &amp; payments ${policyTip(`Credentials agents may use on your behalf, and what tasks may spend`)}</div></div>
-    <div class="card" id="settings-connections"><div class="section-h">Connected apps ${policyTip('Apps agents can use through MCP or Composio. Choose which ones new tasks get in Task defaults.')}</div>
-      <div id="native-connections">Loading connections…</div></div>
-    ${passwordsCard()}
-    ${vaultRequestsCard()}
-    ${agentMailCard()}
-    ${paymentsCard('global')}
-    <div class="settings-section-title" id="settings-agents"><div>Agents</div></div>
     <div class="card" id="accounts-card">
-      <div class="section-h">Accounts ${policyTip('Tasks use the first available account, in this order. Drag to reorder; switch one off to skip it. Projects can reorder them for themselves.')}</div>
+      <div class="section-h section-h-action"><span>Accounts ${policyTip('Tasks use the first available account, in this order. Drag to reorder; switch one off to skip it. Projects can reorder them for themselves.')}</span>
+        <button type="button" class="icon-btn usage-recheck-all" hidden title="Check usage of every account now" aria-label="Check usage of every account now">↻</button></div>
       <div id="cred-editor-global">Loading…</div>
-      <div id="account-status"></div>
       <div class="section-h">Add an account</div>
       <div class="setting-rows ruled account-add">
       <div class="setting-row"><span class="setting-label">Subscription ${policyTip('Sign in with a Claude, ChatGPT/Codex or Grok subscription.')}</span>
@@ -19203,7 +19266,22 @@ function globalSettingsView(embedded = false) {
         <span class="setting-actions"><button class="btn sm" id="acct-add">Add</button></span>
       </div>
       </div>
-    </div>
+    </div>`;
+}
+
+function globalSettingsView(embedded = false) {
+  return `
+    ${embedded ? `<div class="settings-section-title" id="settings-defaults"><div>Task defaults ${policyTip('How new tasks begin, unless a project or task says otherwise')}</div></div>` : '<div class="page-title">Organization settings</div><p style="color:var(--ink-2);margin-top:-8px">How new tasks behave unless a project or task deliberately changes something.</p>'}
+    ${settingsForms('global')}
+    <div class="settings-section-title" id="settings-payments"><div>Passwords &amp; payments ${policyTip(`Credentials agents may use on your behalf, and what tasks may spend`)}</div></div>
+    <div class="card" id="settings-connections"><div class="section-h">Connected apps ${policyTip('Apps agents can use through MCP or Composio. Choose which ones new tasks get in Task defaults.')}</div>
+      <div id="native-connections">Loading connections…</div></div>
+    ${passwordsCard()}
+    ${vaultRequestsCard()}
+    ${agentMailCard()}
+    ${paymentsCard('global')}
+    <div class="settings-section-title" id="settings-agents"><div>Agents</div></div>
+    ${agentAccountsCard()}
     <div class="settings-section-title" id="settings-installation"><div>Workflows ${policyTip(`The orchestration recipes tasks run on`)}</div></div>
     <div class="card" id="workflows-card">
       <div class="section-h">Workflows ${policyTip(`Built-ins ship with ${siteName()} and change only with platform releases. Each task keeps the workflow version it started on.`)}</div>
@@ -21650,11 +21728,10 @@ async function hydrateReviewRoute(scope, projectId, organizationId) {
   wireFieldResets(box, fields);
 }
 
-// The logins + API keys now live in the unified credential manager (#cred-editor-global:
-// drag to reorder, On/Off to enable/disable, ✎/✕ to rename/delete a login). This just
-// refreshes it after a connect/register/delete.
+// The organization's logins and API keys, one row each (#cred-editor-global in
+// accounts mode). Also refreshes it after a connect/register/delete.
 async function hydrateAccounts(organizationId = S.organizationId) {
-  await Promise.all([renderCredentialEditor($('#cred-editor-global'), 'global', { organizationId }), renderAccountStatus(organizationId)]);
+  await renderCredentialEditor($('#cred-editor-global'), 'global', { organizationId, accounts: true, recheckButton: $('#accounts-card .usage-recheck-all') });
 }
 
 function wireGlobalSettings(organizationId) {
@@ -21662,8 +21739,7 @@ function wireGlobalSettings(organizationId) {
   hydrateResourceDefaults('global', undefined, organizationId);
   hydrateTemplatesCard($('[data-templates-card="global"]'));
   hydrateExplanationSettings('global', undefined, organizationId || S.organizationId || 'org_personal');
-  renderCredentialEditor($('#cred-editor-global'), 'global', { organizationId }); // the organization's accounts + precedence list
-  renderAccountStatus(organizationId || S.organizationId);
+  hydrateAccounts(organizationId || S.organizationId); // the organization's accounts, in precedence order, with their live state
   hydrateProfiles('global', undefined, organizationId);
   hydrateReviewRoute('global', undefined, organizationId);
   wireTaskDefaultsSave('global', undefined, organizationId);
