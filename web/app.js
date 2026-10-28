@@ -17283,12 +17283,23 @@ async function hydrateExplanationSettings(scope, projectId, organizationId) {
   });
 }
 
+// One row per host-capacity setting, then Response timing. Unset fields show
+// the value in effect (the manifest default).
+function hostCapacityRows(fields, own = {}) {
+  return fields.map((f, i) => {
+    const inherit = f.default ?? null;
+    const value = own[f.name] ?? inherit ?? '';
+    return `<div class="setting-row"><label class="setting-label" for="host-capacity-${esc(f.name)}">${esc(f.label || f.name)}${f.help ? ` ${policyTip(f.help)}` : ''}</label>
+      <span class="setting-value"><input class="setting-input host-capacity-input" id="host-capacity-${esc(f.name)}" data-field="${esc(f.name)}" data-inherit="${esc(JSON.stringify(inherit))}"
+        ${f.type === 'number' ? 'type="number" min="1" step="1" inputmode="numeric"' : ''} value="${esc(value)}" aria-label="${esc(f.label || f.name)}"></span>
+      ${i === fields.length - 1 ? '<span class="setting-actions"><button class="btn sm primary" id="host-capacity-save" data-unsaved-save>Save</button></span>' : ''}</div>`;
+  }).join('');
+}
 function hostCapacityCard() {
   const fields = settingsFields('agent-queue', 'global');
-  return `<div class="card" id="host-capacity-card" data-wf="agent-queue" data-unsaved>
-    <div class="wf-form parameter-fields">${renderFields(fields)}</div>
-    <button class="btn primary sm" id="host-capacity-save" data-unsaved-save>Save</button>
-    <div class="setting-rows ruled" style="margin-top:14px" data-unsaved-ignore><div class="setting-row">
+  return `<div class="card" id="host-capacity-card"><div class="setting-rows">
+    <div class="setting-rows host-capacity-fields" data-unsaved>${hostCapacityRows(fields)}</div>
+    <div class="setting-row">
       <label class="setting-label" for="timing-enabled">Response timing ${policyTip('Record response measurements and show the Timing tab. Existing measurements are kept when off.')}</label>
       <span class="setting-value"></span>
       <span class="setting-actions"><input class="toggle" type="checkbox" id="timing-enabled" ${S.meta?.timingEnabled ? 'checked' : ''}></span>
@@ -17302,12 +17313,11 @@ async function wireHostCapacityCard() {
   const fields = settingsFields('agent-queue', 'global');
   let own = {};
   try { own = await api('/api/settings/global/agent-queue'); } catch {}
-  // Unset fields show the value in effect (the manifest default), not a blank box.
-  const inherited = Object.fromEntries(fields.filter((f) => f.default !== undefined).map((f) => [f.name, f.default]));
-  card.querySelector('.wf-form').innerHTML = renderFields(fields, own, inherited);
+  const box = card.querySelector('.host-capacity-fields');
+  box.innerHTML = hostCapacityRows(fields, own);
   card.querySelector('#host-capacity-save')?.addEventListener('click', async (event) => {
     const button = event.currentTarget; // null once the save has been awaited
-    const values = collectForm(card.querySelector('.wf-form'), fields);
+    const values = collectForm(box, fields);
     try {
       await api('/api/settings/global/agent-queue', { method: 'PUT', body: JSON.stringify({ values }) });
       flashSaved(button);
@@ -19583,12 +19593,15 @@ async function hydrateSettingsAccess(scope) {
  * everyone, including on the sign-in screen before any organization is known. */
 function appearanceCard() {
   return `<div class="card" id="appearance-card">
-      <div class="setting-rows" style="margin-bottom:14px"><div class="setting-row" data-unsaved>
+      <div class="setting-rows"><div class="setting-row" data-unsaved>
         <label class="setting-label" for="site-name">Site name ${policyTip('Shown in the console, the sign-in screen, the browser tab, the installed app and account email.')}</label>
         <span class="setting-value"><input id="site-name" class="setting-input" maxlength="48" autocomplete="off" /></span>
         <span class="setting-actions"><button class="btn sm primary" id="site-name-save" type="button" data-unsaved-save>Save</button></span>
-      </div></div>
-      <div class="brand-picker" id="brand-picker">
+      </div>
+      ${instRow(`Logo ${policyTip('The mark in the console, the browser tab and the installed app.')}`,
+    '<span class="brand-current" id="brand-current"></span>',
+    '<button class="btn sm" type="button" id="brand-change" aria-expanded="false" aria-controls="brand-picker">Change</button>')}</div>
+      <div class="brand-picker" id="brand-picker" hidden>
         ${BRAND_ICON_CHOICES.map((c) => `<button type="button" class="brand-option" data-icon="${esc(c.id)}" aria-pressed="false">
           <img src="/brand/${esc(c.id)}/icon-192.png" alt="" /><span>${esc(c.label)}</span>
         </button>`).join('')}
@@ -19599,8 +19612,17 @@ function appearanceCard() {
 async function wireAppearanceCard() {
   const picker = $('#brand-picker');
   if (!picker) return;
-  const mark = (id) => picker.querySelectorAll('.brand-option').forEach((b) =>
-    b.setAttribute('aria-pressed', String(b.dataset.icon === id)));
+  const mark = (id) => {
+    picker.querySelectorAll('.brand-option').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.icon === id)));
+    const choice = BRAND_ICON_CHOICES.find((c) => c.id === id);
+    const shown = $('#brand-current');
+    if (shown) shown.innerHTML = `<img src="/brand/${esc(id)}/icon-192.png" alt="" /><span>${esc(choice?.label || id)}</span>`;
+  };
+  $('#brand-change')?.addEventListener('click', (event) => {
+    picker.hidden = !picker.hidden;
+    event.currentTarget.setAttribute('aria-expanded', String(!picker.hidden));
+    event.currentTarget.textContent = picker.hidden ? 'Change' : 'Done';
+  });
   let current = 'diamond';
   // The mark is instance-wide, so only the operator (settings:*) may change it —
   // below that the read fails and the card hides entirely, as outbound email does.
@@ -19715,12 +19737,12 @@ function globalSettingsView(embedded = false) {
     </div>`;
 }
 
+// The Home screen row: [value, action]. Installed, there is nothing to do.
 function phoneInstallHelp() {
   if (matchMedia('(display-mode: standalone)').matches || navigator.standalone) {
-    return '<span class="phone-installed">Installed on this device ✓</span>';
+    return ['<span class="phone-installed">Installed ✓</span>', ''];
   }
-  return `<button class="btn sm" id="install-karmax">Add ${siteNameMarkup()} to this phone</button>
-    <span class="task-sub" id="phone-install-note">No native ${siteNameMarkup()} app is needed.</span>`;
+  return ['<span class="setting-muted" id="phone-install-note"></span>', '<button class="btn sm" id="install-karmax">Add to Home Screen</button>'];
 }
 
 function isFetchInterruption(error) {
@@ -19734,19 +19756,12 @@ function renderPhoneAccess(status) {
   const label = status.setupInProgress ? 'Setting up…' : ready ? 'Ready' : status.state === 'available' ? 'Ready to turn on'
     : status.state === 'needs-login' ? 'Sign-in needed'
       : status.state === 'conflict' ? 'Another service is connected' : status.state === 'unavailable' ? 'Tailscale needed' : 'Needs attention';
-  const address = status.state === 'conflict' && status.url
-    ? `<div class="phone-access-address conflict"><span>Tailscale is already serving</span><a class="phone-access-url mono" href="${esc(status.url)}" target="_blank" rel="noopener">${esc(status.url)}</a></div>`
-    : status.state === 'conflict'
-      ? '<div class="phone-access-address conflict"><span>Phone access</span><b>This computer’s Tailscale address is already serving another local service</b></div>'
-      : status.url
-    ? `<div class="phone-access-address"><span>Open your ${siteNameMarkup()} workspace at</span><a class="phone-access-url mono" href="${esc(status.url)}" target="_blank" rel="noopener">${esc(status.url)}</a></div>`
-    : `<div class="phone-access-address missing"><span>Open your ${siteNameMarkup()} workspace at</span><b>Tailscale not set up</b></div>`;
   const phoneSteps = `<li>Open Tailscale on your phone, sign in to the same account, and make sure it says <b>Connected</b>.</li>
        <li>Open the private ${siteNameMarkup()} address shown here in your phone’s browser.</li>`;
   const recovery = ready
-    ? `<details class="phone-troubleshooting">
+    ? `<details class="inst-fold">
         <summary>Address won’t open?</summary>
-        <ol>
+        <ol class="phone-steps">
           <li>Disconnect Mullvad or any other VPN on both devices, then reconnect Tailscale. Android and iOS allow only one active VPN.</li>
           <li>On Android, check Tailscale → Settings → App-based split tunneling. Your browser must not bypass Tailscale.</li>
           <li>If the error mentions DNS or “name not found,” set Android Private DNS to Automatic, turn off browser Secure DNS temporarily, and reconnect Tailscale.</li>
@@ -19760,9 +19775,9 @@ function renderPhoneAccess(status) {
   const setupLabel = status.setupInProgress ? 'Setting up…' : status.helpUrl ? 'Continue setup'
     : status.setupStage === 'serve' ? 'Finish setup'
       : status.setupStage === 'authorize' ? 'Try setup again' : 'Set up Tailscale';
-  const setupSummary = status.state === 'conflict' ? 'Why this workspace address is unavailable' : 'Set up instructions';
+  const setupSummary = status.state === 'conflict' ? 'Why this address is unavailable' : 'Set up';
   const setupIntro = status.state === 'conflict'
-    ? `<p>Tailscale is already configured on this computer; its address currently belongs to another local service or ${siteNameMarkup()} instance.</p>`
+    ? `<p>${esc(status.detail)}</p>`
     : `<p>Install Tailscale on your <a href="https://tailscale.com/download" target="_blank" rel="noopener noreferrer">computer</a> and phone
         (<a href="https://play.google.com/store/apps/details?id=com.tailscale.ipn" target="_blank" rel="noopener noreferrer">Android Play Store</a>
         or <a href="https://apps.apple.com/us/app/tailscale/id1470499037?ls=1" target="_blank" rel="noopener noreferrer">iOS App Store</a>).
@@ -19775,28 +19790,31 @@ function renderPhoneAccess(status) {
         <button class="btn sm" id="remote-copy-fallback">Copy commands</button>
        </details>`
     : '';
+  const chip = ready ? tipChip(label, status.detail, 'done') : `<span class="chip waiting">${esc(label)}</span>`;
+  // The state is said once, in the Address row; the panel's line adds only what to do next.
+  const detail = ready || status.state === 'conflict' || status.state === 'unavailable' ? '' : `<p class="phone-detail">${esc(status.detail)}</p>`;
   const setupPanel = `<details class="phone-setup" ${ready ? '' : 'open'}>
         <summary>${setupSummary}</summary>
         <div class="phone-setup-body">
           ${setupIntro}
-          <div class="phone-access-head"><span class="remote-state ${ready ? 'ready' : ''}">${esc(label)}</span><span>${esc(status.detail)}</span></div>
+          ${detail}
           ${status.setupCommand ? `<div class="phone-setup-command"><code>${esc(status.setupCommand)}</code><button class="btn sm" id="remote-copy-command">Copy command</button></div>` : ''}
-          <div class="phone-access-actions">
+          ${helpLink || status.canSetup || status.method === 'none' ? `<div class="phone-access-actions">
             ${helpLink}
             ${status.canSetup ? `<button class="btn sm primary" id="remote-setup">${esc(setupLabel)}</button>` : ''}
             ${status.method === 'none' ? '<a class="btn sm primary" href="https://tailscale.com/download" target="_blank" rel="noopener noreferrer">Install on this computer</a>' : ''}
-            <button class="btn sm" id="remote-refresh">Check again</button>
-            ${status.canDisable ? '<button class="btn sm" id="remote-disable">Turn off private access</button>' : ''}
-          </div>
+          </div>` : ''}
           ${status.canSetup ? `<p class="task-sub phone-system-prompt">A system prompt may ask once to let your computer account manage Tailscale. ${siteNameMarkup()} never sees your OS or Tailscale password.</p>` : ''}
           ${fallback}
         </div>
        </details>`;
-  box.innerHTML = `${address}
-    ${setupPanel}
-    ${ready ? `<ol class="phone-steps">${phoneSteps}<li>Use ${siteNameMarkup()} in the browser, or add it to your Home Screen for an app-like window.</li></ol>
-      <div class="phone-access-actions">${phoneInstallHelp()}</div>${recovery}` : ''}
-    <p class="phone-security">This uses Tailscale Serve—not Funnel. ${siteNameMarkup()} stays bound to localhost and is never made public.</p>`;
+  box.innerHTML = `<div class="setting-rows">
+      ${instRow(`Address ${policyTip(`Uses Tailscale Serve, not Funnel: ${siteName()} stays bound to localhost and is never made public.`)}`,
+    `${status.url ? `<a class="phone-access-url mono" href="${esc(status.url)}" target="_blank" rel="noopener">${esc(status.url)}</a>` : ''}${chip}`,
+    `<button class="btn sm" id="remote-refresh">Check again</button>${status.canDisable ? '<button class="btn sm" id="remote-disable">Turn off</button>' : ''}`)}
+      ${ready ? instRow(`Home screen ${policyTip(`No native ${siteName()} app is needed.`)}`, ...phoneInstallHelp()) : ''}
+    </div>
+    ${ready ? `<details class="inst-fold"><summary>Open on your phone</summary><ol class="phone-steps">${phoneSteps}<li>Use ${siteNameMarkup()} in the browser, or add it to your Home Screen for an app-like window.</li></ol></details>${recovery}` : setupPanel}`;
 
   const act = async (action, button) => {
     const approvalTab = action === 'setup' ? window.open('', '_blank') : null;
@@ -19932,18 +19950,11 @@ async function hydratePhoneAccess() {
     if (error?.status === 403) return;
     revealPhoneAccess();
     const disconnected = isFetchInterruption(error);
-    box.innerHTML = `<div class="phone-access-address missing">
-        <span>Open your ${siteNameMarkup()} workspace at</span>
-        <b>${disconnected ? `Could not reach ${siteNameMarkup()}` : 'Could not check Phone Access'}</b>
-      </div>
-      <div class="phone-setup-body">
-        <div class="phone-access-head"><span class="remote-state">Needs attention</span><span>${
-          disconnected
-            ? 'The connection was interrupted. If Tailscale setup just ran, wait a moment for it to reconnect.'
-            : esc(error?.message || `${siteName()} could not check Tailscale.`)
-        }</span></div>
-        <div class="phone-access-actions"><button class="btn sm" id="remote-retry">Check again</button></div>
-      </div>`;
+    box.innerHTML = `<div class="setting-rows">${instRow('Address',
+      tipChip(disconnected ? `Can’t reach ${siteName()}` : 'Can’t check', disconnected
+        ? 'The connection was interrupted. If Tailscale setup just ran, wait a moment for it to reconnect.'
+        : error?.message || `${siteName()} could not check Tailscale.`, 'failed'),
+      '<button class="btn sm" id="remote-retry">Check again</button>')}</div>`;
     $('#remote-retry')?.addEventListener('click', hydratePhoneAccess);
   }
 }
@@ -20035,8 +20046,43 @@ function paymentsCard(scope) {
   </div>`;
 }
 
+// ── Installation setting rows ────────────────────────────────────────────────
+// Builders for the Installation cards: one setting per row (label with its tip,
+// value, actions), 2–4 choices as a segmented control whose value rides on
+// `data-value` (and `data-unsaved-value`, so unsaved tracking sees it), a
+// read-only URL with Copy, and a chip whose tip says what it summarises.
+function instRow(label, value = '', actions = '', cls = '') {
+  return `<div class="setting-row${cls ? ` ${cls}` : ''}"><span class="setting-label">${label}</span><span class="setting-value">${value}</span>${actions ? `<span class="setting-actions">${actions}</span>` : ''}</div>`;
+}
+function instSegmented(cls, choices, value, label) {
+  return `<span class="segmented ${cls}" role="group" aria-label="${esc(label)}" data-value="${esc(value)}" data-unsaved-value="${esc(value)}">${choices.map(([choice, text]) =>
+    `<button type="button" data-choice="${esc(choice)}" aria-pressed="${choice === value}">${esc(text)}</button>`).join('')}</span>`;
+}
+function wireInstSegmented(root) {
+  root.querySelectorAll('.segmented[data-value]').forEach((group) => group.querySelectorAll('[data-choice]').forEach((button) =>
+    button.addEventListener('click', () => {
+      if (group.dataset.value === button.dataset.choice) return;
+      group.dataset.value = group.dataset.unsavedValue = button.dataset.choice;
+      group.querySelectorAll('[data-choice]').forEach((other) => other.setAttribute('aria-pressed', String(other === button)));
+      group.dispatchEvent(new Event('change', { bubbles: true }));
+    })));
+}
+function instCopyRow(label, value) {
+  return instRow(label, `<span class="inst-url" title="${esc(value || '')}">${esc(value || '—')}</span>`,
+    value ? `<button type="button" class="btn sm" data-inst-copy="${esc(value)}">Copy</button>` : '');
+}
+function wireInstCopy(root) {
+  root.querySelectorAll('[data-inst-copy]').forEach((button) => button.addEventListener('click', async () => {
+    try { await copyToClipboard(button.dataset.instCopy); toast('Copied'); }
+    catch { toast('Copy failed; select the text and copy it.', true); }
+  }));
+}
+function tipChip(text, tip, cls = '') {
+  return `<button type="button" class="chip tip-chip info-dot${cls ? ` ${cls}` : ''}" title="${esc(tip)}" aria-label="${esc(`${text}: ${tip}`)}">${esc(text)}</button>`;
+}
+
 function stripePlatformCard() {
-  return '<div class="card" id="stripe-platform-card" data-unsaved><div class="task-sub">Loading Stripe platform setup…</div></div>';
+  return '<div class="card" id="stripe-platform-card" data-unsaved><div class="task-sub">Loading…</div></div>';
 }
 
 async function wireStripePlatformCard() {
@@ -20046,20 +20092,23 @@ async function wireStripePlatformCard() {
   let platform;
   try { platform = await api(endpoint); }
   catch (error) { box.innerHTML = `<p class="task-sub">${esc(error.message)}</p>`; return; }
-  const status = platform.configured ? '<span class="chip" style="color:var(--ok,#4ec9a3)">Connect app ready</span>' : '<span class="chip">setup required</span>';
-  const webhook = platform.webhookConfigured ? '<span class="chip" style="color:var(--ok,#4ec9a3)">webhook ready</span>' : '<span class="chip">webhook secret missing</span>';
-  box.innerHTML = `<div class="section-h">Stripe Connect ${status} ${webhook}</div>
-    <p class="task-sub">This application identifies the installation and receives callbacks. Organizations connect and fund their own Stripe accounts separately.</p>
-    <p class="task-sub">Create or open the application in <a href="https://dashboard.stripe.com/settings/connect" target="_blank" rel="noopener">Stripe Dashboard</a>, then register the callback and webhook URLs below.</p>
-    <div class="settings-grid">
-      <label class="form-row">Connect client ID<input class="stripe-platform-client" value="${esc(platform.clientId || '')}" placeholder="ca_…" /></label>
-      <label class="form-row">Platform secret key<input class="stripe-platform-secret" type="password" autocomplete="new-password" placeholder="${platform.secretKeyConfigured ? 'Configured — leave blank to keep' : 'sk_test_… or sk_live_…'}" /></label>
-      <label class="form-row">Webhook signing secret<input class="stripe-platform-webhook-secret" type="password" autocomplete="new-password" placeholder="${platform.webhookConfigured ? 'Configured — leave blank to keep' : 'whsec_…'}" /></label>
-      <label class="form-row">OAuth callback URL<input value="${esc(platform.callbackUrl)}" readonly /></label>
-      <label class="form-row">Webhook destination URL<input value="${esc(platform.webhookUrl)}" readonly /></label>
+  const status = !platform.configured ? '<span class="chip">Not set up</span>'
+    : platform.webhookConfigured ? '<span class="chip done">Ready</span>'
+      : tipChip('Webhook secret missing', 'Callbacks from Stripe can’t be verified until the webhook signing secret is saved.', 'waiting');
+  const environment = platform.source === 'environment'
+    ? tipChip('From environment', 'Environment variables supply this setup. Saved replacements are stored encrypted in the vault and take precedence.') : '';
+  const keep = (configured, example) => configured ? 'Saved — leave blank to keep' : example;
+  box.innerHTML = `<div class="setting-rows">
+      ${instRow(`Stripe Connect ${policyTip('Identifies this installation to Stripe and receives its callbacks. Organizations connect and fund their own Stripe accounts. Create or open the application in the Stripe Dashboard, then register the two URLs below.')}`,
+    `${status}${environment}`, '<a class="btn sm" href="https://dashboard.stripe.com/settings/connect" target="_blank" rel="noopener">Stripe Dashboard ↗</a>')}
+      ${instRow('Client ID', `<input class="setting-input stripe-platform-client" value="${esc(platform.clientId || '')}" placeholder="ca_…" />`)}
+      ${instRow('Secret key', `<input class="setting-input stripe-platform-secret" type="password" autocomplete="new-password" placeholder="${keep(platform.secretKeyConfigured, 'sk_test_… or sk_live_…')}" />`)}
+      ${instRow('Webhook secret', `<input class="setting-input stripe-platform-webhook-secret" type="password" autocomplete="new-password" placeholder="${keep(platform.webhookConfigured, 'whsec_…')}" />`)}
+      ${instCopyRow('Callback URL', platform.callbackUrl)}
+      ${instCopyRow('Webhook URL', platform.webhookUrl)}
     </div>
-    <button class="btn sm primary stripe-platform-save" data-unsaved-save>Save Stripe platform setup</button>
-    ${platform.source === 'environment' ? '<p class="task-sub">Environment values currently supply this setup. Saved replacements use the encrypted vault and take precedence.</p>' : ''}`;
+    <div class="inst-save"><button class="btn sm primary stripe-platform-save" data-unsaved-save>Save</button></div>`;
+  wireInstCopy(box);
   box.querySelector('.stripe-platform-save')?.addEventListener('click', async (event) => {
     try {
       await api(endpoint, { method: 'PUT', body: JSON.stringify({
@@ -20067,14 +20116,14 @@ async function wireStripePlatformCard() {
         secretKey: box.querySelector('.stripe-platform-secret').value || undefined,
         webhookSecret: box.querySelector('.stripe-platform-webhook-secret').value || undefined,
       }) });
-      toast('Stripe platform setup saved');
+      toast('Stripe Connect saved');
       await wireStripePlatformCard();
     } catch (error) { toast(error.message, true); }
   });
 }
 
 function paidLaunchCard() {
-  return '<div class="card" id="paid-launch-card" data-unsaved><div class="task-sub">Loading paid-launch setup…</div></div>';
+  return '<div class="card" id="paid-launch-card" data-unsaved><div class="task-sub">Loading…</div></div>';
 }
 
 async function wirePaidLaunchCard() {
@@ -20087,85 +20136,89 @@ async function wirePaidLaunchCard() {
   const stripe = state.stripe || {};
   const paddle = state.paddle || {};
   const completed = new Set(state.completedTasks || []);
-  const groups = [...new Set((state.tasks || []).map((task) => task.group))];
-  const readiness = state.paidLaunch
-    ? '<span class="chip" style="color:var(--ok,#4ec9a3)">paid checkout live</span>'
-    : state.canEnable ? '<span class="chip" style="color:var(--ok,#4ec9a3)">ready to enable</span>'
-      : '<span class="chip">setup incomplete</span>';
+  const tasks = state.tasks || [];
+  const groups = [...new Set(tasks.map((task) => task.group))];
+  const isPaddle = state.billingProvider === 'paddle';
   const missing = [...(state.missing || []), ...(state.billingMissing || stripe.missing || [])];
-  const taskMarkup = groups.map((group) => `<div class="section-h" style="margin-top:18px">${esc(group)}</div>${(state.tasks || [])
-    .filter((task) => task.group === group).map((task) => `<label class="card" style="display:flex;gap:10px;padding:12px;margin:8px 0;cursor:pointer">
-      <input type="checkbox" class="paid-launch-task" value="${esc(task.id)}" ${completed.has(task.id) ? 'checked' : ''} style="margin-top:3px;align-self:flex-start" />
-      <span><b>${esc(task.title)}</b><span class="task-sub" style="display:block;margin-top:4px">${esc(task.instructions)} ${task.href ? `<a href="${esc(task.href)}" target="_blank" rel="noopener">Open official setup page ↗</a>` : ''}</span></span></label>`).join('')}`).join('');
-  box.innerHTML = `<div class="section-h">Paid hosted launch ${readiness}</div>
-    <p class="task-sub">Subscription settings for ${esc(location.host)}. No paid-launch environment variables are required. Secret keys stay encrypted in the vault.</p>
-    ${missing.length ? `<p class="task-sub" style="color:var(--warn)"><b>Still required:</b> ${esc(missing.join(', '))}</p>` : ''}
-    <label class="form-row">Billing provider<select class="paid-billing-provider"><option value="paddle" ${state.billingProvider === 'paddle' ? 'selected' : ''}>Paddle · merchant of record</option><option value="stripe" ${state.billingProvider !== 'paddle' ? 'selected' : ''}>Stripe Billing</option></select></label>
-    <div class="paid-paddle-section" ${state.billingProvider === 'paddle' ? '' : 'hidden'}>
-      <div class="section-h" style="margin-top:18px">Paddle Billing</div>
-      <div class="settings-grid">
-        <label class="form-row">Environment<select class="paid-paddle-environment"><option value="sandbox" ${paddle.environment === 'sandbox' ? 'selected' : ''}>Sandbox</option><option value="live" ${paddle.environment !== 'sandbox' ? 'selected' : ''}>Live</option></select></label>
-        <label class="form-row">API key<input class="paid-paddle-api-key" type="password" autocomplete="new-password" placeholder="${paddle.secretKeyConfigured ? 'Configured — leave blank to keep' : 'pdl_…_apikey_…'}" /></label>
-      </div>
-      <button type="button" class="btn paid-paddle-provision" ${state.canManage && paddle.secretKeyConfigured ? '' : 'disabled'} title="Save the API key first. Creates or reuses products, monthly prices, a client token and a signed webhook. Does not enable checkout.">Set up Paddle automatically</button>
-      <details style="margin-top:12px"><summary>Integration details</summary><div class="settings-grid">
-        <label class="form-row">Client-side token<input class="paid-paddle-client-token" value="${esc(paddle.clientToken || '')}" /></label>
-        <label class="form-row">Webhook secret<input class="paid-paddle-webhook" type="password" autocomplete="new-password" placeholder="${paddle.webhookSecretConfigured ? 'Configured — leave blank to keep' : 'pdl_ntfset_…'}" /></label>
-        <label class="form-row">Individual $9 price<input class="paid-paddle-individual-price" value="${esc(paddle.individualPriceId || '')}" placeholder="pri_…" /></label>
-        <label class="form-row">Team $19 base price<input class="paid-paddle-team-base-price" value="${esc(paddle.teamBasePriceId || '')}" placeholder="pri_…" /></label>
-        <label class="form-row">Additional user $5 price<input class="paid-paddle-team-seat-price" value="${esc(paddle.teamSeatPriceId || '')}" placeholder="pri_…" /></label>
-        <label class="form-row">Storage pack $4 price<input class="paid-paddle-storage-pack-price" value="${esc(paddle.storagePackPriceId || '')}" placeholder="pri_…" /></label>
-        <label class="form-row">Default payment link<input value="${esc(paddle.checkoutUrl || '')}" readonly /></label>
-        <label class="form-row">Webhook destination<input value="${esc(paddle.webhookUrl || '')}" readonly /></label>
+  const keep = (configured, example) => configured ? 'Saved — leave blank to keep' : example;
+  const input = (cls, value, placeholder = '', extra = '') =>
+    `<input class="setting-input ${cls}" value="${esc(value || '')}" placeholder="${esc(placeholder)}" ${extra} />`;
+  const secret = (cls, configured, example) =>
+    `<input class="setting-input ${cls}" type="password" autocomplete="new-password" placeholder="${esc(keep(configured, example))}" />`;
+  const status = state.paidLaunch ? '<span class="chip done">Live</span>'
+    : state.canEnable ? '<span class="chip done">Ready</span>'
+      : missing.length ? tipChip(`${missing.length} missing`, `Still required: ${missing.join(', ')}`, 'waiting')
+        : tipChip('Not ready', isPaddle && paddle.environment === 'sandbox' ? 'Real checkout needs the Paddle Live environment.' : 'Setup is incomplete.', 'waiting');
+  const environment = state.source === 'environment-bootstrap'
+    ? tipChip('From environment', 'Older environment variables may supply some values. Saving moves them here; saved values take precedence.') : '';
+  const taskMarkup = groups.map((group) => `<div class="inst-group">${esc(group)}</div>${tasks
+    .filter((task) => task.group === group).map((task) => `<label class="inst-check">
+      <input type="checkbox" class="paid-launch-task" value="${esc(task.id)}" ${completed.has(task.id) ? 'checked' : ''} />
+      <span>${esc(task.title)}</span>${policyTip(task.instructions)}${task.href ? `<a href="${esc(task.href)}" target="_blank" rel="noopener" title="Open the official setup page">↗</a>` : ''}</label>`).join('')}`).join('');
+  const done = tasks.filter((task) => completed.has(task.id)).length;
+  box.innerHTML = `<div class="setting-rows ruled">
+      ${instRow(`Paid checkout ${policyTip('Opens real checkout for paid plans once the legal details and live billing below are complete. Each later policy version takes effect when it deploys. Turning it off closes new checkout without deleting existing subscriptions.')}`,
+    `${status}${state.paidLaunch ? '' : '<span class="setting-muted">Publishes the policies as yours</span>'}${environment}`,
+    `<input class="toggle paid-launch-enabled" type="checkbox" aria-label="Paid checkout" ${state.paidLaunch ? 'checked' : ''} ${state.canEnable || state.paidLaunch ? '' : 'disabled'} />`)}
+      ${instRow(`Billing ${policyTip('How customers pay for plans. Paddle acts as merchant of record. Stripe Billing is SaaS subscription billing, separate from Stripe Connect for agent cards; it uses hosted Stripe Checkout, so it needs no publishable key. No paid-launch environment variables are required; secret keys stay encrypted in the vault.')}`,
+    instSegmented('paid-billing-provider', [['paddle', 'Paddle'], ['stripe', 'Stripe']], isPaddle ? 'paddle' : 'stripe', 'Billing provider'))}
+    </div>
+    <div class="setting-rows paid-paddle-section" ${isPaddle ? '' : 'hidden'}>
+      ${instRow(`Environment ${policyTip('Paddle must approve your identity and checkout domain before going live.')}`,
+    instSegmented('paid-paddle-environment', [['sandbox', 'Sandbox'], ['live', 'Live']], paddle.environment === 'sandbox' ? 'sandbox' : 'live', 'Paddle environment'))}
+      ${instRow('API key', secret('paid-paddle-api-key', paddle.secretKeyConfigured, 'pdl_…_apikey_…'),
+    `<button type="button" class="btn sm paid-paddle-provision" ${state.canManage && paddle.secretKeyConfigured ? '' : 'disabled'} title="Save the API key first. Creates or reuses products, monthly prices, a client token and a signed webhook. Does not turn on checkout.">Set up automatically</button>`)}
+      <details class="inst-fold"><summary>Integration details</summary><div class="setting-rows">
+        ${instRow('Client-side token', input('paid-paddle-client-token', paddle.clientToken))}
+        ${instRow('Webhook secret', secret('paid-paddle-webhook', paddle.webhookSecretConfigured, 'pdl_ntfset_…'))}
+        ${instRow('Individual $9 price', input('paid-paddle-individual-price', paddle.individualPriceId, 'pri_…'))}
+        ${instRow('Team $19 base price', input('paid-paddle-team-base-price', paddle.teamBasePriceId, 'pri_…'))}
+        ${instRow('Extra user $5 price', input('paid-paddle-team-seat-price', paddle.teamSeatPriceId, 'pri_…'))}
+        ${instRow('Storage pack $4 price', input('paid-paddle-storage-pack-price', paddle.storagePackPriceId, 'pri_…'))}
+        ${instCopyRow('Payment link', paddle.checkoutUrl)}
+        ${instCopyRow('Webhook URL', paddle.webhookUrl)}
       </div></details>
-      <p class="task-sub">Paddle must approve your identity and checkout domain before going live.</p>
     </div>
-    <div class="paid-stripe-section" ${state.billingProvider === 'paddle' ? 'hidden' : ''}>
-    <div class="section-h" style="margin-top:18px">Stripe Billing</div>
-    <p class="task-sub">This is SaaS subscription billing, separate from Stripe Connect for cards agents spend from. Start by <a href="https://dashboard.stripe.com/register" target="_blank" rel="noopener">creating a Stripe account</a> for the legal business and completing live-mode verification. ${siteNameMarkup()} uses hosted Stripe Checkout, so it does not need a publishable key.</p>
-    <ol class="task-sub"><li>Create the live recurring products/prices described in the founder checklist below.</li><li>In Stripe Workbench, create a snapshot webhook destination at <span class="mono">${esc(stripe.webhookUrl || '')}</span>, select API version <span class="mono">${esc(stripe.apiVersion || '')}</span>, and subscribe to: <span class="mono">${esc((stripe.webhookEvents || []).join(', '))}</span>.</li><li>Paste the live secret key, webhook signing secret, and IDs here. Blank secret fields keep the encrypted values already saved.</li><li>Configure and test the Stripe customer portal, then exercise the full lifecycle in test mode before enabling checkout.</li></ol>
-    <div class="settings-grid">
-      <label class="form-row">Stripe secret key<input class="paid-stripe-secret" type="password" autocomplete="new-password" placeholder="${stripe.secretKeyConfigured ? 'Configured — leave blank to keep' : 'sk_live_…'}" /></label>
-      <label class="form-row">Webhook signing secret<input class="paid-stripe-webhook" type="password" autocomplete="new-password" placeholder="${stripe.webhookSecretConfigured ? 'Configured — leave blank to keep' : 'whsec_…'}" /></label>
-      <label class="form-row">Individual $9 price ID<input class="paid-stripe-individual-price" value="${esc(stripe.individualPriceId || '')}" placeholder="price_…" /></label>
-      <label class="form-row">Team $19 base price ID<input class="paid-stripe-team-base-price" value="${esc(stripe.teamBasePriceId || '')}" placeholder="price_…" /></label>
-      <label class="form-row">Team $5 extra-user price ID<input class="paid-stripe-team-seat-price" value="${esc(stripe.teamSeatPriceId || '')}" placeholder="price_…" /></label>
-      <label class="form-row">Individual product ID (optional)<input class="paid-stripe-individual-product" value="${esc(stripe.individualProductId || '')}" placeholder="prod_…" /></label>
-      <label class="form-row">Team product ID (optional)<input class="paid-stripe-team-product" value="${esc(stripe.teamProductId || '')}" placeholder="prod_…" /></label>
-      <label class="form-row">Webhook destination<input value="${esc(stripe.webhookUrl || '')}" readonly /></label>
+    <div class="setting-rows paid-stripe-section" ${isPaddle ? 'hidden' : ''}>
+      ${instRow('Secret key', secret('paid-stripe-secret', stripe.secretKeyConfigured, 'sk_live_…'))}
+      ${instRow('Webhook secret', secret('paid-stripe-webhook', stripe.webhookSecretConfigured, 'whsec_…'))}
+      ${instRow('Individual $9 price', input('paid-stripe-individual-price', stripe.individualPriceId, 'price_…'))}
+      ${instRow('Team $19 base price', input('paid-stripe-team-base-price', stripe.teamBasePriceId, 'price_…'))}
+      ${instRow('Extra user $5 price', input('paid-stripe-team-seat-price', stripe.teamSeatPriceId, 'price_…'))}
+      ${instRow(`Individual product ${policyTip('Optional')}`, input('paid-stripe-individual-product', stripe.individualProductId, 'prod_…'))}
+      ${instRow(`Team product ${policyTip('Optional')}`, input('paid-stripe-team-product', stripe.teamProductId, 'prod_…'))}
+      ${instCopyRow('Webhook URL', stripe.webhookUrl)}
+      <details class="inst-fold"><summary>Setup steps</summary><ol class="inst-steps">
+        <li><a href="https://dashboard.stripe.com/register" target="_blank" rel="noopener">Create a Stripe account</a> for the legal business and complete live-mode verification.</li>
+        <li>Create the live recurring products and prices (Launch checklist).</li>
+        <li>In Stripe Workbench, create a snapshot webhook destination at the Webhook URL, API version <code>${esc(stripe.apiVersion || '')}</code>, subscribed to <code>${esc((stripe.webhookEvents || []).join(', '))}</code>.</li>
+        <li>Paste the live secret key, signing secret and IDs above. Blank secret fields keep the saved values.</li>
+        <li>Configure and test the customer portal, then run the full lifecycle in test mode before turning on checkout.</li>
+      </ol></details>
     </div>
+    <div class="section-h inst-h">Legal operator ${policyTip('Use the contracting entity’s exact details: they fill in the public policies and the support and deletion flows. Ask qualified counsel to review the policy drafts for your business, jurisdiction, data flows and customers.')}</div>
+    <div class="setting-rows ruled">
+      ${instRow(`Name ${policyTip('Your legal name as a sole trader, or the registered company name.')}`, input('paid-operator-name', state.operatorName))}
+      ${instRow('Country', input('paid-operator-country', state.operatorCountry))}
+      ${instRow('Governing law', input('paid-governing-law', state.governingLaw, 'Laws of …; courts of …'))}
+      ${instRow('Notice address', `<textarea class="setting-input paid-legal-address" rows="2">${esc(state.legalNoticeAddress || '')}</textarea>`)}
     </div>
-
-    <div class="section-h" style="margin-top:18px">Legal operator and public contacts</div>
-    <p class="task-sub">Use the contracting entity’s exact details. These values populate public policies and support/deletion flows. Ask qualified counsel to review the supplied policy drafts for the business, jurisdiction, data flows, and customers.</p>
-    <div class="settings-grid">
-      <label class="form-row">Legal operator name<input class="paid-operator-name" value="${esc(state.operatorName || '')}" title="Your legal name as a sole trader, or the registered company name." /></label>
-      <label class="form-row">Country of establishment<input class="paid-operator-country" value="${esc(state.operatorCountry || '')}" /></label>
-      <label class="form-row">Governing law and courts<input class="paid-governing-law" value="${esc(state.governingLaw || '')}" placeholder="e.g. laws of …; courts of …" /></label>
-      <label class="form-row">Legal notice address<textarea class="paid-legal-address" rows="3">${esc(state.legalNoticeAddress || '')}</textarea></label>
-      <label class="form-row">Legal email<input class="paid-email-legal" type="email" value="${esc(contacts.legal || '')}" /></label>
-      <label class="form-row">Privacy email<input class="paid-email-privacy" type="email" value="${esc(contacts.privacy || '')}" /></label>
-      <label class="form-row">Security email<input class="paid-email-security" type="email" value="${esc(contacts.security || '')}" /></label>
-      <label class="form-row">Incident email<input class="paid-email-incident" type="email" value="${esc(contacts.incident || '')}" /></label>
-      <label class="form-row">DPA email<input class="paid-email-dpa" type="email" value="${esc(contacts.dpa || '')}" /></label>
-      <label class="form-row">Billing email<input class="paid-email-billing" type="email" value="${esc(contacts.billing || '')}" /></label>
+    <div class="section-h inst-h">Contact emails</div>
+    <div class="setting-rows ruled">
+      ${[['legal', 'Legal'], ['privacy', 'Privacy'], ['security', 'Security'], ['incident', 'Incident'], ['dpa', 'Data processing'], ['billing', 'Billing']]
+    .map(([key, label]) => instRow(label, input(`paid-email-${key}`, contacts[key], '', 'type="email"'))).join('')}
     </div>
-
-    <div class="section-h" style="margin-top:22px">Real-world founder checklist</div>
-    <p class="task-sub">These items happen outside ${siteNameMarkup()}. Check them off here to keep one durable launch record; the checkboxes are guidance and do not falsely claim that ${siteNameMarkup()} verified the work.</p>
-    ${taskMarkup}
-
-    <div class="card" style="margin-top:18px;padding:14px;border-color:${state.paidLaunch ? 'var(--ok,#4ec9a3)' : 'var(--line)'}">
-      <label style="display:flex;gap:10px;align-items:flex-start"><input type="checkbox" class="paid-launch-enabled" ${state.paidLaunch ? 'checked' : ''} ${state.canEnable || state.paidLaunch ? '' : 'disabled'} /><span><b>Enable real paid checkout</b><span class="task-sub" style="display:block">Requires completed legal and live billing setup, and publishes the policies as yours: each later version takes effect when it deploys. Disabling closes new checkout without deleting existing subscriptions.</span></span></label>
-    </div>
-    <button class="btn primary paid-launch-save" style="margin-top:14px" ${state.canManage ? '' : 'disabled'} data-unsaved-save>Save paid-launch setup</button>
-    ${state.source === 'environment-bootstrap' ? '<p class="task-sub">Legacy environment values may currently be supplying some fields. Saving this form moves the editable configuration into Installation settings; saved values take precedence.</p>' : ''}`;
+    <details class="inst-fold inst-checklist"><summary>Launch checklist <span class="setting-muted">${done}/${tasks.length} done</span>
+      ${policyTip(`Work done outside ${siteName()}. Ticking items keeps one launch record; ${siteName()} does not verify them.`)}</summary>${taskMarkup}</details>
+    <div class="inst-save"><button class="btn sm primary paid-launch-save" ${state.canManage ? '' : 'disabled'} data-unsaved-save>Save</button></div>`;
+  wireInstSegmented(box);
+  wireInstCopy(box);
   box.querySelector('.paid-launch-save')?.addEventListener('click', async () => {
     try {
       await api('/api/settings/paid-launch', { method: 'PUT', body: JSON.stringify({
-        billingProvider: box.querySelector('.paid-billing-provider').value,
+        billingProvider: box.querySelector('.paid-billing-provider').dataset.value,
         paddle: {
-          environment: box.querySelector('.paid-paddle-environment').value,
+          environment: box.querySelector('.paid-paddle-environment').dataset.value,
           apiKey: box.querySelector('.paid-paddle-api-key').value || undefined,
           webhookSecret: box.querySelector('.paid-paddle-webhook').value || undefined,
           clientToken: box.querySelector('.paid-paddle-client-token').value,
@@ -20198,7 +20251,7 @@ async function wirePaidLaunchCard() {
         },
         completedTasks: [...box.querySelectorAll('.paid-launch-task:checked')].map((input) => input.value),
       }) });
-      toast('Paid-launch setup saved');
+      toast('Paid launch saved');
       S.launch = await api('/api/launch');
       await wirePaidLaunchCard();
     } catch (error) {
@@ -20207,8 +20260,8 @@ async function wirePaidLaunchCard() {
     }
   });
   box.querySelector('.paid-billing-provider').addEventListener('change', (event) => {
-    box.querySelector('.paid-paddle-section').hidden = event.target.value !== 'paddle';
-    box.querySelector('.paid-stripe-section').hidden = event.target.value === 'paddle';
+    box.querySelector('.paid-paddle-section').hidden = event.currentTarget.dataset.value !== 'paddle';
+    box.querySelector('.paid-stripe-section').hidden = event.currentTarget.dataset.value === 'paddle';
     box.querySelector('.paid-launch-enabled').checked = false;
   });
   box.querySelector('.paid-paddle-environment').addEventListener('change', () => {
@@ -21031,9 +21084,12 @@ async function wireInstallationComposioCard() {
   try {
     const config = await api('/api/connections/config');
     if (!box.isConnected) return;
-    box.innerHTML = `<div class="section-h">Composio <span class="chip">${config.configured ? 'configured' : 'setup required'}</span></div>
-      <p class="task-sub">One Composio project API key serves every organization in this installation. Users connect their own accounts in Passwords & payments or the Tools picker and choose which projects may use them.</p>
-      ${config.canConfigure ? `<form data-composio-config class="inline-form"><input type="password" name="apiKey" placeholder="${config.configured ? 'New key to replace the configured key' : 'Composio project API key'}" autocomplete="new-password" required aria-label="Composio project API key"><button class="btn sm primary">${config.configured ? 'Replace API key' : 'Set up connections'}</button></form>` : ''}`;
+    const tip = 'One Composio project API key serves every organization. People connect their own accounts in Passwords & payments or the Tools picker and choose which projects may use them.';
+    box.innerHTML = config.canConfigure
+      ? `<form data-composio-config class="setting-rows">${instRow(`API key ${policyTip(tip)}`,
+        `<input class="setting-input" type="password" name="apiKey" placeholder="${config.configured ? 'Saved — paste to replace' : 'Composio project API key'}" autocomplete="new-password" required aria-label="Composio project API key">`,
+        '<button class="btn sm primary">Save key</button>')}</form>`
+      : `<div class="setting-rows">${instRow(`API key ${policyTip(tip)}`, config.configured ? '<span class="chip done">Set</span>' : '<span class="chip">Not set up</span>')}</div>`;
     box.querySelector('[data-composio-config]')?.addEventListener('submit', async event => {
       event.preventDefault();
       const form = event.currentTarget; const button = form.querySelector('button');
@@ -21041,7 +21097,7 @@ async function wireInstallationComposioCard() {
       button.disabled = true;
       try {
         await api('/api/connections/config', { method: 'PUT', body: JSON.stringify({ apiKey }) });
-        toast('Composio configured for this installation');
+        toast('Composio key saved');
         await wireInstallationComposioCard();
       } catch (error) { toast(error.message, true); }
       finally { button.disabled = false; }
@@ -21981,49 +22037,40 @@ function outboundEmailCard() {
 
 async function wireOutboundEmailCard() {
   return hydrateInstallationCard('#outbound-email-card', '/api/email', (card, data) => {
-    card.innerHTML = `
-    <div id="oe-status" class="task-sub" style="margin-bottom:8px"></div>
-    <div class="form-row"><label>Provider</label><select id="oe-provider">
-      <option value="resend">Resend</option>
-      <option value="smtp">SMTP server</option>
-    </select></div>
-    <div id="oe-help" style="color:var(--ink-3);font-size:12px;margin:0 0 8px"></div>
-    <div class="form-row"><label for="oe-from">From address</label><input id="oe-from" placeholder="${siteNameMarkup()} &lt;noreply@yourdomain.com&gt;"></div>
-    <div id="oe-smtp" style="display:none">
-      <div class="form-row"><label for="oe-host">SMTP host</label><input id="oe-host" placeholder="auto-detected for Gmail/Outlook/Fastmail — else e.g. smtp.yourprovider.com"></div>
-      <div class="inline-form" style="align-items:center">
-        <input id="oe-port" placeholder="port (587, or 465 for TLS)" style="max-width:220px">
-        <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--ink-2)"><input type="checkbox" id="oe-secure"> Implicit TLS (port 465)</label>
+    const provider = data.provider === 'smtp' ? 'smtp' : 'resend';
+    card.innerHTML = `<div data-unsaved><div class="setting-rows">
+      ${instRow(`Status ${policyTip('Account confirmation, password reset and organization invitations. Until email is connected they are skipped; invitations still show a copyable link.')}`,
+    data.configured ? `<span class="chip done">Connected</span><span class="setting-muted">from ${esc(data.from || '')}</span>` : '<span class="chip">Not connected</span>',
+    data.configured ? '<button class="btn sm" id="oe-test" type="button">Send test</button>' : '')}
+      ${instRow('Provider <span id="oe-help"></span>', `${instSegmented('oe-provider', [['resend', 'Resend'], ['smtp', 'SMTP']], provider, 'Provider')}<span class="oe-links" id="oe-links"></span>`)}
+      ${instRow('From', `<input id="oe-from" class="setting-input" aria-label="From address" placeholder="${siteNameMarkup()} &lt;noreply@yourdomain.com&gt;">`)}
+      <div class="setting-rows" id="oe-smtp" hidden>
+        ${instRow(`Host ${policyTip('Found automatically for Gmail, Outlook and Fastmail.')}`, '<input id="oe-host" class="setting-input" aria-label="SMTP host" placeholder="smtp.example.com">')}
+        ${instRow('Port', '<input id="oe-port" class="setting-input" aria-label="SMTP port" inputmode="numeric" placeholder="587">')}
+        ${instRow(`Implicit TLS ${policyTip('For port 465. Leave off for 587.')}`, '', '<input class="toggle" type="checkbox" id="oe-secure" aria-label="Implicit TLS">')}
+        ${instRow('Username', '<input id="oe-user" class="setting-input" aria-label="SMTP username" placeholder="Same as From">')}
       </div>
-      <div class="form-row"><label for="oe-user">Username</label><input id="oe-user" placeholder="defaults to the From address"></div>
+      ${instRow('<span id="oe-secret-label">API key</span>', '<input type="password" id="oe-secret" class="setting-input" aria-label="API key" autocomplete="new-password">')}
     </div>
-    <div class="form-row"><label id="oe-secret-label">API key</label><input type="password" id="oe-secret" placeholder="Resend API key (re_…)"></div>
-    <div class="inline-form"><button class="btn sm" id="oe-connect">Connect</button><button class="btn sm" id="oe-test">Send test email</button></div>
-    <div id="oe-result" class="task-sub" style="margin-top:6px"></div>
-  `;
-    const providerSel = $('#oe-provider');
-    const helpEl = $('#oe-help');
+    <div class="inst-save"><span id="oe-result" class="setting-muted" role="status"></span><button class="btn sm primary" id="oe-connect" data-unsaved-save>${data.configured ? 'Reconnect' : 'Connect'}</button></div></div>`;
+    wireInstSegmented(card);
+    const providerSel = card.querySelector('.oe-provider');
     const applyProvider = () => {
-      const name = providerSel.value;
+      const name = providerSel.dataset.value;
       const info = (data.providers || []).find((p) => p.name === name);
-      $('#oe-smtp').style.display = name === 'smtp' ? '' : 'none';
+      $('#oe-smtp').hidden = name !== 'smtp';
       $('#oe-secret-label').textContent = name === 'smtp' ? 'Password' : 'API key';
-      $('#oe-secret').placeholder = name === 'smtp' ? 'SMTP password / app-password' : 'Resend API key (re_…)';
-      const links = (info?.links || []).map((l) => `<a href="${esc(safeHref(l.url))}" target="_blank" rel="noopener">${esc(l.label)}</a>`).join(' · ');
-      helpEl.innerHTML = `${esc(info?.help || '')}${links ? `<br>${links}` : ''}`;
+      $('#oe-secret').setAttribute('aria-label', name === 'smtp' ? 'Password' : 'API key');
+      $('#oe-secret').placeholder = name === 'smtp' ? 'App password' : 're_…';
+      $('#oe-help').innerHTML = info?.help ? policyTip(info.help) : '';
+      $('#oe-links').innerHTML = (info?.links || []).map((l) => `<a href="${esc(safeHref(l.url))}" target="_blank" rel="noopener">${esc(l.label)}</a>`).join('');
     };
-    if (data.provider) providerSel.value = data.provider;
     if (data.from) $('#oe-from').value = data.from;
-    $('#oe-status').innerHTML = data.configured
-      ? `<span class="chip done">Connected</span> Sending from <b>${esc(data.from || '')}</b>`
-      : `<span class="chip">Not connected</span> ${policyTip('Until connected, confirmation, reset and invitation emails are skipped; invitations still show a copyable link.')}`;
-    // Nothing to test until a sender is connected.
-    $('#oe-test').disabled = !data.configured;
     applyProvider();
     providerSel.addEventListener('change', applyProvider);
     $('#oe-connect').addEventListener('click', async () => {
-      const body = { provider: providerSel.value, from: $('#oe-from').value.trim(), secret: $('#oe-secret').value };
-      if (providerSel.value === 'smtp') {
+      const body = { provider: providerSel.dataset.value, from: $('#oe-from').value.trim(), secret: $('#oe-secret').value };
+      if (body.provider === 'smtp') {
         body.host = $('#oe-host').value.trim(); body.port = $('#oe-port').value.trim() || undefined;
         body.secure = $('#oe-secure').checked; body.user = $('#oe-user').value.trim() || undefined;
       }
@@ -22031,14 +22078,12 @@ async function wireOutboundEmailCard() {
       try {
         const result = await api('/api/email/connect', { method: 'POST', body: JSON.stringify(body) });
         $('#oe-secret').value = '';
-        $('#oe-result').style.color = 'var(--ink-2)';
-        $('#oe-result').textContent = result.detail || 'Connected';
-        toast('Outbound email connected');
+        toast(result.detail || 'Email connected');
         await wireOutboundEmailCard();
-      } catch (e) { $('#oe-result').style.color = 'var(--danger)'; $('#oe-result').textContent = e.message; toast(e.message, true); }
+      } catch (e) { $('#oe-result').textContent = e.message; $('#oe-result').classList.add('setting-warn'); toast(e.message, true); }
       finally { btn.disabled = false; }
     });
-    $('#oe-test').addEventListener('click', async () => {
+    $('#oe-test')?.addEventListener('click', async () => {
       const to = await promptText('Send a test email to:', data.from ? (data.from.match(/<([^>]+)>/)?.[1] || data.from) : '');
       if (!to) return;
       const btn = $('#oe-test'); btn.disabled = true;
@@ -23198,7 +23243,7 @@ function cycleSettingsPane(delta) {
 }
 
 function installationGithubCard() {
-  return '<div class="card" id="installation-github-card"><div class="task-sub">Loading GitHub App setup…</div></div>';
+  return '<div class="card" id="installation-github-card"><div class="task-sub">Loading…</div></div>';
 }
 
 async function wireInstallationGithubCard() {
@@ -23209,9 +23254,8 @@ async function wireInstallationGithubCard() {
   try { status = await api(`${base}/app`); }
   catch (error) { box.innerHTML = `<p class="task-sub">${esc(error.message)}</p>`; return; }
   if (!status.configured) {
-    box.innerHTML = `<div class="section-h">GitHub App <span class="chip">setup required</span></div>
-      <p class="task-sub">Create the one GitHub App this installation uses for repository transport and personal GitHub authorization. Organizations choose their own App installations and repositories afterwards.</p>
-      <button class="btn primary" id="installation-github-setup">Set up GitHub App</button>`;
+    box.innerHTML = `<div class="setting-rows">${instRow(`GitHub App ${policyTip(`Create the one GitHub App ${siteName()} uses for repository access and signing in with GitHub. Organizations then choose their own App installations and repositories.`)}`,
+      '<span class="chip">Not set up</span>', '<button class="btn sm primary" id="installation-github-setup">Set up GitHub App</button>')}</div>`;
     $('#installation-github-setup')?.addEventListener('click', async () => {
       try {
         submitGithubManifest(await api(`${base}/app-manifest`, { method: 'POST',
@@ -23223,17 +23267,19 @@ async function wireInstallationGithubCard() {
   const permissionStatus = status.permissionStatus;
   const permissionReady = permissionStatus?.ready === true;
   const missingApp = permissionStatus?.missingApp || [];
-  const permissionCard = permissionStatus?.unavailable
-    ? `<div class="card" style="padding:10px;border-color:var(--warn)"><b>Could not verify GitHub access</b><div class="task-sub">${esc(permissionStatus.error || 'GitHub did not return the App permissions.')}</div></div>`
-    : permissionReady ? ''
-      : `<div class="card" style="padding:10px;border-color:var(--warn)"><b>GitHub App permissions need updating</b><div class="task-sub" style="margin-top:4px">${siteNameMarkup()} uses a broad repository-scoped App grant, while its own capabilities decide which operations an agent may invoke. Add the missing permissions${missingApp.length ? `: <b>${esc(missingApp.join(', '))}</b>` : ''}. GitHub requires every existing installation owner to approve the expansion afterwards.</div>${permissionStatus?.appSettingsUrl ? `<a class="btn sm primary" href="${esc(permissionStatus.appSettingsUrl)}" target="_blank" rel="noopener noreferrer">Update permissions on GitHub</a>` : ''}</div>`;
-  box.innerHTML = `<div class="section-h">GitHub App <span class="chip" style="color:${permissionReady ? 'var(--ok,#4ec9a3)' : 'var(--warn)'}">${permissionReady ? 'ready' : 'action required'}</span></div>
-    <p class="task-sub">Shared by every organization for repository transport and personal GitHub authorization. ${siteNameMarkup()} capabilities remain the per-agent authorization boundary.</p>${permissionCard}
-    <div class="settings-grid">
-      <label class="form-row">App slug<input value="${esc(status.appSlug || '')}" readonly /></label>
-      <label class="form-row">App ID<input value="${esc(status.appId || '')}" readonly /></label>
-      <label class="form-row">User authorization<input value="${status.oauthConfigured ? 'Configured' : 'Client credentials missing'}" readonly /></label>
-      <label class="form-row">Webhook verification<input value="${status.webhookConfigured ? 'Configured' : 'Signing secret missing'}" readonly /></label>
+  const state = permissionStatus?.unavailable ? tipChip('Can’t verify', permissionStatus.error || 'GitHub did not return the App permissions.', 'failed')
+    : permissionReady ? '<span class="chip done">Ready</span>' : '<span class="chip waiting">Action required</span>';
+  const permissions = permissionStatus?.unavailable || permissionReady ? ''
+    : instRow(`Permissions ${policyTip(`${siteName()} asks GitHub for broad repository access; its own permissions decide what each agent may do. After you add the missing permissions, GitHub asks every organization that installed the App to approve them.`)}`,
+      `<span class="setting-warn">${missingApp.length ? `Missing ${esc(missingApp.join(', '))}` : 'Need updating'}</span>`,
+      permissionStatus?.appSettingsUrl ? `<a class="btn sm primary" href="${esc(permissionStatus.appSettingsUrl)}" target="_blank" rel="noopener noreferrer">Update on GitHub ↗</a>` : '');
+  const configured = (ok, missing) => ok ? 'Set up' : `<span class="setting-warn">${missing}</span>`;
+  box.innerHTML = `<div class="setting-rows">
+      ${instRow(`GitHub App ${policyTip(`Shared by every organization for repository access and signing in with GitHub. ${siteName()}’s own permissions still decide what each agent may do.`)}`,
+    `${status.appSlug ? `<a href="https://github.com/apps/${encodeURIComponent(status.appSlug)}" target="_blank" rel="noopener noreferrer" title="App ID ${esc(status.appId || '')}">${esc(status.appSlug)}</a>` : ''}${state}`)}
+      ${permissions}
+      ${instRow('Sign in with GitHub', configured(status.oauthConfigured, 'Client credentials missing'))}
+      ${instRow('Webhooks', configured(status.webhookConfigured, 'Signing secret missing'))}
     </div>`;
 }
 
@@ -23243,26 +23289,47 @@ async function wireInstallationUsers() {
   try {
     const users = await api('/api/users');
     const reviews = await api('/api/users/erasure-cases').catch(() => null);
-    box.innerHTML = users.map((user) => `<div class="form-row"><a data-spa href="${profileRoute(user.id)}">${esc(user.name)} · ${esc(user.email)}</a>
-      ${reviews ? `<button class="btn sm" data-erasure-user="${esc(user.id)}">Preview account closure</button>` : ''}</div>`).join('')
-      + (reviews ? `<p class="task-sub">Account closure removes login/access, not shared work. Erasure reviews require documented decisions; replacing a name is not anonymisation.</p>
-        ${reviews.requests.map(request => `<p class="task-sub">Deletion requested: ${esc(request.userId)} · ${esc(new Date(request.requestedAt).toLocaleString())}</p>`).join('')}
-        ${reviews.cases.map(record => `<div class="form-row"><button class="btn sm" data-erasure-user="${esc(record.userId)}">Review ${esc(record.userId)}</button>
-          <span>${esc(record.state)}${record.items.some(item => item.decision?.reviewAt <= Date.now()) ? ' · retention review overdue' : ''}${record.retryRequired ? ' · cleanup retry required' : ''}</span></div>`).join('')}
-        <div id="account-erasure-panel" aria-live="polite"></div>` : '');
+    const requests = new Map((reviews?.requests || []).map((request) => [request.userId, request]));
+    const cases = new Map((reviews?.cases || []).map((record) => [record.userId, record]));
+    const chips = (userId) => {
+      const request = requests.get(userId);
+      const record = cases.get(userId);
+      return [request && !record ? tipChip('Deletion requested', `Requested ${new Date(request.requestedAt).toLocaleString()}`, 'waiting') : '',
+        record ? erasureStateChip(record) : ''].join('');
+    };
+    const action = (userId) => !reviews ? ''
+      : `<button class="btn sm" data-erasure-user="${esc(userId)}">${cases.has(userId) ? 'Review' : 'Close account…'}</button>`;
+    const known = new Set(users.map((user) => user.id));
+    // A closed account has left the user directory; its case still needs review.
+    const closed = [...cases.values()].filter((record) => !known.has(record.userId)).map((record) => {
+      const email = requests.get(record.userId)?.email;
+      return instRow(`<span title="${esc(record.userId)}">Closed account</span>`,
+        `${email ? `<span class="setting-muted">${esc(email)}</span>` : ''}${record.closedAt ? `<span class="setting-muted">${esc(new Date(record.closedAt).toLocaleDateString())}</span>` : ''}${chips(record.userId)}`,
+        action(record.userId));
+    });
+    box.innerHTML = `<div class="setting-rows">${users.map((user) => instRow(`<a data-spa href="${profileRoute(user.id)}">${esc(user.name)}</a>`,
+      `<span class="setting-muted">${esc(user.email)}</span>${chips(user.id)}`, action(user.id))).join('')}${closed.join('')}</div>
+      ${reviews ? '<div id="account-erasure-panel" aria-live="polite"></div>' : ''}`;
     box.querySelectorAll('[data-erasure-user]').forEach(button => button.addEventListener('click', () =>
       loadAccountErasure(button.dataset.erasureUser).catch(error => toast(error.message, true))));
   } catch (error) { box.innerHTML = `<p class="task-sub">${esc(error.message)}</p>`; }
 }
 
+function erasureStateChip(record) {
+  if (record.retryRequired || record.state === 'closing') return tipChip('Cleanup incomplete', 'Closing stopped part-way. Open the review and retry the cleanup.', 'failed');
+  if (record.items?.some((item) => item.decision?.reviewAt <= Date.now())) return tipChip('Review overdue', 'A retention review date has passed.', 'failed');
+  return record.state === 'review-complete' ? '<span class="chip done">Reviewed</span>' : '<span class="chip waiting">Closed · review open</span>';
+}
 function accountErasureMarkup(preview) {
   const record = preview.case;
   const closed = record && record.state !== 'closing';
   const due = record?.items.some(item => item.decision?.reviewAt <= Date.now());
-  return `<div class="card"><div class="section-h">Account closure / erasure review</div>
-    <p><b>${esc(preview.userId)}</b>${preview.identity ? ` · ${esc(preview.identity.email)}` : ''}</p>
-    <p class="task-sub">${esc(preview.warning)} Export must be offered before closure. No subscriptions are cancelled and no external accounts or GitHub activity are deleted automatically.</p>
-    <details><summary>Exact inventory and automatic cleanup</summary><pre style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(JSON.stringify({
+  const outcomes = [['erased', 'Erased'], ['redacted', 'Redacted'], ['retained', 'Retained'], ['not-applicable', 'Not applicable']];
+  const stateLabel = { closing: 'Closing', closed: 'Closed, review open', 'review-complete': 'Review complete' };
+  return `<div class="card"><div class="section-h">${record ? 'Erasure review' : 'Close account'}</div>
+    <p title="${esc(preview.userId)}"><b>${esc(preview.identity?.name || (record ? 'Closed account' : preview.userId))}</b>${preview.identity ? ` · ${esc(preview.identity.email)}` : ''}</p>
+    <p class="task-sub">${esc(preview.warning)} Offer an export before closing. Subscriptions, external accounts and GitHub activity are not deleted automatically.</p>
+    <details><summary>What is removed and kept</summary><pre style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(JSON.stringify({
       organizations: preview.organizations, relatedTaskIds: preview.relatedTaskIds, linkedGit: preview.linkedGit,
       gitProfiles: preview.gitProfiles, automatic: preview.automatic, preserved: preview.preserved,
     }, null, 2))}</pre></details>
@@ -23270,14 +23337,15 @@ function accountErasureMarkup(preview) {
     ${!closed ? `<label class="form-row"><span><input id="erasure-export-handled" type="checkbox"> I verified the requester and offered/handled their export.</span></label>
       <label class="form-row">Type CLOSE ${esc(preview.userId)}<input id="erasure-confirmation" autocomplete="off"></label>
       <button class="btn danger" id="erasure-close" ${!record && preview.blockers.length ? 'disabled' : ''}>${record ? 'Retry interrupted cleanup' : 'Close this account'}</button>` : ''}
-    ${record ? `<p class="task-sub">${esc(record.state)} · completed cleanup: ${esc(record.steps.join(', '))}${record.retryRequired ? ' · cleanup incomplete; retry required' : ''}${due ? ' · retention review overdue' : ''}</p>
+    ${record ? `<p class="task-sub">${esc(stateLabel[record.state] || record.state)} · cleaned up: ${esc(record.steps.join(', ') || 'nothing yet')}${record.retryRequired ? ' · cleanup incomplete; retry required' : ''}${due ? ' · retention review overdue' : ''}</p>
       <a class="btn sm" href="/api/users/${encodeURIComponent(preview.userId)}/erasure/export" download>Download suppression manifest</a>
       <p class="task-sub">Keep the manifest securely outside the backup restore set. Reapply its closure and content actions before restoring service. This is a manual recovery control, not an automatic restore filter.</p>
-      ${closed ? record.items.map((item, index) => `<div class="card" data-erasure-item="${index}" data-unsaved><p>${esc(item.label)}</p>
-        <label class="form-row">Outcome<select data-erasure-outcome><option value="">Unreviewed</option>${['erased', 'redacted', 'retained', 'not-applicable'].map(outcome => `<option value="${outcome}" ${item.decision?.outcome === outcome ? 'selected' : ''}>${outcome}</option>`).join('')}</select></label>
-        <label class="form-row">Evidence / controller instructions / lawful retention reason<textarea data-erasure-evidence maxlength="4000" placeholder="References and reasoning only; do not copy personal content.">${esc(item.decision?.evidence || '')}</textarea></label>
-        <label class="form-row">Review / expiry date (required for retention and backups)<input type="date" data-erasure-review-at value="${item.decision?.reviewAt ? new Date(item.decision.reviewAt).toISOString().slice(0, 10) : ''}"></label>
-        <button class="btn sm" data-erasure-save="${index}" data-unsaved-save>Save decision</button></div>`).join('') : ''}
+      ${closed ? record.items.map((item, index) => `<div class="erasure-item" data-erasure-item="${index}" data-unsaved><p>${esc(item.label)}</p>
+        <div class="setting-rows">
+        <div class="setting-row"><span class="setting-label">Outcome</span><span class="setting-value"><select data-erasure-outcome aria-label="Outcome"><option value="">Unreviewed</option>${outcomes.map(([outcome, text]) => `<option value="${outcome}" ${item.decision?.outcome === outcome ? 'selected' : ''}>${text}</option>`).join('')}</select></span></div>
+        <div class="setting-row"><span class="setting-label">Evidence ${policyTip('References, controller instructions or the lawful reason for keeping it. Reasoning only; don’t copy personal content.')}</span><span class="setting-value"><textarea class="setting-input" data-erasure-evidence maxlength="4000" rows="2" aria-label="Evidence">${esc(item.decision?.evidence || '')}</textarea></span></div>
+        <div class="setting-row"><span class="setting-label">Review by ${policyTip('Required for retained records and backups.')}</span><span class="setting-value"><input type="date" data-erasure-review-at aria-label="Review by" value="${item.decision?.reviewAt ? new Date(item.decision.reviewAt).toISOString().slice(0, 10) : ''}"></span>
+          <span class="setting-actions"><button class="btn sm" data-erasure-save="${index}" data-unsaved-save>Save</button></span></div></div></div>`).join('') : ''}
       ${closed ? `<p class="task-sub">Review completion records your decisions; it is not proof of universal erasure. Retention exceptions remain subject to their review dates.</p>
         <label class="form-row">Type REVIEWED ${esc(preview.userId)}<input id="erasure-reviewed" autocomplete="off"></label>
         <button class="btn" id="erasure-complete" ${record.items.some(item => !item.decision) || due ? 'disabled' : ''}>Mark review complete</button>` : ''}` : ''}
@@ -23454,31 +23522,31 @@ async function wireServiceLimitsCard(view) {
 
 function installationView() {
   const phone = hostLocal()
-    ? `<div class="card phone-access-card" id="phone-access-card" hidden><div id="phone-access-status"><p class="task-sub">Checking this installation…</p></div></div>`
-    : `<div class="card"><p class="task-sub">Phone Access can be changed only from a browser on the machine running ${siteNameMarkup()}.</p></div>`;
+    ? `<div class="card phone-access-card" id="phone-access-card" hidden><div id="phone-access-status"><span class="task-sub">Checking…</span></div></div>`
+    : `<p class="setting-muted">Change phone access from a browser on the machine running ${siteNameMarkup()}.</p>`;
   return `<div class="organization-settings installation-settings"><div class="settings-header"><h1 class="page-title">Installation ${policyTip(`Settings for every organization and the machine running ${siteName()}. Only operators see them.`)}</h1></div>
   <div class="settings-layout">
-    <nav class="settings-nav" aria-label="Installation settings sections"><span>Installation</span>
+    <nav class="settings-nav" aria-label="Installation settings sections">
       <a href="#installation-appearance">Appearance</a><a href="#installation-health">Health</a><a href="#installation-limits">Service limits</a><a href="#installation-compute">Managed compute</a><a href="#installation-capacity">Host capacity</a>
       <a href="#installation-github">GitHub</a><a href="#installation-composio">Composio</a><a href="#installation-paid-launch">Paid launch</a><a href="#installation-stripe">Agent cards</a><a href="#installation-email">Email</a>
       <a href="#installation-access">Phone access</a>${S.meta.hosted ? '<a href="#installation-users">Users</a>' : ''}
     </nav><div class="settings-content">
       <div class="settings-section-title" id="installation-appearance"><div>Appearance ${policyTip(`The identity shown before an organization is known`)}</div></div>${appearanceCard()}
-      <div class="settings-section-title" id="installation-health"><div>Health ${policyTip(`Load, memory, and every process ${siteName()} runs`)}</div></div>
-      <div id="host-diag"><div class="card" style="color:var(--ink-3)">Loading…</div></div>
-      <div id="proc-panel" style="margin-top:12px"><div class="card" style="color:var(--ink-3)">Loading…</div></div>
+      <div class="settings-section-title" id="installation-health"><div>Health ${policyTip(`Load, agent turns and every process ${siteName()} runs. Memory and disk are under Service limits.`)}</div></div>
+      <div id="host-diag"><div class="card"><span class="task-sub">Loading…</span></div></div>
+      <div id="proc-panel" style="margin-top:12px"></div>
       <div class="settings-section-title" id="installation-limits"><div>Service limits ${policyTip(`Shared accounts and this server against their plans`)}</div></div>
       <div class="card service-limits" id="service-limits-card"><span class="task-sub">Loading…</span></div>
       <div class="settings-section-title" id="installation-compute"><div>Managed compute ${policyTip(`${siteName()}’s own provider accounts. Organizations without their own account run on them, charged to their plan’s monthly compute at twice the provider’s price.`)}</div></div>
       <div class="card" id="managed-compute-card"><span class="task-sub">Loading…</span></div>
       <div class="settings-section-title" id="installation-capacity"><div>Host capacity ${policyTip(`Admission limits shared by all agent work`)}</div></div>${hostCapacityCard()}
-      <div class="settings-section-title" id="installation-github"><div>GitHub ${policyTip(`GitHub App for repository access`)}</div></div>${installationGithubCard()}
-      <div class="settings-section-title" id="installation-composio"><div>Composio ${policyTip(`App connection setup shared by every organization`)}</div></div><div class="card" id="installation-composio-card">Loading Composio setup…</div>
-      <div class="settings-section-title" id="installation-paid-launch"><div>Paid launch ${policyTip(`Subscription billing, legal operator details, and the founder launch checklist`)}</div></div>${paidLaunchCard()}
-      <div class="settings-section-title" id="installation-stripe"><div>Agent cards ${policyTip(`Optional Stripe Connect application for cards agents spend from—not SaaS subscriptions`)}</div></div>${stripePlatformCard()}
-      <div class="settings-section-title" id="installation-email"><div>Email ${policyTip(`Account confirmation, password reset, and organization invitations`)}</div></div>${outboundEmailCard()}
-      <div class="settings-section-title" id="installation-access"><div>Phone access ${policyTip(`Secure reachability for this host`)}</div></div>${phone}
-      ${S.meta.hosted ? `<div class="settings-section-title" id="installation-users"><div>Users ${policyTip('Close a person’s account and erase their data')}</div></div><div class="card" id="installation-users-card">Loading users…</div>` : ''}
+      <div class="settings-section-title" id="installation-github"><div>GitHub</div></div>${installationGithubCard()}
+      <div class="settings-section-title" id="installation-composio"><div>Composio</div></div><div class="card" id="installation-composio-card"><span class="task-sub">Loading…</span></div>
+      <div class="settings-section-title" id="installation-paid-launch"><div>Paid launch ${policyTip(`Subscription billing, legal operator details and the launch checklist`)}</div></div>${paidLaunchCard()}
+      <div class="settings-section-title" id="installation-stripe"><div>Agent cards ${policyTip(`Optional: the Stripe Connect application behind the cards agents spend from. Not used for plan subscriptions.`)}</div></div>${stripePlatformCard()}
+      <div class="settings-section-title" id="installation-email"><div>Email</div></div>${outboundEmailCard()}
+      <div class="settings-section-title" id="installation-access"><div>Phone access ${policyTip(`Open ${siteName()} from your phone over a private Tailscale network`)}</div></div>${phone}
+      ${S.meta.hosted ? `<div class="settings-section-title" id="installation-users"><div>Users ${policyTip('Close a person’s account and erase their data. Closing removes sign-in and access, not shared work. Erasure reviews need a documented decision per item; replacing a name is not anonymisation.')}</div></div><div class="card" id="installation-users-card"><span class="task-sub">Loading…</span></div>` : ''}
     </div>
   </div></div>`;
 }
