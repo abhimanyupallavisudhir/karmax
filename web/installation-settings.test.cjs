@@ -31,7 +31,8 @@ ok(!installation.includes('installation-recovery') && !src.includes('hydrateResi
 ok(src.includes("api('/api/settings/paid-launch')"), 'Paid launch loads persisted installation configuration');
 ok(src.includes("method: 'PUT'"), 'Paid launch saves configuration through the installation API');
 ok(src.includes('No paid-launch environment variables are required'), 'Paid launch explains that environment variables are unnecessary');
-ok(src.includes('Real-world founder checklist'), 'Paid launch includes the founder checklist');
+ok(src.includes('Launch checklist <span class="setting-muted">${done}/${tasks.length} done</span>'), 'Paid launch folds the founder checklist with a done count');
+ok(src.includes('Publishes the policies as yours'), 'the paid-checkout switch keeps its consent visible, not only in a tip');
 ok(src.includes('SaaS subscription billing, separate from Stripe Connect'), 'Paid launch distinguishes subscriptions from agent cards');
 ok(src.includes('stripe.apiVersion'), 'Paid launch shows the supported Stripe API version');
 ok(src.includes('stripe.webhookEvents'), 'Paid launch shows the exact Stripe webhook events');

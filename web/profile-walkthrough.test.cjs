@@ -8,7 +8,7 @@ const wiring = source.slice(source.indexOf('function wireProfileView('), source.
 function context(operator) {
   const S = { installationAccess: operator, meta: { hosted: true }, user: { id: 'operator' },
     profileUserId: 'target', users: [{ id: 'target', name: 'Target User', email: 'target@example.com' }] };
-  const ctx = vm.createContext({ S, esc: (value) => String(value), encodeURIComponent });
+  const ctx = vm.createContext({ S, esc: (value) => String(value), encodeURIComponent, policyTip: (text) => `<button class="info-dot" title="${text}">ⓘ</button>` });
   vm.runInContext(views, ctx);
   return ctx;
 }

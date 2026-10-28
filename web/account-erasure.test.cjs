@@ -5,6 +5,7 @@ const source = fs.readFileSync(require('node:path').join(__dirname, 'app.js'), '
 const start = source.indexOf('function accountErasureMarkup(');
 const end = source.indexOf('async function loadAccountErasure(', start);
 const context = { esc: value => String(value).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])) };
+context.policyTip = text => `<button type="button" class="info-dot" title="${context.esc(text)}">ⓘ</button>`;
 vm.createContext(context);
 vm.runInContext(source.slice(start, end), context);
 const preview = { userId: 'user_1', identity: { email: '<script>bad</script>' }, organizations: [], relatedTaskIds: [],
@@ -23,6 +24,8 @@ preview.case.items[0].decision = { outcome: 'retained', evidence: '<b>unsafe</b>
 html = context.accountErasureMarkup(preview);
 assert.match(html, /retention review overdue/);
 assert.ok(!html.includes('<b>unsafe</b>'));
+assert.ok(html.includes('&lt;b&gt;unsafe&lt;/b&gt;</textarea>'), 'a saved decision shows its evidence again');
+assert.match(html, /<option value="retained" selected>Retained<\/option>/, 'outcomes read as words, not enum values');
 assert.match(html, /id="erasure-complete" disabled/);
 preview.case.items[0].decision.reviewAt = Date.now() + 86400000;
 html = context.accountErasureMarkup(preview);

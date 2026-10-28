@@ -152,14 +152,14 @@ describe('GitHub App permission UX', () => {
     const ui = await open('/installation', ({ path }) => path === '/api/settings/installation' ? { canManage: true }
       : path.endsWith('/github/app') ? { configured: true, appSlug: 'krmax', appId: '1', oauthConfigured: true, webhookConfigured: true,
         permissionStatus: { ready: false, missingApp: ['actions: write'], appSettingsUrl: 'https://github.com/settings/apps/krmax/permissions' } }
-      : undefined, '#installation-github-card .section-h');
+      : undefined, '#installation-github-card .setting-row');
     await pane(ui, '#installation-github-card');
     const card = ui.page.locator('#installation-github-card');
-    expect(await card.locator('.section-h').textContent()).toBe('GitHub App action required');
-    const text = await card.textContent();
-    expect(text).toContain('GitHub App permissions need updating');
-    expect(text).toContain('Add the missing permissions: actions: write.');
-    expect(await card.getByRole('link', { name: 'Update permissions on GitHub' }).getAttribute('href'))
+    expect(await card.locator('.setting-row').first().innerText()).toMatch(/^GitHub App\s+ⓘ\s+krmax\s+Action required$/);
+    const permissions = card.locator('.setting-row', { hasText: 'Permissions' });
+    expect(await permissions.locator('.setting-value').innerText()).toBe('Missing actions: write');
+    expect(await permissions.locator('.info-dot').getAttribute('title')).toContain('GitHub asks every organization that installed the App to approve them');
+    expect(await card.getByRole('link', { name: 'Update on GitHub' }).getAttribute('href'))
       .toBe('https://github.com/settings/apps/krmax/permissions');
     await ui.close();
   });

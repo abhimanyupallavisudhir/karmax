@@ -604,7 +604,7 @@ export const MANIFESTS: WorkflowManifest[] = [
         name: 'capacity',
         type: 'number',
         label: 'Concurrent agent turns',
-        help: 'Maximum model subprocesses running at once across all projects. This is distinct from general Temporal activity concurrency and per-login concurrency.',
+        help: 'The most agents working at once across every project. Each login also has its own limit.',
         default: 3,
         required: true,
         scopes: ['global'],

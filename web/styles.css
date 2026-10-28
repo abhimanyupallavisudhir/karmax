@@ -198,6 +198,9 @@ html.rail-collapsed .topbar-context { display: block; }
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.18);
 }
 .brand-picker { display: flex; flex-wrap: wrap; gap: 10px; }
+.brand-picker:not([hidden]) { margin-top: 10px; }
+.brand-current { display: inline-flex; align-items: center; gap: 8px; }
+.brand-current img { width: 24px; height: 24px; border-radius: 6px; }
 .brand-option {
   display: grid; justify-items: center; gap: 6px;
   padding: 10px; width: 88px; cursor: pointer;
@@ -512,7 +515,8 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 }
 .urgency-chip.critical { background:var(--danger-weak); color:var(--danger); }
 .urgency-chip.normal, .urgency-chip.low { background:var(--surface-2); color:var(--ink-3); }
-.notify-row .urgency-chip { justify-self:start; }
+.notify-row .urgency-chip { justify-self:start; font-family:var(--font-ui); font-size:11px; text-transform:none; letter-spacing:0; }
+.notify-off { display:inline-flex; align-items:center; gap:4px; }
 /* Per-urgency behaviour: one row per level, one column per behaviour. */
 .notify-grid { overflow-x:auto; display:grid; gap:2px; margin:6px 0 12px; }
 .notify-row { display:grid; grid-template-columns:90px repeat(4,minmax(70px,1fr)) auto; gap:12px; align-items:center; padding:7px 0; border-bottom:1px solid var(--line); }
@@ -3151,6 +3155,53 @@ html[data-theme="dark"] .github-signin-btn:active,
 .proc-table .proc-task:hover { color: var(--accent); border-color: var(--accent); }
 .proc-table .proc-lock { opacity: .55; cursor: help; font-size: 11px; }
 .proc-table .proc-kill { white-space: nowrap; }
+/* ── Installation cards: one setting per row (instRow), folds, copyable URLs ── */
+.inst-url { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 12px/1.4 var(--font-mono); color: var(--ink-2); }
+.tip-chip.info-dot { width: auto; height: auto; padding: 3px 8px; border: 1px solid var(--line); font-size: 11px; line-height: 14px; font-weight: 600; cursor: help; }
+.tip-chip.info-dot.waiting, .tip-chip.info-dot.failed, .tip-chip.info-dot.done { border-color: transparent; }
+.inst-h { display: flex; align-items: center; gap: 6px; margin-top: 22px; }
+.inst-fold > summary { display: flex; align-items: center; gap: 8px; min-height: 44px; cursor: pointer; list-style: none; color: var(--ink-2); font-size: 12.5px; }
+.inst-fold > summary::-webkit-details-marker { display: none; }
+.inst-fold > summary::before { content: '›'; width: 10px; color: var(--ink-3); font-size: 16px; line-height: 1; transition: transform .12s; }
+.inst-fold[open] > summary::before { transform: rotate(90deg); }
+.inst-fold > .setting-rows { border-top: 1px solid var(--line); }
+.inst-checklist { border-bottom: 1px solid var(--line); }
+.inst-checklist[open] { padding-bottom: 8px; }
+.inst-steps { margin: 0 0 12px; padding-left: 20px; color: var(--ink-2); font-size: 12.5px; line-height: 1.6; }
+.inst-steps code { overflow-wrap: anywhere; font-size: 11.5px; }
+.inst-group { margin: 10px 0 2px; color: var(--ink-3); font-size: 11.5px; font-weight: 600; }
+.inst-check { display: flex; align-items: center; gap: 8px; min-height: 30px; font-size: 13px; cursor: pointer; }
+.inst-check > input { flex: none; margin: 0; accent-color: var(--accent); }
+.inst-check > a { color: var(--ink-3); text-decoration: none; }
+.inst-check > a:hover { color: var(--accent); }
+.inst-save { display: flex; justify-content: flex-end; align-items: center; margin-top: 14px; }
+.setting-value > textarea.setting-input { resize: vertical; font: inherit; }
+.setting-value > .setting-input:is(.host-capacity-input, #oe-port) { max-width: 96px; }
+.installation-settings .setting-label { width: 172px; }
+.oe-links { display: inline-flex; flex-wrap: wrap; gap: 4px 10px; font-size: 12px; }
+.phone-access-card .setting-rows + .phone-setup { margin-top: 8px; }
+.phone-access-card .inst-fold { border-top: 1px solid var(--line); }
+.phone-access-card .inst-fold .phone-steps { margin-top: 0; }
+.phone-detail { margin: 0 0 10px; color: var(--ink-2); font-size: 12px; }
+.health-gate { margin: 8px 0 0; font-size: 12.5px; }
+.proc-toggle { display: inline-flex; align-items: center; gap: 6px; padding: 0; border: 0; background: none; color: inherit; font: inherit; cursor: pointer; }
+.proc-toggle::before { content: '›'; width: 8px; color: var(--ink-3); font-size: 15px; line-height: 1; transition: transform .12s; }
+.proc-toggle[aria-expanded="true"]::before { transform: rotate(90deg); }
+.proc-foot { padding: 8px 12px; color: var(--ink-3); }
+.erasure-item { margin: 12px 0; padding-top: 10px; border-top: 1px solid var(--line); }
+.erasure-item > p { margin: 0 0 4px; font-size: 13px; }
+.computer-providers + .managed-off { margin-top: 8px; border-top: 1px solid var(--line); }
+.managed-off > summary { min-height: 32px; }
+.managed-off[open] > .computer-providers { margin-bottom: 4px; }
+.installation-settings .card > .setting-rows.ruled:first-child { border-top: 0; margin-top: -6px; }
+@media (max-width: 560px) {
+  .installation-settings .setting-label { width: 100%; }
+  :is(.installation-settings, .profile-page) .setting-row:has(> .setting-value:empty) > .setting-label { width: auto; flex: 1; }
+  :is(.installation-settings, .profile-page) .setting-row > .setting-value:empty { display: none; }
+  /* The urgency grid fits a phone instead of scrolling sideways with no hint. */
+  .profile-page .notify-row { grid-template-columns: 58px repeat(4, minmax(38px, 1fr)) auto; gap: 6px; }
+  .profile-page .notify-head { font-size: 9.5px; letter-spacing: 0; }
+}
 
 /* ── wiki (org/project skills, memories, prompts) ─────────────────────────── */
 .wiki-nav { max-height: calc(100vh - 140px); overflow-y: auto; }
@@ -3657,7 +3708,15 @@ html[data-theme="dark"] .github-signin-btn:active,
 .limits-label.info-dot { display: inline; width: auto; height: auto; border-radius: 0; background: none; color: inherit;
   font-size: inherit; line-height: inherit; text-align: left; cursor: help; }
 .limits-label.info-dot:hover { color: var(--ink); }
-.limits-source { margin-left: 3px; color: var(--ink-3); font: 10.5px/1.2 var(--font-mono); white-space: nowrap; cursor: help; }
+/* Unconnected services: one folded row with a count; inside, each says how to connect. */
+.limits-off-fold { border-top: 1px solid var(--line); }
+.limits-off-fold > summary { display: flex; align-items: center; gap: 8px; padding: 7px 0; cursor: pointer; list-style: none; font-size: 13px; line-height: 20px; font-weight: 600; color: var(--ink); }
+.limits-off-fold > summary::-webkit-details-marker { display: none; }
+.limits-off-fold > summary::before { content: '›'; width: 10px; color: var(--ink-3); font-size: 16px; line-height: 1; transition: transform .12s; }
+.limits-off-fold[open] > summary::before { transform: rotate(90deg); }
+.limits-off-fold > summary .setting-muted { font-weight: 400; }
+.limits-off-fold .limits-off { font-size: 12.5px; }
+.limits-link { font-weight: 600; }
 .limits-usage, .limits-actions { min-height: 20px; }
 .limits-usage { display: flex; align-items: center; gap: 8px; }
 .limits-bar { position: relative; flex: 1 1 auto; min-width: 48px; height: 6px; border-radius: 999px; background: var(--line); }
