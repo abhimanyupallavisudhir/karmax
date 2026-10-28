@@ -44,7 +44,7 @@ const VIEW = {
       meter('cloudflare-r2.storage', 'Stored', 'bytes', 4.3 * GIB, 10 * GIB),
     ], { link: { url: 'https://dash.cloudflare.com/?to=/:account/r2/overview', label: 'Billing' } }),
     service('managed-storage', 'Managed storage', undefined, [
-      meter('managed-storage.untracked', 'Untracked', 'bytes', 375e6, GIB, { usedSource: 'count', detail: 'nisada-personal 358 MB' }),
+      meter('managed-storage.untracked', 'Unaccounted data', 'bytes', 375e6, GIB, { usedSource: 'count', detail: 'nisada-personal 358 MB' }),
       meter('managed-storage.pending-delete', 'Awaiting deletion', 'bytes', 29.3e9, undefined, { usedSource: 'count', detail: 'all purged by 2026-11-09' }),
     ], { link: undefined }),
     service('composio', 'Composio', 'Pro', [
@@ -127,20 +127,24 @@ const PAGE = `<!doctype html><html data-theme="light"><body><main class="main"><
     assert.equal(await r2.nth(1).locator('.limits-plan').count(), 0, 'the plan shows once per service');
     assert.equal(await r2.nth(0).locator('.limits-actions a').getAttribute('href'), 'https://dash.cloudflare.com/?to=/:account/r2/overview');
     assert.equal(await r2.nth(0).locator('.limits-actions a').getAttribute('target'), '_blank');
+    // Every service links out the same way, whatever the provider calls its page.
+    assert.deepEqual([...new Set(await page.locator('.limits-actions a').allTextContents())], ['↗']);
+    assert.equal(await r2.nth(0).locator('.limits-actions a').getAttribute('title'), 'Billing · Cloudflare R2');
     assert.equal(await r2.nth(1).locator('.limits-actions a').count(), 0);
 
     // Numbers, compact limits, and where each number came from.
     const workers = page.locator('.limits-row[data-meter="cloudflare-workers.requests"]');
     assert.equal((await workers.locator('.limits-numbers').textContent()).trim(), '9,121 / 100K');
-    assert.equal(await workers.locator('.limits-source').textContent(), 'API');
+    // Where a number comes from is said in the measure's tip, not a badge.
+    assert.equal(await page.locator('.limits-source').count(), 0);
+    assert.equal(await workers.locator('.limits-measure .limits-label').getAttribute('title'), 'Requests today: what it counts. Read from the provider.');
     assert.match(await workers.locator('.limits-bar').getAttribute('title'), /^Now 9,121 \(9%\) · 7-day high 31,500 · tavya-resource-repositories 9,121$/);
     assert.equal(await workers.locator('.limits-peak').count(), 1, 'the 7-day high is above today');
     const calls = page.locator('.limits-row[data-meter="composio.tool-calls"]');
-    assert.equal(await calls.locator('.limits-source').textContent(), 'tavya');
-    assert.equal(await calls.locator('.limits-source').getAttribute('title'), 'Counted by tavya');
+    assert.match(await calls.locator('.limits-measure .limits-label').getAttribute('title'), / Counted by tavya\.$/);
     assert.equal(await calls.locator('.limits-limit').getAttribute('title'), 'Entered by you');
     assert.match(await calls.locator('.limits-limit').getAttribute('class'), /entered/);
-    assert.equal(await page.locator('.limits-row[data-meter="host.heap"] .limits-source').textContent(), 'server');
+    assert.match(await page.locator('.limits-row[data-meter="host.heap"] .limits-label').getAttribute('title'), / Measured on this server\.$/);
     assert.equal((await page.locator('.limits-row[data-meter="host.disk"] .limits-numbers').textContent()).trim(), '85 GB / 193 GB');
     assert.equal((await page.locator('.limits-row[data-meter="e2b.hours"] .limits-numbers').textContent()).trim(), '61.4 h');
     assert.equal(await page.locator('.limits-row[data-meter="e2b.hours"] .limits-bar').count(), 0, 'no limit, no bar');
@@ -169,10 +173,15 @@ const PAGE = `<!doctype html><html data-theme="light"><body><main class="main"><
     // Failing and unconnected services say so; explanations are tooltips.
     assert.match(await page.locator('.limits-row[data-service="agentmail"] .limits-failed').textContent(), /Can’t read/);
     assert.match(await page.locator('.limits-row[data-service="agentmail"] .limits-failed .info-dot').getAttribute('title'), /AgentMail refused the credential \(401\)/);
-    const daytona = page.locator('.limits-row[data-service="daytona"]');
-    assert.match(await daytona.textContent(), /Not connected/);
-    assert.match(await daytona.locator('.limits-off .info-dot').getAttribute('title'), /Compute settings/);
-    assert.equal(await page.locator('.limits-row[data-meter="e2b.hours"] .limits-label').getAttribute('title'), 'Hours this month: what it counts.');
+    // Unconnected services fold into one row with a count; each says how to connect.
+    const off = page.locator('details.limits-off-fold');
+    assert.match(await off.locator('summary').textContent(), /Not connected\s*1/);
+    assert.equal(await off.getAttribute('open'), null, 'the fold starts closed');
+    const daytona = off.locator('.limits-row[data-service="daytona"]');
+    assert.equal(await daytona.isVisible(), false);
+    await off.locator('summary').click();
+    assert.match(await daytona.locator('.limits-off').textContent(), /Compute settings/);
+    assert.equal(await page.locator('.limits-row[data-meter="e2b.hours"] .limits-label').getAttribute('title'), 'Hours this month: what it counts. Counted by tavya.');
     assert.equal(await page.locator('.limits-row .limits-label.info-dot').count(), 20 + 11, 'every service and measure explains itself on hover or tap');
     if (process.env.SERVICE_LIMITS_SCREENSHOT) await page.locator('.settings-content').screenshot({ path: process.env.SERVICE_LIMITS_SCREENSHOT });
     for (const text of await page.locator('.limits-row .limits-measure, .limits-row .limits-numbers').all()) {

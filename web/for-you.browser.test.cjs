@@ -99,13 +99,13 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     await page.locator('#expand-task').click();
     const formPick = page.locator('#tf-project');
     await formPick.waitFor();
-    assert.equal(await formPick.innerText(), 'website', 'new tasks go to the current project by default');
+    assert.equal(await formPick.innerText(), 'Website', 'new tasks go to the current project by default');
     await formPick.click();
     const menu = page.locator('.project-pick-menu:not([hidden])');
-    assert.deepEqual(await menu.locator('[role="option"]').allInnerTexts(), ['website', 'mobile-app'], 'the organization\'s projects');
+    assert.deepEqual(await menu.locator('[role="option"]').allInnerTexts(), ['Website', 'Mobile App'], 'the organization\'s projects, by name');
     if (shots) await page.screenshot({ path: path.join(shots, 'task-form-project-picker.png') });
     await menu.locator('[data-project="q"]').click();
-    await page.waitForFunction(() => document.querySelector('#tf-project')?.innerText === 'mobile-app');
+    await page.waitForFunction(() => document.querySelector('#tf-project')?.innerText === 'Mobile App');
     await page.locator('#tf-page textarea[data-field="prompt"]').fill('Dark mode');
     await page.locator('#tf-queue').click();
     await page.waitForFunction(() => !document.querySelector('#tf-page'));
@@ -116,7 +116,7 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     await page.locator('[data-id="t1"]').waitFor();
     await page.locator('#add-task').click();
     await page.locator('#tf-project').waitFor();
-    assert.equal(await page.locator('#tf-project').innerText(), 'mobile-app', 'the choice is remembered');
+    assert.equal(await page.locator('#tf-project').innerText(), 'Mobile App', 'the choice is remembered');
     await page.locator('#tf-close').click();
     await page.waitForFunction(() => !document.querySelector('#tf-page'));
     // A project's own list opens the form in that project.

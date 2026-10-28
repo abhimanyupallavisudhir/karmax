@@ -65,7 +65,7 @@ export const SERVICE_CATALOG: ServiceSpec[] = [
     tip: 'The bucket that holds every organization’s data, checked against tavya’s records once a day.',
     connect: 'Measured after the first daily check of the bucket.',
     meters: [
-      { id: 'managed-storage.untracked', label: 'Untracked', unit: 'bytes', window: 'now', source: 'count', limit: GB,
+      { id: 'managed-storage.untracked', label: 'Unaccounted data', unit: 'bytes', window: 'now', source: 'count', limit: GB,
         tip: 'Data in the bucket that no record accounts for, such as an upload that never finished. Counted toward no organization.' },
       { id: 'managed-storage.pending-delete', label: 'Awaiting deletion', unit: 'bytes', window: 'now', source: 'count',
         tip: 'Deleted data, kept 30 days so a restored backup still finds it. Counted toward no organization.' },

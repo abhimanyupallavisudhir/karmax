@@ -37,6 +37,9 @@ global.esc = (s) => String(s == null ? '' : s);
 eval(extractFn('taskMergeDomains'));
 eval(extractFn('queueRank'));
 eval(extractFn('queueRowLabel'));
+eval(extractFn('customBranch'));
+eval(extractFn('sentenceCase'));
+global.LANDING_STATES = {};
 eval(extractFn('mergeQueuePanel'));
 
 // ── the helper ───────────────────────────────────────────────────────────────

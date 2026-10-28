@@ -190,9 +190,9 @@ describe('manual PR opening', () => {
 
     expect(helpers.taskActionLabel({ stage: 'escalated' }, { ...action, label: 'Commit changes, open & confirm PR' }))
       .toBe('Commit changes, open & confirm PR');
-    expect(helpers.taskActionLabel({}, action)).toBe('Manually Open & Confirm PR');
-    expect(helpers.taskActionLabel({ pr: { state: 'open', merged: false } }, action)).toBe('Return to Review & Confirm');
-    expect(helpers.taskActionLabel({ prs: [{ state: 'closed', merged: false }] }, action)).toBe('Manually Open & Confirm PR');
+    expect(helpers.taskActionLabel({}, action)).toBe('Send to review');
+    expect(helpers.taskActionLabel({ pr: { state: 'open', merged: false } }, action)).toBe('Back to review');
+    expect(helpers.taskActionLabel({ prs: [{ state: 'closed', merged: false }] }, action)).toBe('Send to review');
     expect(helpers.hasOpenPullRequest({ prs: [{ state: 'open', merged: true }] })).toBe(false);
   });
 
@@ -315,7 +315,7 @@ describe('copy', () => {
   it('points empty states at their next action', () => {
     expect(app).toContain('No agent to fork yet. Choose another attempt or task.');
     expect(app).toContain('No vault items yet. Add one in ');
-    expect(app).toContain('No tags yet. Create one with the Tags button.');
+    expect(app).toContain('No tags yet. Add one with Manage tags.');
   });
 
   /**
@@ -362,6 +362,6 @@ describe('copy', () => {
     expect(app).toContain("const EMAIL_SEND_FAILED = 'Couldn’t send the email — outbound email is misconfigured, or the provider rejected it.';");
     expect(app).not.toContain('Could not send confirmation email');
     expect(app).not.toContain('Precedence + enable/disable');
-    expect(app).toContain('Drag to reorder, toggle to disable — for this task only.');
+    expect(app).toContain('Drag to reorder; switch one off to skip it, for this task only.');
   });
 });

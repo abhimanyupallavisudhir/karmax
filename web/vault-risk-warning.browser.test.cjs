@@ -43,11 +43,14 @@ const requests = [
 
     const warning = page.locator('#vault-card [role="note"]');
     assert.equal(await warning.count(), 1, 'the Passwords card carries one risk warning');
+    // One line, the detail a tip away.
     const text = (await warning.innerText()).replace(/\s+/g, ' ');
     assert.match(text, /at your own risk/i);
-    assert.match(text, /reveal.*agent sees.*model provider.*training data/i, 'reveal: leaves for the model provider and training data');
-    assert.match(text, /use.*blind use.*prompt injection.*malicious server/i, 'use: still leakable by a misbehaving agent');
     assert.match(text, /prefer.*MCP or Composio/i);
+    assert.ok((await warning.boundingBox()).height < 48, 'the warning is one line');
+    const tip = await warning.locator('.info-dot').getAttribute('title');
+    assert.match(tip, /agent sees.*model provider.*training data/i, 'reveal: leaves for the model provider and training data');
+    assert.match(tip, /blind use.*prompt injection.*malicious site/i, 'use: still leakable by a misbehaving agent');
     assert.equal(await warning.getByRole('link', { name: /MCP or Composio/ }).getAttribute('href'), '#settings-connections',
       'points at Connected apps');
     const box = await warning.boundingBox();

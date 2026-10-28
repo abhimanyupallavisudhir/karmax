@@ -184,6 +184,10 @@ a { color: var(--accent); text-decoration: none; }
 }
 .brand { display: flex; align-items: center; gap: 9px; font-weight: 650; letter-spacing: -0.01em; color: inherit; text-decoration: none; border-radius: 7px; }
 .brand:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+/* The open project's name beside the logo, where no sidebar shows it (a phone, a folded rail). */
+.topbar-context { display: none; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; color: var(--ink); }
+html.rail-collapsed .topbar-context { display: block; }
+.tab-narrow { display: none; }
 /* ☰ sits flush with the logo; the rail it folds is the column below it. */
 .topbar .mobile-menu { flex: none; margin-right: -8px; }
 /* The artwork carries its own background and rounded corners (see web/brand/),
@@ -194,6 +198,9 @@ a { color: var(--accent); text-decoration: none; }
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.18);
 }
 .brand-picker { display: flex; flex-wrap: wrap; gap: 10px; }
+.brand-picker:not([hidden]) { margin-top: 10px; }
+.brand-current { display: inline-flex; align-items: center; gap: 8px; }
+.brand-current img { width: 24px; height: 24px; border-radius: 6px; }
 .brand-option {
   display: grid; justify-items: center; gap: 6px;
   padding: 10px; width: 88px; cursor: pointer;
@@ -228,12 +235,12 @@ a { color: var(--accent); text-decoration: none; }
   font-size: 10px; font-weight: 700; display: grid; place-items: center;
 }
 .topbar-user {
-  display: inline-block; line-height: 32px; box-sizing: border-box; /* a block, so a long name ends in … */
-  height: 34px; padding: 0 12px; border: 1px solid var(--line); border-radius: 999px;
-  background: var(--surface-2); color: var(--ink-2); cursor: pointer; font-weight: 600;
-  max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  display: grid; place-items: center; flex: none; width: 30px; height: 30px; border-radius: 50%; overflow: hidden;
+  text-decoration: none; background: linear-gradient(135deg, var(--accent), #8a6cf0); color: #fff;
+  cursor: pointer; font-weight: 700; font-size: 13px;
 }
-.topbar-user:hover { border-color: var(--line-strong); color: var(--ink); background: var(--surface); }
+.topbar-user img { width: 100%; height: 100%; object-fit: cover; }
+.topbar-user:hover, .topbar-user:focus-visible { box-shadow: 0 0 0 3px var(--accent-weak); outline: none; }
 /* The shortcut echo: the keys for what you just did, fading after a moment
    (held while hovered; a pending chord prefix holds until it resolves). */
 .key-echo {
@@ -429,6 +436,8 @@ a { color: var(--accent); text-decoration: none; }
 .task-sub > .chip { white-space: nowrap; }
 /* A phone gives the title the row: the dot and stage chip already say where it is. */
 @media (max-width: 700px) { .task-row > .task-right > .pipeline { display: none; } }
+/* …and the whole title: on a phone it wraps instead of ending in "…". */
+@media (max-width: 720px) { .task-row .task-title { white-space: normal; overflow-wrap: break-word; } }
 /* The flex row above is for a strip of metadata (a div of chips). A <p> is prose:
    as a flex container every inline <a>/<span> in the sentence became its own item,
    gapped and wrapped away from the words around it. Prose flows as prose. */
@@ -506,7 +515,8 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 }
 .urgency-chip.critical { background:var(--danger-weak); color:var(--danger); }
 .urgency-chip.normal, .urgency-chip.low { background:var(--surface-2); color:var(--ink-3); }
-.notify-row .urgency-chip { justify-self:start; }
+.notify-row .urgency-chip { justify-self:start; font-family:var(--font-ui); font-size:11px; text-transform:none; letter-spacing:0; }
+.notify-off { display:inline-flex; align-items:center; gap:4px; }
 /* Per-urgency behaviour: one row per level, one column per behaviour. */
 .notify-grid { overflow-x:auto; display:grid; gap:2px; margin:6px 0 12px; }
 .notify-row { display:grid; grid-template-columns:90px repeat(4,minmax(70px,1fr)) auto; gap:12px; align-items:center; padding:7px 0; border-bottom:1px solid var(--line); }
@@ -566,6 +576,16 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .vault-risk ul { margin:4px 0; padding-left:18px; }
 .vault-risk li + li { margin-top:3px; }
 .vault-risk-mark { flex:none; display:grid; place-items:center; width:18px; height:18px; margin-top:1px; border-radius:50%; background:var(--danger); color:#fff; font-weight:800; line-height:1; }
+.vault-risk .info-dot { vertical-align:-1px; }
+.vault-import-h { display:flex; align-items:center; gap:6px; margin:16px 0 2px; color:var(--ink-2); font-size:12.5px; font-weight:600; }
+.vault-import-rows { margin-bottom:14px; }
+.vault-import-rows .chip.ok { background:var(--merged-weak); color:var(--merged); border-color:transparent; }
+.vault-import-rows .conn-secret { flex:1; min-width:140px; max-width:260px; }
+.vault-policy-field { display:inline-flex; align-items:center; gap:4px; font-size:12px; color:var(--ink-2); }
+/* A label that is its own field row ("Card name<input>") reads like every other field label. */
+.organization-settings:not(.installation-settings, .wiki-page) label.form-row:not(.switch) { color:var(--ink-2); font-size:12px; font-weight:600; }
+.organization-settings:not(.installation-settings, .wiki-page) label.form-row:not(.switch) > :is(input, select, textarea) { color:var(--ink); font-size:14px; font-weight:400; }
+#project-secret-paste .form-row > span { color:var(--ink-2); font-size:12px; font-weight:600; }
 .project-empty { margin:8px 0 14px; padding:14px; border:1px dashed var(--line-strong); border-radius:10px; color:var(--ink-3); font-size:12px; line-height:1.5; }
 .project-form-actions { display:flex; align-items:center; justify-content:flex-end; gap:8px; margin-top:12px; }
 .service-fields[hidden] { display:none; }
@@ -699,8 +719,8 @@ a.git-repo-name:hover { color:var(--accent); }
 }
 .task-project-org { color: var(--ink-3); font-weight: 400; }
 
-/* The project a new task goes to: its slug, with a menu of the organization's
-   projects (Home's composer, the task form's "← New task" bar). */
+/* The project a new task goes to: its name, with a menu of the organization's
+   projects (the task form's "← New task" bar). */
 .project-pick-wrap { position: relative; display: inline-flex; flex: none; min-width: 0; }
 .project-pick {
   display: inline-flex; align-items: center; gap: 5px; min-width: 0; height: 28px; padding: 0 7px;
@@ -709,6 +729,7 @@ a.git-repo-name:hover { color:var(--accent); }
 .project-pick:hover, .project-pick[aria-expanded="true"] { background: var(--surface-2); color: var(--ink-2); }
 .project-pick:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .project-pick .task-project { font-size: 12.5px; color: var(--ink); }
+.project-pick .project-name, .project-pick-opt .project-name { font-family: var(--font-ui); font-size: 13px; }
 .project-pick.static { display: inline-flex; align-items: center; height: 28px; padding: 0 7px; cursor: default; }
 .project-pick-caret { flex: none; }
 .project-pick-menu {
@@ -749,6 +770,7 @@ a.git-repo-name:hover { color:var(--accent); }
 }
 .checkout-row:last-of-type { border-bottom: 0; }
 .checkout-mark { color: var(--ink-3); width: 12px; text-align: center; }
+.checkout-mark:empty { display: none; }
 .checkout-row.landed .checkout-mark { color: var(--merged, var(--accent)); }
 /* Pull requests to approve, as small boxes at the end of the conversation. */
 .pr-asks { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
@@ -908,9 +930,11 @@ a.git-repo-name:hover { color:var(--accent); }
 .tp-rail .org-editor { margin-top: 0; }
 #task-notes { width: 100%; box-sizing: border-box; min-height: 52px; padding: 7px 9px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-2); color: var(--ink); font: 13px/1.45 var(--font-ui); resize: vertical; }
 #task-notes:focus { background: var(--surface); }
+#tf-notes { width: 100%; box-sizing: border-box; }
 .rail-links { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: 10px 12px 0; border-top: 1px solid var(--line); }
 .rail-link { justify-content: flex-start; }
 .rail-link-count { font-family: var(--font-mono); font-size: 11px; color: var(--ink-3); }
+.rail-link.pending, .rail-link.pending .rail-link-count { color: var(--working); font-weight: 600; }
 /* The shell, last: a quiet row like the links above it. */
 .rail-links .ck-terminal-item { align-self: stretch; margin: 0; border-radius: var(--r-sm); font-size: 12.5px; }
 .rail-links .ck-terminal-open { padding: 5px 6px 5px 4px; }
@@ -926,25 +950,21 @@ a.git-repo-name:hover { color:var(--accent); }
 .ck-agent .ck-stop { width: 18px; height: 18px; border-radius: 999px; }
 .conversation-presence.queued .presence-dot { background: transparent; box-shadow: inset 0 0 0 1.5px var(--ink-3); }
 .ck-switch { width: auto; max-width: 220px; }
-/* Delegated and forked work, branches and widgets: the same objects as
-   elsewhere, flattened into rail sections. */
-.tp-rail .subtasks, .tp-rail .agent-forks { margin: 0; border: 0; border-top: 1px solid var(--line); border-radius: 0; box-shadow: none; background: transparent; }
-.tp-rail .subtasks-head, .tp-rail .agent-forks-head { align-items: center; padding: 12px 16px 6px; }
-.tp-rail .subtasks-kicker, .tp-rail .agent-forks-kicker { display: none; }
-.tp-rail .subtasks h3, .tp-rail .agent-forks h3 { color: var(--ink-3); font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; }
-.tp-rail .subtasks-count, .tp-rail .agent-forks-count { font-size: 11px; }
-.tp-rail .subtasks-count strong { font-size: 11px; }
-.tp-rail .subtasks-progress { margin: 0 16px 4px; }
-.tp-rail .subtask-list, .tp-rail .fork-tree { padding: 0 8px 6px; }
-.tp-rail .subtask-row { grid-template-columns: auto minmax(0, 1fr) auto; gap: 10px; min-height: 0; padding: 7px 8px; border-top: 0; }
-.tp-rail .subtask-pipeline { display: none; }
-.tp-rail .fork-row { min-height: 0; padding: 7px 8px; border-top: 0; }
-.tp-rail .subtask-arrow, .tp-rail .fork-arrow { font-size: 16px; }
-.tp-rail > .rail-inner > .section-h { margin: 0; padding: 12px 16px 6px; border-top: 1px solid var(--line); }
-.tp-rail .checkout-list { margin: 0 16px 8px; padding: 6px 10px; }
-.tp-rail .checkout-row { flex-wrap: wrap; font-size: 12px; }
-.tp-rail .checkout-row .mono { display: none; }
+/* Delegated and forked work and branches: rail sections whose rows open the
+   task; each row's chip is its status, as in the task list. */
+.subtask-list, .fork-tree { margin: 0 -8px; }
+.rail-count { color: var(--ink-3); font-weight: 500; letter-spacing: 0; font-variant-numeric: tabular-nums; }
+.rail-warn { color: var(--danger); }
+.checkout-target { color: var(--ink-3); }
+.checkout-row > .chip { margin-left: auto; }
+.tp-rail .checkout-row { flex-wrap: wrap; gap: 6px 10px; font-size: 12px; }
 .rail-widgets .task-sub { flex-wrap: wrap; font-size: 12px; }
+details.rail-widgets > summary { cursor: pointer; list-style: none; margin: 0; }
+details.rail-widgets > summary::-webkit-details-marker { display: none; }
+details.rail-widgets > summary::after { content: '›'; margin-left: auto; font-size: 15px; line-height: 1; letter-spacing: 0; transition: transform .15s; }
+details.rail-widgets[open] > summary { margin-bottom: 6px; }
+details.rail-widgets[open] > summary::after { transform: rotate(90deg); }
+.rail-count { font-weight: 600; color: var(--ink-2); letter-spacing: 0; }
 .rail-widgets .wk-title { margin-top: 4px !important; }
 
 .review-info iframe { display: block; width: 100%; height: 360px; margin-top: 8px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
@@ -976,7 +996,7 @@ a.git-repo-name:hover { color:var(--accent); }
 }
 .tf-head { background: var(--surface); border-bottom: 1px solid var(--line); padding: 12px 0; }
 .tf-head-inner, .tf-foot-inner, .tf-columns { max-width: 1120px; margin: 0 auto; padding: 0 28px; }
-.tf-head-inner { display: flex; align-items: center; gap: 10px; }
+.tf-head-inner { display: flex; align-items: center; gap: 8px 10px; }
 .tf-head h2 { margin: 0; font-size: 17px; letter-spacing: -0.01em; white-space: nowrap; }
 .tf-crumb { color: var(--ink-3); font-size: 13px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* The save note, template and workflow sit at the end; the group (not the
@@ -1026,7 +1046,12 @@ a.git-repo-name:hover { color:var(--accent); }
   .tf-side { margin-top: 10px; border-top: 1px solid var(--line); }
   .tf-foot .tf-hint { display: none; }
 }
-@media (max-width: 720px) { .task-form-page { left: 0; } } /* the rail is hidden */
+@media (max-width: 720px) {
+  .task-form-page { left: 0; } /* the rail is hidden */
+  /* A phone: the template and workflow wrap under the title, never off-screen. */
+  .tf-head-inner { flex-wrap: wrap; }
+  .tf-head .tf-crumb { display: none; }
+}
 
 /* Chat view: a chat-style pane — the thread scrolls, the compose box stays put.
    Its agents and the terminal are picked in the details rail. */
@@ -1058,6 +1083,12 @@ a.git-repo-name:hover { color:var(--accent); }
 .ck-pane-head { display: flex; align-items: center; gap: 10px; padding: 6px 20px; min-height: 40px; box-sizing: border-box; border-bottom: 1px solid var(--line); background: var(--surface); flex-wrap: wrap; }
 .ck-tools { display: inline-flex; align-items: center; gap: 2px; margin-right: -6px; }
 .ck-tools .tool-sep { width: 1px; height: 16px; margin: 0 4px; background: var(--line); }
+/* A phone: the tools as icons (each names itself in its tooltip), one line. */
+@media (max-width: 700px) {
+  .ck-tools .tool-label { display: none; }
+  .ck-tools .btn.tool { width: 32px; padding: 0; justify-content: center; }
+  .ck-pane-head { padding: 4px 12px; }
+}
 /* min-height:0 lets the thread SHRINK below its content (a flex item's default
    min-height is the content size) — without it a long conversation grows the
    pane instead of scrolling, pushing the compose box off-screen. */
@@ -1099,92 +1130,34 @@ a.git-repo-name:hover { color:var(--accent); }
 .section-h { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink-3); font-weight: 600; margin: 18px 0 8px; }
 .section-h:first-child { margin-top: 0; }
 
-/* Delegated work is one composed object, not a loose list of ids. The panel gives
-   the parent an at-a-glance answer to three questions: what was delegated, where
-   is each piece, and how close is the group to returning. */
-.subtasks {
-  margin: 24px 0 4px; overflow: hidden;
-  border: 1px solid var(--line); border-radius: 14px;
-  background: var(--surface); box-shadow: 0 1px 2px rgba(20, 24, 34, .035);
-}
-.subtasks-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; padding: 18px 20px 13px; }
-.subtasks-kicker { margin-bottom: 2px; color: var(--ink-3); font-size: 10px; font-weight: 650; letter-spacing: .09em; text-transform: uppercase; }
-.subtasks h3 { margin: 0; font-size: 17px; line-height: 1.25; letter-spacing: -.015em; }
-.subtasks-count { color: var(--ink-3); font-size: 12px; white-space: nowrap; }
-.subtasks-count strong { color: var(--ink); font-size: 15px; font-weight: 650; }
-.subtasks-progress { height: 3px; margin: 0 20px 5px; overflow: hidden; border-radius: 999px; background: var(--line); }
-.subtasks-progress > span { display: block; width: var(--subtask-progress); height: 100%; border-radius: inherit; background: var(--merged); transition: width .25s ease; }
-.subtask-list { padding: 0 8px 8px; }
-.subtask-row {
-  appearance: none; width: 100%; display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto;
-  align-items: center; gap: 13px; min-height: 64px; padding: 10px 12px;
-  border: 0; border-top: 1px solid var(--line); border-radius: 8px;
+.subtask-row, .fork-row {
+  appearance: none; width: 100%; display: grid; grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center; gap: 10px; padding: 6px 8px;
+  border: 0; border-radius: 8px;
   background: transparent; color: var(--ink); text-align: left; text-decoration: none; cursor: pointer;
   transition: background .12s, transform .04s;
 }
-.subtask-row:first-child { border-top-color: transparent; }
-.subtask-draft { display: flex; align-items: center; gap: 8px; border-top: 1px solid var(--line); }
-.subtask-draft:first-child { border-top-color: transparent; }
-.subtask-draft > .subtask-row { flex: 1; min-width: 0; border-top: 0; }
+.subtask-draft { display: flex; align-items: center; gap: 8px; }
+.subtask-draft > .subtask-row { flex: 1; min-width: 0; }
 .subtask-draft > .btn { flex: none; margin-right: 8px; }
-.subtask-row:hover { background: var(--surface-2); }
-.subtask-row:active { transform: translateY(1px); }
-.subtask-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-.subtask-state { width: 10px; height: 10px; border-radius: 50%; background: var(--ink-3); box-shadow: 0 0 0 4px var(--surface-2); }
-.subtask-state.active { background: var(--accent); box-shadow: 0 0 0 4px var(--accent-weak); animation: pulse 1.4s ease-in-out infinite; }
-.subtask-state.waiting { background: var(--working); box-shadow: 0 0 0 4px var(--working-weak); }
-.subtask-state.blocked, .subtask-state.failed { background: var(--danger); box-shadow: 0 0 0 4px var(--danger-weak); }
-.subtask-state.done { background: var(--merged); box-shadow: 0 0 0 4px var(--merged-weak); }
-.subtask-identity { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
-.subtask-title { min-width: 0; display: flex; align-items: baseline; gap: 7px; }
-.subtask-title strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 600; }
-.subtask-title .task-num { flex: none; font-size: 11px; }
-.subtask-copy { color: var(--ink-3); font-size: 11px; }
-.subtask-copy .chip, .fork-state .chip { margin-left: 4px; padding: 0 6px; font-size: 10px; line-height: 16px; }
-.subtask-pipeline .pipeline .seg { width: 16px; height: 4px; }
-.subtask-pipeline .pipeline .ponr { width: 7px; height: 7px; }
-.subtask-arrow { color: var(--ink-3); font-size: 20px; line-height: 1; transition: transform .12s, color .12s; }
-.subtask-row:hover .subtask-arrow { color: var(--accent); transform: translateX(2px); }
-
-/* Forks belong to conversations rather than the workflow's parent/sub-task
-   control flow. Their nested list keeps that distinction visible while using
-   the same task-state language and full-row navigation as delegated work. */
-.agent-forks {
-  margin: 24px 0 4px; overflow: hidden;
-  border: 1px solid var(--line); border-radius: 14px;
-  background: var(--surface); box-shadow: 0 1px 2px rgba(20, 24, 34, .035);
-}
-.agent-forks-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; padding: 18px 20px 10px; }
-.agent-forks-kicker { margin-bottom: 2px; color: var(--ink-3); font-size: 10px; font-weight: 650; letter-spacing: .09em; text-transform: uppercase; }
-.agent-forks h3 { margin: 0; font-size: 17px; line-height: 1.25; letter-spacing: -.015em; }
-.agent-forks-count { color: var(--ink-3); font-size: 12px; white-space: nowrap; }
-.fork-tree { list-style: none; margin: 0; padding: 0 8px 8px; }
-.fork-tree .fork-tree { margin: 0 0 0 28px; padding: 0 0 0 14px; border-left: 1px solid var(--line); }
+.subtask-row:hover, .fork-row:hover { background: var(--surface-2); }
+.subtask-row:active, .fork-row:active { transform: translateY(1px); }
+.subtask-row:focus-visible, .fork-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.subtask-identity, .fork-identity { min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 3px; }
+.subtask-title, .fork-title { max-width: 100%; min-width: 0; display: flex; align-items: baseline; gap: 7px; }
+.subtask-title strong, .fork-title strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 600; }
+.subtask-title .task-num, .fork-title .task-num { flex: none; font-size: 11px; }
+.subtask-copy .chip, .fork-state .chip { padding: 0 6px; font-size: 10px; line-height: 16px; }
+.subtask-copy .chip + .chip, .fork-state .chip + .chip { margin-left: 4px; }
+.subtask-arrow, .fork-arrow { color: var(--ink-3); font-size: 16px; line-height: 1; transition: transform .12s, color .12s; }
+.subtask-row:hover .subtask-arrow, .fork-row:hover .fork-arrow { color: var(--accent); transform: translateX(2px); }
+/* Forks of forks nest under the task they were forked from. */
+.fork-tree { list-style: none; padding: 0; }
+.fork-tree .fork-tree { margin: 0 0 0 16px; padding: 0 0 0 8px; border-left: 1px solid var(--line); }
 .fork-tree-item { margin: 0; padding: 0; }
-.fork-row {
-  appearance: none; width: 100%; display: grid; grid-template-columns: auto minmax(0, 1fr) auto;
-  align-items: center; gap: 13px; min-height: 54px; padding: 8px 12px;
-  border: 0; border-top: 1px solid var(--line); border-radius: 8px;
-  background: transparent; color: var(--ink); text-align: left; text-decoration: none; cursor: pointer;
-  transition: background .12s, transform .04s;
-}
-.fork-tree > .fork-tree-item:first-child > .fork-row { border-top-color: transparent; }
-.fork-row:hover { background: var(--surface-2); }
-.fork-row:active { transform: translateY(1px); }
-.fork-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-.fork-identity { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
-.fork-title { min-width: 0; display: flex; align-items: baseline; gap: 7px; }
-.fork-title strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 600; }
-.fork-title .task-num { flex: none; font-size: 11px; }
-.fork-state { color: var(--ink-3); font-size: 11px; }
-.fork-arrow { color: var(--ink-3); font-size: 20px; line-height: 1; transition: transform .12s, color .12s; }
-.fork-row:hover .fork-arrow { color: var(--accent); transform: translateX(2px); }
 
 @media (max-width: 700px) {
   .tp-head > .tp-crumbs { padding-left: 28px; }
-  .subtask-pipeline { display: none; }
-  .subtask-row { grid-template-columns: auto minmax(0, 1fr) auto; }
-  .subtasks-head { align-items: center; }
 }
 
 /* thread — a reading surface (Gemini-like): the agent's answers are prose on
@@ -1225,6 +1198,20 @@ a.git-repo-name:hover { color:var(--accent); }
 .review-info-caption { white-space: pre-wrap; }
 .review-info .review-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin-top: 5px; }
 .review-info #review-action-out { max-height: 180px; overflow: auto; margin: 5px 0 0; }
+/* Review files: a gallery of thumbnails (images, videos) and file tiles. */
+.review-gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(148px, 1fr)); gap: 10px; width: 100%; margin: 4px 0 6px; }
+.review-tile { display: flex; flex-direction: column; gap: 6px; min-width: 0; padding: 0; border: 0; background: none; color: var(--ink); font: inherit; text-align: left; cursor: pointer; }
+.review-tile-media { position: relative; display: grid; place-items: center; aspect-ratio: 16 / 10; overflow: hidden;
+  border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); transition: border-color .15s, box-shadow .15s; }
+.review-tile:hover .review-tile-media, .review-tile:focus-visible .review-tile-media { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak); }
+.review-tile:focus-visible { outline: none; }
+.review-tile-media > img, .review-tile-media > video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.review-tile-file { color: var(--ink-3); font: 700 13px/1 var(--font-mono); letter-spacing: .06em; }
+.review-tile-play { position: relative; z-index: 1; display: grid; place-items: center; width: 34px; height: 34px; padding-left: 3px; border-radius: 50%;
+  background: rgb(0 0 0 / .55); color: #fff; font-size: 13px; }
+.review-tile-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; color: var(--ink-2); }
+.review-tile:disabled { opacity: .6; cursor: progress; }
+@media (max-width: 640px) { .review-gallery { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .msg time { color: var(--ink-3); font-size: 12px; line-height: 1.2; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .agent-activity time { color: currentColor; opacity: .58; font: 10px/1.2 var(--font-mono); white-space: nowrap; }
 
@@ -1390,6 +1377,8 @@ a.git-repo-name:hover { color:var(--accent); }
 .events { font-family: var(--font-mono); font-size: 12px; color: var(--ink-2); display: flex; flex-direction: column; gap: 3px; max-height: 240px; overflow-y: auto; }
 .events .ev { display: flex; gap: 8px; }
 .events .ev .t { color: var(--accent); flex: none; }
+.events.events-page { max-height: none; }
+.events .ev-task { flex: none; color: var(--ink-3); }
 
 /* advanced disclosure */
 details.advanced { margin-top: 18px; border-top: 1px dashed var(--line); padding-top: 12px; }
@@ -1552,8 +1541,6 @@ body:has(#tf-page, .ck-compose) .hosted-onboarding { display: none; }
 .ins-key { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
 .ins-key.w { background: var(--accent); }
 .ins-key.h { background: var(--working); }
-.ins-live { font-family: var(--font-mono); font-size: 11px; color: var(--ink-3); text-transform: uppercase; letter-spacing: .06em; }
-.ins-live i { width: 6px; height: 6px; border-radius: 50%; background: var(--merged); animation: pulse 2.4s ease-in-out infinite; }
 
 .ins-kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 12px; }
 .ins-kpi { border: 1px solid var(--line); border-radius: var(--r); background: var(--surface); padding: 12px 14px; min-width: 0; }
@@ -1568,13 +1555,13 @@ body:has(#tf-page, .ck-compose) .hosted-onboarding { display: none; }
 .ins-col { display: flex; flex-direction: column; min-width: 0; }
 .ins-card { padding: 14px 16px; min-width: 0; }
 .ins-card-h { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; min-height: 26px;
-  font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--ink-3); font-weight: 600; }
+  font-size: 13px; color: var(--ink); font-weight: 600; }
 .ins-count { font-family: var(--font-mono); font-size: 12px; color: var(--ink-2); letter-spacing: 0; }
-.ins-more { text-transform: none; letter-spacing: 0; font-weight: 500; font-size: 12px; color: var(--ink-3); text-decoration: none; }
+.ins-more { font-weight: 500; font-size: 12px; color: var(--ink-3); text-decoration: none; }
 .ins-more:hover { color: var(--accent); }
 .ins-empty { font-size: 12px; color: var(--ink-3); padding: 4px 0; }
 
-.ins-chart .ins-card-h { text-transform: none; letter-spacing: 0; font-weight: 500; flex-wrap: wrap; }
+.ins-chart .ins-card-h { font-weight: 500; font-size: 12px; color: var(--ink-3); flex-wrap: wrap; }
 .ins-plot { position: relative; height: 188px; }
 .ins-svg { display: block; overflow: visible; touch-action: pan-y; }
 .ins-svg .grid { stroke: var(--line); stroke-width: 1; }
@@ -1613,6 +1600,8 @@ a.ins-task-title:hover { color: var(--accent); }
 .ins-table th { text-align: left; font-weight: 500; color: var(--ink-3); padding: 0 0 6px; font-size: 11px; }
 .ins-table td { padding: 5px 0; border-top: 1px solid var(--line); vertical-align: middle; }
 .ins-table .num { text-align: right; font-family: var(--font-mono); width: 64px; }
+.ins-table th.num { font-family: var(--font-ui); }
+.ins-table .ins-time-col { width: 76px; }
 .ins-table th.ins-spark-col { width: 80px; }
 .ins-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ins-name a { color: var(--ink); text-decoration: none; font-weight: 550; }
@@ -1637,8 +1626,7 @@ a.ins-task-title:hover { color: var(--accent); }
 .ins-quota-bar.crit i { background: var(--danger); }
 .ins-quota-reset { font-family: var(--font-mono); text-align: right; }
 
-.ins-start { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; padding: 20px; }
-.ins-start p { margin: 2px 0 0; color: var(--ink-2); font-size: 13px; }
+.ins-start { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; padding: 12px 16px; color: var(--ink-3); font-size: 13px; }
 .ins-skeleton { height: 118px; background: linear-gradient(90deg, var(--surface) 0%, var(--surface-2) 50%, var(--surface) 100%); }
 @media (prefers-reduced-motion: no-preference) {
   .ins-enter .ins-node-bar { transform-origin: left; animation: ins-grow .6s cubic-bezier(.2, .7, .2, 1) both; }
@@ -1777,6 +1765,7 @@ a.ins-task-title:hover { color: var(--accent); }
 .github-account-actions { justify-content: flex-end; flex-wrap: wrap; }
 .github-account-row .icon-btn svg { width: 15px; height: 15px; }
 .github-org-actions { flex-wrap: wrap; }
+.github-org-actions > .setting-rows { flex: 1; }
 .git-identity-dialog { width: min(480px, calc(100vw - 28px)); }
 .git-identity-dialog textarea { width: 100%; resize: vertical; }
 @media (max-width: 560px) {
@@ -1814,6 +1803,10 @@ a.ins-task-title:hover { color: var(--accent); }
   display: flex; align-items: center; justify-content: center; font-size: 12px;
 }
 .combo-caret:hover { color: var(--ink); }
+/* An audience box reads by name until it is focused (audienceComboHtml). */
+.audience-face { display: none; position: absolute; inset: 0 30px 0 0; align-items: center; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--ink); pointer-events: none; }
+.audience-combo:not(:focus-within) > input.has-face { color: transparent; }
+.audience-combo:not(:focus-within) > input.has-face + .audience-face { display: block; line-height: normal; align-content: center; }
 .combo-menu {
   position: absolute; top: calc(100% + 3px); left: 0; right: 0; z-index: 70;
   max-height: 220px; overflow: auto; background: var(--surface);
@@ -2405,8 +2398,10 @@ html[data-theme="dark"] .github-signin-btn:active,
   .topbar { gap: 8px; padding-left:max(10px, env(safe-area-inset-left)); padding-right:max(10px, env(safe-area-inset-right)); }
   .mobile-menu { display:grid; flex:none; }
   .topbar .brand { font-size:0; gap:0; }
+  .topbar-context { display:block; margin-left:-4px; }
+  .tab-wide { display:none; }
+  .tab-narrow { display:inline; }
   #rail-help, .topbar .key-echo { display:none; } /* no keyboard to list or echo shortcuts for */
-  .topbar-user { max-width:84px; padding:0 9px; }
   .body { grid-template-columns: 1fr; }
   .rail {
     display:flex; position:fixed; z-index:80; left:0; top:52px; bottom:0;
@@ -2470,12 +2465,7 @@ html[data-theme="dark"] .github-signin-btn:active,
 .cred-drag { cursor: grab; color: var(--ink-3); user-select: none; font-size: 11px; line-height: 1; }
 .cred-drag:active { cursor: grabbing; }
 .cred-label { white-space: nowrap; }
-.cred-toggle {
-  font-size: 10px; font-weight: 700; padding: 0 7px; border-radius: 999px;
-  cursor: pointer; border: 1px solid var(--line); text-transform: uppercase; flex: none;
-}
-.cred-toggle.on { background: var(--accent); color: #fff; border-color: transparent; }
-.cred-toggle.off { background: transparent; color: var(--ink-3); }
+.cred-row .info-dot { margin-left: -2px; }
 .cred-mode {
   max-width: 108px; height: 22px; padding: 0 20px 0 7px; border: 1px solid var(--line);
   border-radius: 999px; background: var(--surface); color: var(--ink-2);
@@ -2704,7 +2694,6 @@ html[data-theme="dark"] .github-signin-btn:active,
   background: var(--surface); color: var(--ink); font-family: var(--font-mono); font-size: 13px; text-align: center;
 }
 .cron-cell input:focus { border-color: var(--accent); outline: none; }
-.cron-cell small { color: var(--ink-3); font-size: 10px; }
 
 /* ── Repeatable series + runs (task list) ─────────────────────────────────── */
 .series-row .series-caret { margin-right: 2px; color: var(--ink-3); }
@@ -2727,7 +2716,7 @@ html[data-theme="dark"] .github-signin-btn:active,
   grid-column: 1 / -1; display: flex; align-items: center; gap: 6px; width: max-content;
   font-size: 12px; font-weight: 600; color: var(--ink-2); cursor: pointer;
 }
-.triggers-block .tb-repeat input { width: auto; margin: 0; padding: 0; }
+.triggers-block .tb-repeat input:not(.toggle) { width: auto; margin: 0; padding: 0; }
 /* On event: the type, then its conditions and what a repeat does. */
 .ev-trigger { display:flex; flex-direction:column; gap:6px; min-width:0; }
 .ev-trigger #ev-type, .ev-cond input, .ev-more #ev-key { padding:6px 9px; background:var(--surface); font-family:var(--mono, ui-monospace, monospace); font-size:12.5px; }
@@ -2764,7 +2753,6 @@ html[data-theme="dark"] .github-signin-btn:active,
 .prompt-field > .wiki-ref-editor > textarea { border: none; background: transparent; outline: none; box-shadow: none; resize: vertical; width: 100%; padding: 9px 12px; }
 .prompt-field > .img-chips { margin: 0; padding: 0 10px 9px; }
 .prompt-attach-row { display: flex; align-items: center; gap: 9px; padding: 0 12px 8px; color: var(--ink-3); font-size: 11px; }
-.prompt-attach-row > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .attach-file-button {
   display: inline-flex; flex: none; align-items: center; width: max-content; cursor: pointer;
   color: var(--accent); font-size: 12px; font-weight: 600;
@@ -2774,11 +2762,17 @@ html[data-theme="dark"] .github-signin-btn:active,
 .attach-file-button:focus-within { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 2px; }
 /* The prompt's clean bottom row: the "wiki context" field — no border, just a
    faint hairline separating it from the prompt text above. */
-.prompt-context-row { display: flex; align-items: baseline; gap: 8px; padding: 6px 12px 8px; border-top: 1px solid color-mix(in srgb, var(--line) 55%, transparent); }
-.prompt-context-row .pc-prefix { flex: none; font-size: 10.5px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; color: var(--ink-3); cursor: default; user-select: none; padding-top: 2px; }
-.prompt-context { flex: 1; border: none; background: transparent; outline: none; box-shadow: none; resize: none; overflow: hidden; width: 100%; padding: 1px 0; font-family: var(--font-mono); font-size: 12px; line-height: 1.5; color: var(--accent); }
+.prompt-context-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; padding: 6px 12px 8px; border-top: 1px solid color-mix(in srgb, var(--line) 55%, transparent); }
+.prompt-context-row .pc-prefix { flex: none; font-size: 11.5px; font-weight: 600; color: var(--ink-3); cursor: default; user-select: none; }
+.prompt-context-row > .info-dot { margin-left: -4px; }
+.pc-chips { display: contents; }
+.pc-chip { display: inline-flex; align-items: center; gap: 2px; max-width: 100%; padding: 1px 2px 1px 8px; border-radius: 999px; background: var(--accent-weak); color: var(--accent); font-size: 12px; line-height: 18px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pc-chip-x { width: 18px; height: 18px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: inherit; font-size: 14px; line-height: 1; cursor: pointer; opacity: .7; }
+.pc-chip-x:hover, .pc-chip-x:focus-visible { opacity: 1; background: color-mix(in srgb, var(--accent) 16%, transparent); }
+.prompt-context { flex: 1; min-width: 80px; border: none; background: transparent; outline: none; box-shadow: none; resize: none; overflow: hidden; width: 100%; padding: 1px 0; font-family: var(--font-mono); font-size: 12px; line-height: 1.5; color: var(--accent); }
 .prompt-context::placeholder { color: var(--ink-3); font-family: var(--font-sans, inherit); }
-.prompt-context-row > .wiki-ref-editor { flex: 1; }
+.form-row .prompt-context-row textarea.prompt-context { min-height: 0; border: 0; border-radius: 0; padding: 1px 0; background: transparent; box-shadow: none; }
+.prompt-context-row > .wiki-ref-editor { flex: 1; min-width: 80px; }
 .form-row .prompt-field { background: var(--surface-2); }
 
 /* Wiki-reference editor: the textarea remains the sole editable control while
@@ -2895,6 +2889,10 @@ html[data-theme="dark"] .github-signin-btn:active,
 @media (max-width: 700px) {
   .organizer-row { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; }
   .organizer-row .views-bar, .organizer-row .query-bar { flex-wrap: nowrap; }
+  /* More chips past an edge: that edge fades (wireScrollFade). */
+  .organizer-row.fade-end { -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 36px), transparent); mask-image: linear-gradient(to right, #000 calc(100% - 36px), transparent); }
+  .organizer-row.fade-start { -webkit-mask-image: linear-gradient(to left, #000 calc(100% - 36px), transparent); mask-image: linear-gradient(to left, #000 calc(100% - 36px), transparent); }
+  .organizer-row.fade-start.fade-end { -webkit-mask-image: linear-gradient(to right, transparent, #000 36px, #000 calc(100% - 36px), transparent); mask-image: linear-gradient(to right, transparent, #000 36px, #000 calc(100% - 36px), transparent); }
 }
 
 .views-bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 8px 0 4px; }
@@ -3048,6 +3046,7 @@ html[data-theme="dark"] .github-signin-btn:active,
   border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--line));
   border-radius: 999px; background: var(--surface-2); color: var(--ink-2);
   font: inherit; font-size: 11px; font-weight: 600; cursor: pointer;
+  field-sizing: content; /* the pill hugs its label, not its longest move */
 }
 .stage-picker select:hover { border-color: var(--accent); color: var(--ink); }
 .stage-picker select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
@@ -3118,11 +3117,63 @@ html[data-theme="dark"] .github-signin-btn:active,
 .proc-table .proc-task:hover { color: var(--accent); border-color: var(--accent); }
 .proc-table .proc-lock { opacity: .55; cursor: help; font-size: 11px; }
 .proc-table .proc-kill { white-space: nowrap; }
+/* ── Installation cards: one setting per row (instRow), folds, copyable URLs ── */
+.inst-url { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 12px/1.4 var(--font-mono); color: var(--ink-2); }
+.tip-chip.info-dot { width: auto; height: auto; padding: 3px 8px; border: 1px solid var(--line); font-size: 11px; line-height: 14px; font-weight: 600; cursor: help; }
+.tip-chip.info-dot.waiting, .tip-chip.info-dot.failed, .tip-chip.info-dot.done { border-color: transparent; }
+.inst-h { display: flex; align-items: center; gap: 6px; margin-top: 22px; }
+.inst-fold > summary { display: flex; align-items: center; gap: 8px; min-height: 44px; cursor: pointer; list-style: none; color: var(--ink-2); font-size: 12.5px; }
+.inst-fold > summary::-webkit-details-marker { display: none; }
+.inst-fold > summary::before { content: '›'; width: 10px; color: var(--ink-3); font-size: 16px; line-height: 1; transition: transform .12s; }
+.inst-fold[open] > summary::before { transform: rotate(90deg); }
+.inst-fold > .setting-rows { border-top: 1px solid var(--line); }
+.inst-checklist { border-bottom: 1px solid var(--line); }
+.inst-checklist[open] { padding-bottom: 8px; }
+.inst-steps { margin: 0 0 12px; padding-left: 20px; color: var(--ink-2); font-size: 12.5px; line-height: 1.6; }
+.inst-steps code { overflow-wrap: anywhere; font-size: 11.5px; }
+.inst-group { margin: 10px 0 2px; color: var(--ink-3); font-size: 11.5px; font-weight: 600; }
+.inst-check { display: flex; align-items: center; gap: 8px; min-height: 30px; font-size: 13px; cursor: pointer; }
+.inst-check > input { flex: none; margin: 0; accent-color: var(--accent); }
+.inst-check > a { color: var(--ink-3); text-decoration: none; }
+.inst-check > a:hover { color: var(--accent); }
+.inst-save { display: flex; justify-content: flex-end; align-items: center; margin-top: 14px; }
+.setting-value > textarea.setting-input { resize: vertical; font: inherit; }
+.setting-value > .setting-input:is(.host-capacity-input, #oe-port) { max-width: 96px; }
+.installation-settings .setting-label { width: 172px; }
+.oe-links { display: inline-flex; flex-wrap: wrap; gap: 4px 10px; font-size: 12px; }
+.phone-access-card .setting-rows + .phone-setup { margin-top: 8px; }
+.phone-access-card .inst-fold { border-top: 1px solid var(--line); }
+.phone-access-card .inst-fold .phone-steps { margin-top: 0; }
+.phone-detail { margin: 0 0 10px; color: var(--ink-2); font-size: 12px; }
+.health-gate { margin: 8px 0 0; font-size: 12.5px; }
+.proc-toggle { display: inline-flex; align-items: center; gap: 6px; padding: 0; border: 0; background: none; color: inherit; font: inherit; cursor: pointer; }
+.proc-toggle::before { content: '›'; width: 8px; color: var(--ink-3); font-size: 15px; line-height: 1; transition: transform .12s; }
+.proc-toggle[aria-expanded="true"]::before { transform: rotate(90deg); }
+.proc-foot { padding: 8px 12px; color: var(--ink-3); }
+.erasure-item { margin: 12px 0; padding-top: 10px; border-top: 1px solid var(--line); }
+.erasure-item > p { margin: 0 0 4px; font-size: 13px; }
+.computer-providers + .managed-off { margin-top: 8px; border-top: 1px solid var(--line); }
+.managed-off > summary { min-height: 32px; }
+.managed-off[open] > .computer-providers { margin-bottom: 4px; }
+.installation-settings .card > .setting-rows.ruled:first-child { border-top: 0; margin-top: -6px; }
+@media (max-width: 560px) {
+  .installation-settings .setting-label { width: 100%; }
+  :is(.installation-settings, .profile-page) .setting-row:has(> .setting-value:empty) > .setting-label { width: auto; flex: 1; }
+  :is(.installation-settings, .profile-page) .setting-row > .setting-value:empty { display: none; }
+  /* The urgency grid fits a phone instead of scrolling sideways with no hint. */
+  .profile-page .notify-row { grid-template-columns: 58px repeat(4, minmax(38px, 1fr)) auto; gap: 6px; }
+  .profile-page .notify-head { font-size: 9.5px; letter-spacing: 0; }
+}
 
 /* ── wiki (org/project skills, memories, prompts) ─────────────────────────── */
 .wiki-nav { max-height: calc(100vh - 140px); overflow-y: auto; }
-.wiki-nav .wiki-sec { color: var(--ink-3); font-size: 11px; font-weight: 650; letter-spacing: .04em; padding: 7px 10px 2px; }
+.wiki-nav .wiki-sec { color: var(--ink-3); font-size: 12px; font-weight: 600; letter-spacing: 0; text-transform: none; padding: 7px 10px 2px; }
 .wiki-nav a { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* A phone's nav is one scrolling row: the button sits in it like the links. */
+@media (max-width: 850px) {
+  .wiki-nav .wiki-new { flex: none; align-self: center; margin: 0 4px 0 0; }
+  .wiki-nav a { flex: none; overflow: visible; } /* the row scrolls; names stay whole */
+}
 .wiki-page .settings-section-title .chip { vertical-align: 3px; margin-left: 6px; }
 .wiki-view-picker { display: flex; align-items: center; gap: 8px; color: var(--ink-3); font-size: 11.5px; }
 .wiki-view-picker select {
@@ -3133,6 +3184,19 @@ html[data-theme="dark"] .github-signin-btn:active,
 .wiki-md { font-size: 13px; line-height: 1.55; }
 .wiki-uncond .wiki-uncond-head { display: flex; align-items: center; gap: 9px; margin-bottom: 10px; padding-bottom: 9px; border-bottom: 1px solid var(--line); }
 .wiki-uncond .wiki-uncond-head b { font-size: 14px; letter-spacing: -.01em; }
+.wiki-uncond .wiki-uncond-head .info-dot { margin-left: -4px; }
+/* The Index's always-included entries: one folded row each. */
+.wiki-always .wiki-uncond-head { margin-bottom: 0; }
+.wiki-always-row { border-bottom: 1px solid var(--line); }
+.wiki-always-row:last-child { border-bottom: 0; margin-bottom: -6px; }
+.wiki-always-row > summary { display: flex; align-items: baseline; gap: 10px; min-width: 0; padding: 9px 0; cursor: pointer; list-style: none; }
+.wiki-always-row > summary::-webkit-details-marker { display: none; }
+.wiki-always-row > summary::before { content: '▸'; flex: none; color: var(--ink-3); font-size: 11px; transition: transform .15s; }
+.wiki-always-row[open] > summary::before { transform: rotate(90deg); }
+.wiki-always-name { flex: none; font-size: 13px; font-weight: 550; color: var(--ink); }
+.wiki-always-desc { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; color: var(--ink-3); }
+.wiki-always-row > .wiki-md { padding: 0 0 10px 19px; }
+.wiki-always-foot { margin: 0 0 12px 19px; }
 
 /* The path-as-title control: parent sections shrink, the stem is the title. */
 .wiki-title-row { display: flex; align-items: baseline; gap: 12px; margin: 0 0 4px; }
@@ -3363,8 +3427,7 @@ html[data-theme="dark"] .github-signin-btn:active,
 .tf-avatar .form-row { display: flex; flex-direction: column; gap: 10px; padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); }
 .tf-avatar-line { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; }
 .tf-avatar-toggle { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; color: var(--ink-2); cursor: pointer; }
-.tf-avatar-toggle input { width: auto; margin: 0; padding: 0; }
-.tf-avatar-hint { font-weight: 400; color: var(--ink-3); }
+.tf-avatar-toggle input:not(.toggle) { width: auto; margin: 0; padding: 0; }
 .risk-chip { display: inline-flex; align-items: center; padding: 1px 7px; border-radius: 999px; background: var(--danger-weak); color: var(--danger); font-size: 11px; font-weight: 700; white-space: nowrap; }
 .tf-avatar-options { display: grid; grid-template-columns: max-content minmax(0, 1fr); align-items: center; gap: 10px 14px; }
 .tf-avatar-options .tb-label { font-size: 12px; font-weight: 600; color: var(--ink-2); }
@@ -3409,19 +3472,28 @@ html[data-theme="dark"] .github-signin-btn:active,
 .artifact-pdf .artifact-reader-content, .artifact-page .artifact-reader-content { padding: 0; overflow: hidden; }
 .artifact-reader-content > iframe { display: block; width: 100%; height: calc(100dvh - 120px); border: 0; background: #fff; }
 .artifact-reader-content > .artifact-error { margin: 0; padding: 20px; color: var(--ink); }
+.artifact-reader-tools:empty { display: none; }
+.artifact-reader-tools { display: contents; }
+.artifact-reader-steps { display: inline-flex; align-items: center; gap: 4px; }
+.artifact-reader-steps .btn.icon { width: 30px; padding: 4px 0; font-size: 17px; line-height: 1; }
+.artifact-reader-count { min-width: 44px; text-align: center; font-size: 12px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.artifact-gallery { width: min(1100px, calc(100vw - 32px)); }
 
 .authz-editor .authz-description { margin: 0; line-height: 1.45; }
 .authz-warning { display: flex; align-items: center; gap: 6px; margin: 6px 0 0; padding: 6px 10px; border-radius: 8px;
   background: var(--danger-weak); color: var(--danger); font-size: 13px; font-weight: 600; line-height: 1.4; }
 .authz-warning[hidden] { display: none; }
 .authz-warning .info-dot { color: inherit; }
-.authorization-role { border-top: 1px solid var(--line); padding: 12px 0; }
+.authorization-role { border-top: 1px solid var(--line); padding: 8px 0; }
 .authorization-role > summary { display: list-item; cursor: pointer; }
 .authorization-role > summary .chip { margin-left: 8px; }
 .role-capability-group { margin: 8px 0 8px 12px; padding: 6px 0; }
 .role-capability-group > summary { cursor: pointer; }
 .role-capability-group ul { list-style: none; margin: 8px 0; padding-left: 16px; border-left: 1px solid var(--line); }
-.role-capability-group li { padding: 6px 0; overflow-wrap: anywhere; }
+.role-capability-group li { display: flex; align-items: center; gap: 6px; padding: 6px 0; overflow-wrap: anywhere; }
+.roles-fold[open] > summary { margin-bottom: 8px; }
+.role-capability-group li b { font-weight: 500; }
+.role-capability-group > summary .setting-muted { margin: 0 2px 0 4px; }
 .role-capability-group code { display: block; color: var(--ink-3); font-size: 11px; }
 .role-capability-group label { display: flex; align-items: center; gap: 8px; }
 .role-capability-group p { margin: 3px 0; }
@@ -3597,7 +3669,15 @@ html[data-theme="dark"] .github-signin-btn:active,
 .limits-label.info-dot { display: inline; width: auto; height: auto; border-radius: 0; background: none; color: inherit;
   font-size: inherit; line-height: inherit; text-align: left; cursor: help; }
 .limits-label.info-dot:hover { color: var(--ink); }
-.limits-source { margin-left: 3px; color: var(--ink-3); font: 10.5px/1.2 var(--font-mono); white-space: nowrap; cursor: help; }
+/* Unconnected services: one folded row with a count; inside, each says how to connect. */
+.limits-off-fold { border-top: 1px solid var(--line); }
+.limits-off-fold > summary { display: flex; align-items: center; gap: 8px; padding: 7px 0; cursor: pointer; list-style: none; font-size: 13px; line-height: 20px; font-weight: 600; color: var(--ink); }
+.limits-off-fold > summary::-webkit-details-marker { display: none; }
+.limits-off-fold > summary::before { content: '›'; width: 10px; color: var(--ink-3); font-size: 16px; line-height: 1; transition: transform .12s; }
+.limits-off-fold[open] > summary::before { transform: rotate(90deg); }
+.limits-off-fold > summary .setting-muted { font-weight: 400; }
+.limits-off-fold .limits-off { font-size: 12.5px; }
+.limits-link { font-weight: 600; }
 .limits-usage, .limits-actions { min-height: 20px; }
 .limits-usage { display: flex; align-items: center; gap: 8px; }
 .limits-bar { position: relative; flex: 1 1 auto; min-width: 48px; height: 6px; border-radius: 999px; background: var(--line); }
@@ -3739,9 +3819,16 @@ html[data-theme="dark"] .github-signin-btn:active,
 /* Responder and Review-route rows: kind · who on one line. */
 .route-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .route-row > select { flex: 0 0 auto; width: auto; }
+.route-row > .route-kind { flex: none; align-self: stretch; }
+.route-row > .route-kind > button { display: flex; align-items: center; }
 .route-row > .cf-human { flex: 1 1 auto; min-width: 0; }
 .route-row .cf-layer-num { font-size: 11px; color: var(--ink-3); min-width: 14px; text-align: right; }
 .route-row .cf-layer-tools { display: inline-flex; gap: 4px; margin-left: auto; }
+/* A phone puts a review step's people on their own line under its kind and tools. */
+@media (max-width: 560px) {
+  .cf-layer-head.route-row { flex-wrap: wrap; }
+  .cf-layer-head.route-row > .cf-human { order: 5; flex-basis: 100%; }
+}
 .cf-human[hidden], .cf-agent[hidden], .cf-empty[hidden] { display: none; }
 .confirmer-field .cf-layer { padding: 8px 10px; }
 .confirmer-field .cf-agent, .responder-field .cf-agent { margin-top: 8px; }
@@ -3827,7 +3914,14 @@ html[data-theme="dark"] .github-signin-btn:active,
 }
 
 /* ── Computers (Settings → Projects, Project → Computers) ── */
-.computer-providers { display: grid; gap: 8px; }
+.computer-providers { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; min-width: 0; }
+.computer-providers > :is(.computer-provider, .computer-any) { min-width: 0; flex-wrap: wrap; }
+.computer-add { position: relative; justify-self: start; }
+.computer-add > summary { list-style: none; }
+.computer-add > summary::-webkit-details-marker { display: none; }
+.computer-add-menu { position: absolute; z-index: 5; top: calc(100% + 4px); left: 0; display: grid; min-width: 180px; padding: 4px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); box-shadow: var(--shadow); }
+.computer-add-menu > .computer-provider { min-height: 0; padding: 7px 10px; border: 0; border-radius: 6px; background: none; color: var(--ink); font: inherit; font-size: 13px; text-align: left; cursor: pointer; }
+.computer-add-menu > .computer-provider:hover, .computer-add-menu > .computer-provider:focus-visible { background: var(--surface-2); }
 .computer-provider { display: flex; align-items: center; gap: 10px; min-height: 48px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); }
 .computer-provider > b { min-width: 72px; }
 /* What provider "Any" can choose among: a summary row above the accounts. */
@@ -4008,7 +4102,7 @@ input.toggle:disabled { opacity:.45; cursor:not-allowed; }
 .member-line .setting-value b { font-weight:600; }
 .wf-pin { min-width:150px; }
 /* A one-click action listed like the disclosures around it. */
-.action-row { display:flex; align-items:center; gap:16px; width:100%; padding:0; border:0; background:none; color:var(--ink); font:inherit; text-align:left; cursor:pointer; }
+.action-row { display:flex; align-items:center; justify-content:space-between; gap:16px; width:100%; padding:0; border:0; background:none; color:var(--ink); font:inherit; text-align:left; cursor:pointer; }
 .action-row::after { content:'›'; color:var(--ink-3); font-size:20px; }
 .action-row > span { margin-left:auto; color:var(--ink-3); font-size:12px; }
 .action-row:hover b { color:var(--accent); }
@@ -4078,10 +4172,13 @@ input.toggle:disabled { opacity:.45; cursor:not-allowed; }
 /* Task store rows (the Task store view and the default view's recommendations):
    ready-made tasks; a row opens the task form filled in from one. */
 .store-need { font-size: 12.5px; color: var(--ink-3); }
-.store-recs .task-group-heading { margin-top: 8px; font-size: 15px; }
+.store-recs .task-group-heading { margin-top: 22px; font-size: 15px; }
 .store-recs .task-group-heading a { color: inherit; text-decoration: underline; text-decoration-color: var(--line-strong); text-underline-offset: 3px; }
-.store-recs #store-recs-dismiss { margin-left: auto; align-self: center; }
+.store-recs #store-recs-dismiss { margin-left: auto; align-self: baseline; }
 .store-recs { margin-bottom: 24px; }
+.store-recs-more { display: flex; flex-wrap: wrap; gap: 4px 8px; padding: 6px 2px 0; font-size: 12.5px; color: var(--ink-3); }
+.store-recs-more a { color: var(--ink-2); text-decoration: none; }
+.store-recs-more a:hover { color: var(--accent); }
 
 /* ── Save state ─────────────────────────────────────────────────────────────
    One note for every form whose edits wait to be saved: beside its Save

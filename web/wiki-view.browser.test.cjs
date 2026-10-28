@@ -24,7 +24,7 @@ function decl(name) {
   return line[1];
 }
 
-const FUNCTIONS = ['wikiScopeInfo', 'wikiView', 'wikiViewOptionsHtml', 'loadWikiRefs', 'wikiUrl', 'wikiRead',
+const FUNCTIONS = ['wikiScopeInfo', 'wikiView', 'wikiViewOptionsHtml', 'wikiViewChoices', 'hasMath', 'loadWikiRefs', 'wikiUrl', 'wikiRead',
   'forgetWikiReads', 'paintWikiRead', 'openWikiEntry', 'wikiEnclosingEntry', 'wikiTreeHtml', 'wireWikiView',
   'wikiBody', 'renderWikiHome', 'renderWikiPage', 'policyTip', 'wireWikiLocalLinks', 'wikiRoute', 'wikiViewFromQuery', 'isNewTabClick', 'plainClick', 'wikiEntryHref', 'decodeRoutePart',
   'renderFlag', 'setMathjaxEnabled', 'mountMarkdownSurface', 'paintMarkdownSurface', 'texToggleHtml', 'wireTexToggles'];
@@ -99,6 +99,7 @@ const page = (p, body) => ({ page: { path: p, name: p, kind: 'skill', content: b
     await tab.evaluate(() => renderWiki());
     await tab.waitForSelector('#wiki-pane >> text=Main table of contents');
     await tab.waitForSelector('#wiki-view-select option[value="task:367"]', { state: 'attached' });
+    assert.equal(await tab.locator('.wiki-view-picker').isVisible(), true);
 
     // Choosing a task branch acts on the choice itself and gets its own URL.
     await tab.selectOption('#wiki-view-select', 'task:367');
@@ -150,6 +151,13 @@ const page = (p, body) => ({ page: { path: p, name: p, kind: 'skill', content: b
     await tab.waitForSelector('#wiki-pane >> text=Main table of contents');
     assert.equal(await tab.evaluate(() => location.hash), '');
 
+    // With nothing but the default branch there is no choice to show.
+    await tab.evaluate(() => {
+      S.wikiRefs = { p1: { data: { defaultBranch: 'main', branches: ['main'], tasks: [] }, at: Date.now() } };
+      history.replaceState({}, '', '/acme/app/wiki'); S.wikiView = ''; renderWiki();
+    });
+    assert.equal(await tab.locator('.wiki-view-picker').isVisible(), false);
+
     // The organization wiki shows edit controls only where the server says the
     // reader may edit: none for a developer; for an organization-wide maintainer,
     // ordinary pages but not the prompt-wide (`default`) ones.
@@ -165,10 +173,18 @@ const page = (p, body) => ({ page: { path: p, name: p, kind: 'skill', content: b
         history.replaceState({}, '', `/acme/wiki${entry ? `#${encodeURIComponent(entry)}` : ''}`);
         $('#main').innerHTML = wikiView(null); wireWikiView(null);
       }, { data: orgIndex(writable), entry, writable });
-      await tab.waitForSelector(entry ? '#wiki-pane >> text=Org notes body' : '#wiki-pane >> text=Everywhere body');
+      await tab.waitForSelector(entry ? '#wiki-pane >> text=Org notes body' : '#wiki-pane .wiki-always-name >> text=Everywhere');
     };
     await showOrg(false);
     assert.equal(await tab.locator('#wiki-new, .wiki-uncond-edit').count(), 0);
+    // Always-included entries are folded rows: the name, its text on opening.
+    assert.equal(await tab.locator('.wiki-always-row:not([open])').count(), 1);
+    assert.equal(await tab.locator('#wiki-pane >> text=Everywhere body').isVisible(), false);
+    await tab.click('.wiki-always-row > summary');
+    assert.equal(await tab.locator('#wiki-pane >> text=Everywhere body').isVisible(), true);
+    // No math, no TeX button; no chips explaining how agents read it.
+    assert.equal(await tab.locator('.tex-toggle').count(), 0);
+    assert.equal(await tab.locator('#wiki-pane .chip').count(), 0);
     await showOrg(false, 'notes/a');
     assert.equal(await tab.locator('#wiki-page-edit, #wiki-page-delete').count(), 0);
     assert.doesNotMatch(await tab.textContent('#wiki-pane'), /Read-only branch view/);

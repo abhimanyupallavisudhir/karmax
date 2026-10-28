@@ -19,7 +19,8 @@ function extractFn(name) {
 
 global.esc = (value) => String(value ?? '').replace(/[&<>"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[char]);
 eval(src.match(/^const usd = .*$/m)[0].replace('const usd', 'global.usd'));
-for (const name of ['currencyDigits', 'money', 'toMinorUnits', 'fromMinorUnits', 'spendRequestRow', 'readTaskPayments']) eval(`global.${name} = ${extractFn(name)}`);
+eval(src.match(/^const PAYMENT_STATUS_LABELS = [\s\S]*?};$/m)[0].replace('const PAYMENT_STATUS_LABELS', 'global.PAYMENT_STATUS_LABELS'));
+for (const name of ['currencyDigits', 'money', 'toMinorUnits', 'fromMinorUnits', 'paymentStatusLabel', 'spendRequestRow', 'readTaskPayments']) eval(`global.${name} = ${extractFn(name)}`);
 
 let pass = 0;
 let fail = 0;

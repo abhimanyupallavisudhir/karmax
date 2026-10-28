@@ -38,10 +38,10 @@ test('a row says why it waits on you, briefly, with the reason in its tooltip', 
   } } } });
   vm.runInContext([constant('ATTENTION_REASONS'), constant('HOLD_REASONS'), constant('PULL_REQUEST_REASONS'), fn('rowAsk'), fn('attentionChip')].join('\n'), ctx);
   const chip = (id, lastView = {}) => ctx.attentionChip({ id, lastView });
-  assert.match(chip('a'), />Review</);
+  assert.match(chip('a'), />Needs review</);
   assert.match(chip('a'), /title="Waiting for your review"/);
-  assert.match(chip('b'), />Input</);
-  assert.match(chip('c'), />Input</, 'an ask outranks a mention');
+  assert.match(chip('b'), />Needs input</);
+  assert.match(chip('c'), />Needs input</, 'an ask outranks a mention');
   assert.equal(chip('d'), '', 'a draft row already says it is a draft');
   assert.match(chip('e', { waitingFor: { kind: 'human', reason: 'error' } }), />Failed</);
   assert.equal(chip('zz'), '', 'an "Active" row has no reason');
@@ -58,7 +58,7 @@ test('a row whose pull request asks says so, and the task keeps its own status',
   const chip = (id) => ctx.attentionChip({ id, lastView: { stage: 'do', status: 'waiting', waitingFor: { kind: 'timer' } } });
   assert.match(chip('a'), />PR review</);
   assert.match(chip('a'), /title="The pull request for "pramana" waits for your review"/);
-  assert.match(chip('b'), />Review</, 'the task itself at Review reads as before');
+  assert.match(chip('b'), />Needs review</, 'the task itself at Review reads as before');
   assert.equal(ctx.rowAsk({ id: 'a' }).pullRequest, 'pramana');
   assert.equal(ctx.rowAsk({ id: 'b' }).pullRequest, undefined);
 });

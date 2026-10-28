@@ -5507,10 +5507,24 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     // The creator merges with the account pinned when the task was created.
     const creator = (await this.deps.store.taskCreatorUserId(task.id));
     const pinned = typeof task.params?._githubAccountId === 'string' ? task.params._githubAccountId : undefined;
-    const creatorCanMerge = Boolean(creator && (await canMergeAll(github, creator, repositories, pinned)));
+    // Someone who linked no GitHub account but whom tavya lets land work on the
+    // target has the App merge for them (`appLanding` in mergeGithubPrs); anyone
+    // who linked one is judged by GitHub. Pull requests from forks still need a
+    // GitHub user.
+    const target = view?.targetBranch || (typeof task.params?.target === 'string' ? task.params.target : '') || 'main';
+    const fromFork = (view?.prs ?? []).some((pr) => pr.state === 'open' && !pr.merged && pr.headRepository);
+    const landsThroughApp = async (userId: string) => {
+      if (fromFork || !this.deps.authorization) return false;
+      if ((await github.activeUserAccountId(userId).catch(() => undefined))
+        || (typeof github.hasLinkedUserAccount === 'function' && (await github.hasLinkedUserAccount(userId)))) return false;
+      return allows((await this.deps.authorization.capabilitiesAsync(`user:${userId}`, project.id, project.organizationId)), `merge-into:${target}`);
+    };
+    const mayMerge = async (userId: string, accountId?: string) =>
+      (await canMergeAll(github, userId, repositories, accountId)) || (await landsThroughApp(userId));
+    const creatorCanMerge = Boolean(creator && (await mayMerge(creator, pinned)));
     const callerUserId = caller.humanSubject?.userId;
     const canMerge = callerUserId && callerUserId === creator ? creatorCanMerge
-      : Boolean(callerUserId && (await canMergeAll(github, callerUserId, repositories)));
+      : Boolean(callerUserId && (await mayMerge(callerUserId)));
     const eligibleUserIds = (await mergeCapableUsers(github, (await this.deps.store.humanAudience(task.id, ['@project'])), repositories));
     return { taskId, required: true, repositories, pullRequests: shown, canMerge,
       blocked: !canMerge && !creatorCanMerge, eligibleUserIds, audience: eligibleUserIds.map((id) => `user:${id}`) };

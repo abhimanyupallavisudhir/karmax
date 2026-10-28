@@ -187,7 +187,7 @@ describe('confirming a merge you cannot make', () => {
   it('offers to send the Review to someone with merge access instead', async () => {
     const ui = await review(eligibility);
     await ui.page.locator('[data-act="confirm"]').click();
-    await expect.poll(() => dialog(ui).getByRole('heading').innerText()).toBe("You can't merge acme/site#7 on GitHub");
+    await expect.poll(() => dialog(ui).getByRole('heading').innerText()).toBe('Someone else needs to merge acme/site#7');
     await dialog(ui).getByRole('button', { name: 'Alert Lea Lead' }).click();
     await expect.poll(() => writes(ui).map((call) => call.path)).toEqual(['/api/tasks/t1/escalate']);
     expect(writes(ui)[0]!.body).toMatchObject({ audience: ['user:lead'], message: expect.stringMatching(/merge/i) });

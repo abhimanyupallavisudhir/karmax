@@ -157,6 +157,7 @@ function ok(condition, message) {
 // it, which is what makes deleting the separate S.activeView state safe.
 global.esc = (s) => String(s ?? ''); // escaping is not what this test is about
 eval(extractFn('listViewChips'));
+eval(extractFn('queryView'));
 eval(extractFn('canSaveViews'));
 eval(extractFn('viewsBar'));
 eval(extractFn('viewQuery'));
@@ -175,7 +176,8 @@ eq(activeChips('for:me -is:archived'), ['__for_me__'], 'the default query lights
 ok(viewsBar().indexOf('__for_me__') < viewsBar().indexOf('__active__'), '“For me” comes first, then “Active”');
 ok(/data-view="__active__"[^>]*title="-is:archived"[^>]*>Active</.test(viewsBar()), 'the chip is called “Active” and shows its query on hover');
 ok(!/>≡ All</.test(viewsBar()), 'there is no “All” chip');
-eq(activeChips('tag:bug priority:>=2'), [], 'an ad-hoc query lights nothing');
+eq(activeChips('tag:bug priority:>=2'), ['V1'], 'a query narrowing a view keeps that view lit');
+eq(activeChips('priority:>=2'), [], 'an ad-hoc query lights nothing');
 
 // ── every chip is a link to its view's URL, so it opens in a new tab ─────────
 const chipHref = (id) => (viewsBar().match(new RegExp(`<a [^>]*data-view="${id}" href="([^"]+)"`)) || [])[1];
@@ -220,6 +222,7 @@ global.runSearch = async () => { searched++; };
 global.renderMain = () => { rendered++; };
 global.currentPath = () => location.pathname + location.search;
 eval(extractFn('syncQueryUrl'));
+eval(extractFn('searchBoxText'));
 eval(extractFn('setQuery'));
 
 (async () => {
@@ -247,6 +250,14 @@ eval(extractFn('setQuery'));
   eq(currentPath(), '/acme/website-redesign?q=', 'clearing the search shows every task — kept in the URL so it survives a reload');
   await setQuery('for:me -is:archived');
   eq(currentPath(), '/acme/website-redesign', 'the default view needs no param');
+  eq(box.value, '', "a view's own query is its lit chip, not text in the search box");
+  await setQuery('-is:archived');
+  eq(box.value, '', 'nor is Active’s');
+  await setQuery('for:me -is:archived tag:bug');
+  eq(box.value, 'tag:bug', 'a search narrowing a view shows only what narrows it; the view stays lit');
+  await setQuery('status:active tag:bug');
+  eq(box.value, 'status:active tag:bug', 'a search of your own shows in full');
+  await setQuery('for:me -is:archived');
 
   // The organization home owns its own query in the same way.
   Object.assign(S, { tab: 'home', searchScope: 'org:org_acme' });

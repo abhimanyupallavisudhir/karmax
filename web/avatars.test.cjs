@@ -32,8 +32,8 @@ function section(value) {
 
 test('the form’s Avatar row: the setting, its red risk label and full disclaimer, then its options', () => {
   const off = section(undefined);
-  assert.match(off, /<input type="checkbox" id="tf-avatar" > Avatār/);
-  assert.match(off, /\(automatically grants future forks the same authorizations\)/);
+  assert.match(off, /<input type="checkbox" class="toggle" id="tf-avatar" > Avatār/);
+  assert.doesNotMatch(off, /automatically grants/, 'what it grants is in the disclaimer tip, not a line beside it');
   assert.match(off, /<span class="risk-chip">! At your own risk<\/span><button class="info-dot" title="Forks of an Avatār act with its authorization/);
   assert.match(off, /class="tf-avatar-options" hidden/);
   assert.match(off, /class="tf-avatar-callers" value="@project"/, 'callable by the project by default');
@@ -136,7 +136,7 @@ for (const scope of ['organization', 'project']) {
     });
     vm.runInContext(hydrateSource, context);
     await context.hydrateAvatarAvailability(scope, 'example');
-    assert.match(box.innerHTML, /Disable Avatārs/);
+    assert.match(box.innerHTML, /class="toggle avatar-availability-toggle" aria-label="Avatārs" checked>/, 'a switch, on by default');
     assert.match(box.innerHTML, /Forks of an Avatār act with its authorization/);
     await listeners['.avatar-availability-toggle']({ currentTarget: {} });
     assert.deepEqual(writes[0], { url: `/api/${scope === 'project' ? 'projects' : 'organizations'}/example/avatar-settings`, body: scope === 'project' ? { value: 'disabled' } : { enabled: false } });

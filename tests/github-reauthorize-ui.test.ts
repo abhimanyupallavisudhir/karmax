@@ -118,27 +118,16 @@ describe('GitHub merge authorization UX', () => {
     return ui;
   };
 
-  it('warns at task composition without blocking queueing', async () => {
+  // Merge rights follow tavya roles (GitHub access is mirrored from them, and
+  // the App lands work for people without GitHub), so composing a task says
+  // nothing about GitHub; a real blocker surfaces when someone confirms.
+  it('says nothing about GitHub merge rights while composing a task', async () => {
     const ui = await taskForm({ remotePolicy: 'pr', creatorCanMerge: false, eligibleUserIds: [], repositories: ['acme/app'] });
-    const warning = ui.page.locator('#tf-github-merge');
-    await expect.poll(() => warning.isVisible()).toBe(true);
-    const text = await warning.innerText();
-    expect(text).toContain('GitHub merge reviewer recommended');
-    expect(text).toContain('No connected project member currently has merge access');
-    expect(text).toContain('You can still queue the task');
-    expect(await ui.page.locator('#tf-queue').isEnabled()).toBe(true);
+    await ui.page.locator('#tf-queue').waitFor();
+    expect(await ui.page.locator('#tf-github-merge').count()).toBe(0);
+    expect(ui.calls.some((call) => call.path.endsWith('/github-merge-eligibility'))).toBe(false);
+    expect(await ui.page.locator('#tf-page').innerText()).not.toMatch(/merge access|request merges/i);
     await ui.close();
-  });
-
-  it('confirms an eligible creator, and stays out of the way when changes land without a PR', async () => {
-    const eligible = await taskForm({ remotePolicy: 'pr', creatorCanMerge: true, repositories: ['acme/app'] });
-    await expect.poll(() => eligible.page.locator('#tf-github-merge').innerText())
-      .toContain('✓ Your connected GitHub account can request merges for acme/app.');
-    await eligible.close();
-    const direct = await taskForm({ remotePolicy: 'push', creatorCanMerge: false });
-    await expect.poll(() => direct.calls.some((call) => call.path.endsWith('/github-merge-eligibility'))).toBe(true);
-    expect(await direct.page.locator('#tf-github-merge').isHidden()).toBe(true);
-    await direct.close();
   });
 
   it('separates PR review confirmation from later GitHub authorization', async () => {
@@ -163,14 +152,14 @@ describe('GitHub App permission UX', () => {
     const ui = await open('/installation', ({ path }) => path === '/api/settings/installation' ? { canManage: true }
       : path.endsWith('/github/app') ? { configured: true, appSlug: 'krmax', appId: '1', oauthConfigured: true, webhookConfigured: true,
         permissionStatus: { ready: false, missingApp: ['actions: write'], appSettingsUrl: 'https://github.com/settings/apps/krmax/permissions' } }
-      : undefined, '#installation-github-card .section-h');
+      : undefined, '#installation-github-card .setting-row');
     await pane(ui, '#installation-github-card');
     const card = ui.page.locator('#installation-github-card');
-    expect(await card.locator('.section-h').textContent()).toBe('GitHub App action required');
-    const text = await card.textContent();
-    expect(text).toContain('GitHub App permissions need updating');
-    expect(text).toContain('Add the missing permissions: actions: write.');
-    expect(await card.getByRole('link', { name: 'Update permissions on GitHub' }).getAttribute('href'))
+    expect(await card.locator('.setting-row').first().innerText()).toMatch(/^GitHub App\s+ⓘ\s+krmax\s+Action required$/);
+    const permissions = card.locator('.setting-row', { hasText: 'Permissions' });
+    expect(await permissions.locator('.setting-value').innerText()).toBe('Missing actions: write');
+    expect(await permissions.locator('.info-dot').getAttribute('title')).toContain('GitHub asks every organization that installed the App to approve them');
+    expect(await card.getByRole('link', { name: 'Update on GitHub' }).getAttribute('href'))
       .toBe('https://github.com/settings/apps/krmax/permissions');
     await ui.close();
   });

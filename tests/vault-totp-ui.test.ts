@@ -17,9 +17,9 @@ new vm.Script(qrSource).runInNewContext(qrContext);
 const { decodeTotpQrImage, parseTotpQrPayload } = qrContext.globalThis.TotpQr!;
 
 describe('manual TOTP entry', () => {
-  it('starts expanded and explains every accepted TOTP source', () => {
-    expect(app).toContain('<details class="vault-custom" open>');
-    expect(app).toContain('TOTP seed (base32, otpauth:// URI, or paste image of QR code)');
+  it('starts folded and explains every accepted TOTP source in a tip', () => {
+    expect(app).toContain('<details class="vault-custom">');
+    expect(app).toContain("['totp', 'TOTP seed', 'Base32, an otpauth:// link, or paste an image of the QR code']");
   });
 
   it('turns a pasted image into an in-field QR attachment', () => {

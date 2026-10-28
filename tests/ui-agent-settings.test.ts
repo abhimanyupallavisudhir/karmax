@@ -10,7 +10,7 @@ describe('agent settings UI', () => {
       wireAgentBox(document.querySelector('.agent-field'))`);
     await ui.page.locator('.af-ref').click();
     const harnesses = await ui.page.locator('.mf-row .mf-harness').allTextContents();
-    expect(harnesses).toEqual(expect.arrayContaining(['claude', 'codex', 'opencode']));
+    expect(harnesses).toEqual(expect.arrayContaining(['Claude', 'Codex', 'OpenCode']));
     expect(harnesses).not.toContain('mock');
     await ui.close();
   });

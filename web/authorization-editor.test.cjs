@@ -76,7 +76,7 @@ ok(/authz-scope-field[\s\S]*authz-scope-chip[\s\S]*authz-scope-input[\s\S]*<\/di
 ok((filled.match(/<input/g) || []).length === 1, 'the scope field is the only text input in the editor');
 ok(/placeholder=""/.test(filled), 'a field that already holds a scope shows no leftover hint');
 ok(/placeholder="[^"]*[Pp]roject[^"]*"/.test(blank), 'an empty field invites typing a project name');
-ok(authorizationScopePlaceholder(['@organization']) === '' && authorizationScopePlaceholder([]).includes('@organization'),
+ok(authorizationScopePlaceholder(['@organization']) === '' && authorizationScopePlaceholder([]).includes('whole organization'),
   'the placeholder is the empty state of the one field, not a permanent hint');
 ok(source.includes('input.placeholder = authorizationScopePlaceholder('),
   'the live editor keeps the placeholder in step with the chips');

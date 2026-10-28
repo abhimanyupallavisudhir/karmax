@@ -93,7 +93,7 @@ it('a Review image opens one viewer however often the page re-rendered, and Esca
     let resolves = 0;
     page.on('request', (request) => { if (request.url().endsWith('/review-action')) resolves++; });
     await page.goto(`${running.url}/personal/images/tasks/${task.num}`);
-    const button = page.getByRole('button', { name: /Screenshot/ });
+    const button = page.getByRole('button', { name: 'Screenshot' });
     await button.waitFor();
     // Live events repaint the task page; the conversation keeps the unchanged
     // review row, buttons and all.
@@ -119,7 +119,7 @@ it('a Review image opens one viewer however often the page re-rendered, and Esca
 
     await open();
     expect(await viewers.count()).toBe(1);
-    expect(resolves).toBe(1);
+    expect(resolves).toBe(1); // the thumbnail's signed URL serves the viewer too
     // It shows at its final size: no frame of a small box growing to fit.
     await page.waitForTimeout(300);
     expect(new Set(await page.evaluate(() => (globalThis as any).viewerSizes))).toHaveLength(1);
@@ -148,7 +148,7 @@ it('a Review image opens one viewer however often the page re-rendered, and Esca
     await open();
     await page.mouse.click(8, 8); // the backdrop
     await expect.poll(() => viewers.count()).toBe(0);
-    expect(resolves).toBe(4);
+    expect(resolves).toBe(1);
     expect(errors).toEqual([]);
   } finally {
     await browser.close();

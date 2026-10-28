@@ -46,7 +46,7 @@ async function openList(options: { answerFirstSocket: boolean }) {
     connectWs(); watchWsLiveness();
   })()`);
   await expect.poll(() => f.sockets.length).toBe(1);
-  await expect.poll(() => ui.page.locator('#main').textContent()).toContain('working');
+  await expect.poll(() => ui.page.locator('#main').textContent()).toContain('Working');
   return { ui, ...f };
 }
 
