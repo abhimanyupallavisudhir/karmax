@@ -179,7 +179,8 @@ const EMPTY = { ...fixture(), totals: { ...fixture().totals, shipped: 0, created
 
     // Lists link straight to tasks; a hold during work reads as needing input.
     assert.equal(await page.locator('.ins-task-title', { hasText: 'Build the refund flow' }).getAttribute('href'), '/acme/web/tasks/12');
-    assert.ok((await page.locator('.ins-task', { hasText: 'Pick a tax provider' }).textContent()).includes('needs input'));
+    assert.ok((await page.locator('.ins-task', { hasText: 'Pick a tax provider' }).textContent()).includes('Needs input'));
+    assert.ok((await page.locator('.ins-task', { hasText: 'Review checkout copy' }).textContent()).includes('Storefront · Review'), 'stages read as the pipeline names them');
     assert.equal(await page.locator('.ins-pr').getAttribute('href'), 'https://github.com/acme/api/pull/7');
     assert.equal(await page.locator('.ins-name a', { hasText: 'Payments API' }).getAttribute('href'), '/acme/api');
 
@@ -208,6 +209,15 @@ const EMPTY = { ...fixture(), totals: { ...fixture().totals, shipped: 0, created
     assert.equal(await page.locator('.ins-kpi', { hasText: 'Tokens' }).locator('.ins-kpi-s').textContent(), 'reported for 21 of 61 turns');
     await page.evaluate(() => { window.insightsResponse = () => ({ ...FIXTURE, totals: { ...FIXTURE.totals, tokens: 0, meteredTurns: 0 } }); return renderPage(); });
     assert.match(await page.locator('.ins-kpi', { hasText: 'Tokens' }).locator('.ins-kpi-n').textContent(), /^—/);
+
+    // Nothing to flag: no foot under the pipeline; a tile with nothing more to say has no third line.
+    await page.evaluate(() => { window.insightsResponse = () => ({ ...FIXTURE, pipeline: { ...FIXTURE.pipeline, drafts: 0,
+      stages: { ...FIXTURE.pipeline.stages, escalated: { open: 0 }, failed: { open: 0 } } } }); return renderPage(); });
+    assert.equal(await page.locator('.ins-flow-foot').count(), 0);
+    assert.equal(await page.locator('.ins-kpi', { hasText: 'Started' }).locator('.ins-kpi-s').count(), 0);
+    // The Projects card does not repeat its title as a column; time is "Agent time" as on its tile.
+    assert.deepEqual(await page.$$eval('.ins-table:not(:has(.ins-model)) th', els => els.map(e => e.textContent)), ['Project', 'Shipped per day', 'Shipped', 'Open', 'Agent time']);
+    assert.equal(await page.locator('.ins-table th .sr-only', { hasText: 'Project' }).count(), 1);
 
     // A narrow phone: no horizontal overflow; what needs a person comes first.
     await page.setViewportSize({ width: 390, height: 900 });

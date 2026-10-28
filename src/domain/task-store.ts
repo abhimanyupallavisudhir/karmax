@@ -56,9 +56,9 @@ const projectWikiPrompt = (hosted: boolean) => [
 export const STORE_TASKS: readonly StoreTask[] = [
   {
     id: PROJECT_WIKI_TEMPLATE_ID,
-    name: 'Auto-create project wiki (memories, skills, AGENTS.md)',
+    name: 'Set up the project wiki',
     summary: 'An agent reads the project and writes what every later agent should know into its wiki.',
-    task: { title: 'Auto-create project wiki (memories, skills, AGENTS.md)', workflow: 'software-dev',
+    task: { title: 'Set up the project wiki', workflow: 'software-dev',
       prompt: projectWikiPrompt(false), hostedPrompt: projectWikiPrompt(true), params: {} },
   },
   {

@@ -5820,10 +5820,11 @@ function renderShell() {
     <div class="topbar">
       <button class="icon-btn mobile-menu" id="mobile-menu" aria-controls="rail" aria-label="Sidebar" aria-expanded="true">${ICON.menu}</button>
       <a class="brand" id="brand-home" data-spa data-shortcut="nav.home" href="${esc(homeRoute())}" title="Home" aria-label="Home">${brandMark()} ${siteNameMarkup()}</a>
+      <span class="topbar-context" id="topbar-context"></span>
       <div class="spacer"></div>
       <span class="ws-offline hidden" id="ws-offline" role="status">Reconnecting — live updates paused</span>
       <kbd class="key-echo" id="key-echo" aria-hidden="true"></kbd>
-      <a class="topbar-user" id="topbar-user" data-spa data-shortcut="nav.profile" href="${profileRoute()}" title="Your profile">${esc(userDisplayName())}</a>
+      <a class="topbar-user" id="topbar-user" data-spa data-shortcut="nav.profile" href="${profileRoute()}" title="${esc(userDisplayName())}" aria-label="Your profile">${userAvatarHtml()}</a>
       <a class="icon-btn has-badge" id="bell" data-shortcut="nav.notifications" data-spa href="${esc(inboxRoute(DEFAULT_LIST_QUERY))}" title="What needs you, in every organization" role="button" aria-label="Inbox">${ICON.bell}<span class="badge hidden" id="bell-badge">0</span></a>
     </div>
     ${verificationBanner()}
@@ -6420,6 +6421,11 @@ function scheduleTaskPageRender() {
 function renderMain() {
   const main = $('#main');
   if (!main) return;
+  // A phone has no sidebar on screen to show which project (or organization) this is: the top bar names it.
+  const context = $('#topbar-context');
+  if (context) context.textContent = S.selected ? ''
+    : PROJECT_SCOPED_TABS.includes(S.tab) ? projectById(S.projectId)?.name || ''
+    : ['home', 'insights', 'orgwiki', 'organization'].includes(S.tab) ? currentOrg()?.name || '' : '';
   // A preload begun on the task list must not survive a trip through settings,
   // where the defaults it captured may have just been edited.
   if (!isTaskListTab()) taskFormDefaultRequests.clear();
@@ -6443,12 +6449,13 @@ function renderMain() {
   // Activity remains available by direct URL for debugging, but is deliberately
   // absent from user-facing navigation.
   const tabs = ['tasks', 'queue', 'wiki', 'settings'];
-  const labels = { tasks: 'Tasks', queue: 'Queues', wiki: 'Wiki', settings: 'Project settings' };
+  // On a phone "Project settings" is "Settings": the top bar names the project.
+  const labels = { tasks: 'Tasks', queue: 'Queues', wiki: 'Wiki', settings: '<span class="tab-wide">Project settings</span><span class="tab-narrow">Settings</span>' };
   const projectScoped = PROJECT_SCOPED_TABS.includes(S.tab);
   const tabbar = projectScoped
     ? `<div class="tabs">${tabs
         .map((t) => `<a class="tab ${S.tab === t ? 'active' : ''}" data-spa href="${projectRoute(proj?.id, t)}" data-tab="${t}"${PROJECT_TAB_COMMANDS[t] ? ` data-shortcut="${PROJECT_TAB_COMMANDS[t]}"` : ''}>${labels[t]}</a>`)
-        .join('')}${S.meta?.hosted ? `<span class="tabs-spacer"></span><button class="btn tool tabs-action" id="project-local-checkout" data-tool="Work locally" title="Check out this project on your computer">${ICON.laptop}Work locally</button>` : ''}</div>`
+        .join('')}${S.meta?.hosted ? `<span class="tabs-spacer"></span><button class="btn tool tabs-action" id="project-local-checkout" data-tool="Work locally" title="Check out this project on your computer" aria-label="Work locally">${ICON.laptop}<span class="tab-wide">Work locally</span></button>` : ''}</div>`
     : '';
 
   let content = '';
@@ -6758,18 +6765,19 @@ function tasksView() {
   } else {
     body = flat.map((t) => row(t)).join('');
   }
+  // Every empty list is one muted line; the query it ran is in the search box.
   const empty = S.searchFailed
-    ? `<div class="empty"><div class="big">Search didn’t run</div>${S.searchRefusal
+    ? `<div class="card queue-empty">Search didn’t run · ${S.searchRefusal
       ? esc(S.searchRefusal.replace(/[.!]?$/, '.'))
-      : 'Couldn’t reach the server. <button class="btn sm" id="retry-search">Try again</button>'}</div>`
+      : 'Couldn’t reach the server <button class="btn sm" id="retry-search">Try again</button>'}</div>`
     : !r && S.searchPending ? ''
     : viewIdForQuery(S.search) === FOR_ME_VIEW
-      ? (notices ? '' : `<div class="empty for-me-empty"><div class="big">All clear</div>Nothing is waiting on you.</div>`)
+      ? (notices ? '' : `<div class="card queue-empty for-me-empty">Nothing is waiting on you</div>`)
     : S.search
-      ? `<div class="empty"><div class="big">No matching tasks</div>Nothing matches <code>${esc(S.search)}</code>. Edit the query or clear it.</div>`
+      ? `<div class="card queue-empty">No matching tasks</div>`
       // Done and cancelled tasks archive themselves, so an empty default list
       // does not mean the project has never had a task.
-      : `<div class="empty"><div class="big">No open tasks</div>${everywhere || (home && !newTaskProjectId()) ? '' : 'Describe one above. '}Finished tasks move to 🗄 Archived.</div>`;
+      : `<div class="card queue-empty">No open tasks ${policyTip('Finished tasks move to Archived.')}</div>`;
   // Home creates in one of its projects; with none yet there is nowhere to put a task.
   // A stand-in for the full task form: the field and Send both open it.
   const composer = everywhere || (home && !newTaskProjectId()) ? '' : `
@@ -6874,7 +6882,7 @@ function storeRowHtml(item) {
   return `<div class="task-row store-row has-row-link" data-store-task="${esc(item.id)}" tabindex="0" role="group" aria-label="${esc(item.name)}">
       <div class="task-main">
         <div class="task-title">${esc(item.name)} ${item.summary ? policyTip(item.summary) : ''}</div>
-        <div class="task-sub">${item.repeatable ? `<span class="chip">${installed > 1 ? `${installed} installed` : installed ? 'installed' : 'repeatable'}</span>` : ''}${need ? `<span>${esc(need[0])}</span>` : ''}</div>
+        ${installed || need ? `<div class="task-sub">${installed ? `<span class="chip">${installed > 1 ? `${installed} installed` : 'Installed'}</span>` : ''}${need ? `<span>${esc(need[0])}</span>` : ''}</div>` : ''}
       </div>
       <div class="task-right">${action}</div>
       ${link}
@@ -6968,11 +6976,11 @@ function chooseStoreProject(id) {
 function storeViewHtml() {
   const projectId = storeProjectId();
   const items = S.taskStore?.[projectId];
-  if (!projectId) return '<div class="empty"><div class="big">No project yet</div>Create a project to run tasks from the store.</div>';
+  if (!projectId) return '<div class="card queue-empty">No project yet</div>';
   if (!items) return '';
   const words = (S.search || '').replace(/(^|\s)-?[\w.#-]+:\S*/g, ' ').toLowerCase().split(/\s+/).filter(Boolean);
   const shown = items.filter((item) => words.every((word) => `${item.name} ${item.summary}`.toLowerCase().includes(word)));
-  return shown.length ? shown.map(storeRowHtml).join('') : `<div class="empty"><div class="big">Nothing matches</div>No ready-made task matches <code>${esc(S.search)}</code>.</div>`;
+  return shown.length ? shown.map(storeRowHtml).join('') : `<div class="card queue-empty">No matching tasks</div>`;
 }
 // The Task store view is not a search of tasks: it loads the store (a promise
 // in place of the search). The default view loads it alongside, to recommend from.
@@ -7006,10 +7014,20 @@ function storeRecsHtml() {
   const projectId = storeProjectId();
   if (S.tab === 'inbox' || viewIdForQuery(S.search) !== FOR_ME_VIEW || !projectId || !S.preferences || storeRecsDismissed(projectId)) return '';
   const items = (S.taskStore?.[projectId] || []).filter((item) => !item.installed?.length);
-  if (!items.length) return '';
+  // Only what can run now: the rest wait in the store, and the one thing most of
+  // them lack (a GitHub repository) is said once, not on every row.
+  const ready = items.filter((item) => !item.missing?.length);
+  const later = items.length - ready.length;
+  if (!ready.length && !later) return '';
+  const store = listQueryRoute(STORE_VIEW_QUERY);
+  const github = items.filter((item) => item.missing?.includes('github')).length;
+  const more = [
+    later ? `<a href="${esc(store)}" data-store-view>${later} more in the Task store</a>` : '',
+    github ? `<a data-spa href="${esc(`${projectRoute(projectId, 'settings')}#project`)}" title="${esc(`${github} of them need a GitHub repository${S.tab === 'home' ? ` in ${projectById(projectId)?.name || 'the project'}` : ''}`)}">Connect GitHub</a>` : '',
+  ].filter(Boolean).join('<span aria-hidden="true">·</span>');
   return `<section class="store-recs">
-      <h2 class="task-group-heading"><span>Recommended from the <a href="${esc(listQueryRoute(STORE_VIEW_QUERY))}" data-store-view>Task store</a></span><button class="btn sm ghost" id="store-recs-dismiss">Dismiss</button></h2>
-      ${items.map(storeRowHtml).join('')}
+      <h2 class="task-group-heading"><span>Recommended from the <a href="${esc(store)}" data-store-view>Task store</a></span><button class="btn sm ghost" id="store-recs-dismiss">Dismiss</button></h2>
+      ${ready.map(storeRowHtml).join('')}${more ? `<div class="store-recs-more">${more}</div>` : ''}
     </section>`;
 }
 function wireTaskStore() {
@@ -16602,12 +16620,17 @@ function insightTaskRow(ref, kind) {
   const project = projectById(ref.projectId)?.name || '';
   const meta = kind === 'shipped'
     ? `${esc(project)}${ref.at ? ` · ${esc(fmtAgo(ref.at))}` : ''}`
-    : `${esc(project)}${ref.stage ? ` · ${esc(kind === 'waiting' && ref.stage === 'do' ? 'needs input' : stageLabel({ stage: ref.stage }))}` : ''}`;
+    : `${esc(project)}${ref.stage ? ` · ${esc(kind === 'waiting' && ref.stage === 'do' ? 'Needs input' : insightStageLabel(ref.stage))}` : ''}`;
   const pr = kind === 'shipped' && ref.pr ? `<a class="ins-pr" href="${esc(safeHref(ref.pr))}" target="_blank" rel="noopener" title="Open pull request">PR ↗</a>` : '';
   const title = `${ref.num != null ? `<span class="ins-num">#${esc(ref.num)}</span> ` : ''}${esc(ref.title)}`;
   return `<div class="ins-task"><span class="ins-dot ${kind}" aria-hidden="true"></span>
     ${href ? `<a class="ins-task-title" data-spa href="${esc(href)}">${title}</a>` : `<span class="ins-task-title">${title}</span>`}
     <span class="ins-task-meta">${meta}</span>${pr}</div>`;
+}
+
+// A stage as the pipeline above names it (Working, Review, Landing…).
+function insightStageLabel(stage) {
+  return INSIGHT_STAGES.find((s) => s.keys.includes(stage))?.label || stageLabel({ stage });
 }
 
 function insightFlowHtml(data) {
@@ -16641,7 +16664,7 @@ function insightFlowHtml(data) {
         <div class="ins-node-name">Shipped</div>
       </div>
     </div>
-    <div class="ins-flow-foot"><span class="ins-live" title="Updates live"><i></i>Now</span>${foot}</div>
+    ${foot ? `<div class="ins-flow-foot">${foot}</div>` : ''}
   </section>`;
 }
 
@@ -16650,7 +16673,7 @@ function insightKpisHtml(data) {
   const failPct = t.turns ? Math.round((t.failedTurns / t.turns) * 100) : 0;
   const tile = (label, tip, value, delta, sub = '') => `<div class="ins-kpi" title="${esc(tip)}">
     <div class="ins-kpi-l">${label}</div><div class="ins-kpi-n">${value}${delta}</div>
-    <div class="ins-kpi-s">${sub || '&nbsp;'}</div></div>`;
+    ${sub ? `<div class="ins-kpi-s">${sub}</div>` : ''}</div>`;
   return `<div class="ins-kpis">
     ${tile('Started', 'Tasks created (drafts excluded)', t.created, insDelta(t.created, p.created, days))}
     ${tile('Time to ship', 'Median time from creating a task to done', insDuration(t.medianShipMs), insDelta(t.medianShipMs, p.medianShipMs, days, 'down'))}
@@ -16795,7 +16818,7 @@ function insightProjectsHtml(data) {
       <td class="num">${project.shipped}</td><td class="num">${project.open}</td><td class="num">${esc(insDuration(project.agentSeconds * 1000))}</td>
     </tr>`;
   }).join('');
-  return `<table class="ins-table"><thead><tr><th>Project</th><th class="ins-spark-col"><span class="sr-only">Shipped per day</span></th><th class="num">Shipped</th><th class="num">Open</th><th class="num">Agent</th></tr></thead><tbody>${rows}</tbody></table>`;
+  return `<table class="ins-table"><thead><tr><th><span class="sr-only">Project</span></th><th class="ins-spark-col"><span class="sr-only">Shipped per day</span></th><th class="num">Shipped</th><th class="num">Open</th><th class="num ins-time-col">Agent time</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
 function insightModelsHtml(data) {
@@ -16887,8 +16910,7 @@ async function renderInsights({ refresh = false } = {}) {
     if (insightsIsEmpty(data)) {
       const project = firstProjectForOrganization(organizationId);
       box.innerHTML = `${insightFlowHtml(data)}
-        <div class="card ins-start"><div><b>Your work will show up here</b>
-          <p>Start a task and follow it from setup to shipped.</p></div>
+        <div class="card ins-start"><span>No activity yet</span>
           ${project ? `<a class="btn primary" data-spa href="${esc(projectRoute(project.id))}">Open ${esc(project.name)}</a>`
             : '<button class="btn primary" type="button" id="insights-new-project">Create a project</button>'}</div>`;
       $('#insights-new-project')?.addEventListener('click', () => newProject());
@@ -17415,7 +17437,8 @@ function wikiScopeInfo(proj) {
 function wikiView(proj) {
   const info = wikiScopeInfo(proj);
   if (!info) return `<div class="empty">No organization yet.</div>`;
-  return `<div class="organization-settings wiki-page"><div class="settings-header">${proj ? '' : '<h1 class="page-title">Wiki</h1>'}${proj ? `<label class="wiki-view-picker" title="Show this wiki on another branch, or live in a task's checkout">
+  // The branch picker shows only once there is another branch or task to view.
+  return `<div class="organization-settings wiki-page"><div class="settings-header">${proj ? '' : '<h1 class="page-title">Wiki</h1>'}${proj ? `<label class="wiki-view-picker" title="Show this wiki on another branch, or live in a task's checkout"${wikiViewChoices(proj) ? '' : ' hidden'}>
       <span>Viewing</span><select id="wiki-view-select">${wikiViewOptionsHtml(proj)}</select></label>` : ''}</div>
     <div class="settings-layout"><nav class="settings-nav wiki-nav" id="wiki-nav" aria-label="Wiki entries"></nav>
     <div class="settings-content" id="wiki-pane"></div></div></div>`;
@@ -17444,6 +17467,11 @@ function wikiViewOptionsHtml(proj) {
     + (branches.length ? `<optgroup label="Branches">${branches.map(option).join('')}</optgroup>` : '');
 }
 
+// Whether the branch picker has anything to choose (more than the default branch).
+function wikiViewChoices(proj) {
+  return (wikiViewOptionsHtml(proj).match(/<option /g) || []).length > 1;
+}
+
 // The picker's list changes only as tasks start and finish: fetch it at most
 // every half minute, in the background, and never rebuild an open dropdown.
 function loadWikiRefs(proj) {
@@ -17454,7 +17482,10 @@ function loadWikiRefs(proj) {
     S.wikiRefs[proj.id] = { data, at: Date.now() };
     const select = $('#wiki-view-select');
     if (!select || S.projectId !== proj.id || S.tab !== 'wiki') return;
-    const refresh = () => { select.innerHTML = wikiViewOptionsHtml(proj); };
+    const refresh = () => {
+      select.innerHTML = wikiViewOptionsHtml(proj);
+      select.closest('.wiki-view-picker').hidden = !wikiViewChoices(proj);
+    };
     if (document.activeElement === select) select.addEventListener('blur', refresh, { once: true });
     else refresh();
   }).catch(() => { S.wikiRefs[proj.id] = { ...entry, pending: null }; });
@@ -18069,23 +18100,33 @@ function wireWikiLocalLinks(root, proj) {
 
 // ── panes ────────────────────────────────────────────────────────────────────
 // Index: exactly what agents receive each turn — every unconditional entry in
-// full, then the rendered table of contents (importance order, [more…] folds).
+// full (a folded row each: the whole text of every one would bury the rest),
+// then the rendered table of contents (importance order, [more…] folds).
 function renderWikiHome(info, proj, pane, data) {
-  const bodies = [...(data.unconditional || []).map((u) => u.body || ''), ...(data.tocText ? [data.tocText] : [])];
-  const titled = (u) => (/^\s*#\s+(.+)/.exec(u.body || '')?.[1] || '').trim().toLowerCase() === String(u.name || '').trim().toLowerCase();
-  if (!bodies.length) { pane.innerHTML = '<div class="card queue-empty">No entries yet</div>'; return; }
-  pane.innerHTML = (data.unconditional || []).map((u) => `
+  const always = data.unconditional || [];
+  // A body opening with its own name as the heading does not repeat it.
+  const untitled = (u) => (/^\s*#\s+(.+)/.exec(u.body || '')?.[1] || '').trim().toLowerCase() === String(u.name || '').trim().toLowerCase()
+    ? (u.body || '').replace(/^\s*#\s+.+\n?/, '') : (u.body || '');
+  if (!always.length && !data.tocText) { pane.innerHTML = '<div class="card queue-empty">No entries yet</div>'; return; }
+  const tex = (text) => (hasMath(text) ? texToggleHtml(!markdownEnabled()) : '');
+  const editable = (u) => data.view?.writable !== false && u.writable !== false;
+  pane.innerHTML = (always.length ? `
+    <div class="card wiki-uncond wiki-always">
+      <div class="wiki-uncond-head"><b>In every prompt</b>${policyTip('Agents get these in full with every task.')}</div>
+      ${always.map((u) => `<details class="wiki-always-row">
+        <summary><span class="wiki-always-name">${esc(u.name || u.path)}</span>${u.description ? `<span class="wiki-always-desc">${esc(u.description)}</span>` : ''}</summary>
+        <div class="msg-text md wiki-md"></div>
+        ${editable(u) || hasMath(u.body) ? `<div class="inline-form wiki-always-foot">${editable(u) ? `<button class="btn sm wiki-uncond-edit" data-path="${esc(u.path)}">Edit</button>` : ''}${tex(u.body)}</div>` : ''}
+      </details>`).join('')}
+    </div>` : '') + (data.tocText ? `
     <div class="card wiki-uncond">
-      <div class="wiki-uncond-head">${titled(u) ? '' : `<b>${esc(u.name)}</b>`}${u.builtin ? '<span class="chip">built-in</span>' : ''}<span class="grow"></span>
-        ${data.view?.writable === false || u.writable === false ? '' : `<button class="btn sm wiki-uncond-edit" data-path="${esc(u.path)}">Edit</button>`}${texToggleHtml(!markdownEnabled())}</div>
-      <div class="msg-text md wiki-md"></div>
-    </div>`).join('') + (data.tocText ? `
-    <div class="card wiki-uncond">
-      <div class="wiki-uncond-head"><b>Table of contents</b><span class="chip" title="Sent to agents as names and descriptions only; they open entries with read_wiki">titles only</span><span class="grow"></span>${texToggleHtml(!markdownEnabled())}</div>
-      <div class="msg-text md wiki-md"></div>
+      <div class="wiki-uncond-head"><b>Table of contents</b>${policyTip('Agents get the names and descriptions, and open an entry when they need it.')}<span class="grow"></span>${tex(data.tocText)}</div>
+      <div class="msg-text md wiki-md wiki-toc"></div>
     </div>` : '');
-  pane.querySelectorAll('.wiki-md').forEach((el, i) =>
-    mountMarkdownSurface(el, (math) => renderMessageBody(bodies[i], math), (body) => wireWikiLocalLinks(body, proj)));
+  pane.querySelectorAll('.wiki-always-row .wiki-md').forEach((el, i) =>
+    mountMarkdownSurface(el, (math) => renderMessageBody(untitled(always[i]), math), (body) => wireWikiLocalLinks(body, proj)));
+  const toc = pane.querySelector('.wiki-toc');
+  if (toc) mountMarkdownSurface(toc, (math) => renderMessageBody(data.tocText, math), (body) => wireWikiLocalLinks(body, proj));
   wireTexToggles(pane);
   pane.querySelectorAll('.wiki-uncond-edit').forEach((b) => b.addEventListener('click', async () => {
     try {
@@ -18104,15 +18145,16 @@ function renderWikiPage(info, proj, pane, page) {
     ? (page.overridden ? '<button class="btn sm danger" id="wiki-page-delete">Restore default</button>' : '')
     : '<button class="btn sm danger" id="wiki-page-delete">Delete</button>';
   // Kind and path are reference details (the tip); chips are only for states.
-  pane.innerHTML = `<div class="settings-section-title"><div>${esc(page.name)} ${policyTip(`${page.kind} · ${page.path}`)}
-      ${wikiIsDefault(page) ? '<span class="chip active" title="Labelled “default” — inlined into every task’s prompt">always in prompt</span>' : ''}
+  // Whether it ships with the app (and was changed here) is reference too.
+  const origin = page.overridden ? ' · Built-in, edited here' : page.builtin ? ' · Built-in' : '';
+  pane.innerHTML = `<div class="settings-section-title"><div>${esc(page.name)} ${policyTip(`${page.kind === 'memory' ? 'Memory' : 'Skill'} · ${page.path}${origin}`)}
+      ${wikiIsDefault(page) ? `<span class="chip active" title="${esc('Agents get it in full with every task')}">In every prompt</span>` : ''}
       ${(page.labels || []).filter((l) => l !== 'default').map((l) => `<span class="chip">${esc(l)}</span>`).join('')}
-      ${page.overridden ? '<span class="chip">customized</span>' : page.builtin ? '<span class="chip">built-in</span>' : ''}
       ${page.description ? `<small>${esc(page.description)}</small>` : ''}</div></div>
     <div class="card">
       <div class="msg-text md wiki-md"></div>
       ${page.files?.length ? `<div class="settings-divider"></div><div class="task-sub">${page.files.map((f) => `<code>${esc(f)}</code>`).join(' ')}</div>` : ''}
-      <div class="inline-form" style="margin-top:10px">${page._wikiWritable === false ? (info.scope === 'project' ? '<span class="task-sub">Read-only branch view</span>' : '') : `<button class="btn sm" id="wiki-page-edit">Edit</button>${remove}`}${texToggleHtml(!markdownEnabled())}</div>
+      <div class="inline-form" style="margin-top:10px">${page._wikiWritable === false ? (info.scope === 'project' ? '<span class="task-sub">Read-only branch view</span>' : '') : `<button class="btn sm" id="wiki-page-edit">Edit</button>${remove}`}${hasMath(wikiBody(page.content)) ? texToggleHtml(!markdownEnabled()) : ''}</div>
     </div>`;
   mountMarkdownSurface(pane.querySelector('.wiki-md'), (math) => renderMessageBody(wikiBody(page.content), math), (body) => wireWikiLocalLinks(body, proj));
   wireTexToggles(pane);
@@ -18150,7 +18192,7 @@ function renderWikiEditor(info, proj, pane, page) {
     <div class="wiki-title-row">
       <div class="wiki-path-edit" id="wiki-path" contenteditable="${page?.builtin ? 'false' : 'true'}" spellcheck="false"></div>
       ${page?.builtin
-        ? `<span class="chip">${page.kind}</span><span class="chip">built-in</span>`
+        ? `<span class="chip">${page.kind === 'memory' ? 'Memory' : 'Skill'}</span>${policyTip('Built-in: your edit replaces it here; Restore default brings it back.')}`
         : `<select id="wiki-kind"><option value="skill" ${(page?.kind ?? 'skill') === 'skill' ? 'selected' : ''}>Skill</option><option value="memory" ${page?.kind === 'memory' ? 'selected' : ''}>Memory</option></select>`}
     </div>
     <div class="wiki-warn" id="wiki-path-warn" hidden></div>
@@ -18165,7 +18207,7 @@ function renderWikiEditor(info, proj, pane, page) {
         <button class="wiki-body-tab active" id="wiki-tab-write" type="button">Write</button>
         <button class="wiki-body-tab" id="wiki-tab-preview" type="button">Preview</button>
         <span class="grow"></span>
-        ${texToggleHtml(!markdownEnabled())}
+        <span class="wiki-preview-tex" hidden>${texToggleHtml(!markdownEnabled())}</span>
         <label class="switch"><input type="checkbox" id="wiki-yaml"><span>YAML</span></label>
       </div>
       <textarea id="wiki-body" rows="16">${esc(body)}</textarea>
@@ -18216,6 +18258,7 @@ function renderWikiEditor(info, proj, pane, page) {
     $('#wiki-tab-preview').classList.remove('active');
     $('#wiki-body').hidden = false;
     $('#wiki-preview').hidden = true;
+    $('.wiki-preview-tex', pane).hidden = true;
   };
   $('#wiki-tab-write').addEventListener('click', showWrite);
   $('#wiki-tab-preview').addEventListener('click', () => {
@@ -18226,6 +18269,7 @@ function renderWikiEditor(info, proj, pane, page) {
     mountMarkdownSurface(preview, (math) => renderMessageBody(source, math) || '<span class="task-sub">Nothing to preview.</span>');
     $('#wiki-body').hidden = true;
     preview.hidden = false;
+    $('.wiki-preview-tex', pane).hidden = !hasMath(source);
   });
   wireTexToggles(pane);
 
@@ -22557,6 +22601,14 @@ function userDisplayName() {
   const u = S.user;
   if (u && typeof u === 'object') return u.name || u.email || 'Account';
   return 'Account';
+}
+
+// The top bar's way to the profile: the person's picture, else their initial
+// (the Profile page's avatar, small). The name is its tooltip: the rail's
+// organization switcher already shows it for a personal organization.
+function userAvatarHtml() {
+  const u = S.user && typeof S.user === 'object' ? S.user : null;
+  return u?.image ? `<img src="${esc(u.image)}" alt="">` : esc((userDisplayName().trim().charAt(0) || '?').toUpperCase());
 }
 
 const githubMark = () => `<svg class="github-mark" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 0a8 8 0 0 0-2.53 15.59c.4.08.55-.17.55-.38l-.01-1.49c-2.23.49-2.7-1.08-2.7-1.08-.37-.93-.9-1.18-.9-1.18-.73-.5.06-.49.06-.49.8.06 1.23.83 1.23.83.72 1.23 1.88.87 2.34.67.07-.52.28-.87.51-1.07-1.78-.2-3.65-.89-3.65-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82A7.65 7.65 0 0 1 8 3.73c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.28.82 2.15 0 3.07-1.87 3.75-3.66 3.95.29.25.54.74.54 1.5l-.01 2.31c0 .21.15.46.55.38A8 8 0 0 0 8 0Z"/></svg>`;
