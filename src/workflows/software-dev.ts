@@ -1102,6 +1102,12 @@ async function softwareDevImpl(
   // The last failed turn's provider limit was reported against its leased
   // credential, so its re-lease parks until that credential recovers.
   let limitReportedToCoordinator = false;
+  // The login the last failed turn hit a limit on that only this task saw (the
+  // host could not confirm it), and the logins this task avoids, each until its
+  // reported reset: unconfirmed, a limit parks nothing shared (AD-7), but this
+  // task goes on elsewhere instead of sleeping until one login's reset.
+  let taskScopedLimitAccount: string | undefined;
+  const avoidedAccounts = new Map<string, number>();
   let turnSeq = 0;
   let accountPool = continued?.accountPool ?? 0; // populated after setup; 0 ⇒ no leasing (zero behavior change)
   // Mid-turn cancel (SPEC §5.6): the running turn's cancellation scope, so a cancel
@@ -2214,6 +2220,7 @@ async function softwareDevImpl(
   });
   setHandler(retrySignal, () => {
     retryRequested = true;
+    avoidedAccounts.clear();
     if (responsiveHumanHold && humanPauseActive)
       humanPauseWake = { kind: 'retry' };
   });
@@ -2445,6 +2452,7 @@ async function softwareDevImpl(
       let freshContext = false;
       for (; attempt <= MAX_RESOLVE_ATTEMPTS; attempt++) {
         limitReportedToCoordinator = false;
+        taskScopedLimitAccount = undefined;
         try {
           return await fn();
         } catch (err) {
@@ -2592,6 +2600,13 @@ async function softwareDevImpl(
               if (providerLimit?.taskScoped && !providerLimit.hard && patched('software-dev-task-scoped-limit-wait-v1')) {
                 attempt--;
                 const until = resetAtFromHint(providerLimit.resetHint, providerLimit.window ?? '5h', Date.now());
+                // This task avoids that login until then and asks for another at
+                // once; it waits only when every login it may use is avoided
+                // (funding-analysis#2 slept 59 h on one login's weekly reset).
+                if (taskScopedLimitAccount && patched('software-dev-task-scoped-limit-avoid-v1')) {
+                  avoidedAccounts.set(taskScopedLimitAccount, until);
+                  continue;
+                }
                 const resumeStatus = status;
                 status = 'waiting';
                 waitingFor = { kind: 'account', ...(providerLimit.provider ? { provider: providerLimit.provider } : {}), earliestResetAt: until };
@@ -2825,6 +2840,31 @@ async function softwareDevImpl(
     sessionHome === undefined || sessionHome === (home ?? '(profile)');
 
   /**
+   * A lease's allow-list without the logins this task avoids (a limit only it
+   * saw, until that login's reported reset). When every login it may use is
+   * avoided, or there is no list to narrow, it waits for the earliest of those
+   * resets (a Retry ends the wait and forgets them), then asks with the list as is.
+   */
+  async function avoiding(list: string[] | undefined, provider: string): Promise<string[] | undefined> {
+    for (const [id, until] of avoidedAccounts) if (until <= Date.now()) avoidedAccounts.delete(id);
+    if (!avoidedAccounts.size || (list && !list.length)) return list;
+    const rest = list?.filter((id) => !avoidedAccounts.has(id));
+    if (rest?.length) return rest;
+    const until = Math.min(...(list ?? [...avoidedAccounts.keys()]).map((id) => avoidedAccounts.get(id) ?? Infinity));
+    const resumeStatus = status;
+    status = 'waiting';
+    waitingFor = { kind: 'account', provider, earliestResetAt: until };
+    await publish();
+    await condition(() => cancelled || retryRequested || halted(), Math.max(1_000, until - Date.now()));
+    waitingFor = undefined;
+    status = resumeStatus;
+    if (cancelled || halted()) throw new Cancelled();
+    retryRequested = false;
+    for (const [id, at] of avoidedAccounts) if (at <= Date.now()) avoidedAccounts.delete(id);
+    return list;
+  }
+
+  /**
    * Lease a connected login for one turn (SPEC §6.2), then return it. Leases only
    * an account of the turn's provider (claude logins for claude agents, codex for
    * codex). Activates only when the account pool is non-empty — otherwise the turn
@@ -3001,9 +3041,9 @@ async function softwareDevImpl(
     for (;;) {
       // The first ask may use a list resolved above (by a compact start, with the
       // provider); a re-ask must not reuse that stale list.
-      const allowed = requests === 0 && compactStart ? prepared?.allowed
+      const allowed = await avoiding(requests === 0 && compactStart ? prepared?.allowed
         : requests === 0 && resolvedFirst ? firstAllowed
-        : await resolveAllowed();
+        : await resolveAllowed(), credentialProvider);
       const lease = await coordinator.leaseAccount(taskId, turnId, credentialProvider, allowed);
       if (requests++ === 0) priorStatus = status;
       status = 'waiting';
@@ -3074,7 +3114,8 @@ async function softwareDevImpl(
         // A sandbox's unconfirmed report never changes the shared login (AD-7);
         // withResolve makes this task wait instead.
         if (cls?.taskScoped) {
-          // nothing to report
+          // Nothing to report; this task avoids the login (withResolve).
+          taskScopedLimitAccount = grant.accountId;
         } else if (cls?.hard) {
           limitReportedToCoordinator = await coordinator.setAccountAvailability({
             accountId: grant.accountId,
