@@ -20989,7 +20989,7 @@ function credentialRequestTaskLink(request) {
 // lives outside the row so a re-render of the approvals list keeps the choice.
 const credentialRequestBindings = new Map();
 
-function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = true, addLink = true } = {}) {
+function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = true } = {}) {
   const itemLabel = (id) => items.find((item) => item.id === id)?.label || id;
   const pending = requests.filter((request) => request.status === 'pending');
   const recent = requests.filter((request) => request.status !== 'pending').slice(-historyLimit).reverse();
@@ -21011,7 +21011,7 @@ function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = 
             : items.find((item) => item.id === request.itemId)?.type === 'passkey' ? '' : `<div class="approval-request-warn caution">Blind use is not foolproof: a misbehaving agent can still leak it, e.g. by entering it on a malicious site.</div>`}
         </div>
         <div class="approval-request-actions">
-          ${request.itemId ? '' : `${addLink ? `<a class="vreq-add" data-spa href="${globalRoute('organization')}#settings-payments" title="Add it in Settings → Passwords &amp; payments">Add to vault</a>` : ''}
+          ${request.itemId ? '' : `<a class="vreq-add" data-spa href="${globalRoute('organization')}#settings-payments" data-domain="${esc(request.domain || '')}" data-name="${esc(request.name || '')}" title="Add it in Settings → Passwords &amp; payments">Add to vault</a>
           <button type="button" class="btn sm vreq-pick" aria-haspopup="dialog"><span>Vault credentials</span><span class="tf-vault-count">${bound ? esc(bound.label) : 'Choose…'}</span></button>`}
           <button class="btn sm" data-vreq-act="once" ${unbound ? 'disabled' : ''}>Once</button>
           <button class="btn sm" data-vreq-act="task" ${unbound ? 'disabled' : ''}>This task</button>
@@ -21190,6 +21190,21 @@ function wirePermissionRequestActions(root, organizationId, onResolved) {
 function wireCredentialRequestActions(root, organizationId, onResolved) {
   if (!root) return;
   const oq = `?organizationId=${encodeURIComponent(organizationId || '')}`;
+  // Beside the vault (Passwords & payments), "Add to vault" opens its folded
+  // hand-entry form with the requested site filled in.
+  root.querySelectorAll('[data-vreq] .vreq-add').forEach((link) => link.addEventListener('click', (event) => {
+    const form = document.querySelector('#vault-card .vault-custom');
+    if (!form || event.metaKey || event.ctrlKey || event.shiftKey || event.button) return;
+    event.preventDefault();
+    event.stopPropagation();
+    form.open = true;
+    const domains = form.querySelector('.vi-domains');
+    if (domains && !domains.value && link.dataset.domain) domains.value = link.dataset.domain;
+    const label = form.querySelector('.vi-label');
+    if (label && !label.value && link.dataset.name) label.value = link.dataset.name;
+    form.scrollIntoView({ block: 'nearest' });
+    label?.focus();
+  }, true));
   // Load the vault when the picker opens, so an item just added elsewhere (the
   // "Add to vault" link, another tab) is there to choose without a reload.
   root.querySelectorAll('[data-vreq] .vreq-pick').forEach((button) => button.addEventListener('click', async () => {
@@ -22212,7 +22227,7 @@ async function wireVaultCards(organizationId) {
     let requests = [];
     let items = [];
     try { [requests, items] = await Promise.all([api(`/api/vault/requests${oq}`), api(`/api/vault/items${oq}`)]); } catch {}
-    rbox.innerHTML = credentialRequestRows(requests, items, { addLink: false, showEmpty: false }) || '<div class="setting-muted">No requests</div>';
+    rbox.innerHTML = credentialRequestRows(requests, items, { showEmpty: false }) || '<div class="setting-muted">No requests</div>';
     wireCredentialRequestActions(rbox, organizationId, renderRequests);
   };
   refreshVaultRequests = renderRequests; // live: a new/resolved approval repaints this list (connectWs)

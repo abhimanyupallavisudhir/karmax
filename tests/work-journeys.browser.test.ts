@@ -128,7 +128,10 @@ describe('self-hosted console journeys (real gateway, mock agent)', () => {
       await step('the agent’s request arrives, not in the vault', () => request.getByText('not in vault').waitFor({ timeout: 30_000 }));
       await expect.poll(() => request.innerText()).toContain('sign in to the staging site');
 
+      // The request's "Add to vault" opens the folded hand-entry form with its site filled in.
+      await request.getByRole('link', { name: 'Add to vault' }).click();
       const add = page.locator('#vault-card');
+      expect(await add.locator('.vi-domains').inputValue()).toBe(LOGIN_SITE);
       await add.locator('.vi-label').fill('Staging login');
       await add.locator('.vi-domains').fill(LOGIN_SITE);
       await add.locator('.vi-username').fill('agent@example.test');
