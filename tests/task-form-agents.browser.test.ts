@@ -79,7 +79,7 @@ it('composes a task whose Responder and Reviewer carry their own authority', asy
 
     await body.locator('textarea[data-field="prompt"]').fill('Ship it');
     // Responder: an agent with instructions and a narrower authority.
-    await body.locator('.rf-kind').selectOption('agent');
+    await body.locator('.responder-field .route-kind [data-route-kind="agent"]').click();
     const responder = body.locator('.responder-field .agent-block');
     expect(await responder.locator('.ab-instructions').inputValue()).toBe('');
     await responder.locator('.ab-instructions').fill('Answer from the README');

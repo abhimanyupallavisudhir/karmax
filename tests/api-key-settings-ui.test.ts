@@ -25,10 +25,14 @@ async function editor(scope: 'global' | 'project' | 'task', policy: Record<strin
 }
 
 describe('API key settings UI', () => {
-  it('offers only On and Off while explanations are turned off', async () => {
-    const { ui, row } = await editor('project', { own: { on: [KEY] }, enabled: [KEY], modes: { [KEY]: 'on' } });
-    const mode = row.getByRole('combobox', { name: 'API key availability' });
-    expect(await mode.locator('option').allTextContents()).toEqual(['On', 'Off']);
+  it('is the same on/off switch as the organization list while explanations are turned off', async () => {
+    const { ui, row, saved } = await editor('project', { own: { on: [KEY] }, enabled: [KEY], modes: { [KEY]: 'on' } });
+    expect(await row.getByRole('combobox').count()).toBe(0);
+    const toggle = row.locator('input.toggle.cred-toggle');
+    expect(await toggle.isChecked()).toBe(true);
+    await toggle.click();
+    await expect.poll(saved).toHaveLength(1);
+    expect(saved()[0]).toMatchObject({ scope: 'project', projectId: 'p', policy: { on: [], off: [KEY], explainerOnly: [] } });
     await ui.close();
   });
 
@@ -48,8 +52,8 @@ describe('API key settings UI', () => {
   it('keeps API keys binary on Task forms and renders inherited explainer-only as Off', async () => {
     const { ui, row, saved } = await editor('task', { own: {}, enabled: [], modes: { [KEY]: 'explainer-only' } });
     expect(await row.getByRole('combobox').count()).toBe(0);
-    const toggle = row.locator('.cred-toggle');
-    expect(await toggle.textContent()).toBe('off');
+    const toggle = row.locator('input.toggle.cred-toggle');
+    expect(await toggle.isChecked()).toBe(false);
     expect(await row.getAttribute('class')).toContain('off');
     await toggle.click();
     await expect.poll(saved).toHaveLength(1);

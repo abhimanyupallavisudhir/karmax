@@ -55,7 +55,7 @@ const root = __dirname;
       const row = page.locator(selector).first();
       await row.waitFor({ state: 'visible' });
       assert.equal(await row.locator('.cf-audience').getAttribute('aria-label'), label);
-      const kind = await row.locator('.cf-kind').boundingBox(), who = await row.locator('.cf-audience').boundingBox();
+      const kind = await row.locator('.route-kind').boundingBox(), who = await row.locator('.cf-audience').boundingBox();
       assert.ok(Math.abs((kind.y + kind.height / 2) - (who.y + who.height / 2)) < 6, `${label}: kind and audience share one line`);
     }
 

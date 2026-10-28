@@ -36,6 +36,7 @@ global.projectById = () => null;
 global.esc = (value) => String(value);
 global.wireCredDrag = () => {};
 global.ICON = { save: '<svg></svg>' };
+global.ACCOUNT_PROVIDER_LABELS = { claude: 'Claude' };
 const renderEpochs = new WeakMap();
 global.beginAsyncElementRender = (target) => {
   const epoch = (renderEpochs.get(target) || 0) + 1;

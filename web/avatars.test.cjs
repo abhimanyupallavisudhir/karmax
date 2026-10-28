@@ -136,7 +136,7 @@ for (const scope of ['organization', 'project']) {
     });
     vm.runInContext(hydrateSource, context);
     await context.hydrateAvatarAvailability(scope, 'example');
-    assert.match(box.innerHTML, /Disable Avatārs/);
+    assert.match(box.innerHTML, /class="toggle avatar-availability-toggle" aria-label="Avatārs" checked>/, 'a switch, on by default');
     assert.match(box.innerHTML, /Forks of an Avatār act with its authorization/);
     await listeners['.avatar-availability-toggle']({ currentTarget: {} });
     assert.deepEqual(writes[0], { url: `/api/${scope === 'project' ? 'projects' : 'organizations'}/example/avatar-settings`, body: scope === 'project' ? { value: 'disabled' } : { enabled: false } });

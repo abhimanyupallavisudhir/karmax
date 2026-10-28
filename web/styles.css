@@ -572,6 +572,16 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .vault-risk ul { margin:4px 0; padding-left:18px; }
 .vault-risk li + li { margin-top:3px; }
 .vault-risk-mark { flex:none; display:grid; place-items:center; width:18px; height:18px; margin-top:1px; border-radius:50%; background:var(--danger); color:#fff; font-weight:800; line-height:1; }
+.vault-risk .info-dot { vertical-align:-1px; }
+.vault-import-h { display:flex; align-items:center; gap:6px; margin:16px 0 2px; color:var(--ink-2); font-size:12.5px; font-weight:600; }
+.vault-import-rows { margin-bottom:14px; }
+.vault-import-rows .chip.ok { background:var(--merged-weak); color:var(--merged); border-color:transparent; }
+.vault-import-rows .conn-secret { flex:1; min-width:140px; max-width:260px; }
+.vault-policy-field { display:inline-flex; align-items:center; gap:4px; font-size:12px; color:var(--ink-2); }
+/* A label that is its own field row ("Card name<input>") reads like every other field label. */
+.organization-settings:not(.installation-settings, .wiki-page) label.form-row:not(.switch) { color:var(--ink-2); font-size:12px; font-weight:600; }
+.organization-settings:not(.installation-settings, .wiki-page) label.form-row:not(.switch) > :is(input, select, textarea) { color:var(--ink); font-size:14px; font-weight:400; }
+#project-secret-paste .form-row > span { color:var(--ink-2); font-size:12px; font-weight:600; }
 .project-empty { margin:8px 0 14px; padding:14px; border:1px dashed var(--line-strong); border-radius:10px; color:var(--ink-3); font-size:12px; line-height:1.5; }
 .project-form-actions { display:flex; align-items:center; justify-content:flex-end; gap:8px; margin-top:12px; }
 .service-fields[hidden] { display:none; }
@@ -1802,6 +1812,7 @@ a.ins-task-title:hover { color: var(--accent); }
 .github-account-actions { justify-content: flex-end; flex-wrap: wrap; }
 .github-account-row .icon-btn svg { width: 15px; height: 15px; }
 .github-org-actions { flex-wrap: wrap; }
+.github-org-actions > .setting-rows { flex: 1; }
 .git-identity-dialog { width: min(480px, calc(100vw - 28px)); }
 .git-identity-dialog textarea { width: 100%; resize: vertical; }
 @media (max-width: 560px) {
@@ -2497,12 +2508,7 @@ html[data-theme="dark"] .github-signin-btn:active,
 .cred-drag { cursor: grab; color: var(--ink-3); user-select: none; font-size: 11px; line-height: 1; }
 .cred-drag:active { cursor: grabbing; }
 .cred-label { white-space: nowrap; }
-.cred-toggle {
-  font-size: 10px; font-weight: 700; padding: 0 7px; border-radius: 999px;
-  cursor: pointer; border: 1px solid var(--line); text-transform: uppercase; flex: none;
-}
-.cred-toggle.on { background: var(--accent); color: #fff; border-color: transparent; }
-.cred-toggle.off { background: transparent; color: var(--ink-3); }
+.cred-row .info-dot { margin-left: -2px; }
 .cred-mode {
   max-width: 108px; height: 22px; padding: 0 20px 0 7px; border: 1px solid var(--line);
   border-radius: 999px; background: var(--surface); color: var(--ink-2);
@@ -3466,13 +3472,16 @@ html[data-theme="dark"] .github-signin-btn:active,
   background: var(--danger-weak); color: var(--danger); font-size: 13px; font-weight: 600; line-height: 1.4; }
 .authz-warning[hidden] { display: none; }
 .authz-warning .info-dot { color: inherit; }
-.authorization-role { border-top: 1px solid var(--line); padding: 12px 0; }
+.authorization-role { border-top: 1px solid var(--line); padding: 8px 0; }
 .authorization-role > summary { display: list-item; cursor: pointer; }
 .authorization-role > summary .chip { margin-left: 8px; }
 .role-capability-group { margin: 8px 0 8px 12px; padding: 6px 0; }
 .role-capability-group > summary { cursor: pointer; }
 .role-capability-group ul { list-style: none; margin: 8px 0; padding-left: 16px; border-left: 1px solid var(--line); }
-.role-capability-group li { padding: 6px 0; overflow-wrap: anywhere; }
+.role-capability-group li { display: flex; align-items: center; gap: 6px; padding: 6px 0; overflow-wrap: anywhere; }
+.roles-fold[open] > summary { margin-bottom: 8px; }
+.role-capability-group li b { font-weight: 500; }
+.role-capability-group > summary .setting-muted { margin: 0 2px 0 4px; }
 .role-capability-group code { display: block; color: var(--ink-3); font-size: 11px; }
 .role-capability-group label { display: flex; align-items: center; gap: 8px; }
 .role-capability-group p { margin: 3px 0; }
@@ -3790,9 +3799,16 @@ html[data-theme="dark"] .github-signin-btn:active,
 /* Responder and Review-route rows: kind · who on one line. */
 .route-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .route-row > select { flex: 0 0 auto; width: auto; }
+.route-row > .route-kind { flex: none; align-self: stretch; }
+.route-row > .route-kind > button { display: flex; align-items: center; }
 .route-row > .cf-human { flex: 1 1 auto; min-width: 0; }
 .route-row .cf-layer-num { font-size: 11px; color: var(--ink-3); min-width: 14px; text-align: right; }
 .route-row .cf-layer-tools { display: inline-flex; gap: 4px; margin-left: auto; }
+/* A phone puts a review step's people on their own line under its kind and tools. */
+@media (max-width: 560px) {
+  .cf-layer-head.route-row { flex-wrap: wrap; }
+  .cf-layer-head.route-row > .cf-human { order: 5; flex-basis: 100%; }
+}
 .cf-human[hidden], .cf-agent[hidden], .cf-empty[hidden] { display: none; }
 .confirmer-field .cf-layer { padding: 8px 10px; }
 .confirmer-field .cf-agent, .responder-field .cf-agent { margin-top: 8px; }
@@ -3878,7 +3894,14 @@ html[data-theme="dark"] .github-signin-btn:active,
 }
 
 /* ── Computers (Settings → Projects, Project → Computers) ── */
-.computer-providers { display: grid; gap: 8px; }
+.computer-providers { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; min-width: 0; }
+.computer-providers > :is(.computer-provider, .computer-any) { min-width: 0; flex-wrap: wrap; }
+.computer-add { position: relative; justify-self: start; }
+.computer-add > summary { list-style: none; }
+.computer-add > summary::-webkit-details-marker { display: none; }
+.computer-add-menu { position: absolute; z-index: 5; top: calc(100% + 4px); left: 0; display: grid; min-width: 180px; padding: 4px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); box-shadow: var(--shadow); }
+.computer-add-menu > .computer-provider { min-height: 0; padding: 7px 10px; border: 0; border-radius: 6px; background: none; color: var(--ink); font: inherit; font-size: 13px; text-align: left; cursor: pointer; }
+.computer-add-menu > .computer-provider:hover, .computer-add-menu > .computer-provider:focus-visible { background: var(--surface-2); }
 .computer-provider { display: flex; align-items: center; gap: 10px; min-height: 48px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); }
 .computer-provider > b { min-width: 72px; }
 /* What provider "Any" can choose among: a summary row above the accounts. */
@@ -4059,7 +4082,7 @@ input.toggle:disabled { opacity:.45; cursor:not-allowed; }
 .member-line .setting-value b { font-weight:600; }
 .wf-pin { min-width:150px; }
 /* A one-click action listed like the disclosures around it. */
-.action-row { display:flex; align-items:center; gap:16px; width:100%; padding:0; border:0; background:none; color:var(--ink); font:inherit; text-align:left; cursor:pointer; }
+.action-row { display:flex; align-items:center; justify-content:space-between; gap:16px; width:100%; padding:0; border:0; background:none; color:var(--ink); font:inherit; text-align:left; cursor:pointer; }
 .action-row::after { content:'›'; color:var(--ink-3); font-size:20px; }
 .action-row > span { margin-left:auto; color:var(--ink-3); font-size:12px; }
 .action-row:hover b { color:var(--accent); }

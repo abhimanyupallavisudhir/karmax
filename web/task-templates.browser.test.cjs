@@ -272,7 +272,8 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     await orgCard.locator('[data-template-id="tmpl_org"]').waitFor();
     assert.deepEqual(await orgCard.locator('[data-template-id] .tpl-name').allInnerTexts(), ['Bug triage', 'Dependencies']);
     assert.equal(await orgCard.locator('.tpl-num').count(), 0, 'numbers belong to a project, where they are offered');
-    await orgCard.getByText('Project templates are in each project’s settings.').waitFor();
+    assert.match(await orgCard.locator('.section-h [title]').getAttribute('title'), /a project’s own are in its settings/,
+      'where the projects’ templates are is a tip, not a line');
     if (shots) await orgCard.screenshot({ path: `${shots}/template-settings-organization.png` });
 
     // ── A task page's Template tool saves that task ──

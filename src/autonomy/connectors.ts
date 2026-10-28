@@ -139,7 +139,7 @@ export class BitwardenConnector implements CredentialConnector {
       label: 'Bitwarden',
       available: false,
       canPush: false, canUpdate: true,
-      detail: 'needs the Bitwarden bw CLI on this host.',
+      detail: 'Needs the Bitwarden bw CLI on the server.',
     };
     try {
       const status = JSON.parse(await this.exec('bw', ['status'], { env: await this.env() }));
@@ -148,7 +148,7 @@ export class BitwardenConnector implements CredentialConnector {
         detail: unlocked ? 'ready' : 'The Bitwarden session key is invalid or expired.' };
     } catch {
       return { name: this.name, label: 'Bitwarden', available: false, canPush: false, canUpdate: true,
-        detail: 'needs the Bitwarden bw CLI on this host.' };
+        detail: 'Needs the Bitwarden bw CLI on the server.' };
     }
   }
   async list(): Promise<ExternalItem[]> {
@@ -229,7 +229,7 @@ export class OnePasswordConnector implements CredentialConnector {
         available: false,
         canPush: false,
         canUpdate: true,
-        detail: 'needs the 1Password op CLI on this host.',
+        detail: 'Needs the 1Password op CLI on the server.',
       };
     try {
       await this.exec('op', ['whoami', '--format=json'], { env: await this.env() });
@@ -241,7 +241,7 @@ export class OnePasswordConnector implements CredentialConnector {
         available: false,
         canPush: false,
         canUpdate: true,
-        detail: 'Check the service-account token and make sure the 1Password op CLI is installed.',
+        detail: 'Check the service-account token and that the 1Password op CLI is installed.',
       };
     }
   }
@@ -412,7 +412,7 @@ export class OnePasswordSdkConnector implements CredentialConnector {
         label: '1Password',
         available: true,
         canPush: false, canUpdate: true,
-        detail: 'service account connected through the 1Password SDK',
+        detail: 'Connected with a service account',
       };
     } catch {
       return {
@@ -420,7 +420,7 @@ export class OnePasswordSdkConnector implements CredentialConnector {
         label: '1Password',
         available: false,
         canPush: false, canUpdate: true,
-        detail: 'the 1Password service-account token is invalid or unavailable',
+        detail: 'The 1Password service-account token is invalid or unavailable.',
       };
     }
   }
@@ -583,14 +583,14 @@ export class PassConnector implements CredentialConnector {
   async describe(): Promise<ConnectorInfo> {
     try {
       await this.run('pass', ['ls']);
-      return { name: this.name, label: 'unix pass', available: true, canPush: true, detail: 'password store present' };
+      return { name: this.name, label: 'unix pass', available: true, canPush: true, detail: 'Password store found' };
     } catch {
       return {
         name: this.name,
         label: 'unix pass',
         available: false,
         canPush: false,
-        detail: 'the `pass` CLI / store is not set up (self-hosted only)',
+        detail: 'Needs pass and a password store on the server (self-hosted only).',
       };
     }
   }
@@ -858,7 +858,7 @@ class GitPassStoreConnector implements CredentialConnector {
       available: false,
       canPush: true,
       setup: 'git-pass',
-      detail: 'connect a Git password-store repository and its GPG private key',
+      detail: 'Connect a Git password-store repository and its GPG private key.',
     };
     try {
       const connection = this.connection(raw);
