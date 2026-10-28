@@ -11809,11 +11809,11 @@ function loadReviewThumbnails(v) {
 // arrow keys) step through every open action in order.
 async function openReviewGallery(v, index) {
   const order = (v.reviewInfo?.actions || []).map((action, i) => (isReviewTile(action) ? i : -1)).filter((i) => i >= 0);
-  const load = async (i) => artifactItem(await resolveReviewArtifact(v, i), () => resolveReviewArtifact(v, i, true));
-  const first = await load(index);
+  const refresh = (i) => () => resolveReviewArtifact(v, i, true);
   // Only one file: what it can't show, the browser downloads.
-  if (!first.view && order.length < 2) return downloadArtifact(first);
-  return showArtifactViewer({ ...first, gallery: order.length > 1 ? { order, at: order.indexOf(index), load } : undefined });
+  if (order.length < 2) return openArtifact(await resolveReviewArtifact(v, index), refresh(index));
+  const load = async (i) => artifactItem(await resolveReviewArtifact(v, i), refresh(i));
+  return showArtifactViewer({ ...(await load(index)), gallery: { order, at: order.indexOf(index), load } });
 }
 
 // A branch's pull request (software-dev ≥1.30) is approved on its own task:
@@ -14486,7 +14486,8 @@ globalThis.document?.addEventListener('toggle', (event) => {
   const key = event.target?.dataset?.widgetGroup;
   if (key === undefined) return;
   const open = (S.openWidgetGroups ||= new Set());
-  event.target.open ? open.add(key) : open.delete(key);
+  if (event.target.open) open.add(key);
+  else open.delete(key);
 }, true);
 function renderWidget(w) {
   const empty = (s) => `<div class="task-sub" style="color:var(--ink-3)">${esc(s || '—')}</div>`;
