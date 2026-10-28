@@ -102,14 +102,20 @@ const { fakeConsole, launch, taskView } = require('../tests/helpers/fake-console
     await page.waitForFunction(() => !document.querySelector('[data-id="t3"]'));
     await settle();
     assert.deepEqual(await rows(), ['t2', 't5'], 'only that project');
-    assert.equal(await page.locator('#task-search').inputValue(), '-is:archived project:mobile-app');
+    assert.equal(await page.locator('#task-search').inputValue(), 'project:mobile-app', 'the box holds what narrows the view');
+    assert.equal(await activeView(), '__active__', 'and Active stays lit');
     await page.locator('#q-project').selectOption('');
     await page.waitForFunction(() => location.search === '?q=-is:archived');
 
-    // ── the empty query is every task, archived ones too ──────────────────────
+    // ── typing narrows the lit view; clearing goes back to it ────────────────
     await page.locator('#task-search').fill('x');
-    await page.waitForFunction(() => location.search === '?q=x');
+    await page.waitForFunction(() => location.search === '?q=-is:archived+x');
+    assert.equal(await activeView(), '__active__', 'the narrowed view stays lit');
     await page.locator('#task-search').fill('');
+    await page.waitForFunction(() => location.search === '?q=-is:archived');
+
+    // ── the lit chip switches off: the empty query is every task, archived too ─
+    await page.locator('.view-chip.active').click();
     await page.waitForFunction(() => location.search === '?q=');
     await page.locator('[data-id="t7"]').waitFor();
     await settle();

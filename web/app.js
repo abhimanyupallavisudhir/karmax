@@ -5204,7 +5204,23 @@ function scheduleSearch(background = false) {
 
 // What the search box shows for a query: nothing for a view's own query (its
 // chip is lit), else the query. Typing in the empty box starts a new search.
-function searchBoxText(q) { return viewIdForQuery(q) ? '' : q || ''; }
+// The view a query starts from: its chip stays lit and the search box holds
+// only what narrows it ("for:me -is:archived bug" → For me + "bug").
+function queryView(q) {
+  const raw = (q || '').trim();
+  const norm = normalizeQuery(raw);
+  if (!norm) return null;
+  let best = null;
+  for (const v of listViewChips()) {
+    const vq = normalizeQuery(v.query);
+    if (!vq || (best && vq.length <= best.query.length)) continue;
+    if (raw === v.query.trim() || norm === vq) best = { id: v.id, query: v.query, rest: '' };
+    else if (raw.startsWith(`${v.query.trim()} `)) best = { id: v.id, query: v.query, rest: raw.slice(v.query.trim().length + 1) };
+    else if (norm.startsWith(`${vq} `)) best = { id: v.id, query: v.query, rest: norm.slice(vq.length + 1) };
+  }
+  return best;
+}
+function searchBoxText(q) { const view = queryView(q); return view ? view.rest : q || ''; }
 
 // Programmatically set the working query (view selection, filter/sort/group menus).
 // Updates the search box and the URL, re-evaluates, re-renders.
@@ -6657,7 +6673,8 @@ function listViewChips(tab = S.tab) {
 // a new tab; wireOrgControls() keeps a plain click an in-place query switch.
 // Its number (`v 1`…`v 9`) shows on it while `v` is held down as a chord prefix.
 function viewsBar() {
-  const active = viewIdForQuery(S.search);
+  const exact = viewIdForQuery(S.search);
+  const active = exact || queryView(S.search)?.id;
   const title = { [FOR_ME_VIEW]: 'Waiting on you: reviews, questions, approvals, mentions — and your drafts',
     [STORE_VIEW]: 'Ready-made tasks: run one now, or install one that runs itself' };
   const chips = listViewChips().map((v, i) => {
@@ -6666,7 +6683,7 @@ function viewsBar() {
     return `<a class="view-chip${BUILTIN_VIEWS.includes(v) || v.id === STORE_VIEW ? ' builtin' : ''}${active === v.id ? ' active' : ''}" data-view="${esc(v.id)}" href="${esc(listQueryRoute(v.query))}"${tip ? ` title="${esc(tip)}"` : ''}${i < 9 ? ` data-shortcut="view.${i + 1}"` : ''}>${label}</a>`;
   }).join('');
   // Saving is offered once the query is not already a view.
-  const save = canSaveViews() && S.search.trim() && !active
+  const save = canSaveViews() && S.search.trim() && !exact
     ? '<button type="button" class="view-chip add" id="save-view" data-shortcut="view.save">+ Save view</button>' : '';
   return `<div class="views-bar">${chips}${save}</div>`;
 }
@@ -7566,13 +7583,15 @@ function wireScrollFade(el) {
 function wireOrgControls() {
   const main = $('#main');
   wireScrollFade(main.querySelector('.organizer-row'));
-  // Saved-view chips: each selects a query.
+  // Saved-view chips: each selects a query; the lit one switches off.
   // A chip is a link (new tab on a modified click); a plain click switches the
   // query in place, replacing the history entry as typing a query does.
   main.querySelectorAll('.view-chip[data-view]').forEach((el) =>
     el.addEventListener('click', (ev) => {
       if (ev.target.closest('[data-delview]')) return; // the ✕ handles itself
-      plainClick(() => setQuery(viewQuery(el.dataset.view)))(ev);
+      // A lit chip switches off, keeping only what the box holds (empty: every task).
+      const lit = queryView(S.search);
+      plainClick(() => setQuery(lit?.id === el.dataset.view ? lit.rest : viewQuery(el.dataset.view)))(ev);
     }),
   );
   // Delete a saved view (with confirmation) — the API/gateway already support it.
@@ -7593,14 +7612,16 @@ function wireOrgControls() {
     }),
   );
   $('#save-view')?.addEventListener('click', saveCurrentView);
-  $('#q-clear')?.addEventListener('click', () => { setQuery(''); $('#task-search')?.focus(); });
+  $('#q-clear')?.addEventListener('click', () => { setQuery(queryView(S.search)?.query || ''); $('#task-search')?.focus(); });
 
   // The in-list search box drives the working query. Debounced re-evaluation keeps
   // typing smooth; the focus/caret survive the re-render via captureFocus/restoreFocus.
   const search = $('#task-search');
   if (search) {
-    search.addEventListener('input', (e) => { S.search = e.target.value; scheduleSearch(); });
-    search.addEventListener('keydown', (e) => { if (e.key === 'Escape' && e.target.value) { e.stopPropagation(); setQuery(''); } });
+    // Typing narrows the lit view; clearing goes back to it.
+    const base = queryView(S.search)?.query || '';
+    search.addEventListener('input', (e) => { S.search = [base, e.target.value].filter((part) => part.trim()).join(' '); scheduleSearch(); });
+    search.addEventListener('keydown', (e) => { if (e.key === 'Escape' && e.target.value) { e.stopPropagation(); setQuery(base); } });
   }
 
   wireQueryToolbar(main, 'q', { get: () => S.search, set: (q) => setQuery(q) });
