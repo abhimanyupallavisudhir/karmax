@@ -58,7 +58,7 @@ describe('Installation → Agent cards', () => {
     const card = ui.page.locator('#stripe-platform-card');
     await card.locator('.stripe-platform-save').waitFor();
     expect(await card.locator('.chip').allInnerTexts()).toEqual(['Webhook secret missing', 'From environment']);
-    expect(await card.locator('[data-inst-copy]').evaluateAll((buttons) => buttons.map((b) => (b as HTMLElement).dataset.instCopy)))
+    expect(await card.locator('[data-inst-copy]').evaluateAll((buttons) => buttons.map((b) => b.getAttribute('data-inst-copy'))))
       .toEqual(['https://x.test/cb', 'https://x.test/wh']);
     expect(await card.locator('.stripe-platform-save').innerText()).toBe('Save');
     await ui.close();
