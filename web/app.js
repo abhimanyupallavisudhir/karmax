@@ -16612,12 +16612,17 @@ function insightTaskRow(ref, kind) {
   const project = projectById(ref.projectId)?.name || '';
   const meta = kind === 'shipped'
     ? `${esc(project)}${ref.at ? ` · ${esc(fmtAgo(ref.at))}` : ''}`
-    : `${esc(project)}${ref.stage ? ` · ${esc(kind === 'waiting' && ref.stage === 'do' ? 'needs input' : stageLabel({ stage: ref.stage }))}` : ''}`;
+    : `${esc(project)}${ref.stage ? ` · ${esc(kind === 'waiting' && ref.stage === 'do' ? 'Needs input' : insightStageLabel(ref.stage))}` : ''}`;
   const pr = kind === 'shipped' && ref.pr ? `<a class="ins-pr" href="${esc(safeHref(ref.pr))}" target="_blank" rel="noopener" title="Open pull request">PR ↗</a>` : '';
   const title = `${ref.num != null ? `<span class="ins-num">#${esc(ref.num)}</span> ` : ''}${esc(ref.title)}`;
   return `<div class="ins-task"><span class="ins-dot ${kind}" aria-hidden="true"></span>
     ${href ? `<a class="ins-task-title" data-spa href="${esc(href)}">${title}</a>` : `<span class="ins-task-title">${title}</span>`}
     <span class="ins-task-meta">${meta}</span>${pr}</div>`;
+}
+
+// A stage as the pipeline above names it (Working, Review, Landing…).
+function insightStageLabel(stage) {
+  return INSIGHT_STAGES.find((s) => s.keys.includes(stage))?.label || stageLabel({ stage });
 }
 
 function insightFlowHtml(data) {
@@ -16651,7 +16656,7 @@ function insightFlowHtml(data) {
         <div class="ins-node-name">Shipped</div>
       </div>
     </div>
-    <div class="ins-flow-foot"><span class="ins-live" title="Updates live"><i></i>Now</span>${foot}</div>
+    ${foot ? `<div class="ins-flow-foot">${foot}</div>` : ''}
   </section>`;
 }
 
@@ -16660,7 +16665,7 @@ function insightKpisHtml(data) {
   const failPct = t.turns ? Math.round((t.failedTurns / t.turns) * 100) : 0;
   const tile = (label, tip, value, delta, sub = '') => `<div class="ins-kpi" title="${esc(tip)}">
     <div class="ins-kpi-l">${label}</div><div class="ins-kpi-n">${value}${delta}</div>
-    <div class="ins-kpi-s">${sub || '&nbsp;'}</div></div>`;
+    ${sub ? `<div class="ins-kpi-s">${sub}</div>` : ''}</div>`;
   return `<div class="ins-kpis">
     ${tile('Started', 'Tasks created (drafts excluded)', t.created, insDelta(t.created, p.created, days))}
     ${tile('Time to ship', 'Median time from creating a task to done', insDuration(t.medianShipMs), insDelta(t.medianShipMs, p.medianShipMs, days, 'down'))}
@@ -16805,7 +16810,7 @@ function insightProjectsHtml(data) {
       <td class="num">${project.shipped}</td><td class="num">${project.open}</td><td class="num">${esc(insDuration(project.agentSeconds * 1000))}</td>
     </tr>`;
   }).join('');
-  return `<table class="ins-table"><thead><tr><th>Project</th><th class="ins-spark-col"><span class="sr-only">Shipped per day</span></th><th class="num">Shipped</th><th class="num">Open</th><th class="num">Agent</th></tr></thead><tbody>${rows}</tbody></table>`;
+  return `<table class="ins-table"><thead><tr><th><span class="sr-only">Project</span></th><th class="ins-spark-col"><span class="sr-only">Shipped per day</span></th><th class="num">Shipped</th><th class="num">Open</th><th class="num ins-time-col">Agent time</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
 function insightModelsHtml(data) {
@@ -16897,8 +16902,7 @@ async function renderInsights({ refresh = false } = {}) {
     if (insightsIsEmpty(data)) {
       const project = firstProjectForOrganization(organizationId);
       box.innerHTML = `${insightFlowHtml(data)}
-        <div class="card ins-start"><div><b>Your work will show up here</b>
-          <p>Start a task and follow it from setup to shipped.</p></div>
+        <div class="card ins-start"><span>No activity yet</span>
           ${project ? `<a class="btn primary" data-spa href="${esc(projectRoute(project.id))}">Open ${esc(project.name)}</a>`
             : '<button class="btn primary" type="button" id="insights-new-project">Create a project</button>'}</div>`;
       $('#insights-new-project')?.addEventListener('click', () => newProject());
