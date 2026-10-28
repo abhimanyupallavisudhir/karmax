@@ -8,7 +8,7 @@ const lock = JSON.parse(fs.readFileSync(new URL('../package-lock.json', import.m
 const minimums: Record<string, string> = {
   '@daytona/sdk': '0.218.0',
   '@temporalio/client': '1.24.0',
-  'better-auth': '1.7.6',
+  'better-auth': '1.7.7',
   'e2b': '2.51.0',
   'nodemailer': '10.0.12',
   'vitest': '4.1.11',
