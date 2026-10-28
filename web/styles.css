@@ -184,6 +184,10 @@ a { color: var(--accent); text-decoration: none; }
 }
 .brand { display: flex; align-items: center; gap: 9px; font-weight: 650; letter-spacing: -0.01em; color: inherit; text-decoration: none; border-radius: 7px; }
 .brand:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+/* The open project's name beside the logo, where no sidebar shows it (a phone, a folded rail). */
+.topbar-context { display: none; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; color: var(--ink); }
+html.rail-collapsed .topbar-context { display: block; }
+.tab-narrow { display: none; }
 /* ☰ sits flush with the logo; the rail it folds is the column below it. */
 .topbar .mobile-menu { flex: none; margin-right: -8px; }
 /* The artwork carries its own background and rounded corners (see web/brand/),
@@ -228,12 +232,12 @@ a { color: var(--accent); text-decoration: none; }
   font-size: 10px; font-weight: 700; display: grid; place-items: center;
 }
 .topbar-user {
-  display: inline-block; line-height: 32px; box-sizing: border-box; /* a block, so a long name ends in … */
-  height: 34px; padding: 0 12px; border: 1px solid var(--line); border-radius: 999px;
-  background: var(--surface-2); color: var(--ink-2); cursor: pointer; font-weight: 600;
-  max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  display: grid; place-items: center; flex: none; width: 30px; height: 30px; border-radius: 50%; overflow: hidden;
+  text-decoration: none; background: linear-gradient(135deg, var(--accent), #8a6cf0); color: #fff;
+  cursor: pointer; font-weight: 700; font-size: 13px;
 }
-.topbar-user:hover { border-color: var(--line-strong); color: var(--ink); background: var(--surface); }
+.topbar-user img { width: 100%; height: 100%; object-fit: cover; }
+.topbar-user:hover, .topbar-user:focus-visible { box-shadow: 0 0 0 3px var(--accent-weak); outline: none; }
 /* The shortcut echo: the keys for what you just did, fading after a moment
    (held while hovered; a pending chord prefix holds until it resolves). */
 .key-echo {
@@ -429,6 +433,8 @@ a { color: var(--accent); text-decoration: none; }
 .task-sub > .chip { white-space: nowrap; }
 /* A phone gives the title the row: the dot and stage chip already say where it is. */
 @media (max-width: 700px) { .task-row > .task-right > .pipeline { display: none; } }
+/* …and the whole title: on a phone it wraps instead of ending in "…". */
+@media (max-width: 720px) { .task-row .task-title { white-space: normal; overflow-wrap: break-word; } }
 /* The flex row above is for a strip of metadata (a div of chips). A <p> is prose:
    as a flex container every inline <a>/<span> in the sentence became its own item,
    gapped and wrapped away from the words around it. Prose flows as prose. */
@@ -2424,8 +2430,10 @@ html[data-theme="dark"] .github-signin-btn:active,
   .topbar { gap: 8px; padding-left:max(10px, env(safe-area-inset-left)); padding-right:max(10px, env(safe-area-inset-right)); }
   .mobile-menu { display:grid; flex:none; }
   .topbar .brand { font-size:0; gap:0; }
+  .topbar-context { display:block; margin-left:-4px; }
+  .tab-wide { display:none; }
+  .tab-narrow { display:inline; }
   #rail-help, .topbar .key-echo { display:none; } /* no keyboard to list or echo shortcuts for */
-  .topbar-user { max-width:84px; padding:0 9px; }
   .body { grid-template-columns: 1fr; }
   .rail {
     display:flex; position:fixed; z-index:80; left:0; top:52px; bottom:0;

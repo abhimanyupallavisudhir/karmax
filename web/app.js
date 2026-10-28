@@ -5820,10 +5820,11 @@ function renderShell() {
     <div class="topbar">
       <button class="icon-btn mobile-menu" id="mobile-menu" aria-controls="rail" aria-label="Sidebar" aria-expanded="true">${ICON.menu}</button>
       <a class="brand" id="brand-home" data-spa data-shortcut="nav.home" href="${esc(homeRoute())}" title="Home" aria-label="Home">${brandMark()} ${siteNameMarkup()}</a>
+      <span class="topbar-context" id="topbar-context"></span>
       <div class="spacer"></div>
       <span class="ws-offline hidden" id="ws-offline" role="status">Reconnecting — live updates paused</span>
       <kbd class="key-echo" id="key-echo" aria-hidden="true"></kbd>
-      <a class="topbar-user" id="topbar-user" data-spa data-shortcut="nav.profile" href="${profileRoute()}" title="Your profile">${esc(userDisplayName())}</a>
+      <a class="topbar-user" id="topbar-user" data-spa data-shortcut="nav.profile" href="${profileRoute()}" title="${esc(userDisplayName())}" aria-label="Your profile">${userAvatarHtml()}</a>
       <a class="icon-btn has-badge" id="bell" data-shortcut="nav.notifications" data-spa href="${esc(inboxRoute(DEFAULT_LIST_QUERY))}" title="What needs you, in every organization" role="button" aria-label="Inbox">${ICON.bell}<span class="badge hidden" id="bell-badge">0</span></a>
     </div>
     ${verificationBanner()}
@@ -6420,6 +6421,11 @@ function scheduleTaskPageRender() {
 function renderMain() {
   const main = $('#main');
   if (!main) return;
+  // A phone has no sidebar on screen to show which project (or organization) this is: the top bar names it.
+  const context = $('#topbar-context');
+  if (context) context.textContent = S.selected ? ''
+    : PROJECT_SCOPED_TABS.includes(S.tab) ? projectById(S.projectId)?.name || ''
+    : ['home', 'insights', 'orgwiki', 'organization'].includes(S.tab) ? currentOrg()?.name || '' : '';
   // A preload begun on the task list must not survive a trip through settings,
   // where the defaults it captured may have just been edited.
   if (!isTaskListTab()) taskFormDefaultRequests.clear();
@@ -6443,12 +6449,13 @@ function renderMain() {
   // Activity remains available by direct URL for debugging, but is deliberately
   // absent from user-facing navigation.
   const tabs = ['tasks', 'queue', 'wiki', 'settings'];
-  const labels = { tasks: 'Tasks', queue: 'Queues', wiki: 'Wiki', settings: 'Project settings' };
+  // On a phone "Project settings" is "Settings": the top bar names the project.
+  const labels = { tasks: 'Tasks', queue: 'Queues', wiki: 'Wiki', settings: '<span class="tab-wide">Project settings</span><span class="tab-narrow">Settings</span>' };
   const projectScoped = PROJECT_SCOPED_TABS.includes(S.tab);
   const tabbar = projectScoped
     ? `<div class="tabs">${tabs
         .map((t) => `<a class="tab ${S.tab === t ? 'active' : ''}" data-spa href="${projectRoute(proj?.id, t)}" data-tab="${t}"${PROJECT_TAB_COMMANDS[t] ? ` data-shortcut="${PROJECT_TAB_COMMANDS[t]}"` : ''}>${labels[t]}</a>`)
-        .join('')}${S.meta?.hosted ? `<span class="tabs-spacer"></span><button class="btn tool tabs-action" id="project-local-checkout" data-tool="Work locally" title="Check out this project on your computer">${ICON.laptop}Work locally</button>` : ''}</div>`
+        .join('')}${S.meta?.hosted ? `<span class="tabs-spacer"></span><button class="btn tool tabs-action" id="project-local-checkout" data-tool="Work locally" title="Check out this project on your computer" aria-label="Work locally">${ICON.laptop}<span class="tab-wide">Work locally</span></button>` : ''}</div>`
     : '';
 
   let content = '';
@@ -22593,6 +22600,14 @@ function userDisplayName() {
   const u = S.user;
   if (u && typeof u === 'object') return u.name || u.email || 'Account';
   return 'Account';
+}
+
+// The top bar's way to the profile: the person's picture, else their initial
+// (the Profile page's avatar, small). The name is its tooltip: the rail's
+// organization switcher already shows it for a personal organization.
+function userAvatarHtml() {
+  const u = S.user && typeof S.user === 'object' ? S.user : null;
+  return u?.image ? `<img src="${esc(u.image)}" alt="">` : esc((userDisplayName().trim().charAt(0) || '?').toUpperCase());
 }
 
 const githubMark = () => `<svg class="github-mark" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 0a8 8 0 0 0-2.53 15.59c.4.08.55-.17.55-.38l-.01-1.49c-2.23.49-2.7-1.08-2.7-1.08-.37-.93-.9-1.18-.9-1.18-.73-.5.06-.49.06-.49.8.06 1.23.83 1.23.83.72 1.23 1.88.87 2.34.67.07-.52.28-.87.51-1.07-1.78-.2-3.65-.89-3.65-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82A7.65 7.65 0 0 1 8 3.73c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.28.82 2.15 0 3.07-1.87 3.75-3.66 3.95.29.25.54.74.54 1.5l-.01 2.31c0 .21.15.46.55.38A8 8 0 0 0 8 0Z"/></svg>`;
