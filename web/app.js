@@ -16194,35 +16194,27 @@ function activityView() {
 // loadavg, free/total RAM, live agent-slot occupancy, and whether either pressure
 // gate is currently holding new agent leases back (adaptive admission control).
 function hostDiagHtml(diag) {
-  if (!diag) return `<div class="card" style="color:var(--ink-3)">Diagnostics unavailable.</div>`;
+  if (!diag) return '<div class="card"><span class="task-sub">Health unavailable</span></div>';
   const h = diag.host || {};
   const s = diag.agentSlots || {};
-  const load = (h.loadavg || []).map((n) => Number(n).toFixed(2)).join('  /  ');
   const loadStyle = s.loadHigh ? ' style="color:var(--danger)"' : '';
-  const memStyle = s.memoryTight ? ' style="color:var(--danger)"' : '';
-  const freeG = (Number(h.freeMemMb || 0) / 1024).toFixed(1);
-  const totG = (Number(h.totalMemMb || 0) / 1024).toFixed(1);
   const gates = [];
-  if (s.memoryTight) gates.push(`low free memory (< ${s.minFreeMb}MB)`);
-  if (s.loadHigh) gates.push(`load above ${s.maxLoadFactor}× cores`);
-  const gate = gates.length
-    ? `<span class="chip waiting">⏸ holding new agent leases — ${esc(gates.join(' + '))}</span>`
-    : `<span class="chip done">admitting agent turns</span>`;
+  if (s.memoryTight) gates.push(`free memory under ${s.minFreeMb} MB (${formatBytes(Number(h.freeMemMb || 0) * 1024 * 1024)} free)`);
+  if (s.loadHigh) gates.push(`load above ${s.maxLoadFactor}× per core`);
   const lifecycle = diag.runtimeLifecycle || [];
   const started = [...lifecycle].reverse().find((event) => event.action === 'runtime.started');
   const unclean = [...lifecycle].reverse().find((event) => event.action === 'runtime.previous-unclean');
-  const runtimeLine = started
-    ? `Runtime started ${esc(new Date(started.ts).toLocaleString())}${started.detail?.buildRevision ? ` · build ${esc(started.detail.buildRevision)}` : ''}${unclean && unclean.ts === started.ts ? ' · ⚠ previous runtime ended uncleanly' : ''}`
-    : 'Runtime lifecycle record unavailable';
+  const uncleanStart = unclean && started && unclean.ts === started.ts;
+  const startedTitle = started ? [`Started ${new Date(started.ts).toLocaleString()}`, started.detail?.buildRevision ? `build ${started.detail.buildRevision}` : '',
+    uncleanStart ? 'the previous run ended uncleanly' : ''].filter(Boolean).join(' · ') : '';
+  const loads = (h.loadavg || []).map((n) => Number(n).toFixed(2)).join(' / ');
   return `
     <div class="stat-grid">
-      <div class="stat"><div class="n"${loadStyle}>${esc(load || '—')}</div><div class="l">Load avg · 1 / 5 / 15 min</div></div>
-      <div class="stat"><div class="n"${loadStyle}>${Number(h.loadPerCore || 0).toFixed(2)}×</div><div class="l">Load per core · ${esc(String(h.cores ?? '?'))} cores</div></div>
-      <div class="stat"><div class="n"${memStyle}>${freeG}G</div><div class="l">Free RAM · of ${totG}G (${esc(String(h.usedMemPct ?? '?'))}% used)</div></div>
-      <div class="stat"><div class="n">${esc(String(s.inUse ?? '?'))}/${esc(String(s.capacity ?? '?'))}${s.waiting ? ` +${esc(String(s.waiting))}` : ''}</div><div class="l">Agent slots in use${s.waiting ? ` · ${esc(String(s.waiting))} waiting` : ''}</div></div>
+      <div class="stat" title="${esc(`Load average ${loads || '—'} over 1, 5 and 15 minutes, per core of ${h.cores ?? '?'}`)}"><div class="n"${loadStyle}>${Number(h.loadPerCore || 0).toFixed(2)}×</div><div class="l">Load per core · ${esc(String(h.cores ?? '?'))} cores</div></div>
+      <div class="stat" title="Agent turns running now, of the most allowed at once (Host capacity)"><div class="n">${esc(String(s.inUse ?? '?'))}/${esc(String(s.capacity ?? '?'))}</div><div class="l">Agent turns${s.waiting ? ` · ${esc(String(s.waiting))} waiting` : ''}</div></div>
+      ${started ? `<div class="stat" title="${esc(startedTitle)}"><div class="n"${uncleanStart ? ' style="color:var(--warn)"' : ''}>${esc(fmtDur(Math.round((Date.now() - started.ts) / 1000)))}</div><div class="l">Up${uncleanStart ? ' · unclean restart' : ''}</div></div>` : ''}
     </div>
-    <div class="task-sub" style="margin-top:8px">${gate}</div>
-    <div class="task-sub" style="margin-top:6px;color:var(--ink-3)"><b>Runtime lifecycle:</b> ${runtimeLine}</div>`;
+    ${gates.length ? `<p class="setting-warn health-gate">New agent turns paused: ${esc(gates.join(' and '))}</p>` : ''}`;
 }
 
 // Live-refresh just the host panel every 5s while Installation is open. Self-
@@ -16245,8 +16237,8 @@ async function refreshHostDiag() {
 // typed into them), the Temporal server, git/exec helpers — grouped by owning
 // entity with live CPU% / RSS. Kill via POST /api/processes/kill (SIGTERM;
 // shift-click for SIGKILL). Protected infrastructure gets no kill button.
-const PROC_KIND_LABEL = { agent: 'agent', terminal: 'terminal', temporal: 'infra', login: 'login', probe: 'probe',
-  get app() { return siteName(); }, untracked: 'misc' };
+// A chip only where the kind adds to the group's own label.
+const PROC_KIND_LABEL = { agent: 'Agent', terminal: 'Terminal', login: 'Sign-in', probe: 'Check' };
 
 function fmtDur(sec) {
   if (!sec || sec < 0) return '—';
@@ -16257,44 +16249,46 @@ function fmtDur(sec) {
 }
 
 function procPanelHtml(sample) {
-  if (!sample) return `<div class="card" style="color:var(--ink-3)">Process list unavailable.</div>`;
-  if (!sample.supported) return `<div class="card" style="color:var(--ink-3)">Process accounting needs Linux procfs — not available on this host.</div>`;
+  if (!sample) return '<div class="card"><span class="task-sub">Process list unavailable</span></div>';
+  if (!sample.supported) return '<div class="card"><span class="task-sub">Process list needs Linux</span></div>';
   const t = sample.totals || {};
-  // A row is either killable (button) or protected (visible lock, so the kill
-  // affordance is discoverable even on an idle instance where only protected
-  // infrastructure — karmax itself + Temporal — is running).
-  const LOCK = `<span class="proc-lock" title="Protected — ${siteNameMarkup()} can't run without this. Kill buttons appear on agents, terminals, and the scripts they run.">🔒</span>`;
-  const killBtn = (pid, label, killable, taskId) =>
-    sample.canKill === false ? '' : killable
-      ? `<button class="btn sm danger proc-kill" data-kill="${pid}" data-label="${esc(label)}" ${taskId ? `data-stop-task="${esc(taskId)}"` : ''} title="${taskId ? 'Stop task and its agent' : 'click: SIGTERM · shift-click: SIGKILL'}">✕ ${taskId ? 'stop task' : 'kill'}</button>`
-      : LOCK;
+  const mem = (mb) => mb >= 1024 ? `${(mb / 1024).toFixed(2)} GB` : `${mb.toFixed(0)} MB`;
+  const open = S.procOpen || new Set();
+  // Protected infrastructure shows one lock on its group, so where Stop is
+  // missing says why even on an idle instance.
+  const LOCK = `<span class="proc-lock" title="Protected: ${siteNameMarkup()} can’t run without it. Agents, terminals and the scripts they run can be stopped.">🔒</span>`;
+  const stopBtn = (pid, label, taskId) => sample.canKill === false ? ''
+    : `<button class="btn sm danger proc-kill" data-kill="${pid}" data-label="${esc(label)}" ${taskId ? `data-stop-task="${esc(taskId)}"` : ''} title="${taskId ? 'Stop the task and its agent' : 'Stop · Shift-click to force'}">${taskId ? 'Stop task' : 'Stop'}</button>`;
   const rows = (sample.groups || [])
     .map((g) => {
-      const kindChip = `<span class="chip">${esc(PROC_KIND_LABEL[g.kind] || g.kind)}</span>`;
+      const label = g.kind === 'app' ? siteNameMarkup() : g.kind === 'untracked' ? 'Other processes'
+        : esc(String(g.label || '').charAt(0).toUpperCase() + String(g.label || '').slice(1));
+      const kindChip = PROC_KIND_LABEL[g.kind] ? `<span class="chip">${esc(PROC_KIND_LABEL[g.kind])}</span>` : '';
       const taskChip = g.taskId
-        ? `<a class="chip proc-task" data-spa href="${esc(taskUrl(g.taskId))}" data-task="${esc(g.taskId)}" title="open task">${esc(numLabel(g.taskId))}</a>`
+        ? `<a class="chip proc-task" data-spa href="${esc(taskUrl(g.taskId))}" data-task="${esc(g.taskId)}" title="Open task">${esc(numLabel(g.taskId))}</a>`
         : '';
-      // A group is killable at the root when it's a registered entity (agents,
+      // A group is stoppable at the root when it's a registered entity (agents,
       // terminals, logins, probes) — its registered killer escalates properly.
       const rootKillable = sample.canKill !== false && !g.protected && g.kind !== 'app' && g.kind !== 'untracked';
-      const head = `<tr class="proc-group">
-        <td class="cmd">${esc(g.label)} ${kindChip}${taskChip}</td>
-        <td class="mono num">${g.procs.length}</td>
+      const expanded = open.has(g.key);
+      const head = `<tr class="proc-group" data-proc-group="${esc(g.key)}">
+        <td class="cmd"><button type="button" class="proc-toggle" aria-expanded="${expanded}" title="${expanded ? 'Hide' : 'Show'} processes">${label}${g.procs.length > 1 ? ` <span class="proc-age">${g.procs.length}</span>` : ''}</button> ${kindChip}${taskChip}</td>
+        <td class="mono num proc-age">${fmtDur(Math.max(0, ...g.procs.map((r) => r.ageSec || 0)))}</td>
         <td class="mono num">${g.cpuPct.toFixed(1)}%</td>
-        <td class="mono num">${g.rssMb >= 1024 ? (g.rssMb / 1024).toFixed(2) + 'G' : g.rssMb.toFixed(0) + 'M'}</td>
-        <td class="num">${rootKillable ? killBtn(g.key, g.label, true, g.kind === 'agent' ? g.taskId : undefined) : g.protected || g.kind === 'app' ? LOCK : ''}</td>
+        <td class="mono num">${mem(g.rssMb)}</td>
+        <td class="num">${rootKillable ? stopBtn(g.key, g.label, g.kind === 'agent' ? g.taskId : undefined) : g.protected || g.kind === 'app' ? LOCK : ''}</td>
       </tr>`;
       const body = g.procs
         .map((r) => {
-          // Never offer to kill karmax itself (the 'app' group's only row); any
-          // other row — including a registered root's own line — is fair game.
+          // Never offer to stop the app itself (the 'app' group's only row) or a
+          // protected root; any other row — a registered root's own line too — may.
           const killable = g.kind !== 'app' && !(g.protected && String(r.pid) === g.key);
-          return `<tr>
-            <td class="cmd mono" title="${esc(r.cmd)}">${esc(r.cmd)}</td>
-            <td class="mono num">${r.pid}<span class="proc-age"> · ${fmtDur(r.ageSec)}</span></td>
+          return `<tr class="proc-row" data-proc-parent="${esc(g.key)}" ${expanded ? '' : 'hidden'}>
+            <td class="cmd mono" title="${esc(`PID ${r.pid} · ${r.cmd}`)}">${esc(r.cmd)}</td>
+            <td class="mono num proc-age">${fmtDur(r.ageSec)}</td>
             <td class="mono num">${r.cpuPct.toFixed(1)}%</td>
-            <td class="mono num">${r.rssMb >= 1024 ? (r.rssMb / 1024).toFixed(2) + 'G' : r.rssMb.toFixed(0) + 'M'}</td>
-            <td class="num">${killBtn(r.pid, r.cmd.slice(0, 60), killable, g.kind === 'agent' && String(r.pid) === g.key ? g.taskId : undefined)}</td>
+            <td class="mono num">${mem(r.rssMb)}</td>
+            <td class="num">${killable ? stopBtn(r.pid, r.cmd.slice(0, 60), g.kind === 'agent' && String(r.pid) === g.key ? g.taskId : undefined) : ''}</td>
           </tr>`;
         })
         .join('');
@@ -16303,25 +16297,34 @@ function procPanelHtml(sample) {
     .join('');
   return `<div class="card" style="padding:0;overflow:auto">
     <table class="proc-table">
-      <thead><tr><th>process</th><th class="num">pid · age</th><th class="num">cpu</th><th class="num">mem</th><th class="num"></th></tr></thead>
+      <thead><tr><th>Process</th><th class="num">Age</th><th class="num">CPU</th><th class="num">Memory</th><th class="num"></th></tr></thead>
       <tbody>${rows}</tbody>
     </table>
-    <div class="task-sub" style="padding:8px 12px;color:var(--ink-3)">${t.procs ?? 0} processes · ${(t.cpuPct ?? 0).toFixed(1)}% cpu · ${((t.rssMb ?? 0) / 1024).toFixed(2)}G rss — sampled ${new Date(sample.ts).toLocaleTimeString()}</div>
+    <div class="task-sub proc-foot">${t.procs ?? 0} processes · ${(t.cpuPct ?? 0).toFixed(1)}% CPU · ${mem(t.rssMb ?? 0)} · updated ${new Date(sample.ts).toLocaleTimeString()}</div>
   </div>`;
 }
 
 function wireProcPanel(el) {
   // .proc-task chips are real <a> permalinks handled by installLinkRouter().
+  el.querySelectorAll('.proc-toggle').forEach((button) => button.addEventListener('click', () => {
+    const key = button.closest('[data-proc-group]').dataset.procGroup;
+    S.procOpen ||= new Set();
+    const expanded = !S.procOpen.has(key);
+    if (expanded) S.procOpen.add(key); else S.procOpen.delete(key);
+    button.setAttribute('aria-expanded', String(expanded));
+    button.title = `${expanded ? 'Hide' : 'Show'} processes`;
+    el.querySelectorAll(`[data-proc-parent="${CSS.escape(key)}"]`).forEach((row) => { row.hidden = !expanded; });
+  }));
   el.querySelectorAll('.proc-kill').forEach((b) =>
     b.addEventListener('click', async (ev) => {
       const pid = Number(b.dataset.kill);
       const signal = ev.shiftKey ? 'SIGKILL' : 'SIGTERM';
       const taskId = b.dataset.stopTask;
-      if (!confirm(taskId ? `Stop task ${numLabel(taskId)} and its agent?` : `Send ${signal} to pid ${pid}?\n\n${b.dataset.label}`)) return;
+      if (!confirm(taskId ? `Stop task ${numLabel(taskId)} and its agent?` : `${signal === 'SIGKILL' ? 'Force-stop' : 'Stop'} this process?\n\n${b.dataset.label}`)) return;
       b.disabled = true;
       try {
         await api('/api/processes/kill', { method: 'POST', body: JSON.stringify({ pid, signal }) });
-        toast(taskId ? 'Task stopping' : `${signal} sent to ${pid}`);
+        toast(taskId ? 'Task stopping' : 'Process stopping');
       } catch (e) { toast(e.message, true); }
       refreshProcPanel(true);
     }),
@@ -23418,7 +23421,7 @@ function serviceLimitMeterMarkup(service, meter, first) {
       ${meter.limit ? `<span class="limits-level ${meter.level === 95 ? 'critical' : meter.level === 80 ? 'warn' : ''}">${meter.level ? '▲ ' : ''}${esc(percent)}</span>` : ''}`;
   return `<div class="limits-row${first ? '' : ' cont'}" role="row" data-service="${esc(service.id)}" data-meter="${esc(meter.id)}" data-level="${meter.level || 0}">
     <span class="limits-service" role="rowheader">${first ? serviceLimitNameMarkup(service, true) : ''}</span>
-    <span class="limits-measure" role="cell"><button type="button" class="info-dot limits-label" title="${esc(meter.tip)}">${esc(meter.label)}</button> <span class="limits-source" title="${esc(source[1])}">${esc(source[0])}</span></span>
+    <span class="limits-measure" role="cell"><button type="button" class="info-dot limits-label" title="${esc(`${meter.tip} ${source[1]}.`)}">${esc(meter.label)}</button></span>
     <span class="limits-usage" role="cell">${usage}</span>
     <span class="limits-actions" role="cell">${first ? serviceLimitActionsMarkup(service) : ''}</span>
   </div>`;
@@ -23431,24 +23434,29 @@ function serviceLimitNameMarkup(service, withPlan = false) {
   return `<button type="button" class="info-dot limits-label limits-name" title="${esc(service.tip)}">${esc(service.name)}</button>${plan}${failed}`;
 }
 function serviceLimitActionsMarkup(service) {
-  const link = service.link ? `<a href="${esc(service.link.url)}" target="_blank" rel="noopener noreferrer">${esc(service.link.label)} ↗</a>` : '';
+  // One look for every provider page (upgrade, billing or limits): the provider's word is in the title.
+  const link = service.link ? `<a class="limits-link" href="${esc(service.link.url)}" target="_blank" rel="noopener noreferrer" title="${esc(`${service.link.label} · ${service.name}`)}" aria-label="${esc(`${service.link.label} · ${service.name}`)}">↗</a>` : '';
   const edit = S.serviceLimitsCanManage ? `<button type="button" class="limits-edit" data-limits-edit="${esc(service.id)}" aria-label="Edit ${esc(service.name)} plan and limits" title="Edit plan and limits">✎</button>` : '';
   return link + edit;
 }
 function serviceLimitsMarkup(view) {
   if (!view) return '';
-  const rows = view.services.map((service) => {
-    if (['not-connected', 'not-needed', 'unchecked'].includes(service.status) || !service.meters.length) {
-      const note = service.status === 'unchecked' ? 'Not checked yet' : service.status === 'not-needed' ? 'Not needed' : 'Not connected';
-      const why = service.status === 'not-needed' ? service.note : service.connect;
-      return `<div class="limits-row off" role="row" data-service="${esc(service.id)}">
+  const offRow = (service) => {
+    const note = service.status === 'unchecked' ? 'Not checked yet' : service.status === 'not-needed' ? 'Not needed' : 'Not connected';
+    const why = service.status === 'not-needed' ? service.note : service.connect;
+    // Inside the Not connected fold the row says how to connect, not the fold's name again.
+    const text = service.status === 'not-connected' ? (why ? esc(why) : note) : `${note}${why ? ` ${policyTip(why)}` : ''}`;
+    return `<div class="limits-row off" role="row" data-service="${esc(service.id)}">
         <span class="limits-service" role="rowheader">${serviceLimitNameMarkup(service)}</span>
-        <span class="limits-off" role="cell">${note}${why ? ` ${policyTip(why)}` : ''}</span>
+        <span class="limits-off" role="cell">${text}</span>
         <span class="limits-actions" role="cell">${serviceLimitActionsMarkup(service)}</span>
       </div>`;
-    }
-    return service.meters.map((meter, index) => serviceLimitMeterMarkup(service, meter, index === 0)).join('');
-  }).join('');
+  };
+  const isOff = (service) => ['not-connected', 'not-needed', 'unchecked'].includes(service.status) || !service.meters.length;
+  const unconnected = view.services.filter((service) => isOff(service) && service.status === 'not-connected');
+  const rows = view.services.filter((service) => !unconnected.includes(service)).map((service) => isOff(service) ? offRow(service)
+    : service.meters.map((meter, index) => serviceLimitMeterMarkup(service, meter, index === 0)).join('')).join('')
+    + (unconnected.length ? `<details class="limits-off-fold"><summary>Not connected <span class="setting-muted">${unconnected.length}</span></summary>${unconnected.map(offRow).join('')}</details>` : '');
   const alerts = view.services.flatMap((service) => service.meters.filter((meter) => meter.level)).length;
   return `<div class="limits-head"><span class="task-sub">${view.checkedAt ? `Checked ${esc(fmtAgo(view.checkedAt))}` : 'Not checked yet'}${alerts ? ` · <b>${alerts} near ${alerts === 1 ? 'its limit' : 'their limits'}</b>` : ''}
       ${policyTip('Checked every 15 minutes. At 80% and again at 95% of a limit, installation operators get an inbox alert and an email.')}</span>
@@ -23470,7 +23478,7 @@ function serviceLimitEditorMarkup(view, service) {
   return `<div class="limits-editor" data-limits-editor="${esc(service.id)}" data-unsaved>
     ${field('Plan', `<input data-plan maxlength="60" value="${esc(service.planSource === 'entered' ? service.plan : '')}" placeholder="${esc(service.planSource !== 'entered' && service.plan ? service.plan : 'Plan name')}">`)}
     ${limits}${cloudflare}${organization}
-    ${field('Upgrade link', `<input type="url" data-link value="" placeholder="${esc(service.link?.url || 'https://…')}">`)}
+    ${field('Link', `<input type="url" data-link value="" placeholder="${esc(service.link?.url || 'https://…')}">`, 'The provider page that ↗ opens, such as its plans or billing.')}
     <div class="limits-editor-actions"><button type="button" class="btn sm primary" data-limits-save data-unsaved-save>Save</button>
       <button type="button" class="btn sm" data-limits-reset title="Use the published plan, limits and link">Reset</button>
       <button type="button" class="btn sm" data-limits-cancel>Cancel</button></div>
@@ -23557,8 +23565,9 @@ function installationView() {
 // against what organizations were charged.
 function managedComputeMarkup(view) {
   const money = (micros) => `$${(Number(micros || 0) / 1e6).toFixed(2)}`;
-  const rows = Object.entries(COMPUTER_PROVIDERS).map(([id, info]) => {
-    const account = (view.providers || []).find((candidate) => candidate.provider === id);
+  const accountOf = (id) => (view.providers || []).find((candidate) => candidate.provider === id);
+  const row = ([id, info]) => {
+    const account = accountOf(id);
     const state = !account ? null : !account.enabled ? ['Off', ''] : account.status === 'error' ? ['Failing', 'failed'] : ['On', 'done'];
     const hours = account ? Math.round(account.seconds / 360) / 10 : 0;
     return `<div class="computer-provider" data-provider="${id}"><b>${esc(info.name)}</b>
@@ -23568,8 +23577,14 @@ function managedComputeMarkup(view) {
       <span class="label-row-fill"></span>
       ${account ? `<button class="icon-btn computer-edit" type="button" title="Edit ${esc(info.name)}" aria-label="Edit ${esc(info.name)}">✎</button><button class="btn sm computer-test" type="button">Test</button>`
         : `<button class="btn sm computer-connect" type="button">Connect</button>`}</div>`;
-  }).join('');
-  return `<div class="computer-providers">${rows}</div>`;
+  };
+  // Connected providers first; the rest fold into one row with a count.
+  const providers = Object.entries(COMPUTER_PROVIDERS);
+  const connected = providers.filter(([id]) => accountOf(id));
+  const unconnected = providers.filter(([id]) => !accountOf(id));
+  return `${connected.length ? `<div class="computer-providers">${connected.map(row).join('')}</div>` : ''}
+    ${unconnected.length ? `<details class="inst-fold managed-off"><summary>Not connected <span class="setting-muted">${unconnected.length}</span></summary>
+      <div class="computer-providers">${unconnected.map(row).join('')}</div></details>` : ''}`;
 }
 async function wireManagedComputeCard() {
   const card = $('#managed-compute-card');
