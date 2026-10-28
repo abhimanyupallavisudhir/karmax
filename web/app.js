@@ -6758,18 +6758,19 @@ function tasksView() {
   } else {
     body = flat.map((t) => row(t)).join('');
   }
+  // Every empty list is one muted line; the query it ran is in the search box.
   const empty = S.searchFailed
-    ? `<div class="empty"><div class="big">Search didn’t run</div>${S.searchRefusal
+    ? `<div class="card queue-empty">Search didn’t run · ${S.searchRefusal
       ? esc(S.searchRefusal.replace(/[.!]?$/, '.'))
-      : 'Couldn’t reach the server. <button class="btn sm" id="retry-search">Try again</button>'}</div>`
+      : 'Couldn’t reach the server <button class="btn sm" id="retry-search">Try again</button>'}</div>`
     : !r && S.searchPending ? ''
     : viewIdForQuery(S.search) === FOR_ME_VIEW
-      ? (notices ? '' : `<div class="empty for-me-empty"><div class="big">All clear</div>Nothing is waiting on you.</div>`)
+      ? (notices ? '' : `<div class="card queue-empty for-me-empty">Nothing is waiting on you</div>`)
     : S.search
-      ? `<div class="empty"><div class="big">No matching tasks</div>Nothing matches <code>${esc(S.search)}</code>. Edit the query or clear it.</div>`
+      ? `<div class="card queue-empty">No matching tasks</div>`
       // Done and cancelled tasks archive themselves, so an empty default list
       // does not mean the project has never had a task.
-      : `<div class="empty"><div class="big">No open tasks</div>${everywhere || (home && !newTaskProjectId()) ? '' : 'Describe one above. '}Finished tasks move to 🗄 Archived.</div>`;
+      : `<div class="card queue-empty">No open tasks ${policyTip('Finished tasks move to Archived.')}</div>`;
   // Home creates in one of its projects; with none yet there is nowhere to put a task.
   // A stand-in for the full task form: the field and Send both open it.
   const composer = everywhere || (home && !newTaskProjectId()) ? '' : `
@@ -6874,7 +6875,7 @@ function storeRowHtml(item) {
   return `<div class="task-row store-row has-row-link" data-store-task="${esc(item.id)}" tabindex="0" role="group" aria-label="${esc(item.name)}">
       <div class="task-main">
         <div class="task-title">${esc(item.name)} ${item.summary ? policyTip(item.summary) : ''}</div>
-        <div class="task-sub">${item.repeatable ? `<span class="chip">${installed > 1 ? `${installed} installed` : installed ? 'installed' : 'repeatable'}</span>` : ''}${need ? `<span>${esc(need[0])}</span>` : ''}</div>
+        ${installed || need ? `<div class="task-sub">${installed ? `<span class="chip">${installed > 1 ? `${installed} installed` : 'Installed'}</span>` : ''}${need ? `<span>${esc(need[0])}</span>` : ''}</div>` : ''}
       </div>
       <div class="task-right">${action}</div>
       ${link}
@@ -6968,11 +6969,11 @@ function chooseStoreProject(id) {
 function storeViewHtml() {
   const projectId = storeProjectId();
   const items = S.taskStore?.[projectId];
-  if (!projectId) return '<div class="empty"><div class="big">No project yet</div>Create a project to run tasks from the store.</div>';
+  if (!projectId) return '<div class="card queue-empty">No project yet</div>';
   if (!items) return '';
   const words = (S.search || '').replace(/(^|\s)-?[\w.#-]+:\S*/g, ' ').toLowerCase().split(/\s+/).filter(Boolean);
   const shown = items.filter((item) => words.every((word) => `${item.name} ${item.summary}`.toLowerCase().includes(word)));
-  return shown.length ? shown.map(storeRowHtml).join('') : `<div class="empty"><div class="big">Nothing matches</div>No ready-made task matches <code>${esc(S.search)}</code>.</div>`;
+  return shown.length ? shown.map(storeRowHtml).join('') : `<div class="card queue-empty">No matching tasks</div>`;
 }
 // The Task store view is not a search of tasks: it loads the store (a promise
 // in place of the search). The default view loads it alongside, to recommend from.
@@ -7006,10 +7007,20 @@ function storeRecsHtml() {
   const projectId = storeProjectId();
   if (S.tab === 'inbox' || viewIdForQuery(S.search) !== FOR_ME_VIEW || !projectId || !S.preferences || storeRecsDismissed(projectId)) return '';
   const items = (S.taskStore?.[projectId] || []).filter((item) => !item.installed?.length);
-  if (!items.length) return '';
+  // Only what can run now: the rest wait in the store, and the one thing most of
+  // them lack (a GitHub repository) is said once, not on every row.
+  const ready = items.filter((item) => !item.missing?.length);
+  const later = items.length - ready.length;
+  if (!ready.length && !later) return '';
+  const store = listQueryRoute(STORE_VIEW_QUERY);
+  const github = items.filter((item) => item.missing?.includes('github')).length;
+  const more = [
+    later ? `<a href="${esc(store)}" data-store-view>${later} more in the Task store</a>` : '',
+    github ? `<a data-spa href="${esc(`${projectRoute(projectId, 'settings')}#project`)}" title="${esc(`${github} of them need a GitHub repository${S.tab === 'home' ? ` in ${projectById(projectId)?.name || 'the project'}` : ''}`)}">Connect GitHub</a>` : '',
+  ].filter(Boolean).join('<span aria-hidden="true">·</span>');
   return `<section class="store-recs">
-      <h2 class="task-group-heading"><span>Recommended from the <a href="${esc(listQueryRoute(STORE_VIEW_QUERY))}" data-store-view>Task store</a></span><button class="btn sm ghost" id="store-recs-dismiss">Dismiss</button></h2>
-      ${items.map(storeRowHtml).join('')}
+      <h2 class="task-group-heading"><span>Recommended from the <a href="${esc(store)}" data-store-view>Task store</a></span><button class="btn sm ghost" id="store-recs-dismiss">Dismiss</button></h2>
+      ${ready.map(storeRowHtml).join('')}${more ? `<div class="store-recs-more">${more}</div>` : ''}
     </section>`;
 }
 function wireTaskStore() {
