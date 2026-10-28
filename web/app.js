@@ -22742,8 +22742,8 @@ function profileWalkthroughCard(userId) {
 }
 function profileWalkthroughRow(userId) {
   if (!S.meta?.hosted || !userId || (!S.installationAccess && userId !== S.user?.id)) return '';
-  return `<div class="setting-row"><span class="setting-label">Walkthrough</span><span class="setting-value setting-muted">Setup guide in each organization</span>
-    <span class="setting-actions"><button class="btn sm" type="button" id="profile-reset-onboarding" data-user-id="${esc(userId)}" title="Existing work and connections are kept">Restart walkthrough</button></span></div>`;
+  return `<div class="setting-row"><span class="setting-label">Walkthrough ${policyTip('The setup guide in each organization. Restarting keeps existing work and connections.')}</span><span class="setting-value"></span>
+    <span class="setting-actions"><button class="btn sm" type="button" id="profile-reset-onboarding" data-user-id="${esc(userId)}" aria-label="Restart walkthrough">Restart</button></span></div>`;
 }
 
 function profileView() {
@@ -22844,37 +22844,37 @@ function profileView() {
             `<button type="button" data-theme-choice="${value}" aria-pressed="${theme === value}">${label}</button>`).join('')}</span></span>
         </div>
         <label class="setting-row" for="profile-md-render">
-          <span class="setting-label">Markdown</span>
-          <span class="setting-value setting-muted">Format agent messages</span>
+          <span class="setting-label">Markdown ${policyTip('Format agent messages.')}</span>
+          <span class="setting-value"></span>
           <span class="setting-actions"><input class="toggle" type="checkbox" id="profile-md-render" ${markdownEnabled() ? 'checked' : ''} /></span>
         </label>
         <label class="setting-row" for="profile-mathjax">
-          <span class="setting-label">Math ${policyTip('Typesets LaTeX with MathJax, loaded from a CDN. Needs Markdown.')}</span>
-          <span class="setting-value setting-muted">Typeset LaTeX</span>
+          <span class="setting-label">Math ${policyTip('Typeset LaTeX with MathJax, loaded from a CDN. Needs Markdown.')}</span>
+          <span class="setting-value"></span>
           <span class="setting-actions"><input class="toggle" type="checkbox" id="profile-mathjax" ${mathjaxEnabled() ? 'checked' : ''} /></span>
         </label>
         ${profileWalkthroughRow(u?.id)}
       </div>
     </div>
     ${notificationsCard()}
-    ${S.meta?.hosted ? '<div class="card"><div class="section-h">Paid subscriptions</div><div id="profile-paid-subscriptions" aria-live="polite">Loading subscriptions…</div></div>' : ''}
+    ${S.meta?.hosted ? '<div class="card"><div class="section-h">Paid subscriptions</div><div id="profile-paid-subscriptions" aria-live="polite"><span class="task-sub">Loading…</span></div></div>' : ''}
     ${u ? appGrantsCard() : ''}
     <div class="card" id="data-account">
       <div class="section-h">Data &amp; account</div>
       <div class="setting-rows">
         <div class="setting-row">
           <span class="setting-label">Your data ${policyTip(`A readable JSON archive of your profile and the ${siteName()} records linked to you. Passwords, tokens and stored credentials are never included.`)}</span>
-          <span class="setting-value setting-muted">JSON archive</span>
+          <span class="setting-value"></span>
           <span class="setting-actions"><button class="btn sm" id="export-user-data" type="button">Export</button></span>
         </div>
         ${u ? `<div class="setting-row">
-          <span class="setting-label">Session</span>
-          <span class="setting-value setting-muted">This browser</span>
+          <span class="setting-label">Session ${policyTip('Sign out of this browser.')}</span>
+          <span class="setting-value"></span>
           <span class="setting-actions"><button class="btn sm" id="profile-logout">Sign out</button></span>
         </div>` : ''}
         <div class="setting-row danger">
-          <span class="setting-label">Delete account ${policyTip(`We verify ownership and any organization or resource transfer, then confirm what is removed or kept. Cancel active subscriptions first. Account compromised? Contact ${incident || 'security'}.`)}</span>
-          <span class="setting-value setting-muted">Permanent</span>
+          <span class="setting-label">Delete account ${policyTip(`Permanent. We verify ownership and any organization or resource transfer, then confirm what is removed or kept. Cancel active subscriptions first. Account compromised? Contact ${incident || 'security'}.`)}</span>
+          <span class="setting-value"></span>
           <span class="setting-actions"><button class="btn sm danger" id="request-account-deletion" type="button">Request deletion</button></span>
         </div>
       </div>
@@ -22897,7 +22897,8 @@ function notificationsCard() {
     notify: 'Shown by your device, even when this tab is in the background. Do Not Disturb still applies.',
     sound: 'Plays in this browser while the app is open.',
     visual: 'A banner inside the app.',
-    email: emailReady ? 'Sent to your account email for this organization, even when the app is closed.' : 'Your administrator hasn’t set up email.',
+    email: emailReady ? 'Sent to your account email for this organization, even when the app is closed.'
+      : S.installationAccess ? 'Email isn’t set up yet: Installation → Email.' : 'Your administrator hasn’t set up email.',
   };
   // Loudest first, the same order the inbox itself is in.
   const levels = [...URGENCY_LEVELS].reverse();
@@ -22905,12 +22906,13 @@ function notificationsCard() {
     <div class="section-h">Notifications ${policyTip('Agents set an urgency when they need you; approvals arrive as high. Choose what each level does. Everything except email applies to this browser only.')}</div>
     <div class="notify-grid">
       <div class="notify-row notify-head"><span>Urgency</span>${NOTIFY_BEHAVIOURS.map((behaviour) =>
-    `<span title="${esc(headTip[behaviour.key])}">${behaviour.label}</span>`).join('')}<span></span></div>
+    behaviour.key === 'email' && !emailReady ? `<span class="notify-off">${behaviour.label} ${policyTip(headTip.email)}</span>`
+      : `<span title="${esc(headTip[behaviour.key])}">${behaviour.label}</span>`).join('')}<span></span></div>
       ${levels.map((level) => `<div class="notify-row" data-notify-level="${level}">
-        <span class="urgency-chip ${level}">${level}</span>
+        <span class="urgency-chip ${level}">${level.charAt(0).toUpperCase() + level.slice(1)}</span>
         ${NOTIFY_BEHAVIOURS.map((behaviour) => `<span><input type="checkbox" data-notify="${level}:${behaviour.key}"
-          aria-label="${behaviour.label} for ${level} urgency" ${(behaviour.key === 'email' ? S.deliveryPreferences?.emailUrgencies?.[level] ?? S.deliveryPreferences?.email : prefs[level][behaviour.key]) ? 'checked' : ''} ${behaviour.key === 'email' && (!emailReady || S.deliveryPreferences?.organizationId !== S.organizationId) ? 'disabled' : ''}/></span>`).join('')}
-        <span><button class="btn sm ghost" type="button" data-notify-test="${level}" title="Send a test ${level} notification">Test</button></span>
+          aria-label="${behaviour.label} for ${level} urgency" ${behaviour.key === 'email' && !emailReady ? `title="${esc(headTip.email)}"` : ''} ${(behaviour.key === 'email' ? S.deliveryPreferences?.emailUrgencies?.[level] ?? S.deliveryPreferences?.email : prefs[level][behaviour.key]) ? 'checked' : ''} ${behaviour.key === 'email' && (!emailReady || S.deliveryPreferences?.organizationId !== S.organizationId) ? 'disabled' : ''}/></span>`).join('')}
+        <span><button class="btn sm" type="button" data-notify-test="${level}" title="Send a test ${level} notification">Test</button></span>
       </div>`).join('')}
     </div>
     <div class="setting-rows ruled">
@@ -22984,11 +22986,12 @@ function wireNotificationsCard() {
 }
 
 function profilePaidSubscriptionsMarkup(subscriptions) {
-  if (!subscriptions.length) return '<p class="task-sub">No paid subscriptions are linked to your account. Unfinished checkouts and gifted plans are not listed.</p>';
+  if (!subscriptions.length) return `<p class="setting-muted">None ${policyTip('Unfinished checkouts and gifted plans are not listed.')}</p>`;
+  const statusLabel = { active: 'Active', trialing: 'Trial', past_due: 'Payment overdue', unpaid: 'Unpaid', canceled: 'Cancelled', paused: 'Paused', incomplete: 'Incomplete' };
   return subscriptions.map(subscription => {
     const end = subscription.cancelAtPeriodEnd
       ? ` · cancellation scheduled${subscription.currentPeriodEnd ? ` for ${new Date(subscription.currentPeriodEnd).toLocaleDateString()}` : ''}` : '';
-    return `<div class="member-row"><div><b>${esc(subscription.organizationName)}</b><p class="task-sub">${esc(subscription.planName)} · ${esc(subscription.status)}${esc(end)}</p>
+    return `<div class="member-row"><div><b>${esc(subscription.organizationName)}</b><p class="task-sub">${esc(subscription.planName)} · ${esc(statusLabel[subscription.status] || subscription.status)}${esc(end)}</p>
       ${!subscription.canManage ? '<p class="task-sub">You no longer have billing-management access. Contact an organization owner or <a href="/legal/billing">billing support</a> for changes or cancellation.</p>' : ''}</div>
       ${subscription.settingsUrl ? `<a class="btn sm" data-spa href="${esc(subscription.settingsUrl)}">Plans &amp; billing</a>` : ''}</div>`;
   }).join('');
