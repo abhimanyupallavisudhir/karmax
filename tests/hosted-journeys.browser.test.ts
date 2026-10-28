@@ -122,7 +122,7 @@ describe('hosted console journeys (real gateway, stubbed paid providers)', () =>
       const organization = (await g.store.defaultOrganization(user!.id))!;
 
       await guide.getByRole('link', { name: 'Add agent login' }).click();
-      await page.locator('#acct-provider').fill('openai');
+      await page.locator('#acct-provider').selectOption('openai');
       await page.locator('#acct-name').fill('work');
       await page.locator('#acct-key').fill('sk-journey');
       await page.locator('#acct-add').click();
@@ -130,7 +130,8 @@ describe('hosted console journeys (real gateway, stubbed paid providers)', () =>
 
       await page.locator('#onboarding-expand').click();
       await guide.getByRole('link', { name: 'Connect a computer' }).click();
-      await page.locator('#org-computers [data-provider="e2b"] .computer-connect').click();
+      await page.locator('#org-computers .computer-add > summary').click();
+      await page.locator('#org-computers .computer-add [data-provider="e2b"]').click();
       await page.locator('.computer-dialog .computer-key').fill('e2b_journey');
       await page.locator('.computer-dialog .computer-save').click();
       await step('the E2B key counts', () => expect.poll(completed, { timeout: 15_000 }).toBe('2 of 4 required steps'));

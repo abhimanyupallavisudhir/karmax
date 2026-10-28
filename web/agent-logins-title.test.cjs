@@ -1,6 +1,6 @@
-// The per-task credential-precedence control lists the Codex/Claude accounts, so its
-// section is titled "Codex/Claude" (not the vaguer "Credentials", which also
-// collides with the separate "Vault credentials" button).
+// The per-task credential-precedence control lists the Claude/Codex accounts, so its
+// section is titled "Accounts", as in Settings (not the vaguer "Credentials", which
+// also collides with the separate "Vault credentials" button).
 // Run: node web/agent-logins-title.test.cjs
 const fs = require('fs');
 const path = require('path');
@@ -45,16 +45,16 @@ global.esc = String;
 eval(extractFn('parametersTab'));
 for (const view of [{ stage: 'do' }, { stage: 'done' }, { stage: 'merge', pointOfNoReturnPassed: true }]) {
   const tab = parametersTab(view);
-  ok(/<label>Codex\/Claude<\/label>/.test(tab), 'Parameters tab titles the section "Codex/Claude"');
+  ok(/<label>Accounts<\/label>/.test(tab), 'Parameters tab titles the section "Accounts"');
   ok(!/>Credentials</.test(tab), 'Parameters tab no longer titles it "Credentials"');
 }
 
 // New-task form (openTaskForm) label.
-ok(/>Codex\/Claude<\/label>/.test(src), 'new-task form labels the control "Codex/Claude"');
+ok(/>Accounts<\/label>\$\{policyTip\('The Claude and Codex accounts this task/.test(src), 'new-task form labels the control "Accounts"');
 
 // Series page (renderSeriesPage) details summary. The title is what's load-bearing
 // here; the trailing gloss is free to be reworded.
-ok(/<summary>Codex\/Claude —/.test(src), 'series page summary is titled "Codex/Claude"');
+ok(/<summary title="[^"]*">Accounts<\/summary>/.test(src), 'series page summary is titled "Accounts"');
 
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

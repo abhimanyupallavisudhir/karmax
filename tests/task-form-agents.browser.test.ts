@@ -74,12 +74,12 @@ it('composes a task whose Responder and Reviewer carry their own authority', asy
     expect(await main.locator('#tf-authorization, #tf-vault-open, #tf-payments').count()).toBe(3);
     expect(await page.locator('.tf-side').locator('#tf-authorization, #tf-vault-open, #tf-payments').count()).toBe(0);
     expect(await page.locator('.tf-side [data-row]').evaluateAll((rows) => rows.map((row) => row.getAttribute('data-row'))))
-      .toEqual(['__org', '__github-merge', '__attempts', '__creds', '__notes']);
+      .toEqual(['__org', '__attempts', '__creds', '__notes']);
     expect(await main.locator('.aa-summary').textContent()).toContain('Developer');
 
     await body.locator('textarea[data-field="prompt"]').fill('Ship it');
     // Responder: an agent with instructions and a narrower authority.
-    await body.locator('.rf-kind').selectOption('agent');
+    await body.locator('.responder-field .route-kind [data-route-kind="agent"]').click();
     const responder = body.locator('.responder-field .agent-block');
     expect(await responder.locator('.ab-instructions').inputValue()).toBe('');
     await responder.locator('.ab-instructions').fill('Answer from the README');

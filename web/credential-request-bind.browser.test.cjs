@@ -12,7 +12,7 @@ const items = Array.from({ length: 40 }, (_, i) => ({ id: `vi_${i}`, type: 'logi
 const request = { id: 'vreq_1', taskId: 'task_1', domain: 'staging.example.test', mode: 'use', why: 'sign in', status: 'pending',
   task: { id: 'task_1', num: 7, title: 'Sign in', projectId: 'project_1' } };
 
-async function open(browser, { addLink = true } = {}) {
+async function open(browser, { settings = false } = {}) {
   const page = await browser.newPage({ viewport: { width: 1100, height: 700 } });
   const errors = [];
   const resolves = [];
@@ -39,11 +39,12 @@ async function open(browser, { addLink = true } = {}) {
       window.resolved = 0;
       const paint = () => {
         const list = document.querySelector('#requests');
-        list.innerHTML = credentialRequestRows([${JSON.stringify(request)}], [], { addLink: ${addLink} });
+        list.innerHTML = credentialRequestRows([${JSON.stringify(request)}], []);
         wireCredentialRequestActions(list, 'org_personal', () => { window.resolved++; });
       };
       window.repaint = paint;
-      document.querySelector('#app').innerHTML = '<main style="padding:16px"><div class="approval-list" id="requests"></div></main>';
+      document.querySelector('#app').innerHTML = '<main style="padding:16px"><div class="approval-list" id="requests"></div>'
+        + ${settings ? `'<div id="vault-card"><details class="vault-custom"><summary>Add one by hand</summary><input class="vi-label"><input class="vi-domains"></details></div>'` : "''"} + '</main>';
       paint();
     `);
     return route.fulfill({ body, contentType: file.endsWith('.js') ? 'text/javascript' : file.endsWith('.css') ? 'text/css' : 'text/html' });
@@ -92,8 +93,14 @@ async function open(browser, { addLink = true } = {}) {
     assert.deepEqual(errors, []);
     await page.close();
 
-    const settings = await open(browser, { addLink: false });
-    assert.equal(await settings.page.getByRole('link', { name: 'Add to vault' }).count(), 0, 'no self-link on the settings page');
+    // Beside the vault, "Add to vault" opens its folded hand-entry form for the requested site.
+    const settings = await open(browser, { settings: true });
+    await settings.page.getByRole('link', { name: 'Add to vault' }).click();
+    assert.equal(await settings.page.locator('#vault-card .vault-custom').evaluate((el) => el.open), true, 'the form opens');
+    assert.equal(await settings.page.locator('.vi-domains').inputValue(), 'staging.example.test', 'with the site filled in');
+    assert.equal(await settings.page.evaluate(() => document.activeElement?.className), 'vi-label', 'ready for its name');
+    assert.equal(new URL(settings.page.url()).pathname, '/', 'without leaving the page');
+    assert.deepEqual(settings.errors, []);
     await settings.page.close();
     console.log('credential request bind: ok');
   } finally { await browser.close(); }

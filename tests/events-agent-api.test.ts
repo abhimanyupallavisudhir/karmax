@@ -111,12 +111,12 @@ describe('events through an agent\'s task token', () => {
         'build-planned-issues': true, 'triage-issues': true, 'chat-requests': true });
       expect(Object.fromEntries(listed.map((t: any) => [t.id, t.missing]))).toEqual({ 'project-wiki': [], 'repair-github-workflow': ['github'],
         'build-planned-issues': ['github'], 'triage-issues': ['github'], 'chat-requests': ['chat'] });
-      expect(listed[0].name).toBe('Auto-create project wiki (memories, skills, AGENTS.md)');
+      expect(listed[0].name).toBe('Set up the project wiki');
 
       // An ordinary task runs at once, as often as asked.
       const wiki = json(await dev.request('POST', `/api/projects/${projectId}/task-store/project-wiki`));
       const run = (await store.getTask(wiki.id))!;
-      expect(run).toMatchObject({ title: 'Auto-create project wiki (memories, skills, AGENTS.md)', workflow: 'software-dev', params: { template: 'project-wiki' } });
+      expect(run).toMatchObject({ title: 'Set up the project wiki', workflow: 'software-dev', params: { template: 'project-wiki' } });
       expect(run.params.draft).toBeFalsy();
       expect(run.params).not.toHaveProperty('repeatable');
       expect(String(run.params.prompt)).toContain('Migrate AGENTS.md, CLAUDE.md');

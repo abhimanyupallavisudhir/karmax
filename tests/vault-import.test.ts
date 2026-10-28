@@ -127,8 +127,9 @@ describe('connector import (web)', () => {
     const ui = await passwords(({ method, path }) => method === 'POST' && path === '/api/vault/import/bitwarden?organizationId=o'
       ? { count: 2, created: 1, updated: 1, skipped: [] } : undefined);
     const row = ui.page.locator('.bitwarden-file-import');
-    expect(await row.textContent()).toContain('one-way import');
-    expect(await row.textContent()).toContain('Export your Bitwarden to a JSON file and import it here (no write-back).');
+    // One row: its name, what it does as a tip, and its action.
+    expect(await row.locator('.setting-label').textContent()).toMatch(/^Bitwarden export\s*ⓘ$/);
+    expect(await row.locator('.info-dot').getAttribute('title')).toMatch(/one-way import of a Bitwarden JSON export/);
     expect(await row.locator('input[type="file"]').getAttribute('accept')).toBe('.json,application/json');
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'karmax-bitwarden-'));
     const pick = async (contents: Buffer) => {

@@ -53,8 +53,8 @@ ok(extractFn('wireNewTaskComposer').includes("$('#expand-task')?.addEventListene
   && extractFn('wireNewTaskComposer').includes("$('#add-task')?.addEventListener('click', () => openNewTaskForm())"), 'the field and Send both open the form');
 ok(!src.includes('id="new-task"') && !src.includes('id="draft-task"') && !src.includes('id="new-task-files"'), 'no typed quick task, draft or attach buttons beside it');
 ok(!src.includes('quick: true') && !src.includes('quickSettingsForms'), 'no quick-task payload or quick-task settings');
-ok(src.includes("{ id: 'nav.newTask', title: 'New task from template', key: 'n', run: () => openTemplatePicker() }"), 'n picks a template');
-ok(src.includes("{ id: 'nav.newTaskDefault', title: 'New task', key: 'N', run: () => openNewTaskForm() }"), 'N opens the form with the Task defaults');
+ok(src.includes("{ id: 'nav.newTask', title: 'New task from template', key: 'n', group: 'General', run: () => openTemplatePicker() }"), 'n picks a template');
+ok(src.includes("{ id: 'nav.newTaskDefault', title: 'New task', key: 'N', group: 'General', run: () => openNewTaskForm() }"), 'N opens the form with the Task defaults');
 
 // The Activity feed is an internal debugging page. Its direct route remains
 // usable, but users must not discover it through the tab bar, command palette,

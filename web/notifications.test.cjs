@@ -156,7 +156,7 @@ for (const level of URGENCY_LEVELS) {
   ok(card.includes(`data-notify="${level}:visual"`) && card.includes(`data-notify="${level}:email"`), `${level} has visual and email controls`);
   ok(card.includes(`data-notify-test="${level}"`), `${level} can be tested`);
 }
-ok(card.indexOf('critical') < card.indexOf('>low<'), 'levels are listed loudest first');
+ok(card.indexOf('>Critical<') < card.indexOf('>Low<'), 'levels are listed loudest first, in sentence case');
 ok(card.includes('id="notifications"'), 'the card is linkable from the inbox');
 ok(!card.includes('>Delivery<') && !card.includes('data-delivery='),
   'unimplemented delivery preferences are not shown as notification behaviour');

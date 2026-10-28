@@ -6,7 +6,7 @@ import type { TaskView } from '../src/domain/types.js';
 
 /** "Can I merge this task's pull requests?" — asked by whoever is about to
  * confirm it, person or agent, and answered with who can. */
-async function fixture(mergers: Record<string, string[]>) {
+async function fixture(mergers: Record<string, string[]>, landers: string[] = []) {
   const store = await Store.create(':memory:');
   const organization = await store.createOrganization({ name: 'Acme', ownerUserId: 'owner' });
   const project = await store.createProject('Site', { remote: 'pr' }, organization.id);
@@ -18,7 +18,11 @@ async function fixture(mergers: Record<string, string[]>) {
     repositoryPermission: async (userId: string, slug: string) => ({ canMerge: (mergers[slug] ?? []).includes(userId) }),
   } as any;
   const tokens = new TokenAuthority(store);
-  const api = new KarmaxApi({ store, tokens, githubApp, client: {} as any, taskQueue: 'test' });
+  // tavya lets `landers` merge into the target; without a GitHub account of
+  // their own, the App lands their work (wiki features/github-repository-access).
+  const authorization = { capabilitiesAsync: async (principal: string) =>
+    landers.includes(principal.replace(/^user:/, '')) ? ['merge-into:*'] : [] } as any;
+  const api = new KarmaxApi({ store, tokens, githubApp, authorization, client: {} as any, taskQueue: 'test' });
   const task = await store.createTask({ projectId: project.id, title: 'Change', workflow: 'software-dev', workflowVersion: '1.4.0',
     createdBy: { kind: 'user', userId: 'creator' }, params: { prompt: 'work' } });
   const pr = (slug: string, number: number) => ({ repo: slug.split('/')[1]!, slug, number, url: `https://github.com/${slug}/pull/${number}`, state: 'open' as const });
@@ -42,6 +46,14 @@ describe('merge eligibility', () => {
     expect(await f.api.mergeEligibility(await f.as('lead'), f.task.id)).toMatchObject({ canMerge: true, blocked: false });
     // The creator sponsors the merge when the reviewer cannot.
     expect(await f.api.mergeEligibility(await f.as('reviewer'), f.task.id)).toMatchObject({ canMerge: false, blocked: false });
+  });
+
+  it('counts someone without GitHub whom tavya lets land the work: the App merges for them', async () => {
+    const f = await fixture({ 'acme/site': ['lead'], 'acme/docs': ['lead'] }, ['unconnected']);
+    expect(await f.api.mergeEligibility(await f.as('unconnected'), f.task.id)).toMatchObject({ canMerge: true, blocked: false });
+    // A connected person is judged by GitHub, whatever tavya would allow.
+    const g = await fixture({ 'acme/site': ['lead'], 'acme/docs': ['lead'] }, ['reviewer']);
+    expect(await g.api.mergeEligibility(await g.as('reviewer'), g.task.id)).toMatchObject({ canMerge: false, blocked: true });
   });
 
   it('answers an agent the same way', async () => {

@@ -114,10 +114,13 @@ describe('events in the console', () => {
       body: JSON.stringify({ title: 'Boom', level: 'error' }) });
     expect(delivered.status).toBe(202);
     await reveal.locator('[data-pe-done]').click();
-    await expect.poll(async () => box.locator('[data-hook]').textContent()).toMatch(/Sentry[\s\S]*sentry\.alert[\s\S]*1 received/);
+    await expect.poll(async () => box.locator('[data-hook]').textContent()).toMatch(/Sentry[\s\S]*Sentry alert[\s\S]*1 received/);
     expect(await box.textContent()).not.toContain(secret);
+    // Recent events fold behind their count; a type reads as words, the raw type is its title.
+    await box.locator('.pe-recent > summary').click();
     const event = box.locator('.pe-event').first();
-    expect(await event.locator('summary').textContent()).toMatch(/sentry\.alert[\s\S]*Sentry[\s\S]*No task waits for this/);
+    expect(await event.locator('summary').textContent()).toMatch(/Sentry alert[\s\S]*Sentry[\s\S]*No task waits for this/);
+    expect(await event.locator('.setting-label').getAttribute('title')).toBe('sentry.alert');
     await event.locator('summary').click();
     expect(await event.locator('.pe-payload').textContent()).toContain('"level": "error"');
     page.once('dialog', (dialog) => dialog.accept());
@@ -186,8 +189,12 @@ describe('events in the console', () => {
     // Below the usual task list (or its empty state), never above it.
     expect(await page.locator('* + .store-recs').count()).toBe(1);
     expect(await page.locator('.store-recs + *').count()).toBe(0);
+    // Only what can run now; the rest wait in the store, and the GitHub they lack is said once.
     expect(await recs.locator('[data-store-task]').evaluateAll((rows) => rows.map((row) => row.getAttribute('data-store-task'))))
-      .toEqual(['project-wiki', 'repair-github-workflow', 'build-planned-issues', 'triage-issues', 'chat-requests']);
+      .toEqual(['project-wiki']);
+    expect(await recs.locator('.store-recs-more').innerText()).toMatch(/^4 more in the Task store\s*·\s*Connect GitHub$/);
+    expect(await recs.locator('.store-recs-more a', { hasText: 'Connect GitHub' }).getAttribute('href')).toBe('/personal/factory/settings#project');
+    expect(await recs.textContent()).not.toContain('Needs GitHub');
     if (process.env.KARMAX_SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.KARMAX_SCREENSHOT_DIR, 'store-recommended.png') });
     await recs.locator('#store-recs-dismiss').click();
     expect(await recs.count()).toBe(0);
@@ -263,7 +270,7 @@ describe('events in the console', () => {
     await form.locator('#tf-queue').click();
     await expect.poll(() => page.url()).toMatch(/\/personal\/factory\/tasks\/\d+$/);
     const run = (await store.listTasks(project.id)).find((task) => task.params?.template === 'project-wiki')!;
-    expect(run.title).toBe('Auto-create project wiki (memories, skills, AGENTS.md)');
+    expect(run.title).toBe('Set up the project wiki');
     expect(run.params.prompt).toBe('Write the wiki, but only for the API.');
     expect(run.params.draft).toBeFalsy();
 
@@ -278,7 +285,7 @@ describe('events in the console', () => {
     expect(series.params).toMatchObject({ repeatable: true, triggerState: 'armed', prompt: 'Build the issue below; keep the change small.',
       triggers: [{ type: 'github.issues.labeled', where: { 'label.name': 'ready' } }] });
     const row = page.locator('.store-row[data-store-task="build-planned-issues"]');
-    await expect.poll(async () => row.textContent()).toMatch(/installed[\s\S]*Open/);
+    await expect.poll(async () => row.textContent()).toMatch(/Installed[\s\S]*Open/);
     // Installed, its row still opens the form, to install another (say, for another label).
     await row.click({ position: { x: 40, y: 12 } });
     await form.locator('#ev-conds .ev-val').waitFor();
@@ -316,7 +323,7 @@ describe('events in the console', () => {
       await expect.poll(() => page.url()).toMatch(/\/personal\/website\/store\/triage-issues$/);
       const form = page.locator('#tf-page:not([aria-busy])');
       await form.waitFor();
-      expect(await form.locator('#tf-project').textContent()).toContain('website');
+      expect(await form.locator('#tf-project').textContent()).toContain('Website');
       // Another project from the form: the same store task there, with what you wrote.
       await form.locator('[data-field="prompt"]').fill('Triage only bug reports.');
       await form.locator('#tf-project').click();
@@ -358,7 +365,7 @@ describe('events in the console', () => {
     await store.attachProjectRepository({ projectId: project.id, repositoryId: repository.id });
     await page.reload();
     await row('build-planned-issues').locator('[data-store-run]:not([disabled])').click();
-    await expect.poll(async () => row('build-planned-issues').textContent()).toMatch(/installed[\s\S]*Open/);
+    await expect.poll(async () => row('build-planned-issues').textContent()).toMatch(/Installed[\s\S]*Open/);
     const series = (await store.listTasks(project.id)).find((task) => task.params?.template === 'build-planned-issues')!;
     expect(series.params).toMatchObject({ repeatable: true, triggerState: 'armed', triggers: [{ type: 'github.issues.labeled' }] });
     if (process.env.KARMAX_SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.KARMAX_SCREENSHOT_DIR, 'task-store.png') });

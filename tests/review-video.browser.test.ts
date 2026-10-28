@@ -145,9 +145,14 @@ it('a ~100 MB saved video starts playing in the Review viewer', async () => {
     page.on('request', (request) => { if (request.url().endsWith('/review-action')) resolves++; });
     // The first link answers as an expired one would: the viewer gets a fresh
     // URL and plays anyway.
+    // (Installed once the gallery's thumbnail has its frame: the viewer reuses
+    // the thumbnail's signed URL.)
     const media = '**/api/artifact-content/**';
-    await page.route(media, async (route) => { await route.fulfill({ status: 403, body: '' }); await page.unroute(media); });
     await page.goto(`${running.url}/personal/videos/tasks/${task.num}`);
+    const thumbnail = page.locator('.review-tile video');
+    await thumbnail.waitFor({ state: 'attached' });
+    await expect.poll(() => thumbnail.evaluate((v) => (v as any).readyState), { timeout: 20_000 }).toBeGreaterThan(0);
+    await page.route(media, async (route) => { await route.fulfill({ status: 403, body: '' }); await page.unroute(media); });
     await page.getByRole('button', { name: /Watch the video/ }).click();
 
     const player = page.locator('dialog.artifact-reader video');

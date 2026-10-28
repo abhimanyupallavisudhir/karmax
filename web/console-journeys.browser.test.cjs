@@ -13,6 +13,7 @@ const { fakeConsole, launch, reply } = require('../tests/helpers/fake-console.cj
     const schema = [{ name: 'software-dev', params: [{ name: 'prompt', type: 'text', label: 'Prompt', scopes: ['task'], bind: 'prompt' }], stages: [{ key: 'do', label: 'Working' }] }];
     let failSearch = false, searchDelay = 0, failTagSave = true;
     const { requests, sockets } = await fakeConsole(context, { project, tasks: [task], schema, async api(p, req) {
+      if (p === '/api/search/fields') return [{ key: 'tag', label: 'Tag', type: 'tag' }];
       if (p === '/api/projects/p/tags') {
         if (req.method() !== 'POST') return tags;
         await new Promise(resolve => setTimeout(resolve, 150));
@@ -34,7 +35,9 @@ const { fakeConsole, launch, reply } = require('../tests/helpers/fake-console.cj
     await page.locator('[data-id="t"]').waitFor();
     assert.equal(await page.locator('[data-id="t"] .task-title').textContent(), '#1 Review <script>世界</script>');
     assert.equal(await page.locator('#main script').count(), 0);
-    await page.getByRole('button', { name: 'Tags', exact: true }).click();
+    // Tags are managed from the Filter menu's Tag picker.
+    await page.locator('#q-filter-field').selectOption('tag');
+    await page.locator('#fp-manage-tags').click();
     await page.locator('#tagm-name').fill('未保存 <b>draft</b>');
     await page.locator('[data-edittag="tag"]').click();
     assert.equal(await page.locator('#tagm-name').inputValue(), '未保存 <b>draft</b>');

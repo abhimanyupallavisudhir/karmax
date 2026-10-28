@@ -15,6 +15,11 @@ async function organization(selector: string, api: ApiHandler, hostLocal = true)
   await ui.page.locator(`.settings-nav a[href="#${id}"]`).click();
   return ui;
 }
+/** Settings → Resources → Connect a computer → `provider`. */
+async function connectMenu(ui: Awaited<ReturnType<typeof organization>>, provider: string) {
+  await ui.page.locator('#org-computers .computer-add > summary').click();
+  await ui.page.locator(`#org-computers .computer-add [data-provider="${provider}"]`).click();
+}
 const usageApi = (usage: Record<string, unknown>): ApiHandler => ({ path }) => path === '/api/organizations/o/usage'
   ? { costMicros: 1_750_000, incurredCostMicros: 1_000_000, estimatedCostMicros: 750_000, activeReservationsMicros: 250_000,
     events: 3, from: month, ...usage }
@@ -27,10 +32,12 @@ describe('organization Computers and usage UI', () => {
   it('lists each cloud computer with its state, an edit dialog and a test', async () => {
     const ui = await organization('#org-computers .computer-provider', ({ method, path }) => path === '/api/organizations/o/world-providers'
       ? connected : method === 'POST' && path.endsWith('/test') ? {} : undefined);
-    const rows = ui.page.locator('#org-computers .computer-provider');
+    // The connected accounts are rows; the others wait in one Connect menu.
+    const rows = ui.page.locator('#org-computers .computer-providers > .computer-provider');
     expect(await rows.evaluateAll((elements) => elements.map((row) => [row.querySelector('b')!.textContent, row.querySelector('.chip')!.textContent])))
-      .toEqual([['E2B', 'connected'], ['Daytona', 'failing'], ['Fly.io', 'not connected'], ['Hetzner', 'not connected'],
-        ['AWS', 'not connected'], ['Google Cloud', 'not connected']]);
+      .toEqual([['E2B', 'Connected'], ['Daytona', 'Failing']]);
+    expect(await ui.page.locator('#org-computers .computer-add-menu [data-provider]').allTextContents())
+      .toEqual(['Fly.io', 'Hetzner', 'AWS', 'Google Cloud']);
     expect(await rows.nth(1).locator('.chip').getAttribute('title')).toBe('Daytona connection failed: 401');
     await rows.nth(0).getByRole('button', { name: 'Test' }).click();
     await expect.poll(() => ui.calls.some((call) => call.method === 'POST' && call.path === '/api/organizations/o/world-providers/e2b/test')).toBe(true);
@@ -47,9 +54,8 @@ describe('organization Computers and usage UI', () => {
 
   it('connects a provider: saves the key, then verifies it', async () => {
     const ui = await organization('#org-computers .computer-provider', ({ method, path }) => method === 'PUT' || method === 'POST' ? {} : undefined);
-    const daytona = ui.page.locator('#org-computers [data-provider="daytona"]');
-    expect(await daytona.locator('.chip').textContent()).toBe('not connected');
-    await daytona.getByRole('button', { name: 'Connect' }).click();
+    expect(await ui.page.locator('#org-computers .computer-providers > .computer-provider').count()).toBe(0);
+    await connectMenu(ui, 'daytona');
     const dialog = ui.page.locator('.computer-dialog');
     expect(await dialog.locator('.computer-key').getAttribute('placeholder')).toBe('Required');
     await dialog.locator('.computer-key').fill('dtn-key');
@@ -64,7 +70,7 @@ describe('organization Computers and usage UI', () => {
 
   it('connects a VM provider with its region', async () => {
     const ui = await organization('#org-computers .computer-provider', ({ method }) => method === 'PUT' || method === 'POST' ? {} : undefined);
-    await ui.page.locator('#org-computers [data-provider="fly"] .computer-connect').click();
+    await connectMenu(ui, 'fly');
     const dialog = ui.page.locator('.computer-dialog');
     await dialog.locator('.computer-key').fill('FlyV1 fm2_key');
     await dialog.locator('.computer-advanced > summary').click();
@@ -80,7 +86,7 @@ describe('organization Computers and usage UI', () => {
 
   it('connects AWS with its access key in two parts, and Google Cloud with a key file', async () => {
     const ui = await organization('#org-computers .computer-provider', ({ method }) => method === 'PUT' || method === 'POST' ? {} : undefined);
-    await ui.page.locator('#org-computers [data-provider="aws"] .computer-connect').click();
+    await connectMenu(ui, 'aws');
     let dialog = ui.page.locator('.computer-dialog');
     expect(await dialog.locator('.computer-key-link').getAttribute('href')).toBe('/docs/computers#aws');
     const parts = dialog.locator('.computer-key-part');
@@ -96,7 +102,7 @@ describe('organization Computers and usage UI', () => {
     await dialog.getByRole('button', { name: 'Connect' }).click();
     await expect.poll(() => ui.calls.find((call) => call.method === 'PUT' && call.path.endsWith('/aws'))?.body)
       .toMatchObject({ apiKey: 'AKIAABCDEFGHIJKLMNOP:abc/def+ghi', config: { region: 'us-east-1' } });
-    await ui.page.locator('#org-computers [data-provider="gcp"] .computer-connect').click();
+    await connectMenu(ui, 'gcp');
     dialog = ui.page.locator('.computer-dialog');
     expect(await dialog.locator('textarea.computer-key').getAttribute('placeholder')).toBe('Paste or drop the JSON key file');
     await dialog.locator('.computer-key').fill('{"type": "service_account"}\n');
@@ -110,7 +116,7 @@ describe('organization Computers and usage UI', () => {
     for (const [provider, field, value] of [['e2b', 'template', 'my-template'], ['daytona', 'snapshot', 'my-snapshot']] as const) {
       const ui = await organization('#org-computers .computer-provider', ({ method, path }) => method === 'PUT'
         && path === `/api/organizations/o/world-providers/${provider}` ? { status: 400, json: { error: 'API key rejected by provider' } } : undefined);
-      await ui.page.locator(`#org-computers [data-provider="${provider}"] .computer-connect`).click();
+      await connectMenu(ui, provider);
       const dialog = ui.page.locator('.computer-dialog');
       await dialog.locator('.computer-key').fill('sk-typed-key');
       await dialog.locator('.computer-advanced > summary').click();

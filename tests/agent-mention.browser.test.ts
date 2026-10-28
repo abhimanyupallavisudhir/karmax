@@ -134,7 +134,7 @@ it('calls a new agent into a task from the follow-up box with @+', async () => {
 
   // Stop, like Ctrl+C: the working agent's turn ends and the task goes on.
   // (Unaddressed text replies to Agent 1, which just answered you; the box says so.)
-  await step('the box replies to Agent 1', () => expect.poll(() => box.getAttribute('placeholder'), { timeout: 15_000 }).toMatch(/^Reply to Agent 1 /));
+  await step('the box replies to Agent 1', () => expect.poll(() => box.getAttribute('placeholder'), { timeout: 15_000 }).toBe('Reply to Agent 1'));
   await box.fill('Take your time.\n@sleep 120000');
   await page.locator('.followup-box[data-role="do"] .followup-send').click();
   // Unrouted, not left passing through: a poll still in the route when the

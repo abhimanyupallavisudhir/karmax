@@ -40,7 +40,10 @@ describe('settings, one row per setting', () => {
     const pins = ui.page.locator('#wf-pins-list .wf-pin');
     await pins.first().waitFor();
     expect(await pins.evaluateAll((selects) => selects.map((select) => (select as any).dataset.wf))).toEqual(['software-dev']);
-    expect(await ui.page.locator('#wf-pins-list b').getAttribute('title')).toBe('Code changes');
+    // Named, with what it is for as a tip; versions read "Latest (1.1.0)", not "latest (v1.1.0)".
+    expect(await ui.page.locator('#wf-pins-list b').textContent()).toBe('Software dev');
+    expect(await ui.page.locator('#wf-pins-list .info-dot').getAttribute('title')).toMatch(/reviewed/);
+    expect(await pins.first().locator('option').allTextContents()).toEqual(['Latest (1.1.0)', '1.1.0', '1.0.0']);
     await ui.close();
   });
 });
