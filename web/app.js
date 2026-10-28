@@ -17429,7 +17429,8 @@ function wikiScopeInfo(proj) {
 function wikiView(proj) {
   const info = wikiScopeInfo(proj);
   if (!info) return `<div class="empty">No organization yet.</div>`;
-  return `<div class="organization-settings wiki-page"><div class="settings-header">${proj ? '' : '<h1 class="page-title">Wiki</h1>'}${proj ? `<label class="wiki-view-picker" title="Show this wiki on another branch, or live in a task's checkout">
+  // The branch picker shows only once there is another branch or task to view.
+  return `<div class="organization-settings wiki-page"><div class="settings-header">${proj ? '' : '<h1 class="page-title">Wiki</h1>'}${proj ? `<label class="wiki-view-picker" title="Show this wiki on another branch, or live in a task's checkout"${wikiViewChoices(proj) ? '' : ' hidden'}>
       <span>Viewing</span><select id="wiki-view-select">${wikiViewOptionsHtml(proj)}</select></label>` : ''}</div>
     <div class="settings-layout"><nav class="settings-nav wiki-nav" id="wiki-nav" aria-label="Wiki entries"></nav>
     <div class="settings-content" id="wiki-pane"></div></div></div>`;
@@ -17458,6 +17459,11 @@ function wikiViewOptionsHtml(proj) {
     + (branches.length ? `<optgroup label="Branches">${branches.map(option).join('')}</optgroup>` : '');
 }
 
+// Whether the branch picker has anything to choose (more than the default branch).
+function wikiViewChoices(proj) {
+  return (wikiViewOptionsHtml(proj).match(/<option /g) || []).length > 1;
+}
+
 // The picker's list changes only as tasks start and finish: fetch it at most
 // every half minute, in the background, and never rebuild an open dropdown.
 function loadWikiRefs(proj) {
@@ -17468,7 +17474,10 @@ function loadWikiRefs(proj) {
     S.wikiRefs[proj.id] = { data, at: Date.now() };
     const select = $('#wiki-view-select');
     if (!select || S.projectId !== proj.id || S.tab !== 'wiki') return;
-    const refresh = () => { select.innerHTML = wikiViewOptionsHtml(proj); };
+    const refresh = () => {
+      select.innerHTML = wikiViewOptionsHtml(proj);
+      select.closest('.wiki-view-picker').hidden = !wikiViewChoices(proj);
+    };
     if (document.activeElement === select) select.addEventListener('blur', refresh, { once: true });
     else refresh();
   }).catch(() => { S.wikiRefs[proj.id] = { ...entry, pending: null }; });
@@ -18083,23 +18092,33 @@ function wireWikiLocalLinks(root, proj) {
 
 // ── panes ────────────────────────────────────────────────────────────────────
 // Index: exactly what agents receive each turn — every unconditional entry in
-// full, then the rendered table of contents (importance order, [more…] folds).
+// full (a folded row each: the whole text of every one would bury the rest),
+// then the rendered table of contents (importance order, [more…] folds).
 function renderWikiHome(info, proj, pane, data) {
-  const bodies = [...(data.unconditional || []).map((u) => u.body || ''), ...(data.tocText ? [data.tocText] : [])];
-  const titled = (u) => (/^\s*#\s+(.+)/.exec(u.body || '')?.[1] || '').trim().toLowerCase() === String(u.name || '').trim().toLowerCase();
-  if (!bodies.length) { pane.innerHTML = '<div class="card queue-empty">No entries yet</div>'; return; }
-  pane.innerHTML = (data.unconditional || []).map((u) => `
+  const always = data.unconditional || [];
+  // A body opening with its own name as the heading does not repeat it.
+  const untitled = (u) => (/^\s*#\s+(.+)/.exec(u.body || '')?.[1] || '').trim().toLowerCase() === String(u.name || '').trim().toLowerCase()
+    ? (u.body || '').replace(/^\s*#\s+.+\n?/, '') : (u.body || '');
+  if (!always.length && !data.tocText) { pane.innerHTML = '<div class="card queue-empty">No entries yet</div>'; return; }
+  const tex = (text) => (hasMath(text) ? texToggleHtml(!markdownEnabled()) : '');
+  const editable = (u) => data.view?.writable !== false && u.writable !== false;
+  pane.innerHTML = (always.length ? `
+    <div class="card wiki-uncond wiki-always">
+      <div class="wiki-uncond-head"><b>In every prompt</b>${policyTip('Agents get these in full with every task.')}</div>
+      ${always.map((u) => `<details class="wiki-always-row">
+        <summary><span class="wiki-always-name">${esc(u.name || u.path)}</span>${u.description ? `<span class="wiki-always-desc">${esc(u.description)}</span>` : ''}</summary>
+        <div class="msg-text md wiki-md"></div>
+        ${editable(u) || hasMath(u.body) ? `<div class="inline-form wiki-always-foot">${editable(u) ? `<button class="btn sm wiki-uncond-edit" data-path="${esc(u.path)}">Edit</button>` : ''}${tex(u.body)}</div>` : ''}
+      </details>`).join('')}
+    </div>` : '') + (data.tocText ? `
     <div class="card wiki-uncond">
-      <div class="wiki-uncond-head">${titled(u) ? '' : `<b>${esc(u.name)}</b>`}${u.builtin ? '<span class="chip">built-in</span>' : ''}<span class="grow"></span>
-        ${data.view?.writable === false || u.writable === false ? '' : `<button class="btn sm wiki-uncond-edit" data-path="${esc(u.path)}">Edit</button>`}${texToggleHtml(!markdownEnabled())}</div>
-      <div class="msg-text md wiki-md"></div>
-    </div>`).join('') + (data.tocText ? `
-    <div class="card wiki-uncond">
-      <div class="wiki-uncond-head"><b>Table of contents</b><span class="chip" title="Sent to agents as names and descriptions only; they open entries with read_wiki">titles only</span><span class="grow"></span>${texToggleHtml(!markdownEnabled())}</div>
-      <div class="msg-text md wiki-md"></div>
+      <div class="wiki-uncond-head"><b>Table of contents</b>${policyTip('Agents get the names and descriptions, and open an entry when they need it.')}<span class="grow"></span>${tex(data.tocText)}</div>
+      <div class="msg-text md wiki-md wiki-toc"></div>
     </div>` : '');
-  pane.querySelectorAll('.wiki-md').forEach((el, i) =>
-    mountMarkdownSurface(el, (math) => renderMessageBody(bodies[i], math), (body) => wireWikiLocalLinks(body, proj)));
+  pane.querySelectorAll('.wiki-always-row .wiki-md').forEach((el, i) =>
+    mountMarkdownSurface(el, (math) => renderMessageBody(untitled(always[i]), math), (body) => wireWikiLocalLinks(body, proj)));
+  const toc = pane.querySelector('.wiki-toc');
+  if (toc) mountMarkdownSurface(toc, (math) => renderMessageBody(data.tocText, math), (body) => wireWikiLocalLinks(body, proj));
   wireTexToggles(pane);
   pane.querySelectorAll('.wiki-uncond-edit').forEach((b) => b.addEventListener('click', async () => {
     try {
@@ -18118,15 +18137,16 @@ function renderWikiPage(info, proj, pane, page) {
     ? (page.overridden ? '<button class="btn sm danger" id="wiki-page-delete">Restore default</button>' : '')
     : '<button class="btn sm danger" id="wiki-page-delete">Delete</button>';
   // Kind and path are reference details (the tip); chips are only for states.
-  pane.innerHTML = `<div class="settings-section-title"><div>${esc(page.name)} ${policyTip(`${page.kind} · ${page.path}`)}
-      ${wikiIsDefault(page) ? '<span class="chip active" title="Labelled “default” — inlined into every task’s prompt">always in prompt</span>' : ''}
+  // Whether it ships with the app (and was changed here) is reference too.
+  const origin = page.overridden ? ' · Built-in, edited here' : page.builtin ? ' · Built-in' : '';
+  pane.innerHTML = `<div class="settings-section-title"><div>${esc(page.name)} ${policyTip(`${page.kind === 'memory' ? 'Memory' : 'Skill'} · ${page.path}${origin}`)}
+      ${wikiIsDefault(page) ? `<span class="chip active" title="${esc('Agents get it in full with every task')}">In every prompt</span>` : ''}
       ${(page.labels || []).filter((l) => l !== 'default').map((l) => `<span class="chip">${esc(l)}</span>`).join('')}
-      ${page.overridden ? '<span class="chip">customized</span>' : page.builtin ? '<span class="chip">built-in</span>' : ''}
       ${page.description ? `<small>${esc(page.description)}</small>` : ''}</div></div>
     <div class="card">
       <div class="msg-text md wiki-md"></div>
       ${page.files?.length ? `<div class="settings-divider"></div><div class="task-sub">${page.files.map((f) => `<code>${esc(f)}</code>`).join(' ')}</div>` : ''}
-      <div class="inline-form" style="margin-top:10px">${page._wikiWritable === false ? (info.scope === 'project' ? '<span class="task-sub">Read-only branch view</span>' : '') : `<button class="btn sm" id="wiki-page-edit">Edit</button>${remove}`}${texToggleHtml(!markdownEnabled())}</div>
+      <div class="inline-form" style="margin-top:10px">${page._wikiWritable === false ? (info.scope === 'project' ? '<span class="task-sub">Read-only branch view</span>' : '') : `<button class="btn sm" id="wiki-page-edit">Edit</button>${remove}`}${hasMath(wikiBody(page.content)) ? texToggleHtml(!markdownEnabled()) : ''}</div>
     </div>`;
   mountMarkdownSurface(pane.querySelector('.wiki-md'), (math) => renderMessageBody(wikiBody(page.content), math), (body) => wireWikiLocalLinks(body, proj));
   wireTexToggles(pane);
@@ -18164,7 +18184,7 @@ function renderWikiEditor(info, proj, pane, page) {
     <div class="wiki-title-row">
       <div class="wiki-path-edit" id="wiki-path" contenteditable="${page?.builtin ? 'false' : 'true'}" spellcheck="false"></div>
       ${page?.builtin
-        ? `<span class="chip">${page.kind}</span><span class="chip">built-in</span>`
+        ? `<span class="chip">${page.kind === 'memory' ? 'Memory' : 'Skill'}</span>${policyTip('Built-in: your edit replaces it here; Restore default brings it back.')}`
         : `<select id="wiki-kind"><option value="skill" ${(page?.kind ?? 'skill') === 'skill' ? 'selected' : ''}>Skill</option><option value="memory" ${page?.kind === 'memory' ? 'selected' : ''}>Memory</option></select>`}
     </div>
     <div class="wiki-warn" id="wiki-path-warn" hidden></div>
@@ -18179,7 +18199,7 @@ function renderWikiEditor(info, proj, pane, page) {
         <button class="wiki-body-tab active" id="wiki-tab-write" type="button">Write</button>
         <button class="wiki-body-tab" id="wiki-tab-preview" type="button">Preview</button>
         <span class="grow"></span>
-        ${texToggleHtml(!markdownEnabled())}
+        <span class="wiki-preview-tex" hidden>${texToggleHtml(!markdownEnabled())}</span>
         <label class="switch"><input type="checkbox" id="wiki-yaml"><span>YAML</span></label>
       </div>
       <textarea id="wiki-body" rows="16">${esc(body)}</textarea>
@@ -18230,6 +18250,7 @@ function renderWikiEditor(info, proj, pane, page) {
     $('#wiki-tab-preview').classList.remove('active');
     $('#wiki-body').hidden = false;
     $('#wiki-preview').hidden = true;
+    $('.wiki-preview-tex', pane).hidden = true;
   };
   $('#wiki-tab-write').addEventListener('click', showWrite);
   $('#wiki-tab-preview').addEventListener('click', () => {
@@ -18240,6 +18261,7 @@ function renderWikiEditor(info, proj, pane, page) {
     mountMarkdownSurface(preview, (math) => renderMessageBody(source, math) || '<span class="task-sub">Nothing to preview.</span>');
     $('#wiki-body').hidden = true;
     preview.hidden = false;
+    $('.wiki-preview-tex', pane).hidden = !hasMath(source);
   });
   wireTexToggles(pane);
 
