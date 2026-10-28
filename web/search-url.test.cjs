@@ -220,6 +220,7 @@ global.runSearch = async () => { searched++; };
 global.renderMain = () => { rendered++; };
 global.currentPath = () => location.pathname + location.search;
 eval(extractFn('syncQueryUrl'));
+eval(extractFn('searchBoxText'));
 eval(extractFn('setQuery'));
 
 (async () => {
@@ -247,6 +248,12 @@ eval(extractFn('setQuery'));
   eq(currentPath(), '/acme/website-redesign?q=', 'clearing the search shows every task — kept in the URL so it survives a reload');
   await setQuery('for:me -is:archived');
   eq(currentPath(), '/acme/website-redesign', 'the default view needs no param');
+  eq(box.value, '', "a view's own query is its lit chip, not text in the search box");
+  await setQuery('-is:archived');
+  eq(box.value, '', 'nor is Active’s');
+  await setQuery('for:me -is:archived tag:bug');
+  eq(box.value, 'for:me -is:archived tag:bug', 'a search of your own shows in full');
+  await setQuery('for:me -is:archived');
 
   // The organization home owns its own query in the same way.
   Object.assign(S, { tab: 'home', searchScope: 'org:org_acme' });

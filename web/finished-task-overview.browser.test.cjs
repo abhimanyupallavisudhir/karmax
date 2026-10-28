@@ -91,12 +91,12 @@ const root = __dirname;
     assert.equal(await page.locator('.review-info').count(), 1, 'the summary shows once');
     assert.equal(await page.locator('#tp-rail #task-notes').inputValue(), 'Ask design about the icon', 'notes are in the rail');
     assert.match(overview, /Screenshot/, 'review outputs stay openable');
-    assert.match(overview, /2 task forks/, 'finished and live forks are both listed');
-    assert.match(overview, /Forked from\s*2 source tasks\s*#8\s*Sketch the export[\s\S]*#9\s*Export as CSV[\s\S]*Agent forks/i,
+    assert.match(overview, /Forks\s*2/i, 'finished and live forks are both listed');
+    assert.match(overview, /Forked from\s*#8\s*Sketch the export[\s\S]*#9\s*Export as CSV[\s\S]*Forks/i,
       'the tasks it was forked from are listed, oldest first, above its own forks');
     assert.equal(await page.locator('#fork-sources-title').locator('xpath=ancestor::section').locator('a[href$="/tasks/origin"] + .fork-tree a[href$="/tasks/attempt"]').count(), 1,
       'its direct source nests under the task that one was forked from');
-    assert.equal(await page.locator('a[href$="/tasks/fork-done"] .subtask-state.done').count(), 1, 'the finished fork shows as done');
+    assert.equal(await page.locator('a[href$="/tasks/fork-done"] .chip.done').count(), 1, 'the finished fork shows as done');
     assert.match(overview, /PR #7\s*merged/i, 'the merged pull request stays linked');
 
     await page.waitForSelector('#ck-term-item');

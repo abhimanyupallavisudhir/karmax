@@ -323,7 +323,7 @@ describe('events in the console', () => {
       await expect.poll(() => page.url()).toMatch(/\/personal\/website\/store\/triage-issues$/);
       const form = page.locator('#tf-page:not([aria-busy])');
       await form.waitFor();
-      expect(await form.locator('#tf-project').textContent()).toContain('website');
+      expect(await form.locator('#tf-project').textContent()).toContain('Website');
       // Another project from the form: the same store task there, with what you wrote.
       await form.locator('[data-field="prompt"]').fill('Triage only bug reports.');
       await form.locator('#tf-project').click();

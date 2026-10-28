@@ -88,7 +88,7 @@ const root = __dirname;
     assert.equal(await page.locator('#tp-rail .rail-inner > :last-child > :last-child').getAttribute('id'), 'ck-term-item', 'the terminal comes last');
     assert.doesNotMatch(await page.locator('#tp-rail').innerText(), /Agents/, 'no agent list: the conversation already shows who speaks');
     assert.equal(await page.locator('.ck-tools #local-checkout').count(), 1, 'Work locally sits beside Share and Fork');
-    assert.match(await page.locator('#tp-rail').innerText(), /src\/theme\.js/, 'workflow widgets are in the rail');
+    assert.match(await page.locator('#tp-rail').textContent(), /src\/theme\.js/, 'workflow widgets are in the rail (folded)');
     assert.equal(await page.locator('.task-page').evaluate((el) => !el.textContent.includes('Nothing to do here')), true);
 
     // Approval requests load only when their history is opened.

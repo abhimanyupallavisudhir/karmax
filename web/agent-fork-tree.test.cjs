@@ -59,7 +59,7 @@ ok(tree[0].task.id === 'fork-a' && tree[0].children[0].task.id === 'nested', 'a 
 ok(tree[1].task.id === 'fork-b' && tree[1].children.length === 0, 'sibling forks stay at the same level');
 
 const panel = agentForksSection({ taskId: 'source' });
-ok(panel.includes('Agent forks') && panel.includes('3 task forks'), 'the overview section names and counts the full fork tree');
+ok(panel.includes('>Forks <span class="rail-count">3</span>'), 'the rail section names and counts the full fork tree');
 ok(panel.includes('href="/tasks/fork-a"') && panel.includes('href="/tasks/fork-b"') && panel.includes('href="/tasks/nested"'), 'every fork is a real task link');
 ok(panel.indexOf('href="/tasks/nested"') > panel.indexOf('class="fork-tree"', panel.indexOf('href="/tasks/fork-a"')), 'recursive forks render inside a nested tree');
 ok(!panel.includes('Continue raw session') && !panel.includes('Independent task'), 'unrelated continuations and tasks stay out of the section');
@@ -73,11 +73,11 @@ const archived = { taskId: 'source', forkSummaries: [
   { id: 'fork-a', num: 21, title: 'Stale summary title', lastView: { stage: 'setup', status: 'active' }, forkOf: ['source'] },
 ] };
 const withArchived = agentForksSection(archived);
-ok(withArchived.includes('5 task forks'), 'archived forks count alongside live ones');
+ok(withArchived.includes('<span class="rail-count">5</span>'), 'archived forks count alongside live ones');
 ok(withArchived.includes('href="/tasks/fork-done"') && withArchived.includes('Complete'), 'a finished fork stays listed as complete');
 ok(withArchived.indexOf('href="/tasks/fork-done-child"') > withArchived.indexOf('href="/tasks/fork-done"'), 'a fork of an archived fork nests beneath it');
 ok(withArchived.includes('Try the first approach') && !withArchived.includes('Stale summary title'), 'a live record supersedes its summary');
-ok(agentForksSection({ taskId: 'archived-only', forkSummaries: [{ id: 'x', title: 'Only fork', lastView: { status: 'done' }, forkOf: ['archived-only'] }] }).includes('1 task fork'),
+ok(agentForksSection({ taskId: 'archived-only', forkSummaries: [{ id: 'x', title: 'Only fork', lastView: { status: 'done' }, forkOf: ['archived-only'] }] }).includes('<span class="rail-count">1</span>'),
   'a task whose only fork finished still shows it');
 
 // The mirror image: a fork names the tasks it was forked from, oldest first,
@@ -91,12 +91,12 @@ const sourceTree = forkSourceTree(lineage);
 ok(sourceTree.map((node) => node.task.id).join() === 'root,side', 'the oldest ancestors occupy the top level');
 ok(sourceTree[0].children[0].task.id === 'fork-a' && !sourceTree[0].children[0].children.length, 'each source nests under the task it forked');
 const sourcesPanel = forkSourcesSection(lineage);
-ok(sourcesPanel.includes('Forked from') && sourcesPanel.includes('3 source tasks'), 'the section names and counts every ancestor');
+ok(sourcesPanel.includes('Forked from') && ['root', 'fork-a', 'side'].every((id) => sourcesPanel.includes(`href="/tasks/${id}"`)), 'the section names every ancestor (the tree shows how many)');
 ok(sourcesPanel.includes('Try the first approach') && !sourcesPanel.includes('Stale summary title'), 'a live record supersedes its summary');
 ok(sourcesPanel.indexOf('href="/tasks/fork-a"') > sourcesPanel.indexOf('class="fork-tree"', sourcesPanel.indexOf('href="/tasks/root"')), 'a source forked from another renders nested beneath it');
 ok(forkSourcesSection({ taskId: 'source' }) === '', 'a task that is no fork shows no Forked from chrome');
-ok(forkSourcesSection({ taskId: 'x', forkSourceSummaries: [{ id: 'y', title: 'Only source', lastView: { status: 'done' }, forkOf: [] }] }).includes('1 source task<'),
-  'a single source is counted in the singular');
+ok(forkSourcesSection({ taskId: 'x', forkSourceSummaries: [{ id: 'y', title: 'Only source', lastView: { status: 'done' }, forkOf: [] }] }).includes('Only source'),
+  'a single source is listed');
 const cyclic = forkSourceTree({ taskId: 'c', forkSourceSummaries: [{ id: 'p', title: 'P', forkOf: ['q'] }, { id: 'q', title: 'Q', forkOf: ['p'] }] });
 ok(Array.isArray(cyclic), 'cyclic stored parameters do not loop forever');
 

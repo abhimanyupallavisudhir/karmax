@@ -78,7 +78,7 @@ ok(!formHtml.includes('<a') && formHtml.includes('aria-current="true"'), 'the dr
 ok(attemptCard(S.attemptGroup.attempts[0], S.attemptGroup, { taskId: 'attempt-2' }, { form: true }).includes('href="/org/project/tasks/attempt-1"'),
   'the draft form links other attempts without pinning a tab');
 ok((html.match(/data-spa/g) || []).length === 2, 'attempts use native links and the shared router');
-ok(html.includes('working') && html.includes('draft'), 'attempts show readable stage labels');
+ok(html.includes('Working') && html.includes('Draft'), 'attempts show readable stage labels');
 ok(taskRecord('attempt-2')?.params?.draft === true, 'task page resolves non-principal records from the attempt group');
 global.projectById = () => ({ id: 'p' });
 eval(extractFn('taskUrl'));
@@ -89,10 +89,10 @@ ok(taskUrl('attempt-2', { num: 14 }) === '/org/project/tasks/14', 'logical task 
 
 const currentHtml = taskAttempts({ taskId: 'attempt-1', stage: 'done', status: 'done', state: {} });
 const currentCard = currentHtml.match(/<a[^>]*aria-current="true"[^>]*>[\s\S]*?<\/a>/)?.[0] || '';
-ok(currentCard.includes('done') && !currentCard.includes('working'),
+ok(currentCard.includes('Done') && !currentCard.includes('Working'),
   'selected attempt status comes from its current view, not the older group snapshot');
 
-ok(stageLabel({ stage: 'setup', state: { draft: true } }) === 'draft', 'draft stage is labelled clearly');
+ok(stageLabel({ stage: 'setup', state: { draft: true } }) === 'Draft', 'draft stage is labelled clearly');
 const archivedDraftRow = taskRow({
   id: 'attempt-2', title: 'Task', workflow: 'software-dev', num: 14,
   params: { draft: true, archived: true },

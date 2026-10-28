@@ -719,8 +719,8 @@ a.git-repo-name:hover { color:var(--accent); }
 }
 .task-project-org { color: var(--ink-3); font-weight: 400; }
 
-/* The project a new task goes to: its slug, with a menu of the organization's
-   projects (Home's composer, the task form's "← New task" bar). */
+/* The project a new task goes to: its name, with a menu of the organization's
+   projects (the task form's "← New task" bar). */
 .project-pick-wrap { position: relative; display: inline-flex; flex: none; min-width: 0; }
 .project-pick {
   display: inline-flex; align-items: center; gap: 5px; min-width: 0; height: 28px; padding: 0 7px;
@@ -729,6 +729,7 @@ a.git-repo-name:hover { color:var(--accent); }
 .project-pick:hover, .project-pick[aria-expanded="true"] { background: var(--surface-2); color: var(--ink-2); }
 .project-pick:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .project-pick .task-project { font-size: 12.5px; color: var(--ink); }
+.project-pick .project-name, .project-pick-opt .project-name { font-family: var(--font-ui); font-size: 13px; }
 .project-pick.static { display: inline-flex; align-items: center; height: 28px; padding: 0 7px; cursor: default; }
 .project-pick-caret { flex: none; }
 .project-pick-menu {
@@ -769,6 +770,7 @@ a.git-repo-name:hover { color:var(--accent); }
 }
 .checkout-row:last-of-type { border-bottom: 0; }
 .checkout-mark { color: var(--ink-3); width: 12px; text-align: center; }
+.checkout-mark:empty { display: none; }
 .checkout-row.landed .checkout-mark { color: var(--merged, var(--accent)); }
 /* Pull requests to approve, as small boxes at the end of the conversation. */
 .pr-asks { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
@@ -928,9 +930,11 @@ a.git-repo-name:hover { color:var(--accent); }
 .tp-rail .org-editor { margin-top: 0; }
 #task-notes { width: 100%; box-sizing: border-box; min-height: 52px; padding: 7px 9px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-2); color: var(--ink); font: 13px/1.45 var(--font-ui); resize: vertical; }
 #task-notes:focus { background: var(--surface); }
+#tf-notes { width: 100%; box-sizing: border-box; }
 .rail-links { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: 10px 12px 0; border-top: 1px solid var(--line); }
 .rail-link { justify-content: flex-start; }
 .rail-link-count { font-family: var(--font-mono); font-size: 11px; color: var(--ink-3); }
+.rail-link.pending, .rail-link.pending .rail-link-count { color: var(--working); font-weight: 600; }
 /* The shell, last: a quiet row like the links above it. */
 .rail-links .ck-terminal-item { align-self: stretch; margin: 0; border-radius: var(--r-sm); font-size: 12.5px; }
 .rail-links .ck-terminal-open { padding: 5px 6px 5px 4px; }
@@ -946,24 +950,14 @@ a.git-repo-name:hover { color:var(--accent); }
 .ck-agent .ck-stop { width: 18px; height: 18px; border-radius: 999px; }
 .conversation-presence.queued .presence-dot { background: transparent; box-shadow: inset 0 0 0 1.5px var(--ink-3); }
 .ck-switch { width: auto; max-width: 220px; }
-/* Delegated and forked work, branches and widgets: the same objects as
-   elsewhere, flattened into rail sections. */
-.tp-rail .subtasks, .tp-rail .agent-forks { margin: 0; border: 0; border-top: 1px solid var(--line); border-radius: 0; box-shadow: none; background: transparent; }
-.tp-rail .subtasks-head, .tp-rail .agent-forks-head { align-items: center; padding: 12px 16px 6px; }
-.tp-rail .subtasks-kicker, .tp-rail .agent-forks-kicker { display: none; }
-.tp-rail .subtasks h3, .tp-rail .agent-forks h3 { color: var(--ink-3); font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; }
-.tp-rail .subtasks-count, .tp-rail .agent-forks-count { font-size: 11px; }
-.tp-rail .subtasks-count strong { font-size: 11px; }
-.tp-rail .subtasks-progress { margin: 0 16px 4px; }
-.tp-rail .subtask-list, .tp-rail .fork-tree { padding: 0 8px 6px; }
-.tp-rail .subtask-row { grid-template-columns: auto minmax(0, 1fr) auto; gap: 10px; min-height: 0; padding: 7px 8px; border-top: 0; }
-.tp-rail .subtask-pipeline { display: none; }
-.tp-rail .fork-row { min-height: 0; padding: 7px 8px; border-top: 0; }
-.tp-rail .subtask-arrow, .tp-rail .fork-arrow { font-size: 16px; }
-.tp-rail > .rail-inner > .section-h { margin: 0; padding: 12px 16px 6px; border-top: 1px solid var(--line); }
-.tp-rail .checkout-list { margin: 0 16px 8px; padding: 6px 10px; }
-.tp-rail .checkout-row { flex-wrap: wrap; font-size: 12px; }
-.tp-rail .checkout-row .mono { display: none; }
+/* Delegated and forked work and branches: rail sections whose rows open the
+   task; each row's chip is its status, as in the task list. */
+.subtask-list, .fork-tree { margin: 0 -8px; }
+.rail-count { color: var(--ink-3); font-weight: 500; letter-spacing: 0; font-variant-numeric: tabular-nums; }
+.rail-warn { color: var(--danger); }
+.checkout-target { color: var(--ink-3); }
+.checkout-row > .chip { margin-left: auto; }
+.tp-rail .checkout-row { flex-wrap: wrap; gap: 6px 10px; font-size: 12px; }
 .rail-widgets .task-sub { flex-wrap: wrap; font-size: 12px; }
 details.rail-widgets > summary { cursor: pointer; list-style: none; margin: 0; }
 details.rail-widgets > summary::-webkit-details-marker { display: none; }
@@ -1002,7 +996,7 @@ details.rail-widgets[open] > summary::after { transform: rotate(90deg); }
 }
 .tf-head { background: var(--surface); border-bottom: 1px solid var(--line); padding: 12px 0; }
 .tf-head-inner, .tf-foot-inner, .tf-columns { max-width: 1120px; margin: 0 auto; padding: 0 28px; }
-.tf-head-inner { display: flex; align-items: center; gap: 10px; }
+.tf-head-inner { display: flex; align-items: center; gap: 8px 10px; }
 .tf-head h2 { margin: 0; font-size: 17px; letter-spacing: -0.01em; white-space: nowrap; }
 .tf-crumb { color: var(--ink-3); font-size: 13px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* The save note, template and workflow sit at the end; the group (not the
@@ -1052,7 +1046,12 @@ details.rail-widgets[open] > summary::after { transform: rotate(90deg); }
   .tf-side { margin-top: 10px; border-top: 1px solid var(--line); }
   .tf-foot .tf-hint { display: none; }
 }
-@media (max-width: 720px) { .task-form-page { left: 0; } } /* the rail is hidden */
+@media (max-width: 720px) {
+  .task-form-page { left: 0; } /* the rail is hidden */
+  /* A phone: the template and workflow wrap under the title, never off-screen. */
+  .tf-head-inner { flex-wrap: wrap; }
+  .tf-head .tf-crumb { display: none; }
+}
 
 /* Chat view: a chat-style pane — the thread scrolls, the compose box stays put.
    Its agents and the terminal are picked in the details rail. */
@@ -1084,6 +1083,12 @@ details.rail-widgets[open] > summary::after { transform: rotate(90deg); }
 .ck-pane-head { display: flex; align-items: center; gap: 10px; padding: 6px 20px; min-height: 40px; box-sizing: border-box; border-bottom: 1px solid var(--line); background: var(--surface); flex-wrap: wrap; }
 .ck-tools { display: inline-flex; align-items: center; gap: 2px; margin-right: -6px; }
 .ck-tools .tool-sep { width: 1px; height: 16px; margin: 0 4px; background: var(--line); }
+/* A phone: the tools as icons (each names itself in its tooltip), one line. */
+@media (max-width: 700px) {
+  .ck-tools .tool-label { display: none; }
+  .ck-tools .btn.tool { width: 32px; padding: 0; justify-content: center; }
+  .ck-pane-head { padding: 4px 12px; }
+}
 /* min-height:0 lets the thread SHRINK below its content (a flex item's default
    min-height is the content size) — without it a long conversation grows the
    pane instead of scrolling, pushing the compose box off-screen. */
@@ -1125,92 +1130,34 @@ details.rail-widgets[open] > summary::after { transform: rotate(90deg); }
 .section-h { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink-3); font-weight: 600; margin: 18px 0 8px; }
 .section-h:first-child { margin-top: 0; }
 
-/* Delegated work is one composed object, not a loose list of ids. The panel gives
-   the parent an at-a-glance answer to three questions: what was delegated, where
-   is each piece, and how close is the group to returning. */
-.subtasks {
-  margin: 24px 0 4px; overflow: hidden;
-  border: 1px solid var(--line); border-radius: 14px;
-  background: var(--surface); box-shadow: 0 1px 2px rgba(20, 24, 34, .035);
-}
-.subtasks-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; padding: 18px 20px 13px; }
-.subtasks-kicker { margin-bottom: 2px; color: var(--ink-3); font-size: 10px; font-weight: 650; letter-spacing: .09em; text-transform: uppercase; }
-.subtasks h3 { margin: 0; font-size: 17px; line-height: 1.25; letter-spacing: -.015em; }
-.subtasks-count { color: var(--ink-3); font-size: 12px; white-space: nowrap; }
-.subtasks-count strong { color: var(--ink); font-size: 15px; font-weight: 650; }
-.subtasks-progress { height: 3px; margin: 0 20px 5px; overflow: hidden; border-radius: 999px; background: var(--line); }
-.subtasks-progress > span { display: block; width: var(--subtask-progress); height: 100%; border-radius: inherit; background: var(--merged); transition: width .25s ease; }
-.subtask-list { padding: 0 8px 8px; }
-.subtask-row {
-  appearance: none; width: 100%; display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto;
-  align-items: center; gap: 13px; min-height: 64px; padding: 10px 12px;
-  border: 0; border-top: 1px solid var(--line); border-radius: 8px;
+.subtask-row, .fork-row {
+  appearance: none; width: 100%; display: grid; grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center; gap: 10px; padding: 6px 8px;
+  border: 0; border-radius: 8px;
   background: transparent; color: var(--ink); text-align: left; text-decoration: none; cursor: pointer;
   transition: background .12s, transform .04s;
 }
-.subtask-row:first-child { border-top-color: transparent; }
-.subtask-draft { display: flex; align-items: center; gap: 8px; border-top: 1px solid var(--line); }
-.subtask-draft:first-child { border-top-color: transparent; }
-.subtask-draft > .subtask-row { flex: 1; min-width: 0; border-top: 0; }
+.subtask-draft { display: flex; align-items: center; gap: 8px; }
+.subtask-draft > .subtask-row { flex: 1; min-width: 0; }
 .subtask-draft > .btn { flex: none; margin-right: 8px; }
-.subtask-row:hover { background: var(--surface-2); }
-.subtask-row:active { transform: translateY(1px); }
-.subtask-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-.subtask-state { width: 10px; height: 10px; border-radius: 50%; background: var(--ink-3); box-shadow: 0 0 0 4px var(--surface-2); }
-.subtask-state.active { background: var(--accent); box-shadow: 0 0 0 4px var(--accent-weak); animation: pulse 1.4s ease-in-out infinite; }
-.subtask-state.waiting { background: var(--working); box-shadow: 0 0 0 4px var(--working-weak); }
-.subtask-state.blocked, .subtask-state.failed { background: var(--danger); box-shadow: 0 0 0 4px var(--danger-weak); }
-.subtask-state.done { background: var(--merged); box-shadow: 0 0 0 4px var(--merged-weak); }
-.subtask-identity { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
-.subtask-title { min-width: 0; display: flex; align-items: baseline; gap: 7px; }
-.subtask-title strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 600; }
-.subtask-title .task-num { flex: none; font-size: 11px; }
-.subtask-copy { color: var(--ink-3); font-size: 11px; }
-.subtask-copy .chip, .fork-state .chip { margin-left: 4px; padding: 0 6px; font-size: 10px; line-height: 16px; }
-.subtask-pipeline .pipeline .seg { width: 16px; height: 4px; }
-.subtask-pipeline .pipeline .ponr { width: 7px; height: 7px; }
-.subtask-arrow { color: var(--ink-3); font-size: 20px; line-height: 1; transition: transform .12s, color .12s; }
-.subtask-row:hover .subtask-arrow { color: var(--accent); transform: translateX(2px); }
-
-/* Forks belong to conversations rather than the workflow's parent/sub-task
-   control flow. Their nested list keeps that distinction visible while using
-   the same task-state language and full-row navigation as delegated work. */
-.agent-forks {
-  margin: 24px 0 4px; overflow: hidden;
-  border: 1px solid var(--line); border-radius: 14px;
-  background: var(--surface); box-shadow: 0 1px 2px rgba(20, 24, 34, .035);
-}
-.agent-forks-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; padding: 18px 20px 10px; }
-.agent-forks-kicker { margin-bottom: 2px; color: var(--ink-3); font-size: 10px; font-weight: 650; letter-spacing: .09em; text-transform: uppercase; }
-.agent-forks h3 { margin: 0; font-size: 17px; line-height: 1.25; letter-spacing: -.015em; }
-.agent-forks-count { color: var(--ink-3); font-size: 12px; white-space: nowrap; }
-.fork-tree { list-style: none; margin: 0; padding: 0 8px 8px; }
-.fork-tree .fork-tree { margin: 0 0 0 28px; padding: 0 0 0 14px; border-left: 1px solid var(--line); }
+.subtask-row:hover, .fork-row:hover { background: var(--surface-2); }
+.subtask-row:active, .fork-row:active { transform: translateY(1px); }
+.subtask-row:focus-visible, .fork-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.subtask-identity, .fork-identity { min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 3px; }
+.subtask-title, .fork-title { max-width: 100%; min-width: 0; display: flex; align-items: baseline; gap: 7px; }
+.subtask-title strong, .fork-title strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 600; }
+.subtask-title .task-num, .fork-title .task-num { flex: none; font-size: 11px; }
+.subtask-copy .chip, .fork-state .chip { padding: 0 6px; font-size: 10px; line-height: 16px; }
+.subtask-copy .chip + .chip, .fork-state .chip + .chip { margin-left: 4px; }
+.subtask-arrow, .fork-arrow { color: var(--ink-3); font-size: 16px; line-height: 1; transition: transform .12s, color .12s; }
+.subtask-row:hover .subtask-arrow, .fork-row:hover .fork-arrow { color: var(--accent); transform: translateX(2px); }
+/* Forks of forks nest under the task they were forked from. */
+.fork-tree { list-style: none; padding: 0; }
+.fork-tree .fork-tree { margin: 0 0 0 16px; padding: 0 0 0 8px; border-left: 1px solid var(--line); }
 .fork-tree-item { margin: 0; padding: 0; }
-.fork-row {
-  appearance: none; width: 100%; display: grid; grid-template-columns: auto minmax(0, 1fr) auto;
-  align-items: center; gap: 13px; min-height: 54px; padding: 8px 12px;
-  border: 0; border-top: 1px solid var(--line); border-radius: 8px;
-  background: transparent; color: var(--ink); text-align: left; text-decoration: none; cursor: pointer;
-  transition: background .12s, transform .04s;
-}
-.fork-tree > .fork-tree-item:first-child > .fork-row { border-top-color: transparent; }
-.fork-row:hover { background: var(--surface-2); }
-.fork-row:active { transform: translateY(1px); }
-.fork-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-.fork-identity { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
-.fork-title { min-width: 0; display: flex; align-items: baseline; gap: 7px; }
-.fork-title strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 600; }
-.fork-title .task-num { flex: none; font-size: 11px; }
-.fork-state { color: var(--ink-3); font-size: 11px; }
-.fork-arrow { color: var(--ink-3); font-size: 20px; line-height: 1; transition: transform .12s, color .12s; }
-.fork-row:hover .fork-arrow { color: var(--accent); transform: translateX(2px); }
 
 @media (max-width: 700px) {
   .tp-head > .tp-crumbs { padding-left: 28px; }
-  .subtask-pipeline { display: none; }
-  .subtask-row { grid-template-columns: auto minmax(0, 1fr) auto; }
-  .subtasks-head { align-items: center; }
 }
 
 /* thread — a reading surface (Gemini-like): the agent's answers are prose on
@@ -1430,6 +1377,8 @@ details.rail-widgets[open] > summary::after { transform: rotate(90deg); }
 .events { font-family: var(--font-mono); font-size: 12px; color: var(--ink-2); display: flex; flex-direction: column; gap: 3px; max-height: 240px; overflow-y: auto; }
 .events .ev { display: flex; gap: 8px; }
 .events .ev .t { color: var(--accent); flex: none; }
+.events.events-page { max-height: none; }
+.events .ev-task { flex: none; color: var(--ink-3); }
 
 /* advanced disclosure */
 details.advanced { margin-top: 18px; border-top: 1px dashed var(--line); padding-top: 12px; }
@@ -1854,6 +1803,10 @@ a.ins-task-title:hover { color: var(--accent); }
   display: flex; align-items: center; justify-content: center; font-size: 12px;
 }
 .combo-caret:hover { color: var(--ink); }
+/* An audience box reads by name until it is focused (audienceComboHtml). */
+.audience-face { display: none; position: absolute; inset: 0 30px 0 0; align-items: center; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--ink); pointer-events: none; }
+.audience-combo:not(:focus-within) > input.has-face { color: transparent; }
+.audience-combo:not(:focus-within) > input.has-face + .audience-face { display: block; line-height: normal; align-content: center; }
 .combo-menu {
   position: absolute; top: calc(100% + 3px); left: 0; right: 0; z-index: 70;
   max-height: 220px; overflow: auto; background: var(--surface);
@@ -2741,7 +2694,6 @@ html[data-theme="dark"] .github-signin-btn:active,
   background: var(--surface); color: var(--ink); font-family: var(--font-mono); font-size: 13px; text-align: center;
 }
 .cron-cell input:focus { border-color: var(--accent); outline: none; }
-.cron-cell small { color: var(--ink-3); font-size: 10px; }
 
 /* ── Repeatable series + runs (task list) ─────────────────────────────────── */
 .series-row .series-caret { margin-right: 2px; color: var(--ink-3); }
@@ -2764,7 +2716,7 @@ html[data-theme="dark"] .github-signin-btn:active,
   grid-column: 1 / -1; display: flex; align-items: center; gap: 6px; width: max-content;
   font-size: 12px; font-weight: 600; color: var(--ink-2); cursor: pointer;
 }
-.triggers-block .tb-repeat input { width: auto; margin: 0; padding: 0; }
+.triggers-block .tb-repeat input:not(.toggle) { width: auto; margin: 0; padding: 0; }
 /* On event: the type, then its conditions and what a repeat does. */
 .ev-trigger { display:flex; flex-direction:column; gap:6px; min-width:0; }
 .ev-trigger #ev-type, .ev-cond input, .ev-more #ev-key { padding:6px 9px; background:var(--surface); font-family:var(--mono, ui-monospace, monospace); font-size:12.5px; }
@@ -2801,7 +2753,6 @@ html[data-theme="dark"] .github-signin-btn:active,
 .prompt-field > .wiki-ref-editor > textarea { border: none; background: transparent; outline: none; box-shadow: none; resize: vertical; width: 100%; padding: 9px 12px; }
 .prompt-field > .img-chips { margin: 0; padding: 0 10px 9px; }
 .prompt-attach-row { display: flex; align-items: center; gap: 9px; padding: 0 12px 8px; color: var(--ink-3); font-size: 11px; }
-.prompt-attach-row > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .attach-file-button {
   display: inline-flex; flex: none; align-items: center; width: max-content; cursor: pointer;
   color: var(--accent); font-size: 12px; font-weight: 600;
@@ -2811,11 +2762,17 @@ html[data-theme="dark"] .github-signin-btn:active,
 .attach-file-button:focus-within { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 2px; }
 /* The prompt's clean bottom row: the "wiki context" field — no border, just a
    faint hairline separating it from the prompt text above. */
-.prompt-context-row { display: flex; align-items: baseline; gap: 8px; padding: 6px 12px 8px; border-top: 1px solid color-mix(in srgb, var(--line) 55%, transparent); }
-.prompt-context-row .pc-prefix { flex: none; font-size: 10.5px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; color: var(--ink-3); cursor: default; user-select: none; padding-top: 2px; }
-.prompt-context { flex: 1; border: none; background: transparent; outline: none; box-shadow: none; resize: none; overflow: hidden; width: 100%; padding: 1px 0; font-family: var(--font-mono); font-size: 12px; line-height: 1.5; color: var(--accent); }
+.prompt-context-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; padding: 6px 12px 8px; border-top: 1px solid color-mix(in srgb, var(--line) 55%, transparent); }
+.prompt-context-row .pc-prefix { flex: none; font-size: 11.5px; font-weight: 600; color: var(--ink-3); cursor: default; user-select: none; }
+.prompt-context-row > .info-dot { margin-left: -4px; }
+.pc-chips { display: contents; }
+.pc-chip { display: inline-flex; align-items: center; gap: 2px; max-width: 100%; padding: 1px 2px 1px 8px; border-radius: 999px; background: var(--accent-weak); color: var(--accent); font-size: 12px; line-height: 18px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pc-chip-x { width: 18px; height: 18px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: inherit; font-size: 14px; line-height: 1; cursor: pointer; opacity: .7; }
+.pc-chip-x:hover, .pc-chip-x:focus-visible { opacity: 1; background: color-mix(in srgb, var(--accent) 16%, transparent); }
+.prompt-context { flex: 1; min-width: 80px; border: none; background: transparent; outline: none; box-shadow: none; resize: none; overflow: hidden; width: 100%; padding: 1px 0; font-family: var(--font-mono); font-size: 12px; line-height: 1.5; color: var(--accent); }
 .prompt-context::placeholder { color: var(--ink-3); font-family: var(--font-sans, inherit); }
-.prompt-context-row > .wiki-ref-editor { flex: 1; }
+.form-row .prompt-context-row textarea.prompt-context { min-height: 0; border: 0; border-radius: 0; padding: 1px 0; background: transparent; box-shadow: none; }
+.prompt-context-row > .wiki-ref-editor { flex: 1; min-width: 80px; }
 .form-row .prompt-field { background: var(--surface-2); }
 
 /* Wiki-reference editor: the textarea remains the sole editable control while
@@ -2932,6 +2889,10 @@ html[data-theme="dark"] .github-signin-btn:active,
 @media (max-width: 700px) {
   .organizer-row { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; }
   .organizer-row .views-bar, .organizer-row .query-bar { flex-wrap: nowrap; }
+  /* More chips past an edge: that edge fades (wireScrollFade). */
+  .organizer-row.fade-end { -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 36px), transparent); mask-image: linear-gradient(to right, #000 calc(100% - 36px), transparent); }
+  .organizer-row.fade-start { -webkit-mask-image: linear-gradient(to left, #000 calc(100% - 36px), transparent); mask-image: linear-gradient(to left, #000 calc(100% - 36px), transparent); }
+  .organizer-row.fade-start.fade-end { -webkit-mask-image: linear-gradient(to right, transparent, #000 36px, #000 calc(100% - 36px), transparent); mask-image: linear-gradient(to right, transparent, #000 36px, #000 calc(100% - 36px), transparent); }
 }
 
 .views-bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 8px 0 4px; }
@@ -3085,6 +3046,7 @@ html[data-theme="dark"] .github-signin-btn:active,
   border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--line));
   border-radius: 999px; background: var(--surface-2); color: var(--ink-2);
   font: inherit; font-size: 11px; font-weight: 600; cursor: pointer;
+  field-sizing: content; /* the pill hugs its label, not its longest move */
 }
 .stage-picker select:hover { border-color: var(--accent); color: var(--ink); }
 .stage-picker select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
@@ -3465,8 +3427,7 @@ html[data-theme="dark"] .github-signin-btn:active,
 .tf-avatar .form-row { display: flex; flex-direction: column; gap: 10px; padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); }
 .tf-avatar-line { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; }
 .tf-avatar-toggle { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; color: var(--ink-2); cursor: pointer; }
-.tf-avatar-toggle input { width: auto; margin: 0; padding: 0; }
-.tf-avatar-hint { font-weight: 400; color: var(--ink-3); }
+.tf-avatar-toggle input:not(.toggle) { width: auto; margin: 0; padding: 0; }
 .risk-chip { display: inline-flex; align-items: center; padding: 1px 7px; border-radius: 999px; background: var(--danger-weak); color: var(--danger); font-size: 11px; font-weight: 700; white-space: nowrap; }
 .tf-avatar-options { display: grid; grid-template-columns: max-content minmax(0, 1fr); align-items: center; gap: 10px 14px; }
 .tf-avatar-options .tb-label { font-size: 12px; font-weight: 600; color: var(--ink-2); }

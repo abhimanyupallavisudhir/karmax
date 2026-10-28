@@ -78,7 +78,7 @@ it('lands on the organization home, For me across projects, Active one click awa
     expect(listed).toEqual([review.id, draft.id].sort());
     expect(await page.locator('#main .task-row[data-draft]').count()).toBe(1);
     expect(await page.locator('.store-recs .store-row[data-store-task="project-wiki"]').count()).toBe(1);
-    expect(await page.locator(`[data-id="${review.id}"] .chip.attention`).innerText()).toBe('Review');
+    expect(await page.locator(`[data-id="${review.id}"] .chip.attention`).innerText()).toBe('Needs review');
     expect(await page.locator(`[data-id="${review.id}"] .task-project`).innerText()).toBe('website');
     // The search panel stands clear of the list: no tighter above the first row than rows are to each other.
     const gaps = await page.evaluate<{ panel: number; rows: number }>(`(() => {
@@ -124,7 +124,7 @@ it('lands on the organization home, For me across projects, Active one click awa
     await step('New task opens the form, which creates a draft in the project picked there', async () => {
       // It starts in the project last visited, Mobile App; choose Website.
       await page.locator('#expand-task').click();
-      expect(await page.locator('#tf-project').innerText()).toBe('mobile-app');
+      expect(await page.locator('#tf-project').innerText()).toBe('Mobile App');
       await page.locator('#tf-project').click();
       await page.locator('.project-pick-menu:not([hidden]) [data-project="' + web.id + '"]').click();
       await page.locator('#tf-body textarea[data-field="prompt"]').fill('Sync reading positions');
@@ -165,7 +165,7 @@ it('lands on the organization home, For me across projects, Active one click awa
     await page.goto(`${app.url}/personal`);
     await page.locator(`[data-id="${review.id}"]`).waitFor();
     await page.locator('#expand-task').click();
-    expect(await page.locator('#tf-project').innerText()).toBe('website'); // the choice is remembered
+    expect(await page.locator('#tf-project').innerText()).toBe('Website'); // the choice is remembered
     await page.locator('#tf-close').click();
     const shots = process.env.HOME_SCREENSHOTS;
     if (shots) {

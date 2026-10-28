@@ -86,7 +86,7 @@ const root = __dirname;
     const box = page.locator('#ck-thread .pr-ask');
     const row = page.locator('#tp-rail .checkout-row', { hasText: 'pramana-wiki' });
     await box.waitFor();
-    assert.match(await page.locator('#tp-rail .rail-inner > :first-child').innerText(), /^branches$/i, 'Branches heads the rail');
+    assert.match(await page.locator('#tp-rail .rail-inner > :first-child > .rail-h').innerText(), /^branches$/i, 'Branches heads the rail');
     assert.match(await box.innerText(), /pramana-wiki[\s\S]*→ main[\s\S]*#86[\s\S]*Approve/);
     assert.equal(await box.count(), 1, 'one box: the branch without a pull request of its own asks nothing');
     assert.match(await row.innerText(), /In review/);

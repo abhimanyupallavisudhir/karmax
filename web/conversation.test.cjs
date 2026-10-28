@@ -18,6 +18,7 @@ function extractFn(name) {
 
 global.esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 global.renderMessageImages = () => '';
+global.policyTip = (text) => `<button type="button" class="info-dot" title="${global.esc(text)}">ⓘ</button>`;
 // Markdown/copy are exercised by markdown.test.cjs; here we pin the plain path so
 // these assertions stay about the timeline, not the message body renderer.
 global.markdownEnabled = () => false;
@@ -236,7 +237,7 @@ ok(ordered.join(',') === 'm0,a1,u1,a2', 'sequence-numbered replies sort after th
 
 // Forking addresses the conversation being viewed, including completed agents
 // and sessions without a native CLI/config home.
-eval(extractFn('reviewActionBtn'));
+for (const fn of ['reviewActionBtn', 'isReviewTile', 'reviewTileKind', 'reviewTile']) eval(extractFn(fn));
 eval(extractFn('conversationReviewInfo'));
 eval(extractFn('conversationError'));
 eval(extractFn('presenceDetail'));
