@@ -2,7 +2,7 @@ import { ExecutionOutput } from './execution-output.js';
 import type { TaskSecrets } from '../autonomy/task-secrets.js';
 import { AsyncInterval } from '../util/async-interval.js';
 import * as __asyncCollections from '../util/async-collections.js';
-import type { WorldHandle, WorldProcess } from '../world/types.js';
+import type { World, WorldHandle, WorldProcess } from '../world/types.js';
 import { WorldRegistry } from '../world/registry.js';
 import type { Store } from '../store/db.js';
 import type { RunnerPoolService } from '../world/runners.js';
@@ -106,32 +106,46 @@ export class ReviewActionRunner {
       runnerLeaseId = (await this.runners.acquire({ project, taskId: opts.taskId, worldId: opts.world.id,
         provider: opts.world.kind })).leaseId;
     }
+    const releaseRunner = async (handle: WorldHandle) => {
+      if (runnerLeaseId && this.access) await this.access.releaseLeaseAndParkIfIdle(handle, runnerLeaseId);
+      else if (runnerLeaseId) (await this.runners?.release(runnerLeaseId, handle.kind));
+    };
+    let world: World;
+    try {
+      const opened = await this.worlds.open(opts.world);
+      world = this.resources ? await this.resources.prepare(opened) : opened;
+    } catch (error) {
+      await releaseRunner(opts.world);
+      throw error;
+    }
+    // The generation is the opened world's, not the caller's: a finished task's
+    // view still names the world it ended in after a checkpoint wake made a new
+    // one, and the preview gateway serves a lease only for the current
+    // generation ("This preview has stopped", opinions task 2).
+    const handle = world.handle ?? opts.world;
     const previewLeaseIds: string[] = [];
     let openUrls: string[];
     try {
       openUrls = (await __asyncCollections.map((opts.openUrls ?? []), async (url) => (await reviewUrl(
-        this.store, opts.taskId, opts.world, url, previewLeaseIds,
+        this.store, opts.taskId, handle, url, previewLeaseIds,
       ))));
       const durableOpenUrls = openUrls.map(redactPreviewToken);
       (await this.store.createExecution({ id: procId, organizationId: project.organizationId, projectId: project.id,
-        taskId: opts.taskId, worldId: opts.world.id, generation: opts.world.generation ?? 1,
+        taskId: opts.taskId, worldId: handle.id, generation: handle.generation ?? 1,
         kind: opts.kind ?? 'review-action', label: opts.label, command: opts.command, server: !!opts.server,
         openUrls: durableOpenUrls, runnerLeaseId }));
     } catch (error) {
-      if (runnerLeaseId && this.access) await this.access.releaseLeaseAndParkIfIdle(opts.world, runnerLeaseId);
-      else if (runnerLeaseId) (await this.runners?.release(runnerLeaseId, opts.world.kind));
+      await releaseRunner(handle);
       for (const id of previewLeaseIds) (await this.store.revokePreviewLease(id));
       throw error;
     }
     let process: WorldProcess;
     let notice = '';
     try {
-      const opened = await this.worlds.open(opts.world);
-      const world = this.resources ? await this.resources.prepare(opened) : opened;
       // A server owns the ports it declares. In an isolated world, a listener
       // already there is a leftover (usually the agent's own check of this
       // server), and it would make this start fail with EADDRINUSE (task 364).
-      if (opts.server && this.worlds.get(opts.world.kind).capabilities?.remote) {
+      if (opts.server && this.worlds.get(handle.kind).capabilities?.remote) {
         const ports = (opts.openUrls ?? []).map(loopbackPort).filter((port): port is number => port !== undefined);
         for (const stopped of await reclaimPorts(world, ports).catch(() => []))
           notice += `Stopped an earlier process on port ${stopped.port}: ${stopped.command || `pid ${stopped.pid}`}\n`;
@@ -141,8 +155,7 @@ export class ReviewActionRunner {
     } catch (error) {
       (await this.store.appendExecutionFrame(procId, (await scrub(`${error instanceof Error ? error.message : String(error)}\n`)), 'system'));
       (await this.store.finishExecution(procId, null, 'failed'));
-      if (runnerLeaseId && this.access) await this.access.releaseLeaseAndParkIfIdle(opts.world, runnerLeaseId);
-      else if (runnerLeaseId) (await this.runners?.release(runnerLeaseId, opts.world.kind));
+      await releaseRunner(handle);
       for (const id of previewLeaseIds) (await this.store.revokePreviewLease(id));
       throw error;
     }
@@ -161,9 +174,9 @@ export class ReviewActionRunner {
       process,
       listeners: new Set(),
       runnerLeaseId,
-      provider: opts.world.kind,
+      provider: handle.kind,
       previewLeaseIds,
-      world: opts.world,
+      world: handle,
       ...(secrets ? { secrets } : {}),
     };
     const output = new ExecutionOutput(data => this.store.appendExecutionFrame(procId, data), undefined, secrets);
