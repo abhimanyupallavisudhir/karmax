@@ -19310,7 +19310,7 @@ function githubAccessView({ githubApp, gitConnections, githubLoadError }, organi
     : !githubApp.configured ? { value: `<span class="setting-muted">Not set up</span>${S.installationAccess ? '' : policyTip('Your administrator needs to set up GitHub first.')}`,
       actions: S.installationAccess ? `<a class="btn sm primary" data-spa href="${installationRoute()}#installation-github">Set up</a>` : '' }
     : !gitConnections.length ? { value: '<span class="setting-muted">Not connected</span>', actions: `<button class="btn sm primary" id="${ids.connect}" type="button">Connect GitHub</button>` }
-    : { value: `${gitConnections.map((connection) => `<b>${esc(connection.accountLogin)}</b>`).join('<span class="setting-sep">·</span>')}${needsUpdate ? '<span class="chip setting-warn" title="Approve GitHub’s updated access in organization settings">needs update</span>' : ''}`,
+    : { value: `${gitConnections.map((connection) => `<b>${esc(connection.accountLogin)}</b>`).join('<span class="setting-sep">·</span>')}${needsUpdate ? '<span class="chip setting-warn" title="Approve GitHub’s updated access in organization settings">Needs update</span>' : ''}`,
       actions: `<button class="icon-btn" id="${ids.refresh}" type="button" title="Refresh repository list" aria-label="Refresh repository list">↻</button><a class="btn sm" data-spa href="${organizationLink}">Manage</a>` };
 }
 // An organization's GitHub as Git & GitHub reads it. Unreadable GitHub state
@@ -20424,7 +20424,7 @@ function toMinorUnits(value, currency = 'usd') { return Math.round(Number(value)
 function fromMinorUnits(minor, currency = 'usd') { const digits = currencyDigits(currency); return (minor / 10 ** digits).toFixed(digits); }
 function spendRequestRow(r) {
   return `<div class="queue-item"><div style="flex:1"><b>${esc(money(r.amount, r.currency))}</b> ${r.merchant ? `at ${esc(r.merchant)}` : ''} <span class="chip">${esc(paymentStatusLabel(r.status))}</span><div class="task-sub">${esc(r.why || r.reason || '')}</div></div>
-          ${['pending_approval', 'needs_funding'].includes(r.status) ? `<button class="btn sm" data-payapprove="${r.id}">Approve / retry</button><button class="btn sm danger" data-paydeny="${r.id}">Deny</button>` : ''}</div>`;
+          ${['pending_approval', 'needs_funding'].includes(r.status) ? `<button class="btn sm" data-payapprove="${r.id}">${r.status === 'needs_funding' ? 'Retry' : 'Approve'}</button><button class="btn sm danger" data-paydeny="${r.id}">Deny</button>` : ''}</div>`;
 }
 async function wirePaymentProviders(box, organizationId, onChange) {
   const list = box.querySelector('.pay-providers-list');
@@ -20438,7 +20438,7 @@ async function wirePaymentProviders(box, organizationId, onChange) {
   // and the mock rail is a development fixture, not a user-facing choice.
   const connectable = data.providers.filter((p) => p.kind === 'oauth');
   list.innerHTML = connectable.map((p) => `<div class="setting-row" data-prov="${esc(p.name)}">
-      <span class="setting-label">${esc(p.label || p.name)} ${p.help ? policyTip(p.help) : ''}</span>
+      <span class="setting-label">${esc(p.name === 'stripe' ? 'Stripe account' : p.label || p.name)} ${p.help ? policyTip(p.help) : ''}</span>
       <span class="setting-value">${p.connected ? '<span class="chip done">Connected</span>' : p.connectionStatus === 'attention' ? '<span class="chip waiting">Needs attention</span>' : !p.available ? '<span class="chip">Needs installation setup</span>' : '<span class="chip">Not connected</span>'}</span>
       <span class="setting-actions">${p.available && !p.connected ? `<button class="btn sm" data-connectpay="${esc(p.name)}">Connect</button>` : ''}
       ${p.connected || p.connectionStatus ? `<button class="btn sm danger" data-disconnectpay="${esc(p.name)}">Disconnect</button>` : ''}</span></div>`).join('');
@@ -20784,7 +20784,7 @@ function credentialRequestRows(requests, items, { historyLimit = 5, showEmpty = 
           <div class="approval-request-title">${request.itemId
             ? esc(itemLabel(request.itemId))
             : `${esc(request.domain || request.name || '?')} <span class="chip approval-needed">not in vault</span>`}
-            ${request.kind === 'reset' ? '<span class="chip approval-needed">reported invalid</span>' : `<span class="chip">${esc(request.mode)}</span>`}
+            ${request.kind === 'reset' ? '<span class="chip approval-needed">reported invalid</span>' : `<span class="chip">${esc({ use: 'Blind use', reveal: 'Agent sees' }[request.mode] || request.mode)}</span>`}
             ${request.dismissed ? ignoredChip() : ''}
           </div>
           <div class="task-sub">${credentialRequestTaskLink(request)}${request.why ? ` — ${esc(request.why)}` : ''}</div>

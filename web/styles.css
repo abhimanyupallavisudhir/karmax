@@ -572,6 +572,10 @@ p.task-sub > .mono, p.task-sub > code { word-break: break-word; }
 .vault-import-rows .chip.ok { background:var(--merged-weak); color:var(--merged); border-color:transparent; }
 .vault-import-rows .conn-secret { flex:1; min-width:140px; max-width:260px; }
 .vault-policy-field { display:inline-flex; align-items:center; gap:4px; font-size:12px; color:var(--ink-2); }
+/* A label that is its own field row ("Card name<input>") reads like every other field label. */
+.organization-settings:not(.installation-settings, .wiki-page) label.form-row:not(.switch) { color:var(--ink-2); font-size:12px; font-weight:600; }
+.organization-settings:not(.installation-settings, .wiki-page) label.form-row:not(.switch) > :is(input, select, textarea) { color:var(--ink); font-size:14px; font-weight:400; }
+#project-secret-paste .form-row > span { color:var(--ink-2); font-size:12px; font-weight:600; }
 .project-empty { margin:8px 0 14px; padding:14px; border:1px dashed var(--line-strong); border-radius:10px; color:var(--ink-3); font-size:12px; line-height:1.5; }
 .project-form-actions { display:flex; align-items:center; justify-content:flex-end; gap:8px; margin-top:12px; }
 .service-fields[hidden] { display:none; }
@@ -3451,6 +3455,8 @@ html[data-theme="dark"] .github-signin-btn:active,
 .role-capability-group ul { list-style: none; margin: 8px 0; padding-left: 16px; border-left: 1px solid var(--line); }
 .role-capability-group li { display: flex; align-items: center; gap: 6px; padding: 6px 0; overflow-wrap: anywhere; }
 .roles-fold[open] > summary { margin-bottom: 8px; }
+.role-capability-group li b { font-weight: 500; }
+.role-capability-group > summary .setting-muted { margin: 0 2px 0 4px; }
 .role-capability-group code { display: block; color: var(--ink-3); font-size: 11px; }
 .role-capability-group label { display: flex; align-items: center; gap: 8px; }
 .role-capability-group p { margin: 3px 0; }
@@ -3863,8 +3869,8 @@ html[data-theme="dark"] .github-signin-btn:active,
 }
 
 /* ── Computers (Settings → Projects, Project → Computers) ── */
-.computer-providers { display: grid; gap: 8px; min-width: 0; }
-.computer-providers > .computer-provider { min-width: 0; flex-wrap: wrap; }
+.computer-providers { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; min-width: 0; }
+.computer-providers > :is(.computer-provider, .computer-any) { min-width: 0; flex-wrap: wrap; }
 .computer-add { position: relative; justify-self: start; }
 .computer-add > summary { list-style: none; }
 .computer-add > summary::-webkit-details-marker { display: none; }
