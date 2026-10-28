@@ -74,7 +74,7 @@ it('composes a task whose Responder and Reviewer carry their own authority', asy
     expect(await main.locator('#tf-authorization, #tf-vault-open, #tf-payments').count()).toBe(3);
     expect(await page.locator('.tf-side').locator('#tf-authorization, #tf-vault-open, #tf-payments').count()).toBe(0);
     expect(await page.locator('.tf-side [data-row]').evaluateAll((rows) => rows.map((row) => row.getAttribute('data-row'))))
-      .toEqual(['__org', '__github-merge', '__attempts', '__creds', '__notes']);
+      .toEqual(['__org', '__attempts', '__creds', '__notes']);
     expect(await main.locator('.aa-summary').textContent()).toContain('Developer');
 
     await body.locator('textarea[data-field="prompt"]').fill('Ship it');
