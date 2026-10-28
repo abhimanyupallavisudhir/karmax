@@ -531,7 +531,7 @@ export class StripeIssuingProvider implements PaymentProvider {
       help: connection?.status === 'ready'
         ? `Connected to ${connection.accountId}${connection.livemode ? ' (live)' : ' (test)'}. Funds come from this organization's Stripe Issuing balance.${await this.hasSecret(STRIPE_WEBHOOK_SECRET_HANDLE, 'STRIPE_WEBHOOK_SECRET') ? '' : ' Add the webhook signing secret in Stripe platform setup before issuing active cards.'}`
         : connection?.status === 'attention'
-          ? `Connected account ${connection.accountId} needs Stripe card_issuing capability activation before ${BRAND} can issue cards.`
+          ? `Connected account ${connection.accountId} needs Stripe Issuing activated before ${BRAND} can issue cards.`
         : available
           ? `Connect this organization’s Stripe account. The deployment Connect app identifies ${BRAND}; it does not fund cards.`
           : 'An installation administrator must complete Stripe platform setup before organizations can connect.',

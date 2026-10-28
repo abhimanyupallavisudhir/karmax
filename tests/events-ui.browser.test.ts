@@ -114,10 +114,13 @@ describe('events in the console', () => {
       body: JSON.stringify({ title: 'Boom', level: 'error' }) });
     expect(delivered.status).toBe(202);
     await reveal.locator('[data-pe-done]').click();
-    await expect.poll(async () => box.locator('[data-hook]').textContent()).toMatch(/Sentry[\s\S]*sentry\.alert[\s\S]*1 received/);
+    await expect.poll(async () => box.locator('[data-hook]').textContent()).toMatch(/Sentry[\s\S]*Sentry alert[\s\S]*1 received/);
     expect(await box.textContent()).not.toContain(secret);
+    // Recent events fold behind their count; a type reads as words, the raw type is its title.
+    await box.locator('.pe-recent > summary').click();
     const event = box.locator('.pe-event').first();
-    expect(await event.locator('summary').textContent()).toMatch(/sentry\.alert[\s\S]*Sentry[\s\S]*No task waits for this/);
+    expect(await event.locator('summary').textContent()).toMatch(/Sentry alert[\s\S]*Sentry[\s\S]*No task waits for this/);
+    expect(await event.locator('.setting-label').getAttribute('title')).toBe('sentry.alert');
     await event.locator('summary').click();
     expect(await event.locator('.pe-payload').textContent()).toContain('"level": "error"');
     page.once('dialog', (dialog) => dialog.accept());

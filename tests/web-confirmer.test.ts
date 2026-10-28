@@ -50,9 +50,9 @@ describe('single-stage Responder form behavior', () => {
     expect(await box.locator('.rf-kind option').allTextContents()).toEqual(['Human responds', 'Agent responds']);
     expect(await box.locator('.cf-add, .cf-move, .cf-del').count()).toBe(0);
     // Choosing an agent shows the agent and its prompt in place of the audience.
-    await box.locator('.rf-kind').selectOption('agent');
+    await box.locator('.route-kind [data-route-kind="agent"]').click();
     expect([await box.locator('.rf-agent').isVisible(), await box.locator('.rf-human').isVisible()]).toEqual([true, false]);
-    await box.locator('.rf-kind').selectOption('human');
+    await box.locator('.route-kind [data-route-kind="human"]').click();
     // The Responder is edited in the Agent card beside the Review route, not
     // among the common task defaults, though both are stored as shared values.
     expect(await ui.run(`S.schema = [{ name: 'software-dev', params: [${JSON.stringify(responder)},
@@ -63,9 +63,9 @@ describe('single-stage Responder form behavior', () => {
 
   it('collects the composite Responder from the live parameters form', async () => {
     expect((await read(ui)).responder).toEqual(human('user:bob'));
-    await ui.page.locator('.responder-field .rf-kind').selectOption('agent');
+    await ui.page.locator('.responder-field .route-kind [data-route-kind="agent"]').click();
     expect((await read(ui)).responder).toMatchObject({ kind: 'agent' });
-    await ui.page.locator('.responder-field .rf-kind').selectOption('human');
+    await ui.page.locator('.responder-field .route-kind [data-route-kind="human"]').click();
   });
 
   it('resets the composite Responder and notifies draft autosave', async () => {

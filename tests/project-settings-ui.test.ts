@@ -173,8 +173,8 @@ describe('Project settings', () => {
     await box.locator('.project-resource-row').first().waitFor();
     const rows = await box.locator('.project-resource-row').evaluateAll((elements) =>
       elements.map((element) => [element.querySelector('b')!.textContent, element.querySelector('code')!.textContent, element.querySelector('.chip')!.textContent]));
-    expect(rows).toEqual([['SHARED', 'SHARED', 'environment variable'], ['DATABASE_URL', 'api/.env', '.env line'],
-      ['sa.json', 'web/config/sa.json', 'private file']]);
+    expect(rows).toEqual([['SHARED', 'SHARED', 'Environment variable'], ['DATABASE_URL', 'api/.env', '.env line'],
+      ['sa.json', 'web/config/sa.json', 'Private file']]);
     await box.locator('.project-secret-suggest', { hasText: 'DATABASE_URL' }).click();
     expect(await box.locator('#project-secret-file').inputValue()).toBe('web/.env');
     await box.locator('#project-secret-value').fill('postgres://web');
@@ -396,10 +396,11 @@ describe('Project settings', () => {
         : route.endsWith('/organizations/o/repositories') ? repositories
           : route.endsWith('/github/app') ? { configured: true } : undefined });
     const empty = await hosted([]);
+    // Nothing can be added yet: no field says so, the GitHub row's Connect does.
     const input = empty.page.locator('#project-repository-input');
-    await input.waitFor();
+    await input.waitFor({ state: 'attached' });
     expect(await input.isDisabled()).toBe(true);
-    expect(await input.getAttribute('placeholder')).toBe('Connect GitHub to add repositories');
+    expect(await input.isVisible()).toBe(false);
     expect(await empty.page.locator('#project-github-access').getByRole('button', { name: 'Connect GitHub' }).count()).toBe(1);
     await empty.close();
 

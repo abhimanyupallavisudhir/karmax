@@ -111,17 +111,17 @@ const { chromium } = require('playwright');
     // UI-23: a rejected sharing policy returns the select to the saved value.
     fail.add('PUT sharing');
     const box = page.locator('#organization-conversation-sharing');
-    const select = box.locator('select');
-    await select.selectOption('enabled');
-    assert.equal(await select.isDisabled(), true, 'the policy is locked while it saves');
+    const toggle = box.getByRole('checkbox', { name: 'Public conversation links' });
+    await toggle.click();
+    assert.equal(await toggle.isDisabled(), true, 'the policy is locked while it saves');
     await page.getByText('Only an owner can change sharing').waitFor();
-    await page.waitForFunction(() => !document.querySelector('#organization-conversation-sharing select').disabled);
-    assert.equal(await select.inputValue(), 'disabled', 'a rejected policy change shows the saved policy');
+    await page.waitForFunction(() => !document.querySelector('#organization-conversation-sharing input').disabled);
+    assert.equal(await toggle.isChecked(), false, 'a rejected policy change shows the saved policy');
     fail.delete('PUT sharing');
-    await select.selectOption('enabled');
+    await toggle.click();
     await page.getByText('Public sharing policy saved').waitFor();
     assert.equal(sharing, true);
-    assert.equal(await select.inputValue(), 'enabled');
+    assert.equal(await toggle.isChecked(), true);
 
     assert.deepEqual(errors, []);
     console.log('Settings truth: ok');
